@@ -23,37 +23,40 @@ def temp_sys_path(paths: list[Path]):
 
 def build_symbol_graph(paths: dict[Path, list[Path]]) -> nx.DiGraph:
     symbol_graph = nx.DiGraph()
-    import_edges = []
+    import_edges = set()
     for base, search_paths in paths.items():
         with temp_sys_path(search_paths):
             paths = list(base.rglob("*.py"))
             mgr = FullRepoManager(base, paths, {FullyQualifiedNameProvider})
             for file in paths:
-                print(file)
                 wrapper = mgr.get_metadata_wrapper_for_path(file)
-                decl_visitor = SymbolVisitor(file, search_paths)
-                wrapper.visit(decl_visitor)
-                for decl_node in decl_visitor.decls:
+                visitor = SymbolVisitor(file, search_paths)
+                wrapper.visit(visitor)
+                for decl_node in visitor.decls:
                     symbol_graph.add_node(decl_node)
-                for src, dst in decl_visitor.internal_edges:
+                for src, dst in visitor.internal_edges:
                     symbol_graph.add_edge(src, dst)
 
                 # collect all the intra module edges
-                import_edges.extend(decl_visitor.import_edges)
+                import_edges = import_edges | visitor.import_edges
 
     # now resolve all the import edges
-    fqname_to_node = {n.fqname: n for n in symbol_graph.nodes}
-    for src, fqname in import_edges:
-        dst = fqname_to_node.get(fqname)
-        if not dst:
-            print(f"Failed to resolve import edge: {src.fqname} -> {fqname}")
+    edge_lookup = {(n.fqname, n.path): n for n in symbol_graph.nodes}
+    for edge in import_edges:
+        if not isinstance(edge.dst_path, Path):
             continue
-        symbol_graph.add_edge(src, dst)
+
+        if dst := edge_lookup.get((edge.dst_fqname, edge.dst_path)):
+            symbol_graph.add_edge(edge.src, dst)
+        else:
+            print(f"Failed to resolve import edge: {edge}")
 
     return symbol_graph
 
 
-def find_reachable(graph: nx.DiGraph, root: Path, entrypoints: list[Path | re.Pattern]) -> Set[str]:
+def find_reachable(
+    graph: nx.DiGraph, root: Path, entrypoints: list[Path | re.Pattern]
+) -> Set[SymbolNode]:
     visited = set()
 
     def _is_entrypoint(sym: SymbolNode) -> bool:
@@ -76,3 +79,12 @@ def find_reachable(graph: nx.DiGraph, root: Path, entrypoints: list[Path | re.Pa
         stack.extend(graph.successors(node))
 
     return visited
+
+
+def count_nodes(graph: nx.DiGraph, prefix: Path | None) -> dict[str, int]:
+    counts = {}
+    for node in graph.nodes:
+        if prefix and not node.path.is_relative_to(prefix):
+            continue
+        counts[node.type] = counts.get(node.type, 0) + 1
+    return counts

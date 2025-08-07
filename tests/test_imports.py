@@ -13,9 +13,31 @@ def test_simple_import(build_decl_graph, assert_edges):
             "x.nested.z -> x",
             "x.a -> x",
             "x.a -> x.y",
+            "x.a -> y.b",
             "x.y -> y",
             "y.b -> y",
             "x.nested.z -> nested.z",
+        },
+    )
+
+
+def test_asname_import(build_decl_graph, assert_edges):
+    graph = build_decl_graph(
+        {
+            "x.py": "import nested.y as z\ndef a(): z.b()",
+            "nested/__init__.py": "",
+            "nested/y.py": "def b(): pass",
+        }
+    )
+    assert_edges(
+        graph,
+        {
+            "x.a -> x",
+            "x.z -> x",
+            "x.a -> x.z",
+            "x.a -> nested.y.b",
+            "x.z -> nested",
+            "nested.y.b -> nested.y",
         },
     )
 
@@ -57,6 +79,7 @@ def test_nested_import(build_decl_graph, assert_edges):
         {
             "x.a -> x",
             "x.a -> y",
+            "x.a -> y.b",
             "y.b -> y",
         },
     )
