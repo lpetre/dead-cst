@@ -2,6 +2,7 @@ import os
 import sys
 import sysconfig
 from dataclasses import dataclass
+from functools import cache
 from importlib.machinery import ModuleSpec
 from importlib.util import resolve_name
 from pathlib import Path
@@ -9,13 +10,7 @@ from typing import Generator, Literal
 
 import libcst as cst
 from libcst.helpers import get_full_name_for_node
-from libcst.metadata import (
-    FullyQualifiedNameProvider,
-    ParentNodeProvider,
-    PositionProvider,
-    QualifiedNameProvider,
-    ScopeProvider,
-)
+from libcst.metadata import FullyQualifiedNameProvider, ParentNodeProvider, ScopeProvider
 
 SITE_PACKAGES = Path(sysconfig.get_path("purelib")).resolve()
 STDLIB = Path(sysconfig.get_path("stdlib")).resolve()
@@ -50,6 +45,7 @@ def _dotted_name_parts(
         yield full, node.attr
 
 
+@cache
 def safe_resolve_module(fullname: str) -> ModuleSpec | None:
     parts = fullname.split(".")
     search_paths = list(sys.path)
@@ -82,10 +78,8 @@ def safe_resolve_module(fullname: str) -> ModuleSpec | None:
 class SymbolVisitor(cst.CSTVisitor):
     METADATA_DEPENDENCIES = (
         FullyQualifiedNameProvider,
-        QualifiedNameProvider,
         ScopeProvider,
         ParentNodeProvider,
-        PositionProvider,
     )
 
     def __init__(self, path: Path, search_paths: list[Path]):
@@ -112,6 +106,7 @@ class SymbolVisitor(cst.CSTVisitor):
         self.decl_stack.append(decl)
         self.decls.add(decl)
 
+    @cache
     def resolve_import(self, name: str) -> str | Path:
         spec = safe_resolve_module(name)
         if spec is None:
@@ -221,7 +216,8 @@ class SymbolVisitor(cst.CSTVisitor):
                     break
 
             if not found:
-                print(f"Failed to resolve import: {alias.name} in {self.path}")
+                code = cst.Module([]).code_for_node(alias)
+                print(f"Failed to resolve cst.Import: '{code}' in {self.path}")
                 continue
 
             final_name = found[0]
@@ -263,11 +259,12 @@ class SymbolVisitor(cst.CSTVisitor):
             if not real_name:
                 continue
 
-            if not found_module:
-                found_module = self.resolve_import(f"{module}.{real_name}")
+            if module_import := self.resolve_import(f"{module}.{real_name}"):
+                found_module = module_import
 
             if not found_module:
-                print(f"Failed to resolve import: {found_module} in {self.path}")
+                code = cst.Module([]).code_for_node(alias)
+                print(f"Failed to resolve cst.ImportFrom: '{code}' in {self.path}")
                 continue
 
             as_name = real_name

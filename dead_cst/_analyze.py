@@ -7,7 +7,7 @@ from typing import Set
 import networkx as nx
 from libcst.metadata import FullRepoManager, FullyQualifiedNameProvider
 
-from ._visitor import SymbolNode, SymbolVisitor
+from ._visitor import safe_resolve_module, SymbolNode, SymbolVisitor
 
 
 @contextlib.contextmanager
@@ -25,10 +25,14 @@ def build_symbol_graph(paths: dict[Path, list[Path]]) -> nx.DiGraph:
     symbol_graph = nx.DiGraph()
     import_edges = set()
     for base, search_paths in paths.items():
+        safe_resolve_module.cache_clear()
         with temp_sys_path(search_paths):
             paths = list(base.rglob("*.py"))
             mgr = FullRepoManager(base, paths, {FullyQualifiedNameProvider})
             for file in paths:
+                # if not str(file).endswith("ml_old/base.py"):
+                #     continue
+                print(file)
                 wrapper = mgr.get_metadata_wrapper_for_path(file)
                 visitor = SymbolVisitor(file, search_paths)
                 wrapper.visit(visitor)
@@ -39,6 +43,14 @@ def build_symbol_graph(paths: dict[Path, list[Path]]) -> nx.DiGraph:
 
                 # collect all the intra module edges
                 import_edges = import_edges | visitor.import_edges
+
+    # keep __init__.py files alive
+    module_lookup = {n.path: n for n in symbol_graph.nodes if n.type == "module"}
+    for file, sym in module_lookup.items():
+        init_file = file.parent / "__init__.py"
+        init_module = module_lookup.get(init_file)
+        if sym != init_module and init_module is not None:
+            symbol_graph.add_edge(sym, init_module)
 
     # now resolve all the import edges
     edge_lookup = {(n.fqname, n.path): n for n in symbol_graph.nodes}
@@ -63,7 +75,7 @@ def find_reachable(
         rel = str(sym.path.relative_to(root))
         for e in entrypoints:
             if isinstance(e, str):
-                if e == rel:
+                if e == rel or e == sym.fqname:
                     return True
             elif isinstance(e, re.Pattern):
                 if e.match(rel):
