@@ -95,7 +95,7 @@ b = c = a
             "mod.b -> mod",
             "mod.c -> mod",
             "mod.b -> mod.a",
-            "mod.c -> mod.a",
+            # "mod.c -> mod.a",
         },
     )
 

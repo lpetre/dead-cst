@@ -17,7 +17,7 @@ def build_decl_graph(tmp_path):
             full_path.write_text(textwrap.dedent(content).strip())
 
         # Build the declaration graph
-        return build_symbol_graph({tmp_path: [tmp_path]})
+        return build_symbol_graph({tmp_path: []})
 
     return _make_graph
 

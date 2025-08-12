@@ -1,9 +1,7 @@
-import os
-import sys
+from __future__ import annotations
+
 import sysconfig
-from dataclasses import dataclass
 from functools import cache
-from importlib.machinery import ModuleSpec
 from importlib.util import resolve_name
 from pathlib import Path
 from typing import Generator, Literal
@@ -12,22 +10,11 @@ import libcst as cst
 from libcst.helpers import get_full_name_for_node
 from libcst.metadata import FullyQualifiedNameProvider, ParentNodeProvider, ScopeProvider
 
+from ._resolve import safe_resolve_module
+from ._symbols import Import, SymbolNode, SymbolTrie
+
 SITE_PACKAGES = Path(sysconfig.get_path("purelib")).resolve()
 STDLIB = Path(sysconfig.get_path("stdlib")).resolve()
-
-
-@dataclass(frozen=True, slots=True)
-class SymbolNode:
-    fqname: str
-    type: Literal["module", "class", "function", "variable", "import"]
-    path: Path
-
-
-@dataclass(frozen=True, slots=True)
-class ImportEdge:
-    src: SymbolNode
-    dst_fqname: str
-    dst_path: Path | str
 
 
 def _dotted_name_parts(
@@ -45,36 +32,6 @@ def _dotted_name_parts(
         yield full, node.attr
 
 
-@cache
-def safe_resolve_module(fullname: str) -> ModuleSpec | None:
-    parts = fullname.split(".")
-    search_paths = list(sys.path)
-
-    # emulate namespace __path__ resolution
-    for i, part in enumerate(parts[:-1]):
-        candidate_paths = []
-        for base in search_paths:
-            subdir = os.path.join(base, parts[i])
-            if os.path.isdir(subdir):
-                candidate_paths.append(subdir)
-        search_paths = candidate_paths
-
-    # print(fullname, "in [", search_paths, "]")
-    # Final part resolution
-    for finder in sys.meta_path:
-        find_spec = getattr(finder, "find_spec", None)
-        if not find_spec:
-            continue
-        try:
-            spec = find_spec(fullname, search_paths)
-            if spec:
-                return spec
-        except Exception:
-            continue
-
-    return None
-
-
 class SymbolVisitor(cst.CSTVisitor):
     METADATA_DEPENDENCIES = (
         FullyQualifiedNameProvider,
@@ -85,12 +42,13 @@ class SymbolVisitor(cst.CSTVisitor):
     def __init__(self, path: Path, search_paths: list[Path]):
         self.path = path
         self.search_paths = search_paths
-        self.decls: set[SymbolNode] = set()
         self.node_to_symbols: dict[cst.CSTNode, list[SymbolNode]] = {}
         self.decl_stack: list[SymbolNode] = []
         self.nearest_decl: dict[cst.CSTNode, SymbolNode] = {}
-        self.import_edges: set[ImportEdge] = set()
+        self.import_lookup: dict[cst.CSTNode, Import] = {}
+        self.import_edges: set[tuple[SymbolNode, Import]] = set()
         self.internal_edges: set[tuple[SymbolNode, SymbolNode]] = set()
+        self.trie: SymbolTrie = SymbolTrie()
 
     @property
     def module_node(self) -> SymbolNode:
@@ -99,12 +57,9 @@ class SymbolVisitor(cst.CSTVisitor):
         return self.decl_stack[0]
 
     def _push_decl(self, node: cst.CSTNode, decl: SymbolNode):
-        # print("->", decl.fqname)
-        if self.decl_stack:
-            self.internal_edges.add((decl, self.decl_stack[0]))
         self.node_to_symbols.setdefault(node, []).append(decl)
         self.decl_stack.append(decl)
-        self.decls.add(decl)
+        self.trie.add_declaration(decl)
 
     @cache
     def resolve_import(self, name: str) -> str | Path:
@@ -152,6 +107,9 @@ class SymbolVisitor(cst.CSTVisitor):
 
         value_to_syms = {}
         for target in reversed(targets):
+            full_name = get_full_name_for_node(target)
+            if full_name and "." in full_name:
+                continue
 
             # see if we're unpacking, eg `a, b = ...`
             names = [target]
@@ -187,6 +145,61 @@ class SymbolVisitor(cst.CSTVisitor):
                     # print("Target", sym.fqname, "for value", value)
                     self._push_decl(value, sym)
 
+    def _add_import(self, from_prefix: str, node: cst.Import | cst.ImportFrom) -> None:
+        current_decl = self.decl_stack[-1] if self.decl_stack else None
+
+        module_path, module_name = None, None
+        if from_prefix:
+            module_path = self.resolve_import(from_prefix)
+            module_name = from_prefix if module_path else None
+
+        for alias in reversed(node.names):
+            alias_name = get_full_name_for_node(alias.name)
+            full_name = f"{from_prefix}.{alias_name}" if from_prefix else alias_name
+
+            if resolved := self.resolve_import(full_name):
+                module_path = resolved
+                module_name = full_name if module_path else None
+
+            if not module_path:
+                code = cst.Module([]).code_for_node(alias)
+                print(f"Failed to resolve cst.Import: '{code}' in {self.path}")
+                continue
+
+            # if there is an asname, that is the decl being added
+            # and we resolve the entire import
+            if alias.asname:
+                decl_name = alias.asname.name
+
+            # if there is not an asname, the first name is the decl
+            else:
+                decl_name = alias.name
+
+            # add the import lookup so we can resolve it in on_leave
+            self.import_lookup[decl_name] = import_info = Import(
+                path=module_path,
+                module=module_name,
+                decl=(
+                    full_name[len(module_name) + 1 :]
+                    if module_name and module_name != full_name
+                    else None
+                ),
+            )
+
+            # get the first name of the decl, eg 'google' for 'google.cloud'
+            while isinstance(decl_name, cst.Attribute):
+                decl_name = decl_name.value
+
+            # add a decl if the import is in the module context
+            if current_decl and current_decl.type == "module":
+                sym = SymbolNode(
+                    f"{self.module_node.fqname}.{decl_name.value}", "import", self.path, import_info
+                )
+                self._push_decl(alias, sym)
+
+            # add the import edge to the last decl on the stack
+            self.import_edges.add((self.decl_stack[-1], import_info))
+
     def visit_Module(self, node: cst.Module) -> None:
         assert not self.decl_stack, "Module node should be the first visited node"
         fqns = self.get_metadata(FullyQualifiedNameProvider, node, default=[])
@@ -206,35 +219,12 @@ class SymbolVisitor(cst.CSTVisitor):
         self._add_variable(node)
 
     def visit_Import(self, node: cst.Import) -> None:
-        current_decl = self.decl_stack[-1] if self.decl_stack else None
-
-        for alias in reversed(node.names):
-            found = None
-            for curr_name, curr_node in _dotted_name_parts("", alias.name):
-                if resolved := self.resolve_import(curr_name):
-                    found = curr_name, curr_node, resolved
-                    break
-
-            if not found:
-                code = cst.Module([]).code_for_node(alias)
-                print(f"Failed to resolve cst.Import: '{code}' in {self.path}")
-                continue
-
-            final_name = found[0]
-            if alias and alias.asname:
-                if eval_alias := alias.evaluated_alias:
-                    final_name = eval_alias
-
-            if current_decl and current_decl.type == "module":
-                sym = SymbolNode(f"{self.module_node.fqname}.{final_name}", "import", self.path)
-                self._push_decl(alias, sym)
-
-            # add the import edge to the last decl on the stack
-            edge = ImportEdge(self.decl_stack[-1], found[0], found[2])
-            self.import_edges.add(edge)
+        self._add_import("", node)
 
     def visit_ImportFrom(self, node: cst.ImportFrom) -> None:
-        current_decl = self.decl_stack[-1] if self.decl_stack else None
+        # FIXME support import star
+        if isinstance(node.names, cst.ImportStar):
+            return
 
         module = ""
         if node.module:
@@ -249,37 +239,7 @@ class SymbolVisitor(cst.CSTVisitor):
             prefix = "." * len(node.relative)
             module = resolve_name(f"{prefix}{module}", current_package)
 
-        # FIXME support import star
-        if isinstance(node.names, cst.ImportStar):
-            return
-
-        found_module = self.resolve_import(module)
-        for alias in reversed(node.names):
-            real_name = get_full_name_for_node(alias.name)
-            if not real_name:
-                continue
-
-            if module_import := self.resolve_import(f"{module}.{real_name}"):
-                found_module = module_import
-
-            if not found_module:
-                code = cst.Module([]).code_for_node(alias)
-                print(f"Failed to resolve cst.ImportFrom: '{code}' in {self.path}")
-                continue
-
-            as_name = real_name
-            if alias and alias.asname:
-                if eval_alias := alias.evaluated_alias:
-                    as_name = eval_alias
-
-            if current_decl and current_decl.type == "module":
-                dst = f"{self.module_node.fqname}.{as_name}"
-                sym = SymbolNode(dst, "import", self.path)
-                self._push_decl(alias, sym)
-
-            src = f"{module}.{real_name}" if module else real_name
-            edge = ImportEdge(self.decl_stack[-1], src, found_module)
-            self.import_edges.add(edge)
+        self._add_import(module, node)
 
     def on_leave(self, original_node: cst.CSTNode) -> None:
         self.nearest_decl[original_node] = self.decl_stack[-1]
@@ -293,55 +253,62 @@ class SymbolVisitor(cst.CSTVisitor):
             return
 
         parent_map = self.metadata[ParentNodeProvider]
+        references = set()
         for scope in self.metadata[ScopeProvider].values():
             for access in scope.accesses:
-                owner_symbol = self.nearest_decl.get(access.node)
                 for referent in access.referents:
                     if isinstance(referent, cst.metadata.scope_provider.BuiltinAssignment):
                         continue
+                    references.add((access, referent))
 
-                    target_node = referent.node
-                    if isinstance(referent, cst.metadata.scope_provider.ImportAssignment):
-                        target_node = referent.as_name
-                        import_name = next(
-                            n.name
-                            for n in referent.node.names
-                            if n.name == referent.as_name
-                            or (n.asname and n.asname.name == referent.as_name)
-                        )
-                        parent = parent_map.get(access.node)
-                        if parent and isinstance(parent, cst.Attribute):
-                            target_parts = get_full_name_for_node(target_node).split(".")
-                            full_parts = get_full_name_for_node(parent).split(".")
-                            import_parts = get_full_name_for_node(import_name).split(".")
-                            real_parts = import_parts + full_parts[len(target_parts) :]
+        for access, referent in references:
+            owner_symbol = self.nearest_decl.get(access.node)
+            target_node = referent.node
+            if isinstance(referent, cst.metadata.scope_provider.ImportAssignment):
+                target_node = referent.as_name
+                original_import = self.import_lookup.get(referent.as_name)
+                if not original_import:
+                    code = cst.Module([]).code_for_node(referent.as_name)
+                    print(f"Failed to resolve import access: '{code}' in {self.path}")
 
-                            for i in range(len(real_parts), 0, -1):
-                                mod_name = ".".join(real_parts[:i])
-                                if resolved := self.resolve_import(mod_name):
-                                    self.import_edges.add(
-                                        ImportEdge(
-                                            owner_symbol,
-                                            ".".join(real_parts),
-                                            resolved,
-                                        )
-                                    )
-                                    break
+                else:
+                    accessed_attrs = [] if not original_import.decl else [original_import.decl]
 
-                    target_symbols = self.node_to_symbols.get(target_node)
-                    if not target_symbols:
-                        target_symbol = self.nearest_decl.get(target_node)
-                        if target_symbol:
-                            target_symbols = {target_symbol}
+                    if isinstance(access.node, (cst.Name, cst.Attribute)):
+                        # figure out what is being accessed
+                        prev_access, curr_access = None, access.node
+                        while prev_access := parent_map.get(curr_access):
+                            if not isinstance(prev_access, cst.Attribute):
+                                break
+                            accessed_attrs.append(prev_access.attr.value)
+                            curr_access = prev_access
 
-                    if not target_symbols:
-                        print(
-                            "Missing target symbol for referent",
-                            referent,
-                            referent.node,
-                            target_node,
-                        )
+                    # Create the new Import with the specific symbol being accessed
+                    resolved_import = Import(
+                        path=original_import.path,
+                        module=original_import.module,
+                        decl=".".join(accessed_attrs) if accessed_attrs else None,
+                    )
 
-                    for target_symbol in target_symbols:
-                        if target_symbol != owner_symbol and target_symbol and owner_symbol:
-                            self.internal_edges.add((owner_symbol, target_symbol))
+                    # if str(self.path) == "/home/lpetre_midjourney_com/dev/src/github.com/midjourney/image-generation/libs/kdj-minimal/v6/prior/model.py" and referent.as_name.value == "nnx":
+                    #     print(f"Original import: {original_import}")
+                    #     print(f"Resolved import: {resolved_import}")
+                    self.import_edges.add((owner_symbol, resolved_import))
+
+            target_symbols = self.node_to_symbols.get(target_node)
+            if not target_symbols:
+                target_symbol = self.nearest_decl.get(target_node)
+                if target_symbol:
+                    target_symbols = {target_symbol}
+
+            if not target_symbols:
+                print(
+                    "Missing target symbol for referent",
+                    referent,
+                    referent.node,
+                    target_node,
+                )
+
+            for target_symbol in target_symbols:
+                if target_symbol != owner_symbol and target_symbol and owner_symbol:
+                    self.internal_edges.add((owner_symbol, target_symbol))

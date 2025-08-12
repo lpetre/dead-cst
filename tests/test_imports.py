@@ -1,106 +1,79 @@
-def test_simple_import(build_decl_graph, assert_edges):
-    graph = build_decl_graph(
-        {
-            "x.py": "import y, nested.z\ndef a(): y.b()",
-            "y.py": "def b(): pass",
-            "nested/z.py": "",
+import pytest
+
+IMPORT_TEST_FILES = {
+    "p/__init__.py": "",
+    "p/functions.py": "def f(): pass",
+    "p/classes.py": "class C(): pass",
+    "p/chain.py": "from . import functions",
+}
+
+
+@pytest.mark.parametrize(
+    "src, symbol_edges",
+    [
+        pytest.param(
+            "import p.functions\ndef a(): p.functions.f()",
+            {"p.x.a": {"p.x", "p.x.p", "p.functions", "p.functions.f"}},
+            id="simple-cst.Import",
+        ),
+        pytest.param(
+            "from p.functions import f\ndef a(): f()",
+            {
+                "p.x.f": {"p.x", "p.functions", "p.functions.f"},
+                "p.x.a": {"p.x", "p.x.f", "p.functions", "p.functions.f"},
+            },
+            id="simple-cst.ImportFrom",
+        ),
+        pytest.param(
+            "from p.classes import C\ndef a(): C.f()",
+            {
+                "p.x.C": {"p.x", "p.classes", "p.classes.C"},
+                "p.x.a": {"p.x", "p.classes", "p.classes.C", "p.x.C"},
+            },
+            id="simple cst.ImportFrom for classmethod",
+        ),
+        # import as
+        pytest.param(
+            "import p.functions as f\ndef a(): f.f()",
+            {"p.x.a": {"p.x", "p.x.f", "p.functions", "p.functions.f"}},
+            id="import module with alias",
+        ),
+        pytest.param(
+            "from p import functions as f\ndef a(): f.f()",
+            {"p.x.a": {"p.x", "p.x.f", "p.functions", "p.functions.f"}},
+            id="import module from module with alias",
+        ),
+        # nested import
+        pytest.param(
+            "def a(): import p.functions; p.functions.f()",
+            {"p.x.a": {"p.x", "p.functions", "p.functions.f"}},
+            id="nested cst.Import",
+        ),
+        pytest.param(
+            "def a(): from p.functions import f; f()",
+            {"p.x.a": {"p.x", "p.functions", "p.functions.f"}},
+            id="nested cst.ImportFrom",
+        ),
+        # relative import
+        pytest.param(
+            "from .functions import f\ndef a(): f()",
+            {"p.x.f": {"p.x", "p.functions", "p.functions.f"}},
+            id="relative import",
+        ),
+        # import chain
+        pytest.param(
+            "from p.chain import functions as g\ndef a(): g.f()",
+            {"p.x.a": {"p.x", "p.x.g", "p.chain", "p.chain.functions", "p.functions.f"}},
+            id="import chain",
+        ),
+    ],
+)
+def test_imports(build_decl_graph, src, symbol_edges):
+    import_test_graph = build_decl_graph({**IMPORT_TEST_FILES, "p/x.py": src})
+    found_symbols = {n.fqname for n in import_test_graph.nodes}
+    for expected_symbol, expected_edges in symbol_edges.items():
+        assert expected_symbol in found_symbols
+        found_edges = {
+            dst.fqname for src, dst in import_test_graph.edges if src.fqname == expected_symbol
         }
-    )
-    assert_edges(
-        graph,
-        {
-            "x.y -> x",
-            "x.nested.z -> x",
-            "x.a -> x",
-            "x.a -> x.y",
-            "x.a -> y.b",
-            "x.y -> y",
-            "y.b -> y",
-            "x.nested.z -> nested.z",
-        },
-    )
-
-
-def test_asname_import(build_decl_graph, assert_edges):
-    graph = build_decl_graph(
-        {
-            "x.py": "import nested.y as z\ndef a(): z.b()",
-            "nested/__init__.py": "",
-            "nested/y.py": "def b(): pass",
-        }
-    )
-    assert_edges(
-        graph,
-        {
-            "x.a -> x",
-            "x.z -> x",
-            "x.a -> x.z",
-            "x.a -> nested.y.b",
-            "x.z -> nested",
-            "nested.y.b -> nested.y",
-        },
-    )
-
-
-def test_import_from(build_decl_graph, assert_edges):
-    graph = build_decl_graph(
-        {
-            "x.py": "from y import b as d, c\ndef a(): d()",
-            "y.py": "from nested import z\ndef b(): pass\ndef c(): pass",
-            "nested/z.py": "",
-        }
-    )
-    assert_edges(
-        graph,
-        {
-            "x.a -> x",
-            "x.d -> x",
-            "x.c -> x",
-            "x.a -> x.d",
-            "x.d -> y.b",
-            "x.c -> y.c",
-            "y.b -> y",
-            "y.c -> y",
-            "y.z -> y",
-            "y.z -> nested.z",
-        },
-    )
-
-
-def test_nested_import(build_decl_graph, assert_edges):
-    graph = build_decl_graph(
-        {
-            "x.py": "def a(): import y; y.b()",
-            "y.py": "def b(): pass",
-        }
-    )
-    assert_edges(
-        graph,
-        {
-            "x.a -> x",
-            "x.a -> y",
-            "x.a -> y.b",
-            "y.b -> y",
-        },
-    )
-
-
-def test_relative_import(build_decl_graph, assert_edges):
-    graph = build_decl_graph(
-        {
-            "pkg/__init__.py": "",
-            "pkg/x.py": "def a(): pass",
-            "pkg/y/__init__.py": "",
-            "pkg/y/z.py": "from ..x import a\ndef b(): a()",
-        }
-    )
-    assert_edges(
-        graph,
-        {
-            "pkg.x.a -> pkg.x",
-            "pkg.y.z.a -> pkg.y.z",
-            "pkg.y.z.b -> pkg.y.z",
-            "pkg.y.z.b -> pkg.y.z.a",
-            "pkg.y.z.a -> pkg.x.a",
-        },
-    )
+        assert found_edges == expected_edges

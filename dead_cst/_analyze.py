@@ -1,74 +1,81 @@
-import contextlib
 import re
-import sys
 from pathlib import Path
-from typing import Set
 
 import networkx as nx
 from libcst.metadata import FullRepoManager, FullyQualifiedNameProvider
 
-from ._visitor import safe_resolve_module, SymbolNode, SymbolVisitor
+from ._resolve import resolve_edges, safe_resolve_module, temp_sys_path
+from ._symbols import SymbolNode, SymbolTrie
+from ._visitor import SymbolVisitor
 
 
-@contextlib.contextmanager
-def temp_sys_path(paths: list[Path]):
-    old = list(sys.path)
-    seen = set(old)
-    sys.path = [str(p) for p in paths if str(p) not in seen] + sys.path
-    try:
-        yield
-    finally:
-        sys.path = old
+def order_paths(paths: dict[Path, list[Path]]) -> list[Path]:
+    path_order = nx.DiGraph()
+    for base, search_paths in paths.items():
+        path_order.add_node(base)
+        for sp in search_paths:
+            path_order.add_edge(sp, base)
+    return list(nx.topological_sort(path_order))
 
 
 def build_symbol_graph(paths: dict[Path, list[Path]]) -> nx.DiGraph:
     symbol_graph = nx.DiGraph()
-    import_edges = set()
-    for base, search_paths in paths.items():
+    base_tries = dict()
+    for base in order_paths(paths):
+        search_paths = [base] + paths.get(base, [])
         safe_resolve_module.cache_clear()
         with temp_sys_path(search_paths):
-            paths = list(base.rglob("*.py"))
-            mgr = FullRepoManager(base, paths, {FullyQualifiedNameProvider})
-            for file in paths:
-                # if not str(file).endswith("ml_old/base.py"):
+            base_tries[base] = current_trie = SymbolTrie()
+            import_edges = set()
+            files = list(sorted(base.rglob("*.py")))
+            mgr = FullRepoManager(base, files, {FullyQualifiedNameProvider})
+            for file in files:
+                # if str(file) != "/home/lpetre_midjourney_com/dev/src/github.com/midjourney/image-generation/ml/src/kdj_v7/omini/model.py":
+                #     continue
+                # if str(file) != "/home/lpetre_midjourney_com/dev/src/github.com/midjourney/image-generation/ml/src/kdpt_model.py":
+                #     continue
+                # if "libs/kdj-minimal/v6/nntree/" not in str(file):
                 #     continue
                 print(file)
                 wrapper = mgr.get_metadata_wrapper_for_path(file)
                 visitor = SymbolVisitor(file, search_paths)
                 wrapper.visit(visitor)
-                for decl_node in visitor.decls:
-                    symbol_graph.add_node(decl_node)
+                curr = [visitor.trie]
+                while curr:
+                    node = curr.pop()
+                    if node.module is not None:
+                        symbol_graph.add_node(node.module)
+                        current_trie.add_declaration(node.module)
+                    for decl in node.declarations.values():
+                        symbol_graph.add_node(decl)
+                        symbol_graph.add_edge(decl, node.module)
+                        current_trie.add_declaration(decl)
+                    curr.extend(node.children.values())
+
                 for src, dst in visitor.internal_edges:
                     symbol_graph.add_edge(src, dst)
 
                 # collect all the intra module edges
                 import_edges = import_edges | visitor.import_edges
 
-    # keep __init__.py files alive
-    module_lookup = {n.path: n for n in symbol_graph.nodes if n.type == "module"}
-    for file, sym in module_lookup.items():
-        init_file = file.parent / "__init__.py"
-        init_module = module_lookup.get(init_file)
-        if sym != init_module and init_module is not None:
-            symbol_graph.add_edge(sym, init_module)
+            # add edges to keep __init__.py files alive
+            current_trie.add_module_hierarchy_edges(symbol_graph)
 
-    # now resolve all the import edges
-    edge_lookup = {(n.fqname, n.path): n for n in symbol_graph.nodes}
-    for edge in import_edges:
-        if not isinstance(edge.dst_path, Path):
-            continue
+            # now merge all the lookup tries
+            symbol_lookup = SymbolTrie()
+            for sp in search_paths:
+                symbol_lookup.merge(base_tries[sp])
 
-        if dst := edge_lookup.get((edge.dst_fqname, edge.dst_path)):
-            symbol_graph.add_edge(edge.src, dst)
-        else:
-            print(f"Failed to resolve import edge: {edge}")
+            # resolve all the import edges
+            for src, dst in resolve_edges(import_edges, symbol_lookup):
+                symbol_graph.add_edge(src, dst)
 
     return symbol_graph
 
 
 def find_reachable(
     graph: nx.DiGraph, root: Path, entrypoints: list[Path | re.Pattern]
-) -> Set[SymbolNode]:
+) -> set[SymbolNode]:
     visited = set()
 
     def _is_entrypoint(sym: SymbolNode) -> bool:
