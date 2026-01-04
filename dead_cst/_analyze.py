@@ -1,3 +1,4 @@
+import logging
 import re
 from pathlib import Path
 
@@ -7,6 +8,8 @@ from libcst.metadata import FullRepoManager, FullyQualifiedNameProvider
 from ._resolve import resolve_edges, safe_resolve_module, temp_sys_path
 from ._symbols import SymbolNode, SymbolTrie
 from ._visitor import SymbolVisitor
+
+logger = logging.getLogger(__name__)
 
 
 def order_paths(paths: dict[Path, list[Path]]) -> list[Path]:
@@ -30,13 +33,7 @@ def build_symbol_graph(paths: dict[Path, list[Path]]) -> nx.DiGraph:
             files = list(sorted(base.rglob("*.py")))
             mgr = FullRepoManager(base, files, {FullyQualifiedNameProvider})
             for file in files:
-                # if str(file) != "/home/lpetre_midjourney_com/dev/src/github.com/midjourney/image-generation/ml/src/kdj_v7/omini/model.py":
-                #     continue
-                # if str(file) != "/home/lpetre_midjourney_com/dev/src/github.com/midjourney/image-generation/ml/src/kdpt_model.py":
-                #     continue
-                # if "libs/kdj-minimal/v6/nntree/" not in str(file):
-                #     continue
-                print(file)
+                logger.debug("Processing %s", file)
                 wrapper = mgr.get_metadata_wrapper_for_path(file)
                 visitor = SymbolVisitor(file, search_paths)
                 wrapper.visit(visitor)
@@ -74,7 +71,7 @@ def build_symbol_graph(paths: dict[Path, list[Path]]) -> nx.DiGraph:
 
 
 def find_reachable(
-    graph: nx.DiGraph, root: Path, entrypoints: list[Path | re.Pattern]
+    graph: nx.DiGraph, root: Path, entrypoints: list[str | re.Pattern[str]]
 ) -> set[SymbolNode]:
     visited = set()
 

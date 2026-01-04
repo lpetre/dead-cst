@@ -1,4 +1,5 @@
 import contextlib
+import logging
 import os
 import sys
 from functools import cache
@@ -7,6 +8,8 @@ from pathlib import Path
 from typing import Generator
 
 from ._symbols import Import, SymbolNode, SymbolTrie
+
+logger = logging.getLogger(__name__)
 
 
 @contextlib.contextmanager
@@ -34,8 +37,6 @@ def safe_resolve_module(fullname: str) -> ModuleSpec | None:
                 candidate_paths.append(subdir)
         search_paths = candidate_paths
 
-    # print(fullname, "in [", search_paths, "]")
-    # Final part resolution
     for finder in sys.meta_path:
         find_spec = getattr(finder, "find_spec", None)
         if not find_spec:
@@ -54,15 +55,12 @@ def resolve_edges(
     import_edges: set[tuple[SymbolNode, Import]], symbol_lookup: SymbolTrie
 ) -> Generator[tuple[SymbolNode, SymbolNode], None, None]:
     for src, dst in import_edges:
-        # if dst.module == "v6.nntree" and dst.decl and dst.decl == "Dense.build":
-        #     import pdb; pdb.set_trace()
-
         if not isinstance(dst.path, Path):
             continue
 
         node = symbol_lookup._get(dst.module.split("."))
         if not node:
-            print(f"Failed to resolve import module: {dst.module}")
+            logger.warning("Failed to resolve import module: %s", dst.module)
             continue
 
         # add the edge to the module
@@ -95,9 +93,13 @@ def resolve_edges(
 
                 dest = symbol_lookup._get(decl.imports.module.split("."))
                 if not dest:
-                    print(
-                        f"b Failed to resolve import edge: {dst.module} + {dst.decl} "
-                        f"via {part} in {node.module.fqname} (no {decl.imports.module})"
+                    logger.warning(
+                        "Failed to resolve import edge: %s.%s via %s in %s (no %s)",
+                        dst.module,
+                        dst.decl,
+                        part,
+                        node.module.fqname,
+                        decl.imports.module,
                     )
                     break
 
@@ -114,8 +116,11 @@ def resolve_edges(
                 continue
 
             # Give up: neither a decl nor a submodule
-            print(
-                f"c Failed to resolve import edge: {dst.module} + {dst.decl} "
-                f"via {part} in {node.module.fqname}"
+            logger.warning(
+                "Failed to resolve import edge: %s.%s via %s in %s",
+                dst.module,
+                dst.decl,
+                part,
+                node.module.fqname,
             )
             break

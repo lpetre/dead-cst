@@ -3,14 +3,38 @@ name = "dead-cst"
 version = "0.1.0"
 description = "Python dead code analysis using libcst"
 readme = "README.md"
+license = "MIT"
 authors = [
     { name = "Luke Petre", email = "lpetre@gmail.com" }
 ]
 requires-python = ">=3.11"
+keywords = ["dead-code", "static-analysis", "libcst", "linter", "code-quality"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Quality Assurance",
+    "Typing :: Typed",
+]
 dependencies = [
+    "click>=8.0",
     "libcst>=1.8.2",
     "networkx>=3.5",
 ]
+
+[project.urls]
+Homepage = "https://github.com/lpetre/dead-cst"
+Repository = "https://github.com/lpetre/dead-cst"
+Issues = "https://github.com/lpetre/dead-cst/issues"
+
+[project.scripts]
+dead-cst = "dead_cst.cli:main"
 
 [build-system]
 requires = ["hatchling"]
