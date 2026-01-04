@@ -2,16 +2,26 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import sys
+from enum import Enum
 from pathlib import Path
+from typing import Annotated, Optional
 
-import click
 import networkx as nx
+import typer
 
 from . import build_symbol_graph, count_nodes, find_reachable, order_paths, remove_code
 from ._symbols import SymbolNode
+
+app = typer.Typer(help="Dead code analysis for Python using libcst.")
+
+
+class OutputFormat(str, Enum):
+    text = "text"
+    json = "json"
 
 
 def setup_logging(verbose: bool) -> None:
@@ -24,7 +34,7 @@ def setup_logging(verbose: bool) -> None:
     )
 
 
-def parse_entrypoint(ep: str) -> str | re.Pattern:
+def parse_entrypoint(ep: str) -> str | re.Pattern[str]:
     """Parse an entrypoint string, converting regex patterns."""
     if ep.startswith("re:"):
         return re.compile(ep[3:])
@@ -52,67 +62,61 @@ def parse_paths(root: Path, paths_str: list[str]) -> dict[Path, list[Path]]:
     return result
 
 
-@click.group()
-@click.version_option()
-def main() -> None:
+def version_callback(value: bool) -> None:
+    if value:
+        from importlib.metadata import version
+
+        typer.echo(f"dead-cst {version('dead-cst')}")
+        raise typer.Exit()
+
+
+@app.callback()
+def main(
+    version: Annotated[
+        Optional[bool],
+        typer.Option("--version", callback=version_callback, is_eager=True, help="Show version."),
+    ] = None,
+) -> None:
     """Dead code analysis for Python using libcst."""
     pass
 
 
-@main.command()
-@click.argument("root", type=click.Path(exists=True, file_okay=False, path_type=Path))
-@click.option(
-    "-p",
-    "--path",
-    "paths",
-    multiple=True,
-    help="Search path spec: 'base:dep1,dep2' or 'base'. Can be repeated.",
-)
-@click.option(
-    "-e",
-    "--entrypoint",
-    "entrypoints",
-    multiple=True,
-    required=True,
-    help="Entrypoint: file path, FQN, or 're:pattern' for regex. Can be repeated.",
-)
-@click.option(
-    "--preserve-dunder-all/--no-preserve-dunder-all",
-    default=True,
-    help="Keep __all__ variables alive.",
-)
-@click.option("-v", "--verbose", is_flag=True, help="Enable verbose output.")
-@click.option(
-    "--format",
-    "output_format",
-    type=click.Choice(["text", "json"]),
-    default="text",
-    help="Output format.",
-)
+@app.command()
 def analyze(
-    root: Path,
-    paths: tuple[str, ...],
-    entrypoints: tuple[str, ...],
-    preserve_dunder_all: bool,
-    verbose: bool,
-    output_format: str,
+    root: Annotated[Path, typer.Argument(help="Root directory to analyze.")],
+    entrypoint: Annotated[
+        list[str],
+        typer.Option(
+            "-e",
+            "--entrypoint",
+            help="Entrypoint: file path, FQN, or 're:pattern' for regex.",
+        ),
+    ],
+    path: Annotated[
+        Optional[list[str]],
+        typer.Option("-p", "--path", help="Search path spec: 'base:dep1,dep2' or 'base'."),
+    ] = None,
+    preserve_dunder_all: Annotated[
+        bool, typer.Option(help="Keep __all__ variables alive.")
+    ] = True,
+    verbose: Annotated[bool, typer.Option("-v", "--verbose", help="Enable verbose output.")] = False,
+    output_format: Annotated[
+        OutputFormat, typer.Option("--format", help="Output format.")
+    ] = OutputFormat.text,
 ) -> None:
-    """Analyze a Python codebase for dead code.
-
-    ROOT is the root directory to analyze.
-    """
+    """Analyze a Python codebase for dead code."""
     setup_logging(verbose)
     root = root.resolve()
 
     # Parse paths
-    paths_dict = parse_paths(root, list(paths))
+    paths_dict = parse_paths(root, path or [])
 
     # Build graph
-    click.echo(f"Building symbol graph for {root}...", err=True)
+    typer.echo(f"Building symbol graph for {root}...", err=True)
     graph = build_symbol_graph(paths_dict)
 
     # Parse entrypoints
-    eps = [parse_entrypoint(ep) for ep in entrypoints]
+    eps = [parse_entrypoint(ep) for ep in entrypoint]
 
     # Find reachable nodes
     reachable = find_reachable(graph, root, eps)
@@ -127,14 +131,14 @@ def analyze(
     unreachable_graph = graph.subgraph([n for n in graph.nodes if n not in reachable])
 
     # Output results
-    if output_format == "json":
+    if output_format == OutputFormat.json:
         _output_json(graph, unreachable_graph, root, paths_dict)
     else:
         _output_text(graph, unreachable_graph, root, paths_dict)
 
     # Exit with error code if dead code found
     if unreachable_graph.number_of_nodes() > 0:
-        sys.exit(1)
+        raise typer.Exit(1)
 
 
 def _output_text(
@@ -145,27 +149,27 @@ def _output_text(
 ) -> None:
     """Output results in text format."""
     for base in order_paths(paths_dict):
-        click.echo(f"\n{base}:")
+        typer.echo(f"\n{base}:")
         total_counts = count_nodes(graph, base)
         unreachable_counts = count_nodes(unreachable, base)
         for kind in sorted(total_counts):
             total = total_counts[kind]
             dead = unreachable_counts.get(kind, 0)
             if dead > 0:
-                click.echo(f"  {kind}: {total} total, {dead} dead")
+                typer.echo(f"  {kind}: {total} total, {dead} dead")
             else:
-                click.echo(f"  {kind}: {total} total")
+                typer.echo(f"  {kind}: {total} total")
 
     # List dead symbols
     dead_count = unreachable.number_of_nodes()
     if dead_count > 0:
-        click.echo(f"\nDead symbols ({dead_count}):")
+        typer.echo(f"\nDead symbols ({dead_count}):")
         for node in sorted(unreachable.nodes, key=lambda n: (str(n.path), n.fqname)):
             try:
                 rel_path = node.path.relative_to(root)
             except ValueError:
                 rel_path = node.path
-            click.echo(f"  {node.fqname} ({node.type}) at {rel_path}")
+            typer.echo(f"  {node.fqname} ({node.type}) at {rel_path}")
 
 
 def _output_json(
@@ -175,9 +179,7 @@ def _output_json(
     paths_dict: dict[Path, list[Path]],
 ) -> None:
     """Output results in JSON format."""
-    import json
-
-    result = {
+    result: dict = {
         "summary": {},
         "dead_symbols": [],
     }
@@ -204,39 +206,28 @@ def _output_json(
             }
         )
 
-    click.echo(json.dumps(result, indent=2))
+    typer.echo(json.dumps(result, indent=2))
 
 
-@main.command("why-alive")
-@click.argument("root", type=click.Path(exists=True, file_okay=False, path_type=Path))
-@click.argument("fqname")
-@click.option(
-    "-p",
-    "--path",
-    "paths",
-    multiple=True,
-    help="Search path spec: 'base:dep1,dep2' or 'base'. Can be repeated.",
-)
-@click.option("-v", "--verbose", is_flag=True, help="Enable verbose output.")
+@app.command("why-alive")
 def why_alive(
-    root: Path,
-    fqname: str,
-    paths: tuple[str, ...],
-    verbose: bool,
+    root: Annotated[Path, typer.Argument(help="Root directory to analyze.")],
+    fqname: Annotated[str, typer.Argument(help="Fully qualified name of the symbol to check.")],
+    path: Annotated[
+        Optional[list[str]],
+        typer.Option("-p", "--path", help="Search path spec: 'base:dep1,dep2' or 'base'."),
+    ] = None,
+    verbose: Annotated[bool, typer.Option("-v", "--verbose", help="Enable verbose output.")] = False,
 ) -> None:
-    """Show why a symbol is considered alive (reachable).
-
-    ROOT is the root directory to analyze.
-    FQNAME is the fully qualified name of the symbol to check.
-    """
+    """Show why a symbol is considered alive (reachable)."""
     setup_logging(verbose)
     root = root.resolve()
 
     # Parse paths
-    paths_dict = parse_paths(root, list(paths))
+    paths_dict = parse_paths(root, path or [])
 
     # Build graph
-    click.echo(f"Building symbol graph for {root}...", err=True)
+    typer.echo(f"Building symbol graph for {root}...", err=True)
     graph = build_symbol_graph(paths_dict)
 
     # Find the node
@@ -247,18 +238,18 @@ def why_alive(
             break
 
     if target_node is None:
-        click.echo(f"Symbol not found: {fqname}", err=True)
-        sys.exit(1)
+        typer.echo(f"Symbol not found: {fqname}", err=True)
+        raise typer.Exit(1)
 
     try:
         rel_path = target_node.path.relative_to(root)
     except ValueError:
         rel_path = target_node.path
 
-    click.echo(f"\nSymbol: {target_node.fqname} ({target_node.type})")
-    click.echo(f"Path: {rel_path}")
-    click.echo(f"In-degree: {graph.in_degree(target_node)}")
-    click.echo("\nPredecessor chain:")
+    typer.echo(f"\nSymbol: {target_node.fqname} ({target_node.type})")
+    typer.echo(f"Path: {rel_path}")
+    typer.echo(f"In-degree: {graph.in_degree(target_node)}")
+    typer.echo("\nPredecessor chain:")
 
     # Walk predecessors
     seen: set[SymbolNode] = set()
@@ -272,58 +263,46 @@ def why_alive(
             node_rel = node.path.relative_to(root)
         except ValueError:
             node_rel = node.path
-        click.echo(f"  <- {node.fqname} ({node.type}) at {node_rel}")
+        typer.echo(f"  <- {node.fqname} ({node.type}) at {node_rel}")
         stack.extend(graph.predecessors(node))
 
 
-@main.command()
-@click.argument("root", type=click.Path(exists=True, file_okay=False, path_type=Path))
-@click.option(
-    "-p",
-    "--path",
-    "paths",
-    multiple=True,
-    help="Search path spec: 'base:dep1,dep2' or 'base'. Can be repeated.",
-)
-@click.option(
-    "-e",
-    "--entrypoint",
-    "entrypoints",
-    multiple=True,
-    required=True,
-    help="Entrypoint: file path, FQN, or 're:pattern' for regex. Can be repeated.",
-)
-@click.option(
-    "--preserve-dunder-all/--no-preserve-dunder-all",
-    default=True,
-    help="Keep __all__ variables alive.",
-)
-@click.option("-v", "--verbose", is_flag=True, help="Enable verbose output.")
-@click.option("--dry-run", is_flag=True, help="Show what would be removed without making changes.")
+@app.command()
 def remove(
-    root: Path,
-    paths: tuple[str, ...],
-    entrypoints: tuple[str, ...],
-    preserve_dunder_all: bool,
-    verbose: bool,
-    dry_run: bool,
+    root: Annotated[Path, typer.Argument(help="Root directory to analyze.")],
+    entrypoint: Annotated[
+        list[str],
+        typer.Option(
+            "-e",
+            "--entrypoint",
+            help="Entrypoint: file path, FQN, or 're:pattern' for regex.",
+        ),
+    ],
+    path: Annotated[
+        Optional[list[str]],
+        typer.Option("-p", "--path", help="Search path spec: 'base:dep1,dep2' or 'base'."),
+    ] = None,
+    preserve_dunder_all: Annotated[
+        bool, typer.Option(help="Keep __all__ variables alive.")
+    ] = True,
+    verbose: Annotated[bool, typer.Option("-v", "--verbose", help="Enable verbose output.")] = False,
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Show what would be removed without making changes.")
+    ] = False,
 ) -> None:
-    """Remove dead code from a Python codebase.
-
-    ROOT is the root directory to analyze.
-    """
+    """Remove dead code from a Python codebase."""
     setup_logging(verbose)
     root = root.resolve()
 
     # Parse paths
-    paths_dict = parse_paths(root, list(paths))
+    paths_dict = parse_paths(root, path or [])
 
     # Build graph
-    click.echo(f"Building symbol graph for {root}...", err=True)
+    typer.echo(f"Building symbol graph for {root}...", err=True)
     graph = build_symbol_graph(paths_dict)
 
     # Parse entrypoints
-    eps = [parse_entrypoint(ep) for ep in entrypoints]
+    eps = [parse_entrypoint(ep) for ep in entrypoint]
 
     # Find reachable nodes
     reachable = find_reachable(graph, root, eps)
@@ -338,33 +317,38 @@ def remove(
     unreachable_graph = graph.subgraph([n for n in graph.nodes if n not in reachable])
 
     if unreachable_graph.number_of_nodes() == 0:
-        click.echo("No dead code found.")
+        typer.echo("No dead code found.")
         return
 
     # Show what would be removed
-    click.echo(f"\nDead symbols to remove ({unreachable_graph.number_of_nodes()}):")
+    typer.echo(f"\nDead symbols to remove ({unreachable_graph.number_of_nodes()}):")
     for node in sorted(unreachable_graph.nodes, key=lambda n: (str(n.path), n.fqname)):
         try:
             rel_path = node.path.relative_to(root)
         except ValueError:
             rel_path = node.path
-        click.echo(f"  {node.fqname} ({node.type}) at {rel_path}")
+        typer.echo(f"  {node.fqname} ({node.type}) at {rel_path}")
 
     if dry_run:
-        click.echo("\n--dry-run specified, no changes made.")
+        typer.echo("\n--dry-run specified, no changes made.")
         return
 
     # Confirm before removing
-    if not click.confirm("\nProceed with removal?"):
-        click.echo("Aborted.")
+    if not typer.confirm("\nProceed with removal?"):
+        typer.echo("Aborted.")
         return
 
     # Remove dead code
     for base in order_paths(paths_dict):
         remove_code(unreachable_graph, base)
 
-    click.echo("Dead code removed.")
+    typer.echo("Dead code removed.")
+
+
+def main_cli() -> None:
+    """Entry point for the CLI."""
+    app()
 
 
 if __name__ == "__main__":
-    main()
+    main_cli()
