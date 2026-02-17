@@ -51,11 +51,9 @@ class SymbolTrie:
                 # Store declarations by their simple name
                 parent, child = parts[:-1], parts[-1]
                 node = self._touch(parent)
-                assert (
-                    node.module is not None
-                ), f"Module should exist when adding {decl.type} {decl.fqname}"
-                # if child in node.declarations:
-                #     assert node.declarations[child] == decl, "Declaration already exists with different value"
+                assert node.module is not None, (
+                    f"Module should exist when adding {decl.type} {decl.fqname}"
+                )
                 node.declarations[child] = decl
 
     def merge(self, other: SymbolTrie) -> SymbolTrie:

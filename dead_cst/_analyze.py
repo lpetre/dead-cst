@@ -1,3 +1,4 @@
+import logging
 import re
 from pathlib import Path
 
@@ -7,6 +8,8 @@ from libcst.metadata import FullRepoManager, FullyQualifiedNameProvider
 from ._resolve import resolve_edges, safe_resolve_module, temp_sys_path
 from ._symbols import SymbolNode, SymbolTrie
 from ._visitor import SymbolVisitor
+
+logger = logging.getLogger(__name__)
 
 
 def order_paths(paths: dict[Path, list[Path]]) -> list[Path]:
@@ -22,7 +25,7 @@ def build_symbol_graph(paths: dict[Path, list[Path]]) -> nx.DiGraph:
     symbol_graph = nx.DiGraph()
     base_tries = dict()
     for base in order_paths(paths):
-        print("Processing base path:", base)
+        logger.debug("Processing base path: %s", base)
         search_paths = [base] + paths.get(base, [])
         safe_resolve_module.cache_clear()
         with temp_sys_path(search_paths):
@@ -68,7 +71,7 @@ def build_symbol_graph(paths: dict[Path, list[Path]]) -> nx.DiGraph:
 
 
 def find_reachable(
-    graph: nx.DiGraph, root: Path, entrypoints: list[Path | re.Pattern]
+    graph: nx.DiGraph, root: Path, entrypoints: list[str | Path | re.Pattern]
 ) -> set[SymbolNode]:
     visited = set()
 

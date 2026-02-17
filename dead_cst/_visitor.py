@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from functools import cache
 from importlib.util import resolve_name
 from pathlib import Path
@@ -11,6 +12,8 @@ from libcst.metadata import FullyQualifiedNameProvider, ParentNodeProvider, Scop
 
 from ._resolve import resolve_import
 from ._symbols import Import, SymbolNode, SymbolTrie
+
+logger = logging.getLogger(__name__)
 
 
 def _dotted_name_parts(
@@ -121,7 +124,6 @@ class SymbolVisitor(cst.CSTVisitor):
         for value in reversed(values):
             if syms := value_to_syms.get(value):
                 for sym in syms:
-                    # print("Target", sym.fqname, "for value", value)
                     self._push_decl(value, sym)
 
     def _add_import(self, from_prefix: str, node: cst.Import | cst.ImportFrom) -> None:
@@ -142,7 +144,7 @@ class SymbolVisitor(cst.CSTVisitor):
 
             if not module_path:
                 code = cst.Module([]).code_for_node(alias)
-                print(f"Failed to resolve cst.Import: '{code}' in {self.path}")
+                logger.warning("Failed to resolve cst.Import: '%s' in %s", code, self.path)
                 continue
 
             # if there is an asname, that is the decl being added
@@ -224,7 +226,6 @@ class SymbolVisitor(cst.CSTVisitor):
         self.nearest_decl[original_node] = self.decl_stack[-1]
         for decl in reversed(self.node_to_symbols.get(original_node, [])):
             last = self.decl_stack.pop()
-            # print("<-", last.fqname)
             assert last == decl, f"Expected {last} to match {decl} on leave of {original_node}"
 
         # only run once for the Module node
@@ -248,7 +249,7 @@ class SymbolVisitor(cst.CSTVisitor):
                 original_import = self.import_lookup.get(referent.as_name)
                 if not original_import:
                     code = cst.Module([]).code_for_node(referent.as_name)
-                    print(f"Failed to resolve import access: '{code}' in {self.path}")
+                    logger.warning("Failed to resolve import access: '%s' in %s", code, self.path)
 
                 else:
                     accessed_attrs = [] if not original_import.decl else [original_import.decl]
@@ -269,9 +270,6 @@ class SymbolVisitor(cst.CSTVisitor):
                         decl=".".join(accessed_attrs) if accessed_attrs else None,
                     )
 
-                    # if str(self.path) == "/home/lpetre_midjourney_com/dev/src/github.com/midjourney/image-generation/libs/kdj-minimal/v6/prior/model.py" and referent.as_name.value == "nnx":
-                    #     print(f"Original import: {original_import}")
-                    #     print(f"Resolved import: {resolved_import}")
                     self.import_edges.add((owner_symbol, resolved_import))
 
             target_symbols = self.node_to_symbols.get(target_node)
@@ -281,8 +279,8 @@ class SymbolVisitor(cst.CSTVisitor):
                     target_symbols = {target_symbol}
 
             if not target_symbols:
-                print(
-                    "Missing target symbol for referent",
+                logger.debug(
+                    "Missing target symbol for referent %s %s %s",
                     referent,
                     referent.node,
                     target_node,

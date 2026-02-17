@@ -1,4 +1,5 @@
 import contextlib
+import logging
 import os
 import sys
 import sysconfig
@@ -8,6 +9,8 @@ from pathlib import Path
 from typing import Generator
 
 from ._symbols import Import, SymbolNode, SymbolTrie
+
+logger = logging.getLogger(__name__)
 
 STDLIB = Path(sysconfig.get_path("stdlib")).resolve()
 SITE_PACKAGES_MARKERS = ("site-packages", "dist-packages")
@@ -38,7 +41,6 @@ def safe_resolve_module(fullname: str) -> ModuleSpec | None:
                 candidate_paths.append(subdir)
         search_paths = candidate_paths
 
-    # print(fullname, "in [", search_paths, "]")
     # Final part resolution
     for finder in sys.meta_path:
         find_spec = getattr(finder, "find_spec", None)
@@ -105,7 +107,7 @@ def resolve_edges(
 
         node = symbol_lookup._get(dst.module.split("."))
         if not node:
-            print(f"Failed to resolve import module: {dst.module}")
+            logger.warning("Failed to resolve import module: %s", dst.module)
             continue
 
         # add the edge to the module
@@ -140,9 +142,13 @@ def resolve_edges(
 
                 dest = symbol_lookup._get(decl.imports.module.split("."))
                 if not dest:
-                    print(
-                        f"b Failed to resolve import edge: {dst.module} + {dst.decl} "
-                        f"via {part} in {node.module.fqname} (no {decl.imports.module})"
+                    logger.warning(
+                        "Failed to resolve import edge: %s + %s via %s in %s (no %s)",
+                        dst.module,
+                        dst.decl,
+                        part,
+                        node.module.fqname,
+                        decl.imports.module,
                     )
                     break
 
@@ -159,11 +165,14 @@ def resolve_edges(
                 continue
 
             # Give up: neither a decl nor a submodule
-            print(
-                f"c Failed to resolve import edge: {dst.module} + {dst.decl} "
-                f"via {part} in {node.module.fqname}"
+            logger.warning(
+                "Failed to resolve import edge: %s + %s via %s in %s",
+                dst.module,
+                dst.decl,
+                part,
+                node.module.fqname,
             )
             break
 
     for mod in sorted(third_party):
-        print(mod)
+        logger.debug(mod)
