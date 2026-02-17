@@ -1,6 +1,6 @@
 [project]
 name = "dead-cst"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Python dead code analysis using libcst"
 readme = "README.md"
 license = "MIT"
@@ -34,8 +34,14 @@ Issues = "https://github.com/lpetre/dead-cst/issues"
 dead-cst = "dead_cst.cli:main_cli"
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.build.hooks.vcs]
+version-file = "dead_cst/_version.py"
 
 [dependency-groups]
 dev = [
