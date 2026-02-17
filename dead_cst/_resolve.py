@@ -1,12 +1,16 @@
 import contextlib
 import os
 import sys
+import sysconfig
 from functools import cache
 from importlib.machinery import ModuleSpec
 from pathlib import Path
 from typing import Generator
 
 from ._symbols import Import, SymbolNode, SymbolTrie
+
+STDLIB = Path(sysconfig.get_path("stdlib")).resolve()
+SITE_PACKAGES_MARKERS = ("site-packages", "dist-packages")
 
 
 @contextlib.contextmanager
@@ -50,14 +54,53 @@ def safe_resolve_module(fullname: str) -> ModuleSpec | None:
     return None
 
 
+@cache
+def distribution_lookup() -> dict[Path, str]:
+    from importlib import metadata
+
+    lookup = {}
+    for dist in metadata.distributions():
+        for file in dist.files:
+            abs_path = Path(dist.locate_file(file)).resolve()
+            lookup[abs_path] = dist.metadata["Name"]
+    return lookup
+
+
+def resolve_import(name: str, search_paths: list[Path]) -> str | Path:
+    spec = safe_resolve_module(name)
+    if spec is None:
+        return None
+    if spec.origin is None:
+        return None
+    if spec.origin in {"built-in", "frozen"}:
+        return f"[stdlib] {name}"
+    path = Path(spec.origin).resolve()
+    if path.is_relative_to(STDLIB):
+        return f"[stdlib] {name}"
+
+    lookup = distribution_lookup()
+    if dist := lookup.get(path):
+        return f"[external dist] {dist}"
+
+    path_str = str(path)
+    if any(m in path_str for m in SITE_PACKAGES_MARKERS):
+        return f"[external file] {name}"
+
+    for search in search_paths:
+        if path.is_relative_to(search):
+            return path
+    raise Exception(f"Module {name} resolved to an unexpected path: {path}")
+
+
 def resolve_edges(
     import_edges: set[tuple[SymbolNode, Import]], symbol_lookup: SymbolTrie
 ) -> Generator[tuple[SymbolNode, SymbolNode], None, None]:
-    for src, dst in import_edges:
-        # if dst.module == "v6.nntree" and dst.decl and dst.decl == "Dense.build":
-        #     import pdb; pdb.set_trace()
+    third_party = set()
 
+    for src, dst in import_edges:
         if not isinstance(dst.path, Path):
+            if "external" in dst.path:
+                third_party.add(dst.path)
             continue
 
         node = symbol_lookup._get(dst.module.split("."))
@@ -91,6 +134,8 @@ def resolve_edges(
                 assert decl.imports is not None, "import symbol needs Import"
 
                 if not isinstance(decl.imports.path, Path):
+                    if "external" in decl.imports.path:
+                        third_party.add(decl.imports.path)
                     break
 
                 dest = symbol_lookup._get(decl.imports.module.split("."))
@@ -119,3 +164,6 @@ def resolve_edges(
                 f"via {part} in {node.module.fqname}"
             )
             break
+
+    for mod in sorted(third_party):
+        print(mod)

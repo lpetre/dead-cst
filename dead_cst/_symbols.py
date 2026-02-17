@@ -45,7 +45,7 @@ class SymbolTrie:
         match decl.type:
             case "module":
                 node = self._touch(parts)
-                assert node.module is None, "Module already exists at this node"
+                assert node.module is None, f"Module already exists at this node {decl.path}"
                 node.module = decl
             case _:
                 # Store declarations by their simple name

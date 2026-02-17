@@ -22,6 +22,7 @@ def build_symbol_graph(paths: dict[Path, list[Path]]) -> nx.DiGraph:
     symbol_graph = nx.DiGraph()
     base_tries = dict()
     for base in order_paths(paths):
+        print("Processing base path:", base)
         search_paths = [base] + paths.get(base, [])
         safe_resolve_module.cache_clear()
         with temp_sys_path(search_paths):
@@ -30,13 +31,6 @@ def build_symbol_graph(paths: dict[Path, list[Path]]) -> nx.DiGraph:
             files = list(sorted(base.rglob("*.py")))
             mgr = FullRepoManager(base, files, {FullyQualifiedNameProvider})
             for file in files:
-                # if str(file) != "/home/lpetre_midjourney_com/dev/src/github.com/midjourney/image-generation/ml/src/kdj_v7/omini/model.py":
-                #     continue
-                # if str(file) != "/home/lpetre_midjourney_com/dev/src/github.com/midjourney/image-generation/ml/src/kdpt_model.py":
-                #     continue
-                # if "libs/kdj-minimal/v6/nntree/" not in str(file):
-                #     continue
-                print(file)
                 wrapper = mgr.get_metadata_wrapper_for_path(file)
                 visitor = SymbolVisitor(file, search_paths)
                 wrapper.visit(visitor)

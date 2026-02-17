@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import sysconfig
 from functools import cache
 from importlib.util import resolve_name
 from pathlib import Path
@@ -10,11 +9,8 @@ import libcst as cst
 from libcst.helpers import get_full_name_for_node
 from libcst.metadata import FullyQualifiedNameProvider, ParentNodeProvider, ScopeProvider
 
-from ._resolve import safe_resolve_module
+from ._resolve import resolve_import
 from ._symbols import Import, SymbolNode, SymbolTrie
-
-SITE_PACKAGES = Path(sysconfig.get_path("purelib")).resolve()
-STDLIB = Path(sysconfig.get_path("stdlib")).resolve()
 
 
 def _dotted_name_parts(
@@ -56,31 +52,14 @@ class SymbolVisitor(cst.CSTVisitor):
             raise ValueError("Module node has not been set yet.")
         return self.decl_stack[0]
 
+    @cache
+    def resolve_import(self, name: str) -> str | Path:
+        return resolve_import(name, self.search_paths)
+
     def _push_decl(self, node: cst.CSTNode, decl: SymbolNode):
         self.node_to_symbols.setdefault(node, []).append(decl)
         self.decl_stack.append(decl)
         self.trie.add_declaration(decl)
-
-    @cache
-    def resolve_import(self, name: str) -> str | Path:
-        spec = safe_resolve_module(name)
-        if spec is None:
-            return None
-        if spec.origin is None:
-            return None
-        if spec.origin in {"built-in", "frozen"}:
-            return f"[stdlib] {name}"
-        path = Path(spec.origin).resolve()
-        if path.is_relative_to(STDLIB):
-            return f"[stdlib] {name}"
-        if path.is_relative_to(SITE_PACKAGES):
-            return f"[external] {name}"
-        for search in self.search_paths:
-            if path.is_relative_to(search):
-                return path
-        raise Exception(
-            f"Module {name} resolved to an unexpected path: {path} (not in {self.base})"
-        )
 
     def _add_decl(
         self,
