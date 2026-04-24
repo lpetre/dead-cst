@@ -436,16 +436,6 @@ import pytest
         pytest.param(
             """
             a = 1
-            a = a + 1
-            """,
-            {
-                "mod.a -> mod",
-            },
-            id="self-reference-drops-self-edge",
-        ),
-        pytest.param(
-            """
-            a = 1
             b = 1
             a += b
             """,
@@ -601,11 +591,288 @@ import pytest
             },
             id="closure-reference-folds-into-outer-decl",
         ),
+        # ------------------------------------------------------------------
+        # Local shadowing of module-level names does not create an edge
+        # ------------------------------------------------------------------
+        pytest.param(
+            """
+            X = 1
+            def f():
+                X = 2
+                return X
+            """,
+            {
+                "mod.X -> mod",
+                "mod.f -> mod",
+            },
+            id="local-var-shadows-module-var",
+        ),
+        pytest.param(
+            """
+            X = 1
+            def f(X): return X
+            """,
+            {
+                "mod.X -> mod",
+                "mod.f -> mod",
+            },
+            id="parameter-shadows-module-var",
+        ),
+        pytest.param(
+            """
+            X = 1
+            def f():
+                for X in [1, 2]:
+                    pass
+            """,
+            {
+                "mod.X -> mod",
+                "mod.f -> mod",
+            },
+            id="for-loop-target-shadows-module-var",
+        ),
+        pytest.param(
+            """
+            E = 1
+            def f():
+                try: pass
+                except Exception as E: pass
+            """,
+            {
+                "mod.E -> mod",
+                "mod.f -> mod",
+            },
+            id="except-as-shadows-module-var",
+        ),
+        pytest.param(
+            """
+            X = 1
+            def f():
+                with open('a') as X:
+                    pass
+            """,
+            {
+                "mod.X -> mod",
+                "mod.f -> mod",
+            },
+            id="with-as-shadows-module-var",
+        ),
+        pytest.param(
+            """
+            def helper(): pass
+            def outer():
+                def helper(): pass
+                helper()
+            """,
+            {
+                "mod.helper -> mod",
+                "mod.outer -> mod",
+            },
+            id="nested-function-shadows-outer-name",
+        ),
+        pytest.param(
+            """
+            X = 1
+            class C:
+                X = 2
+                def m(self): return C.X
+            """,
+            {
+                "mod.C -> mod",
+                "mod.X -> mod",
+            },
+            id="class-attribute-shadows-module-var",
+        ),
+        pytest.param(
+            """
+            X = 1
+            class C:
+                def m(self):
+                    X = 2
+                    return X
+            """,
+            {
+                "mod.C -> mod",
+                "mod.X -> mod",
+            },
+            id="method-local-shadows-module-var",
+        ),
+        pytest.param(
+            """
+            X = [1, 2]
+            def f():
+                return [X for X in X]
+            """,
+            # Python evaluates the outermost iterable of a comprehension
+            # in the enclosing scope, so the ``X`` in ``for X in X``
+            # still resolves to the module-level ``X``. The comprehension
+            # target then shadows it for the element expression.
+            {
+                "mod.X -> mod",
+                "mod.f -> mod",
+                "mod.f -> mod.X",
+            },
+            id="comprehension-iterable-uses-enclosing-scope",
+        ),
     ],
 )
 def test_declarations(build_decl_graph, assert_edges, src, expected_edges):
     graph = build_decl_graph({"mod.py": src})
     assert_edges(graph, expected_edges)
+
+
+@pytest.mark.parametrize(
+    "src, expected_edges",
+    [
+        # ------------------------------------------------------------------
+        # Same-kind redeclaration creates one node per textual decl.
+        # The fqname-only edge view collapses these cases; here we assert
+        # the per-position structure directly.
+        # ------------------------------------------------------------------
+        pytest.param(
+            """
+            a = 1
+            a = a + 1
+            """,
+            # Two distinct ``mod.a`` variable nodes at different
+            # positions. The second assignment's RHS genuinely references
+            # the first binding -- no cycle in the underlying graph.
+            # Only the last decl (trie survivor) gets a parent edge.
+            {
+                "mod.a@2:0 -> mod",
+                "mod.a@2:0 -> mod.a@1:0",
+            },
+            id="reassignment-creates-two-nodes",
+        ),
+        pytest.param(
+            """
+            def f(): pass
+            def f(): pass
+            f()
+            """,
+            # Two function nodes; ``f()`` resolves to both referents so
+            # both get kept alive. Only the last has a parent edge.
+            {
+                "mod -> mod.f@1:0",
+                "mod -> mod.f@2:0",
+                "mod.f@2:0 -> mod",
+            },
+            id="function-redefined-creates-two-nodes",
+        ),
+        pytest.param(
+            """
+            class C: pass
+            class C: pass
+            C()
+            """,
+            {
+                "mod -> mod.C@1:0",
+                "mod -> mod.C@2:0",
+                "mod.C@2:0 -> mod",
+            },
+            id="class-redefined-creates-two-nodes",
+        ),
+        pytest.param(
+            """
+            def a(): pass
+            def f(): pass
+            def f(): a()
+            f()
+            """,
+            # The second ``def f`` references ``a`` from its body. That
+            # edge lives on the ``mod.f@3:0`` node only.
+            {
+                "mod -> mod.f@2:0",
+                "mod -> mod.f@3:0",
+                "mod.a@1:0 -> mod",
+                "mod.f@3:0 -> mod",
+                "mod.f@3:0 -> mod.a@1:0",
+            },
+            id="function-redefined-second-body-has-own-edges",
+        ),
+        pytest.param(
+            """
+            def dec(f): return f
+            def f(): pass
+            @dec
+            def f(): pass
+            f()
+            """,
+            # Decorator edge lives on the decorated (second) decl only.
+            {
+                "mod -> mod.f@2:0",
+                "mod -> mod.f@4:0",
+                "mod.dec@1:0 -> mod",
+                "mod.f@4:0 -> mod",
+                "mod.f@4:0 -> mod.dec@1:0",
+            },
+            id="function-redefined-with-decorator-on-second-copy",
+        ),
+        pytest.param(
+            """
+            def f(): pass
+            def g(): pass
+            if True: f = g
+            f()
+            """,
+            # ``f = g`` creates a second ``mod.f`` variable node at
+            # column 9 (after ``if True: ``). The alias edge lives on
+            # that node.
+            {
+                "mod -> mod.f@1:0",
+                "mod -> mod.f@3:9",
+                "mod.f@3:9 -> mod",
+                "mod.f@3:9 -> mod.g@2:0",
+                "mod.g@2:0 -> mod",
+            },
+            id="conditional-rebind-to-alias",
+        ),
+        pytest.param(
+            """
+            def a(): pass
+            def b(): pass
+            if True:
+                def f(): a()
+            else:
+                def f(): b()
+            f()
+            """,
+            # Each branch's ``def f`` is its own node with its own body
+            # edge. ``f()`` resolves to both.
+            {
+                "mod -> mod.f@4:4",
+                "mod -> mod.f@6:4",
+                "mod.a@1:0 -> mod",
+                "mod.b@2:0 -> mod",
+                "mod.f@4:4 -> mod.a@1:0",
+                "mod.f@6:4 -> mod",
+                "mod.f@6:4 -> mod.b@2:0",
+            },
+            id="if-else-function-redefinition",
+        ),
+        pytest.param(
+            """
+            def f(): return 1
+            def g(): return 2
+            try:
+                x = f()
+            except Exception:
+                x = g()
+            """,
+            {
+                "mod.f@1:0 -> mod",
+                "mod.g@2:0 -> mod",
+                "mod.x@4:4 -> mod.f@1:0",
+                "mod.x@6:4 -> mod",
+                "mod.x@6:4 -> mod.g@2:0",
+            },
+            id="try-except-assignment-creates-two-x-nodes",
+        ),
+    ],
+)
+def test_redeclarations(build_decl_graph, assert_positional_edges, src, expected_edges):
+    graph = build_decl_graph({"mod.py": src})
+    assert_positional_edges(graph, expected_edges)
 
 
 def test_module_hierarchy_edges(build_decl_graph, assert_edges):

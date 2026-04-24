@@ -8,7 +8,12 @@ from typing import Generator, Literal
 
 import libcst as cst
 from libcst.helpers import get_full_name_for_node
-from libcst.metadata import FullyQualifiedNameProvider, ParentNodeProvider, ScopeProvider
+from libcst.metadata import (
+    FullyQualifiedNameProvider,
+    ParentNodeProvider,
+    PositionProvider,
+    ScopeProvider,
+)
 
 from ._resolve import resolve_import
 from ._symbols import Import, SymbolNode, SymbolTrie
@@ -59,7 +64,11 @@ class SymbolVisitor(cst.CSTVisitor):
         FullyQualifiedNameProvider,
         ScopeProvider,
         ParentNodeProvider,
+        PositionProvider,
     )
+
+    def _pos(self, node: cst.CSTNode):
+        return self.get_metadata(PositionProvider, node, default=None)
 
     def __init__(self, path: Path, search_paths: list[Path]):
         self.path = path
@@ -112,8 +121,9 @@ class SymbolVisitor(cst.CSTVisitor):
             return
 
         fqns = self.get_metadata(FullyQualifiedNameProvider, node, default=[])
+        pos = self._pos(node)
         for fqn in fqns:
-            self._push_decl(node, SymbolNode(fqn.name, type_, self.path))
+            self._push_decl(node, SymbolNode(fqn.name, type_, self.path, pos))
 
     def _add_variable(self, node: cst.Assign | cst.AnnAssign):
         # Only collect top-level declarations, skip nested ones
@@ -145,8 +155,9 @@ class SymbolVisitor(cst.CSTVisitor):
         value_to_syms: dict[cst.CSTNode, list[SymbolNode]] = {}
         for name, value in pairs:
             fqns = self.get_metadata(FullyQualifiedNameProvider, name, default=[])
+            pos = self._pos(name)
             for fqn in fqns:
-                sym = SymbolNode(fqn.name, "variable", self.path)
+                sym = SymbolNode(fqn.name, "variable", self.path, pos)
                 name_to_syms.setdefault(name, []).append(sym)
                 if value is not None:
                     value_to_syms.setdefault(value, []).append(sym)
@@ -207,7 +218,11 @@ class SymbolVisitor(cst.CSTVisitor):
             # add a decl if the import is in the module context
             if current_decl and current_decl.type == "module":
                 sym = SymbolNode(
-                    f"{self.module_node.fqname}.{decl_name.value}", "import", self.path, import_info
+                    f"{self.module_node.fqname}.{decl_name.value}",
+                    "import",
+                    self.path,
+                    self._pos(alias),
+                    import_info,
                 )
                 self._push_decl(alias, sym)
 
@@ -217,7 +232,7 @@ class SymbolVisitor(cst.CSTVisitor):
     def visit_Module(self, node: cst.Module) -> None:
         assert not self.decl_stack, "Module node should be the first visited node"
         fqns = self.get_metadata(FullyQualifiedNameProvider, node, default=[])
-        sym = SymbolNode(next(iter(fqns)).name, "module", self.path)
+        sym = SymbolNode(next(iter(fqns)).name, "module", self.path, self._pos(node))
         self._push_decl(node, sym)
 
     def visit_FunctionDef(self, node: cst.FunctionDef) -> None:
