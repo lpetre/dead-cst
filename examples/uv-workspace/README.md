@@ -1,11 +1,12 @@
 # uv-workspace
 
-A two-member uv workspace that exercises `dead-cst`'s multi-base analysis via
-the `-p / --path` flag. Layout:
+A two-member uv workspace that exercises `dead-cst`'s multi-base analysis.
+Layout:
 
 ```
 uv-workspace/
   pyproject.toml             # workspace root
+  uv.lock                    # source of truth for the resolver
   packages/
     core/
       pyproject.toml
@@ -17,12 +18,22 @@ uv-workspace/
         helpers.py           # entire module DEAD
 ```
 
-Why two `-p` specs are necessary: each member uses a `src/` layout, so
-fully-qualified names should be rooted at `packages/<pkg>/src`, not at the
-workspace root. We also need `core/src` to be a search path while analyzing
-`app/src` so `from core.api import used_by_app` resolves.
+Each member uses a `src/` layout, so fully-qualified names need to be rooted
+at `packages/<pkg>/src` (not the workspace root). And while analyzing
+`app/src`, `core/src` must be a search path so `from core.api import
+used_by_app` resolves.
 
 ## Run the analysis
+
+```bash
+uv run dead-cst analyze examples/uv-workspace \
+    --resolver uv_workspace --plugin main_block
+```
+
+The `uv_workspace` resolver reads `uv.lock`, treats every `[[package]]` with
+`source = { editable = "..." }` as a workspace member, and wires each
+member's `src/` directory together using uv's resolved dependency graph.
+The above command is equivalent to:
 
 ```bash
 uv run dead-cst analyze examples/uv-workspace \
@@ -30,6 +41,9 @@ uv run dead-cst analyze examples/uv-workspace \
     -p packages/app/src:packages/core/src \
     --plugin main_block
 ```
+
+...except you don't have to keep the `-p` list in sync with the workspace as
+it grows.
 
 Expected output:
 
@@ -51,27 +65,21 @@ Dead symbols (3):
 ```
 
 `core.api.used_by_app` stays alive because `app.cli` -- kept alive by
-`MainBlockPlugin` -- imports it. `core.api.unused_old`, on the other hand, has
-no remaining callers in the workspace and is correctly flagged.
+`MainBlockPlugin` -- imports it. `core.api.unused_old` has no remaining
+callers in the workspace and is correctly flagged.
 
-## Path-spec syntax
+## How `UvWorkspaceResolver` decides on a src root
 
-`-p` is repeatable. Each spec is one of:
+For each workspace member directory, the resolver picks `<member>/src` if
+that directory exists, otherwise the member directory itself. This matches
+`PyprojectResolver`'s single-package convention and covers both the
+`src/`-layout and the flat layout.
 
-- `BASE` -- analyze `BASE` with no extra search paths.
-- `BASE:DEP1,DEP2,...` -- analyze `BASE` with the listed dependency paths
-  available for import resolution.
+Direct dependency edges come from each member's `dependencies = [...]` list
+in `uv.lock`; non-workspace deps (regular PyPI packages) are dropped because
+they don't have a source tree under your control.
 
-Each `BASE` is resolved relative to the analysis root (here:
-`examples/uv-workspace`). Paths form a small DAG inside
-`build_symbol_graph` -- search paths are processed before the bases that
-depend on them, so by the time `app/src` is visited, every `core` symbol is
-already in the trie.
+## Falling back to explicit paths
 
-## Why this matters
-
-In a real workspace you typically run `dead-cst` once per branch on the
-*entire* code under your control. Without the cross-package search path, the
-imports from `app` into `core` would fail to resolve and `dead-cst` would
-warn (`Failed to resolve cst.Import: ...`); with it, the graph is unified and
-genuine dead code surfaces in every member.
+If you don't want to commit a `uv.lock`, the multi-`-p` invocation above
+keeps working unchanged.
