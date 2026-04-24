@@ -737,8 +737,10 @@ def test_declarations(build_decl_graph, assert_edges, src, expected_edges):
             # Two distinct ``mod.a`` variable nodes at different
             # positions. The second assignment's RHS genuinely references
             # the first binding -- no cycle in the underlying graph.
-            # Only the last decl (trie survivor) gets a parent edge.
+            # Both decls -- including the shadowed one -- carry a
+            # parent-module edge so the graph stays well-formed.
             {
+                "mod.a@1:0 -> mod",
                 "mod.a@2:0 -> mod",
                 "mod.a@2:0 -> mod.a@1:0",
             },
@@ -751,9 +753,12 @@ def test_declarations(build_decl_graph, assert_edges, src, expected_edges):
             f()
             """,
             # The flow filter drops the shadowed line-1 def at the call
-            # site, so only the surviving ``mod.f@2:0`` appears.
+            # site, so only the surviving ``mod.f@2:0`` is reachable
+            # there. The shadowed ``mod.f@1:0`` still belongs to the
+            # module, so it carries the parent-module edge.
             {
                 "mod -> mod.f@2:0",
+                "mod.f@1:0 -> mod",
                 "mod.f@2:0 -> mod",
             },
             id="function-redefined-creates-two-nodes",
@@ -766,6 +771,7 @@ def test_declarations(build_decl_graph, assert_edges, src, expected_edges):
             """,
             {
                 "mod -> mod.C@2:0",
+                "mod.C@1:0 -> mod",
                 "mod.C@2:0 -> mod",
             },
             id="class-redefined-creates-two-nodes",
@@ -778,11 +784,13 @@ def test_declarations(build_decl_graph, assert_edges, src, expected_edges):
             f()
             """,
             # ``f()`` only reaches the last ``def f`` after filtering.
-            # The shadowed ``mod.f@2:0`` had no outgoing references
-            # anyway, so it drops out of the graph entirely.
+            # The shadowed ``mod.f@2:0`` keeps its parent-module edge so
+            # it stays in the graph as a (now-orphan-from-the-call-site)
+            # decl.
             {
                 "mod -> mod.f@3:0",
                 "mod.a@1:0 -> mod",
+                "mod.f@2:0 -> mod",
                 "mod.f@3:0 -> mod",
                 "mod.f@3:0 -> mod.a@1:0",
             },
@@ -800,6 +808,7 @@ def test_declarations(build_decl_graph, assert_edges, src, expected_edges):
             {
                 "mod -> mod.f@4:0",
                 "mod.dec@1:0 -> mod",
+                "mod.f@2:0 -> mod",
                 "mod.f@4:0 -> mod",
                 "mod.f@4:0 -> mod.dec@1:0",
             },
@@ -818,6 +827,7 @@ def test_declarations(build_decl_graph, assert_edges, src, expected_edges):
             {
                 "mod -> mod.f@1:0",
                 "mod -> mod.f@3:9",
+                "mod.f@1:0 -> mod",
                 "mod.f@3:9 -> mod",
                 "mod.f@3:9 -> mod.g@2:0",
                 "mod.g@2:0 -> mod",
@@ -841,6 +851,7 @@ def test_declarations(build_decl_graph, assert_edges, src, expected_edges):
                 "mod -> mod.f@6:4",
                 "mod.a@1:0 -> mod",
                 "mod.b@2:0 -> mod",
+                "mod.f@4:4 -> mod",
                 "mod.f@4:4 -> mod.a@1:0",
                 "mod.f@6:4 -> mod",
                 "mod.f@6:4 -> mod.b@2:0",
@@ -859,6 +870,7 @@ def test_declarations(build_decl_graph, assert_edges, src, expected_edges):
             {
                 "mod.f@1:0 -> mod",
                 "mod.g@2:0 -> mod",
+                "mod.x@4:4 -> mod",
                 "mod.x@4:4 -> mod.f@1:0",
                 "mod.x@6:4 -> mod",
                 "mod.x@6:4 -> mod.g@2:0",
@@ -895,6 +907,7 @@ def test_redeclarations(build_decl_graph, assert_positional_edges, src, expected
             # it so ``other`` is no longer kept alive by this module.
             {
                 "mod -> mod.f@2:0",
+                "mod.f@1:18 -> mod",
                 "mod.f@1:18 -> other",
                 "mod.f@1:18 -> other.f@1:0",
                 "mod.f@2:0 -> mod",
@@ -912,11 +925,13 @@ def test_redeclarations(build_decl_graph, assert_positional_edges, src, expected
                 """,
             },
             # The shadowing import wins at the call; the shadowed def
-            # at line 1 has no incoming edges and drops from the graph.
+            # at line 1 has no incoming edges and stays in the graph
+            # only via its parent-module edge.
             {
                 "mod -> mod.f@2:18",
                 "mod -> other",
                 "mod -> other.f@1:0",
+                "mod.f@1:0 -> mod",
                 "mod.f@2:18 -> mod",
                 "mod.f@2:18 -> other",
                 "mod.f@2:18 -> other.f@1:0",
@@ -935,6 +950,7 @@ def test_redeclarations(build_decl_graph, assert_positional_edges, src, expected
             },
             {
                 "mod -> mod.f@2:0",
+                "mod.f@1:18 -> mod",
                 "mod.f@1:18 -> other",
                 "mod.f@1:18 -> other.f@1:0",
                 "mod.f@2:0 -> mod",
@@ -963,6 +979,7 @@ def test_redeclarations(build_decl_graph, assert_positional_edges, src, expected
                 "mod -> mod.x@2:14",
                 "mod.x@1:14 -> a",
                 "mod.x@1:14 -> a.x@1:0",
+                "mod.x@1:14 -> mod",
                 "mod.x@2:14 -> b",
                 "mod.x@2:14 -> b.x@1:0",
                 "mod.x@2:14 -> mod",
@@ -988,6 +1005,7 @@ def test_redeclarations(build_decl_graph, assert_positional_edges, src, expected
             {
                 "mod -> mod.f@3:0",
                 "mod.dead_helper@1:0 -> mod",
+                "mod.f@2:0 -> mod",
                 "mod.f@2:0 -> mod.dead_helper@1:0",
                 "mod.f@3:0 -> mod",
             },
@@ -1005,6 +1023,7 @@ def test_redeclarations(build_decl_graph, assert_positional_edges, src, expected
             },
             {
                 "mod -> mod.C@4:0",
+                "mod.C@2:0 -> mod",
                 "mod.C@2:0 -> mod.dead_helper@1:0",
                 "mod.C@4:0 -> mod",
                 "mod.dead_helper@1:0 -> mod",
@@ -1029,7 +1048,9 @@ def test_redeclarations(build_decl_graph, assert_positional_edges, src, expected
                 "mod -> mod.f@5:0",
                 "mod.a@1:0 -> mod",
                 "mod.b@2:0 -> mod",
+                "mod.f@3:0 -> mod",
                 "mod.f@3:0 -> mod.a@1:0",
+                "mod.f@4:0 -> mod",
                 "mod.f@4:0 -> mod.b@2:0",
                 "mod.f@5:0 -> mod",
             },

@@ -41,6 +41,11 @@ class SymbolTrie:
     # Keyed by the simple name (not fully qualified)
     declarations: dict[str, SymbolNode] = field(default_factory=dict)
 
+    # Decls displaced by a later same-name decl in source order. They still
+    # belong to this module -- the symbol graph needs them so the
+    # ``decl -> module`` parent edge is emitted for shadowed decls too.
+    shadowed: list[SymbolNode] = field(default_factory=list)
+
     def add_declaration(self, decl: SymbolNode) -> None:
         """Add a declaration to the trie."""
         parts = decl.fqname.split(".")
@@ -56,6 +61,9 @@ class SymbolTrie:
                 assert node.module is not None, (
                     f"Module should exist when adding {decl.type} {decl.fqname}"
                 )
+                existing = node.declarations.get(child)
+                if existing is not None and existing != decl:
+                    node.shadowed.append(existing)
                 node.declarations[child] = decl
 
     def merge(self, other: SymbolTrie) -> SymbolTrie:
@@ -70,6 +78,7 @@ class SymbolTrie:
             assert self.module is None, "Cannot merge module into a node that already has a module"
             self.module = other.module
             self.declarations = other.declarations.copy()
+            self.shadowed = list(other.shadowed)
         return self
 
     def _touch(self, parts: list[str]) -> SymbolTrie:
