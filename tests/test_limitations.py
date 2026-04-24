@@ -196,6 +196,79 @@ import pytest
             },
             id="del-does-not-remove-declaration",
         ),
+        # ------------------------------------------------------------------
+        # Same-kind redeclarations collapse to one graph node, so any
+        # references made from the body of a shadowed (and therefore
+        # unreachable) declaration are folded into the surviving node
+        # and keep their targets alive.
+        # ------------------------------------------------------------------
+        pytest.param(
+            {
+                "mod.py": """
+                def dead_helper(): pass
+                def f(): dead_helper()
+                def f(): pass
+                f()
+                """,
+            },
+            # The first ``def f`` is shadowed before it's ever called,
+            # so its body never runs -- ``dead_helper`` is dead. Because
+            # ``SymbolNode`` hashes on (fqname, type, path) both ``def f``
+            # nodes collapse into one, and the edge from the dead body
+            # keeps ``dead_helper`` alive.
+            {
+                "mod -> mod.f",
+                "mod.dead_helper -> mod",
+                "mod.f -> mod",
+                "mod.f -> mod.dead_helper",
+            },
+            id="dead-function-body-kept-alive-by-node-collapse",
+        ),
+        pytest.param(
+            {
+                "mod.py": """
+                def dead_helper(): pass
+                class C:
+                    def m(self): dead_helper()
+                class C: pass
+                C()
+                """,
+            },
+            # The first ``C`` is shadowed, so its method ``m`` is never
+            # reachable and ``dead_helper`` is dead. The two ``C`` class
+            # nodes collapse into one and the method-body edge survives.
+            {
+                "mod -> mod.C",
+                "mod.C -> mod",
+                "mod.C -> mod.dead_helper",
+                "mod.dead_helper -> mod",
+            },
+            id="dead-method-body-kept-alive-by-node-collapse",
+        ),
+        pytest.param(
+            {
+                "mod.py": """
+                def a(): pass
+                def b(): pass
+                def f(): a()
+                def f(): b()
+                def f(): pass
+                f()
+                """,
+            },
+            # All but the last ``def f`` are dead, so both ``a`` and
+            # ``b`` are only referenced from unreachable bodies. Node
+            # collapse keeps both alive.
+            {
+                "mod -> mod.f",
+                "mod.a -> mod",
+                "mod.b -> mod",
+                "mod.f -> mod",
+                "mod.f -> mod.a",
+                "mod.f -> mod.b",
+            },
+            id="chain-of-shadowed-functions-keeps-all-bodies-alive",
+        ),
     ],
 )
 def test_limitation(build_decl_graph, assert_edges, files, expected_edges):
