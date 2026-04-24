@@ -1063,6 +1063,129 @@ def test_shadowed_declarations(build_decl_graph, assert_positional_edges, files,
     assert_positional_edges(graph, expected_edges)
 
 
+@pytest.mark.parametrize(
+    "files, expected_edges",
+    [
+        # Both branches define ``f``; both are live at module exit, so a
+        # cross-module ``from lib import f`` must reach each one.
+        pytest.param(
+            {
+                "lib.py": """
+                if True:
+                    def f(): pass
+                else:
+                    def f(): pass
+                """,
+                "mod.py": """
+                from lib import f
+                f()
+                """,
+            },
+            {
+                "lib.f@2:4 -> lib",
+                "lib.f@4:4 -> lib",
+                "mod -> lib",
+                "mod -> lib.f@2:4",
+                "mod -> lib.f@4:4",
+                "mod -> mod.f@1:16",
+                "mod.f@1:16 -> lib",
+                "mod.f@1:16 -> lib.f@2:4",
+                "mod.f@1:16 -> lib.f@4:4",
+                "mod.f@1:16 -> mod",
+            },
+            id="cross-module-import-of-if-else-binding",
+        ),
+        # Conditional re-export through an intermediate module: each
+        # branch imports from a different upstream, so resolving
+        # ``mod -> compat.f`` forks the worklist into both upstreams.
+        pytest.param(
+            {
+                "a.py": "def f(): pass\n",
+                "b.py": "def f(): pass\n",
+                "compat.py": """
+                if True:
+                    from a import f
+                else:
+                    from b import f
+                """,
+                "mod.py": """
+                from compat import f
+                f()
+                """,
+            },
+            {
+                "a.f@1:0 -> a",
+                "b.f@1:0 -> b",
+                "compat.f@2:18 -> a",
+                "compat.f@2:18 -> a.f@1:0",
+                "compat.f@2:18 -> compat",
+                "compat.f@4:18 -> b",
+                "compat.f@4:18 -> b.f@1:0",
+                "compat.f@4:18 -> compat",
+                "mod -> a.f@1:0",
+                "mod -> b.f@1:0",
+                "mod -> compat",
+                "mod -> compat.f@2:18",
+                "mod -> compat.f@4:18",
+                "mod -> mod.f@1:19",
+                "mod.f@1:19 -> a.f@1:0",
+                "mod.f@1:19 -> b.f@1:0",
+                "mod.f@1:19 -> compat",
+                "mod.f@1:19 -> compat.f@2:18",
+                "mod.f@1:19 -> compat.f@4:18",
+                "mod.f@1:19 -> mod",
+            },
+            id="cross-module-import-through-conditional-reexport",
+        ),
+        # ``try`` body and ``except`` handler both bind ``f``; both are
+        # live at exit (a handler can run before *or* instead of the
+        # body completing), so both must be importable.
+        pytest.param(
+            {
+                "lib.py": """
+                try:
+                    from a import f
+                except ImportError:
+                    def f(): pass
+                """,
+                "a.py": "def f(): pass\n",
+                "mod.py": """
+                from lib import f
+                f()
+                """,
+            },
+            {
+                "a.f@1:0 -> a",
+                "lib.f@2:18 -> a",
+                "lib.f@2:18 -> a.f@1:0",
+                "lib.f@2:18 -> lib",
+                "lib.f@4:4 -> lib",
+                "mod -> a.f@1:0",
+                "mod -> lib",
+                "mod -> lib.f@2:18",
+                "mod -> lib.f@4:4",
+                "mod -> mod.f@1:16",
+                "mod.f@1:16 -> a.f@1:0",
+                "mod.f@1:16 -> lib",
+                "mod.f@1:16 -> lib.f@2:18",
+                "mod.f@1:16 -> lib.f@4:4",
+                "mod.f@1:16 -> mod",
+            },
+            id="try-except-both-branches-exported",
+        ),
+    ],
+)
+def test_branch_bindings_exported(build_decl_graph, assert_positional_edges, files, expected_edges):
+    """Decls bound on every reachable path to module exit are importable.
+
+    Plain shadowing keeps single-survivor semantics, but conditional
+    bindings (``if/else``, ``try/except``, ...) where multiple branches
+    bind the same name should expose every branch to importing modules.
+    """
+    graph = build_decl_graph(files)
+    assert_positional_edges(graph, expected_edges)
+
+
 def test_module_hierarchy_edges(build_decl_graph, assert_edges):
     """Submodules point at their parent package to keep __init__.py alive."""
     graph = build_decl_graph(

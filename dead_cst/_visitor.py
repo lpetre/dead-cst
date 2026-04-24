@@ -22,7 +22,7 @@ from libcst.metadata.scope_provider import (
     ImportAssignment,
 )
 
-from ._flow import live_referents
+from ._flow import live_at_exit, live_referents
 from ._resolve import resolve_import
 from ._symbols import Import, SymbolNode, SymbolTrie
 
@@ -98,6 +98,12 @@ class SymbolVisitor(cst.CSTVisitor):
         self.import_edges: set[tuple[SymbolNode, Import]] = set()
         self.internal_edges: set[tuple[SymbolNode, SymbolNode]] = set()
         self.trie: SymbolTrie = SymbolTrie()
+        # CST node used as the flow-analysis "binding site" for each
+        # top-level decl. Functions/classes use the def itself, variables
+        # use the LHS Name, imports use the ImportAlias. All are
+        # descendants of the containing statement, which is what
+        # ``live_at_exit`` matches against.
+        self.symbol_referent_nodes: dict[SymbolNode, cst.CSTNode] = {}
 
     @property
     def module_node(self) -> SymbolNode:
@@ -140,7 +146,9 @@ class SymbolVisitor(cst.CSTVisitor):
         fqns = self.get_metadata(FullyQualifiedNameProvider, node, default=[])
         pos = self._pos(node)
         for fqn in fqns:
-            self._push_decl(node, SymbolNode(fqn.name, type_, self.path, pos))
+            sym = SymbolNode(fqn.name, type_, self.path, pos)
+            self.symbol_referent_nodes[sym] = node
+            self._push_decl(node, sym)
 
     def _add_variable(self, node: cst.Assign | cst.AnnAssign):
         # Only collect top-level declarations, skip nested ones
@@ -175,6 +183,7 @@ class SymbolVisitor(cst.CSTVisitor):
             pos = self._pos(name)
             for fqn in fqns:
                 sym = SymbolNode(fqn.name, "variable", self.path, pos)
+                self.symbol_referent_nodes[sym] = name
                 name_to_syms.setdefault(name, []).append(sym)
                 if value is not None:
                     value_to_syms.setdefault(value, []).append(sym)
@@ -241,6 +250,7 @@ class SymbolVisitor(cst.CSTVisitor):
                     self._pos(alias),
                     import_info,
                 )
+                self.symbol_referent_nodes[sym] = alias
                 self._push_decl(alias, sym)
 
             # add the import edge to the last decl on the stack
@@ -250,6 +260,9 @@ class SymbolVisitor(cst.CSTVisitor):
         assert not self.decl_stack, "Module node should be the first visited node"
         fqns = self.get_metadata(FullyQualifiedNameProvider, node, default=[])
         sym = SymbolNode(next(iter(fqns)).name, "module", self.path, self._pos(node))
+        # Cache so ``_finalize_module_declarations`` can locate the trie
+        # node after ``on_leave`` has popped the module frame.
+        self._module_fqname = sym.fqname
         self._push_decl(node, sym)
 
     def visit_FunctionDef(self, node: cst.FunctionDef) -> None:
@@ -287,6 +300,46 @@ class SymbolVisitor(cst.CSTVisitor):
 
         self._add_import(module, node)
 
+    def _finalize_module_declarations(self, module_node: cst.Module) -> None:
+        """Partition same-name top-level decls into live / shadowed at exit.
+
+        For names with more than one decl, ask :func:`live_at_exit` which
+        binding sites survive on at least one path to module exit. Live
+        decls stay in ``trie.declarations[name]`` (multi-valued for
+        conditional bindings); the rest move to ``trie.shadowed`` so the
+        graph keeps their parent-module edge but cross-module imports do
+        not reach them.
+        """
+        trie_node = self.trie._get(self._module_fqname.split("."))
+        if trie_node is None:
+            return
+
+        name_decls = {n: list(d) for n, d in trie_node.declarations.items()}
+        for name, decls in name_decls.items():
+            if len(decls) <= 1:
+                continue
+
+            referent_nodes: list[cst.CSTNode] = []
+            for d in decls:
+                ref = self.symbol_referent_nodes.get(d)
+                if ref is not None:
+                    referent_nodes.append(ref)
+
+            live_ids = {
+                id(n) for n in live_at_exit(list(module_node.body), referent_nodes)
+            }
+
+            live_decls: list[SymbolNode] = []
+            shadowed_decls: list[SymbolNode] = []
+            for d in decls:
+                ref = self.symbol_referent_nodes.get(d)
+                if ref is not None and id(ref) in live_ids:
+                    live_decls.append(d)
+                else:
+                    shadowed_decls.append(d)
+
+            trie_node.finalize_declarations(name, live_decls, shadowed_decls)
+
     def on_leave(self, original_node: cst.CSTNode) -> None:
         self.nearest_decls[original_node] = list(self.decl_stack[-1]) if self.decl_stack else []
         for frame in reversed(self.node_to_frames.get(original_node, [])):
@@ -296,6 +349,8 @@ class SymbolVisitor(cst.CSTVisitor):
         # only run once for the Module node
         if not isinstance(original_node, cst.Module):
             return
+
+        self._finalize_module_declarations(original_node)
 
         parent_map = self.metadata[ParentNodeProvider]
         references = set()

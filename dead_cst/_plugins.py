@@ -52,19 +52,21 @@ class PluginContext:
         node = self.symbol_lookup._get(fqname.split("."))
         return node.module if node else None
 
-    def find_declaration(self, fqname: str) -> SymbolNode | None:
-        """Look up a top-level declaration by dotted name.
+    def find_declarations(self, fqname: str) -> list[SymbolNode]:
+        """Look up top-level declarations by dotted name.
 
         ``pkg.mod.func`` is split into module ``pkg.mod`` and decl ``func``.
-        Returns the declaration's :class:`SymbolNode` or ``None``.
+        Returns every :class:`SymbolNode` bound to ``func`` at module
+        exit -- normally one, but multiple when each branch of a
+        conditional defines the same name. Empty list if nothing matches.
         """
         parts = fqname.split(".")
         for split in range(len(parts) - 1, 0, -1):
             module_parts, decl_name = parts[:split], parts[split]
             node = self.symbol_lookup._get(module_parts)
             if node and node.module and decl_name in node.declarations:
-                return node.declarations[decl_name]
-        return None
+                return list(node.declarations[decl_name])
+        return []
 
 
 @dataclass(frozen=True)
@@ -241,8 +243,11 @@ class ProjectScriptsPlugin:
         for script_name, target in scripts.items():
             module_part, _, decl_part = target.partition(":")
             fqname = f"{module_part}.{decl_part}" if decl_part else module_part
-            target_node = ctx.find_declaration(fqname) or ctx.find_module(module_part)
-            if target_node is None:
+            target_nodes = ctx.find_declarations(fqname)
+            if not target_nodes:
+                module_node = ctx.find_module(module_part)
+                target_nodes = [module_node] if module_node else []
+            if not target_nodes:
                 logger.warning(
                     "ProjectScriptsPlugin: %s -> %r not found in symbol graph",
                     script_name,
@@ -254,7 +259,8 @@ class ProjectScriptsPlugin:
                 path=pyproject,
             )
             yield AddNode(synth, entrypoint=True)
-            yield AddEdge(synth, target_node)
+            for target_node in target_nodes:
+                yield AddEdge(synth, target_node)
 
 
 @dataclass
