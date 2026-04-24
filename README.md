@@ -101,8 +101,9 @@ A module-level `import` / `from ... import ...` is itself a declaration of type 
 - `import *` is not resolved.
 - Dynamic attribute access (`getattr`) and runtime-generated symbols are invisible to static analysis.
 - Only first-party code is analysed; third-party dependencies are treated as opaque.
+- PEP 695 `type` statements are not tracked.
+- String names in `__all__` are not followed to their declarations (but `--preserve-dunder-all` keeps the `__all__` variable itself alive).
 
 ## TODO
 
 - Host API documentation on Read the Docs.
-- Fix the `AnnAssign`-without-value crash captured by `tests/test_limitations.py::test_ann_assign_without_value_crashes`.

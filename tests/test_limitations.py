@@ -17,58 +17,6 @@ import pytest
         # Assignment patterns the visitor cannot fully unpack
         # ------------------------------------------------------------------
         pytest.param(
-            {
-                "mod.py": """
-                def f(): pass
-                b = c = f
-                """,
-            },
-            # Chained assignment: ideally both ``b`` and ``c`` would
-            # point at ``f``. Today only the last-processed target gets
-            # the edge (``mod.c -> mod.f`` is missing).
-            {
-                "mod.b -> mod",
-                "mod.b -> mod.f",
-                "mod.c -> mod",
-                "mod.f -> mod",
-            },
-            id="chained-assignment-only-one-target-linked",
-        ),
-        pytest.param(
-            {
-                "mod.py": """
-                def f(): return 1, 2
-                a, b = f()
-                """,
-            },
-            # Tuple unpacking from a single call expression: ideally
-            # both ``a`` and ``b`` would point at ``f``. Today only the
-            # first iterated target gets the edge.
-            {
-                "mod.a -> mod",
-                "mod.a -> mod.f",
-                "mod.b -> mod",
-                "mod.f -> mod",
-            },
-            id="tuple-unpack-from-call-only-first-target-linked",
-        ),
-        pytest.param(
-            {"mod.py": "[a, b] = 1, 2\n"},
-            # ``[a, b] = ...`` is a valid assignment target pattern but
-            # the visitor does not recognise list targets at all, so no
-            # declarations are produced for ``a`` or ``b``.
-            set(),
-            id="list-target-pattern-produces-no-decls",
-        ),
-        pytest.param(
-            {"mod.py": "(a, (b, c)) = 1, (2, 3)\n"},
-            # Nested-tuple unpacking: ideally all of ``a``, ``b``, and
-            # ``c`` would be tracked. Today only the outermost level is
-            # descended into, so ``b`` and ``c`` never appear.
-            {"mod.a -> mod"},
-            id="nested-tuple-target-misses-inner-names",
-        ),
-        pytest.param(
             {"mod.py": "type T = int\n"},
             # PEP 695 ``type`` statements are ignored, so the alias
             # never appears in the graph.

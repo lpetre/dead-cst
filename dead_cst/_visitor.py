@@ -31,6 +31,29 @@ def _dotted_name_parts(
         yield full, node.attr
 
 
+def _pair_targets(
+    target: cst.BaseExpression, rhs: cst.BaseExpression | None
+) -> Generator[tuple[cst.Name, cst.BaseExpression | None], None, None]:
+    """Yield (name_node, value_node) pairs for an assignment target pattern.
+
+    Handles ``Name`` leaves, tuple / list patterns (including nested ones),
+    and starred elements. Non-name leaves (``Attribute``, ``Subscript``)
+    are skipped. When the RHS is a tuple / list of matching arity we pair
+    element-wise; otherwise the entire RHS is broadcast to every name.
+    """
+    if isinstance(target, cst.Name):
+        yield target, rhs
+        return
+
+    if isinstance(target, (cst.Tuple, cst.List)):
+        if isinstance(rhs, (cst.Tuple, cst.List)) and len(rhs.elements) == len(target.elements):
+            for te, ve in zip(target.elements, rhs.elements):
+                yield from _pair_targets(te.value, ve.value)
+        else:
+            for te in target.elements:
+                yield from _pair_targets(te.value, rhs)
+
+
 class SymbolVisitor(cst.CSTVisitor):
     METADATA_DEPENDENCIES = (
         FullyQualifiedNameProvider,
@@ -42,8 +65,9 @@ class SymbolVisitor(cst.CSTVisitor):
         self.path = path
         self.search_paths = search_paths
         self.node_to_symbols: dict[cst.CSTNode, list[SymbolNode]] = {}
-        self.decl_stack: list[SymbolNode] = []
-        self.nearest_decl: dict[cst.CSTNode, SymbolNode] = {}
+        self.node_to_frames: dict[cst.CSTNode, list[list[SymbolNode]]] = {}
+        self.decl_stack: list[list[SymbolNode]] = []
+        self.nearest_decls: dict[cst.CSTNode, list[SymbolNode]] = {}
         self.import_lookup: dict[cst.CSTNode, Import] = {}
         self.import_edges: set[tuple[SymbolNode, Import]] = set()
         self.internal_edges: set[tuple[SymbolNode, SymbolNode]] = set()
@@ -53,16 +77,30 @@ class SymbolVisitor(cst.CSTVisitor):
     def module_node(self) -> SymbolNode:
         if not self.decl_stack:
             raise ValueError("Module node has not been set yet.")
-        return self.decl_stack[0]
+        return self.decl_stack[0][0]
 
     @cache
     def resolve_import(self, name: str) -> str | Path:
         return resolve_import(name, self.search_paths)
 
     def _push_decl(self, node: cst.CSTNode, decl: SymbolNode):
-        self.node_to_symbols.setdefault(node, []).append(decl)
-        self.decl_stack.append(decl)
-        self.trie.add_declaration(decl)
+        self._push_decls(node, [decl])
+
+    def _push_decls(self, node: cst.CSTNode, decls: list[SymbolNode]) -> None:
+        """Push a frame of decls for ``node``.
+
+        A frame is a group of decls that are simultaneously "active" for any
+        accesses occurring within the subtree rooted at ``node``. A single
+        ``_push_decl`` pushes a one-element frame; chained assignments like
+        ``b = c = f`` push both ``b`` and ``c`` as a single frame so the RHS
+        is attributed to both.
+        """
+        frame = list(decls)
+        self.node_to_symbols.setdefault(node, []).extend(frame)
+        self.node_to_frames.setdefault(node, []).append(frame)
+        self.decl_stack.append(frame)
+        for d in frame:
+            self.trie.add_declaration(d)
 
     def _add_decl(
         self,
@@ -93,47 +131,36 @@ class SymbolVisitor(cst.CSTVisitor):
         if rhs is None and isinstance(node, cst.AnnAssign):
             rhs = node.annotation
 
-        value_to_syms = {}
-        for target in reversed(targets):
+        # Flatten each top-level target against the rhs into (name, value) pairs.
+        # For chained assignment ``b = c = f`` every target shares the same rhs.
+        pairs: list[tuple[cst.Name, cst.BaseExpression | None]] = []
+        for target in targets:
             full_name = get_full_name_for_node(target)
             if full_name and "." in full_name:
                 continue
+            pairs.extend(_pair_targets(target, rhs))
 
-            # see if we're unpacking, eg `a, b = ...`
-            names = [target]
-            if isinstance(target, cst.Tuple):
-                names = [t.value for t in target.elements]
-
-            values = [rhs]
-
-            # this can happen with unpacking, e.g. `a, b = (1, 2)`
-            if len(names) > len(values) and isinstance(rhs, cst.Tuple):
-                values = [v.value for v in rhs.elements]
-
-            if len(names) > len(values) and len(values) == 1:
-                # This can happen with unpacking, e.g. `a, b = f()`
-                # In this case, we assume the first value applies to all names
-                values = [values[0]] * len(names)
-
-            value_name_pairs = list(zip(values, names))
-            for value, name in reversed(value_name_pairs):
-                fqns = self.get_metadata(FullyQualifiedNameProvider, name, default=[])
-                for fqn in fqns:
-                    sym = SymbolNode(fqn.name, "variable", self.path)
-                    self._push_decl(name, sym)
+        # Build the symbol for each name and record which value(s) point at it.
+        name_to_syms: dict[cst.Name, list[SymbolNode]] = {}
+        value_to_syms: dict[cst.CSTNode, list[SymbolNode]] = {}
+        for name, value in pairs:
+            fqns = self.get_metadata(FullyQualifiedNameProvider, name, default=[])
+            for fqn in fqns:
+                sym = SymbolNode(fqn.name, "variable", self.path)
+                name_to_syms.setdefault(name, []).append(sym)
+                if value is not None:
                     value_to_syms.setdefault(value, []).append(sym)
 
-        values = [rhs] if rhs is not None else []
-        if isinstance(rhs, cst.Tuple):
-            values += [v.value for v in rhs.elements]
-
-        for value in reversed(values):
-            if syms := value_to_syms.get(value):
-                for sym in syms:
-                    self._push_decl(value, sym)
+        # Push frames in reverse CST-visit order so on_leave pops them in LIFO.
+        # Values are visited after targets, so their frames go first (popped last).
+        for value, syms in reversed(value_to_syms.items()):
+            self._push_decls(value, syms)
+        for name, syms in reversed(name_to_syms.items()):
+            for sym in syms:
+                self._push_decls(name, [sym])
 
     def _add_import(self, from_prefix: str, node: cst.Import | cst.ImportFrom) -> None:
-        current_decl = self.decl_stack[-1] if self.decl_stack else None
+        current_decl = self.decl_stack[-1][-1] if self.decl_stack else None
 
         module_path, module_name = None, None
         if from_prefix:
@@ -185,7 +212,7 @@ class SymbolVisitor(cst.CSTVisitor):
                 self._push_decl(alias, sym)
 
             # add the import edge to the last decl on the stack
-            self.import_edges.add((self.decl_stack[-1], import_info))
+            self.import_edges.add((self.decl_stack[-1][-1], import_info))
 
     def visit_Module(self, node: cst.Module) -> None:
         assert not self.decl_stack, "Module node should be the first visited node"
@@ -229,10 +256,10 @@ class SymbolVisitor(cst.CSTVisitor):
         self._add_import(module, node)
 
     def on_leave(self, original_node: cst.CSTNode) -> None:
-        self.nearest_decl[original_node] = self.decl_stack[-1]
-        for decl in reversed(self.node_to_symbols.get(original_node, [])):
+        self.nearest_decls[original_node] = list(self.decl_stack[-1]) if self.decl_stack else []
+        for frame in reversed(self.node_to_frames.get(original_node, [])):
             last = self.decl_stack.pop()
-            assert last == decl, f"Expected {last} to match {decl} on leave of {original_node}"
+            assert last == frame, f"Expected {last} to match {frame} on leave of {original_node}"
 
         # only run once for the Module node
         if not isinstance(original_node, cst.Module):
@@ -248,7 +275,7 @@ class SymbolVisitor(cst.CSTVisitor):
                     references.add((access, referent))
 
         for access, referent in references:
-            owner_symbol = self.nearest_decl.get(access.node)
+            owner_symbols = self.nearest_decls.get(access.node, [])
             target_node = referent.node
             if isinstance(referent, cst.metadata.scope_provider.ImportAssignment):
                 target_node = referent.as_name
@@ -276,13 +303,13 @@ class SymbolVisitor(cst.CSTVisitor):
                         decl=".".join(accessed_attrs) if accessed_attrs else None,
                     )
 
-                    self.import_edges.add((owner_symbol, resolved_import))
+                    for owner_symbol in owner_symbols:
+                        self.import_edges.add((owner_symbol, resolved_import))
 
             target_symbols = self.node_to_symbols.get(target_node)
             if not target_symbols:
-                target_symbol = self.nearest_decl.get(target_node)
-                if target_symbol:
-                    target_symbols = {target_symbol}
+                fallback = self.nearest_decls.get(target_node, [])
+                target_symbols = fallback[:1]
 
             if not target_symbols:
                 logger.debug(
@@ -293,5 +320,6 @@ class SymbolVisitor(cst.CSTVisitor):
                 )
 
             for target_symbol in target_symbols:
-                if target_symbol != owner_symbol and target_symbol and owner_symbol:
-                    self.internal_edges.add((owner_symbol, target_symbol))
+                for owner_symbol in owner_symbols:
+                    if target_symbol != owner_symbol and target_symbol and owner_symbol:
+                        self.internal_edges.add((owner_symbol, target_symbol))

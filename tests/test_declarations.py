@@ -352,10 +352,57 @@ import pytest
                 "mod.a -> mod",
                 "mod.a -> mod.xs",
                 "mod.b -> mod",
+                "mod.b -> mod.xs",
                 "mod.c -> mod",
+                "mod.c -> mod.xs",
                 "mod.xs -> mod",
             },
             id="starred-target-in-tuple-unpacking",
+        ),
+        pytest.param(
+            """
+            def f(): pass
+            b = c = f
+            """,
+            {
+                "mod.b -> mod",
+                "mod.b -> mod.f",
+                "mod.c -> mod",
+                "mod.c -> mod.f",
+                "mod.f -> mod",
+            },
+            id="chained-assignment-shares-rhs",
+        ),
+        pytest.param(
+            """
+            def f(): return 1, 2
+            a, b = f()
+            """,
+            {
+                "mod.a -> mod",
+                "mod.a -> mod.f",
+                "mod.b -> mod",
+                "mod.b -> mod.f",
+                "mod.f -> mod",
+            },
+            id="tuple-unpack-from-call-broadcasts-rhs",
+        ),
+        pytest.param(
+            "[a, b] = 1, 2\n",
+            {
+                "mod.a -> mod",
+                "mod.b -> mod",
+            },
+            id="list-target-pattern-produces-decls",
+        ),
+        pytest.param(
+            "(a, (b, c)) = 1, (2, 3)\n",
+            {
+                "mod.a -> mod",
+                "mod.b -> mod",
+                "mod.c -> mod",
+            },
+            id="nested-tuple-target-descends",
         ),
         pytest.param(
             """
