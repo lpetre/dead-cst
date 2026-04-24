@@ -601,6 +601,240 @@ import pytest
             },
             id="closure-reference-folds-into-outer-decl",
         ),
+        # ------------------------------------------------------------------
+        # Redeclarations / shadowing (same-kind collapses cleanly)
+        # ------------------------------------------------------------------
+        pytest.param(
+            """
+            def f(): pass
+            def f(): pass
+            f()
+            """,
+            {
+                "mod -> mod.f",
+                "mod.f -> mod",
+            },
+            id="function-redefined-collapses-to-one-node",
+        ),
+        pytest.param(
+            """
+            class C: pass
+            class C: pass
+            C()
+            """,
+            {
+                "mod -> mod.C",
+                "mod.C -> mod",
+            },
+            id="class-redefined-collapses-to-one-node",
+        ),
+        pytest.param(
+            """
+            def a(): pass
+            def f(): pass
+            def f(): a()
+            f()
+            """,
+            {
+                "mod -> mod.f",
+                "mod.a -> mod",
+                "mod.f -> mod",
+                "mod.f -> mod.a",
+            },
+            id="function-redefined-second-body-references-collapse",
+        ),
+        pytest.param(
+            """
+            def dec(f): return f
+            def f(): pass
+            @dec
+            def f(): pass
+            f()
+            """,
+            {
+                "mod -> mod.f",
+                "mod.dec -> mod",
+                "mod.f -> mod",
+                "mod.f -> mod.dec",
+            },
+            id="function-redefined-with-decorator-on-second-copy",
+        ),
+        pytest.param(
+            """
+            def f(): pass
+            def g(): pass
+            if True: f = g
+            f()
+            """,
+            {
+                "mod -> mod.f",
+                "mod.f -> mod",
+                "mod.f -> mod.g",
+                "mod.g -> mod",
+            },
+            id="conditional-rebind-to-alias-adds-edge",
+        ),
+        pytest.param(
+            """
+            def a(): pass
+            def b(): pass
+            if True:
+                def f(): a()
+            else:
+                def f(): b()
+            f()
+            """,
+            {
+                "mod -> mod.f",
+                "mod.a -> mod",
+                "mod.b -> mod",
+                "mod.f -> mod",
+                "mod.f -> mod.a",
+                "mod.f -> mod.b",
+            },
+            id="if-else-function-redefinition-unifies-edges",
+        ),
+        pytest.param(
+            """
+            def f(): return 1
+            def g(): return 2
+            try:
+                x = f()
+            except Exception:
+                x = g()
+            """,
+            {
+                "mod.f -> mod",
+                "mod.g -> mod",
+                "mod.x -> mod",
+                "mod.x -> mod.f",
+                "mod.x -> mod.g",
+            },
+            id="try-except-assignment-unifies-both-branches",
+        ),
+        # ------------------------------------------------------------------
+        # Local shadowing of module-level names does not create an edge
+        # ------------------------------------------------------------------
+        pytest.param(
+            """
+            X = 1
+            def f():
+                X = 2
+                return X
+            """,
+            {
+                "mod.X -> mod",
+                "mod.f -> mod",
+            },
+            id="local-var-shadows-module-var",
+        ),
+        pytest.param(
+            """
+            X = 1
+            def f(X): return X
+            """,
+            {
+                "mod.X -> mod",
+                "mod.f -> mod",
+            },
+            id="parameter-shadows-module-var",
+        ),
+        pytest.param(
+            """
+            X = 1
+            def f():
+                for X in [1, 2]:
+                    pass
+            """,
+            {
+                "mod.X -> mod",
+                "mod.f -> mod",
+            },
+            id="for-loop-target-shadows-module-var",
+        ),
+        pytest.param(
+            """
+            E = 1
+            def f():
+                try: pass
+                except Exception as E: pass
+            """,
+            {
+                "mod.E -> mod",
+                "mod.f -> mod",
+            },
+            id="except-as-shadows-module-var",
+        ),
+        pytest.param(
+            """
+            X = 1
+            def f():
+                with open('a') as X:
+                    pass
+            """,
+            {
+                "mod.X -> mod",
+                "mod.f -> mod",
+            },
+            id="with-as-shadows-module-var",
+        ),
+        pytest.param(
+            """
+            def helper(): pass
+            def outer():
+                def helper(): pass
+                helper()
+            """,
+            {
+                "mod.helper -> mod",
+                "mod.outer -> mod",
+            },
+            id="nested-function-shadows-outer-name",
+        ),
+        pytest.param(
+            """
+            X = 1
+            class C:
+                X = 2
+                def m(self): return C.X
+            """,
+            {
+                "mod.C -> mod",
+                "mod.X -> mod",
+            },
+            id="class-attribute-shadows-module-var",
+        ),
+        pytest.param(
+            """
+            X = 1
+            class C:
+                def m(self):
+                    X = 2
+                    return X
+            """,
+            {
+                "mod.C -> mod",
+                "mod.X -> mod",
+            },
+            id="method-local-shadows-module-var",
+        ),
+        pytest.param(
+            """
+            X = [1, 2]
+            def f():
+                return [X for X in X]
+            """,
+            # Python evaluates the outermost iterable of a comprehension
+            # in the enclosing scope, so the ``X`` in ``for X in X``
+            # still resolves to the module-level ``X``. The comprehension
+            # target then shadows it for the element expression.
+            {
+                "mod.X -> mod",
+                "mod.f -> mod",
+                "mod.f -> mod.X",
+            },
+            id="comprehension-iterable-uses-enclosing-scope",
+        ),
     ],
 )
 def test_declarations(build_decl_graph, assert_edges, src, expected_edges):
