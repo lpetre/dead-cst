@@ -1,4 +1,4 @@
-"""Prototype flow-sensitive referent filter (phase 2).
+"""Flow-sensitive referent filter.
 
 Given a single access and a set of candidate referents that all share
 one lexical scope (which is what ``ScopeProvider`` guarantees -- see
@@ -23,9 +23,10 @@ Rules applied during a forward pass over the scope's statement list:
 
 Not yet modelled: walrus expressions, ``global`` / ``nonlocal``
 rebindings, exception re-raise edges, ``match`` statements, ``del``.
-This is a prototype -- it is *not* wired into the edge resolution
-pass. See ``tests/test_flow_sensitive_filter.py`` for the cases it
-currently handles.
+Wired into edge resolution via ``SymbolVisitor``; see
+``tests/test_flow_sensitive_filter.py`` for the filter's own cases
+and ``tests/test_declarations.py::test_shadowed_declarations`` for
+the end-to-end behaviour.
 """
 
 from __future__ import annotations
