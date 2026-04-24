@@ -4,6 +4,8 @@ Python dead code analysis using [libcst](https://github.com/Instagram/LibCST).
 
 `dead-cst` builds a full symbol graph of your Python codebase, walks from your entrypoints, and reports (or removes) anything unreachable.
 
+> **Pre-release software.** `dead-cst` is in early alpha. APIs, CLI flags, and output formats may change without notice, and bugs are expected. Do not run `dead-cst remove` against code that isn't committed to version control.
+
 ## Installation
 
 ```bash
