@@ -14,6 +14,14 @@ import networkx as nx
 import typer
 
 from . import build_symbol_graph, count_nodes, find_reachable, order_paths, remove_code
+from ._plugins import (
+    CSTAwareEdgePlugin,
+    DunderAllPlugin,
+    EdgePlugin,
+    ExplicitEntrypointPlugin,
+    load_plugin,
+)
+from ._resolvers import load_resolver, merge_paths
 from ._symbols import SymbolNode
 
 app = typer.Typer(help="Dead code analysis for Python using libcst.")
@@ -37,6 +45,41 @@ def parse_entrypoint(ep: str) -> str | re.Pattern[str]:
     if ep.startswith("re:"):
         return re.compile(ep[3:])
     return ep
+
+
+def build_plugins(
+    *,
+    entrypoints: list[str],
+    plugin_names: list[str],
+    preserve_dunder_all: bool,
+) -> list[EdgePlugin | CSTAwareEdgePlugin]:
+    """Compose the plugin list from CLI flags.
+
+    Order: user-specified plugins first, then ``DunderAllPlugin`` (if
+    enabled), then ``ExplicitEntrypointPlugin`` with the ``-e`` specs.
+    ``-e`` runs last so it can hang entrypoints off any synthetic nodes
+    contributed upstream.
+    """
+    plugins: list[EdgePlugin | CSTAwareEdgePlugin] = []
+    for name in plugin_names:
+        plugins.append(load_plugin(name))
+    if preserve_dunder_all:
+        plugins.append(DunderAllPlugin())
+    if entrypoints:
+        specs = [parse_entrypoint(ep) for ep in entrypoints]
+        plugins.append(ExplicitEntrypointPlugin(specs=specs))
+    return plugins
+
+
+def resolve_paths(
+    root: Path, path_specs: list[str], resolver_names: list[str]
+) -> dict[Path, list[Path]]:
+    """Merge ``-p`` specs and ``--resolver`` outputs into a single path map."""
+    explicit = parse_paths(root, path_specs) if path_specs else {}
+    resolved_maps = [load_resolver(name).resolve(root) for name in resolver_names]
+    if not explicit and not resolved_maps:
+        return {root: []}
+    return merge_paths(explicit, *resolved_maps)
 
 
 def parse_paths(root: Path, paths_str: list[str]) -> dict[Path, list[Path]]:
@@ -82,16 +125,24 @@ def main(
 def analyze(
     root: Annotated[Path, typer.Argument(help="Root directory to analyze.")],
     entrypoint: Annotated[
-        list[str],
+        Optional[list[str]],
         typer.Option(
             "-e",
             "--entrypoint",
             help="Entrypoint: file path, FQN, or 're:pattern' for regex.",
         ),
-    ],
+    ] = None,
     path: Annotated[
         Optional[list[str]],
         typer.Option("-p", "--path", help="Search path spec: 'base:dep1,dep2' or 'base'."),
+    ] = None,
+    resolver: Annotated[
+        Optional[list[str]],
+        typer.Option("--resolver", help="Path resolver to run (e.g. venv, pyproject)."),
+    ] = None,
+    plugin: Annotated[
+        Optional[list[str]],
+        typer.Option("--plugin", help="Edge plugin to run (e.g. main_block, project_scripts)."),
     ] = None,
     preserve_dunder_all: Annotated[bool, typer.Option(help="Keep __all__ variables alive.")] = True,
     verbose: Annotated[
@@ -105,18 +156,16 @@ def analyze(
     setup_logging(verbose)
     root = root.resolve()
 
-    paths_dict = parse_paths(root, path or [])
+    paths_dict = resolve_paths(root, path or [], resolver or [])
 
     typer.echo(f"Building symbol graph for {root}...", err=True)
-    graph = build_symbol_graph(paths_dict)
-
-    eps = [parse_entrypoint(ep) for ep in entrypoint]
-    reachable = find_reachable(graph, root, eps)
-
-    if preserve_dunder_all:
-        for node in graph.nodes:
-            if node.fqname.endswith("__all__") and node.type == "variable":
-                reachable.add(node)
+    plugins = build_plugins(
+        entrypoints=entrypoint or [],
+        plugin_names=plugin or [],
+        preserve_dunder_all=preserve_dunder_all,
+    )
+    graph = build_symbol_graph(paths_dict, plugins=plugins, project_root=root)
+    reachable = find_reachable(graph)
 
     unreachable_graph = graph.subgraph([n for n in graph.nodes if n not in reachable])
 
@@ -202,6 +251,15 @@ def why_alive(
         Optional[list[str]],
         typer.Option("-p", "--path", help="Search path spec: 'base:dep1,dep2' or 'base'."),
     ] = None,
+    resolver: Annotated[
+        Optional[list[str]],
+        typer.Option("--resolver", help="Path resolver to run (e.g. venv, pyproject)."),
+    ] = None,
+    plugin: Annotated[
+        Optional[list[str]],
+        typer.Option("--plugin", help="Edge plugin to run (e.g. main_block, project_scripts)."),
+    ] = None,
+    preserve_dunder_all: Annotated[bool, typer.Option(help="Keep __all__ variables alive.")] = True,
     verbose: Annotated[
         bool, typer.Option("-v", "--verbose", help="Enable verbose output.")
     ] = False,
@@ -210,10 +268,15 @@ def why_alive(
     setup_logging(verbose)
     root = root.resolve()
 
-    paths_dict = parse_paths(root, path or [])
+    paths_dict = resolve_paths(root, path or [], resolver or [])
 
     typer.echo(f"Building symbol graph for {root}...", err=True)
-    graph = build_symbol_graph(paths_dict)
+    plugins = build_plugins(
+        entrypoints=[],
+        plugin_names=plugin or [],
+        preserve_dunder_all=preserve_dunder_all,
+    )
+    graph = build_symbol_graph(paths_dict, plugins=plugins, project_root=root)
 
     target_node: SymbolNode | None = None
     for node in graph.nodes:
@@ -254,16 +317,24 @@ def why_alive(
 def remove(
     root: Annotated[Path, typer.Argument(help="Root directory to analyze.")],
     entrypoint: Annotated[
-        list[str],
+        Optional[list[str]],
         typer.Option(
             "-e",
             "--entrypoint",
             help="Entrypoint: file path, FQN, or 're:pattern' for regex.",
         ),
-    ],
+    ] = None,
     path: Annotated[
         Optional[list[str]],
         typer.Option("-p", "--path", help="Search path spec: 'base:dep1,dep2' or 'base'."),
+    ] = None,
+    resolver: Annotated[
+        Optional[list[str]],
+        typer.Option("--resolver", help="Path resolver to run (e.g. venv, pyproject)."),
+    ] = None,
+    plugin: Annotated[
+        Optional[list[str]],
+        typer.Option("--plugin", help="Edge plugin to run (e.g. main_block, project_scripts)."),
     ] = None,
     preserve_dunder_all: Annotated[bool, typer.Option(help="Keep __all__ variables alive.")] = True,
     verbose: Annotated[
@@ -277,18 +348,16 @@ def remove(
     setup_logging(verbose)
     root = root.resolve()
 
-    paths_dict = parse_paths(root, path or [])
+    paths_dict = resolve_paths(root, path or [], resolver or [])
 
     typer.echo(f"Building symbol graph for {root}...", err=True)
-    graph = build_symbol_graph(paths_dict)
-
-    eps = [parse_entrypoint(ep) for ep in entrypoint]
-    reachable = find_reachable(graph, root, eps)
-
-    if preserve_dunder_all:
-        for node in graph.nodes:
-            if node.fqname.endswith("__all__") and node.type == "variable":
-                reachable.add(node)
+    plugins = build_plugins(
+        entrypoints=entrypoint or [],
+        plugin_names=plugin or [],
+        preserve_dunder_all=preserve_dunder_all,
+    )
+    graph = build_symbol_graph(paths_dict, plugins=plugins, project_root=root)
+    reachable = find_reachable(graph)
 
     unreachable_graph = graph.subgraph([n for n in graph.nodes if n not in reachable])
 

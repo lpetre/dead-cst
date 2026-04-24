@@ -45,6 +45,8 @@ dead-cst analyze ROOT -e ENTRYPOINT [OPTIONS]
 |---|---|
 | `-e, --entrypoint` | Entrypoint: file path, FQN, or `re:pattern` for regex (repeatable) |
 | `-p, --path` | Search path spec: `base:dep1,dep2` or `base` (repeatable) |
+| `--resolver` | Path resolver to run, e.g. `venv`, `pyproject` (repeatable) |
+| `--plugin` | Edge plugin to run, e.g. `main_block`, `project_scripts` (repeatable) |
 | `--preserve-dunder-all / --no-preserve-dunder-all` | Keep `__all__` variables alive (default: true) |
 | `--format` | Output format: `text` or `json` |
 | `-v, --verbose` | Enable verbose logging |
@@ -74,17 +76,44 @@ dead-cst remove ROOT -e ENTRYPOINT [OPTIONS]
 ## Python API
 
 ```python
+import re
 from pathlib import Path
-from dead_cst import build_symbol_graph, find_reachable, remove_code
+from dead_cst import (
+    build_symbol_graph,
+    ExplicitEntrypointPlugin,
+    MainBlockPlugin,
+    find_reachable,
+    remove_code,
+)
 
 root = Path("./src")
-graph = build_symbol_graph({root: []})
-reachable = find_reachable(graph, root, ["re:.*__main__\\.py"])
+graph = build_symbol_graph(
+    {root: []},
+    plugins=[
+        MainBlockPlugin(),
+        ExplicitEntrypointPlugin(specs=[re.compile(r".*__main__\.py")]),
+    ],
+    project_root=root,
+)
+reachable = find_reachable(graph)
 
 unreachable = graph.subgraph([n for n in graph.nodes if n not in reachable])
 # Inspect unreachable nodes, or remove them:
 remove_code(unreachable, root)
 ```
+
+Entrypoint detection is now fully plugin-driven. Builtins:
+
+| Plugin | Purpose |
+|---|---|
+| `MainBlockPlugin` | Mark modules containing `if __name__ == "__main__":` as entrypoints |
+| `ProjectScriptsPlugin` | Read `pyproject.toml [project.scripts]` and mark each target as an entrypoint |
+| `ExplicitEntrypointPlugin` | Match user-supplied file paths / FQNs / regexes (powers the `-e` flag) |
+| `DunderAllPlugin` | Keep top-level `__all__` variables alive (powers `--preserve-dunder-all`) |
+
+Write your own by implementing the `EdgePlugin` or `CSTAwareEdgePlugin` protocol; register under the `dead_cst.plugins` entry-point group for CLI discovery.
+
+Path resolution is similarly pluggable. `PathResolver` implementations return a `{base: [dep_paths]}` map to feed `build_symbol_graph`. Builtins: `VenvResolver`, `PyprojectResolver`. Third-party resolvers register under `dead_cst.resolvers`.
 
 ## Graph model
 
