@@ -87,6 +87,12 @@ class SymbolVisitor(cst.CSTVisitor):
         else:
             targets = [node.target]
 
+        # For `x: T` (AnnAssign without a value) treat the annotation as the
+        # rhs so references inside it are attributed to the new symbol.
+        rhs = node.value
+        if rhs is None and isinstance(node, cst.AnnAssign):
+            rhs = node.annotation
+
         value_to_syms = {}
         for target in reversed(targets):
             full_name = get_full_name_for_node(target)
@@ -98,11 +104,11 @@ class SymbolVisitor(cst.CSTVisitor):
             if isinstance(target, cst.Tuple):
                 names = [t.value for t in target.elements]
 
-            values = [node.value]
+            values = [rhs]
 
             # this can happen with unpacking, e.g. `a, b = (1, 2)`
-            if len(names) > len(values) and isinstance(node.value, cst.Tuple):
-                values = [v.value for v in node.value.elements]
+            if len(names) > len(values) and isinstance(rhs, cst.Tuple):
+                values = [v.value for v in rhs.elements]
 
             if len(names) > len(values) and len(values) == 1:
                 # This can happen with unpacking, e.g. `a, b = f()`
@@ -117,9 +123,9 @@ class SymbolVisitor(cst.CSTVisitor):
                     self._push_decl(name, sym)
                     value_to_syms.setdefault(value, []).append(sym)
 
-        values = [node.value]
-        if isinstance(node.value, cst.Tuple):
-            values += [v.value for v in node.value.elements]
+        values = [rhs] if rhs is not None else []
+        if isinstance(rhs, cst.Tuple):
+            values += [v.value for v in rhs.elements]
 
         for value in reversed(values):
             if syms := value_to_syms.get(value):

@@ -302,6 +302,18 @@ import pytest
         ),
         pytest.param(
             """
+            T = int
+            x: T
+            """,
+            {
+                "mod.T -> mod",
+                "mod.x -> mod",
+                "mod.x -> mod.T",
+            },
+            id="annotated-assign-without-value",
+        ),
+        pytest.param(
+            """
             a, b = 1, 2
             c, d = a, b
             """,
