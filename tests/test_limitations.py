@@ -280,8 +280,6 @@ def test_limitation(build_decl_graph, assert_edges, files, expected_edges):
         ),
     ],
 )
-def test_redeclaration_limitation(
-    build_decl_graph, assert_positional_edges, files, expected_edges
-):
+def test_redeclaration_limitation(build_decl_graph, assert_positional_edges, files, expected_edges):
     graph = build_decl_graph(files)
     assert_positional_edges(graph, expected_edges)
