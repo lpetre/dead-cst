@@ -71,9 +71,7 @@ def live_referents(
     def _contains_access(node: cst.CSTNode) -> bool:
         return access_id in _descendant_ids(node, cache)
 
-    def _flow(
-        stmts: Sequence[cst.BaseStatement], incoming: set[cst.CSTNode]
-    ) -> set[cst.CSTNode]:
+    def _flow(stmts: Sequence[cst.BaseStatement], incoming: set[cst.CSTNode]) -> set[cst.CSTNode]:
         state = set(incoming)
         for stmt in stmts:
             # Record the state the access sees *before* any bindings

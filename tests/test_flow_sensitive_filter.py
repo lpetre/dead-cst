@@ -254,9 +254,7 @@ def test_straight_line_shadowing(
         ),
     ],
 )
-def test_branches_preserved(
-    src: str, name: str, access_line: int, expected: list[int]
-) -> None:
+def test_branches_preserved(src: str, name: str, access_line: int, expected: list[int]) -> None:
     assert _live_lines(src, name, access_line) == expected
 
 
