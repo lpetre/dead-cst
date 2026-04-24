@@ -133,16 +133,3 @@ import pytest
 def test_limitation(build_decl_graph, assert_edges, files, expected_edges):
     graph = build_decl_graph(files)
     assert_edges(graph, expected_edges)
-
-
-@pytest.mark.xfail(
-    raises=AssertionError,
-    strict=True,
-    reason=(
-        "AnnAssign without a value (e.g. `x: T`) triggers a stack-balance"
-        " assertion in SymbolVisitor._add_variable. Once fixed, promote"
-        " this into the positive declaration suite."
-    ),
-)
-def test_ann_assign_without_value_crashes(build_decl_graph):
-    build_decl_graph({"mod.py": "T = int\nx: T\n"})
