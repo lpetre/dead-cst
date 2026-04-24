@@ -1,5 +1,4 @@
 import logging
-import re
 from pathlib import Path
 from typing import Sequence
 
@@ -92,11 +91,13 @@ def build_symbol_graph(
         )
         for plugin in plugins:
             if isinstance(plugin, CSTAwareEdgePlugin):
-                ops = plugin.contribute(ctx, base_managers)
+                ops = list(plugin.contribute(ctx, base_managers))
             elif isinstance(plugin, EdgePlugin):
-                ops = plugin.contribute(ctx)
+                ops = list(plugin.contribute(ctx))
             else:
                 raise TypeError(f"Plugin {plugin!r} does not satisfy EdgePlugin protocol")
+            # Materialize before applying so plugins can iterate ctx.graph.nodes
+            # without tripping "dictionary changed size during iteration".
             apply_ops(symbol_graph, ops)
 
     return symbol_graph
@@ -109,30 +110,22 @@ def _infer_project_root(paths: dict[Path, list[Path]]) -> Path:
     return min(bases, key=lambda p: len(p.parts))
 
 
-def find_reachable(
-    graph: nx.DiGraph, root: Path, entrypoints: list[str | Path | re.Pattern]
-) -> set[SymbolNode]:
-    visited = set()
+def find_reachable(graph: nx.DiGraph) -> set[SymbolNode]:
+    """BFS forward from every node tagged as an entrypoint by a plugin.
 
-    def _is_entrypoint(sym: SymbolNode) -> bool:
-        rel = str(sym.path.relative_to(root))
-        for e in entrypoints:
-            if isinstance(e, str):
-                if e == rel or e == sym.fqname:
-                    return True
-            elif isinstance(e, re.Pattern):
-                if e.match(rel):
-                    return True
-        return False
-
-    stack = [e for e in graph.nodes if _is_entrypoint(e)]
+    Plugins mark seeds by setting ``graph.nodes[node]["entrypoint"] = True``
+    (see :func:`dead_cst._plugins.apply_ops`). There is no longer any
+    built-in matching against file paths or FQNs -- that lives in
+    :class:`ExplicitEntrypointPlugin`.
+    """
+    visited: set[SymbolNode] = set()
+    stack = [n for n, attrs in graph.nodes(data=True) if attrs.get("entrypoint")]
     while stack:
         node = stack.pop()
         if node in visited:
             continue
         visited.add(node)
         stack.extend(graph.successors(node))
-
     return visited
 
 
