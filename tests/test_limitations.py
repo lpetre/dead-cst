@@ -76,110 +76,6 @@ import pytest
             },
             id="getattr-dynamic-access-produces-no-edge",
         ),
-        # ------------------------------------------------------------------
-        # Cross-kind redeclarations keep the shadowed symbol alive
-        # ------------------------------------------------------------------
-        pytest.param(
-            {
-                "other.py": "def f(): pass\n",
-                "mod.py": """
-                from other import f
-                def f(): pass
-                f()
-                """,
-            },
-            # ``def f`` shadows the earlier ``from other import f``, so
-            # at runtime the module-level ``f()`` always calls the local
-            # function. Ideally no edges would point at ``other`` -- the
-            # import is dead. Today the shadowed import node is kept in
-            # the graph and its edges reach ``other.f``, keeping ``other``
-            # alive as a false positive.
-            {
-                "mod -> mod.f",
-                "mod -> other",
-                "mod -> other.f",
-                "mod.f -> mod",
-                "mod.f -> other",
-                "mod.f -> other.f",
-                "other.f -> other",
-            },
-            id="import-shadowed-by-function-keeps-import-alive",
-        ),
-        pytest.param(
-            {
-                "other.py": "def f(): pass\n",
-                "mod.py": """
-                def f(): pass
-                from other import f
-                f()
-                """,
-            },
-            # Symmetric case: the import shadows the prior ``def`` but
-            # both declarations survive in the graph with the same fqname.
-            {
-                "mod -> mod.f",
-                "mod -> other",
-                "mod -> other.f",
-                "mod.f -> mod",
-                "mod.f -> other",
-                "mod.f -> other.f",
-                "other.f -> other",
-            },
-            id="function-shadowed-by-import-keeps-function-alive",
-        ),
-        pytest.param(
-            {
-                "other.py": "def f(): pass\n",
-                "mod.py": """
-                from other import f
-                f = 1
-                print(f)
-                """,
-            },
-            # ``f = 1`` clobbers the import, so ``print(f)`` never
-            # reaches ``other``. Ideally ``other`` would be unreachable,
-            # but the shadowed import node is kept alive and its upstream
-            # edges drag ``other`` / ``other.f`` into the graph.
-            {
-                "mod -> mod.f",
-                "mod -> other",
-                "mod -> other.f",
-                "mod.f -> mod",
-                "mod.f -> other",
-                "mod.f -> other.f",
-                "other.f -> other",
-            },
-            id="import-rebound-to-constant-keeps-import-alive",
-        ),
-        pytest.param(
-            {
-                "a.py": "def x(): pass\n",
-                "b.py": "def x(): pass\n",
-                "mod.py": """
-                from a import x
-                from b import x
-                x()
-                """,
-            },
-            # The second import shadows the first, so only ``b.x`` is
-            # reachable at runtime. Today both imports produce nodes and
-            # both upstream modules stay alive.
-            {
-                "a.x -> a",
-                "b.x -> b",
-                "mod -> a",
-                "mod -> a.x",
-                "mod -> b",
-                "mod -> b.x",
-                "mod -> mod.x",
-                "mod.x -> a",
-                "mod.x -> a.x",
-                "mod.x -> b",
-                "mod.x -> b.x",
-                "mod.x -> mod",
-            },
-            id="two-imports-same-alias-both-kept-alive",
-        ),
         pytest.param(
             {
                 "mod.py": """
@@ -196,11 +92,124 @@ import pytest
             },
             id="del-does-not-remove-declaration",
         ),
+    ],
+)
+def test_limitation(build_decl_graph, assert_edges, files, expected_edges):
+    graph = build_decl_graph(files)
+    assert_edges(graph, expected_edges)
+
+
+@pytest.mark.parametrize(
+    "files, expected_edges",
+    [
         # ------------------------------------------------------------------
-        # Same-kind redeclarations collapse to one graph node, so any
-        # references made from the body of a shadowed (and therefore
-        # unreachable) declaration are folded into the surviving node
-        # and keep their targets alive.
+        # Cross-kind shadowing: both the shadowed and shadowing decl
+        # survive as distinct nodes at the same fqname, so the shadowed
+        # node's upstream edges keep its (dead) import source alive.
+        # ------------------------------------------------------------------
+        pytest.param(
+            {
+                "other.py": "def f(): pass\n",
+                "mod.py": """
+                from other import f
+                def f(): pass
+                f()
+                """,
+            },
+            # The import at col 18 and the ``def`` at col 0 are distinct
+            # nodes. The shadowed import still has outgoing edges to
+            # ``other`` / ``other.f``, and the module-level call reaches
+            # both, so ``other`` stays alive.
+            {
+                "mod -> mod.f@1:18",
+                "mod -> mod.f@2:0",
+                "mod -> other",
+                "mod -> other.f@1:0",
+                "mod.f@1:18 -> other",
+                "mod.f@1:18 -> other.f@1:0",
+                "mod.f@2:0 -> mod",
+                "other.f@1:0 -> other",
+            },
+            id="import-shadowed-by-function-keeps-import-alive",
+        ),
+        pytest.param(
+            {
+                "other.py": "def f(): pass\n",
+                "mod.py": """
+                def f(): pass
+                from other import f
+                f()
+                """,
+            },
+            {
+                "mod -> mod.f@1:0",
+                "mod -> mod.f@2:18",
+                "mod -> other",
+                "mod -> other.f@1:0",
+                "mod.f@2:18 -> mod",
+                "mod.f@2:18 -> other",
+                "mod.f@2:18 -> other.f@1:0",
+                "other.f@1:0 -> other",
+            },
+            id="function-shadowed-by-import-keeps-function-alive",
+        ),
+        pytest.param(
+            {
+                "other.py": "def f(): pass\n",
+                "mod.py": """
+                from other import f
+                f = 1
+                print(f)
+                """,
+            },
+            {
+                "mod -> mod.f@1:18",
+                "mod -> mod.f@2:0",
+                "mod -> other",
+                "mod -> other.f@1:0",
+                "mod.f@1:18 -> other",
+                "mod.f@1:18 -> other.f@1:0",
+                "mod.f@2:0 -> mod",
+                "other.f@1:0 -> other",
+            },
+            id="import-rebound-to-constant-keeps-import-alive",
+        ),
+        pytest.param(
+            {
+                "a.py": "def x(): pass\n",
+                "b.py": "def x(): pass\n",
+                "mod.py": """
+                from a import x
+                from b import x
+                x()
+                """,
+            },
+            # Two distinct ``mod.x`` import nodes, one per source module.
+            # Both stay alive, dragging ``a`` and ``b`` along.
+            {
+                "a.x@1:0 -> a",
+                "b.x@1:0 -> b",
+                "mod -> a",
+                "mod -> a.x@1:0",
+                "mod -> b",
+                "mod -> b.x@1:0",
+                "mod -> mod.x@1:14",
+                "mod -> mod.x@2:14",
+                "mod.x@1:14 -> a",
+                "mod.x@1:14 -> a.x@1:0",
+                "mod.x@2:14 -> b",
+                "mod.x@2:14 -> b.x@1:0",
+                "mod.x@2:14 -> mod",
+            },
+            id="two-imports-same-alias-both-kept-alive",
+        ),
+        # ------------------------------------------------------------------
+        # Same-kind redeclaration: node identity is now per-position, so
+        # each ``def f`` is its own node. The shadowed node still has
+        # outgoing body edges which keep their targets alive -- phase 2
+        # (flow-sensitive referent filtering) should drop the edge
+        # ``mod -> <shadowed>`` at the call site so the dead body
+        # becomes unreachable and collects dead_helper along with it.
         # ------------------------------------------------------------------
         pytest.param(
             {
@@ -211,18 +220,18 @@ import pytest
                 f()
                 """,
             },
-            # The first ``def f`` is shadowed before it's ever called,
-            # so its body never runs -- ``dead_helper`` is dead. Because
-            # ``SymbolNode`` hashes on (fqname, type, path) both ``def f``
-            # nodes collapse into one, and the edge from the dead body
-            # keeps ``dead_helper`` alive.
+            # ``mod.f@2:0`` is the shadowed decl; it has the body edge
+            # to ``dead_helper`` and no parent edge (trie only keeps the
+            # last). ``f()`` reaches both f nodes, so the dead body is
+            # kept alive -- false positive.
             {
-                "mod -> mod.f",
-                "mod.dead_helper -> mod",
-                "mod.f -> mod",
-                "mod.f -> mod.dead_helper",
+                "mod -> mod.f@2:0",
+                "mod -> mod.f@3:0",
+                "mod.dead_helper@1:0 -> mod",
+                "mod.f@2:0 -> mod.dead_helper@1:0",
+                "mod.f@3:0 -> mod",
             },
-            id="dead-function-body-kept-alive-by-node-collapse",
+            id="dead-function-body-kept-alive",
         ),
         pytest.param(
             {
@@ -234,16 +243,14 @@ import pytest
                 C()
                 """,
             },
-            # The first ``C`` is shadowed, so its method ``m`` is never
-            # reachable and ``dead_helper`` is dead. The two ``C`` class
-            # nodes collapse into one and the method-body edge survives.
             {
-                "mod -> mod.C",
-                "mod.C -> mod",
-                "mod.C -> mod.dead_helper",
-                "mod.dead_helper -> mod",
+                "mod -> mod.C@2:0",
+                "mod -> mod.C@4:0",
+                "mod.C@2:0 -> mod.dead_helper@1:0",
+                "mod.C@4:0 -> mod",
+                "mod.dead_helper@1:0 -> mod",
             },
-            id="dead-method-body-kept-alive-by-node-collapse",
+            id="dead-method-body-kept-alive",
         ),
         pytest.param(
             {
@@ -256,21 +263,25 @@ import pytest
                 f()
                 """,
             },
-            # All but the last ``def f`` are dead, so both ``a`` and
-            # ``b`` are only referenced from unreachable bodies. Node
-            # collapse keeps both alive.
+            # Three ``def f`` nodes. The call site reaches all three;
+            # only the last has a parent edge. The body edges to ``a``
+            # and ``b`` live on the shadowed nodes at lines 3 and 4.
             {
-                "mod -> mod.f",
-                "mod.a -> mod",
-                "mod.b -> mod",
-                "mod.f -> mod",
-                "mod.f -> mod.a",
-                "mod.f -> mod.b",
+                "mod -> mod.f@3:0",
+                "mod -> mod.f@4:0",
+                "mod -> mod.f@5:0",
+                "mod.a@1:0 -> mod",
+                "mod.b@2:0 -> mod",
+                "mod.f@3:0 -> mod.a@1:0",
+                "mod.f@4:0 -> mod.b@2:0",
+                "mod.f@5:0 -> mod",
             },
             id="chain-of-shadowed-functions-keeps-all-bodies-alive",
         ),
     ],
 )
-def test_limitation(build_decl_graph, assert_edges, files, expected_edges):
+def test_redeclaration_limitation(
+    build_decl_graph, assert_positional_edges, files, expected_edges
+):
     graph = build_decl_graph(files)
-    assert_edges(graph, expected_edges)
+    assert_positional_edges(graph, expected_edges)
