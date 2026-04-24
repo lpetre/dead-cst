@@ -1,0 +1,10 @@
+[project]
+name = "app"
+version = "0.0.0"
+description = "App half of the dead-cst uv-workspace demo. Depends on the workspace 'core' package."
+requires-python = ">=3.11"
+dependencies = ["core"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
