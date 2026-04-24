@@ -144,3 +144,116 @@ def test_scope_provider_returns_all_in_scope_bindings(
     for discarding the dead ones.
     """
     assert _access_referents(src, name) == expected
+
+
+@pytest.mark.parametrize(
+    "src, name, expected",
+    [
+        pytest.param(
+            """
+            x = 1
+            def foo():
+                x = 2
+            print(x)
+            """,
+            "x",
+            [(4, [("Assignment", 1)])],
+            id="rebind-in-nested-function-does-not-leak-to-outer",
+        ),
+        pytest.param(
+            """
+            x = 1
+            def foo():
+                print(x)
+            """,
+            "x",
+            [(3, [("Assignment", 1)])],
+            id="outer-binding-visible-from-inner-scope",
+        ),
+        pytest.param(
+            """
+            def f(): pass
+            def outer():
+                def f(): pass
+                f()
+            """,
+            "f",
+            [(4, [("Assignment", 3)])],
+            id="inner-def-shadows-outer-for-inner-uses",
+        ),
+        pytest.param(
+            """
+            x = 1
+            [x for x in range(3)]
+            print(x)
+            """,
+            "x",
+            [
+                (2, [("Assignment", 2)]),
+                (3, [("Assignment", 1)]),
+            ],
+            # Comprehensions get their own scope in Py3. The outer
+            # ``print(x)`` correctly resolves to ``x = 1`` even though
+            # a comprehension rebound ``x`` between them.
+            id="comprehension-variable-does-not-leak",
+        ),
+        pytest.param(
+            """
+            if cond:
+                x = 1
+            else:
+                x = 2
+            print(x)
+            """,
+            "x",
+            [(5, [("Assignment", 2), ("Assignment", 4)])],
+            # ``if`` is not a new scope and neither branch dominates
+            # the other -- both bindings are valid at the access.
+            # Any phase-2 filter that drops either edge here is wrong.
+            id="if-else-branches-both-correct",
+        ),
+        pytest.param(
+            """
+            try:
+                x = 1
+            except Exception:
+                x = 2
+            print(x)
+            """,
+            "x",
+            [(5, [("Assignment", 2), ("Assignment", 4)])],
+            # Same structural story as if/else, and the pattern most
+            # likely to appear in real code (optional-import fallbacks).
+            id="try-except-branches-both-correct",
+        ),
+        pytest.param(
+            """
+            def foo():
+                x = 1
+                x = 2
+                print(x)
+            """,
+            "x",
+            [(4, [("Assignment", 2), ("Assignment", 3)])],
+            # Proves the shadowing case occurs inside function scopes
+            # too, not just at module level. Phase 2 must drop the
+            # edge to line 2.
+            id="same-function-scope-shadowing",
+        ),
+    ],
+)
+def test_scope_provider_respects_nesting(
+    src: str, name: str, expected: list[tuple[int, list[tuple[str, int]]]]
+) -> None:
+    """ScopeProvider already filters by lexical scope.
+
+    Nesting boundaries (functions, comprehensions) are respected:
+    rebindings in a nested scope never appear as referents for an
+    access in a containing scope, and shadowed outer bindings do not
+    appear for an access in a nested scope. Conversely, ``if`` /
+    ``try`` are NOT new scopes, so their branch bindings both surface
+    -- and when neither branch dominates the access, both are the
+    correct answer. This means phase-2 filtering is a dominator
+    question within a single scope, not a cross-scope one.
+    """
+    assert _access_referents(src, name) == expected
