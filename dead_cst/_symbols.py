@@ -18,7 +18,7 @@ class Import:
 @dataclass(frozen=True, slots=True)
 class SymbolNode:
     fqname: str
-    type: Literal["module", "class", "function", "variable", "import"]
+    type: Literal["module", "class", "function", "variable", "import", "synthetic"]
     path: Path
     position: CodeRange
     imports: Import | None = None

@@ -1,10 +1,17 @@
 import logging
 import re
 from pathlib import Path
+from typing import Sequence
 
 import networkx as nx
 from libcst.metadata import FullRepoManager, FullyQualifiedNameProvider
 
+from ._plugins import (
+    CSTAwareEdgePlugin,
+    EdgePlugin,
+    PluginContext,
+    apply_ops,
+)
 from ._resolve import resolve_edges, safe_resolve_module, temp_sys_path
 from ._symbols import SymbolNode, SymbolTrie
 from ._visitor import SymbolVisitor
@@ -21,9 +28,16 @@ def order_paths(paths: dict[Path, list[Path]]) -> list[Path]:
     return list(nx.topological_sort(path_order))
 
 
-def build_symbol_graph(paths: dict[Path, list[Path]]) -> nx.DiGraph:
+def build_symbol_graph(
+    paths: dict[Path, list[Path]],
+    *,
+    plugins: Sequence[EdgePlugin | CSTAwareEdgePlugin] = (),
+    project_root: Path | None = None,
+) -> nx.DiGraph:
     symbol_graph = nx.DiGraph()
-    base_tries = dict()
+    base_tries: dict[Path, SymbolTrie] = {}
+    base_managers: dict[Path, FullRepoManager] = {}
+    symbol_lookup: SymbolTrie = SymbolTrie()
     for base in order_paths(paths):
         logger.debug("Processing base path: %s", base)
         search_paths = [base] + paths.get(base, [])
@@ -33,6 +47,7 @@ def build_symbol_graph(paths: dict[Path, list[Path]]) -> nx.DiGraph:
             import_edges = set()
             files = list(sorted(base.rglob("*.py")))
             mgr = FullRepoManager(base, files, {FullyQualifiedNameProvider})
+            base_managers[base] = mgr
             for file in files:
                 wrapper = mgr.get_metadata_wrapper_for_path(file)
                 visitor = SymbolVisitor(file, search_paths)
@@ -67,7 +82,31 @@ def build_symbol_graph(paths: dict[Path, list[Path]]) -> nx.DiGraph:
             for src, dst in resolve_edges(import_edges, symbol_lookup):
                 symbol_graph.add_edge(src, dst)
 
+    if plugins:
+        root = project_root or _infer_project_root(paths)
+        ctx = PluginContext(
+            graph=symbol_graph,
+            symbol_lookup=symbol_lookup,
+            paths=paths,
+            project_root=root,
+        )
+        for plugin in plugins:
+            if isinstance(plugin, CSTAwareEdgePlugin):
+                ops = plugin.contribute(ctx, base_managers)
+            elif isinstance(plugin, EdgePlugin):
+                ops = plugin.contribute(ctx)
+            else:
+                raise TypeError(f"Plugin {plugin!r} does not satisfy EdgePlugin protocol")
+            apply_ops(symbol_graph, ops)
+
     return symbol_graph
+
+
+def _infer_project_root(paths: dict[Path, list[Path]]) -> Path:
+    bases = list(paths)
+    if not bases:
+        return Path.cwd()
+    return min(bases, key=lambda p: len(p.parts))
 
 
 def find_reachable(
