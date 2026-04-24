@@ -39,9 +39,6 @@ build-backend = "hatchling.build"
 
 [tool.hatch.version]
 source = "vcs"
-# PyPI and TestPyPI reject PEP 440 local version identifiers (+gSHA),
-# which hatch-vcs adds to between-tag builds by default.
-raw-options = { local_scheme = "no-local-version" }
 
 [tool.hatch.build.hooks.vcs]
 version-file = "dead_cst/_version.py"
