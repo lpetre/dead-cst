@@ -86,9 +86,23 @@ unreachable = graph.subgraph([n for n in graph.nodes if n not in reachable])
 remove_code(unreachable, root)
 ```
 
+## Graph model
+
+The graph has one node per top-level declaration plus a synthetic module node per file. Edges run from a declaration to each symbol it references, and from every submodule to its parent package so `__init__.py` stays alive as long as anything in the package does. Entrypoints seed the reachability walk; every node not reached is reported as dead.
+
+A module-level `import` / `from ... import ...` is itself a declaration of type `"import"` in the current module. Uses of the imported name inside the file are wired through that local import node, and the import node in turn points at the upstream module (and, when applicable, at the specific imported symbol). Removing the last local use therefore makes the import itself dead, which is how `dead-cst remove` knows to drop now-unused import lines.
+
+## Scope
+
+`dead-cst` tracks top-level declarations only -- module-level functions, classes, and variables. Nested definitions (inner functions, methods, nested classes) are deliberately not given their own nodes; references made from inside those nested scopes are attributed to the enclosing top-level declaration. Keeping the containing top-level symbol alive keeps its nested source alive with it.
+
 ## Limitations
 
-- Only top-level declarations (functions, classes, variables) are tracked; nested definitions are not individually reported.
 - `import *` is not resolved.
 - Dynamic attribute access (`getattr`) and runtime-generated symbols are invisible to static analysis.
 - Only first-party code is analysed; third-party dependencies are treated as opaque.
+
+## TODO
+
+- Host API documentation on Read the Docs.
+- Fix the `AnnAssign`-without-value crash captured by `tests/test_limitations.py::test_ann_assign_without_value_crashes`.

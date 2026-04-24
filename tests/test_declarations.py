@@ -1,121 +1,567 @@
-def test_func(build_decl_graph, assert_edges):
+"""Tests for top-level declaration and assignment tracking.
+
+Each case is a single-module Python source. ``expected_edges`` lists
+*every* edge the resulting symbol graph should contain, so any stray or
+missing edge fails the test.
+"""
+
+import pytest
+
+
+@pytest.mark.parametrize(
+    "src, expected_edges",
+    [
+        # ------------------------------------------------------------------
+        # Functions
+        # ------------------------------------------------------------------
+        pytest.param(
+            """
+            def a(): pass
+            def b(): a()
+            b()
+            """,
+            {
+                "mod.a -> mod",
+                "mod.b -> mod",
+                "mod.b -> mod.a",
+                "mod -> mod.b",
+            },
+            id="function-call-and-module-entry",
+        ),
+        pytest.param(
+            """
+            async def a(): pass
+            async def b(): await a()
+            """,
+            {
+                "mod.a -> mod",
+                "mod.b -> mod",
+                "mod.b -> mod.a",
+            },
+            id="async-def",
+        ),
+        pytest.param(
+            """
+            def dec(f): return f
+            @dec
+            def f(): pass
+            """,
+            {
+                "mod.dec -> mod",
+                "mod.f -> mod",
+                "mod.f -> mod.dec",
+            },
+            id="bare-decorator",
+        ),
+        pytest.param(
+            """
+            def dec(x): return lambda f: f
+            P = 1
+            @dec(P)
+            def f(): pass
+            """,
+            {
+                "mod.P -> mod",
+                "mod.dec -> mod",
+                "mod.f -> mod",
+                "mod.f -> mod.P",
+                "mod.f -> mod.dec",
+            },
+            id="decorator-with-argument-reference",
+        ),
+        pytest.param(
+            """
+            def d1(f): return f
+            def d2(f): return f
+            @d1
+            @d2
+            def f(): pass
+            """,
+            {
+                "mod.d1 -> mod",
+                "mod.d2 -> mod",
+                "mod.f -> mod",
+                "mod.f -> mod.d1",
+                "mod.f -> mod.d2",
+            },
+            id="stacked-decorators",
+        ),
+        pytest.param(
+            """
+            D = 1
+            def f(x=D): return x
+            """,
+            {
+                "mod.D -> mod",
+                "mod.f -> mod",
+                "mod.f -> mod.D",
+            },
+            id="default-argument-reference",
+        ),
+        pytest.param(
+            """
+            D = 1
+            def f(x=D, /): return x
+            """,
+            {
+                "mod.D -> mod",
+                "mod.f -> mod",
+                "mod.f -> mod.D",
+            },
+            id="positional-only-default-reference",
+        ),
+        pytest.param(
+            """
+            D = 1
+            def f(*, x=D): return x
+            """,
+            {
+                "mod.D -> mod",
+                "mod.f -> mod",
+                "mod.f -> mod.D",
+            },
+            id="keyword-only-default-reference",
+        ),
+        pytest.param(
+            """
+            T = int
+            def f(x: T) -> T: return x
+            """,
+            {
+                "mod.T -> mod",
+                "mod.f -> mod",
+                "mod.f -> mod.T",
+            },
+            id="annotation-references-argument-and-return",
+        ),
+        pytest.param(
+            """
+            x = 1
+            f = lambda: x
+            """,
+            {
+                "mod.f -> mod",
+                "mod.f -> mod.x",
+                "mod.x -> mod",
+            },
+            id="lambda-closes-over-module-var",
+        ),
+        # ------------------------------------------------------------------
+        # Classes
+        # ------------------------------------------------------------------
+        pytest.param(
+            """
+            class A: pass
+            class B(A): pass
+            """,
+            {
+                "mod.A -> mod",
+                "mod.B -> mod",
+                "mod.B -> mod.A",
+            },
+            id="single-inheritance",
+        ),
+        pytest.param(
+            """
+            class A: pass
+            class B: pass
+            class C(A, B): pass
+            """,
+            {
+                "mod.A -> mod",
+                "mod.B -> mod",
+                "mod.C -> mod",
+                "mod.C -> mod.A",
+                "mod.C -> mod.B",
+            },
+            id="multiple-inheritance",
+        ),
+        pytest.param(
+            """
+            class Meta(type): pass
+            class C(metaclass=Meta): pass
+            """,
+            {
+                "mod.C -> mod",
+                "mod.C -> mod.Meta",
+                "mod.Meta -> mod",
+            },
+            id="metaclass-keyword",
+        ),
+        pytest.param(
+            """
+            def dec(c): return c
+            @dec
+            class C: pass
+            """,
+            {
+                "mod.C -> mod",
+                "mod.C -> mod.dec",
+                "mod.dec -> mod",
+            },
+            id="class-decorator",
+        ),
+        pytest.param(
+            """
+            X = 1
+            class C:
+                y = X
+                def m(self): return self.y
+            """,
+            {
+                "mod.C -> mod",
+                "mod.C -> mod.X",
+                "mod.X -> mod",
+            },
+            id="class-body-references-module-var",
+        ),
+        pytest.param(
+            """
+            def helper(): return 1
+            class C:
+                v = helper()
+            """,
+            {
+                "mod.C -> mod",
+                "mod.C -> mod.helper",
+                "mod.helper -> mod",
+            },
+            id="class-body-calls-module-function",
+        ),
+        pytest.param(
+            """
+            class A: pass
+            Base = A
+            class C(Base): pass
+            """,
+            {
+                "mod.A -> mod",
+                "mod.Base -> mod",
+                "mod.Base -> mod.A",
+                "mod.C -> mod",
+                "mod.C -> mod.Base",
+            },
+            id="class-base-is-variable-alias",
+        ),
+        pytest.param(
+            """
+            class E(Exception): pass
+            def f():
+                try: pass
+                except E: pass
+            """,
+            {
+                "mod.E -> mod",
+                "mod.f -> mod",
+                "mod.f -> mod.E",
+            },
+            id="exception-class-in-except-clause",
+        ),
+        pytest.param(
+            """
+            class CM:
+                def __enter__(self): return self
+                def __exit__(self, *a): ...
+            def f():
+                with CM() as c:
+                    pass
+            """,
+            {
+                "mod.CM -> mod",
+                "mod.f -> mod",
+                "mod.f -> mod.CM",
+            },
+            id="context-manager-class-in-with",
+        ),
+        # ------------------------------------------------------------------
+        # Variables and assignments
+        # ------------------------------------------------------------------
+        pytest.param(
+            """
+            a = 1
+            b = a
+            """,
+            {
+                "mod.a -> mod",
+                "mod.b -> mod",
+                "mod.b -> mod.a",
+            },
+            id="simple-variable-copy",
+        ),
+        pytest.param(
+            """
+            T = int
+            x: T = 1
+            """,
+            {
+                "mod.T -> mod",
+                "mod.x -> mod",
+                "mod.x -> mod.T",
+            },
+            id="annotated-assign-with-value",
+        ),
+        pytest.param(
+            """
+            a, b = 1, 2
+            c, d = a, b
+            """,
+            {
+                "mod.a -> mod",
+                "mod.b -> mod",
+                "mod.c -> mod",
+                "mod.c -> mod.a",
+                "mod.d -> mod",
+                "mod.d -> mod.b",
+            },
+            id="tuple-unpacking-pairwise",
+        ),
+        pytest.param(
+            """
+            def f(): return 1
+            def g(): return 2
+            a, b = f(), g()
+            """,
+            {
+                "mod.a -> mod",
+                "mod.a -> mod.f",
+                "mod.b -> mod",
+                "mod.b -> mod.g",
+                "mod.f -> mod",
+                "mod.g -> mod",
+            },
+            id="tuple-of-calls-pairwise",
+        ),
+        pytest.param(
+            """
+            xs = [1, 2, 3]
+            a, *b, c = xs
+            """,
+            {
+                "mod.a -> mod",
+                "mod.a -> mod.xs",
+                "mod.b -> mod",
+                "mod.c -> mod",
+                "mod.xs -> mod",
+            },
+            id="starred-target-in-tuple-unpacking",
+        ),
+        pytest.param(
+            """
+            def f(): return 1
+            def g(): return 2
+            if True: x = f()
+            else: x = g()
+            """,
+            {
+                "mod.f -> mod",
+                "mod.g -> mod",
+                "mod.x -> mod",
+                "mod.x -> mod.f",
+                "mod.x -> mod.g",
+            },
+            id="conditional-assignment-unifies-both-branches",
+        ),
+        pytest.param(
+            """
+            a = 1
+            b = a
+            a = 2
+            """,
+            {
+                "mod.a -> mod",
+                "mod.b -> mod",
+                "mod.b -> mod.a",
+            },
+            id="reassignment-does-not-duplicate-decl",
+        ),
+        pytest.param(
+            """
+            a = 1
+            a = a + 1
+            """,
+            {
+                "mod.a -> mod",
+            },
+            id="self-reference-drops-self-edge",
+        ),
+        pytest.param(
+            """
+            a = 1
+            b = 1
+            a += b
+            """,
+            {
+                "mod -> mod.b",
+                "mod.a -> mod",
+                "mod.b -> mod",
+            },
+            id="augmented-assign-rhs-is-module-level-read",
+        ),
+        # ------------------------------------------------------------------
+        # Expressions in RHS / control flow
+        # ------------------------------------------------------------------
+        pytest.param(
+            """
+            A = 1
+            B = 2
+            items = [A, B]
+            """,
+            {
+                "mod.A -> mod",
+                "mod.B -> mod",
+                "mod.items -> mod",
+                "mod.items -> mod.A",
+                "mod.items -> mod.B",
+            },
+            id="list-literal-references",
+        ),
+        pytest.param(
+            """
+            K = 1
+            V = 2
+            d = {K: V}
+            """,
+            {
+                "mod.K -> mod",
+                "mod.V -> mod",
+                "mod.d -> mod",
+                "mod.d -> mod.K",
+                "mod.d -> mod.V",
+            },
+            id="dict-literal-references",
+        ),
+        pytest.param(
+            """
+            A = [1]
+            B = [x for x in A if x]
+            """,
+            {
+                "mod.A -> mod",
+                "mod.B -> mod",
+                "mod.B -> mod.A",
+            },
+            id="list-comprehension-reference",
+        ),
+        pytest.param(
+            """
+            A = [1]
+            B = {x: x for x in A}
+            """,
+            {
+                "mod.A -> mod",
+                "mod.B -> mod",
+                "mod.B -> mod.A",
+            },
+            id="dict-comprehension-reference",
+        ),
+        pytest.param(
+            """
+            NAME = 'x'
+            def f(): return f'{NAME}'
+            """,
+            {
+                "mod.NAME -> mod",
+                "mod.f -> mod",
+                "mod.f -> mod.NAME",
+            },
+            id="fstring-interpolation-reference",
+        ),
+        pytest.param(
+            """
+            def f(): return 1
+            x = (y := f())
+            """,
+            {
+                "mod.f -> mod",
+                "mod.x -> mod",
+                "mod.x -> mod.f",
+            },
+            id="walrus-in-assignment-rhs",
+        ),
+        pytest.param(
+            """
+            data = [1]
+            for x in data: pass
+            """,
+            {
+                "mod -> mod.data",
+                "mod.data -> mod",
+            },
+            id="module-level-for-loop",
+        ),
+        pytest.param(
+            """
+            data = [1]
+            def f():
+                for x in data: pass
+            """,
+            {
+                "mod.data -> mod",
+                "mod.f -> mod",
+                "mod.f -> mod.data",
+            },
+            id="for-loop-inside-function",
+        ),
+        pytest.param(
+            """
+            a = [1,2]
+            def gen():
+                for x in a: yield x
+            """,
+            {
+                "mod.a -> mod",
+                "mod.gen -> mod",
+                "mod.gen -> mod.a",
+            },
+            id="generator-function-body-reference",
+        ),
+        pytest.param(
+            """
+            def f(): pass
+            f()
+            """,
+            {
+                "mod -> mod.f",
+                "mod.f -> mod",
+            },
+            id="module-level-call-is-entry-edge",
+        ),
+        pytest.param(
+            """
+            X = 1
+            def outer():
+                y = X
+                def inner():
+                    return y
+                return inner
+            """,
+            {
+                "mod.X -> mod",
+                "mod.outer -> mod",
+                "mod.outer -> mod.X",
+            },
+            id="closure-reference-folds-into-outer-decl",
+        ),
+    ],
+)
+def test_declarations(build_decl_graph, assert_edges, src, expected_edges):
+    graph = build_decl_graph({"mod.py": src})
+    assert_edges(graph, expected_edges)
+
+
+def test_module_hierarchy_edges(build_decl_graph, assert_edges):
+    """Submodules point at their parent package to keep __init__.py alive."""
     graph = build_decl_graph(
         {
-            "mod.py": """
-def a(): pass
-def b(): a()
-b()
-"""
+            "pkg/__init__.py": "",
+            "pkg/sub/__init__.py": "",
+            "pkg/sub/leaf.py": "",
         }
     )
     assert_edges(
         graph,
         {
-            "mod.a -> mod",
-            "mod.b -> mod",
-            "mod.b -> mod.a",
-            "mod -> mod.b",
-        },
-    )
-
-
-def test_class(build_decl_graph, assert_edges):
-    graph = build_decl_graph(
-        {
-            "mod.py": """
-class A: pass
-class B(A): pass
-"""
-        }
-    )
-    assert_edges(
-        graph,
-        {
-            "mod.A -> mod",
-            "mod.B -> mod",
-            "mod.B -> mod.A",
-        },
-    )
-
-
-def test_simple_variable(build_decl_graph, assert_edges):
-    graph = build_decl_graph(
-        {
-            "mod.py": """
-a = 1
-b = a
-"""
-        }
-    )
-    assert_edges(
-        graph,
-        {
-            "mod.a -> mod",
-            "mod.b -> mod",
-            "mod.b -> mod.a",
-        },
-    )
-
-
-def test_tuple_variable(build_decl_graph, assert_edges):
-    graph = build_decl_graph(
-        {
-            "mod.py": """
-a, b = 1, 2
-c, d = a, b
-"""
-        }
-    )
-    assert_edges(
-        graph,
-        {
-            "mod.a -> mod",
-            "mod.b -> mod",
-            "mod.c -> mod",
-            "mod.d -> mod",
-            "mod.c -> mod.a",
-            "mod.d -> mod.b",
-        },
-    )
-
-
-def test_multiple_assign_variable(build_decl_graph, assert_edges):
-    graph = build_decl_graph(
-        {
-            "mod.py": """
-a = 1
-b = c = a
-"""
-        }
-    )
-    assert_edges(
-        graph,
-        {
-            "mod.a -> mod",
-            "mod.b -> mod",
-            "mod.c -> mod",
-            "mod.b -> mod.a",
-            # "mod.c -> mod.a",
-        },
-    )
-
-
-def test_nested_decl(build_decl_graph, assert_edges):
-    graph = build_decl_graph(
-        {
-            "mod.py": """
-def a(): return 1
-def b():
-    def c():
-        return a()
-"""
-        }
-    )
-    assert_edges(
-        graph,
-        {
-            "mod.a -> mod",
-            "mod.b -> mod",
-            "mod.b -> mod.a",
+            "pkg.sub -> pkg",
+            "pkg.sub.leaf -> pkg.sub",
         },
     )
