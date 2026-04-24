@@ -155,8 +155,9 @@ class SymbolVisitor(cst.CSTVisitor):
         value_to_syms: dict[cst.CSTNode, list[SymbolNode]] = {}
         for name, value in pairs:
             fqns = self.get_metadata(FullyQualifiedNameProvider, name, default=[])
+            pos = self._pos(name)
             for fqn in fqns:
-                sym = SymbolNode(fqn.name, "variable", self.path, position=self._pos(name))
+                sym = SymbolNode(fqn.name, "variable", self.path, position=pos)
                 name_to_syms.setdefault(name, []).append(sym)
                 if value is not None:
                     value_to_syms.setdefault(value, []).append(sym)
