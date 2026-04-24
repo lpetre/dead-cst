@@ -86,9 +86,12 @@ unreachable = graph.subgraph([n for n in graph.nodes if n not in reachable])
 remove_code(unreachable, root)
 ```
 
+## Scope
+
+`dead-cst` tracks top-level declarations only -- module-level functions, classes, and variables. Nested definitions (inner functions, methods, nested classes) are deliberately not given their own nodes; references made from inside those nested scopes are attributed to the enclosing top-level declaration. Keeping the containing top-level symbol alive keeps its nested source alive with it.
+
 ## Limitations
 
-- Only top-level declarations (functions, classes, variables) are tracked; nested definitions are not individually reported.
 - `import *` is not resolved.
 - Dynamic attribute access (`getattr`) and runtime-generated symbols are invisible to static analysis.
 - Only first-party code is analysed; third-party dependencies are treated as opaque.
