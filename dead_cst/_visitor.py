@@ -121,8 +121,9 @@ class SymbolVisitor(cst.CSTVisitor):
             return
 
         fqns = self.get_metadata(FullyQualifiedNameProvider, node, default=[])
+        pos = self._pos(node)
         for fqn in fqns:
-            self._push_decl(node, SymbolNode(fqn.name, type_, self.path, position=self._pos(node)))
+            self._push_decl(node, SymbolNode(fqn.name, type_, self.path, position=pos))
 
     def _add_variable(self, node: cst.Assign | cst.AnnAssign):
         # Only collect top-level declarations, skip nested ones
