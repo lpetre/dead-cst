@@ -18,10 +18,6 @@ jobs:
           fetch-depth: 0
       - uses: astral-sh/setup-uv@v7
       - run: uv build
-        env:
-          # PyPI and TestPyPI reject PEP 440 local version identifiers (+gSHA),
-          # which hatch-vcs adds to between-tag builds by default.
-          SETUPTOOLS_SCM_OVERRIDES_FOR_DEAD_CST: '{local_scheme = "no-local-version"}'
       - uses: actions/upload-artifact@v4
         with:
           name: dist
