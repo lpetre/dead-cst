@@ -438,10 +438,16 @@ import pytest
             a = 1
             a = a + 1
             """,
+            # Each assignment is its own node (distinct positions), so
+            # the RHS access in the second assignment genuinely points
+            # at the first binding. In the fqname-collapsed view that
+            # looks like a self-edge but the underlying graph has no
+            # cycle.
             {
                 "mod.a -> mod",
+                "mod.a -> mod.a",
             },
-            id="self-reference-drops-self-edge",
+            id="reassignment-references-prior-binding",
         ),
         pytest.param(
             """

@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Literal
 
 import networkx as nx
+from libcst.metadata import CodeRange
 
 
 @dataclass(frozen=True, slots=True)
@@ -20,6 +21,7 @@ class SymbolNode:
     type: Literal["module", "class", "function", "variable", "import"]
     path: Path
     imports: Import | None = None
+    position: CodeRange | None = None
 
 
 @dataclass(slots=True)

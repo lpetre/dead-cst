@@ -8,7 +8,12 @@ from typing import Generator, Literal
 
 import libcst as cst
 from libcst.helpers import get_full_name_for_node
-from libcst.metadata import FullyQualifiedNameProvider, ParentNodeProvider, ScopeProvider
+from libcst.metadata import (
+    FullyQualifiedNameProvider,
+    ParentNodeProvider,
+    PositionProvider,
+    ScopeProvider,
+)
 
 from ._resolve import resolve_import
 from ._symbols import Import, SymbolNode, SymbolTrie
@@ -59,7 +64,11 @@ class SymbolVisitor(cst.CSTVisitor):
         FullyQualifiedNameProvider,
         ScopeProvider,
         ParentNodeProvider,
+        PositionProvider,
     )
+
+    def _pos(self, node: cst.CSTNode):
+        return self.get_metadata(PositionProvider, node, default=None)
 
     def __init__(self, path: Path, search_paths: list[Path]):
         self.path = path
@@ -113,7 +122,7 @@ class SymbolVisitor(cst.CSTVisitor):
 
         fqns = self.get_metadata(FullyQualifiedNameProvider, node, default=[])
         for fqn in fqns:
-            self._push_decl(node, SymbolNode(fqn.name, type_, self.path))
+            self._push_decl(node, SymbolNode(fqn.name, type_, self.path, position=self._pos(node)))
 
     def _add_variable(self, node: cst.Assign | cst.AnnAssign):
         # Only collect top-level declarations, skip nested ones
@@ -146,7 +155,7 @@ class SymbolVisitor(cst.CSTVisitor):
         for name, value in pairs:
             fqns = self.get_metadata(FullyQualifiedNameProvider, name, default=[])
             for fqn in fqns:
-                sym = SymbolNode(fqn.name, "variable", self.path)
+                sym = SymbolNode(fqn.name, "variable", self.path, position=self._pos(name))
                 name_to_syms.setdefault(name, []).append(sym)
                 if value is not None:
                     value_to_syms.setdefault(value, []).append(sym)
@@ -207,7 +216,11 @@ class SymbolVisitor(cst.CSTVisitor):
             # add a decl if the import is in the module context
             if current_decl and current_decl.type == "module":
                 sym = SymbolNode(
-                    f"{self.module_node.fqname}.{decl_name.value}", "import", self.path, import_info
+                    f"{self.module_node.fqname}.{decl_name.value}",
+                    "import",
+                    self.path,
+                    import_info,
+                    position=self._pos(alias),
                 )
                 self._push_decl(alias, sym)
 
