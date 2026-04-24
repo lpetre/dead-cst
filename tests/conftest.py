@@ -44,7 +44,9 @@ def assert_positional_edges():
     """
 
     def _fmt(sym):
-        if sym.position is None:
+        # Module nodes have a position too (covering the whole file) but
+        # rendering it would just be noise. Leave modules as bare fqnames.
+        if sym.type == "module":
             return sym.fqname
         start = sym.position.start
         return f"{sym.fqname}@{start.line}:{start.column}"

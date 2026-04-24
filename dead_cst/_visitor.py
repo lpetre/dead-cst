@@ -123,7 +123,7 @@ class SymbolVisitor(cst.CSTVisitor):
         fqns = self.get_metadata(FullyQualifiedNameProvider, node, default=[])
         pos = self._pos(node)
         for fqn in fqns:
-            self._push_decl(node, SymbolNode(fqn.name, type_, self.path, position=pos))
+            self._push_decl(node, SymbolNode(fqn.name, type_, self.path, pos))
 
     def _add_variable(self, node: cst.Assign | cst.AnnAssign):
         # Only collect top-level declarations, skip nested ones
@@ -157,7 +157,7 @@ class SymbolVisitor(cst.CSTVisitor):
             fqns = self.get_metadata(FullyQualifiedNameProvider, name, default=[])
             pos = self._pos(name)
             for fqn in fqns:
-                sym = SymbolNode(fqn.name, "variable", self.path, position=pos)
+                sym = SymbolNode(fqn.name, "variable", self.path, pos)
                 name_to_syms.setdefault(name, []).append(sym)
                 if value is not None:
                     value_to_syms.setdefault(value, []).append(sym)
@@ -221,8 +221,8 @@ class SymbolVisitor(cst.CSTVisitor):
                     f"{self.module_node.fqname}.{decl_name.value}",
                     "import",
                     self.path,
+                    self._pos(alias),
                     import_info,
-                    position=self._pos(alias),
                 )
                 self._push_decl(alias, sym)
 
@@ -232,7 +232,7 @@ class SymbolVisitor(cst.CSTVisitor):
     def visit_Module(self, node: cst.Module) -> None:
         assert not self.decl_stack, "Module node should be the first visited node"
         fqns = self.get_metadata(FullyQualifiedNameProvider, node, default=[])
-        sym = SymbolNode(next(iter(fqns)).name, "module", self.path)
+        sym = SymbolNode(next(iter(fqns)).name, "module", self.path, self._pos(node))
         self._push_decl(node, sym)
 
     def visit_FunctionDef(self, node: cst.FunctionDef) -> None:

@@ -20,8 +20,8 @@ class SymbolNode:
     fqname: str
     type: Literal["module", "class", "function", "variable", "import"]
     path: Path
+    position: CodeRange
     imports: Import | None = None
-    position: CodeRange | None = None
 
 
 @dataclass(slots=True)
