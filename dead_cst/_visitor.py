@@ -14,7 +14,15 @@ from libcst.metadata import (
     PositionProvider,
     ScopeProvider,
 )
+from libcst.metadata.scope_provider import (
+    BuiltinAssignment,
+    ClassScope,
+    FunctionScope,
+    GlobalScope,
+    ImportAssignment,
+)
 
+from ._flow import live_referents
 from ._resolve import resolve_import
 from ._symbols import Import, SymbolNode, SymbolTrie
 
@@ -69,6 +77,15 @@ class SymbolVisitor(cst.CSTVisitor):
 
     def _pos(self, node: cst.CSTNode):
         return self.get_metadata(PositionProvider, node, default=None)
+
+    @staticmethod
+    def _scope_body(scope, module_node: cst.Module) -> list | None:
+        """Statement list for a scope, or ``None`` if flow analysis is unsupported."""
+        if isinstance(scope, GlobalScope):
+            return list(module_node.body)
+        if isinstance(scope, (FunctionScope, ClassScope)):
+            return list(scope.node.body.body)
+        return None
 
     def __init__(self, path: Path, search_paths: list[Path]):
         self.path = path
@@ -282,17 +299,24 @@ class SymbolVisitor(cst.CSTVisitor):
 
         parent_map = self.metadata[ParentNodeProvider]
         references = set()
-        for scope in self.metadata[ScopeProvider].values():
+        for scope in set(self.metadata[ScopeProvider].values()):
             for access in scope.accesses:
-                for referent in access.referents:
-                    if isinstance(referent, cst.metadata.scope_provider.BuiltinAssignment):
-                        continue
+                referents = [r for r in access.referents if not isinstance(r, BuiltinAssignment)]
+                if len(referents) > 1:
+                    body = self._scope_body(referents[0].scope, original_node)
+                    if body is not None:
+                        live_ids = {
+                            id(n)
+                            for n in live_referents(body, access.node, [r.node for r in referents])
+                        }
+                        referents = [r for r in referents if id(r.node) in live_ids]
+                for referent in referents:
                     references.add((access, referent))
 
         for access, referent in references:
             owner_symbols = self.nearest_decls.get(access.node, [])
             target_node = referent.node
-            if isinstance(referent, cst.metadata.scope_provider.ImportAssignment):
+            if isinstance(referent, ImportAssignment):
                 target_node = referent.as_name
                 original_import = self.import_lookup.get(referent.as_name)
                 if not original_import:
