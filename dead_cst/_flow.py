@@ -98,9 +98,9 @@ def _walk_flow(
                 post |= _walk_flow(handler.body.body, state, referent_set, cache, observe)
             if stmt.orelse is not None:
                 # else runs only on the no-exception path, after body.
-                post = _walk_flow(
-                    stmt.orelse.body.body, body_end, referent_set, cache, observe
-                ) | (post - body_end)
+                post = _walk_flow(stmt.orelse.body.body, body_end, referent_set, cache, observe) | (
+                    post - body_end
+                )
             if stmt.finalbody is not None:
                 post = _walk_flow(stmt.finalbody.body, post, referent_set, cache, observe)
             state = post

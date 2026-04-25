@@ -325,9 +325,7 @@ class SymbolVisitor(cst.CSTVisitor):
                 if ref is not None:
                     referent_nodes.append(ref)
 
-            live_ids = {
-                id(n) for n in live_at_exit(list(module_node.body), referent_nodes)
-            }
+            live_ids = {id(n) for n in live_at_exit(list(module_node.body), referent_nodes)}
 
             live_decls: list[SymbolNode] = []
             shadowed_decls: list[SymbolNode] = []

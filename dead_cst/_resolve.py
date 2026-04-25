@@ -100,9 +100,9 @@ def resolve_edges(
     third_party = set()
     emitted: set[tuple[SymbolNode, SymbolNode]] = set()
 
-    def _emit(src: SymbolNode, dst: SymbolNode) -> Generator[
-        tuple[SymbolNode, SymbolNode], None, None
-    ]:
+    def _emit(
+        src: SymbolNode, dst: SymbolNode
+    ) -> Generator[tuple[SymbolNode, SymbolNode], None, None]:
         key = (src, dst)
         if key in emitted:
             return
