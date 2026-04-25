@@ -4,7 +4,7 @@ import logging
 from functools import cache
 from importlib.util import resolve_name
 from pathlib import Path
-from typing import Generator, Literal
+from typing import Generator, Literal, Mapping
 
 import libcst as cst
 from libcst.helpers import get_full_name_for_node
@@ -21,6 +21,7 @@ from libcst.metadata.scope_provider import (
     ImportAssignment,
 )
 
+from ._branches import make_unreachable_node, unreachable_suites
 from ._flow import live_at_exit, live_referents
 from ._fqn import FixedFullyQualifiedNameProvider
 from ._resolve import resolve_import
@@ -104,6 +105,15 @@ class SymbolVisitor(cst.CSTVisitor):
         # descendants of the containing statement, which is what
         # ``live_at_exit`` matches against.
         self.symbol_referent_nodes: dict[SymbolNode, cst.CSTNode] = {}
+        # Synthetic graph nodes for statically-unreachable branches.
+        # ``dead_suite_owner`` maps the ``id()`` of each dead suite node
+        # to the synthetic ``SymbolNode`` that "owns" any references
+        # made inside it; ``unreachable_nodes`` is the flat list the
+        # analyzer pulls into the graph.
+        self.unreachable_nodes: list[SymbolNode] = []
+        self.dead_suite_owner: dict[int, SymbolNode] = {}
+        self.unreachable_internal_edges: set[tuple[SymbolNode, SymbolNode]] = set()
+        self.unreachable_import_edges: set[tuple[SymbolNode, Import]] = set()
 
     @property
     def module_node(self) -> SymbolNode:
@@ -277,6 +287,46 @@ class SymbolVisitor(cst.CSTVisitor):
     def visit_AnnAssign(self, node: cst.AnnAssign) -> None:
         self._add_variable(node)
 
+    def visit_If(self, node: cst.If) -> None:
+        self._record_dead_suites(node)
+
+    def visit_While(self, node: cst.While) -> None:
+        self._record_dead_suites(node)
+
+    def _record_dead_suites(self, stmt: cst.BaseStatement) -> None:
+        """Create a synthetic ``unreachable`` graph node for each dead suite.
+
+        Records the suite's ``id()`` so :meth:`_unreachable_owner` can
+        later attribute references made inside the suite to it. Nested
+        dead suites are handled implicitly: we visit outer ``If`` /
+        ``While`` first, then descend, so an inner dead suite registers
+        afterwards and the innermost match wins at lookup time.
+        """
+        for suite in unreachable_suites(stmt):
+            pos = self._pos(suite)
+            if pos is None:
+                continue
+            sym = make_unreachable_node(self.module_node.fqname, self.path, pos)
+            self.unreachable_nodes.append(sym)
+            self.dead_suite_owner[id(suite)] = sym
+
+    def _unreachable_owner(
+        self, node: cst.CSTNode, parent_map: Mapping[cst.CSTNode, object]
+    ) -> SymbolNode | None:
+        """Return the synthetic node owning ``node`` if it lives inside one.
+
+        Walks up via ``ParentNodeProvider`` looking for a recorded dead
+        suite. Returns the innermost match, or ``None`` if ``node`` is
+        not inside any dead suite.
+        """
+        current: object = parent_map.get(node)
+        while isinstance(current, cst.CSTNode):
+            owner = self.dead_suite_owner.get(id(current))
+            if owner is not None:
+                return owner
+            current = parent_map.get(current)
+        return None
+
     def visit_Import(self, node: cst.Import) -> None:
         self._add_import("", node)
 
@@ -368,6 +418,7 @@ class SymbolVisitor(cst.CSTVisitor):
 
         for access, referent in references:
             owner_symbols = self.nearest_decls.get(access.node, [])
+            unreachable_owner = self._unreachable_owner(access.node, parent_map)
             target_node = referent.node
             if isinstance(referent, ImportAssignment):
                 target_node = referent.as_name
@@ -397,6 +448,8 @@ class SymbolVisitor(cst.CSTVisitor):
 
                     for owner_symbol in owner_symbols:
                         self.import_edges.add((owner_symbol, resolved_import))
+                    if unreachable_owner is not None:
+                        self.unreachable_import_edges.add((unreachable_owner, resolved_import))
 
             target_symbols = self.node_to_symbols.get(target_node)
             if not target_symbols:
@@ -415,3 +468,5 @@ class SymbolVisitor(cst.CSTVisitor):
                 for owner_symbol in owner_symbols:
                     if target_symbol != owner_symbol and target_symbol and owner_symbol:
                         self.internal_edges.add((owner_symbol, target_symbol))
+                if unreachable_owner is not None and target_symbol is not None:
+                    self.unreachable_internal_edges.add((unreachable_owner, target_symbol))

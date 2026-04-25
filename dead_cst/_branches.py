@@ -11,13 +11,24 @@ over those. Anything involving a name lookup (other than the three
 keywords), attribute access, function call, comparison, or other
 dynamic operation returns ``None`` (unknown). Returning ``None`` is
 always the safe default: callers must treat the branch as live.
+
+This module also owns the convention for synthetic graph nodes that
+represent dead suites. The nodes have ``type="synthetic"`` (the
+existing escape hatch in :mod:`dead_cst._symbols`) and a fqname
+prefixed with ``<unreachable ``. ``is_unreachable_node`` is the single
+source of truth for that convention; consumers should never check the
+prefix string themselves.
 """
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Sequence
 
 import libcst as cst
+from libcst.metadata import CodeRange
+
+from ._symbols import SymbolNode
 
 
 _KEYWORDS: dict[str, bool] = {
@@ -25,6 +36,8 @@ _KEYWORDS: dict[str, bool] = {
     "False": False,
     "None": False,
 }
+
+_UNREACHABLE_FQNAME_PREFIX = "<unreachable "
 
 
 def evaluate_truthiness(node: cst.BaseExpression) -> bool | None:
@@ -91,50 +104,54 @@ def evaluate_truthiness(node: cst.BaseExpression) -> bool | None:
     return None
 
 
-def unreachable_bodies(stmt: cst.BaseStatement) -> list[Sequence[cst.CSTNode]]:
-    """Return every dead statement-block body inside ``stmt``.
+def unreachable_suites(stmt: cst.BaseStatement) -> list[cst.BaseSuite]:
+    """Return every dead suite inside ``stmt``.
 
     Supports ``cst.If`` (including ``elif`` / ``else`` chains) and
     ``cst.While``. Returns ``[]`` for any other statement type or when
     no branch can be shown to be unreachable.
 
-    The bodies returned are the ``.body`` lists of the dead suites.
-    Each is typed as ``Sequence[cst.CSTNode]`` because libcst's
-    ``BaseSuite.body`` may be ``Sequence[BaseStatement]`` (an indented
-    block) or ``Sequence[BaseSmallStatement]`` (a one-line suite like
-    ``if False: x = 1``).
+    Returns the suite nodes themselves so callers that need source
+    positions (e.g. the visitor) can read them off the node.
     """
     if isinstance(stmt, cst.If):
         return _unreachable_in_if(stmt, branch_taken=False)
     if isinstance(stmt, cst.While):
         truth = evaluate_truthiness(stmt.test)
         if truth is False:
-            return [_suite_body(stmt.body)]
+            return [stmt.body]
         # ``while True:`` exits only via break / return / exception, so
         # the ``else`` clause (which fires on normal exit) never runs.
         if truth is True and stmt.orelse is not None:
-            return [_suite_body(stmt.orelse.body)]
+            return [stmt.orelse.body]
         return []
     return []
 
 
-def _suite_body(suite: cst.BaseSuite) -> Sequence[cst.CSTNode]:
-    return suite.body
+def unreachable_bodies(stmt: cst.BaseStatement) -> list[Sequence[cst.CSTNode]]:
+    """Return the ``.body`` of every dead suite inside ``stmt``.
+
+    Thin wrapper over :func:`unreachable_suites` for callers that only
+    need the statement list, not the enclosing suite. Each entry is
+    typed as ``Sequence[cst.CSTNode]`` because libcst's
+    ``BaseSuite.body`` may be ``Sequence[BaseStatement]`` (an indented
+    block) or ``Sequence[BaseSmallStatement]`` (a one-line suite like
+    ``if False: x = 1``).
+    """
+    return [suite.body for suite in unreachable_suites(stmt)]
 
 
-def _unreachable_in_if(
-    node: cst.If, branch_taken: bool
-) -> list[Sequence[cst.CSTNode]]:
-    """Walk an ``if`` / ``elif`` / ``else`` chain collecting dead bodies.
+def _unreachable_in_if(node: cst.If, branch_taken: bool) -> list[cst.BaseSuite]:
+    """Walk an ``if`` / ``elif`` / ``else`` chain collecting dead suites.
 
     ``branch_taken`` is ``True`` when an earlier branch in the chain is
     known to fire; everything from this point on is then unreachable.
     """
-    dead: list[Sequence[cst.CSTNode]] = []
+    dead: list[cst.BaseSuite] = []
     truth = None if branch_taken else evaluate_truthiness(node.test)
 
     if branch_taken or truth is False:
-        dead.append(_suite_body(node.body))
+        dead.append(node.body)
 
     next_taken = branch_taken or truth is True
 
@@ -143,7 +160,49 @@ def _unreachable_in_if(
         return dead
     if isinstance(orelse, cst.Else):
         if next_taken:
-            dead.append(_suite_body(orelse.body))
+            dead.append(orelse.body)
         return dead
     dead.extend(_unreachable_in_if(orelse, next_taken))
     return dead
+
+
+def make_unreachable_fqname(module_fqname: str, position: CodeRange) -> str:
+    """Build the fqname for the synthetic node representing a dead suite.
+
+    The format is intentionally fixed: callers should use
+    :func:`is_unreachable_node` to identify these nodes rather than
+    string-matching on their fqnames.
+    """
+    return (
+        f"{_UNREACHABLE_FQNAME_PREFIX}"
+        f"{module_fqname}:{position.start.line}:{position.start.column}>"
+    )
+
+
+def make_unreachable_node(
+    module_fqname: str, path: Path, position: CodeRange
+) -> SymbolNode:
+    """Build the synthetic ``SymbolNode`` for a dead suite.
+
+    Reuses ``type="synthetic"`` -- the existing escape hatch for graph
+    nodes that don't correspond to a top-level declaration -- and
+    distinguishes itself by carrying a real source ``position`` (rather
+    than the ``SYNTHETIC_POSITION`` sentinel used by entrypoint plugins)
+    plus an ``<unreachable ...>`` fqname prefix.
+    """
+    return SymbolNode(
+        fqname=make_unreachable_fqname(module_fqname, position),
+        type="synthetic",
+        path=path,
+        position=position,
+    )
+
+
+def is_unreachable_node(sym: SymbolNode) -> bool:
+    """Predicate: ``True`` iff ``sym`` is a synthetic dead-suite node.
+
+    The only supported way to identify these nodes. Callers should not
+    string-match on the fqname directly; the prefix is an implementation
+    detail of this module.
+    """
+    return sym.type == "synthetic" and sym.fqname.startswith(_UNREACHABLE_FQNAME_PREFIX)
