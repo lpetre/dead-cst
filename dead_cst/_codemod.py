@@ -1,68 +1,26 @@
-from collections.abc import Iterable
 from pathlib import Path
 
 import libcst as cst
 import networkx as nx
+from libcst.codemod import CodemodContext
+from libcst.codemod.visitors import RemoveImportsVisitor
 from libcst.metadata import FullRepoManager, QualifiedNameSource
 
 from ._fqn import FixedFullyQualifiedNameProvider
-
-
-def _with_simple_comma(alias: cst.ImportAlias) -> cst.ImportAlias:
-    """Normalise an alias's trailing comma for single-line use."""
-    if alias.comma is cst.MaybeSentinel.DEFAULT:
-        return alias
-    return alias.with_changes(
-        comma=cst.Comma(
-            whitespace_before=cst.SimpleWhitespace(""),
-            whitespace_after=cst.SimpleWhitespace(" "),
-        )
-    )
-
-
-def _alias_bound_name(alias: cst.ImportAlias) -> str:
-    """Return the local name introduced by ``alias``.
-
-    For ``import foo`` / ``from x import foo`` this is ``"foo"``. For
-    ``import foo.bar`` the bound name is the leftmost segment
-    (``"foo"``). When an ``as`` clause is present the alias name wins.
-    """
-    target: cst.BaseExpression = alias.asname.name if alias.asname is not None else alias.name
-    while isinstance(target, cst.Attribute):
-        target = target.value
-    assert isinstance(target, cst.Name), f"unexpected ImportAlias target: {type(target).__name__}"
-    return target.value
+from ._symbols import SymbolNode
 
 
 class RemoveDeadSymbols(cst.CSTTransformer):
     METADATA_DEPENDENCIES = (FixedFullyQualifiedNameProvider,)
 
-    def __init__(
-        self,
-        dead_fqnames: set[str],
-        dead_import_names: Iterable[str] = (),
-    ):
+    def __init__(self, dead_fqnames: set[str]):
         self.dead_fqnames = dead_fqnames
-        # Imports are matched by their local bound name rather than FQN
-        # because libcst's FQN provider does not surface metadata for
-        # ``ImportAlias`` targets.
-        self.dead_import_names = set(dead_import_names)
 
     def _should_remove(self, node: cst.CSTNode) -> bool:
         fqnames = self.get_metadata(FixedFullyQualifiedNameProvider, node, default=[])
         return any(
             qn.name in self.dead_fqnames for qn in fqnames if qn.source == QualifiedNameSource.LOCAL
         )
-
-    def _filter_aliases(self, aliases: Iterable[cst.ImportAlias]) -> list[cst.ImportAlias] | None:
-        kept = [a for a in aliases if _alias_bound_name(a) not in self.dead_import_names]
-        if not kept:
-            return None
-        # The original last alias may have been kept or dropped; either
-        # way the new last alias must not carry a trailing comma.
-        if kept[-1].comma is not cst.MaybeSentinel.DEFAULT:
-            kept[-1] = kept[-1].with_changes(comma=cst.MaybeSentinel.DEFAULT)
-        return kept
 
     def leave_FunctionDef(self, original_node: cst.FunctionDef, updated_node: cst.FunctionDef):
         if self._should_remove(original_node):
@@ -101,35 +59,27 @@ class RemoveDeadSymbols(cst.CSTTransformer):
             return cst.RemoveFromParent()
         return updated_node
 
-    def leave_Import(self, original_node: cst.Import, updated_node: cst.Import):
-        kept = self._filter_aliases(updated_node.names)
-        if kept is None:
-            return cst.RemoveFromParent()
-        if len(kept) == len(updated_node.names):
-            return updated_node
-        return updated_node.with_changes(names=kept)
 
-    def leave_ImportFrom(self, original_node: cst.ImportFrom, updated_node: cst.ImportFrom):
-        # ``from foo import *`` is opaque; leave it alone.
-        if isinstance(updated_node.names, cst.ImportStar):
-            return updated_node
-        kept = self._filter_aliases(updated_node.names)
-        if kept is None:
-            return cst.RemoveFromParent()
-        if len(kept) == len(updated_node.names):
-            return updated_node
-        # Stripping aliases from a parenthesised multi-line import
-        # leaves the surviving aliases carrying ``ParenthesizedWhitespace``
-        # commas that are invalid once the parens are gone. Renormalise
-        # to a single-line import -- always valid for the surviving names.
-        if updated_node.lpar is not None:
-            kept = [_with_simple_comma(a) for a in kept]
-            updated_node = updated_node.with_changes(lpar=None, rpar=None)
-        return updated_node.with_changes(names=kept)
+def _import_remove_args(node: SymbolNode) -> tuple[str, str | None, str | None]:
+    """Convert an ``"import"``-typed node to ``RemoveImportsVisitor`` args.
+
+    Returns ``(module, obj, asname)`` matching the signature of
+    :meth:`RemoveImportsVisitor.remove_unused_import`. ``asname`` is set
+    only when the local bound name differs from the natural binding
+    (``obj`` for ``from X import obj``, the leftmost segment of
+    ``module`` for bare ``import X``).
+    """
+    assert node.imports is not None, f"Import node missing imports metadata: {node.fqname}"
+    module = str(node.imports.module)
+    obj = node.imports.decl
+    bound = node.fqname.rsplit(".", 1)[-1]
+    natural = obj if obj is not None else module.split(".", 1)[0]
+    asname = bound if bound != natural else None
+    return module, obj, asname
 
 
 def remove_code(G: nx.Graph, base: Path) -> None:
-    by_file: dict[Path, list] = {}
+    by_file: dict[Path, list[SymbolNode]] = {}
     for node in G.nodes:
         if not node.path.is_relative_to(base):
             continue
@@ -145,11 +95,24 @@ def remove_code(G: nx.Graph, base: Path) -> None:
     for path, nodes in sorted(by_file.items(), key=lambda x: x):
         if not path.exists():
             continue
+
+        # Pass 1: drop dead defs / classes / variables. Imports they
+        # used to reference become eligible for removal in pass 2.
         wrapper = mgr.get_metadata_wrapper_for_path(path)
         dead_fqnames = {n.fqname for n in nodes if n.type != "import"}
-        # Imports are addressed by their local bound name -- the trailing
-        # segment of the FQN, e.g. ``mod.x`` -> ``"x"``.
-        dead_import_names = {n.fqname.rsplit(".", 1)[-1] for n in nodes if n.type == "import"}
-        mod_removed = wrapper.visit(RemoveDeadSymbols(dead_fqnames, dead_import_names))
+        result = wrapper.visit(RemoveDeadSymbols(dead_fqnames))
+
+        # Pass 2: hand the dead-import set to libcst's stock import
+        # remover. It walks scopes itself, so it'll skip anything still
+        # referenced after pass 1 (defensive -- if the graph said
+        # something is dead, no live user remains).
+        dead_imports = [n for n in nodes if n.type == "import"]
+        if dead_imports:
+            ctx = CodemodContext()
+            for imp in dead_imports:
+                module, obj, asname = _import_remove_args(imp)
+                RemoveImportsVisitor.remove_unused_import(ctx, module, obj, asname)
+            result = RemoveImportsVisitor(ctx).transform_module(result)
+
         with path.open("w") as f:
-            f.write(mod_removed.code)
+            f.write(result.code)

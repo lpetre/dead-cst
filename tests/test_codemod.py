@@ -1,17 +1,19 @@
-"""Tests for the ``RemoveDeadSymbols`` libcst transformer.
+"""Tests for the ``_codemod`` module.
 
-The transformer takes a set of dead fully-qualified names plus a set
-of dead import bound names and rewrites a single module, dropping or
-trimming declarations whose name is in either set. These tests drive
-the transformer directly with hand-picked dead sets so each behaviour
-is exercised in isolation, without involving graph construction or
-reachability analysis.
+``RemoveDeadSymbols`` rewrites a single module, dropping declarations
+whose FQN is in the supplied dead set. ``remove_code`` is the public
+entry point: it routes a graph of dead nodes per file, runs
+``RemoveDeadSymbols`` for defs / classes / variables, then hands the
+``"import"``-typed nodes to libcst's ``RemoveImportsVisitor`` for a
+second pass.
 
-The cases below pin the formatting decisions libcst makes when nodes
-are removed: trailing commas in chained assignments, decorators
-attached to a removed def, blank-line whitespace between top-level
-statements, and import-alias pruning (single-line, multi-line, and
-aliased forms).
+The transformer-level tests drive ``RemoveDeadSymbols`` directly with
+hand-picked FQN sets so trailing-comma, decorator, and blank-line
+behaviour can be exercised in isolation. The import-pruning tests go
+through ``remove_code`` end-to-end because the wiring -- deriving
+``(module, obj, asname)`` from each ``"import"`` node and sequencing
+the two passes -- is what we own; the alias-rewriting itself is
+libcst's responsibility.
 """
 
 import textwrap
@@ -25,30 +27,54 @@ from dead_cst._fqn import FixedFullyQualifiedNameProvider
 
 @pytest.fixture
 def apply_transformer(tmp_path):
-    """Run ``RemoveDeadSymbols`` against ``src`` with the given dead sets.
+    """Run ``RemoveDeadSymbols`` against ``src`` with the given dead FQNs.
 
     Writes ``src`` to ``tmp_path / filename`` (default ``mod.py``) so
     libcst's metadata pipeline can compute fully-qualified names the
-    same way it does in production. ``dead_import_names`` accepts the
-    bare local-binding names of imports to prune (e.g. ``{"a"}`` for
-    ``from foo import a``).
+    same way it does in production.
     """
 
-    def _apply(
-        src: str,
-        dead_fqnames: set[str] = frozenset(),
-        dead_import_names: set[str] = frozenset(),
-        filename: str = "mod.py",
-    ) -> str:
+    def _apply(src: str, dead_fqnames: set[str], filename: str = "mod.py") -> str:
         path = tmp_path / filename
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(textwrap.dedent(src).lstrip("\n"))
 
         mgr = FullRepoManager(str(tmp_path), [str(path)], {FixedFullyQualifiedNameProvider})
         wrapper: MetadataWrapper = mgr.get_metadata_wrapper_for_path(str(path))
-        return wrapper.visit(RemoveDeadSymbols(dead_fqnames, dead_import_names)).code
+        return wrapper.visit(RemoveDeadSymbols(dead_fqnames)).code
 
     return _apply
+
+
+@pytest.fixture
+def run_remove_code(tmp_path):
+    """Run ``remove_code`` end-to-end against an in-memory project.
+
+    ``files`` maps relative paths to source. ``entrypoints`` lists FQNs
+    to mark as graph entrypoints before computing reachability. Returns
+    the rewritten contents of the file at ``primary``.
+    """
+    from dead_cst import build_symbol_graph, find_reachable
+
+    def _run(
+        files: dict[str, str],
+        entrypoints: set[str],
+        primary: str,
+    ) -> str:
+        for name, src in files.items():
+            path = tmp_path / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(textwrap.dedent(src).lstrip("\n"))
+        graph = build_symbol_graph({tmp_path: []})
+        for node in graph.nodes:
+            if node.fqname in entrypoints:
+                graph.nodes[node]["entrypoint"] = True
+        reachable = find_reachable(graph)
+        unreachable = graph.subgraph([n for n in graph.nodes if n not in reachable]).copy()
+        remove_code(unreachable, tmp_path)
+        return (tmp_path / primary).read_text()
+
+    return _run
 
 
 # ---------------------------------------------------------------------------
@@ -273,111 +299,117 @@ class TestAnnAssignAndClass:
 
 
 # ---------------------------------------------------------------------------
-# Import pruning
+# Import pruning -- end-to-end via ``remove_code`` + ``RemoveImportsVisitor``
 # ---------------------------------------------------------------------------
 
 
 class TestImports:
-    """``leave_Import`` / ``leave_ImportFrom`` drop dead aliases.
+    """``remove_code`` derives ``(module, obj, asname)`` per dead import.
 
-    Imports are matched by their local bound name rather than by FQN
-    because libcst's FQN provider does not surface metadata for
-    ``ImportAlias`` targets. ``remove_code`` derives those bound names
-    as the trailing segment of the import node's FQN.
+    The actual alias rewriting is delegated to libcst's
+    ``RemoveImportsVisitor``; what we own is the derivation from each
+    ``"import"``-typed ``SymbolNode``: ``module`` from
+    ``node.imports.module``, ``obj`` from ``node.imports.decl``, and
+    ``asname`` from the bound name (last segment of the FQN) when it
+    differs from the natural binding. These tests exercise that wiring
+    by building a real graph and checking the rewritten output.
     """
 
-    def test_partial_from_import_drops_named_alias(self, apply_transformer):
-        result = apply_transformer(
-            """
-            from foo import a, b
-            def keep(): return b
-            """,
-            dead_import_names={"a"},
+    LIB = {"lib.py": "def used(): pass\ndef unused(): pass\n"}
+
+    def test_partial_from_import_drops_named_alias(self, run_remove_code):
+        result = run_remove_code(
+            files={
+                **self.LIB,
+                "mod.py": """
+                    from lib import used, unused
+                    def main(): used()
+                """,
+            },
+            entrypoints={"mod", "mod.main"},
+            primary="mod.py",
         )
-        assert result == "from foo import b\ndef keep(): return b\n"
+        assert result == "from lib import used\ndef main(): used()\n"
 
-    def test_multiline_from_import_renormalises_to_single_line(self, apply_transformer):
-        # Stripping aliases out of a parenthesised multi-line import
-        # would leave the survivors carrying invalid indented commas;
-        # the transformer renormalises to a single-line import.
-        result = apply_transformer(
-            """
-            from foo import (
-                a,
-                b,
-                c,
-            )
-            def keep(): return b
-            """,
-            dead_import_names={"a", "c"},
+    def test_multiline_from_import_loses_dead_alias(self, run_remove_code):
+        # Multi-line, parenthesised. The middle alias dies; libcst's
+        # remover keeps the parens with the surviving aliases.
+        files = {
+            "lib.py": "def a(): pass\ndef b(): pass\ndef c(): pass\n",
+            "mod.py": ("from lib import (\n    a,\n    b,\n    c,\n)\ndef main(): a(); c()\n"),
+        }
+        result = run_remove_code(
+            files=files,
+            entrypoints={"mod", "mod.main"},
+            primary="mod.py",
         )
-        assert result == "from foo import b\ndef keep(): return b\n"
+        assert "    b,\n" not in result
+        assert "    a,\n" in result and "    c,\n" in result
+        assert "def main(): a(); c()\n" in result
 
-    def test_multiline_from_import_unchanged_when_nothing_dead(self, apply_transformer):
-        # The parens and per-line layout are preserved when no alias is
-        # dropped, so we don't churn formatting on every removal pass.
-        src = "from foo import (\n    a,\n    b,\n    c,\n)\ndef keep(): return a + b + c\n"
-        result = apply_transformer(src, dead_import_names=set())
-        assert result == src
-
-    def test_aliased_import_drops_when_asname_is_dead(self, apply_transformer):
-        # ``from foo import a as renamed`` binds ``renamed``, so it's
-        # the asname (not ``a``) that decides removal.
-        result = apply_transformer(
-            """
-            from foo import a as renamed
-            def keep(): pass
-            """,
-            dead_import_names={"renamed"},
+    def test_aliased_import_drops_using_asname(self, run_remove_code):
+        # ``from lib import used as kept`` binds ``kept``. When ``kept``
+        # is unused, ``remove_code`` should pass ``asname="kept"`` to
+        # ``RemoveImportsVisitor`` so it matches and removes the line.
+        result = run_remove_code(
+            files={
+                **self.LIB,
+                "mod.py": """
+                    from lib import used as kept
+                    def main(): pass
+                """,
+            },
+            entrypoints={"mod", "mod.main"},
+            primary="mod.py",
         )
-        assert result == "def keep(): pass\n"
+        assert result == "def main(): pass\n"
 
-    def test_bare_import_dropped(self, apply_transformer):
-        result = apply_transformer(
-            """
-            import foo
-            def keep(): pass
-            """,
-            dead_import_names={"foo"},
+    def test_bare_import_dropped(self, run_remove_code):
+        result = run_remove_code(
+            files={
+                **self.LIB,
+                "mod.py": """
+                    import lib
+                    def main(): pass
+                """,
+            },
+            entrypoints={"mod", "mod.main"},
+            primary="mod.py",
         )
-        assert result == "def keep(): pass\n"
+        assert result == "def main(): pass\n"
 
-    def test_dotted_import_uses_leftmost_segment(self, apply_transformer):
-        # ``import foo.bar`` binds ``foo`` at module scope; matching by
-        # the leftmost segment is what lets ``remove_code`` mark it dead.
-        result = apply_transformer(
-            """
-            import foo.bar
-            def keep(): pass
-            """,
-            dead_import_names={"foo"},
+    def test_dead_import_used_only_by_removed_def_is_pruned(self, run_remove_code):
+        # ``helper`` imports ``used`` but ``helper`` itself is dead.
+        # After pass 1 strips ``helper``, pass 2 should drop the import.
+        result = run_remove_code(
+            files={
+                **self.LIB,
+                "mod.py": """
+                    from lib import used
+                    def helper(): used()
+                    def main(): pass
+                """,
+            },
+            entrypoints={"mod", "mod.main"},
+            primary="mod.py",
         )
-        assert result == "def keep(): pass\n"
+        assert result == "def main(): pass\n"
 
-    def test_import_star_is_left_alone(self, apply_transformer):
-        # ``import *`` is opaque -- the visitor cannot enumerate its
-        # bindings -- so the transformer never touches it.
-        src = "from foo import *\ndef keep(): pass\n"
-        result = apply_transformer(src, dead_import_names={"a"})
-        assert result == src
-
-    def test_remove_code_drops_dead_import_end_to_end(self, tmp_path):
-        # Integration check: ``remove_code`` routes ``"import"``-typed
-        # nodes to the transformer with their bound names derived from
-        # the FQN's trailing segment.
-        from dead_cst import build_symbol_graph, find_reachable
-
-        (tmp_path / "lib.py").write_text("def used(): pass\ndef unused(): pass\n")
-        (tmp_path / "mod.py").write_text("from lib import used, unused\ndef main(): used()\n")
-        graph = build_symbol_graph({tmp_path: []})
-        for node in graph.nodes:
-            if node.fqname in {"mod", "mod.main"}:
-                graph.nodes[node]["entrypoint"] = True
-        reachable = find_reachable(graph)
-        unreachable = graph.subgraph([n for n in graph.nodes if n not in reachable]).copy()
-
-        remove_code(unreachable, tmp_path)
-        assert (tmp_path / "mod.py").read_text() == ("from lib import used\ndef main(): used()\n")
+    def test_live_import_is_preserved(self, run_remove_code):
+        # Defensive: when the import is reachable, ``remove_code`` does
+        # not touch it (the dead set never contained it).
+        result = run_remove_code(
+            files={
+                **self.LIB,
+                "mod.py": """
+                    from lib import used
+                    def main(): used()
+                """,
+            },
+            entrypoints={"mod", "mod.main"},
+            primary="mod.py",
+        )
+        assert result == "from lib import used\ndef main(): used()\n"
 
 
 # ---------------------------------------------------------------------------
