@@ -113,7 +113,7 @@ Entrypoint detection is now fully plugin-driven. Builtins:
 
 Write your own by implementing the `EdgePlugin` or `CSTAwareEdgePlugin` protocol; register under the `dead_cst.plugins` entry-point group for CLI discovery.
 
-Path resolution is similarly pluggable. `PathResolver` implementations return a `{base: [dep_paths]}` map to feed `build_symbol_graph`. Builtins: `VenvResolver`, `PyprojectResolver`. Third-party resolvers register under `dead_cst.resolvers`.
+Path resolution is similarly pluggable. `PathResolver` implementations return a `{base: [dep_paths]}` map to feed `build_symbol_graph`. Builtins: `VenvResolver`, `PyprojectResolver`, `UvWorkspaceResolver` (parses `uv.lock` to discover workspace members and their inter-member dep edges). Third-party resolvers register under `dead_cst.resolvers`.
 
 ## Graph model
 

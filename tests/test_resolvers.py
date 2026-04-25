@@ -9,6 +9,7 @@ import pytest
 
 from dead_cst import (
     PyprojectResolver,
+    UvWorkspaceResolver,
     VenvResolver,
     load_resolver,
     merge_paths,
@@ -86,9 +87,119 @@ def test_merge_paths_drops_self():
     assert result == {base: []}
 
 
+def _write_uv_workspace(tmp_path: Path, *, with_src: bool = True) -> None:
+    """Lay out a two-member uv workspace (core + app, app deps on core)."""
+    (tmp_path / "pyproject.toml").write_text(
+        textwrap.dedent("""
+            [project]
+            name = "ws"
+            version = "0.0.0"
+            [tool.uv.workspace]
+            members = ["packages/*"]
+        """).strip()
+    )
+    for name in ("core", "app"):
+        member_dir = tmp_path / "packages" / name
+        if with_src:
+            (member_dir / "src" / name).mkdir(parents=True)
+        else:
+            member_dir.mkdir(parents=True)
+    (tmp_path / "uv.lock").write_text(
+        textwrap.dedent("""
+            version = 1
+            revision = 3
+            requires-python = ">=3.11"
+
+            [manifest]
+            members = ["app", "core", "ws"]
+
+            [[package]]
+            name = "app"
+            version = "0.0.0"
+            source = { editable = "packages/app" }
+            dependencies = [
+                { name = "core" },
+            ]
+
+            [[package]]
+            name = "core"
+            version = "0.0.0"
+            source = { editable = "packages/core" }
+
+            [[package]]
+            name = "ws"
+            version = "0.0.0"
+            source = { virtual = "." }
+        """).strip()
+    )
+
+
+def test_uv_workspace_resolver_src_layout(tmp_path: Path):
+    _write_uv_workspace(tmp_path)
+
+    result = UvWorkspaceResolver().resolve(tmp_path)
+
+    core_src = (tmp_path / "packages" / "core" / "src").resolve()
+    app_src = (tmp_path / "packages" / "app" / "src").resolve()
+    assert result == {core_src: [], app_src: [core_src]}
+
+
+def test_uv_workspace_resolver_flat_layout(tmp_path: Path):
+    _write_uv_workspace(tmp_path, with_src=False)
+
+    result = UvWorkspaceResolver().resolve(tmp_path)
+
+    core_dir = (tmp_path / "packages" / "core").resolve()
+    app_dir = (tmp_path / "packages" / "app").resolve()
+    assert result == {core_dir: [], app_dir: [core_dir]}
+
+
+def test_uv_workspace_resolver_skips_virtual_root(tmp_path: Path):
+    _write_uv_workspace(tmp_path)
+
+    result = UvWorkspaceResolver().resolve(tmp_path)
+
+    # The "ws" package has source = { virtual = "." } and must not appear.
+    assert tmp_path.resolve() not in result
+
+
+def test_uv_workspace_resolver_no_lockfile(tmp_path: Path):
+    assert UvWorkspaceResolver().resolve(tmp_path) == {}
+
+
+def test_uv_workspace_resolver_ignores_non_workspace_deps(tmp_path: Path):
+    """Deps that aren't workspace members (e.g. regular PyPI deps) are dropped
+    silently -- they don't have a source dir under our control."""
+    _write_uv_workspace(tmp_path)
+    lock = tmp_path / "uv.lock"
+    lock.write_text(
+        lock.read_text().replace(
+            'dependencies = [\n    { name = "core" },\n]',
+            'dependencies = [\n    { name = "core" },\n    { name = "requests" },\n]',
+        )
+    )
+
+    result = UvWorkspaceResolver().resolve(tmp_path)
+    core_src = (tmp_path / "packages" / "core" / "src").resolve()
+    app_src = (tmp_path / "packages" / "app" / "src").resolve()
+    assert result[app_src] == [core_src]
+
+
+def test_uv_workspace_resolver_explicit_lock_path(tmp_path: Path):
+    _write_uv_workspace(tmp_path)
+    moved = tmp_path / "stash" / "uv.lock"
+    moved.parent.mkdir()
+    moved.write_text((tmp_path / "uv.lock").read_text())
+    (tmp_path / "uv.lock").unlink()
+
+    result = UvWorkspaceResolver(lock_path=moved).resolve(tmp_path)
+    assert result  # non-empty -- lock_path override took effect
+
+
 def test_load_resolver_known():
     assert isinstance(load_resolver("venv"), VenvResolver)
     assert isinstance(load_resolver("pyproject"), PyprojectResolver)
+    assert isinstance(load_resolver("uv_workspace"), UvWorkspaceResolver)
 
 
 def test_load_resolver_unknown_raises():
