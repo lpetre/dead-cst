@@ -146,6 +146,27 @@ class TestChainedAssign:
         result = apply_transformer(src, {"mod.b"})
         assert result == "a, b, c = 1, 2, 3\ndef keep(): return a + b + c\n"
 
+    def test_list_target_unpacking_is_left_alone(self, apply_transformer):
+        # ``[a, b] = ...`` is the list-target variant of tuple unpacking
+        # -- the visitor produces decls for ``a`` and ``b`` but the
+        # codemod still sees a single Assign target, so per-name
+        # pruning is a no-op (parity with tuple unpacking).
+        src = """
+            [a, b] = [1, 2]
+            def keep(): return a + b
+            """
+        result = apply_transformer(src, {"mod.b"})
+        assert result == "[a, b] = [1, 2]\ndef keep(): return a + b\n"
+
+    def test_nested_tuple_target_is_left_alone(self, apply_transformer):
+        # Same idea for nested patterns like ``((a, b), c) = ...``.
+        src = """
+            ((a, b), c) = ((1, 2), 3)
+            def keep(): return a + b + c
+            """
+        result = apply_transformer(src, {"mod.b"})
+        assert result == "((a, b), c) = ((1, 2), 3)\ndef keep(): return a + b + c\n"
+
 
 # ---------------------------------------------------------------------------
 # Decorator stripping when removing a decorated def / class
@@ -208,6 +229,38 @@ class TestDecoratorStripping:
         assert "@reg" not in result
         assert "class Dead" not in result
         assert "class Keep:" in result
+
+    def test_async_function_removed(self, apply_transformer):
+        # ``async def`` is a ``FunctionDef`` with ``asynchronous`` set,
+        # so ``leave_FunctionDef`` covers it without a separate handler.
+        result = apply_transformer(
+            """
+            async def dead():
+                return 1
+
+            def keep(): pass
+            """,
+            {"mod.dead"},
+        )
+        assert "async def dead" not in result
+        assert "def keep(): pass" in result
+
+    def test_decorated_async_function_removed(self, apply_transformer):
+        result = apply_transformer(
+            """
+            def deco(f): return f
+
+            @deco
+            async def dead():
+                return 1
+
+            def keep(): pass
+            """,
+            {"mod.dead"},
+        )
+        assert "@deco" not in result
+        assert "async def dead" not in result
+        assert "def keep(): pass" in result
 
 
 # ---------------------------------------------------------------------------
@@ -295,6 +348,45 @@ class TestAnnAssignAndClass:
         )
         assert "class Dead" not in result
         assert "def m" not in result
+        assert "def keep(): pass" in result
+
+    def test_class_with_single_base_removed(self, apply_transformer):
+        result = apply_transformer(
+            """
+            class Base: pass
+
+            class Dead(Base):
+                pass
+
+            def keep(): pass
+            """,
+            {"mod.Dead"},
+        )
+        assert "class Dead" not in result
+        assert "class Base: pass" in result
+        assert "def keep(): pass" in result
+
+    def test_class_with_multiple_bases_and_metaclass_removed(self, apply_transformer):
+        # Whole-node removal handles inheritance and the ``metaclass=``
+        # keyword without any special-case logic.
+        result = apply_transformer(
+            """
+            class A: pass
+            class B: pass
+            class Meta(type): pass
+
+            class Dead(A, B, metaclass=Meta):
+                pass
+
+            def keep(): pass
+            """,
+            {"mod.Dead"},
+        )
+        assert "class Dead" not in result
+        assert "metaclass=Meta" not in result
+        assert "class A: pass" in result
+        assert "class B: pass" in result
+        assert "class Meta(type): pass" in result
         assert "def keep(): pass" in result
 
 
