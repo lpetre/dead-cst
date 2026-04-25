@@ -1,0 +1,529 @@
+"""Tests for the ``_codemod`` module.
+
+Each transformer case is a single-module Python source paired with the
+dead FQN set to feed ``RemoveDeadSymbols`` and the exact rewritten
+output expected. ``remove_code`` cases describe a small in-memory
+project, the entrypoints to seed reachability, and the rewritten
+contents of the file under inspection.
+
+Both ``src`` and ``expected`` are dedented and have a single leading
+newline stripped, so the literal indented-triple-quoted form lines up
+visually inside ``pytest.param``. Trailing blank lines are preserved
+because the codemod's whitespace decisions are part of what we're
+pinning -- compare ``test_declarations`` for the matching declaration
+side.
+"""
+
+import textwrap
+
+import pytest
+from libcst.metadata import FullRepoManager, MetadataWrapper
+
+from dead_cst import build_symbol_graph, find_reachable
+from dead_cst._codemod import RemoveDeadSymbols, remove_code
+from dead_cst._fqn import FixedFullyQualifiedNameProvider
+
+
+def _normalise(s: str) -> str:
+    """Dedent and strip up to one leading newline.
+
+    The single-newline rule lets the literal triple-quoted form put
+    its opening quote on its own line (which is the readable
+    convention) without losing genuine leading blank lines that the
+    codemod leaves behind.
+    """
+    s = textwrap.dedent(s)
+    return s[1:] if s.startswith("\n") else s
+
+
+@pytest.fixture
+def apply_transformer(tmp_path):
+    """Write ``src`` to ``tmp_path/mod.py`` and run ``RemoveDeadSymbols``."""
+
+    def _apply(src: str, dead_fqnames: set[str]) -> str:
+        path = tmp_path / "mod.py"
+        path.write_text(_normalise(src))
+        mgr = FullRepoManager(str(tmp_path), [str(path)], {FixedFullyQualifiedNameProvider})
+        wrapper: MetadataWrapper = mgr.get_metadata_wrapper_for_path(str(path))
+        return wrapper.visit(RemoveDeadSymbols(dead_fqnames)).code
+
+    return _apply
+
+
+@pytest.fixture
+def run_remove_code(tmp_path):
+    """Materialise ``files`` under ``tmp_path``, run ``remove_code``, return paths.
+
+    Returns the ``tmp_path`` so the test can inspect rewritten contents
+    and file existence directly. ``entrypoints`` is the set of FQNs to
+    mark as graph entrypoints before computing reachability.
+    """
+
+    def _run(files: dict[str, str], entrypoints: set[str]) -> None:
+        for name, src in files.items():
+            path = tmp_path / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(_normalise(src))
+        graph = build_symbol_graph({tmp_path: []})
+        for node in graph.nodes:
+            if node.fqname in entrypoints:
+                graph.nodes[node]["entrypoint"] = True
+        reachable = find_reachable(graph)
+        unreachable = graph.subgraph([n for n in graph.nodes if n not in reachable]).copy()
+        remove_code(unreachable, tmp_path)
+
+    return _run
+
+
+# ---------------------------------------------------------------------------
+# RemoveDeadSymbols -- per-CST-shape removal
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "src, dead_fqnames, expected",
+    [
+        # ------------------------------------------------------------------
+        # Functions and decorators (FunctionDef, sync + async)
+        # ------------------------------------------------------------------
+        pytest.param(
+            """
+            def dead(): return 1
+            def keep(): pass
+            """,
+            {"mod.dead"},
+            """
+            def keep(): pass
+            """,
+            id="function-removed",
+        ),
+        pytest.param(
+            """
+            async def dead(): return 1
+            def keep(): pass
+            """,
+            {"mod.dead"},
+            """
+            def keep(): pass
+            """,
+            id="async-function-removed",
+        ),
+        pytest.param(
+            """
+            import functools
+
+            @functools.cache
+            def dead():
+                return 1
+
+            def keep(): pass
+            """,
+            {"mod.dead"},
+            """
+            import functools
+
+            def keep(): pass
+            """,
+            id="decorated-function-takes-decorators",
+        ),
+        pytest.param(
+            """
+            def deco_a(f): return f
+            def deco_b(f): return f
+
+            @deco_a
+            @deco_b
+            def dead():
+                return 1
+
+            def keep(): pass
+            """,
+            {"mod.dead"},
+            """
+            def deco_a(f): return f
+            def deco_b(f): return f
+
+            def keep(): pass
+            """,
+            id="stacked-decorators-all-removed",
+        ),
+        pytest.param(
+            """
+            def deco(f): return f
+
+            @deco
+            async def dead():
+                return 1
+
+            def keep(): pass
+            """,
+            {"mod.dead"},
+            """
+            def deco(f): return f
+
+            def keep(): pass
+            """,
+            id="decorated-async-function-removed",
+        ),
+        # ------------------------------------------------------------------
+        # Classes (ClassDef) -- bases, metaclass, decorators
+        # ------------------------------------------------------------------
+        pytest.param(
+            """
+            class Dead:
+                x = 1
+                def m(self): pass
+            def keep(): pass
+            """,
+            {"mod.Dead"},
+            """
+            def keep(): pass
+            """,
+            id="class-with-body-removed",
+        ),
+        pytest.param(
+            """
+            def reg(cls): return cls
+
+            @reg
+            class Dead:
+                pass
+
+            class Keep:
+                pass
+            """,
+            {"mod.Dead"},
+            """
+            def reg(cls): return cls
+
+            class Keep:
+                pass
+            """,
+            id="decorated-class-takes-decorator",
+        ),
+        pytest.param(
+            """
+            class Base: pass
+            class Dead(Base):
+                pass
+            def keep(): pass
+            """,
+            {"mod.Dead"},
+            """
+            class Base: pass
+            def keep(): pass
+            """,
+            id="class-with-single-base",
+        ),
+        pytest.param(
+            """
+            class A: pass
+            class B: pass
+            class Meta(type): pass
+            class Dead(A, B, metaclass=Meta):
+                pass
+            def keep(): pass
+            """,
+            {"mod.Dead"},
+            """
+            class A: pass
+            class B: pass
+            class Meta(type): pass
+            def keep(): pass
+            """,
+            id="class-with-multiple-bases-and-metaclass",
+        ),
+        # ------------------------------------------------------------------
+        # Assign -- chained, single, destructuring
+        # ------------------------------------------------------------------
+        pytest.param(
+            """
+            x = 1
+            def keep(): pass
+            """,
+            {"mod.x"},
+            """
+            def keep(): pass
+            """,
+            id="single-target-assign-removed-entirely",
+        ),
+        pytest.param(
+            """
+            a = b = 1
+            def keep(): return b
+            """,
+            {"mod.a"},
+            """
+            b = 1
+            def keep(): return b
+            """,
+            id="chained-assign-drops-first-target",
+        ),
+        pytest.param(
+            """
+            a = b = 1
+            def keep(): return a
+            """,
+            {"mod.b"},
+            """
+            a = 1
+            def keep(): return a
+            """,
+            id="chained-assign-drops-last-target",
+        ),
+        pytest.param(
+            """
+            a = b = c = 1
+            def keep(): return a + c
+            """,
+            {"mod.b"},
+            """
+            a = c = 1
+            def keep(): return a + c
+            """,
+            id="chained-assign-drops-middle-target",
+        ),
+        pytest.param(
+            """
+            a = b = 1
+            def keep(): pass
+            """,
+            {"mod.a", "mod.b"},
+            """
+            def keep(): pass
+            """,
+            id="chained-assign-all-targets-dead-removes-statement",
+        ),
+        pytest.param(
+            """
+            a, b, c = 1, 2, 3
+            def keep(): return a + b + c
+            """,
+            {"mod.b"},
+            """
+            a, b, c = 1, 2, 3
+            def keep(): return a + b + c
+            """,
+            id="tuple-unpacking-not-pruned-per-name",
+        ),
+        pytest.param(
+            """
+            [a, b] = [1, 2]
+            def keep(): return a + b
+            """,
+            {"mod.b"},
+            """
+            [a, b] = [1, 2]
+            def keep(): return a + b
+            """,
+            id="list-target-unpacking-not-pruned-per-name",
+        ),
+        pytest.param(
+            """
+            ((a, b), c) = ((1, 2), 3)
+            def keep(): return a + b + c
+            """,
+            {"mod.b"},
+            """
+            ((a, b), c) = ((1, 2), 3)
+            def keep(): return a + b + c
+            """,
+            id="nested-tuple-unpacking-not-pruned-per-name",
+        ),
+        # ------------------------------------------------------------------
+        # AnnAssign -- with and without value
+        # ------------------------------------------------------------------
+        pytest.param(
+            """
+            dead_var: int = 1
+            keep_var: str = "x"
+            """,
+            {"mod.dead_var"},
+            """
+            keep_var: str = "x"
+            """,
+            id="ann-assign-with-value-removed",
+        ),
+        pytest.param(
+            """
+            dead_var: int
+            keep_var: str = "x"
+            """,
+            {"mod.dead_var"},
+            """
+            keep_var: str = "x"
+            """,
+            id="ann-assign-without-value-removed",
+        ),
+        # ------------------------------------------------------------------
+        # Whitespace handling around removed statements
+        # ------------------------------------------------------------------
+        pytest.param(
+            """
+            def keep_first():
+                pass
+
+
+            def dead_middle():
+                pass
+
+
+            def keep_last():
+                pass
+            """,
+            {"mod.dead_middle"},
+            """
+            def keep_first():
+                pass
+
+
+            def keep_last():
+                pass
+            """,
+            id="middle-function-removal-collapses-blank-lines",
+        ),
+        pytest.param(
+            """
+            def keep(): pass
+
+            # explainer for dead_fn
+            def dead_fn():
+                pass
+            """,
+            {"mod.dead_fn"},
+            """
+            def keep(): pass
+            """,
+            id="leading-comment-attached-to-removed-def-goes-with-it",
+        ),
+    ],
+)
+def test_remove_dead_symbols(apply_transformer, src, dead_fqnames, expected):
+    assert apply_transformer(src, dead_fqnames) == _normalise(expected)
+
+
+# ---------------------------------------------------------------------------
+# remove_code end-to-end -- import pruning via RemoveImportsVisitor
+# ---------------------------------------------------------------------------
+
+
+_LIB = "def used(): pass\ndef unused(): pass\n"
+
+
+@pytest.mark.parametrize(
+    "files, entrypoints, expected_mod",
+    [
+        pytest.param(
+            {
+                "lib.py": _LIB,
+                "mod.py": """
+                from lib import used, unused
+                def main(): used()
+                """,
+            },
+            {"mod", "mod.main"},
+            """
+            from lib import used
+            def main(): used()
+            """,
+            id="partial-from-import-drops-named-alias",
+        ),
+        pytest.param(
+            {
+                "lib.py": "def a(): pass\ndef b(): pass\ndef c(): pass\n",
+                "mod.py": ("from lib import (\n    a,\n    b,\n    c,\n)\ndef main(): a(); c()\n"),
+            },
+            {"mod", "mod.main"},
+            ("from lib import (\n    a,\n    c,\n)\ndef main(): a(); c()\n"),
+            id="multiline-from-import-loses-dead-alias",
+        ),
+        pytest.param(
+            {
+                "lib.py": _LIB,
+                "mod.py": """
+                from lib import used as kept
+                def main(): pass
+                """,
+            },
+            {"mod", "mod.main"},
+            """
+            def main(): pass
+            """,
+            id="aliased-import-drops-using-asname",
+        ),
+        pytest.param(
+            {
+                "lib.py": _LIB,
+                "mod.py": """
+                import lib
+                def main(): pass
+                """,
+            },
+            {"mod", "mod.main"},
+            """
+            def main(): pass
+            """,
+            id="bare-import-dropped",
+        ),
+        pytest.param(
+            {
+                "lib.py": _LIB,
+                "mod.py": """
+                from lib import used
+                def helper(): used()
+                def main(): pass
+                """,
+            },
+            {"mod", "mod.main"},
+            """
+            def main(): pass
+            """,
+            id="import-only-used-by-removed-def-also-pruned",
+        ),
+        pytest.param(
+            {
+                "lib.py": _LIB,
+                "mod.py": """
+                from lib import used
+                def main(): used()
+                """,
+            },
+            {"mod", "mod.main"},
+            """
+            from lib import used
+            def main(): used()
+            """,
+            id="live-import-preserved",
+        ),
+    ],
+)
+def test_remove_code_rewrites_imports(run_remove_code, tmp_path, files, entrypoints, expected_mod):
+    run_remove_code(files, entrypoints)
+    assert (tmp_path / "mod.py").read_text() == _normalise(expected_mod)
+
+
+# ---------------------------------------------------------------------------
+# remove_code end-to-end -- module-level removal
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "files, entrypoints, expected_files",
+    [
+        pytest.param(
+            {
+                "kept.py": "def main(): pass\n",
+                "dropped.py": "def helper(): pass\n",
+            },
+            {"kept"},
+            {"kept.py": True, "dropped.py": False},
+            id="unreachable-module-file-unlinked",
+        ),
+    ],
+)
+def test_remove_code_unlinks_dead_module_files(
+    run_remove_code, tmp_path, files, entrypoints, expected_files
+):
+    run_remove_code(files, entrypoints)
+    for relpath, should_exist in expected_files.items():
+        assert (tmp_path / relpath).exists() is should_exist

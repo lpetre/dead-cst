@@ -2,9 +2,12 @@ from pathlib import Path
 
 import libcst as cst
 import networkx as nx
+from libcst.codemod import CodemodContext
+from libcst.codemod.visitors import RemoveImportsVisitor
 from libcst.metadata import FullRepoManager, QualifiedNameSource
 
 from ._fqn import FixedFullyQualifiedNameProvider
+from ._symbols import SymbolNode
 
 
 class RemoveDeadSymbols(cst.CSTTransformer):
@@ -57,15 +60,33 @@ class RemoveDeadSymbols(cst.CSTTransformer):
         return updated_node
 
 
+def _import_remove_args(node: SymbolNode) -> tuple[str, str | None, str | None]:
+    """Convert an ``"import"``-typed node to ``RemoveImportsVisitor`` args.
+
+    Returns ``(module, obj, asname)`` matching the signature of
+    :meth:`RemoveImportsVisitor.remove_unused_import`. ``asname`` is set
+    only when the local bound name differs from the natural binding
+    (``obj`` for ``from X import obj``, the leftmost segment of
+    ``module`` for bare ``import X``).
+    """
+    assert node.imports is not None, f"Import node missing imports metadata: {node.fqname}"
+    module = str(node.imports.module)
+    obj = node.imports.decl
+    bound = node.fqname.rsplit(".", 1)[-1]
+    natural = obj if obj is not None else module.split(".", 1)[0]
+    asname = bound if bound != natural else None
+    return module, obj, asname
+
+
 def remove_code(G: nx.Graph, base: Path) -> None:
-    by_file = {}
+    by_file: dict[Path, list[SymbolNode]] = {}
     for node in G.nodes:
         if not node.path.is_relative_to(base):
             continue
         if not node.path.exists():
             continue
         match node.type:
-            case "function" | "class" | "variable":
+            case "function" | "class" | "variable" | "import":
                 by_file.setdefault(node.path, []).append(node)
             case "module":
                 node.path.unlink()
@@ -74,8 +95,24 @@ def remove_code(G: nx.Graph, base: Path) -> None:
     for path, nodes in sorted(by_file.items(), key=lambda x: x):
         if not path.exists():
             continue
+
+        # Pass 1: drop dead defs / classes / variables. Imports they
+        # used to reference become eligible for removal in pass 2.
         wrapper = mgr.get_metadata_wrapper_for_path(path)
-        dead_fqnames = {n.fqname for n in nodes}
-        mod_removed = wrapper.visit(RemoveDeadSymbols(dead_fqnames))
+        dead_fqnames = {n.fqname for n in nodes if n.type != "import"}
+        result = wrapper.visit(RemoveDeadSymbols(dead_fqnames))
+
+        # Pass 2: hand the dead-import set to libcst's stock import
+        # remover. It walks scopes itself, so it'll skip anything still
+        # referenced after pass 1 (defensive -- if the graph said
+        # something is dead, no live user remains).
+        dead_imports = [n for n in nodes if n.type == "import"]
+        if dead_imports:
+            ctx = CodemodContext()
+            for imp in dead_imports:
+                module, obj, asname = _import_remove_args(imp)
+                RemoveImportsVisitor.remove_unused_import(ctx, module, obj, asname)
+            result = RemoveImportsVisitor(ctx).transform_module(result)
+
         with path.open("w") as f:
-            f.write(mod_removed.code)
+            f.write(result.code)
