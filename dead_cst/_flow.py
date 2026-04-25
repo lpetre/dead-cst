@@ -31,7 +31,7 @@ the end-to-end behaviour.
 
 from __future__ import annotations
 
-from typing import Sequence
+from typing import Callable, Sequence
 
 import libcst as cst
 
@@ -46,6 +46,79 @@ def _descendant_ids(node: cst.CSTNode, cache: dict[int, frozenset[int]]) -> froz
     frozen = frozenset(ids)
     cache[key] = frozen
     return frozen
+
+
+def _walk_flow(
+    stmts: Sequence[cst.BaseStatement],
+    incoming: set[cst.CSTNode],
+    referent_set: set[cst.CSTNode],
+    cache: dict[int, frozenset[int]],
+    observe: Callable[[cst.BaseStatement, set[cst.CSTNode]], None] | None,
+) -> set[cst.CSTNode]:
+    """Forward-walk ``stmts`` evolving the live referent set.
+
+    ``observe`` (when supplied) is invoked once per statement with the
+    pre-statement state -- callers use it to capture the state seen by
+    a specific access node nested inside ``stmt``.
+    """
+
+    def _referents_in(node: cst.CSTNode) -> set[cst.CSTNode]:
+        ids = _descendant_ids(node, cache)
+        return {r for r in referent_set if id(r) in ids}
+
+    def _else_flow(
+        orelse: cst.Else | cst.If | None, incoming: set[cst.CSTNode]
+    ) -> set[cst.CSTNode]:
+        if orelse is None:
+            return set(incoming)
+        if isinstance(orelse, cst.Else):
+            return _walk_flow(orelse.body.body, incoming, referent_set, cache, observe)
+        # ``elif`` is an ``If`` in the orelse slot; run it as a nested If.
+        return _walk_flow([orelse], incoming, referent_set, cache, observe)
+
+    state = set(incoming)
+    for stmt in stmts:
+        # Record the state the access sees *before* any bindings in the
+        # same statement take effect. RHS-of-assignment and
+        # expression-statement uses both match that convention.
+        if observe is not None:
+            observe(stmt, state)
+
+        if isinstance(stmt, cst.If):
+            body_end = _walk_flow(stmt.body.body, state, referent_set, cache, observe)
+            orelse_end = _else_flow(stmt.orelse, state)
+            state = body_end | orelse_end
+            continue
+
+        if isinstance(stmt, cst.Try):
+            # Body and each handler both see the pre-try state.
+            body_end = _walk_flow(stmt.body.body, state, referent_set, cache, observe)
+            post = set(body_end)
+            for handler in stmt.handlers:
+                post |= _walk_flow(handler.body.body, state, referent_set, cache, observe)
+            if stmt.orelse is not None:
+                # else runs only on the no-exception path, after body.
+                post = _walk_flow(stmt.orelse.body.body, body_end, referent_set, cache, observe) | (
+                    post - body_end
+                )
+            if stmt.finalbody is not None:
+                post = _walk_flow(stmt.finalbody.body, post, referent_set, cache, observe)
+            state = post
+            continue
+
+        if isinstance(stmt, (cst.For, cst.While)):
+            body_end = _walk_flow(stmt.body.body, state, referent_set, cache, observe)
+            post = state | body_end
+            if stmt.orelse is not None:
+                post = _walk_flow(stmt.orelse.body.body, post, referent_set, cache, observe)
+            state = post
+            continue
+
+        bindings_here = _referents_in(stmt)
+        if bindings_here:
+            state = bindings_here
+
+    return state
 
 
 def live_referents(
@@ -65,69 +138,28 @@ def live_referents(
     access_id = id(access_node)
     observed: list[set[cst.CSTNode]] = []
 
-    def _referents_in(node: cst.CSTNode) -> set[cst.CSTNode]:
-        ids = _descendant_ids(node, cache)
-        return {r for r in referent_set if id(r) in ids}
+    def _observe(stmt: cst.BaseStatement, state: set[cst.CSTNode]) -> None:
+        if access_id in _descendant_ids(stmt, cache):
+            observed.append(set(state))
 
-    def _contains_access(node: cst.CSTNode) -> bool:
-        return access_id in _descendant_ids(node, cache)
-
-    def _flow(stmts: Sequence[cst.BaseStatement], incoming: set[cst.CSTNode]) -> set[cst.CSTNode]:
-        state = set(incoming)
-        for stmt in stmts:
-            # Record the state the access sees *before* any bindings
-            # in the same statement take effect. RHS-of-assignment and
-            # expression-statement uses both match that convention.
-            if _contains_access(stmt):
-                observed.append(set(state))
-
-            if isinstance(stmt, cst.If):
-                body_end = _flow(stmt.body.body, state)
-                orelse_end = _else_flow(stmt.orelse, state)
-                state = body_end | orelse_end
-                continue
-
-            if isinstance(stmt, cst.Try):
-                # Body and each handler both see the pre-try state.
-                body_end = _flow(stmt.body.body, state)
-                post = set(body_end)
-                for handler in stmt.handlers:
-                    post |= _flow(handler.body.body, state)
-                if stmt.orelse is not None:
-                    # else runs only on the no-exception path, after body.
-                    post = _flow(stmt.orelse.body.body, body_end) | (post - body_end)
-                if stmt.finalbody is not None:
-                    post = _flow(stmt.finalbody.body, post)
-                state = post
-                continue
-
-            if isinstance(stmt, (cst.For, cst.While)):
-                body_end = _flow(stmt.body.body, state)
-                post = state | body_end
-                if stmt.orelse is not None:
-                    post = _flow(stmt.orelse.body.body, post)
-                state = post
-                continue
-
-            bindings_here = _referents_in(stmt)
-            if bindings_here:
-                state = bindings_here
-
-        return state
-
-    def _else_flow(
-        orelse: cst.Else | cst.If | None, incoming: set[cst.CSTNode]
-    ) -> set[cst.CSTNode]:
-        if orelse is None:
-            return set(incoming)
-        if isinstance(orelse, cst.Else):
-            return _flow(orelse.body.body, incoming)
-        # ``elif`` is an ``If`` in the orelse slot; run it as a nested If.
-        return _flow([orelse], incoming)
-
-    _flow(scope_body, set())
+    _walk_flow(scope_body, set(), referent_set, cache, _observe)
 
     result: set[cst.CSTNode] = set()
     for s in observed:
         result |= s
     return result
+
+
+def live_at_exit(
+    scope_body: Sequence[cst.BaseStatement],
+    referent_nodes: Sequence[cst.CSTNode],
+) -> set[cst.CSTNode]:
+    """Return the subset of ``referent_nodes`` live after ``scope_body`` runs.
+
+    Same flow model as :func:`live_referents` but observes the state
+    *after* the last statement, so callers can see which bindings
+    survive to the end of the scope -- e.g. which top-level decls a
+    module exports across all reachable control-flow paths.
+    """
+    cache: dict[int, frozenset[int]] = {}
+    return _walk_flow(scope_body, set(), set(referent_nodes), cache, None)

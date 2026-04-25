@@ -57,10 +57,19 @@ def build_symbol_graph(
                     if node.module is not None:
                         symbol_graph.add_node(node.module)
                         current_trie.add_declaration(node.module)
-                    for decl in node.declarations.values():
+                    for decls in node.declarations.values():
+                        for decl in decls:
+                            symbol_graph.add_node(decl)
+                            symbol_graph.add_edge(decl, node.module)
+                            current_trie.add_declaration(decl)
+                    # Shadowed decls still belong to this module: emit them
+                    # so the graph stays well-formed (every decl has a
+                    # parent-module edge). They aren't re-added to
+                    # ``current_trie`` -- only live-at-exit decls should
+                    # win project-wide lookups.
+                    for decl in node.shadowed:
                         symbol_graph.add_node(decl)
                         symbol_graph.add_edge(decl, node.module)
-                        current_trie.add_declaration(decl)
                     curr.extend(node.children.values())
 
                 for src, dst in visitor.internal_edges:
