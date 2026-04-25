@@ -14,6 +14,7 @@ import networkx as nx
 import typer
 
 from . import build_symbol_graph, count_nodes, find_reachable, order_paths, remove_code
+from ._branches import is_unreachable_node
 from ._plugins import (
     CSTAwareEdgePlugin,
     DunderAllPlugin,
@@ -189,6 +190,12 @@ def _output_text(
         total_counts = count_nodes(graph, base)
         unreachable_counts = count_nodes(unreachable, base)
         for kind in sorted(total_counts):
+            # Synthetic nodes (entrypoint sentinels, dead-suite markers)
+            # don't represent user-visible declarations; reporting them
+            # as "dead" alongside functions/classes would be misleading.
+            # Dead-suite nodes get their own section below.
+            if kind == "synthetic":
+                continue
             total = total_counts[kind]
             dead = unreachable_counts.get(kind, 0)
             if dead > 0:
@@ -196,15 +203,27 @@ def _output_text(
             else:
                 typer.echo(f"  {kind}: {total} total")
 
-    dead_count = unreachable.number_of_nodes()
-    if dead_count > 0:
-        typer.echo(f"\nDead symbols ({dead_count}):")
-        for node in sorted(unreachable.nodes, key=lambda n: (str(n.path), n.fqname)):
+    dead_real = [n for n in unreachable.nodes if not is_unreachable_node(n)]
+    if dead_real:
+        typer.echo(f"\nDead symbols ({len(dead_real)}):")
+        for node in sorted(dead_real, key=lambda n: (str(n.path), n.fqname)):
             try:
                 rel_path = node.path.relative_to(root)
             except ValueError:
                 rel_path = node.path
             typer.echo(f"  {node.fqname} ({node.type}) at {rel_path}")
+
+    branches = [n for n in graph.nodes if is_unreachable_node(n)]
+    if branches:
+        typer.echo(f"\nUnreachable branches ({len(branches)}):")
+        for node in sorted(branches, key=lambda n: (str(n.path), n.position.start)):
+            try:
+                rel_path = node.path.relative_to(root)
+            except ValueError:
+                rel_path = node.path
+            start = node.position.start
+            end = node.position.end
+            typer.echo(f"  {rel_path}:{start.line}:{start.column}-{end.line}:{end.column}")
 
 
 def _output_json(
@@ -216,18 +235,25 @@ def _output_json(
     result: dict = {
         "summary": {},
         "dead_symbols": [],
+        "unreachable_branches": [],
     }
 
     for base in order_paths(paths_dict):
         base_str = str(base)
         total_counts = count_nodes(graph, base)
         unreachable_counts = count_nodes(unreachable, base)
+        # Same rationale as the text output: synthetic nodes are reported
+        # via ``unreachable_branches`` (and entrypoint sentinels), not as
+        # part of the per-kind summary.
         result["summary"][base_str] = {
             kind: {"total": total_counts[kind], "dead": unreachable_counts.get(kind, 0)}
             for kind in total_counts
+            if kind != "synthetic"
         }
 
     for node in sorted(unreachable.nodes, key=lambda n: (str(n.path), n.fqname)):
+        if is_unreachable_node(node):
+            continue
         try:
             rel_path = str(node.path.relative_to(root))
         except ValueError:
@@ -237,6 +263,22 @@ def _output_json(
                 "fqname": node.fqname,
                 "type": node.type,
                 "path": rel_path,
+            }
+        )
+
+    for node in sorted(
+        (n for n in graph.nodes if is_unreachable_node(n)),
+        key=lambda n: (str(n.path), n.position.start),
+    ):
+        try:
+            rel_path = str(node.path.relative_to(root))
+        except ValueError:
+            rel_path = str(node.path)
+        result["unreachable_branches"].append(
+            {
+                "path": rel_path,
+                "start": {"line": node.position.start.line, "column": node.position.start.column},
+                "end": {"line": node.position.end.line, "column": node.position.end.column},
             }
         )
 
@@ -361,12 +403,18 @@ def remove(
 
     unreachable_graph = graph.subgraph([n for n in graph.nodes if n not in reachable])
 
-    if unreachable_graph.number_of_nodes() == 0:
+    # Synthetic ``unreachable`` nodes are reported by ``analyze`` but
+    # not yet removable by ``remove`` -- the codemod doesn't know how to
+    # delete an arbitrary suite. Filter them out of the listing so we
+    # don't promise something we don't deliver.
+    removable = [n for n in unreachable_graph.nodes if not is_unreachable_node(n)]
+
+    if not removable:
         typer.echo("No dead code found.")
         return
 
-    typer.echo(f"\nDead symbols to remove ({unreachable_graph.number_of_nodes()}):")
-    for node in sorted(unreachable_graph.nodes, key=lambda n: (str(n.path), n.fqname)):
+    typer.echo(f"\nDead symbols to remove ({len(removable)}):")
+    for node in sorted(removable, key=lambda n: (str(n.path), n.fqname)):
         try:
             rel_path = node.path.relative_to(root)
         except ValueError:

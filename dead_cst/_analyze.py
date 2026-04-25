@@ -76,8 +76,19 @@ def build_symbol_graph(
                 for src, dst in visitor.internal_edges:
                     symbol_graph.add_edge(src, dst)
 
+                # Synthetic ``unreachable`` nodes for statically-dead suites.
+                # They live in the graph as orphan sources -- nothing points
+                # at them, so reachability never visits them, but the edges
+                # they own surface which symbols are referenced from inside
+                # dead branches. Existing top-level decl edges are unchanged.
+                for unreachable in visitor.unreachable_nodes:
+                    symbol_graph.add_node(unreachable)
+                for src, dst in visitor.unreachable_internal_edges:
+                    symbol_graph.add_edge(src, dst)
+
                 # collect all the intra module edges
                 import_edges = import_edges | visitor.import_edges
+                import_edges = import_edges | visitor.unreachable_import_edges
 
             # add edges to keep __init__.py files alive
             current_trie.add_module_hierarchy_edges(symbol_graph)
