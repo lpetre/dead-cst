@@ -58,6 +58,28 @@ def apply_transformer(tmp_path):
 
 
 @pytest.fixture
+def apply_transformer_at_lines(tmp_path):
+    """Run ``RemoveDeadSymbols`` keyed on ``(fqname, start_line)`` pairs.
+
+    Used by shadowing cases where the same FQN binds at multiple
+    positions; the FQN-only fixture above cannot disambiguate them.
+    """
+
+    def _apply(src: str, dead: set[tuple[str, int]]) -> str:
+        path = tmp_path / "mod.py"
+        path.write_text(_normalise(src))
+        graph = build_symbol_graph({tmp_path: []})
+        dead_decls = {
+            (n.fqname, n.position) for n in graph.nodes if (n.fqname, n.position.start.line) in dead
+        }
+        mgr = FullRepoManager(str(tmp_path), [str(path)], {FixedFullyQualifiedNameProvider})
+        wrapper: MetadataWrapper = mgr.get_metadata_wrapper_for_path(str(path))
+        return wrapper.visit(RemoveDeadSymbols(dead_decls)).code
+
+    return _apply
+
+
+@pytest.fixture
 def run_remove_code(tmp_path):
     """Materialise ``files`` under ``tmp_path``, run ``remove_code``, return paths.
 
@@ -407,6 +429,128 @@ def run_remove_code(tmp_path):
 )
 def test_remove_dead_symbols(apply_transformer, src, dead_fqnames, expected):
     assert apply_transformer(src, dead_fqnames) == _normalise(expected)
+
+
+# ---------------------------------------------------------------------------
+# RemoveDeadSymbols -- shadowing (same FQN, multiple positions)
+#
+# The codemod keys on ``(fqname, position)``, so a dead shadowed binding
+# does not drag its live sibling out, and a live binding can be removed
+# without touching a shadowed predecessor that happens to share its
+# name. ``dead`` is a set of ``(fqname, start_line)`` pairs; lines are
+# 1-based and counted from the first non-blank line of the dedented
+# source (matching ``_normalise``).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "src, dead, expected",
+    [
+        pytest.param(
+            """
+            def f(): return 1
+            def f(): return 2
+            """,
+            {("mod.f", 1)},
+            """
+            def f(): return 2
+            """,
+            id="shadowed-function-removed-keeps-live",
+        ),
+        pytest.param(
+            """
+            def f(): return 1
+            def f(): return 2
+            """,
+            {("mod.f", 2)},
+            """
+            def f(): return 1
+            """,
+            id="live-function-removed-keeps-shadowed",
+        ),
+        pytest.param(
+            """
+            def f(): return 1
+            def f(): return 2
+            def f(): return 3
+            """,
+            {("mod.f", 2)},
+            """
+            def f(): return 1
+            def f(): return 3
+            """,
+            id="middle-of-three-shadowed-removed",
+        ),
+        pytest.param(
+            """
+            class C:
+                a = 1
+            class C:
+                b = 2
+            """,
+            {("mod.C", 1)},
+            """
+            class C:
+                b = 2
+            """,
+            id="shadowed-class-removed",
+        ),
+        pytest.param(
+            """
+            x = 1
+            x = 2
+            """,
+            {("mod.x", 1)},
+            """
+            x = 2
+            """,
+            id="shadowed-variable-removed",
+        ),
+        pytest.param(
+            """
+            x: int = 1
+            x: str = "y"
+            """,
+            {("mod.x", 1)},
+            """
+            x: str = "y"
+            """,
+            id="shadowed-ann-assign-removed",
+        ),
+        pytest.param(
+            """
+            if cond:
+                def f(): return 1
+            else:
+                def f(): return 2
+            """,
+            {("mod.f", 2)},
+            """
+            if cond:
+                pass
+            else:
+                def f(): return 2
+            """,
+            id="conditional-branch-def-removed-leaves-pass",
+        ),
+        pytest.param(
+            """
+            def f(): return 1
+            def f(): return 2
+            def keep(): pass
+            """,
+            {("mod.f", 1), ("mod.f", 2)},
+            """
+            def keep(): pass
+            """,
+            id="all-same-name-decls-removed",
+        ),
+    ],
+)
+def test_remove_dead_symbols_disambiguates_by_position(
+    apply_transformer_at_lines, src, dead, expected
+):
+    assert apply_transformer_at_lines(src, dead) == _normalise(expected)
 
 
 # ---------------------------------------------------------------------------
