@@ -82,9 +82,7 @@ def test_unknown_condition_creates_no_synthetic_node(build_decl_graph):
     assert _unreachable_nodes(graph) == []
 
 
-def test_unreachable_node_has_edge_to_internal_referent(
-    build_decl_graph, assert_unreachable_edges
-):
+def test_unreachable_node_has_edge_to_internal_referent(build_decl_graph, assert_unreachable_edges):
     graph = build_decl_graph(
         {
             "mod.py": """
@@ -98,9 +96,7 @@ def test_unreachable_node_has_edge_to_internal_referent(
     assert_unreachable_edges(graph, {"<3:4> -> mod.helper"})
 
 
-def test_unreachable_node_has_edge_to_import_referent(
-    build_decl_graph, assert_unreachable_edges
-):
+def test_unreachable_node_has_edge_to_import_referent(build_decl_graph, assert_unreachable_edges):
     # Reference to an imported name from inside a dead suite produces
     # the same edge fan-out as a reference from a live decl: the local
     # import decl, the upstream module, and the resolved target.
@@ -125,9 +121,7 @@ def test_unreachable_node_has_edge_to_import_referent(
     )
 
 
-def test_original_edges_are_preserved_when_branch_is_dead(
-    build_decl_graph, assert_edges
-):
+def test_original_edges_are_preserved_when_branch_is_dead(build_decl_graph, assert_edges):
     # The "real symbol graph" still contains the enclosing-module ->
     # helper edge. The unreachable-edge filtering in ``assert_edges``
     # ensures this assertion is unaffected by the synthetic node.
@@ -166,9 +160,7 @@ def test_nested_dead_suites_create_separate_synthetic_nodes(build_decl_graph):
     assert len(branches) == 2
 
 
-def test_nested_dead_suite_attributes_to_innermost(
-    build_decl_graph, assert_unreachable_edges
-):
+def test_nested_dead_suite_attributes_to_innermost(build_decl_graph, assert_unreachable_edges):
     # ``a()`` is inside the outer dead suite only; ``b()`` is inside
     # both, but the innermost suite owns it.
     graph = build_decl_graph(

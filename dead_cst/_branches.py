@@ -179,9 +179,7 @@ def make_unreachable_fqname(module_fqname: str, position: CodeRange) -> str:
     )
 
 
-def make_unreachable_node(
-    module_fqname: str, path: Path, position: CodeRange
-) -> SymbolNode:
+def make_unreachable_node(module_fqname: str, path: Path, position: CodeRange) -> SymbolNode:
     """Build the synthetic ``SymbolNode`` for a dead suite.
 
     Reuses ``type="synthetic"`` -- the existing escape hatch for graph

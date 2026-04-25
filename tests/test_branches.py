@@ -42,9 +42,7 @@ def _stmt(src: str) -> cst.BaseStatement:
 def _bodies_as_code(bodies: list[Sequence[cst.CSTNode]]) -> list[str]:
     """Stringify each dead body as concatenated source for assertions."""
     module = cst.Module([])
-    return [
-        "".join(module.code_for_node(s) for s in body).strip() for body in bodies
-    ]
+    return ["".join(module.code_for_node(s) for s in body).strip() for body in bodies]
 
 
 # ----------------------------------------------------------------------
