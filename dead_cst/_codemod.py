@@ -4,22 +4,28 @@ import libcst as cst
 import networkx as nx
 from libcst.codemod import CodemodContext
 from libcst.codemod.visitors import RemoveImportsVisitor
-from libcst.metadata import FullRepoManager, QualifiedNameSource
+from libcst.metadata import CodeRange, FullRepoManager, PositionProvider, QualifiedNameSource
 
 from ._fqn import FixedFullyQualifiedNameProvider
 from ._symbols import SymbolNode
 
 
 class RemoveDeadSymbols(cst.CSTTransformer):
-    METADATA_DEPENDENCIES = (FixedFullyQualifiedNameProvider,)
+    METADATA_DEPENDENCIES = (FixedFullyQualifiedNameProvider, PositionProvider)
 
-    def __init__(self, dead_fqnames: set[str]):
-        self.dead_fqnames = dead_fqnames
+    def __init__(self, dead_decls: set[tuple[str, CodeRange]]):
+        # ``(fqname, position)`` pairs. The position disambiguates same-name
+        # decls so a shadowed dead binding does not drag its live sibling
+        # out with it (and vice versa).
+        self.dead_decls = dead_decls
 
     def _should_remove(self, node: cst.CSTNode) -> bool:
         fqnames = self.get_metadata(FixedFullyQualifiedNameProvider, node, default=[])
+        pos = self.get_metadata(PositionProvider, node, default=None)
         return any(
-            qn.name in self.dead_fqnames for qn in fqnames if qn.source == QualifiedNameSource.LOCAL
+            (qn.name, pos) in self.dead_decls
+            for qn in fqnames
+            if qn.source == QualifiedNameSource.LOCAL
         )
 
     def leave_FunctionDef(self, original_node: cst.FunctionDef, updated_node: cst.FunctionDef):
@@ -35,13 +41,7 @@ class RemoveDeadSymbols(cst.CSTTransformer):
     def leave_Assign(self, original_node: cst.Assign, updated_node: cst.Assign):
         new_targets = []
         for orig_target, new_target in zip(original_node.targets, updated_node.targets):
-            target_node = orig_target.target
-            fqnames = self.get_metadata(FixedFullyQualifiedNameProvider, target_node, default=[])
-            if not any(
-                qn.name in self.dead_fqnames
-                for qn in fqnames
-                if qn.source == QualifiedNameSource.LOCAL
-            ):
+            if not self._should_remove(orig_target.target):
                 new_targets.append(new_target)
 
         if not new_targets:
@@ -50,12 +50,7 @@ class RemoveDeadSymbols(cst.CSTTransformer):
         return updated_node.with_changes(targets=new_targets)
 
     def leave_AnnAssign(self, original_node: cst.AnnAssign, updated_node: cst.AnnAssign):
-        fqnames = self.get_metadata(
-            FixedFullyQualifiedNameProvider, original_node.target, default=[]
-        )
-        if any(
-            qn.name in self.dead_fqnames for qn in fqnames if qn.source == QualifiedNameSource.LOCAL
-        ):
+        if self._should_remove(original_node.target):
             return cst.RemoveFromParent()
         return updated_node
 
@@ -99,8 +94,8 @@ def remove_code(G: nx.Graph, base: Path) -> None:
         # Pass 1: drop dead defs / classes / variables. Imports they
         # used to reference become eligible for removal in pass 2.
         wrapper = mgr.get_metadata_wrapper_for_path(path)
-        dead_fqnames = {n.fqname for n in nodes if n.type != "import"}
-        result = wrapper.visit(RemoveDeadSymbols(dead_fqnames))
+        dead_decls = {(n.fqname, n.position) for n in nodes if n.type != "import"}
+        result = wrapper.visit(RemoveDeadSymbols(dead_decls))
 
         # Pass 2: hand the dead-import set to libcst's stock import
         # remover. It walks scopes itself, so it'll skip anything still
