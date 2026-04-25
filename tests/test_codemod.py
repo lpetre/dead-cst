@@ -38,14 +38,21 @@ def _normalise(s: str) -> str:
 
 @pytest.fixture
 def apply_transformer(tmp_path):
-    """Write ``src`` to ``tmp_path/mod.py`` and run ``RemoveDeadSymbols``."""
+    """Write ``src`` to ``tmp_path/mod.py`` and run ``RemoveDeadSymbols``.
+
+    Resolves each requested FQN to its ``(fqname, position)`` pair via the
+    symbol graph so the codemod's position-aware matching has the data it
+    needs.
+    """
 
     def _apply(src: str, dead_fqnames: set[str]) -> str:
         path = tmp_path / "mod.py"
         path.write_text(_normalise(src))
+        graph = build_symbol_graph({tmp_path: []})
+        dead_decls = {(n.fqname, n.position) for n in graph.nodes if n.fqname in dead_fqnames}
         mgr = FullRepoManager(str(tmp_path), [str(path)], {FixedFullyQualifiedNameProvider})
         wrapper: MetadataWrapper = mgr.get_metadata_wrapper_for_path(str(path))
-        return wrapper.visit(RemoveDeadSymbols(dead_fqnames)).code
+        return wrapper.visit(RemoveDeadSymbols(dead_decls)).code
 
     return _apply
 
