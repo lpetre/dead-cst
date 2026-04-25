@@ -1,9 +1,10 @@
 # simple-app
 
 A minimal package whose only entrypoint is the `if __name__ == "__main__":`
-block in `simple_app/cli.py`. Demonstrates the `MainBlockPlugin`.
+block in `simple_app/__main__.py`, runnable via `python -m simple_app`.
+Demonstrates the `MainBlockPlugin`.
 
-The package contains four obvious bits of dead code:
+The package contains two obvious bits of dead code:
 
 - `simple_app.core.legacy_greet` -- old API, no callers
 - `simple_app.utils.stale_logger` -- old helper, no callers

@@ -9,7 +9,6 @@ from typing import Generator, Literal
 import libcst as cst
 from libcst.helpers import get_full_name_for_node
 from libcst.metadata import (
-    FullyQualifiedNameProvider,
     ParentNodeProvider,
     PositionProvider,
     ScopeProvider,
@@ -23,6 +22,7 @@ from libcst.metadata.scope_provider import (
 )
 
 from ._flow import live_at_exit, live_referents
+from ._fqn import FixedFullyQualifiedNameProvider
 from ._resolve import resolve_import
 from ._symbols import Import, SymbolNode, SymbolTrie
 
@@ -69,7 +69,7 @@ def _pair_targets(
 
 class SymbolVisitor(cst.CSTVisitor):
     METADATA_DEPENDENCIES = (
-        FullyQualifiedNameProvider,
+        FixedFullyQualifiedNameProvider,
         ScopeProvider,
         ParentNodeProvider,
         PositionProvider,
@@ -143,7 +143,7 @@ class SymbolVisitor(cst.CSTVisitor):
         if len(self.decl_stack) > 1:
             return
 
-        fqns = self.get_metadata(FullyQualifiedNameProvider, node, default=[])
+        fqns = self.get_metadata(FixedFullyQualifiedNameProvider, node, default=[])
         pos = self._pos(node)
         for fqn in fqns:
             sym = SymbolNode(fqn.name, type_, self.path, pos)
@@ -179,7 +179,7 @@ class SymbolVisitor(cst.CSTVisitor):
         name_to_syms: dict[cst.Name, list[SymbolNode]] = {}
         value_to_syms: dict[cst.CSTNode, list[SymbolNode]] = {}
         for name, value in pairs:
-            fqns = self.get_metadata(FullyQualifiedNameProvider, name, default=[])
+            fqns = self.get_metadata(FixedFullyQualifiedNameProvider, name, default=[])
             pos = self._pos(name)
             for fqn in fqns:
                 sym = SymbolNode(fqn.name, "variable", self.path, pos)
@@ -258,7 +258,7 @@ class SymbolVisitor(cst.CSTVisitor):
 
     def visit_Module(self, node: cst.Module) -> None:
         assert not self.decl_stack, "Module node should be the first visited node"
-        fqns = self.get_metadata(FullyQualifiedNameProvider, node, default=[])
+        fqns = self.get_metadata(FixedFullyQualifiedNameProvider, node, default=[])
         sym = SymbolNode(next(iter(fqns)).name, "module", self.path, self._pos(node))
         # Cache so ``_finalize_module_declarations`` can locate the trie
         # node after ``on_leave`` has popped the module frame.

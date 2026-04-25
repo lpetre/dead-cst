@@ -3,8 +3,9 @@ from pathlib import Path
 from typing import Sequence
 
 import networkx as nx
-from libcst.metadata import FullRepoManager, FullyQualifiedNameProvider
+from libcst.metadata import FullRepoManager
 
+from ._fqn import FixedFullyQualifiedNameProvider
 from ._plugins import (
     CSTAwareEdgePlugin,
     EdgePlugin,
@@ -45,7 +46,7 @@ def build_symbol_graph(
             base_tries[base] = current_trie = SymbolTrie()
             import_edges = set()
             files = list(sorted(base.rglob("*.py")))
-            mgr = FullRepoManager(base, files, {FullyQualifiedNameProvider})
+            mgr = FullRepoManager(base, files, {FixedFullyQualifiedNameProvider})
             base_managers[base] = mgr
             for file in files:
                 wrapper = mgr.get_metadata_wrapper_for_path(file)
