@@ -338,11 +338,150 @@ class DunderAllPlugin:
             yield AddEdge(synth, node)
 
 
+@dataclass
+class PytestPlugin:
+    """Mark pytest-discovered symbols as entrypoints.
+
+    pytest auto-discovers tests, fixtures, and plugin hooks by filename and
+    decorator conventions; without this plugin those symbols look unused to
+    a static analyzer. Specifically:
+
+    * ``conftest.py`` modules: every top-level function, class, and
+      variable is marked alive (fixtures, ``pytest_*`` hooks, module-level
+      ``pytest_plugins`` / ``collect_ignore``, helper functions used by
+      tests).
+    * Modules matching ``test_*.py`` / ``*_test.py``: every top-level
+      ``test_*`` function and ``Test*`` class is marked alive.
+    * Top-level functions decorated with ``@pytest.fixture`` (or the bare
+      ``@fixture`` form, with or without a call) anywhere in the project
+      -- fixtures are looked up by parameter name and have no static
+      caller edge.
+
+    Marker decorators (``@pytest.mark.*``) are not interpreted: they only
+    affect collection, never reachability.
+
+    This is a :class:`CSTAwareEdgePlugin` because fixture detection needs
+    to inspect decorators on the original CST.
+    """
+
+    name: str = "pytest"
+    cst_aware: bool = True
+
+    def contribute(
+        self, ctx: PluginContext, managers: dict[Path, FullRepoManager]
+    ) -> Iterable[GraphOp]:
+        modules_by_path: dict[Path, SymbolNode] = {}
+        decls_by_path: dict[Path, list[SymbolNode]] = {}
+        for node in ctx.graph.nodes:
+            if node.type == "module":
+                modules_by_path[node.path] = node
+            elif node.type in ("function", "class", "variable"):
+                decls_by_path.setdefault(node.path, []).append(node)
+
+        for path, module_node in modules_by_path.items():
+            module_decls = decls_by_path.get(path, [])
+            filename = path.name
+
+            if filename == "conftest.py":
+                yield from _mark_entrypoints(
+                    f"<pytest:conftest>:{module_node.fqname}", path, module_decls
+                )
+            elif _is_test_filename(filename):
+                test_decls = [d for d in module_decls if _is_test_decl(d)]
+                yield from _mark_entrypoints(
+                    f"<pytest:tests>:{module_node.fqname}", path, test_decls
+                )
+
+            wrapper = _wrapper_for(path, managers)
+            if wrapper is None:
+                continue
+            fixture_names = _find_fixture_names(wrapper.module)
+            if not fixture_names:
+                continue
+            fixture_decls = [
+                d
+                for d in module_decls
+                if d.type == "function" and d.fqname.rsplit(".", 1)[-1] in fixture_names
+            ]
+            yield from _mark_entrypoints(
+                f"<pytest:fixtures>:{module_node.fqname}", path, fixture_decls
+            )
+
+
+def _is_test_filename(name: str) -> bool:
+    return (name.startswith("test_") and name.endswith(".py")) or name.endswith("_test.py")
+
+
+def _is_test_decl(node: SymbolNode) -> bool:
+    simple = node.fqname.rsplit(".", 1)[-1]
+    if node.type == "function" and simple.startswith("test_"):
+        return True
+    if node.type == "class" and simple.startswith("Test"):
+        return True
+    return False
+
+
+def _mark_entrypoints(seed_fqname: str, path: Path, targets: list[SymbolNode]) -> Iterable[GraphOp]:
+    if not targets:
+        return
+    synth = synthetic_node(fqname=seed_fqname, path=path)
+    yield AddNode(synth, entrypoint=True)
+    for target in targets:
+        yield AddEdge(synth, target)
+
+
+def _wrapper_for(path: Path, managers: dict[Path, FullRepoManager]):
+    for base, mgr in managers.items():
+        if not path.is_relative_to(base):
+            continue
+        try:
+            return mgr.get_metadata_wrapper_for_path(path)
+        except Exception:
+            return None
+    return None
+
+
+def _find_fixture_names(module: cst.Module) -> set[str]:
+    names: set[str] = set()
+    for stmt in module.body:
+        func = _as_function_def(stmt)
+        if func is None:
+            continue
+        if any(_is_pytest_fixture_decorator(dec.decorator) for dec in func.decorators):
+            names.add(func.name.value)
+    return names
+
+
+def _as_function_def(stmt: cst.CSTNode) -> cst.FunctionDef | None:
+    # Top-level statements are wrapped in SimpleStatementLine / compound
+    # statement classes; FunctionDef appears directly as a top-level body
+    # entry. async functions share the same FunctionDef class.
+    if isinstance(stmt, cst.FunctionDef):
+        return stmt
+    return None
+
+
+def _is_pytest_fixture_decorator(expr: cst.BaseExpression) -> bool:
+    """Match ``@pytest.fixture``, ``@pytest.fixture(...)``, ``@fixture``, ``@fixture(...)``."""
+    if isinstance(expr, cst.Call):
+        expr = expr.func
+    if isinstance(expr, cst.Attribute):
+        return (
+            isinstance(expr.value, cst.Name)
+            and expr.value.value == "pytest"
+            and expr.attr.value == "fixture"
+        )
+    if isinstance(expr, cst.Name):
+        return expr.value == "fixture"
+    return False
+
+
 BUILTIN_PLUGINS: dict[str, type] = {
     MainBlockPlugin.name: MainBlockPlugin,
     ProjectScriptsPlugin.name: ProjectScriptsPlugin,
     ExplicitEntrypointPlugin.name: ExplicitEntrypointPlugin,
     DunderAllPlugin.name: DunderAllPlugin,
+    PytestPlugin.name: PytestPlugin,
 }
 
 
