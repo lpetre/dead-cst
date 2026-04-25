@@ -10,7 +10,7 @@ import pytest
 
 IMPORT_TEST_FILES = {
     "p/__init__.py": "",
-    "p/functions.py": "def f(): pass",
+    "p/functions.py": "def f(): pass\ndef g(): pass",
     "p/classes.py": "class C(): pass",
     "p/chain.py": "from . import functions",
 }
@@ -27,6 +27,7 @@ IMPORT_BASE_EDGES = frozenset(
         "p.classes.C -> p.classes",
         "p.functions -> p",
         "p.functions.f -> p.functions",
+        "p.functions.g -> p.functions",
         "p.x -> p",
     }
 )
@@ -215,6 +216,16 @@ IMPORT_BASE_EDGES = frozenset(
                 "p.x.p -> p.x",
             },
             id="import-package-then-dotted-access",
+        ),
+        pytest.param(
+            "from p.functions import *\ndef a(): f()",
+            {
+                "p.x -> p.functions",
+                "p.x -> p.functions.f",
+                "p.x -> p.functions.g",
+                "p.x.a -> p.x",
+            },
+            id="star-import-fans-out-to-all-decls",
         ),
     ],
 )

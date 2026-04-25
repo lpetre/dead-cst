@@ -127,6 +127,13 @@ def resolve_edges(
 
         yield from _emit(src, node.module)
 
+        # Star import: fan out to every top-level declaration in the target module
+        if dst.star:
+            for decls in node.declarations.values():
+                for decl in decls:
+                    yield from _emit(src, decl)
+            continue
+
         # No decl? the edge points at a module
         if not dst.decl:
             continue
