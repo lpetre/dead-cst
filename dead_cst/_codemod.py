@@ -2,17 +2,19 @@ from pathlib import Path
 
 import libcst as cst
 import networkx as nx
-from libcst.metadata import FullRepoManager, FullyQualifiedNameProvider, QualifiedNameSource
+from libcst.metadata import FullRepoManager, QualifiedNameSource
+
+from ._fqn import FixedFullyQualifiedNameProvider
 
 
 class RemoveDeadSymbols(cst.CSTTransformer):
-    METADATA_DEPENDENCIES = (FullyQualifiedNameProvider,)
+    METADATA_DEPENDENCIES = (FixedFullyQualifiedNameProvider,)
 
     def __init__(self, dead_fqnames: set[str]):
         self.dead_fqnames = dead_fqnames
 
     def _should_remove(self, node: cst.CSTNode) -> bool:
-        fqnames = self.get_metadata(FullyQualifiedNameProvider, node, default=[])
+        fqnames = self.get_metadata(FixedFullyQualifiedNameProvider, node, default=[])
         return any(
             qn.name in self.dead_fqnames for qn in fqnames if qn.source == QualifiedNameSource.LOCAL
         )
@@ -31,7 +33,7 @@ class RemoveDeadSymbols(cst.CSTTransformer):
         new_targets = []
         for orig_target, new_target in zip(original_node.targets, updated_node.targets):
             target_node = orig_target.target
-            fqnames = self.get_metadata(FullyQualifiedNameProvider, target_node, default=[])
+            fqnames = self.get_metadata(FixedFullyQualifiedNameProvider, target_node, default=[])
             if not any(
                 qn.name in self.dead_fqnames
                 for qn in fqnames
@@ -45,7 +47,9 @@ class RemoveDeadSymbols(cst.CSTTransformer):
         return updated_node.with_changes(targets=new_targets)
 
     def leave_AnnAssign(self, original_node: cst.AnnAssign, updated_node: cst.AnnAssign):
-        fqnames = self.get_metadata(FullyQualifiedNameProvider, original_node.target, default=[])
+        fqnames = self.get_metadata(
+            FixedFullyQualifiedNameProvider, original_node.target, default=[]
+        )
         if any(
             qn.name in self.dead_fqnames for qn in fqnames if qn.source == QualifiedNameSource.LOCAL
         ):
@@ -66,7 +70,7 @@ def remove_code(G: nx.Graph, base: Path) -> None:
             case "module":
                 node.path.unlink()
 
-    mgr = FullRepoManager(base, by_file.keys(), {FullyQualifiedNameProvider})
+    mgr = FullRepoManager(base, by_file.keys(), {FixedFullyQualifiedNameProvider})
     for path, nodes in sorted(by_file.items(), key=lambda x: x):
         if not path.exists():
             continue

@@ -1202,3 +1202,57 @@ def test_module_hierarchy_edges(build_decl_graph, assert_edges):
             "pkg.sub.leaf -> pkg.sub",
         },
     )
+
+
+def test_main_module_distinct_from_package(build_decl_graph, assert_edges):
+    """``pkg/__main__.py`` is the module ``pkg.__main__``, not ``pkg``."""
+    graph = build_decl_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/__main__.py": "def run(): pass\n",
+        }
+    )
+    assert_edges(
+        graph,
+        {
+            "pkg.__main__ -> pkg",
+            "pkg.__main__.run -> pkg.__main__",
+        },
+    )
+
+
+def test_top_level_main_module(build_decl_graph, assert_edges):
+    """A top-level ``__main__.py`` is the module ``__main__``."""
+    graph = build_decl_graph({"__main__.py": "def run(): pass\n"})
+    assert_edges(
+        graph,
+        {
+            "__main__.run -> __main__",
+        },
+    )
+
+
+def test_main_module_relative_import(build_decl_graph, assert_edges):
+    """Relative imports inside ``pkg/__main__.py`` resolve against ``pkg``."""
+    graph = build_decl_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/util.py": "def helper(): pass\n",
+            "pkg/__main__.py": "from .util import helper\ndef run(): helper()\n",
+        }
+    )
+    assert_edges(
+        graph,
+        {
+            "pkg.__main__ -> pkg",
+            "pkg.__main__.helper -> pkg.__main__",
+            "pkg.__main__.helper -> pkg.util",
+            "pkg.__main__.helper -> pkg.util.helper",
+            "pkg.__main__.run -> pkg.__main__",
+            "pkg.__main__.run -> pkg.__main__.helper",
+            "pkg.__main__.run -> pkg.util",
+            "pkg.__main__.run -> pkg.util.helper",
+            "pkg.util -> pkg",
+            "pkg.util.helper -> pkg.util",
+        },
+    )
