@@ -8,6 +8,7 @@ from importlib.machinery import ModuleSpec
 from pathlib import Path
 from typing import Generator
 
+from ._plugins._core import SYNTHETIC_POSITION
 from ._symbols import Import, SymbolNode, SymbolTrie
 
 logger = logging.getLogger(__name__)
@@ -95,9 +96,10 @@ def resolve_import(name: str, search_paths: list[Path]) -> str | Path:
 
 
 def resolve_edges(
-    import_edges: set[tuple[SymbolNode, Import]], symbol_lookup: SymbolTrie
+    import_edges: set[tuple[SymbolNode, Import]],
+    symbol_lookup: SymbolTrie,
+    base: Path,
 ) -> Generator[tuple[SymbolNode, SymbolNode], None, None]:
-    third_party = set()
     emitted: set[tuple[SymbolNode, SymbolNode]] = set()
 
     def _emit(
@@ -109,10 +111,13 @@ def resolve_edges(
         emitted.add(key)
         yield key
 
+    def _synthetic(tag: str) -> SymbolNode:
+        return SymbolNode(fqname=tag, type="synthetic", path=base, position=SYNTHETIC_POSITION)
+
     for src, dst in import_edges:
         if not isinstance(dst.path, Path):
             if "external" in dst.path:
-                third_party.add(dst.path)
+                yield from _emit(src, _synthetic(dst.path))
             continue
 
         node = symbol_lookup._get(dst.module.split("."))
@@ -156,7 +161,7 @@ def resolve_edges(
 
                     if not isinstance(decl.imports.path, Path):
                         if "external" in decl.imports.path:
-                            third_party.add(decl.imports.path)
+                            yield from _emit(src, _synthetic(decl.imports.path))
                         continue
 
                     dest = symbol_lookup._get(decl.imports.module.split("."))
@@ -189,6 +194,3 @@ def resolve_edges(
                 part,
                 cur.module.fqname,
             )
-
-    for mod in sorted(third_party):
-        logger.debug(mod)

@@ -353,6 +353,60 @@ def _is_dunder_all(node: SymbolNode) -> bool:
     return node.type == "variable" and node.fqname.endswith("__all__")
 
 
+def _is_external_dep(node: SymbolNode) -> bool:
+    return node.type == "synthetic" and node.fqname.startswith("[external ")
+
+
+@app.command()
+def dependencies(
+    root: Annotated[Path, typer.Argument(help="Root directory to analyze.")],
+    path: Annotated[
+        Optional[list[str]],
+        typer.Option("-p", "--path", help="Search path spec: 'base:dep1,dep2' or 'base'."),
+    ] = None,
+    resolver: Annotated[
+        Optional[list[str]],
+        typer.Option("--resolver", help="Path resolver to run (e.g. venv, pyproject)."),
+    ] = None,
+    verbose: Annotated[
+        bool, typer.Option("-v", "--verbose", help="Enable verbose output.")
+    ] = False,
+    output_format: Annotated[
+        OutputFormat, typer.Option("--format", help="Output format.")
+    ] = OutputFormat.text,
+) -> None:
+    """List third-party dependencies imported by the codebase."""
+    setup_logging(verbose)
+    root = root.resolve()
+
+    paths_dict = resolve_paths(root, path or [], resolver or [])
+
+    typer.echo(f"Building symbol graph for {root}...", err=True)
+    graph = build_symbol_graph(paths_dict, project_root=root)
+
+    deps_by_base: dict[Path, list[SymbolNode]] = {base: [] for base in order_paths(paths_dict)}
+    for node in graph.nodes:
+        if not _is_external_dep(node):
+            continue
+        if node.path in deps_by_base:
+            deps_by_base[node.path].append(node)
+
+    if output_format == OutputFormat.json:
+        result = {
+            str(base): sorted(n.fqname for n in nodes) for base, nodes in deps_by_base.items()
+        }
+        typer.echo(json.dumps(result, indent=2))
+        return
+
+    for base, nodes in deps_by_base.items():
+        typer.echo(f"\n{base}:")
+        if not nodes:
+            typer.echo("  (no third-party dependencies found)")
+            continue
+        for node in sorted(nodes, key=lambda n: n.fqname):
+            typer.echo(f"  {node.fqname}")
+
+
 @app.command("unused-exports")
 def unused_exports(
     root: Annotated[Path, typer.Argument(help="Root directory to analyze.")],
