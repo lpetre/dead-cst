@@ -220,15 +220,16 @@ class SymbolVisitor(cst.CSTVisitor):
                 if value is not None:
                     value_to_syms.setdefault(value, []).append(sym)
 
-                if isinstance(name, cst.Name) and name.value == "__all__":
-                    # Keep __all__ alive whenever its module is reachable, and
-                    # remember the listed names so we can wire __all__ -> decl
-                    # edges once every top-level decl is in the trie.
-                    self.internal_edges.add((self.module_node, sym))
-                    if value is not None and (
-                        referenced := self._extract_string_sequence(value)
-                    ) is not None:
-                        self.dunder_all_refs.append((sym, referenced))
+                if (
+                    isinstance(name, cst.Name)
+                    and name.value == "__all__"
+                    and value is not None
+                    and (referenced := self._extract_string_sequence(value)) is not None
+                ):
+                    # ModuleDundersPlugin keeps __all__ itself alive; we just
+                    # need to thread it through to the listed declarations
+                    # once the module's trie is populated.
+                    self.dunder_all_refs.append((sym, referenced))
 
         # Push frames in reverse CST-visit order so on_leave pops them in LIFO.
         # Values are visited after targets, so their frames go first (popped last).

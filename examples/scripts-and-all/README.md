@@ -13,8 +13,9 @@ This example demonstrates two plugins and one path resolver:
 - `ProjectScriptsPlugin` reads `[project.scripts]` and treats each target as
   an entrypoint. It keeps `reportkit.cli.main` -- and everything `main`
   reaches -- alive.
-- `DunderAllPlugin` (on by default) keeps the `__all__` variable in
-  `reportkit/renderer.py` from being reported as a dead variable.
+- `ModuleDundersPlugin` (always on) keeps the `__all__` variable in
+  `reportkit/renderer.py` from being reported as a dead variable. It also
+  preserves any other module-level dunder (e.g. `__version__`).
 - `PyprojectResolver` notices the `src/` directory and feeds it to
   `build_symbol_graph` as the analysis base, so `reportkit.cli` resolves to
   `src/reportkit/cli.py`.
@@ -44,18 +45,8 @@ Dead symbols (4):
 ```
 
 The `variable: 1 total` line is `reportkit.renderer.__all__`; note that it is
-*not* in the dead list because `DunderAllPlugin` flagged it as an entrypoint.
-
-## See `DunderAllPlugin`'s effect
-
-Disable it and `__all__` shows up as dead:
-
-```bash
-uv run dead-cst analyze examples/scripts-and-all \
-    --resolver pyproject --plugin project_scripts --no-preserve-dunder-all
-```
-
-You'll now see `reportkit.renderer.__all__ (variable)` in the dead list.
+*not* in the dead list because `ModuleDundersPlugin` flagged it as an
+entrypoint.
 
 ## Equivalent invocation without the resolver
 

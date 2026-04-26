@@ -7,7 +7,7 @@ root.
 | Example | Demonstrates |
 |---|---|
 | [`simple-app/`](./simple-app) | `MainBlockPlugin` -- entrypoints discovered via `if __name__ == "__main__":` |
-| [`scripts-and-all/`](./scripts-and-all) | `ProjectScriptsPlugin`, `DunderAllPlugin`, `PyprojectResolver` (auto-detects `src/` layout) |
+| [`scripts-and-all/`](./scripts-and-all) | `ProjectScriptsPlugin`, `ModuleDundersPlugin`, `PyprojectResolver` (auto-detects `src/` layout) |
 | [`uv-workspace/`](./uv-workspace) | `UvWorkspaceResolver` -- multi-package analysis driven by `uv.lock` |
 
 Each subdirectory has its own README with the exact commands to run and the

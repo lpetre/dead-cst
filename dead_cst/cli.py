@@ -19,10 +19,12 @@ from ._plugins import (
     CSTAwareEdgePlugin,
     EdgePlugin,
     ExplicitEntrypointPlugin,
+    ModuleDundersPlugin,
     load_plugin,
 )
 from ._resolvers import load_resolver, merge_paths
 from ._symbols import SymbolNode
+
 
 app = typer.Typer(help="Dead code analysis for Python using libcst.")
 
@@ -54,14 +56,14 @@ def build_plugins(
 ) -> list[EdgePlugin | CSTAwareEdgePlugin]:
     """Compose the plugin list from CLI flags.
 
-    Order: user-specified plugins first, then
-    :class:`ExplicitEntrypointPlugin` with the ``-e`` specs. ``-e`` runs
-    last so it can hang entrypoints off any synthetic nodes contributed
-    upstream.
+    Order: user-specified plugins first, then ``ModuleDundersPlugin``, then
+    ``ExplicitEntrypointPlugin`` with the ``-e`` specs. ``-e`` runs last so
+    it can hang entrypoints off any synthetic nodes contributed upstream.
     """
     plugins: list[EdgePlugin | CSTAwareEdgePlugin] = []
     for name in plugin_names:
         plugins.append(load_plugin(name))
+    plugins.append(ModuleDundersPlugin())
     if entrypoints:
         specs = [parse_entrypoint(ep) for ep in entrypoints]
         plugins.append(ExplicitEntrypointPlugin(specs=specs))
@@ -392,12 +394,17 @@ def unused_exports(
     graph = build_symbol_graph(paths_dict, plugins=plugins, project_root=root)
     reachable = find_reachable(graph)
 
-    # Cut module -> __all__ edges and re-run reachability. graph.copy()
-    # preserves the per-node ``entrypoint`` attributes that find_reachable
-    # seeds its BFS from.
+    # ModuleDundersPlugin keeps each ``__all__`` alive via a synthetic
+    # entrypoint node ``<dunder>:<fqname>``. Cut the edge from each such
+    # synthetic into an ``__all__`` variable and re-run reachability;
+    # whatever drops out was alive only because of __all__.
     pruned = graph.copy()
     pruned.remove_edges_from(
-        [(s, d) for s, d in graph.edges if s.type == "module" and _is_dunder_all(d)]
+        [
+            (s, d)
+            for s, d in graph.edges
+            if _is_dunder_all(d) and s.type == "synthetic" and s.fqname.startswith("<dunder>:")
+        ]
     )
     reachable_without_all = find_reachable(pruned)
     only_via_all = reachable - reachable_without_all

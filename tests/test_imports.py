@@ -229,7 +229,6 @@ def test_imports(build_decl_graph, assert_edges, src, expected_extra_edges):
         pytest.param(
             'from p.functions import f\n__all__ = ["f"]',
             {
-                "p.x -> p.x.__all__",
                 "p.x.__all__ -> p.x",
                 "p.x.__all__ -> p.x.f",
                 "p.x.f -> p.functions",
@@ -241,7 +240,6 @@ def test_imports(build_decl_graph, assert_edges, src, expected_extra_edges):
         pytest.param(
             'from p.functions import f\nfrom p.classes import C\n__all__ = ("f", "C")',
             {
-                "p.x -> p.x.__all__",
                 "p.x.C -> p.classes",
                 "p.x.C -> p.classes.C",
                 "p.x.C -> p.x",
@@ -257,7 +255,6 @@ def test_imports(build_decl_graph, assert_edges, src, expected_extra_edges):
         pytest.param(
             'def g(): pass\nfrom p.functions import f\n__all__ = ["f", "g"]',
             {
-                "p.x -> p.x.__all__",
                 "p.x.__all__ -> p.x",
                 "p.x.__all__ -> p.x.f",
                 "p.x.__all__ -> p.x.g",
@@ -271,7 +268,6 @@ def test_imports(build_decl_graph, assert_edges, src, expected_extra_edges):
         pytest.param(
             'from p.functions import f\n__all__: list[str] = ["f"]',
             {
-                "p.x -> p.x.__all__",
                 "p.x.__all__ -> p.x",
                 "p.x.__all__ -> p.x.f",
                 "p.x.f -> p.functions",
@@ -283,7 +279,6 @@ def test_imports(build_decl_graph, assert_edges, src, expected_extra_edges):
         pytest.param(
             'from p.functions import f\n__all__ = ["missing"]',
             {
-                "p.x -> p.x.__all__",
                 "p.x.__all__ -> p.x",
                 "p.x.f -> p.functions",
                 "p.x.f -> p.functions.f",
