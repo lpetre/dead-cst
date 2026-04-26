@@ -1,12 +1,58 @@
 from ._analyze import build_symbol_graph, count_nodes, find_reachable, order_paths
 from ._codemod import remove_code
+from ._plugins import (
+    AddEdge,
+    AddNode,
+    BUILTIN_PLUGINS,
+    CSTAwareEdgePlugin,
+    EdgePlugin,
+    ExplicitEntrypointPlugin,
+    GraphOp,
+    MainBlockPlugin,
+    ModuleDundersPlugin,
+    PluginContext,
+    ProjectScriptsPlugin,
+    PytestPlugin,
+    RemoveEdge,
+    load_plugin,
+)
+from ._resolvers import (
+    BUILTIN_RESOLVERS,
+    PathResolver,
+    PyprojectResolver,
+    UvWorkspaceResolver,
+    VenvResolver,
+    load_resolver,
+    merge_paths,
+)
 from ._version import __version__
 
 __all__ = [
     "__version__",
+    "AddEdge",
+    "AddNode",
+    "BUILTIN_PLUGINS",
+    "BUILTIN_RESOLVERS",
+    "CSTAwareEdgePlugin",
+    "EdgePlugin",
+    "ExplicitEntrypointPlugin",
+    "GraphOp",
+    "MainBlockPlugin",
+    "ModuleDundersPlugin",
+    "PathResolver",
+    "PluginContext",
+    "ProjectScriptsPlugin",
+    "PyprojectResolver",
+    "PytestPlugin",
+    "RemoveEdge",
+    "UvWorkspaceResolver",
+    "VenvResolver",
     "build_symbol_graph",
     "count_nodes",
     "find_reachable",
+    "load_plugin",
+    "load_resolver",
+    "merge_paths",
     "order_paths",
     "remove_code",
 ]

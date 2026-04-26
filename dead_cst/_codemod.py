@@ -2,19 +2,30 @@ from pathlib import Path
 
 import libcst as cst
 import networkx as nx
-from libcst.metadata import FullRepoManager, FullyQualifiedNameProvider, QualifiedNameSource
+from libcst.codemod import CodemodContext
+from libcst.codemod.visitors import RemoveImportsVisitor
+from libcst.metadata import CodeRange, FullRepoManager, PositionProvider, QualifiedNameSource
+
+from ._fqn import FixedFullyQualifiedNameProvider
+from ._symbols import SymbolNode
 
 
 class RemoveDeadSymbols(cst.CSTTransformer):
-    METADATA_DEPENDENCIES = (FullyQualifiedNameProvider,)
+    METADATA_DEPENDENCIES = (FixedFullyQualifiedNameProvider, PositionProvider)
 
-    def __init__(self, dead_fqnames: set[str]):
-        self.dead_fqnames = dead_fqnames
+    def __init__(self, dead_decls: set[tuple[str, CodeRange]]):
+        # ``(fqname, position)`` pairs. The position disambiguates same-name
+        # decls so a shadowed dead binding does not drag its live sibling
+        # out with it (and vice versa).
+        self.dead_decls = dead_decls
 
     def _should_remove(self, node: cst.CSTNode) -> bool:
-        fqnames = self.get_metadata(FullyQualifiedNameProvider, node, default=[])
+        fqnames = self.get_metadata(FixedFullyQualifiedNameProvider, node, default=[])
+        pos = self.get_metadata(PositionProvider, node, default=None)
         return any(
-            qn.name in self.dead_fqnames for qn in fqnames if qn.source == QualifiedNameSource.LOCAL
+            (qn.name, pos) in self.dead_decls
+            for qn in fqnames
+            if qn.source == QualifiedNameSource.LOCAL
         )
 
     def leave_FunctionDef(self, original_node: cst.FunctionDef, updated_node: cst.FunctionDef):
@@ -30,13 +41,7 @@ class RemoveDeadSymbols(cst.CSTTransformer):
     def leave_Assign(self, original_node: cst.Assign, updated_node: cst.Assign):
         new_targets = []
         for orig_target, new_target in zip(original_node.targets, updated_node.targets):
-            target_node = orig_target.target
-            fqnames = self.get_metadata(FullyQualifiedNameProvider, target_node, default=[])
-            if not any(
-                qn.name in self.dead_fqnames
-                for qn in fqnames
-                if qn.source == QualifiedNameSource.LOCAL
-            ):
+            if not self._should_remove(orig_target.target):
                 new_targets.append(new_target)
 
         if not new_targets:
@@ -45,33 +50,64 @@ class RemoveDeadSymbols(cst.CSTTransformer):
         return updated_node.with_changes(targets=new_targets)
 
     def leave_AnnAssign(self, original_node: cst.AnnAssign, updated_node: cst.AnnAssign):
-        fqnames = self.get_metadata(FullyQualifiedNameProvider, original_node.target, default=[])
-        if any(
-            qn.name in self.dead_fqnames for qn in fqnames if qn.source == QualifiedNameSource.LOCAL
-        ):
+        if self._should_remove(original_node.target):
             return cst.RemoveFromParent()
         return updated_node
 
 
+def _import_remove_args(node: SymbolNode) -> tuple[str, str | None, str | None]:
+    """Convert an ``"import"``-typed node to ``RemoveImportsVisitor`` args.
+
+    Returns ``(module, obj, asname)`` matching the signature of
+    :meth:`RemoveImportsVisitor.remove_unused_import`. ``asname`` is set
+    only when the local bound name differs from the natural binding
+    (``obj`` for ``from X import obj``, the leftmost segment of
+    ``module`` for bare ``import X``).
+    """
+    assert node.imports is not None, f"Import node missing imports metadata: {node.fqname}"
+    module = str(node.imports.module)
+    obj = node.imports.decl
+    bound = node.fqname.rsplit(".", 1)[-1]
+    natural = obj if obj is not None else module.split(".", 1)[0]
+    asname = bound if bound != natural else None
+    return module, obj, asname
+
+
 def remove_code(G: nx.Graph, base: Path) -> None:
-    by_file = {}
+    by_file: dict[Path, list[SymbolNode]] = {}
     for node in G.nodes:
         if not node.path.is_relative_to(base):
             continue
         if not node.path.exists():
             continue
         match node.type:
-            case "function" | "class" | "variable":
+            case "function" | "class" | "variable" | "import":
                 by_file.setdefault(node.path, []).append(node)
             case "module":
                 node.path.unlink()
 
-    mgr = FullRepoManager(base, by_file.keys(), {FullyQualifiedNameProvider})
+    mgr = FullRepoManager(base, by_file.keys(), {FixedFullyQualifiedNameProvider})
     for path, nodes in sorted(by_file.items(), key=lambda x: x):
         if not path.exists():
             continue
+
+        # Pass 1: drop dead defs / classes / variables. Imports they
+        # used to reference become eligible for removal in pass 2.
         wrapper = mgr.get_metadata_wrapper_for_path(path)
-        dead_fqnames = {n.fqname for n in nodes}
-        mod_removed = wrapper.visit(RemoveDeadSymbols(dead_fqnames))
+        dead_decls = {(n.fqname, n.position) for n in nodes if n.type != "import"}
+        result = wrapper.visit(RemoveDeadSymbols(dead_decls))
+
+        # Pass 2: hand the dead-import set to libcst's stock import
+        # remover. It walks scopes itself, so it'll skip anything still
+        # referenced after pass 1 (defensive -- if the graph said
+        # something is dead, no live user remains).
+        dead_imports = [n for n in nodes if n.type == "import"]
+        if dead_imports:
+            ctx = CodemodContext()
+            for imp in dead_imports:
+                module, obj, asname = _import_remove_args(imp)
+                RemoveImportsVisitor.remove_unused_import(ctx, module, obj, asname)
+            result = RemoveImportsVisitor(ctx).transform_module(result)
+
         with path.open("w") as f:
-            f.write(mod_removed.code)
+            f.write(result.code)

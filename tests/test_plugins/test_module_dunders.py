@@ -1,0 +1,61 @@
+"""Tests for :class:`ModuleDundersPlugin`."""
+
+from __future__ import annotations
+
+from dead_cst import ModuleDundersPlugin, build_symbol_graph
+
+
+def test_keeps_all_alive(tmp_path, write_files, reachable_fqnames):
+    write_files({"pkg/__init__.py": '__all__ = ["a"]\na = 1'})
+    graph = build_symbol_graph(
+        {tmp_path: []},
+        plugins=[ModuleDundersPlugin()],
+        project_root=tmp_path,
+    )
+    reached = reachable_fqnames(graph)
+    assert "pkg.__all__" in reached
+    # the listed symbol itself is *not* followed -- only __all__ stays alive.
+    assert "pkg.a" not in reached
+
+
+def test_keeps_other_dunders_alive(tmp_path, write_files, reachable_fqnames):
+    write_files(
+        {
+            "pkg/__init__.py": (
+                '__version__ = "1.0.0"\n'
+                '__author__ = "someone"\n'
+                '__license__ = "MIT"\n'
+                "unused = 1\n"
+            ),
+        }
+    )
+    graph = build_symbol_graph(
+        {tmp_path: []},
+        plugins=[ModuleDundersPlugin()],
+        project_root=tmp_path,
+    )
+    reached = reachable_fqnames(graph)
+    assert {"pkg.__version__", "pkg.__author__", "pkg.__license__"} <= reached
+    # plain (non-dunder) variables are still dead absent another entrypoint
+    assert "pkg.unused" not in reached
+
+
+def test_ignores_non_dunder_underscore_names(tmp_path, write_files, reachable_fqnames):
+    write_files(
+        {
+            "pkg/__init__.py": (
+                "_private = 1\n"
+                "__mangled = 2\n"  # leading dunder only
+                "trailing__ = 3\n"  # trailing dunder only
+            ),
+        }
+    )
+    graph = build_symbol_graph(
+        {tmp_path: []},
+        plugins=[ModuleDundersPlugin()],
+        project_root=tmp_path,
+    )
+    reached = reachable_fqnames(graph)
+    assert "pkg._private" not in reached
+    assert "pkg.__mangled" not in reached
+    assert "pkg.trailing__" not in reached

@@ -14,7 +14,17 @@ import networkx as nx
 import typer
 
 from . import build_symbol_graph, count_nodes, find_reachable, order_paths, remove_code
+from ._branches import is_unreachable_node
+from ._plugins import (
+    CSTAwareEdgePlugin,
+    EdgePlugin,
+    ExplicitEntrypointPlugin,
+    ModuleDundersPlugin,
+    load_plugin,
+)
+from ._resolvers import load_resolver, merge_paths
 from ._symbols import SymbolNode
+
 
 app = typer.Typer(help="Dead code analysis for Python using libcst.")
 
@@ -22,14 +32,6 @@ app = typer.Typer(help="Dead code analysis for Python using libcst.")
 class OutputFormat(str, Enum):
     text = "text"
     json = "json"
-
-
-def _is_module_dunder(node: SymbolNode) -> bool:
-    """True for module-level variables named like ``__xxx__`` (e.g. ``__version__``)."""
-    if node.type != "variable":
-        return False
-    name = node.fqname.rpartition(".")[2]
-    return len(name) > 4 and name.startswith("__") and name.endswith("__")
 
 
 def setup_logging(verbose: bool) -> None:
@@ -45,6 +47,38 @@ def parse_entrypoint(ep: str) -> str | re.Pattern[str]:
     if ep.startswith("re:"):
         return re.compile(ep[3:])
     return ep
+
+
+def build_plugins(
+    *,
+    entrypoints: list[str],
+    plugin_names: list[str],
+) -> list[EdgePlugin | CSTAwareEdgePlugin]:
+    """Compose the plugin list from CLI flags.
+
+    Order: user-specified plugins first, then ``ModuleDundersPlugin``, then
+    ``ExplicitEntrypointPlugin`` with the ``-e`` specs. ``-e`` runs last so
+    it can hang entrypoints off any synthetic nodes contributed upstream.
+    """
+    plugins: list[EdgePlugin | CSTAwareEdgePlugin] = []
+    for name in plugin_names:
+        plugins.append(load_plugin(name))
+    plugins.append(ModuleDundersPlugin())
+    if entrypoints:
+        specs = [parse_entrypoint(ep) for ep in entrypoints]
+        plugins.append(ExplicitEntrypointPlugin(specs=specs))
+    return plugins
+
+
+def resolve_paths(
+    root: Path, path_specs: list[str], resolver_names: list[str]
+) -> dict[Path, list[Path]]:
+    """Merge ``-p`` specs and ``--resolver`` outputs into a single path map."""
+    explicit = parse_paths(root, path_specs) if path_specs else {}
+    resolved_maps = [load_resolver(name).resolve(root) for name in resolver_names]
+    if not explicit and not resolved_maps:
+        return {root: []}
+    return merge_paths(explicit, *resolved_maps)
 
 
 def parse_paths(root: Path, paths_str: list[str]) -> dict[Path, list[Path]]:
@@ -90,16 +124,24 @@ def main(
 def analyze(
     root: Annotated[Path, typer.Argument(help="Root directory to analyze.")],
     entrypoint: Annotated[
-        list[str],
+        Optional[list[str]],
         typer.Option(
             "-e",
             "--entrypoint",
             help="Entrypoint: file path, FQN, or 're:pattern' for regex.",
         ),
-    ],
+    ] = None,
     path: Annotated[
         Optional[list[str]],
         typer.Option("-p", "--path", help="Search path spec: 'base:dep1,dep2' or 'base'."),
+    ] = None,
+    resolver: Annotated[
+        Optional[list[str]],
+        typer.Option("--resolver", help="Path resolver to run (e.g. venv, pyproject)."),
+    ] = None,
+    plugin: Annotated[
+        Optional[list[str]],
+        typer.Option("--plugin", help="Edge plugin to run (e.g. main_block, project_scripts)."),
     ] = None,
     verbose: Annotated[
         bool, typer.Option("-v", "--verbose", help="Enable verbose output.")
@@ -112,17 +154,15 @@ def analyze(
     setup_logging(verbose)
     root = root.resolve()
 
-    paths_dict = parse_paths(root, path or [])
+    paths_dict = resolve_paths(root, path or [], resolver or [])
 
     typer.echo(f"Building symbol graph for {root}...", err=True)
-    graph = build_symbol_graph(paths_dict)
-
-    eps = [parse_entrypoint(ep) for ep in entrypoint]
-    reachable = find_reachable(graph, root, eps)
-
-    for node in graph.nodes:
-        if _is_module_dunder(node):
-            reachable.add(node)
+    plugins = build_plugins(
+        entrypoints=entrypoint or [],
+        plugin_names=plugin or [],
+    )
+    graph = build_symbol_graph(paths_dict, plugins=plugins, project_root=root)
+    reachable = find_reachable(graph)
 
     unreachable_graph = graph.subgraph([n for n in graph.nodes if n not in reachable])
 
@@ -146,6 +186,12 @@ def _output_text(
         total_counts = count_nodes(graph, base)
         unreachable_counts = count_nodes(unreachable, base)
         for kind in sorted(total_counts):
+            # Synthetic nodes (entrypoint sentinels, dead-suite markers)
+            # don't represent user-visible declarations; reporting them
+            # as "dead" alongside functions/classes would be misleading.
+            # Dead-suite nodes get their own section below.
+            if kind == "synthetic":
+                continue
             total = total_counts[kind]
             dead = unreachable_counts.get(kind, 0)
             if dead > 0:
@@ -153,15 +199,27 @@ def _output_text(
             else:
                 typer.echo(f"  {kind}: {total} total")
 
-    dead_count = unreachable.number_of_nodes()
-    if dead_count > 0:
-        typer.echo(f"\nDead symbols ({dead_count}):")
-        for node in sorted(unreachable.nodes, key=lambda n: (str(n.path), n.fqname)):
+    dead_real = [n for n in unreachable.nodes if not is_unreachable_node(n)]
+    if dead_real:
+        typer.echo(f"\nDead symbols ({len(dead_real)}):")
+        for node in sorted(dead_real, key=lambda n: (str(n.path), n.fqname)):
             try:
                 rel_path = node.path.relative_to(root)
             except ValueError:
                 rel_path = node.path
             typer.echo(f"  {node.fqname} ({node.type}) at {rel_path}")
+
+    branches = [n for n in graph.nodes if is_unreachable_node(n)]
+    if branches:
+        typer.echo(f"\nUnreachable branches ({len(branches)}):")
+        for node in sorted(branches, key=lambda n: (str(n.path), n.position.start)):
+            try:
+                rel_path = node.path.relative_to(root)
+            except ValueError:
+                rel_path = node.path
+            start = node.position.start
+            end = node.position.end
+            typer.echo(f"  {rel_path}:{start.line}:{start.column}-{end.line}:{end.column}")
 
 
 def _output_json(
@@ -173,18 +231,25 @@ def _output_json(
     result: dict = {
         "summary": {},
         "dead_symbols": [],
+        "unreachable_branches": [],
     }
 
     for base in order_paths(paths_dict):
         base_str = str(base)
         total_counts = count_nodes(graph, base)
         unreachable_counts = count_nodes(unreachable, base)
+        # Same rationale as the text output: synthetic nodes are reported
+        # via ``unreachable_branches`` (and entrypoint sentinels), not as
+        # part of the per-kind summary.
         result["summary"][base_str] = {
             kind: {"total": total_counts[kind], "dead": unreachable_counts.get(kind, 0)}
             for kind in total_counts
+            if kind != "synthetic"
         }
 
     for node in sorted(unreachable.nodes, key=lambda n: (str(n.path), n.fqname)):
+        if is_unreachable_node(node):
+            continue
         try:
             rel_path = str(node.path.relative_to(root))
         except ValueError:
@@ -194,6 +259,22 @@ def _output_json(
                 "fqname": node.fqname,
                 "type": node.type,
                 "path": rel_path,
+            }
+        )
+
+    for node in sorted(
+        (n for n in graph.nodes if is_unreachable_node(n)),
+        key=lambda n: (str(n.path), n.position.start),
+    ):
+        try:
+            rel_path = str(node.path.relative_to(root))
+        except ValueError:
+            rel_path = str(node.path)
+        result["unreachable_branches"].append(
+            {
+                "path": rel_path,
+                "start": {"line": node.position.start.line, "column": node.position.start.column},
+                "end": {"line": node.position.end.line, "column": node.position.end.column},
             }
         )
 
@@ -208,6 +289,14 @@ def why_alive(
         Optional[list[str]],
         typer.Option("-p", "--path", help="Search path spec: 'base:dep1,dep2' or 'base'."),
     ] = None,
+    resolver: Annotated[
+        Optional[list[str]],
+        typer.Option("--resolver", help="Path resolver to run (e.g. venv, pyproject)."),
+    ] = None,
+    plugin: Annotated[
+        Optional[list[str]],
+        typer.Option("--plugin", help="Edge plugin to run (e.g. main_block, project_scripts)."),
+    ] = None,
     verbose: Annotated[
         bool, typer.Option("-v", "--verbose", help="Enable verbose output.")
     ] = False,
@@ -216,10 +305,14 @@ def why_alive(
     setup_logging(verbose)
     root = root.resolve()
 
-    paths_dict = parse_paths(root, path or [])
+    paths_dict = resolve_paths(root, path or [], resolver or [])
 
     typer.echo(f"Building symbol graph for {root}...", err=True)
-    graph = build_symbol_graph(paths_dict)
+    plugins = build_plugins(
+        entrypoints=[],
+        plugin_names=plugin or [],
+    )
+    graph = build_symbol_graph(paths_dict, plugins=plugins, project_root=root)
 
     target_node: SymbolNode | None = None
     for node in graph.nodes:
@@ -260,16 +353,24 @@ def why_alive(
 def remove(
     root: Annotated[Path, typer.Argument(help="Root directory to analyze.")],
     entrypoint: Annotated[
-        list[str],
+        Optional[list[str]],
         typer.Option(
             "-e",
             "--entrypoint",
             help="Entrypoint: file path, FQN, or 're:pattern' for regex.",
         ),
-    ],
+    ] = None,
     path: Annotated[
         Optional[list[str]],
         typer.Option("-p", "--path", help="Search path spec: 'base:dep1,dep2' or 'base'."),
+    ] = None,
+    resolver: Annotated[
+        Optional[list[str]],
+        typer.Option("--resolver", help="Path resolver to run (e.g. venv, pyproject)."),
+    ] = None,
+    plugin: Annotated[
+        Optional[list[str]],
+        typer.Option("--plugin", help="Edge plugin to run (e.g. main_block, project_scripts)."),
     ] = None,
     verbose: Annotated[
         bool, typer.Option("-v", "--verbose", help="Enable verbose output.")
@@ -282,26 +383,30 @@ def remove(
     setup_logging(verbose)
     root = root.resolve()
 
-    paths_dict = parse_paths(root, path or [])
+    paths_dict = resolve_paths(root, path or [], resolver or [])
 
     typer.echo(f"Building symbol graph for {root}...", err=True)
-    graph = build_symbol_graph(paths_dict)
-
-    eps = [parse_entrypoint(ep) for ep in entrypoint]
-    reachable = find_reachable(graph, root, eps)
-
-    for node in graph.nodes:
-        if _is_module_dunder(node):
-            reachable.add(node)
+    plugins = build_plugins(
+        entrypoints=entrypoint or [],
+        plugin_names=plugin or [],
+    )
+    graph = build_symbol_graph(paths_dict, plugins=plugins, project_root=root)
+    reachable = find_reachable(graph)
 
     unreachable_graph = graph.subgraph([n for n in graph.nodes if n not in reachable])
 
-    if unreachable_graph.number_of_nodes() == 0:
+    # Synthetic ``unreachable`` nodes are reported by ``analyze`` but
+    # not yet removable by ``remove`` -- the codemod doesn't know how to
+    # delete an arbitrary suite. Filter them out of the listing so we
+    # don't promise something we don't deliver.
+    removable = [n for n in unreachable_graph.nodes if not is_unreachable_node(n)]
+
+    if not removable:
         typer.echo("No dead code found.")
         return
 
-    typer.echo(f"\nDead symbols to remove ({unreachable_graph.number_of_nodes()}):")
-    for node in sorted(unreachable_graph.nodes, key=lambda n: (str(n.path), n.fqname)):
+    typer.echo(f"\nDead symbols to remove ({len(removable)}):")
+    for node in sorted(removable, key=lambda n: (str(n.path), n.fqname)):
         try:
             rel_path = node.path.relative_to(root)
         except ValueError:

@@ -4,6 +4,8 @@ Python dead code analysis using [libcst](https://github.com/Instagram/LibCST).
 
 `dead-cst` builds a full symbol graph of your Python codebase, walks from your entrypoints, and reports (or removes) anything unreachable.
 
+> **Pre-release software.** `dead-cst` is in early alpha. APIs, CLI flags, and output formats may change without notice, and bugs are expected. Do not run `dead-cst remove` against code that isn't committed to version control.
+
 ## Installation
 
 ```bash
@@ -43,6 +45,8 @@ dead-cst analyze ROOT -e ENTRYPOINT [OPTIONS]
 |---|---|
 | `-e, --entrypoint` | Entrypoint: file path, FQN, or `re:pattern` for regex (repeatable) |
 | `-p, --path` | Search path spec: `base:dep1,dep2` or `base` (repeatable) |
+| `--resolver` | Path resolver to run, e.g. `venv`, `pyproject` (repeatable) |
+| `--plugin` | Edge plugin to run, e.g. `main_block`, `project_scripts` (repeatable) |
 | `--format` | Output format: `text` or `json` |
 | `-v, --verbose` | Enable verbose logging |
 
@@ -71,21 +75,64 @@ dead-cst remove ROOT -e ENTRYPOINT [OPTIONS]
 ## Python API
 
 ```python
+import re
 from pathlib import Path
-from dead_cst import build_symbol_graph, find_reachable, remove_code
+from dead_cst import (
+    build_symbol_graph,
+    ExplicitEntrypointPlugin,
+    MainBlockPlugin,
+    find_reachable,
+    remove_code,
+)
 
 root = Path("./src")
-graph = build_symbol_graph({root: []})
-reachable = find_reachable(graph, root, ["re:.*__main__\\.py"])
+graph = build_symbol_graph(
+    {root: []},
+    plugins=[
+        MainBlockPlugin(),
+        ExplicitEntrypointPlugin(specs=[re.compile(r".*__main__\.py")]),
+    ],
+    project_root=root,
+)
+reachable = find_reachable(graph)
 
 unreachable = graph.subgraph([n for n in graph.nodes if n not in reachable])
 # Inspect unreachable nodes, or remove them:
 remove_code(unreachable, root)
 ```
 
+Entrypoint detection is now fully plugin-driven. Builtins:
+
+| Plugin | Purpose |
+|---|---|
+| `MainBlockPlugin` | Mark modules containing `if __name__ == "__main__":` as entrypoints |
+| `ProjectScriptsPlugin` | Read `pyproject.toml [project.scripts]` and mark each target as an entrypoint |
+| `ExplicitEntrypointPlugin` | Match user-supplied file paths / FQNs / regexes (powers the `-e` flag) |
+| `ModuleDundersPlugin` | Keep top-level dunder variables (`__all__`, `__version__`, etc.) alive (always on) |
+| `PytestPlugin` | Keep pytest-discovered tests, `conftest.py` decls, and `@pytest.fixture` functions alive (`--plugin pytest`) |
+
+Write your own by implementing the `EdgePlugin` or `CSTAwareEdgePlugin` protocol; register under the `dead_cst.plugins` entry-point group for CLI discovery.
+
+Path resolution is similarly pluggable. `PathResolver` implementations return a `{base: [dep_paths]}` map to feed `build_symbol_graph`. Builtins: `VenvResolver`, `PyprojectResolver`, `UvWorkspaceResolver` (parses `uv.lock` to discover workspace members and their inter-member dep edges). Third-party resolvers register under `dead_cst.resolvers`.
+
+## Graph model
+
+The graph has one node per top-level declaration plus a synthetic module node per file. Edges run from a declaration to each symbol it references, and from every submodule to its parent package so `__init__.py` stays alive as long as anything in the package does. Entrypoints seed the reachability walk; every node not reached is reported as dead.
+
+A module-level `import` / `from ... import ...` is itself a declaration of type `"import"` in the current module. Uses of the imported name inside the file are wired through that local import node, and the import node in turn points at the upstream module (and, when applicable, at the specific imported symbol). Removing the last local use therefore makes the import itself dead, which is how `dead-cst remove` knows to drop now-unused import lines.
+
+## Scope
+
+`dead-cst` tracks top-level declarations only -- module-level functions, classes, and variables. Nested definitions (inner functions, methods, nested classes) are deliberately not given their own nodes; references made from inside those nested scopes are attributed to the enclosing top-level declaration. Keeping the containing top-level symbol alive keeps its nested source alive with it.
+
 ## Limitations
 
-- Only top-level declarations (functions, classes, variables) are tracked; nested definitions are not individually reported.
 - `import *` is not resolved.
 - Dynamic attribute access (`getattr`) and runtime-generated symbols are invisible to static analysis.
 - Only first-party code is analysed; third-party dependencies are treated as opaque.
+- PEP 695 `type` statements are not tracked.
+- String names in `__all__` are not followed to their declarations (but `ModuleDundersPlugin` keeps the `__all__` variable itself alive).
+
+## TODO
+
+- Host API documentation on Read the Docs.

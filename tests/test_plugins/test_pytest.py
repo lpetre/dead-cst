@@ -1,0 +1,162 @@
+"""Tests for :class:`PytestPlugin`."""
+
+from __future__ import annotations
+
+from dead_cst import PytestPlugin, build_symbol_graph
+
+
+def test_pytest_plugin_marks_test_functions(tmp_path, write_files, reachable_fqnames):
+    write_files(
+        {
+            "tests/__init__.py": "",
+            "tests/test_things.py": """
+            def test_one(): pass
+            def test_two(): pass
+            def helper(): pass
+            """,
+        }
+    )
+    graph = build_symbol_graph(
+        {tmp_path: []},
+        plugins=[PytestPlugin()],
+        project_root=tmp_path,
+    )
+    reached = reachable_fqnames(graph)
+    assert "tests.test_things.test_one" in reached
+    assert "tests.test_things.test_two" in reached
+    # ``helper`` is not a test function and is not referenced from one
+    assert "tests.test_things.helper" not in reached
+
+
+def test_pytest_plugin_recognizes_underscore_test_suffix(tmp_path, write_files, reachable_fqnames):
+    write_files(
+        {
+            "pkg/__init__.py": "",
+            "pkg/things_test.py": "def test_one(): pass",
+        }
+    )
+    graph = build_symbol_graph(
+        {tmp_path: []},
+        plugins=[PytestPlugin()],
+        project_root=tmp_path,
+    )
+    assert "pkg.things_test.test_one" in reachable_fqnames(graph)
+
+
+def test_pytest_plugin_marks_test_classes(tmp_path, write_files, reachable_fqnames):
+    write_files(
+        {
+            "tests/__init__.py": "",
+            "tests/test_cls.py": """
+            class TestThing:
+                def test_a(self): pass
+            class Helper:
+                pass
+            """,
+        }
+    )
+    graph = build_symbol_graph(
+        {tmp_path: []},
+        plugins=[PytestPlugin()],
+        project_root=tmp_path,
+    )
+    reached = reachable_fqnames(graph)
+    assert "tests.test_cls.TestThing" in reached
+    assert "tests.test_cls.Helper" not in reached
+
+
+def test_pytest_plugin_marks_conftest_decls(tmp_path, write_files, reachable_fqnames):
+    write_files(
+        {
+            "tests/__init__.py": "",
+            "tests/conftest.py": """
+            import pytest
+
+            @pytest.fixture
+            def my_fixture():
+                return 1
+
+            def pytest_collection_modifyitems(config, items):
+                pass
+
+            collect_ignore = ["legacy.py"]
+            """,
+        }
+    )
+    graph = build_symbol_graph(
+        {tmp_path: []},
+        plugins=[PytestPlugin()],
+        project_root=tmp_path,
+    )
+    reached = reachable_fqnames(graph)
+    assert "tests.conftest.my_fixture" in reached
+    assert "tests.conftest.pytest_collection_modifyitems" in reached
+    assert "tests.conftest.collect_ignore" in reached
+
+
+def test_pytest_plugin_marks_decorated_fixtures_outside_conftest(
+    tmp_path, write_files, reachable_fqnames
+):
+    write_files(
+        {
+            "tests/__init__.py": "",
+            "tests/fixtures.py": """
+            import pytest
+            from pytest import fixture
+
+            @pytest.fixture
+            def bare_fixture():
+                return 1
+
+            @pytest.fixture(scope="module")
+            def parametrized_fixture():
+                return 2
+
+            @fixture
+            def imported_fixture():
+                return 3
+
+            def not_a_fixture():
+                return 4
+            """,
+        }
+    )
+    graph = build_symbol_graph(
+        {tmp_path: []},
+        plugins=[PytestPlugin()],
+        project_root=tmp_path,
+    )
+    reached = reachable_fqnames(graph)
+    assert "tests.fixtures.bare_fixture" in reached
+    assert "tests.fixtures.parametrized_fixture" in reached
+    assert "tests.fixtures.imported_fixture" in reached
+    assert "tests.fixtures.not_a_fixture" not in reached
+
+
+def test_pytest_plugin_ignores_non_test_modules(tmp_path, write_files, reachable_fqnames):
+    write_files(
+        {
+            "pkg/__init__.py": "",
+            "pkg/utils.py": """
+            def test_helper(): pass
+            class TestData: pass
+            """,
+        }
+    )
+    graph = build_symbol_graph(
+        {tmp_path: []},
+        plugins=[PytestPlugin()],
+        project_root=tmp_path,
+    )
+    reached = reachable_fqnames(graph)
+    # ``utils.py`` isn't a pytest-discovered file even though its symbols
+    # match the test_*/Test* naming
+    assert "pkg.utils.test_helper" not in reached
+    assert "pkg.utils.TestData" not in reached
+
+
+def test_pytest_plugin_loads_via_load_plugin():
+    from dead_cst import load_plugin
+
+    plugin = load_plugin("pytest")
+    assert isinstance(plugin, PytestPlugin)
