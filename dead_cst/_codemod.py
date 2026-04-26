@@ -74,6 +74,26 @@ def _import_remove_args(node: SymbolNode) -> tuple[str, str | None, str | None]:
 
 
 def remove_code(G: nx.Graph, base: Path) -> None:
+    """Delete every symbol in ``G`` from the source files under ``base``.
+
+    Modules are removed by unlinking the file. Functions, classes, and
+    top-level variables are dropped by a LibCST transformer matching on
+    ``(fqname, position)`` so a shadowed dead binding does not drag its
+    live sibling out with it. Surviving statements, comments, and
+    formatting around the deletions are preserved.
+
+    Imports are handled in a second pass via libcst's
+    :class:`RemoveImportsVisitor`, which walks scopes itself and skips
+    anything still referenced (defensive -- the graph already classifies
+    these as dead, but the scope check is cheap insurance).
+
+    ``G`` is typically the unreachable subgraph of the graph from
+    :func:`build_symbol_graph`; only the nodes are inspected, edges are
+    ignored. Symbols whose path is not under ``base`` are skipped, so call
+    once per base when analysing several packages together. The
+    transformation is destructive -- back the files up first, or run on a
+    clean working tree.
+    """
     by_file: dict[Path, list[SymbolNode]] = {}
     for node in G.nodes:
         if not node.path.is_relative_to(base):
