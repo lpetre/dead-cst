@@ -17,6 +17,7 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Software Development :: Quality Assurance",
 ]
 dependencies = [
@@ -53,6 +54,7 @@ version-file = "dead_cst/_version.py"
 dev = [
     "pre-commit>=4.2.0",
     "pytest>=8.4.1",
+    "pytest-cov>=5.0.0",
     "pytest-watcher>=0.4.3",
     "ruff>=0.11.2",
     "ty>=0.0.1a7",
@@ -65,6 +67,20 @@ dev = [
 # collection with ``ImportPathMismatchError`` (the very layout the
 # uv-workspace example exists to demonstrate).
 testpaths = ["tests"]
+
+[tool.coverage.run]
+branch = true
+source = ["dead_cst"]
+omit = ["dead_cst/_version.py"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "if typing.TYPE_CHECKING:",
+    "@overload",
+    "raise NotImplementedError",
+]
 
 [tool.ruff]
 line-length = 100

@@ -1,0 +1,82 @@
+# Coverage policy for dead-cst.
+#
+# Per-component thresholds reflect blast radius, not effort. The codemod
+# rewrites user files; its bar is the highest. The CLI is the user-visible
+# trust surface. Plugins each represent a framework promise. Resolvers and
+# core analytical code carry the rest.
+#
+# Per-component statuses are informational until Tier 1 of ROADMAP.md
+# (CLI integration tests, remaining framework presets) lands and the
+# numbers can actually clear the bars below. The patch-coverage gate on
+# new code is enforcing — regressions are caught at the diff, not in
+# aggregate.
+
+coverage:
+  status:
+    project:
+      default:
+        target: auto
+        threshold: 1%
+        informational: false
+    patch:
+      default:
+        target: 90%
+        threshold: 0%
+        informational: false
+
+component_management:
+  default_rules:
+    statuses:
+      - type: project
+        informational: true
+  individual_components:
+    - component_id: codemod
+      name: codemod
+      paths:
+        - dead_cst/_codemod.py
+      statuses:
+        - type: project
+          target: 95%
+          informational: true
+    - component_id: cli
+      name: cli
+      paths:
+        - dead_cst/cli.py
+      statuses:
+        - type: project
+          target: 80%
+          informational: true
+    - component_id: plugins
+      name: plugins
+      paths:
+        - dead_cst/_plugins/**
+      statuses:
+        - type: project
+          target: 85%
+          informational: true
+    - component_id: resolvers
+      name: resolvers
+      paths:
+        - dead_cst/_resolvers/**
+      statuses:
+        - type: project
+          target: 85%
+          informational: true
+    - component_id: core
+      name: core
+      paths:
+        - dead_cst/_analyze.py
+        - dead_cst/_visitor.py
+        - dead_cst/_resolve.py
+        - dead_cst/_flow.py
+        - dead_cst/_branches.py
+        - dead_cst/_symbols.py
+        - dead_cst/_fqn.py
+      statuses:
+        - type: project
+          target: 80%
+          informational: true
+
+comment:
+  layout: "header, diff, components, files"
+  require_changes: true
