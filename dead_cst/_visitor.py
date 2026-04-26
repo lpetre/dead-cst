@@ -47,6 +47,7 @@ class SymbolVisitor(cst.CSTVisitor):
         self.import_lookup: dict[cst.CSTNode, Import] = {}
         self.import_edges: set[tuple[SymbolNode, Import]] = set()
         self.internal_edges: set[tuple[SymbolNode, SymbolNode]] = set()
+        self.dunder_all_refs: list[tuple[SymbolNode, list[str]]] = []
         self.trie: SymbolTrie = SymbolTrie()
 
     @property
@@ -76,6 +77,27 @@ class SymbolVisitor(cst.CSTVisitor):
         fqns = self.get_metadata(FullyQualifiedNameProvider, node, default=[])
         for fqn in fqns:
             self._push_decl(node, SymbolNode(fqn.name, type_, self.path))
+
+    @staticmethod
+    def _extract_string_sequence(value: cst.BaseExpression) -> list[str] | None:
+        """Extract string elements from a list/tuple literal, e.g. ['f', 'g']."""
+        if not isinstance(value, (cst.List, cst.Tuple)):
+            return None
+        names = []
+        for element in value.elements:
+            if not isinstance(element, cst.Element):
+                return None
+            inner = element.value
+            if not isinstance(inner, cst.SimpleString):
+                return None
+            try:
+                evaluated = inner.evaluated_value
+            except Exception:
+                return None
+            if not isinstance(evaluated, str):
+                return None
+            names.append(evaluated)
+        return names
 
     def _add_variable(self, node: cst.Assign | cst.AnnAssign):
         # Only collect top-level declarations, skip nested ones
@@ -116,6 +138,13 @@ class SymbolVisitor(cst.CSTVisitor):
                     sym = SymbolNode(fqn.name, "variable", self.path)
                     self._push_decl(name, sym)
                     value_to_syms.setdefault(value, []).append(sym)
+
+                    if (
+                        isinstance(name, cst.Name)
+                        and name.value == "__all__"
+                        and (referenced := self._extract_string_sequence(value)) is not None
+                    ):
+                        self.dunder_all_refs.append((sym, referenced))
 
         values = [node.value]
         if isinstance(node.value, cst.Tuple):
@@ -289,3 +318,14 @@ class SymbolVisitor(cst.CSTVisitor):
             for target_symbol in target_symbols:
                 if target_symbol != owner_symbol and target_symbol and owner_symbol:
                     self.internal_edges.add((owner_symbol, target_symbol))
+
+        # Resolve __all__ string references to declarations in the current module
+        if self.dunder_all_refs:
+            module_sym = self.node_to_symbols[original_node][0]
+            module_node = self.trie._get(module_sym.fqname.split("."))
+            if module_node is not None:
+                for owner, names in self.dunder_all_refs:
+                    for name in names:
+                        target = module_node.declarations.get(name)
+                        if target and target != owner:
+                            self.internal_edges.add((owner, target))

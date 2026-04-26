@@ -77,3 +77,44 @@ def test_imports(build_decl_graph, src, symbol_edges):
             dst.fqname for src, dst in import_test_graph.edges if src.fqname == expected_symbol
         }
         assert found_edges == expected_edges
+
+
+@pytest.mark.parametrize(
+    "src, symbol_edges",
+    [
+        pytest.param(
+            'from p.functions import f\n__all__ = ["f"]',
+            {"p.x.__all__": {"p.x", "p.x.f"}},
+            id="dunder-all references import",
+        ),
+        pytest.param(
+            'from p.functions import f\nfrom p.classes import C\n__all__ = ("f", "C")',
+            {"p.x.__all__": {"p.x", "p.x.f", "p.x.C"}},
+            id="dunder-all tuple of imports",
+        ),
+        pytest.param(
+            'def g(): pass\nfrom p.functions import f\n__all__ = ["f", "g"]',
+            {"p.x.__all__": {"p.x", "p.x.f", "p.x.g"}},
+            id="dunder-all mixes local and imported",
+        ),
+        pytest.param(
+            'from p.functions import f\n__all__: list[str] = ["f"]',
+            {"p.x.__all__": {"p.x", "p.x.f"}},
+            id="dunder-all annotated assignment",
+        ),
+        pytest.param(
+            'from p.functions import f\n__all__ = ["missing"]',
+            {"p.x.__all__": {"p.x"}},
+            id="dunder-all unknown name is ignored",
+        ),
+    ],
+)
+def test_dunder_all_edges(build_decl_graph, src, symbol_edges):
+    import_test_graph = build_decl_graph({**IMPORT_TEST_FILES, "p/x.py": src})
+    found_symbols = {n.fqname for n in import_test_graph.nodes}
+    for expected_symbol, expected_edges in symbol_edges.items():
+        assert expected_symbol in found_symbols
+        found_edges = {
+            dst.fqname for src, dst in import_test_graph.edges if src.fqname == expected_symbol
+        }
+        assert found_edges == expected_edges
