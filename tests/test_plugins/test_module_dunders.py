@@ -22,10 +22,7 @@ def test_keeps_other_dunders_alive(tmp_path, write_files, reachable_fqnames):
     write_files(
         {
             "pkg/__init__.py": (
-                '__version__ = "1.0.0"\n'
-                '__author__ = "someone"\n'
-                '__license__ = "MIT"\n'
-                "unused = 1\n"
+                '__version__ = "1.0.0"\n__author__ = "someone"\n__license__ = "MIT"\nunused = 1\n'
             ),
         }
     )
