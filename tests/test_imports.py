@@ -118,3 +118,11 @@ def test_dunder_all_edges(build_decl_graph, src, symbol_edges):
             dst.fqname for src, dst in import_test_graph.edges if src.fqname == expected_symbol
         }
         assert found_edges == expected_edges
+
+
+def test_module_keeps_dunder_all_alive(build_decl_graph):
+    graph = build_decl_graph(
+        {**IMPORT_TEST_FILES, "p/x.py": 'from p.functions import f\n__all__ = ["f"]'}
+    )
+    edges = {(src.fqname, dst.fqname) for src, dst in graph.edges}
+    assert ("p.x", "p.x.__all__") in edges

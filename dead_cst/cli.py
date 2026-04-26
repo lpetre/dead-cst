@@ -93,7 +93,6 @@ def analyze(
         Optional[list[str]],
         typer.Option("-p", "--path", help="Search path spec: 'base:dep1,dep2' or 'base'."),
     ] = None,
-    preserve_dunder_all: Annotated[bool, typer.Option(help="Keep __all__ variables alive.")] = True,
     verbose: Annotated[
         bool, typer.Option("-v", "--verbose", help="Enable verbose output.")
     ] = False,
@@ -112,11 +111,6 @@ def analyze(
 
     eps = [parse_entrypoint(ep) for ep in entrypoint]
     reachable = find_reachable(graph, root, eps)
-
-    if preserve_dunder_all:
-        for node in graph.nodes:
-            if node.fqname.endswith("__all__") and node.type == "variable":
-                reachable.add(node)
 
     unreachable_graph = graph.subgraph([n for n in graph.nodes if n not in reachable])
 
@@ -265,7 +259,6 @@ def remove(
         Optional[list[str]],
         typer.Option("-p", "--path", help="Search path spec: 'base:dep1,dep2' or 'base'."),
     ] = None,
-    preserve_dunder_all: Annotated[bool, typer.Option(help="Keep __all__ variables alive.")] = True,
     verbose: Annotated[
         bool, typer.Option("-v", "--verbose", help="Enable verbose output.")
     ] = False,
@@ -284,11 +277,6 @@ def remove(
 
     eps = [parse_entrypoint(ep) for ep in entrypoint]
     reachable = find_reachable(graph, root, eps)
-
-    if preserve_dunder_all:
-        for node in graph.nodes:
-            if node.fqname.endswith("__all__") and node.type == "variable":
-                reachable.add(node)
 
     unreachable_graph = graph.subgraph([n for n in graph.nodes if n not in reachable])
 

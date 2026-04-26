@@ -139,12 +139,11 @@ class SymbolVisitor(cst.CSTVisitor):
                     self._push_decl(name, sym)
                     value_to_syms.setdefault(value, []).append(sym)
 
-                    if (
-                        isinstance(name, cst.Name)
-                        and name.value == "__all__"
-                        and (referenced := self._extract_string_sequence(value)) is not None
-                    ):
-                        self.dunder_all_refs.append((sym, referenced))
+                    if isinstance(name, cst.Name) and name.value == "__all__":
+                        # Keep __all__ alive whenever its module is reachable
+                        self.internal_edges.add((self.module_node, sym))
+                        if (referenced := self._extract_string_sequence(value)) is not None:
+                            self.dunder_all_refs.append((sym, referenced))
 
         values = [node.value]
         if isinstance(node.value, cst.Tuple):

@@ -43,7 +43,6 @@ dead-cst analyze ROOT -e ENTRYPOINT [OPTIONS]
 |---|---|
 | `-e, --entrypoint` | Entrypoint: file path, FQN, or `re:pattern` for regex (repeatable) |
 | `-p, --path` | Search path spec: `base:dep1,dep2` or `base` (repeatable) |
-| `--preserve-dunder-all / --no-preserve-dunder-all` | Keep `__all__` variables alive (default: true) |
 | `--format` | Output format: `text` or `json` |
 | `-v, --verbose` | Enable verbose logging |
 
