@@ -32,8 +32,9 @@ import pytest
                 """,
             },
             # ``__all__`` strings are not followed, so on their own they
-            # keep nothing alive. The CLI has a separate
-            # ``--preserve-dunder-all`` flag that handles this.
+            # keep nothing alive. ``ModuleDundersPlugin`` keeps the
+            # ``__all__`` variable itself alive but does not chase the
+            # listed names.
             {
                 "mod.__all__ -> mod",
                 "mod.a -> mod",

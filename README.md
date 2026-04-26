@@ -47,7 +47,6 @@ dead-cst analyze ROOT -e ENTRYPOINT [OPTIONS]
 | `-p, --path` | Search path spec: `base:dep1,dep2` or `base` (repeatable) |
 | `--resolver` | Path resolver to run, e.g. `venv`, `pyproject` (repeatable) |
 | `--plugin` | Edge plugin to run, e.g. `main_block`, `project_scripts` (repeatable) |
-| `--preserve-dunder-all / --no-preserve-dunder-all` | Keep `__all__` variables alive (default: true) |
 | `--format` | Output format: `text` or `json` |
 | `-v, --verbose` | Enable verbose logging |
 
@@ -109,7 +108,7 @@ Entrypoint detection is now fully plugin-driven. Builtins:
 | `MainBlockPlugin` | Mark modules containing `if __name__ == "__main__":` as entrypoints |
 | `ProjectScriptsPlugin` | Read `pyproject.toml [project.scripts]` and mark each target as an entrypoint |
 | `ExplicitEntrypointPlugin` | Match user-supplied file paths / FQNs / regexes (powers the `-e` flag) |
-| `DunderAllPlugin` | Keep top-level `__all__` variables alive (powers `--preserve-dunder-all`) |
+| `ModuleDundersPlugin` | Keep top-level dunder variables (`__all__`, `__version__`, etc.) alive (always on) |
 | `PytestPlugin` | Keep pytest-discovered tests, `conftest.py` decls, and `@pytest.fixture` functions alive (`--plugin pytest`) |
 
 Write your own by implementing the `EdgePlugin` or `CSTAwareEdgePlugin` protocol; register under the `dead_cst.plugins` entry-point group for CLI discovery.
@@ -132,7 +131,7 @@ A module-level `import` / `from ... import ...` is itself a declaration of type 
 - Dynamic attribute access (`getattr`) and runtime-generated symbols are invisible to static analysis.
 - Only first-party code is analysed; third-party dependencies are treated as opaque.
 - PEP 695 `type` statements are not tracked.
-- String names in `__all__` are not followed to their declarations (but `--preserve-dunder-all` keeps the `__all__` variable itself alive).
+- String names in `__all__` are not followed to their declarations (but `ModuleDundersPlugin` keeps the `__all__` variable itself alive).
 
 ## TODO
 

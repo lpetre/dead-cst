@@ -38,9 +38,9 @@ from ._core import (
     apply_ops,
     synthetic_node,
 )
-from .dunder_all import DunderAllPlugin
 from .explicit import ExplicitEntrypointPlugin
 from .main_block import MainBlockPlugin
+from .module_dunders import ModuleDundersPlugin
 from .project_scripts import ProjectScriptsPlugin
 from .pytest import PytestPlugin
 
@@ -48,7 +48,7 @@ BUILTIN_PLUGINS: dict[str, type] = {
     MainBlockPlugin.name: MainBlockPlugin,
     ProjectScriptsPlugin.name: ProjectScriptsPlugin,
     ExplicitEntrypointPlugin.name: ExplicitEntrypointPlugin,
-    DunderAllPlugin.name: DunderAllPlugin,
+    ModuleDundersPlugin.name: ModuleDundersPlugin,
     PytestPlugin.name: PytestPlugin,
 }
 
@@ -72,11 +72,11 @@ __all__ = [
     "AddNode",
     "BUILTIN_PLUGINS",
     "CSTAwareEdgePlugin",
-    "DunderAllPlugin",
     "EdgePlugin",
     "ExplicitEntrypointPlugin",
     "GraphOp",
     "MainBlockPlugin",
+    "ModuleDundersPlugin",
     "PluginContext",
     "ProjectScriptsPlugin",
     "PytestPlugin",

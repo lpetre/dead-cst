@@ -17,13 +17,14 @@ from . import build_symbol_graph, count_nodes, find_reachable, order_paths, remo
 from ._branches import is_unreachable_node
 from ._plugins import (
     CSTAwareEdgePlugin,
-    DunderAllPlugin,
     EdgePlugin,
     ExplicitEntrypointPlugin,
+    ModuleDundersPlugin,
     load_plugin,
 )
 from ._resolvers import load_resolver, merge_paths
 from ._symbols import SymbolNode
+
 
 app = typer.Typer(help="Dead code analysis for Python using libcst.")
 
@@ -52,20 +53,17 @@ def build_plugins(
     *,
     entrypoints: list[str],
     plugin_names: list[str],
-    preserve_dunder_all: bool,
 ) -> list[EdgePlugin | CSTAwareEdgePlugin]:
     """Compose the plugin list from CLI flags.
 
-    Order: user-specified plugins first, then ``DunderAllPlugin`` (if
-    enabled), then ``ExplicitEntrypointPlugin`` with the ``-e`` specs.
-    ``-e`` runs last so it can hang entrypoints off any synthetic nodes
-    contributed upstream.
+    Order: user-specified plugins first, then ``ModuleDundersPlugin``, then
+    ``ExplicitEntrypointPlugin`` with the ``-e`` specs. ``-e`` runs last so
+    it can hang entrypoints off any synthetic nodes contributed upstream.
     """
     plugins: list[EdgePlugin | CSTAwareEdgePlugin] = []
     for name in plugin_names:
         plugins.append(load_plugin(name))
-    if preserve_dunder_all:
-        plugins.append(DunderAllPlugin())
+    plugins.append(ModuleDundersPlugin())
     if entrypoints:
         specs = [parse_entrypoint(ep) for ep in entrypoints]
         plugins.append(ExplicitEntrypointPlugin(specs=specs))
@@ -145,7 +143,6 @@ def analyze(
         Optional[list[str]],
         typer.Option("--plugin", help="Edge plugin to run (e.g. main_block, project_scripts)."),
     ] = None,
-    preserve_dunder_all: Annotated[bool, typer.Option(help="Keep __all__ variables alive.")] = True,
     verbose: Annotated[
         bool, typer.Option("-v", "--verbose", help="Enable verbose output.")
     ] = False,
@@ -163,7 +160,6 @@ def analyze(
     plugins = build_plugins(
         entrypoints=entrypoint or [],
         plugin_names=plugin or [],
-        preserve_dunder_all=preserve_dunder_all,
     )
     graph = build_symbol_graph(paths_dict, plugins=plugins, project_root=root)
     reachable = find_reachable(graph)
@@ -301,7 +297,6 @@ def why_alive(
         Optional[list[str]],
         typer.Option("--plugin", help="Edge plugin to run (e.g. main_block, project_scripts)."),
     ] = None,
-    preserve_dunder_all: Annotated[bool, typer.Option(help="Keep __all__ variables alive.")] = True,
     verbose: Annotated[
         bool, typer.Option("-v", "--verbose", help="Enable verbose output.")
     ] = False,
@@ -316,7 +311,6 @@ def why_alive(
     plugins = build_plugins(
         entrypoints=[],
         plugin_names=plugin or [],
-        preserve_dunder_all=preserve_dunder_all,
     )
     graph = build_symbol_graph(paths_dict, plugins=plugins, project_root=root)
 
@@ -378,7 +372,6 @@ def remove(
         Optional[list[str]],
         typer.Option("--plugin", help="Edge plugin to run (e.g. main_block, project_scripts)."),
     ] = None,
-    preserve_dunder_all: Annotated[bool, typer.Option(help="Keep __all__ variables alive.")] = True,
     verbose: Annotated[
         bool, typer.Option("-v", "--verbose", help="Enable verbose output.")
     ] = False,
@@ -396,7 +389,6 @@ def remove(
     plugins = build_plugins(
         entrypoints=entrypoint or [],
         plugin_names=plugin or [],
-        preserve_dunder_all=preserve_dunder_all,
     )
     graph = build_symbol_graph(paths_dict, plugins=plugins, project_root=root)
     reachable = find_reachable(graph)
