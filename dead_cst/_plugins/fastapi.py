@@ -1,4 +1,16 @@
-"""Plugin: keep FastAPI route handlers and lifecycle hooks alive."""
+"""Plugin: keep FastAPI route handlers and lifecycle hooks alive.
+
+Strategy: instead of marking each handler as its own entrypoint, find the
+top-level ``FastAPI()`` / ``APIRouter()`` instances in each module and emit
+inverse edges (instance -> handler) for every ``@<instance>.<method>(...)``
+decorator. ``FastAPI()`` instances are then seeded as entrypoints; routers
+stay pass-through so an unused ``APIRouter`` still surfaces as dead code.
+
+This routes ``why-alive`` chains through the app variable users actually
+recognize ("alive because it's a route on ``app``") and lets the existing
+``app.include_router(router)`` reference flow keep sub-routers reachable
+without any special-casing.
+"""
 
 from __future__ import annotations
 
@@ -10,11 +22,10 @@ import libcst as cst
 from libcst.metadata import FullRepoManager
 
 from .._symbols import SymbolNode
-from ._core import AddEdge, AddNode, GraphOp, PluginContext, synthetic_node
+from ._core import AddEdge, AddNode, GraphOp, PluginContext
 
-# Attribute names used by FastAPI / APIRouter to register a callable. Matched
-# against the rightmost attribute of the decorator expression, so any binding
-# (``app``, ``router``, ``v1_router``, ``self.app`` ...) is accepted.
+# Attribute names FastAPI / APIRouter use to register a callable. Matched as
+# the rightmost attribute of ``@<instance>.<name>(...)``.
 _ROUTE_DECORATORS: frozenset[str] = frozenset(
     {
         "get",
@@ -34,38 +45,45 @@ _ROUTE_DECORATORS: frozenset[str] = frozenset(
     }
 )
 
+# Classes whose instances we treat specially. Value records whether the
+# instance should be seeded as an entrypoint.
+_INSTANCE_KINDS: dict[str, bool] = {
+    "FastAPI": True,  # uvicorn loads ``module:app`` -- always an entrypoint
+    "APIRouter": False,  # only alive if reached via ``include_router``
+}
+
 
 @dataclass
 class FastAPIPlugin:
-    """Mark FastAPI route handlers and lifecycle hooks as entrypoints.
+    """Mark FastAPI apps as entrypoints and wire route handlers through them.
 
-    FastAPI registers callables via decorators -- ``@app.get("/")``,
-    ``@router.post(...)``, ``@app.websocket(...)``, ``@app.middleware(...)``,
-    ``@app.exception_handler(...)``, ``@app.on_event(...)`` -- and the
-    framework, not user code, invokes them at runtime. To a static analyzer
-    they look unused.
+    For each module the plugin:
 
-    For every top-level function whose decorator's rightmost attribute matches
-    a known FastAPI registration name (``get``/``post``/.../``api_route``/
-    ``websocket``/``middleware``/``exception_handler``/``on_event``), this
-    plugin emits a synthetic entrypoint with an edge to the function. The
-    analyzer's regular reference edges then keep dependencies (Pydantic
-    models, ``Depends(...)`` callables, helpers) reachable from there.
+    1. Inspects ``from fastapi import ...`` / ``import fastapi`` to learn
+       which local names refer to ``FastAPI`` and ``APIRouter``.
+    2. Finds top-level assignments ``X = FastAPI(...)`` / ``X = APIRouter(...)``
+       (including ``AnnAssign`` and aliased / module-prefixed forms) and
+       records ``X`` as an instance of that kind.
+    3. For every top-level function decorated ``@X.<route_name>(...)``,
+       emits an edge ``X -> handler`` so the handler is reachable whenever
+       ``X`` is.
+    4. Seeds every ``FastAPI`` instance as an entrypoint. Routers are not
+       seeded -- a router that is never ``include_router``\\ed has no path
+       from any entrypoint and stays dead, which is the correct signal.
 
-    Because the decorator's owner type is not known statically, matching is
-    by attribute name only. ``@app.get(...)`` and ``@router.get(...)`` are
-    both accepted; so is ``@self.app.get(...)``. Bare names without an
-    attribute (``@get(...)``) are not matched -- FastAPI does not expose
-    these as module-level decorators, and matching them would collide with
-    unrelated code (e.g. ``@get`` from another library).
+    Application wiring (``app.include_router(router)``,
+    ``FastAPI(lifespan=fn)``, ``app.add_api_route(..., endpoint=fn)``,
+    ``Depends(fn)``) is plain reference passing already tracked by the
+    regular analyzer.
 
-    Application construction (``FastAPI(lifespan=...)``,
-    ``app.include_router(router)``, ``app.add_api_route(..., endpoint=fn)``,
-    ``Depends(fn)``) is plain reference passing and is already tracked by
-    the regular analyzer; this plugin only fills the decorator-only gap.
+    Limitations: only top-level ``X = FastAPI(...)`` / ``X = APIRouter(...)``
+    assignments with a single ``Name`` target are detected. Factory-style
+    apps (``def create_app(): return FastAPI()``) and class-attribute apps
+    (``self.app = FastAPI()``) are not handled; users can still keep those
+    alive with explicit ``-e`` entrypoints.
 
-    This is a :class:`CSTAwareEdgePlugin` because decorator detection needs
-    the original CST.
+    This is a :class:`CSTAwareEdgePlugin` because detection needs the
+    original CST.
     """
 
     name: str = "fastapi"
@@ -75,34 +93,35 @@ class FastAPIPlugin:
         self, ctx: PluginContext, managers: dict[Path, FullRepoManager]
     ) -> Iterable[GraphOp]:
         modules_by_path: dict[Path, SymbolNode] = {}
-        decls_by_path: dict[Path, dict[str, list[SymbolNode]]] = {}
         for node in ctx.graph.nodes:
             if node.type == "module":
                 modules_by_path[node.path] = node
-            elif node.type == "function":
-                simple = node.fqname.rsplit(".", 1)[-1]
-                decls_by_path.setdefault(node.path, {}).setdefault(simple, []).append(node)
 
         for path, module_node in modules_by_path.items():
             wrapper = _wrapper_for(path, managers)
             if wrapper is None:
                 continue
-            handler_names = _find_handler_names(wrapper.module)
-            if not handler_names:
+            fastapi_imports = _collect_fastapi_imports(wrapper.module)
+            if not fastapi_imports:
                 continue
-            by_name = decls_by_path.get(path, {})
-            handler_decls: list[SymbolNode] = []
-            for name in handler_names:
-                handler_decls.extend(by_name.get(name, []))
-            if not handler_decls:
+            instances = _find_instances(wrapper.module, fastapi_imports)
+            if not instances:
                 continue
-            synth = synthetic_node(
-                fqname=f"<fastapi:routes>:{module_node.fqname}",
-                path=path,
-            )
-            yield AddNode(synth, entrypoint=True)
-            for decl in handler_decls:
-                yield AddEdge(synth, decl)
+            handlers = _find_handlers(wrapper.module, set(instances))
+
+            module_fqname = module_node.fqname
+            for var_name, kind in instances.items():
+                instance_decls = ctx.find_declarations(f"{module_fqname}.{var_name}")
+                if not instance_decls:
+                    continue
+                for instance_decl in instance_decls:
+                    if _INSTANCE_KINDS[kind]:
+                        yield AddNode(instance_decl, entrypoint=True)
+                    for handler_name in handlers.get(var_name, ()):
+                        for handler_decl in ctx.find_declarations(
+                            f"{module_fqname}.{handler_name}"
+                        ):
+                            yield AddEdge(instance_decl, handler_decl)
 
 
 def _wrapper_for(path: Path, managers: dict[Path, FullRepoManager]):
@@ -116,33 +135,123 @@ def _wrapper_for(path: Path, managers: dict[Path, FullRepoManager]):
     return None
 
 
-def _find_handler_names(module: cst.Module) -> set[str]:
-    names: set[str] = set()
+def _collect_fastapi_imports(module: cst.Module) -> dict[str, str]:
+    """Return ``{local_name: target}`` for names imported from ``fastapi``.
+
+    ``target`` is one of ``"FastAPI"``, ``"APIRouter"``, or ``"<module>"``
+    (the whole ``fastapi`` package, for ``import fastapi``).
+    """
+    bindings: dict[str, str] = {}
     for stmt in module.body:
-        func = _as_function_def(stmt)
-        if func is None:
+        if not isinstance(stmt, cst.SimpleStatementLine):
             continue
-        if any(_is_fastapi_decorator(dec.decorator) for dec in func.decorators):
-            names.add(func.name.value)
-    return names
+        for small in stmt.body:
+            if isinstance(small, cst.ImportFrom):
+                if not _is_fastapi_module(small):
+                    continue
+                if isinstance(small.names, cst.ImportStar):
+                    continue
+                for alias in small.names:
+                    target = alias.name.value if isinstance(alias.name, cst.Name) else None
+                    if target not in _INSTANCE_KINDS:
+                        continue
+                    local = alias.asname.name.value if alias.asname else target
+                    if isinstance(local, str):
+                        bindings[local] = target
+            elif isinstance(small, cst.Import):
+                for alias in small.names:
+                    if not _is_name(alias.name, "fastapi"):
+                        continue
+                    local = alias.asname.name.value if alias.asname else "fastapi"
+                    if isinstance(local, str):
+                        bindings[local] = "<module>"
+    return bindings
 
 
-def _as_function_def(stmt: cst.BaseStatement) -> cst.FunctionDef | None:
-    """Unwrap a top-level function definition, including ``async def``."""
-    if isinstance(stmt, cst.FunctionDef):
-        return stmt
+def _is_fastapi_module(node: cst.ImportFrom) -> bool:
+    if node.relative:
+        return False
+    return _is_name(node.module, "fastapi")
+
+
+def _is_name(node: cst.CSTNode | None, value: str) -> bool:
+    return isinstance(node, cst.Name) and node.value == value
+
+
+def _find_instances(
+    module: cst.Module, fastapi_imports: dict[str, str]
+) -> dict[str, str]:
+    """Return ``{var_name: 'FastAPI' | 'APIRouter'}`` for top-level instances."""
+    instances: dict[str, str] = {}
+    for stmt in module.body:
+        if not isinstance(stmt, cst.SimpleStatementLine):
+            continue
+        for small in stmt.body:
+            target_name, value = _single_target_assignment(small)
+            if target_name is None or not isinstance(value, cst.Call):
+                continue
+            kind = _classify_call(value.func, fastapi_imports)
+            if kind is not None:
+                instances[target_name] = kind
+    return instances
+
+
+def _single_target_assignment(
+    stmt: cst.BaseSmallStatement,
+) -> tuple[str | None, cst.BaseExpression | None]:
+    """Extract ``(name, rhs)`` for ``X = ...`` / ``X: T = ...``; else ``(None, None)``."""
+    if isinstance(stmt, cst.Assign):
+        if len(stmt.targets) != 1:
+            return None, None
+        target = stmt.targets[0].target
+        if isinstance(target, cst.Name):
+            return target.value, stmt.value
+    elif isinstance(stmt, cst.AnnAssign):
+        if isinstance(stmt.target, cst.Name) and stmt.value is not None:
+            return stmt.target.value, stmt.value
+    return None, None
+
+
+def _classify_call(func: cst.BaseExpression, fastapi_imports: dict[str, str]) -> str | None:
+    """Return ``"FastAPI"`` / ``"APIRouter"`` if ``func`` calls one, else ``None``."""
+    if isinstance(func, cst.Name):
+        target = fastapi_imports.get(func.value)
+        if target in _INSTANCE_KINDS:
+            return target
+    elif isinstance(func, cst.Attribute) and isinstance(func.value, cst.Name):
+        # ``fastapi.FastAPI(...)`` / ``fa.APIRouter(...)``
+        if fastapi_imports.get(func.value.value) == "<module>":
+            attr = func.attr.value
+            if attr in _INSTANCE_KINDS:
+                return attr
     return None
 
 
-def _is_fastapi_decorator(expr: cst.BaseExpression) -> bool:
-    """Match ``<x>.<route_name>(...)`` -- with or without trailing call.
+def _find_handlers(module: cst.Module, instance_vars: set[str]) -> dict[str, list[str]]:
+    """Return ``{instance_var: [handler_func_name, ...]}`` for decorated handlers."""
+    handlers: dict[str, list[str]] = {}
+    for stmt in module.body:
+        if not isinstance(stmt, cst.FunctionDef):
+            continue
+        for dec in stmt.decorators:
+            owner = _route_decorator_owner(dec.decorator)
+            if owner is None or owner not in instance_vars:
+                continue
+            handlers.setdefault(owner, []).append(stmt.name.value)
+            break
+    return handlers
 
-    FastAPI decorators are conventionally called (``@app.get("/")``), but we
-    also accept the uncalled form for robustness; matching the attribute name
-    is what distinguishes a registration from an unrelated decorator.
-    """
+
+def _route_decorator_owner(expr: cst.BaseExpression) -> str | None:
+    """For ``@X.get(...)`` / ``@X.get`` return ``"X"`` (only when the rightmost
+    attribute is a known FastAPI registration name and ``X`` is a bare
+    ``Name``). Returns ``None`` otherwise."""
     if isinstance(expr, cst.Call):
         expr = expr.func
     if not isinstance(expr, cst.Attribute):
-        return False
-    return expr.attr.value in _ROUTE_DECORATORS
+        return None
+    if expr.attr.value not in _ROUTE_DECORATORS:
+        return None
+    if not isinstance(expr.value, cst.Name):
+        return None
+    return expr.value.value
