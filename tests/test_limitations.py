@@ -34,13 +34,19 @@ import pytest
                 def a(): g()
                 """,
             },
-            # ``import *`` is deliberately skipped. ``mod.a`` should
-            # point at ``other.g`` but the reference cannot be resolved.
+            # ``from other import *`` is fanned out at the module level,
+            # so ``mod`` points at every top-level decl in ``other``.
+            # Per-access resolution is still missing: ideally
+            # ``mod.a -> other.g`` would also be present, but
+            # ScopeProvider cannot bind the bare ``g`` reference back to
+            # the star import.
             {
+                "mod -> other",
+                "mod -> other.g",
                 "mod.a -> mod",
                 "other.g -> other",
             },
-            id="star-import-not-resolved",
+            id="star-import-fans-out-but-misses-per-access-edge",
         ),
         pytest.param(
             {

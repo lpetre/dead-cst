@@ -16,6 +16,7 @@ class Import:
     path: Path | str
     module: str
     decl: str | None = None
+    star: bool = False
 
 
 @dataclass(frozen=True, slots=True)

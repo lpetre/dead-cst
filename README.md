@@ -157,7 +157,7 @@ A module-level `import` / `from ... import ...` is itself a declaration of type 
 
 ## Limitations
 
-- `import *` is not resolved.
+- `import *` is treated pessimistically: every top-level declaration in the target module is considered used by the importing module.
 - Dynamic attribute access (`getattr`) and runtime-generated symbols are invisible to static analysis.
 - Only first-party code is analysed; third-party dependencies are treated as opaque (they appear as synthetic nodes — see `dead-cst dependencies`).
 - PEP 695 `type` statements are not tracked.

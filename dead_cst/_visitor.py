@@ -364,10 +364,6 @@ class SymbolVisitor(cst.CSTVisitor):
         self._add_import("", node)
 
     def visit_ImportFrom(self, node: cst.ImportFrom) -> None:
-        # FIXME support import star
-        if isinstance(node.names, cst.ImportStar):
-            return
-
         module = ""
         if node.module:
             module = get_full_name_for_node(node.module) or ""
@@ -380,6 +376,10 @@ class SymbolVisitor(cst.CSTVisitor):
 
             prefix = "." * len(node.relative)
             module = resolve_name(f"{prefix}{module}", current_package)
+
+        if isinstance(node.names, cst.ImportStar):
+            self._add_star_import(module)
+            return
 
         self._add_import(module, node)
 
@@ -420,6 +420,16 @@ class SymbolVisitor(cst.CSTVisitor):
                     shadowed_decls.append(d)
 
             trie_node.finalize_declarations(name, live_decls, shadowed_decls)
+
+    def _add_star_import(self, module: str) -> None:
+        module_path = self.resolve_import(module) if module else None
+        if not module_path:
+            logger.warning(
+                "Failed to resolve star import: 'from %s import *' in %s", module, self.path
+            )
+            return
+        star = Import(path=module_path, module=module, star=True)
+        self.import_edges.add((self.decl_stack[-1][-1], star))
 
     def on_leave(self, original_node: cst.CSTNode) -> None:
         self.nearest_decls[original_node] = list(self.decl_stack[-1]) if self.decl_stack else []
