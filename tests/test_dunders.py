@@ -45,7 +45,7 @@ def _write_pkg(tmp_path):
     return tmp_path
 
 
-def test_analyze_preserves_module_dunders_by_default(tmp_path):
+def test_analyze_preserves_module_dunders(tmp_path):
     root = _write_pkg(tmp_path)
     result = CliRunner().invoke(app, ["analyze", str(root), "-e", "pkg.main.main"])
     # `unused` is dead, but the dunder vars should not be reported as dead.
@@ -53,13 +53,3 @@ def test_analyze_preserves_module_dunders_by_default(tmp_path):
     assert "pkg.main.__version__" not in result.stdout
     assert "pkg.main.__author__" not in result.stdout
     assert "pkg.main.__all__" not in result.stdout
-
-
-def test_analyze_no_preserve_dunders_marks_them_dead(tmp_path):
-    root = _write_pkg(tmp_path)
-    result = CliRunner().invoke(
-        app, ["analyze", str(root), "-e", "pkg.main.main", "--no-preserve-dunders"]
-    )
-    assert "pkg.main.__version__" in result.stdout
-    assert "pkg.main.__author__" in result.stdout
-    assert "pkg.main.__all__" in result.stdout

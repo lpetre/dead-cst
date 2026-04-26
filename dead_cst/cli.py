@@ -101,10 +101,6 @@ def analyze(
         Optional[list[str]],
         typer.Option("-p", "--path", help="Search path spec: 'base:dep1,dep2' or 'base'."),
     ] = None,
-    preserve_dunders: Annotated[
-        bool,
-        typer.Option(help="Keep module-level dunder variables (e.g. __all__, __version__) alive."),
-    ] = True,
     verbose: Annotated[
         bool, typer.Option("-v", "--verbose", help="Enable verbose output.")
     ] = False,
@@ -124,10 +120,9 @@ def analyze(
     eps = [parse_entrypoint(ep) for ep in entrypoint]
     reachable = find_reachable(graph, root, eps)
 
-    if preserve_dunders:
-        for node in graph.nodes:
-            if _is_module_dunder(node):
-                reachable.add(node)
+    for node in graph.nodes:
+        if _is_module_dunder(node):
+            reachable.add(node)
 
     unreachable_graph = graph.subgraph([n for n in graph.nodes if n not in reachable])
 
@@ -276,10 +271,6 @@ def remove(
         Optional[list[str]],
         typer.Option("-p", "--path", help="Search path spec: 'base:dep1,dep2' or 'base'."),
     ] = None,
-    preserve_dunders: Annotated[
-        bool,
-        typer.Option(help="Keep module-level dunder variables (e.g. __all__, __version__) alive."),
-    ] = True,
     verbose: Annotated[
         bool, typer.Option("-v", "--verbose", help="Enable verbose output.")
     ] = False,
@@ -299,10 +290,9 @@ def remove(
     eps = [parse_entrypoint(ep) for ep in entrypoint]
     reachable = find_reachable(graph, root, eps)
 
-    if preserve_dunders:
-        for node in graph.nodes:
-            if _is_module_dunder(node):
-                reachable.add(node)
+    for node in graph.nodes:
+        if _is_module_dunder(node):
+            reachable.add(node)
 
     unreachable_graph = graph.subgraph([n for n in graph.nodes if n not in reachable])
 
