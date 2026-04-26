@@ -39,6 +39,7 @@ from ._core import (
     synthetic_node,
 )
 from .explicit import ExplicitEntrypointPlugin
+from .fastapi import FastAPIPlugin
 from .main_block import MainBlockPlugin
 from .module_dunders import ModuleDundersPlugin
 from .project_scripts import ProjectScriptsPlugin
@@ -50,6 +51,7 @@ BUILTIN_PLUGINS: dict[str, type] = {
     ExplicitEntrypointPlugin.name: ExplicitEntrypointPlugin,
     ModuleDundersPlugin.name: ModuleDundersPlugin,
     PytestPlugin.name: PytestPlugin,
+    FastAPIPlugin.name: FastAPIPlugin,
 }
 
 
@@ -74,6 +76,7 @@ __all__ = [
     "CSTAwareEdgePlugin",
     "EdgePlugin",
     "ExplicitEntrypointPlugin",
+    "FastAPIPlugin",
     "GraphOp",
     "MainBlockPlugin",
     "ModuleDundersPlugin",
