@@ -14,8 +14,8 @@ two versions.
   `GraphOp`/`AddNode`/`AddEdge`/`RemoveEdge`, `apply_ops`, `synthetic_node`).
   Built-in plugins: `MainBlockPlugin`, `ProjectScriptsPlugin`,
   `ExplicitEntrypointPlugin`, `ModuleDundersPlugin`, `PytestPlugin`,
-  `FastAPIPlugin`. Third-party plugins register under the `dead_cst.plugins`
-  entry-point group and load via `load_plugin`.
+  `FastAPIPlugin`, `TyperPlugin`. Third-party plugins register under the
+  `dead_cst.plugins` entry-point group and load via `load_plugin`.
 - Path resolver architecture (`PathResolver`, `merge_paths`). Built-in
   resolvers: `VenvResolver`, `PyprojectResolver`, `UvWorkspaceResolver`. Third-
   party resolvers register under `dead_cst.resolvers` and load via
@@ -25,6 +25,12 @@ two versions.
   backends, name-match fallback) to determine which subdirs the build
   backend would actually ship, so internal dirs like `tests/` stay scoped
   to their owning workspace member during cross-member import resolution.
+- `TyperPlugin` (`--plugin typer`): detect top-level `Typer()` instances and
+  emit `instance -> handler` edges for `@app.command(...)` and
+  `@app.callback(...)` decorators. Typer apps are pass-through; reachability
+  is expected through `[project.scripts]` or a `__main__` block, after which
+  every registered command and callback stays alive. Sub-typers that are
+  never `add_typer`'d remain dead.
 - `dead-cst unused-exports` CLI command: report `__all__` entries whose targets
   are kept alive only because they are listed in `__all__`.
 - `dead-cst dependencies` CLI command: list third-party distributions and

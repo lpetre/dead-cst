@@ -44,6 +44,7 @@ from .main_block import MainBlockPlugin
 from .module_dunders import ModuleDundersPlugin
 from .project_scripts import ProjectScriptsPlugin
 from .pytest import PytestPlugin
+from .typer import TyperPlugin
 
 BUILTIN_PLUGINS: dict[str, type] = {
     MainBlockPlugin.name: MainBlockPlugin,
@@ -52,6 +53,7 @@ BUILTIN_PLUGINS: dict[str, type] = {
     ModuleDundersPlugin.name: ModuleDundersPlugin,
     PytestPlugin.name: PytestPlugin,
     FastAPIPlugin.name: FastAPIPlugin,
+    TyperPlugin.name: TyperPlugin,
 }
 
 
@@ -85,6 +87,7 @@ __all__ = [
     "PytestPlugin",
     "RemoveEdge",
     "SYNTHETIC_POSITION",
+    "TyperPlugin",
     "apply_ops",
     "load_plugin",
     "synthetic_node",
