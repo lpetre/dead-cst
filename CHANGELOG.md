@@ -70,6 +70,10 @@ two versions.
   (`_flow.py`): `Try.finalbody` is a `cst.Finally` whose `.body` is an
   `IndentedBlock`, so the recursive walk now drills one level further to
   match every other branch.
+- `UvWorkspaceResolver` now picks up workspace members whose lockfile entry
+  uses `source = { virtual = "..." }` (uv's marker for runnable apps/services
+  that don't ship as wheels), not just `editable` ones. The workspace root
+  itself (`virtual = "."`) is still skipped.
 
 ## [0.1.0] - Initial release
 

@@ -88,6 +88,61 @@ def test_uv_workspace_resolver_skips_virtual_root(tmp_path: Path):
     assert tmp_path.resolve() not in result
 
 
+def test_uv_workspace_resolver_includes_virtual_members(tmp_path: Path):
+    """Virtual members (apps/services that don't ship as wheels) are first-party
+    code and must be analyzed alongside editable members.
+
+    Regression for the silent drop documented in issue #32: a workspace mixing
+    ``apps/*`` (virtual) with ``libs/*`` (editable) used to skip the apps,
+    causing libraries whose only consumers were apps to be reported as dead.
+    """
+    (tmp_path / "pyproject.toml").write_text(
+        textwrap.dedent("""
+            [project]
+            name = "ws"
+            version = "0.0.0"
+            [tool.uv.workspace]
+            members = ["apps/*", "libs/*"]
+        """).strip()
+    )
+    for kind, name in (("apps", "app-a"), ("libs", "lib-a")):
+        (tmp_path / kind / name / "src" / name.replace("-", "_")).mkdir(parents=True)
+    (tmp_path / "uv.lock").write_text(
+        textwrap.dedent("""
+            version = 1
+            revision = 3
+            requires-python = ">=3.11"
+
+            [manifest]
+            members = ["app-a", "lib-a", "ws"]
+
+            [[package]]
+            name = "app-a"
+            version = "0.0.0"
+            source = { virtual = "apps/app-a" }
+            dependencies = [
+                { name = "lib-a" },
+            ]
+
+            [[package]]
+            name = "lib-a"
+            version = "0.0.0"
+            source = { editable = "libs/lib-a" }
+
+            [[package]]
+            name = "ws"
+            version = "0.0.0"
+            source = { virtual = "." }
+        """).strip()
+    )
+
+    result = UvWorkspaceResolver().resolve(tmp_path)
+
+    lib_src = (tmp_path / "libs" / "lib-a" / "src").resolve()
+    app_src = (tmp_path / "apps" / "app-a" / "src").resolve()
+    assert result == {lib_src: [], app_src: [lib_src]}
+
+
 def test_uv_workspace_resolver_no_lockfile(tmp_path: Path):
     assert UvWorkspaceResolver().resolve(tmp_path) == {}
 
