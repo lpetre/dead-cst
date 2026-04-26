@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
 import networkx as nx
 from libcst.metadata import CodeRange
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,18 +99,34 @@ class SymbolTrie:
         self.shadowed.extend(shadowed)
 
     def merge(self, other: SymbolTrie) -> SymbolTrie:
-        """Merge another SymbolTrie into this one."""
-        module_count = sum(1 for n in (self.module, other.module) if n is not None)
-        assert module_count <= 1, "Cannot merge two SymbolTries with conflicting modules"
+        """Merge another SymbolTrie into this one.
+
+        When both sides hold a module at the same FQN (a real packaging
+        collision -- two exported roots both shipping a package with the
+        same top-level name), the already-merged module wins and the
+        incoming one is dropped with a warning. Callers control the
+        precedence order by the order of their ``merge()`` calls; today
+        :func:`build_symbol_graph` merges the consumer's own trie first
+        and each dep's exported trie afterwards, so own-module always
+        beats dep-module on legitimate conflict.
+        """
         for part, child in other.children.items():
             if part not in self.children:
                 self.children[part] = SymbolTrie()
             self.children[part].merge(child)
-        if other.module:
-            assert self.module is None, "Cannot merge module into a node that already has a module"
-            self.module = other.module
-            self.declarations = {k: list(v) for k, v in other.declarations.items()}
-            self.shadowed = list(other.shadowed)
+        if other.module is None:
+            return self
+        if self.module is not None:
+            logger.warning(
+                "SymbolTrie collision at %s: keeping %s, dropping %s",
+                self.module.fqname,
+                self.module.path,
+                other.module.path,
+            )
+            return self
+        self.module = other.module
+        self.declarations = {k: list(v) for k, v in other.declarations.items()}
+        self.shadowed = list(other.shadowed)
         return self
 
     def _touch(self, parts: list[str]) -> SymbolTrie:

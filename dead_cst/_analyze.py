@@ -13,6 +13,7 @@ from ._plugins import (
     apply_ops,
 )
 from ._resolve import resolve_edges, safe_resolve_module, temp_sys_path
+from ._resolvers import exported_roots
 from ._symbols import SymbolNode, SymbolTrie
 from ._visitor import SymbolVisitor
 
@@ -36,6 +37,7 @@ def build_symbol_graph(
 ) -> nx.DiGraph:
     symbol_graph = nx.DiGraph()
     base_tries: dict[Path, SymbolTrie] = {}
+    export_tries: dict[Path, SymbolTrie] = {}
     base_managers: dict[Path, FullRepoManager] = {}
     symbol_lookup: SymbolTrie = SymbolTrie()
     for base in order_paths(paths):
@@ -44,6 +46,8 @@ def build_symbol_graph(
         safe_resolve_module.cache_clear()
         with temp_sys_path(search_paths):
             base_tries[base] = current_trie = SymbolTrie()
+            export_trie = SymbolTrie()
+            export_roots = exported_roots(base)
             import_edges = set()
             files = list(sorted(base.rglob("*.py")))
             mgr = FullRepoManager(base, files, {FixedFullyQualifiedNameProvider})
@@ -52,17 +56,29 @@ def build_symbol_graph(
                 wrapper = mgr.get_metadata_wrapper_for_path(file)
                 visitor = SymbolVisitor(file, search_paths)
                 wrapper.visit(visitor)
+                # A file's decls go into ``export_trie`` only when the file
+                # lives under one of ``base``'s exported dirs (or when the
+                # base has no export restriction). This is what hides
+                # ``tests/`` from dependents in the typical workspace
+                # layout: the member analyzes its own ``tests/`` (decls
+                # land in ``current_trie`` and the graph), but consumers'
+                # lookup tries never see them.
+                file_exported = export_roots is None or _under_any(file, export_roots)
                 curr = [visitor.trie]
                 while curr:
                     node = curr.pop()
                     if node.module is not None:
                         symbol_graph.add_node(node.module)
                         current_trie.add_declaration(node.module)
+                        if file_exported:
+                            export_trie.add_declaration(node.module)
                     for decls in node.declarations.values():
                         for decl in decls:
                             symbol_graph.add_node(decl)
                             symbol_graph.add_edge(decl, node.module)
                             current_trie.add_declaration(decl)
+                            if file_exported:
+                                export_trie.add_declaration(decl)
                     # Shadowed decls still belong to this module: emit them
                     # so the graph stays well-formed (every decl has a
                     # parent-module edge). They aren't re-added to
@@ -92,11 +108,17 @@ def build_symbol_graph(
 
             # add edges to keep __init__.py files alive
             current_trie.add_module_hierarchy_edges(symbol_graph)
+            export_tries[base] = export_trie
 
-            # now merge all the lookup tries
+            # Per-consumer lookup trie: this base's full trie (everything
+            # in scope when resolving its own imports) plus each dep's
+            # *exported* trie (what the dep ships to consumers). Deps are
+            # processed earlier by topological order, so their export
+            # tries already exist.
             symbol_lookup = SymbolTrie()
-            for sp in search_paths:
-                symbol_lookup.merge(base_tries[sp])
+            symbol_lookup.merge(current_trie)
+            for dep in paths.get(base, []):
+                symbol_lookup.merge(export_tries.get(dep, base_tries[dep]))
 
             # resolve all the import edges
             for src, dst in resolve_edges(import_edges, symbol_lookup, base):
@@ -122,6 +144,15 @@ def build_symbol_graph(
             apply_ops(symbol_graph, ops)
 
     return symbol_graph
+
+
+def _under_any(file: Path, roots: list[Path]) -> bool:
+    """True iff ``file`` is equal to or nested under any of ``roots``."""
+    f = file.resolve()
+    for r in roots:
+        if f == r or f.is_relative_to(r):
+            return True
+    return False
 
 
 def _infer_project_root(paths: dict[Path, list[Path]]) -> Path:
