@@ -1,91 +1,15 @@
-"""Tests for :mod:`dead_cst._resolvers`."""
+"""Tests for :class:`dead_cst._resolvers.uv_workspace.UvWorkspaceResolver`.
+
+Includes an end-to-end regression test for the cross-member ``tests/``
+collision that motivated :func:`dead_cst._resolvers.exported_roots`.
+"""
 
 from __future__ import annotations
 
 import textwrap
 from pathlib import Path
 
-import pytest
-
-from dead_cst import (
-    PyprojectResolver,
-    UvWorkspaceResolver,
-    VenvResolver,
-    load_resolver,
-    merge_paths,
-)
-from dead_cst._resolvers import exported_roots
-
-
-def test_venv_resolver_finds_site_packages(tmp_path: Path):
-    venv = tmp_path / ".venv"
-    sp = venv / "lib" / "python3.13" / "site-packages"
-    sp.mkdir(parents=True)
-
-    result = VenvResolver().resolve(tmp_path)
-    assert tmp_path.resolve() in result
-    assert sp.resolve() in result[tmp_path.resolve()]
-
-
-def test_venv_resolver_missing_returns_empty(tmp_path: Path):
-    # Passing an explicit (nonexistent) venv_dir skips the active-venv probe.
-    assert VenvResolver(venv_dir="nope").resolve(tmp_path) == {}
-
-
-def test_venv_resolver_custom_dir(tmp_path: Path):
-    venv = tmp_path / "envs" / "myenv"
-    sp = venv / "lib" / "python3.12" / "site-packages"
-    sp.mkdir(parents=True)
-
-    result = VenvResolver(venv_dir="envs/myenv").resolve(tmp_path)
-    assert sp.resolve() in result[tmp_path.resolve()]
-
-
-def test_pyproject_resolver_reads_paths_section(tmp_path: Path):
-    (tmp_path / "src").mkdir()
-    (tmp_path / "tests").mkdir()
-    (tmp_path / "pyproject.toml").write_text(
-        textwrap.dedent("""
-            [project]
-            name = "x"
-
-            [tool.dead-cst]
-            paths = [
-              { base = "src", deps = ["tests"] }
-            ]
-        """).strip()
-    )
-
-    result = PyprojectResolver().resolve(tmp_path)
-    assert result == {
-        (tmp_path / "src").resolve(): [(tmp_path / "tests").resolve()],
-    }
-
-
-def test_pyproject_resolver_src_layout_fallback(tmp_path: Path):
-    (tmp_path / "src").mkdir()
-    (tmp_path / "pyproject.toml").write_text('[project]\nname = "x"\n')
-
-    result = PyprojectResolver().resolve(tmp_path)
-    assert result == {(tmp_path / "src").resolve(): []}
-
-
-def test_pyproject_resolver_no_pyproject(tmp_path: Path):
-    assert PyprojectResolver().resolve(tmp_path) == {}
-
-
-def test_merge_paths_unions_deps():
-    base = Path("/a")
-    d1 = Path("/b")
-    d2 = Path("/c")
-    result = merge_paths({base: [d1]}, {base: [d2]}, {base: [d1]})
-    assert result == {base: [d1, d2]}
-
-
-def test_merge_paths_drops_self():
-    base = Path("/a")
-    result = merge_paths({base: [base]})
-    assert result == {base: []}
+from dead_cst import UvWorkspaceResolver
 
 
 def _write_uv_workspace(tmp_path: Path, *, with_src: bool = True) -> None:
@@ -197,130 +121,6 @@ def test_uv_workspace_resolver_explicit_lock_path(tmp_path: Path):
     assert result  # non-empty -- lock_path override took effect
 
 
-def test_exported_roots_no_pyproject(tmp_path: Path):
-    assert exported_roots(tmp_path) is None
-
-
-def test_exported_roots_src_layout_overrides_backend(tmp_path: Path):
-    (tmp_path / "src").mkdir()
-    (tmp_path / "pyproject.toml").write_text(
-        textwrap.dedent("""
-            [project]
-            name = "x"
-            [build-system]
-            build-backend = "hatchling.build"
-            [tool.hatch.build.targets.wheel]
-            packages = ["should_be_ignored"]
-        """).strip()
-    )
-    assert exported_roots(tmp_path) == [(tmp_path / "src").resolve()]
-
-
-def test_exported_roots_hatch_packages(tmp_path: Path):
-    (tmp_path / "pyproject.toml").write_text(
-        textwrap.dedent("""
-            [project]
-            name = "x"
-            [build-system]
-            build-backend = "hatchling.build"
-            [tool.hatch.build.targets.wheel]
-            packages = ["foo", "bar"]
-        """).strip()
-    )
-    assert exported_roots(tmp_path) == [
-        (tmp_path / "foo").resolve(),
-        (tmp_path / "bar").resolve(),
-    ]
-
-
-def test_exported_roots_setuptools_packages(tmp_path: Path):
-    (tmp_path / "pyproject.toml").write_text(
-        textwrap.dedent("""
-            [project]
-            name = "x"
-            [build-system]
-            build-backend = "setuptools.build_meta"
-            [tool.setuptools]
-            packages = ["foo", "foo.bar"]
-        """).strip()
-    )
-    assert exported_roots(tmp_path) == [
-        (tmp_path / "foo").resolve(),
-        (tmp_path / "foo" / "bar").resolve(),
-    ]
-
-
-def test_exported_roots_poetry_packages(tmp_path: Path):
-    (tmp_path / "pyproject.toml").write_text(
-        textwrap.dedent("""
-            [project]
-            name = "x"
-            [build-system]
-            build-backend = "poetry.core.masonry.api"
-            [[tool.poetry.packages]]
-            include = "foo"
-            from = "lib"
-        """).strip()
-    )
-    assert exported_roots(tmp_path) == [(tmp_path / "lib" / "foo").resolve()]
-
-
-def test_exported_roots_flit_module(tmp_path: Path):
-    (tmp_path / "pyproject.toml").write_text(
-        textwrap.dedent("""
-            [project]
-            name = "x"
-            [build-system]
-            build-backend = "flit_core.buildapi"
-            [tool.flit.module]
-            name = "foo"
-        """).strip()
-    )
-    assert exported_roots(tmp_path) == [(tmp_path / "foo").resolve()]
-
-
-def test_exported_roots_name_match_fallback(tmp_path: Path):
-    (tmp_path / "my_pkg").mkdir()
-    (tmp_path / "my_pkg" / "__init__.py").write_text("")
-    (tmp_path / "tests").mkdir()
-    (tmp_path / "tests" / "__init__.py").write_text("")
-    (tmp_path / "pyproject.toml").write_text(
-        textwrap.dedent("""
-            [project]
-            name = "my-pkg"
-            [build-system]
-            build-backend = "hatchling.build"
-        """).strip()
-    )
-    # Hyphen in [project].name normalizes to underscore for the dir match.
-    assert exported_roots(tmp_path) == [(tmp_path / "my_pkg").resolve()]
-
-
-def test_exported_roots_name_match_requires_init_py(tmp_path: Path):
-    (tmp_path / "my_pkg").mkdir()  # no __init__.py
-    (tmp_path / "pyproject.toml").write_text(
-        textwrap.dedent("""
-            [project]
-            name = "my_pkg"
-            [build-system]
-            build-backend = "hatchling.build"
-        """).strip()
-    )
-    assert exported_roots(tmp_path) is None
-
-
-def test_exported_roots_unknown_backend_with_no_match_returns_none(tmp_path: Path):
-    (tmp_path / "pyproject.toml").write_text(
-        textwrap.dedent("""
-            [project]
-            name = "x"
-            [build-system]
-            build-backend = "some.unknown.backend"
-        """).strip()
-    )
-    assert exported_roots(tmp_path) is None
-
-
 def test_uv_workspace_flat_layout_with_tests_dirs(tmp_path: Path):
     """Regression for the AssertionError in the issue: two members with
     ``tests/`` packages used to collide when their tries were merged.
@@ -414,14 +214,3 @@ def test_uv_workspace_flat_layout_with_tests_dirs(tmp_path: Path):
         if n.type == "import" and n.path == (pkg_a / "pkg_a" / "app.py").resolve()
     )
     assert graph.has_edge(app_import, mod_y)
-
-
-def test_load_resolver_known():
-    assert isinstance(load_resolver("venv"), VenvResolver)
-    assert isinstance(load_resolver("pyproject"), PyprojectResolver)
-    assert isinstance(load_resolver("uv_workspace"), UvWorkspaceResolver)
-
-
-def test_load_resolver_unknown_raises():
-    with pytest.raises(KeyError):
-        load_resolver("does-not-exist")
