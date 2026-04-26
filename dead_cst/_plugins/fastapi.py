@@ -178,9 +178,7 @@ def _is_name(node: cst.CSTNode | None, value: str) -> bool:
     return isinstance(node, cst.Name) and node.value == value
 
 
-def _find_instances(
-    module: cst.Module, fastapi_imports: dict[str, str]
-) -> dict[str, str]:
+def _find_instances(module: cst.Module, fastapi_imports: dict[str, str]) -> dict[str, str]:
     """Return ``{var_name: 'FastAPI' | 'APIRouter'}`` for top-level instances."""
     instances: dict[str, str] = {}
     for stmt in module.body:
