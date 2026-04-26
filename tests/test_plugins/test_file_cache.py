@@ -1,4 +1,4 @@
-"""Tests for :class:`FileTextCache` and the ``ctx.grep`` plugin surface."""
+"""Tests for :class:`FileTextCache` and the ``ctx.grep`` / ``ctx.parse`` surface."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
+import libcst as cst
 import networkx as nx
 
 from dead_cst import (
@@ -117,6 +118,90 @@ class _RecordingPlugin:
         for path in ctx.grep("__main__"):
             self.seen.append(path)
         return ()
+
+
+def test_file_text_cache_parse_returns_module(tmp_path):
+    p = tmp_path / "a.py"
+    p.write_text("def f(): pass\n")
+    cache = FileTextCache([p])
+    module = cache.parse(p)
+    assert isinstance(module, cst.Module)
+    assert "def f()" in module.code
+
+
+def test_file_text_cache_parse_caches(tmp_path):
+    p = tmp_path / "a.py"
+    p.write_text("def f(): pass\n")
+    cache = FileTextCache([p])
+    first = cache.parse(p)
+    p.write_text("def g(): pass\n")
+    # Second call returns the same cached module instance, not a re-parse.
+    assert cache.parse(p) is first
+
+
+def test_file_text_cache_parse_handles_syntax_error(tmp_path):
+    p = tmp_path / "broken.py"
+    p.write_text("def : pass\n")  # syntactically invalid
+    cache = FileTextCache([p])
+    assert cache.parse(p) is None
+    # Failure is also cached -- second call should not re-attempt.
+    assert cache.parse(p) is None
+
+
+def test_file_text_cache_prime_module_skips_reparse(tmp_path):
+    p = tmp_path / "a.py"
+    p.write_text("def f(): pass\n")
+    sentinel = cst.parse_module("def sentinel(): pass\n")
+    cache = FileTextCache([p])
+    cache.prime_module(p, sentinel)
+    # Disk content differs, but the primed module wins.
+    assert cache.parse(p) is sentinel
+
+
+def test_plugin_context_parse_delegates_to_cache(tmp_path):
+    p = tmp_path / "a.py"
+    p.write_text("x = 1\n")
+    cache = FileTextCache([p])
+    ctx = PluginContext(
+        graph=nx.DiGraph(),
+        symbol_lookup=SymbolTrie(),
+        paths={tmp_path: []},
+        project_root=tmp_path,
+        file_cache=cache,
+    )
+    module = ctx.parse(p)
+    assert module is cache.parse(p)
+
+
+def test_analyze_primes_cache_with_parsed_modules(tmp_path, write_files):
+    """build_symbol_graph hands plugins the modules it already parsed."""
+    write_files({"pkg/__init__.py": "", "pkg/a.py": "def f(): pass"})
+    seen: dict[Path, cst.Module] = {}
+
+    @dataclass
+    class _Capture:
+        name: str = "capture"
+        cst_aware: bool = True
+
+        def contribute(self, ctx: PluginContext, managers) -> Iterable[GraphOp]:
+            for path in ctx.file_cache.paths:
+                module = ctx.parse(path)
+                assert module is not None
+                seen[path] = module
+            return ()
+
+    build_symbol_graph(
+        {tmp_path: []},
+        plugins=[_Capture()],
+        project_root=tmp_path,
+    )
+    # Every analyzed file should have a primed module the plugin saw.
+    expected_names = {"__init__.py", "a.py"}
+    assert {p.name for p in seen} == expected_names
+    # And rewriting the file on disk after the analyze pass shouldn't
+    # affect the cached module the plugin received.
+    a_path = next(p for p in seen if p.name == "a.py")
+    assert "def f()" in seen[a_path].code
 
 
 def test_grep_prefilter_skips_unrelated_modules(tmp_path, write_files):

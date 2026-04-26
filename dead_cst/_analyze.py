@@ -2,6 +2,7 @@ import logging
 from pathlib import Path
 from typing import Sequence
 
+import libcst as cst
 import networkx as nx
 from libcst.metadata import FullRepoManager
 
@@ -90,6 +91,9 @@ def build_symbol_graph(
     export_tries: dict[Path, SymbolTrie] = {}
     base_managers: dict[Path, FullRepoManager] = {}
     all_files: list[Path] = []
+    # Hand each parsed module to the plugin file cache so plugins don't
+    # have to re-parse. Only collected when there are plugins to feed.
+    parsed_modules: dict[Path, cst.Module] | None = {} if plugins else None
     symbol_lookup: SymbolTrie = SymbolTrie()
     for base in order_paths(paths):
         logger.debug("Processing base path: %s", base)
@@ -106,6 +110,8 @@ def build_symbol_graph(
             all_files.extend(files)
             for file in files:
                 wrapper = mgr.get_metadata_wrapper_for_path(file)
+                if parsed_modules is not None:
+                    parsed_modules[file] = wrapper.module
                 visitor = SymbolVisitor(file, search_paths)
                 wrapper.visit(visitor)
                 # A file's decls go into ``export_trie`` only when the file
@@ -178,12 +184,16 @@ def build_symbol_graph(
 
     if plugins:
         root = project_root or _infer_project_root(paths)
+        file_cache = FileTextCache(all_files)
+        if parsed_modules is not None:
+            for path, module in parsed_modules.items():
+                file_cache.prime_module(path, module)
         ctx = PluginContext(
             graph=symbol_graph,
             symbol_lookup=symbol_lookup,
             paths=paths,
             project_root=root,
-            file_cache=FileTextCache(all_files),
+            file_cache=file_cache,
         )
         for plugin in plugins:
             if isinstance(plugin, CSTAwareEdgePlugin):

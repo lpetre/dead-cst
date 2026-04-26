@@ -22,9 +22,9 @@ class MainBlockPlugin:
     module. The module's existing internal edges (collected by the regular
     visitor) then keep every symbol referenced in the block reachable.
 
-    This is a :class:`CSTAwareEdgePlugin` so it can reuse the
-    :class:`FullRepoManager` instances the analyzer already built rather than
-    re-parsing files.
+    This is a :class:`CSTAwareEdgePlugin` so it can reach modules through
+    :meth:`PluginContext.parse`; the analyzer pre-populates that cache with
+    the modules it already parsed during the visitor pass.
     """
 
     name: str = "main_block"
@@ -40,26 +40,17 @@ class MainBlockPlugin:
 
         # Cheap prefilter: a module without the literal ``__main__`` text
         # cannot have a main block, so skip parsing it entirely.
-        candidate_paths = set(ctx.grep("__main__", paths=modules_by_path.keys()))
-
-        for base, mgr in managers.items():
-            for path, module_node in modules_by_path.items():
-                if path not in candidate_paths:
-                    continue
-                if not path.is_relative_to(base):
-                    continue
-                try:
-                    wrapper = mgr.get_metadata_wrapper_for_path(path)
-                except Exception:
-                    continue
-                if not _has_main_block(wrapper.module):
-                    continue
-                synth = synthetic_node(
-                    fqname=f"<__main__>:{module_node.fqname}",
-                    path=path,
-                )
-                yield AddNode(synth, entrypoint=True)
-                yield AddEdge(synth, module_node)
+        for path in ctx.grep("__main__", paths=modules_by_path.keys()):
+            module = ctx.parse(path)
+            if module is None or not _has_main_block(module):
+                continue
+            module_node = modules_by_path[path]
+            synth = synthetic_node(
+                fqname=f"<__main__>:{module_node.fqname}",
+                path=path,
+            )
+            yield AddNode(synth, entrypoint=True)
+            yield AddEdge(synth, module_node)
 
 
 def _has_main_block(module: cst.Module) -> bool:

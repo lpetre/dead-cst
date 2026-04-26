@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Iterator, Protocol, Union, runtime_checkable
 
+import libcst as cst
 import networkx as nx
 from libcst.metadata import CodePosition, CodeRange, FullRepoManager
 
@@ -22,22 +23,31 @@ SYNTHETIC_POSITION = CodeRange(start=CodePosition(0, 0), end=CodePosition(0, 0))
 
 
 class FileTextCache:
-    """Lazy byte-level text cache over a fixed set of files.
+    """Lazy file-level cache plugins share across a single analysis run.
 
-    Plugins use this to skip files that obviously can't match before
-    paying the cost of parsing the CST or walking it. The set of files
-    over which :meth:`grep` iterates by default is fixed at construction
-    -- normally every ``.py`` file the analyzer just processed -- but
-    individual reads accept arbitrary paths and cache them too.
+    Stores two things per path:
 
-    Files are read on first access and the bytes retained, so the
-    common pattern (each plugin greps once for its keyword) only ever
-    touches the disk once per file across the whole plugin pass.
+    * raw bytes for cheap substring/regex prefiltering (:meth:`grep`,
+      :meth:`contains`), and
+    * the parsed :class:`libcst.Module` (:meth:`parse`).
+
+    libcst's :class:`~libcst.metadata.FullRepoManager` re-reads and
+    re-parses on every ``get_metadata_wrapper_for_path`` call, so without
+    this cache each CST-aware plugin would re-parse every module it
+    touches. The analyzer hands its own parsed modules to the cache via
+    :meth:`prime_module` during the visitor pass, which means by the
+    time plugins run the cache is already populated and the plugin pass
+    does no parsing at all in the common case.
+
+    The default iteration set for :meth:`grep` is fixed at construction
+    (typically every ``.py`` file the analyzer just processed); reads of
+    arbitrary other paths still work and are cached too.
     """
 
     def __init__(self, paths: Iterable[Path] = ()) -> None:
         self._paths: tuple[Path, ...] = tuple(paths)
         self._content: dict[Path, bytes] = {}
+        self._modules: dict[Path, cst.Module | None] = {}
 
     @property
     def paths(self) -> tuple[Path, ...]:
@@ -87,6 +97,35 @@ class FileTextCache:
             if pattern in self.read(p):
                 yield p
 
+    def prime_module(self, path: Path, module: cst.Module) -> None:
+        """Record an already-parsed module so :meth:`parse` skips re-parsing.
+
+        Used by the analyzer to share the modules it parsed during the
+        visitor pass with downstream plugins. Subsequent calls overwrite
+        the previous entry (last write wins), which matters only if the
+        same path is registered under multiple bases -- in practice the
+        analyzer parses each file exactly once.
+        """
+        self._modules[path] = module
+
+    def parse(self, path: Path) -> cst.Module | None:
+        """Return the parsed :class:`libcst.Module` for ``path``.
+
+        On first access the file is read (via :meth:`read`) and parsed;
+        the result is cached. ``None`` is returned for files that cannot
+        be read or parsed, and the failure is also cached so a flaky
+        file isn't re-attempted.
+        """
+        if path in self._modules:
+            return self._modules[path]
+        text = self.read(path)
+        try:
+            module = cst.parse_module(text)
+        except cst.ParserSyntaxError:
+            module = None
+        self._modules[path] = module
+        return module
+
 
 @dataclass
 class PluginContext:
@@ -126,6 +165,16 @@ class PluginContext:
     ) -> Iterator[Path]:
         """Yield paths whose contents match ``pattern`` (see :meth:`FileTextCache.grep`)."""
         return self.file_cache.grep(pattern, paths=paths)
+
+    def parse(self, path: Path) -> cst.Module | None:
+        """Return the parsed :class:`libcst.Module` for ``path``, cached.
+
+        Convenience shortcut for ``self.file_cache.parse(path)``. The
+        analyzer primes the cache with modules it already parsed during
+        the visitor pass, so for any file under the analyzed bases this
+        returns immediately without re-parsing.
+        """
+        return self.file_cache.parse(path)
 
 
 @dataclass(frozen=True)

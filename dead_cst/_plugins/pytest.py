@@ -75,10 +75,10 @@ class PytestPlugin:
 
             if path not in fixture_candidates:
                 continue
-            wrapper = _wrapper_for(path, managers)
-            if wrapper is None:
+            module = ctx.parse(path)
+            if module is None:
                 continue
-            fixture_names = _find_fixture_names(wrapper.module)
+            fixture_names = _find_fixture_names(module)
             if not fixture_names:
                 continue
             fixture_decls = [
@@ -111,17 +111,6 @@ def _mark_entrypoints(seed_fqname: str, path: Path, targets: list[SymbolNode]) -
     yield AddNode(synth, entrypoint=True)
     for target in targets:
         yield AddEdge(synth, target)
-
-
-def _wrapper_for(path: Path, managers: dict[Path, FullRepoManager]):
-    for base, mgr in managers.items():
-        if not path.is_relative_to(base):
-            continue
-        try:
-            return mgr.get_metadata_wrapper_for_path(path)
-        except Exception:
-            return None
-    return None
 
 
 def _find_fixture_names(module: cst.Module) -> set[str]:

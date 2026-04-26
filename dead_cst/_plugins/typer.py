@@ -81,22 +81,19 @@ class TyperPlugin:
         # Cheap prefilter: importing Typer requires the literal ``typer``
         # substring somewhere in the file. Modules that lack it can't be
         # candidates and are skipped without a CST walk.
-        candidate_paths = set(ctx.grep("typer", paths=modules_by_path.keys()))
-
-        for path, module_node in modules_by_path.items():
-            if path not in candidate_paths:
+        for path in ctx.grep("typer", paths=modules_by_path.keys()):
+            module = ctx.parse(path)
+            if module is None:
                 continue
-            wrapper = _wrapper_for(path, managers)
-            if wrapper is None:
-                continue
-            typer_imports = _collect_typer_imports(wrapper.module)
+            typer_imports = _collect_typer_imports(module)
             if not typer_imports:
                 continue
-            instances = _find_instances(wrapper.module, typer_imports)
+            instances = _find_instances(module, typer_imports)
             if not instances:
                 continue
-            handlers = _find_handlers(wrapper.module, instances)
+            handlers = _find_handlers(module, instances)
 
+            module_node = modules_by_path[path]
             module_fqname = module_node.fqname
             for var_name in instances:
                 instance_decls = ctx.find_declarations(f"{module_fqname}.{var_name}")
@@ -108,17 +105,6 @@ class TyperPlugin:
                             f"{module_fqname}.{handler_name}"
                         ):
                             yield AddEdge(instance_decl, handler_decl)
-
-
-def _wrapper_for(path: Path, managers: dict[Path, FullRepoManager]):
-    for base, mgr in managers.items():
-        if not path.is_relative_to(base):
-            continue
-        try:
-            return mgr.get_metadata_wrapper_for_path(path)
-        except Exception:
-            return None
-    return None
 
 
 def _collect_typer_imports(module: cst.Module) -> dict[str, str]:
