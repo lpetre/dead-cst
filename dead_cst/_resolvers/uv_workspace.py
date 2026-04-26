@@ -12,9 +12,16 @@ class UvWorkspaceResolver:
     together using uv's resolved dependency graph.
 
     For each ``[[package]]`` entry whose ``source`` is ``{ editable = "..." }``
-    -- uv's marker for a workspace member -- emit one :class:`PathMap` entry::
+    or ``{ virtual = "..." }`` -- uv's two markers for a workspace member --
+    emit one :class:`PathMap` entry::
 
         {member_src_root: [direct_workspace_dep_src_roots]}
+
+    ``editable`` members are installable distributions; ``virtual`` members
+    are runnable apps/services that aren't shipped as wheels. Both are
+    first-party code that needs to be analyzed. The workspace root itself
+    (``virtual = "."``) is skipped -- it's a container that holds
+    ``[tool.uv.workspace]``, not a member.
 
     The src root for a member is ``<member_dir>/src`` if that directory
     exists, else ``<member_dir>`` itself (matching the convention
@@ -48,11 +55,16 @@ class UvWorkspaceResolver:
         member_deps: dict[str, list[str]] = {}
         for pkg in data.get("package", []):
             source = pkg.get("source") or {}
-            editable = source.get("editable")
-            if editable is None:
+            location = source.get("editable") or source.get("virtual")
+            if location is None:
+                continue
+            member_dir = (project_root / location).resolve()
+            # The workspace root itself appears as ``virtual = "."``; it's a
+            # container for ``[tool.uv.workspace]``, not a member to analyze.
+            if member_dir == project_root:
                 continue
             name = pkg["name"]
-            member_dirs[name] = (project_root / editable).resolve()
+            member_dirs[name] = member_dir
             member_deps[name] = [d["name"] for d in pkg.get("dependencies", [])]
 
         out: PathMap = {}
