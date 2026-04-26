@@ -97,7 +97,14 @@ class FastAPIPlugin:
             if node.type == "module":
                 modules_by_path[node.path] = node
 
+        # Cheap prefilter: importing FastAPI / APIRouter requires the literal
+        # ``fastapi`` substring somewhere in the file. Modules that lack it
+        # can't be candidates and are skipped without a CST walk.
+        candidate_paths = set(ctx.grep("fastapi", paths=modules_by_path.keys()))
+
         for path, module_node in modules_by_path.items():
+            if path not in candidate_paths:
+                continue
             wrapper = _wrapper_for(path, managers)
             if wrapper is None:
                 continue

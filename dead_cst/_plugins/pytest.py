@@ -54,6 +54,11 @@ class PytestPlugin:
             elif node.type in ("function", "class", "variable"):
                 decls_by_path.setdefault(node.path, []).append(node)
 
+        # Cheap prefilter for the fixture branch: ``@pytest.fixture`` /
+        # ``@fixture`` decorators always include the literal ``fixture``
+        # substring, so any file that doesn't can skip the CST walk below.
+        fixture_candidates = set(ctx.grep("fixture", paths=modules_by_path.keys()))
+
         for path, module_node in modules_by_path.items():
             module_decls = decls_by_path.get(path, [])
             filename = path.name
@@ -68,6 +73,8 @@ class PytestPlugin:
                     f"<pytest:tests>:{module_node.fqname}", path, test_decls
                 )
 
+            if path not in fixture_candidates:
+                continue
             wrapper = _wrapper_for(path, managers)
             if wrapper is None:
                 continue

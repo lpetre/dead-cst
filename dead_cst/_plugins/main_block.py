@@ -38,8 +38,14 @@ class MainBlockPlugin:
             if node.type == "module":
                 modules_by_path[node.path] = node
 
+        # Cheap prefilter: a module without the literal ``__main__`` text
+        # cannot have a main block, so skip parsing it entirely.
+        candidate_paths = set(ctx.grep("__main__", paths=modules_by_path.keys()))
+
         for base, mgr in managers.items():
             for path, module_node in modules_by_path.items():
+                if path not in candidate_paths:
+                    continue
                 if not path.is_relative_to(base):
                     continue
                 try:

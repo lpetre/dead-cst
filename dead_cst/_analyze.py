@@ -9,6 +9,7 @@ from ._fqn import FixedFullyQualifiedNameProvider
 from ._plugins import (
     CSTAwareEdgePlugin,
     EdgePlugin,
+    FileTextCache,
     PluginContext,
     apply_ops,
 )
@@ -88,6 +89,7 @@ def build_symbol_graph(
     base_tries: dict[Path, SymbolTrie] = {}
     export_tries: dict[Path, SymbolTrie] = {}
     base_managers: dict[Path, FullRepoManager] = {}
+    all_files: list[Path] = []
     symbol_lookup: SymbolTrie = SymbolTrie()
     for base in order_paths(paths):
         logger.debug("Processing base path: %s", base)
@@ -101,6 +103,7 @@ def build_symbol_graph(
             files = list(sorted(base.rglob("*.py")))
             mgr = FullRepoManager(base, files, {FixedFullyQualifiedNameProvider})
             base_managers[base] = mgr
+            all_files.extend(files)
             for file in files:
                 wrapper = mgr.get_metadata_wrapper_for_path(file)
                 visitor = SymbolVisitor(file, search_paths)
@@ -180,6 +183,7 @@ def build_symbol_graph(
             symbol_lookup=symbol_lookup,
             paths=paths,
             project_root=root,
+            file_cache=FileTextCache(all_files),
         )
         for plugin in plugins:
             if isinstance(plugin, CSTAwareEdgePlugin):
