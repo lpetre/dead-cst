@@ -24,6 +24,14 @@ class OutputFormat(str, Enum):
     json = "json"
 
 
+def _is_module_dunder(node: SymbolNode) -> bool:
+    """True for module-level variables named like ``__xxx__`` (e.g. ``__version__``)."""
+    if node.type != "variable":
+        return False
+    name = node.fqname.rpartition(".")[2]
+    return len(name) > 4 and name.startswith("__") and name.endswith("__")
+
+
 def setup_logging(verbose: bool) -> None:
     level = logging.DEBUG if verbose else logging.WARNING
     logging.basicConfig(
@@ -93,7 +101,10 @@ def analyze(
         Optional[list[str]],
         typer.Option("-p", "--path", help="Search path spec: 'base:dep1,dep2' or 'base'."),
     ] = None,
-    preserve_dunder_all: Annotated[bool, typer.Option(help="Keep __all__ variables alive.")] = True,
+    preserve_dunders: Annotated[
+        bool,
+        typer.Option(help="Keep module-level dunder variables (e.g. __all__, __version__) alive."),
+    ] = True,
     verbose: Annotated[
         bool, typer.Option("-v", "--verbose", help="Enable verbose output.")
     ] = False,
@@ -113,9 +124,9 @@ def analyze(
     eps = [parse_entrypoint(ep) for ep in entrypoint]
     reachable = find_reachable(graph, root, eps)
 
-    if preserve_dunder_all:
+    if preserve_dunders:
         for node in graph.nodes:
-            if node.fqname.endswith("__all__") and node.type == "variable":
+            if _is_module_dunder(node):
                 reachable.add(node)
 
     unreachable_graph = graph.subgraph([n for n in graph.nodes if n not in reachable])
@@ -265,7 +276,10 @@ def remove(
         Optional[list[str]],
         typer.Option("-p", "--path", help="Search path spec: 'base:dep1,dep2' or 'base'."),
     ] = None,
-    preserve_dunder_all: Annotated[bool, typer.Option(help="Keep __all__ variables alive.")] = True,
+    preserve_dunders: Annotated[
+        bool,
+        typer.Option(help="Keep module-level dunder variables (e.g. __all__, __version__) alive."),
+    ] = True,
     verbose: Annotated[
         bool, typer.Option("-v", "--verbose", help="Enable verbose output.")
     ] = False,
@@ -285,9 +299,9 @@ def remove(
     eps = [parse_entrypoint(ep) for ep in entrypoint]
     reachable = find_reachable(graph, root, eps)
 
-    if preserve_dunder_all:
+    if preserve_dunders:
         for node in graph.nodes:
-            if node.fqname.endswith("__all__") and node.type == "variable":
+            if _is_module_dunder(node):
                 reachable.add(node)
 
     unreachable_graph = graph.subgraph([n for n in graph.nodes if n not in reachable])
