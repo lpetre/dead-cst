@@ -163,6 +163,22 @@ A module-level `import` / `from ... import ...` is itself a declaration of type 
 - PEP 695 `type` statements are not tracked.
 - `__all__` is followed only when assigned a list/tuple of string literals; dynamic mutation (`__all__.append`, comprehensions, etc.) is not tracked.
 
+## Development
+
+```bash
+git clone https://github.com/lpetre/dead-cst
+cd dead-cst
+uv sync
+uv run pytest
+uv run pre-commit run --all-files
+```
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full dev guide, [`CHANGELOG.md`](CHANGELOG.md) for release notes, and [`ROADMAP.md`](ROADMAP.md) for the stack-ranked plan toward 1.0.
+
 ## TODO
 
 - Host API documentation on Read the Docs.
+
+## License
+
+MIT — see [`LICENSE`](LICENSE).

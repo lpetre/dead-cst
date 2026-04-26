@@ -21,6 +21,14 @@ logger = logging.getLogger(__name__)
 
 
 def order_paths(paths: dict[Path, list[Path]]) -> list[Path]:
+    """Topologically sort base paths so dependencies are processed first.
+
+    ``paths`` maps each base directory to the list of other base directories
+    it imports from (added to ``sys.path`` while it is processed). The
+    returned order ensures that when a base is processed every base it
+    depends on has already contributed its symbols to the lookup tables, so
+    cross-package import resolution sees them.
+    """
     path_order = nx.DiGraph()
     for base, search_paths in paths.items():
         path_order.add_node(base)
@@ -35,6 +43,47 @@ def build_symbol_graph(
     plugins: Sequence[EdgePlugin | CSTAwareEdgePlugin] = (),
     project_root: Path | None = None,
 ) -> nx.DiGraph:
+    """Build a directed reachability graph of every top-level symbol under ``paths``.
+
+    Each ``.py`` file under each base in ``paths`` is parsed with LibCST;
+    modules, classes, functions, top-level variables, and module-level imports
+    become :class:`SymbolNode` graph nodes. Edges encode "keeps alive"
+    relationships:
+
+    * a reference points at its referent,
+    * a declaration points at its containing module,
+    * a submodule points at its parent package, and
+    * synthetic ``unreachable`` nodes own edges into symbols referenced from
+      statically-dead suites (``if False:``, ``raise``-only branches, ...) so
+      those references don't keep the targets alive.
+
+    Third-party imports are surfaced as synthetic ``[external dist] <name>``
+    / ``[external file] <name>`` nodes so callers can audit the
+    project's dependency surface (see the ``dependencies`` CLI command).
+
+    Parameters
+    ----------
+    paths:
+        Mapping from base directory to its first-party search-path
+        dependencies. For a single-package project, pass ``{root: []}``. For
+        a monorepo, list the dependencies so they're added to ``sys.path``
+        and resolved as first-party. ``order_paths`` orders the bases.
+    plugins:
+        Sequence of :class:`EdgePlugin` / :class:`CSTAwareEdgePlugin`
+        instances run after analysis. Plugins emit :class:`AddNode`,
+        :class:`AddEdge`, and :class:`RemoveEdge` ops; ``AddNode(...,
+        entrypoint=True)`` seeds :func:`find_reachable`.
+    project_root:
+        Project root used by plugins for path-relative matching and for
+        locating ``pyproject.toml``. If omitted, inferred as the shortest
+        path in ``paths``.
+
+    Returns
+    -------
+    networkx.DiGraph
+        Nodes are :class:`SymbolNode` instances; entrypoint seeds carry
+        ``graph.nodes[node]["entrypoint"] = True``.
+    """
     symbol_graph = nx.DiGraph()
     base_tries: dict[Path, SymbolTrie] = {}
     export_tries: dict[Path, SymbolTrie] = {}
@@ -182,6 +231,14 @@ def find_reachable(graph: nx.DiGraph) -> set[SymbolNode]:
 
 
 def count_nodes(graph: nx.DiGraph, prefix: Path | None) -> dict[str, int]:
+    """Count nodes in ``graph`` by ``SymbolNode.type``, optionally restricted by path.
+
+    If ``prefix`` is given, only nodes whose ``path`` is under ``prefix`` are
+    counted -- useful for per-base summaries when several packages are
+    analysed together. Includes the synthetic ``"synthetic"`` type contributed
+    by plugins and third-party-dep markers; the CLI suppresses that key when
+    rendering summaries.
+    """
     counts = {}
     for node in graph.nodes:
         if prefix and not node.path.is_relative_to(prefix):
