@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Literal
 
 import networkx as nx
+from libcst.metadata import CodeRange
 
 
 @dataclass(frozen=True, slots=True)
@@ -17,8 +18,9 @@ class Import:
 @dataclass(frozen=True, slots=True)
 class SymbolNode:
     fqname: str
-    type: Literal["module", "class", "function", "variable", "import"]
+    type: Literal["module", "class", "function", "variable", "import", "synthetic"]
     path: Path
+    position: CodeRange
     imports: Import | None = None
 
 
@@ -35,12 +37,29 @@ class SymbolTrie:
     # Module information at this node (if this represents an actual module)
     module: SymbolNode | None = None
 
-    # Declarations in this module (classes, functions, variables, imports)
-    # Keyed by the simple name (not fully qualified)
-    declarations: dict[str, SymbolNode] = field(default_factory=dict)
+    # Declarations in this module, keyed by simple name. A name maps to the
+    # set of decls live at module exit: usually one decl, but multiple when
+    # every branch of a conditional binds the same name (``if X: def f...
+    # else: def f...``). All branches are legitimate runtime values and a
+    # ``from mod import name`` should reach each of them.
+    declarations: dict[str, list[SymbolNode]] = field(default_factory=dict)
+
+    # Decls strictly displaced by a later same-name decl on every path to
+    # module exit. They still belong to this module -- the symbol graph
+    # needs them so the ``decl -> module`` parent edge is emitted for
+    # shadowed decls too -- but they are not exported.
+    shadowed: list[SymbolNode] = field(default_factory=list)
 
     def add_declaration(self, decl: SymbolNode) -> None:
-        """Add a declaration to the trie."""
+        """Add a declaration to the trie.
+
+        For non-module decls this just collects: the trie does not yet
+        know which decls are live at module exit. ``finalize_declarations``
+        partitions same-name decls into ``declarations`` (live exports)
+        and ``shadowed`` (strictly displaced). De-duplicates so the
+        visitor's double-push for ``Assign`` (one push for the LHS name,
+        one for the RHS value) does not register the same decl twice.
+        """
         parts = decl.fqname.split(".")
         match decl.type:
             case "module":
@@ -48,13 +67,33 @@ class SymbolTrie:
                 assert node.module is None, f"Module already exists at this node {decl.path}"
                 node.module = decl
             case _:
-                # Store declarations by their simple name
                 parent, child = parts[:-1], parts[-1]
                 node = self._touch(parent)
                 assert node.module is not None, (
                     f"Module should exist when adding {decl.type} {decl.fqname}"
                 )
-                node.declarations[child] = decl
+                bucket = node.declarations.setdefault(child, [])
+                if decl not in bucket:
+                    bucket.append(decl)
+
+    def finalize_declarations(
+        self,
+        name: str,
+        live: list[SymbolNode],
+        shadowed: list[SymbolNode],
+    ) -> None:
+        """Partition collected decls for ``name`` into live vs shadowed.
+
+        ``live`` is the set of decls that bind ``name`` on at least one
+        path to module exit. ``shadowed`` is the rest. The caller is
+        expected to derive both from a flow-sensitive walk of the
+        module body (see :func:`dead_cst._flow.live_at_exit`).
+        """
+        if live:
+            self.declarations[name] = list(live)
+        else:
+            self.declarations.pop(name, None)
+        self.shadowed.extend(shadowed)
 
     def merge(self, other: SymbolTrie) -> SymbolTrie:
         """Merge another SymbolTrie into this one."""
@@ -67,7 +106,8 @@ class SymbolTrie:
         if other.module:
             assert self.module is None, "Cannot merge module into a node that already has a module"
             self.module = other.module
-            self.declarations = other.declarations.copy()
+            self.declarations = {k: list(v) for k, v in other.declarations.items()}
+            self.shadowed = list(other.shadowed)
         return self
 
     def _touch(self, parts: list[str]) -> SymbolTrie:
