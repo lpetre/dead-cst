@@ -8,57 +8,58 @@ dead-code tool enough to run it on their codebase?** The architecture is in
 good shape; the gap to wide adoption is (a) trust that it won't flag legitimate
 code and (b) trust that the codemod won't break files. Tier 1 buys both.
 
+Items marked _shipped_ are kept here briefly for context — see `CHANGELOG.md`
+for the full record.
+
 ---
 
 ## Tier 1 — Trust and correctness
 
-### 1. Framework-aware plugin presets
+### 1. CLI integration tests
 
-The existential risk for any dead-code tool is "I tried it and it flagged half
-my codebase." `dead_cst/_plugins.py` already exposes the right protocol; ship
-opt-in presets for the common offenders:
-
-- pytest fixtures, marks, and `conftest.py` discovery
-- Click / Typer commands
-- FastAPI routes and dependencies
-- Django URLConf, admin registration, signal handlers
-- Pydantic validators and field serializers
-- `__init_subclass__`, `__set_name__`, dataclass `__post_init__`
-
-Surface as `--preset pytest,fastapi` and via entry points so third parties can
-publish their own. Highest-leverage adoption work.
-
-### 2. Codemod test coverage
-
-`dead_cst/_codemod.py` (81 LOC) modifies user files and is currently only
-exercised end-to-end. Add a focused test file covering:
-
-- Trailing-comma cleanup after partial removal
-- Decorator stripping
-- Leading / trailing blank-line normalization
-- Multi-line `import` and `from … import a, b, c` partial removal
-- Class body collapse when the last member is removed
-
-This is the highest-stakes module per LOC in the package.
-
-### 3. CLI integration tests
-
-`dead_cst/cli.py` is 443 LOC and untested. Cover the user-facing surface with
+`dead_cst/cli.py` is now 571 LOC and still untested. It is the largest
+untested surface in the package and the most user-visible. Cover it with
 `typer.testing.CliRunner`:
 
-- `analyze` text and JSON output
-- `remove` with `--dry-run` and actual writes
+- `analyze` text and JSON output (including unreachable branches and the
+  `--resolver` / `--plugin` flags)
+- `remove` with `--dry-run` and actual writes, including import pruning
 - `why-alive` predecessor tracing
-- Exit codes and stderr on parse errors
+- `unused-exports` and `dependencies` output
+- Exit codes and stderr on parse errors and missing inputs
 
-Cheap to write, catches the regressions users notice first.
+Cheap to write, catches the regressions users notice first. Highest-leverage
+trust work remaining.
 
-### 4. Resolve `from X import *`
+### 2. Finish the framework-aware plugin presets
 
-Tracked as a FIXME at `dead_cst/_visitor.py:334`. Star imports are silently
-skipped today, which causes false positives in any codebase that uses them.
-The symbol trie in `dead_cst/_symbols.py` already has the data needed —
-extend `dead_cst/_resolve.py` to expand stars at resolution time.
+`PytestPlugin` and `FastAPIPlugin` shipped, but the existential risk is still
+"I tried it and it flagged half my codebase." The remaining common offenders:
+
+- Click / Typer commands and groups
+- Django URLConf, admin registration, signal handlers, management commands
+- Pydantic validators and field serializers
+- Descriptor-style hooks: `__init_subclass__`, `__set_name__`, dataclass
+  `__post_init__`
+
+Surface a `--preset pytest,fastapi,django` shortcut that expands to the
+existing `--plugin` wiring, and document the entry-point group so third
+parties can publish their own.
+
+### 3. `if TYPE_CHECKING:` awareness
+
+Currently treated as live, which is safe but pessimistic. Tag imports inside
+`TYPE_CHECKING` blocks as type-only so removal is safe when the only
+references are themselves in type-only contexts (annotations, other
+`TYPE_CHECKING` blocks). The flow-sensitive filter (`_flow.py`) already
+distinguishes branches; this is mostly an edge-tagging change in
+`_resolve.py`. Low effort, visible win for typed codebases.
+
+### 4. `--continue-on-parse-error`
+
+A single broken file currently aborts the whole analysis, which is a
+non-starter for running in CI on large repos. Skip the file, log it, mark its
+declared symbols as live conservatively, and exit non-zero only at the end.
 
 ---
 
@@ -78,12 +79,11 @@ top-level `explain_reachability(graph, symbol)` that returns the path from an
 entrypoint to the symbol. Enables IDE plugins, custom dashboards, and richer
 error messages without re-implementing the BFS.
 
-### 7. `if TYPE_CHECKING:` awareness
+### 7. Coverage tracking in CI
 
-Currently treated as live, which is safe but pessimistic. Tag imports inside
-`TYPE_CHECKING` blocks as type-only so removal is safe when the only
-references are themselves in type-only contexts (annotations, other
-`TYPE_CHECKING` blocks). Low effort, visible win for typed codebases.
+Add codecov (or coveralls) to `.github/workflows/ci.yml` to establish a
+baseline and prevent silent regressions. Small, but the value compounds once
+Tier 1 lands and we want to defend the new test coverage.
 
 ---
 
@@ -94,20 +94,10 @@ references are themselves in type-only contexts (annotations, other
 The `EdgePlugin` and `PathResolver` protocols are well-designed but
 undiscovered. A short Sphinx site with one tutorial each ("write a custom
 `EdgePlugin`", "write a custom `PathResolver`") activates the extensibility
-that's already built. Replaces the existing single TODO line in `README.md`.
+that's already built. The docstring pass already in place gives the API
+reference for free.
 
-### 9. Coverage tracking + parser-error recovery
-
-Pair these:
-
-- Add codecov (or coveralls) to `.github/workflows/ci.yml` to establish a
-  baseline and prevent silent regressions.
-- Add `--continue-on-parse-error` so a single broken file doesn't abort the
-  whole analysis.
-
-Both are small; both pay off long-term.
-
-### 10. PEP 695 `type` statements and `del` modeling
+### 9. PEP 695 `type` statements and `del` modeling
 
 Documented limitations in `tests/test_limitations.py`. Low real-world impact;
 tackle once Tier 1–2 has shipped and the protocol surface is stable.
@@ -116,18 +106,34 @@ tackle once Tier 1–2 has shipped and the protocol surface is stable.
 
 ## Tier 4 — Speculative, wait for signal
 
-### 11. Incremental analysis
+### 10. Incremental analysis
 
 A real performance problem at 100k+ LOC, but the project isn't there yet. Adds
 substantial complexity (file-content hashing, partial graph rebuild,
 invalidation). Defer until a user reports it.
 
-### 12. Multiple reachability frontiers
+### 11. Multiple reachability frontiers
 
 Splitting "reachable from tests" vs. "reachable from production entrypoints"
 is interesting and would enable rules like "no production code reachable only
 from tests." But it's solving a problem nobody has reported yet. Wait for
 demand.
+
+---
+
+## Recently shipped
+
+Folded down from earlier tiers as they landed:
+
+- Codemod test coverage and import pruning (Tier 1).
+- `from X import *` resolution, pessimistic by default (Tier 1).
+- `PytestPlugin` and `FastAPIPlugin` (Tier 1, partial — see item 2).
+- `unused-exports` and `dependencies` CLI commands.
+- Unreachable-branch detection surfaced as synthetic graph nodes.
+- Workspace-aware cross-member import scoping via `exported_roots`.
+- Position-aware shadowing in the codemod.
+- `ModuleDundersPlugin` replacing `--preserve-dunder-all`.
+- Public-API docstring pass across the package.
 
 ---
 

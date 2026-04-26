@@ -1,5 +1,13 @@
 # dead-cst
 
+[![PyPI](https://img.shields.io/pypi/v/dead-cst.svg)](https://pypi.org/project/dead-cst/)
+[![Python](https://img.shields.io/pypi/pyversions/dead-cst.svg)](https://pypi.org/project/dead-cst/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![CI](https://github.com/lpetre/dead-cst/actions/workflows/ci.yml/badge.svg)](https://github.com/lpetre/dead-cst/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/lpetre/dead-cst/branch/main/graph/badge.svg)](https://codecov.io/gh/lpetre/dead-cst)
+[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+[![uv](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/uv/main/assets/badge/v0.json)](https://github.com/astral-sh/uv)
+
 Python dead code analysis using [libcst](https://github.com/Instagram/LibCST).
 
 `dead-cst` builds a full symbol graph of your Python codebase, walks from your entrypoints, and reports (or removes) anything unreachable.

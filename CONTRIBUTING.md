@@ -26,6 +26,35 @@ For a tight inner loop while editing the visitor, resolver, or a plugin, `pytest
 uv run ptw
 ```
 
+To collect coverage locally:
+
+```bash
+uv run pytest --cov=dead_cst --cov-branch --cov-report=term-missing
+```
+
+CI uploads branch coverage from the 3.13 matrix entry to Codecov on every push and PR.
+
+## Coverage policy
+
+Per-component thresholds reflect blast radius, not total LOC. The full
+configuration lives in `codecov.yml`; the targets are:
+
+| Component | Target | Why |
+|---|---|---|
+| `_codemod.py` | 95% | Rewrites user files. Regressions corrupt source. |
+| `cli.py` | 80% | User-visible trust surface. |
+| `_plugins/**` | 85% | Each plugin is a framework promise. |
+| `_resolvers/**` | 85% | Path resolution drives every analysis. |
+| `_analyze.py`, `_visitor.py`, `_resolve.py`, `_flow.py`, `_branches.py`, `_symbols.py`, `_fqn.py` | 80% | Analytical core. |
+
+Per-component statuses are **informational** until Tier 1 of `ROADMAP.md`
+(CLI integration tests, remaining framework presets) lands and the numbers
+clear the bars above. The patch-coverage gate on new code is **enforcing**
+at 90% — regressions are caught at the diff, not in aggregate.
+
+`if TYPE_CHECKING:` blocks, `@overload` stubs, and `_version.py` are
+excluded; see `[tool.coverage.*]` in `pyproject.toml`.
+
 ## Linting and formatting
 
 Ruff (lint + format) and a small set of pre-commit hooks run on every commit.

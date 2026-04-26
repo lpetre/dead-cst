@@ -32,7 +32,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.11", "3.12", "3.13"]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v6
         with:
@@ -44,4 +44,11 @@ jobs:
           enable-cache: true
           cache-dependency-glob: "**/uv.lock"
       - run: uv sync --frozen
-      - run: uv run pytest
+      - name: Run tests
+        run: uv run pytest ${{ matrix.python-version == '3.13' && '--cov=dead_cst --cov-branch --cov-report=xml' || '' }}
+      - name: Upload coverage to Codecov
+        if: matrix.python-version == '3.13'
+        uses: codecov/codecov-action@v5
+        with:
+          files: ./coverage.xml
+          fail_ci_if_error: false
