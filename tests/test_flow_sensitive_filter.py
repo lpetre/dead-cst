@@ -252,6 +252,23 @@ def test_straight_line_shadowing(
             # binding survives.
             id="for-loop-keeps-preloop-and-body",
         ),
+        pytest.param(
+            """
+            x = 1
+            try:
+                x = 2
+            finally:
+                x = 3
+            print(x)
+            """,
+            "x",
+            6,
+            [5],
+            # Regression: try/finally with a use-after used to crash
+            # because finalbody.body is the IndentedBlock itself.
+            # finally runs on every path, so its rebinding dominates.
+            id="try-finally-rebinding-dominates",
+        ),
     ],
 )
 def test_branches_preserved(src: str, name: str, access_line: int, expected: list[int]) -> None:

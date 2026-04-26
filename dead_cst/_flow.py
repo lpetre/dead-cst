@@ -102,7 +102,7 @@ def _walk_flow(
                     post - body_end
                 )
             if stmt.finalbody is not None:
-                post = _walk_flow(stmt.finalbody.body, post, referent_set, cache, observe)
+                post = _walk_flow(stmt.finalbody.body.body, post, referent_set, cache, observe)
             state = post
             continue
 
