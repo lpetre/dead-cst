@@ -118,6 +118,7 @@ Entrypoint detection is now fully plugin-driven. Builtins:
 | `ExplicitEntrypointPlugin` | Match user-supplied file paths / FQNs / regexes (powers the `-e` flag) |
 | `ModuleDundersPlugin` | Keep top-level dunder variables (`__all__`, `__version__`, etc.) alive (always on) |
 | `PytestPlugin` | Keep pytest-discovered tests, `conftest.py` decls, and `@pytest.fixture` functions alive (`--plugin pytest`) |
+| `FastAPIPlugin` | Keep FastAPI route handlers (`@app.get(...)`, `@router.post(...)`, etc.), websocket handlers, middleware, exception handlers, and `on_event` hooks alive (`--plugin fastapi`) |
 
 Write your own by implementing the `EdgePlugin` or `CSTAwareEdgePlugin` protocol; register under the `dead_cst.plugins` entry-point group for CLI discovery.
 
