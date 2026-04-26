@@ -214,3 +214,96 @@ def test_uv_workspace_flat_layout_with_tests_dirs(tmp_path: Path):
         if n.type == "import" and n.path == (pkg_a / "pkg_a" / "app.py").resolve()
     )
     assert graph.has_edge(app_import, mod_y)
+
+
+def test_uv_workspace_shared_namespace_package(tmp_path: Path):
+    """PEP 420 namespace shared across workspace members (Google-style monorepo).
+
+    Two distributions contribute submodules to the same top-level ``foo``
+    namespace -- ``foo-a`` ships ``foo/a/`` and ``foo-b`` ships ``foo/b/``,
+    with no ``foo/__init__.py`` in either. A cross-member import
+    ``from foo.a import value`` from inside ``foo.b`` must resolve through
+    PEP 420 namespace merging of the two ``foo/`` dirs on the search path.
+    """
+    from dead_cst import build_symbol_graph
+
+    (tmp_path / "pyproject.toml").write_text(
+        textwrap.dedent("""
+            [project]
+            name = "ws"
+            version = "0.1"
+            [tool.uv.workspace]
+            members = ["packages/*"]
+        """).strip()
+    )
+    (tmp_path / "uv.lock").write_text(
+        textwrap.dedent("""
+            version = 1
+            [[package]]
+            name = "foo-b"
+            version = "0.1"
+            source = { editable = "packages/foo-b" }
+            dependencies = [{ name = "foo-a" }]
+
+            [[package]]
+            name = "foo-a"
+            version = "0.1"
+            source = { editable = "packages/foo-a" }
+        """).strip()
+    )
+
+    foo_a = tmp_path / "packages" / "foo-a"
+    foo_b = tmp_path / "packages" / "foo-b"
+    (foo_a / "foo" / "a").mkdir(parents=True)
+    (foo_b / "foo" / "b").mkdir(parents=True)
+
+    # Note: no foo/__init__.py in either member -- PEP 420 namespace package.
+    (foo_a / "pyproject.toml").write_text(
+        textwrap.dedent("""
+            [project]
+            name = "foo-a"
+            version = "0.1"
+            [build-system]
+            build-backend = "hatchling.build"
+            [tool.hatch.build.targets.wheel]
+            packages = ["foo/a"]
+        """).strip()
+    )
+    (foo_a / "foo" / "a" / "__init__.py").write_text("value = 42\n")
+
+    (foo_b / "pyproject.toml").write_text(
+        textwrap.dedent("""
+            [project]
+            name = "foo-b"
+            version = "0.1"
+            dependencies = ["foo-a"]
+            [build-system]
+            build-backend = "hatchling.build"
+            [tool.hatch.build.targets.wheel]
+            packages = ["foo/b"]
+        """).strip()
+    )
+    (foo_b / "foo" / "b" / "__init__.py").write_text("from foo.a import value\n\nresult = value\n")
+
+    paths = UvWorkspaceResolver().resolve(tmp_path)
+    foo_a_dir = foo_a.resolve()
+    foo_b_dir = foo_b.resolve()
+    assert paths == {foo_a_dir: [], foo_b_dir: [foo_a_dir]}
+
+    graph = build_symbol_graph(paths)
+
+    # foo.a.value (in foo-a) and foo.b.result (in foo-b) both made it into
+    # the graph as distinct variables under the shared ``foo`` namespace.
+    value = next(n for n in graph.nodes if n.fqname == "foo.a.value" and n.type == "variable")
+    result = next(n for n in graph.nodes if n.fqname == "foo.b.result" and n.type == "variable")
+    assert value.path == (foo_a / "foo" / "a" / "__init__.py").resolve()
+    assert result.path == (foo_b / "foo" / "b" / "__init__.py").resolve()
+
+    # The cross-member ``from foo.a import value`` in foo-b resolved across
+    # the namespace boundary back to foo-a's declaration.
+    b_import = next(
+        n
+        for n in graph.nodes
+        if n.type == "import" and n.path == (foo_b / "foo" / "b" / "__init__.py").resolve()
+    )
+    assert graph.has_edge(b_import, value)
