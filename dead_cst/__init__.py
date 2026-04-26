@@ -12,6 +12,7 @@ from ._plugins import (
     MainBlockPlugin,
     PluginContext,
     ProjectScriptsPlugin,
+    PytestPlugin,
     RemoveEdge,
     load_plugin,
 )
@@ -42,6 +43,7 @@ __all__ = [
     "PluginContext",
     "ProjectScriptsPlugin",
     "PyprojectResolver",
+    "PytestPlugin",
     "RemoveEdge",
     "UvWorkspaceResolver",
     "VenvResolver",
