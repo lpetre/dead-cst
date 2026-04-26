@@ -98,6 +98,7 @@ class SymbolVisitor(cst.CSTVisitor):
         self.import_lookup: dict[cst.CSTNode, Import] = {}
         self.import_edges: set[tuple[SymbolNode, Import]] = set()
         self.internal_edges: set[tuple[SymbolNode, SymbolNode]] = set()
+        self.dunder_all_refs: list[tuple[SymbolNode, list[str]]] = []
         self.trie: SymbolTrie = SymbolTrie()
         # CST node used as the flow-analysis "binding site" for each
         # top-level decl. Functions/classes use the def itself, variables
@@ -160,6 +161,27 @@ class SymbolVisitor(cst.CSTVisitor):
             self.symbol_referent_nodes[sym] = node
             self._push_decl(node, sym)
 
+    @staticmethod
+    def _extract_string_sequence(value: cst.BaseExpression) -> list[str] | None:
+        """Extract string elements from a list/tuple literal, e.g. ['f', 'g']."""
+        if not isinstance(value, (cst.List, cst.Tuple)):
+            return None
+        names = []
+        for element in value.elements:
+            if not isinstance(element, cst.Element):
+                return None
+            inner = element.value
+            if not isinstance(inner, cst.SimpleString):
+                return None
+            try:
+                evaluated = inner.evaluated_value
+            except Exception:
+                return None
+            if not isinstance(evaluated, str):
+                return None
+            names.append(evaluated)
+        return names
+
     def _add_variable(self, node: cst.Assign | cst.AnnAssign):
         # Only collect top-level declarations, skip nested ones
         if len(self.decl_stack) > 1:
@@ -197,6 +219,17 @@ class SymbolVisitor(cst.CSTVisitor):
                 name_to_syms.setdefault(name, []).append(sym)
                 if value is not None:
                     value_to_syms.setdefault(value, []).append(sym)
+
+                if (
+                    isinstance(name, cst.Name)
+                    and name.value == "__all__"
+                    and value is not None
+                    and (referenced := self._extract_string_sequence(value)) is not None
+                ):
+                    # ModuleDundersPlugin keeps __all__ itself alive; we just
+                    # need to thread it through to the listed declarations
+                    # once the module's trie is populated.
+                    self.dunder_all_refs.append((sym, referenced))
 
         # Push frames in reverse CST-visit order so on_leave pops them in LIFO.
         # Values are visited after targets, so their frames go first (popped last).
@@ -470,3 +503,14 @@ class SymbolVisitor(cst.CSTVisitor):
                         self.internal_edges.add((owner_symbol, target_symbol))
                 if unreachable_owner is not None and target_symbol is not None:
                     self.unreachable_internal_edges.add((unreachable_owner, target_symbol))
+
+        # Resolve __all__ string references to declarations in the current module
+        if self.dunder_all_refs:
+            module_sym = self.node_to_symbols[original_node][0]
+            module_trie = self.trie._get(module_sym.fqname.split("."))
+            if module_trie is not None:
+                for owner, names in self.dunder_all_refs:
+                    for name in names:
+                        for target in module_trie.declarations.get(name, []):
+                            if target != owner:
+                                self.internal_edges.add((owner, target))

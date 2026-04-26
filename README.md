@@ -60,6 +60,14 @@ Show why a symbol is considered alive by printing its predecessor chain.
 dead-cst why-alive ROOT FQNAME [OPTIONS]
 ```
 
+### `dead-cst unused-exports`
+
+Report `__all__` entries whose targets would be dead without `__all__`. Useful in closed-world / monorepo settings to prune the public surface.
+
+```
+dead-cst unused-exports ROOT -e ENTRYPOINT [OPTIONS]
+```
+
 ### `dead-cst remove`
 
 Remove dead code from a Python codebase. Prompts for confirmation before modifying files.
@@ -131,7 +139,7 @@ A module-level `import` / `from ... import ...` is itself a declaration of type 
 - Dynamic attribute access (`getattr`) and runtime-generated symbols are invisible to static analysis.
 - Only first-party code is analysed; third-party dependencies are treated as opaque.
 - PEP 695 `type` statements are not tracked.
-- String names in `__all__` are not followed to their declarations (but `ModuleDundersPlugin` keeps the `__all__` variable itself alive).
+- `__all__` is followed only when assigned a list/tuple of string literals; dynamic mutation (`__all__.append`, comprehensions, etc.) is not tracked.
 
 ## TODO
 

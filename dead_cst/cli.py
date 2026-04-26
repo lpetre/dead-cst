@@ -349,6 +349,88 @@ def why_alive(
         stack.extend(graph.predecessors(node))
 
 
+def _is_dunder_all(node: SymbolNode) -> bool:
+    return node.type == "variable" and node.fqname.endswith("__all__")
+
+
+@app.command("unused-exports")
+def unused_exports(
+    root: Annotated[Path, typer.Argument(help="Root directory to analyze.")],
+    entrypoint: Annotated[
+        Optional[list[str]],
+        typer.Option(
+            "-e",
+            "--entrypoint",
+            help="Entrypoint: file path, FQN, or 're:pattern' for regex.",
+        ),
+    ] = None,
+    path: Annotated[
+        Optional[list[str]],
+        typer.Option("-p", "--path", help="Search path spec: 'base:dep1,dep2' or 'base'."),
+    ] = None,
+    resolver: Annotated[
+        Optional[list[str]],
+        typer.Option("--resolver", help="Path resolver to run (e.g. venv, pyproject)."),
+    ] = None,
+    plugin: Annotated[
+        Optional[list[str]],
+        typer.Option("--plugin", help="Edge plugin to run (e.g. main_block, project_scripts)."),
+    ] = None,
+    verbose: Annotated[
+        bool, typer.Option("-v", "--verbose", help="Enable verbose output.")
+    ] = False,
+) -> None:
+    """Report __all__ entries whose targets are only alive because of __all__."""
+    setup_logging(verbose)
+    root = root.resolve()
+
+    paths_dict = resolve_paths(root, path or [], resolver or [])
+
+    typer.echo(f"Building symbol graph for {root}...", err=True)
+    plugins = build_plugins(
+        entrypoints=entrypoint or [],
+        plugin_names=plugin or [],
+    )
+    graph = build_symbol_graph(paths_dict, plugins=plugins, project_root=root)
+    reachable = find_reachable(graph)
+
+    # ModuleDundersPlugin keeps each ``__all__`` alive via a synthetic
+    # entrypoint node ``<dunder>:<fqname>``. Cut the edge from each such
+    # synthetic into an ``__all__`` variable and re-run reachability;
+    # whatever drops out was alive only because of __all__.
+    pruned = graph.copy()
+    pruned.remove_edges_from(
+        [
+            (s, d)
+            for s, d in graph.edges
+            if _is_dunder_all(d) and s.type == "synthetic" and s.fqname.startswith("<dunder>:")
+        ]
+    )
+    reachable_without_all = find_reachable(pruned)
+    only_via_all = reachable - reachable_without_all
+
+    by_all: dict[SymbolNode, list[SymbolNode]] = {}
+    for sym in only_via_all:
+        if _is_dunder_all(sym):
+            continue
+        for pred in graph.predecessors(sym):
+            if _is_dunder_all(pred):
+                by_all.setdefault(pred, []).append(sym)
+
+    if not by_all:
+        typer.echo("No __all__ entries are kept alive only by __all__.")
+        return
+
+    for all_sym in sorted(by_all, key=lambda n: n.fqname):
+        try:
+            rel_path = all_sym.path.relative_to(root)
+        except ValueError:
+            rel_path = all_sym.path
+        typer.echo(f"\n{all_sym.fqname} at {rel_path}:")
+        for sym in sorted(by_all[all_sym], key=lambda n: n.fqname):
+            typer.echo(f"  {sym.fqname} ({sym.type})")
+
+
 @app.command()
 def remove(
     root: Annotated[Path, typer.Argument(help="Root directory to analyze.")],

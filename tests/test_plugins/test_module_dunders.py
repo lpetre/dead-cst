@@ -14,8 +14,9 @@ def test_keeps_all_alive(tmp_path, write_files, reachable_fqnames):
     )
     reached = reachable_fqnames(graph)
     assert "pkg.__all__" in reached
-    # the listed symbol itself is *not* followed -- only __all__ stays alive.
-    assert "pkg.a" not in reached
+    # The visitor wires __all__ -> decl edges for string-literal entries,
+    # so preserving __all__ transitively preserves the listed names too.
+    assert "pkg.a" in reached
 
 
 def test_keeps_other_dunders_alive(tmp_path, write_files, reachable_fqnames):

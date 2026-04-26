@@ -23,25 +23,6 @@ import pytest
             set(),
             id="pep-695-type-statement-not-captured",
         ),
-        pytest.param(
-            {
-                "mod.py": """
-                def a(): pass
-                def b(): pass
-                __all__ = ['a', 'b']
-                """,
-            },
-            # ``__all__`` strings are not followed, so on their own they
-            # keep nothing alive. ``ModuleDundersPlugin`` keeps the
-            # ``__all__`` variable itself alive but does not chase the
-            # listed names.
-            {
-                "mod.__all__ -> mod",
-                "mod.a -> mod",
-                "mod.b -> mod",
-            },
-            id="dunder-all-string-literals-not-followed",
-        ),
         # ------------------------------------------------------------------
         # Dynamic / runtime features
         # ------------------------------------------------------------------

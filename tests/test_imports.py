@@ -221,3 +221,73 @@ IMPORT_BASE_EDGES = frozenset(
 def test_imports(build_decl_graph, assert_edges, src, expected_extra_edges):
     graph = build_decl_graph({**IMPORT_TEST_FILES, "p/x.py": src})
     assert_edges(graph, IMPORT_BASE_EDGES | expected_extra_edges)
+
+
+@pytest.mark.parametrize(
+    "src, expected_extra_edges",
+    [
+        pytest.param(
+            'from p.functions import f\n__all__ = ["f"]',
+            {
+                "p.x.__all__ -> p.x",
+                "p.x.__all__ -> p.x.f",
+                "p.x.f -> p.functions",
+                "p.x.f -> p.functions.f",
+                "p.x.f -> p.x",
+            },
+            id="dunder-all-references-import",
+        ),
+        pytest.param(
+            'from p.functions import f\nfrom p.classes import C\n__all__ = ("f", "C")',
+            {
+                "p.x.C -> p.classes",
+                "p.x.C -> p.classes.C",
+                "p.x.C -> p.x",
+                "p.x.__all__ -> p.x",
+                "p.x.__all__ -> p.x.C",
+                "p.x.__all__ -> p.x.f",
+                "p.x.f -> p.functions",
+                "p.x.f -> p.functions.f",
+                "p.x.f -> p.x",
+            },
+            id="dunder-all-tuple-of-imports",
+        ),
+        pytest.param(
+            'def g(): pass\nfrom p.functions import f\n__all__ = ["f", "g"]',
+            {
+                "p.x.__all__ -> p.x",
+                "p.x.__all__ -> p.x.f",
+                "p.x.__all__ -> p.x.g",
+                "p.x.f -> p.functions",
+                "p.x.f -> p.functions.f",
+                "p.x.f -> p.x",
+                "p.x.g -> p.x",
+            },
+            id="dunder-all-mixes-local-and-imported",
+        ),
+        pytest.param(
+            'from p.functions import f\n__all__: list[str] = ["f"]',
+            {
+                "p.x.__all__ -> p.x",
+                "p.x.__all__ -> p.x.f",
+                "p.x.f -> p.functions",
+                "p.x.f -> p.functions.f",
+                "p.x.f -> p.x",
+            },
+            id="dunder-all-annotated-assignment",
+        ),
+        pytest.param(
+            'from p.functions import f\n__all__ = ["missing"]',
+            {
+                "p.x.__all__ -> p.x",
+                "p.x.f -> p.functions",
+                "p.x.f -> p.functions.f",
+                "p.x.f -> p.x",
+            },
+            id="dunder-all-unknown-name-is-ignored",
+        ),
+    ],
+)
+def test_dunder_all_edges(build_decl_graph, assert_edges, src, expected_extra_edges):
+    graph = build_decl_graph({**IMPORT_TEST_FILES, "p/x.py": src})
+    assert_edges(graph, IMPORT_BASE_EDGES | expected_extra_edges)
