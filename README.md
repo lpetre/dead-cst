@@ -56,6 +56,14 @@ Show why a symbol is considered alive by printing its predecessor chain.
 dead-cst why-alive ROOT FQNAME [OPTIONS]
 ```
 
+### `dead-cst unused-exports`
+
+Report `__all__` entries whose targets would be dead without `__all__`. Useful in closed-world / monorepo settings to prune the public surface.
+
+```
+dead-cst unused-exports ROOT -e ENTRYPOINT [OPTIONS]
+```
+
 ### `dead-cst remove`
 
 Remove dead code from a Python codebase. Prompts for confirmation before modifying files.
