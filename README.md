@@ -29,6 +29,9 @@ dead-cst why-alive ./src mypackage.some_module.some_function
 
 # Remove dead code (interactive confirmation)
 dead-cst remove ./src -e "re:.*__main__\.py"
+
+# List third-party dependencies imported by the codebase
+dead-cst dependencies ./src
 ```
 
 ## CLI reference
@@ -67,6 +70,24 @@ Report `__all__` entries whose targets would be dead without `__all__`. Useful i
 ```
 dead-cst unused-exports ROOT -e ENTRYPOINT [OPTIONS]
 ```
+
+### `dead-cst dependencies`
+
+List third-party dependencies imported by the codebase. Each base path gets its
+own section. Distributions are reported as `[external dist] <name>`; files
+resolved inside `site-packages` without a matching distribution are reported as
+`[external file] <name>`.
+
+```
+dead-cst dependencies ROOT [OPTIONS]
+```
+
+| Option | Description |
+|---|---|
+| `-p, --path` | Search path spec: `base:dep1,dep2` or `base` (repeatable) |
+| `--resolver` | Path resolver to run, e.g. `venv`, `pyproject` (repeatable) |
+| `--format` | Output format: `text` or `json` |
+| `-v, --verbose` | Enable verbose logging |
 
 ### `dead-cst remove`
 
@@ -137,7 +158,7 @@ A module-level `import` / `from ... import ...` is itself a declaration of type 
 
 - `import *` is not resolved.
 - Dynamic attribute access (`getattr`) and runtime-generated symbols are invisible to static analysis.
-- Only first-party code is analysed; third-party dependencies are treated as opaque.
+- Only first-party code is analysed; third-party dependencies are treated as opaque (they appear as synthetic nodes — see `dead-cst dependencies`).
 - PEP 695 `type` statements are not tracked.
 - `__all__` is followed only when assigned a list/tuple of string literals; dynamic mutation (`__all__.append`, comprehensions, etc.) is not tracked.
 

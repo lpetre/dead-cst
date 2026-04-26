@@ -99,7 +99,7 @@ def build_symbol_graph(
                 symbol_lookup.merge(base_tries[sp])
 
             # resolve all the import edges
-            for src, dst in resolve_edges(import_edges, symbol_lookup):
+            for src, dst in resolve_edges(import_edges, symbol_lookup, base):
                 symbol_graph.add_edge(src, dst)
 
     if plugins:
