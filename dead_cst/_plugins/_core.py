@@ -94,6 +94,11 @@ class PluginContext:
         files that import fastapi") -- strictly more accurate than
         substring matching, and free because the import edges are
         already in the graph.
+
+        Stdlib imports (``[stdlib] <target>``) are *not* surfaced as
+        synthetic nodes by the resolver, so this method cannot prefilter
+        on them; plugins that care about stdlib imports must walk the
+        import nodes themselves.
         """
         target_node = self.find_module(target)
         if target_node is None:
