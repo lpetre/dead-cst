@@ -11,10 +11,13 @@ two versions.
 
 ### Added
 - `InitSubclassPlugin` (`--plugin init_subclass`): detect classes that define
-  `__init_subclass__` and emit `parent -> subclass` edges for every transitive
-  first-party subclass, so registry-pattern subclasses stay alive whenever
-  the parent class does. Parents are pass-through; reachability still has
-  to flow into the parent through some other means.
+  `__init_subclass__` and route reachability through a synthetic marker node
+  `<__init_subclass__>:<parent.fqname>` with edges
+  `parent -> marker -> subclass` for every transitive first-party subclass.
+  Registry-pattern subclasses stay alive whenever the parent class does;
+  the marker shows up in `why-alive` chains as a labeled breadcrumb.
+  Parents are pass-through, so a registry base nobody else uses still
+  surfaces as dead code.
 - Edge plugin architecture (`EdgePlugin`, `CSTAwareEdgePlugin`, `PluginContext`,
   `GraphOp`/`AddNode`/`AddEdge`/`RemoveEdge`, `apply_ops`, `synthetic_node`).
   Built-in plugins: `MainBlockPlugin`, `ProjectScriptsPlugin`,
