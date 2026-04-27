@@ -33,8 +33,10 @@ from ._core import (
     apply_ops,
     synthetic_node,
 )
+from .click import ClickPlugin
 from .explicit import ExplicitEntrypointPlugin
 from .fastapi import FastAPIPlugin
+from .flask import FlaskPlugin
 from .init_subclass import InitSubclassPlugin
 from .main_block import MainBlockPlugin
 from .module_dunders import ModuleDundersPlugin
@@ -49,7 +51,9 @@ BUILTIN_PLUGINS: dict[str, type] = {
     ModuleDundersPlugin.name: ModuleDundersPlugin,
     PytestPlugin.name: PytestPlugin,
     FastAPIPlugin.name: FastAPIPlugin,
+    FlaskPlugin.name: FlaskPlugin,
     TyperPlugin.name: TyperPlugin,
+    ClickPlugin.name: ClickPlugin,
     InitSubclassPlugin.name: InitSubclassPlugin,
 }
 
@@ -72,9 +76,11 @@ __all__ = [
     "AddEdge",
     "AddNode",
     "BUILTIN_PLUGINS",
+    "ClickPlugin",
     "EdgePlugin",
     "ExplicitEntrypointPlugin",
     "FastAPIPlugin",
+    "FlaskPlugin",
     "GraphOp",
     "InitSubclassPlugin",
     "MainBlockPlugin",

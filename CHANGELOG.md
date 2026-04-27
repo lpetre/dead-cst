@@ -22,7 +22,8 @@ two versions.
   `GraphOp`/`AddNode`/`AddEdge`/`RemoveEdge`, `apply_ops`, `synthetic_node`).
   Built-in plugins: `MainBlockPlugin`, `ProjectScriptsPlugin`,
   `ExplicitEntrypointPlugin`, `ModuleDundersPlugin`, `PytestPlugin`,
-  `FastAPIPlugin`, `TyperPlugin`. Third-party plugins register under the
+  `FastAPIPlugin`, `FlaskPlugin`, `TyperPlugin`, `ClickPlugin`,
+  `InitSubclassPlugin`. Third-party plugins register under the
   `dead_cst.plugins` entry-point group and load via `load_plugin`.
 - Path resolver architecture (`PathResolver`, `merge_paths`). Built-in
   resolvers: `VenvResolver`, `PyprojectResolver`, `UvWorkspaceResolver`. Third-
@@ -39,6 +40,24 @@ two versions.
   is expected through `[project.scripts]` or a `__main__` block, after which
   every registered command and callback stays alive. Sub-typers that are
   never `add_typer`'d remain dead.
+- `FlaskPlugin` (`--plugin flask`): detect top-level `Flask()` / `Blueprint()`
+  instances and emit `instance -> handler` edges for `@app.route(...)`,
+  HTTP-verb shortcuts (`@app.get(...)`, ...), request-lifecycle hooks
+  (`before_request`, `after_request`, `teardown_*`), error handlers,
+  template helpers (`context_processor`, `template_filter`, ...), and URL
+  processors. `Flask` apps are seeded as entrypoints (WSGI servers load
+  `module:app`); `Blueprint`s stay pass-through, so a blueprint never
+  `register_blueprint`'d remains dead, mirroring the `APIRouter` behavior
+  in `FastAPIPlugin`.
+- `ClickPlugin` (`--plugin click`): detect top-level Click `Group` instances
+  (functions decorated `@click.group(...)` / `@click.Group(...)`,
+  `X = click.Group(...)` constructor calls, and inline sub-groups
+  registered via `@<group>.group(...)`, all resolved via fixpoint so a
+  chain of nested groups is fully discovered) and emit `instance ->
+  handler` edges for `@<group>.command(...)`, `@<group>.group(...)`, and
+  `@<group>.result_callback(...)` decorators. Click groups stay
+  pass-through; reachability is expected through `[project.scripts]` or a
+  `__main__` block, mirroring `TyperPlugin`.
 - `dead-cst unused-exports` CLI command: report `__all__` entries whose targets
   are kept alive only because they are listed in `__all__`.
 - `dead-cst dependencies` CLI command: list third-party distributions and
