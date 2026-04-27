@@ -10,7 +10,7 @@ from typing import Iterable
 import libcst as cst
 
 from .._symbols import SymbolNode
-from ._core import AddEdge, AddNode, GraphOp, PluginContext, synthetic_node
+from ._core import GraphOp, PluginContext, mark_entrypoints
 
 
 @dataclass
@@ -56,12 +56,12 @@ class PytestPlugin:
             filename = path.name
 
             if filename == "conftest.py":
-                yield from _mark_entrypoints(
+                yield from mark_entrypoints(
                     f"<pytest:conftest>:{module_node.fqname}", path, module_decls
                 )
             elif _is_test_filename(filename):
                 test_decls = [d for d in module_decls if _is_test_decl(d)]
-                yield from _mark_entrypoints(
+                yield from mark_entrypoints(
                     f"<pytest:tests>:{module_node.fqname}", path, test_decls
                 )
 
@@ -78,7 +78,7 @@ class PytestPlugin:
                 for d in module_decls
                 if d.type == "function" and d.fqname.rsplit(".", 1)[-1] in fixture_names
             ]
-            yield from _mark_entrypoints(
+            yield from mark_entrypoints(
                 f"<pytest:fixtures>:{module_node.fqname}", path, fixture_decls
             )
 
@@ -94,15 +94,6 @@ def _is_test_decl(node: SymbolNode) -> bool:
     if node.type == "class" and simple.startswith("Test"):
         return True
     return False
-
-
-def _mark_entrypoints(seed_fqname: str, path: Path, targets: list[SymbolNode]) -> Iterable[GraphOp]:
-    if not targets:
-        return
-    synth = synthetic_node(fqname=seed_fqname, path=path)
-    yield AddNode(synth, entrypoint=True)
-    for target in targets:
-        yield AddEdge(synth, target)
 
 
 def _find_fixture_names(module: cst.Module) -> set[str]:
