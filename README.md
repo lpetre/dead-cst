@@ -149,6 +149,7 @@ Entrypoint detection is now fully plugin-driven. Builtins:
 | `PytestPlugin` | Keep pytest-discovered tests, `conftest.py` decls, and `@pytest.fixture` functions alive (`--plugin pytest`) |
 | `FastAPIPlugin` | Detect top-level `FastAPI()` / `APIRouter()` instances; mark `FastAPI` apps as entrypoints and add `instance -> handler` edges for every `@app.get(...)`-style decorator (HTTP methods, websockets, middleware, exception handlers, `on_event`). Routers stay pass-through, so an `APIRouter` that's never `include_router`'d remains dead (`--plugin fastapi`) |
 | `TyperPlugin` | Detect top-level `Typer()` instances and add `instance -> handler` edges for every `@app.command(...)` / `@app.callback(...)` decorator. Typer apps are pass-through (reach them via `[project.scripts]` or `if __name__ == "__main__": app()`), so a sub-typer that's never `add_typer`'d stays dead (`--plugin typer`) |
+| `InitSubclassPlugin` | Detect classes that define `__init_subclass__` and add `parent -> subclass` edges for every (transitive) first-party subclass. Parents stay pass-through, so a registry base class only keeps subclasses alive once something else (an entrypoint, an import) keeps the parent alive (`--plugin init_subclass`) |
 
 Write your own by implementing the `EdgePlugin` or `CSTAwareEdgePlugin` protocol; register under the `dead_cst.plugins` entry-point group for CLI discovery.
 
