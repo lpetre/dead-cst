@@ -35,6 +35,7 @@ from ._core import (
 )
 from .explicit import ExplicitEntrypointPlugin
 from .fastapi import FastAPIPlugin
+from .init_subclass import InitSubclassPlugin
 from .main_block import MainBlockPlugin
 from .module_dunders import ModuleDundersPlugin
 from .project_scripts import ProjectScriptsPlugin
@@ -49,6 +50,7 @@ BUILTIN_PLUGINS: dict[str, type] = {
     PytestPlugin.name: PytestPlugin,
     FastAPIPlugin.name: FastAPIPlugin,
     TyperPlugin.name: TyperPlugin,
+    InitSubclassPlugin.name: InitSubclassPlugin,
 }
 
 
@@ -74,6 +76,7 @@ __all__ = [
     "ExplicitEntrypointPlugin",
     "FastAPIPlugin",
     "GraphOp",
+    "InitSubclassPlugin",
     "MainBlockPlugin",
     "ModuleDundersPlugin",
     "PluginContext",
