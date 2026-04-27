@@ -328,6 +328,47 @@ def test_init_subclass_subscripted_base(tmp_path, write_files, reachable_fqnames
     assert "pkg.impls.Foo" in reachable_fqnames(graph)
 
 
+def test_init_subclass_marker_in_predecessor_chain(tmp_path, write_files):
+    """Reachability of a subclass routes through a labeled marker node so
+    ``why-alive`` chains read ``Foo <- <__init_subclass__>:Plugin <- Plugin``."""
+    write_files(
+        {
+            "pkg/__init__.py": "",
+            "pkg/base.py": """
+            class Plugin:
+                def __init_subclass__(cls, **kwargs):
+                    super().__init_subclass__(**kwargs)
+            """,
+            "pkg/impls.py": """
+            from pkg.base import Plugin
+
+            class Foo(Plugin):
+                pass
+            """,
+        }
+    )
+    graph = build_symbol_graph(
+        {tmp_path: []},
+        plugins=[
+            ExplicitEntrypointPlugin(specs=["pkg.base.Plugin"]),
+            InitSubclassPlugin(),
+        ],
+        project_root=tmp_path,
+    )
+    foo = next(n for n in graph.nodes if n.fqname == "pkg.impls.Foo")
+    preds = list(graph.predecessors(foo))
+    marker = next(
+        (p for p in preds if p.type == "synthetic" and p.fqname.startswith("<__init_subclass__>:")),
+        None,
+    )
+    assert marker is not None, f"expected a marker predecessor, got {preds!r}"
+    assert marker.fqname == "<__init_subclass__>:pkg.base.Plugin"
+
+    marker_preds = list(graph.predecessors(marker))
+    parent = next(p for p in marker_preds if p.fqname == "pkg.base.Plugin")
+    assert parent.type == "class"
+
+
 def test_init_subclass_loads_via_load_plugin():
     from dead_cst import load_plugin
 

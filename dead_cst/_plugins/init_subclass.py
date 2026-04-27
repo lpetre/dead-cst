@@ -6,13 +6,21 @@ is subclassed -- typically a registry pattern (``cls.registry.append(cls)``,
 registration, so subclasses look unused even though merely defining them
 has a side effect that the framework relies on at runtime.
 
-Strategy: mirror :class:`TyperPlugin` -- find every class that declares
-``__init_subclass__`` in its body, then emit inverse edges
-``parent -> subclass`` for every (transitive) subclass of that parent.
-The parent itself is *not* seeded as an entrypoint; reachability is
-expected to flow through whatever already keeps the parent alive (an
-explicit ``-e``, an import in a live module, etc.). Once it does, every
-class registered through ``__init_subclass__`` becomes reachable too.
+Strategy: for each ``__init_subclass__`` parent ``P`` create a synthetic
+*marker* node ``S_P`` with edges ``P -> S_P`` and ``S_P -> C`` for every
+(transitive) subclass ``C``. The marker makes "is this class a subclass
+of some registry root?" an O(1) graph predecessor lookup, so when we
+encounter a new class, we only need to peek at its direct bases -- if a
+base is already wired under any marker, the new class inherits the same
+markers without any further ancestor walk. The marker also surfaces in
+``why-alive`` output as a labeled breadcrumb
+(``<__init_subclass__>:pkg.base.Plugin``), making registry-driven
+reachability legible.
+
+Parents are not auto-marked as entrypoints; reachability is expected to
+flow into ``P`` through whatever already keeps it alive (an explicit
+``-e``, an import in a live module, etc.). Once it does, every subclass
+registered through ``__init_subclass__`` becomes reachable too.
 """
 
 from __future__ import annotations
@@ -25,14 +33,15 @@ from typing import Iterable
 import libcst as cst
 
 from .._symbols import SymbolNode
-from ._core import AddEdge, GraphOp, PluginContext
+from ._core import AddEdge, AddNode, GraphOp, PluginContext, synthetic_node
 
 _INIT_SUBCLASS = "__init_subclass__"
+_MARKER_PREFIX = "<__init_subclass__>:"
 
 
 @dataclass
 class InitSubclassPlugin:
-    """Wire subclasses of ``__init_subclass__``-defining classes through the parent.
+    """Wire subclasses of ``__init_subclass__``-defining classes through a marker.
 
     For each top-level class in the project the plugin:
 
@@ -41,10 +50,17 @@ class InitSubclassPlugin:
        body, with or without ``@classmethod``).
     2. Resolves every base expression to a top-level class node, walking
        through local imports so cross-module inheritance is captured.
-    3. For every class whose MRO (within the analysed code) reaches a
-       class that defines ``__init_subclass__``, emits an edge
-       ``parent -> subclass``. Edges are transitive: ``A.__init_subclass__``
-       -> ``B(A)`` -> ``C(B)`` yields both ``A -> B`` and ``A -> C``.
+    3. Creates one synthetic marker node ``<__init_subclass__>:<P.fqname>``
+       per registry parent ``P``, links ``P -> marker``, and links
+       ``marker -> C`` for every direct or transitive first-party
+       subclass.
+
+    Membership is computed by inheriting markers from a class's direct
+    bases: ``C(B)`` joins every marker that ``B`` is already a member of.
+    No traversal up the full MRO is needed -- the marker carried on each
+    class is the transitive closure. The pass runs to a small fixed
+    point so that intra-base sibling chains (``Mid(Root)`` defined
+    before ``Leaf(Mid)``) converge regardless of source order.
 
     Parents are not auto-marked as entrypoints. The expected wiring is
     that something else keeps the parent alive (an entrypoint, an import,
@@ -68,7 +84,7 @@ class InitSubclassPlugin:
         # graph already contains classes from this base and every dep
         # base, so cross-base inheritance resolves correctly. ``parse``
         # is cached, so re-parsing dep modules in later passes is cheap.
-        roots: set[SymbolNode] = set()
+        roots: dict[SymbolNode, SymbolNode] = {}  # parent class -> marker
         bases_of: dict[SymbolNode, list[SymbolNode]] = {}
 
         for class_node in [n for n in ctx.graph.nodes if n.type == "class"]:
@@ -79,7 +95,10 @@ class InitSubclassPlugin:
             if class_def is None:
                 continue
             if _has_init_subclass(class_def):
-                roots.add(class_node)
+                roots[class_node] = synthetic_node(
+                    fqname=f"{_MARKER_PREFIX}{class_node.fqname}",
+                    path=class_node.path,
+                )
             module_fqname = class_node.fqname.rsplit(".", 1)[0]
             resolved = _resolve_bases(class_def, ctx, module_fqname)
             if resolved:
@@ -88,27 +107,61 @@ class InitSubclassPlugin:
         if not roots:
             return
 
-        subclasses_of: dict[SymbolNode, list[SymbolNode]] = defaultdict(list)
-        for sub, parents in bases_of.items():
-            for parent in parents:
-                subclasses_of[parent].append(sub)
+        # ``markers_for[X]`` = the set of markers that already claim ``X``
+        # as a (direct or transitive) subclass. Seeded from this pass'
+        # registry roots and from any membership previous passes already
+        # wired into the graph.
+        markers_for: dict[SymbolNode, set[SymbolNode]] = defaultdict(set)
+        for parent, marker in roots.items():
+            # The parent is its own member so direct subclasses inherit
+            # the marker by base-lookup alone; the parent->parent self
+            # edge is filtered out at emit time.
+            markers_for[parent].add(marker)
+        for marker in roots.values():
+            if marker not in ctx.graph:
+                continue
+            for succ in ctx.graph.successors(marker):
+                if succ.type == "class":
+                    markers_for[succ].add(marker)
 
-        for root in roots:
-            seen: set[SymbolNode] = set()
-            stack: list[SymbolNode] = list(subclasses_of.get(root, []))
-            while stack:
-                sub = stack.pop()
-                if sub in seen:
+        # Fixed point: a class joins every marker its bases are in.
+        # Converges in <= max-inheritance-depth iterations.
+        changed = True
+        while changed:
+            changed = False
+            for sub, bases in bases_of.items():
+                gained: set[SymbolNode] = set()
+                for base in bases:
+                    gained |= markers_for.get(base, set())
+                gained -= markers_for[sub]
+                if gained:
+                    markers_for[sub] |= gained
+                    changed = True
+
+        # Emit the marker node + parent->marker edge once per root.
+        # ``AddNode``/``AddEdge`` are idempotent across passes, so re-
+        # emitting markers we discovered in an earlier dep base is safe.
+        for parent, marker in roots.items():
+            yield AddNode(marker)
+            yield AddEdge(parent, marker)
+
+        # Emit marker->subclass edges, deduplicating against what's
+        # already in the graph (from previous passes) and scoping to
+        # subclasses under the current base.
+        existing_targets = {
+            marker: (set(ctx.graph.successors(marker)) if marker in ctx.graph else set())
+            for marker in roots.values()
+        }
+        parent_of = {marker: parent for parent, marker in roots.items()}
+        for sub, markers in markers_for.items():
+            if not sub.path.is_relative_to(ctx.base):
+                continue
+            for marker in markers:
+                if parent_of.get(marker) is sub:
                     continue
-                seen.add(sub)
-                # Scope the emitted edge to subclasses defined in (or under)
-                # the current base. Subclasses in dep bases were -- or will
-                # be -- handled when their owning base ran; emitting them
-                # here would be a no-op (AddEdge is idempotent) but pollutes
-                # the per-base op stream.
-                if sub.path.is_relative_to(ctx.base):
-                    yield AddEdge(root, sub)
-                stack.extend(subclasses_of.get(sub, []))
+                if sub in existing_targets.get(marker, set()):
+                    continue
+                yield AddEdge(marker, sub)
 
 
 def _find_class_def(module: cst.Module, class_node: SymbolNode) -> cst.ClassDef | None:
