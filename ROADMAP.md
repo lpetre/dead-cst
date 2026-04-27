@@ -33,15 +33,14 @@ trust work remaining.
 
 ### 2. Finish the framework-aware plugin presets
 
-`PytestPlugin`, `FastAPIPlugin`, and `TyperPlugin` shipped, but the
-existential risk is still "I tried it and it flagged half my codebase." The
-remaining common offenders:
+`PytestPlugin`, `FastAPIPlugin`, `FlaskPlugin`, `TyperPlugin`,
+`ClickPlugin`, and `InitSubclassPlugin` shipped, but the existential risk
+is still "I tried it and it flagged half my codebase." The remaining
+common offenders:
 
-- Click commands and groups
 - Django URLConf, admin registration, signal handlers, management commands
 - Pydantic validators and field serializers
 - Descriptor-style hooks: `__set_name__`, dataclass `__post_init__`
-  (`__init_subclass__` shipped as `InitSubclassPlugin`)
 
 Surface a `--preset pytest,fastapi,django` shortcut that expands to the
 existing `--plugin` wiring, and document the entry-point group so third
@@ -128,8 +127,8 @@ Folded down from earlier tiers as they landed:
 
 - Codemod test coverage and import pruning (Tier 1).
 - `from X import *` resolution, pessimistic by default (Tier 1).
-- `PytestPlugin`, `FastAPIPlugin`, `TyperPlugin`, and `InitSubclassPlugin`
-  (Tier 1, partial — see item 2).
+- `PytestPlugin`, `FastAPIPlugin`, `FlaskPlugin`, `TyperPlugin`,
+  `ClickPlugin`, and `InitSubclassPlugin` (Tier 1, partial — see item 2).
 - `unused-exports` and `dependencies` CLI commands.
 - Unreachable-branch detection surfaced as synthetic graph nodes.
 - Workspace-aware cross-member import scoping via `exported_roots`.
