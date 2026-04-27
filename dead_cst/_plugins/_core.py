@@ -1,19 +1,26 @@
 """Shared types and helpers for edge plugins.
 
-Defines the protocols every plugin satisfies, the :class:`GraphOp` value
-objects plugins emit, and small utilities (:func:`apply_ops`,
-:func:`synthetic_node`) used by both the analyzer and the plugins
-themselves.
+Defines the :class:`EdgePlugin` protocol every plugin satisfies, the
+:class:`PluginContext` plugins receive once per base, the :class:`GraphOp`
+value objects plugins emit, and small utilities (:func:`apply_ops`,
+:func:`synthetic_node`) used by both the analyzer and the plugins.
+
+The plugin pass runs once per base after the analyzer has resolved that
+base's edges. Plugins see the symbol lookup that was valid at that base's
+resolution time (the current base + its dependencies' exports), and the
+parsed module cache is primed with the modules the analyzer just walked,
+so plugins never re-read or re-parse source.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Protocol, Union, runtime_checkable
+from typing import Iterable, Iterator, Protocol, Union, runtime_checkable
 
+import libcst as cst
 import networkx as nx
-from libcst.metadata import CodePosition, CodeRange, FullRepoManager
+from libcst.metadata import CodePosition, CodeRange
 
 from .._symbols import SymbolNode, SymbolTrie
 
@@ -22,12 +29,30 @@ SYNTHETIC_POSITION = CodeRange(start=CodePosition(0, 0), end=CodePosition(0, 0))
 
 @dataclass
 class PluginContext:
-    """Read-only view of the analyzer state passed to every plugin."""
+    """Per-base view of the analyzer state passed to every plugin.
+
+    The plugin pass runs once for each base in topological order. Each
+    invocation gets a fresh context whose ``symbol_lookup`` matches what
+    was visible to that base's import resolution. Plugins should normally
+    scope iteration to :attr:`base` -- :meth:`base_modules` is the easy
+    way -- because :attr:`graph` accumulates nodes across bases.
+
+    The parsed-module cache is pre-populated with the modules the analyzer
+    just walked, so :meth:`parse` returns immediately for any file under
+    :attr:`base` without re-reading or re-parsing.
+    """
 
     graph: nx.DiGraph
     symbol_lookup: SymbolTrie
-    paths: dict[Path, list[Path]]
+    base: Path
     project_root: Path
+    _modules: dict[Path, cst.Module | None] = field(default_factory=dict, repr=False)
+    # Lazy ``fqname -> SymbolNode`` index over synthetic nodes (built on
+    # first ``importers`` call).  Plugins that add their own synthetic
+    # nodes during the same pass won't see them through this index, which
+    # is fine in practice -- ``importers`` is for prefiltering against
+    # the analyzer's already-resolved dep markers.
+    _synthetic_index: dict[str, SymbolNode] | None = field(default=None, init=False, repr=False)
 
     def find_module(self, fqname: str) -> SymbolNode | None:
         node = self.symbol_lookup._get(fqname.split("."))
@@ -48,6 +73,76 @@ class PluginContext:
             if node and node.module and decl_name in node.declarations:
                 return list(node.declarations[decl_name])
         return []
+
+    def base_modules(self) -> Iterator[tuple[Path, SymbolNode]]:
+        """Yield ``(path, module_node)`` for every module under :attr:`base`."""
+        for node in self.graph.nodes:
+            if node.type == "module" and node.path.is_relative_to(self.base):
+                yield node.path, node
+
+    def importers(self, target: str) -> set[Path]:
+        """Return paths under :attr:`base` whose imports reach ``target``.
+
+        ``target`` is matched first as a first-party module fqname
+        (e.g. ``pkg.mod``); if no first-party module matches, it is
+        matched against the synthetic markers the analyzer adds for
+        non-first-party imports -- ``[external dist] <target>``,
+        ``[external file] <target>``, and ``[unresolved] <target>``
+        (for imports the resolver couldn't pin to an installed dist,
+        which still tells us "this file tried to import X"). The result
+        is the natural prefilter for framework plugins ("only look at
+        files that import fastapi") -- strictly more accurate than
+        substring matching, and free because the import edges are
+        already in the graph.
+        """
+        target_node = self.find_module(target)
+        if target_node is None:
+            for tag in (
+                f"[external dist] {target}",
+                f"[external file] {target}",
+                f"[unresolved] {target}",
+            ):
+                node = self._synthetic(tag)
+                if node is not None:
+                    target_node = node
+                    break
+        if target_node is None:
+            return set()
+        return {
+            pred.path
+            for pred in self.graph.predecessors(target_node)
+            # Exclude same-file predecessors -- for a first-party module
+            # node, every decl inside that module is a predecessor (via
+            # the standard ``decl -> module`` edge), but we want
+            # *importers* of the module, not its contents.
+            if pred.path != target_node.path and pred.path.is_relative_to(self.base)
+        }
+
+    def parse(self, path: Path) -> cst.Module | None:
+        """Return the parsed :class:`libcst.Module` for ``path``.
+
+        The analyzer primes the cache with the modules it parsed during
+        the visitor pass, so for any file under :attr:`base` this returns
+        immediately. Files outside the base are read and parsed on first
+        access; failures are cached so a flaky file isn't re-attempted.
+        """
+        if path in self._modules:
+            return self._modules[path]
+        try:
+            module = cst.parse_module(path.read_text())
+        except (OSError, cst.ParserSyntaxError):
+            module = None
+        self._modules[path] = module
+        return module
+
+    def prime_module(self, path: Path, module: cst.Module) -> None:
+        """Record an already-parsed module so :meth:`parse` skips re-parsing."""
+        self._modules[path] = module
+
+    def _synthetic(self, fqname: str) -> SymbolNode | None:
+        if self._synthetic_index is None:
+            self._synthetic_index = {n.fqname: n for n in self.graph.nodes if n.type == "synthetic"}
+        return self._synthetic_index.get(fqname)
 
 
 @dataclass(frozen=True)
@@ -76,23 +171,18 @@ GraphOp = Union[AddNode, AddEdge, RemoveEdge]
 
 @runtime_checkable
 class EdgePlugin(Protocol):
+    """A plugin that contributes graph ops once per base.
+
+    The analyzer calls :meth:`contribute` for every base in topological
+    order, after that base's import edges have been resolved. Plugins
+    use the per-base :class:`PluginContext` to look up symbols, parse
+    modules, and find importers of a given dep; they emit
+    :class:`GraphOp` values rather than mutating the graph directly.
+    """
+
     name: str
 
     def contribute(self, ctx: PluginContext) -> Iterable[GraphOp]: ...
-
-
-@runtime_checkable
-class CSTAwareEdgePlugin(Protocol):
-    name: str
-    # marker attribute used by ``isinstance`` to distinguish this protocol from
-    # the plain ``EdgePlugin`` -- runtime_checkable Protocols only look at
-    # attribute presence, not method signatures, so an extra attribute is the
-    # simplest way to disambiguate.
-    cst_aware: bool
-
-    def contribute(
-        self, ctx: PluginContext, managers: dict[Path, FullRepoManager]
-    ) -> Iterable[GraphOp]: ...
 
 
 def apply_ops(graph: nx.DiGraph, ops: Iterable[GraphOp]) -> None:

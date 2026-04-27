@@ -258,7 +258,16 @@ class SymbolVisitor(cst.CSTVisitor):
             if not module_path:
                 code = cst.Module([]).code_for_node(alias)
                 logger.warning("Failed to resolve cst.Import: '%s' in %s", code, self.path)
-                continue
+                # Surface as a synthetic ``[unresolved] <top-level>`` node
+                # anyway so plugins can still answer "which files tried to
+                # import X?". The top-level package name is used (mirroring
+                # how ``[external dist] fastapi`` collapses every fastapi
+                # submodule import into one node) so a plugin's
+                # ``importers("fastapi")`` finds them all. Reachability is
+                # unaffected (the synthetic has no outbound edges).
+                top_level = full_name.split(".", 1)[0]
+                module_path = f"[unresolved] {top_level}"
+                module_name = full_name
 
             # if there is an asname, that is the decl being added
             # and we resolve the entire import

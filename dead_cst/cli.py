@@ -16,7 +16,6 @@ import typer
 from . import build_symbol_graph, count_nodes, find_reachable, order_paths, remove_code
 from ._branches import is_unreachable_node
 from ._plugins import (
-    CSTAwareEdgePlugin,
     EdgePlugin,
     ExplicitEntrypointPlugin,
     ModuleDundersPlugin,
@@ -53,14 +52,14 @@ def build_plugins(
     *,
     entrypoints: list[str],
     plugin_names: list[str],
-) -> list[EdgePlugin | CSTAwareEdgePlugin]:
+) -> list[EdgePlugin]:
     """Compose the plugin list from CLI flags.
 
     Order: user-specified plugins first, then ``ModuleDundersPlugin``, then
     ``ExplicitEntrypointPlugin`` with the ``-e`` specs. ``-e`` runs last so
     it can hang entrypoints off any synthetic nodes contributed upstream.
     """
-    plugins: list[EdgePlugin | CSTAwareEdgePlugin] = []
+    plugins: list[EdgePlugin] = []
     for name in plugin_names:
         plugins.append(load_plugin(name))
     plugins.append(ModuleDundersPlugin())

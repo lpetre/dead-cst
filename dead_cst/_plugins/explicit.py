@@ -34,6 +34,8 @@ class ExplicitEntrypointPlugin:
     def contribute(self, ctx: PluginContext) -> Iterable[GraphOp]:
         root = ctx.project_root
         for node in ctx.graph.nodes:
+            if not node.path.is_relative_to(ctx.base):
+                continue
             if not self._matches(node, root):
                 continue
             synth = synthetic_node(

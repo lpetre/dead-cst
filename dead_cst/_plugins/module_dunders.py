@@ -25,6 +25,8 @@ class ModuleDundersPlugin:
 
     def contribute(self, ctx: PluginContext) -> Iterable[GraphOp]:
         for node in ctx.graph.nodes:
+            if not node.path.is_relative_to(ctx.base):
+                continue
             if not _is_module_dunder(node):
                 continue
             synth = synthetic_node(

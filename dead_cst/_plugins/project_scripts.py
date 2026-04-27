@@ -20,13 +20,19 @@ class ProjectScriptsPlugin:
 
     For each ``name = "pkg.mod:func"`` mapping, look up ``pkg.mod.func`` in the
     symbol trie and wire a synthetic entrypoint node to it.
+
+    Reads the pyproject in the *current base*. uv workspaces and similar
+    layouts are 1:1 with bases, so each member's scripts resolve in its
+    own base's symbol lookup -- which is exactly the lookup that contains
+    that member plus the deps it can import from. ``pyproject_path`` can
+    be set to override the location for non-standard layouts.
     """
 
     name: str = "project_scripts"
     pyproject_path: Path | None = None
 
     def contribute(self, ctx: PluginContext) -> Iterable[GraphOp]:
-        pyproject = self.pyproject_path or ctx.project_root / "pyproject.toml"
+        pyproject = self.pyproject_path or ctx.base / "pyproject.toml"
         if not pyproject.is_file():
             return
 

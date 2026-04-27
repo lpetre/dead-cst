@@ -18,13 +18,10 @@ the behavior of :class:`FastAPIPlugin` for ``APIRouter``.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Iterable
 
 import libcst as cst
-from libcst.metadata import FullRepoManager
 
-from .._symbols import SymbolNode
 from ._core import AddEdge, GraphOp, PluginContext
 
 # Attribute names ``Typer`` uses to register a callable. Matched as the
@@ -62,33 +59,31 @@ class TyperPlugin:
     (``def make_app(): return Typer()``) and class-attribute apps
     (``self.app = Typer()``) are not handled; users can still keep those
     alive with explicit ``-e`` entrypoints.
-
-    This is a :class:`CSTAwareEdgePlugin` because detection needs the
-    original CST.
     """
 
     name: str = "typer"
-    cst_aware: bool = True
 
-    def contribute(
-        self, ctx: PluginContext, managers: dict[Path, FullRepoManager]
-    ) -> Iterable[GraphOp]:
-        modules_by_path: dict[Path, SymbolNode] = {}
-        for node in ctx.graph.nodes:
-            if node.type == "module":
-                modules_by_path[node.path] = node
+    def contribute(self, ctx: PluginContext) -> Iterable[GraphOp]:
+        # Prefilter via the import graph: only files that actually import
+        # ``typer`` can declare an app. Free because the resolver already
+        # added ``[external dist] typer`` predecessors for them.
+        candidate_paths = ctx.importers("typer")
+        if not candidate_paths:
+            return
 
-        for path, module_node in modules_by_path.items():
-            wrapper = _wrapper_for(path, managers)
-            if wrapper is None:
+        for path, module_node in ctx.base_modules():
+            if path not in candidate_paths:
                 continue
-            typer_imports = _collect_typer_imports(wrapper.module)
+            module = ctx.parse(path)
+            if module is None:
+                continue
+            typer_imports = _collect_typer_imports(module)
             if not typer_imports:
                 continue
-            instances = _find_instances(wrapper.module, typer_imports)
+            instances = _find_instances(module, typer_imports)
             if not instances:
                 continue
-            handlers = _find_handlers(wrapper.module, instances)
+            handlers = _find_handlers(module, instances)
 
             module_fqname = module_node.fqname
             for var_name in instances:
@@ -101,17 +96,6 @@ class TyperPlugin:
                             f"{module_fqname}.{handler_name}"
                         ):
                             yield AddEdge(instance_decl, handler_decl)
-
-
-def _wrapper_for(path: Path, managers: dict[Path, FullRepoManager]):
-    for base, mgr in managers.items():
-        if not path.is_relative_to(base):
-            continue
-        try:
-            return mgr.get_metadata_wrapper_for_path(path)
-        except Exception:
-            return None
-    return None
 
 
 def _collect_typer_imports(module: cst.Module) -> dict[str, str]:

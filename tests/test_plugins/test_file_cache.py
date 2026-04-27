@@ -1,0 +1,188 @@
+"""Tests for the per-base ``PluginContext`` surface: ``parse``, ``importers``,
+``base_modules``, and the analyzer's priming behaviour."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable
+
+import libcst as cst
+import networkx as nx
+
+from dead_cst import build_symbol_graph
+from dead_cst._plugins import GraphOp, PluginContext
+from dead_cst._symbols import SymbolTrie
+
+
+def _ctx(tmp_path, modules=None):
+    return PluginContext(
+        graph=nx.DiGraph(),
+        symbol_lookup=SymbolTrie(),
+        base=tmp_path,
+        project_root=tmp_path,
+        _modules=dict(modules or {}),
+    )
+
+
+def test_parse_uses_primed_module(tmp_path):
+    p = tmp_path / "a.py"
+    p.write_text("def f(): pass\n")
+    sentinel = cst.parse_module("def sentinel(): pass\n")
+    ctx = _ctx(tmp_path)
+    ctx.prime_module(p, sentinel)
+    # Disk content differs, but the primed module wins.
+    assert ctx.parse(p) is sentinel
+
+
+def test_parse_lazily_reads_unprimed_path(tmp_path):
+    p = tmp_path / "a.py"
+    p.write_text("def f(): pass\n")
+    ctx = _ctx(tmp_path)
+    module = ctx.parse(p)
+    assert isinstance(module, cst.Module)
+    # Mutating the file afterwards doesn't affect the cached parse.
+    p.write_text("def g(): pass\n")
+    assert ctx.parse(p) is module
+
+
+def test_parse_handles_syntax_error(tmp_path):
+    p = tmp_path / "broken.py"
+    p.write_text("def : pass\n")
+    ctx = _ctx(tmp_path)
+    assert ctx.parse(p) is None
+    # Failure is also cached.
+    assert ctx.parse(p) is None
+
+
+def test_analyze_primes_per_base_modules(tmp_path, write_files):
+    """build_symbol_graph hands plugins the modules it already parsed."""
+    write_files({"pkg/__init__.py": "", "pkg/a.py": "def f(): pass"})
+    seen: dict[Path, cst.Module] = {}
+
+    @dataclass
+    class _Capture:
+        name: str = "capture"
+
+        def contribute(self, ctx: PluginContext) -> Iterable[GraphOp]:
+            for path, _ in ctx.base_modules():
+                module = ctx.parse(path)
+                assert module is not None
+                seen[path] = module
+            return ()
+
+    build_symbol_graph(
+        {tmp_path: []},
+        plugins=[_Capture()],
+        project_root=tmp_path,
+    )
+    assert {p.name for p in seen} == {"__init__.py", "a.py"}
+    a_path = next(p for p in seen if p.name == "a.py")
+    assert "def f()" in seen[a_path].code
+
+
+def test_base_modules_only_yields_under_base(tmp_path, write_files):
+    """``ctx.base_modules()`` filters to the current base, not the full graph."""
+    write_files(
+        {
+            "a/pkg/__init__.py": "",
+            "a/pkg/m.py": "def f(): pass",
+            "b/pkg/__init__.py": "",
+            "b/pkg/m.py": "def g(): pass",
+        }
+    )
+    seen_per_base: dict[Path, set[str]] = {}
+
+    @dataclass
+    class _Capture:
+        name: str = "capture"
+
+        def contribute(self, ctx: PluginContext) -> Iterable[GraphOp]:
+            seen_per_base[ctx.base] = {p.name for p, _ in ctx.base_modules()}
+            return ()
+
+    build_symbol_graph(
+        {tmp_path / "a": [], tmp_path / "b": []},
+        plugins=[_Capture()],
+        project_root=tmp_path,
+    )
+    # Each base only sees its own files, even though the full graph
+    # contains both bases' nodes by the time the second base runs.
+    assert seen_per_base[tmp_path / "a"] == {"__init__.py", "m.py"}
+    assert seen_per_base[tmp_path / "b"] == {"__init__.py", "m.py"}
+
+
+def test_importers_finds_first_party_imports(tmp_path, write_files):
+    """``ctx.importers(fqname)`` returns paths whose imports reach the target module."""
+    write_files(
+        {
+            "pkg/__init__.py": "",
+            "pkg/lib.py": "def util(): pass",
+            "pkg/uses_lib.py": "from pkg.lib import util\nutil()",
+            "pkg/no_lib.py": "def f(): pass",
+        }
+    )
+    seen: set[Path] = set()
+
+    @dataclass
+    class _Capture:
+        name: str = "capture"
+
+        def contribute(self, ctx: PluginContext) -> Iterable[GraphOp]:
+            seen.update(ctx.importers("pkg.lib"))
+            return ()
+
+    build_symbol_graph(
+        {tmp_path: []},
+        plugins=[_Capture()],
+        project_root=tmp_path,
+    )
+    assert {p.name for p in seen} == {"uses_lib.py"}
+
+
+def test_importers_finds_third_party_dist(tmp_path, write_files):
+    """``ctx.importers("typer")`` resolves to the synthetic external dep node."""
+    write_files(
+        {
+            "pkg/__init__.py": "",
+            "pkg/uses_typer.py": "import typer\ncli = typer.Typer()",
+            "pkg/no_typer.py": "def f(): pass",
+        }
+    )
+    seen: set[Path] = set()
+
+    @dataclass
+    class _Capture:
+        name: str = "capture"
+
+        def contribute(self, ctx: PluginContext) -> Iterable[GraphOp]:
+            seen.update(ctx.importers("typer"))
+            return ()
+
+    build_symbol_graph(
+        {tmp_path: []},
+        plugins=[_Capture()],
+        project_root=tmp_path,
+    )
+    assert {p.name for p in seen} == {"uses_typer.py"}
+
+
+def test_importers_unknown_returns_empty(tmp_path, write_files):
+    write_files({"pkg/__init__.py": "", "pkg/a.py": "def f(): pass"})
+    saw_empty = False
+
+    @dataclass
+    class _Capture:
+        name: str = "capture"
+
+        def contribute(self, ctx: PluginContext) -> Iterable[GraphOp]:
+            nonlocal saw_empty
+            saw_empty = ctx.importers("definitely-not-a-module") == set()
+            return ()
+
+    build_symbol_graph(
+        {tmp_path: []},
+        plugins=[_Capture()],
+        project_root=tmp_path,
+    )
+    assert saw_empty

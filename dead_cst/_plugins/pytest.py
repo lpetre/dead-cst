@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import Iterable
 
 import libcst as cst
-from libcst.metadata import FullRepoManager
 
 from .._symbols import SymbolNode
 from ._core import AddEdge, AddNode, GraphOp, PluginContext, synthetic_node
@@ -35,26 +34,24 @@ class PytestPlugin:
 
     Marker decorators (``@pytest.mark.*``) are not interpreted: they only
     affect collection, never reachability.
-
-    This is a :class:`CSTAwareEdgePlugin` because fixture detection needs
-    to inspect decorators on the original CST.
     """
 
     name: str = "pytest"
-    cst_aware: bool = True
 
-    def contribute(
-        self, ctx: PluginContext, managers: dict[Path, FullRepoManager]
-    ) -> Iterable[GraphOp]:
-        modules_by_path: dict[Path, SymbolNode] = {}
+    def contribute(self, ctx: PluginContext) -> Iterable[GraphOp]:
         decls_by_path: dict[Path, list[SymbolNode]] = {}
         for node in ctx.graph.nodes:
-            if node.type == "module":
-                modules_by_path[node.path] = node
-            elif node.type in ("function", "class", "variable"):
+            if node.type in ("function", "class", "variable") and node.path.is_relative_to(
+                ctx.base
+            ):
                 decls_by_path.setdefault(node.path, []).append(node)
 
-        for path, module_node in modules_by_path.items():
+        # Fixture-branch prefilter: ``@pytest.fixture`` / ``@fixture``
+        # require importing pytest somewhere in the file. Free graph
+        # query, no source scan.
+        fixture_candidates = ctx.importers("pytest")
+
+        for path, module_node in ctx.base_modules():
             module_decls = decls_by_path.get(path, [])
             filename = path.name
 
@@ -68,10 +65,12 @@ class PytestPlugin:
                     f"<pytest:tests>:{module_node.fqname}", path, test_decls
                 )
 
-            wrapper = _wrapper_for(path, managers)
-            if wrapper is None:
+            if path not in fixture_candidates:
                 continue
-            fixture_names = _find_fixture_names(wrapper.module)
+            module = ctx.parse(path)
+            if module is None:
+                continue
+            fixture_names = _find_fixture_names(module)
             if not fixture_names:
                 continue
             fixture_decls = [
@@ -104,17 +103,6 @@ def _mark_entrypoints(seed_fqname: str, path: Path, targets: list[SymbolNode]) -
     yield AddNode(synth, entrypoint=True)
     for target in targets:
         yield AddEdge(synth, target)
-
-
-def _wrapper_for(path: Path, managers: dict[Path, FullRepoManager]):
-    for base, mgr in managers.items():
-        if not path.is_relative_to(base):
-            continue
-        try:
-            return mgr.get_metadata_wrapper_for_path(path)
-        except Exception:
-            return None
-    return None
 
 
 def _find_fixture_names(module: cst.Module) -> set[str]:

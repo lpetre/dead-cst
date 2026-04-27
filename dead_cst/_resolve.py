@@ -116,7 +116,7 @@ def resolve_edges(
 
     for src, dst in import_edges:
         if not isinstance(dst.path, Path):
-            if "external" in dst.path:
+            if dst.path.startswith(("[external", "[unresolved")):
                 yield from _emit(src, _synthetic(dst.path))
             continue
 
@@ -167,7 +167,7 @@ def resolve_edges(
                     assert decl.imports is not None, "import symbol needs Import"
 
                     if not isinstance(decl.imports.path, Path):
-                        if "external" in decl.imports.path:
+                        if decl.imports.path.startswith(("[external", "[unresolved")):
                             yield from _emit(src, _synthetic(decl.imports.path))
                         continue
 
