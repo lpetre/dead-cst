@@ -58,6 +58,17 @@ two versions.
   `@<group>.result_callback(...)` decorators. Click groups stay
   pass-through; reachability is expected through `[project.scripts]` or a
   `__main__` block, mirroring `TyperPlugin`.
+- `UnittestPlugin` (`--plugin unittest`): mark stdlib `unittest.TestCase`
+  and `unittest.IsolatedAsyncioTestCase` subclasses, plus module-level
+  `setUpModule` / `tearDownModule` / `load_tests` hooks, as entrypoints.
+  Discovery is CST-based and prefiltered to files whose import nodes
+  reference `unittest`. Supports `import unittest` (with alias),
+  `from unittest import TestCase` (with alias), and module-prefixed base
+  references. Only direct base-class matches are recognised; transitive
+  subclasses through a project-local mixin need an explicit `-e`
+  entrypoint or coverage from `PytestPlugin`'s filename heuristics.
+  `from unittest import *`-only files are skipped (the resolver doesn't
+  surface stdlib star imports as graph nodes); use a non-star import.
 - `dead-cst unused-exports` CLI command: report `__all__` entries whose targets
   are kept alive only because they are listed in `__all__`.
 - `dead-cst dependencies` CLI command: list third-party distributions and

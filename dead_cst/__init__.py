@@ -11,11 +11,11 @@ The public API has three layers:
   :class:`SymbolNode` instances. Edges encode "keeps alive" relationships.
 * Edge plugins (:class:`MainBlockPlugin`, :class:`ProjectScriptsPlugin`,
   :class:`ExplicitEntrypointPlugin`, :class:`ModuleDundersPlugin`,
-  :class:`PytestPlugin`, :class:`FastAPIPlugin`, :class:`FlaskPlugin`,
-  :class:`TyperPlugin`, :class:`ClickPlugin`) extend the graph with edges
-  that pure CST analysis can't infer -- entry points, framework
-  conventions, dynamic dispatch. Custom plugins implement the
-  :class:`EdgePlugin` protocol.
+  :class:`PytestPlugin`, :class:`UnittestPlugin`, :class:`FastAPIPlugin`,
+  :class:`FlaskPlugin`, :class:`TyperPlugin`, :class:`ClickPlugin`)
+  extend the graph with edges that pure CST analysis can't infer --
+  entry points, framework conventions, dynamic dispatch. Custom
+  plugins implement the :class:`EdgePlugin` protocol.
 * Path resolvers (:class:`VenvResolver`, :class:`PyprojectResolver`,
   :class:`UvWorkspaceResolver`) discover the ``{base: [dep_paths]}`` map
   itself from a project root, so callers don't have to hand-build it.
@@ -49,6 +49,7 @@ from ._plugins import (
     PytestPlugin,
     RemoveEdge,
     TyperPlugin,
+    UnittestPlugin,
     load_plugin,
 )
 from ._resolvers import (
@@ -84,6 +85,7 @@ __all__ = [
     "PytestPlugin",
     "RemoveEdge",
     "TyperPlugin",
+    "UnittestPlugin",
     "UvWorkspaceResolver",
     "VenvResolver",
     "build_symbol_graph",
