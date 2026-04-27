@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import Iterable
 
 import libcst as cst
-from libcst.metadata import FullRepoManager
 
 from .._symbols import SymbolNode
 from ._core import AddEdge, AddNode, GraphOp, PluginContext, synthetic_node
@@ -35,31 +34,24 @@ class PytestPlugin:
 
     Marker decorators (``@pytest.mark.*``) are not interpreted: they only
     affect collection, never reachability.
-
-    This is a :class:`CSTAwareEdgePlugin` because fixture detection needs
-    to inspect decorators on the original CST.
     """
 
     name: str = "pytest"
-    cst_aware: bool = True
 
-    def contribute(
-        self, ctx: PluginContext, managers: dict[Path, FullRepoManager]
-    ) -> Iterable[GraphOp]:
-        modules_by_path: dict[Path, SymbolNode] = {}
+    def contribute(self, ctx: PluginContext) -> Iterable[GraphOp]:
         decls_by_path: dict[Path, list[SymbolNode]] = {}
         for node in ctx.graph.nodes:
-            if node.type == "module":
-                modules_by_path[node.path] = node
-            elif node.type in ("function", "class", "variable"):
+            if node.type in ("function", "class", "variable") and node.path.is_relative_to(
+                ctx.base
+            ):
                 decls_by_path.setdefault(node.path, []).append(node)
 
-        # Cheap prefilter for the fixture branch: ``@pytest.fixture`` /
-        # ``@fixture`` decorators always include the literal ``fixture``
-        # substring, so any file that doesn't can skip the CST walk below.
-        fixture_candidates = set(ctx.grep("fixture", paths=modules_by_path.keys()))
+        # Fixture-branch prefilter: ``@pytest.fixture`` / ``@fixture``
+        # require importing pytest somewhere in the file. Free graph
+        # query, no source scan.
+        fixture_candidates = ctx.importers("pytest")
 
-        for path, module_node in modules_by_path.items():
+        for path, module_node in ctx.base_modules():
             module_decls = decls_by_path.get(path, [])
             filename = path.name
 

@@ -15,13 +15,10 @@ without any special-casing.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Iterable
 
 import libcst as cst
-from libcst.metadata import FullRepoManager
 
-from .._symbols import SymbolNode
 from ._core import AddEdge, AddNode, GraphOp, PluginContext
 
 # Attribute names FastAPI / APIRouter use to register a callable. Matched as
@@ -81,26 +78,21 @@ class FastAPIPlugin:
     apps (``def create_app(): return FastAPI()``) and class-attribute apps
     (``self.app = FastAPI()``) are not handled; users can still keep those
     alive with explicit ``-e`` entrypoints.
-
-    This is a :class:`CSTAwareEdgePlugin` because detection needs the
-    original CST.
     """
 
     name: str = "fastapi"
-    cst_aware: bool = True
 
-    def contribute(
-        self, ctx: PluginContext, managers: dict[Path, FullRepoManager]
-    ) -> Iterable[GraphOp]:
-        modules_by_path: dict[Path, SymbolNode] = {}
-        for node in ctx.graph.nodes:
-            if node.type == "module":
-                modules_by_path[node.path] = node
+    def contribute(self, ctx: PluginContext) -> Iterable[GraphOp]:
+        # Prefilter via the import graph: only files that actually import
+        # ``fastapi`` can declare an app or router. The analyzer's resolver
+        # already added ``[external dist] fastapi`` predecessors for them.
+        candidate_paths = ctx.importers("fastapi")
+        if not candidate_paths:
+            return
 
-        # Cheap prefilter: importing FastAPI / APIRouter requires the literal
-        # ``fastapi`` substring somewhere in the file. Modules that lack it
-        # can't be candidates and are skipped without a CST walk.
-        for path in ctx.grep("fastapi", paths=modules_by_path.keys()):
+        for path, module_node in ctx.base_modules():
+            if path not in candidate_paths:
+                continue
             module = ctx.parse(path)
             if module is None:
                 continue
@@ -112,7 +104,6 @@ class FastAPIPlugin:
                 continue
             handlers = _find_handlers(module, set(instances))
 
-            module_node = modules_by_path[path]
             module_fqname = module_node.fqname
             for var_name, kind in instances.items():
                 instance_decls = ctx.find_declarations(f"{module_fqname}.{var_name}")

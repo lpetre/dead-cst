@@ -5,15 +5,11 @@ the symbol graph after regular analysis is complete. Plugins exist to
 encode knowledge the static analyzer cannot infer from CST alone --
 dynamic dispatch, framework conventions, entry-point metadata, etc.
 
-Two flavors exist:
-
-* :class:`EdgePlugin` -- receives a :class:`PluginContext` only. Cheap.
-* :class:`CSTAwareEdgePlugin` -- additionally receives the per-base
-  :class:`FullRepoManager` map, letting the plugin re-walk source with
-  libcst metadata providers.
-
-``build_symbol_graph`` iterates the plugin list and dispatches to whichever
-protocol each plugin satisfies (``isinstance``).
+The analyzer runs every plugin once per base in topological order, after
+that base's import edges have been resolved. Plugins receive a per-base
+:class:`PluginContext`; see its docstring for the available helpers
+(:meth:`~PluginContext.parse`, :meth:`~PluginContext.importers`,
+:meth:`~PluginContext.base_modules`, ...).
 
 Plugins emit :class:`GraphOp` values rather than mutating the graph
 directly; this keeps them easy to test and lets the analyzer report back
@@ -30,9 +26,7 @@ from ._core import (
     SYNTHETIC_POSITION,
     AddEdge,
     AddNode,
-    CSTAwareEdgePlugin,
     EdgePlugin,
-    FileTextCache,
     GraphOp,
     PluginContext,
     RemoveEdge,
@@ -76,11 +70,9 @@ __all__ = [
     "AddEdge",
     "AddNode",
     "BUILTIN_PLUGINS",
-    "CSTAwareEdgePlugin",
     "EdgePlugin",
     "ExplicitEntrypointPlugin",
     "FastAPIPlugin",
-    "FileTextCache",
     "GraphOp",
     "MainBlockPlugin",
     "ModuleDundersPlugin",

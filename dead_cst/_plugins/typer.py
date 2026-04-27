@@ -18,13 +18,10 @@ the behavior of :class:`FastAPIPlugin` for ``APIRouter``.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Iterable
 
 import libcst as cst
-from libcst.metadata import FullRepoManager
 
-from .._symbols import SymbolNode
 from ._core import AddEdge, GraphOp, PluginContext
 
 # Attribute names ``Typer`` uses to register a callable. Matched as the
@@ -62,26 +59,21 @@ class TyperPlugin:
     (``def make_app(): return Typer()``) and class-attribute apps
     (``self.app = Typer()``) are not handled; users can still keep those
     alive with explicit ``-e`` entrypoints.
-
-    This is a :class:`CSTAwareEdgePlugin` because detection needs the
-    original CST.
     """
 
     name: str = "typer"
-    cst_aware: bool = True
 
-    def contribute(
-        self, ctx: PluginContext, managers: dict[Path, FullRepoManager]
-    ) -> Iterable[GraphOp]:
-        modules_by_path: dict[Path, SymbolNode] = {}
-        for node in ctx.graph.nodes:
-            if node.type == "module":
-                modules_by_path[node.path] = node
+    def contribute(self, ctx: PluginContext) -> Iterable[GraphOp]:
+        # Prefilter via the import graph: only files that actually import
+        # ``typer`` can declare an app. Free because the resolver already
+        # added ``[external dist] typer`` predecessors for them.
+        candidate_paths = ctx.importers("typer")
+        if not candidate_paths:
+            return
 
-        # Cheap prefilter: importing Typer requires the literal ``typer``
-        # substring somewhere in the file. Modules that lack it can't be
-        # candidates and are skipped without a CST walk.
-        for path in ctx.grep("typer", paths=modules_by_path.keys()):
+        for path, module_node in ctx.base_modules():
+            if path not in candidate_paths:
+                continue
             module = ctx.parse(path)
             if module is None:
                 continue
@@ -93,7 +85,6 @@ class TyperPlugin:
                 continue
             handlers = _find_handlers(module, instances)
 
-            module_node = modules_by_path[path]
             module_fqname = module_node.fqname
             for var_name in instances:
                 instance_decls = ctx.find_declarations(f"{module_fqname}.{var_name}")

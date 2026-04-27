@@ -14,8 +14,7 @@ The public API has three layers:
   :class:`PytestPlugin`, :class:`FastAPIPlugin`, :class:`TyperPlugin`)
   extend the graph with edges that pure CST analysis can't infer --
   entry points, framework conventions, dynamic dispatch. Custom plugins
-  implement the :class:`EdgePlugin` or :class:`CSTAwareEdgePlugin`
-  protocol.
+  implement the :class:`EdgePlugin` protocol.
 * Path resolvers (:class:`VenvResolver`, :class:`PyprojectResolver`,
   :class:`UvWorkspaceResolver`) discover the ``{base: [dep_paths]}`` map
   itself from a project root, so callers don't have to hand-build it.
@@ -35,11 +34,9 @@ from ._plugins import (
     AddEdge,
     AddNode,
     BUILTIN_PLUGINS,
-    CSTAwareEdgePlugin,
     EdgePlugin,
     ExplicitEntrypointPlugin,
     FastAPIPlugin,
-    FileTextCache,
     GraphOp,
     MainBlockPlugin,
     ModuleDundersPlugin,
@@ -67,11 +64,9 @@ __all__ = [
     "AddNode",
     "BUILTIN_PLUGINS",
     "BUILTIN_RESOLVERS",
-    "CSTAwareEdgePlugin",
     "EdgePlugin",
     "ExplicitEntrypointPlugin",
     "FastAPIPlugin",
-    "FileTextCache",
     "GraphOp",
     "MainBlockPlugin",
     "ModuleDundersPlugin",

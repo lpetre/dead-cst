@@ -8,9 +8,7 @@ from libcst.metadata import FullRepoManager
 
 from ._fqn import FixedFullyQualifiedNameProvider
 from ._plugins import (
-    CSTAwareEdgePlugin,
     EdgePlugin,
-    FileTextCache,
     PluginContext,
     apply_ops,
 )
@@ -42,7 +40,7 @@ def order_paths(paths: dict[Path, list[Path]]) -> list[Path]:
 def build_symbol_graph(
     paths: dict[Path, list[Path]],
     *,
-    plugins: Sequence[EdgePlugin | CSTAwareEdgePlugin] = (),
+    plugins: Sequence[EdgePlugin] = (),
     project_root: Path | None = None,
 ) -> nx.DiGraph:
     """Build a directed reachability graph of every top-level symbol under ``paths``.
@@ -63,6 +61,11 @@ def build_symbol_graph(
     / ``[external file] <name>`` nodes so callers can audit the
     project's dependency surface (see the ``dependencies`` CLI command).
 
+    Plugins run once per base in topological order, after that base's import
+    edges have been resolved. Each plugin invocation gets a per-base
+    :class:`PluginContext` whose parsed-module cache is primed with the
+    modules the analyzer just walked, so plugins never re-read or re-parse.
+
     Parameters
     ----------
     paths:
@@ -71,14 +74,12 @@ def build_symbol_graph(
         a monorepo, list the dependencies so they're added to ``sys.path``
         and resolved as first-party. ``order_paths`` orders the bases.
     plugins:
-        Sequence of :class:`EdgePlugin` / :class:`CSTAwareEdgePlugin`
-        instances run after analysis. Plugins emit :class:`AddNode`,
-        :class:`AddEdge`, and :class:`RemoveEdge` ops; ``AddNode(...,
-        entrypoint=True)`` seeds :func:`find_reachable`.
+        Sequence of :class:`EdgePlugin` instances. Plugins emit
+        :class:`AddNode`, :class:`AddEdge`, and :class:`RemoveEdge` ops;
+        ``AddNode(..., entrypoint=True)`` seeds :func:`find_reachable`.
     project_root:
-        Project root used by plugins for path-relative matching and for
-        locating ``pyproject.toml``. If omitted, inferred as the shortest
-        path in ``paths``.
+        Project root used by plugins for path-relative matching. If
+        omitted, inferred as the shortest path in ``paths``.
 
     Returns
     -------
@@ -89,12 +90,7 @@ def build_symbol_graph(
     symbol_graph = nx.DiGraph()
     base_tries: dict[Path, SymbolTrie] = {}
     export_tries: dict[Path, SymbolTrie] = {}
-    base_managers: dict[Path, FullRepoManager] = {}
-    all_files: list[Path] = []
-    # Hand each parsed module to the plugin file cache so plugins don't
-    # have to re-parse. Only collected when there are plugins to feed.
-    parsed_modules: dict[Path, cst.Module] | None = {} if plugins else None
-    symbol_lookup: SymbolTrie = SymbolTrie()
+    root = project_root or _infer_project_root(paths) if paths else Path.cwd()
     for base in order_paths(paths):
         logger.debug("Processing base path: %s", base)
         search_paths = [base] + paths.get(base, [])
@@ -106,12 +102,13 @@ def build_symbol_graph(
             import_edges = set()
             files = list(sorted(base.rglob("*.py")))
             mgr = FullRepoManager(base, files, {FixedFullyQualifiedNameProvider})
-            base_managers[base] = mgr
-            all_files.extend(files)
+            # Stash the modules the visitor pass parses so plugins can reuse
+            # them via ``ctx.parse(path)`` without re-reading or re-parsing.
+            base_modules: dict[Path, cst.Module] | None = {} if plugins else None
             for file in files:
                 wrapper = mgr.get_metadata_wrapper_for_path(file)
-                if parsed_modules is not None:
-                    parsed_modules[file] = wrapper.module
+                if base_modules is not None:
+                    base_modules[file] = wrapper.module
                 visitor = SymbolVisitor(file, search_paths)
                 wrapper.visit(visitor)
                 # A file's decls go into ``export_trie`` only when the file
@@ -182,29 +179,29 @@ def build_symbol_graph(
             for src, dst in resolve_edges(import_edges, symbol_lookup, base):
                 symbol_graph.add_edge(src, dst)
 
-    if plugins:
-        root = project_root or _infer_project_root(paths)
-        file_cache = FileTextCache(all_files)
-        if parsed_modules is not None:
-            for path, module in parsed_modules.items():
-                file_cache.prime_module(path, module)
-        ctx = PluginContext(
-            graph=symbol_graph,
-            symbol_lookup=symbol_lookup,
-            paths=paths,
-            project_root=root,
-            file_cache=file_cache,
-        )
-        for plugin in plugins:
-            if isinstance(plugin, CSTAwareEdgePlugin):
-                ops = list(plugin.contribute(ctx, base_managers))
-            elif isinstance(plugin, EdgePlugin):
-                ops = list(plugin.contribute(ctx))
-            else:
-                raise TypeError(f"Plugin {plugin!r} does not satisfy EdgePlugin protocol")
-            # Materialize before applying so plugins can iterate ctx.graph.nodes
-            # without tripping "dictionary changed size during iteration".
-            apply_ops(symbol_graph, ops)
+            # Plugin pass for this base, with the symbol lookup that was
+            # valid at this base's resolution time and the parsed modules
+            # we just walked. The context (and ``base_modules``) goes out
+            # of scope once we move to the next base, so the parsed CSTs
+            # for this base can be GC'd.
+            if plugins:
+                ctx = PluginContext(
+                    graph=symbol_graph,
+                    symbol_lookup=symbol_lookup,
+                    base=base,
+                    project_root=root,
+                )
+                if base_modules is not None:
+                    for path, module in base_modules.items():
+                        ctx.prime_module(path, module)
+                for plugin in plugins:
+                    if not isinstance(plugin, EdgePlugin):
+                        raise TypeError(f"Plugin {plugin!r} does not satisfy EdgePlugin protocol")
+                    # Materialize before applying so plugins can iterate
+                    # ctx.graph.nodes without tripping "dictionary changed
+                    # size during iteration".
+                    ops = list(plugin.contribute(ctx))
+                    apply_ops(symbol_graph, ops)
 
     return symbol_graph
 
