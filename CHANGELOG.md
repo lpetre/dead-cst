@@ -22,8 +22,9 @@ two versions.
   `GraphOp`/`AddNode`/`AddEdge`/`RemoveEdge`, `apply_ops`, `synthetic_node`).
   Built-in plugins: `MainBlockPlugin`, `ProjectScriptsPlugin`,
   `ExplicitEntrypointPlugin`, `ModuleDundersPlugin`, `PytestPlugin`,
-  `FastAPIPlugin`, `TyperPlugin`. Third-party plugins register under the
-  `dead_cst.plugins` entry-point group and load via `load_plugin`.
+  `FastAPIPlugin`, `FlaskPlugin`, `TyperPlugin`, `ClickPlugin`. Third-party
+  plugins register under the `dead_cst.plugins` entry-point group and load
+  via `load_plugin`.
 - Path resolver architecture (`PathResolver`, `merge_paths`). Built-in
   resolvers: `VenvResolver`, `PyprojectResolver`, `UvWorkspaceResolver`. Third-
   party resolvers register under `dead_cst.resolvers` and load via
@@ -39,6 +40,21 @@ two versions.
   is expected through `[project.scripts]` or a `__main__` block, after which
   every registered command and callback stays alive. Sub-typers that are
   never `add_typer`'d remain dead.
+- `FlaskPlugin` (`--plugin flask`): detect top-level `Flask()` / `Blueprint()`
+  instances and emit `instance -> handler` edges for `@app.route(...)`,
+  HTTP-verb shortcuts (`@app.get(...)`, ...), request-lifecycle hooks
+  (`before_request`, `after_request`, `teardown_*`), error handlers,
+  template helpers (`context_processor`, `template_filter`, ...), and URL
+  processors. `Flask` apps are seeded as entrypoints (WSGI servers load
+  them); `Blueprint`s are pass-through, so a blueprint never
+  `register_blueprint`'d stays dead.
+- `ClickPlugin` (`--plugin click`): detect top-level Click `Group` instances
+  (functions decorated `@click.group(...)` or `X = click.Group(...)`,
+  including aliased / module-prefixed forms, and nested groups registered
+  inline via `@cli.group(...)`) and emit `instance -> handler` edges for
+  `@cli.command(...)`, `@cli.group(...)`, and `@cli.result_callback(...)`
+  decorators. Click groups are pass-through; reachability is expected
+  through `[project.scripts]` or a `__main__` block.
 - `dead-cst unused-exports` CLI command: report `__all__` entries whose targets
   are kept alive only because they are listed in `__all__`.
 - `dead-cst dependencies` CLI command: list third-party distributions and
