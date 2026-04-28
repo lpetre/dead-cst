@@ -29,7 +29,7 @@ from ._core import (
 
 # Attribute names FastAPI / APIRouter use to register a callable. Matched as
 # the rightmost attribute of ``@<instance>.<name>(...)``.
-_ROUTE_DECORATORS: frozenset[str] = frozenset(
+_REGISTRATION_DECORATORS: frozenset[str] = frozenset(
     {
         "get",
         "post",
@@ -108,7 +108,7 @@ class FastAPIPlugin:
             instances = find_call_assignments(module, fastapi_imports, _INSTANCE_KINDS)
             if not instances:
                 continue
-            handlers = find_handlers(module, set(instances), _ROUTE_DECORATORS)
+            handlers = find_handlers(module, set(instances), _REGISTRATION_DECORATORS)
 
             module_fqname = module_node.fqname
             for var_name, kind in instances.items():

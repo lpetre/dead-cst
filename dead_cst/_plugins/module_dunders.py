@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Iterable
 
 from .._symbols import SymbolNode
-from ._core import GraphOp, PluginContext, mark_entrypoints
+from ._core import GraphOp, PluginContext, mark_entrypoints, simple_name
 
 DUNDER_PREFIX = "<dunder>:"
 
@@ -36,5 +36,5 @@ def _is_module_dunder(node: SymbolNode) -> bool:
     """True for module-level variables named like ``__xxx__``."""
     if node.type != "variable":
         return False
-    name = node.fqname.rpartition(".")[2]
+    name = simple_name(node.fqname)
     return len(name) > 4 and name.startswith("__") and name.endswith("__")

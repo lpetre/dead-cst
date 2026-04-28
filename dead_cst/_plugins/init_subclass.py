@@ -33,7 +33,7 @@ from typing import Iterable
 import libcst as cst
 
 from .._symbols import SymbolNode
-from ._core import AddEdge, AddNode, GraphOp, PluginContext, synthetic_node
+from ._core import AddEdge, AddNode, GraphOp, PluginContext, simple_name, synthetic_node
 
 _INIT_SUBCLASS = "__init_subclass__"
 INIT_SUBCLASS_PREFIX = "<__init_subclass__>:"
@@ -172,7 +172,7 @@ def _find_class_def(module: cst.Module, class_node: SymbolNode) -> cst.ClassDef 
     branch of an ``if/else`` defines the same name), the first match
     wins; both share the same MRO for ``__init_subclass__`` purposes.
     """
-    name = class_node.fqname.rsplit(".", 1)[-1]
+    name = simple_name(class_node.fqname)
     for stmt in module.body:
         if isinstance(stmt, cst.ClassDef) and stmt.name.value == name:
             return stmt

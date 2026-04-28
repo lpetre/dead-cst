@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 
 from ._core import PathMap, load_toml
 
 
+@dataclass
 class PyprojectResolver:
     """Read ``[tool.dead-cst]`` from a project's ``pyproject.toml`` and turn
     its configured paths into a ``PathMap``.
@@ -23,7 +25,7 @@ class PyprojectResolver:
     layout when present.
     """
 
-    name = "pyproject"
+    name: str = "pyproject"
 
     def resolve(self, project_root: Path) -> PathMap:
         project_root = project_root.resolve()

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import logging
 from pathlib import Path
 from typing import Sequence
@@ -13,14 +15,14 @@ from ._plugins import (
     apply_ops,
 )
 from ._resolve import resolve_edges, safe_resolve_module, temp_sys_path
-from ._resolvers import exported_roots
+from ._resolvers import PathMap, exported_roots
 from ._symbols import SymbolNode, SymbolTrie
 from ._visitor import SymbolVisitor
 
 logger = logging.getLogger(__name__)
 
 
-def order_paths(paths: dict[Path, list[Path]]) -> list[Path]:
+def order_paths(paths: PathMap) -> list[Path]:
     """Topologically sort base paths so dependencies are processed first.
 
     ``paths`` maps each base directory to the list of other base directories
@@ -38,7 +40,7 @@ def order_paths(paths: dict[Path, list[Path]]) -> list[Path]:
 
 
 def build_symbol_graph(
-    paths: dict[Path, list[Path]],
+    paths: PathMap,
     *,
     plugins: Sequence[EdgePlugin] = (),
     project_root: Path | None = None,
@@ -211,7 +213,7 @@ def _under_any(file: Path, roots: list[Path]) -> bool:
     return False
 
 
-def _infer_project_root(paths: dict[Path, list[Path]]) -> Path:
+def _infer_project_root(paths: PathMap) -> Path:
     bases = list(paths)
     if not bases:
         return Path.cwd()

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 from ._core import PathMap
 
 
+@dataclass
 class VenvResolver:
     """Discover a sibling ``.venv`` (or the active venv) and add its
     ``site-packages`` as a dep path of the project root.
@@ -16,10 +18,8 @@ class VenvResolver:
     lets the graph correctly classify external imports instead of warning.
     """
 
-    name = "venv"
-
-    def __init__(self, venv_dir: str | None = None) -> None:
-        self.venv_dir = venv_dir
+    venv_dir: str | None = None
+    name: str = "venv"
 
     def resolve(self, project_root: Path) -> PathMap:
         project_root = project_root.resolve()

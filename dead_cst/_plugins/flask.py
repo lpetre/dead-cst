@@ -32,7 +32,7 @@ from ._core import (
 # verb shortcuts (``app.get`` / ``app.post`` / ...), request lifecycle
 # hooks, error handlers, template / context helpers, URL processors, and
 # the ``app_*`` variants Blueprints use to register app-scoped callbacks.
-_ROUTE_DECORATORS: frozenset[str] = frozenset(
+_REGISTRATION_DECORATORS: frozenset[str] = frozenset(
     {
         "route",
         "get",
@@ -129,7 +129,7 @@ class FlaskPlugin:
             instances = find_call_assignments(module, flask_imports, _INSTANCE_KINDS)
             if not instances:
                 continue
-            handlers = find_handlers(module, set(instances), _ROUTE_DECORATORS)
+            handlers = find_handlers(module, set(instances), _REGISTRATION_DECORATORS)
 
             module_fqname = module_node.fqname
             for var_name, kind in instances.items():

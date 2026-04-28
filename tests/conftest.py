@@ -1,7 +1,6 @@
 import textwrap
 
 import networkx as nx
-
 import pytest
 
 from dead_cst import build_symbol_graph
@@ -9,15 +8,29 @@ from dead_cst._branches import is_unreachable_node
 
 
 @pytest.fixture
+def write_files(tmp_path):
+    """Write a ``{relpath: source}`` mapping under ``tmp_path``.
+
+    Each value is dedented and stripped, with a trailing newline appended,
+    matching the inline-source convention used across the test suite.
+    """
+
+    def _write(files: dict[str, str]) -> None:
+        for name, src in files.items():
+            p = tmp_path / name
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(textwrap.dedent(src).strip() + "\n")
+
+    return _write
+
+
+@pytest.fixture
 def build_decl_graph(tmp_path):
     def _make_graph(files: dict[str, str]) -> nx.DiGraph:
-        # Write each file to the temporary directory
         for filename, content in files.items():
             full_path = tmp_path / filename
             full_path.parent.mkdir(parents=True, exist_ok=True)
             full_path.write_text(textwrap.dedent(content).strip())
-
-        # Build the declaration graph
         return build_symbol_graph({tmp_path: []})
 
     return _make_graph

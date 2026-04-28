@@ -8,7 +8,7 @@ import re
 import sys
 from enum import Enum
 from pathlib import Path
-from typing import Annotated, Optional
+from typing import Annotated
 
 import networkx as nx
 import typer
@@ -23,7 +23,7 @@ from ._plugins import (
 )
 from ._plugins._core import EXTERNAL_PREFIXES
 from ._plugins.module_dunders import DUNDER_PREFIX
-from ._resolvers import load_resolver, merge_paths
+from ._resolvers import PathMap, load_resolver, merge_paths
 from ._symbols import SymbolNode
 
 
@@ -79,9 +79,7 @@ def build_plugins(
     return plugins
 
 
-def resolve_paths(
-    root: Path, path_specs: list[str], resolver_names: list[str]
-) -> dict[Path, list[Path]]:
+def resolve_paths(root: Path, path_specs: list[str], resolver_names: list[str]) -> PathMap:
     """Merge ``-p`` specs and ``--resolver`` outputs into a single path map."""
     explicit = parse_paths(root, path_specs) if path_specs else {}
     resolved_maps = [load_resolver(name).resolve(root) for name in resolver_names]
@@ -90,7 +88,7 @@ def resolve_paths(
     return merge_paths(explicit, *resolved_maps)
 
 
-def parse_paths(root: Path, paths_str: list[str]) -> dict[Path, list[Path]]:
+def parse_paths(root: Path, paths_str: list[str]) -> PathMap:
     """Parse path specifications into the paths dict format.
 
     Format: "base:dep1,dep2,dep3" or just "base" for no dependencies.
@@ -122,7 +120,7 @@ def version_callback(value: bool) -> None:
 @app.callback()
 def main(
     version: Annotated[
-        Optional[bool],
+        bool | None,
         typer.Option("--version", callback=version_callback, is_eager=True, help="Show version."),
     ] = None,
 ) -> None:
@@ -133,7 +131,7 @@ def main(
 def analyze(
     root: Annotated[Path, typer.Argument(help="Root directory to analyze.")],
     entrypoint: Annotated[
-        Optional[list[str]],
+        list[str] | None,
         typer.Option(
             "-e",
             "--entrypoint",
@@ -141,15 +139,15 @@ def analyze(
         ),
     ] = None,
     path: Annotated[
-        Optional[list[str]],
+        list[str] | None,
         typer.Option("-p", "--path", help="Search path spec: 'base:dep1,dep2' or 'base'."),
     ] = None,
     resolver: Annotated[
-        Optional[list[str]],
+        list[str] | None,
         typer.Option("--resolver", help="Path resolver to run (e.g. venv, pyproject)."),
     ] = None,
     plugin: Annotated[
-        Optional[list[str]],
+        list[str] | None,
         typer.Option("--plugin", help="Edge plugin to run (e.g. main_block, project_scripts)."),
     ] = None,
     verbose: Annotated[
@@ -188,7 +186,7 @@ def _output_text(
     graph: nx.DiGraph,
     unreachable: nx.DiGraph,
     root: Path,
-    paths_dict: dict[Path, list[Path]],
+    paths_dict: PathMap,
 ) -> None:
     for base in order_paths(paths_dict):
         typer.echo(f"\n{base}:")
@@ -242,7 +240,7 @@ def _output_json(
     graph: nx.DiGraph,
     unreachable: nx.DiGraph,
     root: Path,
-    paths_dict: dict[Path, list[Path]],
+    paths_dict: PathMap,
 ) -> None:
     result: dict = {
         "summary": {},
@@ -290,15 +288,15 @@ def why_alive(
     root: Annotated[Path, typer.Argument(help="Root directory to analyze.")],
     fqname: Annotated[str, typer.Argument(help="Fully qualified name of the symbol to check.")],
     path: Annotated[
-        Optional[list[str]],
+        list[str] | None,
         typer.Option("-p", "--path", help="Search path spec: 'base:dep1,dep2' or 'base'."),
     ] = None,
     resolver: Annotated[
-        Optional[list[str]],
+        list[str] | None,
         typer.Option("--resolver", help="Path resolver to run (e.g. venv, pyproject)."),
     ] = None,
     plugin: Annotated[
-        Optional[list[str]],
+        list[str] | None,
         typer.Option("--plugin", help="Edge plugin to run (e.g. main_block, project_scripts)."),
     ] = None,
     verbose: Annotated[
@@ -356,11 +354,11 @@ def _is_external_dep(node: SymbolNode) -> bool:
 def dependencies(
     root: Annotated[Path, typer.Argument(help="Root directory to analyze.")],
     path: Annotated[
-        Optional[list[str]],
+        list[str] | None,
         typer.Option("-p", "--path", help="Search path spec: 'base:dep1,dep2' or 'base'."),
     ] = None,
     resolver: Annotated[
-        Optional[list[str]],
+        list[str] | None,
         typer.Option("--resolver", help="Path resolver to run (e.g. venv, pyproject)."),
     ] = None,
     verbose: Annotated[
@@ -406,7 +404,7 @@ def dependencies(
 def unused_exports(
     root: Annotated[Path, typer.Argument(help="Root directory to analyze.")],
     entrypoint: Annotated[
-        Optional[list[str]],
+        list[str] | None,
         typer.Option(
             "-e",
             "--entrypoint",
@@ -414,15 +412,15 @@ def unused_exports(
         ),
     ] = None,
     path: Annotated[
-        Optional[list[str]],
+        list[str] | None,
         typer.Option("-p", "--path", help="Search path spec: 'base:dep1,dep2' or 'base'."),
     ] = None,
     resolver: Annotated[
-        Optional[list[str]],
+        list[str] | None,
         typer.Option("--resolver", help="Path resolver to run (e.g. venv, pyproject)."),
     ] = None,
     plugin: Annotated[
-        Optional[list[str]],
+        list[str] | None,
         typer.Option("--plugin", help="Edge plugin to run (e.g. main_block, project_scripts)."),
     ] = None,
     verbose: Annotated[
@@ -480,7 +478,7 @@ def unused_exports(
 def remove(
     root: Annotated[Path, typer.Argument(help="Root directory to analyze.")],
     entrypoint: Annotated[
-        Optional[list[str]],
+        list[str] | None,
         typer.Option(
             "-e",
             "--entrypoint",
@@ -488,15 +486,15 @@ def remove(
         ),
     ] = None,
     path: Annotated[
-        Optional[list[str]],
+        list[str] | None,
         typer.Option("-p", "--path", help="Search path spec: 'base:dep1,dep2' or 'base'."),
     ] = None,
     resolver: Annotated[
-        Optional[list[str]],
+        list[str] | None,
         typer.Option("--resolver", help="Path resolver to run (e.g. venv, pyproject)."),
     ] = None,
     plugin: Annotated[
-        Optional[list[str]],
+        list[str] | None,
         typer.Option("--plugin", help="Edge plugin to run (e.g. main_block, project_scripts)."),
     ] = None,
     verbose: Annotated[

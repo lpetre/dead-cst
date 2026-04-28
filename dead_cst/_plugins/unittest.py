@@ -9,7 +9,7 @@ from typing import Iterable
 import libcst as cst
 
 from .._symbols import SymbolNode
-from ._core import GraphOp, PluginContext, is_from_module, is_name, mark_entrypoints
+from ._core import GraphOp, PluginContext, is_from_module, is_name, mark_entrypoints, simple_name
 
 UNITTEST_PREFIX = "<unittest>:"
 
@@ -54,9 +54,7 @@ class UnittestPlugin:
         # ``Import.module`` field instead of an ``[external dist]`` marker.
         candidate_paths: set[Path] = set()
         decls_by_path: dict[Path, list[SymbolNode]] = {}
-        for node in ctx.graph.nodes:
-            if not node.path.is_relative_to(ctx.base):
-                continue
+        for node in ctx.base_nodes():
             if node.type in ("function", "class"):
                 decls_by_path.setdefault(node.path, []).append(node)
             elif (
@@ -90,7 +88,7 @@ class UnittestPlugin:
                 continue
 
             module_decls = decls_by_path.get(path, [])
-            targets = [d for d in module_decls if d.fqname.rsplit(".", 1)[-1] in wanted]
+            targets = [d for d in module_decls if simple_name(d.fqname) in wanted]
             if not targets:
                 continue
 

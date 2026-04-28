@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import contextlib
 import logging
 import os
@@ -75,7 +77,7 @@ def distribution_lookup() -> dict[Path, str]:
     return lookup
 
 
-def resolve_import(name: str, search_paths: list[Path]) -> str | Path:
+def resolve_import(name: str, search_paths: list[Path]) -> str | Path | None:
     spec = safe_resolve_module(name)
     if spec is None:
         return None
