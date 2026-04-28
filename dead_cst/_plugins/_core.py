@@ -53,6 +53,12 @@ class PluginContext:
     # is fine in practice -- ``importers`` is for prefiltering against
     # the analyzer's already-resolved dep markers.
     _synthetic_index: dict[str, SymbolNode] | None = field(default=None, init=False, repr=False)
+    # Cached materialization of ``base_modules``. Plugins don't add module
+    # nodes during their pass (only the visitor pass does, before plugins
+    # run), so a one-time scan of ``graph.nodes`` is safe to memoize.
+    _base_modules_cache: list[tuple[Path, SymbolNode]] | None = field(
+        default=None, init=False, repr=False
+    )
 
     def find_module(self, fqname: str) -> SymbolNode | None:
         node = self.symbol_lookup._get(fqname.split("."))
@@ -76,9 +82,13 @@ class PluginContext:
 
     def base_modules(self) -> Iterator[tuple[Path, SymbolNode]]:
         """Yield ``(path, module_node)`` for every module under :attr:`base`."""
-        for node in self.graph.nodes:
-            if node.type == "module" and node.path.is_relative_to(self.base):
-                yield node.path, node
+        if self._base_modules_cache is None:
+            self._base_modules_cache = [
+                (node.path, node)
+                for node in self.graph.nodes
+                if node.type == "module" and node.path.is_relative_to(self.base)
+            ]
+        return iter(self._base_modules_cache)
 
     def importers(self, target: str) -> set[Path]:
         """Return paths under :attr:`base` whose imports reach ``target``.
@@ -282,6 +292,60 @@ def find_handlers(
             handlers.setdefault(owner, []).append(stmt.name.value)
             break
     return handlers
+
+
+def matched_attr_call(
+    expr: cst.BaseExpression,
+    imports: dict[str, str],
+    valid_targets: Container[str],
+    *,
+    unwrap_call: bool = True,
+) -> str | None:
+    """Return the matched target name for ``expr`` against ``imports`` / ``valid_targets``.
+
+    Recognizes both forms produced by ``collect_module_imports``:
+
+    * bare ``Name`` (e.g. ``Flask``) where ``imports[name]`` is a real
+      target in ``valid_targets`` (from ``from <mod> import Flask``);
+    * module-prefixed ``Attribute`` (e.g. ``flask.Flask``) where
+      ``imports[<bare module>] == "<module>"`` and the rightmost attr
+      is in ``valid_targets``.
+
+    ``unwrap_call=True`` (default) handles ``Foo(...)`` by inspecting
+    ``.func``; pass ``False`` for callers that have already unwrapped.
+    Returns ``None`` if no match.
+    """
+    if unwrap_call and isinstance(expr, cst.Call):
+        expr = expr.func
+    if isinstance(expr, cst.Name):
+        target = imports.get(expr.value)
+        if target in valid_targets:
+            return target
+    elif isinstance(expr, cst.Attribute) and isinstance(expr.value, cst.Name):
+        if imports.get(expr.value.value) == "<module>":
+            attr = expr.attr.value
+            if attr in valid_targets:
+                return attr
+    return None
+
+
+def find_call_assignments(
+    module: cst.Module, imports: dict[str, str], valid_targets: Container[str]
+) -> dict[str, str]:
+    """Return ``{var_name: target_name}`` for top-level ``X = <call>`` where
+    ``<call>`` matches one of ``valid_targets`` via :func:`matched_attr_call`."""
+    instances: dict[str, str] = {}
+    for stmt in module.body:
+        if not isinstance(stmt, cst.SimpleStatementLine):
+            continue
+        for small in stmt.body:
+            target_name, value = single_target_assignment(small)
+            if target_name is None or not isinstance(value, cst.Call):
+                continue
+            kind = matched_attr_call(value.func, imports, valid_targets, unwrap_call=False)
+            if kind is not None:
+                instances[target_name] = kind
+    return instances
 
 
 def collect_module_imports(

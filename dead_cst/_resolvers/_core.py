@@ -8,7 +8,7 @@ multiple resolvers' outputs.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 PathMap = dict[Path, list[Path]]
 
@@ -18,6 +18,18 @@ class PathResolver(Protocol):
     name: str
 
     def resolve(self, project_root: Path) -> PathMap: ...
+
+
+def load_toml(path: Path) -> dict[str, Any] | None:
+    """Read ``path`` as TOML; ``None`` if the file is missing or tomllib is unavailable."""
+    if not path.is_file():
+        return None
+    try:
+        import tomllib
+    except ImportError:  # pragma: no cover - py<3.11 not supported
+        return None
+    with path.open("rb") as f:
+        return tomllib.load(f)
 
 
 def merge_paths(*maps: PathMap) -> PathMap:

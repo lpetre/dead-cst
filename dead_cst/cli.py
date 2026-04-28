@@ -48,6 +48,14 @@ def parse_entrypoint(ep: str) -> str | re.Pattern[str]:
     return ep
 
 
+def _rel_path(path: Path, root: Path) -> Path:
+    """``path`` made relative to ``root`` if possible, else ``path`` unchanged."""
+    try:
+        return path.relative_to(root)
+    except ValueError:
+        return path
+
+
 def build_plugins(
     *,
     entrypoints: list[str],
@@ -202,23 +210,16 @@ def _output_text(
     if dead_real:
         typer.echo(f"\nDead symbols ({len(dead_real)}):")
         for node in sorted(dead_real, key=lambda n: (str(n.path), n.fqname)):
-            try:
-                rel_path = node.path.relative_to(root)
-            except ValueError:
-                rel_path = node.path
-            typer.echo(f"  {node.fqname} ({node.type}) at {rel_path}")
+            typer.echo(f"  {node.fqname} ({node.type}) at {_rel_path(node.path, root)}")
 
     branches = [n for n in graph.nodes if is_unreachable_node(n)]
     if branches:
         typer.echo(f"\nUnreachable branches ({len(branches)}):")
         for node in sorted(branches, key=lambda n: (str(n.path), n.position.start)):
-            try:
-                rel_path = node.path.relative_to(root)
-            except ValueError:
-                rel_path = node.path
+            rel = _rel_path(node.path, root)
             start = node.position.start
             end = node.position.end
-            typer.echo(f"  {rel_path}:{start.line}:{start.column}-{end.line}:{end.column}")
+            typer.echo(f"  {rel}:{start.line}:{start.column}-{end.line}:{end.column}")
 
 
 def _output_json(
@@ -249,15 +250,11 @@ def _output_json(
     for node in sorted(unreachable.nodes, key=lambda n: (str(n.path), n.fqname)):
         if is_unreachable_node(node):
             continue
-        try:
-            rel_path = str(node.path.relative_to(root))
-        except ValueError:
-            rel_path = str(node.path)
         result["dead_symbols"].append(
             {
                 "fqname": node.fqname,
                 "type": node.type,
-                "path": rel_path,
+                "path": str(_rel_path(node.path, root)),
             }
         )
 
@@ -265,13 +262,9 @@ def _output_json(
         (n for n in graph.nodes if is_unreachable_node(n)),
         key=lambda n: (str(n.path), n.position.start),
     ):
-        try:
-            rel_path = str(node.path.relative_to(root))
-        except ValueError:
-            rel_path = str(node.path)
         result["unreachable_branches"].append(
             {
-                "path": rel_path,
+                "path": str(_rel_path(node.path, root)),
                 "start": {"line": node.position.start.line, "column": node.position.start.column},
                 "end": {"line": node.position.end.line, "column": node.position.end.column},
             }
@@ -323,13 +316,8 @@ def why_alive(
         typer.echo(f"Symbol not found: {fqname}", err=True)
         raise typer.Exit(1)
 
-    try:
-        rel_path = target_node.path.relative_to(root)
-    except ValueError:
-        rel_path = target_node.path
-
     typer.echo(f"\nSymbol: {target_node.fqname} ({target_node.type})")
-    typer.echo(f"Path: {rel_path}")
+    typer.echo(f"Path: {_rel_path(target_node.path, root)}")
     typer.echo(f"In-degree: {graph.in_degree(target_node)}")
     typer.echo("\nPredecessor chain:")
 
@@ -340,11 +328,7 @@ def why_alive(
         if node in seen:
             continue
         seen.add(node)
-        try:
-            node_rel = node.path.relative_to(root)
-        except ValueError:
-            node_rel = node.path
-        typer.echo(f"  <- {node.fqname} ({node.type}) at {node_rel}")
+        typer.echo(f"  <- {node.fqname} ({node.type}) at {_rel_path(node.path, root)}")
         stack.extend(graph.predecessors(node))
 
 
@@ -475,11 +459,7 @@ def unused_exports(
         return
 
     for all_sym in sorted(by_all, key=lambda n: n.fqname):
-        try:
-            rel_path = all_sym.path.relative_to(root)
-        except ValueError:
-            rel_path = all_sym.path
-        typer.echo(f"\n{all_sym.fqname} at {rel_path}:")
+        typer.echo(f"\n{all_sym.fqname} at {_rel_path(all_sym.path, root)}:")
         for sym in sorted(by_all[all_sym], key=lambda n: n.fqname):
             typer.echo(f"  {sym.fqname} ({sym.type})")
 
@@ -542,11 +522,7 @@ def remove(
 
     typer.echo(f"\nDead symbols to remove ({len(removable)}):")
     for node in sorted(removable, key=lambda n: (str(n.path), n.fqname)):
-        try:
-            rel_path = node.path.relative_to(root)
-        except ValueError:
-            rel_path = node.path
-        typer.echo(f"  {node.fqname} ({node.type}) at {rel_path}")
+        typer.echo(f"  {node.fqname} ({node.type}) at {_rel_path(node.path, root)}")
 
     if dry_run:
         typer.echo("\n--dry-run specified, no changes made.")

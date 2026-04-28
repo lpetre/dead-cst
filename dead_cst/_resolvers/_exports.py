@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from ._core import load_toml
+
 
 def exported_roots(base: Path) -> list[Path] | None:
     """Subdirs of ``base`` that are visible to *other* bases at import time.
@@ -47,17 +49,9 @@ def exported_roots(base: Path) -> list[Path] | None:
     listed above also fall through.
     """
     base = base.resolve()
-    pyproject = base / "pyproject.toml"
-    if not pyproject.is_file():
+    data = load_toml(base / "pyproject.toml")
+    if data is None:
         return None
-
-    try:
-        import tomllib
-    except ImportError:  # pragma: no cover - py<3.11 not supported
-        return None
-
-    with pyproject.open("rb") as f:
-        data = tomllib.load(f)
 
     if (base / "src").is_dir():
         return [(base / "src").resolve()]

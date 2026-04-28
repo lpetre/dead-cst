@@ -17,16 +17,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable
 
-import libcst as cst
-
 from ._core import (
     AddEdge,
     AddNode,
     GraphOp,
     PluginContext,
     collect_module_imports,
+    find_call_assignments,
     find_handlers,
-    single_target_assignment,
 )
 
 # Attribute names Flask / Blueprint use to register a callable. Matched as
@@ -128,7 +126,7 @@ class FlaskPlugin:
             flask_imports = collect_module_imports(module, "flask", _INSTANCE_KINDS)
             if not flask_imports:
                 continue
-            instances = _find_instances(module, flask_imports)
+            instances = find_call_assignments(module, flask_imports, _INSTANCE_KINDS)
             if not instances:
                 continue
             handlers = find_handlers(module, set(instances), _ROUTE_DECORATORS)
@@ -146,34 +144,3 @@ class FlaskPlugin:
                             f"{module_fqname}.{handler_name}"
                         ):
                             yield AddEdge(instance_decl, handler_decl)
-
-
-def _find_instances(module: cst.Module, flask_imports: dict[str, str]) -> dict[str, str]:
-    """Return ``{var_name: 'Flask' | 'Blueprint'}`` for top-level instances."""
-    instances: dict[str, str] = {}
-    for stmt in module.body:
-        if not isinstance(stmt, cst.SimpleStatementLine):
-            continue
-        for small in stmt.body:
-            target_name, value = single_target_assignment(small)
-            if target_name is None or not isinstance(value, cst.Call):
-                continue
-            kind = _classify_call(value.func, flask_imports)
-            if kind is not None:
-                instances[target_name] = kind
-    return instances
-
-
-def _classify_call(func: cst.BaseExpression, flask_imports: dict[str, str]) -> str | None:
-    """Return ``"Flask"`` / ``"Blueprint"`` if ``func`` calls one, else ``None``."""
-    if isinstance(func, cst.Name):
-        target = flask_imports.get(func.value)
-        if target in _INSTANCE_KINDS:
-            return target
-    elif isinstance(func, cst.Attribute) and isinstance(func.value, cst.Name):
-        # ``flask.Flask(...)`` / ``fl.Blueprint(...)``
-        if flask_imports.get(func.value.value) == "<module>":
-            attr = func.attr.value
-            if attr in _INSTANCE_KINDS:
-                return attr
-    return None

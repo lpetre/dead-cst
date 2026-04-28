@@ -20,23 +20,20 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable
 
-import libcst as cst
-
 from ._core import (
     AddEdge,
     GraphOp,
     PluginContext,
     collect_module_imports,
+    find_call_assignments,
     find_handlers,
-    single_target_assignment,
 )
 
 # Attribute names ``Typer`` uses to register a callable. Matched as the
 # rightmost attribute of ``@<instance>.<name>(...)``.
 _REGISTRATION_DECORATORS: frozenset[str] = frozenset({"command", "callback"})
 
-_TYPER_CLASS = "Typer"
-_TYPER_TARGETS: frozenset[str] = frozenset({_TYPER_CLASS})
+_TYPER_TARGETS: frozenset[str] = frozenset({"Typer"})
 
 
 @dataclass
@@ -88,7 +85,7 @@ class TyperPlugin:
             typer_imports = collect_module_imports(module, "typer", _TYPER_TARGETS)
             if not typer_imports:
                 continue
-            instances = _find_instances(module, typer_imports)
+            instances = set(find_call_assignments(module, typer_imports, _TYPER_TARGETS))
             if not instances:
                 continue
             handlers = find_handlers(module, instances, _REGISTRATION_DECORATORS)
@@ -104,29 +101,3 @@ class TyperPlugin:
                             f"{module_fqname}.{handler_name}"
                         ):
                             yield AddEdge(instance_decl, handler_decl)
-
-
-def _find_instances(module: cst.Module, typer_imports: dict[str, str]) -> set[str]:
-    """Return the set of top-level names bound to a ``Typer(...)`` call."""
-    instances: set[str] = set()
-    for stmt in module.body:
-        if not isinstance(stmt, cst.SimpleStatementLine):
-            continue
-        for small in stmt.body:
-            target_name, value = single_target_assignment(small)
-            if target_name is None or not isinstance(value, cst.Call):
-                continue
-            if _is_typer_call(value.func, typer_imports):
-                instances.add(target_name)
-    return instances
-
-
-def _is_typer_call(func: cst.BaseExpression, typer_imports: dict[str, str]) -> bool:
-    """Return ``True`` if ``func`` denotes a ``Typer`` constructor."""
-    if isinstance(func, cst.Name):
-        return typer_imports.get(func.value) == _TYPER_CLASS
-    if isinstance(func, cst.Attribute) and isinstance(func.value, cst.Name):
-        # ``typer.Typer(...)`` / ``t.Typer(...)``
-        if typer_imports.get(func.value.value) == "<module>":
-            return func.attr.value == _TYPER_CLASS
-    return False
