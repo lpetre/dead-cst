@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Iterator, Protocol, Union, runtime_checkable
+from typing import Container, Iterable, Iterator, Protocol, Union, runtime_checkable
 
 import libcst as cst
 import networkx as nx
@@ -207,3 +207,115 @@ def apply_ops(graph: nx.DiGraph, ops: Iterable[GraphOp]) -> None:
 def synthetic_node(fqname: str, path: Path) -> SymbolNode:
     """Create a placeholder node plugins can attach edges to."""
     return SymbolNode(fqname=fqname, type="synthetic", path=path, position=SYNTHETIC_POSITION)
+
+
+def mark_entrypoints(
+    seed_fqname: str, path: Path, targets: Iterable[SymbolNode]
+) -> Iterator[GraphOp]:
+    """Emit a synthetic entrypoint node and edges from it to each target.
+
+    Used by plugins that mark a set of decls alive without a natural caller --
+    pytest discovery, unittest discovery, and similar.
+    """
+    targets = list(targets)
+    if not targets:
+        return
+    synth = synthetic_node(fqname=seed_fqname, path=path)
+    yield AddNode(synth, entrypoint=True)
+    for target in targets:
+        yield AddEdge(synth, target)
+
+
+def is_name(node: cst.CSTNode | None, value: str) -> bool:
+    """Return ``True`` if ``node`` is a bare ``Name`` with the given value."""
+    return isinstance(node, cst.Name) and node.value == value
+
+
+def is_from_module(node: cst.ImportFrom, module_name: str) -> bool:
+    """Return ``True`` if ``node`` is ``from <module_name> import ...`` (non-relative)."""
+    return not node.relative and is_name(node.module, module_name)
+
+
+def single_target_assignment(
+    stmt: cst.BaseSmallStatement,
+) -> tuple[str | None, cst.BaseExpression | None]:
+    """Extract ``(name, rhs)`` for ``X = ...`` / ``X: T = ...``; else ``(None, None)``."""
+    if isinstance(stmt, cst.Assign):
+        if len(stmt.targets) != 1:
+            return None, None
+        target = stmt.targets[0].target
+        if isinstance(target, cst.Name):
+            return target.value, stmt.value
+    elif isinstance(stmt, cst.AnnAssign):
+        if isinstance(stmt.target, cst.Name) and stmt.value is not None:
+            return stmt.target.value, stmt.value
+    return None, None
+
+
+def decorator_owner(expr: cst.BaseExpression, valid_attrs: Container[str]) -> str | None:
+    """For ``@X.<attr>(...)`` / ``@X.<attr>`` return ``"X"`` when ``attr`` is in
+    ``valid_attrs`` and ``X`` is a bare ``Name``. Returns ``None`` otherwise."""
+    if isinstance(expr, cst.Call):
+        expr = expr.func
+    if not isinstance(expr, cst.Attribute):
+        return None
+    if expr.attr.value not in valid_attrs:
+        return None
+    if not isinstance(expr.value, cst.Name):
+        return None
+    return expr.value.value
+
+
+def find_handlers(
+    module: cst.Module, instance_vars: Container[str], valid_attrs: Container[str]
+) -> dict[str, list[str]]:
+    """Return ``{instance_var: [handler_func_name, ...]}`` for top-level functions
+    decorated with ``@<instance_var>.<attr>(...)`` where ``attr`` is in ``valid_attrs``."""
+    handlers: dict[str, list[str]] = {}
+    for stmt in module.body:
+        if not isinstance(stmt, cst.FunctionDef):
+            continue
+        for dec in stmt.decorators:
+            owner = decorator_owner(dec.decorator, valid_attrs)
+            if owner is None or owner not in instance_vars:
+                continue
+            handlers.setdefault(owner, []).append(stmt.name.value)
+            break
+    return handlers
+
+
+def collect_module_imports(
+    module: cst.Module, module_name: str, allowed_targets: Container[str]
+) -> dict[str, str]:
+    """Return ``{local_name: target}`` for names imported from ``module_name``.
+
+    Each ``from <module_name> import X [as Y]`` whose ``X`` is in
+    ``allowed_targets`` adds ``{Y or X: X}``. Each ``import <module_name> [as Y]``
+    adds ``{Y or module_name: '<module>'}`` so callers can recognize the bare
+    module-prefixed form (``<module_name>.X(...)``).
+    """
+    bindings: dict[str, str] = {}
+    for stmt in module.body:
+        if not isinstance(stmt, cst.SimpleStatementLine):
+            continue
+        for small in stmt.body:
+            if isinstance(small, cst.ImportFrom):
+                if not is_from_module(small, module_name):
+                    continue
+                if isinstance(small.names, cst.ImportStar):
+                    continue
+                for alias in small.names:
+                    target = alias.name.value if isinstance(alias.name, cst.Name) else None
+                    if target is None or target not in allowed_targets:
+                        continue
+                    local = alias.asname.name.value if alias.asname else target
+                    if isinstance(local, str):
+                        bindings[local] = target
+            elif isinstance(small, cst.Import):
+                for alias in small.names:
+                    if not is_name(alias.name, module_name):
+                        continue
+                    local = alias.asname.name.value if alias.asname else module_name
+                    if isinstance(local, str):
+                        bindings[local] = "<module>"
+    return bindings

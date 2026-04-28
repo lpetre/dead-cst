@@ -269,12 +269,8 @@ class SymbolVisitor(cst.CSTVisitor):
                 module_path = f"[unresolved] {top_level}"
                 module_name = full_name
 
-            # if there is an asname, that is the decl being added
-            # and we resolve the entire import
             if alias.asname:
                 decl_name = alias.asname.name
-
-            # if there is not an asname, the first name is the decl
             else:
                 decl_name = alias.name
 
@@ -483,13 +479,12 @@ class SymbolVisitor(cst.CSTVisitor):
                     accessed_attrs = [] if not original_import.decl else [original_import.decl]
 
                     if isinstance(access.node, (cst.Name, cst.Attribute)):
-                        # figure out what is being accessed
-                        prev_access, curr_access = None, access.node
-                        while prev_access := parent_map.get(curr_access):
-                            if not isinstance(prev_access, cst.Attribute):
+                        curr_access = access.node
+                        while parent := parent_map.get(curr_access):
+                            if not isinstance(parent, cst.Attribute):
                                 break
-                            accessed_attrs.append(prev_access.attr.value)
-                            curr_access = prev_access
+                            accessed_attrs.append(parent.attr.value)
+                            curr_access = parent
 
                     # Create the new Import with the specific symbol being accessed
                     resolved_import = Import(

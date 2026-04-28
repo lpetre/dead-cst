@@ -19,7 +19,15 @@ from typing import Iterable
 
 import libcst as cst
 
-from ._core import AddEdge, AddNode, GraphOp, PluginContext
+from ._core import (
+    AddEdge,
+    AddNode,
+    GraphOp,
+    PluginContext,
+    collect_module_imports,
+    find_handlers,
+    single_target_assignment,
+)
 
 # Attribute names FastAPI / APIRouter use to register a callable. Matched as
 # the rightmost attribute of ``@<instance>.<name>(...)``.
@@ -96,13 +104,13 @@ class FastAPIPlugin:
             module = ctx.parse(path)
             if module is None:
                 continue
-            fastapi_imports = _collect_fastapi_imports(module)
+            fastapi_imports = collect_module_imports(module, "fastapi", _INSTANCE_KINDS)
             if not fastapi_imports:
                 continue
             instances = _find_instances(module, fastapi_imports)
             if not instances:
                 continue
-            handlers = _find_handlers(module, set(instances))
+            handlers = find_handlers(module, set(instances), _ROUTE_DECORATORS)
 
             module_fqname = module_node.fqname
             for var_name, kind in instances.items():
@@ -119,49 +127,6 @@ class FastAPIPlugin:
                             yield AddEdge(instance_decl, handler_decl)
 
 
-def _collect_fastapi_imports(module: cst.Module) -> dict[str, str]:
-    """Return ``{local_name: target}`` for names imported from ``fastapi``.
-
-    ``target`` is one of ``"FastAPI"``, ``"APIRouter"``, or ``"<module>"``
-    (the whole ``fastapi`` package, for ``import fastapi``).
-    """
-    bindings: dict[str, str] = {}
-    for stmt in module.body:
-        if not isinstance(stmt, cst.SimpleStatementLine):
-            continue
-        for small in stmt.body:
-            if isinstance(small, cst.ImportFrom):
-                if not _is_fastapi_module(small):
-                    continue
-                if isinstance(small.names, cst.ImportStar):
-                    continue
-                for alias in small.names:
-                    target = alias.name.value if isinstance(alias.name, cst.Name) else None
-                    if target not in _INSTANCE_KINDS:
-                        continue
-                    local = alias.asname.name.value if alias.asname else target
-                    if isinstance(local, str):
-                        bindings[local] = target
-            elif isinstance(small, cst.Import):
-                for alias in small.names:
-                    if not _is_name(alias.name, "fastapi"):
-                        continue
-                    local = alias.asname.name.value if alias.asname else "fastapi"
-                    if isinstance(local, str):
-                        bindings[local] = "<module>"
-    return bindings
-
-
-def _is_fastapi_module(node: cst.ImportFrom) -> bool:
-    if node.relative:
-        return False
-    return _is_name(node.module, "fastapi")
-
-
-def _is_name(node: cst.CSTNode | None, value: str) -> bool:
-    return isinstance(node, cst.Name) and node.value == value
-
-
 def _find_instances(module: cst.Module, fastapi_imports: dict[str, str]) -> dict[str, str]:
     """Return ``{var_name: 'FastAPI' | 'APIRouter'}`` for top-level instances."""
     instances: dict[str, str] = {}
@@ -169,29 +134,13 @@ def _find_instances(module: cst.Module, fastapi_imports: dict[str, str]) -> dict
         if not isinstance(stmt, cst.SimpleStatementLine):
             continue
         for small in stmt.body:
-            target_name, value = _single_target_assignment(small)
+            target_name, value = single_target_assignment(small)
             if target_name is None or not isinstance(value, cst.Call):
                 continue
             kind = _classify_call(value.func, fastapi_imports)
             if kind is not None:
                 instances[target_name] = kind
     return instances
-
-
-def _single_target_assignment(
-    stmt: cst.BaseSmallStatement,
-) -> tuple[str | None, cst.BaseExpression | None]:
-    """Extract ``(name, rhs)`` for ``X = ...`` / ``X: T = ...``; else ``(None, None)``."""
-    if isinstance(stmt, cst.Assign):
-        if len(stmt.targets) != 1:
-            return None, None
-        target = stmt.targets[0].target
-        if isinstance(target, cst.Name):
-            return target.value, stmt.value
-    elif isinstance(stmt, cst.AnnAssign):
-        if isinstance(stmt.target, cst.Name) and stmt.value is not None:
-            return stmt.target.value, stmt.value
-    return None, None
 
 
 def _classify_call(func: cst.BaseExpression, fastapi_imports: dict[str, str]) -> str | None:
@@ -207,33 +156,3 @@ def _classify_call(func: cst.BaseExpression, fastapi_imports: dict[str, str]) ->
             if attr in _INSTANCE_KINDS:
                 return attr
     return None
-
-
-def _find_handlers(module: cst.Module, instance_vars: set[str]) -> dict[str, list[str]]:
-    """Return ``{instance_var: [handler_func_name, ...]}`` for decorated handlers."""
-    handlers: dict[str, list[str]] = {}
-    for stmt in module.body:
-        if not isinstance(stmt, cst.FunctionDef):
-            continue
-        for dec in stmt.decorators:
-            owner = _route_decorator_owner(dec.decorator)
-            if owner is None or owner not in instance_vars:
-                continue
-            handlers.setdefault(owner, []).append(stmt.name.value)
-            break
-    return handlers
-
-
-def _route_decorator_owner(expr: cst.BaseExpression) -> str | None:
-    """For ``@X.get(...)`` / ``@X.get`` return ``"X"`` (only when the rightmost
-    attribute is a known FastAPI registration name and ``X`` is a bare
-    ``Name``). Returns ``None`` otherwise."""
-    if isinstance(expr, cst.Call):
-        expr = expr.func
-    if not isinstance(expr, cst.Attribute):
-        return None
-    if expr.attr.value not in _ROUTE_DECORATORS:
-        return None
-    if not isinstance(expr.value, cst.Name):
-        return None
-    return expr.value.value

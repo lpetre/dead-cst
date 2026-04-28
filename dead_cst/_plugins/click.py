@@ -31,11 +31,21 @@ from typing import Iterable
 
 import libcst as cst
 
-from ._core import AddEdge, GraphOp, PluginContext
+from ._core import (
+    AddEdge,
+    GraphOp,
+    PluginContext,
+    collect_module_imports,
+    decorator_owner,
+    find_handlers,
+    single_target_assignment,
+)
 
 # Attribute names a Click ``Group`` uses to register a callable. Matched
 # as the rightmost attribute of ``@<instance>.<name>(...)``.
 _REGISTRATION_DECORATORS: frozenset[str] = frozenset({"command", "group", "result_callback"})
+
+_SUBGROUP_DECORATOR: frozenset[str] = frozenset({"group"})
 
 # Names (as imported from ``click``) that produce a ``Group`` when used
 # as a decorator on a function. ``click.group`` is the function form;
@@ -101,13 +111,13 @@ class ClickPlugin:
             module = ctx.parse(path)
             if module is None:
                 continue
-            click_imports = _collect_click_imports(module)
+            click_imports = collect_module_imports(module, "click", _GROUP_DECORATOR_NAMES)
             if not click_imports:
                 continue
             instances = _find_instances(module, click_imports)
             if not instances:
                 continue
-            handlers = _find_handlers(module, instances)
+            handlers = find_handlers(module, instances, _REGISTRATION_DECORATORS)
 
             module_fqname = module_node.fqname
             for var_name in instances:
@@ -120,49 +130,6 @@ class ClickPlugin:
                             f"{module_fqname}.{handler_name}"
                         ):
                             yield AddEdge(instance_decl, handler_decl)
-
-
-def _collect_click_imports(module: cst.Module) -> dict[str, str]:
-    """Return ``{local_name: target}`` for names imported from ``click``.
-
-    ``target`` is one of ``"group"``, ``"Group"``, or ``"<module>"`` (the
-    whole ``click`` package, for ``import click``).
-    """
-    bindings: dict[str, str] = {}
-    for stmt in module.body:
-        if not isinstance(stmt, cst.SimpleStatementLine):
-            continue
-        for small in stmt.body:
-            if isinstance(small, cst.ImportFrom):
-                if not _is_click_module(small):
-                    continue
-                if isinstance(small.names, cst.ImportStar):
-                    continue
-                for alias in small.names:
-                    target = alias.name.value if isinstance(alias.name, cst.Name) else None
-                    if target not in _GROUP_DECORATOR_NAMES:
-                        continue
-                    local = alias.asname.name.value if alias.asname else target
-                    if isinstance(local, str):
-                        bindings[local] = target
-            elif isinstance(small, cst.Import):
-                for alias in small.names:
-                    if not _is_name(alias.name, "click"):
-                        continue
-                    local = alias.asname.name.value if alias.asname else "click"
-                    if isinstance(local, str):
-                        bindings[local] = "<module>"
-    return bindings
-
-
-def _is_click_module(node: cst.ImportFrom) -> bool:
-    if node.relative:
-        return False
-    return _is_name(node.module, "click")
-
-
-def _is_name(node: cst.CSTNode | None, value: str) -> bool:
-    return isinstance(node, cst.Name) and node.value == value
 
 
 def _find_instances(module: cst.Module, click_imports: dict[str, str]) -> set[str]:
@@ -188,7 +155,7 @@ def _find_instances(module: cst.Module, click_imports: dict[str, str]) -> set[st
                     break
         elif isinstance(stmt, cst.SimpleStatementLine):
             for small in stmt.body:
-                target_name, value = _single_target_assignment(small)
+                target_name, value = single_target_assignment(small)
                 if target_name is None or not isinstance(value, cst.Call):
                     continue
                 if _is_group_constructor(value.func, click_imports):
@@ -205,7 +172,7 @@ def _find_instances(module: cst.Module, click_imports: dict[str, str]) -> set[st
             if stmt.name.value in instances:
                 continue
             for dec in stmt.decorators:
-                owner = _registration_decorator_owner(dec.decorator, attr="group")
+                owner = decorator_owner(dec.decorator, _SUBGROUP_DECORATOR)
                 if owner is not None and owner in instances:
                     instances.add(stmt.name.value)
                     changed = True
@@ -240,57 +207,3 @@ def _is_group_constructor(func: cst.BaseExpression, click_imports: dict[str, str
         if click_imports.get(func.value.value) == "<module>":
             return func.attr.value in _GROUP_CONSTRUCTOR_NAMES
     return False
-
-
-def _single_target_assignment(
-    stmt: cst.BaseSmallStatement,
-) -> tuple[str | None, cst.BaseExpression | None]:
-    """Extract ``(name, rhs)`` for ``X = ...`` / ``X: T = ...``; else ``(None, None)``."""
-    if isinstance(stmt, cst.Assign):
-        if len(stmt.targets) != 1:
-            return None, None
-        target = stmt.targets[0].target
-        if isinstance(target, cst.Name):
-            return target.value, stmt.value
-    elif isinstance(stmt, cst.AnnAssign):
-        if isinstance(stmt.target, cst.Name) and stmt.value is not None:
-            return stmt.target.value, stmt.value
-    return None, None
-
-
-def _find_handlers(module: cst.Module, instance_vars: set[str]) -> dict[str, list[str]]:
-    """Return ``{instance_var: [handler_func_name, ...]}`` for decorated handlers."""
-    handlers: dict[str, list[str]] = {}
-    for stmt in module.body:
-        if not isinstance(stmt, cst.FunctionDef):
-            continue
-        for dec in stmt.decorators:
-            owner = _registration_decorator_owner(dec.decorator)
-            if owner is None or owner not in instance_vars:
-                continue
-            handlers.setdefault(owner, []).append(stmt.name.value)
-            break
-    return handlers
-
-
-def _registration_decorator_owner(
-    expr: cst.BaseExpression, *, attr: str | None = None
-) -> str | None:
-    """For ``@X.command(...)`` / ``@X.command`` return ``"X"`` (only when the
-    rightmost attribute is a known Click registration name and ``X`` is a
-    bare ``Name``). Returns ``None`` otherwise.
-
-    When ``attr`` is given, only that specific attribute name is matched
-    (e.g. ``attr="group"`` for sub-group discovery)."""
-    if isinstance(expr, cst.Call):
-        expr = expr.func
-    if not isinstance(expr, cst.Attribute):
-        return None
-    if attr is None:
-        if expr.attr.value not in _REGISTRATION_DECORATORS:
-            return None
-    elif expr.attr.value != attr:
-        return None
-    if not isinstance(expr.value, cst.Name):
-        return None
-    return expr.value.value

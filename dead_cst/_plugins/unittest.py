@@ -9,7 +9,7 @@ from typing import Iterable
 import libcst as cst
 
 from .._symbols import SymbolNode
-from ._core import AddEdge, AddNode, GraphOp, PluginContext, synthetic_node
+from ._core import GraphOp, PluginContext, is_from_module, is_name, mark_entrypoints
 
 # Module-level functions ``unittest`` discovers by name.
 _MODULE_HOOKS: frozenset[str] = frozenset({"setUpModule", "tearDownModule", "load_tests"})
@@ -92,14 +92,7 @@ class UnittestPlugin:
             if not targets:
                 continue
 
-            yield from _mark_entrypoints(f"<unittest>:{module_node.fqname}", path, targets)
-
-
-def _mark_entrypoints(seed_fqname: str, path: Path, targets: list[SymbolNode]) -> Iterable[GraphOp]:
-    synth = synthetic_node(fqname=seed_fqname, path=path)
-    yield AddNode(synth, entrypoint=True)
-    for target in targets:
-        yield AddEdge(synth, target)
+            yield from mark_entrypoints(f"<unittest>:{module_node.fqname}", path, targets)
 
 
 def _collect_unittest_imports(module: cst.Module) -> tuple[set[str], set[str]]:
@@ -119,13 +112,13 @@ def _collect_unittest_imports(module: cst.Module) -> tuple[set[str], set[str]]:
         for small in stmt.body:
             if isinstance(small, cst.Import):
                 for alias in small.names:
-                    if not _is_name(alias.name, "unittest"):
+                    if not is_name(alias.name, "unittest"):
                         continue
                     local = alias.asname.name.value if alias.asname else "unittest"
                     if isinstance(local, str):
                         module_aliases.add(local)
             elif isinstance(small, cst.ImportFrom):
-                if small.relative or not _is_name(small.module, "unittest"):
+                if not is_from_module(small, "unittest"):
                     continue
                 if isinstance(small.names, cst.ImportStar):
                     # ``from unittest import *`` brings every public name in,
@@ -172,7 +165,3 @@ def _find_module_hooks(module: cst.Module) -> set[str]:
         for stmt in module.body
         if isinstance(stmt, cst.FunctionDef) and stmt.name.value in _MODULE_HOOKS
     }
-
-
-def _is_name(node: cst.CSTNode | None, value: str) -> bool:
-    return isinstance(node, cst.Name) and node.value == value
