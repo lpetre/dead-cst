@@ -13,7 +13,6 @@ from ._plugins._core import (
     EXTERNAL_FILE_PREFIX,
     STDLIB_PREFIX,
     SYNTHETIC_PATH_PREFIXES,
-    UNRESOLVED_PREFIX,
     synthetic_node,
 )
 from ._symbols import Import, SymbolNode, SymbolTrie
