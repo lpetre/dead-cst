@@ -38,6 +38,7 @@ from ._core import (
     collect_module_imports,
     decorator_owner,
     find_handlers,
+    require_resolved_dep,
     matched_attr_call,
     single_target_assignment,
 )
@@ -99,12 +100,9 @@ class ClickPlugin:
     name: str = "click"
 
     def contribute(self, ctx: PluginContext) -> Iterable[GraphOp]:
-        # Prefilter via the import graph: only files that actually import
-        # ``click`` can declare a group. Free because the resolver already
-        # added ``[external dist] click`` predecessors for them.
-        candidate_paths = ctx.importers("click")
-        if not candidate_paths:
+        if require_resolved_dep(ctx, "click") is None:
             return
+        candidate_paths = ctx.importers("click")
 
         for path, module_node in ctx.base_modules():
             if path not in candidate_paths:

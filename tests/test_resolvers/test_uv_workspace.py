@@ -9,7 +9,24 @@ from __future__ import annotations
 import textwrap
 from pathlib import Path
 
+import pytest
+
 from dead_cst import UvWorkspaceResolver
+from dead_cst._resolvers import MissingVenvError
+
+
+def _make_fake_venv(workspace_root: Path) -> Path:
+    """Create a minimal ``.venv/lib/pythonX.Y/site-packages`` and return it.
+
+    ``UvWorkspaceResolver`` requires a populated venv -- in real usage,
+    ``uv sync --all-packages`` puts one at the workspace root. Tests
+    create the directory structure the resolver looks for and return
+    the resolved ``site-packages`` path so assertions can include it
+    in expected dep lists.
+    """
+    sp = workspace_root / ".venv" / "lib" / "python3.13" / "site-packages"
+    sp.mkdir(parents=True)
+    return sp.resolve()
 
 
 def _write_uv_workspace(tmp_path: Path, *, with_src: bool = True) -> None:
@@ -61,31 +78,48 @@ def _write_uv_workspace(tmp_path: Path, *, with_src: bool = True) -> None:
 
 def test_uv_workspace_resolver_src_layout(tmp_path: Path):
     _write_uv_workspace(tmp_path)
+    sp = _make_fake_venv(tmp_path)
 
     result = UvWorkspaceResolver().resolve(tmp_path)
 
     core_src = (tmp_path / "packages" / "core" / "src").resolve()
     app_src = (tmp_path / "packages" / "app" / "src").resolve()
-    assert result == {core_src: [], app_src: [core_src]}
+    assert result == {core_src: [sp], app_src: [core_src, sp]}
 
 
 def test_uv_workspace_resolver_flat_layout(tmp_path: Path):
     _write_uv_workspace(tmp_path, with_src=False)
+    sp = _make_fake_venv(tmp_path)
 
     result = UvWorkspaceResolver().resolve(tmp_path)
 
     core_dir = (tmp_path / "packages" / "core").resolve()
     app_dir = (tmp_path / "packages" / "app").resolve()
-    assert result == {core_dir: [], app_dir: [core_dir]}
+    assert result == {core_dir: [sp], app_dir: [core_dir, sp]}
 
 
 def test_uv_workspace_resolver_skips_virtual_root(tmp_path: Path):
     _write_uv_workspace(tmp_path)
+    _make_fake_venv(tmp_path)
 
     result = UvWorkspaceResolver().resolve(tmp_path)
 
     # The "ws" package has source = { virtual = "." } and must not appear.
     assert tmp_path.resolve() not in result
+
+
+def test_uv_workspace_resolver_missing_venv_raises(tmp_path: Path, monkeypatch):
+    """Workspace with no synced ``.venv`` raises an actionable error
+    instead of silently producing wrong results downstream."""
+    import sys
+
+    _write_uv_workspace(tmp_path)
+    # Override the active-venv fallback so the resolver can't accidentally
+    # find one outside the workspace (e.g. the test runner's own venv).
+    monkeypatch.setattr(sys, "prefix", sys.base_prefix)
+
+    with pytest.raises(MissingVenvError, match="uv sync"):
+        UvWorkspaceResolver().resolve(tmp_path)
 
 
 def test_uv_workspace_resolver_includes_virtual_members(tmp_path: Path):
@@ -136,14 +170,17 @@ def test_uv_workspace_resolver_includes_virtual_members(tmp_path: Path):
         """).strip()
     )
 
+    sp = _make_fake_venv(tmp_path)
     result = UvWorkspaceResolver().resolve(tmp_path)
 
     lib_src = (tmp_path / "libs" / "lib-a" / "src").resolve()
     app_src = (tmp_path / "apps" / "app-a" / "src").resolve()
-    assert result == {lib_src: [], app_src: [lib_src]}
+    assert result == {lib_src: [sp], app_src: [lib_src, sp]}
 
 
 def test_uv_workspace_resolver_no_lockfile(tmp_path: Path):
+    # No lockfile => not a uv workspace => silent no-op (don't raise on the
+    # missing venv, since the resolver isn't applicable here).
     assert UvWorkspaceResolver().resolve(tmp_path) == {}
 
 
@@ -151,6 +188,7 @@ def test_uv_workspace_resolver_ignores_non_workspace_deps(tmp_path: Path):
     """Deps that aren't workspace members (e.g. regular PyPI deps) are dropped
     silently -- they don't have a source dir under our control."""
     _write_uv_workspace(tmp_path)
+    sp = _make_fake_venv(tmp_path)
     lock = tmp_path / "uv.lock"
     lock.write_text(
         lock.read_text().replace(
@@ -162,11 +200,12 @@ def test_uv_workspace_resolver_ignores_non_workspace_deps(tmp_path: Path):
     result = UvWorkspaceResolver().resolve(tmp_path)
     core_src = (tmp_path / "packages" / "core" / "src").resolve()
     app_src = (tmp_path / "packages" / "app" / "src").resolve()
-    assert result[app_src] == [core_src]
+    assert result[app_src] == [core_src, sp]
 
 
 def test_uv_workspace_resolver_explicit_lock_path(tmp_path: Path):
     _write_uv_workspace(tmp_path)
+    _make_fake_venv(tmp_path)
     moved = tmp_path / "stash" / "uv.lock"
     moved.parent.mkdir()
     moved.write_text((tmp_path / "uv.lock").read_text())
@@ -250,6 +289,7 @@ def test_uv_workspace_flat_layout_with_tests_dirs(tmp_path: Path):
     (libc / "tests" / "__init__.py").write_text("")
     (libc / "tests" / "conftest.py").write_text("import pytest\n")
 
+    _make_fake_venv(tmp_path)
     paths = UvWorkspaceResolver().resolve(tmp_path)
     # No AssertionError -- this used to crash before the fix.
     graph = build_symbol_graph(paths)
@@ -340,10 +380,11 @@ def test_uv_workspace_shared_namespace_package(tmp_path: Path):
     )
     (foo_b / "foo" / "b" / "__init__.py").write_text("from foo.a import value\n\nresult = value\n")
 
+    sp = _make_fake_venv(tmp_path)
     paths = UvWorkspaceResolver().resolve(tmp_path)
     foo_a_dir = foo_a.resolve()
     foo_b_dir = foo_b.resolve()
-    assert paths == {foo_a_dir: [], foo_b_dir: [foo_a_dir]}
+    assert paths == {foo_a_dir: [sp], foo_b_dir: [foo_a_dir, sp]}
 
     graph = build_symbol_graph(paths)
 

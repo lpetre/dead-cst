@@ -74,6 +74,59 @@ def test_unknown_plugin_raises():
 
 
 # ---------------------------------------------------------------------------
+# require_resolved_dep
+# ---------------------------------------------------------------------------
+
+
+def _ctx_with_synthetic(fqname: str, base: Path) -> PluginContext:
+    """Build a minimal PluginContext containing a single synthetic node."""
+    graph = nx.DiGraph()
+    node = SymbolNode(
+        fqname=fqname,
+        type="synthetic",
+        path=base,
+        position=CodeRange(start=CodePosition(0, 0), end=CodePosition(0, 0)),
+    )
+    graph.add_node(node)
+    return PluginContext(graph=graph, symbol_lookup=SymbolTrie(), base=base, project_root=base)
+
+
+def test_require_resolved_dep_returns_external_dist(tmp_path):
+    from dead_cst._plugins._core import EXTERNAL_DIST_PREFIX, require_resolved_dep
+
+    ctx = _ctx_with_synthetic(f"{EXTERNAL_DIST_PREFIX}fastapi", tmp_path)
+    node = require_resolved_dep(ctx, "fastapi")
+    assert node is not None
+    assert node.fqname == f"{EXTERNAL_DIST_PREFIX}fastapi"
+
+
+def test_require_resolved_dep_returns_external_file(tmp_path):
+    from dead_cst._plugins._core import EXTERNAL_FILE_PREFIX, require_resolved_dep
+
+    ctx = _ctx_with_synthetic(f"{EXTERNAL_FILE_PREFIX}fastapi", tmp_path)
+    assert require_resolved_dep(ctx, "fastapi") is not None
+
+
+def test_require_resolved_dep_returns_none_if_not_imported(tmp_path):
+    from dead_cst._plugins._core import EXTERNAL_DIST_PREFIX, require_resolved_dep
+
+    ctx = _ctx_with_synthetic(f"{EXTERNAL_DIST_PREFIX}something_else", tmp_path)
+    assert require_resolved_dep(ctx, "fastapi") is None
+
+
+def test_require_resolved_dep_raises_on_unresolved(tmp_path):
+    from dead_cst._plugins._core import (
+        UNRESOLVED_PREFIX,
+        UnresolvedDependencyError,
+        require_resolved_dep,
+    )
+
+    ctx = _ctx_with_synthetic(f"{UNRESOLVED_PREFIX}fastapi", tmp_path)
+    with pytest.raises(UnresolvedDependencyError, match="uv sync"):
+        require_resolved_dep(ctx, "fastapi")
+
+
+# ---------------------------------------------------------------------------
 # AST helpers in _plugins._core
 # ---------------------------------------------------------------------------
 

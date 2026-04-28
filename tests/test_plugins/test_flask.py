@@ -534,6 +534,110 @@ def test_flask_plugin_module_prefixed_unknown_attr(tmp_path, write_files, reacha
     assert "app.main.cfg" not in reached
 
 
+def test_flask_plugin_handles_factory_function(tmp_path, write_files, reachable_fqnames):
+    """The canonical Flask factory pattern: ``def create_app(): return Flask(__name__)``."""
+    write_files(
+        {
+            "app/__init__.py": "",
+            "app/factory.py": """
+            from flask import Flask
+
+            def create_app() -> Flask:
+                return Flask(__name__)
+            """,
+            "app/main.py": """
+            from app.factory import create_app
+
+            app = create_app()
+
+            @app.route("/items")
+            def list_items(): pass
+
+            @app.post("/items")
+            def create_item(): pass
+            """,
+        }
+    )
+    graph = build_symbol_graph(
+        {tmp_path: []},
+        plugins=[FlaskPlugin()],
+        project_root=tmp_path,
+    )
+    from dead_cst import find_reachable
+
+    reached = {n.fqname for n in find_reachable(graph) if n.type != "synthetic"}
+    assert "app.main.app" in reached
+    assert "app.main.list_items" in reached
+    assert "app.main.create_item" in reached
+
+
+def test_flask_plugin_factory_returning_blueprint_stays_dead(
+    tmp_path, write_files, reachable_fqnames
+):
+    """Factory-produced Blueprint is treated like a literal Blueprint --
+    never auto-seeded as an entrypoint, so an unregistered one stays dead."""
+    write_files(
+        {
+            "app/__init__.py": "",
+            "app/routes.py": """
+            from flask import Blueprint
+
+            def make_bp() -> Blueprint:
+                return Blueprint("orphan", __name__)
+
+            bp = make_bp()
+
+            @bp.route("/orphan")
+            def orphan(): pass
+            """,
+        }
+    )
+    graph = build_symbol_graph(
+        {tmp_path: []},
+        plugins=[FlaskPlugin()],
+        project_root=tmp_path,
+    )
+    reached = reachable_fqnames(graph)
+    assert "app.routes.bp" not in reached
+    assert "app.routes.orphan" not in reached
+
+
+def test_flask_plugin_ignores_non_app_flask_users(tmp_path, write_files, reachable_fqnames):
+    """Variables that touch ``flask`` for unrelated reasons stay dead.
+
+    Walking only to the ``flask`` synthetic isn't enough -- the plugin
+    must require a discriminating ``Flask`` / ``Blueprint`` import on
+    the path before treating ``X`` as an instance. Otherwise any value
+    derived from e.g. ``request`` would get marked as an app.
+    """
+    write_files(
+        {
+            "pkg/__init__.py": "",
+            "pkg/mod.py": """
+            from flask import request
+
+            current_path = request
+
+            class Decorated:
+                def route(self, path):
+                    def wrap(fn): return fn
+                    return wrap
+
+            thing = Decorated()
+
+            @thing.route("/")
+            def handler(): pass
+            """,
+        }
+    )
+    graph = build_symbol_graph(
+        {tmp_path: []},
+        plugins=[FlaskPlugin()],
+        project_root=tmp_path,
+    )
+    assert "pkg.mod.handler" not in reachable_fqnames(graph)
+
+
 def test_flask_plugin_loads_via_load_plugin():
     from dead_cst import load_plugin
 

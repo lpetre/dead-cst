@@ -10,7 +10,7 @@ from typing import Iterable
 import libcst as cst
 
 from .._symbols import SymbolNode
-from ._core import GraphOp, PluginContext, mark_entrypoints, simple_name
+from ._core import GraphOp, PluginContext, mark_entrypoints, require_resolved_dep, simple_name
 
 PYTEST_CONFTEST_PREFIX = "<pytest:conftest>:"
 PYTEST_TESTS_PREFIX = "<pytest:tests>:"
@@ -49,9 +49,13 @@ class PytestPlugin:
                 decls_by_path.setdefault(node.path, []).append(node)
 
         # Fixture-branch prefilter: ``@pytest.fixture`` / ``@fixture``
-        # require importing pytest somewhere in the file. Free graph
-        # query, no source scan.
-        fixture_candidates = ctx.importers("pytest")
+        # require importing pytest somewhere in the file. Files that
+        # don't import pytest at all skip this branch silently --
+        # test/conftest discovery is filename-driven and doesn't need
+        # pytest installed.
+        fixture_candidates: set[Path] = set()
+        if require_resolved_dep(ctx, "pytest") is not None:
+            fixture_candidates = ctx.importers("pytest")
 
         for path, module_node in ctx.base_modules():
             module_decls = decls_by_path.get(path, [])

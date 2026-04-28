@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from dead_cst import VenvResolver
+from dead_cst._resolvers import MissingVenvError
 
 
 def test_venv_resolver_finds_site_packages(tmp_path: Path):
@@ -17,9 +20,13 @@ def test_venv_resolver_finds_site_packages(tmp_path: Path):
     assert sp.resolve() in result[tmp_path.resolve()]
 
 
-def test_venv_resolver_missing_returns_empty(tmp_path: Path):
-    # Passing an explicit (nonexistent) venv_dir skips the active-venv probe.
-    assert VenvResolver(venv_dir="nope").resolve(tmp_path) == {}
+def test_venv_resolver_missing_raises(tmp_path: Path):
+    # Passing an explicit (nonexistent) venv_dir skips the active-venv probe,
+    # so there's nowhere for the resolver to find a venv -- it raises rather
+    # than silently producing an empty path map (which would just defer the
+    # failure into the plugin pass).
+    with pytest.raises(MissingVenvError, match="nope"):
+        VenvResolver(venv_dir="nope").resolve(tmp_path)
 
 
 def test_venv_resolver_custom_dir(tmp_path: Path):

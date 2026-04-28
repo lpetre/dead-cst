@@ -58,6 +58,13 @@ dev = [
     "pytest-watcher>=0.4.3",
     "ruff>=0.11.2",
     "ty>=0.0.1a7",
+    # Frameworks the 3rd-party plugins target. The plugins now require
+    # their package to be resolved to an installed distribution (rather
+    # than the ``[unresolved] <pkg>`` fallback), so tests need them
+    # importable. ``click`` and ``typer`` are already pulled in by the
+    # runtime deps; only ``fastapi`` and ``flask`` are added here.
+    "fastapi>=0.110",
+    "flask>=3.0",
 ]
 
 [tool.pytest.ini_options]

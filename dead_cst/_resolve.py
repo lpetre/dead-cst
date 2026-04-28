@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
+import re
 import sys
 import sysconfig
 from functools import cache
@@ -23,6 +24,28 @@ logger = logging.getLogger(__name__)
 
 STDLIB = Path(sysconfig.get_path("stdlib")).resolve()
 SITE_PACKAGES_MARKERS = ("site-packages", "dist-packages")
+
+
+def _canonical_dist_name(name: str) -> str:
+    """Normalize a PyPI distribution name per PEP 503.
+
+    PyPI treats ``Flask`` / ``flask`` / ``FLASK`` as the same project;
+    plugins query the analyzer by the lowercase import name (``flask``)
+    so the synthetic ``[external dist] <name>`` node has to match. PEP
+    503's canonical form is ``re.sub(r"[-_.]+", "-", name).lower()`` --
+    we apply that to the raw ``Name`` from each dist's metadata so
+    plugin lookups don't depend on whatever casing the package author
+    chose.
+
+    Note: this still uses the *distribution* name, not the import
+    (top-level) name. For most third-party packages they match after
+    canonicalization (``fastapi``, ``flask``, ``click``, ``typer``,
+    ``networkx``, ...). They differ for a handful of historic names
+    (``Pillow`` → import ``PIL``, ``PyYAML`` → import ``yaml``); plugins
+    targeting those would need an explicit dist-name override, which
+    we don't yet support.
+    """
+    return re.sub(r"[-_.]+", "-", name).lower()
 
 
 @contextlib.contextmanager
@@ -71,9 +94,10 @@ def distribution_lookup() -> dict[Path, str]:
 
     lookup = {}
     for dist in metadata.distributions():
+        canonical = _canonical_dist_name(dist.metadata["Name"])
         for file in dist.files or ():
             abs_path = Path(str(dist.locate_file(file))).resolve()
-            lookup[abs_path] = dist.metadata["Name"]
+            lookup[abs_path] = canonical
     return lookup
 
 

@@ -332,6 +332,107 @@ def test_fastapi_plugin_does_nothing_without_fastapi_imports(
     assert "pkg.mod.looks_like_route" not in reachable_fqnames(graph)
 
 
+def test_fastapi_plugin_handles_factory_function(tmp_path, write_files, reachable_fqnames):
+    write_files(
+        {
+            "app/__init__.py": "",
+            "app/factory.py": """
+            from fastapi import FastAPI
+
+            def create_app() -> FastAPI:
+                return FastAPI()
+            """,
+            "app/main.py": """
+            from app.factory import create_app
+
+            app = create_app()
+
+            @app.get("/items")
+            def list_items(): pass
+
+            @app.post("/items")
+            def create_item(): pass
+            """,
+        }
+    )
+    graph = build_symbol_graph(
+        {tmp_path: []},
+        plugins=[FastAPIPlugin()],
+        project_root=tmp_path,
+    )
+    reached = reachable_fqnames(graph)
+    assert "app.main.app" in reached
+    assert "app.main.list_items" in reached
+    assert "app.main.create_item" in reached
+
+
+def test_fastapi_plugin_factory_returning_router_stays_dead(
+    tmp_path, write_files, reachable_fqnames
+):
+    write_files(
+        {
+            "app/__init__.py": "",
+            "app/routes.py": """
+            from fastapi import APIRouter
+
+            def make_router() -> APIRouter:
+                return APIRouter()
+
+            router = make_router()
+
+            @router.get("/orphan")
+            def orphan(): pass
+            """,
+        }
+    )
+    graph = build_symbol_graph(
+        {tmp_path: []},
+        plugins=[FastAPIPlugin()],
+        project_root=tmp_path,
+    )
+    # Factory-produced router is treated like a literal APIRouter --
+    # never auto-seeded as an entrypoint, so an unincluded one stays dead.
+    reached = reachable_fqnames(graph)
+    assert "app.routes.router" not in reached
+    assert "app.routes.orphan" not in reached
+
+
+def test_fastapi_plugin_ignores_non_app_fastapi_users(tmp_path, write_files, reachable_fqnames):
+    """Variables that touch ``fastapi`` for unrelated reasons stay dead.
+
+    Walking only to the ``fastapi`` synthetic isn't enough -- the plugin
+    must require a discriminating ``FastAPI``/``APIRouter`` import on
+    the path before treating ``X`` as an instance. Otherwise any value
+    derived from e.g. ``HTTPException`` would get marked as an app.
+    """
+    write_files(
+        {
+            "pkg/__init__.py": "",
+            "pkg/mod.py": """
+            from fastapi import HTTPException
+
+            err = HTTPException(404)
+
+            class Decorated:
+                def get(self, path):
+                    def wrap(fn): return fn
+                    return wrap
+
+            thing = Decorated()
+
+            @thing.get("/")
+            def handler(): pass
+            """,
+        }
+    )
+    graph = build_symbol_graph(
+        {tmp_path: []},
+        plugins=[FastAPIPlugin()],
+        project_root=tmp_path,
+    )
+    assert "pkg.mod.handler" not in reachable_fqnames(graph)
+
+
 def test_fastapi_plugin_loads_via_load_plugin():
     from dead_cst import load_plugin
 
