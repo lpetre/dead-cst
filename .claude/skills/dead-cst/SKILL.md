@@ -1,6 +1,6 @@
 ---
 name: dead-cst
-description: Use when running, configuring, or scripting `dead-cst` — the libcst-based dead-code analyzer. Covers entrypoint specs, path layouts, resolver/plugin pairings (especially `uv_workspace` + `uv sync --all-packages`), and the safety contract around `dead-cst remove`. Trigger on `dead-cst analyze|why-alive|remove|dependencies|unused-exports`, on edits to `[tool.dead-cst]` in `pyproject.toml`, or when `from dead_cst import ...` appears.
+description: Use when running, configuring, or scripting `dead-cst` — the libcst-based dead-code analyzer. Covers entrypoint specs, path layouts, resolver/plugin pairings (especially `uv_workspace` + `uv sync --all-packages`), the dead-symbols vs. unreachable-branches output split, and the safety contract around `dead-cst remove`. Trigger on `dead-cst analyze|why-alive|remove|dependencies|unused-exports`, on edits to `[tool.dead-cst]` in `pyproject.toml`, or when `from dead_cst import ...` appears.
 ---
 
 # dead-cst
@@ -13,6 +13,39 @@ Static dead-code analyzer for Python. Builds a symbol graph (one node per top-le
 - **Edges**: declaration → each name it references; submodule → parent package (so `__init__.py` stays alive while the package does).
 - **Imports are declarations**: a module-level `import foo` is itself a node. The last in-file use disappearing makes the import dead, which is how `remove` knows to drop unused import lines.
 - **Reachability**: entrypoints (contributed by plugins) seed the walk. Anything not reached is dead.
+
+## Two kinds of output: dead symbols vs. unreachable branches
+
+`analyze` (and the JSON output) reports **two separate categories**:
+
+1. **Dead symbols** — top-level decls / imports the reachability walk never reaches. These are what `remove` deletes.
+2. **Unreachable branches** — suites inside `if` / `while` whose test is statically known to never fire (or always fire, making `else` / `while-else` dead). Reported as `path:line:col-line:col` ranges.
+
+`remove` **does not delete unreachable branches** — the codemod only handles whole top-level decls, not arbitrary suites. They're report-only; rip them out by hand.
+
+What counts as "statically known" is a deliberately small whitelist (see `_branches.py`):
+
+- The keywords `True` / `False` / `None`
+- Integer and string literals
+- Empty vs. non-empty `list` / `tuple` / `set` / `dict` literals (no `*splat` / `**splat`)
+- `not` / `and` / `or` composed over the above
+
+Anything else — name lookups (other than the three keywords), attribute access, function calls, comparisons (`x == 0`), `sys.version_info`, `TYPE_CHECKING`, env-var checks — returns "unknown" and the branch stays live. This is intentional: false positives here would silently drop real code.
+
+Concretely, dead-cst flags:
+
+```python
+if False: ...                    # body dead
+if True: ... else: ...           # else dead
+if 0 or "": ...                  # body dead
+while False: ...                 # body dead
+while True: ...; else: ...       # else dead (while-True exits via break/return/exc)
+if cond: ... elif True: ... else: ...  # else dead (a True branch fires first)
+```
+
+It does **not** flag `if TYPE_CHECKING:`, `if sys.version_info >= (3, 12):`, `if DEBUG:`, etc. — by design.
+
+Internally, each dead suite becomes a synthetic node (`type="synthetic"`, fqname prefixed `<unreachable>:`); use `dead_cst._branches.is_unreachable_node` to identify them rather than string-matching the prefix.
 
 ## CLI shape
 
