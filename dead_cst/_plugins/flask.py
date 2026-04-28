@@ -32,19 +32,18 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable
 
-import libcst as cst
 import networkx as nx
 
-from .._symbols import SymbolNode
 from ._core import (
     AddEdge,
     AddNode,
     GraphOp,
     PluginContext,
     collect_module_imports,
-    decorator_owner,
     find_call_assignments,
+    find_handlers,
     require_resolved_dep,
+    walk_to_instance_kind,
 )
 
 # Attribute names Flask / Blueprint use to register a callable. Matched as
@@ -136,9 +135,10 @@ class FlaskPlugin:
     name: str = "flask"
 
     def contribute(self, ctx: PluginContext) -> Iterable[GraphOp]:
-        flask_node = require_resolved_dep(ctx, "flask", "Flask")
+        flask_node = require_resolved_dep(ctx, "flask")
         if flask_node is None:
             return
+        reaches_flask = nx.ancestors(ctx.graph, flask_node)
 
         for path, module_node in ctx.base_modules():
             module = ctx.parse(path)
@@ -146,23 +146,23 @@ class FlaskPlugin:
                 continue
 
             flask_imports = collect_module_imports(module, "flask", _INSTANCE_KINDS)
-            direct: dict[str, str] = (
-                find_call_assignments(module, flask_imports, _INSTANCE_KINDS)
-                if flask_imports
-                else {}
-            )
-            decorated = _route_decorator_candidates(module)
+            direct = find_call_assignments(module, flask_imports, _INSTANCE_KINDS)
+            decorated = find_handlers(module, None, _REGISTRATION_DECORATORS)
             if not direct and not decorated:
                 continue
 
             module_fqname = module_node.fqname
-            for var_name in set(direct) | set(decorated):
+            for var_name in direct.keys() | decorated.keys():
                 for instance_decl in ctx.find_declarations(f"{module_fqname}.{var_name}"):
-                    kind = direct.get(var_name) or _walk_to_flask_kind(
-                        ctx.graph, instance_decl, flask_node
-                    )
+                    kind = direct.get(var_name)
                     if kind is None:
-                        continue
+                        if instance_decl not in reaches_flask:
+                            continue
+                        kind = walk_to_instance_kind(
+                            ctx.graph, instance_decl, flask_node, "flask", _INSTANCE_KINDS
+                        )
+                        if kind is None:
+                            continue
                     if _INSTANCE_KINDS[kind]:
                         yield AddNode(instance_decl, entrypoint=True)
                     for handler_name in decorated.get(var_name, ()):
@@ -170,65 +170,3 @@ class FlaskPlugin:
                             f"{module_fqname}.{handler_name}"
                         ):
                             yield AddEdge(instance_decl, handler_decl)
-
-
-def _route_decorator_candidates(module: cst.Module) -> dict[str, list[str]]:
-    """Collect every top-level ``@<X>.<route_verb>(...)``-decorated function.
-
-    Returns ``{owner_var_name: [handler_func_name, ...]}``. Owner is read
-    via :func:`decorator_owner` so bare-name (``@route``) and attribute-on-
-    non-name (``@self.app.route``) forms are skipped.
-    """
-    handlers: dict[str, list[str]] = {}
-    for stmt in module.body:
-        if not isinstance(stmt, cst.FunctionDef):
-            continue
-        for dec in stmt.decorators:
-            owner = decorator_owner(dec.decorator, _REGISTRATION_DECORATORS)
-            if owner is None:
-                continue
-            handlers.setdefault(owner, []).append(stmt.name.value)
-            break
-    return handlers
-
-
-def _walk_to_flask_kind(
-    graph: nx.DiGraph, instance_decl: SymbolNode, flask_node: SymbolNode
-) -> str | None:
-    """Return ``"Flask"`` / ``"Blueprint"`` reached from ``instance_decl``, else ``None``.
-
-    Walks forward through reference edges until hitting an ``import``
-    node bound to one of the two classes. The factory case
-    (``X = create_app()``) drops out because the factory's body
-    references ``Flask`` and the analyzer already recorded that edge.
-    Returns ``None`` when the chain doesn't reach a discriminating
-    import -- callers treat that as "not a Flask instance" rather than
-    guessing a kind.
-    """
-    seen: set[SymbolNode] = set()
-    stack: list[SymbolNode] = [instance_decl]
-    while stack:
-        node = stack.pop()
-        if node in seen or node is flask_node:
-            continue
-        seen.add(node)
-        kind = _import_kind(node)
-        if kind is not None:
-            return kind
-        stack.extend(graph.successors(node))
-    return None
-
-
-def _import_kind(node: SymbolNode) -> str | None:
-    """Return ``"Flask"`` / ``"Blueprint"`` if ``node`` imports either, else ``None``.
-
-    The plugin requires ``flask`` to be a resolved distribution
-    (:func:`require_resolved_dep`), so the visitor always encodes
-    ``from flask import Flask`` as ``Import.module="flask"`` +
-    ``Import.decl="Flask"``.
-    """
-    if node.type != "import" or node.imports is None:
-        return None
-    if node.imports.module != "flask":
-        return None
-    return node.imports.decl if node.imports.decl in _INSTANCE_KINDS else None

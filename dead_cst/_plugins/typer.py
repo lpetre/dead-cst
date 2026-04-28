@@ -70,10 +70,7 @@ class TyperPlugin:
     name: str = "typer"
 
     def contribute(self, ctx: PluginContext) -> Iterable[GraphOp]:
-        # Require that ``typer`` was resolved to an installed distribution.
-        # Raises ``UnresolvedDependencyError`` if only ``[unresolved] typer``
-        # exists, so misconfigured environments fail loudly.
-        if require_resolved_dep(ctx, "typer", "Typer") is None:
+        if require_resolved_dep(ctx, "typer") is None:
             return
         candidate_paths = ctx.importers("typer")
 

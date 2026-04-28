@@ -30,19 +30,18 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable
 
-import libcst as cst
 import networkx as nx
 
-from .._symbols import SymbolNode
 from ._core import (
     AddEdge,
     AddNode,
     GraphOp,
     PluginContext,
     collect_module_imports,
-    decorator_owner,
     find_call_assignments,
+    find_handlers,
     require_resolved_dep,
+    walk_to_instance_kind,
 )
 
 # Attribute names FastAPI / APIRouter use to register a callable. Matched as
@@ -114,9 +113,14 @@ class FastAPIPlugin:
     name: str = "fastapi"
 
     def contribute(self, ctx: PluginContext) -> Iterable[GraphOp]:
-        fastapi_node = require_resolved_dep(ctx, "fastapi", "FastAPI")
+        fastapi_node = require_resolved_dep(ctx, "fastapi")
         if fastapi_node is None:
             return
+        # ``ancestors(fastapi_node)`` is the universe of decls whose
+        # reference chain reaches the ``fastapi`` synthetic. Any
+        # factory-produced instance must be in this set; the rest can't
+        # be a FastAPI/APIRouter, so we skip the forward walk for them.
+        reaches_fastapi = nx.ancestors(ctx.graph, fastapi_node)
 
         for path, module_node in ctx.base_modules():
             module = ctx.parse(path)
@@ -124,23 +128,23 @@ class FastAPIPlugin:
                 continue
 
             fastapi_imports = collect_module_imports(module, "fastapi", _INSTANCE_KINDS)
-            direct: dict[str, str] = (
-                find_call_assignments(module, fastapi_imports, _INSTANCE_KINDS)
-                if fastapi_imports
-                else {}
-            )
-            decorated = _route_decorator_candidates(module)
+            direct = find_call_assignments(module, fastapi_imports, _INSTANCE_KINDS)
+            decorated = find_handlers(module, None, _REGISTRATION_DECORATORS)
             if not direct and not decorated:
                 continue
 
             module_fqname = module_node.fqname
-            for var_name in set(direct) | set(decorated):
+            for var_name in direct.keys() | decorated.keys():
                 for instance_decl in ctx.find_declarations(f"{module_fqname}.{var_name}"):
-                    kind = direct.get(var_name) or _walk_to_fastapi_kind(
-                        ctx.graph, instance_decl, fastapi_node
-                    )
+                    kind = direct.get(var_name)
                     if kind is None:
-                        continue
+                        if instance_decl not in reaches_fastapi:
+                            continue
+                        kind = walk_to_instance_kind(
+                            ctx.graph, instance_decl, fastapi_node, "fastapi", _INSTANCE_KINDS
+                        )
+                        if kind is None:
+                            continue
                     if _INSTANCE_KINDS[kind]:
                         yield AddNode(instance_decl, entrypoint=True)
                     for handler_name in decorated.get(var_name, ()):
@@ -148,65 +152,3 @@ class FastAPIPlugin:
                             f"{module_fqname}.{handler_name}"
                         ):
                             yield AddEdge(instance_decl, handler_decl)
-
-
-def _route_decorator_candidates(module: cst.Module) -> dict[str, list[str]]:
-    """Collect every top-level ``@<X>.<route_verb>(...)``-decorated function.
-
-    Returns ``{owner_var_name: [handler_func_name, ...]}``. Owner is read
-    via :func:`decorator_owner` so bare-name (``@get``) and attribute-on-
-    non-name (``@self.app.get``) forms are skipped.
-    """
-    handlers: dict[str, list[str]] = {}
-    for stmt in module.body:
-        if not isinstance(stmt, cst.FunctionDef):
-            continue
-        for dec in stmt.decorators:
-            owner = decorator_owner(dec.decorator, _REGISTRATION_DECORATORS)
-            if owner is None:
-                continue
-            handlers.setdefault(owner, []).append(stmt.name.value)
-            break
-    return handlers
-
-
-def _walk_to_fastapi_kind(
-    graph: nx.DiGraph, instance_decl: SymbolNode, fastapi_node: SymbolNode
-) -> str | None:
-    """Return ``"FastAPI"`` / ``"APIRouter"`` reached from ``instance_decl``, else ``None``.
-
-    Walks forward through reference edges until hitting an ``import``
-    node bound to one of the two classes. The factory case
-    (``X = create_app()``) drops out because the factory's body
-    references ``FastAPI`` and the analyzer already recorded that
-    edge. Returns ``None`` when the chain doesn't reach a
-    discriminating import -- callers treat that as "not a FastAPI
-    instance" rather than guessing a kind.
-    """
-    seen: set[SymbolNode] = set()
-    stack: list[SymbolNode] = [instance_decl]
-    while stack:
-        node = stack.pop()
-        if node in seen or node is fastapi_node:
-            continue
-        seen.add(node)
-        kind = _import_kind(node)
-        if kind is not None:
-            return kind
-        stack.extend(graph.successors(node))
-    return None
-
-
-def _import_kind(node: SymbolNode) -> str | None:
-    """Return ``"FastAPI"`` / ``"APIRouter"`` if ``node`` imports either, else ``None``.
-
-    The plugin requires ``fastapi`` to be a resolved distribution
-    (:func:`require_resolved_dep`), so the visitor always encodes
-    ``from fastapi import FastAPI`` as ``Import.module="fastapi"`` +
-    ``Import.decl="FastAPI"``.
-    """
-    if node.type != "import" or node.imports is None:
-        return None
-    if node.imports.module != "fastapi":
-        return None
-    return node.imports.decl if node.imports.decl in _INSTANCE_KINDS else None

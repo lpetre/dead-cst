@@ -34,6 +34,7 @@ from ._core import (
     apply_ops,
     require_resolved_dep,
     synthetic_node,
+    walk_to_instance_kind,
 )
 from .click import ClickPlugin
 from .explicit import ExplicitEntrypointPlugin
@@ -101,4 +102,5 @@ __all__ = [
     "load_plugin",
     "require_resolved_dep",
     "synthetic_node",
+    "walk_to_instance_kind",
 ]

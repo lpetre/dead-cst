@@ -108,22 +108,18 @@ def test_uv_workspace_resolver_skips_virtual_root(tmp_path: Path):
     assert tmp_path.resolve() not in result
 
 
-def test_uv_workspace_resolver_missing_venv_raises(tmp_path: Path):
+def test_uv_workspace_resolver_missing_venv_raises(tmp_path: Path, monkeypatch):
     """Workspace with no synced ``.venv`` raises an actionable error
     instead of silently producing wrong results downstream."""
-    _write_uv_workspace(tmp_path)
-
-    # Override the active-venv fallback so the resolver can't accidentally
-    # find one outside the workspace (e.g. the test runner's own venv).
     import sys
 
-    real_prefix = sys.prefix
-    sys.prefix = sys.base_prefix
-    try:
-        with pytest.raises(MissingVenvError, match="uv sync"):
-            UvWorkspaceResolver().resolve(tmp_path)
-    finally:
-        sys.prefix = real_prefix
+    _write_uv_workspace(tmp_path)
+    # Override the active-venv fallback so the resolver can't accidentally
+    # find one outside the workspace (e.g. the test runner's own venv).
+    monkeypatch.setattr(sys, "prefix", sys.base_prefix)
+
+    with pytest.raises(MissingVenvError, match="uv sync"):
+        UvWorkspaceResolver().resolve(tmp_path)
 
 
 def test_uv_workspace_resolver_includes_virtual_members(tmp_path: Path):

@@ -92,35 +92,38 @@ def _ctx_with_synthetic(fqname: str, base: Path) -> PluginContext:
 
 
 def test_require_resolved_dep_returns_external_dist(tmp_path):
-    from dead_cst._plugins._core import require_resolved_dep
+    from dead_cst._plugins._core import EXTERNAL_DIST_PREFIX, require_resolved_dep
 
-    ctx = _ctx_with_synthetic("[external dist] fastapi", tmp_path)
-    node = require_resolved_dep(ctx, "fastapi", "FastAPI")
+    ctx = _ctx_with_synthetic(f"{EXTERNAL_DIST_PREFIX}fastapi", tmp_path)
+    node = require_resolved_dep(ctx, "fastapi")
     assert node is not None
-    assert node.fqname == "[external dist] fastapi"
+    assert node.fqname == f"{EXTERNAL_DIST_PREFIX}fastapi"
 
 
 def test_require_resolved_dep_returns_external_file(tmp_path):
-    from dead_cst._plugins._core import require_resolved_dep
+    from dead_cst._plugins._core import EXTERNAL_FILE_PREFIX, require_resolved_dep
 
-    ctx = _ctx_with_synthetic("[external file] fastapi", tmp_path)
-    node = require_resolved_dep(ctx, "fastapi", "FastAPI")
-    assert node is not None
+    ctx = _ctx_with_synthetic(f"{EXTERNAL_FILE_PREFIX}fastapi", tmp_path)
+    assert require_resolved_dep(ctx, "fastapi") is not None
 
 
 def test_require_resolved_dep_returns_none_if_not_imported(tmp_path):
-    from dead_cst._plugins._core import require_resolved_dep
+    from dead_cst._plugins._core import EXTERNAL_DIST_PREFIX, require_resolved_dep
 
-    ctx = _ctx_with_synthetic("[external dist] something_else", tmp_path)
-    assert require_resolved_dep(ctx, "fastapi", "FastAPI") is None
+    ctx = _ctx_with_synthetic(f"{EXTERNAL_DIST_PREFIX}something_else", tmp_path)
+    assert require_resolved_dep(ctx, "fastapi") is None
 
 
 def test_require_resolved_dep_raises_on_unresolved(tmp_path):
-    from dead_cst._plugins._core import UnresolvedDependencyError, require_resolved_dep
+    from dead_cst._plugins._core import (
+        UNRESOLVED_PREFIX,
+        UnresolvedDependencyError,
+        require_resolved_dep,
+    )
 
-    ctx = _ctx_with_synthetic("[unresolved] fastapi", tmp_path)
+    ctx = _ctx_with_synthetic(f"{UNRESOLVED_PREFIX}fastapi", tmp_path)
     with pytest.raises(UnresolvedDependencyError, match="uv sync"):
-        require_resolved_dep(ctx, "fastapi", "FastAPI")
+        require_resolved_dep(ctx, "fastapi")
 
 
 # ---------------------------------------------------------------------------

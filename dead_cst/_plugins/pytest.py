@@ -49,15 +49,12 @@ class PytestPlugin:
                 decls_by_path.setdefault(node.path, []).append(node)
 
         # Fixture-branch prefilter: ``@pytest.fixture`` / ``@fixture``
-        # require importing pytest somewhere in the file. We also enforce
-        # that ``pytest`` resolved to an installed distribution -- if a
-        # file imports pytest but the resolver only produced
-        # ``[unresolved] pytest``, the env is misconfigured and we'd
-        # silently miss every fixture; raise instead. Files that don't
-        # import pytest are unaffected (test/conftest discovery is
-        # filename-driven and doesn't need pytest installed).
+        # require importing pytest somewhere in the file. Files that
+        # don't import pytest at all skip this branch silently --
+        # test/conftest discovery is filename-driven and doesn't need
+        # pytest installed.
         fixture_candidates: set[Path] = set()
-        if require_resolved_dep(ctx, "pytest", "Pytest") is not None:
+        if require_resolved_dep(ctx, "pytest") is not None:
             fixture_candidates = ctx.importers("pytest")
 
         for path, module_node in ctx.base_modules():

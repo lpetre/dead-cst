@@ -100,10 +100,7 @@ class ClickPlugin:
     name: str = "click"
 
     def contribute(self, ctx: PluginContext) -> Iterable[GraphOp]:
-        # Require that ``click`` was resolved to an installed distribution.
-        # Raises ``UnresolvedDependencyError`` if only ``[unresolved] click``
-        # exists, so misconfigured environments fail loudly.
-        if require_resolved_dep(ctx, "click", "Click") is None:
+        if require_resolved_dep(ctx, "click") is None:
             return
         candidate_paths = ctx.importers("click")
 

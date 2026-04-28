@@ -201,7 +201,7 @@ class UnresolvedDependencyError(RuntimeError):
     """
 
 
-def require_resolved_dep(ctx: PluginContext, package: str, plugin_name: str) -> SymbolNode | None:
+def require_resolved_dep(ctx: PluginContext, package: str) -> SymbolNode | None:
     """Return the resolved ``[external ...]`` synthetic for ``package``.
 
     Three outcomes:
@@ -227,10 +227,10 @@ def require_resolved_dep(ctx: PluginContext, package: str, plugin_name: str) -> 
     if ctx._synthetic(f"{UNRESOLVED_PREFIX}{package}") is None:
         return None
     raise UnresolvedDependencyError(
-        f"{plugin_name} plugin requires '{package}' to be resolvable, but "
-        f"the analyzer only found '[unresolved] {package}'. Activate your "
-        f"project's virtual environment (or run `uv sync --all-packages`) "
-        f"so that '{package}' is importable, then retry."
+        f"'{package}' is imported in this base but the analyzer only "
+        f"found '[unresolved] {package}'. Activate your project's "
+        f"virtual environment (or run `uv sync --all-packages`) so "
+        f"'{package}' is importable, then retry."
     )
 
 
@@ -368,17 +368,25 @@ def decorator_owner(expr: cst.BaseExpression, valid_attrs: Container[str]) -> st
 
 
 def find_handlers(
-    module: cst.Module, instance_vars: Container[str], valid_attrs: Container[str]
+    module: cst.Module,
+    instance_vars: Container[str] | None,
+    valid_attrs: Container[str],
 ) -> dict[str, list[str]]:
-    """Return ``{instance_var: [handler_func_name, ...]}`` for top-level functions
-    decorated with ``@<instance_var>.<attr>(...)`` where ``attr`` is in ``valid_attrs``."""
+    """Return ``{owner_var: [handler_func_name, ...]}`` for top-level functions
+    decorated with ``@<owner_var>.<attr>(...)`` where ``attr`` is in ``valid_attrs``.
+
+    ``instance_vars=None`` accepts any owner -- useful when the caller will
+    classify owners by reachability / kind in a second pass.
+    """
     handlers: dict[str, list[str]] = {}
     for stmt in module.body:
         if not isinstance(stmt, cst.FunctionDef):
             continue
         for dec in stmt.decorators:
             owner = decorator_owner(dec.decorator, valid_attrs)
-            if owner is None or owner not in instance_vars:
+            if owner is None:
+                continue
+            if instance_vars is not None and owner not in instance_vars:
                 continue
             handlers.setdefault(owner, []).append(stmt.name.value)
             break
@@ -472,3 +480,48 @@ def collect_module_imports(
                     local = _asname_value(alias) or module_name
                     bindings[local] = "<module>"
     return bindings
+
+
+def walk_to_instance_kind(
+    graph: nx.DiGraph,
+    start: SymbolNode,
+    terminal: SymbolNode,
+    module_name: str,
+    instance_kinds: Container[str],
+) -> str | None:
+    """Walk forward from ``start`` until hitting an ``import`` node bound to
+    ``module_name`` and one of ``instance_kinds``; return the matched decl name.
+
+    Used by framework plugins to classify a variable as a ``Flask`` /
+    ``Blueprint`` / ``FastAPI`` / ``APIRouter`` / etc. instance via the
+    analyzer's existing reference edges. The factory case
+    (``X = create_app()``) drops out because the factory's body
+    references the framework class and that edge is already in the
+    graph. Returns ``None`` when the chain doesn't reach a discriminating
+    import -- callers treat that as "not an instance" rather than guessing.
+
+    The ``terminal`` cutoff (the framework's external-dist synthetic) is
+    skipped during traversal so the walk doesn't fan out across
+    *every* file that imports the framework.
+
+    Plugins requiring this should also call :func:`require_resolved_dep`
+    so the visitor's ``Import.module`` is the canonical ``"flask"`` /
+    ``"fastapi"`` / etc. (the unresolved fallback uses the dotted full
+    name and would never match here).
+    """
+    seen: set[SymbolNode] = set()
+    stack: list[SymbolNode] = [start]
+    while stack:
+        node = stack.pop()
+        if node in seen or node is terminal:
+            continue
+        seen.add(node)
+        if (
+            node.type == "import"
+            and node.imports is not None
+            and node.imports.module == module_name
+            and node.imports.decl in instance_kinds
+        ):
+            return node.imports.decl
+        stack.extend(graph.successors(node))
+    return None
