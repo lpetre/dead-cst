@@ -26,3 +26,13 @@ repos:
     rev: 0.7.2
     hooks:
       - id: uv-lock
+
+  - repo: local
+    hooks:
+      - id: ty
+        name: ty check
+        entry: uv run --frozen ty check
+        language: system
+        types_or: [python, pyi]
+        pass_filenames: false
+        require_serial: true

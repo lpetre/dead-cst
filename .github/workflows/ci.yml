@@ -20,10 +20,10 @@ jobs:
           cache-dependency-glob: "**/uv.lock"
       - uses: actions/cache@v5
         with:
-          path: ~/.cache/pre-commit
-          key: pre-commit-${{ hashFiles('.pre-commit-config.yaml') }}
+          path: ~/.cache/prek
+          key: prek-${{ hashFiles('.pre-commit-config.yaml') }}
       - run: uv sync --frozen
-      - run: uv run pre-commit run --show-diff-on-failure --color=always --all-files
+      - run: uv run prek run --show-diff-on-failure --color=always --all-files
         env:
           RUFF_OUTPUT_FORMAT: github
           CONFTEST_OUTPUT: github

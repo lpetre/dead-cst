@@ -12,7 +12,7 @@ cd dead-cst
 uv sync
 ```
 
-That installs the package in editable mode along with the `dev` group: `pytest`, `ruff`, `pre-commit`, and `ty`.
+That installs the package in editable mode along with the `dev` group: `pytest`, `ruff`, `prek`, and `ty`.
 
 ## Running tests
 
@@ -57,14 +57,14 @@ excluded; see `[tool.coverage.*]` in `pyproject.toml`.
 
 ## Linting and formatting
 
-Ruff (lint + format) and a small set of pre-commit hooks run on every commit.
+Ruff (lint + format), `ty` (type check), and a small set of hooks run on every commit via [`prek`](https://github.com/j178/prek), a fast Rust-based drop-in replacement for `pre-commit` that reads the same `.pre-commit-config.yaml`.
 
 ```bash
-uv run pre-commit install        # one-time, sets up the git hook
-uv run pre-commit run --all-files
+uv run prek install        # one-time, sets up the git hook
+uv run prek run --all-files
 ```
 
-CI runs `pre-commit run --all-files` on every push and pull request, so running it locally before committing avoids round-trips.
+CI runs `prek run --all-files` on every push and pull request, so running it locally before committing avoids round-trips.
 
 ## Project layout
 
@@ -146,7 +146,7 @@ A good bug report contains a minimal `.py` file (or pair of files) and the entry
 
 - Keep PRs focused — one logical change per PR.
 - Add or update tests for behaviour changes.
-- Run `pre-commit run --all-files` and `pytest` before pushing.
+- Run `prek run --all-files` and `pytest` before pushing.
 - If your change is user-visible, add an entry to `CHANGELOG.md` under `[Unreleased]`.
 
 ## Releasing

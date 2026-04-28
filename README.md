@@ -183,7 +183,7 @@ git clone https://github.com/lpetre/dead-cst
 cd dead-cst
 uv sync
 uv run pytest
-uv run pre-commit run --all-files
+uv run prek run --all-files
 ```
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full dev guide, [`CHANGELOG.md`](CHANGELOG.md) for release notes, and [`ROADMAP.md`](ROADMAP.md) for the stack-ranked plan toward 1.0.
