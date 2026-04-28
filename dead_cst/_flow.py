@@ -35,6 +35,14 @@ from typing import Callable, Sequence
 
 import libcst as cst
 
+# A suite's `.body` is `Sequence[BaseStatement] | Sequence[BaseSmallStatement]`
+# depending on whether it's an `IndentedBlock` or a `SimpleStatementSuite`
+# (the one-line `def f(): pass` form). Flow analysis treats small statements
+# as plain bindings -- none of the compound-statement isinstance checks
+# match -- so accepting both shapes keeps a single code path.
+_StmtSeq = Sequence[cst.BaseStatement] | Sequence[cst.BaseSmallStatement]
+_Stmt = cst.BaseStatement | cst.BaseSmallStatement
+
 
 def _descendant_ids(node: cst.CSTNode, cache: dict[int, frozenset[int]]) -> frozenset[int]:
     key = id(node)
@@ -49,11 +57,11 @@ def _descendant_ids(node: cst.CSTNode, cache: dict[int, frozenset[int]]) -> froz
 
 
 def _walk_flow(
-    stmts: Sequence[cst.BaseStatement],
+    stmts: _StmtSeq,
     incoming: set[cst.CSTNode],
     referent_set: set[cst.CSTNode],
     cache: dict[int, frozenset[int]],
-    observe: Callable[[cst.BaseStatement, set[cst.CSTNode]], None] | None,
+    observe: Callable[[_Stmt, set[cst.CSTNode]], None] | None,
 ) -> set[cst.CSTNode]:
     """Forward-walk ``stmts`` evolving the live referent set.
 
@@ -138,7 +146,7 @@ def live_referents(
     access_id = id(access_node)
     observed: list[set[cst.CSTNode]] = []
 
-    def _observe(stmt: cst.BaseStatement, state: set[cst.CSTNode]) -> None:
+    def _observe(stmt: _Stmt, state: set[cst.CSTNode]) -> None:
         if access_id in _descendant_ids(stmt, cache):
             observed.append(set(state))
 

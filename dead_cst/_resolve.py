@@ -71,8 +71,8 @@ def distribution_lookup() -> dict[Path, str]:
 
     lookup = {}
     for dist in metadata.distributions():
-        for file in dist.files:
-            abs_path = Path(dist.locate_file(file)).resolve()
+        for file in dist.files or ():
+            abs_path = Path(str(dist.locate_file(file))).resolve()
             lookup[abs_path] = dist.metadata["Name"]
     return lookup
 
@@ -126,7 +126,7 @@ def resolve_edges(
             continue
 
         node = symbol_lookup._get(dst.module.split("."))
-        if not node:
+        if not node or node.module is None:
             logger.warning("Failed to resolve import module: %s", dst.module)
             continue
 
@@ -183,7 +183,7 @@ def resolve_edges(
                             dst.module,
                             dst.decl,
                             part,
-                            cur.module.fqname,
+                            cur.module.fqname if cur.module else "<no module>",
                             decl.imports.module,
                         )
                         continue
@@ -204,5 +204,5 @@ def resolve_edges(
                 dst.module,
                 dst.decl,
                 part,
-                cur.module.fqname,
+                cur.module.fqname if cur.module else "<no module>",
             )

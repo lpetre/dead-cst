@@ -108,14 +108,14 @@ def remove_code(G: nx.Graph, base: Path) -> None:
             case "module":
                 node.path.unlink()
 
-    mgr = FullRepoManager(base, by_file.keys(), {FixedFullyQualifiedNameProvider})
+    mgr = FullRepoManager(str(base), [str(p) for p in by_file], {FixedFullyQualifiedNameProvider})
     for path, nodes in sorted(by_file.items(), key=lambda x: x):
         if not path.exists():
             continue
 
         # Pass 1: drop dead defs / classes / variables. Imports they
         # used to reference become eligible for removal in pass 2.
-        wrapper = mgr.get_metadata_wrapper_for_path(path)
+        wrapper = mgr.get_metadata_wrapper_for_path(str(path))
         dead_decls = {(n.fqname, n.position) for n in nodes if n.type != "import"}
         result = wrapper.visit(RemoveDeadSymbols(dead_decls))
 

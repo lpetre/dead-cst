@@ -9,7 +9,15 @@ from typing import Iterable
 import libcst as cst
 
 from .._symbols import SymbolNode
-from ._core import GraphOp, PluginContext, is_from_module, is_name, mark_entrypoints, simple_name
+from ._core import (
+    GraphOp,
+    PluginContext,
+    _asname_value,
+    is_from_module,
+    is_name,
+    mark_entrypoints,
+    simple_name,
+)
 
 UNITTEST_PREFIX = "<unittest>:"
 
@@ -114,9 +122,7 @@ def _collect_unittest_imports(module: cst.Module) -> tuple[set[str], set[str]]:
                 for alias in small.names:
                     if not is_name(alias.name, "unittest"):
                         continue
-                    local = alias.asname.name.value if alias.asname else "unittest"
-                    if isinstance(local, str):
-                        module_aliases.add(local)
+                    module_aliases.add(_asname_value(alias) or "unittest")
             elif isinstance(small, cst.ImportFrom):
                 if not is_from_module(small, "unittest"):
                     continue
@@ -129,9 +135,7 @@ def _collect_unittest_imports(module: cst.Module) -> tuple[set[str], set[str]]:
                     target = alias.name.value if isinstance(alias.name, cst.Name) else None
                     if target not in _TEST_BASE_CLASSES:
                         continue
-                    local = alias.asname.name.value if alias.asname else target
-                    if isinstance(local, str):
-                        base_aliases.add(local)
+                    base_aliases.add(_asname_value(alias) or target)
     return module_aliases, base_aliases
 
 

@@ -90,3 +90,10 @@ docstring-code-format = true
 
 [tool.ruff.lint.isort]
 known-first-party = ["dead_cst"]
+
+[tool.ty.src]
+# Type-check only the package itself. Tests, examples, and the workspace
+# fixtures intentionally exercise untyped LibCST internals and the
+# unresolved-import case the analyzer is meant to detect, so they aren't
+# meaningful targets for ty.
+include = ["dead_cst"]

@@ -278,6 +278,18 @@ def is_from_module(node: cst.ImportFrom, module_name: str) -> bool:
     return not node.relative and is_name(node.module, module_name)
 
 
+def _asname_value(alias: cst.ImportAlias) -> str | None:
+    """Return ``alias.asname.name.value`` when it's a bare ``Name``, else ``None``.
+
+    ``AsName.name`` is typed ``Name | Tuple | List`` to share with ``with``-statement
+    unpacking, but in import contexts only ``Name`` is legal.
+    """
+    if alias.asname is None:
+        return None
+    name = alias.asname.name
+    return name.value if isinstance(name, cst.Name) else None
+
+
 def single_target_assignment(
     stmt: cst.BaseSmallStatement,
 ) -> tuple[str | None, cst.BaseExpression | None]:
@@ -351,7 +363,7 @@ def matched_attr_call(
         expr = expr.func
     if isinstance(expr, cst.Name):
         target = imports.get(expr.value)
-        if target in valid_targets:
+        if target is not None and target in valid_targets:
             return target
     elif isinstance(expr, cst.Attribute) and isinstance(expr.value, cst.Name):
         if imports.get(expr.value.value) == "<module>":
@@ -404,14 +416,12 @@ def collect_module_imports(
                     target = alias.name.value if isinstance(alias.name, cst.Name) else None
                     if target is None or target not in allowed_targets:
                         continue
-                    local = alias.asname.name.value if alias.asname else target
-                    if isinstance(local, str):
-                        bindings[local] = target
+                    local = _asname_value(alias) or target
+                    bindings[local] = target
             elif isinstance(small, cst.Import):
                 for alias in small.names:
                     if not is_name(alias.name, module_name):
                         continue
-                    local = alias.asname.name.value if alias.asname else module_name
-                    if isinstance(local, str):
-                        bindings[local] = "<module>"
+                    local = _asname_value(alias) or module_name
+                    bindings[local] = "<module>"
     return bindings
