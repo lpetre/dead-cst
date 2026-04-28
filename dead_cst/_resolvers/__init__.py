@@ -21,7 +21,7 @@ from ._core import PathMap, PathResolver, merge_paths
 from ._exports import exported_roots
 from .pyproject import PyprojectResolver
 from .uv_workspace import UvWorkspaceResolver
-from .venv import VenvResolver
+from .venv import MissingVenvError, VenvResolver
 
 BUILTIN_RESOLVERS: dict[str, type[PathResolver]] = {
     VenvResolver.name: VenvResolver,
@@ -46,6 +46,7 @@ def load_resolver(name: str) -> PathResolver:
 
 __all__ = [
     "BUILTIN_RESOLVERS",
+    "MissingVenvError",
     "PathMap",
     "PathResolver",
     "PyprojectResolver",

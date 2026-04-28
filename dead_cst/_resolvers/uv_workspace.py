@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ._core import PathMap, load_toml
+from .venv import MissingVenvError, find_venv_site_packages
 
 
 @dataclass
@@ -17,7 +18,7 @@ class UvWorkspaceResolver:
     or ``{ virtual = "..." }`` -- uv's two markers for a workspace member --
     emit one :class:`PathMap` entry::
 
-        {member_src_root: [direct_workspace_dep_src_roots]}
+        {member_src_root: [direct_workspace_dep_src_roots, workspace_site_packages]}
 
     ``editable`` members are installable distributions; ``virtual`` members
     are runnable apps/services that aren't shipped as wheels. Both are
@@ -32,6 +33,16 @@ class UvWorkspaceResolver:
     Direct workspace dependencies come from the lockfile's per-package
     ``dependencies`` array; transitive deps are reachable through the chain
     of returned bases and don't need to be re-listed per member.
+
+    The resolver also requires the workspace's shared venv to be present
+    (uv puts a single ``.venv`` at the workspace root). Each member's
+    dep list ends with that ``site-packages`` so third-party imports
+    resolve to ``[external dist] <pkg>`` synthetics rather than the
+    ``[unresolved]`` fallback. If no venv is found,
+    :class:`MissingVenvError` is raised -- the user almost certainly
+    forgot ``uv sync --all-packages``, and silently returning an empty
+    path map just defers a much less actionable failure into the
+    plugin pass.
     """
 
     lock_path: Path | None = None
@@ -42,6 +53,14 @@ class UvWorkspaceResolver:
         data = load_toml(self.lock_path or project_root / "uv.lock")
         if data is None:
             return {}
+
+        site_packages = find_venv_site_packages(project_root)
+        if site_packages is None:
+            raise MissingVenvError(
+                f"uv_workspace resolver: no virtual environment found for "
+                f"workspace at {project_root}. Run `uv sync --all-packages` "
+                f"to populate the shared `.venv`."
+            )
 
         member_dirs: dict[str, Path] = {}
         member_deps: dict[str, list[str]] = {}
@@ -72,6 +91,7 @@ class UvWorkspaceResolver:
                 dep_src = _src_root_for(dep_dir)
                 if dep_src is not None:
                     deps.append(dep_src)
+            deps.append(site_packages)
             out[src_root] = deps
         return out
 

@@ -27,6 +27,7 @@ from ._core import (
     collect_module_imports,
     find_call_assignments,
     find_handlers,
+    require_resolved_dep,
 )
 
 # Attribute names ``Typer`` uses to register a callable. Matched as the
@@ -69,12 +70,12 @@ class TyperPlugin:
     name: str = "typer"
 
     def contribute(self, ctx: PluginContext) -> Iterable[GraphOp]:
-        # Prefilter via the import graph: only files that actually import
-        # ``typer`` can declare an app. Free because the resolver already
-        # added ``[external dist] typer`` predecessors for them.
-        candidate_paths = ctx.importers("typer")
-        if not candidate_paths:
+        # Require that ``typer`` was resolved to an installed distribution.
+        # Raises ``UnresolvedDependencyError`` if only ``[unresolved] typer``
+        # exists, so misconfigured environments fail loudly.
+        if require_resolved_dep(ctx, "typer", "Typer") is None:
             return
+        candidate_paths = ctx.importers("typer")
 
         for path, module_node in ctx.base_modules():
             if path not in candidate_paths:

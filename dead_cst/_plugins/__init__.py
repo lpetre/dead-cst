@@ -30,7 +30,9 @@ from ._core import (
     GraphOp,
     PluginContext,
     RemoveEdge,
+    UnresolvedDependencyError,
     apply_ops,
+    require_resolved_dep,
     synthetic_node,
 )
 from .click import ClickPlugin
@@ -94,7 +96,9 @@ __all__ = [
     "SYNTHETIC_POSITION",
     "TyperPlugin",
     "UnittestPlugin",
+    "UnresolvedDependencyError",
     "apply_ops",
     "load_plugin",
+    "require_resolved_dep",
     "synthetic_node",
 ]

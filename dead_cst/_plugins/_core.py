@@ -187,6 +187,53 @@ class PluginContext:
         return self._synthetic_index.get(fqname)
 
 
+class UnresolvedDependencyError(RuntimeError):
+    """A plugin needs ``package`` resolved to an installed distribution but
+    only the ``[unresolved] <package>`` synthetic exists.
+
+    This means at least one file under the analyzed base does
+    ``import <package>`` / ``from <package> import ...``, but no resolver
+    found the distribution on ``sys.path`` -- typically the user hasn't
+    activated their venv (or hasn't run ``uv sync``). The plugin can't
+    function without the resolver having pinned the package to a real
+    site-packages location, so we surface the failure rather than
+    silently producing wrong results.
+    """
+
+
+def require_resolved_dep(ctx: PluginContext, package: str, plugin_name: str) -> SymbolNode | None:
+    """Return the resolved ``[external ...]`` synthetic for ``package``.
+
+    Three outcomes:
+
+    * Returns the ``[external dist] <package>`` / ``[external file] <package>``
+      node if the analyzer's resolver pinned ``package`` to an installed
+      distribution.
+    * Returns ``None`` if no file in this base imports ``package`` (no
+      synthetic was created at all). The plugin has nothing to do.
+    * Raises :class:`UnresolvedDependencyError` if only the
+      ``[unresolved] <package>`` synthetic exists -- the plugin's
+      precondition (a resolved import of ``package``) is unmet, so we
+      stop rather than guess.
+
+    Plugins that wrap framework conventions (FastAPI, Flask, Click,
+    Typer, ...) should use this in place of ``ctx.importers(package)``
+    so that misconfigured environments fail loudly.
+    """
+    for prefix in EXTERNAL_PREFIXES:
+        node = ctx._synthetic(f"{prefix}{package}")
+        if node is not None:
+            return node
+    if ctx._synthetic(f"{UNRESOLVED_PREFIX}{package}") is None:
+        return None
+    raise UnresolvedDependencyError(
+        f"{plugin_name} plugin requires '{package}' to be resolvable, but "
+        f"the analyzer only found '[unresolved] {package}'. Activate your "
+        f"project's virtual environment (or run `uv sync --all-packages`) "
+        f"so that '{package}' is importable, then retry."
+    )
+
+
 @dataclass(frozen=True)
 class AddNode:
     """Add a node to the graph. When ``entrypoint=True``, mark the node so

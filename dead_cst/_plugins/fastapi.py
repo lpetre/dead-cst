@@ -42,6 +42,7 @@ from ._core import (
     collect_module_imports,
     decorator_owner,
     find_call_assignments,
+    require_resolved_dep,
 )
 
 # Attribute names FastAPI / APIRouter use to register a callable. Matched as
@@ -113,7 +114,7 @@ class FastAPIPlugin:
     name: str = "fastapi"
 
     def contribute(self, ctx: PluginContext) -> Iterable[GraphOp]:
-        fastapi_node = _find_fastapi_node(ctx)
+        fastapi_node = require_resolved_dep(ctx, "fastapi", "FastAPI")
         if fastapi_node is None:
             return
 
@@ -147,21 +148,6 @@ class FastAPIPlugin:
                             f"{module_fqname}.{handler_name}"
                         ):
                             yield AddEdge(instance_decl, handler_decl)
-
-
-def _find_fastapi_node(ctx: PluginContext) -> SymbolNode | None:
-    """Return the synthetic node the analyzer attaches to ``fastapi`` imports.
-
-    The analyzer surfaces ``import fastapi`` / ``from fastapi import ...``
-    as a predecessor of one of the synthetic markers
-    (``[external dist]``, ``[external file]``, or ``[unresolved]``).
-    Whichever is present is the hub every chain we care about lands on.
-    """
-    for prefix in ("[external dist] ", "[external file] ", "[unresolved] "):
-        node = ctx._synthetic(f"{prefix}fastapi")
-        if node is not None:
-            return node
-    return None
 
 
 def _route_decorator_candidates(module: cst.Module) -> dict[str, list[str]]:
@@ -214,18 +200,13 @@ def _walk_to_fastapi_kind(
 def _import_kind(node: SymbolNode) -> str | None:
     """Return ``"FastAPI"`` / ``"APIRouter"`` if ``node`` imports either, else ``None``.
 
-    Handles both encodings the visitor uses depending on whether
-    ``fastapi`` resolved as an installed distribution: resolved gives
-    ``Import.module="fastapi"`` + ``Import.decl="FastAPI"``, unresolved
-    gives ``Import.module="fastapi.FastAPI"`` + ``Import.decl=None``.
-    Concatenating gives a single shape to match.
+    The plugin requires ``fastapi`` to be a resolved distribution
+    (:func:`require_resolved_dep`), so the visitor always encodes
+    ``from fastapi import FastAPI`` as ``Import.module="fastapi"`` +
+    ``Import.decl="FastAPI"``.
     """
     if node.type != "import" or node.imports is None:
         return None
-    full = node.imports.module
-    if node.imports.decl:
-        full = f"{full}.{node.imports.decl}"
-    if not full.startswith("fastapi."):
+    if node.imports.module != "fastapi":
         return None
-    tail = full.rsplit(".", 1)[-1]
-    return tail if tail in _INSTANCE_KINDS else None
+    return node.imports.decl if node.imports.decl in _INSTANCE_KINDS else None

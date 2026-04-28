@@ -25,6 +25,7 @@ from ._core import (
     collect_module_imports,
     find_call_assignments,
     find_handlers,
+    require_resolved_dep,
 )
 
 # Attribute names Flask / Blueprint use to register a callable. Matched as
@@ -110,12 +111,13 @@ class FlaskPlugin:
     name: str = "flask"
 
     def contribute(self, ctx: PluginContext) -> Iterable[GraphOp]:
-        # Prefilter via the import graph: only files that actually import
-        # ``flask`` can declare an app or blueprint. The analyzer's resolver
-        # already added ``[external dist] flask`` predecessors for them.
-        candidate_paths = ctx.importers("flask")
-        if not candidate_paths:
+        # Require that ``flask`` was resolved to an installed distribution.
+        # Returns ``None`` if no file imports flask (nothing to do); raises
+        # ``UnresolvedDependencyError`` if only the ``[unresolved] flask``
+        # synthetic exists, so misconfigured environments fail loudly.
+        if require_resolved_dep(ctx, "flask", "Flask") is None:
             return
+        candidate_paths = ctx.importers("flask")
 
         for path, module_node in ctx.base_modules():
             if path not in candidate_paths:
