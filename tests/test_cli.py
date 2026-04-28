@@ -30,6 +30,7 @@ from dead_cst._symbols import SymbolNode
 from dead_cst.cli import (
     _is_dunder_all,
     _is_external_dep,
+    _rel_path,
     app,
     build_plugins,
     parse_entrypoint,
@@ -232,6 +233,20 @@ def test_is_dunder_all(fqname, type_, expected):
 def test_is_external_dep(fqname, type_, expected):
     node = SymbolNode(fqname, type_, Path("/x.py"), _pos())
     assert _is_external_dep(node) is expected
+
+
+def test_rel_path_under_root_is_relativized():
+    assert _rel_path(Path("/a/b/c.py"), Path("/a")) == Path("b/c.py")
+
+
+def test_rel_path_outside_root_returned_unchanged():
+    p = Path("/elsewhere/c.py")
+    assert _rel_path(p, Path("/a")) == p
+
+
+def test_rel_path_equal_to_root_yields_empty(tmp_path):
+    """``Path.relative_to`` of a path against itself is ``Path('.')``."""
+    assert _rel_path(tmp_path, tmp_path) == Path(".")
 
 
 # ---------------------------------------------------------------------------
