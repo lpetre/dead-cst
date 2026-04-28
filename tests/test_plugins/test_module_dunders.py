@@ -38,6 +38,43 @@ def test_keeps_other_dunders_alive(tmp_path, write_files, reachable_fqnames):
     assert "pkg.unused" not in reached
 
 
+def test_keeps_future_imports_alive(tmp_path, write_files, reachable_fqnames):
+    write_files(
+        {
+            "pkg/__init__.py": (
+                "from __future__ import annotations\nfrom __future__ import division\nunused = 1\n"
+            ),
+        }
+    )
+    graph = build_symbol_graph(
+        {tmp_path: []},
+        plugins=[ModuleDundersPlugin()],
+        project_root=tmp_path,
+    )
+    reached = reachable_fqnames(graph)
+    # The local bindings of ``from __future__ import X`` are kept alive
+    # even though ``X`` is not a dunder name -- the import itself is a
+    # compile-time directive that can't be rewritten away.
+    assert {"pkg.annotations", "pkg.division"} <= reached
+    assert "pkg.unused" not in reached
+
+
+def test_ignores_non_future_imports_with_plain_names(tmp_path, write_files, reachable_fqnames):
+    write_files(
+        {
+            "pkg/__init__.py": "from os import path\n",
+        }
+    )
+    graph = build_symbol_graph(
+        {tmp_path: []},
+        plugins=[ModuleDundersPlugin()],
+        project_root=tmp_path,
+    )
+    reached = reachable_fqnames(graph)
+    # Non-``__future__`` imports of plain names stay dead absent another entrypoint.
+    assert "pkg.path" not in reached
+
+
 def test_ignores_non_dunder_underscore_names(tmp_path, write_files, reachable_fqnames):
     write_files(
         {
