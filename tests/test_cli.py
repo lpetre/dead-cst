@@ -30,6 +30,7 @@ from dead_cst._symbols import SymbolNode
 from dead_cst.cli import (
     _is_dunder_all,
     _is_external_dep,
+    _partition_unreachable,
     _rel_path,
     app,
     build_plugins,
@@ -247,6 +248,28 @@ def test_rel_path_outside_root_returned_unchanged():
 def test_rel_path_equal_to_root_yields_empty(tmp_path):
     """``Path.relative_to`` of a path against itself is ``Path('.')``."""
     assert _rel_path(tmp_path, tmp_path) == Path(".")
+
+
+def test_partition_unreachable_splits_synthetic_branches_from_real():
+    import networkx as nx
+
+    real = SymbolNode("pkg.f", "function", Path("/a.py"), _pos())
+    branch = SymbolNode("<unreachable pkg.a:5:0>", "synthetic", Path("/a.py"), _pos())
+    entrypoint_synth = SymbolNode("<entrypoint>:pkg.f", "synthetic", Path("/a.py"), _pos())
+
+    g = nx.DiGraph()
+    for n in (real, branch, entrypoint_synth):
+        g.add_node(n)
+
+    dead_real, branches = _partition_unreachable(g)
+    assert dead_real == [real, entrypoint_synth]
+    assert branches == [branch]
+
+
+def test_partition_unreachable_empty_graph_returns_empty_lists():
+    import networkx as nx
+
+    assert _partition_unreachable(nx.DiGraph()) == ([], [])
 
 
 # ---------------------------------------------------------------------------
