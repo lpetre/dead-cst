@@ -4,7 +4,7 @@ import logging
 from functools import cache
 from importlib.util import resolve_name
 from pathlib import Path
-from typing import Generator, Literal, Mapping
+from typing import Generator, Literal, Mapping, cast
 
 import libcst as cst
 from libcst.helpers import get_full_name_for_node
@@ -14,11 +14,12 @@ from libcst.metadata import (
     ScopeProvider,
 )
 from libcst.metadata.scope_provider import (
-    BuiltinAssignment,
+    Assignment,
     ClassScope,
     FunctionScope,
     GlobalScope,
     ImportAssignment,
+    Scope,
 )
 
 from ._branches import make_unreachable_node, unreachable_suites
@@ -121,7 +122,7 @@ class SymbolVisitor(cst.CSTVisitor):
         return self.decl_stack[0][0]
 
     @cache
-    def resolve_import(self, name: str) -> str | Path:
+    def resolve_import(self, name: str) -> str | Path | None:
         return resolve_import(name, self.search_paths)
 
     def _push_decl(self, node: cst.CSTNode, decl: SymbolNode):
@@ -187,11 +188,11 @@ class SymbolVisitor(cst.CSTVisitor):
         else:
             targets = [node.target]
 
-        # For `x: T` (AnnAssign without a value) treat the annotation as the
-        # rhs so references inside it are attributed to the new symbol.
+        # For `x: T` (AnnAssign without a value) treat the annotation expression
+        # as the rhs so references inside it are attributed to the new symbol.
         rhs = node.value
         if rhs is None and isinstance(node, cst.AnnAssign):
-            rhs = node.annotation
+            rhs = node.annotation.annotation
 
         # Flatten each top-level target against the rhs into (name, value) pairs.
         # For chained assignment ``b = c = f`` every target shares the same rhs.
@@ -237,18 +238,27 @@ class SymbolVisitor(cst.CSTVisitor):
     def _add_import(self, from_prefix: str, node: cst.Import | cst.ImportFrom) -> None:
         current_decl = self.decl_stack[-1][-1] if self.decl_stack else None
 
-        module_path, module_name = None, None
+        module_path: str | Path | None = None
+        module_name: str | None = None
         if from_prefix:
-            module_path = self.resolve_import(from_prefix)
-            module_name = from_prefix if module_path else None
+            if path := self.resolve_import(from_prefix):
+                module_path = path
+                module_name = from_prefix
 
+        # ``visit_ImportFrom`` routes ``from X import *`` to ``_add_star_import``,
+        # so by the time we get here ``names`` is always the alias sequence form.
+        assert not isinstance(node.names, cst.ImportStar)
         for alias in reversed(node.names):
             alias_name = get_full_name_for_node(alias.name)
+            # alias.name is always Name | Attribute, both of which produce a
+            # dotted-name string; the helper only returns None for unsupported
+            # node types we never see here.
+            assert alias_name is not None
             full_name = f"{from_prefix}.{alias_name}" if from_prefix else alias_name
 
             if resolved := self.resolve_import(full_name):
                 module_path = resolved
-                module_name = full_name if module_path else None
+                module_name = full_name
 
             if not module_path:
                 code = cst.Module([]).code_for_node(alias)
@@ -263,6 +273,7 @@ class SymbolVisitor(cst.CSTVisitor):
                 top_level = full_name.split(".", 1)[0]
                 module_path = f"{UNRESOLVED_PREFIX}{top_level}"
                 module_name = full_name
+            assert module_name is not None
 
             if alias.asname:
                 decl_name = alias.asname.name
@@ -443,9 +454,15 @@ class SymbolVisitor(cst.CSTVisitor):
 
         parent_map = self.metadata[ParentNodeProvider]
         references = set()
-        for scope in set(self.metadata[ScopeProvider].values()):
+        # ScopeProvider's metadata is typed loosely upstream; the values are
+        # always ``Scope`` instances.
+        scopes = cast("set[Scope]", set(self.metadata[ScopeProvider].values()))
+        for scope in scopes:
             for access in scope.accesses:
-                referents = [r for r in access.referents if not isinstance(r, BuiltinAssignment)]
+                # ``Assignment`` and ``BuiltinAssignment`` are the only
+                # ``BaseAssignment`` subclasses; selecting ``Assignment``
+                # excludes builtins and gives us a typed ``.node``.
+                referents = [r for r in access.referents if isinstance(r, Assignment)]
                 if len(referents) > 1:
                     body = self._scope_body(referents[0].scope, original_node)
                     if body is not None:

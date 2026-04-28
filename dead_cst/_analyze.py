@@ -103,12 +103,14 @@ def build_symbol_graph(
             export_roots = exported_roots(base)
             import_edges = set()
             files = list(sorted(base.rglob("*.py")))
-            mgr = FullRepoManager(base, files, {FixedFullyQualifiedNameProvider})
+            mgr = FullRepoManager(
+                str(base), [str(f) for f in files], {FixedFullyQualifiedNameProvider}
+            )
             # Stash the modules the visitor pass parses so plugins can reuse
             # them via ``ctx.parse(path)`` without re-reading or re-parsing.
             base_modules: dict[Path, cst.Module] | None = {} if plugins else None
             for file in files:
-                wrapper = mgr.get_metadata_wrapper_for_path(file)
+                wrapper = mgr.get_metadata_wrapper_for_path(str(file))
                 if base_modules is not None:
                     base_modules[file] = wrapper.module
                 visitor = SymbolVisitor(file, search_paths)

@@ -52,7 +52,7 @@ version-file = "dead_cst/_version.py"
 
 [dependency-groups]
 dev = [
-    "pre-commit>=4.2.0",
+    "prek>=0.3.11",
     "pytest>=8.4.1",
     "pytest-cov>=5.0.0",
     "pytest-watcher>=0.4.3",
@@ -90,3 +90,10 @@ docstring-code-format = true
 
 [tool.ruff.lint.isort]
 known-first-party = ["dead_cst"]
+
+[tool.ty.src]
+# Type-check only the package itself. Tests, examples, and the workspace
+# fixtures intentionally exercise untyped LibCST internals and the
+# unresolved-import case the analyzer is meant to detect, so they aren't
+# meaningful targets for ty.
+include = ["dead_cst"]
