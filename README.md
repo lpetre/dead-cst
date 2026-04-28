@@ -63,6 +63,13 @@ dead-cst analyze ROOT -e ENTRYPOINT [OPTIONS]
 
 Exit code 1 if dead code is found, 0 otherwise.
 
+`analyze` reports two separate categories of output:
+
+- **Dead symbols** — top-level decls and imports the reachability walk never reaches. These are what `dead-cst remove` deletes.
+- **Unreachable branches** — `if` / `while` suites whose test is statically known (`if False:`, `while True: ... else:`, `if 0 or "":`, `elif True: ... else:`, etc.). These are reported as `path:line:col-line:col` ranges and are **not** removed by `dead-cst remove` — the codemod only handles whole top-level decls.
+
+The truthiness evaluator is deliberately conservative: only the keywords `True` / `False` / `None`, integer / string literals, empty vs. non-empty list / tuple / set / dict literals, and `not` / `and` / `or` over those count. Anything involving a name lookup, attribute access, function call, or comparison stays live, so `if TYPE_CHECKING:`, `if sys.version_info >= (3, 12):`, and `if DEBUG:` are never flagged.
+
 ### `dead-cst why-alive`
 
 Show why a symbol is considered alive by printing its predecessor chain.

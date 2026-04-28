@@ -1,6 +1,6 @@
 ---
 name: dead-cst
-description: Use when running, configuring, or scripting `dead-cst` — the libcst-based dead-code analyzer. Covers entrypoint specs, path layouts, resolver/plugin pairings (especially `uv_workspace` + `uv sync --all-packages`), the dead-symbols vs. unreachable-branches output split, and the safety contract around `dead-cst remove`. Trigger on `dead-cst analyze|why-alive|remove|dependencies|unused-exports`, on edits to `[tool.dead-cst]` in `pyproject.toml`, or when `from dead_cst import ...` appears.
+description: Use when running, configuring, or scripting `dead-cst` — the libcst-based dead-code analyzer. Covers entrypoint specs, path layouts, resolver/plugin pairings (especially `uv_workspace` + `uv sync --all-packages`), the dead-symbols vs. unreachable-branches output split, the safety contract around `dead-cst remove`, and the workflow for pruning unused `[project.dependencies]` from `pyproject.toml` via `dead-cst dependencies`. Trigger on `dead-cst analyze|why-alive|remove|dependencies|unused-exports`, on edits to `[tool.dead-cst]` / `[project.dependencies]` in `pyproject.toml`, or when `from dead_cst import ...` appears.
 ---
 
 # dead-cst
@@ -102,6 +102,39 @@ Two categories: **entrypoint plugins** (seed reachability) and **edge plugins** 
 | `click` | Click CLI. Top-level `Group` instances; sub-groups stay dead unless `add_command`'d. |
 | `init_subclass` | Registry pattern via `__init_subclass__`. Parent stays pass-through; subclasses light up once anything keeps the parent alive. |
 
+## Pruning `pyproject.toml` dependencies
+
+`dead-cst dependencies` lists every third-party module imported under each base. Use it to find dependencies declared in `[project.dependencies]` (or `[dependency-groups]`) that the codebase never actually imports.
+
+```bash
+# Text output
+dead-cst dependencies . --resolver pyproject --resolver venv
+
+# JSON for scripting (one list per base path)
+dead-cst dependencies . --resolver pyproject --resolver venv --format json
+```
+
+Each entry is one of:
+
+- `[external dist] <name>` — resolver matched the import to an installed distribution (the common case; `<name>` is the **distribution** name, e.g. `pyyaml`, not the import name `yaml`).
+- `[external file] <name>` — resolved to a file inside `site-packages` but no matching dist metadata. Treat the same as `external dist` for pruning purposes.
+- `[unresolved] <name>` — visible only in the graph, not in `dependencies` output. Means a venv resolver wasn't run, or the package isn't installed. Fix the venv before pruning.
+
+### Workflow for "remove unused deps from pyproject.toml"
+
+1. Run `dead-cst dependencies . --resolver pyproject --resolver venv --format json` (or `--resolver uv_workspace` for workspaces — remember `uv sync --all-packages` first).
+2. Read `[project.dependencies]` (and any `[project.optional-dependencies]` / `[dependency-groups]` you're pruning).
+3. For each declared dep, check whether its imported name appears in the dependencies output. **Distribution name ≠ import name** — common mismatches: `pyyaml`→`yaml`, `pillow`→`PIL`, `beautifulsoup4`→`bs4`, `python-dateutil`→`dateutil`, `protobuf`→`google.protobuf`, `opencv-python`→`cv2`, `scikit-learn`→`sklearn`. Hyphens vs. underscores are normalized in dist names but **not** in module names. When unsure, look at the dist's top-level packages on PyPI / in the installed `*.dist-info/RECORD`.
+4. Before flagging a dep as unused, rule out:
+   - **CLI-only tools** (`pytest`, `ruff`, `mypy`, `prek`, `coverage`) — invoked as a binary, never imported. They legitimately don't appear in `dependencies` output. They typically belong in `[dependency-groups]` / `[project.optional-dependencies]`, not runtime deps; if found in runtime deps, that's a different cleanup.
+   - **Plugin / entry-point packages** loaded by `importlib.metadata.entry_points` (e.g. pytest plugins, dead-cst plugins) — never imported by name, but required at runtime.
+   - **Build / packaging deps** (`hatchling`, `setuptools`, `hatch-vcs`) — declared in `[build-system].requires`, not `[project.dependencies]`, and never imported.
+   - **Optional / extras-only deps** the user wires up conditionally.
+5. **`dependencies` reports imports across the whole base, including dead modules.** A dep imported only by a file `analyze` reports as dead is still listed. To get a tighter "deps required by reachable code" view, run `analyze` first, exclude reported dead files from the source tree (or remove them), then re-run `dependencies`.
+6. Propose pyproject edits and let the user confirm. Don't bulk-delete.
+
+The reverse check — "imports that aren't declared in `pyproject.toml`" — is also useful: every name in `dependencies` output should appear (under its dist name) in `[project.dependencies]` or be a stdlib module. Anything left over is an undeclared transitive import (a latent bug).
+
 ## Recipes
 
 ```bash
@@ -126,6 +159,9 @@ dead-cst why-alive ./src mypackage.foo.bar
 
 # What does __all__ uselessly re-export?
 dead-cst unused-exports ./src --plugin project_scripts
+
+# What third-party deps does the codebase actually import?
+dead-cst dependencies . --resolver pyproject --resolver venv --format json
 ```
 
 ## `dead-cst remove` — safety contract
