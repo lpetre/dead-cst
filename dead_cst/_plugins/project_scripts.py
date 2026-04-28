@@ -9,7 +9,9 @@ from pathlib import Path
 from typing import Iterable
 
 from .._resolvers._core import load_toml
-from ._core import AddEdge, AddNode, GraphOp, PluginContext, synthetic_node
+from ._core import GraphOp, PluginContext, mark_entrypoints
+
+PROJECT_SCRIPTS_PREFIX = "<project.scripts>:"
 
 logger = logging.getLogger(__name__)
 
@@ -53,10 +55,6 @@ class ProjectScriptsPlugin:
                     target,
                 )
                 continue
-            synth = synthetic_node(
-                fqname=f"<project.scripts>:{script_name}",
-                path=pyproject,
+            yield from mark_entrypoints(
+                f"{PROJECT_SCRIPTS_PREFIX}{script_name}", pyproject, target_nodes
             )
-            yield AddNode(synth, entrypoint=True)
-            for target_node in target_nodes:
-                yield AddEdge(synth, target_node)

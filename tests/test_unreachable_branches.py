@@ -2,7 +2,7 @@
 
 When the visitor sees a statically-dead ``if`` / ``while`` suite (per
 :mod:`dead_cst._branches`) it creates a synthetic ``SymbolNode`` with
-``type="synthetic"`` and a fqname prefixed with ``<unreachable ``.
+``type="synthetic"`` and a fqname prefixed with ``<unreachable>:``.
 Every reference made from inside that suite gets a parallel edge
 ``synthetic -> referent`` -- the original ``enclosing-decl -> referent``
 edge is left in place. The synthetic node is an orphan (no incoming

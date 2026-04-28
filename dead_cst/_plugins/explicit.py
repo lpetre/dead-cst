@@ -9,7 +9,9 @@ from pathlib import Path
 from typing import Iterable
 
 from .._symbols import SymbolNode
-from ._core import AddEdge, AddNode, GraphOp, PluginContext, synthetic_node
+from ._core import GraphOp, PluginContext, mark_entrypoints
+
+EXPLICIT_PREFIX = "<entrypoint>:"
 
 
 @dataclass
@@ -33,17 +35,10 @@ class ExplicitEntrypointPlugin:
 
     def contribute(self, ctx: PluginContext) -> Iterable[GraphOp]:
         root = ctx.project_root
-        for node in ctx.graph.nodes:
-            if not node.path.is_relative_to(ctx.base):
-                continue
+        for node in ctx.base_nodes():
             if not self._matches(node, root):
                 continue
-            synth = synthetic_node(
-                fqname=f"<entrypoint>:{node.fqname}",
-                path=node.path,
-            )
-            yield AddNode(synth, entrypoint=True)
-            yield AddEdge(synth, node)
+            yield from mark_entrypoints(f"{EXPLICIT_PREFIX}{node.fqname}", node.path, [node])
 
     def _matches(self, sym: SymbolNode, root: Path) -> bool:
         try:

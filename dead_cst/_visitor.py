@@ -24,6 +24,7 @@ from libcst.metadata.scope_provider import (
 from ._branches import make_unreachable_node, unreachable_suites
 from ._flow import live_at_exit, live_referents
 from ._fqn import FixedFullyQualifiedNameProvider
+from ._plugins._core import UNRESOLVED_PREFIX
 from ._resolve import resolve_import
 from ._symbols import Import, SymbolNode, SymbolTrie
 
@@ -37,10 +38,8 @@ def _dotted_name_parts(
         full = f"{prefix}{node.value}" if prefix else node.value
         yield full, node
     elif isinstance(node, cst.Attribute):
-        # Recurse on the value first
         for nm, n in _dotted_name_parts(prefix, node.value):
             yield nm, n
-        # then append this attribute to the last prefix
         full = f"{nm}.{node.attr.value}"
         yield full, node.attr
 
@@ -91,7 +90,6 @@ class SymbolVisitor(cst.CSTVisitor):
     def __init__(self, path: Path, search_paths: list[Path]):
         self.path = path
         self.search_paths = search_paths
-        self.node_to_symbols: dict[cst.CSTNode, list[SymbolNode]] = {}
         self.node_to_frames: dict[cst.CSTNode, list[list[SymbolNode]]] = {}
         self.decl_stack: list[list[SymbolNode]] = []
         self.nearest_decls: dict[cst.CSTNode, list[SymbolNode]] = {}
@@ -139,7 +137,6 @@ class SymbolVisitor(cst.CSTVisitor):
         is attributed to both.
         """
         frame = list(decls)
-        self.node_to_symbols.setdefault(node, []).extend(frame)
         self.node_to_frames.setdefault(node, []).append(frame)
         self.decl_stack.append(frame)
         for d in frame:
@@ -150,7 +147,6 @@ class SymbolVisitor(cst.CSTVisitor):
         node: cst.CSTNode,
         type_: Literal["module", "class", "function", "variable"],
     ):
-        # Only collect top-level declarations, skip nested ones
         if len(self.decl_stack) > 1:
             return
 
@@ -183,7 +179,6 @@ class SymbolVisitor(cst.CSTVisitor):
         return names
 
     def _add_variable(self, node: cst.Assign | cst.AnnAssign):
-        # Only collect top-level declarations, skip nested ones
         if len(self.decl_stack) > 1:
             return
 
@@ -266,7 +261,7 @@ class SymbolVisitor(cst.CSTVisitor):
                 # ``importers("fastapi")`` finds them all. Reachability is
                 # unaffected (the synthetic has no outbound edges).
                 top_level = full_name.split(".", 1)[0]
-                module_path = f"[unresolved] {top_level}"
+                module_path = f"{UNRESOLVED_PREFIX}{top_level}"
                 module_name = full_name
 
             if alias.asname:
@@ -274,7 +269,6 @@ class SymbolVisitor(cst.CSTVisitor):
             else:
                 decl_name = alias.name
 
-            # add the import lookup so we can resolve it in on_leave
             self.import_lookup[decl_name] = import_info = Import(
                 path=module_path,
                 module=module_name,
@@ -285,11 +279,11 @@ class SymbolVisitor(cst.CSTVisitor):
                 ),
             )
 
-            # get the first name of the decl, eg 'google' for 'google.cloud'
+            # ``import google.cloud`` binds ``google`` in the local scope; the
+            # decl is stored under that bare name, not the dotted path.
             while isinstance(decl_name, cst.Attribute):
                 decl_name = decl_name.value
 
-            # add a decl if the import is in the module context
             if current_decl and current_decl.type == "module":
                 sym = SymbolNode(
                     f"{self.module_node.fqname}.{decl_name.value}",
@@ -301,7 +295,6 @@ class SymbolVisitor(cst.CSTVisitor):
                 self.symbol_referent_nodes[sym] = alias
                 self._push_decl(alias, sym)
 
-            # add the import edge to the last decl on the stack
             self.import_edges.add((self.decl_stack[-1][-1], import_info))
 
     def visit_Module(self, node: cst.Module) -> None:
@@ -498,7 +491,9 @@ class SymbolVisitor(cst.CSTVisitor):
                     if unreachable_owner is not None:
                         self.unreachable_import_edges.add((unreachable_owner, resolved_import))
 
-            target_symbols = self.node_to_symbols.get(target_node)
+            target_symbols = [
+                s for frame in self.node_to_frames.get(target_node, ()) for s in frame
+            ]
             if not target_symbols:
                 fallback = self.nearest_decls.get(target_node, [])
                 target_symbols = fallback[:1]
@@ -520,7 +515,7 @@ class SymbolVisitor(cst.CSTVisitor):
 
         # Resolve __all__ string references to declarations in the current module
         if self.dunder_all_refs:
-            module_sym = self.node_to_symbols[original_node][0]
+            module_sym = self.node_to_frames[original_node][0][0]
             module_trie = self.trie._get(module_sym.fqname.split("."))
             if module_trie is not None:
                 for owner, names in self.dunder_all_refs:

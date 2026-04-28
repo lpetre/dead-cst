@@ -325,3 +325,24 @@ def test_plugin_context_base_modules_caches_first_scan(tmp_path):
     graph.add_node(late)
     second = list(ctx.base_modules())
     assert second == first
+
+
+def test_plugin_context_base_nodes_filters_to_base_and_caches(tmp_path):
+    base = tmp_path
+    inside_mod = SymbolNode("pkg", "module", base / "__init__.py", _pos())
+    inside_fn = SymbolNode("pkg.f", "function", base / "a.py", _pos())
+    outside = SymbolNode("other.b", "module", tmp_path.parent / "other.py", _pos())
+    graph = nx.DiGraph()
+    for n in (inside_mod, inside_fn, outside):
+        graph.add_node(n)
+
+    ctx = PluginContext(graph=graph, symbol_lookup=SymbolTrie(), base=base, project_root=base)
+    first = sorted(ctx.base_nodes(), key=lambda n: n.fqname)
+    assert first == [inside_mod, inside_fn]
+
+    # Cached: nodes added after the first scan don't appear, even when their
+    # path is under ``base``.
+    late = SymbolNode("pkg.late", "function", base / "late.py", _pos())
+    graph.add_node(late)
+    second = sorted(ctx.base_nodes(), key=lambda n: n.fqname)
+    assert second == first

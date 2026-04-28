@@ -7,7 +7,9 @@ from typing import Iterable
 
 import libcst as cst
 
-from ._core import AddEdge, AddNode, GraphOp, PluginContext, synthetic_node
+from ._core import GraphOp, PluginContext, is_name, mark_entrypoints
+
+MAIN_BLOCK_PREFIX = "<__main__>:"
 
 
 @dataclass
@@ -31,12 +33,9 @@ class MainBlockPlugin:
             module = ctx.parse(path)
             if module is None or not _has_main_block(module):
                 continue
-            synth = synthetic_node(
-                fqname=f"<__main__>:{module_node.fqname}",
-                path=path,
+            yield from mark_entrypoints(
+                f"{MAIN_BLOCK_PREFIX}{module_node.fqname}", path, [module_node]
             )
-            yield AddNode(synth, entrypoint=True)
-            yield AddEdge(synth, module_node)
 
 
 def _has_main_block(module: cst.Module) -> bool:
@@ -57,13 +56,9 @@ def _is_name_eq_main(expr: cst.BaseExpression) -> bool:
     if not isinstance(op.operator, cst.Equal):
         return False
     left, right = expr.left, op.comparator
-    return (_is_dunder_name(left, "__name__") and _is_string(right, "__main__")) or (
-        _is_string(left, "__main__") and _is_dunder_name(right, "__name__")
+    return (is_name(left, "__name__") and _is_string(right, "__main__")) or (
+        _is_string(left, "__main__") and is_name(right, "__name__")
     )
-
-
-def _is_dunder_name(expr: cst.BaseExpression, name: str) -> bool:
-    return isinstance(expr, cst.Name) and expr.value == name
 
 
 def _is_string(expr: cst.BaseExpression, value: str) -> bool:

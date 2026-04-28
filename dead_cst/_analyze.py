@@ -159,7 +159,6 @@ def build_symbol_graph(
 
                 import_edges |= visitor.import_edges | visitor.unreachable_import_edges
 
-            # add edges to keep __init__.py files alive
             current_trie.add_module_hierarchy_edges(symbol_graph)
             export_tries[base] = export_trie
 
@@ -173,7 +172,6 @@ def build_symbol_graph(
             for dep in paths.get(base, []):
                 symbol_lookup.merge(export_tries.get(dep, base_tries[dep]))
 
-            # resolve all the import edges
             for src, dst in resolve_edges(import_edges, symbol_lookup, base):
                 symbol_graph.add_edge(src, dst)
 

@@ -12,6 +12,10 @@ import libcst as cst
 from .._symbols import SymbolNode
 from ._core import GraphOp, PluginContext, mark_entrypoints
 
+PYTEST_CONFTEST_PREFIX = "<pytest:conftest>:"
+PYTEST_TESTS_PREFIX = "<pytest:tests>:"
+PYTEST_FIXTURES_PREFIX = "<pytest:fixtures>:"
+
 
 @dataclass
 class PytestPlugin:
@@ -57,12 +61,12 @@ class PytestPlugin:
 
             if filename == "conftest.py":
                 yield from mark_entrypoints(
-                    f"<pytest:conftest>:{module_node.fqname}", path, module_decls
+                    f"{PYTEST_CONFTEST_PREFIX}{module_node.fqname}", path, module_decls
                 )
             elif _is_test_filename(filename):
                 test_decls = [d for d in module_decls if _is_test_decl(d)]
                 yield from mark_entrypoints(
-                    f"<pytest:tests>:{module_node.fqname}", path, test_decls
+                    f"{PYTEST_TESTS_PREFIX}{module_node.fqname}", path, test_decls
                 )
 
             if path not in fixture_candidates:
@@ -79,7 +83,7 @@ class PytestPlugin:
                 if d.type == "function" and d.fqname.rsplit(".", 1)[-1] in fixture_names
             ]
             yield from mark_entrypoints(
-                f"<pytest:fixtures>:{module_node.fqname}", path, fixture_decls
+                f"{PYTEST_FIXTURES_PREFIX}{module_node.fqname}", path, fixture_decls
             )
 
 

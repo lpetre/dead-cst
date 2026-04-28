@@ -8,7 +8,13 @@ from importlib.machinery import ModuleSpec
 from pathlib import Path
 from typing import Generator
 
-from ._plugins._core import SYNTHETIC_POSITION
+from ._plugins._core import (
+    EXTERNAL_DIST_PREFIX,
+    EXTERNAL_FILE_PREFIX,
+    STDLIB_PREFIX,
+    SYNTHETIC_PATH_PREFIXES,
+    synthetic_node,
+)
 from ._symbols import Import, SymbolNode, SymbolTrie
 
 logger = logging.getLogger(__name__)
@@ -76,18 +82,18 @@ def resolve_import(name: str, search_paths: list[Path]) -> str | Path:
     if spec.origin is None:
         return None
     if spec.origin in {"built-in", "frozen"}:
-        return f"[stdlib] {name}"
+        return f"{STDLIB_PREFIX}{name}"
     path = Path(spec.origin).resolve()
     if path.is_relative_to(STDLIB):
-        return f"[stdlib] {name}"
+        return f"{STDLIB_PREFIX}{name}"
 
     lookup = distribution_lookup()
     if dist := lookup.get(path):
-        return f"[external dist] {dist}"
+        return f"{EXTERNAL_DIST_PREFIX}{dist}"
 
     path_str = str(path)
     if any(m in path_str for m in SITE_PACKAGES_MARKERS):
-        return f"[external file] {name}"
+        return f"{EXTERNAL_FILE_PREFIX}{name}"
 
     for search in search_paths:
         if path.is_relative_to(search):
@@ -111,13 +117,10 @@ def resolve_edges(
         emitted.add(key)
         yield key
 
-    def _synthetic(tag: str) -> SymbolNode:
-        return SymbolNode(fqname=tag, type="synthetic", path=base, position=SYNTHETIC_POSITION)
-
     for src, dst in import_edges:
         if not isinstance(dst.path, Path):
-            if dst.path.startswith(("[external", "[unresolved")):
-                yield from _emit(src, _synthetic(dst.path))
+            if dst.path.startswith(SYNTHETIC_PATH_PREFIXES):
+                yield from _emit(src, synthetic_node(dst.path, base))
             continue
 
         node = symbol_lookup._get(dst.module.split("."))
@@ -167,8 +170,8 @@ def resolve_edges(
                     assert decl.imports is not None, "import symbol needs Import"
 
                     if not isinstance(decl.imports.path, Path):
-                        if decl.imports.path.startswith(("[external", "[unresolved")):
-                            yield from _emit(src, _synthetic(decl.imports.path))
+                        if decl.imports.path.startswith(SYNTHETIC_PATH_PREFIXES):
+                            yield from _emit(src, synthetic_node(decl.imports.path, base))
                         continue
 
                     dest = symbol_lookup._get(decl.imports.module.split("."))

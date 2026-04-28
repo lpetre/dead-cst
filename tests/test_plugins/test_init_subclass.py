@@ -8,6 +8,7 @@ from dead_cst import (
     MainBlockPlugin,
     build_symbol_graph,
 )
+from dead_cst._plugins.init_subclass import INIT_SUBCLASS_PREFIX
 
 
 def test_init_subclass_keeps_subclass_alive_via_parent(tmp_path, write_files, reachable_fqnames):
@@ -358,11 +359,11 @@ def test_init_subclass_marker_in_predecessor_chain(tmp_path, write_files):
     foo = next(n for n in graph.nodes if n.fqname == "pkg.impls.Foo")
     preds = list(graph.predecessors(foo))
     marker = next(
-        (p for p in preds if p.type == "synthetic" and p.fqname.startswith("<__init_subclass__>:")),
+        (p for p in preds if p.type == "synthetic" and p.fqname.startswith(INIT_SUBCLASS_PREFIX)),
         None,
     )
     assert marker is not None, f"expected a marker predecessor, got {preds!r}"
-    assert marker.fqname == "<__init_subclass__>:pkg.base.Plugin"
+    assert marker.fqname == f"{INIT_SUBCLASS_PREFIX}pkg.base.Plugin"
 
     marker_preds = list(graph.predecessors(marker))
     parent = next(p for p in marker_preds if p.fqname == "pkg.base.Plugin")
