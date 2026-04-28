@@ -516,12 +516,9 @@ def walk_to_instance_kind(
         if node in seen or node is terminal:
             continue
         seen.add(node)
-        if (
-            node.type == "import"
-            and node.imports is not None
-            and node.imports.module == module_name
-            and node.imports.decl in instance_kinds
-        ):
-            return node.imports.decl
+        if node.type == "import" and node.imports is not None:
+            decl = node.imports.decl
+            if decl is not None and node.imports.module == module_name and decl in instance_kinds:
+                return decl
         stack.extend(graph.successors(node))
     return None
