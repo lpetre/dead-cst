@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
+from .._resolvers._core import load_toml
 from ._core import AddEdge, AddNode, GraphOp, PluginContext, synthetic_node
 
 logger = logging.getLogger(__name__)
@@ -33,16 +34,9 @@ class ProjectScriptsPlugin:
 
     def contribute(self, ctx: PluginContext) -> Iterable[GraphOp]:
         pyproject = self.pyproject_path or ctx.base / "pyproject.toml"
-        if not pyproject.is_file():
+        data = load_toml(pyproject)
+        if data is None:
             return
-
-        try:
-            import tomllib
-        except ImportError:  # pragma: no cover
-            return
-
-        with pyproject.open("rb") as f:
-            data = tomllib.load(f)
 
         scripts = data.get("project", {}).get("scripts", {})
         for script_name, target in scripts.items():

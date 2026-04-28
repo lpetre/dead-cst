@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from ._core import PathMap
+from ._core import PathMap, load_toml
 
 
 class UvWorkspaceResolver:
@@ -39,17 +39,9 @@ class UvWorkspaceResolver:
 
     def resolve(self, project_root: Path) -> PathMap:
         project_root = project_root.resolve()
-        lock = self.lock_path or project_root / "uv.lock"
-        if not lock.is_file():
+        data = load_toml(self.lock_path or project_root / "uv.lock")
+        if data is None:
             return {}
-
-        try:
-            import tomllib
-        except ImportError:  # pragma: no cover - py<3.11 not supported
-            return {}
-
-        with lock.open("rb") as f:
-            data = tomllib.load(f)
 
         member_dirs: dict[str, Path] = {}
         member_deps: dict[str, list[str]] = {}

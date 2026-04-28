@@ -38,6 +38,7 @@ from ._core import (
     collect_module_imports,
     decorator_owner,
     find_handlers,
+    matched_attr_call,
     single_target_assignment,
 )
 
@@ -150,7 +151,7 @@ def _find_instances(module: cst.Module, click_imports: dict[str, str]) -> set[st
     for stmt in module.body:
         if isinstance(stmt, cst.FunctionDef):
             for dec in stmt.decorators:
-                if _is_group_decorator(dec.decorator, click_imports):
+                if matched_attr_call(dec.decorator, click_imports, _GROUP_DECORATOR_NAMES):
                     instances.add(stmt.name.value)
                     break
         elif isinstance(stmt, cst.SimpleStatementLine):
@@ -158,7 +159,9 @@ def _find_instances(module: cst.Module, click_imports: dict[str, str]) -> set[st
                 target_name, value = single_target_assignment(small)
                 if target_name is None or not isinstance(value, cst.Call):
                     continue
-                if _is_group_constructor(value.func, click_imports):
+                if matched_attr_call(
+                    value.func, click_imports, _GROUP_CONSTRUCTOR_NAMES, unwrap_call=False
+                ):
                     instances.add(target_name)
 
     # Fixpoint: ``@<known_group>.group(...)`` produces a new group; that new
@@ -178,32 +181,3 @@ def _find_instances(module: cst.Module, click_imports: dict[str, str]) -> set[st
                     changed = True
                     break
     return instances
-
-
-def _is_group_decorator(expr: cst.BaseExpression, click_imports: dict[str, str]) -> bool:
-    """Return ``True`` if ``expr`` is ``click.group`` / ``click.Group`` (or
-    aliased / module-prefixed) used as a decorator (with or without a call)."""
-    if isinstance(expr, cst.Call):
-        expr = expr.func
-    if isinstance(expr, cst.Name):
-        return click_imports.get(expr.value) in _GROUP_DECORATOR_NAMES
-    if isinstance(expr, cst.Attribute) and isinstance(expr.value, cst.Name):
-        if click_imports.get(expr.value.value) == "<module>":
-            return expr.attr.value in _GROUP_DECORATOR_NAMES
-    return False
-
-
-def _is_group_constructor(func: cst.BaseExpression, click_imports: dict[str, str]) -> bool:
-    """Return ``True`` if ``func`` denotes a Click ``Group`` constructor.
-
-    Limited to the class form (``click.Group``); the function form
-    (``click.group``) is recognized only as a decorator, since
-    ``X = click.group(...)`` typed on a single line is rare and the class
-    form is the unambiguous spelling for an explicit constructor call.
-    """
-    if isinstance(func, cst.Name):
-        return click_imports.get(func.value) in _GROUP_CONSTRUCTOR_NAMES
-    if isinstance(func, cst.Attribute) and isinstance(func.value, cst.Name):
-        if click_imports.get(func.value.value) == "<module>":
-            return func.attr.value in _GROUP_CONSTRUCTOR_NAMES
-    return False
