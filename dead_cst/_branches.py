@@ -15,9 +15,9 @@ always the safe default: callers must treat the branch as live.
 This module also owns the convention for synthetic graph nodes that
 represent dead suites. The nodes have ``type="synthetic"`` (the
 existing escape hatch in :mod:`dead_cst._symbols`) and a fqname
-prefixed with ``<unreachable ``. ``is_unreachable_node`` is the single
-source of truth for that convention; consumers should never check the
-prefix string themselves.
+prefixed with :data:`UNREACHABLE_PREFIX` (``<unreachable>:``).
+``is_unreachable_node`` is the single source of truth for that
+convention; consumers should never check the prefix string themselves.
 """
 
 from __future__ import annotations
@@ -37,7 +37,7 @@ _KEYWORDS: dict[str, bool] = {
     "None": False,
 }
 
-_UNREACHABLE_PREFIX = "<unreachable "
+UNREACHABLE_PREFIX = "<unreachable>:"
 
 
 def evaluate_truthiness(node: cst.BaseExpression) -> bool | None:
@@ -173,7 +173,7 @@ def make_unreachable_fqname(module_fqname: str, position: CodeRange) -> str:
     :func:`is_unreachable_node` to identify these nodes rather than
     string-matching on their fqnames.
     """
-    return f"{_UNREACHABLE_PREFIX}{module_fqname}:{position.start.line}:{position.start.column}>"
+    return f"{UNREACHABLE_PREFIX}{module_fqname}:{position.start.line}:{position.start.column}"
 
 
 def make_unreachable_node(module_fqname: str, path: Path, position: CodeRange) -> SymbolNode:
@@ -183,7 +183,7 @@ def make_unreachable_node(module_fqname: str, path: Path, position: CodeRange) -
     nodes that don't correspond to a top-level declaration -- and
     distinguishes itself by carrying a real source ``position`` (rather
     than the ``SYNTHETIC_POSITION`` sentinel used by entrypoint plugins)
-    plus an ``<unreachable ...>`` fqname prefix.
+    plus the :data:`UNREACHABLE_PREFIX` fqname prefix.
     """
     return SymbolNode(
         fqname=make_unreachable_fqname(module_fqname, position),
@@ -200,4 +200,4 @@ def is_unreachable_node(sym: SymbolNode) -> bool:
     string-match on the fqname directly; the prefix is an implementation
     detail of this module.
     """
-    return sym.type == "synthetic" and sym.fqname.startswith(_UNREACHABLE_PREFIX)
+    return sym.type == "synthetic" and sym.fqname.startswith(UNREACHABLE_PREFIX)

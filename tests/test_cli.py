@@ -21,11 +21,14 @@ import pytest
 from libcst.metadata import CodePosition, CodeRange
 from typer.testing import CliRunner
 
+from dead_cst._branches import UNREACHABLE_PREFIX
 from dead_cst._plugins import (
     ExplicitEntrypointPlugin,
     MainBlockPlugin,
     ModuleDundersPlugin,
 )
+from dead_cst._plugins._core import EXTERNAL_DIST_PREFIX
+from dead_cst._plugins.explicit import EXPLICIT_PREFIX
 from dead_cst._symbols import SymbolNode
 from dead_cst.cli import (
     _is_dunder_all,
@@ -226,8 +229,8 @@ def test_is_dunder_all(fqname, type_, expected):
 @pytest.mark.parametrize(
     "fqname, type_, expected",
     [
-        pytest.param("[external dist] networkx", "synthetic", True, id="external-synthetic"),
-        pytest.param("<entrypoint>:foo", "synthetic", False, id="entrypoint-synthetic"),
+        pytest.param(f"{EXTERNAL_DIST_PREFIX}networkx", "synthetic", True, id="external-synthetic"),
+        pytest.param(f"{EXPLICIT_PREFIX}foo", "synthetic", False, id="entrypoint-synthetic"),
         pytest.param("pkg.foo", "function", False, id="real-function"),
     ],
 )
@@ -254,8 +257,8 @@ def test_partition_unreachable_splits_synthetic_branches_from_real():
     import networkx as nx
 
     real = SymbolNode("pkg.f", "function", Path("/a.py"), _pos())
-    branch = SymbolNode("<unreachable pkg.a:5:0>", "synthetic", Path("/a.py"), _pos())
-    entrypoint_synth = SymbolNode("<entrypoint>:pkg.f", "synthetic", Path("/a.py"), _pos())
+    branch = SymbolNode(f"{UNREACHABLE_PREFIX}pkg.a:5:0", "synthetic", Path("/a.py"), _pos())
+    entrypoint_synth = SymbolNode(f"{EXPLICIT_PREFIX}pkg.f", "synthetic", Path("/a.py"), _pos())
 
     g = nx.DiGraph()
     for n in (real, branch, entrypoint_synth):

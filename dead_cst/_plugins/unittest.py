@@ -11,6 +11,8 @@ import libcst as cst
 from .._symbols import SymbolNode
 from ._core import GraphOp, PluginContext, is_from_module, is_name, mark_entrypoints
 
+UNITTEST_PREFIX = "<unittest>:"
+
 # Module-level functions ``unittest`` discovers by name.
 _MODULE_HOOKS: frozenset[str] = frozenset({"setUpModule", "tearDownModule", "load_tests"})
 
@@ -92,7 +94,7 @@ class UnittestPlugin:
             if not targets:
                 continue
 
-            yield from mark_entrypoints(f"<unittest>:{module_node.fqname}", path, targets)
+            yield from mark_entrypoints(f"{UNITTEST_PREFIX}{module_node.fqname}", path, targets)
 
 
 def _collect_unittest_imports(module: cst.Module) -> tuple[set[str], set[str]]:

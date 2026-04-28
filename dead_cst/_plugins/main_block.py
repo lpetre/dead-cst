@@ -9,6 +9,8 @@ import libcst as cst
 
 from ._core import GraphOp, PluginContext, is_name, mark_entrypoints
 
+MAIN_BLOCK_PREFIX = "<__main__>:"
+
 
 @dataclass
 class MainBlockPlugin:
@@ -31,7 +33,9 @@ class MainBlockPlugin:
             module = ctx.parse(path)
             if module is None or not _has_main_block(module):
                 continue
-            yield from mark_entrypoints(f"<__main__>:{module_node.fqname}", path, [module_node])
+            yield from mark_entrypoints(
+                f"{MAIN_BLOCK_PREFIX}{module_node.fqname}", path, [module_node]
+            )
 
 
 def _has_main_block(module: cst.Module) -> bool:

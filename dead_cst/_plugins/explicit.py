@@ -11,6 +11,8 @@ from typing import Iterable
 from .._symbols import SymbolNode
 from ._core import GraphOp, PluginContext, mark_entrypoints
 
+EXPLICIT_PREFIX = "<entrypoint>:"
+
 
 @dataclass
 class ExplicitEntrypointPlugin:
@@ -36,7 +38,7 @@ class ExplicitEntrypointPlugin:
         for node in ctx.base_nodes():
             if not self._matches(node, root):
                 continue
-            yield from mark_entrypoints(f"<entrypoint>:{node.fqname}", node.path, [node])
+            yield from mark_entrypoints(f"{EXPLICIT_PREFIX}{node.fqname}", node.path, [node])
 
     def _matches(self, sym: SymbolNode, root: Path) -> bool:
         try:

@@ -11,6 +11,8 @@ from typing import Iterable
 from .._resolvers._core import load_toml
 from ._core import GraphOp, PluginContext, mark_entrypoints
 
+PROJECT_SCRIPTS_PREFIX = "<project.scripts>:"
+
 logger = logging.getLogger(__name__)
 
 
@@ -53,4 +55,6 @@ class ProjectScriptsPlugin:
                     target,
                 )
                 continue
-            yield from mark_entrypoints(f"<project.scripts>:{script_name}", pyproject, target_nodes)
+            yield from mark_entrypoints(
+                f"{PROJECT_SCRIPTS_PREFIX}{script_name}", pyproject, target_nodes
+            )
