@@ -37,7 +37,7 @@ _KEYWORDS: dict[str, bool] = {
     "None": False,
 }
 
-_UNREACHABLE_FQNAME_PREFIX = "<unreachable "
+_UNREACHABLE_PREFIX = "<unreachable "
 
 
 def evaluate_truthiness(node: cst.BaseExpression) -> bool | None:
@@ -173,10 +173,7 @@ def make_unreachable_fqname(module_fqname: str, position: CodeRange) -> str:
     :func:`is_unreachable_node` to identify these nodes rather than
     string-matching on their fqnames.
     """
-    return (
-        f"{_UNREACHABLE_FQNAME_PREFIX}"
-        f"{module_fqname}:{position.start.line}:{position.start.column}>"
-    )
+    return f"{_UNREACHABLE_PREFIX}{module_fqname}:{position.start.line}:{position.start.column}>"
 
 
 def make_unreachable_node(module_fqname: str, path: Path, position: CodeRange) -> SymbolNode:
@@ -203,4 +200,4 @@ def is_unreachable_node(sym: SymbolNode) -> bool:
     string-match on the fqname directly; the prefix is an implementation
     detail of this module.
     """
-    return sym.type == "synthetic" and sym.fqname.startswith(_UNREACHABLE_FQNAME_PREFIX)
+    return sym.type == "synthetic" and sym.fqname.startswith(_UNREACHABLE_PREFIX)

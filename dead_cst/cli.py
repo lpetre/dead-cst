@@ -21,6 +21,7 @@ from ._plugins import (
     ModuleDundersPlugin,
     load_plugin,
 )
+from ._plugins._core import EXTERNAL_PREFIXES
 from ._plugins.module_dunders import DUNDER_PREFIX
 from ._resolvers import load_resolver, merge_paths
 from ._symbols import SymbolNode
@@ -348,7 +349,7 @@ def _is_dunder_all(node: SymbolNode) -> bool:
 
 
 def _is_external_dep(node: SymbolNode) -> bool:
-    return node.type == "synthetic" and node.fqname.startswith("[external ")
+    return node.type == "synthetic" and node.fqname.startswith(EXTERNAL_PREFIXES)
 
 
 @app.command()

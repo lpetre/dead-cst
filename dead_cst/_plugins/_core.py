@@ -26,6 +26,20 @@ from .._symbols import SymbolNode, SymbolTrie
 
 SYNTHETIC_POSITION = CodeRange(start=CodePosition(0, 0), end=CodePosition(0, 0))
 
+# Synthetic-node fqname prefixes, consumed by ``importers`` and the path
+# resolver. Anything in :data:`SYNTHETIC_PATH_PREFIXES` is also a valid
+# value for ``Import.path`` -- the analyzer surfaces non-first-party
+# imports as ``[external dist] X`` / ``[external file] X`` /
+# ``[unresolved] X`` so plugins can answer "which files import X?".
+# Stdlib imports (``[stdlib] X``) are *not* surfaced as graph nodes;
+# the prefix exists for the resolver only.
+STDLIB_PREFIX = "[stdlib] "
+EXTERNAL_DIST_PREFIX = "[external dist] "
+EXTERNAL_FILE_PREFIX = "[external file] "
+EXTERNAL_PREFIXES = (EXTERNAL_DIST_PREFIX, EXTERNAL_FILE_PREFIX)
+UNRESOLVED_PREFIX = "[unresolved] "
+SYNTHETIC_PATH_PREFIXES = (*EXTERNAL_PREFIXES, UNRESOLVED_PREFIX)
+
 
 @dataclass
 class PluginContext:
@@ -129,12 +143,8 @@ class PluginContext:
         """
         target_node = self.find_module(target)
         if target_node is None:
-            for tag in (
-                f"[external dist] {target}",
-                f"[external file] {target}",
-                f"[unresolved] {target}",
-            ):
-                node = self._synthetic(tag)
+            for prefix in SYNTHETIC_PATH_PREFIXES:
+                node = self._synthetic(f"{prefix}{target}")
                 if node is not None:
                     target_node = node
                     break

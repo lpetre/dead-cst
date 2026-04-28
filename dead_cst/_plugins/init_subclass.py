@@ -36,7 +36,7 @@ from .._symbols import SymbolNode
 from ._core import AddEdge, AddNode, GraphOp, PluginContext, synthetic_node
 
 _INIT_SUBCLASS = "__init_subclass__"
-_MARKER_PREFIX = "<__init_subclass__>:"
+INIT_SUBCLASS_PREFIX = "<__init_subclass__>:"
 
 
 @dataclass
@@ -96,7 +96,7 @@ class InitSubclassPlugin:
                 continue
             if _has_init_subclass(class_def):
                 roots[class_node] = synthetic_node(
-                    fqname=f"{_MARKER_PREFIX}{class_node.fqname}",
+                    fqname=f"{INIT_SUBCLASS_PREFIX}{class_node.fqname}",
                     path=class_node.path,
                 )
             module_fqname = class_node.fqname.rsplit(".", 1)[0]

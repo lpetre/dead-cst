@@ -24,6 +24,7 @@ from libcst.metadata.scope_provider import (
 from ._branches import make_unreachable_node, unreachable_suites
 from ._flow import live_at_exit, live_referents
 from ._fqn import FixedFullyQualifiedNameProvider
+from ._plugins._core import UNRESOLVED_PREFIX
 from ._resolve import resolve_import
 from ._symbols import Import, SymbolNode, SymbolTrie
 
@@ -260,7 +261,7 @@ class SymbolVisitor(cst.CSTVisitor):
                 # ``importers("fastapi")`` finds them all. Reachability is
                 # unaffected (the synthetic has no outbound edges).
                 top_level = full_name.split(".", 1)[0]
-                module_path = f"[unresolved] {top_level}"
+                module_path = f"{UNRESOLVED_PREFIX}{top_level}"
                 module_name = full_name
 
             if alias.asname:

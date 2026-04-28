@@ -8,19 +8,20 @@ from importlib.machinery import ModuleSpec
 from pathlib import Path
 from typing import Generator
 
-from ._plugins._core import synthetic_node
+from ._plugins._core import (
+    EXTERNAL_DIST_PREFIX,
+    EXTERNAL_FILE_PREFIX,
+    STDLIB_PREFIX,
+    SYNTHETIC_PATH_PREFIXES,
+    UNRESOLVED_PREFIX,
+    synthetic_node,
+)
 from ._symbols import Import, SymbolNode, SymbolTrie
 
 logger = logging.getLogger(__name__)
 
 STDLIB = Path(sysconfig.get_path("stdlib")).resolve()
 SITE_PACKAGES_MARKERS = ("site-packages", "dist-packages")
-
-STDLIB_PREFIX = "[stdlib] "
-EXTERNAL_DIST_PREFIX = "[external dist] "
-EXTERNAL_FILE_PREFIX = "[external file] "
-UNRESOLVED_PREFIX = "[unresolved] "
-SYNTHETIC_PATH_PREFIXES = ("[external", "[unresolved")
 
 
 @contextlib.contextmanager

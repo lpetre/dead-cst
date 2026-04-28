@@ -8,6 +8,8 @@ the fixture so individual cases only list the edges they introduce.
 
 import pytest
 
+from dead_cst._plugins._core import EXTERNAL_PREFIXES
+
 IMPORT_TEST_FILES = {
     "p/__init__.py": "",
     "p/functions.py": "def f(): pass\ndef g(): pass",
@@ -314,7 +316,9 @@ def test_third_party_import_creates_synthetic_node(build_decl_graph):
     nx_nodes = {
         n
         for n in graph.nodes
-        if n.type == "synthetic" and n.fqname.startswith("[external") and "networkx" in n.fqname
+        if n.type == "synthetic"
+        and n.fqname.startswith(EXTERNAL_PREFIXES)
+        and "networkx" in n.fqname
     }
     assert nx_nodes, (
         "expected an external-dep synthetic node for networkx, got "
