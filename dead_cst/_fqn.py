@@ -1,5 +1,7 @@
+from __future__ import annotations
+
 from pathlib import PurePath
-from typing import Any, List, Mapping
+from typing import Any, Mapping
 
 from libcst.helpers import ModuleNameAndPackage
 from libcst.metadata import FullyQualifiedNameProvider
@@ -13,7 +15,7 @@ class FixedFullyQualifiedNameProvider(FullyQualifiedNameProvider):
     def gen_cache(
         cls,
         root_path,
-        paths: List[str],
+        paths: list[str],
         **kwargs: Any,
     ) -> Mapping[str, ModuleNameAndPackage]:
         cache = super().gen_cache(root_path, paths, **kwargs)

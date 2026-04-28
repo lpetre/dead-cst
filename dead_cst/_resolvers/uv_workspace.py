@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 
 from ._core import PathMap, load_toml
 
 
+@dataclass
 class UvWorkspaceResolver:
     """Discover workspace members from ``uv.lock`` and wire their source roots
     together using uv's resolved dependency graph.
@@ -32,10 +34,8 @@ class UvWorkspaceResolver:
     of returned bases and don't need to be re-listed per member.
     """
 
-    name = "uv_workspace"
-
-    def __init__(self, lock_path: Path | None = None) -> None:
-        self.lock_path = lock_path
+    lock_path: Path | None = None
+    name: str = "uv_workspace"
 
     def resolve(self, project_root: Path) -> PathMap:
         project_root = project_root.resolve()

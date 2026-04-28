@@ -10,7 +10,7 @@ from typing import Iterable
 import libcst as cst
 
 from .._symbols import SymbolNode
-from ._core import GraphOp, PluginContext, mark_entrypoints
+from ._core import GraphOp, PluginContext, mark_entrypoints, simple_name
 
 PYTEST_CONFTEST_PREFIX = "<pytest:conftest>:"
 PYTEST_TESTS_PREFIX = "<pytest:tests>:"
@@ -44,10 +44,8 @@ class PytestPlugin:
 
     def contribute(self, ctx: PluginContext) -> Iterable[GraphOp]:
         decls_by_path: dict[Path, list[SymbolNode]] = {}
-        for node in ctx.graph.nodes:
-            if node.type in ("function", "class", "variable") and node.path.is_relative_to(
-                ctx.base
-            ):
+        for node in ctx.base_nodes():
+            if node.type in ("function", "class", "variable"):
                 decls_by_path.setdefault(node.path, []).append(node)
 
         # Fixture-branch prefilter: ``@pytest.fixture`` / ``@fixture``
@@ -80,7 +78,7 @@ class PytestPlugin:
             fixture_decls = [
                 d
                 for d in module_decls
-                if d.type == "function" and d.fqname.rsplit(".", 1)[-1] in fixture_names
+                if d.type == "function" and simple_name(d.fqname) in fixture_names
             ]
             yield from mark_entrypoints(
                 f"{PYTEST_FIXTURES_PREFIX}{module_node.fqname}", path, fixture_decls
@@ -92,7 +90,7 @@ def _is_test_filename(name: str) -> bool:
 
 
 def _is_test_decl(node: SymbolNode) -> bool:
-    simple = node.fqname.rsplit(".", 1)[-1]
+    simple = simple_name(node.fqname)
     if node.type == "function" and simple.startswith("test_"):
         return True
     if node.type == "class" and simple.startswith("Test"):

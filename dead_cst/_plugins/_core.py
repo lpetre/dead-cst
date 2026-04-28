@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Container, Iterable, Iterator, Protocol, Union, runtime_checkable
+from typing import Container, Iterable, Iterator, Protocol, runtime_checkable
 
 import libcst as cst
 import networkx as nx
@@ -208,7 +208,7 @@ class RemoveEdge:
     dst: SymbolNode
 
 
-GraphOp = Union[AddNode, AddEdge, RemoveEdge]
+GraphOp = AddNode | AddEdge | RemoveEdge
 
 
 @runtime_checkable
@@ -261,6 +261,11 @@ def mark_entrypoints(
     yield AddNode(synth, entrypoint=True)
     for target in targets:
         yield AddEdge(synth, target)
+
+
+def simple_name(fqname: str) -> str:
+    """Return the rightmost dotted segment of ``fqname`` (``pkg.mod.f`` -> ``f``)."""
+    return fqname.rpartition(".")[2]
 
 
 def is_name(node: cst.CSTNode | None, value: str) -> bool:
