@@ -6,7 +6,9 @@ from dataclasses import dataclass
 from typing import Iterable
 
 from .._symbols import SymbolNode
-from ._core import AddEdge, AddNode, GraphOp, PluginContext, synthetic_node
+from ._core import GraphOp, PluginContext, mark_entrypoints
+
+DUNDER_PREFIX = "<dunder>:"
 
 
 @dataclass
@@ -24,17 +26,10 @@ class ModuleDundersPlugin:
     name: str = "module_dunders"
 
     def contribute(self, ctx: PluginContext) -> Iterable[GraphOp]:
-        for node in ctx.graph.nodes:
-            if not node.path.is_relative_to(ctx.base):
-                continue
+        for node in ctx.base_nodes():
             if not _is_module_dunder(node):
                 continue
-            synth = synthetic_node(
-                fqname=f"<dunder>:{node.fqname}",
-                path=node.path,
-            )
-            yield AddNode(synth, entrypoint=True)
-            yield AddEdge(synth, node)
+            yield from mark_entrypoints(f"{DUNDER_PREFIX}{node.fqname}", node.path, [node])
 
 
 def _is_module_dunder(node: SymbolNode) -> bool:

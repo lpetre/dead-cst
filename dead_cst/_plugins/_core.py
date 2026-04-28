@@ -53,12 +53,15 @@ class PluginContext:
     # is fine in practice -- ``importers`` is for prefiltering against
     # the analyzer's already-resolved dep markers.
     _synthetic_index: dict[str, SymbolNode] | None = field(default=None, init=False, repr=False)
-    # Cached materialization of ``base_modules``. Plugins don't add module
-    # nodes during their pass (only the visitor pass does, before plugins
-    # run), so a one-time scan of ``graph.nodes`` is safe to memoize.
+    # Cached materialization of ``base_modules`` / ``base_nodes``. Plugins
+    # may add nodes during their pass (entrypoint synthetics, etc.) but
+    # those are never re-iterated by these helpers; we snapshot once at
+    # first call to keep iteration cheap when ``graph`` accumulates nodes
+    # across bases.
     _base_modules_cache: list[tuple[Path, SymbolNode]] | None = field(
         default=None, init=False, repr=False
     )
+    _base_nodes_cache: list[SymbolNode] | None = field(default=None, init=False, repr=False)
 
     def find_module(self, fqname: str) -> SymbolNode | None:
         node = self.symbol_lookup._get(fqname.split("."))
@@ -89,6 +92,20 @@ class PluginContext:
                 if node.type == "module" and node.path.is_relative_to(self.base)
             ]
         return iter(self._base_modules_cache)
+
+    def base_nodes(self) -> Iterator[SymbolNode]:
+        """Yield every graph node whose path is under :attr:`base`.
+
+        ``graph`` accumulates nodes across bases; plugins that need to
+        iterate "everything in this base" should use this instead of
+        ``ctx.graph.nodes`` so they don't pay O(N) for nodes belonging
+        to sibling bases.
+        """
+        if self._base_nodes_cache is None:
+            self._base_nodes_cache = [
+                node for node in self.graph.nodes if node.path.is_relative_to(self.base)
+            ]
+        return iter(self._base_nodes_cache)
 
     def importers(self, target: str) -> set[Path]:
         """Return paths under :attr:`base` whose imports reach ``target``.

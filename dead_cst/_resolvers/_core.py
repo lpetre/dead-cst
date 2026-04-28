@@ -21,14 +21,20 @@ class PathResolver(Protocol):
 
 
 def load_toml(path: Path) -> dict[str, Any] | None:
-    """Read ``path`` as TOML; ``None`` if the file is missing or tomllib is unavailable."""
-    if not path.is_file():
-        return None
+    """Read ``path`` as TOML; ``None`` if the file is missing or tomllib is unavailable.
+
+    Bad TOML is a programmer/config error and propagates as
+    :class:`tomllib.TOMLDecodeError`.
+    """
     try:
         import tomllib
     except ImportError:  # pragma: no cover - py<3.11 not supported
         return None
-    with path.open("rb") as f:
+    try:
+        f = path.open("rb")
+    except OSError:
+        return None
+    with f:
         return tomllib.load(f)
 
 

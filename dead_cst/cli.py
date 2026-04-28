@@ -21,6 +21,7 @@ from ._plugins import (
     ModuleDundersPlugin,
     load_plugin,
 )
+from ._plugins.module_dunders import DUNDER_PREFIX
 from ._resolvers import load_resolver, merge_paths
 from ._symbols import SymbolNode
 
@@ -206,13 +207,12 @@ def _output_text(
             else:
                 typer.echo(f"  {kind}: {total} total")
 
-    dead_real = [n for n in unreachable.nodes if not is_unreachable_node(n)]
+    dead_real, branches = _partition_unreachable(unreachable)
     if dead_real:
         typer.echo(f"\nDead symbols ({len(dead_real)}):")
         for node in sorted(dead_real, key=lambda n: (str(n.path), n.fqname)):
             typer.echo(f"  {node.fqname} ({node.type}) at {_rel_path(node.path, root)}")
 
-    branches = [n for n in graph.nodes if is_unreachable_node(n)]
     if branches:
         typer.echo(f"\nUnreachable branches ({len(branches)}):")
         for node in sorted(branches, key=lambda n: (str(n.path), n.position.start)):
@@ -220,6 +220,21 @@ def _output_text(
             start = node.position.start
             end = node.position.end
             typer.echo(f"  {rel}:{start.line}:{start.column}-{end.line}:{end.column}")
+
+
+def _partition_unreachable(
+    unreachable: nx.DiGraph,
+) -> tuple[list[SymbolNode], list[SymbolNode]]:
+    """Split ``unreachable.nodes`` into ``(dead_real, branches)`` in one pass.
+
+    Synthetic dead-suite nodes are orphan sources -- never visited by
+    reachability -- so they always land in ``unreachable``.
+    """
+    dead_real: list[SymbolNode] = []
+    branches: list[SymbolNode] = []
+    for n in unreachable.nodes:
+        (branches if is_unreachable_node(n) else dead_real).append(n)
+    return dead_real, branches
 
 
 def _output_json(
@@ -247,9 +262,8 @@ def _output_json(
             if kind != "synthetic"
         }
 
-    for node in sorted(unreachable.nodes, key=lambda n: (str(n.path), n.fqname)):
-        if is_unreachable_node(node):
-            continue
+    dead_real, branches = _partition_unreachable(unreachable)
+    for node in sorted(dead_real, key=lambda n: (str(n.path), n.fqname)):
         result["dead_symbols"].append(
             {
                 "fqname": node.fqname,
@@ -258,10 +272,7 @@ def _output_json(
             }
         )
 
-    for node in sorted(
-        (n for n in graph.nodes if is_unreachable_node(n)),
-        key=lambda n: (str(n.path), n.position.start),
-    ):
+    for node in sorted(branches, key=lambda n: (str(n.path), n.position.start)):
         result["unreachable_branches"].append(
             {
                 "path": str(_rel_path(node.path, root)),
@@ -440,7 +451,7 @@ def unused_exports(
         [
             (s, d)
             for s, d in graph.edges
-            if _is_dunder_all(d) and s.type == "synthetic" and s.fqname.startswith("<dunder>:")
+            if _is_dunder_all(d) and s.type == "synthetic" and s.fqname.startswith(DUNDER_PREFIX)
         ]
     )
     reachable_without_all = find_reachable(pruned)
