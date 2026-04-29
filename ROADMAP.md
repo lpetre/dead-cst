@@ -20,20 +20,25 @@ changes that unblock work elsewhere in the roadmap.
 
 ### Resolver logic as a protocol
 
-`PathResolver` already abstracts how source roots are discovered, but the
-edge-resolution layer in `_resolve.py` (`resolve_import`, `resolve_edges`,
-`safe_resolve_module`) is still a flat module of functions hard-coded to
-`sys.path` and `importlib`. Lift it behind an `EdgeResolver` protocol so the
-analyzer can swap strategies — sys.path-based, project-vendored, stub-aware,
-or test fakes — the same way `EdgePlugin` and `PathResolver` already work.
-Concrete wins:
+`PathResolver` today only answers "where are the source roots?"
+(`resolve(project_root) -> PathMap`). The actual name-to-path step —
+`resolve_import` in `_resolve.py`, hard-coded to `sys.path` + `importlib` —
+sits outside the protocol, so shipped resolvers can describe a layout but
+can't influence how imports inside that layout are looked up. Fold it in:
 
-- Testability: `resolve_edges` is currently exercised only end-to-end; a
-  protocol lets us inject deterministic fakes.
-- Extensibility: third parties can publish resolvers for monorepo layouts
-  (Bazel, Pants) without patching internals.
-- Sets up the partial-rebuild work below, which needs a stable interface to
-  invalidate against.
+- Add a `resolve_import(name, search_paths) -> str | Path | None` method
+  to `PathResolver`. The current function in `_resolve.py` moves into the
+  `_resolvers` subpackage as the default implementation; shipped resolvers
+  (`pyproject`, `uv_workspace`, `venv`) inherit or delegate to it.
+- This lets a resolver override lookup for its own layout — e.g. a
+  vendored-deps resolver pointing at a checked-in `third_party/`, or a
+  stub-aware resolver preferring `.pyi` siblings — without monkey-patching
+  internals.
+
+`resolve_edges` is a different concern (it stitches imports to declarations
+in the already-built symbol trie) and stays in place. The file should be
+renamed though, since "resolution" now lives in `_resolvers/` and what's
+left is edge construction — `_edges.py` reads more honestly.
 
 ### SQLite-cached graph with partial rebuilds
 
