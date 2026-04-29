@@ -13,6 +13,50 @@ for the full record.
 
 ---
 
+## Next release — Quality of life
+
+Two committed items for the upcoming version. Both are internal-architecture
+changes that unblock work elsewhere in the roadmap.
+
+### Resolver logic as a protocol
+
+`PathResolver` already abstracts how source roots are discovered, but the
+edge-resolution layer in `_resolve.py` (`resolve_import`, `resolve_edges`,
+`safe_resolve_module`) is still a flat module of functions hard-coded to
+`sys.path` and `importlib`. Lift it behind an `EdgeResolver` protocol so the
+analyzer can swap strategies — sys.path-based, project-vendored, stub-aware,
+or test fakes — the same way `EdgePlugin` and `PathResolver` already work.
+Concrete wins:
+
+- Testability: `resolve_edges` is currently exercised only end-to-end; a
+  protocol lets us inject deterministic fakes.
+- Extensibility: third parties can publish resolvers for monorepo layouts
+  (Bazel, Pants) without patching internals.
+- Sets up the partial-rebuild work below, which needs a stable interface to
+  invalidate against.
+
+### SQLite-cached graph with partial rebuilds
+
+Cache the symbol graph in a SQLite database keyed by file content hash, and
+rebuild only the modules whose hashes changed (plus their reverse
+dependencies). This is the "Incremental analysis" item previously parked in
+Tier 4 — promoting it because the resolver-protocol work makes the
+invalidation surface tractable, and because cold-start latency is the
+remaining friction users hit before CI integration.
+
+Scope for the first cut:
+
+- Schema for nodes, edges, and per-file content hashes; bump on schema
+  changes.
+- Invalidate a file when its hash changes; recompute its declared symbols
+  and outgoing edges; recompute incoming edges from any file that imports
+  it.
+- Fall back to a full rebuild when the resolver, plugin set, or workspace
+  layout changes (cache key includes those).
+- `--no-cache` escape hatch and a `dead-cst cache clear` subcommand.
+
+---
+
 ## Tier 1 — Trust and correctness
 
 ### 1. CLI integration tests
@@ -106,13 +150,7 @@ tackle once Tier 1–2 has shipped and the protocol surface is stable.
 
 ## Tier 4 — Speculative, wait for signal
 
-### 10. Incremental analysis
-
-A real performance problem at 100k+ LOC, but the project isn't there yet. Adds
-substantial complexity (file-content hashing, partial graph rebuild,
-invalidation). Defer until a user reports it.
-
-### 11. Multiple reachability frontiers
+### 10. Multiple reachability frontiers
 
 Splitting "reachable from tests" vs. "reachable from production entrypoints"
 is interesting and would enable rules like "no production code reachable only
