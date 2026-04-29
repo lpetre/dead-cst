@@ -4,7 +4,7 @@ import logging
 from functools import cache
 from importlib.util import resolve_name
 from pathlib import Path
-from typing import Generator, Literal, Mapping, cast
+from typing import Callable, Generator, Literal, Mapping, cast
 
 import libcst as cst
 from libcst.helpers import get_full_name_for_node
@@ -26,8 +26,10 @@ from ._branches import make_unreachable_node, unreachable_suites
 from ._flow import live_at_exit, live_referents
 from ._fqn import FixedFullyQualifiedNameProvider
 from ._plugins._core import UNRESOLVED_PREFIX
-from ._resolve import resolve_import
+from ._resolvers import default_resolve_import
 from ._symbols import Import, SymbolNode, SymbolTrie
+
+ImportResolver = Callable[[str, list[Path]], "str | Path | None"]
 
 logger = logging.getLogger(__name__)
 
@@ -88,9 +90,15 @@ class SymbolVisitor(cst.CSTVisitor):
             return list(scope.node.body.body)
         return None
 
-    def __init__(self, path: Path, search_paths: list[Path]):
+    def __init__(
+        self,
+        path: Path,
+        search_paths: list[Path],
+        import_resolver: ImportResolver = default_resolve_import,
+    ):
         self.path = path
         self.search_paths = search_paths
+        self._import_resolver = import_resolver
         self.node_to_frames: dict[cst.CSTNode, list[list[SymbolNode]]] = {}
         self.decl_stack: list[list[SymbolNode]] = []
         self.nearest_decls: dict[cst.CSTNode, list[SymbolNode]] = {}
@@ -123,7 +131,7 @@ class SymbolVisitor(cst.CSTVisitor):
 
     @cache
     def resolve_import(self, name: str) -> str | Path | None:
-        return resolve_import(name, self.search_paths)
+        return self._import_resolver(name, self.search_paths)
 
     def _push_decl(self, node: cst.CSTNode, decl: SymbolNode):
         self._push_decls(node, [decl])

@@ -1,130 +1,31 @@
+"""Stitch resolved imports into ``src -> dst`` edges in the symbol graph.
+
+The visitor pass produces ``(src, Import)`` pairs where ``Import.path``
+is whatever a :class:`~dead_cst._resolvers.PathResolver` returned for
+the imported name. :func:`resolve_edges` walks those pairs against the
+already-built per-base :class:`SymbolTrie` and yields the concrete
+``(src_symbol, dst_symbol)`` edges -- following re-exports, fanning
+star imports out to every top-level decl in the target module, and
+emitting synthetic nodes for stdlib / external / unresolved targets.
+
+The ``name -> path`` half of resolution lives in
+:mod:`dead_cst._resolvers._imports`; this module is purely about edge
+construction in the trie that visitor pass populated.
+"""
+
 from __future__ import annotations
 
-import contextlib
 import logging
-import os
-import re
-import sys
-import sysconfig
-from functools import cache
-from importlib.machinery import ModuleSpec
 from pathlib import Path
 from typing import Generator
 
 from ._plugins._core import (
-    EXTERNAL_DIST_PREFIX,
-    EXTERNAL_FILE_PREFIX,
-    STDLIB_PREFIX,
     SYNTHETIC_PATH_PREFIXES,
     synthetic_node,
 )
 from ._symbols import Import, SymbolNode, SymbolTrie
 
 logger = logging.getLogger(__name__)
-
-STDLIB = Path(sysconfig.get_path("stdlib")).resolve()
-SITE_PACKAGES_MARKERS = ("site-packages", "dist-packages")
-
-
-def _canonical_dist_name(name: str) -> str:
-    """Normalize a PyPI distribution name per PEP 503.
-
-    PyPI treats ``Flask`` / ``flask`` / ``FLASK`` as the same project;
-    plugins query the analyzer by the lowercase import name (``flask``)
-    so the synthetic ``[external dist] <name>`` node has to match. PEP
-    503's canonical form is ``re.sub(r"[-_.]+", "-", name).lower()`` --
-    we apply that to the raw ``Name`` from each dist's metadata so
-    plugin lookups don't depend on whatever casing the package author
-    chose.
-
-    Note: this still uses the *distribution* name, not the import
-    (top-level) name. For most third-party packages they match after
-    canonicalization (``fastapi``, ``flask``, ``click``, ``typer``,
-    ``networkx``, ...). They differ for a handful of historic names
-    (``Pillow`` → import ``PIL``, ``PyYAML`` → import ``yaml``); plugins
-    targeting those would need an explicit dist-name override, which
-    we don't yet support.
-    """
-    return re.sub(r"[-_.]+", "-", name).lower()
-
-
-@contextlib.contextmanager
-def temp_sys_path(paths: list[Path]):
-    old = list(sys.path)
-    seen = set(old)
-    sys.path = [str(p) for p in paths if str(p) not in seen] + sys.path
-    try:
-        yield
-    finally:
-        sys.path = old
-
-
-@cache
-def safe_resolve_module(fullname: str) -> ModuleSpec | None:
-    parts = fullname.split(".")
-    search_paths = list(sys.path)
-
-    # emulate namespace __path__ resolution
-    for i, part in enumerate(parts[:-1]):
-        candidate_paths = []
-        for base in search_paths:
-            subdir = os.path.join(base, parts[i])
-            if os.path.isdir(subdir):
-                candidate_paths.append(subdir)
-        search_paths = candidate_paths
-
-    # Final part resolution
-    for finder in sys.meta_path:
-        find_spec = getattr(finder, "find_spec", None)
-        if not find_spec:
-            continue
-        try:
-            spec = find_spec(fullname, search_paths)
-            if spec:
-                return spec
-        except Exception:
-            continue
-
-    return None
-
-
-@cache
-def distribution_lookup() -> dict[Path, str]:
-    from importlib import metadata
-
-    lookup = {}
-    for dist in metadata.distributions():
-        canonical = _canonical_dist_name(dist.metadata["Name"])
-        for file in dist.files or ():
-            abs_path = Path(str(dist.locate_file(file))).resolve()
-            lookup[abs_path] = canonical
-    return lookup
-
-
-def resolve_import(name: str, search_paths: list[Path]) -> str | Path | None:
-    spec = safe_resolve_module(name)
-    if spec is None:
-        return None
-    if spec.origin is None:
-        return None
-    if spec.origin in {"built-in", "frozen"}:
-        return f"{STDLIB_PREFIX}{name}"
-    path = Path(spec.origin).resolve()
-    if path.is_relative_to(STDLIB):
-        return f"{STDLIB_PREFIX}{name}"
-
-    lookup = distribution_lookup()
-    if dist := lookup.get(path):
-        return f"{EXTERNAL_DIST_PREFIX}{dist}"
-
-    path_str = str(path)
-    if any(m in path_str for m in SITE_PACKAGES_MARKERS):
-        return f"{EXTERNAL_FILE_PREFIX}{name}"
-
-    for search in search_paths:
-        if path.is_relative_to(search):
-            return path
-    raise Exception(f"Module {name} resolved to an unexpected path: {path}")
 
 
 def resolve_edges(

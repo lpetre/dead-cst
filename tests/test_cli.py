@@ -154,12 +154,16 @@ def test_parse_paths(tmp_path, specs, expected_keys, expected_deps):
 
 
 def test_resolve_paths_no_specs_no_resolvers_returns_root(tmp_path):
-    assert resolve_paths(tmp_path, [], []) == {tmp_path: []}
+    paths, resolvers = resolve_paths(tmp_path, [], [])
+    assert paths == {tmp_path: []}
+    assert resolvers == []
 
 
 def test_resolve_paths_explicit_specs_only(tmp_path):
     (tmp_path / "src").mkdir()
-    assert resolve_paths(tmp_path, ["src"], []) == {tmp_path / "src": []}
+    paths, resolvers = resolve_paths(tmp_path, ["src"], [])
+    assert paths == {tmp_path / "src": []}
+    assert resolvers == []
 
 
 def test_resolve_paths_unknown_resolver_raises(tmp_path):

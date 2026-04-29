@@ -21,6 +21,24 @@ two versions.
   edges for every top-level decl whose binding site falls inside the
   block.
 
+### Changed
+- `PathResolver` protocol now includes a `resolve_import(name, search_paths)`
+  method, folding `name -> path` lookup into the resolver alongside
+  search-path discovery. The shipped resolvers (`PyprojectResolver`,
+  `UvWorkspaceResolver`, `VenvResolver`) all delegate to the new
+  `dead_cst._resolvers.default_resolve_import`, the `sys.path` +
+  `importlib` implementation. Custom resolvers can now override import
+  lookups for their own layout (vendored deps, `.pyi` siblings, ...)
+  without monkey-patching internals.
+- `build_symbol_graph` accepts a new `resolvers=` keyword whose entries'
+  `resolve_import` methods are tried in order. With no resolvers it
+  falls back to `default_resolve_import`, preserving today's behavior.
+- The CLI threads loaded resolvers through to the analyzer so
+  `--resolver` selections govern import lookup, not just search paths.
+- Renamed `dead_cst._resolve` to `dead_cst._edges`. The remaining
+  module is purely about edge construction in the symbol trie;
+  resolution now lives under `dead_cst._resolvers`.
+
 ## [0.1.0] - 2026-04-28
 
 Initial alpha release. `dead-cst` is pre-1.0 software: the public Python API,

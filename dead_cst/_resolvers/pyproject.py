@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ._core import PathMap, load_toml
+from ._imports import default_resolve_import
 
 
 @dataclass
@@ -47,3 +48,6 @@ class PyprojectResolver:
         if src.is_dir():
             return {src: []}
         return {}
+
+    def resolve_import(self, name: str, search_paths: list[Path]) -> str | Path | None:
+        return default_resolve_import(name, search_paths)

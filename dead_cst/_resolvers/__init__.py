@@ -19,6 +19,12 @@ from __future__ import annotations
 
 from ._core import PathMap, PathResolver, merge_paths
 from ._exports import exported_roots
+from ._imports import (
+    default_resolve_import,
+    distribution_lookup,
+    safe_resolve_module,
+    temp_sys_path,
+)
 from .pyproject import PyprojectResolver
 from .uv_workspace import UvWorkspaceResolver
 from .venv import MissingVenvError, VenvResolver
@@ -52,7 +58,11 @@ __all__ = [
     "PyprojectResolver",
     "UvWorkspaceResolver",
     "VenvResolver",
+    "default_resolve_import",
+    "distribution_lookup",
     "exported_roots",
     "load_resolver",
     "merge_paths",
+    "safe_resolve_module",
+    "temp_sys_path",
 ]

@@ -2,20 +2,27 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
 
 import libcst as cst
 import networkx as nx
 from libcst.metadata import FullRepoManager
 
+from ._edges import resolve_edges
 from ._fqn import FixedFullyQualifiedNameProvider
 from ._plugins import (
     EdgePlugin,
     PluginContext,
     apply_ops,
 )
-from ._resolve import resolve_edges, safe_resolve_module, temp_sys_path
-from ._resolvers import PathMap, exported_roots
+from ._resolvers import (
+    PathMap,
+    PathResolver,
+    default_resolve_import,
+    exported_roots,
+    safe_resolve_module,
+    temp_sys_path,
+)
 from ._symbols import SymbolNode, SymbolTrie
 from ._visitor import SymbolVisitor
 
@@ -39,10 +46,35 @@ def order_paths(paths: PathMap) -> list[Path]:
     return list(nx.topological_sort(path_order))
 
 
+ImportResolver = Callable[[str, list[Path]], "str | Path | None"]
+
+
+def _chain_resolvers(resolvers: Sequence[PathResolver]) -> ImportResolver:
+    """Compose ``resolvers`` into one ``name -> path`` callable.
+
+    Each resolver's :meth:`PathResolver.resolve_import` is tried in
+    order; the first non-``None`` answer wins. With no resolvers,
+    falls back to :func:`default_resolve_import` so the analyzer keeps
+    working when callers don't pass any (the common public-API case).
+    """
+    if not resolvers:
+        return default_resolve_import
+
+    def _resolve(name: str, search_paths: list[Path]) -> str | Path | None:
+        for resolver in resolvers:
+            result = resolver.resolve_import(name, search_paths)
+            if result is not None:
+                return result
+        return None
+
+    return _resolve
+
+
 def build_symbol_graph(
     paths: PathMap,
     *,
     plugins: Sequence[EdgePlugin] = (),
+    resolvers: Sequence[PathResolver] = (),
     project_root: Path | None = None,
 ) -> nx.DiGraph:
     """Build a directed reachability graph of every top-level symbol under ``paths``.
@@ -79,6 +111,13 @@ def build_symbol_graph(
         Sequence of :class:`EdgePlugin` instances. Plugins emit
         :class:`AddNode`, :class:`AddEdge`, and :class:`RemoveEdge` ops;
         ``AddNode(..., entrypoint=True)`` seeds :func:`find_reachable`.
+    resolvers:
+        Sequence of :class:`PathResolver` instances whose
+        :meth:`~PathResolver.resolve_import` overrides ``name -> path``
+        lookups. Tried in order; first non-``None`` answer wins. When
+        empty, the analyzer falls back to
+        :func:`default_resolve_import` -- the same ``sys.path`` +
+        ``importlib`` lookup the shipped resolvers all delegate to.
     project_root:
         Project root used by plugins for path-relative matching. If
         omitted, inferred as the shortest path in ``paths``.
@@ -93,6 +132,7 @@ def build_symbol_graph(
     base_tries: dict[Path, SymbolTrie] = {}
     export_tries: dict[Path, SymbolTrie] = {}
     root = project_root or _infer_project_root(paths) if paths else Path.cwd()
+    import_resolver = _chain_resolvers(resolvers)
     for base in order_paths(paths):
         logger.debug("Processing base path: %s", base)
         search_paths = [base] + paths.get(base, [])
@@ -113,7 +153,7 @@ def build_symbol_graph(
                 wrapper = mgr.get_metadata_wrapper_for_path(str(file))
                 if base_modules is not None:
                     base_modules[file] = wrapper.module
-                visitor = SymbolVisitor(file, search_paths)
+                visitor = SymbolVisitor(file, search_paths, import_resolver)
                 wrapper.visit(visitor)
                 # A file's decls go into ``export_trie`` only when the file
                 # lives under one of ``base``'s exported dirs (or when the

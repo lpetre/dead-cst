@@ -23,7 +23,7 @@ from ._plugins import (
 )
 from ._plugins._core import EXTERNAL_PREFIXES
 from ._plugins.module_dunders import DUNDER_PREFIX
-from ._resolvers import PathMap, load_resolver, merge_paths
+from ._resolvers import PathMap, PathResolver, load_resolver, merge_paths
 from ._symbols import SymbolNode
 
 
@@ -79,13 +79,22 @@ def build_plugins(
     return plugins
 
 
-def resolve_paths(root: Path, path_specs: list[str], resolver_names: list[str]) -> PathMap:
-    """Merge ``-p`` specs and ``--resolver`` outputs into a single path map."""
+def resolve_paths(
+    root: Path, path_specs: list[str], resolver_names: list[str]
+) -> tuple[PathMap, list[PathResolver]]:
+    """Merge ``-p`` specs and ``--resolver`` outputs into a path map and resolver list.
+
+    Returns the merged :data:`PathMap` plus the resolver instances --
+    the analyzer threads the resolvers through so each one's
+    :meth:`PathResolver.resolve_import` participates in
+    ``name -> path`` lookups, not just its :meth:`resolve` output.
+    """
+    resolvers = [load_resolver(name) for name in resolver_names]
     explicit = parse_paths(root, path_specs) if path_specs else {}
-    resolved_maps = [load_resolver(name).resolve(root) for name in resolver_names]
+    resolved_maps = [r.resolve(root) for r in resolvers]
     if not explicit and not resolved_maps:
-        return {root: []}
-    return merge_paths(explicit, *resolved_maps)
+        return {root: []}, resolvers
+    return merge_paths(explicit, *resolved_maps), resolvers
 
 
 def parse_paths(root: Path, paths_str: list[str]) -> PathMap:
@@ -161,14 +170,14 @@ def analyze(
     setup_logging(verbose)
     root = root.resolve()
 
-    paths_dict = resolve_paths(root, path or [], resolver or [])
+    paths_dict, resolvers = resolve_paths(root, path or [], resolver or [])
 
     typer.echo(f"Building symbol graph for {root}...", err=True)
     plugins = build_plugins(
         entrypoints=entrypoint or [],
         plugin_names=plugin or [],
     )
-    graph = build_symbol_graph(paths_dict, plugins=plugins, project_root=root)
+    graph = build_symbol_graph(paths_dict, plugins=plugins, resolvers=resolvers, project_root=root)
     reachable = find_reachable(graph)
 
     unreachable_graph = graph.subgraph([n for n in graph.nodes if n not in reachable])
@@ -307,14 +316,14 @@ def why_alive(
     setup_logging(verbose)
     root = root.resolve()
 
-    paths_dict = resolve_paths(root, path or [], resolver or [])
+    paths_dict, resolvers = resolve_paths(root, path or [], resolver or [])
 
     typer.echo(f"Building symbol graph for {root}...", err=True)
     plugins = build_plugins(
         entrypoints=[],
         plugin_names=plugin or [],
     )
-    graph = build_symbol_graph(paths_dict, plugins=plugins, project_root=root)
+    graph = build_symbol_graph(paths_dict, plugins=plugins, resolvers=resolvers, project_root=root)
 
     target_node: SymbolNode | None = None
     for node in graph.nodes:
@@ -372,10 +381,10 @@ def dependencies(
     setup_logging(verbose)
     root = root.resolve()
 
-    paths_dict = resolve_paths(root, path or [], resolver or [])
+    paths_dict, resolvers = resolve_paths(root, path or [], resolver or [])
 
     typer.echo(f"Building symbol graph for {root}...", err=True)
-    graph = build_symbol_graph(paths_dict, project_root=root)
+    graph = build_symbol_graph(paths_dict, resolvers=resolvers, project_root=root)
 
     deps_by_base: dict[Path, list[SymbolNode]] = {base: [] for base in order_paths(paths_dict)}
     for node in graph.nodes:
@@ -431,14 +440,14 @@ def unused_exports(
     setup_logging(verbose)
     root = root.resolve()
 
-    paths_dict = resolve_paths(root, path or [], resolver or [])
+    paths_dict, resolvers = resolve_paths(root, path or [], resolver or [])
 
     typer.echo(f"Building symbol graph for {root}...", err=True)
     plugins = build_plugins(
         entrypoints=entrypoint or [],
         plugin_names=plugin or [],
     )
-    graph = build_symbol_graph(paths_dict, plugins=plugins, project_root=root)
+    graph = build_symbol_graph(paths_dict, plugins=plugins, resolvers=resolvers, project_root=root)
     reachable = find_reachable(graph)
 
     # ModuleDundersPlugin keeps each ``__all__`` alive via a synthetic
@@ -508,14 +517,14 @@ def remove(
     setup_logging(verbose)
     root = root.resolve()
 
-    paths_dict = resolve_paths(root, path or [], resolver or [])
+    paths_dict, resolvers = resolve_paths(root, path or [], resolver or [])
 
     typer.echo(f"Building symbol graph for {root}...", err=True)
     plugins = build_plugins(
         entrypoints=entrypoint or [],
         plugin_names=plugin or [],
     )
-    graph = build_symbol_graph(paths_dict, plugins=plugins, project_root=root)
+    graph = build_symbol_graph(paths_dict, plugins=plugins, resolvers=resolvers, project_root=root)
     reachable = find_reachable(graph)
 
     unreachable_graph = graph.subgraph([n for n in graph.nodes if n not in reachable])
