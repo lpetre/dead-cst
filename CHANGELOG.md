@@ -9,6 +9,18 @@ two versions.
 
 ## [Unreleased]
 
+### Fixed
+- `MainBlockPlugin` now keeps decls bound inside the
+  `if __name__ == "__main__":` block alive, not just the containing
+  module. Previously a top-level decl introduced by an assignment in
+  the block (e.g. `app = Foo(fn=main).cli()`) had no incoming edge --
+  the visitor's value-frame produced `app -> Foo` / `app -> main`, but
+  nothing pointed at `app` itself -- so the chain was unreachable and
+  `Foo` / `main` were reported dead. The plugin now resolves the
+  block's `CodeRange` via `PositionProvider` and emits `synth -> decl`
+  edges for every top-level decl whose binding site falls inside the
+  block.
+
 ## [0.1.0] - 2026-04-28
 
 Initial alpha release. `dead-cst` is pre-1.0 software: the public Python API,
