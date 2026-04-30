@@ -13,6 +13,55 @@ for the full record.
 
 ---
 
+## Next release — Quality of life
+
+Two committed items for the upcoming version. Both are internal-architecture
+changes that unblock work elsewhere in the roadmap.
+
+### Resolver logic as a protocol
+
+`PathResolver` today only answers "where are the source roots?"
+(`resolve(project_root) -> PathMap`). The actual name-to-path step —
+`resolve_import` in `_resolve.py`, hard-coded to `sys.path` + `importlib` —
+sits outside the protocol, so shipped resolvers can describe a layout but
+can't influence how imports inside that layout are looked up. Fold it in:
+
+- Add a `resolve_import(name, search_paths) -> str | Path | None` method
+  to `PathResolver`. The current function in `_resolve.py` moves into the
+  `_resolvers` subpackage as the default implementation; shipped resolvers
+  (`pyproject`, `uv_workspace`, `venv`) inherit or delegate to it.
+- This lets a resolver override lookup for its own layout — e.g. a
+  vendored-deps resolver pointing at a checked-in `third_party/`, or a
+  stub-aware resolver preferring `.pyi` siblings — without monkey-patching
+  internals.
+
+`resolve_edges` is a different concern (it stitches imports to declarations
+in the already-built symbol trie) and stays in place. The file should be
+renamed though, since "resolution" now lives in `_resolvers/` and what's
+left is edge construction — `_edges.py` reads more honestly.
+
+### SQLite-cached graph with partial rebuilds
+
+Cache the symbol graph in a SQLite database keyed by file content hash, and
+rebuild only the modules whose hashes changed (plus their reverse
+dependencies). This is the "Incremental analysis" item previously parked in
+Tier 4 — promoting it because the resolver-protocol work makes the
+invalidation surface tractable, and because cold-start latency is the
+remaining friction users hit before CI integration.
+
+Scope for the first cut:
+
+- Schema for nodes, edges, and per-file content hashes; bump on schema
+  changes.
+- Invalidate a file when its hash changes; recompute its declared symbols
+  and outgoing edges; recompute incoming edges from any file that imports
+  it.
+- Fall back to a full rebuild when the resolver, plugin set, or workspace
+  layout changes (cache key includes those).
+- `--no-cache` escape hatch and a `dead-cst cache clear` subcommand.
+
+---
+
 ## Tier 1 — Trust and correctness
 
 ### 1. CLI integration tests
@@ -106,13 +155,7 @@ tackle once Tier 1–2 has shipped and the protocol surface is stable.
 
 ## Tier 4 — Speculative, wait for signal
 
-### 10. Incremental analysis
-
-A real performance problem at 100k+ LOC, but the project isn't there yet. Adds
-substantial complexity (file-content hashing, partial graph rebuild,
-invalidation). Defer until a user reports it.
-
-### 11. Multiple reachability frontiers
+### 10. Multiple reachability frontiers
 
 Splitting "reachable from tests" vs. "reachable from production entrypoints"
 is interesting and would enable rules like "no production code reachable only
