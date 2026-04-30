@@ -12,8 +12,8 @@ from typing import Any, Callable, Protocol, runtime_checkable
 
 PathMap = dict[Path, list[Path]]
 
+# ``name -> path`` lookup callable. ``None`` means "not resolvable here".
 ImportResolver = Callable[[str, list[Path]], "str | Path | None"]
-"""``name -> path`` lookup callable. ``None`` means "not resolvable here"."""
 
 
 @runtime_checkable
