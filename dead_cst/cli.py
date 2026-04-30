@@ -23,7 +23,13 @@ from ._plugins import (
 )
 from ._plugins._core import EXTERNAL_PREFIXES
 from ._plugins.module_dunders import DUNDER_PREFIX
-from ._resolvers import PathMap, PathResolver, load_resolver, merge_paths
+from ._resolvers import (
+    ManualResolver,
+    PathMap,
+    PathResolver,
+    load_resolver,
+    merge_paths,
+)
 from ._symbols import SymbolNode
 
 
@@ -82,40 +88,21 @@ def build_plugins(
 def resolve_paths(
     root: Path, path_specs: list[str], resolver_names: list[str]
 ) -> tuple[PathMap, list[PathResolver]]:
-    """Merge ``-p`` specs and ``--resolver`` outputs into a path map and resolver list.
+    """Build the resolver chain from ``-p`` specs and ``--resolver`` names.
 
-    Returns the merged :data:`PathMap` plus the resolver instances --
-    the analyzer threads the resolvers through so each one's
-    :meth:`PathResolver.resolve_import` participates in
-    ``name -> path`` lookups, not just its :meth:`resolve` output.
+    ``-p`` specs become a :class:`ManualResolver` and slot into the
+    chain alongside named resolvers, so explicit specs participate in
+    :meth:`PathResolver.resolve_import` lookups too. Returns the
+    merged :data:`PathMap` and the resolver instances; the analyzer
+    threads the latter through to govern import resolution.
     """
-    resolvers = [load_resolver(name) for name in resolver_names]
-    explicit = parse_paths(root, path_specs) if path_specs else {}
-    resolved_maps = [r.resolve(root) for r in resolvers]
-    if not explicit and not resolved_maps:
-        return {root: []}, resolvers
-    return merge_paths(explicit, *resolved_maps), resolvers
-
-
-def parse_paths(root: Path, paths_str: list[str]) -> PathMap:
-    """Parse path specifications into the paths dict format.
-
-    Format: "base:dep1,dep2,dep3" or just "base" for no dependencies.
-    """
-    if not paths_str:
-        return {root: []}
-
-    result = {}
-    for spec in paths_str:
-        if ":" in spec:
-            base_str, deps_str = spec.split(":", 1)
-            base = root / base_str
-            deps = [root / d.strip() for d in deps_str.split(",") if d.strip()]
-        else:
-            base = root / spec
-            deps = []
-        result[base] = deps
-    return result
+    resolvers: list[PathResolver] = []
+    if path_specs:
+        resolvers.append(ManualResolver(specs=path_specs))
+    resolvers.extend(load_resolver(name) for name in resolver_names)
+    if not resolvers:
+        return {root: []}, []
+    return merge_paths(*[r.resolve(root) for r in resolvers]), resolvers
 
 
 def version_callback(value: bool) -> None:

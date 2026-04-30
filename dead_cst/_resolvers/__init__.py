@@ -25,6 +25,7 @@ from ._imports import (
     safe_resolve_module,
     temp_sys_path,
 )
+from .manual import ManualResolver
 from .pyproject import PyprojectResolver
 from .uv_workspace import UvWorkspaceResolver
 from .venv import MissingVenvError, VenvResolver
@@ -52,6 +53,7 @@ def load_resolver(name: str) -> PathResolver:
 
 __all__ = [
     "BUILTIN_RESOLVERS",
+    "ManualResolver",
     "MissingVenvError",
     "PathMap",
     "PathResolver",
