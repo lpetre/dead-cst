@@ -8,9 +8,12 @@ multiple resolvers' outputs.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Callable, Protocol, runtime_checkable
 
 PathMap = dict[Path, list[Path]]
+
+ImportResolver = Callable[[str, list[Path]], "str | Path | None"]
+"""``name -> path`` lookup callable. ``None`` means "not resolvable here"."""
 
 
 @runtime_checkable

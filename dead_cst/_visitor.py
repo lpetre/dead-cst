@@ -4,7 +4,7 @@ import logging
 from functools import cache
 from importlib.util import resolve_name
 from pathlib import Path
-from typing import Callable, Generator, Literal, Mapping, cast
+from typing import Generator, Literal, Mapping, cast
 
 import libcst as cst
 from libcst.helpers import get_full_name_for_node
@@ -26,10 +26,8 @@ from ._branches import make_unreachable_node, unreachable_suites
 from ._flow import live_at_exit, live_referents
 from ._fqn import FixedFullyQualifiedNameProvider
 from ._plugins._core import UNRESOLVED_PREFIX
-from ._resolvers import default_resolve_import
+from ._resolvers import ImportResolver, default_resolve_import
 from ._symbols import Import, SymbolNode, SymbolTrie
-
-ImportResolver = Callable[[str, list[Path]], "str | Path | None"]
 
 logger = logging.getLogger(__name__)
 

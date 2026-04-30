@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Sequence
 
 import libcst as cst
 import networkx as nx
@@ -16,13 +16,13 @@ from ._plugins import (
     apply_ops,
 )
 from ._resolvers import (
+    ImportResolver,
     PathMap,
     PathResolver,
     default_resolve_import,
     exported_roots,
-    safe_resolve_module,
-    temp_sys_path,
 )
+from ._resolvers._imports import safe_resolve_module, temp_sys_path
 from ._symbols import SymbolNode, SymbolTrie
 from ._visitor import SymbolVisitor
 
@@ -46,9 +46,6 @@ def order_paths(paths: PathMap) -> list[Path]:
     return list(nx.topological_sort(path_order))
 
 
-ImportResolver = Callable[[str, list[Path]], "str | Path | None"]
-
-
 def _chain_resolvers(resolvers: Sequence[PathResolver]) -> ImportResolver:
     """Compose ``resolvers`` into one ``name -> path`` callable.
 
@@ -56,9 +53,14 @@ def _chain_resolvers(resolvers: Sequence[PathResolver]) -> ImportResolver:
     order; the first non-``None`` answer wins. With no resolvers,
     falls back to :func:`default_resolve_import` so the analyzer keeps
     working when callers don't pass any (the common public-API case).
+    A single-resolver chain skips the closure -- the typical CLI
+    invocation passes one resolver, and the chain would just call its
+    method directly.
     """
     if not resolvers:
         return default_resolve_import
+    if len(resolvers) == 1:
+        return resolvers[0].resolve_import
 
     def _resolve(name: str, search_paths: list[Path]) -> str | Path | None:
         for resolver in resolvers:
