@@ -17,8 +17,10 @@ like ``tests/`` stay scoped to their owning member.
 
 from __future__ import annotations
 
-from ._core import PathMap, PathResolver, merge_paths
+from ._core import ImportResolver, PathMap, PathResolver, merge_paths
 from ._exports import exported_roots
+from ._imports import default_resolve_import
+from .manual import ManualResolver
 from .pyproject import PyprojectResolver
 from .uv_workspace import UvWorkspaceResolver
 from .venv import MissingVenvError, VenvResolver
@@ -46,12 +48,15 @@ def load_resolver(name: str) -> PathResolver:
 
 __all__ = [
     "BUILTIN_RESOLVERS",
+    "ImportResolver",
+    "ManualResolver",
     "MissingVenvError",
     "PathMap",
     "PathResolver",
     "PyprojectResolver",
     "UvWorkspaceResolver",
     "VenvResolver",
+    "default_resolve_import",
     "exported_roots",
     "load_resolver",
     "merge_paths",

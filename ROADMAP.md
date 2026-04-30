@@ -15,30 +15,8 @@ for the full record.
 
 ## Next release — Quality of life
 
-Two committed items for the upcoming version. Both are internal-architecture
-changes that unblock work elsewhere in the roadmap.
-
-### Resolver logic as a protocol
-
-`PathResolver` today only answers "where are the source roots?"
-(`resolve(project_root) -> PathMap`). The actual name-to-path step —
-`resolve_import` in `_resolve.py`, hard-coded to `sys.path` + `importlib` —
-sits outside the protocol, so shipped resolvers can describe a layout but
-can't influence how imports inside that layout are looked up. Fold it in:
-
-- Add a `resolve_import(name, search_paths) -> str | Path | None` method
-  to `PathResolver`. The current function in `_resolve.py` moves into the
-  `_resolvers` subpackage as the default implementation; shipped resolvers
-  (`pyproject`, `uv_workspace`, `venv`) inherit or delegate to it.
-- This lets a resolver override lookup for its own layout — e.g. a
-  vendored-deps resolver pointing at a checked-in `third_party/`, or a
-  stub-aware resolver preferring `.pyi` siblings — without monkey-patching
-  internals.
-
-`resolve_edges` is a different concern (it stitches imports to declarations
-in the already-built symbol trie) and stays in place. The file should be
-renamed though, since "resolution" now lives in `_resolvers/` and what's
-left is edge construction — `_edges.py` reads more honestly.
+One committed item for the upcoming version. The resolver-protocol
+companion piece shipped — see `CHANGELOG.md`.
 
 ### SQLite-cached graph with partial rebuilds
 
@@ -168,6 +146,11 @@ demand.
 
 Folded down from earlier tiers as they landed:
 
+- Resolver logic as a protocol: `PathResolver.resolve_import` folds
+  `name -> path` lookup into the resolver, so custom resolvers can
+  override import resolution for their own layouts. `_resolve.py`
+  renamed to `_edges.py` since resolution now lives under
+  `_resolvers/`.
 - Codemod test coverage and import pruning (Tier 1).
 - `from X import *` resolution, pessimistic by default (Tier 1).
 - `PytestPlugin`, `UnittestPlugin`, `FastAPIPlugin`, `FlaskPlugin`,

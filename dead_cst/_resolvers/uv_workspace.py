@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ._core import PathMap, load_toml
+from ._imports import default_resolve_import
 from .venv import MissingVenvError, find_venv_site_packages
 
 
@@ -94,6 +95,9 @@ class UvWorkspaceResolver:
             deps.append(site_packages)
             out[src_root] = deps
         return out
+
+    def resolve_import(self, name: str, search_paths: list[Path]) -> str | Path | None:
+        return default_resolve_import(name, search_paths)
 
 
 def _src_root_for(member_dir: Path) -> Path | None:

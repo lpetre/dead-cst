@@ -54,6 +54,7 @@ from ._plugins import (
 )
 from ._resolvers import (
     BUILTIN_RESOLVERS,
+    ManualResolver,
     PathResolver,
     PyprojectResolver,
     UvWorkspaceResolver,
@@ -77,6 +78,7 @@ __all__ = [
     "GraphOp",
     "InitSubclassPlugin",
     "MainBlockPlugin",
+    "ManualResolver",
     "ModuleDundersPlugin",
     "PathResolver",
     "PluginContext",

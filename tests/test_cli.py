@@ -30,6 +30,7 @@ from dead_cst._plugins import (
 from dead_cst._plugins._core import EXTERNAL_DIST_PREFIX
 from dead_cst._plugins.explicit import EXPLICIT_PREFIX
 from dead_cst._symbols import SymbolNode
+from dead_cst._resolvers import ManualResolver
 from dead_cst.cli import (
     _is_dunder_all,
     _is_external_dep,
@@ -38,7 +39,6 @@ from dead_cst.cli import (
     app,
     build_plugins,
     parse_entrypoint,
-    parse_paths,
     resolve_paths,
     setup_logging,
 )
@@ -112,8 +112,8 @@ def test_parse_entrypoint_re_prefix_with_empty_pattern():
     assert result.pattern == ""
 
 
-def test_parse_paths_empty_list_returns_root_only(tmp_path):
-    assert parse_paths(tmp_path, []) == {tmp_path: []}
+def test_manual_resolver_empty_specs(tmp_path):
+    assert ManualResolver(specs=[]).resolve(tmp_path) == {}
 
 
 @pytest.mark.parametrize(
@@ -146,20 +146,26 @@ def test_parse_paths_empty_list_returns_root_only(tmp_path):
         ),
     ],
 )
-def test_parse_paths(tmp_path, specs, expected_keys, expected_deps):
-    result = parse_paths(tmp_path, specs)
+def test_manual_resolver_parses_specs(tmp_path, specs, expected_keys, expected_deps):
+    result = ManualResolver(specs=specs).resolve(tmp_path)
     assert list(result) == [tmp_path / k for k in expected_keys]
     for key, deps in expected_deps.items():
         assert result[tmp_path / key] == [tmp_path / d for d in deps]
 
 
 def test_resolve_paths_no_specs_no_resolvers_returns_root(tmp_path):
-    assert resolve_paths(tmp_path, [], []) == {tmp_path: []}
+    paths, resolvers = resolve_paths(tmp_path, [], [])
+    assert paths == {tmp_path: []}
+    assert resolvers == []
 
 
 def test_resolve_paths_explicit_specs_only(tmp_path):
     (tmp_path / "src").mkdir()
-    assert resolve_paths(tmp_path, ["src"], []) == {tmp_path / "src": []}
+    paths, resolvers = resolve_paths(tmp_path, ["src"], [])
+    assert paths == {tmp_path / "src": []}
+    # ``-p`` flows through a ManualResolver so its ``resolve_import``
+    # is part of the chain alongside any named resolvers.
+    assert [r.name for r in resolvers] == ["manual"]
 
 
 def test_resolve_paths_unknown_resolver_raises(tmp_path):

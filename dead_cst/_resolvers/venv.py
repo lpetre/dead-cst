@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ._core import PathMap
+from ._imports import default_resolve_import
 
 
 class MissingVenvError(RuntimeError):
@@ -47,6 +48,9 @@ class VenvResolver:
         if sp is None:
             raise MissingVenvError(_missing_venv_message(project_root, self.venv_dir))
         return {project_root: [sp]}
+
+    def resolve_import(self, name: str, search_paths: list[Path]) -> str | Path | None:
+        return default_resolve_import(name, search_paths)
 
 
 def find_venv_site_packages(project_root: Path, venv_dir: str | None = None) -> Path | None:
