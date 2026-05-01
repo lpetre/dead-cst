@@ -2,7 +2,8 @@
 
 Determines, when possible, whether the truthiness of an expression is
 statically known. Used to identify dead branches of ``if`` / ``while``
-statements so callers can prune references that live inside them.
+statements so callers can mark references that live inside them with
+:data:`dead_cst._symbols.EdgeFlags.DEAD_BRANCH`.
 
 Only handles a small whitelist of literal forms: the ``True`` /
 ``False`` / ``None`` keywords, integer / string literals,
@@ -11,24 +12,13 @@ over those. Anything involving a name lookup (other than the three
 keywords), attribute access, function call, comparison, or other
 dynamic operation returns ``None`` (unknown). Returning ``None`` is
 always the safe default: callers must treat the branch as live.
-
-This module also owns the convention for synthetic graph nodes that
-represent dead suites. The nodes have ``type="synthetic"`` (the
-existing escape hatch in :mod:`dead_cst._symbols`) and a fqname
-prefixed with :data:`UNREACHABLE_PREFIX` (``<unreachable>:``).
-``is_unreachable_node`` is the single source of truth for that
-convention; consumers should never check the prefix string themselves.
 """
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Sequence
 
 import libcst as cst
-from libcst.metadata import CodeRange
-
-from ._symbols import SymbolNode
 
 
 _KEYWORDS: dict[str, bool] = {
@@ -36,8 +26,6 @@ _KEYWORDS: dict[str, bool] = {
     "False": False,
     "None": False,
 }
-
-UNREACHABLE_PREFIX = "<unreachable>:"
 
 
 def evaluate_truthiness(node: cst.BaseExpression) -> bool | None:
@@ -164,40 +152,3 @@ def _unreachable_in_if(node: cst.If, branch_taken: bool) -> list[cst.BaseSuite]:
         return dead
     dead.extend(_unreachable_in_if(orelse, next_taken))
     return dead
-
-
-def make_unreachable_fqname(module_fqname: str, position: CodeRange) -> str:
-    """Build the fqname for the synthetic node representing a dead suite.
-
-    The format is intentionally fixed: callers should use
-    :func:`is_unreachable_node` to identify these nodes rather than
-    string-matching on their fqnames.
-    """
-    return f"{UNREACHABLE_PREFIX}{module_fqname}:{position.start.line}:{position.start.column}"
-
-
-def make_unreachable_node(module_fqname: str, path: Path, position: CodeRange) -> SymbolNode:
-    """Build the synthetic ``SymbolNode`` for a dead suite.
-
-    Reuses ``type="synthetic"`` -- the existing escape hatch for graph
-    nodes that don't correspond to a top-level declaration -- and
-    distinguishes itself by carrying a real source ``position`` (rather
-    than the ``SYNTHETIC_POSITION`` sentinel used by entrypoint plugins)
-    plus the :data:`UNREACHABLE_PREFIX` fqname prefix.
-    """
-    return SymbolNode(
-        fqname=make_unreachable_fqname(module_fqname, position),
-        type="synthetic",
-        path=path,
-        position=position,
-    )
-
-
-def is_unreachable_node(sym: SymbolNode) -> bool:
-    """Predicate: ``True`` iff ``sym`` is a synthetic dead-suite node.
-
-    The only supported way to identify these nodes. Callers should not
-    string-match on the fqname directly; the prefix is an implementation
-    detail of this module.
-    """
-    return sym.type == "synthetic" and sym.fqname.startswith(UNREACHABLE_PREFIX)

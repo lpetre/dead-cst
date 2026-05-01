@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import dataclasses
 import logging
+from dataclasses import dataclass
 from functools import cache
 from importlib.util import resolve_name
 from pathlib import Path
-from typing import Generator, Literal, Mapping, cast
+from typing import Generator, Literal, cast
 
 import libcst as cst
 from libcst.helpers import get_full_name_for_node
 from libcst.metadata import (
+    CodeRange,
     ParentNodeProvider,
     PositionProvider,
     ScopeProvider,
@@ -22,12 +25,12 @@ from libcst.metadata.scope_provider import (
     Scope,
 )
 
-from ._branches import make_unreachable_node, unreachable_suites
+from ._branches import unreachable_suites
 from ._flow import live_at_exit, live_referents
 from ._fqn import FixedFullyQualifiedNameProvider
 from ._plugins._core import UNRESOLVED_PREFIX
 from ._resolvers import ImportResolver, default_resolve_import
-from ._symbols import Import, SymbolNode, SymbolTrie
+from ._symbols import Import, NodeFlags, SymbolNode, SymbolTrie
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +46,38 @@ def _dotted_name_parts(
             yield nm, n
         full = f"{nm}.{node.attr.value}"
         yield full, node.attr
+
+
+@dataclass(frozen=True, slots=True)
+class VisitorPayload:
+    """Serializable per-file output of :class:`SymbolVisitor`.
+
+    Four fields cover everything the analyzer needs to reconstruct one
+    file's contribution to the symbol graph:
+
+    * ``nodes`` -- every real ``SymbolNode`` for this file (module +
+      top-level decls). Decls displaced by flow analysis are flagged
+      :data:`NodeFlags.SHADOWED`; the apply step uses that flag to keep
+      them out of the lookup trie while still emitting the parent-module
+      edge for the graph.
+    * ``edges`` -- ``(src, dst, access_pos)`` triples for resolved
+      decl-to-decl references. ``access_pos`` is the source location
+      of the reference; the apply step compares it against
+      ``dead_suites`` to decide whether the resulting graph edge gets
+      :data:`EdgeFlags.DEAD_BRANCH`.
+    * ``imports`` -- ``(src, Import, access_pos)`` triples for
+      unresolved cross-file references. The apply step feeds them into
+      ``resolve_edges`` along with the derived flag.
+    * ``dead_suites`` -- positions of every statically-dead suite in
+      the file (including ones with no outgoing references). Used both
+      for flag derivation and for surfacing "this file has unreachable
+      code at line X" reports without per-edge attribution.
+    """
+
+    nodes: tuple[SymbolNode, ...]
+    edges: tuple[tuple[SymbolNode, SymbolNode, CodeRange], ...]
+    imports: tuple[tuple[SymbolNode, Import, CodeRange], ...]
+    dead_suites: tuple[CodeRange, ...]
 
 
 def _pair_targets(
@@ -101,8 +136,13 @@ class SymbolVisitor(cst.CSTVisitor):
         self.decl_stack: list[list[SymbolNode]] = []
         self.nearest_decls: dict[cst.CSTNode, list[SymbolNode]] = {}
         self.import_lookup: dict[cst.CSTNode, Import] = {}
-        self.import_edges: set[tuple[SymbolNode, Import]] = set()
-        self.internal_edges: set[tuple[SymbolNode, SymbolNode]] = set()
+        # Edges carry the access position so the apply step can decide
+        # whether the reference originated inside a dead suite. Set
+        # semantics still dedupe identical triples; same-decl refs from
+        # different positions remain distinct (which matters when one is
+        # live and one is in a dead branch).
+        self.import_edges: set[tuple[SymbolNode, Import, CodeRange]] = set()
+        self.internal_edges: set[tuple[SymbolNode, SymbolNode, CodeRange]] = set()
         self.dunder_all_refs: list[tuple[SymbolNode, list[str]]] = []
         self.trie: SymbolTrie = SymbolTrie()
         # CST node used as the flow-analysis "binding site" for each
@@ -111,15 +151,17 @@ class SymbolVisitor(cst.CSTVisitor):
         # descendants of the containing statement, which is what
         # ``live_at_exit`` matches against.
         self.symbol_referent_nodes: dict[SymbolNode, cst.CSTNode] = {}
-        # Synthetic graph nodes for statically-unreachable branches.
-        # ``dead_suite_owner`` maps the ``id()`` of each dead suite node
-        # to the synthetic ``SymbolNode`` that "owns" any references
-        # made inside it; ``unreachable_nodes`` is the flat list the
-        # analyzer pulls into the graph.
-        self.unreachable_nodes: list[SymbolNode] = []
-        self.dead_suite_owner: dict[int, SymbolNode] = {}
-        self.unreachable_internal_edges: set[tuple[SymbolNode, SymbolNode]] = set()
-        self.unreachable_import_edges: set[tuple[SymbolNode, Import]] = set()
+        # Positions of every statically-dead suite in this file. The
+        # apply step uses this list to decide which edges land with
+        # ``EdgeFlags.DEAD_BRANCH``; the CLI surfaces them as
+        # "unreachable code at line X" reports.
+        self.dead_suites: list[CodeRange] = []
+        # Decls displaced by flow analysis. Tracked here (rather than on
+        # the trie) so the trie holds only entries cross-module imports
+        # should resolve to. Stored unflagged; ``to_payload`` produces
+        # ``NodeFlags.SHADOWED`` copies and remaps any edge endpoints
+        # that point at them, so the graph keeps consistent identity.
+        self.shadowed_decls: list[SymbolNode] = []
 
     @property
     def module_node(self) -> SymbolNode:
@@ -312,7 +354,7 @@ class SymbolVisitor(cst.CSTVisitor):
                 self.symbol_referent_nodes[sym] = alias
                 self._push_decl(alias, sym)
 
-            self.import_edges.add((self.decl_stack[-1][-1], import_info))
+            self.import_edges.add((self.decl_stack[-1][-1], import_info, self._pos(alias)))
 
     def visit_Module(self, node: cst.Module) -> None:
         assert not self.decl_stack, "Module node should be the first visited node"
@@ -342,38 +384,19 @@ class SymbolVisitor(cst.CSTVisitor):
         self._record_dead_suites(node)
 
     def _record_dead_suites(self, stmt: cst.BaseStatement) -> None:
-        """Create a synthetic ``unreachable`` graph node for each dead suite.
+        """Append the position of every statically-dead suite in ``stmt``.
 
-        Records the suite's ``id()`` so :meth:`_unreachable_owner` can
-        later attribute references made inside the suite to it. Nested
-        dead suites are handled implicitly: we visit outer ``If`` /
-        ``While`` first, then descend, so an inner dead suite registers
-        afterwards and the innermost match wins at lookup time.
+        The apply step (``_apply_payload`` in ``_analyze``) uses this
+        list to decide whether each emitted edge falls inside a dead
+        suite, in which case the edge gets ``EdgeFlags.DEAD_BRANCH``.
+        Nested dead suites are recorded as separate entries; an access
+        is "in a dead suite" if its position falls inside any of them.
         """
         for suite in unreachable_suites(stmt):
             pos = self._pos(suite)
             if pos is None:
                 continue
-            sym = make_unreachable_node(self.module_node.fqname, self.path, pos)
-            self.unreachable_nodes.append(sym)
-            self.dead_suite_owner[id(suite)] = sym
-
-    def _unreachable_owner(
-        self, node: cst.CSTNode, parent_map: Mapping[cst.CSTNode, object]
-    ) -> SymbolNode | None:
-        """Return the synthetic node owning ``node`` if it lives inside one.
-
-        Walks up via ``ParentNodeProvider`` looking for a recorded dead
-        suite. Returns the innermost match, or ``None`` if ``node`` is
-        not inside any dead suite.
-        """
-        current: object = parent_map.get(node)
-        while isinstance(current, cst.CSTNode):
-            owner = self.dead_suite_owner.get(id(current))
-            if owner is not None:
-                return owner
-            current = parent_map.get(current)
-        return None
+            self.dead_suites.append(pos)
 
     def visit_Import(self, node: cst.Import) -> None:
         self._add_import("", node)
@@ -393,7 +416,7 @@ class SymbolVisitor(cst.CSTVisitor):
             module = resolve_name(f"{prefix}{module}", current_package)
 
         if isinstance(node.names, cst.ImportStar):
-            self._add_star_import(module)
+            self._add_star_import(module, self._pos(node))
             return
 
         self._add_import(module, node)
@@ -404,9 +427,9 @@ class SymbolVisitor(cst.CSTVisitor):
         For names with more than one decl, ask :func:`live_at_exit` which
         binding sites survive on at least one path to module exit. Live
         decls stay in ``trie.declarations[name]`` (multi-valued for
-        conditional bindings); the rest move to ``trie.shadowed`` so the
-        graph keeps their parent-module edge but cross-module imports do
-        not reach them.
+        conditional bindings); the rest move to
+        ``self.shadowed_decls`` so the graph keeps their parent-module
+        edge but cross-module imports do not reach them.
         """
         trie_node = self.trie._get(self._module_fqname.split("."))
         if trie_node is None:
@@ -426,17 +449,21 @@ class SymbolVisitor(cst.CSTVisitor):
             live_ids = {id(n) for n in live_at_exit(list(module_node.body), referent_nodes)}
 
             live_decls: list[SymbolNode] = []
-            shadowed_decls: list[SymbolNode] = []
+            shadowed_here: list[SymbolNode] = []
             for d in decls:
                 ref = self.symbol_referent_nodes.get(d)
                 if ref is not None and id(ref) in live_ids:
                     live_decls.append(d)
                 else:
-                    shadowed_decls.append(d)
+                    shadowed_here.append(d)
 
-            trie_node.finalize_declarations(name, live_decls, shadowed_decls)
+            if live_decls:
+                trie_node.declarations[name] = list(live_decls)
+            else:
+                del trie_node.declarations[name]
+            self.shadowed_decls.extend(shadowed_here)
 
-    def _add_star_import(self, module: str) -> None:
+    def _add_star_import(self, module: str, access_pos: CodeRange) -> None:
         module_path = self.resolve_import(module) if module else None
         if not module_path:
             logger.warning(
@@ -444,7 +471,7 @@ class SymbolVisitor(cst.CSTVisitor):
             )
             return
         star = Import(path=module_path, module=module, star=True)
-        self.import_edges.add((self.decl_stack[-1][-1], star))
+        self.import_edges.add((self.decl_stack[-1][-1], star, access_pos))
 
     def on_leave(self, original_node: cst.CSTNode) -> None:
         self.nearest_decls[original_node] = list(self.decl_stack[-1]) if self.decl_stack else []
@@ -482,7 +509,7 @@ class SymbolVisitor(cst.CSTVisitor):
 
         for access, referent in references:
             owner_symbols = self.nearest_decls.get(access.node, [])
-            unreachable_owner = self._unreachable_owner(access.node, parent_map)
+            access_pos = self._pos(access.node)
             target_node = referent.node
             if isinstance(referent, ImportAssignment):
                 target_node = referent.as_name
@@ -510,9 +537,7 @@ class SymbolVisitor(cst.CSTVisitor):
                     )
 
                     for owner_symbol in owner_symbols:
-                        self.import_edges.add((owner_symbol, resolved_import))
-                    if unreachable_owner is not None:
-                        self.unreachable_import_edges.add((unreachable_owner, resolved_import))
+                        self.import_edges.add((owner_symbol, resolved_import, access_pos))
 
             target_symbols = [
                 s for frame in self.node_to_frames.get(target_node, ()) for s in frame
@@ -532,11 +557,12 @@ class SymbolVisitor(cst.CSTVisitor):
             for target_symbol in target_symbols:
                 for owner_symbol in owner_symbols:
                     if target_symbol != owner_symbol and target_symbol and owner_symbol:
-                        self.internal_edges.add((owner_symbol, target_symbol))
-                if unreachable_owner is not None and target_symbol is not None:
-                    self.unreachable_internal_edges.add((unreachable_owner, target_symbol))
+                        self.internal_edges.add((owner_symbol, target_symbol, access_pos))
 
-        # Resolve __all__ string references to declarations in the current module
+        # Resolve __all__ string references to declarations in the current module.
+        # The owner's own position stands in as the access position -- the
+        # ``__all__`` literal is a single source location, not a per-name
+        # one, so the per-string subexpression isn't worth tracking.
         if self.dunder_all_refs:
             module_sym = self.node_to_frames[original_node][0][0]
             module_trie = self.trie._get(module_sym.fqname.split("."))
@@ -545,4 +571,45 @@ class SymbolVisitor(cst.CSTVisitor):
                     for name in names:
                         for target in module_trie.declarations.get(name, []):
                             if target != owner:
-                                self.internal_edges.add((owner, target))
+                                self.internal_edges.add((owner, target, owner.position))
+
+    def to_payload(self) -> VisitorPayload:
+        """Materialize visitor state into a serializable :class:`VisitorPayload`.
+
+        Decls in :attr:`shadowed_decls` are emitted as
+        :data:`NodeFlags.SHADOWED` flagged copies and any edge endpoint
+        pointing at them is remapped to the same flagged identity, so
+        the resulting graph nodes and edges line up. The per-edge
+        :class:`CodeRange` (the access position) is preserved as-is;
+        the apply step in :mod:`dead_cst._analyze` derives the
+        :data:`EdgeFlags.DEAD_BRANCH` flag from it by checking
+        containment against :attr:`dead_suites`.
+        """
+        flag_map: dict[SymbolNode, SymbolNode] = {
+            d: dataclasses.replace(d, flags=d.flags | NodeFlags.SHADOWED)
+            for d in self.shadowed_decls
+        }
+
+        def remap(sym: SymbolNode) -> SymbolNode:
+            return flag_map.get(sym, sym)
+
+        nodes: list[SymbolNode] = []
+        stack: list[SymbolTrie] = [self.trie]
+        while stack:
+            tnode = stack.pop()
+            if tnode.module is not None:
+                nodes.append(tnode.module)
+            for decls in tnode.declarations.values():
+                nodes.extend(decls)
+            stack.extend(tnode.children.values())
+        nodes.extend(remap(d) for d in self.shadowed_decls)
+
+        edges = tuple((remap(src), remap(dst), pos) for src, dst, pos in self.internal_edges)
+        imports = tuple((remap(src), dst, pos) for src, dst, pos in self.import_edges)
+
+        return VisitorPayload(
+            nodes=tuple(nodes),
+            edges=edges,
+            imports=imports,
+            dead_suites=tuple(self.dead_suites),
+        )

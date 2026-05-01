@@ -1,35 +1,33 @@
-"""End-to-end tests for synthetic ``unreachable`` graph nodes.
+"""End-to-end tests for ``EdgeFlags.DEAD_BRANCH`` on graph edges.
 
 When the visitor sees a statically-dead ``if`` / ``while`` suite (per
-:mod:`dead_cst._branches`) it creates a synthetic ``SymbolNode`` with
-``type="synthetic"`` and a fqname prefixed with ``<unreachable>:``.
-Every reference made from inside that suite gets a parallel edge
-``synthetic -> referent`` -- the original ``enclosing-decl -> referent``
-edge is left in place. The synthetic node is an orphan (no incoming
-edges) so reachability never visits it; the parallel edges are purely
-for surfacing.
+:mod:`dead_cst._branches`) it records the suite's position. The
+analyzer's apply step then flags every reference whose access position
+falls inside any recorded dead suite with
+:data:`dead_cst.EdgeFlags.DEAD_BRANCH` -- a single tagged edge per
+reference, no parallel synthetic source node.
 
-These tests exercise the integration end-to-end through
-``build_symbol_graph``: visitor creation of nodes, attribution of
-references inside dead suites, and behavior across nested suites and
-import references.
+By default :func:`find_reachable` does not filter on this flag, so
+dead-code references still propagate liveness through the enclosing
+decl. :func:`find_kept_alive_by_dead_branches` returns the strict
+diff: symbols that would become unreachable if every dead suite were
+severed.
 """
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import networkx as nx
 
-from dead_cst._branches import is_unreachable_node
+from dead_cst import find_kept_alive_by_dead_branches, find_reachable
 
 
-def _unreachable_nodes(graph: nx.DiGraph) -> list:
-    return sorted(
-        (n for n in graph.nodes if is_unreachable_node(n)),
-        key=lambda n: (str(n.path), n.position.start.line, n.position.start.column),
-    )
+def _dead_suite_positions(graph: nx.MultiDiGraph, file: Path) -> tuple:
+    return graph.graph.get("dead_suites", {}).get(file, ())
 
 
-def test_if_false_creates_synthetic_node(build_decl_graph):
+def test_if_false_records_dead_suite(build_decl_graph, tmp_path):
     graph = build_decl_graph(
         {
             "mod.py": """
@@ -39,20 +37,17 @@ def test_if_false_creates_synthetic_node(build_decl_graph):
             """
         }
     )
-    branches = _unreachable_nodes(graph)
-    assert len(branches) == 1
-    suite = branches[0]
-    assert suite.type == "synthetic"
-    # Fqname is opaque; identification goes through is_unreachable_node.
-    assert is_unreachable_node(suite)
+    suites = _dead_suite_positions(graph, tmp_path / "mod.py")
+    assert len(suites) == 1
+    pos = suites[0]
     # libcst positions an ``IndentedBlock`` at its first statement, not
     # at the ``if`` keyword. Pin both line and column to lock down the
     # convention surfacing relies on.
-    assert suite.position.start.line == 3
-    assert suite.position.start.column == 4
+    assert pos.start.line == 3
+    assert pos.start.column == 4
 
 
-def test_if_true_marks_else_as_unreachable(build_decl_graph):
+def test_if_true_marks_else_as_unreachable(build_decl_graph, tmp_path):
     graph = build_decl_graph(
         {
             "mod.py": """
@@ -64,10 +59,10 @@ def test_if_true_marks_else_as_unreachable(build_decl_graph):
             """
         }
     )
-    assert len(_unreachable_nodes(graph)) == 1
+    assert len(_dead_suite_positions(graph, tmp_path / "mod.py")) == 1
 
 
-def test_unknown_condition_creates_no_synthetic_node(build_decl_graph):
+def test_unknown_condition_records_no_dead_suite(build_decl_graph, tmp_path):
     graph = build_decl_graph(
         {
             "mod.py": """
@@ -79,10 +74,10 @@ def test_unknown_condition_creates_no_synthetic_node(build_decl_graph):
             """
         }
     )
-    assert _unreachable_nodes(graph) == []
+    assert _dead_suite_positions(graph, tmp_path / "mod.py") == ()
 
 
-def test_unreachable_node_has_edge_to_internal_referent(build_decl_graph, assert_unreachable_edges):
+def test_dead_branch_internal_ref_is_flagged(build_decl_graph, assert_dead_branch_edges):
     graph = build_decl_graph(
         {
             "mod.py": """
@@ -92,14 +87,14 @@ def test_unreachable_node_has_edge_to_internal_referent(build_decl_graph, assert
             """
         }
     )
-    # Position is the body's first statement.
-    assert_unreachable_edges(graph, {"<3:4> -> mod.helper"})
+    assert_dead_branch_edges(graph, {"mod -> mod.helper"})
 
 
-def test_unreachable_node_has_edge_to_import_referent(build_decl_graph, assert_unreachable_edges):
+def test_dead_branch_import_ref_is_flagged(build_decl_graph, assert_dead_branch_edges):
     # Reference to an imported name from inside a dead suite produces
     # the same edge fan-out as a reference from a live decl: the local
-    # import decl, the upstream module, and the resolved target.
+    # import decl, the upstream module, and the resolved target. All
+    # of them get the ``DEAD_BRANCH`` flag.
     graph = build_decl_graph(
         {
             "pkg/__init__.py": "",
@@ -111,20 +106,24 @@ def test_unreachable_node_has_edge_to_import_referent(build_decl_graph, assert_u
             """,
         }
     )
-    assert_unreachable_edges(
+    assert_dead_branch_edges(
         graph,
         {
-            "<3:4> -> pkg.b.helper",
-            "<3:4> -> pkg.a",
-            "<3:4> -> pkg.a.helper",
+            "pkg.b -> pkg.b.helper",
+            "pkg.b -> pkg.a",
+            "pkg.b -> pkg.a.helper",
         },
     )
 
 
-def test_original_edges_are_preserved_when_branch_is_dead(build_decl_graph, assert_edges):
-    # The "real symbol graph" still contains the enclosing-module ->
-    # helper edge. The unreachable-edge filtering in ``assert_edges``
-    # ensures this assertion is unaffected by the synthetic node.
+def test_default_find_reachable_traverses_dead_branch_edges(build_decl_graph):
+    """Default reachability still keeps ``helper`` alive via the dead-branch ref.
+
+    Today's behavior preservation: even when the only reference to
+    ``helper`` is ``if False: helper()``, ``find_reachable`` from the
+    module-as-entrypoint still reaches it. The edge is flagged but
+    not skipped.
+    """
     graph = build_decl_graph(
         {
             "mod.py": """
@@ -134,16 +133,33 @@ def test_original_edges_are_preserved_when_branch_is_dead(build_decl_graph, asse
             """
         }
     )
-    assert_edges(
-        graph,
+    # Mark the module as an entrypoint manually; the build_decl_graph
+    # fixture doesn't run plugins.
+    module = next(n for n in graph.nodes if n.fqname == "mod")
+    graph.nodes[module]["entrypoint"] = True
+    helper = next(n for n in graph.nodes if n.fqname == "mod.helper")
+    assert helper in find_reachable(graph)
+
+
+def test_find_kept_alive_by_dead_branches_returns_strict_diff(build_decl_graph):
+    """Strict pruning surfaces ``helper`` as kept-alive-only-by-dead-code."""
+    graph = build_decl_graph(
         {
-            "mod.helper -> mod",
-            "mod -> mod.helper",
-        },
+            "mod.py": """
+            def helper(): pass
+            if False:
+                helper()
+            """
+        }
     )
+    module = next(n for n in graph.nodes if n.fqname == "mod")
+    graph.nodes[module]["entrypoint"] = True
+    helper = next(n for n in graph.nodes if n.fqname == "mod.helper")
+    blast = find_kept_alive_by_dead_branches(graph)
+    assert helper in blast
 
 
-def test_nested_dead_suites_create_separate_synthetic_nodes(build_decl_graph):
+def test_nested_dead_suites_record_separate_positions(build_decl_graph, tmp_path):
     graph = build_decl_graph(
         {
             "mod.py": """
@@ -156,13 +172,13 @@ def test_nested_dead_suites_create_separate_synthetic_nodes(build_decl_graph):
             """
         }
     )
-    branches = _unreachable_nodes(graph)
-    assert len(branches) == 2
+    assert len(_dead_suite_positions(graph, tmp_path / "mod.py")) == 2
 
 
-def test_nested_dead_suite_attributes_to_innermost(build_decl_graph, assert_unreachable_edges):
-    # ``a()`` is inside the outer dead suite only; ``b()`` is inside
-    # both, but the innermost suite owns it.
+def test_nested_dead_suites_flag_both_refs(build_decl_graph, assert_dead_branch_edges):
+    # Both refs are inside at least one dead suite; both are flagged.
+    # The previous synthetic-node model attributed each ref to the
+    # innermost suite -- that fidelity intentionally goes away here.
     graph = build_decl_graph(
         {
             "mod.py": """
@@ -175,16 +191,10 @@ def test_nested_dead_suite_attributes_to_innermost(build_decl_graph, assert_unre
             """
         }
     )
-    assert_unreachable_edges(
-        graph,
-        {
-            "<4:4> -> mod.a",
-            "<6:8> -> mod.b",
-        },
-    )
+    assert_dead_branch_edges(graph, {"mod -> mod.a", "mod -> mod.b"})
 
 
-def test_while_false_creates_synthetic_node(build_decl_graph, assert_unreachable_edges):
+def test_while_false_flags_internal_ref(build_decl_graph, assert_dead_branch_edges):
     graph = build_decl_graph(
         {
             "mod.py": """
@@ -194,10 +204,10 @@ def test_while_false_creates_synthetic_node(build_decl_graph, assert_unreachable
             """
         }
     )
-    assert_unreachable_edges(graph, {"<3:4> -> mod.helper"})
+    assert_dead_branch_edges(graph, {"mod -> mod.helper"})
 
 
-def test_while_true_else_is_unreachable(build_decl_graph, assert_unreachable_edges):
+def test_while_true_else_flags_internal_ref(build_decl_graph, assert_dead_branch_edges):
     graph = build_decl_graph(
         {
             "mod.py": """
@@ -209,29 +219,14 @@ def test_while_true_else_is_unreachable(build_decl_graph, assert_unreachable_edg
             """
         }
     )
-    assert_unreachable_edges(graph, {"<5:4> -> mod.helper"})
-
-
-def test_synthetic_nodes_are_unreachable_from_entrypoints(build_decl_graph):
-    # No incoming edges, so reachability skips them. Critical so the
-    # parallel edges do not accidentally keep symbols alive.
-    graph = build_decl_graph(
-        {
-            "mod.py": """
-            def helper(): pass
-            if False:
-                helper()
-            """
-        }
-    )
-    suite = _unreachable_nodes(graph)[0]
-    assert graph.in_degree(suite) == 0
+    assert_dead_branch_edges(graph, {"mod -> mod.helper"})
 
 
 def test_decls_inside_dead_branch_remain_in_graph(build_decl_graph, assert_edges):
     # Per the design decision: top-level decls defined inside a dead
-    # branch keep their normal node + edges. The synthetic node coexists
-    # with them; pruning is a follow-up.
+    # branch keep their normal node + edges. The flagged-edge model
+    # only marks references made from dead code; the decl itself is
+    # not flagged.
     graph = build_decl_graph(
         {
             "mod.py": """
@@ -240,7 +235,7 @@ def test_decls_inside_dead_branch_remain_in_graph(build_decl_graph, assert_edges
             """
         }
     )
-    fqnames = {n.fqname for n in graph.nodes if not is_unreachable_node(n)}
+    fqnames = {n.fqname for n in graph.nodes}
     assert "mod.foo" in fqnames
     assert_edges(
         graph,
@@ -250,9 +245,7 @@ def test_decls_inside_dead_branch_remain_in_graph(build_decl_graph, assert_edges
     )
 
 
-def test_elif_false_in_chain_creates_synthetic_for_only_dead_branch(
-    build_decl_graph, assert_unreachable_edges
-):
+def test_elif_false_in_chain_flags_only_dead_branch(build_decl_graph, assert_dead_branch_edges):
     graph = build_decl_graph(
         {
             "mod.py": """
@@ -268,5 +261,5 @@ def test_elif_false_in_chain_creates_synthetic_for_only_dead_branch(
             """
         }
     )
-    # Only the ``elif False:`` body is unreachable.
-    assert_unreachable_edges(graph, {"<7:4> -> mod.b"})
+    # Only the ``elif False:`` body is dead, so only ``b`` is flagged.
+    assert_dead_branch_edges(graph, {"mod -> mod.b"})
