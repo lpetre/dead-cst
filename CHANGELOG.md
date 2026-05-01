@@ -9,6 +9,32 @@ two versions.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-05-01
+
+### Added
+- SQLite-backed `GraphCache` keyed by per-file SHA-256 hashes,
+  storing pickled `VisitorPayload` blobs under
+  `<root>/.dead-cst-cache/cache.db`. Cache hits skip the per-file
+  visitor pass (the dominant cost in `build_symbol_graph`); the
+  per-base `resolve_edges` step and plugin pass run unconditionally,
+  so a graph built from a warm cache is identical to one built from
+  scratch. The cache is keyed by a fingerprint over
+  `(__version__, python version, PathMap, resolver chain)`; a
+  fingerprint mismatch wipes `file_cache` and rebuilds. Plugins are
+  intentionally **not** part of the fingerprint -- swapping plugins
+  reuses cached payloads. New `--no-cache` flag on `analyze`,
+  `why-alive`, `unused-exports`, `dependencies`, and `remove`; new
+  `dead-cst cache clear` subcommand. `build_symbol_graph` accepts a
+  new `cache=` keyword.
+- `ManualResolver`: a `PathResolver` built from explicit
+  ``base:dep1,dep2`` specs. The CLI's ``-p`` flag now flows through
+  this resolver, so explicit specs sit in the same chain as named
+  resolvers and participate in `resolve_import` lookups too.
+- `NodeFlags.ENTRYPOINT`: a node flag that `_apply_payload` reads to
+  set `graph.nodes[node]["entrypoint"] = True`. Plugin observe passes
+  emit synthetic nodes flagged `ENTRYPOINT` to declare reachability
+  seeds without a separate API surface.
+
 ### Changed
 - `EdgePlugin` is now a two-pass protocol:
   - `observe(ctx) -> VisitorPayload | None` runs in the per-file
@@ -36,48 +62,10 @@ two versions.
     fingerprint includes each plugin's `(name, version)` pair, so
     bumping a plugin's version invalidates the file_cache (its
     observe contributions are baked into cached payloads).
-- `NodeFlags.ENTRYPOINT`: a node flag that `_apply_payload` reads to
-  set `graph.nodes[node]["entrypoint"] = True`. Plugin observe passes
-  emit synthetic nodes flagged `ENTRYPOINT` to declare reachability
-  seeds without a separate API surface.
 - Warm cache runs with the full builtin plugin set now parse **zero**
   files: the visitor and every plugin's observe contributions are
   baked into the cached payloads, and `finalize` runs purely off the
   graph. Pinned by `test_warm_run_with_plugins_parses_zero_files`.
-
-### Fixed
-- `MainBlockPlugin` now keeps decls bound inside the
-  `if __name__ == "__main__":` block alive, not just the containing
-  module. Previously a top-level decl introduced by an assignment in
-  the block (e.g. `app = Foo(fn=main).cli()`) had no incoming edge --
-  the visitor's value-frame produced `app -> Foo` / `app -> main`, but
-  nothing pointed at `app` itself -- so the chain was unreachable and
-  `Foo` / `main` were reported dead. The plugin now resolves the
-  block's `CodeRange` via `PositionProvider` and emits `synth -> decl`
-  edges for every top-level decl whose binding site falls inside the
-  block.
-
-### Added
-- SQLite-backed `GraphCache` keyed by per-file SHA-256 hashes,
-  storing pickled `VisitorPayload` blobs under
-  `<root>/.dead-cst-cache/cache.db`. Cache hits skip the per-file
-  visitor pass (the dominant cost in `build_symbol_graph`); the
-  per-base `resolve_edges` step and plugin pass run unconditionally,
-  so a graph built from a warm cache is identical to one built from
-  scratch. The cache is keyed by a fingerprint over
-  `(__version__, python version, PathMap, resolver chain)`; a
-  fingerprint mismatch wipes `file_cache` and rebuilds. Plugins are
-  intentionally **not** part of the fingerprint -- swapping plugins
-  reuses cached payloads. New `--no-cache` flag on `analyze`,
-  `why-alive`, `unused-exports`, `dependencies`, and `remove`; new
-  `dead-cst cache clear` subcommand. `build_symbol_graph` accepts a
-  new `cache=` keyword.
-- `ManualResolver`: a `PathResolver` built from explicit
-  ``base:dep1,dep2`` specs. The CLI's ``-p`` flag now flows through
-  this resolver, so explicit specs sit in the same chain as named
-  resolvers and participate in `resolve_import` lookups too.
-
-### Changed
 - `PathResolver` protocol now includes a `resolve_import(name, search_paths)`
   method, folding `name -> path` lookup into the resolver alongside
   search-path discovery. The shipped resolvers (`ManualResolver`,
@@ -99,6 +87,18 @@ two versions.
 ### Removed
 - `dead_cst.cli.parse_paths` -- callers should construct a
   `ManualResolver` and call `.resolve(root)`.
+
+### Fixed
+- `MainBlockPlugin` now keeps decls bound inside the
+  `if __name__ == "__main__":` block alive, not just the containing
+  module. Previously a top-level decl introduced by an assignment in
+  the block (e.g. `app = Foo(fn=main).cli()`) had no incoming edge --
+  the visitor's value-frame produced `app -> Foo` / `app -> main`, but
+  nothing pointed at `app` itself -- so the chain was unreachable and
+  `Foo` / `main` were reported dead. The plugin now resolves the
+  block's `CodeRange` via `PositionProvider` and emits `synth -> decl`
+  edges for every top-level decl whose binding site falls inside the
+  block.
 
 ## [0.1.0] - 2026-04-28
 
@@ -209,5 +209,6 @@ versions until the first stable release.
 - `README.md`, `CONTRIBUTING.md`, `CHANGELOG.md`, and `ROADMAP.md` with a
   stack-ranked plan from alpha to 1.0.
 
-[Unreleased]: https://github.com/lpetre/dead-cst/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/lpetre/dead-cst/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/lpetre/dead-cst/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/lpetre/dead-cst/releases/tag/v0.1.0
