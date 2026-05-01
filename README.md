@@ -60,6 +60,7 @@ dead-cst analyze ROOT -e ENTRYPOINT [OPTIONS]
 | `--plugin` | Edge plugin to run, e.g. `main_block`, `project_scripts` (repeatable) |
 | `--format` | Output format: `text` or `json` |
 | `-v, --verbose` | Enable verbose logging |
+| `--no-cache` | Bypass the per-file `VisitorPayload` cache |
 
 Exit code 1 if dead code is found, 0 otherwise.
 
@@ -71,13 +72,30 @@ Show why a symbol is considered alive by printing its predecessor chain.
 dead-cst why-alive ROOT FQNAME [OPTIONS]
 ```
 
+| Option | Description |
+|---|---|
+| `-p, --path` | Search path spec: `base:dep1,dep2` or `base` (repeatable) |
+| `--resolver` | Path resolver to run, e.g. `venv`, `pyproject` (repeatable) |
+| `--plugin` | Edge plugin to run, e.g. `main_block`, `project_scripts` (repeatable) |
+| `-v, --verbose` | Enable verbose logging |
+| `--no-cache` | Bypass the per-file `VisitorPayload` cache |
+
 ### `dead-cst unused-exports`
 
-Report `__all__` entries whose targets would be dead without `__all__`. Useful in closed-world / monorepo settings to prune the public surface.
+Report `__all__` entries whose targets are only alive because of `__all__`. Useful in closed-world / monorepo settings to prune the public surface.
 
 ```
 dead-cst unused-exports ROOT -e ENTRYPOINT [OPTIONS]
 ```
+
+| Option | Description |
+|---|---|
+| `-e, --entrypoint` | Entrypoint: file path, FQN, or `re:pattern` for regex (repeatable) |
+| `-p, --path` | Search path spec: `base:dep1,dep2` or `base` (repeatable) |
+| `--resolver` | Path resolver to run, e.g. `venv`, `pyproject` (repeatable) |
+| `--plugin` | Edge plugin to run, e.g. `main_block`, `project_scripts` (repeatable) |
+| `-v, --verbose` | Enable verbose logging |
+| `--no-cache` | Bypass the per-file `VisitorPayload` cache |
 
 ### `dead-cst dependencies`
 
@@ -96,6 +114,7 @@ dead-cst dependencies ROOT [OPTIONS]
 | `--resolver` | Path resolver to run, e.g. `venv`, `pyproject` (repeatable) |
 | `--format` | Output format: `text` or `json` |
 | `-v, --verbose` | Enable verbose logging |
+| `--no-cache` | Bypass the per-file `VisitorPayload` cache |
 
 ### `dead-cst remove`
 
@@ -107,7 +126,23 @@ dead-cst remove ROOT -e ENTRYPOINT [OPTIONS]
 
 | Option | Description |
 |---|---|
+| `-e, --entrypoint` | Entrypoint: file path, FQN, or `re:pattern` for regex (repeatable) |
+| `-p, --path` | Search path spec: `base:dep1,dep2` or `base` (repeatable) |
+| `--resolver` | Path resolver to run, e.g. `venv`, `pyproject` (repeatable) |
+| `--plugin` | Edge plugin to run, e.g. `main_block`, `project_scripts` (repeatable) |
+| `-v, --verbose` | Enable verbose logging |
 | `--dry-run` | Show what would be removed without making changes |
+| `--no-cache` | Bypass the per-file `VisitorPayload` cache |
+
+### `dead-cst cache clear`
+
+Delete the on-disk `VisitorPayload` cache (`<root>/.dead-cst-cache/`) for a project. The cache is keyed by a fingerprint over the `PathMap`, resolver chain, and plugin set, so most layout changes invalidate it automatically; this command is for force-clearing when needed.
+
+```
+dead-cst cache clear [ROOT]
+```
+
+`ROOT` defaults to the current directory.
 
 ## Python API
 
