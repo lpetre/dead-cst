@@ -21,7 +21,6 @@ import pytest
 from libcst.metadata import CodePosition, CodeRange
 from typer.testing import CliRunner
 
-from dead_cst._branches import UNREACHABLE_PREFIX
 from dead_cst._plugins import (
     ExplicitEntrypointPlugin,
     MainBlockPlugin,
@@ -32,9 +31,9 @@ from dead_cst._plugins.explicit import EXPLICIT_PREFIX
 from dead_cst._symbols import SymbolNode
 from dead_cst._resolvers import ManualResolver
 from dead_cst.cli import (
+    _dead_real,
     _is_dunder_all,
     _is_external_dep,
-    _partition_unreachable,
     _rel_path,
     app,
     build_plugins,
@@ -259,26 +258,26 @@ def test_rel_path_equal_to_root_yields_empty(tmp_path):
     assert _rel_path(tmp_path, tmp_path) == Path(".")
 
 
-def test_partition_unreachable_splits_synthetic_branches_from_real():
+def test_dead_real_filters_synthetic_nodes():
+    """Synthetic nodes (entrypoint sentinels, external markers) are
+    excluded from the dead-symbol report so we don't surface them
+    alongside user-visible declarations."""
     import networkx as nx
 
     real = SymbolNode("pkg.f", "function", Path("/a.py"), _pos())
-    branch = SymbolNode(f"{UNREACHABLE_PREFIX}pkg.a:5:0", "synthetic", Path("/a.py"), _pos())
     entrypoint_synth = SymbolNode(f"{EXPLICIT_PREFIX}pkg.f", "synthetic", Path("/a.py"), _pos())
 
-    g = nx.DiGraph()
-    for n in (real, branch, entrypoint_synth):
+    g = nx.MultiDiGraph()
+    for n in (real, entrypoint_synth):
         g.add_node(n)
 
-    dead_real, branches = _partition_unreachable(g)
-    assert dead_real == [real, entrypoint_synth]
-    assert branches == [branch]
+    assert _dead_real(g) == [real]
 
 
-def test_partition_unreachable_empty_graph_returns_empty_lists():
+def test_dead_real_empty_graph_returns_empty_list():
     import networkx as nx
 
-    assert _partition_unreachable(nx.DiGraph()) == ([], [])
+    assert _dead_real(nx.MultiDiGraph()) == []
 
 
 # ---------------------------------------------------------------------------

@@ -325,5 +325,5 @@ def test_third_party_import_creates_synthetic_node(build_decl_graph):
         f"{[n.fqname for n in graph.nodes if n.type == 'synthetic']}"
     )
 
-    edge_srcs = {src.fqname for src, dst in graph.edges if dst in nx_nodes}
+    edge_srcs = {src.fqname for src, dst in graph.edges(keys=False) if dst in nx_nodes}
     assert {"p.uses_nx.nx", "p.uses_nx.build"} <= edge_srcs

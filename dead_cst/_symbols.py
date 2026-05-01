@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import enum
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -9,6 +10,34 @@ import networkx as nx
 from libcst.metadata import CodeRange
 
 logger = logging.getLogger(__name__)
+
+
+class NodeFlags(enum.IntFlag):
+    """Analyzer-internal marker on :class:`SymbolNode`.
+
+    ``SHADOWED`` decls are emitted into the graph (with their parent
+    module edge) but are excluded from the lookup trie, so cross-module
+    imports never resolve to them.
+    """
+
+    NONE = 0
+    SHADOWED = enum.auto()
+
+
+class EdgeFlags(enum.IntFlag):
+    """Analyzer-internal marker on graph edges.
+
+    ``DEAD_BRANCH`` flags an edge whose reference originated inside a
+    statically-dead suite (per :func:`dead_cst._branches.unreachable_suites`).
+    Default :func:`dead_cst.find_reachable` does **not** filter by this
+    flag -- today's behavior, where dead-code references propagate
+    liveness through the enclosing decl, is preserved. The opt-in
+    :func:`dead_cst.find_kept_alive_by_dead_branches` returns the
+    "blast radius" of removing every dead suite by skipping these edges.
+    """
+
+    NONE = 0
+    DEAD_BRANCH = enum.auto()
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,6 +55,7 @@ class SymbolNode:
     path: Path
     position: CodeRange
     imports: Import | None = None
+    flags: NodeFlags = NodeFlags.NONE
 
 
 @dataclass(slots=True)
@@ -45,24 +75,19 @@ class SymbolTrie:
     # set of decls live at module exit: usually one decl, but multiple when
     # every branch of a conditional binds the same name (``if X: def f...
     # else: def f...``). All branches are legitimate runtime values and a
-    # ``from mod import name`` should reach each of them.
+    # ``from mod import name`` should reach each of them. Decls displaced
+    # before module exit are tagged with ``NodeFlags.SHADOWED`` and tracked
+    # outside the trie -- the trie only stores entries that should be
+    # reachable from cross-module imports.
     declarations: dict[str, list[SymbolNode]] = field(default_factory=dict)
-
-    # Decls strictly displaced by a later same-name decl on every path to
-    # module exit. They still belong to this module -- the symbol graph
-    # needs them so the ``decl -> module`` parent edge is emitted for
-    # shadowed decls too -- but they are not exported.
-    shadowed: list[SymbolNode] = field(default_factory=list)
 
     def add_declaration(self, decl: SymbolNode) -> None:
         """Add a declaration to the trie.
 
-        For non-module decls this just collects: the trie does not yet
-        know which decls are live at module exit. ``finalize_declarations``
-        partitions same-name decls into ``declarations`` (live exports)
-        and ``shadowed`` (strictly displaced). De-duplicates so the
-        visitor's double-push for ``Assign`` (one push for the LHS name,
-        one for the RHS value) does not register the same decl twice.
+        Decls flagged ``SHADOWED`` should never reach this method; the
+        visitor flags them and routes them around the trie. De-duplicates
+        so the visitor's double-push for ``Assign`` (one push for the LHS
+        name, one for the RHS value) does not register the same decl twice.
         """
         parts = decl.fqname.split(".")
         match decl.type:
@@ -80,24 +105,27 @@ class SymbolTrie:
                 if decl not in bucket:
                     bucket.append(decl)
 
-    def finalize_declarations(
-        self,
-        name: str,
-        live: list[SymbolNode],
-        shadowed: list[SymbolNode],
-    ) -> None:
-        """Partition collected decls for ``name`` into live vs shadowed.
+    def remove_declaration(self, decl: SymbolNode) -> None:
+        """Remove a single declaration entry by identity / equality.
 
-        ``live`` is the set of decls that bind ``name`` on at least one
-        path to module exit. ``shadowed`` is the rest. The caller is
-        expected to derive both from a flow-sensitive walk of the
-        module body (see :func:`dead_cst._flow.live_at_exit`).
+        Used by the visitor when flow analysis determines a previously
+        added decl is shadowed: the SHADOWED-flagged copy stays out of
+        the trie, and any unflagged version that reached the trie via
+        ``add_declaration`` is dropped here.
         """
-        if live:
-            self.declarations[name] = list(live)
-        else:
-            self.declarations.pop(name, None)
-        self.shadowed.extend(shadowed)
+        parts = decl.fqname.split(".")
+        node = self._get(parts[:-1])
+        if node is None:
+            return
+        bucket = node.declarations.get(parts[-1])
+        if bucket is None:
+            return
+        try:
+            bucket.remove(decl)
+        except ValueError:
+            return
+        if not bucket:
+            del node.declarations[parts[-1]]
 
     def merge(self, other: SymbolTrie) -> SymbolTrie:
         """Merge another SymbolTrie into this one.
@@ -127,7 +155,6 @@ class SymbolTrie:
             return self
         self.module = other.module
         self.declarations = {k: list(v) for k, v in other.declarations.items()}
-        self.shadowed = list(other.shadowed)
         return self
 
     def _touch(self, parts: list[str]) -> SymbolTrie:

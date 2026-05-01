@@ -12,9 +12,9 @@ from typing import Annotated
 
 import networkx as nx
 import typer
+from libcst.metadata import CodeRange
 
 from . import build_symbol_graph, count_nodes, find_reachable, order_paths, remove_code
-from ._branches import is_unreachable_node
 from ._plugins import (
     EdgePlugin,
     ExplicitEntrypointPlugin,
@@ -179,8 +179,8 @@ def analyze(
 
 
 def _output_text(
-    graph: nx.DiGraph,
-    unreachable: nx.DiGraph,
+    graph: nx.MultiDiGraph,
+    unreachable: nx.MultiDiGraph,
     root: Path,
     paths_dict: PathMap,
 ) -> None:
@@ -189,10 +189,10 @@ def _output_text(
         total_counts = count_nodes(graph, base)
         unreachable_counts = count_nodes(unreachable, base)
         for kind in sorted(total_counts):
-            # Synthetic nodes (entrypoint sentinels, dead-suite markers)
-            # don't represent user-visible declarations; reporting them
-            # as "dead" alongside functions/classes would be misleading.
-            # Dead-suite nodes get their own section below.
+            # Synthetic nodes (entrypoint sentinels, external-dist markers,
+            # dunder-all stand-ins) don't represent user-visible
+            # declarations; reporting them alongside functions/classes
+            # would be misleading.
             if kind == "synthetic":
                 continue
             total = total_counts[kind]
@@ -202,39 +202,56 @@ def _output_text(
             else:
                 typer.echo(f"  {kind}: {total} total")
 
-    dead_real, branches = _partition_unreachable(unreachable)
+    dead_real = _dead_real(unreachable)
     if dead_real:
         typer.echo(f"\nDead symbols ({len(dead_real)}):")
         for node in sorted(dead_real, key=lambda n: (str(n.path), n.fqname)):
             typer.echo(f"  {node.fqname} ({node.type}) at {_rel_path(node.path, root)}")
 
+    branches = _dead_suite_locations(graph, paths_dict)
     if branches:
         typer.echo(f"\nUnreachable branches ({len(branches)}):")
-        for node in sorted(branches, key=lambda n: (str(n.path), n.position.start)):
-            rel = _rel_path(node.path, root)
-            start = node.position.start
-            end = node.position.end
+        for path, pos in branches:
+            rel = _rel_path(path, root)
+            start = pos.start
+            end = pos.end
             typer.echo(f"  {rel}:{start.line}:{start.column}-{end.line}:{end.column}")
 
 
-def _partition_unreachable(
-    unreachable: nx.DiGraph,
-) -> tuple[list[SymbolNode], list[SymbolNode]]:
-    """Split ``unreachable.nodes`` into ``(dead_real, branches)`` in one pass.
+def _dead_real(unreachable: nx.MultiDiGraph) -> list[SymbolNode]:
+    """Return real (non-synthetic) dead nodes from ``unreachable``.
 
-    Synthetic dead-suite nodes are orphan sources -- never visited by
-    reachability -- so they always land in ``unreachable``.
+    Synthetic nodes -- entrypoint sentinels, external-dist markers,
+    dunder-all stand-ins -- are excluded; they don't represent
+    user-visible declarations and would confuse the dead-code report.
     """
-    dead_real: list[SymbolNode] = []
-    branches: list[SymbolNode] = []
-    for n in unreachable.nodes:
-        (branches if is_unreachable_node(n) else dead_real).append(n)
-    return dead_real, branches
+    return [n for n in unreachable.nodes if n.type != "synthetic"]
+
+
+def _dead_suite_locations(
+    graph: nx.MultiDiGraph, paths_dict: PathMap
+) -> list[tuple[Path, CodeRange]]:
+    """Flatten ``graph.graph["dead_suites"]`` into a sorted ``(path, pos)`` list.
+
+    Restricted to files under one of the analyzed bases so the report
+    doesn't surface dead suites in workspace dependencies that the
+    user isn't asking about.
+    """
+    bases = list(paths_dict)
+    raw: dict = graph.graph.get("dead_suites", {})
+    out: list[tuple[Path, CodeRange]] = []
+    for path, suites in raw.items():
+        if not any(path.is_relative_to(b) for b in bases):
+            continue
+        for pos in suites:
+            out.append((path, pos))
+    out.sort(key=lambda entry: (str(entry[0]), entry[1].start.line, entry[1].start.column))
+    return out
 
 
 def _output_json(
-    graph: nx.DiGraph,
-    unreachable: nx.DiGraph,
+    graph: nx.MultiDiGraph,
+    unreachable: nx.MultiDiGraph,
     root: Path,
     paths_dict: PathMap,
 ) -> None:
@@ -257,8 +274,7 @@ def _output_json(
             if kind != "synthetic"
         }
 
-    dead_real, branches = _partition_unreachable(unreachable)
-    for node in sorted(dead_real, key=lambda n: (str(n.path), n.fqname)):
+    for node in sorted(_dead_real(unreachable), key=lambda n: (str(n.path), n.fqname)):
         result["dead_symbols"].append(
             {
                 "fqname": node.fqname,
@@ -267,12 +283,12 @@ def _output_json(
             }
         )
 
-    for node in sorted(branches, key=lambda n: (str(n.path), n.position.start)):
+    for path, pos in _dead_suite_locations(graph, paths_dict):
         result["unreachable_branches"].append(
             {
-                "path": str(_rel_path(node.path, root)),
-                "start": {"line": node.position.start.line, "column": node.position.start.column},
-                "end": {"line": node.position.end.line, "column": node.position.end.column},
+                "path": str(_rel_path(path, root)),
+                "start": {"line": pos.start.line, "column": pos.start.column},
+                "end": {"line": pos.end.line, "column": pos.end.column},
             }
         )
 
@@ -444,8 +460,8 @@ def unused_exports(
     pruned = graph.copy()
     pruned.remove_edges_from(
         [
-            (s, d)
-            for s, d in graph.edges
+            (s, d, k)
+            for s, d, k in graph.edges(keys=True)
             if _is_dunder_all(d) and s.type == "synthetic" and s.fqname.startswith(DUNDER_PREFIX)
         ]
     )
@@ -516,11 +532,11 @@ def remove(
 
     unreachable_graph = graph.subgraph([n for n in graph.nodes if n not in reachable])
 
-    # Synthetic ``unreachable`` nodes are reported by ``analyze`` but
-    # not yet removable by ``remove`` -- the codemod doesn't know how to
-    # delete an arbitrary suite. Filter them out of the listing so we
-    # don't promise something we don't deliver.
-    removable = [n for n in unreachable_graph.nodes if not is_unreachable_node(n)]
+    # Synthetic nodes (entrypoint sentinels, external-dist markers,
+    # dunder-all stand-ins) aren't user-visible declarations. The
+    # codemod can't delete them, so they're filtered out of the
+    # remove listing.
+    removable = [n for n in unreachable_graph.nodes if n.type != "synthetic"]
 
     if not removable:
         typer.echo("No dead code found.")

@@ -6,7 +6,7 @@ from typing import Sequence
 
 import libcst as cst
 import networkx as nx
-from libcst.metadata import FullRepoManager
+from libcst.metadata import CodeRange, FullRepoManager
 
 from ._edges import resolve_edges
 from ._fqn import FixedFullyQualifiedNameProvider
@@ -23,8 +23,8 @@ from ._resolvers import (
     exported_roots,
 )
 from ._resolvers._imports import safe_resolve_module, temp_sys_path
-from ._symbols import SymbolNode, SymbolTrie
-from ._visitor import SymbolVisitor
+from ._symbols import EdgeFlags, Import, NodeFlags, SymbolNode, SymbolTrie
+from ._visitor import SymbolVisitor, VisitorPayload
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +78,7 @@ def build_symbol_graph(
     plugins: Sequence[EdgePlugin] = (),
     resolvers: Sequence[PathResolver] = (),
     project_root: Path | None = None,
-) -> nx.DiGraph:
+) -> nx.MultiDiGraph:
     """Build a directed reachability graph of every top-level symbol under ``paths``.
 
     Each ``.py`` file under each base in ``paths`` is parsed with LibCST;
@@ -87,11 +87,15 @@ def build_symbol_graph(
     relationships:
 
     * a reference points at its referent,
-    * a declaration points at its containing module,
-    * a submodule points at its parent package, and
-    * synthetic ``unreachable`` nodes own edges into symbols referenced from
-      statically-dead suites (``if False:``, ``raise``-only branches, ...) so
-      those references don't keep the targets alive.
+    * a declaration points at its containing module, and
+    * a submodule points at its parent package.
+
+    References made from inside a statically-dead suite are still emitted
+    but tagged with :data:`EdgeFlags.DEAD_BRANCH`. Default
+    :func:`find_reachable` does not filter on the flag, so those refs
+    still propagate liveness through the enclosing decl. The opt-in
+    :func:`find_kept_alive_by_dead_branches` returns the set of symbols
+    that would become unreachable if every dead suite were removed.
 
     Third-party imports are surfaced as synthetic ``[external dist] <name>``
     / ``[external file] <name>`` nodes so callers can audit the
@@ -126,11 +130,16 @@ def build_symbol_graph(
 
     Returns
     -------
-    networkx.DiGraph
-        Nodes are :class:`SymbolNode` instances; entrypoint seeds carry
-        ``graph.nodes[node]["entrypoint"] = True``.
+    networkx.MultiDiGraph
+        Nodes are :class:`SymbolNode` instances. Edges carry a ``flags``
+        attribute (:class:`EdgeFlags`); ``DEAD_BRANCH``-flagged edges
+        originated inside a statically-dead suite. Entrypoint seeds
+        carry ``graph.nodes[node]["entrypoint"] = True``. Per-file
+        dead-suite positions are exposed via ``graph.graph["dead_suites"]``,
+        a ``{path: tuple[CodeRange]}`` mapping.
     """
-    symbol_graph = nx.DiGraph()
+    symbol_graph = nx.MultiDiGraph()
+    symbol_graph.graph["dead_suites"] = {}
     base_tries: dict[Path, SymbolTrie] = {}
     export_tries: dict[Path, SymbolTrie] = {}
     root = project_root or _infer_project_root(paths) if paths else Path.cwd()
@@ -143,7 +152,7 @@ def build_symbol_graph(
             base_tries[base] = current_trie = SymbolTrie()
             export_trie = SymbolTrie()
             export_roots = exported_roots(base)
-            import_edges = set()
+            import_edges: set[tuple[SymbolNode, Import, EdgeFlags]] = set()
             files = list(sorted(base.rglob("*.py")))
             mgr = FullRepoManager(
                 str(base), [str(f) for f in files], {FixedFullyQualifiedNameProvider}
@@ -157,6 +166,7 @@ def build_symbol_graph(
                     base_modules[file] = wrapper.module
                 visitor = SymbolVisitor(file, search_paths, import_resolver)
                 wrapper.visit(visitor)
+                payload = visitor.to_payload()
                 # A file's decls go into ``export_trie`` only when the file
                 # lives under one of ``base``'s exported dirs (or when the
                 # base has no export restriction). This is what hides
@@ -165,45 +175,14 @@ def build_symbol_graph(
                 # land in ``current_trie`` and the graph), but consumers'
                 # lookup tries never see them.
                 file_exported = export_roots is None or _under_any(file, export_roots)
-                curr = [visitor.trie]
-                while curr:
-                    node = curr.pop()
-                    if node.module is not None:
-                        symbol_graph.add_node(node.module)
-                        current_trie.add_declaration(node.module)
-                        if file_exported:
-                            export_trie.add_declaration(node.module)
-                    for decls in node.declarations.values():
-                        for decl in decls:
-                            symbol_graph.add_node(decl)
-                            symbol_graph.add_edge(decl, node.module)
-                            current_trie.add_declaration(decl)
-                            if file_exported:
-                                export_trie.add_declaration(decl)
-                    # Shadowed decls still belong to this module: emit them
-                    # so the graph stays well-formed (every decl has a
-                    # parent-module edge). They aren't re-added to
-                    # ``current_trie`` -- only live-at-exit decls should
-                    # win project-wide lookups.
-                    for decl in node.shadowed:
-                        symbol_graph.add_node(decl)
-                        symbol_graph.add_edge(decl, node.module)
-                    curr.extend(node.children.values())
-
-                for src, dst in visitor.internal_edges:
-                    symbol_graph.add_edge(src, dst)
-
-                # Synthetic ``unreachable`` nodes for statically-dead suites.
-                # They live in the graph as orphan sources -- nothing points
-                # at them, so reachability never visits them, but the edges
-                # they own surface which symbols are referenced from inside
-                # dead branches. Existing top-level decl edges are unchanged.
-                for unreachable in visitor.unreachable_nodes:
-                    symbol_graph.add_node(unreachable)
-                for src, dst in visitor.unreachable_internal_edges:
-                    symbol_graph.add_edge(src, dst)
-
-                import_edges |= visitor.import_edges | visitor.unreachable_import_edges
+                _apply_payload(
+                    payload,
+                    current_trie=current_trie,
+                    export_trie=export_trie,
+                    file_exported=file_exported,
+                    symbol_graph=symbol_graph,
+                    import_edges=import_edges,
+                )
 
             current_trie.add_module_hierarchy_edges(symbol_graph)
             export_tries[base] = export_trie
@@ -218,8 +197,8 @@ def build_symbol_graph(
             for dep in paths.get(base, []):
                 symbol_lookup.merge(export_tries.get(dep, base_tries[dep]))
 
-            for src, dst in resolve_edges(import_edges, symbol_lookup, base):
-                symbol_graph.add_edge(src, dst)
+            for src, dst, flags in resolve_edges(import_edges, symbol_lookup, base):
+                symbol_graph.add_edge(src, dst, flags=flags)
 
             # Plugin pass for this base, with the symbol lookup that was
             # valid at this base's resolution time and the parsed modules
@@ -248,6 +227,81 @@ def build_symbol_graph(
     return symbol_graph
 
 
+def _contains(suite: CodeRange, access: CodeRange) -> bool:
+    """``True`` iff ``access`` is fully nested inside ``suite``.
+
+    Compares ``(line, column)`` lexicographically at both ends. Suites
+    are line-aligned in practice (libcst positions an ``IndentedBlock``
+    at its first statement) so the line check usually decides; the
+    column tiebreak handles one-line ``if False: x = 1`` suites.
+    """
+    s_start = (suite.start.line, suite.start.column)
+    s_end = (suite.end.line, suite.end.column)
+    a_start = (access.start.line, access.start.column)
+    a_end = (access.end.line, access.end.column)
+    return s_start <= a_start and a_end <= s_end
+
+
+def _apply_payload(
+    payload: VisitorPayload,
+    *,
+    current_trie: SymbolTrie,
+    export_trie: SymbolTrie,
+    file_exported: bool,
+    symbol_graph: nx.MultiDiGraph,
+    import_edges: set[tuple[SymbolNode, Import, EdgeFlags]],
+) -> None:
+    """Emit ``payload`` into the in-progress per-base structures.
+
+    Drives all node routing off ``SymbolNode.flags`` and ``type``:
+
+    * ``type == "module"`` goes into the graph and the trie; no parent
+      edge (modules are themselves the parent target).
+    * Other decls go into the graph with a parent-module edge.
+      ``NodeFlags.SHADOWED`` excludes them from the trie -- the graph
+      keeps the parent edge so the decl stays well-formed, but
+      cross-module imports never resolve to it.
+
+    Edge flag derivation: each ``(src, dst, access_pos)`` entry has
+    its access position tested against ``payload.dead_suites`` for
+    containment. If matched, the resulting graph edge gets
+    :data:`EdgeFlags.DEAD_BRANCH`. Unresolved cross-file imports
+    accumulate into ``import_edges`` along with the derived flag and
+    are fed to :func:`resolve_edges` once the per-base trie is fully
+    built; resolution preserves the flag through every emission.
+
+    Per-file dead-suite positions are stashed on the graph as
+    ``graph.graph["dead_suites"][module.path]`` for downstream
+    reporting (e.g. "this file has unreachable code at line X").
+    """
+    module = next(n for n in payload.nodes if n.type == "module")
+
+    def flag_for(pos: CodeRange) -> EdgeFlags:
+        return (
+            EdgeFlags.DEAD_BRANCH
+            if any(_contains(s, pos) for s in payload.dead_suites)
+            else EdgeFlags.NONE
+        )
+
+    for n in payload.nodes:
+        symbol_graph.add_node(n)
+        if n.type != "module":
+            symbol_graph.add_edge(n, module, flags=EdgeFlags.NONE)
+        if not (n.flags & NodeFlags.SHADOWED):
+            current_trie.add_declaration(n)
+            if file_exported:
+                export_trie.add_declaration(n)
+
+    for src, dst, pos in payload.edges:
+        symbol_graph.add_edge(src, dst, flags=flag_for(pos))
+
+    for src, imp, pos in payload.imports:
+        import_edges.add((src, imp, flag_for(pos)))
+
+    if payload.dead_suites:
+        symbol_graph.graph["dead_suites"][module.path] = payload.dead_suites
+
+
 def _under_any(file: Path, roots: list[Path]) -> bool:
     """True iff ``file`` is equal to or nested under any of ``roots``."""
     f = file.resolve()
@@ -264,13 +318,18 @@ def _infer_project_root(paths: PathMap) -> Path:
     return min(bases, key=lambda p: len(p.parts))
 
 
-def find_reachable(graph: nx.DiGraph) -> set[SymbolNode]:
+def find_reachable(graph: nx.MultiDiGraph) -> set[SymbolNode]:
     """BFS forward from every node tagged as an entrypoint by a plugin.
 
     Plugins mark seeds by setting ``graph.nodes[node]["entrypoint"] = True``
     (see :func:`dead_cst._plugins.apply_ops`). There is no longer any
     built-in matching against file paths or FQNs -- that lives in
     :class:`ExplicitEntrypointPlugin`.
+
+    Edges flagged with :data:`EdgeFlags.DEAD_BRANCH` are NOT filtered
+    here -- today's behavior, where dead-code references propagate
+    liveness through the enclosing decl, is preserved. See
+    :func:`find_kept_alive_by_dead_branches` for the strict alternative.
     """
     visited: set[SymbolNode] = set()
     stack = [n for n, attrs in graph.nodes(data=True) if attrs.get("entrypoint")]
@@ -283,7 +342,40 @@ def find_reachable(graph: nx.DiGraph) -> set[SymbolNode]:
     return visited
 
 
-def count_nodes(graph: nx.DiGraph, prefix: Path | None) -> dict[str, int]:
+def _find_reachable_strict(graph: nx.MultiDiGraph) -> set[SymbolNode]:
+    """Like :func:`find_reachable` but skips ``DEAD_BRANCH``-flagged edges."""
+    visited: set[SymbolNode] = set()
+    stack = [n for n, attrs in graph.nodes(data=True) if attrs.get("entrypoint")]
+    while stack:
+        node = stack.pop()
+        if node in visited:
+            continue
+        visited.add(node)
+        for _, succ, attrs in graph.out_edges(node, data=True):
+            if attrs.get("flags", EdgeFlags.NONE) & EdgeFlags.DEAD_BRANCH:
+                continue
+            stack.append(succ)
+    return visited
+
+
+def find_kept_alive_by_dead_branches(graph: nx.MultiDiGraph) -> set[SymbolNode]:
+    """Return symbols that would become unreachable if every dead suite were removed.
+
+    Computed as ``find_reachable(graph) -`` strict-mode BFS that skips
+    every edge flagged :data:`EdgeFlags.DEAD_BRANCH`. The resulting set
+    is the "blast radius" of removing every statically-dead suite in
+    the analyzed source -- symbols currently kept alive only through a
+    chain that crosses at least one dead-branch reference.
+
+    Used by tooling that reports "if you removed your unreachable
+    code, these additional symbols would also become dead." Default
+    :func:`find_reachable` is unchanged; this is an opt-in stricter
+    pass.
+    """
+    return find_reachable(graph) - _find_reachable_strict(graph)
+
+
+def count_nodes(graph: nx.MultiDiGraph, prefix: Path | None) -> dict[str, int]:
     """Count nodes in ``graph`` by ``SymbolNode.type``, optionally restricted by path.
 
     If ``prefix`` is given, only nodes whose ``path`` is under ``prefix`` are

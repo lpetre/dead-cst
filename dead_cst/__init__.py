@@ -7,8 +7,10 @@ entrypoints.
 The public API has three layers:
 
 * :func:`build_symbol_graph` parses every ``.py`` file under each base in a
-  ``{base: [dep_paths]}`` map and returns a :class:`networkx.DiGraph` of
-  :class:`SymbolNode` instances. Edges encode "keeps alive" relationships.
+  ``{base: [dep_paths]}`` map and returns a :class:`networkx.MultiDiGraph` of
+  :class:`SymbolNode` instances. Edges encode "keeps alive" relationships
+  and carry a :class:`EdgeFlags` ``flags`` attribute. References from
+  inside statically-dead suites are flagged ``DEAD_BRANCH``.
 * Edge plugins (:class:`MainBlockPlugin`, :class:`ProjectScriptsPlugin`,
   :class:`ExplicitEntrypointPlugin`, :class:`ModuleDundersPlugin`,
   :class:`PytestPlugin`, :class:`UnittestPlugin`, :class:`FastAPIPlugin`,
@@ -29,8 +31,15 @@ See the README for the CLI, the entrypoint and search-path specs, and the
 limitations of static analysis.
 """
 
-from ._analyze import build_symbol_graph, count_nodes, find_reachable, order_paths
+from ._analyze import (
+    build_symbol_graph,
+    count_nodes,
+    find_kept_alive_by_dead_branches,
+    find_reachable,
+    order_paths,
+)
 from ._codemod import remove_code
+from ._symbols import EdgeFlags, NodeFlags
 from ._plugins import (
     AddEdge,
     AddNode,
@@ -71,6 +80,7 @@ __all__ = [
     "BUILTIN_PLUGINS",
     "BUILTIN_RESOLVERS",
     "ClickPlugin",
+    "EdgeFlags",
     "EdgePlugin",
     "ExplicitEntrypointPlugin",
     "FastAPIPlugin",
@@ -80,6 +90,7 @@ __all__ = [
     "MainBlockPlugin",
     "ManualResolver",
     "ModuleDundersPlugin",
+    "NodeFlags",
     "PathResolver",
     "PluginContext",
     "ProjectScriptsPlugin",
@@ -92,6 +103,7 @@ __all__ = [
     "VenvResolver",
     "build_symbol_graph",
     "count_nodes",
+    "find_kept_alive_by_dead_branches",
     "find_reachable",
     "load_plugin",
     "load_resolver",
