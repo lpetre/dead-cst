@@ -22,6 +22,20 @@ two versions.
   block.
 
 ### Added
+- SQLite-backed `GraphCache` keyed by per-file SHA-256 hashes,
+  storing pickled `VisitorPayload` blobs under
+  `<root>/.dead-cst-cache/cache.db`. Cache hits skip the per-file
+  visitor pass (the dominant cost in `build_symbol_graph`); the
+  per-base `resolve_edges` step and plugin pass run unconditionally,
+  so a graph built from a warm cache is identical to one built from
+  scratch. The cache is keyed by a fingerprint over
+  `(__version__, python version, PathMap, resolver chain)`; a
+  fingerprint mismatch wipes `file_cache` and rebuilds. Plugins are
+  intentionally **not** part of the fingerprint -- swapping plugins
+  reuses cached payloads. New `--no-cache` flag on `analyze`,
+  `why-alive`, `unused-exports`, `dependencies`, and `remove`; new
+  `dead-cst cache clear` subcommand. `build_symbol_graph` accepts a
+  new `cache=` keyword.
 - `ManualResolver`: a `PathResolver` built from explicit
   ``base:dep1,dep2`` specs. The CLI's ``-p`` flag now flows through
   this resolver, so explicit specs sit in the same chain as named

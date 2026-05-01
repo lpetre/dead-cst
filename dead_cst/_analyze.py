@@ -8,6 +8,7 @@ import libcst as cst
 import networkx as nx
 from libcst.metadata import CodeRange, FullRepoManager
 
+from ._cache import GraphCache
 from ._edges import resolve_edges
 from ._fqn import FixedFullyQualifiedNameProvider
 from ._plugins import (
@@ -78,6 +79,7 @@ def build_symbol_graph(
     plugins: Sequence[EdgePlugin] = (),
     resolvers: Sequence[PathResolver] = (),
     project_root: Path | None = None,
+    cache: GraphCache | None = None,
 ) -> nx.MultiDiGraph:
     """Build a directed reachability graph of every top-level symbol under ``paths``.
 
@@ -127,6 +129,14 @@ def build_symbol_graph(
     project_root:
         Project root used by plugins for path-relative matching. If
         omitted, inferred as the shortest path in ``paths``.
+    cache:
+        Optional :class:`~dead_cst._cache.GraphCache`. When provided,
+        per-file :class:`VisitorPayload` results are looked up by
+        content hash and the visitor pass is skipped on cache hit.
+        Plugins, edge resolution, and entrypoint seeding all run
+        unconditionally on every invocation -- the cache only
+        short-circuits the per-file visit. Pass ``None`` (the default)
+        to bypass caching entirely.
 
     Returns
     -------
@@ -154,19 +164,40 @@ def build_symbol_graph(
             export_roots = exported_roots(base)
             import_edges: set[tuple[SymbolNode, Import, EdgeFlags]] = set()
             files = list(sorted(base.rglob("*.py")))
-            mgr = FullRepoManager(
-                str(base), [str(f) for f in files], {FixedFullyQualifiedNameProvider}
-            )
+            # Lazily constructed on the first cache miss; an all-cached
+            # base never builds the manager, since FQN metadata is only
+            # needed when running the visitor.
+            mgr: FullRepoManager | None = None
             # Stash the modules the visitor pass parses so plugins can reuse
             # them via ``ctx.parse(path)`` without re-reading or re-parsing.
             base_modules: dict[Path, cst.Module] | None = {} if plugins else None
             for file in files:
-                wrapper = mgr.get_metadata_wrapper_for_path(str(file))
-                if base_modules is not None:
-                    base_modules[file] = wrapper.module
-                visitor = SymbolVisitor(file, search_paths, import_resolver)
-                wrapper.visit(visitor)
-                payload = visitor.to_payload()
+                payload = cache.get(file) if cache is not None else None
+                if payload is not None:
+                    if base_modules is not None:
+                        # Plugin pass still wants the parsed CST. The visitor
+                        # is what's expensive (ScopeProvider + FQN metadata);
+                        # parsing alone is cheap, so we re-parse on cache hit
+                        # rather than caching the CST too.
+                        try:
+                            base_modules[file] = cst.parse_module(file.read_text())
+                        except (OSError, cst.ParserSyntaxError):
+                            pass
+                else:
+                    if mgr is None:
+                        mgr = FullRepoManager(
+                            str(base),
+                            [str(f) for f in files],
+                            {FixedFullyQualifiedNameProvider},
+                        )
+                    wrapper = mgr.get_metadata_wrapper_for_path(str(file))
+                    if base_modules is not None:
+                        base_modules[file] = wrapper.module
+                    visitor = SymbolVisitor(file, search_paths, import_resolver)
+                    wrapper.visit(visitor)
+                    payload = visitor.to_payload()
+                    if cache is not None:
+                        cache.put(file, payload)
                 # A file's decls go into ``export_trie`` only when the file
                 # lives under one of ``base``'s exported dirs (or when the
                 # base has no export restriction). This is what hides

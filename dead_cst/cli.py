@@ -2,19 +2,26 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import re
 import sys
 from enum import Enum
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Iterator
 
 import networkx as nx
 import typer
 from libcst.metadata import CodeRange
 
 from . import build_symbol_graph, count_nodes, find_reachable, order_paths, remove_code
+from ._cache import (
+    GraphCache,
+    clear_cache,
+    compute_fingerprint,
+    default_cache_path,
+)
 from ._plugins import (
     EdgePlugin,
     ExplicitEntrypointPlugin,
@@ -85,6 +92,28 @@ def build_plugins(
     return plugins
 
 
+@contextlib.contextmanager
+def _maybe_cache(
+    root: Path,
+    paths_dict: PathMap,
+    resolvers: list[PathResolver],
+    no_cache: bool,
+) -> Iterator[GraphCache | None]:
+    """Yield a per-run :class:`GraphCache`, or ``None`` when ``--no-cache`` is set.
+
+    The fingerprint covers the resolved ``PathMap`` and resolver chain so
+    a layout or import-resolution change wipes the on-disk ``file_cache``
+    automatically (see :func:`compute_fingerprint`). The context manager
+    closes the SQLite connection on exit, even when the analysis raises.
+    """
+    if no_cache:
+        yield None
+        return
+    fingerprint = compute_fingerprint(paths=paths_dict, resolvers=resolvers)
+    with GraphCache(default_cache_path(root), fingerprint) as cache:
+        yield cache
+
+
 def resolve_paths(
     root: Path, path_specs: list[str], resolver_names: list[str]
 ) -> tuple[PathMap, list[PathResolver]]:
@@ -152,6 +181,9 @@ def analyze(
     output_format: Annotated[
         OutputFormat, typer.Option("--format", help="Output format.")
     ] = OutputFormat.text,
+    no_cache: Annotated[
+        bool, typer.Option("--no-cache", help="Bypass the per-file VisitorPayload cache.")
+    ] = False,
 ) -> None:
     """Analyze a Python codebase for dead code."""
     setup_logging(verbose)
@@ -164,7 +196,14 @@ def analyze(
         entrypoints=entrypoint or [],
         plugin_names=plugin or [],
     )
-    graph = build_symbol_graph(paths_dict, plugins=plugins, resolvers=resolvers, project_root=root)
+    with _maybe_cache(root, paths_dict, resolvers, no_cache) as cache:
+        graph = build_symbol_graph(
+            paths_dict,
+            plugins=plugins,
+            resolvers=resolvers,
+            project_root=root,
+            cache=cache,
+        )
     reachable = find_reachable(graph)
 
     unreachable_graph = graph.subgraph([n for n in graph.nodes if n not in reachable])
@@ -314,6 +353,9 @@ def why_alive(
     verbose: Annotated[
         bool, typer.Option("-v", "--verbose", help="Enable verbose output.")
     ] = False,
+    no_cache: Annotated[
+        bool, typer.Option("--no-cache", help="Bypass the per-file VisitorPayload cache.")
+    ] = False,
 ) -> None:
     """Show why a symbol is considered alive (reachable)."""
     setup_logging(verbose)
@@ -326,7 +368,14 @@ def why_alive(
         entrypoints=[],
         plugin_names=plugin or [],
     )
-    graph = build_symbol_graph(paths_dict, plugins=plugins, resolvers=resolvers, project_root=root)
+    with _maybe_cache(root, paths_dict, resolvers, no_cache) as cache:
+        graph = build_symbol_graph(
+            paths_dict,
+            plugins=plugins,
+            resolvers=resolvers,
+            project_root=root,
+            cache=cache,
+        )
 
     target_node: SymbolNode | None = None
     for node in graph.nodes:
@@ -379,6 +428,9 @@ def dependencies(
     output_format: Annotated[
         OutputFormat, typer.Option("--format", help="Output format.")
     ] = OutputFormat.text,
+    no_cache: Annotated[
+        bool, typer.Option("--no-cache", help="Bypass the per-file VisitorPayload cache.")
+    ] = False,
 ) -> None:
     """List third-party dependencies imported by the codebase."""
     setup_logging(verbose)
@@ -387,7 +439,13 @@ def dependencies(
     paths_dict, resolvers = resolve_paths(root, path or [], resolver or [])
 
     typer.echo(f"Building symbol graph for {root}...", err=True)
-    graph = build_symbol_graph(paths_dict, resolvers=resolvers, project_root=root)
+    with _maybe_cache(root, paths_dict, resolvers, no_cache) as cache:
+        graph = build_symbol_graph(
+            paths_dict,
+            resolvers=resolvers,
+            project_root=root,
+            cache=cache,
+        )
 
     deps_by_base: dict[Path, list[SymbolNode]] = {base: [] for base in order_paths(paths_dict)}
     for node in graph.nodes:
@@ -438,6 +496,9 @@ def unused_exports(
     verbose: Annotated[
         bool, typer.Option("-v", "--verbose", help="Enable verbose output.")
     ] = False,
+    no_cache: Annotated[
+        bool, typer.Option("--no-cache", help="Bypass the per-file VisitorPayload cache.")
+    ] = False,
 ) -> None:
     """Report __all__ entries whose targets are only alive because of __all__."""
     setup_logging(verbose)
@@ -450,7 +511,14 @@ def unused_exports(
         entrypoints=entrypoint or [],
         plugin_names=plugin or [],
     )
-    graph = build_symbol_graph(paths_dict, plugins=plugins, resolvers=resolvers, project_root=root)
+    with _maybe_cache(root, paths_dict, resolvers, no_cache) as cache:
+        graph = build_symbol_graph(
+            paths_dict,
+            plugins=plugins,
+            resolvers=resolvers,
+            project_root=root,
+            cache=cache,
+        )
     reachable = find_reachable(graph)
 
     # ModuleDundersPlugin keeps each ``__all__`` alive via a synthetic
@@ -515,6 +583,9 @@ def remove(
     dry_run: Annotated[
         bool, typer.Option("--dry-run", help="Show what would be removed without making changes.")
     ] = False,
+    no_cache: Annotated[
+        bool, typer.Option("--no-cache", help="Bypass the per-file VisitorPayload cache.")
+    ] = False,
 ) -> None:
     """Remove dead code from a Python codebase."""
     setup_logging(verbose)
@@ -527,7 +598,14 @@ def remove(
         entrypoints=entrypoint or [],
         plugin_names=plugin or [],
     )
-    graph = build_symbol_graph(paths_dict, plugins=plugins, resolvers=resolvers, project_root=root)
+    with _maybe_cache(root, paths_dict, resolvers, no_cache) as cache:
+        graph = build_symbol_graph(
+            paths_dict,
+            plugins=plugins,
+            resolvers=resolvers,
+            project_root=root,
+            cache=cache,
+        )
     reachable = find_reachable(graph)
 
     unreachable_graph = graph.subgraph([n for n in graph.nodes if n not in reachable])
@@ -558,6 +636,26 @@ def remove(
         remove_code(unreachable_graph, base)
 
     typer.echo("Dead code removed.")
+
+
+cache_app = typer.Typer(help="Manage the on-disk analysis cache.")
+app.add_typer(cache_app, name="cache")
+
+
+@cache_app.command("clear")
+def cache_clear(
+    root: Annotated[
+        Path,
+        typer.Argument(help="Project root whose .dead-cst-cache directory should be removed."),
+    ] = Path("."),
+) -> None:
+    """Delete the cached :class:`VisitorPayload` database for ``root``."""
+    db = default_cache_path(root.resolve())
+    removed = clear_cache(db)
+    if removed:
+        typer.echo(f"Removed {db}.")
+    else:
+        typer.echo(f"No cache found at {db}.")
 
 
 def main_cli() -> None:

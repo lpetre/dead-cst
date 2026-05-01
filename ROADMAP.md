@@ -13,33 +13,6 @@ for the full record.
 
 ---
 
-## Next release — Quality of life
-
-One committed item for the upcoming version. The resolver-protocol
-companion piece shipped — see `CHANGELOG.md`.
-
-### SQLite-cached graph with partial rebuilds
-
-Cache the symbol graph in a SQLite database keyed by file content hash, and
-rebuild only the modules whose hashes changed (plus their reverse
-dependencies). This is the "Incremental analysis" item previously parked in
-Tier 4 — promoting it because the resolver-protocol work makes the
-invalidation surface tractable, and because cold-start latency is the
-remaining friction users hit before CI integration.
-
-Scope for the first cut:
-
-- Schema for nodes, edges, and per-file content hashes; bump on schema
-  changes.
-- Invalidate a file when its hash changes; recompute its declared symbols
-  and outgoing edges; recompute incoming edges from any file that imports
-  it.
-- Fall back to a full rebuild when the resolver, plugin set, or workspace
-  layout changes (cache key includes those).
-- `--no-cache` escape hatch and a `dead-cst cache clear` subcommand.
-
----
-
 ## Tier 1 — Trust and correctness
 
 ### 1. CLI integration tests
@@ -146,6 +119,14 @@ demand.
 
 Folded down from earlier tiers as they landed:
 
+- SQLite-cached graph with partial rebuilds: `GraphCache` stores
+  pickled `VisitorPayload` blobs keyed by per-file content hash under
+  `<root>/.dead-cst-cache/cache.db`. Cache hits skip the per-file
+  visitor pass; per-base edge resolution and the plugin pass run
+  every analysis. Fingerprint over `(__version__, python version,
+  PathMap, resolver chain)` invalidates the whole file_cache on
+  layout / version change. `--no-cache` flag and
+  `dead-cst cache clear` subcommand.
 - Resolver logic as a protocol: `PathResolver.resolve_import` folds
   `name -> path` lookup into the resolver, so custom resolvers can
   override import resolution for their own layouts. `_resolve.py`
