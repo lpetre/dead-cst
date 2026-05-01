@@ -8,13 +8,16 @@ import libcst as cst
 import networkx as nx
 from libcst.metadata import CodeRange, FullRepoManager
 
+from ._cache import GraphCache
 from ._edges import resolve_edges
 from ._fqn import FixedFullyQualifiedNameProvider
 from ._plugins import (
     EdgePlugin,
+    ObserveContext,
     PluginContext,
     apply_ops,
 )
+from ._plugins._core import _payload_from
 from ._resolvers import (
     ImportResolver,
     PathMap,
@@ -78,6 +81,7 @@ def build_symbol_graph(
     plugins: Sequence[EdgePlugin] = (),
     resolvers: Sequence[PathResolver] = (),
     project_root: Path | None = None,
+    cache: GraphCache | None = None,
 ) -> nx.MultiDiGraph:
     """Build a directed reachability graph of every top-level symbol under ``paths``.
 
@@ -127,6 +131,14 @@ def build_symbol_graph(
     project_root:
         Project root used by plugins for path-relative matching. If
         omitted, inferred as the shortest path in ``paths``.
+    cache:
+        Optional :class:`~dead_cst._cache.GraphCache`. When provided,
+        per-file :class:`VisitorPayload` results are looked up by
+        content hash and the visitor pass is skipped on cache hit.
+        Plugins, edge resolution, and entrypoint seeding all run
+        unconditionally on every invocation -- the cache only
+        short-circuits the per-file visit. Pass ``None`` (the default)
+        to bypass caching entirely.
 
     Returns
     -------
@@ -154,19 +166,29 @@ def build_symbol_graph(
             export_roots = exported_roots(base)
             import_edges: set[tuple[SymbolNode, Import, EdgeFlags]] = set()
             files = list(sorted(base.rglob("*.py")))
-            mgr = FullRepoManager(
-                str(base), [str(f) for f in files], {FixedFullyQualifiedNameProvider}
-            )
-            # Stash the modules the visitor pass parses so plugins can reuse
-            # them via ``ctx.parse(path)`` without re-reading or re-parsing.
-            base_modules: dict[Path, cst.Module] | None = {} if plugins else None
+            # Lazily constructed on the first cache miss; an all-cached
+            # base never builds the manager, since FQN metadata is only
+            # needed when running the visitor.
+            mgr: FullRepoManager | None = None
             for file in files:
-                wrapper = mgr.get_metadata_wrapper_for_path(str(file))
-                if base_modules is not None:
-                    base_modules[file] = wrapper.module
-                visitor = SymbolVisitor(file, search_paths, import_resolver)
-                wrapper.visit(visitor)
-                payload = visitor.to_payload()
+                payload = cache.get(file) if cache is not None else None
+                if payload is None:
+                    if mgr is None:
+                        mgr = FullRepoManager(
+                            str(base),
+                            [str(f) for f in files],
+                            {FixedFullyQualifiedNameProvider},
+                        )
+                    wrapper = mgr.get_metadata_wrapper_for_path(str(file))
+                    visitor = SymbolVisitor(file, search_paths, import_resolver)
+                    wrapper.visit(visitor)
+                    base_payload = visitor.to_payload()
+                    plugin_payload = _run_observe(
+                        plugins, file, wrapper.module, base_payload, base, root
+                    )
+                    payload = _merge_payloads(base_payload, plugin_payload)
+                    if cache is not None:
+                        cache.put(file, payload)
                 # A file's decls go into ``export_trie`` only when the file
                 # lives under one of ``base``'s exported dirs (or when the
                 # base has no export restriction). This is what hides
@@ -200,11 +222,10 @@ def build_symbol_graph(
             for src, dst, flags in resolve_edges(import_edges, symbol_lookup, base):
                 symbol_graph.add_edge(src, dst, flags=flags)
 
-            # Plugin pass for this base, with the symbol lookup that was
-            # valid at this base's resolution time and the parsed modules
-            # we just walked. The context (and ``base_modules``) goes out
-            # of scope once we move to the next base, so the parsed CSTs
-            # for this base can be GC'd.
+            # Per-base finalize pass: plugins do graph-only work here
+            # (factory walks, transitive subclass closure, pyproject
+            # script lookups). No CST access -- per-file CST work
+            # already happened in the observe step.
             if plugins:
                 ctx = PluginContext(
                     graph=symbol_graph,
@@ -212,19 +233,70 @@ def build_symbol_graph(
                     base=base,
                     project_root=root,
                 )
-                if base_modules is not None:
-                    for path, module in base_modules.items():
-                        ctx.prime_module(path, module)
                 for plugin in plugins:
                     if not isinstance(plugin, EdgePlugin):
                         raise TypeError(f"Plugin {plugin!r} does not satisfy EdgePlugin protocol")
                     # Materialize before applying so plugins can iterate
                     # ctx.graph.nodes without tripping "dictionary changed
                     # size during iteration".
-                    ops = list(plugin.contribute(ctx))
+                    ops = list(plugin.finalize(ctx))
                     apply_ops(symbol_graph, ops)
 
     return symbol_graph
+
+
+def _run_observe(
+    plugins: Sequence[EdgePlugin],
+    path: Path,
+    module: cst.Module,
+    base_payload: VisitorPayload,
+    base: Path,
+    project_root: Path,
+) -> VisitorPayload:
+    """Invoke each plugin's :meth:`EdgePlugin.observe` and collect contributions.
+
+    Returns a single :class:`VisitorPayload` that merges every plugin's
+    additions for this file. Plugins that return ``None`` contribute
+    nothing. The result is concatenated with the visitor's payload by
+    :func:`_merge_payloads` and cached together so that warm runs skip
+    both the visitor and the observe pass.
+    """
+    if not plugins:
+        return _payload_from()
+    ctx = ObserveContext(
+        path=path,
+        module=module,
+        payload=base_payload,
+        base=base,
+        project_root=project_root,
+    )
+    payloads: list[VisitorPayload] = []
+    for plugin in plugins:
+        if not isinstance(plugin, EdgePlugin):
+            raise TypeError(f"Plugin {plugin!r} does not satisfy EdgePlugin protocol")
+        contribution = plugin.observe(ctx)
+        if contribution is not None:
+            payloads.append(contribution)
+    return _merge_payloads(*payloads) if payloads else _payload_from()
+
+
+def _merge_payloads(*payloads: VisitorPayload) -> VisitorPayload:
+    """Concatenate the ``nodes``/``edges``/``imports``/``dead_suites`` of every payload."""
+    nodes: list[SymbolNode] = []
+    edges: list[tuple[SymbolNode, SymbolNode, CodeRange]] = []
+    imports: list[tuple[SymbolNode, Import, CodeRange]] = []
+    dead_suites: list[CodeRange] = []
+    for p in payloads:
+        nodes.extend(p.nodes)
+        edges.extend(p.edges)
+        imports.extend(p.imports)
+        dead_suites.extend(p.dead_suites)
+    return VisitorPayload(
+        nodes=tuple(nodes),
+        edges=tuple(edges),
+        imports=tuple(imports),
+        dead_suites=tuple(dead_suites),
+    )
 
 
 def _contains(suite: CodeRange, access: CodeRange) -> bool:
@@ -257,18 +329,28 @@ def _apply_payload(
 
     * ``type == "module"`` goes into the graph and the trie; no parent
       edge (modules are themselves the parent target).
+    * ``type == "synthetic"`` (plugin-emitted markers) goes into the
+      graph only -- no parent edge, no trie entry. Synthetic fqnames
+      don't fit the dotted module hierarchy and aren't lookup targets
+      for cross-module imports.
     * Other decls go into the graph with a parent-module edge.
       ``NodeFlags.SHADOWED`` excludes them from the trie -- the graph
       keeps the parent edge so the decl stays well-formed, but
       cross-module imports never resolve to it.
+    * ``NodeFlags.ENTRYPOINT`` (typically on plugin synthetics)
+      seeds reachability: ``graph.nodes[node]["entrypoint"] = True``
+      so :func:`find_reachable` starts its BFS from this node.
 
     Edge flag derivation: each ``(src, dst, access_pos)`` entry has
     its access position tested against ``payload.dead_suites`` for
     containment. If matched, the resulting graph edge gets
-    :data:`EdgeFlags.DEAD_BRANCH`. Unresolved cross-file imports
-    accumulate into ``import_edges`` along with the derived flag and
-    are fed to :func:`resolve_edges` once the per-base trie is fully
-    built; resolution preserves the flag through every emission.
+    :data:`EdgeFlags.DEAD_BRANCH`. Plugin-emitted edges use
+    ``SYNTHETIC_POSITION`` (line 0), which never falls inside a real
+    dead suite, so they always land with ``EdgeFlags.NONE``.
+    Unresolved cross-file imports accumulate into ``import_edges``
+    along with the derived flag and are fed to :func:`resolve_edges`
+    once the per-base trie is fully built; resolution preserves the
+    flag through every emission.
 
     Per-file dead-suite positions are stashed on the graph as
     ``graph.graph["dead_suites"][module.path]`` for downstream
@@ -285,6 +367,10 @@ def _apply_payload(
 
     for n in payload.nodes:
         symbol_graph.add_node(n)
+        if n.flags & NodeFlags.ENTRYPOINT:
+            symbol_graph.nodes[n]["entrypoint"] = True
+        if n.type == "synthetic":
+            continue
         if n.type != "module":
             symbol_graph.add_edge(n, module, flags=EdgeFlags.NONE)
         if not (n.flags & NodeFlags.SHADOWED):

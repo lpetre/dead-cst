@@ -3,14 +3,25 @@ functions alive."""
 
 from __future__ import annotations
 
+from libcst.metadata import CodeRange
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Iterable
+from typing import TYPE_CHECKING, Iterable
 
 import libcst as cst
 
-from .._symbols import SymbolNode
-from ._core import GraphOp, PluginContext, mark_entrypoints, require_resolved_dep, simple_name
+from .._symbols import NodeFlags, SymbolNode
+from ._core import (
+    SYNTHETIC_POSITION,
+    GraphOp,
+    ObserveContext,
+    PluginContext,
+    _payload_from,
+    simple_name,
+    synthetic_node,
+)
+
+if TYPE_CHECKING:
+    from .._visitor import VisitorPayload
 
 PYTEST_CONFTEST_PREFIX = "<pytest:conftest>:"
 PYTEST_TESTS_PREFIX = "<pytest:tests>:"
@@ -38,55 +49,87 @@ class PytestPlugin:
 
     Marker decorators (``@pytest.mark.*``) are not interpreted: they only
     affect collection, never reachability.
+
+    Pure per-file work: filename + payload decls for the test/conftest
+    branches, CST + payload imports for the fixture branch.
     """
 
     name: str = "pytest"
+    version: str = "1"
 
-    def contribute(self, ctx: PluginContext) -> Iterable[GraphOp]:
-        decls_by_path: dict[Path, list[SymbolNode]] = {}
-        for node in ctx.base_nodes():
-            if node.type in ("function", "class", "variable"):
-                decls_by_path.setdefault(node.path, []).append(node)
+    def observe(self, ctx: ObserveContext) -> VisitorPayload | None:
+        module_node = next((n for n in ctx.payload.nodes if n.type == "module"), None)
+        if module_node is None:
+            return None
 
-        # Fixture-branch prefilter: ``@pytest.fixture`` / ``@fixture``
-        # require importing pytest somewhere in the file. Files that
-        # don't import pytest at all skip this branch silently --
-        # test/conftest discovery is filename-driven and doesn't need
-        # pytest installed.
-        fixture_candidates: set[Path] = set()
-        if require_resolved_dep(ctx, "pytest") is not None:
-            fixture_candidates = ctx.importers("pytest")
+        module_decls = [n for n in ctx.payload.nodes if n.type in ("function", "class", "variable")]
+        filename = ctx.path.name
+        new_nodes: list[SymbolNode] = []
+        new_edges: list[tuple[SymbolNode, SymbolNode, CodeRange]] = []
 
-        for path, module_node in ctx.base_modules():
-            module_decls = decls_by_path.get(path, [])
-            filename = path.name
-
-            if filename == "conftest.py":
-                yield from mark_entrypoints(
-                    f"{PYTEST_CONFTEST_PREFIX}{module_node.fqname}", path, module_decls
-                )
-            elif _is_test_filename(filename):
-                test_decls = [d for d in module_decls if _is_test_decl(d)]
-                yield from mark_entrypoints(
-                    f"{PYTEST_TESTS_PREFIX}{module_node.fqname}", path, test_decls
-                )
-
-            if path not in fixture_candidates:
-                continue
-            module = ctx.parse(path)
-            if module is None:
-                continue
-            fixture_names = _find_fixture_names(module)
-            if not fixture_names:
-                continue
-            fixture_decls = [
-                d
-                for d in module_decls
-                if d.type == "function" and simple_name(d.fqname) in fixture_names
-            ]
-            yield from mark_entrypoints(
-                f"{PYTEST_FIXTURES_PREFIX}{module_node.fqname}", path, fixture_decls
+        if filename == "conftest.py":
+            _emit_seed(
+                new_nodes,
+                new_edges,
+                f"{PYTEST_CONFTEST_PREFIX}{module_node.fqname}",
+                ctx.path,
+                module_decls,
             )
+        elif _is_test_filename(filename):
+            test_decls = [d for d in module_decls if _is_test_decl(d)]
+            _emit_seed(
+                new_nodes,
+                new_edges,
+                f"{PYTEST_TESTS_PREFIX}{module_node.fqname}",
+                ctx.path,
+                test_decls,
+            )
+
+        if _file_imports_pytest(ctx.payload):
+            fixture_names = _find_fixture_names(ctx.module)
+            if fixture_names:
+                fixture_decls = [
+                    d
+                    for d in module_decls
+                    if d.type == "function" and simple_name(d.fqname) in fixture_names
+                ]
+                _emit_seed(
+                    new_nodes,
+                    new_edges,
+                    f"{PYTEST_FIXTURES_PREFIX}{module_node.fqname}",
+                    ctx.path,
+                    fixture_decls,
+                )
+
+        if not new_nodes:
+            return None
+        return _payload_from(nodes=new_nodes, edges=new_edges)
+
+    def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]:
+        return ()
+
+
+def _emit_seed(nodes, edges, fqname, path, targets):
+    if not targets:
+        return
+    synth = synthetic_node(fqname, path, flags=NodeFlags.ENTRYPOINT)
+    nodes.append(synth)
+    edges.extend((synth, t, SYNTHETIC_POSITION) for t in targets)
+
+
+def _file_imports_pytest(payload) -> bool:
+    """True iff any visitor-recorded import in this file targets pytest.
+
+    Replaces the old graph-level ``ctx.importers("pytest")`` prefilter
+    with a per-file syntactic check. The visitor's ``imports`` field
+    has every cross-file import attempt (resolved or unresolved) so
+    this is strictly more accurate than substring matching while
+    staying file-local.
+    """
+    for _src, imp, _pos in payload.imports:
+        if imp.module == "pytest" or imp.module.startswith("pytest."):
+            return True
+    return False
 
 
 def _is_test_filename(name: str) -> bool:

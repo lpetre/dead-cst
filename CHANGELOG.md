@@ -9,6 +9,42 @@ two versions.
 
 ## [Unreleased]
 
+### Changed
+- `EdgePlugin` is now a two-pass protocol:
+  - `observe(ctx) -> VisitorPayload | None` runs in the per-file
+    analyzer loop with the file's parsed CST and just-built
+    `VisitorPayload`. The plugin returns the same payload shape
+    (`nodes` + `edges`) and the analyzer concatenates that with the
+    visitor's payload before applying. Plugin contributions are
+    cached alongside the visitor's output, so a warm cache hit
+    returns the combined payload in one read.
+  - `finalize(ctx) -> Iterable[GraphOp]` runs once per base after
+    `resolve_edges`. It is graph-only -- no CST access -- and is
+    where cross-file work belongs (FastAPI's factory walk,
+    InitSubclass's transitive subclass closure, `[project.scripts]`
+    lookups). Plugins use synthetic markers from their `observe`
+    pass to communicate state forward into `finalize` (e.g.
+    `<fastapi-pending>:<X.fqname>` for variables that need a graph
+    walk to classify).
+  - `EdgePlugin.contribute` is replaced by `observe` + `finalize`.
+    Every builtin plugin -- `MainBlockPlugin`,
+    `ProjectScriptsPlugin`, `ExplicitEntrypointPlugin`,
+    `ModuleDundersPlugin`, `PytestPlugin`, `UnittestPlugin`,
+    `FastAPIPlugin`, `FlaskPlugin`, `TyperPlugin`, `ClickPlugin`,
+    `InitSubclassPlugin` -- migrates accordingly.
+  - Plugins declare a `version: str` attribute. The cache
+    fingerprint includes each plugin's `(name, version)` pair, so
+    bumping a plugin's version invalidates the file_cache (its
+    observe contributions are baked into cached payloads).
+- `NodeFlags.ENTRYPOINT`: a node flag that `_apply_payload` reads to
+  set `graph.nodes[node]["entrypoint"] = True`. Plugin observe passes
+  emit synthetic nodes flagged `ENTRYPOINT` to declare reachability
+  seeds without a separate API surface.
+- Warm cache runs with the full builtin plugin set now parse **zero**
+  files: the visitor and every plugin's observe contributions are
+  baked into the cached payloads, and `finalize` runs purely off the
+  graph. Pinned by `test_warm_run_with_plugins_parses_zero_files`.
+
 ### Fixed
 - `MainBlockPlugin` now keeps decls bound inside the
   `if __name__ == "__main__":` block alive, not just the containing
@@ -22,6 +58,20 @@ two versions.
   block.
 
 ### Added
+- SQLite-backed `GraphCache` keyed by per-file SHA-256 hashes,
+  storing pickled `VisitorPayload` blobs under
+  `<root>/.dead-cst-cache/cache.db`. Cache hits skip the per-file
+  visitor pass (the dominant cost in `build_symbol_graph`); the
+  per-base `resolve_edges` step and plugin pass run unconditionally,
+  so a graph built from a warm cache is identical to one built from
+  scratch. The cache is keyed by a fingerprint over
+  `(__version__, python version, PathMap, resolver chain)`; a
+  fingerprint mismatch wipes `file_cache` and rebuilds. Plugins are
+  intentionally **not** part of the fingerprint -- swapping plugins
+  reuses cached payloads. New `--no-cache` flag on `analyze`,
+  `why-alive`, `unused-exports`, `dependencies`, and `remove`; new
+  `dead-cst cache clear` subcommand. `build_symbol_graph` accepts a
+  new `cache=` keyword.
 - `ManualResolver`: a `PathResolver` built from explicit
   ``base:dep1,dep2`` specs. The CLI's ``-p`` flag now flows through
   this resolver, so explicit specs sit in the same chain as named

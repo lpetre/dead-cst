@@ -3,21 +3,26 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Iterable
+from typing import TYPE_CHECKING, Iterable
 
 import libcst as cst
 
-from .._symbols import SymbolNode
+from .._symbols import NodeFlags
 from ._core import (
+    SYNTHETIC_POSITION,
     GraphOp,
+    ObserveContext,
     PluginContext,
     _asname_value,
+    _payload_from,
     is_from_module,
     is_name,
-    mark_entrypoints,
     simple_name,
+    synthetic_node,
 )
+
+if TYPE_CHECKING:
+    from .._visitor import VisitorPayload
 
 UNITTEST_PREFIX = "<unittest>:"
 
@@ -40,6 +45,11 @@ class UnittestPlugin:
     * Top-level ``setUpModule`` / ``tearDownModule`` / ``load_tests``
       functions are marked alive (the unittest discovery protocol).
 
+    Pure per-file work: the file's ``payload.imports`` provides the
+    ``unittest``-import prefilter, the file's CST yields the class
+    bases and module-level hook function names, and the contribution
+    is appended to the cached payload.
+
     Limitations:
 
     * Only direct subclasses of a ``unittest`` base class are detected.
@@ -54,53 +64,63 @@ class UnittestPlugin:
     """
 
     name: str = "unittest"
+    version: str = "1"
 
-    def contribute(self, ctx: PluginContext) -> Iterable[GraphOp]:
-        # ``unittest`` is stdlib, so the resolver doesn't emit a synthetic
-        # node for it (``ctx.importers`` can't prefilter). Walk the graph's
-        # import declarations directly; same idea, just keyed off the
-        # ``Import.module`` field instead of an ``[external dist]`` marker.
-        candidate_paths: set[Path] = set()
-        decls_by_path: dict[Path, list[SymbolNode]] = {}
-        for node in ctx.base_nodes():
-            if node.type in ("function", "class"):
-                decls_by_path.setdefault(node.path, []).append(node)
-            elif (
-                node.type == "import"
-                and node.imports is not None
-                and (
-                    node.imports.module == "unittest" or node.imports.module.startswith("unittest.")
-                )
-            ):
-                candidate_paths.add(node.path)
-        if not candidate_paths:
-            return
+    def observe(self, ctx: ObserveContext) -> VisitorPayload | None:
+        if not _file_imports_unittest(ctx.payload):
+            return None
 
-        for path, module_node in ctx.base_modules():
-            if path not in candidate_paths:
-                continue
-            module = ctx.parse(path)
-            if module is None:
-                continue
+        module_node = next((n for n in ctx.payload.nodes if n.type == "module"), None)
+        if module_node is None:
+            return None
 
-            module_aliases, base_aliases = _collect_unittest_imports(module)
-            if not module_aliases and not base_aliases:
-                # ``unittest`` is reachable through an import chain but the
-                # module itself doesn't bind any of the names we care about.
-                continue
-            test_class_names = _find_testcase_subclasses(module, module_aliases, base_aliases)
-            hook_names = _find_module_hooks(module)
+        module_aliases, base_aliases = _collect_unittest_imports(ctx.module)
+        if not module_aliases and not base_aliases:
+            return None
 
-            wanted = test_class_names | hook_names
-            if not wanted:
-                continue
+        wanted = _find_testcase_subclasses(
+            ctx.module, module_aliases, base_aliases
+        ) | _find_module_hooks(ctx.module)
+        if not wanted:
+            return None
 
-            module_decls = decls_by_path.get(path, [])
-            targets = [d for d in module_decls if simple_name(d.fqname) in wanted]
-            if not targets:
-                continue
+        targets = [
+            n
+            for n in ctx.payload.nodes
+            if n.type in ("function", "class") and simple_name(n.fqname) in wanted
+        ]
+        if not targets:
+            return None
 
-            yield from mark_entrypoints(f"{UNITTEST_PREFIX}{module_node.fqname}", path, targets)
+        synth = synthetic_node(
+            f"{UNITTEST_PREFIX}{module_node.fqname}",
+            ctx.path,
+            flags=NodeFlags.ENTRYPOINT,
+        )
+        edges = [(synth, t, SYNTHETIC_POSITION) for t in targets]
+        return _payload_from(nodes=[synth], edges=edges)
+
+    def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]:
+        return ()
+
+
+def _file_imports_unittest(payload) -> bool:
+    """True iff any non-star import in the file targets ``unittest``.
+
+    Star imports are deliberately excluded: ``from unittest import *``
+    binds the test base classes anonymously, but we can't reliably tie
+    them to a graph node without re-parsing every file. The
+    pre-refactor plugin had the same limitation by virtue of relying
+    on ``ctx.importers`` (which doesn't surface stdlib star imports).
+    The escape hatch is the same: switch to ``from unittest import
+    TestCase``.
+    """
+    for _src, imp, _pos in payload.imports:
+        if imp.star:
+            continue
+        if imp.module == "unittest" or imp.module.startswith("unittest."):
+            return True
+    return False
 
 
 def _collect_unittest_imports(module: cst.Module) -> tuple[set[str], set[str]]:
@@ -127,8 +147,6 @@ def _collect_unittest_imports(module: cst.Module) -> tuple[set[str], set[str]]:
                 if not is_from_module(small, "unittest"):
                     continue
                 if isinstance(small.names, cst.ImportStar):
-                    # ``from unittest import *`` brings every public name in,
-                    # including the test base classes.
                     base_aliases.update(_TEST_BASE_CLASSES)
                     continue
                 for alias in small.names:

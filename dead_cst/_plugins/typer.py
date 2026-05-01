@@ -17,18 +17,25 @@ the behavior of :class:`FastAPIPlugin` for ``APIRouter``.
 
 from __future__ import annotations
 
+from libcst.metadata import CodeRange
 from dataclasses import dataclass
-from typing import Iterable
+from typing import TYPE_CHECKING, Iterable
 
+from .._symbols import SymbolNode
 from ._core import (
-    AddEdge,
+    SYNTHETIC_POSITION,
     GraphOp,
+    ObserveContext,
     PluginContext,
+    _payload_from,
     collect_module_imports,
     find_call_assignments,
     find_handlers,
-    require_resolved_dep,
+    simple_name,
 )
+
+if TYPE_CHECKING:
+    from .._visitor import VisitorPayload
 
 # Attribute names ``Typer`` uses to register a callable. Matched as the
 # rightmost attribute of ``@<instance>.<name>(...)``.
@@ -52,13 +59,12 @@ class TyperPlugin:
        ``@X.callback(...)``, emits an edge ``X -> handler`` so the
        handler is reachable whenever ``X`` is.
 
-    Typer instances are not auto-marked as entrypoints. The expected
-    wiring is ``[project.scripts]`` (``ProjectScriptsPlugin`` seeds
-    ``module:app``) or an ``if __name__ == "__main__": app()`` block
-    (``MainBlockPlugin``); both paths make the instance reachable, after
-    which this plugin's edges keep its commands alive. Sub-typers added
-    via ``app.add_typer(sub)`` are reached through the regular reference
-    tracking on that call.
+    Pure per-file work: instance detection and decorator scanning are
+    both file-local CST passes; the corresponding ``SymbolNode`` decls
+    are looked up in this file's :class:`VisitorPayload`. Typer
+    instances are not auto-marked as entrypoints; reachability flows
+    through ``[project.scripts]`` or a ``__main__`` block as in the
+    pre-refactor implementation.
 
     Limitations: only top-level ``X = Typer(...)`` assignments with a
     single ``Name`` target are detected. Factory-style apps
@@ -68,34 +74,37 @@ class TyperPlugin:
     """
 
     name: str = "typer"
+    version: str = "1"
 
-    def contribute(self, ctx: PluginContext) -> Iterable[GraphOp]:
-        if require_resolved_dep(ctx, "typer") is None:
-            return
-        candidate_paths = ctx.importers("typer")
+    def observe(self, ctx: ObserveContext) -> VisitorPayload | None:
+        typer_imports = collect_module_imports(ctx.module, "typer", _TYPER_TARGETS)
+        if not typer_imports:
+            return None
+        instances = set(find_call_assignments(ctx.module, typer_imports, _TYPER_TARGETS))
+        if not instances:
+            return None
+        handlers = find_handlers(ctx.module, instances, _REGISTRATION_DECORATORS)
+        if not handlers:
+            return None
 
-        for path, module_node in ctx.base_modules():
-            if path not in candidate_paths:
-                continue
-            module = ctx.parse(path)
-            if module is None:
-                continue
-            typer_imports = collect_module_imports(module, "typer", _TYPER_TARGETS)
-            if not typer_imports:
-                continue
-            instances = set(find_call_assignments(module, typer_imports, _TYPER_TARGETS))
-            if not instances:
-                continue
-            handlers = find_handlers(module, instances, _REGISTRATION_DECORATORS)
+        decls_by_name = _decls_by_simple_name(ctx.payload.nodes)
+        edges: list[tuple[SymbolNode, SymbolNode, CodeRange]] = []
+        for var_name, handler_names in handlers.items():
+            for instance_decl in decls_by_name.get(var_name, []):
+                for handler_name in handler_names:
+                    for handler_decl in decls_by_name.get(handler_name, []):
+                        edges.append((instance_decl, handler_decl, SYNTHETIC_POSITION))
+        if not edges:
+            return None
+        return _payload_from(edges=edges)
 
-            module_fqname = module_node.fqname
-            for var_name in instances:
-                instance_decls = ctx.find_declarations(f"{module_fqname}.{var_name}")
-                if not instance_decls:
-                    continue
-                for instance_decl in instance_decls:
-                    for handler_name in handlers.get(var_name, ()):
-                        for handler_decl in ctx.find_declarations(
-                            f"{module_fqname}.{handler_name}"
-                        ):
-                            yield AddEdge(instance_decl, handler_decl)
+    def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]:
+        return ()
+
+
+def _decls_by_simple_name(nodes) -> dict[str, list[SymbolNode]]:
+    out: dict[str, list[SymbolNode]] = {}
+    for n in nodes:
+        if n.type in ("class", "function", "variable", "import"):
+            out.setdefault(simple_name(n.fqname), []).append(n)
+    return out

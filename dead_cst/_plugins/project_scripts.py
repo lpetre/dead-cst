@@ -6,10 +6,13 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import TYPE_CHECKING, Iterable
 
 from .._resolvers._core import load_toml
-from ._core import GraphOp, PluginContext, mark_entrypoints
+from ._core import GraphOp, ObserveContext, PluginContext, mark_entrypoints
+
+if TYPE_CHECKING:
+    from .._visitor import VisitorPayload
 
 PROJECT_SCRIPTS_PREFIX = "<project.scripts>:"
 
@@ -29,12 +32,20 @@ class ProjectScriptsPlugin:
     own base's symbol lookup -- which is exactly the lookup that contains
     that member plus the deps it can import from. ``pyproject_path`` can
     be set to override the location for non-standard layouts.
+
+    Finalize-only: the pyproject scan runs once per base, after the
+    per-file payloads have been applied and import edges resolved, so
+    the symbol trie is fully populated.
     """
 
     name: str = "project_scripts"
+    version: str = "1"
     pyproject_path: Path | None = None
 
-    def contribute(self, ctx: PluginContext) -> Iterable[GraphOp]:
+    def observe(self, ctx: ObserveContext) -> VisitorPayload | None:
+        return None
+
+    def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]:
         pyproject = self.pyproject_path or ctx.base / "pyproject.toml"
         data = load_toml(pyproject)
         if data is None:

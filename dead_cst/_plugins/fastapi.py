@@ -11,38 +11,43 @@ returns ``FastAPI(...)``. The plugin reuses those reference edges:
    ``X = fastapi.FastAPI(...)``, etc.) is recognized syntactically via
    ``find_call_assignments`` -- this is unambiguous, so it gives the
    kind directly even for ``import fastapi`` forms where the graph
-   alone can't distinguish the two classes.
+   alone can't distinguish the two classes. Resolution happens in
+   :meth:`observe`.
 2. Indirect shape (any variable decorated by ``@X.<route_verb>(...)``)
-   is detected via the route-decorator scan; kind is read off the
-   import nodes encountered while walking forward from ``X`` in the
-   graph, which transparently handles factory wrappers because the
-   factory's body is already linked to the right import.
-
-For each detected instance the plugin emits ``X -> handler`` edges for
-its decorated handlers and seeds ``FastAPI`` instances as entrypoints
-(uvicorn loads ``module:app``); routers are not seeded, so an
-``APIRouter`` that nothing ``include_router``s stays dead -- the right
-signal.
+   is detected via the route-decorator scan. Per-file ``observe``
+   emits a ``<fastapi-pending>:<X.fqname>`` marker plus the
+   ``X -> handler`` edges; the per-base ``finalize`` pass walks the
+   graph forward from each pending marker, classifies via
+   ``walk_to_instance_kind``, and promotes ``FastAPI`` instances to
+   entrypoints.
 """
 
 from __future__ import annotations
 
+from libcst.metadata import CodeRange
 from dataclasses import dataclass
-from typing import Iterable
+from typing import TYPE_CHECKING, Iterable
 
-import networkx as nx
-
+from .._symbols import NodeFlags, SymbolNode
 from ._core import (
+    SYNTHETIC_POSITION,
     AddEdge,
     AddNode,
     GraphOp,
+    ObserveContext,
     PluginContext,
+    _payload_from,
     collect_module_imports,
     find_call_assignments,
     find_handlers,
     require_resolved_dep,
+    simple_name,
+    synthetic_node,
     walk_to_instance_kind,
 )
+
+if TYPE_CHECKING:
+    from .._visitor import VisitorPayload
 
 # Attribute names FastAPI / APIRouter use to register a callable. Matched as
 # the rightmost attribute of ``@<instance>.<name>(...)``.
@@ -72,83 +77,109 @@ _INSTANCE_KINDS: dict[str, bool] = {
     "APIRouter": False,  # only alive if reached via ``include_router``
 }
 
+FASTAPI_APP_PREFIX = "<fastapi-app>:"
+FASTAPI_PENDING_PREFIX = "<fastapi-pending>:"
+
 
 @dataclass
 class FastAPIPlugin:
     """Mark FastAPI apps as entrypoints and wire route handlers through them.
 
-    For each module the plugin:
+    For each module the plugin observes:
 
-    1. Finds direct ``X = FastAPI(...)`` / ``X = APIRouter(...)``
-       assignments by inspecting the file's ``fastapi`` imports and
-       matching call sites. This is the unambiguous path and handles
-       module-prefixed forms like ``import fastapi; X = fastapi.FastAPI()``
-       that pure graph reachability cannot distinguish (the variable's
-       edge goes straight to the ``fastapi`` synthetic with no
-       intermediate ``FastAPI`` vs ``APIRouter`` import to discriminate).
-    2. Collects every ``@<X>.<verb>(...)`` decorator (``verb`` from
-       FastAPI's registration set). For each owner ``X`` not already
-       resolved by step 1, walks forward from ``X`` in the symbol graph;
-       if the walk hits an ``import`` node bound to ``FastAPI`` or
-       ``APIRouter``, ``X`` is a factory-produced instance of that kind.
-       Variables that reach ``fastapi`` only through unrelated symbols
-       (e.g. ``HTTPException``) are not classified, so they don't get
-       marked as apps.
-    3. For each detected instance, emits ``X -> handler`` edges for its
-       decorated handlers. ``FastAPI`` instances are seeded as
-       entrypoints; routers are not, so an ``APIRouter`` that nothing
-       ``include_router``s stays dead.
+    1. Direct ``X = FastAPI(...)`` / ``X = APIRouter(...)`` assignments
+       via ``find_call_assignments``. This is the unambiguous path and
+       handles module-prefixed forms like
+       ``import fastapi; X = fastapi.FastAPI()`` that pure graph
+       reachability cannot distinguish (the variable's edge goes
+       straight to the ``fastapi`` synthetic with no intermediate
+       ``FastAPI`` vs ``APIRouter`` import to discriminate). Direct
+       FastAPI hits get a :data:`FASTAPI_APP_PREFIX` synthetic
+       entrypoint plus an edge pointing at the variable; routers do
+       not.
+    2. ``@<X>.<verb>(...)`` decorators via ``find_handlers``. Each
+       ``X -> handler`` edge is emitted unconditionally; whether ``X``
+       is reachable depends on the next step.
+    3. Variables decorated but not directly classified get a
+       :data:`FASTAPI_PENDING_PREFIX` marker synthetic with an edge
+       to the variable. The :meth:`finalize` pass picks these up.
 
-    Application wiring (``app.include_router(router)``,
-    ``FastAPI(lifespan=fn)``, ``app.add_api_route(..., endpoint=fn)``,
-    ``Depends(fn)``) is plain reference passing already tracked by the
-    regular analyzer.
-
-    Limitations: only top-level decls with a single ``Name`` decorator
-    target ``@X.<verb>(...)`` are handled. Class-attribute apps
-    (``self.app = FastAPI(); @self.app.get(...)``) and decorators that
-    chain through extra calls aren't recognized.
+    Finalize walks forward from each pending variable, hits the
+    ``fastapi`` external-dist synthetic if any, classifies the variable
+    via ``walk_to_instance_kind``, and -- for ``FastAPI`` instances --
+    emits a ``<fastapi-app>:`` synthetic entrypoint plus an edge to
+    the variable. Routers and unclassified variables stay as-is, so
+    an ``APIRouter`` that nothing ``include_router``s remains dead.
     """
 
     name: str = "fastapi"
+    version: str = "1"
 
-    def contribute(self, ctx: PluginContext) -> Iterable[GraphOp]:
+    def observe(self, ctx: ObserveContext) -> VisitorPayload | None:
+        fastapi_imports = collect_module_imports(ctx.module, "fastapi", _INSTANCE_KINDS)
+        direct = find_call_assignments(ctx.module, fastapi_imports, _INSTANCE_KINDS)
+        decorated = find_handlers(ctx.module, None, _REGISTRATION_DECORATORS)
+        if not direct and not decorated:
+            return None
+
+        decls_by_name = _decls_by_simple_name(ctx.payload.nodes)
+        nodes: list[SymbolNode] = []
+        edges: list[tuple[SymbolNode, SymbolNode, CodeRange]] = []
+
+        # Every variable observed (direct or just decorated) gets either
+        # an app entrypoint, a router classification, or a pending marker
+        # for finalize to resolve.
+        for var_name in direct.keys() | decorated.keys():
+            var_decls = decls_by_name.get(var_name, [])
+            kind = direct.get(var_name)
+            for var_decl in var_decls:
+                if kind is None:
+                    pending = synthetic_node(f"{FASTAPI_PENDING_PREFIX}{var_decl.fqname}", ctx.path)
+                    nodes.append(pending)
+                    edges.append((pending, var_decl, SYNTHETIC_POSITION))
+                elif _INSTANCE_KINDS[kind]:
+                    seed = synthetic_node(
+                        f"{FASTAPI_APP_PREFIX}{var_decl.fqname}",
+                        ctx.path,
+                        flags=NodeFlags.ENTRYPOINT,
+                    )
+                    nodes.append(seed)
+                    edges.append((seed, var_decl, SYNTHETIC_POSITION))
+                # APIRouter direct hits get only handler edges below.
+
+                for handler_name in decorated.get(var_name, ()):
+                    for handler_decl in decls_by_name.get(handler_name, []):
+                        edges.append((var_decl, handler_decl, SYNTHETIC_POSITION))
+
+        if not nodes and not edges:
+            return None
+        return _payload_from(nodes=nodes, edges=edges)
+
+    def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]:
         fastapi_node = require_resolved_dep(ctx, "fastapi")
         if fastapi_node is None:
             return
-        # ``ancestors(fastapi_node)`` is the universe of decls whose
-        # reference chain reaches the ``fastapi`` synthetic. Any
-        # factory-produced instance must be in this set; the rest can't
-        # be a FastAPI/APIRouter, so we skip the forward walk for them.
-        reaches_fastapi = nx.ancestors(ctx.graph, fastapi_node)
 
-        for path, module_node in ctx.base_modules():
-            module = ctx.parse(path)
-            if module is None:
+        for synth in list(ctx.base_nodes()):
+            if synth.type != "synthetic" or not synth.fqname.startswith(FASTAPI_PENDING_PREFIX):
                 continue
-
-            fastapi_imports = collect_module_imports(module, "fastapi", _INSTANCE_KINDS)
-            direct = find_call_assignments(module, fastapi_imports, _INSTANCE_KINDS)
-            decorated = find_handlers(module, None, _REGISTRATION_DECORATORS)
-            if not direct and not decorated:
+            successors = list(ctx.graph.successors(synth))
+            if not successors:
                 continue
+            for var in successors:
+                kind = walk_to_instance_kind(
+                    ctx.graph, var, fastapi_node, "fastapi", _INSTANCE_KINDS
+                )
+                if kind is None or not _INSTANCE_KINDS[kind]:
+                    continue
+                seed = synthetic_node(f"{FASTAPI_APP_PREFIX}{var.fqname}", var.path)
+                yield AddNode(seed, entrypoint=True)
+                yield AddEdge(seed, var)
 
-            module_fqname = module_node.fqname
-            for var_name in direct.keys() | decorated.keys():
-                for instance_decl in ctx.find_declarations(f"{module_fqname}.{var_name}"):
-                    kind = direct.get(var_name)
-                    if kind is None:
-                        if instance_decl not in reaches_fastapi:
-                            continue
-                        kind = walk_to_instance_kind(
-                            ctx.graph, instance_decl, fastapi_node, "fastapi", _INSTANCE_KINDS
-                        )
-                        if kind is None:
-                            continue
-                    if _INSTANCE_KINDS[kind]:
-                        yield AddNode(instance_decl, entrypoint=True)
-                    for handler_name in decorated.get(var_name, ()):
-                        for handler_decl in ctx.find_declarations(
-                            f"{module_fqname}.{handler_name}"
-                        ):
-                            yield AddEdge(instance_decl, handler_decl)
+
+def _decls_by_simple_name(nodes) -> dict[str, list[SymbolNode]]:
+    out: dict[str, list[SymbolNode]] = {}
+    for n in nodes:
+        if n.type in ("class", "function", "variable", "import"):
+            out.setdefault(simple_name(n.fqname), []).append(n)
+    return out
