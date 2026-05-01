@@ -18,10 +18,17 @@ class NodeFlags(enum.IntFlag):
     ``SHADOWED`` decls are emitted into the graph (with their parent
     module edge) but are excluded from the lookup trie, so cross-module
     imports never resolve to them.
+
+    ``ENTRYPOINT`` flags a node as a reachability seed: ``_apply_payload``
+    sets ``graph.nodes[node]["entrypoint"] = True`` when it sees the
+    flag, so :func:`find_reachable` starts its BFS there. Plugins emit
+    flagged synthetic nodes via their per-file payloads to declare
+    entrypoints without a separate API surface.
     """
 
     NONE = 0
     SHADOWED = enum.auto()
+    ENTRYPOINT = enum.auto()
 
 
 class EdgeFlags(enum.IntFlag):

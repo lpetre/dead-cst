@@ -42,6 +42,7 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
+from ._plugins._core import EdgePlugin
 from ._resolvers import PathMap, PathResolver
 from ._visitor import VisitorPayload
 from ._version import __version__
@@ -69,19 +70,22 @@ def compute_fingerprint(
     *,
     paths: PathMap,
     resolvers: Sequence[PathResolver],
+    plugins: Sequence[EdgePlugin] = (),
 ) -> str:
     """SHA-256 of every input that affects payload semantics for one analysis run.
 
     Includes the dead-cst version (any code change can shift visitor
     output), Python version (pickle protocol stability), the
     ``PathMap`` (the search-path layout governs ``Import.path``
-    resolution), and the resolver chain (resolvers override
-    ``name -> path`` lookups). Each value is normalized to a stable
-    string before hashing so equivalent inputs produce equal keys.
+    resolution), the resolver chain (resolvers override
+    ``name -> path`` lookups), and the plugin set. Plugins are
+    fingerprinted by ``(name, version)`` because their ``observe``
+    contributions are folded into each cached payload; bumping a
+    plugin's ``version`` invalidates the file_cache so the new
+    observe output replaces the old.
 
-    Plugins do **not** participate: they mutate the graph *after* per-file
-    payloads are applied, so a different plugin set should reuse the
-    same cached payloads and only re-run the plugin pass.
+    Each value is normalized to a stable string before hashing so
+    equivalent inputs produce equal keys.
     """
     h = hashlib.sha256()
     h.update(f"schema={SCHEMA_VERSION}\n".encode())
@@ -96,6 +100,17 @@ def compute_fingerprint(
     h.update(b"resolvers=\n")
     for name in sorted(getattr(r, "name", type(r).__name__) for r in resolvers):
         h.update(f"  {name}\n".encode())
+
+    h.update(b"plugins=\n")
+    plugin_entries = sorted(
+        (
+            getattr(p, "name", type(p).__name__),
+            getattr(p, "version", "0"),
+        )
+        for p in plugins
+    )
+    for name, version in plugin_entries:
+        h.update(f"  {name}@{version}\n".encode())
 
     return h.hexdigest()
 

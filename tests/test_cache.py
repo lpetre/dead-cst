@@ -249,6 +249,100 @@ def test_warm_run_skips_visitor(tmp_path, monkeypatch):
     assert calls == []
 
 
+def test_warm_run_with_plugins_parses_zero_files(tmp_path, monkeypatch):
+    """A warm run with the full builtin plugin set never parses any file.
+
+    The two-pass plugin protocol bakes per-file observe contributions
+    into the cached :class:`VisitorPayload`, so on a cache hit the
+    analyzer skips both the visitor and the per-plugin observe. The
+    per-base ``finalize`` step is graph-only (no CST access). This
+    test pins that contract: even with every builtin plugin enabled,
+    a warm run never instantiates ``FullRepoManager`` and never calls
+    ``cst.parse_module`` from inside the analyzer.
+    """
+    import libcst as cst
+
+    from dead_cst import (
+        ClickPlugin,
+        FastAPIPlugin,
+        FlaskPlugin,
+        InitSubclassPlugin,
+        MainBlockPlugin,
+        ModuleDundersPlugin,
+        ProjectScriptsPlugin,
+        PytestPlugin,
+        TyperPlugin,
+        UnittestPlugin,
+    )
+    from dead_cst import _analyze
+
+    _write(
+        tmp_path,
+        {
+            "pkg/__init__.py": "",
+            "pkg/a.py": """
+                def main(): pass
+
+                if __name__ == "__main__":
+                    main()
+            """,
+            "pkg/b.py": """
+                __version__ = "1.0"
+
+                def f(): pass
+            """,
+        },
+    )
+    plugins = [
+        MainBlockPlugin(),
+        ProjectScriptsPlugin(),
+        ModuleDundersPlugin(),
+        PytestPlugin(),
+        UnittestPlugin(),
+        FastAPIPlugin(),
+        FlaskPlugin(),
+        TyperPlugin(),
+        ClickPlugin(),
+        InitSubclassPlugin(),
+    ]
+    db = tmp_path / CACHE_DIR_NAME / "cache.db"
+    fp = compute_fingerprint(paths={tmp_path: []}, resolvers=[], plugins=plugins)
+
+    # Cold run populates the cache and exercises every observe step.
+    with GraphCache(db, fingerprint=fp) as cache:
+        build_symbol_graph({tmp_path: []}, plugins=plugins, cache=cache)
+
+    visitor_calls: list[object] = []
+    mgr_calls: list[object] = []
+    parse_calls: list[object] = []
+    real_visitor = _analyze.SymbolVisitor
+    real_mgr = _analyze.FullRepoManager
+    real_parse = cst.parse_module
+
+    def _visitor_spy(*args, **kwargs):
+        visitor_calls.append(args)
+        return real_visitor(*args, **kwargs)
+
+    def _mgr_spy(*args, **kwargs):
+        mgr_calls.append(args)
+        return real_mgr(*args, **kwargs)
+
+    def _parse_spy(*args, **kwargs):
+        parse_calls.append(args)
+        return real_parse(*args, **kwargs)
+
+    monkeypatch.setattr(_analyze, "SymbolVisitor", _visitor_spy)
+    monkeypatch.setattr(_analyze, "FullRepoManager", _mgr_spy)
+    monkeypatch.setattr(cst, "parse_module", _parse_spy)
+
+    with GraphCache(db, fingerprint=fp) as cache:
+        build_symbol_graph({tmp_path: []}, plugins=plugins, cache=cache)
+
+    assert visitor_calls == []
+    assert mgr_calls == []
+    assert parse_calls == []
+
+
 def test_edited_file_re_runs_visitor(tmp_path, monkeypatch):
     """Editing one file invalidates only that file's cached payload."""
     _write(
@@ -313,12 +407,15 @@ def test_fingerprint_change_forces_full_rebuild(tmp_path, monkeypatch):
     assert {p.name for p in visited} == {"__init__.py", "a.py", "b.py"}
 
 
-def test_plugins_still_run_on_warm_cache(tmp_path):
-    """Plugin pass executes every run, even when every file hits the cache.
+def test_plugin_contributions_survive_warm_cache(tmp_path):
+    """Plugin observe contributions are baked into the cached payload.
 
-    Plugins aren't part of the fingerprint -- swapping them between
-    runs reuses cached payloads and only re-runs the plugin pass. This
-    test confirms a plugin's contributions land in the warm-run graph.
+    The two-pass protocol folds each plugin's per-file ``observe``
+    output into the cached :class:`VisitorPayload`. On warm runs the
+    visitor is skipped *and* observe is skipped -- the cached payload
+    already carries the plugin nodes/edges. The per-base ``finalize``
+    runs every analysis (graph-only, no CST). The end-to-end live
+    set must match the cold run.
     """
     from dead_cst import MainBlockPlugin
 
@@ -335,22 +432,59 @@ def test_plugins_still_run_on_warm_cache(tmp_path):
         },
     )
     db = tmp_path / CACHE_DIR_NAME / "cache.db"
-    fp = compute_fingerprint(paths={tmp_path: []}, resolvers=[])
+    plugins = [MainBlockPlugin()]
+    fp = compute_fingerprint(paths={tmp_path: []}, resolvers=[], plugins=plugins)
 
-    # Cold run with the plugin -- populates the cache and the plugin's
-    # synthetic entrypoint.
     with GraphCache(db, fingerprint=fp) as cache:
-        cold = build_symbol_graph({tmp_path: []}, plugins=[MainBlockPlugin()], cache=cache)
+        cold = build_symbol_graph({tmp_path: []}, plugins=plugins, cache=cache)
     cold_entrypoints = {n.fqname for n, a in cold.nodes(data=True) if a.get("entrypoint")}
 
-    # Warm run -- visitor is skipped, but the plugin must still run and
-    # mark the same entrypoint.
     with GraphCache(db, fingerprint=fp) as cache:
-        warm = build_symbol_graph({tmp_path: []}, plugins=[MainBlockPlugin()], cache=cache)
+        warm = build_symbol_graph({tmp_path: []}, plugins=plugins, cache=cache)
     warm_entrypoints = {n.fqname for n, a in warm.nodes(data=True) if a.get("entrypoint")}
 
     assert cold_entrypoints == warm_entrypoints
     assert cold_entrypoints  # plugin actually contributed something
+
+
+def test_plugin_version_bump_invalidates_cache(tmp_path, monkeypatch):
+    """Bumping a plugin's ``version`` invalidates its cached observe output."""
+    from dead_cst import MainBlockPlugin
+
+    _write(
+        tmp_path,
+        {
+            "pkg/__init__.py": "",
+            "pkg/m.py": "def main(): pass\n",
+        },
+    )
+    db = tmp_path / CACHE_DIR_NAME / "cache.db"
+
+    plugins_v1 = [MainBlockPlugin()]
+    fp_v1 = compute_fingerprint(paths={tmp_path: []}, resolvers=[], plugins=plugins_v1)
+    with GraphCache(db, fingerprint=fp_v1) as cache:
+        build_symbol_graph({tmp_path: []}, plugins=plugins_v1, cache=cache)
+
+    # Bump the plugin's version: should invalidate the file_cache so
+    # the next run re-visits every file (and re-runs observe).
+    bumped = MainBlockPlugin()
+    bumped.version = "2"
+    fp_v2 = compute_fingerprint(paths={tmp_path: []}, resolvers=[], plugins=[bumped])
+    assert fp_v1 != fp_v2
+
+    from dead_cst import _analyze
+
+    visited: list[Path] = []
+    real = _analyze.SymbolVisitor
+
+    def _spy(path, *args, **kwargs):
+        visited.append(path)
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(_analyze, "SymbolVisitor", _spy)
+    with GraphCache(db, fingerprint=fp_v2) as cache:
+        build_symbol_graph({tmp_path: []}, plugins=[bumped], cache=cache)
+    assert {p.name for p in visited} == {"__init__.py", "m.py"}
 
 
 # ---------------------------------------------------------------------------

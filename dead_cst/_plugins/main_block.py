@@ -3,12 +3,24 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable
+from typing import TYPE_CHECKING, Iterable
 
 import libcst as cst
 from libcst.metadata import CodePosition, CodeRange, PositionProvider
 
-from ._core import GraphOp, PluginContext, is_name, mark_entrypoints
+from .._symbols import NodeFlags
+from ._core import (
+    SYNTHETIC_POSITION,
+    GraphOp,
+    ObserveContext,
+    PluginContext,
+    _payload_from,
+    is_name,
+    synthetic_node,
+)
+
+if TYPE_CHECKING:
+    from .._visitor import VisitorPayload
 
 MAIN_BLOCK_PREFIX = "<__main__>:"
 
@@ -31,36 +43,44 @@ class MainBlockPlugin:
     ``synth -> app`` edge that chain stays unreachable and ``Foo`` /
     ``main`` look dead.
 
-    There's no useful import-based prefilter here, but the parsed
-    modules are already in the per-base cache, so iterating every
-    module is effectively free.
+    Pure per-file work: the file's CST locates the ``__main__`` block,
+    the file's :class:`VisitorPayload` provides the top-level decls,
+    and the contribution is added directly to the cached payload.
     """
 
     name: str = "main_block"
+    version: str = "1"
 
-    def contribute(self, ctx: PluginContext) -> Iterable[GraphOp]:
-        for path, module_node in ctx.base_modules():
-            module = ctx.parse(path)
-            if module is None:
-                continue
-            main_block = _find_main_block(module)
-            if main_block is None:
-                continue
-            block_range = cst.MetadataWrapper(module, unsafe_skip_copy=True).resolve(
-                PositionProvider
-            )[main_block]
-            block_decls = [
-                node
-                for node in ctx.base_nodes()
-                if node.path == path
-                and node.type in ("class", "function", "variable", "import")
-                and _range_contains(block_range, node.position)
-            ]
-            yield from mark_entrypoints(
-                f"{MAIN_BLOCK_PREFIX}{module_node.fqname}",
-                path,
-                [module_node, *block_decls],
-            )
+    def observe(self, ctx: ObserveContext) -> VisitorPayload | None:
+        main_block = _find_main_block(ctx.module)
+        if main_block is None:
+            return None
+        block_range = cst.MetadataWrapper(ctx.module, unsafe_skip_copy=True).resolve(
+            PositionProvider
+        )[main_block]
+
+        module_node = next((n for n in ctx.payload.nodes if n.type == "module"), None)
+        if module_node is None:
+            return None
+
+        block_decls = [
+            n
+            for n in ctx.payload.nodes
+            if n.type in ("class", "function", "variable", "import")
+            and _range_contains(block_range, n.position)
+        ]
+
+        synth = synthetic_node(
+            f"{MAIN_BLOCK_PREFIX}{module_node.fqname}",
+            ctx.path,
+            flags=NodeFlags.ENTRYPOINT,
+        )
+        edges = [(synth, module_node, SYNTHETIC_POSITION)]
+        edges.extend((synth, d, SYNTHETIC_POSITION) for d in block_decls)
+        return _payload_from(nodes=[synth], edges=edges)
+
+    def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]:
+        return ()
 
 
 def _find_main_block(module: cst.Module) -> cst.If | None:

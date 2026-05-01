@@ -26,22 +26,29 @@ attached to a group via ``add_command``.
 
 from __future__ import annotations
 
+from libcst.metadata import CodeRange
 from dataclasses import dataclass
-from typing import Iterable
+from typing import TYPE_CHECKING, Iterable
 
 import libcst as cst
 
+from .._symbols import SymbolNode
 from ._core import (
-    AddEdge,
+    SYNTHETIC_POSITION,
     GraphOp,
+    ObserveContext,
     PluginContext,
+    _payload_from,
     collect_module_imports,
     decorator_owner,
     find_handlers,
-    require_resolved_dep,
     matched_attr_call,
+    simple_name,
     single_target_assignment,
 )
+
+if TYPE_CHECKING:
+    from .._visitor import VisitorPayload
 
 # Attribute names a Click ``Group`` uses to register a callable. Matched
 # as the rightmost attribute of ``@<instance>.<name>(...)``.
@@ -82,13 +89,9 @@ class ClickPlugin:
        ``@X.group(...)``, or ``@X.result_callback(...)``, emits an edge
        ``X -> handler`` so the handler is reachable whenever ``X`` is.
 
-    Click groups are not auto-marked as entrypoints. The expected wiring
-    is ``[project.scripts]`` (``ProjectScriptsPlugin`` seeds
-    ``module:cli``) or an ``if __name__ == "__main__": cli()`` block
-    (``MainBlockPlugin``); both paths make the group reachable, after
-    which this plugin's edges keep its commands alive. Sub-groups added
-    via ``cli.add_command(sub)`` are reached through the regular
-    reference tracking on that call.
+    Pure per-file work: the ``@<known_group>.group(...)`` fixpoint
+    operates on the file's CST only -- a chain of nested groups in
+    one module converges in one observe pass.
 
     Limitations: only top-level definitions / assignments with a single
     ``Name`` target are detected. Factory-style groups
@@ -98,37 +101,32 @@ class ClickPlugin:
     """
 
     name: str = "click"
+    version: str = "1"
 
-    def contribute(self, ctx: PluginContext) -> Iterable[GraphOp]:
-        if require_resolved_dep(ctx, "click") is None:
-            return
-        candidate_paths = ctx.importers("click")
+    def observe(self, ctx: ObserveContext) -> VisitorPayload | None:
+        click_imports = collect_module_imports(ctx.module, "click", _GROUP_DECORATOR_NAMES)
+        if not click_imports:
+            return None
+        instances = _find_instances(ctx.module, click_imports)
+        if not instances:
+            return None
+        handlers = find_handlers(ctx.module, instances, _REGISTRATION_DECORATORS)
+        if not handlers:
+            return None
 
-        for path, module_node in ctx.base_modules():
-            if path not in candidate_paths:
-                continue
-            module = ctx.parse(path)
-            if module is None:
-                continue
-            click_imports = collect_module_imports(module, "click", _GROUP_DECORATOR_NAMES)
-            if not click_imports:
-                continue
-            instances = _find_instances(module, click_imports)
-            if not instances:
-                continue
-            handlers = find_handlers(module, instances, _REGISTRATION_DECORATORS)
+        decls_by_name = _decls_by_simple_name(ctx.payload.nodes)
+        edges: list[tuple[SymbolNode, SymbolNode, CodeRange]] = []
+        for var_name, handler_names in handlers.items():
+            for instance_decl in decls_by_name.get(var_name, []):
+                for handler_name in handler_names:
+                    for handler_decl in decls_by_name.get(handler_name, []):
+                        edges.append((instance_decl, handler_decl, SYNTHETIC_POSITION))
+        if not edges:
+            return None
+        return _payload_from(edges=edges)
 
-            module_fqname = module_node.fqname
-            for var_name in instances:
-                instance_decls = ctx.find_declarations(f"{module_fqname}.{var_name}")
-                if not instance_decls:
-                    continue
-                for instance_decl in instance_decls:
-                    for handler_name in handlers.get(var_name, ()):
-                        for handler_decl in ctx.find_declarations(
-                            f"{module_fqname}.{handler_name}"
-                        ):
-                            yield AddEdge(instance_decl, handler_decl)
+    def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]:
+        return ()
 
 
 def _find_instances(module: cst.Module, click_imports: dict[str, str]) -> set[str]:
@@ -179,3 +177,11 @@ def _find_instances(module: cst.Module, click_imports: dict[str, str]) -> set[st
                     changed = True
                     break
     return instances
+
+
+def _decls_by_simple_name(nodes) -> dict[str, list[SymbolNode]]:
+    out: dict[str, list[SymbolNode]] = {}
+    for n in nodes:
+        if n.type in ("class", "function", "variable", "import"):
+            out.setdefault(simple_name(n.fqname), []).append(n)
+    return out

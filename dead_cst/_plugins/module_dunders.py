@@ -3,10 +3,21 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable
+from typing import TYPE_CHECKING, Iterable
 
-from .._symbols import SymbolNode
-from ._core import GraphOp, PluginContext, mark_entrypoints, simple_name
+from .._symbols import NodeFlags, SymbolNode
+from ._core import (
+    SYNTHETIC_POSITION,
+    GraphOp,
+    ObserveContext,
+    PluginContext,
+    _payload_from,
+    simple_name,
+    synthetic_node,
+)
+
+if TYPE_CHECKING:
+    from .._visitor import VisitorPayload
 
 DUNDER_PREFIX = "<dunder>:"
 
@@ -25,15 +36,31 @@ class ModuleDundersPlugin:
     but the import itself changes how the surrounding module parses, so
     rewriting it away is observable. Both kinds get a synthetic entrypoint
     node with an edge so :func:`find_reachable` preserves them.
+
+    The plugin runs entirely off the per-file :class:`VisitorPayload` --
+    no CST inspection is needed -- so the cache hit path skips it for
+    free.
     """
 
     name: str = "module_dunders"
+    version: str = "1"
 
-    def contribute(self, ctx: PluginContext) -> Iterable[GraphOp]:
-        for node in ctx.base_nodes():
-            if not _is_kept_alive(node):
-                continue
-            yield from mark_entrypoints(f"{DUNDER_PREFIX}{node.fqname}", node.path, [node])
+    def observe(self, ctx: ObserveContext) -> VisitorPayload | None:
+        targets = [n for n in ctx.payload.nodes if _is_kept_alive(n)]
+        if not targets:
+            return None
+        nodes: list[SymbolNode] = []
+        edges = []
+        for target in targets:
+            synth = synthetic_node(
+                f"{DUNDER_PREFIX}{target.fqname}", target.path, flags=NodeFlags.ENTRYPOINT
+            )
+            nodes.append(synth)
+            edges.append((synth, target, SYNTHETIC_POSITION))
+        return _payload_from(nodes=nodes, edges=edges)
+
+    def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]:
+        return ()
 
 
 def _is_kept_alive(node: SymbolNode) -> bool:

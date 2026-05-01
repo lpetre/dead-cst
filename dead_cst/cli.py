@@ -97,19 +97,21 @@ def _maybe_cache(
     root: Path,
     paths_dict: PathMap,
     resolvers: list[PathResolver],
+    plugins: list[EdgePlugin],
     no_cache: bool,
 ) -> Iterator[GraphCache | None]:
     """Yield a per-run :class:`GraphCache`, or ``None`` when ``--no-cache`` is set.
 
-    The fingerprint covers the resolved ``PathMap`` and resolver chain so
-    a layout or import-resolution change wipes the on-disk ``file_cache``
-    automatically (see :func:`compute_fingerprint`). The context manager
-    closes the SQLite connection on exit, even when the analysis raises.
+    The fingerprint covers the resolved ``PathMap``, resolver chain,
+    and plugin set so a layout, import-resolution, or plugin change
+    wipes the on-disk ``file_cache`` automatically (see
+    :func:`compute_fingerprint`). The context manager closes the
+    SQLite connection on exit, even when the analysis raises.
     """
     if no_cache:
         yield None
         return
-    fingerprint = compute_fingerprint(paths=paths_dict, resolvers=resolvers)
+    fingerprint = compute_fingerprint(paths=paths_dict, resolvers=resolvers, plugins=plugins)
     with GraphCache(default_cache_path(root), fingerprint) as cache:
         yield cache
 
@@ -196,7 +198,7 @@ def analyze(
         entrypoints=entrypoint or [],
         plugin_names=plugin or [],
     )
-    with _maybe_cache(root, paths_dict, resolvers, no_cache) as cache:
+    with _maybe_cache(root, paths_dict, resolvers, plugins, no_cache) as cache:
         graph = build_symbol_graph(
             paths_dict,
             plugins=plugins,
@@ -368,7 +370,7 @@ def why_alive(
         entrypoints=[],
         plugin_names=plugin or [],
     )
-    with _maybe_cache(root, paths_dict, resolvers, no_cache) as cache:
+    with _maybe_cache(root, paths_dict, resolvers, plugins, no_cache) as cache:
         graph = build_symbol_graph(
             paths_dict,
             plugins=plugins,
@@ -439,7 +441,7 @@ def dependencies(
     paths_dict, resolvers = resolve_paths(root, path or [], resolver or [])
 
     typer.echo(f"Building symbol graph for {root}...", err=True)
-    with _maybe_cache(root, paths_dict, resolvers, no_cache) as cache:
+    with _maybe_cache(root, paths_dict, resolvers, [], no_cache) as cache:
         graph = build_symbol_graph(
             paths_dict,
             resolvers=resolvers,
@@ -511,7 +513,7 @@ def unused_exports(
         entrypoints=entrypoint or [],
         plugin_names=plugin or [],
     )
-    with _maybe_cache(root, paths_dict, resolvers, no_cache) as cache:
+    with _maybe_cache(root, paths_dict, resolvers, plugins, no_cache) as cache:
         graph = build_symbol_graph(
             paths_dict,
             plugins=plugins,
@@ -598,7 +600,7 @@ def remove(
         entrypoints=entrypoint or [],
         plugin_names=plugin or [],
     )
-    with _maybe_cache(root, paths_dict, resolvers, no_cache) as cache:
+    with _maybe_cache(root, paths_dict, resolvers, plugins, no_cache) as cache:
         graph = build_symbol_graph(
             paths_dict,
             plugins=plugins,

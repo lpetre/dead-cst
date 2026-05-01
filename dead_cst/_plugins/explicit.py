@@ -6,10 +6,13 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable
+from typing import TYPE_CHECKING, Iterable
 
 from .._symbols import SymbolNode
-from ._core import GraphOp, PluginContext, mark_entrypoints
+from ._core import GraphOp, ObserveContext, PluginContext, mark_entrypoints
+
+if TYPE_CHECKING:
+    from .._visitor import VisitorPayload
 
 EXPLICIT_PREFIX = "<entrypoint>:"
 
@@ -27,13 +30,19 @@ class ExplicitEntrypointPlugin:
       ``project_root``.
 
     For every matching :class:`SymbolNode`, a synthetic entrypoint node is
-    added with an edge pointing at the match.
+    added with an edge pointing at the match. Finalize-only: matches are
+    computed against the assembled graph, so user specs that target
+    plugin-emitted synthetics are recognized too.
     """
 
     specs: list[str | Path | re.Pattern[str]] = field(default_factory=list)
     name: str = "explicit"
+    version: str = "1"
 
-    def contribute(self, ctx: PluginContext) -> Iterable[GraphOp]:
+    def observe(self, ctx: ObserveContext) -> VisitorPayload | None:
+        return None
+
+    def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]:
         root = ctx.project_root
         for node in ctx.base_nodes():
             if not self._matches(node, root):

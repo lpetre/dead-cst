@@ -1,5 +1,5 @@
 """Tests for the per-base ``PluginContext`` surface: ``parse``, ``importers``,
-``base_modules``, and the analyzer's priming behaviour."""
+``base_modules``."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import libcst as cst
 import networkx as nx
 
 from dead_cst import build_symbol_graph
-from dead_cst._plugins import GraphOp, PluginContext
+from dead_cst._plugins import GraphOp, ObserveContext, PluginContext
 from dead_cst._symbols import SymbolTrie
 
 
@@ -55,32 +55,6 @@ def test_parse_handles_syntax_error(tmp_path):
     assert ctx.parse(p) is None
 
 
-def test_analyze_primes_per_base_modules(tmp_path, write_files):
-    """build_symbol_graph hands plugins the modules it already parsed."""
-    write_files({"pkg/__init__.py": "", "pkg/a.py": "def f(): pass"})
-    seen: dict[Path, cst.Module] = {}
-
-    @dataclass
-    class _Capture:
-        name: str = "capture"
-
-        def contribute(self, ctx: PluginContext) -> Iterable[GraphOp]:
-            for path, _ in ctx.base_modules():
-                module = ctx.parse(path)
-                assert module is not None
-                seen[path] = module
-            return ()
-
-    build_symbol_graph(
-        {tmp_path: []},
-        plugins=[_Capture()],
-        project_root=tmp_path,
-    )
-    assert {p.name for p in seen} == {"__init__.py", "a.py"}
-    a_path = next(p for p in seen if p.name == "a.py")
-    assert "def f()" in seen[a_path].code
-
-
 def test_base_modules_only_yields_under_base(tmp_path, write_files):
     """``ctx.base_modules()`` filters to the current base, not the full graph."""
     write_files(
@@ -96,8 +70,12 @@ def test_base_modules_only_yields_under_base(tmp_path, write_files):
     @dataclass
     class _Capture:
         name: str = "capture"
+        version: str = "1"
 
-        def contribute(self, ctx: PluginContext) -> Iterable[GraphOp]:
+        def observe(self, ctx: ObserveContext):
+            return None
+
+        def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]:
             seen_per_base[ctx.base] = {p.name for p, _ in ctx.base_modules()}
             return ()
 
@@ -127,8 +105,12 @@ def test_importers_finds_first_party_imports(tmp_path, write_files):
     @dataclass
     class _Capture:
         name: str = "capture"
+        version: str = "1"
 
-        def contribute(self, ctx: PluginContext) -> Iterable[GraphOp]:
+        def observe(self, ctx: ObserveContext):
+            return None
+
+        def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]:
             seen.update(ctx.importers("pkg.lib"))
             return ()
 
@@ -154,8 +136,12 @@ def test_importers_finds_third_party_dist(tmp_path, write_files):
     @dataclass
     class _Capture:
         name: str = "capture"
+        version: str = "1"
 
-        def contribute(self, ctx: PluginContext) -> Iterable[GraphOp]:
+        def observe(self, ctx: ObserveContext):
+            return None
+
+        def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]:
             seen.update(ctx.importers("typer"))
             return ()
 
@@ -174,8 +160,12 @@ def test_importers_unknown_returns_empty(tmp_path, write_files):
     @dataclass
     class _Capture:
         name: str = "capture"
+        version: str = "1"
 
-        def contribute(self, ctx: PluginContext) -> Iterable[GraphOp]:
+        def observe(self, ctx: ObserveContext):
+            return None
+
+        def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]:
             nonlocal saw_empty
             saw_empty = ctx.importers("definitely-not-a-module") == set()
             return ()

@@ -9,6 +9,42 @@ two versions.
 
 ## [Unreleased]
 
+### Changed
+- `EdgePlugin` is now a two-pass protocol:
+  - `observe(ctx) -> VisitorPayload | None` runs in the per-file
+    analyzer loop with the file's parsed CST and just-built
+    `VisitorPayload`. The plugin returns the same payload shape
+    (`nodes` + `edges`) and the analyzer concatenates that with the
+    visitor's payload before applying. Plugin contributions are
+    cached alongside the visitor's output, so a warm cache hit
+    returns the combined payload in one read.
+  - `finalize(ctx) -> Iterable[GraphOp]` runs once per base after
+    `resolve_edges`. It is graph-only -- no CST access -- and is
+    where cross-file work belongs (FastAPI's factory walk,
+    InitSubclass's transitive subclass closure, `[project.scripts]`
+    lookups). Plugins use synthetic markers from their `observe`
+    pass to communicate state forward into `finalize` (e.g.
+    `<fastapi-pending>:<X.fqname>` for variables that need a graph
+    walk to classify).
+  - `EdgePlugin.contribute` is replaced by `observe` + `finalize`.
+    Every builtin plugin -- `MainBlockPlugin`,
+    `ProjectScriptsPlugin`, `ExplicitEntrypointPlugin`,
+    `ModuleDundersPlugin`, `PytestPlugin`, `UnittestPlugin`,
+    `FastAPIPlugin`, `FlaskPlugin`, `TyperPlugin`, `ClickPlugin`,
+    `InitSubclassPlugin` -- migrates accordingly.
+  - Plugins declare a `version: str` attribute. The cache
+    fingerprint includes each plugin's `(name, version)` pair, so
+    bumping a plugin's version invalidates the file_cache (its
+    observe contributions are baked into cached payloads).
+- `NodeFlags.ENTRYPOINT`: a node flag that `_apply_payload` reads to
+  set `graph.nodes[node]["entrypoint"] = True`. Plugin observe passes
+  emit synthetic nodes flagged `ENTRYPOINT` to declare reachability
+  seeds without a separate API surface.
+- Warm cache runs with the full builtin plugin set now parse **zero**
+  files: the visitor and every plugin's observe contributions are
+  baked into the cached payloads, and `finalize` runs purely off the
+  graph. Pinned by `test_warm_run_with_plugins_parses_zero_files`.
+
 ### Fixed
 - `MainBlockPlugin` now keeps decls bound inside the
   `if __name__ == "__main__":` block alive, not just the containing

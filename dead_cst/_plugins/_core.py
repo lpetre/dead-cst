@@ -16,13 +16,23 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Container, Iterable, Iterator, Protocol, runtime_checkable
+from typing import (
+    TYPE_CHECKING,
+    Container,
+    Iterable,
+    Iterator,
+    Protocol,
+    runtime_checkable,
+)
 
 import libcst as cst
 import networkx as nx
 from libcst.metadata import CodePosition, CodeRange
 
-from .._symbols import SymbolNode, SymbolTrie
+from .._symbols import NodeFlags, SymbolNode, SymbolTrie
+
+if TYPE_CHECKING:
+    from .._visitor import VisitorPayload
 
 SYNTHETIC_POSITION = CodeRange(start=CodePosition(0, 0), end=CodePosition(0, 0))
 
@@ -258,20 +268,63 @@ class RemoveEdge:
 GraphOp = AddNode | AddEdge | RemoveEdge
 
 
+@dataclass(frozen=True)
+class ObserveContext:
+    """Per-file context handed to :meth:`EdgePlugin.observe`.
+
+    Plugins inspect the just-parsed CST and the visitor's per-file
+    :class:`VisitorPayload` and return a *new* :class:`VisitorPayload`
+    with their additional nodes and edges (or ``None`` if the file
+    contributes nothing). The returned payload is concatenated with
+    the visitor's, cached together, and applied to the graph.
+
+    Plugins should keep observe outputs file-local. Cross-file work
+    (looking through the assembled symbol graph, resolving factory
+    chains, computing transitive subclass closures) belongs in
+    :meth:`EdgePlugin.finalize`, which runs once per base after all
+    files' payloads have been applied and the per-base import edges
+    resolved -- and which never reads CSTs.
+    """
+
+    path: Path
+    module: cst.Module
+    payload: "VisitorPayload"
+    base: Path
+    project_root: Path
+
+
 @runtime_checkable
 class EdgePlugin(Protocol):
-    """A plugin that contributes graph ops once per base.
+    """A plugin that contributes nodes/edges per file plus an optional
+    per-base graph-finalize pass.
 
-    The analyzer calls :meth:`contribute` for every base in topological
-    order, after that base's import edges have been resolved. Plugins
-    use the per-base :class:`PluginContext` to look up symbols, parse
-    modules, and find importers of a given dep; they emit
-    :class:`GraphOp` values rather than mutating the graph directly.
+    Two phases:
+
+    * :meth:`observe` runs inside the analyzer's per-file loop with
+      the file's parsed :class:`libcst.Module` and just-built
+      :class:`VisitorPayload`. It returns a new payload (or ``None``)
+      whose ``nodes``/``edges`` extend the file's contribution. The
+      result is cached alongside the visitor's payload, so warm runs
+      skip both visiting and observing.
+
+    * :meth:`finalize` runs once per base after :func:`resolve_edges`
+      has stitched the cross-file import edges. It operates purely on
+      the assembled graph -- no CST access -- and emits
+      :class:`GraphOp` values. Plugins use this for cross-file work
+      that needs the full graph (factory walks, transitive subclass
+      closure, ``[project.scripts]`` lookups).
+
+    ``version`` invalidates per-plugin output: bumping it forces a
+    full re-run of :meth:`observe` for every file. Bump on any change
+    to the per-file shape that should not be served from older caches.
     """
 
     name: str
+    version: str
 
-    def contribute(self, ctx: PluginContext) -> Iterable[GraphOp]: ...
+    def observe(self, ctx: ObserveContext) -> "VisitorPayload | None": ...
+
+    def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]: ...
 
 
 def apply_ops(graph: nx.DiGraph, ops: Iterable[GraphOp]) -> None:
@@ -288,9 +341,16 @@ def apply_ops(graph: nx.DiGraph, ops: Iterable[GraphOp]) -> None:
                     graph.remove_edge(src, dst)
 
 
-def synthetic_node(fqname: str, path: Path) -> SymbolNode:
-    """Create a placeholder node plugins can attach edges to."""
-    return SymbolNode(fqname=fqname, type="synthetic", path=path, position=SYNTHETIC_POSITION)
+def synthetic_node(fqname: str, path: Path, *, flags: NodeFlags = NodeFlags.NONE) -> SymbolNode:
+    """Create a placeholder node plugins can attach edges to.
+
+    ``flags`` lets callers stamp ``NodeFlags.ENTRYPOINT`` directly on
+    the node so that ``_apply_payload`` will seed reachability from it
+    when the node is added to the graph.
+    """
+    return SymbolNode(
+        fqname=fqname, type="synthetic", path=path, position=SYNTHETIC_POSITION, flags=flags
+    )
 
 
 def mark_entrypoints(
@@ -299,7 +359,10 @@ def mark_entrypoints(
     """Emit a synthetic entrypoint node and edges from it to each target.
 
     Used by plugins that mark a set of decls alive without a natural caller --
-    pytest discovery, unittest discovery, and similar.
+    pytest discovery, unittest discovery, and similar. This helper is for
+    :meth:`EdgePlugin.finalize` (which emits :class:`GraphOp` values);
+    :func:`entrypoint_payload` is the per-file :meth:`EdgePlugin.observe`
+    equivalent.
     """
     targets = list(targets)
     if not targets:
@@ -308,6 +371,50 @@ def mark_entrypoints(
     yield AddNode(synth, entrypoint=True)
     for target in targets:
         yield AddEdge(synth, target)
+
+
+def entrypoint_payload(
+    seed_fqname: str,
+    path: Path,
+    targets: Iterable[SymbolNode],
+) -> "VisitorPayload | None":
+    """Per-file equivalent of :func:`mark_entrypoints`.
+
+    Returns a :class:`VisitorPayload` with one ``ENTRYPOINT``-flagged
+    synthetic node and an edge from it to every target, or ``None``
+    when ``targets`` is empty (so callers can ``return entrypoint_payload(...)``
+    directly from :meth:`EdgePlugin.observe`).
+    """
+    targets = list(targets)
+    if not targets:
+        return None
+    synth = synthetic_node(seed_fqname, path, flags=NodeFlags.ENTRYPOINT)
+    return _payload_from(
+        nodes=[synth],
+        edges=[(synth, t, SYNTHETIC_POSITION) for t in targets],
+    )
+
+
+def _payload_from(
+    *,
+    nodes: Iterable[SymbolNode] = (),
+    edges: Iterable[tuple[SymbolNode, SymbolNode, CodeRange]] = (),
+) -> "VisitorPayload":
+    """Build a plugin-style :class:`VisitorPayload`.
+
+    Plugins only contribute ``nodes`` and ``edges``; ``imports`` and
+    ``dead_suites`` stay empty so they don't disturb the visitor's
+    cross-file resolution or the dead-branch report.
+    """
+    # Lazy import to avoid the circular dep with ``_visitor``.
+    from .._visitor import VisitorPayload
+
+    return VisitorPayload(
+        nodes=tuple(nodes),
+        edges=tuple(edges),
+        imports=(),
+        dead_suites=(),
+    )
 
 
 def simple_name(fqname: str) -> str:
