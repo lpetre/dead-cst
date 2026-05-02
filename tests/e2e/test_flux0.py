@@ -91,9 +91,14 @@ class Flux0DynamicLoaderPlugin:
         return None
 
     def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]:
-        targets = [
-            node for node in ctx.base_nodes() if node.type == "module" and self._covers(node.fqname)
-        ]
+        # ``importlib.import_module(M)`` executes every top-level
+        # statement in ``M``, so every top-level decl inside a covered
+        # module behaves as if it were called from an entrypoint. The
+        # module node itself is a *successor* of its decls (decl -> module
+        # in the keep-alive graph), so attaching the synth to the module
+        # alone keeps the file from being reported but doesn't revive
+        # any of its contents -- we want the decls.
+        targets = [node for node in ctx.base_nodes() if self._covers(node.fqname)]
         if not targets:
             return
         # Inlined ``mark_entrypoints`` -- it lives in ``_plugins._core``
@@ -227,15 +232,23 @@ def test_flux0_cli_cmds_dead_without_plugin(flux0_cli_src):
 
 
 def test_flux0_dynamic_loader_revives_cli_cmds(flux0_cli_src):
+    """The plugin must keep both the modules *and* their contents alive.
+
+    Asserting just the module node would miss the failure mode where a
+    plugin attaches the synth to the module (which is a sink in the
+    keep-alive graph) and silently leaves every decl inside it dead.
+    """
     base = Path(flux0_cli_src)
     graph = _build_graph(base, MainBlockPlugin(), Flux0DynamicLoaderPlugin())
     reachable = find_reachable(graph)
 
     for fqname in (
-        "flux0_cli.cmds.agents",
-        "flux0_cli.cmds.sessions",
+        "flux0_cli.cmds.agents",  # module
+        "flux0_cli.cmds.sessions",  # module
+        "flux0_cli.cmds.agents.list_agents",  # decl inside the dynamic module
+        "flux0_cli.cmds.sessions.create_event",  # decl inside the dynamic module
     ):
-        node = _module_node(graph, fqname)
+        node = next((n for n in graph.nodes if n.fqname == fqname), None)
         assert node is not None, f"{fqname} not in graph"
         assert node in reachable, f"{fqname} should be alive once the plugin runs"
 
@@ -245,9 +258,12 @@ def test_flux0_dynamic_loader_revives_server_internal_modules(flux0_server_src):
     graph = _build_graph(base, MainBlockPlugin(), Flux0DynamicLoaderPlugin())
     reachable = find_reachable(graph)
 
-    replay_agent = _module_node(graph, "flux0_server.replay_agent")
-    assert replay_agent is not None
-    assert replay_agent in reachable, (
-        "flux0_server.replay_agent should be alive via the INTERNAL_MODULES "
-        "rule in the dynamic-loader plugin"
-    )
+    for fqname in (
+        "flux0_server.replay_agent",  # __init__ module
+        "flux0_server.replay_agent.init_module",  # decl inside __init__
+        "flux0_server.replay_agent.replay_agent",  # nested module
+        "flux0_server.replay_agent.replay_agent.ReplayAgentRunner",  # decl
+    ):
+        node = next((n for n in graph.nodes if n.fqname == fqname), None)
+        assert node is not None, f"{fqname} not in graph"
+        assert node in reachable, f"{fqname} should be alive via INTERNAL_MODULES"
