@@ -11,7 +11,7 @@ from ._core import (
     GraphOp,
     ObserveContext,
     PluginContext,
-    _payload_from,
+    make_payload,
     simple_name,
     synthetic_node,
 )
@@ -57,7 +57,7 @@ class ModuleDundersPlugin:
             )
             nodes.append(synth)
             edges.append((synth, target, SYNTHETIC_POSITION))
-        return _payload_from(nodes=nodes, edges=edges)
+        return make_payload(nodes=nodes, edges=edges)
 
     def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]:
         return ()

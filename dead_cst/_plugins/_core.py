@@ -107,6 +107,31 @@ class PluginContext:
                 return list(node.declarations[decl_name])
         return []
 
+    def module_surface(self, fqname: str) -> list[SymbolNode]:
+        """Return the module + every decl + every transitive submodule decl.
+
+        Models ``importlib.import_module(fqname)``: the module's whole
+        top-level surface (decls, imports, side-effecting assignments)
+        runs at import time, plus every submodule the package's own
+        imports bring in transitively. Walks the symbol trie in
+        O(declarations_in_subtree); cheaper than scanning the graph.
+        Returns an empty list when ``fqname`` doesn't resolve to a
+        first-party module.
+        """
+        trie_node = self.symbol_lookup._get(fqname.split("."))
+        if trie_node is None or trie_node.module is None:
+            return []
+        out: list[SymbolNode] = []
+        stack = [trie_node]
+        while stack:
+            node = stack.pop()
+            if node.module is not None:
+                out.append(node.module)
+            for bucket in node.declarations.values():
+                out.extend(bucket)
+            stack.extend(node.children.values())
+        return out
+
     def base_modules(self) -> Iterator[tuple[Path, SymbolNode]]:
         """Yield ``(path, module_node)`` for every module under :attr:`base`."""
         if self._base_modules_cache is None:
@@ -341,16 +366,41 @@ def apply_ops(graph: nx.DiGraph, ops: Iterable[GraphOp]) -> None:
                     graph.remove_edge(src, dst)
 
 
-def synthetic_node(fqname: str, path: Path, *, flags: NodeFlags = NodeFlags.NONE) -> SymbolNode:
+def synthetic_node(
+    fqname: str,
+    path: Path,
+    *,
+    flags: NodeFlags = NodeFlags.NONE,
+    position: CodeRange = SYNTHETIC_POSITION,
+) -> SymbolNode:
     """Create a placeholder node plugins can attach edges to.
 
     ``flags`` lets callers stamp ``NodeFlags.ENTRYPOINT`` directly on
     the node so that ``_apply_payload`` will seed reachability from it
-    when the node is added to the graph.
+    when the node is added to the graph. ``position`` defaults to the
+    file-wide :data:`SYNTHETIC_POSITION`; pass a real :class:`CodeRange`
+    when the synthetic stands in for a specific source location (e.g.
+    a string literal in a registry list) so ``why-alive`` and the
+    codemod report it correctly.
     """
-    return SymbolNode(
-        fqname=fqname, type="synthetic", path=path, position=SYNTHETIC_POSITION, flags=flags
-    )
+    return SymbolNode(fqname=fqname, type="synthetic", path=path, position=position, flags=flags)
+
+
+def decls_by_simple_name(nodes: Iterable[SymbolNode]) -> dict[str, list[SymbolNode]]:
+    """Index ``nodes`` by the rightmost dotted segment of their fqname.
+
+    Used by every framework plugin (Click, FastAPI, Flask, Typer) to
+    map a top-level name spotted in source (e.g. a Click group's
+    handler function) back to its :class:`SymbolNode` so an
+    ``instance -> handler`` edge can be emitted. Skips ``module``
+    and ``synthetic`` types because their fqnames don't denote
+    file-local declarations.
+    """
+    out: dict[str, list[SymbolNode]] = {}
+    for n in nodes:
+        if n.type in ("class", "function", "variable", "import"):
+            out.setdefault(simple_name(n.fqname), []).append(n)
+    return out
 
 
 def mark_entrypoints(
@@ -389,13 +439,13 @@ def entrypoint_payload(
     if not targets:
         return None
     synth = synthetic_node(seed_fqname, path, flags=NodeFlags.ENTRYPOINT)
-    return _payload_from(
+    return make_payload(
         nodes=[synth],
         edges=[(synth, t, SYNTHETIC_POSITION) for t in targets],
     )
 
 
-def _payload_from(
+def make_payload(
     *,
     nodes: Iterable[SymbolNode] = (),
     edges: Iterable[tuple[SymbolNode, SymbolNode, CodeRange]] = (),

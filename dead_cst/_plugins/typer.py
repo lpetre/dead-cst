@@ -27,11 +27,11 @@ from ._core import (
     GraphOp,
     ObserveContext,
     PluginContext,
-    _payload_from,
     collect_module_imports,
+    decls_by_simple_name,
     find_call_assignments,
     find_handlers,
-    simple_name,
+    make_payload,
 )
 
 if TYPE_CHECKING:
@@ -87,7 +87,7 @@ class TyperPlugin:
         if not handlers:
             return None
 
-        decls_by_name = _decls_by_simple_name(ctx.payload.nodes)
+        decls_by_name = decls_by_simple_name(ctx.payload.nodes)
         edges: list[tuple[SymbolNode, SymbolNode, CodeRange]] = []
         for var_name, handler_names in handlers.items():
             for instance_decl in decls_by_name.get(var_name, []):
@@ -96,15 +96,7 @@ class TyperPlugin:
                         edges.append((instance_decl, handler_decl, SYNTHETIC_POSITION))
         if not edges:
             return None
-        return _payload_from(edges=edges)
+        return make_payload(edges=edges)
 
     def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]:
         return ()
-
-
-def _decls_by_simple_name(nodes) -> dict[str, list[SymbolNode]]:
-    out: dict[str, list[SymbolNode]] = {}
-    for n in nodes:
-        if n.type in ("class", "function", "variable", "import"):
-            out.setdefault(simple_name(n.fqname), []).append(n)
-    return out

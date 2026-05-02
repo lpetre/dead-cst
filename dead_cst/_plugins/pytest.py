@@ -15,7 +15,7 @@ from ._core import (
     GraphOp,
     ObserveContext,
     PluginContext,
-    _payload_from,
+    make_payload,
     simple_name,
     synthetic_node,
 )
@@ -103,7 +103,7 @@ class PytestPlugin:
 
         if not new_nodes:
             return None
-        return _payload_from(nodes=new_nodes, edges=new_edges)
+        return make_payload(nodes=new_nodes, edges=new_edges)
 
     def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]:
         return ()

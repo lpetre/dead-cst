@@ -17,7 +17,7 @@ from ._plugins import (
     PluginContext,
     apply_ops,
 )
-from ._plugins._core import _payload_from
+from ._plugins._core import make_payload
 from ._resolvers import (
     ImportResolver,
     PathMap,
@@ -262,7 +262,7 @@ def _run_observe(
     both the visitor and the observe pass.
     """
     if not plugins:
-        return _payload_from()
+        return make_payload()
     ctx = ObserveContext(
         path=path,
         module=module,
@@ -277,7 +277,7 @@ def _run_observe(
         contribution = plugin.observe(ctx)
         if contribution is not None:
             payloads.append(contribution)
-    return _merge_payloads(*payloads) if payloads else _payload_from()
+    return _merge_payloads(*payloads) if payloads else make_payload()
 
 
 def _merge_payloads(*payloads: VisitorPayload) -> VisitorPayload:

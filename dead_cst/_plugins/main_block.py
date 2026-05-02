@@ -14,7 +14,7 @@ from ._core import (
     GraphOp,
     ObserveContext,
     PluginContext,
-    _payload_from,
+    make_payload,
     is_name,
     synthetic_node,
 )
@@ -77,7 +77,7 @@ class MainBlockPlugin:
         )
         edges = [(synth, module_node, SYNTHETIC_POSITION)]
         edges.extend((synth, d, SYNTHETIC_POSITION) for d in block_decls)
-        return _payload_from(nodes=[synth], edges=edges)
+        return make_payload(nodes=[synth], edges=edges)
 
     def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]:
         return ()

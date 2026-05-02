@@ -14,7 +14,7 @@ from ._core import (
     ObserveContext,
     PluginContext,
     _asname_value,
-    _payload_from,
+    make_payload,
     is_from_module,
     is_name,
     simple_name,
@@ -98,7 +98,7 @@ class UnittestPlugin:
             flags=NodeFlags.ENTRYPOINT,
         )
         edges = [(synth, t, SYNTHETIC_POSITION) for t in targets]
-        return _payload_from(nodes=[synth], edges=edges)
+        return make_payload(nodes=[synth], edges=edges)
 
     def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]:
         return ()

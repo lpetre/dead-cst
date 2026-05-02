@@ -46,7 +46,7 @@ from ._core import (
     GraphOp,
     ObserveContext,
     PluginContext,
-    _payload_from,
+    make_payload,
     simple_name,
     synthetic_node,
 )
@@ -127,7 +127,7 @@ class InitSubclassPlugin:
 
         if not nodes and not edges:
             return None
-        return _payload_from(nodes=nodes, edges=edges)
+        return make_payload(nodes=nodes, edges=edges)
 
     def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]:
         # Index synth markers by fqname so we can look up
