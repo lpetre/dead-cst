@@ -28,13 +28,13 @@ from dataclasses import dataclass
 from typing import Iterable
 
 import libcst as cst
+from libcst.metadata import CodeRange, PositionProvider
 
 from dead_cst import AddEdge, GraphOp, NodeFlags, PluginContext
 from dead_cst._plugins import (
     SYNTHETIC_POSITION,
     ObserveContext,
     entrypoint_payload,
-    synthetic_node,
 )
 from dead_cst._plugins._core import (
     _payload_from,
@@ -181,8 +181,8 @@ class LiteralListPlugin:
         module_node = next((n for n in ctx.payload.nodes if n.type == "module"), None)
         if module_node is None or module_node.fqname != self.owner_fqname:
             return None
-        fqnames = _read_string_list(ctx.module, self.variable_name)
-        if not fqnames:
+        captured = _read_string_list_with_positions(ctx.module, self.variable_name)
+        if not captured:
             return None
 
         # Locate the variable's decl in this file's payload so the synth
@@ -201,8 +201,17 @@ class LiteralListPlugin:
         synth_prefix = self._synth_prefix()
         nodes: list[SymbolNode] = []
         edges: list[tuple[SymbolNode, SymbolNode, object]] = []
-        for fqname in fqnames:
-            synth = synthetic_node(f"{synth_prefix}{fqname}", ctx.path, flags=NodeFlags.ENTRYPOINT)
+        for fqname, position in captured:
+            # Anchor the synth at the string literal's position so
+            # ``why-alive`` and the codemod report the actual list
+            # entry as the source.
+            synth = SymbolNode(
+                fqname=f"{synth_prefix}{fqname}",
+                type="synthetic",
+                path=ctx.path,
+                position=position,
+                flags=NodeFlags.ENTRYPOINT,
+            )
             nodes.append(synth)
             if variable_decl is not None:
                 edges.append((synth, variable_decl, SYNTHETIC_POSITION))
@@ -230,15 +239,26 @@ class LiteralListPlugin:
         return list(ctx.find_declarations(fqname))
 
 
-def _read_string_list(module: cst.Module, var_name: str) -> list[str]:
-    """Return ``<var_name> = [<str>, ...]`` (or tuple) at module level.
+def _read_string_list_with_positions(
+    module: cst.Module, var_name: str
+) -> list[tuple[str, CodeRange]]:
+    """Return ``[(value, position), ...]`` for ``<var_name> = [<str>, ...]``.
+
+    Each entry's :class:`CodeRange` is the position of its string
+    literal in the source, so synthetic nodes anchored at those
+    positions get reported by ``why-alive`` / the codemod at the
+    right line + column. The metadata wrapper runs only here, on
+    cold runs -- the captured tuples ride the cached observe
+    payload on warm runs.
 
     Empty list when no such assignment exists or the RHS isn't a
     static list/tuple of string literals. Non-literal entries are
     dropped silently -- the runtime would just fail on them and we
     don't pretend to resolve them.
     """
-    for stmt in module.body:
+    wrapper = cst.MetadataWrapper(module, unsafe_skip_copy=True)
+    positions = wrapper.resolve(PositionProvider)
+    for stmt in wrapper.module.body:
         if not isinstance(stmt, cst.SimpleStatementLine):
             continue
         for small in stmt.body:
@@ -247,13 +267,13 @@ def _read_string_list(module: cst.Module, var_name: str) -> list[str]:
                 continue
             if not isinstance(value, (cst.List, cst.Tuple)):
                 return []
-            out: list[str] = []
+            out: list[tuple[str, CodeRange]] = []
             for elt in value.elements:
                 if not isinstance(elt, cst.Element):
                     continue
                 inner = elt.value
                 if isinstance(inner, cst.SimpleString):
-                    out.append(inner.evaluated_value)
+                    out.append((inner.evaluated_value, positions[inner]))
             return out
     return []
 
