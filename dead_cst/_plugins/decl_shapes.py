@@ -24,7 +24,7 @@ Both bases use only the public plugin-helpers re-exported from
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Iterable
+from typing import TYPE_CHECKING, Iterable, cast
 
 import libcst as cst
 from libcst.metadata import CodeRange, PositionProvider
@@ -261,6 +261,12 @@ def _read_string_list_with_positions(
         if not isinstance(elt, cst.Element):
             continue
         inner = elt.value
-        if isinstance(inner, cst.SimpleString):
-            out.append((inner.evaluated_value, positions[inner]))
+        if not isinstance(inner, cst.SimpleString):
+            continue
+        # ``evaluated_value`` is ``str | bytes`` because b"..." is also a
+        # ``SimpleString``; bytes literals can't be valid module fqnames.
+        value = inner.evaluated_value
+        if not isinstance(value, str):
+            continue
+        out.append((value, cast(CodeRange, positions[inner])))
     return out
