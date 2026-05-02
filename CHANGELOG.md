@@ -9,6 +9,67 @@ two versions.
 
 ## [Unreleased]
 
+### Added
+- `DecoratedDeclPlugin`: abstract `EdgePlugin` base for the "find decls
+  decorated by `@<module>.<name>(...)` or assigned via
+  `X = <module>.<ctor>(...)` in files matching a search path" idiom.
+  Subclasses set `package_prefix`, `decorator_module`, `decorator_names`,
+  `constructor_names`. Pure observe-time, so matches turn directly into
+  cached entrypoint payloads. `ClickPlugin` is now a subclass that adds
+  the nested-group fixpoint pass and overrides `observe` to emit
+  `instance -> handler` edges instead of seeding entrypoints.
+- `LiteralListPlugin`: abstract `EdgePlugin` base for the "read
+  `<owner>.<var> = ["a.b.c", ...]` and revive every fqname inside" idiom.
+  observe parses the literal once and emits ENTRYPOINT-flagged synthetic
+  decls (one per entry, positioned at the literal's site); finalize is a
+  graph-only pass that adds the cross-file edges. Owner-file-only CST
+  work is cached alongside the per-file payload, so warm runs do zero
+  parsing for this plugin. Both bases are abstract -- subclasses must
+  set `name` and `version`.
+- `PluginContext.module_surface(fqname)`: returns the module's
+  `SymbolNode` plus every top-level decl plus every transitive
+  submodule's surface, walked via the symbol trie in
+  `O(decls_in_subtree)`. Replaces hand-rolled scans of
+  `ctx.base_nodes()` for the common "this module is loaded
+  dynamically -- keep its surface alive" pattern.
+- `synthetic_node(..., position=...)`: optional `CodeRange` to anchor
+  a synthetic at a specific source location so `why-alive` and the
+  codemod report the right line. Defaults to `SYNTHETIC_POSITION` for
+  backwards compatibility.
+- New public re-exports under `dead_cst._plugins` (and the most-used
+  ones at the top level): `ObserveContext`, `make_payload` (renamed
+  from the private `_payload_from`), `mark_entrypoints`,
+  `decls_by_simple_name`, `simple_name`, `collect_module_imports`,
+  `matched_attr_call`, `single_target_assignment`, `find_handlers`,
+  `find_call_assignments`, `decorator_owner`, `is_name`,
+  `is_from_module`. These are the helpers user-written plugins reach
+  for; previously they lived in `_core` and required private imports.
+- E2E test suite under `tests/e2e/`, deselected by default
+  (`addopts = "-m 'not e2e'"`); run with `uv run pytest -m e2e`. The
+  first target is `flux0-ai/flux0` pinned at SHA `8d04176`. Tests
+  cover three levels: analyze runs to completion, `why-alive` chains
+  for known-alive symbols, and project-specific plugins that close
+  the repo's `importlib`-driven blind spots. `tests/e2e/conftest.py`
+  exposes a `clone_repo(name, url, sha)` fixture that shallow-clones
+  into pytest's cache dir (or `DEAD_CST_E2E_CACHE`) with a SHA
+  marker for idempotent reuse.
+
+### Changed
+- `EdgePlugin.version` is now `int` (Unix epoch by convention) rather
+  than `str`. Bump `version` to the current epoch on any change to a
+  plugin's `observe` shape that should not be served from older
+  caches; concurrent bumps on different branches merge with `max()`
+  semantics rather than colliding on a re-used label like `"2"`. All
+  builtin plugins migrated; the cache fingerprint format follows.
+- `_decls_by_simple_name` -- a four-line helper duplicated across
+  `ClickPlugin`, `FastAPIPlugin`, `FlaskPlugin`, `TyperPlugin` -- is
+  hoisted into `dead_cst._plugins._core.decls_by_simple_name` and
+  re-exported. Same behaviour, one definition.
+- `ClickPlugin` now subclasses `DecoratedDeclPlugin`, dropping ~70
+  lines of duplicated decorator-finding code. Behaviour is preserved
+  -- the plugin still emits `instance -> handler` edges and does not
+  seed Click groups as entrypoints.
+
 ## [0.2.0] - 2026-05-01
 
 ### Added

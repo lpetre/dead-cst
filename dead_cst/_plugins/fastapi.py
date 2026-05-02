@@ -113,7 +113,7 @@ class FastAPIPlugin:
     """
 
     name: str = "fastapi"
-    version: str = "1"
+    version: int = 1777760307
 
     def observe(self, ctx: ObserveContext) -> VisitorPayload | None:
         fastapi_imports = collect_module_imports(ctx.module, "fastapi", _INSTANCE_KINDS)

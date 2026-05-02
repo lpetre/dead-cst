@@ -74,7 +74,7 @@ class TyperPlugin:
     """
 
     name: str = "typer"
-    version: str = "1"
+    version: int = 1777760307
 
     def observe(self, ctx: ObserveContext) -> VisitorPayload | None:
         typer_imports = collect_module_imports(ctx.module, "typer", _TYPER_TARGETS)

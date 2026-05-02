@@ -339,13 +339,16 @@ class EdgePlugin(Protocol):
       that needs the full graph (factory walks, transitive subclass
       closure, ``[project.scripts]`` lookups).
 
-    ``version`` invalidates per-plugin output: bumping it forces a
-    full re-run of :meth:`observe` for every file. Bump on any change
-    to the per-file shape that should not be served from older caches.
+    ``version`` is a Unix epoch int by convention. Bump it (to the
+    current epoch) on any change to the plugin's per-file ``observe``
+    output that shouldn't be served from older caches. Epoch ints
+    merge with ``max()`` semantics: when two branches both bump the
+    same plugin, whichever commit is later wins instead of producing
+    a string-collision conflict like ``"2"`` vs ``"2"``.
     """
 
     name: str
-    version: str
+    version: int
 
     def observe(self, ctx: ObserveContext) -> "VisitorPayload | None": ...
 

@@ -107,7 +107,7 @@ class FlaskPlugin:
     """
 
     name: str = "flask"
-    version: str = "1"
+    version: int = 1777760307
 
     def observe(self, ctx: ObserveContext) -> VisitorPayload | None:
         flask_imports = collect_module_imports(ctx.module, "flask", _INSTANCE_KINDS)

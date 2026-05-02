@@ -64,7 +64,7 @@ class UnittestPlugin:
     """
 
     name: str = "unittest"
-    version: str = "1"
+    version: int = 1777760307
 
     def observe(self, ctx: ObserveContext) -> VisitorPayload | None:
         if not _file_imports_unittest(ctx.payload):

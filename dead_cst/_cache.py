@@ -82,7 +82,10 @@ def compute_fingerprint(
     fingerprinted by ``(name, version)`` because their ``observe``
     contributions are folded into each cached payload; bumping a
     plugin's ``version`` invalidates the file_cache so the new
-    observe output replaces the old.
+    observe output replaces the old. ``version`` is a Unix epoch
+    int by convention, so concurrent bumps on different branches
+    merge with ``max()``-wins semantics rather than colliding on a
+    re-used integer label.
 
     Each value is normalized to a stable string before hashing so
     equivalent inputs produce equal keys.
@@ -105,7 +108,7 @@ def compute_fingerprint(
     plugin_entries = sorted(
         (
             getattr(p, "name", type(p).__name__),
-            getattr(p, "version", "0"),
+            int(getattr(p, "version", 0)),
         )
         for p in plugins
     )

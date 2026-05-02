@@ -43,7 +43,7 @@ class ModuleDundersPlugin:
     """
 
     name: str = "module_dunders"
-    version: str = "1"
+    version: int = 1777760307
 
     def observe(self, ctx: ObserveContext) -> VisitorPayload | None:
         targets = [n for n in ctx.payload.nodes if _is_kept_alive(n)]

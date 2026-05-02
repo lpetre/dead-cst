@@ -92,7 +92,7 @@ class ClickPlugin(DecoratedDeclPlugin):
     """
 
     name: str = "click"
-    version: str = "1"
+    version: int = 1777760307
     decorator_module: str = "click"
     decorator_names: frozenset[str] = _GROUP_DECORATOR_NAMES
     constructor_names: frozenset[str] = _GROUP_CONSTRUCTOR_NAMES

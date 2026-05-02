@@ -49,7 +49,7 @@ class MainBlockPlugin:
     """
 
     name: str = "main_block"
-    version: str = "1"
+    version: int = 1777760307
 
     def observe(self, ctx: ObserveContext) -> VisitorPayload | None:
         main_block = _find_main_block(ctx.module)

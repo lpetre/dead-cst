@@ -37,7 +37,7 @@ class ExplicitEntrypointPlugin:
 
     specs: list[str | Path | re.Pattern[str]] = field(default_factory=list)
     name: str = "explicit"
-    version: str = "1"
+    version: int = 1777760307
 
     def observe(self, ctx: ObserveContext) -> VisitorPayload | None:
         return None

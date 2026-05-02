@@ -48,7 +48,7 @@ if TYPE_CHECKING:
     from .._visitor import VisitorPayload
 
 
-@dataclass
+@dataclass(kw_only=True)
 class DecoratedDeclPlugin:
     """Mark decls as entrypoints when their file is in scope and they
     bind to a name imported from ``decorator_module`` either via
@@ -71,14 +71,20 @@ class DecoratedDeclPlugin:
     Override :meth:`in_scope` for predicates the prefix can't express.
     Pure observe: matches turn directly into a per-file entrypoint
     payload, so finalize is a no-op.
+
+    Abstract base: subclasses must set ``name`` and ``version``
+    themselves. The cache fingerprint is ``(name, version)``, so
+    every concrete plugin needs its own ``name`` to avoid aliasing
+    other instances' cached observe payloads. Bump ``version`` to a
+    fresh epoch any time the subclass's config changes.
     """
 
+    name: str
+    version: int
     package_prefix: str = ""
     decorator_module: str = ""
     decorator_names: frozenset[str] = frozenset()
     constructor_names: frozenset[str] = frozenset()
-    name: str = "decorated_decl"
-    version: str = "1"
 
     def in_scope(self, ctx: ObserveContext) -> bool:
         """Return True if this file should be inspected.
@@ -154,7 +160,7 @@ class DecoratedDeclPlugin:
         return out
 
 
-@dataclass
+@dataclass(kw_only=True)
 class LiteralListPlugin:
     """Read ``<owner_fqname>.<variable_name>`` (a top-level list/tuple of
     string literals) and treat each entry as a fqname to keep alive.
@@ -171,12 +177,18 @@ class LiteralListPlugin:
     the variable's decl, so ``why-alive <owner>.<var>`` shows the
     list as the entrypoint chain. :meth:`finalize` only walks the
     assembled graph -- no CST parsing, no per-file plugin state.
+
+    Abstract base: subclasses must set ``name`` and ``version``
+    themselves. The cache fingerprint is ``(name, version)``, so
+    every concrete plugin needs its own ``name`` to avoid aliasing
+    other instances' cached observe payloads. Bump ``version`` to a
+    fresh epoch any time the subclass's config changes.
     """
 
+    name: str
+    version: int
     owner_fqname: str = ""
     variable_name: str = ""
-    name: str = "literal_list"
-    version: str = "1"
 
     def observe(self, ctx: ObserveContext) -> "VisitorPayload | None":
         if not self.owner_fqname or not self.variable_name:

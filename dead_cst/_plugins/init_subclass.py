@@ -88,7 +88,7 @@ class InitSubclassPlugin:
     """
 
     name: str = "init_subclass"
-    version: str = "1"
+    version: int = 1777760307
 
     def observe(self, ctx: ObserveContext) -> VisitorPayload | None:
         nodes_by_simple = _local_class_decls(ctx.payload.nodes)
