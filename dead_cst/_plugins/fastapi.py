@@ -36,12 +36,12 @@ from ._core import (
     GraphOp,
     ObserveContext,
     PluginContext,
-    _payload_from,
     collect_module_imports,
+    decls_by_simple_name,
     find_call_assignments,
     find_handlers,
+    make_payload,
     require_resolved_dep,
-    simple_name,
     synthetic_node,
     walk_to_instance_kind,
 )
@@ -113,7 +113,7 @@ class FastAPIPlugin:
     """
 
     name: str = "fastapi"
-    version: str = "1"
+    version: int = 1777760307
 
     def observe(self, ctx: ObserveContext) -> VisitorPayload | None:
         fastapi_imports = collect_module_imports(ctx.module, "fastapi", _INSTANCE_KINDS)
@@ -122,7 +122,7 @@ class FastAPIPlugin:
         if not direct and not decorated:
             return None
 
-        decls_by_name = _decls_by_simple_name(ctx.payload.nodes)
+        decls_by_name = decls_by_simple_name(ctx.payload.nodes)
         nodes: list[SymbolNode] = []
         edges: list[tuple[SymbolNode, SymbolNode, CodeRange]] = []
 
@@ -153,7 +153,7 @@ class FastAPIPlugin:
 
         if not nodes and not edges:
             return None
-        return _payload_from(nodes=nodes, edges=edges)
+        return make_payload(nodes=nodes, edges=edges)
 
     def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]:
         fastapi_node = require_resolved_dep(ctx, "fastapi")
@@ -175,11 +175,3 @@ class FastAPIPlugin:
                 seed = synthetic_node(f"{FASTAPI_APP_PREFIX}{var.fqname}", var.path)
                 yield AddNode(seed, entrypoint=True)
                 yield AddEdge(seed, var)
-
-
-def _decls_by_simple_name(nodes) -> dict[str, list[SymbolNode]]:
-    out: dict[str, list[SymbolNode]] = {}
-    for n in nodes:
-        if n.type in ("class", "function", "variable", "import"):
-            out.setdefault(simple_name(n.fqname), []).append(n)
-    return out

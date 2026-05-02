@@ -39,7 +39,7 @@ class ProjectScriptsPlugin:
     """
 
     name: str = "project_scripts"
-    version: str = "1"
+    version: int = 1777760307
     pyproject_path: Path | None = None
 
     def observe(self, ctx: ObserveContext) -> VisitorPayload | None:

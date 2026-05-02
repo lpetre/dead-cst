@@ -74,6 +74,13 @@ dev = [
 # collection with ``ImportPathMismatchError`` (the very layout the
 # uv-workspace example exists to demonstrate).
 testpaths = ["tests"]
+# E2E tests clone real repos from GitHub and are deselected by default
+# so the standard ``uv run pytest`` invocation stays hermetic. Run them
+# explicitly with ``uv run pytest -m e2e``.
+addopts = "-m 'not e2e'"
+markers = [
+    "e2e: end-to-end test that clones a real GitHub repo (opt-in via -m e2e)",
+]
 
 [tool.coverage.run]
 branch = true

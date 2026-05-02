@@ -189,7 +189,28 @@ Entrypoint detection is now fully plugin-driven. Builtins:
 | `ClickPlugin` | Detect top-level Click `Group` instances (functions decorated `@click.group(...)` or `X = click.Group(...)`) and add `instance -> handler` edges for every `@cli.command(...)` / `@cli.group(...)` / `@cli.result_callback(...)` decorator. Groups are pass-through (reach them via `[project.scripts]` or a `__main__` block), so a sub-group that's never `add_command`'d stays dead (`--plugin click`) |
 | `InitSubclassPlugin` | Detect classes that define `__init_subclass__` and add `parent -> subclass` edges for every (transitive) first-party subclass. Parents stay pass-through, so a registry base class only keeps subclasses alive once something else (an entrypoint, an import) keeps the parent alive (`--plugin init_subclass`) |
 
-Write your own by implementing the `EdgePlugin` or `CSTAwareEdgePlugin` protocol; register under the `dead_cst.plugins` entry-point group for CLI discovery.
+For project-specific dynamic-import patterns, two abstract bases ship as scaffolding that subclasses configure in 4-5 lines:
+
+| Abstract base | Use it for |
+|---|---|
+| `DecoratedDeclPlugin` | "Find decorated decls in files matching a search path." Subclass with `package_prefix`, `decorator_module`, `decorator_names`, `constructor_names`. Pure observe-time. |
+| `LiteralListPlugin` | "Read `<owner>.<var> = ['fqn', ...]` and treat each entry as alive." Subclass with `owner_fqname`, `variable_name`. observe parses and caches; finalize only does graph lookups. |
+
+Both bases require subclasses to set `name` (a unique identifier for the cache namespace) and `version` (a Unix epoch int — bump it to the current epoch when the subclass's config changes). For example:
+
+```python
+from dataclasses import dataclass
+from dead_cst import LiteralListPlugin
+
+@dataclass(kw_only=True)
+class MyInternalModulesPlugin(LiteralListPlugin):
+    owner_fqname: str = "myapp.config"
+    variable_name: str = "INTERNAL_MODULES"
+    name: str = "my_internal_modules"
+    version: int = 1700000000
+```
+
+Write your own from scratch by implementing the `EdgePlugin` protocol (`name`, `version`, `observe`, `finalize`); register under the `dead_cst.plugins` entry-point group for CLI discovery.
 
 Path resolution is similarly pluggable. `PathResolver` implementations return a `{base: [dep_paths]}` map to feed `build_symbol_graph`. Builtins: `VenvResolver`, `PyprojectResolver`, `UvWorkspaceResolver` (parses `uv.lock` to discover workspace members and their inter-member dep edges). Third-party resolvers register under `dead_cst.resolvers`.
 

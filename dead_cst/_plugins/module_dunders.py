@@ -11,7 +11,7 @@ from ._core import (
     GraphOp,
     ObserveContext,
     PluginContext,
-    _payload_from,
+    make_payload,
     simple_name,
     synthetic_node,
 )
@@ -43,7 +43,7 @@ class ModuleDundersPlugin:
     """
 
     name: str = "module_dunders"
-    version: str = "1"
+    version: int = 1777760307
 
     def observe(self, ctx: ObserveContext) -> VisitorPayload | None:
         targets = [n for n in ctx.payload.nodes if _is_kept_alive(n)]
@@ -57,7 +57,7 @@ class ModuleDundersPlugin:
             )
             nodes.append(synth)
             edges.append((synth, target, SYNTHETIC_POSITION))
-        return _payload_from(nodes=nodes, edges=edges)
+        return make_payload(nodes=nodes, edges=edges)
 
     def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]:
         return ()

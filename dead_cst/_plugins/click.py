@@ -26,26 +26,23 @@ attached to a group via ``add_command``.
 
 from __future__ import annotations
 
-from libcst.metadata import CodeRange
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Iterable
+from typing import TYPE_CHECKING
 
 import libcst as cst
+from libcst.metadata import CodeRange
 
 from .._symbols import SymbolNode
 from ._core import (
     SYNTHETIC_POSITION,
-    GraphOp,
     ObserveContext,
-    PluginContext,
-    _payload_from,
     collect_module_imports,
+    decls_by_simple_name,
     decorator_owner,
     find_handlers,
-    matched_attr_call,
-    simple_name,
-    single_target_assignment,
+    make_payload,
 )
+from .decl_shapes import DecoratedDeclPlugin
 
 if TYPE_CHECKING:
     from .._visitor import VisitorPayload
@@ -71,27 +68,21 @@ _GROUP_CONSTRUCTOR_NAMES: frozenset[str] = frozenset({"Group"})
 
 
 @dataclass
-class ClickPlugin:
+class ClickPlugin(DecoratedDeclPlugin):
     """Wire Click command and sub-group handlers through their owning group.
 
-    For each module the plugin:
+    Inherits the ``@click.group()`` / ``X = click.Group(...)`` discovery
+    from :class:`DecoratedDeclPlugin` (configured for the ``click``
+    module + the two name sets above). Adds:
 
-    1. Inspects ``from click import ...`` / ``import click`` to learn
-       which local names refer to ``click.group`` (function), ``click.Group``
-       (class), and the ``click`` module itself.
-    2. Records every top-level function decorated with ``@click.group(...)``
-       / ``@click.Group(...)`` (and aliased / module-prefixed forms) as a
-       Click group instance whose name is the function's name.
-    3. Also records every top-level assignment ``X = click.Group(...)``
-       (including ``AnnAssign`` and aliased forms) as a Click group
-       instance bound to ``X``.
-    4. For every top-level function decorated ``@X.command(...)``,
-       ``@X.group(...)``, or ``@X.result_callback(...)``, emits an edge
-       ``X -> handler`` so the handler is reachable whenever ``X`` is.
-
-    Pure per-file work: the ``@<known_group>.group(...)`` fixpoint
-    operates on the file's CST only -- a chain of nested groups in
-    one module converges in one observe pass.
+    * a fixpoint pass over :meth:`_find_names` so ``@<known_group>.group(...)``
+      registrations register their inner functions as new groups too;
+    * an :meth:`observe` override that emits ``instance -> handler``
+      edges for every top-level ``@<group>.command(...)`` /
+      ``@<group>.group(...)`` / ``@<group>.result_callback(...)`` instead
+      of seeding entrypoint synthetics. Click groups are reached through
+      ``[project.scripts]`` / ``__main__`` / ``add_command``, not through
+      the discovery itself.
 
     Limitations: only top-level definitions / assignments with a single
     ``Name`` target are detected. Factory-style groups
@@ -101,20 +92,25 @@ class ClickPlugin:
     """
 
     name: str = "click"
-    version: str = "1"
+    version: int = 1777760307
+    decorator_module: str = "click"
+    decorator_names: frozenset[str] = _GROUP_DECORATOR_NAMES
+    constructor_names: frozenset[str] = _GROUP_CONSTRUCTOR_NAMES
 
-    def observe(self, ctx: ObserveContext) -> VisitorPayload | None:
-        click_imports = collect_module_imports(ctx.module, "click", _GROUP_DECORATOR_NAMES)
+    def observe(self, ctx: ObserveContext) -> "VisitorPayload | None":
+        click_imports = collect_module_imports(
+            ctx.module, self.decorator_module, self.decorator_names
+        )
         if not click_imports:
             return None
-        instances = _find_instances(ctx.module, click_imports)
+        instances = self._find_names(ctx.module, click_imports)
         if not instances:
             return None
         handlers = find_handlers(ctx.module, instances, _REGISTRATION_DECORATORS)
         if not handlers:
             return None
 
-        decls_by_name = _decls_by_simple_name(ctx.payload.nodes)
+        decls_by_name = decls_by_simple_name(ctx.payload.nodes)
         edges: list[tuple[SymbolNode, SymbolNode, CodeRange]] = []
         for var_name, handler_names in handlers.items():
             for instance_decl in decls_by_name.get(var_name, []):
@@ -123,65 +119,30 @@ class ClickPlugin:
                         edges.append((instance_decl, handler_decl, SYNTHETIC_POSITION))
         if not edges:
             return None
-        return _payload_from(edges=edges)
+        return make_payload(edges=edges)
 
-    def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]:
-        return ()
+    def _find_names(self, module: cst.Module, imports: dict[str, str]) -> set[str]:
+        """Find Click groups, including nested ``@<known_group>.group(...)``.
 
-
-def _find_instances(module: cst.Module, click_imports: dict[str, str]) -> set[str]:
-    """Return the set of top-level names bound to a Click ``Group``.
-
-    Detects three forms:
-
-    * Functions decorated with ``@click.group(...)`` / ``@click.Group(...)``
-      (and aliased / module-prefixed forms) -- the function's name.
-    * Assignments ``X = click.Group(...)`` (and aliased / module-prefixed
-      forms) -- the assignment target.
-    * Functions decorated with ``@<known_group>.group(...)`` -- nested
-      groups registered inline; resolved via fixpoint so a chain of
-      ``@cli.group() -> @admin.group() -> ...`` is fully discovered
-      regardless of source order.
-    """
-    instances: set[str] = set()
-    for stmt in module.body:
-        if isinstance(stmt, cst.FunctionDef):
-            for dec in stmt.decorators:
-                if matched_attr_call(dec.decorator, click_imports, _GROUP_DECORATOR_NAMES):
-                    instances.add(stmt.name.value)
-                    break
-        elif isinstance(stmt, cst.SimpleStatementLine):
-            for small in stmt.body:
-                target_name, value = single_target_assignment(small)
-                if target_name is None or not isinstance(value, cst.Call):
+        First pass: the base's decorator + constructor scan. Second
+        pass (fixpoint): ``@<known_group>.group(...)`` produces a new
+        group, which can then own further sub-groups. Iterate until
+        stable so a chain of ``@cli.group() -> @admin.group() -> ...``
+        is fully discovered regardless of source order.
+        """
+        instances = super()._find_names(module, imports)
+        changed = True
+        while changed:
+            changed = False
+            for stmt in module.body:
+                if not isinstance(stmt, cst.FunctionDef):
                     continue
-                if matched_attr_call(
-                    value.func, click_imports, _GROUP_CONSTRUCTOR_NAMES, unwrap_call=False
-                ):
-                    instances.add(target_name)
-
-    # Fixpoint: ``@<known_group>.group(...)`` produces a new group; that new
-    # group can then own further sub-groups. Iterate until stable.
-    changed = True
-    while changed:
-        changed = False
-        for stmt in module.body:
-            if not isinstance(stmt, cst.FunctionDef):
-                continue
-            if stmt.name.value in instances:
-                continue
-            for dec in stmt.decorators:
-                owner = decorator_owner(dec.decorator, _SUBGROUP_DECORATOR)
-                if owner is not None and owner in instances:
-                    instances.add(stmt.name.value)
-                    changed = True
-                    break
-    return instances
-
-
-def _decls_by_simple_name(nodes) -> dict[str, list[SymbolNode]]:
-    out: dict[str, list[SymbolNode]] = {}
-    for n in nodes:
-        if n.type in ("class", "function", "variable", "import"):
-            out.setdefault(simple_name(n.fqname), []).append(n)
-    return out
+                if stmt.name.value in instances:
+                    continue
+                for dec in stmt.decorators:
+                    owner = decorator_owner(dec.decorator, _SUBGROUP_DECORATOR)
+                    if owner is not None and owner in instances:
+                        instances.add(stmt.name.value)
+                        changed = True
+                        break
+        return instances

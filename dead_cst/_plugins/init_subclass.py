@@ -46,7 +46,7 @@ from ._core import (
     GraphOp,
     ObserveContext,
     PluginContext,
-    _payload_from,
+    make_payload,
     simple_name,
     synthetic_node,
 )
@@ -88,7 +88,7 @@ class InitSubclassPlugin:
     """
 
     name: str = "init_subclass"
-    version: str = "1"
+    version: int = 1777760307
 
     def observe(self, ctx: ObserveContext) -> VisitorPayload | None:
         nodes_by_simple = _local_class_decls(ctx.payload.nodes)
@@ -127,7 +127,7 @@ class InitSubclassPlugin:
 
         if not nodes and not edges:
             return None
-        return _payload_from(nodes=nodes, edges=edges)
+        return make_payload(nodes=nodes, edges=edges)
 
     def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]:
         # Index synth markers by fqname so we can look up

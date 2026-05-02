@@ -73,6 +73,77 @@ def test_fingerprint_changes_with_resolvers(tmp_path):
     assert a != b
 
 
+def test_fingerprint_subclasses_with_distinct_names_distinct(tmp_path):
+    """Two ``LiteralListPlugin`` subclasses with distinct ``name`` produce
+    distinct fingerprints, even when their other config differs.
+
+    This guards the abstract-base contract: the bases deliberately omit
+    ``name`` / ``version`` so subclasses must declare them. Each
+    subclass owns its own cache namespace via its unique ``name``.
+    """
+    from dataclasses import dataclass
+
+    from dead_cst import LiteralListPlugin
+
+    @dataclass(kw_only=True)
+    class A(LiteralListPlugin):
+        owner_fqname: str = "pkg.a"
+        variable_name: str = "X"
+        name: str = "a"
+        version: int = 1700000000
+
+    @dataclass(kw_only=True)
+    class B(LiteralListPlugin):
+        owner_fqname: str = "pkg.b"
+        variable_name: str = "Y"
+        name: str = "b"
+        version: int = 1700000000
+
+    fp_a = compute_fingerprint(paths={tmp_path: []}, resolvers=[], plugins=[A()])
+    fp_b = compute_fingerprint(paths={tmp_path: []}, resolvers=[], plugins=[B()])
+    assert fp_a != fp_b
+
+
+def test_fingerprint_changes_when_plugin_version_bumped(tmp_path):
+    """Bumping a plugin's epoch ``version`` invalidates the cache key.
+
+    Versions are Unix epoch ints by convention -- the convention's
+    point is that two simultaneous bumps merge with ``max()`` semantics
+    instead of colliding on a re-used label.
+    """
+    from dataclasses import dataclass
+
+    from dead_cst import LiteralListPlugin
+
+    @dataclass(kw_only=True)
+    class P(LiteralListPlugin):
+        owner_fqname: str = "pkg"
+        variable_name: str = "X"
+        name: str = "p"
+        version: int = 1700000000
+
+    fp_old = compute_fingerprint(paths={tmp_path: []}, resolvers=[], plugins=[P()])
+    fp_new = compute_fingerprint(
+        paths={tmp_path: []}, resolvers=[], plugins=[P(version=1700000001)]
+    )
+    assert fp_old != fp_new
+
+
+def test_abstract_base_requires_name_and_version():
+    """Direct instantiation of ``LiteralListPlugin`` /
+    ``DecoratedDeclPlugin`` must fail -- both are abstract bases that
+    leave ``name`` / ``version`` to concrete subclasses so the cache
+    fingerprint is always well-defined."""
+    import pytest
+
+    from dead_cst import DecoratedDeclPlugin, LiteralListPlugin
+
+    with pytest.raises(TypeError):
+        LiteralListPlugin()
+    with pytest.raises(TypeError):
+        DecoratedDeclPlugin()
+
+
 # ---------------------------------------------------------------------------
 # GraphCache lifecycle
 # ---------------------------------------------------------------------------
