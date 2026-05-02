@@ -12,105 +12,35 @@ Levels:
   the documented 0 / 1.
 - **1**: ``why-alive`` finds the pinned ``main`` symbol and reports
   the ``MainBlockPlugin`` synthetic in its predecessor chain.
-- **2**: a project-specific :class:`Flux0DynamicLoaderPlugin`, declared
-  below as a prototype of "what a dead-cst user would write," revives
-  flux0's two ``importlib``-driven blind spots (the ``flux0_cli.cmds``
-  Click sub-command auto-loader and the
-  ``flux0_server.main.INTERNAL_MODULES`` registry).
+- **2**: project-specific plugins from :mod:`._flux0_plugins` close
+  flux0's two ``importlib``-driven blind spots. Each is a tiny
+  subclass of an abstract base (:class:`SubpackageDiscoveryPlugin` /
+  :class:`FqnRegistryPlugin`) that a future dead-cst could expose
+  as a builtin.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
 
 import pytest
 from typer.testing import CliRunner
 
 from dead_cst import (
-    AddEdge,
-    AddNode,
-    GraphOp,
     MainBlockPlugin,
-    PluginContext,
+    ModuleDundersPlugin,
     build_symbol_graph,
     find_reachable,
 )
-from dead_cst._plugins import synthetic_node
 from dead_cst.cli import app
+
+from ._flux0_plugins import Flux0CliCommandsPlugin, Flux0InternalModulesPlugin
 
 pytestmark = pytest.mark.e2e
 
 
 FLUX0_URL = "https://github.com/flux0-ai/flux0.git"
 FLUX0_SHA = "8d04176642b091ddb5c5020486f353d4e824460b"
-
-
-# ---------------------------------------------------------------------------
-# Project-specific plugin prototype
-#
-# This is the minimum it takes today to author a project-local plugin
-# that closes a static-analysis blind spot. We use it as a forcing
-# function for "what scaffolding would shrink this further?" -- see the
-# notes in the PR description. Anything that ends up shared across two
-# user plugins is a candidate for promotion to ``dead_cst._plugins``.
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class Flux0DynamicLoaderPlugin:
-    """Keep flux0's dynamically-loaded modules alive.
-
-    Two blind spots in this repo:
-
-    1. ``flux0_cli/main.py`` discovers Click sub-commands with
-       ``pkgutil.iter_modules`` + ``importlib.import_module``, so every
-       module under ``flux0_cli.cmds`` is referenced only via runtime
-       string interpolation.
-    2. ``flux0_server/main.py`` carries an ``INTERNAL_MODULES`` list of
-       string FQNs that's consumed by ``importlib`` elsewhere in the
-       app; ``flux0_server.replay_agent`` is the only entry today.
-
-    The plugin walks the graph once per base in :meth:`finalize`,
-    selects every module whose fqname matches one of the configured
-    package prefixes, and hangs an entrypoint synthetic off them so
-    :func:`find_reachable` will reach them.
-    """
-
-    packages: tuple[str, ...] = (
-        "flux0_cli.cmds",
-        "flux0_server.replay_agent",
-    )
-    name: str = "flux0_dynamic"
-    version: str = "1"
-
-    def observe(self, ctx) -> None:
-        # No per-file work: this plugin is purely a finalize-time
-        # entrypoint declaration.
-        return None
-
-    def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]:
-        # ``importlib.import_module(M)`` executes every top-level
-        # statement in ``M``, so every top-level decl inside a covered
-        # module behaves as if it were called from an entrypoint. The
-        # module node itself is a *successor* of its decls (decl -> module
-        # in the keep-alive graph), so attaching the synth to the module
-        # alone keeps the file from being reported but doesn't revive
-        # any of its contents -- we want the decls.
-        targets = [node for node in ctx.base_nodes() if self._covers(node.fqname)]
-        if not targets:
-            return
-        # Inlined ``mark_entrypoints`` -- it lives in ``_plugins._core``
-        # but isn't re-exported, so a user plugin has to spell the four
-        # lines by hand for now.
-        synth = synthetic_node(f"<flux0-dynamic>:{ctx.base.name}", ctx.base)
-        yield AddNode(synth, entrypoint=True)
-        for target in targets:
-            yield AddEdge(synth, target)
-
-    def _covers(self, fqname: str) -> bool:
-        return any(fqname == pkg or fqname.startswith(pkg + ".") for pkg in self.packages)
 
 
 @pytest.fixture(scope="module")
@@ -239,7 +169,7 @@ def test_flux0_dynamic_loader_revives_cli_cmds(flux0_cli_src):
     keep-alive graph) and silently leaves every decl inside it dead.
     """
     base = Path(flux0_cli_src)
-    graph = _build_graph(base, MainBlockPlugin(), Flux0DynamicLoaderPlugin())
+    graph = _build_graph(base, MainBlockPlugin(), Flux0CliCommandsPlugin())
     reachable = find_reachable(graph)
 
     for fqname in (
@@ -255,7 +185,7 @@ def test_flux0_dynamic_loader_revives_cli_cmds(flux0_cli_src):
 
 def test_flux0_dynamic_loader_revives_server_internal_modules(flux0_server_src):
     base = Path(flux0_server_src)
-    graph = _build_graph(base, MainBlockPlugin(), Flux0DynamicLoaderPlugin())
+    graph = _build_graph(base, MainBlockPlugin(), Flux0InternalModulesPlugin())
     reachable = find_reachable(graph)
 
     for fqname in (
@@ -267,3 +197,38 @@ def test_flux0_dynamic_loader_revives_server_internal_modules(flux0_server_src):
         node = next((n for n in graph.nodes if n.fqname == fqname), None)
         assert node is not None, f"{fqname} not in graph"
         assert node in reachable, f"{fqname} should be alive via INTERNAL_MODULES"
+
+
+def test_flux0_full_plugin_set_only_finds_real_dead_code(flux0_cli_src, flux0_server_src):
+    """With both project plugins + the CLI's defaults active, only real dead code remains.
+
+    Pinning this number guards against future regressions where the
+    dynamic-loader logic stops covering something it used to. Two
+    constants in flux0_server/main.py and one unused TypeVar in
+    flux0_cli/main.py are the genuine findings at SHA 8d04176.
+    """
+    expected_dead = {
+        Path(flux0_server_src): {
+            "flux0_server.main.DEFAULT_PORT",
+            "flux0_server.main.SERVER_ADDRESS",
+        },
+        Path(flux0_cli_src): {
+            "flux0_cli.main.F",
+            "flux0_cli.main.TypeVar",
+        },
+    }
+    plugins = [
+        MainBlockPlugin(),
+        ModuleDundersPlugin(),
+        Flux0CliCommandsPlugin(),
+        Flux0InternalModulesPlugin(),
+    ]
+    for base, expected in expected_dead.items():
+        graph = _build_graph(base, *plugins)
+        reachable = find_reachable(graph)
+        dead = {
+            n.fqname
+            for n in graph.nodes
+            if n not in reachable and n.type != "synthetic" and not n.fqname.startswith("[")
+        }
+        assert dead == expected, f"unexpected dead set under {base}: {sorted(dead)}"
