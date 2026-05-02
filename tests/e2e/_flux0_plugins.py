@@ -1,102 +1,224 @@
 """Project-specific plugin prototypes for the flux0 e2e tests.
 
-These plugins close flux0's two ``importlib``-driven blind spots
-using only the public ``dead_cst`` API plus a couple of CST helpers
-that live in ``dead_cst._plugins._core`` today (and are flagged
-inline as candidates for promotion to the public surface).
+This module also sketches two abstract plugin shapes that generalize
+the patterns flux0 happens to need; the project-specific subclasses
+are 2-3 lines of configuration each. Both bases use only public
+``dead_cst`` helpers + a couple of CST primitives that live in
+``dead_cst._plugins._core`` (and are flagged inline as candidates
+for promotion to the public surface).
 
-Both plugins parse the analyzed source's CST to learn which modules
-to revive -- they do not re-execute ``importlib`` /
-``pkgutil.iter_modules`` at analysis time. Discovery happens by
-inspecting the CST that dead-cst's visitor already parsed, then
-matching on the assembled symbol graph.
+  DecoratedDeclPlugin
+    "Find decorated decls in files matching a search path."
+    Pure observe-time. Per-file CST inspection turns directly into
+    file-local entrypoint synthetics via ``entrypoint_payload``.
+
+  LiteralListPlugin
+    "Read a specific symbol's literal value and treat each fqname
+    inside it as alive."
+    Observe captures the literal once, in the file that owns the
+    symbol; finalize resolves the fqnames against the assembled
+    graph (because they point at other files). The two phases are
+    necessary because cross-file targets aren't constructible until
+    after the visitor has built every base's nodes.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Iterable
 
 import libcst as cst
 
 from dead_cst import AddEdge, AddNode, GraphOp, PluginContext
-from dead_cst._plugins import synthetic_node
+from dead_cst._plugins import (
+    ObserveContext,
+    entrypoint_payload,
+    synthetic_node,
+)
 from dead_cst._plugins._core import (
     collect_module_imports,
     matched_attr_call,
+    simple_name,
     single_target_assignment,
 )
 from dead_cst._symbols import SymbolNode
-
-# ``click.group`` (function) and ``click.Group`` (class) both produce
-# a Group when used as a decorator; only the class produces one when
-# used as a constructor (``X = click.Group(...)``).
-_CLICK_GROUP_DECORATORS: frozenset[str] = frozenset({"group", "Group"})
-_CLICK_GROUP_CONSTRUCTORS: frozenset[str] = frozenset({"Group"})
+from dead_cst._visitor import VisitorPayload
 
 
-def _find_click_group_names(module: cst.Module) -> set[str]:
-    """Return top-level names bound to a Click ``Group`` in ``module``.
+# ---------------------------------------------------------------------------
+# Generic shapes
+# ---------------------------------------------------------------------------
 
-    Mirrors ``flux0_cli.main.register_commands``' runtime check
-    ``isinstance(cmd, click.Group)`` by recognising the two static
-    forms that produce a Group:
 
-    * ``@click.group()`` / ``@click.Group()`` decorating a function --
-      the function's name is rebound to the Group.
-    * ``X = click.Group(...)`` -- ``X`` holds a Group.
+@dataclass
+class DecoratedDeclPlugin:
+    """Mark decls as entrypoints when their file matches a search path
+    and they're decorated with one of ``decorator_names`` (or assigned
+    via ``constructor_names``) sourced from ``decorator_module``.
 
-    Reuses the same primitives the builtin ``ClickPlugin`` uses.
-    Those helpers live in ``dead_cst._plugins._core`` and are not
-    exported today; reaching into ``_core`` from a user plugin is a
-    documented gap.
+    Two top-level forms are recognised, mirroring how the builtin
+    ``ClickPlugin`` detects Click groups:
+
+    * ``@<module>.<name>(...)`` decorating a function -- the function's
+      name becomes the target.
+    * ``X = <module>.<ctor>(...)`` -- ``X`` becomes the target.
+
+    Aliased / module-prefixed forms (``import click as c`` -> ``@c.group``)
+    flow through ``collect_module_imports`` + ``matched_attr_call`` and
+    are handled identically.
+
+    Configuration:
+
+    * ``package_prefix`` -- restrict to files whose module fqname is
+      ``<prefix>`` or under ``<prefix>.``. Empty matches every file.
+    * ``decorator_module`` -- the module the decorators are imported
+      from (``"click"`` for Click groups).
+    * ``decorator_names`` -- names produced by *decorator* form.
+    * ``constructor_names`` -- names produced by *constructor* form.
+
+    Override :meth:`in_scope` for predicates the prefix can't express
+    (e.g. exclude ``test_*`` files).
+
+    Pure observe: every match becomes a file-local entrypoint synthetic
+    via :func:`entrypoint_payload`, so no finalize work is needed.
     """
-    click_imports = collect_module_imports(module, "click", _CLICK_GROUP_DECORATORS)
-    if not click_imports:
-        return set()
 
-    names: set[str] = set()
-    for stmt in module.body:
-        if isinstance(stmt, cst.FunctionDef):
-            for dec in stmt.decorators:
-                if matched_attr_call(dec.decorator, click_imports, _CLICK_GROUP_DECORATORS):
-                    names.add(stmt.name.value)
-                    break
-        elif isinstance(stmt, cst.SimpleStatementLine):
-            for small in stmt.body:
-                target, value = single_target_assignment(small)
-                if target is None or not isinstance(value, cst.Call):
-                    continue
-                if matched_attr_call(
-                    value.func, click_imports, _CLICK_GROUP_CONSTRUCTORS, unwrap_call=False
-                ):
-                    names.add(target)
-    return names
+    package_prefix: str = ""
+    decorator_module: str = ""
+    decorator_names: frozenset[str] = frozenset()
+    constructor_names: frozenset[str] = frozenset()
+    name: str = "decorated_decl"
+    version: str = "1"
+
+    def in_scope(self, ctx: ObserveContext) -> bool:
+        if not self.package_prefix:
+            return True
+        module_node = next((n for n in ctx.payload.nodes if n.type == "module"), None)
+        if module_node is None:
+            return False
+        fqname = module_node.fqname
+        return fqname == self.package_prefix or fqname.startswith(self.package_prefix + ".")
+
+    def observe(self, ctx: ObserveContext) -> VisitorPayload | None:
+        if not self.in_scope(ctx):
+            return None
+        if not self.decorator_module:
+            return None
+
+        imports = collect_module_imports(
+            ctx.module, self.decorator_module, self.decorator_names | self.constructor_names
+        )
+        if not imports:
+            return None
+
+        names = self._find_names(ctx.module, imports)
+        if not names:
+            return None
+
+        targets = [n for n in ctx.payload.nodes if simple_name(n.fqname) in names]
+        return entrypoint_payload(f"<{self.name}>:{ctx.path.name}", ctx.path, targets)
+
+    def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]:
+        return ()
+
+    def _find_names(self, module: cst.Module, imports: dict[str, str]) -> set[str]:
+        out: set[str] = set()
+        for stmt in module.body:
+            if isinstance(stmt, cst.FunctionDef):
+                for dec in stmt.decorators:
+                    if matched_attr_call(dec.decorator, imports, self.decorator_names):
+                        out.add(stmt.name.value)
+                        break
+            elif isinstance(stmt, cst.SimpleStatementLine):
+                for small in stmt.body:
+                    target, value = single_target_assignment(small)
+                    if target is None or not isinstance(value, cst.Call):
+                        continue
+                    if matched_attr_call(
+                        value.func, imports, self.constructor_names, unwrap_call=False
+                    ):
+                        out.add(target)
+        return out
 
 
-def _module_surface(ctx: PluginContext, fqname: str) -> list[SymbolNode]:
-    """Return ``fqname``'s module + every node under it.
+@dataclass
+class LiteralListPlugin:
+    """Read ``<owner_fqname>.<variable_name>`` (a top-level list/tuple of
+    string literals) and treat each entry as a fqname to keep alive.
 
-    Models ``importlib.import_module(fqname)``: the module's whole
-    top-level surface (decls, imports, side-effecting assignments)
-    runs at import time, plus every transitively nested submodule
-    that the package's own imports bring in.
+    Each entry is resolved against the assembled graph -- as a module
+    fqname (whole module surface kept alive, mirroring
+    ``importlib.import_module``) or, falling back, as a single decl
+    fqname.
+
+    Two phases:
+
+    * :meth:`observe` runs only when visiting the owner file. It
+      parses the variable's literal value and records the fqnames in
+      ``self._fqnames``. No graph mutation happens here -- targets
+      live in *other* files which haven't been visited yet.
+    * :meth:`finalize` resolves each captured fqname against the
+      assembled graph and emits the entrypoint synth + edges.
+
+    Cross-observe state lives on the instance. This is fine for one
+    analysis run but interacts badly with dead-cst's per-file cache:
+    a cached observe payload skips the literal-parsing step, leaving
+    ``self._fqnames`` empty on warm runs. ``--no-cache`` (or bumping
+    ``version`` whenever the list shape can change) sidesteps that;
+    a future API for "stash plugin-private data alongside the cached
+    payload" would close it properly.
     """
-    mod = ctx.find_module(fqname)
-    if mod is None:
-        return []
-    prefix = fqname + "."
-    return [n for n in ctx.base_nodes() if n.fqname == fqname or n.fqname.startswith(prefix)]
+
+    owner_fqname: str = ""
+    variable_name: str = ""
+    name: str = "literal_list"
+    version: str = "1"
+    _fqnames: list[str] = field(default_factory=list, repr=False)
+
+    def observe(self, ctx: ObserveContext) -> VisitorPayload | None:
+        if not self.owner_fqname or not self.variable_name:
+            return None
+        module_node = next((n for n in ctx.payload.nodes if n.type == "module"), None)
+        if module_node is None or module_node.fqname != self.owner_fqname:
+            return None
+        self._fqnames = _read_string_list(ctx.module, self.variable_name)
+        return None
+
+    def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]:
+        if not self._fqnames:
+            return
+
+        targets: list[SymbolNode] = []
+        for fqname in self._fqnames:
+            mod = ctx.find_module(fqname)
+            if mod is not None:
+                prefix = fqname + "."
+                targets.extend(
+                    n for n in ctx.base_nodes() if n.fqname == fqname or n.fqname.startswith(prefix)
+                )
+                continue
+            targets.extend(ctx.find_declarations(fqname))
+
+        if not targets:
+            return
+
+        # Anchor the synth at the owner's path when available so
+        # ``why-alive`` reports a sensible source location.
+        owner = ctx.find_module(self.owner_fqname)
+        anchor = owner.path if owner is not None else ctx.base
+        synth = synthetic_node(f"<{self.name}>", anchor)
+        yield AddNode(synth, entrypoint=True)
+        for target in targets:
+            yield AddEdge(synth, target)
 
 
 def _read_string_list(module: cst.Module, var_name: str) -> list[str]:
-    """Extract ``<var_name> = [<str-literal>, ...]`` (or tuple) at module level.
+    """Return ``<var_name> = [<str>, ...]`` (or tuple) at module level.
 
-    Returns the string literals in declaration order, or ``[]`` if no
-    such assignment exists or the RHS isn't a static list/tuple of
-    strings. Non-literal entries are dropped silently -- the runtime
-    consumer would just fail on them; we just don't pretend to know
-    what they resolve to.
+    Empty list when no such assignment exists or the RHS isn't a
+    static list/tuple of string literals. Non-literal entries are
+    dropped silently -- the runtime would just fail on them and we
+    don't pretend to resolve them.
     """
     for stmt in module.body:
         if not isinstance(stmt, cst.SimpleStatementLine):
@@ -118,90 +240,37 @@ def _read_string_list(module: cst.Module, var_name: str) -> list[str]:
     return []
 
 
+# ---------------------------------------------------------------------------
+# Project-specific subclasses
+# ---------------------------------------------------------------------------
+
+
 @dataclass
-class Flux0CliCommandsPlugin:
+class Flux0CliCommandsPlugin(DecoratedDeclPlugin):
     """Mirror ``flux0_cli/main.py:register_commands``.
 
     https://github.com/flux0-ai/flux0/blob/8d04176642b091ddb5c5020486f353d4e824460b/packages/cli/src/flux0_cli/main.py#L61
 
-    The runtime loop iterates every module under ``flux0_cli.cmds``
-    and registers each top-level attribute that ``isinstance``-checks
-    as a ``click.Group``. We mirror that: per submodule, parse the
-    CST, find every top-level Click Group, and seed the analyzer's
-    reachability walk from it. The builtin ``ClickPlugin`` (when
-    composed with this one) then carries reachability through any
-    ``@<group>.command(...)`` handlers; flux0's custom-decorator
-    handlers (``@get_options(group, ...)``) intentionally stay
-    unrecognised -- that's a separate static-analysis blind spot.
+    The runtime check is ``isinstance(cmd, click.Group)`` after
+    ``importlib``-loading every module under ``flux0_cli.cmds``. We
+    reproduce that statically: per submodule, find every top-level
+    ``@click.group()`` function and ``X = click.Group(...)`` assignment.
     """
 
-    package: str = "flux0_cli.cmds"
+    package_prefix: str = "flux0_cli.cmds"
+    decorator_module: str = "click"
+    decorator_names: frozenset[str] = frozenset({"group", "Group"})
+    constructor_names: frozenset[str] = frozenset({"Group"})
     name: str = "flux0_cli_cmds"
-    version: str = "1"
-
-    def observe(self, ctx) -> None:
-        return None
-
-    def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]:
-        prefix = self.package + "."
-        targets: list[SymbolNode] = []
-        for mod_node in [
-            n for n in ctx.base_nodes() if n.type == "module" and n.fqname.startswith(prefix)
-        ]:
-            cst_module = ctx.parse(mod_node.path)
-            if cst_module is None:
-                continue
-            for group_name in _find_click_group_names(cst_module):
-                targets.extend(ctx.find_declarations(f"{mod_node.fqname}.{group_name}"))
-
-        if not targets:
-            return
-        synth = synthetic_node(f"<{self.name}>", ctx.base)
-        yield AddNode(synth, entrypoint=True)
-        for t in targets:
-            yield AddEdge(synth, t)
 
 
 @dataclass
-class Flux0InternalModulesPlugin:
+class Flux0InternalModulesPlugin(LiteralListPlugin):
     """Mirror ``flux0_server.main.INTERNAL_MODULES``.
 
     https://github.com/flux0-ai/flux0/blob/8d04176642b091ddb5c5020486f353d4e824460b/packages/server/src/flux0_server/main.py#L51
-
-    flux0_server lists modules to import by dotted name in
-    ``INTERNAL_MODULES``, then ``importlib``-loads each one and calls
-    its ``init_module`` / ``shutdown_module``. The plugin reads the
-    list literal from the CST (so an upstream rename or addition
-    automatically flows through), resolves each fqname to a module,
-    and treats the whole module surface as alive.
     """
 
-    module_fqname: str = "flux0_server.main"
+    owner_fqname: str = "flux0_server.main"
     variable_name: str = "INTERNAL_MODULES"
     name: str = "flux0_internal_modules"
-    version: str = "1"
-
-    def observe(self, ctx) -> None:
-        return None
-
-    def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]:
-        owner = ctx.find_module(self.module_fqname)
-        if owner is None:
-            return
-        cst_module = ctx.parse(owner.path)
-        if cst_module is None:
-            return
-        fqnames = _read_string_list(cst_module, self.variable_name)
-        if not fqnames:
-            return
-
-        targets: list[SymbolNode] = []
-        for fqname in fqnames:
-            targets.extend(_module_surface(ctx, fqname))
-        if not targets:
-            return
-
-        synth = synthetic_node(f"<{self.name}>", owner.path)
-        yield AddNode(synth, entrypoint=True)
-        for t in targets:
-            yield AddEdge(synth, t)
