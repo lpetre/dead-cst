@@ -32,6 +32,7 @@ from dead_cst import (
     build_symbol_graph,
     find_reachable,
 )
+from dead_cst._cache import GraphCache, compute_fingerprint
 from dead_cst.cli import app
 
 from ._flux0_plugins import Flux0CliCommandsPlugin, Flux0InternalModulesPlugin
@@ -293,3 +294,44 @@ def test_flux0_cli_dead_set_includes_real_findings_and_decorator_blind_spot(flux
     # The Click groups themselves must NOT appear dead.
     assert "flux0_cli.cmds.agents.agents" not in dead
     assert "flux0_cli.cmds.sessions.sessions" not in dead
+
+
+def test_flux0_internal_modules_survives_cache_round_trip(flux0_server_src, tmp_path):
+    """LiteralListPlugin must produce the same dead set warm as cold.
+
+    The naive observe-stashes-on-self design silently regresses on
+    warm runs (cached payload replays without invoking observe, leaving
+    captured fqnames empty). The current design encodes captured
+    fqnames as ENTRYPOINT-flagged synthetic decls in the observe
+    payload, so the cache replay is fully self-sufficient and finalize
+    only walks the graph -- this test guards that property.
+    """
+    base = Path(flux0_server_src)
+    plugins = [
+        MainBlockPlugin(),
+        ModuleDundersPlugin(),
+        Flux0InternalModulesPlugin(),
+    ]
+    paths = {base: []}
+    cache_path = tmp_path / "cache.sqlite"
+    fp = compute_fingerprint(paths=paths, resolvers=[], plugins=plugins)
+
+    dead_sets = []
+    for _ in range(2):
+        with GraphCache(cache_path, fp) as cache:
+            graph = build_symbol_graph(paths, plugins=plugins, project_root=base, cache=cache)
+        reachable = find_reachable(graph)
+        dead_sets.append(
+            {
+                n.fqname
+                for n in graph.nodes
+                if n not in reachable and n.type != "synthetic" and not n.fqname.startswith("[")
+            }
+        )
+
+    cold, warm = dead_sets
+    assert cold == warm, f"cache regressed plugin output: cold={cold}, warm={warm}"
+    assert cold == {
+        "flux0_server.main.DEFAULT_PORT",
+        "flux0_server.main.SERVER_ADDRESS",
+    }

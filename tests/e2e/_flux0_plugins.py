@@ -29,13 +29,15 @@ from typing import Iterable
 
 import libcst as cst
 
-from dead_cst import AddEdge, AddNode, GraphOp, PluginContext
+from dead_cst import AddEdge, GraphOp, NodeFlags, PluginContext
 from dead_cst._plugins import (
+    SYNTHETIC_POSITION,
     ObserveContext,
     entrypoint_payload,
     synthetic_node,
 )
 from dead_cst._plugins._core import (
+    _payload_from,
     collect_module_imports,
     matched_attr_call,
     simple_name,
@@ -151,13 +153,21 @@ class LiteralListPlugin:
     ``importlib.import_module``) or, falling back, as a single decl
     fqname.
 
-    Pure finalize: the owner file's CST is fetched via ``ctx.parse``,
-    which serves from the visitor's pre-warmed cache for any file
-    under :attr:`base`. This keeps the plugin cache-correct -- there's
-    no per-file plugin state that could be stale on warm runs (the
-    obvious "observe captures, finalize emits" split would silently
-    break when ``ctx.payload`` is served from cache and observe is
-    skipped, leaving the captured state empty).
+    Cache strategy: every CST inspection happens in :meth:`observe`,
+    so it goes through dead-cst's per-file payload cache and only
+    re-runs when the owner file actually changes. The captured
+    fqnames are encoded as synthetic ENTRYPOINT-flagged decls (one
+    per entry) parented at the owner file. Each synth carries a
+    file-local edge to the variable's decl, so ``why-alive
+    <owner_fqname>.<variable_name>`` shows our synthetics as
+    predecessors -- the chain visualises "this list keeps these
+    fqnames alive."
+
+    :meth:`finalize` only does graph walks: find our synthetics by
+    fqname prefix, decode the captured target fqname out, resolve
+    against the assembled graph, emit the cross-file edge. No CST
+    parsing, no per-file state -- safe to serve observe from cache
+    on every warm run.
     """
 
     owner_fqname: str = ""
@@ -166,39 +176,58 @@ class LiteralListPlugin:
     version: str = "1"
 
     def observe(self, ctx: ObserveContext) -> VisitorPayload | None:
-        return None
+        if not self.owner_fqname or not self.variable_name:
+            return None
+        module_node = next((n for n in ctx.payload.nodes if n.type == "module"), None)
+        if module_node is None or module_node.fqname != self.owner_fqname:
+            return None
+        fqnames = _read_string_list(ctx.module, self.variable_name)
+        if not fqnames:
+            return None
+
+        # Locate the variable's decl in this file's payload so the synth
+        # can hang off it. Edge ``synth -> variable_decl`` keeps the
+        # variable alive (in case nothing else references it) and gives
+        # ``why-alive`` a readable chain.
+        variable_decl = next(
+            (
+                n
+                for n in ctx.payload.nodes
+                if n.type == "variable" and simple_name(n.fqname) == self.variable_name
+            ),
+            None,
+        )
+
+        synth_prefix = self._synth_prefix()
+        nodes: list[SymbolNode] = []
+        edges: list[tuple[SymbolNode, SymbolNode, object]] = []
+        for fqname in fqnames:
+            synth = synthetic_node(f"{synth_prefix}{fqname}", ctx.path, flags=NodeFlags.ENTRYPOINT)
+            nodes.append(synth)
+            if variable_decl is not None:
+                edges.append((synth, variable_decl, SYNTHETIC_POSITION))
+        return _payload_from(nodes=nodes, edges=edges)
 
     def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]:
-        if not self.owner_fqname or not self.variable_name:
-            return
-        owner = ctx.find_module(self.owner_fqname)
-        if owner is None:
-            return
-        cst_module = ctx.parse(owner.path)
-        if cst_module is None:
-            return
-        fqnames = _read_string_list(cst_module, self.variable_name)
-        if not fqnames:
-            return
-
-        targets: list[SymbolNode] = []
-        for fqname in fqnames:
-            mod = ctx.find_module(fqname)
-            if mod is not None:
-                prefix = fqname + "."
-                targets.extend(
-                    n for n in ctx.base_nodes() if n.fqname == fqname or n.fqname.startswith(prefix)
-                )
+        synth_prefix = self._synth_prefix()
+        for node in ctx.base_nodes():
+            if node.type != "synthetic" or not node.fqname.startswith(synth_prefix):
                 continue
-            targets.extend(ctx.find_declarations(fqname))
+            captured = node.fqname[len(synth_prefix) :]
+            for target in self._resolve(ctx, captured):
+                yield AddEdge(node, target)
 
-        if not targets:
-            return
+    def _synth_prefix(self) -> str:
+        return f"<{self.name}>:"
 
-        synth = synthetic_node(f"<{self.name}>", owner.path)
-        yield AddNode(synth, entrypoint=True)
-        for target in targets:
-            yield AddEdge(synth, target)
+    def _resolve(self, ctx: PluginContext, fqname: str) -> list[SymbolNode]:
+        mod = ctx.find_module(fqname)
+        if mod is not None:
+            prefix = fqname + "."
+            return [
+                n for n in ctx.base_nodes() if n.fqname == fqname or n.fqname.startswith(prefix)
+            ]
+        return list(ctx.find_declarations(fqname))
 
 
 def _read_string_list(module: cst.Module, var_name: str) -> list[str]:
