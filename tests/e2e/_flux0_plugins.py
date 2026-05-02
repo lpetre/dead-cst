@@ -24,7 +24,7 @@ for promotion to the public surface).
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Iterable
 
 import libcst as cst
@@ -151,45 +151,38 @@ class LiteralListPlugin:
     ``importlib.import_module``) or, falling back, as a single decl
     fqname.
 
-    Two phases:
-
-    * :meth:`observe` runs only when visiting the owner file. It
-      parses the variable's literal value and records the fqnames in
-      ``self._fqnames``. No graph mutation happens here -- targets
-      live in *other* files which haven't been visited yet.
-    * :meth:`finalize` resolves each captured fqname against the
-      assembled graph and emits the entrypoint synth + edges.
-
-    Cross-observe state lives on the instance. This is fine for one
-    analysis run but interacts badly with dead-cst's per-file cache:
-    a cached observe payload skips the literal-parsing step, leaving
-    ``self._fqnames`` empty on warm runs. ``--no-cache`` (or bumping
-    ``version`` whenever the list shape can change) sidesteps that;
-    a future API for "stash plugin-private data alongside the cached
-    payload" would close it properly.
+    Pure finalize: the owner file's CST is fetched via ``ctx.parse``,
+    which serves from the visitor's pre-warmed cache for any file
+    under :attr:`base`. This keeps the plugin cache-correct -- there's
+    no per-file plugin state that could be stale on warm runs (the
+    obvious "observe captures, finalize emits" split would silently
+    break when ``ctx.payload`` is served from cache and observe is
+    skipped, leaving the captured state empty).
     """
 
     owner_fqname: str = ""
     variable_name: str = ""
     name: str = "literal_list"
     version: str = "1"
-    _fqnames: list[str] = field(default_factory=list, repr=False)
 
     def observe(self, ctx: ObserveContext) -> VisitorPayload | None:
-        if not self.owner_fqname or not self.variable_name:
-            return None
-        module_node = next((n for n in ctx.payload.nodes if n.type == "module"), None)
-        if module_node is None or module_node.fqname != self.owner_fqname:
-            return None
-        self._fqnames = _read_string_list(ctx.module, self.variable_name)
         return None
 
     def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]:
-        if not self._fqnames:
+        if not self.owner_fqname or not self.variable_name:
+            return
+        owner = ctx.find_module(self.owner_fqname)
+        if owner is None:
+            return
+        cst_module = ctx.parse(owner.path)
+        if cst_module is None:
+            return
+        fqnames = _read_string_list(cst_module, self.variable_name)
+        if not fqnames:
             return
 
         targets: list[SymbolNode] = []
-        for fqname in self._fqnames:
+        for fqname in fqnames:
             mod = ctx.find_module(fqname)
             if mod is not None:
                 prefix = fqname + "."
@@ -202,11 +195,7 @@ class LiteralListPlugin:
         if not targets:
             return
 
-        # Anchor the synth at the owner's path when available so
-        # ``why-alive`` reports a sensible source location.
-        owner = ctx.find_module(self.owner_fqname)
-        anchor = owner.path if owner is not None else ctx.base
-        synth = synthetic_node(f"<{self.name}>", anchor)
+        synth = synthetic_node(f"<{self.name}>", owner.path)
         yield AddNode(synth, entrypoint=True)
         for target in targets:
             yield AddEdge(synth, target)
