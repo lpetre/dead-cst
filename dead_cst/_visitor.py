@@ -25,7 +25,6 @@ from libcst.metadata.scope_provider import (
     Scope,
 )
 
-from ._branches import unreachable_suites
 from ._flow import live_at_exit, live_referents
 from ._fqn import FixedFullyQualifiedNameProvider
 from ._plugins._core import UNRESOLVED_PREFIX
@@ -151,11 +150,6 @@ class SymbolVisitor(cst.CSTVisitor):
         # descendants of the containing statement, which is what
         # ``live_at_exit`` matches against.
         self.symbol_referent_nodes: dict[SymbolNode, cst.CSTNode] = {}
-        # Positions of every statically-dead suite in this file. The
-        # apply step uses this list to decide which edges land with
-        # ``EdgeFlags.DEAD_BRANCH``; the CLI surfaces them as
-        # "unreachable code at line X" reports.
-        self.dead_suites: list[CodeRange] = []
         # Decls displaced by flow analysis. Tracked here (rather than on
         # the trie) so the trie holds only entries cross-module imports
         # should resolve to. Stored unflagged; ``to_payload`` produces
@@ -377,27 +371,6 @@ class SymbolVisitor(cst.CSTVisitor):
     def visit_AnnAssign(self, node: cst.AnnAssign) -> None:
         self._add_variable(node)
 
-    def visit_If(self, node: cst.If) -> None:
-        self._record_dead_suites(node)
-
-    def visit_While(self, node: cst.While) -> None:
-        self._record_dead_suites(node)
-
-    def _record_dead_suites(self, stmt: cst.BaseStatement) -> None:
-        """Append the position of every statically-dead suite in ``stmt``.
-
-        The apply step (``_apply_payload`` in ``_analyze``) uses this
-        list to decide whether each emitted edge falls inside a dead
-        suite, in which case the edge gets ``EdgeFlags.DEAD_BRANCH``.
-        Nested dead suites are recorded as separate entries; an access
-        is "in a dead suite" if its position falls inside any of them.
-        """
-        for suite in unreachable_suites(stmt):
-            pos = self._pos(suite)
-            if pos is None:
-                continue
-            self.dead_suites.append(pos)
-
     def visit_Import(self, node: cst.Import) -> None:
         self._add_import("", node)
 
@@ -573,7 +546,7 @@ class SymbolVisitor(cst.CSTVisitor):
                             if target != owner:
                                 self.internal_edges.add((owner, target, owner.position))
 
-    def to_payload(self) -> VisitorPayload:
+    def to_payload(self, *, dead_suites: tuple[CodeRange, ...] = ()) -> VisitorPayload:
         """Materialize visitor state into a serializable :class:`VisitorPayload`.
 
         Decls in :attr:`shadowed_decls` are emitted as
@@ -583,7 +556,12 @@ class SymbolVisitor(cst.CSTVisitor):
         :class:`CodeRange` (the access position) is preserved as-is;
         the apply step in :mod:`dead_cst._analyze` derives the
         :data:`EdgeFlags.DEAD_BRANCH` flag from it by checking
-        containment against :attr:`dead_suites`.
+        containment against ``dead_suites``.
+
+        ``dead_suites`` is supplied by the caller -- the analyzer runs
+        a swappable :data:`~dead_cst._branches.UnreachableRegionDetector`
+        on the file's :class:`cst.MetadataWrapper` and passes the
+        result here.
         """
         flag_map: dict[SymbolNode, SymbolNode] = {
             d: dataclasses.replace(d, flags=d.flags | NodeFlags.SHADOWED)
@@ -611,5 +589,5 @@ class SymbolVisitor(cst.CSTVisitor):
             nodes=tuple(nodes),
             edges=edges,
             imports=imports,
-            dead_suites=tuple(self.dead_suites),
+            dead_suites=dead_suites,
         )

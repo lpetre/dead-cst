@@ -42,6 +42,10 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
+from ._branches import (
+    UnreachableRegionDetector,
+    default_unreachable_regions,
+)
 from ._plugins._core import EdgePlugin
 from ._resolvers import PathMap, PathResolver
 from ._visitor import VisitorPayload
@@ -71,6 +75,7 @@ def compute_fingerprint(
     paths: PathMap,
     resolvers: Sequence[PathResolver],
     plugins: Sequence[EdgePlugin] = (),
+    unreachable_detector: UnreachableRegionDetector | None = None,
 ) -> str:
     """SHA-256 of every input that affects payload semantics for one analysis run.
 
@@ -78,14 +83,14 @@ def compute_fingerprint(
     output), Python version (pickle protocol stability), the
     ``PathMap`` (the search-path layout governs ``Import.path``
     resolution), the resolver chain (resolvers override
-    ``name -> path`` lookups), and the plugin set. Plugins are
-    fingerprinted by ``(name, version)`` because their ``observe``
-    contributions are folded into each cached payload; bumping a
-    plugin's ``version`` invalidates the file_cache so the new
-    observe output replaces the old. ``version`` is a Unix epoch
-    int by convention, so concurrent bumps on different branches
-    merge with ``max()``-wins semantics rather than colliding on a
-    re-used integer label.
+    ``name -> path`` lookups), the plugin set, and the
+    unreachable-region detector. Plugins and the detector are
+    fingerprinted by ``(name, version)`` because their output is
+    folded into each cached payload; bumping ``version`` invalidates
+    the file_cache so new output replaces the old. ``version`` is a
+    Unix epoch int by convention, so concurrent bumps on different
+    branches merge with ``max()``-wins semantics rather than colliding
+    on a re-used integer label.
 
     Each value is normalized to a stable string before hashing so
     equivalent inputs produce equal keys.
@@ -114,6 +119,13 @@ def compute_fingerprint(
     )
     for name, version in plugin_entries:
         h.update(f"  {name}@{version}\n".encode())
+
+    detector = unreachable_detector or default_unreachable_regions
+    detector_name = getattr(
+        detector, "name", getattr(detector, "__name__", type(detector).__name__)
+    )
+    detector_version = int(getattr(detector, "version", 0))
+    h.update(f"unreachable_detector={detector_name}@{detector_version}\n".encode())
 
     return h.hexdigest()
 

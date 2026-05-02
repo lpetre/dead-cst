@@ -104,6 +104,45 @@ def test_fingerprint_subclasses_with_distinct_names_distinct(tmp_path):
     assert fp_a != fp_b
 
 
+def test_fingerprint_changes_when_unreachable_detector_changes(tmp_path):
+    """Swapping the unreachable-region detector flips the fingerprint.
+
+    Detectors are folded into each cached payload's ``dead_suites``
+    list, so a detector swap must invalidate the file_cache. The
+    default detector ships with a stable ``name`` / ``version``;
+    custom detectors are fingerprinted by their callable's name (or
+    explicit ``name`` attribute) and ``version``.
+    """
+    from libcst.metadata import CodeRange, MetadataWrapper
+
+    def custom(wrapper: MetadataWrapper) -> list[CodeRange]:
+        return []
+
+    custom.name = "custom"  # type: ignore[attr-defined]
+    custom.version = 1  # type: ignore[attr-defined]
+
+    fp_default = compute_fingerprint(paths={tmp_path: []}, resolvers=[])
+    fp_custom = compute_fingerprint(paths={tmp_path: []}, resolvers=[], unreachable_detector=custom)
+    assert fp_default != fp_custom
+
+
+def test_fingerprint_changes_when_unreachable_detector_version_bumped(tmp_path):
+    """Bumping a detector's ``version`` invalidates the cache key."""
+    from libcst.metadata import CodeRange, MetadataWrapper
+
+    def custom(wrapper: MetadataWrapper) -> list[CodeRange]:
+        return []
+
+    custom.name = "custom"  # type: ignore[attr-defined]
+    custom.version = 1  # type: ignore[attr-defined]
+
+    fp_v1 = compute_fingerprint(paths={tmp_path: []}, resolvers=[], unreachable_detector=custom)
+
+    custom.version = 2  # type: ignore[attr-defined]
+    fp_v2 = compute_fingerprint(paths={tmp_path: []}, resolvers=[], unreachable_detector=custom)
+    assert fp_v1 != fp_v2
+
+
 def test_fingerprint_changes_when_plugin_version_bumped(tmp_path):
     """Bumping a plugin's epoch ``version`` invalidates the cache key.
 

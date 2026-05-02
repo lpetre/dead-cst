@@ -214,6 +214,40 @@ Write your own from scratch by implementing the `EdgePlugin` protocol (`name`, `
 
 Path resolution is similarly pluggable. `PathResolver` implementations return a `{base: [dep_paths]}` map to feed `build_symbol_graph`. Builtins: `VenvResolver`, `PyprojectResolver`, `UvWorkspaceResolver` (parses `uv.lock` to discover workspace members and their inter-member dep edges). Third-party resolvers register under `dead_cst.resolvers`.
 
+Unreachable-code detection is a single swappable callable. `build_symbol_graph` accepts an `unreachable_detector: Callable[[cst.MetadataWrapper], list[CodeRange]]`; the default, `default_unreachable_regions`, runs the literal-only truthiness evaluator on every `if` / `while` test. Override it to fold in domain knowledge — e.g. config flags whose values are fixed in production:
+
+```python
+import libcst as cst
+from libcst.metadata import CodeRange, MetadataWrapper, PositionProvider
+from dead_cst import build_symbol_graph
+
+def my_detector(wrapper: MetadataWrapper) -> list[CodeRange]:
+    positions = wrapper.resolve(PositionProvider)
+    out: list[CodeRange] = []
+
+    class V(cst.CSTVisitor):
+        def visit_If(self, node):
+            # "settings.IS_PROD is always True" -- mark the else-branch dead.
+            if isinstance(node.test, cst.Name) and node.test.value == "IS_PROD":
+                if isinstance(node.orelse, cst.Else):
+                    pos = positions.get(node.orelse.body)
+                    if pos is not None:
+                        out.append(pos)
+
+    wrapper.module.visit(V())
+    return out
+
+# Optional name/version feed the per-file cache fingerprint -- bump
+# version when the detector's logic changes so stale payloads are
+# rebuilt automatically.
+my_detector.name = "my_detector"
+my_detector.version = 1700000000
+
+graph = build_symbol_graph({root: []}, unreachable_detector=my_detector)
+```
+
+The default detector ships with a stable `name` / `version`; bare callables fall back to `__name__` and `0` for fingerprinting.
+
 ## Graph model
 
 The graph has one node per top-level declaration plus a synthetic module node per file. Edges run from a declaration to each symbol it references, and from every submodule to its parent package so `__init__.py` stays alive as long as anything in the package does. Entrypoints seed the reachability walk; every node not reached is reported as dead.

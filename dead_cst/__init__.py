@@ -38,6 +38,10 @@ from ._analyze import (
     find_reachable,
     order_paths,
 )
+from ._branches import (
+    UnreachableRegionDetector,
+    default_unreachable_regions,
+)
 from ._codemod import remove_code
 from ._symbols import EdgeFlags, NodeFlags
 from ._plugins import (
@@ -108,10 +112,12 @@ __all__ = [
     "RemoveEdge",
     "TyperPlugin",
     "UnittestPlugin",
+    "UnreachableRegionDetector",
     "UvWorkspaceResolver",
     "VenvResolver",
     "build_symbol_graph",
     "count_nodes",
+    "default_unreachable_regions",
     "entrypoint_payload",
     "find_kept_alive_by_dead_branches",
     "find_reachable",

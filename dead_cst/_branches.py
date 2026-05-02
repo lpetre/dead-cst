@@ -12,13 +12,22 @@ over those. Anything involving a name lookup (other than the three
 keywords), attribute access, function call, comparison, or other
 dynamic operation returns ``None`` (unknown). Returning ``None`` is
 always the safe default: callers must treat the branch as live.
+
+Module-level unreachable-region detection is exposed as a swappable
+callable (:data:`UnreachableRegionDetector`) so downstream consumers
+can fold in domain knowledge -- e.g. config flags whose values are
+fixed in production -- without forking the analyzer. The default
+detector, :func:`default_unreachable_regions`, walks every ``if`` and
+``while`` in the module and runs the literal-only evaluator above on
+the test expression.
 """
 
 from __future__ import annotations
 
-from typing import Sequence
+from typing import Callable, Sequence
 
 import libcst as cst
+from libcst.metadata import CodeRange, MetadataWrapper, PositionProvider
 
 
 _KEYWORDS: dict[str, bool] = {
@@ -127,6 +136,62 @@ def unreachable_bodies(stmt: cst.BaseStatement) -> list[Sequence[cst.CSTNode]]:
     ``if False: x = 1``).
     """
     return [suite.body for suite in unreachable_suites(stmt)]
+
+
+# Type alias for the unreachable-region detector callable. The
+# analyzer invokes one detector per module after the visitor has
+# walked it; the returned list of :class:`CodeRange` determines which
+# declarations and references are flagged with
+# :data:`dead_cst._symbols.EdgeFlags.DEAD_BRANCH` and which positions
+# are surfaced as "unreachable code at line X" reports.
+#
+# Pass a custom detector to :func:`dead_cst.build_symbol_graph` to
+# layer on company-specific constant folding (e.g. "``settings.IS_PROD``
+# is always ``True``"). The default,
+# :func:`default_unreachable_regions`, runs literal-only truthiness on
+# every ``if`` / ``while`` test.
+#
+# Optional ``name`` and ``version`` attributes on the callable feed
+# the per-file cache fingerprint, so swapping detectors invalidates
+# stale ``VisitorPayload`` blobs automatically. Bare functions fall
+# back to ``__name__`` and ``0``; set / bump these explicitly when
+# the detector's logic changes.
+UnreachableRegionDetector = Callable[[MetadataWrapper], list[CodeRange]]
+
+
+def default_unreachable_regions(wrapper: MetadataWrapper) -> list[CodeRange]:
+    """Default detector: literal-truthiness analysis on ``if`` / ``while``.
+
+    Walks every ``cst.If`` and ``cst.While`` in the module, runs
+    :func:`unreachable_suites` on each, and returns the
+    :class:`CodeRange` of every dead suite. The order of the result
+    follows the document order of the suites.
+    """
+    positions = wrapper.resolve(PositionProvider)
+    found: list[CodeRange] = []
+
+    class _Collector(cst.CSTVisitor):
+        def visit_If(self, node: cst.If) -> None:
+            self._collect(node)
+
+        def visit_While(self, node: cst.While) -> None:
+            self._collect(node)
+
+        def _collect(self, stmt: cst.BaseStatement) -> None:
+            for suite in unreachable_suites(stmt):
+                pos = positions.get(suite)
+                if pos is not None:
+                    found.append(pos)
+
+    wrapper.module.visit(_Collector())
+    return found
+
+
+# Cache-fingerprint metadata for the default detector. Custom detectors
+# that want stable cache reuse should set their own ``name`` / ``version``
+# (a Unix-epoch int by convention, matching the ``EdgePlugin`` story).
+default_unreachable_regions.name = "default"  # type: ignore[attr-defined]
+default_unreachable_regions.version = 1  # type: ignore[attr-defined]
 
 
 def _unreachable_in_if(node: cst.If, branch_taken: bool) -> list[cst.BaseSuite]:

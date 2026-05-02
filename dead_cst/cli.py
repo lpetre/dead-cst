@@ -103,10 +103,11 @@ def _maybe_cache(
     """Yield a per-run :class:`GraphCache`, or ``None`` when ``--no-cache`` is set.
 
     The fingerprint covers the resolved ``PathMap``, resolver chain,
-    and plugin set so a layout, import-resolution, or plugin change
-    wipes the on-disk ``file_cache`` automatically (see
-    :func:`compute_fingerprint`). The context manager closes the
-    SQLite connection on exit, even when the analysis raises.
+    plugin set, and the default unreachable-region detector so a
+    layout, import-resolution, or plugin change wipes the on-disk
+    ``file_cache`` automatically (see :func:`compute_fingerprint`).
+    The context manager closes the SQLite connection on exit, even
+    when the analysis raises.
     """
     if no_cache:
         yield None

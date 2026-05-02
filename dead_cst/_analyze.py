@@ -8,6 +8,10 @@ import libcst as cst
 import networkx as nx
 from libcst.metadata import CodeRange, FullRepoManager
 
+from ._branches import (
+    UnreachableRegionDetector,
+    default_unreachable_regions,
+)
 from ._cache import GraphCache
 from ._edges import resolve_edges
 from ._fqn import FixedFullyQualifiedNameProvider
@@ -82,6 +86,7 @@ def build_symbol_graph(
     resolvers: Sequence[PathResolver] = (),
     project_root: Path | None = None,
     cache: GraphCache | None = None,
+    unreachable_detector: UnreachableRegionDetector | None = None,
 ) -> nx.MultiDiGraph:
     """Build a directed reachability graph of every top-level symbol under ``paths``.
 
@@ -139,6 +144,16 @@ def build_symbol_graph(
         unconditionally on every invocation -- the cache only
         short-circuits the per-file visit. Pass ``None`` (the default)
         to bypass caching entirely.
+    unreachable_detector:
+        Optional :data:`~dead_cst._branches.UnreachableRegionDetector`
+        invoked once per file to compute the set of statically-dead
+        suite positions. Defaults to
+        :func:`~dead_cst._branches.default_unreachable_regions`, which
+        evaluates only literal-truthiness of ``if`` / ``while`` tests.
+        Override to fold in domain knowledge (e.g. config flags whose
+        value is fixed in production). The returned :class:`CodeRange`
+        list feeds :data:`EdgeFlags.DEAD_BRANCH` derivation and the
+        per-file ``graph.graph["dead_suites"]`` reporting map.
 
     Returns
     -------
@@ -156,6 +171,7 @@ def build_symbol_graph(
     export_tries: dict[Path, SymbolTrie] = {}
     root = project_root or _infer_project_root(paths) if paths else Path.cwd()
     import_resolver = _chain_resolvers(resolvers)
+    detector = unreachable_detector or default_unreachable_regions
     for base in order_paths(paths):
         logger.debug("Processing base path: %s", base)
         search_paths = [base] + paths.get(base, [])
@@ -182,7 +198,8 @@ def build_symbol_graph(
                     wrapper = mgr.get_metadata_wrapper_for_path(str(file))
                     visitor = SymbolVisitor(file, search_paths, import_resolver)
                     wrapper.visit(visitor)
-                    base_payload = visitor.to_payload()
+                    dead_suites = tuple(detector(wrapper))
+                    base_payload = visitor.to_payload(dead_suites=dead_suites)
                     plugin_payload = _run_observe(
                         plugins, file, wrapper.module, base_payload, base, root
                     )

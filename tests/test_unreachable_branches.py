@@ -245,6 +245,84 @@ def test_decls_inside_dead_branch_remain_in_graph(build_decl_graph, assert_edges
     )
 
 
+def test_custom_detector_folds_constants(tmp_path, write_files, assert_dead_branch_edges):
+    """End-to-end: a custom detector can mark non-literal branches dead.
+
+    Demonstrates the user-facing extension story: a company-specific
+    detector that knows ``settings.IS_PROD`` is always ``True`` walks
+    the file and returns the dead else-branch's :class:`CodeRange`.
+    The analyzer feeds those positions through the same flag-derivation
+    path as the literal-only default, so internal references inside
+    the dead branch land tagged with ``EdgeFlags.DEAD_BRANCH``.
+    """
+    import libcst as cst
+    from libcst.metadata import MetadataWrapper, PositionProvider
+
+    from dead_cst import build_symbol_graph
+
+    write_files(
+        {
+            "mod.py": """
+            from settings import IS_PROD
+            def prod_only(): pass
+            def dev_only(): pass
+            if IS_PROD:
+                prod_only()
+            else:
+                dev_only()
+            """,
+            "settings.py": "IS_PROD = True\n",
+        }
+    )
+
+    def detector(wrapper: MetadataWrapper):
+        positions = wrapper.resolve(PositionProvider)
+        out = []
+
+        class _V(cst.CSTVisitor):
+            def visit_If(self, node: cst.If) -> None:
+                test = node.test
+                # Hard-coded "settings.IS_PROD is always True" -- the
+                # default literal detector returns ``None`` here.
+                if isinstance(test, cst.Name) and test.value == "IS_PROD":
+                    if node.orelse is not None and isinstance(node.orelse, cst.Else):
+                        pos = positions.get(node.orelse.body)
+                        if pos is not None:
+                            out.append(pos)
+
+        wrapper.module.visit(_V())
+        return out
+
+    graph = build_symbol_graph({tmp_path: []}, unreachable_detector=detector)
+    assert_dead_branch_edges(graph, {"mod -> mod.dev_only"})
+
+
+def test_default_detector_does_not_flag_named_condition(tmp_path, write_files):
+    """Sanity check: the default detector leaves ``if NAME`` branches alone.
+
+    Counterpart to :func:`test_custom_detector_folds_constants` --
+    without a custom detector, ``if IS_PROD:`` is unknown and no
+    suite is recorded as dead.
+    """
+    from dead_cst import build_symbol_graph
+
+    write_files(
+        {
+            "mod.py": """
+            from settings import IS_PROD
+            def f(): pass
+            if IS_PROD:
+                f()
+            else:
+                f()
+            """,
+            "settings.py": "IS_PROD = True\n",
+        }
+    )
+    graph = build_symbol_graph({tmp_path: []})
+    assert _dead_suite_positions(graph, tmp_path / "mod.py") == ()
+
+
 def test_elif_false_in_chain_flags_only_dead_branch(build_decl_graph, assert_dead_branch_edges):
     graph = build_decl_graph(
         {
