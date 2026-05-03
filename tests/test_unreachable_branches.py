@@ -348,3 +348,158 @@ def test_elif_false_in_chain_flags_only_dead_branch(build_decl_graph, assert_dea
     )
     # Only the ``elif False:`` body is dead, so only ``b`` is flagged.
     assert_dead_branch_edges(graph, {"mod -> mod.b"})
+
+
+# ----------------------------------------------------------------------
+# Default detector + constant-folding pass: ``DEBUG = False; if DEBUG:``
+# patterns are caught out of the box, including chains the user vision
+# called out (``foo = False; bar = foo or False; if bar: ...``).
+# ----------------------------------------------------------------------
+
+
+def test_default_detector_folds_module_constant(build_decl_graph, assert_dead_branch_edges):
+    graph = build_decl_graph(
+        {
+            "mod.py": """
+            DEBUG = False
+            def helper(): pass
+            if DEBUG:
+                helper()
+            """
+        }
+    )
+    assert_dead_branch_edges(graph, {"mod -> mod.helper"})
+
+
+def test_default_detector_folds_chained_constants(build_decl_graph, assert_dead_branch_edges):
+    # The user-visioned case: ``bar`` resolves through ``foo`` only
+    # after the second pass of the constant-folding fixpoint loop.
+    graph = build_decl_graph(
+        {
+            "mod.py": """
+            foo = False
+            bar = foo or False
+            def helper(): pass
+            if bar:
+                helper()
+            """
+        }
+    )
+    assert_dead_branch_edges(graph, {"mod -> mod.helper"})
+
+
+def test_default_detector_folds_long_chain(build_decl_graph, assert_dead_branch_edges):
+    graph = build_decl_graph(
+        {
+            "mod.py": """
+            a = True
+            b = a
+            c = not b
+            d = c or False
+            def helper(): pass
+            if d:
+                helper()
+            """
+        }
+    )
+    assert_dead_branch_edges(graph, {"mod -> mod.helper"})
+
+
+def test_default_detector_folds_annotated_constant(build_decl_graph, assert_dead_branch_edges):
+    graph = build_decl_graph(
+        {
+            "mod.py": """
+            DEBUG: bool = False
+            def helper(): pass
+            if DEBUG:
+                helper()
+            """
+        }
+    )
+    assert_dead_branch_edges(graph, {"mod -> mod.helper"})
+
+
+def test_default_detector_folds_constant_in_function(build_decl_graph, assert_dead_branch_edges):
+    graph = build_decl_graph(
+        {
+            "mod.py": """
+            def helper(): pass
+            def caller():
+                FLAG = False
+                if FLAG:
+                    helper()
+            """
+        }
+    )
+    assert_dead_branch_edges(graph, {"mod.caller -> mod.helper"})
+
+
+def test_default_detector_marks_else_dead_when_constant_is_truthy(
+    build_decl_graph, assert_dead_branch_edges
+):
+    graph = build_decl_graph(
+        {
+            "mod.py": """
+            ENABLED = True
+            def helper(): pass
+            if ENABLED:
+                pass
+            else:
+                helper()
+            """
+        }
+    )
+    assert_dead_branch_edges(graph, {"mod -> mod.helper"})
+
+
+def test_default_detector_does_not_fold_conditional_binding(
+    build_decl_graph, assert_dead_branch_edges
+):
+    # Both bindings reach the access; their values disagree, so the
+    # fold pass refuses to commit and the suite stays live.
+    graph = build_decl_graph(
+        {
+            "mod.py": """
+            def helper(): pass
+            if cond:
+                cfg = True
+            else:
+                cfg = False
+            if cfg:
+                helper()
+            """
+        }
+    )
+    assert_dead_branch_edges(graph, set())
+
+
+def test_default_detector_does_not_fold_non_literal_rhs(build_decl_graph, assert_dead_branch_edges):
+    graph = build_decl_graph(
+        {
+            "mod.py": """
+            cfg = compute()
+            def helper(): pass
+            if cfg:
+                helper()
+            """
+        }
+    )
+    assert_dead_branch_edges(graph, set())
+
+
+def test_default_detector_does_not_fold_imported_name(build_decl_graph, assert_dead_branch_edges):
+    # Imports go through ``ImportAssignment``, whose binding node's
+    # parent is ``ImportAlias`` (not ``AssignTarget``/``AnnAssign``),
+    # so the fold pass returns no RHS and the access stays unknown.
+    graph = build_decl_graph(
+        {
+            "settings.py": "DEBUG = False\n",
+            "mod.py": """
+            from settings import DEBUG
+            def helper(): pass
+            if DEBUG:
+                helper()
+            """,
+        }
+    )
+    assert_dead_branch_edges(graph, set())

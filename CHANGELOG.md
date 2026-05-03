@@ -22,6 +22,22 @@ two versions.
   tests. The detector runs from inside `SymbolVisitor.visit_Module`
   reusing the analyzer's already-resolved `PositionProvider`, so the
   abstraction is free for the default path.
+- `dead_cst._const_fold.fold_constants(wrapper)`: fixpoint
+  constant-folding pass that returns a `dict[id(Name), bool]` of every
+  access whose binding ties back to a simple `Name = literal` (or
+  `Name: T = literal`) assignment. Iteration is the point: chained
+  forms like `foo = False; bar = foo or False; if bar: ...` resolve
+  fully because each pass propagates one more level of indirection.
+  Flow-sensitive (a later rebinding shadows an earlier one) and
+  conservative (mixed-value bindings, non-literal RHS, unsupported
+  shapes, and cycles all stay unknown).
+- `DefaultUnreachableRegionDetector` now runs `fold_constants` as a
+  pre-pass and threads the resulting truthiness map into
+  `unreachable_suites` via the new `resolve_name` callback on
+  `evaluate_truthiness`. Patterns like `DEBUG = False; if DEBUG: ...`
+  are flagged out of the box. Version bumped to `2`, so any cached
+  `VisitorPayload` from the prior literal-only detector is
+  automatically invalidated.
 - `Cacheable` Protocol (`name: str`, `version: int`): the shared
   cache-fingerprint contract that `EdgePlugin`, `PathResolver`, and
   `UnreachableRegionDetector` now all inherit from. Bumping a

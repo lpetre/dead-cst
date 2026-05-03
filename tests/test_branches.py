@@ -134,6 +134,65 @@ def test_evaluate_truthiness_unknown(src: str) -> None:
 
 
 # ----------------------------------------------------------------------
+# evaluate_truthiness: ``resolve_name`` callback. Callers with scope
+# info (notably the constant-folding pass) pass a resolver so names
+# bound to a known constant fold the same as a literal would.
+# ----------------------------------------------------------------------
+
+
+def _name_resolver(values: dict[str, bool | None]):
+    return lambda n: values.get(n.value)
+
+
+def test_resolver_folds_name_to_constant() -> None:
+    assert evaluate_truthiness(_expr("foo"), _name_resolver({"foo": False})) is False
+    assert evaluate_truthiness(_expr("foo"), _name_resolver({"foo": True})) is True
+
+
+def test_resolver_keywords_take_precedence_over_resolver() -> None:
+    # ``True`` / ``False`` / ``None`` are language keywords; the
+    # resolver should never see them even if the caller supplies an
+    # entry under those names.
+    called: list[str] = []
+
+    def resolver(n):
+        called.append(n.value)
+        return True
+
+    assert evaluate_truthiness(_expr("True"), resolver) is True
+    assert evaluate_truthiness(_expr("False"), resolver) is False
+    assert evaluate_truthiness(_expr("None"), resolver) is False
+    assert called == []
+
+
+def test_resolver_threads_through_not_and_or() -> None:
+    res = _name_resolver({"foo": False, "bar": True})
+    assert evaluate_truthiness(_expr("not foo"), res) is True
+    assert evaluate_truthiness(_expr("foo and bar"), res) is False
+    assert evaluate_truthiness(_expr("foo or bar"), res) is True
+    assert evaluate_truthiness(_expr("foo or unknown"), res) is None
+
+
+def test_resolver_returning_none_stays_unknown() -> None:
+    # Resolver returning None means "I don't know" -- same as no
+    # resolver at all.
+    assert evaluate_truthiness(_expr("foo"), lambda n: None) is None
+
+
+def test_unreachable_bodies_with_resolver() -> None:
+    # The resolver flips a name from "unknown" to "False", so the if
+    # body becomes statically dead.
+    stmt = _stmt(
+        """
+        if foo:
+            x = 1
+        """
+    )
+    assert unreachable_bodies(stmt) == []
+    assert _bodies_as_code(unreachable_bodies(stmt, _name_resolver({"foo": False}))) == ["x = 1"]
+
+
+# ----------------------------------------------------------------------
 # unreachable_bodies: simple ``if`` / ``while``.
 # ----------------------------------------------------------------------
 
