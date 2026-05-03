@@ -22,6 +22,50 @@ two versions.
   tests. The detector runs from inside `SymbolVisitor.visit_Module`
   reusing the analyzer's already-resolved `PositionProvider`, so the
   abstraction is free for the default path.
+- `dead_cst._const_fold.fold_constants(wrapper, resolve_expr=None)`:
+  fixpoint constant-folding pass that returns a `dict[id(Name), bool]`
+  of every access whose binding ties back to a simple `Name = literal`
+  (or `Name: T = literal`) assignment. Iteration is the point: chained
+  forms like `foo = False; bar = foo or False; if bar: ...` resolve
+  fully because each pass propagates one more level of indirection.
+  Flow-sensitive (a later rebinding shadows an earlier one) and
+  conservative (mixed-value bindings, non-literal RHS, unsupported
+  shapes, and cycles all stay unknown). The optional `resolve_expr`
+  callback gets first crack at any expression encountered during RHS
+  evaluation, so domain-specific truthiness composes with the literal
+  fold automatically — `flag = check_flag("x"); if flag:` resolves
+  when the resolver answers for the call.
+- `DefaultUnreachableRegionDetector` now runs three passes per file:
+  the literal-only `unreachable_suites` walk, the new `fold_constants`
+  pre-pass, and a post-terminator scan over every statement-bearing
+  suite. Patterns like `DEBUG = False; if DEBUG: ...`, `return`
+  followed by dead code, and `assert False` followed by dead code are
+  all flagged out of the box. Post-terminator detection is purely
+  suite-relative, so a `raise` inside a `try` body kills the rest of
+  the try body without touching the `except` handler, which runs on
+  its own path.
+- `DefaultUnreachableRegionDetector.resolve(self, expr) -> bool | None`:
+  overridable hook for subclasses to fold non-literal expressions to a
+  known truthiness — e.g. `check_flag("migration-abc")` is always
+  `True` in production. The default returns `None` (defer to literal
+  handling). The override is consulted recursively for every
+  non-keyword expression in every `if` / `while` / `assert` test and
+  every foldable assignment RHS; folded values flow through the
+  fixpoint loop alongside `Name = literal` bindings, so a single
+  high-level decision propagates through chains. Subclasses bump
+  `version` (epoch-int) for cache invalidation.
+- `evaluate_truthiness` and `unreachable_suites` / `unreachable_bodies`
+  now accept `resolve_expr: Callable[[cst.BaseExpression], bool | None]`
+  in place of the previous `Name`-only `resolve_name` callback. The
+  resolver is consulted for any non-keyword expression and short-
+  circuits the built-in literal handling when it returns a `bool`;
+  language keywords (`True` / `False` / `None`) always resolve to
+  their language-defined truthiness and are never passed through.
+  Detector `version` set to the current Unix epoch (`1777795837`),
+  matching the convention used by every other shipped `Cacheable`,
+  so any cached `VisitorPayload` from the prior detector is
+  automatically invalidated and concurrent bumps merge with `max()`
+  semantics.
 - `Cacheable` Protocol (`name: str`, `version: int`): the shared
   cache-fingerprint contract that `EdgePlugin`, `PathResolver`, and
   `UnreachableRegionDetector` now all inherit from. Bumping a

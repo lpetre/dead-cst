@@ -348,3 +348,511 @@ def test_elif_false_in_chain_flags_only_dead_branch(build_decl_graph, assert_dea
     )
     # Only the ``elif False:`` body is dead, so only ``b`` is flagged.
     assert_dead_branch_edges(graph, {"mod -> mod.b"})
+
+
+# ----------------------------------------------------------------------
+# Default detector + constant-folding pass: ``DEBUG = False; if DEBUG:``
+# patterns are caught out of the box, including chains the user vision
+# called out (``foo = False; bar = foo or False; if bar: ...``).
+# ----------------------------------------------------------------------
+
+
+def test_default_detector_folds_module_constant(build_decl_graph, assert_dead_branch_edges):
+    graph = build_decl_graph(
+        {
+            "mod.py": """
+            DEBUG = False
+            def helper(): pass
+            if DEBUG:
+                helper()
+            """
+        }
+    )
+    assert_dead_branch_edges(graph, {"mod -> mod.helper"})
+
+
+def test_default_detector_folds_chained_constants(build_decl_graph, assert_dead_branch_edges):
+    # The user-visioned case: ``bar`` resolves through ``foo`` only
+    # after the second pass of the constant-folding fixpoint loop.
+    graph = build_decl_graph(
+        {
+            "mod.py": """
+            foo = False
+            bar = foo or False
+            def helper(): pass
+            if bar:
+                helper()
+            """
+        }
+    )
+    assert_dead_branch_edges(graph, {"mod -> mod.helper"})
+
+
+def test_default_detector_folds_long_chain(build_decl_graph, assert_dead_branch_edges):
+    graph = build_decl_graph(
+        {
+            "mod.py": """
+            a = True
+            b = a
+            c = not b
+            d = c or False
+            def helper(): pass
+            if d:
+                helper()
+            """
+        }
+    )
+    assert_dead_branch_edges(graph, {"mod -> mod.helper"})
+
+
+def test_default_detector_folds_annotated_constant(build_decl_graph, assert_dead_branch_edges):
+    graph = build_decl_graph(
+        {
+            "mod.py": """
+            DEBUG: bool = False
+            def helper(): pass
+            if DEBUG:
+                helper()
+            """
+        }
+    )
+    assert_dead_branch_edges(graph, {"mod -> mod.helper"})
+
+
+def test_default_detector_folds_constant_in_function(build_decl_graph, assert_dead_branch_edges):
+    graph = build_decl_graph(
+        {
+            "mod.py": """
+            def helper(): pass
+            def caller():
+                FLAG = False
+                if FLAG:
+                    helper()
+            """
+        }
+    )
+    assert_dead_branch_edges(graph, {"mod.caller -> mod.helper"})
+
+
+def test_default_detector_marks_else_dead_when_constant_is_truthy(
+    build_decl_graph, assert_dead_branch_edges
+):
+    graph = build_decl_graph(
+        {
+            "mod.py": """
+            ENABLED = True
+            def helper(): pass
+            if ENABLED:
+                pass
+            else:
+                helper()
+            """
+        }
+    )
+    assert_dead_branch_edges(graph, {"mod -> mod.helper"})
+
+
+def test_default_detector_does_not_fold_conditional_binding(
+    build_decl_graph, assert_dead_branch_edges
+):
+    # Both bindings reach the access; their values disagree, so the
+    # fold pass refuses to commit and the suite stays live.
+    graph = build_decl_graph(
+        {
+            "mod.py": """
+            def helper(): pass
+            if cond:
+                cfg = True
+            else:
+                cfg = False
+            if cfg:
+                helper()
+            """
+        }
+    )
+    assert_dead_branch_edges(graph, set())
+
+
+def test_default_detector_does_not_fold_non_literal_rhs(build_decl_graph, assert_dead_branch_edges):
+    graph = build_decl_graph(
+        {
+            "mod.py": """
+            cfg = compute()
+            def helper(): pass
+            if cfg:
+                helper()
+            """
+        }
+    )
+    assert_dead_branch_edges(graph, set())
+
+
+def test_default_detector_does_not_fold_imported_name(build_decl_graph, assert_dead_branch_edges):
+    # Imports go through ``ImportAssignment``, whose binding node's
+    # parent is ``ImportAlias`` (not ``AssignTarget``/``AnnAssign``),
+    # so the fold pass returns no RHS and the access stays unknown.
+    graph = build_decl_graph(
+        {
+            "settings.py": "DEBUG = False\n",
+            "mod.py": """
+            from settings import DEBUG
+            def helper(): pass
+            if DEBUG:
+                helper()
+            """,
+        }
+    )
+    assert_dead_branch_edges(graph, set())
+
+
+# ----------------------------------------------------------------------
+# Default detector: post-terminator unreachable region. Statements
+# after an unconditional ``return`` / ``raise`` / ``break`` /
+# ``continue`` / ``assert <statically-falsy>`` in the same suite are
+# unreachable. The check is purely suite-relative -- a ``raise`` in
+# a try body kills the rest of *that* suite, not the ``except``
+# handler that runs on its own path.
+# ----------------------------------------------------------------------
+
+
+def test_return_kills_following_statements(build_decl_graph, assert_dead_branch_edges):
+    graph = build_decl_graph(
+        {
+            "mod.py": """
+            def helper(): pass
+            def caller():
+                return
+                helper()
+            """
+        }
+    )
+    assert_dead_branch_edges(graph, {"mod.caller -> mod.helper"})
+
+
+def test_raise_kills_following_statements(build_decl_graph, assert_dead_branch_edges):
+    graph = build_decl_graph(
+        {
+            "mod.py": """
+            def helper(): pass
+            def caller():
+                raise RuntimeError()
+                helper()
+            """
+        }
+    )
+    assert_dead_branch_edges(graph, {"mod.caller -> mod.helper"})
+
+
+def test_assert_false_kills_following_statements(build_decl_graph, assert_dead_branch_edges):
+    graph = build_decl_graph(
+        {
+            "mod.py": """
+            def helper(): pass
+            def caller():
+                assert False
+                helper()
+            """
+        }
+    )
+    assert_dead_branch_edges(graph, {"mod.caller -> mod.helper"})
+
+
+def test_assert_folded_constant_kills_following_statements(
+    build_decl_graph, assert_dead_branch_edges
+):
+    # ``assert NEVER`` where ``NEVER = False`` -- the constant-folding
+    # pass resolves the test to False, then the terminator scan picks
+    # it up. Two passes composing on the same suite.
+    graph = build_decl_graph(
+        {
+            "mod.py": """
+            NEVER = False
+            def helper(): pass
+            def caller():
+                assert NEVER
+                helper()
+            """
+        }
+    )
+    assert_dead_branch_edges(graph, {"mod.caller -> mod.helper"})
+
+
+def test_assert_truthy_does_not_kill_following_statements(
+    build_decl_graph, assert_dead_branch_edges
+):
+    # ``assert True`` (or any truthy literal) is a no-op at runtime --
+    # following statements are reachable.
+    graph = build_decl_graph(
+        {
+            "mod.py": """
+            def helper(): pass
+            def caller():
+                assert True
+                helper()
+            """
+        }
+    )
+    assert_dead_branch_edges(graph, set())
+
+
+def test_break_kills_following_statements_in_loop(build_decl_graph, assert_dead_branch_edges):
+    graph = build_decl_graph(
+        {
+            "mod.py": """
+            def helper(): pass
+            def caller():
+                for _ in range(10):
+                    break
+                    helper()
+            """
+        }
+    )
+    assert_dead_branch_edges(graph, {"mod.caller -> mod.helper"})
+
+
+def test_continue_kills_following_statements_in_loop(build_decl_graph, assert_dead_branch_edges):
+    graph = build_decl_graph(
+        {
+            "mod.py": """
+            def helper(): pass
+            def caller():
+                while True:
+                    continue
+                    helper()
+            """
+        }
+    )
+    assert_dead_branch_edges(graph, {"mod.caller -> mod.helper"})
+
+
+def test_raise_in_try_body_does_not_kill_except_handler(build_decl_graph, assert_dead_branch_edges):
+    # The user-asked case: ``raise`` in a try body is suite-relative.
+    # ``func()`` after the raise in the try body is dead; ``other()``
+    # in the except handler runs on its own path and stays live.
+    graph = build_decl_graph(
+        {
+            "mod.py": """
+            def func(): pass
+            def other(): pass
+            def caller():
+                try:
+                    raise Exception()
+                    func()
+                except Exception:
+                    other()
+            """
+        }
+    )
+    assert_dead_branch_edges(graph, {"mod.caller -> mod.func"})
+
+
+def test_raise_in_except_body_kills_following_statements(
+    build_decl_graph, assert_dead_branch_edges
+):
+    graph = build_decl_graph(
+        {
+            "mod.py": """
+            def helper(): pass
+            def caller():
+                try:
+                    pass
+                except Exception:
+                    raise
+                    helper()
+            """
+        }
+    )
+    assert_dead_branch_edges(graph, {"mod.caller -> mod.helper"})
+
+
+def test_terminator_as_last_statement_marks_nothing(build_decl_graph, assert_dead_branch_edges):
+    # No tail to mark -- the terminator is the last statement.
+    graph = build_decl_graph(
+        {
+            "mod.py": """
+            def helper(): pass
+            def caller():
+                helper()
+                return
+            """
+        }
+    )
+    assert_dead_branch_edges(graph, set())
+
+
+def test_terminator_inside_if_does_not_kill_outside(build_decl_graph, assert_dead_branch_edges):
+    # The ``return`` lives in the if-body suite. Statements at the
+    # outer (function-body) suite are reachable: when ``cond`` is
+    # falsy the if body is skipped and execution falls through.
+    graph = build_decl_graph(
+        {
+            "mod.py": """
+            def helper(): pass
+            def caller(cond):
+                if cond:
+                    return
+                helper()
+            """
+        }
+    )
+    assert_dead_branch_edges(graph, set())
+
+
+def test_terminator_chained_with_constant_fold(build_decl_graph, assert_dead_branch_edges):
+    # A function-call chain: ``if FLAG: return`` where ``FLAG`` is a
+    # folded constant. ``unreachable_suites`` already recognized this
+    # but the test guards against passes interfering with each other.
+    graph = build_decl_graph(
+        {
+            "mod.py": """
+            FLAG = False
+            def helper(): pass
+            def caller():
+                if FLAG:
+                    return
+                helper()
+            """
+        }
+    )
+    # The if-body itself is dead (FLAG=False), but no terminator at
+    # function-body scope, so ``helper()`` is reachable.
+    assert_dead_branch_edges(graph, set())
+
+
+def test_module_level_terminator_kills_following_statements(
+    build_decl_graph, assert_dead_branch_edges
+):
+    # Module-scope: ``raise`` at top level prevents any subsequent
+    # module statement from running, so the trailing ``helper()`` is
+    # dead.
+    graph = build_decl_graph(
+        {
+            "mod.py": """
+            def helper(): pass
+            raise SystemExit()
+            helper()
+            """
+        }
+    )
+    assert_dead_branch_edges(graph, {"mod -> mod.helper"})
+
+
+# ----------------------------------------------------------------------
+# Custom detector subclass overrides ``resolve`` to fold non-Name
+# expressions (function calls, attribute access). The user's example:
+# ``check_flag("migration-abc")`` is treated as a known constant.
+# ----------------------------------------------------------------------
+
+
+def test_custom_detector_override_folds_call_in_if(tmp_path, write_files):
+    """A subclass that knows ``check_flag(name)`` is constant.
+
+    The override answers for the ``Call`` node directly; the detector
+    threads the answer through both ``unreachable_suites`` (so the
+    ``if`` body is marked dead) and ``fold_constants`` (so a chain
+    like ``flag = check_flag(...); if flag:`` would also resolve, see
+    the next test).
+    """
+    from dataclasses import dataclass
+
+    import libcst as cst
+
+    from dead_cst import EdgeFlags, build_symbol_graph
+    from dead_cst._branches import DefaultUnreachableRegionDetector
+
+    write_files(
+        {
+            "mod.py": """
+            def prod_only(): pass
+            def dev_only(): pass
+            if check_flag("migration-abc"):
+                prod_only()
+            else:
+                dev_only()
+            """,
+        }
+    )
+
+    @dataclass(frozen=True)
+    class FlagAwareDetector(DefaultUnreachableRegionDetector):
+        name: str = "flag_aware"
+        version: int = 1
+
+        def resolve(self, expr):
+            if (
+                isinstance(expr, cst.Call)
+                and isinstance(expr.func, cst.Name)
+                and expr.func.value == "check_flag"
+            ):
+                return True
+            return None
+
+    graph = build_symbol_graph({tmp_path: []}, unreachable_detector=FlagAwareDetector())
+    dead = {
+        f"{src.fqname} -> {dst.fqname}"
+        for src, dst, attrs in graph.edges(data=True)
+        if attrs.get("flags", EdgeFlags.NONE) & EdgeFlags.DEAD_BRANCH
+    }
+    # ``check_flag(...)`` resolves to True, so the else branch is dead.
+    assert dead == {"mod -> mod.dev_only"}
+
+
+def test_custom_detector_override_folds_through_assignment(tmp_path, write_files):
+    """Override answer composes with the fixpoint fold pass.
+
+    ``flag = check_flag(...)`` propagates the override's answer
+    through the assignment: by the time ``if flag:`` is evaluated,
+    the fold table already has ``id(flag) -> False``, so the if body
+    is recognized as dead.
+    """
+    from dataclasses import dataclass
+
+    import libcst as cst
+
+    from dead_cst import EdgeFlags, build_symbol_graph
+    from dead_cst._branches import DefaultUnreachableRegionDetector
+
+    write_files(
+        {
+            "mod.py": """
+            def helper(): pass
+            flag = check_flag("migration-abc")
+            if flag:
+                helper()
+            """,
+        }
+    )
+
+    @dataclass(frozen=True)
+    class FlagAwareDetector(DefaultUnreachableRegionDetector):
+        name: str = "flag_aware"
+        version: int = 1
+
+        def resolve(self, expr):
+            if (
+                isinstance(expr, cst.Call)
+                and isinstance(expr.func, cst.Name)
+                and expr.func.value == "check_flag"
+            ):
+                return False
+            return None
+
+    graph = build_symbol_graph({tmp_path: []}, unreachable_detector=FlagAwareDetector())
+    dead = {
+        f"{src.fqname} -> {dst.fqname}"
+        for src, dst, attrs in graph.edges(data=True)
+        if attrs.get("flags", EdgeFlags.NONE) & EdgeFlags.DEAD_BRANCH
+    }
+    assert dead == {"mod -> mod.helper"}
+
+
+def test_default_resolve_returns_none() -> None:
+    # The base detector's ``resolve`` is a no-op hook. Verifying the
+    # default explicitly keeps the contract for subclasses clear.
+    import libcst as cst
+
+    from dead_cst._branches import DefaultUnreachableRegionDetector
+
+    detector = DefaultUnreachableRegionDetector()
+    assert detector.resolve(cst.Name("anything")) is None
+    assert detector.resolve(cst.Integer("0")) is None

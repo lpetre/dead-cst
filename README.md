@@ -216,41 +216,48 @@ Write your own from scratch by implementing the `EdgePlugin` protocol (`name`, `
 
 Path resolution is similarly pluggable. `PathResolver` implementations return a `{base: [dep_paths]}` map to feed `build_symbol_graph`. Builtins: `VenvResolver`, `PyprojectResolver`, `UvWorkspaceResolver` (parses `uv.lock` to discover workspace members and their inter-member dep edges). Third-party resolvers register under `dead_cst.resolvers`.
 
-Unreachable-code detection is pluggable through the `UnreachableRegionDetector` protocol. `build_symbol_graph` accepts an `unreachable_detector` whose `find_regions(wrapper) -> list[CodeRange]` is invoked once per file; the built-in `DefaultUnreachableRegionDetector` runs the literal-only truthiness evaluator on every `if` / `while` test. Override it to fold in domain knowledge — e.g. config flags whose values are fixed in production:
+Unreachable-code detection is pluggable through the `UnreachableRegionDetector` protocol. `build_symbol_graph` accepts an `unreachable_detector` whose `find_regions(wrapper) -> list[CodeRange]` is invoked once per file. The built-in `DefaultUnreachableRegionDetector` covers three things out of the box:
+
+- **Literal truthiness** on every `if` / `while` test (e.g. `if False:` always-dead body, `if True: ... else: ...` always-dead else).
+- **Fixpoint constant folding** over simple `Name = literal` (and `Name: T = literal`) assignments. Chains like `foo = False; bar = foo or False; if bar: ...` resolve to dead because each fixpoint pass propagates one more level of indirection.
+- **Post-terminator regions** inside every suite. Statements after an unconditional `return` / `raise` / `break` / `continue` / `assert <statically-falsy>` in the same suite are marked dead. Suite-relative, so a `raise` in a `try` body kills only the rest of the try body — the `except` handler still runs on its own path.
+
+To layer in domain knowledge — e.g. config flags whose values are fixed in production — subclass and override `resolve(self, expr) -> bool | None`. The override gets first crack at every non-keyword expression in every `if` / `while` / `assert` test and every foldable assignment RHS; returning `None` defers to the built-in literal handling. Constants resolved this way flow through the same fixpoint loop as `Name = literal` bindings, so a single high-level decision propagates through chains:
 
 ```python
 from dataclasses import dataclass
 
 import libcst as cst
-from libcst.metadata import CodeRange, MetadataWrapper, PositionProvider
 from dead_cst import build_symbol_graph
+from dead_cst._branches import DefaultUnreachableRegionDetector
 
 @dataclass(frozen=True)
-class IsProdDetector:
+class FlagAwareDetector(DefaultUnreachableRegionDetector):
     # name/version satisfy the Cacheable contract -- bump version when
-    # the detector's logic changes so stale per-file payloads rebuild
+    # the override's logic changes so stale per-file payloads rebuild
     # automatically.
-    name: str = "is_prod"
+    name: str = "flag_aware"
     version: int = 1700000000
 
-    def find_regions(self, wrapper: MetadataWrapper) -> list[CodeRange]:
-        positions = wrapper.resolve(PositionProvider)
-        out: list[CodeRange] = []
+    def resolve(self, expr: cst.BaseExpression) -> bool | None:
+        # The override is consulted recursively, so guard with an early
+        # isinstance check to keep it cheap.
+        if (
+            isinstance(expr, cst.Call)
+            and isinstance(expr.func, cst.Name)
+            and expr.func.value == "check_flag"
+            and expr.args
+            and isinstance(expr.args[0].value, cst.SimpleString)
+        ):
+            return MIGRATIONS[expr.args[0].value.evaluated_value]
+        return None
 
-        class V(cst.CSTVisitor):
-            def visit_If(self, node):
-                # "settings.IS_PROD is always True" -- mark the else-branch dead.
-                if isinstance(node.test, cst.Name) and node.test.value == "IS_PROD":
-                    if isinstance(node.orelse, cst.Else):
-                        pos = positions.get(node.orelse.body)
-                        if pos is not None:
-                            out.append(pos)
-
-        wrapper.module.visit(V())
-        return out
-
-graph = build_symbol_graph({root: []}, unreachable_detector=IsProdDetector())
+graph = build_symbol_graph({root: []}, unreachable_detector=FlagAwareDetector())
 ```
+
+With the override above, `if check_flag("migration-abc"): ...` and `flag = check_flag("migration-abc"); if flag: ...` both resolve to a known truthiness, and the unreachable suite is flagged just like a literal `if False:` would be.
+
+For detectors that don't fit the constant-folding model at all, write a fresh class that implements `find_regions(wrapper) -> list[CodeRange]` directly — the protocol requires nothing else beyond the `Cacheable` `(name, version)` pair.
 
 ## Graph model
 

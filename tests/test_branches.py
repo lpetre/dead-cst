@@ -134,6 +134,95 @@ def test_evaluate_truthiness_unknown(src: str) -> None:
 
 
 # ----------------------------------------------------------------------
+# evaluate_truthiness: ``resolve_expr`` callback. Custom detectors
+# pass a resolver so expressions whose truthiness is fixed in a
+# specific environment fold the same as a literal would. The resolver
+# operates over any ``BaseExpression`` -- not just ``Name`` -- so a
+# subclass can answer for ``Call`` patterns like
+# ``check_flag("migration-abc")``.
+# ----------------------------------------------------------------------
+
+
+def _name_resolver(values: dict[str, bool | None]):
+    """Fixture: resolver that answers only for ``Name`` nodes."""
+    return lambda n: values.get(n.value) if isinstance(n, cst.Name) else None
+
+
+def test_resolver_folds_name_to_constant() -> None:
+    assert evaluate_truthiness(_expr("foo"), _name_resolver({"foo": False})) is False
+    assert evaluate_truthiness(_expr("foo"), _name_resolver({"foo": True})) is True
+
+
+def test_resolver_folds_arbitrary_expression() -> None:
+    # The resolver is consulted on every non-keyword expression, so a
+    # subclass can answer for ``Call`` / ``Attribute`` / etc. without
+    # touching ``evaluate_truthiness``'s built-in cases.
+    def resolver(expr):
+        if isinstance(expr, cst.Call) and isinstance(expr.func, cst.Name):
+            if expr.func.value == "check_flag":
+                return True
+        return None
+
+    assert evaluate_truthiness(_expr('check_flag("x")'), resolver) is True
+    # Negation threads through too.
+    assert evaluate_truthiness(_expr('not check_flag("x")'), resolver) is False
+
+
+def test_resolver_keywords_take_precedence_over_resolver() -> None:
+    # ``True`` / ``False`` / ``None`` are language keywords; the
+    # resolver should never see them even if the caller supplies an
+    # entry under those names.
+    called: list[str] = []
+
+    def resolver(n):
+        called.append(getattr(n, "value", repr(n)))
+        return True
+
+    assert evaluate_truthiness(_expr("True"), resolver) is True
+    assert evaluate_truthiness(_expr("False"), resolver) is False
+    assert evaluate_truthiness(_expr("None"), resolver) is False
+    assert called == []
+
+
+def test_resolver_threads_through_not_and_or() -> None:
+    res = _name_resolver({"foo": False, "bar": True})
+    assert evaluate_truthiness(_expr("not foo"), res) is True
+    assert evaluate_truthiness(_expr("foo and bar"), res) is False
+    assert evaluate_truthiness(_expr("foo or bar"), res) is True
+    assert evaluate_truthiness(_expr("foo or unknown"), res) is None
+
+
+def test_resolver_returning_none_falls_through_to_literals() -> None:
+    # A resolver that always says "I don't know" must not block the
+    # built-in literal handling.
+    always_none = lambda _: None  # noqa: E731
+    assert evaluate_truthiness(_expr("foo"), always_none) is None
+    assert evaluate_truthiness(_expr("False"), always_none) is False
+    assert evaluate_truthiness(_expr("0"), always_none) is False
+    assert evaluate_truthiness(_expr("[1]"), always_none) is True
+
+
+def test_resolver_short_circuits_literal_handling() -> None:
+    # When the resolver answers, ``evaluate_truthiness`` does *not*
+    # walk into the literal cases. Useful when a custom detector
+    # wants to override the truthiness of a non-empty literal.
+    assert evaluate_truthiness(_expr("[1]"), lambda _: False) is False
+
+
+def test_unreachable_bodies_with_resolver() -> None:
+    # The resolver flips a name from "unknown" to "False", so the if
+    # body becomes statically dead.
+    stmt = _stmt(
+        """
+        if foo:
+            x = 1
+        """
+    )
+    assert unreachable_bodies(stmt) == []
+    assert _bodies_as_code(unreachable_bodies(stmt, _name_resolver({"foo": False}))) == ["x = 1"]
+
+
+# ----------------------------------------------------------------------
 # unreachable_bodies: simple ``if`` / ``while``.
 # ----------------------------------------------------------------------
 
