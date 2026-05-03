@@ -108,38 +108,47 @@ def test_fingerprint_changes_when_unreachable_detector_changes(tmp_path):
     """Swapping the unreachable-region detector flips the fingerprint.
 
     Detectors are folded into each cached payload's ``dead_suites``
-    list, so a detector swap must invalidate the file_cache. The
-    default detector ships with a stable ``name`` / ``version``;
-    custom detectors are fingerprinted by their callable's name (or
-    explicit ``name`` attribute) and ``version``.
+    list, so a detector swap must invalidate the file_cache. Both the
+    default and custom detectors satisfy ``Cacheable`` via their
+    ``(name, version)`` pair.
     """
+    from dataclasses import dataclass
+
     from libcst.metadata import CodeRange, MetadataWrapper
 
-    def custom(wrapper: MetadataWrapper) -> list[CodeRange]:
-        return []
+    @dataclass(frozen=True)
+    class Custom:
+        name: str = "custom"
+        version: int = 1
 
-    custom.name = "custom"  # type: ignore[attr-defined]
-    custom.version = 1  # type: ignore[attr-defined]
+        def find_regions(self, wrapper: MetadataWrapper) -> list[CodeRange]:
+            return []
 
     fp_default = compute_fingerprint(paths={tmp_path: []}, resolvers=[])
-    fp_custom = compute_fingerprint(paths={tmp_path: []}, resolvers=[], unreachable_detector=custom)
+    fp_custom = compute_fingerprint(
+        paths={tmp_path: []}, resolvers=[], unreachable_detector=Custom()
+    )
     assert fp_default != fp_custom
 
 
 def test_fingerprint_changes_when_unreachable_detector_version_bumped(tmp_path):
     """Bumping a detector's ``version`` invalidates the cache key."""
+    from dataclasses import dataclass
+
     from libcst.metadata import CodeRange, MetadataWrapper
 
-    def custom(wrapper: MetadataWrapper) -> list[CodeRange]:
-        return []
+    @dataclass(frozen=True)
+    class Custom:
+        name: str = "custom"
+        version: int = 1
 
-    custom.name = "custom"  # type: ignore[attr-defined]
-    custom.version = 1  # type: ignore[attr-defined]
+        def find_regions(self, wrapper: MetadataWrapper) -> list[CodeRange]:
+            return []
 
-    fp_v1 = compute_fingerprint(paths={tmp_path: []}, resolvers=[], unreachable_detector=custom)
-
-    custom.version = 2  # type: ignore[attr-defined]
-    fp_v2 = compute_fingerprint(paths={tmp_path: []}, resolvers=[], unreachable_detector=custom)
+    fp_v1 = compute_fingerprint(paths={tmp_path: []}, resolvers=[], unreachable_detector=Custom())
+    fp_v2 = compute_fingerprint(
+        paths={tmp_path: []}, resolvers=[], unreachable_detector=Custom(version=2)
+    )
     assert fp_v1 != fp_v2
 
 

@@ -39,9 +39,10 @@ from ._analyze import (
     order_paths,
 )
 from ._branches import (
+    DefaultUnreachableRegionDetector,
     UnreachableRegionDetector,
-    default_unreachable_regions,
 )
+from ._cacheable import Cacheable
 from ._codemod import remove_code
 from ._symbols import EdgeFlags, NodeFlags
 from ._plugins import (
@@ -89,8 +90,10 @@ __all__ = [
     "AddNode",
     "BUILTIN_PLUGINS",
     "BUILTIN_RESOLVERS",
+    "Cacheable",
     "ClickPlugin",
     "DecoratedDeclPlugin",
+    "DefaultUnreachableRegionDetector",
     "EdgeFlags",
     "EdgePlugin",
     "ExplicitEntrypointPlugin",
@@ -117,7 +120,6 @@ __all__ = [
     "VenvResolver",
     "build_symbol_graph",
     "count_nodes",
-    "default_unreachable_regions",
     "entrypoint_payload",
     "find_kept_alive_by_dead_branches",
     "find_reachable",

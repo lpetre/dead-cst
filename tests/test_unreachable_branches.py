@@ -255,6 +255,8 @@ def test_custom_detector_folds_constants(tmp_path, write_files, assert_dead_bran
     path as the literal-only default, so internal references inside
     the dead branch land tagged with ``EdgeFlags.DEAD_BRANCH``.
     """
+    from dataclasses import dataclass
+
     import libcst as cst
     from libcst.metadata import MetadataWrapper, PositionProvider
 
@@ -275,25 +277,30 @@ def test_custom_detector_folds_constants(tmp_path, write_files, assert_dead_bran
         }
     )
 
-    def detector(wrapper: MetadataWrapper):
-        positions = wrapper.resolve(PositionProvider)
-        out = []
+    @dataclass(frozen=True)
+    class IsProdDetector:
+        name: str = "is_prod"
+        version: int = 1
 
-        class _V(cst.CSTVisitor):
-            def visit_If(self, node: cst.If) -> None:
-                test = node.test
-                # Hard-coded "settings.IS_PROD is always True" -- the
-                # default literal detector returns ``None`` here.
-                if isinstance(test, cst.Name) and test.value == "IS_PROD":
-                    if node.orelse is not None and isinstance(node.orelse, cst.Else):
-                        pos = positions.get(node.orelse.body)
-                        if pos is not None:
-                            out.append(pos)
+        def find_regions(self, wrapper: MetadataWrapper):
+            positions = wrapper.resolve(PositionProvider)
+            out = []
 
-        wrapper.module.visit(_V())
-        return out
+            class _V(cst.CSTVisitor):
+                def visit_If(self, node: cst.If) -> None:
+                    test = node.test
+                    # Hard-coded "settings.IS_PROD is always True" --
+                    # the default literal detector returns ``None`` here.
+                    if isinstance(test, cst.Name) and test.value == "IS_PROD":
+                        if isinstance(node.orelse, cst.Else):
+                            pos = positions.get(node.orelse.body)
+                            if pos is not None:
+                                out.append(pos)
 
-    graph = build_symbol_graph({tmp_path: []}, unreachable_detector=detector)
+            wrapper.module.visit(_V())
+            return out
+
+    graph = build_symbol_graph({tmp_path: []}, unreachable_detector=IsProdDetector())
     assert_dead_branch_edges(graph, {"mod -> mod.dev_only"})
 
 

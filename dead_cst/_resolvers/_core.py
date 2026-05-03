@@ -10,6 +10,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Callable, Protocol, runtime_checkable
 
+from .._cacheable import Cacheable
+
 PathMap = dict[Path, list[Path]]
 
 # ``name -> path`` lookup callable. ``None`` means "not resolvable here".
@@ -17,7 +19,7 @@ ImportResolver = Callable[[str, list[Path]], "str | Path | None"]
 
 
 @runtime_checkable
-class PathResolver(Protocol):
+class PathResolver(Cacheable, Protocol):
     """A resolver describes a project layout in two complementary ways.
 
     :meth:`resolve` reports the search paths the analyzer should walk
@@ -32,9 +34,11 @@ class PathResolver(Protocol):
     ``sys.path`` + ``importlib`` implementation. Custom resolvers
     typically call it as a fallback after their own layout-specific
     lookups.
-    """
 
-    name: str
+    Inherits the ``(name, version)`` contract from :class:`Cacheable`
+    so the per-file cache invalidates when a resolver's layout-discovery
+    or import-resolution logic changes (bump the epoch ``version``).
+    """
 
     def resolve(self, project_root: Path) -> PathMap: ...
 

@@ -24,7 +24,7 @@ import pytest
 from libcst.metadata import MetadataWrapper
 
 from dead_cst._branches import (
-    default_unreachable_regions,
+    DefaultUnreachableRegionDetector,
     evaluate_truthiness,
     unreachable_bodies,
 )
@@ -334,7 +334,7 @@ def test_unsupported_statement_returns_empty() -> None:
 
 
 # ----------------------------------------------------------------------
-# default_unreachable_regions: module-level CodeRange detector.
+# DefaultUnreachableRegionDetector: module-level CodeRange detector.
 # ----------------------------------------------------------------------
 
 
@@ -343,7 +343,7 @@ def _wrapper(src: str) -> MetadataWrapper:
 
 
 def test_default_detector_returns_empty_for_no_dead_code() -> None:
-    regions = default_unreachable_regions(
+    regions = DefaultUnreachableRegionDetector().find_regions(
         _wrapper(
             """
             def f(): pass
@@ -354,7 +354,7 @@ def test_default_detector_returns_empty_for_no_dead_code() -> None:
 
 
 def test_default_detector_finds_if_false_body() -> None:
-    regions = default_unreachable_regions(
+    regions = DefaultUnreachableRegionDetector().find_regions(
         _wrapper(
             """
             if False:
@@ -367,7 +367,7 @@ def test_default_detector_finds_if_false_body() -> None:
 
 
 def test_default_detector_finds_multiple_dead_suites() -> None:
-    regions = default_unreachable_regions(
+    regions = DefaultUnreachableRegionDetector().find_regions(
         _wrapper(
             """
             if False:
@@ -386,7 +386,7 @@ def test_default_detector_finds_multiple_dead_suites() -> None:
 
 
 def test_default_detector_handles_while() -> None:
-    regions = default_unreachable_regions(
+    regions = DefaultUnreachableRegionDetector().find_regions(
         _wrapper(
             """
             while False:
@@ -398,6 +398,7 @@ def test_default_detector_handles_while() -> None:
 
 
 def test_default_detector_carries_fingerprint_metadata() -> None:
-    """``name`` / ``version`` attributes feed the cache fingerprint."""
-    assert default_unreachable_regions.name == "default"
-    assert isinstance(default_unreachable_regions.version, int)
+    """``name`` / ``version`` feed the cache fingerprint via ``Cacheable``."""
+    detector = DefaultUnreachableRegionDetector()
+    assert detector.name == "default"
+    assert isinstance(detector.version, int)

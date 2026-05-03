@@ -78,20 +78,15 @@ def _payload_from_source(tmp_path: Path, src: str) -> tuple[VisitorPayload, Path
 
     Bypasses ``build_symbol_graph`` so we can inspect the visitor's own
     output -- i.e. what would be cached -- without the per-base
-    apply-and-resolve work on top. Mirrors the analyzer's call into
-    :func:`default_unreachable_regions` so the resulting payload's
-    ``dead_suites`` field matches an end-to-end run.
+    apply-and-resolve work on top.
     """
-    from dead_cst._branches import default_unreachable_regions
-
     file = tmp_path / "pkg.py"
     file.write_text(textwrap.dedent(src).strip() + "\n")
     mgr = FullRepoManager(str(tmp_path), [str(file)], {FixedFullyQualifiedNameProvider})
     wrapper = mgr.get_metadata_wrapper_for_path(str(file))
-    visitor = SymbolVisitor(file, [tmp_path])
+    visitor = SymbolVisitor(file, [tmp_path], wrapper=wrapper)
     wrapper.visit(visitor)
-    dead_suites = tuple(default_unreachable_regions(wrapper))
-    return visitor.to_payload(dead_suites=dead_suites), file
+    return visitor.to_payload(), file
 
 
 def test_payload_module_node_present(tmp_path):

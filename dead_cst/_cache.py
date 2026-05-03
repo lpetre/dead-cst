@@ -43,8 +43,8 @@ from pathlib import Path
 from typing import Sequence
 
 from ._branches import (
+    DefaultUnreachableRegionDetector,
     UnreachableRegionDetector,
-    default_unreachable_regions,
 )
 from ._plugins._core import EdgePlugin
 from ._resolvers import PathMap, PathResolver
@@ -82,15 +82,14 @@ def compute_fingerprint(
     Includes the dead-cst version (any code change can shift visitor
     output), Python version (pickle protocol stability), the
     ``PathMap`` (the search-path layout governs ``Import.path``
-    resolution), the resolver chain (resolvers override
-    ``name -> path`` lookups), the plugin set, and the
-    unreachable-region detector. Plugins and the detector are
-    fingerprinted by ``(name, version)`` because their output is
-    folded into each cached payload; bumping ``version`` invalidates
+    resolution), and the resolver / plugin / detector chain.
+    Resolvers, plugins, and the detector all satisfy
+    :class:`~dead_cst._cacheable.Cacheable` and are fingerprinted by
+    their ``(name, version)`` pair: bumping ``version`` invalidates
     the file_cache so new output replaces the old. ``version`` is a
     Unix epoch int by convention, so concurrent bumps on different
-    branches merge with ``max()``-wins semantics rather than colliding
-    on a re-used integer label.
+    branches merge with ``max()``-wins semantics rather than
+    colliding on a re-used integer label.
 
     Each value is normalized to a stable string before hashing so
     equivalent inputs produce equal keys.
@@ -106,26 +105,19 @@ def compute_fingerprint(
         h.update(f"  {base}:{','.join(deps)}\n".encode())
 
     h.update(b"resolvers=\n")
-    for name in sorted(getattr(r, "name", type(r).__name__) for r in resolvers):
-        h.update(f"  {name}\n".encode())
+    for r_name, r_version in sorted((r.name, r.version) for r in resolvers):
+        h.update(f"  {r_name}@{r_version}\n".encode())
 
     h.update(b"plugins=\n")
-    plugin_entries = sorted(
-        (
-            getattr(p, "name", type(p).__name__),
-            int(getattr(p, "version", 0)),
-        )
-        for p in plugins
-    )
-    for name, version in plugin_entries:
-        h.update(f"  {name}@{version}\n".encode())
+    for p_name, p_version in sorted((p.name, p.version) for p in plugins):
+        h.update(f"  {p_name}@{p_version}\n".encode())
 
-    detector = unreachable_detector or default_unreachable_regions
-    detector_name = getattr(
-        detector, "name", getattr(detector, "__name__", type(detector).__name__)
+    detector = (
+        unreachable_detector
+        if unreachable_detector is not None
+        else DefaultUnreachableRegionDetector()
     )
-    detector_version = int(getattr(detector, "version", 0))
-    h.update(f"unreachable_detector={detector_name}@{detector_version}\n".encode())
+    h.update(f"unreachable_detector={detector.name}@{detector.version}\n".encode())
 
     return h.hexdigest()
 
