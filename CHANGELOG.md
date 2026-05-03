@@ -9,15 +9,7 @@ two versions.
 
 ## [Unreleased]
 
-### Changed
-- The package `__version__` is no longer folded into the cache
-  fingerprint. Every component whose output can shift between
-  releases (visitor, resolvers, plugins, detector) already carries
-  its own `Cacheable` `(name, version)` knob; mixing `__version__`
-  in on top let unbumped components ride for free on a release bump
-  and masked cases where the granular versions weren't being
-  maintained. The discipline now is to bump the relevant component's
-  `version`. Schema version and Python version still participate.
+## [0.3.0] - 2026-05-03
 
 ### Added
 - PEP 572 walrus (`:=`) bindings at module scope are now surfaced as
@@ -150,6 +142,14 @@ two versions.
   marker for idempotent reuse.
 
 ### Changed
+- The package `__version__` is no longer folded into the cache
+  fingerprint. Every component whose output can shift between
+  releases (visitor, resolvers, plugins, detector) already carries
+  its own `Cacheable` `(name, version)` knob; mixing `__version__`
+  in on top let unbumped components ride for free on a release bump
+  and masked cases where the granular versions weren't being
+  maintained. The discipline now is to bump the relevant component's
+  `version`. Schema version and Python version still participate.
 - `PathResolver` is now a `Cacheable` Protocol: shipped resolvers
   (`ManualResolver`, `PyprojectResolver`, `UvWorkspaceResolver`,
   `VenvResolver`) all carry an epoch `version: int` matching the
@@ -372,6 +372,7 @@ versions until the first stable release.
 - `README.md`, `CONTRIBUTING.md`, `CHANGELOG.md`, and `ROADMAP.md` with a
   stack-ranked plan from alpha to 1.0.
 
-[Unreleased]: https://github.com/lpetre/dead-cst/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/lpetre/dead-cst/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/lpetre/dead-cst/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/lpetre/dead-cst/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/lpetre/dead-cst/releases/tag/v0.1.0
