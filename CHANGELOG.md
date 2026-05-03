@@ -9,6 +9,8 @@ two versions.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-05-03
+
 ### Added
 - PEP 695 `type` statements are now tracked. `type Foo = list[int]`
   surfaces `mod.Foo` as a top-level declaration of kind `"type_alias"`,
@@ -384,7 +386,8 @@ versions until the first stable release.
 - `README.md`, `CONTRIBUTING.md`, `CHANGELOG.md`, and `ROADMAP.md` with a
   stack-ranked plan from alpha to 1.0.
 
-[Unreleased]: https://github.com/lpetre/dead-cst/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/lpetre/dead-cst/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/lpetre/dead-cst/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/lpetre/dead-cst/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/lpetre/dead-cst/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/lpetre/dead-cst/releases/tag/v0.1.0
