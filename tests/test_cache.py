@@ -155,11 +155,13 @@ def test_fingerprint_changes_when_unreachable_detector_version_bumped(tmp_path):
 def test_fingerprint_changes_when_visitor_version_bumped(tmp_path, monkeypatch):
     """Bumping ``SymbolVisitor.version`` invalidates the cache key.
 
-    The visitor's ``__version__`` only ticks on tagged releases, so a
-    behaviour-affecting visitor change between two installs at the
-    same dev version would otherwise be served from stale cached
-    payloads. ``SymbolVisitor`` carries its own ``Cacheable``
-    ``(name, version)`` pair to give that change a knob.
+    The package ``__version__`` is intentionally not in the
+    fingerprint: every component whose output could shift between
+    releases carries its own ``Cacheable`` knob, so the discipline is
+    to bump the relevant component rather than relying on a release
+    bump to invalidate everything at once. ``SymbolVisitor`` carries
+    a ``(name, version)`` pair so visitor-level changes get an
+    explicit knob.
     """
     from dead_cst._visitor import SymbolVisitor
 

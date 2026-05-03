@@ -12,10 +12,11 @@ Two tables make up the database:
 
 ``meta`` holds a single ``fingerprint`` row covering everything that
 could change a payload's *interpretation* without touching file
-contents -- the dead-cst version, Python version, search paths, and
-the chain of resolver names. A fingerprint mismatch on open wipes
-``file_cache`` and writes the new fingerprint, so the very next
-analysis fully rebuilds the graph.
+contents -- Python version, search paths, and the visitor / resolver
+/ plugin / detector chain (each contributing its own
+``Cacheable`` ``(name, version)`` pair). A fingerprint mismatch on
+open wipes ``file_cache`` and writes the new fingerprint, so the
+very next analysis fully rebuilds the graph.
 
 ``file_cache`` is one row per analyzed file, keyed by absolute path,
 with the file's SHA-256 content hash and the pickled payload. A hash
@@ -49,7 +50,6 @@ from ._branches import (
 from ._plugins._core import EdgePlugin
 from ._resolvers import PathMap, PathResolver
 from ._visitor import SymbolVisitor, VisitorPayload
-from ._version import __version__
 
 logger = logging.getLogger(__name__)
 
@@ -79,29 +79,29 @@ def compute_fingerprint(
 ) -> str:
     """SHA-256 of every input that affects payload semantics for one analysis run.
 
-    Includes the dead-cst version (covers tagged releases), Python
-    version (pickle protocol stability), the ``PathMap`` (the
-    search-path layout governs ``Import.path`` resolution), and the
-    visitor / resolver / plugin / detector chain. Each component
-    satisfies :class:`~dead_cst._cacheable.Cacheable` and is
-    fingerprinted by its ``(name, version)`` pair: bumping
-    ``version`` invalidates the file_cache so new output replaces
-    the old. ``version`` is a Unix epoch int by convention, so
-    concurrent bumps on different branches merge with ``max()``-wins
-    semantics rather than colliding on a re-used integer label.
+    Includes Python version (pickle protocol stability), the
+    ``PathMap`` (the search-path layout governs ``Import.path``
+    resolution), and the visitor / resolver / plugin / detector
+    chain. Each component satisfies
+    :class:`~dead_cst._cacheable.Cacheable` and is fingerprinted by
+    its ``(name, version)`` pair: bumping ``version`` invalidates
+    the file_cache so new output replaces the old. ``version`` is a
+    Unix epoch int by convention, so concurrent bumps on different
+    branches merge with ``max()``-wins semantics rather than
+    colliding on a re-used integer label.
 
-    The visitor's own ``(name, version)`` is included so a
-    behaviour-affecting change to ``SymbolVisitor`` invalidates
-    cached payloads even between releases (``__version__`` only
-    moves on tag bumps, so a dev-loop edit at the same version
-    would otherwise be served from stale blobs).
+    The dead-cst package ``__version__`` is *not* in the fingerprint:
+    every component whose output could shift between releases carries
+    its own ``Cacheable`` knob, and folding ``__version__`` in on top
+    would let lazily-unbumped components ride for free on a release
+    bump. Bumping the relevant component's ``version`` is the
+    discipline; ``__version__`` is not a substitute.
 
     Each value is normalized to a stable string before hashing so
     equivalent inputs produce equal keys.
     """
     h = hashlib.sha256()
     h.update(f"schema={SCHEMA_VERSION}\n".encode())
-    h.update(f"version={__version__}\n".encode())
     h.update(f"python={sys.version_info.major}.{sys.version_info.minor}\n".encode())
     h.update(f"visitor={SymbolVisitor.name}@{SymbolVisitor.version}\n".encode())
 

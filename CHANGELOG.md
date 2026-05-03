@@ -19,6 +19,13 @@ two versions.
   even between releases. Concurrent bumps on different branches merge
   with `max()` semantics. The walrus-support change in this release
   bumps the visitor version accordingly.
+- The package `__version__` is no longer folded into the cache
+  fingerprint. Every component whose output can shift between releases
+  (visitor, resolvers, plugins, detector) already carries its own
+  `Cacheable` `(name, version)` knob; mixing `__version__` in on top
+  let unbumped components ride for free on a release bump and masked
+  cases where the granular versions weren't being maintained. The
+  schema version and Python version still participate.
 
 ### Added
 - PEP 572 walrus (`:=`) bindings at module scope are now surfaced as
