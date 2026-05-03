@@ -197,7 +197,7 @@ class UnreachableRegionDetector(Cacheable, Protocol):
 class DefaultUnreachableRegionDetector:
     """Built-in :class:`UnreachableRegionDetector`.
 
-    Runs two passes per file:
+    Runs three passes per file:
 
     1. :func:`~dead_cst._const_fold.fold_constants` -- a fixpoint
        constant-folding pass that propagates simple
@@ -207,6 +207,14 @@ class DefaultUnreachableRegionDetector:
     2. A walk over every ``cst.If`` / ``cst.While``, calling
        :func:`unreachable_suites` with a ``resolve_name`` closure
        that consults the folded table.
+    3. A walk over every statement-bearing suite (module body and
+       every ``IndentedBlock``) marking the trailing region after an
+       unconditional terminator as unreachable. Terminators are
+       ``return`` / ``raise`` / ``break`` / ``continue`` and
+       ``assert <statically-falsy>``. The check is purely
+       suite-relative, so a ``raise`` inside a ``try`` body still
+       kills the rest of the try body even though the surrounding
+       ``except`` runs on its own path.
 
     The folding pass is keyed by ``id`` of the access node, so it
     stays flow-sensitive: a later rebinding shadows an earlier one,
@@ -215,7 +223,7 @@ class DefaultUnreachableRegionDetector:
     """
 
     name: str = "default"
-    version: int = 2
+    version: int = 3
 
     def find_regions(self, wrapper: MetadataWrapper) -> list[CodeRange]:
         # Local import to avoid a top-level cycle: ``_const_fold``
@@ -230,7 +238,50 @@ class DefaultUnreachableRegionDetector:
 
         found: list[CodeRange] = []
 
+        def is_terminator(stmt: cst.CSTNode) -> bool:
+            """``True`` iff ``stmt`` unconditionally exits its enclosing suite.
+
+            Recognized: ``return`` / ``raise`` / ``break`` / ``continue``
+            and ``assert <statically-falsy>``. A ``SimpleStatementLine``
+            is treated as a terminator if any of its small statements is
+            one -- ``x = 1; raise; y = 2`` ends control at ``raise``,
+            and anything after it on a later line is dead too.
+            """
+            if isinstance(stmt, cst.SimpleStatementLine):
+                for sm in stmt.body:
+                    if isinstance(sm, (cst.Return, cst.Raise, cst.Break, cst.Continue)):
+                        return True
+                    if isinstance(sm, cst.Assert):
+                        if evaluate_truthiness(sm.test, resolve) is False:
+                            return True
+            return False
+
+        def scan_suite(stmts) -> None:
+            """Emit one dead region for the tail after the first terminator."""
+            for i, stmt in enumerate(stmts):
+                if not is_terminator(stmt):
+                    continue
+                tail = stmts[i + 1 :]
+                if not tail:
+                    return
+                first_pos = positions.get(tail[0])
+                last_pos = positions.get(tail[-1])
+                if first_pos is None or last_pos is None:
+                    return
+                found.append(CodeRange(start=first_pos.start, end=last_pos.end))
+                return
+
         class _Collector(cst.CSTVisitor):
+            def visit_Module(self, node: cst.Module) -> None:
+                # Module body isn't an IndentedBlock; scan it directly.
+                scan_suite(list(node.body))
+
+            def visit_IndentedBlock(self, node: cst.IndentedBlock) -> None:
+                # Every nested suite (function body, class body,
+                # if/while/for/try/with bodies, ``else`` / ``finally``
+                # clauses, ``except`` handlers) lands here.
+                scan_suite(list(node.body))
+
             def visit_If(self, node: cst.If) -> None:
                 self._collect(node)
 

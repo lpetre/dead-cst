@@ -35,9 +35,20 @@ two versions.
   pre-pass and threads the resulting truthiness map into
   `unreachable_suites` via the new `resolve_name` callback on
   `evaluate_truthiness`. Patterns like `DEBUG = False; if DEBUG: ...`
-  are flagged out of the box. Version bumped to `2`, so any cached
-  `VisitorPayload` from the prior literal-only detector is
-  automatically invalidated.
+  are flagged out of the box.
+- Post-terminator unreachable detection inside
+  `DefaultUnreachableRegionDetector`. Every statement-bearing suite
+  (module body and every `IndentedBlock`) is scanned for an
+  unconditional terminator -- `return` / `raise` / `break` /
+  `continue` / `assert <statically-falsy>` -- and the trailing
+  region is emitted as a dead `CodeRange`. The check is purely
+  suite-relative, so a `raise` inside a `try` body kills the rest
+  of the try body without touching the `except` handler, which runs
+  on its own path. `assert NEVER` composes with the constant-folding
+  pass: when `NEVER` resolves to a falsy literal the assert still
+  counts as a terminator. Detector `version` bumped to `3`, so any
+  cached `VisitorPayload` from the prior detector is automatically
+  invalidated.
 - `Cacheable` Protocol (`name: str`, `version: int`): the shared
   cache-fingerprint contract that `EdgePlugin`, `PathResolver`, and
   `UnreachableRegionDetector` now all inherit from. Bumping a

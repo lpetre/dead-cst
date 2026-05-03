@@ -56,11 +56,11 @@ def fold_constants(wrapper: MetadataWrapper) -> dict[int, bool]:
     parent_map = wrapper.resolve(ParentNodeProvider)
     module = wrapper.module
 
-    accesses_with_scope: list = []
+    accesses: list = []
     for scope in set(scopes.values()):
         for access in scope.accesses:
             if isinstance(access.node, cst.Name):
-                accesses_with_scope.append((access, scope))
+                accesses.append(access)
 
     rhs_cache: dict[int, cst.BaseExpression | None] = {}
 
@@ -77,7 +77,7 @@ def fold_constants(wrapper: MetadataWrapper) -> dict[int, bool]:
 
     while True:
         progressed = False
-        for access, scope in accesses_with_scope:
+        for access in accesses:
             if id(access.node) in truthy:
                 continue
             referents = [
@@ -87,7 +87,15 @@ def fold_constants(wrapper: MetadataWrapper) -> dict[int, bool]:
             ]
             if not referents:
                 continue
-            body = _scope_body(scope, module)
+            # Use the *binding* scope's body, not the access's. A
+            # function-scope access reading a module-level constant
+            # has a referent whose scope is the module; ``live_referents``
+            # needs to walk the body that contains the binding(s), not
+            # the body that contains the access. ScopeProvider's
+            # contract is that all referents of one access share one
+            # scope, so any referent's scope is fine -- match the
+            # existing visitor pattern of taking ``referents[0].scope``.
+            body = _scope_body(referents[0].scope, module)
             if body is None:
                 continue
             # Filter to bindings live on at least one path to the
