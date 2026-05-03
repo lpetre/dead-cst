@@ -429,7 +429,7 @@ class SymbolVisitor(cst.CSTVisitor):
         """
         if len(self.decl_stack) > 1:
             return
-        fqname = f"{self._module_fqname}.{node.name.value}"
+        fqname = f"{self.module_node.fqname}.{node.name.value}"
         sym = SymbolNode(fqname, "type_alias", self.path, self._pos(node.name))
         self.symbol_referent_nodes[sym] = node
         self._push_decl(node, sym)
