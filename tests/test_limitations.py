@@ -7,6 +7,7 @@ is the signal to promote them into ``test_declarations`` or
 ``test_imports``.
 """
 
+import libcst
 import pytest
 
 
@@ -127,3 +128,25 @@ import pytest
 def test_limitation(build_decl_graph, assert_edges, files, expected_edges):
     graph = build_decl_graph(files)
     assert_edges(graph, expected_edges)
+
+
+def test_pep750_tstring_unparseable(build_decl_graph):
+    """PEP 750 template strings (3.14) crash the analyser.
+
+    The pinned ``libcst`` cannot parse ``t"..."`` literals, so any file
+    containing one aborts ``build_symbol_graph`` with a
+    ``ParserSyntaxError`` before the symbol graph is built. Ideally the
+    visitor would either resolve interpolated names (yielding
+    ``mod.greet -> mod.NAME`` here) or at minimum skip the file. When
+    libcst gains t-string support this test will start to fail -- that
+    is the signal to add positive coverage in ``test_declarations``.
+    """
+    with pytest.raises(libcst.ParserSyntaxError):
+        build_decl_graph(
+            {
+                "mod.py": """
+                NAME = "world"
+                def greet(): return t"hello {NAME}"
+                """,
+            }
+        )
