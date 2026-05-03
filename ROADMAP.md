@@ -39,7 +39,7 @@ trivial single-return shapes and lets the resolver recurse through them. Both
 sync `def` (folded via bare `Call`) and async `def` (folded via `Await(Call)`
 only — a bare async call returns a coroutine, always truthy). Cap by caller
 count (default 3) so that configuration helpers used in 50 places don't get
-folded into noise. Same-file only; cross-file is item 7.
+folded into noise. Same-file only; cross-file is item 8.
 
 ### 3. Suite-removal codemod and expanded dead-set helper
 
@@ -49,7 +49,7 @@ terminator suites that `analyze` flags can't be removed automatically. Add a
 `While` / `elif` chains / post-terminator) with empty-suite guards inserting
 `pass` where needed, and a helper that returns the union of dead decls + dead
 suite ranges + `find_kept_alive_by_dead_branches(graph)` so removal expands
-to the blast radius. Foundational for items 5 and 6 — invisible by itself,
+to the blast radius. Foundational for items 5 and 7 — invisible by itself,
 shipped together with whichever consumer lands first.
 
 ---
@@ -70,7 +70,18 @@ flag. Default off — existing decl-only behavior keeps backward-compatibility
 while the new transformer bakes. Once warm in real-world use, flip the
 default to on and rename the opt-out to `--no-dead-branches`.
 
-### 6. `dead-cst preview` (graph-clustered patches)
+### 6. `remove --inline-folds`
+
+Wire item 2's function-call folding into `dead-cst remove` behind an opt-in
+flag, mirroring item 5's shape for suites. For every trivial-return function
+the fold pass classifies as a constant, rewrite each call site with that
+constant and (when the function has no surviving consumers) delete the
+function itself. Default off; flip to default-on once warm in real-world
+use. Composes with item 5: once a fold is inlined, `if is_new_auth():`
+becomes `if False:`, which the suite-removal pass then collapses in the
+same run.
+
+### 7. `dead-cst preview` (graph-clustered patches)
 
 Peer subcommand to `analyze` / `remove` that renders item 3's codemod as
 per-cluster unified diffs instead of editing files. Clusters are weakly-
@@ -78,9 +89,9 @@ connected components of the unreachable subgraph: each WCC is the maximal
 unit that can be applied atomically without leaving dangling references.
 Cluster headers carry blast-radius metadata (symbols, LOC, files affected).
 Composes with `git apply` (whole cluster) and `git add -p` (per-line review)
-without needing a custom TUI; see item 10 for the deferred TUI shape.
+without needing a custom TUI; see item 11 for the deferred TUI shape.
 
-### 7. Cross-file trivial-return folding
+### 8. Cross-file trivial-return folding
 
 Item 2 only folds within a single file. Cross-module folding
 (`from flags import is_new_auth; if is_new_auth():` resolving via the import)
@@ -91,7 +102,7 @@ contract. Defer until item 2 ships and demand is real.
 
 ## Tier 3 — Polish and ecosystem
 
-### 8. Read the Docs site with plugin/resolver tutorials
+### 9. Read the Docs site with plugin/resolver tutorials
 
 The `EdgePlugin` and `PathResolver` protocols are well-designed but
 undiscovered. A short Sphinx site with one tutorial each ("write a custom
@@ -99,7 +110,7 @@ undiscovered. A short Sphinx site with one tutorial each ("write a custom
 that's already built. The docstring pass already in place gives the API
 reference for free.
 
-### 9. `examples/flag_audit/` recipe
+### 10. `examples/flag_audit/` recipe
 
 A working example, not a CLI command. Ships a `flags.toml` mapping flag-name
 → fixed truthiness, a `FlagAuditDetector(DefaultUnreachableRegionDetector)`
@@ -110,21 +121,21 @@ this much cleaner: a one-line wrapper `def is_new_auth(): return
 check_flag("new-auth")` folds without the detector having to recognize the
 wrapper directly.
 
-### 10. Interactive TUI (`dead-cst review`)
+### 11. Interactive TUI (`dead-cst review`)
 
-Speculative; only promote if `git add -p` over item 6's output proves
+Speculative; only promote if `git add -p` over item 7's output proves
 insufficient. Design direction when promoted: walk the cluster condensation
 in topological order, asking accept/reject for each cluster, stopping on the
 first rejection (or letting the user mark "skip" to keep going). Equivalent
 to a DAG-walk where rejecting a parent means we don't bother asking about
-its successors. Pairs directly with item 6's WCC clustering — the data
+its successors. Pairs directly with item 7's WCC clustering — the data
 shape carries over.
 
 ---
 
 ## Tier 4 — Speculative, wait for signal
 
-### 11. Multiple reachability frontiers
+### 12. Multiple reachability frontiers
 
 Splitting "reachable from tests" vs. "reachable from production entrypoints"
 is interesting and would enable rules like "no production code reachable only
@@ -194,22 +205,3 @@ Folded down from earlier tiers as they landed:
 - Position-aware shadowing in the codemod.
 - `ModuleDundersPlugin` replacing `--preserve-dunder-all`.
 - Public-API docstring pass across the package.
-
----
-
-## Out of scope (for now)
-
-- Per-symbol weighting / decay heuristics
-- Stub file (`.pyi`) ingestion
-- Cross-language analysis
-- Language Server Protocol implementation
-- `if TYPE_CHECKING:` rewriting (treating type-only imports as removable)
-- Continuing analysis past parse errors (would silently miss usages from
-  the unparseable file, leading to false-positive dead reports)
-- `del` statement modeling (no real-world bug filed; revisit if a limitation
-  test is added that demonstrates a problem)
-- `explain_reachability` public API (the `why-alive` CLI is sufficient until
-  external tooling actually asks for it)
-
-These may be worth revisiting after a stable 1.0, but each adds significant
-surface area without addressing current adoption blockers.
