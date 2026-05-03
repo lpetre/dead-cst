@@ -276,6 +276,8 @@ A module-level `import` / `from ... import ...` is itself a declaration of type 
 - Only first-party code is analysed; third-party dependencies are treated as opaque (they appear as synthetic nodes — see `dead-cst dependencies`).
 - PEP 695 `type` statements are not tracked.
 - `__all__` is followed only when assigned a list/tuple of string literals; dynamic mutation (`__all__.append`, comprehensions, etc.) is not tracked.
+- Walrus expressions (PEP 572) at module scope — including walruses leaked from a module-level comprehension — bind a name in the module namespace at runtime but are not surfaced as top-level declarations, so cross-decl references to those names are missed. The default unreachable-region detector likewise ignores walrus: `(FLAG := False)` and `if (FLAG := False):` don't enter the constant-folding table even when the RHS is a literal.
+- PEP 750 template strings (`t"..."`, 3.14+) cannot be parsed by the pinned `libcst`, so any file containing one aborts the analysis with a `ParserSyntaxError`.
 
 ## Development
 

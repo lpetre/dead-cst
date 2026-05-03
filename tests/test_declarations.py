@@ -714,6 +714,421 @@ import pytest
             },
             id="comprehension-iterable-uses-enclosing-scope",
         ),
+        # ------------------------------------------------------------------
+        # PEP 572 walrus -- references inside walrus RHS are still attributed
+        # to the enclosing top-level decl. (Top-level walrus binding capture
+        # itself is documented in ``test_limitations``.)
+        # ------------------------------------------------------------------
+        pytest.param(
+            """
+            def src(): return 1
+            def f():
+                if (x := src()): return x
+                return 0
+            """,
+            {
+                "mod.f -> mod",
+                "mod.f -> mod.src",
+                "mod.src -> mod",
+            },
+            id="walrus-in-if-condition",
+        ),
+        pytest.param(
+            """
+            def src(): return None
+            def f():
+                while (x := src()) is not None:
+                    pass
+            """,
+            {
+                "mod.f -> mod",
+                "mod.f -> mod.src",
+                "mod.src -> mod",
+            },
+            id="walrus-in-while-condition",
+        ),
+        pytest.param(
+            """
+            def src(): return 1
+            def f():
+                return [n for v in [1] if (n := src())]
+            """,
+            {
+                "mod.f -> mod",
+                "mod.f -> mod.src",
+                "mod.src -> mod",
+            },
+            id="walrus-in-comprehension",
+        ),
+        pytest.param(
+            """
+            def src(): return 1
+            def f(): return f'{(x := src())}'
+            """,
+            {
+                "mod.f -> mod",
+                "mod.f -> mod.src",
+                "mod.src -> mod",
+            },
+            id="walrus-in-fstring-interpolation",
+        ),
+        # ------------------------------------------------------------------
+        # PEP 695 type-parameter syntax (3.12+) and ``type`` statements.
+        # Generic ``[T]`` clauses introduce a synthetic enclosing scope, but
+        # references in the function/class body still resolve outward to the
+        # module. ``type`` statements themselves don't surface as decls (see
+        # ``test_limitations``), but their RHS is still walked.
+        # ------------------------------------------------------------------
+        pytest.param(
+            """
+            Base = int
+            type Alias = Base
+            """,
+            # The ``type`` alias is not a top-level decl, but the RHS
+            # ``Base`` reference is attributed to the synthetic module
+            # node. ``mod -> mod.Base`` keeps ``Base`` alive whenever
+            # the module is.
+            {
+                "mod -> mod.Base",
+                "mod.Base -> mod",
+            },
+            id="pep695-type-statement-rhs-reference",
+        ),
+        pytest.param(
+            """
+            def helper(): return 1
+            def f[T](x: T) -> T:
+                return helper()
+            """,
+            {
+                "mod.f -> mod",
+                "mod.f -> mod.helper",
+                "mod.helper -> mod",
+            },
+            id="pep695-generic-function-body-reference",
+        ),
+        pytest.param(
+            """
+            def helper(): return 1
+            class C[T]:
+                def m(self): return helper()
+            """,
+            {
+                "mod.C -> mod",
+                "mod.C -> mod.helper",
+                "mod.helper -> mod",
+            },
+            id="pep695-generic-class-body-reference",
+        ),
+        pytest.param(
+            """
+            class B: pass
+            def f[T: B](x: T) -> T: return x
+            """,
+            {
+                "mod.B -> mod",
+                "mod.f -> mod",
+                "mod.f -> mod.B",
+            },
+            id="pep695-generic-typeparam-bound",
+        ),
+        pytest.param(
+            """
+            class A: pass
+            class B: pass
+            def f[T: (A, B)](x: T) -> T: return x
+            """,
+            {
+                "mod.A -> mod",
+                "mod.B -> mod",
+                "mod.f -> mod",
+                "mod.f -> mod.A",
+                "mod.f -> mod.B",
+            },
+            id="pep695-generic-typeparam-constraints",
+        ),
+        pytest.param(
+            """
+            class Default: pass
+            def f[T = Default](x): return x
+            """,
+            # PEP 696 (3.13+) typeparam default. The default expression
+            # is evaluated in the enclosing scope, so ``Default`` is
+            # referenced from ``mod.f``.
+            {
+                "mod.Default -> mod",
+                "mod.f -> mod",
+                "mod.f -> mod.Default",
+            },
+            id="pep695-generic-typeparam-default",
+        ),
+        pytest.param(
+            """
+            class Helper: pass
+            def f[*Ts](x: tuple[Helper]): return x
+            """,
+            {
+                "mod.Helper -> mod",
+                "mod.f -> mod",
+                "mod.f -> mod.Helper",
+            },
+            id="pep695-typevartuple-body-reference",
+        ),
+        pytest.param(
+            """
+            class Helper: pass
+            def f[**P](x: Helper): return x
+            """,
+            {
+                "mod.Helper -> mod",
+                "mod.f -> mod",
+                "mod.f -> mod.Helper",
+            },
+            id="pep695-paramspec-body-reference",
+        ),
+        # ------------------------------------------------------------------
+        # PEP 701 f-string syntax (3.12+) -- nested f-strings, multiline,
+        # format-spec interpolations, conversion modifiers.
+        # ------------------------------------------------------------------
+        pytest.param(
+            """
+            N = 'x'
+            def f(): return f"a {f'b {N}'} c"
+            """,
+            {
+                "mod.N -> mod",
+                "mod.f -> mod",
+                "mod.f -> mod.N",
+            },
+            id="pep701-nested-fstring-reference",
+        ),
+        pytest.param(
+            '''
+            N = "x"
+            def f(): return f"""hi
+            {N}
+            bye"""
+            ''',
+            {
+                "mod.N -> mod",
+                "mod.f -> mod",
+                "mod.f -> mod.N",
+            },
+            id="pep701-multiline-fstring-reference",
+        ),
+        pytest.param(
+            """
+            W = 5
+            N = 1
+            def f(): return f'{N:{W}d}'
+            """,
+            {
+                "mod.N -> mod",
+                "mod.W -> mod",
+                "mod.f -> mod",
+                "mod.f -> mod.N",
+                "mod.f -> mod.W",
+            },
+            id="pep701-fstring-format-spec-reference",
+        ),
+        pytest.param(
+            """
+            N = 1
+            def f(): return f'{N!r}'
+            """,
+            {
+                "mod.N -> mod",
+                "mod.f -> mod",
+                "mod.f -> mod.N",
+            },
+            id="pep701-fstring-conversion-reference",
+        ),
+        # ------------------------------------------------------------------
+        # PEP 634-636 structural pattern matching (3.10+). Names referenced
+        # from value patterns, class patterns, mapping keys, guards, and
+        # ``as`` / ``or`` pattern bodies must all attribute correctly to
+        # the enclosing top-level decl.
+        # ------------------------------------------------------------------
+        pytest.param(
+            """
+            SENT = 1
+            def f(v):
+                match v:
+                    case 1: return SENT
+                    case _: return 0
+            """,
+            {
+                "mod.SENT -> mod",
+                "mod.f -> mod",
+                "mod.f -> mod.SENT",
+            },
+            id="match-case-value-pattern-body-reference",
+        ),
+        pytest.param(
+            """
+            class Dot: pass
+            def f(v):
+                match v:
+                    case Dot(): return 1
+                    case _: return 0
+            """,
+            {
+                "mod.Dot -> mod",
+                "mod.f -> mod",
+                "mod.f -> mod.Dot",
+            },
+            id="match-case-class-pattern-reference",
+        ),
+        pytest.param(
+            """
+            class Pt:
+                __match_args__ = ('x', 'y')
+            def f(v):
+                match v:
+                    case Pt(x_val, y_val): return x_val
+                    case _: return 0
+            """,
+            {
+                "mod.Pt -> mod",
+                "mod.f -> mod",
+                "mod.f -> mod.Pt",
+            },
+            id="match-case-class-positional-pattern-reference",
+        ),
+        pytest.param(
+            """
+            class Pt:
+                x: int
+            def f(v):
+                match v:
+                    case Pt(x=val): return val
+                    case _: return 0
+            """,
+            {
+                "mod.Pt -> mod",
+                "mod.f -> mod",
+                "mod.f -> mod.Pt",
+            },
+            id="match-case-class-keyword-pattern-reference",
+        ),
+        pytest.param(
+            """
+            class K:
+                NAME = 'k'
+            def f(v):
+                match v:
+                    case {K.NAME: val}: return val
+                    case _: return 0
+            """,
+            # Mapping-pattern keys must be literal or dotted-name value
+            # patterns; ``K.NAME`` references the module-level ``K``.
+            {
+                "mod.K -> mod",
+                "mod.f -> mod",
+                "mod.f -> mod.K",
+            },
+            id="match-case-mapping-dotted-key-reference",
+        ),
+        pytest.param(
+            """
+            A = 1
+            B = 2
+            def f(v):
+                match v:
+                    case 1 | 2: return A
+                    case _: return B
+            """,
+            {
+                "mod.A -> mod",
+                "mod.B -> mod",
+                "mod.f -> mod",
+                "mod.f -> mod.A",
+                "mod.f -> mod.B",
+            },
+            id="match-case-or-pattern-body-references",
+        ),
+        pytest.param(
+            """
+            def helper(v): return v
+            def f(v):
+                match v:
+                    case [1, *rest] as found: return helper(found)
+                    case _: return 0
+            """,
+            {
+                "mod.f -> mod",
+                "mod.f -> mod.helper",
+                "mod.helper -> mod",
+            },
+            id="match-case-as-pattern-body-reference",
+        ),
+        pytest.param(
+            """
+            def pred(v): return True
+            def f(v):
+                match v:
+                    case x if pred(x): return x
+                    case _: return 0
+            """,
+            {
+                "mod.f -> mod",
+                "mod.f -> mod.pred",
+                "mod.pred -> mod",
+            },
+            id="match-case-guard-name-reference",
+        ),
+        pytest.param(
+            """
+            def helper(v): return v
+            def f(seq):
+                match seq:
+                    case [first, *rest]: return helper(first)
+                    case _: return None
+            """,
+            {
+                "mod.f -> mod",
+                "mod.f -> mod.helper",
+                "mod.helper -> mod",
+            },
+            id="match-case-sequence-pattern-body-reference",
+        ),
+        # ------------------------------------------------------------------
+        # PEP 654 ``except*`` (3.11+) exception groups. The handler body
+        # is a regular suite, so references inside it should resolve
+        # exactly like a plain ``except``.
+        # ------------------------------------------------------------------
+        pytest.param(
+            """
+            def handle(e): return e
+            def f():
+                try: pass
+                except* ValueError as eg: return handle(eg)
+            """,
+            {
+                "mod.f -> mod",
+                "mod.f -> mod.handle",
+                "mod.handle -> mod",
+            },
+            id="except-star-handler-reference",
+        ),
+        pytest.param(
+            """
+            def h1(e): return e
+            def h2(e): return e
+            def f():
+                try: pass
+                except* ValueError as eg: return h1(eg)
+                except* TypeError as eg: return h2(eg)
+            """,
+            {
+                "mod.f -> mod",
+                "mod.f -> mod.h1",
+                "mod.f -> mod.h2",
+                "mod.h1 -> mod",
+                "mod.h2 -> mod",
+            },
+            id="except-star-multiple-handler-references",
+        ),
     ],
 )
 def test_declarations(build_decl_graph, assert_edges, src, expected_edges):

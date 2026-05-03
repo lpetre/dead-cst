@@ -419,6 +419,51 @@ def test_default_detector_folds_annotated_constant(build_decl_graph, assert_dead
     assert_dead_branch_edges(graph, {"mod -> mod.helper"})
 
 
+def test_default_detector_does_not_fold_walrus_binding(build_decl_graph, assert_dead_branch_edges):
+    """Limitation: walrus bindings are invisible to the fold table.
+
+    The const-folder's ``_constant_assignment_rhs`` only recognises
+    ``Assign`` and ``AnnAssign`` shapes, so a walrus binding -- even
+    one whose RHS is a plain literal -- never enters the table. The
+    if-test therefore stays unknown and the body isn't flagged dead.
+    Ideally ``mod -> mod.helper`` would be flagged here, matching the
+    behaviour of an equivalent ``DEBUG = False`` binding.
+    """
+    graph = build_decl_graph(
+        {
+            "mod.py": """
+            (DEBUG := False)
+            def helper(): pass
+            if DEBUG:
+                helper()
+            """
+        }
+    )
+    assert_dead_branch_edges(graph, set())
+
+
+def test_default_detector_does_not_fold_walrus_in_if_test(
+    build_decl_graph, assert_dead_branch_edges
+):
+    """Limitation: walrus *expression* truthiness isn't recognised either.
+
+    ``evaluate_truthiness`` doesn't unwrap ``NamedExpr``, so even when
+    the walrus's RHS is a literal -- meaning the whole expression's
+    runtime value is statically known -- the if-body isn't flagged.
+    Ideally ``mod -> mod.helper`` would be flagged.
+    """
+    graph = build_decl_graph(
+        {
+            "mod.py": """
+            def helper(): pass
+            if (DEBUG := False):
+                helper()
+            """
+        }
+    )
+    assert_dead_branch_edges(graph, set())
+
+
 def test_default_detector_folds_constant_in_function(build_decl_graph, assert_dead_branch_edges):
     graph = build_decl_graph(
         {

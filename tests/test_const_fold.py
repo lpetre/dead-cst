@@ -180,6 +180,22 @@ def test_tuple_unpacking_does_not_fold() -> None:
     assert out["a"] == [None]
 
 
+def test_walrus_binding_does_not_fold() -> None:
+    # ``_constant_assignment_rhs`` returns ``None`` for walrus
+    # (``NamedExpr``) bindings -- they aren't ``Assign`` / ``AnnAssign``
+    # statements -- so the value never enters the fold table even when
+    # the RHS is a literal. Ideally ``x`` would resolve to ``[False]``
+    # here, matching the behaviour of a plain ``x = False`` binding.
+    out = _resolve_lookup(
+        """
+        (x := False)
+        if x:
+            pass
+        """
+    )
+    assert out["x"] == [None]
+
+
 def test_attribute_target_does_not_fold() -> None:
     out = _resolve_lookup(
         """

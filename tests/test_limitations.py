@@ -7,6 +7,7 @@ is the signal to promote them into ``test_declarations`` or
 ``test_imports``.
 """
 
+import libcst
 import pytest
 
 
@@ -22,6 +23,48 @@ import pytest
             # never appears in the graph.
             set(),
             id="pep-695-type-statement-not-captured",
+        ),
+        pytest.param(
+            {
+                "mod.py": """
+                def src(): return 1
+                if (Y := src()): pass
+                def use(): return Y
+                """,
+            },
+            # PEP 572 walrus expressions at module scope bind a name
+            # in the enclosing (module) scope, but the visitor does not
+            # record that name as a top-level declaration. ``use``
+            # therefore gets no ``use -> mod.Y`` edge -- ideally the
+            # graph would contain ``mod.Y -> mod`` and
+            # ``mod.use -> mod.Y``.
+            {
+                "mod -> mod.src",
+                "mod.src -> mod",
+                "mod.use -> mod",
+            },
+            id="walrus-toplevel-binding-not-captured",
+        ),
+        pytest.param(
+            {
+                "mod.py": """
+                nums = [1, 2, 3]
+                result = [last := n for n in nums]
+                def use(): return last
+                """,
+            },
+            # A walrus inside a comprehension leaks its binding to the
+            # enclosing scope (here, the module). The visitor doesn't
+            # capture that leak either, so ``use`` references a name
+            # the graph never models. Ideally ``mod.last`` would exist
+            # with ``mod.use -> mod.last``.
+            {
+                "mod.nums -> mod",
+                "mod.result -> mod",
+                "mod.result -> mod.nums",
+                "mod.use -> mod",
+            },
+            id="walrus-comprehension-toplevel-leak-not-captured",
         ),
         # ------------------------------------------------------------------
         # Dynamic / runtime features
@@ -85,3 +128,25 @@ import pytest
 def test_limitation(build_decl_graph, assert_edges, files, expected_edges):
     graph = build_decl_graph(files)
     assert_edges(graph, expected_edges)
+
+
+def test_pep750_tstring_unparseable(build_decl_graph):
+    """PEP 750 template strings (3.14) crash the analyser.
+
+    The pinned ``libcst`` cannot parse ``t"..."`` literals, so any file
+    containing one aborts ``build_symbol_graph`` with a
+    ``ParserSyntaxError`` before the symbol graph is built. Ideally the
+    visitor would either resolve interpolated names (yielding
+    ``mod.greet -> mod.NAME`` here) or at minimum skip the file. When
+    libcst gains t-string support this test will start to fail -- that
+    is the signal to add positive coverage in ``test_declarations``.
+    """
+    with pytest.raises(libcst.ParserSyntaxError):
+        build_decl_graph(
+            {
+                "mod.py": """
+                NAME = "world"
+                def greet(): return t"hello {NAME}"
+                """,
+            }
+        )
