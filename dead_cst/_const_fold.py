@@ -33,6 +33,8 @@ escape the unknown bucket because neither ever resolves.
 
 from __future__ import annotations
 
+from typing import Mapping
+
 import libcst as cst
 from libcst.metadata import MetadataWrapper, ScopeProvider, ParentNodeProvider
 from libcst.metadata.scope_provider import (
@@ -176,7 +178,7 @@ def _scope_body(scope, module: cst.Module) -> list | None:
 
 def _constant_assignment_rhs(
     binding_node: cst.CSTNode,
-    parent_map: dict[cst.CSTNode, cst.CSTNode],
+    parent_map: Mapping[cst.CSTNode, cst.CSTNode],
 ) -> cst.BaseExpression | None:
     """RHS of a simple ``name = expr`` (or ``name: T = expr``) binding.
 
