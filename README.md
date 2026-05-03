@@ -173,7 +173,9 @@ unreachable = graph.subgraph([n for n in graph.nodes if n not in reachable])
 remove_code(unreachable, root)
 ```
 
-Entrypoint detection is now fully plugin-driven. Builtins:
+All three extension points — edge plugins, path resolvers, and the unreachable-region detector — share a single `Cacheable` protocol (`name: str`, `version: int`) that feeds the per-file cache fingerprint. Bumping a component's epoch `version` invalidates stale payloads automatically, so swapping or upgrading any of them is safe by default.
+
+Entrypoint detection is fully plugin-driven. Builtins:
 
 | Plugin | Purpose |
 |---|---|
@@ -249,8 +251,6 @@ class IsProdDetector:
 
 graph = build_symbol_graph({root: []}, unreachable_detector=IsProdDetector())
 ```
-
-Plugins, resolvers, and detectors all share a single `Cacheable` protocol — `name: str` plus an epoch-int `version: int` — that feeds the per-file cache fingerprint, so any swap or version bump invalidates stale payloads automatically.
 
 ## Graph model
 

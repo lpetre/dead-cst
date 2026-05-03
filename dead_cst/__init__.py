@@ -4,7 +4,10 @@
 reports (or removes) anything not reachable from a configurable set of
 entrypoints.
 
-The public API has three layers:
+The public API has three extension points, all of which inherit from a
+single :class:`Cacheable` protocol (``name: str``, ``version: int``) so
+the per-file cache invalidates cleanly when any of them is swapped or
+bumped:
 
 * :func:`build_symbol_graph` parses every ``.py`` file under each base in a
   ``{base: [dep_paths]}`` map and returns a :class:`networkx.MultiDiGraph` of
@@ -21,6 +24,12 @@ The public API has three layers:
 * Path resolvers (:class:`VenvResolver`, :class:`PyprojectResolver`,
   :class:`UvWorkspaceResolver`) discover the ``{base: [dep_paths]}`` map
   itself from a project root, so callers don't have to hand-build it.
+* The unreachable-region detector (:class:`UnreachableRegionDetector`)
+  decides which source ranges count as statically dead. The built-in
+  :class:`DefaultUnreachableRegionDetector` runs literal-only truthiness
+  on ``if`` / ``while`` tests; supply a custom one via
+  ``build_symbol_graph(unreachable_detector=...)`` to fold in domain
+  knowledge (e.g. config flags whose values are fixed in production).
 
 After plugins run, :func:`find_reachable` walks successors from every node
 tagged with ``entrypoint=True`` and returns the live set;

@@ -126,6 +126,10 @@ flask_routes = "myproj.plugins:FlaskRoutesPlugin"
 
 A resolver implements `PathResolver`: a `name: str` attribute and a `resolve(project_root)` method returning a `{base: [dep_paths]}` dict. Built-in resolvers live in `_resolvers.py`; third-party resolvers register under `dead_cst.resolvers`.
 
+## Adding an unreachable-region detector
+
+A detector implements `UnreachableRegionDetector`: `find_regions(wrapper) -> list[CodeRange]` plus the standard `Cacheable` `(name, version)` pair. The built-in `DefaultUnreachableRegionDetector` runs literal-only truthiness on `if` / `while` tests; subclass it (or write a fresh one) to fold in domain knowledge — e.g. "`settings.IS_PROD` is always `True` in production." Pass an instance via `build_symbol_graph(unreachable_detector=...)`. The detector's `(name, version)` participates in the per-file cache fingerprint, so bumping `version` after a logic change invalidates stale `VisitorPayload` blobs automatically.
+
 ## Adding a test
 
 Tests use the `build_decl_graph` fixture (in `tests/conftest.py`), which writes a dict of `{filename: source}` to a tmpdir, runs `build_symbol_graph` on it, and returns the resulting graph. The `assert_edges` fixture compares edges as `"src.fqname -> dst.fqname"` strings.
