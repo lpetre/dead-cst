@@ -223,7 +223,7 @@ class DefaultUnreachableRegionDetector:
     """
 
     name: str = "default"
-    version: int = 3
+    version: int = 1777794328
 
     def find_regions(self, wrapper: MetadataWrapper) -> list[CodeRange]:
         # Local import to avoid a top-level cycle: ``_const_fold``

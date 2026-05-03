@@ -46,9 +46,11 @@ two versions.
   of the try body without touching the `except` handler, which runs
   on its own path. `assert NEVER` composes with the constant-folding
   pass: when `NEVER` resolves to a falsy literal the assert still
-  counts as a terminator. Detector `version` bumped to `3`, so any
-  cached `VisitorPayload` from the prior detector is automatically
-  invalidated.
+  counts as a terminator. Detector `version` set to the current Unix
+  epoch (`1777794328`), matching the convention used by every other
+  shipped `Cacheable`, so any cached `VisitorPayload` from the prior
+  detector is automatically invalidated and concurrent bumps merge
+  with `max()` semantics.
 - `Cacheable` Protocol (`name: str`, `version: int`): the shared
   cache-fingerprint contract that `EdgePlugin`, `PathResolver`, and
   `UnreachableRegionDetector` now all inherit from. Bumping a
