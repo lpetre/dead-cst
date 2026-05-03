@@ -136,7 +136,7 @@ dead-cst remove ROOT -e ENTRYPOINT [OPTIONS]
 
 ### `dead-cst cache clear`
 
-Delete the on-disk `VisitorPayload` cache (`<root>/.dead-cst-cache/`) for a project. The cache is keyed by a fingerprint over the `PathMap`, resolver chain, and plugin set, so most layout changes invalidate it automatically; this command is for force-clearing when needed.
+Delete the on-disk `VisitorPayload` cache (`<root>/.dead-cst-cache/`) for a project. The cache is keyed by a fingerprint over the `PathMap` and every `Cacheable` component (visitor, resolvers, plugins, unreachable-region detector), so most layout or analyzer-version changes invalidate it automatically; this command is for force-clearing when needed.
 
 ```
 dead-cst cache clear [ROOT]
@@ -173,7 +173,7 @@ unreachable = graph.subgraph([n for n in graph.nodes if n not in reachable])
 remove_code(unreachable, root)
 ```
 
-All three extension points — edge plugins, path resolvers, and the unreachable-region detector — share a single `Cacheable` protocol (`name: str`, `version: int`) that feeds the per-file cache fingerprint. Bumping a component's epoch `version` invalidates stale payloads automatically, so swapping or upgrading any of them is safe by default.
+All three extension points — edge plugins, path resolvers, and the unreachable-region detector — share a single `Cacheable` protocol (`name: str`, `version: int`) that feeds the per-file cache fingerprint. The core `SymbolVisitor` carries the same pair, so visitor-level changes get an explicit knob too. Bumping a component's epoch `version` invalidates stale payloads automatically, so swapping or upgrading any of them is safe by default. The package `__version__` is intentionally *not* in the fingerprint: every component whose output can shift between releases owns a dedicated `version`, and folding in `__version__` would let unbumped components ride for free on a release bump.
 
 Entrypoint detection is fully plugin-driven. Builtins:
 

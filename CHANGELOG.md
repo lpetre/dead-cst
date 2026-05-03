@@ -10,22 +10,14 @@ two versions.
 ## [Unreleased]
 
 ### Changed
-- `SymbolVisitor` now satisfies the `Cacheable` protocol with class-level
-  `name: str = "default"` and an epoch `version: int`, and
-  `compute_fingerprint` includes the pair in the cache key. Bump
-  `SymbolVisitor.version` on any change to the visitor's per-file output
-  (new node kinds surfaced as decls, edge-attribution rules,
-  flow-analysis fixes, etc.) so stale `VisitorPayload` blobs invalidate
-  even between releases. Concurrent bumps on different branches merge
-  with `max()` semantics. The walrus-support change in this release
-  bumps the visitor version accordingly.
 - The package `__version__` is no longer folded into the cache
-  fingerprint. Every component whose output can shift between releases
-  (visitor, resolvers, plugins, detector) already carries its own
-  `Cacheable` `(name, version)` knob; mixing `__version__` in on top
-  let unbumped components ride for free on a release bump and masked
-  cases where the granular versions weren't being maintained. The
-  schema version and Python version still participate.
+  fingerprint. Every component whose output can shift between
+  releases (visitor, resolvers, plugins, detector) already carries
+  its own `Cacheable` `(name, version)` knob; mixing `__version__`
+  in on top let unbumped components ride for free on a release bump
+  and masked cases where the granular versions weren't being
+  maintained. The discipline now is to bump the relevant component's
+  `version`. Schema version and Python version still participate.
 
 ### Added
 - PEP 572 walrus (`:=`) bindings at module scope are now surfaced as
@@ -42,8 +34,15 @@ two versions.
   `(DEBUG := False)` and `if (DEBUG := False):` both flag dead
   branches. Walruses inside a function / class / lambda body still
   bind locally, matching Python's runtime semantics.
-
-### Added
+- `SymbolVisitor` now satisfies the `Cacheable` protocol with
+  class-level `name: str = "default"` and an epoch `version: int`,
+  and `compute_fingerprint` includes the pair in the cache key.
+  Bump `SymbolVisitor.version` on any change to the visitor's
+  per-file output (new node kinds surfaced as decls, edge-attribution
+  rules, flow-analysis fixes, etc.) so stale `VisitorPayload` blobs
+  invalidate even between releases. Concurrent bumps on different
+  branches merge with `max()` semantics. The walrus-support change
+  bumps the visitor version accordingly.
 - `UnreachableRegionDetector`: pluggable Protocol for module-level
   dead-region detection. Implementers provide
   `find_regions(wrapper) -> list[CodeRange]` and a `(name, version)`
