@@ -121,7 +121,7 @@ class SymbolVisitor(cst.CSTVisitor):
     # edge-attribution rules, flow-analysis fixes, etc. Concurrent
     # bumps on different branches merge with ``max()`` semantics.
     name: str = "default"
-    version: int = 1777800597
+    version: int = 1777808838
 
     def _pos(self, node: cst.CSTNode):
         return self.get_metadata(PositionProvider, node, default=None)
@@ -413,8 +413,26 @@ class SymbolVisitor(cst.CSTVisitor):
     def visit_AnnAssign(self, node: cst.AnnAssign) -> None:
         self._add_variable(node)
 
+    def visit_TypeAlias(self, node: cst.TypeAlias) -> None:
+        self._add_type_alias(node)
+
     def visit_NamedExpr(self, node: cst.NamedExpr) -> None:
         self._add_walrus(node)
+
+    def _add_type_alias(self, node: cst.TypeAlias) -> None:
+        """Surface a PEP 695 ``type X = ...`` statement as a top-level decl.
+
+        ``FixedFullyQualifiedNameProvider`` does not name-bind ``cst.TypeAlias``,
+        so the FQN is constructed from the enclosing module. ``ScopeProvider``
+        reports the binding site as the whole ``TypeAlias`` node, so the frame
+        is pushed there -- this matches what cross-references look up later.
+        """
+        if len(self.decl_stack) > 1:
+            return
+        fqname = f"{self._module_fqname}.{node.name.value}"
+        sym = SymbolNode(fqname, "type_alias", self.path, self._pos(node.name))
+        self.symbol_referent_nodes[sym] = node
+        self._push_decl(node, sym)
 
     def _walrus_module_scope(self, node: cst.NamedExpr) -> tuple[bool, bool]:
         """``(at_module, in_comprehension)`` for the walrus's binding scope.

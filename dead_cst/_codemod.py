@@ -20,6 +20,19 @@ class RemoveDeadSymbols(cst.CSTTransformer):
         # decls so a shadowed dead binding does not drag its live sibling
         # out with it (and vice versa).
         self.dead_decls = dead_decls
+        self._module_fqname: str | None = None
+
+    def visit_Module(self, node: cst.Module) -> bool:
+        # Cached so ``leave_TypeAlias`` can reconstruct the alias's FQN.
+        # ``FixedFullyQualifiedNameProvider`` does not name-bind ``cst.TypeAlias``,
+        # so the codemod has to mirror the visitor's ``<module>.<name>`` form
+        # to recognise dead aliases keyed under that FQN.
+        fqnames = self.get_metadata(FixedFullyQualifiedNameProvider, node, default=[])
+        for qn in fqnames:
+            if qn.source == QualifiedNameSource.LOCAL:
+                self._module_fqname = qn.name
+                break
+        return True
 
     def _should_remove(self, node: cst.CSTNode) -> bool:
         fqnames = self.get_metadata(FixedFullyQualifiedNameProvider, node, default=[])
@@ -54,6 +67,14 @@ class RemoveDeadSymbols(cst.CSTTransformer):
     def leave_AnnAssign(self, original_node: cst.AnnAssign, updated_node: cst.AnnAssign):
         if self._should_remove(original_node.target):
             return cst.RemoveFromParent()
+        return updated_node
+
+    def leave_TypeAlias(self, original_node: cst.TypeAlias, updated_node: cst.TypeAlias):
+        if self._module_fqname is not None:
+            fqname = f"{self._module_fqname}.{original_node.name.value}"
+            pos = self.get_metadata(PositionProvider, original_node.name, default=None)
+            if (fqname, pos) in self.dead_decls:
+                return cst.RemoveFromParent()
         return updated_node
 
 
@@ -103,7 +124,7 @@ def remove_code(G: nx.Graph, base: Path) -> None:
         if not node.path.exists():
             continue
         match node.type:
-            case "function" | "class" | "variable" | "import":
+            case "function" | "class" | "variable" | "type_alias" | "import":
                 by_file.setdefault(node.path, []).append(node)
             case "module":
                 node.path.unlink()

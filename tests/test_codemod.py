@@ -385,6 +385,44 @@ def run_remove_code(tmp_path):
             id="ann-assign-without-value-removed",
         ),
         # ------------------------------------------------------------------
+        # PEP 695 ``type`` statements
+        # ------------------------------------------------------------------
+        pytest.param(
+            """
+            type Dead = int
+            type Keep = str
+            """,
+            {"mod.Dead"},
+            """
+            type Keep = str
+            """,
+            id="type-alias-removed",
+        ),
+        pytest.param(
+            """
+            type Dead[T] = list[T]
+            type Keep = str
+            """,
+            {"mod.Dead"},
+            """
+            type Keep = str
+            """,
+            id="generic-type-alias-removed",
+        ),
+        pytest.param(
+            """
+            type Keep = int
+            type Dead = Keep
+            def f(x: Keep) -> Keep: return x
+            """,
+            {"mod.Dead"},
+            """
+            type Keep = int
+            def f(x: Keep) -> Keep: return x
+            """,
+            id="type-alias-removed-keeps-live-sibling-and-users",
+        ),
+        # ------------------------------------------------------------------
         # Whitespace handling around removed statements
         # ------------------------------------------------------------------
         pytest.param(
@@ -645,6 +683,21 @@ _LIB = "def used(): pass\ndef unused(): pass\n"
             def main(): used()
             """,
             id="live-import-preserved",
+        ),
+        pytest.param(
+            {
+                "mod.py": """
+                type Dead = int
+                type Keep = str
+                def main() -> Keep: return "x"
+                """,
+            },
+            {"mod", "mod.main"},
+            """
+            type Keep = str
+            def main() -> Keep: return "x"
+            """,
+            id="dead-type-alias-removed-end-to-end",
         ),
     ],
 )

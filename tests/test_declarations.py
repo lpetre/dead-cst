@@ -821,23 +821,36 @@ import pytest
         # PEP 695 type-parameter syntax (3.12+) and ``type`` statements.
         # Generic ``[T]`` clauses introduce a synthetic enclosing scope, but
         # references in the function/class body still resolve outward to the
-        # module. ``type`` statements themselves don't surface as decls (see
-        # ``test_limitations``), but their RHS is still walked.
+        # module. ``type`` statements surface as top-level decls of kind
+        # ``"type_alias"`` and the RHS is walked for references.
         # ------------------------------------------------------------------
         pytest.param(
             """
             Base = int
             type Alias = Base
             """,
-            # The ``type`` alias is not a top-level decl, but the RHS
-            # ``Base`` reference is attributed to the synthetic module
-            # node. ``mod -> mod.Base`` keeps ``Base`` alive whenever
-            # the module is.
+            # ``type Alias = Base`` surfaces ``mod.Alias`` as its own
+            # decl. Refs in the RHS are attributed to the alias, not
+            # the module, so removing ``Alias`` releases ``Base``.
             {
-                "mod -> mod.Base",
+                "mod.Alias -> mod",
+                "mod.Alias -> mod.Base",
                 "mod.Base -> mod",
             },
             id="pep695-type-statement-rhs-reference",
+        ),
+        pytest.param(
+            """
+            type Alias = int
+            def use(x: Alias) -> Alias: return x
+            """,
+            # Users referencing the alias get an edge into the alias decl.
+            {
+                "mod.Alias -> mod",
+                "mod.use -> mod",
+                "mod.use -> mod.Alias",
+            },
+            id="pep695-type-statement-referenced-by-annotation",
         ),
         pytest.param(
             """
