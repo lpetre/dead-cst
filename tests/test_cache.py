@@ -152,6 +152,23 @@ def test_fingerprint_changes_when_unreachable_detector_version_bumped(tmp_path):
     assert fp_v1 != fp_v2
 
 
+def test_fingerprint_changes_when_visitor_version_bumped(tmp_path, monkeypatch):
+    """Bumping ``SymbolVisitor.version`` invalidates the cache key.
+
+    The visitor's ``__version__`` only ticks on tagged releases, so a
+    behaviour-affecting visitor change between two installs at the
+    same dev version would otherwise be served from stale cached
+    payloads. ``SymbolVisitor`` carries its own ``Cacheable``
+    ``(name, version)`` pair to give that change a knob.
+    """
+    from dead_cst._visitor import SymbolVisitor
+
+    fp_v1 = compute_fingerprint(paths={tmp_path: []}, resolvers=[])
+    monkeypatch.setattr(SymbolVisitor, "version", SymbolVisitor.version + 1)
+    fp_v2 = compute_fingerprint(paths={tmp_path: []}, resolvers=[])
+    assert fp_v1 != fp_v2
+
+
 def test_fingerprint_changes_when_plugin_version_bumped(tmp_path):
     """Bumping a plugin's epoch ``version`` invalidates the cache key.
 

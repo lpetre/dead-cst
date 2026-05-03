@@ -9,6 +9,17 @@ two versions.
 
 ## [Unreleased]
 
+### Changed
+- `SymbolVisitor` now satisfies the `Cacheable` protocol with class-level
+  `name: str = "default"` and an epoch `version: int`, and
+  `compute_fingerprint` includes the pair in the cache key. Bump
+  `SymbolVisitor.version` on any change to the visitor's per-file output
+  (new node kinds surfaced as decls, edge-attribution rules,
+  flow-analysis fixes, etc.) so stale `VisitorPayload` blobs invalidate
+  even between releases. Concurrent bumps on different branches merge
+  with `max()` semantics. The walrus-support change in this release
+  bumps the visitor version accordingly.
+
 ### Added
 - PEP 572 walrus (`:=`) bindings at module scope are now surfaced as
   top-level declarations. `if (Y := src()): ...` registers `mod.Y`

@@ -48,7 +48,7 @@ from ._branches import (
 )
 from ._plugins._core import EdgePlugin
 from ._resolvers import PathMap, PathResolver
-from ._visitor import VisitorPayload
+from ._visitor import SymbolVisitor, VisitorPayload
 from ._version import __version__
 
 logger = logging.getLogger(__name__)
@@ -79,17 +79,22 @@ def compute_fingerprint(
 ) -> str:
     """SHA-256 of every input that affects payload semantics for one analysis run.
 
-    Includes the dead-cst version (any code change can shift visitor
-    output), Python version (pickle protocol stability), the
-    ``PathMap`` (the search-path layout governs ``Import.path``
-    resolution), and the resolver / plugin / detector chain.
-    Resolvers, plugins, and the detector all satisfy
-    :class:`~dead_cst._cacheable.Cacheable` and are fingerprinted by
-    their ``(name, version)`` pair: bumping ``version`` invalidates
-    the file_cache so new output replaces the old. ``version`` is a
-    Unix epoch int by convention, so concurrent bumps on different
-    branches merge with ``max()``-wins semantics rather than
-    colliding on a re-used integer label.
+    Includes the dead-cst version (covers tagged releases), Python
+    version (pickle protocol stability), the ``PathMap`` (the
+    search-path layout governs ``Import.path`` resolution), and the
+    visitor / resolver / plugin / detector chain. Each component
+    satisfies :class:`~dead_cst._cacheable.Cacheable` and is
+    fingerprinted by its ``(name, version)`` pair: bumping
+    ``version`` invalidates the file_cache so new output replaces
+    the old. ``version`` is a Unix epoch int by convention, so
+    concurrent bumps on different branches merge with ``max()``-wins
+    semantics rather than colliding on a re-used integer label.
+
+    The visitor's own ``(name, version)`` is included so a
+    behaviour-affecting change to ``SymbolVisitor`` invalidates
+    cached payloads even between releases (``__version__`` only
+    moves on tag bumps, so a dev-loop edit at the same version
+    would otherwise be served from stale blobs).
 
     Each value is normalized to a stable string before hashing so
     equivalent inputs produce equal keys.
@@ -98,6 +103,7 @@ def compute_fingerprint(
     h.update(f"schema={SCHEMA_VERSION}\n".encode())
     h.update(f"version={__version__}\n".encode())
     h.update(f"python={sys.version_info.major}.{sys.version_info.minor}\n".encode())
+    h.update(f"visitor={SymbolVisitor.name}@{SymbolVisitor.version}\n".encode())
 
     h.update(b"paths=\n")
     for base in sorted(paths, key=lambda p: str(p)):

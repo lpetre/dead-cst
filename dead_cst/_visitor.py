@@ -111,6 +111,18 @@ class SymbolVisitor(cst.CSTVisitor):
         PositionProvider,
     )
 
+    # ``Cacheable`` (name, version) fingerprint contributed to the
+    # per-run cache key. ``__version__`` already covers tagged releases,
+    # but it doesn't move between commits, so a behaviour-affecting
+    # visitor change between two installs at the same dev version
+    # would be served from stale ``VisitorPayload`` blobs. Bump
+    # ``version`` (to the current Unix epoch) on any change to the
+    # visitor's per-file output -- new node kinds surfaced as decls,
+    # edge-attribution rules, flow-analysis fixes, etc. Concurrent
+    # bumps on different branches merge with ``max()`` semantics.
+    name: str = "default"
+    version: int = 1777800597
+
     def _pos(self, node: cst.CSTNode):
         return self.get_metadata(PositionProvider, node, default=None)
 
