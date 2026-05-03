@@ -520,10 +520,17 @@ import pytest
             def f(): return 1
             x = (y := f())
             """,
+            # The walrus surfaces ``y`` as its own top-level decl, so
+            # the RHS reference to ``f`` attributes to ``y`` rather
+            # than to ``x``. Reachability is preserved -- ``f`` is
+            # still kept alive transitively when ``x`` is reachable
+            # because the parser registers ``mod.y -> mod`` so the
+            # parent-module edge keeps ``y`` (and thus ``f``) live.
             {
                 "mod.f -> mod",
                 "mod.x -> mod",
-                "mod.x -> mod.f",
+                "mod.y -> mod",
+                "mod.y -> mod.f",
             },
             id="walrus-in-assignment-rhs",
         ),
@@ -715,10 +722,48 @@ import pytest
             id="comprehension-iterable-uses-enclosing-scope",
         ),
         # ------------------------------------------------------------------
-        # PEP 572 walrus -- references inside walrus RHS are still attributed
-        # to the enclosing top-level decl. (Top-level walrus binding capture
-        # itself is documented in ``test_limitations``.)
+        # PEP 572 walrus -- module-scope walruses surface as top-level
+        # decls, references inside the RHS attribute to that decl, and
+        # cross-decl uses get edges to it. Walruses inside a function /
+        # class / lambda body stay local; their RHS references attribute
+        # to the enclosing top-level decl as before.
         # ------------------------------------------------------------------
+        pytest.param(
+            """
+            def src(): return 1
+            if (Y := src()): pass
+            def use(): return Y
+            """,
+            {
+                "mod.src -> mod",
+                "mod.Y -> mod",
+                "mod.Y -> mod.src",
+                "mod.use -> mod",
+                "mod.use -> mod.Y",
+            },
+            id="walrus-toplevel-binding-captured",
+        ),
+        pytest.param(
+            """
+            nums = [1, 2, 3]
+            result = [last := n for n in nums]
+            def use(): return last
+            """,
+            # A walrus inside a comprehension leaks its binding to the
+            # enclosing (module) scope per PEP 572. ``mod.last`` is
+            # surfaced as a top-level decl and ``use``'s reference is
+            # routed to it via the unresolved-access fixup in
+            # ``SymbolVisitor.on_leave``.
+            {
+                "mod.nums -> mod",
+                "mod.result -> mod",
+                "mod.result -> mod.nums",
+                "mod.last -> mod",
+                "mod.use -> mod",
+                "mod.use -> mod.last",
+            },
+            id="walrus-comprehension-toplevel-leak-captured",
+        ),
         pytest.param(
             """
             def src(): return 1

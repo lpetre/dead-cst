@@ -23,9 +23,11 @@ flag:`` resolves correctly because the RHS evaluation consults the
 external resolver before falling back to the table.
 
 Only single-target ``Name`` LHS shapes participate. Tuple unpacking,
-attribute / subscript targets, walrus, augmented assign, parameter
-defaults, and import bindings all return ``None`` from the RHS lookup
-helper, which the caller treats as "unknown" -- the safe default.
+attribute / subscript targets, augmented assign, parameter defaults,
+and import bindings all return ``None`` from the RHS lookup helper,
+which the caller treats as "unknown" -- the safe default. Walrus
+(``name := expr``) does fold: the binding is unambiguous and the
+fixpoint loop happily propagates a literal RHS through it.
 Bindings whose live values disagree (e.g. ``if cond: x = True else:
 x = False``) likewise stay unknown. Cycles (``a = b; b = a``) never
 escape the unknown bucket because neither ever resolves.
@@ -183,10 +185,12 @@ def _constant_assignment_rhs(
     """RHS of a simple ``name = expr`` (or ``name: T = expr``) binding.
 
     Returns ``None`` for any shape we don't fold: tuple/list unpacking,
-    attribute or subscript targets, walrus, augmented assign,
-    parameter defaults, import bindings, etc. Multi-target chained
-    assignment (``a = b = expr``) is supported because all targets
-    share one RHS.
+    attribute or subscript targets, augmented assign, parameter
+    defaults, import bindings, etc. Multi-target chained assignment
+    (``a = b = expr``) is supported because all targets share one RHS.
+    Walrus (``name := expr``) is also supported -- the surrounding
+    expression context doesn't matter for fold purposes since the
+    binding's value is unambiguously ``expr``.
     """
     parent = parent_map.get(binding_node)
     if isinstance(parent, cst.AssignTarget):
@@ -199,6 +203,12 @@ def _constant_assignment_rhs(
             return None
         return grandparent.value
     if isinstance(parent, cst.AnnAssign):
+        if not isinstance(parent.target, cst.Name):
+            return None
+        if parent.target is not binding_node:
+            return None
+        return parent.value
+    if isinstance(parent, cst.NamedExpr):
         if not isinstance(parent.target, cst.Name):
             return None
         if parent.target is not binding_node:
