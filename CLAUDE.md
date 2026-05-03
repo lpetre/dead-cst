@@ -118,7 +118,6 @@ Implement `UnreachableRegionDetector`: `name`, `version`, `find_regions(wrapper)
 
 - `import *` is treated pessimistically (every top-level decl in the target is considered used).
 - Dynamic attribute access (`getattr`) and runtime-generated symbols are invisible to static analysis.
-- PEP 695 `type` statements aren't tracked.
 - `__all__` is followed only when assigned a list/tuple of string literals.
 - PEP 750 template strings (`t"..."`, 3.14+) cannot be parsed by the pinned `libcst` and abort analysis with `ParserSyntaxError`.
 
