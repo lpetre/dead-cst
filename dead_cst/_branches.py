@@ -45,28 +45,44 @@ _KEYWORDS: dict[str, bool] = {
 }
 
 
-# Resolver returns the statically-known truthiness of the constant a
-# ``Name`` is bound to, or ``None`` when the binding can't be folded.
-ResolveName = Callable[[cst.Name], bool | None]
+# Resolver returns the statically-known truthiness of an arbitrary
+# expression, or ``None`` to defer to ``evaluate_truthiness``'s
+# built-in literal handling. Custom detectors override
+# :meth:`DefaultUnreachableRegionDetector.resolve` to plug in
+# domain-specific knowledge -- e.g. ``check_flag("migration-abc")``
+# is always ``True`` in production.
+ResolveExpr = Callable[[cst.BaseExpression], bool | None]
 
 
 def evaluate_truthiness(
     node: cst.BaseExpression,
-    resolve_name: ResolveName | None = None,
+    resolve_expr: ResolveExpr | None = None,
 ) -> bool | None:
     """Best-effort static truthiness for ``node``.
 
     Returns ``True`` / ``False`` if the value's truthiness is statically
     determinable, ``None`` otherwise. Never raises.
 
-    ``resolve_name``, when supplied, is consulted for any ``cst.Name``
-    that isn't one of the ``True`` / ``False`` / ``None`` keywords.
+    ``resolve_expr``, when supplied, gets first crack at every
+    non-keyword expression. Returning a ``bool`` short-circuits the
+    built-in handling for that node; returning ``None`` falls through
+    to the literal cases below. The ``True`` / ``False`` / ``None``
+    keywords always resolve to their language-defined truthiness and
+    are never passed to the resolver.
     """
+    # Keywords are language semantics, not user-overridable.
+    if isinstance(node, cst.Name) and node.value in _KEYWORDS:
+        return _KEYWORDS[node.value]
+
+    # User-supplied resolver gets first crack at any expression --
+    # ``Name`` lookups, ``Call`` patterns the user knows about, etc.
+    if resolve_expr is not None:
+        v = resolve_expr(node)
+        if v is not None:
+            return v
+
     if isinstance(node, cst.Name):
-        if node.value in _KEYWORDS:
-            return _KEYWORDS[node.value]
-        if resolve_name is not None:
-            return resolve_name(node)
+        # Bare non-keyword Name with no resolver answer -> unknown.
         return None
 
     if isinstance(node, cst.Integer):
@@ -97,15 +113,15 @@ def evaluate_truthiness(
         return len(node.elements) > 0
 
     if isinstance(node, cst.UnaryOperation) and isinstance(node.operator, cst.Not):
-        inner = evaluate_truthiness(node.expression, resolve_name)
+        inner = evaluate_truthiness(node.expression, resolve_expr)
         return None if inner is None else not inner
 
     if isinstance(node, cst.BooleanOperation):
-        left = evaluate_truthiness(node.left, resolve_name)
+        left = evaluate_truthiness(node.left, resolve_expr)
         if isinstance(node.operator, cst.And):
             if left is False:
                 return False
-            right = evaluate_truthiness(node.right, resolve_name)
+            right = evaluate_truthiness(node.right, resolve_expr)
             if right is False:
                 return False
             if left is True and right is True:
@@ -114,7 +130,7 @@ def evaluate_truthiness(
         if isinstance(node.operator, cst.Or):
             if left is True:
                 return True
-            right = evaluate_truthiness(node.right, resolve_name)
+            right = evaluate_truthiness(node.right, resolve_expr)
             if right is True:
                 return True
             if left is False and right is False:
@@ -126,7 +142,7 @@ def evaluate_truthiness(
 
 def unreachable_suites(
     stmt: cst.BaseStatement,
-    resolve_name: ResolveName | None = None,
+    resolve_expr: ResolveExpr | None = None,
 ) -> list[cst.BaseSuite]:
     """Return every dead suite inside ``stmt``.
 
@@ -138,9 +154,9 @@ def unreachable_suites(
     positions (e.g. the visitor) can read them off the node.
     """
     if isinstance(stmt, cst.If):
-        return _unreachable_in_if(stmt, branch_taken=False, resolve_name=resolve_name)
+        return _unreachable_in_if(stmt, branch_taken=False, resolve_expr=resolve_expr)
     if isinstance(stmt, cst.While):
-        truth = evaluate_truthiness(stmt.test, resolve_name)
+        truth = evaluate_truthiness(stmt.test, resolve_expr)
         if truth is False:
             return [stmt.body]
         # ``while True:`` exits only via break / return / exception, so
@@ -153,7 +169,7 @@ def unreachable_suites(
 
 def unreachable_bodies(
     stmt: cst.BaseStatement,
-    resolve_name: ResolveName | None = None,
+    resolve_expr: ResolveExpr | None = None,
 ) -> list[Sequence[cst.CSTNode]]:
     """Return the ``.body`` of every dead suite inside ``stmt``.
 
@@ -164,7 +180,7 @@ def unreachable_bodies(
     block) or ``Sequence[BaseSmallStatement]`` (a one-line suite like
     ``if False: x = 1``).
     """
-    return [suite.body for suite in unreachable_suites(stmt, resolve_name)]
+    return [suite.body for suite in unreachable_suites(stmt, resolve_expr)]
 
 
 @runtime_checkable
@@ -177,13 +193,14 @@ class UnreachableRegionDetector(Cacheable, Protocol):
     which positions are surfaced as "unreachable code at line X"
     reports.
 
-    Pass a custom detector to :func:`dead_cst.build_symbol_graph` to
-    layer on company-specific constant folding (e.g.
-    ``settings.IS_PROD`` is always ``True``). The default,
-    :class:`DefaultUnreachableRegionDetector`, runs literal-only
-    truthiness on every ``if`` / ``while`` test, augmented by a
-    fixpoint constant-folding pre-pass over simple ``Name = literal``
-    assignments.
+    The shipped :class:`DefaultUnreachableRegionDetector` covers
+    literal-only truthiness on ``if`` / ``while`` tests, fixpoint
+    constant-folding over simple ``Name = literal`` assignments, and
+    post-terminator regions inside every suite. Custom detectors
+    typically subclass it and override
+    :meth:`DefaultUnreachableRegionDetector.resolve` to layer on
+    domain knowledge -- e.g. ``check_flag("migration-abc")`` is
+    always ``True`` in production.
 
     Inherits the ``(name, version)`` contract from :class:`Cacheable`
     so swapping detectors invalidates stale ``VisitorPayload`` blobs
@@ -205,8 +222,8 @@ class DefaultUnreachableRegionDetector:
        through their access points, including chained forms like
        ``a = False; b = a or False; if b:``.
     2. A walk over every ``cst.If`` / ``cst.While``, calling
-       :func:`unreachable_suites` with a ``resolve_name`` closure
-       that consults the folded table.
+       :func:`unreachable_suites` with the truthiness resolver below
+       so folded constants influence branch reachability.
     3. A walk over every statement-bearing suite (module body and
        every ``IndentedBlock``) marking the trailing region after an
        unconditional terminator as unreachable. Terminators are
@@ -216,6 +233,19 @@ class DefaultUnreachableRegionDetector:
        kills the rest of the try body even though the surrounding
        ``except`` runs on its own path.
 
+    Subclasses extend the analysis by overriding :meth:`resolve` to
+    return ``True`` / ``False`` for expressions whose truthiness is
+    fixed in a particular environment (e.g.
+    ``check_flag("migration-abc")`` is always ``True`` in production).
+    The override gets first crack at every non-keyword expression in
+    every ``if`` / ``while`` test, every ``assert`` test, and every
+    foldable assignment RHS; returning ``None`` (the default) defers
+    to the built-in literal handling. Constants resolved this way
+    flow through the same fixpoint loop as ``Name = literal``
+    bindings, so a single high-level decision (``check_flag(...) ==
+    True``) propagates through chains and into ``if`` / ``assert``
+    branches automatically.
+
     The folding pass is keyed by ``id`` of the access node, so it
     stays flow-sensitive: a later rebinding shadows an earlier one,
     and conditional bindings whose live values disagree refuse to
@@ -223,7 +253,21 @@ class DefaultUnreachableRegionDetector:
     """
 
     name: str = "default"
-    version: int = 1777794328
+    version: int = 1777795837
+
+    def resolve(self, expr: cst.BaseExpression) -> bool | None:
+        """Hook for domain-specific constant folding. Default: defer.
+
+        Override in a subclass to return ``True`` / ``False`` for any
+        expression whose truthiness is fixed in your environment.
+        Returning ``None`` falls through to ``evaluate_truthiness``'s
+        built-in literal handling. The override is consulted recursively
+        for every subexpression of an ``if`` / ``while`` / ``assert``
+        test and every foldable assignment RHS, so a check like
+        ``isinstance(expr, cst.Call) and ...`` runs on every node;
+        keep it cheap with an early-return on the wrong type.
+        """
+        return None
 
     def find_regions(self, wrapper: MetadataWrapper) -> list[CodeRange]:
         # Local import to avoid a top-level cycle: ``_const_fold``
@@ -231,10 +275,21 @@ class DefaultUnreachableRegionDetector:
         from ._const_fold import fold_constants
 
         positions = wrapper.resolve(PositionProvider)
-        truthy = fold_constants(wrapper)
+        # Run fold_constants with the subclass hook plumbed in so the
+        # fixpoint loop can resolve names whose RHS depends on a
+        # custom-folded expression (``flag = check_flag("x"); if flag:``).
+        truthy = fold_constants(wrapper, resolve_expr=self.resolve)
 
-        def resolve(name: cst.Name) -> bool | None:
-            return truthy.get(id(name))
+        def resolve(expr: cst.BaseExpression) -> bool | None:
+            # Subclass hook gets first try -- a custom detector may
+            # know things the fold table doesn't.
+            v = self.resolve(expr)
+            if v is not None:
+                return v
+            # Fall back to the fold table: keyed by Name access id.
+            if isinstance(expr, cst.Name):
+                return truthy.get(id(expr))
+            return None
 
         found: list[CodeRange] = []
 
@@ -301,7 +356,7 @@ class DefaultUnreachableRegionDetector:
 def _unreachable_in_if(
     node: cst.If,
     branch_taken: bool,
-    resolve_name: ResolveName | None = None,
+    resolve_expr: ResolveExpr | None = None,
 ) -> list[cst.BaseSuite]:
     """Walk an ``if`` / ``elif`` / ``else`` chain collecting dead suites.
 
@@ -309,7 +364,7 @@ def _unreachable_in_if(
     known to fire; everything from this point on is then unreachable.
     """
     dead: list[cst.BaseSuite] = []
-    truth = None if branch_taken else evaluate_truthiness(node.test, resolve_name)
+    truth = None if branch_taken else evaluate_truthiness(node.test, resolve_expr)
 
     if branch_taken or truth is False:
         dead.append(node.body)
@@ -323,5 +378,5 @@ def _unreachable_in_if(
         if next_taken:
             dead.append(orelse.body)
         return dead
-    dead.extend(_unreachable_in_if(orelse, next_taken, resolve_name))
+    dead.extend(_unreachable_in_if(orelse, next_taken, resolve_expr))
     return dead

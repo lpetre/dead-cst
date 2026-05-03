@@ -256,3 +256,96 @@ def test_keyword_names_are_not_dispatched_to_resolver() -> None:
     # ``True`` accesses don't go through the fold table at all; nothing
     # to assert beyond "no crash, no entry".
     assert "True" not in out or all(v is None for v in out["True"])
+
+
+# ----------------------------------------------------------------------
+# fold_constants accepts an optional ``resolve_expr`` so a custom
+# detector's ``resolve`` method can answer for non-Name expressions
+# (Calls, Attributes) that the literal-only fold would skip.
+# ----------------------------------------------------------------------
+
+
+def _resolve_with_external(src: str, resolve_expr) -> dict[str, list[bool | None]]:
+    """Same as :func:`_resolve_lookup` but plumbs an external resolver."""
+    module = cst.parse_module(textwrap.dedent(src).strip())
+    wrapper = MetadataWrapper(module, unsafe_skip_copy=True)
+    truthy = fold_constants(wrapper, resolve_expr=resolve_expr)
+    scopes = wrapper.resolve(ScopeProvider)
+
+    access_nodes: set[int] = set()
+    for scope in set(scopes.values()):
+        for access in scope.accesses:
+            if isinstance(access.node, cst.Name):
+                access_nodes.add(id(access.node))
+
+    result: dict[str, list] = {}
+
+    class _Collect(cst.CSTVisitor):
+        def visit_Name(self, node: cst.Name) -> None:
+            if id(node) in access_nodes:
+                result.setdefault(node.value, []).append(truthy.get(id(node)))
+
+    wrapper.module.visit(_Collect())
+    return result
+
+
+def test_external_resolver_folds_call_through_assignment() -> None:
+    # The user's example: ``flag = check_flag("x"); if flag:``. The
+    # external resolver answers for the Call expression on the RHS;
+    # the fold pass propagates that into the access for ``flag``.
+    def resolver(expr):
+        if (
+            isinstance(expr, cst.Call)
+            and isinstance(expr.func, cst.Name)
+            and expr.func.value == "check_flag"
+        ):
+            return True
+        return None
+
+    out = _resolve_with_external(
+        """
+        flag = check_flag("migration-abc")
+        if flag:
+            pass
+        """,
+        resolver,
+    )
+    assert out["flag"] == [True]
+
+
+def test_external_resolver_chains_through_boolean_op() -> None:
+    # Compose with literal handling: ``check_flag(...) or False``
+    # resolves because evaluate_truthiness recurses into the boolean
+    # op and the resolver answers for the call.
+    def resolver(expr):
+        if (
+            isinstance(expr, cst.Call)
+            and isinstance(expr.func, cst.Name)
+            and expr.func.value == "check_flag"
+        ):
+            return False
+        return None
+
+    out = _resolve_with_external(
+        """
+        flag = check_flag("x") or False
+        if flag:
+            pass
+        """,
+        resolver,
+    )
+    assert out["flag"] == [False]
+
+
+def test_external_resolver_returning_none_does_not_block_literals() -> None:
+    # A resolver that returns None for everything must not regress the
+    # literal-only fold path.
+    out = _resolve_with_external(
+        """
+        x = False
+        if x:
+            pass
+        """,
+        lambda _: None,
+    )
+    assert out["x"] == [False]

@@ -735,3 +735,124 @@ def test_module_level_terminator_kills_following_statements(
         }
     )
     assert_dead_branch_edges(graph, {"mod -> mod.helper"})
+
+
+# ----------------------------------------------------------------------
+# Custom detector subclass overrides ``resolve`` to fold non-Name
+# expressions (function calls, attribute access). The user's example:
+# ``check_flag("migration-abc")`` is treated as a known constant.
+# ----------------------------------------------------------------------
+
+
+def test_custom_detector_override_folds_call_in_if(tmp_path, write_files):
+    """A subclass that knows ``check_flag(name)`` is constant.
+
+    The override answers for the ``Call`` node directly; the detector
+    threads the answer through both ``unreachable_suites`` (so the
+    ``if`` body is marked dead) and ``fold_constants`` (so a chain
+    like ``flag = check_flag(...); if flag:`` would also resolve, see
+    the next test).
+    """
+    from dataclasses import dataclass
+
+    import libcst as cst
+
+    from dead_cst import EdgeFlags, build_symbol_graph
+    from dead_cst._branches import DefaultUnreachableRegionDetector
+
+    write_files(
+        {
+            "mod.py": """
+            def prod_only(): pass
+            def dev_only(): pass
+            if check_flag("migration-abc"):
+                prod_only()
+            else:
+                dev_only()
+            """,
+        }
+    )
+
+    @dataclass(frozen=True)
+    class FlagAwareDetector(DefaultUnreachableRegionDetector):
+        name: str = "flag_aware"
+        version: int = 1
+
+        def resolve(self, expr):
+            if (
+                isinstance(expr, cst.Call)
+                and isinstance(expr.func, cst.Name)
+                and expr.func.value == "check_flag"
+            ):
+                return True
+            return None
+
+    graph = build_symbol_graph({tmp_path: []}, unreachable_detector=FlagAwareDetector())
+    dead = {
+        f"{src.fqname} -> {dst.fqname}"
+        for src, dst, attrs in graph.edges(data=True)
+        if attrs.get("flags", EdgeFlags.NONE) & EdgeFlags.DEAD_BRANCH
+    }
+    # ``check_flag(...)`` resolves to True, so the else branch is dead.
+    assert dead == {"mod -> mod.dev_only"}
+
+
+def test_custom_detector_override_folds_through_assignment(tmp_path, write_files):
+    """Override answer composes with the fixpoint fold pass.
+
+    ``flag = check_flag(...)`` propagates the override's answer
+    through the assignment: by the time ``if flag:`` is evaluated,
+    the fold table already has ``id(flag) -> False``, so the if body
+    is recognized as dead.
+    """
+    from dataclasses import dataclass
+
+    import libcst as cst
+
+    from dead_cst import EdgeFlags, build_symbol_graph
+    from dead_cst._branches import DefaultUnreachableRegionDetector
+
+    write_files(
+        {
+            "mod.py": """
+            def helper(): pass
+            flag = check_flag("migration-abc")
+            if flag:
+                helper()
+            """,
+        }
+    )
+
+    @dataclass(frozen=True)
+    class FlagAwareDetector(DefaultUnreachableRegionDetector):
+        name: str = "flag_aware"
+        version: int = 1
+
+        def resolve(self, expr):
+            if (
+                isinstance(expr, cst.Call)
+                and isinstance(expr.func, cst.Name)
+                and expr.func.value == "check_flag"
+            ):
+                return False
+            return None
+
+    graph = build_symbol_graph({tmp_path: []}, unreachable_detector=FlagAwareDetector())
+    dead = {
+        f"{src.fqname} -> {dst.fqname}"
+        for src, dst, attrs in graph.edges(data=True)
+        if attrs.get("flags", EdgeFlags.NONE) & EdgeFlags.DEAD_BRANCH
+    }
+    assert dead == {"mod -> mod.helper"}
+
+
+def test_default_resolve_returns_none() -> None:
+    # The base detector's ``resolve`` is a no-op hook. Verifying the
+    # default explicitly keeps the contract for subclasses clear.
+    import libcst as cst
+
+    from dead_cst._branches import DefaultUnreachableRegionDetector
+
+    detector = DefaultUnreachableRegionDetector()
+    assert detector.resolve(cst.Name("anything")) is None
+    assert detector.resolve(cst.Integer("0")) is None

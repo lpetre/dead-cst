@@ -11,9 +11,16 @@ Iteration is the point. A direct one-shot resolver only sees literal
 RHSes, so ``a = False; b = a or False; if b:`` doesn't fold. Each
 pass over the access list propagates one more level of indirection;
 once a pass produces no new entries the table is at fixpoint and the
-caller (``DefaultUnreachableRegionDetector``) can hand it to
-:func:`~dead_cst._branches.unreachable_suites` as a ``resolve_name``
-callback.
+caller (``DefaultUnreachableRegionDetector``) can build a closure
+over the table to feed back into :func:`unreachable_suites`.
+
+The optional ``resolve_expr`` parameter plumbs custom truthiness
+through the same loop: when a subclassed detector overrides
+:meth:`DefaultUnreachableRegionDetector.resolve` to know that
+``check_flag("migration-abc")`` is ``True``, that knowledge composes
+with literal folding -- ``flag = check_flag("migration-abc"); if
+flag:`` resolves correctly because the RHS evaluation consults the
+external resolver before falling back to the table.
 
 Only single-target ``Name`` LHS shapes participate. Tuple unpacking,
 attribute / subscript targets, walrus, augmented assign, parameter
@@ -35,18 +42,30 @@ from libcst.metadata.scope_provider import (
     GlobalScope,
 )
 
-from ._branches import evaluate_truthiness
+from ._branches import ResolveExpr, evaluate_truthiness
 from ._flow import live_referents
 
 
-def fold_constants(wrapper: MetadataWrapper) -> dict[int, bool]:
+def fold_constants(
+    wrapper: MetadataWrapper,
+    resolve_expr: ResolveExpr | None = None,
+) -> dict[int, bool]:
     """Map ``id(name_access_node) -> truthiness`` for every foldable access.
 
     Iteratively propagates known constants through simple
     ``Name = literal`` (or ``Name: T = literal``) assignments until no
     new entries are produced. The returned dict is keyed by Python
     ``id()`` of the access ``cst.Name`` node so the caller can build a
-    flow-sensitive ``resolve_name`` closure: ``lambda n: truthy.get(id(n))``.
+    flow-sensitive resolver: ``lambda expr: truthy.get(id(expr)) if
+    isinstance(expr, cst.Name) else None``.
+
+    ``resolve_expr``, when supplied, gets first crack at any
+    expression encountered while evaluating an assignment's RHS.
+    Returning a ``bool`` short-circuits literal handling for that
+    node; returning ``None`` defers. This is how subclasses of
+    :class:`DefaultUnreachableRegionDetector` thread custom domain
+    knowledge through the loop -- e.g. ``flag = check_flag("x")``
+    folds when the override answers for the call.
 
     Names that don't fold -- mixed-value bindings, non-literal RHS,
     unsupported assignment shape, cyclic references -- are simply
@@ -72,8 +91,17 @@ def fold_constants(wrapper: MetadataWrapper) -> dict[int, bool]:
 
     truthy: dict[int, bool] = {}
 
-    def resolve(name_node: cst.Name) -> bool | None:
-        return truthy.get(id(name_node))
+    def resolve(expr: cst.BaseExpression) -> bool | None:
+        # External (custom) resolver gets first try -- it may know
+        # things the fold table doesn't (e.g. a feature-flag call).
+        if resolve_expr is not None:
+            v = resolve_expr(expr)
+            if v is not None:
+                return v
+        # Fall back to the fold table; only Name accesses live here.
+        if isinstance(expr, cst.Name):
+            return truthy.get(id(expr))
+        return None
 
     while True:
         progressed = False

@@ -26,10 +26,14 @@ bumped:
   itself from a project root, so callers don't have to hand-build it.
 * The unreachable-region detector (:class:`UnreachableRegionDetector`)
   decides which source ranges count as statically dead. The built-in
-  :class:`DefaultUnreachableRegionDetector` runs literal-only truthiness
-  on ``if`` / ``while`` tests; supply a custom one via
-  ``build_symbol_graph(unreachable_detector=...)`` to fold in domain
-  knowledge (e.g. config flags whose values are fixed in production).
+  :class:`DefaultUnreachableRegionDetector` covers literal-only
+  truthiness on ``if`` / ``while`` tests, fixpoint constant-folding
+  over simple ``Name = literal`` assignments, and post-terminator
+  regions inside every suite. Override
+  :meth:`DefaultUnreachableRegionDetector.resolve` in a subclass to
+  fold in domain knowledge -- e.g. ``check_flag("migration-abc")``
+  is always ``True`` in production -- and pass the instance via
+  ``build_symbol_graph(unreachable_detector=...)``.
 
 After plugins run, :func:`find_reachable` walks successors from every node
 tagged with ``entrypoint=True`` and returns the live set;
