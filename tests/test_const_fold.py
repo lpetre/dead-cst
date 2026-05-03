@@ -180,12 +180,10 @@ def test_tuple_unpacking_does_not_fold() -> None:
     assert out["a"] == [None]
 
 
-def test_walrus_binding_does_not_fold() -> None:
-    # ``_constant_assignment_rhs`` returns ``None`` for walrus
-    # (``NamedExpr``) bindings -- they aren't ``Assign`` / ``AnnAssign``
-    # statements -- so the value never enters the fold table even when
-    # the RHS is a literal. Ideally ``x`` would resolve to ``[False]``
-    # here, matching the behaviour of a plain ``x = False`` binding.
+def test_walrus_binding_folds() -> None:
+    # ``_constant_assignment_rhs`` recognises ``NamedExpr`` bindings the
+    # same way it recognises ``Assign`` / ``AnnAssign`` -- the walrus
+    # target's value is unambiguously the RHS, so a literal RHS folds.
     out = _resolve_lookup(
         """
         (x := False)
@@ -193,7 +191,25 @@ def test_walrus_binding_does_not_fold() -> None:
             pass
         """
     )
-    assert out["x"] == [None]
+    assert out["x"] == [False]
+
+
+def test_walrus_in_if_test_folds() -> None:
+    # ``evaluate_truthiness`` unwraps ``NamedExpr`` to its value, so the
+    # if-test's truthiness is statically known even when the test is a
+    # bare walrus expression.
+    out = _resolve_lookup(
+        """
+        if (x := False):
+            pass
+        """
+    )
+    # Two ``x`` accesses: the walrus target binding (folded via the
+    # NamedExpr handler in ``_constant_assignment_rhs``) and... actually
+    # only one access -- the walrus target Name is a binding, not an
+    # access. The ``if`` test's NamedExpr is an expression, not a Name
+    # access, so no entry shows up in ``out`` at all.
+    assert "x" not in out
 
 
 def test_attribute_target_does_not_fold() -> None:

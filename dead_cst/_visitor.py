@@ -170,6 +170,16 @@ class SymbolVisitor(cst.CSTVisitor):
         # ``NodeFlags.SHADOWED`` copies and remaps any edge endpoints
         # that point at them, so the graph keeps consistent identity.
         self.shadowed_decls: list[SymbolNode] = []
+        # Module-scope walrus targets keyed by name. PEP 572 says a
+        # walrus inside a comprehension binds in the comprehension's
+        # enclosing scope, but ``ScopeProvider`` doesn't propagate the
+        # binding out -- the access ``return last`` in
+        # ``def use(): return last`` lands with empty referents when
+        # ``last`` was bound by a walrus inside a module-level
+        # comprehension. We patch that gap in ``on_leave`` by routing
+        # any unresolved Name access whose ``.value`` matches a leaked
+        # walrus target back to the corresponding decl.
+        self.walrus_leak_targets: dict[str, list[SymbolNode]] = {}
 
     @property
     def module_node(self) -> SymbolNode:
@@ -391,6 +401,73 @@ class SymbolVisitor(cst.CSTVisitor):
     def visit_AnnAssign(self, node: cst.AnnAssign) -> None:
         self._add_variable(node)
 
+    def visit_NamedExpr(self, node: cst.NamedExpr) -> None:
+        self._add_walrus(node)
+
+    def _walrus_module_scope(self, node: cst.NamedExpr) -> tuple[bool, bool]:
+        """``(at_module, in_comprehension)`` for the walrus's binding scope.
+
+        Per PEP 572, a walrus inside a comprehension binds in the
+        comprehension's enclosing scope, so we ignore comprehension
+        scopes when deciding "at module". The first ``FunctionDef`` /
+        ``Lambda`` / ``ClassDef`` ancestor terminates the walk;
+        reaching ``Module`` without hitting one of those means the
+        binding leaks to the module namespace. The second flag is
+        ``True`` iff the walk passed through any comprehension on the
+        way -- callers use it to decide whether pushing a value frame
+        would steal attribution from the comprehension target's
+        fallback (``Comprehension targets share their enclosing decl's
+        frame, so a walrus's value frame would create spurious
+        last -> result edges in ``[last := n for n in nums]``).
+        """
+        parent_map = cast("dict[cst.CSTNode, cst.CSTNode]", self.metadata[ParentNodeProvider])
+        parent = parent_map.get(node)
+        in_comp = False
+        while parent is not None:
+            if isinstance(parent, (cst.FunctionDef, cst.Lambda, cst.ClassDef)):
+                return False, in_comp
+            if isinstance(parent, (cst.ListComp, cst.SetComp, cst.DictComp, cst.GeneratorExp)):
+                in_comp = True
+            parent = parent_map.get(parent)
+        return True, in_comp
+
+    def _add_walrus(self, node: cst.NamedExpr) -> None:
+        """Surface a module-scope walrus target as a top-level decl.
+
+        Pushes a frame on the target ``Name`` so accesses elsewhere
+        that resolve to the binding via ``ScopeProvider`` find the
+        correct symbol. For walruses outside any comprehension a
+        frame is also pushed on the value subtree so RHS accesses
+        attribute to the walrus decl (mirroring ``_add_variable``).
+        Comprehension-leaked walruses skip the value frame: their
+        for-loop targets fall back to the enclosing decl's frame, and
+        layering the walrus's frame on top would route those fallback
+        edges through the walrus decl instead.
+        """
+        at_module, in_comp = self._walrus_module_scope(node)
+        if not at_module:
+            return
+        if not isinstance(node.target, cst.Name):
+            return
+
+        # Walrus targets in comprehensions don't get a module-scoped
+        # FQN from the provider -- it returns ``mod.<comprehension>.x``
+        # there. Build the module-scoped FQN directly to keep the
+        # decl's identity consistent with what other top-level decls
+        # use.
+        fqname = f"{self.module_node.fqname}.{node.target.value}"
+        pos = self._pos(node.target)
+        sym = SymbolNode(fqname, "variable", self.path, pos)
+        self.symbol_referent_nodes[sym] = node.target
+        self.walrus_leak_targets.setdefault(node.target.value, []).append(sym)
+
+        # Push frames in reverse CST-visit order: the target ``Name`` is
+        # visited before the value, so the value frame goes on first
+        # (popped last). Mirrors the ordering in ``_add_variable``.
+        if not in_comp:
+            self._push_decls(node.value, [sym])
+        self._push_decls(node.target, [sym])
+
     def visit_Import(self, node: cst.Import) -> None:
         self._add_import("", node)
 
@@ -499,6 +576,29 @@ class SymbolVisitor(cst.CSTVisitor):
                         referents = [r for r in referents if id(r.node) in live_ids]
                 for referent in referents:
                     references.add((access, referent))
+
+        # Walrus bindings that leaked from a comprehension don't appear
+        # in the enclosing scope's assignment list (libcst's
+        # ``ScopeProvider`` keeps them in the ``ComprehensionScope``),
+        # so any access to the leaked name lands here with empty
+        # referents. Route those accesses to the matching top-level
+        # walrus decl so the graph mirrors the runtime semantics.
+        if self.walrus_leak_targets:
+            for scope in scopes:
+                for access in scope.accesses:
+                    if not isinstance(access.node, cst.Name):
+                        continue
+                    if any(isinstance(r, Assignment) for r in access.referents):
+                        continue
+                    targets = self.walrus_leak_targets.get(access.node.value)
+                    if not targets:
+                        continue
+                    owner_symbols = self.nearest_decls.get(access.node, [])
+                    access_pos = self._pos(access.node)
+                    for target_symbol in targets:
+                        for owner_symbol in owner_symbols:
+                            if target_symbol != owner_symbol and target_symbol and owner_symbol:
+                                self.internal_edges.add((owner_symbol, target_symbol, access_pos))
 
         for access, referent in references:
             owner_symbols = self.nearest_decls.get(access.node, [])

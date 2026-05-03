@@ -10,6 +10,22 @@ two versions.
 ## [Unreleased]
 
 ### Added
+- PEP 572 walrus (`:=`) bindings at module scope are now surfaced as
+  top-level declarations. `if (Y := src()): ...` registers `mod.Y`
+  with an outgoing edge to whatever `src` resolves to, and downstream
+  references like `def use(): return Y` get a `mod.use -> mod.Y`
+  edge. Walruses leaked from a module-level comprehension (e.g.
+  `result = [last := n for n in nums]`) are also captured: libcst's
+  `ScopeProvider` keeps the binding inside the comprehension scope,
+  so `SymbolVisitor` patches the gap by routing any unresolved Name
+  access whose `.value` matches a leaked walrus target back to the
+  matching decl. The default unreachable-region detector folds
+  walrus bindings the same way it folds `Assign` / `AnnAssign` --
+  `(DEBUG := False)` and `if (DEBUG := False):` both flag dead
+  branches. Walruses inside a function / class / lambda body still
+  bind locally, matching Python's runtime semantics.
+
+### Added
 - `UnreachableRegionDetector`: pluggable Protocol for module-level
   dead-region detection. Implementers provide
   `find_regions(wrapper) -> list[CodeRange]` and a `(name, version)`

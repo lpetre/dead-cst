@@ -112,6 +112,11 @@ def evaluate_truthiness(
                 return None
         return len(node.elements) > 0
 
+    if isinstance(node, cst.NamedExpr):
+        # ``(x := V)`` evaluates to ``V``; the assignment side-effect
+        # doesn't change the expression's runtime value.
+        return evaluate_truthiness(node.value, resolve_expr)
+
     if isinstance(node, cst.UnaryOperation) and isinstance(node.operator, cst.Not):
         inner = evaluate_truthiness(node.expression, resolve_expr)
         return None if inner is None else not inner
@@ -253,7 +258,7 @@ class DefaultUnreachableRegionDetector:
     """
 
     name: str = "default"
-    version: int = 1777795837
+    version: int = 1777800597
 
     def resolve(self, expr: cst.BaseExpression) -> bool | None:
         """Hook for domain-specific constant folding. Default: defer.
