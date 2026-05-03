@@ -25,7 +25,7 @@ from libcst.metadata.scope_provider import (
     Scope,
 )
 
-from ._branches import unreachable_suites
+from ._branches import DefaultUnreachableRegionDetector, UnreachableRegionDetector
 from ._flow import live_at_exit, live_referents
 from ._fqn import FixedFullyQualifiedNameProvider
 from ._plugins._core import UNRESOLVED_PREFIX
@@ -128,10 +128,22 @@ class SymbolVisitor(cst.CSTVisitor):
         path: Path,
         search_paths: list[Path],
         import_resolver: ImportResolver = default_resolve_import,
+        unreachable_detector: UnreachableRegionDetector | None = None,
+        wrapper: cst.MetadataWrapper | None = None,
     ):
         self.path = path
         self.search_paths = search_paths
         self._import_resolver = import_resolver
+        self._unreachable_detector = (
+            unreachable_detector
+            if unreachable_detector is not None
+            else DefaultUnreachableRegionDetector()
+        )
+        # Stash the wrapper that's about to drive ``visit`` so the
+        # unreachable-region detector can reuse the same resolved
+        # metadata cache (notably ``PositionProvider``) instead of
+        # paying O(file) to re-resolve on a sibling wrapper.
+        self._wrapper = wrapper
         self.node_to_frames: dict[cst.CSTNode, list[list[SymbolNode]]] = {}
         self.decl_stack: list[list[SymbolNode]] = []
         self.nearest_decls: dict[cst.CSTNode, list[SymbolNode]] = {}
@@ -151,10 +163,6 @@ class SymbolVisitor(cst.CSTVisitor):
         # descendants of the containing statement, which is what
         # ``live_at_exit`` matches against.
         self.symbol_referent_nodes: dict[SymbolNode, cst.CSTNode] = {}
-        # Positions of every statically-dead suite in this file. The
-        # apply step uses this list to decide which edges land with
-        # ``EdgeFlags.DEAD_BRANCH``; the CLI surfaces them as
-        # "unreachable code at line X" reports.
         self.dead_suites: list[CodeRange] = []
         # Decls displaced by flow analysis. Tracked here (rather than on
         # the trie) so the trie holds only entries cross-module imports
@@ -364,6 +372,12 @@ class SymbolVisitor(cst.CSTVisitor):
         # node after ``on_leave`` has popped the module frame.
         self._module_fqname = sym.fqname
         self._push_decl(node, sym)
+        # Reuse the wrapper that's driving this visit when one was
+        # provided -- it already has ``PositionProvider`` resolved, so
+        # the detector hits the cache. ``unsafe_skip_copy`` is fine for
+        # the fallback path because the detector reads metadata only.
+        wrapper = self._wrapper or cst.MetadataWrapper(node, unsafe_skip_copy=True)
+        self.dead_suites = list(self._unreachable_detector.find_regions(wrapper))
 
     def visit_FunctionDef(self, node: cst.FunctionDef) -> None:
         self._add_decl(node, "function")
@@ -376,27 +390,6 @@ class SymbolVisitor(cst.CSTVisitor):
 
     def visit_AnnAssign(self, node: cst.AnnAssign) -> None:
         self._add_variable(node)
-
-    def visit_If(self, node: cst.If) -> None:
-        self._record_dead_suites(node)
-
-    def visit_While(self, node: cst.While) -> None:
-        self._record_dead_suites(node)
-
-    def _record_dead_suites(self, stmt: cst.BaseStatement) -> None:
-        """Append the position of every statically-dead suite in ``stmt``.
-
-        The apply step (``_apply_payload`` in ``_analyze``) uses this
-        list to decide whether each emitted edge falls inside a dead
-        suite, in which case the edge gets ``EdgeFlags.DEAD_BRANCH``.
-        Nested dead suites are recorded as separate entries; an access
-        is "in a dead suite" if its position falls inside any of them.
-        """
-        for suite in unreachable_suites(stmt):
-            pos = self._pos(suite)
-            if pos is None:
-                continue
-            self.dead_suites.append(pos)
 
     def visit_Import(self, node: cst.Import) -> None:
         self._add_import("", node)
@@ -583,7 +576,9 @@ class SymbolVisitor(cst.CSTVisitor):
         :class:`CodeRange` (the access position) is preserved as-is;
         the apply step in :mod:`dead_cst._analyze` derives the
         :data:`EdgeFlags.DEAD_BRANCH` flag from it by checking
-        containment against :attr:`dead_suites`.
+        containment against :attr:`dead_suites` (populated by the
+        configured :class:`~dead_cst._branches.UnreachableRegionDetector`
+        in :meth:`visit_Module`).
         """
         flag_map: dict[SymbolNode, SymbolNode] = {
             d: dataclasses.replace(d, flags=d.flags | NodeFlags.SHADOWED)

@@ -173,7 +173,9 @@ unreachable = graph.subgraph([n for n in graph.nodes if n not in reachable])
 remove_code(unreachable, root)
 ```
 
-Entrypoint detection is now fully plugin-driven. Builtins:
+All three extension points — edge plugins, path resolvers, and the unreachable-region detector — share a single `Cacheable` protocol (`name: str`, `version: int`) that feeds the per-file cache fingerprint. Bumping a component's epoch `version` invalidates stale payloads automatically, so swapping or upgrading any of them is safe by default.
+
+Entrypoint detection is fully plugin-driven. Builtins:
 
 | Plugin | Purpose |
 |---|---|
@@ -213,6 +215,42 @@ class MyInternalModulesPlugin(LiteralListPlugin):
 Write your own from scratch by implementing the `EdgePlugin` protocol (`name`, `version`, `observe`, `finalize`); register under the `dead_cst.plugins` entry-point group for CLI discovery.
 
 Path resolution is similarly pluggable. `PathResolver` implementations return a `{base: [dep_paths]}` map to feed `build_symbol_graph`. Builtins: `VenvResolver`, `PyprojectResolver`, `UvWorkspaceResolver` (parses `uv.lock` to discover workspace members and their inter-member dep edges). Third-party resolvers register under `dead_cst.resolvers`.
+
+Unreachable-code detection is pluggable through the `UnreachableRegionDetector` protocol. `build_symbol_graph` accepts an `unreachable_detector` whose `find_regions(wrapper) -> list[CodeRange]` is invoked once per file; the built-in `DefaultUnreachableRegionDetector` runs the literal-only truthiness evaluator on every `if` / `while` test. Override it to fold in domain knowledge — e.g. config flags whose values are fixed in production:
+
+```python
+from dataclasses import dataclass
+
+import libcst as cst
+from libcst.metadata import CodeRange, MetadataWrapper, PositionProvider
+from dead_cst import build_symbol_graph
+
+@dataclass(frozen=True)
+class IsProdDetector:
+    # name/version satisfy the Cacheable contract -- bump version when
+    # the detector's logic changes so stale per-file payloads rebuild
+    # automatically.
+    name: str = "is_prod"
+    version: int = 1700000000
+
+    def find_regions(self, wrapper: MetadataWrapper) -> list[CodeRange]:
+        positions = wrapper.resolve(PositionProvider)
+        out: list[CodeRange] = []
+
+        class V(cst.CSTVisitor):
+            def visit_If(self, node):
+                # "settings.IS_PROD is always True" -- mark the else-branch dead.
+                if isinstance(node.test, cst.Name) and node.test.value == "IS_PROD":
+                    if isinstance(node.orelse, cst.Else):
+                        pos = positions.get(node.orelse.body)
+                        if pos is not None:
+                            out.append(pos)
+
+        wrapper.module.visit(V())
+        return out
+
+graph = build_symbol_graph({root: []}, unreachable_detector=IsProdDetector())
+```
 
 ## Graph model
 

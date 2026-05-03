@@ -12,13 +12,24 @@ over those. Anything involving a name lookup (other than the three
 keywords), attribute access, function call, comparison, or other
 dynamic operation returns ``None`` (unknown). Returning ``None`` is
 always the safe default: callers must treat the branch as live.
+
+Module-level unreachable-region detection is exposed as the
+:class:`UnreachableRegionDetector` protocol so downstream consumers
+can fold in domain knowledge -- e.g. config flags whose values are
+fixed in production -- without forking the analyzer.
+:class:`DefaultUnreachableRegionDetector` ships the literal-only
+behavior above and is used when callers don't supply their own.
 """
 
 from __future__ import annotations
 
-from typing import Sequence
+from dataclasses import dataclass
+from typing import Protocol, Sequence, runtime_checkable
 
 import libcst as cst
+from libcst.metadata import CodeRange, MetadataWrapper, PositionProvider
+
+from ._cacheable import Cacheable
 
 
 _KEYWORDS: dict[str, bool] = {
@@ -127,6 +138,63 @@ def unreachable_bodies(stmt: cst.BaseStatement) -> list[Sequence[cst.CSTNode]]:
     ``if False: x = 1``).
     """
     return [suite.body for suite in unreachable_suites(stmt)]
+
+
+@runtime_checkable
+class UnreachableRegionDetector(Cacheable, Protocol):
+    """Finds statically-unreachable source regions in a parsed module.
+
+    Detectors run once per file after the visitor walk; the returned
+    list of :class:`CodeRange` determines which references land
+    flagged with :data:`dead_cst._symbols.EdgeFlags.DEAD_BRANCH` and
+    which positions are surfaced as "unreachable code at line X"
+    reports.
+
+    Pass a custom detector to :func:`dead_cst.build_symbol_graph` to
+    layer on company-specific constant folding (e.g.
+    ``settings.IS_PROD`` is always ``True``). The default,
+    :class:`DefaultUnreachableRegionDetector`, runs literal-only
+    truthiness on every ``if`` / ``while`` test.
+
+    Inherits the ``(name, version)`` contract from :class:`Cacheable`
+    so swapping detectors invalidates stale ``VisitorPayload`` blobs
+    automatically.
+    """
+
+    def find_regions(self, wrapper: MetadataWrapper) -> list[CodeRange]: ...
+
+
+@dataclass(frozen=True)
+class DefaultUnreachableRegionDetector:
+    """Built-in :class:`UnreachableRegionDetector`.
+
+    Walks every ``cst.If`` and ``cst.While`` in the module and runs
+    :func:`unreachable_suites` on each, returning the
+    :class:`CodeRange` of every dead suite in document order.
+    """
+
+    name: str = "default"
+    version: int = 1
+
+    def find_regions(self, wrapper: MetadataWrapper) -> list[CodeRange]:
+        positions = wrapper.resolve(PositionProvider)
+        found: list[CodeRange] = []
+
+        class _Collector(cst.CSTVisitor):
+            def visit_If(self, node: cst.If) -> None:
+                self._collect(node)
+
+            def visit_While(self, node: cst.While) -> None:
+                self._collect(node)
+
+            def _collect(self, stmt: cst.BaseStatement) -> None:
+                for suite in unreachable_suites(stmt):
+                    pos = positions.get(suite)
+                    if pos is not None:
+                        found.append(pos)
+
+        wrapper.module.visit(_Collector())
+        return found
 
 
 def _unreachable_in_if(node: cst.If, branch_taken: bool) -> list[cst.BaseSuite]:

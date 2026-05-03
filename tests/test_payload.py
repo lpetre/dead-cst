@@ -84,7 +84,7 @@ def _payload_from_source(tmp_path: Path, src: str) -> tuple[VisitorPayload, Path
     file.write_text(textwrap.dedent(src).strip() + "\n")
     mgr = FullRepoManager(str(tmp_path), [str(file)], {FixedFullyQualifiedNameProvider})
     wrapper = mgr.get_metadata_wrapper_for_path(str(file))
-    visitor = SymbolVisitor(file, [tmp_path])
+    visitor = SymbolVisitor(file, [tmp_path], wrapper=wrapper)
     wrapper.visit(visitor)
     return visitor.to_payload(), file
 

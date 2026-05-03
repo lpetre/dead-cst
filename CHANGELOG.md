@@ -10,6 +10,24 @@ two versions.
 ## [Unreleased]
 
 ### Added
+- `UnreachableRegionDetector`: pluggable Protocol for module-level
+  dead-region detection. Implementers provide
+  `find_regions(wrapper) -> list[CodeRange]` and a `(name, version)`
+  pair; consumers pass an instance via the new
+  `build_symbol_graph(unreachable_detector=...)` keyword. Lets a
+  company fold domain knowledge (e.g. "`settings.IS_PROD` is always
+  `True` in production") into the analysis without forking the
+  package. The shipped `DefaultUnreachableRegionDetector` preserves
+  existing behavior — literal-only truthiness on `if` / `while`
+  tests. The detector runs from inside `SymbolVisitor.visit_Module`
+  reusing the analyzer's already-resolved `PositionProvider`, so the
+  abstraction is free for the default path.
+- `Cacheable` Protocol (`name: str`, `version: int`): the shared
+  cache-fingerprint contract that `EdgePlugin`, `PathResolver`, and
+  `UnreachableRegionDetector` now all inherit from. Bumping a
+  component's epoch `version` invalidates the per-file cache the same
+  way it does for plugins. `compute_fingerprint` reads the attributes
+  directly instead of falling back to `getattr` defaults.
 - `DecoratedDeclPlugin`: abstract `EdgePlugin` base for the "find decls
   decorated by `@<module>.<name>(...)` or assigned via
   `X = <module>.<ctor>(...)` in files matching a search path" idiom.
@@ -55,6 +73,13 @@ two versions.
   marker for idempotent reuse.
 
 ### Changed
+- `PathResolver` is now a `Cacheable` Protocol: shipped resolvers
+  (`ManualResolver`, `PyprojectResolver`, `UvWorkspaceResolver`,
+  `VenvResolver`) all carry an epoch `version: int` matching the
+  plugin convention, and the per-file cache fingerprint includes
+  each resolver's `(name, version)` pair. Bump a resolver's
+  `version` when its layout-discovery or `resolve_import` logic
+  changes; stale `VisitorPayload` blobs rebuild automatically.
 - `EdgePlugin.version` is now `int` (Unix epoch by convention) rather
   than `str`. Bump `version` to the current epoch on any change to a
   plugin's `observe` shape that should not be served from older

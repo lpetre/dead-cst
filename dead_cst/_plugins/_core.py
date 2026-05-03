@@ -29,6 +29,7 @@ import libcst as cst
 import networkx as nx
 from libcst.metadata import CodePosition, CodeRange
 
+from .._cacheable import Cacheable
 from .._symbols import NodeFlags, SymbolNode, SymbolTrie
 
 if TYPE_CHECKING:
@@ -319,7 +320,7 @@ class ObserveContext:
 
 
 @runtime_checkable
-class EdgePlugin(Protocol):
+class EdgePlugin(Cacheable, Protocol):
     """A plugin that contributes nodes/edges per file plus an optional
     per-base graph-finalize pass.
 
@@ -339,16 +340,10 @@ class EdgePlugin(Protocol):
       that needs the full graph (factory walks, transitive subclass
       closure, ``[project.scripts]`` lookups).
 
-    ``version`` is a Unix epoch int by convention. Bump it (to the
-    current epoch) on any change to the plugin's per-file ``observe``
-    output that shouldn't be served from older caches. Epoch ints
-    merge with ``max()`` semantics: when two branches both bump the
-    same plugin, whichever commit is later wins instead of producing
-    a string-collision conflict like ``"2"`` vs ``"2"``.
+    Inherits the ``(name, version)`` contract from :class:`Cacheable`
+    so the analyzer's per-file cache invalidates when a plugin's
+    ``observe`` output changes (bump the epoch ``version``).
     """
-
-    name: str
-    version: int
 
     def observe(self, ctx: ObserveContext) -> "VisitorPayload | None": ...
 
