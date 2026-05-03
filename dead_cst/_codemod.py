@@ -20,6 +20,7 @@ class RemoveDeadSymbols(cst.CSTTransformer):
         # decls so a shadowed dead binding does not drag its live sibling
         # out with it (and vice versa).
         self.dead_decls = dead_decls
+        self._dead_positions = {pos for _, pos in dead_decls}
 
     def _should_remove(self, node: cst.CSTNode) -> bool:
         fqnames = self.get_metadata(FixedFullyQualifiedNameProvider, node, default=[])
@@ -53,6 +54,17 @@ class RemoveDeadSymbols(cst.CSTTransformer):
 
     def leave_AnnAssign(self, original_node: cst.AnnAssign, updated_node: cst.AnnAssign):
         if self._should_remove(original_node.target):
+            return cst.RemoveFromParent()
+        return updated_node
+
+    def leave_TypeAlias(self, original_node: cst.TypeAlias, updated_node: cst.TypeAlias):
+        # ``FixedFullyQualifiedNameProvider`` does not name-bind ``cst.TypeAlias``,
+        # so ``_should_remove``'s FQN-based lookup misses. Match on position alone:
+        # a top-level decl's ``Name`` position is unique within the file, and this
+        # method only fires on TypeAlias nodes, so cross-shape collisions are not
+        # possible.
+        pos = self.get_metadata(PositionProvider, original_node.name, default=None)
+        if pos in self._dead_positions:
             return cst.RemoveFromParent()
         return updated_node
 
@@ -103,7 +115,7 @@ def remove_code(G: nx.Graph, base: Path) -> None:
         if not node.path.exists():
             continue
         match node.type:
-            case "function" | "class" | "variable" | "import":
+            case "function" | "class" | "variable" | "type_alias" | "import":
                 by_file.setdefault(node.path, []).append(node)
             case "module":
                 node.path.unlink()

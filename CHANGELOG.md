@@ -9,6 +9,18 @@ two versions.
 
 ## [Unreleased]
 
+### Added
+- PEP 695 `type` statements are now tracked. `type Foo = list[int]`
+  surfaces `mod.Foo` as a top-level declaration of kind `"type_alias"`,
+  and refs in the RHS are attributed to the alias so removing a dead
+  alias releases its references rather than holding them through the
+  enclosing module. The generic form (`type Pair[T] = tuple[T, T]`)
+  is captured the same way. Cross-module users of the alias (e.g.
+  `def f(x: Foo) -> Foo`) get a normal edge into the alias decl.
+  `dead-cst remove` deletes unreachable aliases through a new
+  `leave_TypeAlias` pass on `RemoveDeadSymbols`. Bumps
+  `SymbolVisitor.version` to invalidate cached payloads.
+
 ## [0.3.0] - 2026-05-03
 
 ### Added

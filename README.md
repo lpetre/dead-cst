@@ -274,7 +274,6 @@ A module-level `import` / `from ... import ...` is itself a declaration of type 
 - `import *` is treated pessimistically: every top-level declaration in the target module is considered used by the importing module.
 - Dynamic attribute access (`getattr`) and runtime-generated symbols are invisible to static analysis.
 - Only first-party code is analysed; third-party dependencies are treated as opaque (they appear as synthetic nodes — see `dead-cst dependencies`).
-- PEP 695 `type` statements are not tracked.
 - `__all__` is followed only when assigned a list/tuple of string literals; dynamic mutation (`__all__.append`, comprehensions, etc.) is not tracked.
 - PEP 750 template strings (`t"..."`, 3.14+) cannot be parsed by the pinned `libcst`, so any file containing one aborts the analysis with a `ParserSyntaxError`.
 

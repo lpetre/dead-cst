@@ -15,16 +15,6 @@ import pytest
     "files, expected_edges",
     [
         # ------------------------------------------------------------------
-        # Assignment patterns the visitor cannot fully unpack
-        # ------------------------------------------------------------------
-        pytest.param(
-            {"mod.py": "type T = int\n"},
-            # PEP 695 ``type`` statements are ignored, so the alias
-            # never appears in the graph.
-            set(),
-            id="pep-695-type-statement-not-captured",
-        ),
-        # ------------------------------------------------------------------
         # Dynamic / runtime features
         # ------------------------------------------------------------------
         pytest.param(

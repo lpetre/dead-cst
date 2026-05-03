@@ -97,9 +97,9 @@ undiscovered. A short Sphinx site with one tutorial each ("write a custom
 that's already built. The docstring pass already in place gives the API
 reference for free.
 
-### 9. PEP 695 `type` statements and `del` modeling
+### 9. `del` modeling
 
-Documented limitations in `tests/test_limitations.py`. Low real-world impact;
+Documented limitation in `tests/test_limitations.py`. Low real-world impact;
 tackle once Tier 1–2 has shipped and the protocol surface is stable.
 
 ---
@@ -119,6 +119,12 @@ demand.
 
 Folded down from earlier tiers as they landed:
 
+- PEP 695 `type` statements: `type Foo = list[int]` (and the generic
+  `type Pair[T] = tuple[T, T]` form) now surface as top-level
+  `"type_alias"` decls. RHS references attribute to the alias, so
+  removing a dead alias releases its references; users that reference
+  the alias get an edge into it. The codemod's `RemoveDeadSymbols`
+  pass deletes unreachable aliases.
 - SQLite-cached graph with partial rebuilds: `GraphCache` stores
   pickled `VisitorPayload` blobs keyed by per-file content hash under
   `<root>/.dead-cst-cache/cache.db`. Cache hits skip the per-file
