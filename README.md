@@ -61,6 +61,7 @@ dead-cst analyze ROOT -e ENTRYPOINT [OPTIONS]
 | `--format` | Output format: `text` or `json` |
 | `-v, --verbose` | Enable verbose logging |
 | `--no-cache` | Bypass the per-file `VisitorPayload` cache |
+| `-j, --workers` | Run cache-miss visitor passes in this many worker processes (`>=2` enables it) |
 
 Exit code 1 if dead code is found, 0 otherwise.
 
@@ -79,6 +80,7 @@ dead-cst why-alive ROOT FQNAME [OPTIONS]
 | `--plugin` | Edge plugin to run, e.g. `main_block`, `project_scripts` (repeatable) |
 | `-v, --verbose` | Enable verbose logging |
 | `--no-cache` | Bypass the per-file `VisitorPayload` cache |
+| `-j, --workers` | Run cache-miss visitor passes in this many worker processes (`>=2` enables it) |
 
 ### `dead-cst unused-exports`
 
@@ -96,6 +98,7 @@ dead-cst unused-exports ROOT -e ENTRYPOINT [OPTIONS]
 | `--plugin` | Edge plugin to run, e.g. `main_block`, `project_scripts` (repeatable) |
 | `-v, --verbose` | Enable verbose logging |
 | `--no-cache` | Bypass the per-file `VisitorPayload` cache |
+| `-j, --workers` | Run cache-miss visitor passes in this many worker processes (`>=2` enables it) |
 
 ### `dead-cst dependencies`
 
@@ -115,6 +118,7 @@ dead-cst dependencies ROOT [OPTIONS]
 | `--format` | Output format: `text` or `json` |
 | `-v, --verbose` | Enable verbose logging |
 | `--no-cache` | Bypass the per-file `VisitorPayload` cache |
+| `-j, --workers` | Run cache-miss visitor passes in this many worker processes (`>=2` enables it) |
 
 ### `dead-cst remove`
 
@@ -133,6 +137,7 @@ dead-cst remove ROOT -e ENTRYPOINT [OPTIONS]
 | `-v, --verbose` | Enable verbose logging |
 | `--dry-run` | Show what would be removed without making changes |
 | `--no-cache` | Bypass the per-file `VisitorPayload` cache |
+| `-j, --workers` | Run cache-miss visitor passes in this many worker processes (`>=2` enables it) |
 
 ### `dead-cst cache clear`
 
