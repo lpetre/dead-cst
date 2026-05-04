@@ -187,6 +187,14 @@ def analyze(
     no_cache: Annotated[
         bool, typer.Option("--no-cache", help="Bypass the per-file VisitorPayload cache.")
     ] = False,
+    workers: Annotated[
+        int | None,
+        typer.Option(
+            "--workers",
+            "-j",
+            help="Run cache-miss visitor passes in this many worker processes (>=2 enables it).",
+        ),
+    ] = None,
 ) -> None:
     """Analyze a Python codebase for dead code."""
     setup_logging(verbose)
@@ -206,6 +214,7 @@ def analyze(
             resolvers=resolvers,
             project_root=root,
             cache=cache,
+            workers=workers,
         )
     reachable = find_reachable(graph)
 
@@ -359,6 +368,14 @@ def why_alive(
     no_cache: Annotated[
         bool, typer.Option("--no-cache", help="Bypass the per-file VisitorPayload cache.")
     ] = False,
+    workers: Annotated[
+        int | None,
+        typer.Option(
+            "--workers",
+            "-j",
+            help="Run cache-miss visitor passes in this many worker processes (>=2 enables it).",
+        ),
+    ] = None,
 ) -> None:
     """Show why a symbol is considered alive (reachable)."""
     setup_logging(verbose)
@@ -378,6 +395,7 @@ def why_alive(
             resolvers=resolvers,
             project_root=root,
             cache=cache,
+            workers=workers,
         )
 
     target_node: SymbolNode | None = None
@@ -434,6 +452,14 @@ def dependencies(
     no_cache: Annotated[
         bool, typer.Option("--no-cache", help="Bypass the per-file VisitorPayload cache.")
     ] = False,
+    workers: Annotated[
+        int | None,
+        typer.Option(
+            "--workers",
+            "-j",
+            help="Run cache-miss visitor passes in this many worker processes (>=2 enables it).",
+        ),
+    ] = None,
 ) -> None:
     """List third-party dependencies imported by the codebase."""
     setup_logging(verbose)
@@ -448,6 +474,7 @@ def dependencies(
             resolvers=resolvers,
             project_root=root,
             cache=cache,
+            workers=workers,
         )
 
     deps_by_base: dict[Path, list[SymbolNode]] = {base: [] for base in order_paths(paths_dict)}
@@ -502,6 +529,14 @@ def unused_exports(
     no_cache: Annotated[
         bool, typer.Option("--no-cache", help="Bypass the per-file VisitorPayload cache.")
     ] = False,
+    workers: Annotated[
+        int | None,
+        typer.Option(
+            "--workers",
+            "-j",
+            help="Run cache-miss visitor passes in this many worker processes (>=2 enables it).",
+        ),
+    ] = None,
 ) -> None:
     """Report __all__ entries whose targets are only alive because of __all__."""
     setup_logging(verbose)
@@ -521,6 +556,7 @@ def unused_exports(
             resolvers=resolvers,
             project_root=root,
             cache=cache,
+            workers=workers,
         )
     reachable = find_reachable(graph)
 
@@ -589,6 +625,14 @@ def remove(
     no_cache: Annotated[
         bool, typer.Option("--no-cache", help="Bypass the per-file VisitorPayload cache.")
     ] = False,
+    workers: Annotated[
+        int | None,
+        typer.Option(
+            "--workers",
+            "-j",
+            help="Run cache-miss visitor passes in this many worker processes (>=2 enables it).",
+        ),
+    ] = None,
 ) -> None:
     """Remove dead code from a Python codebase."""
     setup_logging(verbose)
@@ -608,6 +652,7 @@ def remove(
             resolvers=resolvers,
             project_root=root,
             cache=cache,
+            workers=workers,
         )
     reachable = find_reachable(graph)
 

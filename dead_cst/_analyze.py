@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import logging
+import sys
+from concurrent.futures import ProcessPoolExecutor
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Sequence
 
@@ -87,6 +90,7 @@ def build_symbol_graph(
     project_root: Path | None = None,
     cache: GraphCache | None = None,
     unreachable_detector: UnreachableRegionDetector | None = None,
+    workers: int | None = None,
 ) -> nx.MultiDiGraph:
     """Build a directed reachability graph of every top-level symbol under ``paths``.
 
@@ -155,6 +159,16 @@ def build_symbol_graph(
         :class:`CodeRange` list feeds :data:`EdgeFlags.DEAD_BRANCH`
         derivation and the per-file ``graph.graph["dead_suites"]``
         reporting map.
+    workers:
+        When set to an integer ``>= 2``, the per-file visitor + observe
+        passes for cache-miss files are dispatched to a
+        :class:`~concurrent.futures.ProcessPoolExecutor`. Workers
+        return :class:`VisitorPayload` objects to the main process,
+        which still owns the SQLite cache write and the trie-stitching
+        / edge-resolution stages. ``None`` (default) and ``1`` keep
+        the serial path. A fresh pool is built per base so each
+        worker's ``sys.path`` and ``FullRepoManager`` match the base
+        being processed; cache-warm bases never spin one up.
 
     Returns
     -------
@@ -189,35 +203,33 @@ def build_symbol_graph(
             export_roots = exported_roots(base)
             import_edges: set[tuple[SymbolNode, Import, EdgeFlags]] = set()
             files = list(sorted(base.rglob("*.py")))
-            # Lazily constructed on the first cache miss; an all-cached
-            # base never builds the manager, since FQN metadata is only
-            # needed when running the visitor.
-            mgr: FullRepoManager | None = None
+            hits: dict[Path, VisitorPayload] = {}
+            miss_files: list[Path] = []
             for file in files:
                 payload = cache.get(file) if cache is not None else None
                 if payload is None:
-                    if mgr is None:
-                        mgr = FullRepoManager(
-                            str(base),
-                            [str(f) for f in files],
-                            {FixedFullyQualifiedNameProvider},
-                        )
-                    wrapper = mgr.get_metadata_wrapper_for_path(str(file))
-                    visitor = SymbolVisitor(
-                        file,
-                        search_paths,
-                        import_resolver,
-                        unreachable_detector=detector,
-                        wrapper=wrapper,
-                    )
-                    wrapper.visit(visitor)
-                    base_payload = visitor.to_payload()
-                    plugin_payload = _run_observe(
-                        plugins, file, wrapper.module, base_payload, base, root
-                    )
-                    payload = _merge_payloads(base_payload, plugin_payload)
-                    if cache is not None:
-                        cache.put(file, payload)
+                    miss_files.append(file)
+                else:
+                    hits[file] = payload
+
+            miss_payloads = _compute_miss_payloads(
+                miss_files=miss_files,
+                files=files,
+                base=base,
+                search_paths=search_paths,
+                project_root=root,
+                import_resolver=import_resolver,
+                detector=detector,
+                plugins=plugins,
+                resolvers=resolvers,
+                cache=cache,
+                workers=workers,
+            )
+
+            for file in files:
+                payload = hits.get(file)
+                if payload is None:
+                    payload = miss_payloads[file]
                 # A file's decls go into ``export_trie`` only when the file
                 # lives under one of ``base``'s exported dirs (or when the
                 # base has no export restriction). This is what hides
@@ -307,6 +319,217 @@ def _run_observe(
         if contribution is not None:
             payloads.append(contribution)
     return _merge_payloads(*payloads) if payloads else make_payload()
+
+
+def _process_one_file(
+    file: Path,
+    *,
+    mgr: FullRepoManager,
+    search_paths: list[Path],
+    import_resolver: ImportResolver,
+    detector: UnreachableRegionDetector,
+    plugins: Sequence[EdgePlugin],
+    base: Path,
+    project_root: Path,
+) -> VisitorPayload:
+    """Run the visitor + observe pass for a single file and return its payload.
+
+    Shared by the serial path inside :func:`build_symbol_graph` and the
+    worker entry point used when ``workers >= 2``. The caller owns the
+    :class:`FullRepoManager` so it can be reused across files in the
+    same base (the FQN cache is precomputed per base) and so workers
+    don't rebuild it on every task.
+    """
+    wrapper = mgr.get_metadata_wrapper_for_path(str(file))
+    visitor = SymbolVisitor(
+        file,
+        search_paths,
+        import_resolver,
+        unreachable_detector=detector,
+        wrapper=wrapper,
+    )
+    wrapper.visit(visitor)
+    base_payload = visitor.to_payload()
+    plugin_payload = _run_observe(plugins, file, wrapper.module, base_payload, base, project_root)
+    return _merge_payloads(base_payload, plugin_payload)
+
+
+@dataclass(frozen=True)
+class _WorkerInit:
+    """Per-base bundle of state shipped to each :class:`ProcessPoolExecutor` worker.
+
+    Captures everything a worker needs to reproduce the parent's
+    visitor environment: the base + search paths (for ``sys.path`` and
+    ``FullRepoManager`` construction), the full file list (FQN gen
+    cache spans every file in the base), the resolver chain (rebuilt
+    via :func:`_chain_resolvers` inside the worker since the resolver
+    closure isn't picklable), the detector, the plugin list, and the
+    project root used by ``_run_observe``. Frozen so misuse from a
+    worker can't leak state back into queued tasks.
+    """
+
+    base: Path
+    search_paths: tuple[Path, ...]
+    files: tuple[Path, ...]
+    detector: UnreachableRegionDetector
+    plugins: tuple[EdgePlugin, ...]
+    resolvers: tuple[PathResolver, ...]
+    project_root: Path
+
+
+@dataclass
+class _WorkerCtx:
+    """Per-worker mutable state populated by :func:`_init_worker`.
+
+    ``mgr`` is built lazily on the first task so workers that never
+    receive one don't pay the construction cost; the first task in a
+    worker pays it once and subsequent tasks reuse the same FQN cache.
+    """
+
+    init: _WorkerInit
+    import_resolver: ImportResolver
+    mgr: FullRepoManager | None = field(default=None)
+
+
+_worker_ctx: _WorkerCtx | None = None
+
+
+def _init_worker(init: _WorkerInit) -> None:
+    """Pool initializer: prime ``sys.path``, the resolver chain, and worker globals.
+
+    Adds ``init.search_paths`` to ``sys.path`` so
+    :func:`default_resolve_import` finds first-party modules under the
+    current base. Clears :func:`safe_resolve_module`'s LRU cache for
+    the same hygiene the parent does between bases. Rebuilds the
+    resolver chain locally because :func:`_chain_resolvers` returns a
+    closure (not picklable across processes); the ``PathResolver``
+    instances themselves are picklable dataclasses and travel via
+    ``init``.
+    """
+    global _worker_ctx
+    seen = set(sys.path)
+    for p in init.search_paths:
+        s = str(p)
+        if s not in seen:
+            sys.path.insert(0, s)
+    safe_resolve_module.cache_clear()
+    _worker_ctx = _WorkerCtx(
+        init=init,
+        import_resolver=_chain_resolvers(init.resolvers),
+    )
+
+
+def _worker_process_file(file: Path) -> tuple[Path, VisitorPayload]:
+    """Pool task: run :func:`_process_one_file` for ``file`` against worker state.
+
+    Returns ``(file, payload)`` so :meth:`Executor.map` results can be
+    matched back to inputs without relying on submission order.
+    Constructs the per-worker :class:`FullRepoManager` lazily on first
+    use; subsequent tasks in the same worker reuse it.
+    """
+    ctx = _worker_ctx
+    assert ctx is not None, "_init_worker must run before _worker_process_file"
+    if ctx.mgr is None:
+        ctx.mgr = FullRepoManager(
+            str(ctx.init.base),
+            [str(f) for f in ctx.init.files],
+            {FixedFullyQualifiedNameProvider},
+        )
+    payload = _process_one_file(
+        file,
+        mgr=ctx.mgr,
+        search_paths=list(ctx.init.search_paths),
+        import_resolver=ctx.import_resolver,
+        detector=ctx.init.detector,
+        plugins=ctx.init.plugins,
+        base=ctx.init.base,
+        project_root=ctx.init.project_root,
+    )
+    return file, payload
+
+
+def _compute_miss_payloads(
+    *,
+    miss_files: list[Path],
+    files: list[Path],
+    base: Path,
+    search_paths: list[Path],
+    project_root: Path,
+    import_resolver: ImportResolver,
+    detector: UnreachableRegionDetector,
+    plugins: Sequence[EdgePlugin],
+    resolvers: Sequence[PathResolver],
+    cache: GraphCache | None,
+    workers: int | None,
+) -> dict[Path, VisitorPayload]:
+    """Run visitor + observe for every cache-miss file in a base.
+
+    Splits on the ``workers`` knob:
+
+    * ``None`` / ``1`` / ``len(miss_files) < 2`` -- serial path. Builds
+      one :class:`FullRepoManager` for the base and reuses it across
+      every miss.
+    * ``>= 2`` with at least two misses -- spawns a
+      :class:`ProcessPoolExecutor` keyed to this base.
+      :func:`_init_worker` ships the resolver chain + detector +
+      plugins to each worker, which build their own
+      ``FullRepoManager`` on first task. The pool is capped at
+      ``min(workers, len(miss_files))`` so a small batch doesn't
+      over-provision processes.
+
+    Cache writes happen on the main process as each payload arrives,
+    so a partial run still warms the cache for files that completed.
+    Iteration order matches ``miss_files`` (sorted) for determinism.
+    """
+    if not miss_files:
+        return {}
+
+    use_pool = workers is not None and workers >= 2 and len(miss_files) >= 2
+    miss_payloads: dict[Path, VisitorPayload] = {}
+
+    if not use_pool:
+        mgr = FullRepoManager(
+            str(base),
+            [str(f) for f in files],
+            {FixedFullyQualifiedNameProvider},
+        )
+        for file in miss_files:
+            payload = _process_one_file(
+                file,
+                mgr=mgr,
+                search_paths=search_paths,
+                import_resolver=import_resolver,
+                detector=detector,
+                plugins=plugins,
+                base=base,
+                project_root=project_root,
+            )
+            miss_payloads[file] = payload
+            if cache is not None:
+                cache.put(file, payload)
+        return miss_payloads
+
+    init = _WorkerInit(
+        base=base,
+        search_paths=tuple(search_paths),
+        files=tuple(files),
+        detector=detector,
+        plugins=tuple(plugins),
+        resolvers=tuple(resolvers),
+        project_root=project_root,
+    )
+    assert workers is not None
+    max_workers = min(workers, len(miss_files))
+    with ProcessPoolExecutor(
+        max_workers=max_workers,
+        initializer=_init_worker,
+        initargs=(init,),
+    ) as pool:
+        for file, payload in pool.map(_worker_process_file, miss_files):
+            miss_payloads[file] = payload
+            if cache is not None:
+                cache.put(file, payload)
+    return miss_payloads
 
 
 def _merge_payloads(*payloads: VisitorPayload) -> VisitorPayload:

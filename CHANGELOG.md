@@ -9,6 +9,18 @@ two versions.
 
 ## [Unreleased]
 
+### Added
+- `build_symbol_graph(workers=N)` (and matching `--workers` / `-j` CLI
+  flag) dispatches per-file visitor + observe passes to a
+  `ProcessPoolExecutor` when at least two cache-miss files exist in a
+  base. Workers return `VisitorPayload` blobs to the main process,
+  which still owns SQLite cache writes, trie stitching, and edge
+  resolution; serial behaviour and graph output are unchanged. A
+  fresh pool spins up per base so each worker's `sys.path` and
+  `FullRepoManager` match the base being processed, and cache-warm
+  bases never start one. `workers=None` (default) and `workers=1`
+  keep the existing serial path.
+
 ## [0.4.0] - 2026-05-03
 
 ### Added
