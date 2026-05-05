@@ -265,6 +265,34 @@ def test_default_resolve_import_editable_dist_outside_search_paths(tmp_path: Pat
     assert result == "[external dist] dead-cst"
 
 
+def test_default_resolve_import_first_party_wins_over_editable_root(tmp_path: Path):
+    """Regression: a first-party path that happens to nest under an editable
+    distribution's source root must classify as first-party, not as that
+    dist. Reproduces the e2e flux0 failure where ``.pytest_cache/d/e2e-clones/``
+    sat under the editable ``dead-cst`` root and every cloned module
+    misclassified as ``[external dist] dead-cst``."""
+    editable_root = tmp_path / "host"
+    project_src = editable_root / "fixtures" / "clones" / "pkg" / "src"
+    init_py = project_src / "myproj" / "__init__.py"
+    init_py.parent.mkdir(parents=True)
+    init_py.write_text("")
+
+    spec = _make_spec("myproj", str(init_py))
+
+    with patch.object(_imports, "STDLIB", tmp_path / "stdlib"):
+        with patch.object(_imports, "PURELIB", None):
+            with patch.object(_imports, "PLATLIB", None):
+                with patch.object(_imports, "safe_resolve_module", return_value=spec):
+                    with patch.object(_imports, "distribution_lookup", return_value={}):
+                        with patch.object(
+                            _imports,
+                            "editable_distribution_roots",
+                            return_value=((editable_root.resolve(), "host-pkg"),),
+                        ):
+                            result = default_resolve_import("myproj", [project_src])
+    assert result == init_py.resolve()
+
+
 def test_default_resolve_import_first_party_still_returns_path(tmp_path: Path):
     """Regression: the reordered checks must not steal first-party files
     that happen to live near common install roots."""

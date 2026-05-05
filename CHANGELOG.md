@@ -83,6 +83,14 @@ two versions.
   shipping resolvers (`venv`, `pyproject`, `uv_workspace`,
   `manual`) bump their `version` so cached `VisitorPayload` blobs
   rebuild against the corrected classification.
+- First-party search paths now win over editable distribution roots
+  in `default_resolve_import`. Previously a project whose source
+  happened to live inside another editable install's root (e.g. an
+  e2e fixture cloned into `.pytest_cache/` of an editable
+  `dead-cst` checkout) had every first-party file misclassified as
+  `[external dist] <host-pkg>`, severing cross-module edges and
+  reporting the entire surface as dead. The four shipping resolvers
+  bump their `version` again so cached payloads rebuild.
 
 ## [0.4.0] - 2026-05-03
 

@@ -280,9 +280,6 @@ def default_resolve_import(name: str, search_paths: list[Path]) -> str | Path | 
     # their distribution rather than swallowed into ``[stdlib]``.
     if dist := distribution_lookup().get(path):
         return f"{EXTERNAL_DIST_PREFIX}{dist}"
-    for root, dist in editable_distribution_roots():
-        if path.is_relative_to(root):
-            return f"{EXTERNAL_DIST_PREFIX}{dist}"
 
     if _is_stdlib_path(path):
         return f"{STDLIB_PREFIX}{name}"
@@ -290,7 +287,20 @@ def default_resolve_import(name: str, search_paths: list[Path]) -> str | Path | 
     if _is_site_packages_path(path):
         return f"{EXTERNAL_FILE_PREFIX}{name}"
 
+    # First-party wins over editable-dist matching: the project being
+    # analyzed may itself live under another editable install's root
+    # (e.g. an e2e fixture clones a third-party repo into
+    # ``.pytest_cache/`` inside an editable ``dead-cst`` checkout). Those
+    # files are first-party for the run, not third-party. ``stdlib`` /
+    # ``site-packages`` still win above because those are
+    # interpreter-blessed locations and shouldn't appear in a
+    # user-configured ``search_paths``.
     for search in search_paths:
         if path.is_relative_to(search):
             return path
+
+    for root, dist in editable_distribution_roots():
+        if path.is_relative_to(root):
+            return f"{EXTERNAL_DIST_PREFIX}{dist}"
+
     raise Exception(f"Module {name} resolved to an unexpected path: {path}")
