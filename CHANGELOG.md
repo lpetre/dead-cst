@@ -21,16 +21,27 @@ two versions.
   contiguous miss runs from the same base; on each transition the
   worker rebinds `sys.path` and clears `safe_resolve_module` plus
   `distribution_lookup` so cross-venv uv-workspace members don't
-  inherit a sibling base's resolution state. `workers=None`
-  (default) and `workers=1` keep the existing serial path.
+  inherit a sibling base's resolution state. The FQN provider's
+  per-base cache is now built once in the parent over miss files
+  only and shipped per-task to workers, so workers no longer rebuild
+  a `FullRepoManager` and the analyzer skips FQN computation for
+  cache-hit files entirely. `workers=None` (default) and
+  `workers=1` keep the in-process path.
 
 ### Changed
-- `build_symbol_graph` is now structured as three phases: collect
-  per-base specs (cache hits + miss files), compute every miss
-  payload (serial or parallel), then per-base apply + edge stitch +
-  plugin finalize. The graph and cache contents are unchanged; the
-  rearrangement makes the parallel path tractable and removes
-  `temp_sys_path` from the main process loop in parallel mode.
+- `build_symbol_graph` runs as three phases: collect per-base specs
+  (cache hits + miss files + per-base FQN cache), compute every miss
+  payload (in-process or via the pool), then per-base apply + edge
+  stitch + plugin finalize. The graph and cache contents are
+  unchanged. The in-process and worker paths share a single
+  `_process_task` body — the only difference is whether the runner
+  state lives on the main process or in worker globals.
+
+### Removed
+- The internal `temp_sys_path` context manager
+  (`dead_cst._resolvers._imports`). The runner now manages
+  `sys.path` directly, restoring it from a baseline snapshot when
+  the in-process path finishes. Not part of the public API.
 
 ## [0.4.0] - 2026-05-03
 
