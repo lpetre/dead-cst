@@ -517,7 +517,7 @@ class SymbolVisitor(cst.CSTVisitor):
         if not node.args:
             return
         raw = self._string_literal_value(node.args[0].value)
-        if raw is None or not raw:
+        if not raw:
             logger.warning(
                 "Skipping dynamic import '%s(...)' in %s: name is not a string literal",
                 callee,
@@ -531,7 +531,12 @@ class SymbolVisitor(cst.CSTVisitor):
         if callee == "__import__":
             self._handle_dunder_import_fromlist(node, module)
 
-    def _resolve_dynamic_import_name(self, raw: str, callee: str, node: cst.Call) -> str | None:
+    def _resolve_dynamic_import_name(
+        self,
+        raw: str,
+        callee: Literal["__import__", "importlib.import_module"],
+        node: cst.Call,
+    ) -> str | None:
         """Resolve a dynamic-import name to an absolute module path.
 
         ``importlib.import_module`` encodes relativity as leading dots
@@ -569,9 +574,7 @@ class SymbolVisitor(cst.CSTVisitor):
             return raw
         package_expr = self._call_arg(node, position=1, keyword="package")
         package: str | None = None
-        if package_expr is not None and not (
-            isinstance(package_expr, cst.Name) and package_expr.value == "None"
-        ):
+        if package_expr is not None and not self._is_none_literal(package_expr):
             package = self._string_literal_value(package_expr)
             if package is None:
                 logger.warning(
@@ -585,10 +588,7 @@ class SymbolVisitor(cst.CSTVisitor):
 
     def _resolve_relative_name(self, name: str, package: str | None) -> str | None:
         if package is None:
-            if self.path.name == "__init__.py":
-                package = self.module_node.fqname
-            else:
-                package = self.module_node.fqname.rpartition(".")[0]
+            package = self._current_package()
         try:
             return resolve_name(name, package)
         except (ImportError, ValueError):
@@ -599,6 +599,16 @@ class SymbolVisitor(cst.CSTVisitor):
                 package,
             )
             return None
+
+    def _current_package(self) -> str:
+        """Package the current file resolves relative imports against.
+
+        ``__init__.py`` *is* its own package; everything else uses the
+        parent package.
+        """
+        if self.path.name == "__init__.py":
+            return self.module_node.fqname
+        return self.module_node.fqname.rpartition(".")[0]
 
     @staticmethod
     def _string_literal_value(arg: cst.BaseExpression) -> str | None:
@@ -615,9 +625,13 @@ class SymbolVisitor(cst.CSTVisitor):
         if not isinstance(arg, cst.Integer):
             return None
         try:
-            return int(arg.evaluated_value)
-        except (TypeError, ValueError):
+            return arg.evaluated_value
+        except ValueError:
             return None
+
+    @staticmethod
+    def _is_none_literal(arg: cst.BaseExpression) -> bool:
+        return isinstance(arg, cst.Name) and arg.value == "None"
 
     def _handle_dunder_import_fromlist(self, node: cst.Call, module: str) -> None:
         fromlist_expr = self._call_arg(node, position=3, keyword="fromlist")
@@ -641,7 +655,9 @@ class SymbolVisitor(cst.CSTVisitor):
                 self._add_star_import(submod, access_pos)
 
     @staticmethod
-    def _dynamic_import_call_name(func: cst.BaseExpression) -> str | None:
+    def _dynamic_import_call_name(
+        func: cst.BaseExpression,
+    ) -> Literal["__import__", "importlib.import_module"] | None:
         if isinstance(func, cst.Name) and func.value == "__import__":
             return "__import__"
         if (
@@ -670,13 +686,8 @@ class SymbolVisitor(cst.CSTVisitor):
             module = get_full_name_for_node(node.module) or ""
 
         if node.relative:
-            if self.path.name == "__init__.py":
-                current_package = self.module_node.fqname
-            else:
-                current_package = self.module_node.fqname.rpartition(".")[0]
-
             prefix = "." * len(node.relative)
-            module = resolve_name(f"{prefix}{module}", current_package)
+            module = resolve_name(f"{prefix}{module}", self._current_package())
 
         if isinstance(node.names, cst.ImportStar):
             self._add_star_import(module, self._pos(node))
