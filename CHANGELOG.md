@@ -9,6 +9,16 @@ two versions.
 
 ## [Unreleased]
 
+### Removed
+- `PluginContext.prime_module`, the public method for inserting an
+  already-parsed `cst.Module` into the request-scope `parse` memo.
+  The analyzer never called it (warm cache hits skip parsing entirely
+  and the visitor's parsed module is consumed in-process), so it was
+  dead code in the public surface. Plugins that need a `cst.Module`
+  during `observe` already get it for free as `ObserveContext.module`;
+  during `finalize` they go through `ctx.parse(path)` and that path
+  still memoizes within the analysis.
+
 ### Changed
 - `PluginContext`, `ObserveContext`, and the `AddNode` / `AddEdge` /
   `RemoveEdge` graph-op value objects now use `__slots__`, as do the

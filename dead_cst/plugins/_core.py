@@ -220,10 +220,6 @@ class PluginContext:
         self._modules[path] = module
         return module
 
-    def prime_module(self, path: Path, module: cst.Module) -> None:
-        """Record an already-parsed module so :meth:`parse` skips re-parsing."""
-        self._modules[path] = module
-
     def _synthetic(self, fqname: str) -> SymbolNode | None:
         if self._synthetic_index is None:
             self._synthetic_index = {n.fqname: n for n in self.graph.nodes if n.type == "synthetic"}

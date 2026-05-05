@@ -15,27 +15,16 @@ from dead_cst.plugins import GraphOp, ObserveContext, PluginContext
 from dead_cst.graph import SymbolTrie
 
 
-def _ctx(tmp_path, modules=None):
+def _ctx(tmp_path):
     return PluginContext(
         graph=nx.DiGraph(),
         symbol_lookup=SymbolTrie(),
         base=tmp_path,
         project_root=tmp_path,
-        _modules=dict(modules or {}),
     )
 
 
-def test_parse_uses_primed_module(tmp_path):
-    p = tmp_path / "a.py"
-    p.write_text("def f(): pass\n")
-    sentinel = cst.parse_module("def sentinel(): pass\n")
-    ctx = _ctx(tmp_path)
-    ctx.prime_module(p, sentinel)
-    # Disk content differs, but the primed module wins.
-    assert ctx.parse(p) is sentinel
-
-
-def test_parse_lazily_reads_unprimed_path(tmp_path):
+def test_parse_memoizes_within_a_pass(tmp_path):
     p = tmp_path / "a.py"
     p.write_text("def f(): pass\n")
     ctx = _ctx(tmp_path)
