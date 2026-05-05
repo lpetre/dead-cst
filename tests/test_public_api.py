@@ -22,10 +22,12 @@ import pytest
 
 EXPECTED_PUBLIC_API: dict[str, list[str]] = {
     "dead_cst": [
+        "Analysis",
         "Cacheable",
         "EdgeFlags",
         "Import",
         "NodeFlags",
+        "PackageView",
         "SymbolNode",
         "__version__",
         "build_symbol_graph",
@@ -36,6 +38,8 @@ EXPECTED_PUBLIC_API: dict[str, list[str]] = {
         "remove_code",
     ],
     "dead_cst.analyze": [
+        "Analysis",
+        "PackageView",
         "build_symbol_graph",
         "count_nodes",
         "find_kept_alive_by_dead_branches",

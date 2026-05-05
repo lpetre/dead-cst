@@ -22,6 +22,10 @@ from dead_cst.cache import (
 )
 
 
+def _fp(base: Path) -> str:
+    return compute_fingerprint(base=base, search_paths=(base,), resolvers=[])
+
+
 def _write(root: Path, files: dict[str, str]) -> None:
     for rel, src in files.items():
         p = root / rel
@@ -81,19 +85,17 @@ def test_parallel_warms_cache(tmp_path):
     """Parallel runs write payloads to the cache so a follow-up run skips workers."""
     _write(tmp_path, _multi_file_layout())
     db = tmp_path / CACHE_DIR_NAME / "cache.db"
-    fp = compute_fingerprint(paths={tmp_path: []}, resolvers=[])
+    fp = _fp(tmp_path)
 
-    with GraphCache(db, fingerprint=fp) as cache:
+    with GraphCache(db) as cache:
         cold = build_symbol_graph({tmp_path: []}, cache=cache, workers=2)
 
-    # Every .py file under tmp_path should now be cached.
     files = sorted(tmp_path.rglob("*.py"))
-    with GraphCache(db, fingerprint=fp) as cache:
+    with GraphCache(db) as cache:
         for f in files:
-            assert cache.get(f) is not None, f"{f} missing from cache after parallel run"
+            assert cache.get(f, fp) is not None, f"{f} missing from cache after parallel run"
 
-    # And a follow-up serial run sees the same graph.
-    with GraphCache(db, fingerprint=fp) as cache:
+    with GraphCache(db) as cache:
         warm = build_symbol_graph({tmp_path: []}, cache=cache)
     assert _node_set(warm) == _node_set(cold)
     assert _edge_set(warm) == _edge_set(cold)
@@ -103,12 +105,10 @@ def test_parallel_falls_back_to_serial_for_single_miss(tmp_path, monkeypatch):
     """``workers=2`` with a single cache-miss skips the pool (overhead floor)."""
     _write(tmp_path, _multi_file_layout())
     db = tmp_path / CACHE_DIR_NAME / "cache.db"
-    fp = compute_fingerprint(paths={tmp_path: []}, resolvers=[])
 
-    with GraphCache(db, fingerprint=fp) as cache:
+    with GraphCache(db) as cache:
         build_symbol_graph({tmp_path: []}, cache=cache)
 
-    # Edit one file so exactly one miss survives.
     (tmp_path / "pkg" / "a.py").write_text("def f():\n    return 1\n")
 
     from dead_cst import analyze
@@ -121,7 +121,7 @@ def test_parallel_falls_back_to_serial_for_single_miss(tmp_path, monkeypatch):
         return real(*args, **kwargs)
 
     monkeypatch.setattr(analyze, "ProcessPoolExecutor", _spy)
-    with GraphCache(db, fingerprint=fp) as cache:
+    with GraphCache(db) as cache:
         build_symbol_graph({tmp_path: []}, cache=cache, workers=4)
     assert calls == [], "single-miss run should not spawn a pool"
 

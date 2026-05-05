@@ -53,6 +53,8 @@ flags, and output formats may change without notice.
 from ._cacheable import Cacheable
 from ._version import __version__
 from .analyze import (
+    Analysis,
+    PackageView,
     build_symbol_graph,
     count_nodes,
     find_kept_alive_by_dead_branches,
@@ -63,10 +65,12 @@ from .codemod import remove_code
 from .graph import EdgeFlags, Import, NodeFlags, SymbolNode
 
 __all__ = [
+    "Analysis",
     "Cacheable",
     "EdgeFlags",
     "Import",
     "NodeFlags",
+    "PackageView",
     "SymbolNode",
     "__version__",
     "build_symbol_graph",

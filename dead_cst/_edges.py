@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Generator
+from typing import Generator, Iterable
 
 from .graph import EdgeFlags, Import, SymbolNode, SymbolTrie
 from .plugins._core import (
@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 
 
 def resolve_edges(
-    import_edges: set[tuple[SymbolNode, Import, EdgeFlags]],
+    import_edges: Iterable[tuple[SymbolNode, Import, EdgeFlags]],
     symbol_lookup: SymbolTrie,
     base: Path,
 ) -> Generator[tuple[SymbolNode, SymbolNode, EdgeFlags], None, None]:

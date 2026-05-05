@@ -19,7 +19,6 @@ from .analyze import build_symbol_graph, count_nodes, find_reachable, order_path
 from .cache import (
     GraphCache,
     clear_cache,
-    compute_fingerprint,
     default_cache_path,
 )
 from .codemod import remove_code
@@ -113,18 +112,16 @@ def _maybe_cache(
 ) -> Iterator[GraphCache | None]:
     """Yield a per-run :class:`GraphCache`, or ``None`` when ``--no-cache`` is set.
 
-    The fingerprint covers the resolved ``PathMap``, resolver chain,
-    plugin set, and the default unreachable-region detector so a
-    layout, import-resolution, or plugin change wipes the on-disk
-    ``file_cache`` automatically (see :func:`compute_fingerprint`).
+    Per-base fingerprints (computed inside :class:`Analysis`) gate
+    individual cache rows, so this just opens the database. A
+    schema-version mismatch on open wipes ``file_cache`` automatically.
     The context manager closes the SQLite connection on exit, even
     when the analysis raises.
     """
     if no_cache:
         yield None
         return
-    fingerprint = compute_fingerprint(paths=paths_dict, resolvers=resolvers, plugins=plugins)
-    with GraphCache(default_cache_path(root), fingerprint) as cache:
+    with GraphCache(default_cache_path(root)) as cache:
         yield cache
 
 

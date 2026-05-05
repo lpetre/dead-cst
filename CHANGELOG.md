@@ -9,6 +9,36 @@ two versions.
 
 ## [Unreleased]
 
+### Added
+- New primary API: `dead_cst.Analysis` and `dead_cst.PackageView`,
+  the lazy entry point that callers should reach for on large repos.
+  Construction is cheap (no filesystem walk, no parsing). `refresh()`
+  is base-scoped and idempotent. `package(base)` returns a
+  `PackageView` whose `modules` / `declarations` queries are local
+  to that base, while `dead` / `importers_of` / `graph` materialize
+  only the "interesting set" -- the forward closure of the base's
+  reverse (consumer) closure -- which is the smallest scope that
+  gives correct reachability answers for decls in that base. The
+  shipped `build_symbol_graph(...)` is now a thin wrapper over
+  `Analysis(...).materialize_all()`; existing callers see no
+  behavior change.
+
+### Changed
+- **Breaking (cache API):** `compute_fingerprint` is now per-base
+  (`base=`, `search_paths=`) rather than per-project (`paths=`).
+  Each cache row carries its own fingerprint, so changing one base's
+  search paths or plugins no longer invalidates sibling bases'
+  cached payloads. `GraphCache(db_path)` no longer takes a
+  fingerprint at open time; `get` and `put` take it per call.
+  Schema version bumped to 2; older databases auto-wipe on first
+  open. The CLI is unaffected -- `Analysis` computes per-base
+  fingerprints internally.
+- `order_paths` now returns only the keys of the `PathMap`. Search
+  paths that aren't themselves keys (e.g. a venv `site-packages`
+  directory listed for resolver lookup) are no longer silently
+  promoted to bases and are never walked. Pass them as keys
+  explicitly if you want their files visited.
+
 ### Removed
 - `PluginContext.prime_module`, the public method for inserting an
   already-parsed `cst.Module` into the request-scope `parse` memo.
