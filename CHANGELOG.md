@@ -9,6 +9,14 @@ two versions.
 
 ## [Unreleased]
 
+### Added
+- `CycloptsPlugin` (`dead_cst.contrib.cyclopts`, re-exported from
+  `dead_cst.plugins` and `dead_cst.contrib`) wires
+  `@<app>.command` and `@<app>.default` handlers through their owning
+  `cyclopts.App` instance, mirroring the Typer/Click plugins.
+  Registered in `BUILTIN_PLUGINS` under the name `cyclopts` and
+  loadable via `--plugin cyclopts`.
+
 ## [0.5.0] - 2026-05-05
 
 ### Added
