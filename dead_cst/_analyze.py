@@ -33,7 +33,7 @@ from ._resolvers import (
     default_resolve_import,
     exported_roots,
 )
-from ._resolvers._imports import distribution_lookup, safe_resolve_module, temp_sys_path
+from ._resolvers._imports import distribution_lookup, safe_resolve_module
 from ._symbols import EdgeFlags, Import, NodeFlags, SymbolNode, SymbolTrie
 from ._visitor import SymbolVisitor, VisitorPayload
 
@@ -203,14 +203,11 @@ def build_symbol_graph(
     base_specs = _collect_base_specs(paths, cache)
 
     # Phase 2: run the visitor + observe pass for every miss file.
-    # Serial dispatch enters ``temp_sys_path`` per base (parent
-    # process is doing the work). Parallel dispatch builds one
-    # persistent ``ProcessPoolExecutor`` for the whole run, sorts
-    # tasks by ``search_paths`` so a worker tends to see contiguous
-    # runs from the same base, and rebinds ``sys.path`` +
-    # invalidates the resolver caches only when the search-path
-    # tuple changes. Cache writes happen on the main process either
-    # way so failure semantics match the serial path.
+    # Tasks are sorted by ``search_paths`` so the runner sees one
+    # transition per base regardless of file count. Workers and the
+    # in-process serial path share the same ``_process_task`` body;
+    # only the executor differs. Cache writes happen on the main
+    # process so failure semantics match either way.
     miss_payloads = _compute_all_miss_payloads(
         base_specs=base_specs,
         project_root=root,
@@ -425,29 +422,11 @@ def _collect_base_specs(paths: PathMap, cache: GraphCache | None) -> dict[Path, 
 
 
 @dataclass(frozen=True)
-class _WorkerInit:
-    """Run-wide state shipped to every :class:`ProcessPoolExecutor` worker.
-
-    Captures everything a worker needs that doesn't change between
-    bases: the detector, the plugin set, and the resolver list. The
-    resolver chain is rebuilt locally via :func:`_chain_resolvers` --
-    its closure form isn't picklable across processes, but the
-    ``PathResolver`` instances themselves are dataclass-picklable.
-    Per-base context (search paths, file list, base path) travels on
-    each :class:`_WorkerTask`.
-    """
-
-    detector: UnreachableRegionDetector
-    plugins: tuple[EdgePlugin, ...]
-    resolvers: tuple[PathResolver, ...]
-
-
-@dataclass(frozen=True)
-class _WorkerTask:
-    """Per-file unit of work dispatched to a worker.
+class _Task:
+    """Per-file unit of work for the visitor + observe pass.
 
     ``fqn_entry`` is this file's slice of the per-base FQN cache built
-    once in the parent (see :func:`_collect_base_specs`); the worker
+    once in the parent (see :func:`_collect_base_specs`); the runner
     injects it into a :class:`MetadataWrapper` rather than rebuilding
     a :class:`FullRepoManager`. ``search_paths`` doubles as the
     transition key for ``sys.path`` rebinding + resolver-cache
@@ -462,50 +441,25 @@ class _WorkerTask:
 
 
 @dataclass
-class _WorkerState:
-    """Per-worker mutable state populated by :func:`_init_worker`.
+class _RunnerState:
+    """Mutable state for the per-task runner, shared by serial and worker paths.
 
-    ``sys_path_baseline`` snapshots the worker's pristine ``sys.path``
-    at startup. Each transition rebuilds ``sys.path`` from
-    ``search_paths + baseline`` and clears the resolver LRUs.
-    ``last_search_paths`` is the transition key.
+    ``sys_path_baseline`` is the original ``sys.path`` captured at
+    runner startup; transitions rebuild ``sys.path`` from
+    ``search_paths + baseline`` and clear the resolver LRUs. The
+    serial caller restores ``sys.path`` from the baseline when the run
+    finishes; workers don't bother since the process is about to exit.
     """
 
-    init: _WorkerInit
+    detector: UnreachableRegionDetector
+    plugins: tuple[EdgePlugin, ...]
     import_resolver: ImportResolver
     sys_path_baseline: list[str]
     last_search_paths: tuple[Path, ...] | None = field(default=None)
 
 
-_worker_state: _WorkerState | None = None
-
-
-def _init_worker(init: _WorkerInit) -> None:
-    """Pool initializer: snapshot ``sys.path`` and build worker globals.
-
-    No per-base setup happens here -- :func:`_worker_process_task`
-    detects the first base on its first task and rebinds ``sys.path``
-    against the snapshot. This keeps the pool persistent across every
-    base in the run; the parent never re-creates it.
-    """
-    global _worker_state
-    _worker_state = _WorkerState(
-        init=init,
-        import_resolver=_chain_resolvers(init.resolvers),
-        sys_path_baseline=list(sys.path),
-    )
-
-
 def _rebind_sys_path(search_paths: tuple[Path, ...], baseline: list[str]) -> None:
-    """Set ``sys.path`` to ``search_paths + baseline``, deduplicated.
-
-    ``temp_sys_path`` does effectively the same thing in the parent
-    when run serially. Workers can't use a contextmanager (the
-    transition is event-driven, not block-scoped), so the rebinding
-    happens explicitly. Order matters: search_paths first so
-    first-party imports beat any same-named modules on the original
-    ``sys.path``.
-    """
+    """Set ``sys.path`` to ``search_paths + baseline``, deduplicated."""
     new_path: list[str] = []
     seen: set[str] = set()
     for p in search_paths:
@@ -523,48 +477,97 @@ def _rebind_sys_path(search_paths: tuple[Path, ...], baseline: list[str]) -> Non
 def _clear_resolver_caches() -> None:
     """Drop the two ``sys.path``-derived resolver caches.
 
-    Both :func:`safe_resolve_module` (keyed on fullname) and
-    :func:`distribution_lookup` (keyed on ``()``) read live
-    ``sys.path`` and would otherwise return stale results when the
-    base changes -- the first because the same name resolves to a
-    different base's first-party path, the second because uv-workspace
-    members can ship their own ``.venv``.
+    :func:`safe_resolve_module` keys on fullname and
+    :func:`distribution_lookup` keys on ``()`` -- both read live
+    ``sys.path`` and would otherwise return stale results across
+    bases (different first-party prefix; uv-workspace members shipping
+    their own ``.venv``).
     """
     safe_resolve_module.cache_clear()
     distribution_lookup.cache_clear()
 
 
-def _on_search_paths_change(state: _WorkerState, search_paths: tuple[Path, ...]) -> None:
-    """Worker transition: rebind ``sys.path``, clear resolver caches."""
-    _rebind_sys_path(search_paths, state.sys_path_baseline)
-    _clear_resolver_caches()
-    state.last_search_paths = search_paths
+def _process_task(state: _RunnerState, task: _Task) -> tuple[Path, Path, VisitorPayload]:
+    """Run one task, transitioning ``sys.path`` + caches if the base changed.
 
-
-def _worker_process_task(task: _WorkerTask) -> tuple[Path, Path, VisitorPayload]:
-    """Pool task: rebind ``sys.path`` if needed, then visit + observe ``task.file``.
-
-    Returns ``(base, file, payload)`` so the parent can route the
-    payload back into the right per-base bucket. Sorting tasks by
-    ``search_paths`` in the parent keeps any one worker's transitions
-    bounded -- in steady state each worker sees one transition per
-    base it touches, regardless of total file count.
+    Used by both the in-process serial loop and the
+    :class:`ProcessPoolExecutor` workers; the only difference between
+    the two is who owns ``state`` (a local in serial, a per-process
+    global in workers).
     """
-    state = _worker_state
-    assert state is not None, "_init_worker must run before _worker_process_task"
     if state.last_search_paths != task.search_paths:
-        _on_search_paths_change(state, task.search_paths)
+        _rebind_sys_path(task.search_paths, state.sys_path_baseline)
+        _clear_resolver_caches()
+        state.last_search_paths = task.search_paths
     payload = _process_one_file(
         task.file,
         fqn_entry=task.fqn_entry,
         search_paths=list(task.search_paths),
         import_resolver=state.import_resolver,
-        detector=state.init.detector,
-        plugins=state.init.plugins,
+        detector=state.detector,
+        plugins=state.plugins,
         base=task.base,
         project_root=task.project_root,
     )
     return task.base, task.file, payload
+
+
+_worker_state: _RunnerState | None = None
+
+
+def _init_worker(
+    detector: UnreachableRegionDetector,
+    plugins: tuple[EdgePlugin, ...],
+    resolvers: tuple[PathResolver, ...],
+) -> None:
+    """Pool initializer: build the worker's :class:`_RunnerState`.
+
+    Resolver chain is rebuilt locally because :func:`_chain_resolvers`
+    can return a closure (not picklable); the resolver instances
+    themselves travel as picklable dataclasses.
+    """
+    global _worker_state
+    _worker_state = _RunnerState(
+        detector=detector,
+        plugins=plugins,
+        import_resolver=_chain_resolvers(resolvers),
+        sys_path_baseline=list(sys.path),
+    )
+
+
+def _worker_process_task(task: _Task) -> tuple[Path, Path, VisitorPayload]:
+    """Pool task: delegate to :func:`_process_task` against the worker's state."""
+    assert _worker_state is not None, "_init_worker must run before _worker_process_task"
+    return _process_task(_worker_state, task)
+
+
+def _build_sorted_tasks(base_specs: dict[Path, _BaseSpec], project_root: Path) -> list[_Task]:
+    """Flatten every base's miss files into one task list, sorted by search_paths.
+
+    Sorting puts same-base tasks adjacent so a runner sees at most one
+    ``sys.path`` transition per base it touches, regardless of total
+    file count. The sort key is computed once per task rather than
+    per-comparator-call.
+    """
+    keyed: list[tuple[tuple[str, ...], str, _Task]] = []
+    for base, spec in base_specs.items():
+        sp_key = tuple(str(p) for p in spec.search_paths)
+        for file in spec.miss_files:
+            keyed.append(
+                (
+                    sp_key,
+                    str(file),
+                    _Task(
+                        file=file,
+                        base=base,
+                        search_paths=spec.search_paths,
+                        fqn_entry=spec.fqn_cache[str(file)],
+                        project_root=project_root,
+                    ),
+                )
+            )
+    keyed.sort(key=lambda kt: (kt[0], kt[1]))
+    return [kt[2] for kt in keyed]
 
 
 def _compute_all_miss_payloads(
@@ -580,95 +583,57 @@ def _compute_all_miss_payloads(
 ) -> dict[Path, dict[Path, VisitorPayload]]:
     """Run visitor + observe for every cache-miss file across every base.
 
-    Two paths:
-
-    * Serial (``workers`` ``None`` / ``1`` / total misses < 2) --
-      iterate bases in order, enter ``temp_sys_path`` per base,
-      clear the resolver caches, run :func:`_process_one_file` for
-      each miss in turn using the precomputed FQN entry from
-      ``spec.fqn_cache``.
-    * Parallel -- one persistent :class:`ProcessPoolExecutor` for the
-      whole run. Tasks are sorted by ``search_paths`` so a worker
-      tends to see contiguous miss runs from the same base; on each
-      transition the worker rebinds ``sys.path`` + invalidates the
-      resolver caches via :func:`_on_search_paths_change`. Cap the
-      pool at ``min(workers, total_misses)`` so a small batch doesn't
-      over-provision.
+    Both branches use :func:`_process_task` for the per-task work; they
+    differ only in whether the runner state lives on the main process
+    or in :class:`ProcessPoolExecutor` workers. The pool is opt-in
+    (``workers >= 2`` and at least two miss files); below that, the
+    in-process path avoids pool startup cost.
 
     Cache writes happen on the main process as each payload arrives,
     so a partial run still warms the cache for files that completed.
-    Returns ``{base: {file: payload}}`` even for bases with no
-    misses, so the caller can index without an existence check.
+    Returns ``{base: {file: payload}}`` even for bases with no misses,
+    so the caller can index without an existence check.
     """
     out: dict[Path, dict[Path, VisitorPayload]] = {b: {} for b in base_specs}
     total_misses = sum(len(s.miss_files) for s in base_specs.values())
     if total_misses == 0:
         return out
 
+    tasks = _build_sorted_tasks(base_specs, project_root)
     use_pool = workers is not None and workers >= 2 and total_misses >= 2
 
-    if not use_pool:
-        for base, spec in base_specs.items():
-            if not spec.miss_files:
-                continue
-            search_paths = list(spec.search_paths)
-            _clear_resolver_caches()
-            with temp_sys_path(search_paths):
-                for file in spec.miss_files:
-                    payload = _process_one_file(
-                        file,
-                        fqn_entry=spec.fqn_cache[str(file)],
-                        search_paths=search_paths,
-                        import_resolver=import_resolver,
-                        detector=detector,
-                        plugins=plugins,
-                        base=base,
-                        project_root=project_root,
-                    )
-                    out[base][file] = payload
-                    if cache is not None:
-                        cache.put(file, payload)
+    def _record(base: Path, file: Path, payload: VisitorPayload) -> None:
+        out[base][file] = payload
+        if cache is not None:
+            cache.put(file, payload)
+
+    if use_pool:
+        assert workers is not None
+        with ProcessPoolExecutor(
+            max_workers=min(workers, len(tasks)),
+            initializer=_init_worker,
+            initargs=(detector, tuple(plugins), tuple(resolvers)),
+        ) as pool:
+            for base, file, payload in pool.map(_worker_process_task, tasks):
+                _record(base, file, payload)
         return out
 
-    # Sort tasks so each worker sees contiguous runs from the same
-    # base; bounded transitions keep the resolver caches hot. The sort
-    # key is computed once per task rather than per comparator call.
-    keyed_tasks: list[tuple[tuple[str, ...], str, _WorkerTask]] = []
-    for base, spec in base_specs.items():
-        sp_key = tuple(str(p) for p in spec.search_paths)
-        for file in spec.miss_files:
-            keyed_tasks.append(
-                (
-                    sp_key,
-                    str(file),
-                    _WorkerTask(
-                        file=file,
-                        base=base,
-                        search_paths=spec.search_paths,
-                        fqn_entry=spec.fqn_cache[str(file)],
-                        project_root=project_root,
-                    ),
-                )
-            )
-    keyed_tasks.sort(key=lambda kt: (kt[0], kt[1]))
-    tasks = [kt[2] for kt in keyed_tasks]
-
-    init = _WorkerInit(
+    # Serial: run every task in-process. Restore ``sys.path`` on the
+    # way out so callers (tests, library users) don't see lingering
+    # mutations from the runner's per-base rebinds.
+    baseline = list(sys.path)
+    state = _RunnerState(
         detector=detector,
         plugins=tuple(plugins),
-        resolvers=tuple(resolvers),
+        import_resolver=import_resolver,
+        sys_path_baseline=baseline,
     )
-    assert workers is not None
-    max_workers = min(workers, len(tasks))
-    with ProcessPoolExecutor(
-        max_workers=max_workers,
-        initializer=_init_worker,
-        initargs=(init,),
-    ) as pool:
-        for base, file, payload in pool.map(_worker_process_task, tasks):
-            out[base][file] = payload
-            if cache is not None:
-                cache.put(file, payload)
+    try:
+        for task in tasks:
+            base, file, payload = _process_task(state, task)
+            _record(base, file, payload)
+    finally:
+        sys.path[:] = baseline
     return out
 
 
