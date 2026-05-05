@@ -7,9 +7,12 @@ value objects plugins emit, and small utilities (:func:`apply_ops`,
 
 The plugin pass runs once per base after the analyzer has resolved that
 base's edges. Plugins see the symbol lookup that was valid at that base's
-resolution time (the current base + its dependencies' exports), and the
-parsed module cache is primed with the modules the analyzer just walked,
-so plugins never re-read or re-parse source.
+resolution time (the current base + its dependencies' exports). The
+parsed-module cache on :class:`PluginContext` is request-scope: a file is
+read and parsed on first :meth:`PluginContext.parse` call and the result
+memoized for the rest of the analysis. Warm cache hits in the per-file
+visitor pass deliberately skip parsing entirely, so plugins that need a
+``cst.Module`` will pay the parse cost the first time they ask.
 """
 
 from __future__ import annotations
@@ -52,7 +55,7 @@ UNRESOLVED_PREFIX = "[unresolved] "
 SYNTHETIC_PATH_PREFIXES = (*EXTERNAL_PREFIXES, UNRESOLVED_PREFIX)
 
 
-@dataclass
+@dataclass(slots=True)
 class PluginContext:
     """Per-base view of the analyzer state passed to every plugin.
 
@@ -62,9 +65,10 @@ class PluginContext:
     scope iteration to :attr:`base` -- :meth:`base_modules` is the easy
     way -- because :attr:`graph` accumulates nodes across bases.
 
-    The parsed-module cache is pre-populated with the modules the analyzer
-    just walked, so :meth:`parse` returns immediately for any file under
-    :attr:`base` without re-reading or re-parsing.
+    :attr:`_modules` is a request-scope memo for :meth:`parse`: nothing
+    is pre-populated, so the first plugin that asks for a given file's
+    ``cst.Module`` pays the read + parse, and subsequent calls within
+    the same analysis return the cached result.
     """
 
     graph: nx.DiGraph
@@ -199,10 +203,13 @@ class PluginContext:
     def parse(self, path: Path) -> cst.Module | None:
         """Return the parsed :class:`libcst.Module` for ``path``.
 
-        The analyzer primes the cache with the modules it parsed during
-        the visitor pass, so for any file under :attr:`base` this returns
-        immediately. Files outside the base are read and parsed on first
-        access; failures are cached so a flaky file isn't re-attempted.
+        First access reads + parses the file; the result is memoized on
+        the context for the rest of the analysis so repeat calls within
+        the same plugin pass are free. Failures (unreadable file, syntax
+        error) are cached as ``None`` so a flaky file isn't re-attempted.
+        Warm cache hits in the visitor pass skip parsing entirely, so
+        plugins that need a ``cst.Module`` for a hit file pay the parse
+        cost the first time they ask.
         """
         if path in self._modules:
             return self._modules[path]
@@ -270,7 +277,7 @@ def require_resolved_dep(ctx: PluginContext, package: str) -> SymbolNode | None:
     )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class AddNode:
     """Add a node to the graph. When ``entrypoint=True``, mark the node so
     :func:`find_reachable` seeds its BFS from it."""
@@ -279,13 +286,13 @@ class AddNode:
     entrypoint: bool = False
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class AddEdge:
     src: SymbolNode
     dst: SymbolNode
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class RemoveEdge:
     src: SymbolNode
     dst: SymbolNode
@@ -294,7 +301,7 @@ class RemoveEdge:
 GraphOp = AddNode | AddEdge | RemoveEdge
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ObserveContext:
     """Per-file context handed to :meth:`EdgePlugin.observe`.
 

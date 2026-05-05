@@ -9,6 +9,21 @@ two versions.
 
 ## [Unreleased]
 
+### Changed
+- `PluginContext`, `ObserveContext`, and the `AddNode` / `AddEdge` /
+  `RemoveEdge` graph-op value objects now use `__slots__`, as do the
+  analyzer-internal `_BaseSpec` / `_Task` / `_RunnerState` records,
+  shaving a per-instance `__dict__` off objects allocated per file
+  and per emitted op.
+
+### Fixed
+- Documentation no longer claims that `PluginContext.parse` is primed
+  with the modules the analyzer walked during the visitor pass: that
+  hasn't been true since per-file results moved into the SQLite cache
+  (warm hits skip parsing entirely). The `parse` cache is now
+  documented as a request-scope memo, populated lazily on first
+  access.
+
 ## [0.5.0] - 2026-05-05
 
 ### Added

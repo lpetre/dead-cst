@@ -119,8 +119,9 @@ def build_symbol_graph(
 
     Plugins run once per base in topological order, after that base's import
     edges have been resolved. Each plugin invocation gets a per-base
-    :class:`PluginContext` whose parsed-module cache is primed with the
-    modules the analyzer just walked, so plugins never re-read or re-parse.
+    :class:`PluginContext`; its :meth:`PluginContext.parse` lazily reads +
+    parses files on first request and memoizes the result for the rest
+    of the analysis.
 
     Parameters
     ----------
@@ -368,7 +369,7 @@ def _process_one_file(
     return _merge_payloads(base_payload, plugin_payload)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class _BaseSpec:
     """Per-base file list partitioned into cache hits and miss files.
 
@@ -427,7 +428,7 @@ def _collect_base_specs(paths: PathMap, cache: GraphCache | None) -> dict[Path, 
     return specs
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class _Task:
     """Per-file unit of work for the visitor + observe pass.
 
@@ -446,7 +447,7 @@ class _Task:
     project_root: Path
 
 
-@dataclass
+@dataclass(slots=True)
 class _RunnerState:
     """Mutable state for the per-task runner, shared by serial and worker paths.
 
