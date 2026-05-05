@@ -121,7 +121,7 @@ class SymbolVisitor(cst.CSTVisitor):
     # edge-attribution rules, flow-analysis fixes, etc. Concurrent
     # bumps on different branches merge with ``max()`` semantics.
     name: str = "default"
-    version: int = 1777964738
+    version: int = 1777967380
 
     def _pos(self, node: cst.CSTNode):
         return self.get_metadata(PositionProvider, node, default=None)
@@ -511,6 +511,10 @@ class SymbolVisitor(cst.CSTVisitor):
         for dead-code analysis (over- rather than under-approximates).
         Only string-literal arguments are honoured; non-literal forms
         (``__import__(name)``) emit a warning and produce no edge.
+
+        ``__import__('pkg', fromlist=['mod'])`` also imports ``pkg.mod``
+        as a side effect, but our fan-out only sees ``pkg``. Warn so
+        users notice the gap; the fan-out from the name still runs.
         """
         callee = self._dynamic_import_call_name(node.func)
         if callee is None:
@@ -524,6 +528,14 @@ class SymbolVisitor(cst.CSTVisitor):
             except Exception:
                 module = None
             if isinstance(module, str) and module and not module.startswith("."):
+                if callee == "__import__" and self._import_call_fromlist(node) is not None:
+                    logger.warning(
+                        "'__import__(%r, fromlist=...)' in %s: fromlist entries "
+                        "are not resolved (only %r is fanned out)",
+                        module,
+                        self.path,
+                        module,
+                    )
                 self._add_star_import(module, self._pos(node))
                 return
         logger.warning(
@@ -543,6 +555,21 @@ class SymbolVisitor(cst.CSTVisitor):
             and func.attr.value == "import_module"
         ):
             return "importlib.import_module"
+        return None
+
+    @staticmethod
+    def _import_call_fromlist(node: cst.Call) -> cst.BaseExpression | None:
+        """Return the ``fromlist`` arg of a ``__import__`` call, or ``None``.
+
+        ``__import__(name, globals=None, locals=None, fromlist=(), level=0)``:
+        ``fromlist`` is positional index 3 or the keyword ``fromlist``.
+        """
+        for i, arg in enumerate(node.args):
+            if arg.keyword is not None:
+                if isinstance(arg.keyword, cst.Name) and arg.keyword.value == "fromlist":
+                    return arg.value
+            elif i == 3:
+                return arg.value
         return None
 
     def visit_ImportFrom(self, node: cst.ImportFrom) -> None:

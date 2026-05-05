@@ -372,6 +372,37 @@ def test_dynamic_import_non_literal_warns(build_decl_graph, caplog):
     )
 
 
+@pytest.mark.parametrize(
+    "src",
+    [
+        pytest.param("__import__('p.functions', None, None, ['f'])", id="fromlist-positional"),
+        pytest.param("__import__('p.functions', fromlist=['f'])", id="fromlist-keyword"),
+    ],
+)
+def test_dunder_import_fromlist_warns(build_decl_graph, assert_edges, caplog, src):
+    """``__import__(name, fromlist=...)`` warns but still fans out from ``name``."""
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="dead_cst._visitor"):
+        graph = build_decl_graph({**IMPORT_TEST_FILES, "p/x.py": src})
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert any(
+        "fromlist=..." in m and "'p.functions'" in m and "not resolved" in m for m in messages
+    ), messages
+
+    # The fan-out from the name argument still runs.
+    assert_edges(
+        graph,
+        IMPORT_BASE_EDGES
+        | {
+            "p.x -> p.functions",
+            "p.x -> p.functions.f",
+            "p.x -> p.functions.g",
+        },
+    )
+
+
 def test_third_party_import_creates_synthetic_node(build_decl_graph):
     graph = build_decl_graph(
         {

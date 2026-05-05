@@ -18,8 +18,11 @@ two versions.
   `pkg.mod.name` reachable instead of being silently dropped.
   Non-literal arguments (`__import__(var)`) are skipped with a
   warning; relative-name literals (`'.sub'`) are likewise skipped
-  rather than misresolved. Bumps `SymbolVisitor.version` to
-  invalidate cached payloads.
+  rather than misresolved. `__import__(name, fromlist=...)` also
+  warns -- the fan-out runs from `name`, but submodule entries in
+  `fromlist` (`__import__('pkg', fromlist=['mod'])` imports
+  `pkg.mod` as a side effect) are not resolved. Bumps
+  `SymbolVisitor.version` to invalidate cached payloads.
 
 ## [0.4.0] - 2026-05-03
 
