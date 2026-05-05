@@ -1,7 +1,7 @@
 """Project-specific plugin subclasses for the flux0 e2e tests.
 
 The two abstract bases (:class:`DecoratedDeclPlugin`,
-:class:`LiteralListPlugin`) live in :mod:`dead_cst._plugins.decl_shapes`
+:class:`LiteralListPlugin`) live in :mod:`dead_cst.plugins.decl_shapes`
 and were promoted out of this file once they earned a second user. The
 flux0 subclasses below are now pure configuration -- four to five lines
 each.
@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from dead_cst import DecoratedDeclPlugin, LiteralListPlugin
+from dead_cst.plugins import DecoratedDeclPlugin, LiteralListPlugin
 
 
 @dataclass

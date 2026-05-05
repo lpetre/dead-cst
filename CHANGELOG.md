@@ -10,6 +10,47 @@ two versions.
 ## [Unreleased]
 
 ### Added
+- **Public-API reorganization.** The package is now structured around
+  focused public submodules instead of a single flat re-export. Top-level
+  `dead_cst` keeps the highlights -- `build_symbol_graph`,
+  `find_reachable`, `find_kept_alive_by_dead_branches`, `count_nodes`,
+  `order_paths`, `remove_code`, `Cacheable`, the data types
+  (`SymbolNode`, `Import`, `NodeFlags`, `EdgeFlags`), and `__version__`
+  -- and the deeper surface lives in:
+  - `dead_cst.graph` -- node and payload data types (`SymbolNode`,
+    `Import`, `NodeFlags`, `EdgeFlags`, `VisitorPayload`).
+  - `dead_cst.analyze` -- analysis driver and reachability helpers.
+  - `dead_cst.codemod` -- the LibCST source rewriter.
+  - `dead_cst.cache` -- `GraphCache`, `compute_fingerprint`, schema
+    constants. Previously private under `dead_cst._cache`.
+  - `dead_cst.branches` -- `UnreachableRegionDetector`,
+    `DefaultUnreachableRegionDetector`, plus the truthiness / fold
+    helpers (`evaluate_truthiness`, `unreachable_suites`,
+    `unreachable_bodies`, `ResolveExpr`, `fold_constants`) a
+    from-scratch detector needs.
+  - `dead_cst.plugins` -- `EdgePlugin`, `PluginContext`,
+    `ObserveContext`, `GraphOp` value objects, the synthetic-node
+    prefix constants (`STDLIB_PREFIX`, `EXTERNAL_DIST_PREFIX`,
+    `EXTERNAL_FILE_PREFIX`, `UNRESOLVED_PREFIX`, `EXTERNAL_PREFIXES`,
+    `SYNTHETIC_PATH_PREFIXES`, `SYNTHETIC_POSITION`), generic-Python
+    builtin plugins, and the framework plugins re-exported from
+    `dead_cst.contrib`.
+  - `dead_cst.resolvers` -- `PathResolver`, `PathMap`,
+    `ImportResolver`, generic builtin resolvers, `default_resolve_import`,
+    `safe_resolve_module`, `distribution_lookup`,
+    `editable_distribution_roots`, `STDLIB`, `SITE_PACKAGES_MARKERS`,
+    `load_toml`, plus `UvWorkspaceResolver` re-exported from
+    `dead_cst.contrib`.
+  - `dead_cst.contrib` -- canonical home for third-party-aware
+    extensions: `FastAPIPlugin`, `FlaskPlugin`, `ClickPlugin`,
+    `TyperPlugin`, `PytestPlugin`, `UnittestPlugin`, and
+    `UvWorkspaceResolver`.
+
+  Modules prefixed with `_` (`_visitor`, `_edges`, `_flow`, `_fqn`,
+  `_const_fold`, `_cacheable`, `_version`) are internal. A new
+  `tests/test_public_api.py` snapshots each public module's `__all__`
+  so accidental drops are caught in CI.
+
 - Dynamic-import calls with a string-literal argument
   (`__import__('pkg.mod')` and `importlib.import_module('pkg.mod')`)
   are now treated like `from pkg.mod import *`: every top-level decl
@@ -58,9 +99,21 @@ two versions.
 
 ### Removed
 - The internal `temp_sys_path` context manager
-  (`dead_cst._resolvers._imports`). The runner now manages
+  (`dead_cst.resolvers._imports`). The runner now manages
   `sys.path` directly, restoring it from a baseline snapshot when
   the in-process path finishes. Not part of the public API.
+
+### Changed (breaking)
+- Public modules dropped their leading underscore: `_analyze` →
+  `analyze`, `_branches` → `branches`, `_cache` → `cache`, `_codemod`
+  → `codemod`, `_plugins` → `plugins`, `_resolvers` → `resolvers`,
+  and `_symbols` was renamed to `graph` (with `VisitorPayload` moved
+  in from `_visitor`). The `explicit` plugin module was renamed to
+  `explicit_entrypoint` to match its class name. Imports from the
+  old underscored paths break; the same names are available at the
+  new paths. The top-level `dead_cst` package no longer re-exports
+  every plugin and resolver class -- pull them from
+  `dead_cst.plugins` / `dead_cst.resolvers` / `dead_cst.contrib`.
 
 ### Fixed
 - Path classification in `default_resolve_import` no longer

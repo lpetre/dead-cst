@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import re
 
-from dead_cst import ExplicitEntrypointPlugin, build_symbol_graph
+from dead_cst import build_symbol_graph
+from dead_cst.plugins import ExplicitEntrypointPlugin
 
 
 def test_explicit_entrypoint_by_fqname(tmp_path, write_files, reachable_fqnames):

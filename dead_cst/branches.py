@@ -385,3 +385,20 @@ def _unreachable_in_if(
         return dead
     dead.extend(_unreachable_in_if(orelse, next_taken, resolve_expr))
     return dead
+
+
+# Re-exported so detector authors who write a full
+# :meth:`UnreachableRegionDetector.find_regions` (rather than subclassing
+# :class:`DefaultUnreachableRegionDetector`) get the fixpoint
+# constant-folding pass alongside the rest of the detector helpers.
+from ._const_fold import fold_constants  # noqa: E402
+
+__all__ = [
+    "DefaultUnreachableRegionDetector",
+    "ResolveExpr",
+    "UnreachableRegionDetector",
+    "evaluate_truthiness",
+    "fold_constants",
+    "unreachable_bodies",
+    "unreachable_suites",
+]

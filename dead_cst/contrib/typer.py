@@ -21,8 +21,8 @@ from libcst.metadata import CodeRange
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Iterable
 
-from .._symbols import SymbolNode
-from ._core import (
+from ..graph import SymbolNode
+from ..plugins._core import (
     SYNTHETIC_POSITION,
     GraphOp,
     ObserveContext,
@@ -35,7 +35,7 @@ from ._core import (
 )
 
 if TYPE_CHECKING:
-    from .._visitor import VisitorPayload
+    from ..graph import VisitorPayload
 
 # Attribute names ``Typer`` uses to register a callable. Matched as the
 # rightmost attribute of ``@<instance>.<name>(...)``.

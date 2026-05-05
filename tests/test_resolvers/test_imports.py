@@ -1,4 +1,4 @@
-"""Tests for :mod:`dead_cst._resolvers._imports` path classification.
+"""Tests for :mod:`dead_cst.resolvers._imports` path classification.
 
 The bugs these guard against:
 
@@ -21,8 +21,8 @@ from unittest.mock import patch
 
 import pytest
 
-from dead_cst._resolvers import _imports
-from dead_cst._resolvers._imports import (
+from dead_cst.resolvers import _imports
+from dead_cst.resolvers._imports import (
     _editable_source_roots,
     _is_site_packages_path,
     _is_stdlib_path,

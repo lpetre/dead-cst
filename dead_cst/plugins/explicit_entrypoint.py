@@ -8,11 +8,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterable
 
-from .._symbols import SymbolNode
+from ..graph import SymbolNode
 from ._core import GraphOp, ObserveContext, PluginContext, mark_entrypoints
 
 if TYPE_CHECKING:
-    from .._visitor import VisitorPayload
+    from ..graph import VisitorPayload
 
 EXPLICIT_PREFIX = "<entrypoint>:"
 

@@ -5,9 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from ._core import PathMap, load_toml
-from ._imports import default_resolve_import
-from .venv import MissingVenvError, find_venv_site_packages
+from ..resolvers._core import PathMap, load_toml
+from ..resolvers._imports import default_resolve_import
+from ..resolvers.venv import MissingVenvError, find_venv_site_packages
 
 
 @dataclass

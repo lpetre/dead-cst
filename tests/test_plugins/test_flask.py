@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dead_cst import FlaskPlugin, build_symbol_graph
+from dead_cst import build_symbol_graph
+from dead_cst.plugins import FlaskPlugin
 
 
 def test_flask_plugin_marks_route_handlers(tmp_path, write_files, reachable_fqnames):
@@ -639,7 +640,7 @@ def test_flask_plugin_ignores_non_app_flask_users(tmp_path, write_files, reachab
 
 
 def test_flask_plugin_loads_via_load_plugin():
-    from dead_cst import load_plugin
+    from dead_cst.plugins import load_plugin
 
     plugin = load_plugin("flask")
     assert isinstance(plugin, FlaskPlugin)

@@ -15,29 +15,30 @@ import networkx as nx
 import typer
 from libcst.metadata import CodeRange
 
-from . import build_symbol_graph, count_nodes, find_reachable, order_paths, remove_code
-from ._cache import (
+from .analyze import build_symbol_graph, count_nodes, find_reachable, order_paths
+from .cache import (
     GraphCache,
     clear_cache,
     compute_fingerprint,
     default_cache_path,
 )
-from ._plugins import (
+from .codemod import remove_code
+from .graph import SymbolNode
+from .plugins import (
+    EXTERNAL_PREFIXES,
     EdgePlugin,
     ExplicitEntrypointPlugin,
     ModuleDundersPlugin,
     load_plugin,
 )
-from ._plugins._core import EXTERNAL_PREFIXES
-from ._plugins.module_dunders import DUNDER_PREFIX
-from ._resolvers import (
+from .plugins.module_dunders import DUNDER_PREFIX
+from .resolvers import (
     ManualResolver,
     PathMap,
     PathResolver,
     load_resolver,
     merge_paths,
 )
-from ._symbols import SymbolNode
 
 
 app = typer.Typer(help="Dead code analysis for Python using libcst.")

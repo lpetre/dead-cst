@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from dead_cst import (
+from dead_cst import build_symbol_graph
+from dead_cst.plugins import (
     ExplicitEntrypointPlugin,
     InitSubclassPlugin,
     MainBlockPlugin,
-    build_symbol_graph,
 )
-from dead_cst._plugins.init_subclass import INIT_SUBCLASS_PREFIX
+from dead_cst.plugins.init_subclass import INIT_SUBCLASS_PREFIX
 
 
 def test_init_subclass_keeps_subclass_alive_via_parent(tmp_path, write_files, reachable_fqnames):
@@ -371,7 +371,7 @@ def test_init_subclass_marker_in_predecessor_chain(tmp_path, write_files):
 
 
 def test_init_subclass_loads_via_load_plugin():
-    from dead_cst import load_plugin
+    from dead_cst.plugins import load_plugin
 
     plugin = load_plugin("init_subclass")
     assert isinstance(plugin, InitSubclassPlugin)

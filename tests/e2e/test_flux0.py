@@ -26,14 +26,10 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-from dead_cst import (
-    MainBlockPlugin,
-    ModuleDundersPlugin,
-    build_symbol_graph,
-    find_reachable,
-)
-from dead_cst._cache import GraphCache, compute_fingerprint
+from dead_cst import build_symbol_graph, find_reachable
+from dead_cst.cache import GraphCache, compute_fingerprint
 from dead_cst.cli import app
+from dead_cst.plugins import MainBlockPlugin, ModuleDundersPlugin
 
 from ._flux0_plugins import Flux0CliCommandsPlugin, Flux0InternalModulesPlugin
 

@@ -46,8 +46,8 @@ from libcst.metadata.scope_provider import (
     GlobalScope,
 )
 
-from ._branches import ResolveExpr, evaluate_truthiness
 from ._flow import live_referents
+from .branches import ResolveExpr, evaluate_truthiness
 
 
 def fold_constants(

@@ -1,6 +1,6 @@
 """Tests for the plugin surface itself: empty seeds, registry lookup,
 composition across multiple plugins, plus unit tests for the small
-AST helpers in :mod:`dead_cst._plugins._core`."""
+AST helpers in :mod:`dead_cst.plugins._core`."""
 
 from __future__ import annotations
 
@@ -11,13 +11,9 @@ import networkx as nx
 import pytest
 from libcst.metadata import CodePosition, CodeRange
 
-from dead_cst import (
-    MainBlockPlugin,
-    ProjectScriptsPlugin,
-    build_symbol_graph,
-    find_reachable,
-)
-from dead_cst._plugins._core import (
+from dead_cst import build_symbol_graph, find_reachable
+from dead_cst.plugins import MainBlockPlugin, ProjectScriptsPlugin
+from dead_cst.plugins._core import (
     AddEdge,
     AddNode,
     PluginContext,
@@ -31,7 +27,7 @@ from dead_cst._plugins._core import (
     matched_attr_call,
     single_target_assignment,
 )
-from dead_cst._symbols import SymbolNode, SymbolTrie
+from dead_cst.graph import SymbolNode, SymbolTrie
 
 
 def test_no_plugins_means_nothing_reachable(tmp_path, write_files):
@@ -67,7 +63,7 @@ def test_plugins_compose(tmp_path, write_files, reachable_fqnames):
 
 
 def test_unknown_plugin_raises():
-    from dead_cst import load_plugin
+    from dead_cst.plugins import load_plugin
 
     with pytest.raises(KeyError):
         load_plugin("does-not-exist")
@@ -92,7 +88,7 @@ def _ctx_with_synthetic(fqname: str, base: Path) -> PluginContext:
 
 
 def test_require_resolved_dep_returns_external_dist(tmp_path):
-    from dead_cst._plugins._core import EXTERNAL_DIST_PREFIX, require_resolved_dep
+    from dead_cst.plugins._core import EXTERNAL_DIST_PREFIX, require_resolved_dep
 
     ctx = _ctx_with_synthetic(f"{EXTERNAL_DIST_PREFIX}fastapi", tmp_path)
     node = require_resolved_dep(ctx, "fastapi")
@@ -101,21 +97,21 @@ def test_require_resolved_dep_returns_external_dist(tmp_path):
 
 
 def test_require_resolved_dep_returns_external_file(tmp_path):
-    from dead_cst._plugins._core import EXTERNAL_FILE_PREFIX, require_resolved_dep
+    from dead_cst.plugins._core import EXTERNAL_FILE_PREFIX, require_resolved_dep
 
     ctx = _ctx_with_synthetic(f"{EXTERNAL_FILE_PREFIX}fastapi", tmp_path)
     assert require_resolved_dep(ctx, "fastapi") is not None
 
 
 def test_require_resolved_dep_returns_none_if_not_imported(tmp_path):
-    from dead_cst._plugins._core import EXTERNAL_DIST_PREFIX, require_resolved_dep
+    from dead_cst.plugins._core import EXTERNAL_DIST_PREFIX, require_resolved_dep
 
     ctx = _ctx_with_synthetic(f"{EXTERNAL_DIST_PREFIX}something_else", tmp_path)
     assert require_resolved_dep(ctx, "fastapi") is None
 
 
 def test_require_resolved_dep_raises_on_unresolved(tmp_path):
-    from dead_cst._plugins._core import (
+    from dead_cst.plugins._core import (
         UNRESOLVED_PREFIX,
         UnresolvedDependencyError,
         require_resolved_dep,

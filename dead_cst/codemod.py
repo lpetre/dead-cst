@@ -9,7 +9,7 @@ from libcst.codemod.visitors import RemoveImportsVisitor
 from libcst.metadata import CodeRange, FullRepoManager, PositionProvider, QualifiedNameSource
 
 from ._fqn import FixedFullyQualifiedNameProvider
-from ._symbols import SymbolNode
+from .graph import SymbolNode
 
 
 class RemoveDeadSymbols(cst.CSTTransformer):
@@ -145,3 +145,6 @@ def remove_code(G: nx.Graph, base: Path) -> None:
 
         with path.open("w") as f:
             f.write(result.code)
+
+
+__all__ = ["remove_code"]

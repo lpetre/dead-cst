@@ -8,7 +8,7 @@ the fixture so individual cases only list the edges they introduce.
 
 import pytest
 
-from dead_cst._plugins._core import EXTERNAL_PREFIXES
+from dead_cst.plugins._core import EXTERNAL_PREFIXES
 
 IMPORT_TEST_FILES = {
     "p/__init__.py": "",

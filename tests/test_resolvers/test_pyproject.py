@@ -1,11 +1,11 @@
-"""Tests for :class:`dead_cst._resolvers.pyproject.PyprojectResolver`."""
+"""Tests for :class:`dead_cst.resolvers.pyproject.PyprojectResolver`."""
 
 from __future__ import annotations
 
 import textwrap
 from pathlib import Path
 
-from dead_cst import PyprojectResolver
+from dead_cst.resolvers import PyprojectResolver
 
 
 def test_pyproject_resolver_reads_paths_section(tmp_path: Path):

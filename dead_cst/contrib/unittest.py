@@ -7,8 +7,8 @@ from typing import TYPE_CHECKING, Iterable
 
 import libcst as cst
 
-from .._symbols import NodeFlags
-from ._core import (
+from ..graph import NodeFlags
+from ..plugins._core import (
     SYNTHETIC_POSITION,
     GraphOp,
     ObserveContext,
@@ -22,7 +22,7 @@ from ._core import (
 )
 
 if TYPE_CHECKING:
-    from .._visitor import VisitorPayload
+    from ..graph import VisitorPayload
 
 UNITTEST_PREFIX = "<unittest>:"
 

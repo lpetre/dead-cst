@@ -32,8 +32,8 @@ from typing import TYPE_CHECKING
 import libcst as cst
 from libcst.metadata import CodeRange
 
-from .._symbols import SymbolNode
-from ._core import (
+from ..graph import SymbolNode
+from ..plugins._core import (
     SYNTHETIC_POSITION,
     ObserveContext,
     collect_module_imports,
@@ -42,10 +42,10 @@ from ._core import (
     find_handlers,
     make_payload,
 )
-from .decl_shapes import DecoratedDeclPlugin
+from ..plugins.decl_shapes import DecoratedDeclPlugin
 
 if TYPE_CHECKING:
-    from .._visitor import VisitorPayload
+    from ..graph import VisitorPayload
 
 # Attribute names a Click ``Group`` uses to register a callable. Matched
 # as the rightmost attribute of ``@<instance>.<name>(...)``.

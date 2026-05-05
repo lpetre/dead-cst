@@ -22,7 +22,7 @@ from functools import cache
 from importlib.machinery import ModuleSpec
 from pathlib import Path
 
-from .._plugins._core import (
+from ..plugins._core import (
     EXTERNAL_DIST_PREFIX,
     EXTERNAL_FILE_PREFIX,
     STDLIB_PREFIX,

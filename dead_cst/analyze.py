@@ -12,34 +12,32 @@ import networkx as nx
 from libcst.helpers.module import ModuleNameAndPackage
 from libcst.metadata import CodeRange, MetadataWrapper
 
-from ._branches import (
+from ._edges import resolve_edges
+from ._fqn import FixedFullyQualifiedNameProvider
+from ._visitor import SymbolVisitor
+from .branches import (
     DefaultUnreachableRegionDetector,
     UnreachableRegionDetector,
 )
-from ._cache import GraphCache
-from ._edges import resolve_edges
-from ._fqn import FixedFullyQualifiedNameProvider
-from ._plugins import (
+from .cache import GraphCache
+from .graph import EdgeFlags, Import, NodeFlags, SymbolNode, SymbolTrie, VisitorPayload
+from .plugins import (
     EdgePlugin,
     ObserveContext,
     PluginContext,
     apply_ops,
 )
-from ._plugins._core import make_payload
-from ._resolvers import (
+from .plugins._core import make_payload
+from .resolvers import (
     ImportResolver,
     PathMap,
     PathResolver,
     default_resolve_import,
-    exported_roots,
-)
-from ._resolvers._imports import (
     distribution_lookup,
     editable_distribution_roots,
+    exported_roots,
     safe_resolve_module,
 )
-from ._symbols import EdgeFlags, Import, NodeFlags, SymbolNode, SymbolTrie
-from ._visitor import SymbolVisitor, VisitorPayload
 
 logger = logging.getLogger(__name__)
 
@@ -837,3 +835,12 @@ def count_nodes(graph: nx.MultiDiGraph, prefix: Path | None) -> dict[str, int]:
             continue
         counts[node.type] = counts.get(node.type, 0) + 1
     return counts
+
+
+__all__ = [
+    "build_symbol_graph",
+    "count_nodes",
+    "find_kept_alive_by_dead_branches",
+    "find_reachable",
+    "order_paths",
+]

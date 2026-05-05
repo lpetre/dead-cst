@@ -23,7 +23,7 @@ import pytest
 
 from libcst.metadata import MetadataWrapper
 
-from dead_cst._branches import (
+from dead_cst.branches import (
     DefaultUnreachableRegionDetector,
     evaluate_truthiness,
     unreachable_bodies,

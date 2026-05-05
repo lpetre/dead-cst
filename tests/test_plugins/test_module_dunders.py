@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dead_cst import ModuleDundersPlugin, build_symbol_graph
+from dead_cst import build_symbol_graph
+from dead_cst.plugins import ModuleDundersPlugin
 
 
 def test_keeps_all_alive(tmp_path, write_files, reachable_fqnames):

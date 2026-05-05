@@ -24,11 +24,11 @@ import logging
 from pathlib import Path
 from typing import Generator
 
-from ._plugins._core import (
+from .graph import EdgeFlags, Import, SymbolNode, SymbolTrie
+from .plugins._core import (
     SYNTHETIC_PATH_PREFIXES,
     synthetic_node,
 )
-from ._symbols import EdgeFlags, Import, SymbolNode, SymbolTrie
 
 logger = logging.getLogger(__name__)
 

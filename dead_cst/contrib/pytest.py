@@ -9,8 +9,8 @@ from typing import TYPE_CHECKING, Iterable
 
 import libcst as cst
 
-from .._symbols import NodeFlags, SymbolNode
-from ._core import (
+from ..graph import NodeFlags, SymbolNode
+from ..plugins._core import (
     SYNTHETIC_POSITION,
     GraphOp,
     ObserveContext,
@@ -21,7 +21,7 @@ from ._core import (
 )
 
 if TYPE_CHECKING:
-    from .._visitor import VisitorPayload
+    from ..graph import VisitorPayload
 
 PYTEST_CONFTEST_PREFIX = "<pytest:conftest>:"
 PYTEST_TESTS_PREFIX = "<pytest:tests>:"

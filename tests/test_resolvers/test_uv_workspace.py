@@ -1,7 +1,7 @@
-"""Tests for :class:`dead_cst._resolvers.uv_workspace.UvWorkspaceResolver`.
+"""Tests for :class:`dead_cst.resolvers.uv_workspace.UvWorkspaceResolver`.
 
 Includes an end-to-end regression test for the cross-member ``tests/``
-collision that motivated :func:`dead_cst._resolvers.exported_roots`.
+collision that motivated :func:`dead_cst.resolvers.exported_roots`.
 """
 
 from __future__ import annotations
@@ -11,8 +11,8 @@ from pathlib import Path
 
 import pytest
 
-from dead_cst import UvWorkspaceResolver
-from dead_cst._resolvers import MissingVenvError
+from dead_cst.resolvers import UvWorkspaceResolver
+from dead_cst.resolvers import MissingVenvError
 
 
 def _make_fake_venv(workspace_root: Path) -> Path:

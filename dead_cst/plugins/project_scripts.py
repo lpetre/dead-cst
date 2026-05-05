@@ -8,11 +8,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterable
 
-from .._resolvers._core import load_toml
+from ..resolvers import load_toml
 from ._core import GraphOp, ObserveContext, PluginContext, mark_entrypoints
 
 if TYPE_CHECKING:
-    from .._visitor import VisitorPayload
+    from ..graph import VisitorPayload
 
 PROJECT_SCRIPTS_PREFIX = "<project.scripts>:"
 

@@ -13,8 +13,8 @@ from libcst.metadata import CodeRange
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Iterable
 
-from .._symbols import NodeFlags, SymbolNode
-from ._core import (
+from ..graph import NodeFlags, SymbolNode
+from ..plugins._core import (
     SYNTHETIC_POSITION,
     AddEdge,
     AddNode,
@@ -32,7 +32,7 @@ from ._core import (
 )
 
 if TYPE_CHECKING:
-    from .._visitor import VisitorPayload
+    from ..graph import VisitorPayload
 
 # Attribute names Flask / Blueprint use to register a callable. Matched as
 # the rightmost attribute of ``@<instance>.<name>(...)``. Includes the HTTP

@@ -11,8 +11,8 @@ import libcst as cst
 import networkx as nx
 
 from dead_cst import build_symbol_graph
-from dead_cst._plugins import GraphOp, ObserveContext, PluginContext
-from dead_cst._symbols import SymbolTrie
+from dead_cst.plugins import GraphOp, ObserveContext, PluginContext
+from dead_cst.graph import SymbolTrie
 
 
 def _ctx(tmp_path, modules=None):
