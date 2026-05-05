@@ -271,6 +271,57 @@ IMPORT_BASE_EDGES = frozenset(
             },
             id="importlib-import-module-inside-function",
         ),
+        pytest.param(
+            "import importlib\nimportlib.import_module('.functions', 'p')",
+            {
+                "p.x -> p.functions",
+                "p.x -> p.functions.f",
+                "p.x -> p.functions.g",
+                "p.x -> p.x.importlib",
+                "p.x.importlib -> p.x",
+            },
+            id="importlib-import-module-relative-positional-package",
+        ),
+        pytest.param(
+            "import importlib\nimportlib.import_module('.functions', package='p')",
+            {
+                "p.x -> p.functions",
+                "p.x -> p.functions.f",
+                "p.x -> p.functions.g",
+                "p.x -> p.x.importlib",
+                "p.x.importlib -> p.x",
+            },
+            id="importlib-import-module-relative-keyword-package",
+        ),
+        pytest.param(
+            "import importlib\nimportlib.import_module('.functions')",
+            {
+                "p.x -> p.functions",
+                "p.x -> p.functions.f",
+                "p.x -> p.functions.g",
+                "p.x -> p.x.importlib",
+                "p.x.importlib -> p.x",
+            },
+            id="importlib-import-module-relative-uses-enclosing-package",
+        ),
+        pytest.param(
+            "__import__('functions', globals(), locals(), [], 1)",
+            {
+                "p.x -> p.functions",
+                "p.x -> p.functions.f",
+                "p.x -> p.functions.g",
+            },
+            id="dunder-import-positional-level-resolves-relative",
+        ),
+        pytest.param(
+            "__import__('functions', level=1)",
+            {
+                "p.x -> p.functions",
+                "p.x -> p.functions.f",
+                "p.x -> p.functions.g",
+            },
+            id="dunder-import-keyword-level-resolves-relative",
+        ),
     ],
 )
 def test_imports(build_decl_graph, assert_edges, src, expected_extra_edges):
@@ -410,6 +461,32 @@ def test_dunder_import_fromlist_attribute_entries_silent(
             "p.x -> p.functions.g",
         },
     )
+
+
+@pytest.mark.parametrize(
+    "src, fragment",
+    [
+        pytest.param(
+            "__import__('.functions')",
+            "leading dots are invalid for __import__",
+            id="dunder-import-leading-dot-name",
+        ),
+        pytest.param(
+            "level = 1\n__import__('functions', level=level)",
+            "level is not an int literal",
+            id="dunder-import-non-literal-level",
+        ),
+        pytest.param(
+            "import importlib\npkg = 'p'\nimportlib.import_module('.functions', package=pkg)",
+            "package is not a string literal",
+            id="importlib-non-literal-package",
+        ),
+    ],
+)
+def test_dynamic_import_relative_warnings(build_decl_graph, visitor_warnings, src, fragment):
+    build_decl_graph({**IMPORT_TEST_FILES, "p/x.py": src})
+    messages = visitor_warnings()
+    assert any(fragment in m for m in messages), messages
 
 
 def test_dunder_import_fromlist_non_literal_warns(build_decl_graph, visitor_warnings):

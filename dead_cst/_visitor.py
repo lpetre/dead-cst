@@ -121,7 +121,7 @@ class SymbolVisitor(cst.CSTVisitor):
     # edge-attribution rules, flow-analysis fixes, etc. Concurrent
     # bumps on different branches merge with ``max()`` semantics.
     name: str = "default"
-    version: int = 1777968092
+    version: int = 1777971949
 
     def _pos(self, node: cst.CSTNode):
         return self.get_metadata(PositionProvider, node, default=None)
@@ -506,41 +506,121 @@ class SymbolVisitor(cst.CSTVisitor):
 
         Conservative over-approximation: the actual attribute pulled
         out via ``getattr(__import__('m'), 'x')`` is opaque, so every
-        top-level decl in the target module is kept alive. Non-literal
-        module arguments are skipped with a warning.
+        top-level decl in the target module is kept alive. Relative
+        names are resolved against the file's enclosing package the
+        same way ``from .x import *`` is. Non-literal arguments are
+        skipped with a warning.
         """
         callee = self._dynamic_import_call_name(node.func)
         if callee is None:
             return
         if not node.args:
             return
-        module = self._extract_absolute_module_name(node.args[0].value)
-        if module is None:
+        raw = self._string_literal_value(node.args[0].value)
+        if raw is None or not raw:
             logger.warning(
-                "Skipping dynamic import '%s(...)' in %s: "
-                "argument is not an absolute string literal",
+                "Skipping dynamic import '%s(...)' in %s: name is not a string literal",
                 callee,
                 self.path,
             )
+            return
+        module = self._resolve_dynamic_import_name(raw, callee, node)
+        if module is None:
             return
         self._add_star_import(module, self._pos(node))
         if callee == "__import__":
             self._handle_dunder_import_fromlist(node, module)
 
+    def _resolve_dynamic_import_name(self, raw: str, callee: str, node: cst.Call) -> str | None:
+        """Resolve a dynamic-import name to an absolute module path.
+
+        ``importlib.import_module`` encodes relativity as leading dots
+        in ``raw``; ``__import__`` encodes it in the ``level`` int
+        kwarg (the name itself is always absolute). Both forms resolve
+        against the file's enclosing package, or against an explicit
+        literal ``package=`` for ``importlib.import_module``. Returns
+        ``None`` after warning when any required component is
+        non-literal or the resolution fails.
+        """
+        if callee == "__import__":
+            if raw.startswith("."):
+                logger.warning(
+                    "Skipping '__import__(%r)' in %s: leading dots are invalid for __import__",
+                    raw,
+                    self.path,
+                )
+                return None
+            level_expr = self._call_arg(node, position=4, keyword="level")
+            if level_expr is None:
+                return raw
+            level = self._int_literal_value(level_expr)
+            if level is None:
+                logger.warning(
+                    "Skipping '__import__(%r, ..., level=...)' in %s: level is not an int literal",
+                    raw,
+                    self.path,
+                )
+                return None
+            if level == 0:
+                return raw
+            return self._resolve_relative_name("." * level + raw, package=None)
+        # importlib.import_module
+        if not raw.startswith("."):
+            return raw
+        package_expr = self._call_arg(node, position=1, keyword="package")
+        package: str | None = None
+        if package_expr is not None and not (
+            isinstance(package_expr, cst.Name) and package_expr.value == "None"
+        ):
+            package = self._string_literal_value(package_expr)
+            if package is None:
+                logger.warning(
+                    "Skipping 'importlib.import_module(%r, package=...)' in %s: "
+                    "package is not a string literal",
+                    raw,
+                    self.path,
+                )
+                return None
+        return self._resolve_relative_name(raw, package=package)
+
+    def _resolve_relative_name(self, name: str, package: str | None) -> str | None:
+        if package is None:
+            if self.path.name == "__init__.py":
+                package = self.module_node.fqname
+            else:
+                package = self.module_node.fqname.rpartition(".")[0]
+        try:
+            return resolve_name(name, package)
+        except (ImportError, ValueError):
+            logger.warning(
+                "Skipping dynamic import %r in %s: could not resolve against package %r",
+                name,
+                self.path,
+                package,
+            )
+            return None
+
     @staticmethod
-    def _extract_absolute_module_name(arg: cst.BaseExpression) -> str | None:
+    def _string_literal_value(arg: cst.BaseExpression) -> str | None:
         if not isinstance(arg, cst.SimpleString):
             return None
         try:
             value = arg.evaluated_value
         except Exception:
             return None
-        if isinstance(value, str) and value and not value.startswith("."):
-            return value
-        return None
+        return value if isinstance(value, str) else None
+
+    @staticmethod
+    def _int_literal_value(arg: cst.BaseExpression) -> int | None:
+        if not isinstance(arg, cst.Integer):
+            return None
+        try:
+            return int(arg.evaluated_value)
+        except (TypeError, ValueError):
+            return None
 
     def _handle_dunder_import_fromlist(self, node: cst.Call, module: str) -> None:
-        fromlist_expr = self._import_call_fromlist(node)
+        fromlist_expr = self._call_arg(node, position=3, keyword="fromlist")
         if fromlist_expr is None:
             return
         entries = self._extract_string_sequence(fromlist_expr)
@@ -574,17 +654,13 @@ class SymbolVisitor(cst.CSTVisitor):
         return None
 
     @staticmethod
-    def _import_call_fromlist(node: cst.Call) -> cst.BaseExpression | None:
-        """Return the ``fromlist`` arg of a ``__import__`` call, or ``None``.
-
-        ``__import__(name, globals=None, locals=None, fromlist=(), level=0)``:
-        ``fromlist`` is positional index 3 or the keyword ``fromlist``.
-        """
+    def _call_arg(node: cst.Call, *, position: int, keyword: str) -> cst.BaseExpression | None:
+        """Return a positional-index-``position``-or-keyword-``keyword`` arg, or ``None``."""
         for i, arg in enumerate(node.args):
             if arg.keyword is not None:
-                if isinstance(arg.keyword, cst.Name) and arg.keyword.value == "fromlist":
+                if isinstance(arg.keyword, cst.Name) and arg.keyword.value == keyword:
                     return arg.value
-            elif i == 3:
+            elif i == position:
                 return arg.value
         return None
 
