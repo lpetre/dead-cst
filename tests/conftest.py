@@ -1,3 +1,4 @@
+import logging
 import textwrap
 
 import networkx as nx
@@ -21,6 +22,13 @@ def write_files(tmp_path):
             p.write_text(textwrap.dedent(src).strip() + "\n")
 
     return _write
+
+
+@pytest.fixture
+def visitor_warnings(caplog):
+    """Capture WARNING records from the visitor and yield a message getter."""
+    with caplog.at_level(logging.WARNING, logger="dead_cst._visitor"):
+        yield lambda: [r.getMessage() for r in caplog.records]
 
 
 @pytest.fixture

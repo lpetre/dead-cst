@@ -272,6 +272,7 @@ A module-level `import` / `from ... import ...` is itself a declaration of type 
 ## Limitations
 
 - `import *` is treated pessimistically: every top-level declaration in the target module is considered used by the importing module.
+- `__import__('pkg.mod')` and `importlib.import_module('pkg.mod')` are treated the same way when the module name is a string literal -- the call fans out to every top-level decl in the target module so `getattr(__import__('pkg.mod'), 'name')` keeps `pkg.mod.name` reachable. Non-literal arguments (`__import__(var)`) are skipped with a warning. `__import__(name, fromlist=[...])` with a literal list/tuple resolves each entry as a possible submodule and fans those out too; non-literal `fromlist` arguments warn.
 - Dynamic attribute access (`getattr`) and runtime-generated symbols are invisible to static analysis.
 - Only first-party code is analysed; third-party dependencies are treated as opaque (they appear as synthetic nodes — see `dead-cst dependencies`).
 - `__all__` is followed only when assigned a list/tuple of string literals; dynamic mutation (`__all__.append`, comprehensions, etc.) is not tracked.

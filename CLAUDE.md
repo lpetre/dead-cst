@@ -116,7 +116,7 @@ Implement `UnreachableRegionDetector`: `name`, `version`, `find_regions(wrapper)
 
 ## Known limitations to keep in mind
 
-- `import *` is treated pessimistically (every top-level decl in the target is considered used).
+- `import *` is treated pessimistically (every top-level decl in the target is considered used). `__import__('m')` and `importlib.import_module('m')` calls with a string-literal name are folded into the same star-import path; non-literal names warn. `__import__(name, fromlist=[...])` literal entries that resolve as submodules are fanned out as well.
 - Dynamic attribute access (`getattr`) and runtime-generated symbols are invisible to static analysis.
 - `__all__` is followed only when assigned a list/tuple of string literals.
 - PEP 750 template strings (`t"..."`, 3.14+) cannot be parsed by the pinned `libcst` and abort analysis with `ParserSyntaxError`.

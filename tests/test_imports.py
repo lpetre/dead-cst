@@ -348,24 +348,21 @@ def test_dunder_all_edges(build_decl_graph, assert_edges, src, expected_extra_ed
     assert_edges(graph, IMPORT_BASE_EDGES | expected_extra_edges)
 
 
-def test_dynamic_import_non_literal_warns(build_decl_graph, caplog):
+def test_dynamic_import_non_literal_warns(build_decl_graph, visitor_warnings):
     """Non-literal ``__import__(name)`` / ``importlib.import_module(name)`` skip with a warning."""
-    import logging
+    build_decl_graph(
+        {
+            "p/__init__.py": "",
+            "p/x.py": (
+                "import importlib\n"
+                "name = 'p.functions'\n"
+                "def a(): __import__(name)\n"
+                "def b(): importlib.import_module(name)\n"
+            ),
+        }
+    )
 
-    with caplog.at_level(logging.WARNING, logger="dead_cst._visitor"):
-        build_decl_graph(
-            {
-                "p/__init__.py": "",
-                "p/x.py": (
-                    "import importlib\n"
-                    "name = 'p.functions'\n"
-                    "def a(): __import__(name)\n"
-                    "def b(): importlib.import_module(name)\n"
-                ),
-            }
-        )
-
-    messages = [r.getMessage() for r in caplog.records]
+    messages = visitor_warnings()
     assert any("Skipping dynamic import '__import__(...)'" in m for m in messages), messages
     assert any("Skipping dynamic import 'importlib.import_module(...)'" in m for m in messages), (
         messages
@@ -395,16 +392,15 @@ def test_dunder_import_fromlist_resolves_submodules(build_decl_graph, assert_edg
     )
 
 
-def test_dunder_import_fromlist_attribute_entries_silent(build_decl_graph, assert_edges, caplog):
+def test_dunder_import_fromlist_attribute_entries_silent(
+    build_decl_graph, assert_edges, visitor_warnings
+):
     """Fromlist entries that are not submodules don't warn (already covered by name fan-out)."""
-    import logging
+    graph = build_decl_graph(
+        {**IMPORT_TEST_FILES, "p/x.py": "__import__('p.functions', fromlist=['f', ''])"}
+    )
 
-    with caplog.at_level(logging.WARNING, logger="dead_cst._visitor"):
-        graph = build_decl_graph(
-            {**IMPORT_TEST_FILES, "p/x.py": "__import__('p.functions', fromlist=['f', ''])"}
-        )
-
-    assert [r.getMessage() for r in caplog.records] == []
+    assert visitor_warnings() == []
     assert_edges(
         graph,
         IMPORT_BASE_EDGES
@@ -416,19 +412,16 @@ def test_dunder_import_fromlist_attribute_entries_silent(build_decl_graph, asser
     )
 
 
-def test_dunder_import_fromlist_non_literal_warns(build_decl_graph, caplog):
+def test_dunder_import_fromlist_non_literal_warns(build_decl_graph, visitor_warnings):
     """Non-literal fromlists warn (we can't enumerate entries)."""
-    import logging
+    build_decl_graph(
+        {
+            **IMPORT_TEST_FILES,
+            "p/x.py": "names = ['functions']\n__import__('p', fromlist=names)",
+        }
+    )
 
-    with caplog.at_level(logging.WARNING, logger="dead_cst._visitor"):
-        build_decl_graph(
-            {
-                **IMPORT_TEST_FILES,
-                "p/x.py": "names = ['functions']\n__import__('p', fromlist=names)",
-            }
-        )
-
-    messages = [r.getMessage() for r in caplog.records]
+    messages = visitor_warnings()
     assert any("fromlist is not a literal" in m and "'p'" in m for m in messages), messages
 
 

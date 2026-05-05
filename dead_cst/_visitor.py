@@ -502,45 +502,42 @@ class SymbolVisitor(cst.CSTVisitor):
         self._add_import("", node)
 
     def visit_Call(self, node: cst.Call) -> None:
-        """Treat ``__import__('m')`` / ``importlib.import_module('m')`` as star imports.
+        """Treat ``__import__`` / ``importlib.import_module`` as star imports.
 
-        Dynamic imports are usually paired with ``getattr`` to pull a
-        specific attribute, but the attribute name is opaque to static
-        analysis. Fanning the call out to every top-level decl in the
-        target module mirrors how ``from m import *`` is treated -- safe
-        for dead-code analysis (over- rather than under-approximates).
-        Only string-literal arguments are honoured; non-literal forms
-        (``__import__(name)``) emit a warning and produce no edge.
-
-        ``__import__('pkg', fromlist=['mod', ...])`` also imports the
-        listed names as side effects when they are submodules of
-        ``pkg``. When ``fromlist`` is a literal list/tuple of strings
-        every entry that resolves to a real submodule is fanned out
-        too; non-resolving entries are silently treated as plain
-        attributes (already covered by the fan-out from ``pkg``).
-        Non-literal fromlists warn.
+        Conservative over-approximation: the actual attribute pulled
+        out via ``getattr(__import__('m'), 'x')`` is opaque, so every
+        top-level decl in the target module is kept alive. Non-literal
+        module arguments are skipped with a warning.
         """
         callee = self._dynamic_import_call_name(node.func)
         if callee is None:
             return
         if not node.args:
             return
-        arg = node.args[0].value
-        if isinstance(arg, cst.SimpleString):
-            try:
-                module = arg.evaluated_value
-            except Exception:
-                module = None
-            if isinstance(module, str) and module and not module.startswith("."):
-                self._add_star_import(module, self._pos(node))
-                if callee == "__import__":
-                    self._handle_dunder_import_fromlist(node, module)
-                return
-        logger.warning(
-            "Skipping dynamic import '%s(...)' in %s: argument is not an absolute string literal",
-            callee,
-            self.path,
-        )
+        module = self._extract_absolute_module_name(node.args[0].value)
+        if module is None:
+            logger.warning(
+                "Skipping dynamic import '%s(...)' in %s: "
+                "argument is not an absolute string literal",
+                callee,
+                self.path,
+            )
+            return
+        self._add_star_import(module, self._pos(node))
+        if callee == "__import__":
+            self._handle_dunder_import_fromlist(node, module)
+
+    @staticmethod
+    def _extract_absolute_module_name(arg: cst.BaseExpression) -> str | None:
+        if not isinstance(arg, cst.SimpleString):
+            return None
+        try:
+            value = arg.evaluated_value
+        except Exception:
+            return None
+        if isinstance(value, str) and value and not value.startswith("."):
+            return value
+        return None
 
     def _handle_dunder_import_fromlist(self, node: cst.Call, module: str) -> None:
         fromlist_expr = self._import_call_fromlist(node)
