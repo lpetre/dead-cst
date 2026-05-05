@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Iterable
 import libcst as cst
 from libcst.metadata import CodePosition, CodeRange, PositionProvider
 
-from .._symbols import NodeFlags
+from ..graph import NodeFlags
 from ._core import (
     SYNTHETIC_POSITION,
     GraphOp,
@@ -20,7 +20,7 @@ from ._core import (
 )
 
 if TYPE_CHECKING:
-    from .._visitor import VisitorPayload
+    from ..graph import VisitorPayload
 
 MAIN_BLOCK_PREFIX = "<__main__>:"
 

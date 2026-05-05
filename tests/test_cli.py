@@ -21,15 +21,15 @@ import pytest
 from libcst.metadata import CodePosition, CodeRange
 from typer.testing import CliRunner
 
-from dead_cst._plugins import (
+from dead_cst.plugins import (
     ExplicitEntrypointPlugin,
     MainBlockPlugin,
     ModuleDundersPlugin,
 )
-from dead_cst._plugins._core import EXTERNAL_DIST_PREFIX
-from dead_cst._plugins.explicit import EXPLICIT_PREFIX
-from dead_cst._symbols import SymbolNode
-from dead_cst._resolvers import ManualResolver
+from dead_cst.plugins._core import EXTERNAL_DIST_PREFIX
+from dead_cst.plugins.explicit_entrypoint import EXPLICIT_PREFIX
+from dead_cst.graph import SymbolNode
+from dead_cst.resolvers import ManualResolver
 from dead_cst.cli import (
     _dead_real,
     _is_dunder_all,

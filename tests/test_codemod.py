@@ -20,7 +20,7 @@ import pytest
 from libcst.metadata import FullRepoManager, MetadataWrapper
 
 from dead_cst import build_symbol_graph, find_reachable
-from dead_cst._codemod import RemoveDeadSymbols, remove_code
+from dead_cst.codemod import RemoveDeadSymbols, remove_code
 from dead_cst._fqn import FixedFullyQualifiedNameProvider
 
 

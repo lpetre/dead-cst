@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from dead_cst import (
+from dead_cst import build_symbol_graph
+from dead_cst.plugins import (
     ClickPlugin,
     ExplicitEntrypointPlugin,
     MainBlockPlugin,
-    build_symbol_graph,
 )
 
 
@@ -657,7 +657,7 @@ def test_click_plugin_ignores_non_group_assignment_shapes(tmp_path, write_files,
 
 
 def test_click_plugin_loads_via_load_plugin():
-    from dead_cst import load_plugin
+    from dead_cst.plugins import load_plugin
 
     plugin = load_plugin("click")
     assert isinstance(plugin, ClickPlugin)

@@ -1,11 +1,11 @@
-"""Tests for :func:`dead_cst._resolvers.exported_roots` backend dispatch."""
+"""Tests for :func:`dead_cst.resolvers.exported_roots` backend dispatch."""
 
 from __future__ import annotations
 
 import textwrap
 from pathlib import Path
 
-from dead_cst._resolvers import exported_roots
+from dead_cst.resolvers import exported_roots
 
 
 def test_exported_roots_no_pyproject(tmp_path: Path):

@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dead_cst import ProjectScriptsPlugin, build_symbol_graph
+from dead_cst import build_symbol_graph
+from dead_cst.plugins import ProjectScriptsPlugin
 
 
 def test_project_scripts_plugin(tmp_path, write_files, reachable_fqnames):

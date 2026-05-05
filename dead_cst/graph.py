@@ -1,3 +1,17 @@
+"""Public data types of the symbol graph.
+
+:class:`SymbolNode` is what every node in the graph
+:func:`dead_cst.analyze.build_symbol_graph` returns is. :class:`Import`
+captures a cross-file reference at visitor time, before the per-base
+edge stitcher resolves it. :class:`NodeFlags` and :class:`EdgeFlags`
+mark structural attributes (``SHADOWED`` decls, ``DEAD_BRANCH`` edges,
+explicit ``ENTRYPOINT``\\s).
+
+:class:`VisitorPayload` is the analyzer's per-file output -- the
+serializable shape stored in :class:`~dead_cst.cache.GraphCache` and
+the type :meth:`dead_cst.plugins.EdgePlugin.observe` returns.
+"""
+
 from __future__ import annotations
 
 import enum
@@ -35,7 +49,7 @@ class EdgeFlags(enum.IntFlag):
     """Analyzer-internal marker on graph edges.
 
     ``DEAD_BRANCH`` flags an edge whose reference originated inside a
-    statically-dead suite (per :func:`dead_cst._branches.unreachable_suites`).
+    statically-dead suite (per :func:`dead_cst.branches.unreachable_suites`).
     Default :func:`dead_cst.find_reachable` does **not** filter by this
     flag -- today's behavior, where dead-code references propagate
     liveness through the enclosing decl, is preserved. The opt-in
@@ -63,6 +77,38 @@ class SymbolNode:
     position: CodeRange
     imports: Import | None = None
     flags: NodeFlags = NodeFlags.NONE
+
+
+@dataclass(frozen=True, slots=True)
+class VisitorPayload:
+    """Serializable per-file output of the analyzer's symbol visitor.
+
+    Four fields cover everything the analyzer needs to reconstruct one
+    file's contribution to the symbol graph:
+
+    * ``nodes`` -- every real ``SymbolNode`` for this file (module +
+      top-level decls). Decls displaced by flow analysis are flagged
+      :data:`NodeFlags.SHADOWED`; the apply step uses that flag to keep
+      them out of the lookup trie while still emitting the parent-module
+      edge for the graph.
+    * ``edges`` -- ``(src, dst, access_pos)`` triples for resolved
+      decl-to-decl references. ``access_pos`` is the source location
+      of the reference; the apply step compares it against
+      ``dead_suites`` to decide whether the resulting graph edge gets
+      :data:`EdgeFlags.DEAD_BRANCH`.
+    * ``imports`` -- ``(src, Import, access_pos)`` triples for
+      unresolved cross-file references. The apply step feeds them into
+      ``resolve_edges`` along with the derived flag.
+    * ``dead_suites`` -- positions of every statically-dead suite in
+      the file (including ones with no outgoing references). Used both
+      for flag derivation and for surfacing "this file has unreachable
+      code at line X" reports without per-edge attribution.
+    """
+
+    nodes: tuple[SymbolNode, ...]
+    edges: tuple[tuple[SymbolNode, SymbolNode, CodeRange], ...]
+    imports: tuple[tuple[SymbolNode, Import, CodeRange], ...]
+    dead_suites: tuple[CodeRange, ...]
 
 
 @dataclass(slots=True)
@@ -209,3 +255,15 @@ class SymbolTrie:
 
         # Start the walk from the root
         _walk_and_add_edges(self, None)
+
+
+# ``SymbolTrie`` is intentionally absent from ``__all__`` -- it's an
+# internal data structure shared between the visitor, edge stitcher, and
+# plugin context, but not part of the public surface.
+__all__ = [
+    "EdgeFlags",
+    "Import",
+    "NodeFlags",
+    "SymbolNode",
+    "VisitorPayload",
+]

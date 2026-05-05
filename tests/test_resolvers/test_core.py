@@ -1,4 +1,4 @@
-"""Tests for :mod:`dead_cst._resolvers._core` and :func:`load_resolver`."""
+"""Tests for :mod:`dead_cst.resolvers._core` and :func:`load_resolver`."""
 
 from __future__ import annotations
 
@@ -6,14 +6,14 @@ from pathlib import Path
 
 import pytest
 
-from dead_cst import (
+from dead_cst.resolvers import (
     PyprojectResolver,
     UvWorkspaceResolver,
     VenvResolver,
     load_resolver,
+    load_toml,
     merge_paths,
 )
-from dead_cst._resolvers._core import load_toml
 
 
 def test_merge_paths_unions_deps():

@@ -12,7 +12,7 @@ from ._imports import default_resolve_import
 
 class MissingVenvError(RuntimeError):
     """Raised by :class:`VenvResolver` (and resolvers that compose it,
-    like :class:`~dead_cst._resolvers.uv_workspace.UvWorkspaceResolver`)
+    like :class:`~dead_cst.contrib.uv_workspace.UvWorkspaceResolver`)
     when the user asked for venv-based resolution but no virtual
     environment could be located.
 
@@ -61,7 +61,7 @@ def find_venv_site_packages(project_root: Path, venv_dir: str | None = None) -> 
     under the project, the conventional ``.venv`` / ``venv`` siblings,
     or the currently-active venv. Returns ``None`` if none of those
     point at a real ``site-packages``. Shared with
-    :class:`~dead_cst._resolvers.uv_workspace.UvWorkspaceResolver` so
+    :class:`~dead_cst.contrib.uv_workspace.UvWorkspaceResolver` so
     workspace setups inherit the same venv discovery.
     """
     project_root = project_root.resolve()

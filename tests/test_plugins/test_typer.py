@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from dead_cst import (
+from dead_cst import build_symbol_graph
+from dead_cst.plugins import (
     ExplicitEntrypointPlugin,
     MainBlockPlugin,
     TyperPlugin,
-    build_symbol_graph,
 )
 
 
@@ -442,7 +442,7 @@ def test_typer_plugin_ignores_import_star(tmp_path, write_files, reachable_fqnam
 
 
 def test_typer_plugin_loads_via_load_plugin():
-    from dead_cst import load_plugin
+    from dead_cst.plugins import load_plugin
 
     plugin = load_plugin("typer")
     assert isinstance(plugin, TyperPlugin)

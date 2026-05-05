@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-from dataclasses import dataclass
 from functools import cache
 from importlib.util import resolve_name
 from pathlib import Path
@@ -25,12 +24,12 @@ from libcst.metadata.scope_provider import (
     Scope,
 )
 
-from ._branches import DefaultUnreachableRegionDetector, UnreachableRegionDetector
 from ._flow import live_at_exit, live_referents
 from ._fqn import FixedFullyQualifiedNameProvider
-from ._plugins._core import UNRESOLVED_PREFIX
-from ._resolvers import ImportResolver, default_resolve_import
-from ._symbols import Import, NodeFlags, SymbolNode, SymbolTrie
+from .branches import DefaultUnreachableRegionDetector, UnreachableRegionDetector
+from .graph import Import, NodeFlags, SymbolNode, SymbolTrie, VisitorPayload
+from .plugins._core import UNRESOLVED_PREFIX
+from .resolvers import ImportResolver, default_resolve_import
 
 logger = logging.getLogger(__name__)
 
@@ -46,38 +45,6 @@ def _dotted_name_parts(
             yield nm, n
         full = f"{nm}.{node.attr.value}"
         yield full, node.attr
-
-
-@dataclass(frozen=True, slots=True)
-class VisitorPayload:
-    """Serializable per-file output of :class:`SymbolVisitor`.
-
-    Four fields cover everything the analyzer needs to reconstruct one
-    file's contribution to the symbol graph:
-
-    * ``nodes`` -- every real ``SymbolNode`` for this file (module +
-      top-level decls). Decls displaced by flow analysis are flagged
-      :data:`NodeFlags.SHADOWED`; the apply step uses that flag to keep
-      them out of the lookup trie while still emitting the parent-module
-      edge for the graph.
-    * ``edges`` -- ``(src, dst, access_pos)`` triples for resolved
-      decl-to-decl references. ``access_pos`` is the source location
-      of the reference; the apply step compares it against
-      ``dead_suites`` to decide whether the resulting graph edge gets
-      :data:`EdgeFlags.DEAD_BRANCH`.
-    * ``imports`` -- ``(src, Import, access_pos)`` triples for
-      unresolved cross-file references. The apply step feeds them into
-      ``resolve_edges`` along with the derived flag.
-    * ``dead_suites`` -- positions of every statically-dead suite in
-      the file (including ones with no outgoing references). Used both
-      for flag derivation and for surfacing "this file has unreachable
-      code at line X" reports without per-edge attribution.
-    """
-
-    nodes: tuple[SymbolNode, ...]
-    edges: tuple[tuple[SymbolNode, SymbolNode, CodeRange], ...]
-    imports: tuple[tuple[SymbolNode, Import, CodeRange], ...]
-    dead_suites: tuple[CodeRange, ...]
 
 
 def _pair_targets(
@@ -878,10 +845,10 @@ class SymbolVisitor(cst.CSTVisitor):
         pointing at them is remapped to the same flagged identity, so
         the resulting graph nodes and edges line up. The per-edge
         :class:`CodeRange` (the access position) is preserved as-is;
-        the apply step in :mod:`dead_cst._analyze` derives the
+        the apply step in :mod:`dead_cst.analyze` derives the
         :data:`EdgeFlags.DEAD_BRANCH` flag from it by checking
         containment against :attr:`dead_suites` (populated by the
-        configured :class:`~dead_cst._branches.UnreachableRegionDetector`
+        configured :class:`~dead_cst.branches.UnreachableRegionDetector`
         in :meth:`visit_Module`).
         """
         flag_map: dict[SymbolNode, SymbolNode] = {

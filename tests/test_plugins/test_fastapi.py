@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dead_cst import FastAPIPlugin, build_symbol_graph
+from dead_cst import build_symbol_graph
+from dead_cst.plugins import FastAPIPlugin
 
 
 def test_fastapi_plugin_marks_route_handlers(tmp_path, write_files, reachable_fqnames):
@@ -434,7 +435,7 @@ def test_fastapi_plugin_ignores_non_app_fastapi_users(tmp_path, write_files, rea
 
 
 def test_fastapi_plugin_loads_via_load_plugin():
-    from dead_cst import load_plugin
+    from dead_cst.plugins import load_plugin
 
     plugin = load_plugin("fastapi")
     assert isinstance(plugin, FastAPIPlugin)

@@ -1,4 +1,4 @@
-"""Tests for :class:`dead_cst._resolvers.venv.VenvResolver`."""
+"""Tests for :class:`dead_cst.resolvers.venv.VenvResolver`."""
 
 from __future__ import annotations
 
@@ -6,8 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from dead_cst import VenvResolver
-from dead_cst._resolvers import MissingVenvError
+from dead_cst.resolvers import VenvResolver
+from dead_cst.resolvers import MissingVenvError
 
 
 def test_venv_resolver_finds_site_packages(tmp_path: Path):

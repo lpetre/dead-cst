@@ -1,146 +1,78 @@
 """Dead code analysis for Python using LibCST.
 
-`dead-cst` builds a symbol-level reachability graph of a Python codebase and
-reports (or removes) anything not reachable from a configurable set of
-entrypoints.
+``dead-cst`` builds a symbol-level reachability graph of a Python codebase
+and reports (or removes) anything not reachable from a configurable set
+of entrypoints.
 
-The public API has three extension points, all of which inherit from a
-single :class:`Cacheable` protocol (``name: str``, ``version: int``) so
-the per-file cache invalidates cleanly when any of them is swapped or
-bumped:
+The top-level package re-exports the names most callers need:
+:func:`build_symbol_graph` to run the analysis,
+:func:`find_reachable` / :func:`find_kept_alive_by_dead_branches` /
+:func:`count_nodes` / :func:`order_paths` to inspect the result,
+:func:`remove_code` to apply the codemod, and the graph data types
+(:class:`SymbolNode`, :class:`Import`, :class:`NodeFlags`,
+:class:`EdgeFlags`).
 
-* :func:`build_symbol_graph` parses every ``.py`` file under each base in a
-  ``{base: [dep_paths]}`` map and returns a :class:`networkx.MultiDiGraph` of
-  :class:`SymbolNode` instances. Edges encode "keeps alive" relationships
-  and carry a :class:`EdgeFlags` ``flags`` attribute. References from
-  inside statically-dead suites are flagged ``DEAD_BRANCH``.
-* Edge plugins (:class:`MainBlockPlugin`, :class:`ProjectScriptsPlugin`,
-  :class:`ExplicitEntrypointPlugin`, :class:`ModuleDundersPlugin`,
-  :class:`PytestPlugin`, :class:`UnittestPlugin`, :class:`FastAPIPlugin`,
-  :class:`FlaskPlugin`, :class:`TyperPlugin`, :class:`ClickPlugin`)
-  extend the graph with edges that pure CST analysis can't infer --
-  entry points, framework conventions, dynamic dispatch. Custom
-  plugins implement the :class:`EdgePlugin` protocol.
-* Path resolvers (:class:`VenvResolver`, :class:`PyprojectResolver`,
-  :class:`UvWorkspaceResolver`) discover the ``{base: [dep_paths]}`` map
-  itself from a project root, so callers don't have to hand-build it.
-* The unreachable-region detector (:class:`UnreachableRegionDetector`)
-  decides which source ranges count as statically dead. The built-in
-  :class:`DefaultUnreachableRegionDetector` covers literal-only
-  truthiness on ``if`` / ``while`` tests, fixpoint constant-folding
-  over simple ``Name = literal`` assignments, and post-terminator
-  regions inside every suite. Override
-  :meth:`DefaultUnreachableRegionDetector.resolve` in a subclass to
-  fold in domain knowledge -- e.g. ``check_flag("migration-abc")``
-  is always ``True`` in production -- and pass the instance via
-  ``build_symbol_graph(unreachable_detector=...)``.
+The deeper public surface lives in focused sub-packages; pull from
+those when writing extensions:
 
-After plugins run, :func:`find_reachable` walks successors from every node
-tagged with ``entrypoint=True`` and returns the live set;
-:func:`remove_code` rewrites source files in place to delete the rest via
-a LibCST codemod that preserves surrounding formatting.
+* :mod:`dead_cst.graph` -- node and payload data types.
+* :mod:`dead_cst.analyze` -- the analysis driver and reachability helpers.
+* :mod:`dead_cst.codemod` -- the LibCST-based source rewriter.
+* :mod:`dead_cst.cache` -- :class:`~dead_cst.cache.GraphCache` and the
+  :func:`~dead_cst.cache.compute_fingerprint` helper for callers that
+  share or inspect the per-file cache.
+* :mod:`dead_cst.branches` -- the :class:`UnreachableRegionDetector`
+  protocol, :class:`DefaultUnreachableRegionDetector`, and the
+  truthiness / fold helpers a from-scratch detector needs.
+* :mod:`dead_cst.plugins` -- the :class:`EdgePlugin` protocol, the
+  :class:`PluginContext` / :class:`ObserveContext` types,
+  :class:`GraphOp` value objects, and the synthetic-node prefix
+  constants the analyzer uses for non-first-party imports.
+* :mod:`dead_cst.resolvers` -- the :class:`PathResolver` protocol,
+  builtin resolvers (:class:`VenvResolver`, :class:`PyprojectResolver`,
+  :class:`ManualResolver`), and the ``sys.path`` / ``importlib``
+  helpers a custom resolver may want to reuse.
+* :mod:`dead_cst.contrib` -- extensions targeting specific third-party
+  tools: framework plugins (:class:`FastAPIPlugin`, :class:`FlaskPlugin`,
+  :class:`ClickPlugin`, :class:`TyperPlugin`, :class:`PytestPlugin`,
+  :class:`UnittestPlugin`) and tool-specific resolvers
+  (:class:`UvWorkspaceResolver`). All contrib classes are also
+  re-exported from ``dead_cst.plugins`` / ``dead_cst.resolvers`` for
+  ergonomics.
 
-See the README for the CLI, the entrypoint and search-path specs, and the
-limitations of static analysis.
+The :class:`Cacheable` protocol (``name: str`` + ``version: int``) is
+the common contract every extension point inherits from -- the
+``(name, version)`` pair feeds the per-file cache fingerprint, so
+swapping or reconfiguring any of them invalidates stale entries.
+
+See the README for the CLI, the entrypoint and search-path specs, and
+the limitations of static analysis. ``dead-cst`` is alpha; APIs, CLI
+flags, and output formats may change without notice.
 """
 
-from ._analyze import (
+from ._cacheable import Cacheable
+from ._version import __version__
+from .analyze import (
     build_symbol_graph,
     count_nodes,
     find_kept_alive_by_dead_branches,
     find_reachable,
     order_paths,
 )
-from ._branches import (
-    DefaultUnreachableRegionDetector,
-    UnreachableRegionDetector,
-)
-from ._cacheable import Cacheable
-from ._codemod import remove_code
-from ._symbols import EdgeFlags, NodeFlags
-from ._plugins import (
-    AddEdge,
-    AddNode,
-    BUILTIN_PLUGINS,
-    ClickPlugin,
-    DecoratedDeclPlugin,
-    EdgePlugin,
-    ExplicitEntrypointPlugin,
-    FastAPIPlugin,
-    FlaskPlugin,
-    GraphOp,
-    InitSubclassPlugin,
-    LiteralListPlugin,
-    MainBlockPlugin,
-    ModuleDundersPlugin,
-    ObserveContext,
-    PluginContext,
-    ProjectScriptsPlugin,
-    PytestPlugin,
-    RemoveEdge,
-    TyperPlugin,
-    UnittestPlugin,
-    entrypoint_payload,
-    load_plugin,
-    mark_entrypoints,
-    synthetic_node,
-)
-from ._resolvers import (
-    BUILTIN_RESOLVERS,
-    ManualResolver,
-    PathResolver,
-    PyprojectResolver,
-    UvWorkspaceResolver,
-    VenvResolver,
-    load_resolver,
-    merge_paths,
-)
-from ._version import __version__
+from .codemod import remove_code
+from .graph import EdgeFlags, Import, NodeFlags, SymbolNode
 
 __all__ = [
-    "__version__",
-    "AddEdge",
-    "AddNode",
-    "BUILTIN_PLUGINS",
-    "BUILTIN_RESOLVERS",
     "Cacheable",
-    "ClickPlugin",
-    "DecoratedDeclPlugin",
-    "DefaultUnreachableRegionDetector",
     "EdgeFlags",
-    "EdgePlugin",
-    "ExplicitEntrypointPlugin",
-    "FastAPIPlugin",
-    "FlaskPlugin",
-    "GraphOp",
-    "InitSubclassPlugin",
-    "LiteralListPlugin",
-    "MainBlockPlugin",
-    "ManualResolver",
-    "ModuleDundersPlugin",
+    "Import",
     "NodeFlags",
-    "ObserveContext",
-    "PathResolver",
-    "PluginContext",
-    "ProjectScriptsPlugin",
-    "PyprojectResolver",
-    "PytestPlugin",
-    "RemoveEdge",
-    "TyperPlugin",
-    "UnittestPlugin",
-    "UnreachableRegionDetector",
-    "UvWorkspaceResolver",
-    "VenvResolver",
+    "SymbolNode",
+    "__version__",
     "build_symbol_graph",
     "count_nodes",
-    "entrypoint_payload",
     "find_kept_alive_by_dead_branches",
     "find_reachable",
-    "load_plugin",
-    "load_resolver",
-    "mark_entrypoints",
-    "merge_paths",
     "order_paths",
     "remove_code",
-    "synthetic_node",
 ]

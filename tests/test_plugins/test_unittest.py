@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dead_cst import UnittestPlugin, build_symbol_graph
+from dead_cst import build_symbol_graph
+from dead_cst.plugins import UnittestPlugin
 
 
 def test_unittest_plugin_marks_testcase_subclass(tmp_path, write_files, reachable_fqnames):
@@ -201,7 +202,7 @@ def test_unittest_plugin_skips_pure_star_import(tmp_path, write_files, reachable
 
 
 def test_unittest_plugin_loads_via_load_plugin():
-    from dead_cst import load_plugin
+    from dead_cst.plugins import load_plugin
 
     plugin = load_plugin("unittest")
     assert isinstance(plugin, UnittestPlugin)

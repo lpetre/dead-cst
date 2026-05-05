@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dead_cst import PytestPlugin, build_symbol_graph
+from dead_cst import build_symbol_graph
+from dead_cst.plugins import PytestPlugin
 
 
 def test_pytest_plugin_marks_test_functions(tmp_path, write_files, reachable_fqnames):
@@ -156,7 +157,7 @@ def test_pytest_plugin_ignores_non_test_modules(tmp_path, write_files, reachable
 
 
 def test_pytest_plugin_loads_via_load_plugin():
-    from dead_cst import load_plugin
+    from dead_cst.plugins import load_plugin
 
     plugin = load_plugin("pytest")
     assert isinstance(plugin, PytestPlugin)

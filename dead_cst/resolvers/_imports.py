@@ -22,7 +22,7 @@ from functools import cache
 from importlib.machinery import ModuleSpec
 from pathlib import Path
 
-from .._plugins._core import (
+from ..plugins._core import (
     EXTERNAL_DIST_PREFIX,
     EXTERNAL_FILE_PREFIX,
     STDLIB_PREFIX,
@@ -117,7 +117,7 @@ def distribution_lookup() -> dict[Path, str]:
     third-party distribution.
 
     Cached process-wide. The analyzer clears it in worker transitions
-    (see :func:`dead_cst._analyze._on_search_paths_change`) so a worker
+    (see :func:`dead_cst.analyze._on_search_paths_change`) so a worker
     that crosses a venv boundary -- e.g. between two uv-workspace
     members each with their own ``.venv`` -- doesn't keep the prior
     venv's dist map. Serial single-process runs already have a stable

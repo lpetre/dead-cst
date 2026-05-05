@@ -43,13 +43,14 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
-from ._branches import (
+from ._visitor import SymbolVisitor
+from .branches import (
     DefaultUnreachableRegionDetector,
     UnreachableRegionDetector,
 )
-from ._plugins._core import EdgePlugin
-from ._resolvers import PathMap, PathResolver
-from ._visitor import SymbolVisitor, VisitorPayload
+from .graph import VisitorPayload
+from .plugins._core import EdgePlugin
+from .resolvers import PathMap, PathResolver
 
 logger = logging.getLogger(__name__)
 
@@ -294,3 +295,12 @@ def clear_cache(db_path: Path) -> bool:
     if parent.name == CACHE_DIR_NAME and parent.exists() and not any(parent.iterdir()):
         parent.rmdir()
     return True
+
+
+__all__ = [
+    "GraphCache",
+    "SCHEMA_VERSION",
+    "clear_cache",
+    "compute_fingerprint",
+    "default_cache_path",
+]

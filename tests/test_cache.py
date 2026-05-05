@@ -22,7 +22,7 @@ import pytest
 from typer.testing import CliRunner
 
 from dead_cst import build_symbol_graph
-from dead_cst._cache import (
+from dead_cst.cache import (
     CACHE_DIR_NAME,
     GraphCache,
     clear_cache,
@@ -30,8 +30,8 @@ from dead_cst._cache import (
     default_cache_path,
     file_hash,
 )
-from dead_cst._resolvers import ManualResolver
-from dead_cst._visitor import VisitorPayload
+from dead_cst.resolvers import ManualResolver
+from dead_cst.graph import VisitorPayload
 from dead_cst.cli import app
 
 
@@ -83,7 +83,7 @@ def test_fingerprint_subclasses_with_distinct_names_distinct(tmp_path):
     """
     from dataclasses import dataclass
 
-    from dead_cst import LiteralListPlugin
+    from dead_cst.plugins import LiteralListPlugin
 
     @dataclass(kw_only=True)
     class A(LiteralListPlugin):
@@ -180,7 +180,7 @@ def test_fingerprint_changes_when_plugin_version_bumped(tmp_path):
     """
     from dataclasses import dataclass
 
-    from dead_cst import LiteralListPlugin
+    from dead_cst.plugins import LiteralListPlugin
 
     @dataclass(kw_only=True)
     class P(LiteralListPlugin):
@@ -203,7 +203,7 @@ def test_abstract_base_requires_name_and_version():
     fingerprint is always well-defined."""
     import pytest
 
-    from dead_cst import DecoratedDeclPlugin, LiteralListPlugin
+    from dead_cst.plugins import DecoratedDeclPlugin, LiteralListPlugin
 
     with pytest.raises(TypeError):
         LiteralListPlugin()
@@ -372,16 +372,16 @@ def test_warm_run_skips_visitor(tmp_path, monkeypatch):
 
     # Patch SymbolVisitor at the call site (it's imported by name in
     # _analyze) and assert the warm run never instantiates it.
-    from dead_cst import _analyze
+    from dead_cst import analyze
 
     calls = []
-    real = _analyze.SymbolVisitor
+    real = analyze.SymbolVisitor
 
     def _spy(*args, **kwargs):
         calls.append(args)
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(_analyze, "SymbolVisitor", _spy)
+    monkeypatch.setattr(analyze, "SymbolVisitor", _spy)
     with GraphCache(db, fingerprint=fp) as cache:
         build_symbol_graph({tmp_path: []}, cache=cache)
     assert calls == []
@@ -401,7 +401,8 @@ def test_warm_run_with_plugins_parses_zero_files(tmp_path, monkeypatch):
     """
     import libcst as cst
 
-    from dead_cst import (
+    from dead_cst import analyze
+    from dead_cst.plugins import (
         ClickPlugin,
         FastAPIPlugin,
         FlaskPlugin,
@@ -413,7 +414,6 @@ def test_warm_run_with_plugins_parses_zero_files(tmp_path, monkeypatch):
         TyperPlugin,
         UnittestPlugin,
     )
-    from dead_cst import _analyze
 
     _write(
         tmp_path,
@@ -455,10 +455,10 @@ def test_warm_run_with_plugins_parses_zero_files(tmp_path, monkeypatch):
     wrapper_calls: list[object] = []
     parse_calls: list[object] = []
     fqn_calls: list[object] = []
-    real_visitor = _analyze.SymbolVisitor
-    real_wrapper = _analyze.MetadataWrapper
+    real_visitor = analyze.SymbolVisitor
+    real_wrapper = analyze.MetadataWrapper
     real_parse = cst.parse_module
-    real_gen_cache = _analyze.FixedFullyQualifiedNameProvider.gen_cache
+    real_gen_cache = analyze.FixedFullyQualifiedNameProvider.gen_cache
 
     def _visitor_spy(*args, **kwargs):
         visitor_calls.append(args)
@@ -476,12 +476,10 @@ def test_warm_run_with_plugins_parses_zero_files(tmp_path, monkeypatch):
         fqn_calls.append(args)
         return real_gen_cache(*args, **kwargs)
 
-    monkeypatch.setattr(_analyze, "SymbolVisitor", _visitor_spy)
-    monkeypatch.setattr(_analyze, "MetadataWrapper", _wrapper_spy)
+    monkeypatch.setattr(analyze, "SymbolVisitor", _visitor_spy)
+    monkeypatch.setattr(analyze, "MetadataWrapper", _wrapper_spy)
     monkeypatch.setattr(cst, "parse_module", _parse_spy)
-    monkeypatch.setattr(
-        _analyze.FixedFullyQualifiedNameProvider, "gen_cache", classmethod(_fqn_spy)
-    )
+    monkeypatch.setattr(analyze.FixedFullyQualifiedNameProvider, "gen_cache", classmethod(_fqn_spy))
 
     with GraphCache(db, fingerprint=fp) as cache:
         build_symbol_graph({tmp_path: []}, plugins=plugins, cache=cache)
@@ -509,16 +507,16 @@ def test_edited_file_re_runs_visitor(tmp_path, monkeypatch):
 
     (tmp_path / "pkg" / "a.py").write_text("def f(): return 1\n")
 
-    from dead_cst import _analyze
+    from dead_cst import analyze
 
     visited: list[Path] = []
-    real = _analyze.SymbolVisitor
+    real = analyze.SymbolVisitor
 
     def _spy(path, *args, **kwargs):
         visited.append(path)
         return real(path, *args, **kwargs)
 
-    monkeypatch.setattr(_analyze, "SymbolVisitor", _spy)
+    monkeypatch.setattr(analyze, "SymbolVisitor", _spy)
     with GraphCache(db, fingerprint=fp) as cache:
         build_symbol_graph({tmp_path: []}, cache=cache)
 
@@ -540,16 +538,16 @@ def test_fingerprint_change_forces_full_rebuild(tmp_path, monkeypatch):
     with GraphCache(db, fingerprint=fp1) as cache:
         build_symbol_graph({tmp_path: []}, cache=cache)
 
-    from dead_cst import _analyze
+    from dead_cst import analyze
 
     visited: list[Path] = []
-    real = _analyze.SymbolVisitor
+    real = analyze.SymbolVisitor
 
     def _spy(path, *args, **kwargs):
         visited.append(path)
         return real(path, *args, **kwargs)
 
-    monkeypatch.setattr(_analyze, "SymbolVisitor", _spy)
+    monkeypatch.setattr(analyze, "SymbolVisitor", _spy)
     with GraphCache(db, fingerprint="changed") as cache:
         build_symbol_graph({tmp_path: []}, cache=cache)
     # All three files (init + a + b) get re-visited under the new fingerprint.
@@ -566,7 +564,7 @@ def test_plugin_contributions_survive_warm_cache(tmp_path):
     runs every analysis (graph-only, no CST). The end-to-end live
     set must match the cold run.
     """
-    from dead_cst import MainBlockPlugin
+    from dead_cst.plugins import MainBlockPlugin
 
     _write(
         tmp_path,
@@ -598,7 +596,7 @@ def test_plugin_contributions_survive_warm_cache(tmp_path):
 
 def test_plugin_version_bump_invalidates_cache(tmp_path, monkeypatch):
     """Bumping a plugin's ``version`` invalidates its cached observe output."""
-    from dead_cst import MainBlockPlugin
+    from dead_cst.plugins import MainBlockPlugin
 
     _write(
         tmp_path,
@@ -621,16 +619,16 @@ def test_plugin_version_bump_invalidates_cache(tmp_path, monkeypatch):
     fp_v2 = compute_fingerprint(paths={tmp_path: []}, resolvers=[], plugins=[bumped])
     assert fp_v1 != fp_v2
 
-    from dead_cst import _analyze
+    from dead_cst import analyze
 
     visited: list[Path] = []
-    real = _analyze.SymbolVisitor
+    real = analyze.SymbolVisitor
 
     def _spy(path, *args, **kwargs):
         visited.append(path)
         return real(path, *args, **kwargs)
 
-    monkeypatch.setattr(_analyze, "SymbolVisitor", _spy)
+    monkeypatch.setattr(analyze, "SymbolVisitor", _spy)
     with GraphCache(db, fingerprint=fp_v2) as cache:
         build_symbol_graph({tmp_path: []}, plugins=[bumped], cache=cache)
     assert {p.name for p in visited} == {"__init__.py", "m.py"}

@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dead_cst import MainBlockPlugin, build_symbol_graph
+from dead_cst import build_symbol_graph
+from dead_cst.plugins import MainBlockPlugin
 
 
 def test_main_block_plugin_marks_module_entrypoint(tmp_path, write_files, reachable_fqnames):

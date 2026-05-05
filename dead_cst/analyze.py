@@ -12,34 +12,32 @@ import networkx as nx
 from libcst.helpers.module import ModuleNameAndPackage
 from libcst.metadata import CodeRange, MetadataWrapper
 
-from ._branches import (
+from ._edges import resolve_edges
+from ._fqn import FixedFullyQualifiedNameProvider
+from ._visitor import SymbolVisitor
+from .branches import (
     DefaultUnreachableRegionDetector,
     UnreachableRegionDetector,
 )
-from ._cache import GraphCache
-from ._edges import resolve_edges
-from ._fqn import FixedFullyQualifiedNameProvider
-from ._plugins import (
+from .cache import GraphCache
+from .graph import EdgeFlags, Import, NodeFlags, SymbolNode, SymbolTrie, VisitorPayload
+from .plugins import (
     EdgePlugin,
     ObserveContext,
     PluginContext,
     apply_ops,
 )
-from ._plugins._core import make_payload
-from ._resolvers import (
+from .plugins._core import make_payload
+from .resolvers import (
     ImportResolver,
     PathMap,
     PathResolver,
     default_resolve_import,
-    exported_roots,
-)
-from ._resolvers._imports import (
     distribution_lookup,
     editable_distribution_roots,
+    exported_roots,
     safe_resolve_module,
 )
-from ._symbols import EdgeFlags, Import, NodeFlags, SymbolNode, SymbolTrie
-from ._visitor import SymbolVisitor, VisitorPayload
 
 logger = logging.getLogger(__name__)
 
@@ -146,7 +144,7 @@ def build_symbol_graph(
         Project root used by plugins for path-relative matching. If
         omitted, inferred as the shortest path in ``paths``.
     cache:
-        Optional :class:`~dead_cst._cache.GraphCache`. When provided,
+        Optional :class:`~dead_cst.cache.GraphCache`. When provided,
         per-file :class:`VisitorPayload` results are looked up by
         content hash and the visitor pass is skipped on cache hit.
         Plugins, edge resolution, and entrypoint seeding all run
@@ -154,10 +152,10 @@ def build_symbol_graph(
         short-circuits the per-file visit. Pass ``None`` (the default)
         to bypass caching entirely.
     unreachable_detector:
-        Optional :class:`~dead_cst._branches.UnreachableRegionDetector`
+        Optional :class:`~dead_cst.branches.UnreachableRegionDetector`
         whose :meth:`find_regions` is invoked once per file to compute
         the set of statically-dead suite positions. Defaults to
-        :class:`~dead_cst._branches.DefaultUnreachableRegionDetector`,
+        :class:`~dead_cst.branches.DefaultUnreachableRegionDetector`,
         which evaluates only literal-truthiness of ``if`` / ``while``
         tests. Override to fold in domain knowledge (e.g. config flags
         whose value is fixed in production). The returned
@@ -769,7 +767,7 @@ def find_reachable(graph: nx.MultiDiGraph) -> set[SymbolNode]:
     """BFS forward from every node tagged as an entrypoint by a plugin.
 
     Plugins mark seeds by setting ``graph.nodes[node]["entrypoint"] = True``
-    (see :func:`dead_cst._plugins.apply_ops`). There is no longer any
+    (see :func:`dead_cst.plugins.apply_ops`). There is no longer any
     built-in matching against file paths or FQNs -- that lives in
     :class:`ExplicitEntrypointPlugin`.
 
@@ -837,3 +835,12 @@ def count_nodes(graph: nx.MultiDiGraph, prefix: Path | None) -> dict[str, int]:
             continue
         counts[node.type] = counts.get(node.type, 0) + 1
     return counts
+
+
+__all__ = [
+    "build_symbol_graph",
+    "count_nodes",
+    "find_kept_alive_by_dead_branches",
+    "find_reachable",
+    "order_paths",
+]

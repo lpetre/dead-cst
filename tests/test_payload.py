@@ -31,8 +31,9 @@ from libcst.metadata import CodePosition, CodeRange, FullRepoManager
 
 from dead_cst import EdgeFlags, NodeFlags, build_symbol_graph
 from dead_cst._fqn import FixedFullyQualifiedNameProvider
-from dead_cst._symbols import SymbolNode
-from dead_cst._visitor import SymbolVisitor, VisitorPayload
+from dead_cst.graph import SymbolNode
+from dead_cst._visitor import SymbolVisitor
+from dead_cst.graph import VisitorPayload
 
 
 def _pos(line: int = 1, column: int = 0) -> CodeRange:

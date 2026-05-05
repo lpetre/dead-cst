@@ -39,7 +39,7 @@ from typing import TYPE_CHECKING, Iterable
 
 import libcst as cst
 
-from .._symbols import Import, SymbolNode
+from ..graph import Import, SymbolNode
 from ._core import (
     SYNTHETIC_POSITION,
     AddEdge,
@@ -52,7 +52,7 @@ from ._core import (
 )
 
 if TYPE_CHECKING:
-    from .._visitor import VisitorPayload
+    from ..graph import VisitorPayload
 
 _INIT_SUBCLASS = "__init_subclass__"
 INIT_SUBCLASS_PREFIX = "<__init_subclass__>:"

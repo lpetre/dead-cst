@@ -30,10 +30,10 @@ import networkx as nx
 from libcst.metadata import CodePosition, CodeRange
 
 from .._cacheable import Cacheable
-from .._symbols import NodeFlags, SymbolNode, SymbolTrie
+from ..graph import NodeFlags, SymbolNode, SymbolTrie
 
 if TYPE_CHECKING:
-    from .._visitor import VisitorPayload
+    from ..graph import VisitorPayload
 
 SYNTHETIC_POSITION = CodeRange(start=CodePosition(0, 0), end=CodePosition(0, 0))
 
@@ -454,8 +454,7 @@ def make_payload(
     ``dead_suites`` stay empty so they don't disturb the visitor's
     cross-file resolution or the dead-branch report.
     """
-    # Lazy import to avoid the circular dep with ``_visitor``.
-    from .._visitor import VisitorPayload
+    from ..graph import VisitorPayload
 
     return VisitorPayload(
         nodes=tuple(nodes),

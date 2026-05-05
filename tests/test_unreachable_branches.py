@@ -1,7 +1,7 @@
 """End-to-end tests for ``EdgeFlags.DEAD_BRANCH`` on graph edges.
 
 When the visitor sees a statically-dead ``if`` / ``while`` suite (per
-:mod:`dead_cst._branches`) it records the suite's position. The
+:mod:`dead_cst.branches`) it records the suite's position. The
 analyzer's apply step then flags every reference whose access position
 falls inside any recorded dead suite with
 :data:`dead_cst.EdgeFlags.DEAD_BRANCH` -- a single tagged edge per
@@ -798,7 +798,7 @@ def test_custom_detector_override_folds_call_in_if(tmp_path, write_files):
     import libcst as cst
 
     from dead_cst import EdgeFlags, build_symbol_graph
-    from dead_cst._branches import DefaultUnreachableRegionDetector
+    from dead_cst.branches import DefaultUnreachableRegionDetector
 
     write_files(
         {
@@ -850,7 +850,7 @@ def test_custom_detector_override_folds_through_assignment(tmp_path, write_files
     import libcst as cst
 
     from dead_cst import EdgeFlags, build_symbol_graph
-    from dead_cst._branches import DefaultUnreachableRegionDetector
+    from dead_cst.branches import DefaultUnreachableRegionDetector
 
     write_files(
         {
@@ -891,7 +891,7 @@ def test_default_resolve_returns_none() -> None:
     # default explicitly keeps the contract for subclasses clear.
     import libcst as cst
 
-    from dead_cst._branches import DefaultUnreachableRegionDetector
+    from dead_cst.branches import DefaultUnreachableRegionDetector
 
     detector = DefaultUnreachableRegionDetector()
     assert detector.resolve(cst.Name("anything")) is None

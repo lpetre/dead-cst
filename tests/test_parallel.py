@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 
 from dead_cst import build_symbol_graph
-from dead_cst._cache import (
+from dead_cst.cache import (
     CACHE_DIR_NAME,
     GraphCache,
     compute_fingerprint,
@@ -111,16 +111,16 @@ def test_parallel_falls_back_to_serial_for_single_miss(tmp_path, monkeypatch):
     # Edit one file so exactly one miss survives.
     (tmp_path / "pkg" / "a.py").write_text("def f():\n    return 1\n")
 
-    from dead_cst import _analyze
+    from dead_cst import analyze
 
     calls = []
-    real = _analyze.ProcessPoolExecutor
+    real = analyze.ProcessPoolExecutor
 
     def _spy(*args, **kwargs):
         calls.append(kwargs.get("max_workers"))
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(_analyze, "ProcessPoolExecutor", _spy)
+    monkeypatch.setattr(analyze, "ProcessPoolExecutor", _spy)
     with GraphCache(db, fingerprint=fp) as cache:
         build_symbol_graph({tmp_path: []}, cache=cache, workers=4)
     assert calls == [], "single-miss run should not spawn a pool"
@@ -130,16 +130,16 @@ def test_parallel_pool_capped_at_total_task_count(tmp_path, monkeypatch):
     """The pool caps ``max_workers`` at the total number of cache-miss tasks."""
     _write(tmp_path, _multi_file_layout())
 
-    from dead_cst import _analyze
+    from dead_cst import analyze
 
     seen = []
-    real = _analyze.ProcessPoolExecutor
+    real = analyze.ProcessPoolExecutor
 
     def _spy(*args, **kwargs):
         seen.append(kwargs.get("max_workers"))
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(_analyze, "ProcessPoolExecutor", _spy)
+    monkeypatch.setattr(analyze, "ProcessPoolExecutor", _spy)
     build_symbol_graph({tmp_path: []}, workers=64)
     # Five files in _multi_file_layout(); pool should be capped at 5.
     assert seen == [5]
@@ -149,16 +149,16 @@ def test_parallel_pool_capped_at_total_task_count(tmp_path, monkeypatch):
 def test_workers_none_or_one_keeps_serial_path(tmp_path, monkeypatch, workers):
     """``workers=None`` and ``workers=1`` never spawn a pool."""
     _write(tmp_path, _multi_file_layout())
-    from dead_cst import _analyze
+    from dead_cst import analyze
 
     calls = []
-    real = _analyze.ProcessPoolExecutor
+    real = analyze.ProcessPoolExecutor
 
     def _spy(*args, **kwargs):
         calls.append(kwargs)
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(_analyze, "ProcessPoolExecutor", _spy)
+    monkeypatch.setattr(analyze, "ProcessPoolExecutor", _spy)
     build_symbol_graph({tmp_path: []}, workers=workers)
     assert calls == []
 
@@ -184,16 +184,16 @@ def test_multi_base_uses_one_pool(tmp_path, monkeypatch):
         },
     )
 
-    from dead_cst import _analyze
+    from dead_cst import analyze
 
     pool_calls = []
-    real = _analyze.ProcessPoolExecutor
+    real = analyze.ProcessPoolExecutor
 
     def _spy(*args, **kwargs):
         pool_calls.append(kwargs.get("max_workers"))
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(_analyze, "ProcessPoolExecutor", _spy)
+    monkeypatch.setattr(analyze, "ProcessPoolExecutor", _spy)
     build_symbol_graph({base_a: [], base_b: []}, workers=2)
     assert len(pool_calls) == 1, f"expected exactly one pool across both bases, got {pool_calls!r}"
 
@@ -246,17 +246,17 @@ def test_tasks_sorted_by_search_paths(tmp_path, monkeypatch):
         },
     )
 
-    from dead_cst import _analyze
+    from dead_cst import analyze
 
     captured: list = []
-    real_map = _analyze.ProcessPoolExecutor.map  # bound on the class
+    real_map = analyze.ProcessPoolExecutor.map  # bound on the class
 
     def _spy_map(self, fn, iterable, *args, **kwargs):
         materialized = list(iterable)
         captured.append([t.search_paths for t in materialized])
         return real_map(self, fn, materialized, *args, **kwargs)
 
-    monkeypatch.setattr(_analyze.ProcessPoolExecutor, "map", _spy_map)
+    monkeypatch.setattr(analyze.ProcessPoolExecutor, "map", _spy_map)
     build_symbol_graph({base_a: [], base_b: []}, workers=2)
 
     assert len(captured) == 1
