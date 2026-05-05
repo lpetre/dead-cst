@@ -17,7 +17,7 @@ keep stumbling into:
     re-run on warm runs); finalize only does graph lookups.
 
 Both bases use only the public plugin-helpers re-exported from
-:mod:`dead_cst._plugins`; user subclasses don't need to reach into
+:mod:`dead_cst.plugins`; user subclasses don't need to reach into
 ``_core``.
 """
 

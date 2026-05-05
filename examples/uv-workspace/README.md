@@ -101,7 +101,7 @@ Direct dependency edges come from each member's `dependencies = [...]` list
 in `uv.lock`; non-workspace deps (regular PyPI packages) are dropped because
 they don't have a source tree under your control.
 
-For each member, `dead_cst._resolvers.exported_roots` then reads its
+For each member, `dead_cst.resolvers.exported_roots` then reads its
 `pyproject.toml` and returns the subdirs that are visible to other
 members at import time. Discovery dispatches on `[build-system].build-backend`
 (hatchling, setuptools, poetry, pdm, flit) with a `src/`-layout shortcut

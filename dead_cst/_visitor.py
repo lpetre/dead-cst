@@ -845,10 +845,10 @@ class SymbolVisitor(cst.CSTVisitor):
         pointing at them is remapped to the same flagged identity, so
         the resulting graph nodes and edges line up. The per-edge
         :class:`CodeRange` (the access position) is preserved as-is;
-        the apply step in :mod:`dead_cst._analyze` derives the
+        the apply step in :mod:`dead_cst.analyze` derives the
         :data:`EdgeFlags.DEAD_BRANCH` flag from it by checking
         containment against :attr:`dead_suites` (populated by the
-        configured :class:`~dead_cst._branches.UnreachableRegionDetector`
+        configured :class:`~dead_cst.branches.UnreachableRegionDetector`
         in :meth:`visit_Module`).
         """
         flag_map: dict[SymbolNode, SymbolNode] = {

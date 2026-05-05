@@ -144,7 +144,7 @@ def build_symbol_graph(
         Project root used by plugins for path-relative matching. If
         omitted, inferred as the shortest path in ``paths``.
     cache:
-        Optional :class:`~dead_cst._cache.GraphCache`. When provided,
+        Optional :class:`~dead_cst.cache.GraphCache`. When provided,
         per-file :class:`VisitorPayload` results are looked up by
         content hash and the visitor pass is skipped on cache hit.
         Plugins, edge resolution, and entrypoint seeding all run
@@ -152,10 +152,10 @@ def build_symbol_graph(
         short-circuits the per-file visit. Pass ``None`` (the default)
         to bypass caching entirely.
     unreachable_detector:
-        Optional :class:`~dead_cst._branches.UnreachableRegionDetector`
+        Optional :class:`~dead_cst.branches.UnreachableRegionDetector`
         whose :meth:`find_regions` is invoked once per file to compute
         the set of statically-dead suite positions. Defaults to
-        :class:`~dead_cst._branches.DefaultUnreachableRegionDetector`,
+        :class:`~dead_cst.branches.DefaultUnreachableRegionDetector`,
         which evaluates only literal-truthiness of ``if`` / ``while``
         tests. Override to fold in domain knowledge (e.g. config flags
         whose value is fixed in production). The returned
@@ -767,7 +767,7 @@ def find_reachable(graph: nx.MultiDiGraph) -> set[SymbolNode]:
     """BFS forward from every node tagged as an entrypoint by a plugin.
 
     Plugins mark seeds by setting ``graph.nodes[node]["entrypoint"] = True``
-    (see :func:`dead_cst._plugins.apply_ops`). There is no longer any
+    (see :func:`dead_cst.plugins.apply_ops`). There is no longer any
     built-in matching against file paths or FQNs -- that lives in
     :class:`ExplicitEntrypointPlugin`.
 

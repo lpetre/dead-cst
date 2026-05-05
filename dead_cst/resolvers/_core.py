@@ -30,7 +30,7 @@ class PathResolver(Cacheable, Protocol):
     without monkey-patching the analyzer.
 
     The shipped resolvers all delegate :meth:`resolve_import` to
-    :func:`~dead_cst._resolvers._imports.default_resolve_import`, the
+    :func:`~dead_cst.resolvers._imports.default_resolve_import`, the
     ``sys.path`` + ``importlib`` implementation. Custom resolvers
     typically call it as a fallback after their own layout-specific
     lookups.

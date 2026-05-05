@@ -1,9 +1,9 @@
 """Stitch resolved imports into ``src -> dst`` edges in the symbol graph.
 
 The visitor pass produces ``(src, Import, flags)`` triples where
-``Import.path`` is whatever a :class:`~dead_cst._resolvers.PathResolver`
+``Import.path`` is whatever a :class:`~dead_cst.resolvers.PathResolver`
 returned for the imported name and ``flags`` is the
-:class:`~dead_cst._symbols.EdgeFlags` value the apply step derived from
+:class:`~dead_cst.graph.EdgeFlags` value the apply step derived from
 the access position. :func:`resolve_edges` walks those triples against
 the already-built per-base :class:`SymbolTrie` and yields the concrete
 ``(src_symbol, dst_symbol, flags)`` triples -- following re-exports,
@@ -14,7 +14,7 @@ targets. The flag is preserved through every emission so the original
 resolution.
 
 The ``name -> path`` half of resolution lives in
-:mod:`dead_cst._resolvers._imports`; this module is purely about edge
+:mod:`dead_cst.resolvers._imports`; this module is purely about edge
 construction in the trie that visitor pass populated.
 """
 

@@ -1,11 +1,11 @@
 """Shared :class:`Cacheable` protocol for fingerprintable analyzer inputs.
 
 Plugins and the unreachable-region detector both fold their per-file
-output into the cached :class:`~dead_cst._visitor.VisitorPayload`, so
+output into the cached :class:`~dead_cst.graph.VisitorPayload`, so
 swapping or reconfiguring either must invalidate stale entries. Both
 contribute a stable ``(name, version)`` pair to the cache fingerprint;
 :class:`Cacheable` is the structural type that captures that contract
-in one place. :func:`~dead_cst._cache.compute_fingerprint` accepts any
+in one place. :func:`~dead_cst.cache.compute_fingerprint` accepts any
 ``Cacheable`` directly so it can read ``.name`` / ``.version`` without
 ``getattr`` defaults.
 """

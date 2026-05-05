@@ -154,13 +154,8 @@ dead-cst cache clear [ROOT]
 ```python
 import re
 from pathlib import Path
-from dead_cst import (
-    build_symbol_graph,
-    ExplicitEntrypointPlugin,
-    MainBlockPlugin,
-    find_reachable,
-    remove_code,
-)
+from dead_cst import build_symbol_graph, find_reachable, remove_code
+from dead_cst.plugins import ExplicitEntrypointPlugin, MainBlockPlugin
 
 root = Path("./src")
 graph = build_symbol_graph(
@@ -207,7 +202,7 @@ Both bases require subclasses to set `name` (a unique identifier for the cache n
 
 ```python
 from dataclasses import dataclass
-from dead_cst import LiteralListPlugin
+from dead_cst.plugins import LiteralListPlugin
 
 @dataclass(kw_only=True)
 class MyInternalModulesPlugin(LiteralListPlugin):
@@ -234,7 +229,7 @@ from dataclasses import dataclass
 
 import libcst as cst
 from dead_cst import build_symbol_graph
-from dead_cst._branches import DefaultUnreachableRegionDetector
+from dead_cst.branches import DefaultUnreachableRegionDetector
 
 @dataclass(frozen=True)
 class FlagAwareDetector(DefaultUnreachableRegionDetector):

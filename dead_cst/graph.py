@@ -49,7 +49,7 @@ class EdgeFlags(enum.IntFlag):
     """Analyzer-internal marker on graph edges.
 
     ``DEAD_BRANCH`` flags an edge whose reference originated inside a
-    statically-dead suite (per :func:`dead_cst._branches.unreachable_suites`).
+    statically-dead suite (per :func:`dead_cst.branches.unreachable_suites`).
     Default :func:`dead_cst.find_reachable` does **not** filter by this
     flag -- today's behavior, where dead-code references propagate
     liveness through the enclosing decl, is preserved. The opt-in

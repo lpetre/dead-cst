@@ -3,7 +3,7 @@
 Determines, when possible, whether the truthiness of an expression is
 statically known. Used to identify dead branches of ``if`` / ``while``
 statements so callers can mark references that live inside them with
-:data:`dead_cst._symbols.EdgeFlags.DEAD_BRANCH`.
+:data:`dead_cst.graph.EdgeFlags.DEAD_BRANCH`.
 
 Only handles a small whitelist of literal forms: the ``True`` /
 ``False`` / ``None`` keywords, integer / string literals,
@@ -194,7 +194,7 @@ class UnreachableRegionDetector(Cacheable, Protocol):
 
     Detectors run once per file after the visitor walk; the returned
     list of :class:`CodeRange` determines which references land
-    flagged with :data:`dead_cst._symbols.EdgeFlags.DEAD_BRANCH` and
+    flagged with :data:`dead_cst.graph.EdgeFlags.DEAD_BRANCH` and
     which positions are surfaced as "unreachable code at line X"
     reports.
 
