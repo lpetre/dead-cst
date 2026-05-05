@@ -42,22 +42,6 @@ import pytest
         pytest.param(
             {
                 "mod.py": """
-                def a(): pass
-                def b(): getattr(__import__('mod'), 'a')()
-                """,
-            },
-            # ``getattr`` / dynamic attribute access is invisible to
-            # static analysis. Ideally ``mod.b`` would point at
-            # ``mod.a``.
-            {
-                "mod.a -> mod",
-                "mod.b -> mod",
-            },
-            id="getattr-dynamic-access-produces-no-edge",
-        ),
-        pytest.param(
-            {
-                "mod.py": """
                 x = 1
                 del x
                 """,

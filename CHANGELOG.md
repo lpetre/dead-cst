@@ -10,6 +10,25 @@ two versions.
 ## [Unreleased]
 
 ### Added
+- Dynamic-import calls with a string-literal argument
+  (`__import__('pkg.mod')` and `importlib.import_module('pkg.mod')`)
+  are now treated like `from pkg.mod import *`: every top-level decl
+  in the target module is fanned out as a successor of the enclosing
+  top-level decl, so `getattr(__import__('pkg.mod'), 'name')()` keeps
+  `pkg.mod.name` reachable instead of being silently dropped.
+  Relative names are resolved against the file's enclosing package
+  the same way `from .x import *` is:
+  `importlib.import_module('.sub')` from `pkg/x.py` resolves to
+  `pkg.sub`, and `__import__('sub', ..., level=1)` does the same;
+  an explicit `package=` literal overrides the inferred anchor.
+  `__import__(name, fromlist=[...])` with a literal list/tuple is
+  parsed: every entry that resolves as a submodule of `name`
+  (e.g. `__import__('pkg', fromlist=['mod'])` imports `pkg.mod`
+  as a side effect) is fanned out the same way, while non-resolving
+  entries are silently treated as plain attributes (already covered
+  by the fan-out from `name`). Non-literal arguments (name,
+  `level`, `package`, `fromlist`) skip with a warning. Bumps
+  `SymbolVisitor.version` to invalidate cached payloads.
 - `build_symbol_graph(workers=N)` (and matching `--workers` / `-j` CLI
   flag) dispatches per-file visitor + observe passes to a
   `ProcessPoolExecutor` when at least two cache-miss files exist
