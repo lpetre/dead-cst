@@ -144,10 +144,16 @@ def editable_distribution_roots() -> tuple[tuple[Path, str], ...]:
     dist's ``RECORD``. The actual ``.py`` source lives in the user's
     project directory and never appears in :func:`distribution_lookup`.
     We surface it here by reading each dist's ``direct_url.json``
-    (PEP 610) and any ``.pth`` shims it ships, so an importer of, say,
-    an editable ``dead-cst`` resolves to ``[external dist] dead-cst``
+    (PEP 610) and any ``.pth`` shims it ships, so an importer of an
+    editable third-party package resolves to ``[external dist] <name>``
     instead of raising on an "unexpected path" or being silently
     misclassified.
+
+    :func:`default_resolve_import` consults this *after* the
+    ``search_paths`` check, so a first-party file that happens to nest
+    under an editable root (the project being analyzed living inside
+    another editable install's checkout) still classifies as
+    first-party.
 
     Returns ``(root, canonical_name)`` tuples sorted longest-path first
     so prefix-matching against nested editable layouts picks the most
@@ -261,6 +267,24 @@ def default_resolve_import(name: str, search_paths: list[Path]) -> str | Path | 
       the project (collapsed into one synthetic node per group);
     * ``None`` when the importlib finders can't locate ``name`` at all.
 
+    Classification precedence (first match wins):
+
+    1. ``distribution_lookup`` -- the resolved path appears in an
+       installed dist's ``RECORD``.
+    2. stdlib (``_is_stdlib_path``).
+    3. site-packages (``_is_site_packages_path``).
+    4. ``search_paths`` -- first-party project file.
+    5. ``editable_distribution_roots`` -- editable third-party whose
+       source dir lives outside ``search_paths``.
+
+    Stdlib / site-packages precede ``search_paths`` because they're
+    interpreter-blessed locations a user-configured ``search_paths``
+    shouldn't overlap with. ``search_paths`` precedes editable roots so
+    that a project whose source happens to nest under another editable
+    install's root (e.g. an e2e fixture cloned into ``.pytest_cache/``
+    of an editable ``dead-cst`` checkout) is still treated as
+    first-party.
+
     This is the implementation every shipped :class:`PathResolver`
     delegates to. Third-party resolvers can call it as a fallback after
     their own layout-specific lookups, or replace it entirely.
@@ -280,9 +304,6 @@ def default_resolve_import(name: str, search_paths: list[Path]) -> str | Path | 
     # their distribution rather than swallowed into ``[stdlib]``.
     if dist := distribution_lookup().get(path):
         return f"{EXTERNAL_DIST_PREFIX}{dist}"
-    for root, dist in editable_distribution_roots():
-        if path.is_relative_to(root):
-            return f"{EXTERNAL_DIST_PREFIX}{dist}"
 
     if _is_stdlib_path(path):
         return f"{STDLIB_PREFIX}{name}"
@@ -290,7 +311,20 @@ def default_resolve_import(name: str, search_paths: list[Path]) -> str | Path | 
     if _is_site_packages_path(path):
         return f"{EXTERNAL_FILE_PREFIX}{name}"
 
+    # First-party wins over editable-dist matching: the project being
+    # analyzed may itself live under another editable install's root
+    # (e.g. an e2e fixture clones a third-party repo into
+    # ``.pytest_cache/`` inside an editable ``dead-cst`` checkout). Those
+    # files are first-party for the run, not third-party. ``stdlib`` /
+    # ``site-packages`` still win above because those are
+    # interpreter-blessed locations and shouldn't appear in a
+    # user-configured ``search_paths``.
     for search in search_paths:
         if path.is_relative_to(search):
             return path
+
+    for root, dist in editable_distribution_roots():
+        if path.is_relative_to(root):
+            return f"{EXTERNAL_DIST_PREFIX}{dist}"
+
     raise Exception(f"Module {name} resolved to an unexpected path: {path}")
