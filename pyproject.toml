@@ -86,6 +86,13 @@ markers = [
 branch = true
 source = ["dead_cst"]
 omit = ["dead_cst/_version.py"]
+# ProcessPoolExecutor workers (used by ``build_symbol_graph(workers=...)``)
+# must run with the multiprocessing tracer or coverage's import-time
+# instrumentation drifts the class identity of ``_CallItem`` and causes
+# pickle round-trips to fail under ``pytest --cov``.
+concurrency = ["thread", "multiprocessing"]
+parallel = true
+sigterm = true
 
 [tool.coverage.report]
 exclude_lines = [

@@ -395,8 +395,9 @@ def test_warm_run_with_plugins_parses_zero_files(tmp_path, monkeypatch):
     analyzer skips both the visitor and the per-plugin observe. The
     per-base ``finalize`` step is graph-only (no CST access). This
     test pins that contract: even with every builtin plugin enabled,
-    a warm run never instantiates ``FullRepoManager`` and never calls
-    ``cst.parse_module`` from inside the analyzer.
+    a warm run never instantiates :class:`SymbolVisitor` or
+    :class:`MetadataWrapper`, never calls ``cst.parse_module``, and
+    never builds the per-base FQN cache.
     """
     import libcst as cst
 
@@ -451,34 +452,44 @@ def test_warm_run_with_plugins_parses_zero_files(tmp_path, monkeypatch):
         build_symbol_graph({tmp_path: []}, plugins=plugins, cache=cache)
 
     visitor_calls: list[object] = []
-    mgr_calls: list[object] = []
+    wrapper_calls: list[object] = []
     parse_calls: list[object] = []
+    fqn_calls: list[object] = []
     real_visitor = _analyze.SymbolVisitor
-    real_mgr = _analyze.FullRepoManager
+    real_wrapper = _analyze.MetadataWrapper
     real_parse = cst.parse_module
+    real_gen_cache = _analyze.FixedFullyQualifiedNameProvider.gen_cache
 
     def _visitor_spy(*args, **kwargs):
         visitor_calls.append(args)
         return real_visitor(*args, **kwargs)
 
-    def _mgr_spy(*args, **kwargs):
-        mgr_calls.append(args)
-        return real_mgr(*args, **kwargs)
+    def _wrapper_spy(*args, **kwargs):
+        wrapper_calls.append(args)
+        return real_wrapper(*args, **kwargs)
 
     def _parse_spy(*args, **kwargs):
         parse_calls.append(args)
         return real_parse(*args, **kwargs)
 
+    def _fqn_spy(*args, **kwargs):
+        fqn_calls.append(args)
+        return real_gen_cache(*args, **kwargs)
+
     monkeypatch.setattr(_analyze, "SymbolVisitor", _visitor_spy)
-    monkeypatch.setattr(_analyze, "FullRepoManager", _mgr_spy)
+    monkeypatch.setattr(_analyze, "MetadataWrapper", _wrapper_spy)
     monkeypatch.setattr(cst, "parse_module", _parse_spy)
+    monkeypatch.setattr(
+        _analyze.FixedFullyQualifiedNameProvider, "gen_cache", classmethod(_fqn_spy)
+    )
 
     with GraphCache(db, fingerprint=fp) as cache:
         build_symbol_graph({tmp_path: []}, plugins=plugins, cache=cache)
 
     assert visitor_calls == []
-    assert mgr_calls == []
+    assert wrapper_calls == []
     assert parse_calls == []
+    assert fqn_calls == []
 
 
 def test_edited_file_re_runs_visitor(tmp_path, monkeypatch):
