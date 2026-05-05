@@ -506,21 +506,24 @@ def _rebind_sys_path(search_paths: tuple[Path, ...], baseline: list[str]) -> Non
     sys.path[:] = new_path
 
 
-def _on_search_paths_change(state: _WorkerState, search_paths: tuple[Path, ...]) -> None:
-    """Rebind ``sys.path`` and invalidate every resolver cache.
+def _clear_resolver_caches() -> None:
+    """Drop the two ``sys.path``-derived resolver caches.
 
-    Must be called whenever the active ``search_paths`` tuple
-    changes. Clears :func:`safe_resolve_module` (its LRU keys on
-    fullname only, so cross-base reuse would silently leak earlier
-    bases' resolutions) and :func:`distribution_lookup` (caches the
-    venv's installed dist map, which differs across uv-workspace
-    members that ship their own ``.venv``). ``mgr`` goes too --
-    different base means a different file list, so the
-    ``FullRepoManager``'s FQN gen cache must be rebuilt.
+    Both :func:`safe_resolve_module` (keyed on fullname) and
+    :func:`distribution_lookup` (keyed on ``()``) read live
+    ``sys.path`` and would otherwise return stale results when the
+    base changes -- the first because the same name resolves to a
+    different base's first-party path, the second because uv-workspace
+    members can ship their own ``.venv``.
     """
-    _rebind_sys_path(search_paths, state.sys_path_baseline)
     safe_resolve_module.cache_clear()
     distribution_lookup.cache_clear()
+
+
+def _on_search_paths_change(state: _WorkerState, search_paths: tuple[Path, ...]) -> None:
+    """Worker transition: rebind ``sys.path``, clear caches, drop the FQN mgr."""
+    _rebind_sys_path(search_paths, state.sys_path_baseline)
+    _clear_resolver_caches()
     state.mgr = None
     state.last_search_paths = search_paths
 
@@ -597,18 +600,11 @@ def _compute_all_miss_payloads(
     use_pool = workers is not None and workers >= 2 and total_misses >= 2
 
     if not use_pool:
-        # Serial path: ``safe_resolve_module``'s LRU keys on fullname only
-        # so we clear it at every base boundary; ``distribution_lookup``
-        # only depends on the venv's ``site-packages`` (stable in a
-        # single-process run, the first-party prefix that moves doesn't
-        # carry dist-info dirs), so paying its rebuild cost per base
-        # would punish the common single-venv case for no correctness
-        # win. Worker transitions clear it (cross-venv possible there).
         for base, spec in base_specs.items():
             if not spec.miss_files:
                 continue
             search_paths = list(spec.search_paths)
-            safe_resolve_module.cache_clear()
+            _clear_resolver_caches()
             with temp_sys_path(search_paths):
                 mgr = FullRepoManager(
                     str(base),
@@ -631,22 +627,28 @@ def _compute_all_miss_payloads(
                         cache.put(file, payload)
         return out
 
-    tasks: list[_WorkerTask] = []
+    # Sort tasks so each worker sees contiguous runs from the same
+    # base; bounded transitions keep the FQN gen cache hot. The sort
+    # key is computed once per task rather than per comparator call.
+    keyed_tasks: list[tuple[tuple[str, ...], str, _WorkerTask]] = []
     for base, spec in base_specs.items():
+        sp_key = tuple(str(p) for p in spec.search_paths)
         for file in spec.miss_files:
-            tasks.append(
-                _WorkerTask(
-                    file=file,
-                    base=base,
-                    search_paths=spec.search_paths,
-                    files_in_base=spec.files,
-                    project_root=project_root,
+            keyed_tasks.append(
+                (
+                    sp_key,
+                    str(file),
+                    _WorkerTask(
+                        file=file,
+                        base=base,
+                        search_paths=spec.search_paths,
+                        files_in_base=spec.files,
+                        project_root=project_root,
+                    ),
                 )
             )
-    # Sort by search_paths so workers see contiguous runs from the
-    # same base; transition cost is small but bounded transitions
-    # also keep the FQN gen cache hot for longer.
-    tasks.sort(key=lambda t: (tuple(str(p) for p in t.search_paths), str(t.file)))
+    keyed_tasks.sort(key=lambda kt: (kt[0], kt[1]))
+    tasks = [kt[2] for kt in keyed_tasks]
 
     init = _WorkerInit(
         detector=detector,
