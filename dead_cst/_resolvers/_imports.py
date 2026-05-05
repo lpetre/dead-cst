@@ -5,15 +5,14 @@ implementation that every shipped :class:`PathResolver` delegates to.
 Custom resolvers can call it directly, replace it with their own logic
 (for vendored deps, ``.pyi`` siblings, ...), or compose both.
 
-The supporting helpers (:func:`safe_resolve_module`,
-:func:`distribution_lookup`, :func:`temp_sys_path`) are kept here so the
-analyzer and the resolvers share a single cache and one canonical
-treatment of distribution-name normalization.
+The supporting helpers (:func:`safe_resolve_module` and
+:func:`distribution_lookup`) live here so the analyzer and the
+resolvers share a single cache and one canonical treatment of
+distribution-name normalization.
 """
 
 from __future__ import annotations
 
-import contextlib
 import os
 import re
 import sys
@@ -21,7 +20,6 @@ import sysconfig
 from functools import cache
 from importlib.machinery import ModuleSpec
 from pathlib import Path
-from typing import Generator
 
 from .._plugins._core import (
     EXTERNAL_DIST_PREFIX,
@@ -53,23 +51,6 @@ def _canonical_dist_name(name: str) -> str:
     we don't yet support.
     """
     return re.sub(r"[-_.]+", "-", name).lower()
-
-
-@contextlib.contextmanager
-def temp_sys_path(paths: list[Path]) -> Generator[None, None, None]:
-    """Prepend ``paths`` to ``sys.path`` for the duration of the ``with`` block.
-
-    Used by the analyzer to scope :func:`safe_resolve_module`'s lookups
-    to the current base's search paths without leaking entries between
-    bases.
-    """
-    old = list(sys.path)
-    seen = set(old)
-    sys.path = [str(p) for p in paths if str(p) not in seen] + sys.path
-    try:
-        yield
-    finally:
-        sys.path = old
 
 
 @cache
@@ -115,6 +96,14 @@ def distribution_lookup() -> dict[Path, str]:
     Used by :func:`default_resolve_import` to classify a resolved path
     as ``[external dist] <name>`` when the file came from an installed
     third-party distribution.
+
+    Cached process-wide. The analyzer clears it in worker transitions
+    (see :func:`dead_cst._analyze._on_search_paths_change`) so a worker
+    that crosses a venv boundary -- e.g. between two uv-workspace
+    members each with their own ``.venv`` -- doesn't keep the prior
+    venv's dist map. Serial single-process runs already have a stable
+    ``sys.path`` at the venv level (only the first-party prefix moves
+    between bases), so the cache survives across bases there.
     """
     from importlib import metadata
 

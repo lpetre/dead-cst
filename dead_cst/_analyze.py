@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import logging
+import sys
+from concurrent.futures import ProcessPoolExecutor
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Sequence
+from typing import Mapping, Sequence
 
 import libcst as cst
 import networkx as nx
-from libcst.metadata import CodeRange, FullRepoManager
+from libcst.helpers.module import ModuleNameAndPackage
+from libcst.metadata import CodeRange, MetadataWrapper
 
 from ._branches import (
     DefaultUnreachableRegionDetector,
@@ -29,7 +33,7 @@ from ._resolvers import (
     default_resolve_import,
     exported_roots,
 )
-from ._resolvers._imports import safe_resolve_module, temp_sys_path
+from ._resolvers._imports import distribution_lookup, safe_resolve_module
 from ._symbols import EdgeFlags, Import, NodeFlags, SymbolNode, SymbolTrie
 from ._visitor import SymbolVisitor, VisitorPayload
 
@@ -87,6 +91,7 @@ def build_symbol_graph(
     project_root: Path | None = None,
     cache: GraphCache | None = None,
     unreachable_detector: UnreachableRegionDetector | None = None,
+    workers: int | None = None,
 ) -> nx.MultiDiGraph:
     """Build a directed reachability graph of every top-level symbol under ``paths``.
 
@@ -155,6 +160,18 @@ def build_symbol_graph(
         :class:`CodeRange` list feeds :data:`EdgeFlags.DEAD_BRANCH`
         derivation and the per-file ``graph.graph["dead_suites"]``
         reporting map.
+    workers:
+        When set to an integer ``>= 2``, the per-file visitor + observe
+        passes for cache-miss files are dispatched to a
+        :class:`~concurrent.futures.ProcessPoolExecutor`. Workers
+        return :class:`VisitorPayload` objects to the main process,
+        which still owns the SQLite cache write and the trie-stitching
+        / edge-resolution stages. ``None`` (default) and ``1`` keep
+        the serial path. The pool is persistent across bases; tasks
+        are sorted by ``search_paths`` so each worker tends to see
+        contiguous runs from one base, and the FQN cache is built
+        once in the parent and shipped per-task rather than rebuilt
+        in each worker.
 
     Returns
     -------
@@ -179,97 +196,98 @@ def build_symbol_graph(
         if unreachable_detector is not None
         else DefaultUnreachableRegionDetector()
     )
+    # Phase 1: enumerate every base's files and partition into
+    # cache hits (deserialized inline) and miss files (need a visitor
+    # pass). Done up front so the parallel path can build a single
+    # task list across every base.
+    base_specs = _collect_base_specs(paths, cache)
+
+    # Phase 2: run the visitor + observe pass for every miss file.
+    # Tasks are sorted by ``search_paths`` so the runner sees one
+    # transition per base regardless of file count. Workers and the
+    # in-process serial path share the same ``_process_task`` body;
+    # only the executor differs. Cache writes happen on the main
+    # process so failure semantics match either way.
+    miss_payloads = _compute_all_miss_payloads(
+        base_specs=base_specs,
+        project_root=root,
+        detector=detector,
+        plugins=plugins,
+        resolvers=resolvers,
+        import_resolver=import_resolver,
+        cache=cache,
+        workers=workers,
+    )
+
+    # Phase 3: per-base apply + edge stitching + plugin finalize.
+    # ``order_paths`` puts dependencies before dependents so each
+    # base's lookup trie sees its deps' exports. No ``sys.path``
+    # state required here -- ``resolve_edges`` works off the trie
+    # and plugins' ``finalize`` is graph-only.
     for base in order_paths(paths):
-        logger.debug("Processing base path: %s", base)
-        search_paths = [base] + paths.get(base, [])
-        safe_resolve_module.cache_clear()
-        with temp_sys_path(search_paths):
-            base_tries[base] = current_trie = SymbolTrie()
-            export_trie = SymbolTrie()
-            export_roots = exported_roots(base)
-            import_edges: set[tuple[SymbolNode, Import, EdgeFlags]] = set()
-            files = list(sorted(base.rglob("*.py")))
-            # Lazily constructed on the first cache miss; an all-cached
-            # base never builds the manager, since FQN metadata is only
-            # needed when running the visitor.
-            mgr: FullRepoManager | None = None
-            for file in files:
-                payload = cache.get(file) if cache is not None else None
-                if payload is None:
-                    if mgr is None:
-                        mgr = FullRepoManager(
-                            str(base),
-                            [str(f) for f in files],
-                            {FixedFullyQualifiedNameProvider},
-                        )
-                    wrapper = mgr.get_metadata_wrapper_for_path(str(file))
-                    visitor = SymbolVisitor(
-                        file,
-                        search_paths,
-                        import_resolver,
-                        unreachable_detector=detector,
-                        wrapper=wrapper,
-                    )
-                    wrapper.visit(visitor)
-                    base_payload = visitor.to_payload()
-                    plugin_payload = _run_observe(
-                        plugins, file, wrapper.module, base_payload, base, root
-                    )
-                    payload = _merge_payloads(base_payload, plugin_payload)
-                    if cache is not None:
-                        cache.put(file, payload)
-                # A file's decls go into ``export_trie`` only when the file
-                # lives under one of ``base``'s exported dirs (or when the
-                # base has no export restriction). This is what hides
-                # ``tests/`` from dependents in the typical workspace
-                # layout: the member analyzes its own ``tests/`` (decls
-                # land in ``current_trie`` and the graph), but consumers'
-                # lookup tries never see them.
-                file_exported = export_roots is None or _under_any(file, export_roots)
-                _apply_payload(
-                    payload,
-                    current_trie=current_trie,
-                    export_trie=export_trie,
-                    file_exported=file_exported,
-                    symbol_graph=symbol_graph,
-                    import_edges=import_edges,
-                )
+        logger.debug("Stitching base path: %s", base)
+        spec = base_specs[base]
+        base_tries[base] = current_trie = SymbolTrie()
+        export_trie = SymbolTrie()
+        export_roots = exported_roots(base)
+        import_edges: set[tuple[SymbolNode, Import, EdgeFlags]] = set()
 
-            current_trie.add_module_hierarchy_edges(symbol_graph)
-            export_tries[base] = export_trie
+        for file in spec.files:
+            payload = spec.hits.get(file)
+            if payload is None:
+                payload = miss_payloads[base][file]
+            # A file's decls go into ``export_trie`` only when the file
+            # lives under one of ``base``'s exported dirs (or when the
+            # base has no export restriction). This is what hides
+            # ``tests/`` from dependents in the typical workspace
+            # layout: the member analyzes its own ``tests/`` (decls
+            # land in ``current_trie`` and the graph), but consumers'
+            # lookup tries never see them.
+            file_exported = export_roots is None or _under_any(file, export_roots)
+            _apply_payload(
+                payload,
+                current_trie=current_trie,
+                export_trie=export_trie,
+                file_exported=file_exported,
+                symbol_graph=symbol_graph,
+                import_edges=import_edges,
+            )
 
-            # Per-consumer lookup trie: this base's full trie (everything
-            # in scope when resolving its own imports) plus each dep's
-            # *exported* trie (what the dep ships to consumers). Deps are
-            # processed earlier by topological order, so their export
-            # tries already exist.
-            symbol_lookup = SymbolTrie()
-            symbol_lookup.merge(current_trie)
-            for dep in paths.get(base, []):
-                symbol_lookup.merge(export_tries.get(dep, base_tries[dep]))
+        current_trie.add_module_hierarchy_edges(symbol_graph)
+        export_tries[base] = export_trie
 
-            for src, dst, flags in resolve_edges(import_edges, symbol_lookup, base):
-                symbol_graph.add_edge(src, dst, flags=flags)
+        # Per-consumer lookup trie: this base's full trie (everything
+        # in scope when resolving its own imports) plus each dep's
+        # *exported* trie (what the dep ships to consumers). Deps are
+        # processed earlier by topological order, so their export
+        # tries already exist.
+        symbol_lookup = SymbolTrie()
+        symbol_lookup.merge(current_trie)
+        for dep in paths.get(base, []):
+            symbol_lookup.merge(export_tries.get(dep, base_tries[dep]))
 
-            # Per-base finalize pass: plugins do graph-only work here
-            # (factory walks, transitive subclass closure, pyproject
-            # script lookups). No CST access -- per-file CST work
-            # already happened in the observe step.
-            if plugins:
-                ctx = PluginContext(
-                    graph=symbol_graph,
-                    symbol_lookup=symbol_lookup,
-                    base=base,
-                    project_root=root,
-                )
-                for plugin in plugins:
-                    if not isinstance(plugin, EdgePlugin):
-                        raise TypeError(f"Plugin {plugin!r} does not satisfy EdgePlugin protocol")
-                    # Materialize before applying so plugins can iterate
-                    # ctx.graph.nodes without tripping "dictionary changed
-                    # size during iteration".
-                    ops = list(plugin.finalize(ctx))
-                    apply_ops(symbol_graph, ops)
+        for src, dst, flags in resolve_edges(import_edges, symbol_lookup, base):
+            symbol_graph.add_edge(src, dst, flags=flags)
+
+        # Per-base finalize pass: plugins do graph-only work here
+        # (factory walks, transitive subclass closure, pyproject
+        # script lookups). No CST access -- per-file CST work
+        # already happened in the observe step.
+        if plugins:
+            ctx = PluginContext(
+                graph=symbol_graph,
+                symbol_lookup=symbol_lookup,
+                base=base,
+                project_root=root,
+            )
+            for plugin in plugins:
+                if not isinstance(plugin, EdgePlugin):
+                    raise TypeError(f"Plugin {plugin!r} does not satisfy EdgePlugin protocol")
+                # Materialize before applying so plugins can iterate
+                # ctx.graph.nodes without tripping "dictionary changed
+                # size during iteration".
+                ops = list(plugin.finalize(ctx))
+                apply_ops(symbol_graph, ops)
 
     return symbol_graph
 
@@ -307,6 +325,314 @@ def _run_observe(
         if contribution is not None:
             payloads.append(contribution)
     return _merge_payloads(*payloads) if payloads else make_payload()
+
+
+def _process_one_file(
+    file: Path,
+    *,
+    fqn_entry: ModuleNameAndPackage,
+    search_paths: list[Path],
+    import_resolver: ImportResolver,
+    detector: UnreachableRegionDetector,
+    plugins: Sequence[EdgePlugin],
+    base: Path,
+    project_root: Path,
+) -> VisitorPayload:
+    """Run the visitor + observe pass for a single file and return its payload.
+
+    The caller owns the precomputed FQN entry (built once per base by
+    :func:`_collect_base_specs`) so we can construct
+    :class:`MetadataWrapper` directly with ``cache=`` injected,
+    skipping :class:`FullRepoManager`'s per-instance ``gen_cache``
+    rebuild. Same shape ``FullRepoManager.get_metadata_wrapper_for_path``
+    builds, just without re-walking the file list every time.
+    """
+    module = cst.parse_module(file.read_text())
+    wrapper = MetadataWrapper(
+        module,
+        unsafe_skip_copy=True,
+        cache={FixedFullyQualifiedNameProvider: fqn_entry},
+    )
+    visitor = SymbolVisitor(
+        file,
+        search_paths,
+        import_resolver,
+        unreachable_detector=detector,
+        wrapper=wrapper,
+    )
+    wrapper.visit(visitor)
+    base_payload = visitor.to_payload()
+    plugin_payload = _run_observe(plugins, file, wrapper.module, base_payload, base, project_root)
+    return _merge_payloads(base_payload, plugin_payload)
+
+
+@dataclass(frozen=True)
+class _BaseSpec:
+    """Per-base file list partitioned into cache hits and miss files.
+
+    Built once up front in :func:`_collect_base_specs` so the parallel
+    path can flatten every base's miss files into a single sorted task
+    list and the apply phase can iterate every base in deterministic
+    order without re-reading the cache. ``fqn_cache`` covers only the
+    miss files -- hit files never go through the visitor, so they
+    don't need an FQN entry.
+    """
+
+    base: Path
+    search_paths: tuple[Path, ...]
+    files: tuple[Path, ...]
+    hits: dict[Path, VisitorPayload]
+    miss_files: tuple[Path, ...]
+    fqn_cache: Mapping[str, ModuleNameAndPackage]
+
+
+def _collect_base_specs(paths: PathMap, cache: GraphCache | None) -> dict[Path, _BaseSpec]:
+    """Walk every base, hash every file, partition hits from misses.
+
+    Cache reads happen on the main process; each hit is materialized
+    once and stashed on the spec, so the apply phase doesn't pay a
+    second lookup. The FQN cache is built once per base over the
+    miss files only -- workers don't rebuild it, and we skip the
+    ``calculate_module_and_package`` call for files we'll serve
+    from the cache. Iteration order is ``order_paths(paths)`` so the
+    apply phase sees deps before dependents.
+    """
+    specs: dict[Path, _BaseSpec] = {}
+    for base in order_paths(paths):
+        search_paths = (base,) + tuple(paths.get(base, []))
+        files = tuple(sorted(base.rglob("*.py")))
+        hits: dict[Path, VisitorPayload] = {}
+        miss_files: list[Path] = []
+        for file in files:
+            payload = cache.get(file) if cache is not None else None
+            if payload is None:
+                miss_files.append(file)
+            else:
+                hits[file] = payload
+        fqn_cache: Mapping[str, ModuleNameAndPackage] = (
+            FixedFullyQualifiedNameProvider.gen_cache(base, [str(f) for f in miss_files], timeout=5)
+            if miss_files
+            else {}
+        )
+        specs[base] = _BaseSpec(
+            base=base,
+            search_paths=search_paths,
+            files=files,
+            hits=hits,
+            miss_files=tuple(miss_files),
+            fqn_cache=fqn_cache,
+        )
+    return specs
+
+
+@dataclass(frozen=True)
+class _Task:
+    """Per-file unit of work for the visitor + observe pass.
+
+    ``fqn_entry`` is this file's slice of the per-base FQN cache built
+    once in the parent (see :func:`_collect_base_specs`); the runner
+    injects it into a :class:`MetadataWrapper` rather than rebuilding
+    a :class:`FullRepoManager`. ``search_paths`` doubles as the
+    transition key for ``sys.path`` rebinding + resolver-cache
+    invalidation.
+    """
+
+    file: Path
+    base: Path
+    search_paths: tuple[Path, ...]
+    fqn_entry: ModuleNameAndPackage
+    project_root: Path
+
+
+@dataclass
+class _RunnerState:
+    """Mutable state for the per-task runner, shared by serial and worker paths.
+
+    ``sys_path_baseline`` is the original ``sys.path`` captured at
+    runner startup; transitions rebuild ``sys.path`` from
+    ``search_paths + baseline`` and clear the resolver LRUs. The
+    serial caller restores ``sys.path`` from the baseline when the run
+    finishes; workers don't bother since the process is about to exit.
+    """
+
+    detector: UnreachableRegionDetector
+    plugins: tuple[EdgePlugin, ...]
+    import_resolver: ImportResolver
+    sys_path_baseline: list[str]
+    last_search_paths: tuple[Path, ...] | None = field(default=None)
+
+
+def _rebind_sys_path(search_paths: tuple[Path, ...], baseline: list[str]) -> None:
+    """Set ``sys.path`` to ``search_paths + baseline``, deduplicated."""
+    new_path: list[str] = []
+    seen: set[str] = set()
+    for p in search_paths:
+        s = str(p)
+        if s not in seen:
+            new_path.append(s)
+            seen.add(s)
+    for s in baseline:
+        if s not in seen:
+            new_path.append(s)
+            seen.add(s)
+    sys.path[:] = new_path
+
+
+def _clear_resolver_caches() -> None:
+    """Drop the two ``sys.path``-derived resolver caches.
+
+    :func:`safe_resolve_module` keys on fullname and
+    :func:`distribution_lookup` keys on ``()`` -- both read live
+    ``sys.path`` and would otherwise return stale results across
+    bases (different first-party prefix; uv-workspace members shipping
+    their own ``.venv``).
+    """
+    safe_resolve_module.cache_clear()
+    distribution_lookup.cache_clear()
+
+
+def _process_task(state: _RunnerState, task: _Task) -> tuple[Path, Path, VisitorPayload]:
+    """Run one task, transitioning ``sys.path`` + caches if the base changed.
+
+    Used by both the in-process serial loop and the
+    :class:`ProcessPoolExecutor` workers; the only difference between
+    the two is who owns ``state`` (a local in serial, a per-process
+    global in workers).
+    """
+    if state.last_search_paths != task.search_paths:
+        _rebind_sys_path(task.search_paths, state.sys_path_baseline)
+        _clear_resolver_caches()
+        state.last_search_paths = task.search_paths
+    payload = _process_one_file(
+        task.file,
+        fqn_entry=task.fqn_entry,
+        search_paths=list(task.search_paths),
+        import_resolver=state.import_resolver,
+        detector=state.detector,
+        plugins=state.plugins,
+        base=task.base,
+        project_root=task.project_root,
+    )
+    return task.base, task.file, payload
+
+
+_worker_state: _RunnerState | None = None
+
+
+def _init_worker(
+    detector: UnreachableRegionDetector,
+    plugins: tuple[EdgePlugin, ...],
+    resolvers: tuple[PathResolver, ...],
+) -> None:
+    """Pool initializer: build the worker's :class:`_RunnerState`.
+
+    Resolver chain is rebuilt locally because :func:`_chain_resolvers`
+    can return a closure (not picklable); the resolver instances
+    themselves travel as picklable dataclasses.
+    """
+    global _worker_state
+    _worker_state = _RunnerState(
+        detector=detector,
+        plugins=plugins,
+        import_resolver=_chain_resolvers(resolvers),
+        sys_path_baseline=list(sys.path),
+    )
+
+
+def _worker_process_task(task: _Task) -> tuple[Path, Path, VisitorPayload]:
+    """Pool task: delegate to :func:`_process_task` against the worker's state."""
+    assert _worker_state is not None, "_init_worker must run before _worker_process_task"
+    return _process_task(_worker_state, task)
+
+
+def _build_sorted_tasks(base_specs: dict[Path, _BaseSpec], project_root: Path) -> list[_Task]:
+    """Flatten every base's miss files into one task list, sorted by search_paths.
+
+    Sorting puts same-base tasks adjacent so a runner sees at most one
+    ``sys.path`` transition per base it touches, regardless of total
+    file count. Sorting on ``Path`` tuples directly is fine -- it's
+    just attribute access per comparison.
+    """
+    tasks: list[_Task] = [
+        _Task(
+            file=file,
+            base=base,
+            search_paths=spec.search_paths,
+            fqn_entry=spec.fqn_cache[str(file)],
+            project_root=project_root,
+        )
+        for base, spec in base_specs.items()
+        for file in spec.miss_files
+    ]
+    tasks.sort(key=lambda t: (t.search_paths, t.file))
+    return tasks
+
+
+def _compute_all_miss_payloads(
+    *,
+    base_specs: dict[Path, _BaseSpec],
+    project_root: Path,
+    detector: UnreachableRegionDetector,
+    plugins: Sequence[EdgePlugin],
+    resolvers: Sequence[PathResolver],
+    import_resolver: ImportResolver,
+    cache: GraphCache | None,
+    workers: int | None,
+) -> dict[Path, dict[Path, VisitorPayload]]:
+    """Run visitor + observe for every cache-miss file across every base.
+
+    Both branches use :func:`_process_task` for the per-task work; they
+    differ only in whether the runner state lives on the main process
+    or in :class:`ProcessPoolExecutor` workers. The pool is opt-in
+    (``workers >= 2`` and at least two miss files); below that, the
+    in-process path avoids pool startup cost.
+
+    Cache writes happen on the main process as each payload arrives,
+    so a partial run still warms the cache for files that completed.
+    Returns ``{base: {file: payload}}`` even for bases with no misses,
+    so the caller can index without an existence check.
+    """
+    out: dict[Path, dict[Path, VisitorPayload]] = {b: {} for b in base_specs}
+    total_misses = sum(len(s.miss_files) for s in base_specs.values())
+    if total_misses == 0:
+        return out
+
+    tasks = _build_sorted_tasks(base_specs, project_root)
+    use_pool = workers is not None and workers >= 2 and total_misses >= 2
+
+    def _record(base: Path, file: Path, payload: VisitorPayload) -> None:
+        out[base][file] = payload
+        if cache is not None:
+            cache.put(file, payload)
+
+    if use_pool:
+        assert workers is not None
+        with ProcessPoolExecutor(
+            max_workers=min(workers, len(tasks)),
+            initializer=_init_worker,
+            initargs=(detector, tuple(plugins), tuple(resolvers)),
+        ) as pool:
+            for base, file, payload in pool.map(_worker_process_task, tasks):
+                _record(base, file, payload)
+        return out
+
+    # Serial: run every task in-process. Restore ``sys.path`` on the
+    # way out so callers (tests, library users) don't see lingering
+    # mutations from the runner's per-base rebinds.
+    baseline = list(sys.path)
+    state = _RunnerState(
+        detector=detector,
+        plugins=tuple(plugins),
+        import_resolver=import_resolver,
+        sys_path_baseline=baseline,
+    )
+    try:
+        for task in tasks:
+            base, file, payload = _process_task(state, task)
+            _record(base, file, payload)
+    finally:
+        sys.path[:] = baseline
+    return out
 
 
 def _merge_payloads(*payloads: VisitorPayload) -> VisitorPayload:
