@@ -18,11 +18,14 @@ two versions.
   `pkg.mod.name` reachable instead of being silently dropped.
   Non-literal arguments (`__import__(var)`) are skipped with a
   warning; relative-name literals (`'.sub'`) are likewise skipped
-  rather than misresolved. `__import__(name, fromlist=...)` also
-  warns -- the fan-out runs from `name`, but submodule entries in
-  `fromlist` (`__import__('pkg', fromlist=['mod'])` imports
-  `pkg.mod` as a side effect) are not resolved. Bumps
-  `SymbolVisitor.version` to invalidate cached payloads.
+  rather than misresolved. `__import__(name, fromlist=[...])` with
+  a literal list/tuple is parsed: every entry that resolves as a
+  submodule of `name` (e.g. `__import__('pkg', fromlist=['mod'])`
+  imports `pkg.mod` as a side effect) is fanned out the same way,
+  while non-resolving entries are silently treated as plain
+  attributes (already covered by the fan-out from `name`).
+  Non-literal fromlists warn. Bumps `SymbolVisitor.version` to
+  invalidate cached payloads.
 
 ## [0.4.0] - 2026-05-03
 

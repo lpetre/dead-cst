@@ -375,23 +375,15 @@ def test_dynamic_import_non_literal_warns(build_decl_graph, caplog):
 @pytest.mark.parametrize(
     "src",
     [
-        pytest.param("__import__('p.functions', None, None, ['f'])", id="fromlist-positional"),
-        pytest.param("__import__('p.functions', fromlist=['f'])", id="fromlist-keyword"),
+        pytest.param("__import__('p', None, None, ['functions'])", id="fromlist-positional"),
+        pytest.param("__import__('p', fromlist=['functions'])", id="fromlist-keyword"),
     ],
 )
-def test_dunder_import_fromlist_warns(build_decl_graph, assert_edges, caplog, src):
-    """``__import__(name, fromlist=...)`` warns but still fans out from ``name``."""
-    import logging
-
-    with caplog.at_level(logging.WARNING, logger="dead_cst._visitor"):
-        graph = build_decl_graph({**IMPORT_TEST_FILES, "p/x.py": src})
-
-    messages = [r.getMessage() for r in caplog.records]
-    assert any(
-        "fromlist=..." in m and "'p.functions'" in m and "not resolved" in m for m in messages
-    ), messages
-
-    # The fan-out from the name argument still runs.
+def test_dunder_import_fromlist_resolves_submodules(build_decl_graph, assert_edges, src):
+    """Literal ``fromlist`` entries that resolve as submodules are fanned out too."""
+    graph = build_decl_graph({**IMPORT_TEST_FILES, "p/x.py": src})
+    # Fan-out from ``p`` (empty ``__init__.py``) plus fan-out from
+    # ``p.functions`` (the resolved fromlist submodule).
     assert_edges(
         graph,
         IMPORT_BASE_EDGES
@@ -401,6 +393,43 @@ def test_dunder_import_fromlist_warns(build_decl_graph, assert_edges, caplog, sr
             "p.x -> p.functions.g",
         },
     )
+
+
+def test_dunder_import_fromlist_attribute_entries_silent(build_decl_graph, assert_edges, caplog):
+    """Fromlist entries that are not submodules don't warn (already covered by name fan-out)."""
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="dead_cst._visitor"):
+        graph = build_decl_graph(
+            {**IMPORT_TEST_FILES, "p/x.py": "__import__('p.functions', fromlist=['f', ''])"}
+        )
+
+    assert [r.getMessage() for r in caplog.records] == []
+    assert_edges(
+        graph,
+        IMPORT_BASE_EDGES
+        | {
+            "p.x -> p.functions",
+            "p.x -> p.functions.f",
+            "p.x -> p.functions.g",
+        },
+    )
+
+
+def test_dunder_import_fromlist_non_literal_warns(build_decl_graph, caplog):
+    """Non-literal fromlists warn (we can't enumerate entries)."""
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="dead_cst._visitor"):
+        build_decl_graph(
+            {
+                **IMPORT_TEST_FILES,
+                "p/x.py": "names = ['functions']\n__import__('p', fromlist=names)",
+            }
+        )
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("fromlist is not a literal" in m and "'p'" in m for m in messages), messages
 
 
 def test_third_party_import_creates_synthetic_node(build_decl_graph):

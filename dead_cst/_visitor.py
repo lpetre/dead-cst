@@ -121,7 +121,7 @@ class SymbolVisitor(cst.CSTVisitor):
     # edge-attribution rules, flow-analysis fixes, etc. Concurrent
     # bumps on different branches merge with ``max()`` semantics.
     name: str = "default"
-    version: int = 1777967380
+    version: int = 1777968092
 
     def _pos(self, node: cst.CSTNode):
         return self.get_metadata(PositionProvider, node, default=None)
@@ -512,9 +512,13 @@ class SymbolVisitor(cst.CSTVisitor):
         Only string-literal arguments are honoured; non-literal forms
         (``__import__(name)``) emit a warning and produce no edge.
 
-        ``__import__('pkg', fromlist=['mod'])`` also imports ``pkg.mod``
-        as a side effect, but our fan-out only sees ``pkg``. Warn so
-        users notice the gap; the fan-out from the name still runs.
+        ``__import__('pkg', fromlist=['mod', ...])`` also imports the
+        listed names as side effects when they are submodules of
+        ``pkg``. When ``fromlist`` is a literal list/tuple of strings
+        every entry that resolves to a real submodule is fanned out
+        too; non-resolving entries are silently treated as plain
+        attributes (already covered by the fan-out from ``pkg``).
+        Non-literal fromlists warn.
         """
         callee = self._dynamic_import_call_name(node.func)
         if callee is None:
@@ -528,21 +532,36 @@ class SymbolVisitor(cst.CSTVisitor):
             except Exception:
                 module = None
             if isinstance(module, str) and module and not module.startswith("."):
-                if callee == "__import__" and self._import_call_fromlist(node) is not None:
-                    logger.warning(
-                        "'__import__(%r, fromlist=...)' in %s: fromlist entries "
-                        "are not resolved (only %r is fanned out)",
-                        module,
-                        self.path,
-                        module,
-                    )
                 self._add_star_import(module, self._pos(node))
+                if callee == "__import__":
+                    self._handle_dunder_import_fromlist(node, module)
                 return
         logger.warning(
             "Skipping dynamic import '%s(...)' in %s: argument is not an absolute string literal",
             callee,
             self.path,
         )
+
+    def _handle_dunder_import_fromlist(self, node: cst.Call, module: str) -> None:
+        fromlist_expr = self._import_call_fromlist(node)
+        if fromlist_expr is None:
+            return
+        entries = self._extract_string_sequence(fromlist_expr)
+        if entries is None:
+            logger.warning(
+                "'__import__(%r, fromlist=...)' in %s: fromlist is not a literal "
+                "list/tuple, submodule entries are not resolved",
+                module,
+                self.path,
+            )
+            return
+        access_pos = self._pos(node)
+        for entry in entries:
+            if not entry:
+                continue
+            submod = f"{module}.{entry}"
+            if self.resolve_import(submod):
+                self._add_star_import(submod, access_pos)
 
     @staticmethod
     def _dynamic_import_call_name(func: cst.BaseExpression) -> str | None:
