@@ -348,7 +348,11 @@ def _process_one_file(
     builds, just without re-walking the file list every time.
     """
     module = cst.parse_module(file.read_text())
-    wrapper = MetadataWrapper(module, True, {FixedFullyQualifiedNameProvider: fqn_entry})
+    wrapper = MetadataWrapper(
+        module,
+        unsafe_skip_copy=True,
+        cache={FixedFullyQualifiedNameProvider: fqn_entry},
+    )
     visitor = SymbolVisitor(
         file,
         search_paths,
@@ -546,28 +550,22 @@ def _build_sorted_tasks(base_specs: dict[Path, _BaseSpec], project_root: Path) -
 
     Sorting puts same-base tasks adjacent so a runner sees at most one
     ``sys.path`` transition per base it touches, regardless of total
-    file count. The sort key is computed once per task rather than
-    per-comparator-call.
+    file count. Sorting on ``Path`` tuples directly is fine -- it's
+    just attribute access per comparison.
     """
-    keyed: list[tuple[tuple[str, ...], str, _Task]] = []
-    for base, spec in base_specs.items():
-        sp_key = tuple(str(p) for p in spec.search_paths)
-        for file in spec.miss_files:
-            keyed.append(
-                (
-                    sp_key,
-                    str(file),
-                    _Task(
-                        file=file,
-                        base=base,
-                        search_paths=spec.search_paths,
-                        fqn_entry=spec.fqn_cache[str(file)],
-                        project_root=project_root,
-                    ),
-                )
-            )
-    keyed.sort(key=lambda kt: (kt[0], kt[1]))
-    return [kt[2] for kt in keyed]
+    tasks: list[_Task] = [
+        _Task(
+            file=file,
+            base=base,
+            search_paths=spec.search_paths,
+            fqn_entry=spec.fqn_cache[str(file)],
+            project_root=project_root,
+        )
+        for base, spec in base_specs.items()
+        for file in spec.miss_files
+    ]
+    tasks.sort(key=lambda t: (t.search_paths, t.file))
+    return tasks
 
 
 def _compute_all_miss_payloads(
