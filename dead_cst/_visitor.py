@@ -121,7 +121,7 @@ class SymbolVisitor(cst.CSTVisitor):
     # edge-attribution rules, flow-analysis fixes, etc. Concurrent
     # bumps on different branches merge with ``max()`` semantics.
     name: str = "default"
-    version: int = 1777808838
+    version: int = 1777964738
 
     def _pos(self, node: cst.CSTNode):
         return self.get_metadata(PositionProvider, node, default=None)
@@ -500,6 +500,50 @@ class SymbolVisitor(cst.CSTVisitor):
 
     def visit_Import(self, node: cst.Import) -> None:
         self._add_import("", node)
+
+    def visit_Call(self, node: cst.Call) -> None:
+        """Treat ``__import__('m')`` / ``importlib.import_module('m')`` as star imports.
+
+        Dynamic imports are usually paired with ``getattr`` to pull a
+        specific attribute, but the attribute name is opaque to static
+        analysis. Fanning the call out to every top-level decl in the
+        target module mirrors how ``from m import *`` is treated -- safe
+        for dead-code analysis (over- rather than under-approximates).
+        Only string-literal arguments are honoured; non-literal forms
+        (``__import__(name)``) emit a warning and produce no edge.
+        """
+        callee = self._dynamic_import_call_name(node.func)
+        if callee is None:
+            return
+        if not node.args:
+            return
+        arg = node.args[0].value
+        if isinstance(arg, cst.SimpleString):
+            try:
+                module = arg.evaluated_value
+            except Exception:
+                module = None
+            if isinstance(module, str) and module and not module.startswith("."):
+                self._add_star_import(module, self._pos(node))
+                return
+        logger.warning(
+            "Skipping dynamic import '%s(...)' in %s: argument is not an absolute string literal",
+            callee,
+            self.path,
+        )
+
+    @staticmethod
+    def _dynamic_import_call_name(func: cst.BaseExpression) -> str | None:
+        if isinstance(func, cst.Name) and func.value == "__import__":
+            return "__import__"
+        if (
+            isinstance(func, cst.Attribute)
+            and isinstance(func.value, cst.Name)
+            and func.value.value == "importlib"
+            and func.attr.value == "import_module"
+        ):
+            return "importlib.import_module"
+        return None
 
     def visit_ImportFrom(self, node: cst.ImportFrom) -> None:
         module = ""

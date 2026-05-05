@@ -9,6 +9,18 @@ two versions.
 
 ## [Unreleased]
 
+### Added
+- Dynamic-import calls with a string-literal argument
+  (`__import__('pkg.mod')` and `importlib.import_module('pkg.mod')`)
+  are now treated like `from pkg.mod import *`: every top-level decl
+  in the target module is fanned out as a successor of the enclosing
+  top-level decl, so `getattr(__import__('pkg.mod'), 'name')()` keeps
+  `pkg.mod.name` reachable instead of being silently dropped.
+  Non-literal arguments (`__import__(var)`) are skipped with a
+  warning; relative-name literals (`'.sub'`) are likewise skipped
+  rather than misresolved. Bumps `SymbolVisitor.version` to
+  invalidate cached payloads.
+
 ## [0.4.0] - 2026-05-03
 
 ### Added

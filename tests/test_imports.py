@@ -229,6 +229,48 @@ IMPORT_BASE_EDGES = frozenset(
             },
             id="star-import-fans-out-to-all-decls",
         ),
+        pytest.param(
+            "__import__('p.functions')",
+            {
+                "p.x -> p.functions",
+                "p.x -> p.functions.f",
+                "p.x -> p.functions.g",
+            },
+            id="dunder-import-call-fans-out-like-star",
+        ),
+        pytest.param(
+            "def a(): getattr(__import__('p.functions'), 'f')()",
+            {
+                "p.x.a -> p.functions",
+                "p.x.a -> p.functions.f",
+                "p.x.a -> p.functions.g",
+                "p.x.a -> p.x",
+            },
+            id="dunder-import-call-inside-function-attributes-to-enclosing-decl",
+        ),
+        pytest.param(
+            "import importlib\nimportlib.import_module('p.functions')",
+            {
+                "p.x -> p.functions",
+                "p.x -> p.functions.f",
+                "p.x -> p.functions.g",
+                "p.x -> p.x.importlib",
+                "p.x.importlib -> p.x",
+            },
+            id="importlib-import-module-fans-out-like-star",
+        ),
+        pytest.param(
+            "import importlib\ndef a(): importlib.import_module('p.functions')",
+            {
+                "p.x.a -> p.functions",
+                "p.x.a -> p.functions.f",
+                "p.x.a -> p.functions.g",
+                "p.x.a -> p.x",
+                "p.x.a -> p.x.importlib",
+                "p.x.importlib -> p.x",
+            },
+            id="importlib-import-module-inside-function",
+        ),
     ],
 )
 def test_imports(build_decl_graph, assert_edges, src, expected_extra_edges):
@@ -304,6 +346,30 @@ def test_imports(build_decl_graph, assert_edges, src, expected_extra_edges):
 def test_dunder_all_edges(build_decl_graph, assert_edges, src, expected_extra_edges):
     graph = build_decl_graph({**IMPORT_TEST_FILES, "p/x.py": src})
     assert_edges(graph, IMPORT_BASE_EDGES | expected_extra_edges)
+
+
+def test_dynamic_import_non_literal_warns(build_decl_graph, caplog):
+    """Non-literal ``__import__(name)`` / ``importlib.import_module(name)`` skip with a warning."""
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="dead_cst._visitor"):
+        build_decl_graph(
+            {
+                "p/__init__.py": "",
+                "p/x.py": (
+                    "import importlib\n"
+                    "name = 'p.functions'\n"
+                    "def a(): __import__(name)\n"
+                    "def b(): importlib.import_module(name)\n"
+                ),
+            }
+        )
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("Skipping dynamic import '__import__(...)'" in m for m in messages), messages
+    assert any("Skipping dynamic import 'importlib.import_module(...)'" in m for m in messages), (
+        messages
+    )
 
 
 def test_third_party_import_creates_synthetic_node(build_decl_graph):
