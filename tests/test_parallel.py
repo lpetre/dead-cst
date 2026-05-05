@@ -126,8 +126,8 @@ def test_parallel_falls_back_to_serial_for_single_miss(tmp_path, monkeypatch):
     assert calls == [], "single-miss run should not spawn a pool"
 
 
-def test_parallel_pool_capped_at_miss_count(tmp_path, monkeypatch):
-    """The pool caps ``max_workers`` at ``len(miss_files)``."""
+def test_parallel_pool_capped_at_total_task_count(tmp_path, monkeypatch):
+    """The pool caps ``max_workers`` at the total number of cache-miss tasks."""
     _write(tmp_path, _multi_file_layout())
 
     from dead_cst import _analyze
@@ -142,7 +142,7 @@ def test_parallel_pool_capped_at_miss_count(tmp_path, monkeypatch):
     monkeypatch.setattr(_analyze, "ProcessPoolExecutor", _spy)
     build_symbol_graph({tmp_path: []}, workers=64)
     # Five files in _multi_file_layout(); pool should be capped at 5.
-    assert seen and all(w <= 5 for w in seen)
+    assert seen == [5]
 
 
 @pytest.mark.parametrize("workers", [None, 1])
@@ -161,3 +161,109 @@ def test_workers_none_or_one_keeps_serial_path(tmp_path, monkeypatch, workers):
     monkeypatch.setattr(_analyze, "ProcessPoolExecutor", _spy)
     build_symbol_graph({tmp_path: []}, workers=workers)
     assert calls == []
+
+
+def test_multi_base_uses_one_pool(tmp_path, monkeypatch):
+    """Two bases share a single persistent pool, not one per base."""
+    base_a = tmp_path / "a"
+    base_b = tmp_path / "b"
+    _write(
+        base_a,
+        {
+            "pkg/__init__.py": "",
+            "pkg/x.py": "def x(): pass\n",
+            "pkg/y.py": "from .x import x\ndef y(): return x()\n",
+        },
+    )
+    _write(
+        base_b,
+        {
+            "pkg/__init__.py": "",
+            "pkg/p.py": "def p(): pass\n",
+            "pkg/q.py": "from .p import p\ndef q(): return p()\n",
+        },
+    )
+
+    from dead_cst import _analyze
+
+    pool_calls = []
+    real = _analyze.ProcessPoolExecutor
+
+    def _spy(*args, **kwargs):
+        pool_calls.append(kwargs.get("max_workers"))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(_analyze, "ProcessPoolExecutor", _spy)
+    build_symbol_graph({base_a: [], base_b: []}, workers=2)
+    assert len(pool_calls) == 1, f"expected exactly one pool across both bases, got {pool_calls!r}"
+
+
+def test_multi_base_parallel_matches_serial(tmp_path):
+    """Multi-base parallel runs produce the same graph as the serial path."""
+    base_a = tmp_path / "a"
+    base_b = tmp_path / "b"
+    _write(
+        base_a,
+        {
+            "pkg/__init__.py": "",
+            "pkg/x.py": "def x(): pass\n",
+            "pkg/y.py": "from .x import x\ndef y(): return x()\n",
+        },
+    )
+    _write(
+        base_b,
+        {
+            "pkg/__init__.py": "",
+            "pkg/p.py": "def p(): pass\n",
+            "pkg/q.py": "from .p import p\ndef q(): return p()\n",
+        },
+    )
+    paths = {base_a: [], base_b: []}
+    serial = build_symbol_graph(paths)
+    parallel = build_symbol_graph(paths, workers=2)
+    assert _node_set(parallel) == _node_set(serial)
+    assert _edge_set(parallel) == _edge_set(serial)
+
+
+def test_tasks_sorted_by_search_paths(tmp_path, monkeypatch):
+    """Worker tasks are sorted by ``search_paths`` so each worker sees contiguous bases."""
+    base_a = tmp_path / "a"
+    base_b = tmp_path / "b"
+    _write(
+        base_a,
+        {
+            "pkg/__init__.py": "",
+            "pkg/x.py": "def x(): pass\n",
+            "pkg/y.py": "def y(): pass\n",
+        },
+    )
+    _write(
+        base_b,
+        {
+            "pkg/__init__.py": "",
+            "pkg/p.py": "def p(): pass\n",
+            "pkg/q.py": "def q(): pass\n",
+        },
+    )
+
+    from dead_cst import _analyze
+
+    captured: list = []
+    real_map = _analyze.ProcessPoolExecutor.map  # bound on the class
+
+    def _spy_map(self, fn, iterable, *args, **kwargs):
+        materialized = list(iterable)
+        captured.append([t.search_paths for t in materialized])
+        return real_map(self, fn, materialized, *args, **kwargs)
+
+    monkeypatch.setattr(_analyze.ProcessPoolExecutor, "map", _spy_map)
+    build_symbol_graph({base_a: [], base_b: []}, workers=2)
+
+    assert len(captured) == 1
+    sps = captured[0]
+    # Same-base tasks land contiguously after the sort.
+    runs = [sps[0]]
+    for sp in sps[1:]:
+        if sp != runs[-1]:
+            runs.append(sp)
+    assert len(runs) == len(set(runs)), f"expected each base's tasks contiguous, got order {sps!r}"

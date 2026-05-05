@@ -32,7 +32,7 @@ from ._resolvers import (
     default_resolve_import,
     exported_roots,
 )
-from ._resolvers._imports import safe_resolve_module, temp_sys_path
+from ._resolvers._imports import distribution_lookup, safe_resolve_module, temp_sys_path
 from ._symbols import EdgeFlags, Import, NodeFlags, SymbolNode, SymbolTrie
 from ._visitor import SymbolVisitor, VisitorPayload
 
@@ -193,95 +193,101 @@ def build_symbol_graph(
         if unreachable_detector is not None
         else DefaultUnreachableRegionDetector()
     )
-    for base in order_paths(paths):
-        logger.debug("Processing base path: %s", base)
-        search_paths = [base] + paths.get(base, [])
-        safe_resolve_module.cache_clear()
-        with temp_sys_path(search_paths):
-            base_tries[base] = current_trie = SymbolTrie()
-            export_trie = SymbolTrie()
-            export_roots = exported_roots(base)
-            import_edges: set[tuple[SymbolNode, Import, EdgeFlags]] = set()
-            files = list(sorted(base.rglob("*.py")))
-            hits: dict[Path, VisitorPayload] = {}
-            miss_files: list[Path] = []
-            for file in files:
-                payload = cache.get(file) if cache is not None else None
-                if payload is None:
-                    miss_files.append(file)
-                else:
-                    hits[file] = payload
+    # Phase 1: enumerate every base's files and partition into
+    # cache hits (deserialized inline) and miss files (need a visitor
+    # pass). Done up front so the parallel path can build a single
+    # task list across every base.
+    base_specs = _collect_base_specs(paths, cache)
 
-            miss_payloads = _compute_miss_payloads(
-                miss_files=miss_files,
-                files=files,
-                base=base,
-                search_paths=search_paths,
-                project_root=root,
-                import_resolver=import_resolver,
-                detector=detector,
-                plugins=plugins,
-                resolvers=resolvers,
-                cache=cache,
-                workers=workers,
+    # Phase 2: run the visitor + observe pass for every miss file.
+    # Serial dispatch enters ``temp_sys_path`` per base (parent
+    # process is doing the work). Parallel dispatch builds one
+    # persistent ``ProcessPoolExecutor`` for the whole run, sorts
+    # tasks by ``search_paths`` so a worker tends to see contiguous
+    # runs from the same base, and rebinds ``sys.path`` +
+    # invalidates the resolver caches only when the search-path
+    # tuple changes. Cache writes happen on the main process either
+    # way so failure semantics match the serial path.
+    miss_payloads = _compute_all_miss_payloads(
+        base_specs=base_specs,
+        project_root=root,
+        detector=detector,
+        plugins=plugins,
+        resolvers=resolvers,
+        import_resolver=import_resolver,
+        cache=cache,
+        workers=workers,
+    )
+
+    # Phase 3: per-base apply + edge stitching + plugin finalize.
+    # ``order_paths`` puts dependencies before dependents so each
+    # base's lookup trie sees its deps' exports. No ``sys.path``
+    # state required here -- ``resolve_edges`` works off the trie
+    # and plugins' ``finalize`` is graph-only.
+    for base in order_paths(paths):
+        logger.debug("Stitching base path: %s", base)
+        spec = base_specs[base]
+        base_tries[base] = current_trie = SymbolTrie()
+        export_trie = SymbolTrie()
+        export_roots = exported_roots(base)
+        import_edges: set[tuple[SymbolNode, Import, EdgeFlags]] = set()
+
+        for file in spec.files:
+            payload = spec.hits.get(file)
+            if payload is None:
+                payload = miss_payloads[base][file]
+            # A file's decls go into ``export_trie`` only when the file
+            # lives under one of ``base``'s exported dirs (or when the
+            # base has no export restriction). This is what hides
+            # ``tests/`` from dependents in the typical workspace
+            # layout: the member analyzes its own ``tests/`` (decls
+            # land in ``current_trie`` and the graph), but consumers'
+            # lookup tries never see them.
+            file_exported = export_roots is None or _under_any(file, export_roots)
+            _apply_payload(
+                payload,
+                current_trie=current_trie,
+                export_trie=export_trie,
+                file_exported=file_exported,
+                symbol_graph=symbol_graph,
+                import_edges=import_edges,
             )
 
-            for file in files:
-                payload = hits.get(file)
-                if payload is None:
-                    payload = miss_payloads[file]
-                # A file's decls go into ``export_trie`` only when the file
-                # lives under one of ``base``'s exported dirs (or when the
-                # base has no export restriction). This is what hides
-                # ``tests/`` from dependents in the typical workspace
-                # layout: the member analyzes its own ``tests/`` (decls
-                # land in ``current_trie`` and the graph), but consumers'
-                # lookup tries never see them.
-                file_exported = export_roots is None or _under_any(file, export_roots)
-                _apply_payload(
-                    payload,
-                    current_trie=current_trie,
-                    export_trie=export_trie,
-                    file_exported=file_exported,
-                    symbol_graph=symbol_graph,
-                    import_edges=import_edges,
-                )
+        current_trie.add_module_hierarchy_edges(symbol_graph)
+        export_tries[base] = export_trie
 
-            current_trie.add_module_hierarchy_edges(symbol_graph)
-            export_tries[base] = export_trie
+        # Per-consumer lookup trie: this base's full trie (everything
+        # in scope when resolving its own imports) plus each dep's
+        # *exported* trie (what the dep ships to consumers). Deps are
+        # processed earlier by topological order, so their export
+        # tries already exist.
+        symbol_lookup = SymbolTrie()
+        symbol_lookup.merge(current_trie)
+        for dep in paths.get(base, []):
+            symbol_lookup.merge(export_tries.get(dep, base_tries[dep]))
 
-            # Per-consumer lookup trie: this base's full trie (everything
-            # in scope when resolving its own imports) plus each dep's
-            # *exported* trie (what the dep ships to consumers). Deps are
-            # processed earlier by topological order, so their export
-            # tries already exist.
-            symbol_lookup = SymbolTrie()
-            symbol_lookup.merge(current_trie)
-            for dep in paths.get(base, []):
-                symbol_lookup.merge(export_tries.get(dep, base_tries[dep]))
+        for src, dst, flags in resolve_edges(import_edges, symbol_lookup, base):
+            symbol_graph.add_edge(src, dst, flags=flags)
 
-            for src, dst, flags in resolve_edges(import_edges, symbol_lookup, base):
-                symbol_graph.add_edge(src, dst, flags=flags)
-
-            # Per-base finalize pass: plugins do graph-only work here
-            # (factory walks, transitive subclass closure, pyproject
-            # script lookups). No CST access -- per-file CST work
-            # already happened in the observe step.
-            if plugins:
-                ctx = PluginContext(
-                    graph=symbol_graph,
-                    symbol_lookup=symbol_lookup,
-                    base=base,
-                    project_root=root,
-                )
-                for plugin in plugins:
-                    if not isinstance(plugin, EdgePlugin):
-                        raise TypeError(f"Plugin {plugin!r} does not satisfy EdgePlugin protocol")
-                    # Materialize before applying so plugins can iterate
-                    # ctx.graph.nodes without tripping "dictionary changed
-                    # size during iteration".
-                    ops = list(plugin.finalize(ctx))
-                    apply_ops(symbol_graph, ops)
+        # Per-base finalize pass: plugins do graph-only work here
+        # (factory walks, transitive subclass closure, pyproject
+        # script lookups). No CST access -- per-file CST work
+        # already happened in the observe step.
+        if plugins:
+            ctx = PluginContext(
+                graph=symbol_graph,
+                symbol_lookup=symbol_lookup,
+                base=base,
+                project_root=root,
+            )
+            for plugin in plugins:
+                if not isinstance(plugin, EdgePlugin):
+                    raise TypeError(f"Plugin {plugin!r} does not satisfy EdgePlugin protocol")
+                # Materialize before applying so plugins can iterate
+                # ctx.graph.nodes without tripping "dictionary changed
+                # size during iteration".
+                ops = list(plugin.finalize(ctx))
+                apply_ops(symbol_graph, ops)
 
     return symbol_graph
 
@@ -355,181 +361,310 @@ def _process_one_file(
 
 
 @dataclass(frozen=True)
-class _WorkerInit:
-    """Per-base bundle of state shipped to each :class:`ProcessPoolExecutor` worker.
+class _BaseSpec:
+    """Per-base file list partitioned into cache hits and miss files.
 
-    Captures everything a worker needs to reproduce the parent's
-    visitor environment: the base + search paths (for ``sys.path`` and
-    ``FullRepoManager`` construction), the full file list (FQN gen
-    cache spans every file in the base), the resolver chain (rebuilt
-    via :func:`_chain_resolvers` inside the worker since the resolver
-    closure isn't picklable), the detector, the plugin list, and the
-    project root used by ``_run_observe``. Frozen so misuse from a
-    worker can't leak state back into queued tasks.
+    Built once up front in :func:`_collect_base_specs` so the parallel
+    path can flatten every base's miss files into a single sorted task
+    list and the apply phase can iterate every base in deterministic
+    order without re-reading the cache.
     """
 
     base: Path
     search_paths: tuple[Path, ...]
     files: tuple[Path, ...]
+    hits: dict[Path, VisitorPayload]
+    miss_files: tuple[Path, ...]
+
+
+def _collect_base_specs(paths: PathMap, cache: GraphCache | None) -> dict[Path, _BaseSpec]:
+    """Walk every base, hash every file, partition hits from misses.
+
+    Cache reads happen on the main process; each hit is materialized
+    once and stashed on the spec, so the apply phase doesn't pay a
+    second lookup. Iteration order is ``order_paths(paths)`` so the
+    apply phase sees deps before dependents.
+    """
+    specs: dict[Path, _BaseSpec] = {}
+    for base in order_paths(paths):
+        search_paths = (base,) + tuple(paths.get(base, []))
+        files = tuple(sorted(base.rglob("*.py")))
+        hits: dict[Path, VisitorPayload] = {}
+        miss_files: list[Path] = []
+        for file in files:
+            payload = cache.get(file) if cache is not None else None
+            if payload is None:
+                miss_files.append(file)
+            else:
+                hits[file] = payload
+        specs[base] = _BaseSpec(
+            base=base,
+            search_paths=search_paths,
+            files=files,
+            hits=hits,
+            miss_files=tuple(miss_files),
+        )
+    return specs
+
+
+@dataclass(frozen=True)
+class _WorkerInit:
+    """Run-wide state shipped to every :class:`ProcessPoolExecutor` worker.
+
+    Captures everything a worker needs that doesn't change between
+    bases: the detector, the plugin set, and the resolver list. The
+    resolver chain is rebuilt locally via :func:`_chain_resolvers` --
+    its closure form isn't picklable across processes, but the
+    ``PathResolver`` instances themselves are dataclass-picklable.
+    Per-base context (search paths, file list, base path) travels on
+    each :class:`_WorkerTask`.
+    """
+
     detector: UnreachableRegionDetector
     plugins: tuple[EdgePlugin, ...]
     resolvers: tuple[PathResolver, ...]
+
+
+@dataclass(frozen=True)
+class _WorkerTask:
+    """Per-file unit of work dispatched to a worker.
+
+    Carries the base context inline so workers don't need to be
+    re-initialized when the active base changes -- they detect a new
+    ``search_paths`` value and rebind ``sys.path`` + invalidate the
+    resolver caches in place. ``project_root`` is constant for the
+    run but travels here so the worker doesn't need a separate global.
+    """
+
+    file: Path
+    base: Path
+    search_paths: tuple[Path, ...]
+    files_in_base: tuple[Path, ...]
     project_root: Path
 
 
 @dataclass
-class _WorkerCtx:
+class _WorkerState:
     """Per-worker mutable state populated by :func:`_init_worker`.
 
-    ``mgr`` is built lazily on the first task so workers that never
-    receive one don't pay the construction cost; the first task in a
-    worker pays it once and subsequent tasks reuse the same FQN cache.
+    ``sys_path_baseline`` snapshots the worker's pristine ``sys.path``
+    at startup (i.e. inherited from the parent before any per-base
+    prefix). Each transition rebuilds ``sys.path`` from
+    ``search_paths + baseline``. ``last_search_paths`` is the
+    transition key: when it changes we drop ``mgr`` (different base
+    means a different file list, so the FQN gen cache must be
+    rebuilt) and clear the LRU caches.
     """
 
     init: _WorkerInit
     import_resolver: ImportResolver
+    sys_path_baseline: list[str]
+    last_search_paths: tuple[Path, ...] | None = field(default=None)
     mgr: FullRepoManager | None = field(default=None)
 
 
-_worker_ctx: _WorkerCtx | None = None
+_worker_state: _WorkerState | None = None
 
 
 def _init_worker(init: _WorkerInit) -> None:
-    """Pool initializer: prime ``sys.path``, the resolver chain, and worker globals.
+    """Pool initializer: snapshot ``sys.path`` and build worker globals.
 
-    Adds ``init.search_paths`` to ``sys.path`` so
-    :func:`default_resolve_import` finds first-party modules under the
-    current base. Clears :func:`safe_resolve_module`'s LRU cache for
-    the same hygiene the parent does between bases. Rebuilds the
-    resolver chain locally because :func:`_chain_resolvers` returns a
-    closure (not picklable across processes); the ``PathResolver``
-    instances themselves are picklable dataclasses and travel via
-    ``init``.
+    No per-base setup happens here -- :func:`_worker_process_task`
+    detects the first base on its first task and rebinds ``sys.path``
+    against the snapshot. This keeps the pool persistent across every
+    base in the run; the parent never re-creates it.
     """
-    global _worker_ctx
-    seen = set(sys.path)
-    for p in init.search_paths:
-        s = str(p)
-        if s not in seen:
-            sys.path.insert(0, s)
-    safe_resolve_module.cache_clear()
-    _worker_ctx = _WorkerCtx(
+    global _worker_state
+    _worker_state = _WorkerState(
         init=init,
         import_resolver=_chain_resolvers(init.resolvers),
+        sys_path_baseline=list(sys.path),
     )
 
 
-def _worker_process_file(file: Path) -> tuple[Path, VisitorPayload]:
-    """Pool task: run :func:`_process_one_file` for ``file`` against worker state.
+def _rebind_sys_path(search_paths: tuple[Path, ...], baseline: list[str]) -> None:
+    """Set ``sys.path`` to ``search_paths + baseline``, deduplicated.
 
-    Returns ``(file, payload)`` so :meth:`Executor.map` results can be
-    matched back to inputs without relying on submission order.
-    Constructs the per-worker :class:`FullRepoManager` lazily on first
-    use; subsequent tasks in the same worker reuse it.
+    ``temp_sys_path`` does effectively the same thing in the parent
+    when run serially. Workers can't use a contextmanager (the
+    transition is event-driven, not block-scoped), so the rebinding
+    happens explicitly. Order matters: search_paths first so
+    first-party imports beat any same-named modules on the original
+    ``sys.path``.
     """
-    ctx = _worker_ctx
-    assert ctx is not None, "_init_worker must run before _worker_process_file"
-    if ctx.mgr is None:
-        ctx.mgr = FullRepoManager(
-            str(ctx.init.base),
-            [str(f) for f in ctx.init.files],
+    new_path: list[str] = []
+    seen: set[str] = set()
+    for p in search_paths:
+        s = str(p)
+        if s not in seen:
+            new_path.append(s)
+            seen.add(s)
+    for s in baseline:
+        if s not in seen:
+            new_path.append(s)
+            seen.add(s)
+    sys.path[:] = new_path
+
+
+def _on_search_paths_change(state: _WorkerState, search_paths: tuple[Path, ...]) -> None:
+    """Rebind ``sys.path`` and invalidate every resolver cache.
+
+    Must be called whenever the active ``search_paths`` tuple
+    changes. Clears :func:`safe_resolve_module` (its LRU keys on
+    fullname only, so cross-base reuse would silently leak earlier
+    bases' resolutions) and :func:`distribution_lookup` (caches the
+    venv's installed dist map, which differs across uv-workspace
+    members that ship their own ``.venv``). ``mgr`` goes too --
+    different base means a different file list, so the
+    ``FullRepoManager``'s FQN gen cache must be rebuilt.
+    """
+    _rebind_sys_path(search_paths, state.sys_path_baseline)
+    safe_resolve_module.cache_clear()
+    distribution_lookup.cache_clear()
+    state.mgr = None
+    state.last_search_paths = search_paths
+
+
+def _worker_process_task(task: _WorkerTask) -> tuple[Path, Path, VisitorPayload]:
+    """Pool task: rebind ``sys.path`` if needed, then visit + observe ``task.file``.
+
+    Returns ``(base, file, payload)`` so the parent can route the
+    payload back into the right per-base bucket. Sorting tasks by
+    ``search_paths`` in the parent keeps any one worker's transitions
+    bounded -- in steady state each worker sees one transition per
+    base it touches, regardless of total file count.
+    """
+    state = _worker_state
+    assert state is not None, "_init_worker must run before _worker_process_task"
+    if state.last_search_paths != task.search_paths:
+        _on_search_paths_change(state, task.search_paths)
+    if state.mgr is None:
+        state.mgr = FullRepoManager(
+            str(task.base),
+            [str(f) for f in task.files_in_base],
             {FixedFullyQualifiedNameProvider},
         )
     payload = _process_one_file(
-        file,
-        mgr=ctx.mgr,
-        search_paths=list(ctx.init.search_paths),
-        import_resolver=ctx.import_resolver,
-        detector=ctx.init.detector,
-        plugins=ctx.init.plugins,
-        base=ctx.init.base,
-        project_root=ctx.init.project_root,
+        task.file,
+        mgr=state.mgr,
+        search_paths=list(task.search_paths),
+        import_resolver=state.import_resolver,
+        detector=state.init.detector,
+        plugins=state.init.plugins,
+        base=task.base,
+        project_root=task.project_root,
     )
-    return file, payload
+    return task.base, task.file, payload
 
 
-def _compute_miss_payloads(
+def _compute_all_miss_payloads(
     *,
-    miss_files: list[Path],
-    files: list[Path],
-    base: Path,
-    search_paths: list[Path],
+    base_specs: dict[Path, _BaseSpec],
     project_root: Path,
-    import_resolver: ImportResolver,
     detector: UnreachableRegionDetector,
     plugins: Sequence[EdgePlugin],
     resolvers: Sequence[PathResolver],
+    import_resolver: ImportResolver,
     cache: GraphCache | None,
     workers: int | None,
-) -> dict[Path, VisitorPayload]:
-    """Run visitor + observe for every cache-miss file in a base.
+) -> dict[Path, dict[Path, VisitorPayload]]:
+    """Run visitor + observe for every cache-miss file across every base.
 
-    Splits on the ``workers`` knob:
+    Two paths:
 
-    * ``None`` / ``1`` / ``len(miss_files) < 2`` -- serial path. Builds
-      one :class:`FullRepoManager` for the base and reuses it across
-      every miss.
-    * ``>= 2`` with at least two misses -- spawns a
-      :class:`ProcessPoolExecutor` keyed to this base.
-      :func:`_init_worker` ships the resolver chain + detector +
-      plugins to each worker, which build their own
-      ``FullRepoManager`` on first task. The pool is capped at
-      ``min(workers, len(miss_files))`` so a small batch doesn't
-      over-provision processes.
+    * Serial (``workers`` ``None`` / ``1`` / total misses < 2) --
+      iterate bases in order, enter ``temp_sys_path`` per base,
+      clear the resolver caches, build one ``FullRepoManager`` per
+      base, run :func:`_process_one_file` for each miss in turn.
+    * Parallel -- one persistent :class:`ProcessPoolExecutor` for the
+      whole run. Tasks are sorted by ``search_paths`` so a worker
+      tends to see contiguous miss runs from the same base; on each
+      transition the worker rebinds ``sys.path`` + invalidates the
+      resolver caches via :func:`_on_search_paths_change`. Cap the
+      pool at ``min(workers, total_misses)`` so a small batch doesn't
+      over-provision.
 
     Cache writes happen on the main process as each payload arrives,
     so a partial run still warms the cache for files that completed.
-    Iteration order matches ``miss_files`` (sorted) for determinism.
+    Returns ``{base: {file: payload}}`` even for bases with no
+    misses, so the caller can index without an existence check.
     """
-    if not miss_files:
-        return {}
+    out: dict[Path, dict[Path, VisitorPayload]] = {b: {} for b in base_specs}
+    total_misses = sum(len(s.miss_files) for s in base_specs.values())
+    if total_misses == 0:
+        return out
 
-    use_pool = workers is not None and workers >= 2 and len(miss_files) >= 2
-    miss_payloads: dict[Path, VisitorPayload] = {}
+    use_pool = workers is not None and workers >= 2 and total_misses >= 2
 
     if not use_pool:
-        mgr = FullRepoManager(
-            str(base),
-            [str(f) for f in files],
-            {FixedFullyQualifiedNameProvider},
-        )
-        for file in miss_files:
-            payload = _process_one_file(
-                file,
-                mgr=mgr,
-                search_paths=search_paths,
-                import_resolver=import_resolver,
-                detector=detector,
-                plugins=plugins,
-                base=base,
-                project_root=project_root,
+        # Serial path: ``safe_resolve_module``'s LRU keys on fullname only
+        # so we clear it at every base boundary; ``distribution_lookup``
+        # only depends on the venv's ``site-packages`` (stable in a
+        # single-process run, the first-party prefix that moves doesn't
+        # carry dist-info dirs), so paying its rebuild cost per base
+        # would punish the common single-venv case for no correctness
+        # win. Worker transitions clear it (cross-venv possible there).
+        for base, spec in base_specs.items():
+            if not spec.miss_files:
+                continue
+            search_paths = list(spec.search_paths)
+            safe_resolve_module.cache_clear()
+            with temp_sys_path(search_paths):
+                mgr = FullRepoManager(
+                    str(base),
+                    [str(f) for f in spec.files],
+                    {FixedFullyQualifiedNameProvider},
+                )
+                for file in spec.miss_files:
+                    payload = _process_one_file(
+                        file,
+                        mgr=mgr,
+                        search_paths=search_paths,
+                        import_resolver=import_resolver,
+                        detector=detector,
+                        plugins=plugins,
+                        base=base,
+                        project_root=project_root,
+                    )
+                    out[base][file] = payload
+                    if cache is not None:
+                        cache.put(file, payload)
+        return out
+
+    tasks: list[_WorkerTask] = []
+    for base, spec in base_specs.items():
+        for file in spec.miss_files:
+            tasks.append(
+                _WorkerTask(
+                    file=file,
+                    base=base,
+                    search_paths=spec.search_paths,
+                    files_in_base=spec.files,
+                    project_root=project_root,
+                )
             )
-            miss_payloads[file] = payload
-            if cache is not None:
-                cache.put(file, payload)
-        return miss_payloads
+    # Sort by search_paths so workers see contiguous runs from the
+    # same base; transition cost is small but bounded transitions
+    # also keep the FQN gen cache hot for longer.
+    tasks.sort(key=lambda t: (tuple(str(p) for p in t.search_paths), str(t.file)))
 
     init = _WorkerInit(
-        base=base,
-        search_paths=tuple(search_paths),
-        files=tuple(files),
         detector=detector,
         plugins=tuple(plugins),
         resolvers=tuple(resolvers),
-        project_root=project_root,
     )
     assert workers is not None
-    max_workers = min(workers, len(miss_files))
+    max_workers = min(workers, len(tasks))
     with ProcessPoolExecutor(
         max_workers=max_workers,
         initializer=_init_worker,
         initargs=(init,),
     ) as pool:
-        for file, payload in pool.map(_worker_process_file, miss_files):
-            miss_payloads[file] = payload
+        for base, file, payload in pool.map(_worker_process_task, tasks):
+            out[base][file] = payload
             if cache is not None:
                 cache.put(file, payload)
-    return miss_payloads
+    return out
 
 
 def _merge_payloads(*payloads: VisitorPayload) -> VisitorPayload:

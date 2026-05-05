@@ -12,14 +12,25 @@ two versions.
 ### Added
 - `build_symbol_graph(workers=N)` (and matching `--workers` / `-j` CLI
   flag) dispatches per-file visitor + observe passes to a
-  `ProcessPoolExecutor` when at least two cache-miss files exist in a
-  base. Workers return `VisitorPayload` blobs to the main process,
-  which still owns SQLite cache writes, trie stitching, and edge
-  resolution; serial behaviour and graph output are unchanged. A
-  fresh pool spins up per base so each worker's `sys.path` and
-  `FullRepoManager` match the base being processed, and cache-warm
-  bases never start one. `workers=None` (default) and `workers=1`
-  keep the existing serial path.
+  `ProcessPoolExecutor` when at least two cache-miss files exist
+  across all bases. Workers return `VisitorPayload` blobs to the
+  main process, which still owns SQLite cache writes, trie
+  stitching, and edge resolution; serial behaviour and graph output
+  are unchanged. A single persistent pool spans the whole run with
+  tasks sorted by `search_paths`, so any one worker tends to see
+  contiguous miss runs from the same base; on each transition the
+  worker rebinds `sys.path` and clears `safe_resolve_module` plus
+  `distribution_lookup` so cross-venv uv-workspace members don't
+  inherit a sibling base's resolution state. `workers=None`
+  (default) and `workers=1` keep the existing serial path.
+
+### Changed
+- `build_symbol_graph` is now structured as three phases: collect
+  per-base specs (cache hits + miss files), compute every miss
+  payload (serial or parallel), then per-base apply + edge stitch +
+  plugin finalize. The graph and cache contents are unchanged; the
+  rearrangement makes the parallel path tractable and removes
+  `temp_sys_path` from the main process loop in parallel mode.
 
 ## [0.4.0] - 2026-05-03
 
