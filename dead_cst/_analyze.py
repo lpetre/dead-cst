@@ -5,11 +5,12 @@ import sys
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Sequence
+from typing import Mapping, Sequence
 
 import libcst as cst
 import networkx as nx
-from libcst.metadata import CodeRange, FullRepoManager
+from libcst.helpers.module import ModuleNameAndPackage
+from libcst.metadata import CodeRange, MetadataWrapper
 
 from ._branches import (
     DefaultUnreachableRegionDetector,
@@ -166,9 +167,11 @@ def build_symbol_graph(
         return :class:`VisitorPayload` objects to the main process,
         which still owns the SQLite cache write and the trie-stitching
         / edge-resolution stages. ``None`` (default) and ``1`` keep
-        the serial path. A fresh pool is built per base so each
-        worker's ``sys.path`` and ``FullRepoManager`` match the base
-        being processed; cache-warm bases never spin one up.
+        the serial path. The pool is persistent across bases; tasks
+        are sorted by ``search_paths`` so each worker tends to see
+        contiguous runs from one base, and the FQN cache is built
+        once in the parent and shipped per-task rather than rebuilt
+        in each worker.
 
     Returns
     -------
@@ -330,7 +333,7 @@ def _run_observe(
 def _process_one_file(
     file: Path,
     *,
-    mgr: FullRepoManager,
+    fqn_entry: ModuleNameAndPackage,
     search_paths: list[Path],
     import_resolver: ImportResolver,
     detector: UnreachableRegionDetector,
@@ -340,13 +343,15 @@ def _process_one_file(
 ) -> VisitorPayload:
     """Run the visitor + observe pass for a single file and return its payload.
 
-    Shared by the serial path inside :func:`build_symbol_graph` and the
-    worker entry point used when ``workers >= 2``. The caller owns the
-    :class:`FullRepoManager` so it can be reused across files in the
-    same base (the FQN cache is precomputed per base) and so workers
-    don't rebuild it on every task.
+    The caller owns the precomputed FQN entry (built once per base by
+    :func:`_collect_base_specs`) so we can construct
+    :class:`MetadataWrapper` directly with ``cache=`` injected,
+    skipping :class:`FullRepoManager`'s per-instance ``gen_cache``
+    rebuild. Same shape ``FullRepoManager.get_metadata_wrapper_for_path``
+    builds, just without re-walking the file list every time.
     """
-    wrapper = mgr.get_metadata_wrapper_for_path(str(file))
+    module = cst.parse_module(file.read_text())
+    wrapper = MetadataWrapper(module, True, {FixedFullyQualifiedNameProvider: fqn_entry})
     visitor = SymbolVisitor(
         file,
         search_paths,
@@ -367,7 +372,9 @@ class _BaseSpec:
     Built once up front in :func:`_collect_base_specs` so the parallel
     path can flatten every base's miss files into a single sorted task
     list and the apply phase can iterate every base in deterministic
-    order without re-reading the cache.
+    order without re-reading the cache. ``fqn_cache`` covers only the
+    miss files -- hit files never go through the visitor, so they
+    don't need an FQN entry.
     """
 
     base: Path
@@ -375,6 +382,7 @@ class _BaseSpec:
     files: tuple[Path, ...]
     hits: dict[Path, VisitorPayload]
     miss_files: tuple[Path, ...]
+    fqn_cache: Mapping[str, ModuleNameAndPackage]
 
 
 def _collect_base_specs(paths: PathMap, cache: GraphCache | None) -> dict[Path, _BaseSpec]:
@@ -382,7 +390,10 @@ def _collect_base_specs(paths: PathMap, cache: GraphCache | None) -> dict[Path, 
 
     Cache reads happen on the main process; each hit is materialized
     once and stashed on the spec, so the apply phase doesn't pay a
-    second lookup. Iteration order is ``order_paths(paths)`` so the
+    second lookup. The FQN cache is built once per base over the
+    miss files only -- workers don't rebuild it, and we skip the
+    ``calculate_module_and_package`` call for files we'll serve
+    from the cache. Iteration order is ``order_paths(paths)`` so the
     apply phase sees deps before dependents.
     """
     specs: dict[Path, _BaseSpec] = {}
@@ -397,12 +408,18 @@ def _collect_base_specs(paths: PathMap, cache: GraphCache | None) -> dict[Path, 
                 miss_files.append(file)
             else:
                 hits[file] = payload
+        fqn_cache: Mapping[str, ModuleNameAndPackage] = (
+            FixedFullyQualifiedNameProvider.gen_cache(base, [str(f) for f in miss_files], timeout=5)
+            if miss_files
+            else {}
+        )
         specs[base] = _BaseSpec(
             base=base,
             search_paths=search_paths,
             files=files,
             hits=hits,
             miss_files=tuple(miss_files),
+            fqn_cache=fqn_cache,
         )
     return specs
 
@@ -429,17 +446,18 @@ class _WorkerInit:
 class _WorkerTask:
     """Per-file unit of work dispatched to a worker.
 
-    Carries the base context inline so workers don't need to be
-    re-initialized when the active base changes -- they detect a new
-    ``search_paths`` value and rebind ``sys.path`` + invalidate the
-    resolver caches in place. ``project_root`` is constant for the
-    run but travels here so the worker doesn't need a separate global.
+    ``fqn_entry`` is this file's slice of the per-base FQN cache built
+    once in the parent (see :func:`_collect_base_specs`); the worker
+    injects it into a :class:`MetadataWrapper` rather than rebuilding
+    a :class:`FullRepoManager`. ``search_paths`` doubles as the
+    transition key for ``sys.path`` rebinding + resolver-cache
+    invalidation.
     """
 
     file: Path
     base: Path
     search_paths: tuple[Path, ...]
-    files_in_base: tuple[Path, ...]
+    fqn_entry: ModuleNameAndPackage
     project_root: Path
 
 
@@ -448,19 +466,15 @@ class _WorkerState:
     """Per-worker mutable state populated by :func:`_init_worker`.
 
     ``sys_path_baseline`` snapshots the worker's pristine ``sys.path``
-    at startup (i.e. inherited from the parent before any per-base
-    prefix). Each transition rebuilds ``sys.path`` from
-    ``search_paths + baseline``. ``last_search_paths`` is the
-    transition key: when it changes we drop ``mgr`` (different base
-    means a different file list, so the FQN gen cache must be
-    rebuilt) and clear the LRU caches.
+    at startup. Each transition rebuilds ``sys.path`` from
+    ``search_paths + baseline`` and clears the resolver LRUs.
+    ``last_search_paths`` is the transition key.
     """
 
     init: _WorkerInit
     import_resolver: ImportResolver
     sys_path_baseline: list[str]
     last_search_paths: tuple[Path, ...] | None = field(default=None)
-    mgr: FullRepoManager | None = field(default=None)
 
 
 _worker_state: _WorkerState | None = None
@@ -521,10 +535,9 @@ def _clear_resolver_caches() -> None:
 
 
 def _on_search_paths_change(state: _WorkerState, search_paths: tuple[Path, ...]) -> None:
-    """Worker transition: rebind ``sys.path``, clear caches, drop the FQN mgr."""
+    """Worker transition: rebind ``sys.path``, clear resolver caches."""
     _rebind_sys_path(search_paths, state.sys_path_baseline)
     _clear_resolver_caches()
-    state.mgr = None
     state.last_search_paths = search_paths
 
 
@@ -541,15 +554,9 @@ def _worker_process_task(task: _WorkerTask) -> tuple[Path, Path, VisitorPayload]
     assert state is not None, "_init_worker must run before _worker_process_task"
     if state.last_search_paths != task.search_paths:
         _on_search_paths_change(state, task.search_paths)
-    if state.mgr is None:
-        state.mgr = FullRepoManager(
-            str(task.base),
-            [str(f) for f in task.files_in_base],
-            {FixedFullyQualifiedNameProvider},
-        )
     payload = _process_one_file(
         task.file,
-        mgr=state.mgr,
+        fqn_entry=task.fqn_entry,
         search_paths=list(task.search_paths),
         import_resolver=state.import_resolver,
         detector=state.init.detector,
@@ -577,8 +584,9 @@ def _compute_all_miss_payloads(
 
     * Serial (``workers`` ``None`` / ``1`` / total misses < 2) --
       iterate bases in order, enter ``temp_sys_path`` per base,
-      clear the resolver caches, build one ``FullRepoManager`` per
-      base, run :func:`_process_one_file` for each miss in turn.
+      clear the resolver caches, run :func:`_process_one_file` for
+      each miss in turn using the precomputed FQN entry from
+      ``spec.fqn_cache``.
     * Parallel -- one persistent :class:`ProcessPoolExecutor` for the
       whole run. Tasks are sorted by ``search_paths`` so a worker
       tends to see contiguous miss runs from the same base; on each
@@ -606,15 +614,10 @@ def _compute_all_miss_payloads(
             search_paths = list(spec.search_paths)
             _clear_resolver_caches()
             with temp_sys_path(search_paths):
-                mgr = FullRepoManager(
-                    str(base),
-                    [str(f) for f in spec.files],
-                    {FixedFullyQualifiedNameProvider},
-                )
                 for file in spec.miss_files:
                     payload = _process_one_file(
                         file,
-                        mgr=mgr,
+                        fqn_entry=spec.fqn_cache[str(file)],
                         search_paths=search_paths,
                         import_resolver=import_resolver,
                         detector=detector,
@@ -628,7 +631,7 @@ def _compute_all_miss_payloads(
         return out
 
     # Sort tasks so each worker sees contiguous runs from the same
-    # base; bounded transitions keep the FQN gen cache hot. The sort
+    # base; bounded transitions keep the resolver caches hot. The sort
     # key is computed once per task rather than per comparator call.
     keyed_tasks: list[tuple[tuple[str, ...], str, _WorkerTask]] = []
     for base, spec in base_specs.items():
@@ -642,7 +645,7 @@ def _compute_all_miss_payloads(
                         file=file,
                         base=base,
                         search_paths=spec.search_paths,
-                        files_in_base=spec.files,
+                        fqn_entry=spec.fqn_cache[str(file)],
                         project_root=project_root,
                     ),
                 )
