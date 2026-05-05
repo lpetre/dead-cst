@@ -31,7 +31,7 @@ class ManualResolver:
 
     specs: list[str] = field(default_factory=list)
     name: str = "manual"
-    version: int = 1777760307
+    version: int = 1777973896
 
     def resolve(self, project_root: Path) -> PathMap:
         out: PathMap = {}

@@ -62,6 +62,28 @@ two versions.
   `sys.path` directly, restoring it from a baseline snapshot when
   the in-process path finishes. Not part of the public API.
 
+### Fixed
+- Path classification in `default_resolve_import` no longer
+  misclassifies third-party packages as stdlib when running against
+  a Python install whose `site-packages` is nested *inside* the
+  stdlib root (the typical layout for a system Python with no venv,
+  e.g. `/usr/local/lib/python3.13/site-packages` under
+  `/usr/local/lib/python3.13`). The stdlib check now excludes paths
+  under `purelib` / `platlib` and any directory named
+  `site-packages` / `dist-packages`.
+- Editably-installed third-party packages (`pip install -e`,
+  `uv pip install -e`) are now resolved to `[external dist] <name>`
+  instead of raising `Module ... resolved to an unexpected path`.
+  Distribution metadata is consulted via PEP 610
+  `direct_url.json` and any `.pth` shims in the dist's
+  `RECORD`, so editable source dirs that live outside the project's
+  search paths still get attributed to their owning distribution.
+  The new cache (`editable_distribution_roots`) is cleared alongside
+  `distribution_lookup` on worker venv transitions. All four
+  shipping resolvers (`venv`, `pyproject`, `uv_workspace`,
+  `manual`) bump their `version` so cached `VisitorPayload` blobs
+  rebuild against the corrected classification.
+
 ## [0.4.0] - 2026-05-03
 
 ### Added

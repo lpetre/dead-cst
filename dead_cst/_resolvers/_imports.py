@@ -13,6 +13,7 @@ distribution-name normalization.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import sys
@@ -27,7 +28,25 @@ from .._plugins._core import (
     STDLIB_PREFIX,
 )
 
+
+def _resolved_sysconfig_path(name: str) -> Path | None:
+    raw = sysconfig.get_path(name)
+    if not raw:
+        return None
+    try:
+        return Path(raw).resolve()
+    except OSError:
+        return None
+
+
+# A system Python install (no venv) typically nests purelib/platlib *inside*
+# the stdlib root (e.g. ``/usr/local/lib/python3.13/site-packages`` under
+# ``/usr/local/lib/python3.13``). Capturing both lets us classify a resolved
+# path as stdlib only when it isn't actually a third-party package living
+# under that same root.
 STDLIB = Path(sysconfig.get_path("stdlib")).resolve()
+PURELIB = _resolved_sysconfig_path("purelib")
+PLATLIB = _resolved_sysconfig_path("platlib")
 SITE_PACKAGES_MARKERS = ("site-packages", "dist-packages")
 
 
@@ -116,6 +135,120 @@ def distribution_lookup() -> dict[Path, str]:
     return lookup
 
 
+@cache
+def editable_distribution_roots() -> tuple[tuple[Path, str], ...]:
+    """Source-directory roots for editably-installed distributions.
+
+    A modern ``pip install -e`` / ``uv pip install -e`` only records
+    metadata files plus a ``.pth`` (or PEP 660 finder proxy) in the
+    dist's ``RECORD``. The actual ``.py`` source lives in the user's
+    project directory and never appears in :func:`distribution_lookup`.
+    We surface it here by reading each dist's ``direct_url.json``
+    (PEP 610) and any ``.pth`` shims it ships, so an importer of, say,
+    an editable ``dead-cst`` resolves to ``[external dist] dead-cst``
+    instead of raising on an "unexpected path" or being silently
+    misclassified.
+
+    Returns ``(root, canonical_name)`` tuples sorted longest-path first
+    so prefix-matching against nested editable layouts picks the most
+    specific dist. Cached alongside :func:`distribution_lookup` and
+    cleared together when the analyzer transitions across venvs.
+    """
+    from importlib import metadata
+
+    roots: list[tuple[Path, str]] = []
+    for dist in metadata.distributions():
+        canonical = _canonical_dist_name(dist.metadata["Name"])
+        for root in _editable_source_roots(dist):
+            roots.append((root, canonical))
+    roots.sort(key=lambda pair: len(pair[0].parts), reverse=True)
+    return tuple(roots)
+
+
+def _editable_source_roots(dist) -> list[Path]:
+    """Discover editable source directories advertised by ``dist``.
+
+    Honors PEP 610 (``direct_url.json`` with ``dir_info.editable=true``)
+    and the ``.pth`` shim style used by uv / setuptools-legacy
+    editables. Both are best-effort: malformed metadata or missing
+    files just yield no roots for this dist.
+    """
+    roots: list[Path] = []
+
+    direct_url = _safe_read_dist_text(dist, "direct_url.json")
+    if direct_url:
+        try:
+            data = json.loads(direct_url)
+        except json.JSONDecodeError:
+            data = {}
+        if isinstance(data, dict) and data.get("dir_info", {}).get("editable"):
+            url = data.get("url")
+            if isinstance(url, str) and url.startswith("file://"):
+                # ``file:///abs/path`` -> ``/abs/path``; ``file://host/path`` is
+                # not portable on POSIX but we let Path normalize whatever's
+                # left of the scheme prefix.
+                candidate = Path(url[len("file://") :])
+                if candidate.is_absolute() and candidate.is_dir():
+                    roots.append(candidate.resolve())
+
+    for file in dist.files or ():
+        if not str(file).endswith(".pth"):
+            continue
+        try:
+            text = Path(str(dist.locate_file(file))).read_text()
+        except (OSError, UnicodeDecodeError):
+            continue
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or line.startswith(("import ", "import\t")):
+                continue
+            candidate = Path(line)
+            if candidate.is_absolute() and candidate.is_dir():
+                roots.append(candidate.resolve())
+
+    # Deduplicate while preserving order.
+    seen: set[Path] = set()
+    unique: list[Path] = []
+    for root in roots:
+        if root not in seen:
+            seen.add(root)
+            unique.append(root)
+    return unique
+
+
+def _safe_read_dist_text(dist, name: str) -> str | None:
+    try:
+        return dist.read_text(name)
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def _is_site_packages_path(path: Path) -> bool:
+    """True when ``path`` lives inside an interpreter's third-party install dir.
+
+    We check ``purelib`` / ``platlib`` first since they're the
+    interpreter-blessed locations, then fall back to the conventional
+    directory names for layouts where sysconfig disagrees with reality
+    (Debian ``dist-packages`` siblings, vendored bundles, ...).
+    """
+    if PURELIB is not None and path.is_relative_to(PURELIB):
+        return True
+    if PLATLIB is not None and path.is_relative_to(PLATLIB):
+        return True
+    return any(part in SITE_PACKAGES_MARKERS for part in path.parts)
+
+
+def _is_stdlib_path(path: Path) -> bool:
+    """True when ``path`` is part of the standard library.
+
+    Excludes nested site-packages because a system Python install lays
+    them out *inside* ``STDLIB`` (e.g. ``.../python3.13/site-packages``
+    under ``.../python3.13``); a naive ``is_relative_to(STDLIB)`` would
+    otherwise misclassify every third-party package as stdlib.
+    """
+    return path.is_relative_to(STDLIB) and not _is_site_packages_path(path)
+
+
 def default_resolve_import(name: str, search_paths: list[Path]) -> str | Path | None:
     """Resolve a dotted module name against ``sys.path`` + the importlib finders.
 
@@ -140,15 +273,21 @@ def default_resolve_import(name: str, search_paths: list[Path]) -> str | Path | 
     if spec.origin in {"built-in", "frozen"}:
         return f"{STDLIB_PREFIX}{name}"
     path = Path(spec.origin).resolve()
-    if path.is_relative_to(STDLIB):
+
+    # Distribution lookup runs before the stdlib check so that, on a
+    # system Python where site-packages is nested inside the stdlib
+    # root, third-party packages are still correctly attributed to
+    # their distribution rather than swallowed into ``[stdlib]``.
+    if dist := distribution_lookup().get(path):
+        return f"{EXTERNAL_DIST_PREFIX}{dist}"
+    for root, dist in editable_distribution_roots():
+        if path.is_relative_to(root):
+            return f"{EXTERNAL_DIST_PREFIX}{dist}"
+
+    if _is_stdlib_path(path):
         return f"{STDLIB_PREFIX}{name}"
 
-    lookup = distribution_lookup()
-    if dist := lookup.get(path):
-        return f"{EXTERNAL_DIST_PREFIX}{dist}"
-
-    path_str = str(path)
-    if any(m in path_str for m in SITE_PACKAGES_MARKERS):
+    if _is_site_packages_path(path):
         return f"{EXTERNAL_FILE_PREFIX}{name}"
 
     for search in search_paths:

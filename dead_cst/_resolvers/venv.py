@@ -41,7 +41,7 @@ class VenvResolver:
 
     venv_dir: str | None = None
     name: str = "venv"
-    version: int = 1777760307
+    version: int = 1777973896
 
     def resolve(self, project_root: Path) -> PathMap:
         project_root = project_root.resolve()

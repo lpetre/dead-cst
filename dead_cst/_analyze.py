@@ -33,7 +33,11 @@ from ._resolvers import (
     default_resolve_import,
     exported_roots,
 )
-from ._resolvers._imports import distribution_lookup, safe_resolve_module
+from ._resolvers._imports import (
+    distribution_lookup,
+    editable_distribution_roots,
+    safe_resolve_module,
+)
 from ._symbols import EdgeFlags, Import, NodeFlags, SymbolNode, SymbolTrie
 from ._visitor import SymbolVisitor, VisitorPayload
 
@@ -479,16 +483,18 @@ def _rebind_sys_path(search_paths: tuple[Path, ...], baseline: list[str]) -> Non
 
 
 def _clear_resolver_caches() -> None:
-    """Drop the two ``sys.path``-derived resolver caches.
+    """Drop the ``sys.path``-derived resolver caches.
 
     :func:`safe_resolve_module` keys on fullname and
-    :func:`distribution_lookup` keys on ``()`` -- both read live
-    ``sys.path`` and would otherwise return stale results across
-    bases (different first-party prefix; uv-workspace members shipping
-    their own ``.venv``).
+    :func:`distribution_lookup` / :func:`editable_distribution_roots`
+    key on ``()`` -- all three read live ``sys.path`` (or
+    :mod:`importlib.metadata` against it) and would otherwise return
+    stale results across bases (different first-party prefix;
+    uv-workspace members shipping their own ``.venv``).
     """
     safe_resolve_module.cache_clear()
     distribution_lookup.cache_clear()
+    editable_distribution_roots.cache_clear()
 
 
 def _process_task(state: _RunnerState, task: _Task) -> tuple[Path, Path, VisitorPayload]:
