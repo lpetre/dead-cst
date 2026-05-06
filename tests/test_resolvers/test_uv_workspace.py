@@ -222,7 +222,7 @@ def test_uv_workspace_flat_layout_with_tests_dirs(tmp_path: Path):
     With per-consumer export scoping, the dep's ``tests/`` is never
     merged into the consumer's lookup trie, so analysis succeeds and the
     real cross-member ``import foo.c.mod`` resolves."""
-    from dead_cst import build_symbol_graph
+    from dead_cst import Analysis
 
     (tmp_path / "pyproject.toml").write_text(
         textwrap.dedent("""
@@ -292,7 +292,7 @@ def test_uv_workspace_flat_layout_with_tests_dirs(tmp_path: Path):
     _make_fake_venv(tmp_path)
     paths = UvWorkspaceResolver().resolve(tmp_path)
     # No AssertionError -- this used to crash before the fix.
-    graph = build_symbol_graph(paths)
+    graph = Analysis(paths).materialize_all()
 
     # Both members' tests modules exist as distinct nodes (full graph picture).
     tests_modules = [n for n in graph.nodes if n.type == "module" and n.fqname == "tests"]
@@ -320,7 +320,7 @@ def test_uv_workspace_shared_namespace_package(tmp_path: Path):
     ``from foo.a import value`` from inside ``foo.b`` must resolve through
     PEP 420 namespace merging of the two ``foo/`` dirs on the search path.
     """
-    from dead_cst import build_symbol_graph
+    from dead_cst import Analysis
 
     (tmp_path / "pyproject.toml").write_text(
         textwrap.dedent("""
@@ -386,7 +386,7 @@ def test_uv_workspace_shared_namespace_package(tmp_path: Path):
     foo_b_dir = foo_b.resolve()
     assert paths == {foo_a_dir: [sp], foo_b_dir: [foo_a_dir, sp]}
 
-    graph = build_symbol_graph(paths)
+    graph = Analysis(paths).materialize_all()
 
     # foo.a.value (in foo-a) and foo.b.result (in foo-b) both made it into
     # the graph as distinct variables under the shared ``foo`` namespace.

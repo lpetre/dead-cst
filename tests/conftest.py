@@ -4,7 +4,7 @@ import textwrap
 import networkx as nx
 import pytest
 
-from dead_cst import EdgeFlags, build_symbol_graph
+from dead_cst import Analysis, EdgeFlags
 
 
 @pytest.fixture
@@ -38,7 +38,7 @@ def build_decl_graph(tmp_path):
             full_path = tmp_path / filename
             full_path.parent.mkdir(parents=True, exist_ok=True)
             full_path.write_text(textwrap.dedent(content).strip())
-        return build_symbol_graph({tmp_path: []})
+        return Analysis({tmp_path: []}).materialize_all()
 
     return _make_graph
 

@@ -26,8 +26,9 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-from dead_cst import build_symbol_graph, find_reachable
-from dead_cst.cache import GraphCache, compute_fingerprint
+from dead_cst import Analysis
+from dead_cst.analyze import _find_reachable as find_reachable
+from dead_cst.cache import GraphCache
 from dead_cst.cli import app
 from dead_cst.plugins import MainBlockPlugin, ModuleDundersPlugin
 
@@ -141,7 +142,7 @@ def _module_node(graph, fqname):
 
 
 def _build_graph(base: Path, *plugins):
-    return build_symbol_graph({base: []}, plugins=list(plugins), project_root=base)
+    return Analysis({base: []}, plugins=list(plugins), project_root=base).materialize_all()
 
 
 def test_flux0_cli_cmds_dead_without_plugin(flux0_cli_src):
@@ -310,12 +311,13 @@ def test_flux0_internal_modules_survives_cache_round_trip(flux0_server_src, tmp_
     ]
     paths = {base: []}
     cache_path = tmp_path / "cache.sqlite"
-    fp = compute_fingerprint(paths=paths, resolvers=[], plugins=plugins)
 
     dead_sets = []
     for _ in range(2):
-        with GraphCache(cache_path, fp) as cache:
-            graph = build_symbol_graph(paths, plugins=plugins, project_root=base, cache=cache)
+        with GraphCache(cache_path) as cache:
+            graph = Analysis(
+                paths, plugins=plugins, project_root=base, cache=cache
+            ).materialize_all()
         reachable = find_reachable(graph)
         dead_sets.append(
             {

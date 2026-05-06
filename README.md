@@ -154,11 +154,11 @@ dead-cst cache clear [ROOT]
 ```python
 import re
 from pathlib import Path
-from dead_cst import build_symbol_graph, find_reachable, remove_code
+from dead_cst import Analysis
 from dead_cst.plugins import ExplicitEntrypointPlugin, MainBlockPlugin
 
 root = Path("./src")
-graph = build_symbol_graph(
+analysis = Analysis(
     {root: []},
     plugins=[
         MainBlockPlugin(),
@@ -166,12 +166,20 @@ graph = build_symbol_graph(
     ],
     project_root=root,
 )
-reachable = find_reachable(graph)
 
-unreachable = graph.subgraph([n for n in graph.nodes if n not in reachable])
-# Inspect unreachable nodes, or remove them:
-remove_code(unreachable, root)
+# Whole-project queries: cheap to construct, lazy to materialize.
+for node in analysis.dead():
+    print(f"dead: {node.fqname} ({node.type}) at {node.path}")
+
+# Per-package queries scope work to the smallest base set that gives
+# correct reachability answers. Local queries (modules, declarations)
+# never materialize cross-base state.
+pkg = analysis.package(root)
+print(sum(1 for _ in pkg.modules()), "modules")
+pkg.remove_dead_code()  # codemod, scoped to this base
 ```
+
+`Analysis(...).materialize_all()` returns the full `networkx.MultiDiGraph` if you need raw access; `analysis.package(base).graph()` returns the closure-scoped subgraph for one package.
 
 All three extension points — edge plugins, path resolvers, and the unreachable-region detector — share a single `Cacheable` protocol (`name: str`, `version: int`) that feeds the per-file cache fingerprint. The core `SymbolVisitor` carries the same pair, so visitor-level changes get an explicit knob too. Bumping a component's epoch `version` invalidates stale payloads automatically, so swapping or upgrading any of them is safe by default. The package `__version__` is intentionally *not* in the fingerprint: every component whose output can shift between releases owns a dedicated `version`, and folding in `__version__` would let unbumped components ride for free on a release bump.
 
@@ -214,9 +222,9 @@ class MyInternalModulesPlugin(LiteralListPlugin):
 
 Write your own from scratch by implementing the `EdgePlugin` protocol (`name`, `version`, `observe`, `finalize`); register under the `dead_cst.plugins` entry-point group for CLI discovery.
 
-Path resolution is similarly pluggable. `PathResolver` implementations return a `{base: [dep_paths]}` map to feed `build_symbol_graph`. Builtins: `VenvResolver`, `PyprojectResolver`, `UvWorkspaceResolver` (parses `uv.lock` to discover workspace members and their inter-member dep edges). Third-party resolvers register under `dead_cst.resolvers`.
+Path resolution is similarly pluggable. `PathResolver` implementations return a `{base: [dep_paths]}` map to feed `Analysis`. Builtins: `VenvResolver`, `PyprojectResolver`, `UvWorkspaceResolver` (parses `uv.lock` to discover workspace members and their inter-member dep edges). Third-party resolvers register under `dead_cst.resolvers`.
 
-Unreachable-code detection is pluggable through the `UnreachableRegionDetector` protocol. `build_symbol_graph` accepts an `unreachable_detector` whose `find_regions(wrapper) -> list[CodeRange]` is invoked once per file. The built-in `DefaultUnreachableRegionDetector` covers three things out of the box:
+Unreachable-code detection is pluggable through the `UnreachableRegionDetector` protocol. `Analysis` accepts an `unreachable_detector` whose `find_regions(wrapper) -> list[CodeRange]` is invoked once per file. The built-in `DefaultUnreachableRegionDetector` covers three things out of the box:
 
 - **Literal truthiness** on every `if` / `while` test (e.g. `if False:` always-dead body, `if True: ... else: ...` always-dead else).
 - **Fixpoint constant folding** over simple `Name = literal` (and `Name: T = literal`) assignments. Chains like `foo = False; bar = foo or False; if bar: ...` resolve to dead because each fixpoint pass propagates one more level of indirection.
@@ -228,7 +236,7 @@ To layer in domain knowledge — e.g. config flags whose values are fixed in pro
 from dataclasses import dataclass
 
 import libcst as cst
-from dead_cst import build_symbol_graph
+from dead_cst import Analysis
 from dead_cst.branches import DefaultUnreachableRegionDetector
 
 @dataclass(frozen=True)
@@ -252,7 +260,7 @@ class FlagAwareDetector(DefaultUnreachableRegionDetector):
             return MIGRATIONS[expr.args[0].value.evaluated_value]
         return None
 
-graph = build_symbol_graph({root: []}, unreachable_detector=FlagAwareDetector())
+graph = Analysis({root: []}, unreachable_detector=FlagAwareDetector()).materialize_all()
 ```
 
 With the override above, `if check_flag("migration-abc"): ...` and `flag = check_flag("migration-abc"); if flag: ...` both resolve to a known truthiness, and the unreachable suite is flagged just like a literal `if False:` would be.

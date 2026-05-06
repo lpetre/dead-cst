@@ -10,27 +10,37 @@ entirely when the file hasn't changed.
 
 Two tables make up the database:
 
-``meta`` holds a single ``fingerprint`` row covering everything that
-could change a payload's *interpretation* without touching file
-contents -- Python version, search paths, and the visitor / resolver
-/ plugin / detector chain (each contributing its own
-``Cacheable`` ``(name, version)`` pair). A fingerprint mismatch on
-open wipes ``file_cache`` and writes the new fingerprint, so the
-very next analysis fully rebuilds the graph.
+``meta`` holds the schema version (an integer) so reads from a database
+written by an incompatible package version are detected on open: a
+schema-version mismatch drops ``file_cache`` and re-writes the current
+version. The fingerprint that decides whether an individual entry is
+still valid lives on the row itself, not in ``meta``, so different
+bases (or different per-base configurations) can coexist in one
+database without wiping each other.
 
 ``file_cache`` is one row per analyzed file, keyed by absolute path,
-with the file's SHA-256 content hash and the pickled payload. A hash
-mismatch invalidates that single row; the visitor reruns and the new
-payload replaces the old. Per-base :func:`resolve_edges` runs
+with the file's SHA-256 content hash, the per-base fingerprint
+(:func:`compute_fingerprint`) it was written under, and the pickled
+payload. A hash *or* fingerprint mismatch on read is treated as a
+miss; the row is left in place and overwritten by the next
+:meth:`GraphCache.put`. Per-base :func:`resolve_edges` runs
 unconditionally every analysis, so mutating one file's exports
 re-stitches every importer's edges in the same base for free -- the
 cache only short-circuits the per-file visitor work, never the
 graph-stitching work.
 
-Plugins are intentionally **not** part of the fingerprint: they
-contribute graph ops *after* per-file payloads are folded in, so
-swapping plugins between runs reuses the cached visitor output and
-only re-executes the plugin pass.
+Per-base fingerprinting is what makes scoped refresh tractable:
+:meth:`dead_cst.analyze.Analysis.refresh` can rebuild one base
+without invalidating sibling bases' cached payloads, because each
+file's row is gated by its base's own ``(base, search_paths,
+plugins, resolvers, detector)`` fingerprint rather than a single
+project-wide one.
+
+Plugins are intentionally part of the per-base fingerprint (their
+``observe`` output is folded into the cached payload) but the
+``finalize`` pass runs unconditionally on every analysis, so
+swapping ``finalize``-only plugins between runs does not require a
+plugin ``version`` bump.
 """
 
 from __future__ import annotations
@@ -50,20 +60,19 @@ from .branches import (
 )
 from .graph import VisitorPayload
 from .plugins._core import EdgePlugin
-from .resolvers import PathMap, PathResolver
+from .resolvers import PathResolver
 
 logger = logging.getLogger(__name__)
 
 CACHE_DIR_NAME = ".dead-cst-cache"
 CACHE_DB_NAME = "cache.db"
 
-# Bump when ``VisitorPayload``'s on-disk shape changes in a way the
-# unpickler can't handle. The fingerprint already covers ``__version__``,
-# but a major shape break wants an explicit signal so older databases
-# from sibling installs are wiped on open even at the same package
-# version (e.g. an editable checkout running ahead of the published
-# version).
-SCHEMA_VERSION = 1
+# Bump when the per-row shape of ``file_cache`` or the ``meta`` schema
+# changes in a way the unpickler / reader can't handle. Schema-version
+# mismatch on open drops ``file_cache`` so older databases from sibling
+# installs (or pre-per-base-fingerprint releases) are wiped on first
+# use even at the same package version.
+SCHEMA_VERSION = 2
 
 
 def default_cache_path(project_root: Path) -> Path:
@@ -73,30 +82,35 @@ def default_cache_path(project_root: Path) -> Path:
 
 def compute_fingerprint(
     *,
-    paths: PathMap,
+    base: Path,
+    search_paths: Sequence[Path],
     resolvers: Sequence[PathResolver],
     plugins: Sequence[EdgePlugin] = (),
     unreachable_detector: UnreachableRegionDetector | None = None,
 ) -> str:
-    """SHA-256 of every input that affects payload semantics for one analysis run.
+    """SHA-256 of every per-base input that affects payload semantics.
 
-    Includes Python version (pickle protocol stability), the
-    ``PathMap`` (the search-path layout governs ``Import.path``
-    resolution), and the visitor / resolver / plugin / detector
-    chain. Each component satisfies
+    Per-base by design: the fingerprint covers exactly one base's
+    configuration (``base`` itself, its ``search_paths``, the visitor
+    / resolver / plugin / detector chain, the schema version, the
+    Python version), so different bases in the same analysis live
+    side-by-side in one database without invalidating each other.
+    Adding or removing a sibling base, or changing a sibling base's
+    deps, leaves this base's fingerprint untouched.
+
+    Each component (visitor, plugins, resolvers, detector) satisfies
     :class:`~dead_cst._cacheable.Cacheable` and is fingerprinted by
     its ``(name, version)`` pair: bumping ``version`` invalidates
-    the file_cache so new output replaces the old. ``version`` is a
-    Unix epoch int by convention, so concurrent bumps on different
-    branches merge with ``max()``-wins semantics rather than
-    colliding on a re-used integer label.
+    every cached entry that referenced the old version. ``version``
+    is a Unix epoch int by convention so concurrent bumps on
+    different branches merge with ``max()``-wins semantics rather
+    than colliding on a re-used label.
 
     The dead-cst package ``__version__`` is *not* in the fingerprint:
     every component whose output could shift between releases carries
     its own ``Cacheable`` knob, and folding ``__version__`` in on top
     would let lazily-unbumped components ride for free on a release
-    bump. Bumping the relevant component's ``version`` is the
-    discipline; ``__version__`` is not a substitute.
+    bump.
 
     Each value is normalized to a stable string before hashing so
     equivalent inputs produce equal keys.
@@ -105,11 +119,11 @@ def compute_fingerprint(
     h.update(f"schema={SCHEMA_VERSION}\n".encode())
     h.update(f"python={sys.version_info.major}.{sys.version_info.minor}\n".encode())
     h.update(f"visitor={SymbolVisitor.name}@{SymbolVisitor.version}\n".encode())
+    h.update(f"base={base}\n".encode())
 
-    h.update(b"paths=\n")
-    for base in sorted(paths, key=lambda p: str(p)):
-        deps = sorted(str(d) for d in paths[base])
-        h.update(f"  {base}:{','.join(deps)}\n".encode())
+    h.update(b"search_paths=\n")
+    for sp in sorted(search_paths, key=str):
+        h.update(f"  {sp}\n".encode())
 
     h.update(b"resolvers=\n")
     for r_name, r_version in sorted((r.name, r.version) for r in resolvers):
@@ -141,30 +155,33 @@ def file_hash(path: Path) -> str | None:
 class GraphCache:
     """SQLite-backed lookup of pickled :class:`VisitorPayload` per file.
 
-    Open with a fingerprint string covering the full per-run inputs
-    (see :func:`compute_fingerprint`). On open, if the stored
-    fingerprint or schema version differs, ``file_cache`` is wiped and
-    the new fingerprint is recorded -- the next run is effectively a
-    full rebuild, and only the bumped fingerprint is preserved.
+    Open with just the database path -- there is no project-wide
+    fingerprint at the database level. Each :meth:`get` and
+    :meth:`put` takes the per-base fingerprint that the calling
+    analyzer computed via :func:`compute_fingerprint`; the row stores
+    its own fingerprint and a mismatch on read returns ``None``
+    (treated as a cache miss). On open, a schema-version mismatch
+    wipes ``file_cache`` and re-writes the current schema -- this
+    handles upgrading from older databases without intervention.
 
-    :meth:`get` returns the cached payload for a path when the file's
-    SHA-256 matches the stored hash, otherwise ``None``. :meth:`put`
-    writes (or replaces) one row. :meth:`close` flushes and closes the
-    connection; the class is also a context manager.
+    :meth:`get` returns the cached payload for a path when both the
+    file's SHA-256 and the stored fingerprint match the caller's;
+    otherwise ``None``. :meth:`put` writes (or replaces) one row.
+    :meth:`close` flushes and closes the connection; the class is
+    also a context manager.
 
     Concurrency note: SQLite handles a single writer fine, but the
     cache is intentionally process-local for the duration of one
     analysis. Don't share an instance across threads.
     """
 
-    def __init__(self, db_path: Path, fingerprint: str) -> None:
+    def __init__(self, db_path: Path) -> None:
         self._db_path = db_path
         db_path.parent.mkdir(parents=True, exist_ok=True)
         self._write_gitignore(db_path.parent)
         self._conn = sqlite3.connect(db_path)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._ensure_schema()
-        self._reconcile_fingerprint(fingerprint)
 
     @staticmethod
     def _write_gitignore(cache_dir: Path) -> None:
@@ -183,56 +200,73 @@ class GraphCache:
             logger.debug("Could not write %s: %s", gi, exc)
 
     def _ensure_schema(self) -> None:
+        """Create or migrate ``meta`` + ``file_cache`` to ``SCHEMA_VERSION``.
+
+        Schema-version mismatch (or first-run, or upgrade from an
+        older release that stored a single project-wide fingerprint
+        in ``meta.fingerprint``) drops ``file_cache`` and clears
+        ``meta`` so the next run starts clean. The next round of
+        :meth:`put` calls re-populates with rows that carry their own
+        per-base fingerprint.
+        """
         with self._conn:
             self._conn.execute(
                 "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
             )
-            self._conn.execute(
-                "CREATE TABLE IF NOT EXISTS file_cache ("
-                "path TEXT PRIMARY KEY, "
-                "content_hash TEXT NOT NULL, "
-                "payload BLOB NOT NULL)"
-            )
-
-    def _reconcile_fingerprint(self, fingerprint: str) -> None:
-        cur = self._conn.execute("SELECT value FROM meta WHERE key='fingerprint'")
+        cur = self._conn.execute("SELECT value FROM meta WHERE key='schema_version'")
         row = cur.fetchone()
-        stored = row[0] if row else None
-        if stored == fingerprint:
+        stored = int(row[0]) if row else None
+        if stored == SCHEMA_VERSION:
+            with self._conn:
+                self._conn.execute(
+                    "CREATE TABLE IF NOT EXISTS file_cache ("
+                    "path TEXT PRIMARY KEY, "
+                    "content_hash TEXT NOT NULL, "
+                    "fingerprint TEXT NOT NULL, "
+                    "payload BLOB NOT NULL)"
+                )
             return
         logger.debug(
-            "Cache fingerprint mismatch (stored=%s, current=%s); wiping file_cache",
+            "Cache schema mismatch (stored=%s, current=%s); wiping file_cache",
             stored,
-            fingerprint,
+            SCHEMA_VERSION,
         )
         with self._conn:
-            self._conn.execute("DELETE FROM file_cache")
+            self._conn.execute("DROP TABLE IF EXISTS file_cache")
+            self._conn.execute("DELETE FROM meta")
             self._conn.execute(
-                "INSERT INTO meta(key, value) VALUES('fingerprint', ?) "
-                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                (fingerprint,),
+                "CREATE TABLE file_cache ("
+                "path TEXT PRIMARY KEY, "
+                "content_hash TEXT NOT NULL, "
+                "fingerprint TEXT NOT NULL, "
+                "payload BLOB NOT NULL)"
+            )
+            self._conn.execute(
+                "INSERT INTO meta(key, value) VALUES('schema_version', ?)",
+                (str(SCHEMA_VERSION),),
             )
 
-    def get(self, path: Path) -> VisitorPayload | None:
-        """Return the cached payload for ``path`` if its content hash matches.
+    def get(self, path: Path, fingerprint: str) -> VisitorPayload | None:
+        """Return the cached payload for ``path`` if its content hash and
+        fingerprint match.
 
-        Returns ``None`` on first sight of the file, on hash mismatch
-        (the row is left in place; :meth:`put` will overwrite it), or
-        if the stored blob fails to unpickle (the row is dropped to
-        avoid trapping the cache).
+        Returns ``None`` on first sight of the file, on hash or
+        fingerprint mismatch (the row is left in place; :meth:`put`
+        will overwrite it), or if the stored blob fails to unpickle
+        (the row is dropped to avoid trapping the cache).
         """
         h = file_hash(path)
         if h is None:
             return None
         cur = self._conn.execute(
-            "SELECT content_hash, payload FROM file_cache WHERE path=?",
+            "SELECT content_hash, fingerprint, payload FROM file_cache WHERE path=?",
             (str(path),),
         )
         row = cur.fetchone()
         if row is None:
             return None
-        stored_hash, blob = row
-        if stored_hash != h:
+        stored_hash, stored_fp, blob = row
+        if stored_hash != h or stored_fp != fingerprint:
             return None
         try:
             payload = pickle.loads(blob)
@@ -248,18 +282,22 @@ class GraphCache:
             return None
         return payload
 
-    def put(self, path: Path, payload: VisitorPayload) -> None:
-        """Pickle ``payload`` and record it under the file's current hash."""
+    def put(self, path: Path, payload: VisitorPayload, fingerprint: str) -> None:
+        """Pickle ``payload`` and record it under the file's current hash
+        and the caller's per-base ``fingerprint``."""
         h = file_hash(path)
         if h is None:
             return
         blob = pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)
         with self._conn:
             self._conn.execute(
-                "INSERT INTO file_cache(path, content_hash, payload) VALUES(?, ?, ?) "
+                "INSERT INTO file_cache(path, content_hash, fingerprint, payload) "
+                "VALUES(?, ?, ?, ?) "
                 "ON CONFLICT(path) DO UPDATE SET "
-                "content_hash=excluded.content_hash, payload=excluded.payload",
-                (str(path), h, blob),
+                "content_hash=excluded.content_hash, "
+                "fingerprint=excluded.fingerprint, "
+                "payload=excluded.payload",
+                (str(path), h, fingerprint, blob),
             )
 
     def close(self) -> None:

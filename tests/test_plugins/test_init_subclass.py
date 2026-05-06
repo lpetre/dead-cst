@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dead_cst import build_symbol_graph
+from dead_cst import Analysis
 from dead_cst.plugins import (
     ExplicitEntrypointPlugin,
     InitSubclassPlugin,
@@ -37,14 +37,14 @@ def test_init_subclass_keeps_subclass_alive_via_parent(tmp_path, write_files, re
             """,
         }
     )
-    graph = build_symbol_graph(
+    graph = Analysis(
         {tmp_path: []},
         plugins=[
             ExplicitEntrypointPlugin(specs=["pkg.base.Plugin"]),
             InitSubclassPlugin(),
         ],
         project_root=tmp_path,
-    )
+    ).materialize_all()
     reached = reachable_fqnames(graph)
     # Parent is alive via the explicit entrypoint, so its subclasses come along.
     assert "pkg.base.Plugin" in reached
@@ -71,14 +71,14 @@ def test_init_subclass_transitive_subclasses(tmp_path, write_files, reachable_fq
             """,
         }
     )
-    graph = build_symbol_graph(
+    graph = Analysis(
         {tmp_path: []},
         plugins=[
             ExplicitEntrypointPlugin(specs=["pkg.mod.Root"]),
             InitSubclassPlugin(),
         ],
         project_root=tmp_path,
-    )
+    ).materialize_all()
     reached = reachable_fqnames(graph)
     assert "pkg.mod.Root" in reached
     assert "pkg.mod.Mid" in reached
@@ -104,11 +104,11 @@ def test_init_subclass_does_not_seed_parent_entrypoint(tmp_path, write_files, re
             """,
         }
     )
-    graph = build_symbol_graph(
+    graph = Analysis(
         {tmp_path: []},
         plugins=[InitSubclassPlugin()],
         project_root=tmp_path,
-    )
+    ).materialize_all()
     reached = reachable_fqnames(graph)
     assert "pkg.base.Plugin" not in reached
     assert "pkg.impls.Foo" not in reached
@@ -149,11 +149,11 @@ def test_init_subclass_via_main_block(tmp_path, write_files, reachable_fqnames):
             """,
         }
     )
-    graph = build_symbol_graph(
+    graph = Analysis(
         {tmp_path: []},
         plugins=[MainBlockPlugin(), InitSubclassPlugin()],
         project_root=tmp_path,
-    )
+    ).materialize_all()
     reached = reachable_fqnames(graph)
     assert "pkg.base.Handler" in reached
     assert "pkg.impls.JSONHandler" in reached
@@ -177,14 +177,14 @@ def test_init_subclass_aliased_import(tmp_path, write_files, reachable_fqnames):
             """,
         }
     )
-    graph = build_symbol_graph(
+    graph = Analysis(
         {tmp_path: []},
         plugins=[
             ExplicitEntrypointPlugin(specs=["pkg.base.Plugin"]),
             InitSubclassPlugin(),
         ],
         project_root=tmp_path,
-    )
+    ).materialize_all()
     assert "pkg.impls.Foo" in reachable_fqnames(graph)
 
 
@@ -205,14 +205,14 @@ def test_init_subclass_dotted_attribute_base(tmp_path, write_files, reachable_fq
             """,
         }
     )
-    graph = build_symbol_graph(
+    graph = Analysis(
         {tmp_path: []},
         plugins=[
             ExplicitEntrypointPlugin(specs=["pkg.base.Plugin"]),
             InitSubclassPlugin(),
         ],
         project_root=tmp_path,
-    )
+    ).materialize_all()
     assert "pkg.impls.Foo" in reachable_fqnames(graph)
 
 
@@ -237,14 +237,14 @@ def test_init_subclass_class_without_init_subclass_no_edges(
             """,
         }
     )
-    graph = build_symbol_graph(
+    graph = Analysis(
         {tmp_path: []},
         plugins=[
             ExplicitEntrypointPlugin(specs=["pkg.base.Plain"]),
             InitSubclassPlugin(),
         ],
         project_root=tmp_path,
-    )
+    ).materialize_all()
     reached = reachable_fqnames(graph)
     assert "pkg.base.Plain" in reached
     assert "pkg.impls.Sub" not in reached
@@ -281,14 +281,14 @@ def test_init_subclass_keeps_subclass_method_references_alive(
             """,
         }
     )
-    graph = build_symbol_graph(
+    graph = Analysis(
         {tmp_path: []},
         plugins=[
             ExplicitEntrypointPlugin(specs=["pkg.base.Plugin"]),
             InitSubclassPlugin(),
         ],
         project_root=tmp_path,
-    )
+    ).materialize_all()
     reached = reachable_fqnames(graph)
     assert "pkg.impls.Foo" in reached
     assert "pkg.helpers.helper" in reached
@@ -318,14 +318,14 @@ def test_init_subclass_subscripted_base(tmp_path, write_files, reachable_fqnames
             """,
         }
     )
-    graph = build_symbol_graph(
+    graph = Analysis(
         {tmp_path: []},
         plugins=[
             ExplicitEntrypointPlugin(specs=["pkg.base.Plugin"]),
             InitSubclassPlugin(),
         ],
         project_root=tmp_path,
-    )
+    ).materialize_all()
     assert "pkg.impls.Foo" in reachable_fqnames(graph)
 
 
@@ -348,14 +348,14 @@ def test_init_subclass_marker_in_predecessor_chain(tmp_path, write_files):
             """,
         }
     )
-    graph = build_symbol_graph(
+    graph = Analysis(
         {tmp_path: []},
         plugins=[
             ExplicitEntrypointPlugin(specs=["pkg.base.Plugin"]),
             InitSubclassPlugin(),
         ],
         project_root=tmp_path,
-    )
+    ).materialize_all()
     foo = next(n for n in graph.nodes if n.fqname == "pkg.impls.Foo")
     preds = list(graph.predecessors(foo))
     marker = next(

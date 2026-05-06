@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from dead_cst import find_reachable
+from dead_cst.analyze import _find_reachable as find_reachable
 
 
 @pytest.fixture

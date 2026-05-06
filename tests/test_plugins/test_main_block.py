@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dead_cst import build_symbol_graph
+from dead_cst import Analysis
 from dead_cst.plugins import MainBlockPlugin
 
 
@@ -19,11 +19,11 @@ def test_main_block_plugin_marks_module_entrypoint(tmp_path, write_files, reacha
             "pkg/other.py": "def g(): pass",
         }
     )
-    graph = build_symbol_graph(
+    graph = Analysis(
         {tmp_path: []},
         plugins=[MainBlockPlugin()],
         project_root=tmp_path,
-    )
+    ).materialize_all()
     reached = reachable_fqnames(graph)
     assert "pkg.script" in reached
     assert "pkg.script.main" in reached
@@ -56,11 +56,11 @@ def test_main_block_keeps_block_decls_alive(tmp_path, write_files, reachable_fqn
             """,
         }
     )
-    graph = build_symbol_graph(
+    graph = Analysis(
         {tmp_path: []},
         plugins=[MainBlockPlugin()],
         project_root=tmp_path,
-    )
+    ).materialize_all()
     reached = reachable_fqnames(graph)
     assert {"pkg.script", "pkg.script.app", "pkg.script.Foo", "pkg.script.main"} <= reached
     assert "pkg.script.Unused" not in reached
@@ -83,11 +83,11 @@ def test_main_block_keeps_nested_block_decls_alive(tmp_path, write_files, reacha
             """,
         }
     )
-    graph = build_symbol_graph(
+    graph = Analysis(
         {tmp_path: []},
         plugins=[MainBlockPlugin()],
         project_root=tmp_path,
-    )
+    ).materialize_all()
     reached = reachable_fqnames(graph)
     assert {"pkg.script.app", "pkg.script.Foo"} <= reached
     assert "pkg.script.Unused" not in reached
@@ -104,9 +104,9 @@ def test_main_block_reversed_comparison(tmp_path, write_files, reachable_fqnames
             """,
         }
     )
-    graph = build_symbol_graph(
+    graph = Analysis(
         {tmp_path: []},
         plugins=[MainBlockPlugin()],
         project_root=tmp_path,
-    )
+    ).materialize_all()
     assert "pkg.script" in reachable_fqnames(graph)
