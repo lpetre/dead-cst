@@ -64,6 +64,7 @@ EXPECTED_PUBLIC_API: dict[str, list[str]] = {
         "AddNode",
         "BUILTIN_PLUGINS",
         "ClickPlugin",
+        "CycloptsPlugin",
         "DecoratedDeclPlugin",
         "EXTERNAL_DIST_PREFIX",
         "EXTERNAL_FILE_PREFIX",
@@ -110,6 +111,7 @@ EXPECTED_PUBLIC_API: dict[str, list[str]] = {
     ],
     "dead_cst.contrib": [
         "ClickPlugin",
+        "CycloptsPlugin",
         "FastAPIPlugin",
         "FlaskPlugin",
         "PytestPlugin",

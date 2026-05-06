@@ -76,6 +76,7 @@ from ._core import (
     walk_to_instance_kind,
 )
 from ..contrib.click import ClickPlugin
+from ..contrib.cyclopts import CycloptsPlugin
 from ..contrib.fastapi import FastAPIPlugin
 from ..contrib.flask import FlaskPlugin
 from ..contrib.pytest import PytestPlugin
@@ -99,6 +100,7 @@ BUILTIN_PLUGINS: dict[str, type] = {
     FlaskPlugin.name: FlaskPlugin,
     TyperPlugin.name: TyperPlugin,
     ClickPlugin.name: ClickPlugin,
+    CycloptsPlugin.name: CycloptsPlugin,
     InitSubclassPlugin.name: InitSubclassPlugin,
 }
 
@@ -122,6 +124,7 @@ __all__ = [
     "AddNode",
     "BUILTIN_PLUGINS",
     "ClickPlugin",
+    "CycloptsPlugin",
     "DecoratedDeclPlugin",
     "EXTERNAL_DIST_PREFIX",
     "EXTERNAL_FILE_PREFIX",

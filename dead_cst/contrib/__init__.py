@@ -29,6 +29,7 @@ work alongside
 from __future__ import annotations
 
 from .click import ClickPlugin
+from .cyclopts import CycloptsPlugin
 from .fastapi import FastAPIPlugin
 from .flask import FlaskPlugin
 from .pytest import PytestPlugin
@@ -46,6 +47,7 @@ from .unittest import UnittestPlugin
 # pulled.
 __all__ = [
     "ClickPlugin",
+    "CycloptsPlugin",
     "FastAPIPlugin",
     "FlaskPlugin",
     "PytestPlugin",
