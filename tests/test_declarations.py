@@ -1659,6 +1659,34 @@ def test_branch_bindings_exported(build_decl_graph, assert_positional_edges, fil
     assert_positional_edges(graph, expected_edges)
 
 
+def test_cross_module_type_alias_import(build_decl_graph, assert_edges):
+    """Importing a PEP 695 ``type`` alias from another module resolves cleanly.
+
+    Regression: ``_edges.resolve_edges`` hit ``assert decl.type == "import"``
+    when a ``type_alias`` declaration was the re-export target, because it
+    was not included in the concrete-type guard alongside function/class/variable.
+    """
+    graph = build_decl_graph(
+        {
+            "lib.py": "type MyAlias = int\n",
+            "user.py": "from lib import MyAlias\nx: MyAlias\n",
+        }
+    )
+    assert_edges(
+        graph,
+        {
+            "lib.MyAlias -> lib",
+            "user.MyAlias -> lib",
+            "user.MyAlias -> lib.MyAlias",
+            "user.MyAlias -> user",
+            "user.x -> lib",
+            "user.x -> lib.MyAlias",
+            "user.x -> user",
+            "user.x -> user.MyAlias",
+        },
+    )
+
+
 def test_module_hierarchy_edges(build_decl_graph, assert_edges):
     """Submodules point at their parent package to keep __init__.py alive."""
     graph = build_decl_graph(

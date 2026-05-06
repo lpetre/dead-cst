@@ -84,6 +84,10 @@ two versions.
   (warm hits skip parsing entirely). The `parse` cache is now
   documented as a request-scope memo, populated lazily on first
   access.
+- `from mod import MyAlias` where `MyAlias` is a PEP 695 `type` statement
+  no longer raises `AssertionError` during edge resolution. `type_alias`
+  declarations are now treated as concrete termination points in the
+  re-export follower, the same as `function`, `class`, and `variable`.
 
 ## [0.5.0] - 2026-05-05
 
