@@ -32,6 +32,7 @@ from .click import ClickPlugin
 from .cyclopts import CycloptsPlugin
 from .fastapi import FastAPIPlugin
 from .flask import FlaskPlugin
+from .mock_patch import MockPatchPlugin
 from .pytest import PytestPlugin
 from .typer import TyperPlugin
 from .unittest import UnittestPlugin
@@ -50,6 +51,7 @@ __all__ = [
     "CycloptsPlugin",
     "FastAPIPlugin",
     "FlaskPlugin",
+    "MockPatchPlugin",
     "PytestPlugin",
     "TyperPlugin",
     "UnittestPlugin",
