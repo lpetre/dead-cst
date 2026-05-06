@@ -83,6 +83,7 @@ from ..plugins._core import (
     PluginContext,
     _asname_value,
     decls_by_simple_name,
+    is_name,
     make_payload,
     synthetic_node,
 )
@@ -109,6 +110,13 @@ class MockPatchPlugin:
 
     def observe(self, ctx: ObserveContext) -> VisitorPayload | None:
         patch_aliases, mock_module_aliases = _collect_mock_imports(ctx.module)
+        # ``mocker.patch`` (pytest-mock) and ``monkeypatch.setattr`` /
+        # ``delattr`` (pytest) are recognized regardless of imports
+        # because they're the standard pytest-fixture call shape.
+        # Folding ``mocker`` into ``mock_module_aliases`` here lets
+        # ``_PatchCallFinder`` treat all ``<X>.patch(...)`` matches
+        # uniformly.
+        mock_module_aliases.add(_MOCKER_NAME)
         module_node = next((n for n in ctx.payload.nodes if n.type == "module"), None)
         if module_node is None:
             return None
@@ -126,13 +134,7 @@ class MockPatchPlugin:
             if not owners:
                 owners = [module_node]
 
-            finder.targets.clear()
-            stmt.visit(finder)
-            seen: set[str] = set()
-            for fqname in finder.targets:
-                if fqname in seen:
-                    continue
-                seen.add(fqname)
+            for fqname in finder.find(stmt):
                 synth = synthetic_node(f"{PATCH_TARGET_PREFIX}{fqname}", ctx.path)
                 nodes.append(synth)
                 for owner in owners:
@@ -143,15 +145,22 @@ class MockPatchPlugin:
         return make_payload(nodes=nodes, edges=edges)
 
     def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]:
+        # Memoize trie lookups: the same fqname appears in one synthetic
+        # per file that patches it, and trie walks are O(parts).
+        decls_cache: dict[str, list[SymbolNode]] = {}
+        modules_cache: dict[str, SymbolNode | None] = {}
         for node in ctx.base_nodes():
             if node.type != "synthetic" or not node.fqname.startswith(PATCH_TARGET_PREFIX):
                 continue
             fqname = node.fqname[len(PATCH_TARGET_PREFIX) :]
+            if fqname not in decls_cache:
+                decls_cache[fqname] = ctx.find_declarations(fqname)
+                modules_cache[fqname] = ctx.find_module(fqname)
             existing = set(ctx.graph.successors(node))
-            for decl in ctx.find_declarations(fqname):
+            for decl in decls_cache[fqname]:
                 if decl not in existing:
                     yield AddEdge(node, decl)
-            mod = ctx.find_module(fqname)
+            mod = modules_cache[fqname]
             if mod is not None and mod not in existing:
                 yield AddEdge(node, mod)
 
@@ -188,15 +197,15 @@ def _collect_mock_imports(module: cst.Module) -> tuple[set[str], set[str]]:
                     continue
                 if source in _MOCK_MODULES:
                     for alias in small.names:
-                        if isinstance(alias.name, cst.Name) and alias.name.value == "patch":
+                        if is_name(alias.name, "patch"):
                             patch_aliases.add(_asname_value(alias) or "patch")
                 if source == "unittest":
                     for alias in small.names:
-                        if isinstance(alias.name, cst.Name) and alias.name.value == "mock":
+                        if is_name(alias.name, "mock"):
                             module_aliases.add(_asname_value(alias) or "mock")
             elif isinstance(small, cst.Import):
                 for alias in small.names:
-                    name = _dotted_import_name(alias.name)
+                    name = _dotted_name(alias.name)
                     if name not in _MOCK_MODULES:
                         continue
                     asname = _asname_value(alias)
@@ -210,38 +219,53 @@ def _collect_mock_imports(module: cst.Module) -> tuple[set[str], set[str]]:
 def _import_from_source(node: cst.ImportFrom) -> str | None:
     if node.relative:
         return None
-    return _dotted_import_name(node.module)
+    return _dotted_name(node.module)
 
 
-def _dotted_import_name(node: cst.CSTNode | None) -> str | None:
-    if isinstance(node, cst.Name):
-        return node.value
-    if isinstance(node, cst.Attribute):
-        head = _dotted_import_name(node.value)
-        if head is None:
-            return None
-        return f"{head}.{node.attr.value}"
-    return None
+def _dotted_name(node: cst.CSTNode | None) -> str | None:
+    """Return the dotted text of a ``Name`` / ``Attribute`` chain, else ``None``."""
+    parts: list[str] = []
+    current = node
+    while isinstance(current, cst.Attribute):
+        parts.append(current.attr.value)
+        current = current.value
+    if not isinstance(current, cst.Name):
+        return None
+    parts.append(current.value)
+    return ".".join(reversed(parts))
 
 
 class _PatchCallFinder(cst.CSTVisitor):
-    """Walk a CST subtree, collecting fqname strings from patch calls."""
+    """Walk a CST subtree, collecting fqname strings from patch calls.
+
+    A single instance is reused across statements via :meth:`find`,
+    which clears the per-statement target list before visiting.
+    """
 
     def __init__(self, patch_aliases: set[str], mock_module_aliases: set[str]) -> None:
         super().__init__()
         self._patch_aliases = patch_aliases
         self._mock_module_aliases = mock_module_aliases
-        self.targets: list[str] = []
+        self._targets: list[str] = []
+
+    def find(self, stmt: cst.CSTNode) -> list[str]:
+        """Return the deduped fqname strings collected from ``stmt``'s subtree."""
+        self._targets.clear()
+        stmt.visit(self)
+        # ``dict.fromkeys`` preserves first-seen order while deduping --
+        # multiple ``patch("X")`` calls in the same statement collapse
+        # to one synthetic per fqname.
+        return list(dict.fromkeys(self._targets))
 
     def visit_Call(self, node: cst.Call) -> bool | None:
         if self._matches_patch(node.func):
             target = _first_string_arg(node)
             if target is not None:
-                self.targets.append(target)
+                self._targets.append(target)
         else:
             target = _monkeypatch_target(node)
             if target is not None:
-                self.targets.append(target)
+                self._targets.append(target)
         return True
 
     def _matches_patch(self, func: cst.BaseExpression) -> bool:
@@ -250,9 +274,9 @@ class _PatchCallFinder(cst.CSTVisitor):
         if not isinstance(func, cst.Attribute) or func.attr.value != "patch":
             return False
         if isinstance(func.value, cst.Name):
-            return func.value.value in self._mock_module_aliases or func.value.value == _MOCKER_NAME
+            return func.value.value in self._mock_module_aliases
         if isinstance(func.value, cst.Attribute):
-            return _dotted_attr_name(func.value) in _MOCK_MODULES
+            return _dotted_name(func.value) in _MOCK_MODULES
         return False
 
 
@@ -304,16 +328,3 @@ def _string_value(expr: cst.BaseExpression) -> str | None:
     except Exception:
         return None
     return value if isinstance(value, str) else None
-
-
-def _dotted_attr_name(node: cst.BaseExpression) -> str | None:
-    parts: list[str] = []
-    current: cst.BaseExpression = node
-    while isinstance(current, cst.Attribute):
-        parts.append(current.attr.value)
-        current = current.value
-    if not isinstance(current, cst.Name):
-        return None
-    parts.append(current.value)
-    parts.reverse()
-    return ".".join(parts)

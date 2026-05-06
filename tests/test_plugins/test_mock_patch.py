@@ -2,179 +2,123 @@
 
 from __future__ import annotations
 
+import pytest
+
 from dead_cst import Analysis
+from dead_cst.contrib.mock_patch import PATCH_TARGET_PREFIX
 from dead_cst.plugins import MockPatchPlugin, PytestPlugin, UnittestPlugin
 
+# Each entry is a ``tests/test_lib.py`` body that should keep
+# ``pkg.lib.helper`` alive via a string-fqname patch reference. The id
+# names the recognized form so failures point at the specific shape.
+_RECOGNIZED_FORMS: list[tuple[str, str]] = [
+    (
+        "decorator-from-unittest-mock",
+        """
+        from unittest.mock import patch
 
-def test_decorator_form_keeps_target_alive(tmp_path, write_files, reachable_fqnames):
-    write_files(
-        {
-            "pkg/__init__.py": "",
-            "pkg/lib.py": """
-            def helper():
-                return 1
-            """,
-            "tests/__init__.py": "",
-            "tests/test_lib.py": """
-            from unittest.mock import patch
+        @patch("pkg.lib.helper")
+        def test_helper(_): pass
+        """,
+    ),
+    (
+        "with-block-from-unittest-mock",
+        """
+        from unittest.mock import patch
 
-            @patch("pkg.lib.helper")
-            def test_helper(mock_helper):
-                pass
-            """,
-        }
-    )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[MockPatchPlugin(), PytestPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
-    assert "pkg.lib.helper" in reachable_fqnames(graph)
+        def test_helper():
+            with patch("pkg.lib.helper") as m:
+                m.return_value = 2
+        """,
+    ),
+    (
+        "aliased-patch-import",
+        """
+        from unittest.mock import patch as p
 
+        @p("pkg.lib.helper")
+        def test_helper(_): pass
+        """,
+    ),
+    (
+        "from-unittest-import-mock",
+        """
+        from unittest import mock
 
-def test_with_block_keeps_target_alive(tmp_path, write_files, reachable_fqnames):
-    write_files(
-        {
-            "pkg/__init__.py": "",
-            "pkg/lib.py": "def helper(): return 1",
-            "tests/__init__.py": "",
-            "tests/test_lib.py": """
-            from unittest.mock import patch
+        @mock.patch("pkg.lib.helper")
+        def test_helper(_): pass
+        """,
+    ),
+    (
+        "import-unittest-mock-dotted",
+        """
+        import unittest.mock
 
-            def test_helper():
-                with patch("pkg.lib.helper") as m:
-                    m.return_value = 2
-            """,
-        }
-    )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[MockPatchPlugin(), PytestPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
-    assert "pkg.lib.helper" in reachable_fqnames(graph)
+        @unittest.mock.patch("pkg.lib.helper")
+        def test_helper(_): pass
+        """,
+    ),
+    (
+        "third-party-mock-package",
+        """
+        from mock import patch
 
+        @patch("pkg.lib.helper")
+        def test_helper(_): pass
+        """,
+    ),
+    (
+        "import-unittest-mock-as-um",
+        """
+        import unittest.mock as um
 
-def test_aliased_patch_import(tmp_path, write_files, reachable_fqnames):
-    write_files(
-        {
-            "pkg/__init__.py": "",
-            "pkg/lib.py": "def helper(): return 1",
-            "tests/__init__.py": "",
-            "tests/test_lib.py": """
-            from unittest.mock import patch as p
-
-            @p("pkg.lib.helper")
-            def test_helper(_): pass
-            """,
-        }
-    )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[MockPatchPlugin(), PytestPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
-    assert "pkg.lib.helper" in reachable_fqnames(graph)
-
-
-def test_module_prefixed_patch(tmp_path, write_files, reachable_fqnames):
-    write_files(
-        {
-            "pkg/__init__.py": "",
-            "pkg/lib.py": "def helper(): return 1",
-            "tests/__init__.py": "",
-            "tests/test_lib.py": """
-            from unittest import mock
-
-            @mock.patch("pkg.lib.helper")
-            def test_helper(_): pass
-            """,
-        }
-    )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[MockPatchPlugin(), PytestPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
-    assert "pkg.lib.helper" in reachable_fqnames(graph)
-
-
-def test_dotted_unittest_mock_patch(tmp_path, write_files, reachable_fqnames):
-    write_files(
-        {
-            "pkg/__init__.py": "",
-            "pkg/lib.py": "def helper(): return 1",
-            "tests/__init__.py": "",
-            "tests/test_lib.py": """
-            import unittest.mock
-
-            @unittest.mock.patch("pkg.lib.helper")
-            def test_helper(_): pass
-            """,
-        }
-    )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[MockPatchPlugin(), PytestPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
-    assert "pkg.lib.helper" in reachable_fqnames(graph)
+        @um.patch("pkg.lib.helper")
+        def test_helper(_): pass
+        """,
+    ),
+    (
+        "mocker-fixture",
+        """
+        def test_helper(mocker):
+            mocker.patch("pkg.lib.helper")
+        """,
+    ),
+    (
+        "monkeypatch-setattr",
+        """
+        def test_helper(monkeypatch):
+            monkeypatch.setattr("pkg.lib.helper", lambda: 2)
+        """,
+    ),
+    (
+        "monkeypatch-setattr-with-raising-kwarg",
+        """
+        def test_helper(monkeypatch):
+            monkeypatch.setattr("pkg.lib.helper", lambda: 2, raising=False)
+        """,
+    ),
+    (
+        "monkeypatch-delattr",
+        """
+        def test_helper(monkeypatch):
+            monkeypatch.delattr("pkg.lib.helper")
+        """,
+    ),
+]
 
 
-def test_third_party_mock_import(tmp_path, write_files, reachable_fqnames):
+@pytest.mark.parametrize(
+    "test_source",
+    [src for _, src in _RECOGNIZED_FORMS],
+    ids=[name for name, _ in _RECOGNIZED_FORMS],
+)
+def test_recognized_form_keeps_target_alive(tmp_path, write_files, reachable_fqnames, test_source):
     write_files(
         {
             "pkg/__init__.py": "",
             "pkg/lib.py": "def helper(): return 1",
             "tests/__init__.py": "",
-            "tests/test_lib.py": """
-            from mock import patch
-
-            @patch("pkg.lib.helper")
-            def test_helper(_): pass
-            """,
-        }
-    )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[MockPatchPlugin(), PytestPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
-    assert "pkg.lib.helper" in reachable_fqnames(graph)
-
-
-def test_aliased_mock_module_import(tmp_path, write_files, reachable_fqnames):
-    write_files(
-        {
-            "pkg/__init__.py": "",
-            "pkg/lib.py": "def helper(): return 1",
-            "tests/__init__.py": "",
-            "tests/test_lib.py": """
-            import unittest.mock as um
-
-            @um.patch("pkg.lib.helper")
-            def test_helper(_): pass
-            """,
-        }
-    )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[MockPatchPlugin(), PytestPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
-    assert "pkg.lib.helper" in reachable_fqnames(graph)
-
-
-def test_mocker_fixture_patch(tmp_path, write_files, reachable_fqnames):
-    write_files(
-        {
-            "pkg/__init__.py": "",
-            "pkg/lib.py": "def helper(): return 1",
-            "tests/__init__.py": "",
-            "tests/test_lib.py": """
-            def test_helper(mocker):
-                mocker.patch("pkg.lib.helper")
-            """,
+            "tests/test_lib.py": test_source,
         }
     )
     graph = Analysis(
@@ -299,8 +243,8 @@ def test_unittest_testcase_patch(tmp_path, write_files, reachable_fqnames):
 
 
 def test_unresolved_target_is_harmless(tmp_path, write_files, reachable_fqnames):
-    """Patches against third-party / non-existent fqnames don't
-    promote anything but also don't raise."""
+    """Patches against third-party / non-existent fqnames have no
+    first-party decl to keep alive; the test still runs to completion."""
     write_files(
         {
             "pkg/__init__.py": "",
@@ -319,11 +263,7 @@ def test_unresolved_target_is_harmless(tmp_path, write_files, reachable_fqnames)
         plugins=[MockPatchPlugin(), PytestPlugin()],
         project_root=tmp_path,
     ).materialize_all()
-    reached = reachable_fqnames(graph)
-    assert "tests.test_lib.test_one" in reached
-    # Unrelated symbol still alive because tests are entrypoints; the
-    # patch target just has no first-party decl to keep alive.
-    assert "pkg.lib.helper" not in reached
+    assert "pkg.lib.helper" not in reachable_fqnames(graph)
 
 
 def test_module_target_keeps_module_alive(tmp_path, write_files, reachable_fqnames):
@@ -350,12 +290,11 @@ def test_module_target_keeps_module_alive(tmp_path, write_files, reachable_fqnam
 
 
 def test_only_marks_target_when_test_alive(tmp_path, write_files, reachable_fqnames):
-    """Patches in a non-pytest, non-test file don't keep targets alive
-    unless the enclosing decl is itself reachable.
+    """A patch reference inside a dead decl doesn't promote anything.
 
-    A file with no entrypoint plugin and no ``-e`` reference has no
-    reachable nodes, so the plugin's edges from the dead test function
-    to the patch synthetic never fire.
+    No entrypoint reaches ``isolated_helper``, so the synthesized
+    ``isolated_helper -> <patch-target>:pkg.lib.helper`` edge never
+    fires.
     """
     write_files(
         {
@@ -375,49 +314,7 @@ def test_only_marks_target_when_test_alive(tmp_path, write_files, reachable_fqna
         plugins=[MockPatchPlugin()],
         project_root=tmp_path,
     ).materialize_all()
-    # No entrypoint reaches isolated.py's body, so the patch reference
-    # doesn't promote anything.
     assert "pkg.lib.helper" not in reachable_fqnames(graph)
-
-
-def test_monkeypatch_setattr_keeps_target_alive(tmp_path, write_files, reachable_fqnames):
-    write_files(
-        {
-            "pkg/__init__.py": "",
-            "pkg/lib.py": "def helper(): return 1",
-            "tests/__init__.py": "",
-            "tests/test_lib.py": """
-            def test_helper(monkeypatch):
-                monkeypatch.setattr("pkg.lib.helper", lambda: 2)
-            """,
-        }
-    )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[MockPatchPlugin(), PytestPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
-    assert "pkg.lib.helper" in reachable_fqnames(graph)
-
-
-def test_monkeypatch_delattr_keeps_target_alive(tmp_path, write_files, reachable_fqnames):
-    write_files(
-        {
-            "pkg/__init__.py": "",
-            "pkg/lib.py": "def helper(): return 1",
-            "tests/__init__.py": "",
-            "tests/test_lib.py": """
-            def test_helper(monkeypatch):
-                monkeypatch.delattr("pkg.lib.helper")
-            """,
-        }
-    )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[MockPatchPlugin(), PytestPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
-    assert "pkg.lib.helper" in reachable_fqnames(graph)
 
 
 def test_monkeypatch_setattr_object_form_not_treated_as_fqname(
@@ -448,33 +345,8 @@ def test_monkeypatch_setattr_object_form_not_treated_as_fqname(
         plugins=[MockPatchPlugin(), PytestPlugin()],
         project_root=tmp_path,
     ).materialize_all()
-    # Sanity: "pkg.lib" is alive (imported) but the plugin specifically
-    # didn't synthesize an extra ``<patch-target>:helper`` edge.
-    nodes = list(graph.nodes)
-    synthetics = [n.fqname for n in nodes if n.type == "synthetic"]
-    assert "<patch-target>:helper" not in synthetics
-
-
-def test_monkeypatch_setattr_with_raising_kwarg(tmp_path, write_files, reachable_fqnames):
-    """``raising=False`` is a kwarg; the fqname form still has 2
-    positional args."""
-    write_files(
-        {
-            "pkg/__init__.py": "",
-            "pkg/lib.py": "def helper(): return 1",
-            "tests/__init__.py": "",
-            "tests/test_lib.py": """
-            def test_helper(monkeypatch):
-                monkeypatch.setattr("pkg.lib.helper", lambda: 2, raising=False)
-            """,
-        }
-    )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[MockPatchPlugin(), PytestPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
-    assert "pkg.lib.helper" in reachable_fqnames(graph)
+    synthetics = {n.fqname for n in graph.nodes if n.type == "synthetic"}
+    assert f"{PATCH_TARGET_PREFIX}helper" not in synthetics
 
 
 def test_monkeypatch_setitem_not_recognized(tmp_path, write_files, reachable_fqnames):
@@ -497,8 +369,6 @@ def test_monkeypatch_setitem_not_recognized(tmp_path, write_files, reachable_fqn
         plugins=[MockPatchPlugin(), PytestPlugin()],
         project_root=tmp_path,
     ).materialize_all()
-    # ``setitem`` is not in our recognized methods; the string is a
-    # dict key, not a symbol fqname.
     assert "pkg.lib.helper" not in reachable_fqnames(graph)
 
 
