@@ -27,6 +27,15 @@ two versions.
   `cyclopts.App` instance, mirroring the Typer/Click plugins.
   Registered in `BUILTIN_PLUGINS` under the name `cyclopts` and
   loadable via `--plugin cyclopts`.
+- `MockPatchPlugin` (`dead_cst.contrib.mock_patch`, re-exported from
+  `dead_cst.plugins` and `dead_cst.contrib`) resolves string-fqname
+  targets passed to `unittest.mock.patch` / `mock.patch` /
+  `mocker.patch` (decorator and context-manager forms) so symbols
+  whose only consumers are tests patching them by string aren't
+  flagged as dead. `patch.object`, `patch.dict`, and `patch.multiple`
+  are intentionally not handled -- their targets are real references
+  the analyzer already sees. Registered in `BUILTIN_PLUGINS` under
+  the name `mock_patch` and loadable via `--plugin mock_patch`.
 
 ### Changed
 - **Breaking (cache API):** `compute_fingerprint` is now per-base
