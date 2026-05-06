@@ -39,7 +39,7 @@ those when writing extensions:
   tools: framework plugins (:class:`FastAPIPlugin`, :class:`FlaskPlugin`,
   :class:`ClickPlugin`, :class:`TyperPlugin`, :class:`PytestPlugin`,
   :class:`UnittestPlugin`) and tool-specific resolvers
-  (:class:`UvWorkspaceResolver`). All contrib classes are also
+  (:class:`UvResolver`). All contrib classes are also
   re-exported from ``dead_cst.plugins`` / ``dead_cst.resolvers`` for
   ergonomics.
 

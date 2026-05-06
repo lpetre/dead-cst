@@ -22,7 +22,7 @@ Builtin plugins covering core Python conventions (``__main__`` blocks,
 discovery) live as siblings of this ``__init__``. Plugins that target
 specific third-party frameworks (FastAPI, Flask, Click, Typer, pytest,
 unittest) live under :mod:`dead_cst.contrib` next to the
-``UvWorkspaceResolver``; they are re-exported here for ergonomics so
+``UvResolver``; they are re-exported here for ergonomics so
 ``from dead_cst.plugins import FastAPIPlugin`` keeps working.
 
 Third-party plugins can register under the ``dead_cst.plugins``

@@ -10,7 +10,7 @@ from dead_cst.resolvers import (
     PyprojectResolver,
     SourceTree,
     SourceTreeFlags,
-    UvWorkspaceResolver,
+    UvResolver,
     assign_file_to_tree,
     load_resolver,
     load_toml,
@@ -20,7 +20,7 @@ from dead_cst.resolvers import (
 
 def test_load_resolver_known():
     assert isinstance(load_resolver("pyproject"), PyprojectResolver)
-    assert isinstance(load_resolver("uv_workspace"), UvWorkspaceResolver)
+    assert isinstance(load_resolver("uv"), UvResolver)
 
 
 def test_load_resolver_unknown_raises():

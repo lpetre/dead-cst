@@ -24,8 +24,14 @@ two versions.
   (one EXPORTED per package, every search ref points at an
   EXPORTED tree, no self-reference, acyclic).
 - `PathResolver.resolve` now returns `list[SourceTree]`. The shipped
-  resolvers (`PyprojectResolver`, `ManualResolver`,
-  `UvWorkspaceResolver`) all return tree lists.
+  resolvers (`PyprojectResolver`, `ManualResolver`, `UvResolver`)
+  all return tree lists.
+- `UvWorkspaceResolver` renamed to `UvResolver` (and the module
+  `dead_cst.contrib.uv_workspace` to `dead_cst.contrib.uv_resolver`,
+  builtin name `uv_workspace` to `uv`). The resolver is unchanged in
+  spirit -- it reads `uv.lock` -- but the new name reflects that it
+  handles single-package uv projects too, not just multi-member
+  workspaces.
 - `dead-cst` no longer threads venv `site-packages` paths through the
   resolver protocol. Run `dead-cst` with the project's virtual
   environment active (`uv run dead-cst ...` or activate the venv
@@ -36,10 +42,6 @@ two versions.
 - `VenvResolver`, `MissingVenvError`, `find_venv_site_packages`. The
   venv-aware behavior they encoded is replaced by the
   "run-with-venv-active" contract above.
-- `dead_cst.resolvers.exported_roots` and the `_exports.py` module.
-  The pyproject-wheel-target discovery the function performed is now
-  an internal step inside `PyprojectResolver` when it builds the
-  fallback tree list.
 - `dead_cst.resolvers.PathMap` and `dead_cst.resolvers.merge_paths`.
   Multiple resolvers' `SourceTree` lists concatenate; there is no
   per-base merge step.
@@ -53,6 +55,15 @@ two versions.
   explicit list of trees with their `path`, `package`, `exported`
   flag, and `search_trees`, for projects whose layout doesn't fit
   the conventional fallback (`src/`, `tests/`).
+- `dead_cst.resolvers.exported_roots(project_dir)` and
+  `dead_cst.resolvers.exported_tree_root(project_dir)` helpers. The
+  first returns the importable dirs the project's build backend
+  would ship (hatchling / setuptools / poetry / pdm / flit dispatch
+  plus a name-match fallback); the second derives a single
+  ``SourceTree`` path from those, with a src-layout shortcut. Both
+  shipped resolvers (`PyprojectResolver`, `UvResolver`) call them
+  internally so a `pyproject.toml`-aware exported-tree pick is
+  available to custom resolvers too.
 - New primary API: `dead_cst.Analysis` and `dead_cst.PackageView`,
   the lazy entry point that callers should reach for on large repos.
   Construction is cheap (no filesystem walk, no parsing). `refresh()`

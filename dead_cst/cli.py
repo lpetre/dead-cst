@@ -205,7 +205,7 @@ def analyze(
     ] = None,
     resolver: Annotated[
         list[str] | None,
-        typer.Option("--resolver", help="Path resolver to run (e.g. pyproject, uv_workspace)."),
+        typer.Option("--resolver", help="Path resolver to run (e.g. pyproject, uv)."),
     ] = None,
     plugin: Annotated[
         list[str] | None,
@@ -365,7 +365,7 @@ def why_alive(
     ] = None,
     resolver: Annotated[
         list[str] | None,
-        typer.Option("--resolver", help="Path resolver to run (e.g. pyproject, uv_workspace)."),
+        typer.Option("--resolver", help="Path resolver to run (e.g. pyproject, uv)."),
     ] = None,
     plugin: Annotated[
         list[str] | None,
@@ -443,7 +443,7 @@ def dependencies(
     ] = None,
     resolver: Annotated[
         list[str] | None,
-        typer.Option("--resolver", help="Path resolver to run (e.g. pyproject, uv_workspace)."),
+        typer.Option("--resolver", help="Path resolver to run (e.g. pyproject, uv)."),
     ] = None,
     verbose: Annotated[
         bool, typer.Option("-v", "--verbose", help="Enable verbose output.")
@@ -513,7 +513,7 @@ def unused_exports(
     ] = None,
     resolver: Annotated[
         list[str] | None,
-        typer.Option("--resolver", help="Path resolver to run (e.g. pyproject, uv_workspace)."),
+        typer.Option("--resolver", help="Path resolver to run (e.g. pyproject, uv)."),
     ] = None,
     plugin: Annotated[
         list[str] | None,
@@ -595,7 +595,7 @@ def remove(
     ] = None,
     resolver: Annotated[
         list[str] | None,
-        typer.Option("--resolver", help="Path resolver to run (e.g. pyproject, uv_workspace)."),
+        typer.Option("--resolver", help="Path resolver to run (e.g. pyproject, uv)."),
     ] = None,
     plugin: Annotated[
         list[str] | None,

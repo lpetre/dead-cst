@@ -1,14 +1,14 @@
-"""Tests for :class:`dead_cst.contrib.uv_workspace.UvWorkspaceResolver`."""
+"""Tests for :class:`dead_cst.contrib.uv_resolver.UvResolver`."""
 
 from __future__ import annotations
 
 import textwrap
 from pathlib import Path
 
-from dead_cst.resolvers import SourceTreeFlags, UvWorkspaceResolver
+from dead_cst.resolvers import SourceTreeFlags, UvResolver
 
 
-def _write_uv_workspace(tmp_path: Path, *, with_src: bool = True) -> None:
+def _write_uv(tmp_path: Path, *, with_src: bool = True) -> None:
     """Lay out a two-member uv workspace (core + app, app deps on core)."""
     (tmp_path / "pyproject.toml").write_text(
         textwrap.dedent("""
@@ -59,10 +59,10 @@ def _by_pkg(trees):
     return {t.package: t for t in trees}
 
 
-def test_uv_workspace_resolver_src_layout(tmp_path: Path):
-    _write_uv_workspace(tmp_path)
+def test_uv_resolver_src_layout(tmp_path: Path):
+    _write_uv(tmp_path)
 
-    result = UvWorkspaceResolver().resolve(tmp_path)
+    result = UvResolver().resolve(tmp_path)
     by = _by_pkg(result)
 
     core_src = (tmp_path / "packages" / "core" / "src").resolve()
@@ -74,10 +74,10 @@ def test_uv_workspace_resolver_src_layout(tmp_path: Path):
     assert all(t.flags & SourceTreeFlags.EXPORTED for t in result)
 
 
-def test_uv_workspace_resolver_flat_layout(tmp_path: Path):
-    _write_uv_workspace(tmp_path, with_src=False)
+def test_uv_resolver_flat_layout(tmp_path: Path):
+    _write_uv(tmp_path, with_src=False)
 
-    result = UvWorkspaceResolver().resolve(tmp_path)
+    result = UvResolver().resolve(tmp_path)
     by = _by_pkg(result)
 
     core_dir = (tmp_path / "packages" / "core").resolve()
@@ -87,16 +87,16 @@ def test_uv_workspace_resolver_flat_layout(tmp_path: Path):
     assert by["app"].search_trees == (core_dir,)
 
 
-def test_uv_workspace_resolver_skips_virtual_root(tmp_path: Path):
-    _write_uv_workspace(tmp_path)
+def test_uv_resolver_skips_virtual_root(tmp_path: Path):
+    _write_uv(tmp_path)
 
-    result = UvWorkspaceResolver().resolve(tmp_path)
+    result = UvResolver().resolve(tmp_path)
 
     # The "ws" package has source = { virtual = "." } and must not appear.
     assert tmp_path.resolve() not in {t.path for t in result}
 
 
-def test_uv_workspace_resolver_includes_virtual_members(tmp_path: Path):
+def test_uv_resolver_includes_virtual_members(tmp_path: Path):
     """Virtual members (apps/services that don't ship as wheels) are first-party
     code and must be analyzed alongside editable members."""
     (tmp_path / "pyproject.toml").write_text(
@@ -139,7 +139,7 @@ def test_uv_workspace_resolver_includes_virtual_members(tmp_path: Path):
         """).strip()
     )
 
-    result = UvWorkspaceResolver().resolve(tmp_path)
+    result = UvResolver().resolve(tmp_path)
     by = _by_pkg(result)
     lib_src = (tmp_path / "libs" / "lib-a" / "src").resolve()
     app_src = (tmp_path / "apps" / "app-a" / "src").resolve()
@@ -148,14 +148,14 @@ def test_uv_workspace_resolver_includes_virtual_members(tmp_path: Path):
     assert by["app-a"].search_trees == (lib_src,)
 
 
-def test_uv_workspace_resolver_no_lockfile(tmp_path: Path):
-    assert UvWorkspaceResolver().resolve(tmp_path) == []
+def test_uv_resolver_no_lockfile(tmp_path: Path):
+    assert UvResolver().resolve(tmp_path) == []
 
 
-def test_uv_workspace_resolver_ignores_non_workspace_deps(tmp_path: Path):
+def test_uv_resolver_ignores_non_workspace_deps(tmp_path: Path):
     """Deps that aren't workspace members are dropped silently -- they
     don't have a source dir under our control."""
-    _write_uv_workspace(tmp_path)
+    _write_uv(tmp_path)
     lock = tmp_path / "uv.lock"
     lock.write_text(
         lock.read_text().replace(
@@ -164,24 +164,24 @@ def test_uv_workspace_resolver_ignores_non_workspace_deps(tmp_path: Path):
         )
     )
 
-    result = UvWorkspaceResolver().resolve(tmp_path)
+    result = UvResolver().resolve(tmp_path)
     by = _by_pkg(result)
     core_src = (tmp_path / "packages" / "core" / "src").resolve()
     assert by["app"].search_trees == (core_src,)
 
 
-def test_uv_workspace_resolver_explicit_lock_path(tmp_path: Path):
-    _write_uv_workspace(tmp_path)
+def test_uv_resolver_explicit_lock_path(tmp_path: Path):
+    _write_uv(tmp_path)
     moved = tmp_path / "stash" / "uv.lock"
     moved.parent.mkdir()
     moved.write_text((tmp_path / "uv.lock").read_text())
     (tmp_path / "uv.lock").unlink()
 
-    result = UvWorkspaceResolver(lock_path=moved).resolve(tmp_path)
+    result = UvResolver(lock_path=moved).resolve(tmp_path)
     assert result  # non-empty -- lock_path override took effect
 
 
-def test_uv_workspace_flat_layout_with_tests_dirs(tmp_path: Path):
+def test_uv_flat_layout_with_tests_dirs(tmp_path: Path):
     """Two members with ``tests/`` packages used to collide when their tries were merged.
 
     With per-package export tries (and only the EXPORTED tree's decls in the
@@ -255,7 +255,7 @@ def test_uv_workspace_flat_layout_with_tests_dirs(tmp_path: Path):
     (libc / "tests" / "__init__.py").write_text("")
     (libc / "tests" / "conftest.py").write_text("import pytest\n")
 
-    trees = UvWorkspaceResolver().resolve(tmp_path)
+    trees = UvResolver().resolve(tmp_path)
     graph = Analysis(trees).materialize_all()
 
     # The cross-member import resolved: pkg_a/app.py -> libc/foo/c/mod.y
@@ -268,7 +268,7 @@ def test_uv_workspace_flat_layout_with_tests_dirs(tmp_path: Path):
     assert graph.has_edge(app_import, mod_y)
 
 
-def test_uv_workspace_shared_namespace_package(tmp_path: Path):
+def test_uv_shared_namespace_package(tmp_path: Path):
     """PEP 420 namespace shared across workspace members."""
     from dead_cst import Analysis
 
@@ -329,7 +329,7 @@ def test_uv_workspace_shared_namespace_package(tmp_path: Path):
     )
     (foo_b / "foo" / "b" / "__init__.py").write_text("from foo.a import value\n\nresult = value\n")
 
-    trees = UvWorkspaceResolver().resolve(tmp_path)
+    trees = UvResolver().resolve(tmp_path)
     graph = Analysis(trees).materialize_all()
 
     value = next(n for n in graph.nodes if n.fqname == "foo.a.value" and n.type == "variable")

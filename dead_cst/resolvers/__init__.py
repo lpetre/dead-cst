@@ -21,12 +21,15 @@ importlib implementation) directly, or compose with the lower-level
 :func:`editable_distribution_roots` helpers plus the :data:`STDLIB` /
 :data:`SITE_PACKAGES_MARKERS` classification constants.
 :func:`load_toml` is provided for resolvers that read
-``pyproject.toml``-style config.
+``pyproject.toml``-style config; :func:`exported_roots` and
+:func:`exported_tree_root` answer "what does this project's build
+backend ship?" so resolvers can pick exported tree paths
+consistently.
 """
 
 from __future__ import annotations
 
-from ..contrib.uv_workspace import UvWorkspaceResolver
+from ..contrib.uv_resolver import UvResolver
 from ._core import (
     ImportResolver,
     PathResolver,
@@ -36,6 +39,7 @@ from ._core import (
     load_toml,
     validate_source_trees,
 )
+from ._exports import exported_roots, exported_tree_root
 from ._imports import (
     SITE_PACKAGES_MARKERS,
     STDLIB,
@@ -49,7 +53,7 @@ from .pyproject import PyprojectResolver
 
 BUILTIN_RESOLVERS: dict[str, type[PathResolver]] = {
     PyprojectResolver.name: PyprojectResolver,
-    UvWorkspaceResolver.name: UvWorkspaceResolver,
+    UvResolver.name: UvResolver,
 }
 
 
@@ -77,11 +81,13 @@ __all__ = [
     "STDLIB",
     "SourceTree",
     "SourceTreeFlags",
-    "UvWorkspaceResolver",
+    "UvResolver",
     "assign_file_to_tree",
     "default_resolve_import",
     "distribution_lookup",
     "editable_distribution_roots",
+    "exported_roots",
+    "exported_tree_root",
     "load_resolver",
     "load_toml",
     "safe_resolve_module",
