@@ -9,7 +9,81 @@ two versions.
 
 ## [Unreleased]
 
+### Added
+- New primary API: `dead_cst.Analysis` and `dead_cst.PackageView`,
+  the lazy entry point that callers should reach for on large repos.
+  Construction is cheap (no filesystem walk, no parsing). `refresh()`
+  is base-scoped and idempotent. `package(base)` returns a
+  `PackageView` whose `modules` / `declarations` / `count_nodes`
+  queries are local to that base, while `dead` / `reachable` /
+  `kept_alive_by_dead_branches` / `importers_of` / `graph` /
+  `remove_dead_code` materialize only the "interesting set" -- the
+  forward closure of the base's reverse (consumer) closure -- which
+  is the smallest scope that gives correct reachability answers for
+  decls in that base.
+- `CycloptsPlugin` (`dead_cst.contrib.cyclopts`, re-exported from
+  `dead_cst.plugins` and `dead_cst.contrib`) wires
+  `@<app>.command` and `@<app>.default` handlers through their owning
+  `cyclopts.App` instance, mirroring the Typer/Click plugins.
+  Registered in `BUILTIN_PLUGINS` under the name `cyclopts` and
+  loadable via `--plugin cyclopts`.
+
+### Changed
+- **Breaking (cache API):** `compute_fingerprint` is now per-base
+  (`base=`, `search_paths=`) rather than per-project (`paths=`).
+  Each cache row carries its own fingerprint, so changing one base's
+  search paths or plugins no longer invalidates sibling bases'
+  cached payloads. `GraphCache(db_path)` no longer takes a
+  fingerprint at open time; `get` and `put` take it per call.
+  Schema version bumped to 2; older databases auto-wipe on first
+  open. The CLI is unaffected -- `Analysis` computes per-base
+  fingerprints internally.
+- `_order_paths` now returns only the keys of the `PathMap`. Search
+  paths that aren't themselves keys (e.g. a venv `site-packages`
+  directory listed for resolver lookup) are no longer silently
+  promoted to bases and are never walked. Pass them as keys
+  explicitly if you want their files visited.
+- `PluginContext`, `ObserveContext`, and the `AddNode` / `AddEdge` /
+  `RemoveEdge` graph-op value objects now use `__slots__`, as do the
+  analyzer-internal `_BaseSpec` / `_Task` / `_RunnerState` records,
+  shaving a per-instance `__dict__` off objects allocated per file
+  and per emitted op.
+
+### Removed
+- **Breaking (top-level API):** `build_symbol_graph`, `find_reachable`,
+  `find_kept_alive_by_dead_branches`, `count_nodes`, `order_paths`,
+  and the top-level `remove_code` re-export are gone. Replace with
+  the equivalent `Analysis` / `PackageView` methods:
+  - `build_symbol_graph(...)` -> `Analysis(...).materialize_all()`
+    (returns the same `nx.MultiDiGraph` for callers that want raw
+    access).
+  - `find_reachable(graph)` -> `Analysis.reachable()` /
+    `PackageView.reachable()`.
+  - `find_kept_alive_by_dead_branches(graph)` ->
+    `Analysis.kept_alive_by_dead_branches()` /
+    `PackageView.kept_alive_by_dead_branches()`.
+  - `count_nodes(graph, prefix)` -> `Analysis.count_nodes(prefix)` /
+    `PackageView.count_nodes()`.
+  - `order_paths(paths)` -> `Analysis(...).bases`.
+  - `remove_code(graph, base)` -> `PackageView.remove_dead_code()`
+    for the high-level entry point. The standalone function is still
+    available at `dead_cst.codemod.remove_code` for power users.
+- `PluginContext.prime_module`, the public method for inserting an
+  already-parsed `cst.Module` into the request-scope `parse` memo.
+  The analyzer never called it (warm cache hits skip parsing entirely
+  and the visitor's parsed module is consumed in-process), so it was
+  dead code in the public surface. Plugins that need a `cst.Module`
+  during `observe` already get it for free as `ObserveContext.module`;
+  during `finalize` they go through `ctx.parse(path)` and that path
+  still memoizes within the analysis.
+
 ### Fixed
+- Documentation no longer claims that `PluginContext.parse` is primed
+  with the modules the analyzer walked during the visitor pass: that
+  hasn't been true since per-file results moved into the SQLite cache
+  (warm hits skip parsing entirely). The `parse` cache is now
+  documented as a request-scope memo, populated lazily on first
+  access.
 - `from mod import MyAlias` where `MyAlias` is a PEP 695 `type` statement
   no longer raises `AssertionError` during edge resolution. `type_alias`
   declarations are now treated as concrete termination points in the

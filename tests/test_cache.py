@@ -5,7 +5,7 @@ SHA-256 content hash matches what's already on disk; the rest of the
 analyzer (per-base ``resolve_edges``, plugin pass) runs every
 invocation. These tests cover:
 
-* the on-disk schema and fingerprint reconciliation,
+* the on-disk schema and per-base fingerprint reconciliation,
 * per-file hit / miss / mtime-but-no-content-change behavior,
 * graph equivalence between cached and uncached runs,
 * invalidation on path-map / resolver-chain changes,
@@ -21,7 +21,7 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-from dead_cst import build_symbol_graph
+from dead_cst import Analysis
 from dead_cst.cache import (
     CACHE_DIR_NAME,
     GraphCache,
@@ -30,9 +30,9 @@ from dead_cst.cache import (
     default_cache_path,
     file_hash,
 )
-from dead_cst.resolvers import ManualResolver
-from dead_cst.graph import VisitorPayload
 from dead_cst.cli import app
+from dead_cst.graph import VisitorPayload
+from dead_cst.resolvers import ManualResolver
 
 
 def _write(root: Path, files: dict[str, str]) -> None:
@@ -40,6 +40,13 @@ def _write(root: Path, files: dict[str, str]) -> None:
         p = root / rel
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(textwrap.dedent(src).strip() + "\n")
+
+
+def _fp(base: Path, **kwargs) -> str:
+    """Shorthand: per-base fingerprint with ``search_paths=(base,)`` by default."""
+    kwargs.setdefault("search_paths", (base,))
+    kwargs.setdefault("resolvers", [])
+    return compute_fingerprint(base=base, **kwargs)
 
 
 @pytest.fixture
@@ -54,22 +61,41 @@ def runner() -> CliRunner:
 
 def test_fingerprint_stable_for_equal_inputs(tmp_path):
     """Two equal call signatures hash to the same fingerprint."""
-    a = compute_fingerprint(paths={tmp_path: []}, resolvers=[])
-    b = compute_fingerprint(paths={tmp_path: []}, resolvers=[])
+    a = _fp(tmp_path)
+    b = _fp(tmp_path)
     assert a == b
 
 
-def test_fingerprint_changes_with_paths(tmp_path):
-    """Adding a base or dep flips the fingerprint."""
-    a = compute_fingerprint(paths={tmp_path: []}, resolvers=[])
-    b = compute_fingerprint(paths={tmp_path: [tmp_path / "dep"]}, resolvers=[])
+def test_fingerprint_changes_with_search_paths(tmp_path):
+    """Adding a search-path entry flips the fingerprint."""
+    a = _fp(tmp_path, search_paths=(tmp_path,))
+    b = _fp(tmp_path, search_paths=(tmp_path, tmp_path / "dep"))
     assert a != b
+
+
+def test_fingerprint_changes_with_base(tmp_path):
+    """The base itself is in the fingerprint; sibling bases are independent."""
+    a = _fp(tmp_path / "a")
+    b = _fp(tmp_path / "b")
+    assert a != b
+
+
+def test_fingerprint_independent_of_sibling_bases(tmp_path):
+    """A base's fingerprint depends only on its own config, not the project's.
+
+    This is the per-base contract: adding or removing a sibling base
+    from the analysis must not invalidate the cached rows for ``base``.
+    """
+    a = _fp(tmp_path / "lib", search_paths=(tmp_path / "lib",))
+    # Same base, same search paths -- a "sibling" base just doesn't enter the picture.
+    b = _fp(tmp_path / "lib", search_paths=(tmp_path / "lib",))
+    assert a == b
 
 
 def test_fingerprint_changes_with_resolvers(tmp_path):
     """Adding a resolver name changes the fingerprint."""
-    a = compute_fingerprint(paths={tmp_path: []}, resolvers=[])
-    b = compute_fingerprint(paths={tmp_path: []}, resolvers=[ManualResolver(specs=[])])
+    a = _fp(tmp_path, resolvers=[])
+    b = _fp(tmp_path, resolvers=[ManualResolver(specs=[])])
     assert a != b
 
 
@@ -99,19 +125,13 @@ def test_fingerprint_subclasses_with_distinct_names_distinct(tmp_path):
         name: str = "b"
         version: int = 1700000000
 
-    fp_a = compute_fingerprint(paths={tmp_path: []}, resolvers=[], plugins=[A()])
-    fp_b = compute_fingerprint(paths={tmp_path: []}, resolvers=[], plugins=[B()])
+    fp_a = _fp(tmp_path, plugins=[A()])
+    fp_b = _fp(tmp_path, plugins=[B()])
     assert fp_a != fp_b
 
 
 def test_fingerprint_changes_when_unreachable_detector_changes(tmp_path):
-    """Swapping the unreachable-region detector flips the fingerprint.
-
-    Detectors are folded into each cached payload's ``dead_suites``
-    list, so a detector swap must invalidate the file_cache. Both the
-    default and custom detectors satisfy ``Cacheable`` via their
-    ``(name, version)`` pair.
-    """
+    """Swapping the unreachable-region detector flips the fingerprint."""
     from dataclasses import dataclass
 
     from libcst.metadata import CodeRange, MetadataWrapper
@@ -124,10 +144,8 @@ def test_fingerprint_changes_when_unreachable_detector_changes(tmp_path):
         def find_regions(self, wrapper: MetadataWrapper) -> list[CodeRange]:
             return []
 
-    fp_default = compute_fingerprint(paths={tmp_path: []}, resolvers=[])
-    fp_custom = compute_fingerprint(
-        paths={tmp_path: []}, resolvers=[], unreachable_detector=Custom()
-    )
+    fp_default = _fp(tmp_path)
+    fp_custom = _fp(tmp_path, unreachable_detector=Custom())
     assert fp_default != fp_custom
 
 
@@ -145,39 +163,23 @@ def test_fingerprint_changes_when_unreachable_detector_version_bumped(tmp_path):
         def find_regions(self, wrapper: MetadataWrapper) -> list[CodeRange]:
             return []
 
-    fp_v1 = compute_fingerprint(paths={tmp_path: []}, resolvers=[], unreachable_detector=Custom())
-    fp_v2 = compute_fingerprint(
-        paths={tmp_path: []}, resolvers=[], unreachable_detector=Custom(version=2)
-    )
+    fp_v1 = _fp(tmp_path, unreachable_detector=Custom())
+    fp_v2 = _fp(tmp_path, unreachable_detector=Custom(version=2))
     assert fp_v1 != fp_v2
 
 
 def test_fingerprint_changes_when_visitor_version_bumped(tmp_path, monkeypatch):
-    """Bumping ``SymbolVisitor.version`` invalidates the cache key.
-
-    The package ``__version__`` is intentionally not in the
-    fingerprint: every component whose output could shift between
-    releases carries its own ``Cacheable`` knob, so the discipline is
-    to bump the relevant component rather than relying on a release
-    bump to invalidate everything at once. ``SymbolVisitor`` carries
-    a ``(name, version)`` pair so visitor-level changes get an
-    explicit knob.
-    """
+    """Bumping ``SymbolVisitor.version`` invalidates the cache key."""
     from dead_cst._visitor import SymbolVisitor
 
-    fp_v1 = compute_fingerprint(paths={tmp_path: []}, resolvers=[])
+    fp_v1 = _fp(tmp_path)
     monkeypatch.setattr(SymbolVisitor, "version", SymbolVisitor.version + 1)
-    fp_v2 = compute_fingerprint(paths={tmp_path: []}, resolvers=[])
+    fp_v2 = _fp(tmp_path)
     assert fp_v1 != fp_v2
 
 
 def test_fingerprint_changes_when_plugin_version_bumped(tmp_path):
-    """Bumping a plugin's epoch ``version`` invalidates the cache key.
-
-    Versions are Unix epoch ints by convention -- the convention's
-    point is that two simultaneous bumps merge with ``max()`` semantics
-    instead of colliding on a re-used label.
-    """
+    """Bumping a plugin's epoch ``version`` invalidates the cache key."""
     from dataclasses import dataclass
 
     from dead_cst.plugins import LiteralListPlugin
@@ -189,10 +191,8 @@ def test_fingerprint_changes_when_plugin_version_bumped(tmp_path):
         name: str = "p"
         version: int = 1700000000
 
-    fp_old = compute_fingerprint(paths={tmp_path: []}, resolvers=[], plugins=[P()])
-    fp_new = compute_fingerprint(
-        paths={tmp_path: []}, resolvers=[], plugins=[P(version=1700000001)]
-    )
+    fp_old = _fp(tmp_path, plugins=[P()])
+    fp_new = _fp(tmp_path, plugins=[P(version=1700000001)])
     assert fp_old != fp_new
 
 
@@ -201,8 +201,6 @@ def test_abstract_base_requires_name_and_version():
     ``DecoratedDeclPlugin`` must fail -- both are abstract bases that
     leave ``name`` / ``version`` to concrete subclasses so the cache
     fingerprint is always well-defined."""
-    import pytest
-
     from dead_cst.plugins import DecoratedDeclPlugin, LiteralListPlugin
 
     with pytest.raises(TypeError):
@@ -216,10 +214,10 @@ def test_abstract_base_requires_name_and_version():
 # ---------------------------------------------------------------------------
 
 
-def test_open_creates_schema_and_records_fingerprint(tmp_path):
-    """Opening on a fresh path creates the tables and stores the fingerprint."""
+def test_open_creates_schema(tmp_path):
+    """Opening on a fresh path creates the tables and records the schema version."""
     db = tmp_path / CACHE_DIR_NAME / "cache.db"
-    cache = GraphCache(db, fingerprint="fp1")
+    cache = GraphCache(db)
     cache.close()
     assert db.exists()
     conn = sqlite3.connect(db)
@@ -227,8 +225,10 @@ def test_open_creates_schema_and_records_fingerprint(tmp_path):
         tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         assert "meta" in tables
         assert "file_cache" in tables
-        row = conn.execute("SELECT value FROM meta WHERE key='fingerprint'").fetchone()
-        assert row == ("fp1",)
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(file_cache)")}
+        assert {"path", "content_hash", "fingerprint", "payload"}.issubset(cols)
+        row = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+        assert row is not None and int(row[0]) >= 2
     finally:
         conn.close()
 
@@ -236,25 +236,30 @@ def test_open_creates_schema_and_records_fingerprint(tmp_path):
 def test_open_writes_gitignore(tmp_path):
     """The cache directory gets a wildcard .gitignore so it stays out of VCS."""
     db = tmp_path / CACHE_DIR_NAME / "cache.db"
-    GraphCache(db, fingerprint="fp1").close()
+    GraphCache(db).close()
     gi = db.parent / ".gitignore"
     assert gi.exists()
     assert gi.read_text() == "*\n"
 
 
-def test_fingerprint_mismatch_wipes_file_cache(tmp_path):
-    """Opening with a new fingerprint drops every cached row."""
+def test_per_row_fingerprint_isolates_bases(tmp_path):
+    """A row written under fingerprint A is invisible to a get() under B,
+    but other rows in the same DB stay valid."""
     db = tmp_path / CACHE_DIR_NAME / "cache.db"
-    cache = GraphCache(db, fingerprint="fp1")
-    file = tmp_path / "a.py"
-    file.write_text("x = 1\n")
+    file_a = tmp_path / "a.py"
+    file_a.write_text("x = 1\n")
+    file_b = tmp_path / "b.py"
+    file_b.write_text("y = 2\n")
     payload = VisitorPayload(nodes=(), edges=(), imports=(), dead_suites=())
-    cache.put(file, payload)
-    cache.close()
-
-    cache2 = GraphCache(db, fingerprint="fp2")
-    assert cache2.get(file) is None
-    cache2.close()
+    with GraphCache(db) as cache:
+        cache.put(file_a, payload, "fp1")
+        cache.put(file_b, payload, "fp2")
+        # Same fingerprints -> hits.
+        assert cache.get(file_a, "fp1") == payload
+        assert cache.get(file_b, "fp2") == payload
+        # Cross-fingerprint -> miss.
+        assert cache.get(file_a, "fp2") is None
+        assert cache.get(file_b, "fp1") is None
 
 
 def test_get_returns_payload_on_hit(tmp_path):
@@ -263,9 +268,9 @@ def test_get_returns_payload_on_hit(tmp_path):
     file = tmp_path / "a.py"
     file.write_text("x = 1\n")
     payload = VisitorPayload(nodes=(), edges=(), imports=(), dead_suites=())
-    with GraphCache(db, fingerprint="fp") as cache:
-        cache.put(file, payload)
-        restored = cache.get(file)
+    with GraphCache(db) as cache:
+        cache.put(file, payload, "fp")
+        restored = cache.get(file, "fp")
     assert restored == payload
 
 
@@ -275,17 +280,17 @@ def test_get_invalidates_on_content_change(tmp_path):
     file = tmp_path / "a.py"
     file.write_text("x = 1\n")
     payload = VisitorPayload(nodes=(), edges=(), imports=(), dead_suites=())
-    with GraphCache(db, fingerprint="fp") as cache:
-        cache.put(file, payload)
+    with GraphCache(db) as cache:
+        cache.put(file, payload, "fp")
         file.write_text("x = 2\n")
-        assert cache.get(file) is None
+        assert cache.get(file, "fp") is None
 
 
 def test_get_returns_none_for_missing_file(tmp_path):
     """An unreadable / missing file simply misses; no exception."""
     db = tmp_path / CACHE_DIR_NAME / "cache.db"
-    with GraphCache(db, fingerprint="fp") as cache:
-        assert cache.get(tmp_path / "nope.py") is None
+    with GraphCache(db) as cache:
+        assert cache.get(tmp_path / "nope.py", "fp") is None
 
 
 def test_corrupt_blob_is_dropped(tmp_path):
@@ -293,15 +298,15 @@ def test_corrupt_blob_is_dropped(tmp_path):
     db = tmp_path / CACHE_DIR_NAME / "cache.db"
     file = tmp_path / "a.py"
     file.write_text("x = 1\n")
-    cache = GraphCache(db, fingerprint="fp")
+    cache = GraphCache(db)
     h = file_hash(file)
     cache._conn.execute(
-        "INSERT INTO file_cache(path, content_hash, payload) VALUES(?, ?, ?)",
-        (str(file), h, b"not-a-pickle"),
+        "INSERT INTO file_cache(path, content_hash, fingerprint, payload) VALUES(?, ?, ?, ?)",
+        (str(file), h, "fp", b"not-a-pickle"),
     )
     cache._conn.commit()
 
-    assert cache.get(file) is None
+    assert cache.get(file, "fp") is None
     row = cache._conn.execute("SELECT 1 FROM file_cache WHERE path=?", (str(file),)).fetchone()
     assert row is None
     cache.close()
@@ -341,14 +346,13 @@ def test_build_symbol_graph_cached_matches_uncached(tmp_path):
             """,
         },
     )
-    cold = build_symbol_graph({tmp_path: []})
+    cold = Analysis({tmp_path: []}).materialize_all()
 
     db = tmp_path / CACHE_DIR_NAME / "cache.db"
-    fp = compute_fingerprint(paths={tmp_path: []}, resolvers=[])
-    with GraphCache(db, fingerprint=fp) as cache:
-        first = build_symbol_graph({tmp_path: []}, cache=cache)
-    with GraphCache(db, fingerprint=fp) as cache:
-        warm = build_symbol_graph({tmp_path: []}, cache=cache)
+    with GraphCache(db) as cache:
+        first = Analysis({tmp_path: []}, cache=cache).materialize_all()
+    with GraphCache(db) as cache:
+        warm = Analysis({tmp_path: []}, cache=cache).materialize_all()
 
     assert _node_set(first) == _node_set(cold)
     assert _node_set(warm) == _node_set(cold)
@@ -366,12 +370,9 @@ def test_warm_run_skips_visitor(tmp_path, monkeypatch):
         },
     )
     db = tmp_path / CACHE_DIR_NAME / "cache.db"
-    fp = compute_fingerprint(paths={tmp_path: []}, resolvers=[])
-    with GraphCache(db, fingerprint=fp) as cache:
-        build_symbol_graph({tmp_path: []}, cache=cache)
+    with GraphCache(db) as cache:
+        Analysis({tmp_path: []}, cache=cache).materialize_all()
 
-    # Patch SymbolVisitor at the call site (it's imported by name in
-    # _analyze) and assert the warm run never instantiates it.
     from dead_cst import analyze
 
     calls = []
@@ -382,23 +383,13 @@ def test_warm_run_skips_visitor(tmp_path, monkeypatch):
         return real(*args, **kwargs)
 
     monkeypatch.setattr(analyze, "SymbolVisitor", _spy)
-    with GraphCache(db, fingerprint=fp) as cache:
-        build_symbol_graph({tmp_path: []}, cache=cache)
+    with GraphCache(db) as cache:
+        Analysis({tmp_path: []}, cache=cache).materialize_all()
     assert calls == []
 
 
 def test_warm_run_with_plugins_parses_zero_files(tmp_path, monkeypatch):
-    """A warm run with the full builtin plugin set never parses any file.
-
-    The two-pass plugin protocol bakes per-file observe contributions
-    into the cached :class:`VisitorPayload`, so on a cache hit the
-    analyzer skips both the visitor and the per-plugin observe. The
-    per-base ``finalize`` step is graph-only (no CST access). This
-    test pins that contract: even with every builtin plugin enabled,
-    a warm run never instantiates :class:`SymbolVisitor` or
-    :class:`MetadataWrapper`, never calls ``cst.parse_module``, and
-    never builds the per-base FQN cache.
-    """
+    """A warm run with the full builtin plugin set never parses any file."""
     import libcst as cst
 
     from dead_cst import analyze
@@ -445,11 +436,9 @@ def test_warm_run_with_plugins_parses_zero_files(tmp_path, monkeypatch):
         InitSubclassPlugin(),
     ]
     db = tmp_path / CACHE_DIR_NAME / "cache.db"
-    fp = compute_fingerprint(paths={tmp_path: []}, resolvers=[], plugins=plugins)
 
-    # Cold run populates the cache and exercises every observe step.
-    with GraphCache(db, fingerprint=fp) as cache:
-        build_symbol_graph({tmp_path: []}, plugins=plugins, cache=cache)
+    with GraphCache(db) as cache:
+        Analysis({tmp_path: []}, plugins=plugins, cache=cache).materialize_all()
 
     visitor_calls: list[object] = []
     wrapper_calls: list[object] = []
@@ -481,8 +470,8 @@ def test_warm_run_with_plugins_parses_zero_files(tmp_path, monkeypatch):
     monkeypatch.setattr(cst, "parse_module", _parse_spy)
     monkeypatch.setattr(analyze.FixedFullyQualifiedNameProvider, "gen_cache", classmethod(_fqn_spy))
 
-    with GraphCache(db, fingerprint=fp) as cache:
-        build_symbol_graph({tmp_path: []}, plugins=plugins, cache=cache)
+    with GraphCache(db) as cache:
+        Analysis({tmp_path: []}, plugins=plugins, cache=cache).materialize_all()
 
     assert visitor_calls == []
     assert wrapper_calls == []
@@ -501,9 +490,8 @@ def test_edited_file_re_runs_visitor(tmp_path, monkeypatch):
         },
     )
     db = tmp_path / CACHE_DIR_NAME / "cache.db"
-    fp = compute_fingerprint(paths={tmp_path: []}, resolvers=[])
-    with GraphCache(db, fingerprint=fp) as cache:
-        build_symbol_graph({tmp_path: []}, cache=cache)
+    with GraphCache(db) as cache:
+        Analysis({tmp_path: []}, cache=cache).materialize_all()
 
     (tmp_path / "pkg" / "a.py").write_text("def f(): return 1\n")
 
@@ -517,14 +505,15 @@ def test_edited_file_re_runs_visitor(tmp_path, monkeypatch):
         return real(path, *args, **kwargs)
 
     monkeypatch.setattr(analyze, "SymbolVisitor", _spy)
-    with GraphCache(db, fingerprint=fp) as cache:
-        build_symbol_graph({tmp_path: []}, cache=cache)
+    with GraphCache(db) as cache:
+        Analysis({tmp_path: []}, cache=cache).materialize_all()
 
     assert visited == [tmp_path / "pkg" / "a.py"]
 
 
-def test_fingerprint_change_forces_full_rebuild(tmp_path, monkeypatch):
-    """Re-opening with a new fingerprint forces every file through the visitor."""
+def test_resolver_change_forces_full_rebuild_for_that_base(tmp_path, monkeypatch):
+    """Adding a resolver changes the per-base fingerprint, so every file
+    in that base is re-visited; sibling bases are untouched."""
     _write(
         tmp_path,
         {
@@ -534,9 +523,8 @@ def test_fingerprint_change_forces_full_rebuild(tmp_path, monkeypatch):
         },
     )
     db = tmp_path / CACHE_DIR_NAME / "cache.db"
-    fp1 = compute_fingerprint(paths={tmp_path: []}, resolvers=[])
-    with GraphCache(db, fingerprint=fp1) as cache:
-        build_symbol_graph({tmp_path: []}, cache=cache)
+    with GraphCache(db) as cache:
+        Analysis({tmp_path: []}, cache=cache).materialize_all()
 
     from dead_cst import analyze
 
@@ -548,22 +536,15 @@ def test_fingerprint_change_forces_full_rebuild(tmp_path, monkeypatch):
         return real(path, *args, **kwargs)
 
     monkeypatch.setattr(analyze, "SymbolVisitor", _spy)
-    with GraphCache(db, fingerprint="changed") as cache:
-        build_symbol_graph({tmp_path: []}, cache=cache)
-    # All three files (init + a + b) get re-visited under the new fingerprint.
+    with GraphCache(db) as cache:
+        Analysis(
+            {tmp_path: []}, resolvers=[ManualResolver(specs=[])], cache=cache
+        ).materialize_all()
     assert {p.name for p in visited} == {"__init__.py", "a.py", "b.py"}
 
 
 def test_plugin_contributions_survive_warm_cache(tmp_path):
-    """Plugin observe contributions are baked into the cached payload.
-
-    The two-pass protocol folds each plugin's per-file ``observe``
-    output into the cached :class:`VisitorPayload`. On warm runs the
-    visitor is skipped *and* observe is skipped -- the cached payload
-    already carries the plugin nodes/edges. The per-base ``finalize``
-    runs every analysis (graph-only, no CST). The end-to-end live
-    set must match the cold run.
-    """
+    """Plugin observe contributions are baked into the cached payload."""
     from dead_cst.plugins import MainBlockPlugin
 
     _write(
@@ -580,14 +561,13 @@ def test_plugin_contributions_survive_warm_cache(tmp_path):
     )
     db = tmp_path / CACHE_DIR_NAME / "cache.db"
     plugins = [MainBlockPlugin()]
-    fp = compute_fingerprint(paths={tmp_path: []}, resolvers=[], plugins=plugins)
 
-    with GraphCache(db, fingerprint=fp) as cache:
-        cold = build_symbol_graph({tmp_path: []}, plugins=plugins, cache=cache)
+    with GraphCache(db) as cache:
+        cold = Analysis({tmp_path: []}, plugins=plugins, cache=cache).materialize_all()
     cold_entrypoints = {n.fqname for n, a in cold.nodes(data=True) if a.get("entrypoint")}
 
-    with GraphCache(db, fingerprint=fp) as cache:
-        warm = build_symbol_graph({tmp_path: []}, plugins=plugins, cache=cache)
+    with GraphCache(db) as cache:
+        warm = Analysis({tmp_path: []}, plugins=plugins, cache=cache).materialize_all()
     warm_entrypoints = {n.fqname for n, a in warm.nodes(data=True) if a.get("entrypoint")}
 
     assert cold_entrypoints == warm_entrypoints
@@ -608,16 +588,11 @@ def test_plugin_version_bump_invalidates_cache(tmp_path, monkeypatch):
     db = tmp_path / CACHE_DIR_NAME / "cache.db"
 
     plugins_v1 = [MainBlockPlugin()]
-    fp_v1 = compute_fingerprint(paths={tmp_path: []}, resolvers=[], plugins=plugins_v1)
-    with GraphCache(db, fingerprint=fp_v1) as cache:
-        build_symbol_graph({tmp_path: []}, plugins=plugins_v1, cache=cache)
+    with GraphCache(db) as cache:
+        Analysis({tmp_path: []}, plugins=plugins_v1, cache=cache).materialize_all()
 
-    # Bump the plugin's version: should invalidate the file_cache so
-    # the next run re-visits every file (and re-runs observe).
     bumped = MainBlockPlugin()
     bumped.version = "2"
-    fp_v2 = compute_fingerprint(paths={tmp_path: []}, resolvers=[], plugins=[bumped])
-    assert fp_v1 != fp_v2
 
     from dead_cst import analyze
 
@@ -629,8 +604,8 @@ def test_plugin_version_bump_invalidates_cache(tmp_path, monkeypatch):
         return real(path, *args, **kwargs)
 
     monkeypatch.setattr(analyze, "SymbolVisitor", _spy)
-    with GraphCache(db, fingerprint=fp_v2) as cache:
-        build_symbol_graph({tmp_path: []}, plugins=[bumped], cache=cache)
+    with GraphCache(db) as cache:
+        Analysis({tmp_path: []}, plugins=[bumped], cache=cache).materialize_all()
     assert {p.name for p in visited} == {"__init__.py", "m.py"}
 
 
@@ -641,7 +616,7 @@ def test_plugin_version_bump_invalidates_cache(tmp_path, monkeypatch):
 
 def test_clear_cache_returns_true_when_present(tmp_path):
     db = tmp_path / CACHE_DIR_NAME / "cache.db"
-    GraphCache(db, fingerprint="fp").close()
+    GraphCache(db).close()
     assert clear_cache(db) is True
     assert not db.exists()
 
@@ -654,12 +629,10 @@ def test_clear_cache_returns_false_when_missing(tmp_path):
 def test_clear_cache_removes_cache_dir_when_empty(tmp_path):
     """The .dead-cst-cache dir is removed iff it's empty after cleanup."""
     db = tmp_path / CACHE_DIR_NAME / "cache.db"
-    GraphCache(db, fingerprint="fp").close()
+    GraphCache(db).close()
     cache_dir = db.parent
     assert cache_dir.exists()
     clear_cache(db)
-    # Cache was the only thing in the dir (plus the .gitignore we
-    # ourselves dropped); both should be gone.
     assert not cache_dir.exists()
 
 

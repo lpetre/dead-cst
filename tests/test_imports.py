@@ -8,7 +8,7 @@ the fixture so individual cases only list the edges they introduce.
 
 import pytest
 
-from dead_cst import build_symbol_graph
+from dead_cst import Analysis
 from dead_cst.plugins._core import EXTERNAL_PREFIXES
 
 IMPORT_TEST_FILES = {
@@ -550,7 +550,7 @@ def test_cross_dep_submodule_import(tmp_path, assert_edges):
     (pkg_a / "A" / "sub.py").write_text("def f(): ...\n")
     (pkg_b / "B" / "__init__.py").write_text("from A import sub\nsub.f()\n")
 
-    graph = build_symbol_graph({pkg_b: [pkg_a], pkg_a: []})
+    graph = Analysis({pkg_b: [pkg_a], pkg_a: []}).materialize_all()
     assert_edges(
         graph,
         {

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dead_cst import build_symbol_graph
+from dead_cst import Analysis
 from dead_cst.plugins import FastAPIPlugin
 
 
@@ -34,11 +34,11 @@ def test_fastapi_plugin_marks_route_handlers(tmp_path, write_files, reachable_fq
             """,
         }
     )
-    graph = build_symbol_graph(
+    graph = Analysis(
         {tmp_path: []},
         plugins=[FastAPIPlugin()],
         project_root=tmp_path,
-    )
+    ).materialize_all()
     reached = reachable_fqnames(graph)
     assert "app.main.app" in reached
     assert "app.main.list_items" in reached
@@ -73,11 +73,11 @@ def test_fastapi_plugin_marks_websocket_and_lifecycle(tmp_path, write_files, rea
             """,
         }
     )
-    graph = build_symbol_graph(
+    graph = Analysis(
         {tmp_path: []},
         plugins=[FastAPIPlugin()],
         project_root=tmp_path,
-    )
+    ).materialize_all()
     reached = reachable_fqnames(graph)
     assert "app.main.ws_endpoint" in reached
     assert "app.main.add_header" in reached
@@ -111,11 +111,11 @@ def test_fastapi_plugin_keeps_handler_dependencies_alive(tmp_path, write_files, 
             """,
         }
     )
-    graph = build_symbol_graph(
+    graph = Analysis(
         {tmp_path: []},
         plugins=[FastAPIPlugin()],
         project_root=tmp_path,
-    )
+    ).materialize_all()
     reached = reachable_fqnames(graph)
     assert "app.main.get_item" in reached
     # Symbols transitively referenced from the handler stay alive
@@ -142,11 +142,11 @@ def test_fastapi_plugin_ignores_bare_decorators(tmp_path, write_files, reachable
             """,
         }
     )
-    graph = build_symbol_graph(
+    graph = Analysis(
         {tmp_path: []},
         plugins=[FastAPIPlugin()],
         project_root=tmp_path,
-    )
+    ).materialize_all()
     # Bare ``@get`` (no attribute access) is not a FastAPI registration --
     # matching it would clobber unrelated decorators with the same name.
     assert "pkg.mod.looks_like_route" not in reachable_fqnames(graph)
@@ -168,11 +168,11 @@ def test_fastapi_plugin_ignores_unrelated_decorators(tmp_path, write_files, reac
             """,
         }
     )
-    graph = build_symbol_graph(
+    graph = Analysis(
         {tmp_path: []},
         plugins=[FastAPIPlugin()],
         project_root=tmp_path,
-    )
+    ).materialize_all()
     assert "pkg.mod.not_a_route" not in reachable_fqnames(graph)
 
 
@@ -190,11 +190,11 @@ def test_fastapi_plugin_unused_router_stays_dead(tmp_path, write_files, reachabl
             """,
         }
     )
-    graph = build_symbol_graph(
+    graph = Analysis(
         {tmp_path: []},
         plugins=[FastAPIPlugin()],
         project_root=tmp_path,
-    )
+    ).materialize_all()
     reached = reachable_fqnames(graph)
     # No FastAPI app reaches this router, so it (and its handler) are dead.
     assert "app.routes.router" not in reached
@@ -227,11 +227,11 @@ def test_fastapi_plugin_router_reachable_via_include_router(
             """,
         }
     )
-    graph = build_symbol_graph(
+    graph = Analysis(
         {tmp_path: []},
         plugins=[FastAPIPlugin()],
         project_root=tmp_path,
-    )
+    ).materialize_all()
     reached = reachable_fqnames(graph)
     assert "app.main.app" in reached
     assert "app.routes.router" in reached
@@ -253,11 +253,11 @@ def test_fastapi_plugin_handles_aliased_class_import(tmp_path, write_files, reac
             """,
         }
     )
-    graph = build_symbol_graph(
+    graph = Analysis(
         {tmp_path: []},
         plugins=[FastAPIPlugin()],
         project_root=tmp_path,
-    )
+    ).materialize_all()
     assert "app.main.index" in reachable_fqnames(graph)
 
 
@@ -275,11 +275,11 @@ def test_fastapi_plugin_handles_module_import(tmp_path, write_files, reachable_f
             """,
         }
     )
-    graph = build_symbol_graph(
+    graph = Analysis(
         {tmp_path: []},
         plugins=[FastAPIPlugin()],
         project_root=tmp_path,
-    )
+    ).materialize_all()
     assert "app.main.index" in reachable_fqnames(graph)
 
 
@@ -297,11 +297,11 @@ def test_fastapi_plugin_handles_annotated_assignment(tmp_path, write_files, reac
             """,
         }
     )
-    graph = build_symbol_graph(
+    graph = Analysis(
         {tmp_path: []},
         plugins=[FastAPIPlugin()],
         project_root=tmp_path,
-    )
+    ).materialize_all()
     assert "app.main.index" in reachable_fqnames(graph)
 
 
@@ -324,11 +324,11 @@ def test_fastapi_plugin_does_nothing_without_fastapi_imports(
             """,
         }
     )
-    graph = build_symbol_graph(
+    graph = Analysis(
         {tmp_path: []},
         plugins=[FastAPIPlugin()],
         project_root=tmp_path,
-    )
+    ).materialize_all()
     # ``app`` here is not a FastAPI instance -- no ``fastapi`` import in scope.
     assert "pkg.mod.looks_like_route" not in reachable_fqnames(graph)
 
@@ -356,11 +356,11 @@ def test_fastapi_plugin_handles_factory_function(tmp_path, write_files, reachabl
             """,
         }
     )
-    graph = build_symbol_graph(
+    graph = Analysis(
         {tmp_path: []},
         plugins=[FastAPIPlugin()],
         project_root=tmp_path,
-    )
+    ).materialize_all()
     reached = reachable_fqnames(graph)
     assert "app.main.app" in reached
     assert "app.main.list_items" in reached
@@ -386,11 +386,11 @@ def test_fastapi_plugin_factory_returning_router_stays_dead(
             """,
         }
     )
-    graph = build_symbol_graph(
+    graph = Analysis(
         {tmp_path: []},
         plugins=[FastAPIPlugin()],
         project_root=tmp_path,
-    )
+    ).materialize_all()
     # Factory-produced router is treated like a literal APIRouter --
     # never auto-seeded as an entrypoint, so an unincluded one stays dead.
     reached = reachable_fqnames(graph)
@@ -426,11 +426,11 @@ def test_fastapi_plugin_ignores_non_app_fastapi_users(tmp_path, write_files, rea
             """,
         }
     )
-    graph = build_symbol_graph(
+    graph = Analysis(
         {tmp_path: []},
         plugins=[FastAPIPlugin()],
         project_root=tmp_path,
-    )
+    ).materialize_all()
     assert "pkg.mod.handler" not in reachable_fqnames(graph)
 
 

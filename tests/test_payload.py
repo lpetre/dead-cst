@@ -29,7 +29,7 @@ from pathlib import Path
 
 from libcst.metadata import CodePosition, CodeRange, FullRepoManager
 
-from dead_cst import EdgeFlags, NodeFlags, build_symbol_graph
+from dead_cst import Analysis, EdgeFlags, NodeFlags
 from dead_cst._fqn import FixedFullyQualifiedNameProvider
 from dead_cst.graph import SymbolNode
 from dead_cst._visitor import SymbolVisitor
@@ -189,7 +189,7 @@ def test_apply_flags_dead_branch_edges(tmp_path, write_files):
             """,
         }
     )
-    graph = build_symbol_graph({tmp_path: []})
+    graph = Analysis({tmp_path: []}).materialize_all()
     helper = next(n for n in graph.nodes if n.fqname == "pkg.a.helper")
     module = next(n for n in graph.nodes if n.fqname == "pkg.a")
 
@@ -260,7 +260,7 @@ def test_shadowed_decl_in_graph_keeps_consistent_identity(tmp_path, write_files)
             """,
         }
     )
-    g = build_symbol_graph({tmp_path: []})
+    g = Analysis({tmp_path: []}).materialize_all()
     shadowed = [n for n in g.nodes if n.flags & NodeFlags.SHADOWED]
     assert len(shadowed) == 1
     s = shadowed[0]
@@ -284,7 +284,7 @@ def test_dead_suites_exposed_on_graph(tmp_path, write_files):
             """,
         }
     )
-    g = build_symbol_graph({tmp_path: []})
+    g = Analysis({tmp_path: []}).materialize_all()
     suites = g.graph["dead_suites"]
     file = tmp_path / "pkg" / "a.py"
     assert file in suites

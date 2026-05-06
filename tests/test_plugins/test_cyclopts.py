@@ -1,31 +1,31 @@
-"""Tests for :class:`TyperPlugin`."""
+"""Tests for :class:`CycloptsPlugin`."""
 
 from __future__ import annotations
 
 from dead_cst import Analysis
 from dead_cst.plugins import (
+    CycloptsPlugin,
     ExplicitEntrypointPlugin,
     MainBlockPlugin,
-    TyperPlugin,
 )
 
 
-def test_typer_plugin_marks_command_handlers(tmp_path, write_files, reachable_fqnames):
+def test_cyclopts_plugin_marks_command_handlers(tmp_path, write_files, reachable_fqnames):
     write_files(
         {
             "cli/__init__.py": "",
             "cli/main.py": """
-            import typer
+            import cyclopts
 
-            app = typer.Typer()
+            app = cyclopts.App()
 
-            @app.command()
+            @app.command
             def hello(): pass
 
-            @app.command("bye")
+            @app.command(name="bye")
             def goodbye(): pass
 
-            @app.callback()
+            @app.default
             def root(): pass
 
             def helper(): pass
@@ -37,7 +37,7 @@ def test_typer_plugin_marks_command_handlers(tmp_path, write_files, reachable_fq
     )
     graph = Analysis(
         {tmp_path: []},
-        plugins=[MainBlockPlugin(), TyperPlugin()],
+        plugins=[MainBlockPlugin(), CycloptsPlugin()],
         project_root=tmp_path,
     ).materialize_all()
     reached = reachable_fqnames(graph)
@@ -49,7 +49,7 @@ def test_typer_plugin_marks_command_handlers(tmp_path, write_files, reachable_fq
     assert "cli.main.helper" not in reached
 
 
-def test_typer_plugin_keeps_handler_dependencies_alive(tmp_path, write_files, reachable_fqnames):
+def test_cyclopts_plugin_keeps_handler_dependencies_alive(tmp_path, write_files, reachable_fqnames):
     write_files(
         {
             "cli/__init__.py": "",
@@ -61,15 +61,15 @@ def test_typer_plugin_keeps_handler_dependencies_alive(tmp_path, write_files, re
                 pass
             """,
             "cli/main.py": """
-            from typer import Typer
+            from cyclopts import App
             from cli.models import Item
 
-            app = Typer()
+            app = App()
 
             def build_item() -> Item:
                 return Item()
 
-            @app.command()
+            @app.command
             def show():
                 return build_item()
 
@@ -80,7 +80,7 @@ def test_typer_plugin_keeps_handler_dependencies_alive(tmp_path, write_files, re
     )
     graph = Analysis(
         {tmp_path: []},
-        plugins=[MainBlockPlugin(), TyperPlugin()],
+        plugins=[MainBlockPlugin(), CycloptsPlugin()],
         project_root=tmp_path,
     ).materialize_all()
     reached = reachable_fqnames(graph)
@@ -92,23 +92,25 @@ def test_typer_plugin_keeps_handler_dependencies_alive(tmp_path, write_files, re
     assert "cli.models.Unused" not in reached
 
 
-def test_typer_plugin_reachable_via_explicit_entrypoint(tmp_path, write_files, reachable_fqnames):
+def test_cyclopts_plugin_reachable_via_explicit_entrypoint(
+    tmp_path, write_files, reachable_fqnames
+):
     write_files(
         {
             "cli/__init__.py": "",
             "cli/main.py": """
-            from typer import Typer
+            from cyclopts import App
 
-            app = Typer()
+            app = App()
 
-            @app.command()
+            @app.command
             def hello(): pass
             """,
         }
     )
     graph = Analysis(
         {tmp_path: []},
-        plugins=[ExplicitEntrypointPlugin(specs=["cli.main.app"]), TyperPlugin()],
+        plugins=[ExplicitEntrypointPlugin(specs=["cli.main.app"]), CycloptsPlugin()],
         project_root=tmp_path,
     ).materialize_all()
     reached = reachable_fqnames(graph)
@@ -116,26 +118,25 @@ def test_typer_plugin_reachable_via_explicit_entrypoint(tmp_path, write_files, r
     assert "cli.main.hello" in reached
 
 
-def test_typer_plugin_does_not_seed_entrypoint(tmp_path, write_files, reachable_fqnames):
+def test_cyclopts_plugin_does_not_seed_entrypoint(tmp_path, write_files, reachable_fqnames):
     """Without an external reach (no main block, no project.scripts, no -e),
-    the Typer instance itself stays dead -- and so do its commands. Mirrors
-    the ``APIRouter`` behavior in :class:`FastAPIPlugin`."""
+    the cyclopts instance itself stays dead -- and so do its commands."""
     write_files(
         {
             "cli/__init__.py": "",
             "cli/main.py": """
-            from typer import Typer
+            from cyclopts import App
 
-            app = Typer()
+            app = App()
 
-            @app.command()
+            @app.command
             def orphan(): pass
             """,
         }
     )
     graph = Analysis(
         {tmp_path: []},
-        plugins=[TyperPlugin()],
+        plugins=[CycloptsPlugin()],
         project_root=tmp_path,
     ).materialize_all()
     reached = reachable_fqnames(graph)
@@ -143,26 +144,26 @@ def test_typer_plugin_does_not_seed_entrypoint(tmp_path, write_files, reachable_
     assert "cli.main.orphan" not in reached
 
 
-def test_typer_plugin_unused_subapp_stays_dead(tmp_path, write_files, reachable_fqnames):
-    """A sub-Typer that's never ``add_typer``'d has no path from the root
-    app and stays dead, along with its commands."""
+def test_cyclopts_plugin_unused_subapp_stays_dead(tmp_path, write_files, reachable_fqnames):
+    """A sub-App that's never registered has no path from the root app and
+    stays dead, along with its commands."""
     write_files(
         {
             "cli/__init__.py": "",
             "cli/sub.py": """
-            from typer import Typer
+            from cyclopts import App
 
-            sub = Typer()
+            sub = App()
 
-            @sub.command()
+            @sub.command
             def orphan(): pass
             """,
             "cli/main.py": """
-            from typer import Typer
+            from cyclopts import App
 
-            app = Typer()
+            app = App()
 
-            @app.command()
+            @app.command
             def hello(): pass
 
             if __name__ == "__main__":
@@ -172,7 +173,7 @@ def test_typer_plugin_unused_subapp_stays_dead(tmp_path, write_files, reachable_
     )
     graph = Analysis(
         {tmp_path: []},
-        plugins=[MainBlockPlugin(), TyperPlugin()],
+        plugins=[MainBlockPlugin(), CycloptsPlugin()],
         project_root=tmp_path,
     ).materialize_all()
     reached = reachable_fqnames(graph)
@@ -181,27 +182,32 @@ def test_typer_plugin_unused_subapp_stays_dead(tmp_path, write_files, reachable_
     assert "cli.sub.orphan" not in reached
 
 
-def test_typer_plugin_subapp_reachable_via_add_typer(tmp_path, write_files, reachable_fqnames):
+def test_cyclopts_plugin_subapp_reachable_via_command_attach(
+    tmp_path, write_files, reachable_fqnames
+):
+    """``app.command(sub)`` attaches a sub-App by reference -- the analyzer
+    tracks that ordinary call argument, so the sub-App becomes reachable
+    through the root app and its own ``@sub.command`` handlers go live."""
     write_files(
         {
             "cli/__init__.py": "",
             "cli/sub.py": """
-            from typer import Typer
+            from cyclopts import App
 
-            sub = Typer()
+            sub = App()
 
-            @sub.command()
+            @sub.command
             def index(): pass
 
-            @sub.command()
+            @sub.command
             def things(): pass
             """,
             "cli/main.py": """
-            from typer import Typer
+            from cyclopts import App
             from cli.sub import sub
 
-            app = Typer()
-            app.add_typer(sub, name="sub")
+            app = App()
+            app.command(sub)
 
             if __name__ == "__main__":
                 app()
@@ -210,7 +216,7 @@ def test_typer_plugin_subapp_reachable_via_add_typer(tmp_path, write_files, reac
     )
     graph = Analysis(
         {tmp_path: []},
-        plugins=[MainBlockPlugin(), TyperPlugin()],
+        plugins=[MainBlockPlugin(), CycloptsPlugin()],
         project_root=tmp_path,
     ).materialize_all()
     reached = reachable_fqnames(graph)
@@ -220,16 +226,16 @@ def test_typer_plugin_subapp_reachable_via_add_typer(tmp_path, write_files, reac
     assert "cli.sub.things" in reached
 
 
-def test_typer_plugin_handles_aliased_class_import(tmp_path, write_files, reachable_fqnames):
+def test_cyclopts_plugin_handles_aliased_class_import(tmp_path, write_files, reachable_fqnames):
     write_files(
         {
             "cli/__init__.py": "",
             "cli/main.py": """
-            from typer import Typer as T
+            from cyclopts import App as A
 
-            app = T()
+            app = A()
 
-            @app.command()
+            @app.command
             def hello(): pass
 
             if __name__ == "__main__":
@@ -239,22 +245,22 @@ def test_typer_plugin_handles_aliased_class_import(tmp_path, write_files, reacha
     )
     graph = Analysis(
         {tmp_path: []},
-        plugins=[MainBlockPlugin(), TyperPlugin()],
+        plugins=[MainBlockPlugin(), CycloptsPlugin()],
         project_root=tmp_path,
     ).materialize_all()
     assert "cli.main.hello" in reachable_fqnames(graph)
 
 
-def test_typer_plugin_handles_aliased_module_import(tmp_path, write_files, reachable_fqnames):
+def test_cyclopts_plugin_handles_aliased_module_import(tmp_path, write_files, reachable_fqnames):
     write_files(
         {
             "cli/__init__.py": "",
             "cli/main.py": """
-            import typer as ty
+            import cyclopts as cy
 
-            app = ty.Typer()
+            app = cy.App()
 
-            @app.command()
+            @app.command
             def hello(): pass
 
             if __name__ == "__main__":
@@ -264,22 +270,22 @@ def test_typer_plugin_handles_aliased_module_import(tmp_path, write_files, reach
     )
     graph = Analysis(
         {tmp_path: []},
-        plugins=[MainBlockPlugin(), TyperPlugin()],
+        plugins=[MainBlockPlugin(), CycloptsPlugin()],
         project_root=tmp_path,
     ).materialize_all()
     assert "cli.main.hello" in reachable_fqnames(graph)
 
 
-def test_typer_plugin_handles_annotated_assignment(tmp_path, write_files, reachable_fqnames):
+def test_cyclopts_plugin_handles_annotated_assignment(tmp_path, write_files, reachable_fqnames):
     write_files(
         {
             "cli/__init__.py": "",
             "cli/main.py": """
-            import typer
+            import cyclopts
 
-            app: typer.Typer = typer.Typer()
+            app: cyclopts.App = cyclopts.App()
 
-            @app.command()
+            @app.command
             def hello(): pass
 
             if __name__ == "__main__":
@@ -289,20 +295,20 @@ def test_typer_plugin_handles_annotated_assignment(tmp_path, write_files, reacha
     )
     graph = Analysis(
         {tmp_path: []},
-        plugins=[MainBlockPlugin(), TyperPlugin()],
+        plugins=[MainBlockPlugin(), CycloptsPlugin()],
         project_root=tmp_path,
     ).materialize_all()
     assert "cli.main.hello" in reachable_fqnames(graph)
 
 
-def test_typer_plugin_ignores_bare_decorators(tmp_path, write_files, reachable_fqnames):
+def test_cyclopts_plugin_ignores_bare_decorators(tmp_path, write_files, reachable_fqnames):
     write_files(
         {
             "pkg/__init__.py": "",
             "pkg/mod.py": """
-            from typer import Typer
+            from cyclopts import App
 
-            app = Typer()
+            app = App()
 
             def command(fn):
                 return fn
@@ -317,15 +323,15 @@ def test_typer_plugin_ignores_bare_decorators(tmp_path, write_files, reachable_f
     )
     graph = Analysis(
         {tmp_path: []},
-        plugins=[MainBlockPlugin(), TyperPlugin()],
+        plugins=[MainBlockPlugin(), CycloptsPlugin()],
         project_root=tmp_path,
     ).materialize_all()
-    # Bare ``@command`` (no attribute access) is not a Typer registration --
+    # Bare ``@command`` (no attribute access) is not a cyclopts registration --
     # matching it would clobber unrelated decorators with the same name.
     assert "pkg.mod.looks_like_command" not in reachable_fqnames(graph)
 
 
-def test_typer_plugin_ignores_unrelated_decorators(tmp_path, write_files, reachable_fqnames):
+def test_cyclopts_plugin_ignores_unrelated_decorators(tmp_path, write_files, reachable_fqnames):
     write_files(
         {
             "pkg/__init__.py": "",
@@ -343,53 +349,54 @@ def test_typer_plugin_ignores_unrelated_decorators(tmp_path, write_files, reacha
     )
     graph = Analysis(
         {tmp_path: []},
-        plugins=[TyperPlugin()],
+        plugins=[CycloptsPlugin()],
         project_root=tmp_path,
     ).materialize_all()
-    # ``t`` isn't a ``Typer`` instance, so its ``.command`` decorator is ignored.
+    # ``t`` isn't a cyclopts ``App`` instance, so its ``.command`` decorator is ignored.
     assert "pkg.mod.not_a_command" not in reachable_fqnames(graph)
 
 
-def test_typer_plugin_does_nothing_without_typer_imports(tmp_path, write_files, reachable_fqnames):
+def test_cyclopts_plugin_does_nothing_without_cyclopts_imports(
+    tmp_path, write_files, reachable_fqnames
+):
     write_files(
         {
             "pkg/__init__.py": "",
             "pkg/mod.py": """
             class App:
-                def command(self):
-                    def wrap(fn): return fn
-                    return wrap
+                def command(self, fn):
+                    return fn
 
             app = App()
 
-            @app.command()
+            @app.command
             def looks_like_command(): pass
             """,
         }
     )
     graph = Analysis(
         {tmp_path: []},
-        plugins=[TyperPlugin()],
+        plugins=[CycloptsPlugin()],
         project_root=tmp_path,
     ).materialize_all()
-    # ``app`` here is not a Typer instance -- no ``typer`` import in scope.
+    # ``app`` here is not a cyclopts instance -- no ``cyclopts`` import in scope.
     assert "pkg.mod.looks_like_command" not in reachable_fqnames(graph)
 
 
-def test_typer_plugin_multiple_instances_in_one_module(tmp_path, write_files, reachable_fqnames):
+def test_cyclopts_plugin_multiple_instances_in_one_module(tmp_path, write_files, reachable_fqnames):
     write_files(
         {
             "cli/__init__.py": "",
             "cli/main.py": """
-            from typer import Typer
+            from cyclopts import App
 
-            app = Typer()
-            other = Typer()
+            app = App()
+            other = App()
 
-            @app.command()
+            @app.command
             def from_app(): pass
 
-            @other.command()
+            @other.command
             def from_other(): pass
 
             if __name__ == "__main__":
@@ -399,7 +406,7 @@ def test_typer_plugin_multiple_instances_in_one_module(tmp_path, write_files, re
     )
     graph = Analysis(
         {tmp_path: []},
-        plugins=[MainBlockPlugin(), TyperPlugin()],
+        plugins=[MainBlockPlugin(), CycloptsPlugin()],
         project_root=tmp_path,
     ).materialize_all()
     reached = reachable_fqnames(graph)
@@ -411,19 +418,19 @@ def test_typer_plugin_multiple_instances_in_one_module(tmp_path, write_files, re
     assert "cli.main.from_other" not in reached
 
 
-def test_typer_plugin_ignores_import_star(tmp_path, write_files, reachable_fqnames):
-    """``from typer import *`` doesn't bind ``Typer`` for the plugin's
+def test_cyclopts_plugin_ignores_import_star(tmp_path, write_files, reachable_fqnames):
+    """``from cyclopts import *`` doesn't bind ``App`` for the plugin's
     purposes. The ``import *`` analyzer logic is pessimistic enough on its
-    own; the plugin shouldn't infer Typer wiring from the star import."""
+    own; the plugin shouldn't infer cyclopts wiring from the star import."""
     write_files(
         {
             "cli/__init__.py": "",
             "cli/main.py": """
-            from typer import *
+            from cyclopts import *
 
-            app = Typer()
+            app = App()
 
-            @app.command()
+            @app.command
             def hello(): pass
 
             if __name__ == "__main__":
@@ -433,7 +440,7 @@ def test_typer_plugin_ignores_import_star(tmp_path, write_files, reachable_fqnam
     )
     graph = Analysis(
         {tmp_path: []},
-        plugins=[MainBlockPlugin(), TyperPlugin()],
+        plugins=[MainBlockPlugin(), CycloptsPlugin()],
         project_root=tmp_path,
     ).materialize_all()
     # No instance edge from ``app`` to ``hello`` because the plugin ignores
@@ -441,9 +448,9 @@ def test_typer_plugin_ignores_import_star(tmp_path, write_files, reachable_fqnam
     assert "cli.main.hello" not in reachable_fqnames(graph)
 
 
-def test_typer_plugin_loads_via_load_plugin():
+def test_cyclopts_plugin_loads_via_load_plugin():
     from dead_cst.plugins import load_plugin
 
-    plugin = load_plugin("typer")
-    assert isinstance(plugin, TyperPlugin)
-    assert plugin.name == "typer"
+    plugin = load_plugin("cyclopts")
+    assert isinstance(plugin, CycloptsPlugin)
+    assert plugin.name == "cyclopts"

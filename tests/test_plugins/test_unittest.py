@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dead_cst import build_symbol_graph
+from dead_cst import Analysis
 from dead_cst.plugins import UnittestPlugin
 
 
@@ -21,11 +21,11 @@ def test_unittest_plugin_marks_testcase_subclass(tmp_path, write_files, reachabl
             """,
         }
     )
-    graph = build_symbol_graph(
+    graph = Analysis(
         {tmp_path: []},
         plugins=[UnittestPlugin()],
         project_root=tmp_path,
-    )
+    ).materialize_all()
     reached = reachable_fqnames(graph)
     assert "pkg.things.MyThings" in reached
     assert "pkg.things.Helper" not in reached
@@ -43,11 +43,11 @@ def test_unittest_plugin_handles_from_import(tmp_path, write_files, reachable_fq
             """,
         }
     )
-    graph = build_symbol_graph(
+    graph = Analysis(
         {tmp_path: []},
         plugins=[UnittestPlugin()],
         project_root=tmp_path,
-    )
+    ).materialize_all()
     assert "pkg.things.MyThings" in reachable_fqnames(graph)
 
 
@@ -69,11 +69,11 @@ def test_unittest_plugin_handles_aliased_imports(tmp_path, write_files, reachabl
             """,
         }
     )
-    graph = build_symbol_graph(
+    graph = Analysis(
         {tmp_path: []},
         plugins=[UnittestPlugin()],
         project_root=tmp_path,
-    )
+    ).materialize_all()
     reached = reachable_fqnames(graph)
     assert "pkg.aliased_module.ModAliased" in reached
     assert "pkg.aliased_class.ClsAliased" in reached
@@ -91,11 +91,11 @@ def test_unittest_plugin_marks_async_testcase(tmp_path, write_files, reachable_f
             """,
         }
     )
-    graph = build_symbol_graph(
+    graph = Analysis(
         {tmp_path: []},
         plugins=[UnittestPlugin()],
         project_root=tmp_path,
-    )
+    ).materialize_all()
     assert "pkg.things.MyAsync" in reachable_fqnames(graph)
 
 
@@ -116,11 +116,11 @@ def test_unittest_plugin_marks_module_hooks(tmp_path, write_files, reachable_fqn
             """,
         }
     )
-    graph = build_symbol_graph(
+    graph = Analysis(
         {tmp_path: []},
         plugins=[UnittestPlugin()],
         project_root=tmp_path,
-    )
+    ).materialize_all()
     reached = reachable_fqnames(graph)
     assert "pkg.things.setUpModule" in reached
     assert "pkg.things.tearDownModule" in reached
@@ -144,11 +144,11 @@ def test_unittest_plugin_ignores_unrelated_classes(tmp_path, write_files, reacha
             """,
         }
     )
-    graph = build_symbol_graph(
+    graph = Analysis(
         {tmp_path: []},
         plugins=[UnittestPlugin()],
         project_root=tmp_path,
-    )
+    ).materialize_all()
     reached = reachable_fqnames(graph)
     # Bare ``TestCase`` is the locally-defined class (we never imported the
     # name from unittest), so the subclass is not picked up.
@@ -170,11 +170,11 @@ def test_unittest_plugin_skips_files_not_importing_unittest(
             """,
         }
     )
-    graph = build_symbol_graph(
+    graph = Analysis(
         {tmp_path: []},
         plugins=[UnittestPlugin()],
         project_root=tmp_path,
-    )
+    ).materialize_all()
     assert "pkg.things.MyThings" not in reachable_fqnames(graph)
 
 
@@ -193,11 +193,11 @@ def test_unittest_plugin_skips_pure_star_import(tmp_path, write_files, reachable
             """,
         }
     )
-    graph = build_symbol_graph(
+    graph = Analysis(
         {tmp_path: []},
         plugins=[UnittestPlugin()],
         project_root=tmp_path,
-    )
+    ).materialize_all()
     assert "pkg.things.MyThings" not in reachable_fqnames(graph)
 
 

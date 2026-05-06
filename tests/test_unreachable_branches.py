@@ -20,7 +20,10 @@ from pathlib import Path
 
 import networkx as nx
 
-from dead_cst import find_kept_alive_by_dead_branches, find_reachable
+from dead_cst.analyze import (
+    _find_kept_alive_by_dead_branches as find_kept_alive_by_dead_branches,
+    _find_reachable as find_reachable,
+)
 
 
 def _dead_suite_positions(graph: nx.MultiDiGraph, file: Path) -> tuple:
@@ -260,7 +263,7 @@ def test_custom_detector_folds_constants(tmp_path, write_files, assert_dead_bran
     import libcst as cst
     from libcst.metadata import MetadataWrapper, PositionProvider
 
-    from dead_cst import build_symbol_graph
+    from dead_cst import Analysis
 
     write_files(
         {
@@ -300,7 +303,7 @@ def test_custom_detector_folds_constants(tmp_path, write_files, assert_dead_bran
             wrapper.module.visit(_V())
             return out
 
-    graph = build_symbol_graph({tmp_path: []}, unreachable_detector=IsProdDetector())
+    graph = Analysis({tmp_path: []}, unreachable_detector=IsProdDetector()).materialize_all()
     assert_dead_branch_edges(graph, {"mod -> mod.dev_only"})
 
 
@@ -311,7 +314,7 @@ def test_default_detector_does_not_flag_named_condition(tmp_path, write_files):
     without a custom detector, ``if IS_PROD:`` is unknown and no
     suite is recorded as dead.
     """
-    from dead_cst import build_symbol_graph
+    from dead_cst import Analysis
 
     write_files(
         {
@@ -326,7 +329,7 @@ def test_default_detector_does_not_flag_named_condition(tmp_path, write_files):
             "settings.py": "IS_PROD = True\n",
         }
     )
-    graph = build_symbol_graph({tmp_path: []})
+    graph = Analysis({tmp_path: []}).materialize_all()
     assert _dead_suite_positions(graph, tmp_path / "mod.py") == ()
 
 
@@ -797,7 +800,7 @@ def test_custom_detector_override_folds_call_in_if(tmp_path, write_files):
 
     import libcst as cst
 
-    from dead_cst import EdgeFlags, build_symbol_graph
+    from dead_cst import Analysis, EdgeFlags
     from dead_cst.branches import DefaultUnreachableRegionDetector
 
     write_files(
@@ -827,7 +830,7 @@ def test_custom_detector_override_folds_call_in_if(tmp_path, write_files):
                 return True
             return None
 
-    graph = build_symbol_graph({tmp_path: []}, unreachable_detector=FlagAwareDetector())
+    graph = Analysis({tmp_path: []}, unreachable_detector=FlagAwareDetector()).materialize_all()
     dead = {
         f"{src.fqname} -> {dst.fqname}"
         for src, dst, attrs in graph.edges(data=True)
@@ -849,7 +852,7 @@ def test_custom_detector_override_folds_through_assignment(tmp_path, write_files
 
     import libcst as cst
 
-    from dead_cst import EdgeFlags, build_symbol_graph
+    from dead_cst import Analysis, EdgeFlags
     from dead_cst.branches import DefaultUnreachableRegionDetector
 
     write_files(
@@ -877,7 +880,7 @@ def test_custom_detector_override_folds_through_assignment(tmp_path, write_files
                 return False
             return None
 
-    graph = build_symbol_graph({tmp_path: []}, unreachable_detector=FlagAwareDetector())
+    graph = Analysis({tmp_path: []}, unreachable_detector=FlagAwareDetector()).materialize_all()
     dead = {
         f"{src.fqname} -> {dst.fqname}"
         for src, dst, attrs in graph.edges(data=True)
