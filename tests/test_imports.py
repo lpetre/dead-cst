@@ -10,6 +10,7 @@ import pytest
 
 from dead_cst import Analysis
 from dead_cst.plugins._core import EXTERNAL_PREFIXES
+from conftest import build_trees
 
 IMPORT_TEST_FILES = {
     "p/__init__.py": "",
@@ -550,7 +551,7 @@ def test_cross_dep_submodule_import(tmp_path, assert_edges):
     (pkg_a / "A" / "sub.py").write_text("def f(): ...\n")
     (pkg_b / "B" / "__init__.py").write_text("from A import sub\nsub.f()\n")
 
-    graph = Analysis({pkg_b: [pkg_a], pkg_a: []}).materialize_all()
+    graph = Analysis(build_trees({pkg_b: [pkg_a], pkg_a: []})).materialize_all()
     assert_edges(
         graph,
         {

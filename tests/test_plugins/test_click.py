@@ -8,6 +8,7 @@ from dead_cst.plugins import (
     ExplicitEntrypointPlugin,
     MainBlockPlugin,
 )
+from conftest import build_trees
 
 
 def test_click_plugin_marks_command_handlers(tmp_path, write_files, reachable_fqnames):
@@ -37,7 +38,7 @@ def test_click_plugin_marks_command_handlers(tmp_path, write_files, reachable_fq
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[MainBlockPlugin(), ClickPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -81,7 +82,7 @@ def test_click_plugin_keeps_handler_dependencies_alive(tmp_path, write_files, re
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[MainBlockPlugin(), ClickPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -110,7 +111,7 @@ def test_click_plugin_reachable_via_explicit_entrypoint(tmp_path, write_files, r
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[ExplicitEntrypointPlugin(specs=["cli.main.cli"]), ClickPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -138,7 +139,7 @@ def test_click_plugin_does_not_seed_entrypoint(tmp_path, write_files, reachable_
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[ClickPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -177,7 +178,7 @@ def test_click_plugin_unused_subgroup_stays_dead(tmp_path, write_files, reachabl
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[MainBlockPlugin(), ClickPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -218,7 +219,7 @@ def test_click_plugin_subgroup_reachable_via_add_command(tmp_path, write_files, 
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[MainBlockPlugin(), ClickPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -252,7 +253,7 @@ def test_click_plugin_subgroup_via_decorator(tmp_path, write_files, reachable_fq
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[MainBlockPlugin(), ClickPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -281,7 +282,7 @@ def test_click_plugin_handles_from_click_import_group(tmp_path, write_files, rea
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[MainBlockPlugin(), ClickPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -307,7 +308,7 @@ def test_click_plugin_handles_aliased_module_import(tmp_path, write_files, reach
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[MainBlockPlugin(), ClickPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -333,7 +334,7 @@ def test_click_plugin_handles_aliased_decorator_import(tmp_path, write_files, re
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[MainBlockPlugin(), ClickPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -358,7 +359,7 @@ def test_click_plugin_handles_explicit_constructor(tmp_path, write_files, reacha
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[MainBlockPlugin(), ClickPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -387,7 +388,7 @@ def test_click_plugin_ignores_bare_decorators(tmp_path, write_files, reachable_f
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[MainBlockPlugin(), ClickPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -413,7 +414,7 @@ def test_click_plugin_ignores_unrelated_decorators(tmp_path, write_files, reacha
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[ClickPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -439,7 +440,7 @@ def test_click_plugin_does_nothing_without_click_imports(tmp_path, write_files, 
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[ClickPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -472,7 +473,7 @@ def test_click_plugin_multiple_groups_in_one_module(tmp_path, write_files, reach
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[MainBlockPlugin(), ClickPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -507,7 +508,7 @@ def test_click_plugin_ignores_import_star(tmp_path, write_files, reachable_fqnam
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[MainBlockPlugin(), ClickPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -530,7 +531,7 @@ def test_click_plugin_does_nothing_when_click_not_installed(
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[ClickPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -555,7 +556,7 @@ def test_click_plugin_ignores_relative_imports_and_unrelated_names(
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[ClickPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -581,7 +582,7 @@ def test_click_plugin_no_groups_when_click_imported_but_unused(
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[ClickPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -638,7 +639,7 @@ def test_click_plugin_ignores_non_group_assignment_shapes(tmp_path, write_files,
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[MainBlockPlugin(), ClickPlugin()],
         project_root=tmp_path,
     ).materialize_all()

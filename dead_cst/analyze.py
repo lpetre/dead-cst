@@ -5,7 +5,7 @@ import sys
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Iterator, Mapping, Sequence, cast
+from typing import Iterable, Iterator, Mapping, Sequence
 
 import libcst as cst
 import networkx as nx
@@ -559,43 +559,41 @@ def _infer_project_root(trees: Sequence[SourceTree]) -> Path:
     return min((t.path for t in trees), key=lambda p: len(p.parts))
 
 
-def _trees_from_mapping(paths: Mapping[Path, Sequence[Path]]) -> list[SourceTree]:
-    """Convert a ``{path: [search_paths]}`` shorthand into a tree list.
+def _warn_if_project_venv_inactive(project_root: Path) -> None:
+    """Warn when the project has a sibling ``.venv``/``venv`` that
+    isn't the running interpreter.
 
-    Each path becomes its own ``EXPORTED`` tree. Package names are
-    derived from the final path component (with an index suffix when
-    two paths share a name) so they're unique across the resulting
-    list. Search-path entries are passed through as ``search_trees``;
-    paths that aren't keys are simply absent from the resolver's
-    layout, which validation will reject -- the shorthand is a
-    convenience for the homogeneous case where every search ref is
-    another tree in the same mapping.
+    The new contract is "run dead-cst with the project's venv active"
+    (e.g. via ``uv run dead-cst``). Without that, third-party imports
+    classify as ``[unresolved]`` synthetic nodes and framework plugin
+    lookups (FastAPI, Flask, ...) raise ``UnresolvedDependencyError``.
+    The proactive warning is more actionable than that downstream
+    symptom. When no project venv is discoverable we stay silent --
+    the user may intentionally be analyzing without third-party
+    visibility.
     """
-    used: dict[str, int] = {}
-
-    def _pkg(path: Path) -> str:
-        stem = path.name or "root"
-        if stem in used:
-            used[stem] += 1
-            return f"{stem}_{used[stem]}"
-        used[stem] = 0
-        return stem
-
-    pkg_for: dict[Path, str] = {}
-    for p in paths:
-        pkg_for[p.resolve()] = _pkg(p)
-
-    out: list[SourceTree] = []
-    for p, deps in paths.items():
-        out.append(
-            SourceTree(
-                path=p.resolve(),
-                package=pkg_for[p.resolve()],
-                flags=SourceTreeFlags.EXPORTED,
-                search_trees=tuple(d.resolve() for d in deps),
-            )
+    try:
+        running = Path(sys.prefix).resolve()
+    except OSError:
+        return
+    for name in (".venv", "venv"):
+        candidate = project_root / name
+        if not candidate.is_dir():
+            continue
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        if running == resolved:
+            return
+        logger.warning(
+            "dead-cst is not running inside %s. Third-party imports "
+            "may classify as [unresolved] and framework plugin lookups "
+            "may fail. Re-run via 'uv run dead-cst ...' (or activate "
+            "the venv) for full classification.",
+            candidate,
         )
-    return out
+        return
 
 
 def _find_reachable(graph: nx.MultiDiGraph) -> set[SymbolNode]:
@@ -669,7 +667,7 @@ class Analysis:
 
     def __init__(
         self,
-        source_trees: Sequence[SourceTree] | Mapping[Path, Sequence[Path]],
+        source_trees: Sequence[SourceTree],
         *,
         plugins: Sequence[EdgePlugin] = (),
         resolvers: Sequence[PathResolver] = (),
@@ -678,19 +676,7 @@ class Analysis:
         unreachable_detector: UnreachableRegionDetector | None = None,
         workers: int | None = None,
     ) -> None:
-        trees: Sequence[SourceTree]
-        if isinstance(source_trees, Mapping):
-            # ``{path: [search_paths]}`` shorthand: each key becomes its
-            # own ``EXPORTED`` :class:`SourceTree`. Search paths are
-            # interpreted as references to other trees in the same dict
-            # by path identity. The package name is derived from each
-            # path's final component (with an index suffix when names
-            # collide). Useful for tests and the common single-tree
-            # case; the canonical input is the list-of-trees form.
-            trees = _trees_from_mapping(cast(Mapping[Path, Sequence[Path]], source_trees))
-        else:
-            trees = source_trees
-        self._validated = validate_source_trees(trees)
+        self._validated = validate_source_trees(source_trees)
         self._plugins: tuple[EdgePlugin, ...] = tuple(plugins)
         self._resolvers: tuple[PathResolver, ...] = tuple(resolvers)
         self._cache = cache
@@ -712,8 +698,9 @@ class Analysis:
         self._ordered_paths: list[Path] | None = None
         self._tree_specs: dict[Path, _TreeSpec] = {}
         self._contributions: dict[Path, _TreeContribution] = {}
-        self._closure_graphs: dict[Path, nx.MultiDiGraph] = {}
+        self._closure_graphs: dict[str, nx.MultiDiGraph] = {}
         self._full_graph: nx.MultiDiGraph | None = None
+        _warn_if_project_venv_inactive(self._project_root)
 
     @property
     def source_trees(self) -> list[SourceTree]:
@@ -730,53 +717,82 @@ class Analysis:
         return self._dep_graph
 
     @property
-    def tree_paths(self) -> list[Path]:
-        """Tree paths in topological order (deps before consumers)."""
+    def _tree_paths_topo(self) -> list[Path]:
+        """Internal: tree paths in topological order (deps before consumers).
+
+        Drives the per-tree visitor + compose loop. Public callers
+        operate on :attr:`packages` instead.
+        """
         if self._ordered_paths is None:
             self._ordered_paths = list(nx.topological_sort(self._dep_dag()))
         return list(self._ordered_paths)
 
     @property
     def packages(self) -> list[str]:
-        """Unique package names across the configured trees."""
+        """Unique package names across the configured trees, in
+        declaration order."""
         seen: dict[str, None] = {}
         for t in self._validated.trees:
             seen.setdefault(t.package, None)
         return list(seen)
 
-    def reverse_closure(self, tree_path: Path) -> frozenset[Path]:
-        """Tree paths that transitively depend on ``tree_path`` (inclusive)."""
-        if tree_path not in self._validated.by_path:
-            raise KeyError(tree_path)
-        return frozenset({tree_path}) | frozenset(nx.descendants(self._dep_dag(), tree_path))
+    def reverse_closure(self, package: str) -> frozenset[str]:
+        """Packages that transitively depend on ``package`` (inclusive).
 
-    def _interesting_set(self, tree_path: Path) -> frozenset[Path]:
-        """Tree paths needed to answer reachability for decls in ``tree_path``."""
+        A package depends on another if any of its trees lists any of
+        the other's trees in ``search_trees``. Same-package
+        self-references collapse out: the result always contains
+        ``package`` itself plus every consumer package, even when
+        consumers' trees only see this package's exported tree.
+        """
+        if package not in self._validated.by_package:
+            raise KeyError(package)
         dag = self._dep_dag()
-        scope: set[Path] = set()
-        for consumer in self.reverse_closure(tree_path):
-            scope.add(consumer)
-            scope |= nx.ancestors(dag, consumer)
-        return frozenset(scope)
+        my_paths = {t.path for t in self._validated.by_package[package]}
+        out: set[str] = {package}
+        for path in my_paths:
+            for descendant in nx.descendants(dag, path):
+                pkg = self._validated.by_path[descendant].package
+                out.add(pkg)
+        return frozenset(out)
 
-    def _package_interesting_set(self, package: str) -> frozenset[Path]:
-        """Union of :meth:`_interesting_set` over every tree in ``package``."""
-        scope: set[Path] = set()
-        for tree in self._validated.by_package.get(package, []):
-            scope |= self._interesting_set(tree.path)
-        return frozenset(scope)
+    def _interesting_set(self, package: str) -> frozenset[str]:
+        """Packages needed to answer reachability for decls in ``package``.
 
-    def refresh(self, tree_paths: Iterable[Path] | None = None) -> Analysis:
-        """Update the cache and build per-tree contributions for the given trees.
+        The forward (deps) closure of :meth:`reverse_closure` -- every
+        consumer of ``package`` plus every consumer's transitive deps,
+        so we have enough trie data to resolve every cross-package
+        import that could lead into ``package``.
+        """
+        dag = self._dep_dag()
+        out: set[str] = set()
+        for consumer_pkg in self.reverse_closure(package):
+            for tree in self._validated.by_package[consumer_pkg]:
+                out.add(consumer_pkg)
+                for ancestor in nx.ancestors(dag, tree.path):
+                    out.add(self._validated.by_path[ancestor].package)
+        return frozenset(out)
 
-        ``tree_paths=None`` (the default) refreshes every tree.
+    def _tree_paths_in_packages(self, packages: Iterable[str]) -> frozenset[Path]:
+        """Tree paths owned by any of ``packages``."""
+        out: set[Path] = set()
+        for name in packages:
+            for tree in self._validated.by_package[name]:
+                out.add(tree.path)
+        return frozenset(out)
+
+    def refresh(self, packages: Iterable[str] | None = None) -> Analysis:
+        """Update the cache and build per-tree contributions for the given packages.
+
+        ``packages=None`` (the default) refreshes every package.
         Already-refreshed trees are skipped, so calling :meth:`refresh`
         twice with the same argument is cheap.
         """
-        targets = list(tree_paths) if tree_paths is not None else self.tree_paths
-        unknown = [p for p in targets if p not in self._validated.by_path]
+        names = list(packages) if packages is not None else self.packages
+        unknown = [n for n in names if n not in self._validated.by_package]
         if unknown:
-            raise KeyError(f"Unknown tree paths: {unknown}")
+            raise KeyError(f"Unknown packages: {unknown}")
+        targets = [tree.path for n in names for tree in self._validated.by_package[n]]
         new_targets = [p for p in targets if p not in self._contributions]
         if not new_targets:
             return self
@@ -823,21 +839,22 @@ class Analysis:
             self._full_graph = self._materialize(scope=None)
         return self._full_graph
 
-    def materialize_closure(self, tree_path: Path) -> nx.MultiDiGraph:
-        """Build a graph containing every contribution in the
-        :meth:`_interesting_set` of ``tree_path``."""
+    def materialize_closure(self, package: str) -> nx.MultiDiGraph:
+        """Build a graph containing every contribution in
+        :meth:`_interesting_set` of ``package``."""
         if self._full_graph is not None:
             return self._full_graph
-        if tree_path not in self._closure_graphs:
-            scope = self._interesting_set(tree_path)
-            self.refresh(tree_paths=scope)
-            self._closure_graphs[tree_path] = self._materialize(scope=scope)
-        return self._closure_graphs[tree_path]
+        if package not in self._closure_graphs:
+            scope_packages = self._interesting_set(package)
+            scope_paths = self._tree_paths_in_packages(scope_packages)
+            self.refresh(packages=scope_packages)
+            self._closure_graphs[package] = self._materialize(scope=scope_paths)
+        return self._closure_graphs[package]
 
     def _materialize(self, *, scope: frozenset[Path] | None) -> nx.MultiDiGraph:
         g: nx.MultiDiGraph = nx.MultiDiGraph()
         g.graph["dead_suites"] = {}
-        for path in self.tree_paths:
+        for path in self._tree_paths_topo:
             if scope is not None and path not in scope:
                 continue
             _compose_contribution(
@@ -936,19 +953,16 @@ class PackageView:
         """The package's single ``EXPORTED`` tree, if any."""
         return self._analysis._validated.exported_for.get(self._name)
 
-    def reverse_closure(self) -> frozenset[Path]:
-        """Tree paths that transitively depend on any tree in this package."""
-        out: set[Path] = set()
-        for tree in self.trees:
-            out |= self._analysis.reverse_closure(tree.path)
-        return frozenset(out)
+    def reverse_closure(self) -> frozenset[str]:
+        """Packages that transitively depend on this one (inclusive)."""
+        return self._analysis.reverse_closure(self._name)
 
     def _under_any_tree(self, path: Path) -> bool:
         return any(path.is_relative_to(t.path) for t in self.trees)
 
     def modules(self) -> Iterator[SymbolNode]:
         """Module nodes for every ``.py`` file in any tree of this package."""
-        self._analysis.refresh(tree_paths=[t.path for t in self.trees])
+        self._analysis.refresh(packages=[self._name])
         for tree in self.trees:
             for n in self._analysis._contributions[tree.path].base_graph.nodes:
                 if n.type == "module":
@@ -956,7 +970,7 @@ class PackageView:
 
     def declarations(self, name: str | None = None) -> Iterator[SymbolNode]:
         """Top-level decls in any tree of this package."""
-        self._analysis.refresh(tree_paths=[t.path for t in self.trees])
+        self._analysis.refresh(packages=[self._name])
         for tree in self.trees:
             for n in self._analysis._contributions[tree.path].base_graph.nodes:
                 if n.type in ("module", "synthetic"):
@@ -971,14 +985,15 @@ class PackageView:
         Triggers closure materialization. Aggregates across every
         tree in the package.
         """
-        scope = self._analysis._package_interesting_set(self._name)
-        self._analysis.refresh(tree_paths=scope)
-        graph = self._analysis._materialize(scope=scope)
+        scope_packages = self._analysis._interesting_set(self._name)
+        scope_paths = self._analysis._tree_paths_in_packages(scope_packages)
+        self._analysis.refresh(packages=scope_packages)
+        graph = self._analysis._materialize(scope=scope_paths)
         out: set[Path] = set()
         for tree in self.trees:
             ctx = PluginContext(
                 graph=graph,
-                symbol_lookup=self._analysis._build_symbol_lookup(tree.path, scope=scope),
+                symbol_lookup=self._analysis._build_symbol_lookup(tree.path, scope=scope_paths),
                 base=tree.path,
                 project_root=self._analysis.project_root,
             )
@@ -987,9 +1002,7 @@ class PackageView:
 
     def graph(self) -> nx.MultiDiGraph:
         """Materialize and return the closure-scoped graph for this package."""
-        scope = self._analysis._package_interesting_set(self._name)
-        self._analysis.refresh(tree_paths=scope)
-        return self._analysis._materialize(scope=scope)
+        return self._analysis.materialize_closure(self._name)
 
     def reachable(self) -> set[SymbolNode]:
         """Decls in this package reachable from any entrypoint in
@@ -1016,7 +1029,7 @@ class PackageView:
 
     def count_nodes(self) -> dict[str, int]:
         """Count nodes contributed by this package, by ``SymbolNode.type``."""
-        self._analysis.refresh(tree_paths=[t.path for t in self.trees])
+        self._analysis.refresh(packages=[self._name])
         counts: dict[str, int] = {}
         for tree in self.trees:
             sub = _count_nodes(self._analysis._contributions[tree.path].base_graph, prefix=None)

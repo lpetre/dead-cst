@@ -4,12 +4,13 @@ from __future__ import annotations
 
 from dead_cst import Analysis
 from dead_cst.plugins import ModuleDundersPlugin
+from conftest import build_trees
 
 
 def test_keeps_all_alive(tmp_path, write_files, reachable_fqnames):
     write_files({"pkg/__init__.py": '__all__ = ["a"]\na = 1'})
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[ModuleDundersPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -29,7 +30,7 @@ def test_keeps_other_dunders_alive(tmp_path, write_files, reachable_fqnames):
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[ModuleDundersPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -48,7 +49,7 @@ def test_keeps_future_imports_alive(tmp_path, write_files, reachable_fqnames):
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[ModuleDundersPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -67,7 +68,7 @@ def test_ignores_non_future_imports_with_plain_names(tmp_path, write_files, reac
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[ModuleDundersPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -87,7 +88,7 @@ def test_ignores_non_dunder_underscore_names(tmp_path, write_files, reachable_fq
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[ModuleDundersPlugin()],
         project_root=tmp_path,
     ).materialize_all()

@@ -8,7 +8,7 @@ import pytest
 from dead_cst import Analysis, EdgeFlags, SourceTree, SourceTreeFlags
 
 
-def _build_trees(
+def build_trees(
     paths: dict[Path, list[Path]] | Path,
 ) -> list[SourceTree]:
     """Translate a legacy ``{path: [search_paths]}`` mapping (or a single
@@ -51,18 +51,6 @@ def _build_trees(
 
 
 @pytest.fixture
-def trees_for():
-    """Build a :class:`SourceTree` list from a legacy paths dict (or a single Path).
-
-    Most tests want one or two ``EXPORTED`` trees with optional search
-    refs. Pass a ``Path`` for the single-tree case or a
-    ``{path: [search_paths]}`` dict for multi-tree projects with
-    cross-tree dependencies.
-    """
-    return _build_trees
-
-
-@pytest.fixture
 def write_files(tmp_path):
     """Write a ``{relpath: source}`` mapping under ``tmp_path``.
 
@@ -93,7 +81,7 @@ def build_decl_graph(tmp_path):
             full_path = tmp_path / filename
             full_path.parent.mkdir(parents=True, exist_ok=True)
             full_path.write_text(textwrap.dedent(content).strip())
-        return Analysis(_build_trees(tmp_path)).materialize_all()
+        return Analysis(build_trees(tmp_path)).materialize_all()
 
     return _make_graph
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dead_cst import Analysis
 from dead_cst.plugins import MainBlockPlugin
+from conftest import build_trees
 
 
 def test_main_block_plugin_marks_module_entrypoint(tmp_path, write_files, reachable_fqnames):
@@ -20,7 +21,7 @@ def test_main_block_plugin_marks_module_entrypoint(tmp_path, write_files, reacha
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[MainBlockPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -57,7 +58,7 @@ def test_main_block_keeps_block_decls_alive(tmp_path, write_files, reachable_fqn
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[MainBlockPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -84,7 +85,7 @@ def test_main_block_keeps_nested_block_decls_alive(tmp_path, write_files, reacha
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[MainBlockPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -105,7 +106,7 @@ def test_main_block_reversed_comparison(tmp_path, write_files, reachable_fqnames
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[MainBlockPlugin()],
         project_root=tmp_path,
     ).materialize_all()

@@ -9,6 +9,7 @@ from dead_cst.plugins import (
     MainBlockPlugin,
 )
 from dead_cst.plugins.init_subclass import INIT_SUBCLASS_PREFIX
+from conftest import build_trees
 
 
 def test_init_subclass_keeps_subclass_alive_via_parent(tmp_path, write_files, reachable_fqnames):
@@ -38,7 +39,7 @@ def test_init_subclass_keeps_subclass_alive_via_parent(tmp_path, write_files, re
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[
             ExplicitEntrypointPlugin(specs=["pkg.base.Plugin"]),
             InitSubclassPlugin(),
@@ -72,7 +73,7 @@ def test_init_subclass_transitive_subclasses(tmp_path, write_files, reachable_fq
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[
             ExplicitEntrypointPlugin(specs=["pkg.mod.Root"]),
             InitSubclassPlugin(),
@@ -105,7 +106,7 @@ def test_init_subclass_does_not_seed_parent_entrypoint(tmp_path, write_files, re
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[InitSubclassPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -150,7 +151,7 @@ def test_init_subclass_via_main_block(tmp_path, write_files, reachable_fqnames):
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[MainBlockPlugin(), InitSubclassPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -178,7 +179,7 @@ def test_init_subclass_aliased_import(tmp_path, write_files, reachable_fqnames):
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[
             ExplicitEntrypointPlugin(specs=["pkg.base.Plugin"]),
             InitSubclassPlugin(),
@@ -206,7 +207,7 @@ def test_init_subclass_dotted_attribute_base(tmp_path, write_files, reachable_fq
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[
             ExplicitEntrypointPlugin(specs=["pkg.base.Plugin"]),
             InitSubclassPlugin(),
@@ -238,7 +239,7 @@ def test_init_subclass_class_without_init_subclass_no_edges(
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[
             ExplicitEntrypointPlugin(specs=["pkg.base.Plain"]),
             InitSubclassPlugin(),
@@ -282,7 +283,7 @@ def test_init_subclass_keeps_subclass_method_references_alive(
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[
             ExplicitEntrypointPlugin(specs=["pkg.base.Plugin"]),
             InitSubclassPlugin(),
@@ -319,7 +320,7 @@ def test_init_subclass_subscripted_base(tmp_path, write_files, reachable_fqnames
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[
             ExplicitEntrypointPlugin(specs=["pkg.base.Plugin"]),
             InitSubclassPlugin(),
@@ -349,7 +350,7 @@ def test_init_subclass_marker_in_predecessor_chain(tmp_path, write_files):
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[
             ExplicitEntrypointPlugin(specs=["pkg.base.Plugin"]),
             InitSubclassPlugin(),

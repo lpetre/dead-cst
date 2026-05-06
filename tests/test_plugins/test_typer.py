@@ -8,6 +8,7 @@ from dead_cst.plugins import (
     MainBlockPlugin,
     TyperPlugin,
 )
+from conftest import build_trees
 
 
 def test_typer_plugin_marks_command_handlers(tmp_path, write_files, reachable_fqnames):
@@ -36,7 +37,7 @@ def test_typer_plugin_marks_command_handlers(tmp_path, write_files, reachable_fq
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[MainBlockPlugin(), TyperPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -79,7 +80,7 @@ def test_typer_plugin_keeps_handler_dependencies_alive(tmp_path, write_files, re
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[MainBlockPlugin(), TyperPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -107,7 +108,7 @@ def test_typer_plugin_reachable_via_explicit_entrypoint(tmp_path, write_files, r
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[ExplicitEntrypointPlugin(specs=["cli.main.app"]), TyperPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -134,7 +135,7 @@ def test_typer_plugin_does_not_seed_entrypoint(tmp_path, write_files, reachable_
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[TyperPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -171,7 +172,7 @@ def test_typer_plugin_unused_subapp_stays_dead(tmp_path, write_files, reachable_
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[MainBlockPlugin(), TyperPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -209,7 +210,7 @@ def test_typer_plugin_subapp_reachable_via_add_typer(tmp_path, write_files, reac
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[MainBlockPlugin(), TyperPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -238,7 +239,7 @@ def test_typer_plugin_handles_aliased_class_import(tmp_path, write_files, reacha
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[MainBlockPlugin(), TyperPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -263,7 +264,7 @@ def test_typer_plugin_handles_aliased_module_import(tmp_path, write_files, reach
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[MainBlockPlugin(), TyperPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -288,7 +289,7 @@ def test_typer_plugin_handles_annotated_assignment(tmp_path, write_files, reacha
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[MainBlockPlugin(), TyperPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -316,7 +317,7 @@ def test_typer_plugin_ignores_bare_decorators(tmp_path, write_files, reachable_f
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[MainBlockPlugin(), TyperPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -342,7 +343,7 @@ def test_typer_plugin_ignores_unrelated_decorators(tmp_path, write_files, reacha
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[TyperPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -368,7 +369,7 @@ def test_typer_plugin_does_nothing_without_typer_imports(tmp_path, write_files, 
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[TyperPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -398,7 +399,7 @@ def test_typer_plugin_multiple_instances_in_one_module(tmp_path, write_files, re
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[MainBlockPlugin(), TyperPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -432,7 +433,7 @@ def test_typer_plugin_ignores_import_star(tmp_path, write_files, reachable_fqnam
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[MainBlockPlugin(), TyperPlugin()],
         project_root=tmp_path,
     ).materialize_all()

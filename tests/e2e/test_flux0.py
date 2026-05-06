@@ -33,6 +33,7 @@ from dead_cst.cli import app
 from dead_cst.plugins import MainBlockPlugin, ModuleDundersPlugin
 
 from ._flux0_plugins import Flux0CliCommandsPlugin, Flux0InternalModulesPlugin
+from conftest import build_trees
 
 pytestmark = pytest.mark.e2e
 
@@ -142,7 +143,9 @@ def _module_node(graph, fqname):
 
 
 def _build_graph(base: Path, *plugins):
-    return Analysis({base: []}, plugins=list(plugins), project_root=base).materialize_all()
+    return Analysis(
+        build_trees({base: []}), plugins=list(plugins), project_root=base
+    ).materialize_all()
 
 
 def test_flux0_cli_cmds_dead_without_plugin(flux0_cli_src):

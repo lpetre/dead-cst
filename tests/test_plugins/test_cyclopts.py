@@ -8,6 +8,7 @@ from dead_cst.plugins import (
     ExplicitEntrypointPlugin,
     MainBlockPlugin,
 )
+from conftest import build_trees
 
 
 def test_cyclopts_plugin_marks_command_handlers(tmp_path, write_files, reachable_fqnames):
@@ -36,7 +37,7 @@ def test_cyclopts_plugin_marks_command_handlers(tmp_path, write_files, reachable
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[MainBlockPlugin(), CycloptsPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -79,7 +80,7 @@ def test_cyclopts_plugin_keeps_handler_dependencies_alive(tmp_path, write_files,
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[MainBlockPlugin(), CycloptsPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -109,7 +110,7 @@ def test_cyclopts_plugin_reachable_via_explicit_entrypoint(
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[ExplicitEntrypointPlugin(specs=["cli.main.app"]), CycloptsPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -135,7 +136,7 @@ def test_cyclopts_plugin_does_not_seed_entrypoint(tmp_path, write_files, reachab
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[CycloptsPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -172,7 +173,7 @@ def test_cyclopts_plugin_unused_subapp_stays_dead(tmp_path, write_files, reachab
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[MainBlockPlugin(), CycloptsPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -215,7 +216,7 @@ def test_cyclopts_plugin_subapp_reachable_via_command_attach(
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[MainBlockPlugin(), CycloptsPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -244,7 +245,7 @@ def test_cyclopts_plugin_handles_aliased_class_import(tmp_path, write_files, rea
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[MainBlockPlugin(), CycloptsPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -269,7 +270,7 @@ def test_cyclopts_plugin_handles_aliased_module_import(tmp_path, write_files, re
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[MainBlockPlugin(), CycloptsPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -294,7 +295,7 @@ def test_cyclopts_plugin_handles_annotated_assignment(tmp_path, write_files, rea
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[MainBlockPlugin(), CycloptsPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -322,7 +323,7 @@ def test_cyclopts_plugin_ignores_bare_decorators(tmp_path, write_files, reachabl
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[MainBlockPlugin(), CycloptsPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -348,7 +349,7 @@ def test_cyclopts_plugin_ignores_unrelated_decorators(tmp_path, write_files, rea
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[CycloptsPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -375,7 +376,7 @@ def test_cyclopts_plugin_does_nothing_without_cyclopts_imports(
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[CycloptsPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -405,7 +406,7 @@ def test_cyclopts_plugin_multiple_instances_in_one_module(tmp_path, write_files,
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[MainBlockPlugin(), CycloptsPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -439,7 +440,7 @@ def test_cyclopts_plugin_ignores_import_star(tmp_path, write_files, reachable_fq
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[MainBlockPlugin(), CycloptsPlugin()],
         project_root=tmp_path,
     ).materialize_all()

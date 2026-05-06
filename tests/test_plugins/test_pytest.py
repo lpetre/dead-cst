@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dead_cst import Analysis
 from dead_cst.plugins import PytestPlugin
+from conftest import build_trees
 
 
 def test_pytest_plugin_marks_test_functions(tmp_path, write_files, reachable_fqnames):
@@ -18,7 +19,7 @@ def test_pytest_plugin_marks_test_functions(tmp_path, write_files, reachable_fqn
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[PytestPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -37,7 +38,7 @@ def test_pytest_plugin_recognizes_underscore_test_suffix(tmp_path, write_files, 
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[PytestPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -57,7 +58,7 @@ def test_pytest_plugin_marks_test_classes(tmp_path, write_files, reachable_fqnam
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[PytestPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -85,7 +86,7 @@ def test_pytest_plugin_marks_conftest_decls(tmp_path, write_files, reachable_fqn
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[PytestPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -123,7 +124,7 @@ def test_pytest_plugin_marks_decorated_fixtures_outside_conftest(
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[PytestPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -145,7 +146,7 @@ def test_pytest_plugin_ignores_non_test_modules(tmp_path, write_files, reachable
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[PytestPlugin()],
         project_root=tmp_path,
     ).materialize_all()

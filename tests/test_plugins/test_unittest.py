@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dead_cst import Analysis
 from dead_cst.plugins import UnittestPlugin
+from conftest import build_trees
 
 
 def test_unittest_plugin_marks_testcase_subclass(tmp_path, write_files, reachable_fqnames):
@@ -22,7 +23,7 @@ def test_unittest_plugin_marks_testcase_subclass(tmp_path, write_files, reachabl
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[UnittestPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -44,7 +45,7 @@ def test_unittest_plugin_handles_from_import(tmp_path, write_files, reachable_fq
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[UnittestPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -70,7 +71,7 @@ def test_unittest_plugin_handles_aliased_imports(tmp_path, write_files, reachabl
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[UnittestPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -92,7 +93,7 @@ def test_unittest_plugin_marks_async_testcase(tmp_path, write_files, reachable_f
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[UnittestPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -117,7 +118,7 @@ def test_unittest_plugin_marks_module_hooks(tmp_path, write_files, reachable_fqn
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[UnittestPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -145,7 +146,7 @@ def test_unittest_plugin_ignores_unrelated_classes(tmp_path, write_files, reacha
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[UnittestPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -171,7 +172,7 @@ def test_unittest_plugin_skips_files_not_importing_unittest(
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[UnittestPlugin()],
         project_root=tmp_path,
     ).materialize_all()
@@ -194,7 +195,7 @@ def test_unittest_plugin_skips_pure_star_import(tmp_path, write_files, reachable
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[UnittestPlugin()],
         project_root=tmp_path,
     ).materialize_all()

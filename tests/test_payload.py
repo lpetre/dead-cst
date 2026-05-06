@@ -34,6 +34,7 @@ from dead_cst._fqn import FixedFullyQualifiedNameProvider
 from dead_cst.graph import SymbolNode
 from dead_cst._visitor import SymbolVisitor
 from dead_cst.graph import VisitorPayload
+from conftest import build_trees
 
 
 def _pos(line: int = 1, column: int = 0) -> CodeRange:
@@ -189,7 +190,7 @@ def test_apply_flags_dead_branch_edges(tmp_path, write_files):
             """,
         }
     )
-    graph = Analysis({tmp_path: []}).materialize_all()
+    graph = Analysis(build_trees({tmp_path: []})).materialize_all()
     helper = next(n for n in graph.nodes if n.fqname == "pkg.a.helper")
     module = next(n for n in graph.nodes if n.fqname == "pkg.a")
 
@@ -260,7 +261,7 @@ def test_shadowed_decl_in_graph_keeps_consistent_identity(tmp_path, write_files)
             """,
         }
     )
-    g = Analysis({tmp_path: []}).materialize_all()
+    g = Analysis(build_trees({tmp_path: []})).materialize_all()
     shadowed = [n for n in g.nodes if n.flags & NodeFlags.SHADOWED]
     assert len(shadowed) == 1
     s = shadowed[0]
@@ -284,7 +285,7 @@ def test_dead_suites_exposed_on_graph(tmp_path, write_files):
             """,
         }
     )
-    g = Analysis({tmp_path: []}).materialize_all()
+    g = Analysis(build_trees({tmp_path: []})).materialize_all()
     suites = g.graph["dead_suites"]
     file = tmp_path / "pkg" / "a.py"
     assert file in suites

@@ -29,11 +29,12 @@ from dead_cst.plugins._core import (
     single_target_assignment,
 )
 from dead_cst.graph import SymbolNode, SymbolTrie
+from conftest import build_trees
 
 
 def test_no_plugins_means_nothing_reachable(tmp_path, write_files):
     write_files({"pkg/__init__.py": "", "pkg/a.py": "def f(): pass"})
-    graph = Analysis({tmp_path: []}).materialize_all()
+    graph = Analysis(build_trees({tmp_path: []})).materialize_all()
     assert find_reachable(graph) == set()
 
 
@@ -56,7 +57,7 @@ def test_plugins_compose(tmp_path, write_files, reachable_fqnames):
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[MainBlockPlugin(), ProjectScriptsPlugin()],
         project_root=tmp_path,
     ).materialize_all()

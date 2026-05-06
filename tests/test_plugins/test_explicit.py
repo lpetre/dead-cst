@@ -6,12 +6,13 @@ import re
 
 from dead_cst import Analysis
 from dead_cst.plugins import ExplicitEntrypointPlugin
+from conftest import build_trees
 
 
 def test_explicit_entrypoint_by_fqname(tmp_path, write_files, reachable_fqnames):
     write_files({"pkg/__init__.py": "", "pkg/a.py": "def f(): pass"})
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[ExplicitEntrypointPlugin(specs=["pkg.a.f"])],
         project_root=tmp_path,
     ).materialize_all()
@@ -21,7 +22,7 @@ def test_explicit_entrypoint_by_fqname(tmp_path, write_files, reachable_fqnames)
 def test_explicit_entrypoint_by_relpath(tmp_path, write_files, reachable_fqnames):
     write_files({"pkg/__init__.py": "", "pkg/a.py": "def f(): pass"})
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[ExplicitEntrypointPlugin(specs=["pkg/a.py"])],
         project_root=tmp_path,
     ).materialize_all()
@@ -37,7 +38,7 @@ def test_explicit_entrypoint_by_regex(tmp_path, write_files, reachable_fqnames):
         }
     )
     graph = Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[ExplicitEntrypointPlugin(specs=[re.compile(r".*entry\.py")])],
         project_root=tmp_path,
     ).materialize_all()

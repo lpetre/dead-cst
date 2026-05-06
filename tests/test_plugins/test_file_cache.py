@@ -13,6 +13,7 @@ import networkx as nx
 from dead_cst import Analysis
 from dead_cst.plugins import GraphOp, ObserveContext, PluginContext
 from dead_cst.graph import SymbolTrie
+from conftest import build_trees
 
 
 def _ctx(tmp_path):
@@ -69,7 +70,7 @@ def test_base_modules_only_yields_under_base(tmp_path, write_files):
             return ()
 
     Analysis(
-        {tmp_path / "a": [], tmp_path / "b": []},
+        build_trees({tmp_path / "a": [], tmp_path / "b": []}),
         plugins=[_Capture()],
         project_root=tmp_path,
     ).materialize_all()
@@ -104,7 +105,7 @@ def test_importers_finds_first_party_imports(tmp_path, write_files):
             return ()
 
     Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[_Capture()],
         project_root=tmp_path,
     ).materialize_all()
@@ -135,7 +136,7 @@ def test_importers_finds_third_party_dist(tmp_path, write_files):
             return ()
 
     Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[_Capture()],
         project_root=tmp_path,
     ).materialize_all()
@@ -160,7 +161,7 @@ def test_importers_unknown_returns_empty(tmp_path, write_files):
             return ()
 
     Analysis(
-        {tmp_path: []},
+        build_trees({tmp_path: []}),
         plugins=[_Capture()],
         project_root=tmp_path,
     ).materialize_all()
