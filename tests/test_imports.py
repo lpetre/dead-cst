@@ -8,6 +8,7 @@ the fixture so individual cases only list the edges they introduce.
 
 import pytest
 
+from dead_cst import Analysis
 from dead_cst.plugins._core import EXTERNAL_PREFIXES
 
 IMPORT_TEST_FILES = {
@@ -523,3 +524,42 @@ def test_third_party_import_creates_synthetic_node(build_decl_graph):
 
     edge_srcs = {src.fqname for src, dst in graph.edges(keys=False) if dst in nx_nodes}
     assert {"p.uses_nx.nx", "p.uses_nx.build"} <= edge_srcs
+
+
+def test_cross_dep_submodule_import(tmp_path, assert_edges):
+    """Importing a submodule from a dep base resolves through the dep's exported trie.
+
+    Layout:
+        pkg_a/A/__init__.py  -- empty package
+        pkg_a/A/sub.py       -- def f(): ...
+        pkg_b/B/__init__.py  -- from A import sub; sub.f()
+
+    PathMap: {pkg_b: [pkg_a], pkg_a: []}
+
+    ``A.sub`` lives in the dep's exported trie, not the consumer's own
+    trie. ``resolve_edges`` must find it via the merged ``symbol_lookup``
+    and follow the submodule through ``cur.children`` (since ``A/__init__.py``
+    has no explicit ``import sub`` declaration -- the name resolves as a
+    real submodule path).
+    """
+    pkg_a = tmp_path / "pkg_a"
+    pkg_b = tmp_path / "pkg_b"
+    (pkg_a / "A").mkdir(parents=True)
+    (pkg_b / "B").mkdir(parents=True)
+    (pkg_a / "A" / "__init__.py").write_text("")
+    (pkg_a / "A" / "sub.py").write_text("def f(): ...\n")
+    (pkg_b / "B" / "__init__.py").write_text("from A import sub\nsub.f()\n")
+
+    graph = Analysis({pkg_b: [pkg_a], pkg_a: []}).materialize_all()
+    assert_edges(
+        graph,
+        {
+            "A.sub -> A",
+            "A.sub.f -> A.sub",
+            "B -> A.sub",
+            "B -> A.sub.f",
+            "B -> B.sub",
+            "B.sub -> A.sub",
+            "B.sub -> B",
+        },
+    )

@@ -92,7 +92,9 @@ def resolve_edges(
 
                     # Concrete decl terminates this continuation;
                     # trailing attrs like ``.build`` are ignored.
-                    if decl.type in {"function", "class", "variable"}:
+                    # ``type_alias`` (PEP 695 ``type X = ...``) is a
+                    # concrete declaration, not an import re-export.
+                    if decl.type in {"function", "class", "variable", "type_alias"}:
                         continue
 
                     # Import re-export: follow it without advancing

@@ -79,6 +79,7 @@ from ..contrib.click import ClickPlugin
 from ..contrib.cyclopts import CycloptsPlugin
 from ..contrib.fastapi import FastAPIPlugin
 from ..contrib.flask import FlaskPlugin
+from ..contrib.mock_patch import MockPatchPlugin
 from ..contrib.pytest import PytestPlugin
 from ..contrib.typer import TyperPlugin
 from ..contrib.unittest import UnittestPlugin
@@ -96,6 +97,7 @@ BUILTIN_PLUGINS: dict[str, type] = {
     ModuleDundersPlugin.name: ModuleDundersPlugin,
     PytestPlugin.name: PytestPlugin,
     UnittestPlugin.name: UnittestPlugin,
+    MockPatchPlugin.name: MockPatchPlugin,
     FastAPIPlugin.name: FastAPIPlugin,
     FlaskPlugin.name: FlaskPlugin,
     TyperPlugin.name: TyperPlugin,
@@ -137,6 +139,7 @@ __all__ = [
     "InitSubclassPlugin",
     "LiteralListPlugin",
     "MainBlockPlugin",
+    "MockPatchPlugin",
     "ModuleDundersPlugin",
     "ObserveContext",
     "PluginContext",
