@@ -112,6 +112,26 @@ class UvResolver:
                     search_trees=tuple(search),
                 )
             )
+            member_dir = member_dirs[name]
+            if member_dir != tree_root:
+                # The exported tree is a strict subdir of the member
+                # (typical ``src/`` layout). Emit a non-exported tree
+                # at the member root so dead-cst walks ``tests/``,
+                # ``scripts/``, root-level ``conftest.py``, etc. that
+                # live alongside the exported tree but aren't shipped
+                # in the wheel. ``search_trees`` includes the
+                # exported tree (so tests can ``import`` the package
+                # under test) plus every workspace dep's exported
+                # tree (so tests can use the same workspace deps the
+                # exported code does).
+                out.append(
+                    SourceTree(
+                        path=member_dir,
+                        package=name,
+                        flags=SourceTreeFlags.NONE,
+                        search_trees=(tree_root, *search),
+                    )
+                )
         return out
 
     def resolve_import(self, name: str, search_paths: list[Path]) -> str | Path | None:

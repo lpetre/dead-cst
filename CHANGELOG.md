@@ -32,6 +32,16 @@ two versions.
   spirit -- it reads `uv.lock` -- but the new name reflects that it
   handles single-package uv projects too, not just multi-member
   workspaces.
+- `UvResolver` now emits a non-exported `SourceTree` at the member
+  root (in addition to the exported tree at the wheel-target dir)
+  when the exported tree is a strict subdirectory. For src-layout
+  members this walks `tests/`, `scripts/`, root-level
+  `conftest.py`, and other files that live alongside `src/` but
+  aren't shipped in the wheel; previously those were silently
+  ignored. Search refs on the rest tree include the package's own
+  exported tree plus every workspace dep's exported tree, so tests
+  resolve `from <package> import ...` and workspace-dep imports
+  the same way the production code does.
 - `dead-cst` no longer threads venv `site-packages` paths through the
   resolver protocol. Run `dead-cst` with the project's virtual
   environment active (`uv run dead-cst ...` or activate the venv
