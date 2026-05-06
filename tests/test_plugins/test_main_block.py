@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from dead_cst import Analysis
+from dead_cst.resolvers import ManualResolver
 from dead_cst.plugins import MainBlockPlugin
-from conftest import build_trees
 
 
 def test_main_block_plugin_marks_module_entrypoint(tmp_path, write_files, reachable_fqnames):
@@ -21,9 +21,9 @@ def test_main_block_plugin_marks_module_entrypoint(tmp_path, write_files, reacha
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[MainBlockPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     reached = reachable_fqnames(graph)
     assert "pkg.script" in reached
@@ -58,9 +58,9 @@ def test_main_block_keeps_block_decls_alive(tmp_path, write_files, reachable_fqn
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[MainBlockPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     reached = reachable_fqnames(graph)
     assert {"pkg.script", "pkg.script.app", "pkg.script.Foo", "pkg.script.main"} <= reached
@@ -85,9 +85,9 @@ def test_main_block_keeps_nested_block_decls_alive(tmp_path, write_files, reacha
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[MainBlockPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     reached = reachable_fqnames(graph)
     assert {"pkg.script.app", "pkg.script.Foo"} <= reached
@@ -106,8 +106,8 @@ def test_main_block_reversed_comparison(tmp_path, write_files, reachable_fqnames
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[MainBlockPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     assert "pkg.script" in reachable_fqnames(graph)

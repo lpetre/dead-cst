@@ -23,7 +23,7 @@ from dead_cst import Analysis
 from dead_cst.analyze import _find_reachable as find_reachable
 from dead_cst.codemod import RemoveDeadSymbols, remove_code
 from dead_cst._fqn import FixedFullyQualifiedNameProvider
-from conftest import build_trees
+from dead_cst.resolvers import ManualResolver
 
 
 def _normalise(s: str) -> str:
@@ -50,7 +50,7 @@ def apply_transformer(tmp_path):
     def _apply(src: str, dead_fqnames: set[str]) -> str:
         path = tmp_path / "mod.py"
         path.write_text(_normalise(src))
-        graph = Analysis(build_trees({tmp_path: []})).materialize_all()
+        graph = Analysis(tmp_path, resolvers=[ManualResolver(specs=["."])]).materialize_all()
         dead_decls = {(n.fqname, n.position) for n in graph.nodes if n.fqname in dead_fqnames}
         mgr = FullRepoManager(str(tmp_path), [str(path)], {FixedFullyQualifiedNameProvider})
         wrapper: MetadataWrapper = mgr.get_metadata_wrapper_for_path(str(path))
@@ -70,7 +70,7 @@ def apply_transformer_at_lines(tmp_path):
     def _apply(src: str, dead: set[tuple[str, int]]) -> str:
         path = tmp_path / "mod.py"
         path.write_text(_normalise(src))
-        graph = Analysis(build_trees({tmp_path: []})).materialize_all()
+        graph = Analysis(tmp_path, resolvers=[ManualResolver(specs=["."])]).materialize_all()
         dead_decls = {
             (n.fqname, n.position) for n in graph.nodes if (n.fqname, n.position.start.line) in dead
         }
@@ -95,7 +95,7 @@ def run_remove_code(tmp_path):
             path = tmp_path / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(_normalise(src))
-        graph = Analysis(build_trees({tmp_path: []})).materialize_all()
+        graph = Analysis(tmp_path, resolvers=[ManualResolver(specs=["."])]).materialize_all()
         for node in graph.nodes:
             if node.fqname in entrypoints:
                 graph.nodes[node]["entrypoint"] = True

@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 from dead_cst import Analysis
+from dead_cst.resolvers import ManualResolver
 from dead_cst.plugins import (
     ClickPlugin,
     ExplicitEntrypointPlugin,
     MainBlockPlugin,
 )
-from conftest import build_trees
 
 
 def test_click_plugin_marks_command_handlers(tmp_path, write_files, reachable_fqnames):
@@ -38,9 +38,9 @@ def test_click_plugin_marks_command_handlers(tmp_path, write_files, reachable_fq
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[MainBlockPlugin(), ClickPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     reached = reachable_fqnames(graph)
     assert "cli.main.cli" in reached
@@ -82,9 +82,9 @@ def test_click_plugin_keeps_handler_dependencies_alive(tmp_path, write_files, re
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[MainBlockPlugin(), ClickPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     reached = reachable_fqnames(graph)
     assert "cli.main.show" in reached
@@ -111,9 +111,9 @@ def test_click_plugin_reachable_via_explicit_entrypoint(tmp_path, write_files, r
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[ExplicitEntrypointPlugin(specs=["cli.main.cli"]), ClickPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     reached = reachable_fqnames(graph)
     assert "cli.main.cli" in reached
@@ -139,9 +139,9 @@ def test_click_plugin_does_not_seed_entrypoint(tmp_path, write_files, reachable_
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[ClickPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     reached = reachable_fqnames(graph)
     assert "cli.main.cli" not in reached
@@ -178,9 +178,9 @@ def test_click_plugin_unused_subgroup_stays_dead(tmp_path, write_files, reachabl
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[MainBlockPlugin(), ClickPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     reached = reachable_fqnames(graph)
     assert "cli.main.hello" in reached
@@ -219,9 +219,9 @@ def test_click_plugin_subgroup_reachable_via_add_command(tmp_path, write_files, 
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[MainBlockPlugin(), ClickPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     reached = reachable_fqnames(graph)
     assert "cli.main.cli" in reached
@@ -253,9 +253,9 @@ def test_click_plugin_subgroup_via_decorator(tmp_path, write_files, reachable_fq
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[MainBlockPlugin(), ClickPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     reached = reachable_fqnames(graph)
     assert "cli.main.cli" in reached
@@ -282,9 +282,9 @@ def test_click_plugin_handles_from_click_import_group(tmp_path, write_files, rea
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[MainBlockPlugin(), ClickPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     assert "cli.main.hello" in reachable_fqnames(graph)
 
@@ -308,9 +308,9 @@ def test_click_plugin_handles_aliased_module_import(tmp_path, write_files, reach
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[MainBlockPlugin(), ClickPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     assert "cli.main.hello" in reachable_fqnames(graph)
 
@@ -334,9 +334,9 @@ def test_click_plugin_handles_aliased_decorator_import(tmp_path, write_files, re
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[MainBlockPlugin(), ClickPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     assert "cli.main.hello" in reachable_fqnames(graph)
 
@@ -359,9 +359,9 @@ def test_click_plugin_handles_explicit_constructor(tmp_path, write_files, reacha
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[MainBlockPlugin(), ClickPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     assert "cli.main.hello" in reachable_fqnames(graph)
 
@@ -388,9 +388,9 @@ def test_click_plugin_ignores_bare_decorators(tmp_path, write_files, reachable_f
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[MainBlockPlugin(), ClickPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     # Bare ``@command`` (no attribute access) is not a Click registration --
     # matching it would clobber unrelated decorators with the same name.
@@ -414,9 +414,9 @@ def test_click_plugin_ignores_unrelated_decorators(tmp_path, write_files, reacha
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[ClickPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     # ``t`` isn't a Click group, so its ``.command`` decorator is ignored.
     assert "pkg.mod.not_a_command" not in reachable_fqnames(graph)
@@ -440,9 +440,9 @@ def test_click_plugin_does_nothing_without_click_imports(tmp_path, write_files, 
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[ClickPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     # ``cli`` here is not a Click group -- no ``click`` import in scope.
     assert "pkg.mod.looks_like_command" not in reachable_fqnames(graph)
@@ -473,9 +473,9 @@ def test_click_plugin_multiple_groups_in_one_module(tmp_path, write_files, reach
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[MainBlockPlugin(), ClickPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     reached = reachable_fqnames(graph)
     # ``cli`` is reached via the main block; its command is alive.
@@ -508,9 +508,9 @@ def test_click_plugin_ignores_import_star(tmp_path, write_files, reachable_fqnam
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[MainBlockPlugin(), ClickPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     # No instance edge from ``cli`` to ``hello`` because the plugin ignores
     # star imports.
@@ -531,9 +531,9 @@ def test_click_plugin_does_nothing_when_click_not_installed(
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[ClickPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     assert "pkg.mod.helper" not in reachable_fqnames(graph)
 
@@ -556,9 +556,9 @@ def test_click_plugin_ignores_relative_imports_and_unrelated_names(
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[ClickPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     assert "cli.main.helper" not in reachable_fqnames(graph)
 
@@ -582,9 +582,9 @@ def test_click_plugin_no_groups_when_click_imported_but_unused(
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[ClickPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     assert "cli.main.helper" not in reachable_fqnames(graph)
 
@@ -639,9 +639,9 @@ def test_click_plugin_ignores_non_group_assignment_shapes(tmp_path, write_files,
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[MainBlockPlugin(), ClickPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     reached = reachable_fqnames(graph)
     assert "cli.main.cli" in reached

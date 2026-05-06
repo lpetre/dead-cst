@@ -3,16 +3,16 @@
 from __future__ import annotations
 
 from dead_cst import Analysis
+from dead_cst.resolvers import ManualResolver
 from dead_cst.plugins import ModuleDundersPlugin
-from conftest import build_trees
 
 
 def test_keeps_all_alive(tmp_path, write_files, reachable_fqnames):
     write_files({"pkg/__init__.py": '__all__ = ["a"]\na = 1'})
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[ModuleDundersPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     reached = reachable_fqnames(graph)
     assert "pkg.__all__" in reached
@@ -30,9 +30,9 @@ def test_keeps_other_dunders_alive(tmp_path, write_files, reachable_fqnames):
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[ModuleDundersPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     reached = reachable_fqnames(graph)
     assert {"pkg.__version__", "pkg.__author__", "pkg.__license__"} <= reached
@@ -49,9 +49,9 @@ def test_keeps_future_imports_alive(tmp_path, write_files, reachable_fqnames):
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[ModuleDundersPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     reached = reachable_fqnames(graph)
     # The local bindings of ``from __future__ import X`` are kept alive
@@ -68,9 +68,9 @@ def test_ignores_non_future_imports_with_plain_names(tmp_path, write_files, reac
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[ModuleDundersPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     reached = reachable_fqnames(graph)
     # Non-``__future__`` imports of plain names stay dead absent another entrypoint.
@@ -88,9 +88,9 @@ def test_ignores_non_dunder_underscore_names(tmp_path, write_files, reachable_fq
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[ModuleDundersPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     reached = reachable_fqnames(graph)
     assert "pkg._private" not in reached

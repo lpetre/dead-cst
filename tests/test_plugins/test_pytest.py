@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from dead_cst import Analysis
+from dead_cst.resolvers import ManualResolver
 from dead_cst.plugins import PytestPlugin
-from conftest import build_trees
 
 
 def test_pytest_plugin_marks_test_functions(tmp_path, write_files, reachable_fqnames):
@@ -19,9 +19,9 @@ def test_pytest_plugin_marks_test_functions(tmp_path, write_files, reachable_fqn
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[PytestPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     reached = reachable_fqnames(graph)
     assert "tests.test_things.test_one" in reached
@@ -38,9 +38,9 @@ def test_pytest_plugin_recognizes_underscore_test_suffix(tmp_path, write_files, 
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[PytestPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     assert "pkg.things_test.test_one" in reachable_fqnames(graph)
 
@@ -58,9 +58,9 @@ def test_pytest_plugin_marks_test_classes(tmp_path, write_files, reachable_fqnam
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[PytestPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     reached = reachable_fqnames(graph)
     assert "tests.test_cls.TestThing" in reached
@@ -86,9 +86,9 @@ def test_pytest_plugin_marks_conftest_decls(tmp_path, write_files, reachable_fqn
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[PytestPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     reached = reachable_fqnames(graph)
     assert "tests.conftest.my_fixture" in reached
@@ -124,9 +124,9 @@ def test_pytest_plugin_marks_decorated_fixtures_outside_conftest(
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[PytestPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     reached = reachable_fqnames(graph)
     assert "tests.fixtures.bare_fixture" in reached
@@ -146,9 +146,9 @@ def test_pytest_plugin_ignores_non_test_modules(tmp_path, write_files, reachable
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[PytestPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     reached = reachable_fqnames(graph)
     # ``utils.py`` isn't a pytest-discovered file even though its symbols

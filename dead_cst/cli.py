@@ -35,7 +35,6 @@ from .resolvers import (
     ManualResolver,
     PathResolver,
     SourceTree,
-    SourceTreeFlags,
     load_resolver,
 )
 
@@ -120,41 +119,25 @@ def _maybe_cache(
         yield cache
 
 
-def resolve_trees(
-    root: Path, path_specs: list[str], resolver_names: list[str]
-) -> tuple[list[SourceTree], list[PathResolver]]:
+def build_resolvers(path_specs: list[str], resolver_names: list[str]) -> list[PathResolver]:
     """Build the resolver chain from ``-p`` specs and ``--resolver`` names.
 
     ``-p`` specs become a :class:`ManualResolver` and slot into the
     chain alongside named resolvers, so explicit specs participate in
-    :meth:`PathResolver.resolve_import` lookups too. Returns the
-    union of every resolver's :class:`SourceTree` list and the
-    resolver instances themselves.
+    :meth:`PathResolver.resolve_import` lookups too.
 
-    With no ``-p`` and no ``--resolver``, the analyzer falls back to
-    treating ``root`` as a single ``EXPORTED`` :class:`SourceTree`
-    (the simplest "analyze this directory" default).
+    With no ``-p`` and no ``--resolver``, default to a single
+    ``ManualResolver(specs=["."])`` so the friendly "analyze this
+    directory" CLI default keeps working without the user having to
+    spell it out.
     """
     resolvers: list[PathResolver] = []
     if path_specs:
         resolvers.append(ManualResolver(specs=path_specs))
     resolvers.extend(load_resolver(name) for name in resolver_names)
     if not resolvers:
-        return (
-            [
-                SourceTree(
-                    path=root,
-                    package=root.name or "root",
-                    flags=SourceTreeFlags.EXPORTED,
-                    search_trees=(),
-                )
-            ],
-            [],
-        )
-    trees: list[SourceTree] = []
-    for r in resolvers:
-        trees.extend(r.resolve(root))
-    return trees, resolvers
+        resolvers.append(ManualResolver(specs=["."]))
+    return resolvers
 
 
 def _trees_for_reporting(
@@ -226,7 +209,7 @@ def analyze(
     setup_logging(verbose)
     root = root.resolve()
 
-    trees, resolvers = resolve_trees(root, path or [], resolver or [])
+    resolvers = build_resolvers(path or [], resolver or [])
 
     typer.echo(f"Building symbol graph for {root}...", err=True)
     plugins = build_plugins(
@@ -234,14 +217,15 @@ def analyze(
         plugin_names=plugin or [],
     )
     with _maybe_cache(root, no_cache) as cache:
-        graph = Analysis(
-            trees,
-            plugins=plugins,
+        analysis = Analysis(
+            root,
             resolvers=resolvers,
-            project_root=root,
+            plugins=plugins,
             cache=cache,
             workers=workers,
-        ).materialize_all()
+        )
+        graph = analysis.materialize_all()
+    trees = analysis.source_trees
     reachable = _find_reachable(graph)
 
     unreachable_graph = graph.subgraph([n for n in graph.nodes if n not in reachable])
@@ -383,7 +367,7 @@ def why_alive(
     setup_logging(verbose)
     root = root.resolve()
 
-    trees, resolvers = resolve_trees(root, path or [], resolver or [])
+    resolvers = build_resolvers(path or [], resolver or [])
 
     typer.echo(f"Building symbol graph for {root}...", err=True)
     plugins = build_plugins(
@@ -392,10 +376,9 @@ def why_alive(
     )
     with _maybe_cache(root, no_cache) as cache:
         graph = Analysis(
-            trees,
-            plugins=plugins,
+            root,
             resolvers=resolvers,
-            project_root=root,
+            plugins=plugins,
             cache=cache,
             workers=workers,
         ).materialize_all()
@@ -460,17 +443,18 @@ def dependencies(
     setup_logging(verbose)
     root = root.resolve()
 
-    trees, resolvers = resolve_trees(root, path or [], resolver or [])
+    resolvers = build_resolvers(path or [], resolver or [])
 
     typer.echo(f"Building symbol graph for {root}...", err=True)
     with _maybe_cache(root, no_cache) as cache:
-        graph = Analysis(
-            trees,
+        analysis = Analysis(
+            root,
             resolvers=resolvers,
-            project_root=root,
             cache=cache,
             workers=workers,
-        ).materialize_all()
+        )
+        graph = analysis.materialize_all()
+    trees = analysis.source_trees
 
     deps_by_tree: dict[Path, list[SymbolNode]] = {tree.path: [] for tree in trees}
     for node in graph.nodes:
@@ -531,7 +515,7 @@ def unused_exports(
     setup_logging(verbose)
     root = root.resolve()
 
-    trees, resolvers = resolve_trees(root, path or [], resolver or [])
+    resolvers = build_resolvers(path or [], resolver or [])
 
     typer.echo(f"Building symbol graph for {root}...", err=True)
     plugins = build_plugins(
@@ -540,10 +524,9 @@ def unused_exports(
     )
     with _maybe_cache(root, no_cache) as cache:
         graph = Analysis(
-            trees,
-            plugins=plugins,
+            root,
             resolvers=resolvers,
-            project_root=root,
+            plugins=plugins,
             cache=cache,
             workers=workers,
         ).materialize_all()
@@ -616,7 +599,7 @@ def remove(
     setup_logging(verbose)
     root = root.resolve()
 
-    trees, resolvers = resolve_trees(root, path or [], resolver or [])
+    resolvers = build_resolvers(path or [], resolver or [])
 
     typer.echo(f"Building symbol graph for {root}...", err=True)
     plugins = build_plugins(
@@ -624,14 +607,15 @@ def remove(
         plugin_names=plugin or [],
     )
     with _maybe_cache(root, no_cache) as cache:
-        graph = Analysis(
-            trees,
-            plugins=plugins,
+        analysis = Analysis(
+            root,
             resolvers=resolvers,
-            project_root=root,
+            plugins=plugins,
             cache=cache,
             workers=workers,
-        ).materialize_all()
+        )
+        graph = analysis.materialize_all()
+    trees = analysis.source_trees
     reachable = _find_reachable(graph)
 
     unreachable_graph = graph.subgraph([n for n in graph.nodes if n not in reachable])

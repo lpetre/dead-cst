@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 from dead_cst import Analysis
+from dead_cst.resolvers import ManualResolver
 from dead_cst.plugins import (
     ExplicitEntrypointPlugin,
     InitSubclassPlugin,
     MainBlockPlugin,
 )
 from dead_cst.plugins.init_subclass import INIT_SUBCLASS_PREFIX
-from conftest import build_trees
 
 
 def test_init_subclass_keeps_subclass_alive_via_parent(tmp_path, write_files, reachable_fqnames):
@@ -39,12 +39,12 @@ def test_init_subclass_keeps_subclass_alive_via_parent(tmp_path, write_files, re
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[
             ExplicitEntrypointPlugin(specs=["pkg.base.Plugin"]),
             InitSubclassPlugin(),
         ],
-        project_root=tmp_path,
     ).materialize_all()
     reached = reachable_fqnames(graph)
     # Parent is alive via the explicit entrypoint, so its subclasses come along.
@@ -73,12 +73,12 @@ def test_init_subclass_transitive_subclasses(tmp_path, write_files, reachable_fq
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[
             ExplicitEntrypointPlugin(specs=["pkg.mod.Root"]),
             InitSubclassPlugin(),
         ],
-        project_root=tmp_path,
     ).materialize_all()
     reached = reachable_fqnames(graph)
     assert "pkg.mod.Root" in reached
@@ -106,9 +106,9 @@ def test_init_subclass_does_not_seed_parent_entrypoint(tmp_path, write_files, re
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[InitSubclassPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     reached = reachable_fqnames(graph)
     assert "pkg.base.Plugin" not in reached
@@ -151,9 +151,9 @@ def test_init_subclass_via_main_block(tmp_path, write_files, reachable_fqnames):
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[MainBlockPlugin(), InitSubclassPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     reached = reachable_fqnames(graph)
     assert "pkg.base.Handler" in reached
@@ -179,12 +179,12 @@ def test_init_subclass_aliased_import(tmp_path, write_files, reachable_fqnames):
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[
             ExplicitEntrypointPlugin(specs=["pkg.base.Plugin"]),
             InitSubclassPlugin(),
         ],
-        project_root=tmp_path,
     ).materialize_all()
     assert "pkg.impls.Foo" in reachable_fqnames(graph)
 
@@ -207,12 +207,12 @@ def test_init_subclass_dotted_attribute_base(tmp_path, write_files, reachable_fq
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[
             ExplicitEntrypointPlugin(specs=["pkg.base.Plugin"]),
             InitSubclassPlugin(),
         ],
-        project_root=tmp_path,
     ).materialize_all()
     assert "pkg.impls.Foo" in reachable_fqnames(graph)
 
@@ -239,12 +239,12 @@ def test_init_subclass_class_without_init_subclass_no_edges(
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[
             ExplicitEntrypointPlugin(specs=["pkg.base.Plain"]),
             InitSubclassPlugin(),
         ],
-        project_root=tmp_path,
     ).materialize_all()
     reached = reachable_fqnames(graph)
     assert "pkg.base.Plain" in reached
@@ -283,12 +283,12 @@ def test_init_subclass_keeps_subclass_method_references_alive(
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[
             ExplicitEntrypointPlugin(specs=["pkg.base.Plugin"]),
             InitSubclassPlugin(),
         ],
-        project_root=tmp_path,
     ).materialize_all()
     reached = reachable_fqnames(graph)
     assert "pkg.impls.Foo" in reached
@@ -320,12 +320,12 @@ def test_init_subclass_subscripted_base(tmp_path, write_files, reachable_fqnames
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[
             ExplicitEntrypointPlugin(specs=["pkg.base.Plugin"]),
             InitSubclassPlugin(),
         ],
-        project_root=tmp_path,
     ).materialize_all()
     assert "pkg.impls.Foo" in reachable_fqnames(graph)
 
@@ -350,12 +350,12 @@ def test_init_subclass_marker_in_predecessor_chain(tmp_path, write_files):
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[
             ExplicitEntrypointPlugin(specs=["pkg.base.Plugin"]),
             InitSubclassPlugin(),
         ],
-        project_root=tmp_path,
     ).materialize_all()
     foo = next(n for n in graph.nodes if n.fqname == "pkg.impls.Foo")
     preds = list(graph.predecessors(foo))

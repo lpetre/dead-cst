@@ -32,8 +32,7 @@ from dead_cst.cache import (
 )
 from dead_cst.cli import app
 from dead_cst.graph import VisitorPayload
-from dead_cst.resolvers import ManualResolver
-from conftest import build_trees
+from dead_cst.resolvers import ManualResolver, PyprojectResolver
 
 
 def _write(root: Path, files: dict[str, str]) -> None:
@@ -347,13 +346,17 @@ def test_build_symbol_graph_cached_matches_uncached(tmp_path):
             """,
         },
     )
-    cold = Analysis(build_trees({tmp_path: []})).materialize_all()
+    cold = Analysis(tmp_path, resolvers=[ManualResolver(specs=["."])]).materialize_all()
 
     db = tmp_path / CACHE_DIR_NAME / "cache.db"
     with GraphCache(db) as cache:
-        first = Analysis(build_trees({tmp_path: []}), cache=cache).materialize_all()
+        first = Analysis(
+            tmp_path, resolvers=[ManualResolver(specs=["."])], cache=cache
+        ).materialize_all()
     with GraphCache(db) as cache:
-        warm = Analysis(build_trees({tmp_path: []}), cache=cache).materialize_all()
+        warm = Analysis(
+            tmp_path, resolvers=[ManualResolver(specs=["."])], cache=cache
+        ).materialize_all()
 
     assert _node_set(first) == _node_set(cold)
     assert _node_set(warm) == _node_set(cold)
@@ -372,7 +375,7 @@ def test_warm_run_skips_visitor(tmp_path, monkeypatch):
     )
     db = tmp_path / CACHE_DIR_NAME / "cache.db"
     with GraphCache(db) as cache:
-        Analysis(build_trees({tmp_path: []}), cache=cache).materialize_all()
+        Analysis(tmp_path, resolvers=[ManualResolver(specs=["."])], cache=cache).materialize_all()
 
     from dead_cst import analyze
 
@@ -385,7 +388,7 @@ def test_warm_run_skips_visitor(tmp_path, monkeypatch):
 
     monkeypatch.setattr(analyze, "SymbolVisitor", _spy)
     with GraphCache(db) as cache:
-        Analysis(build_trees({tmp_path: []}), cache=cache).materialize_all()
+        Analysis(tmp_path, resolvers=[ManualResolver(specs=["."])], cache=cache).materialize_all()
     assert calls == []
 
 
@@ -439,7 +442,9 @@ def test_warm_run_with_plugins_parses_zero_files(tmp_path, monkeypatch):
     db = tmp_path / CACHE_DIR_NAME / "cache.db"
 
     with GraphCache(db) as cache:
-        Analysis(build_trees({tmp_path: []}), plugins=plugins, cache=cache).materialize_all()
+        Analysis(
+            tmp_path, resolvers=[ManualResolver(specs=["."])], plugins=plugins, cache=cache
+        ).materialize_all()
 
     visitor_calls: list[object] = []
     wrapper_calls: list[object] = []
@@ -472,7 +477,9 @@ def test_warm_run_with_plugins_parses_zero_files(tmp_path, monkeypatch):
     monkeypatch.setattr(analyze.FixedFullyQualifiedNameProvider, "gen_cache", classmethod(_fqn_spy))
 
     with GraphCache(db) as cache:
-        Analysis(build_trees({tmp_path: []}), plugins=plugins, cache=cache).materialize_all()
+        Analysis(
+            tmp_path, resolvers=[ManualResolver(specs=["."])], plugins=plugins, cache=cache
+        ).materialize_all()
 
     assert visitor_calls == []
     assert wrapper_calls == []
@@ -492,7 +499,7 @@ def test_edited_file_re_runs_visitor(tmp_path, monkeypatch):
     )
     db = tmp_path / CACHE_DIR_NAME / "cache.db"
     with GraphCache(db) as cache:
-        Analysis(build_trees({tmp_path: []}), cache=cache).materialize_all()
+        Analysis(tmp_path, resolvers=[ManualResolver(specs=["."])], cache=cache).materialize_all()
 
     (tmp_path / "pkg" / "a.py").write_text("def f(): return 1\n")
 
@@ -507,7 +514,7 @@ def test_edited_file_re_runs_visitor(tmp_path, monkeypatch):
 
     monkeypatch.setattr(analyze, "SymbolVisitor", _spy)
     with GraphCache(db) as cache:
-        Analysis(build_trees({tmp_path: []}), cache=cache).materialize_all()
+        Analysis(tmp_path, resolvers=[ManualResolver(specs=["."])], cache=cache).materialize_all()
 
     assert visited == [tmp_path / "pkg" / "a.py"]
 
@@ -525,7 +532,7 @@ def test_resolver_change_forces_full_rebuild_for_that_base(tmp_path, monkeypatch
     )
     db = tmp_path / CACHE_DIR_NAME / "cache.db"
     with GraphCache(db) as cache:
-        Analysis(build_trees({tmp_path: []}), cache=cache).materialize_all()
+        Analysis(tmp_path, resolvers=[ManualResolver(specs=["."])], cache=cache).materialize_all()
 
     from dead_cst import analyze
 
@@ -538,8 +545,14 @@ def test_resolver_change_forces_full_rebuild_for_that_base(tmp_path, monkeypatch
 
     monkeypatch.setattr(analyze, "SymbolVisitor", _spy)
     with GraphCache(db) as cache:
+        # Add a second (no-tree) resolver to the chain. PyprojectResolver
+        # returns ``[]`` when there's no pyproject.toml, so it doesn't
+        # change the tree set; but its (name, version) flows into the
+        # per-tree fingerprint, which is the property under test.
         Analysis(
-            build_trees({tmp_path: []}), resolvers=[ManualResolver(specs=[])], cache=cache
+            tmp_path,
+            resolvers=[ManualResolver(specs=["."]), PyprojectResolver()],
+            cache=cache,
         ).materialize_all()
     assert {p.name for p in visited} == {"__init__.py", "a.py", "b.py"}
 
@@ -564,11 +577,15 @@ def test_plugin_contributions_survive_warm_cache(tmp_path):
     plugins = [MainBlockPlugin()]
 
     with GraphCache(db) as cache:
-        cold = Analysis(build_trees({tmp_path: []}), plugins=plugins, cache=cache).materialize_all()
+        cold = Analysis(
+            tmp_path, resolvers=[ManualResolver(specs=["."])], plugins=plugins, cache=cache
+        ).materialize_all()
     cold_entrypoints = {n.fqname for n, a in cold.nodes(data=True) if a.get("entrypoint")}
 
     with GraphCache(db) as cache:
-        warm = Analysis(build_trees({tmp_path: []}), plugins=plugins, cache=cache).materialize_all()
+        warm = Analysis(
+            tmp_path, resolvers=[ManualResolver(specs=["."])], plugins=plugins, cache=cache
+        ).materialize_all()
     warm_entrypoints = {n.fqname for n, a in warm.nodes(data=True) if a.get("entrypoint")}
 
     assert cold_entrypoints == warm_entrypoints
@@ -590,7 +607,9 @@ def test_plugin_version_bump_invalidates_cache(tmp_path, monkeypatch):
 
     plugins_v1 = [MainBlockPlugin()]
     with GraphCache(db) as cache:
-        Analysis(build_trees({tmp_path: []}), plugins=plugins_v1, cache=cache).materialize_all()
+        Analysis(
+            tmp_path, resolvers=[ManualResolver(specs=["."])], plugins=plugins_v1, cache=cache
+        ).materialize_all()
 
     bumped = MainBlockPlugin()
     bumped.version = "2"
@@ -606,7 +625,9 @@ def test_plugin_version_bump_invalidates_cache(tmp_path, monkeypatch):
 
     monkeypatch.setattr(analyze, "SymbolVisitor", _spy)
     with GraphCache(db) as cache:
-        Analysis(build_trees({tmp_path: []}), plugins=[bumped], cache=cache).materialize_all()
+        Analysis(
+            tmp_path, resolvers=[ManualResolver(specs=["."])], plugins=[bumped], cache=cache
+        ).materialize_all()
     assert {p.name for p in visited} == {"__init__.py", "m.py"}
 
 

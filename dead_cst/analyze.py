@@ -553,12 +553,6 @@ def _compose_contribution(
             apply_ops(target_graph, ops)
 
 
-def _infer_project_root(trees: Sequence[SourceTree]) -> Path:
-    if not trees:
-        return Path.cwd()
-    return min((t.path for t in trees), key=lambda p: len(p.parts))
-
-
 def _warn_if_project_venv_inactive(project_root: Path) -> None:
     """Warn when the project has a sibling ``.venv``/``venv`` that
     isn't the running interpreter.
@@ -669,27 +663,23 @@ class Analysis:
 
     def __init__(
         self,
-        source_trees: Sequence[SourceTree],
+        project_root: Path,
         *,
-        plugins: Sequence[EdgePlugin] = (),
         resolvers: Sequence[PathResolver] = (),
-        project_root: Path | None = None,
+        plugins: Sequence[EdgePlugin] = (),
         cache: GraphCache | None = None,
         unreachable_detector: UnreachableRegionDetector | None = None,
         workers: int | None = None,
     ) -> None:
-        self._validated = validate_source_trees(source_trees)
-        self._plugins: tuple[EdgePlugin, ...] = tuple(plugins)
+        self._project_root: Path = project_root.resolve()
         self._resolvers: tuple[PathResolver, ...] = tuple(resolvers)
+        trees: list[SourceTree] = []
+        for r in self._resolvers:
+            trees.extend(r.resolve(self._project_root))
+        self._validated = validate_source_trees(trees)
+        self._plugins: tuple[EdgePlugin, ...] = tuple(plugins)
         self._cache = cache
         self._workers = workers
-        self._project_root: Path = (
-            project_root
-            if project_root is not None
-            else (
-                _infer_project_root(self._validated.trees) if self._validated.trees else Path.cwd()
-            )
-        )
         self._import_resolver: ImportResolver = _chain_resolvers(self._resolvers)
         self._detector: UnreachableRegionDetector = (
             unreachable_detector

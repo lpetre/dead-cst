@@ -1,53 +1,11 @@
 import logging
 import textwrap
-from pathlib import Path
 
 import networkx as nx
 import pytest
 
-from dead_cst import Analysis, EdgeFlags, SourceTree, SourceTreeFlags
-
-
-def build_trees(
-    paths: dict[Path, list[Path]] | Path,
-) -> list[SourceTree]:
-    """Translate a legacy ``{path: [search_paths]}`` mapping (or a single
-    ``Path``) into a :class:`SourceTree` list.
-
-    Each path becomes its own ``EXPORTED`` tree; the package name is
-    derived from the path's stem (or ``"root"`` when empty), with an
-    index suffix to keep names unique. Search paths are interpreted
-    as references to other trees in the dict by path identity.
-    """
-    if isinstance(paths, Path):
-        paths = {paths: []}
-
-    used: dict[str, int] = {}
-
-    def _pkg(path: Path) -> str:
-        stem = path.name or "root"
-        if stem in used:
-            used[stem] += 1
-            return f"{stem}_{used[stem]}"
-        used[stem] = 0
-        return stem
-
-    keys = list(paths)
-    pkg_for: dict[Path, str] = {}
-    for p in keys:
-        pkg_for[p.resolve()] = _pkg(p)
-
-    out: list[SourceTree] = []
-    for p, deps in paths.items():
-        out.append(
-            SourceTree(
-                path=p.resolve(),
-                package=pkg_for[p.resolve()],
-                flags=SourceTreeFlags.EXPORTED,
-                search_trees=tuple(d.resolve() for d in deps),
-            )
-        )
-    return out
+from dead_cst import Analysis, EdgeFlags
+from dead_cst.resolvers import ManualResolver
 
 
 @pytest.fixture
@@ -81,7 +39,7 @@ def build_decl_graph(tmp_path):
             full_path = tmp_path / filename
             full_path.parent.mkdir(parents=True, exist_ok=True)
             full_path.write_text(textwrap.dedent(content).strip())
-        return Analysis(build_trees(tmp_path)).materialize_all()
+        return Analysis(tmp_path, resolvers=[ManualResolver(specs=["."])]).materialize_all()
 
     return _make_graph
 

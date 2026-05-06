@@ -38,7 +38,7 @@ from dead_cst.cli import (
     app,
     build_plugins,
     parse_entrypoint,
-    resolve_trees,
+    build_resolvers,
     setup_logging,
 )
 
@@ -151,26 +151,23 @@ def test_manual_resolver_parses_specs(tmp_path, specs, expected):
         assert tree.flags & SourceTreeFlags.EXPORTED
 
 
-def test_resolve_trees_no_specs_no_resolvers_returns_root(tmp_path):
-    trees, resolvers = resolve_trees(tmp_path, [], [])
-    assert len(trees) == 1
-    assert trees[0].path == tmp_path
-    assert trees[0].flags & SourceTreeFlags.EXPORTED
-    assert resolvers == []
+def test_build_resolvers_no_specs_no_resolvers_defaults_to_dot(tmp_path):
+    """With nothing supplied, the CLI defaults to ``ManualResolver(specs=["."])``."""
+    resolvers = build_resolvers([], [])
+    assert [r.name for r in resolvers] == ["manual"]
+    assert resolvers[0].specs == ["."]
 
 
-def test_resolve_trees_explicit_specs_only(tmp_path):
-    (tmp_path / "src").mkdir()
-    trees, resolvers = resolve_trees(tmp_path, ["src"], [])
-    assert [t.path for t in trees] == [(tmp_path / "src").resolve()]
+def test_build_resolvers_explicit_specs_only(tmp_path):
+    resolvers = build_resolvers(["src"], [])
     # ``-p`` flows through a ManualResolver so its ``resolve_import``
     # is part of the chain alongside any named resolvers.
     assert [r.name for r in resolvers] == ["manual"]
 
 
-def test_resolve_trees_unknown_resolver_raises(tmp_path):
+def test_build_resolvers_unknown_resolver_raises(tmp_path):
     with pytest.raises(KeyError):
-        resolve_trees(tmp_path, [], ["does-not-exist"])
+        build_resolvers([], ["does-not-exist"])
 
 
 # ---------------------------------------------------------------------------

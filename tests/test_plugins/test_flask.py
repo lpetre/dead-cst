@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from dead_cst import Analysis
+from dead_cst.resolvers import ManualResolver
 from dead_cst.plugins import FlaskPlugin
-from conftest import build_trees
 
 
 def test_flask_plugin_marks_route_handlers(tmp_path, write_files, reachable_fqnames):
@@ -39,9 +39,9 @@ def test_flask_plugin_marks_route_handlers(tmp_path, write_files, reachable_fqna
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[FlaskPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     reached = reachable_fqnames(graph)
     assert "app.main.app" in reached
@@ -105,9 +105,9 @@ def test_flask_plugin_marks_lifecycle_and_template_helpers(
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[FlaskPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     reached = reachable_fqnames(graph)
     assert "app.main.before" in reached
@@ -151,9 +151,9 @@ def test_flask_plugin_keeps_handler_dependencies_alive(tmp_path, write_files, re
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[FlaskPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     reached = reachable_fqnames(graph)
     assert "app.main.get_item" in reached
@@ -182,9 +182,9 @@ def test_flask_plugin_ignores_bare_decorators(tmp_path, write_files, reachable_f
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[FlaskPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     # Bare ``@route`` (no attribute access) is not a Flask registration --
     # matching it would clobber unrelated decorators with the same name.
@@ -209,9 +209,9 @@ def test_flask_plugin_ignores_unrelated_decorators(tmp_path, write_files, reacha
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[FlaskPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     assert "pkg.mod.not_a_route" not in reachable_fqnames(graph)
 
@@ -231,9 +231,9 @@ def test_flask_plugin_unused_blueprint_stays_dead(tmp_path, write_files, reachab
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[FlaskPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     reached = reachable_fqnames(graph)
     # No Flask app reaches this blueprint, so it (and its handler) are dead.
@@ -268,9 +268,9 @@ def test_flask_plugin_blueprint_reachable_via_register_blueprint(
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[FlaskPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     reached = reachable_fqnames(graph)
     assert "app.main.app" in reached
@@ -294,9 +294,9 @@ def test_flask_plugin_handles_aliased_class_import(tmp_path, write_files, reacha
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[FlaskPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     assert "app.main.index" in reachable_fqnames(graph)
 
@@ -316,9 +316,9 @@ def test_flask_plugin_handles_module_import(tmp_path, write_files, reachable_fqn
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[FlaskPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     assert "app.main.index" in reachable_fqnames(graph)
 
@@ -338,9 +338,9 @@ def test_flask_plugin_handles_annotated_assignment(tmp_path, write_files, reacha
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[FlaskPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     assert "app.main.index" in reachable_fqnames(graph)
 
@@ -363,9 +363,9 @@ def test_flask_plugin_does_nothing_without_flask_imports(tmp_path, write_files, 
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[FlaskPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     # ``app`` here is not a Flask instance -- no ``flask`` import in scope.
     assert "pkg.mod.looks_like_route" not in reachable_fqnames(graph)
@@ -389,9 +389,9 @@ def test_flask_plugin_ignores_import_star(tmp_path, write_files, reachable_fqnam
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[FlaskPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     assert "app.main.index" not in reachable_fqnames(graph)
 
@@ -410,9 +410,9 @@ def test_flask_plugin_does_nothing_when_flask_not_installed(
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[FlaskPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     assert "pkg.mod.index" not in reachable_fqnames(graph)
 
@@ -438,9 +438,9 @@ def test_flask_plugin_ignores_relative_imports_and_unrelated_names(
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[FlaskPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     # No Flask app or Blueprint anywhere -> helper stays dead.
     assert "app.main.helper" not in reachable_fqnames(graph)
@@ -491,9 +491,9 @@ def test_flask_plugin_ignores_non_decorator_assignment_shapes(
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[FlaskPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     reached = reachable_fqnames(graph)
     # The real app + its ``index`` route are kept alive.
@@ -526,9 +526,9 @@ def test_flask_plugin_module_prefixed_unknown_attr(tmp_path, write_files, reacha
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[FlaskPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     reached = reachable_fqnames(graph)
     assert "app.main.index" in reached
@@ -561,9 +561,9 @@ def test_flask_plugin_handles_factory_function(tmp_path, write_files, reachable_
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[FlaskPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     from dead_cst.analyze import _find_reachable as find_reachable
 
@@ -595,9 +595,9 @@ def test_flask_plugin_factory_returning_blueprint_stays_dead(
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[FlaskPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     reached = reachable_fqnames(graph)
     assert "app.routes.bp" not in reached
@@ -633,9 +633,9 @@ def test_flask_plugin_ignores_non_app_flask_users(tmp_path, write_files, reachab
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[FlaskPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     assert "pkg.mod.handler" not in reachable_fqnames(graph)
 

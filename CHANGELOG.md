@@ -45,6 +45,15 @@ two versions.
   per-tree DAG, per-tree fingerprint, per-tree contributions) are
   still what drive the actual work but they're internal; consumers
   reason about packages.
+- `Analysis.__init__` is now `Analysis(project_root, *, resolvers=(),
+  plugins=(), cache=None, ...)`. The `source_trees` positional arg is
+  gone; the analyzer derives the tree list by calling each resolver's
+  `resolve(project_root)`. Callers that previously hand-built a
+  `list[SourceTree]` should pass a resolver that returns it (e.g.
+  `ManualResolver(specs=[...])`). The CLI gains a one-resolver
+  default of `ManualResolver(specs=["."])` when neither `-p` nor
+  `--resolver` is passed, so `dead-cst analyze /some/dir` keeps
+  working unchanged.
 
 ### Removed
 - `VenvResolver`, `MissingVenvError`, `find_venv_site_packages`. The

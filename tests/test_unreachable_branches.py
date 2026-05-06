@@ -24,7 +24,7 @@ from dead_cst.analyze import (
     _find_kept_alive_by_dead_branches as find_kept_alive_by_dead_branches,
     _find_reachable as find_reachable,
 )
-from conftest import build_trees
+from dead_cst.resolvers import ManualResolver
 
 
 def _dead_suite_positions(graph: nx.MultiDiGraph, file: Path) -> tuple:
@@ -305,7 +305,7 @@ def test_custom_detector_folds_constants(tmp_path, write_files, assert_dead_bran
             return out
 
     graph = Analysis(
-        build_trees({tmp_path: []}), unreachable_detector=IsProdDetector()
+        tmp_path, resolvers=[ManualResolver(specs=["."])], unreachable_detector=IsProdDetector()
     ).materialize_all()
     assert_dead_branch_edges(graph, {"mod -> mod.dev_only"})
 
@@ -332,7 +332,7 @@ def test_default_detector_does_not_flag_named_condition(tmp_path, write_files):
             "settings.py": "IS_PROD = True\n",
         }
     )
-    graph = Analysis(build_trees({tmp_path: []})).materialize_all()
+    graph = Analysis(tmp_path, resolvers=[ManualResolver(specs=["."])]).materialize_all()
     assert _dead_suite_positions(graph, tmp_path / "mod.py") == ()
 
 
@@ -834,7 +834,7 @@ def test_custom_detector_override_folds_call_in_if(tmp_path, write_files):
             return None
 
     graph = Analysis(
-        build_trees({tmp_path: []}), unreachable_detector=FlagAwareDetector()
+        tmp_path, resolvers=[ManualResolver(specs=["."])], unreachable_detector=FlagAwareDetector()
     ).materialize_all()
     dead = {
         f"{src.fqname} -> {dst.fqname}"
@@ -886,7 +886,7 @@ def test_custom_detector_override_folds_through_assignment(tmp_path, write_files
             return None
 
     graph = Analysis(
-        build_trees({tmp_path: []}), unreachable_detector=FlagAwareDetector()
+        tmp_path, resolvers=[ManualResolver(specs=["."])], unreachable_detector=FlagAwareDetector()
     ).materialize_all()
     dead = {
         f"{src.fqname} -> {dst.fqname}"

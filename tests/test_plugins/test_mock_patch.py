@@ -5,9 +5,9 @@ from __future__ import annotations
 import pytest
 
 from dead_cst import Analysis
+from dead_cst.resolvers import ManualResolver
 from dead_cst.contrib.mock_patch import PATCH_TARGET_PREFIX
 from dead_cst.plugins import MockPatchPlugin, PytestPlugin, UnittestPlugin
-from conftest import build_trees
 
 # Each entry is a ``tests/test_lib.py`` body that should keep
 # ``pkg.lib.helper`` alive via a string-fqname patch reference. The id
@@ -123,9 +123,9 @@ def test_recognized_form_keeps_target_alive(tmp_path, write_files, reachable_fqn
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[MockPatchPlugin(), PytestPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     assert "pkg.lib.helper" in reachable_fqnames(graph)
 
@@ -154,9 +154,9 @@ def test_class_method_target_resolves_to_class(tmp_path, write_files, reachable_
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[MockPatchPlugin(), PytestPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     assert "pkg.lib.Cls" in reachable_fqnames(graph)
 
@@ -182,9 +182,9 @@ def test_unrelated_patch_method_not_recognized(tmp_path, write_files, reachable_
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[MockPatchPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     # ``handler`` itself isn't reachable (no entrypoint), so neither is
     # ``helper`` -- the plugin must not have hijacked the unrelated
@@ -209,9 +209,9 @@ def test_no_imports_no_effect(tmp_path, write_files, reachable_fqnames):
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[MockPatchPlugin(), PytestPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     # ``patch`` came from a non-mock module, so the plugin does not
     # treat the string as an fqname reference.
@@ -236,9 +236,9 @@ def test_unittest_testcase_patch(tmp_path, write_files, reachable_fqnames):
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[MockPatchPlugin(), UnittestPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     assert "pkg.lib.helper" in reachable_fqnames(graph)
 
@@ -260,9 +260,9 @@ def test_unresolved_target_is_harmless(tmp_path, write_files, reachable_fqnames)
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[MockPatchPlugin(), PytestPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     assert "pkg.lib.helper" not in reachable_fqnames(graph)
 
@@ -283,9 +283,9 @@ def test_module_target_keeps_module_alive(tmp_path, write_files, reachable_fqnam
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[MockPatchPlugin(), PytestPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     assert "pkg.lib" in reachable_fqnames(graph)
 
@@ -311,9 +311,9 @@ def test_only_marks_target_when_test_alive(tmp_path, write_files, reachable_fqna
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[MockPatchPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     assert "pkg.lib.helper" not in reachable_fqnames(graph)
 
@@ -342,9 +342,9 @@ def test_monkeypatch_setattr_object_form_not_treated_as_fqname(
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[MockPatchPlugin(), PytestPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     synthetics = {n.fqname for n in graph.nodes if n.type == "synthetic"}
     assert f"{PATCH_TARGET_PREFIX}helper" not in synthetics
@@ -366,9 +366,9 @@ def test_monkeypatch_setitem_not_recognized(tmp_path, write_files, reachable_fqn
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[MockPatchPlugin(), PytestPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     assert "pkg.lib.helper" not in reachable_fqnames(graph)
 

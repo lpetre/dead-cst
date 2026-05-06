@@ -255,8 +255,7 @@ def test_uv_flat_layout_with_tests_dirs(tmp_path: Path):
     (libc / "tests" / "__init__.py").write_text("")
     (libc / "tests" / "conftest.py").write_text("import pytest\n")
 
-    trees = UvResolver().resolve(tmp_path)
-    graph = Analysis(trees).materialize_all()
+    graph = Analysis(tmp_path, resolvers=[UvResolver()]).materialize_all()
 
     # The cross-member import resolved: pkg_a/app.py -> libc/foo/c/mod.y
     mod_y = next(n for n in graph.nodes if n.fqname == "foo.c.mod.y" and n.type == "variable")
@@ -329,8 +328,7 @@ def test_uv_shared_namespace_package(tmp_path: Path):
     )
     (foo_b / "foo" / "b" / "__init__.py").write_text("from foo.a import value\n\nresult = value\n")
 
-    trees = UvResolver().resolve(tmp_path)
-    graph = Analysis(trees).materialize_all()
+    graph = Analysis(tmp_path, resolvers=[UvResolver()]).materialize_all()
 
     value = next(n for n in graph.nodes if n.fqname == "foo.a.value" and n.type == "variable")
     result = next(n for n in graph.nodes if n.fqname == "foo.b.result" and n.type == "variable")

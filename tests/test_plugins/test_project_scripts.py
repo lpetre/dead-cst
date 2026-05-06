@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from dead_cst import Analysis
+from dead_cst.resolvers import ManualResolver
 from dead_cst.plugins import ProjectScriptsPlugin
-from conftest import build_trees
 
 
 def test_project_scripts_plugin(tmp_path, write_files, reachable_fqnames):
@@ -21,8 +21,8 @@ def test_project_scripts_plugin(tmp_path, write_files, reachable_fqnames):
         }
     )
     graph = Analysis(
-        build_trees({tmp_path: []}),
+        tmp_path,
+        resolvers=[ManualResolver(specs=["."])],
         plugins=[ProjectScriptsPlugin()],
-        project_root=tmp_path,
     ).materialize_all()
     assert "pkg.cli.main" in reachable_fqnames(graph)
