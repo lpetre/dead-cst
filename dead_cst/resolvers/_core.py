@@ -169,8 +169,6 @@ def validate_source_trees(trees: Iterable[SourceTree]) -> _ValidatedTrees:
                     f"SourceTree {t.path} search_trees references {ref} which is not EXPORTED"
                 )
 
-    # Cycle detection over the search_trees relation. Iterative DFS
-    # keyed on path; detects back-edges into the active stack.
     color: dict[Path, int] = {}  # 0=white, 1=gray, 2=black
     for start in by_path:
         if color.get(start, 0) != 0:
@@ -206,12 +204,12 @@ def assign_file_to_tree(file: Path, trees: Sequence[SourceTree]) -> SourceTree |
 
     Returns the tree whose ``path`` is the longest ancestor of
     ``file`` (including ``file == path``); ``None`` when no tree
-    contains the file. Ties (same prefix length) shouldn't happen for
-    a validated tree list -- paths are unique, so two trees can't
-    share a path -- but we tiebreak deterministically by path string
-    just in case.
+    contains the file. ``file`` should already be absolute and
+    symlink-resolved; the analyzer always passes paths joined under
+    a validated (already-resolved) tree, so we skip a per-call
+    ``Path.resolve()`` stat in the hot per-file routing loop. Ties
+    on prefix length tiebreak by path string to stay deterministic.
     """
-    file = file.resolve()
     best: SourceTree | None = None
     best_len = -1
     for t in trees:

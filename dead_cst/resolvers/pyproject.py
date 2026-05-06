@@ -58,14 +58,9 @@ class PyprojectResolver:
         data = load_toml(project_root / "pyproject.toml")
         if data is None:
             return []
-
-        tool = (
-            data.get("tool", {}).get("dead-cst", {}) if isinstance(data.get("tool"), dict) else {}
-        )
-        explicit = tool.get("trees") if isinstance(tool, dict) else None
+        explicit = data.get("tool", {}).get("dead-cst", {}).get("trees")
         if isinstance(explicit, list):
             return _trees_from_config(project_root, explicit)
-
         return _default_trees(project_root, data)
 
     def resolve_import(self, name: str, search_paths: list[Path]) -> str | Path | None:

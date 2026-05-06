@@ -560,34 +560,28 @@ def _warn_if_project_venv_inactive(project_root: Path) -> None:
     The new contract is "run dead-cst with the project's venv active"
     (e.g. via ``uv run dead-cst``). Without that, third-party imports
     classify as ``[unresolved]`` synthetic nodes and framework plugin
-    lookups (FastAPI, Flask, ...) raise ``UnresolvedDependencyError``.
-    The proactive warning is more actionable than that downstream
-    symptom. When no project venv is discoverable we stay silent --
-    the user may intentionally be analyzing without third-party
-    visibility.
+    lookups raise ``UnresolvedDependencyError``. We stay silent when
+    no project venv is discoverable -- the user may intentionally be
+    analyzing without third-party visibility.
     """
+    candidate = next(
+        (project_root / name for name in (".venv", "venv") if (project_root / name).is_dir()),
+        None,
+    )
+    if candidate is None:
+        return
     try:
-        running = Path(sys.prefix).resolve()
+        if Path(sys.prefix).resolve() == candidate.resolve():
+            return
     except OSError:
         return
-    for name in (".venv", "venv"):
-        candidate = project_root / name
-        if not candidate.is_dir():
-            continue
-        try:
-            resolved = candidate.resolve()
-        except OSError:
-            continue
-        if running == resolved:
-            return
-        logger.warning(
-            "dead-cst is not running inside %s. Third-party imports "
-            "may classify as [unresolved] and framework plugin lookups "
-            "may fail. Re-run via 'uv run dead-cst ...' (or activate "
-            "the venv) for full classification.",
-            candidate,
-        )
-        return
+    logger.warning(
+        "dead-cst is not running inside %s. Third-party imports "
+        "may classify as [unresolved] and framework plugin lookups "
+        "may fail. Re-run via 'uv run dead-cst ...' (or activate "
+        "the venv) for full classification.",
+        candidate,
+    )
 
 
 def _find_reachable(graph: nx.MultiDiGraph) -> set[SymbolNode]:

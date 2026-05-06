@@ -140,19 +140,6 @@ def build_resolvers(path_specs: list[str], resolver_names: list[str]) -> list[Pa
     return resolvers
 
 
-def _trees_for_reporting(
-    root: Path,
-    trees: list[SourceTree],
-) -> list[SourceTree]:
-    """Tree paths in the order the CLI should print summaries for them.
-
-    Just the order they came back from the resolvers -- topo order
-    isn't required for reports, and preserving config order is
-    friendlier for users with multiple trees.
-    """
-    return list(trees)
-
-
 def version_callback(value: bool) -> None:
     if value:
         from importlib.metadata import version
@@ -245,7 +232,7 @@ def _output_text(
     root: Path,
     trees: list[SourceTree],
 ) -> None:
-    for tree in _trees_for_reporting(root, trees):
+    for tree in trees:
         typer.echo(f"\n{tree.path}:")
         total_counts = _count_nodes(graph, tree.path)
         unreachable_counts = _count_nodes(unreachable, tree.path)
@@ -308,7 +295,7 @@ def _output_json(
         "unreachable_branches": [],
     }
 
-    for tree in _trees_for_reporting(root, trees):
+    for tree in trees:
         path_str = str(tree.path)
         total_counts = _count_nodes(graph, tree.path)
         unreachable_counts = _count_nodes(unreachable, tree.path)
