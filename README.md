@@ -156,27 +156,28 @@ import re
 from pathlib import Path
 from dead_cst import Analysis
 from dead_cst.plugins import ExplicitEntrypointPlugin, MainBlockPlugin
+from dead_cst.resolvers import ManualResolver
 
 root = Path("./src")
 analysis = Analysis(
-    {root: []},
+    root,
+    resolvers=[ManualResolver(specs=["."])],
     plugins=[
         MainBlockPlugin(),
         ExplicitEntrypointPlugin(specs=[re.compile(r".*__main__\.py")]),
     ],
-    project_root=root,
 )
 
 # Whole-project queries: cheap to construct, lazy to materialize.
 for node in analysis.dead():
     print(f"dead: {node.fqname} ({node.type}) at {node.path}")
 
-# Per-package queries scope work to the smallest base set that gives
+# Per-package queries scope work to the smallest tree set that gives
 # correct reachability answers. Local queries (modules, declarations)
-# never materialize cross-base state.
-pkg = analysis.package(root)
+# never materialize cross-package state.
+pkg = analysis.package(root.name)
 print(sum(1 for _ in pkg.modules()), "modules")
-pkg.remove_dead_code()  # codemod, scoped to this base
+pkg.remove_dead_code()  # codemod, scoped to this package
 ```
 
 `Analysis(...).materialize_all()` returns the full `networkx.MultiDiGraph` if you need raw access; `analysis.package(base).graph()` returns the closure-scoped subgraph for one package.
@@ -239,6 +240,7 @@ from dataclasses import dataclass
 import libcst as cst
 from dead_cst import Analysis
 from dead_cst.branches import DefaultUnreachableRegionDetector
+from dead_cst.resolvers import ManualResolver
 
 @dataclass(frozen=True)
 class FlagAwareDetector(DefaultUnreachableRegionDetector):
@@ -261,7 +263,11 @@ class FlagAwareDetector(DefaultUnreachableRegionDetector):
             return MIGRATIONS[expr.args[0].value.evaluated_value]
         return None
 
-graph = Analysis({root: []}, unreachable_detector=FlagAwareDetector()).materialize_all()
+graph = Analysis(
+    root,
+    resolvers=[ManualResolver(specs=["."])],
+    unreachable_detector=FlagAwareDetector(),
+).materialize_all()
 ```
 
 With the override above, `if check_flag("migration-abc"): ...` and `flag = check_flag("migration-abc"); if flag: ...` both resolve to a known truthiness, and the unreachable suite is flagged just like a literal `if False:` would be.

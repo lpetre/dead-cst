@@ -633,9 +633,13 @@ def _count_nodes(graph: nx.MultiDiGraph, prefix: Path | None) -> dict[str, int]:
 class Analysis:
     """Lazy entrypoint to the dead-cst pipeline.
 
-    Holds the analyzer's config (source trees, plugins, resolvers,
-    cache, detector, worker count) and memoizes per-tree work so
-    multiple queries against the same project share the cost.
+    Constructed with a ``project_root`` and a list of
+    :class:`PathResolver`\\s. The analyzer calls each resolver's
+    :meth:`PathResolver.resolve` to derive the project's
+    :class:`SourceTree` layout; the validated tree list is exposed as
+    :attr:`source_trees`. Holds the analyzer's config (resolvers,
+    plugins, cache, detector, worker count) and memoizes per-tree
+    work so multiple queries against the same project share the cost.
     Construction is cheap; nothing is read or parsed until you ask.
 
     Three coarse stages happen on demand:
