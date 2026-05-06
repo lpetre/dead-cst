@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 from dead_cst import Analysis
-from dead_cst.resolvers import ManualResolver
 from dead_cst.plugins import (
     ExplicitEntrypointPlugin,
     InitSubclassPlugin,
     MainBlockPlugin,
 )
 from dead_cst.plugins.init_subclass import INIT_SUBCLASS_PREFIX
+from conftest import manual
 
 
 def test_init_subclass_keeps_subclass_alive_via_parent(tmp_path, write_files, reachable_fqnames):
@@ -40,7 +40,7 @@ def test_init_subclass_keeps_subclass_alive_via_parent(tmp_path, write_files, re
     )
     graph = Analysis(
         tmp_path,
-        resolvers=[ManualResolver(specs=["."])],
+        resolvers=manual(),
         plugins=[
             ExplicitEntrypointPlugin(specs=["pkg.base.Plugin"]),
             InitSubclassPlugin(),
@@ -74,7 +74,7 @@ def test_init_subclass_transitive_subclasses(tmp_path, write_files, reachable_fq
     )
     graph = Analysis(
         tmp_path,
-        resolvers=[ManualResolver(specs=["."])],
+        resolvers=manual(),
         plugins=[
             ExplicitEntrypointPlugin(specs=["pkg.mod.Root"]),
             InitSubclassPlugin(),
@@ -107,7 +107,7 @@ def test_init_subclass_does_not_seed_parent_entrypoint(tmp_path, write_files, re
     )
     graph = Analysis(
         tmp_path,
-        resolvers=[ManualResolver(specs=["."])],
+        resolvers=manual(),
         plugins=[InitSubclassPlugin()],
     ).materialize_all()
     reached = reachable_fqnames(graph)
@@ -152,7 +152,7 @@ def test_init_subclass_via_main_block(tmp_path, write_files, reachable_fqnames):
     )
     graph = Analysis(
         tmp_path,
-        resolvers=[ManualResolver(specs=["."])],
+        resolvers=manual(),
         plugins=[MainBlockPlugin(), InitSubclassPlugin()],
     ).materialize_all()
     reached = reachable_fqnames(graph)
@@ -180,7 +180,7 @@ def test_init_subclass_aliased_import(tmp_path, write_files, reachable_fqnames):
     )
     graph = Analysis(
         tmp_path,
-        resolvers=[ManualResolver(specs=["."])],
+        resolvers=manual(),
         plugins=[
             ExplicitEntrypointPlugin(specs=["pkg.base.Plugin"]),
             InitSubclassPlugin(),
@@ -208,7 +208,7 @@ def test_init_subclass_dotted_attribute_base(tmp_path, write_files, reachable_fq
     )
     graph = Analysis(
         tmp_path,
-        resolvers=[ManualResolver(specs=["."])],
+        resolvers=manual(),
         plugins=[
             ExplicitEntrypointPlugin(specs=["pkg.base.Plugin"]),
             InitSubclassPlugin(),
@@ -240,7 +240,7 @@ def test_init_subclass_class_without_init_subclass_no_edges(
     )
     graph = Analysis(
         tmp_path,
-        resolvers=[ManualResolver(specs=["."])],
+        resolvers=manual(),
         plugins=[
             ExplicitEntrypointPlugin(specs=["pkg.base.Plain"]),
             InitSubclassPlugin(),
@@ -284,7 +284,7 @@ def test_init_subclass_keeps_subclass_method_references_alive(
     )
     graph = Analysis(
         tmp_path,
-        resolvers=[ManualResolver(specs=["."])],
+        resolvers=manual(),
         plugins=[
             ExplicitEntrypointPlugin(specs=["pkg.base.Plugin"]),
             InitSubclassPlugin(),
@@ -321,7 +321,7 @@ def test_init_subclass_subscripted_base(tmp_path, write_files, reachable_fqnames
     )
     graph = Analysis(
         tmp_path,
-        resolvers=[ManualResolver(specs=["."])],
+        resolvers=manual(),
         plugins=[
             ExplicitEntrypointPlugin(specs=["pkg.base.Plugin"]),
             InitSubclassPlugin(),
@@ -351,7 +351,7 @@ def test_init_subclass_marker_in_predecessor_chain(tmp_path, write_files):
     )
     graph = Analysis(
         tmp_path,
-        resolvers=[ManualResolver(specs=["."])],
+        resolvers=manual(),
         plugins=[
             ExplicitEntrypointPlugin(specs=["pkg.base.Plugin"]),
             InitSubclassPlugin(),

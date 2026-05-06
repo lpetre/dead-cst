@@ -11,9 +11,9 @@ import libcst as cst
 import networkx as nx
 
 from dead_cst import Analysis
-from dead_cst.resolvers import ManualResolver
 from dead_cst.plugins import GraphOp, ObserveContext, PluginContext
 from dead_cst.graph import SymbolTrie
+from conftest import manual
 
 
 def _ctx(tmp_path):
@@ -71,7 +71,7 @@ def test_base_modules_only_yields_under_base(tmp_path, write_files):
 
     Analysis(
         tmp_path,
-        resolvers=[ManualResolver(specs=["a", "b"])],
+        resolvers=manual("a", "b"),
         plugins=[_Capture()],
     ).materialize_all()
     # Each base only sees its own files, even though the full graph
@@ -106,7 +106,7 @@ def test_importers_finds_first_party_imports(tmp_path, write_files):
 
     Analysis(
         tmp_path,
-        resolvers=[ManualResolver(specs=["."])],
+        resolvers=manual(),
         plugins=[_Capture()],
     ).materialize_all()
     assert {p.name for p in seen} == {"uses_lib.py"}
@@ -137,7 +137,7 @@ def test_importers_finds_third_party_dist(tmp_path, write_files):
 
     Analysis(
         tmp_path,
-        resolvers=[ManualResolver(specs=["."])],
+        resolvers=manual(),
         plugins=[_Capture()],
     ).materialize_all()
     assert {p.name for p in seen} == {"uses_typer.py"}
@@ -162,7 +162,7 @@ def test_importers_unknown_returns_empty(tmp_path, write_files):
 
     Analysis(
         tmp_path,
-        resolvers=[ManualResolver(specs=["."])],
+        resolvers=manual(),
         plugins=[_Capture()],
     ).materialize_all()
     assert saw_empty

@@ -23,7 +23,7 @@ import pytest
 from dead_cst import Analysis
 from dead_cst.cache import CACHE_DIR_NAME, GraphCache
 from dead_cst.plugins import ExplicitEntrypointPlugin
-from dead_cst.resolvers import ManualResolver
+from conftest import manual
 
 
 def _write(root: Path, files: dict[str, str]) -> None:
@@ -44,14 +44,14 @@ def test_construction_does_no_filesystem_walk(tmp_path, monkeypatch):
         return real(self, pattern)
 
     monkeypatch.setattr(Path, "rglob", _spy)
-    Analysis(tmp_path, resolvers=[ManualResolver(specs=["."])])
+    Analysis(tmp_path, resolvers=manual())
     assert rglob_calls == []
 
 
 def test_refresh_is_idempotent(tmp_path):
     """A second :meth:`refresh` over the same trees re-uses the cached spec."""
     _write(tmp_path, {"pkg/__init__.py": "", "pkg/a.py": "def f(): pass\n"})
-    a = Analysis(tmp_path, resolvers=[ManualResolver(specs=["."])]).refresh()
+    a = Analysis(tmp_path, resolvers=manual()).refresh()
     contributions_before = dict(a._contributions)
     a.refresh()
     for path, contrib in contributions_before.items():
@@ -61,7 +61,7 @@ def test_refresh_is_idempotent(tmp_path):
 def test_refresh_rejects_unknown_package(tmp_path):
     """Refreshing a package that wasn't configured errors quickly."""
     _write(tmp_path, {"pkg/__init__.py": ""})
-    a = Analysis(tmp_path, resolvers=[ManualResolver(specs=["."])])
+    a = Analysis(tmp_path, resolvers=manual())
     with pytest.raises(KeyError):
         a.refresh(packages=["nope"])
 
@@ -72,7 +72,7 @@ def test_package_modules_local_only(tmp_path):
     base_b = tmp_path / "b"
     _write(base_a, {"pkg/__init__.py": "", "pkg/m.py": "def f(): pass\n"})
     _write(base_b, {"pkg/__init__.py": "", "pkg/m.py": "def g(): pass\n"})
-    a = Analysis(tmp_path, resolvers=[ManualResolver(specs=["a", "b"])])
+    a = Analysis(tmp_path, resolvers=manual("a", "b"))
     pkg_a = a.package("a")
     a_paths = {n.path for n in pkg_a.modules()}
     assert a_paths == {(base_a / "pkg" / "__init__.py"), (base_a / "pkg" / "m.py")}
@@ -88,7 +88,7 @@ def test_package_declarations_filter_by_simple_name(tmp_path):
             "pkg/m.py": "def Foo(): pass\nclass Foo: pass\nbar = 1\n",
         },
     )
-    a = Analysis(base, resolvers=[ManualResolver(specs=["."])])
+    a = Analysis(base, resolvers=manual())
     pkg_name = base.name
     pv = a.package(pkg_name)
     foos = list(pv.declarations("Foo"))
@@ -103,7 +103,7 @@ def test_local_query_doesnt_materialize_full_graph(tmp_path):
     base_b = tmp_path / "b"
     _write(base_a, {"pkg/__init__.py": "", "pkg/m.py": "def f(): pass\n"})
     _write(base_b, {"pkg/__init__.py": "", "pkg/m.py": "def g(): pass\n"})
-    a = Analysis(tmp_path, resolvers=[ManualResolver(specs=["a", "b"])])
+    a = Analysis(tmp_path, resolvers=manual("a", "b"))
     list(a.package("a").modules())
     assert base_a.resolve() in a._contributions
     assert base_b.resolve() not in a._contributions
@@ -119,7 +119,7 @@ def test_reverse_closure_includes_self_and_consumers(tmp_path):
         d.mkdir()
     a = Analysis(
         tmp_path,
-        resolvers=[ManualResolver(specs=["lib", "core:lib", "app:core"])],
+        resolvers=manual("lib", "core:lib", "app:core"),
     )
     assert a.reverse_closure("lib") == frozenset({"lib", "core", "app"})
     assert a.reverse_closure("core") == frozenset({"core", "app"})
@@ -143,7 +143,7 @@ def test_package_dead_uses_closure_only(tmp_path):
     _write(other, {"pkg/__init__.py": "", "pkg/m.py": "def x(): pass\n"})
     a = Analysis(
         tmp_path,
-        resolvers=[ManualResolver(specs=["core", "app:core", "other"])],
+        resolvers=manual("core", "app:core", "other"),
         plugins=[ExplicitEntrypointPlugin(specs=["pkg.main"])],
     )
     list(a.package("core").dead())
@@ -165,13 +165,13 @@ def test_package_dead_matches_full_dead_slice(tmp_path):
     )
     a_full = Analysis(
         tmp_path,
-        resolvers=[ManualResolver(specs=["core", "app:core"])],
+        resolvers=manual("core", "app:core"),
         plugins=[ExplicitEntrypointPlugin(specs=["pkg.main"])],
     )
     full_dead_in_core = {n.fqname for n in a_full.dead() if n.path.is_relative_to(core)}
     a_pkg = Analysis(
         tmp_path,
-        resolvers=[ManualResolver(specs=["core", "app:core"])],
+        resolvers=manual("core", "app:core"),
         plugins=[ExplicitEntrypointPlugin(specs=["pkg.main"])],
     )
     pkg_dead = {n.fqname for n in a_pkg.package("core").dead()}
@@ -191,7 +191,7 @@ def test_per_tree_fingerprint_isolates_siblings(tmp_path, monkeypatch):
     with GraphCache(db) as cache:
         Analysis(
             tmp_path,
-            resolvers=[ManualResolver(specs=["a", "b"])],
+            resolvers=manual("a", "b"),
             cache=cache,
         ).materialize_all()
 
@@ -210,7 +210,7 @@ def test_per_tree_fingerprint_isolates_siblings(tmp_path, monkeypatch):
     with GraphCache(db) as cache:
         Analysis(
             tmp_path,
-            resolvers=[ManualResolver(specs=["a:extra", "b", "extra"])],
+            resolvers=manual("a:extra", "b", "extra"),
             cache=cache,
         ).materialize_all()
     visited_under_a = {p for p in visited if p.is_relative_to(base_a)}

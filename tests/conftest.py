@@ -5,7 +5,18 @@ import networkx as nx
 import pytest
 
 from dead_cst import Analysis, EdgeFlags
-from dead_cst.resolvers import ManualResolver
+from dead_cst.resolvers import ManualResolver, PathResolver
+
+
+def manual(*specs: str) -> list[PathResolver]:
+    """One-line ``[ManualResolver(specs=[...])]`` builder for tests.
+
+    No args (``manual()``) returns the single-tree-at-project-root
+    case (``[ManualResolver(specs=["."])]``); otherwise wraps the
+    given specs verbatim. Imported as a module-level helper so tests
+    don't have to add it to every signature.
+    """
+    return [ManualResolver(specs=list(specs) if specs else ["."])]
 
 
 @pytest.fixture
@@ -39,7 +50,7 @@ def build_decl_graph(tmp_path):
             full_path = tmp_path / filename
             full_path.parent.mkdir(parents=True, exist_ok=True)
             full_path.write_text(textwrap.dedent(content).strip())
-        return Analysis(tmp_path, resolvers=[ManualResolver(specs=["."])]).materialize_all()
+        return Analysis(tmp_path, resolvers=manual()).materialize_all()
 
     return _make_graph
 

@@ -10,7 +10,7 @@ import pytest
 
 from dead_cst import Analysis
 from dead_cst.plugins._core import EXTERNAL_PREFIXES
-from dead_cst.resolvers import ManualResolver
+from conftest import manual
 
 IMPORT_TEST_FILES = {
     "p/__init__.py": "",
@@ -553,7 +553,7 @@ def test_cross_dep_submodule_import(tmp_path, assert_edges):
 
     graph = Analysis(
         tmp_path,
-        resolvers=[ManualResolver(specs=["pkg_b:pkg_a", "pkg_a"])],
+        resolvers=manual("pkg_b:pkg_a", "pkg_a"),
     ).materialize_all()
     assert_edges(
         graph,

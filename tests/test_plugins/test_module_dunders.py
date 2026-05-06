@@ -3,15 +3,15 @@
 from __future__ import annotations
 
 from dead_cst import Analysis
-from dead_cst.resolvers import ManualResolver
 from dead_cst.plugins import ModuleDundersPlugin
+from conftest import manual
 
 
 def test_keeps_all_alive(tmp_path, write_files, reachable_fqnames):
     write_files({"pkg/__init__.py": '__all__ = ["a"]\na = 1'})
     graph = Analysis(
         tmp_path,
-        resolvers=[ManualResolver(specs=["."])],
+        resolvers=manual(),
         plugins=[ModuleDundersPlugin()],
     ).materialize_all()
     reached = reachable_fqnames(graph)
@@ -31,7 +31,7 @@ def test_keeps_other_dunders_alive(tmp_path, write_files, reachable_fqnames):
     )
     graph = Analysis(
         tmp_path,
-        resolvers=[ManualResolver(specs=["."])],
+        resolvers=manual(),
         plugins=[ModuleDundersPlugin()],
     ).materialize_all()
     reached = reachable_fqnames(graph)
@@ -50,7 +50,7 @@ def test_keeps_future_imports_alive(tmp_path, write_files, reachable_fqnames):
     )
     graph = Analysis(
         tmp_path,
-        resolvers=[ManualResolver(specs=["."])],
+        resolvers=manual(),
         plugins=[ModuleDundersPlugin()],
     ).materialize_all()
     reached = reachable_fqnames(graph)
@@ -69,7 +69,7 @@ def test_ignores_non_future_imports_with_plain_names(tmp_path, write_files, reac
     )
     graph = Analysis(
         tmp_path,
-        resolvers=[ManualResolver(specs=["."])],
+        resolvers=manual(),
         plugins=[ModuleDundersPlugin()],
     ).materialize_all()
     reached = reachable_fqnames(graph)
@@ -89,7 +89,7 @@ def test_ignores_non_dunder_underscore_names(tmp_path, write_files, reachable_fq
     )
     graph = Analysis(
         tmp_path,
-        resolvers=[ManualResolver(specs=["."])],
+        resolvers=manual(),
         plugins=[ModuleDundersPlugin()],
     ).materialize_all()
     reached = reachable_fqnames(graph)

@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 from dead_cst import Analysis
-from dead_cst.resolvers import ManualResolver
 from dead_cst.plugins import (
     ExplicitEntrypointPlugin,
     MainBlockPlugin,
     TyperPlugin,
 )
+from conftest import manual
 
 
 def test_typer_plugin_marks_command_handlers(tmp_path, write_files, reachable_fqnames):
@@ -38,7 +38,7 @@ def test_typer_plugin_marks_command_handlers(tmp_path, write_files, reachable_fq
     )
     graph = Analysis(
         tmp_path,
-        resolvers=[ManualResolver(specs=["."])],
+        resolvers=manual(),
         plugins=[MainBlockPlugin(), TyperPlugin()],
     ).materialize_all()
     reached = reachable_fqnames(graph)
@@ -81,7 +81,7 @@ def test_typer_plugin_keeps_handler_dependencies_alive(tmp_path, write_files, re
     )
     graph = Analysis(
         tmp_path,
-        resolvers=[ManualResolver(specs=["."])],
+        resolvers=manual(),
         plugins=[MainBlockPlugin(), TyperPlugin()],
     ).materialize_all()
     reached = reachable_fqnames(graph)
@@ -109,7 +109,7 @@ def test_typer_plugin_reachable_via_explicit_entrypoint(tmp_path, write_files, r
     )
     graph = Analysis(
         tmp_path,
-        resolvers=[ManualResolver(specs=["."])],
+        resolvers=manual(),
         plugins=[ExplicitEntrypointPlugin(specs=["cli.main.app"]), TyperPlugin()],
     ).materialize_all()
     reached = reachable_fqnames(graph)
@@ -136,7 +136,7 @@ def test_typer_plugin_does_not_seed_entrypoint(tmp_path, write_files, reachable_
     )
     graph = Analysis(
         tmp_path,
-        resolvers=[ManualResolver(specs=["."])],
+        resolvers=manual(),
         plugins=[TyperPlugin()],
     ).materialize_all()
     reached = reachable_fqnames(graph)
@@ -173,7 +173,7 @@ def test_typer_plugin_unused_subapp_stays_dead(tmp_path, write_files, reachable_
     )
     graph = Analysis(
         tmp_path,
-        resolvers=[ManualResolver(specs=["."])],
+        resolvers=manual(),
         plugins=[MainBlockPlugin(), TyperPlugin()],
     ).materialize_all()
     reached = reachable_fqnames(graph)
@@ -211,7 +211,7 @@ def test_typer_plugin_subapp_reachable_via_add_typer(tmp_path, write_files, reac
     )
     graph = Analysis(
         tmp_path,
-        resolvers=[ManualResolver(specs=["."])],
+        resolvers=manual(),
         plugins=[MainBlockPlugin(), TyperPlugin()],
     ).materialize_all()
     reached = reachable_fqnames(graph)
@@ -240,7 +240,7 @@ def test_typer_plugin_handles_aliased_class_import(tmp_path, write_files, reacha
     )
     graph = Analysis(
         tmp_path,
-        resolvers=[ManualResolver(specs=["."])],
+        resolvers=manual(),
         plugins=[MainBlockPlugin(), TyperPlugin()],
     ).materialize_all()
     assert "cli.main.hello" in reachable_fqnames(graph)
@@ -265,7 +265,7 @@ def test_typer_plugin_handles_aliased_module_import(tmp_path, write_files, reach
     )
     graph = Analysis(
         tmp_path,
-        resolvers=[ManualResolver(specs=["."])],
+        resolvers=manual(),
         plugins=[MainBlockPlugin(), TyperPlugin()],
     ).materialize_all()
     assert "cli.main.hello" in reachable_fqnames(graph)
@@ -290,7 +290,7 @@ def test_typer_plugin_handles_annotated_assignment(tmp_path, write_files, reacha
     )
     graph = Analysis(
         tmp_path,
-        resolvers=[ManualResolver(specs=["."])],
+        resolvers=manual(),
         plugins=[MainBlockPlugin(), TyperPlugin()],
     ).materialize_all()
     assert "cli.main.hello" in reachable_fqnames(graph)
@@ -318,7 +318,7 @@ def test_typer_plugin_ignores_bare_decorators(tmp_path, write_files, reachable_f
     )
     graph = Analysis(
         tmp_path,
-        resolvers=[ManualResolver(specs=["."])],
+        resolvers=manual(),
         plugins=[MainBlockPlugin(), TyperPlugin()],
     ).materialize_all()
     # Bare ``@command`` (no attribute access) is not a Typer registration --
@@ -344,7 +344,7 @@ def test_typer_plugin_ignores_unrelated_decorators(tmp_path, write_files, reacha
     )
     graph = Analysis(
         tmp_path,
-        resolvers=[ManualResolver(specs=["."])],
+        resolvers=manual(),
         plugins=[TyperPlugin()],
     ).materialize_all()
     # ``t`` isn't a ``Typer`` instance, so its ``.command`` decorator is ignored.
@@ -370,7 +370,7 @@ def test_typer_plugin_does_nothing_without_typer_imports(tmp_path, write_files, 
     )
     graph = Analysis(
         tmp_path,
-        resolvers=[ManualResolver(specs=["."])],
+        resolvers=manual(),
         plugins=[TyperPlugin()],
     ).materialize_all()
     # ``app`` here is not a Typer instance -- no ``typer`` import in scope.
@@ -400,7 +400,7 @@ def test_typer_plugin_multiple_instances_in_one_module(tmp_path, write_files, re
     )
     graph = Analysis(
         tmp_path,
-        resolvers=[ManualResolver(specs=["."])],
+        resolvers=manual(),
         plugins=[MainBlockPlugin(), TyperPlugin()],
     ).materialize_all()
     reached = reachable_fqnames(graph)
@@ -434,7 +434,7 @@ def test_typer_plugin_ignores_import_star(tmp_path, write_files, reachable_fqnam
     )
     graph = Analysis(
         tmp_path,
-        resolvers=[ManualResolver(specs=["."])],
+        resolvers=manual(),
         plugins=[MainBlockPlugin(), TyperPlugin()],
     ).materialize_all()
     # No instance edge from ``app`` to ``hello`` because the plugin ignores

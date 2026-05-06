@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from dead_cst import Analysis
-from dead_cst.resolvers import ManualResolver
 from dead_cst.plugins import MainBlockPlugin
+from conftest import manual
 
 
 def test_main_block_plugin_marks_module_entrypoint(tmp_path, write_files, reachable_fqnames):
@@ -22,7 +22,7 @@ def test_main_block_plugin_marks_module_entrypoint(tmp_path, write_files, reacha
     )
     graph = Analysis(
         tmp_path,
-        resolvers=[ManualResolver(specs=["."])],
+        resolvers=manual(),
         plugins=[MainBlockPlugin()],
     ).materialize_all()
     reached = reachable_fqnames(graph)
@@ -59,7 +59,7 @@ def test_main_block_keeps_block_decls_alive(tmp_path, write_files, reachable_fqn
     )
     graph = Analysis(
         tmp_path,
-        resolvers=[ManualResolver(specs=["."])],
+        resolvers=manual(),
         plugins=[MainBlockPlugin()],
     ).materialize_all()
     reached = reachable_fqnames(graph)
@@ -86,7 +86,7 @@ def test_main_block_keeps_nested_block_decls_alive(tmp_path, write_files, reacha
     )
     graph = Analysis(
         tmp_path,
-        resolvers=[ManualResolver(specs=["."])],
+        resolvers=manual(),
         plugins=[MainBlockPlugin()],
     ).materialize_all()
     reached = reachable_fqnames(graph)
@@ -107,7 +107,7 @@ def test_main_block_reversed_comparison(tmp_path, write_files, reachable_fqnames
     )
     graph = Analysis(
         tmp_path,
-        resolvers=[ManualResolver(specs=["."])],
+        resolvers=manual(),
         plugins=[MainBlockPlugin()],
     ).materialize_all()
     assert "pkg.script" in reachable_fqnames(graph)

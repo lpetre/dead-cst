@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from dead_cst import Analysis
-from dead_cst.resolvers import ManualResolver
 from dead_cst.plugins import PytestPlugin
+from conftest import manual
 
 
 def test_pytest_plugin_marks_test_functions(tmp_path, write_files, reachable_fqnames):
@@ -20,7 +20,7 @@ def test_pytest_plugin_marks_test_functions(tmp_path, write_files, reachable_fqn
     )
     graph = Analysis(
         tmp_path,
-        resolvers=[ManualResolver(specs=["."])],
+        resolvers=manual(),
         plugins=[PytestPlugin()],
     ).materialize_all()
     reached = reachable_fqnames(graph)
@@ -39,7 +39,7 @@ def test_pytest_plugin_recognizes_underscore_test_suffix(tmp_path, write_files, 
     )
     graph = Analysis(
         tmp_path,
-        resolvers=[ManualResolver(specs=["."])],
+        resolvers=manual(),
         plugins=[PytestPlugin()],
     ).materialize_all()
     assert "pkg.things_test.test_one" in reachable_fqnames(graph)
@@ -59,7 +59,7 @@ def test_pytest_plugin_marks_test_classes(tmp_path, write_files, reachable_fqnam
     )
     graph = Analysis(
         tmp_path,
-        resolvers=[ManualResolver(specs=["."])],
+        resolvers=manual(),
         plugins=[PytestPlugin()],
     ).materialize_all()
     reached = reachable_fqnames(graph)
@@ -87,7 +87,7 @@ def test_pytest_plugin_marks_conftest_decls(tmp_path, write_files, reachable_fqn
     )
     graph = Analysis(
         tmp_path,
-        resolvers=[ManualResolver(specs=["."])],
+        resolvers=manual(),
         plugins=[PytestPlugin()],
     ).materialize_all()
     reached = reachable_fqnames(graph)
@@ -125,7 +125,7 @@ def test_pytest_plugin_marks_decorated_fixtures_outside_conftest(
     )
     graph = Analysis(
         tmp_path,
-        resolvers=[ManualResolver(specs=["."])],
+        resolvers=manual(),
         plugins=[PytestPlugin()],
     ).materialize_all()
     reached = reachable_fqnames(graph)
@@ -147,7 +147,7 @@ def test_pytest_plugin_ignores_non_test_modules(tmp_path, write_files, reachable
     )
     graph = Analysis(
         tmp_path,
-        resolvers=[ManualResolver(specs=["."])],
+        resolvers=manual(),
         plugins=[PytestPlugin()],
     ).materialize_all()
     reached = reachable_fqnames(graph)

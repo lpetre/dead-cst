@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from dead_cst import Analysis
-from dead_cst.resolvers import ManualResolver
 from dead_cst.plugins import ProjectScriptsPlugin
+from conftest import manual
 
 
 def test_project_scripts_plugin(tmp_path, write_files, reachable_fqnames):
@@ -22,7 +22,7 @@ def test_project_scripts_plugin(tmp_path, write_files, reachable_fqnames):
     )
     graph = Analysis(
         tmp_path,
-        resolvers=[ManualResolver(specs=["."])],
+        resolvers=manual(),
         plugins=[ProjectScriptsPlugin()],
     ).materialize_all()
     assert "pkg.cli.main" in reachable_fqnames(graph)

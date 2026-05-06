@@ -27,11 +27,11 @@ import pytest
 from typer.testing import CliRunner
 
 from dead_cst import Analysis
-from dead_cst.resolvers import ManualResolver
 from dead_cst.analyze import _find_reachable as find_reachable
 from dead_cst.cache import GraphCache
 from dead_cst.cli import app
 from dead_cst.plugins import MainBlockPlugin, ModuleDundersPlugin
+from conftest import manual
 
 from ._flux0_plugins import Flux0CliCommandsPlugin, Flux0InternalModulesPlugin
 
@@ -143,9 +143,7 @@ def _module_node(graph, fqname):
 
 
 def _build_graph(base: Path, *plugins):
-    return Analysis(
-        base, resolvers=[ManualResolver(specs=["."])], plugins=list(plugins)
-    ).materialize_all()
+    return Analysis(base, resolvers=manual(), plugins=list(plugins)).materialize_all()
 
 
 def test_flux0_cli_cmds_dead_without_plugin(flux0_cli_src):
@@ -312,7 +310,7 @@ def test_flux0_internal_modules_survives_cache_round_trip(flux0_server_src, tmp_
         ModuleDundersPlugin(),
         Flux0InternalModulesPlugin(),
     ]
-    resolvers = [ManualResolver(specs=["."])]
+    resolvers = manual()
     cache_path = tmp_path / "cache.sqlite"
 
     dead_sets = []

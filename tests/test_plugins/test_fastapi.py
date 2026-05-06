@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from dead_cst import Analysis
-from dead_cst.resolvers import ManualResolver
 from dead_cst.plugins import FastAPIPlugin
+from conftest import manual
 
 
 def test_fastapi_plugin_marks_route_handlers(tmp_path, write_files, reachable_fqnames):
@@ -37,7 +37,7 @@ def test_fastapi_plugin_marks_route_handlers(tmp_path, write_files, reachable_fq
     )
     graph = Analysis(
         tmp_path,
-        resolvers=[ManualResolver(specs=["."])],
+        resolvers=manual(),
         plugins=[FastAPIPlugin()],
     ).materialize_all()
     reached = reachable_fqnames(graph)
@@ -76,7 +76,7 @@ def test_fastapi_plugin_marks_websocket_and_lifecycle(tmp_path, write_files, rea
     )
     graph = Analysis(
         tmp_path,
-        resolvers=[ManualResolver(specs=["."])],
+        resolvers=manual(),
         plugins=[FastAPIPlugin()],
     ).materialize_all()
     reached = reachable_fqnames(graph)
@@ -114,7 +114,7 @@ def test_fastapi_plugin_keeps_handler_dependencies_alive(tmp_path, write_files, 
     )
     graph = Analysis(
         tmp_path,
-        resolvers=[ManualResolver(specs=["."])],
+        resolvers=manual(),
         plugins=[FastAPIPlugin()],
     ).materialize_all()
     reached = reachable_fqnames(graph)
@@ -145,7 +145,7 @@ def test_fastapi_plugin_ignores_bare_decorators(tmp_path, write_files, reachable
     )
     graph = Analysis(
         tmp_path,
-        resolvers=[ManualResolver(specs=["."])],
+        resolvers=manual(),
         plugins=[FastAPIPlugin()],
     ).materialize_all()
     # Bare ``@get`` (no attribute access) is not a FastAPI registration --
@@ -171,7 +171,7 @@ def test_fastapi_plugin_ignores_unrelated_decorators(tmp_path, write_files, reac
     )
     graph = Analysis(
         tmp_path,
-        resolvers=[ManualResolver(specs=["."])],
+        resolvers=manual(),
         plugins=[FastAPIPlugin()],
     ).materialize_all()
     assert "pkg.mod.not_a_route" not in reachable_fqnames(graph)
@@ -193,7 +193,7 @@ def test_fastapi_plugin_unused_router_stays_dead(tmp_path, write_files, reachabl
     )
     graph = Analysis(
         tmp_path,
-        resolvers=[ManualResolver(specs=["."])],
+        resolvers=manual(),
         plugins=[FastAPIPlugin()],
     ).materialize_all()
     reached = reachable_fqnames(graph)
@@ -230,7 +230,7 @@ def test_fastapi_plugin_router_reachable_via_include_router(
     )
     graph = Analysis(
         tmp_path,
-        resolvers=[ManualResolver(specs=["."])],
+        resolvers=manual(),
         plugins=[FastAPIPlugin()],
     ).materialize_all()
     reached = reachable_fqnames(graph)
@@ -256,7 +256,7 @@ def test_fastapi_plugin_handles_aliased_class_import(tmp_path, write_files, reac
     )
     graph = Analysis(
         tmp_path,
-        resolvers=[ManualResolver(specs=["."])],
+        resolvers=manual(),
         plugins=[FastAPIPlugin()],
     ).materialize_all()
     assert "app.main.index" in reachable_fqnames(graph)
@@ -278,7 +278,7 @@ def test_fastapi_plugin_handles_module_import(tmp_path, write_files, reachable_f
     )
     graph = Analysis(
         tmp_path,
-        resolvers=[ManualResolver(specs=["."])],
+        resolvers=manual(),
         plugins=[FastAPIPlugin()],
     ).materialize_all()
     assert "app.main.index" in reachable_fqnames(graph)
@@ -300,7 +300,7 @@ def test_fastapi_plugin_handles_annotated_assignment(tmp_path, write_files, reac
     )
     graph = Analysis(
         tmp_path,
-        resolvers=[ManualResolver(specs=["."])],
+        resolvers=manual(),
         plugins=[FastAPIPlugin()],
     ).materialize_all()
     assert "app.main.index" in reachable_fqnames(graph)
@@ -327,7 +327,7 @@ def test_fastapi_plugin_does_nothing_without_fastapi_imports(
     )
     graph = Analysis(
         tmp_path,
-        resolvers=[ManualResolver(specs=["."])],
+        resolvers=manual(),
         plugins=[FastAPIPlugin()],
     ).materialize_all()
     # ``app`` here is not a FastAPI instance -- no ``fastapi`` import in scope.
@@ -359,7 +359,7 @@ def test_fastapi_plugin_handles_factory_function(tmp_path, write_files, reachabl
     )
     graph = Analysis(
         tmp_path,
-        resolvers=[ManualResolver(specs=["."])],
+        resolvers=manual(),
         plugins=[FastAPIPlugin()],
     ).materialize_all()
     reached = reachable_fqnames(graph)
@@ -389,7 +389,7 @@ def test_fastapi_plugin_factory_returning_router_stays_dead(
     )
     graph = Analysis(
         tmp_path,
-        resolvers=[ManualResolver(specs=["."])],
+        resolvers=manual(),
         plugins=[FastAPIPlugin()],
     ).materialize_all()
     # Factory-produced router is treated like a literal APIRouter --
@@ -429,7 +429,7 @@ def test_fastapi_plugin_ignores_non_app_fastapi_users(tmp_path, write_files, rea
     )
     graph = Analysis(
         tmp_path,
-        resolvers=[ManualResolver(specs=["."])],
+        resolvers=manual(),
         plugins=[FastAPIPlugin()],
     ).materialize_all()
     assert "pkg.mod.handler" not in reachable_fqnames(graph)
