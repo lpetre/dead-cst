@@ -380,6 +380,128 @@ def test_only_marks_target_when_test_alive(tmp_path, write_files, reachable_fqna
     assert "pkg.lib.helper" not in reachable_fqnames(graph)
 
 
+def test_monkeypatch_setattr_keeps_target_alive(tmp_path, write_files, reachable_fqnames):
+    write_files(
+        {
+            "pkg/__init__.py": "",
+            "pkg/lib.py": "def helper(): return 1",
+            "tests/__init__.py": "",
+            "tests/test_lib.py": """
+            def test_helper(monkeypatch):
+                monkeypatch.setattr("pkg.lib.helper", lambda: 2)
+            """,
+        }
+    )
+    graph = Analysis(
+        {tmp_path: []},
+        plugins=[MockPatchPlugin(), PytestPlugin()],
+        project_root=tmp_path,
+    ).materialize_all()
+    assert "pkg.lib.helper" in reachable_fqnames(graph)
+
+
+def test_monkeypatch_delattr_keeps_target_alive(tmp_path, write_files, reachable_fqnames):
+    write_files(
+        {
+            "pkg/__init__.py": "",
+            "pkg/lib.py": "def helper(): return 1",
+            "tests/__init__.py": "",
+            "tests/test_lib.py": """
+            def test_helper(monkeypatch):
+                monkeypatch.delattr("pkg.lib.helper")
+            """,
+        }
+    )
+    graph = Analysis(
+        {tmp_path: []},
+        plugins=[MockPatchPlugin(), PytestPlugin()],
+        project_root=tmp_path,
+    ).materialize_all()
+    assert "pkg.lib.helper" in reachable_fqnames(graph)
+
+
+def test_monkeypatch_setattr_object_form_not_treated_as_fqname(
+    tmp_path, write_files, reachable_fqnames
+):
+    """``monkeypatch.setattr(obj, "attr", value)`` has 3 positional args
+    and is the object form -- the ``"attr"`` string must not be treated
+    as a fqname reference."""
+    write_files(
+        {
+            "pkg/__init__.py": "",
+            "pkg/lib.py": "def helper(): return 1",
+            "tests/__init__.py": "",
+            "tests/test_lib.py": """
+            import pkg.lib
+
+            def test_helper(monkeypatch):
+                # 3 positional args: object form, "helper" is just an
+                # attribute name on the pkg.lib module object, not an
+                # fqname string. The reference to ``pkg.lib`` is what
+                # keeps the module alive (and ``helper`` with it).
+                monkeypatch.setattr(pkg.lib, "helper", lambda: 2)
+            """,
+        }
+    )
+    graph = Analysis(
+        {tmp_path: []},
+        plugins=[MockPatchPlugin(), PytestPlugin()],
+        project_root=tmp_path,
+    ).materialize_all()
+    # Sanity: "pkg.lib" is alive (imported) but the plugin specifically
+    # didn't synthesize an extra ``<patch-target>:helper`` edge.
+    nodes = list(graph.nodes)
+    synthetics = [n.fqname for n in nodes if n.type == "synthetic"]
+    assert "<patch-target>:helper" not in synthetics
+
+
+def test_monkeypatch_setattr_with_raising_kwarg(tmp_path, write_files, reachable_fqnames):
+    """``raising=False`` is a kwarg; the fqname form still has 2
+    positional args."""
+    write_files(
+        {
+            "pkg/__init__.py": "",
+            "pkg/lib.py": "def helper(): return 1",
+            "tests/__init__.py": "",
+            "tests/test_lib.py": """
+            def test_helper(monkeypatch):
+                monkeypatch.setattr("pkg.lib.helper", lambda: 2, raising=False)
+            """,
+        }
+    )
+    graph = Analysis(
+        {tmp_path: []},
+        plugins=[MockPatchPlugin(), PytestPlugin()],
+        project_root=tmp_path,
+    ).materialize_all()
+    assert "pkg.lib.helper" in reachable_fqnames(graph)
+
+
+def test_monkeypatch_setitem_not_recognized(tmp_path, write_files, reachable_fqnames):
+    """``monkeypatch.setitem(d, "key", value)`` patches a dict, not a
+    symbol -- the string is a key, not a fqname."""
+    write_files(
+        {
+            "pkg/__init__.py": "",
+            "pkg/lib.py": "def helper(): return 1",
+            "tests/__init__.py": "",
+            "tests/test_lib.py": """
+            def test_helper(monkeypatch):
+                d = {}
+                monkeypatch.setitem(d, "pkg.lib.helper", 1)
+            """,
+        }
+    )
+    graph = Analysis(
+        {tmp_path: []},
+        plugins=[MockPatchPlugin(), PytestPlugin()],
+        project_root=tmp_path,
+    ).materialize_all()
+    # ``setitem`` is not in our recognized methods; the string is a
+    # dict key, not a symbol fqname.
+    assert "pkg.lib.helper" not in reachable_fqnames(graph)
+
+
 def test_mock_patch_loads_via_load_plugin():
     from dead_cst.plugins import load_plugin
 

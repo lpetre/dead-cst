@@ -1,10 +1,10 @@
-"""Plugin: keep symbols referenced by string-fqname ``patch(...)`` calls alive.
+"""Plugin: keep symbols referenced by string-fqname patch calls alive.
 
-``unittest.mock.patch`` (and pytest-mock's ``mocker.patch``) reference
-their target by fully-qualified string name. The static analyzer can't
-see those references, so a symbol whose only consumers are tests
-patching it looks unused even though removing it would break the
-test.
+``unittest.mock.patch``, pytest-mock's ``mocker.patch``, and pytest's
+``monkeypatch.setattr`` / ``monkeypatch.delattr`` reference their
+target by fully-qualified string name. The static analyzer can't see
+those references, so a symbol whose only consumers are tests patching
+it looks unused even though removing it would break the test.
 
 For each file the plugin scans every call expression with a
 string-literal first argument matching one of these forms::
@@ -15,14 +15,16 @@ string-literal first argument matching one of these forms::
     import mock;                     mock.patch("pkg.mod.func")
     import unittest.mock;            unittest.mock.patch("pkg.mod.func")
     import mock as m;                m.patch("pkg.mod.func")
-    @patch("pkg.mod.func")           # decorator form
-    mocker.patch("pkg.mod.func")     # pytest-mock fixture
+    @patch("pkg.mod.func")                   # decorator form
+    mocker.patch("pkg.mod.func")             # pytest-mock fixture
+    monkeypatch.setattr("pkg.mod.func", v)   # pytest monkeypatch fixture
+    monkeypatch.delattr("pkg.mod.func")      # pytest monkeypatch fixture
 
 Two phases:
 
 * :meth:`observe` walks the parsed CST. For each top-level decl it
-  collects every ``patch(<string>, ...)`` call inside that decl's
-  subtree (including its decorators) and emits a
+  collects every recognized patch call inside that decl's subtree
+  (including its decorators) and emits a
   ``<patch-target>:<fqname>`` synthetic plus an edge from the
   enclosing top-level decl to the synthetic. Module-level patches
   (rare) hang off the file's module node.
@@ -32,15 +34,26 @@ Two phases:
   decl). Unresolved fqnames -- patches against third-party code --
   stay as dangling synthetics, which is harmless.
 
-The ``mocker`` parameter name is recognized unconditionally because
-it's the pytest-mock convention; an unrelated ``mocker.patch(...)``
-call whose string doesn't resolve to a first-party decl produces a
-dangling synthetic with no observable effect.
+The ``mocker`` and ``monkeypatch`` parameter names are recognized
+unconditionally because they're the pytest-mock and pytest
+conventions; an unrelated ``mocker.patch(...)`` /
+``monkeypatch.setattr(...)`` call whose string doesn't resolve to a
+first-party decl produces a dangling synthetic with no observable
+effect.
+
+For ``monkeypatch.setattr`` / ``monkeypatch.delattr`` the plugin
+distinguishes the fqname-string form from the object form by
+positional-argument count -- ``setattr("X.Y", value)`` is two
+positional args (fqname + value), while ``setattr(obj, "name", value)``
+is three positional args (object + name + value). Only the
+two-positional / one-positional form (``delattr("X.Y")``) is treated
+as a string fqname; the object form is already a real reference the
+analyzer sees.
 
 Limitations:
 
-* Only string-literal first args are recognized. ``patch(target)``
-  where ``target`` is a variable is invisible to static analysis.
+* Only string-literal first args are recognized. A patch target
+  computed at runtime (``patch(target_var)``) is invisible.
 * ``patch.object(Cls, "attr")`` is not handled here -- ``Cls`` is
   already a real reference the analyzer sees, and the ``"attr"``
   string only names a method/attribute that doesn't have its own
@@ -48,6 +61,9 @@ Limitations:
 * ``patch.dict`` / ``patch.multiple`` are not recognized: their first
   arg can be either a string or a live object, and the kwargs name
   attributes that the class node already keeps alive.
+* ``monkeypatch.setitem`` / ``setenv`` / ``syspath_prepend`` / etc.
+  are not recognized -- their string args name dict keys / env vars
+  / paths, not first-party symbols.
 """
 
 from __future__ import annotations
@@ -78,6 +94,7 @@ PATCH_TARGET_PREFIX = "<patch-target>:"
 
 _MOCK_MODULES = frozenset({"unittest.mock", "mock"})
 _MOCKER_NAME = "mocker"
+_MONKEYPATCH_NAME = "monkeypatch"
 
 
 @dataclass
@@ -88,7 +105,7 @@ class MockPatchPlugin:
     """
 
     name: str = "mock_patch"
-    version: int = 1778025600
+    version: int = 1778025601
 
     def observe(self, ctx: ObserveContext) -> VisitorPayload | None:
         patch_aliases, mock_module_aliases = _collect_mock_imports(ctx.module)
@@ -217,13 +234,17 @@ class _PatchCallFinder(cst.CSTVisitor):
         self.targets: list[str] = []
 
     def visit_Call(self, node: cst.Call) -> bool | None:
-        if self._matches(node.func):
+        if self._matches_patch(node.func):
             target = _first_string_arg(node)
+            if target is not None:
+                self.targets.append(target)
+        else:
+            target = _monkeypatch_target(node)
             if target is not None:
                 self.targets.append(target)
         return True
 
-    def _matches(self, func: cst.BaseExpression) -> bool:
+    def _matches_patch(self, func: cst.BaseExpression) -> bool:
         if isinstance(func, cst.Name):
             return func.value in self._patch_aliases
         if not isinstance(func, cst.Attribute) or func.attr.value != "patch":
@@ -242,6 +263,37 @@ def _first_string_arg(call: cst.Call) -> str | None:
     if first.keyword is not None:
         return None
     return _string_value(first.value)
+
+
+# Methods of pytest's ``monkeypatch`` fixture whose first arg can be a
+# fully-qualified string name. The value is the positional-argument
+# count for the *string-fqname* form (the object form takes one extra
+# positional arg, which is how we disambiguate).
+_MONKEYPATCH_FQNAME_METHODS: dict[str, int] = {
+    "setattr": 2,  # setattr("X.Y", value)              [vs setattr(obj, "name", value)]
+    "delattr": 1,  # delattr("X.Y")                     [vs delattr(obj, "name")]
+}
+
+
+def _monkeypatch_target(call: cst.Call) -> str | None:
+    """Return the fqname string from ``monkeypatch.setattr`` / ``delattr``.
+
+    Disambiguates the string-fqname form from the object form by
+    positional-argument count. Returns ``None`` if the call isn't a
+    monkeypatch fqname-form call.
+    """
+    func = call.func
+    if not isinstance(func, cst.Attribute):
+        return None
+    if not isinstance(func.value, cst.Name) or func.value.value != _MONKEYPATCH_NAME:
+        return None
+    expected_positional = _MONKEYPATCH_FQNAME_METHODS.get(func.attr.value)
+    if expected_positional is None:
+        return None
+    positional = [a for a in call.args if a.keyword is None]
+    if len(positional) != expected_positional:
+        return None
+    return _string_value(positional[0].value)
 
 
 def _string_value(expr: cst.BaseExpression) -> str | None:
