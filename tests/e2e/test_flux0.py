@@ -312,14 +312,14 @@ def test_flux0_internal_modules_survives_cache_round_trip(flux0_server_src, tmp_
         ModuleDundersPlugin(),
         Flux0InternalModulesPlugin(),
     ]
-    paths = {base: []}
+    trees = build_trees({base: []})
     cache_path = tmp_path / "cache.sqlite"
 
     dead_sets = []
     for _ in range(2):
         with GraphCache(cache_path) as cache:
             graph = Analysis(
-                paths, plugins=plugins, project_root=base, cache=cache
+                trees, plugins=plugins, project_root=base, cache=cache
             ).materialize_all()
         reachable = find_reachable(graph)
         dead_sets.append(

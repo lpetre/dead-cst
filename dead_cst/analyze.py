@@ -647,8 +647,8 @@ class Analysis:
     Three coarse stages happen on demand:
 
     1. **Per-tree file enumeration + visitor pass** -- driven by
-       :meth:`refresh`. Walks each requested tree's files, hashes
-       them against the cache, runs the visitor + observe pass on
+       :meth:`refresh`. Walks each requested package's trees, hashes
+       files against the cache, runs the visitor + observe pass on
        misses, writes payloads back to the cache.
 
     2. **Per-tree contribution build** -- the per-tree trie + a
@@ -657,12 +657,14 @@ class Analysis:
     3. **Cross-tree composition** -- merging contributions, running
        :func:`resolve_edges` against the merged tries, running plugin
        :meth:`EdgePlugin.finalize`. Scoped to either every tree
-       (:meth:`materialize_all`) or the "interesting set" of one tree
-       (:meth:`materialize_closure` / :meth:`PackageView.graph`).
+       (:meth:`materialize_all`) or the "interesting set" of a single
+       package (:meth:`materialize_closure` / :meth:`PackageView.graph`).
 
     The lazy split lets cheap per-package queries skip stage 3
     entirely for purely local questions like
-    :meth:`PackageView.modules`.
+    :meth:`PackageView.modules`. The public navigation API
+    (:meth:`reverse_closure`, :meth:`refresh`, :meth:`materialize_closure`)
+    is keyed on package names; tree-level structures are internal.
     """
 
     def __init__(

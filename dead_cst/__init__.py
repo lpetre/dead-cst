@@ -6,11 +6,12 @@ of entrypoints.
 
 The top-level package re-exports the names most callers need:
 :class:`Analysis` is the lazy entry point (cheap construction,
-base-scoped :meth:`Analysis.refresh`, :meth:`Analysis.package` for
-single-base queries via :class:`PackageView`); the graph data types
-(:class:`SymbolNode`, :class:`Import`, :class:`NodeFlags`,
-:class:`EdgeFlags`); and :class:`Cacheable`, the contract every
-extension point implements.
+package-scoped :meth:`Analysis.refresh`, :meth:`Analysis.package` for
+single-package queries via :class:`PackageView`); the
+:class:`SourceTree` / :class:`SourceTreeFlags` types path resolvers
+emit; the graph data types (:class:`SymbolNode`, :class:`Import`,
+:class:`NodeFlags`, :class:`EdgeFlags`); and :class:`Cacheable`, the
+contract every extension point implements.
 
 The deeper public surface lives in focused sub-packages; pull from
 those when writing extensions:

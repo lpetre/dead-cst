@@ -37,6 +37,14 @@ two versions.
   environment active (`uv run dead-cst ...` or activate the venv
   first) so third-party imports resolve via the running Python's
   `sys.path`.
+- `Analysis`'s public navigation API is keyed on package names rather
+  than tree paths: `Analysis.reverse_closure(package: str) ->
+  frozenset[str]`, `Analysis.refresh(packages=...)`, and
+  `Analysis.materialize_closure(package: str)`. `Analysis.packages`
+  replaces the previous `bases` property. Tree-level structures (the
+  per-tree DAG, per-tree fingerprint, per-tree contributions) are
+  still what drive the actual work but they're internal; consumers
+  reason about packages.
 
 ### Removed
 - `VenvResolver`, `MissingVenvError`, `find_venv_site_packages`. The
@@ -67,14 +75,19 @@ two versions.
 - New primary API: `dead_cst.Analysis` and `dead_cst.PackageView`,
   the lazy entry point that callers should reach for on large repos.
   Construction is cheap (no filesystem walk, no parsing). `refresh()`
-  is base-scoped and idempotent. `package(base)` returns a
+  is package-scoped and idempotent. `package(name)` returns a
   `PackageView` whose `modules` / `declarations` / `count_nodes`
-  queries are local to that base, while `dead` / `reachable` /
+  queries are local to that package, while `dead` / `reachable` /
   `kept_alive_by_dead_branches` / `importers_of` / `graph` /
   `remove_dead_code` materialize only the "interesting set" -- the
-  forward closure of the base's reverse (consumer) closure -- which
-  is the smallest scope that gives correct reachability answers for
-  decls in that base.
+  forward closure of the package's reverse (consumer) closure --
+  which is the smallest scope that gives correct reachability
+  answers for decls in that package.
+- `Analysis` warns at construction time when the project root has a
+  sibling `.venv` / `venv` that isn't the running interpreter. The
+  proactive callout is more actionable than the downstream
+  `[unresolved]` synthetic / `UnresolvedDependencyError` symptoms
+  caused by running outside the project's venv.
 - `CycloptsPlugin` (`dead_cst.contrib.cyclopts`, re-exported from
   `dead_cst.plugins` and `dead_cst.contrib`) wires
   `@<app>.command` and `@<app>.default` handlers through their owning
@@ -132,7 +145,8 @@ two versions.
     `PackageView.kept_alive_by_dead_branches()`.
   - `count_nodes(graph, prefix)` -> `Analysis.count_nodes(prefix)` /
     `PackageView.count_nodes()`.
-  - `order_paths(paths)` -> `Analysis(...).bases`.
+  - `order_paths(paths)` -> `Analysis(...).packages` (string package
+    names in declaration order; tree-level topo order is internal).
   - `remove_code(graph, base)` -> `PackageView.remove_dead_code()`
     for the high-level entry point. The standalone function is still
     available at `dead_cst.codemod.remove_code` for power users.
