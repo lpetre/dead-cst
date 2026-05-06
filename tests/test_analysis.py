@@ -115,8 +115,8 @@ def test_local_query_doesnt_materialize_full_graph(tmp_path):
     _write(base_b, {"pkg/__init__.py": "", "pkg/m.py": "def g(): pass\n"})
     a = Analysis({base_a: [], base_b: []})
     list(a.package(base_a).modules())
-    assert base_a in a._refreshed
-    assert base_b not in a._refreshed
+    assert base_a in a._contributions
+    assert base_b not in a._contributions
     assert a._full_graph is None
 
 
@@ -162,7 +162,7 @@ def test_package_dead_uses_closure_only(tmp_path):
         plugins=[ExplicitEntrypointPlugin(specs=["pkg.main"])],
     )
     list(a.package(core).dead())
-    assert other not in a._refreshed
+    assert other not in a._contributions
 
 
 # ---------------------------------------------------------------------------

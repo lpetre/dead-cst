@@ -28,7 +28,7 @@ from typer.testing import CliRunner
 
 from dead_cst import Analysis
 from dead_cst.analyze import _find_reachable as find_reachable
-from dead_cst.cache import GraphCache, compute_fingerprint
+from dead_cst.cache import GraphCache
 from dead_cst.cli import app
 from dead_cst.plugins import MainBlockPlugin, ModuleDundersPlugin
 
@@ -311,11 +311,10 @@ def test_flux0_internal_modules_survives_cache_round_trip(flux0_server_src, tmp_
     ]
     paths = {base: []}
     cache_path = tmp_path / "cache.sqlite"
-    fp = compute_fingerprint(paths=paths, resolvers=[], plugins=plugins)
 
     dead_sets = []
     for _ in range(2):
-        with GraphCache(cache_path, fp) as cache:
+        with GraphCache(cache_path) as cache:
             graph = Analysis(
                 paths, plugins=plugins, project_root=base, cache=cache
             ).materialize_all()

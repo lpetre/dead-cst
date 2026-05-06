@@ -28,8 +28,8 @@ from .plugins import (
     apply_ops,
 )
 from .plugins._core import (
-    SYNTHETIC_PATH_PREFIXES,
     make_payload,
+    simple_name,
 )
 from .resolvers import (
     ImportResolver,
@@ -45,26 +45,28 @@ from .resolvers import (
 logger = logging.getLogger(__name__)
 
 
-def _order_paths(paths: PathMap) -> list[Path]:
-    """Topologically sort ``paths.keys()`` so dependencies are processed first.
+def _build_dep_graph(paths: PathMap) -> nx.DiGraph:
+    """``dep -> consumer`` DAG over ``paths.keys()``.
 
-    ``paths`` maps each base directory to the list of other paths that
-    are added to ``sys.path`` while that base is processed. Only keys
-    of ``paths`` are returned -- search-path entries that aren't
-    themselves keys (e.g. a venv ``site-packages`` directory) are
-    treated as lookup-only by the resolver and are never walked.
-    Edges between two keys (``dep -> consumer``) constrain the topo
-    order so cross-base import resolution sees deps' symbols before
-    the consumer's stitch step runs.
+    Only keys of ``paths`` enter the graph -- search-path entries that
+    aren't themselves keys (e.g. a venv ``site-packages``) are
+    resolver-lookup-only and never walked, so they have no place in
+    the topo order. The DAG drives both :func:`_order_paths` and the
+    forward / reverse closure walks on :class:`Analysis`.
     """
-    path_order: nx.DiGraph = nx.DiGraph()
+    g: nx.DiGraph = nx.DiGraph()
     keys = set(paths)
     for base, search_paths in paths.items():
-        path_order.add_node(base)
+        g.add_node(base)
         for sp in search_paths:
             if sp in keys:
-                path_order.add_edge(sp, base)
-    return list(nx.topological_sort(path_order))
+                g.add_edge(sp, base)
+    return g
+
+
+def _order_paths(paths: PathMap) -> list[Path]:
+    """Topologically sort ``paths.keys()`` so dependencies are processed first."""
+    return list(nx.topological_sort(_build_dep_graph(paths)))
 
 
 def _chain_resolvers(resolvers: Sequence[PathResolver]) -> ImportResolver:
@@ -193,7 +195,7 @@ class _BaseSpec:
 
 def _build_base_spec(
     base: Path,
-    paths: PathMap,
+    deps: Sequence[Path],
     cache: GraphCache | None,
     fingerprint: str,
 ) -> _BaseSpec:
@@ -206,7 +208,7 @@ def _build_base_spec(
     config change leaves these rows valid. The FQN cache covers only
     the miss files because hit files never go through the visitor.
     """
-    search_paths = (base,) + tuple(paths.get(base, []))
+    search_paths = (base, *deps)
     files = tuple(sorted(base.rglob("*.py")))
     hits: dict[Path, VisitorPayload] = {}
     miss_files: list[Path] = []
@@ -556,19 +558,14 @@ def _apply_payload(
 class _BaseContribution:
     """One base's pre-stitched contribution to the symbol graph.
 
-    Built once per base by :func:`_build_contribution` from that base's
-    payloads. Composed into a target graph (full or closure-scoped) by
-    :func:`_compose_contribution`, which then runs cross-base edge
-    stitching and plugin :meth:`EdgePlugin.finalize` against the
-    composed graph.
+    Built once per base by :func:`_build_contribution` and composed
+    into a target graph by :func:`_compose_contribution`, which adds
+    cross-base edges via :func:`resolve_edges` and runs plugin
+    :meth:`EdgePlugin.finalize` against the composed graph.
 
-    Splitting "intra-base apply" from "cross-base compose" is what
-    lets :class:`Analysis` materialize different scopes (full graph
-    vs. a single base's closure) without redoing per-file apply work.
-    Each contribution is also self-contained: ``import_edges`` is the
-    raw cross-file references to feed to :func:`resolve_edges`, and
-    ``current_trie`` / ``export_trie`` are this base's lookup tables
-    (everything visible internally, vs. what consumers see).
+    ``base_graph.graph["dead_suites"]`` carries this base's per-file
+    dead-suite positions; the compose step folds them into the target
+    graph's matching key.
     """
 
     base: Path
@@ -576,7 +573,6 @@ class _BaseContribution:
     export_trie: SymbolTrie
     base_graph: nx.MultiDiGraph
     import_edges: frozenset[tuple[SymbolNode, Import, EdgeFlags]]
-    dead_suites_per_file: dict[Path, tuple[CodeRange, ...]]
 
 
 def _build_contribution(
@@ -586,12 +582,9 @@ def _build_contribution(
 ) -> _BaseContribution:
     """Apply ``spec``'s per-file payloads into a base-local graph slice.
 
-    Identical per-file work to the per-base loop in
-    :func:`build_symbol_graph` pre-refactor: the only change is that
-    ``_apply_payload`` mutates a fresh per-base ``nx.MultiDiGraph``
-    rather than the shared full graph, so the resulting contribution
-    can be composed into different target graphs (full vs. a single
-    base's closure) without redoing this work.
+    The base-local ``nx.MultiDiGraph`` is what makes scope-bounded
+    materialization cheap: composing it into the full graph or a
+    closure graph doesn't redo per-file apply work.
     """
     current_trie = SymbolTrie()
     export_trie = SymbolTrie()
@@ -603,9 +596,6 @@ def _build_contribution(
         payload = spec.hits.get(file)
         if payload is None:
             payload = miss_payloads[file]
-        # See ``_apply_payload``: a file's decls go into ``export_trie``
-        # only when the file lives under one of the base's exported dirs
-        # (or when the base has no export restriction).
         file_exported = export_roots is None or _under_any(file, export_roots)
         _apply_payload(
             payload,
@@ -622,7 +612,6 @@ def _build_contribution(
         export_trie=export_trie,
         base_graph=base_graph,
         import_edges=frozenset(import_edges),
-        dead_suites_per_file=dict(base_graph.graph["dead_suites"]),
     )
 
 
@@ -643,13 +632,11 @@ def _compose_contribution(
     merges every dep's exports, while the closure-scoped path merges
     only deps inside the requested scope.
     """
-    for n, attrs in contrib.base_graph.nodes(data=True):
-        target_graph.add_node(n)
-        if attrs.get("entrypoint"):
-            target_graph.nodes[n]["entrypoint"] = True
-    for u, v, attrs in contrib.base_graph.edges(data=True):
-        target_graph.add_edge(u, v, **attrs)
-    target_graph.graph.setdefault("dead_suites", {}).update(contrib.dead_suites_per_file)
+    target_graph.update(
+        edges=contrib.base_graph.edges(data=True, keys=True),
+        nodes=contrib.base_graph.nodes(data=True),
+    )
+    target_graph.graph.setdefault("dead_suites", {}).update(contrib.base_graph.graph["dead_suites"])
     for src, dst, flags in resolve_edges(contrib.import_edges, symbol_lookup, contrib.base):
         target_graph.add_edge(src, dst, flags=flags)
     if plugins:
@@ -824,11 +811,9 @@ class Analysis:
             if unreachable_detector is not None
             else DefaultUnreachableRegionDetector()
         )
+        self._dep_graph: nx.DiGraph | None = None
         self._ordered_bases: list[Path] | None = None
-        self._reverse_closures: dict[Path, frozenset[Path]] = {}
-        self._interesting_sets: dict[Path, frozenset[Path]] = {}
         self._base_specs: dict[Path, _BaseSpec] = {}
-        self._refreshed: set[Path] = set()
         self._contributions: dict[Path, _BaseContribution] = {}
         self._closure_graphs: dict[Path, nx.MultiDiGraph] = {}
         self._full_graph: nx.MultiDiGraph | None = None
@@ -842,11 +827,19 @@ class Analysis:
     def project_root(self) -> Path:
         return self._project_root
 
+    def _dep_dag(self) -> nx.DiGraph:
+        """``dep -> consumer`` DAG over ``paths.keys()``; reused by
+        topo-sort and ancestor / descendant queries.
+        """
+        if self._dep_graph is None:
+            self._dep_graph = _build_dep_graph(self._paths)
+        return self._dep_graph
+
     @property
     def bases(self) -> list[Path]:
         """Bases in topological order (deps before dependents)."""
         if self._ordered_bases is None:
-            self._ordered_bases = _order_paths(self._paths)
+            self._ordered_bases = list(nx.topological_sort(self._dep_dag()))
         return list(self._ordered_bases)
 
     def reverse_closure(self, base: Path) -> frozenset[Path]:
@@ -860,23 +853,7 @@ class Analysis:
         """
         if base not in self._paths:
             raise KeyError(base)
-        if base in self._reverse_closures:
-            return self._reverse_closures[base]
-        rev: dict[Path, set[Path]] = {b: set() for b in self.bases}
-        for b, deps in self._paths.items():
-            for dep in deps:
-                rev.setdefault(dep, set()).add(b)
-        result: set[Path] = {base}
-        stack = [base]
-        while stack:
-            n = stack.pop()
-            for parent in rev.get(n, ()):
-                if parent not in result:
-                    result.add(parent)
-                    stack.append(parent)
-        closure = frozenset(result)
-        self._reverse_closures[base] = closure
-        return closure
+        return frozenset({base}) | frozenset(nx.descendants(self._dep_dag(), base))
 
     def _interesting_set(self, base: Path) -> frozenset[Path]:
         """Bases needed to answer reachability queries about decls in ``base``.
@@ -886,22 +863,12 @@ class Analysis:
         deps, so we have enough trie data to resolve every cross-base
         import that could lead into ``base``.
         """
-        if base in self._interesting_sets:
-            return self._interesting_sets[base]
-        consumers = self.reverse_closure(base)
-        result: set[Path] = set()
-        stack: list[Path] = list(consumers)
-        while stack:
-            b = stack.pop()
-            if b in result:
-                continue
-            result.add(b)
-            for dep in self._paths.get(b, []):
-                if dep in self._paths and dep not in result:
-                    stack.append(dep)
-        scope = frozenset(result)
-        self._interesting_sets[base] = scope
-        return scope
+        dag = self._dep_dag()
+        scope: set[Path] = set()
+        for consumer in self.reverse_closure(base):
+            scope.add(consumer)
+            scope |= nx.ancestors(dag, consumer)
+        return frozenset(scope)
 
     def refresh(self, bases: Iterable[Path] | None = None) -> Analysis:
         """Update the cache and build per-base contributions for the given bases.
@@ -919,13 +886,14 @@ class Analysis:
         unknown = [b for b in targets if b not in self._paths]
         if unknown:
             raise KeyError(f"Unknown bases: {unknown}")
-        new_targets = [b for b in targets if b not in self._refreshed]
+        new_targets = [b for b in targets if b not in self._contributions]
         if not new_targets:
             return self
         for b in new_targets:
             if b not in self._base_specs:
-                fingerprint = self._base_fingerprint(b)
-                self._base_specs[b] = _build_base_spec(b, self._paths, self._cache, fingerprint)
+                self._base_specs[b] = _build_base_spec(
+                    b, self._paths[b], self._cache, self._base_fingerprint(b)
+                )
         partial_specs = {b: self._base_specs[b] for b in new_targets}
         miss_payloads = _compute_all_miss_payloads(
             base_specs=partial_specs,
@@ -939,7 +907,6 @@ class Analysis:
         )
         for b in new_targets:
             self._contributions[b] = _build_contribution(b, self._base_specs[b], miss_payloads[b])
-            self._refreshed.add(b)
         return self
 
     def package(self, base: Path) -> PackageView:
@@ -965,23 +932,10 @@ class Analysis:
         whole-project cache refresh in callers that don't refresh
         explicitly.
         """
-        if self._full_graph is not None:
-            return self._full_graph
-        self.refresh()
-        g = nx.MultiDiGraph()
-        g.graph["dead_suites"] = {}
-        for base in self.bases:
-            contrib = self._contributions[base]
-            symbol_lookup = self._build_symbol_lookup(base, scope=None)
-            _compose_contribution(
-                contrib,
-                target_graph=g,
-                symbol_lookup=symbol_lookup,
-                plugins=self._plugins,
-                project_root=self._project_root,
-            )
-        self._full_graph = g
-        return g
+        if self._full_graph is None:
+            self.refresh()
+            self._full_graph = self._materialize(scope=None)
+        return self._full_graph
 
     def materialize_closure(self, base: Path) -> nx.MultiDiGraph:
         """Build a graph containing every contribution in ``_interesting_set(base)``.
@@ -997,25 +951,30 @@ class Analysis:
         """
         if self._full_graph is not None:
             return self._full_graph
-        if base in self._closure_graphs:
-            return self._closure_graphs[base]
-        scope = self._interesting_set(base)
-        self.refresh(bases=scope)
-        g = nx.MultiDiGraph()
+        if base not in self._closure_graphs:
+            scope = self._interesting_set(base)
+            self.refresh(bases=scope)
+            self._closure_graphs[base] = self._materialize(scope=scope)
+        return self._closure_graphs[base]
+
+    def _materialize(self, *, scope: frozenset[Path] | None) -> nx.MultiDiGraph:
+        """Compose every refreshed base in ``scope`` into a fresh graph.
+
+        ``scope=None`` composes every base. Caller is responsible for
+        having :meth:`refresh`'d every base in ``scope`` first.
+        """
+        g: nx.MultiDiGraph = nx.MultiDiGraph()
         g.graph["dead_suites"] = {}
-        for b in self.bases:
-            if b not in scope:
+        for base in self.bases:
+            if scope is not None and base not in scope:
                 continue
-            contrib = self._contributions[b]
-            symbol_lookup = self._build_symbol_lookup(b, scope=scope)
             _compose_contribution(
-                contrib,
+                self._contributions[base],
                 target_graph=g,
-                symbol_lookup=symbol_lookup,
+                symbol_lookup=self._build_symbol_lookup(base, scope=scope),
                 plugins=self._plugins,
                 project_root=self._project_root,
             )
-        self._closure_graphs[base] = g
         return g
 
     def reachable(self) -> set[SymbolNode]:
@@ -1147,20 +1106,18 @@ class PackageView:
             if n.type == "module":
                 yield n
 
-    def declarations(self, simple_name: str | None = None) -> Iterator[SymbolNode]:
+    def declarations(self, name: str | None = None) -> Iterator[SymbolNode]:
         """Top-level decls in this base.
 
-        ``simple_name=None`` yields every decl. Pass a string to
-        filter to decls whose rightmost dotted segment matches it
-        (``"Foo"`` matches ``pkg.mod.Foo`` but not ``pkg.Foo.bar``).
-        Local-only.
+        ``name=None`` yields every decl. Pass a string to filter to
+        decls whose rightmost dotted segment matches it (``"Foo"``
+        matches ``pkg.mod.Foo`` but not ``pkg.Foo.bar``). Local-only.
         """
         for n in self._contribution().base_graph.nodes:
             if n.type in ("module", "synthetic"):
                 continue
-            if simple_name is not None:
-                if n.fqname.rpartition(".")[2] != simple_name:
-                    continue
+            if name is not None and simple_name(n.fqname) != name:
+                continue
             yield n
 
     def importers_of(self, target: str) -> set[Path]:
@@ -1173,28 +1130,14 @@ class PackageView:
         as :meth:`graph`) because cross-base import resolution is
         what populates the predecessors used here.
         """
-        g = self._analysis.materialize_closure(self._base)
-        target_node: SymbolNode | None = None
-        for node in g.nodes:
-            if node.type == "module" and node.fqname == target:
-                target_node = node
-                break
-        if target_node is None:
-            for prefix in SYNTHETIC_PATH_PREFIXES:
-                fq = f"{prefix}{target}"
-                for node in g.nodes:
-                    if node.type == "synthetic" and node.fqname == fq:
-                        target_node = node
-                        break
-                if target_node is not None:
-                    break
-        if target_node is None:
-            return set()
-        return {
-            pred.path
-            for pred in g.predecessors(target_node)
-            if pred.path != target_node.path and pred.path.is_relative_to(self._base)
-        }
+        scope = self._analysis._interesting_set(self._base)
+        ctx = PluginContext(
+            graph=self._analysis.materialize_closure(self._base),
+            symbol_lookup=self._analysis._build_symbol_lookup(self._base, scope=scope),
+            base=self._base,
+            project_root=self._analysis.project_root,
+        )
+        return ctx.importers(target)
 
     def graph(self) -> nx.MultiDiGraph:
         """Materialize and return the closure-scoped graph for this base.
@@ -1253,11 +1196,7 @@ class PackageView:
         ``module``, source decls, and any ``synthetic`` nodes plugins
         emitted into this base's contribution during ``observe``.
         """
-        contrib = self._contribution()
-        counts: dict[str, int] = {}
-        for n in contrib.base_graph.nodes:
-            counts[n.type] = counts.get(n.type, 0) + 1
-        return counts
+        return _count_nodes(self._contribution().base_graph, prefix=None)
 
     def remove_dead_code(self) -> None:
         """Apply the LibCST codemod, deleting every dead decl in this base.
