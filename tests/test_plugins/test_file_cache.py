@@ -10,7 +10,7 @@ from typing import Iterable
 import libcst as cst
 import networkx as nx
 
-from dead_cst import build_symbol_graph
+from dead_cst import Analysis
 from dead_cst.plugins import GraphOp, ObserveContext, PluginContext
 from dead_cst.graph import SymbolTrie
 
@@ -68,11 +68,11 @@ def test_base_modules_only_yields_under_base(tmp_path, write_files):
             seen_per_base[ctx.base] = {p.name for p, _ in ctx.base_modules()}
             return ()
 
-    build_symbol_graph(
+    Analysis(
         {tmp_path / "a": [], tmp_path / "b": []},
         plugins=[_Capture()],
         project_root=tmp_path,
-    )
+    ).materialize_all()
     # Each base only sees its own files, even though the full graph
     # contains both bases' nodes by the time the second base runs.
     assert seen_per_base[tmp_path / "a"] == {"__init__.py", "m.py"}
@@ -103,11 +103,11 @@ def test_importers_finds_first_party_imports(tmp_path, write_files):
             seen.update(ctx.importers("pkg.lib"))
             return ()
 
-    build_symbol_graph(
+    Analysis(
         {tmp_path: []},
         plugins=[_Capture()],
         project_root=tmp_path,
-    )
+    ).materialize_all()
     assert {p.name for p in seen} == {"uses_lib.py"}
 
 
@@ -134,11 +134,11 @@ def test_importers_finds_third_party_dist(tmp_path, write_files):
             seen.update(ctx.importers("typer"))
             return ()
 
-    build_symbol_graph(
+    Analysis(
         {tmp_path: []},
         plugins=[_Capture()],
         project_root=tmp_path,
-    )
+    ).materialize_all()
     assert {p.name for p in seen} == {"uses_typer.py"}
 
 
@@ -159,9 +159,9 @@ def test_importers_unknown_returns_empty(tmp_path, write_files):
             saw_empty = ctx.importers("definitely-not-a-module") == set()
             return ()
 
-    build_symbol_graph(
+    Analysis(
         {tmp_path: []},
         plugins=[_Capture()],
         project_root=tmp_path,
-    )
+    ).materialize_all()
     assert saw_empty

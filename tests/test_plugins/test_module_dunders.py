@@ -2,17 +2,17 @@
 
 from __future__ import annotations
 
-from dead_cst import build_symbol_graph
+from dead_cst import Analysis
 from dead_cst.plugins import ModuleDundersPlugin
 
 
 def test_keeps_all_alive(tmp_path, write_files, reachable_fqnames):
     write_files({"pkg/__init__.py": '__all__ = ["a"]\na = 1'})
-    graph = build_symbol_graph(
+    graph = Analysis(
         {tmp_path: []},
         plugins=[ModuleDundersPlugin()],
         project_root=tmp_path,
-    )
+    ).materialize_all()
     reached = reachable_fqnames(graph)
     assert "pkg.__all__" in reached
     # The visitor wires __all__ -> decl edges for string-literal entries,
@@ -28,11 +28,11 @@ def test_keeps_other_dunders_alive(tmp_path, write_files, reachable_fqnames):
             ),
         }
     )
-    graph = build_symbol_graph(
+    graph = Analysis(
         {tmp_path: []},
         plugins=[ModuleDundersPlugin()],
         project_root=tmp_path,
-    )
+    ).materialize_all()
     reached = reachable_fqnames(graph)
     assert {"pkg.__version__", "pkg.__author__", "pkg.__license__"} <= reached
     # plain (non-dunder) variables are still dead absent another entrypoint
@@ -47,11 +47,11 @@ def test_keeps_future_imports_alive(tmp_path, write_files, reachable_fqnames):
             ),
         }
     )
-    graph = build_symbol_graph(
+    graph = Analysis(
         {tmp_path: []},
         plugins=[ModuleDundersPlugin()],
         project_root=tmp_path,
-    )
+    ).materialize_all()
     reached = reachable_fqnames(graph)
     # The local bindings of ``from __future__ import X`` are kept alive
     # even though ``X`` is not a dunder name -- the import itself is a
@@ -66,11 +66,11 @@ def test_ignores_non_future_imports_with_plain_names(tmp_path, write_files, reac
             "pkg/__init__.py": "from os import path\n",
         }
     )
-    graph = build_symbol_graph(
+    graph = Analysis(
         {tmp_path: []},
         plugins=[ModuleDundersPlugin()],
         project_root=tmp_path,
-    )
+    ).materialize_all()
     reached = reachable_fqnames(graph)
     # Non-``__future__`` imports of plain names stay dead absent another entrypoint.
     assert "pkg.path" not in reached
@@ -86,11 +86,11 @@ def test_ignores_non_dunder_underscore_names(tmp_path, write_files, reachable_fq
             ),
         }
     )
-    graph = build_symbol_graph(
+    graph = Analysis(
         {tmp_path: []},
         plugins=[ModuleDundersPlugin()],
         project_root=tmp_path,
-    )
+    ).materialize_all()
     reached = reachable_fqnames(graph)
     assert "pkg._private" not in reached
     assert "pkg.__mangled" not in reached

@@ -11,7 +11,8 @@ import networkx as nx
 import pytest
 from libcst.metadata import CodePosition, CodeRange
 
-from dead_cst import build_symbol_graph, find_reachable
+from dead_cst import Analysis
+from dead_cst.analyze import _find_reachable as find_reachable
 from dead_cst.plugins import MainBlockPlugin, ProjectScriptsPlugin
 from dead_cst.plugins._core import (
     AddEdge,
@@ -32,7 +33,7 @@ from dead_cst.graph import SymbolNode, SymbolTrie
 
 def test_no_plugins_means_nothing_reachable(tmp_path, write_files):
     write_files({"pkg/__init__.py": "", "pkg/a.py": "def f(): pass"})
-    graph = build_symbol_graph({tmp_path: []})
+    graph = Analysis({tmp_path: []}).materialize_all()
     assert find_reachable(graph) == set()
 
 
@@ -54,11 +55,11 @@ def test_plugins_compose(tmp_path, write_files, reachable_fqnames):
             """,
         }
     )
-    graph = build_symbol_graph(
+    graph = Analysis(
         {tmp_path: []},
         plugins=[MainBlockPlugin(), ProjectScriptsPlugin()],
         project_root=tmp_path,
-    )
+    ).materialize_all()
     assert {"pkg.runner", "pkg.cli", "pkg.cli.main"} <= reachable_fqnames(graph)
 
 

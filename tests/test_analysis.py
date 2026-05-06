@@ -21,7 +21,7 @@ from pathlib import Path
 
 import pytest
 
-from dead_cst import Analysis, build_symbol_graph
+from dead_cst import Analysis
 from dead_cst.cache import CACHE_DIR_NAME, GraphCache
 from dead_cst.plugins import ExplicitEntrypointPlugin
 
@@ -166,33 +166,8 @@ def test_package_dead_uses_closure_only(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# materialize_all parity with build_symbol_graph.
+# Reachability + dead semantics.
 # ---------------------------------------------------------------------------
-
-
-def _node_set(g):
-    return {(n.fqname, n.type) for n in g.nodes}
-
-
-def _edge_set(g):
-    return {(s.fqname, d.fqname) for s, d in g.edges()}
-
-
-def test_materialize_all_matches_build_symbol_graph(tmp_path):
-    """:meth:`Analysis.materialize_all` and :func:`build_symbol_graph`
-    return equivalent graphs (same nodes, same edges)."""
-    _write(
-        tmp_path,
-        {
-            "pkg/__init__.py": "",
-            "pkg/a.py": "def f(): pass\ndef g(): return f()\n",
-            "pkg/b.py": "from .a import g\ndef h(): return g()\n",
-        },
-    )
-    legacy = build_symbol_graph({tmp_path: []})
-    direct = Analysis({tmp_path: []}).materialize_all()
-    assert _node_set(direct) == _node_set(legacy)
-    assert _edge_set(direct) == _edge_set(legacy)
 
 
 def test_package_dead_matches_full_dead_slice(tmp_path):

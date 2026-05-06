@@ -15,7 +15,7 @@ import networkx as nx
 import typer
 from libcst.metadata import CodeRange
 
-from .analyze import build_symbol_graph, count_nodes, find_reachable, order_paths
+from .analyze import Analysis, _count_nodes, _find_reachable, _order_paths
 from .cache import (
     GraphCache,
     clear_cache,
@@ -209,15 +209,15 @@ def analyze(
         plugin_names=plugin or [],
     )
     with _maybe_cache(root, paths_dict, resolvers, plugins, no_cache) as cache:
-        graph = build_symbol_graph(
+        graph = Analysis(
             paths_dict,
             plugins=plugins,
             resolvers=resolvers,
             project_root=root,
             cache=cache,
             workers=workers,
-        )
-    reachable = find_reachable(graph)
+        ).materialize_all()
+    reachable = _find_reachable(graph)
 
     unreachable_graph = graph.subgraph([n for n in graph.nodes if n not in reachable])
 
@@ -236,10 +236,10 @@ def _output_text(
     root: Path,
     paths_dict: PathMap,
 ) -> None:
-    for base in order_paths(paths_dict):
+    for base in _order_paths(paths_dict):
         typer.echo(f"\n{base}:")
-        total_counts = count_nodes(graph, base)
-        unreachable_counts = count_nodes(unreachable, base)
+        total_counts = _count_nodes(graph, base)
+        unreachable_counts = _count_nodes(unreachable, base)
         for kind in sorted(total_counts):
             # Synthetic nodes (entrypoint sentinels, external-dist markers,
             # dunder-all stand-ins) don't represent user-visible
@@ -313,10 +313,10 @@ def _output_json(
         "unreachable_branches": [],
     }
 
-    for base in order_paths(paths_dict):
+    for base in _order_paths(paths_dict):
         base_str = str(base)
-        total_counts = count_nodes(graph, base)
-        unreachable_counts = count_nodes(unreachable, base)
+        total_counts = _count_nodes(graph, base)
+        unreachable_counts = _count_nodes(unreachable, base)
         # Same rationale as the text output: synthetic nodes are reported
         # via ``unreachable_branches`` (and entrypoint sentinels), not as
         # part of the per-kind summary.
@@ -383,14 +383,14 @@ def why_alive(
         plugin_names=plugin or [],
     )
     with _maybe_cache(root, paths_dict, resolvers, plugins, no_cache) as cache:
-        graph = build_symbol_graph(
+        graph = Analysis(
             paths_dict,
             plugins=plugins,
             resolvers=resolvers,
             project_root=root,
             cache=cache,
             workers=workers,
-        )
+        ).materialize_all()
 
     target_node: SymbolNode | None = None
     for node in graph.nodes:
@@ -456,15 +456,15 @@ def dependencies(
 
     typer.echo(f"Building symbol graph for {root}...", err=True)
     with _maybe_cache(root, paths_dict, resolvers, [], no_cache) as cache:
-        graph = build_symbol_graph(
+        graph = Analysis(
             paths_dict,
             resolvers=resolvers,
             project_root=root,
             cache=cache,
             workers=workers,
-        )
+        ).materialize_all()
 
-    deps_by_base: dict[Path, list[SymbolNode]] = {base: [] for base in order_paths(paths_dict)}
+    deps_by_base: dict[Path, list[SymbolNode]] = {base: [] for base in _order_paths(paths_dict)}
     for node in graph.nodes:
         if not _is_external_dep(node):
             continue
@@ -530,15 +530,15 @@ def unused_exports(
         plugin_names=plugin or [],
     )
     with _maybe_cache(root, paths_dict, resolvers, plugins, no_cache) as cache:
-        graph = build_symbol_graph(
+        graph = Analysis(
             paths_dict,
             plugins=plugins,
             resolvers=resolvers,
             project_root=root,
             cache=cache,
             workers=workers,
-        )
-    reachable = find_reachable(graph)
+        ).materialize_all()
+    reachable = _find_reachable(graph)
 
     # ModuleDundersPlugin keeps each ``__all__`` alive via a synthetic
     # entrypoint node ``<dunder>:<fqname>``. Cut the edge from each such
@@ -552,7 +552,7 @@ def unused_exports(
             if _is_dunder_all(d) and s.type == "synthetic" and s.fqname.startswith(DUNDER_PREFIX)
         ]
     )
-    reachable_without_all = find_reachable(pruned)
+    reachable_without_all = _find_reachable(pruned)
     only_via_all = reachable - reachable_without_all
 
     by_all: dict[SymbolNode, list[SymbolNode]] = {}
@@ -619,15 +619,15 @@ def remove(
         plugin_names=plugin or [],
     )
     with _maybe_cache(root, paths_dict, resolvers, plugins, no_cache) as cache:
-        graph = build_symbol_graph(
+        graph = Analysis(
             paths_dict,
             plugins=plugins,
             resolvers=resolvers,
             project_root=root,
             cache=cache,
             workers=workers,
-        )
-    reachable = find_reachable(graph)
+        ).materialize_all()
+    reachable = _find_reachable(graph)
 
     unreachable_graph = graph.subgraph([n for n in graph.nodes if n not in reachable])
 
@@ -653,7 +653,7 @@ def remove(
         typer.echo("Aborted.")
         return
 
-    for base in order_paths(paths_dict):
+    for base in _order_paths(paths_dict):
         remove_code(unreachable_graph, base)
 
     typer.echo("Dead code removed.")

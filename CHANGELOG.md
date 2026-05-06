@@ -9,6 +9,26 @@ two versions.
 
 ## [Unreleased]
 
+### Removed
+- **Breaking (top-level API):** `build_symbol_graph`, `find_reachable`,
+  `find_kept_alive_by_dead_branches`, `count_nodes`, `order_paths`,
+  and the top-level `remove_code` re-export are gone. Replace with
+  the equivalent `Analysis` / `PackageView` methods:
+  - `build_symbol_graph(...)` -> `Analysis(...).materialize_all()`
+    (returns the same `nx.MultiDiGraph` for callers that want raw
+    access).
+  - `find_reachable(graph)` -> `Analysis.reachable()` /
+    `PackageView.reachable()`.
+  - `find_kept_alive_by_dead_branches(graph)` ->
+    `Analysis.kept_alive_by_dead_branches()` /
+    `PackageView.kept_alive_by_dead_branches()`.
+  - `count_nodes(graph, prefix)` -> `Analysis.count_nodes(prefix)` /
+    `PackageView.count_nodes()`.
+  - `order_paths(paths)` -> `Analysis(...).bases`.
+  - `remove_code(graph, base)` -> `PackageView.remove_dead_code()`
+    for the high-level entry point. The standalone function is still
+    available at `dead_cst.codemod.remove_code` for power users.
+
 ### Added
 - New primary API: `dead_cst.Analysis` and `dead_cst.PackageView`,
   the lazy entry point that callers should reach for on large repos.

@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from dead_cst import build_symbol_graph
+from dead_cst import Analysis
 from dead_cst.cache import (
     CACHE_DIR_NAME,
     GraphCache,
@@ -75,8 +75,8 @@ def _multi_file_layout() -> dict[str, str]:
 def test_parallel_matches_serial(tmp_path):
     """``workers=2`` and the default serial path return the same graph."""
     _write(tmp_path, _multi_file_layout())
-    serial = build_symbol_graph({tmp_path: []})
-    parallel = build_symbol_graph({tmp_path: []}, workers=2)
+    serial = Analysis({tmp_path: []}).materialize_all()
+    parallel = Analysis({tmp_path: []}, workers=2).materialize_all()
     assert _node_set(parallel) == _node_set(serial)
     assert _edge_set(parallel) == _edge_set(serial)
 
@@ -88,7 +88,7 @@ def test_parallel_warms_cache(tmp_path):
     fp = _fp(tmp_path)
 
     with GraphCache(db) as cache:
-        cold = build_symbol_graph({tmp_path: []}, cache=cache, workers=2)
+        cold = Analysis({tmp_path: []}, cache=cache, workers=2).materialize_all()
 
     files = sorted(tmp_path.rglob("*.py"))
     with GraphCache(db) as cache:
@@ -96,7 +96,7 @@ def test_parallel_warms_cache(tmp_path):
             assert cache.get(f, fp) is not None, f"{f} missing from cache after parallel run"
 
     with GraphCache(db) as cache:
-        warm = build_symbol_graph({tmp_path: []}, cache=cache)
+        warm = Analysis({tmp_path: []}, cache=cache).materialize_all()
     assert _node_set(warm) == _node_set(cold)
     assert _edge_set(warm) == _edge_set(cold)
 
@@ -107,7 +107,7 @@ def test_parallel_falls_back_to_serial_for_single_miss(tmp_path, monkeypatch):
     db = tmp_path / CACHE_DIR_NAME / "cache.db"
 
     with GraphCache(db) as cache:
-        build_symbol_graph({tmp_path: []}, cache=cache)
+        Analysis({tmp_path: []}, cache=cache).materialize_all()
 
     (tmp_path / "pkg" / "a.py").write_text("def f():\n    return 1\n")
 
@@ -122,7 +122,7 @@ def test_parallel_falls_back_to_serial_for_single_miss(tmp_path, monkeypatch):
 
     monkeypatch.setattr(analyze, "ProcessPoolExecutor", _spy)
     with GraphCache(db) as cache:
-        build_symbol_graph({tmp_path: []}, cache=cache, workers=4)
+        Analysis({tmp_path: []}, cache=cache, workers=4).materialize_all()
     assert calls == [], "single-miss run should not spawn a pool"
 
 
@@ -140,7 +140,7 @@ def test_parallel_pool_capped_at_total_task_count(tmp_path, monkeypatch):
         return real(*args, **kwargs)
 
     monkeypatch.setattr(analyze, "ProcessPoolExecutor", _spy)
-    build_symbol_graph({tmp_path: []}, workers=64)
+    Analysis({tmp_path: []}, workers=64).materialize_all()
     # Five files in _multi_file_layout(); pool should be capped at 5.
     assert seen == [5]
 
@@ -159,7 +159,7 @@ def test_workers_none_or_one_keeps_serial_path(tmp_path, monkeypatch, workers):
         return real(*args, **kwargs)
 
     monkeypatch.setattr(analyze, "ProcessPoolExecutor", _spy)
-    build_symbol_graph({tmp_path: []}, workers=workers)
+    Analysis({tmp_path: []}, workers=workers).materialize_all()
     assert calls == []
 
 
@@ -194,7 +194,7 @@ def test_multi_base_uses_one_pool(tmp_path, monkeypatch):
         return real(*args, **kwargs)
 
     monkeypatch.setattr(analyze, "ProcessPoolExecutor", _spy)
-    build_symbol_graph({base_a: [], base_b: []}, workers=2)
+    Analysis({base_a: [], base_b: []}, workers=2).materialize_all()
     assert len(pool_calls) == 1, f"expected exactly one pool across both bases, got {pool_calls!r}"
 
 
@@ -219,8 +219,8 @@ def test_multi_base_parallel_matches_serial(tmp_path):
         },
     )
     paths = {base_a: [], base_b: []}
-    serial = build_symbol_graph(paths)
-    parallel = build_symbol_graph(paths, workers=2)
+    serial = Analysis(paths).materialize_all()
+    parallel = Analysis(paths, workers=2).materialize_all()
     assert _node_set(parallel) == _node_set(serial)
     assert _edge_set(parallel) == _edge_set(serial)
 
@@ -257,7 +257,7 @@ def test_tasks_sorted_by_search_paths(tmp_path, monkeypatch):
         return real_map(self, fn, materialized, *args, **kwargs)
 
     monkeypatch.setattr(analyze.ProcessPoolExecutor, "map", _spy_map)
-    build_symbol_graph({base_a: [], base_b: []}, workers=2)
+    Analysis({base_a: [], base_b: []}, workers=2).materialize_all()
 
     assert len(captured) == 1
     sps = captured[0]

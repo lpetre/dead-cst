@@ -45,7 +45,7 @@ from .resolvers import (
 logger = logging.getLogger(__name__)
 
 
-def order_paths(paths: PathMap) -> list[Path]:
+def _order_paths(paths: PathMap) -> list[Path]:
     """Topologically sort ``paths.keys()`` so dependencies are processed first.
 
     ``paths`` maps each base directory to the list of other paths that
@@ -91,84 +91,6 @@ def _chain_resolvers(resolvers: Sequence[PathResolver]) -> ImportResolver:
         return None
 
     return _resolve
-
-
-def build_symbol_graph(
-    paths: PathMap,
-    *,
-    plugins: Sequence[EdgePlugin] = (),
-    resolvers: Sequence[PathResolver] = (),
-    project_root: Path | None = None,
-    cache: GraphCache | None = None,
-    unreachable_detector: UnreachableRegionDetector | None = None,
-    workers: int | None = None,
-) -> nx.MultiDiGraph:
-    """Build a directed reachability graph of every top-level symbol under ``paths``.
-
-    Thin wrapper over :class:`Analysis` for callers that want the whole
-    graph in one shot. Equivalent to::
-
-        Analysis(
-            paths,
-            plugins=plugins,
-            resolvers=resolvers,
-            project_root=project_root,
-            cache=cache,
-            unreachable_detector=unreachable_detector,
-            workers=workers,
-        ).materialize_all()
-
-    For incremental queries (single package, lazy materialization,
-    scoped cache refresh), construct an :class:`Analysis` directly.
-
-    Each ``.py`` file under each base is parsed with LibCST; modules,
-    classes, functions, top-level variables, and module-level imports
-    become :class:`SymbolNode` graph nodes. Edges encode "keeps alive"
-    relationships:
-
-    * a reference points at its referent,
-    * a declaration points at its containing module, and
-    * a submodule points at its parent package.
-
-    References made from inside a statically-dead suite are still emitted
-    but tagged with :data:`EdgeFlags.DEAD_BRANCH`. Default
-    :func:`find_reachable` does not filter on the flag, so those refs
-    still propagate liveness through the enclosing decl. The opt-in
-    :func:`find_kept_alive_by_dead_branches` returns the set of symbols
-    that would become unreachable if every dead suite were removed.
-
-    Third-party imports are surfaced as synthetic ``[external dist] <name>``
-    / ``[external file] <name>`` nodes so callers can audit the
-    project's dependency surface (see the ``dependencies`` CLI command).
-
-    Plugins run once per base in topological order, after that base's import
-    edges have been resolved. Each plugin invocation gets a per-base
-    :class:`PluginContext`; its :meth:`PluginContext.parse` lazily reads +
-    parses files on first request and memoizes the result for the rest
-    of the analysis.
-
-    See :class:`Analysis` for the full parameter documentation; the
-    arguments here are passed through verbatim.
-
-    Returns
-    -------
-    networkx.MultiDiGraph
-        Nodes are :class:`SymbolNode` instances. Edges carry a ``flags``
-        attribute (:class:`EdgeFlags`); ``DEAD_BRANCH``-flagged edges
-        originated inside a statically-dead suite. Entrypoint seeds
-        carry ``graph.nodes[node]["entrypoint"] = True``. Per-file
-        dead-suite positions are exposed via ``graph.graph["dead_suites"]``,
-        a ``{path: tuple[CodeRange]}`` mapping.
-    """
-    return Analysis(
-        paths,
-        plugins=plugins,
-        resolvers=resolvers,
-        project_root=project_root,
-        cache=cache,
-        unreachable_detector=unreachable_detector,
-        workers=workers,
-    ).materialize_all()
 
 
 def _run_observe(
@@ -763,18 +685,16 @@ def _infer_project_root(paths: PathMap) -> Path:
     return min(bases, key=lambda p: len(p.parts))
 
 
-def find_reachable(graph: nx.MultiDiGraph) -> set[SymbolNode]:
+def _find_reachable(graph: nx.MultiDiGraph) -> set[SymbolNode]:
     """BFS forward from every node tagged as an entrypoint by a plugin.
 
     Plugins mark seeds by setting ``graph.nodes[node]["entrypoint"] = True``
-    (see :func:`dead_cst.plugins.apply_ops`). There is no longer any
-    built-in matching against file paths or FQNs -- that lives in
-    :class:`ExplicitEntrypointPlugin`.
+    (see :func:`dead_cst.plugins.apply_ops`).
 
     Edges flagged with :data:`EdgeFlags.DEAD_BRANCH` are NOT filtered
     here -- today's behavior, where dead-code references propagate
     liveness through the enclosing decl, is preserved. See
-    :func:`find_kept_alive_by_dead_branches` for the strict alternative.
+    :func:`_find_reachable_strict` for the variant that skips them.
     """
     visited: set[SymbolNode] = set()
     stack = [n for n, attrs in graph.nodes(data=True) if attrs.get("entrypoint")]
@@ -788,7 +708,7 @@ def find_reachable(graph: nx.MultiDiGraph) -> set[SymbolNode]:
 
 
 def _find_reachable_strict(graph: nx.MultiDiGraph) -> set[SymbolNode]:
-    """Like :func:`find_reachable` but skips ``DEAD_BRANCH``-flagged edges."""
+    """Like :func:`_find_reachable` but skips ``DEAD_BRANCH``-flagged edges."""
     visited: set[SymbolNode] = set()
     stack = [n for n, attrs in graph.nodes(data=True) if attrs.get("entrypoint")]
     while stack:
@@ -803,33 +723,27 @@ def _find_reachable_strict(graph: nx.MultiDiGraph) -> set[SymbolNode]:
     return visited
 
 
-def find_kept_alive_by_dead_branches(graph: nx.MultiDiGraph) -> set[SymbolNode]:
-    """Return symbols that would become unreachable if every dead suite were removed.
+def _find_kept_alive_by_dead_branches(graph: nx.MultiDiGraph) -> set[SymbolNode]:
+    """Symbols kept alive only via at least one ``DEAD_BRANCH`` edge.
 
-    Computed as ``find_reachable(graph) -`` strict-mode BFS that skips
-    every edge flagged :data:`EdgeFlags.DEAD_BRANCH`. The resulting set
-    is the "blast radius" of removing every statically-dead suite in
-    the analyzed source -- symbols currently kept alive only through a
-    chain that crosses at least one dead-branch reference.
-
-    Used by tooling that reports "if you removed your unreachable
-    code, these additional symbols would also become dead." Default
-    :func:`find_reachable` is unchanged; this is an opt-in stricter
-    pass.
+    ``_find_reachable(graph) -`` strict-mode BFS that skips every edge
+    flagged :data:`EdgeFlags.DEAD_BRANCH`; the difference is the
+    "blast radius" of removing every statically-dead suite. Surfaced
+    on :class:`Analysis` as :meth:`Analysis.kept_alive_by_dead_branches`
+    and on :class:`PackageView` as
+    :meth:`PackageView.kept_alive_by_dead_branches`.
     """
-    return find_reachable(graph) - _find_reachable_strict(graph)
+    return _find_reachable(graph) - _find_reachable_strict(graph)
 
 
-def count_nodes(graph: nx.MultiDiGraph, prefix: Path | None) -> dict[str, int]:
+def _count_nodes(graph: nx.MultiDiGraph, prefix: Path | None) -> dict[str, int]:
     """Count nodes in ``graph`` by ``SymbolNode.type``, optionally restricted by path.
 
-    If ``prefix`` is given, only nodes whose ``path`` is under ``prefix`` are
-    counted -- useful for per-base summaries when several packages are
-    analysed together. Includes the synthetic ``"synthetic"`` type contributed
-    by plugins and third-party-dep markers; the CLI suppresses that key when
-    rendering summaries.
+    If ``prefix`` is given, only nodes whose ``path`` is under ``prefix``
+    are counted. Includes the synthetic ``"synthetic"`` type contributed
+    by plugins and third-party-dep markers.
     """
-    counts = {}
+    counts: dict[str, int] = {}
     for node in graph.nodes:
         if prefix and not node.path.is_relative_to(prefix):
             continue
@@ -932,7 +846,7 @@ class Analysis:
     def bases(self) -> list[Path]:
         """Bases in topological order (deps before dependents)."""
         if self._ordered_bases is None:
-            self._ordered_bases = order_paths(self._paths)
+            self._ordered_bases = _order_paths(self._paths)
         return list(self._ordered_bases)
 
     def reverse_closure(self, base: Path) -> frozenset[Path]:
@@ -1106,7 +1020,7 @@ class Analysis:
 
     def reachable(self) -> set[SymbolNode]:
         """Set of every decl reachable from any entrypoint in the full graph."""
-        return find_reachable(self.materialize_all())
+        return _find_reachable(self.materialize_all())
 
     def dead(self) -> Iterator[SymbolNode]:
         """Yield every decl that no entrypoint reaches.
@@ -1117,12 +1031,40 @@ class Analysis:
         plumbing rather than user-visible decls.
         """
         g = self.materialize_all()
-        reachable = find_reachable(g)
+        reachable = _find_reachable(g)
         for n in g.nodes:
             if n.type in ("module", "synthetic"):
                 continue
             if n not in reachable:
                 yield n
+
+    def kept_alive_by_dead_branches(self) -> set[SymbolNode]:
+        """Symbols that would become unreachable if every dead suite were removed.
+
+        Computed as ``reachable() -`` strict-mode BFS that skips every
+        edge flagged :data:`EdgeFlags.DEAD_BRANCH`. The resulting set
+        is the "blast radius" of removing every statically-dead suite
+        in the analyzed source -- symbols currently kept alive only
+        through a chain that crosses at least one dead-branch
+        reference.
+
+        Used by tooling that reports "if you removed your unreachable
+        code, these additional symbols would also become dead." The
+        default :meth:`reachable` traversal is unchanged; this is the
+        opt-in stricter pass.
+        """
+        g = self.materialize_all()
+        return _find_reachable(g) - _find_reachable_strict(g)
+
+    def count_nodes(self, prefix: Path | None = None) -> dict[str, int]:
+        """Count nodes in the full graph by ``SymbolNode.type``.
+
+        ``prefix=None`` (the default) counts every node. Pass a base
+        path to scope the count to nodes whose ``path`` is under that
+        prefix -- useful for per-base summaries when several bases are
+        analysed together.
+        """
+        return _count_nodes(self.materialize_all(), prefix)
 
     def _base_fingerprint(self, base: Path) -> str:
         """Per-base cache fingerprint for ``base``.
@@ -1263,6 +1205,19 @@ class PackageView:
         """
         return self._analysis.materialize_closure(self._base)
 
+    def reachable(self) -> set[SymbolNode]:
+        """Set of decls in this base reachable from any entrypoint in
+        :meth:`reverse_closure`.
+
+        Triggers closure materialization on first call; subsequent
+        calls reuse the cached graph. Filtered to nodes whose ``path``
+        is under :attr:`base`, so the result is comparable to
+        :meth:`declarations` for "what's alive in this package?"
+        questions.
+        """
+        g = self._analysis.materialize_closure(self._base)
+        return {n for n in _find_reachable(g) if n.path.is_relative_to(self._base)}
+
     def dead(self) -> Iterator[SymbolNode]:
         """Yield decls in this base not reachable from any entrypoint
         in :meth:`reverse_closure`.
@@ -1272,7 +1227,7 @@ class PackageView:
         ``synthetic`` nodes (see :meth:`Analysis.dead`).
         """
         g = self._analysis.materialize_closure(self._base)
-        reachable = find_reachable(g)
+        reachable = _find_reachable(g)
         for n in g.nodes:
             if not n.path.is_relative_to(self._base):
                 continue
@@ -1281,13 +1236,47 @@ class PackageView:
             if n not in reachable:
                 yield n
 
+    def kept_alive_by_dead_branches(self) -> set[SymbolNode]:
+        """Decls in this base kept alive only by dead-branch references.
+
+        Closure-scoped equivalent of :meth:`Analysis.kept_alive_by_dead_branches`,
+        filtered to nodes under :attr:`base`.
+        """
+        g = self._analysis.materialize_closure(self._base)
+        diff = _find_reachable(g) - _find_reachable_strict(g)
+        return {n for n in diff if n.path.is_relative_to(self._base)}
+
+    def count_nodes(self) -> dict[str, int]:
+        """Count nodes contributed by this base, by ``SymbolNode.type``.
+
+        Local-only: doesn't materialize the closure. Counts include
+        ``module``, source decls, and any ``synthetic`` nodes plugins
+        emitted into this base's contribution during ``observe``.
+        """
+        contrib = self._contribution()
+        counts: dict[str, int] = {}
+        for n in contrib.base_graph.nodes:
+            counts[n.type] = counts.get(n.type, 0) + 1
+        return counts
+
+    def remove_dead_code(self) -> None:
+        """Apply the LibCST codemod, deleting every dead decl in this base.
+
+        Materializes the closure, computes reachability, and feeds the
+        unreachable subgraph (filtered to this base) to
+        :func:`dead_cst.codemod.remove_code`. The transformation is
+        destructive -- back the files up first, or run on a clean
+        working tree.
+        """
+        from .codemod import remove_code
+
+        g = self._analysis.materialize_closure(self._base)
+        reachable = _find_reachable(g)
+        dead_nodes = [n for n in g.nodes if n not in reachable]
+        remove_code(g.subgraph(dead_nodes), self._base)
+
 
 __all__ = [
     "Analysis",
     "PackageView",
-    "build_symbol_graph",
-    "count_nodes",
-    "find_kept_alive_by_dead_branches",
-    "find_reachable",
-    "order_paths",
 ]
