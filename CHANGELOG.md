@@ -9,7 +9,50 @@ two versions.
 
 ## [Unreleased]
 
+### Changed (breaking)
+- Resolver protocol now operates on a flat list of
+  `dead_cst.SourceTree` entries (a directory + `package` name +
+  `SourceTreeFlags` + `search_trees`) rather than the previous
+  `PathMap = dict[base, [dep_paths]]`. Each package may carry at
+  most one `EXPORTED` tree; non-exported trees (tests, scripts,
+  internal helpers) participate in the analysis but do not appear
+  in the package's consumer-visible export trie. Files are routed
+  to their longest-prefix-matching tree, so a package can split
+  itself into multiple subtrees with different `search_trees`
+  (e.g. `pkg/`, `pkg/tests/`, `pkg/scripts/`) without per-file
+  shims. `validate_source_trees` enforces the invariants
+  (one EXPORTED per package, every search ref points at an
+  EXPORTED tree, no self-reference, acyclic).
+- `PathResolver.resolve` now returns `list[SourceTree]`. The shipped
+  resolvers (`PyprojectResolver`, `ManualResolver`,
+  `UvWorkspaceResolver`) all return tree lists.
+- `dead-cst` no longer threads venv `site-packages` paths through the
+  resolver protocol. Run `dead-cst` with the project's virtual
+  environment active (`uv run dead-cst ...` or activate the venv
+  first) so third-party imports resolve via the running Python's
+  `sys.path`.
+
+### Removed
+- `VenvResolver`, `MissingVenvError`, `find_venv_site_packages`. The
+  venv-aware behavior they encoded is replaced by the
+  "run-with-venv-active" contract above.
+- `dead_cst.resolvers.exported_roots` and the `_exports.py` module.
+  The pyproject-wheel-target discovery the function performed is now
+  an internal step inside `PyprojectResolver` when it builds the
+  fallback tree list.
+- `dead_cst.resolvers.PathMap` and `dead_cst.resolvers.merge_paths`.
+  Multiple resolvers' `SourceTree` lists concatenate; there is no
+  per-base merge step.
+
 ### Added
+- `dead_cst.SourceTree`, `dead_cst.SourceTreeFlags` (with
+  `EXPORTED`), `dead_cst.resolvers.validate_source_trees`,
+  `dead_cst.resolvers.assign_file_to_tree`. The first two are
+  re-exported from the top-level `dead_cst` package.
+- `[tool.dead-cst].trees` configuration in `pyproject.toml`: an
+  explicit list of trees with their `path`, `package`, `exported`
+  flag, and `search_trees`, for projects whose layout doesn't fit
+  the conventional fallback (`src/`, `tests/`).
 - New primary API: `dead_cst.Analysis` and `dead_cst.PackageView`,
   the lazy entry point that callers should reach for on large repos.
   Construction is cheap (no filesystem walk, no parsing). `refresh()`

@@ -141,7 +141,7 @@ dead-cst remove ROOT -e ENTRYPOINT [OPTIONS]
 
 ### `dead-cst cache clear`
 
-Delete the on-disk `VisitorPayload` cache (`<root>/.dead-cst-cache/`) for a project. The cache is keyed by a fingerprint over the `PathMap` and every `Cacheable` component (visitor, resolvers, plugins, unreachable-region detector), so most layout or analyzer-version changes invalidate it automatically; this command is for force-clearing when needed.
+Delete the on-disk `VisitorPayload` cache (`<root>/.dead-cst-cache/`) for a project. The cache is keyed by a fingerprint over each `SourceTree`'s search paths and every `Cacheable` component (visitor, resolvers, plugins, unreachable-region detector), so most layout or analyzer-version changes invalidate it automatically; this command is for force-clearing when needed.
 
 ```
 dead-cst cache clear [ROOT]
@@ -222,7 +222,7 @@ class MyInternalModulesPlugin(LiteralListPlugin):
 
 Write your own from scratch by implementing the `EdgePlugin` protocol (`name`, `version`, `observe`, `finalize`); register under the `dead_cst.plugins` entry-point group for CLI discovery.
 
-Path resolution is similarly pluggable. `PathResolver` implementations return a `{base: [dep_paths]}` map to feed `Analysis`. Builtins: `VenvResolver`, `PyprojectResolver`, `UvWorkspaceResolver` (parses `uv.lock` to discover workspace members and their inter-member dep edges). Third-party resolvers register under `dead_cst.resolvers`.
+Path resolution is similarly pluggable. `PathResolver` implementations return a `list[SourceTree]` to feed `Analysis`. Each `SourceTree` is a directory + `package` name + `SourceTreeFlags` + `search_trees` (other trees this one's files can import from); files are routed to their longest-prefix-matching tree, so a package can split into `src/`, `tests/`, `scripts/` subtrees with different search paths. Builtins: `PyprojectResolver` (explicit `[tool.dead-cst].trees` or fallback to `src/` + sibling `tests/`), `UvWorkspaceResolver` (parses `uv.lock` to discover workspace members and their inter-member dep edges). Third-party resolvers register under `dead_cst.resolvers`. Run `dead-cst` with the project's venv active so `default_resolve_import` finds third-party dists via the running Python's `sys.path`.
 
 Unreachable-code detection is pluggable through the `UnreachableRegionDetector` protocol. `Analysis` accepts an `unreachable_detector` whose `find_regions(wrapper) -> list[CodeRange]` is invoked once per file. The built-in `DefaultUnreachableRegionDetector` covers three things out of the box:
 

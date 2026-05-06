@@ -74,11 +74,10 @@ dead_cst/
   _analyze.py            # build_symbol_graph, find_reachable, count_nodes, order_paths
   _codemod.py            # remove_code -- LibCST transformer + import pruner
   _resolve.py            # import resolution (stdlib / first-party / third-party)
-  _resolvers/            # path resolvers:
-    venv.py              #   sibling .venv -> site-packages
-    pyproject.py         #   [tool.dead-cst] paths or src/ fallback
+  _resolvers/            # path resolvers (return list[SourceTree]):
+    pyproject.py         #   [tool.dead-cst].trees or src/ + tests/ fallback
+    manual.py            #   -p CLI specs
     uv_workspace.py      #   uv.lock workspace members + inter-member deps
-    _exports.py          #   exported_roots: hide internal dirs from consumers
   _symbols.py            # SymbolNode, SymbolTrie data classes
   _visitor.py            # SymbolVisitor -- walks each file and emits symbols + edges
   _flow.py               # flow-sensitive live-at-exit analysis for shadowing

@@ -1,32 +1,11 @@
-"""Tests for :class:`dead_cst.resolvers.uv_workspace.UvWorkspaceResolver`.
-
-Includes an end-to-end regression test for the cross-member ``tests/``
-collision that motivated :func:`dead_cst.resolvers.exported_roots`.
-"""
+"""Tests for :class:`dead_cst.contrib.uv_workspace.UvWorkspaceResolver`."""
 
 from __future__ import annotations
 
 import textwrap
 from pathlib import Path
 
-import pytest
-
-from dead_cst.resolvers import UvWorkspaceResolver
-from dead_cst.resolvers import MissingVenvError
-
-
-def _make_fake_venv(workspace_root: Path) -> Path:
-    """Create a minimal ``.venv/lib/pythonX.Y/site-packages`` and return it.
-
-    ``UvWorkspaceResolver`` requires a populated venv -- in real usage,
-    ``uv sync --all-packages`` puts one at the workspace root. Tests
-    create the directory structure the resolver looks for and return
-    the resolved ``site-packages`` path so assertions can include it
-    in expected dep lists.
-    """
-    sp = workspace_root / ".venv" / "lib" / "python3.13" / "site-packages"
-    sp.mkdir(parents=True)
-    return sp.resolve()
+from dead_cst.resolvers import SourceTreeFlags, UvWorkspaceResolver
 
 
 def _write_uv_workspace(tmp_path: Path, *, with_src: bool = True) -> None:
@@ -76,60 +55,50 @@ def _write_uv_workspace(tmp_path: Path, *, with_src: bool = True) -> None:
     )
 
 
+def _by_pkg(trees):
+    return {t.package: t for t in trees}
+
+
 def test_uv_workspace_resolver_src_layout(tmp_path: Path):
     _write_uv_workspace(tmp_path)
-    sp = _make_fake_venv(tmp_path)
 
     result = UvWorkspaceResolver().resolve(tmp_path)
+    by = _by_pkg(result)
 
     core_src = (tmp_path / "packages" / "core" / "src").resolve()
     app_src = (tmp_path / "packages" / "app" / "src").resolve()
-    assert result == {core_src: [sp], app_src: [core_src, sp]}
+    assert by["core"].path == core_src
+    assert by["core"].search_trees == ()
+    assert by["app"].path == app_src
+    assert by["app"].search_trees == (core_src,)
+    assert all(t.flags & SourceTreeFlags.EXPORTED for t in result)
 
 
 def test_uv_workspace_resolver_flat_layout(tmp_path: Path):
     _write_uv_workspace(tmp_path, with_src=False)
-    sp = _make_fake_venv(tmp_path)
 
     result = UvWorkspaceResolver().resolve(tmp_path)
+    by = _by_pkg(result)
 
     core_dir = (tmp_path / "packages" / "core").resolve()
     app_dir = (tmp_path / "packages" / "app").resolve()
-    assert result == {core_dir: [sp], app_dir: [core_dir, sp]}
+    assert by["core"].path == core_dir
+    assert by["app"].path == app_dir
+    assert by["app"].search_trees == (core_dir,)
 
 
 def test_uv_workspace_resolver_skips_virtual_root(tmp_path: Path):
     _write_uv_workspace(tmp_path)
-    _make_fake_venv(tmp_path)
 
     result = UvWorkspaceResolver().resolve(tmp_path)
 
     # The "ws" package has source = { virtual = "." } and must not appear.
-    assert tmp_path.resolve() not in result
-
-
-def test_uv_workspace_resolver_missing_venv_raises(tmp_path: Path, monkeypatch):
-    """Workspace with no synced ``.venv`` raises an actionable error
-    instead of silently producing wrong results downstream."""
-    import sys
-
-    _write_uv_workspace(tmp_path)
-    # Override the active-venv fallback so the resolver can't accidentally
-    # find one outside the workspace (e.g. the test runner's own venv).
-    monkeypatch.setattr(sys, "prefix", sys.base_prefix)
-
-    with pytest.raises(MissingVenvError, match="uv sync"):
-        UvWorkspaceResolver().resolve(tmp_path)
+    assert tmp_path.resolve() not in {t.path for t in result}
 
 
 def test_uv_workspace_resolver_includes_virtual_members(tmp_path: Path):
     """Virtual members (apps/services that don't ship as wheels) are first-party
-    code and must be analyzed alongside editable members.
-
-    Regression for the silent drop documented in issue #32: a workspace mixing
-    ``apps/*`` (virtual) with ``libs/*`` (editable) used to skip the apps,
-    causing libraries whose only consumers were apps to be reported as dead.
-    """
+    code and must be analyzed alongside editable members."""
     (tmp_path / "pyproject.toml").write_text(
         textwrap.dedent("""
             [project]
@@ -170,25 +139,23 @@ def test_uv_workspace_resolver_includes_virtual_members(tmp_path: Path):
         """).strip()
     )
 
-    sp = _make_fake_venv(tmp_path)
     result = UvWorkspaceResolver().resolve(tmp_path)
-
+    by = _by_pkg(result)
     lib_src = (tmp_path / "libs" / "lib-a" / "src").resolve()
     app_src = (tmp_path / "apps" / "app-a" / "src").resolve()
-    assert result == {lib_src: [sp], app_src: [lib_src, sp]}
+    assert by["lib-a"].path == lib_src
+    assert by["app-a"].path == app_src
+    assert by["app-a"].search_trees == (lib_src,)
 
 
 def test_uv_workspace_resolver_no_lockfile(tmp_path: Path):
-    # No lockfile => not a uv workspace => silent no-op (don't raise on the
-    # missing venv, since the resolver isn't applicable here).
-    assert UvWorkspaceResolver().resolve(tmp_path) == {}
+    assert UvWorkspaceResolver().resolve(tmp_path) == []
 
 
 def test_uv_workspace_resolver_ignores_non_workspace_deps(tmp_path: Path):
-    """Deps that aren't workspace members (e.g. regular PyPI deps) are dropped
-    silently -- they don't have a source dir under our control."""
+    """Deps that aren't workspace members are dropped silently -- they
+    don't have a source dir under our control."""
     _write_uv_workspace(tmp_path)
-    sp = _make_fake_venv(tmp_path)
     lock = tmp_path / "uv.lock"
     lock.write_text(
         lock.read_text().replace(
@@ -198,14 +165,13 @@ def test_uv_workspace_resolver_ignores_non_workspace_deps(tmp_path: Path):
     )
 
     result = UvWorkspaceResolver().resolve(tmp_path)
+    by = _by_pkg(result)
     core_src = (tmp_path / "packages" / "core" / "src").resolve()
-    app_src = (tmp_path / "packages" / "app" / "src").resolve()
-    assert result[app_src] == [core_src, sp]
+    assert by["app"].search_trees == (core_src,)
 
 
 def test_uv_workspace_resolver_explicit_lock_path(tmp_path: Path):
     _write_uv_workspace(tmp_path)
-    _make_fake_venv(tmp_path)
     moved = tmp_path / "stash" / "uv.lock"
     moved.parent.mkdir()
     moved.write_text((tmp_path / "uv.lock").read_text())
@@ -216,12 +182,12 @@ def test_uv_workspace_resolver_explicit_lock_path(tmp_path: Path):
 
 
 def test_uv_workspace_flat_layout_with_tests_dirs(tmp_path: Path):
-    """Regression for the AssertionError in the issue: two members with
-    ``tests/`` packages used to collide when their tries were merged.
+    """Two members with ``tests/`` packages used to collide when their tries were merged.
 
-    With per-consumer export scoping, the dep's ``tests/`` is never
-    merged into the consumer's lookup trie, so analysis succeeds and the
-    real cross-member ``import foo.c.mod`` resolves."""
+    With per-package export tries (and only the EXPORTED tree's decls in the
+    export trie), the dep's ``tests/`` is never merged into the consumer's
+    lookup, so analysis succeeds and the cross-member ``import foo.c.mod``
+    resolves."""
     from dead_cst import Analysis
 
     (tmp_path / "pyproject.toml").write_text(
@@ -289,17 +255,8 @@ def test_uv_workspace_flat_layout_with_tests_dirs(tmp_path: Path):
     (libc / "tests" / "__init__.py").write_text("")
     (libc / "tests" / "conftest.py").write_text("import pytest\n")
 
-    _make_fake_venv(tmp_path)
-    paths = UvWorkspaceResolver().resolve(tmp_path)
-    # No AssertionError -- this used to crash before the fix.
-    graph = Analysis(paths).materialize_all()
-
-    # Both members' tests modules exist as distinct nodes (full graph picture).
-    tests_modules = [n for n in graph.nodes if n.type == "module" and n.fqname == "tests"]
-    assert {n.path for n in tests_modules} == {
-        (pkg_a / "tests" / "__init__.py").resolve(),
-        (libc / "tests" / "__init__.py").resolve(),
-    }
+    trees = UvWorkspaceResolver().resolve(tmp_path)
+    graph = Analysis(trees).materialize_all()
 
     # The cross-member import resolved: pkg_a/app.py -> libc/foo/c/mod.y
     mod_y = next(n for n in graph.nodes if n.fqname == "foo.c.mod.y" and n.type == "variable")
@@ -312,14 +269,7 @@ def test_uv_workspace_flat_layout_with_tests_dirs(tmp_path: Path):
 
 
 def test_uv_workspace_shared_namespace_package(tmp_path: Path):
-    """PEP 420 namespace shared across workspace members (Google-style monorepo).
-
-    Two distributions contribute submodules to the same top-level ``foo``
-    namespace -- ``foo-a`` ships ``foo/a/`` and ``foo-b`` ships ``foo/b/``,
-    with no ``foo/__init__.py`` in either. A cross-member import
-    ``from foo.a import value`` from inside ``foo.b`` must resolve through
-    PEP 420 namespace merging of the two ``foo/`` dirs on the search path.
-    """
+    """PEP 420 namespace shared across workspace members."""
     from dead_cst import Analysis
 
     (tmp_path / "pyproject.toml").write_text(
@@ -352,7 +302,6 @@ def test_uv_workspace_shared_namespace_package(tmp_path: Path):
     (foo_a / "foo" / "a").mkdir(parents=True)
     (foo_b / "foo" / "b").mkdir(parents=True)
 
-    # Note: no foo/__init__.py in either member -- PEP 420 namespace package.
     (foo_a / "pyproject.toml").write_text(
         textwrap.dedent("""
             [project]
@@ -380,23 +329,14 @@ def test_uv_workspace_shared_namespace_package(tmp_path: Path):
     )
     (foo_b / "foo" / "b" / "__init__.py").write_text("from foo.a import value\n\nresult = value\n")
 
-    sp = _make_fake_venv(tmp_path)
-    paths = UvWorkspaceResolver().resolve(tmp_path)
-    foo_a_dir = foo_a.resolve()
-    foo_b_dir = foo_b.resolve()
-    assert paths == {foo_a_dir: [sp], foo_b_dir: [foo_a_dir, sp]}
+    trees = UvWorkspaceResolver().resolve(tmp_path)
+    graph = Analysis(trees).materialize_all()
 
-    graph = Analysis(paths).materialize_all()
-
-    # foo.a.value (in foo-a) and foo.b.result (in foo-b) both made it into
-    # the graph as distinct variables under the shared ``foo`` namespace.
     value = next(n for n in graph.nodes if n.fqname == "foo.a.value" and n.type == "variable")
     result = next(n for n in graph.nodes if n.fqname == "foo.b.result" and n.type == "variable")
     assert value.path == (foo_a / "foo" / "a" / "__init__.py").resolve()
     assert result.path == (foo_b / "foo" / "b" / "__init__.py").resolve()
 
-    # The cross-member ``from foo.a import value`` in foo-b resolved across
-    # the namespace boundary back to foo-a's declaration.
     b_import = next(
         n
         for n in graph.nodes

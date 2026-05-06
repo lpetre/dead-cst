@@ -15,7 +15,7 @@ import networkx as nx
 import typer
 from libcst.metadata import CodeRange
 
-from .analyze import Analysis, _count_nodes, _find_reachable, _order_paths
+from .analyze import Analysis, _count_nodes, _find_reachable
 from .cache import (
     GraphCache,
     clear_cache,
@@ -33,10 +33,10 @@ from .plugins import (
 from .plugins.module_dunders import DUNDER_PREFIX
 from .resolvers import (
     ManualResolver,
-    PathMap,
     PathResolver,
+    SourceTree,
+    SourceTreeFlags,
     load_resolver,
-    merge_paths,
 )
 
 
@@ -105,18 +105,13 @@ def build_plugins(
 @contextlib.contextmanager
 def _maybe_cache(
     root: Path,
-    paths_dict: PathMap,
-    resolvers: list[PathResolver],
-    plugins: list[EdgePlugin],
     no_cache: bool,
 ) -> Iterator[GraphCache | None]:
     """Yield a per-run :class:`GraphCache`, or ``None`` when ``--no-cache`` is set.
 
-    Per-base fingerprints (computed inside :class:`Analysis`) gate
+    Per-tree fingerprints (computed inside :class:`Analysis`) gate
     individual cache rows, so this just opens the database. A
     schema-version mismatch on open wipes ``file_cache`` automatically.
-    The context manager closes the SQLite connection on exit, even
-    when the analysis raises.
     """
     if no_cache:
         yield None
@@ -125,24 +120,54 @@ def _maybe_cache(
         yield cache
 
 
-def resolve_paths(
+def resolve_trees(
     root: Path, path_specs: list[str], resolver_names: list[str]
-) -> tuple[PathMap, list[PathResolver]]:
+) -> tuple[list[SourceTree], list[PathResolver]]:
     """Build the resolver chain from ``-p`` specs and ``--resolver`` names.
 
     ``-p`` specs become a :class:`ManualResolver` and slot into the
     chain alongside named resolvers, so explicit specs participate in
     :meth:`PathResolver.resolve_import` lookups too. Returns the
-    merged :data:`PathMap` and the resolver instances; the analyzer
-    threads the latter through to govern import resolution.
+    union of every resolver's :class:`SourceTree` list and the
+    resolver instances themselves.
+
+    With no ``-p`` and no ``--resolver``, the analyzer falls back to
+    treating ``root`` as a single ``EXPORTED`` :class:`SourceTree`
+    (the simplest "analyze this directory" default).
     """
     resolvers: list[PathResolver] = []
     if path_specs:
         resolvers.append(ManualResolver(specs=path_specs))
     resolvers.extend(load_resolver(name) for name in resolver_names)
     if not resolvers:
-        return {root: []}, []
-    return merge_paths(*[r.resolve(root) for r in resolvers]), resolvers
+        return (
+            [
+                SourceTree(
+                    path=root,
+                    package=root.name or "root",
+                    flags=SourceTreeFlags.EXPORTED,
+                    search_trees=(),
+                )
+            ],
+            [],
+        )
+    trees: list[SourceTree] = []
+    for r in resolvers:
+        trees.extend(r.resolve(root))
+    return trees, resolvers
+
+
+def _trees_for_reporting(
+    root: Path,
+    trees: list[SourceTree],
+) -> list[SourceTree]:
+    """Tree paths in the order the CLI should print summaries for them.
+
+    Just the order they came back from the resolvers -- topo order
+    isn't required for reports, and preserving config order is
+    friendlier for users with multiple trees.
+    """
+    return list(trees)
 
 
 def version_callback(value: bool) -> None:
@@ -176,11 +201,11 @@ def analyze(
     ] = None,
     path: Annotated[
         list[str] | None,
-        typer.Option("-p", "--path", help="Search path spec: 'base:dep1,dep2' or 'base'."),
+        typer.Option("-p", "--path", help="Search path spec: 'path' or 'path:dep1,dep2'."),
     ] = None,
     resolver: Annotated[
         list[str] | None,
-        typer.Option("--resolver", help="Path resolver to run (e.g. venv, pyproject)."),
+        typer.Option("--resolver", help="Path resolver to run (e.g. pyproject, uv_workspace)."),
     ] = None,
     plugin: Annotated[
         list[str] | None,
@@ -201,16 +226,16 @@ def analyze(
     setup_logging(verbose)
     root = root.resolve()
 
-    paths_dict, resolvers = resolve_paths(root, path or [], resolver or [])
+    trees, resolvers = resolve_trees(root, path or [], resolver or [])
 
     typer.echo(f"Building symbol graph for {root}...", err=True)
     plugins = build_plugins(
         entrypoints=entrypoint or [],
         plugin_names=plugin or [],
     )
-    with _maybe_cache(root, paths_dict, resolvers, plugins, no_cache) as cache:
+    with _maybe_cache(root, no_cache) as cache:
         graph = Analysis(
-            paths_dict,
+            trees,
             plugins=plugins,
             resolvers=resolvers,
             project_root=root,
@@ -222,9 +247,9 @@ def analyze(
     unreachable_graph = graph.subgraph([n for n in graph.nodes if n not in reachable])
 
     if output_format == OutputFormat.json:
-        _output_json(graph, unreachable_graph, root, paths_dict)
+        _output_json(graph, unreachable_graph, root, trees)
     else:
-        _output_text(graph, unreachable_graph, root, paths_dict)
+        _output_text(graph, unreachable_graph, root, trees)
 
     if unreachable_graph.number_of_nodes() > 0:
         raise typer.Exit(1)
@@ -234,17 +259,13 @@ def _output_text(
     graph: nx.MultiDiGraph,
     unreachable: nx.MultiDiGraph,
     root: Path,
-    paths_dict: PathMap,
+    trees: list[SourceTree],
 ) -> None:
-    for base in _order_paths(paths_dict):
-        typer.echo(f"\n{base}:")
-        total_counts = _count_nodes(graph, base)
-        unreachable_counts = _count_nodes(unreachable, base)
+    for tree in _trees_for_reporting(root, trees):
+        typer.echo(f"\n{tree.path}:")
+        total_counts = _count_nodes(graph, tree.path)
+        unreachable_counts = _count_nodes(unreachable, tree.path)
         for kind in sorted(total_counts):
-            # Synthetic nodes (entrypoint sentinels, external-dist markers,
-            # dunder-all stand-ins) don't represent user-visible
-            # declarations; reporting them alongside functions/classes
-            # would be misleading.
             if kind == "synthetic":
                 continue
             total = total_counts[kind]
@@ -260,7 +281,7 @@ def _output_text(
         for node in sorted(dead_real, key=lambda n: (str(n.path), n.fqname)):
             typer.echo(f"  {node.fqname} ({node.type}) at {_rel_path(node.path, root)}")
 
-    branches = _dead_suite_locations(graph, paths_dict)
+    branches = _dead_suite_locations(graph, trees)
     if branches:
         typer.echo(f"\nUnreachable branches ({len(branches)}):")
         for path, pos in branches:
@@ -271,29 +292,19 @@ def _output_text(
 
 
 def _dead_real(unreachable: nx.MultiDiGraph) -> list[SymbolNode]:
-    """Return real (non-synthetic) dead nodes from ``unreachable``.
-
-    Synthetic nodes -- entrypoint sentinels, external-dist markers,
-    dunder-all stand-ins -- are excluded; they don't represent
-    user-visible declarations and would confuse the dead-code report.
-    """
+    """Return real (non-synthetic) dead nodes from ``unreachable``."""
     return [n for n in unreachable.nodes if n.type != "synthetic"]
 
 
 def _dead_suite_locations(
-    graph: nx.MultiDiGraph, paths_dict: PathMap
+    graph: nx.MultiDiGraph, trees: list[SourceTree]
 ) -> list[tuple[Path, CodeRange]]:
-    """Flatten ``graph.graph["dead_suites"]`` into a sorted ``(path, pos)`` list.
-
-    Restricted to files under one of the analyzed bases so the report
-    doesn't surface dead suites in workspace dependencies that the
-    user isn't asking about.
-    """
-    bases = list(paths_dict)
+    """Flatten ``graph.graph["dead_suites"]`` into a sorted ``(path, pos)`` list,
+    restricted to files under any configured tree."""
     raw: dict = graph.graph.get("dead_suites", {})
     out: list[tuple[Path, CodeRange]] = []
     for path, suites in raw.items():
-        if not any(path.is_relative_to(b) for b in bases):
+        if not any(path.is_relative_to(t.path) for t in trees):
             continue
         for pos in suites:
             out.append((path, pos))
@@ -305,7 +316,7 @@ def _output_json(
     graph: nx.MultiDiGraph,
     unreachable: nx.MultiDiGraph,
     root: Path,
-    paths_dict: PathMap,
+    trees: list[SourceTree],
 ) -> None:
     result: dict = {
         "summary": {},
@@ -313,14 +324,11 @@ def _output_json(
         "unreachable_branches": [],
     }
 
-    for base in _order_paths(paths_dict):
-        base_str = str(base)
-        total_counts = _count_nodes(graph, base)
-        unreachable_counts = _count_nodes(unreachable, base)
-        # Same rationale as the text output: synthetic nodes are reported
-        # via ``unreachable_branches`` (and entrypoint sentinels), not as
-        # part of the per-kind summary.
-        result["summary"][base_str] = {
+    for tree in _trees_for_reporting(root, trees):
+        path_str = str(tree.path)
+        total_counts = _count_nodes(graph, tree.path)
+        unreachable_counts = _count_nodes(unreachable, tree.path)
+        result["summary"][path_str] = {
             kind: {"total": total_counts[kind], "dead": unreachable_counts.get(kind, 0)}
             for kind in total_counts
             if kind != "synthetic"
@@ -335,7 +343,7 @@ def _output_json(
             }
         )
 
-    for path, pos in _dead_suite_locations(graph, paths_dict):
+    for path, pos in _dead_suite_locations(graph, trees):
         result["unreachable_branches"].append(
             {
                 "path": str(_rel_path(path, root)),
@@ -353,11 +361,11 @@ def why_alive(
     fqname: Annotated[str, typer.Argument(help="Fully qualified name of the symbol to check.")],
     path: Annotated[
         list[str] | None,
-        typer.Option("-p", "--path", help="Search path spec: 'base:dep1,dep2' or 'base'."),
+        typer.Option("-p", "--path", help="Search path spec: 'path' or 'path:dep1,dep2'."),
     ] = None,
     resolver: Annotated[
         list[str] | None,
-        typer.Option("--resolver", help="Path resolver to run (e.g. venv, pyproject)."),
+        typer.Option("--resolver", help="Path resolver to run (e.g. pyproject, uv_workspace)."),
     ] = None,
     plugin: Annotated[
         list[str] | None,
@@ -375,16 +383,16 @@ def why_alive(
     setup_logging(verbose)
     root = root.resolve()
 
-    paths_dict, resolvers = resolve_paths(root, path or [], resolver or [])
+    trees, resolvers = resolve_trees(root, path or [], resolver or [])
 
     typer.echo(f"Building symbol graph for {root}...", err=True)
     plugins = build_plugins(
         entrypoints=[],
         plugin_names=plugin or [],
     )
-    with _maybe_cache(root, paths_dict, resolvers, plugins, no_cache) as cache:
+    with _maybe_cache(root, no_cache) as cache:
         graph = Analysis(
-            paths_dict,
+            trees,
             plugins=plugins,
             resolvers=resolvers,
             project_root=root,
@@ -431,11 +439,11 @@ def dependencies(
     root: Annotated[Path, typer.Argument(help="Root directory to analyze.")],
     path: Annotated[
         list[str] | None,
-        typer.Option("-p", "--path", help="Search path spec: 'base:dep1,dep2' or 'base'."),
+        typer.Option("-p", "--path", help="Search path spec: 'path' or 'path:dep1,dep2'."),
     ] = None,
     resolver: Annotated[
         list[str] | None,
-        typer.Option("--resolver", help="Path resolver to run (e.g. venv, pyproject)."),
+        typer.Option("--resolver", help="Path resolver to run (e.g. pyproject, uv_workspace)."),
     ] = None,
     verbose: Annotated[
         bool, typer.Option("-v", "--verbose", help="Enable verbose output.")
@@ -452,34 +460,35 @@ def dependencies(
     setup_logging(verbose)
     root = root.resolve()
 
-    paths_dict, resolvers = resolve_paths(root, path or [], resolver or [])
+    trees, resolvers = resolve_trees(root, path or [], resolver or [])
 
     typer.echo(f"Building symbol graph for {root}...", err=True)
-    with _maybe_cache(root, paths_dict, resolvers, [], no_cache) as cache:
+    with _maybe_cache(root, no_cache) as cache:
         graph = Analysis(
-            paths_dict,
+            trees,
             resolvers=resolvers,
             project_root=root,
             cache=cache,
             workers=workers,
         ).materialize_all()
 
-    deps_by_base: dict[Path, list[SymbolNode]] = {base: [] for base in _order_paths(paths_dict)}
+    deps_by_tree: dict[Path, list[SymbolNode]] = {tree.path: [] for tree in trees}
     for node in graph.nodes:
         if not _is_external_dep(node):
             continue
-        if node.path in deps_by_base:
-            deps_by_base[node.path].append(node)
+        if node.path in deps_by_tree:
+            deps_by_tree[node.path].append(node)
 
     if output_format == OutputFormat.json:
         result = {
-            str(base): sorted(n.fqname for n in nodes) for base, nodes in deps_by_base.items()
+            str(tree_path): sorted(n.fqname for n in nodes)
+            for tree_path, nodes in deps_by_tree.items()
         }
         typer.echo(json.dumps(result, indent=2))
         return
 
-    for base, nodes in deps_by_base.items():
-        typer.echo(f"\n{base}:")
+    for tree_path, nodes in deps_by_tree.items():
+        typer.echo(f"\n{tree_path}:")
         if not nodes:
             typer.echo("  (no third-party dependencies found)")
             continue
@@ -500,11 +509,11 @@ def unused_exports(
     ] = None,
     path: Annotated[
         list[str] | None,
-        typer.Option("-p", "--path", help="Search path spec: 'base:dep1,dep2' or 'base'."),
+        typer.Option("-p", "--path", help="Search path spec: 'path' or 'path:dep1,dep2'."),
     ] = None,
     resolver: Annotated[
         list[str] | None,
-        typer.Option("--resolver", help="Path resolver to run (e.g. venv, pyproject)."),
+        typer.Option("--resolver", help="Path resolver to run (e.g. pyproject, uv_workspace)."),
     ] = None,
     plugin: Annotated[
         list[str] | None,
@@ -522,16 +531,16 @@ def unused_exports(
     setup_logging(verbose)
     root = root.resolve()
 
-    paths_dict, resolvers = resolve_paths(root, path or [], resolver or [])
+    trees, resolvers = resolve_trees(root, path or [], resolver or [])
 
     typer.echo(f"Building symbol graph for {root}...", err=True)
     plugins = build_plugins(
         entrypoints=entrypoint or [],
         plugin_names=plugin or [],
     )
-    with _maybe_cache(root, paths_dict, resolvers, plugins, no_cache) as cache:
+    with _maybe_cache(root, no_cache) as cache:
         graph = Analysis(
-            paths_dict,
+            trees,
             plugins=plugins,
             resolvers=resolvers,
             project_root=root,
@@ -540,10 +549,6 @@ def unused_exports(
         ).materialize_all()
     reachable = _find_reachable(graph)
 
-    # ModuleDundersPlugin keeps each ``__all__`` alive via a synthetic
-    # entrypoint node ``<dunder>:<fqname>``. Cut the edge from each such
-    # synthetic into an ``__all__`` variable and re-run reachability;
-    # whatever drops out was alive only because of __all__.
     pruned = graph.copy()
     pruned.remove_edges_from(
         [
@@ -586,11 +591,11 @@ def remove(
     ] = None,
     path: Annotated[
         list[str] | None,
-        typer.Option("-p", "--path", help="Search path spec: 'base:dep1,dep2' or 'base'."),
+        typer.Option("-p", "--path", help="Search path spec: 'path' or 'path:dep1,dep2'."),
     ] = None,
     resolver: Annotated[
         list[str] | None,
-        typer.Option("--resolver", help="Path resolver to run (e.g. venv, pyproject)."),
+        typer.Option("--resolver", help="Path resolver to run (e.g. pyproject, uv_workspace)."),
     ] = None,
     plugin: Annotated[
         list[str] | None,
@@ -611,16 +616,16 @@ def remove(
     setup_logging(verbose)
     root = root.resolve()
 
-    paths_dict, resolvers = resolve_paths(root, path or [], resolver or [])
+    trees, resolvers = resolve_trees(root, path or [], resolver or [])
 
     typer.echo(f"Building symbol graph for {root}...", err=True)
     plugins = build_plugins(
         entrypoints=entrypoint or [],
         plugin_names=plugin or [],
     )
-    with _maybe_cache(root, paths_dict, resolvers, plugins, no_cache) as cache:
+    with _maybe_cache(root, no_cache) as cache:
         graph = Analysis(
-            paths_dict,
+            trees,
             plugins=plugins,
             resolvers=resolvers,
             project_root=root,
@@ -631,10 +636,6 @@ def remove(
 
     unreachable_graph = graph.subgraph([n for n in graph.nodes if n not in reachable])
 
-    # Synthetic nodes (entrypoint sentinels, external-dist markers,
-    # dunder-all stand-ins) aren't user-visible declarations. The
-    # codemod can't delete them, so they're filtered out of the
-    # remove listing.
     removable = [n for n in unreachable_graph.nodes if n.type != "synthetic"]
 
     if not removable:
@@ -653,8 +654,8 @@ def remove(
         typer.echo("Aborted.")
         return
 
-    for base in _order_paths(paths_dict):
-        remove_code(unreachable_graph, base)
+    for tree in trees:
+        remove_code(unreachable_graph, tree.path)
 
     typer.echo("Dead code removed.")
 

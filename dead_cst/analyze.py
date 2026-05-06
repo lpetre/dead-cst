@@ -5,7 +5,7 @@ import sys
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Iterator, Mapping, Sequence
+from typing import Iterable, Iterator, Mapping, Sequence, cast
 
 import libcst as cst
 import networkx as nx
@@ -33,40 +33,36 @@ from .plugins._core import (
 )
 from .resolvers import (
     ImportResolver,
-    PathMap,
     PathResolver,
+    SourceTree,
+    SourceTreeFlags,
+    assign_file_to_tree,
     default_resolve_import,
     distribution_lookup,
     editable_distribution_roots,
-    exported_roots,
     safe_resolve_module,
+    validate_source_trees,
 )
+from .resolvers._core import _ValidatedTrees
 
 logger = logging.getLogger(__name__)
 
 
-def _build_dep_graph(paths: PathMap) -> nx.DiGraph:
-    """``dep -> consumer`` DAG over ``paths.keys()``.
+def _build_tree_dag(validated: _ValidatedTrees) -> nx.DiGraph:
+    """``dep -> consumer`` DAG over :class:`SourceTree` paths.
 
-    Only keys of ``paths`` enter the graph -- search-path entries that
-    aren't themselves keys (e.g. a venv ``site-packages``) are
-    resolver-lookup-only and never walked, so they have no place in
-    the topo order. The DAG drives both :func:`_order_paths` and the
-    forward / reverse closure walks on :class:`Analysis`.
+    Edges go ``S -> T`` where ``S`` is in ``T.search_trees`` (deps
+    flow into consumers). Topological order over this DAG drives
+    processing -- a consumer's ``symbol_lookup`` requires every dep's
+    contribution to be ready before edges are stitched.
     """
     g: nx.DiGraph = nx.DiGraph()
-    keys = set(paths)
-    for base, search_paths in paths.items():
-        g.add_node(base)
-        for sp in search_paths:
-            if sp in keys:
-                g.add_edge(sp, base)
+    for path, tree in validated.by_path.items():
+        g.add_node(path)
+        for ref in tree.search_trees:
+            if ref in validated.by_path:
+                g.add_edge(ref, path)
     return g
-
-
-def _order_paths(paths: PathMap) -> list[Path]:
-    """Topologically sort ``paths.keys()`` so dependencies are processed first."""
-    return list(nx.topological_sort(_build_dep_graph(paths)))
 
 
 def _chain_resolvers(resolvers: Sequence[PathResolver]) -> ImportResolver:
@@ -143,12 +139,11 @@ def _process_one_file(
 ) -> VisitorPayload:
     """Run the visitor + observe pass for a single file and return its payload.
 
-    The caller owns the precomputed FQN entry (built once per base by
-    :func:`_collect_base_specs`) so we can construct
+    The caller owns the precomputed FQN entry (built once per tree by
+    :func:`_collect_tree_specs`) so we can construct
     :class:`MetadataWrapper` directly with ``cache=`` injected,
     skipping :class:`FullRepoManager`'s per-instance ``gen_cache``
-    rebuild. Same shape ``FullRepoManager.get_metadata_wrapper_for_path``
-    builds, just without re-walking the file list every time.
+    rebuild.
     """
     module = cst.parse_module(file.read_text())
     wrapper = MetadataWrapper(
@@ -170,21 +165,18 @@ def _process_one_file(
 
 
 @dataclass(frozen=True, slots=True)
-class _BaseSpec:
-    """Per-base file list partitioned into cache hits and miss files.
+class _TreeSpec:
+    """Per-:class:`SourceTree` file list partitioned into hits and miss files.
 
-    Built once up front in :func:`_collect_base_specs` so the parallel
-    path can flatten every base's miss files into a single sorted task
-    list and the apply phase can iterate every base in deterministic
-    order without re-reading the cache. ``fqn_cache`` covers only the
-    miss files -- hit files never go through the visitor, so they
-    don't need an FQN entry. ``fingerprint`` is this base's per-base
-    cache fingerprint (see :func:`compute_fingerprint`); the recorder
-    uses it when writing payloads back, and :func:`_build_base_spec`
-    uses it when looking them up.
+    Built once up front by :func:`_build_tree_spec` so the parallel
+    path can flatten every tree's miss files into a single sorted task
+    list. ``files`` covers every ``.py`` file longest-prefix-matched to
+    this tree (so files in nested trees are routed there instead, not
+    duplicated here). ``fqn_cache`` covers only the miss files, since
+    hit files never go through the visitor.
     """
 
-    base: Path
+    tree: SourceTree
     search_paths: tuple[Path, ...]
     files: tuple[Path, ...]
     hits: dict[Path, VisitorPayload]
@@ -193,23 +185,32 @@ class _BaseSpec:
     fingerprint: str
 
 
-def _build_base_spec(
-    base: Path,
-    deps: Sequence[Path],
+def _build_tree_spec(
+    tree: SourceTree,
+    all_trees: Sequence[SourceTree],
     cache: GraphCache | None,
     fingerprint: str,
-) -> _BaseSpec:
-    """Build a single :class:`_BaseSpec`: enumerate ``base``'s files and
-    partition into cache hits / misses against ``fingerprint``.
+) -> _TreeSpec:
+    """Build a single :class:`_TreeSpec` for ``tree``.
 
-    Per-base helper so :class:`Analysis` can refresh one base at a
-    time without paying for sibling bases' file walks. Each cache
-    lookup uses this base's per-base fingerprint, so a sibling base's
-    config change leaves these rows valid. The FQN cache covers only
-    the miss files because hit files never go through the visitor.
+    Walks ``tree.path`` for ``.py`` files, then routes each file to
+    its longest-prefix-matching tree and keeps only the ones owned by
+    ``tree``. That filter is what lets a parent tree like
+    ``pkg/`` coexist with a nested tree like ``pkg/tests/`` without
+    double-walking files.
+
+    ``search_paths = (tree.path, *tree.search_trees)`` -- the tree's
+    own path is always its own first-party search root, with declared
+    search refs appended.
     """
-    search_paths = (base, *deps)
-    files = tuple(sorted(base.rglob("*.py")))
+    search_paths = (tree.path, *tree.search_trees)
+    own_files: list[Path] = []
+    for candidate in sorted(tree.path.rglob("*.py")):
+        owner = assign_file_to_tree(candidate, all_trees)
+        if owner is not None and owner.path == tree.path:
+            own_files.append(candidate)
+    files = tuple(own_files)
+
     hits: dict[Path, VisitorPayload] = {}
     miss_files: list[Path] = []
     for file in files:
@@ -219,12 +220,14 @@ def _build_base_spec(
         else:
             hits[file] = payload
     fqn_cache: Mapping[str, ModuleNameAndPackage] = (
-        FixedFullyQualifiedNameProvider.gen_cache(base, [str(f) for f in miss_files], timeout=5)
+        FixedFullyQualifiedNameProvider.gen_cache(
+            tree.path, [str(f) for f in miss_files], timeout=5
+        )
         if miss_files
         else {}
     )
-    return _BaseSpec(
-        base=base,
+    return _TreeSpec(
+        tree=tree,
         search_paths=search_paths,
         files=files,
         hits=hits,
@@ -236,18 +239,10 @@ def _build_base_spec(
 
 @dataclass(frozen=True, slots=True)
 class _Task:
-    """Per-file unit of work for the visitor + observe pass.
-
-    ``fqn_entry`` is this file's slice of the per-base FQN cache built
-    once in the parent (see :func:`_collect_base_specs`); the runner
-    injects it into a :class:`MetadataWrapper` rather than rebuilding
-    a :class:`FullRepoManager`. ``search_paths`` doubles as the
-    transition key for ``sys.path`` rebinding + resolver-cache
-    invalidation.
-    """
+    """Per-file unit of work for the visitor + observe pass."""
 
     file: Path
-    base: Path
+    tree_path: Path
     search_paths: tuple[Path, ...]
     fqn_entry: ModuleNameAndPackage
     project_root: Path
@@ -255,14 +250,7 @@ class _Task:
 
 @dataclass(slots=True)
 class _RunnerState:
-    """Mutable state for the per-task runner, shared by serial and worker paths.
-
-    ``sys_path_baseline`` is the original ``sys.path`` captured at
-    runner startup; transitions rebuild ``sys.path`` from
-    ``search_paths + baseline`` and clear the resolver LRUs. The
-    serial caller restores ``sys.path`` from the baseline when the run
-    finishes; workers don't bother since the process is about to exit.
-    """
+    """Mutable state for the per-task runner, shared by serial and worker paths."""
 
     detector: UnreachableRegionDetector
     plugins: tuple[EdgePlugin, ...]
@@ -290,12 +278,9 @@ def _rebind_sys_path(search_paths: tuple[Path, ...], baseline: list[str]) -> Non
 def _clear_resolver_caches() -> None:
     """Drop the ``sys.path``-derived resolver caches.
 
-    :func:`safe_resolve_module` keys on fullname and
-    :func:`distribution_lookup` / :func:`editable_distribution_roots`
-    key on ``()`` -- all three read live ``sys.path`` (or
-    :mod:`importlib.metadata` against it) and would otherwise return
-    stale results across bases (different first-party prefix;
-    uv-workspace members shipping their own ``.venv``).
+    :func:`safe_resolve_module` keys on fullname and reads live
+    ``sys.path``; clearing avoids stale results across trees with
+    different first-party prefixes.
     """
     safe_resolve_module.cache_clear()
     distribution_lookup.cache_clear()
@@ -303,13 +288,7 @@ def _clear_resolver_caches() -> None:
 
 
 def _process_task(state: _RunnerState, task: _Task) -> tuple[Path, Path, VisitorPayload]:
-    """Run one task, transitioning ``sys.path`` + caches if the base changed.
-
-    Used by both the in-process serial loop and the
-    :class:`ProcessPoolExecutor` workers; the only difference between
-    the two is who owns ``state`` (a local in serial, a per-process
-    global in workers).
-    """
+    """Run one task, transitioning ``sys.path`` + caches if the tree changed."""
     if state.last_search_paths != task.search_paths:
         _rebind_sys_path(task.search_paths, state.sys_path_baseline)
         _clear_resolver_caches()
@@ -321,10 +300,10 @@ def _process_task(state: _RunnerState, task: _Task) -> tuple[Path, Path, Visitor
         import_resolver=state.import_resolver,
         detector=state.detector,
         plugins=state.plugins,
-        base=task.base,
+        base=task.tree_path,
         project_root=task.project_root,
     )
-    return task.base, task.file, payload
+    return task.tree_path, task.file, payload
 
 
 _worker_state: _RunnerState | None = None
@@ -335,12 +314,6 @@ def _init_worker(
     plugins: tuple[EdgePlugin, ...],
     resolvers: tuple[PathResolver, ...],
 ) -> None:
-    """Pool initializer: build the worker's :class:`_RunnerState`.
-
-    Resolver chain is rebuilt locally because :func:`_chain_resolvers`
-    can return a closure (not picklable); the resolver instances
-    themselves travel as picklable dataclasses.
-    """
     global _worker_state
     _worker_state = _RunnerState(
         detector=detector,
@@ -351,28 +324,26 @@ def _init_worker(
 
 
 def _worker_process_task(task: _Task) -> tuple[Path, Path, VisitorPayload]:
-    """Pool task: delegate to :func:`_process_task` against the worker's state."""
     assert _worker_state is not None, "_init_worker must run before _worker_process_task"
     return _process_task(_worker_state, task)
 
 
-def _build_sorted_tasks(base_specs: dict[Path, _BaseSpec], project_root: Path) -> list[_Task]:
-    """Flatten every base's miss files into one task list, sorted by search_paths.
+def _build_sorted_tasks(tree_specs: dict[Path, _TreeSpec], project_root: Path) -> list[_Task]:
+    """Flatten every tree's miss files into one sorted task list.
 
-    Sorting puts same-base tasks adjacent so a runner sees at most one
-    ``sys.path`` transition per base it touches, regardless of total
-    file count. Sorting on ``Path`` tuples directly is fine -- it's
-    just attribute access per comparison.
+    Sorting by ``search_paths`` puts same-tree tasks adjacent so a
+    runner sees at most one ``sys.path`` transition per tree it
+    touches.
     """
     tasks: list[_Task] = [
         _Task(
             file=file,
-            base=base,
+            tree_path=tree_path,
             search_paths=spec.search_paths,
             fqn_entry=spec.fqn_cache[str(file)],
             project_root=project_root,
         )
-        for base, spec in base_specs.items()
+        for tree_path, spec in tree_specs.items()
         for file in spec.miss_files
     ]
     tasks.sort(key=lambda t: (t.search_paths, t.file))
@@ -381,7 +352,7 @@ def _build_sorted_tasks(base_specs: dict[Path, _BaseSpec], project_root: Path) -
 
 def _compute_all_miss_payloads(
     *,
-    base_specs: dict[Path, _BaseSpec],
+    tree_specs: dict[Path, _TreeSpec],
     project_root: Path,
     detector: UnreachableRegionDetector,
     plugins: Sequence[EdgePlugin],
@@ -390,31 +361,19 @@ def _compute_all_miss_payloads(
     cache: GraphCache | None,
     workers: int | None,
 ) -> dict[Path, dict[Path, VisitorPayload]]:
-    """Run visitor + observe for every cache-miss file across every base.
-
-    Both branches use :func:`_process_task` for the per-task work; they
-    differ only in whether the runner state lives on the main process
-    or in :class:`ProcessPoolExecutor` workers. The pool is opt-in
-    (``workers >= 2`` and at least two miss files); below that, the
-    in-process path avoids pool startup cost.
-
-    Cache writes happen on the main process as each payload arrives,
-    so a partial run still warms the cache for files that completed.
-    Returns ``{base: {file: payload}}`` even for bases with no misses,
-    so the caller can index without an existence check.
-    """
-    out: dict[Path, dict[Path, VisitorPayload]] = {b: {} for b in base_specs}
-    total_misses = sum(len(s.miss_files) for s in base_specs.values())
+    """Run visitor + observe for every cache-miss file across every tree."""
+    out: dict[Path, dict[Path, VisitorPayload]] = {p: {} for p in tree_specs}
+    total_misses = sum(len(s.miss_files) for s in tree_specs.values())
     if total_misses == 0:
         return out
 
-    tasks = _build_sorted_tasks(base_specs, project_root)
+    tasks = _build_sorted_tasks(tree_specs, project_root)
     use_pool = workers is not None and workers >= 2 and total_misses >= 2
 
-    def _record(base: Path, file: Path, payload: VisitorPayload) -> None:
-        out[base][file] = payload
+    def _record(tree_path: Path, file: Path, payload: VisitorPayload) -> None:
+        out[tree_path][file] = payload
         if cache is not None:
-            cache.put(file, payload, base_specs[base].fingerprint)
+            cache.put(file, payload, tree_specs[tree_path].fingerprint)
 
     if use_pool:
         assert workers is not None
@@ -423,13 +382,10 @@ def _compute_all_miss_payloads(
             initializer=_init_worker,
             initargs=(detector, tuple(plugins), tuple(resolvers)),
         ) as pool:
-            for base, file, payload in pool.map(_worker_process_task, tasks):
-                _record(base, file, payload)
+            for tree_path, file, payload in pool.map(_worker_process_task, tasks):
+                _record(tree_path, file, payload)
         return out
 
-    # Serial: run every task in-process. Restore ``sys.path`` on the
-    # way out so callers (tests, library users) don't see lingering
-    # mutations from the runner's per-base rebinds.
     baseline = list(sys.path)
     state = _RunnerState(
         detector=detector,
@@ -439,8 +395,8 @@ def _compute_all_miss_payloads(
     )
     try:
         for task in tasks:
-            base, file, payload = _process_task(state, task)
-            _record(base, file, payload)
+            tree_path, file, payload = _process_task(state, task)
+            _record(tree_path, file, payload)
     finally:
         sys.path[:] = baseline
     return out
@@ -466,13 +422,6 @@ def _merge_payloads(*payloads: VisitorPayload) -> VisitorPayload:
 
 
 def _contains(suite: CodeRange, access: CodeRange) -> bool:
-    """``True`` iff ``access`` is fully nested inside ``suite``.
-
-    Compares ``(line, column)`` lexicographically at both ends. Suites
-    are line-aligned in practice (libcst positions an ``IndentedBlock``
-    at its first statement) so the line check usually decides; the
-    column tiebreak handles one-line ``if False: x = 1`` suites.
-    """
     s_start = (suite.start.line, suite.start.column)
     s_end = (suite.end.line, suite.end.column)
     a_start = (access.start.line, access.start.column)
@@ -484,43 +433,16 @@ def _apply_payload(
     payload: VisitorPayload,
     *,
     current_trie: SymbolTrie,
-    export_trie: SymbolTrie,
-    file_exported: bool,
+    export_trie: SymbolTrie | None,
     symbol_graph: nx.MultiDiGraph,
     import_edges: set[tuple[SymbolNode, Import, EdgeFlags]],
 ) -> None:
-    """Emit ``payload`` into the in-progress per-base structures.
+    """Emit ``payload`` into the in-progress per-tree structures.
 
-    Drives all node routing off ``SymbolNode.flags`` and ``type``:
-
-    * ``type == "module"`` goes into the graph and the trie; no parent
-      edge (modules are themselves the parent target).
-    * ``type == "synthetic"`` (plugin-emitted markers) goes into the
-      graph only -- no parent edge, no trie entry. Synthetic fqnames
-      don't fit the dotted module hierarchy and aren't lookup targets
-      for cross-module imports.
-    * Other decls go into the graph with a parent-module edge.
-      ``NodeFlags.SHADOWED`` excludes them from the trie -- the graph
-      keeps the parent edge so the decl stays well-formed, but
-      cross-module imports never resolve to it.
-    * ``NodeFlags.ENTRYPOINT`` (typically on plugin synthetics)
-      seeds reachability: ``graph.nodes[node]["entrypoint"] = True``
-      so :func:`find_reachable` starts its BFS from this node.
-
-    Edge flag derivation: each ``(src, dst, access_pos)`` entry has
-    its access position tested against ``payload.dead_suites`` for
-    containment. If matched, the resulting graph edge gets
-    :data:`EdgeFlags.DEAD_BRANCH`. Plugin-emitted edges use
-    ``SYNTHETIC_POSITION`` (line 0), which never falls inside a real
-    dead suite, so they always land with ``EdgeFlags.NONE``.
-    Unresolved cross-file imports accumulate into ``import_edges``
-    along with the derived flag and are fed to :func:`resolve_edges`
-    once the per-base trie is fully built; resolution preserves the
-    flag through every emission.
-
-    Per-file dead-suite positions are stashed on the graph as
-    ``graph.graph["dead_suites"][module.path]`` for downstream
-    reporting (e.g. "this file has unreachable code at line X").
+    ``export_trie`` is ``None`` for non-exported trees; the apply
+    step still populates ``current_trie`` (so within-tree resolution
+    works) and the graph, but no decls flow into the package's
+    consumer-visible export trie.
     """
     module = next(n for n in payload.nodes if n.type == "module")
 
@@ -541,7 +463,7 @@ def _apply_payload(
             symbol_graph.add_edge(n, module, flags=EdgeFlags.NONE)
         if not (n.flags & NodeFlags.SHADOWED):
             current_trie.add_declaration(n)
-            if file_exported:
+            if export_trie is not None:
                 export_trie.add_declaration(n)
 
     for src, dst, pos in payload.edges:
@@ -555,40 +477,25 @@ def _apply_payload(
 
 
 @dataclass(slots=True)
-class _BaseContribution:
-    """One base's pre-stitched contribution to the symbol graph.
+class _TreeContribution:
+    """One tree's pre-stitched contribution to the symbol graph."""
 
-    Built once per base by :func:`_build_contribution` and composed
-    into a target graph by :func:`_compose_contribution`, which adds
-    cross-base edges via :func:`resolve_edges` and runs plugin
-    :meth:`EdgePlugin.finalize` against the composed graph.
-
-    ``base_graph.graph["dead_suites"]`` carries this base's per-file
-    dead-suite positions; the compose step folds them into the target
-    graph's matching key.
-    """
-
-    base: Path
+    tree: SourceTree
     current_trie: SymbolTrie
-    export_trie: SymbolTrie
+    export_trie: SymbolTrie  # empty trie when the tree isn't EXPORTED
     base_graph: nx.MultiDiGraph
     import_edges: frozenset[tuple[SymbolNode, Import, EdgeFlags]]
 
 
 def _build_contribution(
-    base: Path,
-    spec: _BaseSpec,
+    tree: SourceTree,
+    spec: _TreeSpec,
     miss_payloads: Mapping[Path, VisitorPayload],
-) -> _BaseContribution:
-    """Apply ``spec``'s per-file payloads into a base-local graph slice.
-
-    The base-local ``nx.MultiDiGraph`` is what makes scope-bounded
-    materialization cheap: composing it into the full graph or a
-    closure graph doesn't redo per-file apply work.
-    """
+) -> _TreeContribution:
+    """Apply ``spec``'s per-file payloads into a tree-local graph slice."""
     current_trie = SymbolTrie()
     export_trie = SymbolTrie()
-    export_roots = exported_roots(base)
+    is_exported = bool(tree.flags & SourceTreeFlags.EXPORTED)
     import_edges: set[tuple[SymbolNode, Import, EdgeFlags]] = set()
     base_graph: nx.MultiDiGraph = nx.MultiDiGraph()
     base_graph.graph["dead_suites"] = {}
@@ -596,18 +503,16 @@ def _build_contribution(
         payload = spec.hits.get(file)
         if payload is None:
             payload = miss_payloads[file]
-        file_exported = export_roots is None or _under_any(file, export_roots)
         _apply_payload(
             payload,
             current_trie=current_trie,
-            export_trie=export_trie,
-            file_exported=file_exported,
+            export_trie=export_trie if is_exported else None,
             symbol_graph=base_graph,
             import_edges=import_edges,
         )
     current_trie.add_module_hierarchy_edges(base_graph)
-    return _BaseContribution(
-        base=base,
+    return _TreeContribution(
+        tree=tree,
         current_trie=current_trie,
         export_trie=export_trie,
         base_graph=base_graph,
@@ -616,7 +521,7 @@ def _build_contribution(
 
 
 def _compose_contribution(
-    contrib: _BaseContribution,
+    contrib: _TreeContribution,
     *,
     target_graph: nx.MultiDiGraph,
     symbol_lookup: SymbolTrie,
@@ -624,65 +529,76 @@ def _compose_contribution(
     project_root: Path,
 ) -> None:
     """Merge ``contrib.base_graph`` into ``target_graph``, stitch
-    cross-base imports against ``symbol_lookup``, and run plugin
+    cross-tree imports against ``symbol_lookup``, and run plugin
     :meth:`EdgePlugin.finalize` against the composed graph.
-
-    The caller owns ``symbol_lookup`` because its construction depends
-    on which dep export tries are in scope -- the full-graph path
-    merges every dep's exports, while the closure-scoped path merges
-    only deps inside the requested scope.
     """
     target_graph.update(
         edges=contrib.base_graph.edges(data=True, keys=True),
         nodes=contrib.base_graph.nodes(data=True),
     )
     target_graph.graph.setdefault("dead_suites", {}).update(contrib.base_graph.graph["dead_suites"])
-    for src, dst, flags in resolve_edges(contrib.import_edges, symbol_lookup, contrib.base):
+    for src, dst, flags in resolve_edges(contrib.import_edges, symbol_lookup, contrib.tree.path):
         target_graph.add_edge(src, dst, flags=flags)
     if plugins:
         ctx = PluginContext(
             graph=target_graph,
             symbol_lookup=symbol_lookup,
-            base=contrib.base,
+            base=contrib.tree.path,
             project_root=project_root,
         )
         for plugin in plugins:
             if not isinstance(plugin, EdgePlugin):
                 raise TypeError(f"Plugin {plugin!r} does not satisfy EdgePlugin protocol")
-            # Materialize before applying so plugins can iterate
-            # ctx.graph.nodes without tripping "dictionary changed
-            # size during iteration".
             ops = list(plugin.finalize(ctx))
             apply_ops(target_graph, ops)
 
 
-def _under_any(file: Path, roots: list[Path]) -> bool:
-    """True iff ``file`` is equal to or nested under any of ``roots``."""
-    f = file.resolve()
-    for r in roots:
-        if f == r or f.is_relative_to(r):
-            return True
-    return False
-
-
-def _infer_project_root(paths: PathMap) -> Path:
-    bases = list(paths)
-    if not bases:
+def _infer_project_root(trees: Sequence[SourceTree]) -> Path:
+    if not trees:
         return Path.cwd()
-    return min(bases, key=lambda p: len(p.parts))
+    return min((t.path for t in trees), key=lambda p: len(p.parts))
+
+
+def _trees_from_mapping(paths: Mapping[Path, Sequence[Path]]) -> list[SourceTree]:
+    """Convert a ``{path: [search_paths]}`` shorthand into a tree list.
+
+    Each path becomes its own ``EXPORTED`` tree. Package names are
+    derived from the final path component (with an index suffix when
+    two paths share a name) so they're unique across the resulting
+    list. Search-path entries are passed through as ``search_trees``;
+    paths that aren't keys are simply absent from the resolver's
+    layout, which validation will reject -- the shorthand is a
+    convenience for the homogeneous case where every search ref is
+    another tree in the same mapping.
+    """
+    used: dict[str, int] = {}
+
+    def _pkg(path: Path) -> str:
+        stem = path.name or "root"
+        if stem in used:
+            used[stem] += 1
+            return f"{stem}_{used[stem]}"
+        used[stem] = 0
+        return stem
+
+    pkg_for: dict[Path, str] = {}
+    for p in paths:
+        pkg_for[p.resolve()] = _pkg(p)
+
+    out: list[SourceTree] = []
+    for p, deps in paths.items():
+        out.append(
+            SourceTree(
+                path=p.resolve(),
+                package=pkg_for[p.resolve()],
+                flags=SourceTreeFlags.EXPORTED,
+                search_trees=tuple(d.resolve() for d in deps),
+            )
+        )
+    return out
 
 
 def _find_reachable(graph: nx.MultiDiGraph) -> set[SymbolNode]:
-    """BFS forward from every node tagged as an entrypoint by a plugin.
-
-    Plugins mark seeds by setting ``graph.nodes[node]["entrypoint"] = True``
-    (see :func:`dead_cst.plugins.apply_ops`).
-
-    Edges flagged with :data:`EdgeFlags.DEAD_BRANCH` are NOT filtered
-    here -- today's behavior, where dead-code references propagate
-    liveness through the enclosing decl, is preserved. See
-    :func:`_find_reachable_strict` for the variant that skips them.
-    """
     visited: set[SymbolNode] = set()
     stack = [n for n, attrs in graph.nodes(data=True) if attrs.get("entrypoint")]
     while stack:
@@ -695,7 +611,6 @@ def _find_reachable(graph: nx.MultiDiGraph) -> set[SymbolNode]:
 
 
 def _find_reachable_strict(graph: nx.MultiDiGraph) -> set[SymbolNode]:
-    """Like :func:`_find_reachable` but skips ``DEAD_BRANCH``-flagged edges."""
     visited: set[SymbolNode] = set()
     stack = [n for n, attrs in graph.nodes(data=True) if attrs.get("entrypoint")]
     while stack:
@@ -711,25 +626,10 @@ def _find_reachable_strict(graph: nx.MultiDiGraph) -> set[SymbolNode]:
 
 
 def _find_kept_alive_by_dead_branches(graph: nx.MultiDiGraph) -> set[SymbolNode]:
-    """Symbols kept alive only via at least one ``DEAD_BRANCH`` edge.
-
-    ``_find_reachable(graph) -`` strict-mode BFS that skips every edge
-    flagged :data:`EdgeFlags.DEAD_BRANCH`; the difference is the
-    "blast radius" of removing every statically-dead suite. Surfaced
-    on :class:`Analysis` as :meth:`Analysis.kept_alive_by_dead_branches`
-    and on :class:`PackageView` as
-    :meth:`PackageView.kept_alive_by_dead_branches`.
-    """
     return _find_reachable(graph) - _find_reachable_strict(graph)
 
 
 def _count_nodes(graph: nx.MultiDiGraph, prefix: Path | None) -> dict[str, int]:
-    """Count nodes in ``graph`` by ``SymbolNode.type``, optionally restricted by path.
-
-    If ``prefix`` is given, only nodes whose ``path`` is under ``prefix``
-    are counted. Includes the synthetic ``"synthetic"`` type contributed
-    by plugins and third-party-dep markers.
-    """
     counts: dict[str, int] = {}
     for node in graph.nodes:
         if prefix and not node.path.is_relative_to(prefix):
@@ -741,52 +641,35 @@ def _count_nodes(graph: nx.MultiDiGraph, prefix: Path | None) -> dict[str, int]:
 class Analysis:
     """Lazy entrypoint to the dead-cst pipeline.
 
-    Holds the analyzer's config (paths, plugins, resolvers, cache,
-    detector, worker count) and memoizes per-base work so multiple
-    queries against the same project share the cost. Construction is
-    cheap; nothing is read or parsed until you ask.
+    Holds the analyzer's config (source trees, plugins, resolvers,
+    cache, detector, worker count) and memoizes per-tree work so
+    multiple queries against the same project share the cost.
+    Construction is cheap; nothing is read or parsed until you ask.
 
     Three coarse stages happen on demand:
 
-    1. **Per-base file enumeration + visitor pass** -- driven by
-       :meth:`refresh`. Walks each requested base's files, hashes
+    1. **Per-tree file enumeration + visitor pass** -- driven by
+       :meth:`refresh`. Walks each requested tree's files, hashes
        them against the cache, runs the visitor + observe pass on
-       misses, writes payloads back to the cache. Idempotent and
-       scoped: ``refresh(bases=[B])`` touches only ``B``'s file tree.
+       misses, writes payloads back to the cache.
 
-    2. **Per-base contribution build** -- the per-base trie + a
-       base-local graph slice + the unresolved cross-file import set.
-       Built once per base from the payloads above, memoized for the
-       lifetime of the :class:`Analysis`.
+    2. **Per-tree contribution build** -- the per-tree trie + a
+       tree-local graph slice + the unresolved cross-file import set.
 
-    3. **Cross-base composition** -- merging contributions, running
+    3. **Cross-tree composition** -- merging contributions, running
        :func:`resolve_edges` against the merged tries, running plugin
-       :meth:`EdgePlugin.finalize`. Scoped to either the full base set
-       (:meth:`materialize_all`) or the "interesting set" of one base
-       (:meth:`materialize_closure` / :meth:`PackageView.graph`),
-       which is the forward dependency closure of that base's reverse
-       (consumer) closure -- the only bases that could keep a decl in
-       the target base alive.
+       :meth:`EdgePlugin.finalize`. Scoped to either every tree
+       (:meth:`materialize_all`) or the "interesting set" of one tree
+       (:meth:`materialize_closure` / :meth:`PackageView.graph`).
 
-    The lazy split lets cheap per-base queries skip stage 3 entirely:
-    :meth:`PackageView.modules` and :meth:`PackageView.declarations`
-    only need stage 2 for their own base. Reachability queries
-    (:meth:`PackageView.dead`, :meth:`Analysis.dead`) trigger stage 3
-    over the appropriate scope -- the "interesting set" for a single
-    package, or every base for the full graph. Composing a graph is
-    much cheaper than recomputing payloads, so per-package queries
-    against a warm cache stay fast even on large repos.
-
-    Parameters mirror :func:`build_symbol_graph`; see its docstring for
-    detailed semantics. Once constructed, an :class:`Analysis` is
-    effectively read-only -- mutating ``paths`` after construction has
-    no effect because the configuration is copied. Spin up a fresh
-    instance to pick up new search paths or new plugins.
+    The lazy split lets cheap per-package queries skip stage 3
+    entirely for purely local questions like
+    :meth:`PackageView.modules`.
     """
 
     def __init__(
         self,
-        paths: PathMap,
+        source_trees: Sequence[SourceTree] | Mapping[Path, Sequence[Path]],
         *,
         plugins: Sequence[EdgePlugin] = (),
         resolvers: Sequence[PathResolver] = (),
@@ -795,7 +678,19 @@ class Analysis:
         unreachable_detector: UnreachableRegionDetector | None = None,
         workers: int | None = None,
     ) -> None:
-        self._paths: dict[Path, list[Path]] = {b: list(deps) for b, deps in paths.items()}
+        trees: Sequence[SourceTree]
+        if isinstance(source_trees, Mapping):
+            # ``{path: [search_paths]}`` shorthand: each key becomes its
+            # own ``EXPORTED`` :class:`SourceTree`. Search paths are
+            # interpreted as references to other trees in the same dict
+            # by path identity. The package name is derived from each
+            # path's final component (with an index suffix when names
+            # collide). Useful for tests and the common single-tree
+            # case; the canonical input is the list-of-trees form.
+            trees = _trees_from_mapping(cast(Mapping[Path, Sequence[Path]], source_trees))
+        else:
+            trees = source_trees
+        self._validated = validate_source_trees(trees)
         self._plugins: tuple[EdgePlugin, ...] = tuple(plugins)
         self._resolvers: tuple[PathResolver, ...] = tuple(resolvers)
         self._cache = cache
@@ -803,7 +698,9 @@ class Analysis:
         self._project_root: Path = (
             project_root
             if project_root is not None
-            else (_infer_project_root(self._paths) if self._paths else Path.cwd())
+            else (
+                _infer_project_root(self._validated.trees) if self._validated.trees else Path.cwd()
+            )
         )
         self._import_resolver: ImportResolver = _chain_resolvers(self._resolvers)
         self._detector: UnreachableRegionDetector = (
@@ -812,91 +709,87 @@ class Analysis:
             else DefaultUnreachableRegionDetector()
         )
         self._dep_graph: nx.DiGraph | None = None
-        self._ordered_bases: list[Path] | None = None
-        self._base_specs: dict[Path, _BaseSpec] = {}
-        self._contributions: dict[Path, _BaseContribution] = {}
+        self._ordered_paths: list[Path] | None = None
+        self._tree_specs: dict[Path, _TreeSpec] = {}
+        self._contributions: dict[Path, _TreeContribution] = {}
         self._closure_graphs: dict[Path, nx.MultiDiGraph] = {}
         self._full_graph: nx.MultiDiGraph | None = None
 
     @property
-    def paths(self) -> PathMap:
-        """Read-only view of the base -> deps mapping this analysis was built with."""
-        return {b: list(deps) for b, deps in self._paths.items()}
+    def source_trees(self) -> list[SourceTree]:
+        """The validated tree list this analysis was built with."""
+        return list(self._validated.trees)
 
     @property
     def project_root(self) -> Path:
         return self._project_root
 
     def _dep_dag(self) -> nx.DiGraph:
-        """``dep -> consumer`` DAG over ``paths.keys()``; reused by
-        topo-sort and ancestor / descendant queries.
-        """
         if self._dep_graph is None:
-            self._dep_graph = _build_dep_graph(self._paths)
+            self._dep_graph = _build_tree_dag(self._validated)
         return self._dep_graph
 
     @property
-    def bases(self) -> list[Path]:
-        """Bases in topological order (deps before dependents)."""
-        if self._ordered_bases is None:
-            self._ordered_bases = list(nx.topological_sort(self._dep_dag()))
-        return list(self._ordered_bases)
+    def tree_paths(self) -> list[Path]:
+        """Tree paths in topological order (deps before consumers)."""
+        if self._ordered_paths is None:
+            self._ordered_paths = list(nx.topological_sort(self._dep_dag()))
+        return list(self._ordered_paths)
 
-    def reverse_closure(self, base: Path) -> frozenset[Path]:
-        """Bases that transitively depend on ``base`` (including ``base`` itself).
+    @property
+    def packages(self) -> list[str]:
+        """Unique package names across the configured trees."""
+        seen: dict[str, None] = {}
+        for t in self._validated.trees:
+            seen.setdefault(t.package, None)
+        return list(seen)
 
-        These are the only bases whose source code could import (and
-        therefore keep alive) decls under ``base``. A query like "is X
-        in ``base`` dead?" only needs entrypoints from this set --
-        sibling bases that don't reach ``base`` in the search-paths
-        DAG can't reference its decls.
-        """
-        if base not in self._paths:
-            raise KeyError(base)
-        return frozenset({base}) | frozenset(nx.descendants(self._dep_dag(), base))
+    def reverse_closure(self, tree_path: Path) -> frozenset[Path]:
+        """Tree paths that transitively depend on ``tree_path`` (inclusive)."""
+        if tree_path not in self._validated.by_path:
+            raise KeyError(tree_path)
+        return frozenset({tree_path}) | frozenset(nx.descendants(self._dep_dag(), tree_path))
 
-    def _interesting_set(self, base: Path) -> frozenset[Path]:
-        """Bases needed to answer reachability queries about decls in ``base``.
-
-        Computed as the forward (deps) closure of :meth:`reverse_closure`:
-        every consumer of ``base`` plus every consumer's transitive
-        deps, so we have enough trie data to resolve every cross-base
-        import that could lead into ``base``.
-        """
+    def _interesting_set(self, tree_path: Path) -> frozenset[Path]:
+        """Tree paths needed to answer reachability for decls in ``tree_path``."""
         dag = self._dep_dag()
         scope: set[Path] = set()
-        for consumer in self.reverse_closure(base):
+        for consumer in self.reverse_closure(tree_path):
             scope.add(consumer)
             scope |= nx.ancestors(dag, consumer)
         return frozenset(scope)
 
-    def refresh(self, bases: Iterable[Path] | None = None) -> Analysis:
-        """Update the cache and build per-base contributions for the given bases.
+    def _package_interesting_set(self, package: str) -> frozenset[Path]:
+        """Union of :meth:`_interesting_set` over every tree in ``package``."""
+        scope: set[Path] = set()
+        for tree in self._validated.by_package.get(package, []):
+            scope |= self._interesting_set(tree.path)
+        return frozenset(scope)
 
-        ``bases=None`` (the default) refreshes every base. Passing a
-        subset scopes the file walk + visitor pass to those bases
-        only -- sibling bases are untouched. Already-refreshed bases
-        are skipped, so calling :meth:`refresh` twice with the same
-        argument is cheap.
+    def refresh(self, tree_paths: Iterable[Path] | None = None) -> Analysis:
+        """Update the cache and build per-tree contributions for the given trees.
 
-        Returns ``self`` so callers can chain
-        ``Analysis(...).refresh().materialize_all()``.
+        ``tree_paths=None`` (the default) refreshes every tree.
+        Already-refreshed trees are skipped, so calling :meth:`refresh`
+        twice with the same argument is cheap.
         """
-        targets = list(bases) if bases is not None else self.bases
-        unknown = [b for b in targets if b not in self._paths]
+        targets = list(tree_paths) if tree_paths is not None else self.tree_paths
+        unknown = [p for p in targets if p not in self._validated.by_path]
         if unknown:
-            raise KeyError(f"Unknown bases: {unknown}")
-        new_targets = [b for b in targets if b not in self._contributions]
+            raise KeyError(f"Unknown tree paths: {unknown}")
+        new_targets = [p for p in targets if p not in self._contributions]
         if not new_targets:
             return self
-        for b in new_targets:
-            if b not in self._base_specs:
-                self._base_specs[b] = _build_base_spec(
-                    b, self._paths[b], self._cache, self._base_fingerprint(b)
+        all_trees = list(self._validated.trees)
+        for p in new_targets:
+            if p not in self._tree_specs:
+                tree = self._validated.by_path[p]
+                self._tree_specs[p] = _build_tree_spec(
+                    tree, all_trees, self._cache, self._tree_fingerprint(tree)
                 )
-        partial_specs = {b: self._base_specs[b] for b in new_targets}
+        partial_specs = {p: self._tree_specs[p] for p in new_targets}
         miss_payloads = _compute_all_miss_payloads(
-            base_specs=partial_specs,
+            tree_specs=partial_specs,
             project_root=self._project_root,
             detector=self._detector,
             plugins=self._plugins,
@@ -905,90 +798,61 @@ class Analysis:
             cache=self._cache,
             workers=self._workers,
         )
-        for b in new_targets:
-            self._contributions[b] = _build_contribution(b, self._base_specs[b], miss_payloads[b])
+        for p in new_targets:
+            tree = self._validated.by_path[p]
+            self._contributions[p] = _build_contribution(
+                tree, self._tree_specs[p], miss_payloads[p]
+            )
         return self
 
-    def package(self, base: Path) -> PackageView:
-        """Return a lazy view onto a single base.
+    def package(self, name: str) -> PackageView:
+        """Return a lazy view onto a single logical package."""
+        if name not in self._validated.by_package:
+            raise KeyError(name)
+        return PackageView(self, name)
 
-        The returned :class:`PackageView` is cheap; per-base work is
-        triggered by its query methods.
-        """
-        if base not in self._paths:
-            raise KeyError(base)
-        return PackageView(self, base)
-
-    def packages(self) -> Iterator[PackageView]:
-        """Yield a :class:`PackageView` for every base in topological order."""
-        for base in self.bases:
-            yield PackageView(self, base)
+    def package_views(self) -> Iterator[PackageView]:
+        """Yield a :class:`PackageView` for every package."""
+        for name in self.packages:
+            yield PackageView(self, name)
 
     def materialize_all(self) -> nx.MultiDiGraph:
-        """Build the full graph (every base, cross-base resolution, plugins).
-
-        Memoized: the second call returns the same graph object.
-        Refreshes every base first, so this is also the trigger for a
-        whole-project cache refresh in callers that don't refresh
-        explicitly.
-        """
+        """Build the full graph (every tree, cross-tree resolution, plugins)."""
         if self._full_graph is None:
             self.refresh()
             self._full_graph = self._materialize(scope=None)
         return self._full_graph
 
-    def materialize_closure(self, base: Path) -> nx.MultiDiGraph:
-        """Build a graph containing every contribution in ``_interesting_set(base)``.
-
-        The result is the smallest graph that gives correct
-        reachability answers for decls in ``base``: every consumer of
-        ``base`` (so we see every potential alive-keeper) plus every
-        consumer's transitive deps (so cross-base imports resolve).
-
-        If :meth:`materialize_all` has already been called, returns
-        the full graph instead -- it's a strict superset and cheaper
-        than recomputing.
-        """
+    def materialize_closure(self, tree_path: Path) -> nx.MultiDiGraph:
+        """Build a graph containing every contribution in the
+        :meth:`_interesting_set` of ``tree_path``."""
         if self._full_graph is not None:
             return self._full_graph
-        if base not in self._closure_graphs:
-            scope = self._interesting_set(base)
-            self.refresh(bases=scope)
-            self._closure_graphs[base] = self._materialize(scope=scope)
-        return self._closure_graphs[base]
+        if tree_path not in self._closure_graphs:
+            scope = self._interesting_set(tree_path)
+            self.refresh(tree_paths=scope)
+            self._closure_graphs[tree_path] = self._materialize(scope=scope)
+        return self._closure_graphs[tree_path]
 
     def _materialize(self, *, scope: frozenset[Path] | None) -> nx.MultiDiGraph:
-        """Compose every refreshed base in ``scope`` into a fresh graph.
-
-        ``scope=None`` composes every base. Caller is responsible for
-        having :meth:`refresh`'d every base in ``scope`` first.
-        """
         g: nx.MultiDiGraph = nx.MultiDiGraph()
         g.graph["dead_suites"] = {}
-        for base in self.bases:
-            if scope is not None and base not in scope:
+        for path in self.tree_paths:
+            if scope is not None and path not in scope:
                 continue
             _compose_contribution(
-                self._contributions[base],
+                self._contributions[path],
                 target_graph=g,
-                symbol_lookup=self._build_symbol_lookup(base, scope=scope),
+                symbol_lookup=self._build_symbol_lookup(path, scope=scope),
                 plugins=self._plugins,
                 project_root=self._project_root,
             )
         return g
 
     def reachable(self) -> set[SymbolNode]:
-        """Set of every decl reachable from any entrypoint in the full graph."""
         return _find_reachable(self.materialize_all())
 
     def dead(self) -> Iterator[SymbolNode]:
-        """Yield every decl that no entrypoint reaches.
-
-        Excludes ``module`` and ``synthetic`` nodes -- modules stay
-        alive as long as anything they contain is alive (handled via
-        the parent-module edge), and synthetic nodes are analyzer
-        plumbing rather than user-visible decls.
-        """
         g = self.materialize_all()
         reachable = _find_reachable(g)
         for n in g.nodes:
@@ -998,181 +862,147 @@ class Analysis:
                 yield n
 
     def kept_alive_by_dead_branches(self) -> set[SymbolNode]:
-        """Symbols that would become unreachable if every dead suite were removed.
-
-        Computed as ``reachable() -`` strict-mode BFS that skips every
-        edge flagged :data:`EdgeFlags.DEAD_BRANCH`. The resulting set
-        is the "blast radius" of removing every statically-dead suite
-        in the analyzed source -- symbols currently kept alive only
-        through a chain that crosses at least one dead-branch
-        reference.
-
-        Used by tooling that reports "if you removed your unreachable
-        code, these additional symbols would also become dead." The
-        default :meth:`reachable` traversal is unchanged; this is the
-        opt-in stricter pass.
-        """
         g = self.materialize_all()
         return _find_reachable(g) - _find_reachable_strict(g)
 
     def count_nodes(self, prefix: Path | None = None) -> dict[str, int]:
-        """Count nodes in the full graph by ``SymbolNode.type``.
-
-        ``prefix=None`` (the default) counts every node. Pass a base
-        path to scope the count to nodes whose ``path`` is under that
-        prefix -- useful for per-base summaries when several bases are
-        analysed together.
-        """
         return _count_nodes(self.materialize_all(), prefix)
 
-    def _base_fingerprint(self, base: Path) -> str:
-        """Per-base cache fingerprint for ``base``.
-
-        Each base's fingerprint is independent: it covers ``base`` and
-        its own search paths but not sibling bases' configs, so cache
-        rows for different bases coexist without invalidating each
-        other when one base's deps change.
-        """
+    def _tree_fingerprint(self, tree: SourceTree) -> str:
+        """Per-tree cache fingerprint."""
         return compute_fingerprint(
-            base=base,
-            search_paths=(base, *self._paths.get(base, [])),
+            base=tree.path,
+            search_paths=(tree.path, *tree.search_trees),
             resolvers=self._resolvers,
             plugins=self._plugins,
             unreachable_detector=self._detector,
         )
 
-    def _build_symbol_lookup(self, base: Path, *, scope: frozenset[Path] | None) -> SymbolTrie:
-        """Per-base lookup trie: this base's full trie + each in-scope dep's exports.
+    def _build_symbol_lookup(self, tree_path: Path, *, scope: frozenset[Path] | None) -> SymbolTrie:
+        """Per-tree lookup trie: this tree's full trie + each in-scope
+        search ref's export trie.
 
-        ``scope`` bounds which deps' export tries are merged in:
-        ``None`` for the full-graph path (every dep), or a
-        :meth:`_interesting_set` for closure-scoped materialization.
-        Deps must already be refreshed (the caller is responsible for
-        calling :meth:`refresh` on the right set first).
+        The search refs are the tree's ``search_trees`` (paths to
+        EXPORTED trees of other packages, or another tree in the same
+        package). Only the search refs' *export* tries flow in -- so a
+        tests/ tree that lists lib/ in its search refs sees lib/'s
+        consumer-visible surface, not its private internals.
         """
-        contrib = self._contributions[base]
+        contrib = self._contributions[tree_path]
         lookup = SymbolTrie()
         lookup.merge(contrib.current_trie)
-        for dep in self._paths.get(base, []):
-            if scope is not None and dep not in scope:
+        tree = self._validated.by_path[tree_path]
+        for ref in tree.search_trees:
+            if scope is not None and ref not in scope:
                 continue
-            dep_contrib = self._contributions.get(dep)
-            if dep_contrib is None:
+            ref_contrib = self._contributions.get(ref)
+            if ref_contrib is None:
                 continue
-            lookup.merge(dep_contrib.export_trie)
+            lookup.merge(ref_contrib.export_trie)
         return lookup
 
 
 class PackageView:
-    """Lazy view of a single base inside an :class:`Analysis`.
+    """Lazy view of a logical package inside an :class:`Analysis`.
 
-    Cheap to construct (returned by :meth:`Analysis.package`); query
-    methods trigger only the work their result depends on. Local
-    queries (:meth:`modules`, :meth:`declarations`) only need this
-    base's contribution. Cross-base queries (:meth:`importers_of`,
-    :meth:`dead`, :meth:`graph`) materialize the
-    :meth:`Analysis._interesting_set` for this base.
+    A package is one or more :class:`SourceTree` entries sharing a
+    package name. Queries aggregate over every tree in the package;
+    cross-package queries (:meth:`importers_of`, :meth:`dead`,
+    :meth:`graph`) materialize the union of every tree's interesting
+    set.
     """
 
-    __slots__ = ("_analysis", "_base")
+    __slots__ = ("_analysis", "_name")
 
-    def __init__(self, analysis: Analysis, base: Path) -> None:
+    def __init__(self, analysis: Analysis, name: str) -> None:
         self._analysis = analysis
-        self._base = base
+        self._name = name
 
     @property
-    def base(self) -> Path:
-        return self._base
+    def name(self) -> str:
+        return self._name
 
     @property
     def analysis(self) -> Analysis:
         return self._analysis
 
-    def reverse_closure(self) -> frozenset[Path]:
-        """Bases that transitively depend on this one (including this base)."""
-        return self._analysis.reverse_closure(self._base)
+    @property
+    def trees(self) -> list[SourceTree]:
+        """Trees that share this package's name, in declaration order."""
+        return list(self._analysis._validated.by_package[self._name])
 
-    def _contribution(self) -> _BaseContribution:
-        self._analysis.refresh(bases=[self._base])
-        return self._analysis._contributions[self._base]
+    @property
+    def exported_tree(self) -> SourceTree | None:
+        """The package's single ``EXPORTED`` tree, if any."""
+        return self._analysis._validated.exported_for.get(self._name)
+
+    def reverse_closure(self) -> frozenset[Path]:
+        """Tree paths that transitively depend on any tree in this package."""
+        out: set[Path] = set()
+        for tree in self.trees:
+            out |= self._analysis.reverse_closure(tree.path)
+        return frozenset(out)
+
+    def _under_any_tree(self, path: Path) -> bool:
+        return any(path.is_relative_to(t.path) for t in self.trees)
 
     def modules(self) -> Iterator[SymbolNode]:
-        """Module nodes for every ``.py`` file in this base.
-
-        Local-only: refreshes this base if needed but never touches
-        deps or consumers.
-        """
-        for n in self._contribution().base_graph.nodes:
-            if n.type == "module":
-                yield n
+        """Module nodes for every ``.py`` file in any tree of this package."""
+        self._analysis.refresh(tree_paths=[t.path for t in self.trees])
+        for tree in self.trees:
+            for n in self._analysis._contributions[tree.path].base_graph.nodes:
+                if n.type == "module":
+                    yield n
 
     def declarations(self, name: str | None = None) -> Iterator[SymbolNode]:
-        """Top-level decls in this base.
-
-        ``name=None`` yields every decl. Pass a string to filter to
-        decls whose rightmost dotted segment matches it (``"Foo"``
-        matches ``pkg.mod.Foo`` but not ``pkg.Foo.bar``). Local-only.
-        """
-        for n in self._contribution().base_graph.nodes:
-            if n.type in ("module", "synthetic"):
-                continue
-            if name is not None and simple_name(n.fqname) != name:
-                continue
-            yield n
+        """Top-level decls in any tree of this package."""
+        self._analysis.refresh(tree_paths=[t.path for t in self.trees])
+        for tree in self.trees:
+            for n in self._analysis._contributions[tree.path].base_graph.nodes:
+                if n.type in ("module", "synthetic"):
+                    continue
+                if name is not None and simple_name(n.fqname) != name:
+                    continue
+                yield n
 
     def importers_of(self, target: str) -> set[Path]:
-        """Files in this base whose imports reach ``target``.
+        """Files in this package whose imports reach ``target``.
 
-        ``target`` is matched first as a first-party module fqname,
-        then against the synthetic ``[external dist] / [external file]
-        / [unresolved]`` markers the resolver creates for non-first-
-        party imports. Triggers closure materialization (same scope
-        as :meth:`graph`) because cross-base import resolution is
-        what populates the predecessors used here.
+        Triggers closure materialization. Aggregates across every
+        tree in the package.
         """
-        scope = self._analysis._interesting_set(self._base)
-        ctx = PluginContext(
-            graph=self._analysis.materialize_closure(self._base),
-            symbol_lookup=self._analysis._build_symbol_lookup(self._base, scope=scope),
-            base=self._base,
-            project_root=self._analysis.project_root,
-        )
-        return ctx.importers(target)
+        scope = self._analysis._package_interesting_set(self._name)
+        self._analysis.refresh(tree_paths=scope)
+        graph = self._analysis._materialize(scope=scope)
+        out: set[Path] = set()
+        for tree in self.trees:
+            ctx = PluginContext(
+                graph=graph,
+                symbol_lookup=self._analysis._build_symbol_lookup(tree.path, scope=scope),
+                base=tree.path,
+                project_root=self._analysis.project_root,
+            )
+            out |= ctx.importers(target)
+        return out
 
     def graph(self) -> nx.MultiDiGraph:
-        """Materialize and return the closure-scoped graph for this base.
-
-        See :meth:`Analysis.materialize_closure`. The graph is shared
-        across queries on the same package -- repeated calls return
-        the same object.
-        """
-        return self._analysis.materialize_closure(self._base)
+        """Materialize and return the closure-scoped graph for this package."""
+        scope = self._analysis._package_interesting_set(self._name)
+        self._analysis.refresh(tree_paths=scope)
+        return self._analysis._materialize(scope=scope)
 
     def reachable(self) -> set[SymbolNode]:
-        """Set of decls in this base reachable from any entrypoint in
-        :meth:`reverse_closure`.
-
-        Triggers closure materialization on first call; subsequent
-        calls reuse the cached graph. Filtered to nodes whose ``path``
-        is under :attr:`base`, so the result is comparable to
-        :meth:`declarations` for "what's alive in this package?"
-        questions.
-        """
-        g = self._analysis.materialize_closure(self._base)
-        return {n for n in _find_reachable(g) if n.path.is_relative_to(self._base)}
+        """Decls in this package reachable from any entrypoint in
+        :meth:`reverse_closure`."""
+        g = self.graph()
+        return {n for n in _find_reachable(g) if self._under_any_tree(n.path)}
 
     def dead(self) -> Iterator[SymbolNode]:
-        """Yield decls in this base not reachable from any entrypoint
-        in :meth:`reverse_closure`.
-
-        Triggers closure materialization on first call; subsequent
-        calls reuse the cached graph. Excludes ``module`` and
-        ``synthetic`` nodes (see :meth:`Analysis.dead`).
-        """
-        g = self._analysis.materialize_closure(self._base)
+        """Yield decls in this package not reachable from any entrypoint."""
+        g = self.graph()
         reachable = _find_reachable(g)
         for n in g.nodes:
-            if not n.path.is_relative_to(self._base):
+            if not self._under_any_tree(n.path):
                 continue
             if n.type in ("module", "synthetic"):
                 continue
@@ -1180,39 +1010,30 @@ class PackageView:
                 yield n
 
     def kept_alive_by_dead_branches(self) -> set[SymbolNode]:
-        """Decls in this base kept alive only by dead-branch references.
-
-        Closure-scoped equivalent of :meth:`Analysis.kept_alive_by_dead_branches`,
-        filtered to nodes under :attr:`base`.
-        """
-        g = self._analysis.materialize_closure(self._base)
+        g = self.graph()
         diff = _find_reachable(g) - _find_reachable_strict(g)
-        return {n for n in diff if n.path.is_relative_to(self._base)}
+        return {n for n in diff if self._under_any_tree(n.path)}
 
     def count_nodes(self) -> dict[str, int]:
-        """Count nodes contributed by this base, by ``SymbolNode.type``.
-
-        Local-only: doesn't materialize the closure. Counts include
-        ``module``, source decls, and any ``synthetic`` nodes plugins
-        emitted into this base's contribution during ``observe``.
-        """
-        return _count_nodes(self._contribution().base_graph, prefix=None)
+        """Count nodes contributed by this package, by ``SymbolNode.type``."""
+        self._analysis.refresh(tree_paths=[t.path for t in self.trees])
+        counts: dict[str, int] = {}
+        for tree in self.trees:
+            sub = _count_nodes(self._analysis._contributions[tree.path].base_graph, prefix=None)
+            for k, v in sub.items():
+                counts[k] = counts.get(k, 0) + v
+        return counts
 
     def remove_dead_code(self) -> None:
-        """Apply the LibCST codemod, deleting every dead decl in this base.
-
-        Materializes the closure, computes reachability, and feeds the
-        unreachable subgraph (filtered to this base) to
-        :func:`dead_cst.codemod.remove_code`. The transformation is
-        destructive -- back the files up first, or run on a clean
-        working tree.
-        """
+        """Apply the LibCST codemod, deleting every dead decl in this package."""
         from .codemod import remove_code
 
-        g = self._analysis.materialize_closure(self._base)
+        g = self.graph()
         reachable = _find_reachable(g)
         dead_nodes = [n for n in g.nodes if n not in reachable]
-        remove_code(g.subgraph(dead_nodes), self._base)
+        sub = g.subgraph(dead_nodes)
+        for tree in self.trees:
+            remove_code(sub, tree.path)
 
 
 __all__ = [

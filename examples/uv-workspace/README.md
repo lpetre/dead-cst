@@ -22,11 +22,11 @@ uv-workspace/
 ```
 
 Each member uses the flat layout: importable code lives in a top-level
-package directory (`core/` or `app/`) and `tests/` sits next to it.
-`exported_roots` reads each member's `[tool.hatch.build.targets.wheel].packages`
-and treats only those dirs as visible to other members -- so when `app`
-resolves an import, it never sees `core/tests/` (and vice-versa), even
-though both members have a top-level `tests/` package.
+package directory (`core/` or `app/`) and `tests/` sits next to it. Only
+the EXPORTED `SourceTree` per package contributes to that package's
+export trie -- so when `app` resolves an import, it never sees
+`core/tests/` (and vice-versa), even though both members have a top-level
+`tests/` package.
 
 ## Run the analysis
 
@@ -87,8 +87,8 @@ trees show up as dead because no entrypoint plugin (e.g. `pytest`) is
 enabled in this run -- pass `--plugin pytest` to keep them alive.
 
 The two `tests` modules are distinct nodes (one per file path) and
-coexist in the graph; `exported_roots` keeps them from colliding during
-import resolution.
+coexist in the graph; the per-package export-trie rule keeps them from
+colliding during cross-package import resolution.
 
 ## How `UvWorkspaceResolver` decides on a source root
 
@@ -101,17 +101,17 @@ Direct dependency edges come from each member's `dependencies = [...]` list
 in `uv.lock`; non-workspace deps (regular PyPI packages) are dropped because
 they don't have a source tree under your control.
 
-For each member, `dead_cst.resolvers.exported_roots` then reads its
-`pyproject.toml` and returns the subdirs that are visible to other
-members at import time. Discovery dispatches on `[build-system].build-backend`
-(hatchling, setuptools, poetry, pdm, flit) with a `src/`-layout shortcut
-and a name-match fallback for backends without explicit `packages` lists.
+Each member's resolved `SourceTree` is marked EXPORTED; only the EXPORTED
+tree's decls populate the package's export trie that other members see.
+The resolver picks the source root using a `src/`-layout shortcut, falling
+back to the member directory itself.
 
 ## Falling back to explicit paths
 
 If you don't want to commit a `uv.lock`, the multi-`-p` invocation above
-keeps working unchanged. Note that explicit `-p` paths skip
-`exported_roots` discovery; if you have multiple flat-layout members with
-overlapping internal packages (`tests/`, `scripts/`, etc.), prefer the
-`uv_workspace` resolver so each member's exports are inferred from its
-build backend.
+keeps working. `ManualResolver` produces one EXPORTED tree per `-p`
+spec and doesn't analyze separate `tests/` subtrees; for multi-flat-layout
+workspaces with overlapping internal packages (`tests/`, `scripts/`, etc.),
+prefer the `uv_workspace` resolver or configure
+`[[tool.dead-cst.trees]]` per member so each member's exports are made
+explicit.
