@@ -302,7 +302,7 @@ def test_uv_workspace_flat_layout_with_tests_dirs(tmp_path: Path):
 
     _make_fake_venv(tmp_path)
     # No AssertionError -- this used to crash before the fix.
-    graph = Analysis(tmp_path, resolvers=[UvResolver()]).materialize_all()
+    graph = Analysis(tmp_path, resolver=UvResolver()).materialize_all()
 
     # Both members' tests modules exist as distinct nodes (full graph picture).
     tests_modules = [n for n in graph.nodes if n.type == "module" and n.fqname == "tests"]
@@ -401,7 +401,7 @@ def test_uv_workspace_shared_namespace_package(tmp_path: Path):
     assert by_name["foo-b"].path == foo_b_dir
     assert by_name["foo-b"].deps == ("foo-a",)
 
-    graph = Analysis(tmp_path, resolvers=[resolver]).materialize_all()
+    graph = Analysis(tmp_path, resolver=resolver).materialize_all()
 
     # foo.a.value (in foo-a) and foo.b.result (in foo-b) both made it into
     # the graph as distinct variables under the shared ``foo`` namespace.

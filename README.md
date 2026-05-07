@@ -161,7 +161,7 @@ from dead_cst.resolvers import ManualResolver
 root = Path("./src")
 analysis = Analysis(
     root,
-    resolvers=[ManualResolver(specs=["."])],
+    resolver=ManualResolver(specs=["."]),
     plugins=[
         MainBlockPlugin(),
         ExplicitEntrypointPlugin(specs=[re.compile(r".*__main__\.py")]),
@@ -264,7 +264,7 @@ class FlagAwareDetector(DefaultUnreachableRegionDetector):
 
 graph = Analysis(
     root,
-    resolvers=[ManualResolver(specs=["."])],
+    resolver=ManualResolver(specs=["."]),
     unreachable_detector=FlagAwareDetector(),
 ).materialize_all()
 ```

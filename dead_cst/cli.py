@@ -121,22 +121,22 @@ def _maybe_cache(
         yield cache
 
 
-def build_resolvers(path_specs: list[str], resolver_names: list[str]) -> list[PathResolver]:
-    """Build the resolver chain from ``-p`` specs and ``--resolver`` names.
+def build_resolver(path_specs: list[str], resolver_name: str | None) -> PathResolver:
+    """Pick the single resolver from ``-p`` specs or ``--resolver``.
 
-    ``-p`` specs become a :class:`ManualResolver` and slot into the
-    chain alongside named resolvers, so explicit specs participate in
-    :meth:`PathResolver.resolve_import` lookups too. With neither flag
-    supplied, falls back to a ``ManualResolver`` that treats the project
-    root itself as the only base.
+    The two flags are mutually exclusive: ``-p`` becomes a
+    :class:`ManualResolver`, ``--resolver`` loads a named resolver, and
+    passing both is a usage error. With neither flag supplied, falls
+    back to a :class:`ManualResolver` that treats the project root
+    itself as the only base.
     """
-    resolvers: list[PathResolver] = []
+    if path_specs and resolver_name is not None:
+        raise typer.BadParameter("`-p`/`--path` and `--resolver` are mutually exclusive.")
+    if resolver_name is not None:
+        return load_resolver(resolver_name)
     if path_specs:
-        resolvers.append(ManualResolver(specs=path_specs))
-    resolvers.extend(load_resolver(name) for name in resolver_names)
-    if not resolvers:
-        resolvers.append(ManualResolver(specs=["."]))
-    return resolvers
+        return ManualResolver(specs=path_specs)
+    return ManualResolver(specs=["."])
 
 
 def version_callback(value: bool) -> None:
@@ -173,7 +173,7 @@ def analyze(
         typer.Option("-p", "--path", help="Search path spec: 'base:dep1,dep2' or 'base'."),
     ] = None,
     resolver: Annotated[
-        list[str] | None,
+        str | None,
         typer.Option("--resolver", help="Path resolver to run (e.g. uv)."),
     ] = None,
     plugin: Annotated[
@@ -195,7 +195,7 @@ def analyze(
     setup_logging(verbose)
     root = root.resolve()
 
-    resolvers = build_resolvers(path or [], resolver or [])
+    path_resolver = build_resolver(path or [], resolver)
 
     typer.echo(f"Building symbol graph for {root}...", err=True)
     plugins = build_plugins(
@@ -205,7 +205,7 @@ def analyze(
     with _maybe_cache(root, no_cache) as cache:
         analysis = Analysis(
             root,
-            resolvers=resolvers,
+            resolver=path_resolver,
             plugins=plugins,
             cache=cache,
             workers=workers,
@@ -351,7 +351,7 @@ def why_alive(
         typer.Option("-p", "--path", help="Search path spec: 'base:dep1,dep2' or 'base'."),
     ] = None,
     resolver: Annotated[
-        list[str] | None,
+        str | None,
         typer.Option("--resolver", help="Path resolver to run (e.g. uv)."),
     ] = None,
     plugin: Annotated[
@@ -370,7 +370,7 @@ def why_alive(
     setup_logging(verbose)
     root = root.resolve()
 
-    resolvers = build_resolvers(path or [], resolver or [])
+    path_resolver = build_resolver(path or [], resolver)
 
     typer.echo(f"Building symbol graph for {root}...", err=True)
     plugins = build_plugins(
@@ -380,7 +380,7 @@ def why_alive(
     with _maybe_cache(root, no_cache) as cache:
         graph = Analysis(
             root,
-            resolvers=resolvers,
+            resolver=path_resolver,
             plugins=plugins,
             cache=cache,
             workers=workers,
@@ -428,7 +428,7 @@ def dependencies(
         typer.Option("-p", "--path", help="Search path spec: 'base:dep1,dep2' or 'base'."),
     ] = None,
     resolver: Annotated[
-        list[str] | None,
+        str | None,
         typer.Option("--resolver", help="Path resolver to run (e.g. uv)."),
     ] = None,
     verbose: Annotated[
@@ -446,13 +446,13 @@ def dependencies(
     setup_logging(verbose)
     root = root.resolve()
 
-    resolvers = build_resolvers(path or [], resolver or [])
+    path_resolver = build_resolver(path or [], resolver)
 
     typer.echo(f"Building symbol graph for {root}...", err=True)
     with _maybe_cache(root, no_cache) as cache:
         analysis = Analysis(
             root,
-            resolvers=resolvers,
+            resolver=path_resolver,
             cache=cache,
             workers=workers,
         )
@@ -498,7 +498,7 @@ def unused_exports(
         typer.Option("-p", "--path", help="Search path spec: 'base:dep1,dep2' or 'base'."),
     ] = None,
     resolver: Annotated[
-        list[str] | None,
+        str | None,
         typer.Option("--resolver", help="Path resolver to run (e.g. uv)."),
     ] = None,
     plugin: Annotated[
@@ -517,7 +517,7 @@ def unused_exports(
     setup_logging(verbose)
     root = root.resolve()
 
-    resolvers = build_resolvers(path or [], resolver or [])
+    path_resolver = build_resolver(path or [], resolver)
 
     typer.echo(f"Building symbol graph for {root}...", err=True)
     plugins = build_plugins(
@@ -527,7 +527,7 @@ def unused_exports(
     with _maybe_cache(root, no_cache) as cache:
         graph = Analysis(
             root,
-            resolvers=resolvers,
+            resolver=path_resolver,
             plugins=plugins,
             cache=cache,
             workers=workers,
@@ -583,7 +583,7 @@ def remove(
         typer.Option("-p", "--path", help="Search path spec: 'base:dep1,dep2' or 'base'."),
     ] = None,
     resolver: Annotated[
-        list[str] | None,
+        str | None,
         typer.Option("--resolver", help="Path resolver to run (e.g. uv)."),
     ] = None,
     plugin: Annotated[
@@ -605,7 +605,7 @@ def remove(
     setup_logging(verbose)
     root = root.resolve()
 
-    resolvers = build_resolvers(path or [], resolver or [])
+    path_resolver = build_resolver(path or [], resolver)
 
     typer.echo(f"Building symbol graph for {root}...", err=True)
     plugins = build_plugins(
@@ -615,7 +615,7 @@ def remove(
     with _maybe_cache(root, no_cache) as cache:
         analysis = Analysis(
             root,
-            resolvers=resolvers,
+            resolver=path_resolver,
             plugins=plugins,
             cache=cache,
             workers=workers,

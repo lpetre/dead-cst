@@ -36,9 +36,8 @@ from .resolvers import (
     Package,
     PathResolver,
     clear_path_caches,
-    default_resolve_import,
-    merge_packages,
 )
+from .resolvers._core import _validate_packages
 
 logger = logging.getLogger(__name__)
 
@@ -48,8 +47,8 @@ def _build_dep_graph(packages: Sequence[Package]) -> nx.DiGraph:
 
     Edges are drawn from each :attr:`Package.deps` entry (resolved via
     name) to the consumer's path. Names that don't match any package
-    are skipped silently -- :func:`merge_packages` rejects unresolved
-    refs at construction time, so this only fires for partially-built
+    are skipped silently -- :class:`Analysis` rejects unresolved refs
+    at construction time, so this only fires for partially-built
     states (e.g. tests). The DAG drives both :func:`_order_packages`
     and the forward / reverse closure walks on :class:`Analysis`.
     """
@@ -67,32 +66,6 @@ def _build_dep_graph(packages: Sequence[Package]) -> nx.DiGraph:
 def _order_packages(packages: Sequence[Package]) -> list[Path]:
     """Topologically sort package paths so dependencies are processed first."""
     return list(nx.topological_sort(_build_dep_graph(packages)))
-
-
-def _chain_resolvers(resolvers: Sequence[PathResolver]) -> ImportResolver:
-    """Compose ``resolvers`` into one ``name -> path`` callable.
-
-    Each resolver's :meth:`PathResolver.resolve_import` is tried in
-    order; the first non-``None`` answer wins. With no resolvers,
-    falls back to :func:`default_resolve_import` so the analyzer keeps
-    working when callers don't pass any (the common public-API case).
-    A single-resolver chain skips the closure -- the typical CLI
-    invocation passes one resolver, and the chain would just call its
-    method directly.
-    """
-    if not resolvers:
-        return default_resolve_import
-    if len(resolvers) == 1:
-        return resolvers[0].resolve_import
-
-    def _resolve(name: str, search_paths: list[Path]) -> str | Path | None:
-        for resolver in resolvers:
-            result = resolver.resolve_import(name, search_paths)
-            if result is not None:
-                return result
-        return None
-
-    return _resolve
 
 
 def _run_observe(
@@ -681,10 +654,10 @@ def _count_nodes(graph: nx.MultiDiGraph, prefix: Path | None) -> dict[str, int]:
 class Analysis:
     """Lazy entrypoint to the dead-cst pipeline.
 
-    Holds the analyzer's config (paths, plugins, resolvers, cache,
+    Holds the analyzer's config (paths, plugins, resolver, cache,
     detector, worker count) and memoizes per-base work so multiple
     queries against the same project share the cost. Construction
-    runs each resolver's :meth:`PathResolver.resolve` once to build
+    runs the resolver's :meth:`PathResolver.resolve` once to build
     the path map, but no source files are read or parsed until you
     ask -- the visitor pass is gated on :meth:`refresh` /
     :meth:`materialize_all`.
@@ -720,31 +693,28 @@ class Analysis:
     much cheaper than recomputing payloads, so per-package queries
     against a warm cache stay fast even on large repos.
 
-    The configured ``resolvers`` are queried twice: once at construction
-    time to build the per-base :class:`Package` list (each resolver's
-    :meth:`PathResolver.resolve` is called with ``project_root`` and
-    the results merged via :func:`~dead_cst.resolvers.merge_packages`),
-    and again during edge stitching to classify trie-miss imports via
-    :meth:`PathResolver.resolve_import`. Once constructed, an
-    :class:`Analysis` is effectively read-only -- spin up a fresh
-    instance to pick up new resolvers or new plugins.
+    The configured ``resolver`` is queried twice: once at construction
+    time to build the per-base :class:`Package` list (calling
+    :meth:`PathResolver.resolve` with ``project_root`` and validating
+    the result), and again during edge stitching to classify trie-miss
+    imports via :meth:`PathResolver.resolve_import`. Once constructed,
+    an :class:`Analysis` is effectively read-only -- spin up a fresh
+    instance to pick up a new resolver or new plugins.
     """
 
     def __init__(
         self,
         project_root: Path,
         *,
-        resolvers: Sequence[PathResolver],
+        resolver: PathResolver,
         plugins: Sequence[EdgePlugin] = (),
         cache: GraphCache | None = None,
         unreachable_detector: UnreachableRegionDetector | None = None,
         workers: int | None = None,
     ) -> None:
         self._project_root: Path = project_root
-        self._resolvers: tuple[PathResolver, ...] = tuple(resolvers)
-        self._packages: tuple[Package, ...] = merge_packages(
-            *[r.resolve(project_root) for r in self._resolvers]
-        )
+        self._resolver: PathResolver = resolver
+        self._packages: tuple[Package, ...] = _validate_packages(resolver.resolve(project_root))
         self._packages_by_path: dict[Path, Package] = {p.path: p for p in self._packages}
         by_name = {p.name: p.path for p in self._packages}
         self._dep_paths_by_base: dict[Path, tuple[Path, ...]] = {
@@ -753,7 +723,7 @@ class Analysis:
         self._plugins: tuple[EdgePlugin, ...] = tuple(plugins)
         self._cache = cache
         self._workers = workers
-        self._import_resolver: ImportResolver = _chain_resolvers(self._resolvers)
+        self._import_resolver: ImportResolver = resolver.resolve_import
         self._detector: UnreachableRegionDetector = (
             unreachable_detector
             if unreachable_detector is not None

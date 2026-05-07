@@ -137,7 +137,6 @@ EXPECTED_PUBLIC_API: dict[str, list[str]] = {
         "exported_roots",
         "load_resolver",
         "load_toml",
-        "merge_packages",
         "safe_resolve_module",
     ],
 }

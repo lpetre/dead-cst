@@ -32,8 +32,9 @@ class ManualResolver:
     package, even when ``"dep1"`` isn't explicitly listed.
 
     Each package's ``name`` is the rightmost path component of its
-    ``path`` (e.g. ``/tmp/x/pkg_a -> "pkg_a"``); :func:`merge_packages`
-    rejects duplicates. Workspaces with colliding directory names need
+    ``path`` (e.g. ``/tmp/x/pkg_a -> "pkg_a"``);
+    :class:`~dead_cst.analyze.Analysis` rejects duplicates at
+    construction time. Workspaces with colliding directory names need
     to disambiguate by writing a custom resolver. ``exported`` is
     populated from :func:`exported_roots` (``pyproject.toml`` /
     src-layout discovery) when available, else left empty (no
@@ -41,7 +42,7 @@ class ManualResolver:
 
     Not registered in :data:`BUILTIN_RESOLVERS` -- :func:`load_resolver`
     can't construct it without ``specs``. Instantiate directly when
-    composing a resolver chain programmatically.
+    constructing :class:`~dead_cst.analyze.Analysis` programmatically.
     """
 
     specs: list[str] = field(default_factory=list)

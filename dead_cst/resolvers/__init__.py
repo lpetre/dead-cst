@@ -1,9 +1,10 @@
 """Pluggable resolvers that discover sys.path-like search paths for a project.
 
 A :class:`PathResolver` returns a tuple of :class:`Package` objects (one
-per first-party workspace member) plus an import resolver. Multiple
-resolvers compose by merging their package lists -- see
-:func:`merge_packages`.
+per first-party workspace member) plus an import resolver. An
+:class:`~dead_cst.analyze.Analysis` takes exactly one resolver -- callers
+that need to combine layouts pick a single resolver that describes the
+whole project, or write a custom :class:`PathResolver`.
 
 Each builtin resolver lives in its own submodule. Third-party resolvers
 can register under the ``dead_cst.resolvers`` entry-point group;
@@ -29,7 +30,7 @@ importlib implementation) directly, or compose with the lower-level
 from __future__ import annotations
 
 from ..contrib.uv import UvResolver
-from ._core import ImportResolver, Package, PathResolver, load_toml, merge_packages
+from ._core import ImportResolver, Package, PathResolver, load_toml
 from ._exports import exported_roots
 from ._imports import (
     SITE_PACKAGES_MARKERS,
@@ -77,6 +78,5 @@ __all__ = [
     "exported_roots",
     "load_resolver",
     "load_toml",
-    "merge_packages",
     "safe_resolve_module",
 ]

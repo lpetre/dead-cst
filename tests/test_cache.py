@@ -550,7 +550,7 @@ def test_resolver_change_does_not_invalidate_cache(tmp_path, make_analysis, monk
 
     monkeypatch.setattr(analyze, "SymbolVisitor", _spy)
     with GraphCache(db) as cache:
-        make_analysis(resolvers=[ManualResolver(specs=[])], cache=cache).materialize_all()
+        make_analysis(resolver=ManualResolver(specs=[]), cache=cache).materialize_all()
     assert visited == []
 
 

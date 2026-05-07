@@ -12,25 +12,24 @@ two versions.
 ### Changed
 - **Breaking:** `Analysis` no longer accepts a pre-built `paths` mapping.
   The constructor now takes `project_root` as the first argument and a
-  required `resolvers=` keyword argument; the package list is computed
-  by invoking `resolver.resolve(project_root)` on each resolver and
-  merging the results via `merge_packages`. Callers that used to write
+  required `resolver=` keyword argument (singular -- there is no
+  resolver chain). Callers that used to write
   `Analysis({base: deps}, ...)` should switch to
-  `Analysis(base, resolvers=[ManualResolver(specs=["."])], ...)` (or
-  whichever resolver describes their layout).
+  `Analysis(base, resolver=ManualResolver(specs=["."]), ...)` (or
+  whichever resolver describes their layout). The CLI's `-p` / `--path`
+  and `--resolver` flags are mutually exclusive, and `--resolver` takes
+  a single value.
 - **Breaking:** `PathResolver.resolve()` now returns
   `tuple[Package, ...]` instead of a `dict[Path, list[Path]]`
   (`PathMap`). `Package` is a frozen dataclass carrying `path`,
   `name` (unique within an analysis), `exported` (subdirs visible to
   consumers; empty means "no restriction"), and `deps` (other
-  packages by name). `merge_paths` is replaced by `merge_packages`,
-  which validates name uniqueness, dep references, and that
-  `exported` entries are under each package's `path`. The `PathMap`
-  type alias and `merge_paths` re-exports are gone. Resolvers no
-  longer represent non-package search paths (workspace
-  `.venv/site-packages`, vendored bundles) in `Package.deps`;
-  `UvResolver` splices the workspace venv onto `sys.path` lazily
-  inside its own `resolve_import` instead.
+  packages by name). The `PathMap` type alias and `merge_paths`
+  re-export are gone; `Analysis` validates a single resolver's output
+  internally. Resolvers no longer represent non-package search paths
+  (workspace `.venv/site-packages`, vendored bundles) in
+  `Package.deps`; `UvResolver` splices the workspace venv onto
+  `sys.path` lazily inside its own `resolve_import` instead.
 - **Breaking:** `Analysis.paths` is replaced by `Analysis.packages`,
   which returns the `tuple[Package, ...]` the analysis was built
   with. The previous `Analysis.packages()` iterator (yielding one
@@ -42,8 +41,8 @@ two versions.
   `dead_cst/contrib/uv.py`. The `name` field bumps to `"uv"` so cached
   per-base fingerprints rebuild automatically.
 - **Breaking:** the CLI helper `resolve_paths` is replaced by
-  `build_resolvers`, which returns the resolver chain only. Callers
-  (and the CLI itself) read the merged package list back from
+  `build_resolver`, which returns a single `PathResolver`. Callers
+  (and the CLI itself) read the package list back from
   `Analysis.packages` after construction.
 
 ### Removed
@@ -56,9 +55,7 @@ two versions.
 
 ### Added
 - `dead_cst.resolvers.Package`, the frozen dataclass every resolver
-  now emits, and `dead_cst.resolvers.merge_packages` for combining
-  multiple resolvers' outputs with name-uniqueness, dep-reference,
-  and `exported`-bounds validation.
+  now emits.
 - `dead_cst.resolvers.clear_path_caches`, a one-call helper that
   drops the three `sys.path`-derived LRU caches
   (`safe_resolve_module`, `distribution_lookup`,
