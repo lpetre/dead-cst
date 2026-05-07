@@ -21,8 +21,8 @@ from dead_cst.cache import (
 )
 
 
-def _fp(base: Path) -> str:
-    return compute_fingerprint(base=base)
+def _fp() -> str:
+    return compute_fingerprint()
 
 
 def _write(root: Path, files: dict[str, str]) -> None:
@@ -84,7 +84,7 @@ def test_parallel_warms_cache(tmp_path, make_analysis):
     """Parallel runs write payloads to the cache so a follow-up run skips workers."""
     _write(tmp_path, _multi_file_layout())
     db = tmp_path / CACHE_DIR_NAME / "cache.db"
-    fp = _fp(tmp_path)
+    fp = _fp()
 
     with GraphCache(db) as cache:
         cold = make_analysis(cache=cache, workers=2).materialize_all()

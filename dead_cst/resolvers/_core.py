@@ -19,7 +19,7 @@ class Package:
 
     A resolver returns a list of these to describe a project layout.
     Each package contributes one root to the visitor pass and one node
-    in the cross-package dep DAG used to scope reachability queries.
+    in the cross-package dep graph used to scope reachability queries.
 
     * ``path`` -- the package directory; the visitor walks every
       ``.py`` file under here. Resolved (absolute) by
@@ -32,9 +32,10 @@ class Package:
       analyzer uses this to scope cross-package import lookups, so
       internal dirs like ``tests/`` stay invisible to dependents.
     * ``deps`` -- names of other packages this one imports from.
-      External (non-first-party) search paths are *not* expressed
-      here; resolvers handle those internally via
-      :meth:`PathResolver.resolve_import`.
+      Cycles are tolerated (e.g. when test or script code in two
+      sibling packages cross-import). External (non-first-party)
+      search paths are *not* expressed here; resolvers handle those
+      internally via :meth:`PathResolver.resolve_import`.
 
     Frozen + slotted so packages are hashable / cheap to pass around;
     every ``Path`` field is treated as immutable post-construction.

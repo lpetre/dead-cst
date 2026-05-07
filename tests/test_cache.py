@@ -2,13 +2,12 @@
 
 The cache short-circuits the per-file visitor pass when a file's
 SHA-256 content hash matches what's already on disk; the rest of the
-analyzer (per-base ``resolve_edges``, plugin pass) runs every
+analyzer (``resolve_edges``, plugin ``finalize`` pass) runs every
 invocation. These tests cover:
 
-* the on-disk schema and per-base fingerprint reconciliation,
+* the on-disk schema and analysis-fingerprint reconciliation,
 * per-file hit / miss / mtime-but-no-content-change behavior,
 * graph equivalence between cached and uncached runs,
-* invalidation on path-map / resolver-chain changes,
 * the CLI ``--no-cache`` flag and ``cache clear`` subcommand.
 """
 
@@ -41,9 +40,9 @@ def _write(root: Path, files: dict[str, str]) -> None:
         p.write_text(textwrap.dedent(src).strip() + "\n")
 
 
-def _fp(base: Path, **kwargs) -> str:
-    """Shorthand: per-base fingerprint."""
-    return compute_fingerprint(base=base, **kwargs)
+def _fp(**kwargs) -> str:
+    """Shorthand: analysis-wide fingerprint."""
+    return compute_fingerprint(**kwargs)
 
 
 @pytest.fixture
@@ -56,58 +55,39 @@ def runner() -> CliRunner:
 # ---------------------------------------------------------------------------
 
 
-def test_fingerprint_stable_for_equal_inputs(tmp_path):
+def test_fingerprint_stable_for_equal_inputs():
     """Two equal call signatures hash to the same fingerprint."""
-    a = _fp(tmp_path)
-    b = _fp(tmp_path)
+    a = _fp()
+    b = _fp()
     assert a == b
 
 
-def test_fingerprint_independent_of_search_paths(tmp_path):
-    """``search_paths`` no longer enters the fingerprint.
+def test_fingerprint_independent_of_packages(tmp_path):
+    """The package layout no longer enters the fingerprint.
 
-    Cross-file import resolution moved to
-    :func:`dead_cst._edges.resolve_edges`, which runs unconditionally
-    on every analysis, so search-path changes re-stitch edges
-    without invalidating cached payloads.
+    The visitor's output is purely a function of the file's source
+    plus the plugin / detector chain, so files under any base share
+    one cache key. Dropping the per-base portion lets a single
+    payload survive resolver / search-path / sibling-base churn.
     """
-    a = _fp(tmp_path)
-    b = _fp(tmp_path)
+    a = _fp()
+    b = _fp()
     assert a == b
 
 
-def test_fingerprint_changes_with_base(tmp_path):
-    """The base itself is in the fingerprint; sibling bases are independent."""
-    a = _fp(tmp_path / "a")
-    b = _fp(tmp_path / "b")
-    assert a != b
-
-
-def test_fingerprint_independent_of_sibling_bases(tmp_path):
-    """A base's fingerprint depends only on its own config, not the project's.
-
-    This is the per-base contract: adding or removing a sibling base
-    from the analysis must not invalidate the cached rows for ``base``.
-    """
-    a = _fp(tmp_path / "lib")
-    # Same base -- a "sibling" base just doesn't enter the picture.
-    b = _fp(tmp_path / "lib")
-    assert a == b
-
-
-def test_fingerprint_independent_of_resolvers(tmp_path):
-    """Resolver chain no longer enters the fingerprint.
+def test_fingerprint_independent_of_resolvers():
+    """Resolver chain does not enter the fingerprint.
 
     The resolver participates in :func:`resolve_edges` (which runs
     unconditionally), not the per-file visitor pass, so swapping
     resolvers re-stitches edges without invalidating cached payloads.
     """
-    a = _fp(tmp_path)
-    b = _fp(tmp_path)
+    a = _fp()
+    b = _fp()
     assert a == b
 
 
-def test_fingerprint_subclasses_with_distinct_names_distinct(tmp_path):
+def test_fingerprint_subclasses_with_distinct_names_distinct():
     """Two ``LiteralListPlugin`` subclasses with distinct ``name`` produce
     distinct fingerprints, even when their other config differs.
 
@@ -133,12 +113,12 @@ def test_fingerprint_subclasses_with_distinct_names_distinct(tmp_path):
         name: str = "b"
         version: int = 1700000000
 
-    fp_a = _fp(tmp_path, plugins=[A()])
-    fp_b = _fp(tmp_path, plugins=[B()])
+    fp_a = _fp(plugins=[A()])
+    fp_b = _fp(plugins=[B()])
     assert fp_a != fp_b
 
 
-def test_fingerprint_changes_when_unreachable_detector_changes(tmp_path):
+def test_fingerprint_changes_when_unreachable_detector_changes():
     """Swapping the unreachable-region detector flips the fingerprint."""
     from dataclasses import dataclass
 
@@ -152,12 +132,12 @@ def test_fingerprint_changes_when_unreachable_detector_changes(tmp_path):
         def find_regions(self, wrapper: MetadataWrapper) -> list[CodeRange]:
             return []
 
-    fp_default = _fp(tmp_path)
-    fp_custom = _fp(tmp_path, unreachable_detector=Custom())
+    fp_default = _fp()
+    fp_custom = _fp(unreachable_detector=Custom())
     assert fp_default != fp_custom
 
 
-def test_fingerprint_changes_when_unreachable_detector_version_bumped(tmp_path):
+def test_fingerprint_changes_when_unreachable_detector_version_bumped():
     """Bumping a detector's ``version`` invalidates the cache key."""
     from dataclasses import dataclass
 
@@ -171,22 +151,22 @@ def test_fingerprint_changes_when_unreachable_detector_version_bumped(tmp_path):
         def find_regions(self, wrapper: MetadataWrapper) -> list[CodeRange]:
             return []
 
-    fp_v1 = _fp(tmp_path, unreachable_detector=Custom())
-    fp_v2 = _fp(tmp_path, unreachable_detector=Custom(version=2))
+    fp_v1 = _fp(unreachable_detector=Custom())
+    fp_v2 = _fp(unreachable_detector=Custom(version=2))
     assert fp_v1 != fp_v2
 
 
-def test_fingerprint_changes_when_visitor_version_bumped(tmp_path, monkeypatch):
+def test_fingerprint_changes_when_visitor_version_bumped(monkeypatch):
     """Bumping ``SymbolVisitor.version`` invalidates the cache key."""
     from dead_cst._visitor import SymbolVisitor
 
-    fp_v1 = _fp(tmp_path)
+    fp_v1 = _fp()
     monkeypatch.setattr(SymbolVisitor, "version", SymbolVisitor.version + 1)
-    fp_v2 = _fp(tmp_path)
+    fp_v2 = _fp()
     assert fp_v1 != fp_v2
 
 
-def test_fingerprint_changes_when_plugin_version_bumped(tmp_path):
+def test_fingerprint_changes_when_plugin_version_bumped():
     """Bumping a plugin's epoch ``version`` invalidates the cache key."""
     from dataclasses import dataclass
 
@@ -199,8 +179,8 @@ def test_fingerprint_changes_when_plugin_version_bumped(tmp_path):
         name: str = "p"
         version: int = 1700000000
 
-    fp_old = _fp(tmp_path, plugins=[P()])
-    fp_new = _fp(tmp_path, plugins=[P(version=1700000001)])
+    fp_old = _fp(plugins=[P()])
+    fp_new = _fp(plugins=[P(version=1700000001)])
     assert fp_old != fp_new
 
 

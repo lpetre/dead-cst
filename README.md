@@ -141,7 +141,7 @@ dead-cst remove ROOT -e ENTRYPOINT [OPTIONS]
 
 ### `dead-cst cache clear`
 
-Delete the on-disk `VisitorPayload` cache (`<root>/.dead-cst-cache/`) for a project. Each row is keyed by a per-base fingerprint over the visitor / plugin / unreachable-region-detector `(name, version)` triple plus the base path, schema version, and Python version, so most analyzer-version changes invalidate it automatically; this command is for force-clearing when needed. Resolvers and search paths deliberately do *not* enter the fingerprint — import resolution runs unconditionally on every analysis, so resolver / search-path swaps re-stitch edges without re-running the visitor.
+Delete the on-disk `VisitorPayload` cache (`<root>/.dead-cst-cache/`) for a project. Each row is keyed by an analysis-wide fingerprint over the visitor / plugin / unreachable-region-detector `(name, version)` triple, schema version, and Python version, so most analyzer-version changes invalidate it automatically; this command is for force-clearing when needed. Resolvers, search paths, and the package layout deliberately do *not* enter the fingerprint — import resolution runs unconditionally on every analysis, so resolver / search-path / package-layout swaps re-stitch edges without re-running the visitor.
 
 ```
 dead-cst cache clear [ROOT]

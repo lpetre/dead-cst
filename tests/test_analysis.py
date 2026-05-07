@@ -9,9 +9,7 @@ Pins the lazy / scoped behavior promised by the new entry-point API:
 * :meth:`Analysis.materialize_all` produces the same graph as
   :func:`build_symbol_graph`,
 * per-base ``dead`` answers are equal to the slice of the full ``dead``
-  set restricted to that base,
-* the per-base cache fingerprint isolates sibling bases (changing one
-  base's deps does not invalidate other bases' rows).
+  set restricted to that base.
 """
 
 from __future__ import annotations
@@ -136,6 +134,26 @@ def test_reverse_closure_includes_self_and_consumers(tmp_path, make_analysis):
     assert a.reverse_closure(app) == frozenset({app})
 
 
+def test_cycle_in_deps_is_tolerated(tmp_path, make_analysis):
+    """``a <-> b`` cycles in :attr:`Package.deps` don't crash the analyzer.
+
+    The exported subset is typically acyclic, but tests / scripts can
+    introduce cycles between packages. The dep traversal -- ``bases``,
+    ``reverse_closure``, ``_interesting_set`` -- terminates via the
+    BFS visited set; cycle members appear in :attr:`Analysis.bases` in
+    path order at the end of the iteration.
+    """
+    a_dir = tmp_path / "a"
+    b_dir = tmp_path / "b"
+    for d in (a_dir, b_dir):
+        d.mkdir()
+    analysis = make_analysis(["a:b", "b:a"])
+
+    assert set(analysis.bases) == {a_dir, b_dir}
+    assert analysis.reverse_closure(a_dir) == frozenset({a_dir, b_dir})
+    assert analysis.reverse_closure(b_dir) == frozenset({a_dir, b_dir})
+
+
 def test_package_dead_uses_closure_only(tmp_path, make_analysis):
     """A pkg.dead() materialization only refreshes the interesting set,
     not unrelated sibling bases.
@@ -190,8 +208,8 @@ def test_package_dead_matches_full_dead_slice(tmp_path, make_analysis):
 
 
 # ---------------------------------------------------------------------------
-# Per-base cache fingerprint: changing one base's deps doesn't invalidate
-# sibling bases' rows.
+# Cache fingerprint: changing a base's deps doesn't invalidate any rows,
+# since the fingerprint no longer depends on the package layout.
 # ---------------------------------------------------------------------------
 
 

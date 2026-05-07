@@ -10,6 +10,32 @@ two versions.
 ## [Unreleased]
 
 ### Changed
+- **Breaking:** `compute_fingerprint` no longer takes a `base: Path`
+  argument. The visitor's output is purely a function of the file's
+  source plus the plugin / detector chain, so the analysis fingerprint
+  is now a single value shared across every base. Callers should drop
+  the `base=` keyword from any `compute_fingerprint(...)` invocation;
+  per-file cache rows continue to gate on the analysis-wide fingerprint
+  the same way they previously gated on the per-base one.
+- File parsing is now flow-based rather than partitioned per base.
+  `Analysis.refresh` walks each requested base's tree, collapses every
+  base's cache misses into one global stale-file list, and runs the
+  visitor + observe pass once across the whole batch. Multi-base
+  refreshes that previously paid for one worker pool startup per base
+  now pay for one total.
+- The package dependency graph is no longer represented as a
+  `networkx.DiGraph`, and `Package.deps` may now contain cycles.
+  `Analysis.bases` BFS-walks forward from no-dep packages through
+  the precomputed consumer reverse map (so dependencies precede
+  their consumers when the graph is acyclic, and any cycle-trapped
+  packages get appended in path order); `reverse_closure` walks the
+  same consumer map from a single seed; `_interesting_set` walks
+  the dep map from `reverse_closure`'s result. All three share one
+  `_bfs_order` helper whose visited-set guard makes them cycle-safe,
+  and their results memoize on `Analysis` so repeated `PackageView`
+  queries share the cost. Tolerating cycles lets a package with an
+  acyclic exported subset list cyclic dev/test deps without
+  hand-splitting them out.
 - **Breaking:** `Analysis` no longer accepts a pre-built `paths` mapping.
   The constructor now takes `project_root` as the first argument and a
   required `resolver=` keyword argument (singular -- there is no

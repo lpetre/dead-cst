@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import logging
 import sys
+from collections import deque
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
+from functools import cached_property
 from pathlib import Path
 from typing import Iterable, Iterator, Mapping, Sequence
 
@@ -42,30 +44,24 @@ from .resolvers._core import _validate_packages
 logger = logging.getLogger(__name__)
 
 
-def _build_dep_graph(packages: Sequence[Package]) -> nx.DiGraph:
-    """``dep -> consumer`` DAG over the packages' paths.
+def _bfs_order(seeds: Iterable[Path], neighbors: Mapping[Path, Sequence[Path]]) -> list[Path]:
+    """BFS-reachable nodes from ``seeds``, in visit order.
 
-    Edges are drawn from each :attr:`Package.deps` entry (resolved via
-    name) to the consumer's path. Names that don't match any package
-    are skipped silently -- :class:`Analysis` rejects unresolved refs
-    at construction time, so this only fires for partially-built
-    states (e.g. tests). The DAG drives both :func:`_order_packages`
-    and the forward / reverse closure walks on :class:`Analysis`.
+    Cycle-safe via the ``visited`` set. The order is determined by
+    the iteration order of ``seeds`` and of each ``neighbors[node]``
+    -- pre-sort both for deterministic output.
     """
-    g: nx.DiGraph = nx.DiGraph()
-    by_name = {p.name: p.path for p in packages}
-    for pkg in packages:
-        g.add_node(pkg.path)
-        for dep_name in pkg.deps:
-            dep_path = by_name.get(dep_name)
-            if dep_path is not None:
-                g.add_edge(dep_path, pkg.path)
-    return g
-
-
-def _order_packages(packages: Sequence[Package]) -> list[Path]:
-    """Topologically sort package paths so dependencies are processed first."""
-    return list(nx.topological_sort(_build_dep_graph(packages)))
+    visited: set[Path] = set()
+    order: list[Path] = []
+    queue = deque(seeds)
+    while queue:
+        node = queue.popleft()
+        if node in visited:
+            continue
+        visited.add(node)
+        order.append(node)
+        queue.extend(neighbors.get(node, ()))
+    return order
 
 
 def _run_observe(
@@ -115,7 +111,7 @@ def _process_one_file(
     """Run the visitor + observe pass for a single file and return its payload.
 
     The caller owns the precomputed FQN entry (built once per base by
-    :func:`_collect_base_specs`) so we can construct
+    :func:`_build_stale_tasks`) so we can construct
     :class:`MetadataWrapper` directly with ``cache=`` injected,
     skipping :class:`FullRepoManager`'s per-instance ``gen_cache``
     rebuild. Same shape ``FullRepoManager.get_metadata_wrapper_for_path``
@@ -140,45 +136,26 @@ def _process_one_file(
 
 
 @dataclass(frozen=True, slots=True)
-class _BaseSpec:
-    """Per-base file list partitioned into cache hits and miss files.
+class _BaseFiles:
+    """One base's ``.py`` enumeration partitioned into cache hits and misses.
 
-    Built once up front in :func:`_collect_base_specs` so the parallel
-    path can flatten every base's miss files into a single sorted task
-    list and the apply phase can iterate every base in deterministic
-    order without re-reading the cache. ``fqn_cache`` covers only the
-    miss files -- hit files never go through the visitor, so they
-    don't need an FQN entry. ``fingerprint`` is this base's per-base
-    cache fingerprint (see :func:`compute_fingerprint`); the recorder
-    uses it when writing payloads back, and :func:`_build_base_spec`
-    uses it when looking them up.
+    Built once per base in :func:`_enumerate_files` and parked on
+    :class:`Analysis` so :meth:`Analysis.refresh` can rebuild
+    contributions later without re-walking the tree.
     """
 
     base: Path
-    search_paths: tuple[Path, ...]
     files: tuple[Path, ...]
     hits: dict[Path, VisitorPayload]
     miss_files: tuple[Path, ...]
-    fqn_cache: Mapping[str, ModuleNameAndPackage]
-    fingerprint: str
 
 
-def _build_base_spec(
+def _enumerate_files(
     base: Path,
-    deps: Sequence[Path],
     cache: GraphCache | None,
     fingerprint: str,
-) -> _BaseSpec:
-    """Build a single :class:`_BaseSpec`: enumerate ``base``'s files and
-    partition into cache hits / misses against ``fingerprint``.
-
-    Per-base helper so :class:`Analysis` can refresh one base at a
-    time without paying for sibling bases' file walks. Each cache
-    lookup uses this base's per-base fingerprint, so a sibling base's
-    config change leaves these rows valid. The FQN cache covers only
-    the miss files because hit files never go through the visitor.
-    """
-    search_paths = (base, *deps)
+) -> _BaseFiles:
+    """Walk ``base``'s ``.py`` tree, classify each file as cache hit or miss."""
     files = tuple(sorted(base.rglob("*.py")))
     hits: dict[Path, VisitorPayload] = {}
     miss_files: list[Path] = []
@@ -188,32 +165,22 @@ def _build_base_spec(
             miss_files.append(file)
         else:
             hits[file] = payload
-    fqn_cache: Mapping[str, ModuleNameAndPackage] = (
-        FixedFullyQualifiedNameProvider.gen_cache(base, [str(f) for f in miss_files], timeout=5)
-        if miss_files
-        else {}
-    )
-    return _BaseSpec(
+    return _BaseFiles(
         base=base,
-        search_paths=search_paths,
         files=files,
         hits=hits,
         miss_files=tuple(miss_files),
-        fqn_cache=fqn_cache,
-        fingerprint=fingerprint,
     )
 
 
 @dataclass(frozen=True, slots=True)
-class _Task:
-    """Per-file unit of work for the visitor + observe pass.
+class _StaleFile:
+    """One stale file ready for the visitor + observe pass.
 
-    ``fqn_entry`` is this file's slice of the per-base FQN cache built
-    once in the parent (see :func:`_collect_base_specs`); the runner
-    injects it into a :class:`MetadataWrapper` rather than rebuilding
-    a :class:`FullRepoManager`. The visitor pass no longer touches
-    ``sys.path`` or the resolver, so workers can run in parallel
-    without per-base bookkeeping.
+    ``fqn_entry`` is this file's slice of the per-base FQN cache
+    (FQN resolution is base-keyed, hence one ``gen_cache`` call per
+    base in :func:`_build_stale_tasks`); the runner injects it into a
+    :class:`MetadataWrapper` directly.
     """
 
     file: Path
@@ -246,8 +213,8 @@ def _rebind_sys_path(search_paths: tuple[Path, ...], baseline: list[str]) -> Non
 def _process_task(
     detector: UnreachableRegionDetector,
     plugins: tuple[EdgePlugin, ...],
-    task: _Task,
-) -> tuple[Path, Path, VisitorPayload]:
+    task: _StaleFile,
+) -> tuple[Path, VisitorPayload]:
     """Run one task; pure (no ``sys.path`` mutation, no resolver call)."""
     payload = _process_one_file(
         task.file,
@@ -257,7 +224,7 @@ def _process_task(
         base=task.base,
         project_root=task.project_root,
     )
-    return task.base, task.file, payload
+    return task.file, payload
 
 
 _worker_state: tuple[UnreachableRegionDetector, tuple[EdgePlugin, ...]] | None = None
@@ -272,67 +239,73 @@ def _init_worker(
     _worker_state = (detector, plugins)
 
 
-def _worker_process_task(task: _Task) -> tuple[Path, Path, VisitorPayload]:
+def _worker_process_task(task: _StaleFile) -> tuple[Path, VisitorPayload]:
     """Pool task: delegate to :func:`_process_task` against the worker's state."""
     assert _worker_state is not None, "_init_worker must run before _worker_process_task"
     return _process_task(*_worker_state, task)
 
 
-def _build_sorted_tasks(base_specs: dict[Path, _BaseSpec], project_root: Path) -> list[_Task]:
-    """Flatten every base's miss files into one task list, sorted by ``(base, file)``.
+def _build_stale_tasks(
+    base_files: Mapping[Path, _BaseFiles],
+    project_root: Path,
+) -> list[_StaleFile]:
+    """Flatten every base's miss files into one global, deterministic task list.
 
-    The visitor pass is now ``sys.path``-independent, so task ordering
-    is purely an aesthetic / determinism concern -- sorting on
-    ``(base, file)`` keeps related tasks together for log readability.
+    One ``gen_cache`` call per base (FQN resolution is base-keyed)
+    populates each task's ``fqn_entry``. Sorting on ``(base, file)``
+    keeps related tasks together for log readability and makes
+    parallel-pool output ordering reproducible.
     """
-    tasks: list[_Task] = [
-        _Task(
-            file=file,
-            base=base,
-            fqn_entry=spec.fqn_cache[str(file)],
-            project_root=project_root,
+    tasks: list[_StaleFile] = []
+    for base in sorted(base_files):
+        bf = base_files[base]
+        if not bf.miss_files:
+            continue
+        fqn_cache = FixedFullyQualifiedNameProvider.gen_cache(
+            base, [str(f) for f in bf.miss_files], timeout=5
         )
-        for base, spec in base_specs.items()
-        for file in spec.miss_files
-    ]
-    tasks.sort(key=lambda t: (t.base, t.file))
+        tasks.extend(
+            _StaleFile(
+                file=file,
+                base=base,
+                fqn_entry=fqn_cache[str(file)],
+                project_root=project_root,
+            )
+            for file in bf.miss_files
+        )
     return tasks
 
 
-def _compute_all_miss_payloads(
+def _process_stale_files(
     *,
-    base_specs: dict[Path, _BaseSpec],
-    project_root: Path,
+    tasks: Sequence[_StaleFile],
     detector: UnreachableRegionDetector,
     plugins: Sequence[EdgePlugin],
     cache: GraphCache | None,
+    fingerprint: str,
     workers: int | None,
-) -> dict[Path, dict[Path, VisitorPayload]]:
-    """Run visitor + observe for every cache-miss file across every base.
+) -> dict[Path, VisitorPayload]:
+    """Run visitor + observe across every task; return ``file -> payload``.
 
-    Both branches use :func:`_process_task` for the per-task work; they
-    differ only in whether the runner state lives on the main process
-    or in :class:`ProcessPoolExecutor` workers. The pool is opt-in
-    (``workers >= 2`` and at least two miss files); below that, the
+    Both branches use :func:`_process_task` for the per-task work;
+    they differ only in whether the runner state lives on the main
+    process or in :class:`ProcessPoolExecutor` workers. The pool is
+    opt-in (``workers >= 2`` and at least two tasks); below that, the
     in-process path avoids pool startup cost.
 
     Cache writes happen on the main process as each payload arrives,
     so a partial run still warms the cache for files that completed.
-    Returns ``{base: {file: payload}}`` even for bases with no misses,
-    so the caller can index without an existence check.
     """
-    out: dict[Path, dict[Path, VisitorPayload]] = {b: {} for b in base_specs}
-    total_misses = sum(len(s.miss_files) for s in base_specs.values())
-    if total_misses == 0:
-        return out
+    if not tasks:
+        return {}
 
-    tasks = _build_sorted_tasks(base_specs, project_root)
-    use_pool = workers is not None and workers >= 2 and total_misses >= 2
+    out: dict[Path, VisitorPayload] = {}
+    use_pool = workers is not None and workers >= 2 and len(tasks) >= 2
 
-    def _record(base: Path, file: Path, payload: VisitorPayload) -> None:
-        out[base][file] = payload
+    def _record(file: Path, payload: VisitorPayload) -> None:
+        out[file] = payload
         if cache is not None:
-            cache.put(file, payload, base_specs[base].fingerprint)
+            cache.put(file, payload, fingerprint)
 
     if use_pool:
         assert workers is not None
@@ -341,14 +314,14 @@ def _compute_all_miss_payloads(
             initializer=_init_worker,
             initargs=(detector, tuple(plugins)),
         ) as pool:
-            for base, file, payload in pool.map(_worker_process_task, tasks):
-                _record(base, file, payload)
+            for file, payload in pool.map(_worker_process_task, tasks):
+                _record(file, payload)
         return out
 
     plugins_t = tuple(plugins)
     for task in tasks:
-        base, file, payload = _process_task(detector, plugins_t, task)
-        _record(base, file, payload)
+        file, payload = _process_task(detector, plugins_t, task)
+        _record(file, payload)
     return out
 
 
@@ -483,16 +456,18 @@ class _BaseContribution:
 
 def _build_contribution(
     package: Package,
-    spec: _BaseSpec,
+    base_files: _BaseFiles,
     miss_payloads: Mapping[Path, VisitorPayload],
 ) -> _BaseContribution:
-    """Apply ``spec``'s per-file payloads into a base-local graph slice.
+    """Apply ``base_files``' per-file payloads into a base-local graph slice.
 
-    The base-local ``nx.MultiDiGraph`` is what makes scope-bounded
-    materialization cheap: composing it into the full graph or a
-    closure graph doesn't redo per-file apply work. Empty
-    :attr:`Package.exported` means "no restriction" (every file in
-    the base is exported to consumers).
+    Hits come straight from :class:`_BaseFiles`; the rest are looked
+    up in the global ``miss_payloads`` map produced by
+    :func:`_process_stale_files`. The base-local ``nx.MultiDiGraph``
+    is what makes scope-bounded materialization cheap: composing it
+    into the full graph or a closure graph doesn't redo per-file
+    apply work. Empty :attr:`Package.exported` means "no restriction"
+    (every file in the base is exported to consumers).
     """
     current_trie = SymbolTrie()
     export_trie = SymbolTrie()
@@ -500,8 +475,8 @@ def _build_contribution(
     import_edges: set[tuple[SymbolNode, Import, EdgeFlags]] = set()
     base_graph: nx.MultiDiGraph = nx.MultiDiGraph()
     base_graph.graph["dead_suites"] = {}
-    for file in spec.files:
-        payload = spec.hits.get(file)
+    for file in base_files.files:
+        payload = base_files.hits.get(file)
         if payload is None:
             payload = miss_payloads[file]
         file_exported = not exported or _under_any(file, list(exported))
@@ -664,11 +639,13 @@ class Analysis:
 
     Three coarse stages happen on demand:
 
-    1. **Per-base file enumeration + visitor pass** -- driven by
+    1. **File enumeration + visitor pass** -- driven by
        :meth:`refresh`. Walks each requested base's files, hashes
-       them against the cache, runs the visitor + observe pass on
-       misses, writes payloads back to the cache. Idempotent and
-       scoped: ``refresh(bases=[B])`` touches only ``B``'s file tree.
+       them against the cache, then flattens every base's misses
+       into one global stale-file list and runs the visitor +
+       observe pass once across all of them (parallel when
+       ``workers`` permits). Idempotent and scoped:
+       ``refresh(bases=[B])`` walks only ``B``'s file tree.
 
     2. **Per-base contribution build** -- the per-base trie + a
        base-local graph slice + the unresolved cross-file import set.
@@ -719,6 +696,16 @@ class Analysis:
         self._dep_paths_by_base: dict[Path, tuple[Path, ...]] = {
             p.path: tuple(by_name[d] for d in p.deps) for p in self._packages
         }
+        # Reverse map: base -> bases that name this one in their `deps`.
+        # Pre-sorted by path so consumer-side BFS (used by
+        # `reverse_closure` and `bases`) yields a deterministic order.
+        consumers: dict[Path, list[Path]] = {p.path: [] for p in self._packages}
+        for p in self._packages:
+            for dep_name in p.deps:
+                consumers[by_name[dep_name]].append(p.path)
+        self._consumers_by_base: dict[Path, tuple[Path, ...]] = {
+            base: tuple(sorted(cs)) for base, cs in consumers.items()
+        }
         self._plugins: tuple[EdgePlugin, ...] = tuple(plugins)
         self._cache = cache
         self._workers = workers
@@ -728,12 +715,21 @@ class Analysis:
             if unreachable_detector is not None
             else DefaultUnreachableRegionDetector()
         )
-        self._dep_graph: nx.DiGraph | None = None
-        self._ordered_bases: list[Path] | None = None
-        self._base_specs: dict[Path, _BaseSpec] = {}
+        # One fingerprint per analysis -- the visitor's output is
+        # purely a function of the file's source plus the plugin /
+        # detector chain, so every base shares the same key.
+        self._fingerprint: str = compute_fingerprint(
+            plugins=self._plugins,
+            unreachable_detector=self._detector,
+        )
+        self._base_files: dict[Path, _BaseFiles] = {}
         self._contributions: dict[Path, _BaseContribution] = {}
         self._closure_graphs: dict[Path, nx.MultiDiGraph] = {}
         self._full_graph: nx.MultiDiGraph | None = None
+        # Memoize closure-walk results -- the package graph is
+        # immutable post-construction.
+        self._reverse_closures: dict[Path, frozenset[Path]] = {}
+        self._interesting_sets: dict[Path, frozenset[Path]] = {}
 
     @property
     def packages(self) -> tuple[Package, ...]:
@@ -748,20 +744,21 @@ class Analysis:
         """Precomputed dep paths for the package at ``base``."""
         return self._dep_paths_by_base.get(base, ())
 
-    def _dep_dag(self) -> nx.DiGraph:
-        """``dep -> consumer`` DAG over the packages' paths; reused by
-        topo-sort and ancestor / descendant queries.
-        """
-        if self._dep_graph is None:
-            self._dep_graph = _build_dep_graph(self._packages)
-        return self._dep_graph
-
-    @property
+    @cached_property
     def bases(self) -> list[Path]:
-        """Bases in topological order (deps before dependents)."""
-        if self._ordered_bases is None:
-            self._ordered_bases = list(nx.topological_sort(self._dep_dag()))
-        return list(self._ordered_bases)
+        """Deterministic, cycle-tolerant package order.
+
+        Dependencies precede their dependents whenever the package
+        graph is acyclic. Packages trapped in dep cycles are appended
+        at the end in path order. The traversal is fully deterministic
+        across runs.
+        """
+        sorted_paths = sorted(self._packages_by_path)
+        seeds = [p for p in sorted_paths if not self._dep_paths_by_base.get(p)]
+        order = _bfs_order(seeds, self._consumers_by_base)
+        visited = set(order)
+        order.extend(p for p in sorted_paths if p not in visited)
+        return order
 
     def reverse_closure(self, base: Path) -> frozenset[Path]:
         """Bases that transitively depend on ``base`` (including ``base`` itself).
@@ -769,27 +766,30 @@ class Analysis:
         These are the only bases whose source code could import (and
         therefore keep alive) decls under ``base``. A query like "is X
         in ``base`` dead?" only needs entrypoints from this set --
-        sibling bases that don't reach ``base`` in the search-paths
-        DAG can't reference its decls.
+        sibling bases that can't reach ``base`` through the dep graph
+        can't reference its decls. Cycle-safe: BFS terminates even
+        when ``Package.deps`` cycles.
         """
         if base not in self._packages_by_path:
             raise KeyError(base)
-        return frozenset({base}) | frozenset(nx.descendants(self._dep_dag(), base))
+        cached = self._reverse_closures.get(base)
+        if cached is None:
+            cached = frozenset(_bfs_order([base], self._consumers_by_base))
+            self._reverse_closures[base] = cached
+        return cached
 
     def _interesting_set(self, base: Path) -> frozenset[Path]:
         """Bases needed to answer reachability queries about decls in ``base``.
 
-        Computed as the forward (deps) closure of :meth:`reverse_closure`:
-        every consumer of ``base`` plus every consumer's transitive
-        deps, so we have enough trie data to resolve every cross-base
-        import that could lead into ``base``.
+        :meth:`reverse_closure` ∪ each consumer's transitive deps, so
+        we have enough trie data to resolve every cross-base import
+        that could lead into ``base``.
         """
-        dag = self._dep_dag()
-        scope: set[Path] = set()
-        for consumer in self.reverse_closure(base):
-            scope.add(consumer)
-            scope |= nx.ancestors(dag, consumer)
-        return frozenset(scope)
+        cached = self._interesting_sets.get(base)
+        if cached is None:
+            cached = frozenset(_bfs_order(self.reverse_closure(base), self._dep_paths_by_base))
+            self._interesting_sets[base] = cached
+        return cached
 
     def refresh(self, bases: Iterable[Path] | None = None) -> Analysis:
         """Update the cache and build per-base contributions for the given bases.
@@ -799,6 +799,15 @@ class Analysis:
         only -- sibling bases are untouched. Already-refreshed bases
         are skipped, so calling :meth:`refresh` twice with the same
         argument is cheap.
+
+        Three steps run in order: (1) walk each new target's tree and
+        partition into cache hits / misses, (2) flatten every base's
+        misses into a single global stale-file list and run the
+        visitor + observe pass on each one (parallel when ``workers``
+        permits), (3) apply each base's payloads into a local
+        contribution. Step 2 ignores which base each file lives
+        under, so a refresh that touches several bases pays for one
+        worker pool startup, not one per base.
 
         Returns ``self`` so callers can chain
         ``Analysis(...).refresh().materialize_all()``.
@@ -810,25 +819,27 @@ class Analysis:
         new_targets = [b for b in targets if b not in self._contributions]
         if not new_targets:
             return self
+
         for b in new_targets:
-            if b not in self._base_specs:
-                self._base_specs[b] = _build_base_spec(
-                    b, self._dep_paths(b), self._cache, self._base_fingerprint(b)
-                )
-        partial_specs = {b: self._base_specs[b] for b in new_targets}
-        miss_payloads = _compute_all_miss_payloads(
-            base_specs=partial_specs,
-            project_root=self._project_root,
+            if b not in self._base_files:
+                self._base_files[b] = _enumerate_files(b, self._cache, self._fingerprint)
+
+        pending = {b: self._base_files[b] for b in new_targets}
+        tasks = _build_stale_tasks(pending, self._project_root)
+        miss_payloads = _process_stale_files(
+            tasks=tasks,
             detector=self._detector,
             plugins=self._plugins,
             cache=self._cache,
+            fingerprint=self._fingerprint,
             workers=self._workers,
         )
+
         for b in new_targets:
             self._contributions[b] = _build_contribution(
                 self._packages_by_path[b],
-                self._base_specs[b],
-                miss_payloads[b],
+                self._base_files[b],
+                miss_payloads,
             )
         return self
 
@@ -843,7 +854,7 @@ class Analysis:
         return PackageView(self, base)
 
     def views(self) -> Iterator[PackageView]:
-        """Yield a :class:`PackageView` for every base in topological order."""
+        """Yield a :class:`PackageView` for every base in :attr:`bases` order."""
         for base in self.bases:
             yield PackageView(self, base)
 
@@ -968,23 +979,6 @@ class Analysis:
         analysed together.
         """
         return _count_nodes(self.materialize_all(), prefix)
-
-    def _base_fingerprint(self, base: Path) -> str:
-        """Per-base cache fingerprint for ``base``.
-
-        Covers only the inputs the visitor + observe pass depend on
-        (the base itself, the visitor / plugin / detector versions).
-        ``search_paths`` and the resolver do not enter the
-        fingerprint -- import resolution moved to
-        :func:`resolve_edges`, which runs unconditionally on every
-        analysis, so resolver / search-path changes re-stitch edges
-        without invalidating cached payloads.
-        """
-        return compute_fingerprint(
-            base=base,
-            plugins=self._plugins,
-            unreachable_detector=self._detector,
-        )
 
     def _build_symbol_lookup(self, base: Path, *, scope: frozenset[Path] | None) -> SymbolTrie:
         """Per-base lookup trie: this base's full trie + each in-scope dep's exports.
