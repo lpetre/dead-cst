@@ -56,7 +56,7 @@ dead-cst analyze ROOT -e ENTRYPOINT [OPTIONS]
 |---|---|
 | `-e, --entrypoint` | Entrypoint: file path, FQN, or `re:pattern` for regex (repeatable) |
 | `-p, --path` | Search path spec: `base:dep1,dep2` or `base` (repeatable) |
-| `--resolver` | Path resolver to run, e.g. `venv`, `pyproject` (repeatable) |
+| `--resolver` | Path resolver to run, e.g. `uv` (mutually exclusive with `-p`) |
 | `--plugin` | Edge plugin to run, e.g. `main_block`, `project_scripts` (repeatable) |
 | `--format` | Output format: `text` or `json` |
 | `-v, --verbose` | Enable verbose logging |
@@ -76,7 +76,7 @@ dead-cst why-alive ROOT FQNAME [OPTIONS]
 | Option | Description |
 |---|---|
 | `-p, --path` | Search path spec: `base:dep1,dep2` or `base` (repeatable) |
-| `--resolver` | Path resolver to run, e.g. `venv`, `pyproject` (repeatable) |
+| `--resolver` | Path resolver to run, e.g. `uv` (mutually exclusive with `-p`) |
 | `--plugin` | Edge plugin to run, e.g. `main_block`, `project_scripts` (repeatable) |
 | `-v, --verbose` | Enable verbose logging |
 | `--no-cache` | Bypass the per-file `VisitorPayload` cache |
@@ -94,7 +94,7 @@ dead-cst unused-exports ROOT -e ENTRYPOINT [OPTIONS]
 |---|---|
 | `-e, --entrypoint` | Entrypoint: file path, FQN, or `re:pattern` for regex (repeatable) |
 | `-p, --path` | Search path spec: `base:dep1,dep2` or `base` (repeatable) |
-| `--resolver` | Path resolver to run, e.g. `venv`, `pyproject` (repeatable) |
+| `--resolver` | Path resolver to run, e.g. `uv` (mutually exclusive with `-p`) |
 | `--plugin` | Edge plugin to run, e.g. `main_block`, `project_scripts` (repeatable) |
 | `-v, --verbose` | Enable verbose logging |
 | `--no-cache` | Bypass the per-file `VisitorPayload` cache |
@@ -114,7 +114,7 @@ dead-cst dependencies ROOT [OPTIONS]
 | Option | Description |
 |---|---|
 | `-p, --path` | Search path spec: `base:dep1,dep2` or `base` (repeatable) |
-| `--resolver` | Path resolver to run, e.g. `venv`, `pyproject` (repeatable) |
+| `--resolver` | Path resolver to run, e.g. `uv` (mutually exclusive with `-p`) |
 | `--format` | Output format: `text` or `json` |
 | `-v, --verbose` | Enable verbose logging |
 | `--no-cache` | Bypass the per-file `VisitorPayload` cache |
@@ -132,7 +132,7 @@ dead-cst remove ROOT -e ENTRYPOINT [OPTIONS]
 |---|---|
 | `-e, --entrypoint` | Entrypoint: file path, FQN, or `re:pattern` for regex (repeatable) |
 | `-p, --path` | Search path spec: `base:dep1,dep2` or `base` (repeatable) |
-| `--resolver` | Path resolver to run, e.g. `venv`, `pyproject` (repeatable) |
+| `--resolver` | Path resolver to run, e.g. `uv` (mutually exclusive with `-p`) |
 | `--plugin` | Edge plugin to run, e.g. `main_block`, `project_scripts` (repeatable) |
 | `-v, --verbose` | Enable verbose logging |
 | `--dry-run` | Show what would be removed without making changes |
@@ -161,7 +161,7 @@ from dead_cst.resolvers import ManualResolver
 root = Path("./src")
 analysis = Analysis(
     root,
-    resolvers=[ManualResolver(specs=["."])],
+    resolver=ManualResolver(specs=["."]),
     plugins=[
         MainBlockPlugin(),
         ExplicitEntrypointPlugin(specs=[re.compile(r".*__main__\.py")]),
@@ -264,7 +264,7 @@ class FlagAwareDetector(DefaultUnreachableRegionDetector):
 
 graph = Analysis(
     root,
-    resolvers=[ManualResolver(specs=["."])],
+    resolver=ManualResolver(specs=["."]),
     unreachable_detector=FlagAwareDetector(),
 ).materialize_all()
 ```

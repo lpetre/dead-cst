@@ -1,15 +1,14 @@
 """Shared types and helpers for path resolvers.
 
-Defines the :class:`PathResolver` protocol every resolver satisfies, the
-:class:`Package` value object they emit, and :func:`merge_packages` for
-combining multiple resolvers' outputs into one validated list.
+Defines the :class:`PathResolver` protocol every resolver satisfies and
+the :class:`Package` value object they emit.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Protocol, Sequence, runtime_checkable
+from typing import Any, Callable, Iterable, Protocol, runtime_checkable
 
 from .._cacheable import Cacheable
 
@@ -24,7 +23,7 @@ class Package:
 
     * ``path`` -- the package directory; the visitor walks every
       ``.py`` file under here. Resolved (absolute) by
-      :func:`merge_packages`.
+      :class:`~dead_cst.analyze.Analysis` at construction time.
     * ``name`` -- a stable identifier for this package, unique within
       one :class:`~dead_cst.analyze.Analysis`. Other packages refer to
       it by name in :attr:`deps`.
@@ -106,46 +105,44 @@ def load_toml(path: Path) -> dict[str, Any] | None:
         return tomllib.load(f)
 
 
-def merge_packages(*lists: Sequence[Package]) -> tuple[Package, ...]:
-    """Merge multiple :class:`Package` lists into one validated tuple.
+def _validate_packages(packages: Iterable[Package]) -> tuple[Package, ...]:
+    """Resolve paths and validate one resolver's :class:`Package` output.
 
-    Packages are matched by resolved ``path``; collisions union the
-    ``deps`` and ``exported`` tuples (preserving first-seen order) and
-    keep the first resolver's ``name``. ``path`` and every entry of
-    ``exported`` are resolved before merging so equivalent paths
-    written differently still collapse to one entry.
+    Returns a tuple of packages with ``path`` and every ``exported``
+    entry made absolute. Equivalent paths written differently collapse
+    to one entry; collisions union the ``deps`` and ``exported``
+    tuples (preserving first-seen order) and keep the first occurrence's
+    ``name``.
 
     Raises :class:`ValueError` when:
 
     * Two distinct paths share a ``name`` (names must be unique within
       one analysis -- :attr:`Package.deps` references go by name).
-    * A ``deps`` entry doesn't match any package's ``name`` in the
-      merged list.
+    * A ``deps`` entry doesn't match any package's ``name``.
     * An ``exported`` path isn't equal to or nested under its
       package's ``path``.
     """
     by_path: dict[Path, Package] = {}
     name_to_path: dict[str, Path] = {}
-    for lst in lists:
-        for pkg in lst:
-            path = _absolute(pkg.path)
-            exported = tuple(_absolute(e) for e in pkg.exported)
-            existing = by_path.get(path)
-            if existing is None:
-                claimed = name_to_path.get(pkg.name)
-                if claimed is not None and claimed != path:
-                    raise ValueError(
-                        f"Duplicate package name {pkg.name!r}: both {claimed} and {path} claim it"
-                    )
-                name_to_path[pkg.name] = path
-                by_path[path] = Package(path=path, name=pkg.name, exported=exported, deps=pkg.deps)
-            else:
-                by_path[path] = Package(
-                    path=path,
-                    name=existing.name,
-                    exported=tuple(dict.fromkeys((*existing.exported, *exported))),
-                    deps=tuple(dict.fromkeys((*existing.deps, *pkg.deps))),
+    for pkg in packages:
+        path = _absolute(pkg.path)
+        exported = tuple(_absolute(e) for e in pkg.exported)
+        existing = by_path.get(path)
+        if existing is None:
+            claimed = name_to_path.get(pkg.name)
+            if claimed is not None and claimed != path:
+                raise ValueError(
+                    f"Duplicate package name {pkg.name!r}: both {claimed} and {path} claim it"
                 )
+            name_to_path[pkg.name] = path
+            by_path[path] = Package(path=path, name=pkg.name, exported=exported, deps=pkg.deps)
+        else:
+            by_path[path] = Package(
+                path=path,
+                name=existing.name,
+                exported=tuple(dict.fromkeys((*existing.exported, *exported))),
+                deps=tuple(dict.fromkeys((*existing.deps, *pkg.deps))),
+            )
 
     for pkg in by_path.values():
         for d in pkg.deps:

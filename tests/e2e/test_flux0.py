@@ -144,7 +144,7 @@ def _module_node(graph, fqname):
 
 def _build_graph(base: Path, *plugins):
     return Analysis(
-        base, resolvers=[ManualResolver(specs=["."])], plugins=list(plugins)
+        base, resolver=ManualResolver(specs=["."]), plugins=list(plugins)
     ).materialize_all()
 
 
@@ -319,7 +319,7 @@ def test_flux0_internal_modules_survives_cache_round_trip(flux0_server_src, tmp_
         with GraphCache(cache_path) as cache:
             graph = Analysis(
                 base,
-                resolvers=[ManualResolver(specs=["."])],
+                resolver=ManualResolver(specs=["."]),
                 plugins=plugins,
                 cache=cache,
             ).materialize_all()

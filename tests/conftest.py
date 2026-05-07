@@ -42,12 +42,12 @@ def make_analysis(tmp_path):
     ``make_analysis()``. Any extra keyword arguments flow straight
     through to :class:`Analysis` (``plugins``, ``cache``,
     ``unreachable_detector``, ``workers``, or an explicit
-    ``resolvers=...`` to bypass :class:`ManualResolver` entirely).
+    ``resolver=...`` to bypass :class:`ManualResolver` entirely).
     """
 
     def _make(specs: list[str] | None = None, **kwargs) -> Analysis:
-        if "resolvers" not in kwargs:
-            kwargs["resolvers"] = [ManualResolver(specs=list(specs) if specs else ["."])]
+        if "resolver" not in kwargs:
+            kwargs["resolver"] = ManualResolver(specs=list(specs) if specs else ["."])
         return Analysis(tmp_path, **kwargs)
 
     return _make

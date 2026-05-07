@@ -18,6 +18,7 @@ import textwrap
 from pathlib import Path
 
 import pytest
+import typer
 from libcst.metadata import CodePosition, CodeRange
 from typer.testing import CliRunner
 
@@ -29,7 +30,7 @@ from dead_cst.plugins import (
 from dead_cst.plugins._core import EXTERNAL_DIST_PREFIX
 from dead_cst.plugins.explicit_entrypoint import EXPLICIT_PREFIX
 from dead_cst.graph import SymbolNode
-from dead_cst.resolvers import ManualResolver
+from dead_cst.resolvers import ManualResolver, UvResolver
 from dead_cst.cli import (
     _dead_real,
     _is_dunder_all,
@@ -37,7 +38,7 @@ from dead_cst.cli import (
     _rel_path,
     app,
     build_plugins,
-    build_resolvers,
+    build_resolver,
     parse_entrypoint,
     setup_logging,
 )
@@ -82,7 +83,7 @@ def _pos() -> CodeRange:
 
 
 # ---------------------------------------------------------------------------
-# Pure helpers -- parse_entrypoint, build_resolvers
+# Pure helpers -- parse_entrypoint, build_resolver
 # ---------------------------------------------------------------------------
 
 
@@ -150,26 +151,33 @@ def test_manual_resolver_parses_specs(tmp_path, specs, expected_packages):
         assert by_name[name].path == (tmp_path / name).resolve()
 
 
-def test_build_resolvers_no_specs_no_resolvers_returns_default_manual():
-    """With neither ``-p`` nor ``--resolver``, the chain falls back to a
+def test_build_resolver_no_specs_no_name_returns_default_manual():
+    """With neither ``-p`` nor ``--resolver``, falls back to a
     :class:`ManualResolver` rooted at the project root itself."""
-    resolvers = build_resolvers([], [])
-    assert [r.name for r in resolvers] == ["manual"]
-    assert isinstance(resolvers[0], ManualResolver)
-    assert resolvers[0].specs == ["."]
+    resolver = build_resolver([], None)
+    assert isinstance(resolver, ManualResolver)
+    assert resolver.specs == ["."]
 
 
-def test_build_resolvers_explicit_specs_only():
-    resolvers = build_resolvers(["src"], [])
-    # ``-p`` flows through a ManualResolver so its ``resolve_import``
-    # is part of the chain alongside any named resolvers.
-    assert [r.name for r in resolvers] == ["manual"]
-    assert resolvers[0].specs == ["src"]
+def test_build_resolver_explicit_specs_only():
+    resolver = build_resolver(["src"], None)
+    assert isinstance(resolver, ManualResolver)
+    assert resolver.specs == ["src"]
 
 
-def test_build_resolvers_unknown_resolver_raises():
+def test_build_resolver_named_resolver_only():
+    resolver = build_resolver([], "uv")
+    assert isinstance(resolver, UvResolver)
+
+
+def test_build_resolver_unknown_resolver_raises():
     with pytest.raises(KeyError):
-        build_resolvers([], ["does-not-exist"])
+        build_resolver([], "does-not-exist")
+
+
+def test_build_resolver_path_and_name_are_mutually_exclusive():
+    with pytest.raises(typer.BadParameter, match="mutually exclusive"):
+        build_resolver(["src"], "uv")
 
 
 # ---------------------------------------------------------------------------
