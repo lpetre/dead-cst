@@ -13,38 +13,31 @@ Two tables make up the database:
 ``meta`` holds the schema version (an integer) so reads from a database
 written by an incompatible package version are detected on open: a
 schema-version mismatch drops ``file_cache`` and re-writes the current
-version. The fingerprint that decides whether an individual entry is
-still valid lives on the row itself, not in ``meta``, so different
-bases (or different per-base configurations) can coexist in one
-database without wiping each other.
+version.
 
 ``file_cache`` is one row per analyzed file, keyed by absolute path,
-with the file's SHA-256 content hash, the per-base fingerprint
+with the file's SHA-256 content hash, the analysis fingerprint
 (:func:`compute_fingerprint`) it was written under, and the pickled
 payload. A hash *or* fingerprint mismatch on read is treated as a
 miss; the row is left in place and overwritten by the next
-:meth:`GraphCache.put`. Per-base :func:`resolve_edges` runs
-unconditionally every analysis, so mutating one file's exports
-re-stitches every importer's edges in the same base for free -- the
-cache only short-circuits the per-file visitor work, never the
-graph-stitching work.
+:meth:`GraphCache.put`. :func:`resolve_edges` runs unconditionally
+every analysis, so mutating one file's exports re-stitches every
+importer's edges for free -- the cache only short-circuits the
+per-file visitor work, never the graph-stitching work.
 
-Per-base fingerprinting is what makes scoped refresh tractable:
-:meth:`dead_cst.analyze.Analysis.refresh` can rebuild one base
-without invalidating sibling bases' cached payloads, because each
-file's row is gated by its base's own ``(base, plugins, detector)``
-fingerprint rather than a single project-wide one. Resolvers and
-search paths deliberately do *not* enter the fingerprint --
-cross-file import resolution moved out of the visitor and runs
-unconditionally on every analysis, so swapping a resolver or
-rebinding ``sys.path`` re-stitches edges without invalidating any
-cached payloads.
+The fingerprint covers the visitor / plugin / detector chain, the
+schema version, and the Python version: it does *not* depend on the
+package the file lives under, so the same payload is reusable across
+analyses with different package layouts. Resolvers and search paths
+deliberately do not enter the fingerprint either -- cross-file import
+resolution moved out of the visitor and runs unconditionally on every
+analysis, so swapping a resolver or rebinding ``sys.path`` re-stitches
+edges without invalidating any cached payloads.
 
-Plugins are intentionally part of the per-base fingerprint (their
-``observe`` output is folded into the cached payload) but the
-``finalize`` pass runs unconditionally on every analysis, so
-swapping ``finalize``-only plugins between runs does not require a
-plugin ``version`` bump.
+Plugins are intentionally part of the fingerprint (their ``observe``
+output is folded into the cached payload) but the ``finalize`` pass
+runs unconditionally on every analysis, so swapping ``finalize``-only
+plugins between runs does not require a plugin ``version`` bump.
 """
 
 from __future__ import annotations
@@ -85,27 +78,28 @@ def default_cache_path(project_root: Path) -> Path:
 
 def compute_fingerprint(
     *,
-    base: Path,
     plugins: Sequence[EdgePlugin] = (),
     unreachable_detector: UnreachableRegionDetector | None = None,
 ) -> str:
-    """SHA-256 of every per-base input that affects payload semantics.
+    """SHA-256 of every input that affects :class:`VisitorPayload` semantics.
 
     Covers exactly the inputs the visitor + observe pass depend on:
-    the base (FQN provider keys on it), the visitor / plugin /
-    detector ``(name, version)`` chain, the schema version, the
-    Python version. Different bases in one analysis live side-by-side
-    in one database without invalidating each other.
+    the visitor / plugin / detector ``(name, version)`` chain, the
+    schema version, and the Python version. The package a file lives
+    under is *not* part of the key -- the visitor's output is purely
+    a function of the file's source plus the plugin/detector chain,
+    so a payload computed under one package can be reused if the
+    same file appears under a differently-named package later.
 
-    ``search_paths`` and the resolver are *not* in the
-    fingerprint: cross-file import resolution moved out of the
-    visitor and into :func:`dead_cst._edges.resolve_edges` (which
-    runs unconditionally on every analysis), so swapping a resolver
-    or rebinding ``sys.path`` re-stitches edges without invalidating
-    the cached :class:`VisitorPayload` blobs. The ``Cacheable``
-    contract on :class:`~dead_cst.resolvers.PathResolver` survives
-    because the resolver still drives a (uncached) classification
-    step at stitch time.
+    ``search_paths`` and the resolver are *not* in the fingerprint:
+    cross-file import resolution moved out of the visitor and into
+    :func:`dead_cst._edges.resolve_edges` (which runs unconditionally
+    on every analysis), so swapping a resolver or rebinding
+    ``sys.path`` re-stitches edges without invalidating the cached
+    :class:`VisitorPayload` blobs. The ``Cacheable`` contract on
+    :class:`~dead_cst.resolvers.PathResolver` survives because the
+    resolver still drives a (uncached) classification step at stitch
+    time.
 
     Each component (visitor, plugins, detector) satisfies
     :class:`~dead_cst._cacheable.Cacheable` and is fingerprinted by
@@ -128,7 +122,6 @@ def compute_fingerprint(
     h.update(f"schema={SCHEMA_VERSION}\n".encode())
     h.update(f"python={sys.version_info.major}.{sys.version_info.minor}\n".encode())
     h.update(f"visitor={SymbolVisitor.name}@{SymbolVisitor.version}\n".encode())
-    h.update(f"base={base}\n".encode())
 
     h.update(b"plugins=\n")
     for p_name, p_version in sorted((p.name, p.version) for p in plugins):

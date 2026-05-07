@@ -10,6 +10,25 @@ two versions.
 ## [Unreleased]
 
 ### Changed
+- **Breaking:** `compute_fingerprint` no longer takes a `base: Path`
+  argument. The visitor's output is purely a function of the file's
+  source plus the plugin / detector chain, so the analysis fingerprint
+  is now a single value shared across every base. Callers should drop
+  the `base=` keyword from any `compute_fingerprint(...)` invocation;
+  per-file cache rows continue to gate on the analysis-wide fingerprint
+  the same way they previously gated on the per-base one.
+- File parsing is now flow-based rather than partitioned per base.
+  `Analysis.refresh` walks each requested base's tree, collapses every
+  base's cache misses into one global stale-file list, and runs the
+  visitor + observe pass once across the whole batch. Multi-base
+  refreshes that previously paid for one worker pool startup per base
+  now pay for one total.
+- The package dependency graph is no longer represented as a
+  `networkx.DiGraph`. `bases` topological order, `reverse_closure`,
+  and the closure-scoped materialization queries are now driven by
+  hand-rolled BFS over a precomputed `consumers_by_base` reverse map
+  and the existing `Package.deps` direct-dep map. Behavior is
+  unchanged.
 - **Breaking:** `Analysis` no longer accepts a pre-built `paths` mapping.
   The constructor now takes `project_root` as the first argument and a
   required `resolver=` keyword argument (singular -- there is no
