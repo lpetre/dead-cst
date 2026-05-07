@@ -540,7 +540,7 @@ def test_cross_dep_submodule_import(tmp_path, make_analysis, assert_edges):
         pkg_a/A/sub.py       -- def f(): ...
         pkg_b/B/__init__.py  -- from A import sub; sub.f()
 
-    PathMap: {pkg_b: [pkg_a], pkg_a: []}
+    Packages: pkg_b(deps=("pkg_a",)), pkg_a(deps=())
 
     ``A.sub`` lives in the dep's exported trie, not the consumer's own
     trie. ``resolve_edges`` must find it via the merged ``symbol_lookup``

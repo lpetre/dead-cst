@@ -33,41 +33,40 @@ from .plugins._core import (
 )
 from .resolvers import (
     ImportResolver,
-    PathMap,
+    Package,
     PathResolver,
+    clear_path_caches,
     default_resolve_import,
-    distribution_lookup,
-    editable_distribution_roots,
-    exported_roots,
-    merge_paths,
-    safe_resolve_module,
+    merge_packages,
 )
 
 logger = logging.getLogger(__name__)
 
 
-def _build_dep_graph(paths: PathMap) -> nx.DiGraph:
-    """``dep -> consumer`` DAG over ``paths.keys()``.
+def _build_dep_graph(packages: Sequence[Package]) -> nx.DiGraph:
+    """``dep -> consumer`` DAG over the packages' paths.
 
-    Only keys of ``paths`` enter the graph -- search-path entries that
-    aren't themselves keys (e.g. a venv ``site-packages``) are
-    resolver-lookup-only and never walked, so they have no place in
-    the topo order. The DAG drives both :func:`_order_paths` and the
-    forward / reverse closure walks on :class:`Analysis`.
+    Edges are drawn from each :attr:`Package.deps` entry (resolved via
+    name) to the consumer's path. Names that don't match any package
+    are skipped silently -- :func:`merge_packages` rejects unresolved
+    refs at construction time, so this only fires for partially-built
+    states (e.g. tests). The DAG drives both :func:`_order_packages`
+    and the forward / reverse closure walks on :class:`Analysis`.
     """
     g: nx.DiGraph = nx.DiGraph()
-    keys = set(paths)
-    for base, search_paths in paths.items():
-        g.add_node(base)
-        for sp in search_paths:
-            if sp in keys:
-                g.add_edge(sp, base)
+    by_name = {p.name: p.path for p in packages}
+    for pkg in packages:
+        g.add_node(pkg.path)
+        for dep_name in pkg.deps:
+            dep_path = by_name.get(dep_name)
+            if dep_path is not None:
+                g.add_edge(dep_path, pkg.path)
     return g
 
 
-def _order_paths(paths: PathMap) -> list[Path]:
-    """Topologically sort ``paths.keys()`` so dependencies are processed first."""
-    return list(nx.topological_sort(_build_dep_graph(paths)))
+def _order_packages(packages: Sequence[Package]) -> list[Path]:
+    """Topologically sort package paths so dependencies are processed first."""
+    return list(nx.topological_sort(_build_dep_graph(packages)))
 
 
 def _chain_resolvers(resolvers: Sequence[PathResolver]) -> ImportResolver:
@@ -269,21 +268,6 @@ def _rebind_sys_path(search_paths: tuple[Path, ...], baseline: list[str]) -> Non
             new_path.append(s)
             seen.add(s)
     sys.path[:] = new_path
-
-
-def _clear_resolver_caches() -> None:
-    """Drop the ``sys.path``-derived resolver caches.
-
-    :func:`safe_resolve_module` keys on fullname and
-    :func:`distribution_lookup` / :func:`editable_distribution_roots`
-    key on ``()`` -- all three read live ``sys.path`` (or
-    :mod:`importlib.metadata` against it) and would otherwise return
-    stale results across bases (different first-party prefix;
-    uv-workspace members shipping their own ``.venv``).
-    """
-    safe_resolve_module.cache_clear()
-    distribution_lookup.cache_clear()
-    editable_distribution_roots.cache_clear()
 
 
 def _process_task(
@@ -525,7 +509,7 @@ class _BaseContribution:
 
 
 def _build_contribution(
-    base: Path,
+    package: Package,
     spec: _BaseSpec,
     miss_payloads: Mapping[Path, VisitorPayload],
 ) -> _BaseContribution:
@@ -533,11 +517,13 @@ def _build_contribution(
 
     The base-local ``nx.MultiDiGraph`` is what makes scope-bounded
     materialization cheap: composing it into the full graph or a
-    closure graph doesn't redo per-file apply work.
+    closure graph doesn't redo per-file apply work. Empty
+    :attr:`Package.exported` means "no restriction" (every file in
+    the base is exported to consumers).
     """
     current_trie = SymbolTrie()
     export_trie = SymbolTrie()
-    export_roots = exported_roots(base)
+    exported = package.exported
     import_edges: set[tuple[SymbolNode, Import, EdgeFlags]] = set()
     base_graph: nx.MultiDiGraph = nx.MultiDiGraph()
     base_graph.graph["dead_suites"] = {}
@@ -545,7 +531,7 @@ def _build_contribution(
         payload = spec.hits.get(file)
         if payload is None:
             payload = miss_payloads[file]
-        file_exported = export_roots is None or _under_any(file, export_roots)
+        file_exported = not exported or _under_any(file, list(exported))
         _apply_payload(
             payload,
             current_trie=current_trie,
@@ -556,7 +542,7 @@ def _build_contribution(
         )
     current_trie.add_module_hierarchy_edges(base_graph)
     return _BaseContribution(
-        base=base,
+        base=package.path,
         current_trie=current_trie,
         export_trie=export_trie,
         base_graph=base_graph,
@@ -735,10 +721,10 @@ class Analysis:
     against a warm cache stay fast even on large repos.
 
     The configured ``resolvers`` are queried twice: once at construction
-    time to build the per-base ``PathMap`` (each resolver's
-    :meth:`PathResolver.resolve` is called with ``project_root`` and the
-    results merged via :func:`~dead_cst.resolvers.merge_paths`), and
-    again during edge stitching to classify trie-miss imports via
+    time to build the per-base :class:`Package` list (each resolver's
+    :meth:`PathResolver.resolve` is called with ``project_root`` and
+    the results merged via :func:`~dead_cst.resolvers.merge_packages`),
+    and again during edge stitching to classify trie-miss imports via
     :meth:`PathResolver.resolve_import`. Once constructed, an
     :class:`Analysis` is effectively read-only -- spin up a fresh
     instance to pick up new resolvers or new plugins.
@@ -756,7 +742,14 @@ class Analysis:
     ) -> None:
         self._project_root: Path = project_root
         self._resolvers: tuple[PathResolver, ...] = tuple(resolvers)
-        self._paths: PathMap = merge_paths(*[r.resolve(project_root) for r in self._resolvers])
+        self._packages: tuple[Package, ...] = merge_packages(
+            *[r.resolve(project_root) for r in self._resolvers]
+        )
+        self._packages_by_path: dict[Path, Package] = {p.path: p for p in self._packages}
+        by_name = {p.name: p.path for p in self._packages}
+        self._dep_paths_by_base: dict[Path, tuple[Path, ...]] = {
+            p.path: tuple(by_name[d] for d in p.deps) for p in self._packages
+        }
         self._plugins: tuple[EdgePlugin, ...] = tuple(plugins)
         self._cache = cache
         self._workers = workers
@@ -774,20 +767,24 @@ class Analysis:
         self._full_graph: nx.MultiDiGraph | None = None
 
     @property
-    def paths(self) -> PathMap:
-        """Read-only view of the base -> deps mapping this analysis was built with."""
-        return {b: list(deps) for b, deps in self._paths.items()}
+    def packages(self) -> tuple[Package, ...]:
+        """The :class:`Package` list this analysis was built with."""
+        return self._packages
 
     @property
     def project_root(self) -> Path:
         return self._project_root
 
+    def _dep_paths(self, base: Path) -> tuple[Path, ...]:
+        """Precomputed dep paths for the package at ``base``."""
+        return self._dep_paths_by_base.get(base, ())
+
     def _dep_dag(self) -> nx.DiGraph:
-        """``dep -> consumer`` DAG over ``paths.keys()``; reused by
+        """``dep -> consumer`` DAG over the packages' paths; reused by
         topo-sort and ancestor / descendant queries.
         """
         if self._dep_graph is None:
-            self._dep_graph = _build_dep_graph(self._paths)
+            self._dep_graph = _build_dep_graph(self._packages)
         return self._dep_graph
 
     @property
@@ -806,7 +803,7 @@ class Analysis:
         sibling bases that don't reach ``base`` in the search-paths
         DAG can't reference its decls.
         """
-        if base not in self._paths:
+        if base not in self._packages_by_path:
             raise KeyError(base)
         return frozenset({base}) | frozenset(nx.descendants(self._dep_dag(), base))
 
@@ -838,7 +835,7 @@ class Analysis:
         ``Analysis(...).refresh().materialize_all()``.
         """
         targets = list(bases) if bases is not None else self.bases
-        unknown = [b for b in targets if b not in self._paths]
+        unknown = [b for b in targets if b not in self._packages_by_path]
         if unknown:
             raise KeyError(f"Unknown bases: {unknown}")
         new_targets = [b for b in targets if b not in self._contributions]
@@ -847,7 +844,7 @@ class Analysis:
         for b in new_targets:
             if b not in self._base_specs:
                 self._base_specs[b] = _build_base_spec(
-                    b, self._paths[b], self._cache, self._base_fingerprint(b)
+                    b, self._dep_paths(b), self._cache, self._base_fingerprint(b)
                 )
         partial_specs = {b: self._base_specs[b] for b in new_targets}
         miss_payloads = _compute_all_miss_payloads(
@@ -859,7 +856,11 @@ class Analysis:
             workers=self._workers,
         )
         for b in new_targets:
-            self._contributions[b] = _build_contribution(b, self._base_specs[b], miss_payloads[b])
+            self._contributions[b] = _build_contribution(
+                self._packages_by_path[b],
+                self._base_specs[b],
+                miss_payloads[b],
+            )
         return self
 
     def package(self, base: Path) -> PackageView:
@@ -868,11 +869,11 @@ class Analysis:
         The returned :class:`PackageView` is cheap; per-base work is
         triggered by its query methods.
         """
-        if base not in self._paths:
+        if base not in self._packages_by_path:
             raise KeyError(base)
         return PackageView(self, base)
 
-    def packages(self) -> Iterator[PackageView]:
+    def views(self) -> Iterator[PackageView]:
         """Yield a :class:`PackageView` for every base in topological order."""
         for base in self.bases:
             yield PackageView(self, base)
@@ -933,10 +934,10 @@ class Analysis:
             for base in self.bases:
                 if scope is not None and base not in scope:
                     continue
-                search_paths = (base, *self._paths.get(base, []))
+                search_paths = (base, *self._dep_paths(base))
                 if last_search_paths != search_paths:
                     _rebind_sys_path(search_paths, baseline)
-                    _clear_resolver_caches()
+                    clear_path_caches()
                     last_search_paths = search_paths
                 _compose_contribution(
                     self._contributions[base],
@@ -1028,7 +1029,7 @@ class Analysis:
         contrib = self._contributions[base]
         lookup = SymbolTrie()
         lookup.merge(contrib.current_trie)
-        for dep in self._paths.get(base, []):
+        for dep in self._dep_paths(base):
             if scope is not None and dep not in scope:
                 continue
             dep_contrib = self._contributions.get(dep)

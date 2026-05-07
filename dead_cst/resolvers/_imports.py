@@ -255,6 +255,21 @@ def _is_stdlib_path(path: Path) -> bool:
     return path.is_relative_to(STDLIB) and not _is_site_packages_path(path)
 
 
+def clear_path_caches() -> None:
+    """Drop the ``sys.path``-derived resolver caches.
+
+    :func:`safe_resolve_module` keys on fullname and
+    :func:`distribution_lookup` / :func:`editable_distribution_roots`
+    key on ``()`` -- all three read live ``sys.path`` (or
+    :mod:`importlib.metadata` against it). Anything mutating
+    ``sys.path`` (the analyzer's per-base rebind, a resolver splicing
+    in its own venv) must call this to keep the next lookup honest.
+    """
+    safe_resolve_module.cache_clear()
+    distribution_lookup.cache_clear()
+    editable_distribution_roots.cache_clear()
+
+
 def default_resolve_import(name: str, search_paths: list[Path]) -> str | Path | None:
     """Resolve a dotted module name against ``sys.path`` + the importlib finders.
 

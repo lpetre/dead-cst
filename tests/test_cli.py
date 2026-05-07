@@ -112,44 +112,42 @@ def test_parse_entrypoint_re_prefix_with_empty_pattern():
 
 
 def test_manual_resolver_empty_specs(tmp_path):
-    assert ManualResolver(specs=[]).resolve(tmp_path) == {}
+    assert ManualResolver(specs=[]).resolve(tmp_path) == ()
 
 
 @pytest.mark.parametrize(
-    "specs, expected_keys, expected_deps",
+    "specs, expected_packages",
     [
-        pytest.param(["src"], ["src"], {"src": []}, id="base-only"),
+        pytest.param(["src"], {"src": ()}, id="base-only"),
         pytest.param(
             ["src:dep1,dep2"],
-            ["src"],
-            {"src": ["dep1", "dep2"]},
-            id="base-with-deps",
+            {"src": ("dep1", "dep2"), "dep1": (), "dep2": ()},
+            id="base-with-deps-auto-promoted",
         ),
         pytest.param(
             ["src: dep1 , dep2 "],
-            ["src"],
-            {"src": ["dep1", "dep2"]},
+            {"src": ("dep1", "dep2"), "dep1": (), "dep2": ()},
             id="dep-whitespace-stripped",
         ),
         pytest.param(
             ["src:dep1,"],
-            ["src"],
-            {"src": ["dep1"]},
+            {"src": ("dep1",), "dep1": ()},
             id="trailing-comma-drops-empty-dep",
         ),
         pytest.param(
             ["src:dep1", "lib"],
-            ["src", "lib"],
-            {"src": ["dep1"], "lib": []},
+            {"src": ("dep1",), "dep1": (), "lib": ()},
             id="multiple-specs-merged",
         ),
     ],
 )
-def test_manual_resolver_parses_specs(tmp_path, specs, expected_keys, expected_deps):
+def test_manual_resolver_parses_specs(tmp_path, specs, expected_packages):
     result = ManualResolver(specs=specs).resolve(tmp_path)
-    assert list(result) == [tmp_path / k for k in expected_keys]
-    for key, deps in expected_deps.items():
-        assert result[tmp_path / key] == [tmp_path / d for d in deps]
+    by_name = {p.name: p for p in result}
+    assert set(by_name) == set(expected_packages)
+    for name, deps in expected_packages.items():
+        assert by_name[name].deps == deps
+        assert by_name[name].path == (tmp_path / name).resolve()
 
 
 def test_build_resolvers_no_specs_no_resolvers_returns_default_manual():

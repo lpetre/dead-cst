@@ -1,8 +1,9 @@
 """Pluggable resolvers that discover sys.path-like search paths for a project.
 
-A :class:`PathResolver` returns a ``dict[base, [dep_paths]]`` map plus
-an import resolver. Multiple resolvers compose by merging their maps --
-see :func:`merge_paths`.
+A :class:`PathResolver` returns a tuple of :class:`Package` objects (one
+per first-party workspace member) plus an import resolver. Multiple
+resolvers compose by merging their package lists -- see
+:func:`merge_packages`.
 
 Each builtin resolver lives in its own submodule. Third-party resolvers
 can register under the ``dead_cst.resolvers`` entry-point group;
@@ -10,9 +11,10 @@ can register under the ``dead_cst.resolvers`` entry-point group;
 
 In addition, :func:`exported_roots` -- not a resolver itself -- inspects a
 single base's ``pyproject.toml`` to determine which subdirs the build
-backend would actually ship. The analyzer calls this per-base to scope
-each dep's contribution to consumers' import lookups, so internal dirs
-like ``tests/`` stay scoped to their owning member.
+backend would actually ship. The shipped resolvers call it at
+:meth:`PathResolver.resolve` time to populate
+:attr:`Package.exported`, so internal dirs like ``tests/`` stay scoped
+to their owning member when other packages import from this one.
 
 Custom resolvers re-implementing :meth:`PathResolver.resolve_import`
 can call :func:`default_resolve_import` (the shipped sys.path /
@@ -26,17 +28,18 @@ importlib implementation) directly, or compose with the lower-level
 
 from __future__ import annotations
 
-from ._core import ImportResolver, PathMap, PathResolver, load_toml, merge_paths
+from ..contrib.uv import UvResolver
+from ._core import ImportResolver, Package, PathResolver, load_toml, merge_packages
 from ._exports import exported_roots
 from ._imports import (
     SITE_PACKAGES_MARKERS,
     STDLIB,
+    clear_path_caches,
     default_resolve_import,
     distribution_lookup,
     editable_distribution_roots,
     safe_resolve_module,
 )
-from ..contrib.uv import UvResolver
 from .manual import ManualResolver
 
 BUILTIN_RESOLVERS: dict[str, type[PathResolver]] = {
@@ -62,17 +65,18 @@ __all__ = [
     "BUILTIN_RESOLVERS",
     "ImportResolver",
     "ManualResolver",
-    "PathMap",
+    "Package",
     "PathResolver",
     "SITE_PACKAGES_MARKERS",
     "STDLIB",
     "UvResolver",
+    "clear_path_caches",
     "default_resolve_import",
     "distribution_lookup",
     "editable_distribution_roots",
     "exported_roots",
     "load_resolver",
     "load_toml",
-    "merge_paths",
+    "merge_packages",
     "safe_resolve_module",
 ]
