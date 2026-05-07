@@ -10,6 +10,14 @@ two versions.
 ## [Unreleased]
 
 ### Added
+- Progress reporting around the per-file visitor pass ("Parsing
+  files") and the cross-base composition pass ("Reconciling bases")
+  in `Analysis.refresh` / `Analysis._materialize`. On a TTY the user
+  sees a live `tqdm` bar; off a TTY (pytest capture, pipes, agent
+  harnesses) the same wrapper emits one newline-terminated checkpoint
+  at 0%, every ~10%, and at 100%, so CI logs and LLM tool consumers
+  can track long runs without `tqdm`'s `\r`-overwriting frames going
+  to mush. `tqdm>=4.66` is now a hard runtime dependency.
 - New plugin helpers re-exported from `dead_cst.plugins`: `module_node`,
   `dotted_parts`, `dotted_name`, `string_value`,
   `payload_imports_module`. They consolidate boilerplate every contrib
