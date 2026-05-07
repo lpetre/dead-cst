@@ -7,16 +7,16 @@ from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
-from typing import Iterable, Iterator, Mapping, Sequence, TypeVar
+from typing import Iterable, Iterator, Mapping, Sequence
 
 import libcst as cst
 import networkx as nx
 from libcst.helpers.module import ModuleNameAndPackage
 from libcst.metadata import CodeRange, MetadataWrapper
-from tqdm import tqdm
 
 from ._edges import resolve_edges
 from ._fqn import FixedFullyQualifiedNameProvider
+from ._progress import progress
 from ._visitor import SymbolVisitor
 from .branches import (
     DefaultUnreachableRegionDetector,
@@ -43,55 +43,6 @@ from .resolvers import (
 from .resolvers._core import _validate_packages
 
 logger = logging.getLogger(__name__)
-
-_T = TypeVar("_T")
-
-
-def _progress(
-    iterable: Iterable[_T],
-    *,
-    desc: str,
-    unit: str,
-    total: int | None = None,
-) -> Iterator[_T]:
-    """Wrap ``iterable`` with a tqdm bar on TTYs, decile log lines elsewhere.
-
-    When ``sys.stderr`` is a TTY we hand off to ``tqdm`` for the
-    familiar live bar. When it isn't (pytest capture, pipes, agent
-    harnesses), tqdm's ``\\r``-overwriting renders to nothing useful, so
-    we emit one newline-terminated checkpoint at 0%, every ~10%, and at
-    100% instead. Counts that fall on the same milestone (small
-    ``total``s) coalesce so we never re-print the same line.
-    """
-    if total is None:
-        try:
-            total = len(iterable)  # type: ignore[arg-type]
-        except TypeError:
-            total = None
-
-    if sys.stderr.isatty() or total is None:
-        yield from tqdm(iterable, desc=desc, unit=unit, total=total, disable=None)
-        return
-
-    milestones = sorted({total * k // 10 for k in range(11)})
-    next_idx = 0
-
-    def _emit_through(count: int) -> None:
-        nonlocal next_idx
-        while next_idx < len(milestones) and milestones[next_idx] <= count:
-            print(
-                f"{desc}: {milestones[next_idx]}/{total} {unit}",
-                file=sys.stderr,
-                flush=True,
-            )
-            next_idx += 1
-
-    _emit_through(0)
-    count = 0
-    for item in iterable:
-        yield item
-        count += 1
-        _emit_through(count)
 
 
 def _bfs_order(seeds: Iterable[Path], neighbors: Mapping[Path, Sequence[Path]]) -> list[Path]:
@@ -364,7 +315,7 @@ def _process_stale_files(
             initializer=_init_worker,
             initargs=(detector, tuple(plugins)),
         ) as pool:
-            for file, payload in _progress(
+            for file, payload in progress(
                 pool.map(_worker_process_task, tasks),
                 total=len(tasks),
                 desc="Parsing files",
@@ -374,7 +325,7 @@ def _process_stale_files(
         return out
 
     plugins_t = tuple(plugins)
-    for task in _progress(tasks, desc="Parsing files", unit="file"):
+    for task in progress(tasks, total=len(tasks), desc="Parsing files", unit="file"):
         file, payload = _process_task(detector, plugins_t, task)
         _record(file, payload)
     return out
@@ -976,7 +927,12 @@ class Analysis:
         last_search_paths: tuple[Path, ...] | None = None
         target_bases = [b for b in self.bases if scope is None or b in scope]
         try:
-            for base in _progress(target_bases, desc="Reconciling bases", unit="base"):
+            for base in progress(
+                target_bases,
+                total=len(target_bases),
+                desc="Reconciling bases",
+                unit="base",
+            ):
                 search_paths = (base, *self._dep_paths(base))
                 if last_search_paths != search_paths:
                     _rebind_sys_path(search_paths, baseline)
