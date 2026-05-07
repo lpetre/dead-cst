@@ -13,6 +13,7 @@ import libcst as cst
 import networkx as nx
 from libcst.helpers.module import ModuleNameAndPackage
 from libcst.metadata import CodeRange, MetadataWrapper
+from tqdm import tqdm
 
 from ._edges import resolve_edges
 from ._fqn import FixedFullyQualifiedNameProvider
@@ -314,12 +315,18 @@ def _process_stale_files(
             initializer=_init_worker,
             initargs=(detector, tuple(plugins)),
         ) as pool:
-            for file, payload in pool.map(_worker_process_task, tasks):
+            for file, payload in tqdm(
+                pool.map(_worker_process_task, tasks),
+                total=len(tasks),
+                desc="Parsing files",
+                unit="file",
+                disable=None,
+            ):
                 _record(file, payload)
         return out
 
     plugins_t = tuple(plugins)
-    for task in tasks:
+    for task in tqdm(tasks, desc="Parsing files", unit="file", disable=None):
         file, payload = _process_task(detector, plugins_t, task)
         _record(file, payload)
     return out
@@ -919,10 +926,9 @@ class Analysis:
         g.graph["dead_suites"] = {}
         baseline = list(sys.path)
         last_search_paths: tuple[Path, ...] | None = None
+        target_bases = [b for b in self.bases if scope is None or b in scope]
         try:
-            for base in self.bases:
-                if scope is not None and base not in scope:
-                    continue
+            for base in tqdm(target_bases, desc="Reconciling bases", unit="base", disable=None):
                 search_paths = (base, *self._dep_paths(base))
                 if last_search_paths != search_paths:
                     _rebind_sys_path(search_paths, baseline)

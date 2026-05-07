@@ -10,6 +10,13 @@ two versions.
 ## [Unreleased]
 
 ### Added
+- `tqdm` progress bars now surface during the per-file visitor pass
+  ("Parsing files") and the cross-base composition pass ("Reconciling
+  bases") in `Analysis.refresh` / `Analysis._materialize`. Bars stream
+  to stderr and auto-disable when stderr isn't a TTY (e.g. under pytest
+  capture, or when piping the CLI through another tool), so library
+  callers and CI logs are unaffected. `tqdm>=4.66` is now a hard
+  runtime dependency.
 - New plugin helpers re-exported from `dead_cst.plugins`: `module_node`,
   `dotted_parts`, `dotted_name`, `string_value`,
   `payload_imports_module`. They consolidate boilerplate every contrib
