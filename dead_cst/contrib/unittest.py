@@ -14,9 +14,11 @@ from ..plugins._core import (
     ObserveContext,
     PluginContext,
     _asname_value,
-    make_payload,
     is_from_module,
     is_name,
+    make_payload,
+    module_node,
+    payload_imports_module,
     simple_name,
     synthetic_node,
 )
@@ -67,11 +69,11 @@ class UnittestPlugin:
     version: int = 1777760307
 
     def observe(self, ctx: ObserveContext) -> VisitorPayload | None:
-        if not _file_imports_unittest(ctx.payload):
+        if not payload_imports_module(ctx.payload, "unittest", include_star=False):
             return None
 
-        module_node = next((n for n in ctx.payload.nodes if n.type == "module"), None)
-        if module_node is None:
+        module = module_node(ctx.payload)
+        if module is None:
             return None
 
         module_aliases, base_aliases = _collect_unittest_imports(ctx.module)
@@ -93,7 +95,7 @@ class UnittestPlugin:
             return None
 
         synth = synthetic_node(
-            f"{UNITTEST_PREFIX}{module_node.fqname}",
+            f"{UNITTEST_PREFIX}{module.fqname}",
             ctx.path,
             flags=NodeFlags.ENTRYPOINT,
         )
@@ -102,25 +104,6 @@ class UnittestPlugin:
 
     def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]:
         return ()
-
-
-def _file_imports_unittest(payload) -> bool:
-    """True iff any non-star import in the file targets ``unittest``.
-
-    Star imports are deliberately excluded: ``from unittest import *``
-    binds the test base classes anonymously, but we can't reliably tie
-    them to a graph node without re-parsing every file. The
-    pre-refactor plugin had the same limitation by virtue of relying
-    on ``ctx.importers`` (which doesn't surface stdlib star imports).
-    The escape hatch is the same: switch to ``from unittest import
-    TestCase``.
-    """
-    for _src, imp, _pos in payload.imports:
-        if imp.star:
-            continue
-        if imp.module == "unittest" or imp.module.startswith("unittest."):
-            return True
-    return False
 
 
 def _collect_unittest_imports(module: cst.Module) -> tuple[set[str], set[str]]:

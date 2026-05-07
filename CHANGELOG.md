@@ -9,6 +9,22 @@ two versions.
 
 ## [Unreleased]
 
+### Added
+- New plugin helpers re-exported from `dead_cst.plugins`: `module_node`,
+  `dotted_parts`, `dotted_name`, `string_value`,
+  `payload_imports_module`. They consolidate boilerplate every contrib
+  plugin used to inline (lookup the per-file module node, walk
+  attribute chains, evaluate string literals, scan payload imports).
+- New `DispatchAppPlugin` base in `dead_cst.plugins.decl_shapes` for
+  CLI-style dispatch apps (`X = App(); @X.command(...)`). `TyperPlugin`
+  and `CycloptsPlugin` are now thin subclasses configuring the module,
+  constructor, and registration-decorator names.
+
+### Fixed
+- `dead-cst unused-exports` no longer matches variables whose names
+  merely end with the literal `__all__` (e.g. `pkg.foo__all__`); only
+  variables actually named `__all__` are considered.
+
 ### Changed
 - **Breaking:** `compute_fingerprint` no longer takes a `base: Path`
   argument. The visitor's output is purely a function of the file's

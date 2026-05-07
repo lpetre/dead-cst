@@ -16,6 +16,8 @@ from ..plugins._core import (
     ObserveContext,
     PluginContext,
     make_payload,
+    module_node,
+    payload_imports_module,
     simple_name,
     synthetic_node,
 )
@@ -58,8 +60,8 @@ class PytestPlugin:
     version: int = 1777760307
 
     def observe(self, ctx: ObserveContext) -> VisitorPayload | None:
-        module_node = next((n for n in ctx.payload.nodes if n.type == "module"), None)
-        if module_node is None:
+        module = module_node(ctx.payload)
+        if module is None:
             return None
 
         module_decls = [n for n in ctx.payload.nodes if n.type in ("function", "class", "variable")]
@@ -71,7 +73,7 @@ class PytestPlugin:
             _emit_seed(
                 new_nodes,
                 new_edges,
-                f"{PYTEST_CONFTEST_PREFIX}{module_node.fqname}",
+                f"{PYTEST_CONFTEST_PREFIX}{module.fqname}",
                 ctx.path,
                 module_decls,
             )
@@ -80,12 +82,12 @@ class PytestPlugin:
             _emit_seed(
                 new_nodes,
                 new_edges,
-                f"{PYTEST_TESTS_PREFIX}{module_node.fqname}",
+                f"{PYTEST_TESTS_PREFIX}{module.fqname}",
                 ctx.path,
                 test_decls,
             )
 
-        if _file_imports_pytest(ctx.payload):
+        if payload_imports_module(ctx.payload, "pytest"):
             fixture_names = _find_fixture_names(ctx.module)
             if fixture_names:
                 fixture_decls = [
@@ -96,7 +98,7 @@ class PytestPlugin:
                 _emit_seed(
                     new_nodes,
                     new_edges,
-                    f"{PYTEST_FIXTURES_PREFIX}{module_node.fqname}",
+                    f"{PYTEST_FIXTURES_PREFIX}{module.fqname}",
                     ctx.path,
                     fixture_decls,
                 )
@@ -115,21 +117,6 @@ def _emit_seed(nodes, edges, fqname, path, targets):
     synth = synthetic_node(fqname, path, flags=NodeFlags.ENTRYPOINT)
     nodes.append(synth)
     edges.extend((synth, t, SYNTHETIC_POSITION) for t in targets)
-
-
-def _file_imports_pytest(payload) -> bool:
-    """True iff any visitor-recorded import in this file targets pytest.
-
-    Replaces the old graph-level ``ctx.importers("pytest")`` prefilter
-    with a per-file syntactic check. The visitor's ``imports`` field
-    has every cross-file import attempt (resolved or unresolved) so
-    this is strictly more accurate than substring matching while
-    staying file-local.
-    """
-    for _src, imp, _pos in payload.imports:
-        if imp.module == "pytest" or imp.module.startswith("pytest."):
-            return True
-    return False
 
 
 def _is_test_filename(name: str) -> bool:

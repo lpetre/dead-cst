@@ -264,7 +264,7 @@ class GraphCache:
             return None
         try:
             payload = pickle.loads(blob)
-        except Exception:
+        except (pickle.UnpicklingError, AttributeError, EOFError, ImportError, ValueError):
             logger.warning("Corrupt cache entry for %s; dropping", path)
             with self._conn:
                 self._conn.execute("DELETE FROM file_cache WHERE path=?", (str(path),))

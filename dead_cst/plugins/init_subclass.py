@@ -46,7 +46,9 @@ from ._core import (
     GraphOp,
     ObserveContext,
     PluginContext,
+    dotted_parts,
     make_payload,
+    module_node,
     simple_name,
     synthetic_node,
 )
@@ -93,10 +95,10 @@ class InitSubclassPlugin:
     def observe(self, ctx: ObserveContext) -> VisitorPayload | None:
         nodes_by_simple = _local_class_decls(ctx.payload.nodes)
         local_imports = _local_import_targets(ctx.payload.nodes)
-        module_node = next((n for n in ctx.payload.nodes if n.type == "module"), None)
-        if module_node is None:
+        module = module_node(ctx.payload)
+        if module is None:
             return None
-        module_fqname = module_node.fqname
+        module_fqname = module.fqname
 
         nodes: list[SymbolNode] = []
         edges: list[tuple[SymbolNode, SymbolNode, CodeRange]] = []
@@ -234,7 +236,7 @@ def _resolve_class_expr(
             return _import_target_fqname(imp)
         return None
     if isinstance(expr, cst.Attribute):
-        parts = _dotted_parts(expr)
+        parts = dotted_parts(expr)
         if parts is None:
             return None
         head, rest = parts[0], parts[1:]
@@ -250,19 +252,6 @@ def _import_target_fqname(imp: Import) -> str:
     if imp.decl:
         return f"{imp.module}.{imp.decl}"
     return imp.module
-
-
-def _dotted_parts(expr: cst.BaseExpression) -> list[str] | None:
-    parts: list[str] = []
-    current: cst.BaseExpression = expr
-    while isinstance(current, cst.Attribute):
-        parts.append(current.attr.value)
-        current = current.value
-    if not isinstance(current, cst.Name):
-        return None
-    parts.append(current.value)
-    parts.reverse()
-    return parts
 
 
 def _local_class_decls(nodes) -> dict[str, list[SymbolNode]]:

@@ -29,6 +29,7 @@ from .plugins import (
     ExplicitEntrypointPlugin,
     ModuleDundersPlugin,
     load_plugin,
+    simple_name,
 )
 from .plugins.module_dunders import DUNDER_PREFIX
 from .resolvers import (
@@ -410,7 +411,7 @@ def why_alive(
 
 
 def _is_dunder_all(node: SymbolNode) -> bool:
-    return node.type == "variable" and node.fqname.endswith("__all__")
+    return node.type == "variable" and simple_name(node.fqname) == "__all__"
 
 
 def _is_external_dep(node: SymbolNode) -> bool:
@@ -531,19 +532,25 @@ def unused_exports(
     reachable = _find_reachable(graph)
 
     # ModuleDundersPlugin keeps each ``__all__`` alive via a synthetic
-    # entrypoint node ``<dunder>:<fqname>``. Cut the edge from each such
-    # synthetic into an ``__all__`` variable and re-run reachability;
+    # entrypoint node ``<dunder>:<fqname>``. Re-run reachability while
+    # skipping edges from such synthetics into ``__all__`` variables;
     # whatever drops out was alive only because of __all__.
-    pruned = graph.copy()
-    pruned.remove_edges_from(
-        [
-            (s, d, k)
-            for s, d, k in graph.edges(keys=True)
-            if _is_dunder_all(d) and s.type == "synthetic" and s.fqname.startswith(DUNDER_PREFIX)
-        ]
-    )
-    reachable_without_all = _find_reachable(pruned)
-    only_via_all = reachable - reachable_without_all
+    def _is_dunder_seed(node: SymbolNode) -> bool:
+        return node.type == "synthetic" and node.fqname.startswith(DUNDER_PREFIX)
+
+    visited: set[SymbolNode] = set()
+    stack = [n for n, attrs in graph.nodes(data=True) if attrs.get("entrypoint")]
+    while stack:
+        node = stack.pop()
+        if node in visited:
+            continue
+        visited.add(node)
+        is_seed = _is_dunder_seed(node)
+        for succ in graph.successors(node):
+            if is_seed and _is_dunder_all(succ):
+                continue
+            stack.append(succ)
+    only_via_all = reachable - visited
 
     by_all: dict[SymbolNode, list[SymbolNode]] = {}
     for sym in only_via_all:

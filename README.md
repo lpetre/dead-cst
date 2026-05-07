@@ -201,14 +201,15 @@ Entrypoint detection is fully plugin-driven. Builtins:
 | `ClickPlugin` | Detect top-level Click `Group` instances (functions decorated `@click.group(...)` or `X = click.Group(...)`) and add `instance -> handler` edges for every `@cli.command(...)` / `@cli.group(...)` / `@cli.result_callback(...)` decorator. Groups are pass-through (reach them via `[project.scripts]` or a `__main__` block), so a sub-group that's never `add_command`'d stays dead (`--plugin click`) |
 | `InitSubclassPlugin` | Detect classes that define `__init_subclass__` and add `parent -> subclass` edges for every (transitive) first-party subclass. Parents stay pass-through, so a registry base class only keeps subclasses alive once something else (an entrypoint, an import) keeps the parent alive (`--plugin init_subclass`) |
 
-For project-specific dynamic-import patterns, two abstract bases ship as scaffolding that subclasses configure in 4-5 lines:
+For project-specific dynamic-import patterns, three abstract bases ship as scaffolding that subclasses configure in 4-5 lines:
 
 | Abstract base | Use it for |
 |---|---|
 | `DecoratedDeclPlugin` | "Find decorated decls in files matching a search path." Subclass with `package_prefix`, `decorator_module`, `decorator_names`, `constructor_names`. Pure observe-time. |
 | `LiteralListPlugin` | "Read `<owner>.<var> = ['fqn', ...]` and treat each entry as alive." Subclass with `owner_fqname`, `variable_name`. observe parses and caches; finalize only does graph lookups. |
+| `DispatchAppPlugin` | "Wire `@<instance>.<reg>(...)` handlers to a CLI app instance." Subclass with `app_module`, `constructor_targets`, `registration_decorators`. Powers `TyperPlugin` and `CycloptsPlugin`; reuse for any framework with the `X = App(); @X.command(...)` shape. |
 
-Both bases require subclasses to set `name` (a unique identifier for the cache namespace) and `version` (a Unix epoch int — bump it to the current epoch when the subclass's config changes). For example:
+All three bases require subclasses to set `name` (a unique identifier for the cache namespace) and `version` (a Unix epoch int — bump it to the current epoch when the subclass's config changes). For example:
 
 ```python
 from dataclasses import dataclass

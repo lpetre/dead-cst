@@ -389,6 +389,63 @@ def synthetic_node(
     return SymbolNode(fqname=fqname, type="synthetic", path=path, position=position, flags=flags)
 
 
+def module_node(payload: "VisitorPayload") -> SymbolNode | None:
+    """Return the file's synthetic module node, or ``None`` for empty payloads."""
+    return next((n for n in payload.nodes if n.type == "module"), None)
+
+
+def dotted_parts(expr: cst.CSTNode | None) -> list[str] | None:
+    """Walk an ``Attribute`` chain rooted in a ``Name`` and return its dotted parts.
+
+    Returns the parts in source order (``a.b.c`` -> ``["a", "b", "c"]``)
+    or ``None`` if the chain doesn't bottom out in a bare ``Name``.
+    """
+    parts: list[str] = []
+    current = expr
+    while isinstance(current, cst.Attribute):
+        parts.append(current.attr.value)
+        current = current.value
+    if not isinstance(current, cst.Name):
+        return None
+    parts.append(current.value)
+    parts.reverse()
+    return parts
+
+
+def dotted_name(expr: cst.CSTNode | None) -> str | None:
+    """Like :func:`dotted_parts` but returns ``"a.b.c"`` (or ``None``)."""
+    parts = dotted_parts(expr)
+    return ".".join(parts) if parts is not None else None
+
+
+def string_value(expr: cst.BaseExpression) -> str | None:
+    """Return the value of a ``SimpleString`` / ``ConcatenatedString``, else ``None``.
+
+    Bytes literals (which share the ``SimpleString`` node) and
+    unparseable concatenations resolve to ``None``.
+    """
+    if not isinstance(expr, (cst.SimpleString, cst.ConcatenatedString)):
+        return None
+    try:
+        value = expr.evaluated_value
+    except (SyntaxError, UnicodeDecodeError):
+        return None
+    return value if isinstance(value, str) else None
+
+
+def payload_imports_module(
+    payload: "VisitorPayload", module_name: str, *, include_star: bool = True
+) -> bool:
+    """True iff any import in ``payload`` targets ``module_name`` or a submodule."""
+    prefix = module_name + "."
+    for _src, imp, _pos in payload.imports:
+        if not include_star and imp.star:
+            continue
+        if imp.module == module_name or imp.module.startswith(prefix):
+            return True
+    return False
+
+
 def decls_by_simple_name(nodes: Iterable[SymbolNode]) -> dict[str, list[SymbolNode]]:
     """Index ``nodes`` by the rightmost dotted segment of their fqname.
 
