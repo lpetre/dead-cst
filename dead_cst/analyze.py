@@ -748,12 +748,10 @@ class Analysis:
     def bases(self) -> list[Path]:
         """Deterministic, cycle-tolerant package order.
 
-        BFS forward through :attr:`_consumers_by_base` from packages
-        with no deps, so dependencies precede their dependents
-        whenever the graph is acyclic. Cycle-trapped packages (none
-        of which appear as no-dep seeds) are appended at the end in
-        path order. ``_consumers_by_base`` is pre-sorted at
-        construction so the BFS visit order is fully determined.
+        Dependencies precede their dependents whenever the package
+        graph is acyclic. Packages trapped in dep cycles are appended
+        at the end in path order. The traversal is fully deterministic
+        across runs.
         """
         sorted_paths = sorted(self._packages_by_path)
         seeds = [p for p in sorted_paths if not self._dep_paths_by_base.get(p)]
@@ -856,7 +854,7 @@ class Analysis:
         return PackageView(self, base)
 
     def views(self) -> Iterator[PackageView]:
-        """Yield a :class:`PackageView` for every base in topological order."""
+        """Yield a :class:`PackageView` for every base in :attr:`bases` order."""
         for base in self.bases:
             yield PackageView(self, base)
 

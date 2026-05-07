@@ -59,7 +59,9 @@ SYNTHETIC_PATH_PREFIXES = (*EXTERNAL_PREFIXES, UNRESOLVED_PREFIX)
 class PluginContext:
     """Per-base view of the analyzer state passed to every plugin.
 
-    The plugin pass runs once for each base in topological order. Each
+    The plugin pass runs once for each base in :attr:`Analysis.bases`
+    order (deps before dependents wherever the package graph is
+    acyclic). Each
     invocation gets a fresh context whose ``symbol_lookup`` matches what
     was visible to that base's import resolution. Plugins should normally
     scope iteration to :attr:`base` -- :meth:`base_modules` is the easy
