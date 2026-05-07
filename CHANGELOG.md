@@ -25,13 +25,14 @@ two versions.
   now pay for one total.
 - The package dependency graph is no longer represented as a
   `networkx.DiGraph`, and `Package.deps` may now contain cycles.
-  `Analysis.bases`, `reverse_closure`, and the closure-scoped
-  materialization queries all run through a small BFS helper over a
-  precomputed `consumers_by_base` reverse map and the existing
-  `Package.deps` direct-dep map; the visited-set guard makes them
-  cycle-safe. `bases` walks dep-before-consumer wherever the graph
-  is acyclic and appends any cycle-trapped packages in path order.
-  The walk results memoize on `Analysis` so repeated `PackageView`
+  `Analysis.bases` BFS-walks forward from no-dep packages through
+  the precomputed consumer reverse map (so dependencies precede
+  their consumers when the graph is acyclic, and any cycle-trapped
+  packages get appended in path order); `reverse_closure` walks the
+  same consumer map from a single seed; `_interesting_set` walks
+  the dep map from `reverse_closure`'s result. All three share one
+  `_bfs_order` helper whose visited-set guard makes them cycle-safe,
+  and their results memoize on `Analysis` so repeated `PackageView`
   queries share the cost. Tolerating cycles lets a package with an
   acyclic exported subset list cyclic dev/test deps without
   hand-splitting them out.

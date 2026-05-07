@@ -64,32 +64,6 @@ def _bfs_order(seeds: Iterable[Path], neighbors: Mapping[Path, Sequence[Path]]) 
     return order
 
 
-def _ordered_bases(packages: Sequence[Package]) -> list[Path]:
-    """Deterministic, cycle-tolerant package iteration order.
-
-    BFS forward from packages with no deps through their consumer
-    map, so dependencies precede their dependents whenever the
-    package graph is acyclic. Packages trapped in dep cycles (and
-    any otherwise-unreached packages) are appended at the end in
-    path order.
-    """
-    by_name = {p.name: p.path for p in packages}
-    sorted_paths = sorted(p.path for p in packages)
-    deps_by_path: dict[Path, set[Path]] = {
-        p.path: {by_name[d] for d in p.deps if d in by_name} for p in packages
-    }
-    consumers: dict[Path, list[Path]] = {p: [] for p in sorted_paths}
-    for path, deps in deps_by_path.items():
-        for d in deps:
-            consumers[d].append(path)
-    consumers_sorted = {p: sorted(cs) for p, cs in consumers.items()}
-    seeds = [p for p in sorted_paths if not deps_by_path[p]]
-    order = _bfs_order(seeds, consumers_sorted)
-    visited = set(order)
-    order.extend(p for p in sorted_paths if p not in visited)
-    return order
-
-
 def _run_observe(
     plugins: Sequence[EdgePlugin],
     path: Path,
@@ -723,14 +697,14 @@ class Analysis:
             p.path: tuple(by_name[d] for d in p.deps) for p in self._packages
         }
         # Reverse map: base -> bases that name this one in their `deps`.
-        # Built once at construction so consumer-side BFS (used by
-        # `reverse_closure`) is cheap.
+        # Pre-sorted by path so consumer-side BFS (used by
+        # `reverse_closure` and `bases`) yields a deterministic order.
         consumers: dict[Path, list[Path]] = {p.path: [] for p in self._packages}
         for p in self._packages:
             for dep_name in p.deps:
                 consumers[by_name[dep_name]].append(p.path)
         self._consumers_by_base: dict[Path, tuple[Path, ...]] = {
-            base: tuple(deps) for base, deps in consumers.items()
+            base: tuple(sorted(cs)) for base, cs in consumers.items()
         }
         self._plugins: tuple[EdgePlugin, ...] = tuple(plugins)
         self._cache = cache
@@ -774,10 +748,19 @@ class Analysis:
     def bases(self) -> list[Path]:
         """Deterministic, cycle-tolerant package order.
 
-        Deps precede their dependents whenever the package graph is
-        acyclic; cycle members are emitted at the end in path order.
+        BFS forward through :attr:`_consumers_by_base` from packages
+        with no deps, so dependencies precede their dependents
+        whenever the graph is acyclic. Cycle-trapped packages (none
+        of which appear as no-dep seeds) are appended at the end in
+        path order. ``_consumers_by_base`` is pre-sorted at
+        construction so the BFS visit order is fully determined.
         """
-        return _ordered_bases(self._packages)
+        sorted_paths = sorted(self._packages_by_path)
+        seeds = [p for p in sorted_paths if not self._dep_paths_by_base.get(p)]
+        order = _bfs_order(seeds, self._consumers_by_base)
+        visited = set(order)
+        order.extend(p for p in sorted_paths if p not in visited)
+        return order
 
     def reverse_closure(self, base: Path) -> frozenset[Path]:
         """Bases that transitively depend on ``base`` (including ``base`` itself).

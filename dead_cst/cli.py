@@ -9,13 +9,13 @@ import re
 import sys
 from enum import Enum
 from pathlib import Path
-from typing import Annotated, Iterator
+from typing import Annotated, Iterator, Sequence
 
 import networkx as nx
 import typer
 from libcst.metadata import CodeRange
 
-from .analyze import Analysis, _count_nodes, _find_reachable, _ordered_bases
+from .analyze import Analysis, _count_nodes, _find_reachable
 from .cache import (
     GraphCache,
     clear_cache,
@@ -33,7 +33,6 @@ from .plugins import (
 from .plugins.module_dunders import DUNDER_PREFIX
 from .resolvers import (
     ManualResolver,
-    Package,
     PathResolver,
     load_resolver,
 )
@@ -211,15 +210,14 @@ def analyze(
             workers=workers,
         )
         graph = analysis.materialize_all()
-    packages = analysis.packages
     reachable = _find_reachable(graph)
 
     unreachable_graph = graph.subgraph([n for n in graph.nodes if n not in reachable])
 
     if output_format == OutputFormat.json:
-        _output_json(graph, unreachable_graph, root, packages)
+        _output_json(graph, unreachable_graph, root, analysis.bases)
     else:
-        _output_text(graph, unreachable_graph, root, packages)
+        _output_text(graph, unreachable_graph, root, analysis.bases)
 
     if unreachable_graph.number_of_nodes() > 0:
         raise typer.Exit(1)
@@ -229,9 +227,9 @@ def _output_text(
     graph: nx.MultiDiGraph,
     unreachable: nx.MultiDiGraph,
     root: Path,
-    packages: tuple[Package, ...],
+    bases: Sequence[Path],
 ) -> None:
-    for base in _ordered_bases(packages):
+    for base in bases:
         typer.echo(f"\n{base}:")
         total_counts = _count_nodes(graph, base)
         unreachable_counts = _count_nodes(unreachable, base)
@@ -255,7 +253,7 @@ def _output_text(
         for node in sorted(dead_real, key=lambda n: (str(n.path), n.fqname)):
             typer.echo(f"  {node.fqname} ({node.type}) at {_rel_path(node.path, root)}")
 
-    branches = _dead_suite_locations(graph, packages)
+    branches = _dead_suite_locations(graph, bases)
     if branches:
         typer.echo(f"\nUnreachable branches ({len(branches)}):")
         for path, pos in branches:
@@ -276,7 +274,7 @@ def _dead_real(unreachable: nx.MultiDiGraph) -> list[SymbolNode]:
 
 
 def _dead_suite_locations(
-    graph: nx.MultiDiGraph, packages: tuple[Package, ...]
+    graph: nx.MultiDiGraph, bases: Sequence[Path]
 ) -> list[tuple[Path, CodeRange]]:
     """Flatten ``graph.graph["dead_suites"]`` into a sorted ``(path, pos)`` list.
 
@@ -284,7 +282,6 @@ def _dead_suite_locations(
     the report doesn't surface dead suites in workspace dependencies
     that the user isn't asking about.
     """
-    bases = [p.path for p in packages]
     raw: dict = graph.graph.get("dead_suites", {})
     out: list[tuple[Path, CodeRange]] = []
     for path, suites in raw.items():
@@ -300,7 +297,7 @@ def _output_json(
     graph: nx.MultiDiGraph,
     unreachable: nx.MultiDiGraph,
     root: Path,
-    packages: tuple[Package, ...],
+    bases: Sequence[Path],
 ) -> None:
     result: dict = {
         "summary": {},
@@ -308,7 +305,7 @@ def _output_json(
         "unreachable_branches": [],
     }
 
-    for base in _ordered_bases(packages):
+    for base in bases:
         base_str = str(base)
         total_counts = _count_nodes(graph, base)
         unreachable_counts = _count_nodes(unreachable, base)
@@ -330,7 +327,7 @@ def _output_json(
             }
         )
 
-    for path, pos in _dead_suite_locations(graph, packages):
+    for path, pos in _dead_suite_locations(graph, bases):
         result["unreachable_branches"].append(
             {
                 "path": str(_rel_path(path, root)),
@@ -457,9 +454,8 @@ def dependencies(
             workers=workers,
         )
         graph = analysis.materialize_all()
-    packages = analysis.packages
 
-    deps_by_base: dict[Path, list[SymbolNode]] = {base: [] for base in _ordered_bases(packages)}
+    deps_by_base: dict[Path, list[SymbolNode]] = {base: [] for base in analysis.bases}
     for node in graph.nodes:
         if not _is_external_dep(node):
             continue
@@ -621,7 +617,6 @@ def remove(
             workers=workers,
         )
         graph = analysis.materialize_all()
-    packages = analysis.packages
     reachable = _find_reachable(graph)
 
     unreachable_graph = graph.subgraph([n for n in graph.nodes if n not in reachable])
@@ -648,7 +643,7 @@ def remove(
         typer.echo("Aborted.")
         return
 
-    for base in _ordered_bases(packages):
+    for base in analysis.bases:
         remove_code(unreachable_graph, base)
 
     typer.echo("Dead code removed.")
