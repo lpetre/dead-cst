@@ -18,6 +18,7 @@ import textwrap
 from pathlib import Path
 
 import pytest
+import typer
 from libcst.metadata import CodePosition, CodeRange
 from typer.testing import CliRunner
 
@@ -29,7 +30,7 @@ from dead_cst.plugins import (
 from dead_cst.plugins._core import EXTERNAL_DIST_PREFIX
 from dead_cst.plugins.explicit_entrypoint import EXPLICIT_PREFIX
 from dead_cst.graph import SymbolNode
-from dead_cst.resolvers import ManualResolver
+from dead_cst.resolvers import ManualResolver, UvResolver
 from dead_cst.cli import (
     _dead_real,
     _is_dunder_all,
@@ -165,8 +166,6 @@ def test_build_resolver_explicit_specs_only():
 
 
 def test_build_resolver_named_resolver_only():
-    from dead_cst.resolvers import UvResolver
-
     resolver = build_resolver([], "uv")
     assert isinstance(resolver, UvResolver)
 
@@ -177,8 +176,6 @@ def test_build_resolver_unknown_resolver_raises():
 
 
 def test_build_resolver_path_and_name_are_mutually_exclusive():
-    import typer
-
     with pytest.raises(typer.BadParameter, match="mutually exclusive"):
         build_resolver(["src"], "uv")
 

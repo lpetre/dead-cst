@@ -16,7 +16,7 @@ resolution.
 Centralizing classification here is what lets the per-file visitor
 cache survive search-path changes: the visitor's :class:`Import`
 records depend only on the source code, and any rebinding of
-``sys.path`` / swapping of resolvers re-stitches edges without
+``sys.path`` / swapping the resolver re-stitches edges without
 re-running the visitor.
 """
 
@@ -134,7 +134,7 @@ def resolve_edges(
     the trie can't place a target -- typical first-party imports stay
     purely trie-driven. The default resolver + empty search paths
     suffice for tests; the analyzer wires its configured resolver
-    chain through here.
+    through here.
     """
     if search_paths is None:
         search_paths = []

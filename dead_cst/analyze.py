@@ -225,7 +225,7 @@ class _Task:
 def _rebind_sys_path(search_paths: tuple[Path, ...], baseline: list[str]) -> None:
     """Set ``sys.path`` to ``search_paths + baseline``, deduplicated.
 
-    Used by :meth:`Analysis._materialize` so the resolver chain in
+    Used by :meth:`Analysis._materialize` so the resolver in
     :func:`_compose_contribution` -> :func:`resolve_edges` sees this
     base's first-party prefix while classifying trie-miss imports.
     """
@@ -713,7 +713,6 @@ class Analysis:
         workers: int | None = None,
     ) -> None:
         self._project_root: Path = project_root
-        self._resolver: PathResolver = resolver
         self._packages: tuple[Package, ...] = _validate_packages(resolver.resolve(project_root))
         self._packages_by_path: dict[Path, Package] = {p.path: p for p in self._packages}
         by_name = {p.name: p.path for p in self._packages}
@@ -889,7 +888,7 @@ class Analysis:
 
         Cross-file import resolution runs here (in
         :func:`_compose_contribution` -> :func:`resolve_edges`), which
-        is where the resolver chain reads ``sys.path`` /
+        is where the resolver reads ``sys.path`` /
         :mod:`importlib.metadata`. We rebind ``sys.path`` to each
         base's ``(base, *deps)`` view before composing it and clear
         the resolver LRUs at every transition, restoring the original
@@ -975,7 +974,7 @@ class Analysis:
 
         Covers only the inputs the visitor + observe pass depend on
         (the base itself, the visitor / plugin / detector versions).
-        ``search_paths`` and the resolver chain do not enter the
+        ``search_paths`` and the resolver do not enter the
         fingerprint -- import resolution moved to
         :func:`resolve_edges`, which runs unconditionally on every
         analysis, so resolver / search-path changes re-stitch edges

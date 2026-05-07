@@ -97,7 +97,7 @@ def compute_fingerprint(
     Python version. Different bases in one analysis live side-by-side
     in one database without invalidating each other.
 
-    ``search_paths`` and the resolver chain are *not* in the
+    ``search_paths`` and the resolver are *not* in the
     fingerprint: cross-file import resolution moved out of the
     visitor and into :func:`dead_cst._edges.resolve_edges` (which
     runs unconditionally on every analysis), so swapping a resolver
