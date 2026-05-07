@@ -14,8 +14,6 @@ from pathlib import Path
 
 import pytest
 
-from dead_cst import Analysis
-from dead_cst.resolvers import ManualResolver
 from dead_cst.cache import (
     CACHE_DIR_NAME,
     GraphCache,
@@ -164,7 +162,7 @@ def test_workers_none_or_one_keeps_serial_path(tmp_path, make_analysis, monkeypa
     assert calls == []
 
 
-def test_multi_base_uses_one_pool(tmp_path, monkeypatch):
+def test_multi_base_uses_one_pool(tmp_path, make_analysis, monkeypatch):
     """Two bases share a single persistent pool, not one per base."""
     base_a = tmp_path / "a"
     base_b = tmp_path / "b"
@@ -195,11 +193,11 @@ def test_multi_base_uses_one_pool(tmp_path, monkeypatch):
         return real(*args, **kwargs)
 
     monkeypatch.setattr(analyze, "ProcessPoolExecutor", _spy)
-    Analysis(tmp_path, resolvers=[ManualResolver(specs=["a", "b"])], workers=2).materialize_all()
+    make_analysis(["a", "b"], workers=2).materialize_all()
     assert len(pool_calls) == 1, f"expected exactly one pool across both bases, got {pool_calls!r}"
 
 
-def test_multi_base_parallel_matches_serial(tmp_path):
+def test_multi_base_parallel_matches_serial(tmp_path, make_analysis):
     """Multi-base parallel runs produce the same graph as the serial path."""
     base_a = tmp_path / "a"
     base_b = tmp_path / "b"
@@ -219,14 +217,13 @@ def test_multi_base_parallel_matches_serial(tmp_path):
             "pkg/q.py": "from .p import p\ndef q(): return p()\n",
         },
     )
-    resolvers = [ManualResolver(specs=["a", "b"])]
-    serial = Analysis(tmp_path, resolvers=resolvers).materialize_all()
-    parallel = Analysis(tmp_path, resolvers=resolvers, workers=2).materialize_all()
+    serial = make_analysis(["a", "b"]).materialize_all()
+    parallel = make_analysis(["a", "b"], workers=2).materialize_all()
     assert _node_set(parallel) == _node_set(serial)
     assert _edge_set(parallel) == _edge_set(serial)
 
 
-def test_tasks_sorted_by_base(tmp_path, monkeypatch):
+def test_tasks_sorted_by_base(tmp_path, make_analysis, monkeypatch):
     """Worker tasks are sorted by ``(base, file)`` so each base's files are contiguous.
 
     The visitor pass no longer touches ``sys.path``, so task order is
@@ -264,7 +261,7 @@ def test_tasks_sorted_by_base(tmp_path, monkeypatch):
         return real_map(self, fn, materialized, *args, **kwargs)
 
     monkeypatch.setattr(analyze.ProcessPoolExecutor, "map", _spy_map)
-    Analysis(tmp_path, resolvers=[ManualResolver(specs=["a", "b"])], workers=2).materialize_all()
+    make_analysis(["a", "b"], workers=2).materialize_all()
 
     assert len(captured) == 1
     bases = captured[0]

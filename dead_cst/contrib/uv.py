@@ -11,13 +11,7 @@ from ..resolvers._imports import default_resolve_import
 
 
 class MissingVenvError(RuntimeError):
-    """Raised by :class:`UvResolver` when the workspace's shared
-    ``.venv`` is missing.
-
-    The user almost certainly forgot ``uv sync --all-packages``, and
-    silently returning an empty path map just defers a much less
-    actionable failure into the plugin pass.
-    """
+    """Raised by :class:`UvResolver` when the workspace's shared ``.venv`` is missing."""
 
 
 @dataclass
@@ -108,10 +102,15 @@ class UvResolver:
 
 
 def _src_root_for(member_dir: Path) -> Path | None:
+    """Pick ``<member_dir>/src`` if it exists, else ``member_dir`` itself.
+
+    ``member_dir`` is already absolute (the caller resolves it before lookup),
+    so no further normalization is needed.
+    """
     if (member_dir / "src").is_dir():
-        return (member_dir / "src").resolve()
+        return member_dir / "src"
     if member_dir.is_dir():
-        return member_dir.resolve()
+        return member_dir
     return None
 
 
@@ -122,15 +121,12 @@ def _find_venv_site_packages(project_root: Path) -> Path | None:
     back to the currently-active interpreter. Returns ``None`` if none
     of those point at a real ``site-packages``.
     """
-    project_root = project_root.resolve()
     candidates: list[Path] = [project_root / ".venv", project_root / "venv"]
     active = _active_venv()
     if active:
         candidates.append(active)
 
     for candidate in candidates:
-        if not candidate.is_dir():
-            continue
         for sp in _site_packages_for(candidate):
             return sp
     return None

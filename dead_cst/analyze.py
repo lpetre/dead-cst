@@ -738,7 +738,7 @@ class Analysis:
     again during edge stitching to classify trie-miss imports via
     :meth:`PathResolver.resolve_import`. Once constructed, an
     :class:`Analysis` is effectively read-only -- spin up a fresh
-    instance to pick up new search paths or new plugins.
+    instance to pick up new resolvers or new plugins.
     """
 
     def __init__(
@@ -753,10 +753,7 @@ class Analysis:
     ) -> None:
         self._project_root: Path = project_root
         self._resolvers: tuple[PathResolver, ...] = tuple(resolvers)
-        self._paths: dict[Path, list[Path]] = {
-            b: list(deps)
-            for b, deps in merge_paths(*[r.resolve(project_root) for r in self._resolvers]).items()
-        }
+        self._paths: PathMap = merge_paths(*[r.resolve(project_root) for r in self._resolvers])
         self._plugins: tuple[EdgePlugin, ...] = tuple(plugins)
         self._cache = cache
         self._workers = workers

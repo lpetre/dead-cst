@@ -8,9 +8,7 @@ the fixture so individual cases only list the edges they introduce.
 
 import pytest
 
-from dead_cst import Analysis
 from dead_cst.plugins._core import EXTERNAL_PREFIXES
-from dead_cst.resolvers import ManualResolver
 
 IMPORT_TEST_FILES = {
     "p/__init__.py": "",
@@ -534,7 +532,7 @@ def test_third_party_import_creates_synthetic_node(build_decl_graph):
     assert {"p.uses_nx.nx", "p.uses_nx.build"} <= edge_srcs
 
 
-def test_cross_dep_submodule_import(tmp_path, assert_edges):
+def test_cross_dep_submodule_import(tmp_path, make_analysis, assert_edges):
     """Importing a submodule from a dep base resolves through the dep's exported trie.
 
     Layout:
@@ -558,9 +556,7 @@ def test_cross_dep_submodule_import(tmp_path, assert_edges):
     (pkg_a / "A" / "sub.py").write_text("def f(): ...\n")
     (pkg_b / "B" / "__init__.py").write_text("from A import sub\nsub.f()\n")
 
-    graph = Analysis(
-        tmp_path, resolvers=[ManualResolver(specs=["pkg_b:pkg_a", "pkg_a"])]
-    ).materialize_all()
+    graph = make_analysis(["pkg_b:pkg_a", "pkg_a"]).materialize_all()
     assert_edges(
         graph,
         {

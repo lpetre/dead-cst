@@ -21,10 +21,8 @@ from pathlib import Path
 
 import pytest
 
-from dead_cst import Analysis
 from dead_cst.cache import CACHE_DIR_NAME, GraphCache
 from dead_cst.plugins import ExplicitEntrypointPlugin
-from dead_cst.resolvers import ManualResolver
 
 
 def _write(root: Path, files: dict[str, str]) -> None:
@@ -78,13 +76,13 @@ def test_refresh_rejects_unknown_base(tmp_path, make_analysis):
 # ---------------------------------------------------------------------------
 
 
-def test_package_modules_local_only(tmp_path):
+def test_package_modules_local_only(tmp_path, make_analysis):
     """:meth:`PackageView.modules` returns this base's modules only."""
     base_a = tmp_path / "a"
     base_b = tmp_path / "b"
     _write(base_a, {"pkg/__init__.py": "", "pkg/m.py": "def f(): pass\n"})
     _write(base_b, {"pkg/__init__.py": "", "pkg/m.py": "def g(): pass\n"})
-    a = Analysis(tmp_path, resolvers=[ManualResolver(specs=["a", "b"])])
+    a = make_analysis(["a", "b"])
     pkg_a = a.package(base_a)
     a_paths = {n.path for n in pkg_a.modules()}
     assert a_paths == {(base_a / "pkg" / "__init__.py"), (base_a / "pkg" / "m.py")}
@@ -106,14 +104,14 @@ def test_package_declarations_filter_by_simple_name(tmp_path, make_analysis):
     assert {n.type for n in foos} == {"function", "class"}
 
 
-def test_local_query_doesnt_materialize_full_graph(tmp_path):
+def test_local_query_doesnt_materialize_full_graph(tmp_path, make_analysis):
     """``pkg.modules()`` populates only this base's contribution; full graph
     is still un-materialized."""
     base_a = tmp_path / "a"
     base_b = tmp_path / "b"
     _write(base_a, {"pkg/__init__.py": "", "pkg/m.py": "def f(): pass\n"})
     _write(base_b, {"pkg/__init__.py": "", "pkg/m.py": "def g(): pass\n"})
-    a = Analysis(tmp_path, resolvers=[ManualResolver(specs=["a", "b"])])
+    a = make_analysis(["a", "b"])
     list(a.package(base_a).modules())
     assert base_a in a._contributions
     assert base_b not in a._contributions
@@ -125,23 +123,20 @@ def test_local_query_doesnt_materialize_full_graph(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_reverse_closure_includes_self_and_consumers(tmp_path):
+def test_reverse_closure_includes_self_and_consumers(tmp_path, make_analysis):
     """``app -> core -> lib``: lib's reverse closure is {lib, core, app}."""
     lib = tmp_path / "lib"
     core = tmp_path / "core"
     app = tmp_path / "app"
     for d in (lib, core, app):
         d.mkdir()
-    a = Analysis(
-        tmp_path,
-        resolvers=[ManualResolver(specs=["lib", "core:lib", "app:core"])],
-    )
+    a = make_analysis(["lib", "core:lib", "app:core"])
     assert a.reverse_closure(lib) == frozenset({lib, core, app})
     assert a.reverse_closure(core) == frozenset({core, app})
     assert a.reverse_closure(app) == frozenset({app})
 
 
-def test_package_dead_uses_closure_only(tmp_path):
+def test_package_dead_uses_closure_only(tmp_path, make_analysis):
     """A pkg.dead() materialization only refreshes the interesting set,
     not unrelated sibling bases.
 
@@ -160,9 +155,8 @@ def test_package_dead_uses_closure_only(tmp_path):
         },
     )
     _write(other, {"pkg/__init__.py": "", "pkg/m.py": "def x(): pass\n"})
-    a = Analysis(
-        tmp_path,
-        resolvers=[ManualResolver(specs=["core", "app:core", "other"])],
+    a = make_analysis(
+        ["core", "app:core", "other"],
         plugins=[ExplicitEntrypointPlugin(specs=["pkg.main"])],
     )
     list(a.package(core).dead())
@@ -174,7 +168,7 @@ def test_package_dead_uses_closure_only(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_package_dead_matches_full_dead_slice(tmp_path):
+def test_package_dead_matches_full_dead_slice(tmp_path, make_analysis):
     """For each base, ``pkg.dead()`` equals ``analysis.dead()`` filtered
     to that base."""
     core = tmp_path / "core"
@@ -187,18 +181,10 @@ def test_package_dead_matches_full_dead_slice(tmp_path):
             "pkg/main.py": "from pkg.m import used\nused()\n",
         },
     )
-    resolvers = [ManualResolver(specs=["core", "app:core"])]
-    a_full = Analysis(
-        tmp_path,
-        resolvers=resolvers,
-        plugins=[ExplicitEntrypointPlugin(specs=["pkg.main"])],
-    )
+    plugins = [ExplicitEntrypointPlugin(specs=["pkg.main"])]
+    a_full = make_analysis(["core", "app:core"], plugins=plugins)
     full_dead_in_core = {n.fqname for n in a_full.dead() if n.path.is_relative_to(core)}
-    a_pkg = Analysis(
-        tmp_path,
-        resolvers=resolvers,
-        plugins=[ExplicitEntrypointPlugin(specs=["pkg.main"])],
-    )
+    a_pkg = make_analysis(["core", "app:core"], plugins=plugins)
     pkg_dead = {n.fqname for n in a_pkg.package(core).dead()}
     assert pkg_dead == full_dead_in_core
 
@@ -209,7 +195,7 @@ def test_package_dead_matches_full_dead_slice(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_dep_changes_do_not_invalidate_visitor_cache(tmp_path, monkeypatch):
+def test_dep_changes_do_not_invalidate_visitor_cache(tmp_path, make_analysis, monkeypatch):
     """Changing a base's deps re-stitches edges but does not re-run the visitor.
 
     ``search_paths`` left the per-file fingerprint when import
@@ -226,11 +212,7 @@ def test_dep_changes_do_not_invalidate_visitor_cache(tmp_path, monkeypatch):
 
     db = tmp_path / CACHE_DIR_NAME / "cache.db"
     with GraphCache(db) as cache:
-        Analysis(
-            tmp_path,
-            resolvers=[ManualResolver(specs=["a", "b"])],
-            cache=cache,
-        ).materialize_all()
+        make_analysis(["a", "b"], cache=cache).materialize_all()
 
     from dead_cst import analyze
 
@@ -243,9 +225,5 @@ def test_dep_changes_do_not_invalidate_visitor_cache(tmp_path, monkeypatch):
 
     monkeypatch.setattr(analyze, "SymbolVisitor", _spy)
     with GraphCache(db) as cache:
-        Analysis(
-            tmp_path,
-            resolvers=[ManualResolver(specs=["a:extra", "b"])],
-            cache=cache,
-        ).materialize_all()
+        make_analysis(["a:extra", "b"], cache=cache).materialize_all()
     assert visited == []

@@ -10,10 +10,8 @@ from typing import Iterable
 import libcst as cst
 import networkx as nx
 
-from dead_cst import Analysis
 from dead_cst.graph import SymbolTrie
 from dead_cst.plugins import GraphOp, ObserveContext, PluginContext
-from dead_cst.resolvers import ManualResolver
 
 
 def _ctx(tmp_path):
@@ -45,7 +43,7 @@ def test_parse_handles_syntax_error(tmp_path):
     assert ctx.parse(p) is None
 
 
-def test_base_modules_only_yields_under_base(tmp_path, write_files):
+def test_base_modules_only_yields_under_base(tmp_path, make_analysis, write_files):
     """``ctx.base_modules()`` filters to the current base, not the full graph."""
     write_files(
         {
@@ -69,11 +67,7 @@ def test_base_modules_only_yields_under_base(tmp_path, write_files):
             seen_per_base[ctx.base] = {p.name for p, _ in ctx.base_modules()}
             return ()
 
-    Analysis(
-        tmp_path,
-        resolvers=[ManualResolver(specs=["a", "b"])],
-        plugins=[_Capture()],
-    ).materialize_all()
+    make_analysis(["a", "b"], plugins=[_Capture()]).materialize_all()
     # Each base only sees its own files, even though the full graph
     # contains both bases' nodes by the time the second base runs.
     assert seen_per_base[tmp_path / "a"] == {"__init__.py", "m.py"}
