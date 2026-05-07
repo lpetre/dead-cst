@@ -35,11 +35,9 @@ from .resolvers import (
     ImportResolver,
     Package,
     PathResolver,
+    clear_path_caches,
     default_resolve_import,
-    distribution_lookup,
-    editable_distribution_roots,
     merge_packages,
-    safe_resolve_module,
 )
 
 logger = logging.getLogger(__name__)
@@ -270,21 +268,6 @@ def _rebind_sys_path(search_paths: tuple[Path, ...], baseline: list[str]) -> Non
             new_path.append(s)
             seen.add(s)
     sys.path[:] = new_path
-
-
-def _clear_resolver_caches() -> None:
-    """Drop the ``sys.path``-derived resolver caches.
-
-    :func:`safe_resolve_module` keys on fullname and
-    :func:`distribution_lookup` / :func:`editable_distribution_roots`
-    key on ``()`` -- all three read live ``sys.path`` (or
-    :mod:`importlib.metadata` against it) and would otherwise return
-    stale results across bases (different first-party prefix;
-    uv-workspace members shipping their own ``.venv``).
-    """
-    safe_resolve_module.cache_clear()
-    distribution_lookup.cache_clear()
-    editable_distribution_roots.cache_clear()
 
 
 def _process_task(
@@ -526,22 +509,21 @@ class _BaseContribution:
 
 
 def _build_contribution(
-    base: Path,
+    package: Package,
     spec: _BaseSpec,
     miss_payloads: Mapping[Path, VisitorPayload],
-    exported: tuple[Path, ...],
 ) -> _BaseContribution:
     """Apply ``spec``'s per-file payloads into a base-local graph slice.
 
     The base-local ``nx.MultiDiGraph`` is what makes scope-bounded
     materialization cheap: composing it into the full graph or a
-    closure graph doesn't redo per-file apply work. ``exported`` is
-    the package's :attr:`~dead_cst.resolvers.Package.exported` tuple;
-    empty means "no restriction" (every file in the base is exported
-    to consumers).
+    closure graph doesn't redo per-file apply work. Empty
+    :attr:`Package.exported` means "no restriction" (every file in
+    the base is exported to consumers).
     """
     current_trie = SymbolTrie()
     export_trie = SymbolTrie()
+    exported = package.exported
     import_edges: set[tuple[SymbolNode, Import, EdgeFlags]] = set()
     base_graph: nx.MultiDiGraph = nx.MultiDiGraph()
     base_graph.graph["dead_suites"] = {}
@@ -560,7 +542,7 @@ def _build_contribution(
         )
     current_trie.add_module_hierarchy_edges(base_graph)
     return _BaseContribution(
-        base=base,
+        base=package.path,
         current_trie=current_trie,
         export_trie=export_trie,
         base_graph=base_graph,
@@ -764,7 +746,10 @@ class Analysis:
             *[r.resolve(project_root) for r in self._resolvers]
         )
         self._packages_by_path: dict[Path, Package] = {p.path: p for p in self._packages}
-        self._packages_by_name: dict[str, Package] = {p.name: p for p in self._packages}
+        by_name = {p.name: p.path for p in self._packages}
+        self._dep_paths_by_base: dict[Path, tuple[Path, ...]] = {
+            p.path: tuple(by_name[d] for d in p.deps) for p in self._packages
+        }
         self._plugins: tuple[EdgePlugin, ...] = tuple(plugins)
         self._cache = cache
         self._workers = workers
@@ -790,12 +775,9 @@ class Analysis:
     def project_root(self) -> Path:
         return self._project_root
 
-    def _dep_paths(self, base: Path) -> list[Path]:
-        """Resolved dep paths for the package at ``base`` (by-name lookup)."""
-        pkg = self._packages_by_path.get(base)
-        if pkg is None:
-            return []
-        return [self._packages_by_name[d].path for d in pkg.deps if d in self._packages_by_name]
+    def _dep_paths(self, base: Path) -> tuple[Path, ...]:
+        """Precomputed dep paths for the package at ``base``."""
+        return self._dep_paths_by_base.get(base, ())
 
     def _dep_dag(self) -> nx.DiGraph:
         """``dep -> consumer`` DAG over the packages' paths; reused by
@@ -875,10 +857,9 @@ class Analysis:
         )
         for b in new_targets:
             self._contributions[b] = _build_contribution(
-                b,
+                self._packages_by_path[b],
                 self._base_specs[b],
                 miss_payloads[b],
-                self._packages_by_path[b].exported,
             )
         return self
 
@@ -956,7 +937,7 @@ class Analysis:
                 search_paths = (base, *self._dep_paths(base))
                 if last_search_paths != search_paths:
                     _rebind_sys_path(search_paths, baseline)
-                    _clear_resolver_caches()
+                    clear_path_caches()
                     last_search_paths = search_paths
                 _compose_contribution(
                     self._contributions[base],

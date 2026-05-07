@@ -125,47 +125,44 @@ def merge_packages(*lists: Sequence[Package]) -> tuple[Package, ...]:
       package's ``path``.
     """
     by_path: dict[Path, Package] = {}
-    insertion_order: list[Path] = []
+    name_to_path: dict[str, Path] = {}
     for lst in lists:
         for pkg in lst:
-            path = pkg.path.resolve()
-            exported = tuple(e.resolve() for e in pkg.exported)
+            path = _absolute(pkg.path)
+            exported = tuple(_absolute(e) for e in pkg.exported)
             existing = by_path.get(path)
             if existing is None:
+                claimed = name_to_path.get(pkg.name)
+                if claimed is not None and claimed != path:
+                    raise ValueError(
+                        f"Duplicate package name {pkg.name!r}: both {claimed} and {path} claim it"
+                    )
+                name_to_path[pkg.name] = path
                 by_path[path] = Package(path=path, name=pkg.name, exported=exported, deps=pkg.deps)
-                insertion_order.append(path)
             else:
-                merged_deps = tuple(dict.fromkeys((*existing.deps, *pkg.deps)))
-                merged_exported = tuple(dict.fromkeys((*existing.exported, *exported)))
                 by_path[path] = Package(
                     path=path,
                     name=existing.name,
-                    exported=merged_exported,
-                    deps=merged_deps,
+                    exported=tuple(dict.fromkeys((*existing.exported, *exported))),
+                    deps=tuple(dict.fromkeys((*existing.deps, *pkg.deps))),
                 )
-    out = tuple(by_path[p] for p in insertion_order)
-    _validate(out)
-    return out
 
-
-def _validate(packages: tuple[Package, ...]) -> None:
-    """Raise :class:`ValueError` on name collisions, unknown deps, or
-    out-of-tree ``exported`` entries.
-    """
-    seen: dict[str, Path] = {}
-    for pkg in packages:
-        prev = seen.get(pkg.name)
-        if prev is not None and prev != pkg.path:
-            raise ValueError(
-                f"Duplicate package name {pkg.name!r}: both {prev} and {pkg.path} claim it"
-            )
-        seen[pkg.name] = pkg.path
-
-    names = set(seen)
-    for pkg in packages:
+    for pkg in by_path.values():
         for d in pkg.deps:
-            if d not in names:
+            if d not in name_to_path:
                 raise ValueError(f"Package {pkg.name!r} references unknown dep {d!r}")
         for e in pkg.exported:
             if e != pkg.path and not e.is_relative_to(pkg.path):
                 raise ValueError(f"Package {pkg.name!r}: exported path {e} is not under {pkg.path}")
+    return tuple(by_path.values())
+
+
+def _absolute(path: Path) -> Path:
+    """Resolve ``path`` only when not already absolute.
+
+    Resolvers shipped with the analyzer call ``Path.resolve()`` before
+    constructing :class:`Package`, so this short-circuits the duplicate
+    ``lstat`` for the common case while keeping the safety net for
+    third-party resolvers that hand in relative paths.
+    """
+    return path if path.is_absolute() else path.resolve()

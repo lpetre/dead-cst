@@ -8,12 +8,7 @@ from pathlib import Path
 
 from ..resolvers._core import Package, load_toml
 from ..resolvers._exports import exported_roots
-from ..resolvers._imports import (
-    default_resolve_import,
-    distribution_lookup,
-    editable_distribution_roots,
-    safe_resolve_module,
-)
+from ..resolvers._imports import clear_path_caches, default_resolve_import
 
 
 class MissingVenvError(RuntimeError):
@@ -91,8 +86,6 @@ class UvResolver:
             member_dirs[name] = member_dir
             member_deps[name] = [d["name"] for d in pkg.get("dependencies", [])]
 
-        # Index resolvable src roots per member so deps can map back to
-        # the same Package.path the consumer was assigned.
         src_roots: dict[str, Path] = {}
         for name, member_dir in member_dirs.items():
             src_root = _src_root_for(member_dir)
@@ -101,13 +94,10 @@ class UvResolver:
 
         out: list[Package] = []
         for name, src_root in src_roots.items():
-            dep_names: list[str] = []
-            for dep_name in member_deps[name]:
-                # Workspace deps only -- regular PyPI deps don't have a
-                # member src root and are reached through the venv at
-                # resolve_import time.
-                if dep_name in src_roots:
-                    dep_names.append(dep_name)
+            # Workspace deps only -- regular PyPI deps don't have a
+            # member src root and are reached through the venv at
+            # resolve_import time.
+            dep_names = [d for d in member_deps[name] if d in src_roots]
             exported = tuple(exported_roots(member_dirs[name]) or ())
             out.append(
                 Package(
@@ -133,9 +123,7 @@ class UvResolver:
                 # caches; clear so the next lookup observes the venv.
                 # Subsequent calls within the same base see the venv
                 # already on sys.path and skip the clear.
-                safe_resolve_module.cache_clear()
-                distribution_lookup.cache_clear()
-                editable_distribution_roots.cache_clear()
+                clear_path_caches()
         return default_resolve_import(name, search_paths)
 
 

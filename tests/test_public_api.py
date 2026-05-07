@@ -130,6 +130,7 @@ EXPECTED_PUBLIC_API: dict[str, list[str]] = {
         "SITE_PACKAGES_MARKERS",
         "STDLIB",
         "UvResolver",
+        "clear_path_caches",
         "default_resolve_import",
         "distribution_lookup",
         "editable_distribution_roots",
