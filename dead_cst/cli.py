@@ -108,8 +108,8 @@ def _maybe_cache(
 ) -> Iterator[GraphCache | None]:
     """Yield a per-run :class:`GraphCache`, or ``None`` when ``--no-cache`` is set.
 
-    Per-tree fingerprints (computed inside :class:`Analysis`) gate
-    individual cache rows, so this just opens the database. A
+    Per-(package, phase) fingerprints (computed inside :class:`Analysis`)
+    gate individual cache rows, so this just opens the database. A
     schema-version mismatch on open wipes ``file_cache`` automatically.
     """
     if no_cache:
