@@ -92,9 +92,9 @@ two versions.
   explicitly if you want their files visited.
 - `PluginContext`, `ObserveContext`, and the `AddNode` / `AddEdge` /
   `RemoveEdge` graph-op value objects now use `__slots__`, as do the
-  analyzer-internal `_BaseSpec` / `_Task` / `_RunnerState` records,
-  shaving a per-instance `__dict__` off objects allocated per file
-  and per emitted op.
+  analyzer-internal `_BaseSpec` / `_Task` records, shaving a
+  per-instance `__dict__` off objects allocated per file and per
+  emitted op.
 
 ### Removed
 - **Breaking (top-level API):** `build_symbol_graph`, `find_reachable`,

@@ -32,9 +32,13 @@ graph-stitching work.
 Per-base fingerprinting is what makes scoped refresh tractable:
 :meth:`dead_cst.analyze.Analysis.refresh` can rebuild one base
 without invalidating sibling bases' cached payloads, because each
-file's row is gated by its base's own ``(base, search_paths,
-plugins, resolvers, detector)`` fingerprint rather than a single
-project-wide one.
+file's row is gated by its base's own ``(base, plugins, detector)``
+fingerprint rather than a single project-wide one. Resolvers and
+search paths deliberately do *not* enter the fingerprint --
+cross-file import resolution moved out of the visitor and runs
+unconditionally on every analysis, so swapping a resolver or
+rebinding ``sys.path`` re-stitches edges without invalidating any
+cached payloads.
 
 Plugins are intentionally part of the per-base fingerprint (their
 ``observe`` output is folded into the cached payload) but the

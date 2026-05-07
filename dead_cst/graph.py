@@ -116,8 +116,10 @@ class VisitorPayload:
       ``dead_suites`` to decide whether the resulting graph edge gets
       :data:`EdgeFlags.DEAD_BRANCH`.
     * ``imports`` -- ``(src, Import, access_pos)`` triples for
-      unresolved cross-file references. The apply step feeds them into
-      ``resolve_edges`` along with the derived flag.
+      cross-file references. Each :class:`Import` carries only the
+      raw dotted names from source; classification + canonicalization
+      happen in :func:`dead_cst._edges.resolve_edges`, which the
+      apply step feeds along with the derived flag.
     * ``dead_suites`` -- positions of every statically-dead suite in
       the file (including ones with no outgoing references). Used both
       for flag derivation and for surfacing "this file has unreachable
