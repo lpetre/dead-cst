@@ -37,8 +37,12 @@ from ._core import (
     ObserveContext,
     PluginContext,
     collect_module_imports,
+    decls_by_simple_name,
+    find_call_assignments,
+    find_handlers,
     make_payload,
     matched_attr_call,
+    module_node,
     simple_name,
     single_target_assignment,
     synthetic_node,
@@ -94,10 +98,10 @@ class DecoratedDeclPlugin:
         """
         if not self.package_prefix:
             return True
-        module_node = next((n for n in ctx.payload.nodes if n.type == "module"), None)
-        if module_node is None:
+        module = module_node(ctx.payload)
+        if module is None:
             return False
-        fqname = module_node.fqname
+        fqname = module.fqname
         return fqname == self.package_prefix or fqname.startswith(self.package_prefix + ".")
 
     def observe(self, ctx: ObserveContext) -> "VisitorPayload | None":
@@ -193,8 +197,8 @@ class LiteralListPlugin:
     def observe(self, ctx: ObserveContext) -> "VisitorPayload | None":
         if not self.owner_fqname or not self.variable_name:
             return None
-        module_node = next((n for n in ctx.payload.nodes if n.type == "module"), None)
-        if module_node is None or module_node.fqname != self.owner_fqname:
+        module = module_node(ctx.payload)
+        if module is None or module.fqname != self.owner_fqname:
             return None
         captured = _read_string_list_with_positions(ctx.module, self.variable_name)
         if not captured:
@@ -239,6 +243,62 @@ class LiteralListPlugin:
         if surface:
             return surface
         return list(ctx.find_declarations(fqname))
+
+
+@dataclass(kw_only=True)
+class DispatchAppPlugin:
+    """Wire ``@<instance>.<reg_decorator>(...)`` handlers to their app instance.
+
+    Generic shape behind :class:`~dead_cst.contrib.TyperPlugin` and
+    :class:`~dead_cst.contrib.CycloptsPlugin`: find top-level
+    ``X = <Ctor>(...)`` assignments where ``Ctor`` is one of
+    ``constructor_targets`` imported from ``app_module``, then for every
+    top-level function decorated ``@X.<name>(...)`` where ``name`` is in
+    ``registration_decorators`` emit an edge ``X -> handler``.
+
+    Pure observe: instance detection and decorator scanning are
+    file-local CST passes; the corresponding ``SymbolNode`` decls are
+    looked up in this file's :class:`VisitorPayload`. App instances
+    are not auto-marked as entrypoints; reachability flows through
+    ``[project.scripts]`` or a ``__main__`` block.
+
+    Abstract base: subclasses must set ``name`` and ``version``. The
+    cache fingerprint is ``(name, version)``, so every concrete plugin
+    needs its own ``name``.
+    """
+
+    name: str
+    version: int
+    app_module: str = ""
+    constructor_targets: frozenset[str] = frozenset()
+    registration_decorators: frozenset[str] = frozenset()
+
+    def observe(self, ctx: ObserveContext) -> "VisitorPayload | None":
+        if not (self.app_module and self.constructor_targets and self.registration_decorators):
+            return None
+        imports = collect_module_imports(ctx.module, self.app_module, self.constructor_targets)
+        if not imports:
+            return None
+        instances = set(find_call_assignments(ctx.module, imports, self.constructor_targets))
+        if not instances:
+            return None
+        handlers = find_handlers(ctx.module, instances, self.registration_decorators)
+        if not handlers:
+            return None
+
+        decls_by_name = decls_by_simple_name(ctx.payload.nodes)
+        edges: list[tuple[SymbolNode, SymbolNode, CodeRange]] = []
+        for var_name, handler_names in handlers.items():
+            for instance_decl in decls_by_name.get(var_name, []):
+                for handler_name in handler_names:
+                    for handler_decl in decls_by_name.get(handler_name, []):
+                        edges.append((instance_decl, handler_decl, SYNTHETIC_POSITION))
+        if not edges:
+            return None
+        return make_payload(edges=edges)
+
+    def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]:
+        return ()
 
 
 def _read_string_list_with_positions(

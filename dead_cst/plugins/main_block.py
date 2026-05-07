@@ -14,8 +14,10 @@ from ._core import (
     GraphOp,
     ObserveContext,
     PluginContext,
-    make_payload,
     is_name,
+    make_payload,
+    module_node,
+    string_value,
     synthetic_node,
 )
 
@@ -59,8 +61,8 @@ class MainBlockPlugin:
             PositionProvider
         )[main_block]
 
-        module_node = next((n for n in ctx.payload.nodes if n.type == "module"), None)
-        if module_node is None:
+        module = module_node(ctx.payload)
+        if module is None:
             return None
 
         block_decls = [
@@ -71,11 +73,11 @@ class MainBlockPlugin:
         ]
 
         synth = synthetic_node(
-            f"{MAIN_BLOCK_PREFIX}{module_node.fqname}",
+            f"{MAIN_BLOCK_PREFIX}{module.fqname}",
             ctx.path,
             flags=NodeFlags.ENTRYPOINT,
         )
-        edges = [(synth, module_node, SYNTHETIC_POSITION)]
+        edges = [(synth, module, SYNTHETIC_POSITION)]
         edges.extend((synth, d, SYNTHETIC_POSITION) for d in block_decls)
         return make_payload(nodes=[synth], edges=edges)
 
@@ -113,11 +115,4 @@ def _is_name_eq_main(expr: cst.BaseExpression) -> bool:
 
 
 def _is_string(expr: cst.BaseExpression, value: str) -> bool:
-    if isinstance(expr, cst.SimpleString):
-        return expr.evaluated_value == value
-    if isinstance(expr, cst.ConcatenatedString):
-        try:
-            return expr.evaluated_value == value
-        except Exception:
-            return False
-    return False
+    return string_value(expr) == value

@@ -87,14 +87,14 @@ def evaluate_truthiness(
 
     if isinstance(node, cst.Integer):
         try:
-            return int(node.value, 0) != 0
+            return node.evaluated_value != 0
         except ValueError:
             return None
 
     if isinstance(node, (cst.SimpleString, cst.ConcatenatedString)):
         try:
             value = node.evaluated_value
-        except Exception:
+        except (SyntaxError, UnicodeDecodeError):
             return None
         if value is None:
             return None
@@ -369,21 +369,21 @@ def _unreachable_in_if(
     known to fire; everything from this point on is then unreachable.
     """
     dead: list[cst.BaseSuite] = []
-    truth = None if branch_taken else evaluate_truthiness(node.test, resolve_expr)
+    current: cst.If | None = node
+    while current is not None:
+        truth = None if branch_taken else evaluate_truthiness(current.test, resolve_expr)
+        if branch_taken or truth is False:
+            dead.append(current.body)
+        branch_taken = branch_taken or truth is True
 
-    if branch_taken or truth is False:
-        dead.append(node.body)
-
-    next_taken = branch_taken or truth is True
-
-    orelse = node.orelse
-    if orelse is None:
-        return dead
-    if isinstance(orelse, cst.Else):
-        if next_taken:
-            dead.append(orelse.body)
-        return dead
-    dead.extend(_unreachable_in_if(orelse, next_taken, resolve_expr))
+        orelse = current.orelse
+        if orelse is None:
+            return dead
+        if isinstance(orelse, cst.Else):
+            if branch_taken:
+                dead.append(orelse.body)
+            return dead
+        current = orelse
     return dead
 
 

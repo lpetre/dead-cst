@@ -403,12 +403,19 @@ def _apply_payload(
     """
     module = next(n for n in payload.nodes if n.type == "module")
 
-    def flag_for(pos: CodeRange) -> EdgeFlags:
-        return (
-            EdgeFlags.DEAD_BRANCH
-            if any(_contains(s, pos) for s in payload.dead_suites)
-            else EdgeFlags.NONE
-        )
+    dead_suites = payload.dead_suites
+    if dead_suites:
+
+        def flag_for(pos: CodeRange) -> EdgeFlags:
+            return (
+                EdgeFlags.DEAD_BRANCH
+                if any(_contains(s, pos) for s in dead_suites)
+                else EdgeFlags.NONE
+            )
+    else:
+
+        def flag_for(pos: CodeRange) -> EdgeFlags:
+            return EdgeFlags.NONE
 
     for n in payload.nodes:
         symbol_graph.add_node(n)
@@ -526,14 +533,16 @@ def _compose_contribution(
         nodes=contrib.base_graph.nodes(data=True),
     )
     target_graph.graph.setdefault("dead_suites", {}).update(contrib.base_graph.graph["dead_suites"])
-    for src, dst, flags in resolve_edges(
-        contrib.import_edges,
-        symbol_lookup,
-        contrib.base,
-        import_resolver=import_resolver,
-        search_paths=search_paths,
-    ):
-        target_graph.add_edge(src, dst, flags=flags)
+    target_graph.add_edges_from(
+        (src, dst, {"flags": flags})
+        for src, dst, flags in resolve_edges(
+            contrib.import_edges,
+            symbol_lookup,
+            contrib.base,
+            import_resolver=import_resolver,
+            search_paths=search_paths,
+        )
+    )
     if plugins:
         ctx = PluginContext(
             graph=target_graph,

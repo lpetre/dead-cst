@@ -83,8 +83,11 @@ from ..plugins._core import (
     PluginContext,
     _asname_value,
     decls_by_simple_name,
+    dotted_name,
     is_name,
     make_payload,
+    module_node,
+    string_value,
     synthetic_node,
 )
 
@@ -117,8 +120,8 @@ class MockPatchPlugin:
         # ``_PatchCallFinder`` treat all ``<X>.patch(...)`` matches
         # uniformly.
         mock_module_aliases.add(_MOCKER_NAME)
-        module_node = next((n for n in ctx.payload.nodes if n.type == "module"), None)
-        if module_node is None:
+        module = module_node(ctx.payload)
+        if module is None:
             return None
         decls_by_name = decls_by_simple_name(ctx.payload.nodes)
         finder = _PatchCallFinder(patch_aliases, mock_module_aliases)
@@ -132,7 +135,7 @@ class MockPatchPlugin:
             else:
                 owners = []
             if not owners:
-                owners = [module_node]
+                owners = [module]
 
             for fqname in finder.find(stmt):
                 synth = synthetic_node(f"{PATCH_TARGET_PREFIX}{fqname}", ctx.path)
@@ -205,7 +208,7 @@ def _collect_mock_imports(module: cst.Module) -> tuple[set[str], set[str]]:
                             module_aliases.add(_asname_value(alias) or "mock")
             elif isinstance(small, cst.Import):
                 for alias in small.names:
-                    name = _dotted_name(alias.name)
+                    name = dotted_name(alias.name)
                     if name not in _MOCK_MODULES:
                         continue
                     asname = _asname_value(alias)
@@ -219,20 +222,7 @@ def _collect_mock_imports(module: cst.Module) -> tuple[set[str], set[str]]:
 def _import_from_source(node: cst.ImportFrom) -> str | None:
     if node.relative:
         return None
-    return _dotted_name(node.module)
-
-
-def _dotted_name(node: cst.CSTNode | None) -> str | None:
-    """Return the dotted text of a ``Name`` / ``Attribute`` chain, else ``None``."""
-    parts: list[str] = []
-    current = node
-    while isinstance(current, cst.Attribute):
-        parts.append(current.attr.value)
-        current = current.value
-    if not isinstance(current, cst.Name):
-        return None
-    parts.append(current.value)
-    return ".".join(reversed(parts))
+    return dotted_name(node.module)
 
 
 class _PatchCallFinder(cst.CSTVisitor):
@@ -276,7 +266,7 @@ class _PatchCallFinder(cst.CSTVisitor):
         if isinstance(func.value, cst.Name):
             return func.value.value in self._mock_module_aliases
         if isinstance(func.value, cst.Attribute):
-            return _dotted_name(func.value) in _MOCK_MODULES
+            return dotted_name(func.value) in _MOCK_MODULES
         return False
 
 
@@ -286,7 +276,7 @@ def _first_string_arg(call: cst.Call) -> str | None:
     first = call.args[0]
     if first.keyword is not None:
         return None
-    return _string_value(first.value)
+    return string_value(first.value)
 
 
 # Methods of pytest's ``monkeypatch`` fixture whose first arg can be a
@@ -317,14 +307,4 @@ def _monkeypatch_target(call: cst.Call) -> str | None:
     positional = [a for a in call.args if a.keyword is None]
     if len(positional) != expected_positional:
         return None
-    return _string_value(positional[0].value)
-
-
-def _string_value(expr: cst.BaseExpression) -> str | None:
-    if not isinstance(expr, (cst.SimpleString, cst.ConcatenatedString)):
-        return None
-    try:
-        value = expr.evaluated_value
-    except Exception:
-        return None
-    return value if isinstance(value, str) else None
+    return string_value(positional[0].value)

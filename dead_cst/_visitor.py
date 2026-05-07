@@ -206,7 +206,7 @@ class SymbolVisitor(cst.CSTVisitor):
                 return None
             try:
                 evaluated = inner.evaluated_value
-            except Exception:
+            except (SyntaxError, UnicodeDecodeError):
                 return None
             if not isinstance(evaluated, str):
                 return None
@@ -563,7 +563,7 @@ class SymbolVisitor(cst.CSTVisitor):
             return None
         try:
             value = arg.evaluated_value
-        except Exception:
+        except (SyntaxError, UnicodeDecodeError):
             return None
         return value if isinstance(value, str) else None
 
@@ -713,12 +713,31 @@ class SymbolVisitor(cst.CSTVisitor):
         # ScopeProvider's metadata is typed loosely upstream; the values are
         # always ``Scope`` instances.
         scopes = cast("set[Scope]", set(self.metadata[ScopeProvider].values()))
+        walrus_leaks = self.walrus_leak_targets
         for scope in scopes:
             for access in scope.accesses:
                 # ``Assignment`` and ``BuiltinAssignment`` are the only
                 # ``BaseAssignment`` subclasses; selecting ``Assignment``
                 # excludes builtins and gives us a typed ``.node``.
                 referents = [r for r in access.referents if isinstance(r, Assignment)]
+                if not referents:
+                    # Walrus bindings that leaked from a comprehension
+                    # don't appear in the enclosing scope's assignment
+                    # list (libcst's ``ScopeProvider`` keeps them in the
+                    # ``ComprehensionScope``), so any access to the
+                    # leaked name lands here with empty referents.
+                    if not walrus_leaks or not isinstance(access.node, cst.Name):
+                        continue
+                    targets = walrus_leaks.get(access.node.value)
+                    if not targets:
+                        continue
+                    owner_symbols = self.nearest_decls.get(access.node, [])
+                    access_pos = self._pos(access.node)
+                    for target_symbol in targets:
+                        for owner_symbol in owner_symbols:
+                            if target_symbol != owner_symbol and target_symbol and owner_symbol:
+                                self.internal_edges.add((owner_symbol, target_symbol, access_pos))
+                    continue
                 if len(referents) > 1:
                     body = self._scope_body(referents[0].scope, original_node)
                     if body is not None:
@@ -729,29 +748,6 @@ class SymbolVisitor(cst.CSTVisitor):
                         referents = [r for r in referents if id(r.node) in live_ids]
                 for referent in referents:
                     references.add((access, referent))
-
-        # Walrus bindings that leaked from a comprehension don't appear
-        # in the enclosing scope's assignment list (libcst's
-        # ``ScopeProvider`` keeps them in the ``ComprehensionScope``),
-        # so any access to the leaked name lands here with empty
-        # referents. Route those accesses to the matching top-level
-        # walrus decl so the graph mirrors the runtime semantics.
-        if self.walrus_leak_targets:
-            for scope in scopes:
-                for access in scope.accesses:
-                    if not isinstance(access.node, cst.Name):
-                        continue
-                    if any(isinstance(r, Assignment) for r in access.referents):
-                        continue
-                    targets = self.walrus_leak_targets.get(access.node.value)
-                    if not targets:
-                        continue
-                    owner_symbols = self.nearest_decls.get(access.node, [])
-                    access_pos = self._pos(access.node)
-                    for target_symbol in targets:
-                        for owner_symbol in owner_symbols:
-                            if target_symbol != owner_symbol and target_symbol and owner_symbol:
-                                self.internal_edges.add((owner_symbol, target_symbol, access_pos))
 
         for access, referent in references:
             owner_symbols = self.nearest_decls.get(access.node, [])
@@ -832,14 +828,6 @@ class SymbolVisitor(cst.CSTVisitor):
         configured :class:`~dead_cst.branches.UnreachableRegionDetector`
         in :meth:`visit_Module`).
         """
-        flag_map: dict[SymbolNode, SymbolNode] = {
-            d: dataclasses.replace(d, flags=d.flags | NodeFlags.SHADOWED)
-            for d in self.shadowed_decls
-        }
-
-        def remap(sym: SymbolNode) -> SymbolNode:
-            return flag_map.get(sym, sym)
-
         nodes: list[SymbolNode] = []
         stack: list[SymbolTrie] = [self.trie]
         while stack:
@@ -849,8 +837,24 @@ class SymbolVisitor(cst.CSTVisitor):
             for decls in tnode.declarations.values():
                 nodes.extend(decls)
             stack.extend(tnode.children.values())
-        nodes.extend(remap(d) for d in self.shadowed_decls)
 
+        if not self.shadowed_decls:
+            return VisitorPayload(
+                nodes=tuple(nodes),
+                edges=tuple(self.internal_edges),
+                imports=tuple(self.import_edges),
+                dead_suites=tuple(self.dead_suites),
+            )
+
+        flag_map: dict[SymbolNode, SymbolNode] = {
+            d: dataclasses.replace(d, flags=d.flags | NodeFlags.SHADOWED)
+            for d in self.shadowed_decls
+        }
+
+        def remap(sym: SymbolNode) -> SymbolNode:
+            return flag_map.get(sym, sym)
+
+        nodes.extend(remap(d) for d in self.shadowed_decls)
         edges = tuple((remap(src), remap(dst), pos) for src, dst, pos in self.internal_edges)
         imports = tuple((remap(src), dst, pos) for src, dst, pos in self.import_edges)
 
