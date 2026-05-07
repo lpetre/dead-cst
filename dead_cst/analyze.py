@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import logging
 import sys
+from collections import deque
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from functools import cached_property
-from graphlib import TopologicalSorter
 from pathlib import Path
 from typing import Iterable, Iterator, Mapping, Sequence
 
@@ -44,39 +44,50 @@ from .resolvers._core import _validate_packages
 logger = logging.getLogger(__name__)
 
 
-def _topo_sort_packages(packages: Sequence[Package]) -> list[Path]:
-    """Topologically sort package paths so dependencies come before consumers.
+def _bfs_order(seeds: Iterable[Path], neighbors: Mapping[Path, Sequence[Path]]) -> list[Path]:
+    """BFS-reachable nodes from ``seeds``, in visit order.
 
-    Feeds the predecessor map (consumer -> set of dep paths) to
-    :class:`graphlib.TopologicalSorter`. Sorting ``packages`` by path
-    up front breaks ties between independent packages deterministically
-    (``TopologicalSorter`` preserves dict insertion order at each level).
-    """
-    by_name = {p.name: p.path for p in packages}
-    sorted_pkgs = sorted(packages, key=lambda p: p.path)
-    predecessors = {p.path: {by_name[d] for d in p.deps if d in by_name} for p in sorted_pkgs}
-    return list(TopologicalSorter(predecessors).static_order())
-
-
-def _bfs_closure(
-    seeds: Iterable[Path], neighbors: Mapping[Path, Sequence[Path]]
-) -> frozenset[Path]:
-    """Reachable-set BFS over a static adjacency map.
-
-    Used by :meth:`Analysis.reverse_closure` (consumer-side) and
-    :meth:`Analysis._interesting_set` (dep-side) -- the underlying
-    package graph is immutable post-construction, so callers cache
-    the result keyed on the seed.
+    Cycle-safe via the ``visited`` set. The order is determined by
+    the iteration order of ``seeds`` and of each ``neighbors[node]``
+    -- pre-sort both for deterministic output.
     """
     visited: set[Path] = set()
-    stack = list(seeds)
-    while stack:
-        node = stack.pop()
+    order: list[Path] = []
+    queue = deque(seeds)
+    while queue:
+        node = queue.popleft()
         if node in visited:
             continue
         visited.add(node)
-        stack.extend(neighbors.get(node, ()))
-    return frozenset(visited)
+        order.append(node)
+        queue.extend(neighbors.get(node, ()))
+    return order
+
+
+def _ordered_bases(packages: Sequence[Package]) -> list[Path]:
+    """Deterministic, cycle-tolerant package iteration order.
+
+    BFS forward from packages with no deps through their consumer
+    map, so dependencies precede their dependents whenever the
+    package graph is acyclic. Packages trapped in dep cycles (and
+    any otherwise-unreached packages) are appended at the end in
+    path order.
+    """
+    by_name = {p.name: p.path for p in packages}
+    sorted_paths = sorted(p.path for p in packages)
+    deps_by_path: dict[Path, set[Path]] = {
+        p.path: {by_name[d] for d in p.deps if d in by_name} for p in packages
+    }
+    consumers: dict[Path, list[Path]] = {p: [] for p in sorted_paths}
+    for path, deps in deps_by_path.items():
+        for d in deps:
+            consumers[d].append(path)
+    consumers_sorted = {p: sorted(cs) for p, cs in consumers.items()}
+    seeds = [p for p in sorted_paths if not deps_by_path[p]]
+    order = _bfs_order(seeds, consumers_sorted)
+    visited = set(order)
+    order.extend(p for p in sorted_paths if p not in visited)
+    return order
 
 
 def _run_observe(
@@ -761,8 +772,12 @@ class Analysis:
 
     @cached_property
     def bases(self) -> list[Path]:
-        """Bases in topological order (deps before dependents)."""
-        return _topo_sort_packages(self._packages)
+        """Deterministic, cycle-tolerant package order.
+
+        Deps precede their dependents whenever the package graph is
+        acyclic; cycle members are emitted at the end in path order.
+        """
+        return _ordered_bases(self._packages)
 
     def reverse_closure(self, base: Path) -> frozenset[Path]:
         """Bases that transitively depend on ``base`` (including ``base`` itself).
@@ -770,14 +785,15 @@ class Analysis:
         These are the only bases whose source code could import (and
         therefore keep alive) decls under ``base``. A query like "is X
         in ``base`` dead?" only needs entrypoints from this set --
-        sibling bases that don't reach ``base`` in the search-paths
-        DAG can't reference its decls.
+        sibling bases that can't reach ``base`` through the dep graph
+        can't reference its decls. Cycle-safe: BFS terminates even
+        when ``Package.deps`` cycles.
         """
         if base not in self._packages_by_path:
             raise KeyError(base)
         cached = self._reverse_closures.get(base)
         if cached is None:
-            cached = _bfs_closure([base], self._consumers_by_base)
+            cached = frozenset(_bfs_order([base], self._consumers_by_base))
             self._reverse_closures[base] = cached
         return cached
 
@@ -790,7 +806,7 @@ class Analysis:
         """
         cached = self._interesting_sets.get(base)
         if cached is None:
-            cached = _bfs_closure(self.reverse_closure(base), self._dep_paths_by_base)
+            cached = frozenset(_bfs_order(self.reverse_closure(base), self._dep_paths_by_base))
             self._interesting_sets[base] = cached
         return cached
 

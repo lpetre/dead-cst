@@ -15,7 +15,7 @@ import networkx as nx
 import typer
 from libcst.metadata import CodeRange
 
-from .analyze import Analysis, _count_nodes, _find_reachable, _topo_sort_packages
+from .analyze import Analysis, _count_nodes, _find_reachable, _ordered_bases
 from .cache import (
     GraphCache,
     clear_cache,
@@ -231,7 +231,7 @@ def _output_text(
     root: Path,
     packages: tuple[Package, ...],
 ) -> None:
-    for base in _topo_sort_packages(packages):
+    for base in _ordered_bases(packages):
         typer.echo(f"\n{base}:")
         total_counts = _count_nodes(graph, base)
         unreachable_counts = _count_nodes(unreachable, base)
@@ -308,7 +308,7 @@ def _output_json(
         "unreachable_branches": [],
     }
 
-    for base in _topo_sort_packages(packages):
+    for base in _ordered_bases(packages):
         base_str = str(base)
         total_counts = _count_nodes(graph, base)
         unreachable_counts = _count_nodes(unreachable, base)
@@ -459,9 +459,7 @@ def dependencies(
         graph = analysis.materialize_all()
     packages = analysis.packages
 
-    deps_by_base: dict[Path, list[SymbolNode]] = {
-        base: [] for base in _topo_sort_packages(packages)
-    }
+    deps_by_base: dict[Path, list[SymbolNode]] = {base: [] for base in _ordered_bases(packages)}
     for node in graph.nodes:
         if not _is_external_dep(node):
             continue
@@ -650,7 +648,7 @@ def remove(
         typer.echo("Aborted.")
         return
 
-    for base in _topo_sort_packages(packages):
+    for base in _ordered_bases(packages):
         remove_code(unreachable_graph, base)
 
     typer.echo("Dead code removed.")
