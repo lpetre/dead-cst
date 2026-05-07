@@ -24,11 +24,13 @@ two versions.
   refreshes that previously paid for one worker pool startup per base
   now pay for one total.
 - The package dependency graph is no longer represented as a
-  `networkx.DiGraph`. `bases` topological order, `reverse_closure`,
-  and the closure-scoped materialization queries are now driven by
-  hand-rolled BFS over a precomputed `consumers_by_base` reverse map
-  and the existing `Package.deps` direct-dep map. Behavior is
-  unchanged.
+  `networkx.DiGraph`. `Analysis.bases` topologically sorts via
+  `graphlib.TopologicalSorter` (stdlib); `reverse_closure` and the
+  closure-scoped materialization queries are driven by a small BFS
+  helper over a precomputed `consumers_by_base` reverse map and the
+  existing `Package.deps` direct-dep map. The walk results memoize
+  on `Analysis` so repeated `PackageView` queries share the cost.
+  Behavior is unchanged.
 - **Breaking:** `Analysis` no longer accepts a pre-built `paths` mapping.
   The constructor now takes `project_root` as the first argument and a
   required `resolver=` keyword argument (singular -- there is no
