@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import enum
 import logging
 import sys
 from concurrent.futures import ProcessPoolExecutor
@@ -48,13 +49,10 @@ from .resolvers._core import _ValidatedPackages
 
 logger = logging.getLogger(__name__)
 
-# Phase tags. Phase 1 walks every package's exported files in
-# topological order over ``deps``. Phase 2 walks the rest -- tests,
-# scripts, app entrypoints -- against every package's already-built
-# export trie, so non-exported code can have apparent cross-package
-# cycles without violating the production DAG.
-_PHASE_EXPORTS = "exports"
-_PHASE_INTERNALS = "internals"
+
+class Phase(enum.Enum):
+    EXPORTS = "exports"
+    INTERNALS = "internals"
 
 
 def _build_pkg_dag(validated: _ValidatedPackages) -> nx.DiGraph:
@@ -161,7 +159,7 @@ class _PhaseSpec:
     """
 
     package: Package
-    phase: str
+    phase: Phase
     search_paths: tuple[Path, ...]
     files: tuple[Path, ...]
     hits: dict[Path, VisitorPayload]
@@ -170,12 +168,12 @@ class _PhaseSpec:
     fingerprint: str
 
     @property
-    def key(self) -> tuple[str, str]:
+    def key(self) -> tuple[str, Phase]:
         return (self.package.name, self.phase)
 
 
 def _phase_search_paths(
-    pkg: Package, phase: str, validated: _ValidatedPackages
+    pkg: Package, phase: Phase, validated: _ValidatedPackages
 ) -> tuple[Path, ...]:
     """Sys.path entries used during ``phase`` for ``pkg``.
 
@@ -196,7 +194,7 @@ def _phase_search_paths(
         seen.add(p)
 
     own_export = export_search_root(pkg)
-    if phase == _PHASE_EXPORTS:
+    if phase is Phase.EXPORTS:
         add(own_export)
         for dep_name in pkg.deps:
             add(export_search_root(validated.by_name[dep_name]))
@@ -232,7 +230,7 @@ def _partition_files(pkg: Package, all_pkgs: Sequence[Package]) -> tuple[list[Pa
 
 def _build_phase_spec(
     pkg: Package,
-    phase: str,
+    phase: Phase,
     files: list[Path],
     search_paths: tuple[Path, ...],
     cache: GraphCache | None,
@@ -269,7 +267,7 @@ class _Task:
     """Per-file unit of work for the visitor + observe pass."""
 
     file: Path
-    phase_key: tuple[str, str]
+    phase_key: tuple[str, Phase]
     base: Path
     search_paths: tuple[Path, ...]
     fqn_entry: ModuleNameAndPackage
@@ -310,7 +308,9 @@ def _clear_resolver_caches() -> None:
     editable_distribution_roots.cache_clear()
 
 
-def _process_task(state: _RunnerState, task: _Task) -> tuple[tuple[str, str], Path, VisitorPayload]:
+def _process_task(
+    state: _RunnerState, task: _Task
+) -> tuple[tuple[str, Phase], Path, VisitorPayload]:
     """Run one task, transitioning ``sys.path`` + caches if the search path changed."""
     if state.last_search_paths != task.search_paths:
         _rebind_sys_path(task.search_paths, state.sys_path_baseline)
@@ -346,13 +346,13 @@ def _init_worker(
     )
 
 
-def _worker_process_task(task: _Task) -> tuple[tuple[str, str], Path, VisitorPayload]:
+def _worker_process_task(task: _Task) -> tuple[tuple[str, Phase], Path, VisitorPayload]:
     assert _worker_state is not None, "_init_worker must run before _worker_process_task"
     return _process_task(_worker_state, task)
 
 
 def _build_sorted_tasks(
-    phase_specs: dict[tuple[str, str], _PhaseSpec], project_root: Path
+    phase_specs: dict[tuple[str, Phase], _PhaseSpec], project_root: Path
 ) -> list[_Task]:
     """Flatten every phase's miss files into one sorted task list.
 
@@ -378,7 +378,7 @@ def _build_sorted_tasks(
 
 def _compute_all_miss_payloads(
     *,
-    phase_specs: dict[tuple[str, str], _PhaseSpec],
+    phase_specs: dict[tuple[str, Phase], _PhaseSpec],
     project_root: Path,
     detector: UnreachableRegionDetector,
     plugins: Sequence[EdgePlugin],
@@ -386,9 +386,9 @@ def _compute_all_miss_payloads(
     import_resolver: ImportResolver,
     cache: GraphCache | None,
     workers: int | None,
-) -> dict[tuple[str, str], dict[Path, VisitorPayload]]:
+) -> dict[tuple[str, Phase], dict[Path, VisitorPayload]]:
     """Run visitor + observe for every cache-miss file across every phase spec."""
-    out: dict[tuple[str, str], dict[Path, VisitorPayload]] = {k: {} for k in phase_specs}
+    out: dict[tuple[str, Phase], dict[Path, VisitorPayload]] = {k: {} for k in phase_specs}
     total_misses = sum(len(s.miss_files) for s in phase_specs.values())
     if total_misses == 0:
         return out
@@ -396,7 +396,7 @@ def _compute_all_miss_payloads(
     tasks = _build_sorted_tasks(phase_specs, project_root)
     use_pool = workers is not None and workers >= 2 and total_misses >= 2
 
-    def _record(key: tuple[str, str], file: Path, payload: VisitorPayload) -> None:
+    def _record(key: tuple[str, Phase], file: Path, payload: VisitorPayload) -> None:
         out[key][file] = payload
         if cache is not None:
             cache.put(file, payload, phase_specs[key].fingerprint)
@@ -507,7 +507,7 @@ class _PhaseContribution:
     """One (package, phase) pre-stitched contribution to the symbol graph."""
 
     package: Package
-    phase: str
+    phase: Phase
     current_trie: SymbolTrie
     export_trie: SymbolTrie  # populated only for phase 1; empty for phase 2
     base_graph: nx.MultiDiGraph
@@ -521,7 +521,7 @@ def _build_phase_contribution(
     """Apply ``spec``'s per-file payloads into a phase-local graph slice."""
     current_trie = SymbolTrie()
     export_trie = SymbolTrie()
-    is_exports = spec.phase == _PHASE_EXPORTS
+    is_exports = spec.phase is Phase.EXPORTS
     import_edges: set[tuple[SymbolNode, Import, EdgeFlags]] = set()
     base_graph: nx.MultiDiGraph = nx.MultiDiGraph()
     base_graph.graph["dead_suites"] = {}
@@ -702,12 +702,9 @@ class Analysis:
             else DefaultUnreachableRegionDetector()
         )
         self._dep_graph: nx.DiGraph | None = None
-        self._phase_specs: dict[tuple[str, str], _PhaseSpec] = {}
-        self._contributions: dict[tuple[str, str], _PhaseContribution] = {}
+        self._phase_specs: dict[tuple[str, Phase], _PhaseSpec] = {}
+        self._contributions: dict[tuple[str, Phase], _PhaseContribution] = {}
         self._full_graph: nx.MultiDiGraph | None = None
-        # Cached per-package file partitions so refresh() doesn't
-        # re-walk the filesystem on repeated calls.
-        self._partitions: dict[str, tuple[list[Path], list[Path]]] | None = None
         _warn_if_project_venv_inactive(self._project_root)
 
     @property
@@ -739,14 +736,6 @@ class Analysis:
             out.add(descendant)
         return frozenset(out)
 
-    def _ensure_partitions(self) -> dict[str, tuple[list[Path], list[Path]]]:
-        if self._partitions is None:
-            all_pkgs = list(self._validated.packages)
-            self._partitions = {
-                pkg.name: _partition_files(pkg, all_pkgs) for pkg in self._validated.packages
-            }
-        return self._partitions
-
     def refresh(self, packages: Iterable[str] | None = None) -> Analysis:
         """Walk the cache and build per-phase contributions.
 
@@ -760,15 +749,17 @@ class Analysis:
         unknown = [n for n in names if n not in self._validated.by_name]
         if unknown:
             raise KeyError(f"Unknown packages: {unknown}")
-        partitions = self._ensure_partitions()
-        new_keys: list[tuple[str, str]] = []
+        all_pkgs = list(self._validated.packages)
+        new_keys: list[tuple[str, Phase]] = []
         for name in names:
             pkg = self._validated.by_name[name]
-            exported_files, internal_files = partitions[name]
+            exported_files, internal_files = _partition_files(pkg, all_pkgs)
             for phase, files in (
-                (_PHASE_EXPORTS, exported_files),
-                (_PHASE_INTERNALS, internal_files),
+                (Phase.EXPORTS, exported_files),
+                (Phase.INTERNALS, internal_files),
             ):
+                if not files:
+                    continue
                 key = (name, phase)
                 if key in self._contributions:
                     continue
@@ -835,61 +826,63 @@ class Analysis:
             raise KeyError(package)
         return self.materialize_all()
 
+    def _phase_contributions(self, name: str) -> Iterator[_PhaseContribution]:
+        """Yield this package's contributions in phase order, skipping empty ones."""
+        for phase in (Phase.EXPORTS, Phase.INTERNALS):
+            contrib = self._contributions.get((name, phase))
+            if contrib is not None:
+                yield contrib
+
     def _materialize_full(self) -> nx.MultiDiGraph:
         g: nx.MultiDiGraph = nx.MultiDiGraph()
         g.graph["dead_suites"] = {}
 
-        # Phase 1: exports in topological order. Cross-package imports
-        # in exported code resolve against own export trie + deps'
-        # export tries.
-        for pkg in self._validated.topo_order:
-            key = (pkg.name, _PHASE_EXPORTS)
-            contrib = self._contributions.get(key)
-            if contrib is None:
-                continue
-            lookup = SymbolTrie()
-            lookup.merge(contrib.current_trie)
+        # Built once and shared across every phase-2 lookup. Phase-2
+        # visibility for any package is "every package's export trie",
+        # so the union is identical for every package -- we just merge
+        # the package's own combined trie on top, per-package, below.
+        all_exports = SymbolTrie()
+        for contrib in self._contributions.values():
+            if contrib.phase is Phase.EXPORTS:
+                all_exports.merge(contrib.export_trie)
+
+        for phase in (Phase.EXPORTS, Phase.INTERNALS):
+            for pkg in self._validated.topo_order:
+                contrib = self._contributions.get((pkg.name, phase))
+                if contrib is None:
+                    continue
+                _compose_contribution(
+                    contrib,
+                    target_graph=g,
+                    symbol_lookup=self._build_phase_lookup(pkg, phase, all_exports),
+                    plugins=self._plugins,
+                    project_root=self._project_root,
+                )
+        return g
+
+    def _build_phase_lookup(
+        self, pkg: Package, phase: Phase, all_exports: SymbolTrie
+    ) -> SymbolTrie:
+        """Per-(package, phase) symbol lookup trie used for edge stitching.
+
+        Phase 1 sees the package's own exports (under construction)
+        plus each dep's already-built export trie. Phase 2 sees the
+        package's internal surface plus ``all_exports`` -- the
+        prebuilt union of every package's export tries (including
+        ``pkg``'s own), so non-exported code cycles across packages
+        without violating the deps DAG.
+        """
+        contrib = self._contributions[(pkg.name, phase)]
+        lookup = SymbolTrie()
+        lookup.merge(contrib.current_trie)
+        if phase is Phase.EXPORTS:
             for dep_name in pkg.deps:
-                dep_contrib = self._contributions.get((dep_name, _PHASE_EXPORTS))
+                dep_contrib = self._contributions.get((dep_name, Phase.EXPORTS))
                 if dep_contrib is not None:
                     lookup.merge(dep_contrib.export_trie)
-            _compose_contribution(
-                contrib,
-                target_graph=g,
-                symbol_lookup=lookup,
-                plugins=self._plugins,
-                project_root=self._project_root,
-            )
-
-        # Phase 2: internals in any order. Visibility = own
-        # combined trie (exports + internals) + every other package's
-        # export trie. The "every other" union is what makes apparent
-        # cross-package cycles tractable without violating the deps
-        # DAG.
-        for pkg in self._validated.topo_order:
-            key = (pkg.name, _PHASE_INTERNALS)
-            contrib = self._contributions.get(key)
-            if contrib is None:
-                continue
-            lookup = SymbolTrie()
-            lookup.merge(contrib.current_trie)
-            own_exports = self._contributions.get((pkg.name, _PHASE_EXPORTS))
-            if own_exports is not None:
-                lookup.merge(own_exports.current_trie)
-            for other in self._validated.packages:
-                if other.name == pkg.name:
-                    continue
-                other_exports = self._contributions.get((other.name, _PHASE_EXPORTS))
-                if other_exports is not None:
-                    lookup.merge(other_exports.export_trie)
-            _compose_contribution(
-                contrib,
-                target_graph=g,
-                symbol_lookup=lookup,
-                plugins=self._plugins,
-                project_root=self._project_root,
-            )
-        return g
+            return lookup
+        lookup.merge(all_exports)
+        return lookup
 
     def reachable(self) -> set[SymbolNode]:
         return _find_reachable(self.materialize_all())
@@ -945,10 +938,7 @@ class PackageView:
     def modules(self) -> Iterator[SymbolNode]:
         """Module nodes for every ``.py`` file in this package."""
         self._analysis.refresh(packages=[self._name])
-        for phase in (_PHASE_EXPORTS, _PHASE_INTERNALS):
-            contrib = self._analysis._contributions.get((self._name, phase))
-            if contrib is None:
-                continue
+        for contrib in self._analysis._phase_contributions(self._name):
             for n in contrib.base_graph.nodes:
                 if n.type == "module":
                     yield n
@@ -956,10 +946,7 @@ class PackageView:
     def declarations(self, name: str | None = None) -> Iterator[SymbolNode]:
         """Top-level decls in this package."""
         self._analysis.refresh(packages=[self._name])
-        for phase in (_PHASE_EXPORTS, _PHASE_INTERNALS):
-            contrib = self._analysis._contributions.get((self._name, phase))
-            if contrib is None:
-                continue
+        for contrib in self._analysis._phase_contributions(self._name):
             for n in contrib.base_graph.nodes:
                 if n.type in ("module", "synthetic"):
                     continue
@@ -1008,10 +995,7 @@ class PackageView:
         """Count nodes contributed by this package, by ``SymbolNode.type``."""
         self._analysis.refresh(packages=[self._name])
         counts: dict[str, int] = {}
-        for phase in (_PHASE_EXPORTS, _PHASE_INTERNALS):
-            contrib = self._analysis._contributions.get((self._name, phase))
-            if contrib is None:
-                continue
+        for contrib in self._analysis._phase_contributions(self._name):
             sub = _count_nodes(contrib.base_graph, prefix=None)
             for k, v in sub.items():
                 counts[k] = counts.get(k, 0) + v
