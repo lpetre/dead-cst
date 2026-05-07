@@ -141,7 +141,7 @@ dead-cst remove ROOT -e ENTRYPOINT [OPTIONS]
 
 ### `dead-cst cache clear`
 
-Delete the on-disk `VisitorPayload` cache (`<root>/.dead-cst-cache/`) for a project. The cache is keyed by a fingerprint over the `PathMap` and every `Cacheable` component (visitor, resolvers, plugins, unreachable-region detector), so most layout or analyzer-version changes invalidate it automatically; this command is for force-clearing when needed.
+Delete the on-disk `VisitorPayload` cache (`<root>/.dead-cst-cache/`) for a project. Each row is keyed by a per-base fingerprint over the visitor / plugin / unreachable-region-detector `(name, version)` triple plus the base path, schema version, and Python version, so most analyzer-version changes invalidate it automatically; this command is for force-clearing when needed. Resolvers and search paths deliberately do *not* enter the fingerprint — import resolution runs unconditionally on every analysis, so resolver / search-path swaps re-stitch edges without re-running the visitor.
 
 ```
 dead-cst cache clear [ROOT]
@@ -181,7 +181,7 @@ pkg.remove_dead_code()  # codemod, scoped to this base
 
 `Analysis(...).materialize_all()` returns the full `networkx.MultiDiGraph` if you need raw access; `analysis.package(base).graph()` returns the closure-scoped subgraph for one package.
 
-All three extension points — edge plugins, path resolvers, and the unreachable-region detector — share a single `Cacheable` protocol (`name: str`, `version: int`) that feeds the per-file cache fingerprint. The core `SymbolVisitor` carries the same pair, so visitor-level changes get an explicit knob too. Bumping a component's epoch `version` invalidates stale payloads automatically, so swapping or upgrading any of them is safe by default. The package `__version__` is intentionally *not* in the fingerprint: every component whose output can shift between releases owns a dedicated `version`, and folding in `__version__` would let unbumped components ride for free on a release bump.
+All three extension points — edge plugins, path resolvers, and the unreachable-region detector — share a single `Cacheable` protocol (`name: str`, `version: int`). The core `SymbolVisitor` carries the same pair, so visitor-level changes get an explicit knob too. Only the visitor / plugin / detector triple feeds the per-file cache fingerprint — bumping any of those `version`s invalidates stale payloads automatically. Resolvers also implement `Cacheable`, but their output flows through the (uncached) edge-stitching pass instead, so swapping or upgrading a resolver re-stitches edges without invalidating cached payloads. The package `__version__` is intentionally *not* in the fingerprint: every component whose output can shift between releases owns a dedicated `version`, and folding in `__version__` would let unbumped components ride for free on a release bump.
 
 Entrypoint detection is fully plugin-driven. Builtins:
 

@@ -43,15 +43,48 @@ two versions.
   loadable via `--plugin mock_patch`.
 
 ### Changed
+- **Breaking (visitor / cache / `Import` shape):** Cross-file import
+  resolution moved out of the per-file visitor and into the edge
+  stitcher (`dead_cst._edges.resolve_edges`). Consequences:
+  - `dead_cst.graph.Import` drops `path: Path | str` and gains
+    `speculative: bool = False` (set on the synthetic star imports
+    the visitor produces for `__import__(name, fromlist=[...])`
+    fromlist entries; the stitcher silently drops a speculative
+    entry when neither the trie nor the resolver places it).
+    Plugins that consumed `Import.path` should switch to
+    `Import.module` (and pair it with `ctx.find_module` /
+    `ctx.importers` if they need a resolved target).
+  - `compute_fingerprint` no longer takes `search_paths=` /
+    `resolvers=`. The per-file fingerprint covers only the visitor /
+    plugin / detector versions plus the base path; resolver swaps
+    and search-path changes re-stitch edges on the next analysis
+    without invalidating any cached `VisitorPayload` blobs.
+  - `SymbolVisitor.__init__` no longer takes `search_paths` or
+    `import_resolver`; the visitor is purely a function of the
+    file's source. `resolve_edges` gained
+    `import_resolver=` / `search_paths=` keyword arguments for the
+    trie-miss classification path.
+  - `Analysis._materialize` now rebinds `sys.path` to each base's
+    `(base, *deps)` view before composing it (and clears the
+    resolver LRUs at every transition), restoring the original
+    `sys.path` on the way out. Workers in the parallel visitor pass
+    no longer touch `sys.path` at all -- the cost moves from O(files)
+    to O(bases).
+  - `from p import functions` (where `functions` is a submodule of
+    `p`) now produces edges to `p.functions` only when the access
+    path canonicalizes to that module; the previous shape sometimes
+    pointed at the parent package instead. Reachability is
+    unchanged; the only observable difference is which intermediate
+    module appears in the edge set.
+  - Visitor `version` bumped (cache wipes on first run).
 - **Breaking (cache API):** `compute_fingerprint` is now per-base
-  (`base=`, `search_paths=`) rather than per-project (`paths=`).
-  Each cache row carries its own fingerprint, so changing one base's
-  search paths or plugins no longer invalidates sibling bases'
-  cached payloads. `GraphCache(db_path)` no longer takes a
-  fingerprint at open time; `get` and `put` take it per call.
-  Schema version bumped to 2; older databases auto-wipe on first
-  open. The CLI is unaffected -- `Analysis` computes per-base
-  fingerprints internally.
+  (`base=`) rather than per-project (`paths=`). Each cache row
+  carries its own fingerprint, so changing one base's plugins no
+  longer invalidates sibling bases' cached payloads.
+  `GraphCache(db_path)` no longer takes a fingerprint at open time;
+  `get` and `put` take it per call. Schema version bumped to 2;
+  older databases auto-wipe on first open. The CLI is unaffected --
+  `Analysis` computes per-base fingerprints internally.
 - `_order_paths` now returns only the keys of the `PathMap`. Search
   paths that aren't themselves keys (e.g. a venv `site-packages`
   directory listed for resolver lookup) are no longer silently
@@ -59,9 +92,9 @@ two versions.
   explicitly if you want their files visited.
 - `PluginContext`, `ObserveContext`, and the `AddNode` / `AddEdge` /
   `RemoveEdge` graph-op value objects now use `__slots__`, as do the
-  analyzer-internal `_BaseSpec` / `_Task` / `_RunnerState` records,
-  shaving a per-instance `__dict__` off objects allocated per file
-  and per emitted op.
+  analyzer-internal `_BaseSpec` / `_Task` records, shaving a
+  per-instance `__dict__` off objects allocated per file and per
+  emitted op.
 
 ### Removed
 - **Breaking (top-level API):** `build_symbol_graph`, `find_reachable`,

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-from functools import cache
 from importlib.util import resolve_name
 from pathlib import Path
 from typing import Generator, Literal, cast
@@ -28,8 +27,6 @@ from ._flow import live_at_exit, live_referents
 from ._fqn import FixedFullyQualifiedNameProvider
 from .branches import DefaultUnreachableRegionDetector, UnreachableRegionDetector
 from .graph import Import, NodeFlags, SymbolNode, SymbolTrie, VisitorPayload
-from .plugins._core import UNRESOLVED_PREFIX
-from .resolvers import ImportResolver, default_resolve_import
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +85,7 @@ class SymbolVisitor(cst.CSTVisitor):
     # edge-attribution rules, flow-analysis fixes, etc. Concurrent
     # bumps on different branches merge with ``max()`` semantics.
     name: str = "default"
-    version: int = 1777971949
+    version: int = 1778000000
 
     def _pos(self, node: cst.CSTNode):
         return self.get_metadata(PositionProvider, node, default=None)
@@ -105,14 +102,10 @@ class SymbolVisitor(cst.CSTVisitor):
     def __init__(
         self,
         path: Path,
-        search_paths: list[Path],
-        import_resolver: ImportResolver = default_resolve_import,
         unreachable_detector: UnreachableRegionDetector | None = None,
         wrapper: cst.MetadataWrapper | None = None,
     ):
         self.path = path
-        self.search_paths = search_paths
-        self._import_resolver = import_resolver
         self._unreachable_detector = (
             unreachable_detector
             if unreachable_detector is not None
@@ -165,10 +158,6 @@ class SymbolVisitor(cst.CSTVisitor):
         if not self.decl_stack:
             raise ValueError("Module node has not been set yet.")
         return self.decl_stack[0][0]
-
-    @cache
-    def resolve_import(self, name: str) -> str | Path | None:
-        return self._import_resolver(name, self.search_paths)
 
     def _push_decl(self, node: cst.CSTNode, decl: SymbolNode):
         self._push_decls(node, [decl])
@@ -281,14 +270,19 @@ class SymbolVisitor(cst.CSTVisitor):
                 self._push_decls(name, [sym])
 
     def _add_import(self, from_prefix: str, node: cst.Import | cst.ImportFrom) -> None:
-        current_decl = self.decl_stack[-1][-1] if self.decl_stack else None
+        """Emit raw ``Import`` records for one ``import`` / ``from ... import`` statement.
 
-        module_path: str | Path | None = None
-        module_name: str | None = None
-        if from_prefix:
-            if path := self.resolve_import(from_prefix):
-                module_path = path
-                module_name = from_prefix
+        No name resolution happens here -- the visitor's job is to
+        capture what the source code literally says. The edge stitcher
+        :func:`dead_cst._edges.resolve_edges` is the single point that
+        classifies the target (first-party vs stdlib / external dist /
+        external file / unresolved) and may rewrite the
+        ``(module, decl)`` split to canonical form once it has the
+        per-base trie + resolver in hand. This keeps the visitor pass
+        purely a function of the file's source, so the per-file cache
+        survives changes to ``search_paths`` and the resolver chain.
+        """
+        current_decl = self.decl_stack[-1][-1] if self.decl_stack else None
 
         # ``visit_ImportFrom`` routes ``from X import *`` to ``_add_star_import``,
         # so by the time we get here ``names`` is always the alias sequence form.
@@ -299,50 +293,36 @@ class SymbolVisitor(cst.CSTVisitor):
             # dotted-name string; the helper only returns None for unsupported
             # node types we never see here.
             assert alias_name is not None
-            full_name = f"{from_prefix}.{alias_name}" if from_prefix else alias_name
 
-            if resolved := self.resolve_import(full_name):
-                module_path = resolved
-                module_name = full_name
-
-            if not module_path:
-                code = cst.Module([]).code_for_node(alias)
-                logger.warning("Failed to resolve cst.Import: '%s' in %s", code, self.path)
-                # Surface as a synthetic ``[unresolved] <top-level>`` node
-                # anyway so plugins can still answer "which files tried to
-                # import X?". The top-level package name is used (mirroring
-                # how ``[external dist] fastapi`` collapses every fastapi
-                # submodule import into one node) so a plugin's
-                # ``importers("fastapi")`` finds them all. Reachability is
-                # unaffected (the synthetic has no outbound edges).
-                top_level = full_name.split(".", 1)[0]
-                module_path = f"{UNRESOLVED_PREFIX}{top_level}"
-                module_name = full_name
-            assert module_name is not None
+            # ``from x import a`` -> module="x", decl="a" (the stitcher
+            # canonicalizes to module="x.a", decl=None when ``x.a`` is a
+            # submodule). ``import x.y`` -> module="x.y", decl=None
+            # (``from_prefix`` is empty for plain ``import``).
+            if from_prefix:
+                module_name = from_prefix
+                decl_name_str: str | None = alias_name
+            else:
+                module_name = alias_name
+                decl_name_str = None
 
             if alias.asname:
-                decl_name = alias.asname.name
+                decl_node = alias.asname.name
             else:
-                decl_name = alias.name
+                decl_node = alias.name
 
-            self.import_lookup[decl_name] = import_info = Import(
-                path=module_path,
+            self.import_lookup[decl_node] = import_info = Import(
                 module=module_name,
-                decl=(
-                    full_name[len(module_name) + 1 :]
-                    if module_name and module_name != full_name
-                    else None
-                ),
+                decl=decl_name_str,
             )
 
             # ``import google.cloud`` binds ``google`` in the local scope; the
             # decl is stored under that bare name, not the dotted path.
-            while isinstance(decl_name, cst.Attribute):
-                decl_name = decl_name.value
+            while isinstance(decl_node, cst.Attribute):
+                decl_node = decl_node.value
 
             if current_decl and current_decl.type == "module":
                 sym = SymbolNode(
-                    f"{self.module_node.fqname}.{decl_name.value}",
+                    f"{self.module_node.fqname}.{decl_node.value}",
                     "import",
                     self.path,
                     self._pos(alias),
@@ -617,9 +597,13 @@ class SymbolVisitor(cst.CSTVisitor):
         for entry in entries:
             if not entry:
                 continue
-            submod = f"{module}.{entry}"
-            if self.resolve_import(submod):
-                self._add_star_import(submod, access_pos)
+            # Each fromlist entry could be a submodule (fan out as a star
+            # import) or a name in ``module`` (already covered by the
+            # main star fan-out from ``module``). We can't tell at visit
+            # time, so emit a *speculative* star import for ``module.entry``
+            # and let the stitcher silently drop it when neither the trie
+            # nor the resolver places it.
+            self._add_star_import(f"{module}.{entry}", access_pos, speculative=True)
 
     @staticmethod
     def _dynamic_import_call_name(
@@ -704,14 +688,12 @@ class SymbolVisitor(cst.CSTVisitor):
                 del trie_node.declarations[name]
             self.shadowed_decls.extend(shadowed_here)
 
-    def _add_star_import(self, module: str, access_pos: CodeRange) -> None:
-        module_path = self.resolve_import(module) if module else None
-        if not module_path:
-            logger.warning(
-                "Failed to resolve star import: 'from %s import *' in %s", module, self.path
-            )
+    def _add_star_import(
+        self, module: str, access_pos: CodeRange, *, speculative: bool = False
+    ) -> None:
+        if not module:
             return
-        star = Import(path=module_path, module=module, star=True)
+        star = Import(module=module, star=True, speculative=speculative)
         self.import_edges.add((self.decl_stack[-1][-1], star, access_pos))
 
     def on_leave(self, original_node: cst.CSTNode) -> None:
@@ -795,7 +777,6 @@ class SymbolVisitor(cst.CSTVisitor):
 
                     # Create the new Import with the specific symbol being accessed
                     resolved_import = Import(
-                        path=original_import.path,
                         module=original_import.module,
                         decl=".".join(accessed_attrs) if accessed_attrs else None,
                     )
