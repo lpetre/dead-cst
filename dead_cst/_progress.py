@@ -1,19 +1,9 @@
-"""Progress reporting that survives non-TTY consumers.
-
-``tqdm`` is great for humans on a terminal but its ``\\r``-overwriting
-output renders to mush when stderr is captured (CI logs, pytest, agent
-harnesses). :func:`progress` keeps the live bar on TTYs and falls back
-to newline-terminated decile checkpoints otherwise -- one line at 0%,
-each ~10% boundary, and 100% -- so log consumers can still track a
-long-running pass.
-"""
+"""TTY-aware progress reporting; emits decile log lines off-TTY."""
 
 from __future__ import annotations
 
 import sys
 from typing import Iterable, Iterator, TypeVar
-
-from tqdm import tqdm
 
 T = TypeVar("T")
 
@@ -32,26 +22,28 @@ def progress(
     and ``total`` itself. Counts that fall on the same milestone (small
     ``total``s) coalesce so the same line is never printed twice.
     """
-    if sys.stderr.isatty():
-        yield from tqdm(iterable, total=total, desc=desc, unit=unit, disable=False)
+    if total == 0:
         return
 
-    milestones = sorted({total * k // 10 for k in range(11)})
-    next_idx = 0
+    if sys.stderr.isatty():
+        # Lazy import: tqdm is only needed for the live-bar path,
+        # and skipping it on non-TTY keeps CLI startup snappy.
+        from tqdm import tqdm
 
-    def _emit_through(count: int) -> None:
-        nonlocal next_idx
-        while next_idx < len(milestones) and milestones[next_idx] <= count:
-            print(
-                f"{desc}: {milestones[next_idx]}/{total} {unit}",
-                file=sys.stderr,
-                flush=True,
-            )
-            next_idx += 1
+        yield from tqdm(iterable, total=total, desc=desc, unit=unit)
+        return
 
-    _emit_through(0)
+    milestones = iter(sorted({total * k // 10 for k in range(11)}))
+    next_threshold: int | None = next(milestones, None)
+
+    while next_threshold is not None and next_threshold <= 0:
+        print(f"{desc}: {next_threshold}/{total} {unit}", file=sys.stderr, flush=True)
+        next_threshold = next(milestones, None)
+
     count = 0
     for item in iterable:
         yield item
         count += 1
-        _emit_through(count)
+        while next_threshold is not None and count >= next_threshold:
+            print(f"{desc}: {next_threshold}/{total} {unit}", file=sys.stderr, flush=True)
+            next_threshold = next(milestones, None)
