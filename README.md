@@ -156,15 +156,16 @@ import re
 from pathlib import Path
 from dead_cst import Analysis
 from dead_cst.plugins import ExplicitEntrypointPlugin, MainBlockPlugin
+from dead_cst.resolvers import ManualResolver
 
 root = Path("./src")
 analysis = Analysis(
-    {root: []},
+    root,
+    resolvers=[ManualResolver(specs=["."])],
     plugins=[
         MainBlockPlugin(),
         ExplicitEntrypointPlugin(specs=[re.compile(r".*__main__\.py")]),
     ],
-    project_root=root,
 )
 
 # Whole-project queries: cheap to construct, lazy to materialize.
@@ -223,7 +224,7 @@ class MyInternalModulesPlugin(LiteralListPlugin):
 
 Write your own from scratch by implementing the `EdgePlugin` protocol (`name`, `version`, `observe`, `finalize`); register under the `dead_cst.plugins` entry-point group for CLI discovery.
 
-Path resolution is similarly pluggable. `PathResolver` implementations return a `{base: [dep_paths]}` map to feed `Analysis`. Builtins: `VenvResolver`, `PyprojectResolver`, `UvWorkspaceResolver` (parses `uv.lock` to discover workspace members and their inter-member dep edges). Third-party resolvers register under `dead_cst.resolvers`.
+Path resolution is similarly pluggable. `PathResolver` implementations return a `{base: [dep_paths]}` map to feed `Analysis`. Builtins: `ManualResolver` (explicit `base:dep` specs from `-p`) and `UvResolver` (parses `uv.lock` to discover workspace members and their inter-member dep edges). Third-party resolvers register under `dead_cst.resolvers`.
 
 Unreachable-code detection is pluggable through the `UnreachableRegionDetector` protocol. `Analysis` accepts an `unreachable_detector` whose `find_regions(wrapper) -> list[CodeRange]` is invoked once per file. The built-in `DefaultUnreachableRegionDetector` covers three things out of the box:
 
@@ -261,7 +262,11 @@ class FlagAwareDetector(DefaultUnreachableRegionDetector):
             return MIGRATIONS[expr.args[0].value.evaluated_value]
         return None
 
-graph = Analysis({root: []}, unreachable_detector=FlagAwareDetector()).materialize_all()
+graph = Analysis(
+    root,
+    resolvers=[ManualResolver(specs=["."])],
+    unreachable_detector=FlagAwareDetector(),
+).materialize_all()
 ```
 
 With the override above, `if check_flag("migration-abc"): ...` and `flag = check_flag("migration-abc"); if flag: ...` both resolve to a known truthiness, and the unreachable suite is flagged just like a literal `if False:` would be.

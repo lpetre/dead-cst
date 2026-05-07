@@ -5,6 +5,7 @@ import networkx as nx
 import pytest
 
 from dead_cst import Analysis, EdgeFlags
+from dead_cst.resolvers import ManualResolver
 
 
 @pytest.fixture
@@ -32,13 +33,34 @@ def visitor_warnings(caplog):
 
 
 @pytest.fixture
-def build_decl_graph(tmp_path):
+def make_analysis(tmp_path):
+    """Build an :class:`Analysis` rooted at ``tmp_path`` with minimal boilerplate.
+
+    The single positional argument is a list of :class:`ManualResolver`
+    spec strings (``"."``, ``"pkg_a:pkg_b"``, etc.); defaults to
+    ``["."]`` so the most common single-base case is just
+    ``make_analysis()``. Any extra keyword arguments flow straight
+    through to :class:`Analysis` (``plugins``, ``cache``,
+    ``unreachable_detector``, ``workers``, or an explicit
+    ``resolvers=...`` to bypass :class:`ManualResolver` entirely).
+    """
+
+    def _make(specs: list[str] | None = None, **kwargs) -> Analysis:
+        if "resolvers" not in kwargs:
+            kwargs["resolvers"] = [ManualResolver(specs=list(specs) if specs else ["."])]
+        return Analysis(tmp_path, **kwargs)
+
+    return _make
+
+
+@pytest.fixture
+def build_decl_graph(tmp_path, make_analysis):
     def _make_graph(files: dict[str, str]) -> nx.MultiDiGraph:
         for filename, content in files.items():
             full_path = tmp_path / filename
             full_path.parent.mkdir(parents=True, exist_ok=True)
             full_path.write_text(textwrap.dedent(content).strip())
-        return Analysis({tmp_path: []}).materialize_all()
+        return make_analysis().materialize_all()
 
     return _make_graph
 

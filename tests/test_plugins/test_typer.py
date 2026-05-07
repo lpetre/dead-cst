@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dead_cst import Analysis
 from dead_cst.plugins import (
     ExplicitEntrypointPlugin,
     MainBlockPlugin,
@@ -10,7 +9,7 @@ from dead_cst.plugins import (
 )
 
 
-def test_typer_plugin_marks_command_handlers(tmp_path, write_files, reachable_fqnames):
+def test_typer_plugin_marks_command_handlers(make_analysis, write_files, reachable_fqnames):
     write_files(
         {
             "cli/__init__.py": "",
@@ -35,11 +34,7 @@ def test_typer_plugin_marks_command_handlers(tmp_path, write_files, reachable_fq
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[MainBlockPlugin(), TyperPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[MainBlockPlugin(), TyperPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "cli.main.app" in reached
     assert "cli.main.hello" in reached
@@ -49,7 +44,9 @@ def test_typer_plugin_marks_command_handlers(tmp_path, write_files, reachable_fq
     assert "cli.main.helper" not in reached
 
 
-def test_typer_plugin_keeps_handler_dependencies_alive(tmp_path, write_files, reachable_fqnames):
+def test_typer_plugin_keeps_handler_dependencies_alive(
+    make_analysis, write_files, reachable_fqnames
+):
     write_files(
         {
             "cli/__init__.py": "",
@@ -78,11 +75,7 @@ def test_typer_plugin_keeps_handler_dependencies_alive(tmp_path, write_files, re
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[MainBlockPlugin(), TyperPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[MainBlockPlugin(), TyperPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "cli.main.show" in reached
     # Symbols transitively referenced from the handler stay alive
@@ -92,7 +85,9 @@ def test_typer_plugin_keeps_handler_dependencies_alive(tmp_path, write_files, re
     assert "cli.models.Unused" not in reached
 
 
-def test_typer_plugin_reachable_via_explicit_entrypoint(tmp_path, write_files, reachable_fqnames):
+def test_typer_plugin_reachable_via_explicit_entrypoint(
+    make_analysis, write_files, reachable_fqnames
+):
     write_files(
         {
             "cli/__init__.py": "",
@@ -106,17 +101,15 @@ def test_typer_plugin_reachable_via_explicit_entrypoint(tmp_path, write_files, r
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[ExplicitEntrypointPlugin(specs=["cli.main.app"]), TyperPlugin()],
-        project_root=tmp_path,
+    graph = make_analysis(
+        plugins=[ExplicitEntrypointPlugin(specs=["cli.main.app"]), TyperPlugin()]
     ).materialize_all()
     reached = reachable_fqnames(graph)
     assert "cli.main.app" in reached
     assert "cli.main.hello" in reached
 
 
-def test_typer_plugin_does_not_seed_entrypoint(tmp_path, write_files, reachable_fqnames):
+def test_typer_plugin_does_not_seed_entrypoint(make_analysis, write_files, reachable_fqnames):
     """Without an external reach (no main block, no project.scripts, no -e),
     the Typer instance itself stays dead -- and so do its commands. Mirrors
     the ``APIRouter`` behavior in :class:`FastAPIPlugin`."""
@@ -133,17 +126,13 @@ def test_typer_plugin_does_not_seed_entrypoint(tmp_path, write_files, reachable_
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[TyperPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[TyperPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "cli.main.app" not in reached
     assert "cli.main.orphan" not in reached
 
 
-def test_typer_plugin_unused_subapp_stays_dead(tmp_path, write_files, reachable_fqnames):
+def test_typer_plugin_unused_subapp_stays_dead(make_analysis, write_files, reachable_fqnames):
     """A sub-Typer that's never ``add_typer``'d has no path from the root
     app and stays dead, along with its commands."""
     write_files(
@@ -170,18 +159,14 @@ def test_typer_plugin_unused_subapp_stays_dead(tmp_path, write_files, reachable_
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[MainBlockPlugin(), TyperPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[MainBlockPlugin(), TyperPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "cli.main.hello" in reached
     assert "cli.sub.sub" not in reached
     assert "cli.sub.orphan" not in reached
 
 
-def test_typer_plugin_subapp_reachable_via_add_typer(tmp_path, write_files, reachable_fqnames):
+def test_typer_plugin_subapp_reachable_via_add_typer(make_analysis, write_files, reachable_fqnames):
     write_files(
         {
             "cli/__init__.py": "",
@@ -208,11 +193,7 @@ def test_typer_plugin_subapp_reachable_via_add_typer(tmp_path, write_files, reac
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[MainBlockPlugin(), TyperPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[MainBlockPlugin(), TyperPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "cli.main.app" in reached
     assert "cli.sub.sub" in reached
@@ -220,7 +201,7 @@ def test_typer_plugin_subapp_reachable_via_add_typer(tmp_path, write_files, reac
     assert "cli.sub.things" in reached
 
 
-def test_typer_plugin_handles_aliased_class_import(tmp_path, write_files, reachable_fqnames):
+def test_typer_plugin_handles_aliased_class_import(make_analysis, write_files, reachable_fqnames):
     write_files(
         {
             "cli/__init__.py": "",
@@ -237,15 +218,11 @@ def test_typer_plugin_handles_aliased_class_import(tmp_path, write_files, reacha
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[MainBlockPlugin(), TyperPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[MainBlockPlugin(), TyperPlugin()]).materialize_all()
     assert "cli.main.hello" in reachable_fqnames(graph)
 
 
-def test_typer_plugin_handles_aliased_module_import(tmp_path, write_files, reachable_fqnames):
+def test_typer_plugin_handles_aliased_module_import(make_analysis, write_files, reachable_fqnames):
     write_files(
         {
             "cli/__init__.py": "",
@@ -262,15 +239,11 @@ def test_typer_plugin_handles_aliased_module_import(tmp_path, write_files, reach
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[MainBlockPlugin(), TyperPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[MainBlockPlugin(), TyperPlugin()]).materialize_all()
     assert "cli.main.hello" in reachable_fqnames(graph)
 
 
-def test_typer_plugin_handles_annotated_assignment(tmp_path, write_files, reachable_fqnames):
+def test_typer_plugin_handles_annotated_assignment(make_analysis, write_files, reachable_fqnames):
     write_files(
         {
             "cli/__init__.py": "",
@@ -287,15 +260,11 @@ def test_typer_plugin_handles_annotated_assignment(tmp_path, write_files, reacha
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[MainBlockPlugin(), TyperPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[MainBlockPlugin(), TyperPlugin()]).materialize_all()
     assert "cli.main.hello" in reachable_fqnames(graph)
 
 
-def test_typer_plugin_ignores_bare_decorators(tmp_path, write_files, reachable_fqnames):
+def test_typer_plugin_ignores_bare_decorators(make_analysis, write_files, reachable_fqnames):
     write_files(
         {
             "pkg/__init__.py": "",
@@ -315,17 +284,13 @@ def test_typer_plugin_ignores_bare_decorators(tmp_path, write_files, reachable_f
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[MainBlockPlugin(), TyperPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[MainBlockPlugin(), TyperPlugin()]).materialize_all()
     # Bare ``@command`` (no attribute access) is not a Typer registration --
     # matching it would clobber unrelated decorators with the same name.
     assert "pkg.mod.looks_like_command" not in reachable_fqnames(graph)
 
 
-def test_typer_plugin_ignores_unrelated_decorators(tmp_path, write_files, reachable_fqnames):
+def test_typer_plugin_ignores_unrelated_decorators(make_analysis, write_files, reachable_fqnames):
     write_files(
         {
             "pkg/__init__.py": "",
@@ -341,16 +306,14 @@ def test_typer_plugin_ignores_unrelated_decorators(tmp_path, write_files, reacha
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[TyperPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[TyperPlugin()]).materialize_all()
     # ``t`` isn't a ``Typer`` instance, so its ``.command`` decorator is ignored.
     assert "pkg.mod.not_a_command" not in reachable_fqnames(graph)
 
 
-def test_typer_plugin_does_nothing_without_typer_imports(tmp_path, write_files, reachable_fqnames):
+def test_typer_plugin_does_nothing_without_typer_imports(
+    make_analysis, write_files, reachable_fqnames
+):
     write_files(
         {
             "pkg/__init__.py": "",
@@ -367,16 +330,14 @@ def test_typer_plugin_does_nothing_without_typer_imports(tmp_path, write_files, 
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[TyperPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[TyperPlugin()]).materialize_all()
     # ``app`` here is not a Typer instance -- no ``typer`` import in scope.
     assert "pkg.mod.looks_like_command" not in reachable_fqnames(graph)
 
 
-def test_typer_plugin_multiple_instances_in_one_module(tmp_path, write_files, reachable_fqnames):
+def test_typer_plugin_multiple_instances_in_one_module(
+    make_analysis, write_files, reachable_fqnames
+):
     write_files(
         {
             "cli/__init__.py": "",
@@ -397,11 +358,7 @@ def test_typer_plugin_multiple_instances_in_one_module(tmp_path, write_files, re
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[MainBlockPlugin(), TyperPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[MainBlockPlugin(), TyperPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     # ``app`` is reached via the main block; its command is alive.
     assert "cli.main.from_app" in reached
@@ -411,7 +368,7 @@ def test_typer_plugin_multiple_instances_in_one_module(tmp_path, write_files, re
     assert "cli.main.from_other" not in reached
 
 
-def test_typer_plugin_ignores_import_star(tmp_path, write_files, reachable_fqnames):
+def test_typer_plugin_ignores_import_star(make_analysis, write_files, reachable_fqnames):
     """``from typer import *`` doesn't bind ``Typer`` for the plugin's
     purposes. The ``import *`` analyzer logic is pessimistic enough on its
     own; the plugin shouldn't infer Typer wiring from the star import."""
@@ -431,11 +388,7 @@ def test_typer_plugin_ignores_import_star(tmp_path, write_files, reachable_fqnam
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[MainBlockPlugin(), TyperPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[MainBlockPlugin(), TyperPlugin()]).materialize_all()
     # No instance edge from ``app`` to ``hello`` because the plugin ignores
     # star imports. ``hello`` is not referenced by anything reachable.
     assert "cli.main.hello" not in reachable_fqnames(graph)

@@ -39,6 +39,7 @@ from .resolvers import (
     distribution_lookup,
     editable_distribution_roots,
     exported_roots,
+    merge_paths,
     safe_resolve_module,
 )
 
@@ -625,13 +626,6 @@ def _under_any(file: Path, roots: list[Path]) -> bool:
     return False
 
 
-def _infer_project_root(paths: PathMap) -> Path:
-    bases = list(paths)
-    if not bases:
-        return Path.cwd()
-    return min(bases, key=lambda p: len(p.parts))
-
-
 def _find_reachable(graph: nx.MultiDiGraph) -> set[SymbolNode]:
     """BFS forward from every node tagged as an entrypoint by a plugin.
 
@@ -737,34 +731,35 @@ class Analysis:
     much cheaper than recomputing payloads, so per-package queries
     against a warm cache stay fast even on large repos.
 
-    Parameters mirror :func:`build_symbol_graph`; see its docstring for
-    detailed semantics. Once constructed, an :class:`Analysis` is
-    effectively read-only -- mutating ``paths`` after construction has
-    no effect because the configuration is copied. Spin up a fresh
+    The configured ``resolvers`` are queried twice: once at construction
+    time to build the per-base ``PathMap`` (each resolver's
+    :meth:`PathResolver.resolve` is called with ``project_root`` and the
+    results merged via :func:`~dead_cst.resolvers.merge_paths`), and
+    again during edge stitching to classify trie-miss imports via
+    :meth:`PathResolver.resolve_import`. Once constructed, an
+    :class:`Analysis` is effectively read-only -- spin up a fresh
     instance to pick up new search paths or new plugins.
     """
 
     def __init__(
         self,
-        paths: PathMap,
+        project_root: Path,
         *,
+        resolvers: Sequence[PathResolver],
         plugins: Sequence[EdgePlugin] = (),
-        resolvers: Sequence[PathResolver] = (),
-        project_root: Path | None = None,
         cache: GraphCache | None = None,
         unreachable_detector: UnreachableRegionDetector | None = None,
         workers: int | None = None,
     ) -> None:
-        self._paths: dict[Path, list[Path]] = {b: list(deps) for b, deps in paths.items()}
-        self._plugins: tuple[EdgePlugin, ...] = tuple(plugins)
+        self._project_root: Path = project_root
         self._resolvers: tuple[PathResolver, ...] = tuple(resolvers)
+        self._paths: dict[Path, list[Path]] = {
+            b: list(deps)
+            for b, deps in merge_paths(*[r.resolve(project_root) for r in self._resolvers]).items()
+        }
+        self._plugins: tuple[EdgePlugin, ...] = tuple(plugins)
         self._cache = cache
         self._workers = workers
-        self._project_root: Path = (
-            project_root
-            if project_root is not None
-            else (_infer_project_root(self._paths) if self._paths else Path.cwd())
-        )
         self._import_resolver: ImportResolver = _chain_resolvers(self._resolvers)
         self._detector: UnreachableRegionDetector = (
             unreachable_detector

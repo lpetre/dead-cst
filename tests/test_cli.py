@@ -37,8 +37,8 @@ from dead_cst.cli import (
     _rel_path,
     app,
     build_plugins,
+    build_resolvers,
     parse_entrypoint,
-    resolve_paths,
     setup_logging,
 )
 
@@ -82,7 +82,7 @@ def _pos() -> CodeRange:
 
 
 # ---------------------------------------------------------------------------
-# Pure helpers -- parse_entrypoint, parse_paths, resolve_paths
+# Pure helpers -- parse_entrypoint, build_resolvers
 # ---------------------------------------------------------------------------
 
 
@@ -152,24 +152,26 @@ def test_manual_resolver_parses_specs(tmp_path, specs, expected_keys, expected_d
         assert result[tmp_path / key] == [tmp_path / d for d in deps]
 
 
-def test_resolve_paths_no_specs_no_resolvers_returns_root(tmp_path):
-    paths, resolvers = resolve_paths(tmp_path, [], [])
-    assert paths == {tmp_path: []}
-    assert resolvers == []
+def test_build_resolvers_no_specs_no_resolvers_returns_default_manual():
+    """With neither ``-p`` nor ``--resolver``, the chain falls back to a
+    :class:`ManualResolver` rooted at the project root itself."""
+    resolvers = build_resolvers([], [])
+    assert [r.name for r in resolvers] == ["manual"]
+    assert isinstance(resolvers[0], ManualResolver)
+    assert resolvers[0].specs == ["."]
 
 
-def test_resolve_paths_explicit_specs_only(tmp_path):
-    (tmp_path / "src").mkdir()
-    paths, resolvers = resolve_paths(tmp_path, ["src"], [])
-    assert paths == {tmp_path / "src": []}
+def test_build_resolvers_explicit_specs_only():
+    resolvers = build_resolvers(["src"], [])
     # ``-p`` flows through a ManualResolver so its ``resolve_import``
     # is part of the chain alongside any named resolvers.
     assert [r.name for r in resolvers] == ["manual"]
+    assert resolvers[0].specs == ["src"]
 
 
-def test_resolve_paths_unknown_resolver_raises(tmp_path):
+def test_build_resolvers_unknown_resolver_raises():
     with pytest.raises(KeyError):
-        resolve_paths(tmp_path, [], ["does-not-exist"])
+        build_resolvers([], ["does-not-exist"])
 
 
 # ---------------------------------------------------------------------------

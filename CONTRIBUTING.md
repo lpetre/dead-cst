@@ -75,9 +75,8 @@ dead_cst/
   _codemod.py            # remove_code -- LibCST transformer + import pruner
   _resolve.py            # import resolution (stdlib / first-party / third-party)
   _resolvers/            # path resolvers:
-    venv.py              #   sibling .venv -> site-packages
-    pyproject.py         #   [tool.dead-cst] paths or src/ fallback
-    uv_workspace.py      #   uv.lock workspace members + inter-member deps
+    manual.py            #   explicit base:dep1,dep2 specs (the CLI's -p)
+    uv.py                #   uv.lock workspace members + inter-member deps (lives under contrib/)
     _exports.py          #   exported_roots: hide internal dirs from consumers
   _symbols.py            # SymbolNode, SymbolTrie data classes
   _visitor.py            # SymbolVisitor -- walks each file and emits symbols + edges

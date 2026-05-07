@@ -1,4 +1,4 @@
-"""Tests for :class:`dead_cst.resolvers.uv_workspace.UvWorkspaceResolver`.
+"""Tests for :class:`dead_cst.contrib.uv.UvResolver`.
 
 Includes an end-to-end regression test for the cross-member ``tests/``
 collision that motivated :func:`dead_cst.resolvers.exported_roots`.
@@ -11,14 +11,14 @@ from pathlib import Path
 
 import pytest
 
-from dead_cst.resolvers import UvWorkspaceResolver
-from dead_cst.resolvers import MissingVenvError
+from dead_cst.contrib.uv import MissingVenvError
+from dead_cst.resolvers import UvResolver
 
 
 def _make_fake_venv(workspace_root: Path) -> Path:
     """Create a minimal ``.venv/lib/pythonX.Y/site-packages`` and return it.
 
-    ``UvWorkspaceResolver`` requires a populated venv -- in real usage,
+    ``UvResolver`` requires a populated venv -- in real usage,
     ``uv sync --all-packages`` puts one at the workspace root. Tests
     create the directory structure the resolver looks for and return
     the resolved ``site-packages`` path so assertions can include it
@@ -76,39 +76,39 @@ def _write_uv_workspace(tmp_path: Path, *, with_src: bool = True) -> None:
     )
 
 
-def test_uv_workspace_resolver_src_layout(tmp_path: Path):
+def test_uv_resolver_src_layout(tmp_path: Path):
     _write_uv_workspace(tmp_path)
     sp = _make_fake_venv(tmp_path)
 
-    result = UvWorkspaceResolver().resolve(tmp_path)
+    result = UvResolver().resolve(tmp_path)
 
     core_src = (tmp_path / "packages" / "core" / "src").resolve()
     app_src = (tmp_path / "packages" / "app" / "src").resolve()
     assert result == {core_src: [sp], app_src: [core_src, sp]}
 
 
-def test_uv_workspace_resolver_flat_layout(tmp_path: Path):
+def test_uv_resolver_flat_layout(tmp_path: Path):
     _write_uv_workspace(tmp_path, with_src=False)
     sp = _make_fake_venv(tmp_path)
 
-    result = UvWorkspaceResolver().resolve(tmp_path)
+    result = UvResolver().resolve(tmp_path)
 
     core_dir = (tmp_path / "packages" / "core").resolve()
     app_dir = (tmp_path / "packages" / "app").resolve()
     assert result == {core_dir: [sp], app_dir: [core_dir, sp]}
 
 
-def test_uv_workspace_resolver_skips_virtual_root(tmp_path: Path):
+def test_uv_resolver_skips_virtual_root(tmp_path: Path):
     _write_uv_workspace(tmp_path)
     _make_fake_venv(tmp_path)
 
-    result = UvWorkspaceResolver().resolve(tmp_path)
+    result = UvResolver().resolve(tmp_path)
 
     # The "ws" package has source = { virtual = "." } and must not appear.
     assert tmp_path.resolve() not in result
 
 
-def test_uv_workspace_resolver_missing_venv_raises(tmp_path: Path, monkeypatch):
+def test_uv_resolver_missing_venv_raises(tmp_path: Path, monkeypatch):
     """Workspace with no synced ``.venv`` raises an actionable error
     instead of silently producing wrong results downstream."""
     import sys
@@ -119,10 +119,10 @@ def test_uv_workspace_resolver_missing_venv_raises(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(sys, "prefix", sys.base_prefix)
 
     with pytest.raises(MissingVenvError, match="uv sync"):
-        UvWorkspaceResolver().resolve(tmp_path)
+        UvResolver().resolve(tmp_path)
 
 
-def test_uv_workspace_resolver_includes_virtual_members(tmp_path: Path):
+def test_uv_resolver_includes_virtual_members(tmp_path: Path):
     """Virtual members (apps/services that don't ship as wheels) are first-party
     code and must be analyzed alongside editable members.
 
@@ -171,20 +171,20 @@ def test_uv_workspace_resolver_includes_virtual_members(tmp_path: Path):
     )
 
     sp = _make_fake_venv(tmp_path)
-    result = UvWorkspaceResolver().resolve(tmp_path)
+    result = UvResolver().resolve(tmp_path)
 
     lib_src = (tmp_path / "libs" / "lib-a" / "src").resolve()
     app_src = (tmp_path / "apps" / "app-a" / "src").resolve()
     assert result == {lib_src: [sp], app_src: [lib_src, sp]}
 
 
-def test_uv_workspace_resolver_no_lockfile(tmp_path: Path):
+def test_uv_resolver_no_lockfile(tmp_path: Path):
     # No lockfile => not a uv workspace => silent no-op (don't raise on the
     # missing venv, since the resolver isn't applicable here).
-    assert UvWorkspaceResolver().resolve(tmp_path) == {}
+    assert UvResolver().resolve(tmp_path) == {}
 
 
-def test_uv_workspace_resolver_ignores_non_workspace_deps(tmp_path: Path):
+def test_uv_resolver_ignores_non_workspace_deps(tmp_path: Path):
     """Deps that aren't workspace members (e.g. regular PyPI deps) are dropped
     silently -- they don't have a source dir under our control."""
     _write_uv_workspace(tmp_path)
@@ -197,13 +197,13 @@ def test_uv_workspace_resolver_ignores_non_workspace_deps(tmp_path: Path):
         )
     )
 
-    result = UvWorkspaceResolver().resolve(tmp_path)
+    result = UvResolver().resolve(tmp_path)
     core_src = (tmp_path / "packages" / "core" / "src").resolve()
     app_src = (tmp_path / "packages" / "app" / "src").resolve()
     assert result[app_src] == [core_src, sp]
 
 
-def test_uv_workspace_resolver_explicit_lock_path(tmp_path: Path):
+def test_uv_resolver_explicit_lock_path(tmp_path: Path):
     _write_uv_workspace(tmp_path)
     _make_fake_venv(tmp_path)
     moved = tmp_path / "stash" / "uv.lock"
@@ -211,7 +211,7 @@ def test_uv_workspace_resolver_explicit_lock_path(tmp_path: Path):
     moved.write_text((tmp_path / "uv.lock").read_text())
     (tmp_path / "uv.lock").unlink()
 
-    result = UvWorkspaceResolver(lock_path=moved).resolve(tmp_path)
+    result = UvResolver(lock_path=moved).resolve(tmp_path)
     assert result  # non-empty -- lock_path override took effect
 
 
@@ -290,9 +290,8 @@ def test_uv_workspace_flat_layout_with_tests_dirs(tmp_path: Path):
     (libc / "tests" / "conftest.py").write_text("import pytest\n")
 
     _make_fake_venv(tmp_path)
-    paths = UvWorkspaceResolver().resolve(tmp_path)
     # No AssertionError -- this used to crash before the fix.
-    graph = Analysis(paths).materialize_all()
+    graph = Analysis(tmp_path, resolvers=[UvResolver()]).materialize_all()
 
     # Both members' tests modules exist as distinct nodes (full graph picture).
     tests_modules = [n for n in graph.nodes if n.type == "module" and n.fqname == "tests"]
@@ -381,12 +380,13 @@ def test_uv_workspace_shared_namespace_package(tmp_path: Path):
     (foo_b / "foo" / "b" / "__init__.py").write_text("from foo.a import value\n\nresult = value\n")
 
     sp = _make_fake_venv(tmp_path)
-    paths = UvWorkspaceResolver().resolve(tmp_path)
+    resolver = UvResolver()
+    paths = resolver.resolve(tmp_path)
     foo_a_dir = foo_a.resolve()
     foo_b_dir = foo_b.resolve()
     assert paths == {foo_a_dir: [sp], foo_b_dir: [foo_a_dir, sp]}
 
-    graph = Analysis(paths).materialize_all()
+    graph = Analysis(tmp_path, resolvers=[resolver]).materialize_all()
 
     # foo.a.value (in foo-a) and foo.b.result (in foo-b) both made it into
     # the graph as distinct variables under the shared ``foo`` namespace.

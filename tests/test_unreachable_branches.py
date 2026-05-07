@@ -248,7 +248,7 @@ def test_decls_inside_dead_branch_remain_in_graph(build_decl_graph, assert_edges
     )
 
 
-def test_custom_detector_folds_constants(tmp_path, write_files, assert_dead_branch_edges):
+def test_custom_detector_folds_constants(make_analysis, write_files, assert_dead_branch_edges):
     """End-to-end: a custom detector can mark non-literal branches dead.
 
     Demonstrates the user-facing extension story: a company-specific
@@ -262,8 +262,6 @@ def test_custom_detector_folds_constants(tmp_path, write_files, assert_dead_bran
 
     import libcst as cst
     from libcst.metadata import MetadataWrapper, PositionProvider
-
-    from dead_cst import Analysis
 
     write_files(
         {
@@ -303,18 +301,17 @@ def test_custom_detector_folds_constants(tmp_path, write_files, assert_dead_bran
             wrapper.module.visit(_V())
             return out
 
-    graph = Analysis({tmp_path: []}, unreachable_detector=IsProdDetector()).materialize_all()
+    graph = make_analysis(unreachable_detector=IsProdDetector()).materialize_all()
     assert_dead_branch_edges(graph, {"mod -> mod.dev_only"})
 
 
-def test_default_detector_does_not_flag_named_condition(tmp_path, write_files):
+def test_default_detector_does_not_flag_named_condition(tmp_path, make_analysis, write_files):
     """Sanity check: the default detector leaves ``if NAME`` branches alone.
 
     Counterpart to :func:`test_custom_detector_folds_constants` --
     without a custom detector, ``if IS_PROD:`` is unknown and no
     suite is recorded as dead.
     """
-    from dead_cst import Analysis
 
     write_files(
         {
@@ -329,7 +326,7 @@ def test_default_detector_does_not_flag_named_condition(tmp_path, write_files):
             "settings.py": "IS_PROD = True\n",
         }
     )
-    graph = Analysis({tmp_path: []}).materialize_all()
+    graph = make_analysis().materialize_all()
     assert _dead_suite_positions(graph, tmp_path / "mod.py") == ()
 
 
@@ -787,7 +784,7 @@ def test_module_level_terminator_kills_following_statements(
 # ----------------------------------------------------------------------
 
 
-def test_custom_detector_override_folds_call_in_if(tmp_path, write_files):
+def test_custom_detector_override_folds_call_in_if(make_analysis, write_files):
     """A subclass that knows ``check_flag(name)`` is constant.
 
     The override answers for the ``Call`` node directly; the detector
@@ -800,7 +797,7 @@ def test_custom_detector_override_folds_call_in_if(tmp_path, write_files):
 
     import libcst as cst
 
-    from dead_cst import Analysis, EdgeFlags
+    from dead_cst import EdgeFlags
     from dead_cst.branches import DefaultUnreachableRegionDetector
 
     write_files(
@@ -830,7 +827,7 @@ def test_custom_detector_override_folds_call_in_if(tmp_path, write_files):
                 return True
             return None
 
-    graph = Analysis({tmp_path: []}, unreachable_detector=FlagAwareDetector()).materialize_all()
+    graph = make_analysis(unreachable_detector=FlagAwareDetector()).materialize_all()
     dead = {
         f"{src.fqname} -> {dst.fqname}"
         for src, dst, attrs in graph.edges(data=True)
@@ -840,7 +837,7 @@ def test_custom_detector_override_folds_call_in_if(tmp_path, write_files):
     assert dead == {"mod -> mod.dev_only"}
 
 
-def test_custom_detector_override_folds_through_assignment(tmp_path, write_files):
+def test_custom_detector_override_folds_through_assignment(make_analysis, write_files):
     """Override answer composes with the fixpoint fold pass.
 
     ``flag = check_flag(...)`` propagates the override's answer
@@ -852,7 +849,7 @@ def test_custom_detector_override_folds_through_assignment(tmp_path, write_files
 
     import libcst as cst
 
-    from dead_cst import Analysis, EdgeFlags
+    from dead_cst import EdgeFlags
     from dead_cst.branches import DefaultUnreachableRegionDetector
 
     write_files(
@@ -880,7 +877,7 @@ def test_custom_detector_override_folds_through_assignment(tmp_path, write_files
                 return False
             return None
 
-    graph = Analysis({tmp_path: []}, unreachable_detector=FlagAwareDetector()).materialize_all()
+    graph = make_analysis(unreachable_detector=FlagAwareDetector()).materialize_all()
     dead = {
         f"{src.fqname} -> {dst.fqname}"
         for src, dst, attrs in graph.edges(data=True)

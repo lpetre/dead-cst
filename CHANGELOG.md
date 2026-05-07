@@ -9,6 +9,33 @@ two versions.
 
 ## [Unreleased]
 
+### Changed
+- **Breaking:** `Analysis` no longer accepts a pre-built `paths` mapping.
+  The constructor now takes `project_root` as the first argument and a
+  required `resolvers=` keyword argument; the path map is computed by
+  invoking `resolver.resolve(project_root)` on each resolver and merging
+  the results via `merge_paths`. Callers that used to write
+  `Analysis({base: deps}, ...)` should switch to
+  `Analysis(base, resolvers=[ManualResolver(specs=["."])], ...)` (or
+  whichever resolver describes their layout).
+- **Breaking:** `UvWorkspaceResolver` is renamed to `UvResolver`, the
+  CLI resolver name `uv_workspace` is renamed to `uv`, and the module
+  moved from `dead_cst/contrib/uv_workspace.py` to
+  `dead_cst/contrib/uv.py`. The `name` field bumps to `"uv"` so cached
+  per-base fingerprints rebuild automatically.
+- **Breaking:** the CLI helper `resolve_paths` is replaced by
+  `build_resolvers`, which returns the resolver chain only. Callers
+  (and the CLI itself) read the merged `PathMap` back from
+  `Analysis.paths` after construction.
+
+### Removed
+- **Breaking:** `VenvResolver` and `PyprojectResolver` are removed,
+  along with the `--resolver venv` and `--resolver pyproject` CLI
+  names. `MissingVenvError` is also no longer part of the resolver
+  surface; `UvResolver` raises its own `dead_cst.contrib.uv.MissingVenvError`
+  when the workspace's shared `.venv` is missing. Use `-p src` (the
+  CLI's `ManualResolver`) for the old `pyproject` `src/` shortcut.
+
 ### Added
 - New primary API: `dead_cst.Analysis` and `dead_cst.PackageView`,
   the lazy entry point that callers should reach for on large repos.
