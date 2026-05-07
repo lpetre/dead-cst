@@ -9,9 +9,7 @@ Pins the lazy / scoped behavior promised by the new entry-point API:
 * :meth:`Analysis.materialize_all` produces the same graph as
   :func:`build_symbol_graph`,
 * per-base ``dead`` answers are equal to the slice of the full ``dead``
-  set restricted to that base,
-* the per-base cache fingerprint isolates sibling bases (changing one
-  base's deps does not invalidate other bases' rows).
+  set restricted to that base.
 """
 
 from __future__ import annotations
@@ -190,8 +188,8 @@ def test_package_dead_matches_full_dead_slice(tmp_path, make_analysis):
 
 
 # ---------------------------------------------------------------------------
-# Per-base cache fingerprint: changing one base's deps doesn't invalidate
-# sibling bases' rows.
+# Cache fingerprint: changing a base's deps doesn't invalidate any rows,
+# since the fingerprint no longer depends on the package layout.
 # ---------------------------------------------------------------------------
 
 

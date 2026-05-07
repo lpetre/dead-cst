@@ -2,13 +2,12 @@
 
 The cache short-circuits the per-file visitor pass when a file's
 SHA-256 content hash matches what's already on disk; the rest of the
-analyzer (per-base ``resolve_edges``, plugin pass) runs every
+analyzer (``resolve_edges``, plugin ``finalize`` pass) runs every
 invocation. These tests cover:
 
-* the on-disk schema and per-base fingerprint reconciliation,
+* the on-disk schema and analysis-fingerprint reconciliation,
 * per-file hit / miss / mtime-but-no-content-change behavior,
 * graph equivalence between cached and uncached runs,
-* invalidation on path-map / resolver-chain changes,
 * the CLI ``--no-cache`` flag and ``cache clear`` subcommand.
 """
 

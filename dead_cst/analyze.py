@@ -4,6 +4,8 @@ import logging
 import sys
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
+from functools import cached_property
+from graphlib import TopologicalSorter
 from pathlib import Path
 from typing import Iterable, Iterator, Mapping, Sequence
 
@@ -45,31 +47,36 @@ logger = logging.getLogger(__name__)
 def _topo_sort_packages(packages: Sequence[Package]) -> list[Path]:
     """Topologically sort package paths so dependencies come before consumers.
 
-    Hand-rolled Kahn's algorithm so the package layout is the only
-    structure we lean on -- no networkx involvement. Ties at any
-    given level are broken by sorting on path so the output is
-    deterministic across runs.
+    Feeds the predecessor map (consumer -> set of dep paths) to
+    :class:`graphlib.TopologicalSorter`. Sorting ``packages`` by path
+    up front breaks ties between independent packages deterministically
+    (``TopologicalSorter`` preserves dict insertion order at each level).
     """
     by_name = {p.name: p.path for p in packages}
-    in_degree = {p.path: 0 for p in packages}
-    successors: dict[Path, list[Path]] = {p.path: [] for p in packages}
-    for pkg in packages:
-        for dep_name in pkg.deps:
-            dep_path = by_name.get(dep_name)
-            if dep_path is None:
-                continue
-            successors[dep_path].append(pkg.path)
-            in_degree[pkg.path] += 1
-    ready = sorted(p for p, d in in_degree.items() if d == 0)
-    order: list[Path] = []
-    while ready:
-        node = ready.pop(0)
-        order.append(node)
-        for succ in sorted(successors[node]):
-            in_degree[succ] -= 1
-            if in_degree[succ] == 0:
-                ready.append(succ)
-    return order
+    sorted_pkgs = sorted(packages, key=lambda p: p.path)
+    predecessors = {p.path: {by_name[d] for d in p.deps if d in by_name} for p in sorted_pkgs}
+    return list(TopologicalSorter(predecessors).static_order())
+
+
+def _bfs_closure(
+    seeds: Iterable[Path], neighbors: Mapping[Path, Sequence[Path]]
+) -> frozenset[Path]:
+    """Reachable-set BFS over a static adjacency map.
+
+    Used by :meth:`Analysis.reverse_closure` (consumer-side) and
+    :meth:`Analysis._interesting_set` (dep-side) -- the underlying
+    package graph is immutable post-construction, so callers cache
+    the result keyed on the seed.
+    """
+    visited: set[Path] = set()
+    stack = list(seeds)
+    while stack:
+        node = stack.pop()
+        if node in visited:
+            continue
+        visited.add(node)
+        stack.extend(neighbors.get(node, ()))
+    return frozenset(visited)
 
 
 def _run_observe(
@@ -149,15 +156,7 @@ class _BaseFiles:
 
     Built once per base in :func:`_enumerate_files` and parked on
     :class:`Analysis` so :meth:`Analysis.refresh` can rebuild
-    contributions later without re-walking the tree. ``hits`` is the
-    payloads we already have in :class:`GraphCache`; ``miss_files``
-    are the ones that need a visitor pass.
-
-    No ``fingerprint`` field -- the cache fingerprint is now a single
-    analysis-wide value carried on :class:`Analysis`. No
-    ``search_paths`` field either -- :func:`_materialize` rebuilds
-    those per base when it needs them, so the visitor / parsing
-    layer doesn't need to know.
+    contributions later without re-walking the tree.
     """
 
     base: Path
@@ -193,13 +192,10 @@ def _enumerate_files(
 class _StaleFile:
     """One stale file ready for the visitor + observe pass.
 
-    Tasks are flat: every base's miss files compose into one global
-    list (see :func:`_build_stale_tasks`) so the parallel path runs
-    every cache miss in a single pool, regardless of which base each
-    file lives under. ``fqn_entry`` is this file's slice of the
-    per-base FQN cache (one ``gen_cache`` call per base, since the
-    base is what FQN resolution keys on); the runner injects it into
-    a :class:`MetadataWrapper` directly.
+    ``fqn_entry`` is this file's slice of the per-base FQN cache
+    (FQN resolution is base-keyed, hence one ``gen_cache`` call per
+    base in :func:`_build_stale_tasks`); the runner injects it into a
+    :class:`MetadataWrapper` directly.
     """
 
     file: Path
@@ -745,6 +741,10 @@ class Analysis:
         self._contributions: dict[Path, _BaseContribution] = {}
         self._closure_graphs: dict[Path, nx.MultiDiGraph] = {}
         self._full_graph: nx.MultiDiGraph | None = None
+        # Memoize closure-walk results -- the package graph is
+        # immutable post-construction.
+        self._reverse_closures: dict[Path, frozenset[Path]] = {}
+        self._interesting_sets: dict[Path, frozenset[Path]] = {}
 
     @property
     def packages(self) -> tuple[Package, ...]:
@@ -759,7 +759,7 @@ class Analysis:
         """Precomputed dep paths for the package at ``base``."""
         return self._dep_paths_by_base.get(base, ())
 
-    @property
+    @cached_property
     def bases(self) -> list[Path]:
         """Bases in topological order (deps before dependents)."""
         return _topo_sort_packages(self._packages)
@@ -771,38 +771,28 @@ class Analysis:
         therefore keep alive) decls under ``base``. A query like "is X
         in ``base`` dead?" only needs entrypoints from this set --
         sibling bases that don't reach ``base`` in the search-paths
-        DAG can't reference its decls. Implemented as a plain BFS over
-        ``_consumers_by_base``; no networkx dependency.
+        DAG can't reference its decls.
         """
         if base not in self._packages_by_path:
             raise KeyError(base)
-        visited: set[Path] = {base}
-        stack: list[Path] = [base]
-        while stack:
-            node = stack.pop()
-            for cons in self._consumers_by_base.get(node, ()):
-                if cons not in visited:
-                    visited.add(cons)
-                    stack.append(cons)
-        return frozenset(visited)
+        cached = self._reverse_closures.get(base)
+        if cached is None:
+            cached = _bfs_closure([base], self._consumers_by_base)
+            self._reverse_closures[base] = cached
+        return cached
 
     def _interesting_set(self, base: Path) -> frozenset[Path]:
         """Bases needed to answer reachability queries about decls in ``base``.
 
         :meth:`reverse_closure` ∪ each consumer's transitive deps, so
         we have enough trie data to resolve every cross-base import
-        that could lead into ``base``. Computed by a second BFS over
-        :attr:`_dep_paths_by_base` seeded by every consumer.
+        that could lead into ``base``.
         """
-        scope: set[Path] = set()
-        stack: list[Path] = list(self.reverse_closure(base))
-        while stack:
-            node = stack.pop()
-            if node in scope:
-                continue
-            scope.add(node)
-            stack.extend(self._dep_paths_by_base.get(node, ()))
-        return frozenset(scope)
+        cached = self._interesting_sets.get(base)
+        if cached is None:
+            cached = _bfs_closure(self.reverse_closure(base), self._dep_paths_by_base)
+            self._interesting_sets[base] = cached
+        return cached
 
     def refresh(self, bases: Iterable[Path] | None = None) -> Analysis:
         """Update the cache and build per-base contributions for the given bases.

@@ -149,14 +149,14 @@ def file_hash(path: Path) -> str | None:
 class GraphCache:
     """SQLite-backed lookup of pickled :class:`VisitorPayload` per file.
 
-    Open with just the database path -- there is no project-wide
-    fingerprint at the database level. Each :meth:`get` and
-    :meth:`put` takes the per-base fingerprint that the calling
-    analyzer computed via :func:`compute_fingerprint`; the row stores
-    its own fingerprint and a mismatch on read returns ``None``
-    (treated as a cache miss). On open, a schema-version mismatch
-    wipes ``file_cache`` and re-writes the current schema -- this
-    handles upgrading from older databases without intervention.
+    Open with just the database path -- there is no fingerprint at
+    the database level. Each :meth:`get` and :meth:`put` takes the
+    analysis fingerprint the caller computed via
+    :func:`compute_fingerprint`; the row stores its own fingerprint
+    and a mismatch on read returns ``None`` (treated as a cache miss).
+    On open, a schema-version mismatch wipes ``file_cache`` and
+    re-writes the current schema -- this handles upgrading from older
+    databases without intervention.
 
     :meth:`get` returns the cached payload for a path when both the
     file's SHA-256 and the stored fingerprint match the caller's;
@@ -200,8 +200,8 @@ class GraphCache:
         older release that stored a single project-wide fingerprint
         in ``meta.fingerprint``) drops ``file_cache`` and clears
         ``meta`` so the next run starts clean. The next round of
-        :meth:`put` calls re-populates with rows that carry their own
-        per-base fingerprint.
+        :meth:`put` calls re-populates with rows that carry the
+        current analysis fingerprint.
         """
         with self._conn:
             self._conn.execute(
@@ -278,7 +278,7 @@ class GraphCache:
 
     def put(self, path: Path, payload: VisitorPayload, fingerprint: str) -> None:
         """Pickle ``payload`` and record it under the file's current hash
-        and the caller's per-base ``fingerprint``."""
+        and the caller's analysis ``fingerprint``."""
         h = file_hash(path)
         if h is None:
             return
