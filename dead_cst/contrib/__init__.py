@@ -5,8 +5,7 @@ Contrib modules know about external systems -- frameworks
 build tools (uv) -- and ship the plugin or resolver that bridges
 ``dead-cst`` to that system. Anything that handles a generic Python
 language convention (``__main__`` blocks, ``[project.scripts]``,
-``__init_subclass__`` discovery, ``__all__`` / dunder exports, sibling
-``.venv`` lookup, ``pyproject.toml`` paths) lives in
+``__init_subclass__`` discovery, ``__all__`` / dunder exports) lives in
 :mod:`dead_cst.plugins` or :mod:`dead_cst.resolvers` instead.
 
 The classes here are also re-exported from those packages for
@@ -15,13 +14,13 @@ ergonomics, so
 .. code-block:: python
 
     from dead_cst.plugins import FastAPIPlugin
-    from dead_cst.resolvers import UvWorkspaceResolver
+    from dead_cst.resolvers import UvResolver
 
 work alongside
 
 .. code-block:: python
 
-    from dead_cst.contrib import FastAPIPlugin, UvWorkspaceResolver
+    from dead_cst.contrib import FastAPIPlugin, UvResolver
     from dead_cst.contrib.fastapi import FastAPIPlugin
 
 """
@@ -37,15 +36,14 @@ from .pytest import PytestPlugin
 from .typer import TyperPlugin
 from .unittest import UnittestPlugin
 
-# ``UvWorkspaceResolver`` is re-exported lazily to break an
-# initialization cycle: ``uv_workspace.py`` imports from
-# ``dead_cst.resolvers``, and ``dead_cst.resolvers.__init__`` in turn
-# eagerly re-exports ``UvWorkspaceResolver`` from this contrib module.
-# Loading the class here at module-init time would deadlock the cycle
-# through partially-initialized modules; deferring to ``__getattr__``
-# lets ``dead_cst.resolvers`` finish loading ``_core`` (which is what
-# ``uv_workspace`` actually depends on) before the class itself is
-# pulled.
+# ``UvResolver`` is re-exported lazily to break an initialization cycle:
+# ``uv.py`` imports from ``dead_cst.resolvers``, and
+# ``dead_cst.resolvers.__init__`` in turn eagerly re-exports
+# ``UvResolver`` from this contrib module. Loading the class here at
+# module-init time would deadlock the cycle through partially-initialized
+# modules; deferring to ``__getattr__`` lets ``dead_cst.resolvers``
+# finish loading ``_core`` (which is what ``uv`` actually depends on)
+# before the class itself is pulled.
 __all__ = [
     "ClickPlugin",
     "CycloptsPlugin",
@@ -55,15 +53,15 @@ __all__ = [
     "PytestPlugin",
     "TyperPlugin",
     "UnittestPlugin",
-    "UvWorkspaceResolver",
+    "UvResolver",
 ]
 
 
 def __getattr__(name: str):
-    if name == "UvWorkspaceResolver":
-        from .uv_workspace import UvWorkspaceResolver
+    if name == "UvResolver":
+        from .uv import UvResolver
 
-        return UvWorkspaceResolver
+        return UvResolver
     raise AttributeError(f"module 'dead_cst.contrib' has no attribute {name!r}")
 
 

@@ -11,7 +11,6 @@ import networkx as nx
 import pytest
 from libcst.metadata import CodePosition, CodeRange
 
-from dead_cst import Analysis
 from dead_cst.analyze import _find_reachable as find_reachable
 from dead_cst.plugins import MainBlockPlugin, ProjectScriptsPlugin
 from dead_cst.plugins._core import (
@@ -31,13 +30,13 @@ from dead_cst.plugins._core import (
 from dead_cst.graph import SymbolNode, SymbolTrie
 
 
-def test_no_plugins_means_nothing_reachable(tmp_path, write_files):
+def test_no_plugins_means_nothing_reachable(make_analysis, write_files):
     write_files({"pkg/__init__.py": "", "pkg/a.py": "def f(): pass"})
-    graph = Analysis({tmp_path: []}).materialize_all()
+    graph = make_analysis().materialize_all()
     assert find_reachable(graph) == set()
 
 
-def test_plugins_compose(tmp_path, write_files, reachable_fqnames):
+def test_plugins_compose(make_analysis, write_files, reachable_fqnames):
     write_files(
         {
             "pkg/__init__.py": "",
@@ -55,11 +54,7 @@ def test_plugins_compose(tmp_path, write_files, reachable_fqnames):
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[MainBlockPlugin(), ProjectScriptsPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[MainBlockPlugin(), ProjectScriptsPlugin()]).materialize_all()
     assert {"pkg.runner", "pkg.cli", "pkg.cli.main"} <= reachable_fqnames(graph)
 
 

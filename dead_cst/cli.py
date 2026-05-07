@@ -36,7 +36,6 @@ from .resolvers import (
     PathMap,
     PathResolver,
     load_resolver,
-    merge_paths,
 )
 
 
@@ -105,9 +104,6 @@ def build_plugins(
 @contextlib.contextmanager
 def _maybe_cache(
     root: Path,
-    paths_dict: PathMap,
-    resolvers: list[PathResolver],
-    plugins: list[EdgePlugin],
     no_cache: bool,
 ) -> Iterator[GraphCache | None]:
     """Yield a per-run :class:`GraphCache`, or ``None`` when ``--no-cache`` is set.
@@ -125,24 +121,22 @@ def _maybe_cache(
         yield cache
 
 
-def resolve_paths(
-    root: Path, path_specs: list[str], resolver_names: list[str]
-) -> tuple[PathMap, list[PathResolver]]:
+def build_resolvers(path_specs: list[str], resolver_names: list[str]) -> list[PathResolver]:
     """Build the resolver chain from ``-p`` specs and ``--resolver`` names.
 
     ``-p`` specs become a :class:`ManualResolver` and slot into the
     chain alongside named resolvers, so explicit specs participate in
-    :meth:`PathResolver.resolve_import` lookups too. Returns the
-    merged :data:`PathMap` and the resolver instances; the analyzer
-    threads the latter through to govern import resolution.
+    :meth:`PathResolver.resolve_import` lookups too. With neither flag
+    supplied, falls back to a ``ManualResolver`` that treats the project
+    root itself as the only base.
     """
     resolvers: list[PathResolver] = []
     if path_specs:
         resolvers.append(ManualResolver(specs=path_specs))
     resolvers.extend(load_resolver(name) for name in resolver_names)
     if not resolvers:
-        return {root: []}, []
-    return merge_paths(*[r.resolve(root) for r in resolvers]), resolvers
+        resolvers.append(ManualResolver(specs=["."]))
+    return resolvers
 
 
 def version_callback(value: bool) -> None:
@@ -180,7 +174,7 @@ def analyze(
     ] = None,
     resolver: Annotated[
         list[str] | None,
-        typer.Option("--resolver", help="Path resolver to run (e.g. venv, pyproject)."),
+        typer.Option("--resolver", help="Path resolver to run (e.g. uv)."),
     ] = None,
     plugin: Annotated[
         list[str] | None,
@@ -201,22 +195,23 @@ def analyze(
     setup_logging(verbose)
     root = root.resolve()
 
-    paths_dict, resolvers = resolve_paths(root, path or [], resolver or [])
+    resolvers = build_resolvers(path or [], resolver or [])
 
     typer.echo(f"Building symbol graph for {root}...", err=True)
     plugins = build_plugins(
         entrypoints=entrypoint or [],
         plugin_names=plugin or [],
     )
-    with _maybe_cache(root, paths_dict, resolvers, plugins, no_cache) as cache:
-        graph = Analysis(
-            paths_dict,
-            plugins=plugins,
+    with _maybe_cache(root, no_cache) as cache:
+        analysis = Analysis(
+            root,
             resolvers=resolvers,
-            project_root=root,
+            plugins=plugins,
             cache=cache,
             workers=workers,
-        ).materialize_all()
+        )
+        graph = analysis.materialize_all()
+    paths_dict = analysis.paths
     reachable = _find_reachable(graph)
 
     unreachable_graph = graph.subgraph([n for n in graph.nodes if n not in reachable])
@@ -357,7 +352,7 @@ def why_alive(
     ] = None,
     resolver: Annotated[
         list[str] | None,
-        typer.Option("--resolver", help="Path resolver to run (e.g. venv, pyproject)."),
+        typer.Option("--resolver", help="Path resolver to run (e.g. uv)."),
     ] = None,
     plugin: Annotated[
         list[str] | None,
@@ -375,19 +370,18 @@ def why_alive(
     setup_logging(verbose)
     root = root.resolve()
 
-    paths_dict, resolvers = resolve_paths(root, path or [], resolver or [])
+    resolvers = build_resolvers(path or [], resolver or [])
 
     typer.echo(f"Building symbol graph for {root}...", err=True)
     plugins = build_plugins(
         entrypoints=[],
         plugin_names=plugin or [],
     )
-    with _maybe_cache(root, paths_dict, resolvers, plugins, no_cache) as cache:
+    with _maybe_cache(root, no_cache) as cache:
         graph = Analysis(
-            paths_dict,
-            plugins=plugins,
+            root,
             resolvers=resolvers,
-            project_root=root,
+            plugins=plugins,
             cache=cache,
             workers=workers,
         ).materialize_all()
@@ -435,7 +429,7 @@ def dependencies(
     ] = None,
     resolver: Annotated[
         list[str] | None,
-        typer.Option("--resolver", help="Path resolver to run (e.g. venv, pyproject)."),
+        typer.Option("--resolver", help="Path resolver to run (e.g. uv)."),
     ] = None,
     verbose: Annotated[
         bool, typer.Option("-v", "--verbose", help="Enable verbose output.")
@@ -452,17 +446,18 @@ def dependencies(
     setup_logging(verbose)
     root = root.resolve()
 
-    paths_dict, resolvers = resolve_paths(root, path or [], resolver or [])
+    resolvers = build_resolvers(path or [], resolver or [])
 
     typer.echo(f"Building symbol graph for {root}...", err=True)
-    with _maybe_cache(root, paths_dict, resolvers, [], no_cache) as cache:
-        graph = Analysis(
-            paths_dict,
+    with _maybe_cache(root, no_cache) as cache:
+        analysis = Analysis(
+            root,
             resolvers=resolvers,
-            project_root=root,
             cache=cache,
             workers=workers,
-        ).materialize_all()
+        )
+        graph = analysis.materialize_all()
+    paths_dict = analysis.paths
 
     deps_by_base: dict[Path, list[SymbolNode]] = {base: [] for base in _order_paths(paths_dict)}
     for node in graph.nodes:
@@ -504,7 +499,7 @@ def unused_exports(
     ] = None,
     resolver: Annotated[
         list[str] | None,
-        typer.Option("--resolver", help="Path resolver to run (e.g. venv, pyproject)."),
+        typer.Option("--resolver", help="Path resolver to run (e.g. uv)."),
     ] = None,
     plugin: Annotated[
         list[str] | None,
@@ -522,19 +517,18 @@ def unused_exports(
     setup_logging(verbose)
     root = root.resolve()
 
-    paths_dict, resolvers = resolve_paths(root, path or [], resolver or [])
+    resolvers = build_resolvers(path or [], resolver or [])
 
     typer.echo(f"Building symbol graph for {root}...", err=True)
     plugins = build_plugins(
         entrypoints=entrypoint or [],
         plugin_names=plugin or [],
     )
-    with _maybe_cache(root, paths_dict, resolvers, plugins, no_cache) as cache:
+    with _maybe_cache(root, no_cache) as cache:
         graph = Analysis(
-            paths_dict,
-            plugins=plugins,
+            root,
             resolvers=resolvers,
-            project_root=root,
+            plugins=plugins,
             cache=cache,
             workers=workers,
         ).materialize_all()
@@ -590,7 +584,7 @@ def remove(
     ] = None,
     resolver: Annotated[
         list[str] | None,
-        typer.Option("--resolver", help="Path resolver to run (e.g. venv, pyproject)."),
+        typer.Option("--resolver", help="Path resolver to run (e.g. uv)."),
     ] = None,
     plugin: Annotated[
         list[str] | None,
@@ -611,22 +605,23 @@ def remove(
     setup_logging(verbose)
     root = root.resolve()
 
-    paths_dict, resolvers = resolve_paths(root, path or [], resolver or [])
+    resolvers = build_resolvers(path or [], resolver or [])
 
     typer.echo(f"Building symbol graph for {root}...", err=True)
     plugins = build_plugins(
         entrypoints=entrypoint or [],
         plugin_names=plugin or [],
     )
-    with _maybe_cache(root, paths_dict, resolvers, plugins, no_cache) as cache:
-        graph = Analysis(
-            paths_dict,
-            plugins=plugins,
+    with _maybe_cache(root, no_cache) as cache:
+        analysis = Analysis(
+            root,
             resolvers=resolvers,
-            project_root=root,
+            plugins=plugins,
             cache=cache,
             workers=workers,
-        ).materialize_all()
+        )
+        graph = analysis.materialize_all()
+    paths_dict = analysis.paths
     reachable = _find_reachable(graph)
 
     unreachable_graph = graph.subgraph([n for n in graph.nodes if n not in reachable])

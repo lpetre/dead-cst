@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dead_cst import Analysis
 from dead_cst.plugins import (
     ExplicitEntrypointPlugin,
     InitSubclassPlugin,
@@ -11,7 +10,9 @@ from dead_cst.plugins import (
 from dead_cst.plugins.init_subclass import INIT_SUBCLASS_PREFIX
 
 
-def test_init_subclass_keeps_subclass_alive_via_parent(tmp_path, write_files, reachable_fqnames):
+def test_init_subclass_keeps_subclass_alive_via_parent(
+    make_analysis, write_files, reachable_fqnames
+):
     write_files(
         {
             "pkg/__init__.py": "",
@@ -37,13 +38,11 @@ def test_init_subclass_keeps_subclass_alive_via_parent(tmp_path, write_files, re
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
+    graph = make_analysis(
         plugins=[
             ExplicitEntrypointPlugin(specs=["pkg.base.Plugin"]),
             InitSubclassPlugin(),
-        ],
-        project_root=tmp_path,
+        ]
     ).materialize_all()
     reached = reachable_fqnames(graph)
     # Parent is alive via the explicit entrypoint, so its subclasses come along.
@@ -54,7 +53,7 @@ def test_init_subclass_keeps_subclass_alive_via_parent(tmp_path, write_files, re
     assert "pkg.impls.Unrelated" not in reached
 
 
-def test_init_subclass_transitive_subclasses(tmp_path, write_files, reachable_fqnames):
+def test_init_subclass_transitive_subclasses(make_analysis, write_files, reachable_fqnames):
     write_files(
         {
             "pkg/__init__.py": "",
@@ -71,13 +70,11 @@ def test_init_subclass_transitive_subclasses(tmp_path, write_files, reachable_fq
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
+    graph = make_analysis(
         plugins=[
             ExplicitEntrypointPlugin(specs=["pkg.mod.Root"]),
             InitSubclassPlugin(),
-        ],
-        project_root=tmp_path,
+        ]
     ).materialize_all()
     reached = reachable_fqnames(graph)
     assert "pkg.mod.Root" in reached
@@ -85,7 +82,9 @@ def test_init_subclass_transitive_subclasses(tmp_path, write_files, reachable_fq
     assert "pkg.mod.Leaf" in reached
 
 
-def test_init_subclass_does_not_seed_parent_entrypoint(tmp_path, write_files, reachable_fqnames):
+def test_init_subclass_does_not_seed_parent_entrypoint(
+    make_analysis, write_files, reachable_fqnames
+):
     """The plugin only emits inverse edges; if nothing else keeps the parent
     alive, neither parent nor subclasses become reachable."""
     write_files(
@@ -104,17 +103,13 @@ def test_init_subclass_does_not_seed_parent_entrypoint(tmp_path, write_files, re
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[InitSubclassPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[InitSubclassPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "pkg.base.Plugin" not in reached
     assert "pkg.impls.Foo" not in reached
 
 
-def test_init_subclass_via_main_block(tmp_path, write_files, reachable_fqnames):
+def test_init_subclass_via_main_block(make_analysis, write_files, reachable_fqnames):
     """End-to-end: parent reached via a __main__ block, subclasses come along."""
     write_files(
         {
@@ -149,18 +144,14 @@ def test_init_subclass_via_main_block(tmp_path, write_files, reachable_fqnames):
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[MainBlockPlugin(), InitSubclassPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[MainBlockPlugin(), InitSubclassPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "pkg.base.Handler" in reached
     assert "pkg.impls.JSONHandler" in reached
     assert "pkg.impls.XMLHandler" in reached
 
 
-def test_init_subclass_aliased_import(tmp_path, write_files, reachable_fqnames):
+def test_init_subclass_aliased_import(make_analysis, write_files, reachable_fqnames):
     write_files(
         {
             "pkg/__init__.py": "",
@@ -177,18 +168,16 @@ def test_init_subclass_aliased_import(tmp_path, write_files, reachable_fqnames):
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
+    graph = make_analysis(
         plugins=[
             ExplicitEntrypointPlugin(specs=["pkg.base.Plugin"]),
             InitSubclassPlugin(),
-        ],
-        project_root=tmp_path,
+        ]
     ).materialize_all()
     assert "pkg.impls.Foo" in reachable_fqnames(graph)
 
 
-def test_init_subclass_dotted_attribute_base(tmp_path, write_files, reachable_fqnames):
+def test_init_subclass_dotted_attribute_base(make_analysis, write_files, reachable_fqnames):
     write_files(
         {
             "pkg/__init__.py": "",
@@ -205,19 +194,17 @@ def test_init_subclass_dotted_attribute_base(tmp_path, write_files, reachable_fq
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
+    graph = make_analysis(
         plugins=[
             ExplicitEntrypointPlugin(specs=["pkg.base.Plugin"]),
             InitSubclassPlugin(),
-        ],
-        project_root=tmp_path,
+        ]
     ).materialize_all()
     assert "pkg.impls.Foo" in reachable_fqnames(graph)
 
 
 def test_init_subclass_class_without_init_subclass_no_edges(
-    tmp_path, write_files, reachable_fqnames
+    make_analysis, write_files, reachable_fqnames
 ):
     """A regular base class with no ``__init_subclass__`` produces no edges,
     so a subclass that nothing else references stays dead even when the
@@ -237,13 +224,11 @@ def test_init_subclass_class_without_init_subclass_no_edges(
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
+    graph = make_analysis(
         plugins=[
             ExplicitEntrypointPlugin(specs=["pkg.base.Plain"]),
             InitSubclassPlugin(),
-        ],
-        project_root=tmp_path,
+        ]
     ).materialize_all()
     reached = reachable_fqnames(graph)
     assert "pkg.base.Plain" in reached
@@ -251,7 +236,7 @@ def test_init_subclass_class_without_init_subclass_no_edges(
 
 
 def test_init_subclass_keeps_subclass_method_references_alive(
-    tmp_path, write_files, reachable_fqnames
+    make_analysis, write_files, reachable_fqnames
 ):
     """Methods of a subclass kept alive by ``__init_subclass__`` reach
     through to whatever they reference -- exactly the registry-dispatch
@@ -281,13 +266,11 @@ def test_init_subclass_keeps_subclass_method_references_alive(
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
+    graph = make_analysis(
         plugins=[
             ExplicitEntrypointPlugin(specs=["pkg.base.Plugin"]),
             InitSubclassPlugin(),
-        ],
-        project_root=tmp_path,
+        ]
     ).materialize_all()
     reached = reachable_fqnames(graph)
     assert "pkg.impls.Foo" in reached
@@ -295,7 +278,7 @@ def test_init_subclass_keeps_subclass_method_references_alive(
     assert "pkg.helpers.unused_helper" not in reached
 
 
-def test_init_subclass_subscripted_base(tmp_path, write_files, reachable_fqnames):
+def test_init_subclass_subscripted_base(make_analysis, write_files, reachable_fqnames):
     """``Subscript`` bases like ``Generic[T]`` are unwrapped to their value
     so a class that inherits from a generic registry base is still wired."""
     write_files(
@@ -318,18 +301,16 @@ def test_init_subclass_subscripted_base(tmp_path, write_files, reachable_fqnames
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
+    graph = make_analysis(
         plugins=[
             ExplicitEntrypointPlugin(specs=["pkg.base.Plugin"]),
             InitSubclassPlugin(),
-        ],
-        project_root=tmp_path,
+        ]
     ).materialize_all()
     assert "pkg.impls.Foo" in reachable_fqnames(graph)
 
 
-def test_init_subclass_marker_in_predecessor_chain(tmp_path, write_files):
+def test_init_subclass_marker_in_predecessor_chain(make_analysis, write_files):
     """Reachability of a subclass routes through a labeled marker node so
     ``why-alive`` chains read ``Foo <- <__init_subclass__>:Plugin <- Plugin``."""
     write_files(
@@ -348,13 +329,11 @@ def test_init_subclass_marker_in_predecessor_chain(tmp_path, write_files):
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
+    graph = make_analysis(
         plugins=[
             ExplicitEntrypointPlugin(specs=["pkg.base.Plugin"]),
             InitSubclassPlugin(),
-        ],
-        project_root=tmp_path,
+        ]
     ).materialize_all()
     foo = next(n for n in graph.nodes if n.fqname == "pkg.impls.Foo")
     preds = list(graph.predecessors(foo))

@@ -7,9 +7,7 @@ from pathlib import Path
 import pytest
 
 from dead_cst.resolvers import (
-    PyprojectResolver,
-    UvWorkspaceResolver,
-    VenvResolver,
+    UvResolver,
     load_resolver,
     load_toml,
     merge_paths,
@@ -31,9 +29,7 @@ def test_merge_paths_drops_self():
 
 
 def test_load_resolver_known():
-    assert isinstance(load_resolver("venv"), VenvResolver)
-    assert isinstance(load_resolver("pyproject"), PyprojectResolver)
-    assert isinstance(load_resolver("uv_workspace"), UvWorkspaceResolver)
+    assert isinstance(load_resolver("uv"), UvResolver)
 
 
 def test_load_resolver_unknown_raises():

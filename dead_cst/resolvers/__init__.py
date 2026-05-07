@@ -1,9 +1,8 @@
 """Pluggable resolvers that discover sys.path-like search paths for a project.
 
-A :class:`PathResolver` takes a project root and returns a ``dict[base, [dep_paths]]``
-in the same shape :func:`dead_cst.analyze.build_symbol_graph` already
-consumes. Multiple resolvers compose by merging dicts -- see
-:func:`merge_paths`.
+A :class:`PathResolver` returns a ``dict[base, [dep_paths]]`` map plus
+an import resolver. Multiple resolvers compose by merging their maps --
+see :func:`merge_paths`.
 
 Each builtin resolver lives in its own submodule. Third-party resolvers
 can register under the ``dead_cst.resolvers`` entry-point group;
@@ -37,15 +36,11 @@ from ._imports import (
     editable_distribution_roots,
     safe_resolve_module,
 )
-from ..contrib.uv_workspace import UvWorkspaceResolver
+from ..contrib.uv import UvResolver
 from .manual import ManualResolver
-from .pyproject import PyprojectResolver
-from .venv import MissingVenvError, VenvResolver
 
 BUILTIN_RESOLVERS: dict[str, type[PathResolver]] = {
-    VenvResolver.name: VenvResolver,
-    PyprojectResolver.name: PyprojectResolver,
-    UvWorkspaceResolver.name: UvWorkspaceResolver,
+    UvResolver.name: UvResolver,
 }
 
 
@@ -67,14 +62,11 @@ __all__ = [
     "BUILTIN_RESOLVERS",
     "ImportResolver",
     "ManualResolver",
-    "MissingVenvError",
     "PathMap",
     "PathResolver",
-    "PyprojectResolver",
     "SITE_PACKAGES_MARKERS",
     "STDLIB",
-    "UvWorkspaceResolver",
-    "VenvResolver",
+    "UvResolver",
     "default_resolve_import",
     "distribution_lookup",
     "editable_distribution_roots",

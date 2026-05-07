@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-from dead_cst import Analysis
 from dead_cst.plugins import UnittestPlugin
 
 
-def test_unittest_plugin_marks_testcase_subclass(tmp_path, write_files, reachable_fqnames):
+def test_unittest_plugin_marks_testcase_subclass(make_analysis, write_files, reachable_fqnames):
     write_files(
         {
             "pkg/__init__.py": "",
@@ -21,17 +20,13 @@ def test_unittest_plugin_marks_testcase_subclass(tmp_path, write_files, reachabl
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[UnittestPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[UnittestPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "pkg.things.MyThings" in reached
     assert "pkg.things.Helper" not in reached
 
 
-def test_unittest_plugin_handles_from_import(tmp_path, write_files, reachable_fqnames):
+def test_unittest_plugin_handles_from_import(make_analysis, write_files, reachable_fqnames):
     write_files(
         {
             "pkg/__init__.py": "",
@@ -43,15 +38,11 @@ def test_unittest_plugin_handles_from_import(tmp_path, write_files, reachable_fq
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[UnittestPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[UnittestPlugin()]).materialize_all()
     assert "pkg.things.MyThings" in reachable_fqnames(graph)
 
 
-def test_unittest_plugin_handles_aliased_imports(tmp_path, write_files, reachable_fqnames):
+def test_unittest_plugin_handles_aliased_imports(make_analysis, write_files, reachable_fqnames):
     write_files(
         {
             "pkg/__init__.py": "",
@@ -69,17 +60,13 @@ def test_unittest_plugin_handles_aliased_imports(tmp_path, write_files, reachabl
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[UnittestPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[UnittestPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "pkg.aliased_module.ModAliased" in reached
     assert "pkg.aliased_class.ClsAliased" in reached
 
 
-def test_unittest_plugin_marks_async_testcase(tmp_path, write_files, reachable_fqnames):
+def test_unittest_plugin_marks_async_testcase(make_analysis, write_files, reachable_fqnames):
     write_files(
         {
             "pkg/__init__.py": "",
@@ -91,15 +78,11 @@ def test_unittest_plugin_marks_async_testcase(tmp_path, write_files, reachable_f
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[UnittestPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[UnittestPlugin()]).materialize_all()
     assert "pkg.things.MyAsync" in reachable_fqnames(graph)
 
 
-def test_unittest_plugin_marks_module_hooks(tmp_path, write_files, reachable_fqnames):
+def test_unittest_plugin_marks_module_hooks(make_analysis, write_files, reachable_fqnames):
     write_files(
         {
             "pkg/__init__.py": "",
@@ -116,11 +99,7 @@ def test_unittest_plugin_marks_module_hooks(tmp_path, write_files, reachable_fqn
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[UnittestPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[UnittestPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "pkg.things.setUpModule" in reached
     assert "pkg.things.tearDownModule" in reached
@@ -128,7 +107,7 @@ def test_unittest_plugin_marks_module_hooks(tmp_path, write_files, reachable_fqn
     assert "pkg.things.helper" not in reached
 
 
-def test_unittest_plugin_ignores_unrelated_classes(tmp_path, write_files, reachable_fqnames):
+def test_unittest_plugin_ignores_unrelated_classes(make_analysis, write_files, reachable_fqnames):
     write_files(
         {
             "pkg/__init__.py": "",
@@ -144,11 +123,7 @@ def test_unittest_plugin_ignores_unrelated_classes(tmp_path, write_files, reacha
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[UnittestPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[UnittestPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     # Bare ``TestCase`` is the locally-defined class (we never imported the
     # name from unittest), so the subclass is not picked up.
@@ -156,7 +131,7 @@ def test_unittest_plugin_ignores_unrelated_classes(tmp_path, write_files, reacha
 
 
 def test_unittest_plugin_skips_files_not_importing_unittest(
-    tmp_path, write_files, reachable_fqnames
+    make_analysis, write_files, reachable_fqnames
 ):
     write_files(
         {
@@ -170,15 +145,11 @@ def test_unittest_plugin_skips_files_not_importing_unittest(
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[UnittestPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[UnittestPlugin()]).materialize_all()
     assert "pkg.things.MyThings" not in reachable_fqnames(graph)
 
 
-def test_unittest_plugin_skips_pure_star_import(tmp_path, write_files, reachable_fqnames):
+def test_unittest_plugin_skips_pure_star_import(make_analysis, write_files, reachable_fqnames):
     # Documented limitation: the resolver doesn't surface stdlib star
     # imports as graph nodes, so the prefilter can't see them. Users
     # should ``from unittest import TestCase`` instead.
@@ -193,11 +164,7 @@ def test_unittest_plugin_skips_pure_star_import(tmp_path, write_files, reachable
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[UnittestPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[UnittestPlugin()]).materialize_all()
     assert "pkg.things.MyThings" not in reachable_fqnames(graph)
 
 

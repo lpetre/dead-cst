@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import pytest
 
-from dead_cst import Analysis
 from dead_cst.contrib.mock_patch import PATCH_TARGET_PREFIX
 from dead_cst.plugins import MockPatchPlugin, PytestPlugin, UnittestPlugin
 
@@ -112,7 +111,9 @@ _RECOGNIZED_FORMS: list[tuple[str, str]] = [
     [src for _, src in _RECOGNIZED_FORMS],
     ids=[name for name, _ in _RECOGNIZED_FORMS],
 )
-def test_recognized_form_keeps_target_alive(tmp_path, write_files, reachable_fqnames, test_source):
+def test_recognized_form_keeps_target_alive(
+    make_analysis, write_files, reachable_fqnames, test_source
+):
     write_files(
         {
             "pkg/__init__.py": "",
@@ -121,15 +122,11 @@ def test_recognized_form_keeps_target_alive(tmp_path, write_files, reachable_fqn
             "tests/test_lib.py": test_source,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[MockPatchPlugin(), PytestPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[MockPatchPlugin(), PytestPlugin()]).materialize_all()
     assert "pkg.lib.helper" in reachable_fqnames(graph)
 
 
-def test_class_method_target_resolves_to_class(tmp_path, write_files, reachable_fqnames):
+def test_class_method_target_resolves_to_class(make_analysis, write_files, reachable_fqnames):
     """``patch("pkg.lib.Cls.method")`` walks back to the class node.
 
     Methods are not represented as their own graph nodes, so resolution
@@ -152,15 +149,11 @@ def test_class_method_target_resolves_to_class(tmp_path, write_files, reachable_
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[MockPatchPlugin(), PytestPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[MockPatchPlugin(), PytestPlugin()]).materialize_all()
     assert "pkg.lib.Cls" in reachable_fqnames(graph)
 
 
-def test_unrelated_patch_method_not_recognized(tmp_path, write_files, reachable_fqnames):
+def test_unrelated_patch_method_not_recognized(make_analysis, write_files, reachable_fqnames):
     """``<flask_app>.patch("/url")`` is not a mock call and must not
     promote the string to an fqname reference."""
     write_files(
@@ -180,18 +173,14 @@ def test_unrelated_patch_method_not_recognized(tmp_path, write_files, reachable_
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[MockPatchPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[MockPatchPlugin()]).materialize_all()
     # ``handler`` itself isn't reachable (no entrypoint), so neither is
     # ``helper`` -- the plugin must not have hijacked the unrelated
     # ``app.patch`` call into an fqname reference.
     assert "pkg.lib.helper" not in reachable_fqnames(graph)
 
 
-def test_no_imports_no_effect(tmp_path, write_files, reachable_fqnames):
+def test_no_imports_no_effect(make_analysis, write_files, reachable_fqnames):
     """Files that don't import a recognized mock binding contribute
     nothing -- a bare ``patch("X")`` call could be anything."""
     write_files(
@@ -207,17 +196,13 @@ def test_no_imports_no_effect(tmp_path, write_files, reachable_fqnames):
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[MockPatchPlugin(), PytestPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[MockPatchPlugin(), PytestPlugin()]).materialize_all()
     # ``patch`` came from a non-mock module, so the plugin does not
     # treat the string as an fqname reference.
     assert "pkg.lib.helper" not in reachable_fqnames(graph)
 
 
-def test_unittest_testcase_patch(tmp_path, write_files, reachable_fqnames):
+def test_unittest_testcase_patch(make_analysis, write_files, reachable_fqnames):
     """``@patch("X")`` on a ``unittest.TestCase`` test method works."""
     write_files(
         {
@@ -234,15 +219,11 @@ def test_unittest_testcase_patch(tmp_path, write_files, reachable_fqnames):
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[MockPatchPlugin(), UnittestPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[MockPatchPlugin(), UnittestPlugin()]).materialize_all()
     assert "pkg.lib.helper" in reachable_fqnames(graph)
 
 
-def test_unresolved_target_is_harmless(tmp_path, write_files, reachable_fqnames):
+def test_unresolved_target_is_harmless(make_analysis, write_files, reachable_fqnames):
     """Patches against third-party / non-existent fqnames have no
     first-party decl to keep alive; the test still runs to completion."""
     write_files(
@@ -258,15 +239,11 @@ def test_unresolved_target_is_harmless(tmp_path, write_files, reachable_fqnames)
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[MockPatchPlugin(), PytestPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[MockPatchPlugin(), PytestPlugin()]).materialize_all()
     assert "pkg.lib.helper" not in reachable_fqnames(graph)
 
 
-def test_module_target_keeps_module_alive(tmp_path, write_files, reachable_fqnames):
+def test_module_target_keeps_module_alive(make_analysis, write_files, reachable_fqnames):
     """``patch("pkg.lib")`` keeps the module itself alive."""
     write_files(
         {
@@ -281,15 +258,11 @@ def test_module_target_keeps_module_alive(tmp_path, write_files, reachable_fqnam
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[MockPatchPlugin(), PytestPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[MockPatchPlugin(), PytestPlugin()]).materialize_all()
     assert "pkg.lib" in reachable_fqnames(graph)
 
 
-def test_only_marks_target_when_test_alive(tmp_path, write_files, reachable_fqnames):
+def test_only_marks_target_when_test_alive(make_analysis, write_files, reachable_fqnames):
     """A patch reference inside a dead decl doesn't promote anything.
 
     No entrypoint reaches ``isolated_helper``, so the synthesized
@@ -309,16 +282,12 @@ def test_only_marks_target_when_test_alive(tmp_path, write_files, reachable_fqna
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[MockPatchPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[MockPatchPlugin()]).materialize_all()
     assert "pkg.lib.helper" not in reachable_fqnames(graph)
 
 
 def test_monkeypatch_setattr_object_form_not_treated_as_fqname(
-    tmp_path, write_files, reachable_fqnames
+    make_analysis, write_files, reachable_fqnames
 ):
     """``monkeypatch.setattr(obj, "attr", value)`` has 3 positional args
     and is the object form -- the ``"attr"`` string must not be treated
@@ -340,16 +309,12 @@ def test_monkeypatch_setattr_object_form_not_treated_as_fqname(
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[MockPatchPlugin(), PytestPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[MockPatchPlugin(), PytestPlugin()]).materialize_all()
     synthetics = {n.fqname for n in graph.nodes if n.type == "synthetic"}
     assert f"{PATCH_TARGET_PREFIX}helper" not in synthetics
 
 
-def test_monkeypatch_setitem_not_recognized(tmp_path, write_files, reachable_fqnames):
+def test_monkeypatch_setitem_not_recognized(make_analysis, write_files, reachable_fqnames):
     """``monkeypatch.setitem(d, "key", value)`` patches a dict, not a
     symbol -- the string is a key, not a fqname."""
     write_files(
@@ -364,11 +329,7 @@ def test_monkeypatch_setitem_not_recognized(tmp_path, write_files, reachable_fqn
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[MockPatchPlugin(), PytestPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[MockPatchPlugin(), PytestPlugin()]).materialize_all()
     assert "pkg.lib.helper" not in reachable_fqnames(graph)
 
 
