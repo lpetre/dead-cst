@@ -697,8 +697,11 @@ class Analysis:
 
     Holds the analyzer's config (paths, plugins, resolvers, cache,
     detector, worker count) and memoizes per-base work so multiple
-    queries against the same project share the cost. Construction is
-    cheap; nothing is read or parsed until you ask.
+    queries against the same project share the cost. Construction
+    runs each resolver's :meth:`PathResolver.resolve` once to build
+    the path map, but no source files are read or parsed until you
+    ask -- the visitor pass is gated on :meth:`refresh` /
+    :meth:`materialize_all`.
 
     Three coarse stages happen on demand:
 
