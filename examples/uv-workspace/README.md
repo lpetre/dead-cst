@@ -23,7 +23,7 @@ uv-workspace/
 
 Each member uses the flat layout: importable code lives in a top-level
 package directory (`core/` or `app/`) and `tests/` sits next to it. Only
-the EXPORTED `SourceTree` per package contributes to that package's
+the `exported` portion of each `Package` contributes to that package's
 export trie -- so when `app` resolves an import, it never sees
 `core/tests/` (and vice-versa), even though both members have a top-level
 `tests/` package.
@@ -32,10 +32,10 @@ export trie -- so when `app` resolves an import, it never sees
 
 ```bash
 uv run dead-cst analyze examples/uv-workspace \
-    --resolver uv_workspace --plugin main_block
+    --resolver uv --plugin main_block
 ```
 
-The `uv_workspace` resolver reads `uv.lock`, treats every `[[package]]` with
+The `uv` resolver reads `uv.lock`, treats every `[[package]]` with
 `source = { editable = "..." }` as a workspace member, and wires each
 member's source root together using uv's resolved dependency graph. The
 above command is roughly equivalent to:
@@ -90,28 +90,27 @@ The two `tests` modules are distinct nodes (one per file path) and
 coexist in the graph; the per-package export-trie rule keeps them from
 colliding during cross-package import resolution.
 
-## How `UvWorkspaceResolver` decides on a source root
+## How `UvResolver` decides on a `Package`
 
-For each workspace member directory, the resolver picks `<member>/src` if
-that directory exists, otherwise the member directory itself. This matches
-`PyprojectResolver`'s single-package convention and covers both the
-`src/`-layout and the flat layout.
+For each workspace member directory, the resolver builds one `Package`
+whose `path` is the member directory itself, whose `exported` comes from
+the member's `pyproject.toml` (via `exported_tree_root` -- `<member>/src`
+when the src layout is used, otherwise the member directory), and whose
+`deps` are the member's other workspace deps from the lockfile.
 
 Direct dependency edges come from each member's `dependencies = [...]` list
 in `uv.lock`; non-workspace deps (regular PyPI packages) are dropped because
 they don't have a source tree under your control.
 
-Each member's resolved `SourceTree` is marked EXPORTED; only the EXPORTED
-tree's decls populate the package's export trie that other members see.
-The resolver picks the source root using a `src/`-layout shortcut, falling
-back to the member directory itself.
+Files under `path` but not under any `exported` subdir (tests, scripts,
+root-level `conftest.py`) are *internal* and parsed in phase 2, so they
+can import other members' exports without participating in the deps DAG.
 
 ## Falling back to explicit paths
 
 If you don't want to commit a `uv.lock`, the multi-`-p` invocation above
-keeps working. `ManualResolver` produces one EXPORTED tree per `-p`
-spec and doesn't analyze separate `tests/` subtrees; for multi-flat-layout
-workspaces with overlapping internal packages (`tests/`, `scripts/`, etc.),
-prefer the `uv_workspace` resolver or configure
-`[[tool.dead-cst.trees]]` per member so each member's exports are made
-explicit.
+keeps working. `ManualResolver` produces one `Package` per `-p` spec with
+the entire spec dir marked `exported`; for multi-flat-layout workspaces
+with overlapping internal packages (`tests/`, `scripts/`, etc.), prefer
+the `uv` resolver or configure `[[tool.dead-cst.packages]]` per member so
+each member's exports are made explicit.

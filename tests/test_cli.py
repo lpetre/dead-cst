@@ -29,7 +29,7 @@ from dead_cst.plugins import (
 from dead_cst.plugins._core import EXTERNAL_DIST_PREFIX
 from dead_cst.plugins.explicit_entrypoint import EXPLICIT_PREFIX
 from dead_cst.graph import SymbolNode
-from dead_cst.resolvers import ManualResolver, SourceTreeFlags
+from dead_cst.resolvers import ManualResolver
 from dead_cst.cli import (
     _dead_real,
     _is_dunder_all,
@@ -137,18 +137,21 @@ def test_manual_resolver_empty_specs(tmp_path):
         pytest.param(
             ["src:dep1", "lib"],
             [("src", ("dep1",)), ("lib", ())],
-            id="multiple-specs-emit-multiple-trees",
+            id="multiple-specs-emit-multiple-packages",
         ),
     ],
 )
 def test_manual_resolver_parses_specs(tmp_path, specs, expected):
+    """``-p path[:dep1,dep2]`` becomes one Package per spec, with the
+    entire dir marked ``exported`` and ``deps`` listing other packages
+    by name."""
     result = ManualResolver(specs=specs).resolve(tmp_path)
-    assert [(t.path, t.search_trees) for t in result] == [
-        ((tmp_path / p).resolve(), tuple((tmp_path / d).resolve() for d in deps))
-        for p, deps in expected
+    assert [(p.path, p.deps) for p in result] == [
+        ((tmp_path / path).resolve(), deps) for path, deps in expected
     ]
-    for tree in result:
-        assert tree.flags & SourceTreeFlags.EXPORTED
+    for pkg in result:
+        # Each package's full directory is marked exported.
+        assert pkg.exported == (pkg.path,)
 
 
 def test_build_resolvers_no_specs_no_resolvers_defaults_to_dot(tmp_path):

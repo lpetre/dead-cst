@@ -4,7 +4,7 @@
 build backend would ship as the wheel's importable surface. Both
 :class:`~dead_cst.resolvers.pyproject.PyprojectResolver` and the
 ``uv``-aware contrib resolver use it to pick each project's exported
-:class:`~dead_cst.resolvers.SourceTree` path; custom resolvers can
+:class:`~dead_cst.resolvers.Package` subdir; custom resolvers can
 call it the same way to stay consistent with the rest of the
 ecosystem.
 """
@@ -122,7 +122,7 @@ def exported_roots(project_dir: Path) -> list[Path] | None:
 
 
 def exported_tree_root(project_dir: Path) -> Path | None:
-    """Single directory to use as the exported :class:`SourceTree`'s path.
+    """Single directory to use as a :class:`Package`'s exported subdir.
 
     Two cases:
 

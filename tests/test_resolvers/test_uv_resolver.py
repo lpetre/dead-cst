@@ -5,7 +5,7 @@ from __future__ import annotations
 import textwrap
 from pathlib import Path
 
-from dead_cst.resolvers import SourceTreeFlags, UvResolver
+from dead_cst.resolvers import UvResolver
 
 
 def _write_uv(tmp_path: Path, *, with_src: bool = True) -> None:
@@ -55,59 +55,37 @@ def _write_uv(tmp_path: Path, *, with_src: bool = True) -> None:
     )
 
 
-def _by_pkg(trees):
-    """Index trees by package, keeping only the EXPORTED tree per package.
-
-    Multi-tree-per-package layouts (src-layout members get a sibling
-    non-exported tree at the member root for tests / scripts / etc.)
-    mean a flat ``{pkg: tree}`` dict drops half the data; tests that
-    only care about the exported tree per package use this helper.
-    """
-    return {t.package: t for t in trees if t.flags & SourceTreeFlags.EXPORTED}
+def _by_name(packages):
+    return {p.name: p for p in packages}
 
 
 def test_uv_resolver_src_layout(tmp_path: Path):
     _write_uv(tmp_path)
 
     result = UvResolver().resolve(tmp_path)
-    by = _by_pkg(result)
+    by = _by_name(result)
 
-    core_src = (tmp_path / "packages" / "core" / "src").resolve()
-    app_src = (tmp_path / "packages" / "app" / "src").resolve()
-    assert by["core"].path == core_src
-    assert by["core"].search_trees == ()
-    assert by["app"].path == app_src
-    assert by["app"].search_trees == (core_src,)
-
-    # src-layout members also pick up a non-exported tree at the
-    # member root, so ``tests/`` / ``scripts/`` / root-level
-    # ``conftest.py`` get walked alongside the exported source.
-    rest = [t for t in result if not (t.flags & SourceTreeFlags.EXPORTED)]
-    rest_by_pkg = {t.package: t for t in rest}
     core_dir = (tmp_path / "packages" / "core").resolve()
     app_dir = (tmp_path / "packages" / "app").resolve()
-    assert rest_by_pkg["core"].path == core_dir
-    assert rest_by_pkg["core"].search_trees == (core_src,)
-    assert rest_by_pkg["app"].path == app_dir
-    assert rest_by_pkg["app"].search_trees == (app_src, core_src)
+    assert by["core"].path == core_dir
+    assert by["core"].exported == ((core_dir / "src").resolve(),)
+    assert by["core"].deps == ()
+    assert by["app"].path == app_dir
+    assert by["app"].exported == ((app_dir / "src").resolve(),)
+    assert by["app"].deps == ("core",)
 
 
 def test_uv_resolver_flat_layout(tmp_path: Path):
     _write_uv(tmp_path, with_src=False)
 
     result = UvResolver().resolve(tmp_path)
-    by = _by_pkg(result)
+    by = _by_name(result)
 
     core_dir = (tmp_path / "packages" / "core").resolve()
     app_dir = (tmp_path / "packages" / "app").resolve()
     assert by["core"].path == core_dir
     assert by["app"].path == app_dir
-    assert by["app"].search_trees == (core_dir,)
-
-    # Flat-layout members have tree_root == member_dir, so no
-    # extra non-exported tree is emitted (the member dir IS the
-    # exported tree, and walking it covers tests/ etc. naturally).
-    assert all(t.flags & SourceTreeFlags.EXPORTED for t in result)
+    assert by["app"].deps == ("core",)
 
 
 def test_uv_resolver_skips_virtual_root(tmp_path: Path):
@@ -116,7 +94,7 @@ def test_uv_resolver_skips_virtual_root(tmp_path: Path):
     result = UvResolver().resolve(tmp_path)
 
     # The "ws" package has source = { virtual = "." } and must not appear.
-    assert tmp_path.resolve() not in {t.path for t in result}
+    assert tmp_path.resolve() not in {p.path for p in result}
 
 
 def test_uv_resolver_includes_virtual_members(tmp_path: Path):
@@ -163,12 +141,12 @@ def test_uv_resolver_includes_virtual_members(tmp_path: Path):
     )
 
     result = UvResolver().resolve(tmp_path)
-    by = _by_pkg(result)
-    lib_src = (tmp_path / "libs" / "lib-a" / "src").resolve()
-    app_src = (tmp_path / "apps" / "app-a" / "src").resolve()
-    assert by["lib-a"].path == lib_src
-    assert by["app-a"].path == app_src
-    assert by["app-a"].search_trees == (lib_src,)
+    by = _by_name(result)
+    lib_dir = (tmp_path / "libs" / "lib-a").resolve()
+    app_dir = (tmp_path / "apps" / "app-a").resolve()
+    assert by["lib-a"].path == lib_dir
+    assert by["app-a"].path == app_dir
+    assert by["app-a"].deps == ("lib-a",)
 
 
 def test_uv_resolver_no_lockfile(tmp_path: Path):
@@ -188,9 +166,8 @@ def test_uv_resolver_ignores_non_workspace_deps(tmp_path: Path):
     )
 
     result = UvResolver().resolve(tmp_path)
-    by = _by_pkg(result)
-    core_src = (tmp_path / "packages" / "core" / "src").resolve()
-    assert by["app"].search_trees == (core_src,)
+    by = _by_name(result)
+    assert by["app"].deps == ("core",)
 
 
 def test_uv_resolver_explicit_lock_path(tmp_path: Path):
@@ -205,9 +182,9 @@ def test_uv_resolver_explicit_lock_path(tmp_path: Path):
 
 
 def test_uv_src_layout_walks_tests_dir(tmp_path: Path):
-    """src-layout members get a non-exported tree at the member root,
-    so files in sibling ``tests/`` are walked (and reachable from
-    plugins like pytest) instead of silently dropped."""
+    """src-layout members include sibling ``tests/`` etc. as internal
+    files (everything under ``path`` not under ``exported``), so they
+    get walked by phase 2."""
     from dead_cst import Analysis
 
     _write_uv(tmp_path)

@@ -33,8 +33,8 @@ from .plugins import (
 from .plugins.module_dunders import DUNDER_PREFIX
 from .resolvers import (
     ManualResolver,
+    Package,
     PathResolver,
-    SourceTree,
     load_resolver,
 )
 
@@ -212,15 +212,15 @@ def analyze(
             workers=workers,
         )
         graph = analysis.materialize_all()
-    trees = analysis.source_trees
+    packages = analysis.packages
     reachable = _find_reachable(graph)
 
     unreachable_graph = graph.subgraph([n for n in graph.nodes if n not in reachable])
 
     if output_format == OutputFormat.json:
-        _output_json(graph, unreachable_graph, root, trees)
+        _output_json(graph, unreachable_graph, root, packages)
     else:
-        _output_text(graph, unreachable_graph, root, trees)
+        _output_text(graph, unreachable_graph, root, packages)
 
     if unreachable_graph.number_of_nodes() > 0:
         raise typer.Exit(1)
@@ -230,12 +230,12 @@ def _output_text(
     graph: nx.MultiDiGraph,
     unreachable: nx.MultiDiGraph,
     root: Path,
-    trees: list[SourceTree],
+    packages: list[Package],
 ) -> None:
-    for tree in trees:
-        typer.echo(f"\n{tree.path}:")
-        total_counts = _count_nodes(graph, tree.path)
-        unreachable_counts = _count_nodes(unreachable, tree.path)
+    for pkg in packages:
+        typer.echo(f"\n{pkg.path}:")
+        total_counts = _count_nodes(graph, pkg.path)
+        unreachable_counts = _count_nodes(unreachable, pkg.path)
         for kind in sorted(total_counts):
             if kind == "synthetic":
                 continue
@@ -252,7 +252,7 @@ def _output_text(
         for node in sorted(dead_real, key=lambda n: (str(n.path), n.fqname)):
             typer.echo(f"  {node.fqname} ({node.type}) at {_rel_path(node.path, root)}")
 
-    branches = _dead_suite_locations(graph, trees)
+    branches = _dead_suite_locations(graph, packages)
     if branches:
         typer.echo(f"\nUnreachable branches ({len(branches)}):")
         for path, pos in branches:
@@ -268,14 +268,14 @@ def _dead_real(unreachable: nx.MultiDiGraph) -> list[SymbolNode]:
 
 
 def _dead_suite_locations(
-    graph: nx.MultiDiGraph, trees: list[SourceTree]
+    graph: nx.MultiDiGraph, packages: list[Package]
 ) -> list[tuple[Path, CodeRange]]:
     """Flatten ``graph.graph["dead_suites"]`` into a sorted ``(path, pos)`` list,
-    restricted to files under any configured tree."""
+    restricted to files under any configured package."""
     raw: dict = graph.graph.get("dead_suites", {})
     out: list[tuple[Path, CodeRange]] = []
     for path, suites in raw.items():
-        if not any(path.is_relative_to(t.path) for t in trees):
+        if not any(path.is_relative_to(p.path) for p in packages):
             continue
         for pos in suites:
             out.append((path, pos))
@@ -287,7 +287,7 @@ def _output_json(
     graph: nx.MultiDiGraph,
     unreachable: nx.MultiDiGraph,
     root: Path,
-    trees: list[SourceTree],
+    packages: list[Package],
 ) -> None:
     result: dict = {
         "summary": {},
@@ -295,10 +295,10 @@ def _output_json(
         "unreachable_branches": [],
     }
 
-    for tree in trees:
-        path_str = str(tree.path)
-        total_counts = _count_nodes(graph, tree.path)
-        unreachable_counts = _count_nodes(unreachable, tree.path)
+    for pkg in packages:
+        path_str = str(pkg.path)
+        total_counts = _count_nodes(graph, pkg.path)
+        unreachable_counts = _count_nodes(unreachable, pkg.path)
         result["summary"][path_str] = {
             kind: {"total": total_counts[kind], "dead": unreachable_counts.get(kind, 0)}
             for kind in total_counts
@@ -314,7 +314,7 @@ def _output_json(
             }
         )
 
-    for path, pos in _dead_suite_locations(graph, trees):
+    for path, pos in _dead_suite_locations(graph, packages):
         result["unreachable_branches"].append(
             {
                 "path": str(_rel_path(path, root)),
@@ -441,25 +441,25 @@ def dependencies(
             workers=workers,
         )
         graph = analysis.materialize_all()
-    trees = analysis.source_trees
+    packages = analysis.packages
 
-    deps_by_tree: dict[Path, list[SymbolNode]] = {tree.path: [] for tree in trees}
+    deps_by_pkg: dict[Path, list[SymbolNode]] = {pkg.path: [] for pkg in packages}
     for node in graph.nodes:
         if not _is_external_dep(node):
             continue
-        if node.path in deps_by_tree:
-            deps_by_tree[node.path].append(node)
+        if node.path in deps_by_pkg:
+            deps_by_pkg[node.path].append(node)
 
     if output_format == OutputFormat.json:
         result = {
-            str(tree_path): sorted(n.fqname for n in nodes)
-            for tree_path, nodes in deps_by_tree.items()
+            str(pkg_path): sorted(n.fqname for n in nodes)
+            for pkg_path, nodes in deps_by_pkg.items()
         }
         typer.echo(json.dumps(result, indent=2))
         return
 
-    for tree_path, nodes in deps_by_tree.items():
-        typer.echo(f"\n{tree_path}:")
+    for pkg_path, nodes in deps_by_pkg.items():
+        typer.echo(f"\n{pkg_path}:")
         if not nodes:
             typer.echo("  (no third-party dependencies found)")
             continue
@@ -602,7 +602,7 @@ def remove(
             workers=workers,
         )
         graph = analysis.materialize_all()
-    trees = analysis.source_trees
+    packages = analysis.packages
     reachable = _find_reachable(graph)
 
     unreachable_graph = graph.subgraph([n for n in graph.nodes if n not in reachable])
@@ -625,8 +625,8 @@ def remove(
         typer.echo("Aborted.")
         return
 
-    for tree in trees:
-        remove_code(unreachable_graph, tree.path)
+    for pkg in packages:
+        remove_code(unreachable_graph, pkg.path)
 
     typer.echo("Dead code removed.")
 

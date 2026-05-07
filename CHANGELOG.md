@@ -11,85 +11,98 @@ two versions.
 
 ### Changed (breaking)
 - Resolver protocol now operates on a flat list of
-  `dead_cst.SourceTree` entries (a directory + `package` name +
-  `SourceTreeFlags` + `search_trees`) rather than the previous
-  `PathMap = dict[base, [dep_paths]]`. Each package may carry at
-  most one `EXPORTED` tree; non-exported trees (tests, scripts,
-  internal helpers) participate in the analysis but do not appear
-  in the package's consumer-visible export trie. Files are routed
-  to their longest-prefix-matching tree, so a package can split
-  itself into multiple subtrees with different `search_trees`
-  (e.g. `pkg/`, `pkg/tests/`, `pkg/scripts/`) without per-file
-  shims. `validate_source_trees` enforces the invariants
-  (one EXPORTED per package, every search ref points at an
-  EXPORTED tree, no self-reference, acyclic).
-- `PathResolver.resolve` now returns `list[SourceTree]`. The shipped
+  `dead_cst.Package` entries (a directory `path` + unique `name` +
+  `exported` subdirs + `deps` -- other package names) rather than
+  the previous `PathMap = dict[base, [dep_paths]]`. Each package
+  owns every `.py` file under its `path` (longest-prefix match);
+  files inside any `exported` subdir are part of the wheel-shipped
+  surface, everything else under `path` (tests, scripts, app
+  entrypoints) is *internal*. `deps` is the production DAG between
+  packages; `validate_packages` enforces non-empty unique names,
+  unique paths, exported subdirs under `path`, no self-deps, and
+  acyclic `deps`.
+- The analyzer now parses each package in two phases. **Phase 1**
+  walks every package's exported files in topological order over
+  `deps` and stitches cross-package imports against each dep's
+  already-built export trie (the strict production DAG).
+  **Phase 2** walks every package's internal files in any order
+  against the union of every package's export trie -- so
+  non-exported code can have apparent cross-package cycles
+  (`A.tests` importing `B.lib` while `B.tests` imports `A.lib`)
+  without violating `deps`. The boundary between exported and
+  internal is what makes this sound: only exported code
+  participates in the deps DAG.
+- `PathResolver.resolve` now returns `list[Package]`. The shipped
   resolvers (`PyprojectResolver`, `ManualResolver`, `UvResolver`)
-  all return tree lists.
-- `UvWorkspaceResolver` renamed to `UvResolver` (and the module
-  `dead_cst.contrib.uv_workspace` to `dead_cst.contrib.uv_resolver`,
-  builtin name `uv_workspace` to `uv`). The resolver is unchanged in
+  all return package lists.
+- `UvWorkspaceResolver` renamed to `UvResolver` (module
+  `dead_cst.contrib.uv_workspace` -> `dead_cst.contrib.uv_resolver`,
+  builtin name `uv_workspace` -> `uv`). The resolver is unchanged in
   spirit -- it reads `uv.lock` -- but the new name reflects that it
   handles single-package uv projects too, not just multi-member
-  workspaces.
-- `UvResolver` now emits a non-exported `SourceTree` at the member
-  root (in addition to the exported tree at the wheel-target dir)
-  when the exported tree is a strict subdirectory. For src-layout
-  members this walks `tests/`, `scripts/`, root-level
-  `conftest.py`, and other files that live alongside `src/` but
-  aren't shipped in the wheel; previously those were silently
-  ignored. Search refs on the rest tree include the package's own
-  exported tree plus every workspace dep's exported tree, so tests
-  resolve `from <package> import ...` and workspace-dep imports
-  the same way the production code does.
+  workspaces. Each member becomes one `Package` whose `exported`
+  comes from the member's `pyproject.toml` (via
+  `exported_tree_root`) and whose `deps` are the member's other
+  workspace deps from the lockfile.
 - `dead-cst` no longer threads venv `site-packages` paths through the
   resolver protocol. Run `dead-cst` with the project's virtual
   environment active (`uv run dead-cst ...` or activate the venv
   first) so third-party imports resolve via the running Python's
   `sys.path`.
-- `Analysis`'s public navigation API is keyed on package names rather
-  than tree paths: `Analysis.reverse_closure(package: str) ->
-  frozenset[str]`, `Analysis.refresh(packages=...)`, and
-  `Analysis.materialize_closure(package: str)`. `Analysis.packages`
-  replaces the previous `bases` property. Tree-level structures (the
-  per-tree DAG, per-tree fingerprint, per-tree contributions) are
-  still what drive the actual work but they're internal; consumers
-  reason about packages.
+- `Analysis`'s public navigation API is keyed on package names:
+  `Analysis.packages` returns `list[Package]`, `Analysis.package_names`
+  returns the names, `Analysis.reverse_closure(package: str) ->
+  frozenset[str]` walks the `deps` DAG, and `Analysis.refresh` /
+  `Analysis.package(name)` take package names. The previous
+  `Analysis.source_trees` is gone.
+- `Analysis.materialize_closure(package)` now returns the same graph
+  as `materialize_all()`. Phase 2's all-to-all visibility makes a
+  closure-scoped graph unsound -- any package's internals could
+  keep `package`'s decls alive -- so the API is kept for stability
+  but no longer narrows the work.
+- Explicit `pyproject.toml` configuration moved from
+  `[[tool.dead-cst.trees]]` to `[[tool.dead-cst.packages]]` with
+  the new shape (`path`, `name`, `exported = [...]`, `deps = [...]`).
 - `Analysis.__init__` is now `Analysis(project_root, *, resolvers=(),
   plugins=(), cache=None, ...)`. The `source_trees` positional arg is
-  gone; the analyzer derives the tree list by calling each resolver's
-  `resolve(project_root)`. Callers that previously hand-built a
-  `list[SourceTree]` should pass a resolver that returns it (e.g.
-  `ManualResolver(specs=[...])`). The CLI gains a one-resolver
+  gone; the analyzer derives the package list by calling each
+  resolver's `resolve(project_root)`. The CLI gains a one-resolver
   default of `ManualResolver(specs=["."])` when neither `-p` nor
   `--resolver` is passed, so `dead-cst analyze /some/dir` keeps
   working unchanged.
 
 ### Removed
+- `dead_cst.SourceTree`, `dead_cst.SourceTreeFlags`,
+  `dead_cst.resolvers.validate_source_trees`,
+  `dead_cst.resolvers.assign_file_to_tree`. Replaced by `Package`,
+  `validate_packages`, `assign_file_to_package`, plus the new
+  `is_exported_file` and `export_search_root` helpers.
 - `VenvResolver`, `MissingVenvError`, `find_venv_site_packages`. The
   venv-aware behavior they encoded is replaced by the
   "run-with-venv-active" contract above.
 - `dead_cst.resolvers.PathMap` and `dead_cst.resolvers.merge_paths`.
-  Multiple resolvers' `SourceTree` lists concatenate; there is no
+  Multiple resolvers' `Package` lists concatenate; there is no
   per-base merge step.
 
 ### Added
-- `dead_cst.SourceTree`, `dead_cst.SourceTreeFlags` (with
-  `EXPORTED`), `dead_cst.resolvers.validate_source_trees`,
-  `dead_cst.resolvers.assign_file_to_tree`. The first two are
-  re-exported from the top-level `dead_cst` package.
-- `[tool.dead-cst].trees` configuration in `pyproject.toml`: an
-  explicit list of trees with their `path`, `package`, `exported`
-  flag, and `search_trees`, for projects whose layout doesn't fit
-  the conventional fallback (`src/`, `tests/`).
+- `dead_cst.Package`, `dead_cst.resolvers.validate_packages`,
+  `dead_cst.resolvers.assign_file_to_package`,
+  `dead_cst.resolvers.is_exported_file`,
+  `dead_cst.resolvers.export_search_root`. `Package` is re-exported
+  from the top-level `dead_cst` package.
+- `[tool.dead-cst].packages` configuration in `pyproject.toml`: an
+  explicit list of packages with their `path`, `name`, `exported`
+  subdirs, and `deps`, for projects whose layout doesn't fit the
+  conventional fallback (single package rooted at `project_root`
+  with `exported` derived from the build backend).
 - `dead_cst.resolvers.exported_roots(project_dir)` and
   `dead_cst.resolvers.exported_tree_root(project_dir)` helpers. The
   first returns the importable dirs the project's build backend
   would ship (hatchling / setuptools / poetry / pdm / flit dispatch
-  plus a name-match fallback); the second derives a single
-  ``SourceTree`` path from those, with a src-layout shortcut. Both
-  shipped resolvers (`PyprojectResolver`, `UvResolver`) call them
-  internally so a `pyproject.toml`-aware exported-tree pick is
+  plus a name-match fallback); the second derives a single exported
+  subdir from those, with a src-layout shortcut. Both shipped
+  resolvers (`PyprojectResolver`, `UvResolver`) call them
+  internally so a `pyproject.toml`-aware exported-subdir pick is
   available to custom resolvers too.
 - New primary API: `dead_cst.Analysis` and `dead_cst.PackageView`,
   the lazy entry point that callers should reach for on large repos.

@@ -33,49 +33,48 @@ from .plugins._core import (
 )
 from .resolvers import (
     ImportResolver,
+    Package,
     PathResolver,
-    SourceTree,
-    SourceTreeFlags,
-    assign_file_to_tree,
+    assign_file_to_package,
     default_resolve_import,
     distribution_lookup,
     editable_distribution_roots,
+    export_search_root,
+    is_exported_file,
     safe_resolve_module,
-    validate_source_trees,
+    validate_packages,
 )
-from .resolvers._core import _ValidatedTrees
+from .resolvers._core import _ValidatedPackages
 
 logger = logging.getLogger(__name__)
 
+# Phase tags. Phase 1 walks every package's exported files in
+# topological order over ``deps``. Phase 2 walks the rest -- tests,
+# scripts, app entrypoints -- against every package's already-built
+# export trie, so non-exported code can have apparent cross-package
+# cycles without violating the production DAG.
+_PHASE_EXPORTS = "exports"
+_PHASE_INTERNALS = "internals"
 
-def _build_tree_dag(validated: _ValidatedTrees) -> nx.DiGraph:
-    """``dep -> consumer`` DAG over :class:`SourceTree` paths.
 
-    Edges go ``S -> T`` where ``S`` is in ``T.search_trees`` (deps
-    flow into consumers). Topological order over this DAG drives
-    processing -- a consumer's ``symbol_lookup`` requires every dep's
-    contribution to be ready before edges are stitched.
+def _build_pkg_dag(validated: _ValidatedPackages) -> nx.DiGraph:
+    """``dep -> consumer`` DAG over package names.
+
+    Edges go ``D -> C`` where ``D`` is in ``C.deps`` (deps flow into
+    consumers). Topological order over this DAG drives phase-1
+    processing -- a consumer's export-trie stitch requires every
+    dep's export trie to be ready before edges resolve.
     """
     g: nx.DiGraph = nx.DiGraph()
-    for path, tree in validated.by_path.items():
-        g.add_node(path)
-        for ref in tree.search_trees:
-            if ref in validated.by_path:
-                g.add_edge(ref, path)
+    for name, pkg in validated.by_name.items():
+        g.add_node(name)
+        for dep in pkg.deps:
+            g.add_edge(dep, name)
     return g
 
 
 def _chain_resolvers(resolvers: Sequence[PathResolver]) -> ImportResolver:
-    """Compose ``resolvers`` into one ``name -> path`` callable.
-
-    Each resolver's :meth:`PathResolver.resolve_import` is tried in
-    order; the first non-``None`` answer wins. With no resolvers,
-    falls back to :func:`default_resolve_import` so the analyzer keeps
-    working when callers don't pass any (the common public-API case).
-    A single-resolver chain skips the closure -- the typical CLI
-    invocation passes one resolver, and the chain would just call its
-    method directly.
-    """
+    """Compose ``resolvers`` into one ``name -> path`` callable."""
     if not resolvers:
         return default_resolve_import
     if len(resolvers) == 1:
@@ -99,14 +98,7 @@ def _run_observe(
     base: Path,
     project_root: Path,
 ) -> VisitorPayload:
-    """Invoke each plugin's :meth:`EdgePlugin.observe` and collect contributions.
-
-    Returns a single :class:`VisitorPayload` that merges every plugin's
-    additions for this file. Plugins that return ``None`` contribute
-    nothing. The result is concatenated with the visitor's payload by
-    :func:`_merge_payloads` and cached together so that warm runs skip
-    both the visitor and the observe pass.
-    """
+    """Invoke each plugin's :meth:`EdgePlugin.observe` and collect contributions."""
     if not plugins:
         return make_payload()
     ctx = ObserveContext(
@@ -137,14 +129,7 @@ def _process_one_file(
     base: Path,
     project_root: Path,
 ) -> VisitorPayload:
-    """Run the visitor + observe pass for a single file and return its payload.
-
-    The caller owns the precomputed FQN entry (built once per tree by
-    :func:`_collect_tree_specs`) so we can construct
-    :class:`MetadataWrapper` directly with ``cache=`` injected,
-    skipping :class:`FullRepoManager`'s per-instance ``gen_cache``
-    rebuild.
-    """
+    """Run the visitor + observe pass for a single file and return its payload."""
     module = cst.parse_module(file.read_text())
     wrapper = MetadataWrapper(
         module,
@@ -165,18 +150,18 @@ def _process_one_file(
 
 
 @dataclass(frozen=True, slots=True)
-class _TreeSpec:
-    """Per-:class:`SourceTree` file list partitioned into hits and miss files.
+class _PhaseSpec:
+    """Per-(package, phase) file plan.
 
-    Built once up front by :func:`_build_tree_spec` so the parallel
-    path can flatten every tree's miss files into a single sorted task
-    list. ``files`` covers every ``.py`` file longest-prefix-matched to
-    this tree (so files in nested trees are routed there instead, not
-    duplicated here). ``fqn_cache`` covers only the miss files, since
-    hit files never go through the visitor.
+    Each :class:`Package` contributes up to two phase specs: one for
+    its exported files (phase 1) and one for its internal files
+    (phase 2). The two specs have different ``search_paths``
+    (visibility into other packages) and therefore different cache
+    fingerprints.
     """
 
-    tree: SourceTree
+    package: Package
+    phase: str
     search_paths: tuple[Path, ...]
     files: tuple[Path, ...]
     hits: dict[Path, VisitorPayload]
@@ -184,52 +169,94 @@ class _TreeSpec:
     fqn_cache: Mapping[str, ModuleNameAndPackage]
     fingerprint: str
 
+    @property
+    def key(self) -> tuple[str, str]:
+        return (self.package.name, self.phase)
 
-def _build_tree_spec(
-    tree: SourceTree,
-    all_trees: Sequence[SourceTree],
+
+def _phase_search_paths(
+    pkg: Package, phase: str, validated: _ValidatedPackages
+) -> tuple[Path, ...]:
+    """Sys.path entries used during ``phase`` for ``pkg``.
+
+    Phase 1 (exports) sees ``pkg``'s own exported sys.path entry plus
+    each dep's exported sys.path entry. Phase 2 (internals) sees
+    ``pkg.path`` (so top-level dirs like ``tests/`` resolve), ``pkg``'s
+    exported sys.path entry, and every other package's exported entry
+    -- the all-to-all phase-2 visibility that lets non-exported code
+    have apparent cross-package cycles without violating the deps DAG.
+    """
+    paths: list[Path] = []
+    seen: set[Path] = set()
+
+    def add(p: Path | None) -> None:
+        if p is None or p in seen:
+            return
+        paths.append(p)
+        seen.add(p)
+
+    own_export = export_search_root(pkg)
+    if phase == _PHASE_EXPORTS:
+        add(own_export)
+        for dep_name in pkg.deps:
+            add(export_search_root(validated.by_name[dep_name]))
+    else:
+        add(pkg.path)
+        add(own_export)
+        for other in validated.packages:
+            if other.name == pkg.name:
+                continue
+            add(export_search_root(other))
+    return tuple(paths)
+
+
+def _partition_files(pkg: Package, all_pkgs: Sequence[Package]) -> tuple[list[Path], list[Path]]:
+    """Walk ``pkg.path`` for ``.py`` files and split into (exported, internal).
+
+    Files routed to other packages by longest-prefix-match (a deeper
+    nested package directory) are dropped here -- they show up under
+    that package instead.
+    """
+    exported: list[Path] = []
+    internal: list[Path] = []
+    for candidate in sorted(pkg.path.rglob("*.py")):
+        owner = assign_file_to_package(candidate, all_pkgs)
+        if owner is None or owner.name != pkg.name:
+            continue
+        if is_exported_file(candidate, pkg):
+            exported.append(candidate)
+        else:
+            internal.append(candidate)
+    return exported, internal
+
+
+def _build_phase_spec(
+    pkg: Package,
+    phase: str,
+    files: list[Path],
+    search_paths: tuple[Path, ...],
     cache: GraphCache | None,
     fingerprint: str,
-) -> _TreeSpec:
-    """Build a single :class:`_TreeSpec` for ``tree``.
-
-    Walks ``tree.path`` for ``.py`` files, then routes each file to
-    its longest-prefix-matching tree and keeps only the ones owned by
-    ``tree``. That filter is what lets a parent tree like
-    ``pkg/`` coexist with a nested tree like ``pkg/tests/`` without
-    double-walking files.
-
-    ``search_paths = (tree.path, *tree.search_trees)`` -- the tree's
-    own path is always its own first-party search root, with declared
-    search refs appended.
-    """
-    search_paths = (tree.path, *tree.search_trees)
-    own_files: list[Path] = []
-    for candidate in sorted(tree.path.rglob("*.py")):
-        owner = assign_file_to_tree(candidate, all_trees)
-        if owner is not None and owner.path == tree.path:
-            own_files.append(candidate)
-    files = tuple(own_files)
-
+) -> _PhaseSpec:
+    files_tuple = tuple(files)
     hits: dict[Path, VisitorPayload] = {}
     miss_files: list[Path] = []
-    for file in files:
+    for file in files_tuple:
         payload = cache.get(file, fingerprint) if cache is not None else None
         if payload is None:
             miss_files.append(file)
         else:
             hits[file] = payload
     fqn_cache: Mapping[str, ModuleNameAndPackage] = (
-        FixedFullyQualifiedNameProvider.gen_cache(
-            tree.path, [str(f) for f in miss_files], timeout=5
-        )
+        FixedFullyQualifiedNameProvider.gen_cache(pkg.path, [str(f) for f in miss_files], timeout=5)
         if miss_files
         else {}
     )
-    return _TreeSpec(
-        tree=tree,
+    return _PhaseSpec(
+        package=pkg,
+        phase=phase,
         search_paths=search_paths,
-        files=files,
+        files=files_tuple,
         hits=hits,
         miss_files=tuple(miss_files),
         fqn_cache=fqn_cache,
@@ -242,7 +269,8 @@ class _Task:
     """Per-file unit of work for the visitor + observe pass."""
 
     file: Path
-    tree_path: Path
+    phase_key: tuple[str, str]
+    base: Path
     search_paths: tuple[Path, ...]
     fqn_entry: ModuleNameAndPackage
     project_root: Path
@@ -276,19 +304,14 @@ def _rebind_sys_path(search_paths: tuple[Path, ...], baseline: list[str]) -> Non
 
 
 def _clear_resolver_caches() -> None:
-    """Drop the ``sys.path``-derived resolver caches.
-
-    :func:`safe_resolve_module` keys on fullname and reads live
-    ``sys.path``; clearing avoids stale results across trees with
-    different first-party prefixes.
-    """
+    """Drop the ``sys.path``-derived resolver caches."""
     safe_resolve_module.cache_clear()
     distribution_lookup.cache_clear()
     editable_distribution_roots.cache_clear()
 
 
-def _process_task(state: _RunnerState, task: _Task) -> tuple[Path, Path, VisitorPayload]:
-    """Run one task, transitioning ``sys.path`` + caches if the tree changed."""
+def _process_task(state: _RunnerState, task: _Task) -> tuple[tuple[str, str], Path, VisitorPayload]:
+    """Run one task, transitioning ``sys.path`` + caches if the search path changed."""
     if state.last_search_paths != task.search_paths:
         _rebind_sys_path(task.search_paths, state.sys_path_baseline)
         _clear_resolver_caches()
@@ -300,10 +323,10 @@ def _process_task(state: _RunnerState, task: _Task) -> tuple[Path, Path, Visitor
         import_resolver=state.import_resolver,
         detector=state.detector,
         plugins=state.plugins,
-        base=task.tree_path,
+        base=task.base,
         project_root=task.project_root,
     )
-    return task.tree_path, task.file, payload
+    return task.phase_key, task.file, payload
 
 
 _worker_state: _RunnerState | None = None
@@ -323,27 +346,30 @@ def _init_worker(
     )
 
 
-def _worker_process_task(task: _Task) -> tuple[Path, Path, VisitorPayload]:
+def _worker_process_task(task: _Task) -> tuple[tuple[str, str], Path, VisitorPayload]:
     assert _worker_state is not None, "_init_worker must run before _worker_process_task"
     return _process_task(_worker_state, task)
 
 
-def _build_sorted_tasks(tree_specs: dict[Path, _TreeSpec], project_root: Path) -> list[_Task]:
-    """Flatten every tree's miss files into one sorted task list.
+def _build_sorted_tasks(
+    phase_specs: dict[tuple[str, str], _PhaseSpec], project_root: Path
+) -> list[_Task]:
+    """Flatten every phase's miss files into one sorted task list.
 
-    Sorting by ``search_paths`` puts same-tree tasks adjacent so a
-    runner sees at most one ``sys.path`` transition per tree it
-    touches.
+    Sorting by ``search_paths`` keeps same-search-path tasks adjacent
+    so a runner sees at most one ``sys.path`` transition per
+    (package, phase) it touches.
     """
     tasks: list[_Task] = [
         _Task(
             file=file,
-            tree_path=tree_path,
+            phase_key=key,
+            base=spec.package.path,
             search_paths=spec.search_paths,
             fqn_entry=spec.fqn_cache[str(file)],
             project_root=project_root,
         )
-        for tree_path, spec in tree_specs.items()
+        for key, spec in phase_specs.items()
         for file in spec.miss_files
     ]
     tasks.sort(key=lambda t: (t.search_paths, t.file))
@@ -352,7 +378,7 @@ def _build_sorted_tasks(tree_specs: dict[Path, _TreeSpec], project_root: Path) -
 
 def _compute_all_miss_payloads(
     *,
-    tree_specs: dict[Path, _TreeSpec],
+    phase_specs: dict[tuple[str, str], _PhaseSpec],
     project_root: Path,
     detector: UnreachableRegionDetector,
     plugins: Sequence[EdgePlugin],
@@ -360,20 +386,20 @@ def _compute_all_miss_payloads(
     import_resolver: ImportResolver,
     cache: GraphCache | None,
     workers: int | None,
-) -> dict[Path, dict[Path, VisitorPayload]]:
-    """Run visitor + observe for every cache-miss file across every tree."""
-    out: dict[Path, dict[Path, VisitorPayload]] = {p: {} for p in tree_specs}
-    total_misses = sum(len(s.miss_files) for s in tree_specs.values())
+) -> dict[tuple[str, str], dict[Path, VisitorPayload]]:
+    """Run visitor + observe for every cache-miss file across every phase spec."""
+    out: dict[tuple[str, str], dict[Path, VisitorPayload]] = {k: {} for k in phase_specs}
+    total_misses = sum(len(s.miss_files) for s in phase_specs.values())
     if total_misses == 0:
         return out
 
-    tasks = _build_sorted_tasks(tree_specs, project_root)
+    tasks = _build_sorted_tasks(phase_specs, project_root)
     use_pool = workers is not None and workers >= 2 and total_misses >= 2
 
-    def _record(tree_path: Path, file: Path, payload: VisitorPayload) -> None:
-        out[tree_path][file] = payload
+    def _record(key: tuple[str, str], file: Path, payload: VisitorPayload) -> None:
+        out[key][file] = payload
         if cache is not None:
-            cache.put(file, payload, tree_specs[tree_path].fingerprint)
+            cache.put(file, payload, phase_specs[key].fingerprint)
 
     if use_pool:
         assert workers is not None
@@ -382,8 +408,8 @@ def _compute_all_miss_payloads(
             initializer=_init_worker,
             initargs=(detector, tuple(plugins), tuple(resolvers)),
         ) as pool:
-            for tree_path, file, payload in pool.map(_worker_process_task, tasks):
-                _record(tree_path, file, payload)
+            for key, file, payload in pool.map(_worker_process_task, tasks):
+                _record(key, file, payload)
         return out
 
     baseline = list(sys.path)
@@ -395,8 +421,8 @@ def _compute_all_miss_payloads(
     )
     try:
         for task in tasks:
-            tree_path, file, payload = _process_task(state, task)
-            _record(tree_path, file, payload)
+            key, file, payload = _process_task(state, task)
+            _record(key, file, payload)
     finally:
         sys.path[:] = baseline
     return out
@@ -437,10 +463,10 @@ def _apply_payload(
     symbol_graph: nx.MultiDiGraph,
     import_edges: set[tuple[SymbolNode, Import, EdgeFlags]],
 ) -> None:
-    """Emit ``payload`` into the in-progress per-tree structures.
+    """Emit ``payload`` into the in-progress per-package phase structures.
 
-    ``export_trie`` is ``None`` for non-exported trees; the apply
-    step still populates ``current_trie`` (so within-tree resolution
+    ``export_trie`` is non-``None`` only for phase 1 (exports). Phase
+    2 still populates ``current_trie`` (so within-package resolution
     works) and the graph, but no decls flow into the package's
     consumer-visible export trie.
     """
@@ -477,25 +503,25 @@ def _apply_payload(
 
 
 @dataclass(slots=True)
-class _TreeContribution:
-    """One tree's pre-stitched contribution to the symbol graph."""
+class _PhaseContribution:
+    """One (package, phase) pre-stitched contribution to the symbol graph."""
 
-    tree: SourceTree
+    package: Package
+    phase: str
     current_trie: SymbolTrie
-    export_trie: SymbolTrie  # empty trie when the tree isn't EXPORTED
+    export_trie: SymbolTrie  # populated only for phase 1; empty for phase 2
     base_graph: nx.MultiDiGraph
     import_edges: frozenset[tuple[SymbolNode, Import, EdgeFlags]]
 
 
-def _build_contribution(
-    tree: SourceTree,
-    spec: _TreeSpec,
+def _build_phase_contribution(
+    spec: _PhaseSpec,
     miss_payloads: Mapping[Path, VisitorPayload],
-) -> _TreeContribution:
-    """Apply ``spec``'s per-file payloads into a tree-local graph slice."""
+) -> _PhaseContribution:
+    """Apply ``spec``'s per-file payloads into a phase-local graph slice."""
     current_trie = SymbolTrie()
     export_trie = SymbolTrie()
-    is_exported = bool(tree.flags & SourceTreeFlags.EXPORTED)
+    is_exports = spec.phase == _PHASE_EXPORTS
     import_edges: set[tuple[SymbolNode, Import, EdgeFlags]] = set()
     base_graph: nx.MultiDiGraph = nx.MultiDiGraph()
     base_graph.graph["dead_suites"] = {}
@@ -506,13 +532,14 @@ def _build_contribution(
         _apply_payload(
             payload,
             current_trie=current_trie,
-            export_trie=export_trie if is_exported else None,
+            export_trie=export_trie if is_exports else None,
             symbol_graph=base_graph,
             import_edges=import_edges,
         )
     current_trie.add_module_hierarchy_edges(base_graph)
-    return _TreeContribution(
-        tree=tree,
+    return _PhaseContribution(
+        package=spec.package,
+        phase=spec.phase,
         current_trie=current_trie,
         export_trie=export_trie,
         base_graph=base_graph,
@@ -521,7 +548,7 @@ def _build_contribution(
 
 
 def _compose_contribution(
-    contrib: _TreeContribution,
+    contrib: _PhaseContribution,
     *,
     target_graph: nx.MultiDiGraph,
     symbol_lookup: SymbolTrie,
@@ -529,7 +556,7 @@ def _compose_contribution(
     project_root: Path,
 ) -> None:
     """Merge ``contrib.base_graph`` into ``target_graph``, stitch
-    cross-tree imports against ``symbol_lookup``, and run plugin
+    cross-package imports against ``symbol_lookup``, and run plugin
     :meth:`EdgePlugin.finalize` against the composed graph.
     """
     target_graph.update(
@@ -537,13 +564,13 @@ def _compose_contribution(
         nodes=contrib.base_graph.nodes(data=True),
     )
     target_graph.graph.setdefault("dead_suites", {}).update(contrib.base_graph.graph["dead_suites"])
-    for src, dst, flags in resolve_edges(contrib.import_edges, symbol_lookup, contrib.tree.path):
+    for src, dst, flags in resolve_edges(contrib.import_edges, symbol_lookup, contrib.package.path):
         target_graph.add_edge(src, dst, flags=flags)
     if plugins:
         ctx = PluginContext(
             graph=target_graph,
             symbol_lookup=symbol_lookup,
-            base=contrib.tree.path,
+            base=contrib.package.path,
             project_root=project_root,
         )
         for plugin in plugins:
@@ -555,15 +582,7 @@ def _compose_contribution(
 
 def _warn_if_project_venv_inactive(project_root: Path) -> None:
     """Warn when the project has a sibling ``.venv``/``venv`` that
-    isn't the running interpreter.
-
-    The new contract is "run dead-cst with the project's venv active"
-    (e.g. via ``uv run dead-cst``). Without that, third-party imports
-    classify as ``[unresolved]`` synthetic nodes and framework plugin
-    lookups raise ``UnresolvedDependencyError``. We stay silent when
-    no project venv is discoverable -- the user may intentionally be
-    analyzing without third-party visibility.
-    """
+    isn't the running interpreter."""
     candidate = next(
         (project_root / name for name in (".venv", "venv") if (project_root / name).is_dir()),
         None,
@@ -630,33 +649,31 @@ class Analysis:
     Constructed with a ``project_root`` and a list of
     :class:`PathResolver`\\s. The analyzer calls each resolver's
     :meth:`PathResolver.resolve` to derive the project's
-    :class:`SourceTree` layout; the validated tree list is exposed as
-    :attr:`source_trees`. Holds the analyzer's config (resolvers,
-    plugins, cache, detector, worker count) and memoizes per-tree
+    :class:`Package` layout; the validated package list is exposed as
+    :attr:`packages`. Holds the analyzer's config (resolvers, plugins,
+    cache, detector, worker count) and memoizes per-(package, phase)
     work so multiple queries against the same project share the cost.
     Construction is cheap; nothing is read or parsed until you ask.
 
-    Three coarse stages happen on demand:
+    Stages:
 
-    1. **Per-tree file enumeration + visitor pass** -- driven by
-       :meth:`refresh`. Walks each requested package's trees, hashes
-       files against the cache, runs the visitor + observe pass on
-       misses, writes payloads back to the cache.
+    1. **Per-(package, phase) file enumeration + visitor pass** --
+       driven by :meth:`refresh`. Walks each package's ``path``,
+       partitions ``.py`` files into exported vs internal, hashes
+       against the cache, runs the visitor + observe pass on misses,
+       writes payloads back to the cache.
 
-    2. **Per-tree contribution build** -- the per-tree trie + a
-       tree-local graph slice + the unresolved cross-file import set.
+    2. **Per-(package, phase) contribution build** -- a phase-local
+       trie + graph slice + the unresolved cross-file import set.
 
-    3. **Cross-tree composition** -- merging contributions, running
-       :func:`resolve_edges` against the merged tries, running plugin
-       :meth:`EdgePlugin.finalize`. Scoped to either every tree
-       (:meth:`materialize_all`) or the "interesting set" of a single
-       package (:meth:`materialize_closure` / :meth:`PackageView.graph`).
-
-    The lazy split lets cheap per-package queries skip stage 3
-    entirely for purely local questions like
-    :meth:`PackageView.modules`. The public navigation API
-    (:meth:`reverse_closure`, :meth:`refresh`, :meth:`materialize_closure`)
-    is keyed on package names; tree-level structures are internal.
+    3. **Two-phase composition** -- phase 1 composes exports
+       contributions in topological order over ``deps``, stitching
+       cross-package imports against (own export trie under
+       construction + each dep's already-built export trie). Phase 2
+       composes internals contributions in any order, stitching
+       against (the package's full surface + every package's export
+       trie). Plugin :meth:`EdgePlugin.finalize` runs once per
+       composition.
     """
 
     def __init__(
@@ -671,10 +688,10 @@ class Analysis:
     ) -> None:
         self._project_root: Path = project_root.resolve()
         self._resolvers: tuple[PathResolver, ...] = tuple(resolvers)
-        trees: list[SourceTree] = []
+        pkgs: list[Package] = []
         for r in self._resolvers:
-            trees.extend(r.resolve(self._project_root))
-        self._validated = validate_source_trees(trees)
+            pkgs.extend(r.resolve(self._project_root))
+        self._validated = validate_packages(pkgs)
         self._plugins: tuple[EdgePlugin, ...] = tuple(plugins)
         self._cache = cache
         self._workers = workers
@@ -685,17 +702,23 @@ class Analysis:
             else DefaultUnreachableRegionDetector()
         )
         self._dep_graph: nx.DiGraph | None = None
-        self._ordered_paths: list[Path] | None = None
-        self._tree_specs: dict[Path, _TreeSpec] = {}
-        self._contributions: dict[Path, _TreeContribution] = {}
-        self._closure_graphs: dict[str, nx.MultiDiGraph] = {}
+        self._phase_specs: dict[tuple[str, str], _PhaseSpec] = {}
+        self._contributions: dict[tuple[str, str], _PhaseContribution] = {}
         self._full_graph: nx.MultiDiGraph | None = None
+        # Cached per-package file partitions so refresh() doesn't
+        # re-walk the filesystem on repeated calls.
+        self._partitions: dict[str, tuple[list[Path], list[Path]]] | None = None
         _warn_if_project_venv_inactive(self._project_root)
 
     @property
-    def source_trees(self) -> list[SourceTree]:
-        """The validated tree list this analysis was built with."""
-        return list(self._validated.trees)
+    def packages(self) -> list[Package]:
+        """The validated package list this analysis was built with."""
+        return list(self._validated.packages)
+
+    @property
+    def package_names(self) -> list[str]:
+        """Package names in declaration order."""
+        return [p.name for p in self._validated.packages]
 
     @property
     def project_root(self) -> Path:
@@ -703,99 +726,70 @@ class Analysis:
 
     def _dep_dag(self) -> nx.DiGraph:
         if self._dep_graph is None:
-            self._dep_graph = _build_tree_dag(self._validated)
+            self._dep_graph = _build_pkg_dag(self._validated)
         return self._dep_graph
 
-    @property
-    def _tree_paths_topo(self) -> list[Path]:
-        """Internal: tree paths in topological order (deps before consumers).
-
-        Drives the per-tree visitor + compose loop. Public callers
-        operate on :attr:`packages` instead.
-        """
-        if self._ordered_paths is None:
-            self._ordered_paths = list(nx.topological_sort(self._dep_dag()))
-        return list(self._ordered_paths)
-
-    @property
-    def packages(self) -> list[str]:
-        """Unique package names across the configured trees, in
-        declaration order."""
-        seen: dict[str, None] = {}
-        for t in self._validated.trees:
-            seen.setdefault(t.package, None)
-        return list(seen)
-
     def reverse_closure(self, package: str) -> frozenset[str]:
-        """Packages that transitively depend on ``package`` (inclusive).
-
-        A package depends on another if any of its trees lists any of
-        the other's trees in ``search_trees``. Same-package
-        self-references collapse out: the result always contains
-        ``package`` itself plus every consumer package, even when
-        consumers' trees only see this package's exported tree.
-        """
-        if package not in self._validated.by_package:
+        """Packages that transitively depend on ``package`` (inclusive)."""
+        if package not in self._validated.by_name:
             raise KeyError(package)
         dag = self._dep_dag()
-        my_paths = {t.path for t in self._validated.by_package[package]}
         out: set[str] = {package}
-        for path in my_paths:
-            for descendant in nx.descendants(dag, path):
-                pkg = self._validated.by_path[descendant].package
-                out.add(pkg)
+        for descendant in nx.descendants(dag, package):
+            out.add(descendant)
         return frozenset(out)
 
-    def _interesting_set(self, package: str) -> frozenset[str]:
-        """Packages needed to answer reachability for decls in ``package``.
-
-        The forward (deps) closure of :meth:`reverse_closure` -- every
-        consumer of ``package`` plus every consumer's transitive deps,
-        so we have enough trie data to resolve every cross-package
-        import that could lead into ``package``.
-        """
-        dag = self._dep_dag()
-        out: set[str] = set()
-        for consumer_pkg in self.reverse_closure(package):
-            for tree in self._validated.by_package[consumer_pkg]:
-                out.add(consumer_pkg)
-                for ancestor in nx.ancestors(dag, tree.path):
-                    out.add(self._validated.by_path[ancestor].package)
-        return frozenset(out)
-
-    def _tree_paths_in_packages(self, packages: Iterable[str]) -> frozenset[Path]:
-        """Tree paths owned by any of ``packages``."""
-        out: set[Path] = set()
-        for name in packages:
-            for tree in self._validated.by_package[name]:
-                out.add(tree.path)
-        return frozenset(out)
+    def _ensure_partitions(self) -> dict[str, tuple[list[Path], list[Path]]]:
+        if self._partitions is None:
+            all_pkgs = list(self._validated.packages)
+            self._partitions = {
+                pkg.name: _partition_files(pkg, all_pkgs) for pkg in self._validated.packages
+            }
+        return self._partitions
 
     def refresh(self, packages: Iterable[str] | None = None) -> Analysis:
-        """Update the cache and build per-tree contributions for the given packages.
+        """Walk the cache and build per-phase contributions.
 
-        ``packages=None`` (the default) refreshes every package.
-        Already-refreshed trees are skipped, so calling :meth:`refresh`
-        twice with the same argument is cheap.
+        ``packages=None`` (the default) refreshes every package. The
+        argument exists so callers can narrow the file walk to a
+        subset of packages; phase-2 visibility still resolves against
+        every other package's export trie at composition time, so
+        composition is always full-graph.
         """
-        names = list(packages) if packages is not None else self.packages
-        unknown = [n for n in names if n not in self._validated.by_package]
+        names = list(packages) if packages is not None else self.package_names
+        unknown = [n for n in names if n not in self._validated.by_name]
         if unknown:
             raise KeyError(f"Unknown packages: {unknown}")
-        targets = [tree.path for n in names for tree in self._validated.by_package[n]]
-        new_targets = [p for p in targets if p not in self._contributions]
-        if not new_targets:
+        partitions = self._ensure_partitions()
+        new_keys: list[tuple[str, str]] = []
+        for name in names:
+            pkg = self._validated.by_name[name]
+            exported_files, internal_files = partitions[name]
+            for phase, files in (
+                (_PHASE_EXPORTS, exported_files),
+                (_PHASE_INTERNALS, internal_files),
+            ):
+                key = (name, phase)
+                if key in self._contributions:
+                    continue
+                if key not in self._phase_specs:
+                    search = _phase_search_paths(pkg, phase, self._validated)
+                    fingerprint = compute_fingerprint(
+                        base=pkg.path,
+                        search_paths=search,
+                        resolvers=self._resolvers,
+                        plugins=self._plugins,
+                        unreachable_detector=self._detector,
+                    )
+                    self._phase_specs[key] = _build_phase_spec(
+                        pkg, phase, files, search, self._cache, fingerprint
+                    )
+                new_keys.append(key)
+        if not new_keys:
             return self
-        all_trees = list(self._validated.trees)
-        for p in new_targets:
-            if p not in self._tree_specs:
-                tree = self._validated.by_path[p]
-                self._tree_specs[p] = _build_tree_spec(
-                    tree, all_trees, self._cache, self._tree_fingerprint(tree)
-                )
-        partial_specs = {p: self._tree_specs[p] for p in new_targets}
+        partial_specs = {key: self._phase_specs[key] for key in new_keys}
         miss_payloads = _compute_all_miss_payloads(
-            tree_specs=partial_specs,
+            phase_specs=partial_specs,
             project_root=self._project_root,
             detector=self._detector,
             plugins=self._plugins,
@@ -804,53 +798,94 @@ class Analysis:
             cache=self._cache,
             workers=self._workers,
         )
-        for p in new_targets:
-            tree = self._validated.by_path[p]
-            self._contributions[p] = _build_contribution(
-                tree, self._tree_specs[p], miss_payloads[p]
+        for key in new_keys:
+            self._contributions[key] = _build_phase_contribution(
+                self._phase_specs[key], miss_payloads[key]
             )
         return self
 
     def package(self, name: str) -> PackageView:
         """Return a lazy view onto a single logical package."""
-        if name not in self._validated.by_package:
+        if name not in self._validated.by_name:
             raise KeyError(name)
         return PackageView(self, name)
 
     def package_views(self) -> Iterator[PackageView]:
         """Yield a :class:`PackageView` for every package."""
-        for name in self.packages:
+        for name in self.package_names:
             yield PackageView(self, name)
 
     def materialize_all(self) -> nx.MultiDiGraph:
-        """Build the full graph (every tree, cross-tree resolution, plugins)."""
+        """Build the full graph (every package, both phases, plugins)."""
         if self._full_graph is None:
             self.refresh()
-            self._full_graph = self._materialize(scope=None)
+            self._full_graph = self._materialize_full()
         return self._full_graph
 
     def materialize_closure(self, package: str) -> nx.MultiDiGraph:
-        """Build a graph containing every contribution in
-        :meth:`_interesting_set` of ``package``."""
-        if self._full_graph is not None:
-            return self._full_graph
-        if package not in self._closure_graphs:
-            scope_packages = self._interesting_set(package)
-            scope_paths = self._tree_paths_in_packages(scope_packages)
-            self.refresh(packages=scope_packages)
-            self._closure_graphs[package] = self._materialize(scope=scope_paths)
-        return self._closure_graphs[package]
+        """Build the full graph; ``package`` is just validated.
 
-    def _materialize(self, *, scope: frozenset[Path] | None) -> nx.MultiDiGraph:
+        Phase-2's all-to-all visibility makes a closure-scoped graph
+        unsound -- any package's internals could keep ``package``'s
+        decls alive -- so this returns the same graph as
+        :meth:`materialize_all`. Kept as a stable API surface for
+        callers that previously asked for a closure-scoped graph.
+        """
+        if package not in self._validated.by_name:
+            raise KeyError(package)
+        return self.materialize_all()
+
+    def _materialize_full(self) -> nx.MultiDiGraph:
         g: nx.MultiDiGraph = nx.MultiDiGraph()
         g.graph["dead_suites"] = {}
-        for path in self._tree_paths_topo:
-            if scope is not None and path not in scope:
+
+        # Phase 1: exports in topological order. Cross-package imports
+        # in exported code resolve against own export trie + deps'
+        # export tries.
+        for pkg in self._validated.topo_order:
+            key = (pkg.name, _PHASE_EXPORTS)
+            contrib = self._contributions.get(key)
+            if contrib is None:
                 continue
+            lookup = SymbolTrie()
+            lookup.merge(contrib.current_trie)
+            for dep_name in pkg.deps:
+                dep_contrib = self._contributions.get((dep_name, _PHASE_EXPORTS))
+                if dep_contrib is not None:
+                    lookup.merge(dep_contrib.export_trie)
             _compose_contribution(
-                self._contributions[path],
+                contrib,
                 target_graph=g,
-                symbol_lookup=self._build_symbol_lookup(path, scope=scope),
+                symbol_lookup=lookup,
+                plugins=self._plugins,
+                project_root=self._project_root,
+            )
+
+        # Phase 2: internals in any order. Visibility = own
+        # combined trie (exports + internals) + every other package's
+        # export trie. The "every other" union is what makes apparent
+        # cross-package cycles tractable without violating the deps
+        # DAG.
+        for pkg in self._validated.topo_order:
+            key = (pkg.name, _PHASE_INTERNALS)
+            contrib = self._contributions.get(key)
+            if contrib is None:
+                continue
+            lookup = SymbolTrie()
+            lookup.merge(contrib.current_trie)
+            own_exports = self._contributions.get((pkg.name, _PHASE_EXPORTS))
+            if own_exports is not None:
+                lookup.merge(own_exports.current_trie)
+            for other in self._validated.packages:
+                if other.name == pkg.name:
+                    continue
+                other_exports = self._contributions.get((other.name, _PHASE_EXPORTS))
+                if other_exports is not None:
+                    lookup.merge(other_exports.export_trie)
+            _compose_contribution(
+                contrib,
+                target_graph=g,
+                symbol_lookup=lookup,
                 plugins=self._plugins,
                 project_root=self._project_root,
             )
@@ -875,49 +910,9 @@ class Analysis:
     def count_nodes(self, prefix: Path | None = None) -> dict[str, int]:
         return _count_nodes(self.materialize_all(), prefix)
 
-    def _tree_fingerprint(self, tree: SourceTree) -> str:
-        """Per-tree cache fingerprint."""
-        return compute_fingerprint(
-            base=tree.path,
-            search_paths=(tree.path, *tree.search_trees),
-            resolvers=self._resolvers,
-            plugins=self._plugins,
-            unreachable_detector=self._detector,
-        )
-
-    def _build_symbol_lookup(self, tree_path: Path, *, scope: frozenset[Path] | None) -> SymbolTrie:
-        """Per-tree lookup trie: this tree's full trie + each in-scope
-        search ref's export trie.
-
-        The search refs are the tree's ``search_trees`` (paths to
-        EXPORTED trees of other packages, or another tree in the same
-        package). Only the search refs' *export* tries flow in -- so a
-        tests/ tree that lists lib/ in its search refs sees lib/'s
-        consumer-visible surface, not its private internals.
-        """
-        contrib = self._contributions[tree_path]
-        lookup = SymbolTrie()
-        lookup.merge(contrib.current_trie)
-        tree = self._validated.by_path[tree_path]
-        for ref in tree.search_trees:
-            if scope is not None and ref not in scope:
-                continue
-            ref_contrib = self._contributions.get(ref)
-            if ref_contrib is None:
-                continue
-            lookup.merge(ref_contrib.export_trie)
-        return lookup
-
 
 class PackageView:
-    """Lazy view of a logical package inside an :class:`Analysis`.
-
-    A package is one or more :class:`SourceTree` entries sharing a
-    package name. Queries aggregate over every tree in the package;
-    cross-package queries (:meth:`importers_of`, :meth:`dead`,
-    :meth:`graph`) materialize the union of every tree's interesting
-    set.
-    """
+    """Lazy view of a logical package inside an :class:`Analysis`."""
 
     __slots__ = ("_analysis", "_name")
 
@@ -934,35 +929,38 @@ class PackageView:
         return self._analysis
 
     @property
-    def trees(self) -> list[SourceTree]:
-        """Trees that share this package's name, in declaration order."""
-        return list(self._analysis._validated.by_package[self._name])
-
-    @property
-    def exported_tree(self) -> SourceTree | None:
-        """The package's single ``EXPORTED`` tree, if any."""
-        return self._analysis._validated.exported_for.get(self._name)
+    def package(self) -> Package:
+        return self._analysis._validated.by_name[self._name]
 
     def reverse_closure(self) -> frozenset[str]:
         """Packages that transitively depend on this one (inclusive)."""
         return self._analysis.reverse_closure(self._name)
 
-    def _under_any_tree(self, path: Path) -> bool:
-        return any(path.is_relative_to(t.path) for t in self.trees)
+    def _under_path(self, path: Path) -> bool:
+        try:
+            return path == self.package.path or path.is_relative_to(self.package.path)
+        except ValueError:
+            return False
 
     def modules(self) -> Iterator[SymbolNode]:
-        """Module nodes for every ``.py`` file in any tree of this package."""
+        """Module nodes for every ``.py`` file in this package."""
         self._analysis.refresh(packages=[self._name])
-        for tree in self.trees:
-            for n in self._analysis._contributions[tree.path].base_graph.nodes:
+        for phase in (_PHASE_EXPORTS, _PHASE_INTERNALS):
+            contrib = self._analysis._contributions.get((self._name, phase))
+            if contrib is None:
+                continue
+            for n in contrib.base_graph.nodes:
                 if n.type == "module":
                     yield n
 
     def declarations(self, name: str | None = None) -> Iterator[SymbolNode]:
-        """Top-level decls in any tree of this package."""
+        """Top-level decls in this package."""
         self._analysis.refresh(packages=[self._name])
-        for tree in self.trees:
-            for n in self._analysis._contributions[tree.path].base_graph.nodes:
+        for phase in (_PHASE_EXPORTS, _PHASE_INTERNALS):
+            contrib = self._analysis._contributions.get((self._name, phase))
+            if contrib is None:
+                continue
+            for n in contrib.base_graph.nodes:
                 if n.type in ("module", "synthetic"):
                     continue
                 if name is not None and simple_name(n.fqname) != name:
@@ -970,42 +968,31 @@ class PackageView:
                 yield n
 
     def importers_of(self, target: str) -> set[Path]:
-        """Files in this package whose imports reach ``target``.
-
-        Triggers closure materialization. Aggregates across every
-        tree in the package.
-        """
-        scope_packages = self._analysis._interesting_set(self._name)
-        scope_paths = self._analysis._tree_paths_in_packages(scope_packages)
-        self._analysis.refresh(packages=scope_packages)
-        graph = self._analysis._materialize(scope=scope_paths)
-        out: set[Path] = set()
-        for tree in self.trees:
-            ctx = PluginContext(
-                graph=graph,
-                symbol_lookup=self._analysis._build_symbol_lookup(tree.path, scope=scope_paths),
-                base=tree.path,
-                project_root=self._analysis.project_root,
-            )
-            out |= ctx.importers(target)
-        return out
+        """Files that import ``target`` (anywhere in the workspace)."""
+        graph = self._analysis.materialize_all()
+        ctx = PluginContext(
+            graph=graph,
+            symbol_lookup=SymbolTrie(),  # plugin's importers() doesn't use lookup
+            base=self.package.path,
+            project_root=self._analysis.project_root,
+        )
+        return ctx.importers(target)
 
     def graph(self) -> nx.MultiDiGraph:
-        """Materialize and return the closure-scoped graph for this package."""
-        return self._analysis.materialize_closure(self._name)
+        """Materialize and return the full workspace graph."""
+        return self._analysis.materialize_all()
 
     def reachable(self) -> set[SymbolNode]:
-        """Decls in this package reachable from any entrypoint in
-        :meth:`reverse_closure`."""
+        """Decls in this package reachable from any entrypoint."""
         g = self.graph()
-        return {n for n in _find_reachable(g) if self._under_any_tree(n.path)}
+        return {n for n in _find_reachable(g) if self._under_path(n.path)}
 
     def dead(self) -> Iterator[SymbolNode]:
         """Yield decls in this package not reachable from any entrypoint."""
         g = self.graph()
         reachable = _find_reachable(g)
         for n in g.nodes:
-            if not self._under_any_tree(n.path):
+            if not self._under_path(n.path):
                 continue
             if n.type in ("module", "synthetic"):
                 continue
@@ -1015,14 +1002,17 @@ class PackageView:
     def kept_alive_by_dead_branches(self) -> set[SymbolNode]:
         g = self.graph()
         diff = _find_reachable(g) - _find_reachable_strict(g)
-        return {n for n in diff if self._under_any_tree(n.path)}
+        return {n for n in diff if self._under_path(n.path)}
 
     def count_nodes(self) -> dict[str, int]:
         """Count nodes contributed by this package, by ``SymbolNode.type``."""
         self._analysis.refresh(packages=[self._name])
         counts: dict[str, int] = {}
-        for tree in self.trees:
-            sub = _count_nodes(self._analysis._contributions[tree.path].base_graph, prefix=None)
+        for phase in (_PHASE_EXPORTS, _PHASE_INTERNALS):
+            contrib = self._analysis._contributions.get((self._name, phase))
+            if contrib is None:
+                continue
+            sub = _count_nodes(contrib.base_graph, prefix=None)
             for k, v in sub.items():
                 counts[k] = counts.get(k, 0) + v
         return counts
@@ -1035,8 +1025,7 @@ class PackageView:
         reachable = _find_reachable(g)
         dead_nodes = [n for n in g.nodes if n not in reachable]
         sub = g.subgraph(dead_nodes)
-        for tree in self.trees:
-            remove_code(sub, tree.path)
+        remove_code(sub, self.package.path)
 
 
 __all__ = [

@@ -7,11 +7,11 @@ of entrypoints.
 The top-level package re-exports the names most callers need:
 :class:`Analysis` is the lazy entry point (cheap construction,
 package-scoped :meth:`Analysis.refresh`, :meth:`Analysis.package` for
-single-package queries via :class:`PackageView`); the
-:class:`SourceTree` / :class:`SourceTreeFlags` types path resolvers
-emit; the graph data types (:class:`SymbolNode`, :class:`Import`,
-:class:`NodeFlags`, :class:`EdgeFlags`); and :class:`Cacheable`, the
-contract every extension point implements.
+single-package queries via :class:`PackageView`); :class:`Package` is
+the data type path resolvers emit; the graph data types
+(:class:`SymbolNode`, :class:`Import`, :class:`NodeFlags`,
+:class:`EdgeFlags`); and :class:`Cacheable`, the contract every
+extension point implements.
 
 The deeper public surface lives in focused sub-packages; pull from
 those when writing extensions:
@@ -32,7 +32,7 @@ those when writing extensions:
   :class:`GraphOp` value objects, and the synthetic-node prefix
   constants the analyzer uses for non-first-party imports.
 * :mod:`dead_cst.resolvers` -- the :class:`PathResolver` protocol,
-  the :class:`SourceTree` data type, builtin resolvers
+  the :class:`Package` data type, builtin resolvers
   (:class:`PyprojectResolver`, :class:`ManualResolver`), and the
   ``sys.path`` / ``importlib`` helpers a custom resolver may want
   to reuse.
@@ -58,7 +58,7 @@ from ._cacheable import Cacheable
 from ._version import __version__
 from .analyze import Analysis, PackageView
 from .graph import EdgeFlags, Import, NodeFlags, SymbolNode
-from .resolvers import SourceTree, SourceTreeFlags
+from .resolvers import Package
 
 __all__ = [
     "Analysis",
@@ -66,9 +66,8 @@ __all__ = [
     "EdgeFlags",
     "Import",
     "NodeFlags",
+    "Package",
     "PackageView",
-    "SourceTree",
-    "SourceTreeFlags",
     "SymbolNode",
     "__version__",
 ]

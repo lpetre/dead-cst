@@ -1,13 +1,11 @@
-"""Pluggable resolvers that discover the :class:`SourceTree` layout of a project.
+"""Pluggable resolvers that discover the :class:`Package` layout of a project.
 
 A :class:`PathResolver` takes a project root and returns a flat
-``list[SourceTree]`` describing every directory of first-party source
-the analyzer should walk. Each tree carries its own ``package`` name,
-:class:`SourceTreeFlags` (notably :data:`SourceTreeFlags.EXPORTED`,
-the one-per-package marker that gates cross-package import
-visibility), and ``search_trees`` -- the paths of other trees this
-one's files can import from. The analyzer routes each ``.py`` file to
-its longest-prefix-matching tree.
+``list[Package]`` describing every first-party package the analyzer
+should walk. Each :class:`Package` owns its directory ``path``,
+carries a unique ``name``, lists ``exported`` subdirs whose ``.py``
+files ship in the wheel, and lists ``deps`` (other package names) --
+the production-only DAG that drives topological parse order.
 
 Each builtin resolver lives in its own submodule. Third-party
 resolvers register under the ``dead_cst.resolvers`` entry-point group;
@@ -23,7 +21,7 @@ importlib implementation) directly, or compose with the lower-level
 :func:`load_toml` is provided for resolvers that read
 ``pyproject.toml``-style config; :func:`exported_roots` and
 :func:`exported_tree_root` answer "what does this project's build
-backend ship?" so resolvers can pick exported tree paths
+backend ship?" so resolvers can pick exported subdir paths
 consistently.
 """
 
@@ -32,12 +30,13 @@ from __future__ import annotations
 from ..contrib.uv_resolver import UvResolver
 from ._core import (
     ImportResolver,
+    Package,
     PathResolver,
-    SourceTree,
-    SourceTreeFlags,
-    assign_file_to_tree,
+    assign_file_to_package,
+    export_search_root,
+    is_exported_file,
     load_toml,
-    validate_source_trees,
+    validate_packages,
 )
 from ._exports import exported_roots, exported_tree_root
 from ._imports import (
@@ -75,21 +74,22 @@ __all__ = [
     "BUILTIN_RESOLVERS",
     "ImportResolver",
     "ManualResolver",
+    "Package",
     "PathResolver",
     "PyprojectResolver",
     "SITE_PACKAGES_MARKERS",
     "STDLIB",
-    "SourceTree",
-    "SourceTreeFlags",
     "UvResolver",
-    "assign_file_to_tree",
+    "assign_file_to_package",
     "default_resolve_import",
     "distribution_lookup",
     "editable_distribution_roots",
+    "export_search_root",
     "exported_roots",
     "exported_tree_root",
+    "is_exported_file",
     "load_resolver",
     "load_toml",
     "safe_resolve_module",
-    "validate_source_trees",
+    "validate_packages",
 ]

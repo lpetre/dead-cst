@@ -105,8 +105,9 @@ def test_local_query_doesnt_materialize_full_graph(tmp_path):
     _write(base_b, {"pkg/__init__.py": "", "pkg/m.py": "def g(): pass\n"})
     a = Analysis(tmp_path, resolvers=manual("a", "b"))
     list(a.package("a").modules())
-    assert base_a.resolve() in a._contributions
-    assert base_b.resolve() not in a._contributions
+    contrib_keys = {key[0] for key in a._contributions}
+    assert "a" in contrib_keys
+    assert "b" not in contrib_keys
     assert a._full_graph is None
 
 
