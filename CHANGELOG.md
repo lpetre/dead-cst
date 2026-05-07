@@ -12,12 +12,30 @@ two versions.
 ### Changed
 - **Breaking:** `Analysis` no longer accepts a pre-built `paths` mapping.
   The constructor now takes `project_root` as the first argument and a
-  required `resolvers=` keyword argument; the path map is computed by
-  invoking `resolver.resolve(project_root)` on each resolver and merging
-  the results via `merge_paths`. Callers that used to write
+  required `resolvers=` keyword argument; the package list is computed
+  by invoking `resolver.resolve(project_root)` on each resolver and
+  merging the results via `merge_packages`. Callers that used to write
   `Analysis({base: deps}, ...)` should switch to
   `Analysis(base, resolvers=[ManualResolver(specs=["."])], ...)` (or
   whichever resolver describes their layout).
+- **Breaking:** `PathResolver.resolve()` now returns
+  `tuple[Package, ...]` instead of a `dict[Path, list[Path]]`
+  (`PathMap`). `Package` is a frozen dataclass carrying `path`,
+  `name` (unique within an analysis), `exported` (subdirs visible to
+  consumers; empty means "no restriction"), and `deps` (other
+  packages by name). `merge_paths` is replaced by `merge_packages`,
+  which validates name uniqueness, dep references, and that
+  `exported` entries are under each package's `path`. The `PathMap`
+  type alias and `merge_paths` re-exports are gone. Resolvers no
+  longer represent non-package search paths (workspace
+  `.venv/site-packages`, vendored bundles) in `Package.deps`;
+  `UvResolver` splices the workspace venv onto `sys.path` lazily
+  inside its own `resolve_import` instead.
+- **Breaking:** `Analysis.paths` is replaced by `Analysis.packages`,
+  which returns the `tuple[Package, ...]` the analysis was built
+  with. The previous `Analysis.packages()` iterator (yielding one
+  `PackageView` per base) is renamed to `Analysis.views()` to free
+  the name for the new data attribute.
 - **Breaking:** `UvWorkspaceResolver` is renamed to `UvResolver`, the
   CLI resolver name `uv_workspace` is renamed to `uv`, and the module
   moved from `dead_cst/contrib/uv_workspace.py` to
@@ -25,8 +43,8 @@ two versions.
   per-base fingerprints rebuild automatically.
 - **Breaking:** the CLI helper `resolve_paths` is replaced by
   `build_resolvers`, which returns the resolver chain only. Callers
-  (and the CLI itself) read the merged `PathMap` back from
-  `Analysis.paths` after construction.
+  (and the CLI itself) read the merged package list back from
+  `Analysis.packages` after construction.
 
 ### Removed
 - **Breaking:** `VenvResolver` and `PyprojectResolver` are removed,
@@ -37,6 +55,15 @@ two versions.
   CLI's `ManualResolver`) for the old `pyproject` `src/` shortcut.
 
 ### Added
+- `dead_cst.resolvers.Package`, the frozen dataclass every resolver
+  now emits, and `dead_cst.resolvers.merge_packages` for combining
+  multiple resolvers' outputs with name-uniqueness, dep-reference,
+  and `exported`-bounds validation.
+- `dead_cst.resolvers.clear_path_caches`, a one-call helper that
+  drops the three `sys.path`-derived LRU caches
+  (`safe_resolve_module`, `distribution_lookup`,
+  `editable_distribution_roots`). Custom resolvers that mutate
+  `sys.path` should call it instead of clearing each cache by hand.
 - New primary API: `dead_cst.Analysis` and `dead_cst.PackageView`,
   the lazy entry point that callers should reach for on large repos.
   Construction is cheap (no filesystem walk, no parsing). `refresh()`
@@ -112,11 +139,11 @@ two versions.
   `get` and `put` take it per call. Schema version bumped to 2;
   older databases auto-wipe on first open. The CLI is unaffected --
   `Analysis` computes per-base fingerprints internally.
-- `_order_paths` now returns only the keys of the `PathMap`. Search
-  paths that aren't themselves keys (e.g. a venv `site-packages`
-  directory listed for resolver lookup) are no longer silently
-  promoted to bases and are never walked. Pass them as keys
-  explicitly if you want their files visited.
+- `_order_packages` (formerly `_order_paths`) returns only the
+  paths of `Package` records the resolvers emit. Search paths that
+  aren't themselves packages (e.g. a workspace's
+  `.venv/site-packages`) are never walked; resolvers that need them
+  during classification handle that inside their `resolve_import`.
 - `PluginContext`, `ObserveContext`, and the `AddNode` / `AddEdge` /
   `RemoveEdge` graph-op value objects now use `__slots__`, as do the
   analyzer-internal `_BaseSpec` / `_Task` records, shaving a
