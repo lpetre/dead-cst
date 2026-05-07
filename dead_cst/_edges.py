@@ -40,21 +40,28 @@ from .resolvers import ImportResolver, default_resolve_import
 logger = logging.getLogger(__name__)
 
 
-def _canonicalize(imp: Import, symbol_lookup: SymbolTrie) -> Import:
-    """Push ``decl`` parts into ``module`` while they resolve as submodules.
+def _canonicalize(imp: Import, symbol_lookup: SymbolTrie) -> tuple[Import, SymbolTrie | None]:
+    """Canonicalize ``imp`` and return the trie node its module lands on.
 
-    Recovers the pre-refactor shape where ``from p import functions``
-    (``functions`` is a submodule of ``p``) collapses to
-    ``Import(module="p.functions", decl=None)`` rather than ``module="p"
-    decl="functions"``. Walks the trie greedily through ``module +
-    decl`` and stops at the deepest node that has a real module
-    attached. Star imports are not canonicalized -- the module name is
-    already the target. Imports with no ``decl`` are returned as-is.
+    Pushes ``decl`` parts into ``module`` while they resolve as
+    submodules in the trie, recovering the pre-refactor shape where
+    ``from p import functions`` (``functions`` is a submodule of
+    ``p``) collapses to ``Import(module="p.functions", decl=None)``
+    rather than ``module="p" decl="functions"``. Returns the trie
+    node for the canonical module so the caller doesn't repeat the
+    walk; ``None`` when ``imp.module`` doesn't resolve to anything
+    in the trie.
+
+    Star imports and imports without a ``decl`` skip the walk -- the
+    module name is already the target -- but still benefit from the
+    returned trie node.
     """
     if imp.star or imp.decl is None:
-        return imp
+        return imp, symbol_lookup._get(imp.module.split("."))
+
     parts = imp.module.split(".") + imp.decl.split(".")
     cur = symbol_lookup
+    last_module_node: SymbolTrie | None = None
     last_module_idx = -1
     for i, part in enumerate(parts):
         child = cur.children.get(part)
@@ -62,19 +69,23 @@ def _canonicalize(imp: Import, symbol_lookup: SymbolTrie) -> Import:
             break
         cur = child
         if cur.module is not None:
+            last_module_node = cur
             last_module_idx = i
     if last_module_idx < 0:
-        return imp
+        return imp, None
     new_module = ".".join(parts[: last_module_idx + 1])
     remaining = parts[last_module_idx + 1 :]
     new_decl = ".".join(remaining) if remaining else None
     if new_module == imp.module and new_decl == imp.decl:
-        return imp
-    return Import(
-        module=new_module,
-        decl=new_decl,
-        star=imp.star,
-        speculative=imp.speculative,
+        return imp, last_module_node
+    return (
+        Import(
+            module=new_module,
+            decl=new_decl,
+            star=imp.star,
+            speculative=imp.speculative,
+        ),
+        last_module_node,
     )
 
 
@@ -129,6 +140,27 @@ def resolve_edges(
         search_paths = []
 
     emitted: set[tuple[SymbolNode, SymbolNode, EdgeFlags]] = set()
+    # Per-call memos: imports get canonicalized once (re-exports walk
+    # the same ``decl.imports`` repeatedly) and each synthetic fqname
+    # produces one ``SymbolNode`` regardless of how many edges land
+    # on it.
+    canon_memo: dict[int, tuple[Import, SymbolTrie | None]] = {}
+    synthetic_memo: dict[str, SymbolNode] = {}
+
+    def _canon(imp: Import) -> tuple[Import, SymbolTrie | None]:
+        iid = id(imp)
+        result = canon_memo.get(iid)
+        if result is None:
+            result = _canonicalize(imp, symbol_lookup)
+            canon_memo[iid] = result
+        return result
+
+    def _synth(fqname: str) -> SymbolNode:
+        node = synthetic_memo.get(fqname)
+        if node is None:
+            node = synthetic_node(fqname, base)
+            synthetic_memo[fqname] = node
+        return node
 
     def _emit(
         src: SymbolNode, dst: SymbolNode, flags: EdgeFlags
@@ -144,18 +176,17 @@ def resolve_edges(
     ) -> Generator[tuple[SymbolNode, SymbolNode, EdgeFlags], None, None]:
         synth_fqname = _classify_external(imp, import_resolver, search_paths)
         if synth_fqname is None:
-            if not imp.speculative and imp.star:
-                logger.warning("Failed to resolve star import: 'from %s import *'", imp.module)
-            elif not imp.speculative and not imp.star:
-                logger.warning("Failed to resolve import module: %s", imp.module)
+            if not imp.speculative:
+                if imp.star:
+                    logger.warning("Failed to resolve star import: 'from %s import *'", imp.module)
+                else:
+                    logger.warning("Failed to resolve import module: %s", imp.module)
             return
-        yield from _emit(src, synthetic_node(synth_fqname, base), flags)
+        yield from _emit(src, _synth(synth_fqname), flags)
 
     for src, raw, flags in import_edges:
-        dst = _canonicalize(raw, symbol_lookup)
-
-        node = symbol_lookup._get(dst.module.split("."))
-        if not node or node.module is None:
+        dst, node = _canon(raw)
+        if node is None or node.module is None:
             yield from _emit_external(src, dst, flags)
             continue
 
@@ -202,14 +233,15 @@ def resolve_edges(
                     assert decl.type == "import"
                     assert decl.imports is not None, "import symbol needs Import"
 
-                    # Re-canonicalize the re-export against the lookup
-                    # before chasing it -- the original import was
-                    # captured raw, so a shape like ``Import(module="p",
-                    # decl="functions")`` needs to flatten to
-                    # ``module="p.functions"`` here too.
-                    chained = _canonicalize(decl.imports, symbol_lookup)
-                    dest = symbol_lookup._get(chained.module.split("."))
-                    if not dest or dest.module is None:
+                    # Canonicalize the re-export against the lookup
+                    # before chasing it -- the visitor captured it raw
+                    # too, so ``Import(module="p", decl="functions")``
+                    # needs to flatten to ``module="p.functions"``
+                    # before we walk on. ``_canon`` memoizes per
+                    # unique ``Import`` so chains revisited via
+                    # parallel re-exports stay cheap.
+                    chained, dest = _canon(decl.imports)
+                    if dest is None or dest.module is None:
                         yield from _emit_external(src, chained, flags)
                         continue
 

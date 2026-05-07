@@ -249,14 +249,6 @@ class _Task:
     project_root: Path
 
 
-@dataclass(slots=True)
-class _RunnerState:
-    """Immutable per-process state for the visitor + observe runner."""
-
-    detector: UnreachableRegionDetector
-    plugins: tuple[EdgePlugin, ...]
-
-
 def _rebind_sys_path(search_paths: tuple[Path, ...], baseline: list[str]) -> None:
     """Set ``sys.path`` to ``search_paths + baseline``, deduplicated.
 
@@ -293,35 +285,39 @@ def _clear_resolver_caches() -> None:
     editable_distribution_roots.cache_clear()
 
 
-def _process_task(state: _RunnerState, task: _Task) -> tuple[Path, Path, VisitorPayload]:
+def _process_task(
+    detector: UnreachableRegionDetector,
+    plugins: tuple[EdgePlugin, ...],
+    task: _Task,
+) -> tuple[Path, Path, VisitorPayload]:
     """Run one task; pure (no ``sys.path`` mutation, no resolver call)."""
     payload = _process_one_file(
         task.file,
         fqn_entry=task.fqn_entry,
-        detector=state.detector,
-        plugins=state.plugins,
+        detector=detector,
+        plugins=plugins,
         base=task.base,
         project_root=task.project_root,
     )
     return task.base, task.file, payload
 
 
-_worker_state: _RunnerState | None = None
+_worker_state: tuple[UnreachableRegionDetector, tuple[EdgePlugin, ...]] | None = None
 
 
 def _init_worker(
     detector: UnreachableRegionDetector,
     plugins: tuple[EdgePlugin, ...],
 ) -> None:
-    """Pool initializer: stash a :class:`_RunnerState` in the worker process."""
+    """Pool initializer: stash the worker's detector + plugins."""
     global _worker_state
-    _worker_state = _RunnerState(detector=detector, plugins=plugins)
+    _worker_state = (detector, plugins)
 
 
 def _worker_process_task(task: _Task) -> tuple[Path, Path, VisitorPayload]:
     """Pool task: delegate to :func:`_process_task` against the worker's state."""
     assert _worker_state is not None, "_init_worker must run before _worker_process_task"
-    return _process_task(_worker_state, task)
+    return _process_task(*_worker_state, task)
 
 
 def _build_sorted_tasks(base_specs: dict[Path, _BaseSpec], project_root: Path) -> list[_Task]:
@@ -391,9 +387,9 @@ def _compute_all_miss_payloads(
                 _record(base, file, payload)
         return out
 
-    state = _RunnerState(detector=detector, plugins=tuple(plugins))
+    plugins_t = tuple(plugins)
     for task in tasks:
-        base, file, payload = _process_task(state, task)
+        base, file, payload = _process_task(detector, plugins_t, task)
         _record(base, file, payload)
     return out
 
