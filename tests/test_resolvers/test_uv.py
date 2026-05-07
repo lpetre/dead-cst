@@ -78,24 +78,32 @@ def _write_uv_workspace(tmp_path: Path, *, with_src: bool = True) -> None:
 
 def test_uv_resolver_src_layout(tmp_path: Path):
     _write_uv_workspace(tmp_path)
-    sp = _make_fake_venv(tmp_path)
+    _make_fake_venv(tmp_path)
 
     result = UvResolver().resolve(tmp_path)
+    by_name = {p.name: p for p in result}
 
     core_src = (tmp_path / "packages" / "core" / "src").resolve()
     app_src = (tmp_path / "packages" / "app" / "src").resolve()
-    assert result == {core_src: [sp], app_src: [core_src, sp]}
+    assert by_name["core"].path == core_src
+    assert by_name["core"].deps == ()
+    assert by_name["app"].path == app_src
+    assert by_name["app"].deps == ("core",)
 
 
 def test_uv_resolver_flat_layout(tmp_path: Path):
     _write_uv_workspace(tmp_path, with_src=False)
-    sp = _make_fake_venv(tmp_path)
+    _make_fake_venv(tmp_path)
 
     result = UvResolver().resolve(tmp_path)
+    by_name = {p.name: p for p in result}
 
     core_dir = (tmp_path / "packages" / "core").resolve()
     app_dir = (tmp_path / "packages" / "app").resolve()
-    assert result == {core_dir: [sp], app_dir: [core_dir, sp]}
+    assert by_name["core"].path == core_dir
+    assert by_name["core"].deps == ()
+    assert by_name["app"].path == app_dir
+    assert by_name["app"].deps == ("core",)
 
 
 def test_uv_resolver_skips_virtual_root(tmp_path: Path):
@@ -105,7 +113,7 @@ def test_uv_resolver_skips_virtual_root(tmp_path: Path):
     result = UvResolver().resolve(tmp_path)
 
     # The "ws" package has source = { virtual = "." } and must not appear.
-    assert tmp_path.resolve() not in result
+    assert tmp_path.resolve() not in {p.path for p in result}
 
 
 def test_uv_resolver_missing_venv_raises(tmp_path: Path, monkeypatch):
@@ -170,25 +178,29 @@ def test_uv_resolver_includes_virtual_members(tmp_path: Path):
         """).strip()
     )
 
-    sp = _make_fake_venv(tmp_path)
+    _make_fake_venv(tmp_path)
     result = UvResolver().resolve(tmp_path)
+    by_name = {p.name: p for p in result}
 
     lib_src = (tmp_path / "libs" / "lib-a" / "src").resolve()
     app_src = (tmp_path / "apps" / "app-a" / "src").resolve()
-    assert result == {lib_src: [sp], app_src: [lib_src, sp]}
+    assert by_name["lib-a"].path == lib_src
+    assert by_name["lib-a"].deps == ()
+    assert by_name["app-a"].path == app_src
+    assert by_name["app-a"].deps == ("lib-a",)
 
 
 def test_uv_resolver_no_lockfile(tmp_path: Path):
     # No lockfile => not a uv workspace => silent no-op (don't raise on the
     # missing venv, since the resolver isn't applicable here).
-    assert UvResolver().resolve(tmp_path) == {}
+    assert UvResolver().resolve(tmp_path) == ()
 
 
 def test_uv_resolver_ignores_non_workspace_deps(tmp_path: Path):
     """Deps that aren't workspace members (e.g. regular PyPI deps) are dropped
     silently -- they don't have a source dir under our control."""
     _write_uv_workspace(tmp_path)
-    sp = _make_fake_venv(tmp_path)
+    _make_fake_venv(tmp_path)
     lock = tmp_path / "uv.lock"
     lock.write_text(
         lock.read_text().replace(
@@ -198,9 +210,8 @@ def test_uv_resolver_ignores_non_workspace_deps(tmp_path: Path):
     )
 
     result = UvResolver().resolve(tmp_path)
-    core_src = (tmp_path / "packages" / "core" / "src").resolve()
-    app_src = (tmp_path / "packages" / "app" / "src").resolve()
-    assert result[app_src] == [core_src, sp]
+    by_name = {p.name: p for p in result}
+    assert by_name["app"].deps == ("core",)
 
 
 def test_uv_resolver_explicit_lock_path(tmp_path: Path):
@@ -379,12 +390,16 @@ def test_uv_workspace_shared_namespace_package(tmp_path: Path):
     )
     (foo_b / "foo" / "b" / "__init__.py").write_text("from foo.a import value\n\nresult = value\n")
 
-    sp = _make_fake_venv(tmp_path)
+    _make_fake_venv(tmp_path)
     resolver = UvResolver()
-    paths = resolver.resolve(tmp_path)
+    packages = resolver.resolve(tmp_path)
+    by_name = {p.name: p for p in packages}
     foo_a_dir = foo_a.resolve()
     foo_b_dir = foo_b.resolve()
-    assert paths == {foo_a_dir: [sp], foo_b_dir: [foo_a_dir, sp]}
+    assert by_name["foo-a"].path == foo_a_dir
+    assert by_name["foo-a"].deps == ()
+    assert by_name["foo-b"].path == foo_b_dir
+    assert by_name["foo-b"].deps == ("foo-a",)
 
     graph = Analysis(tmp_path, resolvers=[resolver]).materialize_all()
 

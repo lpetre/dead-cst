@@ -15,7 +15,7 @@ import networkx as nx
 import typer
 from libcst.metadata import CodeRange
 
-from .analyze import Analysis, _count_nodes, _find_reachable, _order_paths
+from .analyze import Analysis, _count_nodes, _find_reachable, _order_packages
 from .cache import (
     GraphCache,
     clear_cache,
@@ -33,7 +33,7 @@ from .plugins import (
 from .plugins.module_dunders import DUNDER_PREFIX
 from .resolvers import (
     ManualResolver,
-    PathMap,
+    Package,
     PathResolver,
     load_resolver,
 )
@@ -211,15 +211,15 @@ def analyze(
             workers=workers,
         )
         graph = analysis.materialize_all()
-    paths_dict = analysis.paths
+    packages = analysis.packages
     reachable = _find_reachable(graph)
 
     unreachable_graph = graph.subgraph([n for n in graph.nodes if n not in reachable])
 
     if output_format == OutputFormat.json:
-        _output_json(graph, unreachable_graph, root, paths_dict)
+        _output_json(graph, unreachable_graph, root, packages)
     else:
-        _output_text(graph, unreachable_graph, root, paths_dict)
+        _output_text(graph, unreachable_graph, root, packages)
 
     if unreachable_graph.number_of_nodes() > 0:
         raise typer.Exit(1)
@@ -229,9 +229,9 @@ def _output_text(
     graph: nx.MultiDiGraph,
     unreachable: nx.MultiDiGraph,
     root: Path,
-    paths_dict: PathMap,
+    packages: tuple[Package, ...],
 ) -> None:
-    for base in _order_paths(paths_dict):
+    for base in _order_packages(packages):
         typer.echo(f"\n{base}:")
         total_counts = _count_nodes(graph, base)
         unreachable_counts = _count_nodes(unreachable, base)
@@ -255,7 +255,7 @@ def _output_text(
         for node in sorted(dead_real, key=lambda n: (str(n.path), n.fqname)):
             typer.echo(f"  {node.fqname} ({node.type}) at {_rel_path(node.path, root)}")
 
-    branches = _dead_suite_locations(graph, paths_dict)
+    branches = _dead_suite_locations(graph, packages)
     if branches:
         typer.echo(f"\nUnreachable branches ({len(branches)}):")
         for path, pos in branches:
@@ -276,15 +276,15 @@ def _dead_real(unreachable: nx.MultiDiGraph) -> list[SymbolNode]:
 
 
 def _dead_suite_locations(
-    graph: nx.MultiDiGraph, paths_dict: PathMap
+    graph: nx.MultiDiGraph, packages: tuple[Package, ...]
 ) -> list[tuple[Path, CodeRange]]:
     """Flatten ``graph.graph["dead_suites"]`` into a sorted ``(path, pos)`` list.
 
-    Restricted to files under one of the analyzed bases so the report
-    doesn't surface dead suites in workspace dependencies that the
-    user isn't asking about.
+    Restricted to files under one of the analyzed packages' paths so
+    the report doesn't surface dead suites in workspace dependencies
+    that the user isn't asking about.
     """
-    bases = list(paths_dict)
+    bases = [p.path for p in packages]
     raw: dict = graph.graph.get("dead_suites", {})
     out: list[tuple[Path, CodeRange]] = []
     for path, suites in raw.items():
@@ -300,7 +300,7 @@ def _output_json(
     graph: nx.MultiDiGraph,
     unreachable: nx.MultiDiGraph,
     root: Path,
-    paths_dict: PathMap,
+    packages: tuple[Package, ...],
 ) -> None:
     result: dict = {
         "summary": {},
@@ -308,7 +308,7 @@ def _output_json(
         "unreachable_branches": [],
     }
 
-    for base in _order_paths(paths_dict):
+    for base in _order_packages(packages):
         base_str = str(base)
         total_counts = _count_nodes(graph, base)
         unreachable_counts = _count_nodes(unreachable, base)
@@ -330,7 +330,7 @@ def _output_json(
             }
         )
 
-    for path, pos in _dead_suite_locations(graph, paths_dict):
+    for path, pos in _dead_suite_locations(graph, packages):
         result["unreachable_branches"].append(
             {
                 "path": str(_rel_path(path, root)),
@@ -457,9 +457,9 @@ def dependencies(
             workers=workers,
         )
         graph = analysis.materialize_all()
-    paths_dict = analysis.paths
+    packages = analysis.packages
 
-    deps_by_base: dict[Path, list[SymbolNode]] = {base: [] for base in _order_paths(paths_dict)}
+    deps_by_base: dict[Path, list[SymbolNode]] = {base: [] for base in _order_packages(packages)}
     for node in graph.nodes:
         if not _is_external_dep(node):
             continue
@@ -621,7 +621,7 @@ def remove(
             workers=workers,
         )
         graph = analysis.materialize_all()
-    paths_dict = analysis.paths
+    packages = analysis.packages
     reachable = _find_reachable(graph)
 
     unreachable_graph = graph.subgraph([n for n in graph.nodes if n not in reachable])
@@ -648,7 +648,7 @@ def remove(
         typer.echo("Aborted.")
         return
 
-    for base in _order_paths(paths_dict):
+    for base in _order_packages(packages):
         remove_code(unreachable_graph, base)
 
     typer.echo("Dead code removed.")

@@ -125,7 +125,7 @@ EXPECTED_PUBLIC_API: dict[str, list[str]] = {
         "BUILTIN_RESOLVERS",
         "ImportResolver",
         "ManualResolver",
-        "PathMap",
+        "Package",
         "PathResolver",
         "SITE_PACKAGES_MARKERS",
         "STDLIB",
@@ -136,7 +136,7 @@ EXPECTED_PUBLIC_API: dict[str, list[str]] = {
         "exported_roots",
         "load_resolver",
         "load_toml",
-        "merge_paths",
+        "merge_packages",
         "safe_resolve_module",
     ],
 }

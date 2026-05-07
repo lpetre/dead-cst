@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
-from ..resolvers._core import PathMap, load_toml
-from ..resolvers._imports import default_resolve_import
+from ..resolvers._core import Package, load_toml
+from ..resolvers._exports import exported_roots
+from ..resolvers._imports import (
+    default_resolve_import,
+    distribution_lookup,
+    editable_distribution_roots,
+    safe_resolve_module,
+)
 
 
 class MissingVenvError(RuntimeError):
@@ -21,40 +27,44 @@ class UvResolver:
 
     For each ``[[package]]`` entry whose ``source`` is ``{ editable = "..." }``
     or ``{ virtual = "..." }`` -- uv's two markers for a workspace member --
-    emit one :class:`PathMap` entry::
-
-        {member_src_root: [direct_workspace_dep_src_roots, workspace_site_packages]}
-
-    ``editable`` members are installable distributions; ``virtual`` members
-    are runnable apps/services that aren't shipped as wheels. Both are
-    first-party code that needs to be analyzed. The workspace root itself
-    (``virtual = "."``) is skipped -- it's a container that holds
-    ``[tool.uv.workspace]``, not a member.
+    emit one :class:`~dead_cst.resolvers.Package`. ``editable`` members are
+    installable distributions; ``virtual`` members are runnable apps/services
+    that aren't shipped as wheels. Both are first-party code that needs to
+    be analyzed. The workspace root itself (``virtual = "."``) is skipped --
+    it's a container that holds ``[tool.uv.workspace]``, not a member.
 
     The src root for a member is ``<member_dir>/src`` if that directory
     exists, else ``<member_dir>`` itself.
 
     Direct workspace dependencies come from the lockfile's per-package
-    ``dependencies`` array; transitive deps are reachable through the chain
-    of returned bases and don't need to be re-listed per member.
+    ``dependencies`` array (matched against fellow workspace members);
+    transitive deps are reachable through the chain of returned packages
+    and don't need to be re-listed per member. The package's
+    :attr:`~dead_cst.resolvers.Package.deps` carries the dep package
+    names (uv's ``[[package]].name`` after PEP 503 canonicalization, but
+    here just the lockfile's literal name).
 
     The resolver also requires the workspace's shared venv to be present
-    (uv puts a single ``.venv`` at the workspace root). Each member's
-    dep list ends with that ``site-packages`` so third-party imports
-    resolve to ``[external dist] <pkg>`` synthetics rather than the
-    ``[unresolved]`` fallback. If no venv is found,
-    :class:`MissingVenvError` is raised.
+    (uv puts a single ``.venv`` at the workspace root). The venv's
+    ``site-packages`` dir is *not* added to any package's ``deps`` -- it
+    is non-first-party, so the dep model doesn't represent it. Instead,
+    :meth:`resolve_import` lazily splices the venv onto ``sys.path`` on
+    first use within an analysis materialization, so third-party
+    imports still classify as ``[external dist] <pkg>`` rather than
+    ``[unresolved]``. If no venv is found, :class:`MissingVenvError`
+    is raised.
     """
 
     lock_path: Path | None = None
     name: str = "uv"
     version: int = 1778500000
+    _site_packages: Path | None = field(default=None, init=False, repr=False)
 
-    def resolve(self, project_root: Path) -> PathMap:
+    def resolve(self, project_root: Path) -> tuple[Package, ...]:
         project_root = project_root.resolve()
         data = load_toml(self.lock_path or project_root / "uv.lock")
         if data is None:
-            return {}
+            return ()
 
         site_packages = _find_venv_site_packages(project_root)
         if site_packages is None:
@@ -63,6 +73,7 @@ class UvResolver:
                 f"workspace at {project_root}. Run `uv sync --all-packages` "
                 f"to populate the shared `.venv`."
             )
+        self._site_packages = site_packages
 
         member_dirs: dict[str, Path] = {}
         member_deps: dict[str, list[str]] = {}
@@ -80,24 +91,51 @@ class UvResolver:
             member_dirs[name] = member_dir
             member_deps[name] = [d["name"] for d in pkg.get("dependencies", [])]
 
-        out: PathMap = {}
+        # Index resolvable src roots per member so deps can map back to
+        # the same Package.path the consumer was assigned.
+        src_roots: dict[str, Path] = {}
         for name, member_dir in member_dirs.items():
             src_root = _src_root_for(member_dir)
-            if src_root is None:
-                continue
-            deps: list[Path] = []
+            if src_root is not None:
+                src_roots[name] = src_root
+
+        out: list[Package] = []
+        for name, src_root in src_roots.items():
+            dep_names: list[str] = []
             for dep_name in member_deps[name]:
-                dep_dir = member_dirs.get(dep_name)
-                if dep_dir is None:
-                    continue
-                dep_src = _src_root_for(dep_dir)
-                if dep_src is not None:
-                    deps.append(dep_src)
-            deps.append(site_packages)
-            out[src_root] = deps
-        return out
+                # Workspace deps only -- regular PyPI deps don't have a
+                # member src root and are reached through the venv at
+                # resolve_import time.
+                if dep_name in src_roots:
+                    dep_names.append(dep_name)
+            exported = tuple(exported_roots(member_dirs[name]) or ())
+            out.append(
+                Package(
+                    path=src_root,
+                    name=name,
+                    exported=exported,
+                    deps=tuple(dep_names),
+                )
+            )
+        return tuple(out)
 
     def resolve_import(self, name: str, search_paths: list[Path]) -> str | Path | None:
+        # The workspace ``.venv`` is no longer represented in
+        # ``Package.deps``, so :func:`Analysis._rebind_sys_path` does not
+        # put it on ``sys.path``. Splice it on lazily here so
+        # :func:`default_resolve_import`'s ``importlib`` lookup can still
+        # find venv-installed third-party packages.
+        if self._site_packages is not None:
+            sp_str = str(self._site_packages)
+            if sp_str not in sys.path:
+                sys.path.append(sp_str)
+                # ``sys.path`` mutation invalidates the dist / module
+                # caches; clear so the next lookup observes the venv.
+                # Subsequent calls within the same base see the venv
+                # already on sys.path and skip the clear.
+                safe_resolve_module.cache_clear()
+                distribution_lookup.cache_clear()
+                editable_distribution_roots.cache_clear()
         return default_resolve_import(name, search_paths)
 
 
