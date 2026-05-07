@@ -8,7 +8,6 @@ import pytest
 
 from dead_cst.resolvers import (
     Package,
-    PyprojectResolver,
     UvResolver,
     assign_file_to_package,
     export_search_root,
@@ -20,7 +19,6 @@ from dead_cst.resolvers import (
 
 
 def test_load_resolver_known():
-    assert isinstance(load_resolver("pyproject"), PyprojectResolver)
     assert isinstance(load_resolver("uv"), UvResolver)
 
 

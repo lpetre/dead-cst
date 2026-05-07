@@ -32,7 +32,7 @@ from dead_cst.cache import (
 )
 from dead_cst.cli import app
 from dead_cst.graph import VisitorPayload
-from dead_cst.resolvers import ManualResolver, PyprojectResolver
+from dead_cst.resolvers import ManualResolver, UvResolver
 from conftest import manual
 
 
@@ -538,13 +538,14 @@ def test_resolver_change_forces_full_rebuild_for_that_base(tmp_path, monkeypatch
 
     monkeypatch.setattr(analyze, "SymbolVisitor", _spy)
     with GraphCache(db) as cache:
-        # Add a second (no-tree) resolver to the chain. PyprojectResolver
-        # returns ``[]`` when there's no pyproject.toml, so it doesn't
-        # change the tree set; but its (name, version) flows into the
-        # per-tree fingerprint, which is the property under test.
+        # Add a second (no-package) resolver to the chain. UvResolver
+        # returns ``[]`` when there's no uv.lock, so it doesn't change
+        # the package set; but its (name, version) flows into the
+        # per-(package, phase) fingerprint, which is the property
+        # under test.
         Analysis(
             tmp_path,
-            resolvers=[ManualResolver(specs=["."]), PyprojectResolver()],
+            resolvers=[ManualResolver(specs=["."]), UvResolver()],
             cache=cache,
         ).materialize_all()
     assert {p.name for p in visited} == {"__init__.py", "a.py", "b.py"}

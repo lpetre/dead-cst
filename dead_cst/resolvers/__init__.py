@@ -48,10 +48,8 @@ from ._imports import (
     safe_resolve_module,
 )
 from .manual import ManualResolver
-from .pyproject import PyprojectResolver
 
 BUILTIN_RESOLVERS: dict[str, type[PathResolver]] = {
-    PyprojectResolver.name: PyprojectResolver,
     UvResolver.name: UvResolver,
 }
 
@@ -76,7 +74,6 @@ __all__ = [
     "ManualResolver",
     "Package",
     "PathResolver",
-    "PyprojectResolver",
     "SITE_PACKAGES_MARKERS",
     "STDLIB",
     "UvResolver",

@@ -32,10 +32,9 @@ those when writing extensions:
   :class:`GraphOp` value objects, and the synthetic-node prefix
   constants the analyzer uses for non-first-party imports.
 * :mod:`dead_cst.resolvers` -- the :class:`PathResolver` protocol,
-  the :class:`Package` data type, builtin resolvers
-  (:class:`PyprojectResolver`, :class:`ManualResolver`), and the
-  ``sys.path`` / ``importlib`` helpers a custom resolver may want
-  to reuse.
+  the :class:`Package` data type, the :class:`ManualResolver`
+  builtin, and the ``sys.path`` / ``importlib`` helpers a custom
+  resolver may want to reuse.
 * :mod:`dead_cst.contrib` -- extensions targeting specific third-party
   tools: framework plugins (:class:`FastAPIPlugin`, :class:`FlaskPlugin`,
   :class:`ClickPlugin`, :class:`TyperPlugin`, :class:`PytestPlugin`,

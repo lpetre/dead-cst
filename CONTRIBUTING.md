@@ -75,7 +75,6 @@ dead_cst/
   _codemod.py            # remove_code -- LibCST transformer + import pruner
   _resolve.py            # import resolution (stdlib / first-party / third-party)
   _resolvers/            # path resolvers (return list[Package]):
-    pyproject.py         #   [tool.dead-cst].packages or src/ + tests/ fallback
     manual.py            #   -p CLI specs
     uv_resolver.py       #   uv.lock workspace members + inter-member deps
   _symbols.py            # SymbolNode, SymbolTrie data classes

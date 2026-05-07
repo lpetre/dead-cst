@@ -33,8 +33,8 @@ two versions.
   internal is what makes this sound: only exported code
   participates in the deps DAG.
 - `PathResolver.resolve` now returns `list[Package]`. The shipped
-  resolvers (`PyprojectResolver`, `ManualResolver`, `UvResolver`)
-  all return package lists.
+  resolvers (`ManualResolver`, `UvResolver`) all return package
+  lists.
 - `UvWorkspaceResolver` renamed to `UvResolver` (module
   `dead_cst.contrib.uv_workspace` -> `dead_cst.contrib.uv_resolver`,
   builtin name `uv_workspace` -> `uv`). The resolver is unchanged in
@@ -60,9 +60,6 @@ two versions.
   closure-scoped graph unsound -- any package's internals could
   keep `package`'s decls alive -- so the API is kept for stability
   but no longer narrows the work.
-- Explicit `pyproject.toml` configuration moved from
-  `[[tool.dead-cst.trees]]` to `[[tool.dead-cst.packages]]` with
-  the new shape (`path`, `name`, `exported = [...]`, `deps = [...]`).
 - `Analysis.__init__` is now `Analysis(project_root, *, resolvers=(),
   plugins=(), cache=None, ...)`. The `source_trees` positional arg is
   gone; the analyzer derives the package list by calling each
@@ -77,6 +74,14 @@ two versions.
   `dead_cst.resolvers.assign_file_to_tree`. Replaced by `Package`,
   `validate_packages`, `assign_file_to_package`, plus the new
   `is_exported_file` and `export_search_root` helpers.
+- `dead_cst.resolvers.PyprojectResolver` and the
+  `[tool.dead-cst].packages` / `[tool.dead-cst].trees` config keys.
+  The conventional-layout fallback offered no value over `-p .`
+  (or a custom resolver), and the explicit-config shape duplicated
+  what a small custom :class:`PathResolver` can express more
+  directly. Use `ManualResolver(specs=["."])` (the CLI default) for
+  the simple case, `UvResolver` for uv projects, or write a custom
+  :class:`PathResolver` for everything else.
 - `VenvResolver`, `MissingVenvError`, `find_venv_site_packages`. The
   venv-aware behavior they encoded is replaced by the
   "run-with-venv-active" contract above.
@@ -90,20 +95,14 @@ two versions.
   `dead_cst.resolvers.is_exported_file`,
   `dead_cst.resolvers.export_search_root`. `Package` is re-exported
   from the top-level `dead_cst` package.
-- `[tool.dead-cst].packages` configuration in `pyproject.toml`: an
-  explicit list of packages with their `path`, `name`, `exported`
-  subdirs, and `deps`, for projects whose layout doesn't fit the
-  conventional fallback (single package rooted at `project_root`
-  with `exported` derived from the build backend).
 - `dead_cst.resolvers.exported_roots(project_dir)` and
   `dead_cst.resolvers.exported_tree_root(project_dir)` helpers. The
   first returns the importable dirs the project's build backend
   would ship (hatchling / setuptools / poetry / pdm / flit dispatch
   plus a name-match fallback); the second derives a single exported
-  subdir from those, with a src-layout shortcut. Both shipped
-  resolvers (`PyprojectResolver`, `UvResolver`) call them
-  internally so a `pyproject.toml`-aware exported-subdir pick is
-  available to custom resolvers too.
+  subdir from those, with a src-layout shortcut. `UvResolver` calls
+  them internally; custom resolvers can do the same to stay
+  consistent.
 - New primary API: `dead_cst.Analysis` and `dead_cst.PackageView`,
   the lazy entry point that callers should reach for on large repos.
   Construction is cheap (no filesystem walk, no parsing). `refresh()`

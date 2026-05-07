@@ -4,8 +4,8 @@ Mirrors the CLI's ``-p`` flag as a first-class :class:`PathResolver`.
 Specs are intentionally minimal -- they cover the simple
 "analyze this directory, with these other packages on the import
 path" case. For src/flat-layout splits and per-file exported vs
-internal classification, use ``[tool.dead-cst].packages`` in
-``pyproject.toml`` (or write a custom :class:`PathResolver`).
+internal classification, write a custom :class:`PathResolver` (or
+use :class:`UvResolver` for uv projects).
 """
 
 from __future__ import annotations

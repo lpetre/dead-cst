@@ -1,9 +1,8 @@
 """Per-project export discovery from ``pyproject.toml``.
 
 :func:`exported_roots` returns the subdirs of a project root that the
-build backend would ship as the wheel's importable surface. Both
-:class:`~dead_cst.resolvers.pyproject.PyprojectResolver` and the
-``uv``-aware contrib resolver use it to pick each project's exported
+build backend would ship as the wheel's importable surface. The
+``uv``-aware contrib resolver uses it to pick each member's exported
 :class:`~dead_cst.resolvers.Package` subdir; custom resolvers can
 call it the same way to stay consistent with the rest of the
 ecosystem.

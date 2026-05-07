@@ -128,7 +128,6 @@ EXPECTED_PUBLIC_API: dict[str, list[str]] = {
         "ManualResolver",
         "Package",
         "PathResolver",
-        "PyprojectResolver",
         "SITE_PACKAGES_MARKERS",
         "STDLIB",
         "UvResolver",
