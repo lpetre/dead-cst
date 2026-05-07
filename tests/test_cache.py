@@ -43,9 +43,7 @@ def _write(root: Path, files: dict[str, str]) -> None:
 
 
 def _fp(base: Path, **kwargs) -> str:
-    """Shorthand: per-base fingerprint with ``search_paths=(base,)`` by default."""
-    kwargs.setdefault("search_paths", (base,))
-    kwargs.setdefault("resolvers", [])
+    """Shorthand: per-base fingerprint."""
     return compute_fingerprint(base=base, **kwargs)
 
 
@@ -66,11 +64,17 @@ def test_fingerprint_stable_for_equal_inputs(tmp_path):
     assert a == b
 
 
-def test_fingerprint_changes_with_search_paths(tmp_path):
-    """Adding a search-path entry flips the fingerprint."""
-    a = _fp(tmp_path, search_paths=(tmp_path,))
-    b = _fp(tmp_path, search_paths=(tmp_path, tmp_path / "dep"))
-    assert a != b
+def test_fingerprint_independent_of_search_paths(tmp_path):
+    """``search_paths`` no longer enters the fingerprint.
+
+    Cross-file import resolution moved to
+    :func:`dead_cst._edges.resolve_edges`, which runs unconditionally
+    on every analysis, so search-path changes re-stitch edges
+    without invalidating cached payloads.
+    """
+    a = _fp(tmp_path)
+    b = _fp(tmp_path)
+    assert a == b
 
 
 def test_fingerprint_changes_with_base(tmp_path):
@@ -86,17 +90,22 @@ def test_fingerprint_independent_of_sibling_bases(tmp_path):
     This is the per-base contract: adding or removing a sibling base
     from the analysis must not invalidate the cached rows for ``base``.
     """
-    a = _fp(tmp_path / "lib", search_paths=(tmp_path / "lib",))
-    # Same base, same search paths -- a "sibling" base just doesn't enter the picture.
-    b = _fp(tmp_path / "lib", search_paths=(tmp_path / "lib",))
+    a = _fp(tmp_path / "lib")
+    # Same base -- a "sibling" base just doesn't enter the picture.
+    b = _fp(tmp_path / "lib")
     assert a == b
 
 
-def test_fingerprint_changes_with_resolvers(tmp_path):
-    """Adding a resolver name changes the fingerprint."""
-    a = _fp(tmp_path, resolvers=[])
-    b = _fp(tmp_path, resolvers=[ManualResolver(specs=[])])
-    assert a != b
+def test_fingerprint_independent_of_resolvers(tmp_path):
+    """Resolver chain no longer enters the fingerprint.
+
+    The resolver participates in :func:`resolve_edges` (which runs
+    unconditionally), not the per-file visitor pass, so swapping
+    resolvers re-stitches edges without invalidating cached payloads.
+    """
+    a = _fp(tmp_path)
+    b = _fp(tmp_path)
+    assert a == b
 
 
 def test_fingerprint_subclasses_with_distinct_names_distinct(tmp_path):
@@ -511,9 +520,14 @@ def test_edited_file_re_runs_visitor(tmp_path, monkeypatch):
     assert visited == [tmp_path / "pkg" / "a.py"]
 
 
-def test_resolver_change_forces_full_rebuild_for_that_base(tmp_path, monkeypatch):
-    """Adding a resolver changes the per-base fingerprint, so every file
-    in that base is re-visited; sibling bases are untouched."""
+def test_resolver_change_does_not_invalidate_cache(tmp_path, monkeypatch):
+    """Resolvers no longer enter the per-file fingerprint.
+
+    Cross-file import resolution moved to
+    :func:`dead_cst._edges.resolve_edges`, so adding or swapping a
+    resolver re-stitches edges on the next analysis without
+    re-running the visitor on any cached file.
+    """
     _write(
         tmp_path,
         {
@@ -540,7 +554,7 @@ def test_resolver_change_forces_full_rebuild_for_that_base(tmp_path, monkeypatch
         Analysis(
             {tmp_path: []}, resolvers=[ManualResolver(specs=[])], cache=cache
         ).materialize_all()
-    assert {p.name for p in visited} == {"__init__.py", "a.py", "b.py"}
+    assert visited == []
 
 
 def test_plugin_contributions_survive_warm_cache(tmp_path):

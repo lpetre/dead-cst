@@ -23,7 +23,7 @@ from dead_cst.cache import (
 
 
 def _fp(base: Path) -> str:
-    return compute_fingerprint(base=base, search_paths=(base,), resolvers=[])
+    return compute_fingerprint(base=base)
 
 
 def _write(root: Path, files: dict[str, str]) -> None:
@@ -225,8 +225,14 @@ def test_multi_base_parallel_matches_serial(tmp_path):
     assert _edge_set(parallel) == _edge_set(serial)
 
 
-def test_tasks_sorted_by_search_paths(tmp_path, monkeypatch):
-    """Worker tasks are sorted by ``search_paths`` so each worker sees contiguous bases."""
+def test_tasks_sorted_by_base(tmp_path, monkeypatch):
+    """Worker tasks are sorted by ``(base, file)`` so each base's files are contiguous.
+
+    The visitor pass no longer touches ``sys.path``, so task order is
+    purely an aesthetic / determinism concern -- but keeping
+    same-base files adjacent stays readable in logs and stable across
+    runs.
+    """
     base_a = tmp_path / "a"
     base_b = tmp_path / "b"
     _write(
@@ -253,17 +259,18 @@ def test_tasks_sorted_by_search_paths(tmp_path, monkeypatch):
 
     def _spy_map(self, fn, iterable, *args, **kwargs):
         materialized = list(iterable)
-        captured.append([t.search_paths for t in materialized])
+        captured.append([t.base for t in materialized])
         return real_map(self, fn, materialized, *args, **kwargs)
 
     monkeypatch.setattr(analyze.ProcessPoolExecutor, "map", _spy_map)
     Analysis({base_a: [], base_b: []}, workers=2).materialize_all()
 
     assert len(captured) == 1
-    sps = captured[0]
-    # Same-base tasks land contiguously after the sort.
-    runs = [sps[0]]
-    for sp in sps[1:]:
-        if sp != runs[-1]:
-            runs.append(sp)
-    assert len(runs) == len(set(runs)), f"expected each base's tasks contiguous, got order {sps!r}"
+    bases = captured[0]
+    runs = [bases[0]]
+    for b in bases[1:]:
+        if b != runs[-1]:
+            runs.append(b)
+    assert len(runs) == len(set(runs)), (
+        f"expected each base's tasks contiguous, got order {bases!r}"
+    )

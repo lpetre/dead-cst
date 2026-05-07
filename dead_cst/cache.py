@@ -60,7 +60,6 @@ from .branches import (
 )
 from .graph import VisitorPayload
 from .plugins._core import EdgePlugin
-from .resolvers import PathResolver
 
 logger = logging.getLogger(__name__)
 
@@ -83,22 +82,28 @@ def default_cache_path(project_root: Path) -> Path:
 def compute_fingerprint(
     *,
     base: Path,
-    search_paths: Sequence[Path],
-    resolvers: Sequence[PathResolver],
     plugins: Sequence[EdgePlugin] = (),
     unreachable_detector: UnreachableRegionDetector | None = None,
 ) -> str:
     """SHA-256 of every per-base input that affects payload semantics.
 
-    Per-base by design: the fingerprint covers exactly one base's
-    configuration (``base`` itself, its ``search_paths``, the visitor
-    / resolver / plugin / detector chain, the schema version, the
-    Python version), so different bases in the same analysis live
-    side-by-side in one database without invalidating each other.
-    Adding or removing a sibling base, or changing a sibling base's
-    deps, leaves this base's fingerprint untouched.
+    Covers exactly the inputs the visitor + observe pass depend on:
+    the base (FQN provider keys on it), the visitor / plugin /
+    detector ``(name, version)`` chain, the schema version, the
+    Python version. Different bases in one analysis live side-by-side
+    in one database without invalidating each other.
 
-    Each component (visitor, plugins, resolvers, detector) satisfies
+    ``search_paths`` and the resolver chain are *not* in the
+    fingerprint: cross-file import resolution moved out of the
+    visitor and into :func:`dead_cst._edges.resolve_edges` (which
+    runs unconditionally on every analysis), so swapping a resolver
+    or rebinding ``sys.path`` re-stitches edges without invalidating
+    the cached :class:`VisitorPayload` blobs. The ``Cacheable``
+    contract on :class:`~dead_cst.resolvers.PathResolver` survives
+    because the resolver still drives a (uncached) classification
+    step at stitch time.
+
+    Each component (visitor, plugins, detector) satisfies
     :class:`~dead_cst._cacheable.Cacheable` and is fingerprinted by
     its ``(name, version)`` pair: bumping ``version`` invalidates
     every cached entry that referenced the old version. ``version``
@@ -120,14 +125,6 @@ def compute_fingerprint(
     h.update(f"python={sys.version_info.major}.{sys.version_info.minor}\n".encode())
     h.update(f"visitor={SymbolVisitor.name}@{SymbolVisitor.version}\n".encode())
     h.update(f"base={base}\n".encode())
-
-    h.update(b"search_paths=\n")
-    for sp in sorted(search_paths, key=str):
-        h.update(f"  {sp}\n".encode())
-
-    h.update(b"resolvers=\n")
-    for r_name, r_version in sorted((r.name, r.version) for r in resolvers):
-        h.update(f"  {r_name}@{r_version}\n".encode())
 
     h.update(b"plugins=\n")
     for p_name, p_version in sorted((p.name, p.version) for p in plugins):

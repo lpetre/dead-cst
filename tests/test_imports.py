@@ -210,8 +210,15 @@ IMPORT_BASE_EDGES = frozenset(
         ),
         pytest.param(
             "import p\ndef a(): p.functions.f()",
+            # The access ``p.functions.f`` synthesizes an
+            # ``Import(module="p", decl="functions.f")``; the stitcher
+            # canonicalizes it to ``module="p.functions"`` because the
+            # whole prefix resolves as a submodule, so the edge points
+            # at the deepest reached module rather than at ``p``.
+            # Reachability of ``p`` itself is still preserved through
+            # ``p.x.p -> p`` plus the ``p.functions -> p`` parent-edge.
             {
-                "p.x.a -> p",
+                "p.x.a -> p.functions",
                 "p.x.a -> p.functions.f",
                 "p.x.a -> p.x",
                 "p.x.a -> p.x.p",

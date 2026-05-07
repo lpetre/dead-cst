@@ -63,10 +63,29 @@ class EdgeFlags(enum.IntFlag):
 
 @dataclass(frozen=True, slots=True)
 class Import:
-    path: Path | str
+    """Raw, pre-resolution record of one cross-file reference.
+
+    Every field is what the source code literally said: ``module`` is
+    the dotted name written in the ``from <module> import ...`` (or
+    ``import <module>``) clause -- no submodule-vs-name disambiguation
+    has happened yet. The edge stitcher
+    (:func:`dead_cst._edges.resolve_edges`) is the single place that
+    classifies the target (first-party module, decl in a module,
+    submodule, stdlib, external dist, ...) and may rewrite ``module`` /
+    ``decl`` to the canonical ``deepest-module + remainder`` split.
+
+    ``speculative`` is set on the synthetic star imports
+    :class:`~dead_cst._visitor.SymbolVisitor` produces for
+    ``__import__(name, fromlist=[...])`` / ``importlib.import_module``
+    fromlist entries that may or may not be submodules. The stitcher
+    silently drops a speculative entry when neither the trie nor the
+    resolver can place it; non-speculative imports warn instead.
+    """
+
     module: str
     decl: str | None = None
     star: bool = False
+    speculative: bool = False
 
 
 @dataclass(frozen=True, slots=True)

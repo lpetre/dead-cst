@@ -202,8 +202,14 @@ def test_package_dead_matches_full_dead_slice(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_per_base_fingerprint_isolates_siblings(tmp_path, monkeypatch):
-    """Changing one base's search paths invalidates *only* that base's rows."""
+def test_dep_changes_do_not_invalidate_visitor_cache(tmp_path, monkeypatch):
+    """Changing a base's deps re-stitches edges but does not re-run the visitor.
+
+    ``search_paths`` left the per-file fingerprint when import
+    resolution moved to :func:`dead_cst._edges.resolve_edges`, so
+    swapping a base's deps just reshuffles the stitching pass --
+    every cached :class:`VisitorPayload` for that base stays valid.
+    """
     base_a = tmp_path / "a"
     base_b = tmp_path / "b"
     extra = tmp_path / "extra"
@@ -225,11 +231,6 @@ def test_per_base_fingerprint_isolates_siblings(tmp_path, monkeypatch):
         return real(path, *args, **kwargs)
 
     monkeypatch.setattr(analyze, "SymbolVisitor", _spy)
-    # Add a search-path entry to base_a only. base_b's fingerprint is
-    # unchanged, so its rows stay valid; base_a's rows are invalidated.
     with GraphCache(db) as cache:
         Analysis({base_a: [extra], base_b: []}, cache=cache).materialize_all()
-    visited_under_a = {p for p in visited if p.is_relative_to(base_a)}
-    visited_under_b = {p for p in visited if p.is_relative_to(base_b)}
-    assert visited_under_a, "base_a should re-visit after fingerprint change"
-    assert not visited_under_b, "base_b should not re-visit -- its fingerprint is unchanged"
+    assert visited == []

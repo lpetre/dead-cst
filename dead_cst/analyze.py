@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import sys
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Iterator, Mapping, Sequence
 
@@ -134,8 +134,6 @@ def _process_one_file(
     file: Path,
     *,
     fqn_entry: ModuleNameAndPackage,
-    search_paths: list[Path],
-    import_resolver: ImportResolver,
     detector: UnreachableRegionDetector,
     plugins: Sequence[EdgePlugin],
     base: Path,
@@ -149,6 +147,11 @@ def _process_one_file(
     skipping :class:`FullRepoManager`'s per-instance ``gen_cache``
     rebuild. Same shape ``FullRepoManager.get_metadata_wrapper_for_path``
     builds, just without re-walking the file list every time.
+
+    Cross-file import resolution moved to
+    :func:`dead_cst._edges.resolve_edges`, so this pass is purely a
+    function of the file's source -- no ``search_paths`` or resolver
+    plumbing is needed here.
     """
     module = cst.parse_module(file.read_text())
     wrapper = MetadataWrapper(
@@ -156,13 +159,7 @@ def _process_one_file(
         unsafe_skip_copy=True,
         cache={FixedFullyQualifiedNameProvider: fqn_entry},
     )
-    visitor = SymbolVisitor(
-        file,
-        search_paths,
-        import_resolver,
-        unreachable_detector=detector,
-        wrapper=wrapper,
-    )
+    visitor = SymbolVisitor(file, unreachable_detector=detector, wrapper=wrapper)
     wrapper.visit(visitor)
     base_payload = visitor.to_payload()
     plugin_payload = _run_observe(plugins, file, wrapper.module, base_payload, base, project_root)
@@ -241,38 +238,32 @@ class _Task:
     ``fqn_entry`` is this file's slice of the per-base FQN cache built
     once in the parent (see :func:`_collect_base_specs`); the runner
     injects it into a :class:`MetadataWrapper` rather than rebuilding
-    a :class:`FullRepoManager`. ``search_paths`` doubles as the
-    transition key for ``sys.path`` rebinding + resolver-cache
-    invalidation.
+    a :class:`FullRepoManager`. The visitor pass no longer touches
+    ``sys.path`` or the resolver, so workers can run in parallel
+    without per-base bookkeeping.
     """
 
     file: Path
     base: Path
-    search_paths: tuple[Path, ...]
     fqn_entry: ModuleNameAndPackage
     project_root: Path
 
 
 @dataclass(slots=True)
 class _RunnerState:
-    """Mutable state for the per-task runner, shared by serial and worker paths.
-
-    ``sys_path_baseline`` is the original ``sys.path`` captured at
-    runner startup; transitions rebuild ``sys.path`` from
-    ``search_paths + baseline`` and clear the resolver LRUs. The
-    serial caller restores ``sys.path`` from the baseline when the run
-    finishes; workers don't bother since the process is about to exit.
-    """
+    """Immutable per-process state for the visitor + observe runner."""
 
     detector: UnreachableRegionDetector
     plugins: tuple[EdgePlugin, ...]
-    import_resolver: ImportResolver
-    sys_path_baseline: list[str]
-    last_search_paths: tuple[Path, ...] | None = field(default=None)
 
 
 def _rebind_sys_path(search_paths: tuple[Path, ...], baseline: list[str]) -> None:
-    """Set ``sys.path`` to ``search_paths + baseline``, deduplicated."""
+    """Set ``sys.path`` to ``search_paths + baseline``, deduplicated.
+
+    Used by :meth:`Analysis._materialize` so the resolver chain in
+    :func:`_compose_contribution` -> :func:`resolve_edges` sees this
+    base's first-party prefix while classifying trie-miss imports.
+    """
     new_path: list[str] = []
     seen: set[str] = set()
     for p in search_paths:
@@ -303,22 +294,10 @@ def _clear_resolver_caches() -> None:
 
 
 def _process_task(state: _RunnerState, task: _Task) -> tuple[Path, Path, VisitorPayload]:
-    """Run one task, transitioning ``sys.path`` + caches if the base changed.
-
-    Used by both the in-process serial loop and the
-    :class:`ProcessPoolExecutor` workers; the only difference between
-    the two is who owns ``state`` (a local in serial, a per-process
-    global in workers).
-    """
-    if state.last_search_paths != task.search_paths:
-        _rebind_sys_path(task.search_paths, state.sys_path_baseline)
-        _clear_resolver_caches()
-        state.last_search_paths = task.search_paths
+    """Run one task; pure (no ``sys.path`` mutation, no resolver call)."""
     payload = _process_one_file(
         task.file,
         fqn_entry=task.fqn_entry,
-        search_paths=list(task.search_paths),
-        import_resolver=state.import_resolver,
         detector=state.detector,
         plugins=state.plugins,
         base=task.base,
@@ -333,21 +312,10 @@ _worker_state: _RunnerState | None = None
 def _init_worker(
     detector: UnreachableRegionDetector,
     plugins: tuple[EdgePlugin, ...],
-    resolvers: tuple[PathResolver, ...],
 ) -> None:
-    """Pool initializer: build the worker's :class:`_RunnerState`.
-
-    Resolver chain is rebuilt locally because :func:`_chain_resolvers`
-    can return a closure (not picklable); the resolver instances
-    themselves travel as picklable dataclasses.
-    """
+    """Pool initializer: stash a :class:`_RunnerState` in the worker process."""
     global _worker_state
-    _worker_state = _RunnerState(
-        detector=detector,
-        plugins=plugins,
-        import_resolver=_chain_resolvers(resolvers),
-        sys_path_baseline=list(sys.path),
-    )
+    _worker_state = _RunnerState(detector=detector, plugins=plugins)
 
 
 def _worker_process_task(task: _Task) -> tuple[Path, Path, VisitorPayload]:
@@ -357,25 +325,23 @@ def _worker_process_task(task: _Task) -> tuple[Path, Path, VisitorPayload]:
 
 
 def _build_sorted_tasks(base_specs: dict[Path, _BaseSpec], project_root: Path) -> list[_Task]:
-    """Flatten every base's miss files into one task list, sorted by search_paths.
+    """Flatten every base's miss files into one task list, sorted by ``(base, file)``.
 
-    Sorting puts same-base tasks adjacent so a runner sees at most one
-    ``sys.path`` transition per base it touches, regardless of total
-    file count. Sorting on ``Path`` tuples directly is fine -- it's
-    just attribute access per comparison.
+    The visitor pass is now ``sys.path``-independent, so task ordering
+    is purely an aesthetic / determinism concern -- sorting on
+    ``(base, file)`` keeps related tasks together for log readability.
     """
     tasks: list[_Task] = [
         _Task(
             file=file,
             base=base,
-            search_paths=spec.search_paths,
             fqn_entry=spec.fqn_cache[str(file)],
             project_root=project_root,
         )
         for base, spec in base_specs.items()
         for file in spec.miss_files
     ]
-    tasks.sort(key=lambda t: (t.search_paths, t.file))
+    tasks.sort(key=lambda t: (t.base, t.file))
     return tasks
 
 
@@ -385,8 +351,6 @@ def _compute_all_miss_payloads(
     project_root: Path,
     detector: UnreachableRegionDetector,
     plugins: Sequence[EdgePlugin],
-    resolvers: Sequence[PathResolver],
-    import_resolver: ImportResolver,
     cache: GraphCache | None,
     workers: int | None,
 ) -> dict[Path, dict[Path, VisitorPayload]]:
@@ -421,28 +385,16 @@ def _compute_all_miss_payloads(
         with ProcessPoolExecutor(
             max_workers=min(workers, len(tasks)),
             initializer=_init_worker,
-            initargs=(detector, tuple(plugins), tuple(resolvers)),
+            initargs=(detector, tuple(plugins)),
         ) as pool:
             for base, file, payload in pool.map(_worker_process_task, tasks):
                 _record(base, file, payload)
         return out
 
-    # Serial: run every task in-process. Restore ``sys.path`` on the
-    # way out so callers (tests, library users) don't see lingering
-    # mutations from the runner's per-base rebinds.
-    baseline = list(sys.path)
-    state = _RunnerState(
-        detector=detector,
-        plugins=tuple(plugins),
-        import_resolver=import_resolver,
-        sys_path_baseline=baseline,
-    )
-    try:
-        for task in tasks:
-            base, file, payload = _process_task(state, task)
-            _record(base, file, payload)
-    finally:
-        sys.path[:] = baseline
+    state = _RunnerState(detector=detector, plugins=tuple(plugins))
+    for task in tasks:
+        base, file, payload = _process_task(state, task)
+        _record(base, file, payload)
     return out
 
 
@@ -622,6 +574,8 @@ def _compose_contribution(
     symbol_lookup: SymbolTrie,
     plugins: Sequence[EdgePlugin],
     project_root: Path,
+    import_resolver: ImportResolver,
+    search_paths: list[Path],
 ) -> None:
     """Merge ``contrib.base_graph`` into ``target_graph``, stitch
     cross-base imports against ``symbol_lookup``, and run plugin
@@ -630,14 +584,24 @@ def _compose_contribution(
     The caller owns ``symbol_lookup`` because its construction depends
     on which dep export tries are in scope -- the full-graph path
     merges every dep's exports, while the closure-scoped path merges
-    only deps inside the requested scope.
+    only deps inside the requested scope. ``import_resolver`` +
+    ``search_paths`` reach :func:`resolve_edges` for the trie-miss
+    classification path (stdlib / external dist / external file /
+    unresolved); they are unused when every import resolves
+    first-party in the trie.
     """
     target_graph.update(
         edges=contrib.base_graph.edges(data=True, keys=True),
         nodes=contrib.base_graph.nodes(data=True),
     )
     target_graph.graph.setdefault("dead_suites", {}).update(contrib.base_graph.graph["dead_suites"])
-    for src, dst, flags in resolve_edges(contrib.import_edges, symbol_lookup, contrib.base):
+    for src, dst, flags in resolve_edges(
+        contrib.import_edges,
+        symbol_lookup,
+        contrib.base,
+        import_resolver=import_resolver,
+        search_paths=search_paths,
+    ):
         target_graph.add_edge(src, dst, flags=flags)
     if plugins:
         ctx = PluginContext(
@@ -900,8 +864,6 @@ class Analysis:
             project_root=self._project_root,
             detector=self._detector,
             plugins=self._plugins,
-            resolvers=self._resolvers,
-            import_resolver=self._import_resolver,
             cache=self._cache,
             workers=self._workers,
         )
@@ -962,19 +924,40 @@ class Analysis:
 
         ``scope=None`` composes every base. Caller is responsible for
         having :meth:`refresh`'d every base in ``scope`` first.
+
+        Cross-file import resolution runs here (in
+        :func:`_compose_contribution` -> :func:`resolve_edges`), which
+        is where the resolver chain reads ``sys.path`` /
+        :mod:`importlib.metadata`. We rebind ``sys.path`` to each
+        base's ``(base, *deps)`` view before composing it and clear
+        the resolver LRUs at every transition, restoring the original
+        ``sys.path`` on the way out so library callers don't see
+        lingering mutations.
         """
         g: nx.MultiDiGraph = nx.MultiDiGraph()
         g.graph["dead_suites"] = {}
-        for base in self.bases:
-            if scope is not None and base not in scope:
-                continue
-            _compose_contribution(
-                self._contributions[base],
-                target_graph=g,
-                symbol_lookup=self._build_symbol_lookup(base, scope=scope),
-                plugins=self._plugins,
-                project_root=self._project_root,
-            )
+        baseline = list(sys.path)
+        last_search_paths: tuple[Path, ...] | None = None
+        try:
+            for base in self.bases:
+                if scope is not None and base not in scope:
+                    continue
+                search_paths = (base, *self._paths.get(base, []))
+                if last_search_paths != search_paths:
+                    _rebind_sys_path(search_paths, baseline)
+                    _clear_resolver_caches()
+                    last_search_paths = search_paths
+                _compose_contribution(
+                    self._contributions[base],
+                    target_graph=g,
+                    symbol_lookup=self._build_symbol_lookup(base, scope=scope),
+                    plugins=self._plugins,
+                    project_root=self._project_root,
+                    import_resolver=self._import_resolver,
+                    search_paths=list(search_paths),
+                )
+        finally:
+            sys.path[:] = baseline
         return g
 
     def reachable(self) -> set[SymbolNode]:
@@ -1028,15 +1011,16 @@ class Analysis:
     def _base_fingerprint(self, base: Path) -> str:
         """Per-base cache fingerprint for ``base``.
 
-        Each base's fingerprint is independent: it covers ``base`` and
-        its own search paths but not sibling bases' configs, so cache
-        rows for different bases coexist without invalidating each
-        other when one base's deps change.
+        Covers only the inputs the visitor + observe pass depend on
+        (the base itself, the visitor / plugin / detector versions).
+        ``search_paths`` and the resolver chain do not enter the
+        fingerprint -- import resolution moved to
+        :func:`resolve_edges`, which runs unconditionally on every
+        analysis, so resolver / search-path changes re-stitch edges
+        without invalidating cached payloads.
         """
         return compute_fingerprint(
             base=base,
-            search_paths=(base, *self._paths.get(base, [])),
-            resolvers=self._resolvers,
             plugins=self._plugins,
             unreachable_detector=self._detector,
         )
