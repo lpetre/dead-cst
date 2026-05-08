@@ -102,8 +102,17 @@ def enumerate_files(
     cache: GraphCache | None,
     fingerprint: str,
 ) -> PackageFiles:
-    """Walk ``package.path``'s ``.py`` tree, classify each file as cache hit or miss."""
-    files = tuple(sorted(package.path.rglob("*.py")))
+    """Walk ``package.path``'s ``.py`` / ``.pyi`` tree, classify each file as cache hit or miss.
+
+    A ``.pyi`` whose ``.py`` twin also exists is skipped at this layer:
+    ingesting both would assert in the symbol trie when they claim the
+    same FQN, and dead-cst has no peer-stub linker. Orphan ``.pyi``
+    (compiled-extension shape) flows through under its natural FQN.
+    """
+    py_files = sorted(package.path.rglob("*.py"))
+    py_stems = {p.with_suffix("") for p in py_files}
+    pyi_files = (p for p in package.path.rglob("*.pyi") if p.with_suffix("") not in py_stems)
+    files = tuple(sorted([*py_files, *pyi_files]))
     hits: dict[Path, VisitorPayload] = {}
     miss_files: list[Path] = []
     for file in files:
@@ -439,7 +448,11 @@ def _apply_payload(
             continue
         if n.type != "module":
             symbol_graph.add_edge(n, module, flags=EdgeFlags.NONE)
-        if not (n.flags & NodeFlags.SHADOWED):
+        # ``OVERLOAD`` and ``SHADOWED`` both keep the decl out of the
+        # cross-module lookup trie; the graph keeps the parent edge so
+        # the decl is well-formed but consumer imports route to the
+        # impl, never the stub.
+        if not (n.flags & (NodeFlags.SHADOWED | NodeFlags.OVERLOAD)):
             current_trie.add_declaration(n)
             if file_exported:
                 export_trie.add_declaration(n)

@@ -39,6 +39,12 @@ class NodeFlags(enum.IntFlag):
     flagged synthetic nodes via their per-file payloads to declare
     entrypoints without a separate API surface.
 
+    ``OVERLOAD`` flags a ``typing.overload`` stub (or any same-name
+    displaced sibling). Excluded from the lookup trie like
+    ``SHADOWED``, but its lifetime is anchored to the matching impl
+    via explicit ``impl -> overload`` edges so the codemod removes
+    the overload alongside a dead impl rather than in isolation.
+
     ``TESTCASE`` tags an entrypoint as test-only (pytest / unittest
     discovery seeds, fixture seeds, etc.). It is metadata on top of
     ``ENTRYPOINT`` -- default :func:`find_reachable` treats those
@@ -50,6 +56,7 @@ class NodeFlags(enum.IntFlag):
     NONE = 0
     SHADOWED = enum.auto()
     ENTRYPOINT = enum.auto()
+    OVERLOAD = enum.auto()
     TESTCASE = enum.auto()
 
 

@@ -42,6 +42,29 @@ two versions.
   `dead_cst._refresh`.
 
 ### Added
+- `.pyi` stub files are now ingested by the analyzer and rewritten by
+  the codemod, targeting the **compiled-extension layout**: a binary
+  module (e.g. `mypkg/_native.so`) shipping next to its hand-written
+  type stub (`mypkg/_native.pyi`) with no `.py` twin. The stub is
+  parsed through the same visitor as a regular module under its
+  natural FQN (`mypkg._native`), so `from mypkg._native import
+  compute` resolves to the stub's `compute` decl through the normal
+  cross-module import path, and reachability + the codemod work the
+  same as for any first-party module. A `.pyi` shipped alongside a
+  real `.py` is dropped during file enumeration -- the runtime
+  module is the canonical declaration of those names, and ingesting
+  the stub on top would collide with it in the symbol trie. Peer-mode
+  stubs are therefore invisible to dead-cst.
+- New `NodeFlags.OVERLOAD` flag plus visitor support for
+  `typing.overload`. `@overload`-decorated functions (recognized
+  syntactically -- bare `overload`, `typing.overload`, and
+  `typing_extensions.overload`) are flagged and excluded from the
+  cross-module lookup trie just like `SHADOWED` decls, so `from mod
+  import f` continues to resolve to the impl rather than a typing
+  stub. The visitor also wires `impl -> overload` edges so an
+  overload's lifetime is anchored to its same-name impl: the codemod
+  removes the overloads alongside the impl when the impl is dead, and
+  preserves them as long as the impl is alive.
 - New `NodeFlags.TESTCASE` flag tags entrypoints created by test
   plugins (pytest / unittest discovery, fixture seeds). The default
   `Analysis.reachable()` traversal still treats those seeds as

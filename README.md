@@ -284,6 +284,10 @@ A module-level `import` / `from ... import ...` is itself a declaration of type 
 
 `dead-cst` tracks top-level declarations only -- module-level functions, classes, and variables. Nested definitions (inner functions, methods, nested classes) are deliberately not given their own nodes; references made from inside those nested scopes are attributed to the enclosing top-level declaration. Keeping the containing top-level symbol alive keeps its nested source alive with it.
 
+`.pyi` stub files are ingested for the **compiled-extension** layout: a binary like `mypkg/_native.so` shipping next to `mypkg/_native.pyi`. With no matching `.py`, the stub is the only Python-discoverable description of those names, so the analyzer parses it under its natural module FQN (`mypkg._native`) and `from mypkg._native import compute` resolves to the stub's declaration through the normal import path. A `.pyi` shipped alongside a real `.py` is dropped during file enumeration -- the runtime always wins, and the peer stub is invisible to dead-cst.
+
+`@typing.overload`-decorated functions in `.py` files are flagged so a dead implementation drags its overloads along during `dead-cst remove` instead of leaving them behind as orphans.
+
 ## Limitations
 
 - `import *` is treated pessimistically: every top-level declaration in the target module is considered used by the importing module.
