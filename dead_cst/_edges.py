@@ -3,9 +3,9 @@
 The visitor pass produces ``(src, Import, flags)`` triples where
 ``Import`` carries the raw dotted name written in the source -- no
 classification has happened yet. :func:`resolve_edges` is the single
-place that walks those triples against the per-base
+place that walks those triples against the per-package
 :class:`SymbolTrie`, falls back to a :class:`PathResolver` for cross-
-base / external classification, and yields the concrete
+package / external classification, and yields the concrete
 ``(src_symbol, dst_symbol, flags)`` triples -- following re-exports,
 fanning star imports out to every top-level decl in the target
 module, and emitting synthetic nodes for stdlib / external / unresolved
@@ -123,7 +123,7 @@ def _classify_external(
 def resolve_edges(
     import_edges: Iterable[tuple[SymbolNode, Import, EdgeFlags]],
     symbol_lookup: SymbolTrie,
-    base: Path,
+    package_path: Path,
     *,
     import_resolver: ImportResolver = default_resolve_import,
     search_paths: list[Path] | None = None,
@@ -158,7 +158,7 @@ def resolve_edges(
     def _synth(fqname: str) -> SymbolNode:
         node = synthetic_memo.get(fqname)
         if node is None:
-            node = synthetic_node(fqname, base)
+            node = synthetic_node(fqname, package_path)
             synthetic_memo[fqname] = node
         return node
 

@@ -110,16 +110,16 @@ def test_parallel_falls_back_to_serial_for_single_miss(tmp_path, make_analysis, 
 
     (tmp_path / "pkg" / "a.py").write_text("def f():\n    return 1\n")
 
-    from dead_cst import analyze
+    from dead_cst import _refresh
 
     calls = []
-    real = analyze.ProcessPoolExecutor
+    real = _refresh.ProcessPoolExecutor
 
     def _spy(*args, **kwargs):
         calls.append(kwargs.get("max_workers"))
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(analyze, "ProcessPoolExecutor", _spy)
+    monkeypatch.setattr(_refresh, "ProcessPoolExecutor", _spy)
     with GraphCache(db) as cache:
         make_analysis(cache=cache, workers=4).materialize_all()
     assert calls == [], "single-miss run should not spawn a pool"
@@ -129,16 +129,16 @@ def test_parallel_pool_capped_at_total_task_count(tmp_path, make_analysis, monke
     """The pool caps ``max_workers`` at the total number of cache-miss tasks."""
     _write(tmp_path, _multi_file_layout())
 
-    from dead_cst import analyze
+    from dead_cst import _refresh
 
     seen = []
-    real = analyze.ProcessPoolExecutor
+    real = _refresh.ProcessPoolExecutor
 
     def _spy(*args, **kwargs):
         seen.append(kwargs.get("max_workers"))
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(analyze, "ProcessPoolExecutor", _spy)
+    monkeypatch.setattr(_refresh, "ProcessPoolExecutor", _spy)
     make_analysis(workers=64).materialize_all()
     # Five files in _multi_file_layout(); pool should be capped at 5.
     assert seen == [5]
@@ -148,16 +148,16 @@ def test_parallel_pool_capped_at_total_task_count(tmp_path, make_analysis, monke
 def test_workers_none_or_one_keeps_serial_path(tmp_path, make_analysis, monkeypatch, workers):
     """``workers=None`` and ``workers=1`` never spawn a pool."""
     _write(tmp_path, _multi_file_layout())
-    from dead_cst import analyze
+    from dead_cst import _refresh
 
     calls = []
-    real = analyze.ProcessPoolExecutor
+    real = _refresh.ProcessPoolExecutor
 
     def _spy(*args, **kwargs):
         calls.append(kwargs)
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(analyze, "ProcessPoolExecutor", _spy)
+    monkeypatch.setattr(_refresh, "ProcessPoolExecutor", _spy)
     make_analysis(workers=workers).materialize_all()
     assert calls == []
 
@@ -183,16 +183,16 @@ def test_multi_base_uses_one_pool(tmp_path, make_analysis, monkeypatch):
         },
     )
 
-    from dead_cst import analyze
+    from dead_cst import _refresh
 
     pool_calls = []
-    real = analyze.ProcessPoolExecutor
+    real = _refresh.ProcessPoolExecutor
 
     def _spy(*args, **kwargs):
         pool_calls.append(kwargs.get("max_workers"))
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(analyze, "ProcessPoolExecutor", _spy)
+    monkeypatch.setattr(_refresh, "ProcessPoolExecutor", _spy)
     make_analysis(["a", "b"], workers=2).materialize_all()
     assert len(pool_calls) == 1, f"expected exactly one pool across both bases, got {pool_calls!r}"
 
@@ -223,12 +223,12 @@ def test_multi_base_parallel_matches_serial(tmp_path, make_analysis):
     assert _edge_set(parallel) == _edge_set(serial)
 
 
-def test_tasks_sorted_by_base(tmp_path, make_analysis, monkeypatch):
-    """Worker tasks are sorted by ``(base, file)`` so each base's files are contiguous.
+def test_tasks_sorted_by_package(tmp_path, make_analysis, monkeypatch):
+    """Worker tasks are sorted by ``(package_path, file)`` so each package's files are contiguous.
 
     The visitor pass no longer touches ``sys.path``, so task order is
     purely an aesthetic / determinism concern -- but keeping
-    same-base files adjacent stays readable in logs and stable across
+    same-package files adjacent stays readable in logs and stable across
     runs.
     """
     base_a = tmp_path / "a"
@@ -250,25 +250,25 @@ def test_tasks_sorted_by_base(tmp_path, make_analysis, monkeypatch):
         },
     )
 
-    from dead_cst import analyze
+    from dead_cst import _refresh
 
     captured: list = []
-    real_map = analyze.ProcessPoolExecutor.map  # bound on the class
+    real_map = _refresh.ProcessPoolExecutor.map  # bound on the class
 
     def _spy_map(self, fn, iterable, *args, **kwargs):
         materialized = list(iterable)
-        captured.append([t.base for t in materialized])
+        captured.append([t.package.path for t in materialized])
         return real_map(self, fn, materialized, *args, **kwargs)
 
-    monkeypatch.setattr(analyze.ProcessPoolExecutor, "map", _spy_map)
+    monkeypatch.setattr(_refresh.ProcessPoolExecutor, "map", _spy_map)
     make_analysis(["a", "b"], workers=2).materialize_all()
 
     assert len(captured) == 1
-    bases = captured[0]
-    runs = [bases[0]]
-    for b in bases[1:]:
-        if b != runs[-1]:
-            runs.append(b)
+    package_paths = captured[0]
+    runs = [package_paths[0]]
+    for p in package_paths[1:]:
+        if p != runs[-1]:
+            runs.append(p)
     assert len(runs) == len(set(runs)), (
-        f"expected each base's tasks contiguous, got order {bases!r}"
+        f"expected each package's tasks contiguous, got order {package_paths!r}"
     )

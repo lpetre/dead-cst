@@ -2,7 +2,7 @@
 
 :class:`SymbolNode` is what every node in the graph
 :func:`dead_cst.analyze.build_symbol_graph` returns is. :class:`Import`
-captures a cross-file reference at visitor time, before the per-base
+captures a cross-file reference at visitor time, before the per-package
 edge stitcher resolves it. :class:`NodeFlags` and :class:`EdgeFlags`
 mark structural attributes (``SHADOWED`` decls, ``DEAD_BRANCH`` edges,
 explicit ``ENTRYPOINT``\\s).

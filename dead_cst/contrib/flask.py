@@ -100,7 +100,7 @@ class FlaskPlugin:
       entrypoint pointed at the variable. Variables that have handlers
       but no direct kind get a :data:`FLASK_PENDING_PREFIX` marker
       synthetic linked to the variable, deferred to :meth:`finalize`.
-    * :meth:`finalize` (per-base) walks each pending marker forward
+    * :meth:`finalize` (per-package) walks each pending marker forward
       through the graph, classifies via ``walk_to_instance_kind``, and
       promotes ``Flask`` factories to entrypoints. Blueprints stay
       pass-through.
@@ -150,7 +150,7 @@ class FlaskPlugin:
         if flask_node is None:
             return
 
-        for synth in list(ctx.base_nodes()):
+        for synth in list(ctx.package_nodes()):
             if synth.type != "synthetic" or not synth.fqname.startswith(FLASK_PENDING_PREFIX):
                 continue
             for var in list(ctx.graph.successors(synth)):

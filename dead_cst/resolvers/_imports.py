@@ -76,9 +76,9 @@ def _canonical_dist_name(name: str) -> str:
 def safe_resolve_module(fullname: str) -> ModuleSpec | None:
     """Locate a :class:`ModuleSpec` for ``fullname`` against the current ``sys.path``.
 
-    Cached, so a base's full sweep over import edges only pays the
+    Cached, so a package's full sweep over import edges only pays the
     finder cost once per unique name. The analyzer clears the cache
-    between bases (search paths change) via
+    between packages (search paths change) via
     :meth:`safe_resolve_module.cache_clear`.
     """
     parts = fullname.split(".")
@@ -87,8 +87,8 @@ def safe_resolve_module(fullname: str) -> ModuleSpec | None:
     # emulate namespace __path__ resolution
     for i, part in enumerate(parts[:-1]):
         candidate_paths = []
-        for base in search_paths:
-            subdir = os.path.join(base, parts[i])
+        for entry in search_paths:
+            subdir = os.path.join(entry, parts[i])
             if os.path.isdir(subdir):
                 candidate_paths.append(subdir)
         search_paths = candidate_paths
@@ -122,7 +122,7 @@ def distribution_lookup() -> dict[Path, str]:
     members each with their own ``.venv`` -- doesn't keep the prior
     venv's dist map. Serial single-process runs already have a stable
     ``sys.path`` at the venv level (only the first-party prefix moves
-    between bases), so the cache survives across bases there.
+    between packages), so the cache survives across packages there.
     """
     from importlib import metadata
 
@@ -262,7 +262,7 @@ def clear_path_caches() -> None:
     :func:`distribution_lookup` / :func:`editable_distribution_roots`
     key on ``()`` -- all three read live ``sys.path`` (or
     :mod:`importlib.metadata` against it). Anything mutating
-    ``sys.path`` (the analyzer's per-base rebind, a resolver splicing
+    ``sys.path`` (the analyzer's per-package rebind, a resolver splicing
     in its own venv) must call this to keep the next lookup honest.
     """
     safe_resolve_module.cache_clear()

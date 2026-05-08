@@ -121,7 +121,7 @@ class UvResolver:
                 sys.path.append(sp_str)
                 # ``sys.path`` mutation invalidates the dist / module
                 # caches; clear so the next lookup observes the venv.
-                # Subsequent calls within the same base see the venv
+                # Subsequent calls within the same package see the venv
                 # already on sys.path and skip the clear.
                 clear_path_caches()
         return default_resolve_import(name, search_paths)
