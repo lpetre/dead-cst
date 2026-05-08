@@ -191,17 +191,7 @@ def _find_kept_alive_by_dead_branches(graph: nx.MultiDiGraph) -> set[SymbolNode]
 
 
 def _find_reachable_excluding_tests(graph: nx.MultiDiGraph) -> set[SymbolNode]:
-    """Like :func:`_find_reachable` but skips entrypoints tagged ``testcase``.
-
-    :class:`~dead_cst.contrib.PytestPlugin` and
-    :class:`~dead_cst.contrib.UnittestPlugin` stamp their synthetic
-    seed nodes with :data:`NodeFlags.TESTCASE` (in addition to
-    :data:`NodeFlags.ENTRYPOINT`); ``_apply_payload`` /
-    :func:`dead_cst.plugins.apply_ops` mirror that into a
-    ``graph.nodes[node]["testcase"] = True`` attribute. This BFS treats
-    such seeds as if they weren't entrypoints at all -- the answer is
-    "what would still be alive if you dropped the test suite?".
-    """
+    """Like :func:`_find_reachable` but skips entrypoints tagged ``testcase=True``."""
     visited: set[SymbolNode] = set()
     stack = [
         n
@@ -608,7 +598,7 @@ class Analysis:
         traversal is unchanged; this is the opt-in stricter pass.
         """
         g = self.materialize_all()
-        return _find_kept_alive_by_tests_only(g)
+        return _find_reachable(g) - _find_reachable_excluding_tests(g)
 
     def count_nodes(self, prefix: Path | None = None) -> dict[str, int]:
         """Count nodes in the full graph by ``SymbolNode.type``.
@@ -780,7 +770,7 @@ class PackageView:
         filtered to nodes under :attr:`path`.
         """
         g = self._analysis.materialize_closure(self._package.path)
-        diff = _find_kept_alive_by_tests_only(g)
+        diff = _find_reachable(g) - _find_reachable_excluding_tests(g)
         return {n for n in diff if n.path.is_relative_to(self._package.path)}
 
     def count_nodes(self) -> dict[str, int]:
