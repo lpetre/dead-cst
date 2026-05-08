@@ -9,6 +9,25 @@ two versions.
 
 ## [Unreleased]
 
+### Added
+- New `[unparseable] <module>` synthetic node, exposed via the
+  `UNPARSEABLE_PREFIX` constant re-exported from `dead_cst.plugins`.
+  When `libcst` cannot parse a file (e.g. PEP 750 `t"..."` literals),
+  the analyser now logs a warning and emits a minimal payload pairing
+  the real module node with one of these synthetics flagged
+  `ENTRYPOINT`, instead of aborting the whole run with
+  `ParserSyntaxError`. The file stays alive in reachability and
+  importers can still target the module; decls inside the file remain
+  invisible until parsing succeeds. The placeholder rides the per-file
+  cache, so a fresh source SHA (i.e. the user fixing the syntax)
+  invalidates the entry automatically.
+
+### Fixed
+- `enumerate_files` now skips directories whose name happens to end in
+  `.py` / `.pyi`. `Path.rglob` matches by name only, so an oddly-named
+  directory (e.g. `something.py/`) used to slip through and crash the
+  visitor on `read_text`.
+
 ## [0.6.0] - 2026-05-08
 
 ### Changed

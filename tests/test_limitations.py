@@ -7,7 +7,6 @@ is the signal to promote them into ``test_declarations`` or
 ``test_imports``.
 """
 
-import libcst
 import pytest
 
 
@@ -62,23 +61,25 @@ def test_limitation(build_decl_graph, assert_edges, files, expected_edges):
     assert_edges(graph, expected_edges)
 
 
-def test_pep750_tstring_unparseable(build_decl_graph):
-    """PEP 750 template strings (3.14) crash the analyser.
+def test_pep750_tstring_unparseable(build_decl_graph, assert_edges):
+    """PEP 750 template strings (3.14) bypass the visitor.
 
-    The pinned ``libcst`` cannot parse ``t"..."`` literals, so any file
-    containing one aborts ``build_symbol_graph`` with a
-    ``ParserSyntaxError`` before the symbol graph is built. Ideally the
-    visitor would either resolve interpolated names (yielding
-    ``mod.greet -> mod.NAME`` here) or at minimum skip the file. When
-    libcst gains t-string support this test will start to fail -- that
-    is the signal to add positive coverage in ``test_declarations``.
+    The pinned ``libcst`` cannot parse ``t"..."`` literals. Rather than
+    aborting the whole run, the analyser emits an ``[unparseable]
+    <module>`` synthetic node flagged ``ENTRYPOINT`` and edged at the
+    real module node, so the file stays alive in reachability and
+    importers can still target the module. Decls inside the file are
+    invisible -- there are none in this graph -- so ideally
+    ``mod.greet -> mod.NAME`` would also be present once libcst gains
+    t-string support. That is the signal to promote this case into
+    ``test_declarations``.
     """
-    with pytest.raises(libcst.ParserSyntaxError):
-        build_decl_graph(
-            {
-                "mod.py": """
-                NAME = "world"
-                def greet(): return t"hello {NAME}"
-                """,
-            }
-        )
+    graph = build_decl_graph(
+        {
+            "mod.py": """
+            NAME = "world"
+            def greet(): return t"hello {NAME}"
+            """,
+        }
+    )
+    assert_edges(graph, {"[unparseable] mod -> mod"})
