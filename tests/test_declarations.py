@@ -146,6 +146,20 @@ import pytest
             },
             id="lambda-closes-over-module-var",
         ),
+        pytest.param(
+            """
+            f = lambda s: (s := 1, s)
+            """,
+            # The walrus ``s := 1`` rebinds the lambda parameter ``s``;
+            # the trailing ``s`` still resolves to that local binding,
+            # so no module-level refs flow out of the body. Regression
+            # test: this used to crash because ``_scope_body`` assumed
+            # every ``FunctionScope.node.body`` was an ``IndentedBlock``.
+            {
+                "mod.f -> mod",
+            },
+            id="lambda-walrus-rebinds-parameter",
+        ),
         # ------------------------------------------------------------------
         # Classes
         # ------------------------------------------------------------------
@@ -514,6 +528,33 @@ import pytest
                 "mod.f -> mod.NAME",
             },
             id="fstring-interpolation-reference",
+        ),
+        pytest.param(
+            """
+            NAME = 'x'
+            def f(): return t'{NAME}'
+            """,
+            {
+                "mod.NAME -> mod",
+                "mod.f -> mod",
+                "mod.f -> mod.NAME",
+            },
+            id="tstring-interpolation-reference",
+        ),
+        pytest.param(
+            """
+            WIDTH = 4
+            def helper(): return 1
+            def f(): return t"v={helper():{WIDTH}d}"
+            """,
+            {
+                "mod.WIDTH -> mod",
+                "mod.helper -> mod",
+                "mod.f -> mod",
+                "mod.f -> mod.WIDTH",
+                "mod.f -> mod.helper",
+            },
+            id="tstring-format-spec-and-call-reference",
         ),
         pytest.param(
             """

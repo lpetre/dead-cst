@@ -2,15 +2,18 @@
 
 ``rglob('*.py')`` matches by name, not by entry kind -- a directory
 literally called ``something.py`` would otherwise sneak through. And
-the pinned ``libcst`` rejects PEP 750 ``t"..."`` literals (and any
-other syntax it doesn't yet understand). Both cases used to crash the
-analyser; the visitor now degrades gracefully.
+``libcst`` may reject any sufficiently broken syntax (or unsupported
+future syntax). Both cases used to crash the analyser; the visitor
+now degrades gracefully.
 """
 
 from __future__ import annotations
 
 import logging
-import textwrap
+
+# Source libcst cannot parse. Kept simple so the test stays meaningful
+# regardless of which exact dialects libcst has caught up with.
+BROKEN_SOURCE = "def f(\n"
 
 
 def test_directory_named_dot_py_is_skipped(tmp_path, make_analysis, assert_edges):
@@ -24,22 +27,14 @@ def test_directory_named_dot_py_is_skipped(tmp_path, make_analysis, assert_edges
 
 
 def test_unparseable_file_emits_synthetic_marker(tmp_path, make_analysis, assert_edges, caplog):
-    """PEP 750 t-strings (and any other libcst-rejected syntax) get a placeholder.
+    """A file libcst can't parse becomes an ``[unparseable]`` placeholder.
 
     The visitor logs a warning, emits a payload pairing the real module
     node with an ``[unparseable] <module>`` synthetic flagged
     ``ENTRYPOINT``, and continues. Sibling files in the same package
     are unaffected.
     """
-    (tmp_path / "broken.py").write_text(
-        textwrap.dedent(
-            """
-            NAME = "world"
-            def greet(): return t"hello {NAME}"
-            """
-        ).strip()
-        + "\n"
-    )
+    (tmp_path / "broken.py").write_text(BROKEN_SOURCE)
     (tmp_path / "ok.py").write_text("def g(): pass\ng()\n")
 
     with caplog.at_level(logging.WARNING, logger="dead_cst._refresh"):
@@ -56,7 +51,7 @@ def test_unparseable_file_emits_synthetic_marker(tmp_path, make_analysis, assert
     )
 
 
-def test_unparseable_module_keeps_importer_alive(tmp_path, make_analysis, assert_edges):
+def test_unparseable_module_keeps_importer_alive(tmp_path, make_analysis):
     """An importer of an unparseable module still resolves to the module level.
 
     We can't see the unparseable module's decls, so ``from broken
@@ -64,7 +59,7 @@ def test_unparseable_module_keeps_importer_alive(tmp_path, make_analysis, assert
     enough to keep the importer chain reachable from the unparseable
     file's own ``[unparseable]`` entrypoint synthetic.
     """
-    (tmp_path / "broken.py").write_text('def greet(): return t"hi"\n')
+    (tmp_path / "broken.py").write_text(BROKEN_SOURCE)
     (tmp_path / "consumer.py").write_text("from broken import greet\n")
 
     graph = make_analysis().materialize_all()
@@ -87,7 +82,7 @@ def test_unparseable_payload_is_cached(tmp_path, make_analysis, caplog):
     """
     from dead_cst.cache import CACHE_DIR_NAME, GraphCache
 
-    (tmp_path / "broken.py").write_text('x = t"oops"\n')
+    (tmp_path / "broken.py").write_text(BROKEN_SOURCE)
     db_path = tmp_path / CACHE_DIR_NAME / "cache.db"
 
     with caplog.at_level(logging.WARNING, logger="dead_cst._refresh"):

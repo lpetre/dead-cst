@@ -134,7 +134,7 @@ Implement `UnreachableRegionDetector`: `name`, `version`, `find_regions(wrapper)
 - `import *` is treated pessimistically (every top-level decl in the target is considered used). `__import__('m')` and `importlib.import_module('m')` calls with a string-literal name are folded into the same star-import path; relative names (`'.sub'`, or `__import__('sub', ..., level=1)`) resolve against the file's enclosing package the same way `from .sub import *` does. Non-literal names / levels / packages warn. `__import__(name, fromlist=[...])` literal entries that resolve as submodules are fanned out as well.
 - Dynamic attribute access (`getattr`) and runtime-generated symbols are invisible to static analysis.
 - `__all__` is followed only when assigned a list/tuple of string literals.
-- PEP 750 template strings (`t"..."`, 3.14+) cannot be parsed by the pinned `libcst`. The analyser logs a warning and substitutes a placeholder payload (the real module node plus a `[unparseable] <module>` synthetic flagged `ENTRYPOINT`), so the file stays alive in reachability but its decls are invisible until parsing succeeds.
+- When `libcst` rejects a file's syntax, the analyser logs a warning and substitutes a placeholder payload (the real module node plus a `[unparseable] <module>` synthetic flagged `ENTRYPOINT`), so the file stays alive in reachability but its decls are invisible until parsing succeeds. The placeholder rides the per-file cache; a fresh source SHA invalidates it automatically.
 
 ## Pre-release status
 
