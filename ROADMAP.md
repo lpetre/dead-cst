@@ -17,14 +17,16 @@ for the full record.
 
 ### 1. Finish the framework-aware plugin presets
 
-`PytestPlugin`, `UnittestPlugin`, `FastAPIPlugin`, `FlaskPlugin`,
-`TyperPlugin`, `ClickPlugin`, and `InitSubclassPlugin` shipped, but the
-existential risk is still "I tried it and it flagged half my codebase."
-The remaining common offenders:
+`PytestPlugin`, `UnittestPlugin` (with transitive `TestCase` discovery),
+`FastAPIPlugin`, `FlaskPlugin`, `TyperPlugin`, `ClickPlugin`,
+`CycloptsPlugin`, `MockPatchPlugin`, and `InitSubclassPlugin` shipped,
+but the existential risk is still "I tried it and it flagged half my
+codebase." The remaining common offenders:
 
 - Django URLConf, admin registration, signal handlers, management commands
 - Pydantic validators and field serializers
 - Descriptor-style hooks: `__set_name__`, dataclass `__post_init__`
+- SQLAlchemy declarative models / event listeners; Celery tasks / signals
 
 Surface a `--preset pytest,fastapi,django` shortcut that expands to the
 existing `--plugin` wiring, and document the entry-point group so third
@@ -148,6 +150,60 @@ demand.
 
 Folded down from earlier tiers as they landed:
 
+- **v0.6.0**: Compiled-extension `.pyi` stub ingestion (`mypkg/_native.so`
+  + `mypkg/_native.pyi`); peer-mode stubs alongside a real `.py` are
+  intentionally dropped. `@typing.overload`-decorated decls flagged with
+  `NodeFlags.OVERLOAD`, excluded from the cross-module trie, and anchored
+  to their same-file impl via explicit `impl -> overload` edges so the
+  codemod removes overloads with their impl.
+- **v0.6.0**: `NodeFlags.TESTCASE` plus
+  `Analysis.kept_alive_by_tests_only()` /
+  `PackageView.kept_alive_by_tests_only()` for "blast radius of dropping
+  the test suite" queries. `PytestPlugin` and `UnittestPlugin` stamp
+  `ENTRYPOINT | TESTCASE` on their synthetic seeds.
+- **v0.6.0**: `UnittestPlugin` resolves transitive `TestCase` subclasses
+  through bucket markers in `observe` + a `finalize` walk from
+  `unittest.TestCase` / `IsolatedAsyncioTestCase` (and every alias) so
+  project-local mixins and re-exported `TestCase` bases keep their
+  subclasses alive.
+- **v0.6.0**: Per-file refresh logic extracted into
+  `dead_cst/_refresh.py` (file enumeration, stale detection, worker
+  pool, payload application). `analyze.py` keeps cross-package
+  composition only. "Base" -> "package" rename across the public API.
+- **v0.6.0**: `tqdm` progress reporting around the parse and reconcile
+  passes; off-TTY consumers get newline-terminated checkpoints instead
+  of `\r`-overwriting frames.
+- **v0.6.0**: `CycloptsPlugin` plus a generalized `DispatchAppPlugin`
+  base for `X = App(); @X.command(...)` shapes (Typer migrated onto
+  it). `MockPatchPlugin` resolves string-fqname targets for
+  `mock.patch` / `mocker.patch` / `monkeypatch.setattr`.
+- **v0.5.0**: Cross-file import resolution moved out of `SymbolVisitor`
+  and into `_edges.resolve_edges`. `Import` is now raw (just the
+  written-down dotted name); the per-file cache survives `search_paths`
+  / resolver / package-layout swaps. Single resolver per `Analysis`
+  (no chain). `PathResolver.resolve` returns `tuple[Package, ...]`
+  with explicit `name` / `exported` / `deps`. `VenvResolver` and
+  `PyprojectResolver` retired (use `-p` / `ManualResolver`);
+  `UvWorkspaceResolver` renamed to `UvResolver`.
+- **v0.5.0**: Parallel visitor pass via `--workers` / `-j`. Workers
+  return `VisitorPayload` blobs; cache writes, trie stitching, and
+  edge resolution stay in the parent. FQN cache built once over miss
+  files only and shipped per-task.
+- **v0.5.0**: Public API split into focused submodules
+  (`dead_cst.graph`, `dead_cst.analyze`, `dead_cst.codemod`,
+  `dead_cst.cache`, `dead_cst.branches`, `dead_cst.plugins`,
+  `dead_cst.resolvers`, `dead_cst.contrib`).
+  `tests/test_public_api.py` pins each module's `__all__`. The lazy
+  `Analysis` / `PackageView` shape replaces the `build_symbol_graph` /
+  `find_reachable` / `count_nodes` / `order_paths` /
+  `find_kept_alive_by_dead_branches` / top-level `remove_code` API.
+- **v0.5.0**: Path-classification fixes for system-Python layouts
+  (site-packages nested inside the stdlib root) and editable installs
+  (`pip install -e`); first-party search paths win over editable dist
+  roots so e2e fixtures cloned inside another project don't blow away
+  reachability. `__import__` / `importlib.import_module` with a
+  string-literal name (including relative names and `fromlist=[...]`
+  literals) fanned out as star imports.
 - PEP 695 `type` statements: `type Foo = list[int]` (and the generic
   `type Pair[T] = tuple[T, T]` form) now surface as top-level
   `"type_alias"` decls. RHS references attribute to the alias, so
@@ -184,11 +240,12 @@ Folded down from earlier tiers as they landed:
 - SQLite-cached graph with partial rebuilds: `GraphCache` stores
   pickled `VisitorPayload` blobs keyed by per-file content hash under
   `<root>/.dead-cst-cache/cache.db`. Cache hits skip the per-file
-  visitor pass; per-base edge resolution and the plugin pass run
-  every analysis. Fingerprint over `(__version__, python version,
-  PathMap, resolver chain)` invalidates the whole file_cache on
-  layout / version change. `--no-cache` flag and
-  `dead-cst cache clear` subcommand.
+  visitor pass; edge resolution and plugin `finalize` run every
+  analysis. The fingerprint covers Python version, schema version,
+  and each visitor / plugin / detector `(name, version)` pair --
+  resolver, `search_paths`, and the package layout deliberately do
+  not enter it (their effect flows through the uncached edge stitcher).
+  `--no-cache` flag and `dead-cst cache clear` subcommand.
 - Resolver logic as a protocol: `PathResolver.resolve_import` folds
   `name -> path` lookup into the resolver, so custom resolvers can
   override import resolution for their own layouts. `_resolve.py`

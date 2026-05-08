@@ -308,7 +308,7 @@ uv run pytest
 uv run prek run --all-files
 ```
 
-See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full dev guide, [`CHANGELOG.md`](CHANGELOG.md) for release notes, and [`ROADMAP.md`](ROADMAP.md) for the stack-ranked plan toward 1.0.
+See [`ARCHITECTURE.md`](ARCHITECTURE.md) for a walkthrough of the analyzer pipeline, [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full dev guide, [`CHANGELOG.md`](CHANGELOG.md) for release notes, and [`ROADMAP.md`](ROADMAP.md) for the stack-ranked plan toward 1.0.
 
 ## TODO
 
