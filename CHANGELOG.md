@@ -23,8 +23,15 @@ two versions.
   field is now `package: Package` (use `ctx.package.path` for the
   directory); `PluginContext.base_modules()` /
   `PluginContext.base_nodes()` are now `package_modules()` /
-  `package_nodes()`. Out-of-tree plugins and resolver consumers must
-  update accordingly.
+  `package_nodes()`. `remove_code(G, base)` is now
+  `remove_code(G, package_path)`, and
+  `dead_cst.resolvers.exported_roots(base)` is now
+  `exported_roots(package_path)`. Out-of-tree plugins and resolver
+  consumers must update accordingly.
+- The CLI's `-p` / `--path` spec is now described as
+  `'package:dep1,dep2' or 'package'` (formerly
+  `'base:dep1,dep2' or 'base'`). The parsing rules are unchanged --
+  same syntax, clearer name -- so existing scripts keep working.
 - Per-file refresh logic moved from `dead_cst/analyze.py` into a new
   `dead_cst/_refresh.py` (file enumeration, stale detection, the
   worker pool, payload application, and per-package contribution

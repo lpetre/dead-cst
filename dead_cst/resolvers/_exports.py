@@ -1,10 +1,10 @@
-"""Per-base export discovery from ``pyproject.toml``.
+"""Per-package export discovery from ``pyproject.toml``.
 
-:func:`exported_roots` returns the subdirs of a base that should be
-visible to *other* bases at import time. The analyzer uses this to hide
-internal directories (like ``tests/`` in flat-layout workspace members)
-from cross-base import resolution while still analyzing them under their
-owning base.
+:func:`exported_roots` returns the subdirs of a package that should be
+visible to *other* packages at import time. The analyzer uses this to
+hide internal directories (like ``tests/`` in flat-layout workspace
+members) from cross-package import resolution while still analyzing
+them under their owning package.
 """
 
 from __future__ import annotations
@@ -14,8 +14,8 @@ from pathlib import Path
 from ._core import load_toml
 
 
-def exported_roots(base: Path) -> list[Path] | None:
-    """Subdirs of ``base`` that are visible to *other* bases at import time.
+def exported_roots(package_path: Path) -> list[Path] | None:
+    """Subdirs of ``package_path`` visible to *other* packages at import time.
 
     Mirrors what a Python build backend would actually ship. For a workspace
     member with a non-``src/`` layout, this lets the analyzer hide internal
@@ -25,13 +25,13 @@ def exported_roots(base: Path) -> list[Path] | None:
 
     Returns ``None`` when no restriction can be inferred (no ``pyproject.toml``,
     unknown backend, no ``[project].name``). The analyzer treats ``None`` as
-    "no restriction; the whole base is exported", preserving today's behavior
+    "no restriction; the whole package is exported", preserving today's behavior
     for projects that don't fit the workspace pattern.
 
     Discovery order, first match wins:
 
-    1. ``<base>/src/`` exists -> ``[<base>/src]``. Universal src-layout
-       convention; no backend introspection needed.
+    1. ``<package_path>/src/`` exists -> ``[<package_path>/src]``. Universal
+       src-layout convention; no backend introspection needed.
     2. ``[build-system].build-backend`` is read and dispatched:
 
        - ``hatchling.build`` -> ``[tool.hatch.build.targets.wheel].packages``
@@ -48,13 +48,13 @@ def exported_roots(base: Path) -> list[Path] | None:
     not interpreted; falls through to the name-match fallback. Backends not
     listed above also fall through.
     """
-    base = base.resolve()
-    data = load_toml(base / "pyproject.toml")
+    package_path = package_path.resolve()
+    data = load_toml(package_path / "pyproject.toml")
     if data is None:
         return None
 
-    if (base / "src").is_dir():
-        return [(base / "src").resolve()]
+    if (package_path / "src").is_dir():
+        return [(package_path / "src").resolve()]
 
     backend = (data.get("build-system") or {}).get("build-backend")
     tool = data.get("tool") or {}
@@ -64,13 +64,18 @@ def exported_roots(base: Path) -> list[Path] | None:
         wheel = (tool.get("hatch") or {}).get("build", {}).get("targets", {}).get("wheel", {})
         packages = wheel.get("packages")
         if isinstance(packages, list):
-            roots = [(base / p).resolve() for p in packages if isinstance(p, str)]
+            roots = [(package_path / p).resolve() for p in packages if isinstance(p, str)]
     elif backend in ("setuptools.build_meta", "setuptools.build_meta:__legacy__"):
         st = tool.get("setuptools") or {}
         packages = st.get("packages")
         if isinstance(packages, list):
-            # Flat list of dotted module names; map ``foo.bar`` -> ``base/foo/bar``.
-            roots = [(base / p.replace(".", "/")).resolve() for p in packages if isinstance(p, str)]
+            # Flat list of dotted module names; map ``foo.bar`` ->
+            # ``package_path/foo/bar``.
+            roots = [
+                (package_path / p.replace(".", "/")).resolve()
+                for p in packages
+                if isinstance(p, str)
+            ]
     elif backend in ("poetry.core.masonry.api", "poetry_core.masonry.api"):
         packages = (tool.get("poetry") or {}).get("packages")
         if isinstance(packages, list):
@@ -81,21 +86,21 @@ def exported_roots(base: Path) -> list[Path] | None:
                     if not isinstance(inc, str):
                         continue
                     frm = p.get("from", "")
-                    roots.append((base / frm / inc).resolve())
+                    roots.append((package_path / frm / inc).resolve())
                 elif isinstance(p, str):
-                    roots.append((base / p).resolve())
+                    roots.append((package_path / p).resolve())
     elif backend == "pdm.backend":
         includes = (tool.get("pdm") or {}).get("build", {}).get("includes")
         if isinstance(includes, list):
             roots = [
-                (base / inc).resolve()
+                (package_path / inc).resolve()
                 for inc in includes
                 if isinstance(inc, str) and "*" not in inc
             ]
     elif backend == "flit_core.buildapi":
         mod = (tool.get("flit") or {}).get("module", {}).get("name")
         if isinstance(mod, str):
-            roots = [(base / mod).resolve()]
+            roots = [(package_path / mod).resolve()]
 
     if roots:
         return roots
@@ -104,7 +109,7 @@ def exported_roots(base: Path) -> list[Path] | None:
     project_name = (data.get("project") or {}).get("name")
     if isinstance(project_name, str) and project_name:
         normalized = project_name.replace("-", "_").replace(".", "_")
-        candidate = base / normalized
+        candidate = package_path / normalized
         if (candidate / "__init__.py").is_file():
             return [candidate.resolve()]
 

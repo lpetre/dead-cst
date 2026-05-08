@@ -128,7 +128,7 @@ def build_resolver(path_specs: list[str], resolver_name: str | None) -> PathReso
     :class:`ManualResolver`, ``--resolver`` loads a named resolver, and
     passing both is a usage error. With neither flag supplied, falls
     back to a :class:`ManualResolver` that treats the project root
-    itself as the only base.
+    itself as the only package.
     """
     if path_specs and resolver_name is not None:
         raise typer.BadParameter("`-p`/`--path` and `--resolver` are mutually exclusive.")
@@ -170,7 +170,7 @@ def analyze(
     ] = None,
     path: Annotated[
         list[str] | None,
-        typer.Option("-p", "--path", help="Search path spec: 'base:dep1,dep2' or 'base'."),
+        typer.Option("-p", "--path", help="Search path spec: 'package:dep1,dep2' or 'package'."),
     ] = None,
     resolver: Annotated[
         str | None,
@@ -347,7 +347,7 @@ def why_alive(
     fqname: Annotated[str, typer.Argument(help="Fully qualified name of the symbol to check.")],
     path: Annotated[
         list[str] | None,
-        typer.Option("-p", "--path", help="Search path spec: 'base:dep1,dep2' or 'base'."),
+        typer.Option("-p", "--path", help="Search path spec: 'package:dep1,dep2' or 'package'."),
     ] = None,
     resolver: Annotated[
         str | None,
@@ -424,7 +424,7 @@ def dependencies(
     root: Annotated[Path, typer.Argument(help="Root directory to analyze.")],
     path: Annotated[
         list[str] | None,
-        typer.Option("-p", "--path", help="Search path spec: 'base:dep1,dep2' or 'base'."),
+        typer.Option("-p", "--path", help="Search path spec: 'package:dep1,dep2' or 'package'."),
     ] = None,
     resolver: Annotated[
         str | None,
@@ -494,7 +494,7 @@ def unused_exports(
     ] = None,
     path: Annotated[
         list[str] | None,
-        typer.Option("-p", "--path", help="Search path spec: 'base:dep1,dep2' or 'base'."),
+        typer.Option("-p", "--path", help="Search path spec: 'package:dep1,dep2' or 'package'."),
     ] = None,
     resolver: Annotated[
         str | None,
@@ -585,7 +585,7 @@ def remove(
     ] = None,
     path: Annotated[
         list[str] | None,
-        typer.Option("-p", "--path", help="Search path spec: 'base:dep1,dep2' or 'base'."),
+        typer.Option("-p", "--path", help="Search path spec: 'package:dep1,dep2' or 'package'."),
     ] = None,
     resolver: Annotated[
         str | None,

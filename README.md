@@ -55,7 +55,7 @@ dead-cst analyze ROOT -e ENTRYPOINT [OPTIONS]
 | Option | Description |
 |---|---|
 | `-e, --entrypoint` | Entrypoint: file path, FQN, or `re:pattern` for regex (repeatable) |
-| `-p, --path` | Search path spec: `base:dep1,dep2` or `base` (repeatable) |
+| `-p, --path` | Search path spec: `package:dep1,dep2` or `package` (repeatable) |
 | `--resolver` | Path resolver to run, e.g. `uv` (mutually exclusive with `-p`) |
 | `--plugin` | Edge plugin to run, e.g. `main_block`, `project_scripts` (repeatable) |
 | `--format` | Output format: `text` or `json` |
@@ -75,7 +75,7 @@ dead-cst why-alive ROOT FQNAME [OPTIONS]
 
 | Option | Description |
 |---|---|
-| `-p, --path` | Search path spec: `base:dep1,dep2` or `base` (repeatable) |
+| `-p, --path` | Search path spec: `package:dep1,dep2` or `package` (repeatable) |
 | `--resolver` | Path resolver to run, e.g. `uv` (mutually exclusive with `-p`) |
 | `--plugin` | Edge plugin to run, e.g. `main_block`, `project_scripts` (repeatable) |
 | `-v, --verbose` | Enable verbose logging |
@@ -93,7 +93,7 @@ dead-cst unused-exports ROOT -e ENTRYPOINT [OPTIONS]
 | Option | Description |
 |---|---|
 | `-e, --entrypoint` | Entrypoint: file path, FQN, or `re:pattern` for regex (repeatable) |
-| `-p, --path` | Search path spec: `base:dep1,dep2` or `base` (repeatable) |
+| `-p, --path` | Search path spec: `package:dep1,dep2` or `package` (repeatable) |
 | `--resolver` | Path resolver to run, e.g. `uv` (mutually exclusive with `-p`) |
 | `--plugin` | Edge plugin to run, e.g. `main_block`, `project_scripts` (repeatable) |
 | `-v, --verbose` | Enable verbose logging |
@@ -113,7 +113,7 @@ dead-cst dependencies ROOT [OPTIONS]
 
 | Option | Description |
 |---|---|
-| `-p, --path` | Search path spec: `base:dep1,dep2` or `base` (repeatable) |
+| `-p, --path` | Search path spec: `package:dep1,dep2` or `package` (repeatable) |
 | `--resolver` | Path resolver to run, e.g. `uv` (mutually exclusive with `-p`) |
 | `--format` | Output format: `text` or `json` |
 | `-v, --verbose` | Enable verbose logging |
@@ -131,7 +131,7 @@ dead-cst remove ROOT -e ENTRYPOINT [OPTIONS]
 | Option | Description |
 |---|---|
 | `-e, --entrypoint` | Entrypoint: file path, FQN, or `re:pattern` for regex (repeatable) |
-| `-p, --path` | Search path spec: `base:dep1,dep2` or `base` (repeatable) |
+| `-p, --path` | Search path spec: `package:dep1,dep2` or `package` (repeatable) |
 | `--resolver` | Path resolver to run, e.g. `uv` (mutually exclusive with `-p`) |
 | `--plugin` | Edge plugin to run, e.g. `main_block`, `project_scripts` (repeatable) |
 | `-v, --verbose` | Enable verbose logging |
@@ -225,7 +225,7 @@ class MyInternalModulesPlugin(LiteralListPlugin):
 
 Write your own from scratch by implementing the `EdgePlugin` protocol (`name`, `version`, `observe`, `finalize`); register under the `dead_cst.plugins` entry-point group for CLI discovery.
 
-Path resolution is similarly pluggable. `PathResolver` implementations return a tuple of `Package` records (`path`, `name`, `exported`, `deps`) to feed `Analysis`. Builtins: `ManualResolver` (explicit `base:dep` specs from `-p`) and `UvResolver` (parses `uv.lock` to discover workspace members and their inter-member dep edges). Third-party resolvers register under `dead_cst.resolvers`.
+Path resolution is similarly pluggable. `PathResolver` implementations return a tuple of `Package` records (`path`, `name`, `exported`, `deps`) to feed `Analysis`. Builtins: `ManualResolver` (explicit `package:dep` specs from `-p`) and `UvResolver` (parses `uv.lock` to discover workspace members and their inter-member dep edges). Third-party resolvers register under `dead_cst.resolvers`.
 
 Unreachable-code detection is pluggable through the `UnreachableRegionDetector` protocol. `Analysis` accepts an `unreachable_detector` whose `find_regions(wrapper) -> list[CodeRange]` is invoked once per file. The built-in `DefaultUnreachableRegionDetector` covers three things out of the box:
 

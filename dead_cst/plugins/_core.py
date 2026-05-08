@@ -256,7 +256,7 @@ def require_resolved_dep(ctx: PluginContext, package: str) -> SymbolNode | None:
     * Returns the ``[external dist] <package>`` / ``[external file] <package>``
       node if the analyzer's resolver pinned ``package`` to an installed
       distribution.
-    * Returns ``None`` if no file in this base imports ``package`` (no
+    * Returns ``None`` if no file in this package imports ``package`` (no
       synthetic was created at all). The plugin has nothing to do.
     * Raises :class:`UnresolvedDependencyError` if only the
       ``[unresolved] <package>`` synthetic exists -- the plugin's

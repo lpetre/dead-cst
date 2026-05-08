@@ -87,8 +87,8 @@ def _import_remove_args(node: SymbolNode) -> tuple[str, str | None, str | None]:
     return module, obj, asname
 
 
-def remove_code(G: nx.Graph, base: Path) -> None:
-    """Delete every symbol in ``G`` from the source files under ``base``.
+def remove_code(G: nx.Graph, package_path: Path) -> None:
+    """Delete every symbol in ``G`` from the source files under ``package_path``.
 
     Modules are removed by unlinking the file. Functions, classes, and
     top-level variables are dropped by a LibCST transformer matching on
@@ -103,14 +103,14 @@ def remove_code(G: nx.Graph, base: Path) -> None:
 
     ``G`` is typically the unreachable subgraph of the graph from
     :func:`build_symbol_graph`; only the nodes are inspected, edges are
-    ignored. Symbols whose path is not under ``base`` are skipped, so call
-    once per package when analysing several packages together. The
-    transformation is destructive -- back the files up first, or run on a
-    clean working tree.
+    ignored. Symbols whose path is not under ``package_path`` are
+    skipped, so call once per package when analysing several packages
+    together. The transformation is destructive -- back the files up
+    first, or run on a clean working tree.
     """
     by_file: dict[Path, list[SymbolNode]] = {}
     for node in G.nodes:
-        if not node.path.is_relative_to(base):
+        if not node.path.is_relative_to(package_path):
             continue
         if not node.path.exists():
             continue
@@ -120,7 +120,9 @@ def remove_code(G: nx.Graph, base: Path) -> None:
             case "module":
                 node.path.unlink()
 
-    mgr = FullRepoManager(str(base), [str(p) for p in by_file], {FixedFullyQualifiedNameProvider})
+    mgr = FullRepoManager(
+        str(package_path), [str(p) for p in by_file], {FixedFullyQualifiedNameProvider}
+    )
     for path, nodes in sorted(by_file.items(), key=lambda x: x):
         if not path.exists():
             continue
