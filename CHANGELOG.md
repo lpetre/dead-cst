@@ -45,20 +45,16 @@ two versions.
 - `.pyi` stub files are now ingested by the analyzer and rewritten by
   the codemod, targeting the **compiled-extension layout**: a binary
   module (e.g. `mypkg/_native.so`) shipping next to its hand-written
-  type stub (`mypkg/_native.pyi`) with no `.py` twin. Stubs are
-  discovered alongside `.py` siblings and parsed through the same
-  visitor (so import edges, type-alias edges, etc. show up normally),
-  given a synthetic `__pyi__` FQN segment (e.g. `mod.pyi` becomes
-  `mod.__pyi__`) so they don't collide with a same-named `.py`, and --
-  in the orphan case where no `.py` twin exists -- the per-package
-  contribution rebinds the runtime FQN in the trie to point at the
-  stub's module + decls. The result: `from mypkg._native import
+  type stub (`mypkg/_native.pyi`) with no `.py` twin. The stub is
+  parsed through the same visitor as a regular module under its
+  natural FQN (`mypkg._native`), so `from mypkg._native import
   compute` resolves to the stub's `compute` decl through the normal
   cross-module import path, and reachability + the codemod work the
-  same as for any first-party module. Peer stubs (a `.pyi` shipping
-  alongside an actual `.py`) are intentionally left orphaned -- the
-  runtime module wins, and the unused stub is treated as dead code
-  unless something imports it.
+  same as for any first-party module. A `.pyi` shipped alongside a
+  real `.py` is dropped during file enumeration -- the runtime
+  module is the canonical declaration of those names, and ingesting
+  the stub on top would collide with it in the symbol trie. Peer-mode
+  stubs are therefore invisible to dead-cst.
 - New `NodeFlags.OVERLOAD` flag plus visitor support for
   `typing.overload`. `@overload`-decorated functions (recognized
   syntactically -- bare `overload`, `typing.overload`, and

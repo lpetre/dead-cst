@@ -53,7 +53,7 @@ Four moving pieces — `SymbolVisitor` itself plus the three extension points (`
 - Submodules edge to their parent package, so `__init__.py` stays alive as long as anything in the package does.
 - `EdgeFlags.DEAD_BRANCH` is metadata only; tests using the `assert_edges` fixture see those edges, while `assert_dead_branch_edges` filters to just them.
 - `NodeFlags.SHADOWED` decls are emitted into the graph (with their parent module edge) but excluded from the trie, so cross-module imports never resolve to them. `NodeFlags.OVERLOAD` follows the same trie-exclusion rule but its lifetime is anchored to the matching same-file impl via explicit `impl -> overload` edges emitted by the visitor.
-- `.pyi` stub files participate as separate modules under a synthetic `__pyi__` FQN segment (stamped by `FixedFullyQualifiedNameProvider`) so `mod.py` and `mod.pyi` don't collide. The compiled-extension layout (`_native.so` + `_native.pyi`, no `.py` twin) is the supported case: `_promote_orphan_stub_modules` in `_refresh.py` rebinds the parent trie node to the stub's module + declarations, so `from mypkg._native import X` resolves to the stub through the normal trie path. Peer-mode `.pyi` (next to a real `.py`) is parsed but left orphaned — the runtime always wins.
+- `.pyi` stub files are ingested only for the compiled-extension layout (`_native.so` + `_native.pyi`, no `.py` twin). The stub is parsed under its natural module FQN (`mypkg._native`), so `from mypkg._native import X` resolves through the normal trie path. Peer-mode `.pyi` (alongside a real `.py`) is dropped at `enumerate_files` time — the runtime always wins, and ingesting both would collide on the same FQN in the trie.
 
 ### Public API surface
 

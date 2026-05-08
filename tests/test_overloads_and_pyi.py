@@ -4,8 +4,10 @@ The visitor recognises ``@typing.overload`` and anchors each overload
 to its same-name impl through ``impl -> overload`` edges so the
 codemod removes them as a unit. ``.pyi`` files are ingested for the
 compiled-extension layout (``_native.so`` next to ``_native.pyi``,
-no ``.py`` twin): the trie promotes the orphan stub's decls so
-``from mypkg._native import compute`` resolves to the stub.
+no ``.py`` twin) and parsed under their natural module FQN. Peer
+``.pyi`` (alongside a real ``.py``) is dropped during file
+enumeration -- the runtime always wins -- so the analyzer never
+sees them.
 """
 
 from __future__ import annotations
@@ -177,25 +179,26 @@ def test_overload_recognized_under_alternate_decorator_forms(tmp_path, make_anal
 # ---------------------------------------------------------------------------
 
 
-def test_pyi_module_gets_distinct_fqn_when_py_twin_exists(tmp_path, make_analysis):
-    """A ``.pyi`` alongside a ``.py`` keeps its synthetic ``__pyi__`` FQN
-    so the runtime module wins the cross-module lookup."""
+def test_peer_pyi_is_skipped_when_py_twin_exists(tmp_path, make_analysis):
+    """``mod.pyi`` alongside ``mod.py`` is dropped at enumeration time,
+    so the analyzer only sees the runtime module."""
     (tmp_path / "mod.py").write_text("def f(x):\n    return x\n")
-    (tmp_path / "mod.pyi").write_text("def f(x: int) -> int: ...\n")
+    (tmp_path / "mod.pyi").write_text("def stub_only(x: int) -> int: ...\n")
 
     graph = make_analysis().materialize_all()
-    fqnames = {n.fqname for n in graph.nodes if n.type == "module"}
-    assert "mod" in fqnames
-    assert "mod.__pyi__" in fqnames
+    paths = {n.path.name for n in graph.nodes if n.type == "module"}
+    assert paths == {"mod.py"}
+    function_names = {n.fqname for n in graph.nodes if n.type == "function"}
+    assert function_names == {"mod.f"}
+    assert "mod.stub_only" not in function_names
 
 
-def test_orphan_pyi_stub_resolves_under_runtime_fqname(tmp_path, make_analysis):
+def test_orphan_pyi_stub_uses_runtime_fqname(tmp_path, make_analysis):
     """Compiled-extension shape: ``_native.pyi`` with no ``.py`` twin.
 
     ``from mypkg._native import compute`` should resolve to the stub
-    decl through the trie -- the orphan-stub promotion in the per-package
-    contribution rebinds ``mypkg._native`` to point at the stub's
-    module + decls.
+    decl through the normal trie path -- the stub is parsed under its
+    natural FQN ``mypkg._native``, with no synthetic suffix.
     """
     pkg = tmp_path / "mypkg"
     pkg.mkdir()
@@ -209,28 +212,13 @@ def test_orphan_pyi_stub_resolves_under_runtime_fqname(tmp_path, make_analysis):
     reachable = find_reachable(graph)
 
     stub_compute = next(
-        n
-        for n in graph.nodes
-        if n.fqname == "mypkg._native.__pyi__.compute" and n.type == "function"
+        n for n in graph.nodes if n.fqname == "mypkg._native.compute" and n.type == "function"
     )
+    assert stub_compute.path.name == "_native.pyi"
     assert stub_compute in reachable, "orphan stub decl should be alive when imported"
 
-    # Cross-module imports landed on the stub: ``mypkg.compute``
-    # (the alias in __init__.py) edges into the stub decl.
     pkg_compute = next(n for n in graph.nodes if n.fqname == "mypkg.compute")
     assert stub_compute in graph.successors(pkg_compute)
-
-
-def test_orphan_pyi_stub_preserves_no_self_edges(tmp_path, make_analysis):
-    """Promotion must not leave ``stub_module -> stub_module`` self-edges."""
-    pkg = tmp_path / "mypkg"
-    pkg.mkdir()
-    (pkg / "__init__.py").write_text("")
-    (pkg / "_native.pyi").write_text("def compute(x: int) -> int: ...\n")
-
-    graph = make_analysis().materialize_all()
-    self_edges = [(s, d) for s, d in graph.edges(keys=False) if s is d]
-    assert self_edges == []
 
 
 def test_orphan_pyi_stub_deleted_when_unused(tmp_path, make_analysis):
@@ -247,7 +235,6 @@ def test_orphan_pyi_stub_deleted_when_unused(tmp_path, make_analysis):
     pkg_view = a.package(tmp_path)
     pkg_view.remove_dead_code()
 
-    # The .pyi file (or its contents) should be removed: no one imports it.
     pyi_path = pkg / "_native.pyi"
     if pyi_path.exists():
         rewritten = pyi_path.read_text()
