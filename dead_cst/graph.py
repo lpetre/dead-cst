@@ -38,11 +38,19 @@ class NodeFlags(enum.IntFlag):
     flag, so :func:`find_reachable` starts its BFS there. Plugins emit
     flagged synthetic nodes via their per-file payloads to declare
     entrypoints without a separate API surface.
+
+    ``TESTCASE`` tags an entrypoint as test-only (pytest / unittest
+    discovery seeds, fixture seeds, etc.). It is metadata on top of
+    ``ENTRYPOINT`` -- default :func:`find_reachable` treats those
+    seeds the same as any other entrypoint -- and powers the opt-in
+    :func:`find_kept_alive_by_tests_only` query, which returns the
+    "blast radius" of dropping the test suite.
     """
 
     NONE = 0
     SHADOWED = enum.auto()
     ENTRYPOINT = enum.auto()
+    TESTCASE = enum.auto()
 
 
 class EdgeFlags(enum.IntFlag):

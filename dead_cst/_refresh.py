@@ -393,6 +393,10 @@ def _apply_payload(
     * ``NodeFlags.ENTRYPOINT`` (typically on plugin synthetics)
       seeds reachability: ``graph.nodes[node]["entrypoint"] = True``
       so :func:`find_reachable` starts its BFS from this node.
+    * ``NodeFlags.TESTCASE`` mirrors into a
+      ``graph.nodes[node]["testcase"] = True`` attribute so
+      :func:`find_reachable_excluding_tests` can drop test seeds when
+      computing the "blast radius" of removing the test suite.
 
     Edge flag derivation: each ``(src, dst, access_pos)`` entry has
     its access position tested against ``payload.dead_suites`` for
@@ -429,6 +433,8 @@ def _apply_payload(
         symbol_graph.add_node(n)
         if n.flags & NodeFlags.ENTRYPOINT:
             symbol_graph.nodes[n]["entrypoint"] = True
+        if n.flags & NodeFlags.TESTCASE:
+            symbol_graph.nodes[n]["testcase"] = True
         if n.type == "synthetic":
             continue
         if n.type != "module":
