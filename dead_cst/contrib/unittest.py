@@ -1,172 +1,253 @@
-"""Plugin: keep stdlib ``unittest`` test classes and lifecycle hooks alive."""
+"""Plugin: keep stdlib ``unittest`` test classes and lifecycle hooks alive.
+
+Two-phase: ``observe`` walks every class def in every file, resolves
+each base expression to a fqname (using the file's local imports +
+same-file decls), and emits a ``<unittest:base-of>:<base_fqname>``
+bucket marker pointing at the subclass. ``finalize`` walks the graph
+from ``unittest.TestCase`` / ``IsolatedAsyncioTestCase`` -- and every
+import alias of those -- through the bucket chain to collect the
+transitive subclass closure. Each discovered subclass becomes a test
+entrypoint.
+
+This handles three real-world patterns the prior single-phase plugin
+missed:
+
+* **Direct subclass:** ``class MyTest(unittest.TestCase)`` -- caught by
+  the ``observe`` bucket emission and finalize's BFS from
+  ``unittest.TestCase``.
+* **Project-local mixin:** ``class ProjectTC(unittest.TestCase)``,
+  then ``class MyTest(ProjectTC)`` -- caught because ``ProjectTC``'s
+  bucket points to it, and a second-level bucket keyed on
+  ``ProjectTC``'s fqname points to ``MyTest``.
+* **Re-exported base:** ``from unittest import TestCase`` in
+  ``pkg.bases``, then ``from pkg.bases import TestCase; class
+  MyTest(TestCase)`` -- caught because finalize iteratively expands
+  the alias set through the graph's import-edge successors, so
+  ``pkg.bases.TestCase`` is treated as a unittest base too.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Iterable
 
 import libcst as cst
 
-from ..graph import NodeFlags
+from ..graph import NodeFlags, SymbolNode
 from ..plugins._core import (
     SYNTHETIC_POSITION,
+    AddEdge,
+    AddNode,
     GraphOp,
     ObserveContext,
     PluginContext,
-    _asname_value,
-    is_from_module,
-    is_name,
     make_payload,
     module_node,
     payload_imports_module,
     simple_name,
     synthetic_node,
 )
+from ..plugins.init_subclass import (
+    _local_class_decls,
+    _local_import_targets,
+    _resolve_bases,
+)
 
 if TYPE_CHECKING:
+    from libcst.metadata import CodeRange
+
     from ..graph import VisitorPayload
 
 UNITTEST_PREFIX = "<unittest>:"
+UNITTEST_BASE_PREFIX = "<unittest:base-of>:"
 
-# Module-level functions ``unittest`` discovers by name.
 _MODULE_HOOKS: frozenset[str] = frozenset({"setUpModule", "tearDownModule", "load_tests"})
 
-# Classes from ``unittest`` whose subclasses are auto-discovered.
-_TEST_BASE_CLASSES: frozenset[str] = frozenset({"TestCase", "IsolatedAsyncioTestCase"})
+_UNITTEST_BASE_FQNAMES: frozenset[str] = frozenset(
+    {"unittest.TestCase", "unittest.IsolatedAsyncioTestCase"}
+)
 
 
 @dataclass
 class UnittestPlugin:
     """Mark stdlib ``unittest`` discoveries as entrypoints.
 
-    For every module that imports ``unittest``:
+    ``observe`` (per file):
 
-    * Top-level classes whose base list mentions ``unittest.TestCase``
-      (or an aliased / ``from``-imported equivalent, including
-      ``IsolatedAsyncioTestCase``) are marked alive.
-    * Top-level ``setUpModule`` / ``tearDownModule`` / ``load_tests``
-      functions are marked alive (the unittest discovery protocol).
+    * ``setUpModule`` / ``tearDownModule`` / ``load_tests`` functions
+      in any file that imports ``unittest`` are wired to a
+      ``<unittest>:<module_fqname>`` entrypoint synth.
+    * Every top-level class def in the project gets a
+      ``<unittest:base-of>:<base_fqname>`` bucket marker per resolvable
+      base, with an edge from the bucket to the subclass. Buckets share
+      a project-root path so identical-fqname buckets dedupe across
+      files into a single graph node.
 
-    Pure per-file work: the file's ``payload.imports`` provides the
-    ``unittest``-import prefilter, the file's CST yields the class
-    bases and module-level hook function names, and the contribution
-    is appended to the cached payload.
+    ``finalize`` (per package):
+
+    * Compute the set of unittest aliases: start with
+      ``unittest.TestCase`` / ``IsolatedAsyncioTestCase``, then expand
+      iteratively through the graph's import nodes -- any import whose
+      successor is already an alias becomes one too. This is what
+      handles re-export chains (``from pkg.bases import TestCase``).
+    * BFS the bucket graph from each alias, collecting transitive
+      subclasses. Each discovered subclass under the current package
+      gets a ``<unittest:subclasses>:<module_fqname>`` entrypoint synth
+      + edge.
 
     Limitations:
 
-    * Only direct subclasses of a ``unittest`` base class are detected.
-      A test class that inherits from a project-local mixin which in
-      turn extends ``TestCase`` won't be picked up by this plugin --
-      users can keep it alive with an explicit ``-e`` entrypoint, or
-      via the pytest plugin's filename heuristics if the file is named
-      ``test_*.py`` / ``*_test.py``.
-    * ``from unittest import *`` is invisible to the prefilter (the
-      resolver doesn't emit a graph node for stdlib star imports), so
-      such files are skipped. Use ``from unittest import TestCase``.
+    * Bases written as calls (``class X(make_base())``) are skipped --
+      same as :class:`InitSubclassPlugin`.
+    * ``from unittest import *`` registers ``TestCase`` /
+      ``IsolatedAsyncioTestCase`` as local aliases (handled by the base
+      resolver), so subclasses still resolve.
     """
 
     name: str = "unittest"
-    version: int = 1778228682
+    version: int = 1778248994
 
     def observe(self, ctx: ObserveContext) -> VisitorPayload | None:
-        if not payload_imports_module(ctx.payload, "unittest", include_star=False):
-            return None
-
         module = module_node(ctx.payload)
         if module is None:
             return None
 
-        module_aliases, base_aliases = _collect_unittest_imports(ctx.module)
-        if not module_aliases and not base_aliases:
-            return None
+        new_nodes: list[SymbolNode] = []
+        new_edges: list[tuple[SymbolNode, SymbolNode, CodeRange]] = []
 
-        wanted = _find_testcase_subclasses(
-            ctx.module, module_aliases, base_aliases
-        ) | _find_module_hooks(ctx.module)
-        if not wanted:
-            return None
+        if payload_imports_module(ctx.payload, "unittest", include_star=True):
+            hook_decls = _find_module_hook_decls(ctx.module, ctx.payload.nodes)
+            if hook_decls:
+                synth = synthetic_node(
+                    f"{UNITTEST_PREFIX}{module.fqname}",
+                    ctx.path,
+                    flags=NodeFlags.ENTRYPOINT | NodeFlags.TESTCASE,
+                )
+                new_nodes.append(synth)
+                new_edges.extend((synth, h, SYNTHETIC_POSITION) for h in hook_decls)
 
-        targets = [
-            n
-            for n in ctx.payload.nodes
-            if n.type in ("function", "class") and simple_name(n.fqname) in wanted
-        ]
-        if not targets:
-            return None
+        nodes_by_simple = _local_class_decls(ctx.payload.nodes)
+        local_imports = _local_import_targets(ctx.payload.nodes)
+        for stmt in ctx.module.body:
+            if not isinstance(stmt, cst.ClassDef):
+                continue
+            class_decls = nodes_by_simple.get(stmt.name.value, [])
+            if not class_decls:
+                continue
+            base_fqnames = _resolve_bases(stmt, local_imports, nodes_by_simple, module.fqname)
+            for class_decl in class_decls:
+                for base_fqname in base_fqnames:
+                    bucket = synthetic_node(
+                        f"{UNITTEST_BASE_PREFIX}{base_fqname}", ctx.project_root
+                    )
+                    new_nodes.append(bucket)
+                    new_edges.append((bucket, class_decl, SYNTHETIC_POSITION))
 
-        synth = synthetic_node(
-            f"{UNITTEST_PREFIX}{module.fqname}",
-            ctx.path,
-            flags=NodeFlags.ENTRYPOINT | NodeFlags.TESTCASE,
-        )
-        edges = [(synth, t, SYNTHETIC_POSITION) for t in targets]
-        return make_payload(nodes=[synth], edges=edges)
+        if not new_nodes:
+            return None
+        return make_payload(nodes=new_nodes, edges=new_edges)
 
     def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]:
-        return ()
+        aliases = _expand_aliases(ctx, _UNITTEST_BASE_FQNAMES)
+
+        buckets_by_base: dict[str, SymbolNode] = {}
+        for node in ctx.graph.nodes:
+            if node.type == "synthetic" and node.fqname.startswith(UNITTEST_BASE_PREFIX):
+                # Buckets share project_root path, so identical-fqname
+                # nodes dedupe to one entry; setdefault preserves the
+                # first one seen even if duplicates slipped in.
+                buckets_by_base.setdefault(node.fqname[len(UNITTEST_BASE_PREFIX) :], node)
+
+        subclasses: set[SymbolNode] = set()
+        stack: list[str] = list(aliases)
+        while stack:
+            fq = stack.pop()
+            bucket = buckets_by_base.get(fq)
+            if bucket is None:
+                continue
+            for sub in ctx.graph.successors(bucket):
+                if sub.type != "class" or sub in subclasses:
+                    continue
+                subclasses.add(sub)
+                # Recurse: a subclass of an alias is itself an alias --
+                # its own subclasses are also test cases.
+                stack.append(sub.fqname)
+
+        package_path = ctx.package.path
+        by_module_path: dict[Path, list[SymbolNode]] = {}
+        for sub in subclasses:
+            if not sub.path.is_relative_to(package_path):
+                continue
+            by_module_path.setdefault(sub.path, []).append(sub)
+
+        if not by_module_path:
+            return
+
+        modules_by_path = {
+            n.path: n for n in ctx.graph.nodes if n.type == "module" and n.path in by_module_path
+        }
+        existing_synths = {
+            n.fqname: n
+            for n in ctx.graph.nodes
+            if n.type == "synthetic" and n.fqname.startswith(UNITTEST_PREFIX)
+        }
+
+        for path, subs in by_module_path.items():
+            module = modules_by_path.get(path)
+            if module is None:
+                continue
+            synth_fqname = f"{UNITTEST_PREFIX}{module.fqname}"
+            synth = existing_synths.get(synth_fqname)
+            if synth is None:
+                synth = synthetic_node(
+                    synth_fqname,
+                    path,
+                    flags=NodeFlags.ENTRYPOINT | NodeFlags.TESTCASE,
+                )
+                yield AddNode(synth, entrypoint=True, testcase=True)
+            for sub in subs:
+                yield AddEdge(synth, sub)
 
 
-def _collect_unittest_imports(module: cst.Module) -> tuple[set[str], set[str]]:
-    """Return ``(module_aliases, base_class_aliases)``.
+def _expand_aliases(ctx: PluginContext, seeds: frozenset[str]) -> set[str]:
+    """Return ``seeds`` plus every import-node fqname that transitively
+    resolves to one of them.
 
-    ``module_aliases`` are local names bound to the ``unittest`` module
-    (so ``unittest.TestCase`` / ``ut.TestCase`` can be matched).
-    ``base_class_aliases`` are local names bound directly to ``TestCase``
-    / ``IsolatedAsyncioTestCase`` (so a bare ``TestCase`` reference can be
-    matched).
+    Uses the raw :class:`Import` metadata on each import node (the
+    dotted ``module``/``decl`` pair literally written in source), not
+    graph successors -- the unittest base is stdlib and therefore
+    never appears as a graph node, so successor-walking would dead-end
+    at the first re-export. Iterates until quiescent so chains like
+    ``a.X <- b.X <- unittest.TestCase`` fold every link into the
+    alias set.
     """
-    module_aliases: set[str] = set()
-    base_aliases: set[str] = set()
-    for stmt in module.body:
-        if not isinstance(stmt, cst.SimpleStatementLine):
-            continue
-        for small in stmt.body:
-            if isinstance(small, cst.Import):
-                for alias in small.names:
-                    if not is_name(alias.name, "unittest"):
-                        continue
-                    module_aliases.add(_asname_value(alias) or "unittest")
-            elif isinstance(small, cst.ImportFrom):
-                if not is_from_module(small, "unittest"):
-                    continue
-                if isinstance(small.names, cst.ImportStar):
-                    base_aliases.update(_TEST_BASE_CLASSES)
-                    continue
-                for alias in small.names:
-                    target = alias.name.value if isinstance(alias.name, cst.Name) else None
-                    if target not in _TEST_BASE_CLASSES:
-                        continue
-                    base_aliases.add(_asname_value(alias) or target)
-    return module_aliases, base_aliases
+    aliases: set[str] = set(seeds)
+    import_nodes = [n for n in ctx.graph.nodes if n.type == "import" and n.imports is not None]
+    changed = True
+    while changed:
+        changed = False
+        for node in import_nodes:
+            if node.fqname in aliases:
+                continue
+            assert node.imports is not None
+            target = (
+                f"{node.imports.module}.{node.imports.decl}"
+                if node.imports.decl
+                else node.imports.module
+            )
+            if target in aliases:
+                aliases.add(node.fqname)
+                changed = True
+    return aliases
 
 
-def _find_testcase_subclasses(
-    module: cst.Module, module_aliases: set[str], base_aliases: set[str]
-) -> set[str]:
-    found: set[str] = set()
-    for stmt in module.body:
-        if not isinstance(stmt, cst.ClassDef):
-            continue
-        for base in stmt.bases:
-            if _is_testcase_base(base.value, module_aliases, base_aliases):
-                found.add(stmt.name.value)
-                break
-    return found
-
-
-def _is_testcase_base(
-    expr: cst.BaseExpression, module_aliases: set[str], base_aliases: set[str]
-) -> bool:
-    if isinstance(expr, cst.Name):
-        return expr.value in base_aliases
-    if isinstance(expr, cst.Attribute) and isinstance(expr.value, cst.Name):
-        return expr.value.value in module_aliases and expr.attr.value in _TEST_BASE_CLASSES
-    return False
-
-
-def _find_module_hooks(module: cst.Module) -> set[str]:
-    return {
+def _find_module_hook_decls(module: cst.Module, nodes: Iterable[SymbolNode]) -> list[SymbolNode]:
+    hook_names = {
         stmt.name.value
         for stmt in module.body
         if isinstance(stmt, cst.FunctionDef) and stmt.name.value in _MODULE_HOOKS
     }
+    if not hook_names:
+        return []
+    return [n for n in nodes if n.type == "function" and simple_name(n.fqname) in hook_names]

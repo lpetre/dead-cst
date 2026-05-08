@@ -53,6 +53,23 @@ two versions.
   seed they create; their `version` epochs were bumped accordingly.
   `AddNode` plugin ops grew an analogous `testcase: bool = False`
   field for plugins that emit entrypoints from `finalize`.
+
+### Fixed
+- `UnittestPlugin` is now two-phase: `observe` emits
+  `<unittest:base-of>:<base_fqname>` bucket markers for every class
+  def in the project, and `finalize` walks the bucket chain from
+  `unittest.TestCase` / `IsolatedAsyncioTestCase` (plus every import
+  alias of those) to find the transitive subclass closure. This
+  closes two real-world gaps the previous single-pass implementation
+  missed: (a) test classes that inherit from a project-local
+  `TestCase` mixin (`class ProjectTC(unittest.TestCase); class
+  MyTest(ProjectTC)`), and (b) test classes that inherit from a
+  re-exported `TestCase` (`from pkg.bases import TestCase` where
+  `pkg.bases` does `from unittest import TestCase`). Alias expansion
+  uses each import node's raw `Import` metadata rather than graph
+  successors, so it works even though `unittest.TestCase` itself is
+  stdlib and never appears as a graph node. The plugin's `version`
+  was bumped, invalidating cached payloads.
 - Progress reporting around the per-file visitor pass ("Parsing
   files") and the cross-package composition pass ("Reconciling
   packages")
