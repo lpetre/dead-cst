@@ -48,7 +48,7 @@ terminator suites that `analyze` flags can't be removed automatically. Add a
 `RemoveDeadSuites` LibCST transformer covering each parent shape (`If` /
 `While` / `elif` chains / post-terminator) with empty-suite guards inserting
 `pass` where needed, and a helper that returns the union of dead decls + dead
-suite ranges + `find_kept_alive_by_dead_branches(graph)` so removal expands
+suite ranges + `Analysis.kept_alive_by_dead_branches()` so removal expands
 to the blast radius. Foundational for items 5 and 7 — invisible by itself,
 shipped together with whichever consumer lands first.
 
@@ -115,7 +115,7 @@ reference for free.
 A working example, not a CLI command. Ships a `flags.toml` mapping flag-name
 → fixed truthiness, a `FlagAuditDetector(DefaultUnreachableRegionDetector)`
 whose `resolve()` answers `check_flag("foo")` calls per the toml config, and
-a `main()` that builds the graph, calls `find_kept_alive_by_dead_branches`,
+a `main()` that builds the analysis, calls `Analysis.kept_alive_by_dead_branches()`,
 and prints "removing flag X would delete N symbols / M LOC". Item 2 makes
 this much cleaner: a one-line wrapper `def is_new_auth(): return
 check_flag("new-auth")` folds without the detector having to recognize the

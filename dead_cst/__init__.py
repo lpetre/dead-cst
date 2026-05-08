@@ -35,10 +35,11 @@ those when writing extensions:
   ``importlib`` helpers a custom resolver may want to reuse.
 * :mod:`dead_cst.contrib` -- extensions targeting specific third-party
   tools: framework plugins (:class:`FastAPIPlugin`, :class:`FlaskPlugin`,
-  :class:`ClickPlugin`, :class:`TyperPlugin`, :class:`PytestPlugin`,
-  :class:`UnittestPlugin`) and tool-specific resolvers
-  (:class:`UvResolver`). All contrib classes are also re-exported from
-  ``dead_cst.plugins`` / ``dead_cst.resolvers`` for ergonomics.
+  :class:`ClickPlugin`, :class:`TyperPlugin`, :class:`CycloptsPlugin`,
+  :class:`PytestPlugin`, :class:`UnittestPlugin`, :class:`MockPatchPlugin`)
+  and tool-specific resolvers (:class:`UvResolver`). All contrib classes
+  are also re-exported from ``dead_cst.plugins`` / ``dead_cst.resolvers``
+  for ergonomics.
 
 The :class:`Cacheable` protocol (``name: str`` + ``version: int``) is
 the common contract every extension point inherits from -- the
