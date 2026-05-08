@@ -88,21 +88,24 @@ class UnittestPlugin:
 
     * Compute the set of unittest aliases: start with
       ``unittest.TestCase`` / ``IsolatedAsyncioTestCase``, then expand
-      iteratively through the graph's import nodes -- any import whose
-      successor is already an alias becomes one too. This is what
-      handles re-export chains (``from pkg.bases import TestCase``).
+      iteratively using each import node's raw ``Import`` metadata --
+      any import whose ``module.decl`` target is already an alias
+      becomes one too. The raw metadata works across the stdlib
+      boundary that ``unittest.TestCase`` sits on (it never appears as
+      a graph node, so successor-walking would dead-end).
     * BFS the bucket graph from each alias, collecting transitive
-      subclasses. Each discovered subclass under the current package
-      gets a ``<unittest:subclasses>:<module_fqname>`` entrypoint synth
-      + edge.
+      subclasses. Each subclass under the current package is wired to
+      its module's ``<unittest>:<module_fqname>`` entrypoint synth
+      (reused from the hooks branch if present, otherwise created).
 
     Limitations:
 
     * Bases written as calls (``class X(make_base())``) are skipped --
       same as :class:`InitSubclassPlugin`.
-    * ``from unittest import *`` registers ``TestCase`` /
-      ``IsolatedAsyncioTestCase`` as local aliases (handled by the base
-      resolver), so subclasses still resolve.
+    * ``from unittest import *`` is invisible to the base resolver:
+      the visitor doesn't bind individual names from a star import,
+      so ``class X(TestCase)`` after ``from unittest import *`` does
+      not resolve. Use ``from unittest import TestCase`` instead.
     """
 
     name: str = "unittest"
