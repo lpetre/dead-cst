@@ -278,10 +278,14 @@ def require_resolved_dep(ctx: PluginContext, package: str) -> SymbolNode | None:
 @dataclass(frozen=True, slots=True)
 class AddNode:
     """Add a node to the graph. When ``entrypoint=True``, mark the node so
-    :func:`find_reachable` seeds its BFS from it."""
+    :func:`find_reachable` seeds its BFS from it. ``testcase=True`` tags
+    the node as a test-only entrypoint -- it still seeds the default
+    BFS, but :func:`find_kept_alive_by_tests_only` excludes those seeds
+    to surface the "blast radius" of removing tests."""
 
     node: SymbolNode
     entrypoint: bool = False
+    testcase: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -358,10 +362,12 @@ class EdgePlugin(Cacheable, Protocol):
 def apply_ops(graph: nx.DiGraph, ops: Iterable[GraphOp]) -> None:
     for op in ops:
         match op:
-            case AddNode(node, entrypoint):
+            case AddNode(node, entrypoint, testcase):
                 graph.add_node(node)
                 if entrypoint:
                     graph.nodes[node]["entrypoint"] = True
+                if testcase:
+                    graph.nodes[node]["testcase"] = True
             case AddEdge(src, dst):
                 graph.add_edge(src, dst)
             case RemoveEdge(src, dst):

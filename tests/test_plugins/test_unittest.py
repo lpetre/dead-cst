@@ -173,3 +173,22 @@ def test_unittest_plugin_loads_via_load_plugin():
 
     plugin = load_plugin("unittest")
     assert isinstance(plugin, UnittestPlugin)
+
+
+def test_unittest_plugin_tags_seeds_as_testcase(make_analysis, write_files):
+    write_files(
+        {
+            "pkg/__init__.py": "",
+            "pkg/things.py": """
+            import unittest
+
+            class MyThings(unittest.TestCase):
+                def test_one(self): pass
+            """,
+        }
+    )
+    graph = make_analysis(plugins=[UnittestPlugin()]).materialize_all()
+    seeds = [n for n, attrs in graph.nodes(data=True) if attrs.get("entrypoint")]
+    assert seeds, "expected unittest plugin to seed at least one entrypoint"
+    for seed in seeds:
+        assert graph.nodes[seed].get("testcase"), seed.fqname

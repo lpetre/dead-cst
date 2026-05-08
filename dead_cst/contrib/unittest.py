@@ -66,7 +66,7 @@ class UnittestPlugin:
     """
 
     name: str = "unittest"
-    version: int = 1777760307
+    version: int = 1778228682
 
     def observe(self, ctx: ObserveContext) -> VisitorPayload | None:
         if not payload_imports_module(ctx.payload, "unittest", include_star=False):
@@ -97,7 +97,7 @@ class UnittestPlugin:
         synth = synthetic_node(
             f"{UNITTEST_PREFIX}{module.fqname}",
             ctx.path,
-            flags=NodeFlags.ENTRYPOINT,
+            flags=NodeFlags.ENTRYPOINT | NodeFlags.TESTCASE,
         )
         edges = [(synth, t, SYNTHETIC_POSITION) for t in targets]
         return make_payload(nodes=[synth], edges=edges)

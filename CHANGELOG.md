@@ -10,6 +10,17 @@ two versions.
 ## [Unreleased]
 
 ### Added
+- New `NodeFlags.TESTCASE` flag tags entrypoints created by test
+  plugins (pytest / unittest discovery, fixture seeds). The default
+  `Analysis.reachable()` traversal still treats those seeds as
+  ordinary entrypoints. The opt-in `Analysis.kept_alive_by_tests_only()`
+  / `PackageView.kept_alive_by_tests_only()` returns the "blast
+  radius" of dropping the test suite -- production code currently
+  kept alive only because tests still touch it. `PytestPlugin` and
+  `UnittestPlugin` stamp `ENTRYPOINT | TESTCASE` on every synthetic
+  seed they create; their `version` epochs were bumped accordingly.
+  `AddNode` plugin ops grew an analogous `testcase: bool = False`
+  field for plugins that emit entrypoints from `finalize`.
 - Progress reporting around the per-file visitor pass ("Parsing
   files") and the cross-base composition pass ("Reconciling bases")
   in `Analysis.refresh` / `Analysis._materialize`. On a TTY the user

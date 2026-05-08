@@ -427,6 +427,8 @@ def _apply_payload(
         symbol_graph.add_node(n)
         if n.flags & NodeFlags.ENTRYPOINT:
             symbol_graph.nodes[n]["entrypoint"] = True
+        if n.flags & NodeFlags.TESTCASE:
+            symbol_graph.nodes[n]["testcase"] = True
         if n.type == "synthetic":
             continue
         if n.type != "module":
@@ -624,6 +626,44 @@ def _find_kept_alive_by_dead_branches(graph: nx.MultiDiGraph) -> set[SymbolNode]
     :meth:`PackageView.kept_alive_by_dead_branches`.
     """
     return _find_reachable(graph) - _find_reachable_strict(graph)
+
+
+def _find_reachable_excluding_tests(graph: nx.MultiDiGraph) -> set[SymbolNode]:
+    """Like :func:`_find_reachable` but skips entrypoints tagged ``testcase``.
+
+    :class:`~dead_cst.contrib.PytestPlugin` and
+    :class:`~dead_cst.contrib.UnittestPlugin` stamp their synthetic
+    seed nodes with :data:`NodeFlags.TESTCASE` (in addition to
+    :data:`NodeFlags.ENTRYPOINT`); ``_apply_payload`` /
+    :func:`dead_cst.plugins.apply_ops` mirror that into a
+    ``graph.nodes[node]["testcase"] = True`` attribute. This BFS treats
+    such seeds as if they weren't entrypoints at all -- the answer is
+    "what would still be alive if you dropped the test suite?".
+    """
+    visited: set[SymbolNode] = set()
+    stack = [
+        n
+        for n, attrs in graph.nodes(data=True)
+        if attrs.get("entrypoint") and not attrs.get("testcase")
+    ]
+    while stack:
+        node = stack.pop()
+        if node in visited:
+            continue
+        visited.add(node)
+        stack.extend(graph.successors(node))
+    return visited
+
+
+def _find_kept_alive_by_tests_only(graph: nx.MultiDiGraph) -> set[SymbolNode]:
+    """Symbols only reachable from ``TESTCASE``-tagged entrypoints.
+
+    ``_find_reachable(graph) -`` :func:`_find_reachable_excluding_tests`;
+    the difference is the "blast radius" of removing the test suite.
+    Surfaced on :class:`Analysis` as :meth:`Analysis.kept_alive_by_tests_only`
+    and on :class:`PackageView` as :meth:`PackageView.kept_alive_by_tests_only`.
+    """
+    return _find_reachable(graph) - _find_reachable_excluding_tests(graph)
 
 
 def _count_nodes(graph: nx.MultiDiGraph, prefix: Path | None) -> dict[str, int]:
@@ -989,6 +1029,22 @@ class Analysis:
         g = self.materialize_all()
         return _find_reachable(g) - _find_reachable_strict(g)
 
+    def kept_alive_by_tests_only(self) -> set[SymbolNode]:
+        """Symbols that would become unreachable if the test suite were dropped.
+
+        Computed as ``reachable() -`` BFS that excludes every
+        entrypoint tagged :data:`NodeFlags.TESTCASE` (today: pytest
+        and unittest discovery seeds). The resulting set is the
+        "blast radius" of removing tests -- production code that is
+        currently kept alive *only* because tests still exercise it.
+
+        Used by tooling that reports "if you deleted your tests, these
+        symbols would also become dead." The default :meth:`reachable`
+        traversal is unchanged; this is the opt-in stricter pass.
+        """
+        g = self.materialize_all()
+        return _find_kept_alive_by_tests_only(g)
+
     def count_nodes(self, prefix: Path | None = None) -> dict[str, int]:
         """Count nodes in the full graph by ``SymbolNode.type``.
 
@@ -1145,6 +1201,16 @@ class PackageView:
         """
         g = self._analysis.materialize_closure(self._base)
         diff = _find_reachable(g) - _find_reachable_strict(g)
+        return {n for n in diff if n.path.is_relative_to(self._base)}
+
+    def kept_alive_by_tests_only(self) -> set[SymbolNode]:
+        """Decls in this base kept alive only by ``TESTCASE`` entrypoints.
+
+        Closure-scoped equivalent of :meth:`Analysis.kept_alive_by_tests_only`,
+        filtered to nodes under :attr:`base`.
+        """
+        g = self._analysis.materialize_closure(self._base)
+        diff = _find_kept_alive_by_tests_only(g)
         return {n for n in diff if n.path.is_relative_to(self._base)}
 
     def count_nodes(self) -> dict[str, int]:
