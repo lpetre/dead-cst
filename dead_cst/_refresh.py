@@ -104,20 +104,15 @@ def enumerate_files(
 ) -> PackageFiles:
     """Walk ``package.path``'s ``.py`` / ``.pyi`` tree, classify each file as cache hit or miss.
 
-    A ``.pyi`` whose ``.py`` twin also exists is skipped: the runtime
-    module is the canonical declaration of those names, and ingesting
-    the stub on top would collide with it in the symbol trie. The
-    supported ``.pyi`` shape is the compiled-extension layout, where
-    a binary (``_native.so``) ships next to a stub (``_native.pyi``)
-    with no ``.py`` sibling -- the stub is the only Python-visible
-    description of those names and gets parsed under their natural FQN.
+    A ``.pyi`` whose ``.py`` twin also exists is skipped at this layer:
+    ingesting both would assert in the symbol trie when they claim the
+    same FQN, and dead-cst has no peer-stub linker. Orphan ``.pyi``
+    (compiled-extension shape) flows through under its natural FQN.
     """
-    # ``rglob("*.py*")`` would also catch ``.pyc`` / ``.pyo`` /
-    # ``.pyx``; filter on the exact suffix so a single tree walk
-    # replaces what used to be two separate ``rglob`` calls.
-    discovered = sorted(p for p in package.path.rglob("*.py*") if p.suffix in (".py", ".pyi"))
-    py_stems = {p.with_suffix("") for p in discovered if p.suffix == ".py"}
-    files = tuple(f for f in discovered if f.suffix == ".py" or f.with_suffix("") not in py_stems)
+    py_files = sorted(package.path.rglob("*.py"))
+    py_stems = {p.with_suffix("") for p in py_files}
+    pyi_files = (p for p in package.path.rglob("*.pyi") if p.with_suffix("") not in py_stems)
+    files = tuple(sorted([*py_files, *pyi_files]))
     hits: dict[Path, VisitorPayload] = {}
     miss_files: list[Path] = []
     for file in files:

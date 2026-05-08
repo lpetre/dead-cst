@@ -1,14 +1,5 @@
-"""Tests for ``@overload`` flagging and ``.pyi`` stub ingestion.
-
-The visitor recognises ``@typing.overload`` and anchors each overload
-to its same-name impl through ``impl -> overload`` edges so the
-codemod removes them as a unit. ``.pyi`` files are ingested for the
-compiled-extension layout (``_native.so`` next to ``_native.pyi``,
-no ``.py`` twin) and parsed under their natural module FQN. Peer
-``.pyi`` (alongside a real ``.py``) is dropped during file
-enumeration -- the runtime always wins -- so the analyzer never
-sees them.
-"""
+"""Tests for ``@overload`` anchoring and ``.pyi`` stub ingestion
+(compiled-extension layout only; peer ``.pyi`` is dropped at enumeration)."""
 
 from __future__ import annotations
 
@@ -180,8 +171,6 @@ def test_overload_recognized_under_alternate_decorator_forms(tmp_path, make_anal
 
 
 def test_peer_pyi_is_skipped_when_py_twin_exists(tmp_path, make_analysis):
-    """``mod.pyi`` alongside ``mod.py`` is dropped at enumeration time,
-    so the analyzer only sees the runtime module."""
     (tmp_path / "mod.py").write_text("def f(x):\n    return x\n")
     (tmp_path / "mod.pyi").write_text("def stub_only(x: int) -> int: ...\n")
 
@@ -190,16 +179,11 @@ def test_peer_pyi_is_skipped_when_py_twin_exists(tmp_path, make_analysis):
     assert paths == {"mod.py"}
     function_names = {n.fqname for n in graph.nodes if n.type == "function"}
     assert function_names == {"mod.f"}
-    assert "mod.stub_only" not in function_names
 
 
 def test_orphan_pyi_stub_uses_runtime_fqname(tmp_path, make_analysis):
-    """Compiled-extension shape: ``_native.pyi`` with no ``.py`` twin.
-
-    ``from mypkg._native import compute`` should resolve to the stub
-    decl through the normal trie path -- the stub is parsed under its
-    natural FQN ``mypkg._native``, with no synthetic suffix.
-    """
+    """Compiled-extension shape: ``from mypkg._native import compute``
+    must resolve to the stub decl when no ``.py`` twin exists."""
     pkg = tmp_path / "mypkg"
     pkg.mkdir()
     (pkg / "__init__.py").write_text("from mypkg._native import compute\n")
@@ -235,8 +219,4 @@ def test_orphan_pyi_stub_deleted_when_unused(tmp_path, make_analysis):
     pkg_view = a.package(tmp_path)
     pkg_view.remove_dead_code()
 
-    pyi_path = pkg / "_native.pyi"
-    if pyi_path.exists():
-        rewritten = pyi_path.read_text()
-        assert "def compute" not in rewritten
-        assert "def other" not in rewritten
+    assert not (pkg / "_native.pyi").exists()
