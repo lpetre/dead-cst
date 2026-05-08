@@ -32,7 +32,7 @@ import networkx as nx
 from libcst.helpers.module import ModuleNameAndPackage
 from libcst.metadata import CodeRange, MetadataWrapper
 
-from ._fqn import FixedFullyQualifiedNameProvider
+from ._fqn import PYI_FQN_SEGMENT, FixedFullyQualifiedNameProvider
 from ._progress import progress
 from ._visitor import SymbolVisitor
 from .branches import UnreachableRegionDetector
@@ -250,6 +250,8 @@ def build_contribution(
             symbol_graph=package_graph,
             import_edges=import_edges,
         )
+    _promote_orphan_stub_modules(current_trie)
+    _promote_orphan_stub_modules(export_trie)
     current_trie.add_module_hierarchy_edges(package_graph)
     return PackageContribution(
         package=package,
@@ -258,6 +260,38 @@ def build_contribution(
         package_graph=package_graph,
         import_edges=frozenset(import_edges),
     )
+
+
+def _promote_orphan_stub_modules(trie: SymbolTrie) -> None:
+    """Expose ``.pyi`` decls under their runtime FQN when no ``.py`` twin exists.
+
+    Compiled-extension layout: ``mypkg/_native.so`` ships next to
+    ``mypkg/_native.pyi``. The visitor parses the ``.pyi`` under FQN
+    ``mypkg._native.__pyi__``, but no ``.py`` produces a module at
+    ``mypkg._native``, so ``from mypkg._native import compute`` would
+    miss the trie. We rebind the parent trie node in place: its
+    ``module`` and ``declarations`` now point at the stub's, so import
+    resolution lands on the stub's :class:`SymbolNode`. The nodes
+    themselves keep their ``.__pyi__`` fqnames (the codemod uses
+    ``path`` to find files, not fqname segments).
+
+    Skipped when the parent trie node already has a ``.py`` module --
+    the runtime wins; orphan stubs are expressly the only case this
+    pass handles.
+    """
+    stack: list[SymbolTrie] = [trie]
+    while stack:
+        node = stack.pop()
+        stack.extend(node.children.values())
+        stub = node.children.get(PYI_FQN_SEGMENT)
+        if stub is None or stub.module is None or node.module is not None:
+            continue
+        node.module = stub.module
+        node.declarations = dict(stub.declarations)
+        # Drop the now-redundant ``__pyi__`` child so the module-hierarchy
+        # walk doesn't emit a self-edge from the stub to itself (both
+        # paths resolved to the same module after the rebind).
+        del node.children[PYI_FQN_SEGMENT]
 
 
 # ---------------------------------------------------------------------------

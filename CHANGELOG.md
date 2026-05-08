@@ -43,18 +43,24 @@ two versions.
 
 ### Added
 - `.pyi` stub files are now ingested by the analyzer and rewritten by
-  the codemod. Stubs are discovered alongside `.py` siblings and parsed
-  through the same visitor (so import edges, type-alias edges, etc.
-  show up normally). To avoid colliding with the matching `.py` in the
-  symbol trie, each stub module is given a synthetic `__pyi__` FQN
-  segment (e.g. `mod.pyi` becomes `mod.__pyi__`). A new built-in
-  `PyiStubPlugin` (registered as `pyi_stub_link` and added to the
-  default CLI plugin chain) emits `runtime_decl -> stub_decl` edges
-  by same-name match so a stub's lifetime tracks its `.py` twin: the
-  stub is kept alive while the runtime decl is alive, and
-  `dead-cst remove` drops it the moment the runtime decl becomes dead.
-- New `NodeFlags.OVERLOAD` flag plus visitor + edge-stitcher support
-  for `typing.overload`. `@overload`-decorated functions (recognized
+  the codemod, targeting the **compiled-extension layout**: a binary
+  module (e.g. `mypkg/_native.so`) shipping next to its hand-written
+  type stub (`mypkg/_native.pyi`) with no `.py` twin. Stubs are
+  discovered alongside `.py` siblings and parsed through the same
+  visitor (so import edges, type-alias edges, etc. show up normally),
+  given a synthetic `__pyi__` FQN segment (e.g. `mod.pyi` becomes
+  `mod.__pyi__`) so they don't collide with a same-named `.py`, and --
+  in the orphan case where no `.py` twin exists -- the per-package
+  contribution rebinds the runtime FQN in the trie to point at the
+  stub's module + decls. The result: `from mypkg._native import
+  compute` resolves to the stub's `compute` decl through the normal
+  cross-module import path, and reachability + the codemod work the
+  same as for any first-party module. Peer stubs (a `.pyi` shipping
+  alongside an actual `.py`) are intentionally left orphaned -- the
+  runtime module wins, and the unused stub is treated as dead code
+  unless something imports it.
+- New `NodeFlags.OVERLOAD` flag plus visitor support for
+  `typing.overload`. `@overload`-decorated functions (recognized
   syntactically -- bare `overload`, `typing.overload`, and
   `typing_extensions.overload`) are flagged and excluded from the
   cross-module lookup trie just like `SHADOWED` decls, so `from mod
@@ -62,9 +68,7 @@ two versions.
   stub. The visitor also wires `impl -> overload` edges so an
   overload's lifetime is anchored to its same-name impl: the codemod
   removes the overloads alongside the impl when the impl is dead, and
-  preserves them as long as the impl is alive. Combined with the
-  `.pyi` ingest above, runtime impls in `.py` automatically anchor
-  overload stubs in the matching `.pyi`.
+  preserves them as long as the impl is alive.
 - Progress reporting around the per-file visitor pass ("Parsing
   files") and the cross-package composition pass ("Reconciling
   packages")

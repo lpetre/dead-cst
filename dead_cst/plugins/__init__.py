@@ -94,7 +94,6 @@ from .init_subclass import InitSubclassPlugin
 from .main_block import MainBlockPlugin
 from .module_dunders import ModuleDundersPlugin
 from .project_scripts import ProjectScriptsPlugin
-from .pyi_stub import PyiStubPlugin
 
 BUILTIN_PLUGINS: dict[str, type] = {
     MainBlockPlugin.name: MainBlockPlugin,
@@ -110,7 +109,6 @@ BUILTIN_PLUGINS: dict[str, type] = {
     ClickPlugin.name: ClickPlugin,
     CycloptsPlugin.name: CycloptsPlugin,
     InitSubclassPlugin.name: InitSubclassPlugin,
-    PyiStubPlugin.name: PyiStubPlugin,
 }
 
 
@@ -151,7 +149,6 @@ __all__ = [
     "ObserveContext",
     "PluginContext",
     "ProjectScriptsPlugin",
-    "PyiStubPlugin",
     "PytestPlugin",
     "RemoveEdge",
     "STDLIB_PREFIX",

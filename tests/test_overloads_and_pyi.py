@@ -1,4 +1,12 @@
-"""Tests for ``@overload`` flagging and ``.pyi`` stub linking."""
+"""Tests for ``@overload`` flagging and ``.pyi`` stub ingestion.
+
+The visitor recognises ``@typing.overload`` and anchors each overload
+to its same-name impl through ``impl -> overload`` edges so the
+codemod removes them as a unit. ``.pyi`` files are ingested for the
+compiled-extension layout (``_native.so`` next to ``_native.pyi``,
+no ``.py`` twin): the trie promotes the orphan stub's decls so
+``from mypkg._native import compute`` resolves to the stub.
+"""
 
 from __future__ import annotations
 
@@ -9,12 +17,17 @@ import pytest
 from dead_cst import NodeFlags
 from dead_cst.analyze import _find_reachable as find_reachable
 from dead_cst.codemod import remove_code
-from dead_cst.plugins import ExplicitEntrypointPlugin, PyiStubPlugin
+from dead_cst.plugins import ExplicitEntrypointPlugin
 
 
 def _normalise(s: str) -> str:
     s = textwrap.dedent(s)
     return s[1:] if s.startswith("\n") else s
+
+
+# ---------------------------------------------------------------------------
+# In-file ``@overload``
+# ---------------------------------------------------------------------------
 
 
 def test_overload_decls_are_flagged_and_anchored_to_impl(tmp_path, make_analysis):
@@ -44,10 +57,8 @@ def test_overload_decls_are_flagged_and_anchored_to_impl(tmp_path, make_analysis
     assert len(overloads) == 2
     assert len(impls) == 1
     impl = impls[0]
-    # Last def in source is the live impl, earlier are overloads.
     for ov in overloads:
         assert impl.position.start.line > ov.position.start.line
-    # impl -> each overload edge so they share lifetime.
     successors = list(graph.successors(impl))
     assert all(o in successors for o in overloads)
 
@@ -135,102 +146,8 @@ def test_live_overloads_survive_codemod(tmp_path, make_analysis):
     remove_code(unreachable, tmp_path)
 
     rewritten = (tmp_path / "mod.py").read_text()
-    assert rewritten.count("def f") == 3  # two overloads + impl
+    assert rewritten.count("def f") == 3
     assert rewritten.count("@overload") == 2
-
-
-def test_pyi_module_gets_distinct_fqn(tmp_path, make_analysis):
-    """Same-named ``.py`` and ``.pyi`` coexist under disjoint FQNs."""
-    (tmp_path / "mod.py").write_text("def f(x):\n    return x\n")
-    (tmp_path / "mod.pyi").write_text("def f(x: int) -> int: ...\n")
-
-    graph = make_analysis().materialize_all()
-    fqnames = {n.fqname for n in graph.nodes if n.type == "module"}
-    assert "mod" in fqnames
-    assert "mod.__pyi__" in fqnames
-
-
-def test_pyi_decls_track_runtime_lifetime(tmp_path, make_analysis):
-    """A ``.pyi`` decl is alive iff its ``.py`` twin is alive."""
-    (tmp_path / "mod.py").write_text(
-        _normalise(
-            """
-            def alive(x):
-                return x
-
-            def dead(x):
-                return x
-            """
-        )
-    )
-    (tmp_path / "mod.pyi").write_text(
-        _normalise(
-            """
-            def alive(x: int) -> int: ...
-            def dead(x: int) -> int: ...
-            """
-        )
-    )
-    a = make_analysis(
-        plugins=[
-            PyiStubPlugin(),
-            ExplicitEntrypointPlugin(specs=["mod.alive"]),
-        ],
-    )
-    graph = a.materialize_all()
-    reachable = find_reachable(graph)
-
-    alive_stub = next(
-        n for n in graph.nodes if n.fqname == "mod.__pyi__.alive" and n.type == "function"
-    )
-    dead_stub = next(
-        n for n in graph.nodes if n.fqname == "mod.__pyi__.dead" and n.type == "function"
-    )
-    assert alive_stub in reachable, "stub for live runtime decl should be alive"
-    assert dead_stub not in reachable, "stub for dead runtime decl should be dead"
-
-
-def test_pyi_overloads_removed_with_dead_runtime_impl(tmp_path, make_analysis):
-    """Dead runtime impl drags its ``.pyi`` overloads into deletion."""
-    (tmp_path / "mod.py").write_text(
-        _normalise(
-            """
-            def keep():
-                return 1
-            def kill():
-                return 2
-            keep()
-            """
-        )
-    )
-    (tmp_path / "mod.pyi").write_text(
-        _normalise(
-            """
-            from typing import overload
-
-            @overload
-            def kill(x: int) -> int: ...
-            @overload
-            def kill(x: str) -> str: ...
-            def kill(x): ...
-
-            def keep() -> int: ...
-            """
-        )
-    )
-    a = make_analysis(
-        plugins=[
-            PyiStubPlugin(),
-            ExplicitEntrypointPlugin(specs=["mod.keep"]),
-        ],
-    )
-    pkg = a.package(tmp_path)
-    pkg.remove_dead_code()
-
-    rewritten = (tmp_path / "mod.pyi").read_text()
-    assert "def keep" in rewritten
-    assert "def kill" not in rewritten
-    assert "@overload" not in rewritten
 
 
 @pytest.mark.parametrize("decorator", ["overload", "typing.overload"])
@@ -253,3 +170,86 @@ def test_overload_recognized_under_alternate_decorator_forms(tmp_path, make_anal
         if n.fqname == "mod.f" and n.type == "function" and n.flags & NodeFlags.OVERLOAD
     ]
     assert len(overloads) == 1
+
+
+# ---------------------------------------------------------------------------
+# ``.pyi`` ingestion -- compiled-extension orphan stubs
+# ---------------------------------------------------------------------------
+
+
+def test_pyi_module_gets_distinct_fqn_when_py_twin_exists(tmp_path, make_analysis):
+    """A ``.pyi`` alongside a ``.py`` keeps its synthetic ``__pyi__`` FQN
+    so the runtime module wins the cross-module lookup."""
+    (tmp_path / "mod.py").write_text("def f(x):\n    return x\n")
+    (tmp_path / "mod.pyi").write_text("def f(x: int) -> int: ...\n")
+
+    graph = make_analysis().materialize_all()
+    fqnames = {n.fqname for n in graph.nodes if n.type == "module"}
+    assert "mod" in fqnames
+    assert "mod.__pyi__" in fqnames
+
+
+def test_orphan_pyi_stub_resolves_under_runtime_fqname(tmp_path, make_analysis):
+    """Compiled-extension shape: ``_native.pyi`` with no ``.py`` twin.
+
+    ``from mypkg._native import compute`` should resolve to the stub
+    decl through the trie -- the orphan-stub promotion in the per-package
+    contribution rebinds ``mypkg._native`` to point at the stub's
+    module + decls.
+    """
+    pkg = tmp_path / "mypkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("from mypkg._native import compute\n")
+    # No mypkg/_native.py -- emulating a binary that ships only its stub.
+    (pkg / "_native.pyi").write_text("def compute(x: int) -> int: ...\n")
+    (tmp_path / "main.py").write_text("from mypkg import compute\ncompute(1)\n")
+
+    a = make_analysis(plugins=[ExplicitEntrypointPlugin(specs=["main"])])
+    graph = a.materialize_all()
+    reachable = find_reachable(graph)
+
+    stub_compute = next(
+        n
+        for n in graph.nodes
+        if n.fqname == "mypkg._native.__pyi__.compute" and n.type == "function"
+    )
+    assert stub_compute in reachable, "orphan stub decl should be alive when imported"
+
+    # Cross-module imports landed on the stub: ``mypkg.compute``
+    # (the alias in __init__.py) edges into the stub decl.
+    pkg_compute = next(n for n in graph.nodes if n.fqname == "mypkg.compute")
+    assert stub_compute in graph.successors(pkg_compute)
+
+
+def test_orphan_pyi_stub_preserves_no_self_edges(tmp_path, make_analysis):
+    """Promotion must not leave ``stub_module -> stub_module`` self-edges."""
+    pkg = tmp_path / "mypkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "_native.pyi").write_text("def compute(x: int) -> int: ...\n")
+
+    graph = make_analysis().materialize_all()
+    self_edges = [(s, d) for s, d in graph.edges(keys=False) if s is d]
+    assert self_edges == []
+
+
+def test_orphan_pyi_stub_deleted_when_unused(tmp_path, make_analysis):
+    """An orphan stub that no entrypoint reaches is still removed by the codemod."""
+    pkg = tmp_path / "mypkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "_native.pyi").write_text(
+        "def compute(x: int) -> int: ...\ndef other(x: int) -> int: ...\n"
+    )
+    (pkg / "live.py").write_text("def keep():\n    return 1\n")
+
+    a = make_analysis(plugins=[ExplicitEntrypointPlugin(specs=["mypkg.live.keep"])])
+    pkg_view = a.package(tmp_path)
+    pkg_view.remove_dead_code()
+
+    # The .pyi file (or its contents) should be removed: no one imports it.
+    pyi_path = pkg / "_native.pyi"
+    if pyi_path.exists():
+        rewritten = pyi_path.read_text()
+        assert "def compute" not in rewritten
+        assert "def other" not in rewritten

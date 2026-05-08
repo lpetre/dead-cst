@@ -284,7 +284,9 @@ A module-level `import` / `from ... import ...` is itself a declaration of type 
 
 `dead-cst` tracks top-level declarations only -- module-level functions, classes, and variables. Nested definitions (inner functions, methods, nested classes) are deliberately not given their own nodes; references made from inside those nested scopes are attributed to the enclosing top-level declaration. Keeping the containing top-level symbol alive keeps its nested source alive with it.
 
-`.pyi` stub files alongside `.py` modules are ingested too. Each stub becomes its own module under a synthetic `<runtime>.__pyi__` FQN segment, and a built-in plugin anchors every stub declaration to its same-named runtime twin so the stub follows the impl's lifetime: kept alive when the impl is alive, deleted by `dead-cst remove` when the impl becomes dead. `@typing.overload`-decorated functions are flagged similarly so a dead implementation drags its overloads with it instead of leaving orphans behind.
+`.pyi` stub files are ingested for the **compiled-extension** layout: a binary like `mypkg/_native.so` shipping next to `mypkg/_native.pyi`. The stub is parsed under a synthetic `<runtime>.__pyi__` FQN, and when no matching `.py` module exists the analyzer rebinds the trie so `from mypkg._native import compute` resolves to the stub's declaration -- the stub *is* the only Python-discoverable description of those names, and reachability flows through it normally. ``.py`` files that ship a peer ``.pyi`` are not anchored together; the runtime module wins on its own, and the peer stub is treated as an orphan unless something imports it.
+
+`@typing.overload`-decorated functions in `.py` files are flagged so a dead implementation drags its overloads along during `dead-cst remove` instead of leaving them behind as orphans.
 
 ## Limitations
 

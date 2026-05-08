@@ -26,7 +26,6 @@ from dead_cst.plugins import (
     ExplicitEntrypointPlugin,
     MainBlockPlugin,
     ModuleDundersPlugin,
-    PyiStubPlugin,
 )
 from dead_cst.plugins._core import EXTERNAL_DIST_PREFIX
 from dead_cst.plugins.explicit_entrypoint import EXPLICIT_PREFIX
@@ -188,12 +187,12 @@ def test_build_resolver_path_and_name_are_mutually_exclusive():
 
 def test_build_plugins_default_only_includes_module_dunders():
     plugins = build_plugins(entrypoints=[], plugin_names=[])
-    assert [type(p) for p in plugins] == [ModuleDundersPlugin, PyiStubPlugin]
+    assert [type(p) for p in plugins] == [ModuleDundersPlugin]
 
 
 def test_build_plugins_named_plugins_run_before_module_dunders():
     plugins = build_plugins(entrypoints=[], plugin_names=["main_block"])
-    assert [type(p) for p in plugins] == [MainBlockPlugin, ModuleDundersPlugin, PyiStubPlugin]
+    assert [type(p) for p in plugins] == [MainBlockPlugin, ModuleDundersPlugin]
 
 
 def test_build_plugins_appends_explicit_last():
@@ -203,7 +202,6 @@ def test_build_plugins_appends_explicit_last():
     assert [type(p) for p in plugins] == [
         MainBlockPlugin,
         ModuleDundersPlugin,
-        PyiStubPlugin,
         ExplicitEntrypointPlugin,
     ]
     explicit = plugins[-1]
