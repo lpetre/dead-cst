@@ -281,6 +281,26 @@ import pytest
             },
             id="lambda-fstring-body",
         ),
+        pytest.param(
+            """
+            A = 1
+            B = 2
+            f = lambda: ((x := A), (x := B))[1]
+            """,
+            # Walrus targets inside a lambda body stay local to the
+            # lambda (same as inside a function), so ``x`` does not
+            # surface as a top-level decl even though the same name is
+            # rebound in both tuple elements. RHS references still
+            # attribute to ``mod.f``.
+            {
+                "mod.A -> mod",
+                "mod.B -> mod",
+                "mod.f -> mod",
+                "mod.f -> mod.A",
+                "mod.f -> mod.B",
+            },
+            id="lambda-tuple-subscript-walrus-rebinds-body",
+        ),
         # ------------------------------------------------------------------
         # Classes
         # ------------------------------------------------------------------
