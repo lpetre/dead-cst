@@ -320,6 +320,18 @@ import pytest
             },
             id="lambda-iife-tuple-subscript-walrus-rebinds-body",
         ),
+        pytest.param(
+            """
+            f = lambda s: (s := 1, s)
+            """,
+            # The walrus ``s := 1`` rebinds the lambda parameter ``s``;
+            # the trailing ``s`` still resolves to that local binding,
+            # so no module-level refs flow out of the body.
+            {
+                "mod.f -> mod",
+            },
+            id="lambda-walrus-rebinds-parameter",
+        ),
         # ------------------------------------------------------------------
         # Classes
         # ------------------------------------------------------------------
