@@ -115,7 +115,7 @@ def test_analysis_method_returns_strict_diff(make_analysis, write_files):
     assert "pkg.lib.helper" in fqnames
 
 
-def test_package_view_kept_alive_by_tests_only(make_analysis, write_files, tmp_path):
+def test_package_view_kept_alive_by_tests_only(make_analysis, write_files):
     write_files(
         {
             "pkg/__init__.py": "",
@@ -129,10 +129,10 @@ def test_package_view_kept_alive_by_tests_only(make_analysis, write_files, tmp_p
         }
     )
     analysis = make_analysis(plugins=[PytestPlugin()])
-    base = analysis.bases[0]
-    blast = analysis.package(base).kept_alive_by_tests_only()
+    package_path = analysis.packages[0].path
+    blast = analysis.package(package_path).kept_alive_by_tests_only()
     fqnames = {n.fqname for n in blast}
     assert "pkg.lib.helper" in fqnames
-    # Filtered to nodes under this base.
+    # Filtered to nodes under this package.
     for n in blast:
-        assert n.path.is_relative_to(base)
+        assert n.path.is_relative_to(package_path)

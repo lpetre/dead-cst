@@ -11,7 +11,7 @@ can register under the ``dead_cst.resolvers`` entry-point group;
 :func:`load_resolver` checks builtins first, then falls back to entry points.
 
 In addition, :func:`exported_roots` -- not a resolver itself -- inspects a
-single base's ``pyproject.toml`` to determine which subdirs the build
+single package's ``pyproject.toml`` to determine which subdirs the build
 backend would actually ship. The shipped resolvers call it at
 :meth:`PathResolver.resolve` time to populate
 :attr:`Package.exported`, so internal dirs like ``tests/`` stay scoped

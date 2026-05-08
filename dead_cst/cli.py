@@ -128,7 +128,7 @@ def build_resolver(path_specs: list[str], resolver_name: str | None) -> PathReso
     :class:`ManualResolver`, ``--resolver`` loads a named resolver, and
     passing both is a usage error. With neither flag supplied, falls
     back to a :class:`ManualResolver` that treats the project root
-    itself as the only base.
+    itself as the only package.
     """
     if path_specs and resolver_name is not None:
         raise typer.BadParameter("`-p`/`--path` and `--resolver` are mutually exclusive.")
@@ -170,7 +170,7 @@ def analyze(
     ] = None,
     path: Annotated[
         list[str] | None,
-        typer.Option("-p", "--path", help="Search path spec: 'base:dep1,dep2' or 'base'."),
+        typer.Option("-p", "--path", help="Search path spec: 'package:dep1,dep2' or 'package'."),
     ] = None,
     resolver: Annotated[
         str | None,
@@ -215,10 +215,11 @@ def analyze(
 
     unreachable_graph = graph.subgraph([n for n in graph.nodes if n not in reachable])
 
+    package_paths = [p.path for p in analysis.packages]
     if output_format == OutputFormat.json:
-        _output_json(graph, unreachable_graph, root, analysis.bases)
+        _output_json(graph, unreachable_graph, root, package_paths)
     else:
-        _output_text(graph, unreachable_graph, root, analysis.bases)
+        _output_text(graph, unreachable_graph, root, package_paths)
 
     if unreachable_graph.number_of_nodes() > 0:
         raise typer.Exit(1)
@@ -228,12 +229,12 @@ def _output_text(
     graph: nx.MultiDiGraph,
     unreachable: nx.MultiDiGraph,
     root: Path,
-    bases: Sequence[Path],
+    package_paths: Sequence[Path],
 ) -> None:
-    for base in bases:
-        typer.echo(f"\n{base}:")
-        total_counts = _count_nodes(graph, base)
-        unreachable_counts = _count_nodes(unreachable, base)
+    for path in package_paths:
+        typer.echo(f"\n{path}:")
+        total_counts = _count_nodes(graph, path)
+        unreachable_counts = _count_nodes(unreachable, path)
         for kind in sorted(total_counts):
             # Synthetic nodes (entrypoint sentinels, external-dist markers,
             # dunder-all stand-ins) don't represent user-visible
@@ -254,7 +255,7 @@ def _output_text(
         for node in sorted(dead_real, key=lambda n: (str(n.path), n.fqname)):
             typer.echo(f"  {node.fqname} ({node.type}) at {_rel_path(node.path, root)}")
 
-    branches = _dead_suite_locations(graph, bases)
+    branches = _dead_suite_locations(graph, package_paths)
     if branches:
         typer.echo(f"\nUnreachable branches ({len(branches)}):")
         for path, pos in branches:
@@ -275,7 +276,7 @@ def _dead_real(unreachable: nx.MultiDiGraph) -> list[SymbolNode]:
 
 
 def _dead_suite_locations(
-    graph: nx.MultiDiGraph, bases: Sequence[Path]
+    graph: nx.MultiDiGraph, package_paths: Sequence[Path]
 ) -> list[tuple[Path, CodeRange]]:
     """Flatten ``graph.graph["dead_suites"]`` into a sorted ``(path, pos)`` list.
 
@@ -286,7 +287,7 @@ def _dead_suite_locations(
     raw: dict = graph.graph.get("dead_suites", {})
     out: list[tuple[Path, CodeRange]] = []
     for path, suites in raw.items():
-        if not any(path.is_relative_to(b) for b in bases):
+        if not any(path.is_relative_to(p) for p in package_paths):
             continue
         for pos in suites:
             out.append((path, pos))
@@ -298,7 +299,7 @@ def _output_json(
     graph: nx.MultiDiGraph,
     unreachable: nx.MultiDiGraph,
     root: Path,
-    bases: Sequence[Path],
+    package_paths: Sequence[Path],
 ) -> None:
     result: dict = {
         "summary": {},
@@ -306,14 +307,14 @@ def _output_json(
         "unreachable_branches": [],
     }
 
-    for base in bases:
-        base_str = str(base)
-        total_counts = _count_nodes(graph, base)
-        unreachable_counts = _count_nodes(unreachable, base)
+    for path in package_paths:
+        path_str = str(path)
+        total_counts = _count_nodes(graph, path)
+        unreachable_counts = _count_nodes(unreachable, path)
         # Same rationale as the text output: synthetic nodes are reported
         # via ``unreachable_branches`` (and entrypoint sentinels), not as
         # part of the per-kind summary.
-        result["summary"][base_str] = {
+        result["summary"][path_str] = {
             kind: {"total": total_counts[kind], "dead": unreachable_counts.get(kind, 0)}
             for kind in total_counts
             if kind != "synthetic"
@@ -328,7 +329,7 @@ def _output_json(
             }
         )
 
-    for path, pos in _dead_suite_locations(graph, bases):
+    for path, pos in _dead_suite_locations(graph, package_paths):
         result["unreachable_branches"].append(
             {
                 "path": str(_rel_path(path, root)),
@@ -346,7 +347,7 @@ def why_alive(
     fqname: Annotated[str, typer.Argument(help="Fully qualified name of the symbol to check.")],
     path: Annotated[
         list[str] | None,
-        typer.Option("-p", "--path", help="Search path spec: 'base:dep1,dep2' or 'base'."),
+        typer.Option("-p", "--path", help="Search path spec: 'package:dep1,dep2' or 'package'."),
     ] = None,
     resolver: Annotated[
         str | None,
@@ -423,7 +424,7 @@ def dependencies(
     root: Annotated[Path, typer.Argument(help="Root directory to analyze.")],
     path: Annotated[
         list[str] | None,
-        typer.Option("-p", "--path", help="Search path spec: 'base:dep1,dep2' or 'base'."),
+        typer.Option("-p", "--path", help="Search path spec: 'package:dep1,dep2' or 'package'."),
     ] = None,
     resolver: Annotated[
         str | None,
@@ -456,22 +457,23 @@ def dependencies(
         )
         graph = analysis.materialize_all()
 
-    deps_by_base: dict[Path, list[SymbolNode]] = {base: [] for base in analysis.bases}
+    deps_by_package: dict[Path, list[SymbolNode]] = {p.path: [] for p in analysis.packages}
     for node in graph.nodes:
         if not _is_external_dep(node):
             continue
-        if node.path in deps_by_base:
-            deps_by_base[node.path].append(node)
+        if node.path in deps_by_package:
+            deps_by_package[node.path].append(node)
 
     if output_format == OutputFormat.json:
         result = {
-            str(base): sorted(n.fqname for n in nodes) for base, nodes in deps_by_base.items()
+            str(pkg_path): sorted(n.fqname for n in nodes)
+            for pkg_path, nodes in deps_by_package.items()
         }
         typer.echo(json.dumps(result, indent=2))
         return
 
-    for base, nodes in deps_by_base.items():
-        typer.echo(f"\n{base}:")
+    for pkg_path, nodes in deps_by_package.items():
+        typer.echo(f"\n{pkg_path}:")
         if not nodes:
             typer.echo("  (no third-party dependencies found)")
             continue
@@ -492,7 +494,7 @@ def unused_exports(
     ] = None,
     path: Annotated[
         list[str] | None,
-        typer.Option("-p", "--path", help="Search path spec: 'base:dep1,dep2' or 'base'."),
+        typer.Option("-p", "--path", help="Search path spec: 'package:dep1,dep2' or 'package'."),
     ] = None,
     resolver: Annotated[
         str | None,
@@ -583,7 +585,7 @@ def remove(
     ] = None,
     path: Annotated[
         list[str] | None,
-        typer.Option("-p", "--path", help="Search path spec: 'base:dep1,dep2' or 'base'."),
+        typer.Option("-p", "--path", help="Search path spec: 'package:dep1,dep2' or 'package'."),
     ] = None,
     resolver: Annotated[
         str | None,
@@ -650,8 +652,8 @@ def remove(
         typer.echo("Aborted.")
         return
 
-    for base in analysis.bases:
-        remove_code(unreachable_graph, base)
+    for package in analysis.packages:
+        remove_code(unreachable_graph, package.path)
 
     typer.echo("Dead code removed.")
 

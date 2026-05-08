@@ -12,7 +12,7 @@ Two phases:
   just-built :class:`~dead_cst.graph.VisitorPayload`. Returns a new
   payload (or ``None``) whose ``nodes`` / ``edges`` extend the file's
   contribution.
-* :meth:`EdgePlugin.finalize` runs once per base after the analyzer's
+* :meth:`EdgePlugin.finalize` runs once per package after the analyzer's
   edge stitching, with the assembled :class:`PluginContext`. Operates
   purely on the graph -- no CST access -- and emits :class:`GraphOp`
   values (:class:`AddNode` / :class:`AddEdge` / :class:`RemoveEdge`).

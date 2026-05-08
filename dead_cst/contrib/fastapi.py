@@ -16,7 +16,7 @@ returns ``FastAPI(...)``. The plugin reuses those reference edges:
 2. Indirect shape (any variable decorated by ``@X.<route_verb>(...)``)
    is detected via the route-decorator scan. Per-file ``observe``
    emits a ``<fastapi-pending>:<X.fqname>`` marker plus the
-   ``X -> handler`` edges; the per-base ``finalize`` pass walks the
+   ``X -> handler`` edges; the per-package ``finalize`` pass walks the
    graph forward from each pending marker, classifies via
    ``walk_to_instance_kind``, and promotes ``FastAPI`` instances to
    entrypoints.
@@ -160,7 +160,7 @@ class FastAPIPlugin:
         if fastapi_node is None:
             return
 
-        for synth in list(ctx.base_nodes()):
+        for synth in list(ctx.package_nodes()):
             if synth.type != "synthetic" or not synth.fqname.startswith(FASTAPI_PENDING_PREFIX):
                 continue
             successors = list(ctx.graph.successors(synth))

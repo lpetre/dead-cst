@@ -1,17 +1,19 @@
 """Shared types and helpers for edge plugins.
 
 Defines the :class:`EdgePlugin` protocol every plugin satisfies, the
-:class:`PluginContext` plugins receive once per base, the :class:`GraphOp`
-value objects plugins emit, and small utilities (:func:`apply_ops`,
-:func:`synthetic_node`) used by both the analyzer and the plugins.
+:class:`PluginContext` plugins receive once per package, the
+:class:`GraphOp` value objects plugins emit, and small utilities
+(:func:`apply_ops`, :func:`synthetic_node`) used by both the analyzer
+and the plugins.
 
-The plugin pass runs once per base after the analyzer has resolved that
-base's edges. Plugins see the symbol lookup that was valid at that base's
-resolution time (the current base + its dependencies' exports). The
-parsed-module cache on :class:`PluginContext` is request-scope: a file is
-read and parsed on first :meth:`PluginContext.parse` call and the result
-memoized for the rest of the analysis. Warm cache hits in the per-file
-visitor pass deliberately skip parsing entirely, so plugins that need a
+The plugin pass runs once per package after the analyzer has resolved
+that package's edges. Plugins see the symbol lookup that was valid at
+that package's resolution time (the current package + its dependencies'
+exports). The parsed-module cache on :class:`PluginContext` is
+request-scope: a file is read and parsed on first
+:meth:`PluginContext.parse` call and the result memoized for the rest
+of the analysis. Warm cache hits in the per-file visitor pass
+deliberately skip parsing entirely, so plugins that need a
 ``cst.Module`` will pay the parse cost the first time they ask.
 """
 
@@ -37,6 +39,7 @@ from ..graph import NodeFlags, SymbolNode, SymbolTrie
 
 if TYPE_CHECKING:
     from ..graph import VisitorPayload
+    from ..resolvers._core import Package
 
 SYNTHETIC_POSITION = CodeRange(start=CodePosition(0, 0), end=CodePosition(0, 0))
 
@@ -57,15 +60,15 @@ SYNTHETIC_PATH_PREFIXES = (*EXTERNAL_PREFIXES, UNRESOLVED_PREFIX)
 
 @dataclass(slots=True)
 class PluginContext:
-    """Per-base view of the analyzer state passed to every plugin.
+    """Per-package view of the analyzer state passed to every plugin.
 
-    The plugin pass runs once for each base in :attr:`Analysis.bases`
+    The plugin pass runs once for each package in :attr:`Analysis.packages`
     order (deps before dependents wherever the package graph is
-    acyclic). Each
-    invocation gets a fresh context whose ``symbol_lookup`` matches what
-    was visible to that base's import resolution. Plugins should normally
-    scope iteration to :attr:`base` -- :meth:`base_modules` is the easy
-    way -- because :attr:`graph` accumulates nodes across bases.
+    acyclic). Each invocation gets a fresh context whose
+    ``symbol_lookup`` matches what was visible to that package's import
+    resolution. Plugins should normally scope iteration to
+    :attr:`package` -- :meth:`package_modules` is the easy way --
+    because :attr:`graph` accumulates nodes across packages.
 
     :attr:`_modules` is a request-scope memo for :meth:`parse`: nothing
     is pre-populated, so the first plugin that asks for a given file's
@@ -75,7 +78,7 @@ class PluginContext:
 
     graph: nx.DiGraph
     symbol_lookup: SymbolTrie
-    base: Path
+    package: Package
     project_root: Path
     _modules: dict[Path, cst.Module | None] = field(default_factory=dict, repr=False)
     # Lazy ``fqname -> SymbolNode`` index over synthetic nodes (built on
@@ -84,15 +87,15 @@ class PluginContext:
     # is fine in practice -- ``importers`` is for prefiltering against
     # the analyzer's already-resolved dep markers.
     _synthetic_index: dict[str, SymbolNode] | None = field(default=None, init=False, repr=False)
-    # Cached materialization of ``base_modules`` / ``base_nodes``. Plugins
-    # may add nodes during their pass (entrypoint synthetics, etc.) but
-    # those are never re-iterated by these helpers; we snapshot once at
-    # first call to keep iteration cheap when ``graph`` accumulates nodes
-    # across bases.
-    _base_modules_cache: list[tuple[Path, SymbolNode]] | None = field(
+    # Cached materialization of ``package_modules`` / ``package_nodes``.
+    # Plugins may add nodes during their pass (entrypoint synthetics,
+    # etc.) but those are never re-iterated by these helpers; we
+    # snapshot once at first call to keep iteration cheap when ``graph``
+    # accumulates nodes across packages.
+    _package_modules_cache: list[tuple[Path, SymbolNode]] | None = field(
         default=None, init=False, repr=False
     )
-    _base_nodes_cache: list[SymbolNode] | None = field(default=None, init=False, repr=False)
+    _package_nodes_cache: list[SymbolNode] | None = field(default=None, init=False, repr=False)
 
     def find_module(self, fqname: str) -> SymbolNode | None:
         node = self.symbol_lookup._get(fqname.split("."))
@@ -139,32 +142,34 @@ class PluginContext:
             stack.extend(node.children.values())
         return out
 
-    def base_modules(self) -> Iterator[tuple[Path, SymbolNode]]:
-        """Yield ``(path, module_node)`` for every module under :attr:`base`."""
-        if self._base_modules_cache is None:
-            self._base_modules_cache = [
+    def package_modules(self) -> Iterator[tuple[Path, SymbolNode]]:
+        """Yield ``(path, module_node)`` for every module under :attr:`package`."""
+        if self._package_modules_cache is None:
+            package_path = self.package.path
+            self._package_modules_cache = [
                 (node.path, node)
                 for node in self.graph.nodes
-                if node.type == "module" and node.path.is_relative_to(self.base)
+                if node.type == "module" and node.path.is_relative_to(package_path)
             ]
-        return iter(self._base_modules_cache)
+        return iter(self._package_modules_cache)
 
-    def base_nodes(self) -> Iterator[SymbolNode]:
-        """Yield every graph node whose path is under :attr:`base`.
+    def package_nodes(self) -> Iterator[SymbolNode]:
+        """Yield every graph node whose path is under :attr:`package`.
 
-        ``graph`` accumulates nodes across bases; plugins that need to
-        iterate "everything in this base" should use this instead of
-        ``ctx.graph.nodes`` so they don't pay O(N) for nodes belonging
-        to sibling bases.
+        ``graph`` accumulates nodes across packages; plugins that need
+        to iterate "everything in this package" should use this instead
+        of ``ctx.graph.nodes`` so they don't pay O(N) for nodes
+        belonging to sibling packages.
         """
-        if self._base_nodes_cache is None:
-            self._base_nodes_cache = [
-                node for node in self.graph.nodes if node.path.is_relative_to(self.base)
+        if self._package_nodes_cache is None:
+            package_path = self.package.path
+            self._package_nodes_cache = [
+                node for node in self.graph.nodes if node.path.is_relative_to(package_path)
             ]
-        return iter(self._base_nodes_cache)
+        return iter(self._package_nodes_cache)
 
     def importers(self, target: str) -> set[Path]:
-        """Return paths under :attr:`base` whose imports reach ``target``.
+        """Return paths under :attr:`package` whose imports reach ``target``.
 
         ``target`` is matched first as a first-party module fqname
         (e.g. ``pkg.mod``); if no first-party module matches, it is
@@ -192,6 +197,7 @@ class PluginContext:
                     break
         if target_node is None:
             return set()
+        package_path = self.package.path
         return {
             pred.path
             for pred in self.graph.predecessors(target_node)
@@ -199,7 +205,7 @@ class PluginContext:
             # node, every decl inside that module is a predecessor (via
             # the standard ``decl -> module`` edge), but we want
             # *importers* of the module, not its contents.
-            if pred.path != target_node.path and pred.path.is_relative_to(self.base)
+            if pred.path != target_node.path and pred.path.is_relative_to(package_path)
         }
 
     def parse(self, path: Path) -> cst.Module | None:
@@ -232,7 +238,7 @@ class UnresolvedDependencyError(RuntimeError):
     """A plugin needs ``package`` resolved to an installed distribution but
     only the ``[unresolved] <package>`` synthetic exists.
 
-    This means at least one file under the analyzed base does
+    This means at least one file under the analyzed package does
     ``import <package>`` / ``from <package> import ...``, but no resolver
     found the distribution on ``sys.path`` -- typically the user hasn't
     activated their venv (or hasn't run ``uv sync``). The plugin can't
@@ -250,7 +256,7 @@ def require_resolved_dep(ctx: PluginContext, package: str) -> SymbolNode | None:
     * Returns the ``[external dist] <package>`` / ``[external file] <package>``
       node if the analyzer's resolver pinned ``package`` to an installed
       distribution.
-    * Returns ``None`` if no file in this base imports ``package`` (no
+    * Returns ``None`` if no file in this package imports ``package`` (no
       synthetic was created at all). The plugin has nothing to do.
     * Raises :class:`UnresolvedDependencyError` if only the
       ``[unresolved] <package>`` synthetic exists -- the plugin's
@@ -268,7 +274,7 @@ def require_resolved_dep(ctx: PluginContext, package: str) -> SymbolNode | None:
     if ctx._synthetic(f"{UNRESOLVED_PREFIX}{package}") is None:
         return None
     raise UnresolvedDependencyError(
-        f"'{package}' is imported in this base but the analyzer only "
+        f"'{package}' is imported in this package but the analyzer only "
         f"found '[unresolved] {package}'. Activate your project's "
         f"virtual environment (or run `uv sync --all-packages`) so "
         f"'{package}' is importable, then retry."
@@ -316,22 +322,22 @@ class ObserveContext:
     Plugins should keep observe outputs file-local. Cross-file work
     (looking through the assembled symbol graph, resolving factory
     chains, computing transitive subclass closures) belongs in
-    :meth:`EdgePlugin.finalize`, which runs once per base after all
-    files' payloads have been applied and the per-base import edges
+    :meth:`EdgePlugin.finalize`, which runs once per package after all
+    files' payloads have been applied and the per-package import edges
     resolved -- and which never reads CSTs.
     """
 
     path: Path
     module: cst.Module
     payload: "VisitorPayload"
-    base: Path
+    package: Package
     project_root: Path
 
 
 @runtime_checkable
 class EdgePlugin(Cacheable, Protocol):
     """A plugin that contributes nodes/edges per file plus an optional
-    per-base graph-finalize pass.
+    per-package graph-finalize pass.
 
     Two phases:
 
@@ -342,7 +348,7 @@ class EdgePlugin(Cacheable, Protocol):
       result is cached alongside the visitor's payload, so warm runs
       skip both visiting and observing.
 
-    * :meth:`finalize` runs once per base after :func:`resolve_edges`
+    * :meth:`finalize` runs once per package after :func:`resolve_edges`
       has stitched the cross-file import edges. It operates purely on
       the assembled graph -- no CST access -- and emits
       :class:`GraphOp` values. Plugins use this for cross-file work

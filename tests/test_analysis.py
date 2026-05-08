@@ -51,22 +51,22 @@ def test_construction_does_no_filesystem_walk(tmp_path, make_analysis, monkeypat
 
 
 def test_refresh_is_idempotent(tmp_path, make_analysis):
-    """A second :meth:`refresh` over the same bases re-uses the cached spec."""
+    """A second :meth:`refresh` over the same packages re-uses the cached spec."""
     _write(tmp_path, {"pkg/__init__.py": "", "pkg/a.py": "def f(): pass\n"})
     a = make_analysis().refresh()
     contributions_before = dict(a._contributions)
     a.refresh()
     # Same instance objects -- nothing was rebuilt.
-    for base, contrib in contributions_before.items():
-        assert a._contributions[base] is contrib
+    for path, contrib in contributions_before.items():
+        assert a._contributions[path] is contrib
 
 
-def test_refresh_rejects_unknown_base(tmp_path, make_analysis):
-    """Refreshing a base not produced by any resolver errors quickly."""
+def test_refresh_rejects_unknown_package(tmp_path, make_analysis):
+    """Refreshing a package not produced by any resolver errors quickly."""
     _write(tmp_path, {"pkg/__init__.py": ""})
     a = make_analysis()
     with pytest.raises(KeyError):
-        a.refresh(bases=[tmp_path / "nope"])
+        a.refresh(packages=[tmp_path / "nope"])
 
 
 # ---------------------------------------------------------------------------
@@ -140,8 +140,8 @@ def test_cycle_in_deps_is_tolerated(tmp_path, make_analysis):
     The exported subset is typically acyclic, but tests / scripts can
     introduce cycles between packages. The dep traversal -- ``bases``,
     ``reverse_closure``, ``_interesting_set`` -- terminates via the
-    BFS visited set; cycle members appear in :attr:`Analysis.bases` in
-    path order at the end of the iteration.
+    BFS visited set; cycle members appear in :attr:`Analysis.packages`
+    in path order at the end of the iteration.
     """
     a_dir = tmp_path / "a"
     b_dir = tmp_path / "b"
@@ -149,7 +149,7 @@ def test_cycle_in_deps_is_tolerated(tmp_path, make_analysis):
         d.mkdir()
     analysis = make_analysis(["a:b", "b:a"])
 
-    assert set(analysis.bases) == {a_dir, b_dir}
+    assert {p.path for p in analysis.packages} == {a_dir, b_dir}
     assert analysis.reverse_closure(a_dir) == frozenset({a_dir, b_dir})
     assert analysis.reverse_closure(b_dir) == frozenset({a_dir, b_dir})
 
@@ -232,16 +232,16 @@ def test_dep_changes_do_not_invalidate_visitor_cache(tmp_path, make_analysis, mo
     with GraphCache(db) as cache:
         make_analysis(["a", "b"], cache=cache).materialize_all()
 
-    from dead_cst import analyze
+    from dead_cst import _refresh
 
     visited: list[Path] = []
-    real = analyze.SymbolVisitor
+    real = _refresh.SymbolVisitor
 
     def _spy(path, *args, **kwargs):
         visited.append(path)
         return real(path, *args, **kwargs)
 
-    monkeypatch.setattr(analyze, "SymbolVisitor", _spy)
+    monkeypatch.setattr(_refresh, "SymbolVisitor", _spy)
     with GraphCache(db) as cache:
         make_analysis(["a:extra", "b"], cache=cache).materialize_all()
     assert visited == []
