@@ -124,7 +124,7 @@ class ClickPlugin(DecoratedDeclPlugin):
     def _find_names(self, module: cst.Module, imports: dict[str, str]) -> set[str]:
         """Find Click groups, including nested ``@<known_group>.group(...)``.
 
-        First pass: the base's decorator + constructor scan. Second
+        First pass: the package's decorator + constructor scan. Second
         pass (fixpoint): ``@<known_group>.group(...)`` produces a new
         group, which can then own further sub-groups. Iterate until
         stable so a chain of ``@cli.group() -> @admin.group() -> ...``

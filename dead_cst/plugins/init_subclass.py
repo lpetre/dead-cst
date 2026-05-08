@@ -16,7 +16,7 @@ Two phases:
   imports + locals, it also emits a ``<subclass-of:base_fqname>``
   marker plus an edge from that marker to ``C``.
 
-* :meth:`finalize` (per-base) walks the assembled graph: for every
+* :meth:`finalize` (per-package) walks the assembled graph: for every
   ``<__init_subclass__>:`` marker ``M`` on parent ``P``, it BFSes the
   ``<subclass-of:>`` graph keyed by ``P.fqname`` to compute the
   transitive subclass closure and emits ``M -> sub`` edges for each
@@ -157,7 +157,7 @@ class InitSubclassPlugin:
 
         # BFS subclass closure rooted at each parent's fqname; emit
         # ``marker -> sub`` for every transitive class scoped to the
-        # current base. Direct subclasses are graph.successors of
+        # current package. Direct subclasses are graph.successors of
         # ``<subclass-of:parent.fqname>``; their own fqnames key further
         # buckets, recursively.
         for parent, marker in init_markers:
@@ -173,7 +173,7 @@ class InitSubclassPlugin:
                         continue
                     seen.add(sub)
                     stack.append(sub)
-                    if not sub.path.is_relative_to(ctx.base):
+                    if not sub.path.is_relative_to(ctx.package.path):
                         continue
                     if sub in existing_targets[marker]:
                         continue

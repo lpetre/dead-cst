@@ -9,9 +9,35 @@ two versions.
 
 ## [Unreleased]
 
+### Changed
+- **Breaking:** the analyzer's "base" terminology has been renamed to
+  "package" everywhere it referred to a `Package` (the unit of
+  workspace membership). On `Analysis`, `bases` is now `packages`
+  (returning `tuple[Package, ...]` in BFS order; the previous
+  `packages` resolver-order tuple is gone), `refresh(bases=)` is now
+  `refresh(packages=)`, `reverse_closure(base)` /
+  `materialize_closure(base)` rename their parameter to `package`,
+  and `Analysis.package(base)` takes `path`. `PackageView.base` is
+  now `PackageView.package` (a `Package`) with a `.path` convenience
+  property. On `PluginContext` and `ObserveContext`, the `base: Path`
+  field is now `package: Package` (use `ctx.package.path` for the
+  directory); `PluginContext.base_modules()` /
+  `PluginContext.base_nodes()` are now `package_modules()` /
+  `package_nodes()`. Out-of-tree plugins and resolver consumers must
+  update accordingly.
+- Per-file refresh logic moved from `dead_cst/analyze.py` into a new
+  `dead_cst/_refresh.py` (file enumeration, stale detection, the
+  worker pool, payload application, and per-package contribution
+  build). `analyze.py` keeps cross-package composition, reachability,
+  and the public `Analysis` / `PackageView` classes. Tests that
+  monkey-patched `analyze.SymbolVisitor` /
+  `analyze.ProcessPoolExecutor` should now patch the same names on
+  `dead_cst._refresh`.
+
 ### Added
 - Progress reporting around the per-file visitor pass ("Parsing
-  files") and the cross-base composition pass ("Reconciling bases")
+  files") and the cross-package composition pass ("Reconciling
+  packages")
   in `Analysis.refresh` / `Analysis._materialize`. On a TTY the user
   sees a live `tqdm` bar; off a TTY (pytest capture, pipes, agent
   harnesses) the same wrapper emits one newline-terminated checkpoint

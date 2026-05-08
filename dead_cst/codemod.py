@@ -104,7 +104,7 @@ def remove_code(G: nx.Graph, base: Path) -> None:
     ``G`` is typically the unreachable subgraph of the graph from
     :func:`build_symbol_graph`; only the nodes are inspected, edges are
     ignored. Symbols whose path is not under ``base`` are skipped, so call
-    once per base when analysing several packages together. The
+    once per package when analysing several packages together. The
     transformation is destructive -- back the files up first, or run on a
     clean working tree.
     """

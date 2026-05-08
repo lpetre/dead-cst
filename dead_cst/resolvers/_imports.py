@@ -262,7 +262,7 @@ def clear_path_caches() -> None:
     :func:`distribution_lookup` / :func:`editable_distribution_roots`
     key on ``()`` -- all three read live ``sys.path`` (or
     :mod:`importlib.metadata` against it). Anything mutating
-    ``sys.path`` (the analyzer's per-base rebind, a resolver splicing
+    ``sys.path`` (the analyzer's per-package rebind, a resolver splicing
     in its own venv) must call this to keep the next lookup honest.
     """
     safe_resolve_module.cache_clear()

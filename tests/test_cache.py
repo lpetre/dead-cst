@@ -361,16 +361,16 @@ def test_warm_run_skips_visitor(tmp_path, make_analysis, monkeypatch):
     with GraphCache(db) as cache:
         make_analysis(cache=cache).materialize_all()
 
-    from dead_cst import analyze
+    from dead_cst import _refresh
 
     calls = []
-    real = analyze.SymbolVisitor
+    real = _refresh.SymbolVisitor
 
     def _spy(*args, **kwargs):
         calls.append(args)
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(analyze, "SymbolVisitor", _spy)
+    monkeypatch.setattr(_refresh, "SymbolVisitor", _spy)
     with GraphCache(db) as cache:
         make_analysis(cache=cache).materialize_all()
     assert calls == []
@@ -380,7 +380,7 @@ def test_warm_run_with_plugins_parses_zero_files(tmp_path, make_analysis, monkey
     """A warm run with the full builtin plugin set never parses any file."""
     import libcst as cst
 
-    from dead_cst import analyze
+    from dead_cst import _refresh
     from dead_cst.plugins import (
         ClickPlugin,
         FastAPIPlugin,
@@ -432,10 +432,10 @@ def test_warm_run_with_plugins_parses_zero_files(tmp_path, make_analysis, monkey
     wrapper_calls: list[object] = []
     parse_calls: list[object] = []
     fqn_calls: list[object] = []
-    real_visitor = analyze.SymbolVisitor
-    real_wrapper = analyze.MetadataWrapper
+    real_visitor = _refresh.SymbolVisitor
+    real_wrapper = _refresh.MetadataWrapper
     real_parse = cst.parse_module
-    real_gen_cache = analyze.FixedFullyQualifiedNameProvider.gen_cache
+    real_gen_cache = _refresh.FixedFullyQualifiedNameProvider.gen_cache
 
     def _visitor_spy(*args, **kwargs):
         visitor_calls.append(args)
@@ -453,10 +453,12 @@ def test_warm_run_with_plugins_parses_zero_files(tmp_path, make_analysis, monkey
         fqn_calls.append(args)
         return real_gen_cache(*args, **kwargs)
 
-    monkeypatch.setattr(analyze, "SymbolVisitor", _visitor_spy)
-    monkeypatch.setattr(analyze, "MetadataWrapper", _wrapper_spy)
+    monkeypatch.setattr(_refresh, "SymbolVisitor", _visitor_spy)
+    monkeypatch.setattr(_refresh, "MetadataWrapper", _wrapper_spy)
     monkeypatch.setattr(cst, "parse_module", _parse_spy)
-    monkeypatch.setattr(analyze.FixedFullyQualifiedNameProvider, "gen_cache", classmethod(_fqn_spy))
+    monkeypatch.setattr(
+        _refresh.FixedFullyQualifiedNameProvider, "gen_cache", classmethod(_fqn_spy)
+    )
 
     with GraphCache(db) as cache:
         make_analysis(plugins=plugins, cache=cache).materialize_all()
@@ -483,16 +485,16 @@ def test_edited_file_re_runs_visitor(tmp_path, make_analysis, monkeypatch):
 
     (tmp_path / "pkg" / "a.py").write_text("def f(): return 1\n")
 
-    from dead_cst import analyze
+    from dead_cst import _refresh
 
     visited: list[Path] = []
-    real = analyze.SymbolVisitor
+    real = _refresh.SymbolVisitor
 
     def _spy(path, *args, **kwargs):
         visited.append(path)
         return real(path, *args, **kwargs)
 
-    monkeypatch.setattr(analyze, "SymbolVisitor", _spy)
+    monkeypatch.setattr(_refresh, "SymbolVisitor", _spy)
     with GraphCache(db) as cache:
         make_analysis(cache=cache).materialize_all()
 
@@ -519,16 +521,16 @@ def test_resolver_change_does_not_invalidate_cache(tmp_path, make_analysis, monk
     with GraphCache(db) as cache:
         make_analysis(cache=cache).materialize_all()
 
-    from dead_cst import analyze
+    from dead_cst import _refresh
 
     visited: list[Path] = []
-    real = analyze.SymbolVisitor
+    real = _refresh.SymbolVisitor
 
     def _spy(path, *args, **kwargs):
         visited.append(path)
         return real(path, *args, **kwargs)
 
-    monkeypatch.setattr(analyze, "SymbolVisitor", _spy)
+    monkeypatch.setattr(_refresh, "SymbolVisitor", _spy)
     with GraphCache(db) as cache:
         make_analysis(resolver=ManualResolver(specs=[]), cache=cache).materialize_all()
     assert visited == []
@@ -585,16 +587,16 @@ def test_plugin_version_bump_invalidates_cache(tmp_path, make_analysis, monkeypa
     bumped = MainBlockPlugin()
     bumped.version = "2"
 
-    from dead_cst import analyze
+    from dead_cst import _refresh
 
     visited: list[Path] = []
-    real = analyze.SymbolVisitor
+    real = _refresh.SymbolVisitor
 
     def _spy(path, *args, **kwargs):
         visited.append(path)
         return real(path, *args, **kwargs)
 
-    monkeypatch.setattr(analyze, "SymbolVisitor", _spy)
+    monkeypatch.setattr(_refresh, "SymbolVisitor", _spy)
     with GraphCache(db) as cache:
         make_analysis(plugins=[bumped], cache=cache).materialize_all()
     assert {p.name for p in visited} == {"__init__.py", "m.py"}

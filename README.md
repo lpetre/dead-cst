@@ -102,8 +102,8 @@ dead-cst unused-exports ROOT -e ENTRYPOINT [OPTIONS]
 
 ### `dead-cst dependencies`
 
-List third-party dependencies imported by the codebase. Each base path gets its
-own section. Distributions are reported as `[external dist] <name>`; files
+List third-party dependencies imported by the codebase. Each package
+gets its own section. Distributions are reported as `[external dist] <name>`; files
 resolved inside `site-packages` without a matching distribution are reported as
 `[external file] <name>`.
 
@@ -172,15 +172,15 @@ analysis = Analysis(
 for node in analysis.dead():
     print(f"dead: {node.fqname} ({node.type}) at {node.path}")
 
-# Per-package queries scope work to the smallest base set that gives
+# Per-package queries scope work to the smallest package set that gives
 # correct reachability answers. Local queries (modules, declarations)
-# never materialize cross-base state.
+# never materialize cross-package state.
 pkg = analysis.package(root)
 print(sum(1 for _ in pkg.modules()), "modules")
-pkg.remove_dead_code()  # codemod, scoped to this base
+pkg.remove_dead_code()  # codemod, scoped to this package
 ```
 
-`Analysis(...).materialize_all()` returns the full `networkx.MultiDiGraph` if you need raw access; `analysis.package(base).graph()` returns the closure-scoped subgraph for one package.
+`Analysis(...).materialize_all()` returns the full `networkx.MultiDiGraph` if you need raw access; `analysis.package(path).graph()` returns the closure-scoped subgraph for one package.
 
 All three extension points — edge plugins, path resolvers, and the unreachable-region detector — share a single `Cacheable` protocol (`name: str`, `version: int`). The core `SymbolVisitor` carries the same pair, so visitor-level changes get an explicit knob too. Only the visitor / plugin / detector triple feeds the per-file cache fingerprint — bumping any of those `version`s invalidates stale payloads automatically. Resolvers also implement `Cacheable`, but their output flows through the (uncached) edge-stitching pass instead, so swapping or upgrading a resolver re-stitches edges without invalidating cached payloads. The package `__version__` is intentionally *not* in the fingerprint: every component whose output can shift between releases owns a dedicated `version`, and folding in `__version__` would let unbumped components ride for free on a release bump.
 

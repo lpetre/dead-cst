@@ -227,7 +227,7 @@ class LiteralListPlugin:
 
     def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]:
         prefix = self._synth_prefix()
-        for node in ctx.base_nodes():
+        for node in ctx.package_nodes():
             if node.type != "synthetic" or not node.fqname.startswith(prefix):
                 continue
             captured = node.fqname[len(prefix) :]

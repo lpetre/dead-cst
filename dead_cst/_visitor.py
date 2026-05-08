@@ -278,7 +278,7 @@ class SymbolVisitor(cst.CSTVisitor):
         classifies the target (first-party vs stdlib / external dist /
         external file / unresolved) and may rewrite the
         ``(module, decl)`` split to canonical form once it has the
-        per-base trie + resolver in hand. This keeps the visitor pass
+        per-package trie + resolver in hand. This keeps the visitor pass
         purely a function of the file's source, so the per-file cache
         survives changes to ``search_paths`` and the resolver chain.
         """
