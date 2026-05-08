@@ -2,7 +2,7 @@
 
 :class:`SymbolNode` is what every node in the graph
 :func:`dead_cst.analyze.build_symbol_graph` returns is. :class:`Import`
-captures a cross-file reference at visitor time, before the per-base
+captures a cross-file reference at visitor time, before the per-package
 edge stitcher resolves it. :class:`NodeFlags` and :class:`EdgeFlags`
 mark structural attributes (``SHADOWED`` decls, ``DEAD_BRANCH`` edges,
 explicit ``ENTRYPOINT``\\s).
@@ -75,10 +75,29 @@ class EdgeFlags(enum.IntFlag):
 
 @dataclass(frozen=True, slots=True)
 class Import:
-    path: Path | str
+    """Raw, pre-resolution record of one cross-file reference.
+
+    Every field is what the source code literally said: ``module`` is
+    the dotted name written in the ``from <module> import ...`` (or
+    ``import <module>``) clause -- no submodule-vs-name disambiguation
+    has happened yet. The edge stitcher
+    (:func:`dead_cst._edges.resolve_edges`) is the single place that
+    classifies the target (first-party module, decl in a module,
+    submodule, stdlib, external dist, ...) and may rewrite ``module`` /
+    ``decl`` to the canonical ``deepest-module + remainder`` split.
+
+    ``speculative`` is set on the synthetic star imports
+    :class:`~dead_cst._visitor.SymbolVisitor` produces for
+    ``__import__(name, fromlist=[...])`` / ``importlib.import_module``
+    fromlist entries that may or may not be submodules. The stitcher
+    silently drops a speculative entry when neither the trie nor the
+    resolver can place it; non-speculative imports warn instead.
+    """
+
     module: str
     decl: str | None = None
     star: bool = False
+    speculative: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,8 +128,10 @@ class VisitorPayload:
       ``dead_suites`` to decide whether the resulting graph edge gets
       :data:`EdgeFlags.DEAD_BRANCH`.
     * ``imports`` -- ``(src, Import, access_pos)`` triples for
-      unresolved cross-file references. The apply step feeds them into
-      ``resolve_edges`` along with the derived flag.
+      cross-file references. Each :class:`Import` carries only the
+      raw dotted names from source; classification + canonicalization
+      happen in :func:`dead_cst._edges.resolve_edges`, which the
+      apply step feeds along with the derived flag.
     * ``dead_suites`` -- positions of every statically-dead suite in
       the file (including ones with no outgoing references). Used both
       for flag derivation and for surfacing "this file has unreachable

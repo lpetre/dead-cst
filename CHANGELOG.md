@@ -9,6 +9,38 @@ two versions.
 
 ## [Unreleased]
 
+### Changed
+- **Breaking:** the analyzer's "base" terminology has been renamed to
+  "package" everywhere it referred to a `Package` (the unit of
+  workspace membership). On `Analysis`, `bases` is now `packages`
+  (returning `tuple[Package, ...]` in BFS order; the previous
+  `packages` resolver-order tuple is gone), `refresh(bases=)` is now
+  `refresh(packages=)`, `reverse_closure(base)` /
+  `materialize_closure(base)` rename their parameter to `package`,
+  and `Analysis.package(base)` takes `path`. `PackageView.base` is
+  now `PackageView.package` (a `Package`) with a `.path` convenience
+  property. On `PluginContext` and `ObserveContext`, the `base: Path`
+  field is now `package: Package` (use `ctx.package.path` for the
+  directory); `PluginContext.base_modules()` /
+  `PluginContext.base_nodes()` are now `package_modules()` /
+  `package_nodes()`. `remove_code(G, base)` is now
+  `remove_code(G, package_path)`, and
+  `dead_cst.resolvers.exported_roots(base)` is now
+  `exported_roots(package_path)`. Out-of-tree plugins and resolver
+  consumers must update accordingly.
+- The CLI's `-p` / `--path` spec is now described as
+  `'package:dep1,dep2' or 'package'` (formerly
+  `'base:dep1,dep2' or 'base'`). The parsing rules are unchanged --
+  same syntax, clearer name -- so existing scripts keep working.
+- Per-file refresh logic moved from `dead_cst/analyze.py` into a new
+  `dead_cst/_refresh.py` (file enumeration, stale detection, the
+  worker pool, payload application, and per-package contribution
+  build). `analyze.py` keeps cross-package composition, reachability,
+  and the public `Analysis` / `PackageView` classes. Tests that
+  monkey-patched `analyze.SymbolVisitor` /
+  `analyze.ProcessPoolExecutor` should now patch the same names on
+  `dead_cst._refresh`.
+
 ### Added
 - `.pyi` stub files are now ingested by the analyzer and rewritten by
   the codemod. Stubs are discovered alongside `.py` siblings and parsed
@@ -33,6 +65,108 @@ two versions.
   preserves them as long as the impl is alive. Combined with the
   `.pyi` ingest above, runtime impls in `.py` automatically anchor
   overload stubs in the matching `.pyi`.
+- Progress reporting around the per-file visitor pass ("Parsing
+  files") and the cross-package composition pass ("Reconciling
+  packages")
+  in `Analysis.refresh` / `Analysis._materialize`. On a TTY the user
+  sees a live `tqdm` bar; off a TTY (pytest capture, pipes, agent
+  harnesses) the same wrapper emits one newline-terminated checkpoint
+  at 0%, every ~10%, and at 100%, so CI logs and LLM tool consumers
+  can track long runs without `tqdm`'s `\r`-overwriting frames going
+  to mush. `tqdm>=4.66` is now a hard runtime dependency.
+- New plugin helpers re-exported from `dead_cst.plugins`: `module_node`,
+  `dotted_parts`, `dotted_name`, `string_value`,
+  `payload_imports_module`. They consolidate boilerplate every contrib
+  plugin used to inline (lookup the per-file module node, walk
+  attribute chains, evaluate string literals, scan payload imports).
+- New `DispatchAppPlugin` base in `dead_cst.plugins.decl_shapes` for
+  CLI-style dispatch apps (`X = App(); @X.command(...)`). `TyperPlugin`
+  and `CycloptsPlugin` are now thin subclasses configuring the module,
+  constructor, and registration-decorator names.
+
+### Fixed
+- `dead-cst unused-exports` no longer matches variables whose names
+  merely end with the literal `__all__` (e.g. `pkg.foo__all__`); only
+  variables actually named `__all__` are considered.
+
+### Changed
+- **Breaking:** `compute_fingerprint` no longer takes a `base: Path`
+  argument. The visitor's output is purely a function of the file's
+  source plus the plugin / detector chain, so the analysis fingerprint
+  is now a single value shared across every base. Callers should drop
+  the `base=` keyword from any `compute_fingerprint(...)` invocation;
+  per-file cache rows continue to gate on the analysis-wide fingerprint
+  the same way they previously gated on the per-base one.
+- File parsing is now flow-based rather than partitioned per base.
+  `Analysis.refresh` walks each requested base's tree, collapses every
+  base's cache misses into one global stale-file list, and runs the
+  visitor + observe pass once across the whole batch. Multi-base
+  refreshes that previously paid for one worker pool startup per base
+  now pay for one total.
+- The package dependency graph is no longer represented as a
+  `networkx.DiGraph`, and `Package.deps` may now contain cycles.
+  `Analysis.bases` BFS-walks forward from no-dep packages through
+  the precomputed consumer reverse map (so dependencies precede
+  their consumers when the graph is acyclic, and any cycle-trapped
+  packages get appended in path order); `reverse_closure` walks the
+  same consumer map from a single seed; `_interesting_set` walks
+  the dep map from `reverse_closure`'s result. All three share one
+  `_bfs_order` helper whose visited-set guard makes them cycle-safe,
+  and their results memoize on `Analysis` so repeated `PackageView`
+  queries share the cost. Tolerating cycles lets a package with an
+  acyclic exported subset list cyclic dev/test deps without
+  hand-splitting them out.
+- **Breaking:** `Analysis` no longer accepts a pre-built `paths` mapping.
+  The constructor now takes `project_root` as the first argument and a
+  required `resolver=` keyword argument (singular -- there is no
+  resolver chain). Callers that used to write
+  `Analysis({base: deps}, ...)` should switch to
+  `Analysis(base, resolver=ManualResolver(specs=["."]), ...)` (or
+  whichever resolver describes their layout). The CLI's `-p` / `--path`
+  and `--resolver` flags are mutually exclusive, and `--resolver` takes
+  a single value.
+- **Breaking:** `PathResolver.resolve()` now returns
+  `tuple[Package, ...]` instead of a `dict[Path, list[Path]]`
+  (`PathMap`). `Package` is a frozen dataclass carrying `path`,
+  `name` (unique within an analysis), `exported` (subdirs visible to
+  consumers; empty means "no restriction"), and `deps` (other
+  packages by name). The `PathMap` type alias and `merge_paths`
+  re-export are gone; `Analysis` validates a single resolver's output
+  internally. Resolvers no longer represent non-package search paths
+  (workspace `.venv/site-packages`, vendored bundles) in
+  `Package.deps`; `UvResolver` splices the workspace venv onto
+  `sys.path` lazily inside its own `resolve_import` instead.
+- **Breaking:** `Analysis.paths` is replaced by `Analysis.packages`,
+  which returns the `tuple[Package, ...]` the analysis was built
+  with. The previous `Analysis.packages()` iterator (yielding one
+  `PackageView` per base) is renamed to `Analysis.views()` to free
+  the name for the new data attribute.
+- **Breaking:** `UvWorkspaceResolver` is renamed to `UvResolver`, the
+  CLI resolver name `uv_workspace` is renamed to `uv`, and the module
+  moved from `dead_cst/contrib/uv_workspace.py` to
+  `dead_cst/contrib/uv.py`. The `name` field bumps to `"uv"` so cached
+  per-base fingerprints rebuild automatically.
+- **Breaking:** the CLI helper `resolve_paths` is replaced by
+  `build_resolver`, which returns a single `PathResolver`. Callers
+  (and the CLI itself) read the package list back from
+  `Analysis.packages` after construction.
+
+### Removed
+- **Breaking:** `VenvResolver` and `PyprojectResolver` are removed,
+  along with the `--resolver venv` and `--resolver pyproject` CLI
+  names. `MissingVenvError` is also no longer part of the resolver
+  surface; `UvResolver` raises its own `dead_cst.contrib.uv.MissingVenvError`
+  when the workspace's shared `.venv` is missing. Use `-p src` (the
+  CLI's `ManualResolver`) for the old `pyproject` `src/` shortcut.
+
+### Added
+- `dead_cst.resolvers.Package`, the frozen dataclass every resolver
+  now emits.
+- `dead_cst.resolvers.clear_path_caches`, a one-call helper that
+  drops the three `sys.path`-derived LRU caches
+  (`safe_resolve_module`, `distribution_lookup`,
+  `editable_distribution_roots`). Custom resolvers that mutate
+  `sys.path` should call it instead of clearing each cache by hand.
 - New primary API: `dead_cst.Analysis` and `dead_cst.PackageView`,
   the lazy entry point that callers should reach for on large repos.
   Construction is cheap (no filesystem walk, no parsing). `refresh()`
@@ -66,25 +200,58 @@ two versions.
   loadable via `--plugin mock_patch`.
 
 ### Changed
+- **Breaking (visitor / cache / `Import` shape):** Cross-file import
+  resolution moved out of the per-file visitor and into the edge
+  stitcher (`dead_cst._edges.resolve_edges`). Consequences:
+  - `dead_cst.graph.Import` drops `path: Path | str` and gains
+    `speculative: bool = False` (set on the synthetic star imports
+    the visitor produces for `__import__(name, fromlist=[...])`
+    fromlist entries; the stitcher silently drops a speculative
+    entry when neither the trie nor the resolver places it).
+    Plugins that consumed `Import.path` should switch to
+    `Import.module` (and pair it with `ctx.find_module` /
+    `ctx.importers` if they need a resolved target).
+  - `compute_fingerprint` no longer takes `search_paths=` /
+    `resolvers=`. The per-file fingerprint covers only the visitor /
+    plugin / detector versions plus the base path; resolver swaps
+    and search-path changes re-stitch edges on the next analysis
+    without invalidating any cached `VisitorPayload` blobs.
+  - `SymbolVisitor.__init__` no longer takes `search_paths` or
+    `import_resolver`; the visitor is purely a function of the
+    file's source. `resolve_edges` gained
+    `import_resolver=` / `search_paths=` keyword arguments for the
+    trie-miss classification path.
+  - `Analysis._materialize` now rebinds `sys.path` to each base's
+    `(base, *deps)` view before composing it (and clears the
+    resolver LRUs at every transition), restoring the original
+    `sys.path` on the way out. Workers in the parallel visitor pass
+    no longer touch `sys.path` at all -- the cost moves from O(files)
+    to O(bases).
+  - `from p import functions` (where `functions` is a submodule of
+    `p`) now produces edges to `p.functions` only when the access
+    path canonicalizes to that module; the previous shape sometimes
+    pointed at the parent package instead. Reachability is
+    unchanged; the only observable difference is which intermediate
+    module appears in the edge set.
+  - Visitor `version` bumped (cache wipes on first run).
 - **Breaking (cache API):** `compute_fingerprint` is now per-base
-  (`base=`, `search_paths=`) rather than per-project (`paths=`).
-  Each cache row carries its own fingerprint, so changing one base's
-  search paths or plugins no longer invalidates sibling bases'
-  cached payloads. `GraphCache(db_path)` no longer takes a
-  fingerprint at open time; `get` and `put` take it per call.
-  Schema version bumped to 2; older databases auto-wipe on first
-  open. The CLI is unaffected -- `Analysis` computes per-base
-  fingerprints internally.
-- `_order_paths` now returns only the keys of the `PathMap`. Search
-  paths that aren't themselves keys (e.g. a venv `site-packages`
-  directory listed for resolver lookup) are no longer silently
-  promoted to bases and are never walked. Pass them as keys
-  explicitly if you want their files visited.
+  (`base=`) rather than per-project (`paths=`). Each cache row
+  carries its own fingerprint, so changing one base's plugins no
+  longer invalidates sibling bases' cached payloads.
+  `GraphCache(db_path)` no longer takes a fingerprint at open time;
+  `get` and `put` take it per call. Schema version bumped to 2;
+  older databases auto-wipe on first open. The CLI is unaffected --
+  `Analysis` computes per-base fingerprints internally.
+- `_order_packages` (formerly `_order_paths`) returns only the
+  paths of `Package` records the resolvers emit. Search paths that
+  aren't themselves packages (e.g. a workspace's
+  `.venv/site-packages`) are never walked; resolvers that need them
+  during classification handle that inside their `resolve_import`.
 - `PluginContext`, `ObserveContext`, and the `AddNode` / `AddEdge` /
   `RemoveEdge` graph-op value objects now use `__slots__`, as do the
-  analyzer-internal `_BaseSpec` / `_Task` / `_RunnerState` records,
-  shaving a per-instance `__dict__` off objects allocated per file
-  and per emitted op.
+  analyzer-internal `_BaseSpec` / `_Task` records, shaving a
+  per-instance `__dict__` off objects allocated per file and per
+  emitted op.
 
 ### Removed
 - **Breaking (top-level API):** `build_symbol_graph`, `find_reachable`,

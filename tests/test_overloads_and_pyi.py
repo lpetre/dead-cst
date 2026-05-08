@@ -6,7 +6,7 @@ import textwrap
 
 import pytest
 
-from dead_cst import Analysis, NodeFlags
+from dead_cst import NodeFlags
 from dead_cst.analyze import _find_reachable as find_reachable
 from dead_cst.codemod import remove_code
 from dead_cst.plugins import ExplicitEntrypointPlugin, PyiStubPlugin
@@ -17,7 +17,7 @@ def _normalise(s: str) -> str:
     return s[1:] if s.startswith("\n") else s
 
 
-def test_overload_decls_are_flagged_and_anchored_to_impl(tmp_path):
+def test_overload_decls_are_flagged_and_anchored_to_impl(tmp_path, make_analysis):
     src = """
     from typing import overload
 
@@ -31,7 +31,7 @@ def test_overload_decls_are_flagged_and_anchored_to_impl(tmp_path):
     f(1)
     """
     (tmp_path / "mod.py").write_text(_normalise(src))
-    graph = Analysis({tmp_path: []}).materialize_all()
+    graph = make_analysis().materialize_all()
 
     f_decls = sorted(
         (n for n in graph.nodes if n.type == "function" and n.fqname == "mod.f"),
@@ -45,17 +45,14 @@ def test_overload_decls_are_flagged_and_anchored_to_impl(tmp_path):
     assert len(impls) == 1
     impl = impls[0]
     # Last def in source is the live impl, earlier are overloads.
-    assert (
-        impl.position.start.line > all_overload.position.start.line
-        if (all_overload := overloads[0])
-        else True
-    )
+    for ov in overloads:
+        assert impl.position.start.line > ov.position.start.line
     # impl -> each overload edge so they share lifetime.
     successors = list(graph.successors(impl))
     assert all(o in successors for o in overloads)
 
 
-def test_overloads_are_excluded_from_cross_module_lookup(tmp_path):
+def test_overloads_are_excluded_from_cross_module_lookup(tmp_path, make_analysis):
     """``from mod import f`` must reach the impl, never an overload."""
     (tmp_path / "mod.py").write_text(
         _normalise(
@@ -70,7 +67,7 @@ def test_overloads_are_excluded_from_cross_module_lookup(tmp_path):
         )
     )
     (tmp_path / "main.py").write_text("from mod import f\nf(1)\n")
-    graph = Analysis({tmp_path: []}).materialize_all()
+    graph = make_analysis().materialize_all()
 
     main_f_import = next(n for n in graph.nodes if n.fqname == "main.f")
     targets = [
@@ -82,7 +79,7 @@ def test_overloads_are_excluded_from_cross_module_lookup(tmp_path):
     )
 
 
-def test_dead_overloads_are_removed_with_impl(tmp_path):
+def test_dead_overloads_are_removed_with_impl(tmp_path, make_analysis):
     """When the impl is dead, the codemod removes the overloads alongside it."""
     (tmp_path / "mod.py").write_text(
         _normalise(
@@ -101,7 +98,7 @@ def test_dead_overloads_are_removed_with_impl(tmp_path):
             """
         )
     )
-    graph = Analysis({tmp_path: []}).materialize_all()
+    graph = make_analysis().materialize_all()
     for node in graph.nodes:
         if node.fqname == "mod.keep":
             graph.nodes[node]["entrypoint"] = True
@@ -115,7 +112,7 @@ def test_dead_overloads_are_removed_with_impl(tmp_path):
     assert "def keep" in rewritten
 
 
-def test_live_overloads_survive_codemod(tmp_path):
+def test_live_overloads_survive_codemod(tmp_path, make_analysis):
     """When the impl is alive, the overloads are kept too."""
     (tmp_path / "mod.py").write_text(
         _normalise(
@@ -131,7 +128,7 @@ def test_live_overloads_survive_codemod(tmp_path):
             """
         )
     )
-    a = Analysis({tmp_path: []}, plugins=[ExplicitEntrypointPlugin(specs=["mod.f"])])
+    a = make_analysis(plugins=[ExplicitEntrypointPlugin(specs=["mod.f"])])
     graph = a.materialize_all()
     reachable = find_reachable(graph)
     unreachable = graph.subgraph([n for n in graph.nodes if n not in reachable]).copy()
@@ -142,18 +139,18 @@ def test_live_overloads_survive_codemod(tmp_path):
     assert rewritten.count("@overload") == 2
 
 
-def test_pyi_module_gets_distinct_fqn(tmp_path):
+def test_pyi_module_gets_distinct_fqn(tmp_path, make_analysis):
     """Same-named ``.py`` and ``.pyi`` coexist under disjoint FQNs."""
     (tmp_path / "mod.py").write_text("def f(x):\n    return x\n")
     (tmp_path / "mod.pyi").write_text("def f(x: int) -> int: ...\n")
 
-    graph = Analysis({tmp_path: []}).materialize_all()
+    graph = make_analysis().materialize_all()
     fqnames = {n.fqname for n in graph.nodes if n.type == "module"}
     assert "mod" in fqnames
     assert "mod.__pyi__" in fqnames
 
 
-def test_pyi_decls_track_runtime_lifetime(tmp_path):
+def test_pyi_decls_track_runtime_lifetime(tmp_path, make_analysis):
     """A ``.pyi`` decl is alive iff its ``.py`` twin is alive."""
     (tmp_path / "mod.py").write_text(
         _normalise(
@@ -174,8 +171,7 @@ def test_pyi_decls_track_runtime_lifetime(tmp_path):
             """
         )
     )
-    a = Analysis(
-        {tmp_path: []},
+    a = make_analysis(
         plugins=[
             PyiStubPlugin(),
             ExplicitEntrypointPlugin(specs=["mod.alive"]),
@@ -194,7 +190,7 @@ def test_pyi_decls_track_runtime_lifetime(tmp_path):
     assert dead_stub not in reachable, "stub for dead runtime decl should be dead"
 
 
-def test_pyi_overloads_removed_with_dead_runtime_impl(tmp_path):
+def test_pyi_overloads_removed_with_dead_runtime_impl(tmp_path, make_analysis):
     """Dead runtime impl drags its ``.pyi`` overloads into deletion."""
     (tmp_path / "mod.py").write_text(
         _normalise(
@@ -222,8 +218,7 @@ def test_pyi_overloads_removed_with_dead_runtime_impl(tmp_path):
             """
         )
     )
-    a = Analysis(
-        {tmp_path: []},
+    a = make_analysis(
         plugins=[
             PyiStubPlugin(),
             ExplicitEntrypointPlugin(specs=["mod.keep"]),
@@ -239,7 +234,7 @@ def test_pyi_overloads_removed_with_dead_runtime_impl(tmp_path):
 
 
 @pytest.mark.parametrize("decorator", ["overload", "typing.overload"])
-def test_overload_recognized_under_alternate_decorator_forms(tmp_path, decorator):
+def test_overload_recognized_under_alternate_decorator_forms(tmp_path, make_analysis, decorator):
     src = (
         "import typing\n" if "." in decorator else "from typing import overload\n"
     ) + textwrap.dedent(
@@ -251,7 +246,7 @@ def test_overload_recognized_under_alternate_decorator_forms(tmp_path, decorator
             """
     ).lstrip()
     (tmp_path / "mod.py").write_text(src)
-    graph = Analysis({tmp_path: []}).materialize_all()
+    graph = make_analysis().materialize_all()
     overloads = [
         n
         for n in graph.nodes

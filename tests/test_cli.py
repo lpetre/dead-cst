@@ -18,6 +18,7 @@ import textwrap
 from pathlib import Path
 
 import pytest
+import typer
 from libcst.metadata import CodePosition, CodeRange
 from typer.testing import CliRunner
 
@@ -30,7 +31,7 @@ from dead_cst.plugins import (
 from dead_cst.plugins._core import EXTERNAL_DIST_PREFIX
 from dead_cst.plugins.explicit_entrypoint import EXPLICIT_PREFIX
 from dead_cst.graph import SymbolNode
-from dead_cst.resolvers import ManualResolver
+from dead_cst.resolvers import ManualResolver, UvResolver
 from dead_cst.cli import (
     _dead_real,
     _is_dunder_all,
@@ -38,8 +39,8 @@ from dead_cst.cli import (
     _rel_path,
     app,
     build_plugins,
+    build_resolver,
     parse_entrypoint,
-    resolve_paths,
     setup_logging,
 )
 
@@ -83,7 +84,7 @@ def _pos() -> CodeRange:
 
 
 # ---------------------------------------------------------------------------
-# Pure helpers -- parse_entrypoint, parse_paths, resolve_paths
+# Pure helpers -- parse_entrypoint, build_resolver
 # ---------------------------------------------------------------------------
 
 
@@ -113,64 +114,71 @@ def test_parse_entrypoint_re_prefix_with_empty_pattern():
 
 
 def test_manual_resolver_empty_specs(tmp_path):
-    assert ManualResolver(specs=[]).resolve(tmp_path) == {}
+    assert ManualResolver(specs=[]).resolve(tmp_path) == ()
 
 
 @pytest.mark.parametrize(
-    "specs, expected_keys, expected_deps",
+    "specs, expected_packages",
     [
-        pytest.param(["src"], ["src"], {"src": []}, id="base-only"),
+        pytest.param(["src"], {"src": ()}, id="base-only"),
         pytest.param(
             ["src:dep1,dep2"],
-            ["src"],
-            {"src": ["dep1", "dep2"]},
-            id="base-with-deps",
+            {"src": ("dep1", "dep2"), "dep1": (), "dep2": ()},
+            id="base-with-deps-auto-promoted",
         ),
         pytest.param(
             ["src: dep1 , dep2 "],
-            ["src"],
-            {"src": ["dep1", "dep2"]},
+            {"src": ("dep1", "dep2"), "dep1": (), "dep2": ()},
             id="dep-whitespace-stripped",
         ),
         pytest.param(
             ["src:dep1,"],
-            ["src"],
-            {"src": ["dep1"]},
+            {"src": ("dep1",), "dep1": ()},
             id="trailing-comma-drops-empty-dep",
         ),
         pytest.param(
             ["src:dep1", "lib"],
-            ["src", "lib"],
-            {"src": ["dep1"], "lib": []},
+            {"src": ("dep1",), "dep1": (), "lib": ()},
             id="multiple-specs-merged",
         ),
     ],
 )
-def test_manual_resolver_parses_specs(tmp_path, specs, expected_keys, expected_deps):
+def test_manual_resolver_parses_specs(tmp_path, specs, expected_packages):
     result = ManualResolver(specs=specs).resolve(tmp_path)
-    assert list(result) == [tmp_path / k for k in expected_keys]
-    for key, deps in expected_deps.items():
-        assert result[tmp_path / key] == [tmp_path / d for d in deps]
+    by_name = {p.name: p for p in result}
+    assert set(by_name) == set(expected_packages)
+    for name, deps in expected_packages.items():
+        assert by_name[name].deps == deps
+        assert by_name[name].path == (tmp_path / name).resolve()
 
 
-def test_resolve_paths_no_specs_no_resolvers_returns_root(tmp_path):
-    paths, resolvers = resolve_paths(tmp_path, [], [])
-    assert paths == {tmp_path: []}
-    assert resolvers == []
+def test_build_resolver_no_specs_no_name_returns_default_manual():
+    """With neither ``-p`` nor ``--resolver``, falls back to a
+    :class:`ManualResolver` rooted at the project root itself."""
+    resolver = build_resolver([], None)
+    assert isinstance(resolver, ManualResolver)
+    assert resolver.specs == ["."]
 
 
-def test_resolve_paths_explicit_specs_only(tmp_path):
-    (tmp_path / "src").mkdir()
-    paths, resolvers = resolve_paths(tmp_path, ["src"], [])
-    assert paths == {tmp_path / "src": []}
-    # ``-p`` flows through a ManualResolver so its ``resolve_import``
-    # is part of the chain alongside any named resolvers.
-    assert [r.name for r in resolvers] == ["manual"]
+def test_build_resolver_explicit_specs_only():
+    resolver = build_resolver(["src"], None)
+    assert isinstance(resolver, ManualResolver)
+    assert resolver.specs == ["src"]
 
 
-def test_resolve_paths_unknown_resolver_raises(tmp_path):
+def test_build_resolver_named_resolver_only():
+    resolver = build_resolver([], "uv")
+    assert isinstance(resolver, UvResolver)
+
+
+def test_build_resolver_unknown_resolver_raises():
     with pytest.raises(KeyError):
-        resolve_paths(tmp_path, [], ["does-not-exist"])
+        build_resolver([], "does-not-exist")
+
+
+def test_build_resolver_path_and_name_are_mutually_exclusive():
+    with pytest.raises(typer.BadParameter, match="mutually exclusive"):
+        build_resolver(["src"], "uv")
 
 
 # ---------------------------------------------------------------------------

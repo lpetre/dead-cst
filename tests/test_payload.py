@@ -29,7 +29,7 @@ from pathlib import Path
 
 from libcst.metadata import CodePosition, CodeRange, FullRepoManager
 
-from dead_cst import Analysis, EdgeFlags, NodeFlags
+from dead_cst import EdgeFlags, NodeFlags
 from dead_cst._fqn import FixedFullyQualifiedNameProvider
 from dead_cst.graph import SymbolNode
 from dead_cst._visitor import SymbolVisitor
@@ -85,7 +85,7 @@ def _payload_from_source(tmp_path: Path, src: str) -> tuple[VisitorPayload, Path
     file.write_text(textwrap.dedent(src).strip() + "\n")
     mgr = FullRepoManager(str(tmp_path), [str(file)], {FixedFullyQualifiedNameProvider})
     wrapper = mgr.get_metadata_wrapper_for_path(str(file))
-    visitor = SymbolVisitor(file, [tmp_path], wrapper=wrapper)
+    visitor = SymbolVisitor(file, wrapper=wrapper)
     wrapper.visit(visitor)
     return visitor.to_payload(), file
 
@@ -175,7 +175,7 @@ def test_payload_edge_carries_access_pos(tmp_path):
         assert isinstance(pos, CodeRange)
 
 
-def test_apply_flags_dead_branch_edges(tmp_path, write_files):
+def test_apply_flags_dead_branch_edges(make_analysis, write_files):
     """End-to-end: refs inside dead suites land with ``DEAD_BRANCH``."""
     write_files(
         {
@@ -189,7 +189,7 @@ def test_apply_flags_dead_branch_edges(tmp_path, write_files):
             """,
         }
     )
-    graph = Analysis({tmp_path: []}).materialize_all()
+    graph = make_analysis().materialize_all()
     helper = next(n for n in graph.nodes if n.fqname == "pkg.a.helper")
     module = next(n for n in graph.nodes if n.fqname == "pkg.a")
 
@@ -236,7 +236,7 @@ def test_payload_pickle_round_trip(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_shadowed_decl_in_graph_keeps_consistent_identity(tmp_path, write_files):
+def test_shadowed_decl_in_graph_keeps_consistent_identity(make_analysis, write_files):
     """Shadowed decl + edges referencing it share one graph node.
 
     The risk of mishandled remapping is two graph nodes for one
@@ -260,7 +260,7 @@ def test_shadowed_decl_in_graph_keeps_consistent_identity(tmp_path, write_files)
             """,
         }
     )
-    g = Analysis({tmp_path: []}).materialize_all()
+    g = make_analysis().materialize_all()
     shadowed = [n for n in g.nodes if n.flags & NodeFlags.SHADOWED]
     assert len(shadowed) == 1
     s = shadowed[0]
@@ -273,7 +273,7 @@ def test_shadowed_decl_in_graph_keeps_consistent_identity(tmp_path, write_files)
     assert flagged_matches == [s]
 
 
-def test_dead_suites_exposed_on_graph(tmp_path, write_files):
+def test_dead_suites_exposed_on_graph(tmp_path, make_analysis, write_files):
     """``graph.graph['dead_suites']`` lists positions per analyzed file."""
     write_files(
         {
@@ -284,7 +284,7 @@ def test_dead_suites_exposed_on_graph(tmp_path, write_files):
             """,
         }
     )
-    g = Analysis({tmp_path: []}).materialize_all()
+    g = make_analysis().materialize_all()
     suites = g.graph["dead_suites"]
     file = tmp_path / "pkg" / "a.py"
     assert file in suites

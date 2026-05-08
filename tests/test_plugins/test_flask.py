@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-from dead_cst import Analysis
 from dead_cst.plugins import FlaskPlugin
 
 
-def test_flask_plugin_marks_route_handlers(tmp_path, write_files, reachable_fqnames):
+def test_flask_plugin_marks_route_handlers(make_analysis, write_files, reachable_fqnames):
     write_files(
         {
             "app/__init__.py": "",
@@ -37,11 +36,7 @@ def test_flask_plugin_marks_route_handlers(tmp_path, write_files, reachable_fqna
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[FlaskPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[FlaskPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "app.main.app" in reached
     assert "app.main.list_items" in reached
@@ -55,7 +50,7 @@ def test_flask_plugin_marks_route_handlers(tmp_path, write_files, reachable_fqna
 
 
 def test_flask_plugin_marks_lifecycle_and_template_helpers(
-    tmp_path, write_files, reachable_fqnames
+    make_analysis, write_files, reachable_fqnames
 ):
     write_files(
         {
@@ -103,11 +98,7 @@ def test_flask_plugin_marks_lifecycle_and_template_helpers(
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[FlaskPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[FlaskPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "app.main.before" in reached
     assert "app.main.after" in reached
@@ -123,7 +114,9 @@ def test_flask_plugin_marks_lifecycle_and_template_helpers(
     assert "app.main.make_shell_context" in reached
 
 
-def test_flask_plugin_keeps_handler_dependencies_alive(tmp_path, write_files, reachable_fqnames):
+def test_flask_plugin_keeps_handler_dependencies_alive(
+    make_analysis, write_files, reachable_fqnames
+):
     write_files(
         {
             "app/__init__.py": "",
@@ -149,11 +142,7 @@ def test_flask_plugin_keeps_handler_dependencies_alive(tmp_path, write_files, re
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[FlaskPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[FlaskPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "app.main.get_item" in reached
     # Symbols transitively referenced from the handler stay alive
@@ -163,7 +152,7 @@ def test_flask_plugin_keeps_handler_dependencies_alive(tmp_path, write_files, re
     assert "app.models.Unused" not in reached
 
 
-def test_flask_plugin_ignores_bare_decorators(tmp_path, write_files, reachable_fqnames):
+def test_flask_plugin_ignores_bare_decorators(make_analysis, write_files, reachable_fqnames):
     write_files(
         {
             "pkg/__init__.py": "",
@@ -180,17 +169,13 @@ def test_flask_plugin_ignores_bare_decorators(tmp_path, write_files, reachable_f
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[FlaskPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[FlaskPlugin()]).materialize_all()
     # Bare ``@route`` (no attribute access) is not a Flask registration --
     # matching it would clobber unrelated decorators with the same name.
     assert "pkg.mod.looks_like_route" not in reachable_fqnames(graph)
 
 
-def test_flask_plugin_ignores_unrelated_decorators(tmp_path, write_files, reachable_fqnames):
+def test_flask_plugin_ignores_unrelated_decorators(make_analysis, write_files, reachable_fqnames):
     write_files(
         {
             "pkg/__init__.py": "",
@@ -207,15 +192,11 @@ def test_flask_plugin_ignores_unrelated_decorators(tmp_path, write_files, reacha
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[FlaskPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[FlaskPlugin()]).materialize_all()
     assert "pkg.mod.not_a_route" not in reachable_fqnames(graph)
 
 
-def test_flask_plugin_unused_blueprint_stays_dead(tmp_path, write_files, reachable_fqnames):
+def test_flask_plugin_unused_blueprint_stays_dead(make_analysis, write_files, reachable_fqnames):
     write_files(
         {
             "app/__init__.py": "",
@@ -229,11 +210,7 @@ def test_flask_plugin_unused_blueprint_stays_dead(tmp_path, write_files, reachab
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[FlaskPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[FlaskPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     # No Flask app reaches this blueprint, so it (and its handler) are dead.
     assert "app.routes.bp" not in reached
@@ -241,7 +218,7 @@ def test_flask_plugin_unused_blueprint_stays_dead(tmp_path, write_files, reachab
 
 
 def test_flask_plugin_blueprint_reachable_via_register_blueprint(
-    tmp_path, write_files, reachable_fqnames
+    make_analysis, write_files, reachable_fqnames
 ):
     write_files(
         {
@@ -266,11 +243,7 @@ def test_flask_plugin_blueprint_reachable_via_register_blueprint(
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[FlaskPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[FlaskPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "app.main.app" in reached
     assert "app.routes.bp" in reached
@@ -278,7 +251,7 @@ def test_flask_plugin_blueprint_reachable_via_register_blueprint(
     assert "app.routes.things" in reached
 
 
-def test_flask_plugin_handles_aliased_class_import(tmp_path, write_files, reachable_fqnames):
+def test_flask_plugin_handles_aliased_class_import(make_analysis, write_files, reachable_fqnames):
     write_files(
         {
             "app/__init__.py": "",
@@ -292,15 +265,11 @@ def test_flask_plugin_handles_aliased_class_import(tmp_path, write_files, reacha
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[FlaskPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[FlaskPlugin()]).materialize_all()
     assert "app.main.index" in reachable_fqnames(graph)
 
 
-def test_flask_plugin_handles_module_import(tmp_path, write_files, reachable_fqnames):
+def test_flask_plugin_handles_module_import(make_analysis, write_files, reachable_fqnames):
     write_files(
         {
             "app/__init__.py": "",
@@ -314,15 +283,11 @@ def test_flask_plugin_handles_module_import(tmp_path, write_files, reachable_fqn
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[FlaskPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[FlaskPlugin()]).materialize_all()
     assert "app.main.index" in reachable_fqnames(graph)
 
 
-def test_flask_plugin_handles_annotated_assignment(tmp_path, write_files, reachable_fqnames):
+def test_flask_plugin_handles_annotated_assignment(make_analysis, write_files, reachable_fqnames):
     write_files(
         {
             "app/__init__.py": "",
@@ -336,15 +301,13 @@ def test_flask_plugin_handles_annotated_assignment(tmp_path, write_files, reacha
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[FlaskPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[FlaskPlugin()]).materialize_all()
     assert "app.main.index" in reachable_fqnames(graph)
 
 
-def test_flask_plugin_does_nothing_without_flask_imports(tmp_path, write_files, reachable_fqnames):
+def test_flask_plugin_does_nothing_without_flask_imports(
+    make_analysis, write_files, reachable_fqnames
+):
     write_files(
         {
             "pkg/__init__.py": "",
@@ -361,16 +324,12 @@ def test_flask_plugin_does_nothing_without_flask_imports(tmp_path, write_files, 
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[FlaskPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[FlaskPlugin()]).materialize_all()
     # ``app`` here is not a Flask instance -- no ``flask`` import in scope.
     assert "pkg.mod.looks_like_route" not in reachable_fqnames(graph)
 
 
-def test_flask_plugin_ignores_import_star(tmp_path, write_files, reachable_fqnames):
+def test_flask_plugin_ignores_import_star(make_analysis, write_files, reachable_fqnames):
     """``from flask import *`` doesn't bind ``Flask`` for the plugin's
     purposes. The ``import *`` analyzer logic is pessimistic enough on
     its own; the plugin shouldn't infer Flask wiring from a star import."""
@@ -387,16 +346,12 @@ def test_flask_plugin_ignores_import_star(tmp_path, write_files, reachable_fqnam
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[FlaskPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[FlaskPlugin()]).materialize_all()
     assert "app.main.index" not in reachable_fqnames(graph)
 
 
 def test_flask_plugin_does_nothing_when_flask_not_installed(
-    tmp_path, write_files, reachable_fqnames
+    make_analysis, write_files, reachable_fqnames
 ):
     """If no file imports ``flask``, the plugin's import-graph prefilter
     short-circuits before touching any module."""
@@ -408,16 +363,12 @@ def test_flask_plugin_does_nothing_when_flask_not_installed(
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[FlaskPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[FlaskPlugin()]).materialize_all()
     assert "pkg.mod.index" not in reachable_fqnames(graph)
 
 
 def test_flask_plugin_ignores_relative_imports_and_unrelated_names(
-    tmp_path, write_files, reachable_fqnames
+    make_analysis, write_files, reachable_fqnames
 ):
     """Imports that look superficially like ``flask`` -- relative imports,
     sibling packages, non-``Flask`` names from ``flask`` -- shouldn't make
@@ -436,17 +387,13 @@ def test_flask_plugin_ignores_relative_imports_and_unrelated_names(
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[FlaskPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[FlaskPlugin()]).materialize_all()
     # No Flask app or Blueprint anywhere -> helper stays dead.
     assert "app.main.helper" not in reachable_fqnames(graph)
 
 
 def test_flask_plugin_ignores_non_decorator_assignment_shapes(
-    tmp_path, write_files, reachable_fqnames
+    make_analysis, write_files, reachable_fqnames
 ):
     """Multi-target assignments, tuple unpacks, bare annotations, and
     nested attribute decorators all bypass the plugin's wiring rules."""
@@ -489,11 +436,7 @@ def test_flask_plugin_ignores_non_decorator_assignment_shapes(
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[FlaskPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[FlaskPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     # The real app + its ``index`` route are kept alive.
     assert "app.main.app" in reached
@@ -508,7 +451,7 @@ def test_flask_plugin_ignores_non_decorator_assignment_shapes(
     assert "app.main.late" not in reached
 
 
-def test_flask_plugin_module_prefixed_unknown_attr(tmp_path, write_files, reachable_fqnames):
+def test_flask_plugin_module_prefixed_unknown_attr(make_analysis, write_files, reachable_fqnames):
     """``flask.SomethingElse(...)`` should not be classified as Flask/Blueprint."""
     write_files(
         {
@@ -524,18 +467,14 @@ def test_flask_plugin_module_prefixed_unknown_attr(tmp_path, write_files, reacha
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[FlaskPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[FlaskPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "app.main.index" in reached
     # ``cfg`` is not classified as a Flask/Blueprint instance and stays dead.
     assert "app.main.cfg" not in reached
 
 
-def test_flask_plugin_handles_factory_function(tmp_path, write_files, reachable_fqnames):
+def test_flask_plugin_handles_factory_function(make_analysis, write_files, reachable_fqnames):
     """The canonical Flask factory pattern: ``def create_app(): return Flask(__name__)``."""
     write_files(
         {
@@ -559,11 +498,7 @@ def test_flask_plugin_handles_factory_function(tmp_path, write_files, reachable_
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[FlaskPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[FlaskPlugin()]).materialize_all()
     from dead_cst.analyze import _find_reachable as find_reachable
 
     reached = {n.fqname for n in find_reachable(graph) if n.type != "synthetic"}
@@ -573,7 +508,7 @@ def test_flask_plugin_handles_factory_function(tmp_path, write_files, reachable_
 
 
 def test_flask_plugin_factory_returning_blueprint_stays_dead(
-    tmp_path, write_files, reachable_fqnames
+    make_analysis, write_files, reachable_fqnames
 ):
     """Factory-produced Blueprint is treated like a literal Blueprint --
     never auto-seeded as an entrypoint, so an unregistered one stays dead."""
@@ -593,17 +528,13 @@ def test_flask_plugin_factory_returning_blueprint_stays_dead(
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[FlaskPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[FlaskPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "app.routes.bp" not in reached
     assert "app.routes.orphan" not in reached
 
 
-def test_flask_plugin_ignores_non_app_flask_users(tmp_path, write_files, reachable_fqnames):
+def test_flask_plugin_ignores_non_app_flask_users(make_analysis, write_files, reachable_fqnames):
     """Variables that touch ``flask`` for unrelated reasons stay dead.
 
     Walking only to the ``flask`` synthetic isn't enough -- the plugin
@@ -631,11 +562,7 @@ def test_flask_plugin_ignores_non_app_flask_users(tmp_path, write_files, reachab
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[FlaskPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[FlaskPlugin()]).materialize_all()
     assert "pkg.mod.handler" not in reachable_fqnames(graph)
 
 

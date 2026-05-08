@@ -8,7 +8,7 @@ A `src/`-layout package whose live entrypoint is the console script declared in
 reportkit = "reportkit.cli:main"
 ```
 
-This example demonstrates two plugins and one path resolver:
+This example demonstrates two plugins:
 
 - `ProjectScriptsPlugin` reads `[project.scripts]` and treats each target as
   an entrypoint. It keeps `reportkit.cli.main` -- and everything `main`
@@ -16,15 +16,16 @@ This example demonstrates two plugins and one path resolver:
 - `ModuleDundersPlugin` (always on) keeps the `__all__` variable in
   `reportkit/renderer.py` from being reported as a dead variable. It also
   preserves any other module-level dunder (e.g. `__version__`).
-- `PyprojectResolver` notices the `src/` directory and feeds it to
-  `build_symbol_graph` as the analysis base, so `reportkit.cli` resolves to
-  `src/reportkit/cli.py`.
+
+The `src/` directory is the analysis base; pass it via the explicit
+`-p` flag (the CLI's `ManualResolver`) so `reportkit.cli` resolves to
+`src/reportkit/cli.py`.
 
 ## Run the analysis
 
 ```bash
 uv run dead-cst analyze examples/scripts-and-all \
-    --resolver pyproject --plugin project_scripts
+    -p src --plugin project_scripts
 ```
 
 Expected output:
@@ -47,15 +48,6 @@ Dead symbols (4):
 The `variable: 1 total` line is `reportkit.renderer.__all__`; note that it is
 *not* in the dead list because `ModuleDundersPlugin` flagged it as an
 entrypoint.
-
-## Equivalent invocation without the resolver
-
-If you'd rather pass the search path explicitly instead of relying on
-`PyprojectResolver`:
-
-```bash
-uv run dead-cst analyze examples/scripts-and-all -p src --plugin project_scripts
-```
 
 ## Note on `__all__` re-exports
 

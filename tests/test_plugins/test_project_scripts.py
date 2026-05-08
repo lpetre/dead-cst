@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-from dead_cst import Analysis
 from dead_cst.plugins import ProjectScriptsPlugin
 
 
-def test_project_scripts_plugin(tmp_path, write_files, reachable_fqnames):
+def test_project_scripts_plugin(make_analysis, write_files, reachable_fqnames):
     write_files(
         {
             "pkg/__init__.py": "",
@@ -19,9 +18,5 @@ def test_project_scripts_plugin(tmp_path, write_files, reachable_fqnames):
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[ProjectScriptsPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[ProjectScriptsPlugin()]).materialize_all()
     assert "pkg.cli.main" in reachable_fqnames(graph)

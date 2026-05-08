@@ -31,6 +31,7 @@ from dead_cst.analyze import _find_reachable as find_reachable
 from dead_cst.cache import GraphCache
 from dead_cst.cli import app
 from dead_cst.plugins import MainBlockPlugin, ModuleDundersPlugin
+from dead_cst.resolvers import ManualResolver
 
 from ._flux0_plugins import Flux0CliCommandsPlugin, Flux0InternalModulesPlugin
 
@@ -142,7 +143,9 @@ def _module_node(graph, fqname):
 
 
 def _build_graph(base: Path, *plugins):
-    return Analysis({base: []}, plugins=list(plugins), project_root=base).materialize_all()
+    return Analysis(
+        base, resolver=ManualResolver(specs=["."]), plugins=list(plugins)
+    ).materialize_all()
 
 
 def test_flux0_cli_cmds_dead_without_plugin(flux0_cli_src):
@@ -309,14 +312,16 @@ def test_flux0_internal_modules_survives_cache_round_trip(flux0_server_src, tmp_
         ModuleDundersPlugin(),
         Flux0InternalModulesPlugin(),
     ]
-    paths = {base: []}
     cache_path = tmp_path / "cache.sqlite"
 
     dead_sets = []
     for _ in range(2):
         with GraphCache(cache_path) as cache:
             graph = Analysis(
-                paths, plugins=plugins, project_root=base, cache=cache
+                base,
+                resolver=ManualResolver(specs=["."]),
+                plugins=plugins,
+                cache=cache,
             ).materialize_all()
         reachable = find_reachable(graph)
         dead_sets.append(

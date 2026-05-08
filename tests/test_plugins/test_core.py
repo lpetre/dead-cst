@@ -11,7 +11,6 @@ import networkx as nx
 import pytest
 from libcst.metadata import CodePosition, CodeRange
 
-from dead_cst import Analysis
 from dead_cst.analyze import _find_reachable as find_reachable
 from dead_cst.plugins import MainBlockPlugin, ProjectScriptsPlugin
 from dead_cst.plugins._core import (
@@ -29,15 +28,16 @@ from dead_cst.plugins._core import (
     single_target_assignment,
 )
 from dead_cst.graph import SymbolNode, SymbolTrie
+from dead_cst.resolvers import Package
 
 
-def test_no_plugins_means_nothing_reachable(tmp_path, write_files):
+def test_no_plugins_means_nothing_reachable(make_analysis, write_files):
     write_files({"pkg/__init__.py": "", "pkg/a.py": "def f(): pass"})
-    graph = Analysis({tmp_path: []}).materialize_all()
+    graph = make_analysis().materialize_all()
     assert find_reachable(graph) == set()
 
 
-def test_plugins_compose(tmp_path, write_files, reachable_fqnames):
+def test_plugins_compose(make_analysis, write_files, reachable_fqnames):
     write_files(
         {
             "pkg/__init__.py": "",
@@ -55,11 +55,7 @@ def test_plugins_compose(tmp_path, write_files, reachable_fqnames):
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[MainBlockPlugin(), ProjectScriptsPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[MainBlockPlugin(), ProjectScriptsPlugin()]).materialize_all()
     assert {"pkg.runner", "pkg.cli", "pkg.cli.main"} <= reachable_fqnames(graph)
 
 
@@ -85,7 +81,12 @@ def _ctx_with_synthetic(fqname: str, base: Path) -> PluginContext:
         position=CodeRange(start=CodePosition(0, 0), end=CodePosition(0, 0)),
     )
     graph.add_node(node)
-    return PluginContext(graph=graph, symbol_lookup=SymbolTrie(), base=base, project_root=base)
+    return PluginContext(
+        graph=graph,
+        symbol_lookup=SymbolTrie(),
+        package=Package(path=base, name="pkg"),
+        project_root=base,
+    )
 
 
 def test_require_resolved_dep_returns_external_dist(tmp_path):
@@ -353,46 +354,46 @@ def test_find_call_assignments_ignores_non_call_rhs():
 
 
 # ---------------------------------------------------------------------------
-# PluginContext: base_modules() caches its first scan
+# PluginContext: package_modules() caches its first scan
 # ---------------------------------------------------------------------------
 
 
-def test_plugin_context_base_modules_caches_first_scan(tmp_path):
-    base = tmp_path
-    inside = SymbolNode("pkg.a", "module", base / "a.py", _pos())
+def test_plugin_context_package_modules_caches_first_scan(tmp_path):
+    pkg = Package(path=tmp_path, name="pkg")
+    inside = SymbolNode("pkg.a", "module", tmp_path / "a.py", _pos())
     outside = SymbolNode("other.b", "module", tmp_path.parent / "other.py", _pos())
     graph = nx.DiGraph()
     graph.add_node(inside)
     graph.add_node(outside)
 
-    ctx = PluginContext(graph=graph, symbol_lookup=SymbolTrie(), base=base, project_root=base)
-    first = list(ctx.base_modules())
+    ctx = PluginContext(graph=graph, symbol_lookup=SymbolTrie(), package=pkg, project_root=tmp_path)
+    first = list(ctx.package_modules())
     assert first == [(inside.path, inside)]
 
     # Adding a module-typed node after the first call must not appear -- the
     # cache is intentional, so plugins see a stable snapshot.
-    late = SymbolNode("pkg.late", "module", base / "late.py", _pos())
+    late = SymbolNode("pkg.late", "module", tmp_path / "late.py", _pos())
     graph.add_node(late)
-    second = list(ctx.base_modules())
+    second = list(ctx.package_modules())
     assert second == first
 
 
-def test_plugin_context_base_nodes_filters_to_base_and_caches(tmp_path):
-    base = tmp_path
-    inside_mod = SymbolNode("pkg", "module", base / "__init__.py", _pos())
-    inside_fn = SymbolNode("pkg.f", "function", base / "a.py", _pos())
+def test_plugin_context_package_nodes_filters_and_caches(tmp_path):
+    pkg = Package(path=tmp_path, name="pkg")
+    inside_mod = SymbolNode("pkg", "module", tmp_path / "__init__.py", _pos())
+    inside_fn = SymbolNode("pkg.f", "function", tmp_path / "a.py", _pos())
     outside = SymbolNode("other.b", "module", tmp_path.parent / "other.py", _pos())
     graph = nx.DiGraph()
     for n in (inside_mod, inside_fn, outside):
         graph.add_node(n)
 
-    ctx = PluginContext(graph=graph, symbol_lookup=SymbolTrie(), base=base, project_root=base)
-    first = sorted(ctx.base_nodes(), key=lambda n: n.fqname)
+    ctx = PluginContext(graph=graph, symbol_lookup=SymbolTrie(), package=pkg, project_root=tmp_path)
+    first = sorted(ctx.package_nodes(), key=lambda n: n.fqname)
     assert first == [inside_mod, inside_fn]
 
     # Cached: nodes added after the first scan don't appear, even when their
-    # path is under ``base``.
-    late = SymbolNode("pkg.late", "function", base / "late.py", _pos())
+    # path is under ``package.path``.
+    late = SymbolNode("pkg.late", "function", tmp_path / "late.py", _pos())
     graph.add_node(late)
-    second = sorted(ctx.base_nodes(), key=lambda n: n.fqname)
+    second = sorted(ctx.package_nodes(), key=lambda n: n.fqname)
     assert second == first

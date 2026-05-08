@@ -32,10 +32,10 @@ though both members have a top-level `tests/` package.
 
 ```bash
 uv run dead-cst analyze examples/uv-workspace \
-    --resolver uv_workspace --plugin main_block
+    --resolver uv --plugin main_block
 ```
 
-The `uv_workspace` resolver reads `uv.lock`, treats every `[[package]]` with
+The `uv` resolver reads `uv.lock`, treats every `[[package]]` with
 `source = { editable = "..." }` as a workspace member, and wires each
 member's source root together using uv's resolved dependency graph. The
 above command is roughly equivalent to:
@@ -90,12 +90,11 @@ The two `tests` modules are distinct nodes (one per file path) and
 coexist in the graph; `exported_roots` keeps them from colliding during
 import resolution.
 
-## How `UvWorkspaceResolver` decides on a source root
+## How `UvResolver` decides on a source root
 
 For each workspace member directory, the resolver picks `<member>/src` if
-that directory exists, otherwise the member directory itself. This matches
-`PyprojectResolver`'s single-package convention and covers both the
-`src/`-layout and the flat layout.
+that directory exists, otherwise the member directory itself. This covers
+both the `src/`-layout and the flat layout.
 
 Direct dependency edges come from each member's `dependencies = [...]` list
 in `uv.lock`; non-workspace deps (regular PyPI packages) are dropped because
@@ -113,5 +112,5 @@ If you don't want to commit a `uv.lock`, the multi-`-p` invocation above
 keeps working unchanged. Note that explicit `-p` paths skip
 `exported_roots` discovery; if you have multiple flat-layout members with
 overlapping internal packages (`tests/`, `scripts/`, etc.), prefer the
-`uv_workspace` resolver so each member's exports are inferred from its
+`uv` resolver so each member's exports are inferred from its
 build backend.

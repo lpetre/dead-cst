@@ -9,9 +9,7 @@ Pins the lazy / scoped behavior promised by the new entry-point API:
 * :meth:`Analysis.materialize_all` produces the same graph as
   :func:`build_symbol_graph`,
 * per-base ``dead`` answers are equal to the slice of the full ``dead``
-  set restricted to that base,
-* the per-base cache fingerprint isolates sibling bases (changing one
-  base's deps does not invalidate other bases' rows).
+  set restricted to that base.
 """
 
 from __future__ import annotations
@@ -21,7 +19,6 @@ from pathlib import Path
 
 import pytest
 
-from dead_cst import Analysis
 from dead_cst.cache import CACHE_DIR_NAME, GraphCache
 from dead_cst.plugins import ExplicitEntrypointPlugin
 
@@ -38,7 +35,7 @@ def _write(root: Path, files: dict[str, str]) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_construction_does_no_filesystem_walk(tmp_path, monkeypatch):
+def test_construction_does_no_filesystem_walk(tmp_path, make_analysis, monkeypatch):
     """Constructing :class:`Analysis` must not touch disk."""
     _write(tmp_path, {"pkg/__init__.py": "", "pkg/a.py": "def f(): pass\n"})
     rglob_calls: list[Path] = []
@@ -49,27 +46,27 @@ def test_construction_does_no_filesystem_walk(tmp_path, monkeypatch):
         return real(self, pattern)
 
     monkeypatch.setattr(Path, "rglob", _spy)
-    Analysis({tmp_path: []})
+    make_analysis()
     assert rglob_calls == []
 
 
-def test_refresh_is_idempotent(tmp_path):
-    """A second :meth:`refresh` over the same bases re-uses the cached spec."""
+def test_refresh_is_idempotent(tmp_path, make_analysis):
+    """A second :meth:`refresh` over the same packages re-uses the cached spec."""
     _write(tmp_path, {"pkg/__init__.py": "", "pkg/a.py": "def f(): pass\n"})
-    a = Analysis({tmp_path: []}).refresh()
+    a = make_analysis().refresh()
     contributions_before = dict(a._contributions)
     a.refresh()
     # Same instance objects -- nothing was rebuilt.
-    for base, contrib in contributions_before.items():
-        assert a._contributions[base] is contrib
+    for path, contrib in contributions_before.items():
+        assert a._contributions[path] is contrib
 
 
-def test_refresh_rejects_unknown_base(tmp_path):
-    """Refreshing a base that wasn't in ``paths`` errors quickly."""
+def test_refresh_rejects_unknown_package(tmp_path, make_analysis):
+    """Refreshing a package not produced by any resolver errors quickly."""
     _write(tmp_path, {"pkg/__init__.py": ""})
-    a = Analysis({tmp_path: []})
+    a = make_analysis()
     with pytest.raises(KeyError):
-        a.refresh(bases=[tmp_path / "nope"])
+        a.refresh(packages=[tmp_path / "nope"])
 
 
 # ---------------------------------------------------------------------------
@@ -77,43 +74,42 @@ def test_refresh_rejects_unknown_base(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_package_modules_local_only(tmp_path):
+def test_package_modules_local_only(tmp_path, make_analysis):
     """:meth:`PackageView.modules` returns this base's modules only."""
     base_a = tmp_path / "a"
     base_b = tmp_path / "b"
     _write(base_a, {"pkg/__init__.py": "", "pkg/m.py": "def f(): pass\n"})
     _write(base_b, {"pkg/__init__.py": "", "pkg/m.py": "def g(): pass\n"})
-    a = Analysis({base_a: [], base_b: []})
+    a = make_analysis(["a", "b"])
     pkg_a = a.package(base_a)
     a_paths = {n.path for n in pkg_a.modules()}
     assert a_paths == {(base_a / "pkg" / "__init__.py"), (base_a / "pkg" / "m.py")}
 
 
-def test_package_declarations_filter_by_simple_name(tmp_path):
+def test_package_declarations_filter_by_simple_name(tmp_path, make_analysis):
     """``simple_name`` matches only the rightmost dotted segment."""
-    base = tmp_path
     _write(
-        base,
+        tmp_path,
         {
             "pkg/__init__.py": "",
             "pkg/m.py": "def Foo(): pass\nclass Foo: pass\nbar = 1\n",
         },
     )
-    a = Analysis({base: []})
-    pv = a.package(base)
+    a = make_analysis()
+    pv = a.package(tmp_path)
     foos = list(pv.declarations("Foo"))
     assert {n.fqname for n in foos} == {"pkg.m.Foo"}
     assert {n.type for n in foos} == {"function", "class"}
 
 
-def test_local_query_doesnt_materialize_full_graph(tmp_path):
+def test_local_query_doesnt_materialize_full_graph(tmp_path, make_analysis):
     """``pkg.modules()`` populates only this base's contribution; full graph
     is still un-materialized."""
     base_a = tmp_path / "a"
     base_b = tmp_path / "b"
     _write(base_a, {"pkg/__init__.py": "", "pkg/m.py": "def f(): pass\n"})
     _write(base_b, {"pkg/__init__.py": "", "pkg/m.py": "def g(): pass\n"})
-    a = Analysis({base_a: [], base_b: []})
+    a = make_analysis(["a", "b"])
     list(a.package(base_a).modules())
     assert base_a in a._contributions
     assert base_b not in a._contributions
@@ -125,20 +121,40 @@ def test_local_query_doesnt_materialize_full_graph(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_reverse_closure_includes_self_and_consumers(tmp_path):
+def test_reverse_closure_includes_self_and_consumers(tmp_path, make_analysis):
     """``app -> core -> lib``: lib's reverse closure is {lib, core, app}."""
     lib = tmp_path / "lib"
     core = tmp_path / "core"
     app = tmp_path / "app"
     for d in (lib, core, app):
         d.mkdir()
-    a = Analysis({lib: [], core: [lib], app: [core]})
+    a = make_analysis(["lib", "core:lib", "app:core"])
     assert a.reverse_closure(lib) == frozenset({lib, core, app})
     assert a.reverse_closure(core) == frozenset({core, app})
     assert a.reverse_closure(app) == frozenset({app})
 
 
-def test_package_dead_uses_closure_only(tmp_path):
+def test_cycle_in_deps_is_tolerated(tmp_path, make_analysis):
+    """``a <-> b`` cycles in :attr:`Package.deps` don't crash the analyzer.
+
+    The exported subset is typically acyclic, but tests / scripts can
+    introduce cycles between packages. The dep traversal -- ``bases``,
+    ``reverse_closure``, ``_interesting_set`` -- terminates via the
+    BFS visited set; cycle members appear in :attr:`Analysis.packages`
+    in path order at the end of the iteration.
+    """
+    a_dir = tmp_path / "a"
+    b_dir = tmp_path / "b"
+    for d in (a_dir, b_dir):
+        d.mkdir()
+    analysis = make_analysis(["a:b", "b:a"])
+
+    assert {p.path for p in analysis.packages} == {a_dir, b_dir}
+    assert analysis.reverse_closure(a_dir) == frozenset({a_dir, b_dir})
+    assert analysis.reverse_closure(b_dir) == frozenset({a_dir, b_dir})
+
+
+def test_package_dead_uses_closure_only(tmp_path, make_analysis):
     """A pkg.dead() materialization only refreshes the interesting set,
     not unrelated sibling bases.
 
@@ -157,8 +173,8 @@ def test_package_dead_uses_closure_only(tmp_path):
         },
     )
     _write(other, {"pkg/__init__.py": "", "pkg/m.py": "def x(): pass\n"})
-    a = Analysis(
-        {core: [], app: [core], other: []},
+    a = make_analysis(
+        ["core", "app:core", "other"],
         plugins=[ExplicitEntrypointPlugin(specs=["pkg.main"])],
     )
     list(a.package(core).dead())
@@ -170,7 +186,7 @@ def test_package_dead_uses_closure_only(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_package_dead_matches_full_dead_slice(tmp_path):
+def test_package_dead_matches_full_dead_slice(tmp_path, make_analysis):
     """For each base, ``pkg.dead()`` equals ``analysis.dead()`` filtered
     to that base."""
     core = tmp_path / "core"
@@ -183,27 +199,28 @@ def test_package_dead_matches_full_dead_slice(tmp_path):
             "pkg/main.py": "from pkg.m import used\nused()\n",
         },
     )
-    a_full = Analysis(
-        {core: [], app: [core]},
-        plugins=[ExplicitEntrypointPlugin(specs=["pkg.main"])],
-    )
+    plugins = [ExplicitEntrypointPlugin(specs=["pkg.main"])]
+    a_full = make_analysis(["core", "app:core"], plugins=plugins)
     full_dead_in_core = {n.fqname for n in a_full.dead() if n.path.is_relative_to(core)}
-    a_pkg = Analysis(
-        {core: [], app: [core]},
-        plugins=[ExplicitEntrypointPlugin(specs=["pkg.main"])],
-    )
+    a_pkg = make_analysis(["core", "app:core"], plugins=plugins)
     pkg_dead = {n.fqname for n in a_pkg.package(core).dead()}
     assert pkg_dead == full_dead_in_core
 
 
 # ---------------------------------------------------------------------------
-# Per-base cache fingerprint: changing one base's deps doesn't invalidate
-# sibling bases' rows.
+# Cache fingerprint: changing a base's deps doesn't invalidate any rows,
+# since the fingerprint no longer depends on the package layout.
 # ---------------------------------------------------------------------------
 
 
-def test_per_base_fingerprint_isolates_siblings(tmp_path, monkeypatch):
-    """Changing one base's search paths invalidates *only* that base's rows."""
+def test_dep_changes_do_not_invalidate_visitor_cache(tmp_path, make_analysis, monkeypatch):
+    """Changing a base's deps re-stitches edges but does not re-run the visitor.
+
+    ``search_paths`` left the per-file fingerprint when import
+    resolution moved to :func:`dead_cst._edges.resolve_edges`, so
+    swapping a base's deps just reshuffles the stitching pass --
+    every cached :class:`VisitorPayload` for that base stays valid.
+    """
     base_a = tmp_path / "a"
     base_b = tmp_path / "b"
     extra = tmp_path / "extra"
@@ -213,23 +230,18 @@ def test_per_base_fingerprint_isolates_siblings(tmp_path, monkeypatch):
 
     db = tmp_path / CACHE_DIR_NAME / "cache.db"
     with GraphCache(db) as cache:
-        Analysis({base_a: [], base_b: []}, cache=cache).materialize_all()
+        make_analysis(["a", "b"], cache=cache).materialize_all()
 
-    from dead_cst import analyze
+    from dead_cst import _refresh
 
     visited: list[Path] = []
-    real = analyze.SymbolVisitor
+    real = _refresh.SymbolVisitor
 
     def _spy(path, *args, **kwargs):
         visited.append(path)
         return real(path, *args, **kwargs)
 
-    monkeypatch.setattr(analyze, "SymbolVisitor", _spy)
-    # Add a search-path entry to base_a only. base_b's fingerprint is
-    # unchanged, so its rows stay valid; base_a's rows are invalidated.
+    monkeypatch.setattr(_refresh, "SymbolVisitor", _spy)
     with GraphCache(db) as cache:
-        Analysis({base_a: [extra], base_b: []}, cache=cache).materialize_all()
-    visited_under_a = {p for p in visited if p.is_relative_to(base_a)}
-    visited_under_b = {p for p in visited if p.is_relative_to(base_b)}
-    assert visited_under_a, "base_a should re-visit after fingerprint change"
-    assert not visited_under_b, "base_b should not re-visit -- its fingerprint is unchanged"
+        make_analysis(["a:extra", "b"], cache=cache).materialize_all()
+    assert visited == []

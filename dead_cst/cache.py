@@ -13,34 +13,31 @@ Two tables make up the database:
 ``meta`` holds the schema version (an integer) so reads from a database
 written by an incompatible package version are detected on open: a
 schema-version mismatch drops ``file_cache`` and re-writes the current
-version. The fingerprint that decides whether an individual entry is
-still valid lives on the row itself, not in ``meta``, so different
-bases (or different per-base configurations) can coexist in one
-database without wiping each other.
+version.
 
 ``file_cache`` is one row per analyzed file, keyed by absolute path,
-with the file's SHA-256 content hash, the per-base fingerprint
+with the file's SHA-256 content hash, the analysis fingerprint
 (:func:`compute_fingerprint`) it was written under, and the pickled
 payload. A hash *or* fingerprint mismatch on read is treated as a
 miss; the row is left in place and overwritten by the next
-:meth:`GraphCache.put`. Per-base :func:`resolve_edges` runs
-unconditionally every analysis, so mutating one file's exports
-re-stitches every importer's edges in the same base for free -- the
-cache only short-circuits the per-file visitor work, never the
-graph-stitching work.
+:meth:`GraphCache.put`. :func:`resolve_edges` runs unconditionally
+every analysis, so mutating one file's exports re-stitches every
+importer's edges for free -- the cache only short-circuits the
+per-file visitor work, never the graph-stitching work.
 
-Per-base fingerprinting is what makes scoped refresh tractable:
-:meth:`dead_cst.analyze.Analysis.refresh` can rebuild one base
-without invalidating sibling bases' cached payloads, because each
-file's row is gated by its base's own ``(base, search_paths,
-plugins, resolvers, detector)`` fingerprint rather than a single
-project-wide one.
+The fingerprint covers the visitor / plugin / detector chain, the
+schema version, and the Python version: it does *not* depend on the
+package the file lives under, so the same payload is reusable across
+analyses with different package layouts. Resolvers and search paths
+deliberately do not enter the fingerprint either -- cross-file import
+resolution moved out of the visitor and runs unconditionally on every
+analysis, so swapping a resolver or rebinding ``sys.path`` re-stitches
+edges without invalidating any cached payloads.
 
-Plugins are intentionally part of the per-base fingerprint (their
-``observe`` output is folded into the cached payload) but the
-``finalize`` pass runs unconditionally on every analysis, so
-swapping ``finalize``-only plugins between runs does not require a
-plugin ``version`` bump.
+Plugins are intentionally part of the fingerprint (their ``observe``
+output is folded into the cached payload) but the ``finalize`` pass
+runs unconditionally on every analysis, so swapping ``finalize``-only
+plugins between runs does not require a plugin ``version`` bump.
 """
 
 from __future__ import annotations
@@ -60,7 +57,6 @@ from .branches import (
 )
 from .graph import VisitorPayload
 from .plugins._core import EdgePlugin
-from .resolvers import PathResolver
 
 logger = logging.getLogger(__name__)
 
@@ -82,23 +78,30 @@ def default_cache_path(project_root: Path) -> Path:
 
 def compute_fingerprint(
     *,
-    base: Path,
-    search_paths: Sequence[Path],
-    resolvers: Sequence[PathResolver],
     plugins: Sequence[EdgePlugin] = (),
     unreachable_detector: UnreachableRegionDetector | None = None,
 ) -> str:
-    """SHA-256 of every per-base input that affects payload semantics.
+    """SHA-256 of every input that affects :class:`VisitorPayload` semantics.
 
-    Per-base by design: the fingerprint covers exactly one base's
-    configuration (``base`` itself, its ``search_paths``, the visitor
-    / resolver / plugin / detector chain, the schema version, the
-    Python version), so different bases in the same analysis live
-    side-by-side in one database without invalidating each other.
-    Adding or removing a sibling base, or changing a sibling base's
-    deps, leaves this base's fingerprint untouched.
+    Covers exactly the inputs the visitor + observe pass depend on:
+    the visitor / plugin / detector ``(name, version)`` chain, the
+    schema version, and the Python version. The package a file lives
+    under is *not* part of the key -- the visitor's output is purely
+    a function of the file's source plus the plugin/detector chain,
+    so a payload computed under one package can be reused if the
+    same file appears under a differently-named package later.
 
-    Each component (visitor, plugins, resolvers, detector) satisfies
+    ``search_paths`` and the resolver are *not* in the fingerprint:
+    cross-file import resolution moved out of the visitor and into
+    :func:`dead_cst._edges.resolve_edges` (which runs unconditionally
+    on every analysis), so swapping a resolver or rebinding
+    ``sys.path`` re-stitches edges without invalidating the cached
+    :class:`VisitorPayload` blobs. The ``Cacheable`` contract on
+    :class:`~dead_cst.resolvers.PathResolver` survives because the
+    resolver still drives a (uncached) classification step at stitch
+    time.
+
+    Each component (visitor, plugins, detector) satisfies
     :class:`~dead_cst._cacheable.Cacheable` and is fingerprinted by
     its ``(name, version)`` pair: bumping ``version`` invalidates
     every cached entry that referenced the old version. ``version``
@@ -119,15 +122,6 @@ def compute_fingerprint(
     h.update(f"schema={SCHEMA_VERSION}\n".encode())
     h.update(f"python={sys.version_info.major}.{sys.version_info.minor}\n".encode())
     h.update(f"visitor={SymbolVisitor.name}@{SymbolVisitor.version}\n".encode())
-    h.update(f"base={base}\n".encode())
-
-    h.update(b"search_paths=\n")
-    for sp in sorted(search_paths, key=str):
-        h.update(f"  {sp}\n".encode())
-
-    h.update(b"resolvers=\n")
-    for r_name, r_version in sorted((r.name, r.version) for r in resolvers):
-        h.update(f"  {r_name}@{r_version}\n".encode())
 
     h.update(b"plugins=\n")
     for p_name, p_version in sorted((p.name, p.version) for p in plugins):
@@ -155,14 +149,14 @@ def file_hash(path: Path) -> str | None:
 class GraphCache:
     """SQLite-backed lookup of pickled :class:`VisitorPayload` per file.
 
-    Open with just the database path -- there is no project-wide
-    fingerprint at the database level. Each :meth:`get` and
-    :meth:`put` takes the per-base fingerprint that the calling
-    analyzer computed via :func:`compute_fingerprint`; the row stores
-    its own fingerprint and a mismatch on read returns ``None``
-    (treated as a cache miss). On open, a schema-version mismatch
-    wipes ``file_cache`` and re-writes the current schema -- this
-    handles upgrading from older databases without intervention.
+    Open with just the database path -- there is no fingerprint at
+    the database level. Each :meth:`get` and :meth:`put` takes the
+    analysis fingerprint the caller computed via
+    :func:`compute_fingerprint`; the row stores its own fingerprint
+    and a mismatch on read returns ``None`` (treated as a cache miss).
+    On open, a schema-version mismatch wipes ``file_cache`` and
+    re-writes the current schema -- this handles upgrading from older
+    databases without intervention.
 
     :meth:`get` returns the cached payload for a path when both the
     file's SHA-256 and the stored fingerprint match the caller's;
@@ -206,8 +200,8 @@ class GraphCache:
         older release that stored a single project-wide fingerprint
         in ``meta.fingerprint``) drops ``file_cache`` and clears
         ``meta`` so the next run starts clean. The next round of
-        :meth:`put` calls re-populates with rows that carry their own
-        per-base fingerprint.
+        :meth:`put` calls re-populates with rows that carry the
+        current analysis fingerprint.
         """
         with self._conn:
             self._conn.execute(
@@ -270,7 +264,7 @@ class GraphCache:
             return None
         try:
             payload = pickle.loads(blob)
-        except Exception:
+        except (pickle.UnpicklingError, AttributeError, EOFError, ImportError, ValueError):
             logger.warning("Corrupt cache entry for %s; dropping", path)
             with self._conn:
                 self._conn.execute("DELETE FROM file_cache WHERE path=?", (str(path),))
@@ -284,7 +278,7 @@ class GraphCache:
 
     def put(self, path: Path, payload: VisitorPayload, fingerprint: str) -> None:
         """Pickle ``payload`` and record it under the file's current hash
-        and the caller's per-base ``fingerprint``."""
+        and the caller's analysis ``fingerprint``."""
         h = file_hash(path)
         if h is None:
             return

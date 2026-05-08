@@ -8,7 +8,6 @@ the fixture so individual cases only list the edges they introduce.
 
 import pytest
 
-from dead_cst import Analysis
 from dead_cst.plugins._core import EXTERNAL_PREFIXES
 
 IMPORT_TEST_FILES = {
@@ -210,8 +209,15 @@ IMPORT_BASE_EDGES = frozenset(
         ),
         pytest.param(
             "import p\ndef a(): p.functions.f()",
+            # The access ``p.functions.f`` synthesizes an
+            # ``Import(module="p", decl="functions.f")``; the stitcher
+            # canonicalizes it to ``module="p.functions"`` because the
+            # whole prefix resolves as a submodule, so the edge points
+            # at the deepest reached module rather than at ``p``.
+            # Reachability of ``p`` itself is still preserved through
+            # ``p.x.p -> p`` plus the ``p.functions -> p`` parent-edge.
             {
-                "p.x.a -> p",
+                "p.x.a -> p.functions",
                 "p.x.a -> p.functions.f",
                 "p.x.a -> p.x",
                 "p.x.a -> p.x.p",
@@ -526,7 +532,7 @@ def test_third_party_import_creates_synthetic_node(build_decl_graph):
     assert {"p.uses_nx.nx", "p.uses_nx.build"} <= edge_srcs
 
 
-def test_cross_dep_submodule_import(tmp_path, assert_edges):
+def test_cross_dep_submodule_import(tmp_path, make_analysis, assert_edges):
     """Importing a submodule from a dep base resolves through the dep's exported trie.
 
     Layout:
@@ -534,7 +540,7 @@ def test_cross_dep_submodule_import(tmp_path, assert_edges):
         pkg_a/A/sub.py       -- def f(): ...
         pkg_b/B/__init__.py  -- from A import sub; sub.f()
 
-    PathMap: {pkg_b: [pkg_a], pkg_a: []}
+    Packages: pkg_b(deps=("pkg_a",)), pkg_a(deps=())
 
     ``A.sub`` lives in the dep's exported trie, not the consumer's own
     trie. ``resolve_edges`` must find it via the merged ``symbol_lookup``
@@ -550,7 +556,7 @@ def test_cross_dep_submodule_import(tmp_path, assert_edges):
     (pkg_a / "A" / "sub.py").write_text("def f(): ...\n")
     (pkg_b / "B" / "__init__.py").write_text("from A import sub\nsub.f()\n")
 
-    graph = Analysis({pkg_b: [pkg_a], pkg_a: []}).materialize_all()
+    graph = make_analysis(["pkg_b:pkg_a", "pkg_a"]).materialize_all()
     assert_edges(
         graph,
         {

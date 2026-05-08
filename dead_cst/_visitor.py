@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-from functools import cache
 from importlib.util import resolve_name
 from pathlib import Path
 from typing import Generator, Literal, cast
@@ -28,8 +27,6 @@ from ._flow import live_at_exit, live_referents
 from ._fqn import FixedFullyQualifiedNameProvider
 from .branches import DefaultUnreachableRegionDetector, UnreachableRegionDetector
 from .graph import Import, NodeFlags, SymbolNode, SymbolTrie, VisitorPayload
-from .plugins._core import UNRESOLVED_PREFIX
-from .resolvers import ImportResolver, default_resolve_import
 
 logger = logging.getLogger(__name__)
 
@@ -125,14 +122,10 @@ class SymbolVisitor(cst.CSTVisitor):
     def __init__(
         self,
         path: Path,
-        search_paths: list[Path],
-        import_resolver: ImportResolver = default_resolve_import,
         unreachable_detector: UnreachableRegionDetector | None = None,
         wrapper: cst.MetadataWrapper | None = None,
     ):
         self.path = path
-        self.search_paths = search_paths
-        self._import_resolver = import_resolver
         self._unreachable_detector = (
             unreachable_detector
             if unreachable_detector is not None
@@ -203,10 +196,6 @@ class SymbolVisitor(cst.CSTVisitor):
             raise ValueError("Module node has not been set yet.")
         return self.decl_stack[0][0]
 
-    @cache
-    def resolve_import(self, name: str) -> str | Path | None:
-        return self._import_resolver(name, self.search_paths)
-
     def _push_decl(self, node: cst.CSTNode, decl: SymbolNode):
         self._push_decls(node, [decl])
 
@@ -254,7 +243,7 @@ class SymbolVisitor(cst.CSTVisitor):
                 return None
             try:
                 evaluated = inner.evaluated_value
-            except Exception:
+            except (SyntaxError, UnicodeDecodeError):
                 return None
             if not isinstance(evaluated, str):
                 return None
@@ -318,14 +307,19 @@ class SymbolVisitor(cst.CSTVisitor):
                 self._push_decls(name, [sym])
 
     def _add_import(self, from_prefix: str, node: cst.Import | cst.ImportFrom) -> None:
-        current_decl = self.decl_stack[-1][-1] if self.decl_stack else None
+        """Emit raw ``Import`` records for one ``import`` / ``from ... import`` statement.
 
-        module_path: str | Path | None = None
-        module_name: str | None = None
-        if from_prefix:
-            if path := self.resolve_import(from_prefix):
-                module_path = path
-                module_name = from_prefix
+        No name resolution happens here -- the visitor's job is to
+        capture what the source code literally says. The edge stitcher
+        :func:`dead_cst._edges.resolve_edges` is the single point that
+        classifies the target (first-party vs stdlib / external dist /
+        external file / unresolved) and may rewrite the
+        ``(module, decl)`` split to canonical form once it has the
+        per-package trie + resolver in hand. This keeps the visitor pass
+        purely a function of the file's source, so the per-file cache
+        survives changes to ``search_paths`` and the resolver chain.
+        """
+        current_decl = self.decl_stack[-1][-1] if self.decl_stack else None
 
         # ``visit_ImportFrom`` routes ``from X import *`` to ``_add_star_import``,
         # so by the time we get here ``names`` is always the alias sequence form.
@@ -336,50 +330,36 @@ class SymbolVisitor(cst.CSTVisitor):
             # dotted-name string; the helper only returns None for unsupported
             # node types we never see here.
             assert alias_name is not None
-            full_name = f"{from_prefix}.{alias_name}" if from_prefix else alias_name
 
-            if resolved := self.resolve_import(full_name):
-                module_path = resolved
-                module_name = full_name
-
-            if not module_path:
-                code = cst.Module([]).code_for_node(alias)
-                logger.warning("Failed to resolve cst.Import: '%s' in %s", code, self.path)
-                # Surface as a synthetic ``[unresolved] <top-level>`` node
-                # anyway so plugins can still answer "which files tried to
-                # import X?". The top-level package name is used (mirroring
-                # how ``[external dist] fastapi`` collapses every fastapi
-                # submodule import into one node) so a plugin's
-                # ``importers("fastapi")`` finds them all. Reachability is
-                # unaffected (the synthetic has no outbound edges).
-                top_level = full_name.split(".", 1)[0]
-                module_path = f"{UNRESOLVED_PREFIX}{top_level}"
-                module_name = full_name
-            assert module_name is not None
+            # ``from x import a`` -> module="x", decl="a" (the stitcher
+            # canonicalizes to module="x.a", decl=None when ``x.a`` is a
+            # submodule). ``import x.y`` -> module="x.y", decl=None
+            # (``from_prefix`` is empty for plain ``import``).
+            if from_prefix:
+                module_name = from_prefix
+                decl_name_str: str | None = alias_name
+            else:
+                module_name = alias_name
+                decl_name_str = None
 
             if alias.asname:
-                decl_name = alias.asname.name
+                decl_node = alias.asname.name
             else:
-                decl_name = alias.name
+                decl_node = alias.name
 
-            self.import_lookup[decl_name] = import_info = Import(
-                path=module_path,
+            self.import_lookup[decl_node] = import_info = Import(
                 module=module_name,
-                decl=(
-                    full_name[len(module_name) + 1 :]
-                    if module_name and module_name != full_name
-                    else None
-                ),
+                decl=decl_name_str,
             )
 
             # ``import google.cloud`` binds ``google`` in the local scope; the
             # decl is stored under that bare name, not the dotted path.
-            while isinstance(decl_name, cst.Attribute):
-                decl_name = decl_name.value
+            while isinstance(decl_node, cst.Attribute):
+                decl_node = decl_node.value
 
             if current_decl and current_decl.type == "module":
                 sym = SymbolNode(
-                    f"{self.module_node.fqname}.{decl_name.value}",
+                    f"{self.module_node.fqname}.{decl_node.value}",
                     "import",
                     self.path,
                     self._pos(alias),
@@ -627,7 +607,7 @@ class SymbolVisitor(cst.CSTVisitor):
             return None
         try:
             value = arg.evaluated_value
-        except Exception:
+        except (SyntaxError, UnicodeDecodeError):
             return None
         return value if isinstance(value, str) else None
 
@@ -661,9 +641,13 @@ class SymbolVisitor(cst.CSTVisitor):
         for entry in entries:
             if not entry:
                 continue
-            submod = f"{module}.{entry}"
-            if self.resolve_import(submod):
-                self._add_star_import(submod, access_pos)
+            # Each fromlist entry could be a submodule (fan out as a star
+            # import) or a name in ``module`` (already covered by the
+            # main star fan-out from ``module``). We can't tell at visit
+            # time, so emit a *speculative* star import for ``module.entry``
+            # and let the stitcher silently drop it when neither the trie
+            # nor the resolver places it.
+            self._add_star_import(f"{module}.{entry}", access_pos, speculative=True)
 
     @staticmethod
     def _dynamic_import_call_name(
@@ -774,14 +758,12 @@ class SymbolVisitor(cst.CSTVisitor):
                 else:
                     self.shadowed_decls.append(d)
 
-    def _add_star_import(self, module: str, access_pos: CodeRange) -> None:
-        module_path = self.resolve_import(module) if module else None
-        if not module_path:
-            logger.warning(
-                "Failed to resolve star import: 'from %s import *' in %s", module, self.path
-            )
+    def _add_star_import(
+        self, module: str, access_pos: CodeRange, *, speculative: bool = False
+    ) -> None:
+        if not module:
             return
-        star = Import(path=module_path, module=module, star=True)
+        star = Import(module=module, star=True, speculative=speculative)
         self.import_edges.add((self.decl_stack[-1][-1], star, access_pos))
 
     def on_leave(self, original_node: cst.CSTNode) -> None:
@@ -801,12 +783,31 @@ class SymbolVisitor(cst.CSTVisitor):
         # ScopeProvider's metadata is typed loosely upstream; the values are
         # always ``Scope`` instances.
         scopes = cast("set[Scope]", set(self.metadata[ScopeProvider].values()))
+        walrus_leaks = self.walrus_leak_targets
         for scope in scopes:
             for access in scope.accesses:
                 # ``Assignment`` and ``BuiltinAssignment`` are the only
                 # ``BaseAssignment`` subclasses; selecting ``Assignment``
                 # excludes builtins and gives us a typed ``.node``.
                 referents = [r for r in access.referents if isinstance(r, Assignment)]
+                if not referents:
+                    # Walrus bindings that leaked from a comprehension
+                    # don't appear in the enclosing scope's assignment
+                    # list (libcst's ``ScopeProvider`` keeps them in the
+                    # ``ComprehensionScope``), so any access to the
+                    # leaked name lands here with empty referents.
+                    if not walrus_leaks or not isinstance(access.node, cst.Name):
+                        continue
+                    targets = walrus_leaks.get(access.node.value)
+                    if not targets:
+                        continue
+                    owner_symbols = self.nearest_decls.get(access.node, [])
+                    access_pos = self._pos(access.node)
+                    for target_symbol in targets:
+                        for owner_symbol in owner_symbols:
+                            if target_symbol != owner_symbol and target_symbol and owner_symbol:
+                                self.internal_edges.add((owner_symbol, target_symbol, access_pos))
+                    continue
                 if len(referents) > 1:
                     body = self._scope_body(referents[0].scope, original_node)
                     if body is not None:
@@ -817,29 +818,6 @@ class SymbolVisitor(cst.CSTVisitor):
                         referents = [r for r in referents if id(r.node) in live_ids]
                 for referent in referents:
                     references.add((access, referent))
-
-        # Walrus bindings that leaked from a comprehension don't appear
-        # in the enclosing scope's assignment list (libcst's
-        # ``ScopeProvider`` keeps them in the ``ComprehensionScope``),
-        # so any access to the leaked name lands here with empty
-        # referents. Route those accesses to the matching top-level
-        # walrus decl so the graph mirrors the runtime semantics.
-        if self.walrus_leak_targets:
-            for scope in scopes:
-                for access in scope.accesses:
-                    if not isinstance(access.node, cst.Name):
-                        continue
-                    if any(isinstance(r, Assignment) for r in access.referents):
-                        continue
-                    targets = self.walrus_leak_targets.get(access.node.value)
-                    if not targets:
-                        continue
-                    owner_symbols = self.nearest_decls.get(access.node, [])
-                    access_pos = self._pos(access.node)
-                    for target_symbol in targets:
-                        for owner_symbol in owner_symbols:
-                            if target_symbol != owner_symbol and target_symbol and owner_symbol:
-                                self.internal_edges.add((owner_symbol, target_symbol, access_pos))
 
         for access, referent in references:
             owner_symbols = self.nearest_decls.get(access.node, [])
@@ -865,7 +843,6 @@ class SymbolVisitor(cst.CSTVisitor):
 
                     # Create the new Import with the specific symbol being accessed
                     resolved_import = Import(
-                        path=original_import.path,
                         module=original_import.module,
                         decl=".".join(accessed_attrs) if accessed_attrs else None,
                     )
@@ -926,6 +903,27 @@ class SymbolVisitor(cst.CSTVisitor):
         :data:`EdgeFlags.DEAD_BRANCH` flag from it by checking
         containment against :attr:`dead_suites`.
         """
+        nodes: list[SymbolNode] = []
+        stack: list[SymbolTrie] = [self.trie]
+
+        # Fast path: nothing to flag, no remap needed. The walk below
+        # mirrors the slow path so trie shape stays the source of truth
+        # for emission order in both branches.
+        if not self.shadowed_decls and not self.overload_decls and not self.overload_marked:
+            while stack:
+                tnode = stack.pop()
+                if tnode.module is not None:
+                    nodes.append(tnode.module)
+                for decls in tnode.declarations.values():
+                    nodes.extend(decls)
+                stack.extend(tnode.children.values())
+            return VisitorPayload(
+                nodes=tuple(nodes),
+                edges=tuple(self.internal_edges),
+                imports=tuple(self.import_edges),
+                dead_suites=tuple(self.dead_suites),
+            )
+
         flag_map: dict[SymbolNode, SymbolNode] = {
             d: dataclasses.replace(d, flags=d.flags | NodeFlags.SHADOWED)
             for d in self.shadowed_decls
@@ -944,8 +942,6 @@ class SymbolVisitor(cst.CSTVisitor):
         def remap(sym: SymbolNode) -> SymbolNode:
             return flag_map.get(sym, sym)
 
-        nodes: list[SymbolNode] = []
-        stack: list[SymbolTrie] = [self.trie]
         while stack:
             tnode = stack.pop()
             if tnode.module is not None:
@@ -955,7 +951,6 @@ class SymbolVisitor(cst.CSTVisitor):
             stack.extend(tnode.children.values())
         nodes.extend(remap(d) for d in self.shadowed_decls)
         nodes.extend(remap(d) for d in self.overload_decls)
-
         edges = tuple((remap(src), remap(dst), pos) for src, dst, pos in self.internal_edges)
         imports = tuple((remap(src), dst, pos) for src, dst, pos in self.import_edges)
 

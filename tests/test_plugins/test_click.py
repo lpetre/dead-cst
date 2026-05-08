@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dead_cst import Analysis
 from dead_cst.plugins import (
     ClickPlugin,
     ExplicitEntrypointPlugin,
@@ -10,7 +9,7 @@ from dead_cst.plugins import (
 )
 
 
-def test_click_plugin_marks_command_handlers(tmp_path, write_files, reachable_fqnames):
+def test_click_plugin_marks_command_handlers(make_analysis, write_files, reachable_fqnames):
     write_files(
         {
             "cli/__init__.py": "",
@@ -36,11 +35,7 @@ def test_click_plugin_marks_command_handlers(tmp_path, write_files, reachable_fq
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[MainBlockPlugin(), ClickPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[MainBlockPlugin(), ClickPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "cli.main.cli" in reached
     assert "cli.main.hello" in reached
@@ -50,7 +45,9 @@ def test_click_plugin_marks_command_handlers(tmp_path, write_files, reachable_fq
     assert "cli.main.helper" not in reached
 
 
-def test_click_plugin_keeps_handler_dependencies_alive(tmp_path, write_files, reachable_fqnames):
+def test_click_plugin_keeps_handler_dependencies_alive(
+    make_analysis, write_files, reachable_fqnames
+):
     write_files(
         {
             "cli/__init__.py": "",
@@ -80,11 +77,7 @@ def test_click_plugin_keeps_handler_dependencies_alive(tmp_path, write_files, re
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[MainBlockPlugin(), ClickPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[MainBlockPlugin(), ClickPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "cli.main.show" in reached
     # Symbols transitively referenced from the handler stay alive
@@ -94,7 +87,9 @@ def test_click_plugin_keeps_handler_dependencies_alive(tmp_path, write_files, re
     assert "cli.models.Unused" not in reached
 
 
-def test_click_plugin_reachable_via_explicit_entrypoint(tmp_path, write_files, reachable_fqnames):
+def test_click_plugin_reachable_via_explicit_entrypoint(
+    make_analysis, write_files, reachable_fqnames
+):
     write_files(
         {
             "cli/__init__.py": "",
@@ -109,17 +104,15 @@ def test_click_plugin_reachable_via_explicit_entrypoint(tmp_path, write_files, r
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[ExplicitEntrypointPlugin(specs=["cli.main.cli"]), ClickPlugin()],
-        project_root=tmp_path,
+    graph = make_analysis(
+        plugins=[ExplicitEntrypointPlugin(specs=["cli.main.cli"]), ClickPlugin()]
     ).materialize_all()
     reached = reachable_fqnames(graph)
     assert "cli.main.cli" in reached
     assert "cli.main.hello" in reached
 
 
-def test_click_plugin_does_not_seed_entrypoint(tmp_path, write_files, reachable_fqnames):
+def test_click_plugin_does_not_seed_entrypoint(make_analysis, write_files, reachable_fqnames):
     """Without an external reach (no main block, no project.scripts, no -e),
     the Click group itself stays dead -- and so do its commands. Mirrors
     the ``APIRouter`` behavior in :class:`FastAPIPlugin`."""
@@ -137,17 +130,13 @@ def test_click_plugin_does_not_seed_entrypoint(tmp_path, write_files, reachable_
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[ClickPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[ClickPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "cli.main.cli" not in reached
     assert "cli.main.orphan" not in reached
 
 
-def test_click_plugin_unused_subgroup_stays_dead(tmp_path, write_files, reachable_fqnames):
+def test_click_plugin_unused_subgroup_stays_dead(make_analysis, write_files, reachable_fqnames):
     """A sub-group that's never ``add_command``'d has no path from the root
     group and stays dead, along with its commands."""
     write_files(
@@ -176,18 +165,16 @@ def test_click_plugin_unused_subgroup_stays_dead(tmp_path, write_files, reachabl
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[MainBlockPlugin(), ClickPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[MainBlockPlugin(), ClickPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "cli.main.hello" in reached
     assert "cli.sub.sub" not in reached
     assert "cli.sub.orphan" not in reached
 
 
-def test_click_plugin_subgroup_reachable_via_add_command(tmp_path, write_files, reachable_fqnames):
+def test_click_plugin_subgroup_reachable_via_add_command(
+    make_analysis, write_files, reachable_fqnames
+):
     write_files(
         {
             "cli/__init__.py": "",
@@ -217,11 +204,7 @@ def test_click_plugin_subgroup_reachable_via_add_command(tmp_path, write_files, 
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[MainBlockPlugin(), ClickPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[MainBlockPlugin(), ClickPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "cli.main.cli" in reached
     assert "cli.sub.sub" in reached
@@ -229,7 +212,7 @@ def test_click_plugin_subgroup_reachable_via_add_command(tmp_path, write_files, 
     assert "cli.sub.things" in reached
 
 
-def test_click_plugin_subgroup_via_decorator(tmp_path, write_files, reachable_fqnames):
+def test_click_plugin_subgroup_via_decorator(make_analysis, write_files, reachable_fqnames):
     """``@<group>.group(...)`` registers a nested group inline."""
     write_files(
         {
@@ -251,18 +234,16 @@ def test_click_plugin_subgroup_via_decorator(tmp_path, write_files, reachable_fq
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[MainBlockPlugin(), ClickPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[MainBlockPlugin(), ClickPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "cli.main.cli" in reached
     assert "cli.main.admin" in reached
     assert "cli.main.reset" in reached
 
 
-def test_click_plugin_handles_from_click_import_group(tmp_path, write_files, reachable_fqnames):
+def test_click_plugin_handles_from_click_import_group(
+    make_analysis, write_files, reachable_fqnames
+):
     write_files(
         {
             "cli/__init__.py": "",
@@ -280,15 +261,11 @@ def test_click_plugin_handles_from_click_import_group(tmp_path, write_files, rea
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[MainBlockPlugin(), ClickPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[MainBlockPlugin(), ClickPlugin()]).materialize_all()
     assert "cli.main.hello" in reachable_fqnames(graph)
 
 
-def test_click_plugin_handles_aliased_module_import(tmp_path, write_files, reachable_fqnames):
+def test_click_plugin_handles_aliased_module_import(make_analysis, write_files, reachable_fqnames):
     write_files(
         {
             "cli/__init__.py": "",
@@ -306,15 +283,13 @@ def test_click_plugin_handles_aliased_module_import(tmp_path, write_files, reach
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[MainBlockPlugin(), ClickPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[MainBlockPlugin(), ClickPlugin()]).materialize_all()
     assert "cli.main.hello" in reachable_fqnames(graph)
 
 
-def test_click_plugin_handles_aliased_decorator_import(tmp_path, write_files, reachable_fqnames):
+def test_click_plugin_handles_aliased_decorator_import(
+    make_analysis, write_files, reachable_fqnames
+):
     write_files(
         {
             "cli/__init__.py": "",
@@ -332,15 +307,11 @@ def test_click_plugin_handles_aliased_decorator_import(tmp_path, write_files, re
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[MainBlockPlugin(), ClickPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[MainBlockPlugin(), ClickPlugin()]).materialize_all()
     assert "cli.main.hello" in reachable_fqnames(graph)
 
 
-def test_click_plugin_handles_explicit_constructor(tmp_path, write_files, reachable_fqnames):
+def test_click_plugin_handles_explicit_constructor(make_analysis, write_files, reachable_fqnames):
     write_files(
         {
             "cli/__init__.py": "",
@@ -357,15 +328,11 @@ def test_click_plugin_handles_explicit_constructor(tmp_path, write_files, reacha
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[MainBlockPlugin(), ClickPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[MainBlockPlugin(), ClickPlugin()]).materialize_all()
     assert "cli.main.hello" in reachable_fqnames(graph)
 
 
-def test_click_plugin_ignores_bare_decorators(tmp_path, write_files, reachable_fqnames):
+def test_click_plugin_ignores_bare_decorators(make_analysis, write_files, reachable_fqnames):
     write_files(
         {
             "pkg/__init__.py": "",
@@ -386,17 +353,13 @@ def test_click_plugin_ignores_bare_decorators(tmp_path, write_files, reachable_f
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[MainBlockPlugin(), ClickPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[MainBlockPlugin(), ClickPlugin()]).materialize_all()
     # Bare ``@command`` (no attribute access) is not a Click registration --
     # matching it would clobber unrelated decorators with the same name.
     assert "pkg.mod.looks_like_command" not in reachable_fqnames(graph)
 
 
-def test_click_plugin_ignores_unrelated_decorators(tmp_path, write_files, reachable_fqnames):
+def test_click_plugin_ignores_unrelated_decorators(make_analysis, write_files, reachable_fqnames):
     write_files(
         {
             "pkg/__init__.py": "",
@@ -412,16 +375,14 @@ def test_click_plugin_ignores_unrelated_decorators(tmp_path, write_files, reacha
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[ClickPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[ClickPlugin()]).materialize_all()
     # ``t`` isn't a Click group, so its ``.command`` decorator is ignored.
     assert "pkg.mod.not_a_command" not in reachable_fqnames(graph)
 
 
-def test_click_plugin_does_nothing_without_click_imports(tmp_path, write_files, reachable_fqnames):
+def test_click_plugin_does_nothing_without_click_imports(
+    make_analysis, write_files, reachable_fqnames
+):
     write_files(
         {
             "pkg/__init__.py": "",
@@ -438,16 +399,12 @@ def test_click_plugin_does_nothing_without_click_imports(tmp_path, write_files, 
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[ClickPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[ClickPlugin()]).materialize_all()
     # ``cli`` here is not a Click group -- no ``click`` import in scope.
     assert "pkg.mod.looks_like_command" not in reachable_fqnames(graph)
 
 
-def test_click_plugin_multiple_groups_in_one_module(tmp_path, write_files, reachable_fqnames):
+def test_click_plugin_multiple_groups_in_one_module(make_analysis, write_files, reachable_fqnames):
     write_files(
         {
             "cli/__init__.py": "",
@@ -471,11 +428,7 @@ def test_click_plugin_multiple_groups_in_one_module(tmp_path, write_files, reach
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[MainBlockPlugin(), ClickPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[MainBlockPlugin(), ClickPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     # ``cli`` is reached via the main block; its command is alive.
     assert "cli.main.from_cli" in reached
@@ -485,7 +438,7 @@ def test_click_plugin_multiple_groups_in_one_module(tmp_path, write_files, reach
     assert "cli.main.from_other" not in reached
 
 
-def test_click_plugin_ignores_import_star(tmp_path, write_files, reachable_fqnames):
+def test_click_plugin_ignores_import_star(make_analysis, write_files, reachable_fqnames):
     """``from click import *`` doesn't bind ``group`` for the plugin's
     purposes. The ``import *`` analyzer logic is pessimistic enough on
     its own; the plugin shouldn't infer Click wiring from the star import."""
@@ -506,18 +459,14 @@ def test_click_plugin_ignores_import_star(tmp_path, write_files, reachable_fqnam
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[MainBlockPlugin(), ClickPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[MainBlockPlugin(), ClickPlugin()]).materialize_all()
     # No instance edge from ``cli`` to ``hello`` because the plugin ignores
     # star imports.
     assert "cli.main.hello" not in reachable_fqnames(graph)
 
 
 def test_click_plugin_does_nothing_when_click_not_installed(
-    tmp_path, write_files, reachable_fqnames
+    make_analysis, write_files, reachable_fqnames
 ):
     """If no file imports ``click``, the plugin's import-graph prefilter
     short-circuits before touching any module."""
@@ -529,16 +478,12 @@ def test_click_plugin_does_nothing_when_click_not_installed(
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[ClickPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[ClickPlugin()]).materialize_all()
     assert "pkg.mod.helper" not in reachable_fqnames(graph)
 
 
 def test_click_plugin_ignores_relative_imports_and_unrelated_names(
-    tmp_path, write_files, reachable_fqnames
+    make_analysis, write_files, reachable_fqnames
 ):
     """Imports that look superficially like ``click`` -- relative imports,
     non-group names from ``click`` -- shouldn't make the plugin synthesize
@@ -554,16 +499,12 @@ def test_click_plugin_ignores_relative_imports_and_unrelated_names(
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[ClickPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[ClickPlugin()]).materialize_all()
     assert "cli.main.helper" not in reachable_fqnames(graph)
 
 
 def test_click_plugin_no_groups_when_click_imported_but_unused(
-    tmp_path, write_files, reachable_fqnames
+    make_analysis, write_files, reachable_fqnames
 ):
     """A file that imports ``click`` but never declares a group is a
     no-op for the plugin (and the early-return after ``_find_instances``
@@ -580,15 +521,13 @@ def test_click_plugin_no_groups_when_click_imported_but_unused(
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[ClickPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[ClickPlugin()]).materialize_all()
     assert "cli.main.helper" not in reachable_fqnames(graph)
 
 
-def test_click_plugin_ignores_non_group_assignment_shapes(tmp_path, write_files, reachable_fqnames):
+def test_click_plugin_ignores_non_group_assignment_shapes(
+    make_analysis, write_files, reachable_fqnames
+):
     """Multi-target assignments, tuple unpacks, bare annotations, and
     nested-attribute decorators all bypass the plugin's wiring rules."""
     write_files(
@@ -637,11 +576,7 @@ def test_click_plugin_ignores_non_group_assignment_shapes(tmp_path, write_files,
             """,
         }
     )
-    graph = Analysis(
-        {tmp_path: []},
-        plugins=[MainBlockPlugin(), ClickPlugin()],
-        project_root=tmp_path,
-    ).materialize_all()
+    graph = make_analysis(plugins=[MainBlockPlugin(), ClickPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "cli.main.cli" in reached
     assert "cli.main.hello" in reached

@@ -64,15 +64,15 @@ class PyiStubPlugin:
         return None
 
     def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]:
-        # Index every node under this base by ``(path, simple_name)`` so
-        # we can match a stub's ``f`` against the runtime module's ``f``
-        # without re-scanning the graph for each link. ``base_nodes``
-        # already filters to this base.
+        # Index every node under this package by ``(path, simple_name)``
+        # so we can match a stub's ``f`` against the runtime module's
+        # ``f`` without re-scanning the graph for each link.
+        # ``package_nodes`` already filters to this package.
         runtime_decls: dict[tuple[str, str], list[SymbolNode]] = {}
         stub_modules: dict[str, SymbolNode] = {}
         stub_decls: dict[str, list[SymbolNode]] = {}
 
-        for node in ctx.base_nodes():
+        for node in ctx.package_nodes():
             if node.type == "module":
                 if node.fqname.endswith(_PYI_SUFFIX):
                     stub_modules[node.fqname] = node

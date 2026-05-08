@@ -44,23 +44,22 @@ _StmtSeq = Sequence[cst.BaseStatement] | Sequence[cst.BaseSmallStatement]
 _Stmt = cst.BaseStatement | cst.BaseSmallStatement
 
 
-def _descendant_ids(node: cst.CSTNode, cache: dict[int, frozenset[int]]) -> frozenset[int]:
+def _descendant_ids(node: cst.CSTNode, cache: dict[int, set[int]]) -> set[int]:
     key = id(node)
     if key in cache:
         return cache[key]
     ids = {key}
     for child in node.children:
         ids |= _descendant_ids(child, cache)
-    frozen = frozenset(ids)
-    cache[key] = frozen
-    return frozen
+    cache[key] = ids
+    return ids
 
 
 def _walk_flow(
     stmts: _StmtSeq,
     incoming: set[cst.CSTNode],
     referent_set: set[cst.CSTNode],
-    cache: dict[int, frozenset[int]],
+    cache: dict[int, set[int]],
     observe: Callable[[_Stmt, set[cst.CSTNode]], None] | None,
 ) -> set[cst.CSTNode]:
     """Forward-walk ``stmts`` evolving the live referent set.
@@ -141,7 +140,7 @@ def live_referents(
     ``functiondef.body.body`` for a function scope, etc.). The access
     and every referent must be reachable from ``scope_body``.
     """
-    cache: dict[int, frozenset[int]] = {}
+    cache: dict[int, set[int]] = {}
     referent_set = set(referent_nodes)
     access_id = id(access_node)
     observed: list[set[cst.CSTNode]] = []
@@ -169,5 +168,5 @@ def live_at_exit(
     survive to the end of the scope -- e.g. which top-level decls a
     module exports across all reachable control-flow paths.
     """
-    cache: dict[int, frozenset[int]] = {}
+    cache: dict[int, set[int]] = {}
     return _walk_flow(scope_body, set(), set(referent_nodes), cache, None)

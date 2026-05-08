@@ -12,7 +12,7 @@ Two phases:
   just-built :class:`~dead_cst.graph.VisitorPayload`. Returns a new
   payload (or ``None``) whose ``nodes`` / ``edges`` extend the file's
   contribution.
-* :meth:`EdgePlugin.finalize` runs once per base after the analyzer's
+* :meth:`EdgePlugin.finalize` runs once per package after the analyzer's
   edge stitching, with the assembled :class:`PluginContext`. Operates
   purely on the graph -- no CST access -- and emits :class:`GraphOp`
   values (:class:`AddNode` / :class:`AddEdge` / :class:`RemoveEdge`).
@@ -22,7 +22,7 @@ Builtin plugins covering core Python conventions (``__main__`` blocks,
 discovery) live as siblings of this ``__init__``. Plugins that target
 specific third-party frameworks (FastAPI, Flask, Click, Typer, pytest,
 unittest) live under :mod:`dead_cst.contrib` next to the
-``UvWorkspaceResolver``; they are re-exported here for ergonomics so
+``UvResolver``; they are re-exported here for ergonomics so
 ``from dead_cst.plugins import FastAPIPlugin`` keeps working.
 
 Third-party plugins can register under the ``dead_cst.plugins``
@@ -61,6 +61,8 @@ from ._core import (
     collect_module_imports,
     decls_by_simple_name,
     decorator_owner,
+    dotted_name,
+    dotted_parts,
     entrypoint_payload,
     find_call_assignments,
     find_handlers,
@@ -69,9 +71,12 @@ from ._core import (
     make_payload,
     mark_entrypoints,
     matched_attr_call,
+    module_node,
+    payload_imports_module,
     require_resolved_dep,
     simple_name,
     single_target_assignment,
+    string_value,
     synthetic_node,
     walk_to_instance_kind,
 )
@@ -160,6 +165,8 @@ __all__ = [
     "collect_module_imports",
     "decls_by_simple_name",
     "decorator_owner",
+    "dotted_name",
+    "dotted_parts",
     "entrypoint_payload",
     "find_call_assignments",
     "find_handlers",
@@ -169,9 +176,12 @@ __all__ = [
     "make_payload",
     "mark_entrypoints",
     "matched_attr_call",
+    "module_node",
+    "payload_imports_module",
     "require_resolved_dep",
     "simple_name",
     "single_target_assignment",
+    "string_value",
     "synthetic_node",
     "walk_to_instance_kind",
 ]

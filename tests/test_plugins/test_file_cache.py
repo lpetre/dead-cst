@@ -1,5 +1,5 @@
-"""Tests for the per-base ``PluginContext`` surface: ``parse``, ``importers``,
-``base_modules``."""
+"""Tests for the per-package ``PluginContext`` surface: ``parse``, ``importers``,
+``package_modules``."""
 
 from __future__ import annotations
 
@@ -10,16 +10,16 @@ from typing import Iterable
 import libcst as cst
 import networkx as nx
 
-from dead_cst import Analysis
-from dead_cst.plugins import GraphOp, ObserveContext, PluginContext
 from dead_cst.graph import SymbolTrie
+from dead_cst.plugins import GraphOp, ObserveContext, PluginContext
+from dead_cst.resolvers import Package
 
 
 def _ctx(tmp_path):
     return PluginContext(
         graph=nx.DiGraph(),
         symbol_lookup=SymbolTrie(),
-        base=tmp_path,
+        package=Package(path=tmp_path, name="pkg"),
         project_root=tmp_path,
     )
 
@@ -44,8 +44,8 @@ def test_parse_handles_syntax_error(tmp_path):
     assert ctx.parse(p) is None
 
 
-def test_base_modules_only_yields_under_base(tmp_path, write_files):
-    """``ctx.base_modules()`` filters to the current base, not the full graph."""
+def test_package_modules_only_yields_under_package(tmp_path, make_analysis, write_files):
+    """``ctx.package_modules()`` filters to the current package, not the full graph."""
     write_files(
         {
             "a/pkg/__init__.py": "",
@@ -54,7 +54,7 @@ def test_base_modules_only_yields_under_base(tmp_path, write_files):
             "b/pkg/m.py": "def g(): pass",
         }
     )
-    seen_per_base: dict[Path, set[str]] = {}
+    seen_per_package: dict[Path, set[str]] = {}
 
     @dataclass
     class _Capture:
@@ -65,21 +65,17 @@ def test_base_modules_only_yields_under_base(tmp_path, write_files):
             return None
 
         def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]:
-            seen_per_base[ctx.base] = {p.name for p, _ in ctx.base_modules()}
+            seen_per_package[ctx.package.path] = {p.name for p, _ in ctx.package_modules()}
             return ()
 
-    Analysis(
-        {tmp_path / "a": [], tmp_path / "b": []},
-        plugins=[_Capture()],
-        project_root=tmp_path,
-    ).materialize_all()
-    # Each base only sees its own files, even though the full graph
-    # contains both bases' nodes by the time the second base runs.
-    assert seen_per_base[tmp_path / "a"] == {"__init__.py", "m.py"}
-    assert seen_per_base[tmp_path / "b"] == {"__init__.py", "m.py"}
+    make_analysis(["a", "b"], plugins=[_Capture()]).materialize_all()
+    # Each package only sees its own files, even though the full graph
+    # contains both packages' nodes by the time the second package runs.
+    assert seen_per_package[tmp_path / "a"] == {"__init__.py", "m.py"}
+    assert seen_per_package[tmp_path / "b"] == {"__init__.py", "m.py"}
 
 
-def test_importers_finds_first_party_imports(tmp_path, write_files):
+def test_importers_finds_first_party_imports(make_analysis, write_files):
     """``ctx.importers(fqname)`` returns paths whose imports reach the target module."""
     write_files(
         {
@@ -103,15 +99,11 @@ def test_importers_finds_first_party_imports(tmp_path, write_files):
             seen.update(ctx.importers("pkg.lib"))
             return ()
 
-    Analysis(
-        {tmp_path: []},
-        plugins=[_Capture()],
-        project_root=tmp_path,
-    ).materialize_all()
+    make_analysis(plugins=[_Capture()]).materialize_all()
     assert {p.name for p in seen} == {"uses_lib.py"}
 
 
-def test_importers_finds_third_party_dist(tmp_path, write_files):
+def test_importers_finds_third_party_dist(make_analysis, write_files):
     """``ctx.importers("typer")`` resolves to the synthetic external dep node."""
     write_files(
         {
@@ -134,15 +126,11 @@ def test_importers_finds_third_party_dist(tmp_path, write_files):
             seen.update(ctx.importers("typer"))
             return ()
 
-    Analysis(
-        {tmp_path: []},
-        plugins=[_Capture()],
-        project_root=tmp_path,
-    ).materialize_all()
+    make_analysis(plugins=[_Capture()]).materialize_all()
     assert {p.name for p in seen} == {"uses_typer.py"}
 
 
-def test_importers_unknown_returns_empty(tmp_path, write_files):
+def test_importers_unknown_returns_empty(make_analysis, write_files):
     write_files({"pkg/__init__.py": "", "pkg/a.py": "def f(): pass"})
     saw_empty = False
 
@@ -159,9 +147,5 @@ def test_importers_unknown_returns_empty(tmp_path, write_files):
             saw_empty = ctx.importers("definitely-not-a-module") == set()
             return ()
 
-    Analysis(
-        {tmp_path: []},
-        plugins=[_Capture()],
-        project_root=tmp_path,
-    ).materialize_all()
+    make_analysis(plugins=[_Capture()]).materialize_all()
     assert saw_empty

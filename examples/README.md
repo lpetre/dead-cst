@@ -7,8 +7,8 @@ root.
 | Example | Demonstrates |
 |---|---|
 | [`simple-app/`](./simple-app) | `MainBlockPlugin` -- entrypoints discovered via `if __name__ == "__main__":` |
-| [`scripts-and-all/`](./scripts-and-all) | `ProjectScriptsPlugin`, `ModuleDundersPlugin`, `PyprojectResolver` (auto-detects `src/` layout) |
-| [`uv-workspace/`](./uv-workspace) | `UvWorkspaceResolver` -- multi-package analysis driven by `uv.lock` |
+| [`scripts-and-all/`](./scripts-and-all) | `ProjectScriptsPlugin`, `ModuleDundersPlugin`, explicit `-p src` path spec |
+| [`uv-workspace/`](./uv-workspace) | `UvResolver` -- multi-package analysis driven by `uv.lock` |
 
 Each subdirectory has its own README with the exact commands to run and the
 expected output. To poke at all three at once:
@@ -17,13 +17,13 @@ expected output. To poke at all three at once:
 # 1. main-block entrypoints
 uv run dead-cst analyze examples/simple-app --plugin main_block
 
-# 2. project.scripts entrypoints + __all__ preservation, src/ auto-detected
+# 2. project.scripts entrypoints + __all__ preservation, src/ layout via -p
 uv run dead-cst analyze examples/scripts-and-all \
-    --resolver pyproject --plugin project_scripts
+    -p src --plugin project_scripts
 
 # 3. multi-package workspace, members + dep edges read from uv.lock
 uv run dead-cst analyze examples/uv-workspace \
-    --resolver uv_workspace --plugin main_block
+    --resolver uv --plugin main_block
 ```
 
 Each command exits non-zero when dead code is found, so they slot into CI

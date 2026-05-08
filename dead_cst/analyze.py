@@ -2,283 +2,72 @@ from __future__ import annotations
 
 import logging
 import sys
-from concurrent.futures import ProcessPoolExecutor
-from dataclasses import dataclass, field
+from collections import deque
+from functools import cached_property
 from pathlib import Path
 from typing import Iterable, Iterator, Mapping, Sequence
 
-import libcst as cst
 import networkx as nx
-from libcst.helpers.module import ModuleNameAndPackage
-from libcst.metadata import CodeRange, MetadataWrapper
 
 from ._edges import resolve_edges
-from ._fqn import FixedFullyQualifiedNameProvider
-from ._visitor import SymbolVisitor
+from ._refresh import (
+    PackageContribution,
+    PackageFiles,
+    build_contribution,
+    build_stale_tasks,
+    enumerate_files,
+    process_stale_files,
+)
 from .branches import (
     DefaultUnreachableRegionDetector,
     UnreachableRegionDetector,
 )
 from .cache import GraphCache, compute_fingerprint
-from .graph import EdgeFlags, Import, NodeFlags, SymbolNode, SymbolTrie, VisitorPayload
+from .graph import EdgeFlags, SymbolNode, SymbolTrie
 from .plugins import (
     EdgePlugin,
-    ObserveContext,
     PluginContext,
     apply_ops,
 )
-from .plugins._core import (
-    make_payload,
-    simple_name,
-)
+from .plugins._core import simple_name
 from .resolvers import (
     ImportResolver,
-    PathMap,
+    Package,
     PathResolver,
-    default_resolve_import,
-    distribution_lookup,
-    editable_distribution_roots,
-    exported_roots,
-    safe_resolve_module,
+    clear_path_caches,
 )
+from .resolvers._core import _validate_packages
 
 logger = logging.getLogger(__name__)
 
 
-def _build_dep_graph(paths: PathMap) -> nx.DiGraph:
-    """``dep -> consumer`` DAG over ``paths.keys()``.
+def _bfs_order(seeds: Iterable[Path], neighbors: Mapping[Path, Sequence[Path]]) -> list[Path]:
+    """BFS-reachable nodes from ``seeds``, in visit order.
 
-    Only keys of ``paths`` enter the graph -- search-path entries that
-    aren't themselves keys (e.g. a venv ``site-packages``) are
-    resolver-lookup-only and never walked, so they have no place in
-    the topo order. The DAG drives both :func:`_order_paths` and the
-    forward / reverse closure walks on :class:`Analysis`.
+    Cycle-safe via the ``visited`` set. The order is determined by
+    the iteration order of ``seeds`` and of each ``neighbors[node]``
+    -- pre-sort both for deterministic output.
     """
-    g: nx.DiGraph = nx.DiGraph()
-    keys = set(paths)
-    for base, search_paths in paths.items():
-        g.add_node(base)
-        for sp in search_paths:
-            if sp in keys:
-                g.add_edge(sp, base)
-    return g
-
-
-def _order_paths(paths: PathMap) -> list[Path]:
-    """Topologically sort ``paths.keys()`` so dependencies are processed first."""
-    return list(nx.topological_sort(_build_dep_graph(paths)))
-
-
-def _chain_resolvers(resolvers: Sequence[PathResolver]) -> ImportResolver:
-    """Compose ``resolvers`` into one ``name -> path`` callable.
-
-    Each resolver's :meth:`PathResolver.resolve_import` is tried in
-    order; the first non-``None`` answer wins. With no resolvers,
-    falls back to :func:`default_resolve_import` so the analyzer keeps
-    working when callers don't pass any (the common public-API case).
-    A single-resolver chain skips the closure -- the typical CLI
-    invocation passes one resolver, and the chain would just call its
-    method directly.
-    """
-    if not resolvers:
-        return default_resolve_import
-    if len(resolvers) == 1:
-        return resolvers[0].resolve_import
-
-    def _resolve(name: str, search_paths: list[Path]) -> str | Path | None:
-        for resolver in resolvers:
-            result = resolver.resolve_import(name, search_paths)
-            if result is not None:
-                return result
-        return None
-
-    return _resolve
-
-
-def _run_observe(
-    plugins: Sequence[EdgePlugin],
-    path: Path,
-    module: cst.Module,
-    base_payload: VisitorPayload,
-    base: Path,
-    project_root: Path,
-) -> VisitorPayload:
-    """Invoke each plugin's :meth:`EdgePlugin.observe` and collect contributions.
-
-    Returns a single :class:`VisitorPayload` that merges every plugin's
-    additions for this file. Plugins that return ``None`` contribute
-    nothing. The result is concatenated with the visitor's payload by
-    :func:`_merge_payloads` and cached together so that warm runs skip
-    both the visitor and the observe pass.
-    """
-    if not plugins:
-        return make_payload()
-    ctx = ObserveContext(
-        path=path,
-        module=module,
-        payload=base_payload,
-        base=base,
-        project_root=project_root,
-    )
-    payloads: list[VisitorPayload] = []
-    for plugin in plugins:
-        if not isinstance(plugin, EdgePlugin):
-            raise TypeError(f"Plugin {plugin!r} does not satisfy EdgePlugin protocol")
-        contribution = plugin.observe(ctx)
-        if contribution is not None:
-            payloads.append(contribution)
-    return _merge_payloads(*payloads) if payloads else make_payload()
-
-
-def _process_one_file(
-    file: Path,
-    *,
-    fqn_entry: ModuleNameAndPackage,
-    search_paths: list[Path],
-    import_resolver: ImportResolver,
-    detector: UnreachableRegionDetector,
-    plugins: Sequence[EdgePlugin],
-    base: Path,
-    project_root: Path,
-) -> VisitorPayload:
-    """Run the visitor + observe pass for a single file and return its payload.
-
-    The caller owns the precomputed FQN entry (built once per base by
-    :func:`_collect_base_specs`) so we can construct
-    :class:`MetadataWrapper` directly with ``cache=`` injected,
-    skipping :class:`FullRepoManager`'s per-instance ``gen_cache``
-    rebuild. Same shape ``FullRepoManager.get_metadata_wrapper_for_path``
-    builds, just without re-walking the file list every time.
-    """
-    module = cst.parse_module(file.read_text())
-    wrapper = MetadataWrapper(
-        module,
-        unsafe_skip_copy=True,
-        cache={FixedFullyQualifiedNameProvider: fqn_entry},
-    )
-    visitor = SymbolVisitor(
-        file,
-        search_paths,
-        import_resolver,
-        unreachable_detector=detector,
-        wrapper=wrapper,
-    )
-    wrapper.visit(visitor)
-    base_payload = visitor.to_payload()
-    plugin_payload = _run_observe(plugins, file, wrapper.module, base_payload, base, project_root)
-    return _merge_payloads(base_payload, plugin_payload)
-
-
-@dataclass(frozen=True, slots=True)
-class _BaseSpec:
-    """Per-base file list partitioned into cache hits and miss files.
-
-    Built once up front in :func:`_collect_base_specs` so the parallel
-    path can flatten every base's miss files into a single sorted task
-    list and the apply phase can iterate every base in deterministic
-    order without re-reading the cache. ``fqn_cache`` covers only the
-    miss files -- hit files never go through the visitor, so they
-    don't need an FQN entry. ``fingerprint`` is this base's per-base
-    cache fingerprint (see :func:`compute_fingerprint`); the recorder
-    uses it when writing payloads back, and :func:`_build_base_spec`
-    uses it when looking them up.
-    """
-
-    base: Path
-    search_paths: tuple[Path, ...]
-    files: tuple[Path, ...]
-    hits: dict[Path, VisitorPayload]
-    miss_files: tuple[Path, ...]
-    fqn_cache: Mapping[str, ModuleNameAndPackage]
-    fingerprint: str
-
-
-def _build_base_spec(
-    base: Path,
-    deps: Sequence[Path],
-    cache: GraphCache | None,
-    fingerprint: str,
-) -> _BaseSpec:
-    """Build a single :class:`_BaseSpec`: enumerate ``base``'s files and
-    partition into cache hits / misses against ``fingerprint``.
-
-    Per-base helper so :class:`Analysis` can refresh one base at a
-    time without paying for sibling bases' file walks. Each cache
-    lookup uses this base's per-base fingerprint, so a sibling base's
-    config change leaves these rows valid. The FQN cache covers only
-    the miss files because hit files never go through the visitor.
-    """
-    search_paths = (base, *deps)
-    # ``.pyi`` stub files participate in the graph as separate modules
-    # under a synthetic ``__pyi__`` FQN segment (see
-    # :class:`~dead_cst._fqn.FixedFullyQualifiedNameProvider`). Their
-    # declarations carry import edges (``cast``, ``TypeAlias``, etc.) and
-    # ``@overload`` stubs need their lifetime tied to the corresponding
-    # ``.py`` impl, so we ingest them through the same visitor pass.
-    files = tuple(sorted([*base.rglob("*.py"), *base.rglob("*.pyi")]))
-    hits: dict[Path, VisitorPayload] = {}
-    miss_files: list[Path] = []
-    for file in files:
-        payload = cache.get(file, fingerprint) if cache is not None else None
-        if payload is None:
-            miss_files.append(file)
-        else:
-            hits[file] = payload
-    fqn_cache: Mapping[str, ModuleNameAndPackage] = (
-        FixedFullyQualifiedNameProvider.gen_cache(base, [str(f) for f in miss_files], timeout=5)
-        if miss_files
-        else {}
-    )
-    return _BaseSpec(
-        base=base,
-        search_paths=search_paths,
-        files=files,
-        hits=hits,
-        miss_files=tuple(miss_files),
-        fqn_cache=fqn_cache,
-        fingerprint=fingerprint,
-    )
-
-
-@dataclass(frozen=True, slots=True)
-class _Task:
-    """Per-file unit of work for the visitor + observe pass.
-
-    ``fqn_entry`` is this file's slice of the per-base FQN cache built
-    once in the parent (see :func:`_collect_base_specs`); the runner
-    injects it into a :class:`MetadataWrapper` rather than rebuilding
-    a :class:`FullRepoManager`. ``search_paths`` doubles as the
-    transition key for ``sys.path`` rebinding + resolver-cache
-    invalidation.
-    """
-
-    file: Path
-    base: Path
-    search_paths: tuple[Path, ...]
-    fqn_entry: ModuleNameAndPackage
-    project_root: Path
-
-
-@dataclass(slots=True)
-class _RunnerState:
-    """Mutable state for the per-task runner, shared by serial and worker paths.
-
-    ``sys_path_baseline`` is the original ``sys.path`` captured at
-    runner startup; transitions rebuild ``sys.path`` from
-    ``search_paths + baseline`` and clear the resolver LRUs. The
-    serial caller restores ``sys.path`` from the baseline when the run
-    finishes; workers don't bother since the process is about to exit.
-    """
-
-    detector: UnreachableRegionDetector
-    plugins: tuple[EdgePlugin, ...]
-    import_resolver: ImportResolver
-    sys_path_baseline: list[str]
-    last_search_paths: tuple[Path, ...] | None = field(default=None)
+    visited: set[Path] = set()
+    order: list[Path] = []
+    queue = deque(seeds)
+    while queue:
+        node = queue.popleft()
+        if node in visited:
+            continue
+        visited.add(node)
+        order.append(node)
+        queue.extend(neighbors.get(node, ()))
+    return order
 
 
 def _rebind_sys_path(search_paths: tuple[Path, ...], baseline: list[str]) -> None:
-    """Set ``sys.path`` to ``search_paths + baseline``, deduplicated."""
+    """Set ``sys.path`` to ``search_paths + baseline``, deduplicated.
+
+    Used by :meth:`Analysis._materialize` so the resolver in
+    :func:`_compose_contribution` -> :func:`resolve_edges` sees this
+    package's first-party prefix while classifying trie-miss imports.
+    """
     new_path: list[str] = []
     seen: set[str] = set()
     for p in search_paths:
@@ -293,369 +82,51 @@ def _rebind_sys_path(search_paths: tuple[Path, ...], baseline: list[str]) -> Non
     sys.path[:] = new_path
 
 
-def _clear_resolver_caches() -> None:
-    """Drop the ``sys.path``-derived resolver caches.
-
-    :func:`safe_resolve_module` keys on fullname and
-    :func:`distribution_lookup` / :func:`editable_distribution_roots`
-    key on ``()`` -- all three read live ``sys.path`` (or
-    :mod:`importlib.metadata` against it) and would otherwise return
-    stale results across bases (different first-party prefix;
-    uv-workspace members shipping their own ``.venv``).
-    """
-    safe_resolve_module.cache_clear()
-    distribution_lookup.cache_clear()
-    editable_distribution_roots.cache_clear()
-
-
-def _process_task(state: _RunnerState, task: _Task) -> tuple[Path, Path, VisitorPayload]:
-    """Run one task, transitioning ``sys.path`` + caches if the base changed.
-
-    Used by both the in-process serial loop and the
-    :class:`ProcessPoolExecutor` workers; the only difference between
-    the two is who owns ``state`` (a local in serial, a per-process
-    global in workers).
-    """
-    if state.last_search_paths != task.search_paths:
-        _rebind_sys_path(task.search_paths, state.sys_path_baseline)
-        _clear_resolver_caches()
-        state.last_search_paths = task.search_paths
-    payload = _process_one_file(
-        task.file,
-        fqn_entry=task.fqn_entry,
-        search_paths=list(task.search_paths),
-        import_resolver=state.import_resolver,
-        detector=state.detector,
-        plugins=state.plugins,
-        base=task.base,
-        project_root=task.project_root,
-    )
-    return task.base, task.file, payload
-
-
-_worker_state: _RunnerState | None = None
-
-
-def _init_worker(
-    detector: UnreachableRegionDetector,
-    plugins: tuple[EdgePlugin, ...],
-    resolvers: tuple[PathResolver, ...],
-) -> None:
-    """Pool initializer: build the worker's :class:`_RunnerState`.
-
-    Resolver chain is rebuilt locally because :func:`_chain_resolvers`
-    can return a closure (not picklable); the resolver instances
-    themselves travel as picklable dataclasses.
-    """
-    global _worker_state
-    _worker_state = _RunnerState(
-        detector=detector,
-        plugins=plugins,
-        import_resolver=_chain_resolvers(resolvers),
-        sys_path_baseline=list(sys.path),
-    )
-
-
-def _worker_process_task(task: _Task) -> tuple[Path, Path, VisitorPayload]:
-    """Pool task: delegate to :func:`_process_task` against the worker's state."""
-    assert _worker_state is not None, "_init_worker must run before _worker_process_task"
-    return _process_task(_worker_state, task)
-
-
-def _build_sorted_tasks(base_specs: dict[Path, _BaseSpec], project_root: Path) -> list[_Task]:
-    """Flatten every base's miss files into one task list, sorted by search_paths.
-
-    Sorting puts same-base tasks adjacent so a runner sees at most one
-    ``sys.path`` transition per base it touches, regardless of total
-    file count. Sorting on ``Path`` tuples directly is fine -- it's
-    just attribute access per comparison.
-    """
-    tasks: list[_Task] = [
-        _Task(
-            file=file,
-            base=base,
-            search_paths=spec.search_paths,
-            fqn_entry=spec.fqn_cache[str(file)],
-            project_root=project_root,
-        )
-        for base, spec in base_specs.items()
-        for file in spec.miss_files
-    ]
-    tasks.sort(key=lambda t: (t.search_paths, t.file))
-    return tasks
-
-
-def _compute_all_miss_payloads(
-    *,
-    base_specs: dict[Path, _BaseSpec],
-    project_root: Path,
-    detector: UnreachableRegionDetector,
-    plugins: Sequence[EdgePlugin],
-    resolvers: Sequence[PathResolver],
-    import_resolver: ImportResolver,
-    cache: GraphCache | None,
-    workers: int | None,
-) -> dict[Path, dict[Path, VisitorPayload]]:
-    """Run visitor + observe for every cache-miss file across every base.
-
-    Both branches use :func:`_process_task` for the per-task work; they
-    differ only in whether the runner state lives on the main process
-    or in :class:`ProcessPoolExecutor` workers. The pool is opt-in
-    (``workers >= 2`` and at least two miss files); below that, the
-    in-process path avoids pool startup cost.
-
-    Cache writes happen on the main process as each payload arrives,
-    so a partial run still warms the cache for files that completed.
-    Returns ``{base: {file: payload}}`` even for bases with no misses,
-    so the caller can index without an existence check.
-    """
-    out: dict[Path, dict[Path, VisitorPayload]] = {b: {} for b in base_specs}
-    total_misses = sum(len(s.miss_files) for s in base_specs.values())
-    if total_misses == 0:
-        return out
-
-    tasks = _build_sorted_tasks(base_specs, project_root)
-    use_pool = workers is not None and workers >= 2 and total_misses >= 2
-
-    def _record(base: Path, file: Path, payload: VisitorPayload) -> None:
-        out[base][file] = payload
-        if cache is not None:
-            cache.put(file, payload, base_specs[base].fingerprint)
-
-    if use_pool:
-        assert workers is not None
-        with ProcessPoolExecutor(
-            max_workers=min(workers, len(tasks)),
-            initializer=_init_worker,
-            initargs=(detector, tuple(plugins), tuple(resolvers)),
-        ) as pool:
-            for base, file, payload in pool.map(_worker_process_task, tasks):
-                _record(base, file, payload)
-        return out
-
-    # Serial: run every task in-process. Restore ``sys.path`` on the
-    # way out so callers (tests, library users) don't see lingering
-    # mutations from the runner's per-base rebinds.
-    baseline = list(sys.path)
-    state = _RunnerState(
-        detector=detector,
-        plugins=tuple(plugins),
-        import_resolver=import_resolver,
-        sys_path_baseline=baseline,
-    )
-    try:
-        for task in tasks:
-            base, file, payload = _process_task(state, task)
-            _record(base, file, payload)
-    finally:
-        sys.path[:] = baseline
-    return out
-
-
-def _merge_payloads(*payloads: VisitorPayload) -> VisitorPayload:
-    """Concatenate the ``nodes``/``edges``/``imports``/``dead_suites`` of every payload."""
-    nodes: list[SymbolNode] = []
-    edges: list[tuple[SymbolNode, SymbolNode, CodeRange]] = []
-    imports: list[tuple[SymbolNode, Import, CodeRange]] = []
-    dead_suites: list[CodeRange] = []
-    for p in payloads:
-        nodes.extend(p.nodes)
-        edges.extend(p.edges)
-        imports.extend(p.imports)
-        dead_suites.extend(p.dead_suites)
-    return VisitorPayload(
-        nodes=tuple(nodes),
-        edges=tuple(edges),
-        imports=tuple(imports),
-        dead_suites=tuple(dead_suites),
-    )
-
-
-def _contains(suite: CodeRange, access: CodeRange) -> bool:
-    """``True`` iff ``access`` is fully nested inside ``suite``.
-
-    Compares ``(line, column)`` lexicographically at both ends. Suites
-    are line-aligned in practice (libcst positions an ``IndentedBlock``
-    at its first statement) so the line check usually decides; the
-    column tiebreak handles one-line ``if False: x = 1`` suites.
-    """
-    s_start = (suite.start.line, suite.start.column)
-    s_end = (suite.end.line, suite.end.column)
-    a_start = (access.start.line, access.start.column)
-    a_end = (access.end.line, access.end.column)
-    return s_start <= a_start and a_end <= s_end
-
-
-def _apply_payload(
-    payload: VisitorPayload,
-    *,
-    current_trie: SymbolTrie,
-    export_trie: SymbolTrie,
-    file_exported: bool,
-    symbol_graph: nx.MultiDiGraph,
-    import_edges: set[tuple[SymbolNode, Import, EdgeFlags]],
-) -> None:
-    """Emit ``payload`` into the in-progress per-base structures.
-
-    Drives all node routing off ``SymbolNode.flags`` and ``type``:
-
-    * ``type == "module"`` goes into the graph and the trie; no parent
-      edge (modules are themselves the parent target).
-    * ``type == "synthetic"`` (plugin-emitted markers) goes into the
-      graph only -- no parent edge, no trie entry. Synthetic fqnames
-      don't fit the dotted module hierarchy and aren't lookup targets
-      for cross-module imports.
-    * Other decls go into the graph with a parent-module edge.
-      ``NodeFlags.SHADOWED`` excludes them from the trie -- the graph
-      keeps the parent edge so the decl stays well-formed, but
-      cross-module imports never resolve to it.
-    * ``NodeFlags.ENTRYPOINT`` (typically on plugin synthetics)
-      seeds reachability: ``graph.nodes[node]["entrypoint"] = True``
-      so :func:`find_reachable` starts its BFS from this node.
-
-    Edge flag derivation: each ``(src, dst, access_pos)`` entry has
-    its access position tested against ``payload.dead_suites`` for
-    containment. If matched, the resulting graph edge gets
-    :data:`EdgeFlags.DEAD_BRANCH`. Plugin-emitted edges use
-    ``SYNTHETIC_POSITION`` (line 0), which never falls inside a real
-    dead suite, so they always land with ``EdgeFlags.NONE``.
-    Unresolved cross-file imports accumulate into ``import_edges``
-    along with the derived flag and are fed to :func:`resolve_edges`
-    once the per-base trie is fully built; resolution preserves the
-    flag through every emission.
-
-    Per-file dead-suite positions are stashed on the graph as
-    ``graph.graph["dead_suites"][module.path]`` for downstream
-    reporting (e.g. "this file has unreachable code at line X").
-    """
-    module = next(n for n in payload.nodes if n.type == "module")
-
-    def flag_for(pos: CodeRange) -> EdgeFlags:
-        return (
-            EdgeFlags.DEAD_BRANCH
-            if any(_contains(s, pos) for s in payload.dead_suites)
-            else EdgeFlags.NONE
-        )
-
-    for n in payload.nodes:
-        symbol_graph.add_node(n)
-        if n.flags & NodeFlags.ENTRYPOINT:
-            symbol_graph.nodes[n]["entrypoint"] = True
-        if n.type == "synthetic":
-            continue
-        if n.type != "module":
-            symbol_graph.add_edge(n, module, flags=EdgeFlags.NONE)
-        # ``OVERLOAD`` and ``SHADOWED`` both keep the decl out of the
-        # cross-module lookup trie. ``OVERLOAD`` decls are kept alive
-        # via explicit ``impl -> overload`` edges (same-file via the
-        # visitor, cross-file via the ``OverloadStubLink`` plugin), so
-        # exposing them as import targets would route consumer imports
-        # through a typing stub instead of the runtime impl.
-        if not (n.flags & (NodeFlags.SHADOWED | NodeFlags.OVERLOAD)):
-            current_trie.add_declaration(n)
-            if file_exported:
-                export_trie.add_declaration(n)
-
-    for src, dst, pos in payload.edges:
-        symbol_graph.add_edge(src, dst, flags=flag_for(pos))
-
-    for src, imp, pos in payload.imports:
-        import_edges.add((src, imp, flag_for(pos)))
-
-    if payload.dead_suites:
-        symbol_graph.graph["dead_suites"][module.path] = payload.dead_suites
-
-
-@dataclass(slots=True)
-class _BaseContribution:
-    """One base's pre-stitched contribution to the symbol graph.
-
-    Built once per base by :func:`_build_contribution` and composed
-    into a target graph by :func:`_compose_contribution`, which adds
-    cross-base edges via :func:`resolve_edges` and runs plugin
-    :meth:`EdgePlugin.finalize` against the composed graph.
-
-    ``base_graph.graph["dead_suites"]`` carries this base's per-file
-    dead-suite positions; the compose step folds them into the target
-    graph's matching key.
-    """
-
-    base: Path
-    current_trie: SymbolTrie
-    export_trie: SymbolTrie
-    base_graph: nx.MultiDiGraph
-    import_edges: frozenset[tuple[SymbolNode, Import, EdgeFlags]]
-
-
-def _build_contribution(
-    base: Path,
-    spec: _BaseSpec,
-    miss_payloads: Mapping[Path, VisitorPayload],
-) -> _BaseContribution:
-    """Apply ``spec``'s per-file payloads into a base-local graph slice.
-
-    The base-local ``nx.MultiDiGraph`` is what makes scope-bounded
-    materialization cheap: composing it into the full graph or a
-    closure graph doesn't redo per-file apply work.
-    """
-    current_trie = SymbolTrie()
-    export_trie = SymbolTrie()
-    export_roots = exported_roots(base)
-    import_edges: set[tuple[SymbolNode, Import, EdgeFlags]] = set()
-    base_graph: nx.MultiDiGraph = nx.MultiDiGraph()
-    base_graph.graph["dead_suites"] = {}
-    for file in spec.files:
-        payload = spec.hits.get(file)
-        if payload is None:
-            payload = miss_payloads[file]
-        file_exported = export_roots is None or _under_any(file, export_roots)
-        _apply_payload(
-            payload,
-            current_trie=current_trie,
-            export_trie=export_trie,
-            file_exported=file_exported,
-            symbol_graph=base_graph,
-            import_edges=import_edges,
-        )
-    current_trie.add_module_hierarchy_edges(base_graph)
-    return _BaseContribution(
-        base=base,
-        current_trie=current_trie,
-        export_trie=export_trie,
-        base_graph=base_graph,
-        import_edges=frozenset(import_edges),
-    )
-
-
 def _compose_contribution(
-    contrib: _BaseContribution,
+    contrib: PackageContribution,
     *,
     target_graph: nx.MultiDiGraph,
     symbol_lookup: SymbolTrie,
     plugins: Sequence[EdgePlugin],
     project_root: Path,
+    import_resolver: ImportResolver,
+    search_paths: list[Path],
 ) -> None:
-    """Merge ``contrib.base_graph`` into ``target_graph``, stitch
-    cross-base imports against ``symbol_lookup``, and run plugin
+    """Merge ``contrib.package_graph`` into ``target_graph``, stitch
+    cross-package imports against ``symbol_lookup``, and run plugin
     :meth:`EdgePlugin.finalize` against the composed graph.
 
     The caller owns ``symbol_lookup`` because its construction depends
     on which dep export tries are in scope -- the full-graph path
     merges every dep's exports, while the closure-scoped path merges
-    only deps inside the requested scope.
+    only deps inside the requested scope. ``import_resolver`` +
+    ``search_paths`` reach :func:`resolve_edges` for the trie-miss
+    classification path (stdlib / external dist / external file /
+    unresolved); they are unused when every import resolves
+    first-party in the trie.
     """
     target_graph.update(
-        edges=contrib.base_graph.edges(data=True, keys=True),
-        nodes=contrib.base_graph.nodes(data=True),
+        edges=contrib.package_graph.edges(data=True, keys=True),
+        nodes=contrib.package_graph.nodes(data=True),
     )
-    target_graph.graph.setdefault("dead_suites", {}).update(contrib.base_graph.graph["dead_suites"])
-    for src, dst, flags in resolve_edges(contrib.import_edges, symbol_lookup, contrib.base):
-        target_graph.add_edge(src, dst, flags=flags)
+    target_graph.graph.setdefault("dead_suites", {}).update(
+        contrib.package_graph.graph["dead_suites"]
+    )
+    target_graph.add_edges_from(
+        (src, dst, {"flags": flags})
+        for src, dst, flags in resolve_edges(
+            contrib.import_edges,
+            symbol_lookup,
+            contrib.package.path,
+            import_resolver=import_resolver,
+            search_paths=search_paths,
+        )
+    )
     if plugins:
         ctx = PluginContext(
             graph=target_graph,
             symbol_lookup=symbol_lookup,
-            base=contrib.base,
+            package=contrib.package,
             project_root=project_root,
         )
         for plugin in plugins:
@@ -666,22 +137,6 @@ def _compose_contribution(
             # size during iteration".
             ops = list(plugin.finalize(ctx))
             apply_ops(target_graph, ops)
-
-
-def _under_any(file: Path, roots: list[Path]) -> bool:
-    """True iff ``file`` is equal to or nested under any of ``roots``."""
-    f = file.resolve()
-    for r in roots:
-        if f == r or f.is_relative_to(r):
-            return True
-    return False
-
-
-def _infer_project_root(paths: PathMap) -> Path:
-    bases = list(paths)
-    if not bases:
-        return Path.cwd()
-    return min(bases, key=lambda p: len(p.parts))
 
 
 def _find_reachable(graph: nx.MultiDiGraph) -> set[SymbolNode]:
@@ -753,195 +208,241 @@ def _count_nodes(graph: nx.MultiDiGraph, prefix: Path | None) -> dict[str, int]:
 class Analysis:
     """Lazy entrypoint to the dead-cst pipeline.
 
-    Holds the analyzer's config (paths, plugins, resolvers, cache,
-    detector, worker count) and memoizes per-base work so multiple
-    queries against the same project share the cost. Construction is
-    cheap; nothing is read or parsed until you ask.
+    Holds the analyzer's config (paths, plugins, resolver, cache,
+    detector, worker count) and memoizes per-package work so multiple
+    queries against the same project share the cost. Construction
+    runs the resolver's :meth:`PathResolver.resolve` once to build
+    the path map, but no source files are read or parsed until you
+    ask -- the visitor pass is gated on :meth:`refresh` /
+    :meth:`materialize_all`.
 
     Three coarse stages happen on demand:
 
-    1. **Per-base file enumeration + visitor pass** -- driven by
-       :meth:`refresh`. Walks each requested base's files, hashes
-       them against the cache, runs the visitor + observe pass on
-       misses, writes payloads back to the cache. Idempotent and
-       scoped: ``refresh(bases=[B])`` touches only ``B``'s file tree.
+    1. **File enumeration + visitor pass** -- driven by
+       :meth:`refresh`. Walks each requested package's files, hashes
+       them against the cache, then flattens every package's misses
+       into one global stale-file list and runs the visitor +
+       observe pass once across all of them (parallel when
+       ``workers`` permits). Idempotent and scoped:
+       ``refresh(packages=[p])`` walks only ``p``'s file tree.
 
-    2. **Per-base contribution build** -- the per-base trie + a
-       base-local graph slice + the unresolved cross-file import set.
-       Built once per base from the payloads above, memoized for the
-       lifetime of the :class:`Analysis`.
+    2. **Per-package contribution build** -- the per-package trie + a
+       package-local graph slice + the unresolved cross-file import
+       set. Built once per package from the payloads above, memoized
+       for the lifetime of the :class:`Analysis`.
 
-    3. **Cross-base composition** -- merging contributions, running
+    3. **Cross-package composition** -- merging contributions, running
        :func:`resolve_edges` against the merged tries, running plugin
-       :meth:`EdgePlugin.finalize`. Scoped to either the full base set
-       (:meth:`materialize_all`) or the "interesting set" of one base
-       (:meth:`materialize_closure` / :meth:`PackageView.graph`),
-       which is the forward dependency closure of that base's reverse
-       (consumer) closure -- the only bases that could keep a decl in
-       the target base alive.
+       :meth:`EdgePlugin.finalize`. Scoped to either the full package
+       set (:meth:`materialize_all`) or the "interesting set" of one
+       package (:meth:`materialize_closure` / :meth:`PackageView.graph`),
+       which is the forward dependency closure of that package's
+       reverse (consumer) closure -- the only packages that could keep
+       a decl in the target package alive.
 
-    The lazy split lets cheap per-base queries skip stage 3 entirely:
+    The lazy split lets cheap per-package queries skip stage 3 entirely:
     :meth:`PackageView.modules` and :meth:`PackageView.declarations`
-    only need stage 2 for their own base. Reachability queries
+    only need stage 2 for their own package. Reachability queries
     (:meth:`PackageView.dead`, :meth:`Analysis.dead`) trigger stage 3
     over the appropriate scope -- the "interesting set" for a single
-    package, or every base for the full graph. Composing a graph is
+    package, or every package for the full graph. Composing a graph is
     much cheaper than recomputing payloads, so per-package queries
     against a warm cache stay fast even on large repos.
 
-    Parameters mirror :func:`build_symbol_graph`; see its docstring for
-    detailed semantics. Once constructed, an :class:`Analysis` is
-    effectively read-only -- mutating ``paths`` after construction has
-    no effect because the configuration is copied. Spin up a fresh
-    instance to pick up new search paths or new plugins.
+    The configured ``resolver`` is queried twice: once at construction
+    time to build the per-package :class:`Package` list (calling
+    :meth:`PathResolver.resolve` with ``project_root`` and validating
+    the result), and again during edge stitching to classify trie-miss
+    imports via :meth:`PathResolver.resolve_import`. Once constructed,
+    an :class:`Analysis` is effectively read-only -- spin up a fresh
+    instance to pick up a new resolver or new plugins.
     """
 
     def __init__(
         self,
-        paths: PathMap,
+        project_root: Path,
         *,
+        resolver: PathResolver,
         plugins: Sequence[EdgePlugin] = (),
-        resolvers: Sequence[PathResolver] = (),
-        project_root: Path | None = None,
         cache: GraphCache | None = None,
         unreachable_detector: UnreachableRegionDetector | None = None,
         workers: int | None = None,
     ) -> None:
-        self._paths: dict[Path, list[Path]] = {b: list(deps) for b, deps in paths.items()}
+        self._project_root: Path = project_root
+        validated = _validate_packages(resolver.resolve(project_root))
+        self._packages_by_path: dict[Path, Package] = {p.path: p for p in validated}
+        by_name = {p.name: p.path for p in validated}
+        self._dep_paths_by_package: dict[Path, tuple[Path, ...]] = {
+            p.path: tuple(by_name[d] for d in p.deps) for p in validated
+        }
+        # Reverse map: package path -> packages that name this one in
+        # their ``deps``. Pre-sorted by path so consumer-side BFS (used
+        # by ``reverse_closure`` and ``packages``) yields a deterministic
+        # order.
+        consumers: dict[Path, list[Path]] = {p.path: [] for p in validated}
+        for p in validated:
+            for dep_name in p.deps:
+                consumers[by_name[dep_name]].append(p.path)
+        self._consumers_by_package: dict[Path, tuple[Path, ...]] = {
+            path: tuple(sorted(cs)) for path, cs in consumers.items()
+        }
         self._plugins: tuple[EdgePlugin, ...] = tuple(plugins)
-        self._resolvers: tuple[PathResolver, ...] = tuple(resolvers)
         self._cache = cache
         self._workers = workers
-        self._project_root: Path = (
-            project_root
-            if project_root is not None
-            else (_infer_project_root(self._paths) if self._paths else Path.cwd())
-        )
-        self._import_resolver: ImportResolver = _chain_resolvers(self._resolvers)
+        self._import_resolver: ImportResolver = resolver.resolve_import
         self._detector: UnreachableRegionDetector = (
             unreachable_detector
             if unreachable_detector is not None
             else DefaultUnreachableRegionDetector()
         )
-        self._dep_graph: nx.DiGraph | None = None
-        self._ordered_bases: list[Path] | None = None
-        self._base_specs: dict[Path, _BaseSpec] = {}
-        self._contributions: dict[Path, _BaseContribution] = {}
+        # One fingerprint per analysis -- the visitor's output is
+        # purely a function of the file's source plus the plugin /
+        # detector chain, so every package shares the same key.
+        self._fingerprint: str = compute_fingerprint(
+            plugins=self._plugins,
+            unreachable_detector=self._detector,
+        )
+        self._package_files: dict[Path, PackageFiles] = {}
+        self._contributions: dict[Path, PackageContribution] = {}
         self._closure_graphs: dict[Path, nx.MultiDiGraph] = {}
         self._full_graph: nx.MultiDiGraph | None = None
-
-    @property
-    def paths(self) -> PathMap:
-        """Read-only view of the base -> deps mapping this analysis was built with."""
-        return {b: list(deps) for b, deps in self._paths.items()}
+        # Memoize closure-walk results -- the package graph is
+        # immutable post-construction.
+        self._reverse_closures: dict[Path, frozenset[Path]] = {}
+        self._interesting_sets: dict[Path, frozenset[Path]] = {}
 
     @property
     def project_root(self) -> Path:
         return self._project_root
 
-    def _dep_dag(self) -> nx.DiGraph:
-        """``dep -> consumer`` DAG over ``paths.keys()``; reused by
-        topo-sort and ancestor / descendant queries.
+    def _dep_paths(self, package: Path) -> tuple[Path, ...]:
+        """Precomputed dep paths for the package at ``package``."""
+        return self._dep_paths_by_package.get(package, ())
+
+    @cached_property
+    def packages(self) -> tuple[Package, ...]:
+        """Deterministic, cycle-tolerant package order.
+
+        Dependencies precede their dependents whenever the package
+        graph is acyclic. Packages trapped in dep cycles are appended
+        at the end in path order. The traversal is fully deterministic
+        across runs.
         """
-        if self._dep_graph is None:
-            self._dep_graph = _build_dep_graph(self._paths)
-        return self._dep_graph
+        sorted_paths = sorted(self._packages_by_path)
+        seeds = [p for p in sorted_paths if not self._dep_paths_by_package.get(p)]
+        order = _bfs_order(seeds, self._consumers_by_package)
+        visited = set(order)
+        order.extend(p for p in sorted_paths if p not in visited)
+        return tuple(self._packages_by_path[p] for p in order)
 
-    @property
-    def bases(self) -> list[Path]:
-        """Bases in topological order (deps before dependents)."""
-        if self._ordered_bases is None:
-            self._ordered_bases = list(nx.topological_sort(self._dep_dag()))
-        return list(self._ordered_bases)
+    def reverse_closure(self, package: Path) -> frozenset[Path]:
+        """Packages that transitively depend on ``package`` (including itself).
 
-    def reverse_closure(self, base: Path) -> frozenset[Path]:
-        """Bases that transitively depend on ``base`` (including ``base`` itself).
-
-        These are the only bases whose source code could import (and
-        therefore keep alive) decls under ``base``. A query like "is X
-        in ``base`` dead?" only needs entrypoints from this set --
-        sibling bases that don't reach ``base`` in the search-paths
-        DAG can't reference its decls.
+        These are the only packages whose source code could import (and
+        therefore keep alive) decls under ``package``. A query like
+        "is X in ``package`` dead?" only needs entrypoints from this
+        set -- sibling packages that can't reach ``package`` through
+        the dep graph can't reference its decls. Cycle-safe: BFS
+        terminates even when ``Package.deps`` cycles.
         """
-        if base not in self._paths:
-            raise KeyError(base)
-        return frozenset({base}) | frozenset(nx.descendants(self._dep_dag(), base))
+        if package not in self._packages_by_path:
+            raise KeyError(package)
+        cached = self._reverse_closures.get(package)
+        if cached is None:
+            cached = frozenset(_bfs_order([package], self._consumers_by_package))
+            self._reverse_closures[package] = cached
+        return cached
 
-    def _interesting_set(self, base: Path) -> frozenset[Path]:
-        """Bases needed to answer reachability queries about decls in ``base``.
+    def _interesting_set(self, package: Path) -> frozenset[Path]:
+        """Packages needed to answer reachability queries about decls in ``package``.
 
-        Computed as the forward (deps) closure of :meth:`reverse_closure`:
-        every consumer of ``base`` plus every consumer's transitive
-        deps, so we have enough trie data to resolve every cross-base
-        import that could lead into ``base``.
+        :meth:`reverse_closure` ∪ each consumer's transitive deps, so
+        we have enough trie data to resolve every cross-package import
+        that could lead into ``package``.
         """
-        dag = self._dep_dag()
-        scope: set[Path] = set()
-        for consumer in self.reverse_closure(base):
-            scope.add(consumer)
-            scope |= nx.ancestors(dag, consumer)
-        return frozenset(scope)
+        cached = self._interesting_sets.get(package)
+        if cached is None:
+            cached = frozenset(
+                _bfs_order(self.reverse_closure(package), self._dep_paths_by_package)
+            )
+            self._interesting_sets[package] = cached
+        return cached
 
-    def refresh(self, bases: Iterable[Path] | None = None) -> Analysis:
-        """Update the cache and build per-base contributions for the given bases.
+    def refresh(self, packages: Iterable[Path] | None = None) -> Analysis:
+        """Update the cache and build per-package contributions.
 
-        ``bases=None`` (the default) refreshes every base. Passing a
-        subset scopes the file walk + visitor pass to those bases
-        only -- sibling bases are untouched. Already-refreshed bases
-        are skipped, so calling :meth:`refresh` twice with the same
-        argument is cheap.
+        ``packages=None`` (the default) refreshes every package.
+        Passing a subset scopes the file walk + visitor pass to those
+        packages only -- siblings are untouched. Already-refreshed
+        packages are skipped, so calling :meth:`refresh` twice with the
+        same argument is cheap.
+
+        Three steps run in order: (1) walk each new target's tree and
+        partition into cache hits / misses, (2) flatten every package's
+        misses into a single global stale-file list and run the
+        visitor + observe pass on each one (parallel when ``workers``
+        permits), (3) apply each package's payloads into a local
+        contribution. Step 2 ignores which package each file lives
+        under, so a refresh that touches several packages pays for one
+        worker pool startup, not one per package.
 
         Returns ``self`` so callers can chain
         ``Analysis(...).refresh().materialize_all()``.
         """
-        targets = list(bases) if bases is not None else self.bases
-        unknown = [b for b in targets if b not in self._paths]
+        targets = list(packages) if packages is not None else [p.path for p in self.packages]
+        unknown = [p for p in targets if p not in self._packages_by_path]
         if unknown:
-            raise KeyError(f"Unknown bases: {unknown}")
-        new_targets = [b for b in targets if b not in self._contributions]
+            raise KeyError(f"Unknown packages: {unknown}")
+        new_targets = [p for p in targets if p not in self._contributions]
         if not new_targets:
             return self
-        for b in new_targets:
-            if b not in self._base_specs:
-                self._base_specs[b] = _build_base_spec(
-                    b, self._paths[b], self._cache, self._base_fingerprint(b)
+
+        for path in new_targets:
+            if path not in self._package_files:
+                self._package_files[path] = enumerate_files(
+                    self._packages_by_path[path], self._cache, self._fingerprint
                 )
-        partial_specs = {b: self._base_specs[b] for b in new_targets}
-        miss_payloads = _compute_all_miss_payloads(
-            base_specs=partial_specs,
-            project_root=self._project_root,
+
+        pending = {p: self._package_files[p] for p in new_targets}
+        tasks = build_stale_tasks(pending, self._project_root)
+        miss_payloads = process_stale_files(
+            tasks=tasks,
             detector=self._detector,
             plugins=self._plugins,
-            resolvers=self._resolvers,
-            import_resolver=self._import_resolver,
             cache=self._cache,
+            fingerprint=self._fingerprint,
             workers=self._workers,
         )
-        for b in new_targets:
-            self._contributions[b] = _build_contribution(b, self._base_specs[b], miss_payloads[b])
+
+        for path in new_targets:
+            self._contributions[path] = build_contribution(
+                self._packages_by_path[path],
+                self._package_files[path],
+                miss_payloads,
+            )
         return self
 
-    def package(self, base: Path) -> PackageView:
-        """Return a lazy view onto a single base.
+    def package(self, path: Path) -> PackageView:
+        """Return a lazy view onto a single package.
 
-        The returned :class:`PackageView` is cheap; per-base work is
+        The returned :class:`PackageView` is cheap; per-package work is
         triggered by its query methods.
         """
-        if base not in self._paths:
-            raise KeyError(base)
-        return PackageView(self, base)
+        if path not in self._packages_by_path:
+            raise KeyError(path)
+        return PackageView(self, self._packages_by_path[path])
 
-    def packages(self) -> Iterator[PackageView]:
-        """Yield a :class:`PackageView` for every base in topological order."""
-        for base in self.bases:
-            yield PackageView(self, base)
+    def views(self) -> Iterator[PackageView]:
+        """Yield a :class:`PackageView` for every package in :attr:`packages` order."""
+        for package in self.packages:
+            yield PackageView(self, package)
 
     def materialize_all(self) -> nx.MultiDiGraph:
-        """Build the full graph (every base, cross-base resolution, plugins).
+        """Build the full graph (every package, cross-package resolution, plugins).
 
         Memoized: the second call returns the same graph object.
-        Refreshes every base first, so this is also the trigger for a
-        whole-project cache refresh in callers that don't refresh
+        Refreshes every package first, so this is also the trigger
+        for a whole-project cache refresh in callers that don't refresh
         explicitly.
         """
         if self._full_graph is None:
@@ -949,13 +450,14 @@ class Analysis:
             self._full_graph = self._materialize(scope=None)
         return self._full_graph
 
-    def materialize_closure(self, base: Path) -> nx.MultiDiGraph:
-        """Build a graph containing every contribution in ``_interesting_set(base)``.
+    def materialize_closure(self, package: Path) -> nx.MultiDiGraph:
+        """Build a graph containing every contribution in ``_interesting_set(package)``.
 
         The result is the smallest graph that gives correct
-        reachability answers for decls in ``base``: every consumer of
-        ``base`` (so we see every potential alive-keeper) plus every
-        consumer's transitive deps (so cross-base imports resolve).
+        reachability answers for decls in ``package``: every consumer
+        of ``package`` (so we see every potential alive-keeper) plus
+        every consumer's transitive deps (so cross-package imports
+        resolve).
 
         If :meth:`materialize_all` has already been called, returns
         the full graph instead -- it's a strict superset and cheaper
@@ -963,30 +465,57 @@ class Analysis:
         """
         if self._full_graph is not None:
             return self._full_graph
-        if base not in self._closure_graphs:
-            scope = self._interesting_set(base)
-            self.refresh(bases=scope)
-            self._closure_graphs[base] = self._materialize(scope=scope)
-        return self._closure_graphs[base]
+        if package not in self._closure_graphs:
+            scope = self._interesting_set(package)
+            self.refresh(packages=scope)
+            self._closure_graphs[package] = self._materialize(scope=scope)
+        return self._closure_graphs[package]
 
     def _materialize(self, *, scope: frozenset[Path] | None) -> nx.MultiDiGraph:
-        """Compose every refreshed base in ``scope`` into a fresh graph.
+        """Compose every refreshed package in ``scope`` into a fresh graph.
 
-        ``scope=None`` composes every base. Caller is responsible for
-        having :meth:`refresh`'d every base in ``scope`` first.
+        ``scope=None`` composes every package. Caller is responsible
+        for having :meth:`refresh`'d every package in ``scope`` first.
+
+        Cross-file import resolution runs here (in
+        :func:`_compose_contribution` -> :func:`resolve_edges`), which
+        is where the resolver reads ``sys.path`` /
+        :mod:`importlib.metadata`. We rebind ``sys.path`` to each
+        package's ``(path, *deps)`` view before composing it and clear
+        the resolver LRUs at every transition, restoring the original
+        ``sys.path`` on the way out so library callers don't see
+        lingering mutations.
         """
+        from ._progress import progress
+
         g: nx.MultiDiGraph = nx.MultiDiGraph()
         g.graph["dead_suites"] = {}
-        for base in self.bases:
-            if scope is not None and base not in scope:
-                continue
-            _compose_contribution(
-                self._contributions[base],
-                target_graph=g,
-                symbol_lookup=self._build_symbol_lookup(base, scope=scope),
-                plugins=self._plugins,
-                project_root=self._project_root,
-            )
+        baseline = list(sys.path)
+        last_search_paths: tuple[Path, ...] | None = None
+        target_paths = [p.path for p in self.packages if scope is None or p.path in scope]
+        try:
+            for path in progress(
+                target_paths,
+                total=len(target_paths),
+                desc="Reconciling packages",
+                unit="package",
+            ):
+                search_paths = (path, *self._dep_paths(path))
+                if last_search_paths != search_paths:
+                    _rebind_sys_path(search_paths, baseline)
+                    clear_path_caches()
+                    last_search_paths = search_paths
+                _compose_contribution(
+                    self._contributions[path],
+                    target_graph=g,
+                    symbol_lookup=self._build_symbol_lookup(path, scope=scope),
+                    plugins=self._plugins,
+                    project_root=self._project_root,
+                    import_resolver=self._import_resolver,
+                    search_paths=list(search_paths),
+                )
+        finally:
+            sys.path[:] = baseline
         return g
 
     def reachable(self) -> set[SymbolNode]:
@@ -1030,31 +559,15 @@ class Analysis:
     def count_nodes(self, prefix: Path | None = None) -> dict[str, int]:
         """Count nodes in the full graph by ``SymbolNode.type``.
 
-        ``prefix=None`` (the default) counts every node. Pass a base
-        path to scope the count to nodes whose ``path`` is under that
-        prefix -- useful for per-base summaries when several bases are
-        analysed together.
+        ``prefix=None`` (the default) counts every node. Pass a
+        package path to scope the count to nodes whose ``path`` is
+        under that prefix -- useful for per-package summaries when
+        several packages are analysed together.
         """
         return _count_nodes(self.materialize_all(), prefix)
 
-    def _base_fingerprint(self, base: Path) -> str:
-        """Per-base cache fingerprint for ``base``.
-
-        Each base's fingerprint is independent: it covers ``base`` and
-        its own search paths but not sibling bases' configs, so cache
-        rows for different bases coexist without invalidating each
-        other when one base's deps change.
-        """
-        return compute_fingerprint(
-            base=base,
-            search_paths=(base, *self._paths.get(base, [])),
-            resolvers=self._resolvers,
-            plugins=self._plugins,
-            unreachable_detector=self._detector,
-        )
-
-    def _build_symbol_lookup(self, base: Path, *, scope: frozenset[Path] | None) -> SymbolTrie:
-        """Per-base lookup trie: this base's full trie + each in-scope dep's exports.
+    def _build_symbol_lookup(self, package: Path, *, scope: frozenset[Path] | None) -> SymbolTrie:
+        """Per-package lookup trie: this package's full trie + each in-scope dep's exports.
 
         ``scope`` bounds which deps' export tries are merged in:
         ``None`` for the full-graph path (every dep), or a
@@ -1062,10 +575,10 @@ class Analysis:
         Deps must already be refreshed (the caller is responsible for
         calling :meth:`refresh` on the right set first).
         """
-        contrib = self._contributions[base]
+        contrib = self._contributions[package]
         lookup = SymbolTrie()
         lookup.merge(contrib.current_trie)
-        for dep in self._paths.get(base, []):
+        for dep in self._dep_paths(package):
             if scope is not None and dep not in scope:
                 continue
             dep_contrib = self._contributions.get(dep)
@@ -1076,56 +589,61 @@ class Analysis:
 
 
 class PackageView:
-    """Lazy view of a single base inside an :class:`Analysis`.
+    """Lazy view of a single package inside an :class:`Analysis`.
 
     Cheap to construct (returned by :meth:`Analysis.package`); query
     methods trigger only the work their result depends on. Local
     queries (:meth:`modules`, :meth:`declarations`) only need this
-    base's contribution. Cross-base queries (:meth:`importers_of`,
+    package's contribution. Cross-package queries (:meth:`importers_of`,
     :meth:`dead`, :meth:`graph`) materialize the
-    :meth:`Analysis._interesting_set` for this base.
+    :meth:`Analysis._interesting_set` for this package.
     """
 
-    __slots__ = ("_analysis", "_base")
+    __slots__ = ("_analysis", "_package")
 
-    def __init__(self, analysis: Analysis, base: Path) -> None:
+    def __init__(self, analysis: Analysis, package: Package) -> None:
         self._analysis = analysis
-        self._base = base
+        self._package = package
 
     @property
-    def base(self) -> Path:
-        return self._base
+    def package(self) -> Package:
+        return self._package
+
+    @property
+    def path(self) -> Path:
+        """Convenience for ``view.package.path``."""
+        return self._package.path
 
     @property
     def analysis(self) -> Analysis:
         return self._analysis
 
     def reverse_closure(self) -> frozenset[Path]:
-        """Bases that transitively depend on this one (including this base)."""
-        return self._analysis.reverse_closure(self._base)
+        """Packages that transitively depend on this one (including itself)."""
+        return self._analysis.reverse_closure(self._package.path)
 
-    def _contribution(self) -> _BaseContribution:
-        self._analysis.refresh(bases=[self._base])
-        return self._analysis._contributions[self._base]
+    def _contribution(self) -> PackageContribution:
+        self._analysis.refresh(packages=[self._package.path])
+        return self._analysis._contributions[self._package.path]
 
     def modules(self) -> Iterator[SymbolNode]:
-        """Module nodes for every ``.py`` file in this base.
+        """Module nodes for every ``.py`` file in this package.
 
-        Local-only: refreshes this base if needed but never touches
-        deps or consumers.
+        Local-only: refreshes this package if needed but never
+        touches deps or consumers.
         """
-        for n in self._contribution().base_graph.nodes:
+        for n in self._contribution().package_graph.nodes:
             if n.type == "module":
                 yield n
 
     def declarations(self, name: str | None = None) -> Iterator[SymbolNode]:
-        """Top-level decls in this base.
+        """Top-level decls in this package.
 
         ``name=None`` yields every decl. Pass a string to filter to
         decls whose rightmost dotted segment matches it (``"Foo"``
         matches ``pkg.mod.Foo`` but not ``pkg.Foo.bar``). Local-only.
         """
-        for n in self._contribution().base_graph.nodes:
+        for n in self._contribution().package_graph.nodes:
             if n.type in ("module", "synthetic"):
                 continue
             if name is not None and simple_name(n.fqname) != name:
@@ -1133,58 +651,58 @@ class PackageView:
             yield n
 
     def importers_of(self, target: str) -> set[Path]:
-        """Files in this base whose imports reach ``target``.
+        """Files in this package whose imports reach ``target``.
 
         ``target`` is matched first as a first-party module fqname,
         then against the synthetic ``[external dist] / [external file]
         / [unresolved]`` markers the resolver creates for non-first-
         party imports. Triggers closure materialization (same scope
-        as :meth:`graph`) because cross-base import resolution is
+        as :meth:`graph`) because cross-package import resolution is
         what populates the predecessors used here.
         """
-        scope = self._analysis._interesting_set(self._base)
+        scope = self._analysis._interesting_set(self._package.path)
         ctx = PluginContext(
-            graph=self._analysis.materialize_closure(self._base),
-            symbol_lookup=self._analysis._build_symbol_lookup(self._base, scope=scope),
-            base=self._base,
+            graph=self._analysis.materialize_closure(self._package.path),
+            symbol_lookup=self._analysis._build_symbol_lookup(self._package.path, scope=scope),
+            package=self._package,
             project_root=self._analysis.project_root,
         )
         return ctx.importers(target)
 
     def graph(self) -> nx.MultiDiGraph:
-        """Materialize and return the closure-scoped graph for this base.
+        """Materialize and return the closure-scoped graph for this package.
 
         See :meth:`Analysis.materialize_closure`. The graph is shared
         across queries on the same package -- repeated calls return
         the same object.
         """
-        return self._analysis.materialize_closure(self._base)
+        return self._analysis.materialize_closure(self._package.path)
 
     def reachable(self) -> set[SymbolNode]:
-        """Set of decls in this base reachable from any entrypoint in
+        """Set of decls in this package reachable from any entrypoint in
         :meth:`reverse_closure`.
 
         Triggers closure materialization on first call; subsequent
         calls reuse the cached graph. Filtered to nodes whose ``path``
-        is under :attr:`base`, so the result is comparable to
+        is under :attr:`path`, so the result is comparable to
         :meth:`declarations` for "what's alive in this package?"
         questions.
         """
-        g = self._analysis.materialize_closure(self._base)
-        return {n for n in _find_reachable(g) if n.path.is_relative_to(self._base)}
+        g = self._analysis.materialize_closure(self._package.path)
+        return {n for n in _find_reachable(g) if n.path.is_relative_to(self._package.path)}
 
     def dead(self) -> Iterator[SymbolNode]:
-        """Yield decls in this base not reachable from any entrypoint
+        """Yield decls in this package not reachable from any entrypoint
         in :meth:`reverse_closure`.
 
         Triggers closure materialization on first call; subsequent
         calls reuse the cached graph. Excludes ``module`` and
         ``synthetic`` nodes (see :meth:`Analysis.dead`).
         """
-        g = self._analysis.materialize_closure(self._base)
+        g = self._analysis.materialize_closure(self._package.path)
         reachable = _find_reachable(g)
         for n in g.nodes:
-            if not n.path.is_relative_to(self._base):
+            if not n.path.is_relative_to(self._package.path):
                 continue
             if n.type in ("module", "synthetic"):
                 continue
@@ -1192,39 +710,39 @@ class PackageView:
                 yield n
 
     def kept_alive_by_dead_branches(self) -> set[SymbolNode]:
-        """Decls in this base kept alive only by dead-branch references.
+        """Decls in this package kept alive only by dead-branch references.
 
         Closure-scoped equivalent of :meth:`Analysis.kept_alive_by_dead_branches`,
-        filtered to nodes under :attr:`base`.
+        filtered to nodes under :attr:`path`.
         """
-        g = self._analysis.materialize_closure(self._base)
+        g = self._analysis.materialize_closure(self._package.path)
         diff = _find_reachable(g) - _find_reachable_strict(g)
-        return {n for n in diff if n.path.is_relative_to(self._base)}
+        return {n for n in diff if n.path.is_relative_to(self._package.path)}
 
     def count_nodes(self) -> dict[str, int]:
-        """Count nodes contributed by this base, by ``SymbolNode.type``.
+        """Count nodes contributed by this package, by ``SymbolNode.type``.
 
         Local-only: doesn't materialize the closure. Counts include
         ``module``, source decls, and any ``synthetic`` nodes plugins
-        emitted into this base's contribution during ``observe``.
+        emitted into this package's contribution during ``observe``.
         """
-        return _count_nodes(self._contribution().base_graph, prefix=None)
+        return _count_nodes(self._contribution().package_graph, prefix=None)
 
     def remove_dead_code(self) -> None:
-        """Apply the LibCST codemod, deleting every dead decl in this base.
+        """Apply the LibCST codemod, deleting every dead decl in this package.
 
         Materializes the closure, computes reachability, and feeds the
-        unreachable subgraph (filtered to this base) to
+        unreachable subgraph (filtered to this package) to
         :func:`dead_cst.codemod.remove_code`. The transformation is
         destructive -- back the files up first, or run on a clean
         working tree.
         """
         from .codemod import remove_code
 
-        g = self._analysis.materialize_closure(self._base)
+        g = self._analysis.materialize_closure(self._package.path)
         reachable = _find_reachable(g)
         dead_nodes = [n for n in g.nodes if n not in reachable]
-        remove_code(g.subgraph(dead_nodes), self._base)
+        remove_code(g.subgraph(dead_nodes), self._package.path)
 
 
 __all__ = [
