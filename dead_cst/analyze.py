@@ -209,7 +209,13 @@ def _build_base_spec(
     the miss files because hit files never go through the visitor.
     """
     search_paths = (base, *deps)
-    files = tuple(sorted(base.rglob("*.py")))
+    # ``.pyi`` stub files participate in the graph as separate modules
+    # under a synthetic ``__pyi__`` FQN segment (see
+    # :class:`~dead_cst._fqn.FixedFullyQualifiedNameProvider`). Their
+    # declarations carry import edges (``cast``, ``TypeAlias``, etc.) and
+    # ``@overload`` stubs need their lifetime tied to the corresponding
+    # ``.py`` impl, so we ingest them through the same visitor pass.
+    files = tuple(sorted([*base.rglob("*.py"), *base.rglob("*.pyi")]))
     hits: dict[Path, VisitorPayload] = {}
     miss_files: list[Path] = []
     for file in files:
@@ -539,7 +545,13 @@ def _apply_payload(
             continue
         if n.type != "module":
             symbol_graph.add_edge(n, module, flags=EdgeFlags.NONE)
-        if not (n.flags & NodeFlags.SHADOWED):
+        # ``OVERLOAD`` and ``SHADOWED`` both keep the decl out of the
+        # cross-module lookup trie. ``OVERLOAD`` decls are kept alive
+        # via explicit ``impl -> overload`` edges (same-file via the
+        # visitor, cross-file via the ``OverloadStubLink`` plugin), so
+        # exposing them as import targets would route consumer imports
+        # through a typing stub instead of the runtime impl.
+        if not (n.flags & (NodeFlags.SHADOWED | NodeFlags.OVERLOAD)):
             current_trie.add_declaration(n)
             if file_exported:
                 export_trie.add_declaration(n)

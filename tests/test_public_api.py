@@ -82,6 +82,7 @@ EXPECTED_PUBLIC_API: dict[str, list[str]] = {
         "ObserveContext",
         "PluginContext",
         "ProjectScriptsPlugin",
+        "PyiStubPlugin",
         "PytestPlugin",
         "RemoveEdge",
         "STDLIB_PREFIX",

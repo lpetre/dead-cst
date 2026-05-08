@@ -88,14 +88,19 @@ def build_plugins(
 ) -> list[EdgePlugin]:
     """Compose the plugin list from CLI flags.
 
-    Order: user-specified plugins first, then ``ModuleDundersPlugin``, then
-    ``ExplicitEntrypointPlugin`` with the ``-e`` specs. ``-e`` runs last so
-    it can hang entrypoints off any synthetic nodes contributed upstream.
+    Order: user-specified plugins first, then ``ModuleDundersPlugin``,
+    then ``PyiStubPlugin`` (anchors ``.pyi`` decls to their ``.py``
+    twins), then ``ExplicitEntrypointPlugin`` with the ``-e`` specs.
+    ``-e`` runs last so it can hang entrypoints off any synthetic nodes
+    contributed upstream.
     """
+    from .plugins import PyiStubPlugin
+
     plugins: list[EdgePlugin] = []
     for name in plugin_names:
         plugins.append(load_plugin(name))
     plugins.append(ModuleDundersPlugin())
+    plugins.append(PyiStubPlugin())
     if entrypoints:
         specs = [parse_entrypoint(ep) for ep in entrypoints]
         plugins.append(ExplicitEntrypointPlugin(specs=specs))
