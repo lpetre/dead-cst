@@ -138,3 +138,24 @@ def test_pytest_plugin_loads_via_load_plugin():
 
     plugin = load_plugin("pytest")
     assert isinstance(plugin, PytestPlugin)
+
+
+def test_pytest_plugin_tags_seeds_as_testcase(make_analysis, write_files):
+    write_files(
+        {
+            "tests/__init__.py": "",
+            "tests/test_things.py": "def test_one(): pass",
+            "tests/conftest.py": """
+            import pytest
+
+            @pytest.fixture
+            def my_fixture(): return 1
+            """,
+        }
+    )
+    graph = make_analysis(plugins=[PytestPlugin()]).materialize_all()
+    seeds = [n for n, attrs in graph.nodes(data=True) if attrs.get("entrypoint")]
+    assert seeds, "expected pytest plugin to seed at least one entrypoint"
+    # Every seed the plugin created is a test entrypoint.
+    for seed in seeds:
+        assert graph.nodes[seed].get("testcase"), seed.fqname

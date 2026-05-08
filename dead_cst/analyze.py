@@ -190,6 +190,34 @@ def _find_kept_alive_by_dead_branches(graph: nx.MultiDiGraph) -> set[SymbolNode]
     return _find_reachable(graph) - _find_reachable_strict(graph)
 
 
+def _find_reachable_excluding_tests(graph: nx.MultiDiGraph) -> set[SymbolNode]:
+    """Like :func:`_find_reachable` but skips entrypoints tagged ``testcase=True``."""
+    visited: set[SymbolNode] = set()
+    stack = [
+        n
+        for n, attrs in graph.nodes(data=True)
+        if attrs.get("entrypoint") and not attrs.get("testcase")
+    ]
+    while stack:
+        node = stack.pop()
+        if node in visited:
+            continue
+        visited.add(node)
+        stack.extend(graph.successors(node))
+    return visited
+
+
+def _find_kept_alive_by_tests_only(graph: nx.MultiDiGraph) -> set[SymbolNode]:
+    """Symbols only reachable from ``TESTCASE``-tagged entrypoints.
+
+    ``_find_reachable(graph) -`` :func:`_find_reachable_excluding_tests`;
+    the difference is the "blast radius" of removing the test suite.
+    Surfaced on :class:`Analysis` as :meth:`Analysis.kept_alive_by_tests_only`
+    and on :class:`PackageView` as :meth:`PackageView.kept_alive_by_tests_only`.
+    """
+    return _find_reachable(graph) - _find_reachable_excluding_tests(graph)
+
+
 def _count_nodes(graph: nx.MultiDiGraph, prefix: Path | None) -> dict[str, int]:
     """Count nodes in ``graph`` by ``SymbolNode.type``, optionally restricted by path.
 
@@ -556,6 +584,22 @@ class Analysis:
         g = self.materialize_all()
         return _find_reachable(g) - _find_reachable_strict(g)
 
+    def kept_alive_by_tests_only(self) -> set[SymbolNode]:
+        """Symbols that would become unreachable if the test suite were dropped.
+
+        Computed as ``reachable() -`` BFS that excludes every
+        entrypoint tagged :data:`NodeFlags.TESTCASE` (today: pytest
+        and unittest discovery seeds). The resulting set is the
+        "blast radius" of removing tests -- production code that is
+        currently kept alive *only* because tests still exercise it.
+
+        Used by tooling that reports "if you deleted your tests, these
+        symbols would also become dead." The default :meth:`reachable`
+        traversal is unchanged; this is the opt-in stricter pass.
+        """
+        g = self.materialize_all()
+        return _find_reachable(g) - _find_reachable_excluding_tests(g)
+
     def count_nodes(self, prefix: Path | None = None) -> dict[str, int]:
         """Count nodes in the full graph by ``SymbolNode.type``.
 
@@ -717,6 +761,16 @@ class PackageView:
         """
         g = self._analysis.materialize_closure(self._package.path)
         diff = _find_reachable(g) - _find_reachable_strict(g)
+        return {n for n in diff if n.path.is_relative_to(self._package.path)}
+
+    def kept_alive_by_tests_only(self) -> set[SymbolNode]:
+        """Decls in this package kept alive only by ``TESTCASE`` entrypoints.
+
+        Closure-scoped equivalent of :meth:`Analysis.kept_alive_by_tests_only`,
+        filtered to nodes under :attr:`path`.
+        """
+        g = self._analysis.materialize_closure(self._package.path)
+        diff = _find_reachable(g) - _find_reachable_excluding_tests(g)
         return {n for n in diff if n.path.is_relative_to(self._package.path)}
 
     def count_nodes(self) -> dict[str, int]:

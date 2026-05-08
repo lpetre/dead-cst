@@ -57,7 +57,7 @@ class PytestPlugin:
     """
 
     name: str = "pytest"
-    version: int = 1777760307
+    version: int = 1778228682
 
     def observe(self, ctx: ObserveContext) -> VisitorPayload | None:
         module = module_node(ctx.payload)
@@ -114,7 +114,7 @@ class PytestPlugin:
 def _emit_seed(nodes, edges, fqname, path, targets):
     if not targets:
         return
-    synth = synthetic_node(fqname, path, flags=NodeFlags.ENTRYPOINT)
+    synth = synthetic_node(fqname, path, flags=NodeFlags.ENTRYPOINT | NodeFlags.TESTCASE)
     nodes.append(synth)
     edges.extend((synth, t, SYNTHETIC_POSITION) for t in targets)
 
