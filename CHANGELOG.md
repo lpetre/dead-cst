@@ -18,6 +18,13 @@ two versions.
   the same `func -> NAME` edge an f-string would, and the
   documented limitation has been removed.
 
+### Fixed
+- Fixed an `AttributeError` crash in the visitor when a lambda body
+  contained an access with multiple potential referents (e.g. a
+  walrus that rebinds the lambda's own parameter). The flow-analysis
+  helper now skips lambdas, whose body is a single expression rather
+  than an `IndentedBlock`.
+
 ## [0.6.0] - 2026-05-08
 
 ### Changed
