@@ -104,15 +104,17 @@ def enumerate_files(
 ) -> PackageFiles:
     """Walk ``package.path``'s ``.py`` / ``.pyi`` tree, classify each file as cache hit or miss.
 
-    ``.pyi`` stub files participate in the graph as separate modules
-    under a synthetic ``__pyi__`` FQN segment (see
-    :class:`~dead_cst._fqn.FixedFullyQualifiedNameProvider`). Their
-    declarations carry import edges (``cast``, ``TypeAlias``, etc.)
-    and ``@overload`` stubs need their lifetime tied to the
-    corresponding ``.py`` impl, so we ingest them through the same
-    visitor pass.
+    Stub files participate in the graph as separate modules under a
+    synthetic ``__pyi__`` FQN segment (see
+    :class:`~dead_cst._fqn.FixedFullyQualifiedNameProvider`); the
+    visitor's own pass produces their import + decl edges, and
+    :class:`~dead_cst.plugins.PyiStubPlugin` anchors them to their
+    runtime twins.
     """
-    files = tuple(sorted([*package.path.rglob("*.py"), *package.path.rglob("*.pyi")]))
+    # ``rglob("*.py*")`` would also catch ``.pyc`` / ``.pyo`` /
+    # ``.pyx``; filter on the exact suffix so a single tree walk
+    # replaces what used to be two separate ``rglob`` calls.
+    files = tuple(sorted(p for p in package.path.rglob("*.py*") if p.suffix in (".py", ".pyi")))
     hits: dict[Path, VisitorPayload] = {}
     miss_files: list[Path] = []
     for file in files:
@@ -443,11 +445,9 @@ def _apply_payload(
         if n.type != "module":
             symbol_graph.add_edge(n, module, flags=EdgeFlags.NONE)
         # ``OVERLOAD`` and ``SHADOWED`` both keep the decl out of the
-        # cross-module lookup trie. ``OVERLOAD`` decls are kept alive
-        # via explicit ``impl -> overload`` edges (same-file via the
-        # visitor, cross-file via the ``PyiStubPlugin``), so exposing
-        # them as import targets would route consumer imports through
-        # a typing stub instead of the runtime impl.
+        # cross-module lookup trie; the graph keeps the parent edge so
+        # the decl is well-formed but consumer imports route to the
+        # impl, never the stub.
         if not (n.flags & (NodeFlags.SHADOWED | NodeFlags.OVERLOAD)):
             current_trie.add_declaration(n)
             if file_exported:

@@ -48,11 +48,11 @@ two versions.
   show up normally). To avoid colliding with the matching `.py` in the
   symbol trie, each stub module is given a synthetic `__pyi__` FQN
   segment (e.g. `mod.pyi` becomes `mod.__pyi__`). A new built-in
-  `PyiStubPlugin` (registered as `pyi_stub` and added to the default
-  CLI plugin chain) emits `runtime_decl -> stub_decl` edges by
-  same-name match so a stub's lifetime tracks its `.py` twin: the stub
-  is kept alive while the runtime decl is alive, and `dead-cst remove`
-  drops it the moment the runtime decl becomes dead.
+  `PyiStubPlugin` (registered as `pyi_stub_link` and added to the
+  default CLI plugin chain) emits `runtime_decl -> stub_decl` edges
+  by same-name match so a stub's lifetime tracks its `.py` twin: the
+  stub is kept alive while the runtime decl is alive, and
+  `dead-cst remove` drops it the moment the runtime decl becomes dead.
 - New `NodeFlags.OVERLOAD` flag plus visitor + edge-stitcher support
   for `typing.overload`. `@overload`-decorated functions (recognized
   syntactically -- bare `overload`, `typing.overload`, and

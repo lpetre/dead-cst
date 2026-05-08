@@ -39,16 +39,11 @@ class NodeFlags(enum.IntFlag):
     flagged synthetic nodes via their per-file payloads to declare
     entrypoints without a separate API surface.
 
-    ``OVERLOAD`` flags a function decorated with ``typing.overload``
-    (or its same-name displaced siblings) as a typing-only stub. Like
-    ``SHADOWED``, an overload is excluded from the lookup trie so
-    cross-module imports do not resolve to it. Unlike ``SHADOWED``, an
-    overload's lifetime is anchored to the matching implementation:
-    the visitor / linker emits ``impl -> overload`` edges so the
-    overload is reachable iff the impl is. ``.pyi`` stub declarations
-    that twin a same-named ``.py`` declaration receive the same
-    treatment, so the codemod removes a ``.pyi`` overload alongside the
-    ``.py`` impl when the impl becomes dead.
+    ``OVERLOAD`` flags a ``typing.overload`` stub (or any same-name
+    displaced sibling). Excluded from the lookup trie like
+    ``SHADOWED``, but its lifetime is anchored to the matching impl
+    via explicit ``impl -> overload`` edges so the codemod removes
+    the overload alongside a dead impl rather than in isolation.
     """
 
     NONE = 0

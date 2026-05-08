@@ -47,12 +47,9 @@ def _dotted_name_parts(
 def _is_overload_decorator(dec: cst.Decorator) -> bool:
     """Recognize ``@overload`` / ``@typing.overload`` / ``@typing_extensions.overload``.
 
-    Syntactic only -- we don't resolve the binding through scope
-    metadata. False positives require a non-typing ``overload`` symbol
-    to decorate a top-level function, which is rare enough not to
-    warrant the extra cost. The check unwraps a ``Call`` form
-    (``@overload()``) defensively even though stdlib usage is the bare
-    decorator.
+    Syntactic only: matches any decorator whose rightmost name segment
+    is ``overload``. False positives require a non-typing ``overload``
+    symbol shadowing a function; rare enough to be worth the simpler check.
     """
     expr = dec.decorator
     if isinstance(expr, cst.Call):
@@ -162,22 +159,14 @@ class SymbolVisitor(cst.CSTVisitor):
         # ``NodeFlags.SHADOWED`` copies and remaps any edge endpoints
         # that point at them, so the graph keeps consistent identity.
         self.shadowed_decls: list[SymbolNode] = []
-        # Same-name decls flagged ``@overload``. Like ``shadowed_decls``,
-        # these were displaced by a later same-name impl, but they are
-        # not user-deletable in isolation: the visitor wires
-        # ``impl -> overload`` edges so removing the impl drags the
-        # overloads with it through normal reachability. ``to_payload``
-        # emits them with ``NodeFlags.OVERLOAD`` (not ``SHADOWED``) so
-        # the codemod and any downstream tooling can distinguish "typing
-        # stub" from "shadowed by reassignment".
+        # ``@overload``-decorated decls displaced by a later same-name
+        # impl. Routed here (instead of ``shadowed_decls``) so
+        # ``to_payload`` flags them ``OVERLOAD`` rather than ``SHADOWED``;
+        # ``_finalize_module_declarations`` also wires ``impl -> overload``
+        # edges so they share the impl's reachability.
         self.overload_decls: list[SymbolNode] = []
-        # Top-level functions whose decorator chain includes ``@overload``
-        # (recognized syntactically -- bare ``Name`` ``"overload"`` or any
-        # ``Attribute`` whose final segment is ``"overload"``, covering
-        # ``typing.overload`` and ``typing_extensions.overload``).
-        # Tracked at visit time; ``_finalize_module_declarations`` reads
-        # this set to decide whether a displaced decl belongs in
-        # ``shadowed_decls`` or ``overload_decls``.
+        # Decls whose decorator list included ``@overload``; consumed by
+        # ``_finalize_module_declarations`` to partition displaced decls.
         self.overload_marked: set[SymbolNode] = set()
         # Module-scope walrus targets keyed by name. PEP 572 says a
         # walrus inside a comprehension binds in the comprehension's
@@ -388,10 +377,6 @@ class SymbolVisitor(cst.CSTVisitor):
     def visit_FunctionDef(self, node: cst.FunctionDef) -> None:
         self._add_decl(node, "function")
         if any(_is_overload_decorator(dec) for dec in node.decorators):
-            # The just-pushed frame's decls are the symbols for this
-            # function (one per FQN; usually one). Mark them so the
-            # finalize pass can route displaced overloads to
-            # ``overload_decls`` and emit ``impl -> overload`` edges.
             for frame in self.node_to_frames.get(node, ()):
                 self.overload_marked.update(frame)
 
@@ -696,20 +681,10 @@ class SymbolVisitor(cst.CSTVisitor):
         For names with more than one decl, ask :func:`live_at_exit` which
         binding sites survive on at least one path to module exit. Live
         decls stay in ``trie.declarations[name]`` (multi-valued for
-        conditional bindings); the rest move to
-        ``self.shadowed_decls`` so the graph keeps their parent-module
-        edge but cross-module imports do not reach them.
-
-        Decls flagged ``@overload`` (in :attr:`overload_marked`) take a
-        separate path. A displaced overload is routed to
-        :attr:`overload_decls` instead of :attr:`shadowed_decls`, and
-        the visitor emits an edge from each live decl to it so the
-        overload is reachable iff the impl is. When every decl of a
-        name is itself an overload (typical inside a ``.pyi`` stub with
-        no co-located impl), the surviving decl keeps its trie entry
-        and we still wire it back to the displaced overloads so a
-        cross-file linker (see ``OverloadStubLink``) can later anchor
-        the whole cluster to the runtime impl.
+        conditional bindings); the rest split between
+        :attr:`overload_decls` (``@overload``-decorated, anchored to
+        each live decl by an explicit edge) and :attr:`shadowed_decls`
+        (everything else, kept out of cross-module lookup).
         """
         trie_node = self.trie._get(self._module_fqname.split("."))
         if trie_node is None:
@@ -745,13 +720,6 @@ class SymbolVisitor(cst.CSTVisitor):
             for d in shadowed_here:
                 if d in self.overload_marked:
                     self.overload_decls.append(d)
-                    # Anchor each displaced overload to every live
-                    # decl. Same-file impl + overloads is the typical
-                    # case (one live, many overloads); keeping the
-                    # overload alive as long as any impl path is alive
-                    # mirrors runtime semantics. Use the overload's own
-                    # position as ``access_pos`` so the apply step's
-                    # dead-suite check sees a stable location.
                     for live in live_decls:
                         if live != d:
                             self.internal_edges.add((live, d, d.position))
@@ -887,29 +855,16 @@ class SymbolVisitor(cst.CSTVisitor):
     def to_payload(self) -> VisitorPayload:
         """Materialize visitor state into a serializable :class:`VisitorPayload`.
 
-        Decls in :attr:`shadowed_decls` are emitted as
-        :data:`NodeFlags.SHADOWED` flagged copies, and decls in
-        :attr:`overload_decls` are emitted as :data:`NodeFlags.OVERLOAD`
-        flagged copies. Any edge endpoint pointing at one of those
-        decls is remapped to the same flagged identity so the resulting
-        graph nodes and edges line up. ``OVERLOAD`` and ``SHADOWED``
-        also drives same-name decls that survived flow analysis but are
-        themselves ``@overload``-decorated -- when ``visit_FunctionDef``
-        marked the survivor, we promote it to ``OVERLOAD`` here so a
-        cross-file linker can recognize the whole cluster of typing
-        stubs uniformly. The per-edge :class:`CodeRange` (the access
-        position) is preserved as-is; the apply step in
-        :mod:`dead_cst.analyze` derives the
-        :data:`EdgeFlags.DEAD_BRANCH` flag from it by checking
-        containment against :attr:`dead_suites`.
+        Decls in :attr:`shadowed_decls` and :attr:`overload_decls` are
+        emitted as :data:`NodeFlags.SHADOWED` / :data:`NodeFlags.OVERLOAD`
+        flagged copies; edge endpoints pointing at them are remapped to
+        the flagged identity so the resulting graph stays consistent.
         """
         nodes: list[SymbolNode] = []
         stack: list[SymbolTrie] = [self.trie]
 
-        # Fast path: nothing to flag, no remap needed. The walk below
-        # mirrors the slow path so trie shape stays the source of truth
-        # for emission order in both branches.
-        if not self.shadowed_decls and not self.overload_decls and not self.overload_marked:
+        # Fast path: nothing to flag, no remap needed.
+        if not self.shadowed_decls and not self.overload_decls:
             while stack:
                 tnode = stack.pop()
                 if tnode.module is not None:
@@ -930,14 +885,6 @@ class SymbolVisitor(cst.CSTVisitor):
         }
         for d in self.overload_decls:
             flag_map[d] = dataclasses.replace(d, flags=d.flags | NodeFlags.OVERLOAD)
-        # A surviving same-name ``@overload`` decl (typical when a
-        # ``.pyi`` stub holds the whole overload cluster with no
-        # in-file impl) is promoted to ``OVERLOAD`` too. Cross-file
-        # linking then anchors the runtime impl to this trie entry,
-        # which already carries edges to its displaced siblings.
-        for d in self.overload_marked:
-            if d not in flag_map:
-                flag_map[d] = dataclasses.replace(d, flags=d.flags | NodeFlags.OVERLOAD)
 
         def remap(sym: SymbolNode) -> SymbolNode:
             return flag_map.get(sym, sym)

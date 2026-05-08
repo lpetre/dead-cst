@@ -284,6 +284,8 @@ A module-level `import` / `from ... import ...` is itself a declaration of type 
 
 `dead-cst` tracks top-level declarations only -- module-level functions, classes, and variables. Nested definitions (inner functions, methods, nested classes) are deliberately not given their own nodes; references made from inside those nested scopes are attributed to the enclosing top-level declaration. Keeping the containing top-level symbol alive keeps its nested source alive with it.
 
+`.pyi` stub files alongside `.py` modules are ingested too. Each stub becomes its own module under a synthetic `<runtime>.__pyi__` FQN segment, and a built-in plugin anchors every stub declaration to its same-named runtime twin so the stub follows the impl's lifetime: kept alive when the impl is alive, deleted by `dead-cst remove` when the impl becomes dead. `@typing.overload`-decorated functions are flagged similarly so a dead implementation drags its overloads with it instead of leaving orphans behind.
+
 ## Limitations
 
 - `import *` is treated pessimistically: every top-level declaration in the target module is considered used by the importing module.
