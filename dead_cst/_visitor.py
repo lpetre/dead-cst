@@ -102,7 +102,7 @@ class SymbolVisitor(cst.CSTVisitor):
     # edge-attribution rules, flow-analysis fixes, etc. Concurrent
     # bumps on different branches merge with ``max()`` semantics.
     name: str = "default"
-    version: int = 1778000000
+    version: int = 1778276692
 
     def _pos(self, node: cst.CSTNode):
         return self.get_metadata(PositionProvider, node, default=None)
@@ -113,7 +113,13 @@ class SymbolVisitor(cst.CSTVisitor):
         if isinstance(scope, GlobalScope):
             return list(module_node.body)
         if isinstance(scope, (FunctionScope, ClassScope)):
-            return list(scope.node.body.body)
+            # Lambda bodies are a single ``BaseExpression`` rather than
+            # an ``IndentedBlock``, so there's no statement list to walk
+            # for flow analysis -- defer to the keep-all-referents path.
+            body = scope.node.body
+            if not isinstance(body, cst.IndentedBlock):
+                return None
+            return list(body.body)
         return None
 
     def __init__(
