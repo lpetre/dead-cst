@@ -9,6 +9,15 @@ two versions.
 
 ## [Unreleased]
 
+### Changed
+- Bumped the `libcst` floor to `>=1.8.6` so PEP 750 template strings
+  (`t"..."`, Python 3.14+) parse rather than aborting with
+  `ParserSyntaxError`. Names referenced inside t-string interpolations
+  and format specs flow through the visitor's existing scope
+  resolution -- a `t"hello {NAME}"` inside a function now produces
+  the same `func -> NAME` edge an f-string would, and the
+  documented limitation has been removed.
+
 ## [0.6.0] - 2026-05-08
 
 ### Changed
