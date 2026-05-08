@@ -301,6 +301,25 @@ import pytest
             },
             id="lambda-tuple-subscript-walrus-rebinds-body",
         ),
+        pytest.param(
+            """
+            A = 1
+            B = 2
+            f = (lambda i, j: ((x := A), (x := B))[i + j])(1, 0)
+            """,
+            # Immediately-invoked lambda: ``f`` is the call result, not
+            # the lambda itself, but the anonymous lambda has no node
+            # of its own, so its body refs still attribute to ``mod.f``
+            # via the enclosing assignment. Walrus ``x`` stays local.
+            {
+                "mod.A -> mod",
+                "mod.B -> mod",
+                "mod.f -> mod",
+                "mod.f -> mod.A",
+                "mod.f -> mod.B",
+            },
+            id="lambda-iife-tuple-subscript-walrus-rebinds-body",
+        ),
         # ------------------------------------------------------------------
         # Classes
         # ------------------------------------------------------------------
