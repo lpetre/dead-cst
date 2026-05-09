@@ -22,6 +22,20 @@ two versions.
   syntax) invalidates the entry automatically.
 
 ### Changed
+- **Breaking:** `dead_cst.branches.fold_constants` is gone, replaced
+  by `dead_cst.branches.TruthinessResolver`, a goal-directed
+  flow-sensitive truthiness object. From-scratch
+  `UnreachableRegionDetector` implementations should construct one
+  resolver per file and pass `resolver.evaluate` as the `resolve_expr`
+  argument to `unreachable_suites` / `evaluate_truthiness`.
+  `DefaultUnreachableRegionDetector`'s `resolve(self, expr)` subclass
+  hook is unchanged. The internal `_const_fold` module is gone.
+- `DefaultUnreachableRegionDetector.find_regions` is now a two-pass
+  design: one CST visit collects every `If` / `While` / suite-bearing
+  site, and the resolver answers truthiness queries on demand. Files
+  with no conditional tests now skip `ScopeProvider` /
+  `ParentNodeProvider` resolution entirely. Self-analysis benchmark
+  drops `find_regions` from 24.2 s to 1.8 s over `dead_cst/` (13×).
 - Bumped the `libcst` floor to `>=1.8.6` so PEP 750 template strings
   (`t"..."`, Python 3.14+) parse rather than aborting with
   `ParserSyntaxError`. Names referenced inside t-string interpolations

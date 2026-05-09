@@ -16,14 +16,11 @@ from libcst.metadata import (
 )
 from libcst.metadata.scope_provider import (
     Assignment,
-    ClassScope,
-    FunctionScope,
-    GlobalScope,
     ImportAssignment,
     Scope,
 )
 
-from ._flow import live_at_exit, live_referents
+from ._flow import live_at_exit, live_referents, scope_body
 from ._fqn import FixedFullyQualifiedNameProvider
 from .branches import DefaultUnreachableRegionDetector, UnreachableRegionDetector
 from .graph import Import, NodeFlags, SymbolNode, SymbolTrie, VisitorPayload
@@ -106,21 +103,6 @@ class SymbolVisitor(cst.CSTVisitor):
 
     def _pos(self, node: cst.CSTNode):
         return self.get_metadata(PositionProvider, node, default=None)
-
-    @staticmethod
-    def _scope_body(scope, module_node: cst.Module) -> list | None:
-        """Statement list for a scope, or ``None`` if flow analysis is unsupported."""
-        if isinstance(scope, GlobalScope):
-            return list(module_node.body)
-        if isinstance(scope, (FunctionScope, ClassScope)):
-            # Lambda bodies are a single ``BaseExpression`` rather than
-            # an ``IndentedBlock``, so there's no statement list to walk
-            # for flow analysis -- defer to the keep-all-referents path.
-            body = scope.node.body
-            if not isinstance(body, cst.IndentedBlock):
-                return None
-            return list(body.body)
-        return None
 
     def __init__(
         self,
@@ -783,7 +765,7 @@ class SymbolVisitor(cst.CSTVisitor):
                                 self.internal_edges.add((owner_symbol, target_symbol, access_pos))
                     continue
                 if len(referents) > 1:
-                    body = self._scope_body(referents[0].scope, original_node)
+                    body = scope_body(referents[0].scope, original_node)
                     if body is not None:
                         live_ids = {
                             id(n)

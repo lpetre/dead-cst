@@ -35,13 +35,14 @@ parties can publish their own.
 ### 2. Function-call folding (same-file, caller-capped)
 
 `def is_new_auth(): return False; if is_new_auth(): X = 1` should mark `X` as
-dead, but doesn't yet — `evaluate_truthiness` doesn't fold through calls. Add
-a pre-pass in `fold_constants` that walks top-level `FunctionDef` bodies for
-trivial single-return shapes and lets the resolver recurse through them. Both
-sync `def` (folded via bare `Call`) and async `def` (folded via `Await(Call)`
-only — a bare async call returns a coroutine, always truthy). Cap by caller
-count (default 3) so that configuration helpers used in 50 places don't get
-folded into noise. Same-file only; cross-file is item 8.
+dead, but doesn't yet — `evaluate_truthiness` doesn't fold through calls. Have
+`TruthinessResolver` recognize trivial single-return `FunctionDef` shapes and
+fold a bare `Call` to one of them by recursing into the function's return
+expression. Both sync `def` (folded via bare `Call`) and async `def` (folded
+via `Await(Call)` only — a bare async call returns a coroutine, always
+truthy). Cap by caller count (default 3) so that configuration helpers used
+in 50 places don't get folded into noise. Same-file only; cross-file is
+item 8.
 
 ### 3. Suite-removal codemod and expanded dead-set helper
 
@@ -216,12 +217,13 @@ Folded down from earlier tiers as they landed:
   comprehensions are captured by patching `ScopeProvider`'s comprehension-
   scoped binding.
 - `UnreachableRegionDetector` Protocol with a shipped
-  `DefaultUnreachableRegionDetector` running three passes per file: the
-  literal-only `unreachable_suites` walk, a `fold_constants` fixpoint pre-
-  pass (chained `Name = literal` propagation), and a post-terminator scan
-  over every statement-bearing suite. Subclasses override
-  `resolve(self, expr) -> bool | None` to fold domain-specific expressions;
-  folded values flow through the same fixpoint loop.
+  `DefaultUnreachableRegionDetector`: a single CST visit collects every
+  `If` / `While` and statement-bearing suite, and a goal-directed
+  `TruthinessResolver` answers truthiness queries on demand (literal +
+  flow-sensitive `Name` lookup over `Name = literal` chains).
+  Post-terminator scan over every collected suite. Subclasses override
+  `resolve(self, expr) -> bool | None` to fold domain-specific
+  expressions; resolved values compose with the resolver's name lookup.
 - `Cacheable` Protocol unifying `(name, version)` across visitor, resolvers,
   plugins, and detectors. Package `__version__` removed from the cache
   fingerprint — each component carries its own knob, and concurrent bumps

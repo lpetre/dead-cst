@@ -34,6 +34,31 @@ from __future__ import annotations
 from typing import Callable, Sequence
 
 import libcst as cst
+from libcst.metadata.scope_provider import ClassScope, FunctionScope, GlobalScope, Scope
+
+
+def scope_body(scope: Scope, module: cst.Module) -> list | None:
+    """Statement list for ``scope``, or ``None`` if flow analysis is unsupported.
+
+    Returns the ordered statement list that flow analysis walks for a
+    given scope: the module body for a ``GlobalScope``, the class /
+    function body for a class or function scope. Lambdas (whose body
+    is a single expression) and comprehension scopes return ``None``
+    so the caller skips them rather than guessing -- they can't host
+    ``if`` / ``while`` statements anyway.
+    """
+    if isinstance(scope, GlobalScope):
+        return list(module.body)
+    if isinstance(scope, (FunctionScope, ClassScope)):
+        # Lambda's body is a single ``BaseExpression``, not an
+        # ``IndentedBlock`` -- narrow to the suite-bearing node kinds
+        # so the caller skips lambdas (which can't host ``if`` /
+        # ``while`` statements anyway).
+        node = scope.node
+        if isinstance(node, (cst.FunctionDef, cst.ClassDef)):
+            return list(node.body.body)
+    return None
+
 
 # A suite's `.body` is `Sequence[BaseStatement] | Sequence[BaseSmallStatement]`
 # depending on whether it's an `IndentedBlock` or a `SimpleStatementSuite`
@@ -132,6 +157,7 @@ def live_referents(
     scope_body: Sequence[cst.BaseStatement],
     access_node: cst.CSTNode,
     referent_nodes: Sequence[cst.CSTNode],
+    cache: dict[int, set[int]] | None = None,
 ) -> set[cst.CSTNode]:
     """Filter ``referent_nodes`` to those live at ``access_node``.
 
@@ -139,8 +165,16 @@ def live_referents(
     containing the access (``module.body`` for module-level accesses,
     ``functiondef.body.body`` for a function scope, etc.). The access
     and every referent must be reachable from ``scope_body``.
+
+    ``cache`` is an optional ``id(node) -> set[id(descendant)]`` map
+    callers can hand in to share descendant-id memoization across many
+    ``live_referents`` calls over the same module. When ``None`` a
+    fresh cache is allocated per call. Sharing is safe as long as the
+    caller keeps every CST node alive for the cache's lifetime
+    (Python may reuse ``id()`` values after GC).
     """
-    cache: dict[int, set[int]] = {}
+    if cache is None:
+        cache = {}
     referent_set = set(referent_nodes)
     access_id = id(access_node)
     observed: list[set[cst.CSTNode]] = []
@@ -160,6 +194,7 @@ def live_referents(
 def live_at_exit(
     scope_body: Sequence[cst.BaseStatement],
     referent_nodes: Sequence[cst.CSTNode],
+    cache: dict[int, set[int]] | None = None,
 ) -> set[cst.CSTNode]:
     """Return the subset of ``referent_nodes`` live after ``scope_body`` runs.
 
@@ -167,6 +202,10 @@ def live_at_exit(
     *after* the last statement, so callers can see which bindings
     survive to the end of the scope -- e.g. which top-level decls a
     module exports across all reachable control-flow paths.
+
+    ``cache`` mirrors :func:`live_referents`: optional shared
+    descendant-id memoization across calls.
     """
-    cache: dict[int, set[int]] = {}
+    if cache is None:
+        cache = {}
     return _walk_flow(scope_body, set(), set(referent_nodes), cache, None)
