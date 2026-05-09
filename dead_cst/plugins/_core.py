@@ -294,8 +294,8 @@ class AddNode:
     """Add a node to the graph. When ``entrypoint=True``, mark the node so
     :func:`find_reachable` seeds its BFS from it. ``testcase=True`` tags
     the node as a test-only entrypoint -- it still seeds the default
-    BFS, but :func:`find_kept_alive_by_tests_only` excludes those seeds
-    to surface the "blast radius" of removing tests."""
+    BFS, but ``Analysis.kept_alive_by_flags_only(NodeFlags.TESTCASE)``
+    excludes those seeds to surface the "blast radius" of removing tests."""
 
     node: SymbolNode
     entrypoint: bool = False
