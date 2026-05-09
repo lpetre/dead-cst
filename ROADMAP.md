@@ -151,6 +151,27 @@ demand.
 
 Folded down from earlier tiers as they landed:
 
+- **v0.7.0**: `DefaultUnreachableRegionDetector` rewrite — the
+  `fold_constants` fixpoint pre-pass is replaced by the goal-directed
+  `TruthinessResolver`, which lazily walks only the binding slices a
+  query touches and memoizes by access node id. Self-analysis benchmark
+  drops `find_regions` from 24.2 s to 1.5 s over `dead_cst/` (~16×).
+  `dead_cst.branches.fold_constants` and the internal `_const_fold`
+  module are gone (breaking); from-scratch detector authors construct
+  `TruthinessResolver(wrapper, resolve_expr=...)` and pass
+  `resolver.evaluate` to `unreachable_suites` / `evaluate_truthiness`.
+- **v0.7.0**: `libcst >= 1.8.6` floor; PEP 750 t-strings (`t"..."`,
+  Python 3.14+) parse cleanly and route through the visitor's existing
+  scope resolution, so `t"hello {NAME}"` produces the same edge an
+  f-string would. The "t-strings unsupported" limitation is gone.
+- **v0.7.0**: Files `libcst` cannot parse no longer abort the run. The
+  analyser logs a warning and substitutes a placeholder payload (the
+  real module node plus an `[unparseable] <module>` synthetic flagged
+  `ENTRYPOINT`), so the file stays alive in reachability and importers
+  still resolve. Decls inside the file are invisible until parsing
+  succeeds; the placeholder rides the per-file cache and a fresh source
+  SHA invalidates it automatically. `enumerate_files` also skips
+  directories whose names happen to end in `.py` / `.pyi`.
 - **v0.6.0**: Compiled-extension `.pyi` stub ingestion (`mypkg/_native.so`
   + `mypkg/_native.pyi`); peer-mode stubs alongside a real `.py` are
   intentionally dropped. `@typing.overload`-decorated decls flagged with
