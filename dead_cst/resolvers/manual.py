@@ -46,8 +46,6 @@ class ManualResolver:
     """
 
     specs: list[str] = field(default_factory=list)
-    name: str = "manual"
-    version: int = 1777985838
 
     def resolve(self, project_root: Path) -> tuple[Package, ...]:
         # Collect (package_path, dep_paths) per spec; Package
