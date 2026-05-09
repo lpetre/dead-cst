@@ -55,6 +55,14 @@ EXTERNAL_DIST_PREFIX = "[external dist] "
 EXTERNAL_FILE_PREFIX = "[external file] "
 EXTERNAL_PREFIXES = (EXTERNAL_DIST_PREFIX, EXTERNAL_FILE_PREFIX)
 UNRESOLVED_PREFIX = "[unresolved] "
+# ``[unparseable] <module fqname>`` marks a file libcst could not parse.
+# The analyser emits one synthetic with this prefix per failing file --
+# tagged ``ENTRYPOINT`` so the file stays alive (we cannot prove its
+# contents are dead) and edged at the module node so importers and
+# ``why-alive`` queries can still locate it. Distinct from
+# ``SYNTHETIC_PATH_PREFIXES`` because these nodes are never import
+# targets -- they're internal markers, not classifications.
+UNPARSEABLE_PREFIX = "[unparseable] "
 SYNTHETIC_PATH_PREFIXES = (*EXTERNAL_PREFIXES, UNRESOLVED_PREFIX)
 
 

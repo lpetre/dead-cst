@@ -22,6 +22,7 @@ package's :class:`Package` and the shared cache / detector / plugins.
 
 from __future__ import annotations
 
+import logging
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,8 +40,15 @@ from .branches import UnreachableRegionDetector
 from .cache import GraphCache
 from .graph import EdgeFlags, Import, NodeFlags, SymbolNode, SymbolTrie, VisitorPayload
 from .plugins import EdgePlugin, ObserveContext
-from .plugins._core import make_payload
+from .plugins._core import (
+    SYNTHETIC_POSITION,
+    UNPARSEABLE_PREFIX,
+    make_payload,
+    synthetic_node,
+)
 from .resolvers import Package
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,10 +116,16 @@ def enumerate_files(
     ingesting both would assert in the symbol trie when they claim the
     same FQN, and dead-cst has no peer-stub linker. Orphan ``.pyi``
     (compiled-extension shape) flows through under its natural FQN.
+
+    ``rglob`` matches by name, so a *directory* literally named
+    ``something.py`` would otherwise sneak in and crash the visitor on
+    ``read_text``. Filter to real files defensively.
     """
-    py_files = sorted(package.path.rglob("*.py"))
+    py_files = sorted(p for p in package.path.rglob("*.py") if p.is_file())
     py_stems = {p.with_suffix("") for p in py_files}
-    pyi_files = (p for p in package.path.rglob("*.pyi") if p.with_suffix("") not in py_stems)
+    pyi_files = (
+        p for p in package.path.rglob("*.pyi") if p.is_file() and p.with_suffix("") not in py_stems
+    )
     files = tuple(sorted([*py_files, *pyi_files]))
     hits: dict[Path, VisitorPayload] = {}
     miss_files: list[Path] = []
@@ -179,6 +193,11 @@ def process_stale_files(
 
     Cache writes happen on the main process as each payload arrives,
     so a partial run still warms the cache for files that completed.
+    Files ``_process_one_file`` could not even read off disk return
+    ``None`` and are dropped here -- not cached, not surfaced to the
+    caller -- so the warning re-fires next run. Files that *parse*
+    fail come back as an ``[unparseable]`` synthetic payload and ride
+    the cache like any other miss.
     """
     if not tasks:
         return {}
@@ -186,7 +205,9 @@ def process_stale_files(
     out: dict[Path, VisitorPayload] = {}
     use_pool = workers is not None and workers >= 2 and len(tasks) >= 2
 
-    def _record(file: Path, payload: VisitorPayload) -> None:
+    def _record(file: Path, payload: VisitorPayload | None) -> None:
+        if payload is None:
+            return
         out[file] = payload
         if cache is not None:
             cache.put(file, payload, fingerprint)
@@ -238,7 +259,13 @@ def build_contribution(
     for file in package_files.files:
         payload = package_files.hits.get(file)
         if payload is None:
-            payload = miss_payloads[file]
+            # ``miss_payloads`` only carries files the visitor managed
+            # to ingest -- parse / IO failures in ``_process_one_file``
+            # are dropped before reaching here, so a missing key means
+            # "skip this file" rather than "lookup error".
+            payload = miss_payloads.get(file)
+        if payload is None:
+            continue
         file_exported = not exported or _under_any(file, list(exported))
         _apply_payload(
             payload,
@@ -271,7 +298,7 @@ def _process_one_file(
     plugins: Sequence[EdgePlugin],
     package: Package,
     project_root: Path,
-) -> VisitorPayload:
+) -> VisitorPayload | None:
     """Run the visitor + observe pass for a single file and return its payload.
 
     The caller owns the precomputed FQN entry (built once per package
@@ -285,8 +312,31 @@ def _process_one_file(
     :func:`dead_cst._edges.resolve_edges`, so this pass is purely a
     function of the file's source -- no ``search_paths`` or resolver
     plumbing is needed here.
+
+    Returns ``None`` when the file cannot even be read off disk
+    (rare; the directory filter in :func:`enumerate_files` already
+    catches the common ``IsADirectoryError`` case). The caller drops
+    such entries without caching them, so a later fix is picked up
+    on the next run.
+
+    On :class:`libcst.ParserSyntaxError` (e.g. PEP 750 t-strings the
+    pinned libcst can't parse) the file is *not* dropped: the analyser
+    emits a minimal payload pairing the real module node with a
+    synthetic ``[unparseable] <module>`` entrypoint so the file stays
+    alive in reachability and importers can still target the module.
+    The payload is cached like any other miss -- a fresh source SHA
+    re-runs the parse, so fixing the syntax invalidates the entry.
     """
-    module = cst.parse_module(file.read_text())
+    try:
+        source = file.read_text()
+    except OSError as exc:
+        logger.warning("Skipping %s: could not read file: %s", file, exc)
+        return None
+    try:
+        module = cst.parse_module(source)
+    except cst.ParserSyntaxError as exc:
+        logger.warning("Could not parse %s: %s; emitting [unparseable] marker", file, exc)
+        return _unparseable_payload(file, fqn_entry)
     wrapper = MetadataWrapper(
         module,
         unsafe_skip_copy=True,
@@ -299,6 +349,38 @@ def _process_one_file(
         plugins, file, wrapper.module, base_payload, package, project_root
     )
     return _merge_payloads(base_payload, plugin_payload)
+
+
+def _unparseable_payload(
+    file: Path,
+    fqn_entry: ModuleNameAndPackage,
+) -> VisitorPayload:
+    """Build the placeholder payload for a file libcst could not parse.
+
+    Pairs the real module node (so importers and the symbol trie still
+    see the module under its natural FQN) with a synthetic
+    ``[unparseable] <module>`` node flagged ``ENTRYPOINT``. The synthetic
+    keeps the file alive during reachability -- we cannot prove its
+    contents are dead -- and gives downstream queries (``why-alive``,
+    reports) a stable handle for "this file did not parse".
+    """
+    module_node_ = SymbolNode(
+        fqname=fqn_entry.name,
+        type="module",
+        path=file,
+        position=SYNTHETIC_POSITION,
+    )
+    marker = synthetic_node(
+        f"{UNPARSEABLE_PREFIX}{fqn_entry.name}",
+        file,
+        flags=NodeFlags.ENTRYPOINT,
+    )
+    return VisitorPayload(
+        nodes=(module_node_, marker),
+        edges=((marker, module_node_, SYNTHETIC_POSITION),),
+        imports=(),
+        dead_suites=(),
+    )
 
 
 def _run_observe(
@@ -340,7 +422,7 @@ def _process_task(
     detector: UnreachableRegionDetector,
     plugins: tuple[EdgePlugin, ...],
     task: StaleFile,
-) -> tuple[Path, VisitorPayload]:
+) -> tuple[Path, VisitorPayload | None]:
     """Run one task; pure (no ``sys.path`` mutation, no resolver call)."""
     payload = _process_one_file(
         task.file,
@@ -365,7 +447,7 @@ def _init_worker(
     _worker_state = (detector, plugins)
 
 
-def _worker_process_task(task: StaleFile) -> tuple[Path, VisitorPayload]:
+def _worker_process_task(task: StaleFile) -> tuple[Path, VisitorPayload | None]:
     """Pool task: delegate to :func:`_process_task` against the worker's state."""
     assert _worker_state is not None, "_init_worker must run before _worker_process_task"
     return _process_task(*_worker_state, task)
