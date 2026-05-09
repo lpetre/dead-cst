@@ -327,13 +327,16 @@ entirely.
 * Imports whose source line carries a ruff/pyflakes `# noqa` directive
   that silences F401 (bare `# noqa`, `# noqa: F401`, multi-rule
   `# noqa: E501, F401`, case-variant `# NOQA`) are flagged
-  `NodeFlags.ENTRYPOINT` so reachability keeps them alive — matching
-  ruff's own semantics. File-level `# ruff: noqa` and `# flake8: noqa`
-  directives (`ruff:` / `flake8:` matched case-sensitively per ruff;
-  `noqa` is not) pin every import in the file. The visitor scans for
-  these in `visit_Comment` plus a per-import-statement
-  `SimpleStatementLine` walk, so per-alias comments inside a
-  parenthesized `from x import (a, b)` are honored.
+  `NodeFlags.ENTRYPOINT | NodeFlags.NOQA` so reachability keeps them
+  alive — matching ruff's own semantics. File-level `# ruff: noqa` and
+  `# flake8: noqa` directives (`ruff:` / `flake8:` matched
+  case-sensitively per ruff; `noqa` is not) pin every import in the
+  file. The visitor scans for these in `visit_Comment` plus a
+  per-import-statement `SimpleStatementLine` walk, so per-alias
+  comments inside a parenthesized `from x import (a, b)` are honored.
+  The `NOQA` bit is metadata layered on `ENTRYPOINT` (parallel to
+  `TESTCASE`); it powers the opt-in `kept_alive_by_noqa_only` query,
+  which returns the blast radius of dropping every F401 pin.
 * Submodules edge to their parent package, so `__init__.py` stays alive
   as long as anything in the package does.
 * `EdgeFlags.DEAD_BRANCH` is metadata only.

@@ -37,11 +37,7 @@ class NodeFlags(enum.IntFlag):
     sets ``graph.nodes[node]["entrypoint"] = True`` when it sees the
     flag, so :func:`find_reachable` starts its BFS there. Plugins emit
     flagged synthetic nodes via their per-file payloads to declare
-    entrypoints without a separate API surface. The visitor also stamps
-    this flag on import nodes whose source line carries a ruff/pyflakes
-    ``# noqa`` directive that silences F401 (and on every import in a
-    file with a ``# ruff: noqa`` / ``# flake8: noqa`` directive), so
-    intentionally-preserved imports are not reported as dead.
+    entrypoints without a separate API surface.
 
     ``OVERLOAD`` flags a ``typing.overload`` stub (or any same-name
     displaced sibling). Excluded from the lookup trie like
@@ -55,6 +51,15 @@ class NodeFlags(enum.IntFlag):
     seeds the same as any other entrypoint -- and powers the opt-in
     :func:`find_kept_alive_by_tests_only` query, which returns the
     "blast radius" of dropping the test suite.
+
+    ``NOQA`` tags an entrypoint as preserved by an explicit user
+    directive -- today, an import whose source line carries a
+    ruff/pyflakes ``# noqa[: ...F401...]`` (or whose file carries a
+    ``# ruff: noqa`` / ``# flake8: noqa``). It is metadata on top of
+    ``ENTRYPOINT`` -- default :func:`find_reachable` treats those
+    seeds the same as any other entrypoint -- and powers the opt-in
+    :func:`find_kept_alive_by_noqa_only` query, which returns the
+    "blast radius" of removing every F401-pinned import.
     """
 
     NONE = 0
@@ -62,6 +67,7 @@ class NodeFlags(enum.IntFlag):
     ENTRYPOINT = enum.auto()
     OVERLOAD = enum.auto()
     TESTCASE = enum.auto()
+    NOQA = enum.auto()
 
 
 class EdgeFlags(enum.IntFlag):

@@ -293,6 +293,8 @@ A module-level `import` / `from ... import ...` is itself a declaration of type 
 
 Imports whose source line carries a ruff/pyflakes `# noqa` directive that silences F401 (`# noqa`, `# noqa: F401`, multi-rule `# noqa: E501, F401`, case-variant `# NOQA`) are pinned alive. File-level `# ruff: noqa` and `# flake8: noqa` directives (`ruff:` / `flake8:` is matched case-sensitively per ruff; `noqa` is not) pin every import in the file. This matches ruff's own semantics: an import you have explicitly preserved (re-exports, side-effect imports, `TYPE_CHECKING` shims guarded by F401) is not surfaced as dead and `dead-cst remove` will not drop it.
 
+Pinned imports are tagged with `NodeFlags.NOQA` (in addition to `NodeFlags.ENTRYPOINT`). The opt-in `Analysis.kept_alive_by_noqa_only()` / `PackageView.kept_alive_by_noqa_only()` queries return the "blast radius" of removing every F401 pin -- modules and decls currently kept alive *only* because a side-effect import or re-export still references them. Useful for auditing stale pins ("if I removed every `# noqa: F401`, what would actually become dead?"), and parallel to the existing `kept_alive_by_tests_only` query for `TESTCASE`-flagged seeds.
+
 ## Scope
 
 `dead-cst` tracks top-level declarations only -- module-level functions, classes, and variables. Nested definitions (inner functions, methods, nested classes) are deliberately not given their own nodes; references made from inside those nested scopes are attributed to the enclosing top-level declaration. Keeping the containing top-level symbol alive keeps its nested source alive with it.

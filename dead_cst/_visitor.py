@@ -144,7 +144,7 @@ class SymbolVisitor(cst.CSTVisitor):
     # edge-attribution rules, flow-analysis fixes, etc. Concurrent
     # bumps on different branches merge with ``max()`` semantics.
     name: str = "default"
-    version: int = 1778322938
+    version: int = 1778326719
 
     def _pos(self, node: cst.CSTNode):
         return self.get_metadata(PositionProvider, node, default=None)
@@ -965,7 +965,10 @@ class SymbolVisitor(cst.CSTVisitor):
 
         def pin_entrypoint(d: SymbolNode) -> None:
             existing = flag_map.get(d, d)
-            flag_map[d] = dataclasses.replace(existing, flags=existing.flags | NodeFlags.ENTRYPOINT)
+            flag_map[d] = dataclasses.replace(
+                existing,
+                flags=existing.flags | NodeFlags.ENTRYPOINT | NodeFlags.NOQA,
+            )
 
         for d in self._pinned_imports:
             pin_entrypoint(d)
