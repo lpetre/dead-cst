@@ -472,10 +472,12 @@ class DefaultUnreachableRegionDetector:
        the truthiness queries on demand: ``unreachable_suites`` for
        conditional branches, and a per-suite scan for the trailing
        region after an unconditional terminator (``return`` /
-       ``raise`` / ``break`` / ``continue`` / ``assert <falsy>``). The
-       check is purely suite-relative, so a ``raise`` inside a ``try``
-       body still kills the rest of the try body even though the
-       surrounding ``except`` runs on its own path.
+       ``raise`` / ``break`` / ``continue`` / ``assert <falsy>``, plus
+       compound ``if`` / ``with`` / ``try`` whose every reachable path
+       itself terminates). The check is purely suite-relative, so a
+       ``raise`` inside a ``try`` body still kills the rest of the try
+       body even though the surrounding ``except`` runs on its own
+       path.
 
     The goal-directed resolver replaces the previous up-front
     fixpoint table: only the names that actually feed an
@@ -600,32 +602,30 @@ def _suite_terminates(suite: cst.BaseSuite, resolver: TruthinessResolver) -> boo
 def _if_terminates(node: cst.If, resolver: TruthinessResolver) -> bool:
     """``True`` iff every reachable branch of an ``if`` chain terminates.
 
-    Folds the test when possible: a statically-true test means only the
-    body needs to terminate, a statically-false test means only the
-    ``elif`` / ``else`` tail needs to terminate. With an unknown test,
-    both the body and the tail must terminate -- and the tail must
-    exist (a missing ``else`` lets control fall through).
+    Iterative walk down the ``if`` / ``elif`` / ``else`` chain, mirroring
+    :func:`_unreachable_in_if` so a deep ``elif`` ladder can't blow the
+    recursion limit. A statically-true test pins the answer to the body
+    (the rest of the chain is dead). A statically-false test means the
+    body never runs and the answer rides on the next branch. With an
+    unknown test, the body must terminate AND every following branch
+    must too -- and a missing final ``else`` always lets control fall
+    through, so it can't be a terminator.
     """
-    test_truth = resolver.evaluate(node.test)
-    if test_truth is True:
-        return _suite_terminates(node.body, resolver)
-    if test_truth is False:
-        return _orelse_terminates(node.orelse, resolver)
-    if not _suite_terminates(node.body, resolver):
-        return False
-    return _orelse_terminates(node.orelse, resolver)
-
-
-def _orelse_terminates(
-    orelse: cst.If | cst.Else | None,
-    resolver: TruthinessResolver,
-) -> bool:
-    """Walk an ``elif`` / ``else`` tail. ``None`` means falls through."""
-    if orelse is None:
-        return False
-    if isinstance(orelse, cst.If):
-        return _if_terminates(orelse, resolver)
-    return _suite_terminates(orelse.body, resolver)
+    current: cst.If | None = node
+    while current is not None:
+        test_truth = resolver.evaluate(current.test)
+        if test_truth is True:
+            return _suite_terminates(current.body, resolver)
+        if test_truth is None and not _suite_terminates(current.body, resolver):
+            return False
+        orelse = current.orelse
+        if orelse is None:
+            return False
+        if isinstance(orelse, cst.If):
+            current = orelse
+            continue
+        return _suite_terminates(orelse.body, resolver)
+    return False
 
 
 def _try_terminates(node: cst.Try | cst.TryStar, resolver: TruthinessResolver) -> bool:

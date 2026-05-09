@@ -256,9 +256,12 @@ Folded down from earlier tiers as they landed:
   `If` / `While` and statement-bearing suite, and a goal-directed
   `TruthinessResolver` answers truthiness queries on demand (literal +
   flow-sensitive `Name` lookup over `Name = literal` chains).
-  Post-terminator scan over every collected suite. Subclasses override
-  `resolve(self, expr) -> bool | None` to fold domain-specific
-  expressions; resolved values compose with the resolver's name lookup.
+  Post-terminator scan over every collected suite, including compound
+  `if` / `with` / `try` whose every reachable branch terminates (so a
+  constant-folded `if True: return` kills the rest of its enclosing
+  suite). Subclasses override `resolve(self, expr) -> bool | None` to
+  fold domain-specific expressions; resolved values compose with the
+  resolver's name lookup.
 - `Cacheable` Protocol unifying `(name, version)` across visitor, resolvers,
   plugins, and detectors. Package `__version__` removed from the cache
   fingerprint — each component carries its own knob, and concurrent bumps

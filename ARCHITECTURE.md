@@ -147,7 +147,11 @@ the analyzer's resolved `PositionProvider`. The shipped
    plus a per-suite scan that marks statements after an unconditional
    `return` / `raise` / `break` / `continue` / `assert <falsy>` as
    dead *within the same suite* — a `raise` in a `try` body doesn't
-   kill the matching `except`. The resolver is goal-directed: it
+   kill the matching `except`. Compound statements (`if` / `with` /
+   `try`) themselves count as terminators when every reachable path
+   inside them terminates, so a constant-folded `if True: return`
+   (and its `FLAG = True` / `if cond: return; else: return` cousins)
+   kills the rest of the enclosing suite. The resolver is goal-directed: it
    lazily resolves `ScopeProvider` / `ParentNodeProvider` only when
    the first `Name` query lands, walks `live_referents` only for the
    names that actually feed a query, memoizes by access node id, and
