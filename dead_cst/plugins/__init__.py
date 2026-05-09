@@ -32,11 +32,12 @@ falls back to entry points.
 The :data:`STDLIB_PREFIX` / :data:`EXTERNAL_DIST_PREFIX` /
 :data:`EXTERNAL_FILE_PREFIX` / :data:`UNRESOLVED_PREFIX` string
 constants name the synthetic-node namespaces the analyzer creates for
-non-first-party imports. :data:`EXTERNAL_PREFIXES` and
-:data:`SYNTHETIC_PATH_PREFIXES` are convenience tuples;
-:data:`SYNTHETIC_POSITION` is the file-wide :class:`CodeRange` sentinel
-plugins stamp on synthetic nodes that don't correspond to a specific
-source location.
+non-first-party imports. :data:`UNPARSEABLE_PREFIX` names the
+analyzer-emitted placeholder used when ``libcst`` rejects a file's
+syntax. :data:`EXTERNAL_PREFIXES` and :data:`SYNTHETIC_PATH_PREFIXES`
+are convenience tuples; :data:`SYNTHETIC_POSITION` is the file-wide
+:class:`CodeRange` sentinel plugins stamp on synthetic nodes that
+don't correspond to a specific source location.
 """
 
 from __future__ import annotations

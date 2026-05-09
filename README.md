@@ -296,6 +296,7 @@ A module-level `import` / `from ... import ...` is itself a declaration of type 
 - Dynamic attribute access (`getattr`) and runtime-generated symbols are invisible to static analysis.
 - Only first-party code is analysed; third-party dependencies are treated as opaque (they appear as synthetic nodes — see `dead-cst dependencies`).
 - `__all__` is followed only when assigned a list/tuple of string literals; dynamic mutation (`__all__.append`, comprehensions, etc.) is not tracked.
+- Files `libcst` cannot parse are not fatal: the analyser logs a warning and stands in a `[unparseable] <module>` placeholder so the file stays alive in reachability and importers can still target the module. Declarations *inside* the file are invisible until parsing succeeds.
 
 ## Development
 
