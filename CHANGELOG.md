@@ -18,6 +18,18 @@ two versions.
   `G.subgraph(scc)` for one SCC at a time) to review a big codebase as
   a series of focused patches.
 
+### Fixed
+- `DefaultUnreachableRegionDetector` now recognizes compound statements
+  as terminators when every reachable branch itself terminates. An
+  ``if`` whose taken branch always ``return``s (e.g.
+  ``if True: return``, ``if FLAG: return`` with ``FLAG = True``, or
+  ``if cond: return; else: return``) kills statements that follow it
+  in the enclosing suite, so constant-folded early returns now flag
+  trailing dead code as expected. Same handling applies to ``with``
+  whose body terminates, and to ``try``/``except``/``finally`` where
+  every path terminates (or a ``finally`` itself terminates). Bumps
+  the detector's `version` so cached payloads rebuild.
+
 ### Changed
 - **Breaking:** `dead-cst remove` no longer modifies files in place. It
   now emits a unified diff to stdout (or to `--output PATH`) and exits;

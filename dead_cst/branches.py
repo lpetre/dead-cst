@@ -495,7 +495,7 @@ class DefaultUnreachableRegionDetector:
     """
 
     name: str = "default"
-    version: int = 1778281000
+    version: int = 1778327222
 
     def resolve(self, expr: cst.BaseExpression) -> bool | None:
         """Hook for domain-specific constant folding. Default: defer.
@@ -556,20 +556,97 @@ class DefaultUnreachableRegionDetector:
 def _is_terminator(stmt: cst.CSTNode, resolver: TruthinessResolver) -> bool:
     """``True`` iff ``stmt`` unconditionally exits its enclosing suite.
 
-    Recognized: ``return`` / ``raise`` / ``break`` / ``continue`` and
-    ``assert <statically-falsy>``. A ``SimpleStatementLine`` is treated
-    as a terminator if any of its small statements is one --
-    ``x = 1; raise; y = 2`` ends control at ``raise``, and anything
-    after it on a later line is dead too.
+    Recognized: ``return`` / ``raise`` / ``break`` / ``continue``,
+    ``assert <statically-falsy>``, and compound statements (``if`` /
+    ``with`` / ``try``) where every reachable path itself terminates.
+    A ``SimpleStatementLine`` is treated as a terminator if any of its
+    small statements is one -- ``x = 1; raise; y = 2`` ends control at
+    ``raise``, and anything after it on a later line is dead too.
     """
     if isinstance(stmt, cst.SimpleStatementLine):
-        for sm in stmt.body:
-            if isinstance(sm, (cst.Return, cst.Raise, cst.Break, cst.Continue)):
-                return True
-            if isinstance(sm, cst.Assert):
-                if resolver.evaluate(sm.test) is False:
-                    return True
+        return any(_is_small_terminator(sm, resolver) for sm in stmt.body)
+    if isinstance(stmt, cst.If):
+        return _if_terminates(stmt, resolver)
+    if isinstance(stmt, cst.With):
+        return _suite_terminates(stmt.body, resolver)
+    if isinstance(stmt, (cst.Try, cst.TryStar)):
+        return _try_terminates(stmt, resolver)
     return False
+
+
+def _is_small_terminator(sm: cst.BaseSmallStatement, resolver: TruthinessResolver) -> bool:
+    if isinstance(sm, (cst.Return, cst.Raise, cst.Break, cst.Continue)):
+        return True
+    if isinstance(sm, cst.Assert):
+        return resolver.evaluate(sm.test) is False
+    return False
+
+
+def _suite_terminates(suite: cst.BaseSuite, resolver: TruthinessResolver) -> bool:
+    """``True`` iff control unconditionally exits ``suite`` before its end.
+
+    Handles both ``IndentedBlock`` (multi-line bodies; recurse into
+    ``_is_terminator`` so nested compound statements compose) and
+    ``SimpleStatementSuite`` (the one-line ``if cond: return`` form,
+    whose body is a sequence of ``BaseSmallStatement``).
+    """
+    if isinstance(suite, cst.IndentedBlock):
+        return any(_is_terminator(s, resolver) for s in suite.body)
+    if isinstance(suite, cst.SimpleStatementSuite):
+        return any(_is_small_terminator(sm, resolver) for sm in suite.body)
+    return False
+
+
+def _if_terminates(node: cst.If, resolver: TruthinessResolver) -> bool:
+    """``True`` iff every reachable branch of an ``if`` chain terminates.
+
+    Folds the test when possible: a statically-true test means only the
+    body needs to terminate, a statically-false test means only the
+    ``elif`` / ``else`` tail needs to terminate. With an unknown test,
+    both the body and the tail must terminate -- and the tail must
+    exist (a missing ``else`` lets control fall through).
+    """
+    test_truth = resolver.evaluate(node.test)
+    if test_truth is True:
+        return _suite_terminates(node.body, resolver)
+    if test_truth is False:
+        return _orelse_terminates(node.orelse, resolver)
+    if not _suite_terminates(node.body, resolver):
+        return False
+    return _orelse_terminates(node.orelse, resolver)
+
+
+def _orelse_terminates(
+    orelse: cst.If | cst.Else | None,
+    resolver: TruthinessResolver,
+) -> bool:
+    """Walk an ``elif`` / ``else`` tail. ``None`` means falls through."""
+    if orelse is None:
+        return False
+    if isinstance(orelse, cst.If):
+        return _if_terminates(orelse, resolver)
+    return _suite_terminates(orelse.body, resolver)
+
+
+def _try_terminates(node: cst.Try | cst.TryStar, resolver: TruthinessResolver) -> bool:
+    """``True`` iff every reachable path through a ``try`` terminates.
+
+    A ``finally`` clause that itself terminates short-circuits the rest
+    -- whatever the ``try`` / ``except`` did, the ``finally`` overrides
+    it. Otherwise, the ``try`` body must terminate (so the ``else``
+    never runs) and every ``except`` handler must terminate too. We
+    deliberately stay coarse: a body that terminates only via ``return``
+    can't actually trigger any handler, but disambiguating
+    return-vs-raise from a static walk isn't worth the precision today.
+    """
+    if node.finalbody is not None and _suite_terminates(node.finalbody.body, resolver):
+        return True
+    if not _suite_terminates(node.body, resolver):
+        return False
+    for handler in node.handlers:
+        if not _suite_terminates(handler.body, resolver):
+            return False
+    return True
 
 
 class _SiteCollector(cst.CSTVisitor):
