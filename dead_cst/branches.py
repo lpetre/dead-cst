@@ -20,7 +20,12 @@ Three layers, in increasing power and scope:
   and only walks each ``live_referents`` slice it actually needs.
   Goal-directed: the file's full constant table is never built up
   front, so files with few ``if``/``while``/``assert`` tests pay
-  proportionally less.
+  proportionally less. Sister method ``resolver.resolve_constant(expr)``
+  returns the underlying ``str`` / ``int`` / ``bool`` / ``None`` value
+  (wrapped in :class:`Const`) over the same flow walk -- intended for
+  custom :meth:`DefaultUnreachableRegionDetector.resolve` overrides
+  that need to pattern-match against a flag *name* (e.g.
+  ``check_flag(FEATURE_A)`` where ``FEATURE_A = "feature_a"``).
 * :class:`UnreachableRegionDetector` -- module-level dead-region
   finder, the protocol the analyzer plugs in. The shipped
   :class:`DefaultUnreachableRegionDetector` builds one
@@ -59,6 +64,29 @@ _KEYWORDS: dict[str, bool] = {
     "False": False,
     "None": False,
 }
+
+
+# Literal values :meth:`TruthinessResolver.resolve_constant` will
+# fold. Keep this conservative -- arbitrary container literals
+# (tuples, sets, frozensets) compose with mutation in ways the static
+# walk doesn't track, and ``bytes`` / ``float`` rarely show up as flag
+# names. Callers that need richer folding can layer it on top via
+# their own ``resolve`` override.
+ConstValue = str | int | bool | None
+
+
+@dataclass(frozen=True, slots=True)
+class Const:
+    """Statically-resolved literal value.
+
+    Wraps the result of :meth:`TruthinessResolver.resolve_constant`
+    so ``Const(None)`` (the ``None`` literal was proved) stays
+    distinct from ``None`` (resolution failed / value unknown). The
+    resolver only folds :data:`ConstValue` -- ``str`` / ``int`` /
+    ``bool`` / ``None`` -- so that's the type ``value`` may take.
+    """
+
+    value: ConstValue
 
 
 # Resolver returns the statically-known truthiness of an arbitrary
@@ -218,6 +246,40 @@ _PENDING: object = object()
 _MISSING: object = object()
 
 
+def _literal_constant(node: cst.BaseExpression) -> Const | None:
+    """Direct literal value of ``node`` as a :class:`Const`, or ``None``.
+
+    Folds the ``True`` / ``False`` / ``None`` keywords, integer
+    literals, and string literals (including concatenated strings).
+    Anything else returns ``None`` (unknown); the caller layers Name
+    resolution on top.
+    """
+    if isinstance(node, cst.Name):
+        if node.value == "True":
+            return Const(True)
+        if node.value == "False":
+            return Const(False)
+        if node.value == "None":
+            return Const(None)
+        return None
+    if isinstance(node, cst.Integer):
+        try:
+            return Const(node.evaluated_value)
+        except ValueError:
+            return None
+    if isinstance(node, (cst.SimpleString, cst.ConcatenatedString)):
+        try:
+            value = node.evaluated_value
+        except (SyntaxError, UnicodeDecodeError):
+            return None
+        if not isinstance(value, str):
+            # ``b"..."`` concatenations land here -- not in
+            # :data:`ConstValue` so we report unknown.
+            return None
+        return Const(value)
+    return None
+
+
 def _constant_assignment_rhs(
     binding_node: cst.CSTNode,
     parent_map: Mapping[cst.CSTNode, cst.CSTNode],
@@ -286,6 +348,7 @@ class TruthinessResolver:
         "_parent_map",
         "_access_index",
         "_eval_name_cache",
+        "_eval_name_const_cache",
         "_live_cache",
         "_rhs_cache",
         "_descendant_cache",
@@ -310,6 +373,9 @@ class TruthinessResolver:
         # is the cycle sentinel; once evaluation finishes the entry is
         # overwritten with the final answer.
         self._eval_name_cache: dict[int, object] = {}
+        # Same shape as ``_eval_name_cache`` but for the
+        # value-folding path: ``id(name_access) -> Const | None | _PENDING``.
+        self._eval_name_const_cache: dict[int, object] = {}
         # ``id(name_access) -> set[live referent CSTNode]``.
         self._live_cache: dict[int, set[cst.CSTNode]] = {}
         # ``id(binding_node) -> rhs_expr | None`` (caches the
@@ -396,6 +462,113 @@ class TruthinessResolver:
             if rhs is None:
                 return None
             v = self.evaluate(rhs)
+            if v is None:
+                return None
+            values.add(v)
+        if len(values) != 1:
+            return None
+        return next(iter(values))
+
+    def resolve_constant(self, expr: cst.BaseExpression) -> Const | None:
+        """Best-effort statically-known *value* of ``expr``.
+
+        Returns a :class:`Const` wrapping the literal value (one of
+        :data:`ConstValue` -- ``str`` / ``int`` / ``bool`` / ``None``)
+        when statically determinable; ``None`` when the value cannot
+        be folded. ``Const(None)`` (the ``None`` literal was proved)
+        stays distinct from a bare ``None`` return ("unknown").
+
+        Folds direct literals plus flow-sensitive ``Name`` lookup over
+        bindings to those literals -- the same flow walk
+        :meth:`evaluate` uses for truthiness, but returning the value
+        instead of its boolean projection. Multi-target assignment
+        (``A = B = "feature_a"``), :class:`cst.AnnAssign`, and walrus
+        share one RHS so all targets fold the same way. Cyclic
+        bindings (``a = b; b = a``) bottom out at ``None`` via the
+        same ``_PENDING`` sentinel as :meth:`evaluate`.
+
+        Intended for custom :meth:`DefaultUnreachableRegionDetector.resolve`
+        overrides that need the actual value of an argument -- e.g.
+        pattern-matching ``check_flag(FEATURE_A)`` where
+        ``FEATURE_A = "feature_a"``::
+
+            def resolve(self, expr):
+                if (
+                    isinstance(expr, cst.Call)
+                    and is_name(expr.func, "check_flag")
+                    and len(expr.args) == 1
+                ):
+                    flag = self._truthiness.resolve_constant(expr.args[0].value)
+                    if flag is not None and flag.value in self._on_flags:
+                        return True
+                return None
+
+        The caller passes ``self._truthiness = TruthinessResolver(...)``
+        through ``resolve_expr=`` so the same instance is reused
+        across the file -- caching is per resolver instance.
+
+        Calls and other dynamic operations are *not* folded -- the
+        resolver knows nothing about your runtime. Override
+        :meth:`DefaultUnreachableRegionDetector.resolve` to layer on
+        domain knowledge for those.
+        """
+        lit = _literal_constant(expr)
+        if lit is not None:
+            return lit
+        if isinstance(expr, cst.Name):
+            return self._evaluate_name_const(expr)
+        return None
+
+    def _evaluate_name_const(self, name: cst.Name) -> Const | None:
+        key = id(name)
+        cached = self._eval_name_const_cache.get(key, _MISSING)
+        if cached is _PENDING:
+            return None
+        if cached is not _MISSING:
+            return cached  # type: ignore[return-value]
+        self._eval_name_const_cache[key] = _PENDING
+        result = self._evaluate_name_const_uncached(name)
+        self._eval_name_const_cache[key] = result
+        return result
+
+    def _evaluate_name_const_uncached(self, name: cst.Name) -> Const | None:
+        scopes = self._scopes
+        if scopes is None:
+            scopes = self._wrapper.resolve(ScopeProvider)
+            self._scopes = scopes
+        scope = scopes.get(name)
+        if scope is None:
+            return None
+        access = self._access_for(name, scope)
+        if access is None:
+            return None
+        referents = [
+            r
+            for r in access.referents
+            if isinstance(r, Assignment) and isinstance(r.node, cst.Name)
+        ]
+        if not referents:
+            return None
+        body = scope_body(referents[0].scope, self._module)
+        if body is None:
+            return None
+        live_set = self._live_cache.get(id(name))
+        if live_set is None:
+            live_set = live_referents(
+                body,
+                name,
+                [r.node for r in referents],
+                cache=self._descendant_cache,
+            )
+            self._live_cache[id(name)] = live_set
+        if not live_set:
+            return None
+        values: set[Const] = set()
+        for live_node in live_set:
+            rhs = self._rhs_for(live_node)
+            if rhs is None:
+                return None
+            v = self.resolve_constant(rhs)
             if v is None:
                 return None
             values.add(v)
@@ -492,12 +665,22 @@ class DefaultUnreachableRegionDetector:
     resolved this way compose with name resolution: a single high-level
     decision (``check_flag(...)`` is ``True``) propagates through
     chains and into ``if`` / ``assert`` branches automatically.
+
+    The override receives the active :class:`TruthinessResolver` as
+    its second argument so it can call
+    :meth:`TruthinessResolver.resolve_constant` to fold a flag's
+    *value* (``check_flag(FEATURE_A)`` where ``FEATURE_A = "feature_a"``)
+    before pattern-matching.
     """
 
     name: str = "default"
     version: int = 1778281000
 
-    def resolve(self, expr: cst.BaseExpression) -> bool | None:
+    def resolve(
+        self,
+        expr: cst.BaseExpression,
+        resolver: TruthinessResolver,
+    ) -> bool | None:
         """Hook for domain-specific constant folding. Default: defer.
 
         Override in a subclass to return ``True`` / ``False`` for any
@@ -508,12 +691,39 @@ class DefaultUnreachableRegionDetector:
         test and every foldable assignment RHS, so a check like
         ``isinstance(expr, cst.Call) and ...`` runs on every node;
         keep it cheap with an early-return on the wrong type.
+
+        ``resolver`` is the active :class:`TruthinessResolver` for the
+        current file, supplied by :meth:`find_regions`. Use it to fold
+        a flag-name argument before matching::
+
+            def resolve(self, expr, resolver):
+                if (
+                    isinstance(expr, cst.Call)
+                    and isinstance(expr.func, cst.Name)
+                    and expr.func.value == "check_flag"
+                    and len(expr.args) == 1
+                ):
+                    flag = resolver.resolve_constant(expr.args[0].value)
+                    if flag is not None and flag.value in self._on_flags:
+                        return True
+                return None
         """
         return None
 
     def find_regions(self, wrapper: MetadataWrapper) -> list[CodeRange]:
         positions = wrapper.resolve(PositionProvider)
-        resolver = TruthinessResolver(wrapper, resolve_expr=self.resolve)
+        # The resolver-with-resolver bridge: ``resolve_expr`` is a
+        # one-arg callable by contract, so we wrap ``self.resolve``
+        # in a closure that injects the active resolver as the second
+        # argument. The list-based late binding breaks the
+        # chicken-and-egg between the two.
+        resolver_holder: list[TruthinessResolver] = []
+
+        def hook(expr: cst.BaseExpression) -> bool | None:
+            return self.resolve(expr, resolver_holder[0])
+
+        resolver = TruthinessResolver(wrapper, resolve_expr=hook)
+        resolver_holder.append(resolver)
 
         sites = _SiteCollector()
         wrapper.module.visit(sites)
@@ -632,6 +842,8 @@ def _unreachable_in_if(
 
 
 __all__ = [
+    "Const",
+    "ConstValue",
     "DefaultUnreachableRegionDetector",
     "ResolveExpr",
     "TruthinessResolver",

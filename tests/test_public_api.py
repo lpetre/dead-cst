@@ -33,9 +33,12 @@ EXPECTED_PUBLIC_API: dict[str, list[str]] = {
     ],
     "dead_cst.analyze": [
         "Analysis",
+        "GraphView",
         "PackageView",
     ],
     "dead_cst.branches": [
+        "Const",
+        "ConstValue",
         "DefaultUnreachableRegionDetector",
         "ResolveExpr",
         "TruthinessResolver",

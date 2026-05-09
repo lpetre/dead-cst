@@ -23,7 +23,7 @@ from .branches import (
     UnreachableRegionDetector,
 )
 from .cache import GraphCache, compute_fingerprint
-from .graph import EdgeFlags, SymbolNode, SymbolTrie
+from .graph import EdgeFlags, SymbolNode, SymbolTrie, VisitorPayload
 from .plugins import (
     EdgePlugin,
     PluginContext,
@@ -332,6 +332,13 @@ class Analysis:
         )
         self._package_files: dict[Path, PackageFiles] = {}
         self._contributions: dict[Path, PackageContribution] = {}
+        # Stashed per-file payloads (hits + freshly processed misses)
+        # so :meth:`materialize_with` can rebuild a package's
+        # contribution with substitutions without re-parsing every
+        # other file. Populated by :meth:`refresh` for each file in
+        # the touched packages; absent for packages that were never
+        # refreshed.
+        self._payloads: dict[Path, VisitorPayload] = {}
         self._closure_graphs: dict[Path, nx.MultiDiGraph] = {}
         self._full_graph: nx.MultiDiGraph | None = None
         # Memoize closure-walk results -- the package graph is
@@ -443,11 +450,24 @@ class Analysis:
         )
 
         for path in new_targets:
+            pf = self._package_files[path]
             self._contributions[path] = build_contribution(
                 self._packages_by_path[path],
-                self._package_files[path],
+                pf,
                 miss_payloads,
             )
+            # Stash per-file payloads so an overlay materialization
+            # can substitute selected files without re-parsing the
+            # others. Hits come straight from the cache; misses come
+            # from this refresh's parse pass. Files the visitor
+            # could not even read are absent from both maps and stay
+            # out of ``_payloads``.
+            for f in pf.files:
+                payload = pf.hits.get(f)
+                if payload is None:
+                    payload = miss_payloads.get(f)
+                if payload is not None:
+                    self._payloads[f] = payload
         return self
 
     def package(self, path: Path) -> PackageView:
@@ -499,7 +519,165 @@ class Analysis:
             self._closure_graphs[package] = self._materialize(scope=scope)
         return self._closure_graphs[package]
 
-    def _materialize(self, *, scope: frozenset[Path] | None) -> nx.MultiDiGraph:
+    def preview_payloads(
+        self,
+        files: Iterable[Path],
+        *,
+        detector: UnreachableRegionDetector | None = None,
+    ) -> dict[Path, VisitorPayload]:
+        """Regenerate :class:`VisitorPayload`\\ s for ``files`` without touching the cache.
+
+        Useful for "what-if" scenarios: regenerate a small set of
+        files with a substitute :class:`UnreachableRegionDetector`
+        (e.g. one that bakes ``check_flag("feature_a")`` to ``True``)
+        without forking the analysis-wide fingerprint or polluting
+        the on-disk cache with one-shot results. Cache reads and
+        writes are skipped for this call; subsequent calls re-do the
+        parse pass.
+
+        Each path must lie under one of this analysis's packages.
+        ``detector=None`` (the default) reuses the analysis's own
+        detector, which is useful when callers only need a cache
+        bypass; pass any other detector for a one-shot override.
+
+        Pair with :meth:`materialize_with` (or :meth:`preview`) to
+        splice the regenerated payloads into a fresh graph.
+        """
+        files_list = [Path(f) for f in files]
+        if not files_list:
+            return {}
+        by_package: dict[Path, list[Path]] = {}
+        for f in files_list:
+            owner = self._owning_package(f)
+            if owner is None:
+                raise KeyError(f"{f} is not under any package in this analysis")
+            by_package.setdefault(owner, []).append(f)
+        pending: dict[Path, PackageFiles] = {}
+        for package_path, package_files in by_package.items():
+            package = self._packages_by_path[package_path]
+            pending[package_path] = PackageFiles(
+                package=package,
+                files=tuple(package_files),
+                hits={},
+                miss_files=tuple(package_files),
+            )
+        from ._refresh import build_stale_tasks, process_stale_files
+
+        tasks = build_stale_tasks(pending, self._project_root)
+        return process_stale_files(
+            tasks=tasks,
+            detector=detector if detector is not None else self._detector,
+            plugins=self._plugins,
+            cache=None,
+            fingerprint=self._fingerprint,
+            workers=self._workers,
+        )
+
+    def materialize_with(
+        self,
+        payloads: Mapping[Path, VisitorPayload],
+    ) -> nx.MultiDiGraph:
+        """Materialize a fresh graph with ``payloads`` spliced in for their files.
+
+        The non-mutating overlay path: rebuilds only the affected
+        packages' contributions (with the substitute payloads
+        replacing the originals), leaves every other package's
+        contribution untouched, then re-runs the cross-package
+        composition into a new :class:`networkx.MultiDiGraph`.
+
+        Pairs with :meth:`preview_payloads` for "what-if" graph
+        surgery. The original :meth:`materialize_all` /
+        :meth:`materialize_closure` graphs are unaffected; subsequent
+        calls without an overlay return the cached baseline.
+
+        Each substitute file must lie under one of this analysis's
+        packages. Empty ``payloads`` falls through to
+        :meth:`materialize_all`.
+        """
+        if not payloads:
+            return self.materialize_all()
+        self.refresh()
+        by_package: dict[Path, dict[Path, VisitorPayload]] = {}
+        for f, payload in payloads.items():
+            owner = self._owning_package(Path(f))
+            if owner is None:
+                raise KeyError(f"{f} is not under any package in this analysis")
+            by_package.setdefault(owner, {})[Path(f)] = payload
+        overlay_contribs: dict[Path, PackageContribution] = {}
+        for package_path, subs in by_package.items():
+            package = self._packages_by_path[package_path]
+            package_files = self._package_files[package_path]
+            # Rebuild this package's contribution with substitutes.
+            # Pass everything as ``miss_payloads`` (i.e. supply the
+            # full payload set) so we don't have to track which
+            # entries were originally hits vs. processed misses.
+            all_payloads: dict[Path, VisitorPayload] = {
+                f: self._payloads[f] for f in package_files.files if f in self._payloads
+            }
+            for f, p in subs.items():
+                all_payloads[f] = p
+            modified_pf = PackageFiles(
+                package=package_files.package,
+                files=package_files.files,
+                hits={},
+                miss_files=package_files.files,
+            )
+            overlay_contribs[package_path] = build_contribution(package, modified_pf, all_payloads)
+        return self._materialize(scope=None, contributions_override=overlay_contribs)
+
+    def preview(
+        self,
+        files: Iterable[Path],
+        *,
+        detector: UnreachableRegionDetector | None = None,
+    ) -> GraphView:
+        """One-shot :meth:`preview_payloads` + :meth:`materialize_with`.
+
+        Returns a read-only :class:`GraphView` over the overlay graph
+        with the same reachability surface as :class:`Analysis`
+        (:meth:`GraphView.dead`,
+        :meth:`GraphView.kept_alive_by_dead_branches`, etc.) so
+        callers can compare against the baseline::
+
+            baseline_dead = set(analysis.dead())
+            view = analysis.preview(
+                files=[mod_a, mod_b],
+                detector=BakedFlagDetector(on={"feature_a"}),
+            )
+            new_dead = set(view.dead()) - baseline_dead
+        """
+        regenerated = self.preview_payloads(files, detector=detector)
+        return GraphView(self.materialize_with(regenerated))
+
+    def _owning_package(self, file: Path) -> Path | None:
+        """Most-specific package path that contains ``file``, or ``None``.
+
+        Resolved via the package paths the resolver returned at
+        construction. The longest-match rule handles nested package
+        layouts (e.g. a workspace whose root is also a package).
+        """
+        try:
+            f = file.resolve()
+        except OSError:
+            f = file
+        candidates: list[Path] = []
+        for pkg_path in self._packages_by_path:
+            try:
+                p = pkg_path.resolve()
+            except OSError:
+                p = pkg_path
+            if f == p or f.is_relative_to(p):
+                candidates.append(pkg_path)
+        if not candidates:
+            return None
+        return max(candidates, key=lambda p: len(str(p)))
+
+    def _materialize(
+        self,
+        *,
+        scope: frozenset[Path] | None,
+        contributions_override: Mapping[Path, PackageContribution] | None = None,
+    ) -> nx.MultiDiGraph:
         """Compose every refreshed package in ``scope`` into a fresh graph.
 
         ``scope=None`` composes every package. Caller is responsible
@@ -533,10 +711,17 @@ class Analysis:
                     _rebind_sys_path(search_paths, baseline)
                     clear_path_caches()
                     last_search_paths = search_paths
+                contrib = (
+                    contributions_override.get(path) if contributions_override is not None else None
+                ) or self._contributions[path]
                 _compose_contribution(
-                    self._contributions[path],
+                    contrib,
                     target_graph=g,
-                    symbol_lookup=self._build_symbol_lookup(path, scope=scope),
+                    symbol_lookup=self._build_symbol_lookup(
+                        path,
+                        scope=scope,
+                        contributions_override=contributions_override,
+                    ),
                     plugins=self._plugins,
                     project_root=self._project_root,
                     import_resolver=self._import_resolver,
@@ -610,7 +795,13 @@ class Analysis:
         """
         return _count_nodes(self.materialize_all(), prefix)
 
-    def _build_symbol_lookup(self, package: Path, *, scope: frozenset[Path] | None) -> SymbolTrie:
+    def _build_symbol_lookup(
+        self,
+        package: Path,
+        *,
+        scope: frozenset[Path] | None,
+        contributions_override: Mapping[Path, PackageContribution] | None = None,
+    ) -> SymbolTrie:
         """Per-package lookup trie: this package's full trie + each in-scope dep's exports.
 
         ``scope`` bounds which deps' export tries are merged in:
@@ -618,14 +809,28 @@ class Analysis:
         :meth:`_interesting_set` for closure-scoped materialization.
         Deps must already be refreshed (the caller is responsible for
         calling :meth:`refresh` on the right set first).
+
+        ``contributions_override`` supplies overlay contributions for
+        :meth:`materialize_with`: when present, an entry there wins
+        over the baseline ``self._contributions`` so the substituted
+        package's exports flow into consumers that import from it.
         """
-        contrib = self._contributions[package]
+
+        def _contrib(p: Path) -> PackageContribution | None:
+            if contributions_override is not None:
+                ovr = contributions_override.get(p)
+                if ovr is not None:
+                    return ovr
+            return self._contributions.get(p)
+
+        contrib = _contrib(package)
         lookup = SymbolTrie()
-        lookup.merge(contrib.current_trie)
+        if contrib is not None:
+            lookup.merge(contrib.current_trie)
         for dep in self._dep_paths(package):
             if scope is not None and dep not in scope:
                 continue
-            dep_contrib = self._contributions.get(dep)
+            dep_contrib = _contrib(dep)
             if dep_contrib is None:
                 continue
             lookup.merge(dep_contrib.export_trie)
@@ -799,7 +1004,72 @@ class PackageView:
         remove_code(g.subgraph(dead_nodes), self._package.path)
 
 
+class GraphView:
+    """Read-only reachability surface over an already-materialized graph.
+
+    Returned by :meth:`Analysis.preview` so callers can ask the
+    standard reachability questions (:meth:`reachable`, :meth:`dead`,
+    :meth:`kept_alive_by_dead_branches`,
+    :meth:`kept_alive_by_tests_only`, :meth:`count_nodes`) against an
+    overlay graph without exposing the underlying composition
+    machinery. Holds a reference to the supplied graph; does not own
+    or refresh it.
+
+    Construct directly when you want the same reachability surface
+    over a graph you assembled yourself (e.g. via
+    :meth:`Analysis.materialize_with`).
+    """
+
+    __slots__ = ("_graph",)
+
+    def __init__(self, graph: nx.MultiDiGraph) -> None:
+        self._graph = graph
+
+    @property
+    def graph(self) -> nx.MultiDiGraph:
+        """The underlying :class:`networkx.MultiDiGraph`."""
+        return self._graph
+
+    def reachable(self) -> set[SymbolNode]:
+        """Set of every decl reachable from any entrypoint in :attr:`graph`."""
+        return _find_reachable(self._graph)
+
+    def dead(self) -> Iterator[SymbolNode]:
+        """Yield every decl in :attr:`graph` that no entrypoint reaches.
+
+        Excludes ``module`` and ``synthetic`` nodes -- same shape as
+        :meth:`Analysis.dead`.
+        """
+        reachable = _find_reachable(self._graph)
+        for n in self._graph.nodes:
+            if n.type in ("module", "synthetic"):
+                continue
+            if n not in reachable:
+                yield n
+
+    def kept_alive_by_dead_branches(self) -> set[SymbolNode]:
+        """Symbols kept alive only via at least one ``DEAD_BRANCH`` edge.
+
+        Same shape as :meth:`Analysis.kept_alive_by_dead_branches`,
+        evaluated against :attr:`graph`.
+        """
+        return _find_reachable(self._graph) - _find_reachable_strict(self._graph)
+
+    def kept_alive_by_tests_only(self) -> set[SymbolNode]:
+        """Symbols only reachable from ``TESTCASE``-tagged entrypoints.
+
+        Same shape as :meth:`Analysis.kept_alive_by_tests_only`,
+        evaluated against :attr:`graph`.
+        """
+        return _find_reachable(self._graph) - _find_reachable_excluding_tests(self._graph)
+
+    def count_nodes(self, prefix: Path | None = None) -> dict[str, int]:
+        """Count nodes in :attr:`graph` by ``SymbolNode.type``."""
+        return _count_nodes(self._graph, prefix)
+
+
 __all__ = [
     "Analysis",
+    "GraphView",
     "PackageView",
 ]
