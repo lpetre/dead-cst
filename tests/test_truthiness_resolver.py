@@ -247,6 +247,42 @@ def test_annotated_assignment_without_value_does_not_fold() -> None:
     assert out["x"] == [None]
 
 
+def test_mutable_container_binding_does_not_fold() -> None:
+    # ``x = []`` then ``x.append(...)`` -- the binding sees an empty
+    # list, but mutations happen invisibly to the binding-only flow
+    # walk. Folding here would let ``if not x:`` look like a statically
+    # known terminator and incorrectly kill trailing code. Same for
+    # dicts and sets, plus their comprehensions.
+    for empty in (
+        "[]",
+        "{}",
+        "[i for i in range(0)]",
+        "{i for i in r}",
+        "{i: i for i in r}",
+    ):
+        out = _resolve_lookup(
+            f"""
+            x = {empty}
+            if x:
+                pass
+            """
+        )
+        assert out["x"] == [None], f"expected unknown for x = {empty}, got {out['x']}"
+
+
+def test_tuple_binding_still_folds() -> None:
+    # Tuples are immutable, so the empty-tuple truthiness is preserved
+    # for the lifetime of the binding -- safe to fold.
+    out = _resolve_lookup(
+        """
+        x = ()
+        if x:
+            pass
+        """
+    )
+    assert out["x"] == [False]
+
+
 def test_function_scope_constant_folds() -> None:
     out = _resolve_lookup(
         """
