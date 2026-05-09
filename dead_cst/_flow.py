@@ -34,6 +34,31 @@ from __future__ import annotations
 from typing import Callable, Sequence
 
 import libcst as cst
+from libcst.metadata.scope_provider import ClassScope, FunctionScope, GlobalScope, Scope
+
+
+def scope_body(scope: Scope, module: cst.Module) -> list | None:
+    """Statement list for ``scope``, or ``None`` if flow analysis is unsupported.
+
+    Returns the ordered statement list that flow analysis walks for a
+    given scope: the module body for a ``GlobalScope``, the class /
+    function body for a class or function scope. Lambdas (whose body
+    is a single expression) and comprehension scopes return ``None``
+    so the caller skips them rather than guessing -- they can't host
+    ``if`` / ``while`` statements anyway.
+    """
+    if isinstance(scope, GlobalScope):
+        return list(module.body)
+    if isinstance(scope, (FunctionScope, ClassScope)):
+        # Lambda's body is a single ``BaseExpression``, not an
+        # ``IndentedBlock`` -- narrow to the suite-bearing node kinds
+        # so the caller skips lambdas (which can't host ``if`` /
+        # ``while`` statements anyway).
+        node = scope.node
+        if isinstance(node, (cst.FunctionDef, cst.ClassDef)):
+            return list(node.body.body)
+    return None
+
 
 # A suite's `.body` is `Sequence[BaseStatement] | Sequence[BaseSmallStatement]`
 # depending on whether it's an `IndentedBlock` or a `SimpleStatementSuite`

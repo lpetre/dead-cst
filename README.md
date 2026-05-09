@@ -231,10 +231,10 @@ Path resolution is similarly pluggable. `PathResolver` implementations return a 
 Unreachable-code detection is pluggable through the `UnreachableRegionDetector` protocol. `Analysis` accepts an `unreachable_detector` whose `find_regions(wrapper) -> list[CodeRange]` is invoked once per file. The built-in `DefaultUnreachableRegionDetector` covers three things out of the box:
 
 - **Literal truthiness** on every `if` / `while` test (e.g. `if False:` always-dead body, `if True: ... else: ...` always-dead else).
-- **Fixpoint constant folding** over simple `Name = literal` (and `Name: T = literal`) assignments. Chains like `foo = False; bar = foo or False; if bar: ...` resolve to dead because each fixpoint pass propagates one more level of indirection.
+- **Flow-sensitive name resolution** over simple `Name = literal` (and `Name: T = literal`) assignments. Chains like `foo = False; bar = foo or False; if bar: ...` resolve to dead because the goal-directed `TruthinessResolver` recursively evaluates each binding's RHS on demand and memoizes the result.
 - **Post-terminator regions** inside every suite. Statements after an unconditional `return` / `raise` / `break` / `continue` / `assert <statically-falsy>` in the same suite are marked dead. Suite-relative, so a `raise` in a `try` body kills only the rest of the try body — the `except` handler still runs on its own path.
 
-To layer in domain knowledge — e.g. config flags whose values are fixed in production — subclass and override `resolve(self, expr) -> bool | None`. The override gets first crack at every non-keyword expression in every `if` / `while` / `assert` test and every foldable assignment RHS; returning `None` defers to the built-in literal handling. Constants resolved this way flow through the same fixpoint loop as `Name = literal` bindings, so a single high-level decision propagates through chains:
+To layer in domain knowledge — e.g. config flags whose values are fixed in production — subclass and override `resolve(self, expr) -> bool | None`. The override gets first crack at every non-keyword expression routed through the resolver chain; returning `None` defers to the built-in literal handling and name lookup. Constants resolved this way compose with name resolution, so a single high-level decision propagates through chains:
 
 ```python
 from dataclasses import dataclass

@@ -46,15 +46,12 @@ from libcst.metadata import CodeRange, MetadataWrapper, ParentNodeProvider, Posi
 from libcst.metadata.scope_provider import (
     Access,
     Assignment,
-    ClassScope,
-    FunctionScope,
-    GlobalScope,
     Scope,
     ScopeProvider,
 )
 
 from ._cacheable import Cacheable
-from ._flow import live_referents
+from ._flow import live_referents, scope_body
 
 
 _KEYWORDS: dict[str, bool] = {
@@ -212,22 +209,13 @@ def unreachable_bodies(
 # ---------------------------------------------------------------------------
 
 
-def _scope_body(scope, module: cst.Module) -> list | None:
-    """Statement list for ``scope``, or ``None`` for unsupported kinds.
-
-    Mirrors :meth:`SymbolVisitor._scope_body` but additionally guards
-    against ``FunctionScope`` over a ``Lambda`` (whose ``body`` is a
-    ``BaseExpression``, not a ``BaseSuite``). Comprehension scopes and
-    lambdas return ``None`` so the caller skips them rather than
-    guessing -- they can't host ``if`` / ``while`` statements anyway.
-    """
-    if isinstance(scope, GlobalScope):
-        return list(module.body)
-    if isinstance(scope, ClassScope):
-        return list(scope.node.body.body)
-    if isinstance(scope, FunctionScope) and isinstance(scope.node, cst.FunctionDef):
-        return list(scope.node.body.body)
-    return None
+# Sentinel for "evaluation in progress" so cyclic ``Name`` references
+# (``a = b; b = a``) bottom out at ``None`` instead of recursing
+# forever. ``_MISSING`` is the cache-miss default for ``dict.get``,
+# distinct from ``None`` (a real "couldn't determine" answer) so the
+# cache stays well-defined.
+_PENDING: object = object()
+_MISSING: object = object()
 
 
 def _constant_assignment_rhs(
@@ -267,13 +255,6 @@ def _constant_assignment_rhs(
             return None
         return parent.value
     return None
-
-
-# Sentinel for "evaluation in progress" so cyclic ``Name`` references
-# (``a = b; b = a``) bottom out at ``None`` instead of recursing
-# forever. Distinct from ``None`` (a real "couldn't determine" answer)
-# so the cache stays well-defined.
-_PENDING: object = object()
 
 
 class TruthinessResolver:
@@ -349,12 +330,16 @@ class TruthinessResolver:
         return evaluate_truthiness(expr, resolve_expr=self._compose)
 
     def _compose(self, expr: cst.BaseExpression) -> bool | None:
-        """Resolver chain: external ``resolve_expr`` → name lookup → defer."""
+        """Resolver chain: external ``resolve_expr`` → name lookup → defer.
+
+        Only invoked from ``evaluate_truthiness`` after its keyword
+        short-circuit, so any ``Name`` reaching here is non-keyword.
+        """
         if self._resolve_expr is not None:
             v = self._resolve_expr(expr)
             if v is not None:
                 return v
-        if isinstance(expr, cst.Name) and expr.value not in _KEYWORDS:
+        if isinstance(expr, cst.Name):
             return self._evaluate_name(expr)
         return None
 
@@ -391,7 +376,7 @@ class TruthinessResolver:
         ]
         if not referents:
             return None
-        body = _scope_body(referents[0].scope, self._module)
+        body = scope_body(referents[0].scope, self._module)
         if body is None:
             return None
         live_set = self._live_cache.get(id(name))
@@ -405,12 +390,9 @@ class TruthinessResolver:
             self._live_cache[id(name)] = live_set
         if not live_set:
             return None
-        live_ids = {id(n) for n in live_set}
         values: set[bool] = set()
-        for ref in referents:
-            if id(ref.node) not in live_ids:
-                continue
-            rhs = self._rhs_for(ref.node)
+        for live_node in live_set:
+            rhs = self._rhs_for(live_node)
             if rhs is None:
                 return None
             v = self.evaluate(rhs)
@@ -448,9 +430,6 @@ class TruthinessResolver:
         rhs = _constant_assignment_rhs(binding_node, parent_map)
         self._rhs_cache[key] = rhs
         return rhs
-
-
-_MISSING: object = object()
 
 
 @runtime_checkable
