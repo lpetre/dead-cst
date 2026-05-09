@@ -645,9 +645,7 @@ def remove(
 
     unreachable_graph = graph.subgraph([n for n in graph.nodes if n not in reachable])
 
-    patch = "".join(
-        generate_patch(unreachable_graph, package.path, root=root) for package in analysis.packages
-    )
+    patch = generate_patch(unreachable_graph, root)
 
     if not patch:
         typer.echo("No dead code found.", err=True)

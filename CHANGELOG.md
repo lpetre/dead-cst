@@ -10,10 +10,13 @@ two versions.
 ## [Unreleased]
 
 ### Added
-- `dead_cst.codemod.generate_patch(G, package_path, *, root=None)` returns
-  the same removal as `remove_code` as a `git apply`-compatible unified
-  diff (with `diff --git` headers and `deleted file mode 100644` for
-  module deletions) instead of writing in place.
+- `dead_cst.codemod.generate_patch(G, root)` returns the same removal
+  as `remove_code` as a `git apply`-compatible unified diff (with
+  `diff --git` headers and `deleted file mode 100644` for module
+  deletions) instead of writing in place. Selection is driven entirely
+  by `G.nodes`, so callers can slice the unreachable graph (e.g.
+  `G.subgraph(scc)` for one SCC at a time) to review a big codebase as
+  a series of focused patches.
 
 ### Changed
 - **Breaking:** `dead-cst remove` no longer modifies files in place. It

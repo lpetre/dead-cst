@@ -150,20 +150,20 @@ def remove_code(G: nx.Graph, package_path: Path) -> None:
             f.write(result.code)
 
 
-def generate_patch(G: nx.Graph, package_path: Path, *, root: Path | None = None) -> str:
-    """Return the unified diff that :func:`remove_code` would produce.
+def generate_patch(G: nx.Graph, root: Path) -> str:
+    """Return a ``git apply``-compatible unified diff that removes ``G``'s nodes.
 
     Same selection logic as :func:`remove_code` -- group dead nodes by
     file, run :class:`RemoveDeadSymbols` then :class:`RemoveImportsVisitor`
     -- but instead of writing the rewritten source back to disk, compare
-    it to the original and emit a ``git apply``-compatible unified diff.
-    Module nodes become file-deletion hunks (``+++ /dev/null`` plus the
-    ``deleted file mode 100644`` extended header).
+    it to the original and emit a unified diff. Module nodes become
+    file-deletion hunks (``+++ /dev/null`` plus the ``deleted file
+    mode 100644`` extended header).
 
-    Patch paths are emitted as ``a/<rel>`` / ``b/<rel>`` where ``rel`` is
-    the file path relative to ``root`` (defaults to ``package_path``).
-    Pass the project root explicitly when generating patches across
-    multiple packages so all hunks share a common base for ``git apply``.
+    Patch paths are emitted as ``a/<rel>`` / ``b/<rel>`` where ``rel``
+    is each file's path relative to ``root``; ``git apply`` should be
+    run from that same directory. Nodes whose source path is not under
+    ``root`` are skipped.
 
     Selection is driven entirely by ``G.nodes`` -- only those nodes are
     candidates for removal -- so callers can slice the unreachable
@@ -177,12 +177,10 @@ def generate_patch(G: nx.Graph, package_path: Path, *, root: Path | None = None)
     The returned string is the concatenation of every per-file diff,
     sorted by path. An empty string means there was nothing to remove.
     """
-    base = root if root is not None else package_path
-
     by_file: dict[Path, list[SymbolNode]] = {}
     deleted_modules: list[Path] = []
     for node in G.nodes:
-        if not node.path.is_relative_to(package_path):
+        if not node.path.is_relative_to(root):
             continue
         if not node.path.exists():
             continue
@@ -195,7 +193,7 @@ def generate_patch(G: nx.Graph, package_path: Path, *, root: Path | None = None)
     chunks: list[str] = []
 
     for path in sorted(deleted_modules):
-        rel = path.relative_to(base).as_posix()
+        rel = path.relative_to(root).as_posix()
         original = path.read_text().splitlines(keepends=True)
         body = "".join(
             difflib.unified_diff(
@@ -211,7 +209,7 @@ def generate_patch(G: nx.Graph, package_path: Path, *, root: Path | None = None)
 
     if by_file:
         mgr = FullRepoManager(
-            str(package_path), [str(p) for p in by_file], {FixedFullyQualifiedNameProvider}
+            str(root), [str(p) for p in by_file], {FixedFullyQualifiedNameProvider}
         )
         for path, nodes in sorted(by_file.items(), key=lambda x: x[0]):
             wrapper = mgr.get_metadata_wrapper_for_path(str(path))
@@ -231,7 +229,7 @@ def generate_patch(G: nx.Graph, package_path: Path, *, root: Path | None = None)
             if new_text == original_text:
                 continue
 
-            rel = path.relative_to(base).as_posix()
+            rel = path.relative_to(root).as_posix()
             body = "".join(
                 difflib.unified_diff(
                     original_text.splitlines(keepends=True),
