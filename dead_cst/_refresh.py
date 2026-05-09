@@ -488,10 +488,10 @@ def _apply_payload(
       ``graph.nodes[node]["testcase"] = True`` attribute so
       :func:`find_reachable_excluding_tests` can drop test seeds when
       computing the "blast radius" of removing the test suite.
-    * ``NodeFlags.NOQA`` mirrors into a
-      ``graph.nodes[node]["noqa"] = True`` attribute so
-      :func:`find_reachable_excluding` can drop F401-pinned imports
-      when computing the "blast radius" of removing every noqa pin.
+    * ``NodeFlags.NOQA`` is read straight off the ``SymbolNode`` (no
+      attr-dict mirror) by :func:`find_reachable_excluding`, which
+      filters seeds via ``n.flags & exclude_flags`` for the "blast
+      radius" of removing every noqa-pinned import.
 
     Edge flag derivation: each ``(src, dst, access_pos)`` entry has
     its access position tested against ``payload.dead_suites`` for
@@ -530,8 +530,6 @@ def _apply_payload(
             symbol_graph.nodes[n]["entrypoint"] = True
         if n.flags & NodeFlags.TESTCASE:
             symbol_graph.nodes[n]["testcase"] = True
-        if n.flags & NodeFlags.NOQA:
-            symbol_graph.nodes[n]["noqa"] = True
         if n.type == "synthetic":
             continue
         if n.type != "module":

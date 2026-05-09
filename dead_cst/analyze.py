@@ -139,11 +139,21 @@ def _compose_contribution(
             apply_ops(target_graph, ops)
 
 
-def _find_reachable(graph: nx.MultiDiGraph) -> set[SymbolNode]:
+def _find_reachable(
+    graph: nx.MultiDiGraph, exclude_flags: NodeFlags = NodeFlags.NONE
+) -> set[SymbolNode]:
     """BFS forward from every node tagged as an entrypoint by a plugin.
 
     Plugins mark seeds by setting ``graph.nodes[node]["entrypoint"] = True``
     (see :func:`dead_cst.plugins.apply_ops`).
+
+    ``exclude_flags`` may carry one or more :class:`NodeFlags` bits to
+    drop entrypoints whose flags intersect; the default
+    :data:`NodeFlags.NONE` keeps every seed and reproduces today's
+    "all entrypoints" reachability. The diff
+    ``_find_reachable(g) - _find_reachable(g, flags)`` is the blast
+    radius of dropping every entrypoint with any of those bits, surfaced
+    as :func:`_find_kept_alive_by_flags_only`.
 
     Edges flagged with :data:`EdgeFlags.DEAD_BRANCH` are NOT filtered
     here -- today's behavior, where dead-code references propagate
@@ -151,7 +161,11 @@ def _find_reachable(graph: nx.MultiDiGraph) -> set[SymbolNode]:
     :func:`_find_reachable_strict` for the variant that skips them.
     """
     visited: set[SymbolNode] = set()
-    stack = [n for n, attrs in graph.nodes(data=True) if attrs.get("entrypoint")]
+    stack = [
+        n
+        for n, attrs in graph.nodes(data=True)
+        if attrs.get("entrypoint") and not (n.flags & exclude_flags)
+    ]
     while stack:
         node = stack.pop()
         if node in visited:
@@ -190,41 +204,15 @@ def _find_kept_alive_by_dead_branches(graph: nx.MultiDiGraph) -> set[SymbolNode]
     return _find_reachable(graph) - _find_reachable_strict(graph)
 
 
-def _find_reachable_excluding(graph: nx.MultiDiGraph, exclude_flags: NodeFlags) -> set[SymbolNode]:
-    """Like :func:`_find_reachable` but skips entrypoints with any of ``exclude_flags``.
-
-    The ``SymbolNode`` (the graph key) carries its own flag bits, so
-    membership is checked directly off the node. ``exclude_flags`` may
-    combine multiple bits (``NodeFlags.TESTCASE | NodeFlags.NOQA``) to
-    drop several entrypoint classes in one pass.
-    """
-    visited: set[SymbolNode] = set()
-    stack = [
-        n
-        for n, attrs in graph.nodes(data=True)
-        if attrs.get("entrypoint") and not (n.flags & exclude_flags)
-    ]
-    while stack:
-        node = stack.pop()
-        if node in visited:
-            continue
-        visited.add(node)
-        stack.extend(graph.successors(node))
-    return visited
-
-
 def _find_kept_alive_by_flags_only(graph: nx.MultiDiGraph, flags: NodeFlags) -> set[SymbolNode]:
     """Symbols reachable only from entrypoints carrying any of ``flags``.
 
-    ``_find_reachable(graph) -`` :func:`_find_reachable_excluding(graph, flags)`;
-    the difference is the "blast radius" of dropping every entrypoint with
+    ``_find_reachable(graph) - _find_reachable(graph, flags)``; the
+    difference is the "blast radius" of dropping every entrypoint with
     any of those flag bits. Surfaced on :class:`Analysis` and
-    :class:`PackageView` as ``kept_alive_by_flags_only(flags)`` -- pass
-    :data:`NodeFlags.TESTCASE` for "blast radius of dropping the test
-    suite", :data:`NodeFlags.NOQA` for "blast radius of removing every
-    F401 pin", or both ORed together.
+    :class:`PackageView` as ``kept_alive_by_flags_only(flags)``.
     """
-    return _find_reachable(graph) - _find_reachable_excluding(graph, flags)
+    return _find_reachable(graph) - _find_reachable(graph, flags)
 
 
 def _count_nodes(graph: nx.MultiDiGraph, prefix: Path | None) -> dict[str, int]:
@@ -596,23 +584,12 @@ class Analysis:
     def kept_alive_by_flags_only(self, flags: NodeFlags) -> set[SymbolNode]:
         """Symbols reachable only from entrypoints carrying any of ``flags``.
 
-        Computed as ``reachable() -`` BFS that excludes every entrypoint
-        whose flags intersect the argument. The resulting set is the
-        "blast radius" of dropping every entrypoint with any of those
-        flag bits. The default :meth:`reachable` traversal is
-        unchanged; this is the opt-in stricter pass.
-
-        Common flag arguments:
-
-        * :data:`NodeFlags.TESTCASE` -- "if you deleted your tests,
-          these symbols would also become dead" (pytest / unittest
-          discovery seeds).
-        * :data:`NodeFlags.NOQA` -- "if I removed every
-          ``# noqa: F401`` pin, what would actually become dead?"
-          (imports the visitor preserved because of a per-line or
-          file-level ruff/pyflakes directive).
-        * ``NodeFlags.TESTCASE | NodeFlags.NOQA`` -- combine in one
-          pass.
+        Opt-in "blast radius" query: the diff between full reachability
+        and reachability with those entrypoints dropped. Pass
+        :data:`NodeFlags.TESTCASE` for "what dies if the test suite
+        goes", :data:`NodeFlags.NOQA` for "what dies if every
+        ``# noqa: F401`` pin is removed", or any OR-combination. See
+        :class:`NodeFlags` for the full list.
         """
         g = self.materialize_all()
         return _find_kept_alive_by_flags_only(g, flags)

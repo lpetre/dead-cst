@@ -1,19 +1,10 @@
-"""End-to-end tests for :data:`NodeFlags.NOQA` and the
-``kept_alive_by_noqa_only`` queries.
+"""End-to-end tests for :data:`NodeFlags.NOQA` and ``kept_alive_by_flags_only(NodeFlags.NOQA)``.
 
-The visitor stamps :data:`NodeFlags.NOQA` (in addition to
-:data:`NodeFlags.ENTRYPOINT`) on imports whose source line carries a
-ruff/pyflakes ``# noqa[: ...F401...]`` directive, plus on every import
-in a file with a ``# ruff: noqa`` / ``# flake8: noqa``. The analyzer
-mirrors that into ``graph.nodes[node]["noqa"] = True``.
-
-Default :func:`find_reachable` ignores the flag -- pinned imports keep
-their targets alive the same as any other entrypoint. The strict pass
-``_find_reachable_excluding(graph, NodeFlags.NOQA)`` skips those
-seeds, and the diff ``_find_kept_alive_by_flags_only(graph,
-NodeFlags.NOQA)`` is the "blast radius" of removing every F401 pin:
-modules and decls currently kept alive only because a side-effect
-import or re-export still references them.
+The visitor stamps ``ENTRYPOINT | NOQA`` on imports preserved by a
+ruff/pyflakes ``# noqa[: ...F401...]`` (per-line) or by a file-level
+``# ruff: noqa`` / ``# flake8: noqa``. The flag-taking blast-radius
+query returns modules and decls currently kept alive only because of
+those pinned imports.
 """
 
 from __future__ import annotations
@@ -22,12 +13,11 @@ from dead_cst import NodeFlags
 from dead_cst.analyze import (
     _find_kept_alive_by_flags_only,
     _find_reachable as find_reachable,
-    _find_reachable_excluding,
 )
 
 
 def find_reachable_excluding_noqa(graph):
-    return _find_reachable_excluding(graph, NodeFlags.NOQA)
+    return find_reachable(graph, NodeFlags.NOQA)
 
 
 def find_kept_alive_by_noqa_only(graph):
@@ -77,14 +67,12 @@ def test_production_only_decl_survives_strict_pass(make_analysis, write_files):
 
 
 def test_pinned_import_carries_noqa_flag(build_decl_graph):
-    """Per-line ``# noqa: F401`` stamps both ENTRYPOINT and NOQA on the
-    import node, mirrored as ``noqa=True`` on the graph attrs."""
+    """Per-line ``# noqa: F401`` stamps both ENTRYPOINT and NOQA on the import node."""
     graph = build_decl_graph({"m.py": "import os  # noqa: F401\n"})
     pinned = next(n for n in graph.nodes if n.fqname == "m.os")
     assert pinned.flags & NodeFlags.ENTRYPOINT
     assert pinned.flags & NodeFlags.NOQA
     assert graph.nodes[pinned].get("entrypoint") is True
-    assert graph.nodes[pinned].get("noqa") is True
 
 
 def test_file_level_directive_stamps_noqa(build_decl_graph):
@@ -100,12 +88,11 @@ def test_unpinned_import_has_no_noqa_flag(build_decl_graph):
     graph = build_decl_graph({"m.py": "import os\n"})
     node = next(n for n in graph.nodes if n.fqname == "m.os")
     assert not (node.flags & NodeFlags.NOQA)
-    assert graph.nodes[node].get("noqa") is None
 
 
 def test_excluding_multiple_flags_in_one_pass(make_analysis, write_files):
-    """``_find_reachable_excluding`` accepts a combined ``IntFlag`` value
-    so callers can drop several entrypoint classes at once."""
+    """``_find_reachable`` accepts a combined ``IntFlag`` value so
+    callers can drop several entrypoint classes at once."""
     write_files(
         {
             "pkg/__init__.py": """
@@ -125,7 +112,7 @@ def test_excluding_multiple_flags_in_one_pass(make_analysis, write_files):
     graph = make_analysis(plugins=[PytestPlugin()]).materialize_all()
     side = next(n for n in graph.nodes if n.fqname == "pkg.side_effect")
     assert side in find_reachable(graph)
-    excluded = _find_reachable_excluding(graph, NodeFlags.TESTCASE | NodeFlags.NOQA)
+    excluded = find_reachable(graph, NodeFlags.TESTCASE | NodeFlags.NOQA)
     assert side not in excluded
 
 

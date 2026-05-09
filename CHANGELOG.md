@@ -27,8 +27,8 @@ two versions.
   ``TYPE_CHECKING`` shims guarded by F401) is no longer surfaced or
   removed.
 - New ``NodeFlags.NOQA`` flag, layered on ``NodeFlags.ENTRYPOINT``
-  (parallel to ``NodeFlags.TESTCASE``). The flag is mirrored as
-  ``graph.nodes[n]["noqa"] = True`` on the materialized graph.
+  (parallel to ``NodeFlags.TESTCASE``). Read ``n.flags & NodeFlags.NOQA``
+  off the ``SymbolNode`` directly; there is no graph attr-dict mirror.
 
 ### Changed
 
@@ -38,12 +38,10 @@ two versions.
   ``NodeFlags.TESTCASE`` for the old ``kept_alive_by_tests_only``
   behavior ("blast radius of dropping the test suite"),
   ``NodeFlags.NOQA`` for "blast radius of removing every F401 pin",
-  or both ORed together to drop several entrypoint classes in one
-  pass. The private BFS helper
-  ``dead_cst.analyze._find_reachable_excluding(graph, flags)``
-  follows the same shape; both replace the old
-  ``_find_reachable_excluding_tests`` /
-  ``_find_kept_alive_by_tests_only`` helpers.
+  or both ORed together. ``dead_cst.analyze._find_reachable(graph,
+  exclude_flags=NodeFlags.NONE)`` is the matching private helper
+  shape; ``_find_reachable_excluding_tests`` and
+  ``_find_kept_alive_by_tests_only`` are gone.
 - `dead_cst.codemod.generate_patch(G, root)` returns the same removal
   as `remove_code` as a `git apply`-compatible unified diff (with
   `diff --git` headers and `deleted file mode 100644` for module

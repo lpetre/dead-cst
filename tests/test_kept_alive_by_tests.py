@@ -1,16 +1,10 @@
-"""End-to-end tests for :data:`NodeFlags.TESTCASE` and the
-``kept_alive_by_tests_only`` queries.
+"""End-to-end tests for :data:`NodeFlags.TESTCASE` and ``kept_alive_by_flags_only(NodeFlags.TESTCASE)``.
 
 Test plugins (pytest, unittest) stamp their synthetic seed nodes with
-:data:`NodeFlags.TESTCASE` (in addition to :data:`NodeFlags.ENTRYPOINT`).
-The analyzer mirrors that into ``graph.nodes[seed]["testcase"] = True``.
-
-Default :func:`find_reachable` ignores the flag -- test seeds keep their
-targets alive the same as any other entrypoint. The strict pass
-:func:`find_reachable_excluding_tests` skips those seeds, and the diff
-:func:`find_kept_alive_by_tests_only` is the "blast radius" of dropping
-the test suite: production code that's currently kept alive only because
-tests still touch it.
+``ENTRYPOINT | TESTCASE``. Default :func:`find_reachable` treats those
+seeds the same as any other entrypoint; the flag-taking blast-radius
+query returns production code currently kept alive only because tests
+still touch it.
 """
 
 from __future__ import annotations
@@ -19,13 +13,12 @@ from dead_cst import NodeFlags
 from dead_cst.analyze import (
     _find_kept_alive_by_flags_only,
     _find_reachable as find_reachable,
-    _find_reachable_excluding,
 )
 from dead_cst.plugins import PytestPlugin, UnittestPlugin
 
 
 def find_reachable_excluding_tests(graph):
-    return _find_reachable_excluding(graph, NodeFlags.TESTCASE)
+    return find_reachable(graph, NodeFlags.TESTCASE)
 
 
 def find_kept_alive_by_tests_only(graph):

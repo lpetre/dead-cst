@@ -192,11 +192,9 @@ Folded down from earlier tiers as they landed:
   `NodeFlags.OVERLOAD`, excluded from the cross-module trie, and anchored
   to their same-file impl via explicit `impl -> overload` edges so the
   codemod removes overloads with their impl.
-- **v0.6.0**: `NodeFlags.TESTCASE` plus the
-  `Analysis.kept_alive_by_flags_only(NodeFlags.TESTCASE)` /
-  `PackageView.kept_alive_by_flags_only(...)` queries (originally shipped
-  as `kept_alive_by_tests_only`; collapsed into the flag-taking shape
-  before 0.8.0) for "blast radius of dropping the test suite".
+- **v0.6.0**: `NodeFlags.TESTCASE` plus the per-package
+  blast-radius query for "what would die if the test suite were
+  dropped" (later generalized into `kept_alive_by_flags_only`).
   `PytestPlugin` and `UnittestPlugin` stamp `ENTRYPOINT | TESTCASE` on
   their synthetic seeds.
 - **v0.6.0**: `UnittestPlugin` resolves transitive `TestCase` subclasses
