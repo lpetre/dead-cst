@@ -31,6 +31,7 @@ dependencies = [
 Homepage = "https://github.com/lpetre/dead-cst"
 Repository = "https://github.com/lpetre/dead-cst"
 Issues = "https://github.com/lpetre/dead-cst/issues"
+Changelog = "https://github.com/lpetre/dead-cst/blob/main/CHANGELOG.md"
 
 [project.scripts]
 dead-cst = "dead_cst.cli:main_cli"
