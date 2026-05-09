@@ -16,7 +16,7 @@ import textwrap
 import libcst as cst
 from libcst.metadata import MetadataWrapper, ScopeProvider
 
-from dead_cst.branches import TruthinessResolver
+from dead_cst.branches import Const, TruthinessResolver
 
 
 def _resolve_lookup(src: str) -> dict[str, list[bool | None]]:
@@ -427,3 +427,194 @@ def test_external_resolver_returning_none_does_not_block_literals() -> None:
         lambda _: None,
     )
     assert out["x"] == [False]
+
+
+# ----------------------------------------------------------------------
+# resolve_constant: same flow walk as ``evaluate``, but returns the
+# underlying literal value rather than its boolean projection.
+# Intended for custom detectors that pattern-match against a flag
+# *name* (e.g. ``check_flag(FEATURE_A)`` where
+# ``FEATURE_A = "feature_a"``).
+# ----------------------------------------------------------------------
+
+
+def _const_lookup(src: str) -> dict[str, list[Const | None]]:
+    """Return ``{name -> [const, ...]}`` for every Name access.
+
+    Same shape as :func:`_resolve_lookup` but exercises
+    :meth:`TruthinessResolver.resolve_constant` rather than
+    ``evaluate``.
+    """
+    module = cst.parse_module(textwrap.dedent(src).strip())
+    wrapper = MetadataWrapper(module, unsafe_skip_copy=True)
+    resolver = TruthinessResolver(wrapper)
+    scopes = wrapper.resolve(ScopeProvider)
+
+    access_nodes: set[int] = set()
+    for scope in set(scopes.values()):
+        for access in scope.accesses:
+            if isinstance(access.node, cst.Name):
+                access_nodes.add(id(access.node))
+
+    result: dict[str, list] = {}
+
+    class _Collect(cst.CSTVisitor):
+        def visit_Name(self, node: cst.Name) -> None:
+            if id(node) in access_nodes:
+                result.setdefault(node.value, []).append(resolver.resolve_constant(node))
+
+    wrapper.module.visit(_Collect())
+    return result
+
+
+def test_resolve_constant_direct_string_literal() -> None:
+    out = _const_lookup(
+        """
+        FEATURE = "feature_a"
+        use(FEATURE)
+        """
+    )
+    assert out["FEATURE"] == [Const("feature_a")]
+
+
+def test_resolve_constant_keywords() -> None:
+    # True / False / None resolve to their language-defined values.
+    module = cst.parse_module("True; False; None")
+    wrapper = MetadataWrapper(module, unsafe_skip_copy=True)
+    resolver = TruthinessResolver(wrapper)
+    seen: list = []
+
+    class _Collect(cst.CSTVisitor):
+        def visit_Name(self, node: cst.Name) -> None:
+            seen.append((node.value, resolver.resolve_constant(node)))
+
+    wrapper.module.visit(_Collect())
+    assert ("True", Const(True)) in seen
+    assert ("False", Const(False)) in seen
+    assert ("None", Const(None)) in seen
+
+
+def test_resolve_constant_integer_literal() -> None:
+    out = _const_lookup(
+        """
+        N = 42
+        use(N)
+        """
+    )
+    assert out["N"] == [Const(42)]
+
+
+def test_resolve_constant_concatenated_string() -> None:
+    # ``"a" "b"`` is one ConcatenatedString; libcst evaluates it to "ab".
+    module = cst.parse_module(textwrap.dedent('s = "a" "b"\nuse(s)').strip())
+    wrapper = MetadataWrapper(module, unsafe_skip_copy=True)
+    resolver = TruthinessResolver(wrapper)
+    out: list = []
+
+    class _Collect(cst.CSTVisitor):
+        def visit_Name(self, node: cst.Name) -> None:
+            if node.value == "s":
+                out.append(resolver.resolve_constant(node))
+
+    wrapper.module.visit(_Collect())
+    # Two ``s`` Names: the binding LHS (None) and the access in ``use(s)``.
+    assert Const("ab") in out
+
+
+def test_resolve_constant_chained_assignment() -> None:
+    out = _const_lookup(
+        """
+        FEATURE = "feature_a"
+        ALIAS = FEATURE
+        use(ALIAS)
+        """
+    )
+    # ALIAS access folds through FEATURE.
+    assert out["ALIAS"] == [Const("feature_a")]
+    # FEATURE access on RHS of ALIAS = FEATURE folds directly.
+    assert out["FEATURE"] == [Const("feature_a")]
+
+
+def test_resolve_constant_annassign() -> None:
+    out = _const_lookup(
+        """
+        FEATURE: str = "feature_a"
+        use(FEATURE)
+        """
+    )
+    assert out["FEATURE"] == [Const("feature_a")]
+
+
+def test_resolve_constant_multi_target_assign() -> None:
+    # ``A = B = "x"`` -- both targets share one RHS, so both fold.
+    out = _const_lookup(
+        """
+        A = B = "shared"
+        use(A)
+        use(B)
+        """
+    )
+    assert out["A"] == [Const("shared")]
+    assert out["B"] == [Const("shared")]
+
+
+def test_resolve_constant_cycle_returns_none() -> None:
+    # ``a = b; b = a`` bottoms out at None via the _PENDING sentinel
+    # rather than recursing forever. Two accesses (``b = a`` RHS and
+    # ``use(a)``) both fail to fold without crashing.
+    out = _const_lookup(
+        """
+        a = b
+        b = a
+        use(a)
+        """
+    )
+    assert out["a"] == [None, None]
+
+
+def test_resolve_constant_divergent_values_return_none() -> None:
+    # Two reaching definitions with different literals must NOT fold.
+    out = _const_lookup(
+        """
+        if cond:
+            x = "a"
+        else:
+            x = "b"
+        use(x)
+        """
+    )
+    assert out["x"][-1] is None  # the access in ``use(x)``
+
+
+def test_resolve_constant_unknown_rhs_returns_none() -> None:
+    # RHS isn't a literal we fold (call expression) -- unknown.
+    out = _const_lookup(
+        """
+        x = compute_flag()
+        use(x)
+        """
+    )
+    assert out["x"] == [None]
+
+
+def test_resolve_constant_distinguishes_none_literal_from_unknown() -> None:
+    # ``Const(None)`` (proved None) vs ``None`` (couldn't determine).
+    out = _const_lookup(
+        """
+        x = None
+        y = unresolvable
+        use(x)
+        use(y)
+        """
+    )
+    assert out["x"] == [Const(None)]
+    assert out["y"] == [None]
+
+
+def test_resolve_constant_literal_for_non_name_inputs() -> None:
+    # Direct literal arguments fold without any Name lookup.
+    module = cst.parse_module('check("feature_a")')
+    wrapper = MetadataWrapper(module, unsafe_skip_copy=True)
+    resolver = TruthinessResolver(wrapper)
+    args = [a.value for a in module.body[0].body[0].value.args]
+    assert resolver.resolve_constant(args[0]) == Const("feature_a")

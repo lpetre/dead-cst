@@ -1028,7 +1028,7 @@ def test_custom_detector_override_folds_call_in_if(make_analysis, write_files):
         name: str = "flag_aware"
         version: int = 1
 
-        def resolve(self, expr):
+        def resolve(self, expr, resolver):
             if (
                 isinstance(expr, cst.Call)
                 and isinstance(expr.func, cst.Name)
@@ -1078,7 +1078,7 @@ def test_custom_detector_override_folds_through_assignment(make_analysis, write_
         name: str = "flag_aware"
         version: int = 1
 
-        def resolve(self, expr):
+        def resolve(self, expr, resolver):
             if (
                 isinstance(expr, cst.Call)
                 and isinstance(expr.func, cst.Name)
@@ -1100,9 +1100,12 @@ def test_default_resolve_returns_none() -> None:
     # The base detector's ``resolve`` is a no-op hook. Verifying the
     # default explicitly keeps the contract for subclasses clear.
     import libcst as cst
+    from libcst.metadata import MetadataWrapper
 
-    from dead_cst.branches import DefaultUnreachableRegionDetector
+    from dead_cst.branches import DefaultUnreachableRegionDetector, TruthinessResolver
 
     detector = DefaultUnreachableRegionDetector()
-    assert detector.resolve(cst.Name("anything")) is None
-    assert detector.resolve(cst.Integer("0")) is None
+    wrapper = MetadataWrapper(cst.parse_module(""), unsafe_skip_copy=True)
+    resolver = TruthinessResolver(wrapper)
+    assert detector.resolve(cst.Name("anything"), resolver) is None
+    assert detector.resolve(cst.Integer("0"), resolver) is None

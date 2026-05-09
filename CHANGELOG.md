@@ -29,9 +29,38 @@ two versions.
 - New ``NodeFlags.NOQA`` flag, layered on ``NodeFlags.ENTRYPOINT``
   (parallel to ``NodeFlags.TESTCASE``). Read ``n.flags & NodeFlags.NOQA``
   off the ``SymbolNode`` directly; there is no graph attr-dict mirror.
+- `dead_cst.codemod.generate_patch(G, root)` returns the same removal
+  as `remove_code` as a `git apply`-compatible unified diff (with
+  `diff --git` headers and `deleted file mode 100644` for module
+  deletions) instead of writing in place. Selection is driven entirely
+  by `G.nodes`, so callers can slice the unreachable graph (e.g.
+  `G.subgraph(scc)` for one SCC at a time) to review a big codebase as
+  a series of focused patches.
+- `TruthinessResolver.resolve_constant(expr) -> Const | None` returns
+  the underlying literal *value* (`str` / `int` / `bool` / `None`,
+  wrapped in the new `Const` dataclass) over the same flow-sensitive
+  Name walk `evaluate` uses for truthiness. Intended for custom
+  detectors that pattern-match against a flag *name* -- e.g.
+  `check_flag(FEATURE_A)` where `FEATURE_A = "feature_a"` is bound at
+  module level. `Const(None)` (the `None` literal was proved) stays
+  distinct from a bare `None` return ("unknown"). Re-exported from
+  `dead_cst.branches`.
+- `Analysis.preview_payloads(files, *, detector=None) -> dict[Path, VisitorPayload]`
+  regenerates per-file payloads for a hand-picked file set, bypassing
+  the on-disk cache (no read, no write) and accepting a one-shot
+  `UnreachableRegionDetector` override. Pairs with the new
+  `Analysis.materialize_with(payloads)` to splice the substitute
+  payloads into a fresh graph without mutating any baseline state.
+  `Analysis.preview(files, *, detector=None)` chains the two and
+  returns a new `GraphView` (also new) wrapping the overlay graph
+  with the same reachability surface as `Analysis` (`reachable`,
+  `dead`, `kept_alive_by_dead_branches`, `kept_alive_by_flags_only`,
+  `count_nodes`). The combined API enables what-if graph surgery:
+  bake a flag's truthiness into a small set of files and ask "what
+  becomes dead if we land this rollout?" without forking the
+  analysis-wide fingerprint or polluting the cache.
 
 ### Changed
-
 - **Breaking:** The two ``kept_alive_by_*_only`` methods on
   ``Analysis`` and ``PackageView`` have been collapsed into a single
   ``kept_alive_by_flags_only(flags: NodeFlags)``. Pass
@@ -42,13 +71,21 @@ two versions.
   exclude_flags=NodeFlags.NONE)`` is the matching private helper
   shape; ``_find_reachable_excluding_tests`` and
   ``_find_kept_alive_by_tests_only`` are gone.
-- `dead_cst.codemod.generate_patch(G, root)` returns the same removal
-  as `remove_code` as a `git apply`-compatible unified diff (with
-  `diff --git` headers and `deleted file mode 100644` for module
-  deletions) instead of writing in place. Selection is driven entirely
-  by `G.nodes`, so callers can slice the unreachable graph (e.g.
-  `G.subgraph(scc)` for one SCC at a time) to review a big codebase as
-  a series of focused patches.
+- **Breaking:** `dead-cst remove` no longer modifies files in place. It
+  now emits a unified diff to stdout (or to `--output PATH`) and exits;
+  apply with `dead-cst remove . | git apply` (or `git apply <path>` if
+  you used `--output`). The `--dry-run` flag and the
+  `Proceed with removal? [y/N]` confirmation prompt are gone -- the
+  command is non-destructive by construction. The "Building symbol
+  graph" banner, the "No dead code found." message, and the apply hint
+  go to stderr so the patch on stdout stays clean.
+- **Breaking:** `DefaultUnreachableRegionDetector.resolve(expr)` is now
+  `resolve(expr, resolver)`. The active `TruthinessResolver` is the
+  second argument, so overrides can call
+  `resolver.resolve_constant(...)` to fold a flag-name `Name` to its
+  literal value before pattern-matching. Subclasses with a one-arg
+  `def resolve(self, expr): ...` need to add the `resolver` parameter;
+  ignore it if you don't use it.
 
 ### Fixed
 - `DefaultUnreachableRegionDetector` now recognizes compound statements
@@ -68,16 +105,6 @@ two versions.
   ``edges`` to ``False`` and incorrectly mark the trailing code dead.
   Tuples and primitive literals are immutable and stay safe to fold.
   Bumps the detector's `version` so cached payloads rebuild.
-
-### Changed
-- **Breaking:** `dead-cst remove` no longer modifies files in place. It
-  now emits a unified diff to stdout (or to `--output PATH`) and exits;
-  apply with `dead-cst remove . | git apply` (or `git apply <path>` if
-  you used `--output`). The `--dry-run` flag and the
-  `Proceed with removal? [y/N]` confirmation prompt are gone -- the
-  command is non-destructive by construction. The "Building symbol
-  graph" banner, the "No dead code found." message, and the apply hint
-  go to stderr so the patch on stdout stays clean.
 
 ## [0.7.0] - 2026-05-09
 
