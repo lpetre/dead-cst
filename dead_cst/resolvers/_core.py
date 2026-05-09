@@ -10,8 +10,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Protocol, runtime_checkable
 
-from .._cacheable import Cacheable
-
 
 @dataclass(frozen=True, slots=True)
 class Package:
@@ -52,7 +50,7 @@ ImportResolver = Callable[[str, list[Path]], "str | Path | None"]
 
 
 @runtime_checkable
-class PathResolver(Cacheable, Protocol):
+class PathResolver(Protocol):
     """A resolver describes a project layout in two complementary ways.
 
     :meth:`resolve` reports the first-party packages the analyzer
@@ -78,9 +76,12 @@ class PathResolver(Cacheable, Protocol):
     typically call it as a fallback after their own layout-specific
     lookups.
 
-    Inherits the ``(name, version)`` contract from :class:`Cacheable`
-    so the per-file cache invalidates when a resolver's layout-discovery
-    or import-resolution logic changes (bump the epoch ``version``).
+    Resolvers do *not* satisfy :class:`~dead_cst._cacheable.Cacheable`:
+    their output flows through the (uncached) edge-stitching pass in
+    :func:`~dead_cst._edges.resolve_edges`, so swapping a resolver
+    re-stitches edges without invalidating any per-file
+    :class:`~dead_cst.graph.VisitorPayload` blob. There is no
+    ``(name, version)`` knob to bump.
     """
 
     def resolve(self, project_root: Path) -> tuple[Package, ...]: ...

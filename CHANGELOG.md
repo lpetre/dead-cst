@@ -22,6 +22,16 @@ two versions.
   syntax) invalidates the entry automatically.
 
 ### Changed
+- **Breaking:** `PathResolver` no longer satisfies the `Cacheable`
+  protocol -- the `name` / `version` attributes have been removed from
+  the protocol and from the shipped `ManualResolver` and `UvResolver`.
+  Resolver output flows through the (uncached) edge-stitching pass, so
+  swapping a resolver re-stitches edges without invalidating any
+  cached `VisitorPayload` blob; there was nothing for the
+  `(name, version)` pair to gate. Out-of-tree resolvers should drop
+  their `name` and `version` fields. `BUILTIN_RESOLVERS` now keys the
+  builtin entry by the literal string `"uv"` rather than reading
+  `UvResolver.name`.
 - **Breaking:** `dead_cst.branches.fold_constants` is gone, replaced
   by `dead_cst.branches.TruthinessResolver`, a goal-directed
   flow-sensitive truthiness object. From-scratch

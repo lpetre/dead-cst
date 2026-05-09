@@ -96,10 +96,10 @@ def compute_fingerprint(
     :func:`dead_cst._edges.resolve_edges` (which runs unconditionally
     on every analysis), so swapping a resolver or rebinding
     ``sys.path`` re-stitches edges without invalidating the cached
-    :class:`VisitorPayload` blobs. The ``Cacheable`` contract on
-    :class:`~dead_cst.resolvers.PathResolver` survives because the
-    resolver still drives a (uncached) classification step at stitch
-    time.
+    :class:`VisitorPayload` blobs. :class:`~dead_cst.resolvers.PathResolver`
+    deliberately does *not* satisfy :class:`Cacheable` for the same
+    reason -- there is no fingerprint to invalidate, and the (uncached)
+    edge-stitching pass picks up a swapped resolver on the next run.
 
     Each component (visitor, plugins, detector) satisfies
     :class:`~dead_cst._cacheable.Cacheable` and is fingerprinted by

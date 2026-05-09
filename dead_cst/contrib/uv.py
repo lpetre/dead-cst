@@ -51,8 +51,6 @@ class UvResolver:
     """
 
     lock_path: Path | None = None
-    name: str = "uv"
-    version: int = 1778500000
     _site_packages: Path | None = field(default=None, init=False, repr=False)
 
     def resolve(self, project_root: Path) -> tuple[Package, ...]:

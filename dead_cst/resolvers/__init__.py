@@ -44,7 +44,7 @@ from ._imports import (
 from .manual import ManualResolver
 
 BUILTIN_RESOLVERS: dict[str, type[PathResolver]] = {
-    UvResolver.name: UvResolver,
+    "uv": UvResolver,
 }
 
 
