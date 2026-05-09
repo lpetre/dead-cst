@@ -155,16 +155,59 @@ demand.
 
 Folded down from earlier tiers as they landed:
 
-- **Unreleased**: `dead-cst remove` is now non-destructive — it emits a
+- **v0.8.0**: `dead-cst remove` is now non-destructive — it emits a
   `git apply`-compatible unified diff to stdout (or `--output PATH`)
-  and never touches source files. The `--dry-run` flag and the
-  confirmation prompt are gone. New public function
+  and never touches source files (breaking; `--dry-run` and the
+  confirmation prompt are gone). New public function
   `dead_cst.codemod.generate_patch(G, root)` returns the same diff for
   any subgraph slice, so callers can render per-SCC (or per-WCC)
   patches by passing `G.subgraph(scc)` for incremental review of large
   codebases. This lays the foundation for the `dead-cst preview`
   subcommand in tier 7 — automatic WCC clustering and blast-radius
   headers are the remaining work.
+- **v0.8.0**: The visitor now honors ruff/pyflakes ``# noqa`` directives
+  that silence F401. Per-line variants (bare ``# noqa``,
+  ``# noqa: F401``, multi-rule ``# noqa: E501, F401``, case-variant
+  ``# NOQA``) and file-level pins (``# ruff: noqa``, ``# flake8: noqa``)
+  flag the resulting import nodes ``ENTRYPOINT | NOQA`` so reachability
+  keeps them alive — bringing dead-cst's unused-import semantics in
+  line with ruff's. The new ``NodeFlags.NOQA`` flag layers on
+  ``NodeFlags.ENTRYPOINT`` parallel to ``NodeFlags.TESTCASE``, and the
+  two ``kept_alive_by_*_only`` methods collapse into a single
+  ``kept_alive_by_flags_only(flags: NodeFlags)`` (breaking) that takes
+  any flag combination — pass ``NodeFlags.TESTCASE`` for the old
+  test-blast-radius behavior, ``NodeFlags.NOQA`` for the F401 pin
+  blast radius, or both ORed together.
+- **v0.8.0**: What-if graph surgery via
+  ``Analysis.preview(files, *, detector=None)`` — regenerates per-file
+  payloads for a hand-picked file set (bypassing the on-disk cache,
+  no read or write), splices them into a fresh overlay graph leaving
+  the baseline untouched, and returns a ``GraphView`` exposing the
+  same ``reachable`` / ``dead`` / ``kept_alive_by_dead_branches`` /
+  ``kept_alive_by_flags_only`` / ``count_nodes`` surface as
+  ``Analysis``. Pairs with the new
+  ``TruthinessResolver.resolve_constant(expr) -> Const | None`` (the
+  literal-value sibling of ``evaluate``, wrapped in ``Const`` so a
+  proved-``None`` literal stays distinct from a bare ``None`` "unknown"
+  return) so a custom detector can fold a flag-name ``Name``
+  (``check_flag(FEATURE_A)`` where ``FEATURE_A = "feature_a"``) before
+  pattern-matching. ``DefaultUnreachableRegionDetector.resolve(expr)``
+  is now ``resolve(expr, resolver)`` (breaking — subclasses with a
+  one-arg ``resolve`` need to add the parameter) so overrides can call
+  ``resolver.resolve_constant`` recursively.
+- **v0.8.0**: ``DefaultUnreachableRegionDetector`` recognizes compound
+  statements as terminators when every reachable branch terminates —
+  ``if True: return``, ``if FLAG: return`` with ``FLAG = True``,
+  ``if cond: return; else: return``, ``with`` whose body terminates,
+  and ``try``/``except``/``finally`` where every path terminates all
+  kill statements that follow them in the enclosing suite. Constant-
+  folded early returns now flag trailing dead code as expected. The
+  resolver also no longer folds a ``Name`` whose binding's RHS is a
+  mutable container literal (``[]``, ``{}``, comprehension RHS): the
+  binding-only flow walk is invisible to ``.append`` / item assignment
+  / ``.update``, so an ``edges = []; edges.append(x); if not edges:``
+  chain used to fold incorrectly. Tuples and primitives stay safe to
+  fold. Detector ``version`` bumped so cached payloads rebuild.
 - **v0.7.0**: `DefaultUnreachableRegionDetector` rewrite — the
   `fold_constants` fixpoint pre-pass is replaced by the goal-directed
   `TruthinessResolver`, which lazily walks only the binding slices a
