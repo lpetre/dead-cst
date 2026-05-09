@@ -9,6 +9,22 @@ two versions.
 
 ## [Unreleased]
 
+### Added
+- `dead_cst.codemod.generate_patch(G, package_path, *, root=None)` returns
+  the same removal as `remove_code` as a `git apply`-compatible unified
+  diff (with `diff --git` headers and `deleted file mode 100644` for
+  module deletions) instead of writing in place.
+
+### Changed
+- **Breaking:** `dead-cst remove` no longer modifies files in place. It
+  now emits a unified diff to stdout (or to `--output PATH`) and exits;
+  apply with `dead-cst remove . | git apply` (or `git apply <path>` if
+  you used `--output`). The `--dry-run` flag and the
+  `Proceed with removal? [y/N]` confirmation prompt are gone -- the
+  command is non-destructive by construction. The "Building symbol
+  graph" banner, the "No dead code found." message, and the apply hint
+  go to stderr so the patch on stdout stays clean.
+
 ## [0.7.0] - 2026-05-09
 
 ### Added

@@ -21,7 +21,7 @@ from .cache import (
     clear_cache,
     default_cache_path,
 )
-from .codemod import remove_code
+from .codemod import generate_patch
 from .graph import SymbolNode
 from .plugins import (
     EXTERNAL_PREFIXES,
@@ -598,15 +598,30 @@ def remove(
     verbose: Annotated[
         bool, typer.Option("-v", "--verbose", help="Enable verbose output.")
     ] = False,
-    dry_run: Annotated[
-        bool, typer.Option("--dry-run", help="Show what would be removed without making changes.")
-    ] = False,
+    output: Annotated[
+        Path | None,
+        typer.Option(
+            "-o",
+            "--output",
+            help="Write patch to this file instead of stdout.",
+        ),
+    ] = None,
     no_cache: Annotated[
         bool, typer.Option("--no-cache", help="Bypass the per-file VisitorPayload cache.")
     ] = False,
     workers: WorkersOption = None,
 ) -> None:
-    """Remove dead code from a Python codebase."""
+    """Emit a unified diff that removes dead code; pipe to ``git apply``.
+
+    Writes the patch to stdout (or to ``--output``) without touching any
+    source files. Apply with::
+
+        dead-cst remove . | git apply
+
+    or, with an explicit output path::
+
+        dead-cst remove . -o dead.patch && git apply dead.patch
+    """
     setup_logging(verbose)
     root = root.resolve()
 
@@ -630,32 +645,20 @@ def remove(
 
     unreachable_graph = graph.subgraph([n for n in graph.nodes if n not in reachable])
 
-    # Synthetic nodes (entrypoint sentinels, external-dist markers,
-    # dunder-all stand-ins) aren't user-visible declarations. The
-    # codemod can't delete them, so they're filtered out of the
-    # remove listing.
-    removable = [n for n in unreachable_graph.nodes if n.type != "synthetic"]
+    patch = "".join(
+        generate_patch(unreachable_graph, package.path, root=root) for package in analysis.packages
+    )
 
-    if not removable:
-        typer.echo("No dead code found.")
+    if not patch:
+        typer.echo("No dead code found.", err=True)
         return
 
-    typer.echo(f"\nDead symbols to remove ({len(removable)}):")
-    for node in sorted(removable, key=lambda n: (str(n.path), n.fqname)):
-        typer.echo(f"  {node.fqname} ({node.type}) at {_rel_path(node.path, root)}")
-
-    if dry_run:
-        typer.echo("\n--dry-run specified, no changes made.")
-        return
-
-    if not typer.confirm("\nProceed with removal?"):
-        typer.echo("Aborted.")
-        return
-
-    for package in analysis.packages:
-        remove_code(unreachable_graph, package.path)
-
-    typer.echo("Dead code removed.")
+    if output is not None:
+        output.write_text(patch)
+        typer.echo(f"Wrote patch to {output}. Apply with: git apply {output}", err=True)
+    else:
+        sys.stdout.write(patch)
+        typer.echo("Apply with: dead-cst remove ... | git apply", err=True)
 
 
 cache_app = typer.Typer(help="Manage the on-disk analysis cache.")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import difflib
 from pathlib import Path
 
 import libcst as cst
@@ -149,4 +150,99 @@ def remove_code(G: nx.Graph, package_path: Path) -> None:
             f.write(result.code)
 
 
-__all__ = ["remove_code"]
+def generate_patch(G: nx.Graph, package_path: Path, *, root: Path | None = None) -> str:
+    """Return the unified diff that :func:`remove_code` would produce.
+
+    Same selection logic as :func:`remove_code` -- group dead nodes by
+    file, run :class:`RemoveDeadSymbols` then :class:`RemoveImportsVisitor`
+    -- but instead of writing the rewritten source back to disk, compare
+    it to the original and emit a ``git apply``-compatible unified diff.
+    Module nodes become file-deletion hunks (``+++ /dev/null`` plus the
+    ``deleted file mode 100644`` extended header).
+
+    Patch paths are emitted as ``a/<rel>`` / ``b/<rel>`` where ``rel`` is
+    the file path relative to ``root`` (defaults to ``package_path``).
+    Pass the project root explicitly when generating patches across
+    multiple packages so all hunks share a common base for ``git apply``.
+
+    Selection is driven entirely by ``G.nodes`` -- only those nodes are
+    candidates for removal -- so callers can slice the unreachable
+    graph however they like (e.g. ``G.subgraph(scc)`` for one SCC at a
+    time) to review a big codebase as a series of focused patches. The
+    underlying file rewrite still uses ``FullRepoManager`` against the
+    real source, so a partial slice removes only the decls in the slice
+    and leaves their siblings (and any imports the slice does not
+    cover) intact.
+
+    The returned string is the concatenation of every per-file diff,
+    sorted by path. An empty string means there was nothing to remove.
+    """
+    base = root if root is not None else package_path
+
+    by_file: dict[Path, list[SymbolNode]] = {}
+    deleted_modules: list[Path] = []
+    for node in G.nodes:
+        if not node.path.is_relative_to(package_path):
+            continue
+        if not node.path.exists():
+            continue
+        match node.type:
+            case "function" | "class" | "variable" | "type_alias" | "import":
+                by_file.setdefault(node.path, []).append(node)
+            case "module":
+                deleted_modules.append(node.path)
+
+    chunks: list[str] = []
+
+    for path in sorted(deleted_modules):
+        rel = path.relative_to(base).as_posix()
+        original = path.read_text().splitlines(keepends=True)
+        body = "".join(
+            difflib.unified_diff(
+                original,
+                [],
+                fromfile=f"a/{rel}",
+                tofile="/dev/null",
+            )
+        )
+        chunks.append(
+            f"diff --git a/{rel} b/{rel}\ndeleted file mode 100644\n{body}",
+        )
+
+    if by_file:
+        mgr = FullRepoManager(
+            str(package_path), [str(p) for p in by_file], {FixedFullyQualifiedNameProvider}
+        )
+        for path, nodes in sorted(by_file.items(), key=lambda x: x[0]):
+            wrapper = mgr.get_metadata_wrapper_for_path(str(path))
+            dead_decls = {(n.fqname, n.position) for n in nodes if n.type != "import"}
+            result = wrapper.visit(RemoveDeadSymbols(dead_decls))
+
+            dead_imports = [n for n in nodes if n.type == "import"]
+            if dead_imports:
+                ctx = CodemodContext()
+                for imp in dead_imports:
+                    module, obj, asname = _import_remove_args(imp)
+                    RemoveImportsVisitor.remove_unused_import(ctx, module, obj, asname)
+                result = RemoveImportsVisitor(ctx).transform_module(result)
+
+            original_text = path.read_text()
+            new_text = result.code
+            if new_text == original_text:
+                continue
+
+            rel = path.relative_to(base).as_posix()
+            body = "".join(
+                difflib.unified_diff(
+                    original_text.splitlines(keepends=True),
+                    new_text.splitlines(keepends=True),
+                    fromfile=f"a/{rel}",
+                    tofile=f"b/{rel}",
+                )
+            )
+            chunks.append(f"diff --git a/{rel} b/{rel}\n{body}")
+
+    return "".join(chunks)
+
+
+__all__ = ["generate_patch", "remove_code"]

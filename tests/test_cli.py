@@ -3,10 +3,10 @@
 The CLI is a thin Typer wrapper around the public API: every command
 calls :func:`build_symbol_graph` then renders the result. These tests
 exercise the wrapper -- argument parsing, plugin/resolver composition,
-output formatting (text and JSON), exit codes, and the confirm/dry-run
-prompts on ``remove`` -- against tiny in-memory projects under
-``tmp_path``. The underlying analysis is covered by ``test_declarations``
-/ ``test_codemod`` / etc.
+output formatting (text and JSON), exit codes, and the patch emission
+on ``remove`` -- against tiny in-memory projects under ``tmp_path``.
+The underlying analysis is covered by ``test_declarations`` /
+``test_codemod`` / etc.
 """
 
 from __future__ import annotations
@@ -575,16 +575,17 @@ def test_unused_exports_reports_entry_alive_only_via_dunder_all(runner, project)
 # ---------------------------------------------------------------------------
 
 
-def test_remove_no_dead_code_when_clean(runner, project):
+def test_remove_no_dead_code_emits_no_patch(runner, project):
     root = project({"mod.py": "def f():\n    pass\nf()\n"})
     original = (root / "mod.py").read_text()
     result = runner.invoke(app, ["remove", str(root), "-e", "mod.f"])
     assert result.exit_code == 0
-    assert "No dead code found." in result.stdout
+    assert result.stdout == ""
+    assert "No dead code found." in result.stderr
     assert (root / "mod.py").read_text() == original
 
 
-def test_remove_dry_run_lists_but_keeps_file(runner, project):
+def test_remove_emits_patch_to_stdout_without_touching_files(runner, project):
     root = project(
         {
             "mod.py": """
@@ -599,15 +600,20 @@ def test_remove_dry_run_lists_but_keeps_file(runner, project):
         }
     )
     original = (root / "mod.py").read_text()
-    result = runner.invoke(app, ["remove", str(root), "-e", "mod.used", "--dry-run"])
+    result = runner.invoke(app, ["remove", str(root), "-e", "mod.used"])
     assert result.exit_code == 0
-    assert "Dead symbols to remove (1):" in result.stdout
-    assert "mod.dead (function) at mod.py" in result.stdout
-    assert "--dry-run specified, no changes made." in result.stdout
+    # Source untouched -- this command never writes back.
     assert (root / "mod.py").read_text() == original
+    # Patch headers are git-style so `git apply` accepts the diff.
+    assert "diff --git a/mod.py b/mod.py" in result.stdout
+    assert "--- a/mod.py" in result.stdout
+    assert "+++ b/mod.py" in result.stdout
+    assert "-def dead():" in result.stdout
+    # Hint goes to stderr so the patch piped on stdout stays clean.
+    assert "git apply" in result.stderr
 
 
-def test_remove_decline_confirm_aborts(runner, project):
+def test_remove_writes_patch_to_output_file(runner, project, tmp_path):
     root = project(
         {
             "mod.py": """
@@ -622,13 +628,26 @@ def test_remove_decline_confirm_aborts(runner, project):
         }
     )
     original = (root / "mod.py").read_text()
-    result = runner.invoke(app, ["remove", str(root), "-e", "mod.used"], input="n\n")
+    out = tmp_path / "dead.patch"
+    result = runner.invoke(app, ["remove", str(root), "-e", "mod.used", "-o", str(out)])
     assert result.exit_code == 0
-    assert "Aborted." in result.stdout
     assert (root / "mod.py").read_text() == original
+    # Stdout is empty when --output is set; the hint references the file.
+    assert result.stdout == ""
+    assert f"git apply {out}" in result.stderr
+    patch = out.read_text()
+    assert "diff --git a/mod.py b/mod.py" in patch
+    assert "-def dead():" in patch
 
 
-def test_remove_accept_confirm_rewrites_file(runner, project):
+def test_remove_patch_round_trips_through_git_apply(runner, project, tmp_path):
+    """End-to-end: produced patch applies cleanly with ``git apply``."""
+    import shutil
+    import subprocess
+
+    if shutil.which("git") is None:
+        pytest.skip("git not available")
+
     root = project(
         {
             "mod.py": """
@@ -642,30 +661,14 @@ def test_remove_accept_confirm_rewrites_file(runner, project):
             """,
         }
     )
-    result = runner.invoke(app, ["remove", str(root), "-e", "mod.used"], input="y\n")
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    subprocess.run(["git", "add", "."], cwd=root, check=True)
+    result = runner.invoke(app, ["remove", str(root), "-e", "mod.used"])
     assert result.exit_code == 0
-    assert "Dead code removed." in result.stdout
+
+    patch_path = tmp_path / "dead.patch"
+    patch_path.write_text(result.stdout)
+    subprocess.run(["git", "apply", str(patch_path)], cwd=root, check=True)
     rewritten = (root / "mod.py").read_text()
     assert "def dead" not in rewritten
     assert "def used" in rewritten
-
-
-def test_remove_dry_run_does_not_prompt(runner, project):
-    # Pass no stdin: if ``--dry-run`` short-circuits before the prompt
-    # the command exits cleanly. Without that branch ``typer.confirm``
-    # would hit EOF and abort.
-    root = project(
-        {
-            "mod.py": """
-            def used():
-                pass
-
-            def dead():
-                pass
-
-            used()
-            """,
-        }
-    )
-    result = runner.invoke(app, ["remove", str(root), "-e", "mod.used", "--dry-run"])
-    assert result.exit_code == 0
