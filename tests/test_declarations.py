@@ -531,6 +531,33 @@ import pytest
         ),
         pytest.param(
             """
+            NAME = 'x'
+            def f(): return t'{NAME}'
+            """,
+            {
+                "mod.NAME -> mod",
+                "mod.f -> mod",
+                "mod.f -> mod.NAME",
+            },
+            id="tstring-interpolation-reference",
+        ),
+        pytest.param(
+            """
+            WIDTH = 4
+            def helper(): return 1
+            def f(): return t"v={helper():{WIDTH}d}"
+            """,
+            {
+                "mod.WIDTH -> mod",
+                "mod.helper -> mod",
+                "mod.f -> mod",
+                "mod.f -> mod.WIDTH",
+                "mod.f -> mod.helper",
+            },
+            id="tstring-format-spec-and-call-reference",
+        ),
+        pytest.param(
+            """
             def f(): return 1
             x = (y := f())
             """,

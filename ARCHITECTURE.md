@@ -182,7 +182,14 @@ A cache row covers both the visitor's payload **and** every plugin's
 The orchestration around this stage — file enumeration, stale detection,
 the parallel worker pool, payload application into the per-package
 contribution — lives in `dead_cst/_refresh.py` so `analyze.py` can stay
-focused on cross-package composition.
+focused on cross-package composition. File enumeration filters
+directories whose name happens to end in `.py` / `.pyi` (`Path.rglob`
+matches by name only). When `libcst` rejects a file's syntax, the
+per-file work logs a warning and substitutes a placeholder payload
+pairing the real module node with a `[unparseable] <module>` synthetic
+flagged `ENTRYPOINT` — the file stays alive in reachability and rides
+the per-file cache like any other miss, so a fresh source SHA picks
+up the fix automatically.
 
 ### 5. Edge stitching — `dead_cst/_edges.py`
 
@@ -317,6 +324,10 @@ entirely.
 * `.pyi` stubs are ingested only for the compiled-extension layout
   (`_native.so` + `_native.pyi`, no `.py` twin). Peer-mode `.pyi` is
   dropped at file-enumeration time — the runtime always wins.
+* `[unparseable] <module>` synthetics stand in for files `libcst`
+  cannot parse. They carry `NodeFlags.ENTRYPOINT` and edge at the real
+  module node, so the file stays alive even though its decls are
+  invisible.
 
 ## Where to make changes
 

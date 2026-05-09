@@ -88,6 +88,7 @@ EXPECTED_PUBLIC_API: dict[str, list[str]] = {
         "SYNTHETIC_PATH_PREFIXES",
         "SYNTHETIC_POSITION",
         "TyperPlugin",
+        "UNPARSEABLE_PREFIX",
         "UNRESOLVED_PREFIX",
         "UnittestPlugin",
         "UnresolvedDependencyError",
