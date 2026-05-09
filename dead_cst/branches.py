@@ -280,6 +280,22 @@ def _literal_constant(node: cst.BaseExpression) -> Const | None:
     return None
 
 
+# Mutable container literals can change truthiness via ``.append`` /
+# item assignment / ``.update`` between binding and use, so the
+# binding-only flow walk would happily fold an ``edges = []`` to
+# ``False`` even when ``edges.append(...)`` runs in between. Refuse
+# to fold these through Name resolution; tuples and primitive literals
+# are immutable and stay safe.
+_MUTABLE_CONTAINER_LITERALS: tuple[type, ...] = (
+    cst.List,
+    cst.Set,
+    cst.Dict,
+    cst.ListComp,
+    cst.SetComp,
+    cst.DictComp,
+)
+
+
 def _constant_assignment_rhs(
     binding_node: cst.CSTNode,
     parent_map: Mapping[cst.CSTNode, cst.CSTNode],
@@ -338,6 +354,12 @@ class TruthinessResolver:
     the ``resolve_expr`` argument to :func:`unreachable_suites` /
     :func:`evaluate_truthiness`. The resolver is the supported way to
     get name-aware truthiness without re-implementing the flow walk.
+
+    ``Name`` resolution deliberately refuses to fold mutable container
+    literals (``[]``, ``{}``, comprehensions): the binding-only flow
+    walk can't see ``.append`` / item assignment / ``.update`` between
+    binding and use, so their truthiness is not preserved across the
+    lifetime of the binding. Tuples and primitive literals stay safe.
     """
 
     __slots__ = (
@@ -461,6 +483,8 @@ class TruthinessResolver:
             rhs = self._rhs_for(live_node)
             if rhs is None:
                 return None
+            if isinstance(rhs, _MUTABLE_CONTAINER_LITERALS):
+                return None
             v = self.evaluate(rhs)
             if v is None:
                 return None
@@ -492,20 +516,23 @@ class TruthinessResolver:
         pattern-matching ``check_flag(FEATURE_A)`` where
         ``FEATURE_A = "feature_a"``::
 
-            def resolve(self, expr):
+            def resolve(self, expr, resolver):
                 if (
                     isinstance(expr, cst.Call)
-                    and is_name(expr.func, "check_flag")
+                    and isinstance(expr.func, cst.Name)
+                    and expr.func.value == "check_flag"
                     and len(expr.args) == 1
                 ):
-                    flag = self._truthiness.resolve_constant(expr.args[0].value)
+                    flag = resolver.resolve_constant(expr.args[0].value)
                     if flag is not None and flag.value in self._on_flags:
                         return True
                 return None
 
-        The caller passes ``self._truthiness = TruthinessResolver(...)``
-        through ``resolve_expr=`` so the same instance is reused
-        across the file -- caching is per resolver instance.
+        The active resolver is supplied by
+        :meth:`DefaultUnreachableRegionDetector.find_regions` as the
+        second argument to ``resolve``, so the same instance is
+        reused across one file's queries -- caching is per resolver
+        instance.
 
         Calls and other dynamic operations are *not* folded -- the
         resolver knows nothing about your runtime. Override
@@ -645,10 +672,12 @@ class DefaultUnreachableRegionDetector:
        the truthiness queries on demand: ``unreachable_suites`` for
        conditional branches, and a per-suite scan for the trailing
        region after an unconditional terminator (``return`` /
-       ``raise`` / ``break`` / ``continue`` / ``assert <falsy>``). The
-       check is purely suite-relative, so a ``raise`` inside a ``try``
-       body still kills the rest of the try body even though the
-       surrounding ``except`` runs on its own path.
+       ``raise`` / ``break`` / ``continue`` / ``assert <falsy>``, plus
+       compound ``if`` / ``with`` / ``try`` whose every reachable path
+       itself terminates). The check is purely suite-relative, so a
+       ``raise`` inside a ``try`` body still kills the rest of the try
+       body even though the surrounding ``except`` runs on its own
+       path.
 
     The goal-directed resolver replaces the previous up-front
     fixpoint table: only the names that actually feed an
@@ -674,7 +703,7 @@ class DefaultUnreachableRegionDetector:
     """
 
     name: str = "default"
-    version: int = 1778281000
+    version: int = 1778328362
 
     def resolve(
         self,
@@ -766,20 +795,95 @@ class DefaultUnreachableRegionDetector:
 def _is_terminator(stmt: cst.CSTNode, resolver: TruthinessResolver) -> bool:
     """``True`` iff ``stmt`` unconditionally exits its enclosing suite.
 
-    Recognized: ``return`` / ``raise`` / ``break`` / ``continue`` and
-    ``assert <statically-falsy>``. A ``SimpleStatementLine`` is treated
-    as a terminator if any of its small statements is one --
-    ``x = 1; raise; y = 2`` ends control at ``raise``, and anything
-    after it on a later line is dead too.
+    Recognized: ``return`` / ``raise`` / ``break`` / ``continue``,
+    ``assert <statically-falsy>``, and compound statements (``if`` /
+    ``with`` / ``try``) where every reachable path itself terminates.
+    A ``SimpleStatementLine`` is treated as a terminator if any of its
+    small statements is one -- ``x = 1; raise; y = 2`` ends control at
+    ``raise``, and anything after it on a later line is dead too.
     """
     if isinstance(stmt, cst.SimpleStatementLine):
-        for sm in stmt.body:
-            if isinstance(sm, (cst.Return, cst.Raise, cst.Break, cst.Continue)):
-                return True
-            if isinstance(sm, cst.Assert):
-                if resolver.evaluate(sm.test) is False:
-                    return True
+        return any(_is_small_terminator(sm, resolver) for sm in stmt.body)
+    if isinstance(stmt, cst.If):
+        return _if_terminates(stmt, resolver)
+    if isinstance(stmt, cst.With):
+        return _suite_terminates(stmt.body, resolver)
+    if isinstance(stmt, (cst.Try, cst.TryStar)):
+        return _try_terminates(stmt, resolver)
     return False
+
+
+def _is_small_terminator(sm: cst.BaseSmallStatement, resolver: TruthinessResolver) -> bool:
+    if isinstance(sm, (cst.Return, cst.Raise, cst.Break, cst.Continue)):
+        return True
+    if isinstance(sm, cst.Assert):
+        return resolver.evaluate(sm.test) is False
+    return False
+
+
+def _suite_terminates(suite: cst.BaseSuite, resolver: TruthinessResolver) -> bool:
+    """``True`` iff control unconditionally exits ``suite`` before its end.
+
+    Handles both ``IndentedBlock`` (multi-line bodies; recurse into
+    ``_is_terminator`` so nested compound statements compose) and
+    ``SimpleStatementSuite`` (the one-line ``if cond: return`` form,
+    whose body is a sequence of ``BaseSmallStatement``).
+    """
+    if isinstance(suite, cst.IndentedBlock):
+        return any(_is_terminator(s, resolver) for s in suite.body)
+    if isinstance(suite, cst.SimpleStatementSuite):
+        return any(_is_small_terminator(sm, resolver) for sm in suite.body)
+    return False
+
+
+def _if_terminates(node: cst.If, resolver: TruthinessResolver) -> bool:
+    """``True`` iff every reachable branch of an ``if`` chain terminates.
+
+    Iterative walk down the ``if`` / ``elif`` / ``else`` chain, mirroring
+    :func:`_unreachable_in_if` so a deep ``elif`` ladder can't blow the
+    recursion limit. A statically-true test pins the answer to the body
+    (the rest of the chain is dead). A statically-false test means the
+    body never runs and the answer rides on the next branch. With an
+    unknown test, the body must terminate AND every following branch
+    must too -- and a missing final ``else`` always lets control fall
+    through, so it can't be a terminator.
+    """
+    current: cst.If | None = node
+    while current is not None:
+        test_truth = resolver.evaluate(current.test)
+        if test_truth is True:
+            return _suite_terminates(current.body, resolver)
+        if test_truth is None and not _suite_terminates(current.body, resolver):
+            return False
+        orelse = current.orelse
+        if orelse is None:
+            return False
+        if isinstance(orelse, cst.If):
+            current = orelse
+            continue
+        return _suite_terminates(orelse.body, resolver)
+    return False
+
+
+def _try_terminates(node: cst.Try | cst.TryStar, resolver: TruthinessResolver) -> bool:
+    """``True`` iff every reachable path through a ``try`` terminates.
+
+    A ``finally`` clause that itself terminates short-circuits the rest
+    -- whatever the ``try`` / ``except`` did, the ``finally`` overrides
+    it. Otherwise, the ``try`` body must terminate (so the ``else``
+    never runs) and every ``except`` handler must terminate too. We
+    deliberately stay coarse: a body that terminates only via ``return``
+    can't actually trigger any handler, but disambiguating
+    return-vs-raise from a static walk isn't worth the precision today.
+    """
+    if node.finalbody is not None and _suite_terminates(node.finalbody.body, resolver):
+        return True
+    if not _suite_terminates(node.body, resolver):
+        return False
+    for handler in node.handlers:
+        if not _suite_terminates(handler.body, resolver):
+            return False
+    return True
 
 
 class _SiteCollector(cst.CSTVisitor):

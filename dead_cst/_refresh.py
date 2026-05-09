@@ -488,6 +488,10 @@ def _apply_payload(
       ``graph.nodes[node]["testcase"] = True`` attribute so
       :func:`find_reachable_excluding_tests` can drop test seeds when
       computing the "blast radius" of removing the test suite.
+    * ``NodeFlags.NOQA`` is read straight off the ``SymbolNode`` (no
+      attr-dict mirror) by :func:`find_reachable_excluding`, which
+      filters seeds via ``n.flags & exclude_flags`` for the "blast
+      radius" of removing every noqa-pinned import.
 
     Edge flag derivation: each ``(src, dst, access_pos)`` entry has
     its access position tested against ``payload.dead_suites`` for

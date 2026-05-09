@@ -192,11 +192,11 @@ Folded down from earlier tiers as they landed:
   `NodeFlags.OVERLOAD`, excluded from the cross-module trie, and anchored
   to their same-file impl via explicit `impl -> overload` edges so the
   codemod removes overloads with their impl.
-- **v0.6.0**: `NodeFlags.TESTCASE` plus
-  `Analysis.kept_alive_by_tests_only()` /
-  `PackageView.kept_alive_by_tests_only()` for "blast radius of dropping
-  the test suite" queries. `PytestPlugin` and `UnittestPlugin` stamp
-  `ENTRYPOINT | TESTCASE` on their synthetic seeds.
+- **v0.6.0**: `NodeFlags.TESTCASE` plus the per-package
+  blast-radius query for "what would die if the test suite were
+  dropped" (later generalized into `kept_alive_by_flags_only`).
+  `PytestPlugin` and `UnittestPlugin` stamp `ENTRYPOINT | TESTCASE` on
+  their synthetic seeds.
 - **v0.6.0**: `UnittestPlugin` resolves transitive `TestCase` subclasses
   through bucket markers in `observe` + a `finalize` walk from
   `unittest.TestCase` / `IsolatedAsyncioTestCase` (and every alias) so
@@ -256,9 +256,12 @@ Folded down from earlier tiers as they landed:
   `If` / `While` and statement-bearing suite, and a goal-directed
   `TruthinessResolver` answers truthiness queries on demand (literal +
   flow-sensitive `Name` lookup over `Name = literal` chains).
-  Post-terminator scan over every collected suite. Subclasses override
-  `resolve(self, expr) -> bool | None` to fold domain-specific
-  expressions; resolved values compose with the resolver's name lookup.
+  Post-terminator scan over every collected suite, including compound
+  `if` / `with` / `try` whose every reachable branch terminates (so a
+  constant-folded `if True: return` kills the rest of its enclosing
+  suite). Subclasses override `resolve(self, expr) -> bool | None` to
+  fold domain-specific expressions; resolved values compose with the
+  resolver's name lookup.
 - `Cacheable` Protocol unifying `(name, version)` across visitor, resolvers,
   plugins, and detectors. Package `__version__` removed from the cache
   fingerprint — each component carries its own knob, and concurrent bumps

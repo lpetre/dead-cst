@@ -778,6 +778,216 @@ def test_module_level_terminator_kills_following_statements(
 
 
 # ----------------------------------------------------------------------
+# Compound-statement terminators. An ``if`` whose every reachable
+# branch terminates is itself a terminator -- statements that follow
+# it in the enclosing suite are unreachable. Same for ``with`` (body
+# terminates) and ``try`` (every path terminates, possibly via
+# ``finally``). This is what makes constant-folded early returns
+# (``if True: return``) actually kill the rest of the function.
+# ----------------------------------------------------------------------
+
+
+def test_if_true_with_return_kills_trailing(build_decl_graph, assert_dead_branch_edges):
+    graph = build_decl_graph(
+        {
+            "mod.py": """
+            def helper(): pass
+            def caller():
+                if True:
+                    return
+                helper()
+            """
+        }
+    )
+    assert_dead_branch_edges(graph, {"mod.caller -> mod.helper"})
+
+
+def test_if_else_both_return_kills_trailing(build_decl_graph, assert_dead_branch_edges):
+    # Unknown test, but every branch terminates -- the if/else as a
+    # whole is a terminator regardless of which branch fires.
+    graph = build_decl_graph(
+        {
+            "mod.py": """
+            def helper(): pass
+            def caller(cond):
+                if cond:
+                    return 1
+                else:
+                    return 2
+                helper()
+            """
+        }
+    )
+    assert_dead_branch_edges(graph, {"mod.caller -> mod.helper"})
+
+
+def test_if_elif_else_all_return_kills_trailing(build_decl_graph, assert_dead_branch_edges):
+    graph = build_decl_graph(
+        {
+            "mod.py": """
+            def helper(): pass
+            def caller(x):
+                if x == 1:
+                    return 1
+                elif x == 2:
+                    return 2
+                else:
+                    return 3
+                helper()
+            """
+        }
+    )
+    assert_dead_branch_edges(graph, {"mod.caller -> mod.helper"})
+
+
+def test_constant_folded_flag_early_return_kills_trailing(
+    build_decl_graph, assert_dead_branch_edges
+):
+    # Two passes composing: ``FLAG = True`` resolves the if test to
+    # True, so the if body always runs. The body is a ``return``, so
+    # the if is itself a terminator and ``helper()`` is dead.
+    graph = build_decl_graph(
+        {
+            "mod.py": """
+            FLAG = True
+            def helper(): pass
+            def caller():
+                if FLAG:
+                    return
+                helper()
+            """
+        }
+    )
+    assert_dead_branch_edges(graph, {"mod.caller -> mod.helper"})
+
+
+def test_one_line_if_true_return_kills_trailing(build_decl_graph, assert_dead_branch_edges):
+    # ``SimpleStatementSuite`` path: ``if True: return`` on a single
+    # line, body is ``Sequence[BaseSmallStatement]`` rather than an
+    # ``IndentedBlock``. The terminator scan must still reach inside.
+    graph = build_decl_graph(
+        {
+            "mod.py": """
+            def helper(): pass
+            def caller():
+                if True: return
+                helper()
+            """
+        }
+    )
+    assert_dead_branch_edges(graph, {"mod.caller -> mod.helper"})
+
+
+def test_if_without_else_unknown_test_does_not_kill_trailing(
+    build_decl_graph, assert_dead_branch_edges
+):
+    # No ``else`` and the test is unknown -- a falsy ``cond`` lets
+    # control fall through to ``helper()``. (This case is the inverse
+    # guard for the new compound-terminator handling.)
+    graph = build_decl_graph(
+        {
+            "mod.py": """
+            def helper(): pass
+            def caller(cond):
+                if cond:
+                    return
+                helper()
+            """
+        }
+    )
+    assert_dead_branch_edges(graph, set())
+
+
+def test_if_true_without_body_terminator_does_not_kill_trailing(
+    build_decl_graph, assert_dead_branch_edges
+):
+    # ``if True:`` body that doesn't terminate -- control flows past
+    # the if to ``helper()``.
+    graph = build_decl_graph(
+        {
+            "mod.py": """
+            def helper(): pass
+            def caller():
+                if True:
+                    pass
+                helper()
+            """
+        }
+    )
+    assert_dead_branch_edges(graph, set())
+
+
+def test_with_block_terminator_kills_trailing(build_decl_graph, assert_dead_branch_edges):
+    graph = build_decl_graph(
+        {
+            "mod.py": """
+            def helper(): pass
+            def caller(ctx):
+                with ctx:
+                    return
+                helper()
+            """
+        }
+    )
+    assert_dead_branch_edges(graph, {"mod.caller -> mod.helper"})
+
+
+def test_try_except_all_terminate_kills_trailing(build_decl_graph, assert_dead_branch_edges):
+    graph = build_decl_graph(
+        {
+            "mod.py": """
+            def helper(): pass
+            def caller():
+                try:
+                    return 1
+                except Exception:
+                    return 2
+                helper()
+            """
+        }
+    )
+    assert_dead_branch_edges(graph, {"mod.caller -> mod.helper"})
+
+
+def test_try_finally_terminator_kills_trailing(build_decl_graph, assert_dead_branch_edges):
+    # ``finally`` that terminates short-circuits everything regardless
+    # of what the try / except did.
+    graph = build_decl_graph(
+        {
+            "mod.py": """
+            def helper(): pass
+            def caller():
+                try:
+                    pass
+                finally:
+                    return
+                helper()
+            """
+        }
+    )
+    assert_dead_branch_edges(graph, {"mod.caller -> mod.helper"})
+
+
+def test_try_except_handler_falls_through_does_not_kill(build_decl_graph, assert_dead_branch_edges):
+    # Body terminates but a handler falls through -- a caught exception
+    # path can reach ``helper()``, so the try is not a terminator.
+    graph = build_decl_graph(
+        {
+            "mod.py": """
+            def helper(): pass
+            def caller():
+                try:
+                    return 1
+                except Exception:
+                    pass
+                helper()
+            """
+        }
+    )
+    assert_dead_branch_edges(graph, set())
+
+
+# ----------------------------------------------------------------------
 # Custom detector subclass overrides ``resolve`` to fold non-Name
 # expressions (function calls, attribute access). The user's example:
 # ``check_flag("migration-abc")`` is treated as a known constant.

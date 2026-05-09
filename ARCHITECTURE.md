@@ -147,7 +147,11 @@ the analyzer's resolved `PositionProvider`. The shipped
    plus a per-suite scan that marks statements after an unconditional
    `return` / `raise` / `break` / `continue` / `assert <falsy>` as
    dead *within the same suite* — a `raise` in a `try` body doesn't
-   kill the matching `except`. The resolver is goal-directed: it
+   kill the matching `except`. Compound statements (`if` / `with` /
+   `try`) themselves count as terminators when every reachable path
+   inside them terminates, so a constant-folded `if True: return`
+   (and its `FLAG = True` / `if cond: return; else: return` cousins)
+   kills the rest of the enclosing suite. The resolver is goal-directed: it
    lazily resolves `ScopeProvider` / `ParentNodeProvider` only when
    the first `Name` query lands, walks `live_referents` only for the
    names that actually feed a query, memoizes by access node id, and
@@ -262,11 +266,15 @@ BFS from every node with `entrypoint=True`. Default traversal **does**
 follow `DEAD_BRANCH` edges (preserving today's behavior).
 `Analysis.kept_alive_by_dead_branches()` is the opt-in inverse, returning
 the blast radius of removing every dead suite by skipping those edges.
-`Analysis.kept_alive_by_tests_only()` / the per-package `PackageView`
-twin returns the blast radius of dropping the test suite — production
-code currently kept alive only because tests still touch it
-(`PytestPlugin` and `UnittestPlugin` stamp `ENTRYPOINT | TESTCASE` on
-their seeds).
+`Analysis.kept_alive_by_flags_only(flags)` / the per-package
+`PackageView` twin returns the blast radius of dropping every
+entrypoint carrying any of those flag bits. Pass `NodeFlags.TESTCASE`
+for "production code currently kept alive only because tests still
+touch it" (`PytestPlugin` / `UnittestPlugin` stamp `ENTRYPOINT |
+TESTCASE`); pass `NodeFlags.NOQA` for "decls kept alive only by an
+F401 pin" (the visitor stamps `ENTRYPOINT | NOQA` on imports
+preserved by a per-line or file-level ruff/pyflakes directive); OR
+the bits to combine.
 
 ### 8. Codemod — `dead_cst/codemod.py`
 
@@ -324,6 +332,20 @@ entirely.
   type `"import"`. Local uses of an imported name go through the import
   node, which points at the upstream module / symbol. This is how
   `dead-cst remove` knows to drop now-unused imports.
+* Imports whose source line carries a ruff/pyflakes `# noqa` directive
+  that silences F401 (bare `# noqa`, `# noqa: F401`, multi-rule
+  `# noqa: E501, F401`, case-variant `# NOQA`) are flagged
+  `NodeFlags.ENTRYPOINT | NodeFlags.NOQA` so reachability keeps them
+  alive — matching ruff's own semantics. File-level `# ruff: noqa` and
+  `# flake8: noqa` directives (`ruff:` / `flake8:` matched
+  case-sensitively per ruff; `noqa` is not) pin every import in the
+  file. The visitor scans for these in `visit_Comment` plus a
+  per-import-statement `SimpleStatementLine` walk, so per-alias
+  comments inside a parenthesized `from x import (a, b)` are honored.
+  The `NOQA` bit is metadata layered on `ENTRYPOINT` (parallel to
+  `TESTCASE`); the single `kept_alive_by_flags_only(flags)` method on
+  `Analysis` / `PackageView` takes either flag (or both ORed) to
+  return the blast radius of dropping the matching entrypoints.
 * Submodules edge to their parent package, so `__init__.py` stays alive
   as long as anything in the package does.
 * `EdgeFlags.DEAD_BRANCH` is metadata only.

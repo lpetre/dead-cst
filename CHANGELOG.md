@@ -10,6 +10,25 @@ two versions.
 ## [Unreleased]
 
 ### Added
+- The visitor now honors ruff/pyflakes ``# noqa`` directives that
+  silence F401 (unused-import). A per-line ``# noqa``,
+  ``# noqa: F401``, multi-rule ``# noqa: E501, F401``, or case-variant
+  ``# NOQA`` on the same source line as an import alias pins the
+  resulting import node alive (``NodeFlags.ENTRYPOINT |
+  NodeFlags.NOQA``) so it is no longer reported as dead. File-level
+  directives -- ``# ruff: noqa``, ``# ruff: noqa: F401``, and the
+  ``# flake8: noqa`` aliases -- pin every import in the file. The
+  ``ruff:`` / ``flake8:`` prefix is matched case-sensitively per
+  ruff's documented behavior; the ``noqa`` keyword is case-insensitive.
+  Per-alias directives inside a parenthesized ``from x import (a, b)``
+  pin only the alias on that line. This brings dead-cst's unused-import
+  semantics in line with ruff: an import you have explicitly marked as
+  intentionally preserved (re-exports, side-effect imports,
+  ``TYPE_CHECKING`` shims guarded by F401) is no longer surfaced or
+  removed.
+- New ``NodeFlags.NOQA`` flag, layered on ``NodeFlags.ENTRYPOINT``
+  (parallel to ``NodeFlags.TESTCASE``). Read ``n.flags & NodeFlags.NOQA``
+  off the ``SymbolNode`` directly; there is no graph attr-dict mirror.
 - `dead_cst.codemod.generate_patch(G, root)` returns the same removal
   as `remove_code` as a `git apply`-compatible unified diff (with
   `diff --git` headers and `deleted file mode 100644` for module
@@ -35,13 +54,23 @@ two versions.
   `Analysis.preview(files, *, detector=None)` chains the two and
   returns a new `GraphView` (also new) wrapping the overlay graph
   with the same reachability surface as `Analysis` (`reachable`,
-  `dead`, `kept_alive_by_dead_branches`, `kept_alive_by_tests_only`,
+  `dead`, `kept_alive_by_dead_branches`, `kept_alive_by_flags_only`,
   `count_nodes`). The combined API enables what-if graph surgery:
   bake a flag's truthiness into a small set of files and ask "what
   becomes dead if we land this rollout?" without forking the
   analysis-wide fingerprint or polluting the cache.
 
 ### Changed
+- **Breaking:** The two ``kept_alive_by_*_only`` methods on
+  ``Analysis`` and ``PackageView`` have been collapsed into a single
+  ``kept_alive_by_flags_only(flags: NodeFlags)``. Pass
+  ``NodeFlags.TESTCASE`` for the old ``kept_alive_by_tests_only``
+  behavior ("blast radius of dropping the test suite"),
+  ``NodeFlags.NOQA`` for "blast radius of removing every F401 pin",
+  or both ORed together. ``dead_cst.analyze._find_reachable(graph,
+  exclude_flags=NodeFlags.NONE)`` is the matching private helper
+  shape; ``_find_reachable_excluding_tests`` and
+  ``_find_kept_alive_by_tests_only`` are gone.
 - **Breaking:** `dead-cst remove` no longer modifies files in place. It
   now emits a unified diff to stdout (or to `--output PATH`) and exits;
   apply with `dead-cst remove . | git apply` (or `git apply <path>` if
@@ -57,6 +86,25 @@ two versions.
   literal value before pattern-matching. Subclasses with a one-arg
   `def resolve(self, expr): ...` need to add the `resolver` parameter;
   ignore it if you don't use it.
+
+### Fixed
+- `DefaultUnreachableRegionDetector` now recognizes compound statements
+  as terminators when every reachable branch itself terminates. An
+  ``if`` whose taken branch always ``return``s (e.g.
+  ``if True: return``, ``if FLAG: return`` with ``FLAG = True``, or
+  ``if cond: return; else: return``) kills statements that follow it
+  in the enclosing suite, so constant-folded early returns now flag
+  trailing dead code as expected. Same handling applies to ``with``
+  whose body terminates, and to ``try``/``except``/``finally`` where
+  every path terminates (or a ``finally`` itself terminates).
+- `TruthinessResolver` no longer folds a ``Name`` whose binding's RHS
+  is a mutable container literal (``[]``, ``{}``, ``set()``-shaped
+  comprehensions, etc.). The binding-only flow walk is invisible to
+  ``.append`` / item assignment / ``.update`` mutations, so an
+  ``edges = []; edges.append(x); if not edges:`` chain used to fold
+  ``edges`` to ``False`` and incorrectly mark the trailing code dead.
+  Tuples and primitive literals are immutable and stay safe to fold.
+  Bumps the detector's `version` so cached payloads rebuild.
 
 ## [0.7.0] - 2026-05-09
 
