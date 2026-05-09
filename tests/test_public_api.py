@@ -38,9 +38,9 @@ EXPECTED_PUBLIC_API: dict[str, list[str]] = {
     "dead_cst.branches": [
         "DefaultUnreachableRegionDetector",
         "ResolveExpr",
+        "TruthinessResolver",
         "UnreachableRegionDetector",
         "evaluate_truthiness",
-        "fold_constants",
         "unreachable_bodies",
         "unreachable_suites",
     ],

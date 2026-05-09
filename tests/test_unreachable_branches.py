@@ -789,7 +789,7 @@ def test_custom_detector_override_folds_call_in_if(make_analysis, write_files):
 
     The override answers for the ``Call`` node directly; the detector
     threads the answer through both ``unreachable_suites`` (so the
-    ``if`` body is marked dead) and ``fold_constants`` (so a chain
+    ``if`` body is marked dead) and ``TruthinessResolver`` (so a chain
     like ``flag = check_flag(...); if flag:`` would also resolve, see
     the next test).
     """

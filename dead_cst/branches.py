@@ -5,16 +5,28 @@ statically known. Used to identify dead branches of ``if`` / ``while``
 statements so callers can mark references that live inside them with
 :data:`dead_cst.graph.EdgeFlags.DEAD_BRANCH`.
 
-Only handles a small whitelist of literal forms: the ``True`` /
-``False`` / ``None`` keywords, integer / string literals,
-empty-vs-non-empty collection literals, and ``not`` / ``and`` / ``or``
-over those. Anything involving an attribute access, function call,
-comparison, or other dynamic operation returns ``None`` (unknown).
-Bare ``Name`` nodes outside the three keywords are also unknown by
-default; callers that have scope information (notably
-:class:`DefaultUnreachableRegionDetector` via
-:func:`~dead_cst._const_fold.fold_constants`) pass a ``resolve_name``
-callback to fold names whose binding resolves to a known constant.
+Three layers, in increasing power and scope:
+
+* :func:`evaluate_truthiness` -- single-expression, literal-only. The
+  ``True`` / ``False`` / ``None`` keywords, integer / string literals,
+  empty-vs-non-empty collection literals, and ``not`` / ``and`` / ``or``
+  over those. Anything involving an attribute access, function call,
+  comparison, or other dynamic operation returns ``None`` (unknown).
+  An optional ``resolve_expr`` callback gets first crack at every
+  non-keyword expression so callers can layer in their own knowledge.
+* :class:`TruthinessResolver` -- file-scoped, name-aware. Wraps a
+  parsed module; ``resolver.evaluate(expr)`` adds flow-sensitive
+  ``Name`` lookup on top of literal handling, memoizes by access node,
+  and only walks each ``live_referents`` slice it actually needs.
+  Goal-directed: the file's full constant table is never built up
+  front, so files with few ``if``/``while``/``assert`` tests pay
+  proportionally less.
+* :class:`UnreachableRegionDetector` -- module-level dead-region
+  finder, the protocol the analyzer plugs in. The shipped
+  :class:`DefaultUnreachableRegionDetector` builds one
+  :class:`TruthinessResolver` per file and consults it from a single
+  CST visit that collects every conditional / suite-bearing site.
+
 Returning ``None`` is always the safe default: callers must treat the
 branch as live.
 
@@ -22,20 +34,27 @@ Module-level unreachable-region detection is exposed as the
 :class:`UnreachableRegionDetector` protocol so downstream consumers
 can fold in domain knowledge -- e.g. config flags whose values are
 fixed in production -- without forking the analyzer.
-:class:`DefaultUnreachableRegionDetector` ships the literal-only
-behavior above plus a fixpoint constant-folding pre-pass so simple
-``DEBUG = False; if DEBUG:`` patterns are caught out of the box.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Protocol, Sequence, runtime_checkable
+from typing import Callable, Mapping, Protocol, Sequence, runtime_checkable
 
 import libcst as cst
-from libcst.metadata import CodeRange, MetadataWrapper, PositionProvider
+from libcst.metadata import CodeRange, MetadataWrapper, ParentNodeProvider, PositionProvider
+from libcst.metadata.scope_provider import (
+    Access,
+    Assignment,
+    ClassScope,
+    FunctionScope,
+    GlobalScope,
+    Scope,
+    ScopeProvider,
+)
 
 from ._cacheable import Cacheable
+from ._flow import live_referents
 
 
 _KEYWORDS: dict[str, bool] = {
@@ -188,6 +207,252 @@ def unreachable_bodies(
     return [suite.body for suite in unreachable_suites(stmt, resolve_expr)]
 
 
+# ---------------------------------------------------------------------------
+# Goal-directed truthiness resolver
+# ---------------------------------------------------------------------------
+
+
+def _scope_body(scope, module: cst.Module) -> list | None:
+    """Statement list for ``scope``, or ``None`` for unsupported kinds.
+
+    Mirrors :meth:`SymbolVisitor._scope_body` but additionally guards
+    against ``FunctionScope`` over a ``Lambda`` (whose ``body`` is a
+    ``BaseExpression``, not a ``BaseSuite``). Comprehension scopes and
+    lambdas return ``None`` so the caller skips them rather than
+    guessing -- they can't host ``if`` / ``while`` statements anyway.
+    """
+    if isinstance(scope, GlobalScope):
+        return list(module.body)
+    if isinstance(scope, ClassScope):
+        return list(scope.node.body.body)
+    if isinstance(scope, FunctionScope) and isinstance(scope.node, cst.FunctionDef):
+        return list(scope.node.body.body)
+    return None
+
+
+def _constant_assignment_rhs(
+    binding_node: cst.CSTNode,
+    parent_map: Mapping[cst.CSTNode, cst.CSTNode],
+) -> cst.BaseExpression | None:
+    """RHS of a simple ``name = expr`` (or ``name: T = expr``) binding.
+
+    Returns ``None`` for any shape we don't fold: tuple/list unpacking,
+    attribute or subscript targets, augmented assign, parameter
+    defaults, import bindings, etc. Multi-target chained assignment
+    (``a = b = expr``) is supported because all targets share one RHS.
+    Walrus (``name := expr``) is also supported -- the surrounding
+    expression context doesn't matter for fold purposes since the
+    binding's value is unambiguously ``expr``.
+    """
+    parent = parent_map.get(binding_node)
+    if isinstance(parent, cst.AssignTarget):
+        grandparent = parent_map.get(parent)
+        if not isinstance(grandparent, cst.Assign):
+            return None
+        if not isinstance(parent.target, cst.Name):
+            return None
+        if parent.target is not binding_node:
+            return None
+        return grandparent.value
+    if isinstance(parent, cst.AnnAssign):
+        if not isinstance(parent.target, cst.Name):
+            return None
+        if parent.target is not binding_node:
+            return None
+        return parent.value
+    if isinstance(parent, cst.NamedExpr):
+        if not isinstance(parent.target, cst.Name):
+            return None
+        if parent.target is not binding_node:
+            return None
+        return parent.value
+    return None
+
+
+# Sentinel for "evaluation in progress" so cyclic ``Name`` references
+# (``a = b; b = a``) bottom out at ``None`` instead of recursing
+# forever. Distinct from ``None`` (a real "couldn't determine" answer)
+# so the cache stays well-defined.
+_PENDING: object = object()
+
+
+class TruthinessResolver:
+    """File-scoped, flow-sensitive truthiness for one parsed module.
+
+    Goal-directed: nothing is computed up front. ``evaluate(expr)``
+    walks just the slice it needs, memoizes by node id, and only
+    consults :func:`live_referents` for the names that actually feed
+    into a query. Files with no conditional tests pay only the cost of
+    construction (which itself is lazy in resolving libcst metadata).
+
+    Composes with subclass / detector overrides via the optional
+    ``resolve_expr`` callback: it gets first crack at every non-keyword
+    expression. Returning a ``bool`` short-circuits; returning ``None``
+    falls through to the built-in literal + name-resolution handling.
+
+    From-scratch :class:`UnreachableRegionDetector` implementations can
+    instantiate one resolver per file and pass ``resolver.evaluate`` as
+    the ``resolve_expr`` argument to :func:`unreachable_suites` /
+    :func:`evaluate_truthiness`. The resolver is the supported way to
+    get name-aware truthiness without re-implementing the flow walk.
+    """
+
+    __slots__ = (
+        "_wrapper",
+        "_module",
+        "_resolve_expr",
+        "_scopes",
+        "_parent_map",
+        "_access_index",
+        "_eval_name_cache",
+        "_live_cache",
+        "_rhs_cache",
+        "_descendant_cache",
+    )
+
+    def __init__(
+        self,
+        wrapper: MetadataWrapper,
+        resolve_expr: ResolveExpr | None = None,
+    ) -> None:
+        self._wrapper = wrapper
+        self._module = wrapper.module
+        self._resolve_expr = resolve_expr
+        # Resolved lazily on first ``evaluate`` -- a detector that's
+        # constructed but never queried (file with no conditionals)
+        # never pays for ScopeProvider / ParentNodeProvider.
+        self._scopes: Mapping[cst.CSTNode, Scope] | None = None
+        self._parent_map: Mapping[cst.CSTNode, cst.CSTNode] | None = None
+        # ``id(scope) -> {id(access.node) -> Access}`` built on demand.
+        self._access_index: dict[int, dict[int, Access]] = {}
+        # ``id(name_access) -> bool | None | _PENDING``. ``_PENDING``
+        # is the cycle sentinel; once evaluation finishes the entry is
+        # overwritten with the final answer.
+        self._eval_name_cache: dict[int, object] = {}
+        # ``id(name_access) -> set[live referent CSTNode]``.
+        self._live_cache: dict[int, set[cst.CSTNode]] = {}
+        # ``id(binding_node) -> rhs_expr | None`` (caches the
+        # ``_constant_assignment_rhs`` lookup).
+        self._rhs_cache: dict[int, cst.BaseExpression | None] = {}
+        # Hoisted ``_descendant_ids`` cache shared across every
+        # ``live_referents`` call routed through this resolver.
+        self._descendant_cache: dict[int, set[int]] = {}
+
+    def evaluate(self, expr: cst.BaseExpression) -> bool | None:
+        """Best-effort statically-known truthiness of ``expr``.
+
+        Same return contract as :func:`evaluate_truthiness`: ``True`` /
+        ``False`` when the truthiness is determined, ``None`` when
+        unknown. Composes literal handling with flow-sensitive ``Name``
+        lookup; intermediate ``Name`` results are memoized.
+        """
+        return evaluate_truthiness(expr, resolve_expr=self._compose)
+
+    def _compose(self, expr: cst.BaseExpression) -> bool | None:
+        """Resolver chain: external ``resolve_expr`` → name lookup → defer."""
+        if self._resolve_expr is not None:
+            v = self._resolve_expr(expr)
+            if v is not None:
+                return v
+        if isinstance(expr, cst.Name) and expr.value not in _KEYWORDS:
+            return self._evaluate_name(expr)
+        return None
+
+    def _evaluate_name(self, name: cst.Name) -> bool | None:
+        key = id(name)
+        cached = self._eval_name_cache.get(key, _MISSING)
+        if cached is _PENDING:
+            # Cyclic dependency (``a = b; b = a``). Bottom out unknown;
+            # the surrounding evaluation will fold it the same way it
+            # folds any other ``None``.
+            return None
+        if cached is not _MISSING:
+            return cached  # type: ignore[return-value]
+        self._eval_name_cache[key] = _PENDING
+        result = self._evaluate_name_uncached(name)
+        self._eval_name_cache[key] = result
+        return result
+
+    def _evaluate_name_uncached(self, name: cst.Name) -> bool | None:
+        scopes = self._scopes
+        if scopes is None:
+            scopes = self._wrapper.resolve(ScopeProvider)
+            self._scopes = scopes
+        scope = scopes.get(name)
+        if scope is None:
+            return None
+        access = self._access_for(name, scope)
+        if access is None:
+            return None
+        referents = [
+            r
+            for r in access.referents
+            if isinstance(r, Assignment) and isinstance(r.node, cst.Name)
+        ]
+        if not referents:
+            return None
+        body = _scope_body(referents[0].scope, self._module)
+        if body is None:
+            return None
+        live_set = self._live_cache.get(id(name))
+        if live_set is None:
+            live_set = live_referents(
+                body,
+                name,
+                [r.node for r in referents],
+                cache=self._descendant_cache,
+            )
+            self._live_cache[id(name)] = live_set
+        if not live_set:
+            return None
+        live_ids = {id(n) for n in live_set}
+        values: set[bool] = set()
+        for ref in referents:
+            if id(ref.node) not in live_ids:
+                continue
+            rhs = self._rhs_for(ref.node)
+            if rhs is None:
+                return None
+            v = self.evaluate(rhs)
+            if v is None:
+                return None
+            values.add(v)
+        if len(values) != 1:
+            return None
+        return next(iter(values))
+
+    def _access_for(self, name: cst.Name, scope: Scope) -> Access | None:
+        """Look up the ``Access`` record for ``name`` in ``scope``.
+
+        ``scope.accesses`` is iterated once per scope on first hit and
+        indexed by access-node id; subsequent lookups in the same scope
+        are O(1). Names that aren't accesses (LHS bindings, etc.)
+        return ``None``.
+        """
+        scope_key = id(scope)
+        index = self._access_index.get(scope_key)
+        if index is None:
+            index = {id(a.node): a for a in scope.accesses}
+            self._access_index[scope_key] = index
+        return index.get(id(name))
+
+    def _rhs_for(self, binding_node: cst.CSTNode) -> cst.BaseExpression | None:
+        key = id(binding_node)
+        cached = self._rhs_cache.get(key, _MISSING)
+        if cached is not _MISSING:
+            return cached  # type: ignore[return-value]
+        parent_map = self._parent_map
+        if parent_map is None:
+            parent_map = self._wrapper.resolve(ParentNodeProvider)
+            self._parent_map = parent_map
+        rhs = _constant_assignment_rhs(binding_node, parent_map)
+        self._rhs_cache[key] = rhs
+        return rhs
+
+
+_MISSING: object = object()
+
+
 @runtime_checkable
 class UnreachableRegionDetector(Cacheable, Protocol):
     """Finds statically-unreachable source regions in a parsed module.
@@ -199,8 +464,8 @@ class UnreachableRegionDetector(Cacheable, Protocol):
     reports.
 
     The shipped :class:`DefaultUnreachableRegionDetector` covers
-    literal-only truthiness on ``if`` / ``while`` tests, fixpoint
-    constant-folding over simple ``Name = literal`` assignments, and
+    literal-only truthiness on ``if`` / ``while`` tests, name-aware
+    truthiness over simple ``Name = literal`` chains, and
     post-terminator regions inside every suite. Custom detectors
     typically subclass it and override
     :meth:`DefaultUnreachableRegionDetector.resolve` to layer on
@@ -219,54 +484,47 @@ class UnreachableRegionDetector(Cacheable, Protocol):
 class DefaultUnreachableRegionDetector:
     """Built-in :class:`UnreachableRegionDetector`.
 
-    Runs three passes per file:
+    Two passes per file:
 
-    1. :func:`~dead_cst._const_fold.fold_constants` -- a fixpoint
-       constant-folding pass that propagates simple
-       ``Name = literal`` (and ``Name: T = literal``) assignments
-       through their access points, including chained forms like
-       ``a = False; b = a or False; if b:``.
-    2. A walk over every ``cst.If`` / ``cst.While``, calling
-       :func:`unreachable_suites` with the truthiness resolver below
-       so folded constants influence branch reachability.
-    3. A walk over every statement-bearing suite (module body and
-       every ``IndentedBlock``) marking the trailing region after an
-       unconditional terminator as unreachable. Terminators are
-       ``return`` / ``raise`` / ``break`` / ``continue`` and
-       ``assert <statically-falsy>``. The check is purely
-       suite-relative, so a ``raise`` inside a ``try`` body still
-       kills the rest of the try body even though the surrounding
-       ``except`` runs on its own path.
+    1. A single :class:`cst.CSTVisitor` walk collects every
+       ``cst.If`` / ``cst.While`` and every statement-bearing suite
+       (module body and every ``IndentedBlock``).
+    2. For each collected site, a :class:`TruthinessResolver` answers
+       the truthiness queries on demand: ``unreachable_suites`` for
+       conditional branches, and a per-suite scan for the trailing
+       region after an unconditional terminator (``return`` /
+       ``raise`` / ``break`` / ``continue`` / ``assert <falsy>``). The
+       check is purely suite-relative, so a ``raise`` inside a ``try``
+       body still kills the rest of the try body even though the
+       surrounding ``except`` runs on its own path.
+
+    The goal-directed resolver replaces the previous up-front
+    fixpoint table: only the names that actually feed an
+    ``if``/``while``/``assert`` test pay for ``live_referents`` and
+    ``ScopeProvider`` resolution.
 
     Subclasses extend the analysis by overriding :meth:`resolve` to
     return ``True`` / ``False`` for expressions whose truthiness is
     fixed in a particular environment (e.g.
     ``check_flag("migration-abc")`` is always ``True`` in production).
-    The override gets first crack at every non-keyword expression in
-    every ``if`` / ``while`` test, every ``assert`` test, and every
-    foldable assignment RHS; returning ``None`` (the default) defers
-    to the built-in literal handling. Constants resolved this way
-    flow through the same fixpoint loop as ``Name = literal``
-    bindings, so a single high-level decision (``check_flag(...) ==
-    True``) propagates through chains and into ``if`` / ``assert``
-    branches automatically.
-
-    The folding pass is keyed by ``id`` of the access node, so it
-    stays flow-sensitive: a later rebinding shadows an earlier one,
-    and conditional bindings whose live values disagree refuse to
-    fold (the safe default).
+    The override gets first crack at every non-keyword expression
+    routed through the resolver chain; returning ``None`` (the default)
+    defers to the built-in literal handling and name lookup. Constants
+    resolved this way compose with name resolution: a single high-level
+    decision (``check_flag(...)`` is ``True``) propagates through
+    chains and into ``if`` / ``assert`` branches automatically.
     """
 
     name: str = "default"
-    version: int = 1777800597
+    version: int = 1778281000
 
     def resolve(self, expr: cst.BaseExpression) -> bool | None:
         """Hook for domain-specific constant folding. Default: defer.
 
         Override in a subclass to return ``True`` / ``False`` for any
         expression whose truthiness is fixed in your environment.
-        Returning ``None`` falls through to ``evaluate_truthiness``'s
-        built-in literal handling. The override is consulted recursively
+        Returning ``None`` falls through to the built-in literal
+        handling and name lookup. The override is consulted recursively
         for every subexpression of an ``if`` / ``while`` / ``assert``
         test and every foldable assignment RHS, so a check like
         ``isinstance(expr, cst.Call) and ...`` runs on every node;
@@ -275,87 +533,94 @@ class DefaultUnreachableRegionDetector:
         return None
 
     def find_regions(self, wrapper: MetadataWrapper) -> list[CodeRange]:
-        # Local import to avoid a top-level cycle: ``_const_fold``
-        # depends on :func:`evaluate_truthiness` from this module.
-        from ._const_fold import fold_constants
-
         positions = wrapper.resolve(PositionProvider)
-        # Run fold_constants with the subclass hook plumbed in so the
-        # fixpoint loop can resolve names whose RHS depends on a
-        # custom-folded expression (``flag = check_flag("x"); if flag:``).
-        truthy = fold_constants(wrapper, resolve_expr=self.resolve)
+        resolver = TruthinessResolver(wrapper, resolve_expr=self.resolve)
 
-        def resolve(expr: cst.BaseExpression) -> bool | None:
-            # Subclass hook gets first try -- a custom detector may
-            # know things the fold table doesn't.
-            v = self.resolve(expr)
-            if v is not None:
-                return v
-            # Fall back to the fold table: keyed by Name access id.
-            if isinstance(expr, cst.Name):
-                return truthy.get(id(expr))
-            return None
+        sites = _SiteCollector()
+        wrapper.module.visit(sites)
 
         found: list[CodeRange] = []
 
-        def is_terminator(stmt: cst.CSTNode) -> bool:
-            """``True`` iff ``stmt`` unconditionally exits its enclosing suite.
+        for stmt in sites.if_while:
+            for suite in unreachable_suites(stmt, resolver.evaluate):
+                pos = positions.get(suite)
+                if pos is not None:
+                    found.append(pos)
 
-            Recognized: ``return`` / ``raise`` / ``break`` / ``continue``
-            and ``assert <statically-falsy>``. A ``SimpleStatementLine``
-            is treated as a terminator if any of its small statements is
-            one -- ``x = 1; raise; y = 2`` ends control at ``raise``,
-            and anything after it on a later line is dead too.
-            """
-            if isinstance(stmt, cst.SimpleStatementLine):
-                for sm in stmt.body:
-                    if isinstance(sm, (cst.Return, cst.Raise, cst.Break, cst.Continue)):
-                        return True
-                    if isinstance(sm, cst.Assert):
-                        if evaluate_truthiness(sm.test, resolve) is False:
-                            return True
-            return False
+        for stmts in sites.suites:
+            self._scan_terminators(stmts, resolver, positions, found)
 
-        def scan_suite(stmts) -> None:
-            """Emit one dead region for the tail after the first terminator."""
-            for i, stmt in enumerate(stmts):
-                if not is_terminator(stmt):
-                    continue
-                tail = stmts[i + 1 :]
-                if not tail:
-                    return
-                first_pos = positions.get(tail[0])
-                last_pos = positions.get(tail[-1])
-                if first_pos is None or last_pos is None:
-                    return
-                found.append(CodeRange(start=first_pos.start, end=last_pos.end))
-                return
-
-        class _Collector(cst.CSTVisitor):
-            def visit_Module(self, node: cst.Module) -> None:
-                # Module body isn't an IndentedBlock; scan it directly.
-                scan_suite(list(node.body))
-
-            def visit_IndentedBlock(self, node: cst.IndentedBlock) -> None:
-                # Every nested suite (function body, class body,
-                # if/while/for/try/with bodies, ``else`` / ``finally``
-                # clauses, ``except`` handlers) lands here.
-                scan_suite(list(node.body))
-
-            def visit_If(self, node: cst.If) -> None:
-                self._collect(node)
-
-            def visit_While(self, node: cst.While) -> None:
-                self._collect(node)
-
-            def _collect(self, stmt: cst.BaseStatement) -> None:
-                for suite in unreachable_suites(stmt, resolve):
-                    pos = positions.get(suite)
-                    if pos is not None:
-                        found.append(pos)
-
-        wrapper.module.visit(_Collector())
         return found
+
+    @staticmethod
+    def _scan_terminators(
+        stmts: list[cst.CSTNode],
+        resolver: TruthinessResolver,
+        positions,
+        found: list[CodeRange],
+    ) -> None:
+        """Emit one dead region for the tail after the first terminator in ``stmts``."""
+        for i, stmt in enumerate(stmts):
+            if not _is_terminator(stmt, resolver):
+                continue
+            tail = stmts[i + 1 :]
+            if not tail:
+                return
+            first_pos = positions.get(tail[0])
+            last_pos = positions.get(tail[-1])
+            if first_pos is None or last_pos is None:
+                return
+            found.append(CodeRange(start=first_pos.start, end=last_pos.end))
+            return
+
+
+def _is_terminator(stmt: cst.CSTNode, resolver: TruthinessResolver) -> bool:
+    """``True`` iff ``stmt`` unconditionally exits its enclosing suite.
+
+    Recognized: ``return`` / ``raise`` / ``break`` / ``continue`` and
+    ``assert <statically-falsy>``. A ``SimpleStatementLine`` is treated
+    as a terminator if any of its small statements is one --
+    ``x = 1; raise; y = 2`` ends control at ``raise``, and anything
+    after it on a later line is dead too.
+    """
+    if isinstance(stmt, cst.SimpleStatementLine):
+        for sm in stmt.body:
+            if isinstance(sm, (cst.Return, cst.Raise, cst.Break, cst.Continue)):
+                return True
+            if isinstance(sm, cst.Assert):
+                if resolver.evaluate(sm.test) is False:
+                    return True
+    return False
+
+
+class _SiteCollector(cst.CSTVisitor):
+    """Pass-1 walk: gather every site the detector may need to query.
+
+    Output is two lists: ``if_while`` for the conditional-suite check
+    and ``suites`` for the per-suite terminator scan. The walk is a
+    single pass with no metadata dependency, so the cost is just the
+    raw CST traversal (the file's expensive ``ScopeProvider`` resolve
+    only fires later, when :class:`TruthinessResolver` actually has to
+    answer a ``Name`` query).
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.if_while: list[cst.If | cst.While] = []
+        self.suites: list[list[cst.CSTNode]] = []
+
+    def visit_Module(self, node: cst.Module) -> None:
+        # Module body isn't an IndentedBlock; collect it directly.
+        self.suites.append(list(node.body))
+
+    def visit_IndentedBlock(self, node: cst.IndentedBlock) -> None:
+        self.suites.append(list(node.body))
+
+    def visit_If(self, node: cst.If) -> None:
+        self.if_while.append(node)
+
+    def visit_While(self, node: cst.While) -> None:
+        self.if_while.append(node)
 
 
 def _unreachable_in_if(
@@ -387,18 +652,12 @@ def _unreachable_in_if(
     return dead
 
 
-# Re-exported so detector authors who write a full
-# :meth:`UnreachableRegionDetector.find_regions` (rather than subclassing
-# :class:`DefaultUnreachableRegionDetector`) get the fixpoint
-# constant-folding pass alongside the rest of the detector helpers.
-from ._const_fold import fold_constants  # noqa: E402
-
 __all__ = [
     "DefaultUnreachableRegionDetector",
     "ResolveExpr",
+    "TruthinessResolver",
     "UnreachableRegionDetector",
     "evaluate_truthiness",
-    "fold_constants",
     "unreachable_bodies",
     "unreachable_suites",
 ]

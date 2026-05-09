@@ -165,3 +165,27 @@ Order of impact-vs-risk:
 5. **#7 table-based resolver** — API tweak (`resolve_expr` → table), nice ergonomics for subclassers.
 
 Items #4, #6, #8, #9, #10 are smaller wins or already mostly handled.
+
+## Measured outcome
+
+Levers #1, #2, and #3 (and a piece of #7 — the resolver is now an object
+instead of a callback) shipped together as the
+:class:`TruthinessResolver` + two-pass detector restructure. Same
+benchmark, same ``dead_cst/`` self-analysis, same ``total_regions``
+output:
+
+| metric                     | before    | after    | speedup |
+|----------------------------|----------:|---------:|--------:|
+| ``find_regions`` total     | 24,215 ms | 1,816 ms | **13.3×** |
+| ``find_regions`` per file  |    621 ms |    48 ms | **13.0×** |
+| total dead regions found   |         1 |        1 | (unchanged) |
+
+cProfile of the post-refactor run no longer shows ``_descendant_ids``,
+``_walk_flow``, or ``live_referents`` in the top 20. The new dominant
+cost is libcst's ``PositionProvider`` codegen (~2 s under cProfile,
+~1 s wall clock) — work both implementations have to do — followed by
+the single ``_SiteCollector`` CST walk per file (~0.4 s).
+
+The full pytest suite (775 tests) passes; one test had to be updated
+because the new resolver correctly returns ``True`` for the ``True``
+keyword, where the old ``fold_constants`` table simply omitted it.

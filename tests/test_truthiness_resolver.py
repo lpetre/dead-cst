@@ -1,12 +1,12 @@
-"""Unit tests for the fixpoint constant-folding pass.
+"""Unit tests for the goal-directed truthiness resolver.
 
-The pass is a forward dataflow analysis over simple
-``Name = literal`` (and ``Name: T = literal``) bindings, iterated to
-fixpoint so chained forms like ``a = False; b = a or False`` resolve
-fully. Cases here cover the value pipeline -- direct literals, chains,
-boolean operators, conditional bindings -- without going through the
-symbol graph; the end-to-end behaviour is in
-``test_unreachable_branches.py``.
+The resolver layers flow-sensitive ``Name`` lookup over the literal-only
+:func:`~dead_cst.branches.evaluate_truthiness`, propagating simple
+``Name = literal`` (and ``Name: T = literal``) bindings through
+chained forms like ``a = False; b = a or False``. Cases here cover the
+value pipeline -- direct literals, chains, boolean operators,
+conditional bindings -- without going through the symbol graph; the
+end-to-end behaviour is in ``test_unreachable_branches.py``.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ import textwrap
 import libcst as cst
 from libcst.metadata import MetadataWrapper, ScopeProvider
 
-from dead_cst._const_fold import fold_constants
+from dead_cst.branches import TruthinessResolver
 
 
 def _resolve_lookup(src: str) -> dict[str, list[bool | None]]:
@@ -29,7 +29,7 @@ def _resolve_lookup(src: str) -> dict[str, list[bool | None]]:
     """
     module = cst.parse_module(textwrap.dedent(src).strip())
     wrapper = MetadataWrapper(module, unsafe_skip_copy=True)
-    truthy = fold_constants(wrapper)
+    resolver = TruthinessResolver(wrapper)
     scopes = wrapper.resolve(ScopeProvider)
 
     access_nodes: set[int] = set()
@@ -43,7 +43,7 @@ def _resolve_lookup(src: str) -> dict[str, list[bool | None]]:
     class _Collect(cst.CSTVisitor):
         def visit_Name(self, node: cst.Name) -> None:
             if id(node) in access_nodes:
-                result.setdefault(node.value, []).append(truthy.get(id(node)))
+                result.setdefault(node.value, []).append(resolver.evaluate(node))
 
     wrapper.module.visit(_Collect())
     return result
@@ -73,9 +73,9 @@ def test_truthy_literal_folds_to_true() -> None:
     assert out["x"] == [True]
 
 
-def test_chained_constants_resolve_through_fixpoint() -> None:
-    # ``b``'s RHS references ``a``; the second iteration of the
-    # fixpoint loop is what propagates ``a``'s value through.
+def test_chained_constants_resolve_through_recursion() -> None:
+    # ``b``'s RHS references ``a``; the resolver recurses into ``a``
+    # and memoizes the result before answering for ``b``.
     out = _resolve_lookup(
         """
         a = False
@@ -151,7 +151,8 @@ def test_non_literal_rhs_blocks_fold() -> None:
 
 
 def test_cyclic_self_reference_stays_unknown() -> None:
-    # ``a`` and ``b`` reference each other; neither resolves.
+    # ``a`` and ``b`` reference each other; the cycle sentinel makes
+    # the resolver bottom out at ``None`` instead of recursing forever.
     out = _resolve_lookup(
         """
         a = b
@@ -197,18 +198,15 @@ def test_walrus_binding_folds() -> None:
 def test_walrus_in_if_test_folds() -> None:
     # ``evaluate_truthiness`` unwraps ``NamedExpr`` to its value, so the
     # if-test's truthiness is statically known even when the test is a
-    # bare walrus expression.
+    # bare walrus expression. There's no Name access here -- the walrus
+    # target is a binding, and the if-test's NamedExpr is an expression
+    # node, not a Name lookup -- so nothing shows up in ``out``.
     out = _resolve_lookup(
         """
         if (x := False):
             pass
         """
     )
-    # Two ``x`` accesses: the walrus target binding (folded via the
-    # NamedExpr handler in ``_constant_assignment_rhs``) and... actually
-    # only one access -- the walrus target Name is a binding, not an
-    # access. The ``if`` test's NamedExpr is an expression, not a Name
-    # access, so no entry shows up in ``out`` at all.
     assert "x" not in out
 
 
@@ -275,25 +273,37 @@ def test_lambda_scope_does_not_crash() -> None:
     assert out["FLAG"] == [False]
 
 
-def test_keyword_names_are_not_dispatched_to_resolver() -> None:
-    # ``True`` / ``False`` / ``None`` are language keywords, handled by
-    # ``evaluate_truthiness`` directly. The fold pass shouldn't try to
-    # look them up.
-    out = _resolve_lookup(
+def test_keyword_names_resolve_to_language_truthiness() -> None:
+    # ``True`` / ``False`` / ``None`` are language keywords, handled
+    # by ``evaluate_truthiness`` directly. The resolver returns their
+    # language-defined truthiness and never offers them to the external
+    # ``resolve_expr`` (a custom resolver must not be able to redefine
+    # ``True is True``).
+    seen: list[cst.BaseExpression] = []
+
+    def external(expr):
+        seen.append(expr)
+        return None
+
+    out = _resolve_with_external(
         """
         if True:
             x = 1
-        """
+        if False:
+            y = 2
+        """,
+        external,
     )
-    # ``True`` accesses don't go through the fold table at all; nothing
-    # to assert beyond "no crash, no entry".
-    assert "True" not in out or all(v is None for v in out["True"])
+    assert out["True"] == [True]
+    assert out["False"] == [False]
+    # External resolver never sees True/False/None Name nodes.
+    assert not any(isinstance(e, cst.Name) and e.value in {"True", "False", "None"} for e in seen)
 
 
 # ----------------------------------------------------------------------
-# fold_constants accepts an optional ``resolve_expr`` so a custom
+# TruthinessResolver accepts an optional ``resolve_expr`` so a custom
 # detector's ``resolve`` method can answer for non-Name expressions
-# (Calls, Attributes) that the literal-only fold would skip.
+# (Calls, Attributes) that the literal-only path would skip.
 # ----------------------------------------------------------------------
 
 
@@ -301,7 +311,7 @@ def _resolve_with_external(src: str, resolve_expr) -> dict[str, list[bool | None
     """Same as :func:`_resolve_lookup` but plumbs an external resolver."""
     module = cst.parse_module(textwrap.dedent(src).strip())
     wrapper = MetadataWrapper(module, unsafe_skip_copy=True)
-    truthy = fold_constants(wrapper, resolve_expr=resolve_expr)
+    resolver = TruthinessResolver(wrapper, resolve_expr=resolve_expr)
     scopes = wrapper.resolve(ScopeProvider)
 
     access_nodes: set[int] = set()
@@ -315,7 +325,7 @@ def _resolve_with_external(src: str, resolve_expr) -> dict[str, list[bool | None
     class _Collect(cst.CSTVisitor):
         def visit_Name(self, node: cst.Name) -> None:
             if id(node) in access_nodes:
-                result.setdefault(node.value, []).append(truthy.get(id(node)))
+                result.setdefault(node.value, []).append(resolver.evaluate(node))
 
     wrapper.module.visit(_Collect())
     return result
@@ -324,7 +334,7 @@ def _resolve_with_external(src: str, resolve_expr) -> dict[str, list[bool | None
 def test_external_resolver_folds_call_through_assignment() -> None:
     # The user's example: ``flag = check_flag("x"); if flag:``. The
     # external resolver answers for the Call expression on the RHS;
-    # the fold pass propagates that into the access for ``flag``.
+    # the resolver propagates that into the access for ``flag``.
     def resolver(expr):
         if (
             isinstance(expr, cst.Call)

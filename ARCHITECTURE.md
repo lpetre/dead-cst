@@ -137,17 +137,22 @@ and the flow-sensitive shadowing in `_flow.py`.
 
 Invoked once per file from inside `SymbolVisitor.visit_Module` reusing
 the analyzer's resolved `PositionProvider`. The shipped
-`DefaultUnreachableRegionDetector` runs three passes:
+`DefaultUnreachableRegionDetector` is a two-pass design:
 
-1. Literal-truthiness `unreachable_suites` walk over `if` / `while`
-   tests and `assert`.
-2. Fixpoint `fold_constants` pre-pass (`dead_cst/_const_fold.py`):
-   propagates simple `Name = literal` bindings through chained `or` /
-   `and` / `not` until quiescent.
-3. Post-terminator scan: statements after an unconditional `return` /
-   `raise` / `break` / `continue` / `assert <falsy>` are marked dead
-   *within the same suite* — a `raise` in a `try` body doesn't kill
-   the matching `except`.
+1. A single `cst.CSTVisitor` walk collects every `If` / `While` plus
+   every statement-bearing suite (module body and every
+   `IndentedBlock`).
+2. A `TruthinessResolver` (also in `branches.py`) answers truthiness
+   queries on demand: `unreachable_suites` for the conditional sites,
+   plus a per-suite scan that marks statements after an unconditional
+   `return` / `raise` / `break` / `continue` / `assert <falsy>` as
+   dead *within the same suite* — a `raise` in a `try` body doesn't
+   kill the matching `except`. The resolver is goal-directed: it
+   lazily resolves `ScopeProvider` / `ParentNodeProvider` only when
+   the first `Name` query lands, walks `live_referents` only for the
+   names that actually feed a query, memoizes by access node id, and
+   uses a `_PENDING` sentinel to bottom out cyclic references like
+   `a = b; b = a`.
 
 The apply step compares each `access_pos` in `edges` against
 `dead_suites` to flag `EdgeFlags.DEAD_BRANCH`. Reachability still
@@ -156,10 +161,12 @@ is the opt-in inverse.
 
 To layer in domain knowledge, subclass `DefaultUnreachableRegionDetector`
 and override `resolve(self, expr) -> bool | None` — it gets first crack
-at every non-keyword expression in `if` / `while` / `assert` tests and
-every foldable RHS. Pass an instance via
-`Analysis(unreachable_detector=...)`. Bump `version` whenever the
-override's logic changes.
+at every non-keyword expression routed through the resolver chain. Pass
+an instance via `Analysis(unreachable_detector=...)`. Bump `version`
+whenever the override's logic changes. From-scratch detectors that
+need name-aware truthiness construct `TruthinessResolver(wrapper,
+resolve_expr=...)` once per file and pass `resolver.evaluate` as the
+`resolve_expr` callback to `unreachable_suites` / `evaluate_truthiness`.
 
 ### 4. Visitor + observe cache — `dead_cst/cache.py`
 
