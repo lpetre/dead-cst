@@ -9,6 +9,8 @@ two versions.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-05-09
+
 ### Added
 - New `[unparseable] <module>` synthetic node, exposed via the
   `UNPARSEABLE_PREFIX` constant re-exported from `dead_cst.plugins`.
@@ -880,7 +882,8 @@ versions until the first stable release.
 - `README.md`, `CONTRIBUTING.md`, `CHANGELOG.md`, and `ROADMAP.md` with a
   stack-ranked plan from alpha to 1.0.
 
-[Unreleased]: https://github.com/lpetre/dead-cst/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/lpetre/dead-cst/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/lpetre/dead-cst/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/lpetre/dead-cst/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/lpetre/dead-cst/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/lpetre/dead-cst/compare/v0.3.0...v0.4.0
