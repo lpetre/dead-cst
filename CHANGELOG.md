@@ -10,6 +10,38 @@ two versions.
 ## [Unreleased]
 
 ### Added
+- The visitor now honors ruff/pyflakes ``# noqa`` directives that
+  silence F401 (unused-import). A per-line ``# noqa``,
+  ``# noqa: F401``, multi-rule ``# noqa: E501, F401``, or case-variant
+  ``# NOQA`` on the same source line as an import alias pins the
+  resulting import node alive (``NodeFlags.ENTRYPOINT |
+  NodeFlags.NOQA``) so it is no longer reported as dead. File-level
+  directives -- ``# ruff: noqa``, ``# ruff: noqa: F401``, and the
+  ``# flake8: noqa`` aliases -- pin every import in the file. The
+  ``ruff:`` / ``flake8:`` prefix is matched case-sensitively per
+  ruff's documented behavior; the ``noqa`` keyword is case-insensitive.
+  Per-alias directives inside a parenthesized ``from x import (a, b)``
+  pin only the alias on that line. This brings dead-cst's unused-import
+  semantics in line with ruff: an import you have explicitly marked as
+  intentionally preserved (re-exports, side-effect imports,
+  ``TYPE_CHECKING`` shims guarded by F401) is no longer surfaced or
+  removed.
+- New ``NodeFlags.NOQA`` flag, layered on ``NodeFlags.ENTRYPOINT``
+  (parallel to ``NodeFlags.TESTCASE``). Read ``n.flags & NodeFlags.NOQA``
+  off the ``SymbolNode`` directly; there is no graph attr-dict mirror.
+
+### Changed
+
+- **Breaking:** The two ``kept_alive_by_*_only`` methods on
+  ``Analysis`` and ``PackageView`` have been collapsed into a single
+  ``kept_alive_by_flags_only(flags: NodeFlags)``. Pass
+  ``NodeFlags.TESTCASE`` for the old ``kept_alive_by_tests_only``
+  behavior ("blast radius of dropping the test suite"),
+  ``NodeFlags.NOQA`` for "blast radius of removing every F401 pin",
+  or both ORed together. ``dead_cst.analyze._find_reachable(graph,
+  exclude_flags=NodeFlags.NONE)`` is the matching private helper
+  shape; ``_find_reachable_excluding_tests`` and
+  ``_find_kept_alive_by_tests_only`` are gone.
 - `dead_cst.codemod.generate_patch(G, root)` returns the same removal
   as `remove_code` as a `git apply`-compatible unified diff (with
   `diff --git` headers and `deleted file mode 100644` for module

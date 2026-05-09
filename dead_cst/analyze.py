@@ -23,7 +23,7 @@ from .branches import (
     UnreachableRegionDetector,
 )
 from .cache import GraphCache, compute_fingerprint
-from .graph import EdgeFlags, SymbolNode, SymbolTrie
+from .graph import EdgeFlags, NodeFlags, SymbolNode, SymbolTrie
 from .plugins import (
     EdgePlugin,
     PluginContext,
@@ -139,11 +139,21 @@ def _compose_contribution(
             apply_ops(target_graph, ops)
 
 
-def _find_reachable(graph: nx.MultiDiGraph) -> set[SymbolNode]:
+def _find_reachable(
+    graph: nx.MultiDiGraph, exclude_flags: NodeFlags = NodeFlags.NONE
+) -> set[SymbolNode]:
     """BFS forward from every node tagged as an entrypoint by a plugin.
 
     Plugins mark seeds by setting ``graph.nodes[node]["entrypoint"] = True``
     (see :func:`dead_cst.plugins.apply_ops`).
+
+    ``exclude_flags`` may carry one or more :class:`NodeFlags` bits to
+    drop entrypoints whose flags intersect; the default
+    :data:`NodeFlags.NONE` keeps every seed and reproduces today's
+    "all entrypoints" reachability. The diff
+    ``_find_reachable(g) - _find_reachable(g, flags)`` is the blast
+    radius of dropping every entrypoint with any of those bits, surfaced
+    as :func:`_find_kept_alive_by_flags_only`.
 
     Edges flagged with :data:`EdgeFlags.DEAD_BRANCH` are NOT filtered
     here -- today's behavior, where dead-code references propagate
@@ -151,7 +161,11 @@ def _find_reachable(graph: nx.MultiDiGraph) -> set[SymbolNode]:
     :func:`_find_reachable_strict` for the variant that skips them.
     """
     visited: set[SymbolNode] = set()
-    stack = [n for n, attrs in graph.nodes(data=True) if attrs.get("entrypoint")]
+    stack = [
+        n
+        for n, attrs in graph.nodes(data=True)
+        if attrs.get("entrypoint") and not (n.flags & exclude_flags)
+    ]
     while stack:
         node = stack.pop()
         if node in visited:
@@ -190,32 +204,15 @@ def _find_kept_alive_by_dead_branches(graph: nx.MultiDiGraph) -> set[SymbolNode]
     return _find_reachable(graph) - _find_reachable_strict(graph)
 
 
-def _find_reachable_excluding_tests(graph: nx.MultiDiGraph) -> set[SymbolNode]:
-    """Like :func:`_find_reachable` but skips entrypoints tagged ``testcase=True``."""
-    visited: set[SymbolNode] = set()
-    stack = [
-        n
-        for n, attrs in graph.nodes(data=True)
-        if attrs.get("entrypoint") and not attrs.get("testcase")
-    ]
-    while stack:
-        node = stack.pop()
-        if node in visited:
-            continue
-        visited.add(node)
-        stack.extend(graph.successors(node))
-    return visited
+def _find_kept_alive_by_flags_only(graph: nx.MultiDiGraph, flags: NodeFlags) -> set[SymbolNode]:
+    """Symbols reachable only from entrypoints carrying any of ``flags``.
 
-
-def _find_kept_alive_by_tests_only(graph: nx.MultiDiGraph) -> set[SymbolNode]:
-    """Symbols only reachable from ``TESTCASE``-tagged entrypoints.
-
-    ``_find_reachable(graph) -`` :func:`_find_reachable_excluding_tests`;
-    the difference is the "blast radius" of removing the test suite.
-    Surfaced on :class:`Analysis` as :meth:`Analysis.kept_alive_by_tests_only`
-    and on :class:`PackageView` as :meth:`PackageView.kept_alive_by_tests_only`.
+    ``_find_reachable(graph) - _find_reachable(graph, flags)``; the
+    difference is the "blast radius" of dropping every entrypoint with
+    any of those flag bits. Surfaced on :class:`Analysis` and
+    :class:`PackageView` as ``kept_alive_by_flags_only(flags)``.
     """
-    return _find_reachable(graph) - _find_reachable_excluding_tests(graph)
+    return _find_reachable(graph) - _find_reachable(graph, flags)
 
 
 def _count_nodes(graph: nx.MultiDiGraph, prefix: Path | None) -> dict[str, int]:
@@ -584,21 +581,18 @@ class Analysis:
         g = self.materialize_all()
         return _find_reachable(g) - _find_reachable_strict(g)
 
-    def kept_alive_by_tests_only(self) -> set[SymbolNode]:
-        """Symbols that would become unreachable if the test suite were dropped.
+    def kept_alive_by_flags_only(self, flags: NodeFlags) -> set[SymbolNode]:
+        """Symbols reachable only from entrypoints carrying any of ``flags``.
 
-        Computed as ``reachable() -`` BFS that excludes every
-        entrypoint tagged :data:`NodeFlags.TESTCASE` (today: pytest
-        and unittest discovery seeds). The resulting set is the
-        "blast radius" of removing tests -- production code that is
-        currently kept alive *only* because tests still exercise it.
-
-        Used by tooling that reports "if you deleted your tests, these
-        symbols would also become dead." The default :meth:`reachable`
-        traversal is unchanged; this is the opt-in stricter pass.
+        Opt-in "blast radius" query: the diff between full reachability
+        and reachability with those entrypoints dropped. Pass
+        :data:`NodeFlags.TESTCASE` for "what dies if the test suite
+        goes", :data:`NodeFlags.NOQA` for "what dies if every
+        ``# noqa: F401`` pin is removed", or any OR-combination. See
+        :class:`NodeFlags` for the full list.
         """
         g = self.materialize_all()
-        return _find_reachable(g) - _find_reachable_excluding_tests(g)
+        return _find_kept_alive_by_flags_only(g, flags)
 
     def count_nodes(self, prefix: Path | None = None) -> dict[str, int]:
         """Count nodes in the full graph by ``SymbolNode.type``.
@@ -763,14 +757,15 @@ class PackageView:
         diff = _find_reachable(g) - _find_reachable_strict(g)
         return {n for n in diff if n.path.is_relative_to(self._package.path)}
 
-    def kept_alive_by_tests_only(self) -> set[SymbolNode]:
-        """Decls in this package kept alive only by ``TESTCASE`` entrypoints.
+    def kept_alive_by_flags_only(self, flags: NodeFlags) -> set[SymbolNode]:
+        """Decls in this package kept alive only by entrypoints carrying any of ``flags``.
 
-        Closure-scoped equivalent of :meth:`Analysis.kept_alive_by_tests_only`,
-        filtered to nodes under :attr:`path`.
+        Closure-scoped equivalent of :meth:`Analysis.kept_alive_by_flags_only`,
+        filtered to nodes under :attr:`path`. See that method for the
+        common flag arguments (``TESTCASE``, ``NOQA``, or both).
         """
         g = self._analysis.materialize_closure(self._package.path)
-        diff = _find_reachable(g) - _find_reachable_excluding_tests(g)
+        diff = _find_kept_alive_by_flags_only(g, flags)
         return {n for n in diff if n.path.is_relative_to(self._package.path)}
 
     def count_nodes(self) -> dict[str, int]:
