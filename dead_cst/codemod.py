@@ -88,6 +88,58 @@ def _import_remove_args(node: SymbolNode) -> tuple[str, str | None, str | None]:
     return module, obj, asname
 
 
+def _select_files(G: nx.Graph, base: Path) -> tuple[dict[Path, list[SymbolNode]], list[Path]]:
+    """Group ``G``'s nodes under ``base`` into files-to-rewrite vs. files-to-delete.
+
+    Used by both :func:`remove_code` and :func:`generate_patch`. Symbols
+    outside ``base`` (other packages, vendored deps) are dropped, as are
+    nodes whose source file no longer exists. Synthetic nodes are
+    ignored implicitly -- they don't appear in the type ``match``.
+    """
+    by_file: dict[Path, list[SymbolNode]] = {}
+    deleted_modules: list[Path] = []
+    for node in G.nodes:
+        if not node.path.is_relative_to(base):
+            continue
+        if not node.path.exists():
+            continue
+        match node.type:
+            case "function" | "class" | "variable" | "type_alias" | "import":
+                by_file.setdefault(node.path, []).append(node)
+            case "module":
+                deleted_modules.append(node.path)
+    # A file marked for outright deletion needs no per-decl rewrite on top.
+    for path in deleted_modules:
+        by_file.pop(path, None)
+    return by_file, deleted_modules
+
+
+def _rewrite_one(wrapper, nodes: list[SymbolNode]) -> tuple[str, str]:
+    """Run the two-pass dead-symbol + dead-import transform on one file.
+
+    Returns ``(original, new)`` source pairs read straight off
+    ``wrapper.module.code`` -- no extra disk read, and no TOCTOU window
+    against a concurrent edit between the parser load and the diff base.
+    Pass 1 (:class:`RemoveDeadSymbols`) drops dead defs/classes/variables;
+    pass 2 (:class:`RemoveImportsVisitor`) prunes imports they used to
+    reference. Pass 2 is skipped when there are no dead imports so the
+    Module passes through unchanged.
+    """
+    original = wrapper.module.code
+    dead_decls = {(n.fqname, n.position) for n in nodes if n.type != "import"}
+    result = wrapper.visit(RemoveDeadSymbols(dead_decls))
+
+    dead_imports = [n for n in nodes if n.type == "import"]
+    if dead_imports:
+        ctx = CodemodContext()
+        for imp in dead_imports:
+            module, obj, asname = _import_remove_args(imp)
+            RemoveImportsVisitor.remove_unused_import(ctx, module, obj, asname)
+        result = RemoveImportsVisitor(ctx).transform_module(result)
+
+    return original, result.code
+
+
 def remove_code(G: nx.Graph, package_path: Path) -> None:
     """Delete every symbol in ``G`` from the source files under ``package_path``.
 
@@ -109,45 +161,22 @@ def remove_code(G: nx.Graph, package_path: Path) -> None:
     together. The transformation is destructive -- back the files up
     first, or run on a clean working tree.
     """
-    by_file: dict[Path, list[SymbolNode]] = {}
-    for node in G.nodes:
-        if not node.path.is_relative_to(package_path):
-            continue
-        if not node.path.exists():
-            continue
-        match node.type:
-            case "function" | "class" | "variable" | "type_alias" | "import":
-                by_file.setdefault(node.path, []).append(node)
-            case "module":
-                node.path.unlink()
+    by_file, deleted_modules = _select_files(G, package_path)
+
+    for path in deleted_modules:
+        path.unlink()
+
+    if not by_file:
+        return
 
     mgr = FullRepoManager(
         str(package_path), [str(p) for p in by_file], {FixedFullyQualifiedNameProvider}
     )
-    for path, nodes in sorted(by_file.items(), key=lambda x: x):
-        if not path.exists():
-            continue
-
-        # Pass 1: drop dead defs / classes / variables. Imports they
-        # used to reference become eligible for removal in pass 2.
+    for path, nodes in sorted(by_file.items()):
         wrapper = mgr.get_metadata_wrapper_for_path(str(path))
-        dead_decls = {(n.fqname, n.position) for n in nodes if n.type != "import"}
-        result = wrapper.visit(RemoveDeadSymbols(dead_decls))
-
-        # Pass 2: hand the dead-import set to libcst's stock import
-        # remover. It walks scopes itself, so it'll skip anything still
-        # referenced after pass 1 (defensive -- if the graph said
-        # something is dead, no live user remains).
-        dead_imports = [n for n in nodes if n.type == "import"]
-        if dead_imports:
-            ctx = CodemodContext()
-            for imp in dead_imports:
-                module, obj, asname = _import_remove_args(imp)
-                RemoveImportsVisitor.remove_unused_import(ctx, module, obj, asname)
-            result = RemoveImportsVisitor(ctx).transform_module(result)
-
-        with path.open("w") as f:
-            f.write(result.code)
+        original, new = _rewrite_one(wrapper, nodes)
+        if new != original:
+            path.write_text(new)
 
 
 def generate_patch(G: nx.Graph, root: Path) -> str:
@@ -177,19 +206,7 @@ def generate_patch(G: nx.Graph, root: Path) -> str:
     The returned string is the concatenation of every per-file diff,
     sorted by path. An empty string means there was nothing to remove.
     """
-    by_file: dict[Path, list[SymbolNode]] = {}
-    deleted_modules: list[Path] = []
-    for node in G.nodes:
-        if not node.path.is_relative_to(root):
-            continue
-        if not node.path.exists():
-            continue
-        match node.type:
-            case "function" | "class" | "variable" | "type_alias" | "import":
-                by_file.setdefault(node.path, []).append(node)
-            case "module":
-                deleted_modules.append(node.path)
-
+    by_file, deleted_modules = _select_files(G, root)
     chunks: list[str] = []
 
     for path in sorted(deleted_modules):
@@ -203,37 +220,22 @@ def generate_patch(G: nx.Graph, root: Path) -> str:
                 tofile="/dev/null",
             )
         )
-        chunks.append(
-            f"diff --git a/{rel} b/{rel}\ndeleted file mode 100644\n{body}",
-        )
+        chunks.append(f"diff --git a/{rel} b/{rel}\ndeleted file mode 100644\n{body}")
 
     if by_file:
         mgr = FullRepoManager(
             str(root), [str(p) for p in by_file], {FixedFullyQualifiedNameProvider}
         )
-        for path, nodes in sorted(by_file.items(), key=lambda x: x[0]):
+        for path, nodes in sorted(by_file.items()):
             wrapper = mgr.get_metadata_wrapper_for_path(str(path))
-            dead_decls = {(n.fqname, n.position) for n in nodes if n.type != "import"}
-            result = wrapper.visit(RemoveDeadSymbols(dead_decls))
-
-            dead_imports = [n for n in nodes if n.type == "import"]
-            if dead_imports:
-                ctx = CodemodContext()
-                for imp in dead_imports:
-                    module, obj, asname = _import_remove_args(imp)
-                    RemoveImportsVisitor.remove_unused_import(ctx, module, obj, asname)
-                result = RemoveImportsVisitor(ctx).transform_module(result)
-
-            original_text = path.read_text()
-            new_text = result.code
-            if new_text == original_text:
+            original, new = _rewrite_one(wrapper, nodes)
+            if new == original:
                 continue
-
             rel = path.relative_to(root).as_posix()
             body = "".join(
                 difflib.unified_diff(
-                    original_text.splitlines(keepends=True),
-                    new_text.splitlines(keepends=True),
+                    original.splitlines(keepends=True),
+                    new.splitlines(keepends=True),
                     fromfile=f"a/{rel}",
                     tofile=f"b/{rel}",
                 )

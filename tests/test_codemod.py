@@ -80,15 +80,16 @@ def apply_transformer_at_lines(tmp_path, make_analysis):
 
 
 @pytest.fixture
-def run_remove_code(tmp_path, make_analysis):
-    """Materialise ``files`` under ``tmp_path``, run ``remove_code``, return paths.
+def build_unreachable_graph(tmp_path, make_analysis):
+    """Materialise ``files`` under ``tmp_path`` and return the unreachable subgraph.
 
-    Returns the ``tmp_path`` so the test can inspect rewritten contents
-    and file existence directly. ``entrypoints`` is the set of FQNs to
-    mark as graph entrypoints before computing reachability.
+    ``entrypoints`` is the set of FQNs to mark as graph entrypoints
+    before computing reachability. Used by both ``run_remove_code`` and
+    the ``generate_patch`` tests below; tests that need the full graph
+    can call this directly.
     """
 
-    def _run(files: dict[str, str], entrypoints: set[str]) -> None:
+    def _build(files: dict[str, str], entrypoints: set[str]):
         for name, src in files.items():
             path = tmp_path / name
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -98,8 +99,17 @@ def run_remove_code(tmp_path, make_analysis):
             if node.fqname in entrypoints:
                 graph.nodes[node]["entrypoint"] = True
         reachable = find_reachable(graph)
-        unreachable = graph.subgraph([n for n in graph.nodes if n not in reachable]).copy()
-        remove_code(unreachable, tmp_path)
+        return graph.subgraph([n for n in graph.nodes if n not in reachable]).copy()
+
+    return _build
+
+
+@pytest.fixture
+def run_remove_code(tmp_path, build_unreachable_graph):
+    """Materialise ``files`` under ``tmp_path`` and run ``remove_code``."""
+
+    def _run(files: dict[str, str], entrypoints: set[str]) -> None:
+        remove_code(build_unreachable_graph(files, entrypoints), tmp_path)
 
     return _run
 
@@ -738,10 +748,10 @@ def test_remove_code_unlinks_dead_module_files(
 # ---------------------------------------------------------------------------
 
 
-def test_generate_patch_emits_git_diff_for_dead_function(tmp_path, make_analysis):
-    (tmp_path / "mod.py").write_text(
-        _normalise(
-            """
+def test_generate_patch_emits_git_diff_for_dead_function(build_unreachable_graph, tmp_path):
+    unreachable = build_unreachable_graph(
+        {
+            "mod.py": """
             def used():
                 pass
 
@@ -749,50 +759,42 @@ def test_generate_patch_emits_git_diff_for_dead_function(tmp_path, make_analysis
                 pass
 
             used()
-            """
-        )
+            """,
+        },
+        {"mod.used"},
     )
-    graph = make_analysis().materialize_all()
-    for node in graph.nodes:
-        if node.fqname == "mod.used":
-            graph.nodes[node]["entrypoint"] = True
-    reachable = find_reachable(graph)
-    unreachable = graph.subgraph([n for n in graph.nodes if n not in reachable]).copy()
-
     patch = generate_patch(unreachable, tmp_path)
 
     assert "diff --git a/mod.py b/mod.py" in patch
     assert "--- a/mod.py" in patch
     assert "+++ b/mod.py" in patch
     assert "-def dead():" in patch
-    # File on disk is untouched.
     assert "def dead" in (tmp_path / "mod.py").read_text()
 
 
-def test_generate_patch_emits_deleted_file_header_for_dead_module(tmp_path, make_analysis):
-    (tmp_path / "kept.py").write_text(_normalise("def main(): pass\n"))
-    (tmp_path / "dropped.py").write_text(_normalise("def helper(): pass\n"))
-    graph = make_analysis().materialize_all()
-    for node in graph.nodes:
-        if node.fqname == "kept":
-            graph.nodes[node]["entrypoint"] = True
-    reachable = find_reachable(graph)
-    unreachable = graph.subgraph([n for n in graph.nodes if n not in reachable]).copy()
-
+def test_generate_patch_emits_deleted_file_header_for_dead_module(
+    build_unreachable_graph, tmp_path
+):
+    unreachable = build_unreachable_graph(
+        {
+            "kept.py": "def main(): pass\n",
+            "dropped.py": "def helper(): pass\n",
+        },
+        {"kept"},
+    )
     patch = generate_patch(unreachable, tmp_path)
 
     assert "diff --git a/dropped.py b/dropped.py" in patch
     assert "deleted file mode 100644" in patch
     assert "+++ /dev/null" in patch
-    # Module file still on disk -- patch is just a description.
     assert (tmp_path / "dropped.py").exists()
 
 
-def test_generate_patch_per_subgraph_slice_isolates_decls(tmp_path, make_analysis):
+def test_generate_patch_per_subgraph_slice_isolates_decls(build_unreachable_graph, tmp_path):
     """Caller-supplied subgraphs (e.g. one SCC at a time) limit the diff."""
-    (tmp_path / "mod.py").write_text(
-        _normalise(
-            """
+    unreachable = build_unreachable_graph(
+        {
+            "mod.py": """
             def used():
                 pass
 
@@ -803,22 +805,15 @@ def test_generate_patch_per_subgraph_slice_isolates_decls(tmp_path, make_analysi
                 pass
 
             used()
-            """
-        )
+            """,
+        },
+        {"mod.used"},
     )
-    graph = make_analysis().materialize_all()
-    for node in graph.nodes:
-        if node.fqname == "mod.used":
-            graph.nodes[node]["entrypoint"] = True
-    reachable = find_reachable(graph)
-    unreachable = graph.subgraph([n for n in graph.nodes if n not in reachable]).copy()
-
     one_only = unreachable.subgraph(
         [n for n in unreachable.nodes if n.fqname == "mod.dead_one"]
     ).copy()
     patch = generate_patch(one_only, tmp_path)
 
     assert "-def dead_one():" in patch
-    # The slice did not include dead_two, so that decl stays in the diff's
-    # post-image -- a downstream SCC pass would emit its own patch for it.
+    # The slice excludes dead_two, so the downstream SCC pass owns it.
     assert "-def dead_two():" not in patch

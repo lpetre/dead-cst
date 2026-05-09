@@ -585,7 +585,8 @@ def test_remove_no_dead_code_emits_no_patch(runner, project):
     assert (root / "mod.py").read_text() == original
 
 
-def test_remove_emits_patch_to_stdout_without_touching_files(runner, project):
+@pytest.mark.parametrize("output_to_file", [False, True], ids=["stdout", "output-file"])
+def test_remove_emits_patch_without_touching_files(runner, project, tmp_path, output_to_file):
     root = project(
         {
             "mod.py": """
@@ -600,48 +601,37 @@ def test_remove_emits_patch_to_stdout_without_touching_files(runner, project):
         }
     )
     original = (root / "mod.py").read_text()
-    result = runner.invoke(app, ["remove", str(root), "-e", "mod.used"])
-    assert result.exit_code == 0
-    # Source untouched -- this command never writes back.
-    assert (root / "mod.py").read_text() == original
-    # Patch headers are git-style so `git apply` accepts the diff.
-    assert "diff --git a/mod.py b/mod.py" in result.stdout
-    assert "--- a/mod.py" in result.stdout
-    assert "+++ b/mod.py" in result.stdout
-    assert "-def dead():" in result.stdout
-    # Hint goes to stderr so the patch piped on stdout stays clean.
-    assert "git apply" in result.stderr
 
+    args = ["remove", str(root), "-e", "mod.used"]
+    out: Path | None = None
+    if output_to_file:
+        out = tmp_path / "dead.patch"
+        args += ["-o", str(out)]
 
-def test_remove_writes_patch_to_output_file(runner, project, tmp_path):
-    root = project(
-        {
-            "mod.py": """
-            def used():
-                pass
-
-            def dead():
-                pass
-
-            used()
-            """,
-        }
-    )
-    original = (root / "mod.py").read_text()
-    out = tmp_path / "dead.patch"
-    result = runner.invoke(app, ["remove", str(root), "-e", "mod.used", "-o", str(out)])
+    result = runner.invoke(app, args)
     assert result.exit_code == 0
     assert (root / "mod.py").read_text() == original
-    # Stdout is empty when --output is set; the hint references the file.
-    assert result.stdout == ""
-    assert f"git apply {out}" in result.stderr
-    patch = out.read_text()
+
+    if out is not None:
+        patch = out.read_text()
+        assert result.stdout == ""
+        assert f"git apply {out}" in result.stderr
+    else:
+        patch = result.stdout
+        assert "git apply" in result.stderr
+
     assert "diff --git a/mod.py b/mod.py" in patch
+    assert "--- a/mod.py" in patch
+    assert "+++ b/mod.py" in patch
     assert "-def dead():" in patch
 
 
 def test_remove_patch_round_trips_through_git_apply(runner, project, tmp_path):
-    """End-to-end: produced patch applies cleanly with ``git apply``."""
+    """End-to-end: produced patch applies cleanly with ``git apply``.
+
+    Covers both the in-place-edit path (``mod.py``) and the file-deletion
+    path (``orphan.py`` is unreferenced and becomes a dead module).
+    """
     import shutil
     import subprocess
 
@@ -659,12 +649,14 @@ def test_remove_patch_round_trips_through_git_apply(runner, project, tmp_path):
 
             used()
             """,
+            "orphan.py": "def helper():\n    pass\n",
         }
     )
     subprocess.run(["git", "init", "-q"], cwd=root, check=True)
     subprocess.run(["git", "add", "."], cwd=root, check=True)
     result = runner.invoke(app, ["remove", str(root), "-e", "mod.used"])
     assert result.exit_code == 0
+    assert "deleted file mode" in result.stdout
 
     patch_path = tmp_path / "dead.patch"
     patch_path.write_text(result.stdout)
@@ -672,3 +664,4 @@ def test_remove_patch_round_trips_through_git_apply(runner, project, tmp_path):
     rewritten = (root / "mod.py").read_text()
     assert "def dead" not in rewritten
     assert "def used" in rewritten
+    assert not (root / "orphan.py").exists()

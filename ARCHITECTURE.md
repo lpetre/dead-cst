@@ -53,8 +53,8 @@ or before touching the visitor.
                              ▼
                 ┌────────────┴────────────┐
                 ▼                         ▼
-        reachability BFS         codemod (remove_code)
-        from entrypoint=True
+        reachability BFS         codemod (remove_code /
+        from entrypoint=True       generate_patch)
 ```
 
 The cache boundary is the line that matters most when reasoning about
@@ -279,6 +279,17 @@ The high-level entry point is `PackageView.remove_dead_code()`, which
 materializes the package's interesting-set closure, computes
 reachability, and feeds the unreachable subgraph into `remove_code`.
 
+`generate_patch(G, root)` is the non-destructive twin: same selection
+logic, same two-pass LibCST pipeline (a private `_rewrite_one` helper
+keeps the two functions from drifting), but instead of writing back it
+emits a `git apply`-compatible unified diff with `diff --git` headers
+and a `deleted file mode 100644` extended header for module-node
+deletions. Selection is driven entirely by `G.nodes`, so callers can
+slice the unreachable graph however they like (e.g. one SCC at a time)
+to review a big codebase as a series of focused patches. The
+`dead-cst remove` CLI uses `generate_patch` exclusively — it emits a
+patch to stdout (or `--output PATH`) and never mutates source.
+
 ## Lazy materialization on `Analysis`
 
 `Analysis` is cheap to construct — the resolver runs once at `__init__`,
@@ -338,6 +349,7 @@ entirely.
 | Keep alive symbols a framework registers dynamically     | new `EdgePlugin` under `contrib/`              |
 | Support a new project layout / lockfile                  | new `PathResolver` under `contrib/`            |
 | Change how cross-file imports get classified             | `_edges.resolve_edges` + the resolver fallback |
-| Change codemod output shape                              | `codemod.py` (`RemoveDeadSymbols`)             |
+| Change codemod output shape                              | `codemod.py` (`RemoveDeadSymbols` / `_rewrite_one`) |
+| Change patch format / per-SCC patch slicing              | `codemod.generate_patch`                       |
 
 See `CLAUDE.md` for the per-stage cache-invalidation discipline.

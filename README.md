@@ -12,7 +12,7 @@ Python dead code analysis using [libcst](https://github.com/Instagram/LibCST).
 
 `dead-cst` builds a full symbol graph of your Python codebase, walks from your entrypoints, and reports (or removes) anything unreachable.
 
-> **Pre-release software.** `dead-cst` is in early alpha. APIs, CLI flags, and output formats may change without notice, and bugs are expected. Do not run `dead-cst remove` against code that isn't committed to version control.
+> **Pre-release software.** `dead-cst` is in early alpha. APIs, CLI flags, and output formats may change without notice, and bugs are expected. `dead-cst remove` itself is non-destructive — it emits a patch to stdout — but apply the patch on a clean working tree so you can inspect (and easily revert) the result.
 
 ## Installation
 
@@ -35,8 +35,8 @@ dead-cst analyze ./src -e "re:.*__main__\.py"
 # See why a symbol is kept alive
 dead-cst why-alive ./src mypackage.some_module.some_function
 
-# Remove dead code (interactive confirmation)
-dead-cst remove ./src -e "re:.*__main__\.py"
+# Generate a patch that removes dead code, then apply it
+dead-cst remove ./src -e "re:.*__main__\.py" | git apply
 
 # List third-party dependencies imported by the codebase
 dead-cst dependencies ./src
@@ -122,10 +122,18 @@ dead-cst dependencies ROOT [OPTIONS]
 
 ### `dead-cst remove`
 
-Remove dead code from a Python codebase. Prompts for confirmation before modifying files.
+Emit a `git apply`-compatible unified diff that removes the dead code. The
+command never touches source files itself — pipe the patch into `git apply`
+(or write it to a file with `-o` and apply later).
 
 ```
 dead-cst remove ROOT -e ENTRYPOINT [OPTIONS]
+```
+
+```bash
+dead-cst remove ./src -e mypkg.__main__ | git apply
+# or
+dead-cst remove ./src -e mypkg.__main__ -o dead.patch && git apply dead.patch
 ```
 
 | Option | Description |
@@ -135,7 +143,7 @@ dead-cst remove ROOT -e ENTRYPOINT [OPTIONS]
 | `--resolver` | Path resolver to run, e.g. `uv` (mutually exclusive with `-p`) |
 | `--plugin` | Edge plugin to run, e.g. `main_block`, `project_scripts` (repeatable) |
 | `-v, --verbose` | Enable verbose logging |
-| `--dry-run` | Show what would be removed without making changes |
+| `-o, --output` | Write the patch to this file instead of stdout |
 | `--no-cache` | Bypass the per-file `VisitorPayload` cache |
 | `-j, --workers` | Run cache-miss visitor passes in this many worker processes (`>=2` enables it) |
 
@@ -179,6 +187,8 @@ pkg = analysis.package(root)
 print(sum(1 for _ in pkg.modules()), "modules")
 pkg.remove_dead_code()  # codemod, scoped to this package
 ```
+
+For non-destructive review, `dead_cst.codemod.generate_patch(G, root)` returns the same removal as a `git apply`-compatible unified diff. Selection is driven entirely by `G.nodes`, so you can pass any subgraph slice — e.g. one [strongly-connected component](https://networkx.org/documentation/stable/reference/algorithms/generated/networkx.algorithms.components.strongly_connected_components.html) at a time — to review a large codebase as a series of focused patches.
 
 `Analysis(...).materialize_all()` returns the full `networkx.MultiDiGraph` if you need raw access; `analysis.package(path).graph()` returns the closure-scoped subgraph for one package.
 
