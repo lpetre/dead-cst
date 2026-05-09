@@ -59,8 +59,15 @@ two versions.
   in the enclosing suite, so constant-folded early returns now flag
   trailing dead code as expected. Same handling applies to ``with``
   whose body terminates, and to ``try``/``except``/``finally`` where
-  every path terminates (or a ``finally`` itself terminates). Bumps
-  the detector's `version` so cached payloads rebuild.
+  every path terminates (or a ``finally`` itself terminates).
+- `TruthinessResolver` no longer folds a ``Name`` whose binding's RHS
+  is a mutable container literal (``[]``, ``{}``, ``set()``-shaped
+  comprehensions, etc.). The binding-only flow walk is invisible to
+  ``.append`` / item assignment / ``.update`` mutations, so an
+  ``edges = []; edges.append(x); if not edges:`` chain used to fold
+  ``edges`` to ``False`` and incorrectly mark the trailing code dead.
+  Tuples and primitive literals are immutable and stay safe to fold.
+  Bumps the detector's `version` so cached payloads rebuild.
 
 ### Changed
 - **Breaking:** `dead-cst remove` no longer modifies files in place. It

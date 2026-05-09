@@ -218,6 +218,22 @@ _PENDING: object = object()
 _MISSING: object = object()
 
 
+# Mutable container literals can change truthiness via ``.append`` /
+# item assignment / ``.update`` between binding and use, so the
+# binding-only flow walk would happily fold an ``edges = []`` to
+# ``False`` even when ``edges.append(...)`` runs in between. Refuse
+# to fold these through Name resolution; tuples and primitive literals
+# are immutable and stay safe.
+_MUTABLE_CONTAINER_LITERALS: tuple[type, ...] = (
+    cst.List,
+    cst.Set,
+    cst.Dict,
+    cst.ListComp,
+    cst.SetComp,
+    cst.DictComp,
+)
+
+
 def _constant_assignment_rhs(
     binding_node: cst.CSTNode,
     parent_map: Mapping[cst.CSTNode, cst.CSTNode],
@@ -276,6 +292,12 @@ class TruthinessResolver:
     the ``resolve_expr`` argument to :func:`unreachable_suites` /
     :func:`evaluate_truthiness`. The resolver is the supported way to
     get name-aware truthiness without re-implementing the flow walk.
+
+    ``Name`` resolution deliberately refuses to fold mutable container
+    literals (``[]``, ``{}``, comprehensions): the binding-only flow
+    walk can't see ``.append`` / item assignment / ``.update`` between
+    binding and use, so their truthiness is not preserved across the
+    lifetime of the binding. Tuples and primitive literals stay safe.
     """
 
     __slots__ = (
@@ -395,6 +417,8 @@ class TruthinessResolver:
             rhs = self._rhs_for(live_node)
             if rhs is None:
                 return None
+            if isinstance(rhs, _MUTABLE_CONTAINER_LITERALS):
+                return None
             v = self.evaluate(rhs)
             if v is None:
                 return None
@@ -497,7 +521,7 @@ class DefaultUnreachableRegionDetector:
     """
 
     name: str = "default"
-    version: int = 1778327222
+    version: int = 1778328362
 
     def resolve(self, expr: cst.BaseExpression) -> bool | None:
         """Hook for domain-specific constant folding. Default: defer.
