@@ -82,39 +82,40 @@ def _pair_targets(
                 yield from _pair_targets(te.value, rhs)
 
 
-# Per-line ``# noqa`` directive. ``noqa`` is case-insensitive; codes are
-# uppercase letter+digits. Bare ``# noqa`` (no code list) silences every
-# rule on the line, including F401.
-_NOQA_RE = re.compile(
-    r"#\s*noqa(?:\s*:\s*(?P<codes>[A-Z][0-9]+(?:\s*,\s*[A-Z][0-9]+)*))?",
-    re.IGNORECASE,
-)
-# File-level directive. Per ruff docs, the ``ruff:`` / ``flake8:`` prefix
-# is case-sensitive but ``noqa`` is not. Anywhere in the file is enough;
-# both spellings are accepted (``# flake8: noqa`` is a ruff-supported alias).
+# ruff/pyflakes ``noqa`` grammar shared between per-line and file-level
+# directives: optional ``: CODE[, CODE]*`` suffix where each code is an
+# uppercase letter followed by digits. Bare directives (no code list)
+# silence every rule including F401.
+_NOQA_CODES = r"[A-Z][0-9]+(?:\s*,\s*[A-Z][0-9]+)*"
+_NOQA_RE = re.compile(rf"#\s*noqa(?:\s*:\s*(?P<codes>{_NOQA_CODES}))?", re.IGNORECASE)
+# Per ruff docs, the ``ruff:`` / ``flake8:`` prefix is case-sensitive but
+# ``noqa`` is not; ``# flake8: noqa`` is accepted as a ruff-compat alias.
 _FILE_NOQA_RE = re.compile(
-    r"#\s*(?:ruff|flake8)\s*:\s*[Nn][Oo][Qq][Aa]"
-    r"(?:\s*:\s*(?P<codes>[A-Z][0-9]+(?:\s*,\s*[A-Z][0-9]+)*))?"
+    rf"#\s*(?:ruff|flake8)\s*:\s*[Nn][Oo][Qq][Aa](?:\s*:\s*(?P<codes>{_NOQA_CODES}))?"
 )
 
 
 def _silences_f401(comment_value: str, pattern: re.Pattern[str]) -> bool:
+    # Substring prefilter: ``visit_Comment`` runs on every comment in
+    # the file, so dodging the regex when ``noqa`` isn't present at all
+    # keeps comment-heavy files cheap.
+    if "noqa" not in comment_value.lower():
+        return False
     m = pattern.search(comment_value)
     if m is None:
         return False
     codes = m.group("codes")
     if codes is None:
-        # Bare directive silences every rule.
         return True
     return any(c.strip().upper() == "F401" for c in codes.split(","))
 
 
 class _ImportCommentCollector(cst.CSTVisitor):
-    """Collect every ``cst.Comment`` reachable from a node subtree.
+    """Collect every ``cst.Comment`` in the subtree.
 
-    Used to find every comment on the ``SimpleStatementLine`` that wraps
-    one ``import`` / ``from ... import`` so per-alias ``# noqa: F401``
-    can be matched against the alias's source line.
+    Used on the ``SimpleStatementLine`` wrapping an import statement so
+    per-alias ``# noqa: F401`` comments inside a parenthesized
+    ``from x import (a, b)`` can be matched against the alias's line.
     """
 
     def __init__(self) -> None:
@@ -210,13 +211,9 @@ class SymbolVisitor(cst.CSTVisitor):
         # any unresolved Name access whose ``.value`` matches a leaked
         # walrus target back to the corresponding decl.
         self.walrus_leak_targets: dict[str, list[SymbolNode]] = {}
-        # Imports flagged ``NodeFlags.ENTRYPOINT`` because their source
-        # line carries a ``# noqa[: ...F401...]`` directive (the same
-        # marker ruff/pyflakes use to keep an unused import alive).
-        # Populated in ``_add_import``; consumed in ``to_payload`` along
-        # with ``_file_pins_imports`` for file-level
-        # ``# ruff: noqa`` / ``# flake8: noqa`` directives, which pin
-        # every import in the file alive.
+        # Per-line ``# noqa[: ...F401...]`` pins; file-level
+        # ``# ruff: noqa`` / ``# flake8: noqa`` is collected separately
+        # because comments may precede the import statements they cover.
         self._pinned_imports: set[SymbolNode] = set()
         self._file_pins_imports: bool = False
 
@@ -428,9 +425,6 @@ class SymbolVisitor(cst.CSTVisitor):
         return lines
 
     def visit_Comment(self, node: cst.Comment) -> None:
-        # File-level ``# ruff: noqa`` / ``# flake8: noqa`` directives
-        # silence F401 across the whole module. We treat that as a signal
-        # to pin every import in the file alive.
         if not self._file_pins_imports and _silences_f401(node.value, _FILE_NOQA_RE):
             self._file_pins_imports = True
 
@@ -941,22 +935,13 @@ class SymbolVisitor(cst.CSTVisitor):
         nodes: list[SymbolNode] = []
         stack: list[SymbolTrie] = [self.trie]
 
-        # Compose the full set of imports that should gain ENTRYPOINT.
-        # Per-line pins are accumulated during the visit; file-level
-        # pins fan out to every live import in the trie.
-        pinned_imports: set[SymbolNode] = set(self._pinned_imports)
-        if self._file_pins_imports:
-            scan: list[SymbolTrie] = [self.trie]
-            while scan:
-                tnode = scan.pop()
-                for decls in tnode.declarations.values():
-                    for d in decls:
-                        if d.type == "import":
-                            pinned_imports.add(d)
-                scan.extend(tnode.children.values())
-
         # Fast path: nothing to flag, no remap needed.
-        if not self.shadowed_decls and not self.overload_decls and not pinned_imports:
+        if (
+            not self.shadowed_decls
+            and not self.overload_decls
+            and not self._pinned_imports
+            and not self._file_pins_imports
+        ):
             while stack:
                 tnode = stack.pop()
                 if tnode.module is not None:
@@ -977,19 +962,30 @@ class SymbolVisitor(cst.CSTVisitor):
         }
         for d in self.overload_decls:
             flag_map[d] = dataclasses.replace(d, flags=d.flags | NodeFlags.OVERLOAD)
-        for d in pinned_imports:
+
+        def pin_entrypoint(d: SymbolNode) -> None:
             existing = flag_map.get(d, d)
             flag_map[d] = dataclasses.replace(existing, flags=existing.flags | NodeFlags.ENTRYPOINT)
+
+        for d in self._pinned_imports:
+            pin_entrypoint(d)
 
         def remap(sym: SymbolNode) -> SymbolNode:
             return flag_map.get(sym, sym)
 
+        # Slow-path trie walk pulls double duty: file-level
+        # ``# ruff: noqa`` fans out into ENTRYPOINT pinning during the
+        # same pass that builds ``nodes``, so no separate scan.
+        file_pins = self._file_pins_imports
         while stack:
             tnode = stack.pop()
             if tnode.module is not None:
                 nodes.append(tnode.module)
             for decls in tnode.declarations.values():
-                nodes.extend(remap(d) for d in decls)
+                for d in decls:
+                    if file_pins and d.type == "import":
+                        pin_entrypoint(d)
+                    nodes.append(remap(d))
             stack.extend(tnode.children.values())
         nodes.extend(remap(d) for d in self.shadowed_decls)
         nodes.extend(remap(d) for d in self.overload_decls)
