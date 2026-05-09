@@ -324,6 +324,16 @@ entirely.
   type `"import"`. Local uses of an imported name go through the import
   node, which points at the upstream module / symbol. This is how
   `dead-cst remove` knows to drop now-unused imports.
+* Imports whose source line carries a ruff/pyflakes `# noqa` directive
+  that silences F401 (bare `# noqa`, `# noqa: F401`, multi-rule
+  `# noqa: E501, F401`, case-variant `# NOQA`) are flagged
+  `NodeFlags.ENTRYPOINT` so reachability keeps them alive — matching
+  ruff's own semantics. File-level `# ruff: noqa` and `# flake8: noqa`
+  directives (`ruff:` / `flake8:` matched case-sensitively per ruff;
+  `noqa` is not) pin every import in the file. The visitor scans for
+  these in `visit_Comment` plus a per-import-statement
+  `SimpleStatementLine` walk, so per-alias comments inside a
+  parenthesized `from x import (a, b)` are honored.
 * Submodules edge to their parent package, so `__init__.py` stays alive
   as long as anything in the package does.
 * `EdgeFlags.DEAD_BRANCH` is metadata only.

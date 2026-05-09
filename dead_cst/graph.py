@@ -37,7 +37,11 @@ class NodeFlags(enum.IntFlag):
     sets ``graph.nodes[node]["entrypoint"] = True`` when it sees the
     flag, so :func:`find_reachable` starts its BFS there. Plugins emit
     flagged synthetic nodes via their per-file payloads to declare
-    entrypoints without a separate API surface.
+    entrypoints without a separate API surface. The visitor also stamps
+    this flag on import nodes whose source line carries a ruff/pyflakes
+    ``# noqa`` directive that silences F401 (and on every import in a
+    file with a ``# ruff: noqa`` / ``# flake8: noqa`` directive), so
+    intentionally-preserved imports are not reported as dead.
 
     ``OVERLOAD`` flags a ``typing.overload`` stub (or any same-name
     displaced sibling). Excluded from the lookup trie like

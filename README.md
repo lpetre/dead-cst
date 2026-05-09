@@ -291,6 +291,8 @@ The graph has one node per top-level declaration plus a synthetic module node pe
 
 A module-level `import` / `from ... import ...` is itself a declaration of type `"import"` in the current module. Uses of the imported name inside the file are wired through that local import node, and the import node in turn points at the upstream module (and, when applicable, at the specific imported symbol). Removing the last local use therefore makes the import itself dead, which is how `dead-cst remove` knows to drop now-unused import lines.
 
+Imports whose source line carries a ruff/pyflakes `# noqa` directive that silences F401 (`# noqa`, `# noqa: F401`, multi-rule `# noqa: E501, F401`, case-variant `# NOQA`) are pinned alive. File-level `# ruff: noqa` and `# flake8: noqa` directives (`ruff:` / `flake8:` is matched case-sensitively per ruff; `noqa` is not) pin every import in the file. This matches ruff's own semantics: an import you have explicitly preserved (re-exports, side-effect imports, `TYPE_CHECKING` shims guarded by F401) is not surfaced as dead and `dead-cst remove` will not drop it.
+
 ## Scope
 
 `dead-cst` tracks top-level declarations only -- module-level functions, classes, and variables. Nested definitions (inner functions, methods, nested classes) are deliberately not given their own nodes; references made from inside those nested scopes are attributed to the enclosing top-level declaration. Keeping the containing top-level symbol alive keeps its nested source alive with it.
