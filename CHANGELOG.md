@@ -9,6 +9,23 @@ two versions.
 
 ## [Unreleased]
 
+### Added
+- The visitor now honors ruff/pyflakes ``# noqa`` directives that
+  silence F401 (unused-import). A per-line ``# noqa``,
+  ``# noqa: F401``, multi-rule ``# noqa: E501, F401``, or case-variant
+  ``# NOQA`` on the same source line as an import alias pins the
+  resulting import node alive (``NodeFlags.ENTRYPOINT``) so it is no
+  longer reported as dead. File-level directives -- ``# ruff: noqa``,
+  ``# ruff: noqa: F401``, and the ``# flake8: noqa`` aliases -- pin
+  every import in the file. The ``ruff:`` / ``flake8:`` prefix is
+  matched case-sensitively per ruff's documented behavior; the
+  ``noqa`` keyword is case-insensitive. Per-alias directives inside a
+  parenthesized ``from x import (a, b)`` pin only the alias on that
+  line. This brings dead-cst's unused-import semantics in line with
+  ruff: an import you have explicitly marked as intentionally
+  preserved (re-exports, side-effect imports, ``TYPE_CHECKING`` shims
+  guarded by F401) is no longer surfaced or removed.
+
 ## [0.7.0] - 2026-05-09
 
 ### Added

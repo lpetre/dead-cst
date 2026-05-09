@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import re
 from importlib.util import resolve_name
 from pathlib import Path
 from typing import Generator, Literal, cast
@@ -81,6 +82,49 @@ def _pair_targets(
                 yield from _pair_targets(te.value, rhs)
 
 
+# Per-line ``# noqa`` directive. ``noqa`` is case-insensitive; codes are
+# uppercase letter+digits. Bare ``# noqa`` (no code list) silences every
+# rule on the line, including F401.
+_NOQA_RE = re.compile(
+    r"#\s*noqa(?:\s*:\s*(?P<codes>[A-Z][0-9]+(?:\s*,\s*[A-Z][0-9]+)*))?",
+    re.IGNORECASE,
+)
+# File-level directive. Per ruff docs, the ``ruff:`` / ``flake8:`` prefix
+# is case-sensitive but ``noqa`` is not. Anywhere in the file is enough;
+# both spellings are accepted (``# flake8: noqa`` is a ruff-supported alias).
+_FILE_NOQA_RE = re.compile(
+    r"#\s*(?:ruff|flake8)\s*:\s*[Nn][Oo][Qq][Aa]"
+    r"(?:\s*:\s*(?P<codes>[A-Z][0-9]+(?:\s*,\s*[A-Z][0-9]+)*))?"
+)
+
+
+def _silences_f401(comment_value: str, pattern: re.Pattern[str]) -> bool:
+    m = pattern.search(comment_value)
+    if m is None:
+        return False
+    codes = m.group("codes")
+    if codes is None:
+        # Bare directive silences every rule.
+        return True
+    return any(c.strip().upper() == "F401" for c in codes.split(","))
+
+
+class _ImportCommentCollector(cst.CSTVisitor):
+    """Collect every ``cst.Comment`` reachable from a node subtree.
+
+    Used to find every comment on the ``SimpleStatementLine`` that wraps
+    one ``import`` / ``from ... import`` so per-alias ``# noqa: F401``
+    can be matched against the alias's source line.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.comments: list[cst.Comment] = []
+
+    def visit_Comment(self, node: cst.Comment) -> None:
+        self.comments.append(node)
+
+
 class SymbolVisitor(cst.CSTVisitor):
     METADATA_DEPENDENCIES = (
         FixedFullyQualifiedNameProvider,
@@ -99,7 +143,7 @@ class SymbolVisitor(cst.CSTVisitor):
     # edge-attribution rules, flow-analysis fixes, etc. Concurrent
     # bumps on different branches merge with ``max()`` semantics.
     name: str = "default"
-    version: int = 1778276692
+    version: int = 1778322938
 
     def _pos(self, node: cst.CSTNode):
         return self.get_metadata(PositionProvider, node, default=None)
@@ -166,6 +210,15 @@ class SymbolVisitor(cst.CSTVisitor):
         # any unresolved Name access whose ``.value`` matches a leaked
         # walrus target back to the corresponding decl.
         self.walrus_leak_targets: dict[str, list[SymbolNode]] = {}
+        # Imports flagged ``NodeFlags.ENTRYPOINT`` because their source
+        # line carries a ``# noqa[: ...F401...]`` directive (the same
+        # marker ruff/pyflakes use to keep an unused import alive).
+        # Populated in ``_add_import``; consumed in ``to_payload`` along
+        # with ``_file_pins_imports`` for file-level
+        # ``# ruff: noqa`` / ``# flake8: noqa`` directives, which pin
+        # every import in the file alive.
+        self._pinned_imports: set[SymbolNode] = set()
+        self._file_pins_imports: bool = False
 
     @property
     def module_node(self) -> SymbolNode:
@@ -301,6 +354,7 @@ class SymbolVisitor(cst.CSTVisitor):
         # ``visit_ImportFrom`` routes ``from X import *`` to ``_add_star_import``,
         # so by the time we get here ``names`` is always the alias sequence form.
         assert not isinstance(node.names, cst.ImportStar)
+        f401_lines = self._collect_f401_noqa_lines(node)
         for alias in reversed(node.names):
             alias_name = get_full_name_for_node(alias.name)
             # alias.name is always Name | Attribute, both of which produce a
@@ -335,17 +389,50 @@ class SymbolVisitor(cst.CSTVisitor):
                 decl_node = decl_node.value
 
             if current_decl and current_decl.type == "module":
+                alias_pos = self._pos(alias)
                 sym = SymbolNode(
                     f"{self.module_node.fqname}.{decl_node.value}",
                     "import",
                     self.path,
-                    self._pos(alias),
+                    alias_pos,
                     import_info,
                 )
                 self.symbol_referent_nodes[sym] = alias
                 self._push_decl(alias, sym)
+                if f401_lines and alias_pos is not None and alias_pos.start.line in f401_lines:
+                    self._pinned_imports.add(sym)
 
             self.import_edges.add((self.decl_stack[-1][-1], import_info, self._pos(alias)))
+
+    def _collect_f401_noqa_lines(self, node: cst.Import | cst.ImportFrom) -> set[int]:
+        """Source lines that carry a ``# noqa`` directive silencing F401.
+
+        Walks the entire ``SimpleStatementLine`` that wraps this import (so
+        inner per-alias comments inside a parenthesized ``from`` form are
+        seen too) and groups by line. Each alias's start line is later
+        checked against this set to decide whether to flag its import node
+        ``NodeFlags.ENTRYPOINT``.
+        """
+        parent = self.get_metadata(ParentNodeProvider, node, default=None)
+        if not isinstance(parent, cst.SimpleStatementLine):
+            return set()
+        collector = _ImportCommentCollector()
+        parent.visit(collector)
+        lines: set[int] = set()
+        for comment in collector.comments:
+            if not _silences_f401(comment.value, _NOQA_RE):
+                continue
+            pos = self._pos(comment)
+            if pos is not None:
+                lines.add(pos.start.line)
+        return lines
+
+    def visit_Comment(self, node: cst.Comment) -> None:
+        # File-level ``# ruff: noqa`` / ``# flake8: noqa`` directives
+        # silence F401 across the whole module. We treat that as a signal
+        # to pin every import in the file alive.
+        if not self._file_pins_imports and _silences_f401(node.value, _FILE_NOQA_RE):
+            self._file_pins_imports = True
 
     def visit_Module(self, node: cst.Module) -> None:
         assert not self.decl_stack, "Module node should be the first visited node"
@@ -845,14 +932,31 @@ class SymbolVisitor(cst.CSTVisitor):
 
         Decls in :attr:`shadowed_decls` and :attr:`overload_decls` are
         emitted as :data:`NodeFlags.SHADOWED` / :data:`NodeFlags.OVERLOAD`
-        flagged copies; edge endpoints pointing at them are remapped to
-        the flagged identity so the resulting graph stays consistent.
+        flagged copies; imports pinned by a ``# noqa[: ...F401...]``
+        directive (per-line or via a file-level ``# ruff: noqa`` /
+        ``# flake8: noqa``) gain :data:`NodeFlags.ENTRYPOINT`. Edge
+        endpoints pointing at any remapped node are rewritten to the
+        flagged identity so the resulting graph stays consistent.
         """
         nodes: list[SymbolNode] = []
         stack: list[SymbolTrie] = [self.trie]
 
+        # Compose the full set of imports that should gain ENTRYPOINT.
+        # Per-line pins are accumulated during the visit; file-level
+        # pins fan out to every live import in the trie.
+        pinned_imports: set[SymbolNode] = set(self._pinned_imports)
+        if self._file_pins_imports:
+            scan: list[SymbolTrie] = [self.trie]
+            while scan:
+                tnode = scan.pop()
+                for decls in tnode.declarations.values():
+                    for d in decls:
+                        if d.type == "import":
+                            pinned_imports.add(d)
+                scan.extend(tnode.children.values())
+
         # Fast path: nothing to flag, no remap needed.
-        if not self.shadowed_decls and not self.overload_decls:
+        if not self.shadowed_decls and not self.overload_decls and not pinned_imports:
             while stack:
                 tnode = stack.pop()
                 if tnode.module is not None:
@@ -873,6 +977,9 @@ class SymbolVisitor(cst.CSTVisitor):
         }
         for d in self.overload_decls:
             flag_map[d] = dataclasses.replace(d, flags=d.flags | NodeFlags.OVERLOAD)
+        for d in pinned_imports:
+            existing = flag_map.get(d, d)
+            flag_map[d] = dataclasses.replace(existing, flags=existing.flags | NodeFlags.ENTRYPOINT)
 
         def remap(sym: SymbolNode) -> SymbolNode:
             return flag_map.get(sym, sym)
