@@ -86,13 +86,17 @@ same run.
 
 ### 7. `dead-cst preview` (graph-clustered patches)
 
-Peer subcommand to `analyze` / `remove` that renders item 3's codemod as
-per-cluster unified diffs instead of editing files. Clusters are weakly-
-connected components of the unreachable subgraph: each WCC is the maximal
-unit that can be applied atomically without leaving dangling references.
-Cluster headers carry blast-radius metadata (symbols, LOC, files affected).
-Composes with `git apply` (whole cluster) and `git add -p` (per-line review)
-without needing a custom TUI; see item 11 for the deferred TUI shape.
+`dead-cst remove` already emits a `git apply`-compatible unified diff
+(see "Recently shipped"), and `dead_cst.codemod.generate_patch(G, root)`
+slices on whatever subgraph you hand it — so per-cluster patches are
+already a one-liner from the Python API. The remaining work for the
+peer subcommand is automatic clustering (weakly-connected components of
+the unreachable subgraph, each the maximal unit applicable atomically
+without leaving dangling references), cluster headers carrying
+blast-radius metadata (symbols, LOC, files affected), and folding in
+item 3's suite-removal output once that lands. Composes with `git apply`
+(whole cluster) and `git add -p` (per-line review) without needing a
+custom TUI; see item 11 for the deferred TUI shape.
 
 ### 8. Cross-file trivial-return folding
 
@@ -151,6 +155,16 @@ demand.
 
 Folded down from earlier tiers as they landed:
 
+- **Unreleased**: `dead-cst remove` is now non-destructive — it emits a
+  `git apply`-compatible unified diff to stdout (or `--output PATH`)
+  and never touches source files. The `--dry-run` flag and the
+  confirmation prompt are gone. New public function
+  `dead_cst.codemod.generate_patch(G, root)` returns the same diff for
+  any subgraph slice, so callers can render per-SCC (or per-WCC)
+  patches by passing `G.subgraph(scc)` for incremental review of large
+  codebases. This lays the foundation for the `dead-cst preview`
+  subcommand in tier 7 — automatic WCC clustering and blast-radius
+  headers are the remaining work.
 - **v0.7.0**: `DefaultUnreachableRegionDetector` rewrite — the
   `fold_constants` fixpoint pre-pass is replaced by the goal-directed
   `TruthinessResolver`, which lazily walks only the binding slices a

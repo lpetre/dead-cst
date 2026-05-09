@@ -51,7 +51,7 @@ EXPECTED_PUBLIC_API: dict[str, list[str]] = {
         "compute_fingerprint",
         "default_cache_path",
     ],
-    "dead_cst.codemod": ["remove_code"],
+    "dead_cst.codemod": ["generate_patch", "remove_code"],
     "dead_cst.graph": [
         "EdgeFlags",
         "Import",

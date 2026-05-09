@@ -25,6 +25,23 @@ two versions.
   ruff: an import you have explicitly marked as intentionally
   preserved (re-exports, side-effect imports, ``TYPE_CHECKING`` shims
   guarded by F401) is no longer surfaced or removed.
+- `dead_cst.codemod.generate_patch(G, root)` returns the same removal
+  as `remove_code` as a `git apply`-compatible unified diff (with
+  `diff --git` headers and `deleted file mode 100644` for module
+  deletions) instead of writing in place. Selection is driven entirely
+  by `G.nodes`, so callers can slice the unreachable graph (e.g.
+  `G.subgraph(scc)` for one SCC at a time) to review a big codebase as
+  a series of focused patches.
+
+### Changed
+- **Breaking:** `dead-cst remove` no longer modifies files in place. It
+  now emits a unified diff to stdout (or to `--output PATH`) and exits;
+  apply with `dead-cst remove . | git apply` (or `git apply <path>` if
+  you used `--output`). The `--dry-run` flag and the
+  `Proceed with removal? [y/N]` confirmation prompt are gone -- the
+  command is non-destructive by construction. The "Building symbol
+  graph" banner, the "No dead code found." message, and the apply hint
+  go to stderr so the patch on stdout stays clean.
 
 ## [0.7.0] - 2026-05-09
 
