@@ -119,7 +119,7 @@ def test_analysis_method_returns_strict_diff(make_analysis, write_files):
         }
     )
     analysis = make_analysis(plugins=[PytestPlugin()])
-    blast = analysis.kept_alive_by_tests_only()
+    blast = analysis.kept_alive_by_flags_only(NodeFlags.TESTCASE)
     fqnames = {n.fqname for n in blast}
     assert "pkg.lib.helper" in fqnames
 
@@ -139,7 +139,7 @@ def test_package_view_kept_alive_by_tests_only(make_analysis, write_files):
     )
     analysis = make_analysis(plugins=[PytestPlugin()])
     package_path = analysis.packages[0].path
-    blast = analysis.package(package_path).kept_alive_by_tests_only()
+    blast = analysis.package(package_path).kept_alive_by_flags_only(NodeFlags.TESTCASE)
     fqnames = {n.fqname for n in blast}
     assert "pkg.lib.helper" in fqnames
     # Filtered to nodes under this package.

@@ -218,9 +218,11 @@ def _find_kept_alive_by_flags_only(graph: nx.MultiDiGraph, flags: NodeFlags) -> 
 
     ``_find_reachable(graph) -`` :func:`_find_reachable_excluding(graph, flags)`;
     the difference is the "blast radius" of dropping every entrypoint with
-    any of those flag bits. Surfaced on :class:`Analysis` /
-    :class:`PackageView` as ``kept_alive_by_tests_only`` (``TESTCASE``)
-    and ``kept_alive_by_noqa_only`` (``NOQA``).
+    any of those flag bits. Surfaced on :class:`Analysis` and
+    :class:`PackageView` as ``kept_alive_by_flags_only(flags)`` -- pass
+    :data:`NodeFlags.TESTCASE` for "blast radius of dropping the test
+    suite", :data:`NodeFlags.NOQA` for "blast radius of removing every
+    F401 pin", or both ORed together.
     """
     return _find_reachable(graph) - _find_reachable_excluding(graph, flags)
 
@@ -591,41 +593,29 @@ class Analysis:
         g = self.materialize_all()
         return _find_reachable(g) - _find_reachable_strict(g)
 
-    def kept_alive_by_tests_only(self) -> set[SymbolNode]:
-        """Symbols that would become unreachable if the test suite were dropped.
+    def kept_alive_by_flags_only(self, flags: NodeFlags) -> set[SymbolNode]:
+        """Symbols reachable only from entrypoints carrying any of ``flags``.
 
-        Computed as ``reachable() -`` BFS that excludes every
-        entrypoint tagged :data:`NodeFlags.TESTCASE` (today: pytest
-        and unittest discovery seeds). The resulting set is the
-        "blast radius" of removing tests -- production code that is
-        currently kept alive *only* because tests still exercise it.
+        Computed as ``reachable() -`` BFS that excludes every entrypoint
+        whose flags intersect the argument. The resulting set is the
+        "blast radius" of dropping every entrypoint with any of those
+        flag bits. The default :meth:`reachable` traversal is
+        unchanged; this is the opt-in stricter pass.
 
-        Used by tooling that reports "if you deleted your tests, these
-        symbols would also become dead." The default :meth:`reachable`
-        traversal is unchanged; this is the opt-in stricter pass.
+        Common flag arguments:
+
+        * :data:`NodeFlags.TESTCASE` -- "if you deleted your tests,
+          these symbols would also become dead" (pytest / unittest
+          discovery seeds).
+        * :data:`NodeFlags.NOQA` -- "if I removed every
+          ``# noqa: F401`` pin, what would actually become dead?"
+          (imports the visitor preserved because of a per-line or
+          file-level ruff/pyflakes directive).
+        * ``NodeFlags.TESTCASE | NodeFlags.NOQA`` -- combine in one
+          pass.
         """
         g = self.materialize_all()
-        return _find_kept_alive_by_flags_only(g, NodeFlags.TESTCASE)
-
-    def kept_alive_by_noqa_only(self) -> set[SymbolNode]:
-        """Symbols that would become unreachable if every F401 ``# noqa`` pin were dropped.
-
-        Computed as ``reachable() -`` BFS that excludes every
-        entrypoint tagged :data:`NodeFlags.NOQA` (the visitor stamps this
-        on imports whose source line carries a ruff/pyflakes
-        ``# noqa[: ...F401...]`` directive, plus on every import in a
-        file with a ``# ruff: noqa`` / ``# flake8: noqa`` directive). The
-        resulting set is the "blast radius" of removing every preserved
-        import: modules and decls currently kept alive *only* because a
-        side-effect import or re-export pin reaches them.
-
-        Used by tooling that audits old noqa pins -- "if I removed every
-        ``# noqa: F401``, what would actually become dead?". The default
-        :meth:`reachable` traversal is unchanged; this is the opt-in
-        stricter pass.
-        """
-        g = self.materialize_all()
-        return _find_kept_alive_by_flags_only(g, NodeFlags.NOQA)
+        return _find_kept_alive_by_flags_only(g, flags)
 
     def count_nodes(self, prefix: Path | None = None) -> dict[str, int]:
         """Count nodes in the full graph by ``SymbolNode.type``.
@@ -790,24 +780,15 @@ class PackageView:
         diff = _find_reachable(g) - _find_reachable_strict(g)
         return {n for n in diff if n.path.is_relative_to(self._package.path)}
 
-    def kept_alive_by_tests_only(self) -> set[SymbolNode]:
-        """Decls in this package kept alive only by ``TESTCASE`` entrypoints.
+    def kept_alive_by_flags_only(self, flags: NodeFlags) -> set[SymbolNode]:
+        """Decls in this package kept alive only by entrypoints carrying any of ``flags``.
 
-        Closure-scoped equivalent of :meth:`Analysis.kept_alive_by_tests_only`,
-        filtered to nodes under :attr:`path`.
+        Closure-scoped equivalent of :meth:`Analysis.kept_alive_by_flags_only`,
+        filtered to nodes under :attr:`path`. See that method for the
+        common flag arguments (``TESTCASE``, ``NOQA``, or both).
         """
         g = self._analysis.materialize_closure(self._package.path)
-        diff = _find_kept_alive_by_flags_only(g, NodeFlags.TESTCASE)
-        return {n for n in diff if n.path.is_relative_to(self._package.path)}
-
-    def kept_alive_by_noqa_only(self) -> set[SymbolNode]:
-        """Decls in this package kept alive only by ``NOQA``-pinned imports.
-
-        Closure-scoped equivalent of :meth:`Analysis.kept_alive_by_noqa_only`,
-        filtered to nodes under :attr:`path`.
-        """
-        g = self._analysis.materialize_closure(self._package.path)
-        diff = _find_kept_alive_by_flags_only(g, NodeFlags.NOQA)
+        diff = _find_kept_alive_by_flags_only(g, flags)
         return {n for n in diff if n.path.is_relative_to(self._package.path)}
 
     def count_nodes(self) -> dict[str, int]:

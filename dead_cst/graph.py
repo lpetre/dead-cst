@@ -47,18 +47,17 @@ class NodeFlags(enum.IntFlag):
 
     ``TESTCASE`` tags an entrypoint as test-only (pytest / unittest
     discovery seeds, fixture seeds, etc.). It is metadata on top of
-    ``ENTRYPOINT`` -- default :func:`find_reachable` treats those
-    seeds the same as any other entrypoint -- and powers the opt-in
-    :func:`find_kept_alive_by_tests_only` query, which returns the
-    "blast radius" of dropping the test suite.
+    ``ENTRYPOINT``: default :func:`find_reachable` treats those seeds
+    the same as any other entrypoint, but the opt-in
+    ``Analysis.kept_alive_by_flags_only(NodeFlags.TESTCASE)`` query
+    returns the "blast radius" of dropping the test suite.
 
     ``NOQA`` tags an entrypoint as preserved by an explicit user
     directive -- today, an import whose source line carries a
     ruff/pyflakes ``# noqa[: ...F401...]`` (or whose file carries a
-    ``# ruff: noqa`` / ``# flake8: noqa``). It is metadata on top of
-    ``ENTRYPOINT`` -- default :func:`find_reachable` treats those
-    seeds the same as any other entrypoint -- and powers the opt-in
-    :func:`find_kept_alive_by_noqa_only` query, which returns the
+    ``# ruff: noqa`` / ``# flake8: noqa``). Like ``TESTCASE`` it is
+    metadata on top of ``ENTRYPOINT``, queried via
+    ``Analysis.kept_alive_by_flags_only(NodeFlags.NOQA)`` for the
     "blast radius" of removing every F401-pinned import.
     """
 

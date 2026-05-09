@@ -262,11 +262,15 @@ BFS from every node with `entrypoint=True`. Default traversal **does**
 follow `DEAD_BRANCH` edges (preserving today's behavior).
 `Analysis.kept_alive_by_dead_branches()` is the opt-in inverse, returning
 the blast radius of removing every dead suite by skipping those edges.
-`Analysis.kept_alive_by_tests_only()` / the per-package `PackageView`
-twin returns the blast radius of dropping the test suite — production
-code currently kept alive only because tests still touch it
-(`PytestPlugin` and `UnittestPlugin` stamp `ENTRYPOINT | TESTCASE` on
-their seeds).
+`Analysis.kept_alive_by_flags_only(flags)` / the per-package
+`PackageView` twin returns the blast radius of dropping every
+entrypoint carrying any of those flag bits. Pass `NodeFlags.TESTCASE`
+for "production code currently kept alive only because tests still
+touch it" (`PytestPlugin` / `UnittestPlugin` stamp `ENTRYPOINT |
+TESTCASE`); pass `NodeFlags.NOQA` for "decls kept alive only by an
+F401 pin" (the visitor stamps `ENTRYPOINT | NOQA` on imports
+preserved by a per-line or file-level ruff/pyflakes directive); OR
+the bits to combine.
 
 ### 8. Codemod — `dead_cst/codemod.py`
 
@@ -335,8 +339,9 @@ entirely.
   per-import-statement `SimpleStatementLine` walk, so per-alias
   comments inside a parenthesized `from x import (a, b)` are honored.
   The `NOQA` bit is metadata layered on `ENTRYPOINT` (parallel to
-  `TESTCASE`); it powers the opt-in `kept_alive_by_noqa_only` query,
-  which returns the blast radius of dropping every F401 pin.
+  `TESTCASE`); the single `kept_alive_by_flags_only(flags)` method on
+  `Analysis` / `PackageView` takes either flag (or both ORed) to
+  return the blast radius of dropping the matching entrypoints.
 * Submodules edge to their parent package, so `__init__.py` stays alive
   as long as anything in the package does.
 * `EdgeFlags.DEAD_BRANCH` is metadata only.

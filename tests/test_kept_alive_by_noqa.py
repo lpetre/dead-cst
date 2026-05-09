@@ -129,7 +129,7 @@ def test_excluding_multiple_flags_in_one_pass(make_analysis, write_files):
     assert side not in excluded
 
 
-def test_analysis_kept_alive_by_noqa_only_method(make_analysis, write_files):
+def test_analysis_kept_alive_by_flags_only_noqa(make_analysis, write_files):
     write_files(
         {
             "pkg/__init__.py": """
@@ -139,12 +139,12 @@ def test_analysis_kept_alive_by_noqa_only_method(make_analysis, write_files):
         }
     )
     analysis = make_analysis()
-    diff = analysis.kept_alive_by_noqa_only()
+    diff = analysis.kept_alive_by_flags_only(NodeFlags.NOQA)
     fqnames = {n.fqname for n in diff}
     assert "pkg.side_effect" in fqnames
 
 
-def test_packageview_kept_alive_by_noqa_only_filters_to_package(make_analysis, write_files):
+def test_packageview_kept_alive_by_flags_only_noqa_filters_to_package(make_analysis, write_files):
     write_files(
         {
             "pkg/__init__.py": """
@@ -155,6 +155,6 @@ def test_packageview_kept_alive_by_noqa_only_filters_to_package(make_analysis, w
     )
     analysis = make_analysis()
     (view,) = analysis.views()
-    diff = view.kept_alive_by_noqa_only()
+    diff = view.kept_alive_by_flags_only(NodeFlags.NOQA)
     assert {n.fqname for n in diff} >= {"pkg.side_effect"}
     assert all(n.path.is_relative_to(view.path) for n in diff)
