@@ -9,6 +9,8 @@ two versions.
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-05-11
+
 ### Fixed
 - `resolve_edges` no longer spins forever on cyclic re-exports. The
   worklist DFS now carries a per-walk `visited` set keyed on
