@@ -155,6 +155,45 @@ demand.
 
 Folded down from earlier tiers as they landed:
 
+- **v0.9.0**: Parallel refresh (``--workers >= 2``) is now resilient and
+  observable. Worker results stream via ``concurrent.futures.as_completed``
+  instead of ``pool.map``, so cache writes and progress ticks land in
+  completion order and a single slow file no longer blocks the cache from
+  warming with the fast files behind it. Per-task failures are collected
+  and re-raised as one ``ExceptionGroup`` after every other task finishes
+  (successfully-parsed files are still cache-warmed before the group is
+  raised, so a re-run after fixing the bad file only re-parses what
+  failed). The pool installs SIGTERM/SIGINT handlers for the lifetime of
+  the run; on signal it cancels every pending future and raises
+  ``KeyboardInterrupt``, with completed files still cache-warmed.
+- **v0.9.0**: Progress reporting is fully logger-driven and controlled by
+  the root logger level. Per-file refresh status goes through
+  ``logger.debug`` on ``dead_cst._refresh``; off-TTY decile checkpoints
+  go through ``logger.info`` on ``dead_cst._progress``; the on-TTY tqdm
+  bar wraps its iteration in ``logging_redirect_tqdm`` so concurrent log
+  records print above the bar without shattering it. ``dead-cst -v``
+  keeps its meaning; library users get the same firehose by configuring
+  their root logger.
+- **v0.9.0**: ``SymbolNode`` and ``Import`` pre-compute their hash in
+  ``__post_init__`` and store it in a private ``_hash`` slot, so
+  ``__hash__`` is a single attribute read. Cuts edge-stitching time on
+  large multi-package workspaces where ``resolve_edges._emit`` re-hashes
+  the same ``(src, dst, flags)`` tuples into its dedup set, and pays off
+  again every time a ``SymbolNode`` is hashed by networkx (graph
+  insertion, BFS traversal). ``SCHEMA_VERSION`` bumped to 3 so cache
+  rows pickled before the slot existed are invalidated on first use.
+- **v0.9.0**: Edge stitching no longer emits a spurious "Failed to
+  resolve import module: <name>" warning for stdlib imports
+  (``import datetime``, ``from pathlib import Path``); the orphaned
+  warning fired for every successfully-classified stdlib import because
+  the silent-drop and speculative-miss branches both returned ``None``.
+  Truly-unresolved non-speculative imports already surface as
+  ``[unresolved] <top-level>`` synthetic nodes.
+  ``default_resolve_import`` also now falls back to the parent module
+  when a dotted name can't be resolved directly, so
+  ``collections.abc``, ``importlib.resources.abc``, and similar
+  synthesized-in-``__init__`` submodules classify as ``[stdlib] <name>``
+  instead of being misfiled as ``[unresolved] <top>``.
 - **v0.8.0**: `dead-cst remove` is now non-destructive — it emits a
   `git apply`-compatible unified diff to stdout (or `--output PATH`)
   and never touches source files (breaking; `--dry-run` and the
