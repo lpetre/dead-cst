@@ -111,12 +111,9 @@ class Import:
     decl: str | None = None
     star: bool = False
     speculative: bool = False
-    # Pre-computed hash. ``resolve_edges`` hashes ``(src, dst, flags)`` on
-    # every emission and an ``Import`` participates in ``SymbolNode``'s hash,
-    # so this gets re-hashed thousands of times per analysis on large
-    # workspaces. Computing eagerly in ``__post_init__`` keeps ``__hash__``
-    # to a single attribute read; the slot is fed into ``SCHEMA_VERSION``
-    # so old cache rows are invalidated.
+    # Memoized: ``resolve_edges._emit`` probes ``(src, dst, flags)`` once
+    # per emission and ``SymbolNode.__hash__`` recurses into this, so the
+    # same instance gets re-hashed many times per analysis.
     _hash: int = field(init=False, compare=False, hash=False, repr=False)
 
     def __post_init__(self) -> None:
