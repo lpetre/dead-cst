@@ -26,6 +26,15 @@ two versions.
   ``pool.shutdown(wait=False, cancel_futures=True)``, restores the
   prior handlers, and raises ``KeyboardInterrupt``. Files that
   completed before the signal stay cache-warmed.
+- `SymbolNode` and `Import` now memoize their `__hash__` in a private
+  `_hash` slot. The instances are frozen so the result is stable;
+  hashing them goes from "walk six fields (and a nested `Import`) per
+  call" to a cached int load. Cuts edge-stitching time on large
+  multi-package workspaces where `resolve_edges._emit` re-hashes the
+  same `(src, dst, flags)` tuples into its dedup set. Cache entries
+  pickled before this change still load correctly -- the slot is
+  populated lazily on first hash via a `try`/`except AttributeError`
+  fallback, so no `SCHEMA_VERSION` bump is required.
 
 ### Added
 - ``dead-cst -v`` now prints one ``[i/N] ok|FAILED <file>`` line per
@@ -33,6 +42,21 @@ two versions.
   reporter for the duration of the refresh). New ``Analysis(...,
   verbose=True)`` library knob threads through to
   ``process_stale_files`` to opt in.
+
+### Fixed
+- Stdlib imports no longer emit a spurious ``Failed to resolve import
+  module: <name>`` warning during edge stitching. The orphaned warning
+  in ``_edges._emit_external`` fired for every successfully-classified
+  stdlib import (``import datetime`` / ``from pathlib import Path`` / …)
+  because the silent-drop and speculative-miss branches both returned
+  ``None``; the warning is removed since no legitimate path reached it
+  -- truly-unresolved non-speculative imports already surface as
+  ``[unresolved] <top-level>`` synthetic nodes.
+- ``default_resolve_import`` now falls back to the parent module when a
+  dotted name can't be resolved directly, so ``collections.abc``,
+  ``importlib.resources.abc``, and similar synthesized-in-``__init__``
+  submodules classify as ``[stdlib] <name>`` instead of being misfiled
+  as ``[unresolved] <top>``.
 
 ## [0.8.0] - 2026-05-09
 

@@ -103,13 +103,32 @@ class Import:
     ``__import__(name, fromlist=[...])`` / ``importlib.import_module``
     fromlist entries that may or may not be submodules. The stitcher
     silently drops a speculative entry when neither the trie nor the
-    resolver can place it; non-speculative imports warn instead.
+    resolver can place it; non-speculative misses are surfaced as
+    ``[unresolved] <top-level>`` synthetic nodes instead.
     """
 
     module: str
     decl: str | None = None
     star: bool = False
     speculative: bool = False
+    # Lazily-populated hash cache. The instance is frozen so the hash
+    # is stable; recomputing it on every set/dict lookup shows up in
+    # ``resolve_edges`` profiles on large workspaces. The ``__hash__``
+    # read is wrapped in ``try``/``except AttributeError`` (rather than
+    # ``if self._hash is None``) so instances unpickled from caches
+    # written before this slot existed still hash correctly -- they
+    # get the slot populated on first read.
+    _hash: int | None = field(init=False, default=None, compare=False, hash=False, repr=False)
+
+    def __hash__(self) -> int:
+        try:
+            cached = self._hash
+        except AttributeError:
+            cached = None
+        if cached is None:
+            cached = hash((self.module, self.decl, self.star, self.speculative))
+            object.__setattr__(self, "_hash", cached)
+        return cached
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,6 +139,22 @@ class SymbolNode:
     position: CodeRange
     imports: Import | None = None
     flags: NodeFlags = NodeFlags.NONE
+    # See ``Import._hash`` for the rationale; ``_edges._emit`` hashes
+    # ``(src, dst, flags)`` once per emitted edge, so the same node
+    # instance gets re-hashed many times per analysis.
+    _hash: int | None = field(init=False, default=None, compare=False, hash=False, repr=False)
+
+    def __hash__(self) -> int:
+        try:
+            cached = self._hash
+        except AttributeError:
+            cached = None
+        if cached is None:
+            cached = hash(
+                (self.fqname, self.type, self.path, self.position, self.imports, self.flags)
+            )
+            object.__setattr__(self, "_hash", cached)
+        return cached
 
 
 @dataclass(frozen=True, slots=True)
