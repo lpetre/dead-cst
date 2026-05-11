@@ -110,6 +110,22 @@ class Import:
     decl: str | None = None
     star: bool = False
     speculative: bool = False
+    # Lazily-populated hash cache. The instance is frozen so the hash
+    # is stable; recomputing it on every set/dict lookup shows up in
+    # ``resolve_edges`` profiles on large workspaces.
+    _hash: int | None = field(init=False, default=None, compare=False, hash=False, repr=False)
+
+    def __hash__(self) -> int:
+        try:
+            cached = self._hash
+        except AttributeError:
+            # Older pickled instances predate the ``_hash`` slot; treat
+            # them as uncomputed and stash the result on first read.
+            cached = None
+        if cached is None:
+            cached = hash((self.module, self.decl, self.star, self.speculative))
+            object.__setattr__(self, "_hash", cached)
+        return cached
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,6 +136,22 @@ class SymbolNode:
     position: CodeRange
     imports: Import | None = None
     flags: NodeFlags = NodeFlags.NONE
+    # See ``Import._hash`` for the rationale; ``_edges._emit`` hashes
+    # ``(src, dst, flags)`` once per emitted edge, so the same node
+    # instance gets re-hashed many times per analysis.
+    _hash: int | None = field(init=False, default=None, compare=False, hash=False, repr=False)
+
+    def __hash__(self) -> int:
+        try:
+            cached = self._hash
+        except AttributeError:
+            cached = None
+        if cached is None:
+            cached = hash(
+                (self.fqname, self.type, self.path, self.position, self.imports, self.flags)
+            )
+            object.__setattr__(self, "_hash", cached)
+        return cached
 
 
 @dataclass(frozen=True, slots=True)
