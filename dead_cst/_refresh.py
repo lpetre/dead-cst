@@ -23,7 +23,7 @@ package's :class:`Package` and the shared cache / detector / plugins.
 from __future__ import annotations
 
 import logging
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Sequence
@@ -191,6 +191,14 @@ def process_stale_files(
     opt-in (``workers >= 2`` and at least two tasks); below that, the
     in-process path avoids pool startup cost.
 
+    The pool branch submits every task up-front and consumes results
+    via :func:`as_completed`, so cache writes and progress ticks land
+    in completion order -- a single slow file no longer blocks the
+    cache from warming with the fast files behind it. Tasks are still
+    *submitted* in :func:`build_stale_tasks` order, so the per-package
+    contiguity invariant downstream consumers rely on is preserved
+    even though completion order is non-deterministic.
+
     Cache writes happen on the main process as each payload arrives,
     so a partial run still warms the cache for files that completed.
     Files ``_process_one_file`` could not even read off disk return
@@ -198,6 +206,14 @@ def process_stale_files(
     caller -- so the warning re-fires next run. Files that *parse*
     fail come back as an ``[unparseable]`` synthetic payload and ride
     the cache like any other miss.
+
+    Exception handling: ``_process_one_file`` already absorbs the
+    expected :class:`OSError` / :class:`libcst.ParserSyntaxError` cases
+    in-band (returning ``None`` / an unparseable payload). Anything
+    else propagating out of a worker is a real bug; we log the failing
+    file (which ``pool.map`` would otherwise lose in the iterator
+    teardown) and re-raise so the analysis aborts loudly rather than
+    silently producing a partial graph.
     """
     if not tasks:
         return {}
@@ -219,12 +235,19 @@ def process_stale_files(
             initializer=_init_worker,
             initargs=(detector, tuple(plugins)),
         ) as pool:
-            for file, payload in progress(
-                pool.map(_worker_process_task, tasks),
-                total=len(tasks),
+            futures = {pool.submit(_worker_process_task, task): task for task in tasks}
+            for future in progress(
+                as_completed(futures),
+                total=len(futures),
                 desc="Parsing files",
                 unit="file",
             ):
+                task = futures[future]
+                try:
+                    file, payload = future.result()
+                except Exception:
+                    logger.error("Worker failed processing %s", task.file)
+                    raise
                 _record(file, payload)
         return out
 

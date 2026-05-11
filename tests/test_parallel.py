@@ -224,12 +224,14 @@ def test_multi_base_parallel_matches_serial(tmp_path, make_analysis):
 
 
 def test_tasks_sorted_by_package(tmp_path, make_analysis, monkeypatch):
-    """Worker tasks are sorted by ``(package_path, file)`` so each package's files are contiguous.
+    """Worker tasks are submitted ``(package_path, file)``-sorted so each package's files are contiguous.
 
     The visitor pass no longer touches ``sys.path``, so task order is
     purely an aesthetic / determinism concern -- but keeping
     same-package files adjacent stays readable in logs and stable across
-    runs.
+    runs. ``as_completed`` reorders results by completion, so we assert
+    on submission order via the ``submit`` spy rather than the consumer
+    iterator.
     """
     base_a = tmp_path / "a"
     base_b = tmp_path / "b"
@@ -252,23 +254,23 @@ def test_tasks_sorted_by_package(tmp_path, make_analysis, monkeypatch):
 
     from dead_cst import _refresh
 
-    captured: list = []
-    real_map = _refresh.ProcessPoolExecutor.map  # bound on the class
+    submitted: list = []
+    real_submit = _refresh.ProcessPoolExecutor.submit  # bound on the class
 
-    def _spy_map(self, fn, iterable, *args, **kwargs):
-        materialized = list(iterable)
-        captured.append([t.package.path for t in materialized])
-        return real_map(self, fn, materialized, *args, **kwargs)
+    def _spy_submit(self, fn, *args, **kwargs):
+        # First positional arg is the StaleFile task.
+        if args:
+            submitted.append(args[0].package.path)
+        return real_submit(self, fn, *args, **kwargs)
 
-    monkeypatch.setattr(_refresh.ProcessPoolExecutor, "map", _spy_map)
+    monkeypatch.setattr(_refresh.ProcessPoolExecutor, "submit", _spy_submit)
     make_analysis(["a", "b"], workers=2).materialize_all()
 
-    assert len(captured) == 1
-    package_paths = captured[0]
-    runs = [package_paths[0]]
-    for p in package_paths[1:]:
+    assert submitted, "expected at least one task submitted to the pool"
+    runs = [submitted[0]]
+    for p in submitted[1:]:
         if p != runs[-1]:
             runs.append(p)
     assert len(runs) == len(set(runs)), (
-        f"expected each package's tasks contiguous, got order {package_paths!r}"
+        f"expected each package's tasks contiguous, got order {submitted!r}"
     )

@@ -9,6 +9,17 @@ two versions.
 
 ## [Unreleased]
 
+### Changed
+- The parallel refresh pool (``--workers >= 2``) now drains worker
+  results via ``concurrent.futures.as_completed`` instead of
+  ``pool.map``. Cache writes and progress ticks land in completion
+  order, so a single slow file no longer blocks the cache from warming
+  with the fast files behind it. Tasks are still submitted in
+  ``(package_path, file)`` order so same-package work stays contiguous.
+  Unexpected exceptions raised by a worker now log the offending file
+  path before propagating, instead of being lost in ``pool.map``'s
+  iterator teardown.
+
 ## [0.8.0] - 2026-05-09
 
 ### Added
