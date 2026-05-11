@@ -176,11 +176,9 @@ def resolve_edges(
     ) -> Generator[tuple[SymbolNode, SymbolNode, EdgeFlags], None, None]:
         synth_fqname = _classify_external(imp, import_resolver, search_paths)
         if synth_fqname is None:
-            if not imp.speculative:
-                if imp.star:
-                    logger.warning("Failed to resolve star import: 'from %s import *'", imp.module)
-                else:
-                    logger.warning("Failed to resolve import module: %s", imp.module)
+            # A ``None`` here means stdlib (silent-drop) or a speculative
+            # miss the visitor synthesized -- never something worth warning
+            # about. ``_classify_external`` already filtered those.
             return
         yield from _emit(src, _synth(synth_fqname), flags)
 

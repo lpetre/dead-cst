@@ -305,9 +305,25 @@ def default_resolve_import(name: str, search_paths: list[Path]) -> str | Path | 
     their own layout-specific lookups, or replace it entirely.
     """
     spec = safe_resolve_module(name)
-    if spec is None:
-        return None
-    if spec.origin is None:
+    if spec is None or spec.origin is None:
+        # ``collections.abc``, ``importlib.resources.abc`` and friends are
+        # synthesized in their parent's ``__init__.py`` (``from
+        # _collections_abc import *``) and can't be located by a static
+        # ``find_spec``. Fall back to the parent: if it resolves to a
+        # stdlib / external classification, the child inherits it.
+        if "." in name:
+            parent_classification = default_resolve_import(name.rsplit(".", 1)[0], search_paths)
+            if isinstance(parent_classification, str) and parent_classification.startswith(
+                (STDLIB_PREFIX, EXTERNAL_DIST_PREFIX, EXTERNAL_FILE_PREFIX)
+            ):
+                prefix = parent_classification.split("] ", 1)[0] + "] "
+                tail = parent_classification.split("] ", 1)[1]
+                # For dist / file the synthetic-node key is the dist /
+                # top-level name -- keep the parent's tail verbatim so
+                # children collapse onto the same node.
+                if prefix == STDLIB_PREFIX:
+                    return f"{STDLIB_PREFIX}{name}"
+                return f"{prefix}{tail}"
         return None
     if spec.origin in {"built-in", "frozen"}:
         return f"{STDLIB_PREFIX}{name}"
