@@ -575,6 +575,49 @@ def test_unresolved_import_emits_synthetic_silently(build_decl_graph, caplog):
     )
 
 
+def test_cyclic_reexport_terminates(build_decl_graph, assert_edges):
+    """Re-export cycle (``A.x: from B import x``, ``B.x: from A import x``) terminates.
+
+    Before cycle protection in ``resolve_edges``, the worklist DFS
+    spun forever following ``A.x -> B.x -> A.x -> ...``. The fix adds
+    a per-walk ``visited`` set keyed on ``(id(SymbolTrie), parts)`` so
+    each state is processed at most once; the still-emitted decls
+    along the cycle remain in the graph.
+    """
+    graph = build_decl_graph(
+        {
+            "A.py": "from B import x",
+            "B.py": "from A import x",
+            "main.py": "from A import x\nx()",
+        }
+    )
+
+    # Both legs of the cycle are emitted (one trip around terminates
+    # the walk via the visited check) and the importer still reaches
+    # both intermediate re-export nodes.
+    assert_edges(
+        graph,
+        {
+            "A.x -> A",
+            "A.x -> A.x",
+            "A.x -> B",
+            "A.x -> B.x",
+            "B.x -> A",
+            "B.x -> A.x",
+            "B.x -> B",
+            "B.x -> B.x",
+            "main -> A",
+            "main -> A.x",
+            "main -> B.x",
+            "main -> main.x",
+            "main.x -> A",
+            "main.x -> A.x",
+            "main.x -> B.x",
+            "main.x -> main",
+        },
+    )
+
+
 def test_cross_dep_submodule_import(tmp_path, make_analysis, assert_edges):
     """Importing a submodule from a dep base resolves through the dep's exported trie.
 

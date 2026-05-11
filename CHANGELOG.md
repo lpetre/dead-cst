@@ -9,6 +9,29 @@ two versions.
 
 ## [Unreleased]
 
+### Fixed
+- `resolve_edges` no longer spins forever on cyclic re-exports. The
+  worklist DFS now carries a per-walk `visited` set keyed on
+  `(id(SymbolTrie), parts_tail)`, so a pathological pair like
+  `A.x: from B import x` / `B.x: from A import x` terminates after one
+  trip around the cycle instead of repeatedly chaining back to its
+  starting state. The decls actually encountered along the cycle are
+  still emitted, so first-party reachability through the chain is
+  preserved.
+
+### Changed
+- `resolve_edges` now memoizes the re-export DFS by
+  `(start_node, decl_parts)` and the external-classification fallback
+  by `(import.module, import.speculative)`. The walk's output depends
+  only on the trie state, so N importers traversing the same chain now
+  share one walk (and one resolver hit per unique external name)
+  instead of redoing each step per importer. On large multi-package
+  workspaces where one big package's edge contribution dominates
+  composition (the case `compute_fingerprint` / hash precomputation
+  helped on but did not change the algorithmic shape of), this turns
+  the per-package compose loop's growth in importer count from
+  multiplicative to additive.
+
 ## [0.9.0] - 2026-05-11
 
 ### Changed
