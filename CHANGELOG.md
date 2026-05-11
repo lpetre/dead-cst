@@ -20,17 +20,21 @@ two versions.
   preserved.
 
 ### Changed
-- `resolve_edges` now memoizes the re-export DFS by
-  `(start_node, decl_parts)` and the external-classification fallback
-  by `(import.module, import.speculative)`. The walk's output depends
-  only on the trie state, so N importers traversing the same chain now
-  share one walk (and one resolver hit per unique external name)
-  instead of redoing each step per importer. On large multi-package
-  workspaces where one big package's edge contribution dominates
-  composition (the case `compute_fingerprint` / hash precomputation
-  helped on but did not change the algorithmic shape of), this turns
-  the per-package compose loop's growth in importer count from
-  multiplicative to additive.
+- `resolve_edges` now memoizes the full per-import resolution at three
+  layers: ``_resolve_targets`` keyed by ``Import`` value (so equal
+  spellings across files share the precomputed dst list — the visitor
+  builds fresh ``Import`` objects per file, but they hash equal because
+  ``Import`` is frozen with an eager ``__hash__``); ``_walk`` keyed by
+  ``(start_node, decl_parts)`` (so different ``Import`` shapes that
+  canonicalize to the same trie state share the re-export DFS); and
+  ``_classify`` keyed by ``(import.module, import.speculative)`` (so
+  the resolver runs once per unique external name). The per-src loop
+  collapses to ``for dst in cached_targets: emit(...)``. On large
+  multi-package workspaces where one big package's edge contribution
+  dominates composition (the case `compute_fingerprint` / hash
+  precomputation helped on but did not change the algorithmic shape
+  of), this turns the per-package compose loop's growth in importer
+  count from multiplicative to additive.
 
 ## [0.9.0] - 2026-05-11
 

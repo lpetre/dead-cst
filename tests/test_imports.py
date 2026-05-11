@@ -578,11 +578,9 @@ def test_unresolved_import_emits_synthetic_silently(build_decl_graph, caplog):
 def test_cyclic_reexport_terminates(build_decl_graph, assert_edges):
     """Re-export cycle (``A.x: from B import x``, ``B.x: from A import x``) terminates.
 
-    Before cycle protection in ``resolve_edges``, the worklist DFS
-    spun forever following ``A.x -> B.x -> A.x -> ...``. The fix adds
-    a per-walk ``visited`` set keyed on ``(id(SymbolTrie), parts)`` so
-    each state is processed at most once; the still-emitted decls
-    along the cycle remain in the graph.
+    Before the per-walk ``visited`` set in ``_walk``, this DFS spun
+    forever; the still-emitted decls along the cycle remain in the
+    graph.
     """
     graph = build_decl_graph(
         {
@@ -592,9 +590,6 @@ def test_cyclic_reexport_terminates(build_decl_graph, assert_edges):
         }
     )
 
-    # Both legs of the cycle are emitted (one trip around terminates
-    # the walk via the visited check) and the importer still reaches
-    # both intermediate re-export nodes.
     assert_edges(
         graph,
         {
