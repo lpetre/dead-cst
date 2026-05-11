@@ -135,31 +135,44 @@ def resolve_edges(
     purely trie-driven. The default resolver + empty search paths
     suffice for tests; the analyzer wires its configured resolver
     through here.
+
+    Resolution is memoized at three nested layers so the per-package
+    compose loop's growth in importer count is additive rather than
+    multiplicative. Equal-spelling :class:`Import` instances (the
+    visitor produces fresh objects per file) share one
+    :func:`_resolve_targets` entry; different :class:`Import` shapes
+    that canonicalize to the same trie state share one ``_walk``
+    entry; the re-export DFS itself is cycle-protected so a
+    pathological pair like ``A.x: from B import x`` /
+    ``B.x: from A import x`` terminates after one trip instead of
+    spinning.
     """
     if search_paths is None:
         search_paths = []
 
     emitted: set[tuple[SymbolNode, SymbolNode, EdgeFlags]] = set()
-    # Per-call memos: imports get canonicalized once (re-exports walk
-    # the same ``decl.imports`` repeatedly) and each synthetic fqname
-    # produces one ``SymbolNode`` regardless of how many edges land
-    # on it.
-    canon_memo: dict[int, tuple[Import, SymbolTrie | None]] = {}
     synthetic_memo: dict[str, SymbolNode] = {}
-
-    def _canon(imp: Import) -> tuple[Import, SymbolTrie | None]:
-        iid = id(imp)
-        result = canon_memo.get(iid)
-        if result is None:
-            result = _canonicalize(imp, symbol_lookup)
-            canon_memo[iid] = result
-        return result
+    external_memo: dict[tuple[str, bool], SymbolNode | None] = {}
+    # ``id(SymbolTrie)`` is safe as a key here: each trie node is held
+    # alive for the call by ``symbol_lookup``'s child chain, so id
+    # reuse is impossible inside one ``resolve_edges`` invocation.
+    walk_memo: dict[tuple[int, tuple[str, ...]], tuple[SymbolNode, ...]] = {}
+    target_memo: dict[Import, tuple[SymbolNode, ...]] = {}
 
     def _synth(fqname: str) -> SymbolNode:
         node = synthetic_memo.get(fqname)
         if node is None:
             node = synthetic_node(fqname, package_path)
             synthetic_memo[fqname] = node
+        return node
+
+    def _classify(imp: Import) -> SymbolNode | None:
+        key = (imp.module, imp.speculative)
+        if key in external_memo:
+            return external_memo[key]
+        synth_fqname = _classify_external(imp, import_resolver, search_paths)
+        node = _synth(synth_fqname) if synth_fqname is not None else None
+        external_memo[key] = node
         return node
 
     def _emit(
@@ -171,97 +184,107 @@ def resolve_edges(
         emitted.add(key)
         yield key
 
-    def _emit_external(
-        src: SymbolNode, imp: Import, flags: EdgeFlags
-    ) -> Generator[tuple[SymbolNode, SymbolNode, EdgeFlags], None, None]:
-        synth_fqname = _classify_external(imp, import_resolver, search_paths)
-        if synth_fqname is None:
-            return
-        yield from _emit(src, _synth(synth_fqname), flags)
+    def _walk(start_node: SymbolTrie, parts: tuple[str, ...]) -> tuple[SymbolNode, ...]:
+        cache_key = (id(start_node), parts)
+        cached = walk_memo.get(cache_key)
+        if cached is not None:
+            return cached
+        # Caller (``_resolve_targets``) only invokes ``_walk`` for trie
+        # nodes that already passed the ``node.module is None`` gate.
+        assert start_node.module is not None
+        results: list[SymbolNode] = []
+        worklist: list[tuple[SymbolTrie, tuple[str, ...]]] = [(start_node, parts)]
+        # ``visited`` breaks re-export cycles by gating every push;
+        # the per-walk scope means the still-emitted decls along the
+        # cycle remain correct.
+        visited: set[tuple[int, tuple[str, ...]]] = {cache_key}
 
-    for src, raw, flags in import_edges:
-        dst, node = _canon(raw)
-        if node is None or node.module is None:
-            yield from _emit_external(src, dst, flags)
-            continue
+        def _enqueue(target: SymbolTrie, next_parts: tuple[str, ...]) -> None:
+            state = (id(target), next_parts)
+            if state in visited:
+                return
+            visited.add(state)
+            worklist.append((target, next_parts))
 
-        yield from _emit(src, node.module, flags)
-
-        # Star import: fan out to every top-level declaration in the target module
-        if dst.star:
-            for decls in node.declarations.values():
-                for decl in decls:
-                    yield from _emit(src, decl, flags)
-            continue
-
-        # No decl? the edge points at a module
-        if not dst.decl:
-            continue
-
-        # Resolve the access to the deepest declaration(s) we can find.
-        # ``node.declarations[name]`` may have multiple entries when each
-        # branch of a conditional binds the same name (``if X: from a
-        # import f else: from b import f``); each one is a separate
-        # continuation, so the walk is a small DFS.
-        worklist: list[tuple[SymbolTrie, list[str]]] = [(node, dst.decl.split("."))]
         while worklist:
-            cur, parts = worklist.pop()
-            if not parts:
+            cur, parts_now = worklist.pop()
+            if not parts_now:
                 continue
-            part = parts[0]
+            part = parts_now[0]
 
             decls = cur.declarations.get(part, [])
             if decls:
                 for decl in decls:
-                    yield from _emit(src, decl, flags)
-
-                    # Concrete decl terminates this continuation;
-                    # trailing attrs like ``.build`` are ignored.
-                    # ``type_alias`` (PEP 695 ``type X = ...``) is a
-                    # concrete declaration, not an import re-export.
-                    if decl.type in {"function", "class", "variable", "type_alias"}:
+                    results.append(decl)
+                    # Only ``import`` decls re-export; concrete decls terminate.
+                    if decl.type != "import":
                         continue
-
-                    # Import re-export: follow it without advancing
-                    # ``parts`` so the remaining attrs resolve in the
-                    # destination module.
-                    assert decl.type == "import"
                     assert decl.imports is not None, "import symbol needs Import"
 
-                    # Canonicalize the re-export against the lookup
-                    # before chasing it -- the visitor captured it raw
-                    # too, so ``Import(module="p", decl="functions")``
-                    # needs to flatten to ``module="p.functions"``
-                    # before we walk on. ``_canon`` memoizes per
-                    # unique ``Import`` so chains revisited via
-                    # parallel re-exports stay cheap.
-                    chained, dest = _canon(decl.imports)
+                    chained, dest = _canonicalize(decl.imports, symbol_lookup)
                     if dest is None or dest.module is None:
-                        yield from _emit_external(src, chained, flags)
+                        ext = _classify(chained)
+                        if ext is not None:
+                            results.append(ext)
                         continue
 
-                    next_parts = parts[1:]
+                    next_parts: tuple[str, ...] = parts_now[1:]
                     if chained.decl:
-                        next_parts = chained.decl.split(".") + next_parts
-                    worklist.append((dest, next_parts))
+                        next_parts = (*chained.decl.split("."), *next_parts)
+                    _enqueue(dest, next_parts)
                 continue
 
-            # Maybe ``part`` is a submodule under the current package/module.
-            # Don't emit the intermediate-module edge here -- canonicalize
-            # already pushed every decl prefix that resolves as a submodule
-            # into ``Import.module``, so any submodule we still hit during
-            # the walk only matters for reaching its descendants.
+            # Submodule descent: don't emit the intermediate-module
+            # edge -- canonicalize already pushed every decl prefix
+            # that resolves as a submodule into ``Import.module``.
             if child := cur.children.get(part):
-                worklist.append((child, parts[1:]))
+                _enqueue(child, parts_now[1:])
                 continue
 
             logger.warning(
                 "Failed to resolve import edge: %s + %s via %s in %s",
-                dst.module,
-                dst.decl,
+                start_node.module.fqname,
+                ".".join(parts),
                 part,
                 cur.module.fqname if cur.module else "<no module>",
             )
+        out = tuple(results)
+        walk_memo[cache_key] = out
+        return out
+
+    def _resolve_targets(raw: Import) -> tuple[SymbolNode, ...]:
+        """Unique dst SymbolNodes a ``raw`` Import contributes, by value.
+
+        ``Import`` is frozen with an eager ``__hash__``, so equal
+        spellings across files (the visitor builds fresh objects per
+        file) collapse to one cache entry. The result is pre-deduped
+        so the per-src ``_emit`` loop stays short.
+        """
+        cached = target_memo.get(raw)
+        if cached is not None:
+            return cached
+        dst, node = _canonicalize(raw, symbol_lookup)
+        targets: dict[SymbolNode, None] = {}
+        if node is None or node.module is None:
+            ext = _classify(dst)
+            if ext is not None:
+                targets[ext] = None
+        else:
+            targets[node.module] = None
+            if dst.star:
+                for decls in node.declarations.values():
+                    for decl in decls:
+                        targets[decl] = None
+            elif dst.decl:
+                for n in _walk(node, tuple(dst.decl.split("."))):
+                    targets[n] = None
+        out = tuple(targets)
+        target_memo[raw] = out
+        return out
+
+    for src, raw, flags in import_edges:
+        for dst_node in _resolve_targets(raw):
+            yield from _emit(src, dst_node, flags)
 
 
 # Keep these re-exports stable for callers that historically reached

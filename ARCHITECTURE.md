@@ -242,6 +242,18 @@ Re-running this every analysis is what makes single-file edits cheap:
 only the edited file's payload is recomputed; importers re-stitch for
 free.
 
+Resolution is memoized at three nested layers per call so the per-
+package compose loop stays additive in importer count: equal-spelling
+`Import` instances (the visitor builds fresh objects per file but they
+hash equal because `Import` is frozen) share one `_resolve_targets`
+entry; different `Import` shapes that canonicalize to the same trie
+state share one `_walk` entry; and the resolver fallback runs once per
+unique `(module, speculative)` external. The walk's worklist DFS is
+cycle-protected via a per-walk `visited` set keyed on
+`(id(SymbolTrie), parts_tail)`, so a pathological re-export cycle
+(`A.x: from B import x` / `B.x: from A import x`) terminates after one
+trip with the encountered decls still emitted.
+
 ### 6. Plugins — `dead_cst/plugins/`
 
 Two phases per `EdgePlugin`:
