@@ -216,9 +216,17 @@ place that reads `sys.path` and the resolver LRU caches.
 `(path, *deps)` view before composing it and clears the resolver caches
 at every transition, restoring `sys.path` on the way out.
 
+Stdlib imports drop silently — they aren't surfaced as graph nodes.
+External-dist / external-file / unresolved misses produce one synthetic
+node per group so plugins can still answer "which files imported X?".
+A dotted name whose own `find_spec` returns nothing (`collections.abc`
+and friends, synthesized in their parent's `__init__`) falls back to
+the parent's classification, so the child inherits stdlib / dist
+attribution instead of being misfiled as `[unresolved]`.
+
 Star imports follow the same path; `Import.speculative` (set on
-`__import__` fromlist synthesis) silences the warning when both the
-trie and resolver miss.
+`__import__` fromlist synthesis) drops a trie+resolver miss without
+emitting an `[unresolved]` node.
 
 Re-running this every analysis is what makes single-file edits cheap:
 only the edited file's payload is recomputed; importers re-stitch for

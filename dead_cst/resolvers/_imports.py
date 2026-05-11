@@ -282,6 +282,12 @@ def default_resolve_import(name: str, search_paths: list[Path]) -> str | Path | 
       the project (collapsed into one synthetic node per group);
     * ``None`` when the importlib finders can't locate ``name`` at all.
 
+    A dotted name whose own ``find_spec`` returns nothing (``collections.abc``
+    and friends, synthesized in their parent's ``__init__.py``) inherits
+    its parent's classification — the child collapses onto the parent's
+    synthetic node for dist / file, or gets its own ``[stdlib] <name>``
+    entry for stdlib.
+
     Classification precedence (first match wins):
 
     1. ``distribution_lookup`` -- the resolved path appears in an
@@ -307,23 +313,18 @@ def default_resolve_import(name: str, search_paths: list[Path]) -> str | Path | 
     spec = safe_resolve_module(name)
     if spec is None or spec.origin is None:
         # ``collections.abc``, ``importlib.resources.abc`` and friends are
-        # synthesized in their parent's ``__init__.py`` (``from
-        # _collections_abc import *``) and can't be located by a static
-        # ``find_spec``. Fall back to the parent: if it resolves to a
-        # stdlib / external classification, the child inherits it.
+        # synthesized in their parent's ``__init__.py`` and can't be
+        # located by a static ``find_spec``. Fall back to the parent: if
+        # it classifies, the child inherits.
         if "." in name:
-            parent_classification = default_resolve_import(name.rsplit(".", 1)[0], search_paths)
-            if isinstance(parent_classification, str) and parent_classification.startswith(
-                (STDLIB_PREFIX, EXTERNAL_DIST_PREFIX, EXTERNAL_FILE_PREFIX)
-            ):
-                prefix = parent_classification.split("] ", 1)[0] + "] "
-                tail = parent_classification.split("] ", 1)[1]
-                # For dist / file the synthetic-node key is the dist /
-                # top-level name -- keep the parent's tail verbatim so
-                # children collapse onto the same node.
-                if prefix == STDLIB_PREFIX:
+            parent = default_resolve_import(name.rsplit(".", 1)[0], search_paths)
+            if isinstance(parent, str):
+                if parent.startswith(STDLIB_PREFIX):
                     return f"{STDLIB_PREFIX}{name}"
-                return f"{prefix}{tail}"
+                # Dist / file synthetic-node keys are the dist / top-level
+                # name -- children collapse onto the parent's node.
+                if parent.startswith((EXTERNAL_DIST_PREFIX, EXTERNAL_FILE_PREFIX)):
+                    return parent
         return None
     if spec.origin in {"built-in", "frozen"}:
         return f"{STDLIB_PREFIX}{name}"
