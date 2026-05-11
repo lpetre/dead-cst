@@ -216,10 +216,7 @@ def resolve_edges(
             if decls:
                 for decl in decls:
                     results.append(decl)
-                    # Only ``import`` decls re-export through the
-                    # chain; concrete decls (function / class /
-                    # variable / type_alias) terminate this
-                    # continuation.
+                    # Only ``import`` decls re-export; concrete decls terminate.
                     if decl.type != "import":
                         continue
                     assert decl.imports is not None, "import symbol needs Import"
@@ -246,7 +243,7 @@ def resolve_edges(
 
             logger.warning(
                 "Failed to resolve import edge: %s + %s via %s in %s",
-                start_node.module.fqname,  # caller guarantees non-None
+                start_node.module.fqname,
                 ".".join(parts),
                 part,
                 cur.module.fqname if cur.module else "<no module>",
@@ -267,28 +264,20 @@ def resolve_edges(
         if cached is not None:
             return cached
         dst, node = _canonicalize(raw, symbol_lookup)
-        seen: set[SymbolNode] = set()
-        targets: list[SymbolNode] = []
-
-        def _add(n: SymbolNode) -> None:
-            if n not in seen:
-                seen.add(n)
-                targets.append(n)
-
+        targets: dict[SymbolNode, None] = {}
         if node is None or node.module is None:
             ext = _classify(dst)
             if ext is not None:
-                _add(ext)
+                targets[ext] = None
         else:
-            _add(node.module)
+            targets[node.module] = None
             if dst.star:
-                # Fan out to every top-level declaration in the target module.
                 for decls in node.declarations.values():
                     for decl in decls:
-                        _add(decl)
+                        targets[decl] = None
             elif dst.decl:
                 for n in _walk(node, tuple(dst.decl.split("."))):
-                    _add(n)
+                    targets[n] = None
         out = tuple(targets)
         target_memo[raw] = out
         return out

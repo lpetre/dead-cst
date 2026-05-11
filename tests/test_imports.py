@@ -576,12 +576,7 @@ def test_unresolved_import_emits_synthetic_silently(build_decl_graph, caplog):
 
 
 def test_cyclic_reexport_terminates(build_decl_graph, assert_edges):
-    """Re-export cycle (``A.x: from B import x``, ``B.x: from A import x``) terminates.
-
-    Before the per-walk ``visited`` set in ``_walk``, this DFS spun
-    forever; the still-emitted decls along the cycle remain in the
-    graph.
-    """
+    """Re-export cycle (``A.x: from B import x``, ``B.x: from A import x``) terminates with both legs emitted."""
     graph = build_decl_graph(
         {
             "A.py": "from B import x",
