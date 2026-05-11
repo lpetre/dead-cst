@@ -292,6 +292,7 @@ class Analysis:
         cache: GraphCache | None = None,
         unreachable_detector: UnreachableRegionDetector | None = None,
         workers: int | None = None,
+        verbose: bool = False,
     ) -> None:
         self._project_root: Path = project_root
         validated = _validate_packages(resolver.resolve(project_root))
@@ -314,6 +315,7 @@ class Analysis:
         self._plugins: tuple[EdgePlugin, ...] = tuple(plugins)
         self._cache = cache
         self._workers = workers
+        self._verbose = verbose
         self._import_resolver: ImportResolver = resolver.resolve_import
         self._detector: UnreachableRegionDetector = (
             unreachable_detector
@@ -444,6 +446,7 @@ class Analysis:
             cache=self._cache,
             fingerprint=self._fingerprint,
             workers=self._workers,
+            verbose=self._verbose,
         )
 
         for path in new_targets:
@@ -568,6 +571,7 @@ class Analysis:
             cache=None,
             fingerprint=self._fingerprint,
             workers=self._workers,
+            verbose=self._verbose,
         )
 
     def materialize_with(

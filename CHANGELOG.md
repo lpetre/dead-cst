@@ -16,9 +16,23 @@ two versions.
   order, so a single slow file no longer blocks the cache from warming
   with the fast files behind it. Tasks are still submitted in
   ``(package_path, file)`` order so same-package work stays contiguous.
-  Unexpected exceptions raised by a worker now log the offending file
-  path before propagating, instead of being lost in ``pool.map``'s
-  iterator teardown.
+- Refresh now collects per-task failures and raises a single
+  ``ExceptionGroup`` after every other task has finished, instead of
+  aborting on the first error. Successfully-parsed files are still
+  cache-warmed before the group is raised, so a re-run after fixing
+  the bad file only re-parses what failed.
+- The pool branch installs SIGTERM / SIGINT handlers for the lifetime
+  of the run; on signal it cancels every still-pending future, calls
+  ``pool.shutdown(wait=False, cancel_futures=True)``, restores the
+  prior handlers, and raises ``KeyboardInterrupt``. Files that
+  completed before the signal stay cache-warmed.
+
+### Added
+- ``dead-cst -v`` now prints one ``[i/N] ok|FAILED <file>`` line per
+  refresh completion to stderr (replacing the tqdm / decile progress
+  reporter for the duration of the refresh). New ``Analysis(...,
+  verbose=True)`` library knob threads through to
+  ``process_stale_files`` to opt in.
 
 ## [0.8.0] - 2026-05-09
 
