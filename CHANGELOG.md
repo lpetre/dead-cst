@@ -9,6 +9,17 @@ two versions.
 
 ## [Unreleased]
 
+### Changed
+- `SymbolNode` and `Import` now memoize their `__hash__` in a private
+  `_hash` slot. The instances are frozen so the result is stable;
+  hashing them goes from "walk six fields (and a nested `Import`) per
+  call" to a cached int load. Cuts edge-stitching time on large
+  multi-package workspaces where `resolve_edges._emit` re-hashes the
+  same `(src, dst, flags)` tuples into its dedup set. Cache entries
+  pickled before this change still load correctly -- the slot is
+  populated lazily on first hash via a `try`/`except AttributeError`
+  fallback, so no `SCHEMA_VERSION` bump is required.
+
 ### Fixed
 - Stdlib imports no longer emit a spurious ``Failed to resolve import
   module: <name>`` warning during edge stitching. The orphaned warning
