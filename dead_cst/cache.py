@@ -68,7 +68,7 @@ CACHE_DB_NAME = "cache.db"
 # mismatch on open drops ``file_cache`` so older databases from sibling
 # installs (or pre-per-base-fingerprint releases) are wiped on first
 # use even at the same package version.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def default_cache_path(project_root: Path) -> Path:

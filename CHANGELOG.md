@@ -26,16 +26,15 @@ two versions.
   ``pool.shutdown(wait=False, cancel_futures=True)``, restores the
   prior handlers, and raises ``KeyboardInterrupt``. Files that
   completed before the signal stay cache-warmed.
-- `SymbolNode` and `Import` now memoize their `__hash__` in a private
-  `_hash` slot. The instances are frozen so the result is stable;
-  hashing them goes from "walk six fields (and a nested `Import`) per
-  call" to a cached int load. Cuts edge-stitching time on large
-  multi-package workspaces where `resolve_edges._emit` re-hashes the
-  same `(src, dst, flags)` tuples into its dedup set. Cache entries
-  pickled before this change still load correctly -- the slot is
-  populated lazily on first hash via a `try`/`except AttributeError`
-  fallback, so no `SCHEMA_VERSION` bump is required.
-
+- `SymbolNode` and `Import` now pre-compute their hash in
+  `__post_init__` and store it in a private `_hash` slot; `__hash__`
+  becomes a single attribute read. The instances are frozen so the
+  result is stable. Cuts edge-stitching time on large multi-package
+  workspaces where `resolve_edges._emit` re-hashes the same
+  `(src, dst, flags)` tuples into its dedup set, and pays off again
+  every time a `SymbolNode` is hashed by networkx (graph insertion,
+  BFS traversal). `SCHEMA_VERSION` is bumped to 3 so cache rows
+  pickled before the slot existed are invalidated on first use.
 - Progress reporting is fully logger-driven and controlled by the root
   logger level. Per-file refresh status ``[i/N] ok|FAILED <file>`` goes
   through ``logger.debug`` on ``dead_cst._refresh``; off-TTY decile
