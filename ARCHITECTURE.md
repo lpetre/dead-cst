@@ -193,7 +193,17 @@ per-file work logs a warning and substitutes a placeholder payload
 pairing the real module node with a `[unparseable] <module>` synthetic
 flagged `ENTRYPOINT` — the file stays alive in reachability and rides
 the per-file cache like any other miss, so a fresh source SHA picks
-up the fix automatically.
+up the fix automatically. The pool consumes worker results via
+`concurrent.futures.as_completed`, so cache writes land in completion
+order — a single slow file does not block the cache from warming with
+the fast files behind it. Per-task failures other than the in-band
+`OSError` / parse cases are collected and re-raised as a single
+`ExceptionGroup` after the run drains, so one bad file does not waste
+the rest of the work; successful payloads are cache-warmed before the
+group is raised. The pool installs SIGTERM/SIGINT handlers for its
+lifetime, so a signal cancels pending futures and re-raises
+`KeyboardInterrupt`; files that completed before the signal stay
+cache-warmed.
 
 ### 5. Edge stitching — `dead_cst/_edges.py`
 
