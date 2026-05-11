@@ -35,7 +35,6 @@ two versions.
   every time a `SymbolNode` is hashed by networkx (graph insertion,
   BFS traversal). `SCHEMA_VERSION` is bumped to 3 so cache rows
   pickled before the slot existed are invalidated on first use.
-
 - Progress reporting is fully logger-driven and controlled by the root
   logger level. Per-file refresh status ``[i/N] ok|FAILED <file>`` goes
   through ``logger.debug`` on ``dead_cst._refresh``; off-TTY decile
