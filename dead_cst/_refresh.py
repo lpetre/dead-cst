@@ -23,10 +23,12 @@ package's :class:`Package` and the shared cache / detector / plugins.
 from __future__ import annotations
 
 import logging
-from concurrent.futures import ProcessPoolExecutor
+import signal
+import threading
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Callable, Mapping, Sequence
 
 import libcst as cst
 import networkx as nx
@@ -185,25 +187,18 @@ def process_stale_files(
 ) -> dict[Path, VisitorPayload]:
     """Run visitor + observe across every task; return ``file -> payload``.
 
-    Both branches use :func:`_process_task` for the per-task work;
-    they differ only in whether the runner state lives on the main
-    process or in :class:`ProcessPoolExecutor` workers. The pool is
-    opt-in (``workers >= 2`` and at least two tasks); below that, the
-    in-process path avoids pool startup cost.
-
-    Cache writes happen on the main process as each payload arrives,
-    so a partial run still warms the cache for files that completed.
-    Files ``_process_one_file`` could not even read off disk return
-    ``None`` and are dropped here -- not cached, not surfaced to the
-    caller -- so the warning re-fires next run. Files that *parse*
-    fail come back as an ``[unparseable]`` synthetic payload and ride
-    the cache like any other miss.
+    Per-task failures other than the ``OSError`` / parse cases that
+    ``_process_one_file`` absorbs in-band are collected and re-raised
+    as a single :class:`ExceptionGroup` after the run drains, so one
+    bad file does not waste the rest of the work. Successful payloads
+    are cache-warmed before the group is raised.
     """
     if not tasks:
         return {}
 
     out: dict[Path, VisitorPayload] = {}
-    use_pool = workers is not None and workers >= 2 and len(tasks) >= 2
+    failures: list[tuple[Path, Exception]] = []
+    total = len(tasks)
 
     def _record(file: Path, payload: VisitorPayload | None) -> None:
         if payload is None:
@@ -212,27 +207,105 @@ def process_stale_files(
         if cache is not None:
             cache.put(file, payload, fingerprint)
 
+    use_pool = workers is not None and workers >= 2 and total >= 2
+
     if use_pool:
         assert workers is not None
+        _run_pool(
+            tasks=tasks,
+            workers=workers,
+            detector=detector,
+            plugins=plugins,
+            record=_record,
+            failures=failures,
+        )
+    else:
+        plugins_t = tuple(plugins)
+        for idx, task in enumerate(
+            progress(tasks, total=total, desc="Parsing files", unit="file"), 1
+        ):
+            try:
+                file, payload = _process_task(detector, plugins_t, task)
+            except Exception as exc:
+                failures.append((task.file, exc))
+                logger.debug("[%d/%d] FAILED %s", idx, total, task.file)
+                continue
+            _record(file, payload)
+            logger.debug("[%d/%d] ok %s", idx, total, file)
+
+    if failures:
+        raise ExceptionGroup(
+            f"dead-cst refresh: {len(failures)}/{total} file(s) failed",
+            [exc for _, exc in failures],
+        )
+    return out
+
+
+def _run_pool(
+    *,
+    tasks: Sequence[StaleFile],
+    workers: int,
+    detector: UnreachableRegionDetector,
+    plugins: Sequence[EdgePlugin],
+    record: Callable[[Path, VisitorPayload | None], None],
+    failures: list[tuple[Path, Exception]],
+) -> None:
+    """Run ``tasks`` through a :class:`ProcessPoolExecutor`.
+
+    Installs SIGTERM/SIGINT handlers for the pool's lifetime so a
+    signal cancels pending futures and re-raises
+    :class:`KeyboardInterrupt`; files that completed before the
+    signal stay cache-warmed via ``record``. Signal install is
+    skipped off the main thread, where :func:`signal.signal` raises.
+    """
+    cancelled = threading.Event()
+    total = len(tasks)
+
+    def _on_signal(signum: int, _frame: object) -> None:
+        cancelled.set()
+        logger.warning(
+            "Received signal %s; cancelling pending dead-cst tasks...",
+            signal.Signals(signum).name,
+        )
+
+    prev_handlers: dict[int, object] = {}
+    if threading.current_thread() is threading.main_thread():
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                prev_handlers[sig] = signal.signal(sig, _on_signal)
+            except (ValueError, OSError):
+                pass
+
+    try:
         with ProcessPoolExecutor(
-            max_workers=min(workers, len(tasks)),
+            max_workers=min(workers, total),
             initializer=_init_worker,
             initargs=(detector, tuple(plugins)),
         ) as pool:
-            for file, payload in progress(
-                pool.map(_worker_process_task, tasks),
-                total=len(tasks),
-                desc="Parsing files",
-                unit="file",
+            futures = {pool.submit(_worker_process_task, task): task for task in tasks}
+            for idx, future in enumerate(
+                progress(as_completed(futures), total=total, desc="Parsing files", unit="file"),
+                1,
             ):
-                _record(file, payload)
-        return out
-
-    plugins_t = tuple(plugins)
-    for task in progress(tasks, total=len(tasks), desc="Parsing files", unit="file"):
-        file, payload = _process_task(detector, plugins_t, task)
-        _record(file, payload)
-    return out
+                if cancelled.is_set():
+                    break
+                task = futures[future]
+                try:
+                    file, payload = future.result()
+                except Exception as exc:
+                    failures.append((task.file, exc))
+                    logger.debug("[%d/%d] FAILED %s", idx, total, task.file)
+                    continue
+                record(file, payload)
+                logger.debug("[%d/%d] ok %s", idx, total, file)
+            if cancelled.is_set():
+                for f in futures:
+                    f.cancel()
+                pool.shutdown(wait=False, cancel_futures=True)
+                raise KeyboardInterrupt("dead-cst refresh cancelled")
+    finally:
+        for sig, prev in prev_handlers.items():
+            signal.signal(sig, prev)  # type: ignore[arg-type]
 
 
 def build_contribution(

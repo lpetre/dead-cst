@@ -10,6 +10,22 @@ two versions.
 ## [Unreleased]
 
 ### Changed
+- The parallel refresh pool (``--workers >= 2``) now drains worker
+  results via ``concurrent.futures.as_completed`` instead of
+  ``pool.map``. Cache writes and progress ticks land in completion
+  order, so a single slow file no longer blocks the cache from warming
+  with the fast files behind it. Tasks are still submitted in
+  ``(package_path, file)`` order so same-package work stays contiguous.
+- Refresh now collects per-task failures and raises a single
+  ``ExceptionGroup`` after every other task has finished, instead of
+  aborting on the first error. Successfully-parsed files are still
+  cache-warmed before the group is raised, so a re-run after fixing
+  the bad file only re-parses what failed.
+- The pool branch installs SIGTERM / SIGINT handlers for the lifetime
+  of the run; on signal it cancels every still-pending future, calls
+  ``pool.shutdown(wait=False, cancel_futures=True)``, restores the
+  prior handlers, and raises ``KeyboardInterrupt``. Files that
+  completed before the signal stay cache-warmed.
 - `SymbolNode` and `Import` now pre-compute their hash in
   `__post_init__` and store it in a private `_hash` slot; `__hash__`
   becomes a single attribute read. The instances are frozen so the
@@ -19,6 +35,16 @@ two versions.
   every time a `SymbolNode` is hashed by networkx (graph insertion,
   BFS traversal). `SCHEMA_VERSION` is bumped to 3 so cache rows
   pickled before the slot existed are invalidated on first use.
+
+- Progress reporting is fully logger-driven and controlled by the root
+  logger level. Per-file refresh status ``[i/N] ok|FAILED <file>`` goes
+  through ``logger.debug`` on ``dead_cst._refresh``; off-TTY decile
+  checkpoints go through ``logger.info`` on ``dead_cst._progress``.
+  The on-TTY tqdm bar is preserved and wraps its iteration in
+  ``logging_redirect_tqdm`` so concurrent log records print above the
+  bar without shattering it. ``dead-cst -v`` keeps its meaning (the
+  CLI's ``setup_logging`` flips the root level to ``DEBUG``); library
+  users get the same firehose by configuring their root logger.
 
 ### Fixed
 - Stdlib imports no longer emit a spurious ``Failed to resolve import
