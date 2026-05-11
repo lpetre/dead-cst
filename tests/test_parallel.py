@@ -29,13 +29,7 @@ def _fp() -> str:
 
 
 class _RaiseOnFilePlugin:
-    """Pickleable :class:`EdgePlugin` that raises on a single file by name.
-
-    Used to inject deterministic worker failures into the parallel
-    refresh tests. Plugins ride to workers via ``initargs``, so this
-    works under fork *and* spawn -- unlike a monkeypatch on
-    ``_process_one_file``, which only sticks in fork-inherited workers.
-    """
+    """EdgePlugin that raises on a single file by name (works under fork *and* spawn)."""
 
     name = "raise_on_file"
     version = 1
@@ -311,18 +305,7 @@ def test_tasks_sorted_by_package(tmp_path, make_analysis, monkeypatch):
 
 @pytest.mark.parametrize("workers", [None, 2])
 def test_failures_aggregate_at_end(tmp_path, make_analysis, workers):
-    """A worker failure does not abort the run; the rest finishes and we raise an ExceptionGroup.
-
-    Covers both the in-process serial path (``workers=None``) and the
-    pool path (``workers=2``) so the aggregation contract holds in
-    both. The good file should still land in the cache; the bad file
-    surfaces inside the ExceptionGroup with a recognizable message.
-
-    Uses an :class:`EdgePlugin` to inject the failure (rather than
-    monkeypatching ``_process_one_file``) so the bad-file behaviour
-    travels into worker processes via ``initargs`` regardless of
-    multiprocessing start method (fork vs. spawn).
-    """
+    """One task's failure surfaces as an ExceptionGroup; the rest still cache-warm."""
     _write(
         tmp_path,
         {
@@ -357,20 +340,15 @@ def test_failures_aggregate_at_end(tmp_path, make_analysis, workers):
 
 
 @pytest.mark.parametrize("workers", [None, 2])
-def test_verbose_prints_per_file_status(tmp_path, make_analysis, capsys, workers):
-    """``verbose=True`` writes ``[i/N] ok <file>`` to stderr; one line per task."""
+def test_debug_logs_per_file_status(tmp_path, make_analysis, caplog, workers):
+    """At ``DEBUG`` level each completion emits one ``[i/N] ok|FAILED <file>`` record."""
     _write(tmp_path, _multi_file_layout())
-    make_analysis(workers=workers, verbose=True).materialize_all()
-    captured = capsys.readouterr()
-    lines = [
-        ln
-        for ln in captured.err.splitlines()
-        if ln.startswith("[") and ("] ok " in ln or "] FAILED " in ln)
-    ]
-    # Five files in _multi_file_layout(); each emits exactly one line.
-    assert len(lines) == 5, lines
-    # Check the [i/N] prefix matches the total task count.
-    assert all(ln.startswith(f"[{i}/5]") for i, ln in enumerate(lines, 1)), lines
+    with caplog.at_level("DEBUG", logger="dead_cst._refresh"):
+        make_analysis(workers=workers).materialize_all()
+    lines = [r.getMessage() for r in caplog.records if r.name == "dead_cst._refresh"]
+    progress_lines = [ln for ln in lines if ("] ok " in ln or "] FAILED " in ln)]
+    assert len(progress_lines) == 5, progress_lines
+    assert all(ln.startswith(f"[{i}/5]") for i, ln in enumerate(progress_lines, 1)), progress_lines
 
 
 def test_pool_installs_and_restores_signal_handlers(tmp_path, make_analysis, monkeypatch):
@@ -393,30 +371,17 @@ def test_pool_installs_and_restores_signal_handlers(tmp_path, make_analysis, mon
 
     make_analysis(workers=2).materialize_all()
 
-    # Install order: SIGTERM custom, SIGINT custom, then the matching restores.
     sigs = [s for s, _ in installed]
     assert int(signal.SIGTERM) in sigs, sigs
     assert int(signal.SIGINT) in sigs, sigs
-
-    # Restore counts: each signal installed twice (set + restore).
-    term_calls = [s for s in sigs if s == int(signal.SIGTERM)]
-    int_calls = [s for s in sigs if s == int(signal.SIGINT)]
-    assert len(term_calls) == 2, term_calls
-    assert len(int_calls) == 2, int_calls
-
-    # And the live handlers match what was there before the run.
+    assert sigs.count(int(signal.SIGTERM)) == 2, sigs
+    assert sigs.count(int(signal.SIGINT)) == 2, sigs
     assert signal.getsignal(signal.SIGTERM) is sigterm_before
     assert signal.getsignal(signal.SIGINT) is sigint_before
 
 
 def test_pool_cancel_flag_raises_keyboard_interrupt(tmp_path, make_analysis, monkeypatch):
-    """Setting the cancel flag inside the pool raises ``KeyboardInterrupt`` cleanly.
-
-    Exercises the cancellation path without depending on real signal
-    delivery timing: we monkeypatch the SIGTERM handler install so the
-    handler is invoked synchronously *before* the consumer loop drains,
-    matching what would happen if a signal landed mid-pool.
-    """
+    """Tripping the SIGTERM handler synchronously raises ``KeyboardInterrupt``."""
     _write(tmp_path, _multi_file_layout())
 
     from dead_cst import _refresh
@@ -427,8 +392,6 @@ def test_pool_cancel_flag_raises_keyboard_interrupt(tmp_path, make_analysis, mon
     def _spy(sig, handler):
         if int(sig) == int(signal.SIGTERM) and "handler" not in captured:
             captured["handler"] = handler
-            # Trip the cancel flag immediately, as if SIGTERM landed
-            # the moment the pool started running.
             handler(int(sig), None)
         return real_signal(sig, handler)
 

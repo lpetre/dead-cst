@@ -36,12 +36,15 @@ two versions.
   populated lazily on first hash via a `try`/`except AttributeError`
   fallback, so no `SCHEMA_VERSION` bump is required.
 
-### Added
-- ``dead-cst -v`` now prints one ``[i/N] ok|FAILED <file>`` line per
-  refresh completion to stderr (replacing the tqdm / decile progress
-  reporter for the duration of the refresh). New ``Analysis(...,
-  verbose=True)`` library knob threads through to
-  ``process_stale_files`` to opt in.
+- Progress reporting is fully logger-driven and controlled by the root
+  logger level. Per-file refresh status ``[i/N] ok|FAILED <file>`` goes
+  through ``logger.debug`` on ``dead_cst._refresh``; off-TTY decile
+  checkpoints go through ``logger.info`` on ``dead_cst._progress``.
+  The on-TTY tqdm bar is preserved and wraps its iteration in
+  ``logging_redirect_tqdm`` so concurrent log records print above the
+  bar without shattering it. ``dead-cst -v`` keeps its meaning (the
+  CLI's ``setup_logging`` flips the root level to ``DEBUG``); library
+  users get the same firehose by configuring their root logger.
 
 ### Fixed
 - Stdlib imports no longer emit a spurious ``Failed to resolve import

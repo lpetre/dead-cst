@@ -209,7 +209,6 @@ def analyze(
             plugins=plugins,
             cache=cache,
             workers=workers,
-            verbose=verbose,
         )
         graph = analysis.materialize_all()
     reachable = _find_reachable(graph)
@@ -384,7 +383,6 @@ def why_alive(
             plugins=plugins,
             cache=cache,
             workers=workers,
-            verbose=verbose,
         ).materialize_all()
 
     target_node: SymbolNode | None = None
@@ -456,7 +454,6 @@ def dependencies(
             resolver=path_resolver,
             cache=cache,
             workers=workers,
-            verbose=verbose,
         )
         graph = analysis.materialize_all()
 
@@ -533,7 +530,6 @@ def unused_exports(
             plugins=plugins,
             cache=cache,
             workers=workers,
-            verbose=verbose,
         ).materialize_all()
     reachable = _find_reachable(graph)
 
@@ -643,7 +639,6 @@ def remove(
             plugins=plugins,
             cache=cache,
             workers=workers,
-            verbose=verbose,
         )
         graph = analysis.materialize_all()
     reachable = _find_reachable(graph)
