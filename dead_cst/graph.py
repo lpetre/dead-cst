@@ -112,15 +112,17 @@ class Import:
     speculative: bool = False
     # Lazily-populated hash cache. The instance is frozen so the hash
     # is stable; recomputing it on every set/dict lookup shows up in
-    # ``resolve_edges`` profiles on large workspaces.
+    # ``resolve_edges`` profiles on large workspaces. The ``__hash__``
+    # read is wrapped in ``try``/``except AttributeError`` (rather than
+    # ``if self._hash is None``) so instances unpickled from caches
+    # written before this slot existed still hash correctly -- they
+    # get the slot populated on first read.
     _hash: int | None = field(init=False, default=None, compare=False, hash=False, repr=False)
 
     def __hash__(self) -> int:
         try:
             cached = self._hash
         except AttributeError:
-            # Older pickled instances predate the ``_hash`` slot; treat
-            # them as uncomputed and stash the result on first read.
             cached = None
         if cached is None:
             cached = hash((self.module, self.decl, self.star, self.speculative))
