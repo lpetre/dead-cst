@@ -111,24 +111,21 @@ class Import:
     decl: str | None = None
     star: bool = False
     speculative: bool = False
-    # Lazily-populated hash cache. The instance is frozen so the hash
-    # is stable; recomputing it on every set/dict lookup shows up in
-    # ``resolve_edges`` profiles on large workspaces. The ``__hash__``
-    # read is wrapped in ``try``/``except AttributeError`` (rather than
-    # ``if self._hash is None``) so instances unpickled from caches
-    # written before this slot existed still hash correctly -- they
-    # get the slot populated on first read.
-    _hash: int | None = field(init=False, default=None, compare=False, hash=False, repr=False)
+    # Pre-computed hash. ``resolve_edges`` hashes ``(src, dst, flags)`` on
+    # every emission and an ``Import`` participates in ``SymbolNode``'s hash,
+    # so this gets re-hashed thousands of times per analysis on large
+    # workspaces. Computing eagerly in ``__post_init__`` keeps ``__hash__``
+    # to a single attribute read; the slot is fed into ``SCHEMA_VERSION``
+    # so old cache rows are invalidated.
+    _hash: int = field(init=False, compare=False, hash=False, repr=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "_hash", hash((self.module, self.decl, self.star, self.speculative))
+        )
 
     def __hash__(self) -> int:
-        try:
-            cached = self._hash
-        except AttributeError:
-            cached = None
-        if cached is None:
-            cached = hash((self.module, self.decl, self.star, self.speculative))
-            object.__setattr__(self, "_hash", cached)
-        return cached
+        return self._hash
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,22 +136,18 @@ class SymbolNode:
     position: CodeRange
     imports: Import | None = None
     flags: NodeFlags = NodeFlags.NONE
-    # See ``Import._hash`` for the rationale; ``_edges._emit`` hashes
-    # ``(src, dst, flags)`` once per emitted edge, so the same node
-    # instance gets re-hashed many times per analysis.
-    _hash: int | None = field(init=False, default=None, compare=False, hash=False, repr=False)
+    # See ``Import._hash`` for the rationale.
+    _hash: int = field(init=False, compare=False, hash=False, repr=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "_hash",
+            hash((self.fqname, self.type, self.path, self.position, self.imports, self.flags)),
+        )
 
     def __hash__(self) -> int:
-        try:
-            cached = self._hash
-        except AttributeError:
-            cached = None
-        if cached is None:
-            cached = hash(
-                (self.fqname, self.type, self.path, self.position, self.imports, self.flags)
-            )
-            object.__setattr__(self, "_hash", cached)
-        return cached
+        return self._hash
 
 
 @dataclass(frozen=True, slots=True)
