@@ -103,7 +103,8 @@ class Import:
     ``__import__(name, fromlist=[...])`` / ``importlib.import_module``
     fromlist entries that may or may not be submodules. The stitcher
     silently drops a speculative entry when neither the trie nor the
-    resolver can place it; non-speculative imports warn instead.
+    resolver can place it; non-speculative misses are surfaced as
+    ``[unresolved] <top-level>`` synthetic nodes instead.
     """
 
     module: str

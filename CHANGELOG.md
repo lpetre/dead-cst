@@ -20,6 +20,21 @@ two versions.
   populated lazily on first hash via a `try`/`except AttributeError`
   fallback, so no `SCHEMA_VERSION` bump is required.
 
+### Fixed
+- Stdlib imports no longer emit a spurious ``Failed to resolve import
+  module: <name>`` warning during edge stitching. The orphaned warning
+  in ``_edges._emit_external`` fired for every successfully-classified
+  stdlib import (``import datetime`` / ``from pathlib import Path`` / …)
+  because the silent-drop and speculative-miss branches both returned
+  ``None``; the warning is removed since no legitimate path reached it
+  -- truly-unresolved non-speculative imports already surface as
+  ``[unresolved] <top-level>`` synthetic nodes.
+- ``default_resolve_import`` now falls back to the parent module when a
+  dotted name can't be resolved directly, so ``collections.abc``,
+  ``importlib.resources.abc``, and similar synthesized-in-``__init__``
+  submodules classify as ``[stdlib] <name>`` instead of being misfiled
+  as ``[unresolved] <top>``.
+
 ## [0.8.0] - 2026-05-09
 
 ### Added

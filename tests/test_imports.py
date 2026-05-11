@@ -6,9 +6,11 @@ below and asserts the complete set of edges the graph contains.
 the fixture so individual cases only list the edges they introduce.
 """
 
+import logging
+
 import pytest
 
-from dead_cst.plugins._core import EXTERNAL_PREFIXES
+from dead_cst.plugins._core import EXTERNAL_PREFIXES, STDLIB_PREFIX, UNRESOLVED_PREFIX
 
 IMPORT_TEST_FILES = {
     "p/__init__.py": "",
@@ -530,6 +532,47 @@ def test_third_party_import_creates_synthetic_node(build_decl_graph):
 
     edge_srcs = {src.fqname for src, dst in graph.edges(keys=False) if dst in nx_nodes}
     assert {"p.uses_nx.nx", "p.uses_nx.build"} <= edge_srcs
+
+
+def test_stdlib_imports_are_silent(build_decl_graph, caplog):
+    """Stdlib imports drop without surfacing a synthetic node or a warning."""
+    with caplog.at_level(logging.WARNING, logger="dead_cst._edges"):
+        graph = build_decl_graph(
+            {
+                "p/__init__.py": "",
+                "p/uses_stdlib.py": (
+                    "import datetime\n"
+                    "import os\n"
+                    "from pathlib import Path\n"
+                    "from collections.abc import Iterable\n"
+                ),
+            }
+        )
+
+    assert [r.getMessage() for r in caplog.records] == []
+    synthetics = {n.fqname for n in graph.nodes if n.type == "synthetic"}
+    # No stdlib ever surfaces as a graph node, and ``collections.abc``
+    # must not fall through to ``[unresolved] collections`` (regression
+    # against the synthesized-submodule parent-fallback).
+    assert not [fq for fq in synthetics if fq.startswith(STDLIB_PREFIX)]
+    assert f"{UNRESOLVED_PREFIX}collections" not in synthetics
+
+
+def test_unresolved_import_emits_synthetic_silently(build_decl_graph, caplog):
+    """A genuinely-missing top-level import gets a ``[unresolved]`` node, no warning."""
+    with caplog.at_level(logging.WARNING, logger="dead_cst._edges"):
+        graph = build_decl_graph(
+            {
+                "p/__init__.py": "",
+                "p/uses_missing.py": "from unknown_pkg_xyz import thing\n",
+            }
+        )
+
+    assert [r.getMessage() for r in caplog.records] == []
+    assert any(
+        n.type == "synthetic" and n.fqname == f"{UNRESOLVED_PREFIX}unknown_pkg_xyz"
+        for n in graph.nodes
+    )
 
 
 def test_cross_dep_submodule_import(tmp_path, make_analysis, assert_edges):
