@@ -19,9 +19,10 @@ for the full record.
 
 `PytestPlugin`, `UnittestPlugin` (with transitive `TestCase` discovery),
 `FastAPIPlugin`, `FlaskPlugin`, `TyperPlugin`, `ClickPlugin`,
-`CycloptsPlugin`, `MockPatchPlugin`, and `InitSubclassPlugin` shipped,
-but the existential risk is still "I tried it and it flagged half my
-codebase." The remaining common offenders:
+`CycloptsPlugin`, `DiscordPyPlugin`, `MockPatchPlugin`, and
+`InitSubclassPlugin` shipped, but the existential risk is still
+"I tried it and it flagged half my codebase." The remaining common
+offenders:
 
 - Django URLConf, admin registration, signal handlers, management commands
 - Pydantic validators and field serializers

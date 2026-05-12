@@ -163,7 +163,9 @@ def test_is_name_handles_none():
         ("from flask import Flask", "flask", True),
         ("from flask import Flask", "fastapi", False),
         ("from .pkg import x", "pkg", False),  # relative
-        ("from a.b import c", "a", False),  # dotted module name -- not a bare Name
+        ("from a.b import c", "a", False),  # dotted module name -- prefix doesn't match
+        ("from a.b import c", "a.b", True),  # dotted module name -- exact match
+        ("from a.b.c import d", "a.b.c", True),  # deeper dotted module name
     ],
 )
 def test_is_from_module(src, module_name, expected):

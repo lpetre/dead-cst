@@ -84,6 +84,7 @@ from ._core import (
 )
 from ..contrib.click import ClickPlugin
 from ..contrib.cyclopts import CycloptsPlugin
+from ..contrib.discordpy import DiscordPyPlugin
 from ..contrib.fastapi import FastAPIPlugin
 from ..contrib.flask import FlaskPlugin
 from ..contrib.mock_patch import MockPatchPlugin
@@ -110,6 +111,7 @@ BUILTIN_PLUGINS: dict[str, type] = {
     TyperPlugin.name: TyperPlugin,
     ClickPlugin.name: ClickPlugin,
     CycloptsPlugin.name: CycloptsPlugin,
+    DiscordPyPlugin.name: DiscordPyPlugin,
     InitSubclassPlugin.name: InitSubclassPlugin,
 }
 
@@ -135,6 +137,7 @@ __all__ = [
     "ClickPlugin",
     "CycloptsPlugin",
     "DecoratedDeclPlugin",
+    "DiscordPyPlugin",
     "EXTERNAL_DIST_PREFIX",
     "EXTERNAL_FILE_PREFIX",
     "EXTERNAL_PREFIXES",
