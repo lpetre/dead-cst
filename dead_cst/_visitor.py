@@ -29,15 +29,11 @@ from .graph import Import, NodeFlags, SymbolNode, SymbolTrie, VisitorPayload
 logger = logging.getLogger(__name__)
 
 # Attributes the import machinery injects on every module object at
-# runtime. They never appear in source, so attribute access like
-# ``some_module.__file__`` (the standard "find a data file next to me"
-# idiom) is a module-level dependency, not a symbol dependency --
-# attribute chains past these dunders are runtime string / path
-# operations, not symbol references. Truncating the access chain
-# before the dunder lets the visitor emit a clean
-# ``Import(module=X, decl=None)`` instead of a speculative
-# ``Import(module=X, decl="__file__")`` that the edge stitcher would
-# fail to resolve.
+# runtime. They never appear in source, so attribute access past one
+# of these (``some_pkg.__file__``, ``some_pkg.__spec__``, ...) is a
+# path / string op, not a symbol reference -- the access chain is
+# truncated at the dunder so the Import collapses to a module-level
+# dep.
 _MODULE_RUNTIME_DUNDERS = frozenset(
     {
         "__file__",
@@ -916,13 +912,6 @@ class SymbolVisitor(cst.CSTVisitor):
                             accessed_attrs.append(parent.attr.value)
                             curr_access = parent
 
-                    # ``slurm_pkg.__file__`` and friends: the import
-                    # machinery's runtime dunders aren't source decls,
-                    # so the chain past them is path / string ops, not
-                    # symbol references. Drop the dunder (and anything
-                    # after it) so the edge stitcher sees a plain
-                    # module-level Import instead of a speculative
-                    # ``decl="__file__"`` it can't resolve.
                     for i, attr in enumerate(accessed_attrs):
                         if attr in _MODULE_RUNTIME_DUNDERS:
                             del accessed_attrs[i:]
