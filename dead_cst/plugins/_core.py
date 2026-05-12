@@ -88,15 +88,13 @@ class PluginContext:
     symbol_lookup: SymbolTrie
     package: Package
     project_root: Path
-    # Optional pre-merge per-package contribution graph. When supplied,
-    # ``package_modules`` / ``package_nodes`` seed their caches directly
-    # from its node set instead of filtering the merged cross-package
-    # ``graph`` by ``Path.is_relative_to`` -- an O(N_total) walk that
-    # dominates the first plugin call in each finalize pass. The analyzer
-    # passes ``PackageContribution.package_graph`` here; external callers
-    # (tests, custom pipelines) can leave it unset and the helpers fall
-    # back to the filter path.
-    package_graph: nx.MultiDiGraph | None = None
+    # Per-package contribution graph: every node whose path is under
+    # ``package.path``, before the cross-package merge. ``package_nodes``
+    # / ``package_modules`` source from this directly so they don't pay
+    # an O(N_total) ``Path.is_relative_to`` scan over the merged
+    # ``graph`` on the first call. The analyzer passes
+    # ``PackageContribution.package_graph``.
+    package_graph: nx.MultiDiGraph
     _modules: dict[Path, cst.Module | None] = field(default_factory=dict, repr=False)
     # Lazy ``fqname -> SymbolNode`` index over synthetic nodes (built on
     # first ``importers`` call).  Plugins that add their own synthetic
@@ -108,8 +106,7 @@ class PluginContext:
     # Plugins may add nodes during their pass (entrypoint synthetics,
     # etc.) but those are never re-iterated by these helpers; we
     # snapshot once at first call to keep iteration cheap when ``graph``
-    # accumulates nodes across packages. When ``package_graph`` is set,
-    # the snapshot is taken from it directly, sidestepping the filter.
+    # accumulates nodes across packages.
     _package_modules_cache: list[tuple[Path, SymbolNode]] | None = field(
         default=None, init=False, repr=False
     )
@@ -163,21 +160,13 @@ class PluginContext:
     def package_modules(self) -> Iterator[tuple[Path, SymbolNode]]:
         """Yield ``(path, module_node)`` for every module under :attr:`package`."""
         if self._package_modules_cache is None:
-            if self.package_graph is not None:
-                self._package_modules_cache = [
-                    (node.path, node) for node in self.package_graph.nodes if node.type == "module"
-                ]
-            else:
-                package_path = self.package.path
-                self._package_modules_cache = [
-                    (node.path, node)
-                    for node in self.graph.nodes
-                    if node.type == "module" and node.path.is_relative_to(package_path)
-                ]
+            self._package_modules_cache = [
+                (node.path, node) for node in self.package_graph.nodes if node.type == "module"
+            ]
         return iter(self._package_modules_cache)
 
     def package_nodes(self) -> Iterator[SymbolNode]:
-        """Yield every graph node whose path is under :attr:`package`.
+        """Yield every graph node under :attr:`package`.
 
         ``graph`` accumulates nodes across packages; plugins that need
         to iterate "everything in this package" should use this instead
@@ -185,13 +174,7 @@ class PluginContext:
         belonging to sibling packages.
         """
         if self._package_nodes_cache is None:
-            if self.package_graph is not None:
-                self._package_nodes_cache = list(self.package_graph.nodes)
-            else:
-                package_path = self.package.path
-                self._package_nodes_cache = [
-                    node for node in self.graph.nodes if node.path.is_relative_to(package_path)
-                ]
+            self._package_nodes_cache = list(self.package_graph.nodes)
         return iter(self._package_nodes_cache)
 
     def importers(self, target: str) -> set[Path]:

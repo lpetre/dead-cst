@@ -10,17 +10,17 @@ two versions.
 ## [Unreleased]
 
 ### Changed
-- `PluginContext` accepts an optional `package_graph` constructor
-  argument; when set, `package_nodes` / `package_modules` seed their
-  caches directly from the per-package contribution graph instead of
-  filtering the merged cross-package graph by `Path.is_relative_to`.
-  The analyzer wires `PackageContribution.package_graph` through
-  automatically during `_compose_contribution`, so plugins inside
-  `finalize` skip the O(N_total) walk that previously dominated the
-  first `package_nodes` call in each pass (~235× faster on the
-  dead-cst self-analysis: 9.2 ms → 39 µs). Behavior is unchanged for
-  tests and custom pipelines that construct `PluginContext` without
-  the hint -- the filter path still works.
+- `PluginContext` now requires a `package_graph` argument: the
+  pre-merge per-package contribution graph. `package_nodes` /
+  `package_modules` source their snapshot from it directly, replacing
+  the previous `Path.is_relative_to` filter over the merged
+  cross-package `graph` -- an O(N_total) walk that dominated the first
+  plugin call in each finalize pass (~235× faster on the dead-cst
+  self-analysis: 9.2 ms → 39 µs). The analyzer wires
+  `PackageContribution.package_graph` through automatically. **Custom
+  callers that construct `PluginContext` directly (in tests or
+  out-of-tree pipelines) must pass `package_graph=`** -- for tests with
+  a single graph, `package_graph=graph` reuses the existing input.
 
 ## [0.9.3] - 2026-05-12
 

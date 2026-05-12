@@ -949,6 +949,7 @@ class PackageView:
             symbol_lookup=self._analysis._build_symbol_lookup(self._package.path, scope=scope),
             package=self._package,
             project_root=self._analysis.project_root,
+            package_graph=self._analysis._contributions[self._package.path].package_graph,
         )
         return ctx.importers(target)
 

@@ -81,11 +81,14 @@ def _ctx_with_synthetic(fqname: str, base: Path) -> PluginContext:
         position=CodeRange(start=CodePosition(0, 0), end=CodePosition(0, 0)),
     )
     graph.add_node(node)
+    package_graph = nx.MultiDiGraph()
+    package_graph.add_node(node)
     return PluginContext(
         graph=graph,
         symbol_lookup=SymbolTrie(),
         package=Package(path=base, name="pkg"),
         project_root=base,
+        package_graph=package_graph,
     )
 
 
@@ -360,100 +363,52 @@ def test_find_call_assignments_ignores_non_call_rhs():
 # ---------------------------------------------------------------------------
 
 
-def test_plugin_context_package_modules_caches_first_scan(tmp_path):
+def test_plugin_context_package_modules_yields_from_package_graph(tmp_path):
+    """``package_modules`` sources from ``package_graph`` and snapshots once."""
     pkg = Package(path=tmp_path, name="pkg")
     inside = SymbolNode("pkg.a", "module", tmp_path / "a.py", _pos())
-    outside = SymbolNode("other.b", "module", tmp_path.parent / "other.py", _pos())
-    graph = nx.DiGraph()
-    graph.add_node(inside)
-    graph.add_node(outside)
+    fn = SymbolNode("pkg.a.f", "function", tmp_path / "a.py", _pos())
+    package_graph = nx.MultiDiGraph()
+    package_graph.add_node(inside)
+    package_graph.add_node(fn)
 
-    ctx = PluginContext(graph=graph, symbol_lookup=SymbolTrie(), package=pkg, project_root=tmp_path)
+    ctx = PluginContext(
+        graph=nx.DiGraph(),
+        symbol_lookup=SymbolTrie(),
+        package=pkg,
+        project_root=tmp_path,
+        package_graph=package_graph,
+    )
     first = list(ctx.package_modules())
     assert first == [(inside.path, inside)]
 
-    # Adding a module-typed node after the first call must not appear -- the
-    # cache is intentional, so plugins see a stable snapshot.
+    # Nodes added after the first call must not appear -- the cache is
+    # intentional, so plugins see a stable snapshot.
     late = SymbolNode("pkg.late", "module", tmp_path / "late.py", _pos())
-    graph.add_node(late)
-    second = list(ctx.package_modules())
-    assert second == first
+    package_graph.add_node(late)
+    assert list(ctx.package_modules()) == first
 
 
-def test_plugin_context_package_nodes_filters_and_caches(tmp_path):
+def test_plugin_context_package_nodes_yields_from_package_graph(tmp_path):
+    """``package_nodes`` yields the whole ``package_graph`` node set and snapshots once."""
     pkg = Package(path=tmp_path, name="pkg")
-    inside_mod = SymbolNode("pkg", "module", tmp_path / "__init__.py", _pos())
-    inside_fn = SymbolNode("pkg.f", "function", tmp_path / "a.py", _pos())
-    outside = SymbolNode("other.b", "module", tmp_path.parent / "other.py", _pos())
-    graph = nx.DiGraph()
-    for n in (inside_mod, inside_fn, outside):
-        graph.add_node(n)
-
-    ctx = PluginContext(graph=graph, symbol_lookup=SymbolTrie(), package=pkg, project_root=tmp_path)
-    first = sorted(ctx.package_nodes(), key=lambda n: n.fqname)
-    assert first == [inside_mod, inside_fn]
-
-    # Cached: nodes added after the first scan don't appear, even when their
-    # path is under ``package.path``.
-    late = SymbolNode("pkg.late", "function", tmp_path / "late.py", _pos())
-    graph.add_node(late)
-    second = sorted(ctx.package_nodes(), key=lambda n: n.fqname)
-    assert second == first
-
-
-def test_plugin_context_package_nodes_seeded_from_package_graph(tmp_path):
-    """Seeded path: ``package_graph`` is the source, no filter walk."""
-    pkg = Package(path=tmp_path, name="pkg")
-    inside_mod = SymbolNode("pkg", "module", tmp_path / "__init__.py", _pos())
-    inside_fn = SymbolNode("pkg.f", "function", tmp_path / "a.py", _pos())
-    outside = SymbolNode("other.b", "module", tmp_path.parent / "other.py", _pos())
-
+    mod = SymbolNode("pkg", "module", tmp_path / "__init__.py", _pos())
+    fn = SymbolNode("pkg.f", "function", tmp_path / "a.py", _pos())
     package_graph = nx.MultiDiGraph()
-    package_graph.add_node(inside_mod)
-    package_graph.add_node(inside_fn)
-
-    merged = nx.DiGraph()
-    merged.add_node(inside_mod)
-    merged.add_node(inside_fn)
-    merged.add_node(outside)
+    package_graph.add_node(mod)
+    package_graph.add_node(fn)
 
     ctx = PluginContext(
-        graph=merged,
+        graph=nx.DiGraph(),
         symbol_lookup=SymbolTrie(),
         package=pkg,
         project_root=tmp_path,
         package_graph=package_graph,
     )
-    assert sorted(ctx.package_nodes(), key=lambda n: n.fqname) == [inside_mod, inside_fn]
-    assert sorted(ctx.package_modules(), key=lambda kv: kv[1].fqname) == [
-        (inside_mod.path, inside_mod)
-    ]
+    first = sorted(ctx.package_nodes(), key=lambda n: n.fqname)
+    assert first == [mod, fn]
 
-
-def test_plugin_context_package_graph_seeding_matches_filter(tmp_path):
-    """Seeded and filter paths agree on the same input."""
-    pkg = Package(path=tmp_path, name="pkg")
-    inside_mod = SymbolNode("pkg", "module", tmp_path / "__init__.py", _pos())
-    inside_fn = SymbolNode("pkg.f", "function", tmp_path / "a.py", _pos())
-    outside = SymbolNode("other.b", "module", tmp_path.parent / "other.py", _pos())
-
-    merged = nx.DiGraph()
-    for n in (inside_mod, inside_fn, outside):
-        merged.add_node(n)
-
-    package_graph = nx.MultiDiGraph()
-    package_graph.add_node(inside_mod)
-    package_graph.add_node(inside_fn)
-
-    filter_ctx = PluginContext(
-        graph=merged, symbol_lookup=SymbolTrie(), package=pkg, project_root=tmp_path
-    )
-    seeded_ctx = PluginContext(
-        graph=merged,
-        symbol_lookup=SymbolTrie(),
-        package=pkg,
-        project_root=tmp_path,
-        package_graph=package_graph,
-    )
-    assert set(filter_ctx.package_nodes()) == set(seeded_ctx.package_nodes())
-    assert set(filter_ctx.package_modules()) == set(seeded_ctx.package_modules())
+    # Cached: nodes added after the first scan don't appear.
+    late = SymbolNode("pkg.late", "function", tmp_path / "late.py", _pos())
+    package_graph.add_node(late)
+    assert sorted(ctx.package_nodes(), key=lambda n: n.fqname) == first
