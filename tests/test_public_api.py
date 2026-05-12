@@ -104,6 +104,7 @@ EXPECTED_PUBLIC_API: dict[str, list[str]] = {
         "dotted_parts",
         "entrypoint_payload",
         "find_call_assignments",
+        "find_factory_decls",
         "find_handlers",
         "is_from_module",
         "is_name",

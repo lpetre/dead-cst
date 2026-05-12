@@ -730,6 +730,8 @@ def walk_to_instance_kind(
     terminal: SymbolNode,
     module_name: str,
     instance_kinds: Container[str],
+    *,
+    factory_marker_prefix: str | None = None,
 ) -> str | None:
     """Walk forward from ``start`` until hitting an ``import`` node bound to
     ``module_name`` and one of ``instance_kinds``; return the matched decl name.
@@ -745,6 +747,14 @@ def walk_to_instance_kind(
     The ``terminal`` cutoff (the framework's external-dist synthetic) is
     skipped during traversal so the walk doesn't fan out across
     *every* file that imports the framework.
+
+    ``factory_marker_prefix`` opts in to recognizing the
+    ``<prefix><kind>:<owner.fqname>`` synthetic markers
+    :func:`find_factory_decls` emits. The factory-marker check kicks in
+    when the import-node discriminator is unreliable -- typically the
+    ``import <module>; <module>.<Cls>()`` (attribute-form) cases that
+    collapse to a bare ``[external dist] <module>`` edge after
+    :func:`resolve_edges` drops the ``decl`` half.
 
     Plugins requiring this should also call :func:`require_resolved_dep`
     so the visitor's ``Import.module`` is the canonical ``"flask"`` /
@@ -762,5 +772,62 @@ def walk_to_instance_kind(
             decl = node.imports.decl
             if decl is not None and node.imports.module == module_name and decl in instance_kinds:
                 return decl
+        if (
+            factory_marker_prefix is not None
+            and node.type == "synthetic"
+            and node.fqname.startswith(factory_marker_prefix)
+        ):
+            kind = node.fqname[len(factory_marker_prefix) :].split(":", 1)[0]
+            if kind in instance_kinds:
+                return kind
         stack.extend(graph.successors(node))
     return None
+
+
+class _ConstructorFinder(cst.CSTVisitor):
+    """Collect construction kinds for ``valid_targets`` inside a decl body."""
+
+    def __init__(self, imports: dict[str, str], valid_targets: Container[str]) -> None:
+        super().__init__()
+        self._imports = imports
+        self._valid_targets = valid_targets
+        self.kinds: set[str] = set()
+
+    def visit_Call(self, node: cst.Call) -> bool | None:
+        kind = matched_attr_call(node.func, self._imports, self._valid_targets, unwrap_call=False)
+        if kind is not None:
+            self.kinds.add(kind)
+        return None
+
+
+def find_factory_decls(
+    module: cst.Module, imports: dict[str, str], valid_targets: Container[str]
+) -> dict[str, set[str]]:
+    """Return ``{decl_name: {kind, ...}}`` for top-level decls whose body
+    constructs one of ``valid_targets``.
+
+    Scans every top-level ``def`` / ``class`` body for ``<Cls>(...)`` /
+    ``<mod>.<Cls>(...)`` call shapes (named or module-prefixed, both
+    forms produced by :func:`collect_module_imports`). Skips files whose
+    ``imports`` map is empty -- :func:`matched_attr_call` would reject
+    every candidate anyway, so the AST walk would be wasted.
+
+    Used by framework plugins (FastAPI, Flask, ...) to anchor a
+    factory-marker synthetic on the constructing decl so
+    :func:`walk_to_instance_kind` (with ``factory_marker_prefix=``) can
+    classify cross-file consumers even when the framework class is
+    reached via the attribute-form ``<mod>.<Cls>()`` -- where
+    :func:`resolve_edges` drops the ``decl`` half of the external-edge
+    classification and the import-node check alone misses the case.
+    """
+    if not imports:
+        return {}
+    out: dict[str, set[str]] = {}
+    for stmt in module.body:
+        if not isinstance(stmt, (cst.FunctionDef, cst.ClassDef)):
+            continue
+        finder = _ConstructorFinder(imports, valid_targets)
+        stmt.body.visit(finder)
+        if finder.kinds:
+            out[stmt.name.value] = finder.kinds
+    return out
