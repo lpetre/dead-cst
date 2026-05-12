@@ -387,6 +387,13 @@ entirely.
 * `.pyi` stubs are ingested only for the compiled-extension layout
   (`_native.so` + `_native.pyi`, no `.py` twin). Peer-mode `.pyi` is
   dropped at file-enumeration time — the runtime always wins.
+* A `foo.py` next to a `foo/__init__.py` is shadowed by the package
+  (mirroring CPython's `FileFinder`). `_refresh.shadowed_paths` flags
+  the `.py` before `_apply_payload` runs, and the apply pass skips its
+  trie additions only — its nodes still land in the graph so
+  observe-time entrypoints (`__main__`, plugin synthetics) keep
+  working, but cross-module imports of `pkg.foo` route to the
+  package's `__init__.py` alone.
 * `[unparseable] <module>` synthetics stand in for files `libcst`
   cannot parse. They carry `NodeFlags.ENTRYPOINT` and edge at the real
   module node, so the file stays alive even though its decls are
