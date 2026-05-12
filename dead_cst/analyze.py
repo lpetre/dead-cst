@@ -34,7 +34,7 @@ from .resolvers import (
     ImportResolver,
     Package,
     PathResolver,
-    clear_path_caches,
+    clear_module_specs_cache,
 )
 from .resolvers._core import _validate_packages
 
@@ -228,6 +228,41 @@ def _count_nodes(graph: nx.MultiDiGraph, prefix: Path | None) -> dict[str, int]:
             continue
         counts[node.type] = counts.get(node.type, 0) + 1
     return counts
+
+
+def _count_nodes_by_prefix(
+    graph: nx.MultiDiGraph, prefixes: Sequence[Path]
+) -> dict[Path, dict[str, int]]:
+    """One-pass equivalent of :func:`_count_nodes` for many prefixes.
+
+    A naive ``[_count_nodes(graph, p) for p in prefixes]`` re-walks every
+    node of the full graph for every prefix; the CLI's text/JSON output
+    paths do this twice (once for the full graph, once for the
+    unreachable subgraph) and it dominates report-formatting time on
+    large workspaces. We bucket nodes by ``node.path`` first so each
+    unique file pays the prefix-matching cost once regardless of how
+    many declarations live in it.
+
+    Semantics match :func:`_count_nodes`: a node contributes to every
+    prefix it ``is_relative_to`` -- nested prefixes both pick it up.
+    """
+    by_path: dict[Path, dict[str, int]] = {}
+    for node in graph.nodes:
+        bucket = by_path.get(node.path)
+        if bucket is None:
+            bucket = {}
+            by_path[node.path] = bucket
+        bucket[node.type] = bucket.get(node.type, 0) + 1
+
+    result: dict[Path, dict[str, int]] = {p: {} for p in prefixes}
+    for path, bucket in by_path.items():
+        for prefix in prefixes:
+            if not path.is_relative_to(prefix):
+                continue
+            target = result[prefix]
+            for kind, count in bucket.items():
+                target[kind] = target.get(kind, 0) + count
+    return result
 
 
 class Analysis:
@@ -706,7 +741,11 @@ class Analysis:
                 search_paths = (path, *self._dep_paths(path))
                 if last_search_paths != search_paths:
                     _rebind_sys_path(search_paths, baseline)
-                    clear_path_caches()
+                    # Only the first-party prefix moved -- dist caches in
+                    # ``_imports`` are keyed on the site-packages slice of
+                    # ``sys.path`` and survive the transition for free, so
+                    # we just refresh the fullname-keyed module-spec cache.
+                    clear_module_specs_cache()
                     last_search_paths = search_paths
                 contrib = (
                     contributions_override.get(path) if contributions_override is not None else None

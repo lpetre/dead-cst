@@ -15,7 +15,7 @@ import networkx as nx
 import typer
 from libcst.metadata import CodeRange
 
-from .analyze import Analysis, _count_nodes, _find_reachable
+from .analyze import Analysis, _count_nodes_by_prefix, _find_reachable
 from .cache import (
     GraphCache,
     clear_cache,
@@ -231,10 +231,12 @@ def _output_text(
     root: Path,
     package_paths: Sequence[Path],
 ) -> None:
+    total_by_path = _count_nodes_by_prefix(graph, package_paths)
+    unreachable_by_path = _count_nodes_by_prefix(unreachable, package_paths)
     for path in package_paths:
         typer.echo(f"\n{path}:")
-        total_counts = _count_nodes(graph, path)
-        unreachable_counts = _count_nodes(unreachable, path)
+        total_counts = total_by_path[path]
+        unreachable_counts = unreachable_by_path[path]
         for kind in sorted(total_counts):
             # Synthetic nodes (entrypoint sentinels, external-dist markers,
             # dunder-all stand-ins) don't represent user-visible
@@ -307,10 +309,12 @@ def _output_json(
         "unreachable_branches": [],
     }
 
+    total_by_path = _count_nodes_by_prefix(graph, package_paths)
+    unreachable_by_path = _count_nodes_by_prefix(unreachable, package_paths)
     for path in package_paths:
         path_str = str(path)
-        total_counts = _count_nodes(graph, path)
-        unreachable_counts = _count_nodes(unreachable, path)
+        total_counts = total_by_path[path]
+        unreachable_counts = unreachable_by_path[path]
         # Same rationale as the text output: synthetic nodes are reported
         # via ``unreachable_branches`` (and entrypoint sentinels), not as
         # part of the per-kind summary.

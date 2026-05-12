@@ -223,8 +223,17 @@ Trie misses fall back to the `PathResolver` chain for stdlib /
 external-dist / external-file / unresolved classification — the *only*
 place that reads `sys.path` and the resolver LRU caches.
 `Analysis._materialize` rebinds `sys.path` to each package's
-`(path, *deps)` view before composing it and clears the resolver caches
-at every transition, restoring `sys.path` on the way out.
+`(path, *deps)` view before composing it and calls
+`clear_module_specs_cache()` at every transition, restoring `sys.path`
+on the way out. That narrow clear drops only the fullname-keyed
+`safe_resolve_module` cache; `distribution_lookup` and
+`editable_distribution_roots` are keyed on the dist-bearing slice of
+`sys.path` (site-packages / dist-packages / purelib / platlib entries)
+so they survive the rebind for free — only the first-party prefix
+moves, and that prefix never enters the key. A real venv change (uv
+splicing in a workspace `.venv`) flips the key and triggers a single
+rebuild. `clear_path_caches()` is still available as the heavy-hammer
+full reset for callers that mutate the venv slice themselves.
 
 Stdlib imports drop silently — they aren't surfaced as graph nodes.
 External-dist / external-file / unresolved misses produce one synthetic
