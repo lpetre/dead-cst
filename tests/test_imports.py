@@ -575,6 +575,59 @@ def test_unresolved_import_emits_synthetic_silently(build_decl_graph, caplog):
     )
 
 
+def test_module_runtime_dunder_access_is_module_dep(build_decl_graph, assert_edges, caplog):
+    """``pkg.__file__`` collapses to a plain ``Import(module=pkg, decl=None)``.
+
+    The import machinery injects ``__file__`` / ``__name__`` / ``__spec__`` /
+    etc. onto every module object at runtime -- attribute access past one of
+    these is a path / string op, not a symbol reference. The visitor truncates
+    the access chain at the dunder so the edge stitcher sees a clean module-
+    level dependency (no speculative ``decl="__file__"`` that it would warn
+    about, no synthetic node for the missing attribute).
+    """
+    with caplog.at_level(logging.WARNING, logger="dead_cst._edges"):
+        graph = build_decl_graph(
+            {
+                "pkg/__init__.py": "",
+                "pkg/config.py": (
+                    "from pathlib import Path\n"
+                    "import pkg as pkg_alias\n"
+                    "FILE_PATH = Path(pkg_alias.__file__).parent\n"
+                    "NAME = pkg_alias.__name__\n"
+                    "SPEC = pkg_alias.__spec__\n"
+                ),
+            }
+        )
+
+    assert [r.getMessage() for r in caplog.records] == []
+    # No synthetic was minted for the missing-dunder lookup.
+    assert not [n.fqname for n in graph.nodes if n.fqname.endswith(".__file__")]
+    # The module-level dependency edges remain intact for each user of a dunder.
+    edge_strs = {f"{src.fqname} -> {dst.fqname}" for src, dst in graph.edges(keys=False)}
+    assert "pkg.config.FILE_PATH -> pkg" in edge_strs
+    assert "pkg.config.NAME -> pkg" in edge_strs
+    assert "pkg.config.SPEC -> pkg" in edge_strs
+
+
+def test_dunder_on_imported_symbol_strips_dunder_tail(build_decl_graph, assert_edges):
+    """``from pkg import Cls; Cls.__name__`` -> edge to ``Cls``, not ``Cls.__name__``.
+
+    Regression guard for the visitor-level dunder strip: the truncation
+    drops the dunder *and everything after it*, so an access through an
+    imported symbol still resolves to that symbol (not past it).
+    """
+    graph = build_decl_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/lib.py": "class Cls:\n    pass\n",
+            "pkg/uses.py": ("from pkg.lib import Cls\nWHO = Cls.__name__\nDOCSTR = Cls.__doc__\n"),
+        }
+    )
+    edge_strs = {f"{src.fqname} -> {dst.fqname}" for src, dst in graph.edges(keys=False)}
+    assert "pkg.uses.WHO -> pkg.lib.Cls" in edge_strs
+    assert "pkg.uses.DOCSTR -> pkg.lib.Cls" in edge_strs
+
+
 def test_cyclic_reexport_terminates(build_decl_graph, assert_edges):
     """Re-export cycle (``A.x: from B import x``, ``B.x: from A import x``) terminates with both legs emitted."""
     graph = build_decl_graph(

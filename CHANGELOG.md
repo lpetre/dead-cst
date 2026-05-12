@@ -9,6 +9,21 @@ two versions.
 
 ## [Unreleased]
 
+### Fixed
+- Attribute access on a runtime module dunder (`some_pkg.__file__`,
+  `some_pkg.__name__`, `some_pkg.__spec__`, etc.) no longer surfaces a
+  "Failed to resolve import edge" warning. The import machinery injects
+  these attributes on every module object at runtime, so the chain past
+  them is a path / string op, not a symbol reference. The visitor now
+  truncates the access chain at the dunder and emits a clean
+  `Import(module=X, decl=None)` instead of a speculative
+  `Import(module=X, decl="__file__")`. Reachability is unchanged -- the
+  module-level edge that previously rode alongside the failed lookup is
+  the same edge that's now emitted directly. Recognised dunders:
+  `__file__`, `__name__`, `__doc__`, `__loader__`, `__spec__`,
+  `__package__`, `__path__`, `__builtins__`, `__cached__`. Visitor
+  `version` is bumped so cached payloads rebuild.
+
 ## [0.9.2] - 2026-05-12
 
 ### Added
