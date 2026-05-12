@@ -159,18 +159,16 @@ Folded down from earlier tiers as they landed:
 
 - **v0.9.4**: ``PluginContext`` now requires ``package_graph`` (the
   per-package contribution graph) and ``module_nodes`` (its
-  module-typed entries, precomputed in ``_apply_payload`` from the
-  ``next(...)`` it already does per file). ``package_nodes`` snapshots
-  ``package_graph.nodes`` and ``package_modules`` reads ``module_nodes``
-  directly, replacing two filter passes -- ``Path.is_relative_to`` over
-  the merged cross-package ``graph`` (dominated the first call in every
-  finalize pass: ~9 ms → ~40 µs on the dead-cst self-analysis) and
-  ``type == "module"`` over the contribution graph (~50 µs → ~4 µs).
-  Plugin behavior is unchanged; the helpers expose the same node sets
-  they always did. Custom callers that construct ``PluginContext``
-  directly (tests, out-of-tree pipelines) must pass both fields -- a
-  hard break rather than an optional shim, matching the pre-1.0 API
-  churn budget.
+  module-typed entries). ``package_nodes`` snapshots
+  ``package_graph.nodes`` and ``package_modules`` iterates
+  ``module_nodes`` directly, replacing two filter passes that ran on
+  the merged cross-package ``graph`` every finalize pass:
+  ``Path.is_relative_to`` (~9 ms → ~40 µs on the dead-cst
+  self-analysis) and ``type == "module"`` (~50 µs → ~4 µs). The
+  analyzer wires both through automatically; custom callers that
+  construct ``PluginContext`` directly must pass them -- a hard break
+  rather than an optional shim, matching the pre-1.0 API churn budget.
+  ``PackageView.modules()`` also picks up the precomputed list.
 - **v0.9.3**: ``ServerConfigPlugin`` (``dead_cst.contrib.server_config``,
   registered as the ``server_config`` builtin) marks Gunicorn / Hypercorn
   config files (``gunicorn.conf.py``, ``gunicorn_conf.py``,

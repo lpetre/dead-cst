@@ -916,9 +916,7 @@ class PackageView:
         Local-only: refreshes this package if needed but never
         touches deps or consumers.
         """
-        for n in self._contribution().package_graph.nodes:
-            if n.type == "module":
-                yield n
+        yield from self._contribution().module_nodes
 
     def declarations(self, name: str | None = None) -> Iterator[SymbolNode]:
         """Top-level decls in this package.

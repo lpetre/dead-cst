@@ -13,14 +13,14 @@ two versions.
 
 ### Changed
 - `PluginContext` now requires `package_graph` (the per-package
-  contribution graph) and `module_nodes` (its module-typed entries,
-  precomputed in `_apply_payload` from the `next(...)` it already does
-  per file). `package_nodes` iterates `package_graph.nodes` directly
-  and `package_modules` iterates the `module_nodes` tuple -- both drop
-  the `Path.is_relative_to` filter over the merged cross-package
-  `graph`, and `package_modules` also drops the `type == "module"`
-  scan. The analyzer wires these through automatically; custom
-  callers that construct `PluginContext` directly must pass both.
+  contribution graph) and `module_nodes` (its module-typed entries).
+  `package_nodes` and `package_modules` source from these directly,
+  dropping the `Path.is_relative_to` filter and `type == "module"`
+  scan they used to run on the merged cross-package `graph`. The
+  analyzer wires both through automatically; custom callers that
+  construct `PluginContext` directly must pass them.
+- `PackageView.modules()` now reads `PackageContribution.module_nodes`
+  instead of refiltering the contribution graph.
 
 ## [0.9.3] - 2026-05-12
 
