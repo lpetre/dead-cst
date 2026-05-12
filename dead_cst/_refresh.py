@@ -322,6 +322,12 @@ def build_contribution(
     cheap: composing it into the full graph or a closure graph doesn't
     redo per-file apply work. Empty :attr:`Package.exported` means
     "no restriction" (every file in the package is exported to consumers).
+
+    A pre-pass identifies module-FQN collisions (``foo.py`` alongside
+    ``foo/__init__.py``) via :func:`shadowed_paths` so the loser is
+    skipped at the trie -- the visitor still graphs its nodes so any
+    observe-time entrypoints (``__main__``, plugin synthetics) keep
+    working, but cross-module imports route to the package winner.
     """
     current_trie = SymbolTrie()
     export_trie = SymbolTrie()
@@ -329,6 +335,7 @@ def build_contribution(
     import_edges: set[tuple[SymbolNode, Import, EdgeFlags]] = set()
     package_graph: nx.MultiDiGraph = nx.MultiDiGraph()
     package_graph.graph["dead_suites"] = {}
+    shadowed = shadowed_paths(package_files.files)
     for file in package_files.files:
         payload = package_files.hits.get(file)
         if payload is None:
@@ -345,6 +352,7 @@ def build_contribution(
             current_trie=current_trie,
             export_trie=export_trie,
             file_exported=file_exported,
+            add_to_trie=file not in shadowed,
             symbol_graph=package_graph,
             import_edges=import_edges,
         )
@@ -356,6 +364,40 @@ def build_contribution(
         package_graph=package_graph,
         import_edges=frozenset(import_edges),
     )
+
+
+def shadowed_paths(files: Sequence[Path]) -> frozenset[Path]:
+    """Return every ``.py`` / ``.pyi`` in ``files`` shadowed by a sibling package.
+
+    Mirrors CPython's :class:`importlib.machinery.FileFinder` precedence:
+    a regular package (``__init__.py``) shadows a sibling module file
+    that would claim the same dotted name. Given a directory containing
+    both ``foo.py`` and ``foo/__init__.py``, ``foo.py`` is returned --
+    Python's import machinery loads the package, so resolving
+    ``pkg.foo`` to the ``.py`` would mis-route every consumer import.
+
+    Logs a warning per shadowed file: this layout is almost always a
+    bug, and surfacing it during analysis helps users notice before
+    the dead-code report blames the wrong half.
+    """
+    init_dirs = {f.parent for f in files if f.name == "__init__.py"}
+    shadowed: set[Path] = set()
+    for f in files:
+        if f.name == "__init__.py":
+            continue
+        candidate = f.with_suffix("")
+        if candidate in init_dirs:
+            init_path = candidate / "__init__.py"
+            logger.warning(
+                "Module %s shadowed by sibling package %s; "
+                "Python loads the package, so %s will not be "
+                "reachable as an importable module",
+                f,
+                init_path,
+                f.name,
+            )
+            shadowed.add(f)
+    return frozenset(shadowed)
 
 
 # ---------------------------------------------------------------------------
@@ -537,6 +579,7 @@ def _apply_payload(
     current_trie: SymbolTrie,
     export_trie: SymbolTrie,
     file_exported: bool,
+    add_to_trie: bool,
     symbol_graph: nx.MultiDiGraph,
     import_edges: set[tuple[SymbolNode, Import, EdgeFlags]],
 ) -> None:
@@ -607,11 +650,12 @@ def _apply_payload(
             continue
         if n.type != "module":
             symbol_graph.add_edge(n, module, flags=EdgeFlags.NONE)
-        # ``OVERLOAD`` and ``SHADOWED`` both keep the decl out of the
-        # cross-module lookup trie; the graph keeps the parent edge so
-        # the decl is well-formed but consumer imports route to the
-        # impl, never the stub.
-        if not (n.flags & (NodeFlags.SHADOWED | NodeFlags.OVERLOAD)):
+        # ``OVERLOAD`` and ``SHADOWED`` exclude a single decl from the
+        # cross-module lookup trie; ``add_to_trie=False`` is the
+        # file-level equivalent for a ``.py`` whose sibling package
+        # shadows it. Either way the graph keeps the parent edge so
+        # the decl is well-formed -- only consumer FQN lookups change.
+        if add_to_trie and not (n.flags & (NodeFlags.SHADOWED | NodeFlags.OVERLOAD)):
             current_trie.add_declaration(n)
             if file_exported:
                 export_trie.add_declaration(n)

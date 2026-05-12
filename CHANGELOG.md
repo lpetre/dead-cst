@@ -19,6 +19,18 @@ two versions.
   scratch on every access. Pure performance change — output and
   payload-cache fingerprint are unchanged.
 
+### Fixed
+- A `foo.py` sibling of a `foo/__init__.py` package no longer asserts
+  out of `SymbolTrie.add_declaration`. The new
+  `dead_cst._refresh.shadowed_paths` pre-pass mirrors CPython's
+  `FileFinder` precedence (regular package wins over a same-named
+  module file), so the trie holds the package and cross-module imports
+  of `pkg.foo` route there. The shadowed `.py` is still parsed and its
+  nodes still appear in the package graph -- observe-time entrypoints
+  (`__main__` blocks, plugin synthetics) keep working -- but consumer
+  imports never see its decls. A WARNING is logged per shadowed file
+  so the layout (almost always a bug) surfaces during analysis.
+
 ## [0.9.1] - 2026-05-11
 
 ### Fixed
