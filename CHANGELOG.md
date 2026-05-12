@@ -23,6 +23,39 @@ two versions.
   by the server process at startup (Docker, Cloud Run, systemd) and
   not imported anywhere in the project, so without this plugin their
   whole surface looks dead.
+- `find_factory_decls(module, imports, valid_targets)` is exported from
+  `dead_cst.plugins`. Third-party framework plugins that follow the
+  same instance-construction shape can use it together with
+  `walk_to_instance_kind(..., factory_marker_prefix=...)` to get
+  cross-package factory support for free.
+
+### Fixed
+- `FastAPIPlugin` and `FlaskPlugin` now classify the factory pattern
+  across packages when the factory uses `import fastapi; fastapi.FastAPI()`
+  / `import flask; flask.Flask()` (module-prefixed form). The
+  external-edge classifier drops the `decl=` half of the access, so the
+  downstream walk had no discriminator to tell `FastAPI` from
+  `APIRouter` (or `Flask` from `Blueprint`). `observe` now tags every
+  top-level decl whose body constructs one of those classes with a
+  `<{fastapi,flask}-factory>:<kind>:<owner>` synthetic, and
+  `walk_to_instance_kind` accepts a `factory_marker_prefix=` kwarg so
+  the per-package finalize walk picks the marker up regardless of which
+  file the factory lives in. The named-import shape
+  (`from fastapi import FastAPI`) was already covered by the
+  import-node discriminator and is unaffected.
+- Attribute access on a runtime module dunder (`some_pkg.__file__`,
+  `some_pkg.__name__`, `some_pkg.__spec__`, etc.) no longer surfaces a
+  "Failed to resolve import edge" warning. The import machinery injects
+  these attributes on every module object at runtime, so the chain past
+  them is a path / string op, not a symbol reference. The visitor now
+  truncates the access chain at the dunder and emits a clean
+  `Import(module=X, decl=None)` instead of a speculative
+  `Import(module=X, decl="__file__")`. Reachability is unchanged -- the
+  module-level edge that previously rode alongside the failed lookup is
+  the same edge that's now emitted directly. Recognised dunders:
+  `__file__`, `__name__`, `__doc__`, `__loader__`, `__spec__`,
+  `__package__`, `__path__`, `__builtins__`, `__cached__`. Visitor
+  `version` is bumped so cached payloads rebuild.
 
 ## [0.9.2] - 2026-05-12
 

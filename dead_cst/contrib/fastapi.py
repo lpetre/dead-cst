@@ -17,9 +17,17 @@ returns ``FastAPI(...)``. The plugin reuses those reference edges:
    is detected via the route-decorator scan. Per-file ``observe``
    emits a ``<fastapi-pending>:<X.fqname>`` marker plus the
    ``X -> handler`` edges; the per-package ``finalize`` pass walks the
-   graph forward from each pending marker, classifies via
-   ``walk_to_instance_kind``, and promotes ``FastAPI`` instances to
-   entrypoints.
+   graph forward from each pending marker and promotes
+   ``FastAPI`` instances to entrypoints.
+3. Factory functions / classes whose body constructs a FastAPI /
+   APIRouter instance are tagged at ``observe`` time with a
+   ``<fastapi-factory>:<kind>:<decl.fqname>`` marker. This lets a
+   cross-package consumer's pending-variable walk hit a discriminator
+   even when the factory uses the ``import fastapi; fastapi.FastAPI()``
+   form -- the attribute access lands as a bare
+   ``[external dist] fastapi`` edge after :func:`resolve_edges` drops
+   the ``decl='FastAPI'`` half, so the graph alone can't tell FastAPI
+   from APIRouter on the downstream walk.
 """
 
 from __future__ import annotations
@@ -39,6 +47,7 @@ from ..plugins._core import (
     collect_module_imports,
     decls_by_simple_name,
     find_call_assignments,
+    find_factory_decls,
     find_handlers,
     make_payload,
     require_resolved_dep,
@@ -79,6 +88,15 @@ _INSTANCE_KINDS: dict[str, bool] = {
 
 FASTAPI_APP_PREFIX = "<fastapi-app>:"
 FASTAPI_PENDING_PREFIX = "<fastapi-pending>:"
+# Synthetic emitted from ``observe`` for any top-level function / class whose
+# body constructs a ``FastAPI()`` / ``APIRouter()`` instance. Lets
+# :meth:`FastAPIPlugin.finalize` classify cross-package factory chains where
+# the framework class is reached via ``import fastapi; fastapi.FastAPI()`` --
+# the attribute-form access lands as a bare ``[external dist] fastapi`` edge
+# (the resolver drops ``decl='FastAPI'`` for external classifications), so the
+# graph alone can't distinguish FastAPI from APIRouter on the downstream walk.
+# Format: ``<fastapi-factory>:<FastAPI|APIRouter>:<owner.fqname>``.
+FASTAPI_FACTORY_PREFIX = "<fastapi-factory>:"
 
 
 @dataclass
@@ -103,23 +121,33 @@ class FastAPIPlugin:
     3. Variables decorated but not directly classified get a
        :data:`FASTAPI_PENDING_PREFIX` marker synthetic with an edge
        to the variable. The :meth:`finalize` pass picks these up.
+    4. Top-level decls whose body constructs a FastAPI / APIRouter
+       instance get a :data:`FASTAPI_FACTORY_PREFIX` marker. This
+       discriminator survives cross-package walks where the external
+       edge would otherwise lose ``decl='FastAPI'`` info.
 
-    Finalize walks forward from each pending variable, hits the
-    ``fastapi`` external-dist synthetic if any, classifies the variable
-    via ``walk_to_instance_kind``, and -- for ``FastAPI`` instances --
-    emits a ``<fastapi-app>:`` synthetic entrypoint plus an edge to
-    the variable. Routers and unclassified variables stay as-is, so
-    an ``APIRouter`` that nothing ``include_router``s remains dead.
+    Finalize walks forward from each pending variable until it hits
+    a discriminator (a ``from fastapi import FastAPI``-style import
+    node or a factory marker), classifies the variable, and -- for
+    ``FastAPI`` instances -- emits a ``<fastapi-app>:`` synthetic
+    entrypoint plus an edge to the variable. Routers and unclassified
+    variables stay as-is, so an ``APIRouter`` that nothing
+    ``include_router``s remains dead.
     """
 
     name: str = "fastapi"
-    version: int = 1777760307
+    version: int = 1778973600
 
     def observe(self, ctx: ObserveContext) -> VisitorPayload | None:
         fastapi_imports = collect_module_imports(ctx.module, "fastapi", _INSTANCE_KINDS)
         direct = find_call_assignments(ctx.module, fastapi_imports, _INSTANCE_KINDS)
         decorated = find_handlers(ctx.module, None, _REGISTRATION_DECORATORS)
-        if not direct and not decorated:
+        # Top-level decls whose body constructs a FastAPI / APIRouter instance.
+        # ``fastapi_imports`` doubles as the binding map for ``matched_attr_call``
+        # so both ``FastAPI()`` (named import) and ``fastapi.FastAPI()`` (module
+        # import) are recognized.
+        factory_kinds = find_factory_decls(ctx.module, fastapi_imports, _INSTANCE_KINDS)
+        if not direct and not decorated and not factory_kinds:
             return None
 
         decls_by_name = decls_by_simple_name(ctx.payload.nodes)
@@ -151,6 +179,18 @@ class FastAPIPlugin:
                     for handler_decl in decls_by_name.get(handler_name, []):
                         edges.append((var_decl, handler_decl, SYNTHETIC_POSITION))
 
+        # Factory markers: decl bodies that build a FastAPI / APIRouter
+        # instance. Anchored to the constructing decl so finalize's forward
+        # walk hits them regardless of which file the consumer lives in.
+        for decl_name, kinds in factory_kinds.items():
+            for decl in decls_by_name.get(decl_name, []):
+                for kind in kinds:
+                    marker = synthetic_node(
+                        f"{FASTAPI_FACTORY_PREFIX}{kind}:{decl.fqname}", ctx.path
+                    )
+                    nodes.append(marker)
+                    edges.append((decl, marker, SYNTHETIC_POSITION))
+
         if not nodes and not edges:
             return None
         return make_payload(nodes=nodes, edges=edges)
@@ -168,7 +208,12 @@ class FastAPIPlugin:
                 continue
             for var in successors:
                 kind = walk_to_instance_kind(
-                    ctx.graph, var, fastapi_node, "fastapi", _INSTANCE_KINDS
+                    ctx.graph,
+                    var,
+                    fastapi_node,
+                    "fastapi",
+                    _INSTANCE_KINDS,
+                    factory_marker_prefix=FASTAPI_FACTORY_PREFIX,
                 )
                 if kind is None or not _INSTANCE_KINDS[kind]:
                     continue

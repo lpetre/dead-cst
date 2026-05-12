@@ -572,3 +572,137 @@ def test_flask_plugin_loads_via_load_plugin():
     plugin = load_plugin("flask")
     assert isinstance(plugin, FlaskPlugin)
     assert plugin.name == "flask"
+
+
+def test_flask_plugin_factory_in_different_package(make_analysis, write_files, reachable_fqnames):
+    """Factory in dep package, consumer in dependent package."""
+    write_files(
+        {
+            "pkg_a/pkg_a/__init__.py": "",
+            "pkg_a/pkg_a/factory.py": """
+            from flask import Flask
+
+            def create_app() -> Flask:
+                return Flask(__name__)
+            """,
+            "pkg_b/pkg_b/__init__.py": "",
+            "pkg_b/pkg_b/main.py": """
+            from pkg_a.factory import create_app
+
+            app = create_app()
+
+            @app.route("/")
+            def index(): pass
+            """,
+        }
+    )
+    graph = make_analysis(["pkg_a", "pkg_b:pkg_a"], plugins=[FlaskPlugin()]).materialize_all()
+    reached = reachable_fqnames(graph)
+    assert "pkg_b.main.app" in reached
+    assert "pkg_b.main.index" in reached
+
+
+def test_flask_plugin_factory_module_form_in_different_package(
+    make_analysis, write_files, reachable_fqnames
+):
+    """Factory in dep package uses ``import flask; flask.Flask()``.
+
+    Without the factory-marker synthetic the cross-package walk has no
+    discriminator -- the external-edge classifier drops the
+    ``decl='Flask'`` half of the access.
+    """
+    write_files(
+        {
+            "pkg_a/pkg_a/__init__.py": "",
+            "pkg_a/pkg_a/factory.py": """
+            import flask
+
+            def create_app():
+                return flask.Flask(__name__)
+            """,
+            "pkg_b/pkg_b/__init__.py": "",
+            "pkg_b/pkg_b/main.py": """
+            from pkg_a.factory import create_app
+
+            app = create_app()
+
+            @app.route("/")
+            def index(): pass
+            """,
+        }
+    )
+    graph = make_analysis(["pkg_a", "pkg_b:pkg_a"], plugins=[FlaskPlugin()]).materialize_all()
+    reached = reachable_fqnames(graph)
+    assert "pkg_b.main.app" in reached
+    assert "pkg_b.main.index" in reached
+
+
+def test_flask_plugin_blueprint_factory_in_different_package(
+    make_analysis, write_files, reachable_fqnames
+):
+    """Blueprint factory in dep package, consumer wires it via ``register_blueprint``."""
+    write_files(
+        {
+            "pkg_a/pkg_a/__init__.py": "",
+            "pkg_a/pkg_a/routes.py": """
+            from flask import Blueprint
+
+            def make_blueprint() -> Blueprint:
+                bp = Blueprint("bp", __name__)
+
+                @bp.route("/")
+                def index(): pass
+
+                return bp
+            """,
+            "pkg_b/pkg_b/__init__.py": "",
+            "pkg_b/pkg_b/main.py": """
+            from flask import Flask
+            from pkg_a.routes import make_blueprint
+
+            app = Flask(__name__)
+            bp = make_blueprint()
+            app.register_blueprint(bp)
+            """,
+        }
+    )
+    graph = make_analysis(["pkg_a", "pkg_b:pkg_a"], plugins=[FlaskPlugin()]).materialize_all()
+    reached = reachable_fqnames(graph)
+    assert "pkg_b.main.app" in reached
+    assert "pkg_b.main.bp" in reached
+
+
+def test_flask_plugin_orphan_blueprint_factory_stays_dead_cross_package(
+    make_analysis, write_files, reachable_fqnames
+):
+    """Blueprint factory in dep package that nobody ``register_blueprint``s.
+
+    The factory marker carries the ``Blueprint`` kind, which finalize
+    explicitly leaves un-entrypointed -- so a downstream consumer that
+    only constructs the blueprint (without registering it on a Flask
+    app) still gets flagged dead.
+    """
+    write_files(
+        {
+            "pkg_a/pkg_a/__init__.py": "",
+            "pkg_a/pkg_a/routes.py": """
+            from flask import Blueprint
+
+            def make_blueprint() -> Blueprint:
+                return Blueprint("bp", __name__)
+            """,
+            "pkg_b/pkg_b/__init__.py": "",
+            "pkg_b/pkg_b/main.py": """
+            from pkg_a.routes import make_blueprint
+
+            bp = make_blueprint()
+
+            @bp.route("/orphan")
+            def orphan(): pass
+            """,
+        }
+    )
+    graph = make_analysis(["pkg_a", "pkg_b:pkg_a"], plugins=[FlaskPlugin()]).materialize_all()
+    reached = reachable_fqnames(graph)
+    assert "pkg_b.main.bp" not in reached
+    assert "pkg_b.main.orphan" not in reached

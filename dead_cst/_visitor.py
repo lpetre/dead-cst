@@ -28,6 +28,26 @@ from .graph import Import, NodeFlags, SymbolNode, SymbolTrie, VisitorPayload
 
 logger = logging.getLogger(__name__)
 
+# Attributes the import machinery injects on every module object at
+# runtime. They never appear in source, so attribute access past one
+# of these (``some_pkg.__file__``, ``some_pkg.__spec__``, ...) is a
+# path / string op, not a symbol reference -- the access chain is
+# truncated at the dunder so the Import collapses to a module-level
+# dep.
+_MODULE_RUNTIME_DUNDERS = frozenset(
+    {
+        "__file__",
+        "__name__",
+        "__doc__",
+        "__loader__",
+        "__spec__",
+        "__package__",
+        "__path__",
+        "__builtins__",
+        "__cached__",
+    }
+)
+
 
 def _dotted_name_parts(
     prefix: str, node: cst.BaseExpression
@@ -144,7 +164,7 @@ class SymbolVisitor(cst.CSTVisitor):
     # edge-attribution rules, flow-analysis fixes, etc. Concurrent
     # bumps on different branches merge with ``max()`` semantics.
     name: str = "default"
-    version: int = 1778326719
+    version: int = 1778573113
 
     def _pos(self, node: cst.CSTNode):
         return self.get_metadata(PositionProvider, node, default=None)
@@ -891,6 +911,11 @@ class SymbolVisitor(cst.CSTVisitor):
                                 break
                             accessed_attrs.append(parent.attr.value)
                             curr_access = parent
+
+                    for i, attr in enumerate(accessed_attrs):
+                        if attr in _MODULE_RUNTIME_DUNDERS:
+                            del accessed_attrs[i:]
+                            break
 
                     # Create the new Import with the specific symbol being accessed
                     resolved_import = Import(
