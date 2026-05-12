@@ -85,16 +85,10 @@ class PluginContext:
     """
 
     graph: nx.DiGraph
+    package_graph: nx.MultiDiGraph
     symbol_lookup: SymbolTrie
     package: Package
     project_root: Path
-    # Per-package contribution graph: every node whose path is under
-    # ``package.path``, before the cross-package merge. ``package_nodes``
-    # / ``package_modules`` source from this directly so they don't pay
-    # an O(N_total) ``Path.is_relative_to`` scan over the merged
-    # ``graph`` on the first call. The analyzer passes
-    # ``PackageContribution.package_graph``.
-    package_graph: nx.MultiDiGraph
     _modules: dict[Path, cst.Module | None] = field(default_factory=dict, repr=False)
     # Lazy ``fqname -> SymbolNode`` index over synthetic nodes (built on
     # first ``importers`` call).  Plugins that add their own synthetic

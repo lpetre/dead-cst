@@ -363,8 +363,8 @@ def test_find_call_assignments_ignores_non_call_rhs():
 # ---------------------------------------------------------------------------
 
 
-def test_plugin_context_package_modules_yields_from_package_graph(tmp_path):
-    """``package_modules`` sources from ``package_graph`` and snapshots once."""
+def test_plugin_context_package_modules_yields_modules_only(tmp_path):
+    """``package_modules`` yields module-typed nodes and snapshots once."""
     pkg = Package(path=tmp_path, name="pkg")
     inside = SymbolNode("pkg.a", "module", tmp_path / "a.py", _pos())
     fn = SymbolNode("pkg.a.f", "function", tmp_path / "a.py", _pos())
@@ -389,8 +389,8 @@ def test_plugin_context_package_modules_yields_from_package_graph(tmp_path):
     assert list(ctx.package_modules()) == first
 
 
-def test_plugin_context_package_nodes_yields_from_package_graph(tmp_path):
-    """``package_nodes`` yields the whole ``package_graph`` node set and snapshots once."""
+def test_plugin_context_package_nodes_snapshots_first_scan(tmp_path):
+    """``package_nodes`` yields every node and snapshots once."""
     pkg = Package(path=tmp_path, name="pkg")
     mod = SymbolNode("pkg", "module", tmp_path / "__init__.py", _pos())
     fn = SymbolNode("pkg.f", "function", tmp_path / "a.py", _pos())

@@ -1,20 +1,4 @@
-"""Standalone benchmark + cProfile for ``_refresh.build_contribution``
-and ``PluginContext.package_nodes``.
-
-Times the per-package apply pass -- the loop that stitches every cached
-:class:`VisitorPayload` into a per-package graph + trie -- over the
-``dead_cst/`` source tree. The visitor pass is run once up front to
-produce the payloads, then :func:`build_contribution` is called in a
-hot loop with everything already in ``PackageFiles.hits`` so the
-measurement isolates apply-pass cost from libcst parse work.
-
-A second section measures :meth:`PluginContext.package_nodes`, the
-helper plugins use during :meth:`EdgePlugin.finalize` to iterate
-"every node in this package". It scans the composed cross-package
-graph and filters by ``node.path.is_relative_to(package_path)``;
-plugins like ``ExplicitEntrypointPlugin``, ``MockPatchPlugin``, and
-the framework plugins (FastAPI / Flask / discord.py) call it once
-per finalize pass.
+"""Benchmark + cProfile for ``build_contribution`` and ``package_nodes``.
 
 Run from the repo root:
 
@@ -28,16 +12,16 @@ import pstats
 import time
 from pathlib import Path
 
-from dead_cst._fqn import FixedFullyQualifiedNameProvider
 from dead_cst._refresh import (
     PackageContribution,
     PackageFiles,
-    StaleFile,
     build_contribution,
+    build_stale_tasks,
     process_stale_files,
 )
 from dead_cst.branches import DefaultUnreachableRegionDetector
 from dead_cst.cache import GraphCache, compute_fingerprint, default_cache_path
+from dead_cst.graph import VisitorPayload
 from dead_cst.plugins._core import PluginContext
 from dead_cst.resolvers._core import Package
 from dead_cst.resolvers._exports import exported_roots
@@ -47,6 +31,11 @@ REPEATS = 50
 
 def main() -> None:
     project_root = Path(".").resolve()
+    # Walk ``dead_cst/`` only; an ``Analysis`` rooted at ``project_root``
+    # would rglob ``.venv`` / tests / examples too, but libcst's FQN
+    # provider only handles relative imports correctly when the package
+    # root is the project root (``from ..resolvers`` in ``dead_cst/contrib/``
+    # would escape a ``dead_cst``-rooted package).
     target_dir = project_root / "dead_cst"
     assert target_dir.is_dir(), f"expected {target_dir} to exist"
 
@@ -60,14 +49,11 @@ def main() -> None:
         deps=(),
     )
 
-    # Walk only ``dead_cst/`` to avoid the venv / examples / tests trees
-    # that an ``rglob`` from ``project_root`` would otherwise pull in.
     files = tuple(sorted(p for p in target_dir.rglob("*.py") if p.is_file()))
     print(f"build_contribution over {len(files)} file(s) under {target_dir.name}/")
 
     with GraphCache(default_cache_path(project_root)) as cache:
-        # Visitor pass (one-time): produce a payload for every file.
-        hits: dict[Path, object] = {}
+        hits: dict[Path, VisitorPayload] = {}
         miss_files: list[Path] = []
         for f in files:
             payload = cache.get(f, fingerprint)
@@ -76,19 +62,9 @@ def main() -> None:
             else:
                 hits[f] = payload
 
+        pf = PackageFiles(package=package, files=files, hits=hits, miss_files=tuple(miss_files))
         if miss_files:
-            fqn_cache = FixedFullyQualifiedNameProvider.gen_cache(
-                project_root, [str(f) for f in miss_files], timeout=30
-            )
-            tasks = [
-                StaleFile(
-                    file=f,
-                    package=package,
-                    fqn_entry=fqn_cache[str(f)],
-                    project_root=project_root,
-                )
-                for f in miss_files
-            ]
+            tasks = build_stale_tasks({package.path: pf}, project_root)
             t0 = time.perf_counter()
             miss_payloads = process_stale_files(
                 tasks=tasks,
@@ -98,19 +74,10 @@ def main() -> None:
                 fingerprint=fingerprint,
                 workers=None,
             )
-            print(
-                f"  visitor warmup: {(time.perf_counter() - t0) * 1000:.0f} ms over {len(tasks)} miss(es)"
-            )
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            print(f"  visitor warmup: {elapsed_ms:.0f} ms over {len(tasks)} miss(es)")
             hits.update(miss_payloads)
 
-        pf = PackageFiles(
-            package=package,
-            files=files,
-            hits=hits,  # type: ignore[arg-type]
-            miss_files=(),
-        )
-
-    # Warmup call before timing.
     contrib = build_contribution(package, pf, {})
 
     t0 = time.perf_counter()
@@ -139,12 +106,7 @@ def main() -> None:
 
 
 def _profile_package_nodes(contrib: PackageContribution, project_root: Path) -> None:
-    """Benchmark :meth:`PluginContext.package_nodes`.
-
-    Cold = fresh :class:`PluginContext` per iteration (the per-finalize
-    cost; ``_compose_contribution`` builds a new context per package).
-    Warm = same context, subsequent calls hit the snapshot cache.
-    """
+    """Benchmark :meth:`PluginContext.package_nodes`."""
     graph = contrib.package_graph
     n_total = graph.number_of_nodes()
     print(f"\npackage_nodes: package graph has {n_total} node(s)")
@@ -158,7 +120,7 @@ def _profile_package_nodes(contrib: PackageContribution, project_root: Path) -> 
             package_graph=contrib.package_graph,
         )
 
-    _make_ctx()  # warm import paths
+    _make_ctx()
 
     t0 = time.perf_counter()
     matched = 0
