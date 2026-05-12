@@ -39,26 +39,6 @@ from .resolvers import ImportResolver, default_resolve_import
 
 logger = logging.getLogger(__name__)
 
-# Dunder attributes the import machinery injects on every module
-# object at runtime. They never appear in source as decls, so
-# ``some_module.__file__`` and friends always miss the trie -- but
-# they're real, valid attribute accesses, not unresolved symbols.
-# Silently drop the lookup so the module-level edge (already emitted
-# by the caller before ``_walk``) carries the dependency on its own.
-_MODULE_RUNTIME_DUNDERS = frozenset(
-    {
-        "__file__",
-        "__name__",
-        "__doc__",
-        "__loader__",
-        "__spec__",
-        "__package__",
-        "__path__",
-        "__builtins__",
-        "__cached__",
-    }
-)
-
 
 def _canonicalize(imp: Import, symbol_lookup: SymbolTrie) -> tuple[Import, SymbolTrie | None]:
     """Canonicalize ``imp`` and return the trie node its module lands on.
@@ -259,14 +239,6 @@ def resolve_edges(
             # that resolves as a submodule into ``Import.module``.
             if child := cur.children.get(part):
                 _enqueue(child, parts_now[1:])
-                continue
-
-            # ``some_module.__file__`` / ``__name__`` / ``__spec__`` /
-            # etc. are runtime attributes the import machinery injects
-            # on every module object -- never source decls, so they
-            # never appear in the trie. Drop silently; the module-level
-            # edge already covers the dependency.
-            if part in _MODULE_RUNTIME_DUNDERS:
                 continue
 
             logger.warning(

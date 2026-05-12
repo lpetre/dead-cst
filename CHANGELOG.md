@@ -10,15 +10,19 @@ two versions.
 ## [Unreleased]
 
 ### Fixed
-- `_edges.resolve_edges` no longer logs a spurious "Failed to resolve import
-  edge" warning for accesses to runtime module dunders (`__file__`,
-  `__name__`, `__doc__`, `__loader__`, `__spec__`, `__package__`,
-  `__path__`, `__builtins__`, `__cached__`). These attributes are injected
-  by the import machinery on every module object and never appear as
-  source decls, so the trie walk would otherwise miss on any
-  `Path(some_pkg.__file__).parent` idiom (the standard "find a data file
-  next to me" pattern). The module-level edge already covers the
-  dependency; the trie miss is now dropped silently.
+- Attribute access on a runtime module dunder (`some_pkg.__file__`,
+  `some_pkg.__name__`, `some_pkg.__spec__`, etc.) no longer surfaces a
+  "Failed to resolve import edge" warning. The import machinery injects
+  these attributes on every module object at runtime, so the chain past
+  them is a path / string op, not a symbol reference. The visitor now
+  truncates the access chain at the dunder and emits a clean
+  `Import(module=X, decl=None)` instead of a speculative
+  `Import(module=X, decl="__file__")`. Reachability is unchanged -- the
+  module-level edge that previously rode alongside the failed lookup is
+  the same edge that's now emitted directly. Recognised dunders:
+  `__file__`, `__name__`, `__doc__`, `__loader__`, `__spec__`,
+  `__package__`, `__path__`, `__builtins__`, `__cached__`. Visitor
+  `version` is bumped so cached payloads rebuild.
 
 ## [0.9.2] - 2026-05-12
 
