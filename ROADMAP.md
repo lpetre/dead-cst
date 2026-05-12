@@ -157,6 +157,118 @@ demand.
 
 Folded down from earlier tiers as they landed:
 
+- **v0.9.3**: ``ServerConfigPlugin`` (``dead_cst.contrib.server_config``,
+  registered as the ``server_config`` builtin) marks Gunicorn / Hypercorn
+  config files (``gunicorn.conf.py``, ``gunicorn_conf.py``,
+  ``hypercorn.conf.py``, ``hypercorn_conf.py`` by default; override the
+  ``filenames`` tuple for non-standard layouts) and every top-level decl
+  inside them (hook callbacks like ``on_starting`` / ``post_fork`` /
+  ``when_ready``, settings like ``bind`` / ``workers``, inline custom
+  logger / worker classes, helper imports) as entrypoints. These files
+  are loaded by the server process at startup (Docker, Cloud Run,
+  systemd) and not imported anywhere in the project, so without this
+  plugin their whole surface looked dead. Closes the
+  ServerConfigPlugin checkbox in Tier 1 #1.
+- **v0.9.3**: ``FastAPIPlugin`` and ``FlaskPlugin`` now classify the
+  factory pattern across packages when the factory uses the
+  module-prefixed form (``import fastapi; fastapi.FastAPI()`` /
+  ``import flask; flask.Flask()``). The external-edge classifier
+  drops the ``decl=`` half of the access, so the downstream walk had
+  no discriminator to tell ``FastAPI`` from ``APIRouter`` (or ``Flask``
+  from ``Blueprint``). ``observe`` now tags every top-level decl whose
+  body constructs one of those classes with a
+  ``<{fastapi,flask}-factory>:<kind>:<owner>`` synthetic, and
+  ``walk_to_instance_kind`` accepts a ``factory_marker_prefix=`` kwarg
+  so the per-package finalize walk picks the marker up regardless of
+  which file the factory lives in. ``find_factory_decls`` is exported
+  from ``dead_cst.plugins`` so third-party framework plugins with the
+  same instance-construction shape get cross-package factory support
+  for free. The named-import shape (``from fastapi import FastAPI``)
+  was already covered by the import-node discriminator and is
+  unaffected.
+- **v0.9.3**: Attribute access on a runtime module dunder
+  (``some_pkg.__file__``, ``some_pkg.__name__``, ``some_pkg.__spec__``,
+  etc.) no longer surfaces a "Failed to resolve import edge" warning.
+  The import machinery injects these attributes on every module object
+  at runtime, so the chain past them is a path / string op, not a
+  symbol reference. The visitor now truncates the access chain at the
+  dunder and emits a clean ``Import(module=X, decl=None)`` instead of a
+  speculative ``Import(module=X, decl="__file__")``. Reachability is
+  unchanged. Recognised dunders: ``__file__``, ``__name__``, ``__doc__``,
+  ``__loader__``, ``__spec__``, ``__package__``, ``__path__``,
+  ``__builtins__``, ``__cached__``. Visitor ``version`` bumped so cached
+  payloads rebuild.
+- **v0.9.2**: ``DiscordPyPlugin`` (``dead_cst.contrib.discordpy``,
+  registered as the ``discordpy`` builtin) recognizes top-level
+  ``commands.Bot`` / ``discord.Client`` (and the ``AutoSharded*``
+  variants) constructions and seeds them as entrypoints, wires
+  ``@bot.command()`` / ``@bot.event`` / ``@bot.listen()`` /
+  ``@bot.tree.command()`` / ``@bot.tree.context_menu()`` decorators
+  (and their group / hybrid / invoke-hook siblings) to their bot
+  variable, marks any module that defines a ``commands.Cog`` subclass
+  as alive together with its module-level ``setup`` / ``teardown``
+  hooks, and resolves ``<expr>.load_extension("dotted.path")`` /
+  ``load_extensions([...])`` string-literal targets onto the captured
+  module's surface (matching ``importlib.import_module`` semantics).
+  Closes the DiscordPyPlugin checkbox in Tier 1 #1.
+- **v0.9.2**: ``distribution_lookup`` and ``editable_distribution_roots``
+  are now keyed on the dist-bearing slice of ``sys.path``
+  (site-packages / dist-packages / purelib / platlib entries) instead
+  of an empty tuple, so they survive the analyzer's per-package
+  ``sys.path`` rebind for free — only the first-party prefix moves
+  during a transition, and that prefix never enters the key.
+  ``Analysis._materialize`` now uses the narrower
+  ``clear_module_specs_cache()`` (newly exported from
+  ``dead_cst.resolvers``) on every package transition instead of the
+  full ``clear_path_caches()``, dropping a ~10 s/package
+  ``importlib.metadata`` walk that dominated large-workspace runs
+  (a 110-package analysis was spending ~19 minutes inside the inner
+  dist scan alone). A real venv change (uv splicing in a workspace
+  ``.venv``) still flips the key automatically and triggers a single
+  rebuild. The CLI text/JSON report also gained a
+  ``_count_nodes_by_prefix`` batching helper that walks the graph
+  once per report instead of twice per package.
+- **v0.9.2**: ``SymbolVisitor`` hoists the ``_descendant_ids`` cache
+  used by ``live_referents`` / ``live_at_exit`` onto the visitor
+  instance, so a single shared cache covers every flow-analysis call
+  the visitor makes for a file. Previously each multi-referent access
+  in ``on_leave`` triggered a fresh cache allocation, so large files
+  with many reassignments re-walked the same statement subtrees from
+  scratch on every access. Pure performance change — output and
+  payload-cache fingerprint are unchanged.
+- **v0.9.2**: A ``foo.py`` sibling of a ``foo/__init__.py`` package no
+  longer asserts out of ``SymbolTrie.add_declaration``. The new
+  ``dead_cst._refresh.shadowed_paths`` pre-pass mirrors CPython's
+  ``FileFinder`` precedence (regular package wins over a same-named
+  module file), so the trie holds the package and cross-module imports
+  of ``pkg.foo`` route there. The shadowed ``.py`` is still parsed and
+  its nodes still appear in the package graph — observe-time
+  entrypoints (``__main__`` blocks, plugin synthetics) keep working —
+  but consumer imports never see its decls. A WARNING is logged per
+  shadowed file so the layout (almost always a bug) surfaces during
+  analysis.
+- **v0.9.1**: ``resolve_edges`` no longer spins forever on cyclic
+  re-exports. The worklist DFS now carries a per-walk ``visited`` set
+  keyed on ``(id(SymbolTrie), parts_tail)``, so a pathological pair
+  like ``A.x: from B import x`` / ``B.x: from A import x`` terminates
+  after one trip around the cycle instead of repeatedly chaining back
+  to its starting state. On a 1470-file monorepo this manifested as a
+  22-minute hang at 100% CPU stuck inside the per-package compose
+  loop; the decls actually encountered along the cycle are still
+  emitted, so first-party reachability through the chain is preserved.
+  ``resolve_edges`` also memoizes the full per-import resolution at
+  three layers: ``_resolve_targets`` keyed by ``Import`` value (so
+  equal spellings across files share the precomputed dst list — the
+  visitor builds fresh ``Import`` objects per file, but they hash
+  equal because ``Import`` is frozen with an eager ``__hash__``);
+  ``_walk`` keyed by ``(start_node, decl_parts)`` (so different
+  ``Import`` shapes that canonicalize to the same trie state share the
+  re-export DFS); and ``_classify`` keyed by
+  ``(import.module, import.speculative)`` (so the resolver runs once
+  per unique external name). The per-src loop collapses to
+  ``for dst in cached_targets: emit(...)``, turning the per-package
+  compose loop's growth in importer count from multiplicative to
+  additive.
 - **v0.9.0**: Parallel refresh (``--workers >= 2``) is now resilient and
   observable. Worker results stream via ``concurrent.futures.as_completed``
   instead of ``pool.map``, so cache writes and progress ticks land in
