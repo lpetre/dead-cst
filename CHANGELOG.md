@@ -9,6 +9,26 @@ two versions.
 
 ## [Unreleased]
 
+### Added
+- `ServerConfigPlugin` ships in `dead_cst.contrib.server_config` and
+  is registered under the `server_config` builtin name. Matches
+  Gunicorn / Hypercorn config files by basename (`gunicorn.conf.py`,
+  `gunicorn_conf.py`, `hypercorn.conf.py`, `hypercorn_conf.py` by
+  default; override the `filenames` tuple for non-standard layouts)
+  and marks the module plus every top-level decl (functions for hook
+  callbacks like `on_starting` / `post_fork` / `when_ready`,
+  variables for settings like `bind` / `workers`, classes for inline
+  custom logger / worker definitions, imports for helpers used only
+  to build config values) as an entrypoint. These files are loaded
+  by the server process at startup (Docker, Cloud Run, systemd) and
+  not imported anywhere in the project, so without this plugin their
+  whole surface looks dead.
+- `find_factory_decls(module, imports, valid_targets)` is exported from
+  `dead_cst.plugins`. Third-party framework plugins that follow the
+  same instance-construction shape can use it together with
+  `walk_to_instance_kind(..., factory_marker_prefix=...)` to get
+  cross-package factory support for free.
+
 ### Fixed
 - `FastAPIPlugin` and `FlaskPlugin` now classify the factory pattern
   across packages when the factory uses `import fastapi; fastapi.FastAPI()`
@@ -36,13 +56,6 @@ two versions.
   `__file__`, `__name__`, `__doc__`, `__loader__`, `__spec__`,
   `__package__`, `__path__`, `__builtins__`, `__cached__`. Visitor
   `version` is bumped so cached payloads rebuild.
-
-### Added
-- `find_factory_decls(module, imports, valid_targets)` is exported from
-  `dead_cst.plugins`. Third-party framework plugins that follow the
-  same instance-construction shape can use it together with
-  `walk_to_instance_kind(..., factory_marker_prefix=...)` to get
-  cross-package factory support for free.
 
 ## [0.9.2] - 2026-05-12
 
