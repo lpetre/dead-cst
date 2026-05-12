@@ -35,6 +35,7 @@ from ._exports import exported_roots
 from ._imports import (
     SITE_PACKAGES_MARKERS,
     STDLIB,
+    clear_module_specs_cache,
     clear_path_caches,
     default_resolve_import,
     distribution_lookup,
@@ -71,6 +72,7 @@ __all__ = [
     "SITE_PACKAGES_MARKERS",
     "STDLIB",
     "UvResolver",
+    "clear_module_specs_cache",
     "clear_path_caches",
     "default_resolve_import",
     "distribution_lookup",

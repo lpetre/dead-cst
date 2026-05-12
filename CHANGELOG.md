@@ -10,6 +10,26 @@ two versions.
 ## [Unreleased]
 
 ### Changed
+- `distribution_lookup` and `editable_distribution_roots` are now keyed
+  on the dist-bearing slice of `sys.path` (site-packages /
+  dist-packages / purelib / platlib entries) instead of an empty
+  tuple, so they survive the analyzer's per-package `sys.path` rebind
+  for free -- only the first-party prefix moves during a transition,
+  and that prefix never enters the key. `Analysis._materialize` now
+  uses the narrower `clear_module_specs_cache()` (also newly exported
+  from `dead_cst.resolvers`) on every package transition instead of
+  the full `clear_path_caches()`, dropping a ~10s/package
+  `importlib.metadata` walk that dominated large-workspace runs. A
+  real venv change (uv splicing in a workspace `.venv`) still flips
+  the key automatically and triggers a single rebuild. Pure
+  performance change.
+- `_count_nodes_by_prefix` batches the per-package node-counting that
+  the CLI text/JSON report does. Previously
+  `_output_text` / `_output_json` called `_count_nodes(graph, prefix)`
+  twice per package, each walking the entire graph; on large
+  workspaces this dominated report formatting. The bucketed helper
+  walks the graph once and aggregates by prefix in a second pass keyed
+  on unique file paths.
 - `SymbolVisitor` now hoists the `_descendant_ids` cache used by
   `live_referents` / `live_at_exit` onto the visitor instance, so a
   single shared cache covers every flow-analysis call the visitor

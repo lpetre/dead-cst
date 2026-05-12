@@ -108,25 +108,46 @@ def safe_resolve_module(fullname: str) -> ModuleSpec | None:
     return None
 
 
+def _dist_relevant_sys_path() -> tuple[str, ...]:
+    """Snapshot of ``sys.path`` entries that can host installed distributions.
+
+    :func:`distribution_lookup` and :func:`editable_distribution_roots`
+    depend on the *dist-bearing* portion of ``sys.path`` --
+    ``importlib.metadata`` discovers distributions by walking
+    site-packages-style directories. The analyzer's per-package
+    ``sys.path`` rebind only moves the first-party project prefix,
+    which never matches this filter, so the dist caches keyed on this
+    snapshot survive package transitions for free. A real venv change
+    (uv resolver splicing in a workspace ``.venv``, see
+    :func:`dead_cst.contrib.uv.UvResolver.resolve_import`) adds a new
+    site-packages entry, which flips the key and triggers a single
+    rebuild.
+    """
+    purelib_str = str(PURELIB) if PURELIB is not None else None
+    platlib_str = str(PLATLIB) if PLATLIB is not None else None
+    out: list[str] = []
+    for entry in sys.path:
+        if entry == purelib_str or entry == platlib_str:
+            out.append(entry)
+            continue
+        if any(marker in entry for marker in SITE_PACKAGES_MARKERS):
+            out.append(entry)
+    return tuple(out)
+
+
 @cache
-def distribution_lookup() -> dict[Path, str]:
-    """Map every installed distribution file to its canonical project name.
+def _distribution_lookup_for(_key: tuple[str, ...]) -> dict[Path, str]:
+    """Cached worker for :func:`distribution_lookup`, keyed on the venv slice.
 
-    Used by :func:`default_resolve_import` to classify a resolved path
-    as ``[external dist] <name>`` when the file came from an installed
-    third-party distribution.
-
-    Cached process-wide. The analyzer clears it in worker transitions
-    (see :func:`dead_cst.analyze._on_search_paths_change`) so a worker
-    that crosses a venv boundary -- e.g. between two uv-workspace
-    members each with their own ``.venv`` -- doesn't keep the prior
-    venv's dist map. Serial single-process runs already have a stable
-    ``sys.path`` at the venv level (only the first-party prefix moves
-    between packages), so the cache survives across packages there.
+    ``_key`` is the :func:`_dist_relevant_sys_path` snapshot at call
+    time. The body still reads :mod:`importlib.metadata` against the
+    live ``sys.path`` -- the key is purely a cache-invalidation
+    fingerprint so the same dist-bearing layout maps to the same
+    entry.
     """
     from importlib import metadata
 
-    lookup = {}
+    lookup: dict[Path, str] = {}
     for dist in metadata.distributions():
         canonical = _canonical_dist_name(dist.metadata["Name"])
         for file in dist.files or ():
@@ -135,7 +156,40 @@ def distribution_lookup() -> dict[Path, str]:
     return lookup
 
 
+def distribution_lookup() -> dict[Path, str]:
+    """Map every installed distribution file to its canonical project name.
+
+    Used by :func:`default_resolve_import` to classify a resolved path
+    as ``[external dist] <name>`` when the file came from an installed
+    third-party distribution.
+
+    Cached process-wide and keyed on :func:`_dist_relevant_sys_path` --
+    the dist-bearing slice of ``sys.path``. A worker crossing a venv
+    boundary (two uv-workspace members each with their own ``.venv``)
+    sees a different key and rebuilds. Single-venv runs hit the cache
+    on every package transition: the analyzer's per-package rebind
+    only moves the first-party prefix, which doesn't enter the key.
+    """
+    return _distribution_lookup_for(_dist_relevant_sys_path())
+
+
 @cache
+def _editable_distribution_roots_for(
+    _key: tuple[str, ...],
+) -> tuple[tuple[Path, str], ...]:
+    """Cached worker for :func:`editable_distribution_roots`. See
+    :func:`_distribution_lookup_for` for the keying contract."""
+    from importlib import metadata
+
+    roots: list[tuple[Path, str]] = []
+    for dist in metadata.distributions():
+        canonical = _canonical_dist_name(dist.metadata["Name"])
+        for root in _editable_source_roots(dist):
+            roots.append((root, canonical))
+    roots.sort(key=lambda pair: len(pair[0].parts), reverse=True)
+    return tuple(roots)
+
+
 def editable_distribution_roots() -> tuple[tuple[Path, str], ...]:
     """Source-directory roots for editably-installed distributions.
 
@@ -157,18 +211,10 @@ def editable_distribution_roots() -> tuple[tuple[Path, str], ...]:
 
     Returns ``(root, canonical_name)`` tuples sorted longest-path first
     so prefix-matching against nested editable layouts picks the most
-    specific dist. Cached alongside :func:`distribution_lookup` and
-    cleared together when the analyzer transitions across venvs.
+    specific dist. Cached alongside :func:`distribution_lookup` on the
+    same dist-bearing ``sys.path`` slice.
     """
-    from importlib import metadata
-
-    roots: list[tuple[Path, str]] = []
-    for dist in metadata.distributions():
-        canonical = _canonical_dist_name(dist.metadata["Name"])
-        for root in _editable_source_roots(dist):
-            roots.append((root, canonical))
-    roots.sort(key=lambda pair: len(pair[0].parts), reverse=True)
-    return tuple(roots)
+    return _editable_distribution_roots_for(_dist_relevant_sys_path())
 
 
 def _editable_source_roots(dist) -> list[Path]:
@@ -255,19 +301,37 @@ def _is_stdlib_path(path: Path) -> bool:
     return path.is_relative_to(STDLIB) and not _is_site_packages_path(path)
 
 
-def clear_path_caches() -> None:
-    """Drop the ``sys.path``-derived resolver caches.
+def clear_module_specs_cache() -> None:
+    """Clear the fullname-keyed module-spec cache only.
 
-    :func:`safe_resolve_module` keys on fullname and
-    :func:`distribution_lookup` / :func:`editable_distribution_roots`
-    key on ``()`` -- all three read live ``sys.path`` (or
-    :mod:`importlib.metadata` against it). Anything mutating
-    ``sys.path`` (the analyzer's per-package rebind, a resolver splicing
-    in its own venv) must call this to keep the next lookup honest.
+    :func:`safe_resolve_module` is keyed on the import fullname; it
+    reads ``sys.path`` live, so anything mutating ``sys.path`` needs to
+    invalidate it. The analyzer calls this on every package transition
+    where only the first-party prefix moves -- the dist caches are
+    keyed on :func:`_dist_relevant_sys_path` and survive that
+    transition automatically, so a narrower clear is enough to keep
+    every name resolution honest without re-paying the
+    ``importlib.metadata`` walk.
     """
     safe_resolve_module.cache_clear()
-    distribution_lookup.cache_clear()
-    editable_distribution_roots.cache_clear()
+
+
+def clear_path_caches() -> None:
+    """Drop every ``sys.path``-derived resolver cache.
+
+    The thorough variant of :func:`clear_module_specs_cache`. Useful
+    when ``sys.path`` mutation actually changes the visible
+    distributions (e.g. a uv resolver splicing in a workspace
+    ``.venv``) or when a caller wants a full reset (tests). Note that
+    :func:`distribution_lookup` / :func:`editable_distribution_roots`
+    *also* self-invalidate via their dist-bearing ``sys.path`` slice,
+    so callers that just want correctness across a real venv change
+    don't strictly need to call this -- the next lookup will rebuild
+    on its own. It is kept for explicit-reset semantics.
+    """
+    safe_resolve_module.cache_clear()
+    _distribution_lookup_for.cache_clear()
+    _editable_distribution_roots_for.cache_clear()
 
 
 def default_resolve_import(name: str, search_paths: list[Path]) -> str | Path | None:
