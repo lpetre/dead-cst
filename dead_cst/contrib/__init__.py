@@ -29,6 +29,7 @@ from __future__ import annotations
 
 from .click import ClickPlugin
 from .cyclopts import CycloptsPlugin
+from .discordpy import DiscordPyPlugin
 from .fastapi import FastAPIPlugin
 from .flask import FlaskPlugin
 from .mock_patch import MockPatchPlugin
@@ -47,6 +48,7 @@ from .unittest import UnittestPlugin
 __all__ = [
     "ClickPlugin",
     "CycloptsPlugin",
+    "DiscordPyPlugin",
     "FastAPIPlugin",
     "FlaskPlugin",
     "MockPatchPlugin",

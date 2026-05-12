@@ -9,6 +9,20 @@ two versions.
 
 ## [Unreleased]
 
+### Added
+- `DiscordPyPlugin` ships in `dead_cst.contrib.discordpy` and is
+  registered under the `discordpy` builtin name. The plugin recognizes
+  top-level `commands.Bot` / `discord.Client` (and the `AutoSharded*`
+  variants) constructions and seeds them as entrypoints, wires
+  `@bot.command()` / `@bot.event` / `@bot.listen()` / `@bot.tree.command()`
+  / `@bot.tree.context_menu()` decorators (and their group / hybrid /
+  invoke-hook siblings) to their bot variable, marks any module that
+  defines a `commands.Cog` subclass as alive together with its module-
+  level `setup` / `teardown` hooks, and resolves
+  `<expr>.load_extension("dotted.path")` / `load_extensions([...])`
+  string-literal targets onto the captured module's surface
+  (matching `importlib.import_module` semantics).
+
 ### Changed
 - `SymbolVisitor` now hoists the `_descendant_ids` cache used by
   `live_referents` / `live_at_exit` onto the visitor instance, so a
