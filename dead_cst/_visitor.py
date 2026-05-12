@@ -216,6 +216,12 @@ class SymbolVisitor(cst.CSTVisitor):
         # because comments may precede the import statements they cover.
         self._pinned_imports: set[SymbolNode] = set()
         self._file_pins_imports: bool = False
+        # Hoisted ``_descendant_ids`` cache shared across every
+        # ``live_referents`` / ``live_at_exit`` call this visitor makes.
+        # Big files with many reassignments fire one ``live_referents``
+        # per multi-referent access; without sharing, each call re-walks
+        # the same statement subtrees from scratch.
+        self._descendant_cache: dict[int, set[int]] = {}
 
     @property
     def module_node(self) -> SymbolNode:
@@ -770,7 +776,12 @@ class SymbolVisitor(cst.CSTVisitor):
                 if ref is not None:
                     referent_nodes.append(ref)
 
-            live_ids = {id(n) for n in live_at_exit(list(module_node.body), referent_nodes)}
+            live_ids = {
+                id(n)
+                for n in live_at_exit(
+                    list(module_node.body), referent_nodes, cache=self._descendant_cache
+                )
+            }
 
             live_decls: list[SymbolNode] = []
             shadowed_here: list[SymbolNode] = []
@@ -850,7 +861,12 @@ class SymbolVisitor(cst.CSTVisitor):
                     if body is not None:
                         live_ids = {
                             id(n)
-                            for n in live_referents(body, access.node, [r.node for r in referents])
+                            for n in live_referents(
+                                body,
+                                access.node,
+                                [r.node for r in referents],
+                                cache=self._descendant_cache,
+                            )
                         }
                         referents = [r for r in referents if id(r.node) in live_ids]
                 for referent in referents:
