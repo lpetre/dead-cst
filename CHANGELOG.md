@@ -12,12 +12,15 @@ two versions.
 ## [0.9.4] - 2026-05-12
 
 ### Changed
-- `PluginContext` now requires a `package_graph` field (the per-package
-  contribution graph). `package_nodes` / `package_modules` iterate it
-  directly, dropping the `Path.is_relative_to` filter over the merged
-  cross-package `graph`. The analyzer wires this through automatically;
-  custom callers that construct `PluginContext` directly must pass
-  `package_graph=`.
+- `PluginContext` now requires `package_graph` (the per-package
+  contribution graph) and `module_nodes` (its module-typed entries,
+  precomputed in `_apply_payload` from the `next(...)` it already does
+  per file). `package_nodes` iterates `package_graph.nodes` directly
+  and `package_modules` iterates the `module_nodes` tuple -- both drop
+  the `Path.is_relative_to` filter over the merged cross-package
+  `graph`, and `package_modules` also drops the `type == "module"`
+  scan. The analyzer wires these through automatically; custom
+  callers that construct `PluginContext` directly must pass both.
 
 ## [0.9.3] - 2026-05-12
 

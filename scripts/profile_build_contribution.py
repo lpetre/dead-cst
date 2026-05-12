@@ -118,6 +118,7 @@ def _profile_package_nodes(contrib: PackageContribution, project_root: Path) -> 
             package=contrib.package,
             project_root=project_root,
             package_graph=contrib.package_graph,
+            module_nodes=contrib.module_nodes,
         )
 
     _make_ctx()
@@ -147,6 +148,15 @@ def _profile_package_nodes(contrib: PackageContribution, project_root: Path) -> 
 
     print("\npackage_nodes cold-call top 15 by tottime:")
     pstats.Stats(profiler).sort_stats("tottime").print_stats(15)
+
+    n_modules = len(contrib.module_nodes)
+    print(f"\npackage_modules: {n_modules} module(s) of {n_total} node(s)")
+    t0 = time.perf_counter()
+    matched = 0
+    for _ in range(REPEATS):
+        matched = sum(1 for _ in _make_ctx().package_modules())
+    cold_per_call_us = (time.perf_counter() - t0) / REPEATS * 1e6
+    print(f"  cold:  {cold_per_call_us:8.1f} us per call ({matched} modules)")
 
 
 if __name__ == "__main__":

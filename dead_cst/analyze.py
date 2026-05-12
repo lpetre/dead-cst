@@ -129,6 +129,7 @@ def _compose_contribution(
             package=contrib.package,
             project_root=project_root,
             package_graph=contrib.package_graph,
+            module_nodes=contrib.module_nodes,
         )
         for plugin in plugins:
             if not isinstance(plugin, EdgePlugin):
@@ -944,12 +945,14 @@ class PackageView:
         what populates the predecessors used here.
         """
         scope = self._analysis._interesting_set(self._package.path)
+        contrib = self._analysis._contributions[self._package.path]
         ctx = PluginContext(
             graph=self._analysis.materialize_closure(self._package.path),
             symbol_lookup=self._analysis._build_symbol_lookup(self._package.path, scope=scope),
             package=self._package,
             project_root=self._analysis.project_root,
-            package_graph=self._analysis._contributions[self._package.path].package_graph,
+            package_graph=contrib.package_graph,
+            module_nodes=contrib.module_nodes,
         )
         return ctx.importers(target)
 

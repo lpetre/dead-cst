@@ -105,6 +105,7 @@ class PackageContribution:
     export_trie: SymbolTrie
     package_graph: nx.MultiDiGraph
     import_edges: frozenset[tuple[SymbolNode, Import, EdgeFlags]]
+    module_nodes: tuple[SymbolNode, ...]
 
 
 def enumerate_files(
@@ -335,6 +336,7 @@ def build_contribution(
     import_edges: set[tuple[SymbolNode, Import, EdgeFlags]] = set()
     package_graph: nx.MultiDiGraph = nx.MultiDiGraph()
     package_graph.graph["dead_suites"] = {}
+    module_nodes: list[SymbolNode] = []
     shadowed = shadowed_paths(package_files.files)
     for file in package_files.files:
         payload = package_files.hits.get(file)
@@ -347,14 +349,16 @@ def build_contribution(
         if payload is None:
             continue
         file_exported = not exported or _under_any(file, list(exported))
-        _apply_payload(
-            payload,
-            current_trie=current_trie,
-            export_trie=export_trie,
-            file_exported=file_exported,
-            add_to_trie=file not in shadowed,
-            symbol_graph=package_graph,
-            import_edges=import_edges,
+        module_nodes.append(
+            _apply_payload(
+                payload,
+                current_trie=current_trie,
+                export_trie=export_trie,
+                file_exported=file_exported,
+                add_to_trie=file not in shadowed,
+                symbol_graph=package_graph,
+                import_edges=import_edges,
+            )
         )
     current_trie.add_module_hierarchy_edges(package_graph)
     return PackageContribution(
@@ -363,6 +367,7 @@ def build_contribution(
         export_trie=export_trie,
         package_graph=package_graph,
         import_edges=frozenset(import_edges),
+        module_nodes=tuple(module_nodes),
     )
 
 
@@ -582,7 +587,7 @@ def _apply_payload(
     add_to_trie: bool,
     symbol_graph: nx.MultiDiGraph,
     import_edges: set[tuple[SymbolNode, Import, EdgeFlags]],
-) -> None:
+) -> SymbolNode:
     """Emit ``payload`` into the in-progress per-package structures.
 
     Drives all node routing off ``SymbolNode.flags`` and ``type``:
@@ -668,6 +673,8 @@ def _apply_payload(
 
     if payload.dead_suites:
         symbol_graph.graph["dead_suites"][module.path] = payload.dead_suites
+
+    return module
 
 
 def _merge_payloads(*payloads: VisitorPayload) -> VisitorPayload:

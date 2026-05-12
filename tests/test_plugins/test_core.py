@@ -89,6 +89,7 @@ def _ctx_with_synthetic(fqname: str, base: Path) -> PluginContext:
         package=Package(path=base, name="pkg"),
         project_root=base,
         package_graph=package_graph,
+        module_nodes=(),
     )
 
 
@@ -364,29 +365,19 @@ def test_find_call_assignments_ignores_non_call_rhs():
 
 
 def test_plugin_context_package_modules_yields_modules_only(tmp_path):
-    """``package_modules`` yields module-typed nodes and snapshots once."""
+    """``package_modules`` yields the precomputed module-node tuple."""
     pkg = Package(path=tmp_path, name="pkg")
-    inside = SymbolNode("pkg.a", "module", tmp_path / "a.py", _pos())
-    fn = SymbolNode("pkg.a.f", "function", tmp_path / "a.py", _pos())
-    package_graph = nx.MultiDiGraph()
-    package_graph.add_node(inside)
-    package_graph.add_node(fn)
+    mod = SymbolNode("pkg.a", "module", tmp_path / "a.py", _pos())
 
     ctx = PluginContext(
         graph=nx.DiGraph(),
         symbol_lookup=SymbolTrie(),
         package=pkg,
         project_root=tmp_path,
-        package_graph=package_graph,
+        package_graph=nx.MultiDiGraph(),
+        module_nodes=(mod,),
     )
-    first = list(ctx.package_modules())
-    assert first == [(inside.path, inside)]
-
-    # Nodes added after the first call must not appear -- the cache is
-    # intentional, so plugins see a stable snapshot.
-    late = SymbolNode("pkg.late", "module", tmp_path / "late.py", _pos())
-    package_graph.add_node(late)
-    assert list(ctx.package_modules()) == first
+    assert list(ctx.package_modules()) == [(mod.path, mod)]
 
 
 def test_plugin_context_package_nodes_snapshots_first_scan(tmp_path):
@@ -404,6 +395,7 @@ def test_plugin_context_package_nodes_snapshots_first_scan(tmp_path):
         package=pkg,
         project_root=tmp_path,
         package_graph=package_graph,
+        module_nodes=(mod,),
     )
     first = sorted(ctx.package_nodes(), key=lambda n: n.fqname)
     assert first == [mod, fn]
