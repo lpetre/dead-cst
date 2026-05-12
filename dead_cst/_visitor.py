@@ -216,11 +216,9 @@ class SymbolVisitor(cst.CSTVisitor):
         # because comments may precede the import statements they cover.
         self._pinned_imports: set[SymbolNode] = set()
         self._file_pins_imports: bool = False
-        # Hoisted ``_descendant_ids`` cache shared across every
-        # ``live_referents`` / ``live_at_exit`` call this visitor makes.
-        # Big files with many reassignments fire one ``live_referents``
-        # per multi-referent access; without sharing, each call re-walks
-        # the same statement subtrees from scratch.
+        # Shared ``_descendant_ids`` cache for every ``live_referents`` /
+        # ``live_at_exit`` call. Visitor lifetime pins every CST node,
+        # so ``id()`` reuse can't poison entries.
         self._descendant_cache: dict[int, set[int]] = {}
 
     @property
@@ -779,7 +777,7 @@ class SymbolVisitor(cst.CSTVisitor):
             live_ids = {
                 id(n)
                 for n in live_at_exit(
-                    list(module_node.body), referent_nodes, cache=self._descendant_cache
+                    module_node.body, referent_nodes, cache=self._descendant_cache
                 )
             }
 
