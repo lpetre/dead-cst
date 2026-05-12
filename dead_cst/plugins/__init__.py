@@ -89,6 +89,7 @@ from ..contrib.fastapi import FastAPIPlugin
 from ..contrib.flask import FlaskPlugin
 from ..contrib.mock_patch import MockPatchPlugin
 from ..contrib.pytest import PytestPlugin
+from ..contrib.server_config import ServerConfigPlugin
 from ..contrib.typer import TyperPlugin
 from ..contrib.unittest import UnittestPlugin
 from .decl_shapes import DecoratedDeclPlugin, LiteralListPlugin
@@ -106,6 +107,7 @@ BUILTIN_PLUGINS: dict[str, type] = {
     PytestPlugin.name: PytestPlugin,
     UnittestPlugin.name: UnittestPlugin,
     MockPatchPlugin.name: MockPatchPlugin,
+    ServerConfigPlugin.name: ServerConfigPlugin,
     FastAPIPlugin.name: FastAPIPlugin,
     FlaskPlugin.name: FlaskPlugin,
     TyperPlugin.name: TyperPlugin,
@@ -159,6 +161,7 @@ __all__ = [
     "STDLIB_PREFIX",
     "SYNTHETIC_PATH_PREFIXES",
     "SYNTHETIC_POSITION",
+    "ServerConfigPlugin",
     "TyperPlugin",
     "UNPARSEABLE_PREFIX",
     "UNRESOLVED_PREFIX",

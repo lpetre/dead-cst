@@ -34,6 +34,7 @@ from .fastapi import FastAPIPlugin
 from .flask import FlaskPlugin
 from .mock_patch import MockPatchPlugin
 from .pytest import PytestPlugin
+from .server_config import ServerConfigPlugin
 from .typer import TyperPlugin
 from .unittest import UnittestPlugin
 
@@ -53,6 +54,7 @@ __all__ = [
     "FlaskPlugin",
     "MockPatchPlugin",
     "PytestPlugin",
+    "ServerConfigPlugin",
     "TyperPlugin",
     "UnittestPlugin",
     "UvResolver",

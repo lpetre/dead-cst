@@ -9,6 +9,21 @@ two versions.
 
 ## [Unreleased]
 
+### Added
+- `ServerConfigPlugin` ships in `dead_cst.contrib.server_config` and
+  is registered under the `server_config` builtin name. Matches
+  Gunicorn / Hypercorn config files by basename (`gunicorn.conf.py`,
+  `gunicorn_conf.py`, `hypercorn.conf.py`, `hypercorn_conf.py` by
+  default; override the `filenames` tuple for non-standard layouts)
+  and marks the module plus every top-level decl (functions for hook
+  callbacks like `on_starting` / `post_fork` / `when_ready`,
+  variables for settings like `bind` / `workers`, classes for inline
+  custom logger / worker definitions, imports for helpers used only
+  to build config values) as an entrypoint. These files are loaded
+  by the server process at startup (Docker, Cloud Run, systemd) and
+  not imported anywhere in the project, so without this plugin their
+  whole surface looks dead.
+
 ## [0.9.2] - 2026-05-12
 
 ### Added
