@@ -9,6 +9,17 @@ two versions.
 
 ## [Unreleased]
 
+### Fixed
+- `_edges.resolve_edges` no longer logs a spurious "Failed to resolve import
+  edge" warning for accesses to runtime module dunders (`__file__`,
+  `__name__`, `__doc__`, `__loader__`, `__spec__`, `__package__`,
+  `__path__`, `__builtins__`, `__cached__`). These attributes are injected
+  by the import machinery on every module object and never appear as
+  source decls, so the trie walk would otherwise miss on any
+  `Path(some_pkg.__file__).parent` idiom (the standard "find a data file
+  next to me" pattern). The module-level edge already covers the
+  dependency; the trie miss is now dropped silently.
+
 ## [0.9.2] - 2026-05-12
 
 ### Added

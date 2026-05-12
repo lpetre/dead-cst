@@ -575,6 +575,39 @@ def test_unresolved_import_emits_synthetic_silently(build_decl_graph, caplog):
     )
 
 
+def test_module_runtime_dunder_access_is_silent(build_decl_graph, caplog):
+    """``pkg.__file__`` (and other runtime dunders) don't warn or surface synthetics.
+
+    The import machinery injects ``__file__`` / ``__name__`` / ``__spec__`` /
+    etc. onto every module object at runtime; they're never source decls, so
+    the trie walker would otherwise log "Failed to resolve import edge" for
+    a valid ``Path(some_pkg.__file__).parent`` idiom. The module-level edge
+    already covers the dependency.
+    """
+    with caplog.at_level(logging.WARNING, logger="dead_cst._edges"):
+        graph = build_decl_graph(
+            {
+                "pkg/__init__.py": "",
+                "pkg/config.py": (
+                    "from pathlib import Path\n"
+                    "import pkg as pkg_alias\n"
+                    "FILE_PATH = Path(pkg_alias.__file__).parent\n"
+                    "NAME = pkg_alias.__name__\n"
+                    "SPEC = pkg_alias.__spec__\n"
+                ),
+            }
+        )
+
+    failure_messages = [
+        r.getMessage() for r in caplog.records if "Failed to resolve import edge" in r.getMessage()
+    ]
+    assert failure_messages == [], failure_messages
+    # ``pkg`` stays alive via the module-level edge from ``pkg_alias``.
+    pkg_fqnames = {n.fqname for n in graph.nodes}
+    assert "pkg" in pkg_fqnames
+    assert "pkg.config.pkg_alias" in pkg_fqnames
+
+
 def test_cyclic_reexport_terminates(build_decl_graph, assert_edges):
     """Re-export cycle (``A.x: from B import x``, ``B.x: from A import x``) terminates with both legs emitted."""
     graph = build_decl_graph(
