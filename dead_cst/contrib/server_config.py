@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Iterable
 
 from ..plugins._core import (
@@ -27,6 +27,8 @@ _DEFAULT_FILENAMES: tuple[str, ...] = (
     "hypercorn.conf.py",
     "hypercorn_conf.py",
 )
+
+_TOPLEVEL_DECL_TYPES: frozenset[str] = frozenset({"function", "class", "variable", "import"})
 
 
 @dataclass
@@ -65,7 +67,7 @@ class ServerConfigPlugin:
     not by import.
     """
 
-    filenames: tuple[str, ...] = field(default=_DEFAULT_FILENAMES)
+    filenames: tuple[str, ...] = _DEFAULT_FILENAMES
     name: str = "server_config"
     version: int = 1778573528
 
@@ -75,9 +77,7 @@ class ServerConfigPlugin:
         module = module_node(ctx.payload)
         if module is None:
             return None
-        decls = [
-            n for n in ctx.payload.nodes if n.type in ("function", "class", "variable", "import")
-        ]
+        decls = [n for n in ctx.payload.nodes if n.type in _TOPLEVEL_DECL_TYPES]
         return entrypoint_payload(
             f"{SERVER_CONFIG_PREFIX}{module.fqname}",
             ctx.path,

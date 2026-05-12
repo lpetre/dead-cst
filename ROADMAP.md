@@ -19,7 +19,8 @@ for the full record.
 
 `PytestPlugin`, `UnittestPlugin` (with transitive `TestCase` discovery),
 `FastAPIPlugin`, `FlaskPlugin`, `TyperPlugin`, `ClickPlugin`,
-`CycloptsPlugin`, `DiscordPyPlugin`, `MockPatchPlugin`, and
+`CycloptsPlugin`, `DiscordPyPlugin`, `MockPatchPlugin`,
+`ServerConfigPlugin` (gunicorn / hypercorn config files), and
 `InitSubclassPlugin` shipped, but the existential risk is still
 "I tried it and it flagged half my codebase." The remaining common
 offenders:
