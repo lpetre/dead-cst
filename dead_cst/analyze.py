@@ -128,6 +128,8 @@ def _compose_contribution(
             symbol_lookup=symbol_lookup,
             package=contrib.package,
             project_root=project_root,
+            package_graph=contrib.package_graph,
+            module_nodes=contrib.module_nodes,
         )
         for plugin in plugins:
             if not isinstance(plugin, EdgePlugin):
@@ -914,9 +916,7 @@ class PackageView:
         Local-only: refreshes this package if needed but never
         touches deps or consumers.
         """
-        for n in self._contribution().package_graph.nodes:
-            if n.type == "module":
-                yield n
+        yield from self._contribution().module_nodes
 
     def declarations(self, name: str | None = None) -> Iterator[SymbolNode]:
         """Top-level decls in this package.
@@ -943,11 +943,14 @@ class PackageView:
         what populates the predecessors used here.
         """
         scope = self._analysis._interesting_set(self._package.path)
+        contrib = self._analysis._contributions[self._package.path]
         ctx = PluginContext(
             graph=self._analysis.materialize_closure(self._package.path),
             symbol_lookup=self._analysis._build_symbol_lookup(self._package.path, scope=scope),
             package=self._package,
             project_root=self._analysis.project_root,
+            package_graph=contrib.package_graph,
+            module_nodes=contrib.module_nodes,
         )
         return ctx.importers(target)
 

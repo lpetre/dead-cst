@@ -9,6 +9,19 @@ two versions.
 
 ## [Unreleased]
 
+## [0.9.4] - 2026-05-12
+
+### Changed
+- `PluginContext` now requires `package_graph` (the per-package
+  contribution graph) and `module_nodes` (its module-typed entries).
+  `package_nodes` and `package_modules` source from these directly,
+  dropping the `Path.is_relative_to` filter and `type == "module"`
+  scan they used to run on the merged cross-package `graph`. The
+  analyzer wires both through automatically; custom callers that
+  construct `PluginContext` directly must pass them.
+- `PackageView.modules()` now reads `PackageContribution.module_nodes`
+  instead of refiltering the contribution graph.
+
 ## [0.9.3] - 2026-05-12
 
 ### Added
