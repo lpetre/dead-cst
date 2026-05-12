@@ -9,6 +9,8 @@ two versions.
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-05-12
+
 ### Added
 - `DiscordPyPlugin` ships in `dead_cst.contrib.discordpy` and is
   registered under the `discordpy` builtin name. The plugin recognizes
