@@ -32,12 +32,9 @@ returns ``FastAPI(...)``. The plugin reuses those reference edges:
 
 from __future__ import annotations
 
-import libcst as cst
 from libcst.metadata import CodeRange
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Container, Iterable
-
-import networkx as nx
+from typing import TYPE_CHECKING, Iterable
 
 from ..graph import NodeFlags, SymbolNode
 from ..plugins._core import (
@@ -50,11 +47,12 @@ from ..plugins._core import (
     collect_module_imports,
     decls_by_simple_name,
     find_call_assignments,
+    find_factory_decls,
     find_handlers,
     make_payload,
-    matched_attr_call,
     require_resolved_dep,
     synthetic_node,
+    walk_to_instance_kind,
 )
 
 if TYPE_CHECKING:
@@ -99,54 +97,6 @@ FASTAPI_PENDING_PREFIX = "<fastapi-pending>:"
 # graph alone can't distinguish FastAPI from APIRouter on the downstream walk.
 # Format: ``<fastapi-factory>:<FastAPI|APIRouter>:<owner.fqname>``.
 FASTAPI_FACTORY_PREFIX = "<fastapi-factory>:"
-
-
-class _ConstructorFinder(cst.CSTVisitor):
-    """Collect ``FastAPI``/``APIRouter`` construction kinds inside a decl body."""
-
-    def __init__(self, imports: dict[str, str], valid_targets: Container[str]) -> None:
-        super().__init__()
-        self._imports = imports
-        self._valid_targets = valid_targets
-        self.kinds: set[str] = set()
-
-    def visit_Call(self, node: cst.Call) -> bool | None:
-        kind = matched_attr_call(node.func, self._imports, self._valid_targets, unwrap_call=False)
-        if kind is not None:
-            self.kinds.add(kind)
-        return None
-
-
-def _walk_factory_kind(
-    graph: nx.DiGraph,
-    start: SymbolNode,
-    terminal: SymbolNode,
-) -> str | None:
-    """Forward walk from ``start`` to a FastAPI / APIRouter discriminator.
-
-    Like :func:`walk_to_instance_kind` but also recognizes the
-    :data:`FASTAPI_FACTORY_PREFIX` markers ``observe`` emits for factory
-    functions that construct via ``fastapi.FastAPI(...)`` -- the
-    attribute-form whose ``decl`` info is dropped by the external-edge
-    classifier, so the import-node check alone misses it across files.
-    """
-    seen: set[SymbolNode] = set()
-    stack: list[SymbolNode] = [start]
-    while stack:
-        node = stack.pop()
-        if node in seen or node is terminal:
-            continue
-        seen.add(node)
-        if node.type == "import" and node.imports is not None:
-            decl = node.imports.decl
-            if decl is not None and node.imports.module == "fastapi" and decl in _INSTANCE_KINDS:
-                return decl
-        if node.type == "synthetic" and node.fqname.startswith(FASTAPI_FACTORY_PREFIX):
-            kind = node.fqname[len(FASTAPI_FACTORY_PREFIX) :].split(":", 1)[0]
-            if kind in _INSTANCE_KINDS:
-                return kind
-        stack.extend(graph.successors(node))
-    return None
 
 
 @dataclass
@@ -196,7 +146,7 @@ class FastAPIPlugin:
         # ``fastapi_imports`` doubles as the binding map for ``matched_attr_call``
         # so both ``FastAPI()`` (named import) and ``fastapi.FastAPI()`` (module
         # import) are recognized.
-        factory_kinds = _find_factory_decls(ctx.module, fastapi_imports)
+        factory_kinds = find_factory_decls(ctx.module, fastapi_imports, _INSTANCE_KINDS)
         if not direct and not decorated and not factory_kinds:
             return None
 
@@ -257,31 +207,16 @@ class FastAPIPlugin:
             if not successors:
                 continue
             for var in successors:
-                kind = _walk_factory_kind(ctx.graph, var, fastapi_node)
+                kind = walk_to_instance_kind(
+                    ctx.graph,
+                    var,
+                    fastapi_node,
+                    "fastapi",
+                    _INSTANCE_KINDS,
+                    factory_marker_prefix=FASTAPI_FACTORY_PREFIX,
+                )
                 if kind is None or not _INSTANCE_KINDS[kind]:
                     continue
                 seed = synthetic_node(f"{FASTAPI_APP_PREFIX}{var.fqname}", var.path)
                 yield AddNode(seed, entrypoint=True)
                 yield AddEdge(seed, var)
-
-
-def _find_factory_decls(module: cst.Module, fastapi_imports: dict[str, str]) -> dict[str, set[str]]:
-    """Return ``{decl_name: {kind, ...}}`` for top-level decls whose body
-    constructs a FastAPI / APIRouter instance.
-
-    Scans every top-level ``def`` / ``class`` body for ``FastAPI(...)`` /
-    ``APIRouter(...)`` call shapes (named or module-prefixed). Skips files
-    that don't import ``fastapi`` at all -- ``fastapi_imports`` would be
-    empty, and ``matched_attr_call`` would reject every candidate anyway.
-    """
-    if not fastapi_imports:
-        return {}
-    out: dict[str, set[str]] = {}
-    for stmt in module.body:
-        if not isinstance(stmt, (cst.FunctionDef, cst.ClassDef)):
-            continue
-        finder = _ConstructorFinder(fastapi_imports, _INSTANCE_KINDS)
-        stmt.body.visit(finder)
-        if finder.kinds:
-            out[stmt.name.value] = finder.kinds
-    return out
