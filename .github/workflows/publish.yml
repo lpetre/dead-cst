@@ -3,7 +3,8 @@ name: Publish
 on:
   push:
     branches: [main]
-    tags: ["v*"]
+  release:
+    types: [published]
 
 permissions:
   id-token: write
@@ -38,7 +39,7 @@ jobs:
           repository-url: https://test.pypi.org/legacy/
 
   publish-pypi:
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'release'
     needs: build
     runs-on: ubuntu-latest
     environment: pypi
@@ -49,8 +50,8 @@ jobs:
           path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1
 
-  github-release:
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+  attach-release-assets:
+    if: github.event_name == 'release'
     needs: publish-pypi
     runs-on: ubuntu-latest
     permissions:
@@ -62,7 +63,5 @@ jobs:
           path: dist/
       - uses: softprops/action-gh-release@v2
         with:
-          generate_release_notes: true
           files: dist/*
-          prerelease: true
           fail_on_unmatched_files: true

@@ -154,4 +154,4 @@ A good bug report contains a minimal `.py` file (or pair of files) and the entry
 
 ## Releasing
 
-Releases are tag-driven. Pushing a `vX.Y.Z` tag triggers `.github/workflows/publish.yml`, which builds the package with `uv build` and publishes to PyPI via OIDC. The version is read from the tag by `hatch-vcs`, so no manual version bumps in source files are needed.
+Releases are GitHub-Release-driven. Publishing a GitHub Release with a `vX.Y.Z` tag name (the Releases UI creates the tag for you, which makes it possible from mobile) triggers `.github/workflows/publish.yml`, which builds the package with `uv build`, publishes to PyPI via OIDC, and attaches the built sdist/wheel to the release. The version is read from the tag by `hatch-vcs`, so no manual version bumps in source files are needed.

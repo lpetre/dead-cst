@@ -131,7 +131,7 @@ Implement `UnreachableRegionDetector`: `name`, `version`, `find_regions(wrapper)
 - **Versioning is tag-driven via `hatch-vcs`** — never hand-edit a version. `local_scheme = "no-local-version"` is required because PyPI rejects PEP 440 local-version identifiers; `SETUPTOOLS_SCM_OVERRIDES_FOR_*` does not work here (only `Configuration.from_file()` reads it).
 - **Cache invalidation discipline**: any change to the visitor / plugin / detector's *output* for the same input requires bumping its `version` to a fresh epoch, or stale cache entries will be served. Resolvers and the package layout are *not* in the fingerprint — their effect flows through the (uncached) edge-stitching pass — so a resolver swap or update doesn't invalidate cached payloads (and `PathResolver` carries no `Cacheable` knob to bump). `__version__` deliberately is not a backstop. The schema-level `SCHEMA_VERSION` in `_cache.py` is for `VisitorPayload` shape breaks the unpickler can't handle.
 - **PRs**: one logical change per PR, add/update tests, add a `[Unreleased]` `CHANGELOG.md` entry for user-visible changes.
-- **Releases**: pushing a `vX.Y.Z` tag triggers `.github/workflows/publish.yml` (uv build + PyPI OIDC publish).
+- **Releases**: publishing a GitHub Release with a `vX.Y.Z` tag name triggers `.github/workflows/publish.yml` (uv build + PyPI OIDC publish + dist attached to the release). The Releases UI creates the tag, so a release can be cut from mobile.
 
 ## Known limitations to keep in mind
 
