@@ -18,7 +18,7 @@ import os
 import re
 import sys
 import sysconfig
-from functools import cache
+from functools import cache, lru_cache
 from importlib.machinery import ModuleSpec
 from pathlib import Path
 
@@ -108,6 +108,28 @@ def safe_resolve_module(fullname: str) -> ModuleSpec | None:
     return None
 
 
+def _entry_is_site_packages(entry: str) -> bool:
+    """True when a ``sys.path`` string entry can host installed distributions.
+
+    Mirrors :func:`_is_site_packages_path` but takes the raw string form
+    that lives on ``sys.path`` (the entries are strings, not ``Path``).
+    Uses ``Path.parts`` membership rather than substring containment so
+    a directory like ``/home/u/my-site-packages-fork/src`` doesn't match
+    by accident.
+    """
+    if not entry:
+        return False
+    try:
+        path = Path(entry)
+    except (TypeError, ValueError):
+        return False
+    if PURELIB is not None and entry == str(PURELIB):
+        return True
+    if PLATLIB is not None and entry == str(PLATLIB):
+        return True
+    return any(part in SITE_PACKAGES_MARKERS for part in path.parts)
+
+
 def _dist_relevant_sys_path() -> tuple[str, ...]:
     """Snapshot of ``sys.path`` entries that can host installed distributions.
 
@@ -123,28 +145,25 @@ def _dist_relevant_sys_path() -> tuple[str, ...]:
     site-packages entry, which flips the key and triggers a single
     rebuild.
     """
-    purelib_str = str(PURELIB) if PURELIB is not None else None
-    platlib_str = str(PLATLIB) if PLATLIB is not None else None
-    out: list[str] = []
-    for entry in sys.path:
-        if entry == purelib_str or entry == platlib_str:
-            out.append(entry)
-            continue
-        if any(marker in entry for marker in SITE_PACKAGES_MARKERS):
-            out.append(entry)
-    return tuple(out)
+    return tuple(entry for entry in sys.path if _entry_is_site_packages(entry))
 
 
-@cache
-def _distribution_lookup_for(_key: tuple[str, ...]) -> dict[Path, str]:
+# ``maxsize`` bounds the dist-map across long-lived multi-venv processes
+# (an IDE integration analyzing several uv-workspace members in
+# sequence). The common case is 1-2 distinct venv slices; 8 leaves
+# headroom without unbounded growth, since each entry can be megabytes
+# (full file-to-dist map of an installed Python environment).
+@lru_cache(maxsize=8)
+def _distribution_lookup_for(key: tuple[str, ...]) -> dict[Path, str]:
     """Cached worker for :func:`distribution_lookup`, keyed on the venv slice.
 
-    ``_key`` is the :func:`_dist_relevant_sys_path` snapshot at call
+    ``key`` is the :func:`_dist_relevant_sys_path` snapshot at call
     time. The body still reads :mod:`importlib.metadata` against the
-    live ``sys.path`` -- the key is purely a cache-invalidation
+    live ``sys.path`` -- ``key`` is purely a cache-invalidation
     fingerprint so the same dist-bearing layout maps to the same
     entry.
     """
+    del key  # consumed by the cache decorator; the body reads sys.path live
     from importlib import metadata
 
     lookup: dict[Path, str] = {}
@@ -156,6 +175,11 @@ def _distribution_lookup_for(_key: tuple[str, ...]) -> dict[Path, str]:
     return lookup
 
 
+# The public wrapper intentionally does NOT carry its own ``@cache``;
+# caching happens one layer down on the sys.path-derived key, so that
+# the first-party prefix swap (which never enters the key) hits the
+# cache and a real venv change misses. A wrapper-level ``@cache`` would
+# memoize the empty-arg call and defeat the keying.
 def distribution_lookup() -> dict[Path, str]:
     """Map every installed distribution file to its canonical project name.
 
@@ -173,12 +197,13 @@ def distribution_lookup() -> dict[Path, str]:
     return _distribution_lookup_for(_dist_relevant_sys_path())
 
 
-@cache
+@lru_cache(maxsize=8)
 def _editable_distribution_roots_for(
-    _key: tuple[str, ...],
+    key: tuple[str, ...],
 ) -> tuple[tuple[Path, str], ...]:
     """Cached worker for :func:`editable_distribution_roots`. See
     :func:`_distribution_lookup_for` for the keying contract."""
+    del key
     from importlib import metadata
 
     roots: list[tuple[Path, str]] = []
@@ -190,6 +215,9 @@ def _editable_distribution_roots_for(
     return tuple(roots)
 
 
+# See the matching note on :func:`distribution_lookup`: the wrapper is
+# deliberately uncached so its inner ``key``-bearing worker can drive
+# invalidation.
 def editable_distribution_roots() -> tuple[tuple[Path, str], ...]:
     """Source-directory roots for editably-installed distributions.
 

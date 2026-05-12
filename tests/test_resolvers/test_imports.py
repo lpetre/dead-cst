@@ -376,31 +376,38 @@ def test_editable_distribution_roots_self_install():
     )
 
 
-def test_distribution_lookup_survives_first_party_sys_path_change(tmp_path: Path):
+def test_distribution_lookup_survives_first_party_sys_path_change(tmp_path: Path, monkeypatch):
     """A first-party path prepended to ``sys.path`` doesn't change which
     distributions are visible -- so the dist cache must survive it without
     a rebuild. Regression for the per-package transition hot path in
     :meth:`Analysis._materialize`, which used to flush this on every
     package and burn ~10s/transition on large venvs.
     """
-    import sys
+    from importlib import metadata
 
-    # Force a clean baseline so we measure rebuild count, not residue.
+    real_distributions = metadata.distributions
+    calls = 0
+
+    def counting_distributions(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return real_distributions(*args, **kwargs)
+
+    monkeypatch.setattr(metadata, "distributions", counting_distributions)
+
     _imports.clear_path_caches()
-    first = _imports.distribution_lookup()
+    _imports.distribution_lookup()
+    assert calls == 1
 
     project_src = tmp_path / "project" / "src"
     project_src.mkdir(parents=True)
-    sys.path.insert(0, str(project_src))
-    try:
-        # Only the project prefix changed -- the dist-bearing slice of
-        # sys.path is identical, so the cache key must match and the same
-        # mapping must come back without rebuilding.
-        _imports.clear_module_specs_cache()
-        assert _imports.distribution_lookup() is first
-    finally:
-        sys.path.remove(str(project_src))
-    # And ``clear_path_caches`` is still the heavy hammer for the rare
-    # cases (uv splicing in a venv, test reset) that want a true rebuild.
+    monkeypatch.syspath_prepend(str(project_src))
+    _imports.clear_module_specs_cache()
+    _imports.distribution_lookup()
+    # The dist-bearing slice of sys.path didn't change, so no rebuild.
+    assert calls == 1
+
+    # ``clear_path_caches`` remains the heavy hammer for explicit resets.
     _imports.clear_path_caches()
-    assert _imports.distribution_lookup() is not first
+    _imports.distribution_lookup()
+    assert calls == 2
