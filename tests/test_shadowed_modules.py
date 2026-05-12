@@ -52,7 +52,7 @@ def test_shadowed_file_keeps_main_block_entrypoint(tmp_path, write_files, make_a
     write_files(
         {
             "pkg/__init__.py": "",
-            "pkg/foo.py": ("def helper():\n    pass\nif __name__ == '__main__':\n    helper()\n"),
+            "pkg/foo.py": "def helper():\n    pass\nif __name__ == '__main__':\n    helper()\n",
             "pkg/foo/__init__.py": "value = 1\n",
         }
     )

@@ -57,6 +57,7 @@ Three moving pieces — `SymbolVisitor` itself plus two of the three extension p
 - `EdgeFlags.DEAD_BRANCH` is metadata only; tests using the `assert_edges` fixture see those edges, while `assert_dead_branch_edges` filters to just them.
 - `NodeFlags.SHADOWED` decls are emitted into the graph (with their parent module edge) but excluded from the trie, so cross-module imports never resolve to them. `NodeFlags.OVERLOAD` follows the same trie-exclusion rule but its lifetime is anchored to the matching same-file impl via explicit `impl -> overload` edges emitted by the visitor.
 - `.pyi` stub files are ingested only for the compiled-extension layout (`_native.so` + `_native.pyi`, no `.py` twin). The stub is parsed under its natural module FQN (`mypkg._native`), so `from mypkg._native import X` resolves through the normal trie path. Peer-mode `.pyi` (alongside a real `.py`) is dropped at `enumerate_files` time — the runtime always wins, and ingesting both would collide on the same FQN in the trie.
+- A `.py` whose stem matches a sibling regular package (`pkg/foo.py` next to `pkg/foo/__init__.py`) is shadowed: `_refresh.shadowed_paths` flags it before `_apply_payload`, and the apply pass sets `add_to_trie=False` so its decls never enter the trie. The file's nodes still land in the package graph (so observe-time entrypoints like `__main__` blocks keep working in the shadowed file), but consumer imports of `pkg.foo` route to the package's `__init__.py` alone — matching CPython's `FileFinder` precedence. A WARNING is logged per shadow.
 
 ### Public API surface
 

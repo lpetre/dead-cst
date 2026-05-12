@@ -650,14 +650,11 @@ def _apply_payload(
             continue
         if n.type != "module":
             symbol_graph.add_edge(n, module, flags=EdgeFlags.NONE)
-        # ``OVERLOAD`` and ``SHADOWED`` both keep the decl out of the
-        # cross-module lookup trie; the graph keeps the parent edge so
-        # the decl is well-formed but consumer imports route to the
-        # impl, never the stub. ``add_to_trie=False`` is the file-level
-        # equivalent: a sibling package shadows this whole file
-        # (``foo.py`` next to ``foo/__init__.py``), so its decls are
-        # graphed for entrypoint reachability but never resolved as
-        # ``pkg.foo.<name>`` from outside.
+        # ``OVERLOAD`` and ``SHADOWED`` exclude a single decl from the
+        # cross-module lookup trie; ``add_to_trie=False`` is the
+        # file-level equivalent for a ``.py`` whose sibling package
+        # shadows it. Either way the graph keeps the parent edge so
+        # the decl is well-formed -- only consumer FQN lookups change.
         if add_to_trie and not (n.flags & (NodeFlags.SHADOWED | NodeFlags.OVERLOAD)):
             current_trie.add_declaration(n)
             if file_exported:
