@@ -9,6 +9,19 @@ two versions.
 
 ## [Unreleased]
 
+### Fixed
+- `FastAPIPlugin` now classifies the factory pattern across packages
+  when the factory uses `import fastapi; fastapi.FastAPI()` (module-
+  prefixed form). The external-edge classifier drops the
+  `decl='FastAPI'` half of the access, so the downstream walk had no
+  discriminator to distinguish `FastAPI` from `APIRouter`. `observe`
+  now tags every top-level decl whose body constructs a FastAPI /
+  APIRouter instance with a `<fastapi-factory>:<kind>:<owner>`
+  synthetic; finalize's forward walk picks the marker up regardless of
+  which file the factory lives in. `from fastapi import FastAPI` users
+  were already covered by the import-node discriminator and are
+  unaffected.
+
 ## [0.9.2] - 2026-05-12
 
 ### Added

@@ -388,3 +388,152 @@ def test_fastapi_plugin_loads_via_load_plugin():
 
     plugin = load_plugin("fastapi")
     assert isinstance(plugin, FastAPIPlugin)
+
+
+def test_fastapi_plugin_factory_in_different_package(
+    tmp_path, make_analysis, write_files, reachable_fqnames
+):
+    """Factory in dep package, consumer in dependent package.
+
+    The classic uv-workspace layout: ``pkg_a`` owns the FastAPI factory
+    and ``pkg_b`` imports + calls it. Walking from the pending marker
+    in ``pkg_b`` must reach the ``FastAPI`` import inside ``pkg_a``'s
+    factory body.
+    """
+    write_files(
+        {
+            "pkg_a/pkg_a/__init__.py": "",
+            "pkg_a/pkg_a/factory.py": """
+            from fastapi import FastAPI
+
+            def create_app() -> FastAPI:
+                return FastAPI()
+            """,
+            "pkg_b/pkg_b/__init__.py": "",
+            "pkg_b/pkg_b/main.py": """
+            from pkg_a.factory import create_app
+
+            app = create_app()
+
+            @app.get("/items")
+            def list_items(): pass
+            """,
+        }
+    )
+    graph = make_analysis(["pkg_a", "pkg_b:pkg_a"], plugins=[FastAPIPlugin()]).materialize_all()
+    reached = reachable_fqnames(graph)
+    assert "pkg_b.main.app" in reached
+    assert "pkg_b.main.list_items" in reached
+
+
+def test_fastapi_plugin_factory_module_form_in_different_package(
+    tmp_path, make_analysis, write_files, reachable_fqnames
+):
+    """Factory in dep package uses ``import fastapi; fastapi.FastAPI()``.
+
+    Without the factory-marker synthetic the cross-package walk has no
+    discriminator: the external-edge classifier drops the
+    ``decl='FastAPI'`` half of the access, so every reference to
+    ``fastapi`` collapses to the same ``[external dist] fastapi``
+    node regardless of which class is being constructed.
+    """
+    write_files(
+        {
+            "pkg_a/pkg_a/__init__.py": "",
+            "pkg_a/pkg_a/factory.py": """
+            import fastapi
+
+            def create_app():
+                return fastapi.FastAPI()
+            """,
+            "pkg_b/pkg_b/__init__.py": "",
+            "pkg_b/pkg_b/main.py": """
+            from pkg_a.factory import create_app
+
+            app = create_app()
+
+            @app.get("/items")
+            def list_items(): pass
+            """,
+        }
+    )
+    graph = make_analysis(["pkg_a", "pkg_b:pkg_a"], plugins=[FastAPIPlugin()]).materialize_all()
+    reached = reachable_fqnames(graph)
+    assert "pkg_b.main.app" in reached
+    assert "pkg_b.main.list_items" in reached
+
+
+def test_fastapi_plugin_router_factory_in_different_package(
+    tmp_path, make_analysis, write_files, reachable_fqnames
+):
+    """APIRouter factory in dep package, consumer wires it via include_router.
+
+    The factory-marker route shouldn't promote routers to entrypoints
+    on its own -- only a FastAPI app that ``include_router``s it keeps
+    the router alive.
+    """
+    write_files(
+        {
+            "pkg_a/pkg_a/__init__.py": "",
+            "pkg_a/pkg_a/routes.py": """
+            from fastapi import APIRouter
+
+            def make_router() -> APIRouter:
+                r = APIRouter()
+
+                @r.get("/")
+                def index(): pass
+
+                return r
+            """,
+            "pkg_b/pkg_b/__init__.py": "",
+            "pkg_b/pkg_b/main.py": """
+            from fastapi import FastAPI
+            from pkg_a.routes import make_router
+
+            app = FastAPI()
+            router = make_router()
+            app.include_router(router)
+            """,
+        }
+    )
+    graph = make_analysis(["pkg_a", "pkg_b:pkg_a"], plugins=[FastAPIPlugin()]).materialize_all()
+    reached = reachable_fqnames(graph)
+    assert "pkg_b.main.app" in reached
+    assert "pkg_b.main.router" in reached
+
+
+def test_fastapi_plugin_orphan_router_factory_stays_dead_cross_package(
+    tmp_path, make_analysis, write_files, reachable_fqnames
+):
+    """APIRouter factory in dep package that nobody ``include_router``s.
+
+    The factory marker carries the ``APIRouter`` kind, which finalize
+    explicitly leaves un-entrypointed -- so a downstream consumer that
+    only constructs the router (without registering it on a FastAPI
+    app) still gets flagged dead.
+    """
+    write_files(
+        {
+            "pkg_a/pkg_a/__init__.py": "",
+            "pkg_a/pkg_a/routes.py": """
+            from fastapi import APIRouter
+
+            def make_router() -> APIRouter:
+                return APIRouter()
+            """,
+            "pkg_b/pkg_b/__init__.py": "",
+            "pkg_b/pkg_b/main.py": """
+            from pkg_a.routes import make_router
+
+            router = make_router()
+
+            @router.get("/orphan")
+            def orphan(): pass
+            """,
+        }
+    )
+    graph = make_analysis(["pkg_a", "pkg_b:pkg_a"], plugins=[FastAPIPlugin()]).materialize_all()
+    reached = reachable_fqnames(graph)
+    assert "pkg_b.main.router" not in reached
+    assert "pkg_b.main.orphan" not in reached
