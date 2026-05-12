@@ -9,6 +9,8 @@ two versions.
 
 ## [Unreleased]
 
+## [0.9.4] - 2026-05-12
+
 ### Changed
 - `PluginContext` now requires a `package_graph` field (the per-package
   contribution graph). `package_nodes` / `package_modules` iterate it

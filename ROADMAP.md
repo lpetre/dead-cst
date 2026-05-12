@@ -157,6 +157,17 @@ demand.
 
 Folded down from earlier tiers as they landed:
 
+- **v0.9.4**: ``PluginContext`` now requires a ``package_graph`` field
+  (the per-package contribution graph, passed by the analyzer);
+  ``package_nodes`` and ``package_modules`` snapshot from it directly
+  instead of filtering the merged cross-package ``graph`` by
+  ``Path.is_relative_to``. The filter was an O(N_total) walk that
+  dominated the first ``package_nodes`` call in every finalize pass
+  (~9 ms → ~40 µs on the dead-cst self-analysis). Plugin behavior is
+  unchanged; the helpers expose the same node sets they always did.
+  Custom callers that construct ``PluginContext`` directly (tests,
+  out-of-tree pipelines) must pass ``package_graph=`` -- a hard break
+  rather than an optional shim, matching the pre-1.0 API churn budget.
 - **v0.9.3**: ``ServerConfigPlugin`` (``dead_cst.contrib.server_config``,
   registered as the ``server_config`` builtin) marks Gunicorn / Hypercorn
   config files (``gunicorn.conf.py``, ``gunicorn_conf.py``,
