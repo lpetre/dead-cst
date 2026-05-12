@@ -557,8 +557,14 @@ def is_name(node: cst.CSTNode | None, value: str) -> bool:
 
 
 def is_from_module(node: cst.ImportFrom, module_name: str) -> bool:
-    """Return ``True`` if ``node`` is ``from <module_name> import ...`` (non-relative)."""
-    return not node.relative and is_name(node.module, module_name)
+    """Return ``True`` if ``node`` is ``from <module_name> import ...`` (non-relative).
+
+    ``module_name`` may be a dotted path (``"discord.ext.commands"``);
+    the comparison resolves the import's module reference via
+    :func:`dotted_name` so both ``from flask`` and
+    ``from discord.ext.commands`` round-trip correctly.
+    """
+    return not node.relative and dotted_name(node.module) == module_name
 
 
 def _asname_value(alias: cst.ImportAlias) -> str | None:

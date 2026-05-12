@@ -66,14 +66,14 @@ from ..plugins._core import (
     GraphOp,
     ObserveContext,
     PluginContext,
+    collect_module_imports,
     decls_by_simple_name,
     decorator_owner,
-    dotted_name,
     dotted_parts,
-    is_name,
+    find_call_assignments,
     make_payload,
+    matched_attr_call,
     payload_imports_module,
-    single_target_assignment,
     string_value,
     synthetic_node,
 )
@@ -81,15 +81,6 @@ from ..plugins._core import (
 if TYPE_CHECKING:
     from ..graph import VisitorPayload
 
-
-# Sentinel values used as the "target" entry in the unified discord
-# import map. ``"<discord.ext.commands>"`` marks a local name bound to
-# the ``commands`` submodule (``from discord.ext import commands``);
-# ``"<discord>"`` marks a local name bound to the top-level ``discord``
-# package (``import discord``). Concrete class names ("Bot", "Cog", ...)
-# appear as themselves when imported directly.
-_COMMANDS_MODULE = "<discord.ext.commands>"
-_DISCORD_MODULE = "<discord>"
 
 # Classes from ``discord.ext.commands`` that produce a bot instance.
 _COMMANDS_BOT_KINDS: frozenset[str] = frozenset({"Bot", "AutoShardedBot"})
@@ -100,6 +91,10 @@ _DISCORD_CLIENT_KINDS: frozenset[str] = frozenset({"Client", "AutoShardedClient"
 # Cog base classes (from ``discord.ext.commands``). ``GroupCog`` is the
 # slash-command analogue introduced in 2.0.
 _COG_BASES: frozenset[str] = frozenset({"Cog", "GroupCog"})
+
+# Combined whitelist of class names the plugin recognizes when imported
+# from ``discord.ext.commands``.
+_COMMANDS_DIRECT_TARGETS: frozenset[str] = _COMMANDS_BOT_KINDS | _COG_BASES
 
 # Single-attribute decorators on a bot/client variable.
 _BOT_DECORATORS: frozenset[str] = frozenset(
@@ -132,10 +127,19 @@ DISCORDPY_EXTENSION_PREFIX = "<discordpy-extension>:"
 
 @dataclass
 class DiscordPyPlugin:
-    """discord.py-aware reachability.
+    """Wire discord.py bots, Cogs, and extension hooks into reachability.
 
-    See module docstring for the four-pillar strategy (bot instances,
-    decorator handlers, Cog subclasses, ``load_extension`` targets).
+    Two phases:
+
+    * :meth:`observe` (per-file) classifies top-level ``commands.Bot`` /
+      ``discord.Client`` constructions, emits ``bot -> handler`` edges
+      for decorated handlers (including ``@bot.tree.command()`` slash
+      commands), anchors Cog subclasses + their module-level ``setup``
+      / ``teardown`` hooks to a per-file entrypoint synthetic, and
+      captures string-literal ``load_extension`` targets.
+    * :meth:`finalize` (per-package) stitches each captured extension
+      target to its module's surface so the dynamically-loaded module
+      and its hooks survive.
     """
 
     name: str = "discordpy"
@@ -146,8 +150,8 @@ class DiscordPyPlugin:
         if not payload_imports_module(ctx.payload, "discord"):
             return None
 
-        imports = _collect_discord_imports(ctx.module)
-        if not imports:
+        commands_imports, discord_imports = _collect_discord_imports(ctx.module)
+        if not (commands_imports or discord_imports):
             return None
 
         decls_by_name = decls_by_simple_name(ctx.payload.nodes)
@@ -155,7 +159,10 @@ class DiscordPyPlugin:
         edges: list[tuple[SymbolNode, SymbolNode, CodeRange]] = []
 
         # 1. Bot/Client instances ----------------------------------------
-        bot_vars = _find_bot_instances(ctx.module, imports)
+        bot_vars: set[str] = set(
+            find_call_assignments(ctx.module, commands_imports, _COMMANDS_BOT_KINDS)
+        )
+        bot_vars |= set(find_call_assignments(ctx.module, discord_imports, _DISCORD_CLIENT_KINDS))
         for var_name in bot_vars:
             for var_decl in decls_by_name.get(var_name, []):
                 seed = synthetic_node(
@@ -167,16 +174,16 @@ class DiscordPyPlugin:
                 edges.append((seed, var_decl, SYNTHETIC_POSITION))
 
         # 2. Decorator handlers wired to a bot var -----------------------
-        handlers = _find_discordpy_handlers(ctx.module, bot_vars)
-        for var_name, handler_names in handlers.items():
-            for var_decl in decls_by_name.get(var_name, []):
-                for handler_name in handler_names:
-                    for handler_decl in decls_by_name.get(handler_name, []):
-                        edges.append((var_decl, handler_decl, SYNTHETIC_POSITION))
+        if bot_vars:
+            for var_name, handler_names in _find_handlers(ctx.module, bot_vars).items():
+                for var_decl in decls_by_name.get(var_name, []):
+                    for handler_name in handler_names:
+                        for handler_decl in decls_by_name.get(handler_name, []):
+                            edges.append((var_decl, handler_decl, SYNTHETIC_POSITION))
 
         # 3. Cog classes + the module's setup/teardown hooks -------------
         cog_class_decls: list[SymbolNode] = []
-        for cog_name in _find_cog_subclass_names(ctx.module, imports):
+        for cog_name in _find_cog_subclass_names(ctx.module, commands_imports):
             for decl in decls_by_name.get(cog_name, []):
                 if decl.type == "class":
                     cog_class_decls.append(decl)
@@ -208,11 +215,6 @@ class DiscordPyPlugin:
         return make_payload(nodes=nodes, edges=edges)
 
     def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]:
-        # Stitch each ``<discordpy-extension>:<fqname>`` synthetic to its
-        # target module's surface so the module + its top-level decls
-        # (including the ``setup`` / ``teardown`` hooks discord.py calls
-        # dynamically) stay alive. Mirrors how the visitor folds
-        # ``importlib.import_module("m")`` into a star import on ``m``.
         for synth in list(ctx.package_nodes()):
             if synth.type != "synthetic" or not synth.fqname.startswith(DISCORDPY_EXTENSION_PREFIX):
                 continue
@@ -224,155 +226,42 @@ class DiscordPyPlugin:
 # --- helpers ----------------------------------------------------------------
 
 
-def _collect_discord_imports(module: cst.Module) -> dict[str, str]:
-    """Return a unified ``{local_name: target}`` map for discord.py imports.
+def _collect_discord_imports(
+    module: cst.Module,
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Return ``(commands_imports, discord_imports)`` for discord.py imports.
 
-    Five legal shapes are recognized:
+    Each dict has the shape ``collect_module_imports`` already produces:
+    ``{local_name: target}``, with the literal ``"<module>"`` sentinel
+    marking a bare module binding (``import discord``,
+    ``from discord.ext import commands``). Keeping the two source
+    modules in separate dicts lets the call-site / base-class matchers
+    validate each name against the right whitelist
+    (``_COMMANDS_DIRECT_TARGETS`` for ``commands_imports``,
+    ``_DISCORD_CLIENT_KINDS`` for ``discord_imports``) without an
+    extra discord-specific sentinel layer.
 
-    * ``from discord.ext.commands import Bot``       -> ``{"Bot": "Bot"}``
-    * ``from discord.ext.commands import Bot as B``  -> ``{"B": "Bot"}``
-    * ``from discord.ext import commands``           -> ``{"commands": "<discord.ext.commands>"}``
-    * ``from discord import Client``                 -> ``{"Client": "Client"}``
-    * ``import discord``                             -> ``{"discord": "<discord>"}``
-
-    Class names outside the recognized discord.py whitelist
-    (``Bot``/``AutoShardedBot``/``Client``/``AutoShardedClient``/``Cog``/
-    ``GroupCog``) are dropped to keep the map small. Aliased forms
-    (``as ...``) flow through naturally.
+    The ``commands`` alias produced by ``from discord.ext import commands``
+    is spliced into ``commands_imports`` as a ``"<module>"`` entry so
+    ``commands.Bot(...)`` resolves through the standard
+    :func:`matched_attr_call` attribute-form check.
     """
-    bindings: dict[str, str] = {}
-    known_targets = _COMMANDS_BOT_KINDS | _DISCORD_CLIENT_KINDS | _COG_BASES
-    for stmt in module.body:
-        if not isinstance(stmt, cst.SimpleStatementLine):
-            continue
-        for small in stmt.body:
-            if isinstance(small, cst.ImportFrom):
-                if isinstance(small.names, cst.ImportStar):
-                    continue
-                module_name = _import_from_module_name(small)
-                if module_name is None:
-                    continue
-                if module_name == "discord.ext.commands":
-                    for alias in small.names:
-                        if not isinstance(alias.name, cst.Name):
-                            continue
-                        target = alias.name.value
-                        if target not in known_targets:
-                            continue
-                        local = _alias_local(alias) or target
-                        bindings[local] = target
-                elif module_name == "discord.ext":
-                    for alias in small.names:
-                        if not isinstance(alias.name, cst.Name):
-                            continue
-                        if alias.name.value != "commands":
-                            continue
-                        local = _alias_local(alias) or "commands"
-                        bindings[local] = _COMMANDS_MODULE
-                elif module_name == "discord":
-                    for alias in small.names:
-                        if not isinstance(alias.name, cst.Name):
-                            continue
-                        target = alias.name.value
-                        if target not in known_targets:
-                            continue
-                        local = _alias_local(alias) or target
-                        bindings[local] = target
-            elif isinstance(small, cst.Import):
-                for alias in small.names:
-                    if is_name(alias.name, "discord"):
-                        local = _alias_local(alias) or "discord"
-                        bindings[local] = _DISCORD_MODULE
-    return bindings
+    commands_imports = collect_module_imports(
+        module, "discord.ext.commands", _COMMANDS_DIRECT_TARGETS
+    )
+    for local in collect_module_imports(module, "discord.ext", {"commands"}):
+        commands_imports[local] = "<module>"
+    discord_imports = collect_module_imports(module, "discord", _DISCORD_CLIENT_KINDS)
+    return commands_imports, discord_imports
 
 
-def _import_from_module_name(node: cst.ImportFrom) -> str | None:
-    """Return the dotted module name for ``from <name> import ...``.
-
-    ``None`` for relative imports (``from .x import y``) or unparseable
-    module references. Supports dotted module names
-    (``from discord.ext.commands import Bot``) that ``is_from_module``
-    rejects because its underlying ``is_name`` check only matches a
-    bare ``cst.Name``.
-    """
-    if node.relative:
-        return None
-    return dotted_name(node.module)
-
-
-def _alias_local(alias: cst.ImportAlias) -> str | None:
-    if alias.asname is None:
-        return None
-    name = alias.asname.name
-    return name.value if isinstance(name, cst.Name) else None
-
-
-def _matched_constructor(
-    expr: cst.BaseExpression,
-    imports: dict[str, str],
-    valid_targets: Container[str],
-) -> str | None:
-    """Return the matched class name for ``Bot(...)``, ``commands.Bot(...)``,
-    or ``discord.Client(...)``; ``None`` otherwise.
-
-    Caller is expected to pass the ``Call.func`` directly (i.e. the
-    expression has been unwrapped from the surrounding ``Call``).
-    """
-    if isinstance(expr, cst.Name):
-        target = imports.get(expr.value)
-        if target is not None and target in valid_targets:
-            return target
-    elif isinstance(expr, cst.Attribute) and isinstance(expr.value, cst.Name):
-        sentinel = imports.get(expr.value.value)
-        attr = expr.attr.value
-        if sentinel in (_COMMANDS_MODULE, _DISCORD_MODULE) and attr in valid_targets:
-            return attr
-    return None
-
-
-def _find_bot_instances(module: cst.Module, imports: dict[str, str]) -> set[str]:
-    """Top-level var names bound to a Bot/Client constructor call."""
-    valid = _COMMANDS_BOT_KINDS | _DISCORD_CLIENT_KINDS
-    found: set[str] = set()
-    for stmt in module.body:
-        if not isinstance(stmt, cst.SimpleStatementLine):
-            continue
-        for small in stmt.body:
-            target, value = single_target_assignment(small)
-            if target is None or not isinstance(value, cst.Call):
-                continue
-            kind = _matched_constructor(value.func, imports, valid)
-            if kind is not None:
-                found.add(target)
-    return found
-
-
-def _tree_decorator_owner(expr: cst.BaseExpression) -> str | None:
-    """For ``@X.tree.<attr>(...)`` return ``"X"`` when ``attr`` is in
-    :data:`_TREE_DECORATORS`. Returns ``None`` otherwise.
-
-    The ``.tree`` attribute is the ``CommandTree`` instance discord.py
-    auto-creates on every ``Bot`` -- it isn't a separate variable, so
-    the owner is whatever bare ``Name`` heads the attribute chain.
-    """
-    if isinstance(expr, cst.Call):
-        expr = expr.func
-    parts = dotted_parts(expr)
-    if parts is None or len(parts) != 3:
-        return None
-    if parts[1] != "tree" or parts[2] not in _TREE_DECORATORS:
-        return None
-    return parts[0]
-
-
-def _find_discordpy_handlers(
-    module: cst.Module, instance_vars: Container[str]
-) -> dict[str, list[str]]:
+def _find_handlers(module: cst.Module, instance_vars: Container[str]) -> dict[str, list[str]]:
     """Map ``bot_var -> [handler_func_name, ...]`` for decorated top-level functions.
 
-    Recognizes both single-attribute decorators (``@bot.command()``,
-    ``@bot.event``) and the two-level slash-command form
-    (``@bot.tree.command()``, ``@bot.tree.context_menu()``).
+    Single-attribute decorators (``@bot.command()``, ``@bot.event``) and
+    the two-level slash-command form (``@bot.tree.command()``,
+    ``@bot.tree.context_menu()``) are both recognized in one pass over
+    ``module.body``.
     """
     handlers: dict[str, list[str]] = {}
     for stmt in module.body:
@@ -389,37 +278,41 @@ def _find_discordpy_handlers(
     return handlers
 
 
-def _find_cog_subclass_names(module: cst.Module, imports: dict[str, str]) -> list[str]:
+def _tree_decorator_owner(expr: cst.BaseExpression) -> str | None:
+    """For ``@X.tree.<attr>(...)`` return ``"X"`` when ``attr`` is a
+    recognized tree decorator; ``None`` otherwise.
+
+    The ``.tree`` attribute is the ``CommandTree`` instance discord.py
+    auto-creates on every ``Bot`` -- it isn't a separate variable, so
+    the owner is whatever bare ``Name`` heads the attribute chain.
+    """
+    if isinstance(expr, cst.Call):
+        expr = expr.func
+    parts = dotted_parts(expr)
+    if parts is None or len(parts) != 3:
+        return None
+    if parts[1] != "tree" or parts[2] not in _TREE_DECORATORS:
+        return None
+    return parts[0]
+
+
+def _find_cog_subclass_names(module: cst.Module, commands_imports: dict[str, str]) -> list[str]:
     """Top-level class names inheriting from a recognized Cog base."""
     out: list[str] = []
     for stmt in module.body:
         if not isinstance(stmt, cst.ClassDef):
             continue
-        if _is_cog_subclass(stmt, imports):
-            out.append(stmt.name.value)
+        for arg in stmt.bases:
+            if arg.keyword is not None:
+                continue
+            base_expr = arg.value
+            # ``class Foo(commands.Cog[Generic[T]])`` is unusual but safe to unwrap.
+            if isinstance(base_expr, cst.Subscript):
+                base_expr = base_expr.value
+            if matched_attr_call(base_expr, commands_imports, _COG_BASES, unwrap_call=False):
+                out.append(stmt.name.value)
+                break
     return out
-
-
-def _is_cog_subclass(class_def: cst.ClassDef, imports: dict[str, str]) -> bool:
-    for arg in class_def.bases:
-        if arg.keyword is not None:
-            continue
-        if _matched_base(arg.value, imports):
-            return True
-    return False
-
-
-def _matched_base(expr: cst.BaseExpression, imports: dict[str, str]) -> bool:
-    """Return True if ``expr`` resolves to a Cog base class."""
-    # ``class Foo(commands.Cog[Generic[T]])`` is unusual but safe to unwrap.
-    if isinstance(expr, cst.Subscript):
-        expr = expr.value
-    if isinstance(expr, cst.Name):
-        return imports.get(expr.value) in _COG_BASES
-    if isinstance(expr, cst.Attribute) and isinstance(expr.value, cst.Name):
-        sentinel = imports.get(expr.value.value)
-        return sentinel == _COMMANDS_MODULE and expr.attr.value in _COG_BASES
-    return False
 
 
 def _find_load_extension_targets(module: cst.Module) -> list[str]:
@@ -469,7 +362,6 @@ class _LoadExtensionFinder(cst.CSTVisitor):
             if captured:
                 self.captured.append(captured)
             return None
-        # load_extensions: iterable of string literals.
         if isinstance(value, (cst.List, cst.Tuple)):
             for elt in value.elements:
                 if not isinstance(elt, cst.Element):

@@ -24,6 +24,14 @@ two versions.
   (matching `importlib.import_module` semantics).
 
 ### Changed
+- `is_from_module` (exported from `dead_cst.plugins`) now recognizes
+  dotted module names — `is_from_module(node, "discord.ext.commands")`
+  matches `from discord.ext.commands import ...`. Previously only
+  single-segment module names worked, because the helper bottomed out
+  in `is_name` (bare `cst.Name` only). Backward-compatible: every
+  existing single-segment caller still matches. `collect_module_imports`
+  inherits the change, so plugins can now scan dotted source modules
+  without rolling their own import-walker.
 - `SymbolVisitor` now hoists the `_descendant_ids` cache used by
   `live_referents` / `live_at_exit` onto the visitor instance, so a
   single shared cache covers every flow-analysis call the visitor
