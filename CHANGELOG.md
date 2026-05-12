@@ -9,6 +9,13 @@ two versions.
 
 ## [Unreleased]
 
+### Changed
+- Release workflow now triggers on GitHub Release `published` instead of
+  on a `v*` tag push. Publishing a Release with a new `vX.Y.Z` tag name
+  (which the GitHub Releases UI creates for you, including from mobile)
+  builds the package, publishes to PyPI via OIDC, and attaches the
+  built sdist/wheel to the release. Tag-only pushes no longer publish.
+
 ### Fixed
 - `FastAPIPlugin` and `FlaskPlugin` now classify the factory pattern
   across packages when the factory uses `import fastapi; fastapi.FastAPI()`
