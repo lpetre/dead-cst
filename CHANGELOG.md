@@ -9,6 +9,16 @@ two versions.
 
 ## [Unreleased]
 
+### Changed
+- `SymbolVisitor` now hoists the `_descendant_ids` cache used by
+  `live_referents` / `live_at_exit` onto the visitor instance, so a
+  single shared cache covers every flow-analysis call the visitor
+  makes for a file. Previously each multi-referent access in
+  `on_leave` triggered a fresh cache allocation, so large files with
+  many reassignments re-walked the same statement subtrees from
+  scratch on every access. Pure performance change — output and
+  payload-cache fingerprint are unchanged.
+
 ### Fixed
 - A `foo.py` sibling of a `foo/__init__.py` package no longer asserts
   out of `SymbolTrie.add_declaration`. The new
