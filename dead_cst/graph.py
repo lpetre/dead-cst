@@ -211,6 +211,12 @@ class SymbolTrie:
         visitor flags them and routes them around the trie. De-duplicates
         so the visitor's double-push for ``Assign`` (one push for the LHS
         name, one for the RHS value) does not register the same decl twice.
+
+        Module-FQN collisions across files (``foo.py`` alongside
+        ``foo/__init__.py``) are resolved upstream by
+        :func:`dead_cst._refresh.shadowed_paths`: the loser's payload is
+        applied to the graph but skipped at the trie, so this method
+        never sees two ``module`` decls at the same node.
         """
         parts = decl.fqname.split(".")
         match decl.type:
