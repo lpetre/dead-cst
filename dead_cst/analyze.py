@@ -128,6 +128,7 @@ def _compose_contribution(
             symbol_lookup=symbol_lookup,
             package=contrib.package,
             project_root=project_root,
+            package_graph=contrib.package_graph,
         )
         for plugin in plugins:
             if not isinstance(plugin, EdgePlugin):

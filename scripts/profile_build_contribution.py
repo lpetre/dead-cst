@@ -139,23 +139,18 @@ def main() -> None:
 
 
 def _profile_package_nodes(contrib: PackageContribution, project_root: Path) -> None:
-    """Benchmark :meth:`PluginContext.package_nodes`.
+    """Benchmark :meth:`PluginContext.package_nodes` on both paths.
 
     Single-package workload: ``contrib.package_graph`` *is* the composed
-    graph, so the ``is_relative_to`` filter is a worst-case "every node
-    matches" scan. A multi-package workspace gets a slightly cheaper
-    filter per package but the same per-call cost class -- this run
-    bounds it.
+    graph, so the legacy ``is_relative_to`` filter is a worst-case "every
+    node matches" scan. The seeded path (``package_graph=...`` passed to
+    :class:`PluginContext`) sidesteps the filter entirely.
     """
     graph = contrib.package_graph
     n_total = graph.number_of_nodes()
     print(f"\npackage_nodes: composed graph has {n_total} node(s)")
 
-    # Cold-call benchmark: rebuild a fresh ``PluginContext`` each
-    # iteration so the cache doesn't short-circuit the walk. This is
-    # the real per-finalize cost (``_compose_contribution`` constructs
-    # a new context per package).
-    def _make_ctx() -> PluginContext:
+    def _make_filter_ctx() -> PluginContext:
         return PluginContext(
             graph=graph,
             symbol_lookup=contrib.current_trie,
@@ -163,39 +158,45 @@ def _profile_package_nodes(contrib: PackageContribution, project_root: Path) -> 
             project_root=project_root,
         )
 
-    _make_ctx()  # warm import paths
+    def _make_seeded_ctx() -> PluginContext:
+        return PluginContext(
+            graph=graph,
+            symbol_lookup=contrib.current_trie,
+            package=contrib.package,
+            project_root=project_root,
+            package_graph=contrib.package_graph,
+        )
 
-    t0 = time.perf_counter()
-    matched = 0
-    for _ in range(REPEATS):
-        matched = sum(1 for _ in _make_ctx().package_nodes())
-    cold_wall = time.perf_counter() - t0
-    cold_per_call = cold_wall / REPEATS * 1000
-    print(
-        f"  cold:  {cold_per_call:7.2f} ms per call "
-        f"({matched}/{n_total} nodes matched, {REPEATS} iters)"
-    )
+    for label, make_ctx in (("filter", _make_filter_ctx), ("seeded", _make_seeded_ctx)):
+        make_ctx()  # warm import paths
+        t0 = time.perf_counter()
+        matched = 0
+        for _ in range(REPEATS):
+            matched = sum(1 for _ in make_ctx().package_nodes())
+        cold_wall = time.perf_counter() - t0
+        cold_per_call_us = cold_wall / REPEATS * 1e6
+        print(
+            f"  {label:6s} cold:  {cold_per_call_us:8.1f} us per call "
+            f"({matched}/{n_total} nodes matched)"
+        )
 
-    # Warm-call benchmark: same context across calls. Each plugin after
-    # the first in a finalize pass hits this path because ``package_nodes``
-    # memoizes on the ``PluginContext``.
-    warm_ctx = _make_ctx()
-    list(warm_ctx.package_nodes())  # populate cache
-    iters = 10000
-    t0 = time.perf_counter()
-    for _ in range(iters):
-        for _ in warm_ctx.package_nodes():
-            pass
-    warm_per_call_us = (time.perf_counter() - t0) / iters * 1e6
-    print(f"  warm:  {warm_per_call_us:7.2f} us per call ({iters} iters, cached)")
+        warm_ctx = make_ctx()
+        list(warm_ctx.package_nodes())
+        iters = 10000
+        t0 = time.perf_counter()
+        for _ in range(iters):
+            for _ in warm_ctx.package_nodes():
+                pass
+        warm_per_call_us = (time.perf_counter() - t0) / iters * 1e6
+        print(f"  {label:6s} warm:  {warm_per_call_us:8.2f} us per call (cached)")
 
     profiler = cProfile.Profile()
     profiler.enable()
     for _ in range(REPEATS):
-        sum(1 for _ in _make_ctx().package_nodes())
+        sum(1 for _ in _make_seeded_ctx().package_nodes())
     profiler.disable()
 
-    print("\npackage_nodes cold-call top 15 by tottime:")
+    print("\npackage_nodes seeded cold-call top 15 by tottime:")
     pstats.Stats(profiler).sort_stats("tottime").print_stats(15)
 
 

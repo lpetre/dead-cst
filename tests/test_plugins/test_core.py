@@ -399,3 +399,61 @@ def test_plugin_context_package_nodes_filters_and_caches(tmp_path):
     graph.add_node(late)
     second = sorted(ctx.package_nodes(), key=lambda n: n.fqname)
     assert second == first
+
+
+def test_plugin_context_package_nodes_seeded_from_package_graph(tmp_path):
+    """Seeded path: ``package_graph`` is the source, no filter walk."""
+    pkg = Package(path=tmp_path, name="pkg")
+    inside_mod = SymbolNode("pkg", "module", tmp_path / "__init__.py", _pos())
+    inside_fn = SymbolNode("pkg.f", "function", tmp_path / "a.py", _pos())
+    outside = SymbolNode("other.b", "module", tmp_path.parent / "other.py", _pos())
+
+    package_graph = nx.MultiDiGraph()
+    package_graph.add_node(inside_mod)
+    package_graph.add_node(inside_fn)
+
+    merged = nx.DiGraph()
+    merged.add_node(inside_mod)
+    merged.add_node(inside_fn)
+    merged.add_node(outside)
+
+    ctx = PluginContext(
+        graph=merged,
+        symbol_lookup=SymbolTrie(),
+        package=pkg,
+        project_root=tmp_path,
+        package_graph=package_graph,
+    )
+    assert sorted(ctx.package_nodes(), key=lambda n: n.fqname) == [inside_mod, inside_fn]
+    assert sorted(ctx.package_modules(), key=lambda kv: kv[1].fqname) == [
+        (inside_mod.path, inside_mod)
+    ]
+
+
+def test_plugin_context_package_graph_seeding_matches_filter(tmp_path):
+    """Seeded and filter paths agree on the same input."""
+    pkg = Package(path=tmp_path, name="pkg")
+    inside_mod = SymbolNode("pkg", "module", tmp_path / "__init__.py", _pos())
+    inside_fn = SymbolNode("pkg.f", "function", tmp_path / "a.py", _pos())
+    outside = SymbolNode("other.b", "module", tmp_path.parent / "other.py", _pos())
+
+    merged = nx.DiGraph()
+    for n in (inside_mod, inside_fn, outside):
+        merged.add_node(n)
+
+    package_graph = nx.MultiDiGraph()
+    package_graph.add_node(inside_mod)
+    package_graph.add_node(inside_fn)
+
+    filter_ctx = PluginContext(
+        graph=merged, symbol_lookup=SymbolTrie(), package=pkg, project_root=tmp_path
+    )
+    seeded_ctx = PluginContext(
+        graph=merged,
+        symbol_lookup=SymbolTrie(),
+        package=pkg,
+        project_root=tmp_path,
+        package_graph=package_graph,
+    )
+    assert set(filter_ctx.package_nodes()) == set(seeded_ctx.package_nodes())
+    assert set(filter_ctx.package_modules()) == set(seeded_ctx.package_modules())
