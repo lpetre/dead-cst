@@ -242,7 +242,9 @@ def test_is_dunder_all(fqname, type_, expected):
 @pytest.mark.parametrize(
     "fqname, type_, expected",
     [
-        pytest.param(f"{EXTERNAL_DIST_PREFIX}networkx", "synthetic", True, id="external-synthetic"),
+        pytest.param(
+            f"{EXTERNAL_DIST_PREFIX}rustworkx", "synthetic", True, id="external-synthetic"
+        ),
         pytest.param(f"{EXPLICIT_PREFIX}foo", "synthetic", False, id="entrypoint-synthetic"),
         pytest.param("pkg.foo", "function", False, id="real-function"),
     ],
@@ -526,17 +528,17 @@ def test_dependencies_no_third_party(runner, project):
 
 
 def test_dependencies_third_party_listed(runner, project):
-    root = project({"mod.py": "import networkx\n_x = networkx\n"})
+    root = project({"mod.py": "import rustworkx\n_x = rustworkx\n"})
     result = runner.invoke(app, ["dependencies", str(root)])
     assert result.exit_code == 0
-    assert "[external dist] networkx" in result.stdout
+    assert "[external dist] rustworkx" in result.stdout
 
 
 def test_dependencies_json_output_groups_by_base(runner, project):
-    root = project({"mod.py": "import networkx\n_x = networkx\n"})
+    root = project({"mod.py": "import rustworkx\n_x = rustworkx\n"})
     result = runner.invoke(app, ["dependencies", str(root), "--format", "json"])
     assert result.exit_code == 0
-    assert json.loads(result.stdout) == {str(root.resolve()): ["[external dist] networkx"]}
+    assert json.loads(result.stdout) == {str(root.resolve()): ["[external dist] rustworkx"]}
 
 
 def test_dependencies_json_output_empty_when_no_deps(runner, project):

@@ -23,9 +23,15 @@ two versions.
   `networkx.MultiDiGraph`; out-of-tree code that constructed graphs
   manually has to swap `nx.MultiDiGraph()` for `SymbolGraph()`. The
   per-file `VisitorPayload` cache shape is unchanged, so no
-  invalidation is required. `networkx` is no longer a runtime
-  dependency (kept in the dev group for test fixtures that exercise
-  external-dist resolution against a recognizable third-party name).
+  invalidation is required. `networkx` is dropped entirely.
+- Edges are now deduplicated by `(src, dst, flags)` at apply / stitch
+  time. Repeated same-suite references (`f(); f(); f()`) used to land
+  as parallel edges with identical attrs; they collapse to a single
+  edge now. Metadata-distinct edges between the same pair (e.g. one
+  `DEAD_BRANCH` + one `NONE`) are still kept separate so strict-mode
+  reachability filters correctly. Reachability behavior is unchanged
+  (BFS already used a `visited` set); the win is memory + iteration
+  cost on hot files.
 - `DispatchAppPlugin` (in `dead_cst.plugins.decl_shapes`) is now the
   shared base for `FlaskPlugin`, `FastAPIPlugin`, and `CeleryPlugin` in
   addition to `TyperPlugin` / `CycloptsPlugin`. The base learned an

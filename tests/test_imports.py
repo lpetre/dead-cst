@@ -515,23 +515,23 @@ def test_third_party_import_creates_synthetic_node(build_decl_graph):
     graph = build_decl_graph(
         {
             "p/__init__.py": "",
-            "p/uses_nx.py": "import networkx as nx\ndef build(): return nx.DiGraph()",
+            "p/uses_rx.py": "import rustworkx as rx\ndef build(): return rx.PyDiGraph()",
         }
     )
-    nx_nodes = {
+    rx_nodes = {
         n
         for n in graph.nodes
         if n.type == "synthetic"
         and n.fqname.startswith(EXTERNAL_PREFIXES)
-        and "networkx" in n.fqname
+        and "rustworkx" in n.fqname
     }
-    assert nx_nodes, (
-        "expected an external-dep synthetic node for networkx, got "
+    assert rx_nodes, (
+        "expected an external-dep synthetic node for rustworkx, got "
         f"{[n.fqname for n in graph.nodes if n.type == 'synthetic']}"
     )
 
-    edge_srcs = {src.fqname for src, dst in graph.edges(keys=False) if dst in nx_nodes}
-    assert {"p.uses_nx.nx", "p.uses_nx.build"} <= edge_srcs
+    edge_srcs = {src.fqname for src, dst in graph.edges(keys=False) if dst in rx_nodes}
+    assert {"p.uses_rx.rx", "p.uses_rx.build"} <= edge_srcs
 
 
 def test_stdlib_imports_are_silent(build_decl_graph, caplog):

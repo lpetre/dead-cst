@@ -695,6 +695,18 @@ def _apply_payload(
         def flag_for(pos: CodeRange) -> EdgeFlags:
             return EdgeFlags.NONE
 
+    # Dedup edges produced by this file. Repeated references inside a
+    # single suite (``f(); f(); f()``) record one ``payload.edges`` entry
+    # per access; after ``flag_for(pos)`` collapse, they would otherwise
+    # land as parallel edges with identical ``(src, dst, flags)``. The
+    # ``decl -> module`` edge is structurally unique per decl so the
+    # ``(n, module, NONE)`` insertion is safe to dedup against the same
+    # set without changing behavior. Per-file scope is sufficient because
+    # ``src`` / ``dst`` SymbolNodes are file-scoped (different files emit
+    # distinct nodes), so no two files in a package can produce the same
+    # triple.
+    seen_edges: set[tuple[SymbolNode, SymbolNode, EdgeFlags]] = set()
+
     for n in payload.nodes:
         symbol_graph.add_node(n)
         if n.flags & NodeFlags.ENTRYPOINT:
@@ -704,7 +716,10 @@ def _apply_payload(
         if n.type == "synthetic":
             continue
         if n.type != "module":
-            symbol_graph.add_edge(n, module, flags=EdgeFlags.NONE)
+            key = (n, module, EdgeFlags.NONE)
+            if key not in seen_edges:
+                seen_edges.add(key)
+                symbol_graph.add_edge(n, module, flags=EdgeFlags.NONE)
         # ``OVERLOAD`` and ``SHADOWED`` exclude a single decl from the
         # cross-module lookup trie; ``add_to_trie=False`` is the
         # file-level equivalent for a ``.py`` whose sibling package
@@ -718,7 +733,11 @@ def _apply_payload(
                 export_trie.add_declaration(n)
 
     for src, dst, pos in payload.edges:
-        symbol_graph.add_edge(src, dst, flags=flag_for(pos))
+        flags = flag_for(pos)
+        key = (src, dst, flags)
+        if key not in seen_edges:
+            seen_edges.add(key)
+            symbol_graph.add_edge(src, dst, flags=flags)
 
     for src, imp, pos in payload.imports:
         import_edges.add((src, imp, flag_for(pos)))

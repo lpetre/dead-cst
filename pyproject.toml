@@ -70,11 +70,6 @@ dev = [
     "fastapi>=0.110",
     "fastmcp>=2.0",
     "flask>=3.0",
-    # ``networkx`` is no longer a runtime dep but a handful of resolver /
-    # external-dist tests fixture-import it as a recognizable third-party
-    # name (it has to be importable for the analyzer to classify it as
-    # ``[external dist] networkx`` rather than ``[unresolved]``).
-    "networkx>=3.0",
 ]
 
 [tool.pytest.ini_options]

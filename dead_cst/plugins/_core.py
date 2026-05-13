@@ -359,6 +359,12 @@ class EdgePlugin(Cacheable, Protocol):
 
 
 def apply_ops(graph: SymbolGraph, ops: Iterable[GraphOp]) -> None:
+    # Plugins that fan out across the graph (subclass-closure walks,
+    # factory-chain traversals) can rediscover the same target node via
+    # multiple paths and emit ``AddEdge(src, dst)`` for the same pair
+    # more than once. The natural attrs payload here is empty
+    # (plugin-emitted edges carry no flags), so a single ``has_edge``
+    # check is enough to collapse the duplicates.
     for op in ops:
         match op:
             case AddNode(node, entrypoint, testcase):
@@ -368,7 +374,8 @@ def apply_ops(graph: SymbolGraph, ops: Iterable[GraphOp]) -> None:
                 if testcase:
                     graph.nodes[node]["testcase"] = True
             case AddEdge(src, dst):
-                graph.add_edge(src, dst)
+                if not graph.has_edge(src, dst):
+                    graph.add_edge(src, dst)
             case RemoveEdge(src, dst):
                 if graph.has_edge(src, dst):
                     graph.remove_edge(src, dst)
