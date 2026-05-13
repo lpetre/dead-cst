@@ -71,7 +71,7 @@ def test_fingerprint_independent_of_package_path_and_name(tmp_path):
     relative to ``package.path`` -- because :data:`NodeFlags.EXPORTED`
     is stamped onto every node from a file under those subdirs.
     """
-    from dead_cst.resolvers._core import Package
+    from dead_cst.resolvers import Package
 
     a = _fp(package=Package(path=tmp_path / "a", name="a", exported=(), deps=()))
     b = _fp(package=Package(path=tmp_path / "b", name="b", exported=(), deps=("x",)))
@@ -87,7 +87,7 @@ def test_fingerprint_changes_when_exported_changes(tmp_path):
     ``[tool.uv]`` workspace config) changes the cached payload, so
     the fingerprint must reflect the new configuration.
     """
-    from dead_cst.resolvers._core import Package
+    from dead_cst.resolvers import Package
 
     pkg_path = tmp_path / "pkg"
     pkg_path.mkdir()

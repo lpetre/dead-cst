@@ -52,8 +52,6 @@ def test_merge_exported_drops_non_exported_module():
     dst = SymbolTrie()
     dst.merge_exported(src)
 
-    # Non-exported module is dropped, but the trie node still exists
-    # because the recursion walks every child unconditionally.
     pkg_node = dst.children.get("pkg")
     if pkg_node is not None:
         assert pkg_node.module is None

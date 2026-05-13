@@ -22,7 +22,7 @@ from dead_cst.cache import (
 )
 from dead_cst.graph import VisitorPayload
 from dead_cst.plugins import ObserveContext, PluginContext
-from dead_cst.resolvers._core import Package
+from dead_cst.resolvers import Package
 
 
 def _fp(tmp_path: Path, **kwargs) -> str:

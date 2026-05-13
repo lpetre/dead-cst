@@ -32,21 +32,11 @@ logger = logging.getLogger(__name__)
 class PackageContribution:
     """One package's pre-stitched contribution to the symbol graph.
 
-    Built once per package by :func:`build_contribution` and composed
-    into a target graph by :func:`dead_cst.analyze._compose_contribution`,
-    which adds cross-package edges via :func:`resolve_edges` and runs
-    plugin :meth:`EdgePlugin.finalize` against the composed graph.
-
-    ``trie`` is the single per-package lookup trie carrying every
-    visible decl (both exported and non-exported). The package's own
-    self-lookup uses :meth:`SymbolTrie.merge` (sees everything);
-    consumer-side merges call :meth:`SymbolTrie.merge_exported` to
-    filter to nodes flagged :data:`NodeFlags.EXPORTED` (set at visitor
-    time via the per-package fingerprint).
-
-    ``package_graph.graph["dead_suites"]`` carries this package's
-    per-file dead-suite positions; the compose step folds them into the
-    target graph's matching key.
+    Built by :func:`build_contribution` and composed into a target
+    graph by :func:`dead_cst.analyze._compose_contribution`. ``trie``
+    holds every visible decl; consumer-side merges filter via
+    :meth:`SymbolTrie.merge_exported`. ``package_graph.graph["dead_suites"]``
+    carries per-file dead-suite positions.
     """
 
     package: Package
@@ -164,44 +154,20 @@ def _apply_payload(
 ) -> SymbolNode:
     """Emit ``payload`` into the in-progress per-package structures.
 
-    Drives all node routing off ``SymbolNode.flags`` and ``type``:
+    Routing by ``SymbolNode.type``: ``module`` goes to graph + trie,
+    ``synthetic`` to graph only (no parent edge, no trie entry), other
+    decls to graph with a parent-module edge plus a trie entry gated
+    by ``eclipsed`` and the per-decl ``SHADOWED`` / ``OVERLOAD`` /
+    ``NOTEBOOK`` flags. ``ENTRYPOINT`` and ``TESTCASE`` mirror into
+    attr-dict entries for the reachability passes; see :class:`NodeFlags`
+    for the full taxonomy.
 
-    * ``type == "module"`` goes into the graph and the trie; no parent
-      edge (modules are themselves the parent target).
-    * ``type == "synthetic"`` (plugin-emitted markers) goes into the
-      graph only -- no parent edge, no trie entry. Synthetic fqnames
-      don't fit the dotted module hierarchy and aren't lookup targets
-      for cross-module imports.
-    * Other decls go into the graph with a parent-module edge.
-      ``NodeFlags.SHADOWED`` excludes them from the trie -- the graph
-      keeps the parent edge so the decl stays well-formed, but
-      cross-module imports never resolve to it.
-    * ``NodeFlags.ENTRYPOINT`` (typically on plugin synthetics)
-      seeds reachability: ``graph.nodes[node]["entrypoint"] = True``
-      so :func:`find_reachable` starts its BFS from this node.
-    * ``NodeFlags.TESTCASE`` mirrors into a
-      ``graph.nodes[node]["testcase"] = True`` attribute so
-      :func:`find_reachable_excluding_tests` can drop test seeds when
-      computing the "blast radius" of removing the test suite.
-    * ``NodeFlags.NOQA`` is read straight off the ``SymbolNode`` (no
-      attr-dict mirror) by :func:`find_reachable_excluding`, which
-      filters seeds via ``n.flags & exclude_flags`` for the "blast
-      radius" of removing every noqa-pinned import.
-
-    Edge flag derivation: each ``(src, dst, access_pos)`` entry has
-    its access position tested against ``payload.dead_suites`` for
-    containment. If matched, the resulting graph edge gets
-    :data:`EdgeFlags.DEAD_BRANCH`. Plugin-emitted edges use
-    ``SYNTHETIC_POSITION`` (line 0), which never falls inside a real
-    dead suite, so they always land with ``EdgeFlags.NONE``.
-    Unresolved cross-file imports accumulate into ``import_edges``
-    along with the derived flag and are fed to :func:`resolve_edges`
-    once the per-package trie is fully built; resolution preserves
-    the flag through every emission.
-
-    Per-file dead-suite positions are stashed on the graph as
-    ``graph.graph["dead_suites"][module.path]`` for downstream
-    reporting (e.g. "this file has unreachable code at line X").
+    Each edge gets :data:`EdgeFlags.DEAD_BRANCH` when its access
+    position falls inside one of ``payload.dead_suites``. Unresolved
+    cross-file imports accumulate into ``import_edges`` along with the
+    derived flag for :func:`resolve_edges` to stitch later. Per-file
+    dead-suite positions are stashed under
+    ``graph.graph["dead_suites"][module.path]`` for downstream reports.
     """
     module = next(n for n in payload.nodes if n.type == "module")
 
@@ -229,14 +195,9 @@ def _apply_payload(
             continue
         if n.type != "module":
             symbol_graph.add_edge(n, module, flags=EdgeFlags.NONE)
-        # ``OVERLOAD`` and ``SHADOWED`` exclude a single decl from the
-        # cross-module lookup trie; ``eclipsed=True`` is the
-        # file-level equivalent for a ``.py`` whose sibling package
-        # eclipses it. Either way the graph keeps the parent edge so
-        # the decl is well-formed -- only consumer FQN lookups change.
-        # ``NodeFlags.EXPORTED`` is *not* a trie-entry filter -- the
-        # trie holds every visible decl, and consumer-side merges use
-        # ``SymbolTrie.merge_exported`` to read only the exported subset.
+        # File-level (``eclipsed``) and per-decl flags both gate trie
+        # entry; the graph keeps the parent edge either way so the decl
+        # stays well-formed.
         if not eclipsed and not (
             n.flags & (NodeFlags.SHADOWED | NodeFlags.OVERLOAD | NodeFlags.NOTEBOOK)
         ):

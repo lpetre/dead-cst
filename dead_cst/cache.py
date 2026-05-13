@@ -48,7 +48,7 @@ import pickle
 import sqlite3
 import sys
 from pathlib import Path
-from typing import Sequence
+from typing import TYPE_CHECKING, Sequence
 
 from ._visitor import SymbolVisitor
 from .branches import (
@@ -57,7 +57,9 @@ from .branches import (
 )
 from .graph import VisitorPayload
 from .plugins._core import EdgePlugin
-from .resolvers._core import Package
+
+if TYPE_CHECKING:
+    from .resolvers import Package
 
 logger = logging.getLogger(__name__)
 

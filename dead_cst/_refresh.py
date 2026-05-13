@@ -528,9 +528,10 @@ def _merge_payloads(*payloads: VisitorPayload) -> VisitorPayload:
 
 
 def _under_any(file: Path, roots: tuple[Path, ...]) -> bool:
-    """True iff ``file`` is equal to or nested under any of ``roots``."""
-    f = file.resolve()
-    for r in roots:
-        if f == r or f.is_relative_to(r):
-            return True
-    return False
+    """True iff ``file`` is nested under any of ``roots``.
+
+    Both inputs are absolute by construction (``enumerate_files`` walks
+    ``package.path.rglob`` and ``_validate_packages`` absolutizes every
+    ``Package.exported`` entry), so no ``resolve()`` is needed.
+    """
+    return any(file.is_relative_to(r) for r in roots)

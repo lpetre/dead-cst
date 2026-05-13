@@ -393,12 +393,7 @@ class Analysis:
             if unreachable_detector is not None
             else DefaultUnreachableRegionDetector()
         )
-        # One fingerprint per package -- the visitor's output is a
-        # function of the file's source plus the plugin / detector
-        # chain plus the package's ``exported`` setting (which feeds
-        # ``NodeFlags.EXPORTED`` into every node via ``default_flags``).
-        # Sibling packages with different export configurations get
-        # independent invalidation; the rest of the inputs are shared.
+        # Per-package because ``Package.exported`` enters the fingerprint.
         self._fingerprints: dict[Path, str] = {
             p.path: compute_fingerprint(
                 plugins=self._plugins,
@@ -777,9 +772,6 @@ class PackageView:
         as :meth:`graph`) because cross-package import resolution is
         what populates the predecessors used here.
         """
-        # Trigger closure materialization first so every dep is refreshed
-        # and ``_build_symbol_lookup``'s ``self._contributions[dep]`` access
-        # is safe.
         graph = self._analysis.materialize_closure(self._package.path)
         contrib = self._analysis._contributions[self._package.path]
         ctx = PluginContext(
