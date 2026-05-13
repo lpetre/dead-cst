@@ -39,7 +39,6 @@ def main() -> None:
     assert target_dir.is_dir(), f"expected {target_dir} to exist"
 
     detector = DefaultUnreachableRegionDetector()
-    fingerprint = compute_fingerprint(plugins=(), unreachable_detector=detector)
 
     package = Package(
         path=project_root,
@@ -47,6 +46,7 @@ def main() -> None:
         exported=tuple(exported_roots(project_root) or ()),
         deps=(),
     )
+    fingerprint = compute_fingerprint(plugins=(), unreachable_detector=detector, package=package)
 
     files = tuple(sorted(p for p in target_dir.rglob("*.py") if p.is_file()))
     print(f"build_contribution over {len(files)} file(s) under {target_dir.name}/")
@@ -63,14 +63,13 @@ def main() -> None:
 
         pf = PackageFiles(package=package, files=files, hits=hits, miss_files=tuple(miss_files))
         if miss_files:
-            tasks = build_stale_tasks({package.path: pf}, project_root)
+            tasks = build_stale_tasks({package.path: pf}, project_root, {package.path: fingerprint})
             t0 = time.perf_counter()
             miss_payloads = process_stale_files(
                 tasks=tasks,
                 detector=detector,
                 plugins=(),
                 cache=cache,
-                fingerprint=fingerprint,
                 workers=None,
             )
             elapsed_ms = (time.perf_counter() - t0) * 1000
@@ -113,7 +112,7 @@ def _profile_package_nodes(contrib: PackageContribution, project_root: Path) -> 
     def _make_ctx() -> PluginContext:
         return PluginContext(
             graph=graph,
-            symbol_lookup=contrib.current_trie,
+            symbol_lookup=contrib.trie,
             package=contrib.package,
             project_root=project_root,
             package_graph=contrib.package_graph,

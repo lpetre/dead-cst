@@ -9,6 +9,46 @@ two versions.
 
 ## [Unreleased]
 
+### Changed
+- `Package.exported` now enters the per-package cache fingerprint, so
+  editing the exported subdirs invalidates that package's cache (siblings
+  are unaffected). The fingerprint is computed per-package via the new
+  `package=` argument on `compute_fingerprint`. `Package.path` / `name` /
+  `deps`, the resolver, and `search_paths` remain outside the fingerprint.
+  Schema bumped to 4; existing caches will rebuild on first run.
+
+- Two trie fields on `PackageContribution` collapse into one. Previously
+  each package kept a `current_trie` (everything) plus an `export_trie`
+  (only decls from files under `Package.exported`); they now share a
+  single `trie`, with each entry's exported-ness carried by the new
+  `NodeFlags.EXPORTED` flag. `_build_symbol_lookup` calls
+  `SymbolTrie.merge` for the package's own trie and the new
+  `SymbolTrie.merge_exported` for each dep's trie, which filters to
+  EXPORTED-flagged entries while still walking through unexported
+  intermediate modules so exported descendants stay reachable.
+  `EXPORTED` is set via the visitor's `default_flags` mechanism (same
+  pattern as `NOTEBOOK`).
+
+- The "shadowed by sibling package" file-vs-package precedence case is
+  now called **eclipsed** to disambiguate from `NodeFlags.SHADOWED`
+  (intra-file decl rebinding, unchanged). The function is
+  `eclipsed_paths`, the warning text says "eclipsed by sibling package",
+  and `_apply_payload` takes `eclipsed: bool`. The standard linter
+  meaning of `SHADOWED` is preserved.
+
+### Refactored
+- The per-package apply layer (`PackageContribution`, `build_contribution`,
+  `_apply_payload`, `eclipsed_paths`) moved from `_refresh.py` into a new
+  `_package.py` module. `_refresh.py` now hosts the per-file pipeline
+  exclusively (enumerate, parse, observe, cache); the per-package step
+  consumes those payloads. No public API change.
+
+- `Analysis._materialize` renamed its `scope` parameter to `included` and
+  dropped the `None`-means-everything case (`materialize_all` now passes
+  the full package set explicitly). `Analysis._build_symbol_lookup` lost
+  its `scope` parameter entirely — the `_interesting_set` is closed under
+  transitive deps by construction, so the filter could never trigger.
+
 ### Removed
 - The overlay / what-if API on `Analysis` is gone (breaking):
   `Analysis.preview_payloads`, `Analysis.materialize_with`,

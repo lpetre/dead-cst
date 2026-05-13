@@ -65,6 +65,15 @@ class NodeFlags(enum.IntFlag):
     ``NOTEBOOK | ENTRYPOINT`` on every node so the whole file's content
     is a reachability seed. The codemod uses this flag to skip
     notebooks (cell-aware writeback is out of scope today).
+
+    ``EXPORTED`` tags every node sourced from a file that the package
+    exports to its consumers (per :attr:`Package.exported`). Set via
+    the visitor's ``default_flags`` mechanism, so it lands on every
+    node a file produces. The single per-package lookup trie carries
+    both exported and non-exported decls; consumer-side merges use
+    :meth:`SymbolTrie.merge_exported` to filter to entries with this
+    bit set, while the package's own self-lookup uses :meth:`merge`
+    and sees everything.
     """
 
     NONE = 0
@@ -74,6 +83,7 @@ class NodeFlags(enum.IntFlag):
     TESTCASE = enum.auto()
     NOQA = enum.auto()
     NOTEBOOK = enum.auto()
+    EXPORTED = enum.auto()
 
 
 class EdgeFlags(enum.IntFlag):
@@ -270,10 +280,11 @@ class SymbolTrie:
         collision -- two exported roots both shipping a package with the
         same top-level name), the already-merged module wins and the
         incoming one is dropped with a warning. Callers control the
-        precedence order by the order of their ``merge()`` calls; today
-        :func:`build_symbol_graph` merges the consumer's own trie first
-        and each dep's exported trie afterwards, so own-module always
-        beats dep-module on legitimate conflict.
+        precedence order by the order of their ``merge()`` calls;
+        :meth:`Analysis._build_symbol_lookup` merges the consumer's own
+        trie first and each dep's trie via :meth:`merge_exported`
+        afterwards, so own-module always beats dep-module on
+        legitimate conflict.
         """
         for part, child in other.children.items():
             if part not in self.children:
@@ -291,6 +302,42 @@ class SymbolTrie:
             return self
         self.module = other.module
         self.declarations = {k: list(v) for k, v in other.declarations.items()}
+        return self
+
+    def merge_exported(self, other: SymbolTrie) -> SymbolTrie:
+        """Merge entries flagged :data:`NodeFlags.EXPORTED` from ``other``.
+
+        Used to fold a dep's per-package trie into a consumer's lookup:
+        the dep stores every decl in one trie, and consumers see only
+        the subset its source files marked exported (via the visitor's
+        ``default_flags`` for files under :attr:`Package.exported`).
+
+        Walks children recursively even when an intermediate module
+        isn't exported -- ``pkg/__init__.py`` may not be exported while
+        ``pkg/api/__init__.py`` is, and the consumer needs the path
+        ``pkg`` -> ``api`` to exist so the descendant resolves.
+        Non-exported decls and non-exported intermediate modules are
+        dropped; exported descendants still get through.
+        """
+        for part, child in other.children.items():
+            if part not in self.children:
+                self.children[part] = SymbolTrie()
+            self.children[part].merge_exported(child)
+        if other.module is None or not (other.module.flags & NodeFlags.EXPORTED):
+            return self
+        if self.module is not None:
+            logger.warning(
+                "SymbolTrie collision at %s: keeping %s, dropping %s",
+                self.module.fqname,
+                self.module.path,
+                other.module.path,
+            )
+            return self
+        self.module = other.module
+        for k, v in other.declarations.items():
+            exported = [d for d in v if d.flags & NodeFlags.EXPORTED]
+            if exported:
+                self.declarations[k] = exported
         return self
 
     def _touch(self, parts: list[str]) -> SymbolTrie:

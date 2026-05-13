@@ -37,14 +37,20 @@ class PackageContribution:
     which adds cross-package edges via :func:`resolve_edges` and runs
     plugin :meth:`EdgePlugin.finalize` against the composed graph.
 
+    ``trie`` is the single per-package lookup trie carrying every
+    visible decl (both exported and non-exported). The package's own
+    self-lookup uses :meth:`SymbolTrie.merge` (sees everything);
+    consumer-side merges call :meth:`SymbolTrie.merge_exported` to
+    filter to nodes flagged :data:`NodeFlags.EXPORTED` (set at visitor
+    time via the per-package fingerprint).
+
     ``package_graph.graph["dead_suites"]`` carries this package's
     per-file dead-suite positions; the compose step folds them into the
     target graph's matching key.
     """
 
     package: Package
-    current_trie: SymbolTrie
-    export_trie: SymbolTrie
+    trie: SymbolTrie
     package_graph: nx.MultiDiGraph
     import_edges: frozenset[tuple[SymbolNode, Import, EdgeFlags]]
     module_nodes: tuple[SymbolNode, ...]
@@ -71,9 +77,7 @@ def build_contribution(
     observe-time entrypoints (``__main__``, plugin synthetics) keep
     working, but cross-module imports route to the package winner.
     """
-    current_trie = SymbolTrie()
-    export_trie = SymbolTrie()
-    exported = package.exported
+    trie = SymbolTrie()
     import_edges: set[tuple[SymbolNode, Import, EdgeFlags]] = set()
     package_graph: nx.MultiDiGraph = nx.MultiDiGraph()
     package_graph.graph["dead_suites"] = {}
@@ -89,23 +93,19 @@ def build_contribution(
             payload = miss_payloads.get(file)
         if payload is None:
             continue
-        file_exported = not exported or _under_any(file, list(exported))
         module_nodes.append(
             _apply_payload(
                 payload,
-                current_trie=current_trie,
-                export_trie=export_trie,
-                file_exported=file_exported,
+                trie=trie,
                 eclipsed=file in eclipsed,
                 symbol_graph=package_graph,
                 import_edges=import_edges,
             )
         )
-    current_trie.add_module_hierarchy_edges(package_graph)
+    trie.add_module_hierarchy_edges(package_graph)
     return PackageContribution(
         package=package,
-        current_trie=current_trie,
-        export_trie=export_trie,
+        trie=trie,
         package_graph=package_graph,
         import_edges=frozenset(import_edges),
         module_nodes=tuple(module_nodes),
@@ -157,9 +157,7 @@ def eclipsed_paths(files: Sequence[Path]) -> frozenset[Path]:
 def _apply_payload(
     payload: VisitorPayload,
     *,
-    current_trie: SymbolTrie,
-    export_trie: SymbolTrie,
-    file_exported: bool,
+    trie: SymbolTrie,
     eclipsed: bool,
     symbol_graph: nx.MultiDiGraph,
     import_edges: set[tuple[SymbolNode, Import, EdgeFlags]],
@@ -236,12 +234,13 @@ def _apply_payload(
         # file-level equivalent for a ``.py`` whose sibling package
         # eclipses it. Either way the graph keeps the parent edge so
         # the decl is well-formed -- only consumer FQN lookups change.
+        # ``NodeFlags.EXPORTED`` is *not* a trie-entry filter -- the
+        # trie holds every visible decl, and consumer-side merges use
+        # ``SymbolTrie.merge_exported`` to read only the exported subset.
         if not eclipsed and not (
             n.flags & (NodeFlags.SHADOWED | NodeFlags.OVERLOAD | NodeFlags.NOTEBOOK)
         ):
-            current_trie.add_declaration(n)
-            if file_exported:
-                export_trie.add_declaration(n)
+            trie.add_declaration(n)
 
     for src, dst, pos in payload.edges:
         symbol_graph.add_edge(src, dst, flags=flag_for(pos))
@@ -268,12 +267,3 @@ def _contains(suite: CodeRange, access: CodeRange) -> bool:
     a_start = (access.start.line, access.start.column)
     a_end = (access.end.line, access.end.column)
     return s_start <= a_start and a_end <= s_end
-
-
-def _under_any(file: Path, roots: list[Path]) -> bool:
-    """True iff ``file`` is equal to or nested under any of ``roots``."""
-    f = file.resolve()
-    for r in roots:
-        if f == r or f.is_relative_to(r):
-            return True
-    return False

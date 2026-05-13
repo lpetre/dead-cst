@@ -57,6 +57,7 @@ from .branches import (
 )
 from .graph import VisitorPayload
 from .plugins._core import EdgePlugin
+from .resolvers._core import Package
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +69,7 @@ CACHE_DB_NAME = "cache.db"
 # mismatch on open drops ``file_cache`` so older databases from sibling
 # installs (or pre-per-base-fingerprint releases) are wiped on first
 # use even at the same package version.
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def default_cache_path(project_root: Path) -> Path:
@@ -80,16 +81,20 @@ def compute_fingerprint(
     *,
     plugins: Sequence[EdgePlugin] = (),
     unreachable_detector: UnreachableRegionDetector | None = None,
+    package: Package | None = None,
 ) -> str:
     """SHA-256 of every input that affects :class:`VisitorPayload` semantics.
 
-    Covers exactly the inputs the visitor + observe pass depend on:
-    the visitor / plugin / detector ``(name, version)`` chain, the
-    schema version, and the Python version. The package a file lives
-    under is *not* part of the key -- the visitor's output is purely
-    a function of the file's source plus the plugin/detector chain,
-    so a payload computed under one package can be reused if the
-    same file appears under a differently-named package later.
+    Covers the inputs the visitor + observe pass depend on: the visitor /
+    plugin / detector ``(name, version)`` chain, the schema version, the
+    Python version, and -- when ``package`` is given -- the package's
+    :attr:`Package.exported` setting. The package's exported subdirs
+    are part of the key because :data:`NodeFlags.EXPORTED` is stamped
+    onto every node from a file under those subdirs via the visitor's
+    ``default_flags`` mechanism, so changing ``exported`` changes the
+    cached payload. Exported paths are canonicalized relative to
+    ``package.path`` so the fingerprint is portable across machines
+    (CI vs dev with different absolute roots).
 
     ``search_paths`` and the resolver are *not* in the fingerprint:
     cross-file import resolution moved out of the visitor and into
@@ -133,6 +138,10 @@ def compute_fingerprint(
         else DefaultUnreachableRegionDetector()
     )
     h.update(f"unreachable_detector={detector.name}@{detector.version}\n".encode())
+
+    if package is not None:
+        rel_exports = sorted(str(e.relative_to(package.path)) for e in package.exported)
+        h.update(f"package.exported={rel_exports}\n".encode())
 
     return h.hexdigest()
 

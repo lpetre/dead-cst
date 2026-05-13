@@ -393,13 +393,20 @@ class Analysis:
             if unreachable_detector is not None
             else DefaultUnreachableRegionDetector()
         )
-        # One fingerprint per analysis -- the visitor's output is
-        # purely a function of the file's source plus the plugin /
-        # detector chain, so every package shares the same key.
-        self._fingerprint: str = compute_fingerprint(
-            plugins=self._plugins,
-            unreachable_detector=self._detector,
-        )
+        # One fingerprint per package -- the visitor's output is a
+        # function of the file's source plus the plugin / detector
+        # chain plus the package's ``exported`` setting (which feeds
+        # ``NodeFlags.EXPORTED`` into every node via ``default_flags``).
+        # Sibling packages with different export configurations get
+        # independent invalidation; the rest of the inputs are shared.
+        self._fingerprints: dict[Path, str] = {
+            p.path: compute_fingerprint(
+                plugins=self._plugins,
+                unreachable_detector=self._detector,
+                package=p,
+            )
+            for p in validated
+        }
         self._package_files: dict[Path, PackageFiles] = {}
         self._contributions: dict[Path, PackageContribution] = {}
         self._closure_graphs: dict[Path, nx.MultiDiGraph] = {}
@@ -498,17 +505,16 @@ class Analysis:
         for path in new_targets:
             if path not in self._package_files:
                 self._package_files[path] = enumerate_files(
-                    self._packages_by_path[path], self._cache, self._fingerprint
+                    self._packages_by_path[path], self._cache, self._fingerprints[path]
                 )
 
         pending = {p: self._package_files[p] for p in new_targets}
-        tasks = build_stale_tasks(pending, self._project_root)
+        tasks = build_stale_tasks(pending, self._project_root, self._fingerprints)
         miss_payloads = process_stale_files(
             tasks=tasks,
             detector=self._detector,
             plugins=self._plugins,
             cache=self._cache,
-            fingerprint=self._fingerprint,
             workers=self._workers,
         )
 
@@ -683,6 +689,11 @@ class Analysis:
     def _build_symbol_lookup(self, package: Path) -> SymbolTrie:
         """Per-package lookup trie: this package's full trie + each dep's exports.
 
+        ``merge`` pulls in every entry from this package's own trie
+        (the package sees itself fully). ``merge_exported`` filters
+        each dep's trie to entries flagged :data:`NodeFlags.EXPORTED`,
+        so dep-internal decls stay invisible to the consumer.
+
         Deps must already be refreshed; both
         :meth:`materialize_all` and :meth:`materialize_closure`
         guarantee this because :meth:`_interesting_set` is closed
@@ -690,9 +701,9 @@ class Analysis:
         """
         contrib = self._contributions[package]
         lookup = SymbolTrie()
-        lookup.merge(contrib.current_trie)
+        lookup.merge(contrib.trie)
         for dep in self._dep_paths(package):
-            lookup.merge(self._contributions[dep].export_trie)
+            lookup.merge_exported(self._contributions[dep].trie)
         return lookup
 
 

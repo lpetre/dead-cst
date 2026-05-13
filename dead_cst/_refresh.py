@@ -79,13 +79,18 @@ class StaleFile:
     package in :func:`build_stale_tasks`); the runner injects it into
     a :class:`MetadataWrapper` directly. ``package`` rides through to
     :class:`ObserveContext` so plugins see the full :class:`Package`
-    (path + exported + deps), not just the directory.
+    (path + exported + deps), not just the directory. ``fingerprint``
+    is the per-package cache key the worker writes alongside the
+    payload -- per-package because :attr:`Package.exported` enters the
+    fingerprint, so siblings with different export configurations get
+    independent invalidation.
     """
 
     file: Path
     package: Package
     fqn_entry: ModuleNameAndPackage
     project_root: Path
+    fingerprint: str
 
 
 def enumerate_files(
@@ -143,13 +148,16 @@ def enumerate_files(
 def build_stale_tasks(
     package_files: Mapping[Path, PackageFiles],
     project_root: Path,
+    fingerprints: Mapping[Path, str],
 ) -> list[StaleFile]:
     """Flatten every package's miss files into one global, deterministic task list.
 
     One ``gen_cache`` call per package (FQN resolution is package-keyed)
     populates each task's ``fqn_entry``. Sorting on ``(package_path, file)``
     keeps related tasks together for log readability and makes
-    parallel-pool output ordering reproducible.
+    parallel-pool output ordering reproducible. Each task carries its
+    package's fingerprint so the worker writes the correct cache key
+    even when packages are batched into one parallel pool.
     """
     tasks: list[StaleFile] = []
     for package_path in sorted(package_files):
@@ -165,6 +173,7 @@ def build_stale_tasks(
             if gen_cache_files
             else {}
         )
+        fingerprint = fingerprints[package_path]
         for file in pf.miss_files:
             fqn_entry = notebook_fqn_entry(file) if is_notebook(file) else fqn_cache[str(file)]
             tasks.append(
@@ -173,6 +182,7 @@ def build_stale_tasks(
                     package=pf.package,
                     fqn_entry=fqn_entry,
                     project_root=project_root,
+                    fingerprint=fingerprint,
                 )
             )
     return tasks
@@ -184,7 +194,6 @@ def process_stale_files(
     detector: UnreachableRegionDetector,
     plugins: Sequence[EdgePlugin],
     cache: GraphCache | None,
-    fingerprint: str,
     workers: int | None,
 ) -> dict[Path, VisitorPayload]:
     """Run visitor + observe across every task; return ``file -> payload``.
@@ -193,7 +202,9 @@ def process_stale_files(
     ``_process_one_file`` absorbs in-band are collected and re-raised
     as a single :class:`ExceptionGroup` after the run drains, so one
     bad file does not waste the rest of the work. Successful payloads
-    are cache-warmed before the group is raised.
+    are cache-warmed before the group is raised; each task carries its
+    package's fingerprint so cache writes use the correct key even
+    when tasks from multiple packages share one pool.
     """
     if not tasks:
         return {}
@@ -202,12 +213,12 @@ def process_stale_files(
     failures: list[tuple[Path, Exception]] = []
     total = len(tasks)
 
-    def _record(file: Path, payload: VisitorPayload | None) -> None:
+    def _record(task: StaleFile, payload: VisitorPayload | None) -> None:
         if payload is None:
             return
-        out[file] = payload
+        out[task.file] = payload
         if cache is not None:
-            cache.put(file, payload, fingerprint)
+            cache.put(task.file, payload, task.fingerprint)
 
     use_pool = workers is not None and workers >= 2 and total >= 2
 
@@ -227,13 +238,13 @@ def process_stale_files(
             progress(tasks, total=total, desc="Parsing files", unit="file"), 1
         ):
             try:
-                file, payload = _process_task(detector, plugins_t, task)
+                _, payload = _process_task(detector, plugins_t, task)
             except Exception as exc:
                 failures.append((task.file, exc))
                 logger.debug("[%d/%d] FAILED %s", idx, total, task.file)
                 continue
-            _record(file, payload)
-            logger.debug("[%d/%d] ok %s", idx, total, file)
+            _record(task, payload)
+            logger.debug("[%d/%d] ok %s", idx, total, task.file)
 
     if failures:
         raise ExceptionGroup(
@@ -249,7 +260,7 @@ def _run_pool(
     workers: int,
     detector: UnreachableRegionDetector,
     plugins: Sequence[EdgePlugin],
-    record: Callable[[Path, VisitorPayload | None], None],
+    record: Callable[[StaleFile, VisitorPayload | None], None],
     failures: list[tuple[Path, Exception]],
 ) -> None:
     """Run ``tasks`` through a :class:`ProcessPoolExecutor`.
@@ -293,13 +304,13 @@ def _run_pool(
                     break
                 task = futures[future]
                 try:
-                    file, payload = future.result()
+                    _, payload = future.result()
                 except Exception as exc:
                     failures.append((task.file, exc))
                     logger.debug("[%d/%d] FAILED %s", idx, total, task.file)
                     continue
-                record(file, payload)
-                logger.debug("[%d/%d] ok %s", idx, total, file)
+                record(task, payload)
+                logger.debug("[%d/%d] ok %s", idx, total, task.file)
             if cancelled.is_set():
                 for f in futures:
                     f.cancel()
@@ -354,6 +365,8 @@ def _process_one_file(
     """
     notebook = is_notebook(file)
     default_flags = NodeFlags.NOTEBOOK | NodeFlags.ENTRYPOINT if notebook else NodeFlags.NONE
+    if not package.exported or _under_any(file, package.exported):
+        default_flags |= NodeFlags.EXPORTED
     if notebook:
         nb_source = notebook_to_module(file)
         if nb_source is None:
@@ -512,3 +525,12 @@ def _merge_payloads(*payloads: VisitorPayload) -> VisitorPayload:
         imports=tuple(imports),
         dead_suites=tuple(dead_suites),
     )
+
+
+def _under_any(file: Path, roots: tuple[Path, ...]) -> bool:
+    """True iff ``file`` is equal to or nested under any of ``roots``."""
+    f = file.resolve()
+    for r in roots:
+        if f == r or f.is_relative_to(r):
+            return True
+    return False

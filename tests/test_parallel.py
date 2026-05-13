@@ -22,10 +22,18 @@ from dead_cst.cache import (
 )
 from dead_cst.graph import VisitorPayload
 from dead_cst.plugins import ObserveContext, PluginContext
+from dead_cst.resolvers._core import Package
 
 
-def _fp() -> str:
-    return compute_fingerprint()
+def _fp(tmp_path: Path, **kwargs) -> str:
+    """Per-package fingerprint matching what ``ManualResolver(["."])`` builds.
+
+    ``ManualResolver`` constructs a ``Package`` at ``project_root`` with
+    ``exported`` populated from ``exported_roots`` (empty for fixture
+    layouts without a ``pyproject.toml``), so we mirror that here.
+    """
+    package = Package(path=tmp_path, name=tmp_path.name, exported=(), deps=())
+    return compute_fingerprint(package=package, **kwargs)
 
 
 class _RaiseOnFilePlugin:
@@ -111,7 +119,7 @@ def test_parallel_warms_cache(tmp_path, make_analysis):
     """Parallel runs write payloads to the cache so a follow-up run skips workers."""
     _write(tmp_path, _multi_file_layout())
     db = tmp_path / CACHE_DIR_NAME / "cache.db"
-    fp = _fp()
+    fp = _fp(tmp_path)
 
     with GraphCache(db) as cache:
         cold = make_analysis(cache=cache, workers=2).materialize_all()
@@ -329,7 +337,7 @@ def test_failures_aggregate_at_end(tmp_path, make_analysis, workers):
     messages = [str(e) for e in group.exceptions]
     assert any("boom: bad.py" in m for m in messages), messages
 
-    fp = compute_fingerprint(plugins=[_RaiseOnFilePlugin(target_name="bad.py")])
+    fp = _fp(tmp_path, plugins=[_RaiseOnFilePlugin(target_name="bad.py")])
     with GraphCache(db) as cache:
         assert cache.get(tmp_path / "pkg" / "good.py", fp) is not None, (
             "good.py payload should be cache-warmed despite bad.py failing"

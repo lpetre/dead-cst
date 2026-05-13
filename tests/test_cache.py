@@ -62,17 +62,40 @@ def test_fingerprint_stable_for_equal_inputs():
     assert a == b
 
 
-def test_fingerprint_independent_of_packages(tmp_path):
-    """The package layout no longer enters the fingerprint.
+def test_fingerprint_independent_of_package_path_and_name(tmp_path):
+    """``Package.path``, ``name``, ``deps`` do not enter the fingerprint.
 
-    The visitor's output is purely a function of the file's source
-    plus the plugin / detector chain, so files under any base share
-    one cache key. Dropping the per-base portion lets a single
-    payload survive resolver / search-path / sibling-base churn.
+    The cache key is portable across machines (different absolute
+    roots) and across packages with the same export configuration.
+    Only :attr:`Package.exported` participates -- canonicalized
+    relative to ``package.path`` -- because :data:`NodeFlags.EXPORTED`
+    is stamped onto every node from a file under those subdirs.
     """
-    a = _fp()
-    b = _fp()
+    from dead_cst.resolvers._core import Package
+
+    a = _fp(package=Package(path=tmp_path / "a", name="a", exported=(), deps=()))
+    b = _fp(package=Package(path=tmp_path / "b", name="b", exported=(), deps=("x",)))
     assert a == b
+
+
+def test_fingerprint_changes_when_exported_changes(tmp_path):
+    """``Package.exported`` enters the fingerprint, so changes invalidate it.
+
+    The visitor stamps :data:`NodeFlags.EXPORTED` onto every node
+    from a file under :attr:`Package.exported` via the visitor's
+    ``default_flags`` mechanism. Editing exported subdirs (e.g. via
+    ``[tool.uv]`` workspace config) changes the cached payload, so
+    the fingerprint must reflect the new configuration.
+    """
+    from dead_cst.resolvers._core import Package
+
+    pkg_path = tmp_path / "pkg"
+    pkg_path.mkdir()
+    (pkg_path / "api").mkdir()
+
+    a = _fp(package=Package(path=pkg_path, name="pkg", exported=(), deps=()))
+    b = _fp(package=Package(path=pkg_path, name="pkg", exported=(pkg_path / "api",), deps=()))
+    assert a != b
 
 
 def test_fingerprint_independent_of_resolvers():
