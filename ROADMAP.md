@@ -343,18 +343,10 @@ Folded down from earlier tiers as they landed:
   any flag combination — pass ``NodeFlags.TESTCASE`` for the old
   test-blast-radius behavior, ``NodeFlags.NOQA`` for the F401 pin
   blast radius, or both ORed together.
-- **v0.8.0**: What-if graph surgery via
-  ``Analysis.preview(files, *, detector=None)`` — regenerates per-file
-  payloads for a hand-picked file set (bypassing the on-disk cache,
-  no read or write), splices them into a fresh overlay graph leaving
-  the baseline untouched, and returns a ``GraphView`` exposing the
-  same ``reachable`` / ``dead`` / ``kept_alive_by_dead_branches`` /
-  ``kept_alive_by_flags_only`` / ``count_nodes`` surface as
-  ``Analysis``. Pairs with the new
-  ``TruthinessResolver.resolve_constant(expr) -> Const | None`` (the
-  literal-value sibling of ``evaluate``, wrapped in ``Const`` so a
+- **v0.8.0**: ``TruthinessResolver.resolve_constant(expr) -> Const | None``
+  — the literal-value sibling of ``evaluate``, wrapped in ``Const`` so a
   proved-``None`` literal stays distinct from a bare ``None`` "unknown"
-  return) so a custom detector can fold a flag-name ``Name``
+  return. Lets a custom detector fold a flag-name ``Name``
   (``check_flag(FEATURE_A)`` where ``FEATURE_A = "feature_a"``) before
   pattern-matching. ``DefaultUnreachableRegionDetector.resolve(expr)``
   is now ``resolve(expr, resolver)`` (breaking — subclasses with a
