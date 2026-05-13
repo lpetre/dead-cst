@@ -24,14 +24,17 @@ two versions.
   manually has to swap `nx.MultiDiGraph()` for `SymbolGraph()`. The
   per-file `VisitorPayload` cache shape is unchanged, so no
   invalidation is required. `networkx` is dropped entirely.
-- Edges are now deduplicated by `(src, dst, flags)` at apply / stitch
-  time. Repeated same-suite references (`f(); f(); f()`) used to land
-  as parallel edges with identical attrs; they collapse to a single
-  edge now. Metadata-distinct edges between the same pair (e.g. one
-  `DEAD_BRANCH` + one `NONE`) are still kept separate so strict-mode
-  reachability filters correctly. Reachability behavior is unchanged
-  (BFS already used a `visited` set); the win is memory + iteration
-  cost on hot files.
+- `SymbolGraph` now enforces an edge-uniqueness invariant: no two
+  edges share the same `(src, dst, attrs)`. Duplicate inserts are
+  silently dropped. This consolidates dedup logic that previously
+  lived in three different call sites (the visitor's repeated
+  same-suite refs in `_apply_payload`, plugin fan-outs in
+  `apply_ops`, the cross-file fan-out in `resolve_edges._emit`); all
+  three now rely on the wrapper. Metadata-distinct edges between the
+  same pair (one `DEAD_BRANCH` + one `NONE`) are still preserved so
+  strict-mode reachability filters correctly. Reachability behavior
+  is unchanged (BFS uses a `visited` set); the win is fewer parallel
+  edges on hot files plus one source of truth for the invariant.
 - `DispatchAppPlugin` (in `dead_cst.plugins.decl_shapes`) is now the
   shared base for `FlaskPlugin`, `FastAPIPlugin`, and `CeleryPlugin` in
   addition to `TyperPlugin` / `CycloptsPlugin`. The base learned an

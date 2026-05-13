@@ -451,14 +451,30 @@ class SymbolGraph:
     table rather than on the rustworkx payload, so the payload stays
     a bare :class:`SymbolNode` (which keeps ``successors`` /
     ``predecessors`` returning the domain object directly).
+
+    **Edge uniqueness invariant.** The graph never carries two edges
+    that share the same ``(src, dst, attrs)`` -- duplicate inserts are
+    silently dropped. Multiple callers used to deduplicate before
+    insertion (the visitor's repeated same-suite refs, plugin
+    fan-outs that rediscover the same target, the cross-file
+    :func:`resolve_edges` algorithm's natural fan-out); the wrapper now
+    owns that invariant so call sites don't carry parallel ``seen``
+    sets. The multigraph base is retained so metadata-distinct edges
+    (one ``DEAD_BRANCH``, one ``NONE``) between the same pair stay
+    separate -- strict-mode reachability filters on attrs, so
+    collapsing those would lose fidelity.
     """
 
-    __slots__ = ("_g", "_idx", "_node_attrs", "graph")
+    __slots__ = ("_g", "_idx", "_node_attrs", "_edge_keys", "graph")
 
     def __init__(self) -> None:
         self._g: rx.PyDiGraph = rx.PyDiGraph(multigraph=True)
         self._idx: dict[SymbolNode, int] = {}
         self._node_attrs: dict[int, dict[str, Any]] = {}
+        # ``(src_idx, dst_idx, frozen_attrs)`` triples already in the
+        # graph. Consulted on every edge insertion to enforce the
+        # uniqueness invariant; see the class docstring.
+        self._edge_keys: set[tuple[int, int, tuple]] = set()
         # ``graph`` is the networkx convention for graph-level
         # attributes (``g.graph["dead_suites"]`` etc.). We mirror it.
         self.graph: dict[str, Any] = {}
@@ -479,10 +495,32 @@ class SymbolGraph:
             self._idx[node] = idx
         return idx
 
+    @staticmethod
+    def _freeze_attrs(attrs: dict[str, Any]) -> tuple:
+        """Hashable key for an edge's attrs dict (order-independent).
+
+        Empty / single-entry attrs are the common case -- our edges
+        carry at most ``{"flags": EdgeFlags.X}``. Sorting on the empty
+        / 1-element path costs nothing and keeps the rule generic.
+        """
+        if not attrs:
+            return ()
+        return tuple(sorted(attrs.items()))
+
+    def _insert_edge(self, src_idx: int, dst_idx: int, payload: dict[str, Any]) -> bool:
+        """Insert one edge under the uniqueness invariant. Returns True
+        if a new edge was added, False if it was a duplicate."""
+        key = (src_idx, dst_idx, self._freeze_attrs(payload))
+        if key in self._edge_keys:
+            return False
+        self._edge_keys.add(key)
+        self._g.add_edge(src_idx, dst_idx, payload)
+        return True
+
     def add_edge(self, src: SymbolNode, dst: SymbolNode, **attrs: Any) -> None:
         s = self.add_node(src)
         d = self.add_node(dst)
-        self._g.add_edge(s, d, dict(attrs))
+        self._insert_edge(s, d, dict(attrs))
 
     def add_edges_from(
         self, edges: Iterable[tuple[SymbolNode, SymbolNode, dict[str, Any]]]
@@ -491,7 +529,7 @@ class SymbolGraph:
         for src, dst, payload in edges:
             s = self.add_node(src)
             d = self.add_node(dst)
-            self._g.add_edge(s, d, payload)
+            self._insert_edge(s, d, payload)
 
     def has_edge(self, src: SymbolNode, dst: SymbolNode) -> bool:
         s = self._idx.get(src)
@@ -501,8 +539,23 @@ class SymbolGraph:
         return self._g.has_edge(s, d)
 
     def remove_edge(self, src: SymbolNode, dst: SymbolNode) -> None:
-        """Remove a single edge ``src -> dst``. Matches ``MultiDiGraph.remove_edge``."""
-        self._g.remove_edge(self._idx[src], self._idx[dst])
+        """Remove a single edge ``src -> dst``. Matches ``MultiDiGraph.remove_edge``.
+
+        rustworkx's ``remove_edge(s, d)`` drops one of the parallel
+        edges (impl-defined choice when several share the endpoints).
+        We mirror that choice into ``_edge_keys`` by diffing the
+        ``(s, d)`` payload set across the removal -- the missing entry
+        is the one rustworkx just removed. Edge removal is a cold path
+        (no in-tree plugin emits ``RemoveEdge`` today), so the small
+        scan over parallel edges at the pair is fine.
+        """
+        s = self._idx[src]
+        d = self._idx[dst]
+        pre = {self._freeze_attrs(p) for _u, v_idx, p in self._g.out_edges(s) if v_idx == d}
+        self._g.remove_edge(s, d)
+        post = {self._freeze_attrs(p) for _u, v_idx, p in self._g.out_edges(s) if v_idx == d}
+        for removed in pre - post:
+            self._edge_keys.discard((s, d, removed))
 
     def successors(self, node: SymbolNode) -> Iterator[SymbolNode]:
         idx = self._idx.get(node)
@@ -559,7 +612,7 @@ class SymbolGraph:
                 dst = self._g[v_idx]
                 new_dst = sub._idx.get(dst)
                 if new_dst is not None:
-                    sub._g.add_edge(new_src, new_dst, payload)
+                    sub._insert_edge(new_src, new_dst, payload)
         return sub
 
     def update(
@@ -590,7 +643,7 @@ class SymbolGraph:
                     u, v, payload = entry
                 s = self.add_node(u)
                 d = self.add_node(v)
-                self._g.add_edge(s, d, payload if isinstance(payload, dict) else {})
+                self._insert_edge(s, d, payload if isinstance(payload, dict) else {})
 
 
 # ``SymbolTrie`` is intentionally absent from ``__all__`` -- it's an

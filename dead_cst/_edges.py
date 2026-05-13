@@ -150,7 +150,6 @@ def resolve_edges(
     if search_paths is None:
         search_paths = []
 
-    emitted: set[tuple[SymbolNode, SymbolNode, EdgeFlags]] = set()
     synthetic_memo: dict[str, SymbolNode] = {}
     external_memo: dict[tuple[str, bool], SymbolNode | None] = {}
     # ``id(SymbolTrie)`` is safe as a key here: each trie node is held
@@ -175,14 +174,11 @@ def resolve_edges(
         external_memo[key] = node
         return node
 
-    def _emit(
-        src: SymbolNode, dst: SymbolNode, flags: EdgeFlags
-    ) -> Generator[tuple[SymbolNode, SymbolNode, EdgeFlags], None, None]:
-        key = (src, dst, flags)
-        if key in emitted:
-            return
-        emitted.add(key)
-        yield key
+    # No explicit dedup: ``SymbolGraph.add_edges_from`` (the only
+    # consumer of this generator) enforces the edge-uniqueness invariant
+    # on insertion. The walk algorithm can re-discover the same target
+    # via several ``Import`` shapes that canonicalize to the same trie
+    # state; those duplicates flow into the graph and collapse there.
 
     def _walk(start_node: SymbolTrie, parts: tuple[str, ...]) -> tuple[SymbolNode, ...]:
         cache_key = (id(start_node), parts)
@@ -258,7 +254,7 @@ def resolve_edges(
         ``Import`` is frozen with an eager ``__hash__``, so equal
         spellings across files (the visitor builds fresh objects per
         file) collapse to one cache entry. The result is pre-deduped
-        so the per-src ``_emit`` loop stays short.
+        so the per-src yield loop stays short.
         """
         cached = target_memo.get(raw)
         if cached is not None:
@@ -284,7 +280,7 @@ def resolve_edges(
 
     for src, raw, flags in import_edges:
         for dst_node in _resolve_targets(raw):
-            yield from _emit(src, dst_node, flags)
+            yield (src, dst_node, flags)
 
 
 # Keep these re-exports stable for callers that historically reached
