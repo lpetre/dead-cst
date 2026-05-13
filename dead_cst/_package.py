@@ -21,6 +21,7 @@ from libcst.metadata import CodeRange
 from ._notebooks import is_notebook
 from ._refresh import PackageFiles
 from .graph import EdgeFlags, Import, NodeFlags, SymbolNode, SymbolTrie, VisitorPayload
+from .plugins._core import module_node
 from .resolvers import Package
 
 logger = logging.getLogger(__name__)
@@ -166,7 +167,8 @@ def _apply_payload(
     cross-file imports accumulate into ``import_edges`` for
     :func:`resolve_edges` to stitch later.
     """
-    module = next(n for n in payload.nodes if n.type == "module")
+    module = module_node(payload)
+    assert module is not None, "payload must include a module node"
 
     payload_dead_suites = payload.dead_suites
     if payload_dead_suites:

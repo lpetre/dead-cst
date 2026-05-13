@@ -15,25 +15,15 @@ from dead_cst.resolvers import ManualResolver
 def mark_entrypoint():
     """Replace ``node`` in ``graph`` with a copy carrying ``NodeFlags.ENTRYPOINT``.
 
-    ``_find_reachable`` reads the flag straight off :class:`SymbolNode`,
-    so tests that want to seed reachability without going through a
-    plugin's observe/finalize pass swap in a flag-tagged copy via this
-    fixture. The returned callable yields the new node so callers can
-    re-bind their local reference.
+    Returns a callable ``(graph, node) -> SymbolNode`` so tests can
+    re-bind their local reference to the new node.
     """
 
     def _mark(graph: nx.MultiDiGraph, node: SymbolNode) -> SymbolNode:
         new = dataclasses.replace(node, flags=node.flags | NodeFlags.ENTRYPOINT)
         if new == node:
             return node
-        in_edges = list(graph.in_edges(node, keys=True, data=True))
-        out_edges = list(graph.out_edges(node, keys=True, data=True))
-        graph.remove_node(node)
-        graph.add_node(new)
-        for src, _, key, data in in_edges:
-            graph.add_edge(src, new, key=key, **data)
-        for _, dst, key, data in out_edges:
-            graph.add_edge(new, dst, key=key, **data)
+        nx.relabel_nodes(graph, {node: new}, copy=False)
         return new
 
     return _mark
@@ -184,13 +174,7 @@ def assert_positional_edges():
 
 @pytest.fixture
 def assert_dead_branch_edges():
-    """Assert on edges flagged ``EdgeFlags.DEAD_BRANCH``.
-
-    Format: ``"src.fqname -> dst.fqname"``. The previous synthetic-node
-    model carried per-suite line/column on the edge source; that
-    fidelity is intentionally dropped (see plan -- per-suite
-    attribution is a payload-level concern, not a per-edge one).
-    """
+    """Assert on edges flagged ``EdgeFlags.DEAD_BRANCH`` as ``"src.fqname -> dst.fqname"``."""
 
     def _check(graph: nx.MultiDiGraph, expected_edges: set[str]):
         actual = {

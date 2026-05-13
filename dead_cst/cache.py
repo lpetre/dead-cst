@@ -65,10 +65,8 @@ CACHE_DIR_NAME = ".dead-cst-cache"
 CACHE_DB_NAME = "cache.db"
 
 # Bump when the per-row shape of ``file_cache`` or the ``meta`` schema
-# changes in a way the unpickler / reader can't handle. Schema-version
-# mismatch on open drops ``file_cache`` so older databases from sibling
-# installs (or pre-per-base-fingerprint releases) are wiped on first
-# use even at the same package version.
+# changes in a way the unpickler can't handle. Mismatch on open drops
+# ``file_cache`` so older databases are wiped on first use.
 SCHEMA_VERSION = 4
 
 

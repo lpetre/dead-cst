@@ -143,21 +143,20 @@ def _find_reachable(
     exclude_flags: NodeFlags = NodeFlags.NONE,
     *,
     prefix: Path | None = None,
+    skip_dead_branches: bool = False,
 ) -> set[SymbolNode]:
     """BFS forward from every node carrying :data:`NodeFlags.ENTRYPOINT`.
 
     ``exclude_flags`` may carry one or more :class:`NodeFlags` bits to
     drop entrypoints whose flags intersect; the default
-    :data:`NodeFlags.NONE` keeps every seed and reproduces today's
-    "all entrypoints" reachability. The diff
+    :data:`NodeFlags.NONE` keeps every seed. The diff
     ``_find_reachable(g) - _find_reachable(g, flags)`` is the blast
     radius of dropping every entrypoint with any of those bits, surfaced
     as :func:`_find_kept_alive_by_flags_only`.
 
-    Edges flagged with :data:`EdgeFlags.DEAD_BRANCH` are NOT filtered
-    here -- today's behavior, where dead-code references propagate
-    liveness through the enclosing decl, is preserved. See
-    :func:`_find_reachable_strict` for the variant that skips them.
+    ``skip_dead_branches=True`` filters :data:`EdgeFlags.DEAD_BRANCH`
+    edges from traversal -- the diff against the default traversal is
+    the "blast radius" of removing every statically-dead suite.
 
     ``prefix`` filters the returned set to nodes whose ``path`` lies
     under it; the BFS still traverses the full graph, so transitive
@@ -172,27 +171,12 @@ def _find_reachable(
         if node in visited:
             continue
         visited.add(node)
-        stack.extend(graph.successors(node))
-    if prefix is None:
-        return visited
-    return {n for n in visited if n.path.is_relative_to(prefix)}
-
-
-def _find_reachable_strict(
-    graph: nx.MultiDiGraph, *, prefix: Path | None = None
-) -> set[SymbolNode]:
-    """Like :func:`_find_reachable` but skips ``DEAD_BRANCH``-flagged edges."""
-    visited: set[SymbolNode] = set()
-    stack = [n for n in graph.nodes if n.flags & NodeFlags.ENTRYPOINT]
-    while stack:
-        node = stack.pop()
-        if node in visited:
-            continue
-        visited.add(node)
-        for _, succ, attrs in graph.out_edges(node, data=True):
-            if attrs.get("flags", EdgeFlags.NONE) & EdgeFlags.DEAD_BRANCH:
-                continue
-            stack.append(succ)
+        if skip_dead_branches:
+            for _, succ, attrs in graph.out_edges(node, data=True):
+                if not (attrs.get("flags", EdgeFlags.NONE) & EdgeFlags.DEAD_BRANCH):
+                    stack.append(succ)
+        else:
+            stack.extend(graph.successors(node))
     if prefix is None:
         return visited
     return {n for n in visited if n.path.is_relative_to(prefix)}
@@ -210,7 +194,9 @@ def _find_kept_alive_by_dead_branches(
     and on :class:`PackageView` as
     :meth:`PackageView.kept_alive_by_dead_branches`.
     """
-    return _find_reachable(graph, prefix=prefix) - _find_reachable_strict(graph, prefix=prefix)
+    return _find_reachable(graph, prefix=prefix) - _find_reachable(
+        graph, prefix=prefix, skip_dead_branches=True
+    )
 
 
 def _find_kept_alive_by_flags_only(
