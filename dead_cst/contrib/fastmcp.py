@@ -54,10 +54,8 @@ _REGISTRATION_DECORATORS: frozenset[str] = frozenset(
     }
 )
 
-# Classes whose instances we treat as auto-entrypoints. FastMCP has a
-# single server class today; we keep the mapping for parity with the
-# FastAPI / Flask shape so adding a future "Router"-style peer is just
-# a dict entry.
+# Classes whose instances we treat specially. Value records whether the
+# instance should be seeded as an entrypoint.
 _INSTANCE_KINDS: Mapping[str, bool] = {
     "FastMCP": True,  # ``fastmcp run module:mcp`` -- always an entrypoint
 }
