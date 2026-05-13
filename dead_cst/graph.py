@@ -430,39 +430,15 @@ class SymbolGraph:
     Backed by :class:`rustworkx.PyDiGraph` with ``multigraph=True``;
     nodes are :class:`SymbolNode` instances, edges carry an attribute
     dict (typically ``{"flags": EdgeFlags}``). The wrapper owns the
-    ``SymbolNode -> int`` index map so callers continue to address
-    nodes by their domain identity while rustworkx operates on
-    integer indices internally.
+    ``SymbolNode -> int`` index map so callers address nodes by their
+    domain identity while rustworkx operates on integer indices
+    internally. Per-node attributes (``entrypoint``, ``testcase``)
+    live in a side table rather than on the rustworkx payload.
 
-    Exposes the ``networkx``-style surface the analyzer relies on
-    (``successors``, ``predecessors``, ``subgraph``, ``out_edges``,
-    ``nodes(data=True)``, ``edges(data=True, keys=True)``, the
-    ``graph`` attribute for graph-level metadata, etc.) so call sites
-    read naturally. Two methods deserve note:
-
-    * :meth:`subgraph` returns a fresh :class:`SymbolGraph` (rather
-      than a view) containing the induced subgraph; cheap to build
-      because the wrapper is thin.
-    * :meth:`update` merges nodes + edges from another graph -- the
-      composition primitive used to fold per-package graphs into the
-      full / closure graph.
-
-    Node attributes (``entrypoint``, ``testcase``) live in a side
-    table rather than on the rustworkx payload, so the payload stays
-    a bare :class:`SymbolNode` (which keeps ``successors`` /
-    ``predecessors`` returning the domain object directly).
-
-    **Edge uniqueness invariant.** The graph never carries two edges
-    that share the same ``(src, dst, attrs)`` -- duplicate inserts are
-    silently dropped. Multiple callers used to deduplicate before
-    insertion (the visitor's repeated same-suite refs, plugin
-    fan-outs that rediscover the same target, the cross-file
-    :func:`resolve_edges` algorithm's natural fan-out); the wrapper now
-    owns that invariant so call sites don't carry parallel ``seen``
-    sets. The multigraph base is retained so metadata-distinct edges
-    (one ``DEAD_BRANCH``, one ``NONE``) between the same pair stay
-    separate -- strict-mode reachability filters on attrs, so
-    collapsing those would lose fidelity.
+    Duplicate ``(src, dst, attrs)`` inserts are silently dropped.
+    Metadata-distinct parallel edges (e.g. one ``DEAD_BRANCH`` plus
+    one ``NONE``) are preserved -- strict-mode reachability filters
+    on attrs, so collapsing those would lose fidelity.
     """
 
     __slots__ = ("_g", "_idx", "_node_attrs", "_edge_keys", "graph")
@@ -471,12 +447,9 @@ class SymbolGraph:
         self._g: rx.PyDiGraph = rx.PyDiGraph(multigraph=True)
         self._idx: dict[SymbolNode, int] = {}
         self._node_attrs: dict[int, dict[str, Any]] = {}
-        # ``(src_idx, dst_idx, frozen_attrs)`` triples already in the
-        # graph. Consulted on every edge insertion to enforce the
-        # uniqueness invariant; see the class docstring.
         self._edge_keys: set[tuple[int, int, tuple]] = set()
-        # ``graph`` is the networkx convention for graph-level
-        # attributes (``g.graph["dead_suites"]`` etc.). We mirror it.
+        # ``graph`` mirrors networkx's graph-level attribute dict
+        # (``g.graph["dead_suites"]``).
         self.graph: dict[str, Any] = {}
 
     @property
@@ -499,12 +472,15 @@ class SymbolGraph:
     def _freeze_attrs(attrs: dict[str, Any]) -> tuple:
         """Hashable key for an edge's attrs dict (order-independent).
 
-        Empty / single-entry attrs are the common case -- our edges
-        carry at most ``{"flags": EdgeFlags.X}``. Sorting on the empty
-        / 1-element path costs nothing and keeps the rule generic.
+        Fast-paths the empty and single-key cases -- our edges carry
+        at most ``{"flags": EdgeFlags.X}``, so ``sorted`` is wasted
+        work in the dominant path.
         """
-        if not attrs:
+        size = len(attrs)
+        if size == 0:
             return ()
+        if size == 1:
+            return next(iter(attrs.items()))
         return tuple(sorted(attrs.items()))
 
     def _insert_edge(self, src_idx: int, dst_idx: int, payload: dict[str, Any]) -> bool:
@@ -520,7 +496,9 @@ class SymbolGraph:
     def add_edge(self, src: SymbolNode, dst: SymbolNode, **attrs: Any) -> None:
         s = self.add_node(src)
         d = self.add_node(dst)
-        self._insert_edge(s, d, dict(attrs))
+        # ``attrs`` is a fresh dict produced by Python's kwarg
+        # collection; pass it through as the rustworkx edge payload.
+        self._insert_edge(s, d, attrs)
 
     def add_edges_from(
         self, edges: Iterable[tuple[SymbolNode, SymbolNode, dict[str, Any]]]
@@ -593,42 +571,46 @@ class SymbolGraph:
     def subgraph(self, nodes: Iterable[SymbolNode]) -> SymbolGraph:
         """Induced subgraph over ``nodes``: includes every edge whose
         endpoints both survive the filter. Returns a fresh
-        :class:`SymbolGraph`; not a view."""
+        :class:`SymbolGraph`; not a view.
+
+        Source-graph edges are already deduped under the uniqueness
+        invariant, so the rebuild populates ``_edge_keys`` directly
+        without re-probing it on every edge.
+        """
+        old_indices: list[int] = []
+        for n in nodes:
+            idx = self._idx.get(n)
+            if idx is not None:
+                old_indices.append(idx)
         sub = SymbolGraph()
         sub.graph = dict(self.graph)
-        selected: list[tuple[SymbolNode, int]] = []
-        for n in nodes:
-            old_idx = self._idx.get(n)
-            if old_idx is None:
-                continue
-            new_idx = sub.add_node(n)
+        sub._g = self._g.subgraph(old_indices)
+        # rustworkx's ``subgraph`` renumbers; rebuild the side tables
+        # by walking the new graph.
+        for new_idx in sub._g.node_indices():
+            node = sub._g[new_idx]
+            sub._idx[node] = new_idx
+            old_idx = self._idx[node]
             attrs = self._node_attrs.get(old_idx)
             if attrs:
                 sub._node_attrs[new_idx] = dict(attrs)
-            selected.append((n, old_idx))
-        for n, old_idx in selected:
-            new_src = sub._idx[n]
-            for _u_idx, v_idx, payload in self._g.out_edges(old_idx):
-                dst = self._g[v_idx]
-                new_dst = sub._idx.get(dst)
-                if new_dst is not None:
-                    sub._insert_edge(new_src, new_dst, payload)
+        for u, v, payload in sub._g.weighted_edge_list():
+            sub._edge_keys.add((u, v, SymbolGraph._freeze_attrs(payload)))
         return sub
 
     def update(
         self,
         *,
-        edges: Iterable[tuple] | None = None,
+        edges: Iterable[tuple[SymbolNode, SymbolNode, dict[str, Any]]] | None = None,
         nodes: Iterable[tuple[SymbolNode, dict[str, Any]]] | None = None,
     ) -> None:
         """Merge ``nodes`` and ``edges`` from another graph into this one.
 
-        ``nodes`` is an iterable of ``(node, attrs_dict)`` (the shape
-        :meth:`nodes` returns under ``data=True``). ``edges`` may be
-        ``(u, v, attrs)`` triples or ``(u, v, key, attrs)`` 4-tuples
-        (the shape :meth:`edges` returns under ``keys=True, data=True``;
-        the key is discarded because it has no meaning in the target
-        graph)."""
+        ``nodes`` yields ``(node, attrs_dict)`` (the shape returned by
+        :meth:`nodes` under ``data=True``); ``edges`` yields
+        ``(u, v, attrs)`` (the shape returned by :meth:`edges` under
+        ``data=True``).
+        """
         if nodes is not None:
             for n, attrs in nodes:
                 idx = self.add_node(n)
@@ -636,14 +618,10 @@ class SymbolGraph:
                     bucket = self._node_attrs.setdefault(idx, {})
                     bucket.update(attrs)
         if edges is not None:
-            for entry in edges:
-                if len(entry) == 4:
-                    u, v, _key, payload = entry
-                else:
-                    u, v, payload = entry
+            for u, v, payload in edges:
                 s = self.add_node(u)
                 d = self.add_node(v)
-                self._insert_edge(s, d, payload if isinstance(payload, dict) else {})
+                self._insert_edge(s, d, payload)
 
 
 # ``SymbolTrie`` is intentionally absent from ``__all__`` -- it's an

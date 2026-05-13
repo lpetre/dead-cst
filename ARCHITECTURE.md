@@ -49,7 +49,7 @@ or before touching the visitor.
 │                                                              │
 │   each EdgePlugin.finalize(ctx) -> Iterable[GraphOp]         │
 └────────────────────────────┬─────────────────────────────────┘
-                             │ MultiDiGraph
+                             │ SymbolGraph (rustworkx-backed)
                              ▼
                 ┌────────────┴────────────┐
                 ▼                         ▼
@@ -378,6 +378,22 @@ entirely.
 
 ## Graph model invariants
 
+* The graph is `dead_cst.graph.SymbolGraph`, a thin wrapper around
+  `rustworkx.PyDiGraph(multigraph=True)` that owns the
+  `SymbolNode -> int` index map and exposes a `networkx`-shaped surface
+  (`successors`, `predecessors`, `subgraph`, `out_edges`,
+  `nodes(data=True)`, `edges(data=True)`, the `graph` attribute, etc.)
+  so call sites read naturally. Per-node attributes (`entrypoint`,
+  `testcase`) live in a side table on the wrapper rather than on the
+  rustworkx payload, so `successors` / `predecessors` return the bare
+  `SymbolNode` directly.
+* `SymbolGraph` enforces an edge-uniqueness invariant: no two edges
+  share the same `(src, dst, attrs)`. Duplicate inserts are silently
+  dropped. Metadata-distinct parallel edges (one `DEAD_BRANCH` + one
+  `NONE`) are preserved so strict-mode reachability filters on attrs
+  correctly. Callers (visitor apply, plugin op application, cross-file
+  edge stitching) all rely on this and carry no shadow dedup state of
+  their own.
 * One node per top-level declaration plus one synthetic module node per
   file. Nested defs (inner functions, methods, nested classes) are
   deliberately not given their own nodes — refs from inside them

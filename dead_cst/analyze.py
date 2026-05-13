@@ -104,7 +104,7 @@ def _compose_contribution(
     first-party in the trie.
     """
     target_graph.update(
-        edges=contrib.package_graph.edges(data=True, keys=True),
+        edges=contrib.package_graph.edges(data=True),
         nodes=contrib.package_graph.nodes(data=True),
     )
     target_graph.graph.setdefault("dead_suites", {}).update(

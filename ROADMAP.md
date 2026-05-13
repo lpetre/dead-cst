@@ -303,11 +303,12 @@ Folded down from earlier tiers as they landed:
 - **v0.9.0**: ``SymbolNode`` and ``Import`` pre-compute their hash in
   ``__post_init__`` and store it in a private ``_hash`` slot, so
   ``__hash__`` is a single attribute read. Cuts edge-stitching time on
-  large multi-package workspaces where ``resolve_edges._emit`` re-hashes
-  the same ``(src, dst, flags)`` tuples into its dedup set, and pays off
-  again every time a ``SymbolNode`` is hashed by networkx (graph
-  insertion, BFS traversal). ``SCHEMA_VERSION`` bumped to 3 so cache
-  rows pickled before the slot existed are invalidated on first use.
+  large multi-package workspaces where ``resolve_edges`` re-hashes the
+  same ``(src, dst, flags)`` tuples through ``SymbolGraph``'s
+  edge-uniqueness set (since v0.10 the dedup invariant lives on the
+  graph wrapper itself; previously the resolver carried its own
+  ``_emit`` dedup set). ``SCHEMA_VERSION`` bumped to 3 so cache rows
+  pickled before the slot existed are invalidated on first use.
 - **v0.9.0**: Edge stitching no longer emits a spurious "Failed to
   resolve import module: <name>" warning for stdlib imports
   (``import datetime``, ``from pathlib import Path``); the orphaned
