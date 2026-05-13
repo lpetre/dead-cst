@@ -121,10 +121,9 @@ def enumerate_files(
     same FQN, and dead-cst has no peer-stub linker. Orphan ``.pyi``
     (compiled-extension shape) flows through under its natural FQN.
 
-    ``.ipynb`` files are always picked up; notebooks aren't importable
-    modules so they sidestep the trie entirely (every node is flagged
-    ``NOTEBOOK | ENTRYPOINT`` and the apply pass keeps them out of the
-    cross-module lookup trie).
+    ``.ipynb`` files flow through too. They aren't importable, so the
+    apply pass keeps them out of the cross-module lookup trie via
+    ``NodeFlags.NOTEBOOK`` (stamped in :func:`_stamp_notebook_flags`).
 
     ``rglob`` matches by name, so a *directory* literally named
     ``something.py`` would otherwise sneak in and crash the visitor on
@@ -169,9 +168,7 @@ def build_stale_tasks(
         pf = package_files[package_path]
         if not pf.miss_files:
             continue
-        # ``gen_cache`` walks the filesystem to derive a dotted module name
-        # from each path; it has no notion of notebooks. Feed it the .py /
-        # .pyi subset only and synthesize FQN entries for notebooks.
+        # ``gen_cache`` has no notion of notebooks; synthesize FQNs for them.
         gen_cache_files = [str(f) for f in pf.miss_files if not is_notebook(f)]
         fqn_cache: dict[str, ModuleNameAndPackage] = (
             dict(
@@ -181,10 +178,7 @@ def build_stale_tasks(
             else {}
         )
         for file in pf.miss_files:
-            if is_notebook(file):
-                fqn_entry = notebook_fqn_entry(file)
-            else:
-                fqn_entry = fqn_cache[str(file)]
+            fqn_entry = notebook_fqn_entry(file) if is_notebook(file) else fqn_cache[str(file)]
             tasks.append(
                 StaleFile(
                     file=file,
@@ -471,10 +465,10 @@ def _process_one_file(
     re-runs the parse, so fixing the syntax invalidates the entry.
     """
     if is_notebook(file):
-        nb = notebook_to_module(file)
-        if nb is None:
+        nb_source = notebook_to_module(file)
+        if nb_source is None:
             return _unparseable_payload(file, fqn_entry)
-        source = nb.text
+        source = nb_source
     else:
         try:
             source = file.read_text()
@@ -714,10 +708,8 @@ def _apply_payload(
 def _stamp_notebook_flags(payload: VisitorPayload) -> VisitorPayload:
     """Tag every ``SymbolNode`` in ``payload`` with ``NOTEBOOK | ENTRYPOINT``.
 
-    ``SymbolNode`` is frozen, so the rewrite goes through
-    :func:`dataclasses.replace`. Edges and imports reference nodes by
-    value -- we remap each tuple through a fresh ``id(old) -> new`` table
-    so the new nodes stay consistent across the payload.
+    ``SymbolNode`` is frozen, so edges and imports must be rebuilt in
+    lockstep with the node rewrite.
     """
     extra = NodeFlags.NOTEBOOK | NodeFlags.ENTRYPOINT
     remap: dict[SymbolNode, SymbolNode] = {}

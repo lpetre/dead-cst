@@ -96,10 +96,8 @@ def _select_files(G: nx.Graph, base: Path) -> tuple[dict[Path, list[SymbolNode]]
     nodes whose source file no longer exists. Synthetic nodes are
     ignored implicitly -- they don't appear in the type ``match``.
 
-    Notebook (``.ipynb``) nodes are dropped: the codemod rewrites Python
-    source, and cell-aware writeback into the notebook JSON envelope is
-    not implemented. Every notebook node carries ``NodeFlags.NOTEBOOK``
-    anyway, but the suffix check is a cheap pre-filter.
+    ``NodeFlags.NOTEBOOK`` nodes are dropped: cell-aware writeback into
+    the notebook JSON envelope is not implemented today.
     """
     by_file: dict[Path, list[SymbolNode]] = {}
     deleted_modules: list[Path] = []
@@ -108,7 +106,7 @@ def _select_files(G: nx.Graph, base: Path) -> tuple[dict[Path, list[SymbolNode]]
             continue
         if not node.path.exists():
             continue
-        if node.path.suffix == ".ipynb" or node.flags & NodeFlags.NOTEBOOK:
+        if node.flags & NodeFlags.NOTEBOOK:
             continue
         match node.type:
             case "function" | "class" | "variable" | "type_alias" | "import":

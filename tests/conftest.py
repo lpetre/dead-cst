@@ -1,3 +1,4 @@
+import json
 import logging
 import textwrap
 
@@ -63,6 +64,43 @@ def build_decl_graph(tmp_path, make_analysis):
         return make_analysis().materialize_all()
 
     return _make_graph
+
+
+@pytest.fixture
+def write_notebook(tmp_path):
+    """Write an nbformat-4 notebook to ``tmp_path``.
+
+    Each entry in ``cells`` is either a ``str`` (becomes a code cell with
+    that source, dedented) or a ``dict`` (written through unmodified, for
+    testing markdown / raw / malformed shapes).
+    """
+
+    def _write(relpath: str, cells: list) -> None:
+        nb_cells = []
+        for cell in cells:
+            if isinstance(cell, str):
+                nb_cells.append(
+                    {
+                        "cell_type": "code",
+                        "execution_count": None,
+                        "metadata": {},
+                        "outputs": [],
+                        "source": textwrap.dedent(cell).strip() + "\n",
+                    }
+                )
+            else:
+                nb_cells.append(cell)
+        nb = {
+            "cells": nb_cells,
+            "metadata": {},
+            "nbformat": 4,
+            "nbformat_minor": 5,
+        }
+        p = tmp_path / relpath
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(nb))
+
+    return _write
 
 
 def _is_dead_branch(attrs) -> bool:

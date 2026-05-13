@@ -303,6 +303,8 @@ Pinned imports are tagged with `NodeFlags.NOQA` (in addition to `NodeFlags.ENTRY
 
 `.pyi` stub files are ingested for the **compiled-extension** layout: a binary like `mypkg/_native.so` shipping next to `mypkg/_native.pyi`. With no matching `.py`, the stub is the only Python-discoverable description of those names, so the analyzer parses it under its natural module FQN (`mypkg._native`) and `from mypkg._native import compute` resolves to the stub's declaration through the normal import path. A `.pyi` shipped alongside a real `.py` is dropped during file enumeration -- the runtime always wins, and the peer stub is invisible to dead-cst.
 
+Jupyter notebooks (`.ipynb`) are ingested too: code cells are concatenated in document order into a single libcst-parseable module, IPython line / cell magics, shell escapes (`!ls`), and trailing-help forms (`obj?`, `obj.attr??`) are neutralized line-for-line into `pass  # <line>` comments, and every emitted `SymbolNode` is flagged `NodeFlags.NOTEBOOK | NodeFlags.ENTRYPOINT`. Notebooks aren't importable, so their decls stay out of the cross-module lookup trie — but `.py` code a notebook imports stays alive, which makes notebooks effective reachability seeds. `dead-cst remove` skips `.ipynb` paths (cell-aware writeback into the notebook JSON envelope is out of scope today).
+
 `@typing.overload`-decorated functions in `.py` files are flagged so a dead implementation drags its overloads along during `dead-cst remove` instead of leaving them behind as orphans.
 
 ## Limitations

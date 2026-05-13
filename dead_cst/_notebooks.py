@@ -1,17 +1,15 @@
 """Jupyter ``.ipynb`` ingestion: turn a notebook into parseable Python source.
 
 A notebook is opened, its ``code`` cells concatenated in document order, and
-IPython magics / shell escapes are line-rewritten to a no-op statement so
-``libcst.parse_module`` accepts the result. Non-code cells (markdown, raw) and
-malformed inputs cause :func:`notebook_to_module` to return ``None``; the
-caller falls through to the same ``[unparseable]`` placeholder used for
-``.py`` files that fail to parse.
+IPython magics / shell escapes are line-rewritten to ``pass  # <orig>`` so
+``libcst.parse_module`` accepts the result. Malformed inputs cause
+:func:`notebook_to_module` to return ``None``; the caller falls through to
+the same ``[unparseable]`` placeholder used for ``.py`` files that fail to
+parse.
 
-Notebooks are not importable modules, so the synthetic FQN is derived from
-the path's stem (sanitized to a Python identifier); nothing imports a
-notebook -- every node from a notebook is flagged ``NOTEBOOK | ENTRYPOINT``
-so reachability seeds the whole file, and notebooks are deliberately kept
-out of the cross-module lookup trie via ``add_to_trie=False``.
+Notebooks are not importable modules, so every node from a notebook is
+flagged ``NOTEBOOK | ENTRYPOINT`` and kept out of the cross-module lookup
+trie via :func:`dead_cst._refresh._apply_payload`'s flag-aware skip.
 """
 
 from __future__ import annotations
@@ -19,73 +17,34 @@ from __future__ import annotations
 import json
 import logging
 import re
-from dataclasses import dataclass
 from pathlib import Path
 
 from libcst.helpers.module import ModuleNameAndPackage
 
 logger = logging.getLogger(__name__)
 
+NOTEBOOK_SUFFIX = ".ipynb"
 
-# Line-magic forms IPython recognizes; ``%%`` cell magics are matched
-# separately because they swallow the rest of the cell. ``!`` is only a
-# shell-escape when not followed by ``=`` (so ``!= 0`` stays Python).
-# ``?`` prefix is only help-syntax when followed by an identifier.
+# ``!`` is only a shell-escape when not followed by ``=`` (so ``!= 0`` stays
+# Python). ``?`` prefix is only help-syntax when followed by an identifier.
 _LINE_MAGIC_RE = re.compile(r"^\s*(%[%A-Za-z_]|!(?!=)|\?[A-Za-z_])")
 _CELL_MAGIC_RE = re.compile(r"^\s*%%[A-Za-z_]")
-# A line that is exactly ``obj?`` or ``obj??`` (possibly dotted) is IPython
-# trailing-help, not Python.
 _HELP_SUFFIX_RE = re.compile(r"^\s*[A-Za-z_]\w*(\.[A-Za-z_]\w*)*\?{1,2}\s*$")
-
-
-@dataclass(frozen=True, slots=True)
-class NotebookSource:
-    """Concatenated code-cell source plus enough metadata to map back.
-
-    ``text`` is the joined, magic-neutralized source ready for
-    ``libcst.parse_module``. ``cell_line_starts`` records the 1-indexed line
-    in ``text`` where each preserved code cell begins, in document order;
-    ``cell_indices`` is the parallel list of original cell indices from
-    ``nb["cells"]`` so callers can map a libcst position back to
-    ``(cell_index, line_in_cell)``.
-    """
-
-    text: str
-    cell_line_starts: tuple[int, ...]
-    cell_indices: tuple[int, ...]
-
-    def locate(self, line: int) -> tuple[int, int] | None:
-        """Return ``(cell_index, line_in_cell)`` for a 1-indexed ``line`` in ``text``.
-
-        ``line_in_cell`` is also 1-indexed. Returns ``None`` if ``line`` is out
-        of range or falls before the first cell.
-        """
-        if line < 1 or not self.cell_line_starts:
-            return None
-        # Find the last cell whose start is <= line.
-        idx = -1
-        for i, start in enumerate(self.cell_line_starts):
-            if start <= line:
-                idx = i
-            else:
-                break
-        if idx < 0:
-            return None
-        return self.cell_indices[idx], line - self.cell_line_starts[idx] + 1
+# Cheap pre-check: if a line's stripped form starts with none of these and
+# doesn't end in ``?``, the regex pass can't fire. Avoids three regex hits
+# per pure-Python line in a magics-free notebook.
+_MAGIC_TRIGGERS = ("%", "!", "?")
 
 
 def is_notebook(path: Path) -> bool:
-    """Cheap suffix check used by ingestion and codemod gates."""
-    return path.suffix == ".ipynb"
+    return path.suffix == NOTEBOOK_SUFFIX
 
 
-def notebook_to_module(path: Path) -> NotebookSource | None:
-    """Load ``path`` and return its code cells joined into parseable Python.
+def notebook_to_module(path: Path) -> str | None:
+    """Concatenate ``path``'s code cells into one parseable Python source string.
 
     Returns ``None`` if the file is not valid notebook JSON, has no
-    ``cells`` array, or contains no code cells. Magics and shell escapes
-    are replaced with a same-line ``pass`` so the line-to-cell map stays
-    byte-faithful.
+    ``cells`` array, or contains no usable code cells.
     """
     try:
         raw = path.read_text()
@@ -102,36 +61,22 @@ def notebook_to_module(path: Path) -> NotebookSource | None:
         return None
 
     parts: list[str] = []
-    cell_line_starts: list[int] = []
-    cell_indices: list[int] = []
-    current_line = 1
-    for idx, cell in enumerate(cells):
-        if not isinstance(cell, dict):
+    for cell in cells:
+        if not isinstance(cell, dict) or cell.get("cell_type") != "code":
             continue
-        if cell.get("cell_type") != "code":
-            continue
-        source = cell.get("source")
-        text = _cell_source_to_text(source)
+        text = _cell_source_to_text(cell.get("source"))
         if text is None:
             continue
         scrubbed = _strip_ipython_magics(text)
-        # Ensure each cell ends with a newline so the next cell's
-        # statements start fresh -- otherwise a trailing-expression cell
-        # would glue onto the next cell's first line.
+        # Without a trailing newline a cell's last expression glues onto the
+        # next cell's first line.
         if not scrubbed.endswith("\n"):
             scrubbed += "\n"
-        cell_indices.append(idx)
-        cell_line_starts.append(current_line)
         parts.append(scrubbed)
-        current_line += scrubbed.count("\n")
 
     if not parts:
         return None
-    return NotebookSource(
-        text="".join(parts),
-        cell_line_starts=tuple(cell_line_starts),
-        cell_indices=tuple(cell_indices),
-    )
+    return "".join(parts)
 
 
 def _cell_source_to_text(source: object) -> str | None:
@@ -149,42 +94,49 @@ def _cell_source_to_text(source: object) -> str | None:
 
 
 def _strip_ipython_magics(src: str) -> str:
-    """Replace lines starting with an IPython magic / shell escape with ``pass``.
+    """Replace IPython magic / shell-escape / help-syntax lines with ``pass``.
 
-    A ``%%cell`` magic swallows the remainder of the cell, so we replace
-    every subsequent line with ``pass`` too. The output preserves line
-    count so libcst positions still map back to the original notebook.
+    A ``%%cell`` magic swallows the remainder of the cell, so every
+    subsequent line is replaced too. Line count is preserved so libcst
+    positions still map back to the original cell.
     """
     out: list[str] = []
     in_cell_magic = False
     for line in src.splitlines(keepends=True):
-        stripped = line.rstrip("\r\n")
-        terminator = line[len(stripped) :]
         if in_cell_magic:
-            out.append(f"pass  # {stripped}" + (terminator or "\n"))
+            out.append(_neutralize(line))
             continue
-        if _CELL_MAGIC_RE.match(stripped):
+        stripped = line.lstrip()
+        if not stripped or not (
+            stripped.startswith(_MAGIC_TRIGGERS) or stripped.rstrip().endswith("?")
+        ):
+            out.append(line)
+            continue
+        if _CELL_MAGIC_RE.match(line):
             in_cell_magic = True
-            out.append(f"pass  # {stripped}" + (terminator or "\n"))
-            continue
-        if _LINE_MAGIC_RE.match(stripped) or _HELP_SUFFIX_RE.match(stripped):
-            out.append(f"pass  # {stripped}" + (terminator or "\n"))
-            continue
-        out.append(line)
+            out.append(_neutralize(line))
+        elif _LINE_MAGIC_RE.match(line) or _HELP_SUFFIX_RE.match(line):
+            out.append(_neutralize(line))
+        else:
+            out.append(line)
     return "".join(out)
+
+
+def _neutralize(line: str) -> str:
+    body = line.rstrip("\r\n")
+    return f"pass  # {body}\n"
 
 
 _FQN_SANITIZE = re.compile(r"[^0-9A-Za-z_]")
 
 
 def notebook_fqn_entry(path: Path) -> ModuleNameAndPackage:
-    """Build a synthetic FQN entry for a notebook path.
+    """Synthesize a per-notebook ``ModuleNameAndPackage`` from the path stem.
 
-    The notebook's stem is sanitized to a valid Python identifier; if the
-    stem starts with a digit it's prefixed with ``_``. ``package`` is the
-    empty string because notebooks aren't packaged. Notebooks never enter
-    the cross-module lookup trie, so collisions with a real module of the
-    same name are harmless -- the trie skip is enforced upstream.
+    libcst's ``gen_cache`` derives module names from filesystem layout and
+    has no concept of notebooks, so we bypass it. Notebooks never enter
+    the cross-module lookup trie, so name collisions with a real module
+    are harmless.
     """
     stem = path.stem or "notebook"
     sanitized = _FQN_SANITIZE.sub("_", stem)
