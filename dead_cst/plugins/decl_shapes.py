@@ -23,8 +23,8 @@ Both bases use only the public plugin-helpers re-exported from
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Iterable, cast
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Iterable, Mapping, cast
 
 import libcst as cst
 from libcst.metadata import CodeRange, PositionProvider
@@ -33,19 +33,23 @@ from ..graph import NodeFlags, SymbolNode
 from ._core import (
     SYNTHETIC_POSITION,
     AddEdge,
+    AddNode,
     GraphOp,
     ObserveContext,
     PluginContext,
     collect_module_imports,
     decls_by_simple_name,
     find_call_assignments,
+    find_factory_decls,
     find_handlers,
     make_payload,
     matched_attr_call,
     module_node,
+    require_resolved_dep,
     simple_name,
     single_target_assignment,
     synthetic_node,
+    walk_to_instance_kind,
 )
 
 if TYPE_CHECKING:
@@ -249,18 +253,62 @@ class LiteralListPlugin:
 class DispatchAppPlugin:
     """Wire ``@<instance>.<reg_decorator>(...)`` handlers to their app instance.
 
-    Generic shape behind :class:`~dead_cst.contrib.TyperPlugin` and
-    :class:`~dead_cst.contrib.CycloptsPlugin`: find top-level
-    ``X = <Ctor>(...)`` assignments where ``Ctor`` is one of
-    ``constructor_targets`` imported from ``app_module``, then for every
+    Generic shape behind :class:`~dead_cst.contrib.TyperPlugin`,
+    :class:`~dead_cst.contrib.CycloptsPlugin`,
+    :class:`~dead_cst.contrib.FlaskPlugin`,
+    :class:`~dead_cst.contrib.FastAPIPlugin`, and
+    :class:`~dead_cst.contrib.CeleryPlugin`: find top-level
+    ``X = <Ctor>(...)`` assignments where ``Ctor`` is recognized as an
+    app constructor imported from ``app_module``, then for every
     top-level function decorated ``@X.<name>(...)`` where ``name`` is in
     ``registration_decorators`` emit an edge ``X -> handler``.
 
-    Pure observe: instance detection and decorator scanning are
-    file-local CST passes; the corresponding ``SymbolNode`` decls are
-    looked up in this file's :class:`VisitorPayload`. App instances
-    are not auto-marked as entrypoints; reachability flows through
-    ``[project.scripts]`` or a ``__main__`` block.
+    The plugin has two modes:
+
+    * **Pure dispatch** (``instance_kinds`` empty -- Typer / Cyclopts):
+      only top-level ``X = Ctor(...)`` assignments are tracked, and
+      every ``X -> handler`` edge requires ``X`` to be one of those
+      direct constructions. App instances are *not* auto-marked as
+      entrypoints; reachability flows through ``[project.scripts]`` or
+      a ``__main__`` block. Pure observe-time; :meth:`finalize` is a
+      no-op.
+    * **Factory-aware** (``instance_kinds`` non-empty -- Flask /
+      FastAPI / Celery): each kind in the mapping is recognized as a
+      constructor, and the boolean value tells us whether direct
+      ``X = Kind(...)`` hits should be promoted to entrypoints (e.g.
+      ``Flask=True``, ``Blueprint=False``). Factory functions / classes
+      whose body constructs one of the kinds get a
+      ``<{name}-factory>:<kind>:<owner.fqname>`` marker. Variables
+      decorated by handler decorators but not directly classified get a
+      ``<{name}-pending>:<var.fqname>`` marker that :meth:`finalize`
+      resolves by walking forward through the graph until it hits a
+      classifying import node or factory marker.
+
+    Configuration:
+
+    * ``app_module`` -- dotted module name the constructors are
+      imported from (``"flask"``, ``"fastapi"``, ``"celery"``,
+      ``"typer"``, ...).
+    * ``constructor_targets`` -- legacy field used only when
+      ``instance_kinds`` is empty. Names of constructors to recognize.
+    * ``registration_decorators`` -- attribute names on the instance
+      that register a handler (``"route"`` / ``"get"`` / ``"task"`` /
+      ``"command"`` / ...).
+    * ``instance_kinds`` -- mapping ``{kind_name: auto_entrypoint}``.
+      Setting any entry opts the plugin into factory-aware mode. The
+      auto-entrypoint flag controls whether a direct hit on that kind
+      gets a ``<{name}-app>:`` entrypoint synthetic (the framework's
+      "this is always alive" classification, e.g. WSGI / ASGI / Celery
+      worker autoloads).
+
+    Aliased / module-prefixed forms (``import flask as f`` ->
+    ``f.Flask()``) flow through :func:`collect_module_imports` and
+    :func:`matched_attr_call`, so subclasses don't have to model them.
+
+    Subclasses inject framework-specific behaviour (e.g. Celery's
+    ``@shared_task``) by overriding :meth:`observe` to call
+    ``super().observe(ctx)`` and splice extra nodes / edges into the
+    returned payload.
 
     Abstract base: subclasses must set ``name`` and ``version``. The
     cache fingerprint is ``(name, version)``, so every concrete plugin
@@ -272,33 +320,130 @@ class DispatchAppPlugin:
     app_module: str = ""
     constructor_targets: frozenset[str] = frozenset()
     registration_decorators: frozenset[str] = frozenset()
+    instance_kinds: Mapping[str, bool] = field(default_factory=dict)
+
+    @property
+    def _factory_aware(self) -> bool:
+        return bool(self.instance_kinds)
+
+    @property
+    def _targets(self) -> Mapping[str, bool] | frozenset[str]:
+        # Factory-aware plugins drive recognition off the kinds map;
+        # pure-dispatch plugins keep the legacy flat-set config.
+        return self.instance_kinds if self._factory_aware else self.constructor_targets
+
+    @property
+    def _app_prefix(self) -> str:
+        return f"<{self.name}-app>:"
+
+    @property
+    def _pending_prefix(self) -> str:
+        return f"<{self.name}-pending>:"
+
+    @property
+    def _factory_prefix(self) -> str:
+        return f"<{self.name}-factory>:"
 
     def observe(self, ctx: ObserveContext) -> "VisitorPayload | None":
-        if not (self.app_module and self.constructor_targets and self.registration_decorators):
+        if not (self.app_module and self.registration_decorators):
             return None
-        imports = collect_module_imports(ctx.module, self.app_module, self.constructor_targets)
-        if not imports:
+        targets = self._targets
+        if not targets:
             return None
-        instances = set(find_call_assignments(ctx.module, imports, self.constructor_targets))
-        if not instances:
-            return None
-        handlers = find_handlers(ctx.module, instances, self.registration_decorators)
-        if not handlers:
-            return None
+        imports = collect_module_imports(ctx.module, self.app_module, targets)
+
+        # ``find_call_assignments`` / ``find_factory_decls`` need imports to
+        # recognize the constructors; ``find_handlers`` does not (it scans
+        # ``@<owner>.<attr>`` decorator shapes directly). Factory-aware mode
+        # depends on that: ``app = create_app()`` in a file that imports the
+        # factory (not Flask itself) still needs a pending marker emitted
+        # from the decorator scan alone.
+        direct = find_call_assignments(ctx.module, imports, targets) if imports else {}
+        if self._factory_aware:
+            decorated = find_handlers(ctx.module, None, self.registration_decorators)
+            factory_kinds = find_factory_decls(ctx.module, imports, targets) if imports else {}
+            if not direct and not decorated and not factory_kinds:
+                return None
+        else:
+            # Pure-dispatch: only emit edges for handlers owned by a
+            # direct construction, so the imports gate is meaningful.
+            if not direct:
+                return None
+            decorated = find_handlers(ctx.module, set(direct), self.registration_decorators)
+            factory_kinds = {}
+            if not decorated:
+                return None
 
         decls_by_name = decls_by_simple_name(ctx.payload.nodes)
+        nodes: list[SymbolNode] = []
         edges: list[tuple[SymbolNode, SymbolNode, CodeRange]] = []
-        for var_name, handler_names in handlers.items():
-            for instance_decl in decls_by_name.get(var_name, []):
-                for handler_name in handler_names:
+
+        for var_name in direct.keys() | decorated.keys():
+            var_decls = decls_by_name.get(var_name, [])
+            kind = direct.get(var_name)
+            for var_decl in var_decls:
+                if self._factory_aware:
+                    if kind is None:
+                        pending = synthetic_node(
+                            f"{self._pending_prefix}{var_decl.fqname}", ctx.path
+                        )
+                        nodes.append(pending)
+                        edges.append((pending, var_decl, SYNTHETIC_POSITION))
+                    elif self.instance_kinds[kind]:
+                        seed = synthetic_node(
+                            f"{self._app_prefix}{var_decl.fqname}",
+                            ctx.path,
+                            flags=NodeFlags.ENTRYPOINT,
+                        )
+                        nodes.append(seed)
+                        edges.append((seed, var_decl, SYNTHETIC_POSITION))
+                    # Non-entrypoint direct kinds (e.g. Blueprint / APIRouter)
+                    # get only handler edges below.
+                for handler_name in decorated.get(var_name, ()):
                     for handler_decl in decls_by_name.get(handler_name, []):
-                        edges.append((instance_decl, handler_decl, SYNTHETIC_POSITION))
-        if not edges:
+                        edges.append((var_decl, handler_decl, SYNTHETIC_POSITION))
+
+        # Factory markers: anchored on the constructing decl so finalize's
+        # forward walk hits them regardless of which file the consumer lives
+        # in. Required because ``import <mod>; <mod>.<Cls>()`` flows through
+        # an external-edge that loses ``decl='<Cls>'`` after
+        # :func:`resolve_edges`, so the import-node check alone can't tell
+        # the kinds apart on the downstream walk.
+        for decl_name, kinds in factory_kinds.items():
+            for decl in decls_by_name.get(decl_name, []):
+                for kind in kinds:
+                    marker = synthetic_node(f"{self._factory_prefix}{kind}:{decl.fqname}", ctx.path)
+                    nodes.append(marker)
+                    edges.append((decl, marker, SYNTHETIC_POSITION))
+
+        if not nodes and not edges:
             return None
-        return make_payload(edges=edges)
+        return make_payload(nodes=nodes, edges=edges)
 
     def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]:
-        return ()
+        if not self._factory_aware:
+            return
+        app_node = require_resolved_dep(ctx, self.app_module)
+        if app_node is None:
+            return
+        pending_prefix = self._pending_prefix
+        for synth in list(ctx.package_nodes()):
+            if synth.type != "synthetic" or not synth.fqname.startswith(pending_prefix):
+                continue
+            for var in list(ctx.graph.successors(synth)):
+                kind = walk_to_instance_kind(
+                    ctx.graph,
+                    var,
+                    app_node,
+                    self.app_module,
+                    self.instance_kinds,
+                    factory_marker_prefix=self._factory_prefix,
+                )
+                if kind is None or not self.instance_kinds[kind]:
+                    continue
+                seed = synthetic_node(f"{self._app_prefix}{var.fqname}", var.path)
+                yield AddNode(seed, entrypoint=True)
+                yield AddEdge(seed, var)
 
 
 def _read_string_list_with_positions(
