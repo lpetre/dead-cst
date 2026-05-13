@@ -10,10 +10,9 @@ from typing import Iterable, Iterator, Mapping, Sequence
 import networkx as nx
 
 from ._edges import resolve_edges
+from ._package import PackageContribution, build_contribution
 from ._refresh import (
-    PackageContribution,
     PackageFiles,
-    build_contribution,
     build_stale_tasks,
     enumerate_files,
     process_stale_files,
@@ -92,9 +91,9 @@ def _compose_contribution(
     import_resolver: ImportResolver,
     search_paths: list[Path],
 ) -> None:
-    """Merge ``contrib.package_graph`` into ``target_graph``, stitch
-    cross-package imports against ``symbol_lookup``, and run plugin
-    :meth:`EdgePlugin.finalize` against the composed graph.
+    """Merge ``contrib``'s raw nodes / edges into ``target_graph``,
+    stitch cross-package imports against ``symbol_lookup``, and run
+    plugin :meth:`EdgePlugin.finalize` against the composed graph.
 
     The caller owns ``symbol_lookup`` because its construction depends
     on which dep export tries are in scope -- the full-graph path
@@ -105,13 +104,9 @@ def _compose_contribution(
     unresolved); they are unused when every import resolves
     first-party in the trie.
     """
-    target_graph.update(
-        edges=contrib.package_graph.edges(data=True, keys=True),
-        nodes=contrib.package_graph.nodes(data=True),
-    )
-    target_graph.graph.setdefault("dead_suites", {}).update(
-        contrib.package_graph.graph["dead_suites"]
-    )
+    target_graph.add_nodes_from(contrib.nodes)
+    target_graph.add_edges_from((src, dst, {"flags": flags}) for src, dst, flags in contrib.edges)
+    target_graph.graph.setdefault("dead_suites", {}).update(contrib.dead_suites)
     target_graph.add_edges_from(
         (src, dst, {"flags": flags})
         for src, dst, flags in resolve_edges(
@@ -128,8 +123,7 @@ def _compose_contribution(
             symbol_lookup=symbol_lookup,
             package=contrib.package,
             project_root=project_root,
-            package_graph=contrib.package_graph,
-            module_nodes=contrib.module_nodes,
+            package_nodes=contrib.nodes,
         )
         for plugin in plugins:
             if not isinstance(plugin, EdgePlugin):
@@ -149,24 +143,20 @@ def _find_reachable(
     exclude_flags: NodeFlags = NodeFlags.NONE,
     *,
     prefix: Path | None = None,
+    skip_dead_branches: bool = False,
 ) -> set[SymbolNode]:
-    """BFS forward from every node tagged as an entrypoint by a plugin.
-
-    Plugins mark seeds by setting ``graph.nodes[node]["entrypoint"] = True``
-    (see :func:`dead_cst.plugins.apply_ops`).
+    """BFS forward from every node carrying :data:`NodeFlags.ENTRYPOINT`.
 
     ``exclude_flags`` may carry one or more :class:`NodeFlags` bits to
     drop entrypoints whose flags intersect; the default
-    :data:`NodeFlags.NONE` keeps every seed and reproduces today's
-    "all entrypoints" reachability. The diff
+    :data:`NodeFlags.NONE` keeps every seed. The diff
     ``_find_reachable(g) - _find_reachable(g, flags)`` is the blast
     radius of dropping every entrypoint with any of those bits, surfaced
     as :func:`_find_kept_alive_by_flags_only`.
 
-    Edges flagged with :data:`EdgeFlags.DEAD_BRANCH` are NOT filtered
-    here -- today's behavior, where dead-code references propagate
-    liveness through the enclosing decl, is preserved. See
-    :func:`_find_reachable_strict` for the variant that skips them.
+    ``skip_dead_branches=True`` filters :data:`EdgeFlags.DEAD_BRANCH`
+    edges from traversal -- the diff against the default traversal is
+    the "blast radius" of removing every statically-dead suite.
 
     ``prefix`` filters the returned set to nodes whose ``path`` lies
     under it; the BFS still traverses the full graph, so transitive
@@ -174,36 +164,19 @@ def _find_reachable(
     """
     visited: set[SymbolNode] = set()
     stack = [
-        n
-        for n, attrs in graph.nodes(data=True)
-        if attrs.get("entrypoint") and not (n.flags & exclude_flags)
+        n for n in graph.nodes if n.flags & NodeFlags.ENTRYPOINT and not (n.flags & exclude_flags)
     ]
     while stack:
         node = stack.pop()
         if node in visited:
             continue
         visited.add(node)
-        stack.extend(graph.successors(node))
-    if prefix is None:
-        return visited
-    return {n for n in visited if n.path.is_relative_to(prefix)}
-
-
-def _find_reachable_strict(
-    graph: nx.MultiDiGraph, *, prefix: Path | None = None
-) -> set[SymbolNode]:
-    """Like :func:`_find_reachable` but skips ``DEAD_BRANCH``-flagged edges."""
-    visited: set[SymbolNode] = set()
-    stack = [n for n, attrs in graph.nodes(data=True) if attrs.get("entrypoint")]
-    while stack:
-        node = stack.pop()
-        if node in visited:
-            continue
-        visited.add(node)
-        for _, succ, attrs in graph.out_edges(node, data=True):
-            if attrs.get("flags", EdgeFlags.NONE) & EdgeFlags.DEAD_BRANCH:
-                continue
-            stack.append(succ)
+        if skip_dead_branches:
+            for _, succ, attrs in graph.out_edges(node, data=True):
+                if not (attrs.get("flags", EdgeFlags.NONE) & EdgeFlags.DEAD_BRANCH):
+                    stack.append(succ)
+        else:
+            stack.extend(graph.successors(node))
     if prefix is None:
         return visited
     return {n for n in visited if n.path.is_relative_to(prefix)}
@@ -221,7 +194,9 @@ def _find_kept_alive_by_dead_branches(
     and on :class:`PackageView` as
     :meth:`PackageView.kept_alive_by_dead_branches`.
     """
-    return _find_reachable(graph, prefix=prefix) - _find_reachable_strict(graph, prefix=prefix)
+    return _find_reachable(graph, prefix=prefix) - _find_reachable(
+        graph, prefix=prefix, skip_dead_branches=True
+    )
 
 
 def _find_kept_alive_by_flags_only(
@@ -254,15 +229,15 @@ def _iter_dead(graph: nx.MultiDiGraph, *, prefix: Path | None = None) -> Iterato
             yield n
 
 
-def _count_nodes(graph: nx.MultiDiGraph, prefix: Path | None) -> dict[str, int]:
-    """Count nodes in ``graph`` by ``SymbolNode.type``, optionally restricted by path.
+def _count_nodes(nodes: Iterable[SymbolNode], prefix: Path | None) -> dict[str, int]:
+    """Count ``nodes`` by ``SymbolNode.type``, optionally restricted by path.
 
     If ``prefix`` is given, only nodes whose ``path`` is under ``prefix``
     are counted. Includes the synthetic ``"synthetic"`` type contributed
     by plugins and third-party-dep markers.
     """
     counts: dict[str, int] = {}
-    for node in graph.nodes:
+    for node in nodes:
         if prefix and not node.path.is_relative_to(prefix):
             continue
         counts[node.type] = counts.get(node.type, 0) + 1
@@ -270,13 +245,13 @@ def _count_nodes(graph: nx.MultiDiGraph, prefix: Path | None) -> dict[str, int]:
 
 
 def _count_nodes_by_prefix(
-    graph: nx.MultiDiGraph, prefixes: Sequence[Path]
+    nodes: Iterable[SymbolNode], prefixes: Sequence[Path]
 ) -> dict[Path, dict[str, int]]:
     """One-pass equivalent of :func:`_count_nodes` for many prefixes.
 
-    A naive ``[_count_nodes(graph, p) for p in prefixes]`` re-walks every
-    node of the full graph for every prefix; the CLI's text/JSON output
-    paths do this twice (once for the full graph, once for the
+    A naive ``[_count_nodes(nodes, p) for p in prefixes]`` re-walks
+    every node of the full graph for every prefix; the CLI's text/JSON
+    output paths do this twice (once for the full graph, once for the
     unreachable subgraph) and it dominates report-formatting time on
     large workspaces. We bucket nodes by ``node.path`` first so each
     unique file pays the prefix-matching cost once regardless of how
@@ -286,7 +261,7 @@ def _count_nodes_by_prefix(
     prefix it ``is_relative_to`` -- nested prefixes both pick it up.
     """
     by_path: dict[Path, dict[str, int]] = {}
-    for node in graph.nodes:
+    for node in nodes:
         bucket = by_path.get(node.path)
         if bucket is None:
             bucket = {}
@@ -340,7 +315,7 @@ class Analysis:
        a decl in the target package alive.
 
     The lazy split lets cheap per-package queries skip stage 3 entirely:
-    :meth:`PackageView.modules` and :meth:`PackageView.declarations`
+    :meth:`PackageView.declarations` and :meth:`PackageView.count_nodes`
     only need stage 2 for their own package. Reachability queries
     (:meth:`PackageView.dead`, :meth:`Analysis.dead`) trigger stage 3
     over the appropriate scope -- the "interesting set" for a single
@@ -394,13 +369,15 @@ class Analysis:
             if unreachable_detector is not None
             else DefaultUnreachableRegionDetector()
         )
-        # One fingerprint per analysis -- the visitor's output is
-        # purely a function of the file's source plus the plugin /
-        # detector chain, so every package shares the same key.
-        self._fingerprint: str = compute_fingerprint(
-            plugins=self._plugins,
-            unreachable_detector=self._detector,
-        )
+        # Per-package because ``Package.exported`` enters the fingerprint.
+        self._fingerprints: dict[Path, str] = {
+            p.path: compute_fingerprint(
+                plugins=self._plugins,
+                unreachable_detector=self._detector,
+                package=p,
+            )
+            for p in validated
+        }
         self._package_files: dict[Path, PackageFiles] = {}
         self._contributions: dict[Path, PackageContribution] = {}
         self._closure_graphs: dict[Path, nx.MultiDiGraph] = {}
@@ -499,17 +476,16 @@ class Analysis:
         for path in new_targets:
             if path not in self._package_files:
                 self._package_files[path] = enumerate_files(
-                    self._packages_by_path[path], self._cache, self._fingerprint
+                    self._packages_by_path[path], self._cache, self._fingerprints[path]
                 )
 
         pending = {p: self._package_files[p] for p in new_targets}
-        tasks = build_stale_tasks(pending, self._project_root)
+        tasks = build_stale_tasks(pending, self._project_root, self._fingerprints)
         miss_payloads = process_stale_files(
             tasks=tasks,
             detector=self._detector,
             plugins=self._plugins,
             cache=self._cache,
-            fingerprint=self._fingerprint,
             workers=self._workers,
         )
 
@@ -547,7 +523,7 @@ class Analysis:
         """
         if self._full_graph is None:
             self.refresh()
-            self._full_graph = self._materialize(scope=None)
+            self._full_graph = self._materialize(included=frozenset(p.path for p in self.packages))
         return self._full_graph
 
     def materialize_closure(self, package: Path) -> nx.MultiDiGraph:
@@ -566,20 +542,22 @@ class Analysis:
         if self._full_graph is not None:
             return self._full_graph
         if package not in self._closure_graphs:
-            scope = self._interesting_set(package)
-            self.refresh(packages=scope)
-            self._closure_graphs[package] = self._materialize(scope=scope)
+            included = self._interesting_set(package)
+            self.refresh(packages=included)
+            self._closure_graphs[package] = self._materialize(included=included)
         return self._closure_graphs[package]
 
     def _materialize(
         self,
         *,
-        scope: frozenset[Path] | None,
+        included: frozenset[Path],
     ) -> nx.MultiDiGraph:
-        """Compose every refreshed package in ``scope`` into a fresh graph.
+        """Compose every package in ``included`` into a fresh graph.
 
-        ``scope=None`` composes every package. Caller is responsible
-        for having :meth:`refresh`'d every package in ``scope`` first.
+        Caller is responsible for having :meth:`refresh`'d every
+        package in ``included`` first; ``_interesting_set`` is closed
+        under transitive deps, so passing one of those (or the full
+        package set for ``materialize_all``) is enough.
 
         Cross-file import resolution runs here (in
         :func:`_compose_contribution` -> :func:`resolve_edges`), which
@@ -596,7 +574,7 @@ class Analysis:
         g.graph["dead_suites"] = {}
         baseline = list(sys.path)
         last_search_paths: tuple[Path, ...] | None = None
-        target_paths = [p.path for p in self.packages if scope is None or p.path in scope]
+        target_paths = [p.path for p in self.packages if p.path in included]
         try:
             for path in progress(
                 target_paths,
@@ -616,7 +594,7 @@ class Analysis:
                 _compose_contribution(
                     self._contributions[path],
                     target_graph=g,
-                    symbol_lookup=self._build_symbol_lookup(path, scope=scope),
+                    symbol_lookup=self._build_symbol_lookup(path),
                     plugins=self._plugins,
                     project_root=self._project_root,
                     import_resolver=self._import_resolver,
@@ -677,33 +655,26 @@ class Analysis:
         under that prefix -- useful for per-package summaries when
         several packages are analysed together.
         """
-        return _count_nodes(self.materialize_all(), prefix)
+        return _count_nodes(self.materialize_all().nodes, prefix)
 
-    def _build_symbol_lookup(
-        self,
-        package: Path,
-        *,
-        scope: frozenset[Path] | None,
-    ) -> SymbolTrie:
-        """Per-package lookup trie: this package's full trie + each in-scope dep's exports.
+    def _build_symbol_lookup(self, package: Path) -> SymbolTrie:
+        """Per-package lookup trie: this package's full trie + each dep's exports.
 
-        ``scope`` bounds which deps' export tries are merged in:
-        ``None`` for the full-graph path (every dep), or a
-        :meth:`_interesting_set` for closure-scoped materialization.
-        Deps must already be refreshed (the caller is responsible for
-        calling :meth:`refresh` on the right set first).
+        ``merge`` pulls in every entry from this package's own trie
+        (the package sees itself fully). ``merge_exported`` filters
+        each dep's trie to entries flagged :data:`NodeFlags.EXPORTED`,
+        so dep-internal decls stay invisible to the consumer.
+
+        Deps must already be refreshed; both
+        :meth:`materialize_all` and :meth:`materialize_closure`
+        guarantee this because :meth:`_interesting_set` is closed
+        under transitive deps.
         """
-        contrib = self._contributions.get(package)
+        contrib = self._contributions[package]
         lookup = SymbolTrie()
-        if contrib is not None:
-            lookup.merge(contrib.current_trie)
+        lookup.merge(contrib.trie)
         for dep in self._dep_paths(package):
-            if scope is not None and dep not in scope:
-                continue
-            dep_contrib = self._contributions.get(dep)
-            if dep_contrib is None:
-                continue
-            lookup.merge(dep_contrib.export_trie)
+            lookup.merge_exported(self._contributions[dep].trie)
         return lookup
 
 
@@ -712,7 +683,7 @@ class PackageView:
 
     Cheap to construct (returned by :meth:`Analysis.package`); query
     methods trigger only the work their result depends on. Local
-    queries (:meth:`modules`, :meth:`declarations`) only need this
+    queries (:meth:`declarations`, :meth:`count_nodes`) only need this
     package's contribution. Cross-package queries (:meth:`importers_of`,
     :meth:`dead`, :meth:`graph`) materialize the
     :meth:`Analysis._interesting_set` for this package.
@@ -745,14 +716,6 @@ class PackageView:
         self._analysis.refresh(packages=[self._package.path])
         return self._analysis._contributions[self._package.path]
 
-    def modules(self) -> Iterator[SymbolNode]:
-        """Module nodes for every ``.py`` file in this package.
-
-        Local-only: refreshes this package if needed but never
-        touches deps or consumers.
-        """
-        yield from self._contribution().module_nodes
-
     def declarations(self, name: str | None = None) -> Iterator[SymbolNode]:
         """Top-level decls in this package.
 
@@ -760,7 +723,7 @@ class PackageView:
         decls whose rightmost dotted segment matches it (``"Foo"``
         matches ``pkg.mod.Foo`` but not ``pkg.Foo.bar``). Local-only.
         """
-        for n in self._contribution().package_graph.nodes:
+        for n in self._contribution().nodes:
             if n.type in ("module", "synthetic"):
                 continue
             if name is not None and simple_name(n.fqname) != name:
@@ -777,15 +740,14 @@ class PackageView:
         as :meth:`graph`) because cross-package import resolution is
         what populates the predecessors used here.
         """
-        scope = self._analysis._interesting_set(self._package.path)
+        graph = self._analysis.materialize_closure(self._package.path)
         contrib = self._analysis._contributions[self._package.path]
         ctx = PluginContext(
-            graph=self._analysis.materialize_closure(self._package.path),
-            symbol_lookup=self._analysis._build_symbol_lookup(self._package.path, scope=scope),
+            graph=graph,
+            symbol_lookup=self._analysis._build_symbol_lookup(self._package.path),
             package=self._package,
             project_root=self._analysis.project_root,
-            package_graph=contrib.package_graph,
-            module_nodes=contrib.module_nodes,
+            package_nodes=contrib.nodes,
         )
         return ctx.importers(target)
 
@@ -848,7 +810,7 @@ class PackageView:
         ``module``, source decls, and any ``synthetic`` nodes plugins
         emitted into this package's contribution during ``observe``.
         """
-        return _count_nodes(self._contribution().package_graph, prefix=None)
+        return _count_nodes(self._contribution().nodes, prefix=None)
 
     def remove_dead_code(self) -> None:
         """Apply the LibCST codemod, deleting every dead decl in this package.

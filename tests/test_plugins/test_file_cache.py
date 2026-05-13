@@ -1,5 +1,5 @@
 """Tests for the per-package ``PluginContext`` surface: ``parse``, ``importers``,
-``package_modules``."""
+``package_nodes``."""
 
 from __future__ import annotations
 
@@ -21,8 +21,7 @@ def _ctx(tmp_path):
         symbol_lookup=SymbolTrie(),
         package=Package(path=tmp_path, name="pkg"),
         project_root=tmp_path,
-        package_graph=nx.MultiDiGraph(),
-        module_nodes=(),
+        package_nodes=frozenset(),
     )
 
 
@@ -46,8 +45,8 @@ def test_parse_handles_syntax_error(tmp_path):
     assert ctx.parse(p) is None
 
 
-def test_package_modules_only_yields_under_package(tmp_path, make_analysis, write_files):
-    """``ctx.package_modules()`` filters to the current package, not the full graph."""
+def test_package_nodes_only_yields_under_package(tmp_path, make_analysis, write_files):
+    """``ctx.package_nodes`` filters to the current package, not the full graph."""
     write_files(
         {
             "a/pkg/__init__.py": "",
@@ -67,12 +66,12 @@ def test_package_modules_only_yields_under_package(tmp_path, make_analysis, writ
             return None
 
         def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]:
-            seen_per_package[ctx.package.path] = {p.name for p, _ in ctx.package_modules()}
+            seen_per_package[ctx.package.path] = {
+                n.path.name for n in ctx.package_nodes if n.type == "module"
+            }
             return ()
 
     make_analysis(["a", "b"], plugins=[_Capture()]).materialize_all()
-    # Each package only sees its own files, even though the full graph
-    # contains both packages' nodes by the time the second package runs.
     assert seen_per_package[tmp_path / "a"] == {"__init__.py", "m.py"}
     assert seen_per_package[tmp_path / "b"] == {"__init__.py", "m.py"}
 

@@ -9,6 +9,62 @@ two versions.
 
 ## [Unreleased]
 
+### Changed
+- New `NodeFlags.EXPORTED` tags every node from a file under
+  `Package.exported`, set via the visitor's `default_flags` mechanism
+  (same pattern as `NOTEBOOK`). `Package.exported` now participates in
+  the per-package cache fingerprint via the new `package=` argument on
+  `compute_fingerprint`; editing exported subdirs invalidates that
+  package's cache (siblings are unaffected). `Package.path` / `name` /
+  `deps`, the resolver, and `search_paths` remain outside the
+  fingerprint. Schema bumped to 4; existing caches rebuild on first run.
+
+- `PackageContribution` is now a raw record (`frozenset[SymbolNode]` /
+  `frozenset[(src, dst, EdgeFlags)]` / `Mapping[Path, tuple[CodeRange, ...]]`
+  plus the trie and import-edges); no more `nx.MultiDiGraph` wrapper.
+  The two-trie design (`current_trie` + `export_trie`) collapses into
+  one `trie`; consumer-side merges call the new
+  `SymbolTrie.merge_exported`, which filters by `NodeFlags.EXPORTED`
+  while walking through unexported intermediates so exported
+  descendants stay reachable.
+
+- The file-vs-package precedence case (`foo.py` next to
+  `foo/__init__.py`) is now called **eclipsed** to disambiguate from
+  `NodeFlags.SHADOWED` (intra-file decl rebinding, unchanged). The
+  helper is `eclipsed_paths`; the warning text says "eclipsed by
+  sibling package".
+
+### Removed (breaking, plugin API)
+- `PluginContext.package_modules()` and `PackageView.modules()` are
+  removed. Neither had any in-tree consumer (only tests and a
+  benchmark referenced them); callers that want module nodes can
+  filter `ctx.package_nodes` / `view.declarations()` by `n.type == "module"`.
+- `PluginContext.package_graph` and `PluginContext.module_nodes` are
+  gone. `package_nodes` is now a `frozenset[SymbolNode]` field
+  (was a method with internal caching); call sites change from
+  `ctx.package_nodes()` to `ctx.package_nodes`. `package_modules()`
+  derives modules from `package_nodes` by filter.
+- `AddNode` drops its `entrypoint: bool` / `testcase: bool` fields.
+  Plugins that need an entrypoint synthetic stamp the flag at
+  construction: `synthetic_node(..., flags=NodeFlags.ENTRYPOINT)`.
+- `NodeFlags.ENTRYPOINT` / `TESTCASE` are the only source of truth
+  for reachability seeds. The `graph.nodes[n]["entrypoint"]` /
+  `"testcase"` attr-dict mirror is no longer set or read anywhere;
+  `_find_reachable` reads flags directly off `SymbolNode`.
+- `SymbolTrie.add_module_hierarchy_edges(graph)` (mutator) replaced
+  by `SymbolTrie.module_hierarchy_edges()` (iterator yielding
+  `(child_module, parent_module)` pairs).
+
+### Refactored
+- The per-package apply layer (`PackageContribution`, `build_contribution`,
+  `_apply_payload`, `eclipsed_paths`) moved from `_refresh.py` into a new
+  `_package.py` module. `_refresh.py` now hosts the per-file pipeline
+  exclusively (enumerate, parse, observe, cache).
+- `Analysis._materialize` renamed `scope` -> `included` and dropped
+  the `None`-means-everything case. `Analysis._build_symbol_lookup`
+  lost its `scope` parameter — `_interesting_set` is closed under
+  transitive deps, so the filter could never trigger.
+
 ### Removed
 - The overlay / what-if API on `Analysis` is gone (breaking):
   `Analysis.preview_payloads`, `Analysis.materialize_with`,

@@ -152,7 +152,7 @@ class MockPatchPlugin:
         # per file that patches it, and trie walks are O(parts).
         decls_cache: dict[str, list[SymbolNode]] = {}
         modules_cache: dict[str, SymbolNode | None] = {}
-        for node in ctx.package_nodes():
+        for node in ctx.package_nodes:
             if node.type != "synthetic" or not node.fqname.startswith(PATCH_TARGET_PREFIX):
                 continue
             fqname = node.fqname[len(PATCH_TARGET_PREFIX) :]

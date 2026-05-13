@@ -83,7 +83,7 @@ def test_overloads_are_excluded_from_cross_module_lookup(tmp_path, make_analysis
     )
 
 
-def test_dead_overloads_are_removed_with_impl(tmp_path, make_analysis):
+def test_dead_overloads_are_removed_with_impl(tmp_path, make_analysis, mark_entrypoint):
     """When the impl is dead, the codemod removes the overloads alongside it."""
     (tmp_path / "mod.py").write_text(
         _normalise(
@@ -103,9 +103,9 @@ def test_dead_overloads_are_removed_with_impl(tmp_path, make_analysis):
         )
     )
     graph = make_analysis().materialize_all()
-    for node in graph.nodes:
+    for node in list(graph.nodes):
         if node.fqname == "mod.keep":
-            graph.nodes[node]["entrypoint"] = True
+            mark_entrypoint(graph, node)
     reachable = find_reachable(graph)
     unreachable = graph.subgraph([n for n in graph.nodes if n not in reachable]).copy()
     remove_code(unreachable, tmp_path)

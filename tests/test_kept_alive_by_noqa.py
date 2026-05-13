@@ -72,7 +72,6 @@ def test_pinned_import_carries_noqa_flag(build_decl_graph):
     pinned = next(n for n in graph.nodes if n.fqname == "m.os")
     assert pinned.flags & NodeFlags.ENTRYPOINT
     assert pinned.flags & NodeFlags.NOQA
-    assert graph.nodes[pinned].get("entrypoint") is True
 
 
 def test_file_level_directive_stamps_noqa(build_decl_graph):

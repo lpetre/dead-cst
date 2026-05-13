@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dead_cst.graph import NodeFlags
 from dead_cst.plugins import ServerConfigPlugin
 
 
@@ -163,8 +164,8 @@ def test_seeds_are_not_tagged_testcase(make_analysis, write_files):
         }
     )
     graph = make_analysis(plugins=[ServerConfigPlugin()]).materialize_all()
-    seeds = [n for n, attrs in graph.nodes(data=True) if attrs.get("entrypoint")]
+    seeds = [n for n in graph.nodes if n.flags & NodeFlags.ENTRYPOINT]
     server_seeds = [s for s in seeds if s.fqname.startswith("<server-config>:")]
     assert server_seeds
     for seed in server_seeds:
-        assert not graph.nodes[seed].get("testcase"), seed.fqname
+        assert not (seed.flags & NodeFlags.TESTCASE), seed.fqname

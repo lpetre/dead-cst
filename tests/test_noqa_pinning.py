@@ -21,11 +21,7 @@ def _import_nodes(graph):
 
 
 def _entrypoint_imports(graph) -> set[str]:
-    return {
-        n.fqname
-        for n, attrs in graph.nodes(data=True)
-        if n.type == "import" and attrs.get("entrypoint")
-    }
+    return {n.fqname for n in graph.nodes if n.type == "import" and n.flags & NodeFlags.ENTRYPOINT}
 
 
 @pytest.mark.parametrize(

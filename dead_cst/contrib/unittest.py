@@ -208,7 +208,7 @@ class UnittestPlugin:
                     path,
                     flags=NodeFlags.ENTRYPOINT | NodeFlags.TESTCASE,
                 )
-                yield AddNode(synth, entrypoint=True, testcase=True)
+                yield AddNode(synth)
             for sub in subs:
                 yield AddEdge(synth, sub)
 

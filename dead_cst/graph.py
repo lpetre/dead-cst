@@ -18,9 +18,8 @@ import enum
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import Iterator, Literal
 
-import networkx as nx
 from libcst.metadata import CodeRange
 
 logger = logging.getLogger(__name__)
@@ -33,11 +32,11 @@ class NodeFlags(enum.IntFlag):
     module edge) but are excluded from the lookup trie, so cross-module
     imports never resolve to them.
 
-    ``ENTRYPOINT`` flags a node as a reachability seed: ``_apply_payload``
-    sets ``graph.nodes[node]["entrypoint"] = True`` when it sees the
-    flag, so :func:`find_reachable` starts its BFS there. Plugins emit
-    flagged synthetic nodes via their per-file payloads to declare
-    entrypoints without a separate API surface.
+    ``ENTRYPOINT`` flags a node as a reachability seed: :func:`find_reachable`
+    starts its BFS from every node carrying this bit. Plugins emit
+    flagged synthetic nodes via their per-file payloads (or via
+    :class:`AddNode` ops constructing :func:`synthetic_node` with
+    ``flags=NodeFlags.ENTRYPOINT``) to declare entrypoints.
 
     ``OVERLOAD`` flags a ``typing.overload`` stub (or any same-name
     displaced sibling). Excluded from the lookup trie like
@@ -65,6 +64,15 @@ class NodeFlags(enum.IntFlag):
     ``NOTEBOOK | ENTRYPOINT`` on every node so the whole file's content
     is a reachability seed. The codemod uses this flag to skip
     notebooks (cell-aware writeback is out of scope today).
+
+    ``EXPORTED`` tags every node sourced from a file that the package
+    exports to its consumers (per :attr:`Package.exported`). Set via
+    the visitor's ``default_flags`` mechanism, so it lands on every
+    node a file produces. The single per-package lookup trie carries
+    both exported and non-exported decls; consumer-side merges use
+    :meth:`SymbolTrie.merge_exported` to filter to entries with this
+    bit set, while the package's own self-lookup uses :meth:`merge`
+    and sees everything.
     """
 
     NONE = 0
@@ -74,6 +82,7 @@ class NodeFlags(enum.IntFlag):
     TESTCASE = enum.auto()
     NOQA = enum.auto()
     NOTEBOOK = enum.auto()
+    EXPORTED = enum.auto()
 
 
 class EdgeFlags(enum.IntFlag):
@@ -221,7 +230,7 @@ class SymbolTrie:
 
         Module-FQN collisions across files (``foo.py`` alongside
         ``foo/__init__.py``) are resolved upstream by
-        :func:`dead_cst._refresh.shadowed_paths`: the loser's payload is
+        :func:`dead_cst._package.eclipsed_paths`: the loser's payload is
         applied to the graph but skipped at the trie, so this method
         never sees two ``module`` decls at the same node.
         """
@@ -270,10 +279,11 @@ class SymbolTrie:
         collision -- two exported roots both shipping a package with the
         same top-level name), the already-merged module wins and the
         incoming one is dropped with a warning. Callers control the
-        precedence order by the order of their ``merge()`` calls; today
-        :func:`build_symbol_graph` merges the consumer's own trie first
-        and each dep's exported trie afterwards, so own-module always
-        beats dep-module on legitimate conflict.
+        precedence order by the order of their ``merge()`` calls;
+        :meth:`Analysis._build_symbol_lookup` merges the consumer's own
+        trie first and each dep's trie via :meth:`merge_exported`
+        afterwards, so own-module always beats dep-module on
+        legitimate conflict.
         """
         for part, child in other.children.items():
             if part not in self.children:
@@ -293,6 +303,42 @@ class SymbolTrie:
         self.declarations = {k: list(v) for k, v in other.declarations.items()}
         return self
 
+    def merge_exported(self, other: SymbolTrie) -> SymbolTrie:
+        """Merge entries flagged :data:`NodeFlags.EXPORTED` from ``other``.
+
+        Used to fold a dep's per-package trie into a consumer's lookup:
+        the dep stores every decl in one trie, and consumers see only
+        the subset its source files marked exported (via the visitor's
+        ``default_flags`` for files under :attr:`Package.exported`).
+
+        Walks children recursively even when an intermediate module
+        isn't exported -- ``pkg/__init__.py`` may not be exported while
+        ``pkg/api/__init__.py`` is, and the consumer needs the path
+        ``pkg`` -> ``api`` to exist so the descendant resolves.
+        Non-exported decls and non-exported intermediate modules are
+        dropped; exported descendants still get through.
+        """
+        for part, child in other.children.items():
+            if part not in self.children:
+                self.children[part] = SymbolTrie()
+            self.children[part].merge_exported(child)
+        if other.module is None or not (other.module.flags & NodeFlags.EXPORTED):
+            return self
+        if self.module is not None:
+            logger.warning(
+                "SymbolTrie collision at %s: keeping %s, dropping %s",
+                self.module.fqname,
+                self.module.path,
+                other.module.path,
+            )
+            return self
+        self.module = other.module
+        for k, v in other.declarations.items():
+            exported = [d for d in v if d.flags & NodeFlags.EXPORTED]
+            if exported:
+                self.declarations[k] = exported
+        return self
+
     def _touch(self, parts: list[str]) -> SymbolTrie:
         node = self
         for p in parts:
@@ -307,9 +353,8 @@ class SymbolTrie:
                 return None
         return node
 
-    def add_module_hierarchy_edges(self, symbol_graph: nx.DiGraph) -> None:
-        """
-        Walk the trie and add edges from each submodule to its parent module.
+    def module_hierarchy_edges(self) -> Iterator[tuple[SymbolNode, SymbolNode]]:
+        """Yield ``(child_module, parent_module)`` for every submodule edge.
 
         For a structure like:
             v6/
@@ -320,24 +365,21 @@ class SymbolTrie:
                     ├── __init__.py
                     └── clip.py
 
-        This will add edges:
+        Yields:
             v6.nntree -> v6
             v6.nntree.extern -> v6.nntree
             v6.nntree.extern.clip -> v6.nntree.extern
         """
 
-        def _walk_and_add_edges(node: SymbolTrie, parent_module: SymbolNode | None):
-            """Recursive helper to walk the trie and add edges."""
-            # If this node represents a module and has a parent, add an edge
+        def _walk(
+            node: SymbolTrie, parent_module: SymbolNode | None
+        ) -> Iterator[tuple[SymbolNode, SymbolNode]]:
             if node.module and parent_module:
-                symbol_graph.add_edge(node.module, parent_module)
-
-            # Recurse into children, passing this node's module as the parent
+                yield (node.module, parent_module)
             for child_node in node.children.values():
-                _walk_and_add_edges(child_node, node.module)
+                yield from _walk(child_node, node.module)
 
-        # Start the walk from the root
-        _walk_and_add_edges(self, None)
+        yield from _walk(self, None)
 
 
 # ``SymbolTrie`` is intentionally absent from ``__all__`` -- it's an

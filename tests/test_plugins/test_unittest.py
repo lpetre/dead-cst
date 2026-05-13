@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dead_cst.graph import NodeFlags
 from dead_cst.plugins import UnittestPlugin
 
 
@@ -188,10 +189,10 @@ def test_unittest_plugin_tags_seeds_as_testcase(make_analysis, write_files):
         }
     )
     graph = make_analysis(plugins=[UnittestPlugin()]).materialize_all()
-    seeds = [n for n, attrs in graph.nodes(data=True) if attrs.get("entrypoint")]
+    seeds = [n for n in graph.nodes if n.flags & NodeFlags.ENTRYPOINT]
     assert seeds, "expected unittest plugin to seed at least one entrypoint"
     for seed in seeds:
-        assert graph.nodes[seed].get("testcase"), seed.fqname
+        assert seed.flags & NodeFlags.TESTCASE, seed.fqname
 
 
 def test_unittest_plugin_marks_subclass_via_local_mixin(

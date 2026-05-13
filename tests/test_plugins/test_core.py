@@ -27,7 +27,7 @@ from dead_cst.plugins._core import (
     matched_attr_call,
     single_target_assignment,
 )
-from dead_cst.graph import SymbolNode, SymbolTrie
+from dead_cst.graph import NodeFlags, SymbolNode, SymbolTrie
 from dead_cst.resolvers import Package
 
 
@@ -81,15 +81,12 @@ def _ctx_with_synthetic(fqname: str, base: Path) -> PluginContext:
         position=CodeRange(start=CodePosition(0, 0), end=CodePosition(0, 0)),
     )
     graph.add_node(node)
-    package_graph = nx.MultiDiGraph()
-    package_graph.add_node(node)
     return PluginContext(
         graph=graph,
         symbol_lookup=SymbolTrie(),
         package=Package(path=base, name="pkg"),
         project_root=base,
-        package_graph=package_graph,
-        module_nodes=(),
+        package_nodes=frozenset({node}),
     )
 
 
@@ -298,7 +295,7 @@ def test_mark_entrypoints_emits_synthetic_node_and_edges(tmp_path):
     ops = list(mark_entrypoints("seed", tmp_path / "p.toml", [target]))
     assert len(ops) == 2
     assert isinstance(ops[0], AddNode)
-    assert ops[0].entrypoint is True
+    assert ops[0].node.flags & NodeFlags.ENTRYPOINT
     assert ops[0].node.fqname == "seed"
     assert isinstance(ops[1], AddEdge)
     assert ops[1].src is ops[0].node
@@ -359,48 +356,18 @@ def test_find_call_assignments_ignores_non_call_rhs():
     assert find_call_assignments(module, {"Flask": "Flask"}, {"Flask"}) == {}
 
 
-# ---------------------------------------------------------------------------
-# PluginContext: package_modules() caches its first scan
-# ---------------------------------------------------------------------------
-
-
-def test_plugin_context_package_modules_yields_modules_only(tmp_path):
-    """``package_modules`` yields the precomputed module-node tuple."""
-    pkg = Package(path=tmp_path, name="pkg")
-    mod = SymbolNode("pkg.a", "module", tmp_path / "a.py", _pos())
-
-    ctx = PluginContext(
-        graph=nx.DiGraph(),
-        symbol_lookup=SymbolTrie(),
-        package=pkg,
-        project_root=tmp_path,
-        package_graph=nx.MultiDiGraph(),
-        module_nodes=(mod,),
-    )
-    assert list(ctx.package_modules()) == [(mod.path, mod)]
-
-
-def test_plugin_context_package_nodes_snapshots_first_scan(tmp_path):
-    """``package_nodes`` yields every node and snapshots once."""
+def test_plugin_context_package_nodes_exposes_constructor_set(tmp_path):
+    """``package_nodes`` is the immutable frozenset passed in."""
     pkg = Package(path=tmp_path, name="pkg")
     mod = SymbolNode("pkg", "module", tmp_path / "__init__.py", _pos())
     fn = SymbolNode("pkg.f", "function", tmp_path / "a.py", _pos())
-    package_graph = nx.MultiDiGraph()
-    package_graph.add_node(mod)
-    package_graph.add_node(fn)
+    nodes = frozenset({mod, fn})
 
     ctx = PluginContext(
         graph=nx.DiGraph(),
         symbol_lookup=SymbolTrie(),
         package=pkg,
         project_root=tmp_path,
-        package_graph=package_graph,
-        module_nodes=(mod,),
+        package_nodes=nodes,
     )
-    first = sorted(ctx.package_nodes(), key=lambda n: n.fqname)
-    assert first == [mod, fn]
-
-    # Cached: nodes added after the first scan don't appear.
-    late = SymbolNode("pkg.late", "function", tmp_path / "late.py", _pos())
-    package_graph.add_node(late)
-    assert sorted(ctx.package_nodes(), key=lambda n: n.fqname) == first
+    assert ctx.package_nodes == nodes

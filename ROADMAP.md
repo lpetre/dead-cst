@@ -157,18 +157,18 @@ demand.
 
 Folded down from earlier tiers as they landed:
 
-- **v0.9.4**: ``PluginContext`` now requires ``package_graph`` (the
-  per-package contribution graph) and ``module_nodes`` (its
-  module-typed entries). ``package_nodes`` snapshots
-  ``package_graph.nodes`` and ``package_modules`` iterates
-  ``module_nodes`` directly, replacing two filter passes that ran on
-  the merged cross-package ``graph`` every finalize pass:
-  ``Path.is_relative_to`` (~9 ms → ~40 µs on the dead-cst
-  self-analysis) and ``type == "module"`` (~50 µs → ~4 µs). The
-  analyzer wires both through automatically; custom callers that
-  construct ``PluginContext`` directly must pass them -- a hard break
-  rather than an optional shim, matching the pre-1.0 API churn budget.
-  ``PackageView.modules()`` also picks up the precomputed list.
+- **v0.9.4**: ``PluginContext`` gained ``package_graph`` and
+  ``module_nodes`` fields plus a ``package_nodes()`` snapshot method,
+  replacing two filter passes that ran on the merged cross-package
+  ``graph`` every finalize pass: ``Path.is_relative_to`` (~9 ms → ~40
+  µs on the dead-cst self-analysis) and ``type == "module"`` (~50 µs →
+  ~4 µs). The unreleased follow-up in ``_package.py`` (see CHANGELOG
+  ``[Unreleased]``) reshaped this further: ``PackageContribution``
+  itself became a raw record (no ``nx.MultiDiGraph`` wrapper),
+  ``package_nodes`` is now a ``frozenset[SymbolNode]`` field rather
+  than a method, and ``package_graph`` / ``module_nodes`` /
+  ``package_modules()`` / ``PackageView.modules()`` were removed for
+  having no in-tree consumers.
 - **v0.9.3**: ``ServerConfigPlugin`` (``dead_cst.contrib.server_config``,
   registered as the ``server_config`` builtin) marks Gunicorn / Hypercorn
   config files (``gunicorn.conf.py``, ``gunicorn_conf.py``,
@@ -249,16 +249,18 @@ Folded down from earlier tiers as they landed:
   scratch on every access. Pure performance change — output and
   payload-cache fingerprint are unchanged.
 - **v0.9.2**: A ``foo.py`` sibling of a ``foo/__init__.py`` package no
-  longer asserts out of ``SymbolTrie.add_declaration``. The new
-  ``dead_cst._refresh.shadowed_paths`` pre-pass mirrors CPython's
-  ``FileFinder`` precedence (regular package wins over a same-named
-  module file), so the trie holds the package and cross-module imports
-  of ``pkg.foo`` route there. The shadowed ``.py`` is still parsed and
-  its nodes still appear in the package graph — observe-time
-  entrypoints (``__main__`` blocks, plugin synthetics) keep working —
-  but consumer imports never see its decls. A WARNING is logged per
-  shadowed file so the layout (almost always a bug) surfaces during
-  analysis.
+  longer asserts out of ``SymbolTrie.add_declaration``. The
+  ``eclipsed_paths`` pre-pass (in ``dead_cst._package``) mirrors
+  CPython's ``FileFinder`` precedence (regular package wins over a
+  same-named module file), so the trie holds the package and
+  cross-module imports of ``pkg.foo`` route there. The eclipsed
+  ``.py`` is still parsed and its nodes still appear in the package
+  contribution — observe-time entrypoints (``__main__`` blocks, plugin
+  synthetics) keep working — but consumer imports never see its
+  decls. A WARNING is logged per eclipsed file so the layout (almost
+  always a bug) surfaces during analysis. (Renamed from
+  ``shadowed_paths`` to disambiguate from ``NodeFlags.SHADOWED`` in
+  the unreleased ``_package.py`` reshape.)
 - **v0.9.1**: ``resolve_edges`` no longer spins forever on cyclic
   re-exports. The worklist DFS now carries a per-walk ``visited`` set
   keyed on ``(id(SymbolTrie), parts_tail)``, so a pathological pair
@@ -482,10 +484,13 @@ Folded down from earlier tiers as they landed:
   `<root>/.dead-cst-cache/cache.db`. Cache hits skip the per-file
   visitor pass; edge resolution and plugin `finalize` run every
   analysis. The fingerprint covers Python version, schema version,
-  and each visitor / plugin / detector `(name, version)` pair --
-  resolver, `search_paths`, and the package layout deliberately do
-  not enter it (their effect flows through the uncached edge stitcher).
-  `--no-cache` flag and `dead-cst cache clear` subcommand.
+  each visitor / plugin / detector `(name, version)` pair, and (since
+  the unreleased ``_package.py`` reshape) the package's ``exported``
+  subdirs (which feed ``NodeFlags.EXPORTED`` via the visitor's
+  ``default_flags``). Resolver, `search_paths`, and `Package.path` /
+  `name` / `deps` deliberately do not enter it (their effect flows
+  through the uncached edge stitcher). `--no-cache` flag and
+  `dead-cst cache clear` subcommand.
 - Resolver logic as a protocol: `PathResolver.resolve_import` folds
   `name -> path` lookup into the resolver, so custom resolvers can
   override import resolution for their own layouts. `_resolve.py`

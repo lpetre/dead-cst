@@ -1,10 +1,10 @@
-"""Tests for ``foo.py`` shadowed by a sibling ``foo/__init__.py`` package.
+"""Tests for ``foo.py`` eclipsed by a sibling ``foo/__init__.py`` package.
 
 CPython's ``FileFinder`` resolves ``import pkg.foo`` to the package
 directory whenever both shapes coexist, so the analyzer mirrors that
 precedence: the trie holds the ``__init__.py`` and any cross-module
 import of ``pkg.foo`` (or of a name re-exported from it) routes to the
-package alone. The shadowed file is still parsed -- its nodes appear in
+package alone. The eclipsed file is still parsed -- its nodes appear in
 the graph and observe-time entrypoints (``__main__``, plugin
 synthetics) keep working -- but consumer imports never see its decls.
 """
@@ -28,11 +28,11 @@ def test_package_wins_trie_slot_for_cross_module_imports(
             "caller.py": "from pkg.foo import x\nx()\n",
         }
     )
-    with caplog.at_level(logging.WARNING, logger="dead_cst._refresh"):
+    with caplog.at_level(logging.WARNING, logger="dead_cst._package"):
         analysis = make_analysis(plugins=[ExplicitEntrypointPlugin(specs=["caller"])])
         graph = analysis.materialize_all()
 
-    assert any("shadowed by sibling package" in r.getMessage() for r in caplog.records)
+    assert any("eclipsed by sibling package" in r.getMessage() for r in caplog.records)
 
     caller_x = next(n for n in graph.nodes if n.fqname == "caller.x")
     targets = [s for s in graph.successors(caller_x) if s.fqname == "pkg.foo.x"]
@@ -43,12 +43,12 @@ def test_package_wins_trie_slot_for_cross_module_imports(
     package_x = next(
         n for n in graph.nodes if n.fqname == "pkg.foo.x" and n.path.name == "__init__.py"
     )
-    shadowed_x = next(n for n in graph.nodes if n.fqname == "pkg.foo.x" and n.path.name == "foo.py")
+    eclipsed_x = next(n for n in graph.nodes if n.fqname == "pkg.foo.x" and n.path.name == "foo.py")
     assert package_x in reachable
-    assert shadowed_x not in reachable
+    assert eclipsed_x not in reachable
 
 
-def test_shadowed_file_keeps_main_block_entrypoint(tmp_path, write_files, make_analysis):
+def test_eclipsed_file_keeps_main_block_entrypoint(tmp_path, write_files, make_analysis):
     write_files(
         {
             "pkg/__init__.py": "",
@@ -61,7 +61,7 @@ def test_shadowed_file_keeps_main_block_entrypoint(tmp_path, write_files, make_a
     reachable = find_reachable(graph)
 
     helper = next(n for n in graph.nodes if n.fqname == "pkg.foo.helper")
-    shadowed_module = next(
+    eclipsed_module = next(
         n for n in graph.nodes if n.fqname == "pkg.foo" and n.path.name == "foo.py"
     )
     package_module = next(
@@ -72,14 +72,14 @@ def test_shadowed_file_keeps_main_block_entrypoint(tmp_path, write_files, make_a
     )
 
     assert main_synth in reachable, "MainBlockPlugin synthetic must seed reachability"
-    assert helper in reachable, "decls in the shadowed file are alive when the synth reaches them"
-    assert shadowed_module in reachable, "shadowed module node stays alive via the synth"
+    assert helper in reachable, "decls in the eclipsed file are alive when the synth reaches them"
+    assert eclipsed_module in reachable, "eclipsed module node stays alive via the synth"
     # The package itself is unreached: nothing imports pkg.foo from outside.
     assert package_module not in reachable
 
 
-def test_name_only_in_shadowed_file_is_unresolvable(tmp_path, write_files, make_analysis, caplog):
-    """A name only the shadowed ``.py`` defines does not satisfy a consumer
+def test_name_only_in_eclipsed_file_is_unresolvable(tmp_path, write_files, make_analysis, caplog):
+    """A name only the eclipsed ``.py`` defines does not satisfy a consumer
     import -- mirrors what Python would do at runtime (``ImportError``)."""
     write_files(
         {

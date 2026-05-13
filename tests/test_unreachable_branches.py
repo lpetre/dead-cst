@@ -119,7 +119,7 @@ def test_dead_branch_import_ref_is_flagged(build_decl_graph, assert_dead_branch_
     )
 
 
-def test_default_find_reachable_traverses_dead_branch_edges(build_decl_graph):
+def test_default_find_reachable_traverses_dead_branch_edges(build_decl_graph, mark_entrypoint):
     """Default reachability still keeps ``helper`` alive via the dead-branch ref.
 
     Today's behavior preservation: even when the only reference to
@@ -139,12 +139,12 @@ def test_default_find_reachable_traverses_dead_branch_edges(build_decl_graph):
     # Mark the module as an entrypoint manually; the build_decl_graph
     # fixture doesn't run plugins.
     module = next(n for n in graph.nodes if n.fqname == "mod")
-    graph.nodes[module]["entrypoint"] = True
+    module = mark_entrypoint(graph, module)
     helper = next(n for n in graph.nodes if n.fqname == "mod.helper")
     assert helper in find_reachable(graph)
 
 
-def test_find_kept_alive_by_dead_branches_returns_strict_diff(build_decl_graph):
+def test_find_kept_alive_by_dead_branches_returns_strict_diff(build_decl_graph, mark_entrypoint):
     """Strict pruning surfaces ``helper`` as kept-alive-only-by-dead-code."""
     graph = build_decl_graph(
         {
@@ -156,7 +156,7 @@ def test_find_kept_alive_by_dead_branches_returns_strict_diff(build_decl_graph):
         }
     )
     module = next(n for n in graph.nodes if n.fqname == "mod")
-    graph.nodes[module]["entrypoint"] = True
+    module = mark_entrypoint(graph, module)
     helper = next(n for n in graph.nodes if n.fqname == "mod.helper")
     blast = find_kept_alive_by_dead_branches(graph)
     assert helper in blast
