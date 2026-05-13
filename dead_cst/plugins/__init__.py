@@ -88,6 +88,7 @@ from ..contrib.click import ClickPlugin
 from ..contrib.cyclopts import CycloptsPlugin
 from ..contrib.discordpy import DiscordPyPlugin
 from ..contrib.fastapi import FastAPIPlugin
+from ..contrib.fastmcp import FastMCPPlugin
 from ..contrib.flask import FlaskPlugin
 from ..contrib.mock_patch import MockPatchPlugin
 from ..contrib.pytest import PytestPlugin
@@ -111,6 +112,7 @@ BUILTIN_PLUGINS: dict[str, type] = {
     MockPatchPlugin.name: MockPatchPlugin,
     ServerConfigPlugin.name: ServerConfigPlugin,
     FastAPIPlugin.name: FastAPIPlugin,
+    FastMCPPlugin.name: FastMCPPlugin,
     FlaskPlugin.name: FlaskPlugin,
     TyperPlugin.name: TyperPlugin,
     ClickPlugin.name: ClickPlugin,
@@ -150,6 +152,7 @@ __all__ = [
     "EdgePlugin",
     "ExplicitEntrypointPlugin",
     "FastAPIPlugin",
+    "FastMCPPlugin",
     "FlaskPlugin",
     "GraphOp",
     "InitSubclassPlugin",

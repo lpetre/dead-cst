@@ -64,9 +64,11 @@ dev = [
     # their package to be resolved to an installed distribution (rather
     # than the ``[unresolved] <pkg>`` fallback), so tests need them
     # importable. ``click`` and ``typer`` are already pulled in by the
-    # runtime deps; only ``fastapi``, ``flask``, and ``celery`` are added here.
+    # runtime deps; only ``fastapi``, ``flask``, ``celery``, and ``fastmcp``
+    # are added here.
     "celery>=5.3",
     "fastapi>=0.110",
+    "fastmcp>=2.0",
     "flask>=3.0",
 ]
 

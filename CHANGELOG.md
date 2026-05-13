@@ -26,6 +26,20 @@ two versions.
   user-visible behavior change.
 
 ### Added
+- `FastMCPPlugin` ships in `dead_cst.contrib.fastmcp` and is registered
+  under the `fastmcp` builtin name. Marks top-level
+  `X = FastMCP(...)` server instances as entrypoints (the `fastmcp` CLI
+  loads `module:mcp` by import path the same way `uvicorn` loads a
+  FastAPI `module:app`, so every FastMCP server is framework-visible
+  the moment it's constructed) and wires `@mcp.tool` / `@mcp.resource`
+  / `@mcp.prompt` / `@mcp.completion` decorators on top-level functions
+  through the owning server. Supports the
+  `def create_server() -> FastMCP: ...` factory shape across packages
+  via the shared `DispatchAppPlugin` factory-marker mechanism. Only the
+  `fastmcp` import path is recognized; the Anthropic MCP SDK's
+  compatibility re-export (`mcp.server.fastmcp.FastMCP`) is not
+  detected -- users on that path can keep their handlers alive with
+  explicit `-e` entrypoints or a project-local plugin.
 - Jupyter notebook (`.ipynb`) support. Every `.ipynb` file under a
   package root is ingested by concatenating its code cells into a
   single libcst-parseable module; IPython line magics (`%foo`),
