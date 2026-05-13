@@ -220,7 +220,7 @@ For project-specific dynamic-import patterns, three abstract bases ship as scaff
 |---|---|
 | `DecoratedDeclPlugin` | "Find decorated decls in files matching a search path." Subclass with `package_prefix`, `decorator_module`, `decorator_names`, `constructor_names`. Pure observe-time. |
 | `LiteralListPlugin` | "Read `<owner>.<var> = ['fqn', ...]` and treat each entry as alive." Subclass with `owner_fqname`, `variable_name`. observe parses and caches; finalize only does graph lookups. |
-| `DispatchAppPlugin` | "Wire `@<instance>.<reg>(...)` handlers to a CLI app instance." Subclass with `app_module`, `constructor_targets`, `registration_decorators`. Powers `TyperPlugin` and `CycloptsPlugin`; reuse for any framework with the `X = App(); @X.command(...)` shape. |
+| `DispatchAppPlugin` | "Wire `@<instance>.<reg>(...)` handlers to an app instance." Subclass with `app_module`, `registration_decorators`, plus either `constructor_targets` (pure-dispatch — powers `TyperPlugin` / `CycloptsPlugin`, app instances stay pass-through) or `instance_kinds: Mapping[str, bool]` (factory-aware — powers `FlaskPlugin` / `FastAPIPlugin` / `CeleryPlugin`; emits `<{name}-app>` / `<{name}-pending>` / `<{name}-factory>` synthetics and runs a per-package finalize walk that classifies factory chains across files and promotes auto-entrypoint kinds). |
 
 All three bases require subclasses to set `name` (a unique identifier for the cache namespace) and `version` (a Unix epoch int — bump it to the current epoch when the subclass's config changes). For example:
 

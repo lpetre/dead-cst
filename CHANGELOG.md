@@ -9,6 +9,22 @@ two versions.
 
 ## [Unreleased]
 
+### Changed
+- `DispatchAppPlugin` (in `dead_cst.plugins.decl_shapes`) is now the
+  shared base for `FlaskPlugin`, `FastAPIPlugin`, and `CeleryPlugin` in
+  addition to `TyperPlugin` / `CycloptsPlugin`. The base learned an
+  opt-in factory-aware mode driven by a new
+  `instance_kinds: Mapping[str, bool]` field: when set, the plugin
+  emits `<{name}-app>:` / `<{name}-pending>:` / `<{name}-factory>:`
+  synthetics and runs a per-package finalize pass that walks pending
+  variables forward to a discriminating import node or factory marker
+  before promoting the matching kinds to entrypoints. When
+  `instance_kinds` is empty (Typer / Cyclopts) the plugin behaves as
+  before: pure observe, no entrypoint promotion. Flask / FastAPI /
+  Celery now consist almost entirely of their handler / kind config,
+  with Celery's `@shared_task` channel as its only override. No
+  user-visible behavior change.
+
 ### Added
 - Jupyter notebook (`.ipynb`) support. Every `.ipynb` file under a
   package root is ingested by concatenating its code cells into a

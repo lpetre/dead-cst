@@ -294,17 +294,25 @@ siblings of `plugins/__init__.py` (`MainBlockPlugin`,
 `ProjectScriptsPlugin`, `ExplicitEntrypointPlugin`,
 `ModuleDundersPlugin`, `InitSubclassPlugin`). Third-party-aware
 plugins live under `dead_cst/contrib/` and are re-exported from
-`dead_cst.plugins`. `FastAPIPlugin` is the full-featured reference for
-two-phase plugins; `ClickPlugin` for the `DecoratedDeclPlugin`
-subclass shape; `TyperPlugin` / `CycloptsPlugin` for the
-`DispatchAppPlugin` shape.
+`dead_cst.plugins`. `CeleryPlugin` is the full-featured reference for
+two-phase plugins (factory-aware `DispatchAppPlugin` plus a per-file
+`@shared_task` channel spliced in via an `observe()` override);
+`FlaskPlugin` / `FastAPIPlugin` for the factory-aware
+`DispatchAppPlugin` shape; `TyperPlugin` / `CycloptsPlugin` for the
+pure-dispatch `DispatchAppPlugin` shape; `ClickPlugin` for the
+`DecoratedDeclPlugin` subclass shape.
 
 For the common dynamic-import idioms, three abstract bases ship as
 scaffolding (`plugins/decl_shapes.py`):
 
 * `DecoratedDeclPlugin` — "decorated decls in files matching a search path."
 * `LiteralListPlugin` — "read `<owner>.<var> = ['fqn', ...]` and revive each entry."
-* `DispatchAppPlugin` — "wire `@<instance>.<reg>(...)` handlers to a CLI app."
+* `DispatchAppPlugin` — "wire `@<instance>.<reg>(...)` handlers to an app instance."
+  Pure-dispatch by default (Typer / Cyclopts: `X = App(); @X.command(...)`); opt into
+  factory-aware mode (Flask / FastAPI / Celery) by setting `instance_kinds: Mapping[str, bool]`
+  to emit `<{name}-app>` / `<{name}-pending>` / `<{name}-factory>` synthetics and run a
+  cross-package finalize walk that classifies factory chains (`X = create_app()`) and
+  promotes auto-entrypoint kinds.
 
 ### 7. Reachability — `Analysis.reachable` / `PackageView.reachable`
 
