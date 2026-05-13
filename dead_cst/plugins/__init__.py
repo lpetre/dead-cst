@@ -42,6 +42,7 @@ don't correspond to a specific source location.
 
 from __future__ import annotations
 
+from .._package import PackageContribution
 from ._core import (
     EXTERNAL_DIST_PREFIX,
     EXTERNAL_FILE_PREFIX,
@@ -161,6 +162,7 @@ __all__ = [
     "MockPatchPlugin",
     "ModuleDundersPlugin",
     "ObserveContext",
+    "PackageContribution",
     "PluginContext",
     "ProjectScriptsPlugin",
     "PytestPlugin",

@@ -85,6 +85,7 @@ EXPECTED_PUBLIC_API: dict[str, list[str]] = {
         "MockPatchPlugin",
         "ModuleDundersPlugin",
         "ObserveContext",
+        "PackageContribution",
         "PluginContext",
         "ProjectScriptsPlugin",
         "PytestPlugin",

@@ -231,7 +231,7 @@ class LiteralListPlugin:
 
     def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]:
         prefix = self._synth_prefix()
-        for node in ctx.package_nodes:
+        for node in ctx.contribution.nodes:
             if node.type != "synthetic" or not node.fqname.startswith(prefix):
                 continue
             captured = node.fqname[len(prefix) :]
@@ -422,7 +422,7 @@ class DispatchAppPlugin:
         app_prefix = self._prefix("app")
         pending_prefix = self._prefix("pending")
         factory_prefix = self._prefix("factory")
-        for synth in ctx.package_nodes:
+        for synth in ctx.contribution.nodes:
             if synth.type != "synthetic" or not synth.fqname.startswith(pending_prefix):
                 continue
             for var in list(ctx.graph.successors(synth)):

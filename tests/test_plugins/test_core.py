@@ -12,6 +12,7 @@ import pytest
 from libcst.metadata import CodePosition, CodeRange
 
 from dead_cst.analyze import _find_reachable as find_reachable
+from dead_cst._package import PackageContribution
 from dead_cst.plugins import MainBlockPlugin, ProjectScriptsPlugin
 from dead_cst.plugins._core import (
     AddEdge,
@@ -81,12 +82,19 @@ def _ctx_with_synthetic(fqname: str, base: Path) -> PluginContext:
         position=CodeRange(start=CodePosition(0, 0), end=CodePosition(0, 0)),
     )
     graph.add_node(node)
+    contribution = PackageContribution(
+        package=Package(path=base, name="pkg"),
+        trie=SymbolTrie(),
+        nodes=frozenset({node}),
+        edges=frozenset(),
+        dead_suites={},
+        import_edges=frozenset(),
+    )
     return PluginContext(
         graph=graph,
         symbol_lookup=SymbolTrie(),
-        package=Package(path=base, name="pkg"),
+        contribution=contribution,
         project_root=base,
-        package_nodes=frozenset({node}),
     )
 
 
@@ -356,18 +364,26 @@ def test_find_call_assignments_ignores_non_call_rhs():
     assert find_call_assignments(module, {"Flask": "Flask"}, {"Flask"}) == {}
 
 
-def test_plugin_context_package_nodes_exposes_constructor_set(tmp_path):
-    """``package_nodes`` is the immutable frozenset passed in."""
+def test_plugin_context_contribution_exposes_nodes(tmp_path):
+    """``contribution.nodes`` is the immutable frozenset passed in."""
     pkg = Package(path=tmp_path, name="pkg")
     mod = SymbolNode("pkg", "module", tmp_path / "__init__.py", _pos())
     fn = SymbolNode("pkg.f", "function", tmp_path / "a.py", _pos())
     nodes = frozenset({mod, fn})
 
+    contribution = PackageContribution(
+        package=pkg,
+        trie=SymbolTrie(),
+        nodes=nodes,
+        edges=frozenset(),
+        dead_suites={},
+        import_edges=frozenset(),
+    )
     ctx = PluginContext(
         graph=nx.DiGraph(),
         symbol_lookup=SymbolTrie(),
-        package=pkg,
+        contribution=contribution,
         project_root=tmp_path,
-        package_nodes=nodes,
     )
-    assert ctx.package_nodes == nodes
+    assert ctx.contribution.nodes == nodes
+    assert ctx.contribution.package is pkg

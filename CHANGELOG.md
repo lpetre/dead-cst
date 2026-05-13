@@ -35,15 +35,22 @@ two versions.
   sibling package".
 
 ### Removed (breaking, plugin API)
+- `PluginContext.package` and `PluginContext.package_nodes` are folded
+  into a single `PluginContext.contribution: PackageContribution`
+  field. Read `ctx.contribution.package` / `ctx.contribution.nodes`
+  instead. `PackageContribution` is now re-exported from
+  `dead_cst.plugins` for plugin authors. `contribution` also exposes
+  the package-local `trie`, raw `edges`, `dead_suites`, and
+  `import_edges` — fields plugins previously couldn't reach.
 - `PluginContext.package_modules()` and `PackageView.modules()` are
   removed. Neither had any in-tree consumer (only tests and a
   benchmark referenced them); callers that want module nodes can
-  filter `ctx.package_nodes` / `view.declarations()` by `n.type == "module"`.
+  filter `ctx.contribution.nodes` / `view.declarations()` by `n.type == "module"`.
 - `PluginContext.package_graph` and `PluginContext.module_nodes` are
-  gone. `package_nodes` is now a `frozenset[SymbolNode]` field
-  (was a method with internal caching); call sites change from
-  `ctx.package_nodes()` to `ctx.package_nodes`. `package_modules()`
-  derives modules from `package_nodes` by filter.
+  gone. `contribution.nodes` is a `frozenset[SymbolNode]` (was a
+  method with internal caching on the old `package_nodes`); call sites
+  change from `ctx.package_nodes()` to `ctx.contribution.nodes`.
+  `package_modules()` derives modules by filter.
 - `AddNode` drops its `entrypoint: bool` / `testcase: bool` fields.
   Plugins that need an entrypoint synthetic stamp the flag at
   construction: `synthetic_node(..., flags=NodeFlags.ENTRYPOINT)`.

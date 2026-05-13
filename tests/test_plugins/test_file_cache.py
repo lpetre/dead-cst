@@ -1,5 +1,5 @@
 """Tests for the per-package ``PluginContext`` surface: ``parse``, ``importers``,
-``package_nodes``."""
+``contribution.nodes``."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from typing import Iterable
 import libcst as cst
 import networkx as nx
 
+from dead_cst._package import PackageContribution
 from dead_cst.graph import SymbolTrie
 from dead_cst.plugins import GraphOp, ObserveContext, PluginContext
 from dead_cst.resolvers import Package
@@ -19,9 +20,15 @@ def _ctx(tmp_path):
     return PluginContext(
         graph=nx.DiGraph(),
         symbol_lookup=SymbolTrie(),
-        package=Package(path=tmp_path, name="pkg"),
+        contribution=PackageContribution(
+            package=Package(path=tmp_path, name="pkg"),
+            trie=SymbolTrie(),
+            nodes=frozenset(),
+            edges=frozenset(),
+            dead_suites={},
+            import_edges=frozenset(),
+        ),
         project_root=tmp_path,
-        package_nodes=frozenset(),
     )
 
 
@@ -46,7 +53,7 @@ def test_parse_handles_syntax_error(tmp_path):
 
 
 def test_package_nodes_only_yields_under_package(tmp_path, make_analysis, write_files):
-    """``ctx.package_nodes`` filters to the current package, not the full graph."""
+    """``ctx.contribution.nodes`` filters to the current package, not the full graph."""
     write_files(
         {
             "a/pkg/__init__.py": "",
@@ -66,8 +73,8 @@ def test_package_nodes_only_yields_under_package(tmp_path, make_analysis, write_
             return None
 
         def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]:
-            seen_per_package[ctx.package.path] = {
-                n.path.name for n in ctx.package_nodes if n.type == "module"
+            seen_per_package[ctx.contribution.package.path] = {
+                n.path.name for n in ctx.contribution.nodes if n.type == "module"
             }
             return ()
 
