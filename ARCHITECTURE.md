@@ -186,18 +186,21 @@ A cache row covers both the visitor's payload **and** every plugin's
 The orchestration around this stage — file enumeration, stale detection,
 the parallel worker pool, payload application into the per-package
 contribution — lives in `dead_cst/_refresh.py` so `analyze.py` can stay
-focused on cross-package composition. File enumeration filters
-directories whose name happens to end in `.py` / `.pyi` / `.ipynb`
-(`Path.rglob` matches by name only). Jupyter notebooks are converted to
-a single Python source string by `_notebooks.notebook_to_module` before
-the visitor sees them, and the visitor is constructed with
+focused on cross-package composition. File enumeration walks the tree
+once via `Path.rglob("*")` and dispatches by suffix into `.py` /
+`.pyi` / `.ipynb` buckets — directory I/O dominates the per-name
+fnmatch cost on large repos, so one walk beats three suffix-specific
+globs. Jupyter notebooks are converted to a single Python source
+string by `_notebooks.notebook_to_module` before the visitor sees
+them, and the visitor is constructed with
 `default_flags=NodeFlags.NOTEBOOK | NodeFlags.ENTRYPOINT` so every
-emitted node carries those flags from the start. When `libcst` rejects a file's syntax (or a
-notebook's JSON is malformed), the per-file work logs a warning and
-substitutes a placeholder payload pairing the real module node with a
-`[unparseable] <module>` synthetic flagged `ENTRYPOINT` — the file stays alive in reachability and rides
-the per-file cache like any other miss, so a fresh source SHA picks
-up the fix automatically. The pool consumes worker results via
+emitted node carries those flags from the start. When `libcst`
+rejects a file's syntax (or a notebook's JSON is malformed), the
+per-file work logs a warning and substitutes a placeholder payload
+pairing the real module node with a `[unparseable] <module>`
+synthetic flagged `ENTRYPOINT` — the file stays alive in reachability
+and rides the per-file cache like any other miss, so a fresh source
+SHA picks up the fix automatically. The pool consumes worker results via
 `concurrent.futures.as_completed`, so cache writes land in completion
 order — a single slow file does not block the cache from warming with
 the fast files behind it. Per-task failures other than the in-band

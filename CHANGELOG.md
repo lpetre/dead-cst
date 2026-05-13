@@ -15,18 +15,18 @@ two versions.
   single libcst-parseable module; IPython line magics (`%foo`),
   cell magics (`%%bash`), shell escapes (`!ls`), and trailing-help
   forms (`obj?`, `obj.attr??`) are neutralized to `pass  # <line>`
-  comments so the line count is preserved for diagnostic mapping.
-  Notebooks aren't importable, so their decls are deliberately kept
-  out of the cross-module lookup trie.
+  so libcst accepts the source. Notebooks aren't importable, so their
+  decls are deliberately kept out of the cross-module lookup trie.
 - `NodeFlags.NOTEBOOK` stamps every `SymbolNode` sourced from a
-  notebook. Every node is also stamped `NodeFlags.ENTRYPOINT`, so a
-  notebook's contents are reachability seeds and any `.py` code the
-  notebook imports stays alive. Malformed notebooks fall through to
-  the same `[unparseable] <module>` placeholder used for `.py` files
-  that fail to parse.
-- The codemod (`generate_patch` / `remove_code`) skips `.ipynb`
-  paths; cell-aware writeback into the notebook JSON envelope is
-  out of scope.
+  notebook. `SymbolVisitor` now takes a `default_flags` kwarg that
+  `_refresh._process_one_file` sets to `NOTEBOOK | ENTRYPOINT` for
+  notebooks, so a notebook's contents are reachability seeds and any
+  `.py` code the notebook imports stays alive. Malformed notebooks
+  fall through to the same `[unparseable] <module>` placeholder used
+  for `.py` files that fail to parse.
+- The codemod (`generate_patch` / `remove_code`) skips
+  `NodeFlags.NOTEBOOK` nodes; cell-aware writeback into the notebook
+  JSON envelope is out of scope.
 - `CeleryPlugin` ships in `dead_cst.contrib.celery` and is registered
   under the `celery` builtin name. Marks top-level `X = Celery(...)`
   app instances as entrypoints (the Celery worker process loads
