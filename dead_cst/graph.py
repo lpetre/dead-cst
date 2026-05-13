@@ -59,6 +59,12 @@ class NodeFlags(enum.IntFlag):
     metadata on top of ``ENTRYPOINT``, queried via
     ``Analysis.kept_alive_by_flags_only(NodeFlags.NOQA)`` for the
     "blast radius" of removing every F401-pinned import.
+
+    ``NOTEBOOK`` tags every node sourced from a Jupyter ``.ipynb`` file.
+    Notebooks are not importable modules; they're stamped
+    ``NOTEBOOK | ENTRYPOINT`` on every node so the whole file's content
+    is a reachability seed. The codemod uses this flag to skip
+    notebooks (cell-aware writeback is out of scope today).
     """
 
     NONE = 0
@@ -67,6 +73,7 @@ class NodeFlags(enum.IntFlag):
     OVERLOAD = enum.auto()
     TESTCASE = enum.auto()
     NOQA = enum.auto()
+    NOTEBOOK = enum.auto()
 
 
 class EdgeFlags(enum.IntFlag):

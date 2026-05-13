@@ -9,6 +9,25 @@ two versions.
 
 ## [Unreleased]
 
+### Added
+- Jupyter notebook (`.ipynb`) support. Every `.ipynb` file under a
+  package root is ingested by concatenating its code cells into a
+  single libcst-parseable module; IPython line magics (`%foo`),
+  cell magics (`%%bash`), shell escapes (`!ls`), and trailing-help
+  forms (`obj?`, `obj.attr??`) are neutralized to `pass  # <line>`
+  comments so the line count is preserved for diagnostic mapping.
+  Notebooks aren't importable, so their decls are deliberately kept
+  out of the cross-module lookup trie.
+- `NodeFlags.NOTEBOOK` stamps every `SymbolNode` sourced from a
+  notebook. Every node is also stamped `NodeFlags.ENTRYPOINT`, so a
+  notebook's contents are reachability seeds and any `.py` code the
+  notebook imports stays alive. Malformed notebooks fall through to
+  the same `[unparseable] <module>` placeholder used for `.py` files
+  that fail to parse.
+- The codemod (`generate_patch` / `remove_code`) skips `.ipynb`
+  paths; cell-aware writeback into the notebook JSON envelope is
+  out of scope.
+
 ## [0.9.4] - 2026-05-12
 
 ### Changed

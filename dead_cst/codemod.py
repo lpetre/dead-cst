@@ -10,7 +10,7 @@ from libcst.codemod.visitors import RemoveImportsVisitor
 from libcst.metadata import CodeRange, FullRepoManager, PositionProvider, QualifiedNameSource
 
 from ._fqn import FixedFullyQualifiedNameProvider
-from .graph import SymbolNode
+from .graph import NodeFlags, SymbolNode
 
 
 class RemoveDeadSymbols(cst.CSTTransformer):
@@ -95,6 +95,11 @@ def _select_files(G: nx.Graph, base: Path) -> tuple[dict[Path, list[SymbolNode]]
     outside ``base`` (other packages, vendored deps) are dropped, as are
     nodes whose source file no longer exists. Synthetic nodes are
     ignored implicitly -- they don't appear in the type ``match``.
+
+    Notebook (``.ipynb``) nodes are dropped: the codemod rewrites Python
+    source, and cell-aware writeback into the notebook JSON envelope is
+    not implemented. Every notebook node carries ``NodeFlags.NOTEBOOK``
+    anyway, but the suffix check is a cheap pre-filter.
     """
     by_file: dict[Path, list[SymbolNode]] = {}
     deleted_modules: list[Path] = []
@@ -102,6 +107,8 @@ def _select_files(G: nx.Graph, base: Path) -> tuple[dict[Path, list[SymbolNode]]
         if not node.path.is_relative_to(base):
             continue
         if not node.path.exists():
+            continue
+        if node.path.suffix == ".ipynb" or node.flags & NodeFlags.NOTEBOOK:
             continue
         match node.type:
             case "function" | "class" | "variable" | "type_alias" | "import":

@@ -26,7 +26,7 @@ import logging
 import signal
 import threading
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
@@ -36,6 +36,7 @@ from libcst.helpers.module import ModuleNameAndPackage
 from libcst.metadata import CodeRange, MetadataWrapper
 
 from ._fqn import FixedFullyQualifiedNameProvider
+from ._notebooks import is_notebook, notebook_fqn_entry, notebook_to_module
 from ._progress import progress
 from ._visitor import SymbolVisitor
 from .branches import UnreachableRegionDetector
@@ -113,12 +114,17 @@ def enumerate_files(
     cache: GraphCache | None,
     fingerprint: str,
 ) -> PackageFiles:
-    """Walk ``package.path``'s ``.py`` / ``.pyi`` tree, classify each file as cache hit or miss.
+    """Walk ``package.path``'s ``.py`` / ``.pyi`` / ``.ipynb`` tree.
 
     A ``.pyi`` whose ``.py`` twin also exists is skipped at this layer:
     ingesting both would assert in the symbol trie when they claim the
     same FQN, and dead-cst has no peer-stub linker. Orphan ``.pyi``
     (compiled-extension shape) flows through under its natural FQN.
+
+    ``.ipynb`` files are always picked up; notebooks aren't importable
+    modules so they sidestep the trie entirely (every node is flagged
+    ``NOTEBOOK | ENTRYPOINT`` and the apply pass keeps them out of the
+    cross-module lookup trie).
 
     ``rglob`` matches by name, so a *directory* literally named
     ``something.py`` would otherwise sneak in and crash the visitor on
@@ -129,7 +135,8 @@ def enumerate_files(
     pyi_files = (
         p for p in package.path.rglob("*.pyi") if p.is_file() and p.with_suffix("") not in py_stems
     )
-    files = tuple(sorted([*py_files, *pyi_files]))
+    ipynb_files = (p for p in package.path.rglob("*.ipynb") if p.is_file())
+    files = tuple(sorted([*py_files, *pyi_files, *ipynb_files]))
     hits: dict[Path, VisitorPayload] = {}
     miss_files: list[Path] = []
     for file in files:
@@ -162,18 +169,30 @@ def build_stale_tasks(
         pf = package_files[package_path]
         if not pf.miss_files:
             continue
-        fqn_cache = FixedFullyQualifiedNameProvider.gen_cache(
-            package_path, [str(f) for f in pf.miss_files], timeout=5
-        )
-        tasks.extend(
-            StaleFile(
-                file=file,
-                package=pf.package,
-                fqn_entry=fqn_cache[str(file)],
-                project_root=project_root,
+        # ``gen_cache`` walks the filesystem to derive a dotted module name
+        # from each path; it has no notion of notebooks. Feed it the .py /
+        # .pyi subset only and synthesize FQN entries for notebooks.
+        gen_cache_files = [str(f) for f in pf.miss_files if not is_notebook(f)]
+        fqn_cache: dict[str, ModuleNameAndPackage] = (
+            dict(
+                FixedFullyQualifiedNameProvider.gen_cache(package_path, gen_cache_files, timeout=5)
             )
-            for file in pf.miss_files
+            if gen_cache_files
+            else {}
         )
+        for file in pf.miss_files:
+            if is_notebook(file):
+                fqn_entry = notebook_fqn_entry(file)
+            else:
+                fqn_entry = fqn_cache[str(file)]
+            tasks.append(
+                StaleFile(
+                    file=file,
+                    package=pf.package,
+                    fqn_entry=fqn_entry,
+                    project_root=project_root,
+                )
+            )
     return tasks
 
 
@@ -390,6 +409,10 @@ def shadowed_paths(files: Sequence[Path]) -> frozenset[Path]:
     for f in files:
         if f.name == "__init__.py":
             continue
+        # Notebooks aren't importable modules, so they can't be shadowed
+        # by a sibling ``__init__.py`` -- treat them as orthogonal.
+        if is_notebook(f):
+            continue
         candidate = f.with_suffix("")
         if candidate in init_dirs:
             init_path = candidate / "__init__.py"
@@ -447,11 +470,17 @@ def _process_one_file(
     The payload is cached like any other miss -- a fresh source SHA
     re-runs the parse, so fixing the syntax invalidates the entry.
     """
-    try:
-        source = file.read_text()
-    except OSError as exc:
-        logger.warning("Skipping %s: could not read file: %s", file, exc)
-        return None
+    if is_notebook(file):
+        nb = notebook_to_module(file)
+        if nb is None:
+            return _unparseable_payload(file, fqn_entry)
+        source = nb.text
+    else:
+        try:
+            source = file.read_text()
+        except OSError as exc:
+            logger.warning("Skipping %s: could not read file: %s", file, exc)
+            return None
     try:
         module = cst.parse_module(source)
     except cst.ParserSyntaxError as exc:
@@ -468,7 +497,10 @@ def _process_one_file(
     plugin_payload = _run_observe(
         plugins, file, wrapper.module, base_payload, package, project_root
     )
-    return _merge_payloads(base_payload, plugin_payload)
+    merged = _merge_payloads(base_payload, plugin_payload)
+    if is_notebook(file):
+        merged = _stamp_notebook_flags(merged)
+    return merged
 
 
 def _unparseable_payload(
@@ -660,7 +692,9 @@ def _apply_payload(
         # file-level equivalent for a ``.py`` whose sibling package
         # shadows it. Either way the graph keeps the parent edge so
         # the decl is well-formed -- only consumer FQN lookups change.
-        if add_to_trie and not (n.flags & (NodeFlags.SHADOWED | NodeFlags.OVERLOAD)):
+        if add_to_trie and not (
+            n.flags & (NodeFlags.SHADOWED | NodeFlags.OVERLOAD | NodeFlags.NOTEBOOK)
+        ):
             current_trie.add_declaration(n)
             if file_exported:
                 export_trie.add_declaration(n)
@@ -675,6 +709,31 @@ def _apply_payload(
         symbol_graph.graph["dead_suites"][module.path] = payload.dead_suites
 
     return module
+
+
+def _stamp_notebook_flags(payload: VisitorPayload) -> VisitorPayload:
+    """Tag every ``SymbolNode`` in ``payload`` with ``NOTEBOOK | ENTRYPOINT``.
+
+    ``SymbolNode`` is frozen, so the rewrite goes through
+    :func:`dataclasses.replace`. Edges and imports reference nodes by
+    value -- we remap each tuple through a fresh ``id(old) -> new`` table
+    so the new nodes stay consistent across the payload.
+    """
+    extra = NodeFlags.NOTEBOOK | NodeFlags.ENTRYPOINT
+    remap: dict[SymbolNode, SymbolNode] = {}
+    new_nodes: list[SymbolNode] = []
+    for n in payload.nodes:
+        new = replace(n, flags=n.flags | extra)
+        remap[n] = new
+        new_nodes.append(new)
+    new_edges = tuple((remap.get(s, s), remap.get(d, d), pos) for s, d, pos in payload.edges)
+    new_imports = tuple((remap.get(s, s), imp, pos) for s, imp, pos in payload.imports)
+    return VisitorPayload(
+        nodes=tuple(new_nodes),
+        edges=new_edges,
+        imports=new_imports,
+        dead_suites=payload.dead_suites,
+    )
 
 
 def _merge_payloads(*payloads: VisitorPayload) -> VisitorPayload:
