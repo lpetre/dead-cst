@@ -36,6 +36,7 @@ from libcst.helpers.module import ModuleNameAndPackage
 from libcst.metadata import CodeRange, MetadataWrapper
 
 from ._fqn import FixedFullyQualifiedNameProvider
+from ._notebooks import is_notebook, notebook_fqn_entry, notebook_to_module
 from ._progress import progress
 from ._visitor import SymbolVisitor
 from .branches import UnreachableRegionDetector
@@ -113,23 +114,37 @@ def enumerate_files(
     cache: GraphCache | None,
     fingerprint: str,
 ) -> PackageFiles:
-    """Walk ``package.path``'s ``.py`` / ``.pyi`` tree, classify each file as cache hit or miss.
+    """Walk ``package.path`` once, classifying ``.py`` / ``.pyi`` / ``.ipynb``.
 
     A ``.pyi`` whose ``.py`` twin also exists is skipped at this layer:
     ingesting both would assert in the symbol trie when they claim the
     same FQN, and dead-cst has no peer-stub linker. Orphan ``.pyi``
     (compiled-extension shape) flows through under its natural FQN.
+    Notebooks aren't importable; ``_process_one_file`` stamps them with
+    ``NodeFlags.NOTEBOOK`` via the visitor's ``default_flags``.
 
     ``rglob`` matches by name, so a *directory* literally named
     ``something.py`` would otherwise sneak in and crash the visitor on
-    ``read_text``. Filter to real files defensively.
+    ``read_text``. Filter to real files defensively. One walk over the
+    tree (vs three suffix-specific globs) is the cheap path on large
+    repos where directory I/O dominates the per-name fnmatch cost.
     """
-    py_files = sorted(p for p in package.path.rglob("*.py") if p.is_file())
+    py_files: list[Path] = []
+    pyi_candidates: list[Path] = []
+    ipynb_files: list[Path] = []
+    for p in package.path.rglob("*"):
+        if not p.is_file():
+            continue
+        match p.suffix:
+            case ".py":
+                py_files.append(p)
+            case ".pyi":
+                pyi_candidates.append(p)
+            case ".ipynb":
+                ipynb_files.append(p)
     py_stems = {p.with_suffix("") for p in py_files}
-    pyi_files = (
-        p for p in package.path.rglob("*.pyi") if p.is_file() and p.with_suffix("") not in py_stems
-    )
-    files = tuple(sorted([*py_files, *pyi_files]))
+    pyi_files = [p for p in pyi_candidates if p.with_suffix("") not in py_stems]
+    files = tuple(sorted([*py_files, *pyi_files, *ipynb_files]))
     hits: dict[Path, VisitorPayload] = {}
     miss_files: list[Path] = []
     for file in files:
@@ -162,18 +177,25 @@ def build_stale_tasks(
         pf = package_files[package_path]
         if not pf.miss_files:
             continue
-        fqn_cache = FixedFullyQualifiedNameProvider.gen_cache(
-            package_path, [str(f) for f in pf.miss_files], timeout=5
-        )
-        tasks.extend(
-            StaleFile(
-                file=file,
-                package=pf.package,
-                fqn_entry=fqn_cache[str(file)],
-                project_root=project_root,
+        # ``gen_cache`` has no notion of notebooks; synthesize FQNs for them.
+        gen_cache_files = [str(f) for f in pf.miss_files if not is_notebook(f)]
+        fqn_cache: dict[str, ModuleNameAndPackage] = (
+            dict(
+                FixedFullyQualifiedNameProvider.gen_cache(package_path, gen_cache_files, timeout=5)
             )
-            for file in pf.miss_files
+            if gen_cache_files
+            else {}
         )
+        for file in pf.miss_files:
+            fqn_entry = notebook_fqn_entry(file) if is_notebook(file) else fqn_cache[str(file)]
+            tasks.append(
+                StaleFile(
+                    file=file,
+                    package=pf.package,
+                    fqn_entry=fqn_entry,
+                    project_root=project_root,
+                )
+            )
     return tasks
 
 
@@ -390,6 +412,10 @@ def shadowed_paths(files: Sequence[Path]) -> frozenset[Path]:
     for f in files:
         if f.name == "__init__.py":
             continue
+        # Notebooks aren't importable modules, so they can't be shadowed
+        # by a sibling ``__init__.py`` -- treat them as orthogonal.
+        if is_notebook(f):
+            continue
         candidate = f.with_suffix("")
         if candidate in init_dirs:
             init_path = candidate / "__init__.py"
@@ -447,22 +473,32 @@ def _process_one_file(
     The payload is cached like any other miss -- a fresh source SHA
     re-runs the parse, so fixing the syntax invalidates the entry.
     """
-    try:
-        source = file.read_text()
-    except OSError as exc:
-        logger.warning("Skipping %s: could not read file: %s", file, exc)
-        return None
+    notebook = is_notebook(file)
+    default_flags = NodeFlags.NOTEBOOK | NodeFlags.ENTRYPOINT if notebook else NodeFlags.NONE
+    if notebook:
+        nb_source = notebook_to_module(file)
+        if nb_source is None:
+            return _unparseable_payload(file, fqn_entry, default_flags=default_flags)
+        source = nb_source
+    else:
+        try:
+            source = file.read_text()
+        except OSError as exc:
+            logger.warning("Skipping %s: could not read file: %s", file, exc)
+            return None
     try:
         module = cst.parse_module(source)
     except cst.ParserSyntaxError as exc:
         logger.warning("Could not parse %s: %s; emitting [unparseable] marker", file, exc)
-        return _unparseable_payload(file, fqn_entry)
+        return _unparseable_payload(file, fqn_entry, default_flags=default_flags)
     wrapper = MetadataWrapper(
         module,
         unsafe_skip_copy=True,
         cache={FixedFullyQualifiedNameProvider: fqn_entry},
     )
-    visitor = SymbolVisitor(file, unreachable_detector=detector, wrapper=wrapper)
+    visitor = SymbolVisitor(
+        file, unreachable_detector=detector, wrapper=wrapper, default_flags=default_flags
+    )
     wrapper.visit(visitor)
     base_payload = visitor.to_payload()
     plugin_payload = _run_observe(
@@ -474,6 +510,8 @@ def _process_one_file(
 def _unparseable_payload(
     file: Path,
     fqn_entry: ModuleNameAndPackage,
+    *,
+    default_flags: NodeFlags = NodeFlags.NONE,
 ) -> VisitorPayload:
     """Build the placeholder payload for a file libcst could not parse.
 
@@ -483,17 +521,22 @@ def _unparseable_payload(
     keeps the file alive during reachability -- we cannot prove its
     contents are dead -- and gives downstream queries (``why-alive``,
     reports) a stable handle for "this file did not parse".
+
+    ``default_flags`` mirrors ``SymbolVisitor``'s knob: an unparseable
+    notebook still lands flagged ``NOTEBOOK`` so the codemod gate and
+    trie exclusion stay consistent with the parseable path.
     """
     module_node_ = SymbolNode(
         fqname=fqn_entry.name,
         type="module",
         path=file,
         position=SYNTHETIC_POSITION,
+        flags=default_flags,
     )
     marker = synthetic_node(
         f"{UNPARSEABLE_PREFIX}{fqn_entry.name}",
         file,
-        flags=NodeFlags.ENTRYPOINT,
+        flags=NodeFlags.ENTRYPOINT | default_flags,
     )
     return VisitorPayload(
         nodes=(module_node_, marker),
@@ -660,7 +703,9 @@ def _apply_payload(
         # file-level equivalent for a ``.py`` whose sibling package
         # shadows it. Either way the graph keeps the parent edge so
         # the decl is well-formed -- only consumer FQN lookups change.
-        if add_to_trie and not (n.flags & (NodeFlags.SHADOWED | NodeFlags.OVERLOAD)):
+        if add_to_trie and not (
+            n.flags & (NodeFlags.SHADOWED | NodeFlags.OVERLOAD | NodeFlags.NOTEBOOK)
+        ):
             current_trie.add_declaration(n)
             if file_exported:
                 export_trie.add_declaration(n)

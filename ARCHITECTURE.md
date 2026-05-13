@@ -186,14 +186,21 @@ A cache row covers both the visitor's payload **and** every plugin's
 The orchestration around this stage — file enumeration, stale detection,
 the parallel worker pool, payload application into the per-package
 contribution — lives in `dead_cst/_refresh.py` so `analyze.py` can stay
-focused on cross-package composition. File enumeration filters
-directories whose name happens to end in `.py` / `.pyi` (`Path.rglob`
-matches by name only). When `libcst` rejects a file's syntax, the
+focused on cross-package composition. File enumeration walks the tree
+once via `Path.rglob("*")` and dispatches by suffix into `.py` /
+`.pyi` / `.ipynb` buckets — directory I/O dominates the per-name
+fnmatch cost on large repos, so one walk beats three suffix-specific
+globs. Jupyter notebooks are converted to a single Python source
+string by `_notebooks.notebook_to_module` before the visitor sees
+them, and the visitor is constructed with
+`default_flags=NodeFlags.NOTEBOOK | NodeFlags.ENTRYPOINT` so every
+emitted node carries those flags from the start. When `libcst`
+rejects a file's syntax (or a notebook's JSON is malformed), the
 per-file work logs a warning and substitutes a placeholder payload
-pairing the real module node with a `[unparseable] <module>` synthetic
-flagged `ENTRYPOINT` — the file stays alive in reachability and rides
-the per-file cache like any other miss, so a fresh source SHA picks
-up the fix automatically. The pool consumes worker results via
+pairing the real module node with a `[unparseable] <module>`
+synthetic flagged `ENTRYPOINT` — the file stays alive in reachability
+and rides the per-file cache like any other miss, so a fresh source
+SHA picks up the fix automatically. The pool consumes worker results via
 `concurrent.futures.as_completed`, so cache writes land in completion
 order — a single slow file does not block the cache from warming with
 the fast files behind it. Per-task failures other than the in-band
@@ -396,6 +403,15 @@ entirely.
 * `.pyi` stubs are ingested only for the compiled-extension layout
   (`_native.so` + `_native.pyi`, no `.py` twin). Peer-mode `.pyi` is
   dropped at file-enumeration time — the runtime always wins.
+* `.ipynb` (Jupyter) files are concatenated cell-by-cell into one
+  parseable Python module by `_notebooks.notebook_to_module`. IPython
+  magics, shell escapes, and trailing-help forms are rewritten to
+  `pass  # <line>` so libcst accepts the source. The visitor is
+  constructed with `default_flags=NodeFlags.NOTEBOOK | NodeFlags.ENTRYPOINT`
+  so every node carries those flags from the start; `NOTEBOOK` also
+  keeps the decl out of the cross-module lookup trie alongside
+  `SHADOWED` / `OVERLOAD`. The codemod skips any node flagged
+  `NOTEBOOK`.
 * A `foo.py` next to a `foo/__init__.py` is shadowed by the package
   (mirroring CPython's `FileFinder`). `_refresh.shadowed_paths` flags
   the `.py` before `_apply_payload` runs, and the apply pass skips its
