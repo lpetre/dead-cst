@@ -123,7 +123,8 @@ def enumerate_files(
 
     ``.ipynb`` files flow through too. They aren't importable, so the
     apply pass keeps them out of the cross-module lookup trie via
-    ``NodeFlags.NOTEBOOK`` (stamped in :func:`_stamp_notebook_flags`).
+    ``NodeFlags.NOTEBOOK`` (set on the visitor's ``default_flags`` in
+    :func:`_process_one_file`).
 
     ``rglob`` matches by name, so a *directory* literally named
     ``something.py`` would otherwise sneak in and crash the visitor on
@@ -464,10 +465,12 @@ def _process_one_file(
     The payload is cached like any other miss -- a fresh source SHA
     re-runs the parse, so fixing the syntax invalidates the entry.
     """
-    if is_notebook(file):
+    notebook = is_notebook(file)
+    default_flags = NodeFlags.NOTEBOOK | NodeFlags.ENTRYPOINT if notebook else NodeFlags.NONE
+    if notebook:
         nb_source = notebook_to_module(file)
         if nb_source is None:
-            return _unparseable_payload(file, fqn_entry)
+            return _unparseable_payload(file, fqn_entry, default_flags=default_flags)
         source = nb_source
     else:
         try:
@@ -479,14 +482,11 @@ def _process_one_file(
         module = cst.parse_module(source)
     except cst.ParserSyntaxError as exc:
         logger.warning("Could not parse %s: %s; emitting [unparseable] marker", file, exc)
-        return _unparseable_payload(file, fqn_entry)
+        return _unparseable_payload(file, fqn_entry, default_flags=default_flags)
     wrapper = MetadataWrapper(
         module,
         unsafe_skip_copy=True,
         cache={FixedFullyQualifiedNameProvider: fqn_entry},
-    )
-    default_flags = (
-        NodeFlags.NOTEBOOK | NodeFlags.ENTRYPOINT if is_notebook(file) else NodeFlags.NONE
     )
     visitor = SymbolVisitor(
         file, unreachable_detector=detector, wrapper=wrapper, default_flags=default_flags
@@ -502,6 +502,8 @@ def _process_one_file(
 def _unparseable_payload(
     file: Path,
     fqn_entry: ModuleNameAndPackage,
+    *,
+    default_flags: NodeFlags = NodeFlags.NONE,
 ) -> VisitorPayload:
     """Build the placeholder payload for a file libcst could not parse.
 
@@ -511,17 +513,23 @@ def _unparseable_payload(
     keeps the file alive during reachability -- we cannot prove its
     contents are dead -- and gives downstream queries (``why-alive``,
     reports) a stable handle for "this file did not parse".
+
+    ``default_flags`` mirrors ``SymbolVisitor``'s knob: a notebook whose
+    JSON is malformed (or whose source libcst rejects) still lands a
+    module + marker pair flagged ``NOTEBOOK`` so the codemod gate and
+    trie-exclusion logic stay consistent with the parseable path.
     """
     module_node_ = SymbolNode(
         fqname=fqn_entry.name,
         type="module",
         path=file,
         position=SYNTHETIC_POSITION,
+        flags=default_flags,
     )
     marker = synthetic_node(
         f"{UNPARSEABLE_PREFIX}{fqn_entry.name}",
         file,
-        flags=NodeFlags.ENTRYPOINT,
+        flags=NodeFlags.ENTRYPOINT | default_flags,
     )
     return VisitorPayload(
         nodes=(module_node_, marker),

@@ -177,10 +177,9 @@ class SymbolVisitor(cst.CSTVisitor):
         default_flags: NodeFlags = NodeFlags.NONE,
     ):
         self.path = path
-        # ORed into ``flags=`` on every ``SymbolNode`` the visitor builds.
-        # Notebook ingestion uses ``NOTEBOOK | ENTRYPOINT`` to stamp the
-        # whole file as a reachability seed at construction time, avoiding
-        # a separate payload-rewrite pass.
+        # ORed into every emitted ``SymbolNode``'s flags. Lets callers stamp
+        # whole-file properties (e.g. notebook ingestion) without a post-pass
+        # rewrite that would have to rebuild edges/imports in lockstep.
         self._default_flags = default_flags
         self._unreachable_detector = (
             unreachable_detector
