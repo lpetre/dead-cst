@@ -190,9 +190,9 @@ focused on cross-package composition. File enumeration filters
 directories whose name happens to end in `.py` / `.pyi` / `.ipynb`
 (`Path.rglob` matches by name only). Jupyter notebooks are converted to
 a single Python source string by `_notebooks.notebook_to_module` before
-the visitor sees them, and `_stamp_notebook_flags` rewrites the
-resulting payload so every node carries `NodeFlags.NOTEBOOK |
-NodeFlags.ENTRYPOINT`. When `libcst` rejects a file's syntax (or a
+the visitor sees them, and the visitor is constructed with
+`default_flags=NodeFlags.NOTEBOOK | NodeFlags.ENTRYPOINT` so every
+emitted node carries those flags from the start. When `libcst` rejects a file's syntax (or a
 notebook's JSON is malformed), the per-file work logs a warning and
 substitutes a placeholder payload pairing the real module node with a
 `[unparseable] <module>` synthetic flagged `ENTRYPOINT` — the file stays alive in reachability and rides
@@ -403,8 +403,9 @@ entirely.
 * `.ipynb` (Jupyter) files are concatenated cell-by-cell into one
   parseable Python module by `_notebooks.notebook_to_module`. IPython
   magics, shell escapes, and trailing-help forms are rewritten to
-  `pass  # <line>` so libcst accepts the source. Every resulting node
-  carries `NodeFlags.NOTEBOOK | NodeFlags.ENTRYPOINT`; `NOTEBOOK` also
+  `pass  # <line>` so libcst accepts the source. The visitor is
+  constructed with `default_flags=NodeFlags.NOTEBOOK | NodeFlags.ENTRYPOINT`
+  so every node carries those flags from the start; `NOTEBOOK` also
   keeps the decl out of the cross-module lookup trie alongside
   `SHADOWED` / `OVERLOAD`. The codemod skips any node flagged
   `NOTEBOOK`.

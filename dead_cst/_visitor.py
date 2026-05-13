@@ -174,8 +174,14 @@ class SymbolVisitor(cst.CSTVisitor):
         path: Path,
         unreachable_detector: UnreachableRegionDetector | None = None,
         wrapper: cst.MetadataWrapper | None = None,
+        default_flags: NodeFlags = NodeFlags.NONE,
     ):
         self.path = path
+        # ORed into ``flags=`` on every ``SymbolNode`` the visitor builds.
+        # Notebook ingestion uses ``NOTEBOOK | ENTRYPOINT`` to stamp the
+        # whole file as a reachability seed at construction time, avoiding
+        # a separate payload-rewrite pass.
+        self._default_flags = default_flags
         self._unreachable_detector = (
             unreachable_detector
             if unreachable_detector is not None
@@ -276,7 +282,7 @@ class SymbolVisitor(cst.CSTVisitor):
         fqns = self.get_metadata(FixedFullyQualifiedNameProvider, node, default=[])
         pos = self._pos(node)
         for fqn in fqns:
-            sym = SymbolNode(fqn.name, type_, self.path, pos)
+            sym = SymbolNode(fqn.name, type_, self.path, pos, flags=self._default_flags)
             self.symbol_referent_nodes[sym] = node
             self._push_decl(node, sym)
 
@@ -332,7 +338,7 @@ class SymbolVisitor(cst.CSTVisitor):
             fqns = self.get_metadata(FixedFullyQualifiedNameProvider, name, default=[])
             pos = self._pos(name)
             for fqn in fqns:
-                sym = SymbolNode(fqn.name, "variable", self.path, pos)
+                sym = SymbolNode(fqn.name, "variable", self.path, pos, flags=self._default_flags)
                 self.symbol_referent_nodes[sym] = name
                 name_to_syms.setdefault(name, []).append(sym)
                 if value is not None:
@@ -417,6 +423,7 @@ class SymbolVisitor(cst.CSTVisitor):
                     self.path,
                     alias_pos,
                     import_info,
+                    flags=self._default_flags,
                 )
                 self.symbol_referent_nodes[sym] = alias
                 self._push_decl(alias, sym)
@@ -455,7 +462,13 @@ class SymbolVisitor(cst.CSTVisitor):
     def visit_Module(self, node: cst.Module) -> None:
         assert not self.decl_stack, "Module node should be the first visited node"
         fqns = self.get_metadata(FixedFullyQualifiedNameProvider, node, default=[])
-        sym = SymbolNode(next(iter(fqns)).name, "module", self.path, self._pos(node))
+        sym = SymbolNode(
+            next(iter(fqns)).name,
+            "module",
+            self.path,
+            self._pos(node),
+            flags=self._default_flags,
+        )
         # Cache so ``_finalize_module_declarations`` can locate the trie
         # node after ``on_leave`` has popped the module frame.
         self._module_fqname = sym.fqname
@@ -499,7 +512,9 @@ class SymbolVisitor(cst.CSTVisitor):
         if len(self.decl_stack) > 1:
             return
         fqname = f"{self.module_node.fqname}.{node.name.value}"
-        sym = SymbolNode(fqname, "type_alias", self.path, self._pos(node.name))
+        sym = SymbolNode(
+            fqname, "type_alias", self.path, self._pos(node.name), flags=self._default_flags
+        )
         self.symbol_referent_nodes[sym] = node
         self._push_decl(node, sym)
 
@@ -556,7 +571,7 @@ class SymbolVisitor(cst.CSTVisitor):
         # use.
         fqname = f"{self.module_node.fqname}.{node.target.value}"
         pos = self._pos(node.target)
-        sym = SymbolNode(fqname, "variable", self.path, pos)
+        sym = SymbolNode(fqname, "variable", self.path, pos, flags=self._default_flags)
         self.symbol_referent_nodes[sym] = node.target
         self.walrus_leak_targets.setdefault(node.target.value, []).append(sym)
 

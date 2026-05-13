@@ -26,7 +26,7 @@ import logging
 import signal
 import threading
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
@@ -485,16 +485,18 @@ def _process_one_file(
         unsafe_skip_copy=True,
         cache={FixedFullyQualifiedNameProvider: fqn_entry},
     )
-    visitor = SymbolVisitor(file, unreachable_detector=detector, wrapper=wrapper)
+    default_flags = (
+        NodeFlags.NOTEBOOK | NodeFlags.ENTRYPOINT if is_notebook(file) else NodeFlags.NONE
+    )
+    visitor = SymbolVisitor(
+        file, unreachable_detector=detector, wrapper=wrapper, default_flags=default_flags
+    )
     wrapper.visit(visitor)
     base_payload = visitor.to_payload()
     plugin_payload = _run_observe(
         plugins, file, wrapper.module, base_payload, package, project_root
     )
-    merged = _merge_payloads(base_payload, plugin_payload)
-    if is_notebook(file):
-        merged = _stamp_notebook_flags(merged)
-    return merged
+    return _merge_payloads(base_payload, plugin_payload)
 
 
 def _unparseable_payload(
@@ -703,29 +705,6 @@ def _apply_payload(
         symbol_graph.graph["dead_suites"][module.path] = payload.dead_suites
 
     return module
-
-
-def _stamp_notebook_flags(payload: VisitorPayload) -> VisitorPayload:
-    """Tag every ``SymbolNode`` in ``payload`` with ``NOTEBOOK | ENTRYPOINT``.
-
-    ``SymbolNode`` is frozen, so edges and imports must be rebuilt in
-    lockstep with the node rewrite.
-    """
-    extra = NodeFlags.NOTEBOOK | NodeFlags.ENTRYPOINT
-    remap: dict[SymbolNode, SymbolNode] = {}
-    new_nodes: list[SymbolNode] = []
-    for n in payload.nodes:
-        new = replace(n, flags=n.flags | extra)
-        remap[n] = new
-        new_nodes.append(new)
-    new_edges = tuple((remap.get(s, s), remap.get(d, d), pos) for s, d, pos in payload.edges)
-    new_imports = tuple((remap.get(s, s), imp, pos) for s, imp, pos in payload.imports)
-    return VisitorPayload(
-        nodes=tuple(new_nodes),
-        edges=new_edges,
-        imports=new_imports,
-        dead_suites=payload.dead_suites,
-    )
 
 
 def _merge_payloads(*payloads: VisitorPayload) -> VisitorPayload:
