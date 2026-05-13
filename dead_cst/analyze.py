@@ -546,7 +546,7 @@ class Analysis:
         """
         if self._full_graph is None:
             self.refresh()
-            self._full_graph = self._materialize(scope=None)
+            self._full_graph = self._materialize(included=frozenset(p.path for p in self.packages))
         return self._full_graph
 
     def materialize_closure(self, package: Path) -> nx.MultiDiGraph:
@@ -565,20 +565,22 @@ class Analysis:
         if self._full_graph is not None:
             return self._full_graph
         if package not in self._closure_graphs:
-            scope = self._interesting_set(package)
-            self.refresh(packages=scope)
-            self._closure_graphs[package] = self._materialize(scope=scope)
+            included = self._interesting_set(package)
+            self.refresh(packages=included)
+            self._closure_graphs[package] = self._materialize(included=included)
         return self._closure_graphs[package]
 
     def _materialize(
         self,
         *,
-        scope: frozenset[Path] | None,
+        included: frozenset[Path],
     ) -> nx.MultiDiGraph:
-        """Compose every refreshed package in ``scope`` into a fresh graph.
+        """Compose every package in ``included`` into a fresh graph.
 
-        ``scope=None`` composes every package. Caller is responsible
-        for having :meth:`refresh`'d every package in ``scope`` first.
+        Caller is responsible for having :meth:`refresh`'d every
+        package in ``included`` first; ``_interesting_set`` is closed
+        under transitive deps, so passing one of those (or the full
+        package set for ``materialize_all``) is enough.
 
         Cross-file import resolution runs here (in
         :func:`_compose_contribution` -> :func:`resolve_edges`), which
@@ -595,7 +597,7 @@ class Analysis:
         g.graph["dead_suites"] = {}
         baseline = list(sys.path)
         last_search_paths: tuple[Path, ...] | None = None
-        target_paths = [p.path for p in self.packages if scope is None or p.path in scope]
+        target_paths = [p.path for p in self.packages if p.path in included]
         try:
             for path in progress(
                 target_paths,
@@ -615,7 +617,7 @@ class Analysis:
                 _compose_contribution(
                     self._contributions[path],
                     target_graph=g,
-                    symbol_lookup=self._build_symbol_lookup(path, scope=scope),
+                    symbol_lookup=self._build_symbol_lookup(path),
                     plugins=self._plugins,
                     project_root=self._project_root,
                     import_resolver=self._import_resolver,
@@ -678,31 +680,19 @@ class Analysis:
         """
         return _count_nodes(self.materialize_all(), prefix)
 
-    def _build_symbol_lookup(
-        self,
-        package: Path,
-        *,
-        scope: frozenset[Path] | None,
-    ) -> SymbolTrie:
-        """Per-package lookup trie: this package's full trie + each in-scope dep's exports.
+    def _build_symbol_lookup(self, package: Path) -> SymbolTrie:
+        """Per-package lookup trie: this package's full trie + each dep's exports.
 
-        ``scope`` bounds which deps' export tries are merged in:
-        ``None`` for the full-graph path (every dep), or a
-        :meth:`_interesting_set` for closure-scoped materialization.
-        Deps must already be refreshed (the caller is responsible for
-        calling :meth:`refresh` on the right set first).
+        Deps must already be refreshed; both
+        :meth:`materialize_all` and :meth:`materialize_closure`
+        guarantee this because :meth:`_interesting_set` is closed
+        under transitive deps.
         """
-        contrib = self._contributions.get(package)
+        contrib = self._contributions[package]
         lookup = SymbolTrie()
-        if contrib is not None:
-            lookup.merge(contrib.current_trie)
+        lookup.merge(contrib.current_trie)
         for dep in self._dep_paths(package):
-            if scope is not None and dep not in scope:
-                continue
-            dep_contrib = self._contributions.get(dep)
-            if dep_contrib is None:
-                continue
-            lookup.merge(dep_contrib.export_trie)
+            lookup.merge(self._contributions[dep].export_trie)
         return lookup
 
 
@@ -776,11 +766,14 @@ class PackageView:
         as :meth:`graph`) because cross-package import resolution is
         what populates the predecessors used here.
         """
-        scope = self._analysis._interesting_set(self._package.path)
+        # Trigger closure materialization first so every dep is refreshed
+        # and ``_build_symbol_lookup``'s ``self._contributions[dep]`` access
+        # is safe.
+        graph = self._analysis.materialize_closure(self._package.path)
         contrib = self._analysis._contributions[self._package.path]
         ctx = PluginContext(
-            graph=self._analysis.materialize_closure(self._package.path),
-            symbol_lookup=self._analysis._build_symbol_lookup(self._package.path, scope=scope),
+            graph=graph,
+            symbol_lookup=self._analysis._build_symbol_lookup(self._package.path),
             package=self._package,
             project_root=self._analysis.project_root,
             package_graph=contrib.package_graph,
