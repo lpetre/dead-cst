@@ -106,7 +106,7 @@ def main() -> None:
 
 
 def _profile_package_nodes(contrib: PackageContribution, project_root: Path) -> None:
-    """Benchmark :attr:`PluginContext.package_nodes` and :meth:`package_modules`."""
+    """Benchmark :attr:`PluginContext.package_nodes` iteration."""
     n_total = len(contrib.nodes)
     print(f"\npackage_nodes: contribution has {n_total} node(s)")
 
@@ -125,15 +125,6 @@ def _profile_package_nodes(contrib: PackageContribution, project_root: Path) -> 
         matched = sum(1 for _ in _make_ctx().package_nodes)
     cold_per_call_us = (time.perf_counter() - t0) / REPEATS * 1e6
     print(f"  cold:  {cold_per_call_us:8.1f} us per call ({matched} nodes)")
-
-    n_modules = sum(1 for n in contrib.nodes if n.type == "module")
-    print(f"\npackage_modules: {n_modules} module(s) of {n_total} node(s)")
-    t0 = time.perf_counter()
-    matched = 0
-    for _ in range(REPEATS):
-        matched = sum(1 for _ in _make_ctx().package_modules())
-    cold_per_call_us = (time.perf_counter() - t0) / REPEATS * 1e6
-    print(f"  cold:  {cold_per_call_us:8.1f} us per call ({matched} modules)")
 
 
 if __name__ == "__main__":

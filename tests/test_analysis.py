@@ -74,18 +74,6 @@ def test_refresh_rejects_unknown_package(tmp_path, make_analysis):
 # ---------------------------------------------------------------------------
 
 
-def test_package_modules_local_only(tmp_path, make_analysis):
-    """:meth:`PackageView.modules` returns this base's modules only."""
-    base_a = tmp_path / "a"
-    base_b = tmp_path / "b"
-    _write(base_a, {"pkg/__init__.py": "", "pkg/m.py": "def f(): pass\n"})
-    _write(base_b, {"pkg/__init__.py": "", "pkg/m.py": "def g(): pass\n"})
-    a = make_analysis(["a", "b"])
-    pkg_a = a.package(base_a)
-    a_paths = {n.path for n in pkg_a.modules()}
-    assert a_paths == {(base_a / "pkg" / "__init__.py"), (base_a / "pkg" / "m.py")}
-
-
 def test_package_declarations_filter_by_simple_name(tmp_path, make_analysis):
     """``simple_name`` matches only the rightmost dotted segment."""
     _write(
@@ -103,14 +91,14 @@ def test_package_declarations_filter_by_simple_name(tmp_path, make_analysis):
 
 
 def test_local_query_doesnt_materialize_full_graph(tmp_path, make_analysis):
-    """``pkg.modules()`` populates only this base's contribution; full graph
+    """``pkg.declarations()`` populates only this base's contribution; full graph
     is still un-materialized."""
     base_a = tmp_path / "a"
     base_b = tmp_path / "b"
     _write(base_a, {"pkg/__init__.py": "", "pkg/m.py": "def f(): pass\n"})
     _write(base_b, {"pkg/__init__.py": "", "pkg/m.py": "def g(): pass\n"})
     a = make_analysis(["a", "b"])
-    list(a.package(base_a).modules())
+    list(a.package(base_a).declarations())
     assert base_a in a._contributions
     assert base_b not in a._contributions
     assert a._full_graph is None

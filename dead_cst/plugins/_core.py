@@ -74,9 +74,9 @@ class PluginContext:
     order (deps before dependents wherever the package graph is
     acyclic). Each invocation gets a fresh context whose
     ``symbol_lookup`` matches what was visible to that package's import
-    resolution. Plugins should normally scope iteration to
-    :attr:`package` -- :meth:`package_modules` is the easy way --
-    because :attr:`graph` accumulates nodes across packages.
+    resolution. Plugins should normally iterate :attr:`package_nodes`
+    rather than :attr:`graph` because :attr:`graph` accumulates nodes
+    across packages.
 
     :attr:`_modules` is a request-scope memo for :meth:`parse`: nothing
     is pre-populated, so the first plugin that asks for a given file's
@@ -141,10 +141,6 @@ class PluginContext:
                 out.extend(bucket)
             stack.extend(node.children.values())
         return out
-
-    def package_modules(self) -> Iterator[tuple[Path, SymbolNode]]:
-        """Yield ``(path, module_node)`` for every module under :attr:`package`."""
-        return ((n.path, n) for n in self.package_nodes if n.type == "module")
 
     def importers(self, target: str) -> set[Path]:
         """Return paths under :attr:`package` whose imports reach ``target``.

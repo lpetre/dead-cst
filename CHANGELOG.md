@@ -35,6 +35,10 @@ two versions.
   sibling package".
 
 ### Removed (breaking, plugin API)
+- `PluginContext.package_modules()` and `PackageView.modules()` are
+  removed. Neither had any in-tree consumer (only tests and a
+  benchmark referenced them); callers that want module nodes can
+  filter `ctx.package_nodes` / `view.declarations()` by `n.type == "module"`.
 - `PluginContext.package_graph` and `PluginContext.module_nodes` are
   gone. `package_nodes` is now a `frozenset[SymbolNode]` field
   (was a method with internal caching); call sites change from

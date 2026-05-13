@@ -716,14 +716,6 @@ class PackageView:
         self._analysis.refresh(packages=[self._package.path])
         return self._analysis._contributions[self._package.path]
 
-    def modules(self) -> Iterator[SymbolNode]:
-        """Module nodes for every ``.py`` file in this package.
-
-        Local-only: refreshes this package if needed but never
-        touches deps or consumers.
-        """
-        yield from (n for n in self._contribution().nodes if n.type == "module")
-
     def declarations(self, name: str | None = None) -> Iterator[SymbolNode]:
         """Top-level decls in this package.
 

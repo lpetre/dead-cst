@@ -356,27 +356,6 @@ def test_find_call_assignments_ignores_non_call_rhs():
     assert find_call_assignments(module, {"Flask": "Flask"}, {"Flask"}) == {}
 
 
-# ---------------------------------------------------------------------------
-# PluginContext: package_modules() caches its first scan
-# ---------------------------------------------------------------------------
-
-
-def test_plugin_context_package_modules_yields_modules_only(tmp_path):
-    """``package_modules`` filters ``package_nodes`` to ``type == "module"``."""
-    pkg = Package(path=tmp_path, name="pkg")
-    mod = SymbolNode("pkg.a", "module", tmp_path / "a.py", _pos())
-    fn = SymbolNode("pkg.a.f", "function", tmp_path / "a.py", _pos())
-
-    ctx = PluginContext(
-        graph=nx.DiGraph(),
-        symbol_lookup=SymbolTrie(),
-        package=pkg,
-        project_root=tmp_path,
-        package_nodes=frozenset({mod, fn}),
-    )
-    assert list(ctx.package_modules()) == [(mod.path, mod)]
-
-
 def test_plugin_context_package_nodes_exposes_constructor_set(tmp_path):
     """``package_nodes`` is the immutable frozenset passed in."""
     pkg = Package(path=tmp_path, name="pkg")
