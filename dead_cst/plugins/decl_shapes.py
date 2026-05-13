@@ -332,17 +332,9 @@ class DispatchAppPlugin:
         # pure-dispatch plugins keep the legacy flat-set config.
         return self.instance_kinds if self._factory_aware else self.constructor_targets
 
-    @property
-    def _app_prefix(self) -> str:
-        return f"<{self.name}-app>:"
-
-    @property
-    def _pending_prefix(self) -> str:
-        return f"<{self.name}-pending>:"
-
-    @property
-    def _factory_prefix(self) -> str:
-        return f"<{self.name}-factory>:"
+    def _prefix(self, kind: str) -> str:
+        """Return the synthetic prefix ``<{name}-{kind}>:`` for ``app`` / ``pending`` / ``factory``."""
+        return f"<{self.name}-{kind}>:"
 
     def observe(self, ctx: ObserveContext) -> "VisitorPayload | None":
         if not (self.app_module and self.registration_decorators):
@@ -378,20 +370,21 @@ class DispatchAppPlugin:
         nodes: list[SymbolNode] = []
         edges: list[tuple[SymbolNode, SymbolNode, CodeRange]] = []
 
+        app_prefix = self._prefix("app")
+        pending_prefix = self._prefix("pending")
+        factory_prefix = self._prefix("factory")
         for var_name in direct.keys() | decorated.keys():
             var_decls = decls_by_name.get(var_name, [])
             kind = direct.get(var_name)
             for var_decl in var_decls:
                 if self._factory_aware:
                     if kind is None:
-                        pending = synthetic_node(
-                            f"{self._pending_prefix}{var_decl.fqname}", ctx.path
-                        )
+                        pending = synthetic_node(f"{pending_prefix}{var_decl.fqname}", ctx.path)
                         nodes.append(pending)
                         edges.append((pending, var_decl, SYNTHETIC_POSITION))
                     elif self.instance_kinds[kind]:
                         seed = synthetic_node(
-                            f"{self._app_prefix}{var_decl.fqname}",
+                            f"{app_prefix}{var_decl.fqname}",
                             ctx.path,
                             flags=NodeFlags.ENTRYPOINT,
                         )
@@ -412,7 +405,7 @@ class DispatchAppPlugin:
         for decl_name, kinds in factory_kinds.items():
             for decl in decls_by_name.get(decl_name, []):
                 for kind in kinds:
-                    marker = synthetic_node(f"{self._factory_prefix}{kind}:{decl.fqname}", ctx.path)
+                    marker = synthetic_node(f"{factory_prefix}{kind}:{decl.fqname}", ctx.path)
                     nodes.append(marker)
                     edges.append((decl, marker, SYNTHETIC_POSITION))
 
@@ -426,7 +419,9 @@ class DispatchAppPlugin:
         app_node = require_resolved_dep(ctx, self.app_module)
         if app_node is None:
             return
-        pending_prefix = self._pending_prefix
+        app_prefix = self._prefix("app")
+        pending_prefix = self._prefix("pending")
+        factory_prefix = self._prefix("factory")
         for synth in list(ctx.package_nodes()):
             if synth.type != "synthetic" or not synth.fqname.startswith(pending_prefix):
                 continue
@@ -437,11 +432,11 @@ class DispatchAppPlugin:
                     app_node,
                     self.app_module,
                     self.instance_kinds,
-                    factory_marker_prefix=self._factory_prefix,
+                    factory_marker_prefix=factory_prefix,
                 )
                 if kind is None or not self.instance_kinds[kind]:
                     continue
-                seed = synthetic_node(f"{self._app_prefix}{var.fqname}", var.path)
+                seed = synthetic_node(f"{app_prefix}{var.fqname}", var.path)
                 yield AddNode(seed, entrypoint=True)
                 yield AddEdge(seed, var)
 
