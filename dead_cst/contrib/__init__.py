@@ -27,6 +27,7 @@ work alongside
 
 from __future__ import annotations
 
+from .celery import CeleryPlugin
 from .click import ClickPlugin
 from .cyclopts import CycloptsPlugin
 from .discordpy import DiscordPyPlugin
@@ -47,6 +48,7 @@ from .unittest import UnittestPlugin
 # finish loading ``_core`` (which is what ``uv`` actually depends on)
 # before the class itself is pulled.
 __all__ = [
+    "CeleryPlugin",
     "ClickPlugin",
     "CycloptsPlugin",
     "DiscordPyPlugin",

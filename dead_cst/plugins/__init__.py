@@ -83,6 +83,7 @@ from ._core import (
     synthetic_node,
     walk_to_instance_kind,
 )
+from ..contrib.celery import CeleryPlugin
 from ..contrib.click import ClickPlugin
 from ..contrib.cyclopts import CycloptsPlugin
 from ..contrib.discordpy import DiscordPyPlugin
@@ -114,6 +115,7 @@ BUILTIN_PLUGINS: dict[str, type] = {
     TyperPlugin.name: TyperPlugin,
     ClickPlugin.name: ClickPlugin,
     CycloptsPlugin.name: CycloptsPlugin,
+    CeleryPlugin.name: CeleryPlugin,
     DiscordPyPlugin.name: DiscordPyPlugin,
     InitSubclassPlugin.name: InitSubclassPlugin,
 }
@@ -137,6 +139,7 @@ __all__ = [
     "AddEdge",
     "AddNode",
     "BUILTIN_PLUGINS",
+    "CeleryPlugin",
     "ClickPlugin",
     "CycloptsPlugin",
     "DecoratedDeclPlugin",
