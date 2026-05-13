@@ -54,6 +54,50 @@ import pytest
             },
             id="del-does-not-remove-declaration",
         ),
+        pytest.param(
+            {
+                "mod.py": """
+                x = 1
+                def f():
+                    global x
+                    x = 2
+                f()
+                print(x)
+                """,
+            },
+            # ``global x`` means the inner ``x = 2`` writes through to
+            # the module-level binding, so the module-level ``print(x)``
+            # read at line 6 should produce ``mod -> mod.x``.
+            #
+            # Instead, two things conspire to break this:
+            #   1. ``ScopeProvider`` reports BOTH the module-level
+            #      ``x = 1`` and the inner ``x = 2`` as referents of the
+            #      outer ``print(x)`` access (libcst attaches the inner
+            #      assignment to the global scope's chain because of
+            #      ``global x``).
+            #   2. The flow filter's forward walk over the module body
+            #      treats ``def f(): ...`` as a single statement and
+            #      asks ``_referents_in(stmt)`` for any referents nested
+            #      in it -- which finds the inner ``x = 2`` and (line
+            #      151 of ``_flow.py``) replaces the live set with just
+            #      that inner assignment, killing the module-level
+            #      ``x = 1`` referent.
+            # The inner ``x = 2`` is attributed to its enclosing
+            # top-level decl ``mod.f``, so the ``print(x)`` access
+            # produces a spurious ``mod -> mod.f`` edge that collapses
+            # into the existing one from the ``f()`` call, and the real
+            # ``mod -> mod.x`` edge never gets emitted.
+            #
+            # See ``dead_cst/_flow.py``'s module docstring:
+            # ``global`` / ``nonlocal`` rebindings are explicitly listed
+            # as not-yet-modelled.
+            {
+                "mod -> mod.f",
+                "mod.f -> mod",
+                "mod.x -> mod",
+            },
+            id="global-rebind-misattributes-outer-read",
+        ),
     ],
 )
 def test_limitation(build_decl_graph, assert_edges, files, expected_edges):
