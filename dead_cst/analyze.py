@@ -141,8 +141,14 @@ def _compose_contribution(
             apply_ops(target_graph, ops)
 
 
+_NON_DECL_TYPES: frozenset[str] = frozenset({"module", "synthetic"})
+
+
 def _find_reachable(
-    graph: nx.MultiDiGraph, exclude_flags: NodeFlags = NodeFlags.NONE
+    graph: nx.MultiDiGraph,
+    exclude_flags: NodeFlags = NodeFlags.NONE,
+    *,
+    prefix: Path | None = None,
 ) -> set[SymbolNode]:
     """BFS forward from every node tagged as an entrypoint by a plugin.
 
@@ -161,6 +167,10 @@ def _find_reachable(
     here -- today's behavior, where dead-code references propagate
     liveness through the enclosing decl, is preserved. See
     :func:`_find_reachable_strict` for the variant that skips them.
+
+    ``prefix`` filters the returned set to nodes whose ``path`` lies
+    under it; the BFS still traverses the full graph, so transitive
+    reachability through nodes outside ``prefix`` is preserved.
     """
     visited: set[SymbolNode] = set()
     stack = [
@@ -174,10 +184,14 @@ def _find_reachable(
             continue
         visited.add(node)
         stack.extend(graph.successors(node))
-    return visited
+    if prefix is None:
+        return visited
+    return {n for n in visited if n.path.is_relative_to(prefix)}
 
 
-def _find_reachable_strict(graph: nx.MultiDiGraph) -> set[SymbolNode]:
+def _find_reachable_strict(
+    graph: nx.MultiDiGraph, *, prefix: Path | None = None
+) -> set[SymbolNode]:
     """Like :func:`_find_reachable` but skips ``DEAD_BRANCH``-flagged edges."""
     visited: set[SymbolNode] = set()
     stack = [n for n, attrs in graph.nodes(data=True) if attrs.get("entrypoint")]
@@ -190,10 +204,14 @@ def _find_reachable_strict(graph: nx.MultiDiGraph) -> set[SymbolNode]:
             if attrs.get("flags", EdgeFlags.NONE) & EdgeFlags.DEAD_BRANCH:
                 continue
             stack.append(succ)
-    return visited
+    if prefix is None:
+        return visited
+    return {n for n in visited if n.path.is_relative_to(prefix)}
 
 
-def _find_kept_alive_by_dead_branches(graph: nx.MultiDiGraph) -> set[SymbolNode]:
+def _find_kept_alive_by_dead_branches(
+    graph: nx.MultiDiGraph, *, prefix: Path | None = None
+) -> set[SymbolNode]:
     """Symbols kept alive only via at least one ``DEAD_BRANCH`` edge.
 
     ``_find_reachable(graph) -`` strict-mode BFS that skips every edge
@@ -203,10 +221,12 @@ def _find_kept_alive_by_dead_branches(graph: nx.MultiDiGraph) -> set[SymbolNode]
     and on :class:`PackageView` as
     :meth:`PackageView.kept_alive_by_dead_branches`.
     """
-    return _find_reachable(graph) - _find_reachable_strict(graph)
+    return _find_reachable(graph, prefix=prefix) - _find_reachable_strict(graph, prefix=prefix)
 
 
-def _find_kept_alive_by_flags_only(graph: nx.MultiDiGraph, flags: NodeFlags) -> set[SymbolNode]:
+def _find_kept_alive_by_flags_only(
+    graph: nx.MultiDiGraph, flags: NodeFlags, *, prefix: Path | None = None
+) -> set[SymbolNode]:
     """Symbols reachable only from entrypoints carrying any of ``flags``.
 
     ``_find_reachable(graph) - _find_reachable(graph, flags)``; the
@@ -214,7 +234,24 @@ def _find_kept_alive_by_flags_only(graph: nx.MultiDiGraph, flags: NodeFlags) -> 
     any of those flag bits. Surfaced on :class:`Analysis` and
     :class:`PackageView` as ``kept_alive_by_flags_only(flags)``.
     """
-    return _find_reachable(graph) - _find_reachable(graph, flags)
+    return _find_reachable(graph, prefix=prefix) - _find_reachable(graph, flags, prefix=prefix)
+
+
+def _iter_dead(graph: nx.MultiDiGraph, *, prefix: Path | None = None) -> Iterator[SymbolNode]:
+    """Yield every decl in ``graph`` no entrypoint reaches.
+
+    Excludes ``module`` and ``synthetic`` nodes (see
+    :data:`_NON_DECL_TYPES`). ``prefix`` restricts the iteration to
+    nodes whose ``path`` lies under it.
+    """
+    reachable = _find_reachable(graph)
+    for n in graph.nodes:
+        if prefix is not None and not n.path.is_relative_to(prefix):
+            continue
+        if n.type in _NON_DECL_TYPES:
+            continue
+        if n not in reachable:
+            yield n
 
 
 def _count_nodes(graph: nx.MultiDiGraph, prefix: Path | None) -> dict[str, int]:
@@ -601,13 +638,7 @@ class Analysis:
         the parent-module edge), and synthetic nodes are analyzer
         plumbing rather than user-visible decls.
         """
-        g = self.materialize_all()
-        reachable = _find_reachable(g)
-        for n in g.nodes:
-            if n.type in ("module", "synthetic"):
-                continue
-            if n not in reachable:
-                yield n
+        return _iter_dead(self.materialize_all())
 
     def kept_alive_by_dead_branches(self) -> set[SymbolNode]:
         """Symbols that would become unreachable if every dead suite were removed.
@@ -624,8 +655,7 @@ class Analysis:
         default :meth:`reachable` traversal is unchanged; this is the
         opt-in stricter pass.
         """
-        g = self.materialize_all()
-        return _find_reachable(g) - _find_reachable_strict(g)
+        return _find_kept_alive_by_dead_branches(self.materialize_all())
 
     def kept_alive_by_flags_only(self, flags: NodeFlags) -> set[SymbolNode]:
         """Symbols reachable only from entrypoints carrying any of ``flags``.
@@ -637,8 +667,7 @@ class Analysis:
         ``# noqa: F401`` pin is removed", or any OR-combination. See
         :class:`NodeFlags` for the full list.
         """
-        g = self.materialize_all()
-        return _find_kept_alive_by_flags_only(g, flags)
+        return _find_kept_alive_by_flags_only(self.materialize_all(), flags)
 
     def count_nodes(self, prefix: Path | None = None) -> dict[str, int]:
         """Count nodes in the full graph by ``SymbolNode.type``.
@@ -780,7 +809,7 @@ class PackageView:
         questions.
         """
         g = self._analysis.materialize_closure(self._package.path)
-        return {n for n in _find_reachable(g) if n.path.is_relative_to(self._package.path)}
+        return _find_reachable(g, prefix=self._package.path)
 
     def dead(self) -> Iterator[SymbolNode]:
         """Yield decls in this package not reachable from any entrypoint
@@ -791,14 +820,7 @@ class PackageView:
         ``synthetic`` nodes (see :meth:`Analysis.dead`).
         """
         g = self._analysis.materialize_closure(self._package.path)
-        reachable = _find_reachable(g)
-        for n in g.nodes:
-            if not n.path.is_relative_to(self._package.path):
-                continue
-            if n.type in ("module", "synthetic"):
-                continue
-            if n not in reachable:
-                yield n
+        return _iter_dead(g, prefix=self._package.path)
 
     def kept_alive_by_dead_branches(self) -> set[SymbolNode]:
         """Decls in this package kept alive only by dead-branch references.
@@ -807,8 +829,7 @@ class PackageView:
         filtered to nodes under :attr:`path`.
         """
         g = self._analysis.materialize_closure(self._package.path)
-        diff = _find_reachable(g) - _find_reachable_strict(g)
-        return {n for n in diff if n.path.is_relative_to(self._package.path)}
+        return _find_kept_alive_by_dead_branches(g, prefix=self._package.path)
 
     def kept_alive_by_flags_only(self, flags: NodeFlags) -> set[SymbolNode]:
         """Decls in this package kept alive only by entrypoints carrying any of ``flags``.
@@ -818,8 +839,7 @@ class PackageView:
         common flag arguments (``TESTCASE``, ``NOQA``, or both).
         """
         g = self._analysis.materialize_closure(self._package.path)
-        diff = _find_kept_alive_by_flags_only(g, flags)
-        return {n for n in diff if n.path.is_relative_to(self._package.path)}
+        return _find_kept_alive_by_flags_only(g, flags, prefix=self._package.path)
 
     def count_nodes(self) -> dict[str, int]:
         """Count nodes contributed by this package, by ``SymbolNode.type``.
