@@ -1,15 +1,8 @@
 """Jupyter ``.ipynb`` ingestion: turn a notebook into parseable Python source.
 
-A notebook is opened, its ``code`` cells concatenated in document order, and
-IPython magics / shell escapes are line-rewritten to ``pass  # <orig>`` so
-``libcst.parse_module`` accepts the result. Malformed inputs cause
-:func:`notebook_to_module` to return ``None``; the caller falls through to
-the same ``[unparseable]`` placeholder used for ``.py`` files that fail to
-parse.
-
-Notebooks are not importable modules, so every node from a notebook is
-flagged ``NOTEBOOK | ENTRYPOINT`` and kept out of the cross-module lookup
-trie via :func:`dead_cst._refresh._apply_payload`'s flag-aware skip.
+Code cells are concatenated in document order; IPython magics, shell
+escapes, and trailing-help forms are rewritten to ``pass  # <orig>`` so
+``libcst.parse_module`` accepts the result.
 """
 
 from __future__ import annotations
@@ -23,8 +16,6 @@ from libcst.helpers.module import ModuleNameAndPackage
 
 logger = logging.getLogger(__name__)
 
-NOTEBOOK_SUFFIX = ".ipynb"
-
 # ``!`` is only a shell-escape when not followed by ``=`` (so ``!= 0`` stays
 # Python). ``?`` prefix is only help-syntax when followed by an identifier.
 _LINE_MAGIC_RE = re.compile(r"^\s*(%[%A-Za-z_]|!(?!=)|\?[A-Za-z_])")
@@ -37,7 +28,7 @@ _MAGIC_TRIGGERS = ("%", "!", "?")
 
 
 def is_notebook(path: Path) -> bool:
-    return path.suffix == NOTEBOOK_SUFFIX
+    return path.suffix == ".ipynb"
 
 
 def notebook_to_module(path: Path) -> str | None:
@@ -47,12 +38,11 @@ def notebook_to_module(path: Path) -> str | None:
     ``cells`` array, or contains no usable code cells.
     """
     try:
-        raw = path.read_text()
+        with path.open() as f:
+            nb = json.load(f)
     except OSError as exc:
         logger.warning("Skipping notebook %s: could not read file: %s", path, exc)
         return None
-    try:
-        nb = json.loads(raw)
     except json.JSONDecodeError as exc:
         logger.warning("Skipping notebook %s: invalid JSON: %s", path, exc)
         return None
@@ -94,11 +84,8 @@ def _cell_source_to_text(source: object) -> str | None:
 
 
 def _strip_ipython_magics(src: str) -> str:
-    """Replace IPython magic / shell-escape / help-syntax lines with ``pass``.
-
-    A ``%%cell`` magic swallows the remainder of the cell, so every
-    subsequent line is replaced too. Line count is preserved so libcst
-    positions still map back to the original cell.
+    """A ``%%cell`` magic swallows the rest of its cell. Line count is
+    preserved so libcst positions still map back to the original cell.
     """
     out: list[str] = []
     in_cell_magic = False
@@ -131,12 +118,10 @@ _FQN_SANITIZE = re.compile(r"[^0-9A-Za-z_]")
 
 
 def notebook_fqn_entry(path: Path) -> ModuleNameAndPackage:
-    """Synthesize a per-notebook ``ModuleNameAndPackage`` from the path stem.
+    """Synthesize a ``ModuleNameAndPackage`` from a notebook path's stem.
 
-    libcst's ``gen_cache`` derives module names from filesystem layout and
-    has no concept of notebooks, so we bypass it. Notebooks never enter
-    the cross-module lookup trie, so name collisions with a real module
-    are harmless.
+    Notebooks never enter the cross-module lookup trie, so name
+    collisions with a real module are harmless.
     """
     stem = path.stem or "notebook"
     sanitized = _FQN_SANITIZE.sub("_", stem)

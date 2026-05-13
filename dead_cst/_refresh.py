@@ -114,28 +114,36 @@ def enumerate_files(
     cache: GraphCache | None,
     fingerprint: str,
 ) -> PackageFiles:
-    """Walk ``package.path``'s ``.py`` / ``.pyi`` / ``.ipynb`` tree.
+    """Walk ``package.path`` once, classifying ``.py`` / ``.pyi`` / ``.ipynb``.
 
     A ``.pyi`` whose ``.py`` twin also exists is skipped at this layer:
     ingesting both would assert in the symbol trie when they claim the
     same FQN, and dead-cst has no peer-stub linker. Orphan ``.pyi``
     (compiled-extension shape) flows through under its natural FQN.
-
-    ``.ipynb`` files flow through too. They aren't importable, so the
-    apply pass keeps them out of the cross-module lookup trie via
-    ``NodeFlags.NOTEBOOK`` (set on the visitor's ``default_flags`` in
-    :func:`_process_one_file`).
+    Notebooks aren't importable; ``_process_one_file`` stamps them with
+    ``NodeFlags.NOTEBOOK`` via the visitor's ``default_flags``.
 
     ``rglob`` matches by name, so a *directory* literally named
     ``something.py`` would otherwise sneak in and crash the visitor on
-    ``read_text``. Filter to real files defensively.
+    ``read_text``. Filter to real files defensively. One walk over the
+    tree (vs three suffix-specific globs) is the cheap path on large
+    repos where directory I/O dominates the per-name fnmatch cost.
     """
-    py_files = sorted(p for p in package.path.rglob("*.py") if p.is_file())
+    py_files: list[Path] = []
+    pyi_candidates: list[Path] = []
+    ipynb_files: list[Path] = []
+    for p in package.path.rglob("*"):
+        if not p.is_file():
+            continue
+        match p.suffix:
+            case ".py":
+                py_files.append(p)
+            case ".pyi":
+                pyi_candidates.append(p)
+            case ".ipynb":
+                ipynb_files.append(p)
     py_stems = {p.with_suffix("") for p in py_files}
-    pyi_files = (
-        p for p in package.path.rglob("*.pyi") if p.is_file() and p.with_suffix("") not in py_stems
-    )
-    ipynb_files = (p for p in package.path.rglob("*.ipynb") if p.is_file())
+    pyi_files = [p for p in pyi_candidates if p.with_suffix("") not in py_stems]
     files = tuple(sorted([*py_files, *pyi_files, *ipynb_files]))
     hits: dict[Path, VisitorPayload] = {}
     miss_files: list[Path] = []
@@ -514,10 +522,9 @@ def _unparseable_payload(
     contents are dead -- and gives downstream queries (``why-alive``,
     reports) a stable handle for "this file did not parse".
 
-    ``default_flags`` mirrors ``SymbolVisitor``'s knob: a notebook whose
-    JSON is malformed (or whose source libcst rejects) still lands a
-    module + marker pair flagged ``NOTEBOOK`` so the codemod gate and
-    trie-exclusion logic stay consistent with the parseable path.
+    ``default_flags`` mirrors ``SymbolVisitor``'s knob: an unparseable
+    notebook still lands flagged ``NOTEBOOK`` so the codemod gate and
+    trie exclusion stay consistent with the parseable path.
     """
     module_node_ = SymbolNode(
         fqname=fqn_entry.name,

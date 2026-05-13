@@ -177,9 +177,8 @@ class SymbolVisitor(cst.CSTVisitor):
         default_flags: NodeFlags = NodeFlags.NONE,
     ):
         self.path = path
-        # ORed into every emitted ``SymbolNode``'s flags. Lets callers stamp
-        # whole-file properties (e.g. notebook ingestion) without a post-pass
-        # rewrite that would have to rebuild edges/imports in lockstep.
+        # ORed into every emitted ``SymbolNode``'s flags so callers can
+        # stamp whole-file properties (notebook ingestion uses this).
         self._default_flags = default_flags
         self._unreachable_detector = (
             unreachable_detector

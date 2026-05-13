@@ -1,11 +1,4 @@
-"""End-to-end tests for Jupyter ``.ipynb`` ingestion.
-
-Notebooks are concatenated into a single Python source per file, parsed
-with libcst, and every emitted node is flagged ``NOTEBOOK | ENTRYPOINT``.
-Notebook decls stay out of the cross-module lookup trie; cross-file
-references *from* a notebook into a real package resolve normally, so
-notebooks act as reachability seeds for downstream code.
-"""
+"""End-to-end tests for Jupyter ``.ipynb`` ingestion via ``Analysis``."""
 
 from __future__ import annotations
 
