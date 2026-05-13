@@ -66,6 +66,7 @@ EXPECTED_PUBLIC_API: dict[str, list[str]] = {
         "AddEdge",
         "AddNode",
         "BUILTIN_PLUGINS",
+        "CeleryPlugin",
         "ClickPlugin",
         "CycloptsPlugin",
         "DecoratedDeclPlugin",
@@ -123,6 +124,7 @@ EXPECTED_PUBLIC_API: dict[str, list[str]] = {
         "walk_to_instance_kind",
     ],
     "dead_cst.contrib": [
+        "CeleryPlugin",
         "ClickPlugin",
         "CycloptsPlugin",
         "DiscordPyPlugin",

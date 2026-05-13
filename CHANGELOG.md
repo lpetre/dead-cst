@@ -9,6 +9,21 @@ two versions.
 
 ## [Unreleased]
 
+### Added
+- `CeleryPlugin` ships in `dead_cst.contrib.celery` and is registered
+  under the `celery` builtin name. Marks top-level `X = Celery(...)`
+  app instances as entrypoints (the Celery worker process loads
+  `module:app` by import path via `celery -A`, mirroring how
+  `FastAPIPlugin` / `FlaskPlugin` treat their app instances), wires
+  `@app.task` / `@app.task(...)` decorators on top-level functions
+  through the owning app (so a task callable lives as long as the app
+  does), supports the `def make_celery(): return Celery(...)` factory
+  shape across packages via a factory marker, and seeds module-level
+  `@shared_task` / `@shared_task(...)` decorated functions (with
+  `shared_task` imported from `celery`) as entrypoints directly --
+  `shared_task` registers into Celery's global registry and is invoked
+  by name with no owning app variable to wire through.
+
 ## [0.9.4] - 2026-05-12
 
 ### Changed
