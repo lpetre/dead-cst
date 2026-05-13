@@ -59,6 +59,7 @@ EXPECTED_PUBLIC_API: dict[str, list[str]] = {
         "EdgeFlags",
         "Import",
         "NodeFlags",
+        "SymbolGraph",
         "SymbolNode",
         "VisitorPayload",
     ],

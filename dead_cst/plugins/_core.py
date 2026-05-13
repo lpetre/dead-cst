@@ -31,11 +31,10 @@ from typing import (
 )
 
 import libcst as cst
-import networkx as nx
 from libcst.metadata import CodePosition, CodeRange
 
 from .._cacheable import Cacheable
-from ..graph import NodeFlags, SymbolNode, SymbolTrie
+from ..graph import NodeFlags, SymbolGraph, SymbolNode, SymbolTrie
 
 if TYPE_CHECKING:
     from ..graph import VisitorPayload
@@ -84,8 +83,8 @@ class PluginContext:
     the same analysis return the cached result.
     """
 
-    graph: nx.DiGraph
-    package_graph: nx.MultiDiGraph
+    graph: SymbolGraph
+    package_graph: SymbolGraph
     module_nodes: tuple[SymbolNode, ...]
     symbol_lookup: SymbolTrie
     package: Package
@@ -359,7 +358,7 @@ class EdgePlugin(Cacheable, Protocol):
     def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]: ...
 
 
-def apply_ops(graph: nx.DiGraph, ops: Iterable[GraphOp]) -> None:
+def apply_ops(graph: SymbolGraph, ops: Iterable[GraphOp]) -> None:
     for op in ops:
         match op:
             case AddNode(node, entrypoint, testcase):
@@ -711,7 +710,7 @@ def collect_module_imports(
 
 
 def walk_to_instance_kind(
-    graph: nx.DiGraph,
+    graph: SymbolGraph,
     start: SymbolNode,
     terminal: SymbolNode,
     module_name: str,

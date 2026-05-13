@@ -25,7 +25,9 @@ A `PostToolUse` hook in `.claude/settings.json` automatically runs `ruff format`
 
 ## Architecture
 
-`dead-cst` builds a symbol-level reachability graph of a Python codebase using [libcst](https://github.com/Instagram/LibCST) and [networkx](https://networkx.org/), walks from configured entrypoints, and reports (or removes) anything unreachable. The flow is staged so each stage has one job; understanding the staging is the key to navigating the code.
+`dead-cst` builds a symbol-level reachability graph of a Python codebase using [libcst](https://github.com/Instagram/LibCST) and [rustworkx](https://www.rustworkx.org/), walks from configured entrypoints, and reports (or removes) anything unreachable. The flow is staged so each stage has one job; understanding the staging is the key to navigating the code.
+
+The graph is wrapped in `dead_cst.graph.SymbolGraph`, a thin shim around `rustworkx.PyDiGraph(multigraph=True)` that owns the `SymbolNode -> int` index map and exposes a `networkx`-shaped surface (`successors`, `predecessors`, `subgraph`, `out_edges`, `nodes(data=True)`, `edges(data=True, keys=True)`, `update`, `add_edges_from`, the `graph` attribute for graph-level metadata like `dead_suites`). Domain code addresses nodes by `SymbolNode` identity; the integer index is an implementation detail. Per-node attributes (`entrypoint`, `testcase`) live in a side table on the wrapper rather than on the rustworkx payload, so the payload stays a bare `SymbolNode` and `successors` / `predecessors` return the domain object directly.
 
 ### The unified `Cacheable` contract
 
@@ -64,8 +66,8 @@ Three moving pieces — `SymbolVisitor` itself plus two of the three extension p
 
 The supported surface is whatever is re-exported from a module named without a leading `_`. The top-level `dead_cst/__init__.py` re-exports the highlights (`Analysis`, `PackageView`, `Cacheable`, the graph data types). Deeper symbols live in focused public submodules:
 
-- `dead_cst.graph` — `SymbolNode`, `Import`, `NodeFlags`, `EdgeFlags`, `VisitorPayload` (the data classes the analyzer emits and consumes).
-- `dead_cst.analyze` — `Analysis` and `PackageView`, the lazy entry-point classes; plus `GraphView`, the read-only reachability surface returned by `Analysis.preview` (and useful directly to wrap any externally-built `nx.MultiDiGraph`).
+- `dead_cst.graph` — `SymbolNode`, `Import`, `NodeFlags`, `EdgeFlags`, `VisitorPayload` (the data classes the analyzer emits and consumes), and `SymbolGraph` (the rustworkx-backed graph wrapper).
+- `dead_cst.analyze` — `Analysis` and `PackageView`, the lazy entry-point classes; plus `GraphView`, the read-only reachability surface returned by `Analysis.preview` (and useful directly to wrap any externally-built `SymbolGraph`).
 - `dead_cst.codemod` — the LibCST source rewriter.
 - `dead_cst.cache` — `GraphCache`, `compute_fingerprint`, schema/dirname constants.
 - `dead_cst.branches` — `UnreachableRegionDetector`, `DefaultUnreachableRegionDetector`, `TruthinessResolver` (with `evaluate` for truthiness and `resolve_constant` for the underlying literal value), `Const` / `ConstValue` (the wrapper that distinguishes a proved-`None` literal from "unknown"), plus the truthiness helpers (`evaluate_truthiness`, `unreachable_suites`, `unreachable_bodies`) a from-scratch detector needs.

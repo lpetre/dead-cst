@@ -10,6 +10,22 @@ two versions.
 ## [Unreleased]
 
 ### Changed
+- **BREAKING.** The graph backend swapped from `networkx` to
+  `rustworkx`. A new `dead_cst.graph.SymbolGraph` wrapper owns a
+  `rustworkx.PyDiGraph(multigraph=True)` plus the `SymbolNode -> int`
+  index map; it exposes the `networkx`-style surface the analyzer
+  relied on (`successors`, `predecessors`, `subgraph`, `out_edges`,
+  `nodes(data=True)`, `edges(data=True, keys=True)`, `update`,
+  `add_edges_from`, the `graph` attribute for graph-level metadata)
+  so call sites read naturally. `Analysis.graph`,
+  `PackageView.graph`, `GraphView.graph`, and `PluginContext.graph` /
+  `package_graph` now all return / accept `SymbolGraph` rather than
+  `networkx.MultiDiGraph`; out-of-tree code that constructed graphs
+  manually has to swap `nx.MultiDiGraph()` for `SymbolGraph()`. The
+  per-file `VisitorPayload` cache shape is unchanged, so no
+  invalidation is required. `networkx` is no longer a runtime
+  dependency (kept in the dev group for test fixtures that exercise
+  external-dist resolution against a recognizable third-party name).
 - `DispatchAppPlugin` (in `dead_cst.plugins.decl_shapes`) is now the
   shared base for `FlaskPlugin`, `FastAPIPlugin`, and `CeleryPlugin` in
   addition to `TyperPlugin` / `CycloptsPlugin`. The base learned an

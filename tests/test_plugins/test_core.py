@@ -7,11 +7,11 @@ from __future__ import annotations
 from pathlib import Path
 
 import libcst as cst
-import networkx as nx
 import pytest
 from libcst.metadata import CodePosition, CodeRange
 
 from dead_cst.analyze import _find_reachable as find_reachable
+from dead_cst.graph import SymbolGraph, SymbolNode, SymbolTrie
 from dead_cst.plugins import MainBlockPlugin, ProjectScriptsPlugin
 from dead_cst.plugins._core import (
     AddEdge,
@@ -27,7 +27,6 @@ from dead_cst.plugins._core import (
     matched_attr_call,
     single_target_assignment,
 )
-from dead_cst.graph import SymbolNode, SymbolTrie
 from dead_cst.resolvers import Package
 
 
@@ -73,7 +72,7 @@ def test_unknown_plugin_raises():
 
 def _ctx_with_synthetic(fqname: str, base: Path) -> PluginContext:
     """Build a minimal PluginContext containing a single synthetic node."""
-    graph = nx.DiGraph()
+    graph = SymbolGraph()
     node = SymbolNode(
         fqname=fqname,
         type="synthetic",
@@ -81,7 +80,7 @@ def _ctx_with_synthetic(fqname: str, base: Path) -> PluginContext:
         position=CodeRange(start=CodePosition(0, 0), end=CodePosition(0, 0)),
     )
     graph.add_node(node)
-    package_graph = nx.MultiDiGraph()
+    package_graph = SymbolGraph()
     package_graph.add_node(node)
     return PluginContext(
         graph=graph,
@@ -370,11 +369,11 @@ def test_plugin_context_package_modules_yields_modules_only(tmp_path):
     mod = SymbolNode("pkg.a", "module", tmp_path / "a.py", _pos())
 
     ctx = PluginContext(
-        graph=nx.DiGraph(),
+        graph=SymbolGraph(),
         symbol_lookup=SymbolTrie(),
         package=pkg,
         project_root=tmp_path,
-        package_graph=nx.MultiDiGraph(),
+        package_graph=SymbolGraph(),
         module_nodes=(mod,),
     )
     assert list(ctx.package_modules()) == [(mod.path, mod)]
@@ -385,12 +384,12 @@ def test_plugin_context_package_nodes_snapshots_first_scan(tmp_path):
     pkg = Package(path=tmp_path, name="pkg")
     mod = SymbolNode("pkg", "module", tmp_path / "__init__.py", _pos())
     fn = SymbolNode("pkg.f", "function", tmp_path / "a.py", _pos())
-    package_graph = nx.MultiDiGraph()
+    package_graph = SymbolGraph()
     package_graph.add_node(mod)
     package_graph.add_node(fn)
 
     ctx = PluginContext(
-        graph=nx.DiGraph(),
+        graph=SymbolGraph(),
         symbol_lookup=SymbolTrie(),
         package=pkg,
         project_root=tmp_path,

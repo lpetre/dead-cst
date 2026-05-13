@@ -270,12 +270,12 @@ def test_dead_real_filters_synthetic_nodes():
     """Synthetic nodes (entrypoint sentinels, external markers) are
     excluded from the dead-symbol report so we don't surface them
     alongside user-visible declarations."""
-    import networkx as nx
+    from dead_cst.graph import SymbolGraph
 
     real = SymbolNode("pkg.f", "function", Path("/a.py"), _pos())
     entrypoint_synth = SymbolNode(f"{EXPLICIT_PREFIX}pkg.f", "synthetic", Path("/a.py"), _pos())
 
-    g = nx.MultiDiGraph()
+    g = SymbolGraph()
     for n in (real, entrypoint_synth):
         g.add_node(n)
 
@@ -283,9 +283,9 @@ def test_dead_real_filters_synthetic_nodes():
 
 
 def test_dead_real_empty_graph_returns_empty_list():
-    import networkx as nx
+    from dead_cst.graph import SymbolGraph
 
-    assert _dead_real(nx.MultiDiGraph()) == []
+    assert _dead_real(SymbolGraph()) == []
 
 
 # ---------------------------------------------------------------------------

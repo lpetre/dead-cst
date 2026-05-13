@@ -107,7 +107,7 @@ def test_dead_overloads_are_removed_with_impl(tmp_path, make_analysis):
         if node.fqname == "mod.keep":
             graph.nodes[node]["entrypoint"] = True
     reachable = find_reachable(graph)
-    unreachable = graph.subgraph([n for n in graph.nodes if n not in reachable]).copy()
+    unreachable = graph.subgraph([n for n in graph.nodes if n not in reachable])
     remove_code(unreachable, tmp_path)
 
     rewritten = (tmp_path / "mod.py").read_text()
@@ -135,7 +135,7 @@ def test_live_overloads_survive_codemod(tmp_path, make_analysis):
     a = make_analysis(plugins=[ExplicitEntrypointPlugin(specs=["mod.f"])])
     graph = a.materialize_all()
     reachable = find_reachable(graph)
-    unreachable = graph.subgraph([n for n in graph.nodes if n not in reachable]).copy()
+    unreachable = graph.subgraph([n for n in graph.nodes if n not in reachable])
     remove_code(unreachable, tmp_path)
 
     rewritten = (tmp_path / "mod.py").read_text()

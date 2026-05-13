@@ -31,7 +31,6 @@ from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
 import libcst as cst
-import networkx as nx
 from libcst.helpers.module import ModuleNameAndPackage
 from libcst.metadata import CodeRange, MetadataWrapper
 
@@ -41,7 +40,15 @@ from ._progress import progress
 from ._visitor import SymbolVisitor
 from .branches import UnreachableRegionDetector
 from .cache import GraphCache
-from .graph import EdgeFlags, Import, NodeFlags, SymbolNode, SymbolTrie, VisitorPayload
+from .graph import (
+    EdgeFlags,
+    Import,
+    NodeFlags,
+    SymbolGraph,
+    SymbolNode,
+    SymbolTrie,
+    VisitorPayload,
+)
 from .plugins import EdgePlugin, ObserveContext
 from .plugins._core import (
     SYNTHETIC_POSITION,
@@ -104,7 +111,7 @@ class PackageContribution:
     package: Package
     current_trie: SymbolTrie
     export_trie: SymbolTrie
-    package_graph: nx.MultiDiGraph
+    package_graph: SymbolGraph
     import_edges: frozenset[tuple[SymbolNode, Import, EdgeFlags]]
     module_nodes: tuple[SymbolNode, ...]
 
@@ -341,7 +348,7 @@ def build_contribution(
     Hits come straight from :class:`PackageFiles`; the rest are looked
     up in the global ``miss_payloads`` map produced by
     :func:`process_stale_files`. The package-local
-    :class:`nx.MultiDiGraph` is what makes scope-bounded materialization
+    :class:`SymbolGraph` is what makes scope-bounded materialization
     cheap: composing it into the full graph or a closure graph doesn't
     redo per-file apply work. Empty :attr:`Package.exported` means
     "no restriction" (every file in the package is exported to consumers).
@@ -356,7 +363,7 @@ def build_contribution(
     export_trie = SymbolTrie()
     exported = package.exported
     import_edges: set[tuple[SymbolNode, Import, EdgeFlags]] = set()
-    package_graph: nx.MultiDiGraph = nx.MultiDiGraph()
+    package_graph: SymbolGraph = SymbolGraph()
     package_graph.graph["dead_suites"] = {}
     module_nodes: list[SymbolNode] = []
     shadowed = shadowed_paths(package_files.files)
@@ -628,7 +635,7 @@ def _apply_payload(
     export_trie: SymbolTrie,
     file_exported: bool,
     add_to_trie: bool,
-    symbol_graph: nx.MultiDiGraph,
+    symbol_graph: SymbolGraph,
     import_edges: set[tuple[SymbolNode, Import, EdgeFlags]],
 ) -> SymbolNode:
     """Emit ``payload`` into the in-progress per-package structures.

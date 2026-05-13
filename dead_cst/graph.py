@@ -16,11 +16,12 @@ from __future__ import annotations
 
 import enum
 import logging
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
-import networkx as nx
+import rustworkx as rx
 from libcst.metadata import CodeRange
 
 logger = logging.getLogger(__name__)
@@ -307,7 +308,7 @@ class SymbolTrie:
                 return None
         return node
 
-    def add_module_hierarchy_edges(self, symbol_graph: nx.DiGraph) -> None:
+    def add_module_hierarchy_edges(self, symbol_graph: SymbolGraph) -> None:
         """
         Walk the trie and add edges from each submodule to its parent module.
 
@@ -340,6 +341,258 @@ class SymbolTrie:
         _walk_and_add_edges(self, None)
 
 
+class _NodesView:
+    """View over :class:`SymbolGraph`'s nodes.
+
+    Iterable (yields :class:`SymbolNode`), indexable
+    (``view[node]`` returns the node's mutable attribute dict, creating
+    it on first access), callable (``view(data=True)`` yields
+    ``(node, attrs)`` pairs). Mirrors ``networkx``'s ``NodeView`` for
+    the patterns the analyzer relies on.
+    """
+
+    __slots__ = ("_graph",)
+
+    def __init__(self, graph: SymbolGraph) -> None:
+        self._graph = graph
+
+    def __iter__(self) -> Iterator[SymbolNode]:
+        g = self._graph._g
+        for idx in g.node_indices():
+            yield g[idx]
+
+    def __len__(self) -> int:
+        return self._graph._g.num_nodes()
+
+    def __contains__(self, node: object) -> bool:
+        return node in self._graph._idx
+
+    def __getitem__(self, node: SymbolNode) -> dict[str, Any]:
+        idx = self._graph._idx[node]
+        attrs = self._graph._node_attrs.get(idx)
+        if attrs is None:
+            attrs = {}
+            self._graph._node_attrs[idx] = attrs
+        return attrs
+
+    def __call__(self, *, data: bool = False) -> Iterator[Any]:
+        g = self._graph._g
+        node_attrs = self._graph._node_attrs
+        if data:
+            for idx in g.node_indices():
+                yield g[idx], node_attrs.get(idx, _EMPTY_ATTRS)
+        else:
+            for idx in g.node_indices():
+                yield g[idx]
+
+
+class _EdgesView:
+    """View over :class:`SymbolGraph`'s edges.
+
+    Callable: ``view()`` / ``view(data=True)`` / ``view(keys=True)`` /
+    ``view(data=True, keys=True)`` yield 2-, 3-, 3-, or 4-tuples
+    respectively, one entry per edge instance (parallel edges are not
+    deduped, matching ``networkx.MultiDiGraph``).
+    """
+
+    __slots__ = ("_graph",)
+
+    def __init__(self, graph: SymbolGraph) -> None:
+        self._graph = graph
+
+    def __call__(self, *, data: bool = False, keys: bool = False) -> Iterator[Any]:
+        g = self._graph._g
+        if data and keys:
+            for edge_idx, (u_idx, v_idx, payload) in g.edge_index_map().items():
+                yield g[u_idx], g[v_idx], edge_idx, payload
+        elif data:
+            for u_idx, v_idx, payload in g.weighted_edge_list():
+                yield g[u_idx], g[v_idx], payload
+        elif keys:
+            for edge_idx, (u_idx, v_idx, _payload) in g.edge_index_map().items():
+                yield g[u_idx], g[v_idx], edge_idx
+        else:
+            for u_idx, v_idx in g.edge_list():
+                yield g[u_idx], g[v_idx]
+
+
+# Shared sentinel for ``nodes(data=True)`` on un-attributed nodes. The
+# default dict has to be read-only at the call site -- callers either
+# query ``.get("entrypoint")`` (safe) or use ``nodes[node]["..."] = ...``
+# which routes through :meth:`_NodesView.__getitem__` and materializes
+# a fresh dict.
+_EMPTY_ATTRS: dict[str, Any] = {}
+
+
+class SymbolGraph:
+    """The analyzer's directed multigraph of symbol references.
+
+    Backed by :class:`rustworkx.PyDiGraph` with ``multigraph=True``;
+    nodes are :class:`SymbolNode` instances, edges carry an attribute
+    dict (typically ``{"flags": EdgeFlags}``). The wrapper owns the
+    ``SymbolNode -> int`` index map so callers continue to address
+    nodes by their domain identity while rustworkx operates on
+    integer indices internally.
+
+    Exposes the ``networkx``-style surface the analyzer relies on
+    (``successors``, ``predecessors``, ``subgraph``, ``out_edges``,
+    ``nodes(data=True)``, ``edges(data=True, keys=True)``, the
+    ``graph`` attribute for graph-level metadata, etc.) so call sites
+    read naturally. Two methods deserve note:
+
+    * :meth:`subgraph` returns a fresh :class:`SymbolGraph` (rather
+      than a view) containing the induced subgraph; cheap to build
+      because the wrapper is thin.
+    * :meth:`update` merges nodes + edges from another graph -- the
+      composition primitive used to fold per-package graphs into the
+      full / closure graph.
+
+    Node attributes (``entrypoint``, ``testcase``) live in a side
+    table rather than on the rustworkx payload, so the payload stays
+    a bare :class:`SymbolNode` (which keeps ``successors`` /
+    ``predecessors`` returning the domain object directly).
+    """
+
+    __slots__ = ("_g", "_idx", "_node_attrs", "graph")
+
+    def __init__(self) -> None:
+        self._g: rx.PyDiGraph = rx.PyDiGraph(multigraph=True)
+        self._idx: dict[SymbolNode, int] = {}
+        self._node_attrs: dict[int, dict[str, Any]] = {}
+        # ``graph`` is the networkx convention for graph-level
+        # attributes (``g.graph["dead_suites"]`` etc.). We mirror it.
+        self.graph: dict[str, Any] = {}
+
+    @property
+    def nodes(self) -> _NodesView:
+        return _NodesView(self)
+
+    @property
+    def edges(self) -> _EdgesView:
+        return _EdgesView(self)
+
+    def add_node(self, node: SymbolNode) -> int:
+        """Idempotent: returns the existing index if ``node`` is already in the graph."""
+        idx = self._idx.get(node)
+        if idx is None:
+            idx = self._g.add_node(node)
+            self._idx[node] = idx
+        return idx
+
+    def add_edge(self, src: SymbolNode, dst: SymbolNode, **attrs: Any) -> None:
+        s = self.add_node(src)
+        d = self.add_node(dst)
+        self._g.add_edge(s, d, dict(attrs))
+
+    def add_edges_from(
+        self, edges: Iterable[tuple[SymbolNode, SymbolNode, dict[str, Any]]]
+    ) -> None:
+        """Bulk-add ``(src, dst, attrs)`` triples. ``attrs`` is the edge payload dict."""
+        for src, dst, payload in edges:
+            s = self.add_node(src)
+            d = self.add_node(dst)
+            self._g.add_edge(s, d, payload)
+
+    def has_edge(self, src: SymbolNode, dst: SymbolNode) -> bool:
+        s = self._idx.get(src)
+        d = self._idx.get(dst)
+        if s is None or d is None:
+            return False
+        return self._g.has_edge(s, d)
+
+    def remove_edge(self, src: SymbolNode, dst: SymbolNode) -> None:
+        """Remove a single edge ``src -> dst``. Matches ``MultiDiGraph.remove_edge``."""
+        self._g.remove_edge(self._idx[src], self._idx[dst])
+
+    def successors(self, node: SymbolNode) -> Iterator[SymbolNode]:
+        idx = self._idx.get(node)
+        if idx is None:
+            return iter(())
+        return iter(self._g.successors(idx))
+
+    def predecessors(self, node: SymbolNode) -> Iterator[SymbolNode]:
+        idx = self._idx.get(node)
+        if idx is None:
+            return iter(())
+        return iter(self._g.predecessors(idx))
+
+    def out_edges(self, node: SymbolNode, *, data: bool = False) -> Iterator[Any]:
+        idx = self._idx.get(node)
+        if idx is None:
+            return
+        g = self._g
+        if data:
+            for u_idx, v_idx, payload in g.out_edges(idx):
+                yield g[u_idx], g[v_idx], payload
+        else:
+            for u_idx, v_idx, _payload in g.out_edges(idx):
+                yield g[u_idx], g[v_idx]
+
+    def in_degree(self, node: SymbolNode) -> int:
+        idx = self._idx.get(node)
+        if idx is None:
+            return 0
+        return self._g.in_degree(idx)
+
+    def number_of_nodes(self) -> int:
+        return self._g.num_nodes()
+
+    def subgraph(self, nodes: Iterable[SymbolNode]) -> SymbolGraph:
+        """Induced subgraph over ``nodes``: includes every edge whose
+        endpoints both survive the filter. Returns a fresh
+        :class:`SymbolGraph`; not a view."""
+        sub = SymbolGraph()
+        sub.graph = dict(self.graph)
+        selected: list[tuple[SymbolNode, int]] = []
+        for n in nodes:
+            old_idx = self._idx.get(n)
+            if old_idx is None:
+                continue
+            new_idx = sub.add_node(n)
+            attrs = self._node_attrs.get(old_idx)
+            if attrs:
+                sub._node_attrs[new_idx] = dict(attrs)
+            selected.append((n, old_idx))
+        for n, old_idx in selected:
+            new_src = sub._idx[n]
+            for _u_idx, v_idx, payload in self._g.out_edges(old_idx):
+                dst = self._g[v_idx]
+                new_dst = sub._idx.get(dst)
+                if new_dst is not None:
+                    sub._g.add_edge(new_src, new_dst, payload)
+        return sub
+
+    def update(
+        self,
+        *,
+        edges: Iterable[tuple] | None = None,
+        nodes: Iterable[tuple[SymbolNode, dict[str, Any]]] | None = None,
+    ) -> None:
+        """Merge ``nodes`` and ``edges`` from another graph into this one.
+
+        ``nodes`` is an iterable of ``(node, attrs_dict)`` (the shape
+        :meth:`nodes` returns under ``data=True``). ``edges`` may be
+        ``(u, v, attrs)`` triples or ``(u, v, key, attrs)`` 4-tuples
+        (the shape :meth:`edges` returns under ``keys=True, data=True``;
+        the key is discarded because it has no meaning in the target
+        graph)."""
+        if nodes is not None:
+            for n, attrs in nodes:
+                idx = self.add_node(n)
+                if attrs:
+                    bucket = self._node_attrs.setdefault(idx, {})
+                    bucket.update(attrs)
+        if edges is not None:
+            for entry in edges:
+                if len(entry) == 4:
+                    u, v, _key, payload = entry
+                else:
+                    u, v, payload = entry
+                s = self.add_node(u)
+                d = self.add_node(v)
+                self._g.add_edge(s, d, payload if isinstance(payload, dict) else {})
+
+
 # ``SymbolTrie`` is intentionally absent from ``__all__`` -- it's an
 # internal data structure shared between the visitor, edge stitcher, and
 # plugin context, but not part of the public surface.
@@ -347,6 +600,7 @@ __all__ = [
     "EdgeFlags",
     "Import",
     "NodeFlags",
+    "SymbolGraph",
     "SymbolNode",
     "VisitorPayload",
 ]

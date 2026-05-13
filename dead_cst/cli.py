@@ -11,7 +11,6 @@ from enum import Enum
 from pathlib import Path
 from typing import Annotated, Iterator, Sequence
 
-import networkx as nx
 import typer
 from libcst.metadata import CodeRange
 
@@ -22,7 +21,7 @@ from .cache import (
     default_cache_path,
 )
 from .codemod import generate_patch
-from .graph import SymbolNode
+from .graph import SymbolGraph, SymbolNode
 from .plugins import (
     EXTERNAL_PREFIXES,
     EdgePlugin,
@@ -226,8 +225,8 @@ def analyze(
 
 
 def _output_text(
-    graph: nx.MultiDiGraph,
-    unreachable: nx.MultiDiGraph,
+    graph: SymbolGraph,
+    unreachable: SymbolGraph,
     root: Path,
     package_paths: Sequence[Path],
 ) -> None:
@@ -267,7 +266,7 @@ def _output_text(
             typer.echo(f"  {rel}:{start.line}:{start.column}-{end.line}:{end.column}")
 
 
-def _dead_real(unreachable: nx.MultiDiGraph) -> list[SymbolNode]:
+def _dead_real(unreachable: SymbolGraph) -> list[SymbolNode]:
     """Return real (non-synthetic) dead nodes from ``unreachable``.
 
     Synthetic nodes -- entrypoint sentinels, external-dist markers,
@@ -278,7 +277,7 @@ def _dead_real(unreachable: nx.MultiDiGraph) -> list[SymbolNode]:
 
 
 def _dead_suite_locations(
-    graph: nx.MultiDiGraph, package_paths: Sequence[Path]
+    graph: SymbolGraph, package_paths: Sequence[Path]
 ) -> list[tuple[Path, CodeRange]]:
     """Flatten ``graph.graph["dead_suites"]`` into a sorted ``(path, pos)`` list.
 
@@ -298,8 +297,8 @@ def _dead_suite_locations(
 
 
 def _output_json(
-    graph: nx.MultiDiGraph,
-    unreachable: nx.MultiDiGraph,
+    graph: SymbolGraph,
+    unreachable: SymbolGraph,
     root: Path,
     package_paths: Sequence[Path],
 ) -> None:

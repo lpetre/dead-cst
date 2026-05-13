@@ -188,9 +188,9 @@ print(sum(1 for _ in pkg.modules()), "modules")
 pkg.remove_dead_code()  # codemod, scoped to this package
 ```
 
-For non-destructive review, `dead_cst.codemod.generate_patch(G, root)` returns the same removal as a `git apply`-compatible unified diff. Selection is driven entirely by `G.nodes`, so you can pass any subgraph slice — e.g. one [strongly-connected component](https://networkx.org/documentation/stable/reference/algorithms/generated/networkx.algorithms.components.strongly_connected_components.html) at a time — to review a large codebase as a series of focused patches.
+For non-destructive review, `dead_cst.codemod.generate_patch(G, root)` returns the same removal as a `git apply`-compatible unified diff. Selection is driven entirely by `G.nodes`, so you can pass any subgraph slice — e.g. one strongly-connected component at a time — to review a large codebase as a series of focused patches.
 
-`Analysis(...).materialize_all()` returns the full `networkx.MultiDiGraph` if you need raw access; `analysis.package(path).graph()` returns the closure-scoped subgraph for one package.
+`Analysis(...).materialize_all()` returns the full `dead_cst.graph.SymbolGraph` (a thin wrapper around `rustworkx.PyDiGraph(multigraph=True)` exposing a `networkx`-shaped surface) if you need raw access; `analysis.package(path).graph()` returns the closure-scoped subgraph for one package.
 
 Edge plugins and the unreachable-region detector share a single `Cacheable` protocol (`name: str`, `version: int`). The core `SymbolVisitor` carries the same pair, so visitor-level changes get an explicit knob too. The visitor / plugin / detector triple feeds the per-file cache fingerprint — bumping any of those `version`s invalidates stale payloads automatically. Path resolvers do **not** implement `Cacheable`: their output flows through the (uncached) edge-stitching pass, so swapping or upgrading a resolver re-stitches edges without invalidating cached payloads (and there is no version to bump). The package `__version__` is intentionally *not* in the fingerprint: every component whose output can shift between releases owns a dedicated `version`, and folding in `__version__` would let unbumped components ride for free on a release bump.
 

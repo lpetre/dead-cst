@@ -18,15 +18,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import networkx as nx
-
 from dead_cst.analyze import (
     _find_kept_alive_by_dead_branches as find_kept_alive_by_dead_branches,
     _find_reachable as find_reachable,
 )
+from dead_cst.graph import SymbolGraph
 
 
-def _dead_suite_positions(graph: nx.MultiDiGraph, file: Path) -> tuple:
+def _dead_suite_positions(graph: SymbolGraph, file: Path) -> tuple:
     return graph.graph.get("dead_suites", {}).get(file, ())
 
 
