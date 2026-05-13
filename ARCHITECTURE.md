@@ -75,14 +75,19 @@ Four moving parts satisfy `Cacheable` (`dead_cst/_cacheable.py`) — just
 | `UnreachableRegionDetector`  | `dead_cst/branches.py`      | yes                 |
 | `PathResolver`               | `dead_cst/resolvers/`       | **no**              |
 
-Only the visitor / plugin / detector triple feeds `compute_fingerprint`
-(`dead_cst/cache.py`); resolver and package-layout swaps re-stitch edges
-through the (uncached) stage 5 pass instead of invalidating the per-file
-cache. `version` is a Unix epoch int *by convention* — concurrent bumps
-on different branches merge with `max()`-wins semantics rather than
+The visitor / plugin / detector triple plus the package's `exported`
+subdirs (canonicalized relative to `package.path` for cross-machine
+portability) feed `compute_fingerprint` (`dead_cst/cache.py`).
+`Package.exported` enters because it stamps `NodeFlags.EXPORTED` onto
+every node via the visitor's `default_flags`, so editing it changes
+the cached payload; resolver swaps, `search_paths`, and
+`Package.path` / `name` / `deps` re-stitch edges through the
+(uncached) stage 5 pass instead of invalidating the per-file cache.
+`version` is a Unix epoch int *by convention* — concurrent bumps on
+different branches merge with `max()`-wins semantics rather than
 colliding on a re-used label. The package `__version__` is **not** in
-the fingerprint: every component whose output can shift between releases
-owns its own knob.
+the fingerprint: every component whose output can shift between
+releases owns its own knob.
 
 ## The pipeline, top-down
 
@@ -176,17 +181,22 @@ resolve_expr=...)` once per file and pass `resolver.evaluate` as the
 
 SQLite-backed `GraphCache` at `<root>/.dead-cst-cache/cache.db` stores
 pickled per-file payloads keyed by file SHA-256. Each row carries a
-single analysis-wide fingerprint over Python version, schema version,
-and every visitor / plugin / detector `(name, version)` pair.
+per-package fingerprint over Python version, schema version, every
+visitor / plugin / detector `(name, version)` pair, and the package's
+`exported` setting (canonicalized relative to `package.path`).
+`Package.exported` enters because it feeds `NodeFlags.EXPORTED` into
+every node via the visitor's `default_flags`; editing it invalidates
+only the affected package's rows.
 
 A cache row covers both the visitor's payload **and** every plugin's
 `observe()` output for that file — warm runs skip both. Bypass with
 `--no-cache`; force-clear with `dead-cst cache clear`.
 
 The orchestration around this stage — file enumeration, stale detection,
-the parallel worker pool, payload application into the per-package
-contribution — lives in `dead_cst/_refresh.py` so `analyze.py` can stay
-focused on cross-package composition. File enumeration walks the tree
+the parallel worker pool — lives in `dead_cst/_refresh.py`; the
+per-package apply step (`PackageContribution`, `build_contribution`,
+`_apply_payload`, `eclipsed_paths`) lives in `dead_cst/_package.py`
+so `analyze.py` can stay focused on cross-package composition. File enumeration walks the tree
 once via `Path.rglob("*")` and dispatches by suffix into `.py` /
 `.pyi` / `.ipynb` buckets — directory I/O dominates the per-name
 fnmatch cost on large repos, so one walk beats three suffix-specific
@@ -286,8 +296,9 @@ Two phases per `EdgePlugin`:
   `AddNode` / `AddEdge` / `RemoveEdge` ops.
 
 `PluginContext` provides helpers (`find_module`, `find_declarations`,
-`module_surface`, `package_modules`, `package_nodes`, `importers`, …)
-and exposes the current `Package` via `ctx.package`.
+`module_surface`, `importers`, …), exposes the current `Package` via
+`ctx.package`, and yields the package's nodes via the
+`ctx.package_nodes: frozenset[SymbolNode]` field.
 
 Builtins ship in `BUILTIN_PLUGINS`. Generic-Python plugins live as
 siblings of `plugins/__init__.py` (`MainBlockPlugin`,
@@ -363,9 +374,11 @@ stages happen on demand:
    into one global stale-file list, and runs the visitor + observe
    pass once across the whole batch.
 2. **Per-package contribution build** — the per-package
-   `SymbolTrie` + a package-local graph slice + the unresolved
-   cross-file import set. Built once per package from the payloads
-   above, memoized for the lifetime of the `Analysis`.
+   `SymbolTrie` + raw `frozenset[SymbolNode]` / `frozenset[(src, dst,
+   EdgeFlags)]` / `Mapping[Path, tuple[CodeRange, ...]]` (dead-suite
+   positions) + the unresolved cross-file import set. Built once per
+   package from the payloads above by `dead_cst._package.build_contribution`,
+   memoized for the lifetime of the `Analysis`.
 3. **Cross-package composition** — `materialize_all()` (every package)
    or `materialize_closure(package)` (the "interesting set" of one
    package — the forward dep closure of that package's reverse-consumer
@@ -373,7 +386,7 @@ stages happen on demand:
    payloads, so warm per-package queries stay fast.
 
 Per-package queries that don't need the assembled graph
-(`PackageView.modules` / `PackageView.declarations`) skip stage 3
+(`PackageView.declarations` / `PackageView.count_nodes`) skip stage 3
 entirely.
 
 ## Graph model invariants
@@ -420,13 +433,23 @@ entirely.
   keeps the decl out of the cross-module lookup trie alongside
   `SHADOWED` / `OVERLOAD`. The codemod skips any node flagged
   `NOTEBOOK`.
-* A `foo.py` next to a `foo/__init__.py` is shadowed by the package
-  (mirroring CPython's `FileFinder`). `_refresh.shadowed_paths` flags
+* A `foo.py` next to a `foo/__init__.py` is **eclipsed** by the package
+  (mirroring CPython's `FileFinder`). `_package.eclipsed_paths` flags
   the `.py` before `_apply_payload` runs, and the apply pass skips its
-  trie additions only — its nodes still land in the graph so
+  trie additions only — its nodes still land in the contribution so
   observe-time entrypoints (`__main__`, plugin synthetics) keep
   working, but cross-module imports of `pkg.foo` route to the
-  package's `__init__.py` alone.
+  package's `__init__.py` alone. Disambiguates from
+  `NodeFlags.SHADOWED` (intra-file decl rebinding) and the `.pyi`
+  peer-stub filter.
+* `NodeFlags.EXPORTED` tags every node from a file under
+  `Package.exported`. The visitor's `default_flags` mechanism stamps
+  it at construction; the single per-package lookup trie holds every
+  visible decl, and consumer-side merges use `SymbolTrie.merge_exported`
+  to filter to entries with this bit set (the package's own self-lookup
+  uses plain `merge` and sees everything). `Package.exported` is in
+  the per-package fingerprint, so editing it invalidates that
+  package's cache.
 * `[unparseable] <module>` synthetics stand in for files `libcst`
   cannot parse. They carry `NodeFlags.ENTRYPOINT` and edge at the real
   module node, so the file stays alive even though its decls are

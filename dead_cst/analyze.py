@@ -315,7 +315,7 @@ class Analysis:
        a decl in the target package alive.
 
     The lazy split lets cheap per-package queries skip stage 3 entirely:
-    :meth:`PackageView.modules` and :meth:`PackageView.declarations`
+    :meth:`PackageView.declarations` and :meth:`PackageView.count_nodes`
     only need stage 2 for their own package. Reachability queries
     (:meth:`PackageView.dead`, :meth:`Analysis.dead`) trigger stage 3
     over the appropriate scope -- the "interesting set" for a single
@@ -683,7 +683,7 @@ class PackageView:
 
     Cheap to construct (returned by :meth:`Analysis.package`); query
     methods trigger only the work their result depends on. Local
-    queries (:meth:`modules`, :meth:`declarations`) only need this
+    queries (:meth:`declarations`, :meth:`count_nodes`) only need this
     package's contribution. Cross-package queries (:meth:`importers_of`,
     :meth:`dead`, :meth:`graph`) materialize the
     :meth:`Analysis._interesting_set` for this package.
