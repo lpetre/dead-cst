@@ -12,10 +12,9 @@ import pstats
 import time
 from pathlib import Path
 
+from dead_cst._package import PackageContribution, build_contribution
 from dead_cst._refresh import (
-    PackageContribution,
     PackageFiles,
-    build_contribution,
     build_stale_tasks,
     process_stale_files,
 )

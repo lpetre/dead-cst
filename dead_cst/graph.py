@@ -221,7 +221,7 @@ class SymbolTrie:
 
         Module-FQN collisions across files (``foo.py`` alongside
         ``foo/__init__.py``) are resolved upstream by
-        :func:`dead_cst._refresh.shadowed_paths`: the loser's payload is
+        :func:`dead_cst._package.shadowed_paths`: the loser's payload is
         applied to the graph but skipped at the trie, so this method
         never sees two ``module`` decls at the same node.
         """

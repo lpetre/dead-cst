@@ -10,10 +10,9 @@ from typing import Iterable, Iterator, Mapping, Sequence
 import networkx as nx
 
 from ._edges import resolve_edges
+from ._package import PackageContribution, build_contribution
 from ._refresh import (
-    PackageContribution,
     PackageFiles,
-    build_contribution,
     build_stale_tasks,
     enumerate_files,
     process_stale_files,
