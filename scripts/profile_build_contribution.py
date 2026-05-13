@@ -12,6 +12,8 @@ import pstats
 import time
 from pathlib import Path
 
+import networkx as nx
+
 from dead_cst._package import PackageContribution, build_contribution
 from dead_cst._refresh import (
     PackageFiles,
@@ -104,50 +106,27 @@ def main() -> None:
 
 
 def _profile_package_nodes(contrib: PackageContribution, project_root: Path) -> None:
-    """Benchmark :meth:`PluginContext.package_nodes`."""
-    graph = contrib.package_graph
-    n_total = graph.number_of_nodes()
-    print(f"\npackage_nodes: package graph has {n_total} node(s)")
+    """Benchmark :attr:`PluginContext.package_nodes` and :meth:`package_modules`."""
+    n_total = len(contrib.nodes)
+    print(f"\npackage_nodes: contribution has {n_total} node(s)")
 
     def _make_ctx() -> PluginContext:
         return PluginContext(
-            graph=graph,
+            graph=nx.DiGraph(),
             symbol_lookup=contrib.trie,
             package=contrib.package,
             project_root=project_root,
-            package_graph=contrib.package_graph,
-            module_nodes=contrib.module_nodes,
+            package_nodes=contrib.nodes,
         )
-
-    _make_ctx()
 
     t0 = time.perf_counter()
     matched = 0
     for _ in range(REPEATS):
-        matched = sum(1 for _ in _make_ctx().package_nodes())
+        matched = sum(1 for _ in _make_ctx().package_nodes)
     cold_per_call_us = (time.perf_counter() - t0) / REPEATS * 1e6
     print(f"  cold:  {cold_per_call_us:8.1f} us per call ({matched} nodes)")
 
-    warm_ctx = _make_ctx()
-    list(warm_ctx.package_nodes())
-    iters = 10000
-    t0 = time.perf_counter()
-    for _ in range(iters):
-        for _ in warm_ctx.package_nodes():
-            pass
-    warm_per_call_us = (time.perf_counter() - t0) / iters * 1e6
-    print(f"  warm:  {warm_per_call_us:8.2f} us per call (cached)")
-
-    profiler = cProfile.Profile()
-    profiler.enable()
-    for _ in range(REPEATS):
-        sum(1 for _ in _make_ctx().package_nodes())
-    profiler.disable()
-
-    print("\npackage_nodes cold-call top 15 by tottime:")
-    pstats.Stats(profiler).sort_stats("tottime").print_stats(15)
-
-    n_modules = len(contrib.module_nodes)
+    n_modules = sum(1 for n in contrib.nodes if n.type == "module")
     print(f"\npackage_modules: {n_modules} module(s) of {n_total} node(s)")
     t0 = time.perf_counter()
     matched = 0

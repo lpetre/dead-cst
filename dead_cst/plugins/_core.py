@@ -85,8 +85,7 @@ class PluginContext:
     """
 
     graph: nx.DiGraph
-    package_graph: nx.MultiDiGraph
-    module_nodes: tuple[SymbolNode, ...]
+    package_nodes: frozenset[SymbolNode]
     symbol_lookup: SymbolTrie
     package: Package
     project_root: Path
@@ -97,9 +96,6 @@ class PluginContext:
     # is fine in practice -- ``importers`` is for prefiltering against
     # the analyzer's already-resolved dep markers.
     _synthetic_index: dict[str, SymbolNode] | None = field(default=None, init=False, repr=False)
-    # Snapshot of ``package_graph.nodes`` taken on first call so plugins
-    # that add nodes during their pass see a stable iteration target.
-    _package_nodes_cache: list[SymbolNode] | None = field(default=None, init=False, repr=False)
 
     def find_module(self, fqname: str) -> SymbolNode | None:
         node = self.symbol_lookup._get(fqname.split("."))
@@ -148,19 +144,7 @@ class PluginContext:
 
     def package_modules(self) -> Iterator[tuple[Path, SymbolNode]]:
         """Yield ``(path, module_node)`` for every module under :attr:`package`."""
-        return ((n.path, n) for n in self.module_nodes)
-
-    def package_nodes(self) -> Iterator[SymbolNode]:
-        """Yield every graph node under :attr:`package`.
-
-        ``graph`` accumulates nodes across packages; plugins that need
-        to iterate "everything in this package" should use this instead
-        of ``ctx.graph.nodes`` so they don't pay O(N) for nodes
-        belonging to sibling packages.
-        """
-        if self._package_nodes_cache is None:
-            self._package_nodes_cache = list(self.package_graph.nodes)
-        return iter(self._package_nodes_cache)
+        return ((n.path, n) for n in self.package_nodes if n.type == "module")
 
     def importers(self, target: str) -> set[Path]:
         """Return paths under :attr:`package` whose imports reach ``target``.
@@ -277,15 +261,12 @@ def require_resolved_dep(ctx: PluginContext, package: str) -> SymbolNode | None:
 
 @dataclass(frozen=True, slots=True)
 class AddNode:
-    """Add a node to the graph. When ``entrypoint=True``, mark the node so
-    :func:`find_reachable` seeds its BFS from it. ``testcase=True`` tags
-    the node as a test-only entrypoint -- it still seeds the default
-    BFS, but ``Analysis.kept_alive_by_flags_only(NodeFlags.TESTCASE)``
-    excludes those seeds to surface the "blast radius" of removing tests."""
+    """Add a node to the graph. The node carries its own
+    :class:`NodeFlags` (``ENTRYPOINT``, ``TESTCASE``, ...); plugins
+    that want an entrypoint construct the node via
+    :func:`synthetic_node` with the appropriate flags."""
 
     node: SymbolNode
-    entrypoint: bool = False
-    testcase: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -362,12 +343,8 @@ class EdgePlugin(Cacheable, Protocol):
 def apply_ops(graph: nx.DiGraph, ops: Iterable[GraphOp]) -> None:
     for op in ops:
         match op:
-            case AddNode(node, entrypoint, testcase):
+            case AddNode(node):
                 graph.add_node(node)
-                if entrypoint:
-                    graph.nodes[node]["entrypoint"] = True
-                if testcase:
-                    graph.nodes[node]["testcase"] = True
             case AddEdge(src, dst):
                 graph.add_edge(src, dst)
             case RemoveEdge(src, dst):
@@ -483,8 +460,8 @@ def mark_entrypoints(
     targets = list(targets)
     if not targets:
         return
-    synth = synthetic_node(fqname=seed_fqname, path=path)
-    yield AddNode(synth, entrypoint=True)
+    synth = synthetic_node(fqname=seed_fqname, path=path, flags=NodeFlags.ENTRYPOINT)
+    yield AddNode(synth)
     for target in targets:
         yield AddEdge(synth, target)
 

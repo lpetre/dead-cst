@@ -80,7 +80,7 @@ def apply_transformer_at_lines(tmp_path, make_analysis):
 
 
 @pytest.fixture
-def build_unreachable_graph(tmp_path, make_analysis):
+def build_unreachable_graph(tmp_path, make_analysis, mark_entrypoint):
     """Materialise ``files`` under ``tmp_path`` and return the unreachable subgraph.
 
     ``entrypoints`` is the set of FQNs to mark as graph entrypoints
@@ -95,9 +95,9 @@ def build_unreachable_graph(tmp_path, make_analysis):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(_normalise(src))
         graph = make_analysis().materialize_all()
-        for node in graph.nodes:
+        for node in list(graph.nodes):
             if node.fqname in entrypoints:
-                graph.nodes[node]["entrypoint"] = True
+                mark_entrypoint(graph, node)
         reachable = find_reachable(graph)
         return graph.subgraph([n for n in graph.nodes if n not in reachable]).copy()
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dead_cst.graph import NodeFlags
 from dead_cst.plugins import PytestPlugin
 
 
@@ -154,8 +155,7 @@ def test_pytest_plugin_tags_seeds_as_testcase(make_analysis, write_files):
         }
     )
     graph = make_analysis(plugins=[PytestPlugin()]).materialize_all()
-    seeds = [n for n, attrs in graph.nodes(data=True) if attrs.get("entrypoint")]
+    seeds = [n for n in graph.nodes if n.flags & NodeFlags.ENTRYPOINT]
     assert seeds, "expected pytest plugin to seed at least one entrypoint"
-    # Every seed the plugin created is a test entrypoint.
     for seed in seeds:
-        assert graph.nodes[seed].get("testcase"), seed.fqname
+        assert seed.flags & NodeFlags.TESTCASE, seed.fqname

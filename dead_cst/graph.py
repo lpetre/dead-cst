@@ -18,9 +18,8 @@ import enum
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import Iterator, Literal
 
-import networkx as nx
 from libcst.metadata import CodeRange
 
 logger = logging.getLogger(__name__)
@@ -33,11 +32,11 @@ class NodeFlags(enum.IntFlag):
     module edge) but are excluded from the lookup trie, so cross-module
     imports never resolve to them.
 
-    ``ENTRYPOINT`` flags a node as a reachability seed: ``_apply_payload``
-    sets ``graph.nodes[node]["entrypoint"] = True`` when it sees the
-    flag, so :func:`find_reachable` starts its BFS there. Plugins emit
-    flagged synthetic nodes via their per-file payloads to declare
-    entrypoints without a separate API surface.
+    ``ENTRYPOINT`` flags a node as a reachability seed: :func:`find_reachable`
+    starts its BFS from every node carrying this bit. Plugins emit
+    flagged synthetic nodes via their per-file payloads (or via
+    :class:`AddNode` ops constructing :func:`synthetic_node` with
+    ``flags=NodeFlags.ENTRYPOINT``) to declare entrypoints.
 
     ``OVERLOAD`` flags a ``typing.overload`` stub (or any same-name
     displaced sibling). Excluded from the lookup trie like
@@ -354,9 +353,8 @@ class SymbolTrie:
                 return None
         return node
 
-    def add_module_hierarchy_edges(self, symbol_graph: nx.DiGraph) -> None:
-        """
-        Walk the trie and add edges from each submodule to its parent module.
+    def module_hierarchy_edges(self) -> Iterator[tuple[SymbolNode, SymbolNode]]:
+        """Yield ``(child_module, parent_module)`` for every submodule edge.
 
         For a structure like:
             v6/
@@ -367,24 +365,21 @@ class SymbolTrie:
                     ├── __init__.py
                     └── clip.py
 
-        This will add edges:
+        Yields:
             v6.nntree -> v6
             v6.nntree.extern -> v6.nntree
             v6.nntree.extern.clip -> v6.nntree.extern
         """
 
-        def _walk_and_add_edges(node: SymbolTrie, parent_module: SymbolNode | None):
-            """Recursive helper to walk the trie and add edges."""
-            # If this node represents a module and has a parent, add an edge
+        def _walk(
+            node: SymbolTrie, parent_module: SymbolNode | None
+        ) -> Iterator[tuple[SymbolNode, SymbolNode]]:
             if node.module and parent_module:
-                symbol_graph.add_edge(node.module, parent_module)
-
-            # Recurse into children, passing this node's module as the parent
+                yield (node.module, parent_module)
             for child_node in node.children.values():
-                _walk_and_add_edges(child_node, node.module)
+                yield from _walk(child_node, node.module)
 
-        # Start the walk from the root
-        _walk_and_add_edges(self, None)
+        yield from _walk(self, None)
 
 
 # ``SymbolTrie`` is intentionally absent from ``__all__`` -- it's an

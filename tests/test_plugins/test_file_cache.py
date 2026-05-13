@@ -21,8 +21,7 @@ def _ctx(tmp_path):
         symbol_lookup=SymbolTrie(),
         package=Package(path=tmp_path, name="pkg"),
         project_root=tmp_path,
-        package_graph=nx.MultiDiGraph(),
-        module_nodes=(),
+        package_nodes=frozenset(),
     )
 
 

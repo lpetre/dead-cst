@@ -22,7 +22,7 @@ from .cache import (
     default_cache_path,
 )
 from .codemod import generate_patch
-from .graph import SymbolNode
+from .graph import NodeFlags, SymbolNode
 from .plugins import (
     EXTERNAL_PREFIXES,
     EdgePlugin,
@@ -231,8 +231,8 @@ def _output_text(
     root: Path,
     package_paths: Sequence[Path],
 ) -> None:
-    total_by_path = _count_nodes_by_prefix(graph, package_paths)
-    unreachable_by_path = _count_nodes_by_prefix(unreachable, package_paths)
+    total_by_path = _count_nodes_by_prefix(graph.nodes, package_paths)
+    unreachable_by_path = _count_nodes_by_prefix(unreachable.nodes, package_paths)
     for path in package_paths:
         typer.echo(f"\n{path}:")
         total_counts = total_by_path[path]
@@ -309,8 +309,8 @@ def _output_json(
         "unreachable_branches": [],
     }
 
-    total_by_path = _count_nodes_by_prefix(graph, package_paths)
-    unreachable_by_path = _count_nodes_by_prefix(unreachable, package_paths)
+    total_by_path = _count_nodes_by_prefix(graph.nodes, package_paths)
+    unreachable_by_path = _count_nodes_by_prefix(unreachable.nodes, package_paths)
     for path in package_paths:
         path_str = str(path)
         total_counts = total_by_path[path]
@@ -545,7 +545,7 @@ def unused_exports(
         return node.type == "synthetic" and node.fqname.startswith(DUNDER_PREFIX)
 
     visited: set[SymbolNode] = set()
-    stack = [n for n, attrs in graph.nodes(data=True) if attrs.get("entrypoint")]
+    stack = [n for n in graph.nodes if n.flags & NodeFlags.ENTRYPOINT]
     while stack:
         node = stack.pop()
         if node in visited:

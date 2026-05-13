@@ -44,7 +44,7 @@ class ExplicitEntrypointPlugin:
 
     def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]:
         root = ctx.project_root
-        for node in ctx.package_nodes():
+        for node in ctx.package_nodes:
             if not self._matches(node, root):
                 continue
             yield from mark_entrypoints(f"{EXPLICIT_PREFIX}{node.fqname}", node.path, [node])

@@ -29,7 +29,7 @@ from dead_cst.cache import (
     file_hash,
 )
 from dead_cst.cli import app
-from dead_cst.graph import VisitorPayload
+from dead_cst.graph import NodeFlags, VisitorPayload
 from dead_cst.resolvers import ManualResolver
 
 
@@ -580,11 +580,11 @@ def test_plugin_contributions_survive_warm_cache(tmp_path, make_analysis):
 
     with GraphCache(db) as cache:
         cold = make_analysis(plugins=plugins, cache=cache).materialize_all()
-    cold_entrypoints = {n.fqname for n, a in cold.nodes(data=True) if a.get("entrypoint")}
+    cold_entrypoints = {n.fqname for n in cold.nodes if n.flags & NodeFlags.ENTRYPOINT}
 
     with GraphCache(db) as cache:
         warm = make_analysis(plugins=plugins, cache=cache).materialize_all()
-    warm_entrypoints = {n.fqname for n, a in warm.nodes(data=True) if a.get("entrypoint")}
+    warm_entrypoints = {n.fqname for n in warm.nodes if n.flags & NodeFlags.ENTRYPOINT}
 
     assert cold_entrypoints == warm_entrypoints
     assert cold_entrypoints  # plugin actually contributed something

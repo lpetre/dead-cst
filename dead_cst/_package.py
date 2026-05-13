@@ -1,13 +1,12 @@
-"""Per-package contribution build: apply file payloads into a graph slice.
+"""Per-package contribution build: apply file payloads into raw sets/edges.
 
 Sits between :mod:`dead_cst._refresh` (per-file work) and
 :func:`dead_cst.analyze._compose_contribution` (cross-package
 composition). Takes a :class:`PackageFiles` plus the visitor payloads
 for its miss files and produces one :class:`PackageContribution` --
-the per-package trie + a package-local graph slice + the unresolved
-cross-file import set used downstream by
-:func:`dead_cst._edges.resolve_edges` and the plugin
-:meth:`EdgePlugin.finalize` pass.
+the per-package trie plus raw nodes / edges / dead-suite map and the
+unresolved cross-file import set. The graph itself is built once at
+compose time; this stage only accumulates data.
 """
 
 from __future__ import annotations
@@ -17,7 +16,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Sequence
 
-import networkx as nx
 from libcst.metadata import CodeRange
 
 from ._notebooks import is_notebook
@@ -28,22 +26,23 @@ from .resolvers import Package
 logger = logging.getLogger(__name__)
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class PackageContribution:
     """One package's pre-stitched contribution to the symbol graph.
 
-    Built by :func:`build_contribution` and composed into a target
+    Built by :func:`build_contribution` and folded into the target
     graph by :func:`dead_cst.analyze._compose_contribution`. ``trie``
     holds every visible decl; consumer-side merges filter via
-    :meth:`SymbolTrie.merge_exported`. ``package_graph.graph["dead_suites"]``
-    carries per-file dead-suite positions.
+    :meth:`SymbolTrie.merge_exported`. ``nodes`` and ``edges`` are raw
+    sets; ``dead_suites`` maps each file to its dead-suite positions.
     """
 
     package: Package
     trie: SymbolTrie
-    package_graph: nx.MultiDiGraph
+    nodes: frozenset[SymbolNode]
+    edges: frozenset[tuple[SymbolNode, SymbolNode, EdgeFlags]]
+    dead_suites: Mapping[Path, tuple[CodeRange, ...]]
     import_edges: frozenset[tuple[SymbolNode, Import, EdgeFlags]]
-    module_nodes: tuple[SymbolNode, ...]
 
 
 def build_contribution(
@@ -51,27 +50,25 @@ def build_contribution(
     package_files: PackageFiles,
     miss_payloads: Mapping[Path, VisitorPayload],
 ) -> PackageContribution:
-    """Apply ``package_files``' per-file payloads into a package-local graph slice.
+    """Apply ``package_files``' per-file payloads into raw sets / dicts.
 
     Hits come straight from :class:`PackageFiles`; the rest are looked
     up in the global ``miss_payloads`` map produced by
-    :func:`dead_cst._refresh.process_stale_files`. The package-local
-    :class:`nx.MultiDiGraph` is what makes scope-bounded materialization
-    cheap: composing it into the full graph or a closure graph doesn't
-    redo per-file apply work. Empty :attr:`Package.exported` means
-    "no restriction" (every file in the package is exported to consumers).
+    :func:`dead_cst._refresh.process_stale_files`. Empty
+    :attr:`Package.exported` means "no restriction" (every file in the
+    package is exported to consumers).
 
     A pre-pass identifies module-FQN collisions (``foo.py`` alongside
     ``foo/__init__.py``) via :func:`eclipsed_paths` so the loser is
-    skipped at the trie -- the visitor still graphs its nodes so any
+    skipped at the trie -- its nodes still land in the contribution so
     observe-time entrypoints (``__main__``, plugin synthetics) keep
     working, but cross-module imports route to the package winner.
     """
     trie = SymbolTrie()
+    nodes: set[SymbolNode] = set()
+    edges: set[tuple[SymbolNode, SymbolNode, EdgeFlags]] = set()
     import_edges: set[tuple[SymbolNode, Import, EdgeFlags]] = set()
-    package_graph: nx.MultiDiGraph = nx.MultiDiGraph()
-    package_graph.graph["dead_suites"] = {}
-    module_nodes: list[SymbolNode] = []
+    dead_suites: dict[Path, tuple[CodeRange, ...]] = {}
     eclipsed = eclipsed_paths(package_files.files)
     for file in package_files.files:
         payload = package_files.hits.get(file)
@@ -83,22 +80,24 @@ def build_contribution(
             payload = miss_payloads.get(file)
         if payload is None:
             continue
-        module_nodes.append(
-            _apply_payload(
-                payload,
-                trie=trie,
-                eclipsed=file in eclipsed,
-                symbol_graph=package_graph,
-                import_edges=import_edges,
-            )
+        _apply_payload(
+            payload,
+            trie=trie,
+            eclipsed=file in eclipsed,
+            nodes=nodes,
+            edges=edges,
+            import_edges=import_edges,
+            dead_suites=dead_suites,
         )
-    trie.add_module_hierarchy_edges(package_graph)
+    for child, parent in trie.module_hierarchy_edges():
+        edges.add((child, parent, EdgeFlags.NONE))
     return PackageContribution(
         package=package,
         trie=trie,
-        package_graph=package_graph,
+        nodes=frozenset(nodes),
+        edges=frozenset(edges),
+        dead_suites=dead_suites,
         import_edges=frozenset(import_edges),
-        module_nodes=tuple(module_nodes),
     )
 
 
@@ -149,35 +148,33 @@ def _apply_payload(
     *,
     trie: SymbolTrie,
     eclipsed: bool,
-    symbol_graph: nx.MultiDiGraph,
+    nodes: set[SymbolNode],
+    edges: set[tuple[SymbolNode, SymbolNode, EdgeFlags]],
     import_edges: set[tuple[SymbolNode, Import, EdgeFlags]],
-) -> SymbolNode:
-    """Emit ``payload`` into the in-progress per-package structures.
+    dead_suites: dict[Path, tuple[CodeRange, ...]],
+) -> None:
+    """Emit ``payload`` into the in-progress per-package accumulators.
 
-    Routing by ``SymbolNode.type``: ``module`` goes to graph + trie,
-    ``synthetic`` to graph only (no parent edge, no trie entry), other
-    decls to graph with a parent-module edge plus a trie entry gated
-    by ``eclipsed`` and the per-decl ``SHADOWED`` / ``OVERLOAD`` /
-    ``NOTEBOOK`` flags. ``ENTRYPOINT`` and ``TESTCASE`` mirror into
-    attr-dict entries for the reachability passes; see :class:`NodeFlags`
-    for the full taxonomy.
+    Routing by ``SymbolNode.type``: ``module`` and other decls go into
+    ``nodes`` and (subject to ``eclipsed`` + the per-decl ``SHADOWED`` /
+    ``OVERLOAD`` / ``NOTEBOOK`` flags) the trie; non-module decls also
+    get a parent-module edge. ``synthetic`` nodes land in ``nodes`` only
+    -- no parent edge, no trie entry.
 
     Each edge gets :data:`EdgeFlags.DEAD_BRANCH` when its access
     position falls inside one of ``payload.dead_suites``. Unresolved
-    cross-file imports accumulate into ``import_edges`` along with the
-    derived flag for :func:`resolve_edges` to stitch later. Per-file
-    dead-suite positions are stashed under
-    ``graph.graph["dead_suites"][module.path]`` for downstream reports.
+    cross-file imports accumulate into ``import_edges`` for
+    :func:`resolve_edges` to stitch later.
     """
     module = next(n for n in payload.nodes if n.type == "module")
 
-    dead_suites = payload.dead_suites
-    if dead_suites:
+    payload_dead_suites = payload.dead_suites
+    if payload_dead_suites:
 
         def flag_for(pos: CodeRange) -> EdgeFlags:
             return (
                 EdgeFlags.DEAD_BRANCH
-                if any(_contains(s, pos) for s in dead_suites)
+                if any(_contains(s, pos) for s in payload_dead_suites)
                 else EdgeFlags.NONE
             )
     else:
@@ -186,33 +183,24 @@ def _apply_payload(
             return EdgeFlags.NONE
 
     for n in payload.nodes:
-        symbol_graph.add_node(n)
-        if n.flags & NodeFlags.ENTRYPOINT:
-            symbol_graph.nodes[n]["entrypoint"] = True
-        if n.flags & NodeFlags.TESTCASE:
-            symbol_graph.nodes[n]["testcase"] = True
+        nodes.add(n)
         if n.type == "synthetic":
             continue
         if n.type != "module":
-            symbol_graph.add_edge(n, module, flags=EdgeFlags.NONE)
-        # File-level (``eclipsed``) and per-decl flags both gate trie
-        # entry; the graph keeps the parent edge either way so the decl
-        # stays well-formed.
+            edges.add((n, module, EdgeFlags.NONE))
         if not eclipsed and not (
             n.flags & (NodeFlags.SHADOWED | NodeFlags.OVERLOAD | NodeFlags.NOTEBOOK)
         ):
             trie.add_declaration(n)
 
     for src, dst, pos in payload.edges:
-        symbol_graph.add_edge(src, dst, flags=flag_for(pos))
+        edges.add((src, dst, flag_for(pos)))
 
     for src, imp, pos in payload.imports:
         import_edges.add((src, imp, flag_for(pos)))
 
-    if payload.dead_suites:
-        symbol_graph.graph["dead_suites"][module.path] = payload.dead_suites
-
-    return module
+    if payload_dead_suites:
+        dead_suites[module.path] = payload_dead_suites
 
 
 def _contains(suite: CodeRange, access: CodeRange) -> bool:

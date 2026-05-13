@@ -215,7 +215,7 @@ class DiscordPyPlugin:
         return make_payload(nodes=nodes, edges=edges)
 
     def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]:
-        for synth in list(ctx.package_nodes()):
+        for synth in ctx.package_nodes:
             if synth.type != "synthetic" or not synth.fqname.startswith(DISCORDPY_EXTENSION_PREFIX):
                 continue
             captured = synth.fqname[len(DISCORDPY_EXTENSION_PREFIX) :]

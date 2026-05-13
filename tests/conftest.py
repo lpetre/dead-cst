@@ -1,3 +1,4 @@
+import dataclasses
 import json
 import logging
 import textwrap
@@ -6,7 +7,36 @@ import networkx as nx
 import pytest
 
 from dead_cst import Analysis, EdgeFlags
+from dead_cst.graph import NodeFlags, SymbolNode
 from dead_cst.resolvers import ManualResolver
+
+
+@pytest.fixture
+def mark_entrypoint():
+    """Replace ``node`` in ``graph`` with a copy carrying ``NodeFlags.ENTRYPOINT``.
+
+    ``_find_reachable`` reads the flag straight off :class:`SymbolNode`,
+    so tests that want to seed reachability without going through a
+    plugin's observe/finalize pass swap in a flag-tagged copy via this
+    fixture. The returned callable yields the new node so callers can
+    re-bind their local reference.
+    """
+
+    def _mark(graph: nx.MultiDiGraph, node: SymbolNode) -> SymbolNode:
+        new = dataclasses.replace(node, flags=node.flags | NodeFlags.ENTRYPOINT)
+        if new == node:
+            return node
+        in_edges = list(graph.in_edges(node, keys=True, data=True))
+        out_edges = list(graph.out_edges(node, keys=True, data=True))
+        graph.remove_node(node)
+        graph.add_node(new)
+        for src, _, key, data in in_edges:
+            graph.add_edge(src, new, key=key, **data)
+        for _, dst, key, data in out_edges:
+            graph.add_edge(new, dst, key=key, **data)
+        return new
+
+    return _mark
 
 
 @pytest.fixture

@@ -91,9 +91,9 @@ def _compose_contribution(
     import_resolver: ImportResolver,
     search_paths: list[Path],
 ) -> None:
-    """Merge ``contrib.package_graph`` into ``target_graph``, stitch
-    cross-package imports against ``symbol_lookup``, and run plugin
-    :meth:`EdgePlugin.finalize` against the composed graph.
+    """Merge ``contrib``'s raw nodes / edges into ``target_graph``,
+    stitch cross-package imports against ``symbol_lookup``, and run
+    plugin :meth:`EdgePlugin.finalize` against the composed graph.
 
     The caller owns ``symbol_lookup`` because its construction depends
     on which dep export tries are in scope -- the full-graph path
@@ -104,13 +104,9 @@ def _compose_contribution(
     unresolved); they are unused when every import resolves
     first-party in the trie.
     """
-    target_graph.update(
-        edges=contrib.package_graph.edges(data=True, keys=True),
-        nodes=contrib.package_graph.nodes(data=True),
-    )
-    target_graph.graph.setdefault("dead_suites", {}).update(
-        contrib.package_graph.graph["dead_suites"]
-    )
+    target_graph.add_nodes_from(contrib.nodes)
+    target_graph.add_edges_from((src, dst, {"flags": flags}) for src, dst, flags in contrib.edges)
+    target_graph.graph.setdefault("dead_suites", {}).update(contrib.dead_suites)
     target_graph.add_edges_from(
         (src, dst, {"flags": flags})
         for src, dst, flags in resolve_edges(
@@ -127,8 +123,7 @@ def _compose_contribution(
             symbol_lookup=symbol_lookup,
             package=contrib.package,
             project_root=project_root,
-            package_graph=contrib.package_graph,
-            module_nodes=contrib.module_nodes,
+            package_nodes=contrib.nodes,
         )
         for plugin in plugins:
             if not isinstance(plugin, EdgePlugin):
@@ -149,10 +144,7 @@ def _find_reachable(
     *,
     prefix: Path | None = None,
 ) -> set[SymbolNode]:
-    """BFS forward from every node tagged as an entrypoint by a plugin.
-
-    Plugins mark seeds by setting ``graph.nodes[node]["entrypoint"] = True``
-    (see :func:`dead_cst.plugins.apply_ops`).
+    """BFS forward from every node carrying :data:`NodeFlags.ENTRYPOINT`.
 
     ``exclude_flags`` may carry one or more :class:`NodeFlags` bits to
     drop entrypoints whose flags intersect; the default
@@ -173,9 +165,7 @@ def _find_reachable(
     """
     visited: set[SymbolNode] = set()
     stack = [
-        n
-        for n, attrs in graph.nodes(data=True)
-        if attrs.get("entrypoint") and not (n.flags & exclude_flags)
+        n for n in graph.nodes if n.flags & NodeFlags.ENTRYPOINT and not (n.flags & exclude_flags)
     ]
     while stack:
         node = stack.pop()
@@ -193,7 +183,7 @@ def _find_reachable_strict(
 ) -> set[SymbolNode]:
     """Like :func:`_find_reachable` but skips ``DEAD_BRANCH``-flagged edges."""
     visited: set[SymbolNode] = set()
-    stack = [n for n, attrs in graph.nodes(data=True) if attrs.get("entrypoint")]
+    stack = [n for n in graph.nodes if n.flags & NodeFlags.ENTRYPOINT]
     while stack:
         node = stack.pop()
         if node in visited:
@@ -253,15 +243,15 @@ def _iter_dead(graph: nx.MultiDiGraph, *, prefix: Path | None = None) -> Iterato
             yield n
 
 
-def _count_nodes(graph: nx.MultiDiGraph, prefix: Path | None) -> dict[str, int]:
-    """Count nodes in ``graph`` by ``SymbolNode.type``, optionally restricted by path.
+def _count_nodes(nodes: Iterable[SymbolNode], prefix: Path | None) -> dict[str, int]:
+    """Count ``nodes`` by ``SymbolNode.type``, optionally restricted by path.
 
     If ``prefix`` is given, only nodes whose ``path`` is under ``prefix``
     are counted. Includes the synthetic ``"synthetic"`` type contributed
     by plugins and third-party-dep markers.
     """
     counts: dict[str, int] = {}
-    for node in graph.nodes:
+    for node in nodes:
         if prefix and not node.path.is_relative_to(prefix):
             continue
         counts[node.type] = counts.get(node.type, 0) + 1
@@ -269,13 +259,13 @@ def _count_nodes(graph: nx.MultiDiGraph, prefix: Path | None) -> dict[str, int]:
 
 
 def _count_nodes_by_prefix(
-    graph: nx.MultiDiGraph, prefixes: Sequence[Path]
+    nodes: Iterable[SymbolNode], prefixes: Sequence[Path]
 ) -> dict[Path, dict[str, int]]:
     """One-pass equivalent of :func:`_count_nodes` for many prefixes.
 
-    A naive ``[_count_nodes(graph, p) for p in prefixes]`` re-walks every
-    node of the full graph for every prefix; the CLI's text/JSON output
-    paths do this twice (once for the full graph, once for the
+    A naive ``[_count_nodes(nodes, p) for p in prefixes]`` re-walks
+    every node of the full graph for every prefix; the CLI's text/JSON
+    output paths do this twice (once for the full graph, once for the
     unreachable subgraph) and it dominates report-formatting time on
     large workspaces. We bucket nodes by ``node.path`` first so each
     unique file pays the prefix-matching cost once regardless of how
@@ -285,7 +275,7 @@ def _count_nodes_by_prefix(
     prefix it ``is_relative_to`` -- nested prefixes both pick it up.
     """
     by_path: dict[Path, dict[str, int]] = {}
-    for node in graph.nodes:
+    for node in nodes:
         bucket = by_path.get(node.path)
         if bucket is None:
             bucket = {}
@@ -679,7 +669,7 @@ class Analysis:
         under that prefix -- useful for per-package summaries when
         several packages are analysed together.
         """
-        return _count_nodes(self.materialize_all(), prefix)
+        return _count_nodes(self.materialize_all().nodes, prefix)
 
     def _build_symbol_lookup(self, package: Path) -> SymbolTrie:
         """Per-package lookup trie: this package's full trie + each dep's exports.
@@ -746,7 +736,7 @@ class PackageView:
         Local-only: refreshes this package if needed but never
         touches deps or consumers.
         """
-        yield from self._contribution().module_nodes
+        yield from (n for n in self._contribution().nodes if n.type == "module")
 
     def declarations(self, name: str | None = None) -> Iterator[SymbolNode]:
         """Top-level decls in this package.
@@ -755,7 +745,7 @@ class PackageView:
         decls whose rightmost dotted segment matches it (``"Foo"``
         matches ``pkg.mod.Foo`` but not ``pkg.Foo.bar``). Local-only.
         """
-        for n in self._contribution().package_graph.nodes:
+        for n in self._contribution().nodes:
             if n.type in ("module", "synthetic"):
                 continue
             if name is not None and simple_name(n.fqname) != name:
@@ -779,8 +769,7 @@ class PackageView:
             symbol_lookup=self._analysis._build_symbol_lookup(self._package.path),
             package=self._package,
             project_root=self._analysis.project_root,
-            package_graph=contrib.package_graph,
-            module_nodes=contrib.module_nodes,
+            package_nodes=contrib.nodes,
         )
         return ctx.importers(target)
 
@@ -843,7 +832,7 @@ class PackageView:
         ``module``, source decls, and any ``synthetic`` nodes plugins
         emitted into this package's contribution during ``observe``.
         """
-        return _count_nodes(self._contribution().package_graph, prefix=None)
+        return _count_nodes(self._contribution().nodes, prefix=None)
 
     def remove_dead_code(self) -> None:
         """Apply the LibCST codemod, deleting every dead decl in this package.

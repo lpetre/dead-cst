@@ -10,6 +10,37 @@ two versions.
 ## [Unreleased]
 
 ### Changed
+- `PackageContribution` no longer carries an `nx.MultiDiGraph`. The
+  per-package intermediate now exposes raw `frozenset[SymbolNode]` /
+  `frozenset[(src, dst, EdgeFlags)]` / `Mapping[Path, tuple[CodeRange, ...]]`
+  fields plus the trie and import-edges; the target graph is built
+  once at compose time via `target_graph.add_nodes_from` /
+  `add_edges_from`. `module_nodes` is dropped — `PluginContext.package_modules`
+  filters `package_nodes` by `type == "module"` on demand.
+
+- `PluginContext.package_graph` and `PluginContext.module_nodes` are
+  **removed**. `package_nodes` is now a `frozenset[SymbolNode]` field
+  (was an iterator method with internal caching). Plugin call sites
+  change from `ctx.package_nodes()` to `ctx.package_nodes`. Third-party
+  plugins that reached `ctx.package_graph` for graph queries need to
+  call `ctx.graph` (the full target graph) instead.
+
+- `AddNode` drops its `entrypoint: bool` / `testcase: bool` fields.
+  Plugins that need an entrypoint synthetic construct the node with
+  `synthetic_node(..., flags=NodeFlags.ENTRYPOINT)` directly; the bit
+  on `SymbolNode.flags` is now the only source of truth.
+
+- `_find_reachable` reads `n.flags & NodeFlags.ENTRYPOINT` instead of
+  `graph.nodes[n].get("entrypoint")`. The attr-dict mirror in
+  `_apply_payload` and `apply_ops` is gone — same change for
+  `TESTCASE`. Existing graph node attrs (`entrypoint`, `testcase`) are
+  no longer set or read anywhere.
+
+- `SymbolTrie.add_module_hierarchy_edges(graph)` (mutator) renamed to
+  `SymbolTrie.module_hierarchy_edges()` (iterator yielding
+  `(child_module, parent_module)` pairs). Callers append to their own
+  edge accumulators.
+
 - `Package.exported` now enters the per-package cache fingerprint, so
   editing the exported subdirs invalidates that package's cache (siblings
   are unaffected). The fingerprint is computed per-package via the new
