@@ -9,6 +9,18 @@ two versions.
 
 ## [Unreleased]
 
+### Removed
+- The overlay / what-if API on `Analysis` is gone (breaking):
+  `Analysis.preview_payloads`, `Analysis.materialize_with`,
+  `Analysis.preview`, and the `GraphView` class (with its
+  `dead_cst.analyze` re-export) have been deleted. The design
+  didn't pay its keep — callers comparing baseline vs. perturbed
+  reachability can construct a second `Analysis` with a substitute
+  detector or modified sources and diff `dead()` directly.
+  `TruthinessResolver.resolve_constant` and the
+  `DefaultUnreachableRegionDetector.resolve(expr, resolver)` hook
+  stay — they're independently useful for custom detectors.
+
 ### Changed
 - `DispatchAppPlugin` (in `dead_cst.plugins.decl_shapes`) is now the
   shared base for `FlaskPlugin`, `FastAPIPlugin`, and `CeleryPlugin` in
