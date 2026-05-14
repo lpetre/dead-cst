@@ -36,7 +36,7 @@ from dead_cst.resolvers import Package
 def test_no_plugins_means_nothing_reachable(make_analysis, write_files):
     write_files({"pkg/__init__.py": "", "pkg/a.py": "def f(): pass"})
     graph = make_analysis().materialize_all()
-    assert find_reachable(graph, seeds=_entrypoint_seeds(graph)) == set()
+    assert find_reachable(graph, _entrypoint_seeds(graph)) == set()
 
 
 def test_plugins_compose(make_analysis, write_files, reachable_fqnames):

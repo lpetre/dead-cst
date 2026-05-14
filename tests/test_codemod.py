@@ -95,7 +95,7 @@ def build_unreachable_graph(tmp_path, make_analysis):
             path.write_text(_normalise(src))
         graph = make_analysis().materialize_all()
         seeds = [n for n in graph.nodes if n.fqname in entrypoints]
-        reachable = find_reachable(graph, seeds=seeds)
+        reachable = find_reachable(graph, seeds)
         return graph.subgraph([n for n in graph.nodes if n not in reachable]).copy()
 
     return _build

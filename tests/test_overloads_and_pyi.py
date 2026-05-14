@@ -104,7 +104,7 @@ def test_dead_overloads_are_removed_with_impl(tmp_path, make_analysis):
     )
     graph = make_analysis().materialize_all()
     seeds = [n for n in graph.nodes if n.fqname == "mod.keep"]
-    reachable = find_reachable(graph, seeds=seeds)
+    reachable = find_reachable(graph, seeds)
     unreachable = graph.subgraph([n for n in graph.nodes if n not in reachable]).copy()
     remove_code(unreachable, tmp_path)
 
@@ -132,7 +132,7 @@ def test_live_overloads_survive_codemod(tmp_path, make_analysis):
     )
     a = make_analysis(plugins=[ExplicitEntrypointPlugin(specs=["mod.f"])])
     graph = a.materialize_all()
-    reachable = find_reachable(graph, seeds=_entrypoint_seeds(graph))
+    reachable = find_reachable(graph, _entrypoint_seeds(graph))
     unreachable = graph.subgraph([n for n in graph.nodes if n not in reachable]).copy()
     remove_code(unreachable, tmp_path)
 
@@ -191,7 +191,7 @@ def test_orphan_pyi_stub_uses_runtime_fqname(tmp_path, make_analysis):
 
     a = make_analysis(plugins=[ExplicitEntrypointPlugin(specs=["main"])])
     graph = a.materialize_all()
-    reachable = find_reachable(graph, seeds=_entrypoint_seeds(graph))
+    reachable = find_reachable(graph, _entrypoint_seeds(graph))
 
     stub_compute = next(
         n for n in graph.nodes if n.fqname == "mypkg._native.compute" and n.type == "function"

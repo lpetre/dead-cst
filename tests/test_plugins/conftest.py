@@ -15,7 +15,7 @@ def reachable_fqnames():
     """Return ``{fqname for n in find_reachable(graph) if not synthetic}``."""
 
     def _reachable(graph) -> set[str]:
-        reached = find_reachable(graph, seeds=_entrypoint_seeds(graph))
+        reached = find_reachable(graph, _entrypoint_seeds(graph))
         return {n.fqname for n in reached if n.type != "synthetic"}
 
     return _reachable

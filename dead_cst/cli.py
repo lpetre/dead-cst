@@ -211,7 +211,7 @@ def analyze(
             workers=workers,
         )
         graph = analysis.materialize_all()
-    reachable = _find_reachable(graph, seeds=_entrypoint_seeds(graph))
+    reachable = _find_reachable(graph, _entrypoint_seeds(graph))
 
     unreachable_graph = graph.subgraph([n for n in graph.nodes if n not in reachable])
 
@@ -537,7 +537,7 @@ def unused_exports(
             cache=cache,
             workers=workers,
         ).materialize_all()
-    reachable = _find_reachable(graph, seeds=_entrypoint_seeds(graph))
+    reachable = _find_reachable(graph, _entrypoint_seeds(graph))
 
     # ModuleDundersPlugin keeps each ``__all__`` alive via a synthetic
     # entrypoint node ``<dunder>:<fqname>``. Re-run reachability while
@@ -647,7 +647,7 @@ def remove(
             workers=workers,
         )
         graph = analysis.materialize_all()
-    reachable = _find_reachable(graph, seeds=_entrypoint_seeds(graph))
+    reachable = _find_reachable(graph, _entrypoint_seeds(graph))
 
     unreachable_graph = graph.subgraph([n for n in graph.nodes if n not in reachable])
 

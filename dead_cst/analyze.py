@@ -161,8 +161,8 @@ def _entrypoint_seeds(
 
 def _find_reachable(
     graph: nx.MultiDiGraph,
-    *,
     seeds: Iterable[SymbolNode],
+    *,
     prefix: Path | None = None,
     skip_dead_branches: bool = False,
 ) -> set[SymbolNode]:
@@ -211,8 +211,8 @@ def _find_kept_alive_by_dead_branches(
     :meth:`PackageView.kept_alive_by_dead_branches`.
     """
     seeds = _entrypoint_seeds(graph)
-    return _find_reachable(graph, seeds=seeds, prefix=prefix) - _find_reachable(
-        graph, seeds=seeds, prefix=prefix, skip_dead_branches=True
+    return _find_reachable(graph, seeds, prefix=prefix) - _find_reachable(
+        graph, seeds, prefix=prefix, skip_dead_branches=True
     )
 
 
@@ -226,8 +226,8 @@ def _find_kept_alive_by_flags_only(
     any of those flag bits. Surfaced on :class:`Analysis` and
     :class:`PackageView` as ``kept_alive_by_flags_only(flags)``.
     """
-    return _find_reachable(graph, seeds=_entrypoint_seeds(graph), prefix=prefix) - _find_reachable(
-        graph, seeds=_entrypoint_seeds(graph, flags), prefix=prefix
+    return _find_reachable(graph, _entrypoint_seeds(graph), prefix=prefix) - _find_reachable(
+        graph, _entrypoint_seeds(graph, flags), prefix=prefix
     )
 
 
@@ -238,7 +238,7 @@ def _iter_dead(graph: nx.MultiDiGraph, *, prefix: Path | None = None) -> Iterato
     :data:`_NON_DECL_TYPES`). ``prefix`` restricts the iteration to
     nodes whose ``path`` lies under it.
     """
-    reachable = _find_reachable(graph, seeds=_entrypoint_seeds(graph))
+    reachable = _find_reachable(graph, _entrypoint_seeds(graph))
     for n in graph.nodes:
         if prefix is not None and not n.path.is_relative_to(prefix):
             continue
@@ -632,7 +632,7 @@ class Analysis:
     def reachable(self) -> set[SymbolNode]:
         """Set of every decl reachable from any entrypoint in the full graph."""
         g = self.materialize_all()
-        return _find_reachable(g, seeds=_entrypoint_seeds(g))
+        return _find_reachable(g, _entrypoint_seeds(g))
 
     def dead(self) -> Iterator[SymbolNode]:
         """Yield every decl that no entrypoint reaches.
@@ -810,7 +810,7 @@ class PackageView:
         questions.
         """
         g = self._analysis.materialize_closure(self._package.path)
-        return _find_reachable(g, seeds=_entrypoint_seeds(g), prefix=self._package.path)
+        return _find_reachable(g, _entrypoint_seeds(g), prefix=self._package.path)
 
     def dead(self) -> Iterator[SymbolNode]:
         """Yield decls in this package not reachable from any entrypoint
@@ -872,7 +872,7 @@ class PackageView:
         from .codemod import remove_code
 
         g = self._analysis.materialize_closure(self._package.path)
-        reachable = _find_reachable(g, seeds=_entrypoint_seeds(g))
+        reachable = _find_reachable(g, _entrypoint_seeds(g))
         dead_nodes = [n for n in g.nodes if n not in reachable]
         remove_code(g.subgraph(dead_nodes), self._package.path)
 

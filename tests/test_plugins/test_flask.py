@@ -502,9 +502,7 @@ def test_flask_plugin_handles_factory_function(make_analysis, write_files, reach
     from dead_cst.analyze import _entrypoint_seeds, _find_reachable as find_reachable
 
     reached = {
-        n.fqname
-        for n in find_reachable(graph, seeds=_entrypoint_seeds(graph))
-        if n.type != "synthetic"
+        n.fqname for n in find_reachable(graph, _entrypoint_seeds(graph)) if n.type != "synthetic"
     }
     assert "app.main.app" in reached
     assert "app.main.list_items" in reached
