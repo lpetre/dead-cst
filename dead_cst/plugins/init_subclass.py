@@ -145,13 +145,10 @@ class InitSubclassPlugin:
                 # graph dedupes by node identity. Keep the first.
                 subclass_buckets.setdefault(node.fqname[len(SUBCLASS_OF_PREFIX) :], node)
             elif node.fqname.startswith(INIT_SUBCLASS_PREFIX):
-                preds = [
-                    raw[i]
-                    for i in raw.predecessor_indices(ctx.graph.index(node))
-                    if raw[i].type == "class"
-                ]
-                for parent in preds:
-                    init_markers.append((parent, node))
+                for i in raw.predecessor_indices(ctx.graph.index(node)):
+                    pred = raw[i]
+                    if pred.type == "class":
+                        init_markers.append((pred, node))
 
         if not init_markers:
             return
