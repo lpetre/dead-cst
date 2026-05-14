@@ -1043,9 +1043,9 @@ def test_custom_detector_override_folds_call_in_if(make_analysis, write_files):
 
     graph = make_analysis(unreachable_detector=FlagAwareDetector()).materialize_all()
     dead = {
-        f"{src.fqname} -> {dst.fqname}"
-        for src, dst, attrs in graph.edges(data=True)
-        if attrs.get("flags", EdgeFlags.NONE) & EdgeFlags.DEAD_BRANCH
+        f"{graph.node(u).fqname} -> {graph.node(v).fqname}"
+        for u, v, payload in graph.raw.weighted_edge_list()
+        if payload & EdgeFlags.DEAD_BRANCH
     }
     # ``check_flag(...)`` resolves to True, so the else branch is dead.
     assert dead == {"mod -> mod.dev_only"}
@@ -1093,9 +1093,9 @@ def test_custom_detector_override_folds_through_assignment(make_analysis, write_
 
     graph = make_analysis(unreachable_detector=FlagAwareDetector()).materialize_all()
     dead = {
-        f"{src.fqname} -> {dst.fqname}"
-        for src, dst, attrs in graph.edges(data=True)
-        if attrs.get("flags", EdgeFlags.NONE) & EdgeFlags.DEAD_BRANCH
+        f"{graph.node(u).fqname} -> {graph.node(v).fqname}"
+        for u, v, payload in graph.raw.weighted_edge_list()
+        if payload & EdgeFlags.DEAD_BRANCH
     }
     assert dead == {"mod -> mod.helper"}
 

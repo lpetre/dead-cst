@@ -7,10 +7,10 @@ from __future__ import annotations
 from pathlib import Path
 
 import libcst as cst
-import networkx as nx
 import pytest
 from libcst.metadata import CodePosition, CodeRange
 
+from dead_cst._graphstore import SymbolGraph
 from dead_cst.analyze import _find_reachable as find_reachable
 from dead_cst.plugins import MainBlockPlugin, ProjectScriptsPlugin
 from dead_cst.plugins._core import (
@@ -75,14 +75,14 @@ def test_unknown_plugin_raises():
 
 def _ctx_with_synthetic(fqname: str, base: Path, make_contribution) -> PluginContext:
     """Build a minimal PluginContext containing a single synthetic node."""
-    graph = nx.DiGraph()
+    graph = SymbolGraph()
     node = SymbolNode(
         fqname=fqname,
         type="synthetic",
         path=base,
         position=CodeRange(start=CodePosition(0, 0), end=CodePosition(0, 0)),
     )
-    graph.add_node(node)
+    graph.add(node)
     return PluginContext(
         graph=graph,
         symbol_lookup=SymbolTrie(),
@@ -364,15 +364,16 @@ def test_apply_ops_dedupes_add_edge_against_emitted_set(tmp_path):
     ``MultiDiGraph`` doesn't accumulate parallel edges from cross-
     source duplicates.
     """
-    graph = nx.MultiDiGraph()
+    graph = SymbolGraph()
     src = SymbolNode("pkg.a", "function", tmp_path / "a.py", _pos())
     dst = SymbolNode("pkg.b", "function", tmp_path / "b.py", _pos())
-    graph.add_nodes_from([src, dst])
+    graph.add(src)
+    graph.add(dst)
     emitted: set[tuple[SymbolNode, SymbolNode, EdgeFlags]] = set()
 
     apply_ops(graph, [AddEdge(src, dst), AddEdge(src, dst)], emitted)
 
-    assert graph.number_of_edges(src, dst) == 1
+    assert len(graph.raw.get_all_edge_data(graph.index(src), graph.index(dst))) == 1
     assert (src, dst, EdgeFlags.NONE) in emitted
 
 
@@ -382,16 +383,17 @@ def test_apply_ops_dedup_respects_prior_contribution_edge(tmp_path):
     single source of truth across all three edge sources composed in
     one pass.
     """
-    graph = nx.MultiDiGraph()
+    graph = SymbolGraph()
     src = SymbolNode("pkg.a", "function", tmp_path / "a.py", _pos())
     dst = SymbolNode("pkg.b", "function", tmp_path / "b.py", _pos())
-    graph.add_nodes_from([src, dst])
-    graph.add_edge(src, dst, flags=EdgeFlags.NONE)
+    graph.add(src)
+    graph.add(dst)
+    graph.add_edge(src, dst, EdgeFlags.NONE)
     emitted: set[tuple[SymbolNode, SymbolNode, EdgeFlags]] = {(src, dst, EdgeFlags.NONE)}
 
     apply_ops(graph, [AddEdge(src, dst)], emitted)
 
-    assert graph.number_of_edges(src, dst) == 1
+    assert len(graph.raw.get_all_edge_data(graph.index(src), graph.index(dst))) == 1
 
 
 def test_apply_ops_remove_edge_drops_dedup_key(tmp_path):
@@ -399,16 +401,17 @@ def test_apply_ops_remove_edge_drops_dedup_key(tmp_path):
     so a subsequent ``AddEdge`` for the same pair is re-added rather
     than silently swallowed.
     """
-    graph = nx.MultiDiGraph()
+    graph = SymbolGraph()
     src = SymbolNode("pkg.a", "function", tmp_path / "a.py", _pos())
     dst = SymbolNode("pkg.b", "function", tmp_path / "b.py", _pos())
-    graph.add_nodes_from([src, dst])
+    graph.add(src)
+    graph.add(dst)
     graph.add_edge(src, dst)
     emitted: set[tuple[SymbolNode, SymbolNode, EdgeFlags]] = {(src, dst, EdgeFlags.NONE)}
 
     apply_ops(graph, [RemoveEdge(src, dst), AddEdge(src, dst)], emitted)
 
-    assert graph.number_of_edges(src, dst) == 1
+    assert len(graph.raw.get_all_edge_data(graph.index(src), graph.index(dst))) == 1
     assert (src, dst, EdgeFlags.NONE) in emitted
 
 
@@ -451,7 +454,7 @@ def test_materialize_dedupes_edges_across_visitor_and_plugin(make_analysis, writ
     graph = make_analysis(plugins=[_ReAssertImportPlugin()]).materialize_all()
     caller = next(n for n in graph.nodes if n.fqname == "pkg.a.caller")
     target = next(n for n in graph.nodes if n.fqname == "pkg.b.target")
-    assert graph.number_of_edges(caller, target) == 1
+    assert len(graph.raw.get_all_edge_data(graph.index(caller), graph.index(target))) == 1
 
 
 def test_apply_ops_dedup_keeps_parallel_edges_with_distinct_flags(tmp_path):
@@ -461,16 +464,17 @@ def test_apply_ops_dedup_keeps_parallel_edges_with_distinct_flags(tmp_path):
     keeps both parallel edges -- the flag is what distinguishes them
     downstream.
     """
-    graph = nx.MultiDiGraph()
+    graph = SymbolGraph()
     src = SymbolNode("pkg.a", "function", tmp_path / "a.py", _pos())
     dst = SymbolNode("pkg.b", "function", tmp_path / "b.py", _pos())
-    graph.add_nodes_from([src, dst])
-    graph.add_edge(src, dst, flags=EdgeFlags.DEAD_BRANCH)
+    graph.add(src)
+    graph.add(dst)
+    graph.add_edge(src, dst, EdgeFlags.DEAD_BRANCH)
     emitted: set[tuple[SymbolNode, SymbolNode, EdgeFlags]] = {(src, dst, EdgeFlags.DEAD_BRANCH)}
 
     apply_ops(graph, [AddEdge(src, dst)], emitted)
 
-    assert graph.number_of_edges(src, dst) == 2
+    assert len(graph.raw.get_all_edge_data(graph.index(src), graph.index(dst))) == 2
 
 
 def test_plugin_context_contribution_exposes_nodes(tmp_path, make_contribution):
@@ -481,7 +485,7 @@ def test_plugin_context_contribution_exposes_nodes(tmp_path, make_contribution):
     nodes = frozenset({mod, fn})
 
     ctx = PluginContext(
-        graph=nx.DiGraph(),
+        graph=SymbolGraph(),
         symbol_lookup=SymbolTrie(),
         contribution=make_contribution(pkg, nodes),
         project_root=tmp_path,

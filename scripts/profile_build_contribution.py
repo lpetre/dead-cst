@@ -12,8 +12,7 @@ import pstats
 import time
 from pathlib import Path
 
-import networkx as nx
-
+from dead_cst._graphstore import SymbolGraph
 from dead_cst._package import PackageContribution, build_contribution
 from dead_cst._refresh import (
     PackageFiles,
@@ -112,7 +111,7 @@ def _profile_package_nodes(contrib: PackageContribution, project_root: Path) -> 
 
     def _make_ctx() -> PluginContext:
         return PluginContext(
-            graph=nx.DiGraph(),
+            graph=SymbolGraph(),
             symbol_lookup=contrib.trie,
             contribution=contrib,
             project_root=project_root,

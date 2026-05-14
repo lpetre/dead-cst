@@ -11,10 +11,10 @@ from enum import Enum
 from pathlib import Path
 from typing import Annotated, Iterator, Mapping, Sequence
 
-import networkx as nx
 import typer
 from libcst.metadata import CodeRange
 
+from ._graphstore import SymbolGraph
 from .analyze import Analysis, _count_nodes_by_prefix, _find_reachable
 from .cache import (
     GraphCache,
@@ -222,13 +222,13 @@ def analyze(
     else:
         _output_text(graph, unreachable_graph, root, package_paths, dead_suites)
 
-    if unreachable_graph.number_of_nodes() > 0:
+    if len(unreachable_graph) > 0:
         raise typer.Exit(1)
 
 
 def _output_text(
-    graph: nx.MultiDiGraph,
-    unreachable: nx.MultiDiGraph,
+    graph: SymbolGraph,
+    unreachable: SymbolGraph,
     root: Path,
     package_paths: Sequence[Path],
     dead_suites: Mapping[Path, tuple[CodeRange, ...]],
@@ -269,7 +269,7 @@ def _output_text(
             typer.echo(f"  {rel}:{start.line}:{start.column}-{end.line}:{end.column}")
 
 
-def _dead_real(unreachable: nx.MultiDiGraph) -> list[SymbolNode]:
+def _dead_real(unreachable: SymbolGraph) -> list[SymbolNode]:
     """Return real (non-synthetic) dead nodes from ``unreachable``.
 
     Synthetic nodes -- entrypoint sentinels, external-dist markers,
@@ -299,8 +299,8 @@ def _dead_suite_locations(
 
 
 def _output_json(
-    graph: nx.MultiDiGraph,
-    unreachable: nx.MultiDiGraph,
+    graph: SymbolGraph,
+    unreachable: SymbolGraph,
     root: Path,
     package_paths: Sequence[Path],
     dead_suites: Mapping[Path, tuple[CodeRange, ...]],
@@ -403,7 +403,7 @@ def why_alive(
 
     typer.echo(f"\nSymbol: {target_node.fqname} ({target_node.type})")
     typer.echo(f"Path: {_rel_path(target_node.path, root)}")
-    typer.echo(f"In-degree: {graph.in_degree(target_node)}")
+    typer.echo(f"In-degree: {graph.raw.in_degree(graph.index(target_node))}")
     typer.echo("\nPredecessor chain:")
 
     seen: set[SymbolNode] = set()

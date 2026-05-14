@@ -8,8 +8,8 @@ from pathlib import Path
 from typing import Iterable
 
 import libcst as cst
-import networkx as nx
 
+from dead_cst._graphstore import SymbolGraph
 from dead_cst.graph import SymbolTrie
 from dead_cst.plugins import GraphOp, ObserveContext, PluginContext
 from dead_cst.resolvers import Package
@@ -17,7 +17,7 @@ from dead_cst.resolvers import Package
 
 def _ctx(tmp_path, make_contribution):
     return PluginContext(
-        graph=nx.DiGraph(),
+        graph=SymbolGraph(),
         symbol_lookup=SymbolTrie(),
         contribution=make_contribution(Package(path=tmp_path, name="pkg")),
         project_root=tmp_path,

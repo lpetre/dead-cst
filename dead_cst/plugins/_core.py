@@ -31,10 +31,10 @@ from typing import (
 )
 
 import libcst as cst
-import networkx as nx
 from libcst.metadata import CodePosition, CodeRange
 
 from .._cacheable import Cacheable
+from .._graphstore import SymbolGraph
 from ..graph import EdgeFlags, NodeFlags, SymbolNode, SymbolTrie, _claim_edge
 
 if TYPE_CHECKING:
@@ -96,7 +96,7 @@ class PluginContext:
     the same analysis return the cached result.
     """
 
-    graph: nx.DiGraph
+    graph: SymbolGraph
     contribution: PackageContribution
     symbol_lookup: SymbolTrie
     project_root: Path
@@ -348,7 +348,7 @@ class EdgePlugin(Cacheable, Protocol):
 
 
 def apply_ops(
-    graph: nx.DiGraph,
+    graph: SymbolGraph,
     ops: Iterable[GraphOp],
     emitted: set[tuple[SymbolNode, SymbolNode, EdgeFlags]],
 ) -> None:
@@ -362,13 +362,14 @@ def apply_ops(
     for op in ops:
         match op:
             case AddNode(node):
-                graph.add_node(node)
+                graph.add(node)
             case AddEdge(src, dst):
                 if _claim_edge(emitted, src, dst, EdgeFlags.NONE):
                     graph.add_edge(src, dst)
             case RemoveEdge(src, dst):
-                if graph.has_edge(src, dst):
-                    graph.remove_edge(src, dst)
+                s, d = graph.index(src), graph.index(dst)
+                if graph.raw.has_edge(s, d):
+                    graph.raw.remove_edge(s, d)
                 emitted.discard((src, dst, EdgeFlags.NONE))
 
 
@@ -708,7 +709,7 @@ def collect_module_imports(
 
 
 def walk_to_instance_kind(
-    graph: nx.DiGraph,
+    graph: SymbolGraph,
     start: SymbolNode,
     terminal: SymbolNode,
     module_name: str,

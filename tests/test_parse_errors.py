@@ -64,7 +64,7 @@ def test_unparseable_module_keeps_importer_alive(tmp_path, make_analysis):
 
     graph = make_analysis().materialize_all()
 
-    edges = {f"{src.fqname} -> {dst.fqname}" for src, dst in graph.edges(keys=False)}
+    edges = {f"{graph.node(u).fqname} -> {graph.node(v).fqname}" for u, v in graph.raw.edge_list()}
     # The import node routes to the module (decl-level resolution is
     # impossible without the module's parsed decls).
     assert "consumer.greet -> broken" in edges

@@ -72,7 +72,7 @@ def _node_set(graph) -> set[tuple[str, str]]:
 
 
 def _edge_set(graph) -> set[tuple[str, str]]:
-    return {(s.fqname, d.fqname) for s, d in graph.edges()}
+    return {(graph.node(u).fqname, graph.node(v).fqname) for u, v in graph.raw.edge_list()}
 
 
 def _multi_file_layout() -> dict[str, str]:

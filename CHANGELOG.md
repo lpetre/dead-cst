@@ -10,6 +10,20 @@ two versions.
 ## [Unreleased]
 
 ### Changed
+- Swapped the graph backend from `networkx.MultiDiGraph` to a minimal
+  `rustworkx.PyDiGraph` wrapper (`dead_cst._graphstore.SymbolGraph`).
+  `SymbolGraph` exposes the `SymbolNode <-> int` index map plus
+  `SymbolNode`-keyed traversal sugar (`nodes`, `successors`,
+  `predecessors`, `subgraph`); anything beyond that goes through
+  `.raw` for rustworkx primitives. Plugin extension points
+  (`PluginContext.graph`, `Analysis.materialize_*` return types) are
+  now `SymbolGraph` instead of `networkx.MultiDiGraph`. Plugins that
+  used `ctx.graph.nodes` / `successors` / `predecessors` keep working
+  unchanged; anything that called other networkx methods (`edges`,
+  `has_edge`, `in_degree`, ...) needs to reach through `ctx.graph.raw`
+  for the rustworkx equivalent. `networkx` is no longer a runtime
+  dependency; `rustworkx>=0.15` replaces it.
+
 - Edge deduplication is centralized in the compose pass. One
   `emitted: set[(src, dst, EdgeFlags)]` owned by `_materialize` is
   shared across the three edge sources (contribution edges,
