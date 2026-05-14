@@ -1,15 +1,18 @@
 //! Experimental ty-backed native parser for dead-cst.
 //!
-//! Exposes a `Project` class that owns a ty `ProjectDatabase` (Salsa
-//! incremental computation, module/import resolution, semantic model).
-//! Queries against the project re-use the warm database, so repeated
-//! calls only re-execute work whose inputs changed.
+//! Exposes a `Project` class that owns a ty `ProjectDatabase`. Unlike
+//! `ty check`, this prototype does NOT discover a `pyproject.toml`:
+//! the resolver -- whatever produces dead-cst's `Package` tuples
+//! today -- is responsible for feeding the project layout in
+//! directly. This mirrors dead-cst's `Analysis(project_root,
+//! resolver=...)` shape: callers retain control of which paths are
+//! first-party, where the venv lives, and which Python version to
+//! target.
 //!
-//! Today there is one query, `extract_top_level_decls(path)`, which
-//! returns top-level def/class/assignment names from one file with
-//! libcst-compatible positions. The point of the prototype is to land
-//! the ty plumbing so follow-on queries (imports, FQN resolution,
-//! inferred-literal truthiness) ride the same Salsa db.
+//! One query today, `extract_top_level_decls(path)`. The Salsa db is
+//! re-used across calls so warm queries are free.
+
+use std::str::FromStr;
 
 use pyo3::exceptions::{PyOSError, PyValueError};
 use pyo3::prelude::*;
@@ -20,7 +23,11 @@ use ruff_db::system::{OsSystem, SystemPath, SystemPathBuf};
 use ruff_python_ast::{Expr, Stmt};
 use ruff_source_file::LineIndex;
 use ruff_text_size::TextRange;
+use ty_project::metadata::options::{EnvironmentOptions, Options};
+use ty_project::metadata::python_version::SupportedPythonVersion;
+use ty_project::metadata::value::{RangedValue, RelativePathBuf};
 use ty_project::{ProjectDatabase, ProjectMetadata};
+use ty_python_core::program::UseDefaultStrategy;
 
 /// One top-level declaration with libcst-compatible position info.
 ///
@@ -52,11 +59,19 @@ impl Decl {
     }
 }
 
-/// A ty-backed analysis project rooted at a filesystem path.
+/// A ty-backed analysis project with explicitly-injected configuration.
 ///
-/// Construction runs `ProjectMetadata::discover` against the root,
-/// which looks for a `pyproject.toml` / `ty.toml` walking upward,
-/// then builds a Salsa `ProjectDatabase` that all queries share.
+/// `root` is the directory all relative paths are resolved against.
+/// `src_roots` lists first-party search roots in priority order
+/// (analogous to the union of `Package.path` values produced by a
+/// `PathResolver`). `extra_paths` covers non-package roots that still
+/// need to be importable (vendored bundles, etc.). `python_env`
+/// points at a venv / `sys.prefix` so site-packages becomes
+/// available. `python_version` is the language version ty assumes
+/// when targeting `sys.version_info` conditionals. `typeshed`
+/// overrides the bundled stdlib stubs.
+///
+/// No on-disk config (`pyproject.toml`, `ty.toml`) is read.
 #[pyclass(unsendable)]
 struct Project {
     db: ProjectDatabase,
@@ -65,8 +80,51 @@ struct Project {
 #[pymethods]
 impl Project {
     #[new]
-    fn new(root: &str) -> PyResult<Self> {
+    #[pyo3(signature = (
+        root,
+        *,
+        src_roots = None,
+        extra_paths = None,
+        python_env = None,
+        python_version = None,
+        typeshed = None,
+    ))]
+    fn new(
+        root: &str,
+        src_roots: Option<Vec<String>>,
+        extra_paths: Option<Vec<String>>,
+        python_env: Option<&str>,
+        python_version: Option<&str>,
+        typeshed: Option<&str>,
+    ) -> PyResult<Self> {
         let root = SystemPathBuf::from(root);
+
+        let env = EnvironmentOptions {
+            root: src_roots.map(|paths| paths.into_iter().map(rel_path).collect()),
+            extra_paths: extra_paths.map(|paths| paths.into_iter().map(rel_path).collect()),
+            python: python_env.map(rel_path),
+            python_version: python_version
+                .map(|v| {
+                    SupportedPythonVersion::from_str(v).map_err(|e| {
+                        PyValueError::new_err(format!("invalid python_version {v:?}: {e}"))
+                    })
+                })
+                .transpose()?
+                .map(RangedValue::cli),
+            typeshed: typeshed.map(rel_path),
+            ..EnvironmentOptions::default()
+        };
+
+        let options = Options {
+            environment: Some(env),
+            ..Options::default()
+        };
+
+        let metadata = ProjectMetadata::from_options(options, root, None, &UseDefaultStrategy)
+            .map_err(|e| {
+                PyValueError::new_err(format!("invalid configuration: {e:?}"))
+            })?;
+
         let cwd = std::env::current_dir()
             .map_err(|e| PyOSError::new_err(format!("cwd unavailable: {e}")))?;
         let cwd = SystemPathBuf::from_path_buf(cwd.try_into().map_err(|_| {
@@ -74,8 +132,7 @@ impl Project {
         })?)
         .map_err(|_| PyValueError::new_err("current working directory is not absolute"))?;
         let system = OsSystem::new(cwd);
-        let metadata = ProjectMetadata::discover(&root, &system)
-            .map_err(|e| PyValueError::new_err(format!("project discovery failed: {e}")))?;
+
         let db = ProjectDatabase::use_defaults(metadata, system);
         Ok(Self { db })
     }
@@ -96,6 +153,10 @@ impl Project {
         }
         Ok(decls)
     }
+}
+
+fn rel_path<P: AsRef<str>>(path: P) -> RelativePathBuf {
+    RelativePathBuf::cli(SystemPath::new(path.as_ref()))
 }
 
 fn position(index: &LineIndex, source: &str, range: TextRange) -> (usize, usize, usize, usize) {
