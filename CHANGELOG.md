@@ -16,8 +16,8 @@ two versions.
   `resolve_edges` import resolution, plugin `AddEdge` ops), so
   cross-source and cross-package duplicates collapse to one edge
   instead of accumulating as parallel `MultiDiGraph` edges.
-  `resolve_edges` takes `emitted` as a required argument; `apply_ops`
-  takes it as an optional keyword for standalone callers.
+  `resolve_edges` and `apply_ops` both take `emitted` as a required
+  argument (breaking).
 
 - New `NodeFlags.EXPORTED` tags every node from a file under
   `Package.exported`, set via the visitor's `default_flags` mechanism

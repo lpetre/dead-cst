@@ -350,29 +350,26 @@ class EdgePlugin(Cacheable, Protocol):
 def apply_ops(
     graph: nx.DiGraph,
     ops: Iterable[GraphOp],
-    *,
-    emitted: set[tuple[SymbolNode, SymbolNode, EdgeFlags]] | None = None,
+    emitted: set[tuple[SymbolNode, SymbolNode, EdgeFlags]],
 ) -> None:
     """Apply ``ops`` to ``graph``.
 
     Plugin edges carry no flags, so ``AddEdge`` keys against ``emitted``
     as ``(src, dst, EdgeFlags.NONE)``. ``RemoveEdge`` drops that key so
-    a remove-then-add pair still re-adds the edge. Pass ``emitted=None``
-    for standalone use (no dedup).
+    a remove-then-add pair still re-adds the edge. Pass a fresh
+    ``set()`` for standalone use.
     """
     for op in ops:
         match op:
             case AddNode(node):
                 graph.add_node(node)
             case AddEdge(src, dst):
-                if emitted is not None and not _claim_edge(emitted, src, dst, EdgeFlags.NONE):
-                    continue
-                graph.add_edge(src, dst)
+                if _claim_edge(emitted, src, dst, EdgeFlags.NONE):
+                    graph.add_edge(src, dst)
             case RemoveEdge(src, dst):
                 if graph.has_edge(src, dst):
                     graph.remove_edge(src, dst)
-                if emitted is not None:
-                    emitted.discard((src, dst, EdgeFlags.NONE))
+                emitted.discard((src, dst, EdgeFlags.NONE))
 
 
 def synthetic_node(

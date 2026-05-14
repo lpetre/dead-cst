@@ -139,7 +139,7 @@ def _compose_contribution(
             # ctx.graph.nodes without tripping "dictionary changed
             # size during iteration".
             ops = list(plugin.finalize(ctx))
-            apply_ops(target_graph, ops, emitted=emitted)
+            apply_ops(target_graph, ops, emitted)
 
 
 _NON_DECL_TYPES: frozenset[str] = frozenset({"module", "synthetic"})

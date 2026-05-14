@@ -370,7 +370,7 @@ def test_apply_ops_dedupes_add_edge_against_emitted_set(tmp_path):
     graph.add_nodes_from([src, dst])
     emitted: set[tuple[SymbolNode, SymbolNode, EdgeFlags]] = set()
 
-    apply_ops(graph, [AddEdge(src, dst), AddEdge(src, dst)], emitted=emitted)
+    apply_ops(graph, [AddEdge(src, dst), AddEdge(src, dst)], emitted)
 
     assert graph.number_of_edges(src, dst) == 1
     assert (src, dst, EdgeFlags.NONE) in emitted
@@ -389,7 +389,7 @@ def test_apply_ops_dedup_respects_prior_contribution_edge(tmp_path):
     graph.add_edge(src, dst, flags=EdgeFlags.NONE)
     emitted: set[tuple[SymbolNode, SymbolNode, EdgeFlags]] = {(src, dst, EdgeFlags.NONE)}
 
-    apply_ops(graph, [AddEdge(src, dst)], emitted=emitted)
+    apply_ops(graph, [AddEdge(src, dst)], emitted)
 
     assert graph.number_of_edges(src, dst) == 1
 
@@ -406,7 +406,7 @@ def test_apply_ops_remove_edge_drops_dedup_key(tmp_path):
     graph.add_edge(src, dst)
     emitted: set[tuple[SymbolNode, SymbolNode, EdgeFlags]] = {(src, dst, EdgeFlags.NONE)}
 
-    apply_ops(graph, [RemoveEdge(src, dst), AddEdge(src, dst)], emitted=emitted)
+    apply_ops(graph, [RemoveEdge(src, dst), AddEdge(src, dst)], emitted)
 
     assert graph.number_of_edges(src, dst) == 1
     assert (src, dst, EdgeFlags.NONE) in emitted
@@ -468,7 +468,7 @@ def test_apply_ops_dedup_keeps_parallel_edges_with_distinct_flags(tmp_path):
     graph.add_edge(src, dst, flags=EdgeFlags.DEAD_BRANCH)
     emitted: set[tuple[SymbolNode, SymbolNode, EdgeFlags]] = {(src, dst, EdgeFlags.DEAD_BRANCH)}
 
-    apply_ops(graph, [AddEdge(src, dst)], emitted=emitted)
+    apply_ops(graph, [AddEdge(src, dst)], emitted)
 
     assert graph.number_of_edges(src, dst) == 2
 
