@@ -127,6 +127,7 @@ def resolve_edges(
     *,
     import_resolver: ImportResolver = default_resolve_import,
     search_paths: list[Path] | None = None,
+    emitted: set[tuple[SymbolNode, SymbolNode, EdgeFlags]] | None = None,
 ) -> Generator[tuple[SymbolNode, SymbolNode, EdgeFlags], None, None]:
     """Yield concrete edges from raw-name import triples.
 
@@ -135,6 +136,14 @@ def resolve_edges(
     purely trie-driven. The default resolver + empty search paths
     suffice for tests; the analyzer wires its configured resolver
     through here.
+
+    ``emitted`` is the compose-time edge-dedup set shared across the
+    three edge sources (contribution edges, import resolution, plugin
+    finalize). When supplied, ``resolve_edges`` populates it instead of
+    a private set, so triples already added by the caller are skipped
+    here and the caller can add yielded triples to the graph without
+    re-checking. Standalone callers (tests, scripts) can omit it and
+    get the same per-call dedup behavior as before.
 
     Resolution is memoized at three nested layers so the per-package
     compose loop's growth in importer count is additive rather than
@@ -149,8 +158,8 @@ def resolve_edges(
     """
     if search_paths is None:
         search_paths = []
-
-    emitted: set[tuple[SymbolNode, SymbolNode, EdgeFlags]] = set()
+    if emitted is None:
+        emitted = set()
     synthetic_memo: dict[str, SymbolNode] = {}
     external_memo: dict[tuple[str, bool], SymbolNode | None] = {}
     # ``id(SymbolTrie)`` is safe as a key here: each trie node is held

@@ -17,6 +17,8 @@ from dead_cst.plugins._core import (
     AddEdge,
     AddNode,
     PluginContext,
+    RemoveEdge,
+    apply_ops,
     collect_module_imports,
     decorator_owner,
     find_call_assignments,
@@ -27,7 +29,7 @@ from dead_cst.plugins._core import (
     matched_attr_call,
     single_target_assignment,
 )
-from dead_cst.graph import NodeFlags, SymbolNode, SymbolTrie
+from dead_cst.graph import EdgeFlags, NodeFlags, SymbolNode, SymbolTrie
 from dead_cst.resolvers import Package
 
 
@@ -353,6 +355,122 @@ def test_find_call_assignments_ignores_non_call_rhs():
         """
     )
     assert find_call_assignments(module, {"Flask": "Flask"}, {"Flask"}) == {}
+
+
+def test_apply_ops_dedupes_add_edge_against_emitted_set(tmp_path):
+    """``apply_ops`` keys plugin ``AddEdge`` against
+    ``(src, dst, EdgeFlags.NONE)`` -- the second emission for the same
+    pair becomes a no-op when the dedup set already has the key, so
+    ``MultiDiGraph`` doesn't accumulate parallel edges from cross-
+    source duplicates.
+    """
+    graph = nx.MultiDiGraph()
+    src = SymbolNode("pkg.a", "function", tmp_path / "a.py", _pos())
+    dst = SymbolNode("pkg.b", "function", tmp_path / "b.py", _pos())
+    graph.add_nodes_from([src, dst])
+    emitted: set[tuple[SymbolNode, SymbolNode, EdgeFlags]] = set()
+
+    apply_ops(graph, [AddEdge(src, dst), AddEdge(src, dst)], emitted=emitted)
+
+    assert graph.number_of_edges(src, dst) == 1
+    assert (src, dst, EdgeFlags.NONE) in emitted
+
+
+def test_apply_ops_dedup_respects_prior_contribution_edge(tmp_path):
+    """A visitor / import edge already in the emitted set blocks a
+    later plugin ``AddEdge`` for the same pair. The dedup set is the
+    single source of truth across all three edge sources composed in
+    one pass.
+    """
+    graph = nx.MultiDiGraph()
+    src = SymbolNode("pkg.a", "function", tmp_path / "a.py", _pos())
+    dst = SymbolNode("pkg.b", "function", tmp_path / "b.py", _pos())
+    graph.add_nodes_from([src, dst])
+    graph.add_edge(src, dst, flags=EdgeFlags.NONE)
+    emitted: set[tuple[SymbolNode, SymbolNode, EdgeFlags]] = {(src, dst, EdgeFlags.NONE)}
+
+    apply_ops(graph, [AddEdge(src, dst)], emitted=emitted)
+
+    assert graph.number_of_edges(src, dst) == 1
+
+
+def test_apply_ops_remove_edge_drops_dedup_key(tmp_path):
+    """``RemoveEdge`` clears the matching ``(src, dst, NONE)`` entry
+    so a subsequent ``AddEdge`` for the same pair is re-added rather
+    than silently swallowed.
+    """
+    graph = nx.MultiDiGraph()
+    src = SymbolNode("pkg.a", "function", tmp_path / "a.py", _pos())
+    dst = SymbolNode("pkg.b", "function", tmp_path / "b.py", _pos())
+    graph.add_nodes_from([src, dst])
+    graph.add_edge(src, dst)
+    emitted: set[tuple[SymbolNode, SymbolNode, EdgeFlags]] = {(src, dst, EdgeFlags.NONE)}
+
+    apply_ops(graph, [RemoveEdge(src, dst), AddEdge(src, dst)], emitted=emitted)
+
+    assert graph.number_of_edges(src, dst) == 1
+    assert (src, dst, EdgeFlags.NONE) in emitted
+
+
+def test_materialize_dedupes_edges_across_visitor_and_plugin(make_analysis, write_files, tmp_path):
+    """Plugin ``AddEdge`` re-asserting an edge the visitor already
+    contributed does not produce a parallel multi-edge -- the compose-
+    pass dedup set spans all three edge sources.
+    """
+    from dead_cst.plugins._core import ObserveContext
+
+    write_files(
+        {
+            "pkg/__init__.py": "",
+            "pkg/a.py": """
+                from pkg.b import target
+                def caller():
+                    target()
+            """,
+            "pkg/b.py": "def target(): pass",
+        }
+    )
+
+    class _ReAssertImportPlugin:
+        name = "re_assert_import"
+        version = 1
+
+        def observe(self, ctx: ObserveContext) -> None:
+            return None
+
+        def finalize(self, ctx: PluginContext):
+            # Re-assert the cross-file edge ``pkg.a.caller -> pkg.b.target``
+            # that the visitor + import resolution already contributed.
+            # Without compose-time dedup this produces a parallel edge.
+            caller = next((n for n in ctx.graph.nodes if n.fqname == "pkg.a.caller"), None)
+            target = next((n for n in ctx.graph.nodes if n.fqname == "pkg.b.target"), None)
+            if caller is None or target is None:
+                return ()
+            return [AddEdge(caller, target)]
+
+    graph = make_analysis(plugins=[_ReAssertImportPlugin()]).materialize_all()
+    caller = next(n for n in graph.nodes if n.fqname == "pkg.a.caller")
+    target = next(n for n in graph.nodes if n.fqname == "pkg.b.target")
+    assert graph.number_of_edges(caller, target) == 1
+
+
+def test_apply_ops_dedup_keeps_parallel_edges_with_distinct_flags(tmp_path):
+    """Plugin edges key as ``NONE``; a pre-existing flagged edge for
+    the same pair (e.g. ``DEAD_BRANCH`` from the visitor) does not
+    block the plugin emission because the keys differ. MultiDiGraph
+    keeps both parallel edges -- the flag is what distinguishes them
+    downstream.
+    """
+    graph = nx.MultiDiGraph()
+    src = SymbolNode("pkg.a", "function", tmp_path / "a.py", _pos())
+    dst = SymbolNode("pkg.b", "function", tmp_path / "b.py", _pos())
+    graph.add_nodes_from([src, dst])
+    graph.add_edge(src, dst, flags=EdgeFlags.DEAD_BRANCH)
+    emitted: set[tuple[SymbolNode, SymbolNode, EdgeFlags]] = {(src, dst, EdgeFlags.DEAD_BRANCH)}
+
+    apply_ops(graph, [AddEdge(src, dst)], emitted=emitted)
+
+    assert graph.number_of_edges(src, dst) == 2
 
 
 def test_plugin_context_contribution_exposes_nodes(tmp_path, make_contribution):

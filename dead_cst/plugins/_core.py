@@ -35,7 +35,7 @@ import networkx as nx
 from libcst.metadata import CodePosition, CodeRange
 
 from .._cacheable import Cacheable
-from ..graph import NodeFlags, SymbolNode, SymbolTrie
+from ..graph import EdgeFlags, NodeFlags, SymbolNode, SymbolTrie
 
 if TYPE_CHECKING:
     from .._package import PackageContribution
@@ -347,16 +347,39 @@ class EdgePlugin(Cacheable, Protocol):
     def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]: ...
 
 
-def apply_ops(graph: nx.DiGraph, ops: Iterable[GraphOp]) -> None:
+def apply_ops(
+    graph: nx.DiGraph,
+    ops: Iterable[GraphOp],
+    *,
+    emitted: set[tuple[SymbolNode, SymbolNode, EdgeFlags]] | None = None,
+) -> None:
+    """Apply ``ops`` to ``graph``.
+
+    ``emitted`` is the compose-time edge-dedup set shared across the
+    three edge sources (contribution edges, import resolution, plugin
+    finalize). When supplied, an :class:`AddEdge` whose ``(src, dst,
+    EdgeFlags.NONE)`` triple is already in the set is skipped (plugin
+    edges carry no flags, so they key as ``NONE``); otherwise the
+    triple is recorded so siblings + later passes can dedupe against
+    it. :class:`RemoveEdge` drops the same key so a remove-then-add
+    pair still re-adds the edge.
+    """
     for op in ops:
         match op:
             case AddNode(node):
                 graph.add_node(node)
             case AddEdge(src, dst):
+                key = (src, dst, EdgeFlags.NONE)
+                if emitted is not None:
+                    if key in emitted:
+                        continue
+                    emitted.add(key)
                 graph.add_edge(src, dst)
             case RemoveEdge(src, dst):
                 if graph.has_edge(src, dst):
                     graph.remove_edge(src, dst)
+                if emitted is not None:
+                    emitted.discard((src, dst, EdgeFlags.NONE))
 
 
 def synthetic_node(

@@ -90,6 +90,7 @@ def _compose_contribution(
     project_root: Path,
     import_resolver: ImportResolver,
     search_paths: list[Path],
+    emitted: set[tuple[SymbolNode, SymbolNode, EdgeFlags]],
 ) -> None:
     """Merge ``contrib``'s raw nodes / edges into ``target_graph``,
     stitch cross-package imports against ``symbol_lookup``, and run
@@ -103,20 +104,32 @@ def _compose_contribution(
     classification path (stdlib / external dist / external file /
     unresolved); they are unused when every import resolves
     first-party in the trie.
+
+    ``emitted`` is the compose-pass edge-dedup set: every
+    ``(src, dst, flags)`` triple added to ``target_graph`` -- from any
+    of the three edge sources -- gets recorded here, and any repeat is
+    skipped. Caller (:meth:`Analysis._materialize`) owns the set so
+    the dedup window spans every package in the same pass; cross-
+    package duplicates (e.g. two packages re-exporting the same
+    external) collapse to one edge.
     """
     target_graph.add_nodes_from(contrib.nodes)
-    target_graph.add_edges_from((src, dst, {"flags": flags}) for src, dst, flags in contrib.edges)
     target_graph.graph.setdefault("dead_suites", {}).update(contrib.dead_suites)
-    target_graph.add_edges_from(
-        (src, dst, {"flags": flags})
-        for src, dst, flags in resolve_edges(
-            contrib.import_edges,
-            symbol_lookup,
-            contrib.package.path,
-            import_resolver=import_resolver,
-            search_paths=search_paths,
-        )
-    )
+    for src, dst, flags in contrib.edges:
+        key = (src, dst, flags)
+        if key in emitted:
+            continue
+        emitted.add(key)
+        target_graph.add_edge(src, dst, flags=flags)
+    for src, dst, flags in resolve_edges(
+        contrib.import_edges,
+        symbol_lookup,
+        contrib.package.path,
+        import_resolver=import_resolver,
+        search_paths=search_paths,
+        emitted=emitted,
+    ):
+        target_graph.add_edge(src, dst, flags=flags)
     if plugins:
         ctx = PluginContext(
             graph=target_graph,
@@ -131,7 +144,7 @@ def _compose_contribution(
             # ctx.graph.nodes without tripping "dictionary changed
             # size during iteration".
             ops = list(plugin.finalize(ctx))
-            apply_ops(target_graph, ops)
+            apply_ops(target_graph, ops, emitted=emitted)
 
 
 _NON_DECL_TYPES: frozenset[str] = frozenset({"module", "synthetic"})
@@ -574,6 +587,12 @@ class Analysis:
         baseline = list(sys.path)
         last_search_paths: tuple[Path, ...] | None = None
         target_paths = [p.path for p in self.packages if p.path in included]
+        # One dedup set spans the whole compose pass so cross-package
+        # duplicates (e.g. two packages both importing the same external
+        # dist) collapse to one edge. ``_compose_contribution`` populates
+        # it from contribution edges, ``resolve_edges`` (called through
+        # the same path), and plugin ``AddEdge`` ops.
+        emitted: set[tuple[SymbolNode, SymbolNode, EdgeFlags]] = set()
         try:
             for path in progress(
                 target_paths,
@@ -598,6 +617,7 @@ class Analysis:
                     project_root=self._project_root,
                     import_resolver=self._import_resolver,
                     search_paths=list(search_paths),
+                    emitted=emitted,
                 )
         finally:
             sys.path[:] = baseline
