@@ -105,6 +105,59 @@ import pytest
             },
             id="global-rebind-misattributes-outer-read",
         ),
+        pytest.param(
+            {
+                "a.py": 'def g(): return "a"\n',
+                "b.py": 'def g(): return "b"\n',
+                "mod.py": """
+                from a import *
+                from b import *
+                """,
+                "consumer.py": "from mod import g\ng()\n",
+            },
+            # Python's runtime: the second ``from b import *`` overwrites
+            # the first, so ``mod.g`` resolves to ``b.g``. The ideal edge
+            # set would include ``consumer.g -> b.g`` and omit
+            # ``consumer.g -> a.g``.
+            #
+            # ``_materialize_star_reexports`` is "first writer wins": it
+            # sorts star records by ``(importer_fqname, target_module,
+            # line, col)`` and creates a synthetic ``mod.g`` re-export
+            # pointing at the first one to claim the name. Since stars
+            # sort by target-module string (``"a" < "b"``), ``mod.g``
+            # ends up pointing at ``a.g`` rather than ``b.g``. The
+            # consumer's ``from mod import g`` routes through that
+            # synthetic, so ``consumer.g -> a.g`` instead of
+            # ``consumer.g -> b.g``.
+            #
+            # Both ``a.g`` and ``b.g`` are still kept alive via the
+            # module-level fan-out (``mod -> a.g``, ``mod -> b.g``), so
+            # this gap doesn't affect dead-code detection. Fixing it
+            # requires propagating each star's source position into
+            # ``star_records`` and replacing-on-collision in source
+            # order rather than alphabetic-by-target order.
+            {
+                "a.g -> a",
+                "b.g -> b",
+                "consumer -> a.g",
+                "consumer -> consumer.g",
+                "consumer -> mod",
+                "consumer -> mod.g",
+                "consumer.g -> a.g",
+                "consumer.g -> consumer",
+                "consumer.g -> mod",
+                "consumer.g -> mod.g",
+                "mod -> a",
+                "mod -> a.g",
+                "mod -> b",
+                "mod -> b.g",
+                "mod -> mod.g",
+                "mod.g -> a",
+                "mod.g -> a.g",
+                "mod.g -> mod",
+            },
+            id="last-star-wins-not-implemented",
+        ),
     ],
 )
 def test_limitation(build_decl_graph, assert_edges, files, expected_edges):
