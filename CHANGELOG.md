@@ -10,19 +10,14 @@ two versions.
 ## [Unreleased]
 
 ### Changed
-- Edge deduplication is now centralized in the compose pass. A single
-  `emitted: set[(src, dst, EdgeFlags)]` set owned by
-  `Analysis._materialize` is shared across the three edge sources
-  (contribution edges, `resolve_edges` import resolution, plugin
-  `AddEdge` ops). Cross-source duplicates -- including cross-package
-  ones (e.g. two packages re-exporting the same external) -- collapse
-  to one edge instead of accumulating as parallel `MultiDiGraph`
-  edges. `resolve_edges` and `apply_ops` gained an optional
-  `emitted=` keyword; standalone callers (tests, scripts) can omit it
-  and get the same per-call dedup behavior as before. Plugin `AddEdge`
-  ops key as `(src, dst, EdgeFlags.NONE)` (plugins emit flagless
-  edges) and `RemoveEdge` drops the matching key so remove-then-add
-  still re-adds the edge.
+- Edge deduplication is centralized in the compose pass. One
+  `emitted: set[(src, dst, EdgeFlags)]` owned by `_materialize` is
+  shared across the three edge sources (contribution edges,
+  `resolve_edges` import resolution, plugin `AddEdge` ops), so
+  cross-source and cross-package duplicates collapse to one edge
+  instead of accumulating as parallel `MultiDiGraph` edges.
+  `resolve_edges` takes `emitted` as a required argument; `apply_ops`
+  takes it as an optional keyword for standalone callers.
 
 - New `NodeFlags.EXPORTED` tags every node from a file under
   `Package.exported`, set via the visitor's `default_flags` mechanism

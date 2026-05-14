@@ -35,7 +35,7 @@ import networkx as nx
 from libcst.metadata import CodePosition, CodeRange
 
 from .._cacheable import Cacheable
-from ..graph import EdgeFlags, NodeFlags, SymbolNode, SymbolTrie
+from ..graph import EdgeFlags, NodeFlags, SymbolNode, SymbolTrie, _claim_edge
 
 if TYPE_CHECKING:
     from .._package import PackageContribution
@@ -355,25 +355,18 @@ def apply_ops(
 ) -> None:
     """Apply ``ops`` to ``graph``.
 
-    ``emitted`` is the compose-time edge-dedup set shared across the
-    three edge sources (contribution edges, import resolution, plugin
-    finalize). When supplied, an :class:`AddEdge` whose ``(src, dst,
-    EdgeFlags.NONE)`` triple is already in the set is skipped (plugin
-    edges carry no flags, so they key as ``NONE``); otherwise the
-    triple is recorded so siblings + later passes can dedupe against
-    it. :class:`RemoveEdge` drops the same key so a remove-then-add
-    pair still re-adds the edge.
+    Plugin edges carry no flags, so ``AddEdge`` keys against ``emitted``
+    as ``(src, dst, EdgeFlags.NONE)``. ``RemoveEdge`` drops that key so
+    a remove-then-add pair still re-adds the edge. Pass ``emitted=None``
+    for standalone use (no dedup).
     """
     for op in ops:
         match op:
             case AddNode(node):
                 graph.add_node(node)
             case AddEdge(src, dst):
-                key = (src, dst, EdgeFlags.NONE)
-                if emitted is not None:
-                    if key in emitted:
-                        continue
-                    emitted.add(key)
+                if emitted is not None and not _claim_edge(emitted, src, dst, EdgeFlags.NONE):
+                    continue
                 graph.add_edge(src, dst)
             case RemoveEdge(src, dst):
                 if graph.has_edge(src, dst):

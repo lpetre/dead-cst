@@ -280,6 +280,18 @@ cycle-protected via a per-walk `visited` set keyed on
 (`A.x: from B import x` / `B.x: from A import x`) terminates after one
 trip with the encountered decls still emitted.
 
+Edge deduplication is centralized in the compose pass: one
+`emitted: set[(src, dst, EdgeFlags)]` owned by
+`Analysis._materialize` is threaded through `_compose_contribution`
+into all three edge sources — contribution edges, `resolve_edges`
+import resolution, and `apply_ops` (plugin `AddEdge`). The shared
+`graph._claim_edge` helper records each triple once, so cross-source
+and cross-package duplicates (e.g. two packages re-exporting the
+same external) collapse to one edge instead of accumulating as
+parallel `MultiDiGraph` edges. Plugin edges carry no flags, so they
+key as `(src, dst, EdgeFlags.NONE)`; `RemoveEdge` drops that key so
+remove-then-add still re-adds the edge.
+
 ### 6. Plugins — `dead_cst/plugins/`
 
 Two phases per `EdgePlugin`:

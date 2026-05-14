@@ -22,7 +22,7 @@ from .branches import (
     UnreachableRegionDetector,
 )
 from .cache import GraphCache, compute_fingerprint
-from .graph import EdgeFlags, NodeFlags, SymbolNode, SymbolTrie
+from .graph import EdgeFlags, NodeFlags, SymbolNode, SymbolTrie, _claim_edge
 from .plugins import (
     EdgePlugin,
     PluginContext,
@@ -105,29 +105,24 @@ def _compose_contribution(
     unresolved); they are unused when every import resolves
     first-party in the trie.
 
-    ``emitted`` is the compose-pass edge-dedup set: every
-    ``(src, dst, flags)`` triple added to ``target_graph`` -- from any
-    of the three edge sources -- gets recorded here, and any repeat is
-    skipped. Caller (:meth:`Analysis._materialize`) owns the set so
-    the dedup window spans every package in the same pass; cross-
-    package duplicates (e.g. two packages re-exporting the same
-    external) collapse to one edge.
+    ``emitted`` is owned by :meth:`Analysis._materialize` so the dedup
+    window spans every package in one compose pass -- cross-package
+    duplicates (e.g. two packages re-exporting the same external)
+    collapse to one edge instead of accumulating as parallel
+    ``MultiDiGraph`` edges.
     """
     target_graph.add_nodes_from(contrib.nodes)
     target_graph.graph.setdefault("dead_suites", {}).update(contrib.dead_suites)
     for src, dst, flags in contrib.edges:
-        key = (src, dst, flags)
-        if key in emitted:
-            continue
-        emitted.add(key)
-        target_graph.add_edge(src, dst, flags=flags)
+        if _claim_edge(emitted, src, dst, flags):
+            target_graph.add_edge(src, dst, flags=flags)
     for src, dst, flags in resolve_edges(
         contrib.import_edges,
         symbol_lookup,
         contrib.package.path,
+        emitted,
         import_resolver=import_resolver,
         search_paths=search_paths,
-        emitted=emitted,
     ):
         target_graph.add_edge(src, dst, flags=flags)
     if plugins:
