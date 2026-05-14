@@ -175,10 +175,6 @@ def _find_reachable(
     ``prefix`` filters the returned set to nodes whose ``path`` lies
     under it; the BFS still traverses the full graph, so transitive
     reachability through nodes outside ``prefix`` is preserved.
-
-    Callers wanting the default flag-driven seed set (every node
-    carrying :data:`NodeFlags.ENTRYPOINT`) compute it with
-    :func:`_entrypoint_seeds`.
     """
     visited: set[SymbolNode] = set()
     stack = list(seeds)
@@ -221,13 +217,15 @@ def _find_kept_alive_by_flags_only(
 ) -> set[SymbolNode]:
     """Symbols reachable only from entrypoints carrying any of ``flags``.
 
-    ``_find_reachable(graph) - _find_reachable(graph, flags)``; the
-    difference is the "blast radius" of dropping every entrypoint with
-    any of those flag bits. Surfaced on :class:`Analysis` and
+    Diff between full reachability and reachability with every
+    ``flags``-tagged entrypoint dropped -- the "blast radius" of
+    removing those entrypoints. Surfaced on :class:`Analysis` and
     :class:`PackageView` as ``kept_alive_by_flags_only(flags)``.
     """
-    return _find_reachable(graph, _entrypoint_seeds(graph), prefix=prefix) - _find_reachable(
-        graph, _entrypoint_seeds(graph, flags), prefix=prefix
+    all_seeds = _entrypoint_seeds(graph)
+    kept_seeds = [n for n in all_seeds if not (n.flags & flags)]
+    return _find_reachable(graph, all_seeds, prefix=prefix) - _find_reachable(
+        graph, kept_seeds, prefix=prefix
     )
 
 
