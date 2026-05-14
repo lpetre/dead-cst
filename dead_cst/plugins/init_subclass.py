@@ -173,7 +173,7 @@ class InitSubclassPlugin:
                         continue
                     seen.add(sub)
                     stack.append(sub)
-                    if not sub.path.is_relative_to(ctx.package.path):
+                    if not sub.path.is_relative_to(ctx.contribution.package.path):
                         continue
                     if sub in existing_targets[marker]:
                         continue

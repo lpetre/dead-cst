@@ -106,23 +106,22 @@ def main() -> None:
 
 
 def _profile_package_nodes(contrib: PackageContribution, project_root: Path) -> None:
-    """Benchmark :attr:`PluginContext.package_nodes` iteration."""
+    """Benchmark :attr:`PluginContext.contribution.nodes` iteration."""
     n_total = len(contrib.nodes)
-    print(f"\npackage_nodes: contribution has {n_total} node(s)")
+    print(f"\ncontribution.nodes: contribution has {n_total} node(s)")
 
     def _make_ctx() -> PluginContext:
         return PluginContext(
             graph=nx.DiGraph(),
             symbol_lookup=contrib.trie,
-            package=contrib.package,
+            contribution=contrib,
             project_root=project_root,
-            package_nodes=contrib.nodes,
         )
 
     t0 = time.perf_counter()
     matched = 0
     for _ in range(REPEATS):
-        matched = sum(1 for _ in _make_ctx().package_nodes)
+        matched = sum(1 for _ in _make_ctx().contribution.nodes)
     cold_per_call_us = (time.perf_counter() - t0) / REPEATS * 1e6
     print(f"  cold:  {cold_per_call_us:8.1f} us per call ({matched} nodes)")
 

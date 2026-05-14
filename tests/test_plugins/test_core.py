@@ -71,7 +71,7 @@ def test_unknown_plugin_raises():
 # ---------------------------------------------------------------------------
 
 
-def _ctx_with_synthetic(fqname: str, base: Path) -> PluginContext:
+def _ctx_with_synthetic(fqname: str, base: Path, make_contribution) -> PluginContext:
     """Build a minimal PluginContext containing a single synthetic node."""
     graph = nx.DiGraph()
     node = SymbolNode(
@@ -84,43 +84,42 @@ def _ctx_with_synthetic(fqname: str, base: Path) -> PluginContext:
     return PluginContext(
         graph=graph,
         symbol_lookup=SymbolTrie(),
-        package=Package(path=base, name="pkg"),
+        contribution=make_contribution(Package(path=base, name="pkg"), frozenset({node})),
         project_root=base,
-        package_nodes=frozenset({node}),
     )
 
 
-def test_require_resolved_dep_returns_external_dist(tmp_path):
+def test_require_resolved_dep_returns_external_dist(tmp_path, make_contribution):
     from dead_cst.plugins._core import EXTERNAL_DIST_PREFIX, require_resolved_dep
 
-    ctx = _ctx_with_synthetic(f"{EXTERNAL_DIST_PREFIX}fastapi", tmp_path)
+    ctx = _ctx_with_synthetic(f"{EXTERNAL_DIST_PREFIX}fastapi", tmp_path, make_contribution)
     node = require_resolved_dep(ctx, "fastapi")
     assert node is not None
     assert node.fqname == f"{EXTERNAL_DIST_PREFIX}fastapi"
 
 
-def test_require_resolved_dep_returns_external_file(tmp_path):
+def test_require_resolved_dep_returns_external_file(tmp_path, make_contribution):
     from dead_cst.plugins._core import EXTERNAL_FILE_PREFIX, require_resolved_dep
 
-    ctx = _ctx_with_synthetic(f"{EXTERNAL_FILE_PREFIX}fastapi", tmp_path)
+    ctx = _ctx_with_synthetic(f"{EXTERNAL_FILE_PREFIX}fastapi", tmp_path, make_contribution)
     assert require_resolved_dep(ctx, "fastapi") is not None
 
 
-def test_require_resolved_dep_returns_none_if_not_imported(tmp_path):
+def test_require_resolved_dep_returns_none_if_not_imported(tmp_path, make_contribution):
     from dead_cst.plugins._core import EXTERNAL_DIST_PREFIX, require_resolved_dep
 
-    ctx = _ctx_with_synthetic(f"{EXTERNAL_DIST_PREFIX}something_else", tmp_path)
+    ctx = _ctx_with_synthetic(f"{EXTERNAL_DIST_PREFIX}something_else", tmp_path, make_contribution)
     assert require_resolved_dep(ctx, "fastapi") is None
 
 
-def test_require_resolved_dep_raises_on_unresolved(tmp_path):
+def test_require_resolved_dep_raises_on_unresolved(tmp_path, make_contribution):
     from dead_cst.plugins._core import (
         UNRESOLVED_PREFIX,
         UnresolvedDependencyError,
         require_resolved_dep,
     )
 
-    ctx = _ctx_with_synthetic(f"{UNRESOLVED_PREFIX}fastapi", tmp_path)
+    ctx = _ctx_with_synthetic(f"{UNRESOLVED_PREFIX}fastapi", tmp_path, make_contribution)
     with pytest.raises(UnresolvedDependencyError, match="uv sync"):
         require_resolved_dep(ctx, "fastapi")
 
@@ -356,8 +355,8 @@ def test_find_call_assignments_ignores_non_call_rhs():
     assert find_call_assignments(module, {"Flask": "Flask"}, {"Flask"}) == {}
 
 
-def test_plugin_context_package_nodes_exposes_constructor_set(tmp_path):
-    """``package_nodes`` is the immutable frozenset passed in."""
+def test_plugin_context_contribution_exposes_nodes(tmp_path, make_contribution):
+    """``contribution.nodes`` is the immutable frozenset passed in."""
     pkg = Package(path=tmp_path, name="pkg")
     mod = SymbolNode("pkg", "module", tmp_path / "__init__.py", _pos())
     fn = SymbolNode("pkg.f", "function", tmp_path / "a.py", _pos())
@@ -366,8 +365,8 @@ def test_plugin_context_package_nodes_exposes_constructor_set(tmp_path):
     ctx = PluginContext(
         graph=nx.DiGraph(),
         symbol_lookup=SymbolTrie(),
-        package=pkg,
+        contribution=make_contribution(pkg, nodes),
         project_root=tmp_path,
-        package_nodes=nodes,
     )
-    assert ctx.package_nodes == nodes
+    assert ctx.contribution.nodes == nodes
+    assert ctx.contribution.package is pkg

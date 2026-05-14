@@ -43,10 +43,11 @@ from ._visitor import SymbolVisitor
 from .branches import UnreachableRegionDetector
 from .cache import GraphCache
 from .graph import Import, NodeFlags, SymbolNode, VisitorPayload
-from .plugins import EdgePlugin, ObserveContext
 from .plugins._core import (
     SYNTHETIC_POSITION,
     UNPARSEABLE_PREFIX,
+    EdgePlugin,
+    ObserveContext,
     make_payload,
     synthetic_node,
 )

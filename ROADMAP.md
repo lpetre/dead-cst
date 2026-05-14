@@ -162,13 +162,15 @@ Folded down from earlier tiers as they landed:
   replacing two filter passes that ran on the merged cross-package
   ``graph`` every finalize pass: ``Path.is_relative_to`` (~9 ms → ~40
   µs on the dead-cst self-analysis) and ``type == "module"`` (~50 µs →
-  ~4 µs). The unreleased follow-up in ``_package.py`` (see CHANGELOG
+  ~4 µs). The unreleased follow-ups in ``_package.py`` (see CHANGELOG
   ``[Unreleased]``) reshaped this further: ``PackageContribution``
-  itself became a raw record (no ``nx.MultiDiGraph`` wrapper),
-  ``package_nodes`` is now a ``frozenset[SymbolNode]`` field rather
-  than a method, and ``package_graph`` / ``module_nodes`` /
-  ``package_modules()`` / ``PackageView.modules()`` were removed for
-  having no in-tree consumers.
+  became a raw record (no ``nx.MultiDiGraph`` wrapper); the per-package
+  ``trie``, raw edges, dead-suite map, and import-edges are now
+  surfaced on ``PluginContext`` via a single ``ctx.contribution: PackageContribution``
+  field; and ``package`` / ``package_nodes`` / ``package_graph`` /
+  ``module_nodes`` / ``package_modules()`` / ``PackageView.modules()``
+  were removed for having no in-tree consumers (plugins read
+  ``ctx.contribution.package`` / ``ctx.contribution.nodes``).
 - **v0.9.3**: ``ServerConfigPlugin`` (``dead_cst.contrib.server_config``,
   registered as the ``server_config`` builtin) marks Gunicorn / Hypercorn
   config files (``gunicorn.conf.py``, ``gunicorn_conf.py``,

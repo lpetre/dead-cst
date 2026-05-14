@@ -36,6 +36,12 @@ class PackageContribution:
     holds every visible decl; consumer-side merges filter via
     :meth:`SymbolTrie.merge_exported`. ``nodes`` and ``edges`` are raw
     sets; ``dead_suites`` maps each file to its dead-suite positions.
+
+    Surfaced to plugin authors as :attr:`dead_cst.plugins.PluginContext.contribution`
+    so finalize passes can read package-local data (the per-package
+    trie, the contributed node set, the raw edge / import-edge triples,
+    the dead-suite map) without reaching back into the cross-package
+    graph.
     """
 
     package: Package

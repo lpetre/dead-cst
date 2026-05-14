@@ -121,9 +121,8 @@ def _compose_contribution(
         ctx = PluginContext(
             graph=target_graph,
             symbol_lookup=symbol_lookup,
-            package=contrib.package,
+            contribution=contrib,
             project_root=project_root,
-            package_nodes=contrib.nodes,
         )
         for plugin in plugins:
             if not isinstance(plugin, EdgePlugin):
@@ -745,9 +744,8 @@ class PackageView:
         ctx = PluginContext(
             graph=graph,
             symbol_lookup=self._analysis._build_symbol_lookup(self._package.path),
-            package=self._package,
+            contribution=contrib,
             project_root=self._analysis.project_root,
-            package_nodes=contrib.nodes,
         )
         return ctx.importers(target)
 

@@ -46,7 +46,7 @@ class ProjectScriptsPlugin:
         return None
 
     def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]:
-        pyproject = self.pyproject_path or ctx.package.path / "pyproject.toml"
+        pyproject = self.pyproject_path or ctx.contribution.package.path / "pyproject.toml"
         data = load_toml(pyproject)
         if data is None:
             return

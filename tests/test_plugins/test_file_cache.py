@@ -1,5 +1,5 @@
 """Tests for the per-package ``PluginContext`` surface: ``parse``, ``importers``,
-``package_nodes``."""
+``contribution.nodes``."""
 
 from __future__ import annotations
 
@@ -15,20 +15,19 @@ from dead_cst.plugins import GraphOp, ObserveContext, PluginContext
 from dead_cst.resolvers import Package
 
 
-def _ctx(tmp_path):
+def _ctx(tmp_path, make_contribution):
     return PluginContext(
         graph=nx.DiGraph(),
         symbol_lookup=SymbolTrie(),
-        package=Package(path=tmp_path, name="pkg"),
+        contribution=make_contribution(Package(path=tmp_path, name="pkg")),
         project_root=tmp_path,
-        package_nodes=frozenset(),
     )
 
 
-def test_parse_memoizes_within_a_pass(tmp_path):
+def test_parse_memoizes_within_a_pass(tmp_path, make_contribution):
     p = tmp_path / "a.py"
     p.write_text("def f(): pass\n")
-    ctx = _ctx(tmp_path)
+    ctx = _ctx(tmp_path, make_contribution)
     module = ctx.parse(p)
     assert isinstance(module, cst.Module)
     # Mutating the file afterwards doesn't affect the cached parse.
@@ -36,17 +35,17 @@ def test_parse_memoizes_within_a_pass(tmp_path):
     assert ctx.parse(p) is module
 
 
-def test_parse_handles_syntax_error(tmp_path):
+def test_parse_handles_syntax_error(tmp_path, make_contribution):
     p = tmp_path / "broken.py"
     p.write_text("def : pass\n")
-    ctx = _ctx(tmp_path)
+    ctx = _ctx(tmp_path, make_contribution)
     assert ctx.parse(p) is None
     # Failure is also cached.
     assert ctx.parse(p) is None
 
 
 def test_package_nodes_only_yields_under_package(tmp_path, make_analysis, write_files):
-    """``ctx.package_nodes`` filters to the current package, not the full graph."""
+    """``ctx.contribution.nodes`` filters to the current package, not the full graph."""
     write_files(
         {
             "a/pkg/__init__.py": "",
@@ -66,8 +65,8 @@ def test_package_nodes_only_yields_under_package(tmp_path, make_analysis, write_
             return None
 
         def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]:
-            seen_per_package[ctx.package.path] = {
-                n.path.name for n in ctx.package_nodes if n.type == "module"
+            seen_per_package[ctx.contribution.package.path] = {
+                n.path.name for n in ctx.contribution.nodes if n.type == "module"
             }
             return ()
 

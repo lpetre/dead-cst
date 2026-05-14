@@ -38,6 +38,7 @@ from .._cacheable import Cacheable
 from ..graph import NodeFlags, SymbolNode, SymbolTrie
 
 if TYPE_CHECKING:
+    from .._package import PackageContribution
     from ..graph import VisitorPayload
     from ..resolvers._core import Package
 
@@ -74,9 +75,20 @@ class PluginContext:
     order (deps before dependents wherever the package graph is
     acyclic). Each invocation gets a fresh context whose
     ``symbol_lookup`` matches what was visible to that package's import
-    resolution. Plugins should normally iterate :attr:`package_nodes`
-    rather than :attr:`graph` because :attr:`graph` accumulates nodes
-    across packages.
+    resolution. Plugins should normally iterate
+    ``contribution.nodes`` rather than :attr:`graph` because
+    :attr:`graph` accumulates nodes across packages.
+
+    :attr:`contribution` is the raw per-package build product
+    (:class:`~dead_cst.plugins.PackageContribution`): the
+    :class:`~dead_cst.resolvers.Package`, the package-local
+    :class:`~dead_cst.graph.SymbolTrie`, the contributed
+    :class:`~dead_cst.graph.SymbolNode` set, the raw edge / import-edge
+    triples, and the per-file dead-suite map. ``contribution.trie`` is
+    *not* the same as :attr:`symbol_lookup`: the former is just this
+    package's decls, while ``symbol_lookup`` carries this package plus
+    its dependencies' exported entries (the lookup that was visible to
+    edge stitching for this package).
 
     :attr:`_modules` is a request-scope memo for :meth:`parse`: nothing
     is pre-populated, so the first plugin that asks for a given file's
@@ -85,9 +97,8 @@ class PluginContext:
     """
 
     graph: nx.DiGraph
-    package_nodes: frozenset[SymbolNode]
+    contribution: PackageContribution
     symbol_lookup: SymbolTrie
-    package: Package
     project_root: Path
     _modules: dict[Path, cst.Module | None] = field(default_factory=dict, repr=False)
     # Lazy ``fqname -> SymbolNode`` index over synthetic nodes (built on
@@ -171,7 +182,7 @@ class PluginContext:
                     break
         if target_node is None:
             return set()
-        package_path = self.package.path
+        package_path = self.contribution.package.path
         return {
             pred.path
             for pred in self.graph.predecessors(target_node)

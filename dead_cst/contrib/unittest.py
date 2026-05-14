@@ -177,7 +177,7 @@ class UnittestPlugin:
                 # its own subclasses are also test cases.
                 stack.append(sub.fqname)
 
-        package_path = ctx.package.path
+        package_path = ctx.contribution.package.path
         by_module_path: dict[Path, list[SymbolNode]] = {}
         for sub in subclasses:
             if not sub.path.is_relative_to(package_path):
