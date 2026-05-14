@@ -18,20 +18,19 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import networkx as nx
-
+from dead_cst import Analysis
 from dead_cst.analyze import (
     _find_kept_alive_by_dead_branches as find_kept_alive_by_dead_branches,
     _find_reachable as find_reachable,
 )
 
 
-def _dead_suite_positions(graph: nx.MultiDiGraph, file: Path) -> tuple:
-    return graph.graph.get("dead_suites", {}).get(file, ())
+def _dead_suite_positions(analysis: Analysis, file: Path) -> tuple:
+    return analysis.dead_suites().get(file, ())
 
 
-def test_if_false_records_dead_suite(build_decl_graph, tmp_path):
-    graph = build_decl_graph(
+def test_if_false_records_dead_suite(make_analysis, write_files, tmp_path):
+    write_files(
         {
             "mod.py": """
             def helper(): pass
@@ -40,7 +39,8 @@ def test_if_false_records_dead_suite(build_decl_graph, tmp_path):
             """
         }
     )
-    suites = _dead_suite_positions(graph, tmp_path / "mod.py")
+    analysis = make_analysis()
+    suites = _dead_suite_positions(analysis, tmp_path / "mod.py")
     assert len(suites) == 1
     pos = suites[0]
     # libcst positions an ``IndentedBlock`` at its first statement, not
@@ -50,8 +50,8 @@ def test_if_false_records_dead_suite(build_decl_graph, tmp_path):
     assert pos.start.column == 4
 
 
-def test_if_true_marks_else_as_unreachable(build_decl_graph, tmp_path):
-    graph = build_decl_graph(
+def test_if_true_marks_else_as_unreachable(make_analysis, write_files, tmp_path):
+    write_files(
         {
             "mod.py": """
             def helper(): pass
@@ -62,11 +62,12 @@ def test_if_true_marks_else_as_unreachable(build_decl_graph, tmp_path):
             """
         }
     )
-    assert len(_dead_suite_positions(graph, tmp_path / "mod.py")) == 1
+    analysis = make_analysis()
+    assert len(_dead_suite_positions(analysis, tmp_path / "mod.py")) == 1
 
 
-def test_unknown_condition_records_no_dead_suite(build_decl_graph, tmp_path):
-    graph = build_decl_graph(
+def test_unknown_condition_records_no_dead_suite(make_analysis, write_files, tmp_path):
+    write_files(
         {
             "mod.py": """
             def helper(): pass
@@ -77,7 +78,8 @@ def test_unknown_condition_records_no_dead_suite(build_decl_graph, tmp_path):
             """
         }
     )
-    assert _dead_suite_positions(graph, tmp_path / "mod.py") == ()
+    analysis = make_analysis()
+    assert _dead_suite_positions(analysis, tmp_path / "mod.py") == ()
 
 
 def test_dead_branch_internal_ref_is_flagged(build_decl_graph, assert_dead_branch_edges):
@@ -162,8 +164,8 @@ def test_find_kept_alive_by_dead_branches_returns_strict_diff(build_decl_graph, 
     assert helper in blast
 
 
-def test_nested_dead_suites_record_separate_positions(build_decl_graph, tmp_path):
-    graph = build_decl_graph(
+def test_nested_dead_suites_record_separate_positions(make_analysis, write_files, tmp_path):
+    write_files(
         {
             "mod.py": """
             def a(): pass
@@ -175,7 +177,8 @@ def test_nested_dead_suites_record_separate_positions(build_decl_graph, tmp_path
             """
         }
     )
-    assert len(_dead_suite_positions(graph, tmp_path / "mod.py")) == 2
+    analysis = make_analysis()
+    assert len(_dead_suite_positions(analysis, tmp_path / "mod.py")) == 2
 
 
 def test_nested_dead_suites_flag_both_refs(build_decl_graph, assert_dead_branch_edges):
@@ -326,8 +329,9 @@ def test_default_detector_does_not_flag_named_condition(tmp_path, make_analysis,
             "settings.py": "IS_PROD = True\n",
         }
     )
-    graph = make_analysis().materialize_all()
-    assert _dead_suite_positions(graph, tmp_path / "mod.py") == ()
+    analysis = make_analysis()
+    analysis.materialize_all()
+    assert _dead_suite_positions(analysis, tmp_path / "mod.py") == ()
 
 
 def test_elif_false_in_chain_flags_only_dead_branch(build_decl_graph, assert_dead_branch_edges):

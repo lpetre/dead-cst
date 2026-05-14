@@ -273,8 +273,8 @@ def test_shadowed_decl_in_graph_keeps_consistent_identity(make_analysis, write_f
     assert flagged_matches == [s]
 
 
-def test_dead_suites_exposed_on_graph(tmp_path, make_analysis, write_files):
-    """``graph.graph['dead_suites']`` lists positions per analyzed file."""
+def test_dead_suites_exposed_on_analysis(tmp_path, make_analysis, write_files):
+    """``Analysis.dead_suites()`` lists positions per analyzed file."""
     write_files(
         {
             "pkg/__init__.py": "",
@@ -284,8 +284,7 @@ def test_dead_suites_exposed_on_graph(tmp_path, make_analysis, write_files):
             """,
         }
     )
-    g = make_analysis().materialize_all()
-    suites = g.graph["dead_suites"]
+    suites = make_analysis().dead_suites()
     file = tmp_path / "pkg" / "a.py"
     assert file in suites
     assert len(suites[file]) == 1
