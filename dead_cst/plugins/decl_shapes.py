@@ -422,10 +422,12 @@ class DispatchAppPlugin:
         app_prefix = self._prefix("app")
         pending_prefix = self._prefix("pending")
         factory_prefix = self._prefix("factory")
+        raw = ctx.graph.raw
         for synth in ctx.contribution.nodes:
             if synth.type != "synthetic" or not synth.fqname.startswith(pending_prefix):
                 continue
-            for var in list(ctx.graph.successors(synth)):
+            for j in list(raw.successor_indices(ctx.graph.index(synth))):
+                var = raw[j]
                 kind = walk_to_instance_kind(
                     ctx.graph,
                     var,

@@ -4,12 +4,12 @@ import difflib
 from pathlib import Path
 
 import libcst as cst
-import networkx as nx
 from libcst.codemod import CodemodContext
 from libcst.codemod.visitors import RemoveImportsVisitor
 from libcst.metadata import CodeRange, FullRepoManager, PositionProvider, QualifiedNameSource
 
 from ._fqn import FixedFullyQualifiedNameProvider
+from ._graphstore import SymbolGraph
 from .graph import NodeFlags, SymbolNode
 
 
@@ -88,7 +88,7 @@ def _import_remove_args(node: SymbolNode) -> tuple[str, str | None, str | None]:
     return module, obj, asname
 
 
-def _select_files(G: nx.Graph, base: Path) -> tuple[dict[Path, list[SymbolNode]], list[Path]]:
+def _select_files(G: SymbolGraph, base: Path) -> tuple[dict[Path, list[SymbolNode]], list[Path]]:
     """Group ``G``'s nodes under ``base`` into files-to-rewrite vs. files-to-delete.
 
     Used by both :func:`remove_code` and :func:`generate_patch`. Symbols
@@ -149,7 +149,7 @@ def _rewrite_one(wrapper, nodes: list[SymbolNode]) -> tuple[str, str]:
     return original, result.code
 
 
-def remove_code(G: nx.Graph, package_path: Path) -> None:
+def remove_code(G: SymbolGraph, package_path: Path) -> None:
     """Delete every symbol in ``G`` from the source files under ``package_path``.
 
     Modules are removed by unlinking the file. Functions, classes, and
@@ -188,7 +188,7 @@ def remove_code(G: nx.Graph, package_path: Path) -> None:
             path.write_text(new)
 
 
-def generate_patch(G: nx.Graph, root: Path) -> str:
+def generate_patch(G: SymbolGraph, root: Path) -> str:
     """Return a ``git apply``-compatible unified diff that removes ``G``'s nodes.
 
     Same selection logic as :func:`remove_code` -- group dead nodes by

@@ -196,8 +196,8 @@ def test_apply_flags_dead_branch_edges(make_analysis, write_files):
     # MultiDiGraph: parallel edges between the same pair are kept
     # separate. Both live and dead-branch refs to ``helper`` produce
     # edges from the module; the flag distinguishes them.
-    edges = list(graph.edges(module, data=True))
-    flags_seen = {attrs.get("flags", EdgeFlags.NONE) for _, dst, attrs in edges if dst == helper}
+    edges = list(graph.raw.out_edges(graph.index(module)))
+    flags_seen = {payload for _, dst_i, payload in edges if graph.node(dst_i) == helper}
     assert EdgeFlags.NONE in flags_seen
     assert EdgeFlags.DEAD_BRANCH in flags_seen
 

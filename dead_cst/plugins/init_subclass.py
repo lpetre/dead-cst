@@ -134,6 +134,7 @@ class InitSubclassPlugin:
     def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]:
         # Index synth markers by fqname so we can look up
         # ``<subclass-of:F>`` buckets in O(1) per parent fqname.
+        raw = ctx.graph.raw
         subclass_buckets: dict[str, SymbolNode] = {}
         init_markers: list[tuple[SymbolNode, SymbolNode]] = []  # (parent_class, marker)
         for node in ctx.graph.nodes:
@@ -144,15 +145,17 @@ class InitSubclassPlugin:
                 # graph dedupes by node identity. Keep the first.
                 subclass_buckets.setdefault(node.fqname[len(SUBCLASS_OF_PREFIX) :], node)
             elif node.fqname.startswith(INIT_SUBCLASS_PREFIX):
-                preds = [p for p in ctx.graph.predecessors(node) if p.type == "class"]
-                for parent in preds:
-                    init_markers.append((parent, node))
+                for i in raw.predecessor_indices(ctx.graph.index(node)):
+                    pred = raw[i]
+                    if pred.type == "class":
+                        init_markers.append((pred, node))
 
         if not init_markers:
             return
 
         existing_targets = {
-            marker: set(ctx.graph.successors(marker)) for _parent, marker in init_markers
+            marker: {raw[i] for i in raw.successor_indices(ctx.graph.index(marker))}
+            for _parent, marker in init_markers
         }
 
         # BFS subclass closure rooted at each parent's fqname; emit
@@ -160,20 +163,25 @@ class InitSubclassPlugin:
         # current package. Direct subclasses are graph.successors of
         # ``<subclass-of:parent.fqname>``; their own fqnames key further
         # buckets, recursively.
+        package_path = ctx.contribution.package.path
         for parent, marker in init_markers:
-            seen: set[SymbolNode] = set()
-            stack = [parent]
+            parent_idx = ctx.graph.index(parent)
+            seen_idx: set[int] = {parent_idx}
+            stack: list[int] = [parent_idx]
             while stack:
-                current = stack.pop()
+                current = raw[stack.pop()]
                 bucket = subclass_buckets.get(current.fqname)
                 if bucket is None:
                     continue
-                for sub in ctx.graph.successors(bucket):
-                    if sub.type != "class" or sub in seen or sub is parent:
+                for j in raw.successor_indices(ctx.graph.index(bucket)):
+                    if j in seen_idx:
                         continue
-                    seen.add(sub)
-                    stack.append(sub)
-                    if not sub.path.is_relative_to(ctx.contribution.package.path):
+                    sub = raw[j]
+                    if sub.type != "class":
+                        continue
+                    seen_idx.add(j)
+                    stack.append(j)
+                    if not sub.path.is_relative_to(package_path):
                         continue
                     if sub in existing_targets[marker]:
                         continue

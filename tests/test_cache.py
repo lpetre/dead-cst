@@ -338,7 +338,7 @@ def _node_set(graph):
 
 
 def _edge_set(graph):
-    return {(s.fqname, d.fqname) for s, d in graph.edges()}
+    return {(graph.node(u).fqname, graph.node(v).fqname) for u, v in graph.raw.edge_list()}
 
 
 def test_build_symbol_graph_cached_matches_uncached(tmp_path, make_analysis):

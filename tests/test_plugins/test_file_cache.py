@@ -1,5 +1,5 @@
-"""Tests for the per-package ``PluginContext`` surface: ``parse``, ``importers``,
-``contribution.nodes``."""
+"""Tests for the per-package ``PluginContext`` surface: ``parse``,
+``contribution.nodes``, and the analyzer-side ``PackageView.importers_of``."""
 
 from __future__ import annotations
 
@@ -8,8 +8,8 @@ from pathlib import Path
 from typing import Iterable
 
 import libcst as cst
-import networkx as nx
 
+from dead_cst._graphstore import SymbolGraph
 from dead_cst.graph import SymbolTrie
 from dead_cst.plugins import GraphOp, ObserveContext, PluginContext
 from dead_cst.resolvers import Package
@@ -17,7 +17,7 @@ from dead_cst.resolvers import Package
 
 def _ctx(tmp_path, make_contribution):
     return PluginContext(
-        graph=nx.DiGraph(),
+        graph=SymbolGraph(),
         symbol_lookup=SymbolTrie(),
         contribution=make_contribution(Package(path=tmp_path, name="pkg")),
         project_root=tmp_path,
@@ -75,8 +75,8 @@ def test_package_nodes_only_yields_under_package(tmp_path, make_analysis, write_
     assert seen_per_package[tmp_path / "b"] == {"__init__.py", "m.py"}
 
 
-def test_importers_finds_first_party_imports(make_analysis, write_files):
-    """``ctx.importers(fqname)`` returns paths whose imports reach the target module."""
+def test_importers_of_finds_first_party_imports(make_analysis, write_files, tmp_path):
+    """``PackageView.importers_of(fqname)`` returns paths whose imports reach the target."""
     write_files(
         {
             "pkg/__init__.py": "",
@@ -85,26 +85,12 @@ def test_importers_finds_first_party_imports(make_analysis, write_files):
             "pkg/no_lib.py": "def f(): pass",
         }
     )
-    seen: set[Path] = set()
-
-    @dataclass
-    class _Capture:
-        name: str = "capture"
-        version: str = "1"
-
-        def observe(self, ctx: ObserveContext):
-            return None
-
-        def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]:
-            seen.update(ctx.importers("pkg.lib"))
-            return ()
-
-    make_analysis(plugins=[_Capture()]).materialize_all()
+    seen = make_analysis().package(tmp_path).importers_of("pkg.lib")
     assert {p.name for p in seen} == {"uses_lib.py"}
 
 
-def test_importers_finds_third_party_dist(make_analysis, write_files):
-    """``ctx.importers("typer")`` resolves to the synthetic external dep node."""
+def test_importers_of_finds_third_party_dist(make_analysis, write_files, tmp_path):
+    """``PackageView.importers_of("typer")`` resolves to the synthetic external dep node."""
     write_files(
         {
             "pkg/__init__.py": "",
@@ -112,40 +98,10 @@ def test_importers_finds_third_party_dist(make_analysis, write_files):
             "pkg/no_typer.py": "def f(): pass",
         }
     )
-    seen: set[Path] = set()
-
-    @dataclass
-    class _Capture:
-        name: str = "capture"
-        version: str = "1"
-
-        def observe(self, ctx: ObserveContext):
-            return None
-
-        def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]:
-            seen.update(ctx.importers("typer"))
-            return ()
-
-    make_analysis(plugins=[_Capture()]).materialize_all()
+    seen = make_analysis().package(tmp_path).importers_of("typer")
     assert {p.name for p in seen} == {"uses_typer.py"}
 
 
-def test_importers_unknown_returns_empty(make_analysis, write_files):
+def test_importers_of_unknown_returns_empty(make_analysis, write_files, tmp_path):
     write_files({"pkg/__init__.py": "", "pkg/a.py": "def f(): pass"})
-    saw_empty = False
-
-    @dataclass
-    class _Capture:
-        name: str = "capture"
-        version: str = "1"
-
-        def observe(self, ctx: ObserveContext):
-            return None
-
-        def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]:
-            nonlocal saw_empty
-            saw_empty = ctx.importers("definitely-not-a-module") == set()
-            return ()
-
-    make_analysis(plugins=[_Capture()]).materialize_all()
-    assert saw_empty
+    assert make_analysis().package(tmp_path).importers_of("definitely-not-a-module") == set()

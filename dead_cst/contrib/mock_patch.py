@@ -159,7 +159,9 @@ class MockPatchPlugin:
             if fqname not in decls_cache:
                 decls_cache[fqname] = ctx.find_declarations(fqname)
                 modules_cache[fqname] = ctx.find_module(fqname)
-            existing = set(ctx.graph.successors(node))
+            existing = {
+                ctx.graph.raw[i] for i in ctx.graph.raw.successor_indices(ctx.graph.index(node))
+            }
             for decl in decls_cache[fqname]:
                 if decl not in existing:
                     yield AddEdge(node, decl)

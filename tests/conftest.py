@@ -2,10 +2,10 @@ import json
 import logging
 import textwrap
 
-import networkx as nx
 import pytest
 
 from dead_cst import Analysis, EdgeFlags
+from dead_cst._graphstore import SymbolGraph
 from dead_cst.resolvers import ManualResolver
 
 
@@ -56,7 +56,7 @@ def make_analysis(tmp_path):
 
 @pytest.fixture
 def build_decl_graph(tmp_path, make_analysis):
-    def _make_graph(files: dict[str, str]) -> nx.MultiDiGraph:
+    def _make_graph(files: dict[str, str]) -> SymbolGraph:
         for filename, content in files.items():
             full_path = tmp_path / filename
             full_path.parent.mkdir(parents=True, exist_ok=True)
@@ -103,13 +103,9 @@ def write_notebook(tmp_path):
     return _write
 
 
-def _is_dead_branch(attrs) -> bool:
-    return bool(attrs.get("flags", EdgeFlags.NONE) & EdgeFlags.DEAD_BRANCH)
-
-
 @pytest.fixture
 def assert_edges():
-    def _check(graph: nx.MultiDiGraph, expected_edges: set[str]):
+    def _check(graph: SymbolGraph, expected_edges: set[str]):
         """Compare graph edges to expected 'a -> b' strings.
 
         Iterates the full edge set, including ``DEAD_BRANCH``-flagged
@@ -120,7 +116,9 @@ def assert_edges():
         ``(u, v)`` pair, different attrs) collapse to one assertion
         entry; ``set`` deduping handles that automatically.
         """
-        actual_edges = {f"{src.fqname} -> {dst.fqname}" for src, dst in graph.edges(keys=False)}
+        actual_edges = {
+            f"{graph.node(u).fqname} -> {graph.node(v).fqname}" for u, v in graph.raw.edge_list()
+        }
         assert actual_edges == expected_edges
 
     return _check
@@ -145,8 +143,10 @@ def assert_positional_edges():
         start = sym.position.start
         return f"{sym.fqname}@{start.line}:{start.column}"
 
-    def _check(graph: nx.MultiDiGraph, expected_edges: set[str]):
-        actual_edges = {f"{_fmt(src)} -> {_fmt(dst)}" for src, dst in graph.edges(keys=False)}
+    def _check(graph: SymbolGraph, expected_edges: set[str]):
+        actual_edges = {
+            f"{_fmt(graph.node(u))} -> {_fmt(graph.node(v))}" for u, v in graph.raw.edge_list()
+        }
         assert actual_edges == expected_edges
 
     return _check
@@ -156,11 +156,11 @@ def assert_positional_edges():
 def assert_dead_branch_edges():
     """Assert on edges flagged ``EdgeFlags.DEAD_BRANCH`` as ``"src.fqname -> dst.fqname"``."""
 
-    def _check(graph: nx.MultiDiGraph, expected_edges: set[str]):
+    def _check(graph: SymbolGraph, expected_edges: set[str]):
         actual = {
-            f"{src.fqname} -> {dst.fqname}"
-            for src, dst, attrs in graph.edges(data=True)
-            if _is_dead_branch(attrs)
+            f"{graph.node(u).fqname} -> {graph.node(v).fqname}"
+            for u, v, payload in graph.raw.weighted_edge_list()
+            if payload & EdgeFlags.DEAD_BRANCH
         }
         assert actual == expected_edges
 

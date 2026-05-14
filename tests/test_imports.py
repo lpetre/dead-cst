@@ -540,23 +540,25 @@ def test_third_party_import_creates_synthetic_node(build_decl_graph):
     graph = build_decl_graph(
         {
             "p/__init__.py": "",
-            "p/uses_nx.py": "import networkx as nx\ndef build(): return nx.DiGraph()",
+            "p/uses_rx.py": "import rustworkx as rx\ndef build(): return rx.PyDiGraph()",
         }
     )
-    nx_nodes = {
+    rx_nodes = {
         n
         for n in graph.nodes
         if n.type == "synthetic"
         and n.fqname.startswith(EXTERNAL_PREFIXES)
-        and "networkx" in n.fqname
+        and "rustworkx" in n.fqname
     }
-    assert nx_nodes, (
-        "expected an external-dep synthetic node for networkx, got "
+    assert rx_nodes, (
+        "expected an external-dep synthetic node for rustworkx, got "
         f"{[n.fqname for n in graph.nodes if n.type == 'synthetic']}"
     )
 
-    edge_srcs = {src.fqname for src, dst in graph.edges(keys=False) if dst in nx_nodes}
-    assert {"p.uses_nx.nx", "p.uses_nx.build"} <= edge_srcs
+    edge_srcs = {
+        graph.node(u).fqname for u, v in graph.raw.edge_list() if graph.node(v) in rx_nodes
+    }
+    assert {"p.uses_rx.rx", "p.uses_rx.build"} <= edge_srcs
 
 
 def test_stdlib_imports_are_silent(build_decl_graph, caplog):
@@ -628,7 +630,9 @@ def test_module_runtime_dunder_access_is_module_dep(build_decl_graph, assert_edg
     # No synthetic was minted for the missing-dunder lookup.
     assert not [n.fqname for n in graph.nodes if n.fqname.endswith(".__file__")]
     # The module-level dependency edges remain intact for each user of a dunder.
-    edge_strs = {f"{src.fqname} -> {dst.fqname}" for src, dst in graph.edges(keys=False)}
+    edge_strs = {
+        f"{graph.node(u).fqname} -> {graph.node(v).fqname}" for u, v in graph.raw.edge_list()
+    }
     assert "pkg.config.FILE_PATH -> pkg" in edge_strs
     assert "pkg.config.NAME -> pkg" in edge_strs
     assert "pkg.config.SPEC -> pkg" in edge_strs
@@ -648,7 +652,9 @@ def test_dunder_on_imported_symbol_strips_dunder_tail(build_decl_graph, assert_e
             "pkg/uses.py": ("from pkg.lib import Cls\nWHO = Cls.__name__\nDOCSTR = Cls.__doc__\n"),
         }
     )
-    edge_strs = {f"{src.fqname} -> {dst.fqname}" for src, dst in graph.edges(keys=False)}
+    edge_strs = {
+        f"{graph.node(u).fqname} -> {graph.node(v).fqname}" for u, v in graph.raw.edge_list()
+    }
     assert "pkg.uses.WHO -> pkg.lib.Cls" in edge_strs
     assert "pkg.uses.DOCSTR -> pkg.lib.Cls" in edge_strs
 
@@ -695,7 +701,9 @@ def test_import_resolves_through_star_reexport(build_decl_graph, assert_edges):
             "consumer.py": "from pkg import g\ng()\n",
         }
     )
-    edge_strs = {f"{src.fqname} -> {dst.fqname}" for src, dst in graph.edges(keys=False)}
+    edge_strs = {
+        f"{graph.node(u).fqname} -> {graph.node(v).fqname}" for u, v in graph.raw.edge_list()
+    }
     assert "consumer.g -> pkg._internal.g" in edge_strs
     assert "consumer.g -> pkg.g" in edge_strs
 
@@ -710,7 +718,9 @@ def test_import_resolves_through_chained_star_reexports(build_decl_graph, assert
             "consumer.py": "from A import g\ng()\n",
         }
     )
-    edge_strs = {f"{src.fqname} -> {dst.fqname}" for src, dst in graph.edges(keys=False)}
+    edge_strs = {
+        f"{graph.node(u).fqname} -> {graph.node(v).fqname}" for u, v in graph.raw.edge_list()
+    }
     assert "consumer.g -> C.g" in edge_strs
 
 
@@ -723,7 +733,9 @@ def test_star_reexport_cycle_terminates(build_decl_graph, assert_edges):
             "consumer.py": "from A import b\n",
         }
     )
-    edge_strs = {f"{src.fqname} -> {dst.fqname}" for src, dst in graph.edges(keys=False)}
+    edge_strs = {
+        f"{graph.node(u).fqname} -> {graph.node(v).fqname}" for u, v in graph.raw.edge_list()
+    }
     assert "consumer.b -> B.b" in edge_strs
 
 
@@ -736,7 +748,9 @@ def test_star_reexport_shadowed_by_real_decl(build_decl_graph, assert_edges):
             "consumer.py": "from mod import g\ng()\n",
         }
     )
-    edge_strs = {f"{src.fqname} -> {dst.fqname}" for src, dst in graph.edges(keys=False)}
+    edge_strs = {
+        f"{graph.node(u).fqname} -> {graph.node(v).fqname}" for u, v in graph.raw.edge_list()
+    }
     assert "consumer.g -> mod.g" in edge_strs
     assert "consumer.g -> other.g" not in edge_strs
 
@@ -812,7 +826,9 @@ def test_star_reexport_crosses_packages(tmp_path, make_analysis, assert_edges):
     (pkg_b / "B" / "__init__.py").write_text("from A import *\n")
 
     graph = make_analysis(["pkg_b:pkg_a", "pkg_a"]).materialize_all()
-    edge_strs = {f"{src.fqname} -> {dst.fqname}" for src, dst in graph.edges(keys=False)}
+    edge_strs = {
+        f"{graph.node(u).fqname} -> {graph.node(v).fqname}" for u, v in graph.raw.edge_list()
+    }
     assert "B.g -> A.g" in edge_strs
     assert "B -> B.g" in edge_strs
 

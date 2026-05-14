@@ -11,10 +11,10 @@ from enum import Enum
 from pathlib import Path
 from typing import Annotated, Iterator, Mapping, Sequence
 
-import networkx as nx
 import typer
 from libcst.metadata import CodeRange
 
+from ._graphstore import SymbolGraph
 from .analyze import Analysis, _count_nodes_by_prefix, _entrypoint_seeds, _find_reachable
 from .cache import (
     GraphCache,
@@ -222,13 +222,13 @@ def analyze(
     else:
         _output_text(graph, unreachable_graph, root, package_paths, dead_suites)
 
-    if unreachable_graph.number_of_nodes() > 0:
+    if len(unreachable_graph) > 0:
         raise typer.Exit(1)
 
 
 def _output_text(
-    graph: nx.MultiDiGraph,
-    unreachable: nx.MultiDiGraph,
+    graph: SymbolGraph,
+    unreachable: SymbolGraph,
     root: Path,
     package_paths: Sequence[Path],
     dead_suites: Mapping[Path, tuple[CodeRange, ...]],
@@ -269,7 +269,7 @@ def _output_text(
             typer.echo(f"  {rel}:{start.line}:{start.column}-{end.line}:{end.column}")
 
 
-def _dead_real(unreachable: nx.MultiDiGraph) -> list[SymbolNode]:
+def _dead_real(unreachable: SymbolGraph) -> list[SymbolNode]:
     """Return real (non-synthetic) dead nodes from ``unreachable``.
 
     Synthetic nodes -- entrypoint sentinels, external-dist markers,
@@ -299,8 +299,8 @@ def _dead_suite_locations(
 
 
 def _output_json(
-    graph: nx.MultiDiGraph,
-    unreachable: nx.MultiDiGraph,
+    graph: SymbolGraph,
+    unreachable: SymbolGraph,
     root: Path,
     package_paths: Sequence[Path],
     dead_suites: Mapping[Path, tuple[CodeRange, ...]],
@@ -403,18 +403,19 @@ def why_alive(
 
     typer.echo(f"\nSymbol: {target_node.fqname} ({target_node.type})")
     typer.echo(f"Path: {_rel_path(target_node.path, root)}")
-    typer.echo(f"In-degree: {graph.in_degree(target_node)}")
+    typer.echo(f"In-degree: {graph.raw.in_degree(graph.index(target_node))}")
     typer.echo("\nPredecessor chain:")
 
-    seen: set[SymbolNode] = set()
-    stack = [target_node]
+    seen_idx: set[int] = set()
+    stack: list[int] = [graph.index(target_node)]
     while stack:
-        node = stack.pop()
-        if node in seen:
+        i = stack.pop()
+        if i in seen_idx:
             continue
-        seen.add(node)
+        seen_idx.add(i)
+        node = graph.node(i)
         typer.echo(f"  <- {node.fqname} ({node.type}) at {_rel_path(node.path, root)}")
-        stack.extend(graph.predecessors(node))
+        stack.extend(graph.raw.predecessor_indices(i))
 
 
 def _is_dunder_all(node: SymbolNode) -> bool:
@@ -546,25 +547,27 @@ def unused_exports(
     def _is_dunder_seed(node: SymbolNode) -> bool:
         return node.type == "synthetic" and node.fqname.startswith(DUNDER_PREFIX)
 
-    visited: set[SymbolNode] = set()
-    stack = [n for n in graph.nodes if n.flags & NodeFlags.ENTRYPOINT]
+    visited_idx: set[int] = set()
+    stack: list[int] = [graph.index(n) for n in graph.nodes if n.flags & NodeFlags.ENTRYPOINT]
     while stack:
-        node = stack.pop()
-        if node in visited:
+        i = stack.pop()
+        if i in visited_idx:
             continue
-        visited.add(node)
-        is_seed = _is_dunder_seed(node)
-        for succ in graph.successors(node):
-            if is_seed and _is_dunder_all(succ):
+        visited_idx.add(i)
+        is_seed = _is_dunder_seed(graph.node(i))
+        for j in graph.raw.successor_indices(i):
+            if is_seed and _is_dunder_all(graph.node(j)):
                 continue
-            stack.append(succ)
+            stack.append(j)
+    visited = {graph.node(i) for i in visited_idx}
     only_via_all = reachable - visited
 
     by_all: dict[SymbolNode, list[SymbolNode]] = {}
     for sym in only_via_all:
         if _is_dunder_all(sym):
             continue
-        for pred in graph.predecessors(sym):
+        for j in graph.raw.predecessor_indices(graph.index(sym)):
+            pred = graph.node(j)
             if _is_dunder_all(pred):
                 by_all.setdefault(pred, []).append(sym)
 

@@ -7,10 +7,10 @@ from functools import cached_property
 from pathlib import Path
 from typing import Iterable, Iterator, Mapping, Sequence
 
-import networkx as nx
 from libcst.metadata import CodeRange
 
 from ._edges import resolve_edges
+from ._graphstore import SymbolGraph
 from ._package import PackageContribution, build_contribution, compose_lookup
 from ._refresh import (
     PackageFiles,
@@ -25,6 +25,7 @@ from .branches import (
 from .cache import GraphCache, compute_fingerprint
 from .graph import EdgeFlags, NodeFlags, SymbolNode, SymbolTrie, _claim_edge
 from .plugins import (
+    SYNTHETIC_PATH_PREFIXES,
     EdgePlugin,
     PluginContext,
     apply_ops,
@@ -85,7 +86,7 @@ def _rebind_sys_path(search_paths: tuple[Path, ...], baseline: list[str]) -> Non
 def _compose_contribution(
     contrib: PackageContribution,
     *,
-    target_graph: nx.MultiDiGraph,
+    target_graph: SymbolGraph,
     symbol_lookup: SymbolTrie,
     plugins: Sequence[EdgePlugin],
     project_root: Path,
@@ -110,12 +111,13 @@ def _compose_contribution(
     window spans every package in one compose pass -- cross-package
     duplicates (e.g. two packages re-exporting the same external)
     collapse to one edge instead of accumulating as parallel
-    ``MultiDiGraph`` edges.
+    multigraph edges.
     """
-    target_graph.add_nodes_from(contrib.nodes)
+    for node in contrib.nodes:
+        target_graph.add(node)
     for src, dst, flags in contrib.edges:
         if _claim_edge(emitted, src, dst, flags):
-            target_graph.add_edge(src, dst, flags=flags)
+            target_graph.add_edge(src, dst, flags)
     for src, dst, flags in resolve_edges(
         contrib.import_edges,
         symbol_lookup,
@@ -124,7 +126,7 @@ def _compose_contribution(
         import_resolver=import_resolver,
         search_paths=search_paths,
     ):
-        target_graph.add_edge(src, dst, flags=flags)
+        target_graph.add_edge(src, dst, flags)
     if plugins:
         ctx = PluginContext(
             graph=target_graph,
@@ -145,28 +147,31 @@ def _compose_contribution(
 _NON_DECL_TYPES: frozenset[str] = frozenset({"module", "synthetic"})
 
 
-def _entrypoint_seeds(
-    graph: nx.MultiDiGraph, exclude_flags: NodeFlags = NodeFlags.NONE
-) -> list[SymbolNode]:
-    """Nodes carrying :data:`NodeFlags.ENTRYPOINT`, optionally minus ``exclude_flags``.
+def _entrypoint_seeds(graph: SymbolGraph, exclude_flags: NodeFlags = NodeFlags.NONE) -> list[int]:
+    """Indices of nodes carrying :data:`NodeFlags.ENTRYPOINT`, optionally minus ``exclude_flags``.
 
-    The default seed source for :func:`_find_reachable`. Passing
+    The default seed source for :func:`_find_reachable`. Returns
+    rustworkx node indices, not :class:`SymbolNode`\\s -- the BFS in
+    :func:`_find_reachable` runs in index space, and going through
+    :class:`SymbolNode` and back is a wasted round-trip. Passing
     ``exclude_flags`` drops any entrypoint whose flags intersect it --
     the building block for :func:`_find_kept_alive_by_flags_only`.
     """
     return [
-        n for n in graph.nodes if n.flags & NodeFlags.ENTRYPOINT and not (n.flags & exclude_flags)
+        graph.index(n)
+        for n in graph.nodes
+        if n.flags & NodeFlags.ENTRYPOINT and not (n.flags & exclude_flags)
     ]
 
 
 def _find_reachable(
-    graph: nx.MultiDiGraph,
-    seeds: Iterable[SymbolNode],
+    graph: SymbolGraph,
+    seeds: Iterable[int],
     *,
     prefix: Path | None = None,
     skip_dead_branches: bool = False,
 ) -> set[SymbolNode]:
-    """BFS forward from ``seeds``.
+    """BFS forward from ``seeds`` (rustworkx node indices).
 
     ``skip_dead_branches=True`` filters :data:`EdgeFlags.DEAD_BRANCH`
     edges from traversal -- the diff against the default traversal is
@@ -176,26 +181,28 @@ def _find_reachable(
     under it; the BFS still traverses the full graph, so transitive
     reachability through nodes outside ``prefix`` is preserved.
     """
-    visited: set[SymbolNode] = set()
-    stack = list(seeds)
+    raw = graph.raw
+    visited_idx: set[int] = set()
+    stack: list[int] = list(seeds)
     while stack:
-        node = stack.pop()
-        if node in visited:
+        i = stack.pop()
+        if i in visited_idx:
             continue
-        visited.add(node)
+        visited_idx.add(i)
         if skip_dead_branches:
-            for _, succ, attrs in graph.out_edges(node, data=True):
-                if not (attrs.get("flags", EdgeFlags.NONE) & EdgeFlags.DEAD_BRANCH):
-                    stack.append(succ)
+            for _, dst_i, payload in raw.out_edges(i):
+                if not (payload & EdgeFlags.DEAD_BRANCH):
+                    stack.append(dst_i)
         else:
-            stack.extend(graph.successors(node))
+            stack.extend(raw.successor_indices(i))
+    visited = {raw[i] for i in visited_idx}
     if prefix is None:
         return visited
     return {n for n in visited if n.path.is_relative_to(prefix)}
 
 
 def _find_kept_alive_by_dead_branches(
-    graph: nx.MultiDiGraph, *, prefix: Path | None = None
+    graph: SymbolGraph, *, prefix: Path | None = None
 ) -> set[SymbolNode]:
     """Symbols kept alive only via at least one ``DEAD_BRANCH`` edge.
 
@@ -213,7 +220,7 @@ def _find_kept_alive_by_dead_branches(
 
 
 def _find_kept_alive_by_flags_only(
-    graph: nx.MultiDiGraph, flags: NodeFlags, *, prefix: Path | None = None
+    graph: SymbolGraph, flags: NodeFlags, *, prefix: Path | None = None
 ) -> set[SymbolNode]:
     """Symbols reachable only from entrypoints carrying any of ``flags``.
 
@@ -223,13 +230,13 @@ def _find_kept_alive_by_flags_only(
     :class:`PackageView` as ``kept_alive_by_flags_only(flags)``.
     """
     all_seeds = _entrypoint_seeds(graph)
-    kept_seeds = [n for n in all_seeds if not (n.flags & flags)]
+    kept_seeds = [i for i in all_seeds if not (graph.node(i).flags & flags)]
     return _find_reachable(graph, all_seeds, prefix=prefix) - _find_reachable(
         graph, kept_seeds, prefix=prefix
     )
 
 
-def _iter_dead(graph: nx.MultiDiGraph, *, prefix: Path | None = None) -> Iterator[SymbolNode]:
+def _iter_dead(graph: SymbolGraph, *, prefix: Path | None = None) -> Iterator[SymbolNode]:
     """Yield every decl in ``graph`` no entrypoint reaches.
 
     Excludes ``module`` and ``synthetic`` nodes (see
@@ -397,8 +404,8 @@ class Analysis:
         }
         self._package_files: dict[Path, PackageFiles] = {}
         self._contributions: dict[Path, PackageContribution] = {}
-        self._closure_graphs: dict[Path, nx.MultiDiGraph] = {}
-        self._full_graph: nx.MultiDiGraph | None = None
+        self._closure_graphs: dict[Path, SymbolGraph] = {}
+        self._full_graph: SymbolGraph | None = None
         # Memoize closure-walk results -- the package graph is
         # immutable post-construction.
         self._reverse_closures: dict[Path, frozenset[Path]] = {}
@@ -544,7 +551,7 @@ class Analysis:
         for package in self.packages:
             yield PackageView(self, package)
 
-    def materialize_all(self) -> nx.MultiDiGraph:
+    def materialize_all(self) -> SymbolGraph:
         """Build the full graph (every package, cross-package resolution, plugins).
 
         Memoized: the second call returns the same graph object.
@@ -557,7 +564,7 @@ class Analysis:
             self._full_graph = self._materialize(included=frozenset(p.path for p in self.packages))
         return self._full_graph
 
-    def materialize_closure(self, package: Path) -> nx.MultiDiGraph:
+    def materialize_closure(self, package: Path) -> SymbolGraph:
         """Build a graph containing every contribution in ``_interesting_set(package)``.
 
         The result is the smallest graph that gives correct
@@ -582,7 +589,7 @@ class Analysis:
         self,
         *,
         included: frozenset[Path],
-    ) -> nx.MultiDiGraph:
+    ) -> SymbolGraph:
         """Compose every package in ``included`` into a fresh graph.
 
         Caller is responsible for having :meth:`refresh`'d every
@@ -601,7 +608,7 @@ class Analysis:
         """
         from ._progress import progress
 
-        g: nx.MultiDiGraph = nx.MultiDiGraph()
+        g = SymbolGraph()
         baseline = list(sys.path)
         last_search_paths: tuple[Path, ...] | None = None
         target_paths = [p.path for p in self.packages if p.path in included]
@@ -783,18 +790,43 @@ class PackageView:
         party imports. Triggers closure materialization (same scope
         as :meth:`graph`) because cross-package import resolution is
         what populates the predecessors used here.
-        """
-        graph = self._analysis.materialize_closure(self._package.path)
-        contrib = self._analysis._contributions[self._package.path]
-        ctx = PluginContext(
-            graph=graph,
-            symbol_lookup=self._analysis._build_symbol_lookup(self._package.path),
-            contribution=contrib,
-            project_root=self._analysis.project_root,
-        )
-        return ctx.importers(target)
 
-    def graph(self) -> nx.MultiDiGraph:
+        Stdlib imports (``[stdlib] <target>``) are not surfaced as
+        synthetic nodes by the resolver, so this method cannot match
+        on them.
+        """
+        package_path = self._package.path
+        graph = self._analysis.materialize_closure(package_path)
+        symbol_lookup = self._analysis._build_symbol_lookup(package_path)
+
+        # First-party module lookup goes through the trie; on miss,
+        # scan synthetic markers (one pass over graph.nodes covering all
+        # three prefixes).
+        trie_node = symbol_lookup._get(target.split("."))
+        target_node: SymbolNode | None = trie_node.module if trie_node else None
+        if target_node is None:
+            wanted = {f"{prefix}{target}" for prefix in SYNTHETIC_PATH_PREFIXES}
+            for n in graph.nodes:
+                if n.type == "synthetic" and n.fqname in wanted:
+                    target_node = n
+                    break
+        if target_node is None:
+            return set()
+
+        # Exclude same-file predecessors -- for a first-party module
+        # node, every decl inside the module is a predecessor (via the
+        # standard ``decl -> module`` edge), but we want *importers* of
+        # the module, not its contents.
+        target_path = target_node.path
+        raw = graph.raw
+        result: set[Path] = set()
+        for i in raw.predecessor_indices(graph.index(target_node)):
+            pred_path = raw[i].path
+            if pred_path != target_path and pred_path.is_relative_to(package_path):
+                result.add(pred_path)
+        return result
+
+    def graph(self) -> SymbolGraph:
         """Materialize and return the closure-scoped graph for this package.
 
         See :meth:`Analysis.materialize_closure`. The graph is shared
