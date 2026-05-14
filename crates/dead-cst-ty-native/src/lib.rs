@@ -35,18 +35,22 @@ use std::str::FromStr;
 
 use pyo3::exceptions::{PyOSError, PyValueError};
 use pyo3::prelude::*;
-use ruff_db::files::system_path_to_file;
+use ruff_db::files::{File, system_path_to_file};
 use ruff_db::parsed::parsed_module;
 use ruff_db::source::source_text;
 use ruff_db::system::{OsSystem, SystemPath, SystemPathBuf};
-use ruff_python_ast::{Expr, Stmt};
+use ruff_python_ast::visitor::{walk_expr, walk_stmt, Visitor};
+use ruff_python_ast::{Expr, ExprName, Stmt};
 use ruff_source_file::LineIndex;
-use ruff_text_size::TextRange;
+use ruff_text_size::{Ranged, TextRange};
 use ty_project::metadata::options::{EnvironmentOptions, Options};
 use ty_project::metadata::python_version::SupportedPythonVersion;
 use ty_project::metadata::value::{RangedValue, RelativePathBuf};
 use ty_project::{ProjectDatabase, ProjectMetadata};
 use ty_python_core::program::UseDefaultStrategy;
+use ty_python_core::scope::FileScopeId;
+use ty_python_semantic::SemanticModel;
+use ty_python_semantic::{ImportAliasResolution, definitions_for_name};
 
 /// Description of one package the resolver discovered.
 ///
@@ -82,6 +86,13 @@ impl PackageSpec {
 }
 
 /// Top-level declaration with libcst-compatible position info.
+///
+/// ``target_range`` is the source location of the bare name being
+/// defined -- ``def <here>:`` / ``class <here>:`` / the LHS ``Name``
+/// of an assignment. It matches ty's ``Definition::target_range``
+/// (a.k.a. ``focus_range``) so that consumers can look up the decl
+/// from a definition handle returned by ty without rebuilding any
+/// node-to-AST mapping.
 #[pyclass(get_all, frozen)]
 struct Decl {
     name: String,
@@ -90,6 +101,8 @@ struct Decl {
     start_column: usize,
     end_line: usize,
     end_column: usize,
+    target_start: u32,
+    target_end: u32,
 }
 
 #[pymethods]
@@ -526,7 +539,21 @@ fn ingest_file(
     for stmt in &parsed.syntax().body {
         collect_top_level(stmt, &source, &index, &mut decls);
     }
-    for decl in decls {
+
+    // ``target_range -> decl index`` is the primary lookup, keyed on
+    // the same range ty's ``Definition::target_range`` returns. When a
+    // name resolves through ty we can map the binding straight to the
+    // matching decl (which is critical for redeclaration cases: two
+    // ``def f`` at different lines get distinct nodes, and the
+    // reference must land on the live one).
+    //
+    // ``by_name`` is kept as a fallback for the rare case where ty
+    // returns a definition whose target_range we didn't index (e.g.
+    // walrus targets, for-loop targets that we haven't promoted to
+    // top-level decls yet).
+    let mut decl_by_range: HashMap<(u32, u32), usize> = HashMap::new();
+    let mut decl_by_name: HashMap<String, Vec<usize>> = HashMap::new();
+    for decl in &decls {
         let decl_idx = builder.intern_node(
             py,
             NativeNode {
@@ -541,8 +568,405 @@ fn ingest_file(
             },
         )?;
         builder.add_edge(decl_idx, module_idx, 0);
+        decl_by_range.insert((decl.target_start, decl.target_end), decl_idx);
+        decl_by_name.entry(decl.name.clone()).or_default().push(decl_idx);
     }
+
+    let model = SemanticModel::new(db, file);
+    let module_ref = parsed_module(db, file).load(db);
+    let index = DeclIndex {
+        by_range: decl_by_range,
+        by_name: decl_by_name,
+    };
+    collect_reference_edges(
+        &parsed.syntax().body,
+        module_idx,
+        &index,
+        &model,
+        file,
+        &module_ref,
+        builder,
+    );
+
     Ok(())
+}
+
+/// Per-file lookup tables used to resolve a name reference back to the
+/// matching graph node. ``by_range`` is keyed on ty's
+/// ``Definition::target_range`` for exact same-file binding lookups;
+/// ``by_name`` is the fallback when the resolved definition's target
+/// range falls outside the indexed set (e.g. an ``import`` alias whose
+/// definition target_range we haven't materialized into a node yet).
+struct DeclIndex {
+    by_range: HashMap<(u32, u32), usize>,
+    by_name: HashMap<String, Vec<usize>>,
+}
+
+/// Walk top-level statements emitting same-file Name-reference edges.
+///
+/// Top-level FunctionDef / ClassDef bodies attribute every Name they
+/// contain to the enclosing top-level decl (the "top-level only"
+/// model: nested defs do not get their own graph node). Assign /
+/// AnnAssign RHS / annotation expressions attribute to their LHS
+/// target decls. Every other module-level statement attributes its
+/// Names to the synthetic module node. Compound statements that don't
+/// introduce a new scope (``if`` / ``while`` / ``for`` / ``with`` /
+/// ``try`` / ``match``) are descended into so that assignments inside
+/// them still get edge attribution.
+fn collect_reference_edges<'db>(
+    body: &[Stmt],
+    module_idx: usize,
+    decl_index: &DeclIndex,
+    model: &SemanticModel<'db>,
+    file: File,
+    module_ref: &ruff_db::parsed::ParsedModuleRef,
+    builder: &mut GraphBuilder,
+) {
+    for stmt in body {
+        emit_top_level_refs(
+            stmt,
+            module_idx,
+            decl_index,
+            model,
+            file,
+            module_ref,
+            builder,
+        );
+    }
+}
+
+fn emit_top_level_refs<'db>(
+    stmt: &Stmt,
+    module_idx: usize,
+    decl_index: &DeclIndex,
+    model: &SemanticModel<'db>,
+    file: File,
+    module_ref: &ruff_db::parsed::ParsedModuleRef,
+    builder: &mut GraphBuilder,
+) {
+    match stmt {
+        Stmt::FunctionDef(f) => {
+            // Resolve the specific decl for this FunctionDef via its
+            // name's source range -- the by-name list also contains
+            // shadowed siblings (``def f`` redefined), which must not
+            // share the body's reference edges.
+            let key = (f.name.range().start().to_u32(), f.name.range().end().to_u32());
+            if let Some(&decl_idx) = decl_index.by_range.get(&key) {
+                let mut coll = RefCollector::new(vec![decl_idx], decl_index, model, file, module_ref);
+                coll.visit_stmt(stmt);
+                coll.flush(builder);
+            }
+        }
+        Stmt::ClassDef(c) => {
+            let key = (c.name.range().start().to_u32(), c.name.range().end().to_u32());
+            if let Some(&decl_idx) = decl_index.by_range.get(&key) {
+                let mut coll = RefCollector::new(vec![decl_idx], decl_index, model, file, module_ref);
+                coll.visit_stmt(stmt);
+                coll.flush(builder);
+            }
+        }
+        Stmt::Assign(a) => {
+            let mut pairs: Vec<(&ExprName, &Expr)> = Vec::new();
+            for t in &a.targets {
+                pair_targets(t, &a.value, &mut pairs);
+            }
+            // Group by the RHS expression (chained assignment
+            // ``b = c = f`` lets ``b`` and ``c`` share the same RHS
+            // identity) so we walk each RHS once with every LHS decl
+            // it should attribute to.
+            let mut by_rhs: HashMap<*const Expr, Vec<usize>> = HashMap::new();
+            for (lhs, rhs) in &pairs {
+                let key = (lhs.range().start().to_u32(), lhs.range().end().to_u32());
+                if let Some(&idx) = decl_index.by_range.get(&key) {
+                    by_rhs
+                        .entry(*rhs as *const Expr)
+                        .or_default()
+                        .push(idx);
+                }
+            }
+            for (rhs_ptr, decls) in by_rhs {
+                // SAFETY: the pointer was derived from a borrow of
+                // `a.value` (or a descendant), still alive in this arm.
+                let rhs = unsafe { &*rhs_ptr };
+                let mut coll = RefCollector::new(decls, decl_index, model, file, module_ref);
+                coll.visit_expr(rhs);
+                coll.flush(builder);
+            }
+        }
+        Stmt::AnnAssign(a) => {
+            if let Expr::Name(n) = a.target.as_ref() {
+                let key = (n.range().start().to_u32(), n.range().end().to_u32());
+                if let Some(&decl_idx) = decl_index.by_range.get(&key) {
+                    let mut coll =
+                        RefCollector::new(vec![decl_idx], decl_index, model, file, module_ref);
+                    coll.visit_expr(&a.annotation);
+                    if let Some(v) = &a.value {
+                        coll.visit_expr(v);
+                    }
+                    coll.flush(builder);
+                }
+            }
+        }
+        Stmt::AugAssign(a) => {
+            // ``a += b`` is treated like a module-level expression:
+            // only the RHS read is emitted, and it attributes to the
+            // module (not to the LHS decl). Mirrors libcst's visitor.
+            let mut coll = RefCollector::new(vec![module_idx], decl_index, model, file, module_ref);
+            coll.visit_expr(&a.value);
+            coll.flush(builder);
+        }
+        // No-new-scope compound statements: ``if`` / ``while`` /
+        // ``for`` / ``with`` / ``try`` / ``match``. Their test / iter /
+        // context-manager / pattern expressions attribute to the
+        // module node; their bodies recurse so nested assignments
+        // still get attributed to their LHS decls.
+        Stmt::If(i) => {
+            {
+                let mut coll = RefCollector::new(vec![module_idx], decl_index, model, file, module_ref);
+                coll.visit_expr(&i.test);
+                coll.flush(builder);
+            }
+            for s in &i.body {
+                emit_top_level_refs(s, module_idx, decl_index, model, file, module_ref, builder);
+            }
+            for clause in &i.elif_else_clauses {
+                if let Some(test) = &clause.test {
+                    let mut coll = RefCollector::new(vec![module_idx], decl_index, model, file, module_ref);
+                    coll.visit_expr(test);
+                    coll.flush(builder);
+                }
+                for s in &clause.body {
+                    emit_top_level_refs(s, module_idx, decl_index, model, file, module_ref, builder);
+                }
+            }
+        }
+        Stmt::While(w) => {
+            {
+                let mut coll = RefCollector::new(vec![module_idx], decl_index, model, file, module_ref);
+                coll.visit_expr(&w.test);
+                coll.flush(builder);
+            }
+            for s in &w.body {
+                emit_top_level_refs(s, module_idx, decl_index, model, file, module_ref, builder);
+            }
+            for s in &w.orelse {
+                emit_top_level_refs(s, module_idx, decl_index, model, file, module_ref, builder);
+            }
+        }
+        Stmt::For(f) => {
+            // ``for x in iter:`` binds ``x`` (its own decl) and the
+            // iterable is a read for that decl. Pair them up so
+            // ``for x in y:`` produces ``mod.x -> mod.y``.
+            let mut targets = Vec::new();
+            collect_assign_targets(&f.target, &mut targets);
+            let lhs_decls: Vec<usize> = targets
+                .iter()
+                .filter_map(|(_, range)| {
+                    let k = (range.start().to_u32(), range.end().to_u32());
+                    decl_index.by_range.get(&k).copied()
+                })
+                .collect();
+            if !lhs_decls.is_empty() {
+                let mut coll = RefCollector::new(lhs_decls, decl_index, model, file, module_ref);
+                coll.visit_expr(&f.iter);
+                coll.flush(builder);
+            } else {
+                let mut coll = RefCollector::new(vec![module_idx], decl_index, model, file, module_ref);
+                coll.visit_expr(&f.iter);
+                coll.flush(builder);
+            }
+            for s in &f.body {
+                emit_top_level_refs(s, module_idx, decl_index, model, file, module_ref, builder);
+            }
+            for s in &f.orelse {
+                emit_top_level_refs(s, module_idx, decl_index, model, file, module_ref, builder);
+            }
+        }
+        Stmt::With(w) => {
+            for item in &w.items {
+                // The context expression attributes to the LHS decl
+                // when ``with X as y:`` binds ``y`` at module level.
+                let target_decls: Vec<usize> = if let Some(target) = &item.optional_vars {
+                    let mut targets = Vec::new();
+                    collect_assign_targets(target, &mut targets);
+                    targets
+                        .iter()
+                        .filter_map(|(_, range)| {
+                            let k = (range.start().to_u32(), range.end().to_u32());
+                            decl_index.by_range.get(&k).copied()
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let owner = if target_decls.is_empty() {
+                    vec![module_idx]
+                } else {
+                    target_decls
+                };
+                let mut coll = RefCollector::new(owner, decl_index, model, file, module_ref);
+                coll.visit_expr(&item.context_expr);
+                coll.flush(builder);
+            }
+            for s in &w.body {
+                emit_top_level_refs(s, module_idx, decl_index, model, file, module_ref, builder);
+            }
+        }
+        Stmt::Try(t) => {
+            for s in &t.body {
+                emit_top_level_refs(s, module_idx, decl_index, model, file, module_ref, builder);
+            }
+            for handler in &t.handlers {
+                let ruff_python_ast::ExceptHandler::ExceptHandler(eh) = handler;
+                if let Some(ty) = &eh.type_ {
+                    let mut coll = RefCollector::new(vec![module_idx], decl_index, model, file, module_ref);
+                    coll.visit_expr(ty);
+                    coll.flush(builder);
+                }
+                for s in &eh.body {
+                    emit_top_level_refs(s, module_idx, decl_index, model, file, module_ref, builder);
+                }
+            }
+            for s in &t.orelse {
+                emit_top_level_refs(s, module_idx, decl_index, model, file, module_ref, builder);
+            }
+            for s in &t.finalbody {
+                emit_top_level_refs(s, module_idx, decl_index, model, file, module_ref, builder);
+            }
+        }
+        Stmt::Match(m) => {
+            {
+                let mut coll = RefCollector::new(vec![module_idx], decl_index, model, file, module_ref);
+                coll.visit_expr(&m.subject);
+                coll.flush(builder);
+            }
+            for case in &m.cases {
+                for s in &case.body {
+                    emit_top_level_refs(s, module_idx, decl_index, model, file, module_ref, builder);
+                }
+            }
+        }
+        _ => {
+            let mut coll = RefCollector::new(vec![module_idx], decl_index, model, file, module_ref);
+            coll.visit_stmt(stmt);
+            coll.flush(builder);
+        }
+    }
+}
+
+/// Visitor that records every ``Name`` reference encountered against
+/// the active ``current_decls`` stack.
+///
+/// "Top-level only" attribution: ``current_decls`` is set once per
+/// top-level statement by :func:`collect_reference_edges` and is *not*
+/// pushed when descending into nested ``def`` / ``class`` -- inner
+/// references fold into the outer decl. Edges collapse to a unique
+/// ``(src, dst)`` set so a repeated reference within the same decl
+/// emits one edge.
+///
+/// Scope resolution is delegated to ty's :type:`SemanticModel` (the
+/// same use-def map ty uses for type inference): a ``Name`` is emitted
+/// as a same-file edge only when ``definitions_for_name`` resolves the
+/// reference to a definition in the file's global scope. Closures,
+/// parameter shadowing, walrus targets, ``import`` aliases, and the
+/// rest of Python's LEGB rules fall out of ty's index for free, so
+/// this visitor stays a thin shell over name -> top-level-decl
+/// emission.
+struct RefCollector<'a, 'db> {
+    current_decls: Vec<usize>,
+    decl_index: &'a DeclIndex,
+    edges: HashSet<(usize, usize)>,
+    model: &'a SemanticModel<'db>,
+    file: File,
+    module_ref: &'a ruff_db::parsed::ParsedModuleRef,
+}
+
+impl<'a, 'db> RefCollector<'a, 'db> {
+    fn new(
+        current_decls: Vec<usize>,
+        decl_index: &'a DeclIndex,
+        model: &'a SemanticModel<'db>,
+        file: File,
+        module_ref: &'a ruff_db::parsed::ParsedModuleRef,
+    ) -> Self {
+        Self {
+            current_decls,
+            decl_index,
+            edges: HashSet::new(),
+            model,
+            file,
+            module_ref,
+        }
+    }
+
+    fn flush(self, builder: &mut GraphBuilder) {
+        for (src, dst) in self.edges {
+            builder.add_edge(src, dst, 0);
+        }
+    }
+
+    fn emit_name(&mut self, name: &ExprName) {
+        let defs = definitions_for_name(
+            self.model,
+            name.id.as_str(),
+            name.into(),
+            ImportAliasResolution::PreserveAliases,
+        );
+        // Collect every same-file global-scope binding ty found for
+        // this name. We map each to a specific decl by target_range
+        // (so two ``def f`` at different lines resolve to different
+        // nodes); the per-name fallback handles the very rare case
+        // where a target_range fell outside the indexed set.
+        let mut targets: HashSet<usize> = HashSet::new();
+        let db = self.model.db();
+        for resolved in defs {
+            let Some(def) = resolved.definition() else {
+                continue;
+            };
+            if def.file(db) != self.file {
+                continue;
+            }
+            if def.file_scope(db) != FileScopeId::global() {
+                continue;
+            }
+            let tr = def.kind(db).target_range(self.module_ref);
+            let key = (tr.start().to_u32(), tr.end().to_u32());
+            if let Some(&idx) = self.decl_index.by_range.get(&key) {
+                targets.insert(idx);
+            } else if let Some(by_name) = self.decl_index.by_name.get(name.id.as_str()) {
+                // Fallback: ty pinned the binding to the global scope
+                // but we never minted a decl at that exact target
+                // range (e.g. an ``import`` alias we don't model yet).
+                // Land on every same-name decl so reachability is at
+                // least conservative.
+                for &idx in by_name {
+                    targets.insert(idx);
+                }
+            }
+        }
+        for dst in targets {
+            for &src in &self.current_decls {
+                if src == dst {
+                    continue;
+                }
+                self.edges.insert((src, dst));
+            }
+        }
+    }
+}
+
+impl<'ast, 'db> Visitor<'ast> for RefCollector<'_, 'db> {
+    fn visit_expr(&mut self, expr: &'ast Expr) {
+        if let Expr::Name(n) = expr {
+            self.emit_name(n);
+            return;
+        }
+        walk_expr(self, expr);
+    }
+
+    fn visit_stmt(&mut self, stmt: &'ast Stmt) {
+        walk_stmt(self, stmt);
+    }
 }
 
 fn rel_path<P: AsRef<str>>(path: P) -> RelativePathBuf {
@@ -564,6 +988,7 @@ fn push_decl(
     name: String,
     kind: &'static str,
     range: TextRange,
+    target_range: TextRange,
     source: &str,
     index: &LineIndex,
     out: &mut Vec<Decl>,
@@ -576,7 +1001,64 @@ fn push_decl(
         start_column: sc,
         end_line: el,
         end_column: ec,
+        target_start: target_range.start().to_u32(),
+        target_end: target_range.end().to_u32(),
     });
+}
+
+/// Yield ``(name, rhs)`` pairs for an assignment target pattern.
+///
+/// ``a, b = x, y`` -> ``[(a, x), (b, y)]``. ``a, b = call()`` (RHS
+/// arity mismatches the target tuple) -> the whole ``call()`` is
+/// broadcast to both ``a`` and ``b``. Nested tuple / list patterns
+/// recurse; non-Name leaves (``Attribute``, ``Subscript``) are
+/// skipped. Mirrors :func:`dead_cst._visitor._pair_targets`. Each
+/// pair carries the LHS ``ExprName`` so the caller can recover the
+/// per-target ``target_range`` and disambiguate redeclarations.
+fn pair_targets<'ast>(
+    target: &'ast Expr,
+    rhs: &'ast Expr,
+    out: &mut Vec<(&'ast ExprName, &'ast Expr)>,
+) {
+    match target {
+        Expr::Name(n) => {
+            out.push((n, rhs));
+        }
+        Expr::Tuple(t) => {
+            let rhs_elts = match rhs {
+                Expr::Tuple(rt) if rt.elts.len() == t.elts.len() => Some(&rt.elts),
+                Expr::List(rl) if rl.elts.len() == t.elts.len() => Some(&rl.elts),
+                _ => None,
+            };
+            if let Some(rhs_elts) = rhs_elts {
+                for (te, re) in t.elts.iter().zip(rhs_elts.iter()) {
+                    pair_targets(te, re, out);
+                }
+            } else {
+                for te in &t.elts {
+                    pair_targets(te, rhs, out);
+                }
+            }
+        }
+        Expr::List(t) => {
+            let rhs_elts = match rhs {
+                Expr::Tuple(rt) if rt.elts.len() == t.elts.len() => Some(&rt.elts),
+                Expr::List(rl) if rl.elts.len() == t.elts.len() => Some(&rl.elts),
+                _ => None,
+            };
+            if let Some(rhs_elts) = rhs_elts {
+                for (te, re) in t.elts.iter().zip(rhs_elts.iter()) {
+                    pair_targets(te, re, out);
+                }
+            } else {
+                for te in &t.elts {
+                    pair_targets(te, rhs, out);
+                }
+            }
+        }
+        Expr::Starred(s) => pair_targets(&s.value, rhs, out),
+        _ => {}
+    }
 }
 
 fn collect_assign_targets(target: &Expr, out: &mut Vec<(String, TextRange)>) {
@@ -592,6 +1074,7 @@ fn collect_assign_targets(target: &Expr, out: &mut Vec<(String, TextRange)>) {
                 collect_assign_targets(e, out);
             }
         }
+        Expr::Starred(s) => collect_assign_targets(&s.value, out),
         _ => {}
     }
 }
@@ -599,10 +1082,26 @@ fn collect_assign_targets(target: &Expr, out: &mut Vec<(String, TextRange)>) {
 fn collect_top_level(stmt: &Stmt, source: &str, index: &LineIndex, out: &mut Vec<Decl>) {
     match stmt {
         Stmt::FunctionDef(f) => {
-            push_decl(f.name.to_string(), "function", f.range, source, index, out);
+            push_decl(
+                f.name.to_string(),
+                "function",
+                f.range,
+                f.name.range(),
+                source,
+                index,
+                out,
+            );
         }
         Stmt::ClassDef(c) => {
-            push_decl(c.name.to_string(), "class", c.range, source, index, out);
+            push_decl(
+                c.name.to_string(),
+                "class",
+                c.range,
+                c.name.range(),
+                source,
+                index,
+                out,
+            );
         }
         Stmt::Assign(a) => {
             let mut targets = Vec::new();
@@ -610,12 +1109,85 @@ fn collect_top_level(stmt: &Stmt, source: &str, index: &LineIndex, out: &mut Vec
                 collect_assign_targets(t, &mut targets);
             }
             for (name, range) in targets {
-                push_decl(name, "variable", range, source, index, out);
+                push_decl(name, "variable", range, range, source, index, out);
             }
         }
         Stmt::AnnAssign(a) => {
             if let Expr::Name(n) = a.target.as_ref() {
-                push_decl(n.id.to_string(), "variable", n.range, source, index, out);
+                push_decl(n.id.to_string(), "variable", n.range, n.range, source, index, out);
+            }
+        }
+        // Compound statements that don't introduce a new scope: their
+        // assignments still create top-level decls. Mirrors libcst's
+        // ScopeProvider rules.
+        Stmt::If(i) => {
+            for s in &i.body {
+                collect_top_level(s, source, index, out);
+            }
+            for clause in &i.elif_else_clauses {
+                for s in &clause.body {
+                    collect_top_level(s, source, index, out);
+                }
+            }
+        }
+        Stmt::While(w) => {
+            for s in &w.body {
+                collect_top_level(s, source, index, out);
+            }
+            for s in &w.orelse {
+                collect_top_level(s, source, index, out);
+            }
+        }
+        Stmt::For(f) => {
+            // ``for x in ...:`` binds ``x`` at module scope.
+            let mut targets = Vec::new();
+            collect_assign_targets(&f.target, &mut targets);
+            for (name, range) in targets {
+                push_decl(name, "variable", range, range, source, index, out);
+            }
+            for s in &f.body {
+                collect_top_level(s, source, index, out);
+            }
+            for s in &f.orelse {
+                collect_top_level(s, source, index, out);
+            }
+        }
+        Stmt::With(w) => {
+            for item in &w.items {
+                if let Some(target) = &item.optional_vars {
+                    let mut targets = Vec::new();
+                    collect_assign_targets(target, &mut targets);
+                    for (name, range) in targets {
+                        push_decl(name, "variable", range, range, source, index, out);
+                    }
+                }
+            }
+            for s in &w.body {
+                collect_top_level(s, source, index, out);
+            }
+        }
+        Stmt::Try(t) => {
+            for s in &t.body {
+                collect_top_level(s, source, index, out);
+            }
+            for handler in &t.handlers {
+                let ruff_python_ast::ExceptHandler::ExceptHandler(eh) = handler;
+                for s in &eh.body {
+                    collect_top_level(s, source, index, out);
+                }
+            }
+            for s in &t.orelse {
+                collect_top_level(s, source, index, out);
+            }
+            for s in &t.finalbody {
+                collect_top_level(s, source, index, out);
+            }
+        }
+        Stmt::Match(m) => {
+            for case in &m.cases {
+                for s in &case.body {
+                    collect_top_level(s, source, index, out);
+                }
             }
         }
         _ => {}

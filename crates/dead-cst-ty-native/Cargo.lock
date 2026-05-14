@@ -337,6 +337,7 @@ dependencies = [
  "ruff_text_size",
  "ty_project",
  "ty_python_core",
+ "ty_python_semantic",
 ]
 
 [[package]]
