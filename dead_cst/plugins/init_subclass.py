@@ -165,19 +165,22 @@ class InitSubclassPlugin:
         # buckets, recursively.
         package_path = ctx.contribution.package.path
         for parent, marker in init_markers:
-            seen: set[SymbolNode] = set()
-            stack = [parent]
+            parent_idx = ctx.graph.index(parent)
+            seen_idx: set[int] = {parent_idx}
+            stack: list[int] = [parent_idx]
             while stack:
-                current = stack.pop()
+                current = raw[stack.pop()]
                 bucket = subclass_buckets.get(current.fqname)
                 if bucket is None:
                     continue
                 for j in raw.successor_indices(ctx.graph.index(bucket)):
-                    sub = raw[j]
-                    if sub.type != "class" or sub in seen or sub is parent:
+                    if j in seen_idx:
                         continue
-                    seen.add(sub)
-                    stack.append(sub)
+                    sub = raw[j]
+                    if sub.type != "class":
+                        continue
+                    seen_idx.add(j)
+                    stack.append(j)
                     if not sub.path.is_relative_to(package_path):
                         continue
                     if sub in existing_targets[marker]:
