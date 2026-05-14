@@ -64,7 +64,7 @@ def _canonical_dist_name(name: str) -> str:
     Note: this still uses the *distribution* name, not the import
     (top-level) name. For most third-party packages they match after
     canonicalization (``fastapi``, ``flask``, ``click``, ``typer``,
-    ``networkx``, ...). They differ for a handful of historic names
+    ``rustworkx``, ...). They differ for a handful of historic names
     (``Pillow`` → import ``PIL``, ``PyYAML`` → import ``yaml``); plugins
     targeting those would need an explicit dist-name override, which
     we don't yet support.

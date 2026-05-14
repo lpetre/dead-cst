@@ -4,8 +4,7 @@ from __future__ import annotations
 
 import logging
 
-import networkx as nx
-
+from dead_cst._graph_impl import MultiDiGraph
 from dead_cst.analyze import _find_reachable as find_reachable
 from dead_cst.codemod import generate_patch
 from dead_cst.graph import NodeFlags
@@ -81,7 +80,7 @@ def test_codemod_skips_notebook_nodes(write_notebook, make_analysis):
     analysis = make_analysis()
     graph = analysis.materialize_all()
     nb_nodes = [n for n in graph.nodes if n.flags & NodeFlags.NOTEBOOK]
-    sub = nx.MultiDiGraph()
+    sub = MultiDiGraph()
     sub.add_nodes_from(nb_nodes)
     patch = generate_patch(sub, analysis.project_root)
     assert patch == ""

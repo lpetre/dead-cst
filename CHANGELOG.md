@@ -10,6 +10,13 @@ two versions.
 ## [Unreleased]
 
 ### Changed
+- Swapped the analyzer's graph backend from `networkx` to
+  [`rustworkx`](https://www.rustworkx.org/). The networkx-style call
+  surface the analyzer, codemod, CLI, plugins, and tests use is
+  preserved by a thin wrapper (`dead_cst._graph_impl.MultiDiGraph` /
+  `DiGraph`) so call sites don't move. `networkx` is no longer a
+  runtime dependency; `rustworkx>=0.17` replaces it.
+
 - New `NodeFlags.EXPORTED` tags every node from a file under
   `Package.exported`, set via the visitor's `default_flags` mechanism
   (same pattern as `NOTEBOOK`). `Package.exported` now participates in

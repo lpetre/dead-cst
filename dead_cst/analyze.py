@@ -7,9 +7,8 @@ from functools import cached_property
 from pathlib import Path
 from typing import Iterable, Iterator, Mapping, Sequence
 
-import networkx as nx
-
 from ._edges import resolve_edges
+from ._graph_impl import MultiDiGraph
 from ._package import PackageContribution, build_contribution
 from ._refresh import (
     PackageFiles,
@@ -84,7 +83,7 @@ def _rebind_sys_path(search_paths: tuple[Path, ...], baseline: list[str]) -> Non
 def _compose_contribution(
     contrib: PackageContribution,
     *,
-    target_graph: nx.MultiDiGraph,
+    target_graph: MultiDiGraph[SymbolNode],
     symbol_lookup: SymbolTrie,
     plugins: Sequence[EdgePlugin],
     project_root: Path,
@@ -138,7 +137,7 @@ _NON_DECL_TYPES: frozenset[str] = frozenset({"module", "synthetic"})
 
 
 def _find_reachable(
-    graph: nx.MultiDiGraph,
+    graph: MultiDiGraph[SymbolNode],
     exclude_flags: NodeFlags = NodeFlags.NONE,
     *,
     prefix: Path | None = None,
@@ -182,7 +181,7 @@ def _find_reachable(
 
 
 def _find_kept_alive_by_dead_branches(
-    graph: nx.MultiDiGraph, *, prefix: Path | None = None
+    graph: MultiDiGraph[SymbolNode], *, prefix: Path | None = None
 ) -> set[SymbolNode]:
     """Symbols kept alive only via at least one ``DEAD_BRANCH`` edge.
 
@@ -199,7 +198,7 @@ def _find_kept_alive_by_dead_branches(
 
 
 def _find_kept_alive_by_flags_only(
-    graph: nx.MultiDiGraph, flags: NodeFlags, *, prefix: Path | None = None
+    graph: MultiDiGraph[SymbolNode], flags: NodeFlags, *, prefix: Path | None = None
 ) -> set[SymbolNode]:
     """Symbols reachable only from entrypoints carrying any of ``flags``.
 
@@ -211,7 +210,9 @@ def _find_kept_alive_by_flags_only(
     return _find_reachable(graph, prefix=prefix) - _find_reachable(graph, flags, prefix=prefix)
 
 
-def _iter_dead(graph: nx.MultiDiGraph, *, prefix: Path | None = None) -> Iterator[SymbolNode]:
+def _iter_dead(
+    graph: MultiDiGraph[SymbolNode], *, prefix: Path | None = None
+) -> Iterator[SymbolNode]:
     """Yield every decl in ``graph`` no entrypoint reaches.
 
     Excludes ``module`` and ``synthetic`` nodes (see
@@ -379,8 +380,8 @@ class Analysis:
         }
         self._package_files: dict[Path, PackageFiles] = {}
         self._contributions: dict[Path, PackageContribution] = {}
-        self._closure_graphs: dict[Path, nx.MultiDiGraph] = {}
-        self._full_graph: nx.MultiDiGraph | None = None
+        self._closure_graphs: dict[Path, MultiDiGraph[SymbolNode]] = {}
+        self._full_graph: MultiDiGraph[SymbolNode] | None = None
         # Memoize closure-walk results -- the package graph is
         # immutable post-construction.
         self._reverse_closures: dict[Path, frozenset[Path]] = {}
@@ -512,7 +513,7 @@ class Analysis:
         for package in self.packages:
             yield PackageView(self, package)
 
-    def materialize_all(self) -> nx.MultiDiGraph:
+    def materialize_all(self) -> MultiDiGraph[SymbolNode]:
         """Build the full graph (every package, cross-package resolution, plugins).
 
         Memoized: the second call returns the same graph object.
@@ -525,7 +526,7 @@ class Analysis:
             self._full_graph = self._materialize(included=frozenset(p.path for p in self.packages))
         return self._full_graph
 
-    def materialize_closure(self, package: Path) -> nx.MultiDiGraph:
+    def materialize_closure(self, package: Path) -> MultiDiGraph[SymbolNode]:
         """Build a graph containing every contribution in ``_interesting_set(package)``.
 
         The result is the smallest graph that gives correct
@@ -550,7 +551,7 @@ class Analysis:
         self,
         *,
         included: frozenset[Path],
-    ) -> nx.MultiDiGraph:
+    ) -> MultiDiGraph[SymbolNode]:
         """Compose every package in ``included`` into a fresh graph.
 
         Caller is responsible for having :meth:`refresh`'d every
@@ -569,7 +570,7 @@ class Analysis:
         """
         from ._progress import progress
 
-        g: nx.MultiDiGraph = nx.MultiDiGraph()
+        g: MultiDiGraph[SymbolNode] = MultiDiGraph()
         g.graph["dead_suites"] = {}
         baseline = list(sys.path)
         last_search_paths: tuple[Path, ...] | None = None
@@ -749,7 +750,7 @@ class PackageView:
         )
         return ctx.importers(target)
 
-    def graph(self) -> nx.MultiDiGraph:
+    def graph(self) -> MultiDiGraph[SymbolNode]:
         """Materialize and return the closure-scoped graph for this package.
 
         See :meth:`Analysis.materialize_closure`. The graph is shared

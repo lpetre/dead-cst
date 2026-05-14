@@ -7,10 +7,10 @@ from __future__ import annotations
 from pathlib import Path
 
 import libcst as cst
-import networkx as nx
 import pytest
 from libcst.metadata import CodePosition, CodeRange
 
+from dead_cst._graph_impl import MultiDiGraph
 from dead_cst.analyze import _find_reachable as find_reachable
 from dead_cst.plugins import MainBlockPlugin, ProjectScriptsPlugin
 from dead_cst.plugins._core import (
@@ -73,7 +73,7 @@ def test_unknown_plugin_raises():
 
 def _ctx_with_synthetic(fqname: str, base: Path, make_contribution) -> PluginContext:
     """Build a minimal PluginContext containing a single synthetic node."""
-    graph = nx.DiGraph()
+    graph = MultiDiGraph()
     node = SymbolNode(
         fqname=fqname,
         type="synthetic",
@@ -363,7 +363,7 @@ def test_plugin_context_contribution_exposes_nodes(tmp_path, make_contribution):
     nodes = frozenset({mod, fn})
 
     ctx = PluginContext(
-        graph=nx.DiGraph(),
+        graph=MultiDiGraph(),
         symbol_lookup=SymbolTrie(),
         contribution=make_contribution(pkg, nodes),
         project_root=tmp_path,

@@ -25,7 +25,7 @@ A `PostToolUse` hook in `.claude/settings.json` automatically runs `ruff format`
 
 ## Architecture
 
-`dead-cst` builds a symbol-level reachability graph of a Python codebase using [libcst](https://github.com/Instagram/LibCST) and [networkx](https://networkx.org/), walks from configured entrypoints, and reports (or removes) anything unreachable. The flow is staged so each stage has one job; understanding the staging is the key to navigating the code.
+`dead-cst` builds a symbol-level reachability graph of a Python codebase using [libcst](https://github.com/Instagram/LibCST) and [rustworkx](https://www.rustworkx.org/) (wrapped by `dead_cst._graph_impl` to expose the small networkx-style call sites the analyzer historically used), walks from configured entrypoints, and reports (or removes) anything unreachable. The flow is staged so each stage has one job; understanding the staging is the key to navigating the code.
 
 ### The unified `Cacheable` contract
 
