@@ -102,10 +102,10 @@ class PluginContext:
     project_root: Path
     _modules: dict[Path, cst.Module | None] = field(default_factory=dict, repr=False)
     # Lazy ``fqname -> SymbolNode`` index over synthetic nodes (built on
-    # first ``importers`` call).  Plugins that add their own synthetic
+    # first ``_synthetic`` call). Plugins that add their own synthetic
     # nodes during the same pass won't see them through this index, which
-    # is fine in practice -- ``importers`` is for prefiltering against
-    # the analyzer's already-resolved dep markers.
+    # is fine -- the only consumer is ``require_resolved_dep``, which
+    # prefilters against the analyzer's already-resolved dep markers.
     _synthetic_index: dict[str, SymbolNode] | None = field(default=None, init=False, repr=False)
 
     def find_module(self, fqname: str) -> SymbolNode | None:
@@ -152,49 +152,6 @@ class PluginContext:
                 out.extend(bucket)
             stack.extend(node.children.values())
         return out
-
-    def importers(self, target: str) -> set[Path]:
-        """Return paths under :attr:`package` whose imports reach ``target``.
-
-        ``target`` is matched first as a first-party module fqname
-        (e.g. ``pkg.mod``); if no first-party module matches, it is
-        matched against the synthetic markers the analyzer adds for
-        non-first-party imports -- ``[external dist] <target>``,
-        ``[external file] <target>``, and ``[unresolved] <target>``
-        (for imports the resolver couldn't pin to an installed dist,
-        which still tells us "this file tried to import X"). The result
-        is the natural prefilter for framework plugins ("only look at
-        files that import fastapi") -- strictly more accurate than
-        substring matching, and free because the import edges are
-        already in the graph.
-
-        Stdlib imports (``[stdlib] <target>``) are *not* surfaced as
-        synthetic nodes by the resolver, so this method cannot prefilter
-        on them; plugins that care about stdlib imports must walk the
-        import nodes themselves.
-        """
-        target_node = self.find_module(target)
-        if target_node is None:
-            for prefix in SYNTHETIC_PATH_PREFIXES:
-                node = self._synthetic(f"{prefix}{target}")
-                if node is not None:
-                    target_node = node
-                    break
-        if target_node is None:
-            return set()
-        package_path = self.contribution.package.path
-        target_path = target_node.path
-        raw = self.graph.raw
-        # Exclude same-file predecessors -- for a first-party module
-        # node, every decl inside that module is a predecessor (via the
-        # standard ``decl -> module`` edge), but we want *importers* of
-        # the module, not its contents.
-        result: set[Path] = set()
-        for i in raw.predecessor_indices(self.graph.index(target_node)):
-            pred_path = raw[i].path
-            if pred_path != target_path and pred_path.is_relative_to(package_path):
-                result.add(pred_path)
-        return result
 
     def parse(self, path: Path) -> cst.Module | None:
         """Return the parsed :class:`libcst.Module` for ``path``.
@@ -252,8 +209,9 @@ def require_resolved_dep(ctx: PluginContext, package: str) -> SymbolNode | None:
       stop rather than guess.
 
     Plugins that wrap framework conventions (FastAPI, Flask, Click,
-    Typer, ...) should use this in place of ``ctx.importers(package)``
-    so that misconfigured environments fail loudly.
+    Typer, ...) use this so misconfigured environments fail loudly --
+    the resolver-attested synthetic is what they need, not a substring
+    or prefix match.
     """
     for prefix in EXTERNAL_PREFIXES:
         node = ctx._synthetic(f"{prefix}{package}")

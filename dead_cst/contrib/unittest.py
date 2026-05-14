@@ -189,28 +189,26 @@ class UnittestPlugin:
         if not by_module_path:
             return
 
-        modules_by_path = {
-            n.path: n for n in ctx.graph.nodes if n.type == "module" and n.path in by_module_path
-        }
-        existing_synths = {
-            n.fqname: n
-            for n in ctx.graph.nodes
-            if n.type == "synthetic" and n.fqname.startswith(UNITTEST_PREFIX)
+        # Modules with subclasses are all in this package, so the lookup
+        # only needs ``contribution.nodes`` -- not the full composed
+        # graph. Store graph indices, not SymbolNodes; resolve at use.
+        modules_by_path: dict[Path, int] = {
+            n.path: ctx.graph.index(n)
+            for n in ctx.contribution.nodes
+            if n.type == "module" and n.path in by_module_path
         }
 
         for path, subs in by_module_path.items():
-            module = modules_by_path.get(path)
-            if module is None:
+            module_idx = modules_by_path.get(path)
+            if module_idx is None:
                 continue
-            synth_fqname = f"{UNITTEST_PREFIX}{module.fqname}"
-            synth = existing_synths.get(synth_fqname)
-            if synth is None:
-                synth = synthetic_node(
-                    synth_fqname,
-                    path,
-                    flags=NodeFlags.ENTRYPOINT | NodeFlags.TESTCASE,
-                )
-                yield AddNode(synth)
+            module = ctx.graph.node(module_idx)
+            synth = synthetic_node(
+                f"{UNITTEST_PREFIX}{module.fqname}",
+                path,
+                flags=NodeFlags.ENTRYPOINT | NodeFlags.TESTCASE,
+            )
+            yield AddNode(synth)
             for sub in subs:
                 yield AddEdge(synth, sub)
 

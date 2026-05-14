@@ -25,6 +25,7 @@ from .branches import (
 from .cache import GraphCache, compute_fingerprint
 from .graph import EdgeFlags, NodeFlags, SymbolNode, SymbolTrie, _claim_edge
 from .plugins import (
+    SYNTHETIC_PATH_PREFIXES,
     EdgePlugin,
     PluginContext,
     apply_ops,
@@ -783,16 +784,41 @@ class PackageView:
         party imports. Triggers closure materialization (same scope
         as :meth:`graph`) because cross-package import resolution is
         what populates the predecessors used here.
+
+        Stdlib imports (``[stdlib] <target>``) are not surfaced as
+        synthetic nodes by the resolver, so this method cannot match
+        on them.
         """
-        graph = self._analysis.materialize_closure(self._package.path)
-        contrib = self._analysis._contributions[self._package.path]
-        ctx = PluginContext(
-            graph=graph,
-            symbol_lookup=self._analysis._build_symbol_lookup(self._package.path),
-            contribution=contrib,
-            project_root=self._analysis.project_root,
-        )
-        return ctx.importers(target)
+        package_path = self._package.path
+        graph = self._analysis.materialize_closure(package_path)
+        symbol_lookup = self._analysis._build_symbol_lookup(package_path)
+
+        # First-party module lookup goes through the trie; on miss,
+        # scan synthetic markers (one pass over graph.nodes covering all
+        # three prefixes).
+        trie_node = symbol_lookup._get(target.split("."))
+        target_node: SymbolNode | None = trie_node.module if trie_node else None
+        if target_node is None:
+            wanted = {f"{prefix}{target}" for prefix in SYNTHETIC_PATH_PREFIXES}
+            for n in graph.nodes:
+                if n.type == "synthetic" and n.fqname in wanted:
+                    target_node = n
+                    break
+        if target_node is None:
+            return set()
+
+        # Exclude same-file predecessors -- for a first-party module
+        # node, every decl inside the module is a predecessor (via the
+        # standard ``decl -> module`` edge), but we want *importers* of
+        # the module, not its contents.
+        target_path = target_node.path
+        raw = graph.raw
+        result: set[Path] = set()
+        for i in raw.predecessor_indices(graph.index(target_node)):
+            pred_path = raw[i].path
+            if pred_path != target_path and pred_path.is_relative_to(package_path):
+                result.add(pred_path)
+        return result
 
     def graph(self) -> SymbolGraph:
         """Materialize and return the closure-scoped graph for this package.
