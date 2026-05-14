@@ -355,6 +355,13 @@ F401 pin" (the visitor stamps `ENTRYPOINT | NOQA` on imports
 preserved by a per-line or file-level ruff/pyflakes directive); OR
 the bits to combine.
 
+For the raw dead-suite positions themselves (the input to the
+`EdgeFlags.DEAD_BRANCH` flagging from stage 3), call
+`Analysis.dead_suites()` for the merged `{file: tuple[CodeRange, ...]}`
+across every package, or `PackageView.dead_suites()` for one
+package's slice. Both read straight off the per-package contribution
+— no graph materialization required.
+
 ### 8. Codemod — `dead_cst/codemod.py`
 
 `remove_code` runs a LibCST `RemoveDeadSymbols` transformer keyed on
@@ -400,8 +407,10 @@ stages happen on demand:
    payloads, so warm per-package queries stay fast.
 
 Per-package queries that don't need the assembled graph
-(`PackageView.declarations` / `PackageView.count_nodes`) skip stage 3
-entirely.
+(`PackageView.declarations` / `PackageView.count_nodes` /
+`PackageView.dead_suites`) skip stage 3 entirely.
+`Analysis.dead_suites()` also stops at stage 2 — it merges the
+per-package contribution maps without composing a graph.
 
 ## Graph model invariants
 
