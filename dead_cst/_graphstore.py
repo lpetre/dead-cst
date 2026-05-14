@@ -52,12 +52,6 @@ class SymbolGraph:
     def node(self, idx: int) -> SymbolNode:
         return self.raw[idx]
 
-    def relabel(self, old: SymbolNode, new: SymbolNode) -> None:
-        """Swap a node's payload in place, keeping its index stable."""
-        i = self._idx.pop(old)
-        self.raw[i] = new
-        self._idx[new] = i
-
     def subgraph(self, nodes: Iterable[SymbolNode]) -> SymbolGraph:
         """Return a new ``SymbolGraph`` induced by ``nodes``.
 

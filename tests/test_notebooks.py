@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 
 from dead_cst._graphstore import SymbolGraph
-from dead_cst.analyze import _find_reachable as find_reachable
+from dead_cst.analyze import _entrypoint_seeds, _find_reachable as find_reachable
 from dead_cst.codemod import generate_patch
 from dead_cst.graph import NodeFlags
 
@@ -29,7 +29,7 @@ def test_notebook_keeps_referenced_py_code_alive(write_notebook, write_files, ma
     write_files({"lib.py": "def used(): return 1\ndef unused(): return 2\n"})
     write_notebook("use.ipynb", ["from lib import used\nused()\n"])
     graph = make_analysis().materialize_all()
-    reachable = find_reachable(graph)
+    reachable = find_reachable(graph, _entrypoint_seeds(graph))
     used = next(n for n in graph.nodes if n.fqname == "lib.used")
     unused = next(n for n in graph.nodes if n.fqname == "lib.unused")
     assert used in reachable
