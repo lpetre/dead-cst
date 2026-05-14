@@ -49,7 +49,7 @@ or before touching the visitor.
 │                                                              │
 │   each EdgePlugin.finalize(ctx) -> Iterable[GraphOp]         │
 └────────────────────────────┬─────────────────────────────────┘
-                             │ MultiDiGraph
+                             │ SymbolGraph
                              ▼
                 ┌────────────┴────────────┐
                 ▼                         ▼
@@ -62,6 +62,18 @@ performance: stages 1–4 ride the per-file SQLite cache; stage 5 onward
 runs every invocation. That's why import classification deliberately
 moved out of the visitor — keeping the cache survival surface as small
 as possible was worth re-stitching edges every run.
+
+The assembled graph at stage 5 and beyond is a `SymbolGraph`
+(`dead_cst/_graphstore.py`) — a thin wrapper around a
+`rustworkx.PyDiGraph` paired with a `SymbolNode <-> int` index map.
+The wrapper exposes the bookkeeping (`add`, `add_edge`, `index`,
+`node`, `subgraph`, `nodes`, `__contains__`/`__iter__`/`__len__`) and
+nothing else; edge-payload-aware iteration, traversal
+(`successor_indices` / `predecessor_indices`), `has_edge`, and every
+algorithm go through `SymbolGraph.raw` directly. BFS-shaped code in
+`analyze.py` / `cli.py` / the plugins operates in index space —
+`set[int]` visited sets, deferred `raw[i]` resolution at the point
+the loop body actually reads payload.
 
 ## The `Cacheable` contract
 
@@ -288,7 +300,7 @@ import resolution, and `apply_ops` (plugin `AddEdge`). The shared
 `graph._claim_edge` helper records each triple once, so cross-source
 and cross-package duplicates (e.g. two packages re-exporting the
 same external) collapse to one edge instead of accumulating as
-parallel `MultiDiGraph` edges. Plugin edges carry no flags, so they
+parallel multigraph edges. Plugin edges carry no flags, so they
 key as `(src, dst, EdgeFlags.NONE)`; `RemoveEdge` drops that key so
 remove-then-add still re-adds the edge.
 
@@ -308,8 +320,10 @@ Two phases per `EdgePlugin`:
   `AddNode` / `AddEdge` / `RemoveEdge` ops.
 
 `PluginContext` provides helpers (`find_module`, `find_declarations`,
-`module_surface`, `importers`, …) and exposes the current package's
-raw build product via `ctx.contribution: PackageContribution` — the
+`module_surface`, …; cross-package "who imports X" is
+`analysis.package(path).importers_of(target)`, not a context method)
+and exposes the current package's raw build product via
+`ctx.contribution: PackageContribution` — the
 `Package`, the package-local `SymbolTrie`, the contributed
 `frozenset[SymbolNode]` (`ctx.contribution.nodes`), the raw edge and
 import-edge triples, and the per-file dead-suite map.

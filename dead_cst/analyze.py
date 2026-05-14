@@ -111,7 +111,7 @@ def _compose_contribution(
     window spans every package in one compose pass -- cross-package
     duplicates (e.g. two packages re-exporting the same external)
     collapse to one edge instead of accumulating as parallel
-    ``MultiDiGraph`` edges.
+    multigraph edges.
     """
     for node in contrib.nodes:
         target_graph.add(node)

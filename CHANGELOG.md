@@ -12,17 +12,41 @@ two versions.
 ### Changed
 - Swapped the graph backend from `networkx.MultiDiGraph` to a minimal
   `rustworkx.PyDiGraph` wrapper (`dead_cst._graphstore.SymbolGraph`).
-  `SymbolGraph` exposes the `SymbolNode <-> int` index map plus
-  `SymbolNode`-keyed traversal sugar (`nodes`, `successors`,
-  `predecessors`, `subgraph`); anything beyond that goes through
-  `.raw` for rustworkx primitives. Plugin extension points
+  The wrapper exposes the `SymbolNode <-> int` index bookkeeping
+  (`add`, `add_edge`, `index`, `node`, `subgraph`, `nodes`,
+  `__contains__`, `__iter__`, `__len__`) plus the raw rustworkx graph
+  on `SymbolGraph.raw`. Everything beyond that -- edge-payload-aware
+  iteration, `has_edge`, `in_degree`, algorithm calls, and
+  `successor_indices` / `predecessor_indices` traversal -- goes
+  through `.raw` directly. Plugin extension points
   (`PluginContext.graph`, `Analysis.materialize_*` return types) are
-  now `SymbolGraph` instead of `networkx.MultiDiGraph`. Plugins that
-  used `ctx.graph.nodes` / `successors` / `predecessors` keep working
-  unchanged; anything that called other networkx methods (`edges`,
-  `has_edge`, `in_degree`, ...) needs to reach through `ctx.graph.raw`
-  for the rustworkx equivalent. `networkx` is no longer a runtime
-  dependency; `rustworkx>=0.15` replaces it.
+  now `SymbolGraph` instead of `networkx.MultiDiGraph`. `networkx` is
+  no longer a runtime dependency; `rustworkx>=0.15` replaces it.
+
+- **Breaking for plugin authors and downstream callers.** The wrapper
+  intentionally does not provide `SymbolNode`-yielding traversal
+  sugar. Plugins that previously called `ctx.graph.successors(node)`
+  / `predecessors(node)` now write
+  `ctx.graph.raw.successor_indices(ctx.graph.index(node))` and resolve
+  back to a `SymbolNode` via `ctx.graph.node(i)` only when the body
+  needs the payload. Index-keyed visited sets (`set[int]`) replace
+  `set[SymbolNode]` in BFS-shaped code.
+
+- `_find_reachable` / `_entrypoint_seeds` operate in index space.
+  `_entrypoint_seeds(graph)` now returns `list[int]`;
+  `_find_reachable(graph, seeds, ...)` takes `Iterable[int]` for
+  seeds. The pre-merge `SymbolNode -> int` round-trip on every BFS
+  invocation is gone. Tests that built explicit seed lists build them
+  as `[graph.index(n) for n in ...]`.
+
+- `PluginContext.importers` removed. The synthetic-prefix walk +
+  predecessor filter is inlined in `PackageView.importers_of`, which
+  was the only production caller; the public CLI command and tests
+  continue to drive it via that method. Out-of-tree plugins that
+  called `ctx.importers(...)` need to switch to
+  `analysis.package(path).importers_of(...)` or use
+  `ctx.find_module(...)` / `require_resolved_dep(ctx, package)` for
+  the in-plugin equivalent.
 
 - Edge deduplication is centralized in the compose pass. One
   `emitted: set[(src, dst, EdgeFlags)]` owned by `_materialize` is
