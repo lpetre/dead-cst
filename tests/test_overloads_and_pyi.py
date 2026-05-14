@@ -52,7 +52,7 @@ def test_overload_decls_are_flagged_and_anchored_to_impl(tmp_path, make_analysis
     impl = impls[0]
     for ov in overloads:
         assert impl.position.start.line > ov.position.start.line
-    successors = list(graph.successors(impl))
+    successors = [graph.node(i) for i in graph.raw.successor_indices(graph.index(impl))]
     assert all(o in successors for o in overloads)
 
 
@@ -75,7 +75,9 @@ def test_overloads_are_excluded_from_cross_module_lookup(tmp_path, make_analysis
 
     main_f_import = next(n for n in graph.nodes if n.fqname == "main.f")
     targets = [
-        s for s in graph.successors(main_f_import) if s.fqname == "mod.f" and s.type == "function"
+        s
+        for s in (graph.node(i) for i in graph.raw.successor_indices(graph.index(main_f_import)))
+        if s.fqname == "mod.f" and s.type == "function"
     ]
     assert targets, "main.f should reach mod.f"
     assert all(not (t.flags & NodeFlags.OVERLOAD) for t in targets), (
@@ -103,7 +105,7 @@ def test_dead_overloads_are_removed_with_impl(tmp_path, make_analysis):
         )
     )
     graph = make_analysis().materialize_all()
-    seeds = [n for n in graph.nodes if n.fqname == "mod.keep"]
+    seeds = [graph.index(n) for n in graph.nodes if n.fqname == "mod.keep"]
     reachable = find_reachable(graph, seeds)
     unreachable = graph.subgraph([n for n in graph.nodes if n not in reachable])
     remove_code(unreachable, tmp_path)
@@ -200,7 +202,9 @@ def test_orphan_pyi_stub_uses_runtime_fqname(tmp_path, make_analysis):
     assert stub_compute in reachable, "orphan stub decl should be alive when imported"
 
     pkg_compute = next(n for n in graph.nodes if n.fqname == "mypkg.compute")
-    assert stub_compute in graph.successors(pkg_compute)
+    assert stub_compute in (
+        graph.node(i) for i in graph.raw.successor_indices(graph.index(pkg_compute))
+    )
 
 
 def test_orphan_pyi_stub_deleted_when_unused(tmp_path, make_analysis):

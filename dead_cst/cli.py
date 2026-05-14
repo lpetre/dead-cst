@@ -406,15 +406,16 @@ def why_alive(
     typer.echo(f"In-degree: {graph.raw.in_degree(graph.index(target_node))}")
     typer.echo("\nPredecessor chain:")
 
-    seen: set[SymbolNode] = set()
-    stack = [target_node]
+    seen_idx: set[int] = set()
+    stack: list[int] = [graph.index(target_node)]
     while stack:
-        node = stack.pop()
-        if node in seen:
+        i = stack.pop()
+        if i in seen_idx:
             continue
-        seen.add(node)
+        seen_idx.add(i)
+        node = graph.node(i)
         typer.echo(f"  <- {node.fqname} ({node.type}) at {_rel_path(node.path, root)}")
-        stack.extend(graph.predecessors(node))
+        stack.extend(graph.raw.predecessor_indices(i))
 
 
 def _is_dunder_all(node: SymbolNode) -> bool:
@@ -546,25 +547,27 @@ def unused_exports(
     def _is_dunder_seed(node: SymbolNode) -> bool:
         return node.type == "synthetic" and node.fqname.startswith(DUNDER_PREFIX)
 
-    visited: set[SymbolNode] = set()
-    stack = [n for n in graph.nodes if n.flags & NodeFlags.ENTRYPOINT]
+    visited_idx: set[int] = set()
+    stack: list[int] = [graph.index(n) for n in graph.nodes if n.flags & NodeFlags.ENTRYPOINT]
     while stack:
-        node = stack.pop()
-        if node in visited:
+        i = stack.pop()
+        if i in visited_idx:
             continue
-        visited.add(node)
-        is_seed = _is_dunder_seed(node)
-        for succ in graph.successors(node):
-            if is_seed and _is_dunder_all(succ):
+        visited_idx.add(i)
+        is_seed = _is_dunder_seed(graph.node(i))
+        for j in graph.raw.successor_indices(i):
+            if is_seed and _is_dunder_all(graph.node(j)):
                 continue
-            stack.append(succ)
+            stack.append(j)
+    visited = {graph.node(i) for i in visited_idx}
     only_via_all = reachable - visited
 
     by_all: dict[SymbolNode, list[SymbolNode]] = {}
     for sym in only_via_all:
         if _is_dunder_all(sym):
             continue
-        for pred in graph.predecessors(sym):
+        for j in graph.raw.predecessor_indices(graph.index(sym)):
+            pred = graph.node(j)
             if _is_dunder_all(pred):
                 by_all.setdefault(pred, []).append(sym)
 

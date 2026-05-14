@@ -183,15 +183,18 @@ class PluginContext:
         if target_node is None:
             return set()
         package_path = self.contribution.package.path
-        return {
-            pred.path
-            for pred in self.graph.predecessors(target_node)
-            # Exclude same-file predecessors -- for a first-party module
-            # node, every decl inside that module is a predecessor (via
-            # the standard ``decl -> module`` edge), but we want
-            # *importers* of the module, not its contents.
-            if pred.path != target_node.path and pred.path.is_relative_to(package_path)
-        }
+        target_path = target_node.path
+        raw = self.graph.raw
+        # Exclude same-file predecessors -- for a first-party module
+        # node, every decl inside that module is a predecessor (via the
+        # standard ``decl -> module`` edge), but we want *importers* of
+        # the module, not its contents.
+        result: set[Path] = set()
+        for i in raw.predecessor_indices(self.graph.index(target_node)):
+            pred_path = raw[i].path
+            if pred_path != target_path and pred_path.is_relative_to(package_path):
+                result.add(pred_path)
+        return result
 
     def parse(self, path: Path) -> cst.Module | None:
         """Return the parsed :class:`libcst.Module` for ``path``.
@@ -745,13 +748,16 @@ def walk_to_instance_kind(
     ``"fastapi"`` / etc. (the unresolved fallback uses the dotted full
     name and would never match here).
     """
-    seen: set[SymbolNode] = set()
-    stack: list[SymbolNode] = [start]
+    raw = graph.raw
+    terminal_idx = graph.index(terminal)
+    seen_idx: set[int] = set()
+    stack: list[int] = [graph.index(start)]
     while stack:
-        node = stack.pop()
-        if node in seen or node is terminal:
+        i = stack.pop()
+        if i in seen_idx or i == terminal_idx:
             continue
-        seen.add(node)
+        seen_idx.add(i)
+        node = raw[i]
         if node.type == "import" and node.imports is not None:
             decl = node.imports.decl
             if decl is not None and node.imports.module == module_name and decl in instance_kinds:
@@ -764,7 +770,7 @@ def walk_to_instance_kind(
             kind = node.fqname[len(factory_marker_prefix) :].split(":", 1)[0]
             if kind in instance_kinds:
                 return kind
-        stack.extend(graph.successors(node))
+        stack.extend(raw.successor_indices(i))
     return None
 
 

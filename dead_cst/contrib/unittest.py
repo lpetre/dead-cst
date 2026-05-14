@@ -162,6 +162,7 @@ class UnittestPlugin:
                 # first one seen even if duplicates slipped in.
                 buckets_by_base.setdefault(node.fqname[len(UNITTEST_BASE_PREFIX) :], node)
 
+        raw = ctx.graph.raw
         subclasses: set[SymbolNode] = set()
         stack: list[str] = list(aliases)
         while stack:
@@ -169,7 +170,8 @@ class UnittestPlugin:
             bucket = buckets_by_base.get(fq)
             if bucket is None:
                 continue
-            for sub in ctx.graph.successors(bucket):
+            for j in raw.successor_indices(ctx.graph.index(bucket)):
+                sub = raw[j]
                 if sub.type != "class" or sub in subclasses:
                     continue
                 subclasses.add(sub)

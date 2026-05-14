@@ -146,28 +146,31 @@ def _compose_contribution(
 _NON_DECL_TYPES: frozenset[str] = frozenset({"module", "synthetic"})
 
 
-def _entrypoint_seeds(
-    graph: SymbolGraph, exclude_flags: NodeFlags = NodeFlags.NONE
-) -> list[SymbolNode]:
-    """Nodes carrying :data:`NodeFlags.ENTRYPOINT`, optionally minus ``exclude_flags``.
+def _entrypoint_seeds(graph: SymbolGraph, exclude_flags: NodeFlags = NodeFlags.NONE) -> list[int]:
+    """Indices of nodes carrying :data:`NodeFlags.ENTRYPOINT`, optionally minus ``exclude_flags``.
 
-    The default seed source for :func:`_find_reachable`. Passing
+    The default seed source for :func:`_find_reachable`. Returns
+    rustworkx node indices, not :class:`SymbolNode`\\s -- the BFS in
+    :func:`_find_reachable` runs in index space, and going through
+    :class:`SymbolNode` and back is a wasted round-trip. Passing
     ``exclude_flags`` drops any entrypoint whose flags intersect it --
     the building block for :func:`_find_kept_alive_by_flags_only`.
     """
     return [
-        n for n in graph.nodes if n.flags & NodeFlags.ENTRYPOINT and not (n.flags & exclude_flags)
+        graph.index(n)
+        for n in graph.nodes
+        if n.flags & NodeFlags.ENTRYPOINT and not (n.flags & exclude_flags)
     ]
 
 
 def _find_reachable(
     graph: SymbolGraph,
-    seeds: Iterable[SymbolNode],
+    seeds: Iterable[int],
     *,
     prefix: Path | None = None,
     skip_dead_branches: bool = False,
 ) -> set[SymbolNode]:
-    """BFS forward from ``seeds``.
+    """BFS forward from ``seeds`` (rustworkx node indices).
 
     ``skip_dead_branches=True`` filters :data:`EdgeFlags.DEAD_BRANCH`
     edges from traversal -- the diff against the default traversal is
@@ -179,7 +182,7 @@ def _find_reachable(
     """
     raw = graph.raw
     visited_idx: set[int] = set()
-    stack: list[int] = [graph.index(n) for n in seeds]
+    stack: list[int] = list(seeds)
     while stack:
         i = stack.pop()
         if i in visited_idx:
@@ -226,7 +229,7 @@ def _find_kept_alive_by_flags_only(
     :class:`PackageView` as ``kept_alive_by_flags_only(flags)``.
     """
     all_seeds = _entrypoint_seeds(graph)
-    kept_seeds = [n for n in all_seeds if not (n.flags & flags)]
+    kept_seeds = [i for i in all_seeds if not (graph.node(i).flags & flags)]
     return _find_reachable(graph, all_seeds, prefix=prefix) - _find_reachable(
         graph, kept_seeds, prefix=prefix
     )

@@ -136,7 +136,7 @@ def test_default_find_reachable_traverses_dead_branch_edges(build_decl_graph):
     )
     module = next(n for n in graph.nodes if n.fqname == "mod")
     helper = next(n for n in graph.nodes if n.fqname == "mod.helper")
-    assert helper in find_reachable(graph, [module])
+    assert helper in find_reachable(graph, [graph.index(module)])
 
 
 def test_find_kept_alive_by_dead_branches_returns_strict_diff(build_decl_graph):
@@ -152,8 +152,9 @@ def test_find_kept_alive_by_dead_branches_returns_strict_diff(build_decl_graph):
     )
     module = next(n for n in graph.nodes if n.fqname == "mod")
     helper = next(n for n in graph.nodes if n.fqname == "mod.helper")
-    full = find_reachable(graph, [module])
-    strict = find_reachable(graph, [module], skip_dead_branches=True)
+    module_idx = graph.index(module)
+    full = find_reachable(graph, [module_idx])
+    strict = find_reachable(graph, [module_idx], skip_dead_branches=True)
     assert helper in full - strict
 
 

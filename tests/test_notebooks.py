@@ -71,7 +71,7 @@ def test_notebook_decls_excluded_from_cross_module_imports(
     ]
     assert notebook_secret
     caller_secret = next(n for n in graph.nodes if n.fqname == "caller.secret")
-    targets = list(graph.successors(caller_secret))
+    targets = [graph.node(i) for i in graph.raw.successor_indices(graph.index(caller_secret))]
     assert all(t not in notebook_secret for t in targets)
 
 

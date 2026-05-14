@@ -1,11 +1,14 @@
 """Minimal :mod:`rustworkx` wrapper for the symbol graph.
 
 :class:`SymbolGraph` holds a :class:`rustworkx.PyDiGraph` plus a
-``SymbolNode -> int`` map. It exposes the index bookkeeping and trivial
-``SymbolNode``-keyed traversal sugar (because that sugar *is* the reason
-the index map exists). Anything beyond that -- edge-payload-aware
-iteration, in-place edge removal, algorithm calls -- goes through
-:attr:`SymbolGraph.raw` directly using rustworkx primitives.
+``SymbolNode -> int`` map. It exposes the index bookkeeping and not much
+else -- traversal (``successor_indices`` / ``predecessor_indices``),
+payload-aware iteration, in-place edge removal, and every algorithm
+goes through :attr:`SymbolGraph.raw` directly using rustworkx
+primitives. Callers that want a ``SymbolNode`` resolve indices through
+:meth:`SymbolGraph.node` at the boundary; the wrapper deliberately does
+not yield ``SymbolNode``\\s from edge traversal so callers feel the
+cost when they round-trip through it.
 
 The graph is always built as ``multigraph=True`` to match the
 ``networkx.MultiDiGraph`` behaviour the codebase relied on; cross-package
@@ -78,11 +81,3 @@ class SymbolGraph:
     @property
     def nodes(self) -> Iterator[SymbolNode]:
         return iter(self._idx)
-
-    def successors(self, node: SymbolNode) -> Iterator[SymbolNode]:
-        for succ in self.raw.successors(self._idx[node]):
-            yield succ
-
-    def predecessors(self, node: SymbolNode) -> Iterator[SymbolNode]:
-        for pred in self.raw.predecessors(self._idx[node]):
-            yield pred
