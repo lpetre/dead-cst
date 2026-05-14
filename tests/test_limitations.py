@@ -24,16 +24,23 @@ import pytest
                 def a(): g()
                 """,
             },
-            # ``from other import *`` is fanned out at the module level,
-            # so ``mod`` points at every top-level decl in ``other``.
-            # Per-access resolution is still missing: ideally
+            # ``from other import *`` is fanned out at the module level
+            # and re-export-materialized as ``mod.g`` (an ``"import"``
+            # node pointing at ``other.g``), so cross-module
+            # ``from mod import g`` resolves correctly. Per-access
+            # resolution inside ``a`` is still missing: ideally
             # ``mod.a -> other.g`` would also be present, but
             # ScopeProvider cannot bind the bare ``g`` reference back to
-            # the star import.
+            # the star import, so the visitor never emits anything for
+            # the call site.
             {
+                "mod -> mod.g",
                 "mod -> other",
                 "mod -> other.g",
                 "mod.a -> mod",
+                "mod.g -> mod",
+                "mod.g -> other",
+                "mod.g -> other.g",
                 "other.g -> other",
             },
             id="star-import-fans-out-but-misses-per-access-edge",

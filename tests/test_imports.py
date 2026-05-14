@@ -230,20 +230,47 @@ IMPORT_BASE_EDGES = frozenset(
         ),
         pytest.param(
             "from p.functions import *\ndef a(): f()",
+            # Module-level ``from p.functions import *`` produces two
+            # overlapping sets of edges. The visitor-emitted star still
+            # fans out to every decl in the target (``p.x -> p.functions.{f,g}``
+            # keep-alive). On top of that, ``build_contribution``'s star
+            # re-export materialization synthesizes one ``"import"``
+            # node per re-exported name (``p.x.f``, ``p.x.g``) so a
+            # downstream ``from p.x import f`` resolves through the
+            # synthetic to ``p.functions.f``.
             {
                 "p.x -> p.functions",
                 "p.x -> p.functions.f",
                 "p.x -> p.functions.g",
+                "p.x -> p.x.f",
+                "p.x -> p.x.g",
                 "p.x.a -> p.x",
+                "p.x.f -> p.functions",
+                "p.x.f -> p.functions.f",
+                "p.x.f -> p.x",
+                "p.x.g -> p.functions",
+                "p.x.g -> p.functions.g",
+                "p.x.g -> p.x",
             },
             id="star-import-fans-out-to-all-decls",
         ),
         pytest.param(
             "__import__('p.functions')",
+            # ``__import__('p.functions')`` is folded into a star import
+            # at the visitor level, so both the legacy fan-out and the
+            # re-export materialization apply.
             {
                 "p.x -> p.functions",
                 "p.x -> p.functions.f",
                 "p.x -> p.functions.g",
+                "p.x -> p.x.f",
+                "p.x -> p.x.g",
+                "p.x.f -> p.functions",
+                "p.x.f -> p.functions.f",
+                "p.x.f -> p.x",
+                "p.x.g -> p.functions",
+                "p.x.g -> p.functions.g",
+                "p.x.g -> p.x",
             },
             id="dunder-import-call-fans-out-like-star",
         ),
@@ -263,7 +290,15 @@ IMPORT_BASE_EDGES = frozenset(
                 "p.x -> p.functions",
                 "p.x -> p.functions.f",
                 "p.x -> p.functions.g",
+                "p.x -> p.x.f",
+                "p.x -> p.x.g",
                 "p.x -> p.x.importlib",
+                "p.x.f -> p.functions",
+                "p.x.f -> p.functions.f",
+                "p.x.f -> p.x",
+                "p.x.g -> p.functions",
+                "p.x.g -> p.functions.g",
+                "p.x.g -> p.x",
                 "p.x.importlib -> p.x",
             },
             id="importlib-import-module-fans-out-like-star",
@@ -286,7 +321,15 @@ IMPORT_BASE_EDGES = frozenset(
                 "p.x -> p.functions",
                 "p.x -> p.functions.f",
                 "p.x -> p.functions.g",
+                "p.x -> p.x.f",
+                "p.x -> p.x.g",
                 "p.x -> p.x.importlib",
+                "p.x.f -> p.functions",
+                "p.x.f -> p.functions.f",
+                "p.x.f -> p.x",
+                "p.x.g -> p.functions",
+                "p.x.g -> p.functions.g",
+                "p.x.g -> p.x",
                 "p.x.importlib -> p.x",
             },
             id="importlib-import-module-relative-positional-package",
@@ -297,7 +340,15 @@ IMPORT_BASE_EDGES = frozenset(
                 "p.x -> p.functions",
                 "p.x -> p.functions.f",
                 "p.x -> p.functions.g",
+                "p.x -> p.x.f",
+                "p.x -> p.x.g",
                 "p.x -> p.x.importlib",
+                "p.x.f -> p.functions",
+                "p.x.f -> p.functions.f",
+                "p.x.f -> p.x",
+                "p.x.g -> p.functions",
+                "p.x.g -> p.functions.g",
+                "p.x.g -> p.x",
                 "p.x.importlib -> p.x",
             },
             id="importlib-import-module-relative-keyword-package",
@@ -308,7 +359,15 @@ IMPORT_BASE_EDGES = frozenset(
                 "p.x -> p.functions",
                 "p.x -> p.functions.f",
                 "p.x -> p.functions.g",
+                "p.x -> p.x.f",
+                "p.x -> p.x.g",
                 "p.x -> p.x.importlib",
+                "p.x.f -> p.functions",
+                "p.x.f -> p.functions.f",
+                "p.x.f -> p.x",
+                "p.x.g -> p.functions",
+                "p.x.g -> p.functions.g",
+                "p.x.g -> p.x",
                 "p.x.importlib -> p.x",
             },
             id="importlib-import-module-relative-uses-enclosing-package",
@@ -319,6 +378,14 @@ IMPORT_BASE_EDGES = frozenset(
                 "p.x -> p.functions",
                 "p.x -> p.functions.f",
                 "p.x -> p.functions.g",
+                "p.x -> p.x.f",
+                "p.x -> p.x.g",
+                "p.x.f -> p.functions",
+                "p.x.f -> p.functions.f",
+                "p.x.f -> p.x",
+                "p.x.g -> p.functions",
+                "p.x.g -> p.functions.g",
+                "p.x.g -> p.x",
             },
             id="dunder-import-positional-level-resolves-relative",
         ),
@@ -328,6 +395,14 @@ IMPORT_BASE_EDGES = frozenset(
                 "p.x -> p.functions",
                 "p.x -> p.functions.f",
                 "p.x -> p.functions.g",
+                "p.x -> p.x.f",
+                "p.x -> p.x.g",
+                "p.x.f -> p.functions",
+                "p.x.f -> p.functions.f",
+                "p.x.f -> p.x",
+                "p.x.g -> p.functions",
+                "p.x.g -> p.functions.g",
+                "p.x.g -> p.x",
             },
             id="dunder-import-keyword-level-resolves-relative",
         ),
@@ -439,8 +514,8 @@ def test_dynamic_import_non_literal_warns(build_decl_graph, visitor_warnings):
 def test_dunder_import_fromlist_resolves_submodules(build_decl_graph, assert_edges, src):
     """Literal ``fromlist`` entries that resolve as submodules are fanned out too."""
     graph = build_decl_graph({**IMPORT_TEST_FILES, "p/x.py": src})
-    # Fan-out from ``p`` (empty ``__init__.py``) plus fan-out from
-    # ``p.functions`` (the resolved fromlist submodule).
+    # Fan-out from ``p.functions`` (the resolved fromlist submodule)
+    # plus the star re-export materialization of its decls into ``p.x``.
     assert_edges(
         graph,
         IMPORT_BASE_EDGES
@@ -448,6 +523,14 @@ def test_dunder_import_fromlist_resolves_submodules(build_decl_graph, assert_edg
             "p.x -> p.functions",
             "p.x -> p.functions.f",
             "p.x -> p.functions.g",
+            "p.x -> p.x.f",
+            "p.x -> p.x.g",
+            "p.x.f -> p.functions",
+            "p.x.f -> p.functions.f",
+            "p.x.f -> p.x",
+            "p.x.g -> p.functions",
+            "p.x.g -> p.functions.g",
+            "p.x.g -> p.x",
         },
     )
 
@@ -468,6 +551,14 @@ def test_dunder_import_fromlist_attribute_entries_silent(
             "p.x -> p.functions",
             "p.x -> p.functions.f",
             "p.x -> p.functions.g",
+            "p.x -> p.x.f",
+            "p.x -> p.x.g",
+            "p.x.f -> p.functions",
+            "p.x.f -> p.functions.f",
+            "p.x.f -> p.x",
+            "p.x.g -> p.functions",
+            "p.x.g -> p.functions.g",
+            "p.x.g -> p.x",
         },
     )
 
@@ -659,6 +750,169 @@ def test_cyclic_reexport_terminates(build_decl_graph, assert_edges):
             "main.x -> main",
         },
     )
+
+
+def test_import_resolves_through_star_reexport(build_decl_graph, assert_edges):
+    """``from pkg import name`` resolves through ``from pkg._internal import *``.
+
+    The package's ``__init__.py`` re-exports its private module via star.
+    ``build_contribution`` synthesizes ``pkg.g`` as an ``"import"``
+    node pointing at ``pkg._internal.g``, so ``from pkg import g`` in a
+    consumer produces an edge to ``pkg._internal.g`` -- not just keeps
+    ``pkg._internal`` alive via the star's module-level fan-out.
+    """
+    graph = build_decl_graph(
+        {
+            "pkg/__init__.py": "from pkg._internal import *\n",
+            "pkg/_internal.py": "def g(): pass\n",
+            "consumer.py": "from pkg import g\ng()\n",
+        }
+    )
+    edge_strs = {f"{src.fqname} -> {dst.fqname}" for src, dst in graph.edges(keys=False)}
+    # The key new edge: consumer's import resolves through the synthetic
+    # re-export to the real source.
+    assert "consumer.g -> pkg._internal.g" in edge_strs
+    assert "consumer.g -> pkg.g" in edge_strs
+
+
+def test_import_resolves_through_chained_star_reexports(build_decl_graph, assert_edges):
+    """``from A import g`` follows ``A -> B -> C`` star chain to ``C.g``."""
+    graph = build_decl_graph(
+        {
+            "A.py": "from B import *\n",
+            "B.py": "from C import *\n",
+            "C.py": "def g(): pass\n",
+            "consumer.py": "from A import g\ng()\n",
+        }
+    )
+    edge_strs = {f"{src.fqname} -> {dst.fqname}" for src, dst in graph.edges(keys=False)}
+    assert "consumer.g -> C.g" in edge_strs
+
+
+def test_star_reexport_cycle_terminates(build_decl_graph, assert_edges):
+    """Mutual ``from B import *`` / ``from A import *`` terminates without spinning."""
+    graph = build_decl_graph(
+        {
+            "A.py": "from B import *\ndef a(): pass\n",
+            "B.py": "from A import *\ndef b(): pass\n",
+            "consumer.py": "from A import b\n",
+        }
+    )
+    edge_strs = {f"{src.fqname} -> {dst.fqname}" for src, dst in graph.edges(keys=False)}
+    # ``b`` originates in ``B`` and is re-exported into ``A`` via the
+    # star cycle; consumer's ``from A import b`` resolves through the
+    # synthetic ``A.b`` to ``B.b``.
+    assert "consumer.b -> B.b" in edge_strs
+
+
+def test_star_reexport_shadowed_by_real_decl(build_decl_graph, assert_edges):
+    """A real decl in the importing module wins over a star re-export of the same name."""
+    graph = build_decl_graph(
+        {
+            "other.py": "def g(): pass\n",
+            "mod.py": "from other import *\ndef g(): return 1\n",
+            "consumer.py": "from mod import g\ng()\n",
+        }
+    )
+    edge_strs = {f"{src.fqname} -> {dst.fqname}" for src, dst in graph.edges(keys=False)}
+    # The real ``mod.g`` shadows the star re-export of ``other.g``;
+    # ``from mod import g`` resolves to the real decl, not other.g.
+    assert "consumer.g -> mod.g" in edge_strs
+    assert "consumer.g -> other.g" not in edge_strs
+
+
+def test_star_reexport_is_skipped_by_codemod(build_decl_graph, tmp_path, assert_edges):
+    """Star re-export synthetics carry ``STAR_REEXPORT`` and stay out of the codemod's hands."""
+    from dead_cst.graph import NodeFlags
+
+    graph = build_decl_graph(
+        {
+            "pkg/__init__.py": "from pkg._internal import *\n",
+            "pkg/_internal.py": "def g(): pass\n",
+        }
+    )
+    reexports = [
+        n for n in graph.nodes if n.fqname == "pkg.g" and n.flags & NodeFlags.STAR_REEXPORT
+    ]
+    assert len(reexports) == 1, [n.fqname for n in graph.nodes if "pkg" in n.fqname]
+
+
+def test_star_reexport_inherits_exported_from_importing_module(tmp_path, make_analysis):
+    """A re-export's ``EXPORTED`` flag mirrors the importing module's.
+
+    The synthetic stands in for a name in the importing module's
+    namespace, so it should be visible to consumers iff the importing
+    module is. An exported file produces ``EXPORTED`` synthetics that
+    flow through :meth:`SymbolTrie.merge_exported`; a non-exported
+    file produces synthetics that stay package-internal.
+    """
+    from dead_cst.graph import NodeFlags
+    from dead_cst.resolvers import ManualResolver, Package
+
+    (tmp_path / "mypkg").mkdir()
+    (tmp_path / "mypkg" / "__init__.py").write_text("from mypkg._impl import *\n")
+    (tmp_path / "mypkg" / "_impl.py").write_text("def g(): pass\n")
+    (tmp_path / "mypkg" / "api").mkdir()
+    (tmp_path / "mypkg" / "api" / "__init__.py").write_text("from mypkg._impl import *\n")
+
+    class FixedResolver:
+        name = "fixed"
+        version = 0
+
+        def resolve(self, project_root):
+            return (
+                Package(
+                    path=tmp_path,
+                    name="mypkg",
+                    exported=(tmp_path / "mypkg" / "api",),
+                    deps=(),
+                ),
+            )
+
+        def resolve_import(self, name, search_paths):
+            return ManualResolver(specs=[]).resolve_import(name, search_paths)
+
+    analysis = make_analysis(resolver=FixedResolver())
+    graph = analysis.materialize_all()
+
+    by_fqname: dict[str, list] = {}
+    for n in graph.nodes:
+        if n.flags & NodeFlags.STAR_REEXPORT:
+            by_fqname.setdefault(n.fqname, []).append(n)
+
+    # ``mypkg.api.g`` lives in an exported file -> EXPORTED set.
+    assert "mypkg.api.g" in by_fqname, list(by_fqname)
+    assert all(n.flags & NodeFlags.EXPORTED for n in by_fqname["mypkg.api.g"])
+
+    # ``mypkg.g`` lives in a non-exported file -> EXPORTED not set.
+    assert "mypkg.g" in by_fqname, list(by_fqname)
+    assert not any(n.flags & NodeFlags.EXPORTED for n in by_fqname["mypkg.g"])
+
+
+def test_star_reexport_crosses_packages(tmp_path, make_analysis, assert_edges):
+    """``from dep import *`` in a consumer package materializes against the dep's trie.
+
+    Layout:
+        pkg_a/A/__init__.py    -- def g(): ...
+        pkg_b/B/__init__.py    -- from A import *
+
+    The dep ``pkg_a`` is built first (dep-order in ``refresh``), so by
+    the time ``pkg_b``'s ``build_contribution`` runs, ``A``'s trie is
+    available for star materialization. ``B.g`` should be synthesized
+    as a re-export pointing at ``A.g``.
+    """
+    pkg_a = tmp_path / "pkg_a"
+    pkg_b = tmp_path / "pkg_b"
+    (pkg_a / "A").mkdir(parents=True)
+    (pkg_b / "B").mkdir(parents=True)
+    (pkg_a / "A" / "__init__.py").write_text("def g(): pass\n")
+    (pkg_b / "B" / "__init__.py").write_text("from A import *\n")
+
+    graph = make_analysis(["pkg_b:pkg_a", "pkg_a"]).materialize_all()
+    edge_strs = {f"{src.fqname} -> {dst.fqname}" for src, dst in graph.edges(keys=False)}
+    # ``B.g`` is synthesized as the re-export and points at ``A.g``.
+    assert "B.g -> A.g" in edge_strs
+    assert "B -> B.g" in edge_strs
 
 
 def test_cross_dep_submodule_import(tmp_path, make_analysis, assert_edges):

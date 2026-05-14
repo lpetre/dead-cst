@@ -73,6 +73,15 @@ class NodeFlags(enum.IntFlag):
     :meth:`SymbolTrie.merge_exported` to filter to entries with this
     bit set, while the package's own self-lookup uses :meth:`merge`
     and sees everything.
+
+    ``STAR_REEXPORT`` tags an import decl that ``build_contribution``
+    materialized from a ``from X import *`` statement: each name in
+    the star target's trie becomes a synthetic ``"import"`` node in
+    the importing module so cross-module lookups like
+    ``from <importer> import <name>`` resolve through to the real
+    source. These nodes have no literal counterpart in the source
+    file, so the codemod skips them (the ``RemoveImportsVisitor``
+    pass would otherwise hunt for a non-existent line).
     """
 
     NONE = 0
@@ -83,6 +92,7 @@ class NodeFlags(enum.IntFlag):
     NOQA = enum.auto()
     NOTEBOOK = enum.auto()
     EXPORTED = enum.auto()
+    STAR_REEXPORT = enum.auto()
 
 
 class EdgeFlags(enum.IntFlag):

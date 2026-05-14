@@ -486,7 +486,17 @@ class Analysis:
         unknown = [p for p in targets if p not in self._packages_by_path]
         if unknown:
             raise KeyError(f"Unknown packages: {unknown}")
-        new_targets = [p for p in targets if p not in self._contributions]
+        # Walk ``self.packages`` rather than ``targets`` so the work
+        # order is dep-first regardless of how ``packages`` was supplied
+        # (``_interesting_set`` returns a frozenset). Star re-export
+        # materialization in :func:`build_contribution` reads each
+        # dep's already-built contribution, so dep-order is a contract.
+        targets_set = set(targets)
+        new_targets = [
+            p.path
+            for p in self.packages
+            if p.path in targets_set and p.path not in self._contributions
+        ]
         if not new_targets:
             return self
 
@@ -508,10 +518,14 @@ class Analysis:
 
         for path in new_targets:
             pf = self._package_files[path]
+            dep_contribs = tuple(
+                self._contributions[dp] for dp in self._dep_paths(path) if dp in self._contributions
+            )
             self._contributions[path] = build_contribution(
                 self._packages_by_path[path],
                 pf,
                 miss_payloads,
+                dep_contributions=dep_contribs,
             )
         return self
 
