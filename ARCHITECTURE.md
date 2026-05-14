@@ -222,6 +222,26 @@ lifetime, so a signal cancels pending futures and re-raises
 `KeyboardInterrupt`; files that completed before the signal stay
 cache-warmed.
 
+`build_contribution` runs two passes per package. Pass 1 is the
+per-file apply step above (visitor payloads land in `trie`, `nodes`,
+`edges`, `import_edges`). Pass 2 — `_materialize_star_reexports` —
+walks every module-level `from X import *` in `import_edges`, looks
+`X` up in `compose_lookup(own_trie, dep_contributions)` (the own
+trie plus each dep's exported view, the same recipe
+`Analysis._build_symbol_lookup` uses at compose time), and
+synthesizes one `"import"`-typed `SymbolNode` per re-exported name
+in the importing module. Each synthetic gets `STAR_REEXPORT` (so the
+codemod skips it), `EXPORTED` inherited from the importing module
+(so `merge_exported` flows it to consumers), parent edges, a
+`module -> synthetic` keep-alive edge, and its own entry in
+`import_edges` so `resolve_edges` later stitches the
+`synthetic -> target.<name>` chain. Star chains converge via
+fixed-point iteration with a `(importer, target, name)` `seen` set
+breaking cycles. The refresh loop walks packages in
+`Analysis.packages` (dep-first) order, so by the time pass 2 runs
+on a dependent each dep's contribution is already in
+`self._contributions`.
+
 ### 5. Edge stitching — `dead_cst/_edges.py`
 
 `resolve_edges` runs **unconditionally** every analysis (it isn't
@@ -262,7 +282,11 @@ attribution instead of being misfiled as `[unresolved]`.
 
 Star imports follow the same path; `Import.speculative` (set on
 `__import__` fromlist synthesis) drops a trie+resolver miss without
-emitting an `[unresolved]` node.
+emitting an `[unresolved]` node. Module-level first-party stars are
+also routed through synthetics by `_materialize_star_reexports`
+(stage 4.5 above); the fan-out here covers the non-module-level case
+(`def a(): __import__('p.functions')`), where the materializer can't
+attach synthetics because they need a module home.
 
 Re-running this every analysis is what makes single-file edits cheap:
 only the edited file's payload is recomputed; importers re-stitch for
@@ -473,6 +497,14 @@ per-package contribution maps without composing a graph.
   uses plain `merge` and sees everything). `Package.exported` is in
   the per-package fingerprint, so editing it invalidates that
   package's cache.
+* `NodeFlags.STAR_REEXPORT` tags synthetic `"import"`-typed decls
+  that `_materialize_star_reexports` synthesizes for every name a
+  `from X import *` re-exports. They live in the trie like real
+  re-export imports (so cross-module lookups resolve through them)
+  and inherit `EXPORTED` from their importing module. The codemod
+  skips them: the file has only `from X import *`, not the per-name
+  `from X import <decl>` line `RemoveImportsVisitor` would otherwise
+  chase.
 * `[unparseable] <module>` synthetics stand in for files `libcst`
   cannot parse. They carry `NodeFlags.ENTRYPOINT` and edge at the real
   module node, so the file stays alive even though its decls are
@@ -487,6 +519,7 @@ per-package contribution maps without composing a graph.
 | Keep alive symbols a framework registers dynamically     | new `EdgePlugin` under `contrib/`              |
 | Support a new project layout / lockfile                  | new `PathResolver` under `contrib/`            |
 | Change how cross-file imports get classified             | `_edges.resolve_edges` + the resolver fallback |
+| Change how `from X import *` re-exports are materialized | `_package._materialize_star_reexports`         |
 | Change codemod output shape                              | `codemod.py` (`RemoveDeadSymbols` / `_rewrite_one`) |
 | Change patch format / per-SCC patch slicing              | `codemod.generate_patch`                       |
 
