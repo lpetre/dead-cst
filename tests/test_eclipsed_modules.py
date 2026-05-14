@@ -35,7 +35,11 @@ def test_package_wins_trie_slot_for_cross_module_imports(
     assert any("eclipsed by sibling package" in r.getMessage() for r in caplog.records)
 
     caller_x = next(n for n in graph.nodes if n.fqname == "caller.x")
-    targets = [s for s in graph.successors(caller_x) if s.fqname == "pkg.foo.x"]
+    targets = [
+        s
+        for s in (graph.node(i) for i in graph.raw.successor_indices(graph.index(caller_x)))
+        if s.fqname == "pkg.foo.x"
+    ]
     assert len(targets) == 1
     assert targets[0].path.name == "__init__.py"
 

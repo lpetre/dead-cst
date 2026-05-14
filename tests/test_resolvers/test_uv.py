@@ -318,7 +318,7 @@ def test_uv_workspace_flat_layout_with_tests_dirs(tmp_path: Path):
         for n in graph.nodes
         if n.type == "import" and n.path == (pkg_a / "pkg_a" / "app.py").resolve()
     )
-    assert graph.has_edge(app_import, mod_y)
+    assert graph.raw.has_edge(graph.index(app_import), graph.index(mod_y))
 
 
 def test_uv_workspace_shared_namespace_package(tmp_path: Path):
@@ -417,4 +417,4 @@ def test_uv_workspace_shared_namespace_package(tmp_path: Path):
         for n in graph.nodes
         if n.type == "import" and n.path == (foo_b / "foo" / "b" / "__init__.py").resolve()
     )
-    assert graph.has_edge(b_import, value)
+    assert graph.raw.has_edge(graph.index(b_import), graph.index(value))

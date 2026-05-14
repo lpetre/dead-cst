@@ -94,9 +94,9 @@ def build_unreachable_graph(tmp_path, make_analysis):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(_normalise(src))
         graph = make_analysis().materialize_all()
-        seeds = [n for n in graph.nodes if n.fqname in entrypoints]
+        seeds = [graph.index(n) for n in graph.nodes if n.fqname in entrypoints]
         reachable = find_reachable(graph, seeds)
-        return graph.subgraph([n for n in graph.nodes if n not in reachable]).copy()
+        return graph.subgraph([n for n in graph.nodes if n not in reachable])
 
     return _build
 
@@ -806,9 +806,7 @@ def test_generate_patch_per_subgraph_slice_isolates_decls(build_unreachable_grap
         },
         {"mod.used"},
     )
-    one_only = unreachable.subgraph(
-        [n for n in unreachable.nodes if n.fqname == "mod.dead_one"]
-    ).copy()
+    one_only = unreachable.subgraph([n for n in unreachable.nodes if n.fqname == "mod.dead_one"])
     patch = generate_patch(one_only, tmp_path)
 
     assert "-def dead_one():" in patch

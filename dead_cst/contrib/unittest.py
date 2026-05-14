@@ -162,6 +162,7 @@ class UnittestPlugin:
                 # first one seen even if duplicates slipped in.
                 buckets_by_base.setdefault(node.fqname[len(UNITTEST_BASE_PREFIX) :], node)
 
+        raw = ctx.graph.raw
         subclasses: set[SymbolNode] = set()
         stack: list[str] = list(aliases)
         while stack:
@@ -169,7 +170,8 @@ class UnittestPlugin:
             bucket = buckets_by_base.get(fq)
             if bucket is None:
                 continue
-            for sub in ctx.graph.successors(bucket):
+            for j in raw.successor_indices(ctx.graph.index(bucket)):
+                sub = raw[j]
                 if sub.type != "class" or sub in subclasses:
                     continue
                 subclasses.add(sub)
@@ -187,28 +189,26 @@ class UnittestPlugin:
         if not by_module_path:
             return
 
-        modules_by_path = {
-            n.path: n for n in ctx.graph.nodes if n.type == "module" and n.path in by_module_path
-        }
-        existing_synths = {
-            n.fqname: n
-            for n in ctx.graph.nodes
-            if n.type == "synthetic" and n.fqname.startswith(UNITTEST_PREFIX)
+        # Modules with subclasses are all in this package, so the lookup
+        # only needs ``contribution.nodes`` -- not the full composed
+        # graph. Store graph indices, not SymbolNodes; resolve at use.
+        modules_by_path: dict[Path, int] = {
+            n.path: ctx.graph.index(n)
+            for n in ctx.contribution.nodes
+            if n.type == "module" and n.path in by_module_path
         }
 
         for path, subs in by_module_path.items():
-            module = modules_by_path.get(path)
-            if module is None:
+            module_idx = modules_by_path.get(path)
+            if module_idx is None:
                 continue
-            synth_fqname = f"{UNITTEST_PREFIX}{module.fqname}"
-            synth = existing_synths.get(synth_fqname)
-            if synth is None:
-                synth = synthetic_node(
-                    synth_fqname,
-                    path,
-                    flags=NodeFlags.ENTRYPOINT | NodeFlags.TESTCASE,
-                )
-                yield AddNode(synth)
+            module = ctx.graph.node(module_idx)
+            synth = synthetic_node(
+                f"{UNITTEST_PREFIX}{module.fqname}",
+                path,
+                flags=NodeFlags.ENTRYPOINT | NodeFlags.TESTCASE,
+            )
+            yield AddNode(synth)
             for sub in subs:
                 yield AddEdge(synth, sub)
 

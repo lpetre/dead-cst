@@ -4,8 +4,7 @@ from __future__ import annotations
 
 import logging
 
-import networkx as nx
-
+from dead_cst._graphstore import SymbolGraph
 from dead_cst.analyze import _entrypoint_seeds, _find_reachable as find_reachable
 from dead_cst.codemod import generate_patch
 from dead_cst.graph import NodeFlags
@@ -72,7 +71,7 @@ def test_notebook_decls_excluded_from_cross_module_imports(
     ]
     assert notebook_secret
     caller_secret = next(n for n in graph.nodes if n.fqname == "caller.secret")
-    targets = list(graph.successors(caller_secret))
+    targets = [graph.node(i) for i in graph.raw.successor_indices(graph.index(caller_secret))]
     assert all(t not in notebook_secret for t in targets)
 
 
@@ -81,7 +80,8 @@ def test_codemod_skips_notebook_nodes(write_notebook, make_analysis):
     analysis = make_analysis()
     graph = analysis.materialize_all()
     nb_nodes = [n for n in graph.nodes if n.flags & NodeFlags.NOTEBOOK]
-    sub = nx.MultiDiGraph()
-    sub.add_nodes_from(nb_nodes)
+    sub = SymbolGraph()
+    for n in nb_nodes:
+        sub.add(n)
     patch = generate_patch(sub, analysis.project_root)
     assert patch == ""

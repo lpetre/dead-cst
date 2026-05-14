@@ -31,10 +31,10 @@ from typing import (
 )
 
 import libcst as cst
-import networkx as nx
 from libcst.metadata import CodePosition, CodeRange
 
 from .._cacheable import Cacheable
+from .._graphstore import SymbolGraph
 from ..graph import EdgeFlags, NodeFlags, SymbolNode, SymbolTrie, _claim_edge
 
 if TYPE_CHECKING:
@@ -96,16 +96,16 @@ class PluginContext:
     the same analysis return the cached result.
     """
 
-    graph: nx.DiGraph
+    graph: SymbolGraph
     contribution: PackageContribution
     symbol_lookup: SymbolTrie
     project_root: Path
     _modules: dict[Path, cst.Module | None] = field(default_factory=dict, repr=False)
     # Lazy ``fqname -> SymbolNode`` index over synthetic nodes (built on
-    # first ``importers`` call).  Plugins that add their own synthetic
+    # first ``_synthetic`` call). Plugins that add their own synthetic
     # nodes during the same pass won't see them through this index, which
-    # is fine in practice -- ``importers`` is for prefiltering against
-    # the analyzer's already-resolved dep markers.
+    # is fine -- the only consumer is ``require_resolved_dep``, which
+    # prefilters against the analyzer's already-resolved dep markers.
     _synthetic_index: dict[str, SymbolNode] | None = field(default=None, init=False, repr=False)
 
     def find_module(self, fqname: str) -> SymbolNode | None:
@@ -152,46 +152,6 @@ class PluginContext:
                 out.extend(bucket)
             stack.extend(node.children.values())
         return out
-
-    def importers(self, target: str) -> set[Path]:
-        """Return paths under :attr:`package` whose imports reach ``target``.
-
-        ``target`` is matched first as a first-party module fqname
-        (e.g. ``pkg.mod``); if no first-party module matches, it is
-        matched against the synthetic markers the analyzer adds for
-        non-first-party imports -- ``[external dist] <target>``,
-        ``[external file] <target>``, and ``[unresolved] <target>``
-        (for imports the resolver couldn't pin to an installed dist,
-        which still tells us "this file tried to import X"). The result
-        is the natural prefilter for framework plugins ("only look at
-        files that import fastapi") -- strictly more accurate than
-        substring matching, and free because the import edges are
-        already in the graph.
-
-        Stdlib imports (``[stdlib] <target>``) are *not* surfaced as
-        synthetic nodes by the resolver, so this method cannot prefilter
-        on them; plugins that care about stdlib imports must walk the
-        import nodes themselves.
-        """
-        target_node = self.find_module(target)
-        if target_node is None:
-            for prefix in SYNTHETIC_PATH_PREFIXES:
-                node = self._synthetic(f"{prefix}{target}")
-                if node is not None:
-                    target_node = node
-                    break
-        if target_node is None:
-            return set()
-        package_path = self.contribution.package.path
-        return {
-            pred.path
-            for pred in self.graph.predecessors(target_node)
-            # Exclude same-file predecessors -- for a first-party module
-            # node, every decl inside that module is a predecessor (via
-            # the standard ``decl -> module`` edge), but we want
-            # *importers* of the module, not its contents.
-            if pred.path != target_node.path and pred.path.is_relative_to(package_path)
-        }
 
     def parse(self, path: Path) -> cst.Module | None:
         """Return the parsed :class:`libcst.Module` for ``path``.
@@ -249,8 +209,9 @@ def require_resolved_dep(ctx: PluginContext, package: str) -> SymbolNode | None:
       stop rather than guess.
 
     Plugins that wrap framework conventions (FastAPI, Flask, Click,
-    Typer, ...) should use this in place of ``ctx.importers(package)``
-    so that misconfigured environments fail loudly.
+    Typer, ...) use this so misconfigured environments fail loudly --
+    the resolver-attested synthetic is what they need, not a substring
+    or prefix match.
     """
     for prefix in EXTERNAL_PREFIXES:
         node = ctx._synthetic(f"{prefix}{package}")
@@ -348,7 +309,7 @@ class EdgePlugin(Cacheable, Protocol):
 
 
 def apply_ops(
-    graph: nx.DiGraph,
+    graph: SymbolGraph,
     ops: Iterable[GraphOp],
     emitted: set[tuple[SymbolNode, SymbolNode, EdgeFlags]],
 ) -> None:
@@ -362,13 +323,14 @@ def apply_ops(
     for op in ops:
         match op:
             case AddNode(node):
-                graph.add_node(node)
+                graph.add(node)
             case AddEdge(src, dst):
                 if _claim_edge(emitted, src, dst, EdgeFlags.NONE):
                     graph.add_edge(src, dst)
             case RemoveEdge(src, dst):
-                if graph.has_edge(src, dst):
-                    graph.remove_edge(src, dst)
+                s, d = graph.index(src), graph.index(dst)
+                if graph.raw.has_edge(s, d):
+                    graph.raw.remove_edge(s, d)
                 emitted.discard((src, dst, EdgeFlags.NONE))
 
 
@@ -708,7 +670,7 @@ def collect_module_imports(
 
 
 def walk_to_instance_kind(
-    graph: nx.DiGraph,
+    graph: SymbolGraph,
     start: SymbolNode,
     terminal: SymbolNode,
     module_name: str,
@@ -744,13 +706,16 @@ def walk_to_instance_kind(
     ``"fastapi"`` / etc. (the unresolved fallback uses the dotted full
     name and would never match here).
     """
-    seen: set[SymbolNode] = set()
-    stack: list[SymbolNode] = [start]
+    raw = graph.raw
+    terminal_idx = graph.index(terminal)
+    seen_idx: set[int] = set()
+    stack: list[int] = [graph.index(start)]
     while stack:
-        node = stack.pop()
-        if node in seen or node is terminal:
+        i = stack.pop()
+        if i in seen_idx or i == terminal_idx:
             continue
-        seen.add(node)
+        seen_idx.add(i)
+        node = raw[i]
         if node.type == "import" and node.imports is not None:
             decl = node.imports.decl
             if decl is not None and node.imports.module == module_name and decl in instance_kinds:
@@ -763,7 +728,7 @@ def walk_to_instance_kind(
             kind = node.fqname[len(factory_marker_prefix) :].split(":", 1)[0]
             if kind in instance_kinds:
                 return kind
-        stack.extend(graph.successors(node))
+        stack.extend(raw.successor_indices(i))
     return None
 
 
