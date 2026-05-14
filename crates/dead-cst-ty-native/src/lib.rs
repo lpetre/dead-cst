@@ -35,7 +35,7 @@ use std::str::FromStr;
 
 use pyo3::exceptions::{PyOSError, PyValueError};
 use pyo3::prelude::*;
-use ruff_db::files::{File, system_path_to_file};
+use ruff_db::files::{system_path_to_file, File};
 use ruff_db::parsed::parsed_module;
 use ruff_db::source::source_text;
 use ruff_db::system::{OsSystem, SystemPath, SystemPathBuf};
@@ -50,7 +50,7 @@ use ty_project::{ProjectDatabase, ProjectMetadata};
 use ty_python_core::program::UseDefaultStrategy;
 use ty_python_core::scope::FileScopeId;
 use ty_python_semantic::SemanticModel;
-use ty_python_semantic::{ImportAliasResolution, definitions_for_name};
+use ty_python_semantic::{definitions_for_name, ImportAliasResolution};
 
 /// Description of one package the resolver discovered.
 ///
@@ -569,7 +569,10 @@ fn ingest_file(
         )?;
         builder.add_edge(decl_idx, module_idx, 0);
         decl_by_range.insert((decl.target_start, decl.target_end), decl_idx);
-        decl_by_name.entry(decl.name.clone()).or_default().push(decl_idx);
+        decl_by_name
+            .entry(decl.name.clone())
+            .or_default()
+            .push(decl_idx);
     }
 
     let model = SemanticModel::new(db, file);
@@ -624,13 +627,7 @@ fn collect_reference_edges<'db>(
 ) {
     for stmt in body {
         emit_top_level_refs(
-            stmt,
-            module_idx,
-            decl_index,
-            model,
-            file,
-            module_ref,
-            builder,
+            stmt, module_idx, decl_index, model, file, module_ref, builder,
         );
     }
 }
@@ -650,17 +647,25 @@ fn emit_top_level_refs<'db>(
             // name's source range -- the by-name list also contains
             // shadowed siblings (``def f`` redefined), which must not
             // share the body's reference edges.
-            let key = (f.name.range().start().to_u32(), f.name.range().end().to_u32());
+            let key = (
+                f.name.range().start().to_u32(),
+                f.name.range().end().to_u32(),
+            );
             if let Some(&decl_idx) = decl_index.by_range.get(&key) {
-                let mut coll = RefCollector::new(vec![decl_idx], decl_index, model, file, module_ref);
+                let mut coll =
+                    RefCollector::new(vec![decl_idx], decl_index, model, file, module_ref);
                 coll.visit_stmt(stmt);
                 coll.flush(builder);
             }
         }
         Stmt::ClassDef(c) => {
-            let key = (c.name.range().start().to_u32(), c.name.range().end().to_u32());
+            let key = (
+                c.name.range().start().to_u32(),
+                c.name.range().end().to_u32(),
+            );
             if let Some(&decl_idx) = decl_index.by_range.get(&key) {
-                let mut coll = RefCollector::new(vec![decl_idx], decl_index, model, file, module_ref);
+                let mut coll =
+                    RefCollector::new(vec![decl_idx], decl_index, model, file, module_ref);
                 coll.visit_stmt(stmt);
                 coll.flush(builder);
             }
@@ -678,10 +683,7 @@ fn emit_top_level_refs<'db>(
             for (lhs, rhs) in &pairs {
                 let key = (lhs.range().start().to_u32(), lhs.range().end().to_u32());
                 if let Some(&idx) = decl_index.by_range.get(&key) {
-                    by_rhs
-                        .entry(*rhs as *const Expr)
-                        .or_default()
-                        .push(idx);
+                    by_rhs.entry(*rhs as *const Expr).or_default().push(idx);
                 }
             }
             for (rhs_ptr, decls) in by_rhs {
@@ -722,7 +724,8 @@ fn emit_top_level_refs<'db>(
         // still get attributed to their LHS decls.
         Stmt::If(i) => {
             {
-                let mut coll = RefCollector::new(vec![module_idx], decl_index, model, file, module_ref);
+                let mut coll =
+                    RefCollector::new(vec![module_idx], decl_index, model, file, module_ref);
                 coll.visit_expr(&i.test);
                 coll.flush(builder);
             }
@@ -731,18 +734,22 @@ fn emit_top_level_refs<'db>(
             }
             for clause in &i.elif_else_clauses {
                 if let Some(test) = &clause.test {
-                    let mut coll = RefCollector::new(vec![module_idx], decl_index, model, file, module_ref);
+                    let mut coll =
+                        RefCollector::new(vec![module_idx], decl_index, model, file, module_ref);
                     coll.visit_expr(test);
                     coll.flush(builder);
                 }
                 for s in &clause.body {
-                    emit_top_level_refs(s, module_idx, decl_index, model, file, module_ref, builder);
+                    emit_top_level_refs(
+                        s, module_idx, decl_index, model, file, module_ref, builder,
+                    );
                 }
             }
         }
         Stmt::While(w) => {
             {
-                let mut coll = RefCollector::new(vec![module_idx], decl_index, model, file, module_ref);
+                let mut coll =
+                    RefCollector::new(vec![module_idx], decl_index, model, file, module_ref);
                 coll.visit_expr(&w.test);
                 coll.flush(builder);
             }
@@ -771,7 +778,8 @@ fn emit_top_level_refs<'db>(
                 coll.visit_expr(&f.iter);
                 coll.flush(builder);
             } else {
-                let mut coll = RefCollector::new(vec![module_idx], decl_index, model, file, module_ref);
+                let mut coll =
+                    RefCollector::new(vec![module_idx], decl_index, model, file, module_ref);
                 coll.visit_expr(&f.iter);
                 coll.flush(builder);
             }
@@ -819,12 +827,15 @@ fn emit_top_level_refs<'db>(
             for handler in &t.handlers {
                 let ruff_python_ast::ExceptHandler::ExceptHandler(eh) = handler;
                 if let Some(ty) = &eh.type_ {
-                    let mut coll = RefCollector::new(vec![module_idx], decl_index, model, file, module_ref);
+                    let mut coll =
+                        RefCollector::new(vec![module_idx], decl_index, model, file, module_ref);
                     coll.visit_expr(ty);
                     coll.flush(builder);
                 }
                 for s in &eh.body {
-                    emit_top_level_refs(s, module_idx, decl_index, model, file, module_ref, builder);
+                    emit_top_level_refs(
+                        s, module_idx, decl_index, model, file, module_ref, builder,
+                    );
                 }
             }
             for s in &t.orelse {
@@ -836,13 +847,16 @@ fn emit_top_level_refs<'db>(
         }
         Stmt::Match(m) => {
             {
-                let mut coll = RefCollector::new(vec![module_idx], decl_index, model, file, module_ref);
+                let mut coll =
+                    RefCollector::new(vec![module_idx], decl_index, model, file, module_ref);
                 coll.visit_expr(&m.subject);
                 coll.flush(builder);
             }
             for case in &m.cases {
                 for s in &case.body {
-                    emit_top_level_refs(s, module_idx, decl_index, model, file, module_ref, builder);
+                    emit_top_level_refs(
+                        s, module_idx, decl_index, model, file, module_ref, builder,
+                    );
                 }
             }
         }
@@ -1114,7 +1128,15 @@ fn collect_top_level(stmt: &Stmt, source: &str, index: &LineIndex, out: &mut Vec
         }
         Stmt::AnnAssign(a) => {
             if let Expr::Name(n) = a.target.as_ref() {
-                push_decl(n.id.to_string(), "variable", n.range, n.range, source, index, out);
+                push_decl(
+                    n.id.to_string(),
+                    "variable",
+                    n.range,
+                    n.range,
+                    source,
+                    index,
+                    out,
+                );
             }
         }
         // Compound statements that don't introduce a new scope: their
