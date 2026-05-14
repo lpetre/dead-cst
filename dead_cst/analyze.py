@@ -11,7 +11,7 @@ import networkx as nx
 from libcst.metadata import CodeRange
 
 from ._edges import resolve_edges
-from ._package import PackageContribution, build_contribution
+from ._package import PackageContribution, build_contribution, compose_lookup
 from ._refresh import (
     PackageFiles,
     build_stale_tasks,
@@ -710,24 +710,16 @@ class Analysis:
         return _count_nodes(self.materialize_all().nodes, prefix)
 
     def _build_symbol_lookup(self, package: Path) -> SymbolTrie:
-        """Per-package lookup trie: this package's full trie + each dep's exports.
+        """Per-package lookup trie via :func:`_package.compose_lookup`.
 
-        ``merge`` pulls in every entry from this package's own trie
-        (the package sees itself fully). ``merge_exported`` filters
-        each dep's trie to entries flagged :data:`NodeFlags.EXPORTED`,
-        so dep-internal decls stay invisible to the consumer.
-
-        Deps must already be refreshed; both
-        :meth:`materialize_all` and :meth:`materialize_closure`
-        guarantee this because :meth:`_interesting_set` is closed
-        under transitive deps.
+        Deps must already be refreshed; both :meth:`materialize_all`
+        and :meth:`materialize_closure` guarantee this because
+        :meth:`_interesting_set` is closed under transitive deps.
         """
-        contrib = self._contributions[package]
-        lookup = SymbolTrie()
-        lookup.merge(contrib.trie)
-        for dep in self._dep_paths(package):
-            lookup.merge_exported(self._contributions[dep].trie)
-        return lookup
+        return compose_lookup(
+            self._contributions[package].trie,
+            tuple(self._contributions[dep] for dep in self._dep_paths(package)),
+        )
 
 
 class PackageView:

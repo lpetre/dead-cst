@@ -52,6 +52,28 @@ class PackageContribution:
     import_edges: frozenset[tuple[SymbolNode, Import, EdgeFlags]]
 
 
+def compose_lookup(
+    own_trie: SymbolTrie, dep_contributions: Sequence[PackageContribution]
+) -> SymbolTrie:
+    """Build a per-package lookup trie: own trie + each dep's exports.
+
+    ``merge`` pulls in every entry from the package's own trie (the
+    package sees itself fully). ``merge_exported`` filters each dep's
+    trie to entries flagged :data:`NodeFlags.EXPORTED`, so dep-internal
+    decls stay invisible to the consumer. Shared by
+    :func:`_materialize_star_reexports` (called during
+    :func:`build_contribution`) and
+    :meth:`dead_cst.analyze.Analysis._build_symbol_lookup` (called at
+    compose time) so the "what's visible to this package" rule lives
+    in one place.
+    """
+    lookup = SymbolTrie()
+    lookup.merge(own_trie)
+    for dep in dep_contributions:
+        lookup.merge_exported(dep.trie)
+    return lookup
+
+
 def build_contribution(
     package: Package,
     package_files: PackageFiles,
@@ -61,40 +83,22 @@ def build_contribution(
 ) -> PackageContribution:
     """Apply ``package_files``' per-file payloads into raw sets / dicts.
 
-    Two-pass over the files:
-
-    1. **Per-file apply.** Hits come straight from :class:`PackageFiles`;
-       the rest are looked up in the global ``miss_payloads`` map produced
-       by :func:`dead_cst._refresh.process_stale_files`. A pre-pass
-       identifies module-FQN collisions (``foo.py`` alongside
-       ``foo/__init__.py``) via :func:`eclipsed_paths` so the loser is
-       skipped at the trie -- its nodes still land in the contribution
-       so observe-time entrypoints (``__main__``, plugin synthetics)
-       keep working, but cross-module imports route to the package
-       winner. Empty :attr:`Package.exported` means "no restriction"
-       (every file in the package is exported to consumers).
-    2. **Star re-export materialization** -- :func:`_materialize_star_reexports`.
-       For each module-level ``from X import *`` collected in pass 1,
-       look up ``X`` in the package's own trie or in
-       ``dep_contributions`` and synthesize a ``"import"``-typed
-       :class:`SymbolNode` in the importing module for every name the
-       target exposes. ``dep_contributions`` is read directly: callers
-       must pass each dep that's already had its own contribution built
-       (the refresh loop iterates packages in dep order, so this holds).
-
-    The materialization is what makes cross-module
-    ``from <pkg> import <name>`` resolve through to ``<name>``'s real
-    source when ``<pkg>/__init__.py`` only re-exports via star, and
-    makes downstream ``from <pkg> import *`` fan-outs transitive through
-    every re-export chain without any special-casing in the edge
-    stitcher.
+    Two passes: per-file ``_apply_payload`` (hits from
+    :class:`PackageFiles`, misses from ``miss_payloads``), then
+    :func:`_materialize_star_reexports` against the assembled trie plus
+    ``dep_contributions``. Callers must pass deps whose contributions
+    are already built; the refresh loop walks packages in dep order to
+    uphold this. Empty :attr:`Package.exported` means "no restriction"
+    -- every file in the package is exported to consumers. Eclipsed
+    files (``foo.py`` next to ``foo/__init__.py``, per
+    :func:`eclipsed_paths`) still land in the contribution but skip
+    the trie so consumer imports route to the package winner.
     """
     trie = SymbolTrie()
     nodes: set[SymbolNode] = set()
     edges: set[tuple[SymbolNode, SymbolNode, EdgeFlags]] = set()
     import_edges: set[tuple[SymbolNode, Import, EdgeFlags]] = set()
     dead_suites: dict[Path, tuple[CodeRange, ...]] = {}
-    star_records: list[tuple[SymbolNode, Import, EdgeFlags]] = []
     eclipsed = eclipsed_paths(package_files.files)
     for file in package_files.files:
         payload = package_files.hits.get(file)
@@ -114,10 +118,8 @@ def build_contribution(
             edges=edges,
             import_edges=import_edges,
             dead_suites=dead_suites,
-            star_records=star_records,
         )
     _materialize_star_reexports(
-        star_records=star_records,
         trie=trie,
         dep_contributions=dep_contributions,
         nodes=nodes,
@@ -187,7 +189,6 @@ def _apply_payload(
     edges: set[tuple[SymbolNode, SymbolNode, EdgeFlags]],
     import_edges: set[tuple[SymbolNode, Import, EdgeFlags]],
     dead_suites: dict[Path, tuple[CodeRange, ...]],
-    star_records: list[tuple[SymbolNode, Import, EdgeFlags]],
 ) -> None:
     """Emit ``payload`` into the in-progress per-package accumulators.
 
@@ -234,14 +235,7 @@ def _apply_payload(
         edges.add((src, dst, flag_for(pos)))
 
     for src, imp, pos in payload.imports:
-        flags = flag_for(pos)
-        import_edges.add((src, imp, flags))
-        # Track module-level star imports for pass 2; sub-module-level
-        # stars (inside class bodies, conditional blocks) are rare and
-        # don't participate in cross-module re-export resolution, so
-        # the ``src is module`` guard filters them out.
-        if imp.star and src is module and not eclipsed:
-            star_records.append((src, imp, flags))
+        import_edges.add((src, imp, flag_for(pos)))
 
     if payload_dead_suites:
         dead_suites[module.path] = payload_dead_suites
@@ -249,78 +243,58 @@ def _apply_payload(
 
 def _materialize_star_reexports(
     *,
-    star_records: list[tuple[SymbolNode, Import, EdgeFlags]],
     trie: SymbolTrie,
     dep_contributions: Sequence[PackageContribution],
     nodes: set[SymbolNode],
     edges: set[tuple[SymbolNode, SymbolNode, EdgeFlags]],
     import_edges: set[tuple[SymbolNode, Import, EdgeFlags]],
 ) -> None:
-    """Synthesize ``"import"`` nodes for each name a ``from X import *`` re-exports.
+    """Synthesize one ``"import"`` decl per name ``from X import *`` re-exports.
 
-    For each module-level star recorded in pass 1, look ``X`` up in a
-    transient lookup trie (this package's own trie plus each dep's
-    exported view), then for every name the target's trie node holds,
-    create one synthetic re-export node in the importing module:
+    Shadowing: if any decl already claims the name in the importing
+    module's trie (a real def, an explicit import, or a prior star
+    re-export) the synthetic is skipped -- "first writer wins" within
+    the module. Stars sort by source position so the order is
+    deterministic; see ``last-star-wins-not-implemented`` in
+    ``tests/test_limitations.py`` for the Python-runtime gap this
+    leaves.
 
-    * ``type="import"``, ``imports=Import(module=<target>, decl=<name>)``
-      -- :func:`dead_cst._edges.resolve_edges` treats it like any other
-      re-export decl, chaining the consumer's ``from <importer> import
-      <name>`` through to ``<name>``'s real source.
-    * ``flags`` carries :data:`NodeFlags.STAR_REEXPORT` so the codemod
-      skips it (the file has no literal ``from <target> import <name>``
-      line to remove). Inherits :data:`NodeFlags.EXPORTED` from the
-      importing module so the re-exports flow through
-      :meth:`SymbolTrie.merge_exported` to downstream packages.
-    * Two edges: ``synthetic -> module`` (the standard decl parent edge)
-      and ``module -> synthetic`` (so the re-export is alive whenever
-      the importing module is alive, mirroring today's pessimistic
-      "star keeps target decls alive" behavior). The synthetic's
-      ``Import`` is added to ``import_edges`` so the edge stitcher
-      emits the ``synthetic -> target.<name>`` chain.
-
-    Shadowing rule: if a real decl, an explicit import, or a prior
-    star re-export already claims the name in the importing module's
-    trie, we skip -- "first writer wins" within the module. Stars
-    are processed in source order (by line, column, target FQN) so
-    the result is deterministic across runs.
-
-    Star chains within the package converge via fixed-point iteration:
-    each round materializes synthetics that the previous round made
-    visible, and the loop exits when a pass adds nothing new. Cycles
-    (``A: from B import *`` / ``B: from A import *``) terminate after
-    one trip around because the ``seen`` set tracks
-    ``(importer_fqname, target_fqname, name)`` triples.
+    Star chains converge via fixed-point iteration -- a star whose
+    target itself contains a star needs the inner star to materialize
+    before its names become visible. The ``seen`` set keyed on
+    ``(importer_fqname, target_fqname, name)`` makes cycles like
+    ``A: from B import *`` / ``B: from A import *`` terminate after
+    one trip.
     """
+    star_records = [
+        (src, imp, flags, src.fqname.split("."), imp.module.split("."))
+        for src, imp, flags in import_edges
+        if imp.star and src.type == "module"
+    ]
     if not star_records:
         return
 
-    lookup = SymbolTrie()
-    lookup.merge(trie)
-    for dep_contrib in dep_contributions:
-        lookup.merge_exported(dep_contrib.trie)
-
-    sorted_records = sorted(
-        star_records,
+    lookup = compose_lookup(trie, dep_contributions)
+    star_records.sort(
         key=lambda r: (
             r[0].fqname,
-            r[1].module,
             r[0].position.start.line,
             r[0].position.start.column,
-        ),
+            r[1].module,
+        )
     )
 
     seen: set[tuple[str, str, str]] = set()
     while True:
         progress = False
-        for src_module, imp, flags in sorted_records:
-            target = lookup._get(imp.module.split("."))
+        for src_module, imp, flags, src_parts, target_parts in star_records:
+            target = lookup._get(target_parts)
             if target is None or target.module is None:
                 continue
-            target_fqname = target.module.fqname
-            src_trie_node = trie._get(src_module.fqname.split("."))
+            src_trie_node = trie._get(src_parts)
             if src_trie_node is None:
                 continue
+            target_fqname = target.module.fqname
             inherited_export = src_module.flags & NodeFlags.EXPORTED
             for name in list(target.declarations.keys()):
                 key = (src_module.fqname, target_fqname, name)

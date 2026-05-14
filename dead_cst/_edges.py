@@ -273,16 +273,11 @@ def resolve_edges(
         else:
             targets[node.module] = None
             if dst.star:
-                # Module-level stars also get one synthetic ``"import"``
-                # decl per re-exported name from
-                # :func:`dead_cst._package._materialize_star_reexports`,
-                # which is what makes ``from <importer> import <name>``
-                # resolve through to the original source. We keep the
-                # direct decl fan-out alongside the materialization so
-                # non-module-level stars (``def a(): __import__(...)``,
-                # which the materializer skips because synthetics need
-                # a module home) still produce the pessimistic
-                # ``<enclosing_decl> -> target.<name>`` keep-alive edges.
+                # Module-level stars are also materialized into synthetic
+                # re-export decls by :func:`dead_cst._package._materialize_star_reexports`;
+                # this fan-out covers non-module-level stars (e.g. inside
+                # a function body) which the materializer skips because
+                # synthetics need a module home.
                 for decls in node.declarations.values():
                     for decl in decls:
                         targets[decl] = None
