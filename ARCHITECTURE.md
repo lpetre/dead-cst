@@ -296,9 +296,11 @@ Two phases per `EdgePlugin`:
   `AddNode` / `AddEdge` / `RemoveEdge` ops.
 
 `PluginContext` provides helpers (`find_module`, `find_declarations`,
-`module_surface`, `importers`, …), exposes the current `Package` via
-`ctx.package`, and yields the package's nodes via the
-`ctx.package_nodes: frozenset[SymbolNode]` field.
+`module_surface`, `importers`, …) and exposes the current package's
+raw build product via `ctx.contribution: PackageContribution` — the
+`Package`, the package-local `SymbolTrie`, the contributed
+`frozenset[SymbolNode]` (`ctx.contribution.nodes`), the raw edge and
+import-edge triples, and the per-file dead-suite map.
 
 Builtins ship in `BUILTIN_PLUGINS`. Generic-Python plugins live as
 siblings of `plugins/__init__.py` (`MainBlockPlugin`,
