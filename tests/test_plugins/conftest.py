@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from dead_cst._package import PackageContribution
-from dead_cst.analyze import _find_reachable as find_reachable
+from dead_cst.analyze import _entrypoint_seeds, _find_reachable as find_reachable
 from dead_cst.graph import SymbolNode, SymbolTrie
 from dead_cst.resolvers import Package
 
@@ -15,7 +15,8 @@ def reachable_fqnames():
     """Return ``{fqname for n in find_reachable(graph) if not synthetic}``."""
 
     def _reachable(graph) -> set[str]:
-        return {n.fqname for n in find_reachable(graph) if n.type != "synthetic"}
+        reached = find_reachable(graph, seeds=_entrypoint_seeds(graph))
+        return {n.fqname for n in reached if n.type != "synthetic"}
 
     return _reachable
 

@@ -11,13 +11,14 @@ from __future__ import annotations
 
 from dead_cst import NodeFlags
 from dead_cst.analyze import (
+    _entrypoint_seeds,
     _find_kept_alive_by_flags_only,
     _find_reachable as find_reachable,
 )
 
 
 def find_reachable_excluding_noqa(graph):
-    return find_reachable(graph, NodeFlags.NOQA)
+    return find_reachable(graph, seeds=_entrypoint_seeds(graph, NodeFlags.NOQA))
 
 
 def find_kept_alive_by_noqa_only(graph):
@@ -39,7 +40,7 @@ def test_noqa_pin_keeps_module_alive_only_via_noqa(make_analysis, write_files):
     )
     graph = make_analysis().materialize_all()
     side = next(n for n in graph.nodes if n.fqname == "pkg.side_effect")
-    assert side in find_reachable(graph)
+    assert side in find_reachable(graph, seeds=_entrypoint_seeds(graph))
     assert side not in find_reachable_excluding_noqa(graph)
     assert side in find_kept_alive_by_noqa_only(graph)
 
@@ -110,8 +111,10 @@ def test_excluding_multiple_flags_in_one_pass(make_analysis, write_files):
 
     graph = make_analysis(plugins=[PytestPlugin()]).materialize_all()
     side = next(n for n in graph.nodes if n.fqname == "pkg.side_effect")
-    assert side in find_reachable(graph)
-    excluded = find_reachable(graph, NodeFlags.TESTCASE | NodeFlags.NOQA)
+    assert side in find_reachable(graph, seeds=_entrypoint_seeds(graph))
+    excluded = find_reachable(
+        graph, seeds=_entrypoint_seeds(graph, NodeFlags.TESTCASE | NodeFlags.NOQA)
+    )
     assert side not in excluded
 
 

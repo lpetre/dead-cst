@@ -343,9 +343,13 @@ def test_celery_plugin_handles_factory_function(make_analysis, write_files, reac
         }
     )
     graph = make_analysis(plugins=[CeleryPlugin()]).materialize_all()
-    from dead_cst.analyze import _find_reachable as find_reachable
+    from dead_cst.analyze import _entrypoint_seeds, _find_reachable as find_reachable
 
-    reached = {n.fqname for n in find_reachable(graph) if n.type != "synthetic"}
+    reached = {
+        n.fqname
+        for n in find_reachable(graph, seeds=_entrypoint_seeds(graph))
+        if n.type != "synthetic"
+    }
     assert "app.celery.app" in reached
     assert "app.celery.run" in reached
     assert "app.celery.bound" in reached
