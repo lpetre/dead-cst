@@ -382,6 +382,27 @@ class SymbolTrie:
         yield from _walk(self, None)
 
 
+def _claim_edge(
+    emitted: set[tuple[SymbolNode, SymbolNode, EdgeFlags]],
+    src: SymbolNode,
+    dst: SymbolNode,
+    flags: EdgeFlags,
+) -> bool:
+    """Record ``(src, dst, flags)`` in ``emitted``; return ``True`` iff new.
+
+    Single dedup point shared by the three edge sources in the compose
+    pass: contribution edges (``_compose_contribution``), import
+    resolution (``resolve_edges._emit``), and plugin ``AddEdge`` ops
+    (``apply_ops``). Lives here rather than in ``_edges`` because
+    ``plugins._core`` would otherwise pull in a circular import.
+    """
+    key = (src, dst, flags)
+    if key in emitted:
+        return False
+    emitted.add(key)
+    return True
+
+
 # ``SymbolTrie`` is intentionally absent from ``__all__`` -- it's an
 # internal data structure shared between the visitor, edge stitcher, and
 # plugin context, but not part of the public surface.

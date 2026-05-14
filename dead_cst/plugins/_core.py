@@ -35,7 +35,7 @@ import networkx as nx
 from libcst.metadata import CodePosition, CodeRange
 
 from .._cacheable import Cacheable
-from ..graph import NodeFlags, SymbolNode, SymbolTrie
+from ..graph import EdgeFlags, NodeFlags, SymbolNode, SymbolTrie, _claim_edge
 
 if TYPE_CHECKING:
     from .._package import PackageContribution
@@ -347,16 +347,29 @@ class EdgePlugin(Cacheable, Protocol):
     def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]: ...
 
 
-def apply_ops(graph: nx.DiGraph, ops: Iterable[GraphOp]) -> None:
+def apply_ops(
+    graph: nx.DiGraph,
+    ops: Iterable[GraphOp],
+    emitted: set[tuple[SymbolNode, SymbolNode, EdgeFlags]],
+) -> None:
+    """Apply ``ops`` to ``graph``.
+
+    Plugin edges carry no flags, so ``AddEdge`` keys against ``emitted``
+    as ``(src, dst, EdgeFlags.NONE)``. ``RemoveEdge`` drops that key so
+    a remove-then-add pair still re-adds the edge. Pass a fresh
+    ``set()`` for standalone use.
+    """
     for op in ops:
         match op:
             case AddNode(node):
                 graph.add_node(node)
             case AddEdge(src, dst):
-                graph.add_edge(src, dst)
+                if _claim_edge(emitted, src, dst, EdgeFlags.NONE):
+                    graph.add_edge(src, dst)
             case RemoveEdge(src, dst):
                 if graph.has_edge(src, dst):
                     graph.remove_edge(src, dst)
+                emitted.discard((src, dst, EdgeFlags.NONE))
 
 
 def synthetic_node(

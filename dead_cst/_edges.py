@@ -26,7 +26,7 @@ import logging
 from pathlib import Path
 from typing import Generator, Iterable
 
-from .graph import EdgeFlags, Import, SymbolNode, SymbolTrie
+from .graph import EdgeFlags, Import, SymbolNode, SymbolTrie, _claim_edge
 from .plugins._core import (
     EXTERNAL_DIST_PREFIX,
     EXTERNAL_FILE_PREFIX,
@@ -124,6 +124,7 @@ def resolve_edges(
     import_edges: Iterable[tuple[SymbolNode, Import, EdgeFlags]],
     symbol_lookup: SymbolTrie,
     package_path: Path,
+    emitted: set[tuple[SymbolNode, SymbolNode, EdgeFlags]],
     *,
     import_resolver: ImportResolver = default_resolve_import,
     search_paths: list[Path] | None = None,
@@ -135,6 +136,11 @@ def resolve_edges(
     purely trie-driven. The default resolver + empty search paths
     suffice for tests; the analyzer wires its configured resolver
     through here.
+
+    ``emitted`` is the compose-pass edge-dedup set (see
+    :func:`dead_cst.graph._claim_edge`); triples already in it are
+    skipped, yielded triples are recorded. Pass a fresh ``set()`` for
+    standalone use.
 
     Resolution is memoized at three nested layers so the per-package
     compose loop's growth in importer count is additive rather than
@@ -149,8 +155,6 @@ def resolve_edges(
     """
     if search_paths is None:
         search_paths = []
-
-    emitted: set[tuple[SymbolNode, SymbolNode, EdgeFlags]] = set()
     synthetic_memo: dict[str, SymbolNode] = {}
     external_memo: dict[tuple[str, bool], SymbolNode | None] = {}
     # ``id(SymbolTrie)`` is safe as a key here: each trie node is held
@@ -178,11 +182,8 @@ def resolve_edges(
     def _emit(
         src: SymbolNode, dst: SymbolNode, flags: EdgeFlags
     ) -> Generator[tuple[SymbolNode, SymbolNode, EdgeFlags], None, None]:
-        key = (src, dst, flags)
-        if key in emitted:
-            return
-        emitted.add(key)
-        yield key
+        if _claim_edge(emitted, src, dst, flags):
+            yield (src, dst, flags)
 
     def _walk(start_node: SymbolTrie, parts: tuple[str, ...]) -> tuple[SymbolNode, ...]:
         cache_key = (id(start_node), parts)

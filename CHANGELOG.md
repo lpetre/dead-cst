@@ -10,6 +10,15 @@ two versions.
 ## [Unreleased]
 
 ### Changed
+- Edge deduplication is centralized in the compose pass. One
+  `emitted: set[(src, dst, EdgeFlags)]` owned by `_materialize` is
+  shared across the three edge sources (contribution edges,
+  `resolve_edges` import resolution, plugin `AddEdge` ops), so
+  cross-source and cross-package duplicates collapse to one edge
+  instead of accumulating as parallel `MultiDiGraph` edges.
+  `resolve_edges` and `apply_ops` both take `emitted` as a required
+  argument (breaking).
+
 - New `NodeFlags.EXPORTED` tags every node from a file under
   `Package.exported`, set via the visitor's `default_flags` mechanism
   (same pattern as `NOTEBOOK`). `Package.exported` now participates in
