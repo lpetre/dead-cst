@@ -32,7 +32,7 @@ def project_factory(tmp_path: Path):
 
 
 def test_envelope_shape(project_factory):
-    """Rust returns the right envelope shape; no Python conversion yet."""
+    """Rust returns the right envelope shape; nodes carry pre-composed fqnames."""
     proj, root = project_factory({"mod.py": "def foo(): pass\nclass Bar: pass\n"})
     g = proj.build_file_graph(str(root / "mod.py"), "smoke.mod")
 
@@ -41,13 +41,13 @@ def test_envelope_shape(project_factory):
     # module node + 2 decls
     assert len(g.nodes) == 3
     assert g.nodes[0].kind == "module"
-    assert g.nodes[0].local_name == ""
+    assert g.nodes[0].fqname == "smoke.mod"
     assert g.nodes[1].kind == "function"
-    assert g.nodes[1].local_name == "foo"
+    assert g.nodes[1].fqname == "smoke.mod.foo"
     assert g.nodes[2].kind == "class"
-    assert g.nodes[2].local_name == "Bar"
+    assert g.nodes[2].fqname == "smoke.mod.Bar"
     # Each decl emits one decl -> module edge.
-    assert sorted(g.edges) == [(1, 0, 0), (2, 0, 0)]
+    assert g.edges == [(1, 0, 0), (2, 0, 0)]
 
 
 def test_materialize_round_trip(project_factory):
@@ -138,3 +138,48 @@ def test_materialize_is_idempotent(project_factory):
     g2 = materialize(native_graph)
     assert {n.fqname for n in g1.nodes} == {n.fqname for n in g2.nodes}
     assert g1.raw.num_edges() == g2.raw.num_edges()
+
+
+def _node_identity(n: native.NativeNode) -> tuple:
+    """The tuple the Rust builder dedupes nodes by."""
+    return (
+        n.fqname,
+        n.kind,
+        n.path,
+        n.start_line,
+        n.start_column,
+        n.end_line,
+        n.end_column,
+        n.flags,
+    )
+
+
+def test_nodes_are_unique(project_factory):
+    """The Rust builder guarantees unique node identities."""
+    proj, root = project_factory(
+        {
+            "mod.py": (
+                "def alpha(): pass\nclass Beta: pass\nGAMMA = 1\nDELTA: int = 2\nE, F = 3, 4\n"
+            )
+        }
+    )
+    g = proj.build_file_graph(str(root / "mod.py"), "mod")
+
+    identities = [_node_identity(n) for n in g.nodes]
+    assert len(identities) == len(set(identities)), "duplicate node identities"
+
+
+def test_edges_are_unique(project_factory):
+    """The Rust builder guarantees unique edge triples."""
+    proj, root = project_factory({"mod.py": "def a(): pass\nclass B: pass\nC = 1\nD, E = 2, 3\n"})
+    g = proj.build_file_graph(str(root / "mod.py"), "mod")
+    assert len(g.edges) == len(set(g.edges)), "duplicate edge triples"
+
+
+def test_node_path_field_is_absolute(project_factory):
+    """Each NativeNode carries the file's absolute path."""
+    proj, root = project_factory({"x/y.py": "def f(): pass\n"})
+    file_path = root / "x/y.py"
+    g = proj.build_file_graph(str(file_path), "x.y")
+    for n in g.nodes:
+        assert n.path == str(file_path)

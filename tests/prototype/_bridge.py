@@ -15,30 +15,27 @@ from __future__ import annotations
 from pathlib import Path
 from typing import cast
 
+import dead_cst_ty_native as native
 from libcst.metadata import CodePosition, CodeRange
 
 from dead_cst._graphstore import SymbolGraph
 from dead_cst.graph import EdgeFlags, NodeFlags, SymbolNode
 
-import dead_cst_ty_native as native
-
 
 def materialize(graph: native.NativeGraph) -> SymbolGraph:
-    """Turn a ``NativeGraph`` into a real ``SymbolGraph``."""
-    file_path = Path(graph.file_path)
-    module_fqname = graph.module_fqname
+    """Turn a ``NativeGraph`` into a real ``SymbolGraph``.
 
+    The native side hands us deduplicated nodes (full fqnames already
+    composed) and deduplicated edge triples, so this is just a
+    one-pass conversion into libcst / rustworkx types.
+    """
     out = SymbolGraph()
     symbol_nodes: list[SymbolNode] = []
     for n in graph.nodes:
-        if n.kind == "module":
-            fqname = module_fqname
-        else:
-            fqname = f"{module_fqname}.{n.local_name}"
         sn = SymbolNode(
-            fqname=fqname,
+            fqname=n.fqname,
             type=cast("SymbolNode.type", n.kind),
-            path=file_path,
+            path=Path(n.path),
             position=CodeRange(
                 CodePosition(n.start_line, n.start_column),
                 CodePosition(n.end_line, n.end_column),

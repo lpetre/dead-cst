@@ -13,12 +13,13 @@
 //!   * `extract_top_level_decls(path)` returns a flat list of decls
 //!     (development/debug shape).
 //!   * `build_file_graph(path, module_fqname)` returns a
-//!     `NativeGraph` envelope (nodes + edges as primitive data) that
+//!     `NativeGraph` envelope (unique nodes + unique edge triples) that
 //!     Python materializes into a `SymbolGraph` (rustworkx PyDiGraph +
 //!     SymbolNode ↔ int map). The boundary crosses once; rustworkx
 //!     construction stays Python-side because rustworkx is itself a
 //!     pyo3 type and per-node FFI hops would defeat the speed win.
 
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
 use pyo3::exceptions::{PyOSError, PyValueError};
@@ -68,20 +69,18 @@ impl Decl {
 
 /// A single node in a `NativeGraph`.
 ///
-/// Mirrors the primitive fields of `dead_cst.graph.SymbolNode`. The
-/// Python materializer turns each one into a real `SymbolNode`
-/// (combining `local_name` with the graph's `module_fqname`,
-/// wrapping the position into a libcst `CodeRange`, and converting
-/// `flags` to `NodeFlags`).
-///
-/// `local_name` is the bare name as written at module top-level
-/// (`"foo"` for `def foo(): ...`). Module nodes carry an empty
-/// `local_name` and the materializer uses the graph's
-/// `module_fqname` verbatim.
+/// Mirrors the primitive fields of `dead_cst.graph.SymbolNode`.
+/// `fqname` is the fully-qualified dotted name (composed in Rust
+/// from the caller-supplied `module_fqname` plus the source-level
+/// local name); `path` is the absolute filesystem path the node
+/// belongs to. Identity for deduplication is
+/// `(fqname, kind, path, position, flags)` -- matching how
+/// `SymbolNode.__hash__` works in Python.
 #[pyclass(get_all, frozen)]
 struct NativeNode {
-    local_name: String,
+    fqname: String,
     kind: &'static str,
+    path: String,
     start_line: usize,
     start_column: usize,
     end_line: usize,
@@ -93,9 +92,10 @@ struct NativeNode {
 impl NativeNode {
     fn __repr__(&self) -> String {
         format!(
-            "NativeNode(local_name={:?}, kind={:?}, start=({}, {}), end=({}, {}), flags={})",
-            self.local_name,
+            "NativeNode(fqname={:?}, kind={:?}, path={:?}, start=({}, {}), end=({}, {}), flags={})",
+            self.fqname,
             self.kind,
+            self.path,
             self.start_line,
             self.start_column,
             self.end_line,
@@ -107,11 +107,12 @@ impl NativeNode {
 
 /// One file's worth of graph contribution, packed for one FFI hop.
 ///
-/// `nodes[0]` is always the synthetic module node. Subsequent nodes
-/// are top-level decls in source order. Each `(src, dst, flags)`
-/// triple in `edges` indexes into `nodes`; today every decl emits
-/// one `(decl_idx, 0, NodeFlags::NONE)` edge so the module stays
-/// alive whenever any decl is reachable.
+/// `nodes` is the unique node list in insertion order; `nodes[0]` is
+/// always the synthetic module node and later entries are top-level
+/// decls in source order. `edges` is the unique
+/// `(src_idx, dst_idx, flags)` triple list, also in insertion order.
+/// Both lists are deduplicated at build time -- callers (and the
+/// Python materializer) get to assume uniqueness without re-checking.
 ///
 /// `file_path` and `module_fqname` are echoed back so the Python
 /// materializer doesn't need to re-derive them.
@@ -133,6 +134,70 @@ impl NativeGraph {
             self.nodes.len(),
             self.edges.len(),
         )
+    }
+}
+
+/// Dedup-aware builder for a `NativeGraph`'s nodes and edges.
+///
+/// `intern_node` returns the existing index for any node already
+/// present (matched on the full identity tuple), inserting only if
+/// it's new. `add_edge` is a no-op on a repeated `(src, dst, flags)`
+/// triple. Both methods preserve insertion order in the returned
+/// vectors so tests can assert deterministic shapes.
+#[derive(Hash, Eq, PartialEq, Clone)]
+struct NodeKey {
+    fqname: String,
+    kind: &'static str,
+    path: String,
+    start_line: usize,
+    start_column: usize,
+    end_line: usize,
+    end_column: usize,
+    flags: u32,
+}
+
+struct GraphBuilder {
+    nodes: Vec<Py<NativeNode>>,
+    node_index: HashMap<NodeKey, usize>,
+    edges: Vec<(usize, usize, u32)>,
+    edge_set: HashSet<(usize, usize, u32)>,
+}
+
+impl GraphBuilder {
+    fn new() -> Self {
+        Self {
+            nodes: Vec::new(),
+            node_index: HashMap::new(),
+            edges: Vec::new(),
+            edge_set: HashSet::new(),
+        }
+    }
+
+    fn intern_node(&mut self, py: Python<'_>, node: NativeNode) -> PyResult<usize> {
+        let key = NodeKey {
+            fqname: node.fqname.clone(),
+            kind: node.kind,
+            path: node.path.clone(),
+            start_line: node.start_line,
+            start_column: node.start_column,
+            end_line: node.end_line,
+            end_column: node.end_column,
+            flags: node.flags,
+        };
+        if let Some(&idx) = self.node_index.get(&key) {
+            return Ok(idx);
+        }
+        let idx = self.nodes.len();
+        self.nodes.push(Py::new(py, node)?);
+        self.node_index.insert(key, idx);
+        Ok(idx)
+    }
+
+    fn add_edge(&mut self, src: usize, dst: usize, flags: u32) {
+        let triple = (src, dst, flags);
+        if self.edge_set.insert(triple) {
+            self.edges.push(triple);
+        }
     }
 }
 
@@ -229,10 +294,10 @@ impl Project {
 
     /// Build a per-file graph contribution as a transferable envelope.
     ///
-    /// Emits one synthetic module node at index 0 (carrying the
-    /// supplied `module_fqname`), then one node per top-level decl,
-    /// then one `decl -> module` edge per decl. The caller turns
-    /// this into a real `SymbolGraph` via the Python bridge.
+    /// Emits one synthetic module node first, then one node per
+    /// top-level decl, then one `decl -> module` edge per decl.
+    /// Nodes and edges are deduplicated -- repeated calls into the
+    /// builder with identical inputs collapse to a single entry.
     fn build_file_graph(
         &self,
         py: Python<'_>,
@@ -246,56 +311,54 @@ impl Project {
         let source = source_text(&self.db, file);
         let index = LineIndex::from_source_text(&source);
 
-        // Module node spans the whole file. ruff's ModModule range
-        // covers from start of source to last token; libcst's
-        // PositionProvider over the module spans (1,0)..(<last>, 0)
-        // but we don't try to match it bit-for-bit here -- the
-        // module node's position is informational.
+        // Module node spans the whole file. The module node's
+        // position is informational -- libcst's PositionProvider over
+        // the module spans (1,0)..(<last>, 0) and we don't try to
+        // match it bit-for-bit.
         let module_range = parsed.syntax().range;
         let (msl, msc, mel, mec) = position(&index, &source, module_range);
 
-        let mut nodes: Vec<Py<NativeNode>> = Vec::new();
-        nodes.push(Py::new(
+        let mut builder = GraphBuilder::new();
+        let module_idx = builder.intern_node(
             py,
             NativeNode {
-                local_name: String::new(),
+                fqname: module_fqname.to_string(),
                 kind: "module",
+                path: path.to_string(),
                 start_line: msl,
                 start_column: msc,
                 end_line: mel,
                 end_column: mec,
                 flags: 0,
             },
-        )?);
+        )?;
 
         let mut decls: Vec<Decl> = Vec::new();
         for stmt in &parsed.syntax().body {
             collect_top_level(stmt, &source, &index, &mut decls);
         }
-        let mut edges: Vec<(usize, usize, u32)> = Vec::with_capacity(decls.len());
         for decl in decls {
-            let idx = nodes.len();
-            nodes.push(Py::new(
+            let decl_idx = builder.intern_node(
                 py,
                 NativeNode {
-                    local_name: decl.name,
+                    fqname: format!("{module_fqname}.{}", decl.name),
                     kind: decl.kind,
+                    path: path.to_string(),
                     start_line: decl.start_line,
                     start_column: decl.start_column,
                     end_line: decl.end_line,
                     end_column: decl.end_column,
                     flags: 0,
                 },
-            )?);
-            // decl -> module: module stays alive as long as any decl does.
-            edges.push((idx, 0, 0));
+            )?;
+            builder.add_edge(decl_idx, module_idx, 0);
         }
 
         Ok(NativeGraph {
             file_path: path.to_string(),
             module_fqname: module_fqname.to_string(),
-            nodes,
-            edges,
+            nodes: builder.nodes,
+            edges: builder.edges,
         })
     }
 }
