@@ -10,7 +10,7 @@ from libcst.metadata import CodePosition, CodeRange
 from dead_cst import Analysis, EdgeFlags
 from dead_cst._fqn import FixedFullyQualifiedNameProvider
 from dead_cst._graphstore import SymbolGraph
-from dead_cst.graph import NodeFlags, SymbolNode
+from dead_cst.graph import Import, NodeFlags, SymbolNode
 from dead_cst.resolvers import ManualResolver
 
 
@@ -147,6 +147,16 @@ def _accumulate_native(graph: SymbolGraph, native_graph) -> None:
             position=CodeRange(
                 CodePosition(n.start_line, n.start_column),
                 CodePosition(n.end_line, n.end_column),
+            ),
+            imports=(
+                Import(
+                    module=n.imports.module,
+                    decl=n.imports.decl,
+                    star=n.imports.star,
+                    speculative=n.imports.speculative,
+                )
+                if n.imports is not None
+                else None
             ),
             flags=NodeFlags(n.flags),
         )

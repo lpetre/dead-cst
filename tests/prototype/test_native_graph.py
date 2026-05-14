@@ -183,3 +183,100 @@ def test_node_path_field_is_absolute(project_factory):
     g = proj.build_file_graph(str(file_path), "x.y")
     for n in g.nodes:
         assert n.path == str(file_path)
+
+
+def test_from_import_emits_import_node(project_factory):
+    """``from X import Y`` mints an ``import``-kind node with the raw Import payload."""
+    proj, root = project_factory({"mod.py": "from other import g\n"})
+    g = proj.build_file_graph(str(root / "mod.py"), "mod")
+
+    import_nodes = [n for n in g.nodes if n.kind == "import"]
+    assert len(import_nodes) == 1
+    node = import_nodes[0]
+    assert node.fqname == "mod.g"
+    assert node.imports is not None
+    assert node.imports.module == "other"
+    assert node.imports.decl == "g"
+    assert node.imports.star is False
+    assert node.imports.speculative is False
+
+
+def test_plain_import_uses_first_segment_for_local_name(project_factory):
+    """``import a.b.c`` binds the local name ``a`` (matches libcst's SymbolNode FQN)."""
+    proj, root = project_factory({"mod.py": "import a.b.c\n"})
+    g = proj.build_file_graph(str(root / "mod.py"), "mod")
+
+    import_nodes = [n for n in g.nodes if n.kind == "import"]
+    assert len(import_nodes) == 1
+    node = import_nodes[0]
+    assert node.fqname == "mod.a"
+    assert node.imports.module == "a.b.c"
+    assert node.imports.decl is None
+
+
+def test_aliased_import_uses_asname(project_factory):
+    """``import x.y as z`` / ``from x import y as z`` both bind the local name ``z``."""
+    proj, root = project_factory(
+        {
+            "mod1.py": "import x.y as z\n",
+            "mod2.py": "from x import y as z\n",
+        }
+    )
+    g1 = proj.build_file_graph(str(root / "mod1.py"), "mod1")
+    g2 = proj.build_file_graph(str(root / "mod2.py"), "mod2")
+
+    [import1] = [n for n in g1.nodes if n.kind == "import"]
+    [import2] = [n for n in g2.nodes if n.kind == "import"]
+    assert import1.fqname == "mod1.z"
+    assert import1.imports.module == "x.y"
+    assert import1.imports.decl is None
+    assert import2.fqname == "mod2.z"
+    assert import2.imports.module == "x"
+    assert import2.imports.decl == "y"
+
+
+def test_relative_import_resolves_against_module_fqname(project_factory):
+    """``from .sibling import x`` resolves to the file's enclosing package."""
+    proj, root = project_factory({"pkg/mod.py": "from .sibling import x\n"})
+    g = proj.build_file_graph(str(root / "pkg/mod.py"), "pkg.mod")
+
+    [imp] = [n for n in g.nodes if n.kind == "import"]
+    assert imp.imports.module == "pkg.sibling"
+    assert imp.imports.decl == "x"
+
+
+def test_relative_dot_import_in_init_resolves_against_package(project_factory):
+    """``from . import x`` in ``pkg/__init__.py`` targets ``pkg``, not ``pkg``'s parent."""
+    proj, root = project_factory({"pkg/__init__.py": "from . import x\n"})
+    g = proj.build_file_graph(str(root / "pkg/__init__.py"), "pkg")
+
+    [imp] = [n for n in g.nodes if n.kind == "import"]
+    assert imp.imports.module == "pkg"
+    assert imp.imports.decl == "x"
+
+
+def test_import_node_carries_parent_module_edge(project_factory):
+    """Each import alias gets a decl -> module edge like any other top-level decl."""
+    proj, root = project_factory({"mod.py": "from other import g\n"})
+    g = proj.build_file_graph(str(root / "mod.py"), "mod")
+
+    module_idx = next(i for i, n in enumerate(g.nodes) if n.kind == "module")
+    import_idx = next(i for i, n in enumerate(g.nodes) if n.kind == "import")
+    assert (import_idx, module_idx, 0) in g.edges
+
+
+def test_imported_name_use_emits_reference_edge(project_factory):
+    """A function body using the imported name attributes to the import node."""
+    proj, root = project_factory({"mod.py": "from other import g\ndef a(): g()\n"})
+    g = proj.build_file_graph(str(root / "mod.py"), "mod")
+
+    edge_strs = {(g.nodes[s].fqname, g.nodes[d].fqname) for s, d, _ in g.edges}
+    assert ("mod.a", "mod.g") in edge_strs
+
+
+def test_star_import_does_not_mint_a_node(project_factory):
+    """``from X import *`` doesn't bind a specific name; no per-name import node is emitted."""
+    proj, root = project_factory({"mod.py": "from other import *\n"})
+    g = proj.build_file_graph(str(root / "mod.py"), "mod")
+
+    assert [n for n in g.nodes if n.kind == "import"] == []

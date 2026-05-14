@@ -31,7 +31,7 @@ import dead_cst_ty_native as native
 from libcst.metadata import CodePosition, CodeRange
 
 from dead_cst._graphstore import SymbolGraph
-from dead_cst.graph import EdgeFlags, NodeFlags, SymbolNode
+from dead_cst.graph import EdgeFlags, Import, NodeFlags, SymbolNode
 
 
 def _to_symbol_node(n: native.NativeNode) -> SymbolNode:
@@ -43,7 +43,19 @@ def _to_symbol_node(n: native.NativeNode) -> SymbolNode:
             CodePosition(n.start_line, n.start_column),
             CodePosition(n.end_line, n.end_column),
         ),
+        imports=_to_import(n.imports),
         flags=NodeFlags(n.flags),
+    )
+
+
+def _to_import(native_import: native.Import | None) -> Import | None:
+    if native_import is None:
+        return None
+    return Import(
+        module=native_import.module,
+        decl=native_import.decl,
+        star=native_import.star,
+        speculative=native_import.speculative,
     )
 
 

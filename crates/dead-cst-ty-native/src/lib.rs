@@ -40,7 +40,7 @@ use ruff_db::parsed::parsed_module;
 use ruff_db::source::source_text;
 use ruff_db::system::{OsSystem, SystemPath, SystemPathBuf};
 use ruff_python_ast::visitor::{walk_expr, walk_stmt, Visitor};
-use ruff_python_ast::{Expr, ExprName, Stmt};
+use ruff_python_ast::{Alias, Expr, ExprName, Stmt, StmtImportFrom};
 use ruff_source_file::LineIndex;
 use ruff_text_size::{Ranged, TextRange};
 use ty_project::metadata::options::{EnvironmentOptions, Options};
@@ -120,7 +120,55 @@ impl Decl {
     }
 }
 
+/// Raw, pre-resolution record of one cross-file import reference.
+///
+/// Mirrors :class:`dead_cst.graph.Import`: ``module`` and ``decl`` are
+/// what the source code literally said (``from <module> import <decl>``
+/// or ``import <module>``). Cross-file canonicalization -- promoting
+/// ``decl`` to a submodule segment of ``module``, classifying the target
+/// as first-party / stdlib / external, attaching attribute chains --
+/// happens on the Python side after every package has been ingested.
+///
+/// ``star`` flags a ``from X import *`` reference (currently unused;
+/// no per-name node is materialized for star imports yet).
+/// ``speculative`` flags an entry the visitor synthesized for a
+/// dynamic-import fromlist that may or may not name a submodule
+/// (currently unused).
+#[pyclass(get_all, frozen)]
+#[derive(Clone)]
+struct Import {
+    module: String,
+    decl: Option<String>,
+    star: bool,
+    speculative: bool,
+}
+
+#[pymethods]
+impl Import {
+    #[new]
+    #[pyo3(signature = (module, decl = None, star = false, speculative = false))]
+    fn new(module: String, decl: Option<String>, star: bool, speculative: bool) -> Self {
+        Self {
+            module,
+            decl,
+            star,
+            speculative,
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "Import(module={:?}, decl={:?}, star={}, speculative={})",
+            self.module, self.decl, self.star, self.speculative,
+        )
+    }
+}
+
 /// A single node in a `NativeGraph`.
+///
+/// ``imports`` is set for ``kind == "import"`` nodes only -- one per
+/// module-level alias in an ``import`` / ``from ... import`` statement.
+/// All other kinds carry ``None``.
 #[pyclass(get_all, frozen)]
 struct NativeNode {
     fqname: String,
@@ -131,6 +179,7 @@ struct NativeNode {
     end_line: usize,
     end_column: usize,
     flags: u32,
+    imports: Option<Py<Import>>,
 }
 
 #[pymethods]
@@ -532,6 +581,7 @@ fn ingest_file(
             end_line: mel,
             end_column: mec,
             flags: 0,
+            imports: None,
         },
     )?;
 
@@ -565,12 +615,68 @@ fn ingest_file(
                 end_line: decl.end_line,
                 end_column: decl.end_column,
                 flags: 0,
+                imports: None,
             },
         )?;
         builder.add_edge(decl_idx, module_idx, 0);
         decl_by_range.insert((decl.target_start, decl.target_end), decl_idx);
         decl_by_name
             .entry(decl.name.clone())
+            .or_default()
+            .push(decl_idx);
+    }
+
+    // Imports get the same shape as other top-level decls (one node per
+    // bound name, edge to the module). Their ``target_range`` follows
+    // ty's ``DefinitionKind::{Import, ImportFrom}::target_range``, which
+    // is the full alias range -- so ``RefCollector`` can resolve a
+    // ``Name`` use straight to the import node via ``by_range`` without
+    // any special-casing for aliased / dotted / from-style imports.
+    let is_init = std::path::Path::new(path)
+        .file_name()
+        .map(|n| n == "__init__.py")
+        .unwrap_or(false);
+
+    let mut import_sites: Vec<ImportSite> = Vec::new();
+    for stmt in &parsed.syntax().body {
+        collect_top_level_imports(stmt, module_fqname, is_init, &mut import_sites);
+    }
+
+    for site in &import_sites {
+        let (sl, sc, el, ec) = position(&index, &source, site.alias_range);
+        let import_obj = Py::new(
+            py,
+            Import {
+                module: site.module.clone(),
+                decl: site.decl.clone(),
+                star: false,
+                speculative: false,
+            },
+        )?;
+        let decl_idx = builder.intern_node(
+            py,
+            NativeNode {
+                fqname: format!("{module_fqname}.{}", site.local_name),
+                kind: "import",
+                path: path.to_string(),
+                start_line: sl,
+                start_column: sc,
+                end_line: el,
+                end_column: ec,
+                flags: 0,
+                imports: Some(import_obj),
+            },
+        )?;
+        builder.add_edge(decl_idx, module_idx, 0);
+        decl_by_range.insert(
+            (
+                site.target_range.start().to_u32(),
+                site.target_range.end().to_u32(),
+            ),
+            decl_idx,
+        );
+        decl_by_name
+            .entry(site.local_name.clone())
             .or_default()
             .push(decl_idx);
     }
@@ -1093,6 +1199,180 @@ fn collect_assign_targets(target: &Expr, out: &mut Vec<(String, TextRange)>) {
     }
 }
 
+/// Per-alias record emitted by :func:`collect_top_level_imports`.
+///
+/// ``target_range`` matches ty's ``DefinitionKind::{Import, ImportFrom}::target_range``
+/// (the full alias range -- including ``as asname`` if present), so a
+/// :class:`RefCollector` lookup against ``decl_by_range`` lands on this
+/// site whenever a ``Name`` use resolves through the alias. ``module``
+/// is what the source code literally said for ``import <module>`` /
+/// ``from <module> import ...``, with relative dots resolved against the
+/// file's enclosing package; ``decl`` is the ``from``-style imported
+/// name (``None`` for plain ``import``).
+struct ImportSite {
+    local_name: String,
+    module: String,
+    decl: Option<String>,
+    target_range: TextRange,
+    alias_range: TextRange,
+}
+
+fn collect_top_level_imports(
+    stmt: &Stmt,
+    module_fqname: &str,
+    is_init: bool,
+    out: &mut Vec<ImportSite>,
+) {
+    match stmt {
+        Stmt::Import(s) => {
+            for alias in &s.names {
+                if let Some(site) = build_import_site(alias, "", false) {
+                    out.push(site);
+                }
+            }
+        }
+        Stmt::ImportFrom(s) => {
+            let from_module = resolve_from_module(s, module_fqname, is_init);
+            for alias in &s.names {
+                if let Some(site) = build_import_site(alias, &from_module, true) {
+                    out.push(site);
+                }
+            }
+        }
+        // Compound non-scope statements (mirrors ``collect_top_level``):
+        // imports nested under ``if TYPE_CHECKING:`` and friends still
+        // bind at module scope.
+        Stmt::If(i) => {
+            for s in &i.body {
+                collect_top_level_imports(s, module_fqname, is_init, out);
+            }
+            for clause in &i.elif_else_clauses {
+                for s in &clause.body {
+                    collect_top_level_imports(s, module_fqname, is_init, out);
+                }
+            }
+        }
+        Stmt::While(w) => {
+            for s in &w.body {
+                collect_top_level_imports(s, module_fqname, is_init, out);
+            }
+            for s in &w.orelse {
+                collect_top_level_imports(s, module_fqname, is_init, out);
+            }
+        }
+        Stmt::For(f) => {
+            for s in &f.body {
+                collect_top_level_imports(s, module_fqname, is_init, out);
+            }
+            for s in &f.orelse {
+                collect_top_level_imports(s, module_fqname, is_init, out);
+            }
+        }
+        Stmt::With(w) => {
+            for s in &w.body {
+                collect_top_level_imports(s, module_fqname, is_init, out);
+            }
+        }
+        Stmt::Try(t) => {
+            for s in &t.body {
+                collect_top_level_imports(s, module_fqname, is_init, out);
+            }
+            for handler in &t.handlers {
+                let ruff_python_ast::ExceptHandler::ExceptHandler(eh) = handler;
+                for s in &eh.body {
+                    collect_top_level_imports(s, module_fqname, is_init, out);
+                }
+            }
+            for s in &t.orelse {
+                collect_top_level_imports(s, module_fqname, is_init, out);
+            }
+            for s in &t.finalbody {
+                collect_top_level_imports(s, module_fqname, is_init, out);
+            }
+        }
+        Stmt::Match(m) => {
+            for case in &m.cases {
+                for s in &case.body {
+                    collect_top_level_imports(s, module_fqname, is_init, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn build_import_site(alias: &Alias, from_module: &str, is_from: bool) -> Option<ImportSite> {
+    let name_id = alias.name.id.as_str();
+    if name_id == "*" {
+        // ``from X import *`` doesn't bind any individual name and so
+        // doesn't get a per-name node. It will land in a future raw
+        // ``imports`` field on ``NativeGraph`` so the Python edge
+        // stitcher can fan it out across the star target's surface.
+        return None;
+    }
+
+    let local_name = if let Some(asname) = &alias.asname {
+        asname.id.as_str().to_string()
+    } else if is_from {
+        name_id.to_string()
+    } else {
+        // ``import a.b.c`` binds the first segment ``a`` in the local
+        // scope; everything after the first dot is attribute access on
+        // the bound module object.
+        let dot = name_id.find('.').unwrap_or(name_id.len());
+        name_id[..dot].to_string()
+    };
+
+    let (module, decl) = if is_from {
+        (from_module.to_string(), Some(name_id.to_string()))
+    } else {
+        (name_id.to_string(), None)
+    };
+
+    Some(ImportSite {
+        local_name,
+        module,
+        decl,
+        target_range: alias.range,
+        alias_range: alias.range,
+    })
+}
+
+/// Resolve a ``from .x import y`` clause's module to its absolute form.
+///
+/// ``level == 0`` is an absolute import -- return the module string
+/// verbatim. ``level >= 1`` resolves relative to the file's enclosing
+/// package: ``__init__.py`` resolves dots starting from the file's own
+/// FQN, every other file drops its module segment first. Each additional
+/// dot beyond the first pops one more parent off the segment stack.
+fn resolve_from_module(s: &StmtImportFrom, module_fqname: &str, is_init: bool) -> String {
+    let base = s.module.as_ref().map(|i| i.id.as_str()).unwrap_or("");
+    if s.level == 0 {
+        return base.to_string();
+    }
+    let mut segments: Vec<&str> = if module_fqname.is_empty() {
+        Vec::new()
+    } else {
+        module_fqname.split('.').collect()
+    };
+    if !is_init && !segments.is_empty() {
+        segments.pop();
+    }
+    let pop_count = (s.level as usize).saturating_sub(1);
+    for _ in 0..pop_count {
+        if segments.pop().is_none() {
+            break;
+        }
+    }
+    if base.is_empty() {
+        segments.join(".")
+    } else if segments.is_empty() {
+        base.to_string()
+    } else {
+        format!("{}.{}", segments.join("."), base)
+    }
+}
+
 fn collect_top_level(stmt: &Stmt, source: &str, index: &LineIndex, out: &mut Vec<Decl>) {
     match stmt {
         Stmt::FunctionDef(f) => {
@@ -1219,6 +1499,7 @@ fn collect_top_level(stmt: &Stmt, source: &str, index: &LineIndex, out: &mut Vec
 #[pymodule]
 fn dead_cst_ty_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Decl>()?;
+    m.add_class::<Import>()?;
     m.add_class::<NativeNode>()?;
     m.add_class::<NativeGraph>()?;
     m.add_class::<PackageSpec>()?;
