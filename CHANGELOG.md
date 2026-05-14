@@ -9,6 +9,38 @@ two versions.
 
 ## [Unreleased]
 
+### Added
+- ``from <pkg> import <name>`` now resolves through ``from <other> import *``
+  re-exports. ``build_contribution`` runs a second pass over each
+  package after its per-file payloads are applied: for every
+  module-level ``from X import *`` in a file, it looks ``X`` up against
+  the package's own trie plus each dep's exported trie (deps are built
+  first thanks to the dep-ordered ``refresh`` loop) and synthesizes one
+  ``"import"``-typed :class:`SymbolNode` in the importing module for
+  every name the target exposes. Cross-module ``from <importer> import
+  <name>`` resolves through these synthetics like any other re-export
+  decl; a downstream ``from <importer> import *`` fan-out picks them up
+  for free. Star chains within a package converge via fixed-point
+  iteration and cycles terminate after one trip via a
+  ``(importer, target, name)`` ``seen`` set. The synthetics carry a
+  new :data:`NodeFlags.STAR_REEXPORT` flag so :mod:`dead_cst.codemod`
+  skips them (the file has no per-name ``from <target> import <decl>``
+  line to remove), and inherit :data:`NodeFlags.EXPORTED` from their
+  importing module so the visibility story flows through
+  :meth:`SymbolTrie.merge_exported` to downstream packages. The
+  pre-existing module-level fan-out in
+  :func:`dead_cst._edges.resolve_edges` is preserved alongside
+  materialization so non-module-level stars
+  (``def a(): __import__('p.functions')``, which the materializer
+  skips because synthetics need a module home) still produce
+  pessimistic ``<enclosing_decl> -> target.<name>`` keep-alive edges.
+- New :func:`dead_cst._package.build_contribution` keyword argument
+  ``dep_contributions: Sequence[PackageContribution] = ()``; callers
+  must pass already-built dep contributions for cross-package star
+  resolution to work. :meth:`Analysis.refresh` walks ``self.packages``
+  (dep-first order) rather than the caller's ``packages`` iterable so
+  this contract is upheld regardless of how ``refresh`` is invoked.
+
 ### Changed
 - Swapped the graph backend from `networkx.MultiDiGraph` to a minimal
   `rustworkx.PyDiGraph` wrapper (`dead_cst._graphstore.SymbolGraph`).

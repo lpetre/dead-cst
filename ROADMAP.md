@@ -157,6 +157,25 @@ demand.
 
 Folded down from earlier tiers as they landed:
 
+- **Unreleased**: ``from <pkg> import <name>`` now resolves through
+  ``from <other> import *`` re-exports. ``build_contribution`` runs a
+  second pass after applying per-file payloads: for every module-level
+  star, it looks the target up in the package's own trie plus each
+  dep's exported view (deps are processed first because the refresh
+  loop walks ``self.packages`` in dep order) and synthesizes one
+  ``"import"``-typed ``SymbolNode`` per re-exported name in the
+  importing module. Cross-module imports route through the synthetic
+  to the original source; chains converge via fixed-point iteration
+  with cycle protection via a ``(importer, target, name)`` ``seen``
+  set. Synthetics carry ``NodeFlags.STAR_REEXPORT`` so the codemod
+  skips them (no literal ``from <target> import <decl>`` line to
+  remove) and inherit ``NodeFlags.EXPORTED`` from the importing module.
+  The pre-existing module-level fan-out in ``_resolve_targets`` stays
+  alongside materialization so non-module-level stars
+  (``def a(): __import__('p.functions')``) still produce pessimistic
+  keep-alive edges; "first writer wins" between two stars exporting
+  the same name, not Python's "last star wins"
+  (``test_limitations.py::last-star-wins-not-implemented``).
 - **v0.9.4**: ``PluginContext`` gained ``package_graph`` and
   ``module_nodes`` fields plus a ``package_nodes()`` snapshot method,
   replacing two filter passes that ran on the merged cross-package

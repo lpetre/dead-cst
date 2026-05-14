@@ -97,7 +97,11 @@ def _select_files(G: SymbolGraph, base: Path) -> tuple[dict[Path, list[SymbolNod
     ignored implicitly -- they don't appear in the type ``match``.
 
     ``NodeFlags.NOTEBOOK`` nodes are dropped: cell-aware writeback into
-    the notebook JSON envelope is not implemented today.
+    the notebook JSON envelope is not implemented today. Star-import
+    re-export synthetics (:data:`NodeFlags.STAR_REEXPORT`) are skipped
+    for a similar reason -- the importing file has a literal
+    ``from <target> import *`` line, not the per-name ``from <target>
+    import <decl>`` the import remover would chase.
     """
     by_file: dict[Path, list[SymbolNode]] = {}
     deleted_modules: list[Path] = []
@@ -106,7 +110,7 @@ def _select_files(G: SymbolGraph, base: Path) -> tuple[dict[Path, list[SymbolNod
             continue
         if not node.path.exists():
             continue
-        if node.flags & NodeFlags.NOTEBOOK:
+        if node.flags & (NodeFlags.NOTEBOOK | NodeFlags.STAR_REEXPORT):
             continue
         match node.type:
             case "function" | "class" | "variable" | "type_alias" | "import":

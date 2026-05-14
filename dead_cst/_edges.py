@@ -273,6 +273,11 @@ def resolve_edges(
         else:
             targets[node.module] = None
             if dst.star:
+                # Module-level stars are also materialized into synthetic
+                # re-export decls by :func:`dead_cst._package._materialize_star_reexports`;
+                # this fan-out covers non-module-level stars (e.g. inside
+                # a function body) which the materializer skips because
+                # synthetics need a module home.
                 for decls in node.declarations.values():
                     for decl in decls:
                         targets[decl] = None

@@ -11,7 +11,7 @@ from libcst.metadata import CodeRange
 
 from ._edges import resolve_edges
 from ._graphstore import SymbolGraph
-from ._package import PackageContribution, build_contribution
+from ._package import PackageContribution, build_contribution, compose_lookup
 from ._refresh import (
     PackageFiles,
     build_stale_tasks,
@@ -493,7 +493,17 @@ class Analysis:
         unknown = [p for p in targets if p not in self._packages_by_path]
         if unknown:
             raise KeyError(f"Unknown packages: {unknown}")
-        new_targets = [p for p in targets if p not in self._contributions]
+        # Walk ``self.packages`` rather than ``targets`` so the work
+        # order is dep-first regardless of how ``packages`` was supplied
+        # (``_interesting_set`` returns a frozenset). Star re-export
+        # materialization in :func:`build_contribution` reads each
+        # dep's already-built contribution, so dep-order is a contract.
+        targets_set = set(targets)
+        new_targets = [
+            p.path
+            for p in self.packages
+            if p.path in targets_set and p.path not in self._contributions
+        ]
         if not new_targets:
             return self
 
@@ -515,10 +525,14 @@ class Analysis:
 
         for path in new_targets:
             pf = self._package_files[path]
+            dep_contribs = tuple(
+                self._contributions[dp] for dp in self._dep_paths(path) if dp in self._contributions
+            )
             self._contributions[path] = build_contribution(
                 self._packages_by_path[path],
                 pf,
                 miss_payloads,
+                dep_contributions=dep_contribs,
             )
         return self
 
@@ -703,24 +717,16 @@ class Analysis:
         return _count_nodes(self.materialize_all().nodes, prefix)
 
     def _build_symbol_lookup(self, package: Path) -> SymbolTrie:
-        """Per-package lookup trie: this package's full trie + each dep's exports.
+        """Per-package lookup trie via :func:`_package.compose_lookup`.
 
-        ``merge`` pulls in every entry from this package's own trie
-        (the package sees itself fully). ``merge_exported`` filters
-        each dep's trie to entries flagged :data:`NodeFlags.EXPORTED`,
-        so dep-internal decls stay invisible to the consumer.
-
-        Deps must already be refreshed; both
-        :meth:`materialize_all` and :meth:`materialize_closure`
-        guarantee this because :meth:`_interesting_set` is closed
-        under transitive deps.
+        Deps must already be refreshed; both :meth:`materialize_all`
+        and :meth:`materialize_closure` guarantee this because
+        :meth:`_interesting_set` is closed under transitive deps.
         """
-        contrib = self._contributions[package]
-        lookup = SymbolTrie()
-        lookup.merge(contrib.trie)
-        for dep in self._dep_paths(package):
-            lookup.merge_exported(self._contributions[dep].trie)
-        return lookup
+        return compose_lookup(
+            self._contributions[package].trie,
+            tuple(self._contributions[dep] for dep in self._dep_paths(package)),
+        )
 
 
 class PackageView:

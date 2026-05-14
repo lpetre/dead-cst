@@ -24,16 +24,23 @@ import pytest
                 def a(): g()
                 """,
             },
-            # ``from other import *`` is fanned out at the module level,
-            # so ``mod`` points at every top-level decl in ``other``.
-            # Per-access resolution is still missing: ideally
+            # ``from other import *`` is fanned out at the module level
+            # and re-export-materialized as ``mod.g`` (an ``"import"``
+            # node pointing at ``other.g``), so cross-module
+            # ``from mod import g`` resolves correctly. Per-access
+            # resolution inside ``a`` is still missing: ideally
             # ``mod.a -> other.g`` would also be present, but
             # ScopeProvider cannot bind the bare ``g`` reference back to
-            # the star import.
+            # the star import, so the visitor never emits anything for
+            # the call site.
             {
+                "mod -> mod.g",
                 "mod -> other",
                 "mod -> other.g",
                 "mod.a -> mod",
+                "mod.g -> mod",
+                "mod.g -> other",
+                "mod.g -> other.g",
                 "other.g -> other",
             },
             id="star-import-fans-out-but-misses-per-access-edge",
@@ -97,6 +104,59 @@ import pytest
                 "mod.x -> mod",
             },
             id="global-rebind-misattributes-outer-read",
+        ),
+        pytest.param(
+            {
+                "a.py": 'def g(): return "a"\n',
+                "b.py": 'def g(): return "b"\n',
+                "mod.py": """
+                from a import *
+                from b import *
+                """,
+                "consumer.py": "from mod import g\ng()\n",
+            },
+            # Python's runtime: the second ``from b import *`` overwrites
+            # the first, so ``mod.g`` resolves to ``b.g``. The ideal edge
+            # set would include ``consumer.g -> b.g`` and omit
+            # ``consumer.g -> a.g``.
+            #
+            # ``_materialize_star_reexports`` is "first writer wins": it
+            # sorts star records by ``(importer_fqname, target_module,
+            # line, col)`` and creates a synthetic ``mod.g`` re-export
+            # pointing at the first one to claim the name. Since stars
+            # sort by target-module string (``"a" < "b"``), ``mod.g``
+            # ends up pointing at ``a.g`` rather than ``b.g``. The
+            # consumer's ``from mod import g`` routes through that
+            # synthetic, so ``consumer.g -> a.g`` instead of
+            # ``consumer.g -> b.g``.
+            #
+            # Both ``a.g`` and ``b.g`` are still kept alive via the
+            # module-level fan-out (``mod -> a.g``, ``mod -> b.g``), so
+            # this gap doesn't affect dead-code detection. Fixing it
+            # requires propagating each star's source position into
+            # ``star_records`` and replacing-on-collision in source
+            # order rather than alphabetic-by-target order.
+            {
+                "a.g -> a",
+                "b.g -> b",
+                "consumer -> a.g",
+                "consumer -> consumer.g",
+                "consumer -> mod",
+                "consumer -> mod.g",
+                "consumer.g -> a.g",
+                "consumer.g -> consumer",
+                "consumer.g -> mod",
+                "consumer.g -> mod.g",
+                "mod -> a",
+                "mod -> a.g",
+                "mod -> b",
+                "mod -> b.g",
+                "mod -> mod.g",
+                "mod.g -> a",
+                "mod.g -> a.g",
+                "mod.g -> mod",
+            },
+            id="last-star-wins-not-implemented",
         ),
     ],
 )

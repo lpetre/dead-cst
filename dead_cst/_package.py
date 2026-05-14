@@ -52,24 +52,47 @@ class PackageContribution:
     import_edges: frozenset[tuple[SymbolNode, Import, EdgeFlags]]
 
 
+def compose_lookup(
+    own_trie: SymbolTrie, dep_contributions: Sequence[PackageContribution]
+) -> SymbolTrie:
+    """Build a per-package lookup trie: own trie + each dep's exports.
+
+    ``merge`` pulls in every entry from the package's own trie (the
+    package sees itself fully). ``merge_exported`` filters each dep's
+    trie to entries flagged :data:`NodeFlags.EXPORTED`, so dep-internal
+    decls stay invisible to the consumer. Shared by
+    :func:`_materialize_star_reexports` (called during
+    :func:`build_contribution`) and
+    :meth:`dead_cst.analyze.Analysis._build_symbol_lookup` (called at
+    compose time) so the "what's visible to this package" rule lives
+    in one place.
+    """
+    lookup = SymbolTrie()
+    lookup.merge(own_trie)
+    for dep in dep_contributions:
+        lookup.merge_exported(dep.trie)
+    return lookup
+
+
 def build_contribution(
     package: Package,
     package_files: PackageFiles,
     miss_payloads: Mapping[Path, VisitorPayload],
+    *,
+    dep_contributions: Sequence[PackageContribution] = (),
 ) -> PackageContribution:
     """Apply ``package_files``' per-file payloads into raw sets / dicts.
 
-    Hits come straight from :class:`PackageFiles`; the rest are looked
-    up in the global ``miss_payloads`` map produced by
-    :func:`dead_cst._refresh.process_stale_files`. Empty
-    :attr:`Package.exported` means "no restriction" (every file in the
-    package is exported to consumers).
-
-    A pre-pass identifies module-FQN collisions (``foo.py`` alongside
-    ``foo/__init__.py``) via :func:`eclipsed_paths` so the loser is
-    skipped at the trie -- its nodes still land in the contribution so
-    observe-time entrypoints (``__main__``, plugin synthetics) keep
-    working, but cross-module imports route to the package winner.
+    Two passes: per-file ``_apply_payload`` (hits from
+    :class:`PackageFiles`, misses from ``miss_payloads``), then
+    :func:`_materialize_star_reexports` against the assembled trie plus
+    ``dep_contributions``. Callers must pass deps whose contributions
+    are already built; the refresh loop walks packages in dep order to
+    uphold this. Empty :attr:`Package.exported` means "no restriction"
+    -- every file in the package is exported to consumers. Eclipsed
+    files (``foo.py`` next to ``foo/__init__.py``, per
+    :func:`eclipsed_paths`) still land in the contribution but skip
+    the trie so consumer imports route to the package winner.
     """
     trie = SymbolTrie()
     nodes: set[SymbolNode] = set()
@@ -96,6 +119,13 @@ def build_contribution(
             import_edges=import_edges,
             dead_suites=dead_suites,
         )
+    _materialize_star_reexports(
+        trie=trie,
+        dep_contributions=dep_contributions,
+        nodes=nodes,
+        edges=edges,
+        import_edges=import_edges,
+    )
     for child, parent in trie.module_hierarchy_edges():
         edges.add((child, parent, EdgeFlags.NONE))
     return PackageContribution(
@@ -209,6 +239,88 @@ def _apply_payload(
 
     if payload_dead_suites:
         dead_suites[module.path] = payload_dead_suites
+
+
+def _materialize_star_reexports(
+    *,
+    trie: SymbolTrie,
+    dep_contributions: Sequence[PackageContribution],
+    nodes: set[SymbolNode],
+    edges: set[tuple[SymbolNode, SymbolNode, EdgeFlags]],
+    import_edges: set[tuple[SymbolNode, Import, EdgeFlags]],
+) -> None:
+    """Synthesize one ``"import"`` decl per name ``from X import *`` re-exports.
+
+    Shadowing: if any decl already claims the name in the importing
+    module's trie (a real def, an explicit import, or a prior star
+    re-export) the synthetic is skipped -- "first writer wins" within
+    the module. Stars sort by source position so the order is
+    deterministic; see ``last-star-wins-not-implemented`` in
+    ``tests/test_limitations.py`` for the Python-runtime gap this
+    leaves.
+
+    Star chains converge via fixed-point iteration -- a star whose
+    target itself contains a star needs the inner star to materialize
+    before its names become visible. The ``seen`` set keyed on
+    ``(importer_fqname, target_fqname, name)`` makes cycles like
+    ``A: from B import *`` / ``B: from A import *`` terminate after
+    one trip.
+    """
+    star_records = [
+        (src, imp, flags, src.fqname.split("."), imp.module.split("."))
+        for src, imp, flags in import_edges
+        if imp.star and src.type == "module"
+    ]
+    if not star_records:
+        return
+
+    lookup = compose_lookup(trie, dep_contributions)
+    star_records.sort(
+        key=lambda r: (
+            r[0].fqname,
+            r[0].position.start.line,
+            r[0].position.start.column,
+            r[1].module,
+        )
+    )
+
+    seen: set[tuple[str, str, str]] = set()
+    while True:
+        progress = False
+        for src_module, imp, flags, src_parts, target_parts in star_records:
+            target = lookup._get(target_parts)
+            if target is None or target.module is None:
+                continue
+            src_trie_node = trie._get(src_parts)
+            if src_trie_node is None:
+                continue
+            target_fqname = target.module.fqname
+            inherited_export = src_module.flags & NodeFlags.EXPORTED
+            for name in list(target.declarations.keys()):
+                key = (src_module.fqname, target_fqname, name)
+                if key in seen:
+                    continue
+                seen.add(key)
+                if name in src_trie_node.declarations:
+                    continue
+                reexport_import = Import(module=target_fqname, decl=name)
+                reexport = SymbolNode(
+                    fqname=f"{src_module.fqname}.{name}",
+                    type="import",
+                    path=src_module.path,
+                    position=src_module.position,
+                    imports=reexport_import,
+                    flags=NodeFlags.STAR_REEXPORT | inherited_export,
+                )
+                nodes.add(reexport)
+                edges.add((reexport, src_module, EdgeFlags.NONE))
+                edges.add((src_module, reexport, flags))
+                import_edges.add((reexport, reexport_import, flags))
+                trie.add_declaration(reexport)
+                lookup.add_declaration(reexport)
+                progress = True
+        if not progress:
+            break
 
 
 def _contains(suite: CodeRange, access: CodeRange) -> bool:
