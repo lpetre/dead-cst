@@ -9,17 +9,22 @@
 //! first-party, where the venv lives, and which Python version to
 //! target.
 //!
-//! Two queries today:
-//!   * `extract_top_level_decls(path)` returns a flat list of decls
-//!     (development/debug shape).
-//!   * `build_file_graph(path, module_fqname)` returns a
-//!     `NativeGraph` envelope (unique nodes + unique edge triples) that
-//!     Python materializes into a `SymbolGraph` (rustworkx PyDiGraph +
-//!     SymbolNode ↔ int map). The boundary crosses once; rustworkx
-//!     construction stays Python-side because rustworkx is itself a
-//!     pyo3 type and per-node FFI hops would defeat the speed win.
+//! The native API is structured around packages:
+//!   * `PackageSpec(name, path, deps)` describes one package and
+//!     its dep relationships.
+//!   * `Project.package_order()` returns a toposort of package names
+//!     (deps before dependents).
+//!   * `Project.build_package_graph(name)` walks every `.py` file
+//!     in the package's path and returns a single deduplicated
+//!     `NativeGraph` envelope. Plugins consume this on the Python
+//!     side and add their own nodes / edges through a context.
+//!
+//! `build_file_graph(path, module_fqname)` is retained for
+//! single-file probing during development.
 
 use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::PathBuf;
 use std::str::FromStr;
 
 use pyo3::exceptions::{PyOSError, PyValueError};
@@ -37,11 +42,40 @@ use ty_project::metadata::value::{RangedValue, RelativePathBuf};
 use ty_project::{ProjectDatabase, ProjectMetadata};
 use ty_python_core::program::UseDefaultStrategy;
 
-/// Top-level declaration with libcst-compatible position info.
+/// Description of one package the resolver discovered.
 ///
-/// `line` is 1-based, `column` is 0-based. `kind` is one of
-/// `"function"`, `"class"`, `"variable"`. Used by the
-/// `extract_top_level_decls` debug query.
+/// `path` is the package's root directory; it can be absolute or
+/// relative to the project root. `deps` lists other package names
+/// this one depends on -- used to compute the analysis order.
+#[pyclass(get_all, frozen)]
+#[derive(Clone)]
+struct PackageSpec {
+    name: String,
+    path: String,
+    deps: Vec<String>,
+}
+
+#[pymethods]
+impl PackageSpec {
+    #[new]
+    #[pyo3(signature = (name, path, deps = None))]
+    fn new(name: String, path: String, deps: Option<Vec<String>>) -> Self {
+        Self {
+            name,
+            path,
+            deps: deps.unwrap_or_default(),
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "PackageSpec(name={:?}, path={:?}, deps={:?})",
+            self.name, self.path, self.deps,
+        )
+    }
+}
+
+/// Top-level declaration with libcst-compatible position info.
 #[pyclass(get_all, frozen)]
 struct Decl {
     name: String,
@@ -68,14 +102,6 @@ impl Decl {
 }
 
 /// A single node in a `NativeGraph`.
-///
-/// Mirrors the primitive fields of `dead_cst.graph.SymbolNode`.
-/// `fqname` is the fully-qualified dotted name (composed in Rust
-/// from the caller-supplied `module_fqname` plus the source-level
-/// local name); `path` is the absolute filesystem path the node
-/// belongs to. Identity for deduplication is
-/// `(fqname, kind, path, position, flags)` -- matching how
-/// `SymbolNode.__hash__` works in Python.
 #[pyclass(get_all, frozen)]
 struct NativeNode {
     fqname: String,
@@ -105,21 +131,17 @@ impl NativeNode {
     }
 }
 
-/// One file's worth of graph contribution, packed for one FFI hop.
+/// One graph contribution, packed for one FFI hop.
 ///
-/// `nodes` is the unique node list in insertion order; `nodes[0]` is
-/// always the synthetic module node and later entries are top-level
-/// decls in source order. `edges` is the unique
-/// `(src_idx, dst_idx, flags)` triple list, also in insertion order.
-/// Both lists are deduplicated at build time -- callers (and the
-/// Python materializer) get to assume uniqueness without re-checking.
-///
-/// `file_path` and `module_fqname` are echoed back so the Python
-/// materializer doesn't need to re-derive them.
+/// `nodes` and `edges` are unique within the envelope (deduplicated
+/// in Rust at build time). `package_name` identifies which package
+/// produced it; for the per-file `build_file_graph` shape this is
+/// empty.
 #[pyclass(get_all, frozen)]
 struct NativeGraph {
-    file_path: String,
+    package_name: String,
     module_fqname: String,
+    file_path: String,
     nodes: Vec<Py<NativeNode>>,
     edges: Vec<(usize, usize, u32)>,
 }
@@ -128,22 +150,16 @@ struct NativeGraph {
 impl NativeGraph {
     fn __repr__(&self) -> String {
         format!(
-            "NativeGraph(file_path={:?}, module_fqname={:?}, nodes={}, edges={})",
-            self.file_path,
+            "NativeGraph(package_name={:?}, module_fqname={:?}, file_path={:?}, nodes={}, edges={})",
+            self.package_name,
             self.module_fqname,
+            self.file_path,
             self.nodes.len(),
             self.edges.len(),
         )
     }
 }
 
-/// Dedup-aware builder for a `NativeGraph`'s nodes and edges.
-///
-/// `intern_node` returns the existing index for any node already
-/// present (matched on the full identity tuple), inserting only if
-/// it's new. `add_edge` is a no-op on a repeated `(src, dst, flags)`
-/// triple. Both methods preserve insertion order in the returned
-/// vectors so tests can assert deterministic shapes.
 #[derive(Hash, Eq, PartialEq, Clone)]
 struct NodeKey {
     fqname: String,
@@ -202,21 +218,12 @@ impl GraphBuilder {
 }
 
 /// A ty-backed analysis project with explicitly-injected configuration.
-///
-/// `root` is the directory all relative paths are resolved against.
-/// `src_roots` lists first-party search roots in priority order
-/// (analogous to the union of `Package.path` values produced by a
-/// `PathResolver`). `extra_paths` covers non-package roots that still
-/// need to be importable (vendored bundles, etc.). `python_env`
-/// points at a venv / `sys.prefix` so site-packages becomes
-/// available. `python_version` is the language version ty assumes
-/// when targeting `sys.version_info` conditionals. `typeshed`
-/// overrides the bundled stdlib stubs.
-///
-/// No on-disk config (`pyproject.toml`, `ty.toml`) is read.
 #[pyclass(unsendable)]
 struct Project {
     db: ProjectDatabase,
+    root: SystemPathBuf,
+    packages: Vec<PackageSpec>,
+    packages_by_name: HashMap<String, usize>,
 }
 
 #[pymethods]
@@ -225,6 +232,7 @@ impl Project {
     #[pyo3(signature = (
         root,
         *,
+        packages = None,
         src_roots = None,
         extra_paths = None,
         python_env = None,
@@ -233,6 +241,7 @@ impl Project {
     ))]
     fn new(
         root: &str,
+        packages: Option<Vec<PackageSpec>>,
         src_roots: Option<Vec<String>>,
         extra_paths: Option<Vec<String>>,
         python_env: Option<&str>,
@@ -262,8 +271,9 @@ impl Project {
             ..Options::default()
         };
 
-        let metadata = ProjectMetadata::from_options(options, root, None, &UseDefaultStrategy)
-            .map_err(|e| PyValueError::new_err(format!("invalid configuration: {e:?}")))?;
+        let metadata =
+            ProjectMetadata::from_options(options, root.clone(), None, &UseDefaultStrategy)
+                .map_err(|e| PyValueError::new_err(format!("invalid configuration: {e:?}")))?;
 
         let cwd = std::env::current_dir()
             .map_err(|e| PyOSError::new_err(format!("cwd unavailable: {e}")))?;
@@ -274,10 +284,87 @@ impl Project {
         let system = OsSystem::new(cwd);
 
         let db = ProjectDatabase::use_defaults(metadata, system);
-        Ok(Self { db })
+
+        let packages = packages.unwrap_or_default();
+        let mut packages_by_name: HashMap<String, usize> = HashMap::new();
+        for (i, pkg) in packages.iter().enumerate() {
+            if packages_by_name.insert(pkg.name.clone(), i).is_some() {
+                return Err(PyValueError::new_err(format!(
+                    "duplicate package name: {:?}",
+                    pkg.name
+                )));
+            }
+        }
+        for pkg in &packages {
+            for dep in &pkg.deps {
+                if !packages_by_name.contains_key(dep) {
+                    return Err(PyValueError::new_err(format!(
+                        "package {:?} declares unknown dep {:?}",
+                        pkg.name, dep
+                    )));
+                }
+            }
+        }
+
+        Ok(Self {
+            db,
+            root,
+            packages,
+            packages_by_name,
+        })
     }
 
-    /// Return the top-level declarations of the given file (debug shape).
+    /// The packages this project was configured with (read-only view).
+    fn packages(&self) -> Vec<PackageSpec> {
+        self.packages.clone()
+    }
+
+    /// Return package names in toposort order (deps before dependents).
+    ///
+    /// Errors if a cycle is present. Unknown dep references are caught
+    /// at `Project` construction, so this only fails on cycles.
+    fn package_order(&self) -> PyResult<Vec<String>> {
+        let n = self.packages.len();
+        let mut in_degree: Vec<usize> = vec![0; n];
+        let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); n];
+
+        for (i, pkg) in self.packages.iter().enumerate() {
+            in_degree[i] = pkg.deps.len();
+            for dep in &pkg.deps {
+                let dep_idx = self.packages_by_name[dep];
+                dependents[dep_idx].push(i);
+            }
+        }
+
+        let mut queue: Vec<usize> = (0..n).filter(|&i| in_degree[i] == 0).collect();
+        let mut result: Vec<String> = Vec::with_capacity(n);
+
+        while let Some(i) = queue.pop() {
+            result.push(self.packages[i].name.clone());
+            for &j in &dependents[i] {
+                in_degree[j] -= 1;
+                if in_degree[j] == 0 {
+                    queue.push(j);
+                }
+            }
+        }
+
+        if result.len() != n {
+            let unresolved: Vec<&str> = self
+                .packages
+                .iter()
+                .enumerate()
+                .filter(|&(i, _)| in_degree[i] > 0)
+                .map(|(_, pkg)| pkg.name.as_str())
+                .collect();
+            return Err(PyValueError::new_err(format!(
+                "package dep cycle involving: {unresolved:?}"
+            )));
+        }
+        Ok(result)
+    }
+
+    /// Return the top-level declarations of one file (debug helper).
     fn extract_top_level_decls(&self, path: &str) -> PyResult<Vec<Decl>> {
         let path = SystemPath::new(path);
         let file = system_path_to_file(&self.db, path)
@@ -292,75 +379,165 @@ impl Project {
         Ok(decls)
     }
 
-    /// Build a per-file graph contribution as a transferable envelope.
+    /// Build a graph for one file (development / debug shape).
     ///
-    /// Emits one synthetic module node first, then one node per
-    /// top-level decl, then one `decl -> module` edge per decl.
-    /// Nodes and edges are deduplicated -- repeated calls into the
-    /// builder with identical inputs collapse to a single entry.
+    /// For real per-package processing, prefer `build_package_graph`.
     fn build_file_graph(
         &self,
         py: Python<'_>,
         path: &str,
         module_fqname: &str,
     ) -> PyResult<NativeGraph> {
-        let sys_path = SystemPath::new(path);
-        let file = system_path_to_file(&self.db, sys_path)
-            .map_err(|e| PyOSError::new_err(format!("cannot open {path}: {e:?}")))?;
-        let parsed = parsed_module(&self.db, file).load(&self.db);
-        let source = source_text(&self.db, file);
-        let index = LineIndex::from_source_text(&source);
-
-        // Module node spans the whole file. The module node's
-        // position is informational -- libcst's PositionProvider over
-        // the module spans (1,0)..(<last>, 0) and we don't try to
-        // match it bit-for-bit.
-        let module_range = parsed.syntax().range;
-        let (msl, msc, mel, mec) = position(&index, &source, module_range);
-
         let mut builder = GraphBuilder::new();
-        let module_idx = builder.intern_node(
-            py,
-            NativeNode {
-                fqname: module_fqname.to_string(),
-                kind: "module",
-                path: path.to_string(),
-                start_line: msl,
-                start_column: msc,
-                end_line: mel,
-                end_column: mec,
-                flags: 0,
-            },
-        )?;
-
-        let mut decls: Vec<Decl> = Vec::new();
-        for stmt in &parsed.syntax().body {
-            collect_top_level(stmt, &source, &index, &mut decls);
-        }
-        for decl in decls {
-            let decl_idx = builder.intern_node(
-                py,
-                NativeNode {
-                    fqname: format!("{module_fqname}.{}", decl.name),
-                    kind: decl.kind,
-                    path: path.to_string(),
-                    start_line: decl.start_line,
-                    start_column: decl.start_column,
-                    end_line: decl.end_line,
-                    end_column: decl.end_column,
-                    flags: 0,
-                },
-            )?;
-            builder.add_edge(decl_idx, module_idx, 0);
-        }
-
+        ingest_file(py, &self.db, path, module_fqname, &mut builder)?;
         Ok(NativeGraph {
-            file_path: path.to_string(),
+            package_name: String::new(),
             module_fqname: module_fqname.to_string(),
+            file_path: path.to_string(),
             nodes: builder.nodes,
             edges: builder.edges,
         })
     }
+
+    /// Build the graph contribution for one package.
+    ///
+    /// Walks every `.py` file under the package's path, ingesting
+    /// each into a shared `GraphBuilder`. The resulting `NativeGraph`
+    /// is deduplicated across all files in the package -- the
+    /// in-package module + decl nodes appear at most once.
+    ///
+    /// `file_path` on the returned envelope is empty (the package
+    /// spans many files; each node carries its own `path` field).
+    fn build_package_graph(&self, py: Python<'_>, name: &str) -> PyResult<NativeGraph> {
+        let idx = self
+            .packages_by_name
+            .get(name)
+            .copied()
+            .ok_or_else(|| PyValueError::new_err(format!("unknown package: {name:?}")))?;
+        let package = &self.packages[idx];
+        let pkg_abs = absolute_package_path(&self.root, &package.path);
+
+        let mut builder = GraphBuilder::new();
+        let mut files = Vec::new();
+        collect_py_files(&pkg_abs, &mut files)
+            .map_err(|e| PyOSError::new_err(format!("walking {pkg_abs:?}: {e}")))?;
+        files.sort();
+
+        for file_abs in files {
+            let module_fqname = derive_module_fqname(&file_abs, &pkg_abs, &package.name);
+            let file_str = file_abs.to_string_lossy().into_owned();
+            ingest_file(py, &self.db, &file_str, &module_fqname, &mut builder)?;
+        }
+
+        Ok(NativeGraph {
+            package_name: package.name.clone(),
+            module_fqname: String::new(),
+            file_path: String::new(),
+            nodes: builder.nodes,
+            edges: builder.edges,
+        })
+    }
+}
+
+fn absolute_package_path(root: &SystemPath, package_path: &str) -> PathBuf {
+    let p = PathBuf::from(package_path);
+    if p.is_absolute() {
+        p
+    } else {
+        PathBuf::from(root.as_str()).join(p)
+    }
+}
+
+fn collect_py_files(dir: &PathBuf, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str == "__pycache__" || name_str.starts_with('.') {
+                continue;
+            }
+            collect_py_files(&path, out)?;
+        } else if file_type.is_file() {
+            if let Some(ext) = path.extension() {
+                if ext == "py" {
+                    out.push(path);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn derive_module_fqname(file: &PathBuf, package_dir: &PathBuf, package_name: &str) -> String {
+    let rel = file.strip_prefix(package_dir).unwrap_or(file);
+    let s = rel.to_string_lossy().replace('\\', "/");
+    let stripped = s
+        .strip_suffix(".py")
+        .unwrap_or(&s)
+        .trim_end_matches("/__init__")
+        .trim_end_matches("__init__");
+    if stripped.is_empty() {
+        package_name.to_string()
+    } else {
+        format!("{package_name}.{}", stripped.replace('/', "."))
+    }
+}
+
+fn ingest_file(
+    py: Python<'_>,
+    db: &ProjectDatabase,
+    path: &str,
+    module_fqname: &str,
+    builder: &mut GraphBuilder,
+) -> PyResult<()> {
+    let sys_path = SystemPath::new(path);
+    let file = system_path_to_file(db, sys_path)
+        .map_err(|e| PyOSError::new_err(format!("cannot open {path}: {e:?}")))?;
+    let parsed = parsed_module(db, file).load(db);
+    let source = source_text(db, file);
+    let index = LineIndex::from_source_text(&source);
+
+    let module_range = parsed.syntax().range;
+    let (msl, msc, mel, mec) = position(&index, &source, module_range);
+
+    let module_idx = builder.intern_node(
+        py,
+        NativeNode {
+            fqname: module_fqname.to_string(),
+            kind: "module",
+            path: path.to_string(),
+            start_line: msl,
+            start_column: msc,
+            end_line: mel,
+            end_column: mec,
+            flags: 0,
+        },
+    )?;
+
+    let mut decls: Vec<Decl> = Vec::new();
+    for stmt in &parsed.syntax().body {
+        collect_top_level(stmt, &source, &index, &mut decls);
+    }
+    for decl in decls {
+        let decl_idx = builder.intern_node(
+            py,
+            NativeNode {
+                fqname: format!("{module_fqname}.{}", decl.name),
+                kind: decl.kind,
+                path: path.to_string(),
+                start_line: decl.start_line,
+                start_column: decl.start_column,
+                end_line: decl.end_line,
+                end_column: decl.end_column,
+                flags: 0,
+            },
+        )?;
+        builder.add_edge(decl_idx, module_idx, 0);
+    }
+    Ok(())
 }
 
 fn rel_path<P: AsRef<str>>(path: P) -> RelativePathBuf {
@@ -370,7 +547,6 @@ fn rel_path<P: AsRef<str>>(path: P) -> RelativePathBuf {
 fn position(index: &LineIndex, source: &str, range: TextRange) -> (usize, usize, usize, usize) {
     let start = index.line_column(range.start(), source);
     let end = index.line_column(range.end(), source);
-    // ruff's `column` is 1-based; libcst's is 0-based. Subtract one.
     (
         start.line.get(),
         start.column.get() - 1,
@@ -446,6 +622,7 @@ fn dead_cst_ty_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Decl>()?;
     m.add_class::<NativeNode>()?;
     m.add_class::<NativeGraph>()?;
+    m.add_class::<PackageSpec>()?;
     m.add_class::<Project>()?;
     Ok(())
 }
