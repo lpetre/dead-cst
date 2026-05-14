@@ -1,4 +1,3 @@
-import dataclasses
 import json
 import logging
 import textwrap
@@ -7,26 +6,7 @@ import networkx as nx
 import pytest
 
 from dead_cst import Analysis, EdgeFlags
-from dead_cst.graph import NodeFlags, SymbolNode
 from dead_cst.resolvers import ManualResolver
-
-
-@pytest.fixture
-def mark_entrypoint():
-    """Replace ``node`` in ``graph`` with a copy carrying ``NodeFlags.ENTRYPOINT``.
-
-    Returns a callable ``(graph, node) -> SymbolNode`` so tests can
-    re-bind their local reference to the new node.
-    """
-
-    def _mark(graph: nx.MultiDiGraph, node: SymbolNode) -> SymbolNode:
-        new = dataclasses.replace(node, flags=node.flags | NodeFlags.ENTRYPOINT)
-        if new == node:
-            return node
-        nx.relabel_nodes(graph, {node: new}, copy=False)
-        return new
-
-    return _mark
 
 
 @pytest.fixture

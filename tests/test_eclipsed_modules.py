@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 
-from dead_cst.analyze import _find_reachable as find_reachable
+from dead_cst.analyze import _entrypoint_seeds, _find_reachable as find_reachable
 from dead_cst.plugins import ExplicitEntrypointPlugin, MainBlockPlugin
 
 
@@ -39,7 +39,7 @@ def test_package_wins_trie_slot_for_cross_module_imports(
     assert len(targets) == 1
     assert targets[0].path.name == "__init__.py"
 
-    reachable = find_reachable(graph)
+    reachable = find_reachable(graph, _entrypoint_seeds(graph))
     package_x = next(
         n for n in graph.nodes if n.fqname == "pkg.foo.x" and n.path.name == "__init__.py"
     )
@@ -58,7 +58,7 @@ def test_eclipsed_file_keeps_main_block_entrypoint(tmp_path, write_files, make_a
     )
     analysis = make_analysis(plugins=[MainBlockPlugin()])
     graph = analysis.materialize_all()
-    reachable = find_reachable(graph)
+    reachable = find_reachable(graph, _entrypoint_seeds(graph))
 
     helper = next(n for n in graph.nodes if n.fqname == "pkg.foo.helper")
     eclipsed_module = next(
