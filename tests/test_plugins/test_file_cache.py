@@ -10,32 +10,24 @@ from typing import Iterable
 import libcst as cst
 import networkx as nx
 
-from dead_cst._package import PackageContribution
 from dead_cst.graph import SymbolTrie
 from dead_cst.plugins import GraphOp, ObserveContext, PluginContext
 from dead_cst.resolvers import Package
 
 
-def _ctx(tmp_path):
+def _ctx(tmp_path, make_contribution):
     return PluginContext(
         graph=nx.DiGraph(),
         symbol_lookup=SymbolTrie(),
-        contribution=PackageContribution(
-            package=Package(path=tmp_path, name="pkg"),
-            trie=SymbolTrie(),
-            nodes=frozenset(),
-            edges=frozenset(),
-            dead_suites={},
-            import_edges=frozenset(),
-        ),
+        contribution=make_contribution(Package(path=tmp_path, name="pkg")),
         project_root=tmp_path,
     )
 
 
-def test_parse_memoizes_within_a_pass(tmp_path):
+def test_parse_memoizes_within_a_pass(tmp_path, make_contribution):
     p = tmp_path / "a.py"
     p.write_text("def f(): pass\n")
-    ctx = _ctx(tmp_path)
+    ctx = _ctx(tmp_path, make_contribution)
     module = ctx.parse(p)
     assert isinstance(module, cst.Module)
     # Mutating the file afterwards doesn't affect the cached parse.
@@ -43,10 +35,10 @@ def test_parse_memoizes_within_a_pass(tmp_path):
     assert ctx.parse(p) is module
 
 
-def test_parse_handles_syntax_error(tmp_path):
+def test_parse_handles_syntax_error(tmp_path, make_contribution):
     p = tmp_path / "broken.py"
     p.write_text("def : pass\n")
-    ctx = _ctx(tmp_path)
+    ctx = _ctx(tmp_path, make_contribution)
     assert ctx.parse(p) is None
     # Failure is also cached.
     assert ctx.parse(p) is None
