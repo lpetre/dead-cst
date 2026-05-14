@@ -10,7 +10,8 @@ crate-type = ["cdylib"]
 
 [dependencies]
 pyo3 = { version = "0.22", features = ["extension-module", "abi3-py311"] }
-ruff_python_parser = { path = "../../vendor/ruff/crates/ruff_python_parser" }
+ty_project = { path = "../../vendor/ruff/crates/ty_project" }
+ruff_db = { path = "../../vendor/ruff/crates/ruff_db", features = ["os"] }
 ruff_python_ast = { path = "../../vendor/ruff/crates/ruff_python_ast" }
 ruff_source_file = { path = "../../vendor/ruff/crates/ruff_source_file" }
 ruff_text_size = { path = "../../vendor/ruff/crates/ruff_text_size" }
