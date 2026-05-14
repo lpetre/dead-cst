@@ -9,7 +9,7 @@ import re
 import sys
 from enum import Enum
 from pathlib import Path
-from typing import Annotated, Iterator, Sequence
+from typing import Annotated, Iterator, Mapping, Sequence
 
 import networkx as nx
 import typer
@@ -216,10 +216,11 @@ def analyze(
     unreachable_graph = graph.subgraph([n for n in graph.nodes if n not in reachable])
 
     package_paths = [p.path for p in analysis.packages]
+    dead_suites = analysis.dead_suites()
     if output_format == OutputFormat.json:
-        _output_json(graph, unreachable_graph, root, package_paths)
+        _output_json(graph, unreachable_graph, root, package_paths, dead_suites)
     else:
-        _output_text(graph, unreachable_graph, root, package_paths)
+        _output_text(graph, unreachable_graph, root, package_paths, dead_suites)
 
     if unreachable_graph.number_of_nodes() > 0:
         raise typer.Exit(1)
@@ -230,6 +231,7 @@ def _output_text(
     unreachable: nx.MultiDiGraph,
     root: Path,
     package_paths: Sequence[Path],
+    dead_suites: Mapping[Path, tuple[CodeRange, ...]],
 ) -> None:
     total_by_path = _count_nodes_by_prefix(graph.nodes, package_paths)
     unreachable_by_path = _count_nodes_by_prefix(unreachable.nodes, package_paths)
@@ -257,7 +259,7 @@ def _output_text(
         for node in sorted(dead_real, key=lambda n: (str(n.path), n.fqname)):
             typer.echo(f"  {node.fqname} ({node.type}) at {_rel_path(node.path, root)}")
 
-    branches = _dead_suite_locations(graph, package_paths)
+    branches = _dead_suite_locations(dead_suites, package_paths)
     if branches:
         typer.echo(f"\nUnreachable branches ({len(branches)}):")
         for path, pos in branches:
@@ -278,17 +280,16 @@ def _dead_real(unreachable: nx.MultiDiGraph) -> list[SymbolNode]:
 
 
 def _dead_suite_locations(
-    graph: nx.MultiDiGraph, package_paths: Sequence[Path]
+    dead_suites: Mapping[Path, tuple[CodeRange, ...]], package_paths: Sequence[Path]
 ) -> list[tuple[Path, CodeRange]]:
-    """Flatten ``graph.graph["dead_suites"]`` into a sorted ``(path, pos)`` list.
+    """Flatten :meth:`Analysis.dead_suites` into a sorted ``(path, pos)`` list.
 
     Restricted to files under one of the analyzed packages' paths so
     the report doesn't surface dead suites in workspace dependencies
     that the user isn't asking about.
     """
-    raw: dict = graph.graph.get("dead_suites", {})
     out: list[tuple[Path, CodeRange]] = []
-    for path, suites in raw.items():
+    for path, suites in dead_suites.items():
         if not any(path.is_relative_to(p) for p in package_paths):
             continue
         for pos in suites:
@@ -302,6 +303,7 @@ def _output_json(
     unreachable: nx.MultiDiGraph,
     root: Path,
     package_paths: Sequence[Path],
+    dead_suites: Mapping[Path, tuple[CodeRange, ...]],
 ) -> None:
     result: dict = {
         "summary": {},
@@ -333,7 +335,7 @@ def _output_json(
             }
         )
 
-    for path, pos in _dead_suite_locations(graph, package_paths):
+    for path, pos in _dead_suite_locations(dead_suites, package_paths):
         result["unreachable_branches"].append(
             {
                 "path": str(_rel_path(path, root)),

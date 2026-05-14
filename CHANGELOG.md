@@ -19,6 +19,14 @@ two versions.
   `resolve_edges` and `apply_ops` both take `emitted` as a required
   argument (breaking).
 
+- Dead-suite positions moved off the materialized graph onto the
+  analysis itself: `Analysis.dead_suites()` returns the merged
+  `{file: tuple[CodeRange, ...]}` mapping across every package's
+  contribution, and `PackageView.dead_suites()` returns the per-package
+  slice. The previous `graph.graph["dead_suites"]` attribute is gone.
+  Reads off `_contributions` instead of duplicating onto the graph; the
+  CLI's `dead-cst report` is the only first-party consumer.
+
 - New `NodeFlags.EXPORTED` tags every node from a file under
   `Package.exported`, set via the visitor's `default_flags` mechanism
   (same pattern as `NOTEBOOK`). `Package.exported` now participates in

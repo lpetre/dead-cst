@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Iterable, Iterator, Mapping, Sequence
 
 import networkx as nx
+from libcst.metadata import CodeRange
 
 from ._edges import resolve_edges
 from ._package import PackageContribution, build_contribution
@@ -112,7 +113,6 @@ def _compose_contribution(
     ``MultiDiGraph`` edges.
     """
     target_graph.add_nodes_from(contrib.nodes)
-    target_graph.graph.setdefault("dead_suites", {}).update(contrib.dead_suites)
     for src, dst, flags in contrib.edges:
         if _claim_edge(emitted, src, dst, flags):
             target_graph.add_edge(src, dst, flags=flags)
@@ -578,7 +578,6 @@ class Analysis:
         from ._progress import progress
 
         g: nx.MultiDiGraph = nx.MultiDiGraph()
-        g.graph["dead_suites"] = {}
         baseline = list(sys.path)
         last_search_paths: tuple[Path, ...] | None = None
         target_paths = [p.path for p in self.packages if p.path in included]
@@ -660,6 +659,20 @@ class Analysis:
         :class:`NodeFlags` for the full list.
         """
         return _find_kept_alive_by_flags_only(self.materialize_all(), flags)
+
+    def dead_suites(self) -> Mapping[Path, tuple[CodeRange, ...]]:
+        """Statically-dead suite positions, merged across every package.
+
+        Triggers :meth:`refresh` on first call so the contributions are
+        populated. Each key is the absolute file path; the value is the
+        tuple of dead-suite :class:`CodeRange`s the detector recorded
+        for that file. Files with no dead suites are omitted.
+        """
+        self.refresh()
+        merged: dict[Path, tuple[CodeRange, ...]] = {}
+        for contrib in self._contributions.values():
+            merged.update(contrib.dead_suites)
+        return merged
 
     def count_nodes(self, prefix: Path | None = None) -> dict[str, int]:
         """Count nodes in the full graph by ``SymbolNode.type``.
@@ -815,6 +828,15 @@ class PackageView:
         """
         g = self._analysis.materialize_closure(self._package.path)
         return _find_kept_alive_by_flags_only(g, flags, prefix=self._package.path)
+
+    def dead_suites(self) -> Mapping[Path, tuple[CodeRange, ...]]:
+        """Statically-dead suite positions for files in this package.
+
+        Local-only: reads straight from this package's
+        :class:`PackageContribution` (triggers a refresh of just this
+        package). Files with no dead suites are omitted.
+        """
+        return dict(self._contribution().dead_suites)
 
     def count_nodes(self) -> dict[str, int]:
         """Count nodes contributed by this package, by ``SymbolNode.type``.
