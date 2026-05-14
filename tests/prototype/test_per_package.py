@@ -190,9 +190,7 @@ def test_cross_package_node_dedup(make_project):
 
     from dead_cst._graphstore import SymbolGraph
 
-    # Build A; it owns "shared".
     pkg_a = proj.build_package_graph("a")
-    pkg_b = proj.build_package_graph("b")
 
     graph = SymbolGraph()
     sn_a = accumulate(graph, pkg_a)
@@ -267,7 +265,7 @@ def test_plugin_runs_once_per_package_in_order(make_project):
         packages=[("b", "b", ["a"]), ("a", "a", [])],
     )
     plugin = _MarkClassesEntrypoint()
-    report = build_project_graph(proj, plugins=[plugin])
+    build_project_graph(proj, plugins=[plugin])
     assert plugin.package_order_seen == ["a", "b"]
 
 
