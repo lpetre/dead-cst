@@ -19,10 +19,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from dead_cst import Analysis
-from dead_cst.analyze import (
-    _find_kept_alive_by_dead_branches as find_kept_alive_by_dead_branches,
-    _find_reachable as find_reachable,
-)
+from dead_cst.analyze import _find_reachable as find_reachable
 
 
 def _dead_suite_positions(analysis: Analysis, file: Path) -> tuple:
@@ -121,13 +118,12 @@ def test_dead_branch_import_ref_is_flagged(build_decl_graph, assert_dead_branch_
     )
 
 
-def test_default_find_reachable_traverses_dead_branch_edges(build_decl_graph, mark_entrypoint):
+def test_default_find_reachable_traverses_dead_branch_edges(build_decl_graph):
     """Default reachability still keeps ``helper`` alive via the dead-branch ref.
 
     Today's behavior preservation: even when the only reference to
-    ``helper`` is ``if False: helper()``, ``find_reachable`` from the
-    module-as-entrypoint still reaches it. The edge is flagged but
-    not skipped.
+    ``helper`` is ``if False: helper()``, ``find_reachable`` seeded at
+    the module still reaches it. The edge is flagged but not skipped.
     """
     graph = build_decl_graph(
         {
@@ -138,15 +134,12 @@ def test_default_find_reachable_traverses_dead_branch_edges(build_decl_graph, ma
             """
         }
     )
-    # Mark the module as an entrypoint manually; the build_decl_graph
-    # fixture doesn't run plugins.
     module = next(n for n in graph.nodes if n.fqname == "mod")
-    module = mark_entrypoint(graph, module)
     helper = next(n for n in graph.nodes if n.fqname == "mod.helper")
-    assert helper in find_reachable(graph)
+    assert helper in find_reachable(graph, seeds=[module])
 
 
-def test_find_kept_alive_by_dead_branches_returns_strict_diff(build_decl_graph, mark_entrypoint):
+def test_find_kept_alive_by_dead_branches_returns_strict_diff(build_decl_graph):
     """Strict pruning surfaces ``helper`` as kept-alive-only-by-dead-code."""
     graph = build_decl_graph(
         {
@@ -158,10 +151,10 @@ def test_find_kept_alive_by_dead_branches_returns_strict_diff(build_decl_graph, 
         }
     )
     module = next(n for n in graph.nodes if n.fqname == "mod")
-    module = mark_entrypoint(graph, module)
     helper = next(n for n in graph.nodes if n.fqname == "mod.helper")
-    blast = find_kept_alive_by_dead_branches(graph)
-    assert helper in blast
+    full = find_reachable(graph, seeds=[module])
+    strict = find_reachable(graph, seeds=[module], skip_dead_branches=True)
+    assert helper in full - strict
 
 
 def test_nested_dead_suites_record_separate_positions(make_analysis, write_files, tmp_path):

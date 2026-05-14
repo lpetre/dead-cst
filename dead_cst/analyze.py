@@ -151,6 +151,7 @@ def _find_reachable(
     *,
     prefix: Path | None = None,
     skip_dead_branches: bool = False,
+    seeds: Iterable[SymbolNode] | None = None,
 ) -> set[SymbolNode]:
     """BFS forward from every node carrying :data:`NodeFlags.ENTRYPOINT`.
 
@@ -168,11 +169,21 @@ def _find_reachable(
     ``prefix`` filters the returned set to nodes whose ``path`` lies
     under it; the BFS still traverses the full graph, so transitive
     reachability through nodes outside ``prefix`` is preserved.
+
+    ``seeds`` overrides the default flag-based seed selection: when
+    provided, those nodes are the BFS starting points and
+    ``exclude_flags`` is ignored. Useful in tests that want to seed
+    reachability from specific nodes without rebuilding the graph.
     """
     visited: set[SymbolNode] = set()
-    stack = [
-        n for n in graph.nodes if n.flags & NodeFlags.ENTRYPOINT and not (n.flags & exclude_flags)
-    ]
+    if seeds is not None:
+        stack = list(seeds)
+    else:
+        stack = [
+            n
+            for n in graph.nodes
+            if n.flags & NodeFlags.ENTRYPOINT and not (n.flags & exclude_flags)
+        ]
     while stack:
         node = stack.pop()
         if node in visited:
