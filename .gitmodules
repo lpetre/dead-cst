@@ -1,0 +1,3 @@
+[submodule "vendor/ruff"]
+	path = vendor/ruff
+	url = https://github.com/astral-sh/ruff.git
