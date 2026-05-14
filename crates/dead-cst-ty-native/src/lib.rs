@@ -22,9 +22,15 @@
 //! `build_file_graph(path, module_fqname)` is retained for
 //! single-file probing during development.
 
+// pyo3 0.22's `#[pymethods]` macro emits `.into()` on already-`PyErr`
+// error paths, which clippy 1.95 flags as `useless_conversion` against
+// the user-written function signature. Suppress crate-wide; first-party
+// useless conversions are still caught by inspection at PR time.
+#![allow(clippy::useless_conversion)]
+
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use pyo3::exceptions::{PyOSError, PyValueError};
@@ -277,10 +283,9 @@ impl Project {
 
         let cwd = std::env::current_dir()
             .map_err(|e| PyOSError::new_err(format!("cwd unavailable: {e}")))?;
-        let cwd = SystemPathBuf::from_path_buf(cwd.try_into().map_err(|_| {
-            PyValueError::new_err("current working directory is not valid UTF-8")
-        })?)
-        .map_err(|_| PyValueError::new_err("current working directory is not absolute"))?;
+        let cwd = SystemPathBuf::from_path_buf(cwd).map_err(|_| {
+            PyValueError::new_err("current working directory is not a valid absolute UTF-8 path")
+        })?;
         let system = OsSystem::new(cwd);
 
         let db = ProjectDatabase::use_defaults(metadata, system);
@@ -471,7 +476,7 @@ fn collect_py_files(dir: &PathBuf, out: &mut Vec<PathBuf>) -> std::io::Result<()
     Ok(())
 }
 
-fn derive_module_fqname(file: &PathBuf, package_dir: &PathBuf, package_name: &str) -> String {
+fn derive_module_fqname(file: &Path, package_dir: &Path, package_name: &str) -> String {
     let rel = file.strip_prefix(package_dir).unwrap_or(file);
     let s = rel.to_string_lossy().replace('\\', "/");
     let stripped = s
