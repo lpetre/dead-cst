@@ -102,10 +102,6 @@ impl Import {
 /// other kinds carry `None`.
 #[pyclass(get_all, frozen)]
 struct NativeNode {
-    /// Index into the graph's node list. Stable for the lifetime of the
-    /// owning builder/context; plugins thread node identity through this
-    /// when calling `add_edge`.
-    idx: usize,
     fqname: String,
     kind: &'static str,
     path: String,
@@ -121,8 +117,7 @@ struct NativeNode {
 impl NativeNode {
     fn __repr__(&self) -> String {
         format!(
-            "NativeNode(idx={}, fqname={:?}, kind={:?}, path={:?}, start=({}, {}), end=({}, {}), flags={})",
-            self.idx,
+            "NativeNode(fqname={:?}, kind={:?}, path={:?}, start=({}, {}), end=({}, {}), flags={})",
             self.fqname,
             self.kind,
             self.path,
@@ -222,21 +217,12 @@ impl GraphBuilder {
         }
     }
 
-    fn intern_node(&mut self, py: Python<'_>, mut node: NativeNode) -> PyResult<usize> {
-        let key = NodeKey {
-            fqname: node.fqname.clone(),
-            kind: node.kind,
-            path: node.path.clone(),
-            start_line: node.start_line,
-            start_column: node.start_column,
-            end_line: node.end_line,
-            end_column: node.end_column,
-        };
+    fn intern_node(&mut self, py: Python<'_>, node: NativeNode) -> PyResult<usize> {
+        let key = node_key_of(&node);
         if let Some(&idx) = self.node_index.get(&key) {
             return Ok(idx);
         }
         let idx = self.nodes.len();
-        node.idx = idx;
         self.nodes.push(Py::new(py, node)?);
         self.node_index.insert(key, idx);
         Ok(idx)
@@ -280,43 +266,15 @@ impl Project {
         python_version: Option<&str>,
         typeshed: Option<&str>,
     ) -> PyResult<Self> {
-        let root = SystemPathBuf::from(root);
-
-        let env = EnvironmentOptions {
-            root: src_roots.map(|paths| paths.into_iter().map(rel_path).collect()),
-            extra_paths: extra_paths.map(|paths| paths.into_iter().map(rel_path).collect()),
-            python: python_env.map(rel_path),
-            python_version: python_version
-                .map(|v| {
-                    SupportedPythonVersion::from_str(v).map_err(|e| {
-                        PyValueError::new_err(format!("invalid python_version {v:?}: {e}"))
-                    })
-                })
-                .transpose()?
-                .map(RangedValue::cli),
-            typeshed: typeshed.map(rel_path),
-            ..EnvironmentOptions::default()
-        };
-
-        let options = Options {
-            environment: Some(env),
-            ..Options::default()
-        };
-
-        let metadata =
-            ProjectMetadata::from_options(options, root.clone(), None, &UseDefaultStrategy)
-                .map_err(|e| PyValueError::new_err(format!("invalid configuration: {e:?}")))?;
-
-        let cwd = std::env::current_dir()
-            .map_err(|e| PyOSError::new_err(format!("cwd unavailable: {e}")))?;
-        let cwd = SystemPathBuf::from_path_buf(cwd).map_err(|_| {
-            PyValueError::new_err("current working directory is not a valid absolute UTF-8 path")
-        })?;
-        let system = OsSystem::new(cwd);
-
-        Ok(Self {
-            db: ProjectDatabase::use_defaults(metadata, system),
-        })
+        let db = make_db(
+            root,
+            src_roots,
+            extra_paths,
+            python_env,
+            python_version,
+            typeshed,
+        )?;
+        Ok(Self { db })
     }
 
     /// Build the project-wide symbol graph.
@@ -338,12 +296,13 @@ struct BuildOutputs {
     builder: GraphBuilder,
     project_files: Vec<File>,
     global_index: DeclIndex,
-    #[allow(dead_code)]
-    module_nodes: HashMap<File, usize>,
-    #[allow(dead_code)]
-    alias_imports: HashMap<usize, ImportSpec>,
-    #[allow(dead_code)]
-    live_decls: LiveDeclIndex,
+    /// `file_path_string(file) -> File` so seed lookups don't have to
+    /// linear-scan `project_files`. Populated alongside ingest.
+    path_to_file: HashMap<String, File>,
+    /// `(file, class_target_range_key) -> class node idx`. Lets
+    /// `find_subclasses_of` map ty's `TypeHierarchyClass.selection_range`
+    /// back to a graph node in O(1).
+    class_by_selection: HashMap<(File, (u32, u32)), usize>,
 }
 
 /// Run the three build phases (ingest → hierarchy+imports → references)
@@ -354,8 +313,13 @@ fn build_project_graph(py: Python<'_>, db: &ProjectDatabase) -> PyResult<BuildOu
     let mut module_nodes: HashMap<File, usize> = HashMap::new();
     let mut alias_imports: HashMap<usize, ImportSpec> = HashMap::new();
     let mut live_decls: LiveDeclIndex = HashMap::new();
+    let mut class_by_selection: HashMap<(File, (u32, u32)), usize> = HashMap::new();
 
     let project_files: Vec<File> = (&db.project().files(db)).into_iter().collect();
+    let mut path_to_file: HashMap<String, File> = HashMap::with_capacity(project_files.len());
+    for &file in &project_files {
+        path_to_file.insert(file_path_string(db, file), file);
+    }
     for file in &project_files {
         ingest_decls(
             py,
@@ -366,6 +330,7 @@ fn build_project_graph(py: Python<'_>, db: &ProjectDatabase) -> PyResult<BuildOu
             &mut module_nodes,
             &mut alias_imports,
             &mut live_decls,
+            &mut class_by_selection,
         )?;
     }
     for file in &project_files {
@@ -394,9 +359,8 @@ fn build_project_graph(py: Python<'_>, db: &ProjectDatabase) -> PyResult<BuildOu
         builder,
         project_files,
         global_index,
-        module_nodes,
-        alias_imports,
-        live_decls,
+        path_to_file,
+        class_by_selection,
     })
 }
 
@@ -476,34 +440,26 @@ impl ProjectContext {
     /// re-enter `add_node` / `add_edge` / queries through the same ctx
     /// without aliasing violations.
     fn materialize(slf: Py<Self>, py: Python<'_>) -> PyResult<NativeGraph> {
-        // Phase 1 — build (mutates self.outputs).
         {
             let this = slf.borrow(py);
             let outputs = build_project_graph(py, &this.db)?;
             *this.outputs.borrow_mut() = Some(outputs);
         }
 
-        // Phase 2 — plugins. Clone refs out so we don't hold a borrow
-        // across the Python callback (plugins re-enter ctx methods).
-        let plugins: Vec<PyObject> = {
-            let this = slf.borrow(py);
-            this.plugins.iter().map(|p| p.clone_ref(py)).collect()
-        };
+        let plugins: Vec<PyObject> = slf
+            .borrow(py)
+            .plugins
+            .iter()
+            .map(|p| p.clone_ref(py))
+            .collect();
         for plugin in &plugins {
-            let ctx_arg = slf.clone_ref(py);
-            plugin.bind(py).call_method1("run", (ctx_arg,))?;
+            plugin.bind(py).call_method1("run", (slf.clone_ref(py),))?;
         }
 
-        // Phase 3 — snapshot. Move builder out (leaving outputs as
-        // None) so plugins that cached the ctx see a clean failure
-        // rather than silently mutating after the snapshot.
-        let taken = {
-            let this = slf.borrow(py);
-            let value = this.outputs.borrow_mut().take();
-            value
-        };
-        let outputs = taken
-            .ok_or_else(|| PyRuntimeError::new_err("ProjectContext was already materialized"))?;
+        let outputs =
+            slf.borrow(py).outputs.borrow_mut().take().ok_or_else(|| {
+                PyRuntimeError::new_err("ProjectContext was already materialized")
+            })?;
         Ok(NativeGraph {
             nodes: outputs.builder.nodes,
             edges: outputs.builder.edges,
@@ -549,7 +505,6 @@ impl ProjectContext {
         let idx = outputs.builder.intern_node(
             py,
             NativeNode {
-                idx: 0,
                 fqname,
                 kind,
                 path,
@@ -565,12 +520,20 @@ impl ProjectContext {
     }
 
     /// Add an edge between two nodes returned by `add_node` or a query.
+    ///
+    /// Identity is content-based: each side is looked up in the
+    /// builder's intern table via its `(fqname, kind, path, position)`
+    /// key, so two `NativeNode` Python references that wrap the same
+    /// logical node resolve to the same edge endpoint. Passing a node
+    /// that was never interned raises `ValueError`.
     fn add_edge(&self, src: &NativeNode, dst: &NativeNode) -> PyResult<()> {
         let mut outputs = self.outputs.borrow_mut();
         let outputs = outputs
             .as_mut()
             .ok_or_else(|| not_materialized("add_edge"))?;
-        outputs.builder.add_edge(src.idx, dst.idx, 0);
+        let src_idx = lookup_idx(&outputs.builder, src, "src")?;
+        let dst_idx = lookup_idx(&outputs.builder, dst, "dst")?;
+        outputs.builder.add_edge(src_idx, dst_idx, 0);
         Ok(())
     }
 
@@ -669,7 +632,7 @@ impl ProjectContext {
         // its inferred Type via the StmtClassDef at that range.
         let Some((seed_file, seed_range)) = locate_class_def(
             &self.db,
-            &outputs.project_files,
+            &outputs.path_to_file,
             &class_node.path,
             class_node,
         ) else {
@@ -696,9 +659,9 @@ impl ProjectContext {
             if !seen.insert(file_key) {
                 continue;
             }
-            // Map THC back to a node idx — selection_range matches our
-            // class-node target_range exactly.
-            if let Some(idx) = class_idx_by_selection(outputs, thc.file, thc.selection_range) {
+            // `selection_range` is the class name range — same key the
+            // class-node was interned under.
+            if let Some(&idx) = outputs.class_by_selection.get(&file_key) {
                 out_idx.push(idx);
             }
             // Recurse: ask ty for the next layer.
@@ -741,10 +704,8 @@ impl ProjectContext {
         for &file in &outputs.project_files {
             let parsed = parsed_module(&self.db, file).load(&self.db);
             let source = source_text(&self.db, file);
-            // Build a per-file sorted list of (target_range_start, idx)
-            // so we can find the next decl after a comment via binary
-            // search.
-            let file_decls = file_decl_sites(&self.db, file, &outputs.global_index, &parsed);
+            // Lazy — files with no matching comments skip the decl scan.
+            let mut file_decls: Option<Vec<(u32, usize)>> = None;
             for token in parsed.tokens() {
                 if token.kind() != TokenKind::Comment {
                     continue;
@@ -754,10 +715,11 @@ impl ProjectContext {
                 if !regex.is_match(text) {
                     continue;
                 }
+                let decls =
+                    file_decls.get_or_insert_with(|| file_decl_sites(file, &outputs.global_index));
                 let comment_end = range.end().to_u32();
-                let Some(&(_, decl_idx)) =
-                    file_decls.iter().find(|(start, _)| *start >= comment_end)
-                else {
+                let i = decls.partition_point(|(start, _)| *start < comment_end);
+                let Some(&(_, decl_idx)) = decls.get(i) else {
                     continue;
                 };
                 out.push((
@@ -841,10 +803,39 @@ fn not_materialized(op: &str) -> PyErr {
     ))
 }
 
+/// Project a `NativeNode` onto the `NodeKey` used for intern-table
+/// identity. Clones the two `String` fields (`fqname`, `path`); the
+/// rest are `Copy`.
+fn node_key_of(node: &NativeNode) -> NodeKey {
+    NodeKey {
+        fqname: node.fqname.clone(),
+        kind: node.kind,
+        path: node.path.clone(),
+        start_line: node.start_line,
+        start_column: node.start_column,
+        end_line: node.end_line,
+        end_column: node.end_column,
+    }
+}
+
+/// Resolve a `NativeNode` reference to its builder-side index for an
+/// edge endpoint. Surfaces a precise `ValueError` (with `side`) when
+/// the node was never interned in this context.
+fn lookup_idx(builder: &GraphBuilder, node: &NativeNode, side: &str) -> PyResult<usize> {
+    builder
+        .node_index
+        .get(&node_key_of(node))
+        .copied()
+        .ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "add_edge: {side} node {:?} is not interned in this ProjectContext",
+                node.fqname
+            ))
+        })
+}
+
 /// Map a plugin-supplied `kind` string to one of the stable `&'static
-/// str` kinds NativeNode carries. Plugins typically use "synthetic" but
-/// "import"/"function"/"class"/"variable"/"module" are accepted too so
-/// the protocol round-trips with query results.
+/// str` kinds NativeNode carries.
 fn static_kind_str(kind: &str) -> PyResult<&'static str> {
     Ok(match kind {
         "synthetic" => "synthetic",
@@ -875,35 +866,34 @@ fn class_body_defines_method(class_def: &StmtClassDef, method_name: &str) -> boo
     })
 }
 
+fn iter_top_level_classes(parsed: &ParsedModuleRef) -> impl Iterator<Item = &StmtClassDef> {
+    parsed.syntax().body.iter().filter_map(|stmt| match stmt {
+        Stmt::ClassDef(cls) => Some(cls),
+        _ => None,
+    })
+}
+
 /// Locate a class's File + name TextRange from its NativeNode positions.
 ///
 /// We don't store ty `Definition<'db>` references across plugin calls
 /// (the `'db` lifetime is tied to the active borrow), so this re-walks
-/// the file's top-level statements to find the class whose name range
+/// the matching file's top-level classes for one whose name range
 /// projects to the same `(start_line, start_column)` as the node.
 fn locate_class_def(
     db: &ProjectDatabase,
-    project_files: &[File],
+    path_to_file: &HashMap<String, File>,
     path: &str,
     class_node: &NativeNode,
 ) -> Option<(File, TextRange)> {
-    let target_start_line = class_node.start_line;
-    let target_start_col = class_node.start_column;
-    for &file in project_files {
-        if file_path_string(db, file) != path {
-            continue;
-        }
-        let parsed = parsed_module(db, file).load(db);
-        let source = source_text(db, file);
-        let line_index = line_index(db, file);
-        for stmt in &parsed.syntax().body {
-            if let Stmt::ClassDef(cls) = stmt {
-                let name_range = cls.name.range();
-                let (sl, sc, _, _) = position(&line_index, &source, name_range);
-                if sl == target_start_line && sc == target_start_col {
-                    return Some((file, name_range));
-                }
-            }
+    let &file = path_to_file.get(path)?;
+    let parsed = parsed_module(db, file).load(db);
+    let source = source_text(db, file);
+    let line_index = line_index(db, file);
+    for cls in iter_top_level_classes(&parsed) {
+        let name_range = cls.name.range();
+        let (sl, sc, _, _) = position(&line_index, &source, name_range);
+        if sl == class_node.start_line && sc == class_node.start_column {
+            return Some((file, name_range));
         }
     }
     None
@@ -911,65 +901,22 @@ fn locate_class_def(
 
 /// Find a top-level `StmtClassDef` whose name range equals `selection_range`.
 fn class_def_at(parsed: &ParsedModuleRef, selection_range: TextRange) -> Option<&StmtClassDef> {
-    for stmt in &parsed.syntax().body {
-        if let Stmt::ClassDef(cls) = stmt {
-            if cls.name.range() == selection_range {
-                return Some(cls);
-            }
-        }
-    }
-    None
-}
-
-/// Map ty's `TypeHierarchyClass.selection_range` (the class name range)
-/// back to a node idx in our graph. We don't have a pre-built index
-/// because every other path uses `(file, place_id, range_key)` — but
-/// for class nodes the `place_id` is always the class's own symbol
-/// place, so a linear scan over `global_index` entries with the
-/// matching `(file, range_key)` suffices for the prototype.
-fn class_idx_by_selection(
-    outputs: &BuildOutputs,
-    file: File,
-    selection_range: TextRange,
-) -> Option<usize> {
-    let needle = range_key(selection_range);
-    for ((entry_file, _place_id, range), idx) in &outputs.global_index {
-        if *entry_file == file && *range == needle {
-            return Some(*idx);
-        }
-    }
-    None
+    iter_top_level_classes(parsed).find(|cls| cls.name.range() == selection_range)
 }
 
 /// Per-file sorted list of `(target_start_offset, node_idx)` for the
-/// file's top-level decls. Sorted ascending so callers can find the
-/// next decl after a comment via linear scan (small files) or binary
-/// search.
-fn file_decl_sites(
-    db: &ProjectDatabase,
-    file: File,
-    global_index: &DeclIndex,
-    _parsed: &ParsedModuleRef,
-) -> Vec<(u32, usize)> {
-    let mut out: Vec<(u32, usize)> = Vec::new();
-    let index = semantic_index(db, file);
-    let global = FileScopeId::global();
-    let use_def_map = index.use_def_map(global);
-    let parsed = parsed_module(db, file).load(db);
-    for (_def_id, state, _used) in use_def_map.all_definitions_with_usage() {
-        let DefinitionState::Defined(def) = state else {
-            continue;
-        };
-        if def.file(db) != file || def.file_scope(db) != global {
-            continue;
-        }
-        let kind = def.kind(db);
-        let target_range = kind.target_range(&parsed);
-        let key = (file, def.place(db), range_key(target_range));
-        if let Some(&idx) = global_index.get(&key) {
-            out.push((target_range.start().to_u32(), idx));
-        }
-    }
+/// file's top-level decls. Sorted ascending so callers can binary-search
+/// for the next decl after a comment.
+///
+/// Reads straight from `global_index` — every key in there already
+/// carries the decl's `(start, end)` range tuple, and `ingest_decls`
+/// populated it from the same `all_definitions_with_usage()` walk.
+fn file_decl_sites(file: File, global_index: &DeclIndex) -> Vec<(u32, usize)> {
+    let mut out: Vec<(u32, usize)> = global_index
+        .iter()
+        .filter(|((f, _, _), _)| *f == file)
+        .map(|((_, _, (start, _)), idx)| (*start, *idx))
+        .collect();
     out.sort_by_key(|(start, _)| *start);
     out
 }
@@ -988,6 +935,7 @@ fn ingest_decls(
     module_nodes: &mut HashMap<File, usize>,
     alias_imports: &mut HashMap<usize, ImportSpec>,
     live_decls: &mut LiveDeclIndex,
+    class_by_selection: &mut HashMap<(File, (u32, u32)), usize>,
 ) -> PyResult<()> {
     let parsed = parsed_module(db, file).load(db);
     let source = source_text(db, file);
@@ -999,7 +947,6 @@ fn ingest_decls(
     let module_idx = builder.intern_node(
         py,
         NativeNode {
-            idx: 0,
             fqname: module_fqname.clone(),
             kind: "module",
             path: path_str.clone(),
@@ -1065,7 +1012,6 @@ fn ingest_decls(
         let node_idx = builder.intern_node(
             py,
             NativeNode {
-                idx: 0,
                 fqname: format!("{module_fqname}.{local_name}"),
                 kind: node_kind,
                 path: path_str.clone(),
@@ -1079,6 +1025,9 @@ fn ingest_decls(
         )?;
         builder.add_edge(node_idx, module_idx, 0);
         global_index.insert((file, place_id, range_key(target_range)), node_idx);
+        if node_kind == "class" {
+            class_by_selection.insert((file, range_key(target_range)), node_idx);
+        }
 
         if let Some(spec) = import_spec {
             alias_imports.insert(node_idx, spec);
@@ -1454,7 +1403,6 @@ fn mint_module_node(
     let idx = builder.intern_node(
         py,
         NativeNode {
-            idx: 0,
             fqname,
             kind: "module",
             path: path_str,

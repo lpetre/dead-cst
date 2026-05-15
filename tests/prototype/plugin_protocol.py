@@ -35,6 +35,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Iterable, Protocol, runtime_checkable
 
+from dead_cst.graph import NodeFlags
+
 if TYPE_CHECKING:
     import dead_cst_ty_native as native
 
@@ -99,6 +101,6 @@ class KeepAliveCommentPlugin:
             marker = ctx.add_node(
                 fqname=f"<keep>:{decl.fqname}",
                 path=decl.path,
-                flags=2,  # NodeFlags.ENTRYPOINT
+                flags=int(NodeFlags.ENTRYPOINT),
             )
             ctx.add_edge(marker, decl)

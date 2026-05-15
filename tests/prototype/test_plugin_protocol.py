@@ -208,9 +208,8 @@ def test_find_comment_patterns_skips_unmatched_comments(make_ctx):
 # ---------------------------------------------------------------------------
 
 
-def test_add_node_returns_node_with_idx(make_ctx):
-    """Nodes minted by `add_node` carry a stable idx that `add_edge` consumes."""
-    captured: dict[str, object] = {}
+def test_add_node_and_add_edge_round_trip(make_ctx):
+    """`add_edge` resolves node identity by content (no idx field needed)."""
 
     class MintAndCheck:
         name = "mint_and_check"
@@ -220,10 +219,7 @@ def test_add_node_returns_node_with_idx(make_ctx):
             assert len(decls) == 1
             decl = decls[0]
             synth = ctx.add_node(fqname="<seed>", path=decl.path)
-            assert synth.idx != decl.idx
             ctx.add_edge(synth, decl)
-            captured["synth_idx"] = synth.idx
-            captured["decl_idx"] = decl.idx
 
     ctx = make_ctx({"mod.py": "def f(): pass\n"})
     ctx.add_plugin(MintAndCheck())
@@ -233,6 +229,34 @@ def test_add_node_returns_node_with_idx(make_ctx):
     synth_idx = fqnames.index("<seed>")
     decl_idx = fqnames.index("mod.f")
     assert (synth_idx, decl_idx, 0) in graph.edges
+
+
+def test_add_edge_dedups_by_content(make_ctx):
+    """Two NativeNode refs to the same logical node resolve to one edge."""
+
+    class MintTwice:
+        name = "mint_twice"
+
+        def run(self, ctx: native.ProjectContext) -> None:
+            decl = next(n for n in ctx.nodes() if n.fqname == "mod.f")
+            # Two `add_node` calls with the same key return refs that
+            # alias the same interned node; `add_edge` from either one
+            # produces the same single edge.
+            synth1 = ctx.add_node(fqname="<seed>", path=decl.path)
+            synth2 = ctx.add_node(fqname="<seed>", path=decl.path)
+            ctx.add_edge(synth1, decl)
+            ctx.add_edge(synth2, decl)
+
+    ctx = make_ctx({"mod.py": "def f(): pass\n"})
+    ctx.add_plugin(MintTwice())
+    graph = ctx.materialize()
+    fqnames = [n.fqname for n in graph.nodes]
+    # The synthetic was interned exactly once.
+    assert fqnames.count("<seed>") == 1
+    synth_idx = fqnames.index("<seed>")
+    decl_idx = fqnames.index("mod.f")
+    seed_to_f = [(s, d, f) for (s, d, f) in graph.edges if s == synth_idx and d == decl_idx]
+    assert len(seed_to_f) == 1
 
 
 def test_query_outside_materialize_raises(make_ctx):
