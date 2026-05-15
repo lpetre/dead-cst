@@ -123,3 +123,10 @@ known-first-party = ["dead_cst"]
 # unresolved-import case the analyzer is meant to detect, so they aren't
 # meaningful targets for ty.
 include = ["dead_cst"]
+
+[tool.ty.environment]
+# The rust extension `dead_cst_ty_native` ships its type stubs from
+# `crates/dead-cst-ty-native/python/`. Point ty at the source layout
+# directly so CI (which never builds the maturin wheel) can still
+# resolve `native.ProjectContext` in plugin annotations.
+extra-paths = ["crates/dead-cst-ty-native/python"]

@@ -54,6 +54,8 @@ from ._core import (
 )
 
 if TYPE_CHECKING:
+    import dead_cst_ty_native as native
+
     from ..graph import VisitorPayload
 
 _INIT_SUBCLASS = "__init_subclass__"
@@ -186,6 +188,16 @@ class InitSubclassPlugin:
                     if sub in existing_targets[marker]:
                         continue
                     yield AddEdge(marker, sub)
+
+    def run(self, ctx: native.ProjectContext) -> None:
+        for parent in ctx.find_classes_defining_method(_INIT_SUBCLASS):
+            marker = ctx.add_node(
+                fqname=f"{INIT_SUBCLASS_PREFIX}{parent.fqname}",
+                path=parent.path,
+            )
+            ctx.add_edge(parent, marker)
+            for sub in ctx.find_subclasses_of(parent):
+                ctx.add_edge(marker, sub)
 
 
 def _has_init_subclass(class_def: cst.ClassDef) -> bool:
