@@ -1260,7 +1260,7 @@ impl<'a, 'db> RefCollector<'a, 'db> {
 /// `Name.s1.s2`, ... — i.e. one or more attribute accesses on a bare
 /// name. Returns `None` when the chain bottoms out at anything else
 /// (a call result, subscript, attribute of attribute of a non-Name, …).
-fn collapse_attribute_chain<'ast>(expr: &'ast Expr) -> Option<(&'ast ExprName, Vec<&'ast str>)> {
+fn collapse_attribute_chain(expr: &Expr) -> Option<(&ExprName, Vec<&str>)> {
     let mut segments: Vec<&str> = Vec::new();
     let mut current = expr;
     loop {
