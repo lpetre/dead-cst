@@ -177,6 +177,22 @@ struct ImportSpec {
 /// non-`SHADOWED` decl.
 type LiveDeclIndex = HashMap<(File, String), usize>;
 
+/// Outcome of resolving a `Name` use to its reaching definition.
+///
+/// `Alias` is the module-scope path: the use has a local graph node
+/// (an import alias or a top-level decl) that takes the in-edge.
+/// `NestedImport` is the function-/class-scope path: ty saw an import
+/// binding in a non-global scope, so no graph node was minted, and
+/// the use's parallel upstream edges flow from the enclosing top-level
+/// owner instead.
+enum Resolution {
+    Alias(usize),
+    NestedImport {
+        spec: ImportSpec,
+        bound_name: String,
+    },
+}
+
 // ---------------------------------------------------------------------------
 // GraphBuilder + node interning
 // ---------------------------------------------------------------------------
@@ -499,7 +515,7 @@ fn decl_kind_str(kind: &DefinitionKind<'_>) -> Option<&'static str> {
 
 fn import_payload_for<'db>(
     kind: &DefinitionKind<'db>,
-    db: &'db dyn ProjectDb,
+    db: &'db dyn ty_python_semantic::Db,
     file: File,
     parsed: &ParsedModuleRef,
 ) -> ImportSpec {
@@ -546,7 +562,7 @@ fn import_payload_for<'db>(
 /// resolve (invalid syntax or too many leading dots) — downstream
 /// classification can treat that as an unresolved target.
 fn from_module_string(
-    db: &dyn ProjectDb,
+    db: &dyn ty_python_semantic::Db,
     file: File,
     stmt: &ruff_python_ast::StmtImportFrom,
 ) -> String {
@@ -960,14 +976,18 @@ fn stmt_creates_top_level_definition(stmt: &Stmt) -> bool {
 fn walk_owned(kind: &DefinitionKind<'_>, parsed: &ParsedModuleRef, v: &mut RefCollector<'_, '_>) {
     match kind {
         DefinitionKind::Function(func) => {
+            v.nested_context = true;
             for s in &func.node(parsed).body {
                 v.visit_stmt(s);
             }
+            v.nested_context = false;
         }
         DefinitionKind::Class(cls) => {
+            v.nested_context = true;
             for s in &cls.node(parsed).body {
                 v.visit_stmt(s);
             }
+            v.nested_context = false;
         }
         DefinitionKind::Assignment(a) => v.visit_expr(a.value(parsed)),
         DefinitionKind::AnnotatedAssignment(a) => {
@@ -1008,6 +1028,14 @@ struct RefCollector<'a, 'db> {
     alias_imports: &'a HashMap<usize, ImportSpec>,
     live_decls: &'a LiveDeclIndex,
     edges: HashSet<(usize, usize)>,
+    /// `true` while walking a function- or class-body subtree. In
+    /// that context, nested `Stmt::Import` / `Stmt::ImportFrom`
+    /// statements emit parallel upstream edges from `owner` (no
+    /// alias node is minted, since the binding lives in a non-global
+    /// scope). At module level the flag stays false, so we don't
+    /// double-emit for imports that `emit_import_edges` already
+    /// processed via their proper alias nodes.
+    nested_context: bool,
 }
 
 impl<'a, 'db> RefCollector<'a, 'db> {
@@ -1032,6 +1060,7 @@ impl<'a, 'db> RefCollector<'a, 'db> {
             alias_imports,
             live_decls,
             edges: HashSet::new(),
+            nested_context: false,
         }
     }
 
@@ -1047,25 +1076,30 @@ impl<'a, 'db> RefCollector<'a, 'db> {
         }
     }
 
-    /// Walk the use's scope chain and return the local alias / decl
-    /// node bound to `name`, if any. Stops at the first scope that
-    /// binds the name; ty's flow-sensitive `end_of_scope_symbol_bindings`
-    /// filters to the reaching def (Principle 3).
+    /// Walk the use's scope chain looking for the reaching definition
+    /// of `name`. Returns `None` when no binding is found.
+    ///
+    /// Walks outward through visible scopes until we find one that
+    /// *binds* `name` (not merely lists it in its place table — a free
+    /// variable can show up there without any local binding, and in
+    /// that case we want to keep walking up to the actual definer).
+    /// The first binding scope wins; ty's flow-sensitive
+    /// `end_of_scope_symbol_bindings` filters within that scope to the
+    /// reaching def (Principle 3).
+    ///
+    /// Resolutions split on whether the binding has a graph node:
+    /// module-scope decls and import aliases give `Alias(idx)`;
+    /// imports nested in a function/class scope (no graph node minted)
+    /// give `NestedImport { spec, bound_name }` so the caller can fan
+    /// out parallel upstream edges from the enclosing top-level owner.
     ///
     /// Deliberately does NOT use `definitions_for_name`: that walks
-    /// past `from X import y` to the upstream definition in `X`, but
-    /// Principle 2 requires the alias edge to terminate locally.
-    fn find_local_binding(&self, name: &ExprName) -> Option<usize> {
+    /// past `from X import y` to the upstream definition in `X`,
+    /// flattening the local alias edge Principle 2 requires.
+    fn find_local_binding(&self, name: &ExprName) -> Option<Resolution> {
         let db = self.model.db();
         let index = semantic_index(db, self.file);
         let file_scope = self.model.scope(name.into())?;
-        // Walk outward through visible scopes until we find one that
-        // *binds* `name` (not merely lists it in its place table — a
-        // free variable can show up there without any local binding,
-        // and in that case we want to keep walking up to the actual
-        // definer). The first binding scope wins; ty's
-        // `end_of_scope_symbol_bindings` gives us the reaching def
-        // within that scope.
         for (scope_id, _scope) in index.visible_ancestor_scopes(file_scope) {
             let place_table = index.place_table(scope_id);
             let Some(symbol_id) = place_table.symbol_id(name.id.as_str()) else {
@@ -1079,38 +1113,60 @@ impl<'a, 'db> RefCollector<'a, 'db> {
                 if def.file(db) != self.file {
                     continue;
                 }
+                let kind = def.kind(db);
+                let place_id = def.place(db);
                 let key = (
                     self.file,
-                    def.place(db),
-                    range_key(def.kind(db).target_range(self.parsed)),
+                    place_id,
+                    range_key(kind.target_range(self.parsed)),
                 );
                 if let Some(&idx) = self.global_index.get(&key) {
-                    return Some(idx);
+                    return Some(Resolution::Alias(idx));
+                }
+                // Not in global_index — the binding lives in a
+                // non-global scope. Imports are the only non-global
+                // bindings we care about (function parameters / local
+                // assigns / comprehension vars have no upstream to
+                // chase). For each nested import, hand back the spec
+                // and the actual bound name so the caller can emit
+                // parallel upstream edges from the enclosing owner.
+                if kind.is_import() {
+                    let PlaceExprRef::Symbol(sym) = place_table.place(place_id) else {
+                        continue;
+                    };
+                    let bound_name = sym.name().as_str().to_string();
+                    let spec = import_payload_for(kind, db, self.file, self.parsed);
+                    return Some(Resolution::NestedImport { spec, bound_name });
                 }
             }
         }
         None
     }
 
-    /// Emit `owner → alias` and the parallel upstream reachability
-    /// edges implied by the alias's `imports` payload and any
-    /// attribute chain past the bound name.
+    /// Emit edges implied by a use of `name`.
     ///
     /// `extra_chain` is the list of attribute segments past the bare
     /// name (`[]` for a bare-name use, `["bar", "f"]` for
-    /// `name.bar.f`). `bound_name` is the textual root of the use,
-    /// used to detect the `import M.Y.Z` no-asname case where the
-    /// bound name is just `M` but the import statement loaded `M.Y.Z`.
+    /// `name.bar.f`).
+    ///
+    /// For module-scope bindings: emit `owner → alias` (codemod
+    /// invariant), then parallel upstream reachability edges from
+    /// `alias_imports[idx]` if the binding is an import. For nested
+    /// imports there's no alias node — go straight to the parallel
+    /// edges, using the spec ty handed us.
     fn emit_name_use(&mut self, name: &ExprName, extra_chain: &[&str]) {
-        let Some(alias_idx) = self.find_local_binding(name) else {
-            return;
-        };
-        self.emit_edge(alias_idx);
-        let Some(spec) = self.alias_imports.get(&alias_idx).cloned() else {
-            // Local non-import binding; nothing upstream to follow.
-            return;
-        };
-        self.emit_upstream(&spec, name.id.as_str(), extra_chain);
+        match self.find_local_binding(name) {
+            Some(Resolution::Alias(alias_idx)) => {
+                self.emit_edge(alias_idx);
+                if let Some(spec) = self.alias_imports.get(&alias_idx).cloned() {
+                    self.emit_upstream(&spec, name.id.as_str(), extra_chain);
+                }
+            }
+            Some(Resolution::NestedImport { spec, bound_name }) => {
+                self.emit_upstream(&spec, &bound_name, extra_chain);
+            }
+            None => {}
+        }
     }
 
     fn emit_upstream(&mut self, spec: &ImportSpec, bound_name: &str, extra_chain: &[&str]) {
@@ -1252,6 +1308,99 @@ impl<'a, 'db> RefCollector<'a, 'db> {
             self.emit_edge(idx);
         }
     }
+
+    /// Handle `import X[.Y.Z][ as A]` inside a function/class body.
+    ///
+    /// No alias node is minted — the binding lives in a non-global
+    /// scope. We emit parallel upstream edges directly from `self.owner`
+    /// for each alias in the statement, simulating a `synthetic chain`
+    /// that matches the loading prefix so `emit_upstream` walks all
+    /// the way to the deepest loaded module rather than stopping at
+    /// the bound name's first segment (the bare-name use shortcut
+    /// that's correct for use sites but wrong for the import
+    /// statement itself).
+    fn emit_nested_import(&mut self, stmt: &ruff_python_ast::StmtImport) {
+        for alias in &stmt.names {
+            let dotted = alias.name.id.as_str();
+            let first_seg = dotted.split('.').next().unwrap_or(dotted);
+            let (bound_name, synthetic_chain): (&str, Vec<&str>) = match &alias.asname {
+                Some(asname) => (asname.id.as_str(), Vec::new()),
+                None => (first_seg, dotted.split('.').skip(1).collect()),
+            };
+            let spec = ImportSpec {
+                module: dotted.to_string(),
+                decl: None,
+                star: false,
+            };
+            self.emit_upstream(&spec, bound_name, &synthetic_chain);
+        }
+    }
+
+    /// Handle `from X import ...` inside a function/class body.
+    ///
+    /// Resolves the from-clause via ty (so relative imports get
+    /// their level dots converted to an absolute name), then walks
+    /// every alias. `*` imports fan out to every non-underscore decl
+    /// in the upstream module via `emit_nested_star`; explicit names
+    /// (with or without `as`) emit upstream edges through the same
+    /// `emit_upstream` path module-scope from-imports use.
+    fn emit_nested_import_from(&mut self, stmt: &ruff_python_ast::StmtImportFrom) {
+        let db = self.model.db();
+        let Ok(module_name) = ModuleName::from_import_statement(db, self.file, stmt) else {
+            return;
+        };
+        let module_str = module_name.as_str().to_string();
+        for alias in &stmt.names {
+            let name = alias.name.id.as_str();
+            if name == "*" {
+                self.emit_nested_star(&module_name);
+                continue;
+            }
+            let bound_name = match &alias.asname {
+                Some(asname) => asname.id.as_str(),
+                None => name,
+            };
+            let spec = ImportSpec {
+                module: module_str.clone(),
+                decl: Some(name.to_string()),
+                star: false,
+            };
+            self.emit_upstream(&spec, bound_name, &[]);
+        }
+    }
+
+    /// Fan a nested `from X import *` out to every non-underscore
+    /// decl in the upstream module, plus the module itself.
+    ///
+    /// Module-scope star imports use ty's `StarImport` definitions
+    /// (one per resolved name) and route through the per-alias-node
+    /// path; nested star imports have no per-name graph nodes to
+    /// mint, so we go straight to the upstream `live_decls`. The
+    /// underscore filter approximates the libcst pipeline's star
+    /// expansion, which respects PEP 8's "names starting with `_`
+    /// are not star-exported" rule (and `__all__` when present —
+    /// not modeled here yet, but no current test exercises that).
+    fn emit_nested_star(&mut self, module_name: &ModuleName) {
+        let db = self.model.db();
+        let Some(module) = resolve_module(db, self.file, module_name) else {
+            return;
+        };
+        let Some(target_file) = module.file(db) else {
+            return;
+        };
+        if let Some(&idx) = self.module_nodes.get(&target_file) {
+            self.emit_edge(idx);
+        }
+        let targets: Vec<usize> = self
+            .live_decls
+            .iter()
+            .filter(|((file, name), _)| *file == target_file && !name.starts_with('_'))
+            .map(|(_, &idx)| idx)
+            .collect();
+        for idx in targets {
+            self.emit_edge(idx);
+        }
+    }
 }
 
 /// Peel an attribute chain back to its `Name` root.
@@ -1306,6 +1455,19 @@ impl<'ast, 'db> Visitor<'ast> for RefCollector<'_, 'db> {
     }
 
     fn visit_stmt(&mut self, stmt: &'ast Stmt) {
+        if self.nested_context {
+            match stmt {
+                Stmt::Import(s) => {
+                    self.emit_nested_import(s);
+                    return;
+                }
+                Stmt::ImportFrom(s) => {
+                    self.emit_nested_import_from(s);
+                    return;
+                }
+                _ => {}
+            }
+        }
         walk_stmt(self, stmt);
     }
 }
