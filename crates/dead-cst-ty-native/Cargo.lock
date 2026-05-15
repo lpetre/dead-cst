@@ -331,8 +331,10 @@ name = "dead-cst-ty-native"
 version = "0.0.0"
 dependencies = [
  "pyo3",
+ "regex",
  "ruff_db",
  "ruff_python_ast",
+ "ruff_python_parser",
  "ruff_source_file",
  "ruff_text_size",
  "ty_module_resolver",
