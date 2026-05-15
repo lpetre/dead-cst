@@ -156,6 +156,27 @@ type DeclKey = (File, ScopedPlaceId, (u32, u32));
 
 type DeclIndex = HashMap<DeclKey, usize>;
 
+/// Cloneable snapshot of an alias's import payload.
+///
+/// Lives in `alias_imports` (alias_node_idx -> spec) so the reference
+/// collector can emit *parallel reachability edges* through an alias
+/// without holding a PyO3 reference. Mirrors `Import`'s three fields.
+#[derive(Clone, Debug)]
+struct ImportSpec {
+    module: String,
+    decl: Option<String>,
+    star: bool,
+}
+
+/// (upstream_file, local_decl_name) -> upstream decl node idx.
+///
+/// Populated during `ingest_decls` for every non-import, non-module
+/// node. The last write wins, so the entry tracks the *end-of-scope
+/// live* binding for any name that gets rebound during the module's
+/// body — matching how the libcst pipeline's trie only keeps the
+/// non-`SHADOWED` decl.
+type LiveDeclIndex = HashMap<(File, String), usize>;
+
 // ---------------------------------------------------------------------------
 // GraphBuilder + node interning
 // ---------------------------------------------------------------------------
@@ -294,6 +315,8 @@ impl Project {
         let mut builder = GraphBuilder::new();
         let mut global_index: DeclIndex = HashMap::new();
         let mut module_nodes: HashMap<File, usize> = HashMap::new();
+        let mut alias_imports: HashMap<usize, ImportSpec> = HashMap::new();
+        let mut live_decls: LiveDeclIndex = HashMap::new();
 
         let project_files: Vec<File> = (&self.db.project().files(&self.db)).into_iter().collect();
 
@@ -305,6 +328,8 @@ impl Project {
                 &mut builder,
                 &mut global_index,
                 &mut module_nodes,
+                &mut alias_imports,
+                &mut live_decls,
             )?;
         }
         for file in &project_files {
@@ -319,7 +344,15 @@ impl Project {
             )?;
         }
         for file in &project_files {
-            emit_reference_edges(&self.db, *file, &global_index, &module_nodes, &mut builder);
+            emit_reference_edges(
+                &self.db,
+                *file,
+                &global_index,
+                &module_nodes,
+                &alias_imports,
+                &live_decls,
+                &mut builder,
+            );
         }
 
         Ok(NativeGraph {
@@ -333,6 +366,7 @@ impl Project {
 // Phase 1: decl enumeration via ty's SemanticIndex
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn ingest_decls(
     py: Python<'_>,
     db: &ProjectDatabase,
@@ -340,6 +374,8 @@ fn ingest_decls(
     builder: &mut GraphBuilder,
     global_index: &mut DeclIndex,
     module_nodes: &mut HashMap<File, usize>,
+    alias_imports: &mut HashMap<usize, ImportSpec>,
+    live_decls: &mut LiveDeclIndex,
 ) -> PyResult<()> {
     let parsed = parsed_module(db, file).load(db);
     let source = source_text(db, file);
@@ -395,8 +431,20 @@ fn ingest_decls(
         let target_range = kind.target_range(&parsed);
         let (sl, sc, el, ec) = position(&line_index, &source, target_range);
 
-        let imports = if node_kind == "import" {
-            Some(Py::new(py, import_payload_for(kind, db, file, &parsed))?)
+        let import_spec = if node_kind == "import" {
+            Some(import_payload_for(kind, db, file, &parsed))
+        } else {
+            None
+        };
+        let imports = if let Some(spec) = &import_spec {
+            Some(Py::new(
+                py,
+                Import {
+                    module: spec.module.clone(),
+                    decl: spec.decl.clone(),
+                    star: spec.star,
+                },
+            )?)
         } else {
             None
         };
@@ -417,6 +465,14 @@ fn ingest_decls(
         )?;
         builder.add_edge(node_idx, module_idx, 0);
         global_index.insert((file, place_id, range_key(target_range)), node_idx);
+
+        if let Some(spec) = import_spec {
+            alias_imports.insert(node_idx, spec);
+        } else if node_kind != "module" {
+            // Last-write-wins so the map ends up with the end-of-scope
+            // live binding (mirrors libcst's `SHADOWED`-excluding trie).
+            live_decls.insert((file, local_name.clone()), node_idx);
+        }
     }
 
     Ok(())
@@ -446,11 +502,11 @@ fn import_payload_for<'db>(
     db: &'db dyn ProjectDb,
     file: File,
     parsed: &ParsedModuleRef,
-) -> Import {
+) -> ImportSpec {
     match kind {
         DefinitionKind::Import(k) => {
             let alias = k.alias(parsed);
-            Import {
+            ImportSpec {
                 module: alias.name.id.as_str().to_string(),
                 decl: None,
                 star: false,
@@ -458,7 +514,7 @@ fn import_payload_for<'db>(
         }
         DefinitionKind::ImportFrom(k) => {
             let alias = k.alias(parsed);
-            Import {
+            ImportSpec {
                 module: from_module_string(db, file, k.import(parsed)),
                 decl: Some(alias.name.id.as_str().to_string()),
                 star: false,
@@ -469,13 +525,13 @@ fn import_payload_for<'db>(
             // module string is the parent of that segment; ``decl`` is
             // the segment itself, mirroring the libcst convention for
             // ``from a.b import c`` where ``c`` is a submodule.
-            Import {
+            ImportSpec {
                 module: from_module_string(db, file, k.import(parsed)),
                 decl: Some(k.module(parsed).id.as_str().to_string()),
                 star: false,
             }
         }
-        DefinitionKind::StarImport(k) => Import {
+        DefinitionKind::StarImport(k) => ImportSpec {
             module: from_module_string(db, file, k.import(parsed)),
             decl: None,
             star: true,
@@ -560,6 +616,13 @@ fn emit_import_edges(
                 None => continue,
             };
 
+        let from_stmt = match kind {
+            DefinitionKind::ImportFrom(k) => Some(k.import(&parsed)),
+            DefinitionKind::ImportFromSubmodule(k) => Some(k.import(&parsed)),
+            DefinitionKind::StarImport(k) => Some(k.import(&parsed)),
+            _ => None,
+        };
+
         let target = match kind {
             DefinitionKind::Import(k) => resolve_import_target(
                 py,
@@ -603,6 +666,28 @@ fn emit_import_edges(
         };
         if let Some(target_idx) = target {
             builder.add_edge(alias_idx, target_idx, 0);
+        }
+
+        // Parallel reachability edge: when `from X import Y` resolved
+        // to a *decl* (Y in module X), also link the alias to the
+        // upstream module X so reachability can see the file's
+        // module-level dependency. Skip when the target is itself a
+        // module (the `from X import sub` case where `sub` is a
+        // submodule of X) — the submodule's parent-module edge
+        // already keeps X alive.
+        if let Some(stmt) = from_stmt {
+            let target_is_module = target
+                .map(|idx| module_nodes.values().any(|&m| m == idx))
+                .unwrap_or(false);
+            if !target_is_module {
+                if let Some(upstream_module_idx) =
+                    from_import_module_node(py, db, file, stmt, builder, module_nodes)?
+                {
+                    if Some(upstream_module_idx) != target && upstream_module_idx != alias_idx {
+                        builder.add_edge(alias_idx, upstream_module_idx, 0);
+                    }
+                }
+            }
         }
     }
     Ok(())
@@ -705,6 +790,37 @@ fn resolve_from_imported(
     )?))
 }
 
+/// Resolve the upstream module of a `from <stmt> import ...` and
+/// return (or mint) its module node.
+///
+/// Returns `Ok(None)` when ty's `from_import_statement` cannot resolve
+/// the target (invalid syntax, too many leading dots, missing file).
+fn from_import_module_node(
+    py: Python<'_>,
+    db: &ProjectDatabase,
+    importing_file: File,
+    stmt: &ruff_python_ast::StmtImportFrom,
+    builder: &mut GraphBuilder,
+    module_nodes: &mut HashMap<File, usize>,
+) -> PyResult<Option<usize>> {
+    let Ok(module_name) = ModuleName::from_import_statement(db, importing_file, stmt) else {
+        return Ok(None);
+    };
+    let Some(module) = resolve_module(db, importing_file, &module_name) else {
+        return Ok(None);
+    };
+    let Some(target_file) = module.file(db) else {
+        return Ok(None);
+    };
+    Ok(Some(mint_module_node(
+        py,
+        db,
+        target_file,
+        builder,
+        module_nodes,
+    )?))
+}
+
 fn mint_module_node(
     py: Python<'_>,
     db: &ProjectDatabase,
@@ -743,11 +859,14 @@ fn mint_module_node(
 // Phase 3: same-file Name→decl reference edges
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn emit_reference_edges(
     db: &ProjectDatabase,
     file: File,
     global_index: &DeclIndex,
     module_nodes: &HashMap<File, usize>,
+    alias_imports: &HashMap<usize, ImportSpec>,
+    live_decls: &LiveDeclIndex,
     builder: &mut GraphBuilder,
 ) {
     let Some(&module_idx) = module_nodes.get(&file) else {
@@ -775,7 +894,16 @@ fn emit_reference_edges(
             continue;
         };
 
-        let mut coll = RefCollector::new(owner_idx, &model, file, &parsed, global_index);
+        let mut coll = RefCollector::new(
+            owner_idx,
+            &model,
+            file,
+            &parsed,
+            global_index,
+            module_nodes,
+            alias_imports,
+            live_decls,
+        );
         walk_owned(kind, &parsed, &mut coll);
         coll.flush(builder);
     }
@@ -786,7 +914,16 @@ fn emit_reference_edges(
         if stmt_creates_top_level_definition(stmt) {
             continue;
         }
-        let mut coll = RefCollector::new(module_idx, &model, file, &parsed, global_index);
+        let mut coll = RefCollector::new(
+            module_idx,
+            &model,
+            file,
+            &parsed,
+            global_index,
+            module_nodes,
+            alias_imports,
+            live_decls,
+        );
         coll.visit_stmt(stmt);
         coll.flush(builder);
     }
@@ -854,28 +991,36 @@ fn walk_owned(kind: &DefinitionKind<'_>, parsed: &ParsedModuleRef, v: &mut RefCo
 /// Walks an expression / body and records every Name reference,
 /// attributing to a single owner decl.
 ///
-/// Resolution is delegated to ty's `definitions_for_name` with
-/// `PreserveAliases`: imported-name uses land on the local import
-/// node, not on the cross-file target (Principle 2 — edges flow
-/// through the local decl). Shadow handling falls out of ty's
-/// flow-sensitive use-def chain (Principle 3 — each use lands on its
-/// reaching def, never on all same-name siblings).
+/// Per Principle 2, every use of an imported name emits an edge to
+/// the local alias *and* parallel reachability edges to whatever the
+/// alias resolves to upstream. Bare-Name uses (`f()`) emit edges to
+/// the upstream module/decl directly. Attribute chains on aliased
+/// modules (`foo.bar.f()`) are walked segment by segment, emitting
+/// edges to each module / decl reached. Shadow handling falls out of
+/// ty's flow-sensitive use-def chain (Principle 3).
 struct RefCollector<'a, 'db> {
     owner: usize,
     model: &'a SemanticModel<'db>,
     file: File,
     parsed: &'a ParsedModuleRef,
     global_index: &'a DeclIndex,
+    module_nodes: &'a HashMap<File, usize>,
+    alias_imports: &'a HashMap<usize, ImportSpec>,
+    live_decls: &'a LiveDeclIndex,
     edges: HashSet<(usize, usize)>,
 }
 
 impl<'a, 'db> RefCollector<'a, 'db> {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         owner: usize,
         model: &'a SemanticModel<'db>,
         file: File,
         parsed: &'a ParsedModuleRef,
         global_index: &'a DeclIndex,
+        module_nodes: &'a HashMap<File, usize>,
+        alias_imports: &'a HashMap<usize, ImportSpec>,
+        live_decls: &'a LiveDeclIndex,
     ) -> Self {
         Self {
             owner,
@@ -883,6 +1028,9 @@ impl<'a, 'db> RefCollector<'a, 'db> {
             file,
             parsed,
             global_index,
+            module_nodes,
+            alias_imports,
+            live_decls,
             edges: HashSet::new(),
         }
     }
@@ -893,36 +1041,37 @@ impl<'a, 'db> RefCollector<'a, 'db> {
         }
     }
 
-    fn emit_name(&mut self, name: &ExprName) {
-        // Walk the use's scope chain looking for *local* bindings of
-        // ``name``. We deliberately do NOT call
-        // ``definitions_for_name`` here -- it always chases bare
-        // ``from X import y`` to the upstream definition in ``X``, and
-        // Principle 2 requires use edges to terminate at the local
-        // alias node. The scope walk stops at the first scope that
-        // binds the name; bindings inside that scope are emitted as
-        // edges (ty's flow tracking already filters reachable ones).
+    fn emit_edge(&mut self, dst: usize) {
+        if dst != self.owner {
+            self.edges.insert((self.owner, dst));
+        }
+    }
+
+    /// Walk the use's scope chain and return the local alias / decl
+    /// node bound to `name`, if any. Stops at the first scope that
+    /// binds the name; ty's flow-sensitive `end_of_scope_symbol_bindings`
+    /// filters to the reaching def (Principle 3).
+    ///
+    /// Deliberately does NOT use `definitions_for_name`: that walks
+    /// past `from X import y` to the upstream definition in `X`, but
+    /// Principle 2 requires the alias edge to terminate locally.
+    fn find_local_binding(&self, name: &ExprName) -> Option<usize> {
         let db = self.model.db();
         let index = semantic_index(db, self.file);
-        let Some(file_scope) = self.model.scope(name.into()) else {
-            return;
-        };
-
+        let file_scope = self.model.scope(name.into())?;
+        // Walk outward through visible scopes until we find one that
+        // *binds* `name` (not merely lists it in its place table — a
+        // free variable can show up there without any local binding,
+        // and in that case we want to keep walking up to the actual
+        // definer). The first binding scope wins; ty's
+        // `end_of_scope_symbol_bindings` gives us the reaching def
+        // within that scope.
         for (scope_id, _scope) in index.visible_ancestor_scopes(file_scope) {
             let place_table = index.place_table(scope_id);
             let Some(symbol_id) = place_table.symbol_id(name.id.as_str()) else {
                 continue;
             };
             let use_def_map = index.use_def_map(scope_id);
-            // ``end_of_scope_symbol_bindings`` is flow-sensitive: it
-            // returns only bindings that *reach* the end of the scope
-            // (Principle 3 — shadowed-earlier defs that have been
-            // overwritten by end-of-scope are excluded). For free
-            // references in nested functions/classes this is the
-            // right query because the function body runs after the
-            // enclosing module finishes loading, by which point the
-            // module's bindings are at their end-of-scope state.
-            let mut matched = false;
             for binding in use_def_map.end_of_scope_symbol_bindings(symbol_id) {
                 let Some(def) = binding.binding.definition() else {
                     continue;
@@ -935,26 +1084,223 @@ impl<'a, 'db> RefCollector<'a, 'db> {
                     def.place(db),
                     range_key(def.kind(db).target_range(self.parsed)),
                 );
-                let Some(&dst) = self.global_index.get(&key) else {
-                    continue;
-                };
-                if dst != self.owner {
-                    self.edges.insert((self.owner, dst));
+                if let Some(&idx) = self.global_index.get(&key) {
+                    return Some(idx);
                 }
-                matched = true;
-            }
-            if matched {
-                break;
             }
         }
+        None
     }
+
+    /// Emit `owner → alias` and the parallel upstream reachability
+    /// edges implied by the alias's `imports` payload and any
+    /// attribute chain past the bound name.
+    ///
+    /// `extra_chain` is the list of attribute segments past the bare
+    /// name (`[]` for a bare-name use, `["bar", "f"]` for
+    /// `name.bar.f`). `bound_name` is the textual root of the use,
+    /// used to detect the `import M.Y.Z` no-asname case where the
+    /// bound name is just `M` but the import statement loaded `M.Y.Z`.
+    fn emit_name_use(&mut self, name: &ExprName, extra_chain: &[&str]) {
+        let Some(alias_idx) = self.find_local_binding(name) else {
+            return;
+        };
+        self.emit_edge(alias_idx);
+        let Some(spec) = self.alias_imports.get(&alias_idx).cloned() else {
+            // Local non-import binding; nothing upstream to follow.
+            return;
+        };
+        self.emit_upstream(&spec, name.id.as_str(), extra_chain);
+    }
+
+    fn emit_upstream(&mut self, spec: &ImportSpec, bound_name: &str, extra_chain: &[&str]) {
+        if spec.module.is_empty() {
+            return;
+        }
+
+        // Decide the "loading target" — the absolute dotted module
+        // the alias makes available — plus any extra prefix segments
+        // the import statement walked deeper than the bound name.
+        //
+        // `import M[.Y.Z]` no-asname: bound name matches `M` (first
+        //   segment). The runtime object of `M` is just the package
+        //   `M`, but the import statement *loaded* `M.Y.Z`. The
+        //   user's attribute chain typically re-traverses `.Y.Z`
+        //   before walking beyond; we peel that prefix off so the
+        //   walk continues from the deepest loaded module.
+        // `import M[.Y.Z] as A`: bound name is `A`; loading target
+        //   is `M.Y.Z` and there's no prefix to strip.
+        // `from P import D[as A]`: try `P.D` as submodule; if it
+        //   resolves the alias represents that submodule, else it
+        //   binds the decl `D` in `P`.
+        // `from P import *` (per-name synthetic): bound name is the
+        //   name brought in; alias binds either `P.<name>` (submodule)
+        //   or decl `<name>` in `P`.
+        let db = self.model.db();
+        let module_first_seg = spec.module.split('.').next().unwrap_or("").to_string();
+
+        let mut adjusted_chain: Vec<&str> = extra_chain.to_vec();
+        let loading_target: String;
+        let mut decl_tail: Option<String> = None;
+
+        if spec.star {
+            // Star reexport: alias's `module` is the source package and
+            // `bound_name` is one of the names it exports. Resolve as
+            // either submodule `module.bound_name` or decl `bound_name`
+            // in `module`.
+            let candidate = format!("{}.{}", spec.module, bound_name);
+            if module_name_resolves(&candidate, self.file, db) {
+                loading_target = candidate;
+            } else {
+                loading_target = spec.module.clone();
+                decl_tail = Some(bound_name.to_string());
+            }
+        } else {
+            match &spec.decl {
+                Some(decl) => {
+                    let candidate = format!("{}.{}", spec.module, decl);
+                    if module_name_resolves(&candidate, self.file, db) {
+                        loading_target = candidate;
+                    } else {
+                        loading_target = spec.module.clone();
+                        decl_tail = Some(decl.clone());
+                    }
+                }
+                None => {
+                    let no_asname = bound_name == module_first_seg;
+                    if no_asname && spec.module != module_first_seg {
+                        // `import M.Y.Z` no-asname: peel the loading
+                        // prefix off the chain before walking past.
+                        let loading_extras: Vec<&str> = spec.module.split('.').skip(1).collect();
+                        let n = loading_extras.len();
+                        let prefix_matches = adjusted_chain.len() >= n
+                            && adjusted_chain
+                                .iter()
+                                .take(n)
+                                .zip(&loading_extras)
+                                .all(|(a, b)| *a == *b);
+                        if prefix_matches {
+                            adjusted_chain.drain(..n);
+                            loading_target = spec.module.clone();
+                        } else {
+                            // User reached for something off the bare
+                            // `M` module (`import M.Y.Z; M.other`).
+                            // Walk from `M`, not `M.Y.Z`.
+                            loading_target = module_first_seg;
+                        }
+                    } else {
+                        loading_target = spec.module.clone();
+                    }
+                }
+            }
+        }
+
+        // Resolve the initial loading target to a project file.
+        let Some(start_mn) = ModuleName::new(&loading_target) else {
+            return;
+        };
+        let Some(start_module) = resolve_module(db, self.file, &start_mn) else {
+            return;
+        };
+        let Some(start_file) = start_module.file(db) else {
+            return;
+        };
+
+        // Decl-style alias: emit edges to the upstream module and the
+        // decl inside it, then stop. Attribute access past a decl is
+        // field access on the decl's value, which we don't model.
+        if let Some(decl_name) = decl_tail {
+            if let Some(&idx) = self.module_nodes.get(&start_file) {
+                self.emit_edge(idx);
+            }
+            if let Some(&idx) = self.live_decls.get(&(start_file, decl_name)) {
+                self.emit_edge(idx);
+            }
+            return;
+        }
+
+        // Module-style alias: walk the chain submodule-by-submodule
+        // and record the *deepest* module reached plus any decl the
+        // chain ends on. We emit exactly one module edge (the deepest)
+        // and at most one decl edge — mirroring the libcst stitcher's
+        // canonicalization rule that pushes decl parts into the module
+        // as long as they resolve as submodules.
+        let mut current_file = start_file;
+        let mut current_path = loading_target.clone();
+        let mut terminal_decl_idx: Option<usize> = None;
+        for seg in &adjusted_chain {
+            let candidate = format!("{current_path}.{seg}");
+            let submodule_file = ModuleName::new(&candidate)
+                .and_then(|mn| resolve_module(db, self.file, &mn))
+                .and_then(|m| m.file(db));
+            if let Some(sub_file) = submodule_file {
+                current_file = sub_file;
+                current_path = candidate;
+                continue;
+            }
+            terminal_decl_idx = self
+                .live_decls
+                .get(&(current_file, (*seg).to_string()))
+                .copied();
+            break;
+        }
+
+        if let Some(&idx) = self.module_nodes.get(&current_file) {
+            self.emit_edge(idx);
+        }
+        if let Some(idx) = terminal_decl_idx {
+            self.emit_edge(idx);
+        }
+    }
+}
+
+/// Peel an attribute chain back to its `Name` root.
+///
+/// Returns `Some((root, segments))` when `expr` is `Name`, `Name.s1`,
+/// `Name.s1.s2`, ... — i.e. one or more attribute accesses on a bare
+/// name. Returns `None` when the chain bottoms out at anything else
+/// (a call result, subscript, attribute of attribute of a non-Name, …).
+fn collapse_attribute_chain<'ast>(expr: &'ast Expr) -> Option<(&'ast ExprName, Vec<&'ast str>)> {
+    let mut segments: Vec<&str> = Vec::new();
+    let mut current = expr;
+    loop {
+        match current {
+            Expr::Attribute(attr) => {
+                segments.push(attr.attr.as_str());
+                current = &attr.value;
+            }
+            Expr::Name(n) => {
+                segments.reverse();
+                return Some((n, segments));
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// True iff `dotted` resolves to *some* module (project, stdlib, or
+/// third-party) as seen from `anchor`. Used to disambiguate
+/// "submodule" vs "decl in module" for `from X import Y`.
+fn module_name_resolves(dotted: &str, anchor: File, db: &dyn ty_python_semantic::Db) -> bool {
+    ModuleName::new(dotted)
+        .and_then(|n| resolve_module(db, anchor, &n))
+        .is_some()
 }
 
 impl<'ast, 'db> Visitor<'ast> for RefCollector<'_, 'db> {
     fn visit_expr(&mut self, expr: &'ast Expr) {
         if let Expr::Name(n) = expr {
-            self.emit_name(n);
+            self.emit_name_use(n, &[]);
             return;
+        }
+        if matches!(expr, Expr::Attribute(_)) {
+            if let Some((root, segments)) = collapse_attribute_chain(expr) {
+                self.emit_name_use(root, &segments);
+                // Don't recurse into the chain — every Name in it has
+                // been handled and an attribute access has no other
+                // walk-worthy children.
+                return;
+            }
         }
         walk_expr(self, expr);
     }

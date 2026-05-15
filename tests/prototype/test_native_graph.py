@@ -100,9 +100,18 @@ def test_from_import_binds_local_decl(project_factory):
     )
     g = proj.build()
     edges = _edges(g)
-    assert "pkg.mod.g -> pkg.other.g" in edges  # alias → upstream
-    assert "pkg.mod.use -> pkg.mod.g" in edges  # use → local alias
-    assert "pkg.mod.use -> pkg.other.g" not in edges  # never skips local
+    # Codemod invariant: every use of an imported name emits an edge
+    # to the local alias.
+    assert "pkg.mod.use -> pkg.mod.g" in edges
+    # Alias edges to the upstream module / decl.
+    assert "pkg.mod.g -> pkg.other.g" in edges
+    assert "pkg.mod.g -> pkg.other" in edges
+    # Parallel reachability edges: the use *also* links directly to
+    # the upstream decl + its enclosing module so reachability can
+    # see what each call site actually depends on. The alias edge
+    # above is what keeps `pkg.mod.g` from being marked unused.
+    assert "pkg.mod.use -> pkg.other.g" in edges
+    assert "pkg.mod.use -> pkg.other" in edges
 
 
 def test_dotted_import_binds_first_segment(project_factory):
