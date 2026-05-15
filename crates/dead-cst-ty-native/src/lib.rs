@@ -1,126 +1,102 @@
-//! Experimental ty-backed native parser for dead-cst.
+//! ty-backed native graph builder for dead-cst.
 //!
-//! Exposes a `Project` class that owns a ty `ProjectDatabase`. Unlike
-//! `ty check`, this prototype does NOT discover a `pyproject.toml`:
-//! the resolver -- whatever produces dead-cst's `Package` tuples
-//! today -- is responsible for feeding the project layout in
-//! directly. This mirrors dead-cst's `Analysis(project_root,
-//! resolver=...)` shape: callers retain control of which paths are
-//! first-party, where the venv lives, and which Python version to
-//! target.
+//! Architecture is governed by the crate's `CLAUDE.md`: ty does every
+//! piece of Python semantics, ruff is only used where ty hasn't surfaced
+//! the structure we need, and there is **no per-file cache** (ty's
+//! Salsa db is the cache).
 //!
-//! The native API is structured around packages:
-//!   * `PackageSpec(name, path, deps)` describes one package and
-//!     its dep relationships.
-//!   * `Project.package_order()` returns a toposort of package names
-//!     (deps before dependents).
-//!   * `Project.build_package_graph(name)` walks every `.py` file
-//!     in the package's path and returns a single deduplicated
-//!     `NativeGraph` envelope. Plugins consume this on the Python
-//!     side and add their own nodes / edges through a context.
+//! The pipeline is one method (`Project.build()`) returning one
+//! project-wide `NativeGraph`:
 //!
-//! `build_file_graph(path, module_fqname)` is retained for
-//! single-file probing during development.
+//! 1. **Phase 1 — decls**. For every project file, iterate every
+//!    binding in the file's global scope via
+//!    `UseDefMap::all_definitions_with_usage`, minting a node per
+//!    binding (including each name brought in by `from foo import *`).
+//!    Each node lands in a global `(File, target_range) → node_idx`
+//!    index so cross-file edges can find it later.
+//! 2. **Phase 2 — chain**. For every module node, emit the submodule
+//!    edge to its parent. For every import-kind binding, resolve the
+//!    upstream target via `ty_module_resolver::resolve_module` and
+//!    emit `alias_node → upstream_node`; lazily mint a module-only
+//!    node for any target outside the project (stdlib / site-packages).
+//! 3. **Phase 3 — references**. For every Definition that owns an
+//!    expression (function body, class body, assignment value,
+//!    annotation), walk the contained `Name`s and resolve each to its
+//!    reaching def via `visible_ancestor_scopes` +
+//!    `end_of_scope_symbol_bindings` (Principle 2 — the local alias
+//!    is the target, not the upstream definition). Module-level
+//!    non-definition statements attribute to the module.
 
-// pyo3 0.22's `#[pymethods]` macro emits `.into()` on already-`PyErr`
-// error paths, which clippy 1.95 flags as `useless_conversion` against
-// the user-written function signature. Suppress crate-wide; first-party
-// useless conversions are still caught by inspection at PR time.
 #![allow(clippy::useless_conversion)]
 
 use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use pyo3::exceptions::{PyOSError, PyValueError};
 use pyo3::prelude::*;
-use ruff_db::files::{system_path_to_file, File};
-use ruff_db::parsed::parsed_module;
-use ruff_db::source::source_text;
+use ruff_db::files::{File, FilePath};
+use ruff_db::parsed::{parsed_module, ParsedModuleRef};
+use ruff_db::source::{line_index, source_text};
 use ruff_db::system::{OsSystem, SystemPath, SystemPathBuf};
 use ruff_python_ast::visitor::{walk_expr, walk_stmt, Visitor};
 use ruff_python_ast::{Expr, ExprName, Stmt};
 use ruff_source_file::LineIndex;
-use ruff_text_size::{Ranged, TextRange};
+use ruff_text_size::TextRange;
+use ty_module_resolver::{file_to_module, resolve_module, ModuleName};
 use ty_project::metadata::options::{EnvironmentOptions, Options};
 use ty_project::metadata::python_version::SupportedPythonVersion;
 use ty_project::metadata::value::{RangedValue, RelativePathBuf};
-use ty_project::{ProjectDatabase, ProjectMetadata};
+use ty_project::{Db as ProjectDb, ProjectDatabase, ProjectMetadata};
+use ty_python_core::definition::{DefinitionKind, DefinitionState};
+use ty_python_core::place::{PlaceExprRef, ScopedPlaceId};
 use ty_python_core::program::UseDefaultStrategy;
 use ty_python_core::scope::FileScopeId;
-use ty_python_semantic::SemanticModel;
-use ty_python_semantic::{definitions_for_name, ImportAliasResolution};
+use ty_python_core::semantic_index;
+use ty_python_semantic::{
+    definitions_for_imported_symbol, ImportAliasResolution, ResolvedDefinition, SemanticModel,
+};
 
-/// Description of one package the resolver discovered.
+// ---------------------------------------------------------------------------
+// Public Python data classes
+// ---------------------------------------------------------------------------
+
+/// Raw record of one cross-file import reference, attached to a
+/// `kind="import"` node. Mirrors `dead_cst.graph.Import`.
 ///
-/// `path` is the package's root directory; it can be absolute or
-/// relative to the project root. `deps` lists other package names
-/// this one depends on -- used to compute the analysis order.
+/// `module` is the import's *absolute* dotted target (relative dots
+/// are resolved by ty before this field is populated). `decl` is the
+/// from-style imported name (`None` for plain `import` and for the
+/// per-name nodes minted from `from X import *`). `star` flags the
+/// implicit-from-star case.
 #[pyclass(get_all, frozen)]
 #[derive(Clone)]
-struct PackageSpec {
-    name: String,
-    path: String,
-    deps: Vec<String>,
+struct Import {
+    module: String,
+    decl: Option<String>,
+    star: bool,
 }
 
 #[pymethods]
-impl PackageSpec {
+impl Import {
     #[new]
-    #[pyo3(signature = (name, path, deps = None))]
-    fn new(name: String, path: String, deps: Option<Vec<String>>) -> Self {
-        Self {
-            name,
-            path,
-            deps: deps.unwrap_or_default(),
-        }
+    #[pyo3(signature = (module, decl = None, star = false))]
+    fn new(module: String, decl: Option<String>, star: bool) -> Self {
+        Self { module, decl, star }
     }
 
     fn __repr__(&self) -> String {
         format!(
-            "PackageSpec(name={:?}, path={:?}, deps={:?})",
-            self.name, self.path, self.deps,
-        )
-    }
-}
-
-/// Top-level declaration with libcst-compatible position info.
-///
-/// ``target_range`` is the source location of the bare name being
-/// defined -- ``def <here>:`` / ``class <here>:`` / the LHS ``Name``
-/// of an assignment. It matches ty's ``Definition::target_range``
-/// (a.k.a. ``focus_range``) so that consumers can look up the decl
-/// from a definition handle returned by ty without rebuilding any
-/// node-to-AST mapping.
-#[pyclass(get_all, frozen)]
-struct Decl {
-    name: String,
-    kind: &'static str,
-    start_line: usize,
-    start_column: usize,
-    end_line: usize,
-    end_column: usize,
-    target_start: u32,
-    target_end: u32,
-}
-
-#[pymethods]
-impl Decl {
-    fn __repr__(&self) -> String {
-        format!(
-            "Decl(name={:?}, kind={:?}, start=({}, {}), end=({}, {}))",
-            self.name,
-            self.kind,
-            self.start_line,
-            self.start_column,
-            self.end_line,
-            self.end_column,
+            "Import(module={:?}, decl={:?}, star={})",
+            self.module, self.decl, self.star,
         )
     }
 }
 
 /// A single node in a `NativeGraph`.
+///
+/// `imports` is populated for `kind="import"` nodes only (one per
+/// alias, plus one per name brought in by `from X import *`). All
+/// other kinds carry `None`.
 #[pyclass(get_all, frozen)]
 struct NativeNode {
     fqname: String,
@@ -131,6 +107,7 @@ struct NativeNode {
     end_line: usize,
     end_column: usize,
     flags: u32,
+    imports: Option<Py<Import>>,
 }
 
 #[pymethods]
@@ -150,17 +127,9 @@ impl NativeNode {
     }
 }
 
-/// One graph contribution, packed for one FFI hop.
-///
-/// `nodes` and `edges` are unique within the envelope (deduplicated
-/// in Rust at build time). `package_name` identifies which package
-/// produced it; for the per-file `build_file_graph` shape this is
-/// empty.
+/// One project-wide graph contribution, packed for one FFI hop.
 #[pyclass(get_all, frozen)]
 struct NativeGraph {
-    package_name: String,
-    module_fqname: String,
-    file_path: String,
     nodes: Vec<Py<NativeNode>>,
     edges: Vec<(usize, usize, u32)>,
 }
@@ -169,16 +138,33 @@ struct NativeGraph {
 impl NativeGraph {
     fn __repr__(&self) -> String {
         format!(
-            "NativeGraph(package_name={:?}, module_fqname={:?}, file_path={:?}, nodes={}, edges={})",
-            self.package_name,
-            self.module_fqname,
-            self.file_path,
+            "NativeGraph(nodes={}, edges={})",
             self.nodes.len(),
             self.edges.len(),
         )
     }
 }
 
+/// Key into the cross-file decl lookup.
+///
+/// `target_range` alone is ambiguous for star imports — every name
+/// brought in by one `from foo import *` shares the same `*` alias
+/// range. Including the bound `place_id` disambiguates star bindings
+/// while still distinguishing two `def f` redefinitions by their
+/// distinct target ranges.
+type DeclKey = (File, ScopedPlaceId, (u32, u32));
+
+type DeclIndex = HashMap<DeclKey, usize>;
+
+// ---------------------------------------------------------------------------
+// GraphBuilder + node interning
+// ---------------------------------------------------------------------------
+
+/// Positional identity for a node.
+///
+/// Per `CLAUDE.md` principle 3, `flags` is deliberately *not* part of
+/// the key: two nodes for the same `(fqname, kind, path, position)` are
+/// the same node regardless of which path computed their flags.
 #[derive(Hash, Eq, PartialEq, Clone)]
 struct NodeKey {
     fqname: String,
@@ -188,7 +174,6 @@ struct NodeKey {
     start_column: usize,
     end_line: usize,
     end_column: usize,
-    flags: u32,
 }
 
 struct GraphBuilder {
@@ -217,7 +202,6 @@ impl GraphBuilder {
             start_column: node.start_column,
             end_line: node.end_line,
             end_column: node.end_column,
-            flags: node.flags,
         };
         if let Some(&idx) = self.node_index.get(&key) {
             return Ok(idx);
@@ -236,13 +220,14 @@ impl GraphBuilder {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Project
+// ---------------------------------------------------------------------------
+
 /// A ty-backed analysis project with explicitly-injected configuration.
 #[pyclass(unsendable)]
 struct Project {
     db: ProjectDatabase,
-    root: SystemPathBuf,
-    packages: Vec<PackageSpec>,
-    packages_by_name: HashMap<String, usize>,
 }
 
 #[pymethods]
@@ -251,7 +236,6 @@ impl Project {
     #[pyo3(signature = (
         root,
         *,
-        packages = None,
         src_roots = None,
         extra_paths = None,
         python_env = None,
@@ -260,7 +244,6 @@ impl Project {
     ))]
     fn new(
         root: &str,
-        packages: Option<Vec<PackageSpec>>,
         src_roots: Option<Vec<String>>,
         extra_paths: Option<Vec<String>>,
         python_env: Option<&str>,
@@ -301,615 +284,606 @@ impl Project {
         })?;
         let system = OsSystem::new(cwd);
 
-        let db = ProjectDatabase::use_defaults(metadata, system);
-
-        let packages = packages.unwrap_or_default();
-        let mut packages_by_name: HashMap<String, usize> = HashMap::new();
-        for (i, pkg) in packages.iter().enumerate() {
-            if packages_by_name.insert(pkg.name.clone(), i).is_some() {
-                return Err(PyValueError::new_err(format!(
-                    "duplicate package name: {:?}",
-                    pkg.name
-                )));
-            }
-        }
-        for pkg in &packages {
-            for dep in &pkg.deps {
-                if !packages_by_name.contains_key(dep) {
-                    return Err(PyValueError::new_err(format!(
-                        "package {:?} declares unknown dep {:?}",
-                        pkg.name, dep
-                    )));
-                }
-            }
-        }
-
         Ok(Self {
-            db,
-            root,
-            packages,
-            packages_by_name,
+            db: ProjectDatabase::use_defaults(metadata, system),
         })
     }
 
-    /// The packages this project was configured with (read-only view).
-    fn packages(&self) -> Vec<PackageSpec> {
-        self.packages.clone()
-    }
-
-    /// Return package names in toposort order (deps before dependents).
-    ///
-    /// Errors if a cycle is present. Unknown dep references are caught
-    /// at `Project` construction, so this only fails on cycles.
-    fn package_order(&self) -> PyResult<Vec<String>> {
-        let n = self.packages.len();
-        let mut in_degree: Vec<usize> = vec![0; n];
-        let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); n];
-
-        for (i, pkg) in self.packages.iter().enumerate() {
-            in_degree[i] = pkg.deps.len();
-            for dep in &pkg.deps {
-                let dep_idx = self.packages_by_name[dep];
-                dependents[dep_idx].push(i);
-            }
-        }
-
-        let mut queue: Vec<usize> = (0..n).filter(|&i| in_degree[i] == 0).collect();
-        let mut result: Vec<String> = Vec::with_capacity(n);
-
-        while let Some(i) = queue.pop() {
-            result.push(self.packages[i].name.clone());
-            for &j in &dependents[i] {
-                in_degree[j] -= 1;
-                if in_degree[j] == 0 {
-                    queue.push(j);
-                }
-            }
-        }
-
-        if result.len() != n {
-            let unresolved: Vec<&str> = self
-                .packages
-                .iter()
-                .enumerate()
-                .filter(|&(i, _)| in_degree[i] > 0)
-                .map(|(_, pkg)| pkg.name.as_str())
-                .collect();
-            return Err(PyValueError::new_err(format!(
-                "package dep cycle involving: {unresolved:?}"
-            )));
-        }
-        Ok(result)
-    }
-
-    /// Return the top-level declarations of one file (debug helper).
-    fn extract_top_level_decls(&self, path: &str) -> PyResult<Vec<Decl>> {
-        let path = SystemPath::new(path);
-        let file = system_path_to_file(&self.db, path)
-            .map_err(|e| PyOSError::new_err(format!("cannot open {path}: {e:?}")))?;
-        let parsed = parsed_module(&self.db, file).load(&self.db);
-        let source = source_text(&self.db, file);
-        let index = LineIndex::from_source_text(&source);
-        let mut decls: Vec<Decl> = Vec::new();
-        for stmt in &parsed.syntax().body {
-            collect_top_level(stmt, &source, &index, &mut decls);
-        }
-        Ok(decls)
-    }
-
-    /// Build a graph for one file (development / debug shape).
-    ///
-    /// For real per-package processing, prefer `build_package_graph`.
-    fn build_file_graph(
-        &self,
-        py: Python<'_>,
-        path: &str,
-        module_fqname: &str,
-    ) -> PyResult<NativeGraph> {
+    /// Build the project-wide symbol graph.
+    fn build(&self, py: Python<'_>) -> PyResult<NativeGraph> {
         let mut builder = GraphBuilder::new();
-        ingest_file(py, &self.db, path, module_fqname, &mut builder)?;
-        Ok(NativeGraph {
-            package_name: String::new(),
-            module_fqname: module_fqname.to_string(),
-            file_path: path.to_string(),
-            nodes: builder.nodes,
-            edges: builder.edges,
-        })
-    }
+        let mut global_index: DeclIndex = HashMap::new();
+        let mut module_nodes: HashMap<File, usize> = HashMap::new();
 
-    /// Build the graph contribution for one package.
-    ///
-    /// Walks every `.py` file under the package's path, ingesting
-    /// each into a shared `GraphBuilder`. The resulting `NativeGraph`
-    /// is deduplicated across all files in the package -- the
-    /// in-package module + decl nodes appear at most once.
-    ///
-    /// `file_path` on the returned envelope is empty (the package
-    /// spans many files; each node carries its own `path` field).
-    fn build_package_graph(&self, py: Python<'_>, name: &str) -> PyResult<NativeGraph> {
-        let idx = self
-            .packages_by_name
-            .get(name)
-            .copied()
-            .ok_or_else(|| PyValueError::new_err(format!("unknown package: {name:?}")))?;
-        let package = &self.packages[idx];
-        let pkg_abs = absolute_package_path(&self.root, &package.path);
+        let project_files: Vec<File> = (&self.db.project().files(&self.db)).into_iter().collect();
 
-        let mut builder = GraphBuilder::new();
-        let mut files = Vec::new();
-        collect_py_files(&pkg_abs, &mut files)
-            .map_err(|e| PyOSError::new_err(format!("walking {pkg_abs:?}: {e}")))?;
-        files.sort();
-
-        for file_abs in files {
-            let module_fqname = derive_module_fqname(&file_abs, &pkg_abs, &package.name);
-            let file_str = file_abs.to_string_lossy().into_owned();
-            ingest_file(py, &self.db, &file_str, &module_fqname, &mut builder)?;
+        for file in &project_files {
+            ingest_decls(
+                py,
+                &self.db,
+                *file,
+                &mut builder,
+                &mut global_index,
+                &mut module_nodes,
+            )?;
+        }
+        for file in &project_files {
+            emit_module_hierarchy(&self.db, *file, &module_nodes, &mut builder);
+            emit_import_edges(
+                py,
+                &self.db,
+                *file,
+                &mut builder,
+                &mut global_index,
+                &mut module_nodes,
+            )?;
+        }
+        for file in &project_files {
+            emit_reference_edges(&self.db, *file, &global_index, &module_nodes, &mut builder);
         }
 
         Ok(NativeGraph {
-            package_name: package.name.clone(),
-            module_fqname: String::new(),
-            file_path: String::new(),
             nodes: builder.nodes,
             edges: builder.edges,
         })
     }
 }
 
-fn absolute_package_path(root: &SystemPath, package_path: &str) -> PathBuf {
-    let p = PathBuf::from(package_path);
-    if p.is_absolute() {
-        p
-    } else {
-        PathBuf::from(root.as_str()).join(p)
-    }
-}
+// ---------------------------------------------------------------------------
+// Phase 1: decl enumeration via ty's SemanticIndex
+// ---------------------------------------------------------------------------
 
-fn collect_py_files(dir: &PathBuf, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() {
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            if name_str == "__pycache__" || name_str.starts_with('.') {
-                continue;
-            }
-            collect_py_files(&path, out)?;
-        } else if file_type.is_file() {
-            if let Some(ext) = path.extension() {
-                if ext == "py" {
-                    out.push(path);
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-fn derive_module_fqname(file: &Path, package_dir: &Path, package_name: &str) -> String {
-    let rel = file.strip_prefix(package_dir).unwrap_or(file);
-    let s = rel.to_string_lossy().replace('\\', "/");
-    let stripped = s
-        .strip_suffix(".py")
-        .unwrap_or(&s)
-        .trim_end_matches("/__init__")
-        .trim_end_matches("__init__");
-    if stripped.is_empty() {
-        package_name.to_string()
-    } else {
-        format!("{package_name}.{}", stripped.replace('/', "."))
-    }
-}
-
-fn ingest_file(
+fn ingest_decls(
     py: Python<'_>,
     db: &ProjectDatabase,
-    path: &str,
-    module_fqname: &str,
+    file: File,
     builder: &mut GraphBuilder,
+    global_index: &mut DeclIndex,
+    module_nodes: &mut HashMap<File, usize>,
 ) -> PyResult<()> {
-    let sys_path = SystemPath::new(path);
-    let file = system_path_to_file(db, sys_path)
-        .map_err(|e| PyOSError::new_err(format!("cannot open {path}: {e:?}")))?;
     let parsed = parsed_module(db, file).load(db);
     let source = source_text(db, file);
-    let index = LineIndex::from_source_text(&source);
+    let line_index = line_index(db, file);
+    let path_str = file_path_string(db, file);
+    let module_fqname = module_fqname_for_file(db, file);
 
-    let module_range = parsed.syntax().range;
-    let (msl, msc, mel, mec) = position(&index, &source, module_range);
-
+    let (msl, msc, mel, mec) = position(&line_index, &source, parsed.syntax().range);
     let module_idx = builder.intern_node(
         py,
         NativeNode {
-            fqname: module_fqname.to_string(),
+            fqname: module_fqname.clone(),
             kind: "module",
-            path: path.to_string(),
+            path: path_str.clone(),
             start_line: msl,
             start_column: msc,
             end_line: mel,
             end_column: mec,
             flags: 0,
+            imports: None,
         },
     )?;
+    module_nodes.insert(file, module_idx);
 
-    let mut decls: Vec<Decl> = Vec::new();
-    for stmt in &parsed.syntax().body {
-        collect_top_level(stmt, &source, &index, &mut decls);
-    }
+    // Iterate every binding (including shadowed siblings) — Principle 3.
+    let index = semantic_index(db, file);
+    let global = FileScopeId::global();
+    let place_table = index.place_table(global);
+    let use_def_map = index.use_def_map(global);
 
-    // ``target_range -> decl index`` is the primary lookup, keyed on
-    // the same range ty's ``Definition::target_range`` returns. When a
-    // name resolves through ty we can map the binding straight to the
-    // matching decl (which is critical for redeclaration cases: two
-    // ``def f`` at different lines get distinct nodes, and the
-    // reference must land on the live one).
-    //
-    // ``by_name`` is kept as a fallback for the rare case where ty
-    // returns a definition whose target_range we didn't index (e.g.
-    // walrus targets, for-loop targets that we haven't promoted to
-    // top-level decls yet).
-    let mut decl_by_range: HashMap<(u32, u32), usize> = HashMap::new();
-    let mut decl_by_name: HashMap<String, Vec<usize>> = HashMap::new();
-    for decl in &decls {
-        let decl_idx = builder.intern_node(
+    for (_def_id, state, _used) in use_def_map.all_definitions_with_usage() {
+        let DefinitionState::Defined(def) = state else {
+            continue;
+        };
+        if def.file(db) != file || def.file_scope(db) != global {
+            continue;
+        }
+
+        let kind = def.kind(db);
+        let Some(node_kind) = decl_kind_str(kind) else {
+            continue;
+        };
+
+        // Bound place must be a simple symbol — Member places (e.g.
+        // `x.y = ...` style attribute defs) aren't top-level decls in
+        // our model.
+        let place_id = def.place(db);
+        let PlaceExprRef::Symbol(symbol) = place_table.place(place_id) else {
+            continue;
+        };
+        let local_name = symbol.name().as_str().to_string();
+
+        let target_range = kind.target_range(&parsed);
+        let (sl, sc, el, ec) = position(&line_index, &source, target_range);
+
+        let imports = if node_kind == "import" {
+            Some(Py::new(py, import_payload_for(kind, db, file, &parsed))?)
+        } else {
+            None
+        };
+
+        let node_idx = builder.intern_node(
             py,
             NativeNode {
-                fqname: format!("{module_fqname}.{}", decl.name),
-                kind: decl.kind,
-                path: path.to_string(),
-                start_line: decl.start_line,
-                start_column: decl.start_column,
-                end_line: decl.end_line,
-                end_column: decl.end_column,
+                fqname: format!("{module_fqname}.{local_name}"),
+                kind: node_kind,
+                path: path_str.clone(),
+                start_line: sl,
+                start_column: sc,
+                end_line: el,
+                end_column: ec,
                 flags: 0,
+                imports,
             },
         )?;
-        builder.add_edge(decl_idx, module_idx, 0);
-        decl_by_range.insert((decl.target_start, decl.target_end), decl_idx);
-        decl_by_name
-            .entry(decl.name.clone())
-            .or_default()
-            .push(decl_idx);
+        builder.add_edge(node_idx, module_idx, 0);
+        global_index.insert((file, place_id, range_key(target_range)), node_idx);
     }
-
-    let model = SemanticModel::new(db, file);
-    let module_ref = parsed_module(db, file).load(db);
-    let index = DeclIndex {
-        by_range: decl_by_range,
-        by_name: decl_by_name,
-    };
-    collect_reference_edges(
-        &parsed.syntax().body,
-        module_idx,
-        &index,
-        &model,
-        file,
-        &module_ref,
-        builder,
-    );
 
     Ok(())
 }
 
-/// Per-file lookup tables used to resolve a name reference back to the
-/// matching graph node. ``by_range`` is keyed on ty's
-/// ``Definition::target_range`` for exact same-file binding lookups;
-/// ``by_name`` is the fallback when the resolved definition's target
-/// range falls outside the indexed set (e.g. an ``import`` alias whose
-/// definition target_range we haven't materialized into a node yet).
-struct DeclIndex {
-    by_range: HashMap<(u32, u32), usize>,
-    by_name: HashMap<String, Vec<usize>>,
+fn decl_kind_str(kind: &DefinitionKind<'_>) -> Option<&'static str> {
+    if kind.is_import() {
+        return Some("import");
+    }
+    Some(match kind {
+        DefinitionKind::Function(_) => "function",
+        DefinitionKind::Class(_) => "class",
+        DefinitionKind::TypeAlias(_) => "type_alias",
+        DefinitionKind::Assignment(_)
+        | DefinitionKind::AnnotatedAssignment(_)
+        | DefinitionKind::NamedExpression(_)
+        | DefinitionKind::For(_)
+        | DefinitionKind::WithItem(_)
+        | DefinitionKind::ExceptHandler(_)
+        | DefinitionKind::MatchPattern(_) => "variable",
+        _ => return None,
+    })
 }
 
-/// Walk top-level statements emitting same-file Name-reference edges.
-///
-/// Top-level FunctionDef / ClassDef bodies attribute every Name they
-/// contain to the enclosing top-level decl (the "top-level only"
-/// model: nested defs do not get their own graph node). Assign /
-/// AnnAssign RHS / annotation expressions attribute to their LHS
-/// target decls. Every other module-level statement attributes its
-/// Names to the synthetic module node. Compound statements that don't
-/// introduce a new scope (``if`` / ``while`` / ``for`` / ``with`` /
-/// ``try`` / ``match``) are descended into so that assignments inside
-/// them still get edge attribution.
-fn collect_reference_edges<'db>(
-    body: &[Stmt],
-    module_idx: usize,
-    decl_index: &DeclIndex,
-    model: &SemanticModel<'db>,
+fn import_payload_for<'db>(
+    kind: &DefinitionKind<'db>,
+    db: &'db dyn ProjectDb,
     file: File,
-    module_ref: &ruff_db::parsed::ParsedModuleRef,
-    builder: &mut GraphBuilder,
-) {
-    for stmt in body {
-        emit_top_level_refs(
-            stmt, module_idx, decl_index, model, file, module_ref, builder,
-        );
+    parsed: &ParsedModuleRef,
+) -> Import {
+    match kind {
+        DefinitionKind::Import(k) => {
+            let alias = k.alias(parsed);
+            Import {
+                module: alias.name.id.as_str().to_string(),
+                decl: None,
+                star: false,
+            }
+        }
+        DefinitionKind::ImportFrom(k) => {
+            let alias = k.alias(parsed);
+            Import {
+                module: from_module_string(db, file, k.import(parsed)),
+                decl: Some(alias.name.id.as_str().to_string()),
+                star: false,
+            }
+        }
+        DefinitionKind::ImportFromSubmodule(k) => {
+            // Bound name is one of the dotted submodule segments. The
+            // module string is the parent of that segment; ``decl`` is
+            // the segment itself, mirroring the libcst convention for
+            // ``from a.b import c`` where ``c`` is a submodule.
+            Import {
+                module: from_module_string(db, file, k.import(parsed)),
+                decl: Some(k.module(parsed).id.as_str().to_string()),
+                star: false,
+            }
+        }
+        DefinitionKind::StarImport(k) => Import {
+            module: from_module_string(db, file, k.import(parsed)),
+            decl: None,
+            star: true,
+        },
+        _ => unreachable!("import_payload_for called with non-import kind"),
     }
 }
 
-fn emit_top_level_refs<'db>(
-    stmt: &Stmt,
-    module_idx: usize,
-    decl_index: &DeclIndex,
-    model: &SemanticModel<'db>,
+/// Resolved absolute module name for a `from ... import ...` clause.
+///
+/// Returns the empty string when ty's `from_import_statement` fails to
+/// resolve (invalid syntax or too many leading dots) — downstream
+/// classification can treat that as an unresolved target.
+fn from_module_string(
+    db: &dyn ProjectDb,
     file: File,
-    module_ref: &ruff_db::parsed::ParsedModuleRef,
+    stmt: &ruff_python_ast::StmtImportFrom,
+) -> String {
+    ModuleName::from_import_statement(db, file, stmt)
+        .map(|n| n.as_str().to_string())
+        .unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2: module-hierarchy + cross-file alias edges
+// ---------------------------------------------------------------------------
+
+fn emit_module_hierarchy(
+    db: &ProjectDatabase,
+    file: File,
+    module_nodes: &HashMap<File, usize>,
     builder: &mut GraphBuilder,
 ) {
-    match stmt {
-        Stmt::FunctionDef(f) => {
-            // Resolve the specific decl for this FunctionDef via its
-            // name's source range -- the by-name list also contains
-            // shadowed siblings (``def f`` redefined), which must not
-            // share the body's reference edges.
-            let key = (
-                f.name.range().start().to_u32(),
-                f.name.range().end().to_u32(),
-            );
-            if let Some(&decl_idx) = decl_index.by_range.get(&key) {
-                let mut coll =
-                    RefCollector::new(vec![decl_idx], decl_index, model, file, module_ref);
-                coll.visit_stmt(stmt);
-                coll.flush(builder);
-            }
-        }
-        Stmt::ClassDef(c) => {
-            let key = (
-                c.name.range().start().to_u32(),
-                c.name.range().end().to_u32(),
-            );
-            if let Some(&decl_idx) = decl_index.by_range.get(&key) {
-                let mut coll =
-                    RefCollector::new(vec![decl_idx], decl_index, model, file, module_ref);
-                coll.visit_stmt(stmt);
-                coll.flush(builder);
-            }
-        }
-        Stmt::Assign(a) => {
-            let mut pairs: Vec<(&ExprName, &Expr)> = Vec::new();
-            for t in &a.targets {
-                pair_targets(t, &a.value, &mut pairs);
-            }
-            // Group by the RHS expression (chained assignment
-            // ``b = c = f`` lets ``b`` and ``c`` share the same RHS
-            // identity) so we walk each RHS once with every LHS decl
-            // it should attribute to.
-            let mut by_rhs: HashMap<*const Expr, Vec<usize>> = HashMap::new();
-            for (lhs, rhs) in &pairs {
-                let key = (lhs.range().start().to_u32(), lhs.range().end().to_u32());
-                if let Some(&idx) = decl_index.by_range.get(&key) {
-                    by_rhs.entry(*rhs as *const Expr).or_default().push(idx);
-                }
-            }
-            for (rhs_ptr, decls) in by_rhs {
-                // SAFETY: the pointer was derived from a borrow of
-                // `a.value` (or a descendant), still alive in this arm.
-                let rhs = unsafe { &*rhs_ptr };
-                let mut coll = RefCollector::new(decls, decl_index, model, file, module_ref);
-                coll.visit_expr(rhs);
-                coll.flush(builder);
-            }
-        }
-        Stmt::AnnAssign(a) => {
-            if let Expr::Name(n) = a.target.as_ref() {
-                let key = (n.range().start().to_u32(), n.range().end().to_u32());
-                if let Some(&decl_idx) = decl_index.by_range.get(&key) {
-                    let mut coll =
-                        RefCollector::new(vec![decl_idx], decl_index, model, file, module_ref);
-                    coll.visit_expr(&a.annotation);
-                    if let Some(v) = &a.value {
-                        coll.visit_expr(v);
-                    }
-                    coll.flush(builder);
-                }
-            }
-        }
-        Stmt::AugAssign(a) => {
-            // ``a += b`` is treated like a module-level expression:
-            // only the RHS read is emitted, and it attributes to the
-            // module (not to the LHS decl). Mirrors libcst's visitor.
-            let mut coll = RefCollector::new(vec![module_idx], decl_index, model, file, module_ref);
-            coll.visit_expr(&a.value);
-            coll.flush(builder);
-        }
-        // No-new-scope compound statements: ``if`` / ``while`` /
-        // ``for`` / ``with`` / ``try`` / ``match``. Their test / iter /
-        // context-manager / pattern expressions attribute to the
-        // module node; their bodies recurse so nested assignments
-        // still get attributed to their LHS decls.
-        Stmt::If(i) => {
-            {
-                let mut coll =
-                    RefCollector::new(vec![module_idx], decl_index, model, file, module_ref);
-                coll.visit_expr(&i.test);
-                coll.flush(builder);
-            }
-            for s in &i.body {
-                emit_top_level_refs(s, module_idx, decl_index, model, file, module_ref, builder);
-            }
-            for clause in &i.elif_else_clauses {
-                if let Some(test) = &clause.test {
-                    let mut coll =
-                        RefCollector::new(vec![module_idx], decl_index, model, file, module_ref);
-                    coll.visit_expr(test);
-                    coll.flush(builder);
-                }
-                for s in &clause.body {
-                    emit_top_level_refs(
-                        s, module_idx, decl_index, model, file, module_ref, builder,
-                    );
-                }
-            }
-        }
-        Stmt::While(w) => {
-            {
-                let mut coll =
-                    RefCollector::new(vec![module_idx], decl_index, model, file, module_ref);
-                coll.visit_expr(&w.test);
-                coll.flush(builder);
-            }
-            for s in &w.body {
-                emit_top_level_refs(s, module_idx, decl_index, model, file, module_ref, builder);
-            }
-            for s in &w.orelse {
-                emit_top_level_refs(s, module_idx, decl_index, model, file, module_ref, builder);
-            }
-        }
-        Stmt::For(f) => {
-            // ``for x in iter:`` binds ``x`` (its own decl) and the
-            // iterable is a read for that decl. Pair them up so
-            // ``for x in y:`` produces ``mod.x -> mod.y``.
-            let mut targets = Vec::new();
-            collect_assign_targets(&f.target, &mut targets);
-            let lhs_decls: Vec<usize> = targets
-                .iter()
-                .filter_map(|(_, range)| {
-                    let k = (range.start().to_u32(), range.end().to_u32());
-                    decl_index.by_range.get(&k).copied()
-                })
-                .collect();
-            if !lhs_decls.is_empty() {
-                let mut coll = RefCollector::new(lhs_decls, decl_index, model, file, module_ref);
-                coll.visit_expr(&f.iter);
-                coll.flush(builder);
-            } else {
-                let mut coll =
-                    RefCollector::new(vec![module_idx], decl_index, model, file, module_ref);
-                coll.visit_expr(&f.iter);
-                coll.flush(builder);
-            }
-            for s in &f.body {
-                emit_top_level_refs(s, module_idx, decl_index, model, file, module_ref, builder);
-            }
-            for s in &f.orelse {
-                emit_top_level_refs(s, module_idx, decl_index, model, file, module_ref, builder);
-            }
-        }
-        Stmt::With(w) => {
-            for item in &w.items {
-                // The context expression attributes to the LHS decl
-                // when ``with X as y:`` binds ``y`` at module level.
-                let target_decls: Vec<usize> = if let Some(target) = &item.optional_vars {
-                    let mut targets = Vec::new();
-                    collect_assign_targets(target, &mut targets);
-                    targets
-                        .iter()
-                        .filter_map(|(_, range)| {
-                            let k = (range.start().to_u32(), range.end().to_u32());
-                            decl_index.by_range.get(&k).copied()
-                        })
-                        .collect()
-                } else {
-                    Vec::new()
-                };
-                let owner = if target_decls.is_empty() {
-                    vec![module_idx]
-                } else {
-                    target_decls
-                };
-                let mut coll = RefCollector::new(owner, decl_index, model, file, module_ref);
-                coll.visit_expr(&item.context_expr);
-                coll.flush(builder);
-            }
-            for s in &w.body {
-                emit_top_level_refs(s, module_idx, decl_index, model, file, module_ref, builder);
-            }
-        }
-        Stmt::Try(t) => {
-            for s in &t.body {
-                emit_top_level_refs(s, module_idx, decl_index, model, file, module_ref, builder);
-            }
-            for handler in &t.handlers {
-                let ruff_python_ast::ExceptHandler::ExceptHandler(eh) = handler;
-                if let Some(ty) = &eh.type_ {
-                    let mut coll =
-                        RefCollector::new(vec![module_idx], decl_index, model, file, module_ref);
-                    coll.visit_expr(ty);
-                    coll.flush(builder);
-                }
-                for s in &eh.body {
-                    emit_top_level_refs(
-                        s, module_idx, decl_index, model, file, module_ref, builder,
-                    );
-                }
-            }
-            for s in &t.orelse {
-                emit_top_level_refs(s, module_idx, decl_index, model, file, module_ref, builder);
-            }
-            for s in &t.finalbody {
-                emit_top_level_refs(s, module_idx, decl_index, model, file, module_ref, builder);
-            }
-        }
-        Stmt::Match(m) => {
-            {
-                let mut coll =
-                    RefCollector::new(vec![module_idx], decl_index, model, file, module_ref);
-                coll.visit_expr(&m.subject);
-                coll.flush(builder);
-            }
-            for case in &m.cases {
-                for s in &case.body {
-                    emit_top_level_refs(
-                        s, module_idx, decl_index, model, file, module_ref, builder,
-                    );
-                }
-            }
-        }
-        _ => {
-            let mut coll = RefCollector::new(vec![module_idx], decl_index, model, file, module_ref);
-            coll.visit_stmt(stmt);
-            coll.flush(builder);
-        }
+    if let Some((self_idx, parent_idx)) = parent_module_edge(db, file, module_nodes) {
+        builder.add_edge(self_idx, parent_idx, 0);
     }
 }
 
-/// Visitor that records every ``Name`` reference encountered against
-/// the active ``current_decls`` stack.
+fn parent_module_edge(
+    db: &ProjectDatabase,
+    file: File,
+    module_nodes: &HashMap<File, usize>,
+) -> Option<(usize, usize)> {
+    let parent_name = file_to_module(db, file)?.name(db).parent()?;
+    let parent_file = resolve_module(db, file, &parent_name)?.file(db)?;
+    let self_idx = *module_nodes.get(&file)?;
+    let parent_idx = *module_nodes.get(&parent_file)?;
+    Some((self_idx, parent_idx))
+}
+
+fn emit_import_edges(
+    py: Python<'_>,
+    db: &ProjectDatabase,
+    file: File,
+    builder: &mut GraphBuilder,
+    global_index: &mut DeclIndex,
+    module_nodes: &mut HashMap<File, usize>,
+) -> PyResult<()> {
+    let parsed = parsed_module(db, file).load(db);
+    let index = semantic_index(db, file);
+    let global = FileScopeId::global();
+    let place_table = index.place_table(global);
+    let use_def_map = index.use_def_map(global);
+    let model = SemanticModel::new(db, file);
+
+    for (_def_id, state, _used) in use_def_map.all_definitions_with_usage() {
+        let DefinitionState::Defined(def) = state else {
+            continue;
+        };
+        if def.file(db) != file || def.file_scope(db) != global {
+            continue;
+        }
+        let kind = def.kind(db);
+        let place_id = def.place(db);
+        let PlaceExprRef::Symbol(_) = place_table.place(place_id) else {
+            continue;
+        };
+
+        let alias_idx =
+            match global_index.get(&(file, place_id, range_key(kind.target_range(&parsed)))) {
+                Some(&idx) => idx,
+                None => continue,
+            };
+
+        let target = match kind {
+            DefinitionKind::Import(k) => resolve_import_target(
+                py,
+                db,
+                k.alias(&parsed).name.id.as_str(),
+                file,
+                builder,
+                module_nodes,
+            )?,
+            DefinitionKind::ImportFrom(k) => resolve_from_imported(
+                py,
+                db,
+                &model,
+                k.import(&parsed),
+                k.alias(&parsed).name.id.as_str(),
+                builder,
+                module_nodes,
+                global_index,
+            )?,
+            DefinitionKind::ImportFromSubmodule(k) => resolve_from_imported(
+                py,
+                db,
+                &model,
+                k.import(&parsed),
+                k.module(&parsed).id.as_str(),
+                builder,
+                module_nodes,
+                global_index,
+            )?,
+            DefinitionKind::StarImport(k) => resolve_from_imported(
+                py,
+                db,
+                &model,
+                k.import(&parsed),
+                place_table.symbol(k.symbol_id()).name().as_str(),
+                builder,
+                module_nodes,
+                global_index,
+            )?,
+            _ => continue,
+        };
+        if let Some(target_idx) = target {
+            builder.add_edge(alias_idx, target_idx, 0);
+        }
+    }
+    Ok(())
+}
+
+/// Resolve a dotted module name to its target module node.
 ///
-/// "Top-level only" attribution: ``current_decls`` is set once per
-/// top-level statement by :func:`collect_reference_edges` and is *not*
-/// pushed when descending into nested ``def`` / ``class`` -- inner
-/// references fold into the outer decl. Edges collapse to a unique
-/// ``(src, dst)`` set so a repeated reference within the same decl
-/// emits one edge.
+/// For `import a.b.c`, the alias binds the local name "a" to the
+/// deepest module (`a.b.c`) — that's what this returns. Submodule
+/// hierarchy edges are only emitted for project modules via
+/// [`emit_module_hierarchy`]; external chains are not modeled today.
+fn resolve_import_target(
+    py: Python<'_>,
+    db: &ProjectDatabase,
+    dotted: &str,
+    importing_file: File,
+    builder: &mut GraphBuilder,
+    module_nodes: &mut HashMap<File, usize>,
+) -> PyResult<Option<usize>> {
+    let Some(module_name) = ModuleName::new(dotted) else {
+        return Ok(None);
+    };
+    let Some(module) = resolve_module(db, importing_file, &module_name) else {
+        return Ok(None);
+    };
+    let Some(file) = module.file(db) else {
+        return Ok(None);
+    };
+    Ok(Some(mint_module_node(py, db, file, builder, module_nodes)?))
+}
+
+/// Resolve `from <stmt> import <symbol>` to its upstream target node.
 ///
-/// Scope resolution is delegated to ty's :type:`SemanticModel` (the
-/// same use-def map ty uses for type inference): a ``Name`` is emitted
-/// as a same-file edge only when ``definitions_for_name`` resolves the
-/// reference to a definition in the file's global scope. Closures,
-/// parameter shadowing, walrus targets, ``import`` aliases, and the
-/// rest of Python's LEGB rules fall out of ty's index for free, so
-/// this visitor stays a thin shell over name -> top-level-decl
-/// emission.
+/// Delegates to ty's `definitions_for_imported_symbol`, which already
+/// tries `<module>.<symbol>` as a submodule first, then falls back to a
+/// global-scope binding in `<module>`, then to namespace-package
+/// submodule resolution. Returns the first `ResolvedDefinition` we can
+/// map to a graph node; otherwise mints (or finds) the upstream module
+/// node so the alias still has an out-edge.
+#[allow(clippy::too_many_arguments)]
+fn resolve_from_imported(
+    py: Python<'_>,
+    db: &ProjectDatabase,
+    model: &SemanticModel<'_>,
+    stmt: &ruff_python_ast::StmtImportFrom,
+    symbol_name: &str,
+    builder: &mut GraphBuilder,
+    module_nodes: &mut HashMap<File, usize>,
+    global_index: &DeclIndex,
+) -> PyResult<Option<usize>> {
+    let resolved = definitions_for_imported_symbol(
+        model,
+        stmt,
+        symbol_name,
+        ImportAliasResolution::ResolveAliases,
+    );
+    for r in &resolved {
+        match r {
+            ResolvedDefinition::Definition(def) => {
+                let target_file = def.file(db);
+                let parsed = parsed_module(db, target_file).load(db);
+                let key = (
+                    target_file,
+                    def.place(db),
+                    range_key(def.kind(db).target_range(&parsed)),
+                );
+                if let Some(&idx) = global_index.get(&key) {
+                    return Ok(Some(idx));
+                }
+            }
+            ResolvedDefinition::Module(target_file) => {
+                return Ok(Some(mint_module_node(
+                    py,
+                    db,
+                    *target_file,
+                    builder,
+                    module_nodes,
+                )?));
+            }
+            ResolvedDefinition::FileWithRange(_) => continue,
+        }
+    }
+    // ty resolved nothing we can graph; fall back to the upstream module
+    // so the alias still propagates reachability.
+    let Ok(module_name) = ModuleName::from_import_statement(db, model.file(), stmt) else {
+        return Ok(None);
+    };
+    let Some(module) = resolve_module(db, model.file(), &module_name) else {
+        return Ok(None);
+    };
+    let Some(target_file) = module.file(db) else {
+        return Ok(None);
+    };
+    Ok(Some(mint_module_node(
+        py,
+        db,
+        target_file,
+        builder,
+        module_nodes,
+    )?))
+}
+
+fn mint_module_node(
+    py: Python<'_>,
+    db: &ProjectDatabase,
+    file: File,
+    builder: &mut GraphBuilder,
+    module_nodes: &mut HashMap<File, usize>,
+) -> PyResult<usize> {
+    if let Some(&idx) = module_nodes.get(&file) {
+        return Ok(idx);
+    }
+    let parsed = parsed_module(db, file).load(db);
+    let source = source_text(db, file);
+    let line_index = line_index(db, file);
+    let (sl, sc, el, ec) = position(&line_index, &source, parsed.syntax().range);
+    let fqname = module_fqname_for_file(db, file);
+    let path_str = file_path_string(db, file);
+    let idx = builder.intern_node(
+        py,
+        NativeNode {
+            fqname,
+            kind: "module",
+            path: path_str,
+            start_line: sl,
+            start_column: sc,
+            end_line: el,
+            end_column: ec,
+            flags: 0,
+            imports: None,
+        },
+    )?;
+    module_nodes.insert(file, idx);
+    Ok(idx)
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3: same-file Name→decl reference edges
+// ---------------------------------------------------------------------------
+
+fn emit_reference_edges(
+    db: &ProjectDatabase,
+    file: File,
+    global_index: &DeclIndex,
+    module_nodes: &HashMap<File, usize>,
+    builder: &mut GraphBuilder,
+) {
+    let Some(&module_idx) = module_nodes.get(&file) else {
+        return;
+    };
+    let parsed = parsed_module(db, file).load(db);
+    let index = semantic_index(db, file);
+    let global = FileScopeId::global();
+    let use_def_map = index.use_def_map(global);
+    let model = SemanticModel::new(db, file);
+
+    // (a) Definitions that own an expression / body — attribute their
+    //     contained Names to the owning decl.
+    for (_def_id, state, _used) in use_def_map.all_definitions_with_usage() {
+        let DefinitionState::Defined(def) = state else {
+            continue;
+        };
+        if def.file(db) != file || def.file_scope(db) != global {
+            continue;
+        }
+        let kind = def.kind(db);
+        let target_range = kind.target_range(&parsed);
+        let Some(&owner_idx) = global_index.get(&(file, def.place(db), range_key(target_range)))
+        else {
+            continue;
+        };
+
+        let mut coll = RefCollector::new(owner_idx, &model, file, &parsed, global_index);
+        walk_owned(kind, &parsed, &mut coll);
+        coll.flush(builder);
+    }
+
+    // (b) Module-level statements that don't carry a Definition (and
+    //     so didn't get covered by (a)) attribute to the module node.
+    for stmt in &parsed.syntax().body {
+        if stmt_creates_top_level_definition(stmt) {
+            continue;
+        }
+        let mut coll = RefCollector::new(module_idx, &model, file, &parsed, global_index);
+        coll.visit_stmt(stmt);
+        coll.flush(builder);
+    }
+}
+
+/// True iff this top-level statement is a binding form whose Names
+/// have already been attributed by the per-definition walk in (a).
+///
+/// Compound non-scope statements (``if`` / ``while`` / ``for`` / ...)
+/// return ``false`` here: their *bodies* contain definitions that (a)
+/// covers, but their *test/iter/etc. expressions* belong to the module
+/// and (b) needs to walk them.
+fn stmt_creates_top_level_definition(stmt: &Stmt) -> bool {
+    matches!(
+        stmt,
+        Stmt::FunctionDef(_)
+            | Stmt::ClassDef(_)
+            | Stmt::Assign(_)
+            | Stmt::AnnAssign(_)
+            | Stmt::TypeAlias(_)
+            | Stmt::Import(_)
+            | Stmt::ImportFrom(_)
+    )
+}
+
+/// Walk every value-bearing AST node a Definition owns.
+///
+/// Functions and classes own their body statements; assignments own
+/// the RHS expression; annotated assignments own annotation + value;
+/// `for x in iter:` owns the iterable; `with X as y:` owns the
+/// context expression; walrus owns its value; type aliases own their
+/// value expression. Other Definition kinds (imports, parameters, …)
+/// own no walk-worthy expression.
+fn walk_owned(kind: &DefinitionKind<'_>, parsed: &ParsedModuleRef, v: &mut RefCollector<'_, '_>) {
+    match kind {
+        DefinitionKind::Function(func) => {
+            for s in &func.node(parsed).body {
+                v.visit_stmt(s);
+            }
+        }
+        DefinitionKind::Class(cls) => {
+            for s in &cls.node(parsed).body {
+                v.visit_stmt(s);
+            }
+        }
+        DefinitionKind::Assignment(a) => v.visit_expr(a.value(parsed)),
+        DefinitionKind::AnnotatedAssignment(a) => {
+            v.visit_expr(a.annotation(parsed));
+            if let Some(val) = a.value(parsed) {
+                v.visit_expr(val);
+            }
+        }
+        DefinitionKind::For(for_stmt) => v.visit_expr(for_stmt.iterable(parsed)),
+        DefinitionKind::WithItem(item) => v.visit_expr(item.context_expr(parsed)),
+        DefinitionKind::NamedExpression(named) => v.visit_expr(named.node(parsed).value.as_ref()),
+        DefinitionKind::TypeAlias(alias) => v.visit_expr(alias.node(parsed).value.as_ref()),
+        _ => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Reference collector
+// ---------------------------------------------------------------------------
+
+/// Walks an expression / body and records every Name reference,
+/// attributing to a single owner decl.
+///
+/// Resolution is delegated to ty's `definitions_for_name` with
+/// `PreserveAliases`: imported-name uses land on the local import
+/// node, not on the cross-file target (Principle 2 — edges flow
+/// through the local decl). Shadow handling falls out of ty's
+/// flow-sensitive use-def chain (Principle 3 — each use lands on its
+/// reaching def, never on all same-name siblings).
 struct RefCollector<'a, 'db> {
-    current_decls: Vec<usize>,
-    decl_index: &'a DeclIndex,
-    edges: HashSet<(usize, usize)>,
+    owner: usize,
     model: &'a SemanticModel<'db>,
     file: File,
-    module_ref: &'a ruff_db::parsed::ParsedModuleRef,
+    parsed: &'a ParsedModuleRef,
+    global_index: &'a DeclIndex,
+    edges: HashSet<(usize, usize)>,
 }
 
 impl<'a, 'db> RefCollector<'a, 'db> {
     fn new(
-        current_decls: Vec<usize>,
-        decl_index: &'a DeclIndex,
+        owner: usize,
         model: &'a SemanticModel<'db>,
         file: File,
-        module_ref: &'a ruff_db::parsed::ParsedModuleRef,
+        parsed: &'a ParsedModuleRef,
+        global_index: &'a DeclIndex,
     ) -> Self {
         Self {
-            current_decls,
-            decl_index,
-            edges: HashSet::new(),
+            owner,
             model,
             file,
-            module_ref,
+            parsed,
+            global_index,
+            edges: HashSet::new(),
         }
     }
 
@@ -920,50 +894,57 @@ impl<'a, 'db> RefCollector<'a, 'db> {
     }
 
     fn emit_name(&mut self, name: &ExprName) {
-        let defs = definitions_for_name(
-            self.model,
-            name.id.as_str(),
-            name.into(),
-            ImportAliasResolution::PreserveAliases,
-        );
-        // Collect every same-file global-scope binding ty found for
-        // this name. We map each to a specific decl by target_range
-        // (so two ``def f`` at different lines resolve to different
-        // nodes); the per-name fallback handles the very rare case
-        // where a target_range fell outside the indexed set.
-        let mut targets: HashSet<usize> = HashSet::new();
+        // Walk the use's scope chain looking for *local* bindings of
+        // ``name``. We deliberately do NOT call
+        // ``definitions_for_name`` here -- it always chases bare
+        // ``from X import y`` to the upstream definition in ``X``, and
+        // Principle 2 requires use edges to terminate at the local
+        // alias node. The scope walk stops at the first scope that
+        // binds the name; bindings inside that scope are emitted as
+        // edges (ty's flow tracking already filters reachable ones).
         let db = self.model.db();
-        for resolved in defs {
-            let Some(def) = resolved.definition() else {
+        let index = semantic_index(db, self.file);
+        let Some(file_scope) = self.model.scope(name.into()) else {
+            return;
+        };
+
+        for (scope_id, _scope) in index.visible_ancestor_scopes(file_scope) {
+            let place_table = index.place_table(scope_id);
+            let Some(symbol_id) = place_table.symbol_id(name.id.as_str()) else {
                 continue;
             };
-            if def.file(db) != self.file {
-                continue;
-            }
-            if def.file_scope(db) != FileScopeId::global() {
-                continue;
-            }
-            let tr = def.kind(db).target_range(self.module_ref);
-            let key = (tr.start().to_u32(), tr.end().to_u32());
-            if let Some(&idx) = self.decl_index.by_range.get(&key) {
-                targets.insert(idx);
-            } else if let Some(by_name) = self.decl_index.by_name.get(name.id.as_str()) {
-                // Fallback: ty pinned the binding to the global scope
-                // but we never minted a decl at that exact target
-                // range (e.g. an ``import`` alias we don't model yet).
-                // Land on every same-name decl so reachability is at
-                // least conservative.
-                for &idx in by_name {
-                    targets.insert(idx);
-                }
-            }
-        }
-        for dst in targets {
-            for &src in &self.current_decls {
-                if src == dst {
+            let use_def_map = index.use_def_map(scope_id);
+            // ``end_of_scope_symbol_bindings`` is flow-sensitive: it
+            // returns only bindings that *reach* the end of the scope
+            // (Principle 3 — shadowed-earlier defs that have been
+            // overwritten by end-of-scope are excluded). For free
+            // references in nested functions/classes this is the
+            // right query because the function body runs after the
+            // enclosing module finishes loading, by which point the
+            // module's bindings are at their end-of-scope state.
+            let mut matched = false;
+            for binding in use_def_map.end_of_scope_symbol_bindings(symbol_id) {
+                let Some(def) = binding.binding.definition() else {
+                    continue;
+                };
+                if def.file(db) != self.file {
                     continue;
                 }
-                self.edges.insert((src, dst));
+                let key = (
+                    self.file,
+                    def.place(db),
+                    range_key(def.kind(db).target_range(self.parsed)),
+                );
+                let Some(&dst) = self.global_index.get(&key) else {
+                    continue;
+                };
+                if dst != self.owner {
+                    self.edges.insert((self.owner, dst));
+                }
+                matched = true;
+            }
+            if matched {
+                break;
             }
         }
     }
@@ -983,6 +964,10 @@ impl<'ast, 'db> Visitor<'ast> for RefCollector<'_, 'db> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
 fn rel_path<P: AsRef<str>>(path: P) -> RelativePathBuf {
     RelativePathBuf::cli(SystemPath::new(path.as_ref()))
 }
@@ -998,230 +983,33 @@ fn position(index: &LineIndex, source: &str, range: TextRange) -> (usize, usize,
     )
 }
 
-fn push_decl(
-    name: String,
-    kind: &'static str,
-    range: TextRange,
-    target_range: TextRange,
-    source: &str,
-    index: &LineIndex,
-    out: &mut Vec<Decl>,
-) {
-    let (sl, sc, el, ec) = position(index, source, range);
-    out.push(Decl {
-        name,
-        kind,
-        start_line: sl,
-        start_column: sc,
-        end_line: el,
-        end_column: ec,
-        target_start: target_range.start().to_u32(),
-        target_end: target_range.end().to_u32(),
-    });
+fn range_key(range: TextRange) -> (u32, u32) {
+    (range.start().to_u32(), range.end().to_u32())
 }
 
-/// Yield ``(name, rhs)`` pairs for an assignment target pattern.
-///
-/// ``a, b = x, y`` -> ``[(a, x), (b, y)]``. ``a, b = call()`` (RHS
-/// arity mismatches the target tuple) -> the whole ``call()`` is
-/// broadcast to both ``a`` and ``b``. Nested tuple / list patterns
-/// recurse; non-Name leaves (``Attribute``, ``Subscript``) are
-/// skipped. Mirrors :func:`dead_cst._visitor._pair_targets`. Each
-/// pair carries the LHS ``ExprName`` so the caller can recover the
-/// per-target ``target_range`` and disambiguate redeclarations.
-fn pair_targets<'ast>(
-    target: &'ast Expr,
-    rhs: &'ast Expr,
-    out: &mut Vec<(&'ast ExprName, &'ast Expr)>,
-) {
-    match target {
-        Expr::Name(n) => {
-            out.push((n, rhs));
-        }
-        Expr::Tuple(t) => {
-            let rhs_elts = match rhs {
-                Expr::Tuple(rt) if rt.elts.len() == t.elts.len() => Some(&rt.elts),
-                Expr::List(rl) if rl.elts.len() == t.elts.len() => Some(&rl.elts),
-                _ => None,
-            };
-            if let Some(rhs_elts) = rhs_elts {
-                for (te, re) in t.elts.iter().zip(rhs_elts.iter()) {
-                    pair_targets(te, re, out);
-                }
-            } else {
-                for te in &t.elts {
-                    pair_targets(te, rhs, out);
-                }
-            }
-        }
-        Expr::List(t) => {
-            let rhs_elts = match rhs {
-                Expr::Tuple(rt) if rt.elts.len() == t.elts.len() => Some(&rt.elts),
-                Expr::List(rl) if rl.elts.len() == t.elts.len() => Some(&rl.elts),
-                _ => None,
-            };
-            if let Some(rhs_elts) = rhs_elts {
-                for (te, re) in t.elts.iter().zip(rhs_elts.iter()) {
-                    pair_targets(te, re, out);
-                }
-            } else {
-                for te in &t.elts {
-                    pair_targets(te, rhs, out);
-                }
-            }
-        }
-        Expr::Starred(s) => pair_targets(&s.value, rhs, out),
-        _ => {}
+fn file_path_string(db: &dyn ProjectDb, file: File) -> String {
+    match file.path(db) {
+        FilePath::System(p) => p.to_string(),
+        FilePath::SystemVirtual(p) => p.to_string(),
+        FilePath::Vendored(p) => p.to_string(),
     }
 }
 
-fn collect_assign_targets(target: &Expr, out: &mut Vec<(String, TextRange)>) {
-    match target {
-        Expr::Name(n) => out.push((n.id.to_string(), n.range)),
-        Expr::Tuple(t) => {
-            for e in &t.elts {
-                collect_assign_targets(e, out);
-            }
-        }
-        Expr::List(l) => {
-            for e in &l.elts {
-                collect_assign_targets(e, out);
-            }
-        }
-        Expr::Starred(s) => collect_assign_targets(&s.value, out),
-        _ => {}
-    }
+fn module_fqname_for_file(db: &dyn ProjectDb, file: File) -> String {
+    file_to_module(db, file)
+        .map(|m| m.name(db).as_str().to_string())
+        .unwrap_or_else(|| file_path_string(db, file))
 }
 
-fn collect_top_level(stmt: &Stmt, source: &str, index: &LineIndex, out: &mut Vec<Decl>) {
-    match stmt {
-        Stmt::FunctionDef(f) => {
-            push_decl(
-                f.name.to_string(),
-                "function",
-                f.range,
-                f.name.range(),
-                source,
-                index,
-                out,
-            );
-        }
-        Stmt::ClassDef(c) => {
-            push_decl(
-                c.name.to_string(),
-                "class",
-                c.range,
-                c.name.range(),
-                source,
-                index,
-                out,
-            );
-        }
-        Stmt::Assign(a) => {
-            let mut targets = Vec::new();
-            for t in &a.targets {
-                collect_assign_targets(t, &mut targets);
-            }
-            for (name, range) in targets {
-                push_decl(name, "variable", range, range, source, index, out);
-            }
-        }
-        Stmt::AnnAssign(a) => {
-            if let Expr::Name(n) = a.target.as_ref() {
-                push_decl(
-                    n.id.to_string(),
-                    "variable",
-                    n.range,
-                    n.range,
-                    source,
-                    index,
-                    out,
-                );
-            }
-        }
-        // Compound statements that don't introduce a new scope: their
-        // assignments still create top-level decls. Mirrors libcst's
-        // ScopeProvider rules.
-        Stmt::If(i) => {
-            for s in &i.body {
-                collect_top_level(s, source, index, out);
-            }
-            for clause in &i.elif_else_clauses {
-                for s in &clause.body {
-                    collect_top_level(s, source, index, out);
-                }
-            }
-        }
-        Stmt::While(w) => {
-            for s in &w.body {
-                collect_top_level(s, source, index, out);
-            }
-            for s in &w.orelse {
-                collect_top_level(s, source, index, out);
-            }
-        }
-        Stmt::For(f) => {
-            // ``for x in ...:`` binds ``x`` at module scope.
-            let mut targets = Vec::new();
-            collect_assign_targets(&f.target, &mut targets);
-            for (name, range) in targets {
-                push_decl(name, "variable", range, range, source, index, out);
-            }
-            for s in &f.body {
-                collect_top_level(s, source, index, out);
-            }
-            for s in &f.orelse {
-                collect_top_level(s, source, index, out);
-            }
-        }
-        Stmt::With(w) => {
-            for item in &w.items {
-                if let Some(target) = &item.optional_vars {
-                    let mut targets = Vec::new();
-                    collect_assign_targets(target, &mut targets);
-                    for (name, range) in targets {
-                        push_decl(name, "variable", range, range, source, index, out);
-                    }
-                }
-            }
-            for s in &w.body {
-                collect_top_level(s, source, index, out);
-            }
-        }
-        Stmt::Try(t) => {
-            for s in &t.body {
-                collect_top_level(s, source, index, out);
-            }
-            for handler in &t.handlers {
-                let ruff_python_ast::ExceptHandler::ExceptHandler(eh) = handler;
-                for s in &eh.body {
-                    collect_top_level(s, source, index, out);
-                }
-            }
-            for s in &t.orelse {
-                collect_top_level(s, source, index, out);
-            }
-            for s in &t.finalbody {
-                collect_top_level(s, source, index, out);
-            }
-        }
-        Stmt::Match(m) => {
-            for case in &m.cases {
-                for s in &case.body {
-                    collect_top_level(s, source, index, out);
-                }
-            }
-        }
-        _ => {}
-    }
-}
+// ---------------------------------------------------------------------------
+// Module entry point
+// ---------------------------------------------------------------------------
 
 #[pymodule]
 fn dead_cst_ty_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_class::<Decl>()?;
+    m.add_class::<Import>()?;
     m.add_class::<NativeNode>()?;
     m.add_class::<NativeGraph>()?;
-    m.add_class::<PackageSpec>()?;
     m.add_class::<Project>()?;
     Ok(())
 }

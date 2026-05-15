@@ -2,15 +2,11 @@ import json
 import logging
 import textwrap
 from pathlib import Path
-from typing import cast
 
 import pytest
-from libcst.metadata import CodePosition, CodeRange
 
 from dead_cst import Analysis, EdgeFlags
-from dead_cst._fqn import FixedFullyQualifiedNameProvider
 from dead_cst._graphstore import SymbolGraph
-from dead_cst.graph import NodeFlags, SymbolNode
 from dead_cst.resolvers import ManualResolver
 
 
@@ -101,59 +97,21 @@ def build_decl_graph(tmp_path, make_analysis, backend):
 
 
 def _build_rust_graph(root: Path) -> SymbolGraph:
-    """Build a SymbolGraph by routing every ``.py`` file under ``root`` through Rust.
+    """Build a SymbolGraph by routing the whole project through Rust.
 
-    Uses libcst's :class:`FixedFullyQualifiedNameProvider` to derive each
-    file's canonical FQN (matching the libcst pipeline), then asks the
-    Rust prototype for one ``NativeGraph`` per file and accumulates the
-    results into a single :class:`SymbolGraph`. Skips the suite if the
-    native extension hasn't been built.
-
-    Tests that hit this path are expected to fail wherever the Rust
-    backend doesn't yet emit the edges / nodes the libcst visitor would
-    — that is the whole point of the abstraction.
+    Tests that hit this path are expected to fail wherever the rust
+    backend doesn't yet emit the edges / nodes the libcst visitor
+    would — that is the whole point of the abstraction.
     """
-    native = pytest.importorskip(
+    pytest.importorskip(
         "dead_cst_ty_native",
         reason="Run `maturin develop --manifest-path crates/dead-cst-ty-native/Cargo.toml` "
         "to build the prototype rust backend.",
     )
+    from tests.prototype._bridge import materialize
+    import dead_cst_ty_native as native
 
-    files = sorted(p for p in root.rglob("*.py") if p.is_file())
-    fqn_cache = FixedFullyQualifiedNameProvider.gen_cache(root, [str(f) for f in files], timeout=5)
-
-    project = native.Project(str(root))
-    graph = SymbolGraph()
-    for f in files:
-        fqn = fqn_cache[str(f)].name
-        native_graph = project.build_file_graph(str(f), fqn)
-        _accumulate_native(graph, native_graph)
-    return graph
-
-
-def _accumulate_native(graph: SymbolGraph, native_graph) -> None:
-    """Merge a ``NativeGraph`` envelope into ``graph``.
-
-    Mirrors ``tests/prototype/_bridge.accumulate``; inlined here so
-    the conftest doesn't have to reach across into the prototype
-    package (no ``tests/__init__.py`` today).
-    """
-    symbol_nodes: list[SymbolNode] = []
-    for n in native_graph.nodes:
-        sn = SymbolNode(
-            fqname=n.fqname,
-            type=cast("SymbolNode.type", n.kind),
-            path=Path(n.path),
-            position=CodeRange(
-                CodePosition(n.start_line, n.start_column),
-                CodePosition(n.end_line, n.end_column),
-            ),
-            flags=NodeFlags(n.flags),
-        )
-        graph.add(sn)
-        symbol_nodes.append(sn)
-    for src, dst, flags in native_graph.edges:
-        graph.add_edge(symbol_nodes[src], symbol_nodes[dst], EdgeFlags(flags))
+    return materialize(native.Project(str(root)).build())
 
 
 @pytest.fixture

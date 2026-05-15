@@ -13,6 +13,7 @@ pyo3 = { version = "0.22", features = ["extension-module", "abi3-py311"] }
 ty_project = { path = "../../vendor/ruff/crates/ty_project" }
 ty_python_core = { path = "../../vendor/ruff/crates/ty_python_core" }
 ty_python_semantic = { path = "../../vendor/ruff/crates/ty_python_semantic" }
+ty_module_resolver = { path = "../../vendor/ruff/crates/ty_module_resolver" }
 ruff_db = { path = "../../vendor/ruff/crates/ruff_db", features = ["os"] }
 ruff_python_ast = { path = "../../vendor/ruff/crates/ruff_python_ast" }
 ruff_source_file = { path = "../../vendor/ruff/crates/ruff_source_file" }
