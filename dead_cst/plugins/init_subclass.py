@@ -54,6 +54,8 @@ from ._core import (
 )
 
 if TYPE_CHECKING:
+    import dead_cst_ty_native as native
+
     from ..graph import VisitorPayload
 
 _INIT_SUBCLASS = "__init_subclass__"
@@ -186,6 +188,32 @@ class InitSubclassPlugin:
                     if sub in existing_targets[marker]:
                         continue
                     yield AddEdge(marker, sub)
+
+    def run(self, ctx: native.ProjectContext) -> None:
+        """Rust-backend entry point: one query for parents, one per parent
+        for the transitive subclass closure.
+
+        Replaces the two-phase libcst flow (per-file ``observe`` collecting
+        bases + ``finalize`` BFS) with two ty queries:
+        ``find_classes_defining_method("__init_subclass__")`` locates each
+        parent, and ``find_subclasses_of`` returns the transitive closure
+        straight out of ty's ``type_hierarchy_subtypes``.
+
+        The marker keying matches ``observe`` / ``finalize``
+        (``<__init_subclass__>:<parent.fqname>``) so external tooling
+        keying on the prefix sees the same shape regardless of backend.
+        The ``<subclass-of>:`` intermediate buckets the libcst path
+        emits are not needed here -- ty answers the transitive question
+        in one call, so the marker edges directly to each subclass.
+        """
+        for parent in ctx.find_classes_defining_method(_INIT_SUBCLASS):
+            marker = ctx.add_node(
+                fqname=f"{INIT_SUBCLASS_PREFIX}{parent.fqname}",
+                path=parent.path,
+            )
+            ctx.add_edge(parent, marker)
+            for sub in ctx.find_subclasses_of(parent):
+                ctx.add_edge(marker, sub)
 
 
 def _has_init_subclass(class_def: cst.ClassDef) -> bool:

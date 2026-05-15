@@ -75,51 +75,13 @@ def run_plugins(
 
 
 # ---------------------------------------------------------------------------
-# Example plugins — same intent as the libcst-side builtins, ported to
-# the new shape so the size delta is visible.
+# Example plugin — demonstrates a query (``find_comment_patterns``) with
+# no libcst-side equivalent. The built-in plugins
+# (:class:`dead_cst.plugins.ModuleDundersPlugin`,
+# :class:`dead_cst.plugins.InitSubclassPlugin`, ...) implement ``run``
+# directly so they satisfy this protocol alongside the libcst-side
+# ``observe`` / ``finalize`` contract.
 # ---------------------------------------------------------------------------
-
-
-class ModuleDundersPlugin:
-    """Keep module-level dunder variables alive.
-
-    Same intent as :class:`dead_cst.plugins.ModuleDundersPlugin` but
-    the per-file CST inspection is gone: ``ctx.find_module_dunders``
-    already returns the matching variable nodes from the rust side.
-    """
-
-    name = "module_dunders"
-
-    def run(self, ctx: "native.ProjectContext") -> None:
-        for dunder in ctx.find_module_dunders():
-            marker = ctx.add_node(
-                fqname=f"<dunder>:{dunder.fqname}",
-                path=dunder.path,
-                flags=2,  # NodeFlags.ENTRYPOINT
-            )
-            ctx.add_edge(marker, dunder)
-
-
-class InitSubclassPlugin:
-    """Keep transitive subclasses of ``__init_subclass__``-defining classes alive.
-
-    Replaces the two-phase libcst plugin (observe + finalize) with one
-    query each: ``find_classes_defining_method("__init_subclass__")``
-    locates the parents, then ``find_subclasses_of`` returns the
-    transitive closure straight from ty's `type_hierarchy_subtypes`.
-    """
-
-    name = "init_subclass"
-
-    def run(self, ctx: "native.ProjectContext") -> None:
-        for parent in ctx.find_classes_defining_method("__init_subclass__"):
-            marker = ctx.add_node(
-                fqname=f"<__init_subclass__>:{parent.fqname}",
-                path=parent.path,
-            )
-            ctx.add_edge(parent, marker)
-            for sub in ctx.find_subclasses_of(parent):
-                ctx.add_edge(marker, sub)
 
 
 class KeepAliveCommentPlugin:

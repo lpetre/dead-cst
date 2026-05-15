@@ -17,6 +17,8 @@ from ._core import (
 )
 
 if TYPE_CHECKING:
+    import dead_cst_ty_native as native
+
     from ..graph import VisitorPayload
 
 DUNDER_PREFIX = "<dunder>:"
@@ -61,6 +63,23 @@ class ModuleDundersPlugin:
 
     def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]:
         return ()
+
+    def run(self, ctx: native.ProjectContext) -> None:
+        """Rust-backend entry point: same intent, one query call.
+
+        ``__future__`` imports are not surfaced here yet -- the rust
+        crate currently has no `find_future_imports` query, and a
+        single ``find_module_dunders`` covers the more common
+        ``__all__`` / ``__version__`` case. Follow-up: a
+        ``find_imports_of`` query would close the gap.
+        """
+        for dunder in ctx.find_module_dunders():
+            marker = ctx.add_node(
+                fqname=f"{DUNDER_PREFIX}{dunder.fqname}",
+                path=dunder.path,
+                flags=int(NodeFlags.ENTRYPOINT),
+            )
+            ctx.add_edge(marker, dunder)
 
 
 def _is_kept_alive(node: SymbolNode) -> bool:

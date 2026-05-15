@@ -17,12 +17,9 @@ import pytest
 
 native = pytest.importorskip("dead_cst_ty_native")
 
-from .plugin_protocol import (  # noqa: E402
-    InitSubclassPlugin,
-    KeepAliveCommentPlugin,
-    ModuleDundersPlugin,
-    run_plugins,
-)
+from dead_cst.plugins import InitSubclassPlugin, ModuleDundersPlugin  # noqa: E402
+
+from .plugin_protocol import KeepAliveCommentPlugin, run_plugins  # noqa: E402
 
 
 @pytest.fixture
