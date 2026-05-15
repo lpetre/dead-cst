@@ -138,6 +138,110 @@ STAR_REEXPORT_EDGES = frozenset(
             id="nested-cst.ImportFrom",
         ),
         pytest.param(
+            # Nested import with no use of the bound name still
+            # creates a dep on the upstream module — the import
+            # statement itself is a side effect attributed to the
+            # enclosing decl.
+            "def a():\n    import p.functions\n",
+            {
+                "p.x.a -> p.functions",
+                "p.x.a -> p.x",
+            },
+            id="nested-cst.Import-no-use",
+        ),
+        pytest.param(
+            # `from X import Y` with no use still emits both the
+            # parent module and the upstream decl edges, just like
+            # the module-scope ImportFrom alias does.
+            "def a():\n    from p.functions import f\n",
+            {
+                "p.x.a -> p.functions",
+                "p.x.a -> p.functions.f",
+                "p.x.a -> p.x",
+            },
+            id="nested-cst.ImportFrom-no-use",
+        ),
+        pytest.param(
+            # Bare-`import p` then dotted access through it inside
+            # the function body. The chain `.functions.f` walks
+            # submodule then decl from the bound name `p`.
+            "def a():\n    import p\n    p.functions.f()\n",
+            {
+                "p.x.a -> p",
+                "p.x.a -> p.functions",
+                "p.x.a -> p.functions.f",
+                "p.x.a -> p.x",
+            },
+            id="nested-cst.Import-bare-then-dotted",
+        ),
+        pytest.param(
+            # Nested import shadows a module-scope import of the
+            # same root name. Inside `a` the use resolves to the
+            # nested binding; outside it the module-scope alias
+            # still points at its own upstream.
+            "import p.functions\ndef a():\n    import p.classes\n    p.classes.C()\n",
+            {
+                "p.x.a -> p.classes",
+                "p.x.a -> p.classes.C",
+                "p.x.a -> p.x",
+                "p.x.p -> p.functions",
+                "p.x.p -> p.x",
+            },
+            id="nested-cst.Import-shadows-module-scope",
+        ),
+        pytest.param(
+            # Import in a class body. The class is the owner;
+            # the chain walks normally.
+            "class A:\n    import p.functions\n    p.functions.f()\n",
+            {
+                "p.x.A -> p.functions",
+                "p.x.A -> p.functions.f",
+                "p.x.A -> p.x",
+            },
+            id="class-body-cst.Import",
+        ),
+        pytest.param(
+            "class A:\n    from p.functions import f\n    f()\n",
+            {
+                "p.x.A -> p.functions",
+                "p.x.A -> p.functions.f",
+                "p.x.A -> p.x",
+            },
+            id="class-body-cst.ImportFrom",
+        ),
+        pytest.param(
+            # Imports inside method bodies attribute to the
+            # enclosing class — methods are not separate top-level
+            # nodes, per the project's "nested defs are folded
+            # into the enclosing top-level decl" convention.
+            "class A:\n    def m(self):\n        import p.functions\n        p.functions.f()\n",
+            {
+                "p.x.A -> p.functions",
+                "p.x.A -> p.functions.f",
+                "p.x.A -> p.x",
+            },
+            id="method-body-cst.Import",
+        ),
+        pytest.param(
+            # `try: import X as A; except: import Y as A` — both
+            # branches reach end-of-scope with `A` bound, so a use
+            # of `A` (or the import statements alone) attributes
+            # edges to *both* upstreams (Principle 3 — every
+            # reaching def gets edges).
+            "def a():\n"
+            "    try:\n"
+            "        import p.functions as src\n"
+            "    except ImportError:\n"
+            "        import p.classes as src\n"
+            "    src\n",
+            {
+                "p.x.a -> p.classes",
+                "p.x.a -> p.functions",
+                "p.x.a -> p.x",
+            },
+            id="nested-try-except-cst.Import",
+        ),
+        pytest.param(
             "from .functions import f\ndef a(): f()",
             {
                 "p.x.a -> p.functions",
