@@ -242,6 +242,19 @@ STAR_REEXPORT_EDGES = frozenset(
             id="nested-try-except-cst.Import",
         ),
         pytest.param(
+            # Nested star import fans out to every name `p.functions`
+            # exports, attributed to the enclosing function. No alias
+            # node is minted.
+            "def a():\n    from p.functions import *\n    f()\n",
+            {
+                "p.x.a -> p.functions",
+                "p.x.a -> p.functions.f",
+                "p.x.a -> p.functions.g",
+                "p.x.a -> p.x",
+            },
+            id="nested-star-import",
+        ),
+        pytest.param(
             "from .functions import f\ndef a(): f()",
             {
                 "p.x.a -> p.functions",
