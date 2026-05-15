@@ -1065,13 +1065,16 @@ fn decl_kind_str(kind: &DefinitionKind<'_>) -> Option<&'static str> {
         DefinitionKind::Function(_) => "function",
         DefinitionKind::Class(_) => "class",
         DefinitionKind::TypeAlias(_) => "type_alias",
+        // Walrus's bound name (PEP 572) leaks to the enclosing scope
+        // — at module level that's a top-level decl. The other
+        // binding-statement targets (`for`, `with ... as`, `except as`,
+        // structural-`match` captures) are local loop / context /
+        // pattern bindings that the libcst pipeline does *not* model
+        // as top-level nodes; skip them so we don't mint phantom
+        // module-scope decls.
         DefinitionKind::Assignment(_)
         | DefinitionKind::AnnotatedAssignment(_)
-        | DefinitionKind::NamedExpression(_)
-        | DefinitionKind::For(_)
-        | DefinitionKind::WithItem(_)
-        | DefinitionKind::ExceptHandler(_)
-        | DefinitionKind::MatchPattern(_) => "variable",
+        | DefinitionKind::NamedExpression(_) => "variable",
         _ => return None,
     })
 }
@@ -1539,15 +1542,42 @@ fn stmt_creates_top_level_definition(stmt: &Stmt) -> bool {
 fn walk_owned(kind: &DefinitionKind<'_>, parsed: &ParsedModuleRef, v: &mut RefCollector<'_, '_>) {
     match kind {
         DefinitionKind::Function(func) => {
+            let node = func.node(parsed);
+            // Header parts evaluate at the *definition* site (module
+            // scope for top-level defs), not inside the body — leave
+            // `nested_context` false so a stray `import X` in a
+            // decorator expression doesn't get re-attributed as a
+            // body-local nested import.
+            walk_decorators(&node.decorator_list, v);
+            if let Some(type_params) = &node.type_params {
+                walk_type_params(type_params, v);
+            }
+            walk_parameters(&node.parameters, v);
+            if let Some(returns) = &node.returns {
+                v.visit_expr(returns);
+            }
             v.nested_context = true;
-            for s in &func.node(parsed).body {
+            for s in &node.body {
                 v.visit_stmt(s);
             }
             v.nested_context = false;
         }
         DefinitionKind::Class(cls) => {
+            let node = cls.node(parsed);
+            walk_decorators(&node.decorator_list, v);
+            if let Some(type_params) = &node.type_params {
+                walk_type_params(type_params, v);
+            }
+            if let Some(args) = &node.arguments {
+                for base in &args.args {
+                    v.visit_expr(base);
+                }
+                for kw in &args.keywords {
+                    v.visit_expr(&kw.value);
+                }
+            }
             v.nested_context = true;
-            for s in &cls.node(parsed).body {
+            for s in &node.body {
                 v.visit_stmt(s);
             }
             v.nested_context = false;
@@ -1570,11 +1600,80 @@ fn walk_owned(kind: &DefinitionKind<'_>, parsed: &ParsedModuleRef, v: &mut RefCo
                 }
             }
         }
-        DefinitionKind::For(for_stmt) => v.visit_expr(for_stmt.iterable(parsed)),
-        DefinitionKind::WithItem(item) => v.visit_expr(item.context_expr(parsed)),
         DefinitionKind::NamedExpression(named) => v.visit_expr(named.node(parsed).value.as_ref()),
-        DefinitionKind::TypeAlias(alias) => v.visit_expr(alias.node(parsed).value.as_ref()),
+        DefinitionKind::TypeAlias(alias) => {
+            let node = alias.node(parsed);
+            if let Some(type_params) = &node.type_params {
+                walk_type_params(type_params, v);
+            }
+            v.visit_expr(node.value.as_ref());
+        }
+        // For / WithItem / ExceptHandler / MatchPattern bindings are
+        // not modeled as top-level decls (see `decl_kind_str`), so
+        // their definitions never appear in `global_index` and
+        // `walk_owned` never runs for them. Their value-bearing
+        // sub-expressions (loop iterables, context managers, etc.)
+        // are walked instead from the module-level non-definition
+        // pass, where `Stmt::For` / `Stmt::With` / `Stmt::Try` get
+        // their normal `walk_stmt` recursion.
         _ => {}
+    }
+}
+
+fn walk_decorators(decorators: &[ruff_python_ast::Decorator], v: &mut RefCollector<'_, '_>) {
+    for d in decorators {
+        v.visit_expr(&d.expression);
+    }
+}
+
+fn walk_parameters(parameters: &ruff_python_ast::Parameters, v: &mut RefCollector<'_, '_>) {
+    for p in parameters
+        .posonlyargs
+        .iter()
+        .chain(&parameters.args)
+        .chain(&parameters.kwonlyargs)
+    {
+        if let Some(annotation) = &p.parameter.annotation {
+            v.visit_expr(annotation);
+        }
+        if let Some(default) = &p.default {
+            v.visit_expr(default);
+        }
+    }
+    if let Some(vararg) = &parameters.vararg {
+        if let Some(annotation) = &vararg.annotation {
+            v.visit_expr(annotation);
+        }
+    }
+    if let Some(kwarg) = &parameters.kwarg {
+        if let Some(annotation) = &kwarg.annotation {
+            v.visit_expr(annotation);
+        }
+    }
+}
+
+fn walk_type_params(type_params: &ruff_python_ast::TypeParams, v: &mut RefCollector<'_, '_>) {
+    for tp in &type_params.type_params {
+        match tp {
+            ruff_python_ast::TypeParam::TypeVar(t) => {
+                if let Some(bound) = &t.bound {
+                    v.visit_expr(bound);
+                }
+                if let Some(default) = &t.default {
+                    v.visit_expr(default);
+                }
+            }
+            ruff_python_ast::TypeParam::TypeVarTuple(t) => {
+                if let Some(default) = &t.default {
+                    v.visit_expr(default);
+                }
+            }
+            ruff_python_ast::TypeParam::ParamSpec(t) => {
+                if let Some(default) = &t.default {
+                    v.visit_expr(default);
+                }
+            }
+        }
     }
 }
 
@@ -1752,11 +1851,25 @@ impl<'a, 'db> RefCollector<'a, 'db> {
                 continue;
             };
             let use_def_map = index.use_def_map(scope_id);
+            // The first scope that *binds* this name wins, even if the
+            // binding has no graph node (function parameter, loop
+            // target, except-as, walrus inside a comprehension, …) —
+            // outer scopes are shadowed by this one. Free-variable
+            // references show up in `place_table` without producing
+            // any bindings, and for those we fall through to outer
+            // scopes (handled by `place_table.symbol_id` returning
+            // `Some` but the bindings iterator yielding nothing).
+            let mut saw_binding = false;
+            let mut result: Option<Resolution> = None;
             for binding in use_def_map.end_of_scope_symbol_bindings(symbol_id) {
                 let Some(def) = binding.binding.definition() else {
                     continue;
                 };
                 if def.file(db) != self.file {
+                    continue;
+                }
+                saw_binding = true;
+                if result.is_some() {
                     continue;
                 }
                 let kind = def.kind(db);
@@ -1767,23 +1880,20 @@ impl<'a, 'db> RefCollector<'a, 'db> {
                     range_key(kind.target_range(self.parsed)),
                 );
                 if let Some(&idx) = self.global_index.get(&key) {
-                    return Some(Resolution::Alias(idx));
+                    result = Some(Resolution::Alias(idx));
+                    continue;
                 }
-                // Not in global_index — the binding lives in a
-                // non-global scope. Imports are the only non-global
-                // bindings we care about (function parameters / local
-                // assigns / comprehension vars have no upstream to
-                // chase). For each nested import, hand back the spec
-                // and the actual bound name so the caller can emit
-                // parallel upstream edges from the enclosing owner.
                 if kind.is_import() {
                     let PlaceExprRef::Symbol(sym) = place_table.place(place_id) else {
                         continue;
                     };
                     let bound_name = sym.name().as_str().to_string();
                     let spec = import_payload_for(kind, db, self.file, self.parsed);
-                    return Some(Resolution::NestedImport { spec, bound_name });
+                    result = Some(Resolution::NestedImport { spec, bound_name });
                 }
+            }
+            if saw_binding {
+                return result;
             }
         }
         None
@@ -1801,6 +1911,15 @@ impl<'a, 'db> RefCollector<'a, 'db> {
     /// imports there's no alias node — go straight to the parallel
     /// edges, using the spec ty handed us.
     fn emit_name_use(&mut self, name: &ExprName, extra_chain: &[&str]) {
+        // `Name`s in non-`Load` context are binding sites, not uses:
+        // the `x` in `for x in data`, `with y as x`, `except E as x`,
+        // and the LHS of `x = ...` / `del x`. Skipping them keeps the
+        // graph free of spurious target → binding-source edges (and
+        // mirrors the libcst pipeline, which only emits edges for
+        // reads).
+        if !matches!(name.ctx, ruff_python_ast::ExprContext::Load) {
+            return;
+        }
         match self.find_local_binding(name) {
             Some(Resolution::Alias(alias_idx)) => {
                 self.emit_edge(alias_idx);
