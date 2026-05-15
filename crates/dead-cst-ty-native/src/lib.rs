@@ -989,11 +989,22 @@ fn walk_owned(kind: &DefinitionKind<'_>, parsed: &ParsedModuleRef, v: &mut RefCo
             }
             v.nested_context = false;
         }
-        DefinitionKind::Assignment(a) => v.visit_expr(a.value(parsed)),
+        DefinitionKind::Assignment(a) => {
+            let value = a.value(parsed);
+            if target_is_dunder_all(a.target(parsed)) {
+                emit_dunder_all_edges(v, value);
+            } else {
+                v.visit_expr(value);
+            }
+        }
         DefinitionKind::AnnotatedAssignment(a) => {
             v.visit_expr(a.annotation(parsed));
             if let Some(val) = a.value(parsed) {
-                v.visit_expr(val);
+                if target_is_dunder_all(a.target(parsed)) {
+                    emit_dunder_all_edges(v, val);
+                } else {
+                    v.visit_expr(val);
+                }
             }
         }
         DefinitionKind::For(for_stmt) => v.visit_expr(for_stmt.iterable(parsed)),
@@ -1001,6 +1012,44 @@ fn walk_owned(kind: &DefinitionKind<'_>, parsed: &ParsedModuleRef, v: &mut RefCo
         DefinitionKind::NamedExpression(named) => v.visit_expr(named.node(parsed).value.as_ref()),
         DefinitionKind::TypeAlias(alias) => v.visit_expr(alias.node(parsed).value.as_ref()),
         _ => {}
+    }
+}
+
+/// True iff `target` is the bare `Name("__all__")` LHS of an
+/// assignment (`__all__ = ...` or `__all__: list[str] = ...`).
+///
+/// Subscript / attribute / tuple-unpack targets (e.g.
+/// `__all__[0] = "f"`, `mod.__all__ = [...]`) are excluded — those
+/// don't redefine the binding in a way the libcst pipeline picks up,
+/// and treating them as `__all__` would emit edges from unrelated
+/// nodes.
+fn target_is_dunder_all(target: &Expr) -> bool {
+    matches!(target, Expr::Name(n) if n.id.as_str() == "__all__")
+}
+
+/// Walk the value of an `__all__` assignment and emit one edge from
+/// the owner (the `__all__` variable node) to each module-scope
+/// binding whose name appears in the list/tuple.
+///
+/// Only string-literal elements are followed; computed entries (e.g.
+/// `__all__ = [*BASE, "extra"]`, `__all__ = list(...)`) are silently
+/// skipped — matching the libcst pipeline, which folds `__all__` only
+/// when it's assigned a list or tuple of string literals. Names that
+/// don't resolve in the file's global scope are skipped without a
+/// warning (`__all__ = ["missing"]` is a runtime error at import
+/// time, not a static dep).
+fn emit_dunder_all_edges(v: &mut RefCollector<'_, '_>, value: &Expr) {
+    let elements = match value {
+        Expr::List(l) => &l.elts,
+        Expr::Tuple(t) => &t.elts,
+        _ => return,
+    };
+    for elem in elements {
+        if let Expr::StringLiteral(s) = elem {
+            if let Some(idx) = v.lookup_module_scope_name(s.value.to_str()) {
+                v.emit_edge(idx);
+            }
+        }
     }
 }
 
@@ -1074,6 +1123,40 @@ impl<'a, 'db> RefCollector<'a, 'db> {
         if dst != self.owner {
             self.edges.insert((self.owner, dst));
         }
+    }
+
+    /// Look up a name in the current file's global scope and return
+    /// its end-of-scope live binding's graph node.
+    ///
+    /// Used by the `__all__` walk: each string literal listed there
+    /// should resolve to a top-level decl (or import alias) bound in
+    /// the same file. Names that don't resolve are silently skipped —
+    /// `__all__ = ["missing"]` is a runtime error at import time but
+    /// doesn't influence static dep tracking.
+    fn lookup_module_scope_name(&self, name: &str) -> Option<usize> {
+        let db = self.model.db();
+        let index = semantic_index(db, self.file);
+        let global = FileScopeId::global();
+        let place_table = index.place_table(global);
+        let symbol_id = place_table.symbol_id(name)?;
+        let use_def_map = index.use_def_map(global);
+        for binding in use_def_map.end_of_scope_symbol_bindings(symbol_id) {
+            let Some(def) = binding.binding.definition() else {
+                continue;
+            };
+            if def.file(db) != self.file {
+                continue;
+            }
+            let key = (
+                self.file,
+                def.place(db),
+                range_key(def.kind(db).target_range(self.parsed)),
+            );
+            if let Some(&idx) = self.global_index.get(&key) {
+                return Some(idx);
+            }
+        }
+        None
     }
 
     /// Walk the use's scope chain looking for the reaching definition
