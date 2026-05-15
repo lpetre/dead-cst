@@ -20,15 +20,15 @@ for the full record.
 `PytestPlugin`, `UnittestPlugin` (with transitive `TestCase` discovery),
 `FastAPIPlugin`, `FlaskPlugin`, `TyperPlugin`, `ClickPlugin`,
 `CycloptsPlugin`, `DiscordPyPlugin`, `MockPatchPlugin`,
-`ServerConfigPlugin` (gunicorn / hypercorn config files), and
-`InitSubclassPlugin` shipped, but the existential risk is still
-"I tried it and it flagged half my codebase." The remaining common
-offenders:
+`ServerConfigPlugin` (gunicorn / hypercorn config files), `CeleryPlugin`,
+`FastMCPPlugin`, and `InitSubclassPlugin` shipped, but the existential
+risk is still "I tried it and it flagged half my codebase." The remaining
+common offenders:
 
 - Django URLConf, admin registration, signal handlers, management commands
 - Pydantic validators and field serializers
 - Descriptor-style hooks: `__set_name__`, dataclass `__post_init__`
-- SQLAlchemy declarative models / event listeners; Celery tasks / signals
+- SQLAlchemy declarative models / event listeners
 
 Surface a `--preset pytest,fastapi,django` shortcut that expands to the
 existing `--plugin` wiring, and document the entry-point group so third
@@ -157,7 +157,7 @@ demand.
 
 Folded down from earlier tiers as they landed:
 
-- **Unreleased**: ``from <pkg> import <name>`` now resolves through
+- **v0.10.0**: ``from <pkg> import <name>`` now resolves through
   ``from <other> import *`` re-exports. ``build_contribution`` runs a
   second pass after applying per-file payloads: for every module-level
   star, it looks the target up in the package's own trie plus each
@@ -176,17 +176,161 @@ Folded down from earlier tiers as they landed:
   keep-alive edges; "first writer wins" between two stars exporting
   the same name, not Python's "last star wins"
   (``test_limitations.py::last-star-wins-not-implemented``).
+- **v0.10.0**: Graph backend swapped from ``networkx.MultiDiGraph`` to a
+  minimal ``rustworkx.PyDiGraph`` wrapper
+  (``dead_cst._graphstore.SymbolGraph``). The wrapper exposes the
+  ``SymbolNode <-> int`` index bookkeeping (``add``, ``add_edge``,
+  ``index``, ``node``, ``subgraph``, ``nodes``, ``__contains__``,
+  ``__iter__``, ``__len__``) plus the raw rustworkx graph on
+  ``SymbolGraph.raw``; everything beyond that — edge-payload-aware
+  iteration, ``has_edge``, ``in_degree``, algorithm calls,
+  ``successor_indices`` / ``predecessor_indices`` traversal — goes
+  through ``.raw`` directly. Plugin extension points
+  (``PluginContext.graph``, ``Analysis.materialize_*`` return types)
+  are now ``SymbolGraph``. ``networkx`` is no longer a runtime
+  dependency; ``rustworkx>=0.15`` replaces it. ``_find_reachable`` /
+  ``_entrypoint_seeds`` operate in index space, so the pre-merge
+  ``SymbolNode -> int`` round-trip on every BFS invocation is gone.
+  **Breaking for plugin authors and downstream callers**: plugins
+  that called ``ctx.graph.successors(node)`` / ``predecessors(node)``
+  now write
+  ``ctx.graph.raw.successor_indices(ctx.graph.index(node))`` and
+  resolve back to a ``SymbolNode`` via ``ctx.graph.node(i)`` only when
+  the body needs the payload; index-keyed visited sets (``set[int]``)
+  replace ``set[SymbolNode]`` in BFS-shaped code.
+- **v0.10.0**: Per-package apply layer refactor.
+  ``PackageContribution`` became a raw record
+  (``frozenset[SymbolNode]`` / ``frozenset[(src, dst, EdgeFlags)]`` /
+  ``Mapping[Path, tuple[CodeRange, ...]]`` plus the trie and
+  import-edges) — no more ``nx.MultiDiGraph`` wrapper. The two-trie
+  design (``current_trie`` + ``export_trie``) collapses into one
+  ``trie``; consumer-side merges call the new
+  ``SymbolTrie.merge_exported``, which filters by
+  ``NodeFlags.EXPORTED`` while walking through unexported
+  intermediates so exported descendants stay reachable. The new
+  ``NodeFlags.EXPORTED`` tags every node from a file under
+  ``Package.exported`` (via the visitor's ``default_flags``
+  mechanism, same pattern as ``NOTEBOOK``); ``Package.exported`` now
+  participates in the per-package cache fingerprint via the new
+  ``package=`` argument on ``compute_fingerprint``, so editing
+  exported subdirs invalidates only that package's cache. Schema
+  bumped to 4; existing caches rebuild on first run. The apply layer
+  (``PackageContribution``, ``build_contribution``, ``_apply_payload``,
+  ``eclipsed_paths``) moved from ``_refresh.py`` into a new
+  ``_package.py`` module so ``_refresh.py`` hosts the per-file
+  pipeline (enumerate, parse, observe, cache) exclusively.
+- **v0.10.0**: ``PluginContext.package`` and
+  ``PluginContext.package_nodes`` folded into a single
+  ``PluginContext.contribution: PackageContribution`` field; read
+  ``ctx.contribution.package`` / ``ctx.contribution.nodes`` instead.
+  ``contribution`` also exposes the package-local ``trie``, raw
+  ``edges``, ``dead_suites``, and ``import_edges`` — fields plugins
+  previously couldn't reach. ``PluginContext.package_modules()`` and
+  ``PackageView.modules()`` removed (no in-tree consumers); callers
+  filter ``ctx.contribution.nodes`` / ``view.declarations()`` by
+  ``n.type == "module"``. ``PluginContext.importers`` removed too —
+  the synthetic-prefix walk + predecessor filter is inlined in
+  ``PackageView.importers_of``, which is the in-plugin equivalent.
+  ``AddNode`` drops its ``entrypoint: bool`` / ``testcase: bool``
+  fields; plugins that need an entrypoint synthetic stamp the flag at
+  construction: ``synthetic_node(..., flags=NodeFlags.ENTRYPOINT)``.
+  ``NodeFlags.ENTRYPOINT`` / ``TESTCASE`` are the only source of
+  truth for reachability seeds; the
+  ``graph.nodes[n]["entrypoint"]`` / ``"testcase"`` attr-dict mirror
+  is gone.
+- **v0.10.0**: Edge deduplication centralized in the compose pass.
+  One ``emitted: set[(src, dst, EdgeFlags)]`` owned by
+  ``_materialize`` is shared across the three edge sources
+  (contribution edges, ``resolve_edges`` import resolution, plugin
+  ``AddEdge`` ops), so cross-source and cross-package duplicates
+  collapse to one edge instead of accumulating as parallel
+  ``MultiDiGraph`` edges. ``resolve_edges`` and ``apply_ops`` both
+  take ``emitted`` as a required argument (breaking). Dead-suite
+  positions moved off the materialized graph onto the analysis
+  itself: ``Analysis.dead_suites()`` returns the merged
+  ``{file: tuple[CodeRange, ...]}`` mapping across every package's
+  contribution; the previous ``graph.graph["dead_suites"]`` attribute
+  is gone.
+- **v0.10.0**: The overlay / what-if API on ``Analysis`` is gone
+  (breaking): ``Analysis.preview_payloads``,
+  ``Analysis.materialize_with``, ``Analysis.preview``, and the
+  ``GraphView`` class (with its ``dead_cst.analyze`` re-export) have
+  been deleted. The design didn't pay its keep — callers comparing
+  baseline vs. perturbed reachability can construct a second
+  ``Analysis`` with a substitute detector or modified sources and
+  diff ``dead()`` directly. ``TruthinessResolver.resolve_constant``
+  and the ``DefaultUnreachableRegionDetector.resolve(expr, resolver)``
+  hook stay — they're independently useful for custom detectors.
+  The file-vs-package precedence case (``foo.py`` next to
+  ``foo/__init__.py``) is now called **eclipsed** to disambiguate
+  from ``NodeFlags.SHADOWED`` (intra-file decl rebinding, unchanged);
+  the helper is ``eclipsed_paths`` and the warning text says
+  "eclipsed by sibling package".
+- **v0.10.0**: ``FastMCPPlugin``
+  (``dead_cst.contrib.fastmcp``, registered as the ``fastmcp``
+  builtin) marks top-level ``X = FastMCP(...)`` server instances as
+  entrypoints (the ``fastmcp`` CLI loads ``module:mcp`` by import
+  path the same way ``uvicorn`` loads a FastAPI ``module:app``) and
+  wires ``@mcp.tool`` / ``@mcp.resource`` / ``@mcp.prompt`` /
+  ``@mcp.completion`` decorators on top-level functions through the
+  owning server. Supports the
+  ``def create_server() -> FastMCP: ...`` factory shape across
+  packages via the shared ``DispatchAppPlugin`` factory-marker
+  mechanism. Only the ``fastmcp`` import path is recognized; the
+  Anthropic MCP SDK's compatibility re-export
+  (``mcp.server.fastmcp.FastMCP``) is not detected.
+- **v0.10.0**: ``CeleryPlugin``
+  (``dead_cst.contrib.celery``, registered as the ``celery``
+  builtin) marks top-level ``X = Celery(...)`` app instances as
+  entrypoints (the Celery worker process loads ``module:app`` by
+  import path via ``celery -A``), wires ``@app.task`` /
+  ``@app.task(...)`` decorators on top-level functions through the
+  owning app, supports the ``def make_celery(): return Celery(...)``
+  factory shape across packages via a factory marker, and seeds
+  module-level ``@shared_task`` / ``@shared_task(...)`` decorated
+  functions (with ``shared_task`` imported from ``celery``) as
+  entrypoints directly — ``shared_task`` registers into Celery's
+  global registry with no owning app variable to wire through.
+  Closes the Celery tasks / signals entry in Tier 1 #1.
+- **v0.10.0**: ``DispatchAppPlugin`` (in
+  ``dead_cst.plugins.decl_shapes``) is now the shared base for
+  ``FlaskPlugin``, ``FastAPIPlugin``, and ``CeleryPlugin`` in
+  addition to ``TyperPlugin`` / ``CycloptsPlugin``. The base learned
+  an opt-in factory-aware mode driven by a new
+  ``instance_kinds: Mapping[str, bool]`` field: when set, the plugin
+  emits ``<{name}-app>:`` / ``<{name}-pending>:`` /
+  ``<{name}-factory>:`` synthetics and runs a per-package finalize
+  pass that walks pending variables forward to a discriminating
+  import node or factory marker before promoting the matching kinds
+  to entrypoints. When ``instance_kinds`` is empty (Typer /
+  Cyclopts) the plugin behaves as before: pure observe, no
+  entrypoint promotion. Flask / FastAPI / Celery now consist almost
+  entirely of their handler / kind config, with Celery's
+  ``@shared_task`` channel as its only override. No user-visible
+  behavior change.
+- **v0.10.0**: Jupyter notebook (``.ipynb``) support. Every
+  ``.ipynb`` file under a package root is ingested by concatenating
+  its code cells into a single libcst-parseable module; IPython line
+  magics (``%foo``), cell magics (``%%bash``), shell escapes
+  (``!ls``), and trailing-help forms (``obj?``, ``obj.attr??``) are
+  neutralized to ``pass  # <line>`` so libcst accepts the source.
+  ``NodeFlags.NOTEBOOK`` stamps every ``SymbolNode`` sourced from a
+  notebook, and ``_refresh._process_one_file`` sets
+  ``default_flags=NOTEBOOK | ENTRYPOINT`` so a notebook's contents
+  are reachability seeds and any ``.py`` code the notebook imports
+  stays alive. Notebooks aren't importable, so their decls are
+  deliberately kept out of the cross-module lookup trie. The codemod
+  (``generate_patch`` / ``remove_code``) skips ``NodeFlags.NOTEBOOK``
+  nodes; cell-aware writeback into the notebook JSON envelope is out
+  of scope.
 - **v0.9.4**: ``PluginContext`` gained ``package_graph`` and
   ``module_nodes`` fields plus a ``package_nodes()`` snapshot method,
   replacing two filter passes that ran on the merged cross-package
   ``graph`` every finalize pass: ``Path.is_relative_to`` (~9 ms → ~40
   µs on the dead-cst self-analysis) and ``type == "module"`` (~50 µs →
-  ~4 µs). The unreleased follow-ups in ``_package.py`` (see CHANGELOG
-  ``[Unreleased]``) reshaped this further: ``PackageContribution``
-  became a raw record (no ``nx.MultiDiGraph`` wrapper); the per-package
-  ``trie``, raw edges, dead-suite map, and import-edges are now
-  surfaced on ``PluginContext`` via a single ``ctx.contribution: PackageContribution``
-  field; and ``package`` / ``package_nodes`` / ``package_graph`` /
+  ~4 µs). The v0.10.0 follow-ups in ``_package.py`` (see the
+  ``PackageContribution`` raw-record entry above) reshaped this
+  further — ``package`` / ``package_nodes`` / ``package_graph`` /
   ``module_nodes`` / ``package_modules()`` / ``PackageView.modules()``
   were removed for having no in-tree consumers (plugins read
   ``ctx.contribution.package`` / ``ctx.contribution.nodes``).
