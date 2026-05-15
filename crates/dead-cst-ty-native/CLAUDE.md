@@ -34,12 +34,45 @@ any other "snapshot the visitor output" layer. Trust the Salsa db.
 ### 2. Every import binds a local declaration
 
 Every import materializes a `kind="import"` node in the *importing*
-file. Use-site edges flow *through* the local decl, never around it:
+file. A use of an imported name always emits an edge to its local
+alias — that's the codemod invariant: the codemod removes an import
+node iff its in-edge count is zero, so the use must show up in those
+in-edges. **It also makes "what does this file consume" a faithful
+per-file query** without having to walk cross-file edges.
 
 ```
 mod.f  ─uses→  mod.bar  ─aliases→  foo.bar
                 (local)             (cross-file)
 ```
+
+The alias edge is required; it is **not exclusive**. A single use
+may carry additional parallel edges directly to the upstream module
+and decl. These extra edges exist because static reachability needs
+the granularity:
+
+* For `import foo.bar; foo.bar.f()`, the local alias binds *only*
+  the name `foo` — the runtime `foo` module object. Without parallel
+  edges, the function `foo.bar.f` is never reached from the use, and
+  reachability marks it dead. The use therefore emits `use → alias`
+  **and** `use → foo.bar` **and** `use → foo.bar.f`.
+* For `from foo import bar; bar()`, the use emits `use → alias`
+  **and** `use → foo.bar` (the upstream decl) **and** `use → foo`
+  (the upstream module).
+
+Concrete contract:
+
+* **Codemod invariant.** Every use of an imported name emits exactly
+  one edge to the local alias. An unused import has zero in-edges
+  and is safe to drop.
+* **Reachability edges (parallel).** When ty's module resolver /
+  global-scope lookup can pin the use to specific upstream targets,
+  the use also emits direct edges to each of them. These edges
+  bypass the alias for reachability purposes but do not replace it.
+* **Attribute chains on aliased modules.** A chain `name.seg1.seg2`
+  rooted at an aliased module is walked segment by segment. Each
+  segment that resolves as a submodule or as a global-scope decl
+  emits a parallel `use → target` edge. The walk stops on the first
+  segment that resolves as neither (or at the chain's end).
 
 This applies equally to:
 
@@ -51,12 +84,6 @@ This applies equally to:
   name. The libcst pipeline labels these `NodeFlags.STAR_REEXPORT`;
   in the rust path the `kind == "import"` plus a missing source
   position (it's synthetic) is enough.
-
-**Why local-first**: the codemod removes import nodes when they have
-no in-edges, which only works if use-site edges terminate at the
-local decl rather than jumping straight to the upstream module. It
-also makes "what does this file consume" a faithful per-file query
-without having to walk cross-file edges.
 
 ### 3. Shadowed declarations are first-class graph nodes
 
