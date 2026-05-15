@@ -12,5 +12,6 @@ classifiers = [
 ]
 
 [tool.maturin]
-module-name = "dead_cst_ty_native"
+module-name = "dead_cst_ty_native.dead_cst_ty_native"
+python-source = "python"
 features = ["pyo3/extension-module"]
