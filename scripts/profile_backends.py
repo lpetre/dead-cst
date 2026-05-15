@@ -42,12 +42,14 @@ import subprocess
 import sys
 import tempfile
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
 from dead_cst import Analysis
 from dead_cst.cache import GraphCache
-from dead_cst.resolvers import ManualResolver
+from dead_cst.resolvers import ManualResolver, UvResolver
+from dead_cst.resolvers._core import PathResolver
 
 # The visitor logs WARNING-level breadcrumbs for things like
 # ``importlib.import_module(<not-a-literal>)``. Useful in normal runs,
@@ -119,6 +121,24 @@ def _clone_flux0(cache_root: Path) -> Path:
     return dest
 
 
+def _ensure_flux0_venv(flux0_root: Path) -> Path:
+    """Run ``uv sync --all-packages`` in the clone so :class:`UvResolver`
+    finds a ``.venv``. Skipped if one already exists at the workspace root.
+    Returns the path to the venv."""
+    venv = flux0_root / ".venv"
+    if venv.is_dir():
+        return venv
+    if shutil.which("uv") is None:
+        raise RuntimeError("uv not on PATH; cannot create flux0 workspace venv")
+    print(f"  (one-time setup: uv sync --all-packages in {flux0_root})")
+    subprocess.run(
+        ["uv", "sync", "--all-packages"],
+        cwd=flux0_root,
+        check=True,
+    )
+    return venv
+
+
 # ---------------------------------------------------------------------------
 # Bridge (inlined so the script doesn't depend on the test package layout)
 # ---------------------------------------------------------------------------
@@ -165,34 +185,56 @@ def _time(fn: Callable[[], object]) -> float:
     return time.perf_counter() - t0
 
 
-def _bench_libcst_cold(target_root: Path, repeats: int) -> list[float]:
+@dataclass
+class TargetConfig:
+    """Per-target settings for the bench drivers.
+
+    ``make_resolver`` is a factory so every libcst run gets a fresh
+    resolver instance (some resolvers carry per-analysis state like
+    ``UvResolver._site_packages`` that gets primed during ``resolve``).
+
+    ``rust_kwargs`` are forwarded to ``native.Project`` — typically
+    ``python_env`` for workspace targets so ty resolves third-party
+    imports through the workspace's own ``.venv`` rather than the
+    active interpreter's.
+    """
+
+    name: str
+    root: Path
+    make_resolver: Callable[[], PathResolver]
+    rust_kwargs: dict[str, object] = field(default_factory=dict)
+
+
+def _bench_libcst_cold(cfg: TargetConfig, repeats: int) -> list[float]:
     timings: list[float] = []
     for _ in range(repeats):
-        analysis = Analysis(target_root, resolver=ManualResolver(specs=["."]), cache=None)
+        analysis = Analysis(cfg.root, resolver=cfg.make_resolver(), cache=None)
         timings.append(_time(analysis.materialize_all))
     return timings
 
 
-def _bench_libcst_warm(target_root: Path, repeats: int) -> list[float]:
+def _bench_libcst_warm(cfg: TargetConfig, repeats: int) -> list[float]:
     with tempfile.TemporaryDirectory(prefix="dead-cst-bench-cache-") as cd:
         cache_path = Path(cd) / "cache.sqlite"
         with GraphCache(cache_path) as cache:
             # Warm-up: populate the cache with one full run.
-            Analysis(
-                target_root, resolver=ManualResolver(specs=["."]), cache=cache
-            ).materialize_all()
+            Analysis(cfg.root, resolver=cfg.make_resolver(), cache=cache).materialize_all()
             timings: list[float] = []
             for _ in range(repeats):
-                analysis = Analysis(target_root, resolver=ManualResolver(specs=["."]), cache=cache)
+                analysis = Analysis(cfg.root, resolver=cfg.make_resolver(), cache=cache)
                 timings.append(_time(analysis.materialize_all))
             return timings
 
 
-def _bench_rust_cold(target_root: Path, repeats: int) -> list[float]:
+def _new_native_project(cfg: TargetConfig) -> "native.Project":
+    return native.Project(str(cfg.root), **cfg.rust_kwargs)
+
+
+def _bench_rust_cold(cfg: TargetConfig, repeats: int) -> list[float]:
     timings: list[float] = []
     for _ in range(repeats):
         # Fresh Project per iter → fresh ty Salsa db → cold.
-        proj = native.Project(str(target_root))
+        proj = _new_native_project(cfg)
 
         def _run() -> None:
             g = proj.build()
@@ -202,8 +244,8 @@ def _bench_rust_cold(target_root: Path, repeats: int) -> list[float]:
     return timings
 
 
-def _bench_rust_warm(target_root: Path, repeats: int) -> list[float]:
-    proj = native.Project(str(target_root))
+def _bench_rust_warm(cfg: TargetConfig, repeats: int) -> list[float]:
+    proj = _new_native_project(cfg)
     # Warm-up: prime Salsa.
     g = proj.build()
     _bridge_materialize(g)
@@ -241,17 +283,17 @@ def _fmt_ms(timings: list[float]) -> str:
     return f"{best:7.0f} ms   (best of {len(timings)}, worst {worst:.0f} ms)"
 
 
-def _run_target(name: str, target_root: Path, repeats: int) -> None:
-    files = _file_count(target_root)
-    print(f"\n=== {name} ===")
-    print(f"  path:  {target_root}")
+def _run_target(cfg: TargetConfig, repeats: int) -> None:
+    files = _file_count(cfg.root)
+    print(f"\n=== {cfg.name} ===")
+    print(f"  path:  {cfg.root}")
     print(f"  files: {files}")
 
-    print(f"  libcst cold : {_fmt_ms(_bench_libcst_cold(target_root, repeats))}")
-    print(f"  libcst warm : {_fmt_ms(_bench_libcst_warm(target_root, repeats))}")
+    print(f"  libcst cold : {_fmt_ms(_bench_libcst_cold(cfg, repeats))}")
+    print(f"  libcst warm : {_fmt_ms(_bench_libcst_warm(cfg, repeats))}")
     if HAS_RUST:
-        print(f"  rust   cold : {_fmt_ms(_bench_rust_cold(target_root, repeats))}")
-        print(f"  rust   warm : {_fmt_ms(_bench_rust_warm(target_root, repeats))}")
+        print(f"  rust   cold : {_fmt_ms(_bench_rust_cold(cfg, repeats))}")
+        print(f"  rust   warm : {_fmt_ms(_bench_rust_warm(cfg, repeats))}")
     else:
         print(f"  rust   cold : SKIP (dead_cst_ty_native: {_RUST_IMPORT_ERROR})")
         print("  rust   warm : SKIP")
@@ -270,9 +312,9 @@ def main() -> None:
     parser.add_argument(
         "--targets",
         nargs="+",
-        default=["dead_cst", "flux0_server"],
-        choices=["dead_cst", "flux0_server", "flux0_cli"],
-        help="Which targets to profile (default: dead_cst flux0_server)",
+        default=["dead_cst", "flux0_server", "flux0_workspace"],
+        choices=["dead_cst", "flux0_server", "flux0_cli", "flux0_workspace"],
+        help="Which targets to profile (default: dead_cst flux0_server flux0_workspace)",
     )
     parser.add_argument(
         "--no-flux0",
@@ -292,7 +334,14 @@ def main() -> None:
     print(f"repeats: {args.repeats}")
 
     if "dead_cst" in args.targets:
-        _run_target("dead_cst (self)", _stage_dead_cst(), args.repeats)
+        _run_target(
+            TargetConfig(
+                name="dead_cst (self)",
+                root=_stage_dead_cst(),
+                make_resolver=lambda: ManualResolver(specs=["."]),
+            ),
+            args.repeats,
+        )
 
     flux0_targets = [t for t in args.targets if t.startswith("flux0_")]
     if flux0_targets and not args.no_flux0:
@@ -303,9 +352,38 @@ def main() -> None:
             print(f"\nflux0 SKIP: {e}")
             return
         if "flux0_server" in flux0_targets:
-            _run_target("flux0 server", flux0_root / "packages" / "server" / "src", args.repeats)
+            _run_target(
+                TargetConfig(
+                    name="flux0 server",
+                    root=flux0_root / "packages" / "server" / "src",
+                    make_resolver=lambda: ManualResolver(specs=["."]),
+                ),
+                args.repeats,
+            )
         if "flux0_cli" in flux0_targets:
-            _run_target("flux0 cli", flux0_root / "packages" / "cli" / "src", args.repeats)
+            _run_target(
+                TargetConfig(
+                    name="flux0 cli",
+                    root=flux0_root / "packages" / "cli" / "src",
+                    make_resolver=lambda: ManualResolver(specs=["."]),
+                ),
+                args.repeats,
+            )
+        if "flux0_workspace" in flux0_targets:
+            try:
+                venv = _ensure_flux0_venv(flux0_root)
+            except (RuntimeError, subprocess.CalledProcessError) as e:
+                print(f"\nflux0_workspace SKIP: {e}")
+                return
+            _run_target(
+                TargetConfig(
+                    name="flux0 workspace (uv)",
+                    root=flux0_root,
+                    make_resolver=UvResolver,
+                    rust_kwargs={"python_env": str(venv)},
+                ),
+                args.repeats,
+            )
 
 
 if __name__ == "__main__":
