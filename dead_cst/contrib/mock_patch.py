@@ -92,6 +92,8 @@ from ..plugins._core import (
 )
 
 if TYPE_CHECKING:
+    import dead_cst_ty_native as native
+
     from ..graph import VisitorPayload
 
 PATCH_TARGET_PREFIX = "<patch-target>:"
@@ -168,6 +170,43 @@ class MockPatchPlugin:
             mod = modules_cache[fqname]
             if mod is not None and mod not in existing:
                 yield AddEdge(node, mod)
+
+    def run(self, ctx: "native.ProjectContext") -> None:
+        pairs: list[tuple[native.NativeNode, str]] = []
+        for module in _MOCK_MODULES:
+            pairs.extend(ctx.find_calls_to_imported(module, "patch", 0))
+        pairs.extend(ctx.find_calls_on_var(_MOCKER_NAME, "patch", 0, required_positional=None))
+        for attr, required in _MONKEYPATCH_FQNAME_METHODS.items():
+            pairs.extend(
+                ctx.find_calls_on_var(_MONKEYPATCH_NAME, attr, 0, required_positional=required)
+            )
+
+        # Dedupe per (owner, fqname) to mirror the libcst plugin's
+        # ``dict.fromkeys`` collapse across multiple patch calls in the
+        # same owner.
+        seen: set[tuple[str, str, str]] = set()
+        markers: dict[str, native.NativeNode] = {}
+        for owner, fqname in pairs:
+            key = (owner.path, owner.fqname, fqname)
+            if key in seen:
+                continue
+            seen.add(key)
+            marker = markers.get(fqname)
+            if marker is None:
+                marker = ctx.add_node(
+                    fqname=f"{PATCH_TARGET_PREFIX}{fqname}",
+                    path=owner.path,
+                )
+                markers[fqname] = marker
+            ctx.add_edge(owner, marker)
+
+        # Resolve each marker's fqname to first-party decls / modules.
+        for fqname, marker in markers.items():
+            for decl in ctx.find_declarations(fqname):
+                ctx.add_edge(marker, decl)
+            mod = ctx.find_module(fqname)
+            if mod is not None:
+                ctx.add_edge(marker, mod)
 
 
 def _collect_mock_imports(module: cst.Module) -> tuple[set[str], set[str]]:
