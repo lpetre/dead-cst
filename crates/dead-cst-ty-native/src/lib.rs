@@ -1499,6 +1499,7 @@ fn emit_reference_edges(
         return;
     };
     let parsed = parsed_module(db, file).load(db);
+    let dead_ranges = detect_dead_ranges(&parsed);
     let index = semantic_index(db, file);
     let global = FileScopeId::global();
     let use_def_map = index.use_def_map(global);
@@ -1529,6 +1530,7 @@ fn emit_reference_edges(
             module_nodes,
             alias_imports,
             live_decls,
+            &dead_ranges,
         );
         walk_owned(kind, &parsed, &mut coll);
         coll.flush(builder);
@@ -1549,6 +1551,7 @@ fn emit_reference_edges(
             module_nodes,
             alias_imports,
             live_decls,
+            &dead_ranges,
         );
         coll.visit_stmt(stmt);
         coll.flush(builder);
@@ -1782,7 +1785,18 @@ struct RefCollector<'a, 'db> {
     module_nodes: &'a HashMap<File, usize>,
     alias_imports: &'a HashMap<usize, ImportSpec>,
     live_decls: &'a LiveDeclIndex,
-    edges: HashSet<(usize, usize)>,
+    /// Ranges of statically-dead source regions in the current file
+    /// (`if False:` bodies, statements after a `return`/`raise`/`break`/
+    /// `continue`/`assert <falsy>`, etc.). A use whose source range
+    /// is `contains_range`-covered by any of these gets
+    /// `EdgeFlags::DEAD_BRANCH` stamped on every edge it emits.
+    dead_ranges: &'a [TextRange],
+    /// Edges accumulated for this collector pass. The value is the
+    /// AND of the flags contributed by each reference that produced
+    /// this `(src, dst)` pair — so a `(src, dst)` reachable from both
+    /// a live and a dead reference loses `DEAD_BRANCH` (the live ref
+    /// wins), matching the libcst pipeline's parallel-edge semantics.
+    edges: HashMap<(usize, usize), u32>,
     /// `true` while walking a function- or class-body subtree. In
     /// that context, nested `Stmt::Import` / `Stmt::ImportFrom`
     /// statements emit parallel upstream edges from `owner` (no
@@ -1791,6 +1805,10 @@ struct RefCollector<'a, 'db> {
     /// double-emit for imports that `emit_import_edges` already
     /// processed via their proper alias nodes.
     nested_context: bool,
+    /// Flags stamped on each edge emitted by the current reference
+    /// (set by `emit_name_use` / nested-import handlers based on the
+    /// reference's source position; cleared afterward).
+    current_flags: u32,
 }
 
 impl<'a, 'db> RefCollector<'a, 'db> {
@@ -1804,6 +1822,7 @@ impl<'a, 'db> RefCollector<'a, 'db> {
         module_nodes: &'a HashMap<File, usize>,
         alias_imports: &'a HashMap<usize, ImportSpec>,
         live_decls: &'a LiveDeclIndex,
+        dead_ranges: &'a [TextRange],
     ) -> Self {
         Self {
             owner,
@@ -1814,20 +1833,36 @@ impl<'a, 'db> RefCollector<'a, 'db> {
             module_nodes,
             alias_imports,
             live_decls,
-            edges: HashSet::new(),
+            dead_ranges,
+            edges: HashMap::new(),
             nested_context: false,
+            current_flags: 0,
         }
     }
 
     fn flush(self, builder: &mut GraphBuilder) {
-        for (src, dst) in self.edges {
-            builder.add_edge(src, dst, 0);
+        for ((src, dst), flags) in self.edges {
+            builder.add_edge(src, dst, flags);
         }
     }
 
     fn emit_edge(&mut self, dst: usize) {
         if dst != self.owner {
-            self.edges.insert((self.owner, dst));
+            let flags = self.current_flags;
+            self.edges
+                .entry((self.owner, dst))
+                .and_modify(|f| *f &= flags)
+                .or_insert(flags);
+        }
+    }
+
+    /// Returns `EDGE_FLAG_DEAD_BRANCH` if `range` is contained in any
+    /// dead-region recorded for this file, else `0`.
+    fn flags_for_range(&self, range: TextRange) -> u32 {
+        if self.dead_ranges.iter().any(|r| r.contains_range(range)) {
+            EDGE_FLAG_DEAD_BRANCH
+        } else {
+            0
         }
     }
 
@@ -1960,6 +1995,7 @@ impl<'a, 'db> RefCollector<'a, 'db> {
         if !matches!(name.ctx, ruff_python_ast::ExprContext::Load) {
             return;
         }
+        self.current_flags = self.flags_for_range(name.range());
         for resolution in self.find_local_bindings(name) {
             match resolution {
                 Resolution::Alias(alias_idx) => {
@@ -1973,6 +2009,7 @@ impl<'a, 'db> RefCollector<'a, 'db> {
                 }
             }
         }
+        self.current_flags = 0;
     }
 
     fn emit_upstream(&mut self, spec: &ImportSpec, bound_name: &str, extra_chain: &[&str]) {
@@ -2136,6 +2173,7 @@ impl<'a, 'db> RefCollector<'a, 'db> {
     /// that's correct for use sites but wrong for the import
     /// statement itself).
     fn emit_nested_import(&mut self, stmt: &ruff_python_ast::StmtImport) {
+        self.current_flags = self.flags_for_range(stmt.range);
         for alias in &stmt.names {
             let dotted = alias.name.id.as_str();
             let first_seg = dotted.split('.').next().unwrap_or(dotted);
@@ -2150,6 +2188,7 @@ impl<'a, 'db> RefCollector<'a, 'db> {
             };
             self.emit_upstream(&spec, bound_name, &synthetic_chain);
         }
+        self.current_flags = 0;
     }
 
     /// Handle `from X import ...` inside a function/class body.
@@ -2166,6 +2205,7 @@ impl<'a, 'db> RefCollector<'a, 'db> {
             return;
         };
         let module_str = module_name.as_str().to_string();
+        self.current_flags = self.flags_for_range(stmt.range);
         for alias in &stmt.names {
             let name = alias.name.id.as_str();
             if name == "*" {
@@ -2183,6 +2223,7 @@ impl<'a, 'db> RefCollector<'a, 'db> {
             };
             self.emit_upstream(&spec, bound_name, &[]);
         }
+        self.current_flags = 0;
     }
 
     /// Fan a nested `from X import *` out to every non-underscore
@@ -2682,6 +2723,407 @@ fn rel_path<P: AsRef<str>>(path: P) -> RelativePathBuf {
 const NODE_FLAG_ENTRYPOINT: u32 = 2;
 const NODE_FLAG_NOQA: u32 = 16;
 const NODE_FLAGS_NOQA_PIN: u32 = NODE_FLAG_ENTRYPOINT | NODE_FLAG_NOQA;
+
+/// `EdgeFlags::DEAD_BRANCH = enum.auto()` in `dead_cst.graph` —
+/// first non-`NONE` bit, value `1`. Stamped on every edge produced
+/// by a use site that lives inside a statically-dead region.
+const EDGE_FLAG_DEAD_BRANCH: u32 = 1;
+
+// ---------------------------------------------------------------------------
+// Dead-region detection
+// ---------------------------------------------------------------------------
+
+/// Collect the source ranges of every statically-dead statement in
+/// `parsed` — bodies of `if False` / `else` of `if True` / `while False`
+/// / `while True else` branches, statements after an unconditional
+/// terminator (`return` / `raise` / `break` / `continue` /
+/// `assert <falsy>`), and the suites of compound terminators (an
+/// `if/elif/else` whose every branch terminates, a `try` whose body
+/// and every handler terminate, a `with` whose body terminates).
+///
+/// The result is a flat `Vec<TextRange>`; callers use
+/// `TextRange::contains_range` to test whether a use site sits
+/// inside any of them.
+/// Per-scope name → known-truthiness map. Populated by
+/// `build_scope_table` from the scope's literal assignments,
+/// annotated assignments, and walrus expressions. Function and class
+/// bodies inherit and override their enclosing scope's table.
+type NameTable = HashMap<String, bool>;
+
+fn detect_dead_ranges(parsed: &ParsedModuleRef) -> Vec<TextRange> {
+    let mut dead = Vec::new();
+    let empty: NameTable = HashMap::new();
+    let module_table = build_scope_table(&parsed.syntax().body, &empty);
+    walk_suite_for_dead(&parsed.syntax().body, &module_table, &mut dead);
+    dead
+}
+
+fn walk_suite_for_dead(stmts: &[Stmt], table: &NameTable, dead: &mut Vec<TextRange>) {
+    let mut killed = false;
+    for stmt in stmts {
+        if killed {
+            // Past an in-suite terminator. Mark this stmt's range as
+            // dead and don't recurse — descendant uses are covered by
+            // the outer range.
+            dead.push(stmt.range());
+            continue;
+        }
+        walk_compound_for_dead(stmt, table, dead);
+        if stmt_is_terminator(stmt, table) {
+            killed = true;
+        }
+    }
+}
+
+fn walk_compound_for_dead(stmt: &Stmt, table: &NameTable, dead: &mut Vec<TextRange>) {
+    match stmt {
+        Stmt::If(if_stmt) => {
+            let mut taken = false;
+            match evaluate_truthiness(&if_stmt.test, table) {
+                Some(true) => {
+                    walk_suite_for_dead(&if_stmt.body, table, dead);
+                    taken = true;
+                }
+                Some(false) => {
+                    for s in &if_stmt.body {
+                        dead.push(s.range());
+                    }
+                }
+                None => {
+                    walk_suite_for_dead(&if_stmt.body, table, dead);
+                }
+            }
+            for clause in &if_stmt.elif_else_clauses {
+                if taken {
+                    dead.push(clause.range);
+                    continue;
+                }
+                match &clause.test {
+                    Some(test) => match evaluate_truthiness(test, table) {
+                        Some(true) => {
+                            walk_suite_for_dead(&clause.body, table, dead);
+                            taken = true;
+                        }
+                        Some(false) => {
+                            for s in &clause.body {
+                                dead.push(s.range());
+                            }
+                        }
+                        None => walk_suite_for_dead(&clause.body, table, dead),
+                    },
+                    None => walk_suite_for_dead(&clause.body, table, dead),
+                }
+            }
+        }
+        Stmt::While(w) => match evaluate_truthiness(&w.test, table) {
+            Some(false) => {
+                for s in &w.body {
+                    dead.push(s.range());
+                }
+                walk_suite_for_dead(&w.orelse, table, dead);
+            }
+            Some(true) => {
+                walk_suite_for_dead(&w.body, table, dead);
+                for s in &w.orelse {
+                    dead.push(s.range());
+                }
+            }
+            None => {
+                walk_suite_for_dead(&w.body, table, dead);
+                walk_suite_for_dead(&w.orelse, table, dead);
+            }
+        },
+        Stmt::For(f) => {
+            walk_suite_for_dead(&f.body, table, dead);
+            walk_suite_for_dead(&f.orelse, table, dead);
+        }
+        Stmt::With(w) => walk_suite_for_dead(&w.body, table, dead),
+        Stmt::Try(t) => {
+            walk_suite_for_dead(&t.body, table, dead);
+            for handler in &t.handlers {
+                let ruff_python_ast::ExceptHandler::ExceptHandler(h) = handler;
+                walk_suite_for_dead(&h.body, table, dead);
+            }
+            walk_suite_for_dead(&t.orelse, table, dead);
+            walk_suite_for_dead(&t.finalbody, table, dead);
+        }
+        Stmt::FunctionDef(f) => {
+            let nested = build_scope_table(&f.body, table);
+            walk_suite_for_dead(&f.body, &nested, dead);
+        }
+        Stmt::ClassDef(c) => {
+            let nested = build_scope_table(&c.body, table);
+            walk_suite_for_dead(&c.body, &nested, dead);
+        }
+        Stmt::Match(m) => {
+            for case in &m.cases {
+                walk_suite_for_dead(&case.body, table, dead);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Does `stmt` unconditionally hand off control out of the enclosing
+/// suite? Statements *after* a terminator in the same suite are dead.
+///
+/// Bare terminators are `return` / `raise` / `break` / `continue`
+/// plus `assert <falsy>`. Compound forms (`if/elif/else`, `try`,
+/// `with`, `match`) are terminators when every reachable path inside
+/// them ends in one.
+fn stmt_is_terminator(stmt: &Stmt, table: &NameTable) -> bool {
+    match stmt {
+        Stmt::Return(_) | Stmt::Raise(_) | Stmt::Break(_) | Stmt::Continue(_) => true,
+        Stmt::Assert(a) => evaluate_truthiness(&a.test, table) == Some(false),
+        Stmt::If(if_stmt) => {
+            // A constant-truthy `if` is unconditional: it's a
+            // terminator iff its body terminates, with or without
+            // any else (`if True: return; …` kills the rest of
+            // the enclosing suite).
+            if evaluate_truthiness(&if_stmt.test, table) == Some(true) {
+                return suite_terminates(&if_stmt.body, table);
+            }
+            // Otherwise we need an else for completeness — without
+            // one, the `if` (or every `elif`) might not fire and the
+            // suite continues normally.
+            let has_else = if_stmt
+                .elif_else_clauses
+                .last()
+                .is_some_and(|c| c.test.is_none());
+            if !has_else {
+                return false;
+            }
+            let test = evaluate_truthiness(&if_stmt.test, table);
+            let body_term = suite_terminates(&if_stmt.body, table) || test == Some(false);
+            let clauses_term = if_stmt
+                .elif_else_clauses
+                .iter()
+                .all(|c| suite_terminates(&c.body, table));
+            body_term && clauses_term
+        }
+        Stmt::With(w) => suite_terminates(&w.body, table),
+        Stmt::Try(t) => {
+            if suite_terminates(&t.finalbody, table) {
+                return true;
+            }
+            suite_terminates(&t.body, table)
+                && t.handlers.iter().all(|h| {
+                    let ruff_python_ast::ExceptHandler::ExceptHandler(eh) = h;
+                    suite_terminates(&eh.body, table)
+                })
+        }
+        _ => false,
+    }
+}
+
+fn suite_terminates(stmts: &[Stmt], table: &NameTable) -> bool {
+    stmts.iter().any(|s| stmt_is_terminator(s, table))
+}
+
+/// Constant-fold the truthiness of `expr`. Returns `None` when the
+/// expression doesn't reduce to a known value — names not in `table`,
+/// calls, attribute access, comparisons, etc.
+///
+/// `BoolOp` (`and` / `or`) short-circuits the way Python does:
+/// `True or anything` is `True` even when "anything" is unknown.
+/// `not` flips a known truth value through `UnaryOp`.
+fn evaluate_truthiness(expr: &Expr, table: &NameTable) -> Option<bool> {
+    match expr {
+        Expr::BooleanLiteral(b) => Some(b.value),
+        Expr::NoneLiteral(_) => Some(false),
+        Expr::EllipsisLiteral(_) => Some(true),
+        Expr::NumberLiteral(n) => match &n.value {
+            ruff_python_ast::Number::Int(i) => i.as_i64().map(|x| x != 0),
+            ruff_python_ast::Number::Float(f) => Some(*f != 0.0),
+            ruff_python_ast::Number::Complex { real, imag } => Some(*real != 0.0 || *imag != 0.0),
+        },
+        Expr::StringLiteral(s) => Some(!s.value.is_empty()),
+        Expr::BytesLiteral(b) => Some(!b.value.is_empty()),
+        Expr::List(l) => Some(!l.elts.is_empty()),
+        Expr::Tuple(t) => Some(!t.elts.is_empty()),
+        Expr::Set(s) => Some(!s.elts.is_empty()),
+        Expr::Dict(d) => Some(!d.items.is_empty()),
+        Expr::Name(n) => table.get(n.id.as_str()).copied(),
+        Expr::Named(named) => evaluate_truthiness(&named.value, table),
+        Expr::BoolOp(b) => match b.op {
+            ruff_python_ast::BoolOp::Or => {
+                let mut any_unknown = false;
+                for v in &b.values {
+                    match evaluate_truthiness(v, table) {
+                        Some(true) => return Some(true),
+                        Some(false) => continue,
+                        None => any_unknown = true,
+                    }
+                }
+                if any_unknown {
+                    None
+                } else {
+                    Some(false)
+                }
+            }
+            ruff_python_ast::BoolOp::And => {
+                let mut any_unknown = false;
+                for v in &b.values {
+                    match evaluate_truthiness(v, table) {
+                        Some(false) => return Some(false),
+                        Some(true) => continue,
+                        None => any_unknown = true,
+                    }
+                }
+                if any_unknown {
+                    None
+                } else {
+                    Some(true)
+                }
+            }
+        },
+        Expr::UnaryOp(u) => {
+            if matches!(u.op, ruff_python_ast::UnaryOp::Not) {
+                evaluate_truthiness(&u.operand, table).map(|v| !v)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Build the scope's name→truthiness table.
+///
+/// Collects all unconditional assignments at the scope's top level
+/// (`X = literal`, `X: T = literal`) plus every walrus binding the
+/// scope's expressions contain (PEP 572 leaks walrus bindings to the
+/// enclosing function/module). Iterates to fixed point so that
+/// chained constants — `foo = False; bar = foo or False; baz = bar`
+/// — fold through the chain.
+///
+/// Conservative on conflicts: a name with multiple disagreeing
+/// bindings (`X = True` and `X = False` both at top level), or any
+/// binding whose RHS we can't fold, drops out of the table. That
+/// matches the libcst pipeline's "only fold when every binding
+/// agrees" rule and is what keeps the `does_not_fold_*` tests honest.
+fn build_scope_table(stmts: &[Stmt], enclosing: &NameTable) -> NameTable {
+    let mut table = enclosing.clone();
+    let mut bindings: HashMap<String, Vec<&Expr>> = HashMap::new();
+    collect_scope_bindings(stmts, &mut bindings);
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for (name, exprs) in &bindings {
+            let values: Vec<Option<bool>> = exprs
+                .iter()
+                .map(|e| evaluate_truthiness(e, &table))
+                .collect();
+            let resolved = if let Some(first) = values.first().copied() {
+                if values.iter().all(|v| *v == first) {
+                    first
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            match (resolved, table.get(name).copied()) {
+                (Some(v), prev) if prev != Some(v) => {
+                    table.insert(name.clone(), v);
+                    changed = true;
+                }
+                (None, Some(_)) => {
+                    // Previously folded, now conflicting / unknown:
+                    // drop it. Don't fall back to the enclosing
+                    // scope's value because a same-name binding in
+                    // this scope shadows it.
+                    table.remove(name);
+                    changed = true;
+                }
+                _ => {}
+            }
+        }
+    }
+    table
+}
+
+/// Top-level `name → rhs-expression` bindings for the scope, plus
+/// any walrus bindings the scope's *expressions* contain (PEP 572
+/// leaks walruses to the enclosing function/module). Does NOT
+/// recurse into nested function/class bodies — those are separate
+/// scopes with their own tables.
+fn collect_scope_bindings<'a>(stmts: &'a [Stmt], out: &mut HashMap<String, Vec<&'a Expr>>) {
+    for stmt in stmts {
+        match stmt {
+            Stmt::Assign(a) => {
+                if let [Expr::Name(target)] = a.targets.as_slice() {
+                    out.entry(target.id.as_str().to_string())
+                        .or_default()
+                        .push(&a.value);
+                }
+                collect_walrus_in_expr(&a.value, out);
+            }
+            Stmt::AnnAssign(a) => {
+                if let (Expr::Name(target), Some(value)) = (&*a.target, &a.value) {
+                    out.entry(target.id.as_str().to_string())
+                        .or_default()
+                        .push(value);
+                }
+                if let Some(value) = &a.value {
+                    collect_walrus_in_expr(value, out);
+                }
+                collect_walrus_in_expr(&a.annotation, out);
+            }
+            Stmt::Expr(e) => {
+                collect_walrus_in_expr(&e.value, out);
+            }
+            Stmt::If(if_stmt) => {
+                collect_walrus_in_expr(&if_stmt.test, out);
+            }
+            Stmt::While(w) => {
+                collect_walrus_in_expr(&w.test, out);
+            }
+            Stmt::Return(r) => {
+                if let Some(value) = &r.value {
+                    collect_walrus_in_expr(value, out);
+                }
+            }
+            // Nested function/class bodies are separate scopes —
+            // don't drag their bindings into this table.
+            Stmt::FunctionDef(_) | Stmt::ClassDef(_) => {}
+            _ => {}
+        }
+    }
+}
+
+/// Scan `expr` for walrus (`:=`) targets that bind names in the
+/// enclosing scope.
+fn collect_walrus_in_expr<'a>(expr: &'a Expr, out: &mut HashMap<String, Vec<&'a Expr>>) {
+    match expr {
+        Expr::Named(named) => {
+            if let Expr::Name(target) = &*named.target {
+                out.entry(target.id.as_str().to_string())
+                    .or_default()
+                    .push(&named.value);
+            }
+            collect_walrus_in_expr(&named.value, out);
+        }
+        Expr::BoolOp(b) => {
+            for v in &b.values {
+                collect_walrus_in_expr(v, out);
+            }
+        }
+        Expr::UnaryOp(u) => collect_walrus_in_expr(&u.operand, out),
+        Expr::BinOp(b) => {
+            collect_walrus_in_expr(&b.left, out);
+            collect_walrus_in_expr(&b.right, out);
+        }
+        Expr::Compare(c) => {
+            collect_walrus_in_expr(&c.left, out);
+            for v in &c.comparators {
+                collect_walrus_in_expr(v, out);
+            }
+        }
+        _ => {}
+    }
+}
 
 /// Result of parsing the `noqa[: codes…]` tail of a comment.
 ///
