@@ -23,6 +23,8 @@ from ..plugins._core import (
 )
 
 if TYPE_CHECKING:
+    import dead_cst_ty_native as native
+
     from ..graph import VisitorPayload
 
 PYTEST_CONFTEST_PREFIX = "<pytest:conftest>:"
@@ -109,6 +111,71 @@ class PytestPlugin:
 
     def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]:
         return ()
+
+    def run(self, ctx: native.ProjectContext) -> None:
+        from pathlib import Path
+
+        # Group decls by their module so we can emit one synthetic per
+        # conftest / test file rather than per-decl.
+        nodes = list(ctx.nodes())
+        modules_by_path: dict[str, native.NativeNode] = {
+            n.path: n for n in nodes if n.kind == "module"
+        }
+        decls_by_path: dict[str, list[native.NativeNode]] = {}
+        for n in nodes:
+            if n.kind not in ("function", "class", "variable"):
+                continue
+            decls_by_path.setdefault(n.path, []).append(n)
+
+        for path, decls in decls_by_path.items():
+            module = modules_by_path.get(path)
+            if module is None:
+                continue
+            filename = Path(path).name
+            if filename == "conftest.py":
+                _mark_seed(ctx, f"{PYTEST_CONFTEST_PREFIX}{module.fqname}", path, decls)
+            elif _is_test_filename(filename):
+                test_decls = [d for d in decls if _is_test_decl_native(d)]
+                if test_decls:
+                    _mark_seed(ctx, f"{PYTEST_TESTS_PREFIX}{module.fqname}", path, test_decls)
+
+        # ``@pytest.fixture`` (and bare ``@fixture``) decorators
+        # anywhere in the project. Group by module so the synthetic
+        # mirrors the libcst payload shape.
+        fixtures_by_path: dict[str, list[native.NativeNode]] = {}
+        for func in ctx.find_decorated_decls("pytest", ["fixture"]):
+            fixtures_by_path.setdefault(func.path, []).append(func)
+        for path, fixtures in fixtures_by_path.items():
+            module = modules_by_path.get(path)
+            if module is None:
+                continue
+            _mark_seed(ctx, f"{PYTEST_FIXTURES_PREFIX}{module.fqname}", path, fixtures)
+
+
+def _mark_seed(
+    ctx: native.ProjectContext,
+    fqname: str,
+    path: str,
+    targets: list[native.NativeNode],
+) -> None:
+    if not targets:
+        return
+    marker = ctx.add_node(
+        fqname=fqname,
+        path=path,
+        flags=int(NodeFlags.ENTRYPOINT | NodeFlags.TESTCASE),
+    )
+    for t in targets:
+        ctx.add_edge(marker, t)
+
+
+def _is_test_decl_native(node: native.NativeNode) -> bool:
+    simple = node.fqname.rsplit(".", 1)[-1]
+    if node.kind == "function" and simple.startswith("test_"):
+        return True
+    if node.kind == "class" and simple.startswith("Test"):
+        return True
+    return False
 
 
 def _emit_seed(nodes, edges, fqname, path, targets):

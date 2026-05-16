@@ -705,6 +705,53 @@ impl ProjectContext {
 
     /// Return every class that defines a method with the given name.
     ///
+    /// Return every top-level function decorated with ``@<decorator_module>.<name>``
+    /// or ``@<name>`` for any ``name`` in ``decorator_names``.
+    ///
+    /// Both ``@<name>`` (bare) and ``@<name>(...)`` (called) forms
+    /// match — the function call is unwrapped before the pattern is
+    /// checked. Identity for the attribute prefix is literal
+    /// (``@pytest.fixture`` matches; ``@p.fixture`` with
+    /// ``import pytest as p`` does not). Bare-name decorators
+    /// (``@fixture``) match purely by attribute name regardless of
+    /// what the local ``fixture`` refers to — this mirrors the libcst
+    /// plugin helpers used by ``PytestPlugin`` etc., which intentionally
+    /// keep a loose pattern match rather than trying to chase decorator
+    /// imports through ty's resolver.
+    fn find_decorated_decls(
+        &self,
+        py: Python<'_>,
+        decorator_module: &str,
+        decorator_names: Vec<String>,
+    ) -> PyResult<Vec<Py<NativeNode>>> {
+        let outputs = self.outputs.borrow();
+        let outputs = outputs
+            .as_ref()
+            .ok_or_else(|| not_materialized("find_decorated_decls"))?;
+        let names: HashSet<&str> = decorator_names.iter().map(String::as_str).collect();
+        let mut out = Vec::new();
+        for &file in &outputs.project_files {
+            let parsed = parsed_module(&self.db, file).load(&self.db);
+            for stmt in &parsed.syntax().body {
+                let Stmt::FunctionDef(func) = stmt else {
+                    continue;
+                };
+                if !decorators_match(&func.decorator_list, decorator_module, &names) {
+                    continue;
+                }
+                let target_range = func.name.range();
+                let key = (file, range_key(target_range));
+                for ((entry_file, _place, range), &idx) in &outputs.global_index {
+                    if *entry_file == file && *range == key.1 {
+                        out.push(outputs.builder.nodes[idx].clone_ref(py));
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Walks each class's `DefinitionKind::Class` body for an
     /// `Stmt::FunctionDef` whose name matches. ty's `parsed_module` is
     /// Salsa-cached, so this is just a body scan per class.
@@ -1005,6 +1052,39 @@ fn class_body_defines_method(class_def: &StmtClassDef, method_name: &str) -> boo
         Stmt::FunctionDef(f) => f.name.as_str() == method_name,
         _ => false,
     })
+}
+
+/// Return ``true`` if any decorator in ``decorators`` matches
+/// ``@<module>.<name>`` (literal module name) or ``@<name>`` for
+/// any ``name`` in ``names``. Trailing ``(...)`` is unwrapped before
+/// the pattern check.
+fn decorators_match(
+    decorators: &[ruff_python_ast::Decorator],
+    module: &str,
+    names: &HashSet<&str>,
+) -> bool {
+    for dec in decorators {
+        let mut expr = &dec.expression;
+        if let Expr::Call(call) = expr {
+            expr = &call.func;
+        }
+        match expr {
+            Expr::Name(n) => {
+                if names.contains(n.id.as_str()) {
+                    return true;
+                }
+            }
+            Expr::Attribute(attr) => {
+                if let Expr::Name(prefix) = attr.value.as_ref() {
+                    if prefix.id.as_str() == module && names.contains(attr.attr.as_str()) {
+                        return true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 fn iter_top_level_classes(parsed: &ParsedModuleRef) -> impl Iterator<Item = &StmtClassDef> {
@@ -2475,9 +2555,27 @@ fn file_path_string(db: &dyn ProjectDb, file: File) -> String {
 }
 
 fn module_fqname_for_file(db: &dyn ProjectDb, file: File) -> String {
-    file_to_module(db, file)
-        .map(|m| m.name(db).as_str().to_string())
-        .unwrap_or_else(|| file_path_string(db, file))
+    if let Some(module) = file_to_module(db, file) {
+        return module.name(db).as_str().to_string();
+    }
+    // Fallback for files ty doesn't classify (e.g. ``gunicorn.conf.py`` at
+    // the project root — there's no ``__init__.py`` and the stem contains
+    // a dot, so ty's module resolver returns ``None``). Mirror the libcst
+    // pipeline's ``strip .py / replace / with .`` derivation so plugins
+    // like ``ServerConfigPlugin`` can address the file by its conventional
+    // dotted name.
+    let path_str = file_path_string(db, file);
+    let root_str = db.project().root(db).as_str();
+    let rel = path_str
+        .strip_prefix(root_str)
+        .unwrap_or(&path_str)
+        .trim_start_matches('/')
+        .trim_start_matches('\\');
+    let stem = rel
+        .strip_suffix(".pyi")
+        .or_else(|| rel.strip_suffix(".py"))
+        .unwrap_or(rel);
+    stem.replace(['/', '\\'], ".")
 }
 
 // ---------------------------------------------------------------------------
