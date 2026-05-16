@@ -8,10 +8,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterable
 
-from ..graph import SymbolNode
+from ..graph import NodeFlags, SymbolNode
 from ._core import GraphOp, ObserveContext, PluginContext, mark_entrypoints
 
 if TYPE_CHECKING:
+    import dead_cst_ty_native as native
+
     from ..graph import VisitorPayload
 
 EXPLICIT_PREFIX = "<entrypoint>:"
@@ -48,6 +50,36 @@ class ExplicitEntrypointPlugin:
             if not self._matches(node, root):
                 continue
             yield from mark_entrypoints(f"{EXPLICIT_PREFIX}{node.fqname}", node.path, [node])
+
+    def run(self, ctx: native.ProjectContext) -> None:
+        root = Path(ctx.project_root)
+        for node in ctx.nodes():
+            if not self._matches_native(node, root):
+                continue
+            marker = ctx.add_node(
+                fqname=f"{EXPLICIT_PREFIX}{node.fqname}",
+                path=node.path,
+                flags=int(NodeFlags.ENTRYPOINT),
+            )
+            ctx.add_edge(marker, node)
+
+    def _matches_native(self, node: native.NativeNode, root: Path) -> bool:
+        path = Path(node.path)
+        try:
+            rel = str(path.relative_to(root))
+        except ValueError:
+            rel = node.path
+        for spec in self.specs:
+            if isinstance(spec, re.Pattern):
+                if spec.match(rel):
+                    return True
+            elif isinstance(spec, Path):
+                if spec == path:
+                    return True
+            elif isinstance(spec, str):
+                if spec == rel or spec == node.fqname:
+                    return True
+        return False
 
     def _matches(self, sym: SymbolNode, root: Path) -> bool:
         try:

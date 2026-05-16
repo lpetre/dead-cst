@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Iterable
 
+from ..graph import NodeFlags
 from ..plugins._core import (
     GraphOp,
     ObserveContext,
@@ -14,6 +16,8 @@ from ..plugins._core import (
 )
 
 if TYPE_CHECKING:
+    import dead_cst_ty_native as native
+
     from ..graph import VisitorPayload
 
 SERVER_CONFIG_PREFIX = "<server-config>:"
@@ -86,3 +90,23 @@ class ServerConfigPlugin:
 
     def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]:
         return ()
+
+    def run(self, ctx: native.ProjectContext) -> None:
+        targets_by_path: dict[str, list[native.NativeNode]] = {}
+        for n in ctx.nodes():
+            if Path(n.path).name not in self.filenames:
+                continue
+            if n.kind in ("module", "function", "class", "variable", "import"):
+                targets_by_path.setdefault(n.path, []).append(n)
+
+        for path, targets in targets_by_path.items():
+            module = ctx.module_for(path)
+            if module is None:
+                continue
+            marker = ctx.add_node(
+                fqname=f"{SERVER_CONFIG_PREFIX}{module.fqname}",
+                path=path,
+                flags=int(NodeFlags.ENTRYPOINT),
+            )
+            for target in targets:
+                ctx.add_edge(marker, target)

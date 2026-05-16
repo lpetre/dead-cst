@@ -24,6 +24,7 @@ Both bases use only the public plugin-helpers re-exported from
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Iterable, Mapping, cast
 
 import libcst as cst
@@ -53,6 +54,8 @@ from ._core import (
 )
 
 if TYPE_CHECKING:
+    import dead_cst_ty_native as native
+
     from ..graph import VisitorPayload
 
 
@@ -141,6 +144,42 @@ class DecoratedDeclPlugin:
 
     def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]:
         return ()
+
+    def run(self, ctx: "native.ProjectContext") -> None:
+        if not self.decorator_module:
+            return
+        if not (self.decorator_names or self.constructor_names):
+            return
+        names = sorted(self.decorator_names | self.constructor_names)
+
+        decorated = ctx.find_decorated_decls(self.decorator_module, names)
+        constructed = ctx.find_instance_constructions(self.decorator_module, names)
+        prefix = self.package_prefix
+
+        def in_scope(path: str) -> bool:
+            if not prefix:
+                return True
+            module = ctx.module_for(path)
+            if module is None:
+                return False
+            return module.fqname == prefix or module.fqname.startswith(prefix + ".")
+
+        seeds_by_path: dict[str, list[native.NativeNode]] = {}
+        for node in decorated:
+            if in_scope(node.path):
+                seeds_by_path.setdefault(node.path, []).append(node)
+        for var_node, _kind in constructed:
+            if in_scope(var_node.path):
+                seeds_by_path.setdefault(var_node.path, []).append(var_node)
+
+        for path, targets in seeds_by_path.items():
+            synth = ctx.add_node(
+                fqname=f"<{self.name}>:{Path(path).name}",
+                path=path,
+                flags=int(NodeFlags.ENTRYPOINT),
+            )
+            for target in targets:
+                ctx.add_edge(synth, target)
 
     def _find_names(self, module: cst.Module, imports: dict[str, str]) -> set[str]:
         """Return top-level names bound to a configured decorator/constructor.
@@ -443,6 +482,50 @@ class DispatchAppPlugin:
                 )
                 yield AddNode(seed)
                 yield AddEdge(seed, var)
+
+    def run(self, ctx: "native.ProjectContext") -> None:
+        if not (self.app_module and self.registration_decorators):
+            return
+        targets = self._targets
+        if not targets:
+            return
+        target_names = list(targets)
+        decorator_attrs = list(self.registration_decorators)
+
+        direct = ctx.find_instance_constructions(self.app_module, target_names)
+        handlers = ctx.find_handler_decorators(decorator_attrs)
+        factory_decls = (
+            ctx.find_factory_decls(self.app_module, target_names) if self._factory_aware else []
+        )
+
+        direct_by_owner: dict[tuple[str, str], list[tuple["native.NativeNode", str]]] = {}
+        for var_node, kind in direct:
+            simple = var_node.fqname.rsplit(".", 1)[-1]
+            direct_by_owner.setdefault((var_node.path, simple), []).append((var_node, kind))
+
+        app_prefix = self._prefix("app")
+        factory_prefix = self._prefix("factory")
+
+        if self._factory_aware:
+            for var_node, kind in direct:
+                if self.instance_kinds.get(kind):
+                    marker = ctx.add_node(
+                        fqname=f"{app_prefix}{var_node.fqname}",
+                        path=var_node.path,
+                        flags=int(NodeFlags.ENTRYPOINT),
+                    )
+                    ctx.add_edge(marker, var_node)
+            for decl_node, kinds in factory_decls:
+                for kind in kinds:
+                    marker = ctx.add_node(
+                        fqname=f"{factory_prefix}{kind}:{decl_node.fqname}",
+                        path=decl_node.path,
+                    )
+                    ctx.add_edge(decl_node, marker)
+
+        for owner_name, handler_func in handlers:
+            for var_node, _kind in direct_by_owner.get((handler_func.path, owner_name), []):
+                ctx.add_edge(var_node, handler_func)
 
 
 def _read_string_list_with_positions(

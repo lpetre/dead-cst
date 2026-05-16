@@ -5,8 +5,8 @@ from __future__ import annotations
 from dead_cst.plugins import CeleryPlugin
 
 
-def test_celery_plugin_marks_task_handlers(make_analysis, write_files, reachable_fqnames):
-    write_files(
+def test_celery_plugin_marks_task_handlers(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "app/__init__.py": "",
             "app/celery.py": """
@@ -25,9 +25,9 @@ def test_celery_plugin_marks_task_handlers(make_analysis, write_files, reachable
 
             def helper(): pass
             """,
-        }
+        },
+        [CeleryPlugin()],
     )
-    graph = make_analysis(plugins=[CeleryPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "app.celery.app" in reached
     assert "app.celery.send_email" in reached
@@ -37,10 +37,8 @@ def test_celery_plugin_marks_task_handlers(make_analysis, write_files, reachable
     assert "app.celery.helper" not in reached
 
 
-def test_celery_plugin_keeps_handler_dependencies_alive(
-    make_analysis, write_files, reachable_fqnames
-):
-    write_files(
+def test_celery_plugin_keeps_handler_dependencies_alive(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "app/__init__.py": "",
             "app/models.py": """
@@ -63,9 +61,9 @@ def test_celery_plugin_keeps_handler_dependencies_alive(
             def run_job():
                 return build_job()
             """,
-        }
+        },
+        [CeleryPlugin()],
     )
-    graph = make_analysis(plugins=[CeleryPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "app.celery.run_job" in reached
     assert "app.celery.build_job" in reached
@@ -73,8 +71,8 @@ def test_celery_plugin_keeps_handler_dependencies_alive(
     assert "app.models.Unused" not in reached
 
 
-def test_celery_plugin_handles_aliased_class_import(make_analysis, write_files, reachable_fqnames):
-    write_files(
+def test_celery_plugin_handles_aliased_class_import(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "app/__init__.py": "",
             "app/celery.py": """
@@ -85,14 +83,14 @@ def test_celery_plugin_handles_aliased_class_import(make_analysis, write_files, 
             @app.task
             def run(): pass
             """,
-        }
+        },
+        [CeleryPlugin()],
     )
-    graph = make_analysis(plugins=[CeleryPlugin()]).materialize_all()
     assert "app.celery.run" in reachable_fqnames(graph)
 
 
-def test_celery_plugin_handles_module_import(make_analysis, write_files, reachable_fqnames):
-    write_files(
+def test_celery_plugin_handles_module_import(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "app/__init__.py": "",
             "app/celery.py": """
@@ -103,14 +101,14 @@ def test_celery_plugin_handles_module_import(make_analysis, write_files, reachab
             @app.task
             def run(): pass
             """,
-        }
+        },
+        [CeleryPlugin()],
     )
-    graph = make_analysis(plugins=[CeleryPlugin()]).materialize_all()
     assert "app.celery.run" in reachable_fqnames(graph)
 
 
-def test_celery_plugin_handles_annotated_assignment(make_analysis, write_files, reachable_fqnames):
-    write_files(
+def test_celery_plugin_handles_annotated_assignment(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "app/__init__.py": "",
             "app/celery.py": """
@@ -121,16 +119,16 @@ def test_celery_plugin_handles_annotated_assignment(make_analysis, write_files, 
             @app.task
             def run(): pass
             """,
-        }
+        },
+        [CeleryPlugin()],
     )
-    graph = make_analysis(plugins=[CeleryPlugin()]).materialize_all()
     assert "app.celery.run" in reachable_fqnames(graph)
 
 
-def test_celery_plugin_marks_shared_tasks(make_analysis, write_files, reachable_fqnames):
+def test_celery_plugin_marks_shared_tasks(build_plugin_graph, reachable_fqnames):
     """``@shared_task`` registers into Celery's global registry and is
     invoked by name by the worker -- no owning app variable needed."""
-    write_files(
+    graph = build_plugin_graph(
         {
             "app/__init__.py": "",
             "app/tasks.py": """
@@ -147,9 +145,9 @@ def test_celery_plugin_marks_shared_tasks(make_analysis, write_files, reachable_
 
             def helper(): pass
             """,
-        }
+        },
+        [CeleryPlugin()],
     )
-    graph = make_analysis(plugins=[CeleryPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "app.tasks.bare_decorator" in reached
     assert "app.tasks.called_decorator" in reached
@@ -157,8 +155,8 @@ def test_celery_plugin_marks_shared_tasks(make_analysis, write_files, reachable_
     assert "app.tasks.helper" not in reached
 
 
-def test_celery_plugin_shared_task_aliased(make_analysis, write_files, reachable_fqnames):
-    write_files(
+def test_celery_plugin_shared_task_aliased(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "app/__init__.py": "",
             "app/tasks.py": """
@@ -170,16 +168,16 @@ def test_celery_plugin_shared_task_aliased(make_analysis, write_files, reachable
             @task(bind=True)
             def alias_called(): pass
             """,
-        }
+        },
+        [CeleryPlugin()],
     )
-    graph = make_analysis(plugins=[CeleryPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "app.tasks.alias_bare" in reached
     assert "app.tasks.alias_called" in reached
 
 
-def test_celery_plugin_shared_task_module_form(make_analysis, write_files, reachable_fqnames):
-    write_files(
+def test_celery_plugin_shared_task_module_form(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "app/__init__.py": "",
             "app/tasks.py": """
@@ -191,19 +189,17 @@ def test_celery_plugin_shared_task_module_form(make_analysis, write_files, reach
             @celery.shared_task(bind=True)
             def via_module_called(self): pass
             """,
-        }
+        },
+        [CeleryPlugin()],
     )
-    graph = make_analysis(plugins=[CeleryPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "app.tasks.via_module" in reached
     assert "app.tasks.via_module_called" in reached
 
 
-def test_celery_plugin_ignores_unrelated_task_decorators(
-    make_analysis, write_files, reachable_fqnames
-):
+def test_celery_plugin_ignores_unrelated_task_decorators(build_plugin_graph, reachable_fqnames):
     """A ``.task`` attribute on a non-Celery instance shouldn't be wired."""
-    write_files(
+    graph = build_plugin_graph(
         {
             "pkg/__init__.py": "",
             "pkg/mod.py": """
@@ -216,15 +212,15 @@ def test_celery_plugin_ignores_unrelated_task_decorators(
             @q.task
             def not_a_celery_task(): pass
             """,
-        }
+        },
+        [CeleryPlugin()],
     )
-    graph = make_analysis(plugins=[CeleryPlugin()]).materialize_all()
     assert "pkg.mod.not_a_celery_task" not in reachable_fqnames(graph)
 
 
-def test_celery_plugin_ignores_bare_shared_task_name(make_analysis, write_files, reachable_fqnames):
+def test_celery_plugin_ignores_bare_shared_task_name(build_plugin_graph, reachable_fqnames):
     """A local ``shared_task`` name not imported from ``celery`` shouldn't trigger the plugin."""
-    write_files(
+    graph = build_plugin_graph(
         {
             "pkg/__init__.py": "",
             "pkg/mod.py": """
@@ -234,16 +230,14 @@ def test_celery_plugin_ignores_bare_shared_task_name(make_analysis, write_files,
             @shared_task
             def looks_like_shared(): pass
             """,
-        }
+        },
+        [CeleryPlugin()],
     )
-    graph = make_analysis(plugins=[CeleryPlugin()]).materialize_all()
     assert "pkg.mod.looks_like_shared" not in reachable_fqnames(graph)
 
 
-def test_celery_plugin_does_nothing_without_celery_imports(
-    make_analysis, write_files, reachable_fqnames
-):
-    write_files(
+def test_celery_plugin_does_nothing_without_celery_imports(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "pkg/__init__.py": "",
             "pkg/mod.py": """
@@ -256,15 +250,15 @@ def test_celery_plugin_does_nothing_without_celery_imports(
             @app.task
             def fake(): pass
             """,
-        }
+        },
+        [CeleryPlugin()],
     )
-    graph = make_analysis(plugins=[CeleryPlugin()]).materialize_all()
     assert "pkg.mod.fake" not in reachable_fqnames(graph)
 
 
-def test_celery_plugin_ignores_import_star(make_analysis, write_files, reachable_fqnames):
+def test_celery_plugin_ignores_import_star(build_plugin_graph, reachable_fqnames):
     """``from celery import *`` shouldn't synthesize Celery wiring."""
-    write_files(
+    graph = build_plugin_graph(
         {
             "app/__init__.py": "",
             "app/celery.py": """
@@ -275,30 +269,30 @@ def test_celery_plugin_ignores_import_star(make_analysis, write_files, reachable
             @app.task
             def run(): pass
             """,
-        }
+        },
+        [CeleryPlugin()],
     )
-    graph = make_analysis(plugins=[CeleryPlugin()]).materialize_all()
     assert "app.celery.run" not in reachable_fqnames(graph)
 
 
 def test_celery_plugin_does_nothing_when_celery_not_imported_anywhere(
-    make_analysis, write_files, reachable_fqnames
+    build_plugin_graph, reachable_fqnames
 ):
-    write_files(
+    graph = build_plugin_graph(
         {
             "pkg/__init__.py": "",
             "pkg/mod.py": """
             def index(): pass
             """,
-        }
+        },
+        [CeleryPlugin()],
     )
-    graph = make_analysis(plugins=[CeleryPlugin()]).materialize_all()
     assert "pkg.mod.index" not in reachable_fqnames(graph)
 
 
-def test_celery_plugin_module_prefixed_unknown_attr(make_analysis, write_files, reachable_fqnames):
+def test_celery_plugin_module_prefixed_unknown_attr(build_plugin_graph, reachable_fqnames):
     """``celery.SomethingElse(...)`` should not be classified as a Celery app."""
-    write_files(
+    graph = build_plugin_graph(
         {
             "app/__init__.py": "",
             "app/celery.py": """
@@ -310,17 +304,17 @@ def test_celery_plugin_module_prefixed_unknown_attr(make_analysis, write_files, 
             @app.task
             def run(): pass
             """,
-        }
+        },
+        [CeleryPlugin()],
     )
-    graph = make_analysis(plugins=[CeleryPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "app.celery.run" in reached
     assert "app.celery.cfg" not in reached
 
 
-def test_celery_plugin_handles_factory_function(make_analysis, write_files, reachable_fqnames):
+def test_celery_plugin_handles_factory_function(build_plugin_graph, reachable_fqnames):
     """``def make_celery(): return Celery(...)``."""
-    write_files(
+    graph = build_plugin_graph(
         {
             "app/__init__.py": "",
             "app/factory.py": """
@@ -340,9 +334,9 @@ def test_celery_plugin_handles_factory_function(make_analysis, write_files, reac
             @app.task(bind=True)
             def bound(self): pass
             """,
-        }
+        },
+        [CeleryPlugin()],
     )
-    graph = make_analysis(plugins=[CeleryPlugin()]).materialize_all()
     from dead_cst.analyze import _entrypoint_seeds, _find_reachable as find_reachable
 
     reached = {
@@ -417,10 +411,10 @@ def test_celery_plugin_factory_module_form_in_different_package(
 
 
 def test_celery_plugin_ignores_non_decorator_assignment_shapes(
-    make_analysis, write_files, reachable_fqnames
+    build_plugin_graph, reachable_fqnames
 ):
     """Multi-target / tuple / bare-annotation forms shouldn't produce instance nodes."""
-    write_files(
+    graph = build_plugin_graph(
         {
             "app/__init__.py": "",
             "app/celery.py": """
@@ -449,9 +443,9 @@ def test_celery_plugin_ignores_non_decorator_assignment_shapes(
             @holder.cli.task
             def nested(): pass
             """,
-        }
+        },
+        [CeleryPlugin()],
     )
-    graph = make_analysis(plugins=[CeleryPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "app.celery.app" in reached
     assert "app.celery.run" in reached
@@ -461,7 +455,7 @@ def test_celery_plugin_ignores_non_decorator_assignment_shapes(
     assert "app.celery.late" not in reached
 
 
-def test_celery_plugin_ignores_non_app_celery_users(make_analysis, write_files, reachable_fqnames):
+def test_celery_plugin_ignores_non_app_celery_users(build_plugin_graph, reachable_fqnames):
     """Variables that touch ``celery`` for unrelated reasons stay dead.
 
     The pending-walk must require a discriminating ``Celery`` import on
@@ -469,7 +463,7 @@ def test_celery_plugin_ignores_non_app_celery_users(make_analysis, write_files, 
     value derived from e.g. ``celery.signals`` would get marked as an
     app.
     """
-    write_files(
+    graph = build_plugin_graph(
         {
             "pkg/__init__.py": "",
             "pkg/mod.py": """
@@ -486,9 +480,9 @@ def test_celery_plugin_ignores_non_app_celery_users(make_analysis, write_files, 
             @thing.task
             def handler(): pass
             """,
-        }
+        },
+        [CeleryPlugin()],
     )
-    graph = make_analysis(plugins=[CeleryPlugin()]).materialize_all()
     assert "pkg.mod.handler" not in reachable_fqnames(graph)
 
 

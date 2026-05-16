@@ -5,8 +5,8 @@ from __future__ import annotations
 from dead_cst.plugins import FastAPIPlugin
 
 
-def test_fastapi_plugin_marks_route_handlers(make_analysis, write_files, reachable_fqnames):
-    write_files(
+def test_fastapi_plugin_marks_route_handlers(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "app/__init__.py": "",
             "app/main.py": """
@@ -31,9 +31,9 @@ def test_fastapi_plugin_marks_route_handlers(make_analysis, write_files, reachab
 
             def helper(): pass
             """,
-        }
+        },
+        [FastAPIPlugin()],
     )
-    graph = make_analysis(plugins=[FastAPIPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "app.main.app" in reached
     assert "app.main.list_items" in reached
@@ -45,10 +45,8 @@ def test_fastapi_plugin_marks_route_handlers(make_analysis, write_files, reachab
     assert "app.main.helper" not in reached
 
 
-def test_fastapi_plugin_marks_websocket_and_lifecycle(
-    make_analysis, write_files, reachable_fqnames
-):
-    write_files(
+def test_fastapi_plugin_marks_websocket_and_lifecycle(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "app/__init__.py": "",
             "app/main.py": """
@@ -68,9 +66,9 @@ def test_fastapi_plugin_marks_websocket_and_lifecycle(
             @app.on_event("startup")
             async def startup(): pass
             """,
-        }
+        },
+        [FastAPIPlugin()],
     )
-    graph = make_analysis(plugins=[FastAPIPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "app.main.ws_endpoint" in reached
     assert "app.main.add_header" in reached
@@ -78,10 +76,8 @@ def test_fastapi_plugin_marks_websocket_and_lifecycle(
     assert "app.main.startup" in reached
 
 
-def test_fastapi_plugin_keeps_handler_dependencies_alive(
-    make_analysis, write_files, reachable_fqnames
-):
-    write_files(
+def test_fastapi_plugin_keeps_handler_dependencies_alive(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "app/__init__.py": "",
             "app/models.py": """
@@ -104,9 +100,9 @@ def test_fastapi_plugin_keeps_handler_dependencies_alive(
             def get_item():
                 return build_item()
             """,
-        }
+        },
+        [FastAPIPlugin()],
     )
-    graph = make_analysis(plugins=[FastAPIPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "app.main.get_item" in reached
     # Symbols transitively referenced from the handler stay alive
@@ -116,8 +112,8 @@ def test_fastapi_plugin_keeps_handler_dependencies_alive(
     assert "app.models.Unused" not in reached
 
 
-def test_fastapi_plugin_ignores_bare_decorators(make_analysis, write_files, reachable_fqnames):
-    write_files(
+def test_fastapi_plugin_ignores_bare_decorators(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "pkg/__init__.py": "",
             "pkg/mod.py": """
@@ -131,16 +127,16 @@ def test_fastapi_plugin_ignores_bare_decorators(make_analysis, write_files, reac
             @get
             def looks_like_route(): pass
             """,
-        }
+        },
+        [FastAPIPlugin()],
     )
-    graph = make_analysis(plugins=[FastAPIPlugin()]).materialize_all()
     # Bare ``@get`` (no attribute access) is not a FastAPI registration --
     # matching it would clobber unrelated decorators with the same name.
     assert "pkg.mod.looks_like_route" not in reachable_fqnames(graph)
 
 
-def test_fastapi_plugin_ignores_unrelated_decorators(make_analysis, write_files, reachable_fqnames):
-    write_files(
+def test_fastapi_plugin_ignores_unrelated_decorators(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "pkg/__init__.py": "",
             "pkg/mod.py": """
@@ -153,14 +149,14 @@ def test_fastapi_plugin_ignores_unrelated_decorators(make_analysis, write_files,
             @t.register
             def not_a_route(): pass
             """,
-        }
+        },
+        [FastAPIPlugin()],
     )
-    graph = make_analysis(plugins=[FastAPIPlugin()]).materialize_all()
     assert "pkg.mod.not_a_route" not in reachable_fqnames(graph)
 
 
-def test_fastapi_plugin_unused_router_stays_dead(make_analysis, write_files, reachable_fqnames):
-    write_files(
+def test_fastapi_plugin_unused_router_stays_dead(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "app/__init__.py": "",
             "app/routes.py": """
@@ -171,19 +167,17 @@ def test_fastapi_plugin_unused_router_stays_dead(make_analysis, write_files, rea
             @router.get("/")
             def orphan(): pass
             """,
-        }
+        },
+        [FastAPIPlugin()],
     )
-    graph = make_analysis(plugins=[FastAPIPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     # No FastAPI app reaches this router, so it (and its handler) are dead.
     assert "app.routes.router" not in reached
     assert "app.routes.orphan" not in reached
 
 
-def test_fastapi_plugin_router_reachable_via_include_router(
-    make_analysis, write_files, reachable_fqnames
-):
-    write_files(
+def test_fastapi_plugin_router_reachable_via_include_router(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "app/__init__.py": "",
             "app/routes.py": """
@@ -204,9 +198,9 @@ def test_fastapi_plugin_router_reachable_via_include_router(
             app = FastAPI()
             app.include_router(router)
             """,
-        }
+        },
+        [FastAPIPlugin()],
     )
-    graph = make_analysis(plugins=[FastAPIPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "app.main.app" in reached
     assert "app.routes.router" in reached
@@ -214,8 +208,8 @@ def test_fastapi_plugin_router_reachable_via_include_router(
     assert "app.routes.things" in reached
 
 
-def test_fastapi_plugin_handles_aliased_class_import(make_analysis, write_files, reachable_fqnames):
-    write_files(
+def test_fastapi_plugin_handles_aliased_class_import(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "app/__init__.py": "",
             "app/main.py": """
@@ -226,14 +220,14 @@ def test_fastapi_plugin_handles_aliased_class_import(make_analysis, write_files,
             @app.get("/")
             def index(): pass
             """,
-        }
+        },
+        [FastAPIPlugin()],
     )
-    graph = make_analysis(plugins=[FastAPIPlugin()]).materialize_all()
     assert "app.main.index" in reachable_fqnames(graph)
 
 
-def test_fastapi_plugin_handles_module_import(make_analysis, write_files, reachable_fqnames):
-    write_files(
+def test_fastapi_plugin_handles_module_import(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "app/__init__.py": "",
             "app/main.py": """
@@ -244,14 +238,14 @@ def test_fastapi_plugin_handles_module_import(make_analysis, write_files, reacha
             @app.get("/")
             def index(): pass
             """,
-        }
+        },
+        [FastAPIPlugin()],
     )
-    graph = make_analysis(plugins=[FastAPIPlugin()]).materialize_all()
     assert "app.main.index" in reachable_fqnames(graph)
 
 
-def test_fastapi_plugin_handles_annotated_assignment(make_analysis, write_files, reachable_fqnames):
-    write_files(
+def test_fastapi_plugin_handles_annotated_assignment(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "app/__init__.py": "",
             "app/main.py": """
@@ -262,16 +256,14 @@ def test_fastapi_plugin_handles_annotated_assignment(make_analysis, write_files,
             @app.get("/")
             def index(): pass
             """,
-        }
+        },
+        [FastAPIPlugin()],
     )
-    graph = make_analysis(plugins=[FastAPIPlugin()]).materialize_all()
     assert "app.main.index" in reachable_fqnames(graph)
 
 
-def test_fastapi_plugin_does_nothing_without_fastapi_imports(
-    make_analysis, write_files, reachable_fqnames
-):
-    write_files(
+def test_fastapi_plugin_does_nothing_without_fastapi_imports(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "pkg/__init__.py": "",
             "pkg/mod.py": """
@@ -285,15 +277,15 @@ def test_fastapi_plugin_does_nothing_without_fastapi_imports(
             @app.get("/")
             def looks_like_route(): pass
             """,
-        }
+        },
+        [FastAPIPlugin()],
     )
-    graph = make_analysis(plugins=[FastAPIPlugin()]).materialize_all()
     # ``app`` here is not a FastAPI instance -- no ``fastapi`` import in scope.
     assert "pkg.mod.looks_like_route" not in reachable_fqnames(graph)
 
 
-def test_fastapi_plugin_handles_factory_function(make_analysis, write_files, reachable_fqnames):
-    write_files(
+def test_fastapi_plugin_handles_factory_function(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "app/__init__.py": "",
             "app/factory.py": """
@@ -313,19 +305,17 @@ def test_fastapi_plugin_handles_factory_function(make_analysis, write_files, rea
             @app.post("/items")
             def create_item(): pass
             """,
-        }
+        },
+        [FastAPIPlugin()],
     )
-    graph = make_analysis(plugins=[FastAPIPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "app.main.app" in reached
     assert "app.main.list_items" in reached
     assert "app.main.create_item" in reached
 
 
-def test_fastapi_plugin_factory_returning_router_stays_dead(
-    make_analysis, write_files, reachable_fqnames
-):
-    write_files(
+def test_fastapi_plugin_factory_returning_router_stays_dead(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "app/__init__.py": "",
             "app/routes.py": """
@@ -339,9 +329,9 @@ def test_fastapi_plugin_factory_returning_router_stays_dead(
             @router.get("/orphan")
             def orphan(): pass
             """,
-        }
+        },
+        [FastAPIPlugin()],
     )
-    graph = make_analysis(plugins=[FastAPIPlugin()]).materialize_all()
     # Factory-produced router is treated like a literal APIRouter --
     # never auto-seeded as an entrypoint, so an unincluded one stays dead.
     reached = reachable_fqnames(graph)
@@ -349,9 +339,7 @@ def test_fastapi_plugin_factory_returning_router_stays_dead(
     assert "app.routes.orphan" not in reached
 
 
-def test_fastapi_plugin_ignores_non_app_fastapi_users(
-    make_analysis, write_files, reachable_fqnames
-):
+def test_fastapi_plugin_ignores_non_app_fastapi_users(build_plugin_graph, reachable_fqnames):
     """Variables that touch ``fastapi`` for unrelated reasons stay dead.
 
     Walking only to the ``fastapi`` synthetic isn't enough -- the plugin
@@ -359,7 +347,7 @@ def test_fastapi_plugin_ignores_non_app_fastapi_users(
     the path before treating ``X`` as an instance. Otherwise any value
     derived from e.g. ``HTTPException`` would get marked as an app.
     """
-    write_files(
+    graph = build_plugin_graph(
         {
             "pkg/__init__.py": "",
             "pkg/mod.py": """
@@ -377,9 +365,9 @@ def test_fastapi_plugin_ignores_non_app_fastapi_users(
             @thing.get("/")
             def handler(): pass
             """,
-        }
+        },
+        [FastAPIPlugin()],
     )
-    graph = make_analysis(plugins=[FastAPIPlugin()]).materialize_all()
     assert "pkg.mod.handler" not in reachable_fqnames(graph)
 
 

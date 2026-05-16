@@ -111,29 +111,27 @@ _RECOGNIZED_FORMS: list[tuple[str, str]] = [
     [src for _, src in _RECOGNIZED_FORMS],
     ids=[name for name, _ in _RECOGNIZED_FORMS],
 )
-def test_recognized_form_keeps_target_alive(
-    make_analysis, write_files, reachable_fqnames, test_source
-):
-    write_files(
+def test_recognized_form_keeps_target_alive(build_plugin_graph, reachable_fqnames, test_source):
+    graph = build_plugin_graph(
         {
             "pkg/__init__.py": "",
             "pkg/lib.py": "def helper(): return 1",
             "tests/__init__.py": "",
             "tests/test_lib.py": test_source,
-        }
+        },
+        [MockPatchPlugin(), PytestPlugin()],
     )
-    graph = make_analysis(plugins=[MockPatchPlugin(), PytestPlugin()]).materialize_all()
     assert "pkg.lib.helper" in reachable_fqnames(graph)
 
 
-def test_class_method_target_resolves_to_class(make_analysis, write_files, reachable_fqnames):
+def test_class_method_target_resolves_to_class(build_plugin_graph, reachable_fqnames):
     """``patch("pkg.lib.Cls.method")`` walks back to the class node.
 
     Methods are not represented as their own graph nodes, so resolution
     must climb dotted segments until it finds the enclosing top-level
     decl (the class).
     """
-    write_files(
+    graph = build_plugin_graph(
         {
             "pkg/__init__.py": "",
             "pkg/lib.py": """
@@ -147,16 +145,16 @@ def test_class_method_target_resolves_to_class(make_analysis, write_files, reach
             @patch("pkg.lib.Cls.method")
             def test_helper(_): pass
             """,
-        }
+        },
+        [MockPatchPlugin(), PytestPlugin()],
     )
-    graph = make_analysis(plugins=[MockPatchPlugin(), PytestPlugin()]).materialize_all()
     assert "pkg.lib.Cls" in reachable_fqnames(graph)
 
 
-def test_unrelated_patch_method_not_recognized(make_analysis, write_files, reachable_fqnames):
+def test_unrelated_patch_method_not_recognized(build_plugin_graph, reachable_fqnames):
     """``<flask_app>.patch("/url")`` is not a mock call and must not
     promote the string to an fqname reference."""
-    write_files(
+    graph = build_plugin_graph(
         {
             "pkg/__init__.py": "",
             "pkg/lib.py": "def helper(): return 1",
@@ -171,19 +169,19 @@ def test_unrelated_patch_method_not_recognized(make_analysis, write_files, reach
             @app.patch("pkg.lib.helper")
             def handler(): return 1
             """,
-        }
+        },
+        [MockPatchPlugin()],
     )
-    graph = make_analysis(plugins=[MockPatchPlugin()]).materialize_all()
     # ``handler`` itself isn't reachable (no entrypoint), so neither is
     # ``helper`` -- the plugin must not have hijacked the unrelated
     # ``app.patch`` call into an fqname reference.
     assert "pkg.lib.helper" not in reachable_fqnames(graph)
 
 
-def test_no_imports_no_effect(make_analysis, write_files, reachable_fqnames):
+def test_no_imports_no_effect(build_plugin_graph, reachable_fqnames):
     """Files that don't import a recognized mock binding contribute
     nothing -- a bare ``patch("X")`` call could be anything."""
-    write_files(
+    graph = build_plugin_graph(
         {
             "pkg/__init__.py": "",
             "pkg/lib.py": "def helper(): return 1",
@@ -194,17 +192,17 @@ def test_no_imports_no_effect(make_analysis, write_files, reachable_fqnames):
             @patch("pkg.lib.helper")
             def test_helper(_): pass
             """,
-        }
+        },
+        [MockPatchPlugin(), PytestPlugin()],
     )
-    graph = make_analysis(plugins=[MockPatchPlugin(), PytestPlugin()]).materialize_all()
     # ``patch`` came from a non-mock module, so the plugin does not
     # treat the string as an fqname reference.
     assert "pkg.lib.helper" not in reachable_fqnames(graph)
 
 
-def test_unittest_testcase_patch(make_analysis, write_files, reachable_fqnames):
+def test_unittest_testcase_patch(build_plugin_graph, reachable_fqnames):
     """``@patch("X")`` on a ``unittest.TestCase`` test method works."""
-    write_files(
+    graph = build_plugin_graph(
         {
             "pkg/__init__.py": "",
             "pkg/lib.py": "def helper(): return 1",
@@ -217,16 +215,16 @@ def test_unittest_testcase_patch(make_analysis, write_files, reachable_fqnames):
                 @patch("pkg.lib.helper")
                 def test_helper(self, _): pass
             """,
-        }
+        },
+        [MockPatchPlugin(), UnittestPlugin()],
     )
-    graph = make_analysis(plugins=[MockPatchPlugin(), UnittestPlugin()]).materialize_all()
     assert "pkg.lib.helper" in reachable_fqnames(graph)
 
 
-def test_unresolved_target_is_harmless(make_analysis, write_files, reachable_fqnames):
+def test_unresolved_target_is_harmless(build_plugin_graph, reachable_fqnames):
     """Patches against third-party / non-existent fqnames have no
     first-party decl to keep alive; the test still runs to completion."""
-    write_files(
+    graph = build_plugin_graph(
         {
             "pkg/__init__.py": "",
             "pkg/lib.py": "def helper(): return 1",
@@ -237,15 +235,15 @@ def test_unresolved_target_is_harmless(make_analysis, write_files, reachable_fqn
             @patch("third_party.lib.something")
             def test_one(_): pass
             """,
-        }
+        },
+        [MockPatchPlugin(), PytestPlugin()],
     )
-    graph = make_analysis(plugins=[MockPatchPlugin(), PytestPlugin()]).materialize_all()
     assert "pkg.lib.helper" not in reachable_fqnames(graph)
 
 
-def test_module_target_keeps_module_alive(make_analysis, write_files, reachable_fqnames):
+def test_module_target_keeps_module_alive(build_plugin_graph, reachable_fqnames):
     """``patch("pkg.lib")`` keeps the module itself alive."""
-    write_files(
+    graph = build_plugin_graph(
         {
             "pkg/__init__.py": "",
             "pkg/lib.py": "VALUE = 1",
@@ -256,20 +254,20 @@ def test_module_target_keeps_module_alive(make_analysis, write_files, reachable_
             @patch("pkg.lib")
             def test_helper(_): pass
             """,
-        }
+        },
+        [MockPatchPlugin(), PytestPlugin()],
     )
-    graph = make_analysis(plugins=[MockPatchPlugin(), PytestPlugin()]).materialize_all()
     assert "pkg.lib" in reachable_fqnames(graph)
 
 
-def test_only_marks_target_when_test_alive(make_analysis, write_files, reachable_fqnames):
+def test_only_marks_target_when_test_alive(build_plugin_graph, reachable_fqnames):
     """A patch reference inside a dead decl doesn't promote anything.
 
     No entrypoint reaches ``isolated_helper``, so the synthesized
     ``isolated_helper -> <patch-target>:pkg.lib.helper`` edge never
     fires.
     """
-    write_files(
+    graph = build_plugin_graph(
         {
             "pkg/__init__.py": "",
             "pkg/lib.py": "def helper(): return 1",
@@ -280,19 +278,19 @@ def test_only_marks_target_when_test_alive(make_analysis, write_files, reachable
                 with patch("pkg.lib.helper") as m:
                     return m
             """,
-        }
+        },
+        [MockPatchPlugin()],
     )
-    graph = make_analysis(plugins=[MockPatchPlugin()]).materialize_all()
     assert "pkg.lib.helper" not in reachable_fqnames(graph)
 
 
 def test_monkeypatch_setattr_object_form_not_treated_as_fqname(
-    make_analysis, write_files, reachable_fqnames
+    build_plugin_graph, reachable_fqnames
 ):
     """``monkeypatch.setattr(obj, "attr", value)`` has 3 positional args
     and is the object form -- the ``"attr"`` string must not be treated
     as a fqname reference."""
-    write_files(
+    graph = build_plugin_graph(
         {
             "pkg/__init__.py": "",
             "pkg/lib.py": "def helper(): return 1",
@@ -307,17 +305,17 @@ def test_monkeypatch_setattr_object_form_not_treated_as_fqname(
                 # keeps the module alive (and ``helper`` with it).
                 monkeypatch.setattr(pkg.lib, "helper", lambda: 2)
             """,
-        }
+        },
+        [MockPatchPlugin(), PytestPlugin()],
     )
-    graph = make_analysis(plugins=[MockPatchPlugin(), PytestPlugin()]).materialize_all()
     synthetics = {n.fqname for n in graph.nodes if n.type == "synthetic"}
     assert f"{PATCH_TARGET_PREFIX}helper" not in synthetics
 
 
-def test_monkeypatch_setitem_not_recognized(make_analysis, write_files, reachable_fqnames):
+def test_monkeypatch_setitem_not_recognized(build_plugin_graph, reachable_fqnames):
     """``monkeypatch.setitem(d, "key", value)`` patches a dict, not a
     symbol -- the string is a key, not a fqname."""
-    write_files(
+    graph = build_plugin_graph(
         {
             "pkg/__init__.py": "",
             "pkg/lib.py": "def helper(): return 1",
@@ -327,9 +325,9 @@ def test_monkeypatch_setitem_not_recognized(make_analysis, write_files, reachabl
                 d = {}
                 monkeypatch.setitem(d, "pkg.lib.helper", 1)
             """,
-        }
+        },
+        [MockPatchPlugin(), PytestPlugin()],
     )
-    graph = make_analysis(plugins=[MockPatchPlugin(), PytestPlugin()]).materialize_all()
     assert "pkg.lib.helper" not in reachable_fqnames(graph)
 
 
