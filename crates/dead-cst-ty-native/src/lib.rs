@@ -1329,6 +1329,16 @@ fn resolve_import_target(
     let Some(module) = resolve_module(db, importing_file, &module_name) else {
         return Ok(None);
     };
+    // Stdlib imports (e.g. `import importlib`) don't surface as graph
+    // nodes — the libcst pipeline emits no `[stdlib] X` synthetic and
+    // no upstream edge. The alias node itself is still minted in
+    // `ingest_decls`, so the call site keeps a use edge through it.
+    if module
+        .search_path(db)
+        .is_some_and(|sp| sp.is_standard_library())
+    {
+        return Ok(None);
+    }
     let Some(file) = module.file(db) else {
         return Ok(None);
     };
@@ -2054,6 +2064,16 @@ impl<'a, 'db> RefCollector<'a, 'db> {
         let Some(start_module) = resolve_module(db, self.file, &start_mn) else {
             return;
         };
+        // Stdlib targets don't surface as graph nodes; skip the
+        // parallel upstream edges so a use of e.g. `importlib` only
+        // links through the local alias (whose own upstream edge
+        // is also filtered in `resolve_import_target`).
+        if start_module
+            .search_path(db)
+            .is_some_and(|sp| sp.is_standard_library())
+        {
+            return;
+        }
         let Some(start_file) = start_module.file(db) else {
             return;
         };
@@ -2197,6 +2217,338 @@ impl<'a, 'db> RefCollector<'a, 'db> {
             self.emit_edge(idx);
         }
     }
+
+    /// Handle a call expression that may be a dynamic-import shape:
+    /// `__import__('name', …)` or `importlib.import_module('name', …)`.
+    ///
+    /// Returns `true` if the call was recognized (recognized but
+    /// rejected — e.g. non-literal first argument — still returns
+    /// `true`, since the visitor shouldn't fall through to walk the
+    /// arguments looking for normal name references). Returns `false`
+    /// when the call doesn't match either shape.
+    fn try_emit_dynamic_import(&mut self, call: &ruff_python_ast::ExprCall) -> bool {
+        let Some(kind) = detect_dynamic_call(&call.func) else {
+            return false;
+        };
+        let py = unsafe { Python::assume_gil_acquired() };
+        match parse_dynamic_args(kind, call) {
+            DynamicParseResult::Ok {
+                name,
+                fromlist,
+                explicit_package,
+                explicit_level,
+            } => {
+                let db = self.model.db();
+                let file_pkg = file_package_name(db, self.file);
+                let pkg = explicit_package.or(file_pkg.as_deref());
+                match resolve_dynamic_target(kind, &name, explicit_level, pkg) {
+                    Ok(target) => {
+                        if let Some(module_name) = ModuleName::new(&target) {
+                            self.emit_nested_star(&module_name);
+                            // Literal fromlist entries that themselves
+                            // resolve as submodules of the target get
+                            // fanned out too — they correspond to a
+                            // child `from target.entry import *`.
+                            for entry in &fromlist {
+                                if entry.is_empty() {
+                                    continue;
+                                }
+                                let sub = format!("{target}.{entry}");
+                                if let Some(sub_mn) = ModuleName::new(&sub) {
+                                    if module_name_resolves(&sub, self.file, db) {
+                                        self.emit_nested_star(&sub_mn);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(message) => emit_visitor_warning(py, &message),
+                }
+                true
+            }
+            DynamicParseResult::Warn(message) => {
+                emit_visitor_warning(py, &message);
+                true
+            }
+            DynamicParseResult::NotApplicable => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DynamicKind {
+    DunderImport,
+    ImportlibImportModule,
+}
+
+impl DynamicKind {
+    fn label(self) -> &'static str {
+        match self {
+            DynamicKind::DunderImport => "__import__(...)",
+            DynamicKind::ImportlibImportModule => "importlib.import_module(...)",
+        }
+    }
+}
+
+/// Match `call.func` against the two dynamic-import call shapes we
+/// recognize: a bare `Name("__import__")` or
+/// `Attribute(Name("importlib"), "import_module")`. The `importlib`
+/// receiver is matched textually — a local `class importlib` would
+/// be a false positive, but that pattern is vanishingly rare in
+/// practice and the libcst pipeline does the same syntactic match.
+fn detect_dynamic_call(func: &Expr) -> Option<DynamicKind> {
+    match func {
+        Expr::Name(n) if n.id.as_str() == "__import__" => Some(DynamicKind::DunderImport),
+        Expr::Attribute(attr) => {
+            if let Expr::Name(receiver) = &*attr.value {
+                if receiver.id.as_str() == "importlib" && attr.attr.as_str() == "import_module" {
+                    return Some(DynamicKind::ImportlibImportModule);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+enum DynamicParseResult<'a> {
+    /// Successfully parsed.
+    Ok {
+        name: String,
+        fromlist: Vec<&'a str>,
+        explicit_package: Option<&'a str>,
+        explicit_level: Option<u32>,
+    },
+    /// Recognized as a dynamic import but rejected with this warning
+    /// message. The visitor still skips the call's argument walk —
+    /// the call site itself doesn't carry normal name references
+    /// once we've identified it as a dynamic import.
+    Warn(String),
+    /// Not a dynamic import (e.g. the first argument is missing
+    /// entirely, so it isn't really one of these call shapes). Caller
+    /// should fall through to a normal expression walk.
+    NotApplicable,
+}
+
+fn parse_dynamic_args<'a>(
+    kind: DynamicKind,
+    call: &'a ruff_python_ast::ExprCall,
+) -> DynamicParseResult<'a> {
+    let Some(first_arg) = first_positional(call) else {
+        return DynamicParseResult::NotApplicable;
+    };
+    let Some(name) = string_literal(first_arg) else {
+        return DynamicParseResult::Warn(format!(
+            "Skipping dynamic import '{}': name is not a string literal",
+            kind.label()
+        ));
+    };
+
+    match kind {
+        DynamicKind::DunderImport => {
+            // `__import__(name, globals=None, locals=None, fromlist=[], level=0)`
+            let fromlist_expr = positional_or_kwarg(call, 3, "fromlist");
+            let level_expr = positional_or_kwarg(call, 4, "level");
+            let fromlist = match fromlist_expr {
+                None => Vec::new(),
+                Some(expr) => match string_literal_list(expr) {
+                    Some(list) => list,
+                    None => {
+                        return DynamicParseResult::Warn(format!(
+                            "Skipping dynamic import '{}': fromlist is not a literal \
+                             list/tuple of strings (name: '{name}')",
+                            kind.label(),
+                        ));
+                    }
+                },
+            };
+            let explicit_level = match level_expr {
+                None => None,
+                Some(expr) => match int_literal(expr) {
+                    Some(n) if n >= 0 => Some(n as u32),
+                    Some(_) | None => {
+                        return DynamicParseResult::Warn(format!(
+                            "Skipping dynamic import '{}': level is not an int literal \
+                             (name: '{name}')",
+                            kind.label(),
+                        ));
+                    }
+                },
+            };
+            DynamicParseResult::Ok {
+                name: name.to_string(),
+                fromlist,
+                explicit_package: None,
+                explicit_level,
+            }
+        }
+        DynamicKind::ImportlibImportModule => {
+            // `importlib.import_module(name, package=None)`
+            let pkg_expr = positional_or_kwarg(call, 1, "package");
+            let explicit_package = match pkg_expr {
+                None => None,
+                Some(expr) => match string_literal(expr) {
+                    Some(s) => Some(s),
+                    None => {
+                        return DynamicParseResult::Warn(format!(
+                            "Skipping dynamic import '{}': package is not a string literal \
+                             (name: '{name}')",
+                            kind.label(),
+                        ));
+                    }
+                },
+            };
+            DynamicParseResult::Ok {
+                name: name.to_string(),
+                fromlist: Vec::new(),
+                explicit_package,
+                explicit_level: None,
+            }
+        }
+    }
+}
+
+fn first_positional(call: &ruff_python_ast::ExprCall) -> Option<&Expr> {
+    call.arguments.args.first()
+}
+
+fn positional_or_kwarg<'a>(
+    call: &'a ruff_python_ast::ExprCall,
+    idx: usize,
+    kwarg_name: &str,
+) -> Option<&'a Expr> {
+    if let Some(expr) = call.arguments.args.get(idx) {
+        return Some(expr);
+    }
+    call.arguments
+        .keywords
+        .iter()
+        .find(|k| k.arg.as_ref().is_some_and(|id| id.as_str() == kwarg_name))
+        .map(|k| &k.value)
+}
+
+fn string_literal(expr: &Expr) -> Option<&str> {
+    if let Expr::StringLiteral(s) = expr {
+        Some(s.value.to_str())
+    } else {
+        None
+    }
+}
+
+fn int_literal(expr: &Expr) -> Option<i64> {
+    let Expr::NumberLiteral(n) = expr else {
+        return None;
+    };
+    if let ruff_python_ast::Number::Int(i) = &n.value {
+        i.as_i64()
+    } else {
+        None
+    }
+}
+
+fn string_literal_list(expr: &Expr) -> Option<Vec<&str>> {
+    let elements: &[Expr] = match expr {
+        Expr::List(l) => &l.elts,
+        Expr::Tuple(t) => &t.elts,
+        _ => return None,
+    };
+    let mut out = Vec::with_capacity(elements.len());
+    for elem in elements {
+        out.push(string_literal(elem)?);
+    }
+    Some(out)
+}
+
+/// Resolve a dynamic-import `name` against its level / package
+/// context to an absolute module name, or return an error message
+/// suitable for logging.
+///
+/// Per CPython semantics:
+/// * `__import__`: leading dots in `name` are invalid (level is the
+///   `level=` keyword/positional arg); `level=N` means "start from
+///   the current package and go up N-1 levels."
+/// * `importlib.import_module`: leading dots in `name` are the level
+///   (count them); `level=1` means current package, `level=2` parent,
+///   etc. `package=` is optional and defaults to the caller's
+///   package — that's what `pkg` is here.
+fn resolve_dynamic_target(
+    kind: DynamicKind,
+    name: &str,
+    explicit_level: Option<u32>,
+    pkg: Option<&str>,
+) -> Result<String, String> {
+    let (name_no_dots, level): (&str, u32) = match kind {
+        DynamicKind::DunderImport => {
+            if name.starts_with('.') {
+                return Err(format!(
+                    "Skipping dynamic import '{}': leading dots are invalid for \
+                     __import__ (name: '{name}')",
+                    kind.label()
+                ));
+            }
+            (name, explicit_level.unwrap_or(0))
+        }
+        DynamicKind::ImportlibImportModule => {
+            let dots = name.chars().take_while(|c| *c == '.').count();
+            (&name[dots..], dots as u32)
+        }
+    };
+
+    if level == 0 {
+        return Ok(name_no_dots.to_string());
+    }
+    let Some(pkg) = pkg else {
+        return Err(format!(
+            "Skipping dynamic import '{}': relative import '{name}' has no package context",
+            kind.label()
+        ));
+    };
+    let segments: Vec<&str> = pkg.split('.').filter(|s| !s.is_empty()).collect();
+    let levels_up = (level - 1) as usize;
+    if levels_up > segments.len() {
+        return Err(format!(
+            "Skipping dynamic import '{}': relative import '{name}' goes beyond top-level \
+             package '{pkg}'",
+            kind.label()
+        ));
+    }
+    let base = &segments[..segments.len() - levels_up];
+    let mut parts: Vec<&str> = base.to_vec();
+    if !name_no_dots.is_empty() {
+        parts.push(name_no_dots);
+    }
+    Ok(parts.join("."))
+}
+
+/// Package name (i.e. enclosing package) of `file`. For
+/// `pkg/__init__.py` this is `"pkg"`; for `pkg/sub.py` this is
+/// `"pkg"`; for a top-level `mod.py` this is `None`.
+fn file_package_name(db: &dyn ty_python_semantic::Db, file: File) -> Option<String> {
+    let module = file_to_module(db, file)?;
+    let name = module.name(db);
+    let path_str = match file.path(db) {
+        FilePath::System(p) => p.to_string(),
+        FilePath::SystemVirtual(p) => p.to_string(),
+        FilePath::Vendored(p) => p.to_string(),
+    };
+    let is_init = path_str.ends_with("/__init__.py") || path_str.ends_with("\\__init__.py");
+    if is_init {
+        Some(name.as_str().to_string())
+    } else {
+        name.parent().map(|n| n.as_str().to_string())
+    }
+}
+
+/// Send a warning to the `dead_cst._visitor` logger so the
+/// `visitor_warnings` test fixture (pytest caplog scoped to that
+/// logger) can observe it.
+fn emit_visitor_warning(py: Python<'_>, message: &str) {
+    let _ = (|| -> PyResult<()> {
+        let logging = py.import_bound("logging")?;
+        let logger = logging.call_method1("getLogger", ("dead_cst._visitor",))?;
+        logger.call_method1("warning", (message,))?;
+        Ok(())
+    })();
 }
 
 /// Peel an attribute chain back to its `Name` root.
@@ -2244,6 +2596,35 @@ impl<'ast, 'db> Visitor<'ast> for RefCollector<'_, 'db> {
                 // Don't recurse into the chain — every Name in it has
                 // been handled and an attribute access has no other
                 // walk-worthy children.
+                return;
+            }
+        }
+        if let Expr::Call(call) = expr {
+            if self.try_emit_dynamic_import(call) {
+                // For `importlib.import_module(...)`, attribute the
+                // `importlib` receiver to the call's owner so the
+                // alias keeps a use edge — without it the
+                // module-level call would leave `p.x.importlib`
+                // orphaned from the call site. The chain segment
+                // (`import_module`) isn't a walkable target, so we
+                // pass an empty extra-chain rather than walking the
+                // attribute via `collapse_attribute_chain`.
+                if let Expr::Attribute(attr) = &*call.func {
+                    if let Expr::Name(receiver) = &*attr.value {
+                        self.emit_name_use(receiver, &[]);
+                    }
+                }
+                // Walk arguments for any nested non-string Names
+                // (e.g. `__import__(name, fromlist=names)` where
+                // `name` and `names` should still emit normal use
+                // edges that attribute the *receiver* of those
+                // values to the owner).
+                for arg in &call.arguments.args {
+                    self.visit_expr(arg);
+                }
+                for kw in &call.arguments.keywords {
+                    self.visit_expr(&kw.value);
+                }
                 return;
             }
         }
