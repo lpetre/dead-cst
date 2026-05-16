@@ -42,6 +42,14 @@ two versions.
   this contract is upheld regardless of how ``refresh`` is invoked.
 
 ### Changed
+- ``tests/prototype/_bridge.materialize`` (and the inlined copy in
+  ``scripts/profile_backends.py``) interns ``pathlib.Path`` objects per
+  build and reuses the ``NodeFlags(0)`` / ``EdgeFlags(0)`` singletons
+  instead of constructing fresh enum instances per node/edge. Halves
+  the warm-path bridge cost (``dead_cst`` self: 15.0 ms → 7.5 ms;
+  flux0 server: 2.2 ms → 1.0 ms), which is the dominant cost on warm
+  rust runs now that ty's Salsa db keeps ``Project.build()`` at 10 ms.
+
 - Swapped the graph backend from `networkx.MultiDiGraph` to a minimal
   `rustworkx.PyDiGraph` wrapper (`dead_cst._graphstore.SymbolGraph`).
   The wrapper exposes the `SymbolNode <-> int` index bookkeeping
