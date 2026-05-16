@@ -1511,6 +1511,153 @@ impl ProjectContext {
         Ok(out)
     }
 
+    // ----- Stage 2: ty-backed semantic queries ---------------------------
+
+    /// Decls decorated by ``@<decorator_fqn>`` or ``@<decorator_fqn>(...)``.
+    ///
+    /// Resolves through the file's local imports — aliased / dotted /
+    /// module-prefixed forms all match. ``decorator_fqn`` is the
+    /// upstream callable's absolute fqn (``celery.shared_task``,
+    /// ``pytest.fixture``). For instance-method decorators
+    /// (``@app.route(...)`` where ``app`` is a ``flask.Flask``) use
+    /// :meth:`find_decorations_on` instead.
+    fn find_decorated(&self, py: Python<'_>, decorator_fqn: &str) -> PyResult<Vec<Py<NativeNode>>> {
+        let Some((module, name)) = decorator_fqn.rsplit_once('.') else {
+            return Err(PyValueError::new_err(format!(
+                "expected a dotted decorator fqn (e.g. 'pytest.fixture'), got {decorator_fqn:?}"
+            )));
+        };
+        self.find_decorated_decls(py, module, vec![name.to_string()])
+    }
+
+    /// Module-level variables assigned an instance of ``class_fqn``.
+    ///
+    /// e.g. ``find_constructions("flask.Flask")`` → every ``app =
+    /// Flask(...)`` variable node. ``include_subclasses=True`` also
+    /// matches direct constructions of any class that subclasses
+    /// ``class_fqn`` (works for both project subclasses and external
+    /// ones via ty's type hierarchy).
+    #[pyo3(signature = (class_fqn, *, include_subclasses = false))]
+    fn find_constructions(
+        &self,
+        py: Python<'_>,
+        class_fqn: &str,
+        include_subclasses: bool,
+    ) -> PyResult<Vec<Py<NativeNode>>> {
+        let Some((module, name)) = class_fqn.rsplit_once('.') else {
+            return Err(PyValueError::new_err(format!(
+                "expected a dotted class fqn, got {class_fqn:?}"
+            )));
+        };
+        let mut ctors: Vec<String> = vec![name.to_string()];
+        if include_subclasses {
+            for sub in self.find_subclasses(py, class_fqn, true)? {
+                let simple = sub
+                    .borrow(py)
+                    .fqname
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                if !simple.is_empty() && !ctors.contains(&simple) {
+                    ctors.push(simple);
+                }
+            }
+        }
+        let pairs = self.find_instance_constructions(py, module, ctors)?;
+        Ok(pairs.into_iter().map(|(node, _)| node).collect())
+    }
+
+    /// Decls decorated by ``@<instance>.<method>(...)`` for ``method``
+    /// in ``method_names``, where ``<instance>`` resolves to the given
+    /// decl in the same file.
+    ///
+    /// Cross-file owners (where ``app = imported_factory()`` and
+    /// ``@app.route`` is in a different file) aren't matched — same
+    /// limitation the rust dispatch-app path has today.
+    fn find_decorations_on(
+        &self,
+        py: Python<'_>,
+        instance: &NativeNode,
+        method_names: Vec<String>,
+    ) -> PyResult<Vec<Py<NativeNode>>> {
+        let instance_simple = instance.fqname.rsplit('.').next().unwrap_or("").to_string();
+        let handlers = self.find_handler_decorators(py, method_names)?;
+        let mut out = Vec::new();
+        for (owner_name, handler) in handlers {
+            if owner_name != instance_simple {
+                continue;
+            }
+            if handler.borrow(py).path != instance.path {
+                continue;
+            }
+            out.push(handler);
+        }
+        Ok(out)
+    }
+
+    /// Subclasses of the class addressed by ``base_fqn``.
+    ///
+    /// Works for both project classes (where the fqn resolves to a
+    /// graph node) and external classes (``unittest.TestCase``,
+    /// ``pydantic.BaseModel``) via ty's module resolver +
+    /// ``type_hierarchy_subtypes``. ``transitive=True`` (default)
+    /// walks the full subclass closure; ``transitive=False`` returns
+    /// only direct subclasses.
+    #[pyo3(signature = (base_fqn, *, transitive = true))]
+    fn find_subclasses(
+        &self,
+        py: Python<'_>,
+        base_fqn: &str,
+        transitive: bool,
+    ) -> PyResult<Vec<Py<NativeNode>>> {
+        let outputs = self.outputs.borrow();
+        let outputs = outputs
+            .as_ref()
+            .ok_or_else(|| not_materialized("find_subclasses"))?;
+        let Some((seed_file, seed_range)) = locate_class_seed(&self.db, outputs, py, base_fqn)
+        else {
+            return Ok(Vec::new());
+        };
+        let parsed_seed = parsed_module(&self.db, seed_file).load(&self.db);
+        let model_seed = SemanticModel::new(&self.db, seed_file);
+        let Some(seed_class) = class_def_at(&parsed_seed, seed_range) else {
+            return Ok(Vec::new());
+        };
+        let Some(seed_ty) = seed_class.inferred_type(&model_seed) else {
+            return Ok(Vec::new());
+        };
+
+        let mut out_idx: Vec<usize> = Vec::new();
+        let mut seen: HashSet<(File, (u32, u32))> = HashSet::new();
+        let mut frontier: Vec<TypeHierarchyClass> = type_hierarchy_subtypes(&self.db, seed_ty);
+        while let Some(thc) = frontier.pop() {
+            let file_key = (thc.file, range_key(thc.selection_range));
+            if !seen.insert(file_key) {
+                continue;
+            }
+            if let Some(&idx) = outputs.class_by_selection.get(&file_key) {
+                out_idx.push(idx);
+            }
+            if !transitive {
+                continue;
+            }
+            let parsed = parsed_module(&self.db, thc.file).load(&self.db);
+            let Some(class_def) = class_def_at(&parsed, thc.selection_range) else {
+                continue;
+            };
+            let model = SemanticModel::new(&self.db, thc.file);
+            let Some(ty) = class_def.inferred_type(&model) else {
+                continue;
+            };
+            frontier.extend(type_hierarchy_subtypes(&self.db, ty));
+        }
+        Ok(out_idx
+            .into_iter()
+            .map(|idx| outputs.builder.nodes[idx].clone_ref(py))
+            .collect())
+    }
+
     /// Return `(decl_node, comment_text)` for every comment in the
     /// project that matches `pattern` (a regex), paired with the next
     /// declaration that follows it in the same file.
@@ -1891,6 +2038,101 @@ fn locate_class_def(
 /// Find a top-level `StmtClassDef` whose name range equals `selection_range`.
 fn class_def_at(parsed: &ParsedModuleRef, selection_range: TextRange) -> Option<&StmtClassDef> {
     iter_top_level_classes(parsed).find(|cls| cls.name.range() == selection_range)
+}
+
+/// Find a top-level ``StmtClassDef`` by its bound name.
+fn class_def_named<'a>(parsed: &'a ParsedModuleRef, name: &str) -> Option<&'a StmtClassDef> {
+    iter_top_level_classes(parsed).find(|cls| cls.name.as_str() == name)
+}
+
+/// Resolve a dotted class fqn to ``(File, name_range)`` so the caller
+/// can fetch the corresponding ``Type`` via ``class_def_at`` +
+/// ``inferred_type``. Handles both project classes (looked up via
+/// ``decl_by_fqname``) and external classes (ty's ``resolve_module``
+/// + AST scan by name in the resolved module).
+fn locate_class_seed(
+    db: &ProjectDatabase,
+    outputs: &BuildOutputs,
+    py: Python<'_>,
+    fqn: &str,
+) -> Option<(File, TextRange)> {
+    // Project class: cheap path through the existing indices.
+    if let Some(idxs) = outputs.decl_by_fqname.get(fqn) {
+        for &idx in idxs {
+            let node = outputs.builder.nodes[idx].borrow(py);
+            if node.kind != "class" {
+                continue;
+            }
+            let path = node.path.clone();
+            drop(node);
+            if let Some(seed) = locate_class_def(
+                db,
+                &outputs.path_to_file,
+                &path,
+                &outputs.builder.nodes[idx].borrow(py),
+            ) {
+                return Some(seed);
+            }
+        }
+    }
+    // External class: resolve the module via ty, then follow any
+    // re-export chains until we find the actual class def.
+    let (module_str, class_name) = fqn.rsplit_once('.')?;
+    let module_name = ModuleName::new(module_str)?;
+    let anchor = *outputs.project_files.first()?;
+    let module = resolve_module(db, anchor, &module_name)?;
+    let module_file = module.file(db)?;
+    let mut visited: HashSet<File> = HashSet::new();
+    follow_class_through_module(db, module_file, class_name, &mut visited)
+}
+
+/// Walk through a module looking for ``class_name``. If the module
+/// only re-exports the name (``from .other import class_name as
+/// class_name``), recurse into the source module. Bounded by a
+/// visited-file set so cycles can't loop forever.
+fn follow_class_through_module(
+    db: &ProjectDatabase,
+    start_file: File,
+    class_name: &str,
+    visited: &mut HashSet<File>,
+) -> Option<(File, TextRange)> {
+    if !visited.insert(start_file) {
+        return None;
+    }
+    let parsed = parsed_module(db, start_file).load(db);
+    if let Some(cls) = class_def_named(&parsed, class_name) {
+        return Some((start_file, cls.name.range()));
+    }
+    for stmt in &parsed.syntax().body {
+        let Stmt::ImportFrom(im) = stmt else {
+            continue;
+        };
+        for alias in &im.names {
+            let imported_name = alias.name.as_str();
+            let local_name = alias
+                .asname
+                .as_ref()
+                .map(|n| n.as_str())
+                .unwrap_or(imported_name);
+            if local_name != class_name {
+                continue;
+            }
+            let Ok(module_name) = ModuleName::from_import_statement(db, start_file, im) else {
+                continue;
+            };
+            let Some(resolved) = resolve_module(db, start_file, &module_name) else {
+                continue;
+            };
+            let Some(source_file) = resolved.file(db) else {
+                continue;
+            };
+            if let Some(seed) = follow_class_through_module(db, source_file, imported_name, visited)
+            {
+                return Some(seed);
+            }
+        }
+    }
+    None
 }
 
 /// Locate the top-level ``if __name__ == "__main__":`` block in a
