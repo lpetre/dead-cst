@@ -54,9 +54,9 @@ from ._core import (
 )
 
 if TYPE_CHECKING:
-    import dead_cst_ty_native as native
-
     from ..graph import VisitorPayload
+
+import dead_cst_ty_native as native
 
 
 @dataclass(kw_only=True)
@@ -145,7 +145,7 @@ class DecoratedDeclPlugin:
     def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]:
         return ()
 
-    def run(self, ctx: "native.ProjectContext") -> None:
+    def run(self, ctx: "native.ProjectContext") -> "Iterable[native.GraphOp]":
         if not self.decorator_module:
             return
         if not (self.decorator_names or self.constructor_names):
@@ -173,13 +173,12 @@ class DecoratedDeclPlugin:
                 seeds_by_path.setdefault(var_node.path, []).append(var_node)
 
         for path, targets in seeds_by_path.items():
-            synth = ctx.add_node(
+            yield native.AddNode(
                 fqname=f"<{self.name}>:{Path(path).name}",
                 path=path,
                 flags=int(NodeFlags.ENTRYPOINT),
+                edges_to=targets,
             )
-            for target in targets:
-                ctx.add_edge(synth, target)
 
     def _find_names(self, module: cst.Module, imports: dict[str, str]) -> set[str]:
         """Return top-level names bound to a configured decorator/constructor.
@@ -483,7 +482,7 @@ class DispatchAppPlugin:
                 yield AddNode(seed)
                 yield AddEdge(seed, var)
 
-    def run(self, ctx: "native.ProjectContext") -> None:
+    def run(self, ctx: "native.ProjectContext") -> "Iterable[native.GraphOp]":
         if not (self.app_module and self.registration_decorators):
             return
         targets = self._targets
@@ -509,23 +508,23 @@ class DispatchAppPlugin:
         if self._factory_aware:
             for var_node, kind in direct:
                 if self.instance_kinds.get(kind):
-                    marker = ctx.add_node(
+                    yield native.AddNode(
                         fqname=f"{app_prefix}{var_node.fqname}",
                         path=var_node.path,
                         flags=int(NodeFlags.ENTRYPOINT),
+                        edges_to=[var_node],
                     )
-                    ctx.add_edge(marker, var_node)
             for decl_node, kinds in factory_decls:
                 for kind in kinds:
-                    marker = ctx.add_node(
+                    yield native.AddNode(
                         fqname=f"{factory_prefix}{kind}:{decl_node.fqname}",
                         path=decl_node.path,
+                        edges_from=[decl_node],
                     )
-                    ctx.add_edge(decl_node, marker)
 
         for owner_name, handler_func in handlers:
             for var_node, _kind in direct_by_owner.get((handler_func.path, owner_name), []):
-                ctx.add_edge(var_node, handler_func)
+                yield native.AddEdge(var_node, handler_func)
 
 
 def _read_string_list_with_positions(

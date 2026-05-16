@@ -58,7 +58,12 @@ class AddEdge:
 
 class AddEntrypoint:
     """Mark ``decl`` as an entrypoint. ``marker`` is a self-documenting
-    label for ``why-alive`` (e.g. ``"<celery-worker>"``)."""
+    label for ``why-alive`` (e.g. ``"<celery-worker>"``).
+
+    Sugar for the single-target case; for multi-target
+    (``marker -> [t1, t2, t3]``) or intermediate
+    (``source -> marker -> targets``) markers use ``AddNode`` with
+    ``edges_to`` / ``edges_from``."""
 
     decl: NativeNode
     marker: str
@@ -66,15 +71,31 @@ class AddEntrypoint:
     def __init__(self, decl: NativeNode, *, marker: str) -> None: ...
 
 class AddNode:
-    """Mint a synthetic intermediate node. Use rarely — ``AddEntrypoint``
-    covers the common "this is alive because of X" pattern without
-    needing a graph node for the reason."""
+    """Mint a synthetic node with optional in/out edges.
+
+    ``edges_from`` becomes one ``source -> this`` edge per element;
+    ``edges_to`` becomes ``this -> target`` edges. Set
+    ``flags = NodeFlags.ENTRYPOINT`` to make the node a reachability
+    seed. For the common single-target entrypoint pattern, prefer
+    ``AddEntrypoint(decl, marker=...)``."""
 
     fqname: str
     kind: NodeKind
     path: str
+    flags: int
+    edges_from: list[NativeNode]
+    edges_to: list[NativeNode]
 
-    def __init__(self, fqname: str, *, path: str, kind: NodeKind = "synthetic") -> None: ...
+    def __init__(
+        self,
+        fqname: str,
+        *,
+        path: str,
+        kind: NodeKind = "synthetic",
+        flags: int = 0,
+        edges_from: Iterable[NativeNode] = ...,
+        edges_to: Iterable[NativeNode] = ...,
+    ) -> None: ...
 
 GraphOp = AddEdge | AddEntrypoint | AddNode
 
@@ -113,19 +134,6 @@ class ProjectContext:
     ) -> None: ...
     def add_plugin(self, plugin: _ProjectPluginLike | Any) -> None: ...
     def materialize(self) -> NativeGraph: ...
-    def add_node(
-        self,
-        fqname: str,
-        path: str,
-        *,
-        kind: str = ...,
-        start_line: int = ...,
-        start_column: int = ...,
-        end_line: int = ...,
-        end_column: int = ...,
-        flags: int = ...,
-    ) -> NativeNode: ...
-    def add_edge(self, src: NativeNode, dst: NativeNode) -> None: ...
     def find_decorated(self, decorator_fqn: str) -> list[NativeNode]: ...
     def find_constructions(
         self, class_fqn: str, *, include_subclasses: bool = False

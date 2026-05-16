@@ -27,10 +27,12 @@ attached to a group via ``add_command``.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Iterable
 
 import libcst as cst
 from libcst.metadata import CodeRange
+
+import dead_cst_ty_native as native
 
 from ..graph import SymbolNode
 from ..plugins._core import (
@@ -45,8 +47,6 @@ from ..plugins._core import (
 from ..plugins.decl_shapes import DecoratedDeclPlugin
 
 if TYPE_CHECKING:
-    import dead_cst_ty_native as native
-
     from ..graph import VisitorPayload
 
 # Attribute names a Click ``Group`` uses to register a callable. Matched
@@ -123,7 +123,7 @@ class ClickPlugin(DecoratedDeclPlugin):
             return None
         return make_payload(edges=edges)
 
-    def run(self, ctx: "native.ProjectContext") -> None:
+    def run(self, ctx: "native.ProjectContext") -> "Iterable[native.GraphOp]":
         decorated = ctx.find_decorated_decls(self.decorator_module, list(self.decorator_names))
         constructed = ctx.find_instance_constructions(
             self.decorator_module, list(self.constructor_names)
@@ -159,7 +159,7 @@ class ClickPlugin(DecoratedDeclPlugin):
                     if key in emitted:
                         continue
                     emitted.add(key)
-                    ctx.add_edge(owner, handler_func)
+                    yield native.AddEdge(owner, handler_func)
                     if (handler_func.path, handler_func.fqname, owner_name) in subgroup_links:
                         add_group(handler_func)
                         changed = True

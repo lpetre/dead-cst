@@ -92,9 +92,9 @@ from ..plugins._core import (
 )
 
 if TYPE_CHECKING:
-    import dead_cst_ty_native as native
-
     from ..graph import VisitorPayload
+
+import dead_cst_ty_native as native
 
 PATCH_TARGET_PREFIX = "<patch-target>:"
 
@@ -180,7 +180,7 @@ class MockPatchPlugin:
             if mod is not None and mod not in existing:
                 yield AddEdge(node, mod)
 
-    def run(self, ctx: "native.ProjectContext") -> None:
+    def run(self, ctx: "native.ProjectContext") -> "Iterable[native.GraphOp]":
         pairs: list[tuple[native.NativeNode, str]] = []
         for module in _MOCK_MODULES:
             pairs.extend(ctx.find_calls_to_imported(module, "patch", 0))
@@ -190,23 +190,21 @@ class MockPatchPlugin:
                 ctx.find_calls_on_var(_MONKEYPATCH_NAME, attr, 0, required_positional=required)
             )
 
-        markers: dict[str, native.NativeNode] = {}
+        owners_by_fqname: dict[str, list[native.NativeNode]] = {}
         for owner, fqname in pairs:
-            marker = markers.get(fqname)
-            if marker is None:
-                marker = ctx.add_node(
-                    fqname=f"{PATCH_TARGET_PREFIX}{fqname}",
-                    path=owner.path,
-                )
-                markers[fqname] = marker
-            ctx.add_edge(owner, marker)
+            owners_by_fqname.setdefault(fqname, []).append(owner)
 
-        for fqname, marker in markers.items():
-            for decl in ctx.find_declarations(fqname):
-                ctx.add_edge(marker, decl)
+        for fqname, owners in owners_by_fqname.items():
+            targets = list(ctx.find_declarations(fqname))
             mod = ctx.find_module(fqname)
             if mod is not None:
-                ctx.add_edge(marker, mod)
+                targets.append(mod)
+            yield native.AddNode(
+                fqname=f"{PATCH_TARGET_PREFIX}{fqname}",
+                path=owners[0].path,
+                edges_from=owners,
+                edges_to=targets,
+            )
 
 
 def _collect_mock_imports(module: cst.Module) -> tuple[set[str], set[str]]:

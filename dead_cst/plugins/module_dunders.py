@@ -17,9 +17,9 @@ from ._core import (
 )
 
 if TYPE_CHECKING:
-    import dead_cst_ty_native as native
-
     from ..graph import VisitorPayload
+
+import dead_cst_ty_native as native
 
 DUNDER_PREFIX = "<dunder>:"
 
@@ -64,15 +64,9 @@ class ModuleDundersPlugin:
     def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]:
         return ()
 
-    def run(self, ctx: native.ProjectContext) -> None:
-        targets = [*ctx.find_module_dunders(), *ctx.find_imports_of("__future__")]
-        for target in targets:
-            marker = ctx.add_node(
-                fqname=f"{DUNDER_PREFIX}{target.fqname}",
-                path=target.path,
-                flags=int(NodeFlags.ENTRYPOINT),
-            )
-            ctx.add_edge(marker, target)
+    def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
+        for target in [*ctx.find_module_dunders(), *ctx.find_imports_of("__future__")]:
+            yield native.AddEntrypoint(target, marker=DUNDER_PREFIX.rstrip(":"))
 
 
 def _is_kept_alive(node: SymbolNode) -> bool:

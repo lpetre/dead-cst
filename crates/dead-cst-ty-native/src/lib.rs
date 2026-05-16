@@ -540,26 +540,49 @@ impl AddEntrypoint {
 
 /// Mint a synthetic intermediate node.
 ///
-/// Rare under the new model — the ``AddEntrypoint`` marker covers
-/// "this is alive because of X" without a graph node. Use ``AddNode``
-/// only when you genuinely need an intermediate the codemod / patches
-/// can reference (e.g. the ``<subclass-of>:`` bucket pattern).
+/// ``edges_from`` / ``edges_to`` wire the new node atomically — every
+/// element of ``edges_from`` becomes a ``source -> this`` edge, every
+/// element of ``edges_to`` a ``this -> target`` edge — so a plugin
+/// doesn't need a separate handle to reference the freshly-minted node
+/// from subsequent ops. Set ``flags = NodeFlags.ENTRYPOINT`` to make
+/// the node a seed (``AddEntrypoint`` is the single-target sugar).
 #[pyclass(frozen, get_all)]
 struct AddNode {
     fqname: String,
     kind: &'static str,
     path: String,
+    flags: u32,
+    edges_from: Vec<Py<NativeNode>>,
+    edges_to: Vec<Py<NativeNode>>,
 }
 
 #[pymethods]
 impl AddNode {
     #[new]
-    #[pyo3(signature = (fqname, *, path, kind = "synthetic"))]
-    fn new(fqname: String, path: String, kind: &str) -> PyResult<Self> {
+    #[pyo3(signature = (
+        fqname,
+        *,
+        path,
+        kind = "synthetic",
+        flags = 0,
+        edges_from = Vec::new(),
+        edges_to = Vec::new(),
+    ))]
+    fn new(
+        fqname: String,
+        path: String,
+        kind: &str,
+        flags: u32,
+        edges_from: Vec<Py<NativeNode>>,
+        edges_to: Vec<Py<NativeNode>>,
+    ) -> PyResult<Self> {
         Ok(Self {
             fqname,
             kind: static_kind_str(kind)?,
             path,
+            flags,
+            edges_from,
+            edges_to,
         })
     }
 }
@@ -570,8 +593,10 @@ impl AddNode {
 /// `add_plugin`, then calls `materialize()`. `materialize` runs the
 /// project-wide build in rust, then for each registered plugin calls
 /// `plugin.run(ctx)` back into Python with `ctx` set to the same
-/// `ProjectContext` instance — re-entrant calls invoke the rust
-/// `add_node` / `add_edge` / `find_*` methods listed below.
+/// `ProjectContext` instance. Plugins yield `GraphOp` values
+/// (``AddNode`` / ``AddEdge`` / ``AddEntrypoint``) that we apply to
+/// the graph; the rust `find_*` methods listed below answer queries
+/// against the graph in-progress.
 ///
 /// Queries are answered from ty's semantic index: subclass closure goes
 /// through `type_hierarchy_subtypes`, method-defines walks each class's
@@ -587,7 +612,7 @@ struct ProjectContext {
     root: String,
     plugins: Vec<PyObject>,
     /// Populated by `materialize` before plugins run. `None` outside a
-    /// materialize call — `add_node` / `add_edge` / queries assume it's
+    /// materialize call — `apply_graph_op` / queries assume it's
     /// `Some` and error if a plugin (incorrectly) caches the ctx and
     /// uses it after materialize returns.
     outputs: RefCell<Option<BuildOutputs>>,
@@ -651,8 +676,7 @@ impl ProjectContext {
     /// then snapshot the final state.
     ///
     /// Borrows are released between phases so plugin `run` methods can
-    /// re-enter `add_node` / `add_edge` / queries through the same ctx
-    /// without aliasing violations.
+    /// re-enter queries through the same ctx without aliasing violations.
     fn materialize(slf: Py<Self>, py: Python<'_>) -> PyResult<NativeGraph> {
         {
             let this = slf.borrow(py);
@@ -667,18 +691,16 @@ impl ProjectContext {
             .map(|p| p.clone_ref(py))
             .collect();
         for plugin in &plugins {
-            // ``plugin.run(ctx)`` may either mutate the graph through
-            // ``ctx.add_node`` / ``ctx.add_edge`` (the legacy direct-
-            // mutation style) *or* yield ``GraphOp`` instances we apply
-            // here. Returning ``None`` from a non-generator ``run`` is
-            // the direct-mutation path; returning an iterable opts into
-            // the new yield model. Both can coexist during the migration.
+            // ``plugin.run(ctx)`` yields ``GraphOp`` values; we apply
+            // each as it comes off the iterator. The plugin can run
+            // queries against ``ctx`` mid-iteration since each
+            // ``apply_graph_op`` call releases its borrows before
+            // returning control to the generator. ``None`` (a regular
+            // function that ran to completion without yielding) is
+            // allowed for plugins with nothing to do.
             let result = plugin.bind(py).call_method1("run", (slf.clone_ref(py),))?;
-            if result.is_none() {
-                continue;
-            }
-            if let Ok(iter) = result.iter() {
-                for item in iter {
+            if !result.is_none() {
+                for item in result.iter()? {
                     let op = item?;
                     apply_graph_op(&slf, py, &op)?;
                 }
@@ -693,77 +715,6 @@ impl ProjectContext {
             nodes: outputs.builder.nodes,
             edges: outputs.builder.edges,
         })
-    }
-
-    // ----- Mutation -------------------------------------------------------
-
-    /// Intern a synthetic node into the graph.
-    ///
-    /// `path` should be a real source path when the node stands in for a
-    /// specific location (so codemod / why-alive output can reach the
-    /// file); pass the project root for file-agnostic markers.
-    #[pyo3(signature = (
-        fqname,
-        path,
-        *,
-        kind = "synthetic",
-        start_line = 0,
-        start_column = 0,
-        end_line = 0,
-        end_column = 0,
-        flags = 0,
-    ))]
-    #[allow(clippy::too_many_arguments)]
-    fn add_node(
-        &self,
-        py: Python<'_>,
-        fqname: String,
-        path: String,
-        kind: &str,
-        start_line: usize,
-        start_column: usize,
-        end_line: usize,
-        end_column: usize,
-        flags: u32,
-    ) -> PyResult<Py<NativeNode>> {
-        let kind = static_kind_str(kind)?;
-        let mut outputs = self.outputs.borrow_mut();
-        let outputs = outputs
-            .as_mut()
-            .ok_or_else(|| not_materialized("add_node"))?;
-        let idx = outputs.builder.intern_node(
-            py,
-            NativeNode {
-                fqname,
-                kind,
-                path,
-                start_line,
-                start_column,
-                end_line,
-                end_column,
-                flags,
-                imports: None,
-            },
-        )?;
-        Ok(outputs.builder.nodes[idx].clone_ref(py))
-    }
-
-    /// Add an edge between two nodes returned by `add_node` or a query.
-    ///
-    /// Identity is content-based: each side is looked up in the
-    /// builder's intern table via its `(fqname, kind, path, position)`
-    /// key, so two `NativeNode` Python references that wrap the same
-    /// logical node resolve to the same edge endpoint. Passing a node
-    /// that was never interned raises `ValueError`.
-    fn add_edge(&self, src: &NativeNode, dst: &NativeNode) -> PyResult<()> {
-        let mut outputs = self.outputs.borrow_mut();
-        let outputs = outputs
-            .as_mut()
-            .ok_or_else(|| not_materialized("add_edge"))?;
-        let src_idx = lookup_idx(&outputs.builder, src, "src")?;
-        let dst_idx = lookup_idx(&outputs.builder, dst, "dst")?;
-        outputs.builder.add_edge(src_idx, dst_idx, 0);
-        Ok(())
     }
 
     // ----- Queries (rust-resident, results pass back to Python) -----------
@@ -1853,55 +1804,64 @@ fn bfs(
 }
 
 fn apply_graph_op(ctx: &Py<ProjectContext>, py: Python<'_>, op: &Bound<'_, PyAny>) -> PyResult<()> {
+    let this = ctx.borrow(py);
+    let mut outputs = this.outputs.borrow_mut();
+    let outputs = outputs
+        .as_mut()
+        .ok_or_else(|| not_materialized("apply_graph_op"))?;
+
     if let Ok(add_edge) = op.extract::<PyRef<AddEdge>>() {
-        let src = add_edge.src.borrow(py);
-        let dst = add_edge.dst.borrow(py);
-        let this = ctx.borrow(py);
-        let mut outputs = this.outputs.borrow_mut();
-        let outputs = outputs
-            .as_mut()
-            .ok_or_else(|| not_materialized("add_edge"))?;
-        let src_idx = lookup_idx(&outputs.builder, &src, "src")?;
-        let dst_idx = lookup_idx(&outputs.builder, &dst, "dst")?;
+        let src_idx = lookup_idx(&outputs.builder, &add_edge.src.borrow(py), "src")?;
+        let dst_idx = lookup_idx(&outputs.builder, &add_edge.dst.borrow(py), "dst")?;
         outputs.builder.add_edge(src_idx, dst_idx, add_edge.flags);
         return Ok(());
     }
     if let Ok(add_ep) = op.extract::<PyRef<AddEntrypoint>>() {
-        let (marker_fqname, path) = {
-            let decl = add_ep.decl.borrow(py);
-            (
-                format!("{}:{}", add_ep.marker, decl.fqname),
-                decl.path.clone(),
-            )
-        };
-        let this = ctx.borrow(py);
-        let marker = this.add_node(
+        let decl = add_ep.decl.borrow(py);
+        let marker_fqname = format!("{}:{}", add_ep.marker, decl.fqname);
+        let path = decl.path.clone();
+        drop(decl);
+        let marker_idx = outputs.builder.intern_node(
             py,
-            marker_fqname,
-            path,
-            "synthetic",
-            0,
-            0,
-            0,
-            0,
-            NODE_FLAG_ENTRYPOINT,
+            NativeNode {
+                fqname: marker_fqname,
+                kind: "synthetic",
+                path,
+                start_line: 0,
+                start_column: 0,
+                end_line: 0,
+                end_column: 0,
+                flags: NODE_FLAG_ENTRYPOINT,
+                imports: None,
+            },
         )?;
-        this.add_edge(&marker.borrow(py), &add_ep.decl.borrow(py))?;
+        let decl_idx = lookup_idx(&outputs.builder, &add_ep.decl.borrow(py), "decl")?;
+        outputs.builder.add_edge(marker_idx, decl_idx, 0);
         return Ok(());
     }
     if let Ok(add_node) = op.extract::<PyRef<AddNode>>() {
-        let this = ctx.borrow(py);
-        this.add_node(
+        let node_idx = outputs.builder.intern_node(
             py,
-            add_node.fqname.clone(),
-            add_node.path.clone(),
-            add_node.kind,
-            0,
-            0,
-            0,
-            0,
-            0,
+            NativeNode {
+                fqname: add_node.fqname.clone(),
+                kind: add_node.kind,
+                path: add_node.path.clone(),
+                start_line: 0,
+                start_column: 0,
+                end_line: 0,
+                end_column: 0,
+                flags: add_node.flags,
+                imports: None,
+            },
         )?;
+        for src in &add_node.edges_from {
+            let src_idx = lookup_idx(&outputs.builder, &src.borrow(py), "edges_from")?;
+            outputs.builder.add_edge(src_idx, node_idx, 0);
+        }
+        for dst in &add_node.edges_to {
+            let dst_idx = lookup_idx(&outputs.builder, &dst.borrow(py), "edges_to")?;
+            outputs.builder.add_edge(node_idx, dst_idx, 0);
+        }
         return Ok(());
     }
     Err(PyValueError::new_err(format!(

@@ -13,9 +13,9 @@ from ..resolvers import load_toml
 from ._core import GraphOp, ObserveContext, PluginContext, mark_entrypoints
 
 if TYPE_CHECKING:
-    import dead_cst_ty_native as native
-
     from ..graph import VisitorPayload
+
+import dead_cst_ty_native as native
 
 PROJECT_SCRIPTS_PREFIX = "<project.scripts>:"
 
@@ -73,7 +73,7 @@ class ProjectScriptsPlugin:
                 f"{PROJECT_SCRIPTS_PREFIX}{script_name}", pyproject, target_nodes
             )
 
-    def run(self, ctx: native.ProjectContext) -> None:
+    def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
         pyproject = self.pyproject_path or Path(ctx.project_root) / "pyproject.toml"
         data = load_toml(pyproject)
         if data is None:
@@ -95,10 +95,9 @@ class ProjectScriptsPlugin:
                     target,
                 )
                 continue
-            marker = ctx.add_node(
+            yield native.AddNode(
                 fqname=f"{PROJECT_SCRIPTS_PREFIX}{script_name}",
                 path=str(pyproject),
                 flags=int(NodeFlags.ENTRYPOINT),
+                edges_to=targets,
             )
-            for t in targets:
-                ctx.add_edge(marker, t)

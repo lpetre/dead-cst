@@ -10,12 +10,12 @@ Demonstrates a new plugin shape distinct from the libcst-side
   implemented in rust against ty's `SemanticIndex` / `parsed_module`.
 
 * The **context is the rust pyclass** (`dead_cst_ty_native.ProjectContext`).
-  Plugins call its methods to mint nodes (`add_node`), wire edges
-  (`add_edge`), and ask structured questions
-  (`find_module_dunders`, `find_classes_defining_method`,
-  `find_subclasses_of`, `find_comment_patterns`). Queries return
-  `NativeNode` Python objects whose `idx` carries the graph identity
-  edges need.
+  Plugins ``yield`` ``GraphOp`` values (``AddNode`` / ``AddEdge`` /
+  ``AddEntrypoint``) to extend the graph, and call ``ctx.find_*`` to
+  ask structured questions (``find_module_dunders``,
+  ``find_classes_defining_method``, ``find_subclasses_of``,
+  ``find_comment_patterns``). Queries return ``NativeNode`` Python
+  objects whose ``idx`` carries the graph identity edges need.
 
 * Configuration mirrors the existing `Project` constructor today
   (root + optional `src_roots` / `python_env` / `python_version` /
@@ -33,22 +33,22 @@ Typical flow::
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Iterable, Protocol, runtime_checkable
+from typing import Iterable, Protocol, runtime_checkable
+
+import dead_cst_ty_native as native
 
 from dead_cst.graph import NodeFlags
-
-if TYPE_CHECKING:
-    import dead_cst_ty_native as native
 
 
 @runtime_checkable
 class ProjectPlugin(Protocol):
     """One project-scoped pass over the rust-built graph.
 
-    Implementations call ``ctx.add_node`` / ``ctx.add_edge`` to extend
-    the graph and ``ctx.find_*`` to query it. Both groups round-trip
-    through rust — queries execute against ty's semantic index;
-    mutations land in the same builder the snapshot reads at the end.
+    Implementations yield ``GraphOp`` values (``AddNode`` / ``AddEdge``
+    / ``AddEntrypoint``) to extend the graph and call ``ctx.find_*``
+    to query it. Both groups round-trip through rust — queries execute
+    against ty's semantic index; ``apply_graph_op`` lands each yielded
+    op in the same builder the snapshot reads at the end.
 
     A plugin's :attr:`name` is informational (used in error messages
     and for ordering / dedup at the call site). Plugins don't carry a
@@ -58,7 +58,7 @@ class ProjectPlugin(Protocol):
 
     name: str
 
-    def run(self, ctx: "native.ProjectContext") -> None: ...
+    def run(self, ctx: "native.ProjectContext") -> "Iterable[native.GraphOp] | None": ...
 
 
 def run_plugins(
@@ -96,11 +96,6 @@ class KeepAliveCommentPlugin:
 
     name = "keep_alive_comment"
 
-    def run(self, ctx: "native.ProjectContext") -> None:
+    def run(self, ctx: "native.ProjectContext") -> "Iterable[native.GraphOp]":
         for decl, _comment in ctx.find_comment_patterns(r"#\s*dead-cst:\s*keep\b"):
-            marker = ctx.add_node(
-                fqname=f"<keep>:{decl.fqname}",
-                path=decl.path,
-                flags=int(NodeFlags.ENTRYPOINT),
-            )
-            ctx.add_edge(marker, decl)
+            yield native.AddEntrypoint(decl, marker="<keep>")
