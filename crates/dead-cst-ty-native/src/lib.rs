@@ -180,6 +180,11 @@ struct ImportSpec {
 /// non-`SHADOWED` decl.
 type LiveDeclIndex = HashMap<(File, String), usize>;
 
+/// Return type of `ProjectContext.find_main_blocks`: one entry per
+/// file with a top-level ``if __name__ == "__main__":`` block, paired
+/// with the decls that fall inside it.
+type MainBlock = (Py<NativeNode>, Vec<Py<NativeNode>>);
+
 /// Outcome of resolving a `Name` use to its reaching definition.
 ///
 /// `Alias` is the module-scope path: the use has a local graph node
@@ -319,6 +324,9 @@ struct BuildOutputs {
     /// `find_subclasses_of` map ty's `TypeHierarchyClass.selection_range`
     /// back to a graph node in O(1).
     class_by_selection: HashMap<(File, (u32, u32)), usize>,
+    /// `file -> module node idx`. Lets `find_main_blocks` reach the
+    /// file's module node without a linear scan over `builder.nodes`.
+    module_nodes_by_file: HashMap<File, usize>,
 }
 
 /// Run the three build phases (ingest → hierarchy+imports → references)
@@ -377,6 +385,7 @@ fn build_project_graph(py: Python<'_>, db: &ProjectDatabase) -> PyResult<BuildOu
         global_index,
         path_to_file,
         class_by_selection,
+        module_nodes_by_file: module_nodes,
     })
 }
 
@@ -400,6 +409,11 @@ fn build_project_graph(py: Python<'_>, db: &ProjectDatabase) -> PyResult<BuildOu
 #[pyclass(unsendable)]
 struct ProjectContext {
     db: ProjectDatabase,
+    /// Absolute path of the project root, echoed back to Python via the
+    /// :attr:`project_root` getter. Plugins use it to compute paths
+    /// relative to the project (e.g. ``ExplicitEntrypointPlugin`` matching
+    /// path specs).
+    root: String,
     plugins: Vec<PyObject>,
     /// Populated by `materialize` before plugins run. `None` outside a
     /// materialize call — `add_node` / `add_edge` / queries assume it's
@@ -438,9 +452,16 @@ impl ProjectContext {
         )?;
         Ok(Self {
             db,
+            root: root.to_string(),
             plugins: Vec::new(),
             outputs: RefCell::new(None),
         })
+    }
+
+    /// Absolute project root passed at construction.
+    #[getter]
+    fn project_root(&self) -> &str {
+        &self.root
     }
 
     /// Register a Python plugin. Order of registration is order of
@@ -602,6 +623,82 @@ impl ProjectContext {
             if import_py.borrow(py).module == module_name {
                 out.push(node_py.clone_ref(py));
             }
+        }
+        Ok(out)
+    }
+
+    /// Return every declaration (function / class / variable / import)
+    /// whose fully qualified name matches ``fqname``.
+    ///
+    /// Multiple results are returned when the same fqname has more
+    /// than one reaching definition (e.g. ``try: import X; except:
+    /// import Y as X``). Modules are not returned — use
+    /// :meth:`find_module` for that.
+    fn find_declarations(&self, py: Python<'_>, fqname: &str) -> PyResult<Vec<Py<NativeNode>>> {
+        let outputs = self.outputs.borrow();
+        let outputs = outputs
+            .as_ref()
+            .ok_or_else(|| not_materialized("find_declarations"))?;
+        let mut out = Vec::new();
+        for node_py in &outputs.builder.nodes {
+            let node = node_py.borrow(py);
+            if !matches!(node.kind, "function" | "class" | "variable" | "import") {
+                continue;
+            }
+            if node.fqname == fqname {
+                out.push(node_py.clone_ref(py));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Return the module node for the given dotted fqname, if it
+    /// exists in the project graph.
+    fn find_module(&self, py: Python<'_>, fqname: &str) -> PyResult<Option<Py<NativeNode>>> {
+        let outputs = self.outputs.borrow();
+        let outputs = outputs
+            .as_ref()
+            .ok_or_else(|| not_materialized("find_module"))?;
+        for node_py in &outputs.builder.nodes {
+            let node = node_py.borrow(py);
+            if node.kind == "module" && node.fqname == fqname {
+                return Ok(Some(node_py.clone_ref(py)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Return ``(module_node, [decls inside the block])`` for every
+    /// file with a top-level ``if __name__ == "__main__":`` block.
+    ///
+    /// The decls list contains the file's class / function / variable
+    /// / import nodes whose source position falls inside the block's
+    /// range — same shape ``MainBlockPlugin``'s libcst path computes
+    /// from the visitor's payload.
+    fn find_main_blocks(&self, py: Python<'_>) -> PyResult<Vec<MainBlock>> {
+        let outputs = self.outputs.borrow();
+        let outputs = outputs
+            .as_ref()
+            .ok_or_else(|| not_materialized("find_main_blocks"))?;
+        let mut out: Vec<MainBlock> = Vec::new();
+        for (&file, &module_idx) in &outputs.module_nodes_by_file {
+            let parsed = parsed_module(&self.db, file).load(&self.db);
+            let Some(block_range) = find_main_block_range(&parsed) else {
+                continue;
+            };
+            // Collect decls whose target_range falls within block_range.
+            let mut decls: Vec<Py<NativeNode>> = Vec::new();
+            for ((entry_file, _place_id, (start, end)), idx) in &outputs.global_index {
+                if *entry_file != file {
+                    continue;
+                }
+                let block_start = block_range.start().to_u32();
+                let block_end = block_range.end().to_u32();
+                if *start >= block_start && *end <= block_end {
+                    decls.push(outputs.builder.nodes[*idx].clone_ref(py));
+                }
+            }
+            out.push((outputs.builder.nodes[module_idx].clone_ref(py), decls));
         }
         Ok(out)
     }
@@ -953,6 +1050,51 @@ fn locate_class_def(
 /// Find a top-level `StmtClassDef` whose name range equals `selection_range`.
 fn class_def_at(parsed: &ParsedModuleRef, selection_range: TextRange) -> Option<&StmtClassDef> {
     iter_top_level_classes(parsed).find(|cls| cls.name.range() == selection_range)
+}
+
+/// Locate the top-level ``if __name__ == "__main__":`` block in a
+/// parsed module and return its source range. Both orderings
+/// (``__name__ == "__main__"`` and ``"__main__" == __name__``) are
+/// recognized; the ``elif`` / ``else`` branches are not matched.
+fn find_main_block_range(parsed: &ParsedModuleRef) -> Option<TextRange> {
+    for stmt in &parsed.syntax().body {
+        let Stmt::If(if_stmt) = stmt else {
+            continue;
+        };
+        if is_name_eq_main(&if_stmt.test) {
+            return Some(if_stmt.range);
+        }
+    }
+    None
+}
+
+/// Match ``__name__ == "__main__"`` or its reverse.
+fn is_name_eq_main(expr: &Expr) -> bool {
+    let Expr::Compare(cmp) = expr else {
+        return false;
+    };
+    if cmp.ops.len() != 1 {
+        return false;
+    }
+    if !matches!(cmp.ops[0], ruff_python_ast::CmpOp::Eq) {
+        return false;
+    }
+    let comparators = &cmp.comparators;
+    if comparators.len() != 1 {
+        return false;
+    }
+    let left = &*cmp.left;
+    let right = &comparators[0];
+    (is_name(left, "__name__") && is_string_literal(right, "__main__"))
+        || (is_string_literal(left, "__main__") && is_name(right, "__name__"))
+}
+
+fn is_name(expr: &Expr, value: &str) -> bool {
+    matches!(expr, Expr::Name(n) if n.id.as_str() == value)
+}
+
+fn is_string_literal(expr: &Expr, value: &str) -> bool {
+    matches!(expr, Expr::StringLiteral(s) if s.value.to_str() == value)
 }
 
 /// Per-file sorted list of `(target_start_offset, node_idx)` for the

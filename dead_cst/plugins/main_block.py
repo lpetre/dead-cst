@@ -22,6 +22,8 @@ from ._core import (
 )
 
 if TYPE_CHECKING:
+    import dead_cst_ty_native as native
+
     from ..graph import VisitorPayload
 
 MAIN_BLOCK_PREFIX = "<__main__>:"
@@ -83,6 +85,17 @@ class MainBlockPlugin:
 
     def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]:
         return ()
+
+    def run(self, ctx: native.ProjectContext) -> None:
+        for module, block_decls in ctx.find_main_blocks():
+            marker = ctx.add_node(
+                fqname=f"{MAIN_BLOCK_PREFIX}{module.fqname}",
+                path=module.path,
+                flags=int(NodeFlags.ENTRYPOINT),
+            )
+            ctx.add_edge(marker, module)
+            for decl in block_decls:
+                ctx.add_edge(marker, decl)
 
 
 def _find_main_block(module: cst.Module) -> cst.If | None:
