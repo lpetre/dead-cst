@@ -55,10 +55,7 @@ use ty_python_core::program::UseDefaultStrategy;
 use ty_python_core::scope::FileScopeId;
 use ty_python_core::semantic_index;
 use ty_python_core::SemanticIndex;
-use ty_python_semantic::{
-    definitions_for_imported_symbol, type_hierarchy_subtypes, HasType, ImportAliasResolution,
-    ResolvedDefinition, SemanticModel, TypeHierarchyClass,
-};
+use ty_python_semantic::{type_hierarchy_subtypes, HasType, SemanticModel, TypeHierarchyClass};
 
 // ---------------------------------------------------------------------------
 // Public Python data classes
@@ -180,6 +177,24 @@ struct ImportSpec {
 /// body — matching how the libcst pipeline's trie only keeps the
 /// non-`SHADOWED` decl.
 type LiveDeclIndex = HashMap<(File, String), usize>;
+
+/// (file, name) -> idx of *any* live module-scope binding, decl or
+/// import alias. Last-write-wins like `LiveDeclIndex`.
+///
+/// Used by `resolve_from_imported` so it can shortcut ty's full
+/// `definitions_for_imported_symbol` walk (which recursively chases
+/// alias chains across files) into a single hashmap probe.
+type GlobalsByName = HashMap<(File, String), usize>;
+
+/// (file, name) -> upstream module name when `name` in `file` is bound
+/// by `from <upstream> import *`. Populated alongside `GlobalsByName`
+/// during Phase 1.
+///
+/// Lets `resolve_from_imported` walk a star-reexport chain
+/// `A → B → C` and emit `consumer → C.g` directly when `from A import g`
+/// resolves through the chain, matching the libcst pipeline's
+/// fixed-point trie merge. Cycle-safe via a `seen` set in the caller.
+type StarReexports = HashMap<(File, String), String>;
 
 /// Outcome of resolving a `Name` use to its reaching definition.
 ///
@@ -331,6 +346,8 @@ fn build_project_graph(py: Python<'_>, db: &ProjectDatabase) -> PyResult<BuildOu
     let mut module_nodes: HashMap<File, usize> = HashMap::new();
     let mut alias_imports: HashMap<usize, ImportSpec> = HashMap::new();
     let mut live_decls: LiveDeclIndex = HashMap::new();
+    let mut globals_by_name: GlobalsByName = HashMap::new();
+    let mut star_reexports: StarReexports = HashMap::new();
     let mut class_by_selection: HashMap<(File, (u32, u32)), usize> = HashMap::new();
 
     let t0 = std::time::Instant::now();
@@ -351,6 +368,8 @@ fn build_project_graph(py: Python<'_>, db: &ProjectDatabase) -> PyResult<BuildOu
             &mut module_nodes,
             &mut alias_imports,
             &mut live_decls,
+            &mut globals_by_name,
+            &mut star_reexports,
             &mut class_by_selection,
         )?;
     }
@@ -365,6 +384,8 @@ fn build_project_graph(py: Python<'_>, db: &ProjectDatabase) -> PyResult<BuildOu
             &mut builder,
             &mut global_index,
             &mut module_nodes,
+            &globals_by_name,
+            &star_reexports,
         )?;
     }
     let t_phase2 = t2.elapsed();
@@ -974,6 +995,8 @@ fn ingest_decls(
     module_nodes: &mut HashMap<File, usize>,
     alias_imports: &mut HashMap<usize, ImportSpec>,
     live_decls: &mut LiveDeclIndex,
+    globals_by_name: &mut GlobalsByName,
+    star_reexports: &mut StarReexports,
     class_by_selection: &mut HashMap<(File, (u32, u32)), usize>,
 ) -> PyResult<()> {
     let parsed = parsed_module(db, file).load(db);
@@ -1102,13 +1125,31 @@ fn ingest_decls(
             class_by_selection.insert((file, range_key(target_range)), node_idx);
         }
 
+        let name_key = (file, local_name.clone());
         if let Some(spec) = import_spec {
+            // Star-reexport synthetics need their upstream tracked so
+            // Phase 2 can walk a `from A import g` resolution through
+            // an `A.g` star-reexport alias all the way to its real
+            // def. Non-star imports clear the entry so a shadowing
+            // import correctly disables chain walking.
+            if spec.star {
+                star_reexports.insert(name_key.clone(), spec.module.clone());
+            } else {
+                star_reexports.remove(&name_key);
+            }
             alias_imports.insert(node_idx, spec);
         } else if node_kind != "module" {
             // Last-write-wins so the map ends up with the end-of-scope
             // live binding (mirrors libcst's `SHADOWED`-excluding trie).
-            live_decls.insert((file, local_name.clone()), node_idx);
+            // A later real decl also kills any earlier star reexport
+            // for the same name.
+            star_reexports.remove(&name_key);
+            live_decls.insert(name_key.clone(), node_idx);
         }
+        // Track every binding (decl + import) by name so Phase 2's
+        // `from X import Y` lookup can probe directly without ty's
+        // recursive alias-resolution walk.
+        globals_by_name.insert(name_key, node_idx);
     }
 
     Ok(())
@@ -1221,6 +1262,7 @@ fn parent_module_edge(
     Some((self_idx, parent_idx))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_import_edges(
     py: Python<'_>,
     db: &ProjectDatabase,
@@ -1228,13 +1270,14 @@ fn emit_import_edges(
     builder: &mut GraphBuilder,
     global_index: &mut DeclIndex,
     module_nodes: &mut HashMap<File, usize>,
+    globals_by_name: &GlobalsByName,
+    star_reexports: &StarReexports,
 ) -> PyResult<()> {
     let parsed = parsed_module(db, file).load(db);
     let index = semantic_index(db, file);
     let global = FileScopeId::global();
     let place_table = index.place_table(global);
     let use_def_map = index.use_def_map(global);
-    let model = SemanticModel::new(db, file);
 
     for (_def_id, state, _used) in use_def_map.all_definitions_with_usage() {
         let DefinitionState::Defined(def) = state else {
@@ -1274,32 +1317,35 @@ fn emit_import_edges(
             DefinitionKind::ImportFrom(k) => resolve_from_imported(
                 py,
                 db,
-                &model,
+                file,
                 k.import(&parsed),
                 k.alias(&parsed).name.id.as_str(),
                 builder,
                 module_nodes,
-                global_index,
+                globals_by_name,
+                star_reexports,
             )?,
             DefinitionKind::ImportFromSubmodule(k) => resolve_from_imported(
                 py,
                 db,
-                &model,
+                file,
                 k.import(&parsed),
                 k.module(&parsed).id.as_str(),
                 builder,
                 module_nodes,
-                global_index,
+                globals_by_name,
+                star_reexports,
             )?,
             DefinitionKind::StarImport(k) => resolve_from_imported(
                 py,
                 db,
-                &model,
+                file,
                 k.import(&parsed),
                 place_table.symbol(k.symbol_id()).name().as_str(),
                 builder,
                 module_nodes,
-                global_index,
+                globals_by_name,
+                star_reexports,
             )?,
             _ => continue,
         };
@@ -1370,66 +1416,76 @@ fn resolve_import_target(
 
 /// Resolve `from <stmt> import <symbol>` to its upstream target node.
 ///
-/// Delegates to ty's `definitions_for_imported_symbol`, which already
-/// tries `<module>.<symbol>` as a submodule first, then falls back to a
-/// global-scope binding in `<module>`, then to namespace-package
-/// submodule resolution. Returns the first `ResolvedDefinition` we can
-/// map to a graph node; otherwise mints (or finds) the upstream module
-/// node so the alias still has an out-edge.
+/// Tries, in order:
+/// 1. **Submodule** — `<module>.<symbol>` resolves as a module (so
+///    `from p import q` where `p/q.py` exists).
+/// 2. **Direct global lookup** — walks `globals_by_name` through any
+///    star-reexport chain (`A → B → C`) until it hits a non-reexport
+///    binding (a decl or non-star import alias). For the shadow case
+///    (`from other import *; def g():` in mod), the last-write-wins
+///    `globals_by_name` returns the local def directly. Cycle-safe via
+///    a `seen` set in `walk_globals_chain`.
+/// 3. **Module fallback** — alias still gets an out-edge to the
+///    upstream module so reachability propagates.
+///
+/// Deliberately does NOT use ty's `definitions_for_imported_symbol`,
+/// which recursively chases alias chains across files. Per Principle 2
+/// every alias is its own graph node with an outgoing edge, so the
+/// transitive walk is already encoded in the graph — replicating it
+/// here cost ~100µs per from-import (94% of Phase 2 on flux0 workspace)
+/// for no extra reachability information.
 #[allow(clippy::too_many_arguments)]
 fn resolve_from_imported(
     py: Python<'_>,
     db: &ProjectDatabase,
-    model: &SemanticModel<'_>,
+    importing_file: File,
     stmt: &ruff_python_ast::StmtImportFrom,
     symbol_name: &str,
     builder: &mut GraphBuilder,
     module_nodes: &mut HashMap<File, usize>,
-    global_index: &DeclIndex,
+    globals_by_name: &GlobalsByName,
+    star_reexports: &StarReexports,
 ) -> PyResult<Option<usize>> {
-    let resolved = definitions_for_imported_symbol(
-        model,
-        stmt,
-        symbol_name,
-        ImportAliasResolution::ResolveAliases,
-    );
-    for r in &resolved {
-        match r {
-            ResolvedDefinition::Definition(def) => {
-                let target_file = def.file(db);
-                let parsed = parsed_module(db, target_file).load(db);
-                let key = (
-                    target_file,
-                    def.place(db),
-                    range_key(def.kind(db).target_range(&parsed)),
-                );
-                if let Some(&idx) = global_index.get(&key) {
-                    return Ok(Some(idx));
-                }
-            }
-            ResolvedDefinition::Module(target_file) => {
+    let Ok(module_name) = ModuleName::from_import_statement(db, importing_file, stmt) else {
+        return Ok(None);
+    };
+
+    // 1. Try `<module>.<symbol>` as a submodule first.
+    if let Some(submodule_name) = ModuleName::new(symbol_name) {
+        let mut combined = module_name.clone();
+        combined.extend(&submodule_name);
+        if let Some(sub_module) = resolve_module(db, importing_file, &combined) {
+            if let Some(sub_file) = sub_module.file(db) {
                 return Ok(Some(mint_module_node(
                     py,
                     db,
-                    *target_file,
+                    sub_file,
                     builder,
                     module_nodes,
                 )?));
             }
-            ResolvedDefinition::FileWithRange(_) => continue,
         }
     }
-    // ty resolved nothing we can graph; fall back to the upstream module
-    // so the alias still propagates reachability.
-    let Ok(module_name) = ModuleName::from_import_statement(db, model.file(), stmt) else {
-        return Ok(None);
-    };
-    let Some(module) = resolve_module(db, model.file(), &module_name) else {
+
+    // 2. Resolve the target module's file, then walk globals_by_name
+    //    through any star-reexport chain.
+    let Some(module) = resolve_module(db, importing_file, &module_name) else {
         return Ok(None);
     };
     let Some(target_file) = module.file(db) else {
         return Ok(None);
     };
+    if let Some(idx) = walk_globals_chain(
+        db,
+        target_file,
+        symbol_name,
+        globals_by_name,
+        star_reexports,
+    ) {
+        return Ok(Some(idx));
+    }
+
+    // 3. Fallback: link the alias to the upstream module node.
     Ok(Some(mint_module_node(
         py,
         db,
@@ -1437,6 +1493,50 @@ fn resolve_from_imported(
         builder,
         module_nodes,
     )?))
+}
+
+/// Walk `(file, name)` through star-reexport chains. Returns the first
+/// non-star-reexport binding (a decl, or a non-star import alias).
+///
+/// `from A import g` where A has `from B import *` lands on A's star
+/// alias for `g`; we resolve B → file, look up `g` there, and recurse.
+/// Stops on a decl, on a non-star import, on a missed lookup (returns
+/// the prior idx), or on a cycle (revisit of an already-seen key).
+fn walk_globals_chain(
+    db: &ProjectDatabase,
+    target_file: File,
+    symbol_name: &str,
+    globals_by_name: &GlobalsByName,
+    star_reexports: &StarReexports,
+) -> Option<usize> {
+    let mut seen: HashSet<(File, String)> = HashSet::new();
+    let mut current_file = target_file;
+    let current_name = symbol_name.to_string();
+    let mut last_idx: Option<usize> = None;
+    loop {
+        let key = (current_file, current_name.clone());
+        if !seen.insert(key.clone()) {
+            return last_idx;
+        }
+        let &idx = globals_by_name.get(&key)?;
+        last_idx = Some(idx);
+        // If this binding is a `from <upstream> import *` reexport,
+        // step into the upstream file and look up the same name there.
+        let Some(upstream_module) = star_reexports.get(&key) else {
+            return Some(idx);
+        };
+        let Some(mn) = ModuleName::new(upstream_module) else {
+            return Some(idx);
+        };
+        let Some(upstream) = resolve_module(db, current_file, &mn) else {
+            return Some(idx);
+        };
+        let Some(upstream_file) = upstream.file(db) else {
+            return Some(idx);
+        };
+        current_file = upstream_file;
+        // current_name stays the same — star reexport carries the name through unchanged.
+    }
 }
 
 /// Resolve the upstream module of a `from <stmt> import ...` and
