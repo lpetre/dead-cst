@@ -65,15 +65,14 @@ class ModuleDundersPlugin:
         return ()
 
     def run(self, ctx: native.ProjectContext) -> None:
-        # ``__future__`` imports are not surfaced here yet; the rust
-        # crate has no ``find_future_imports`` query today.
-        for dunder in ctx.find_module_dunders():
+        targets = [*ctx.find_module_dunders(), *ctx.find_imports_of("__future__")]
+        for target in targets:
             marker = ctx.add_node(
-                fqname=f"{DUNDER_PREFIX}{dunder.fqname}",
-                path=dunder.path,
+                fqname=f"{DUNDER_PREFIX}{target.fqname}",
+                path=target.path,
                 flags=int(NodeFlags.ENTRYPOINT),
             )
-            ctx.add_edge(marker, dunder)
+            ctx.add_edge(marker, target)
 
 
 def _is_kept_alive(node: SymbolNode) -> bool:

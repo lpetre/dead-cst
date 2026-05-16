@@ -578,6 +578,34 @@ impl ProjectContext {
         Ok(out)
     }
 
+    /// Return every import-kind node whose upstream `module` matches.
+    ///
+    /// Covers both `import <module_name>` and
+    /// `from <module_name> import ...` styles — both bind import-kind
+    /// nodes whose `Import.module` is the absolute dotted name. Star
+    /// reexports synthesized from `from <module_name> import *` are
+    /// also included.
+    fn find_imports_of(&self, py: Python<'_>, module_name: &str) -> PyResult<Vec<Py<NativeNode>>> {
+        let outputs = self.outputs.borrow();
+        let outputs = outputs
+            .as_ref()
+            .ok_or_else(|| not_materialized("find_imports_of"))?;
+        let mut out = Vec::new();
+        for node_py in &outputs.builder.nodes {
+            let node = node_py.borrow(py);
+            if node.kind != "import" {
+                continue;
+            }
+            let Some(import_py) = node.imports.as_ref() else {
+                continue;
+            };
+            if import_py.borrow(py).module == module_name {
+                out.push(node_py.clone_ref(py));
+            }
+        }
+        Ok(out)
+    }
+
     /// Return every class that defines a method with the given name.
     ///
     /// Walks each class's `DefinitionKind::Class` body for an
@@ -893,8 +921,15 @@ fn iter_top_level_classes(parsed: &ParsedModuleRef) -> impl Iterator<Item = &Stm
 ///
 /// We don't store ty `Definition<'db>` references across plugin calls
 /// (the `'db` lifetime is tied to the active borrow), so this re-walks
-/// the matching file's top-level classes for one whose name range
-/// projects to the same `(start_line, start_column)` as the node.
+/// Locate a class's File + name TextRange from its NativeNode positions.
+///
+/// We don't store ty `Definition<'db>` references across plugin calls
+/// (the `'db` lifetime is tied to the active borrow), so this re-walks
+/// the matching file's top-level classes for one whose name lands on
+/// the node's start line. Match-by-line (not line+column) because
+/// Function / Class / TypeAlias node columns are snapped to the line's
+/// indent — not the bound name's column — to align with libcst, and
+/// two top-level classes can't share a source line.
 fn locate_class_def(
     db: &ProjectDatabase,
     path_to_file: &HashMap<String, File>,
@@ -907,8 +942,8 @@ fn locate_class_def(
     let line_index = line_index(db, file);
     for cls in iter_top_level_classes(&parsed) {
         let name_range = cls.name.range();
-        let (sl, sc, _, _) = position(&line_index, &source, name_range);
-        if sl == class_node.start_line && sc == class_node.start_column {
+        let (sl, _, _, _) = position(&line_index, &source, name_range);
+        if sl == class_node.start_line {
             return Some((file, name_range));
         }
     }
