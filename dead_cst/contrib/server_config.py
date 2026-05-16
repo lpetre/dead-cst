@@ -15,9 +15,9 @@ from ..plugins._core import (
     module_node,
 )
 
-import dead_cst_ty_native as native
-
 if TYPE_CHECKING:
+    import dead_cst_ty_native as native
+
     from ..graph import VisitorPayload
 
 SERVER_CONFIG_PREFIX = "<server-config>:"
@@ -92,6 +92,8 @@ class ServerConfigPlugin:
         return ()
 
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
+        import dead_cst_ty_native as native
+
         targets_by_path: dict[str, list[native.NativeNode]] = {}
         for n in ctx.nodes():
             if Path(n.path).name not in self.filenames:

@@ -53,9 +53,9 @@ from ._core import (
     synthetic_node,
 )
 
-import dead_cst_ty_native as native
-
 if TYPE_CHECKING:
+    import dead_cst_ty_native as native
+
     from ..graph import VisitorPayload
 
 _INIT_SUBCLASS = "__init_subclass__"
@@ -190,6 +190,8 @@ class InitSubclassPlugin:
                     yield AddEdge(marker, sub)
 
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
+        import dead_cst_ty_native as native
+
         for parent in ctx.find_classes_defining_method(_INIT_SUBCLASS):
             yield native.AddNode(
                 fqname=f"{INIT_SUBCLASS_PREFIX}{parent.fqname}",

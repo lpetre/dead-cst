@@ -21,9 +21,9 @@ from ._core import (
     synthetic_node,
 )
 
-import dead_cst_ty_native as native
-
 if TYPE_CHECKING:
+    import dead_cst_ty_native as native
+
     from ..graph import VisitorPayload
 
 MAIN_BLOCK_PREFIX = "<__main__>:"
@@ -87,6 +87,8 @@ class MainBlockPlugin:
         return ()
 
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
+        import dead_cst_ty_native as native
+
         for module, block_decls in ctx.find_main_blocks():
             yield native.AddNode(
                 fqname=f"{MAIN_BLOCK_PREFIX}{module.fqname}",

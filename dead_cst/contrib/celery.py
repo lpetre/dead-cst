@@ -52,8 +52,6 @@ from typing import TYPE_CHECKING, Iterable, Mapping
 import libcst as cst
 from libcst.metadata import CodeRange
 
-import dead_cst_ty_native as native
-
 from ..graph import NodeFlags, SymbolNode
 from ..plugins._core import (
     SYNTHETIC_POSITION,
@@ -67,6 +65,8 @@ from ..plugins._core import (
 from ..plugins.decl_shapes import DispatchAppPlugin
 
 if TYPE_CHECKING:
+    import dead_cst_ty_native as native
+
     from ..graph import VisitorPayload
 
 # Classes from ``celery`` that produce an app instance. Value records
@@ -116,6 +116,8 @@ class CeleryPlugin(DispatchAppPlugin):
         )
 
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
+        import dead_cst_ty_native as native
+
         yield from DispatchAppPlugin.run(self, ctx)
         # ``@shared_task`` is appless and not covered by DispatchAppPlugin.
         funcs = ctx.find_decorated_decls("celery", list(_SHARED_TASK_NAMES))

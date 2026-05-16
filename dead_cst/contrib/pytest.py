@@ -23,9 +23,9 @@ from ..plugins._core import (
     synthetic_node,
 )
 
-import dead_cst_ty_native as native
-
 if TYPE_CHECKING:
+    import dead_cst_ty_native as native
+
     from ..graph import VisitorPayload
 
 PYTEST_CONFTEST_PREFIX = "<pytest:conftest>:"
@@ -148,6 +148,8 @@ def _mark_seed(
     path: str,
     targets: list[native.NativeNode],
 ) -> Iterable[native.GraphOp]:
+    import dead_cst_ty_native as native
+
     if not targets:
         return
     yield native.AddNode(

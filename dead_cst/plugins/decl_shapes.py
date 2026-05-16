@@ -53,9 +53,9 @@ from ._core import (
     walk_to_instance_kind,
 )
 
-import dead_cst_ty_native as native
-
 if TYPE_CHECKING:
+    import dead_cst_ty_native as native
+
     from ..graph import VisitorPayload
 
 
@@ -146,6 +146,8 @@ class DecoratedDeclPlugin:
         return ()
 
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
+        import dead_cst_ty_native as native
+
         if not self.decorator_module:
             return
         if not (self.decorator_names or self.constructor_names):
@@ -483,6 +485,8 @@ class DispatchAppPlugin:
                 yield AddEdge(seed, var)
 
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
+        import dead_cst_ty_native as native
+
         if not (self.app_module and self.registration_decorators):
             return
         targets = self._targets

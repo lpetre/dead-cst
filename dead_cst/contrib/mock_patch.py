@@ -91,9 +91,9 @@ from ..plugins._core import (
     synthetic_node,
 )
 
-import dead_cst_ty_native as native
-
 if TYPE_CHECKING:
+    import dead_cst_ty_native as native
+
     from ..graph import VisitorPayload
 
 PATCH_TARGET_PREFIX = "<patch-target>:"
@@ -181,6 +181,8 @@ class MockPatchPlugin:
                 yield AddEdge(node, mod)
 
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
+        import dead_cst_ty_native as native
+
         pairs: list[tuple[native.NativeNode, str]] = []
         for module in _MOCK_MODULES:
             pairs.extend(ctx.find_calls_to_imported(module, "patch", 0))

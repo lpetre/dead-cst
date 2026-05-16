@@ -37,8 +37,6 @@ from typing import Iterable, Protocol, runtime_checkable
 
 import dead_cst_ty_native as native
 
-from dead_cst.graph import NodeFlags
-
 
 @runtime_checkable
 class ProjectPlugin(Protocol):

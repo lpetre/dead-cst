@@ -8,12 +8,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterable
 
-from ..graph import NodeFlags, SymbolNode
+from ..graph import SymbolNode
 from ._core import GraphOp, ObserveContext, PluginContext, mark_entrypoints
 
-import dead_cst_ty_native as native
-
 if TYPE_CHECKING:
+    import dead_cst_ty_native as native
+
     from ..graph import VisitorPayload
 
 EXPLICIT_PREFIX = "<entrypoint>:"
@@ -52,6 +52,8 @@ class ExplicitEntrypointPlugin:
             yield from mark_entrypoints(f"{EXPLICIT_PREFIX}{node.fqname}", node.path, [node])
 
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
+        import dead_cst_ty_native as native
+
         root = Path(ctx.project_root)
         for node in ctx.nodes():
             if not self._matches_native(node, root):
