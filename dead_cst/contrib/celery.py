@@ -52,6 +52,9 @@ import libcst as cst
 from libcst.metadata import CodeRange
 
 from ..graph import NodeFlags, SymbolNode
+
+if TYPE_CHECKING:
+    import dead_cst_ty_native as native
 from ..plugins._core import (
     SYNTHETIC_POSITION,
     ObserveContext,
@@ -111,6 +114,31 @@ class CeleryPlugin(DispatchAppPlugin):
             nodes=tuple(base.nodes) + tuple(shared.nodes),
             edges=tuple(base.edges) + tuple(shared.edges),
         )
+
+    def run(self, ctx: "native.ProjectContext") -> None:
+        # The base class's run() handles ``X = Celery(...)`` + ``@app.task``.
+        DispatchAppPlugin.run(self, ctx)
+
+        # ``@shared_task`` / ``@shared_task(...)`` adds an appless channel
+        # not covered by DispatchAppPlugin. Group by file so the synthetic
+        # shape matches the libcst payload (one ``<celery-shared>:<basename>``
+        # synth per file).
+        from pathlib import Path
+
+        funcs = ctx.find_decorated_decls("celery", list(_SHARED_TASK_NAMES))
+        if not funcs:
+            return
+        by_path: dict[str, list[native.NativeNode]] = {}
+        for func in funcs:
+            by_path.setdefault(func.path, []).append(func)
+        for path, targets in by_path.items():
+            seed = ctx.add_node(
+                fqname=f"{CELERY_SHARED_PREFIX}{Path(path).name}",
+                path=path,
+                flags=int(NodeFlags.ENTRYPOINT),
+            )
+            for target in targets:
+                ctx.add_edge(seed, target)
 
     def _shared_task_payload(self, ctx: ObserveContext) -> "VisitorPayload | None":
         """Wire ``@shared_task`` decorated top-level functions to a per-file synthetic."""
