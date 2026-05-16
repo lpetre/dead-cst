@@ -3150,7 +3150,11 @@ impl NoqaKind {
 /// optional whitespace.
 fn parse_noqa_tail(content: &str) -> Option<NoqaKind> {
     let trimmed = content.trim_start();
-    if trimmed.len() < 4 || !trimmed[..4].eq_ignore_ascii_case("noqa") {
+    // `str::get` short-circuits when byte 4 isn't a char boundary —
+    // e.g. a comment that starts with the 3-byte `─` box-drawing char
+    // (common in section banners). Direct slicing would panic.
+    let prefix = trimmed.get(..4)?;
+    if !prefix.eq_ignore_ascii_case("noqa") {
         return None;
     }
     let after_noqa = &trimmed[4..];
@@ -3277,4 +3281,44 @@ fn dead_cst_ty_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Project>()?;
     m.add_class::<ProjectContext>()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_noqa_tail_multibyte_prefix_does_not_panic() {
+        // Regression: byte-slicing `trimmed[..4]` panicked when the
+        // comment started with a multi-byte UTF-8 char (e.g. the
+        // 3-byte `─` box-drawing char in section banners).
+        assert_eq!(parse_noqa_tail("── Top-level model (dataclass) ──"), None,);
+        assert_eq!(parse_noqa_tail("─"), None);
+        assert_eq!(parse_noqa_tail("héllo"), None);
+        assert_eq!(parse_noqa_tail("🙂🙂"), None);
+    }
+
+    #[test]
+    fn parse_noqa_tail_short_content_returns_none() {
+        assert_eq!(parse_noqa_tail(""), None);
+        assert_eq!(parse_noqa_tail("no"), None);
+        assert_eq!(parse_noqa_tail("noq"), None);
+    }
+
+    #[test]
+    fn parse_noqa_tail_recognizes_bare_directive() {
+        assert_eq!(parse_noqa_tail(" noqa"), Some(NoqaKind::Bare));
+        assert_eq!(parse_noqa_tail("NOQA"), Some(NoqaKind::Bare));
+        assert_eq!(parse_noqa_tail("noqa: "), Some(NoqaKind::Bare));
+    }
+
+    #[test]
+    fn parse_noqa_tail_recognizes_f401() {
+        assert_eq!(parse_noqa_tail("noqa: F401"), Some(NoqaKind::F401Present));
+        assert_eq!(
+            parse_noqa_tail("noqa: E501, F401"),
+            Some(NoqaKind::F401Present),
+        );
+        assert_eq!(parse_noqa_tail("noqa: E501"), Some(NoqaKind::OtherOnly));
+    }
 }
