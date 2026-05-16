@@ -38,6 +38,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from dead_cst.plugins import BUILTIN_PLUGINS
+
 # Silence the visitor's WARNING-level breadcrumbs (e.g.
 # ``importlib.import_module(<not-a-literal>)``) — useful in normal
 # runs, pure noise when we want a clean timing table.
@@ -51,8 +53,6 @@ except ImportError as exc:
         "Build with: uv run maturin develop --release "
         "--manifest-path crates/dead-cst-ty-native/Cargo.toml"
     )
-
-from dead_cst.plugins import BUILTIN_PLUGINS
 
 FLUX0_URL = "https://github.com/flux0-ai/flux0.git"
 FLUX0_SHA = "8d04176642b091ddb5c5020486f353d4e824460b"
