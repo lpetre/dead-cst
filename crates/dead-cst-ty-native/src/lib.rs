@@ -54,6 +54,7 @@ use ty_python_core::place::{PlaceExprRef, ScopedPlaceId};
 use ty_python_core::program::UseDefaultStrategy;
 use ty_python_core::scope::FileScopeId;
 use ty_python_core::semantic_index;
+use ty_python_core::SemanticIndex;
 use ty_python_semantic::{
     definitions_for_imported_symbol, type_hierarchy_subtypes, HasType, ImportAliasResolution,
     ResolvedDefinition, SemanticModel, TypeHierarchyClass,
@@ -324,6 +325,7 @@ struct BuildOutputs {
 /// Run the three build phases (ingest → hierarchy+imports → references)
 /// and return every index the plugin queries need.
 fn build_project_graph(py: Python<'_>, db: &ProjectDatabase) -> PyResult<BuildOutputs> {
+    let timing = std::env::var_os("DEAD_CST_TIMING").is_some();
     let mut builder = GraphBuilder::new();
     let mut global_index: DeclIndex = HashMap::new();
     let mut module_nodes: HashMap<File, usize> = HashMap::new();
@@ -331,11 +333,14 @@ fn build_project_graph(py: Python<'_>, db: &ProjectDatabase) -> PyResult<BuildOu
     let mut live_decls: LiveDeclIndex = HashMap::new();
     let mut class_by_selection: HashMap<(File, (u32, u32)), usize> = HashMap::new();
 
+    let t0 = std::time::Instant::now();
     let project_files: Vec<File> = (&db.project().files(db)).into_iter().collect();
     let mut path_to_file: HashMap<String, File> = HashMap::with_capacity(project_files.len());
     for &file in &project_files {
         path_to_file.insert(file_path_string(db, file), file);
     }
+    let t_enum = t0.elapsed();
+    let t1 = std::time::Instant::now();
     for file in &project_files {
         ingest_decls(
             py,
@@ -349,6 +354,8 @@ fn build_project_graph(py: Python<'_>, db: &ProjectDatabase) -> PyResult<BuildOu
             &mut class_by_selection,
         )?;
     }
+    let t_phase1 = t1.elapsed();
+    let t2 = std::time::Instant::now();
     for file in &project_files {
         emit_module_hierarchy(db, *file, &module_nodes, &mut builder);
         emit_import_edges(
@@ -360,6 +367,8 @@ fn build_project_graph(py: Python<'_>, db: &ProjectDatabase) -> PyResult<BuildOu
             &mut module_nodes,
         )?;
     }
+    let t_phase2 = t2.elapsed();
+    let t3 = std::time::Instant::now();
     for file in &project_files {
         emit_reference_edges(
             db,
@@ -369,6 +378,20 @@ fn build_project_graph(py: Python<'_>, db: &ProjectDatabase) -> PyResult<BuildOu
             &alias_imports,
             &live_decls,
             &mut builder,
+        );
+    }
+    let t_phase3 = t3.elapsed();
+    if timing {
+        eprintln!(
+            "[dead-cst-timing] files={} nodes={} edges={} enum={:?} phase1={:?} phase2={:?} phase3={:?} total={:?}",
+            project_files.len(),
+            builder.nodes.len(),
+            builder.edges.len(),
+            t_enum,
+            t_phase1,
+            t_phase2,
+            t_phase3,
+            t0.elapsed(),
         );
     }
     Ok(BuildOutputs {
@@ -1526,6 +1549,7 @@ fn emit_reference_edges(
             &model,
             file,
             &parsed,
+            index,
             global_index,
             module_nodes,
             alias_imports,
@@ -1547,6 +1571,7 @@ fn emit_reference_edges(
             &model,
             file,
             &parsed,
+            index,
             global_index,
             module_nodes,
             alias_imports,
@@ -1781,6 +1806,11 @@ struct RefCollector<'a, 'db> {
     model: &'a SemanticModel<'db>,
     file: File,
     parsed: &'a ParsedModuleRef,
+    /// Cached `&SemanticIndex` for `self.file`. Avoids re-doing the
+    /// Salsa `semantic_index(db, file)` lookup per Name reference —
+    /// every call to `find_local_bindings` / `lookup_module_scope_name`
+    /// used to issue one. ~10k saved lookups on a 100-file workspace.
+    index: &'a SemanticIndex<'db>,
     global_index: &'a DeclIndex,
     module_nodes: &'a HashMap<File, usize>,
     alias_imports: &'a HashMap<usize, ImportSpec>,
@@ -1818,6 +1848,7 @@ impl<'a, 'db> RefCollector<'a, 'db> {
         model: &'a SemanticModel<'db>,
         file: File,
         parsed: &'a ParsedModuleRef,
+        index: &'a SemanticIndex<'db>,
         global_index: &'a DeclIndex,
         module_nodes: &'a HashMap<File, usize>,
         alias_imports: &'a HashMap<usize, ImportSpec>,
@@ -1829,6 +1860,7 @@ impl<'a, 'db> RefCollector<'a, 'db> {
             model,
             file,
             parsed,
+            index,
             global_index,
             module_nodes,
             alias_imports,
@@ -1876,11 +1908,10 @@ impl<'a, 'db> RefCollector<'a, 'db> {
     /// doesn't influence static dep tracking.
     fn lookup_module_scope_name(&self, name: &str) -> Option<usize> {
         let db = self.model.db();
-        let index = semantic_index(db, self.file);
         let global = FileScopeId::global();
-        let place_table = index.place_table(global);
+        let place_table = self.index.place_table(global);
         let symbol_id = place_table.symbol_id(name)?;
-        let use_def_map = index.use_def_map(global);
+        let use_def_map = self.index.use_def_map(global);
         for binding in use_def_map.end_of_scope_symbol_bindings(symbol_id) {
             let Some(def) = binding.binding.definition() else {
                 continue;
@@ -1925,16 +1956,15 @@ impl<'a, 'db> RefCollector<'a, 'db> {
     /// flattening the local alias edge Principle 2 requires.
     fn find_local_bindings(&self, name: &ExprName) -> Vec<Resolution> {
         let db = self.model.db();
-        let index = semantic_index(db, self.file);
         let Some(file_scope) = self.model.scope(name.into()) else {
             return Vec::new();
         };
-        for (scope_id, _scope) in index.visible_ancestor_scopes(file_scope) {
-            let place_table = index.place_table(scope_id);
+        for (scope_id, _scope) in self.index.visible_ancestor_scopes(file_scope) {
+            let place_table = self.index.place_table(scope_id);
             let Some(symbol_id) = place_table.symbol_id(name.id.as_str()) else {
                 continue;
             };
-            let use_def_map = index.use_def_map(scope_id);
+            let use_def_map = self.index.use_def_map(scope_id);
             let mut saw_binding = false;
             let mut results: Vec<Resolution> = Vec::new();
             for binding in use_def_map.end_of_scope_symbol_bindings(symbol_id) {
