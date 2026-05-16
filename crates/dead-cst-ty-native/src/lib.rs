@@ -1818,6 +1818,7 @@ fn apply_graph_op(ctx: &Py<ProjectContext>, py: Python<'_>, op: &Bound<'_, PyAny
     }
     if let Ok(add_ep) = op.extract::<PyRef<AddEntrypoint>>() {
         let decl = add_ep.decl.borrow(py);
+        let decl_idx = lookup_idx(&outputs.builder, &decl, "decl")?;
         let marker_fqname = format!("{}:{}", add_ep.marker, decl.fqname);
         let path = decl.path.clone();
         drop(decl);
@@ -1835,7 +1836,6 @@ fn apply_graph_op(ctx: &Py<ProjectContext>, py: Python<'_>, op: &Bound<'_, PyAny
                 imports: None,
             },
         )?;
-        let decl_idx = lookup_idx(&outputs.builder, &add_ep.decl.borrow(py), "decl")?;
         outputs.builder.add_edge(marker_idx, decl_idx, 0);
         return Ok(());
     }

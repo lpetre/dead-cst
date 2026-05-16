@@ -53,10 +53,10 @@ from ._core import (
     walk_to_instance_kind,
 )
 
+import dead_cst_ty_native as native
+
 if TYPE_CHECKING:
     from ..graph import VisitorPayload
-
-import dead_cst_ty_native as native
 
 
 @dataclass(kw_only=True)
@@ -145,7 +145,7 @@ class DecoratedDeclPlugin:
     def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]:
         return ()
 
-    def run(self, ctx: "native.ProjectContext") -> "Iterable[native.GraphOp]":
+    def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
         if not self.decorator_module:
             return
         if not (self.decorator_names or self.constructor_names):
@@ -482,7 +482,7 @@ class DispatchAppPlugin:
                 yield AddNode(seed)
                 yield AddEdge(seed, var)
 
-    def run(self, ctx: "native.ProjectContext") -> "Iterable[native.GraphOp]":
+    def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
         if not (self.app_module and self.registration_decorators):
             return
         targets = self._targets

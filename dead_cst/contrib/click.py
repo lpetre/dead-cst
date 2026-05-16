@@ -123,7 +123,7 @@ class ClickPlugin(DecoratedDeclPlugin):
             return None
         return make_payload(edges=edges)
 
-    def run(self, ctx: "native.ProjectContext") -> "Iterable[native.GraphOp]":
+    def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
         decorated = ctx.find_decorated_decls(self.decorator_module, list(self.decorator_names))
         constructed = ctx.find_instance_constructions(
             self.decorator_module, list(self.constructor_names)

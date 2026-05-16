@@ -12,10 +12,10 @@ from ..graph import NodeFlags
 from ..resolvers import load_toml
 from ._core import GraphOp, ObserveContext, PluginContext, mark_entrypoints
 
+import dead_cst_ty_native as native
+
 if TYPE_CHECKING:
     from ..graph import VisitorPayload
-
-import dead_cst_ty_native as native
 
 PROJECT_SCRIPTS_PREFIX = "<project.scripts>:"
 

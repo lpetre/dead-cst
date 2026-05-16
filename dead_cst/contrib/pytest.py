@@ -23,10 +23,10 @@ from ..plugins._core import (
     synthetic_node,
 )
 
+import dead_cst_ty_native as native
+
 if TYPE_CHECKING:
     from ..graph import VisitorPayload
-
-import dead_cst_ty_native as native
 
 PYTEST_CONFTEST_PREFIX = "<pytest:conftest>:"
 PYTEST_TESTS_PREFIX = "<pytest:tests>:"

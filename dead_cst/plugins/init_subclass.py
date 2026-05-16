@@ -53,10 +53,10 @@ from ._core import (
     synthetic_node,
 )
 
+import dead_cst_ty_native as native
+
 if TYPE_CHECKING:
     from ..graph import VisitorPayload
-
-import dead_cst_ty_native as native
 
 _INIT_SUBCLASS = "__init_subclass__"
 INIT_SUBCLASS_PREFIX = "<__init_subclass__>:"

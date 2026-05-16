@@ -15,10 +15,10 @@ from ..plugins._core import (
     module_node,
 )
 
+import dead_cst_ty_native as native
+
 if TYPE_CHECKING:
     from ..graph import VisitorPayload
-
-import dead_cst_ty_native as native
 
 SERVER_CONFIG_PREFIX = "<server-config>:"
 

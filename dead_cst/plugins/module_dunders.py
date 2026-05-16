@@ -16,10 +16,10 @@ from ._core import (
     synthetic_node,
 )
 
+import dead_cst_ty_native as native
+
 if TYPE_CHECKING:
     from ..graph import VisitorPayload
-
-import dead_cst_ty_native as native
 
 DUNDER_PREFIX = "<dunder>:"
 
@@ -66,7 +66,7 @@ class ModuleDundersPlugin:
 
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
         for target in [*ctx.find_module_dunders(), *ctx.find_imports_of("__future__")]:
-            yield native.AddEntrypoint(target, marker=DUNDER_PREFIX.rstrip(":"))
+            yield native.AddEntrypoint(target, marker="<dunder>")
 
 
 def _is_kept_alive(node: SymbolNode) -> bool:

@@ -11,10 +11,10 @@ from typing import TYPE_CHECKING, Iterable
 from ..graph import NodeFlags, SymbolNode
 from ._core import GraphOp, ObserveContext, PluginContext, mark_entrypoints
 
+import dead_cst_ty_native as native
+
 if TYPE_CHECKING:
     from ..graph import VisitorPayload
-
-import dead_cst_ty_native as native
 
 EXPLICIT_PREFIX = "<entrypoint>:"
 
@@ -56,7 +56,7 @@ class ExplicitEntrypointPlugin:
         for node in ctx.nodes():
             if not self._matches_native(node, root):
                 continue
-            yield native.AddEntrypoint(node, marker=EXPLICIT_PREFIX.rstrip(":"))
+            yield native.AddEntrypoint(node, marker="<entrypoint>")
 
     def _matches_native(self, node: native.NativeNode, root: Path) -> bool:
         path = Path(node.path)

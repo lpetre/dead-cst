@@ -91,10 +91,10 @@ from ..plugins._core import (
     synthetic_node,
 )
 
+import dead_cst_ty_native as native
+
 if TYPE_CHECKING:
     from ..graph import VisitorPayload
-
-import dead_cst_ty_native as native
 
 PATCH_TARGET_PREFIX = "<patch-target>:"
 
@@ -180,7 +180,7 @@ class MockPatchPlugin:
             if mod is not None and mod not in existing:
                 yield AddEdge(node, mod)
 
-    def run(self, ctx: "native.ProjectContext") -> "Iterable[native.GraphOp]":
+    def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
         pairs: list[tuple[native.NativeNode, str]] = []
         for module in _MOCK_MODULES:
             pairs.extend(ctx.find_calls_to_imported(module, "patch", 0))
@@ -199,6 +199,8 @@ class MockPatchPlugin:
             mod = ctx.find_module(fqname)
             if mod is not None:
                 targets.append(mod)
+            # The marker is per-fqname, not per-file: any owner's path is
+            # an acceptable anchor for `why-alive` output.
             yield native.AddNode(
                 fqname=f"{PATCH_TARGET_PREFIX}{fqname}",
                 path=owners[0].path,

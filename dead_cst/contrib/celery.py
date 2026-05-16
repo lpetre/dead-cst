@@ -115,7 +115,7 @@ class CeleryPlugin(DispatchAppPlugin):
             edges=tuple(base.edges) + tuple(shared.edges),
         )
 
-    def run(self, ctx: "native.ProjectContext") -> "Iterable[native.GraphOp]":
+    def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
         yield from DispatchAppPlugin.run(self, ctx)
         # ``@shared_task`` is appless and not covered by DispatchAppPlugin.
         funcs = ctx.find_decorated_decls("celery", list(_SHARED_TASK_NAMES))
