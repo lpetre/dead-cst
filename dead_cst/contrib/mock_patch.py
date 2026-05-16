@@ -92,6 +92,8 @@ from ..plugins._core import (
 )
 
 if TYPE_CHECKING:
+    import dead_cst_ty_native as native
+
     from ..graph import VisitorPayload
 
 PATCH_TARGET_PREFIX = "<patch-target>:"
@@ -99,6 +101,15 @@ PATCH_TARGET_PREFIX = "<patch-target>:"
 _MOCK_MODULES = frozenset({"unittest.mock", "mock"})
 _MOCKER_NAME = "mocker"
 _MONKEYPATCH_NAME = "monkeypatch"
+
+# Methods of pytest's ``monkeypatch`` fixture whose first arg can be a
+# fully-qualified string name. The value is the positional-argument
+# count for the string-fqname form (the object form takes one extra
+# positional arg, which is how we disambiguate).
+_MONKEYPATCH_FQNAME_METHODS: dict[str, int] = {
+    "setattr": 2,  # setattr("X.Y", value)              [vs setattr(obj, "name", value)]
+    "delattr": 1,  # delattr("X.Y")                     [vs delattr(obj, "name")]
+}
 
 
 @dataclass
@@ -168,6 +179,34 @@ class MockPatchPlugin:
             mod = modules_cache[fqname]
             if mod is not None and mod not in existing:
                 yield AddEdge(node, mod)
+
+    def run(self, ctx: "native.ProjectContext") -> None:
+        pairs: list[tuple[native.NativeNode, str]] = []
+        for module in _MOCK_MODULES:
+            pairs.extend(ctx.find_calls_to_imported(module, "patch", 0))
+        pairs.extend(ctx.find_calls_on_var(_MOCKER_NAME, "patch", 0, required_positional=None))
+        for attr, required in _MONKEYPATCH_FQNAME_METHODS.items():
+            pairs.extend(
+                ctx.find_calls_on_var(_MONKEYPATCH_NAME, attr, 0, required_positional=required)
+            )
+
+        markers: dict[str, native.NativeNode] = {}
+        for owner, fqname in pairs:
+            marker = markers.get(fqname)
+            if marker is None:
+                marker = ctx.add_node(
+                    fqname=f"{PATCH_TARGET_PREFIX}{fqname}",
+                    path=owner.path,
+                )
+                markers[fqname] = marker
+            ctx.add_edge(owner, marker)
+
+        for fqname, marker in markers.items():
+            for decl in ctx.find_declarations(fqname):
+                ctx.add_edge(marker, decl)
+            mod = ctx.find_module(fqname)
+            if mod is not None:
+                ctx.add_edge(marker, mod)
 
 
 def _collect_mock_imports(module: cst.Module) -> tuple[set[str], set[str]]:
@@ -279,16 +318,6 @@ def _first_string_arg(call: cst.Call) -> str | None:
     if first.keyword is not None:
         return None
     return string_value(first.value)
-
-
-# Methods of pytest's ``monkeypatch`` fixture whose first arg can be a
-# fully-qualified string name. The value is the positional-argument
-# count for the *string-fqname* form (the object form takes one extra
-# positional arg, which is how we disambiguate).
-_MONKEYPATCH_FQNAME_METHODS: dict[str, int] = {
-    "setattr": 2,  # setattr("X.Y", value)              [vs setattr(obj, "name", value)]
-    "delattr": 1,  # delattr("X.Y")                     [vs delattr(obj, "name")]
-}
 
 
 def _monkeypatch_target(call: cst.Call) -> str | None:

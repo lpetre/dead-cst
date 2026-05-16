@@ -349,6 +349,14 @@ struct BuildOutputs {
     /// and the dispatch-app queries map an AST node's target range to a
     /// graph node in O(1) instead of scanning the full ``global_index``.
     decl_by_name_range: HashMap<(File, (u32, u32)), usize>,
+    /// `decl_fqname -> [node idx]`. Lets ``find_declarations`` answer
+    /// in O(parts) instead of O(parts × all_nodes). Multiple entries
+    /// per fqname arise from try/except rebinds and conditional
+    /// re-imports.
+    decl_by_fqname: HashMap<String, Vec<usize>>,
+    /// `module_fqname -> node idx`. Lets ``find_module`` answer in
+    /// O(1) instead of scanning all nodes.
+    module_by_fqname: HashMap<String, usize>,
 }
 
 /// Run the three build phases (ingest → hierarchy+imports → references)
@@ -418,9 +426,12 @@ fn build_project_graph(py: Python<'_>, db: &ProjectDatabase) -> PyResult<BuildOu
         );
     }
     let t_phase3 = t3.elapsed();
+    let t4 = std::time::Instant::now();
+    let (decl_by_fqname, module_by_fqname) = build_fqname_indices(py, &builder);
+    let t_fqname = t4.elapsed();
     if timing {
         eprintln!(
-            "[dead-cst-timing] files={} nodes={} edges={} enum={:?} phase1={:?} phase2={:?} phase3={:?} total={:?}",
+            "[dead-cst-timing] files={} nodes={} edges={} enum={:?} phase1={:?} phase2={:?} phase3={:?} fqname={:?} total={:?}",
             project_files.len(),
             builder.nodes.len(),
             builder.edges.len(),
@@ -428,6 +439,7 @@ fn build_project_graph(py: Python<'_>, db: &ProjectDatabase) -> PyResult<BuildOu
             t_phase1,
             t_phase2,
             t_phase3,
+            t_fqname,
             t0.elapsed(),
         );
     }
@@ -439,7 +451,34 @@ fn build_project_graph(py: Python<'_>, db: &ProjectDatabase) -> PyResult<BuildOu
         class_by_selection,
         module_nodes_by_file: module_nodes,
         decl_by_name_range,
+        decl_by_fqname,
+        module_by_fqname,
     })
+}
+
+/// Pre-build the fqname -> idx maps used by ``find_declarations`` and
+/// ``find_module``. One pass over interned nodes; module entries are
+/// 1:1 (one module node per fqname) while decl entries can have
+/// multiple binders for the same fqname (try/except rebind etc.).
+fn build_fqname_indices(
+    py: Python<'_>,
+    builder: &GraphBuilder,
+) -> (HashMap<String, Vec<usize>>, HashMap<String, usize>) {
+    let mut decls: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut modules: HashMap<String, usize> = HashMap::new();
+    for (idx, node_py) in builder.nodes.iter().enumerate() {
+        let node = node_py.borrow(py);
+        match node.kind {
+            "module" => {
+                modules.insert(node.fqname.clone(), idx);
+            }
+            "function" | "class" | "variable" | "import" => {
+                decls.entry(node.fqname.clone()).or_default().push(idx);
+            }
+            _ => {}
+        }
+    }
+    (decls, modules)
 }
 
 // ---------------------------------------------------------------------------
@@ -681,28 +720,33 @@ impl ProjectContext {
     }
 
     /// Return every declaration (function / class / variable / import)
-    /// whose fully qualified name matches ``fqname``.
+    /// whose fully qualified name matches ``fqname``, walking back
+    /// through dotted segments to find the enclosing top-level decl
+    /// when the exact name doesn't match.
     ///
-    /// Multiple results are returned when the same fqname has more
-    /// than one reaching definition (e.g. ``try: import X; except:
-    /// import Y as X``). Modules are not returned — use
-    /// :meth:`find_module` for that.
+    /// ``pkg.lib.Cls.method`` returns ``pkg.lib.Cls`` because methods
+    /// aren't represented as their own graph nodes — same rule the
+    /// libcst :func:`find_declarations` follows. Modules are never
+    /// returned; use :meth:`find_module` for that.
     fn find_declarations(&self, py: Python<'_>, fqname: &str) -> PyResult<Vec<Py<NativeNode>>> {
         let outputs = self.outputs.borrow();
         let outputs = outputs
             .as_ref()
             .ok_or_else(|| not_materialized("find_declarations"))?;
-        let mut out = Vec::new();
-        for node_py in &outputs.builder.nodes {
-            let node = node_py.borrow(py);
-            if !matches!(node.kind, "function" | "class" | "variable" | "import") {
-                continue;
+        // Try exact match first, then strip trailing segments.
+        let mut prefix = fqname;
+        loop {
+            if let Some(idxs) = outputs.decl_by_fqname.get(prefix) {
+                return Ok(idxs
+                    .iter()
+                    .map(|&i| outputs.builder.nodes[i].clone_ref(py))
+                    .collect());
             }
-            if node.fqname == fqname {
-                out.push(node_py.clone_ref(py));
+            match prefix.rsplit_once('.') {
+                Some((parent, _)) => prefix = parent,
+                None => return Ok(Vec::new()),
             }
         }
-        Ok(out)
     }
 
     /// Return the module node for the given dotted fqname, if it
@@ -712,13 +756,10 @@ impl ProjectContext {
         let outputs = outputs
             .as_ref()
             .ok_or_else(|| not_materialized("find_module"))?;
-        for node_py in &outputs.builder.nodes {
-            let node = node_py.borrow(py);
-            if node.kind == "module" && node.fqname == fqname {
-                return Ok(Some(node_py.clone_ref(py)));
-            }
-        }
-        Ok(None)
+        Ok(outputs
+            .module_by_fqname
+            .get(fqname)
+            .map(|&idx| outputs.builder.nodes[idx].clone_ref(py)))
     }
 
     /// Return the module node owning ``path``, if any. O(1) — backed
@@ -862,7 +903,8 @@ impl ProjectContext {
                     Some(pair) => pair,
                     None => continue,
                 };
-                if let Some(matched) = matched_call_target(value, &imports, &allowed) {
+                let Expr::Call(call) = value else { continue };
+                if let Some(matched) = matched_call_target(call, &imports, module, &allowed) {
                     let key = (file, range_key(target_range));
                     if let Some(&idx) = outputs.decl_by_name_range.get(&key) {
                         out.push((outputs.builder.nodes[idx].clone_ref(py), matched));
@@ -964,6 +1006,7 @@ impl ProjectContext {
                 };
                 let mut finder = FactoryCallFinder {
                     imports: &imports,
+                    module,
                     allowed: &allowed,
                     kinds: HashSet::new(),
                 };
@@ -978,6 +1021,101 @@ impl ProjectContext {
                     let mut kinds_vec: Vec<String> = finder.kinds.into_iter().collect();
                     kinds_vec.sort();
                     out.push((outputs.builder.nodes[idx].clone_ref(py), kinds_vec));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Find calls to a callable imported from ``module`` with the name
+    /// ``name``. Returns ``(owning_decl, string_literal_arg)`` pairs
+    /// where the call resolves through the file's local imports.
+    ///
+    /// The owning decl is the top-level ``FunctionDef`` / ``ClassDef``
+    /// the call lives under (including its decorator subtree); calls
+    /// at module scope attribute to the module node.
+    #[allow(clippy::type_complexity)]
+    fn find_calls_to_imported(
+        &self,
+        py: Python<'_>,
+        module: &str,
+        name: &str,
+        arg_index: usize,
+    ) -> PyResult<Vec<(Py<NativeNode>, String)>> {
+        let outputs = self.outputs.borrow();
+        let outputs = outputs
+            .as_ref()
+            .ok_or_else(|| not_materialized("find_calls_to_imported"))?;
+        let allowed: HashSet<&str> = [name].into_iter().collect();
+        let mut out = Vec::new();
+        for &file in &outputs.project_files {
+            let parsed = parsed_module(&self.db, file).load(&self.db);
+            let imports = collect_module_imports_local(&parsed, module, &allowed);
+            if imports.is_empty() {
+                continue;
+            }
+            for stmt in &parsed.syntax().body {
+                let Some(owner_idx) = owner_idx_for_stmt(outputs, file, stmt) else {
+                    continue;
+                };
+                let mut finder = StringArgCallFinder {
+                    predicate: |call: &ruff_python_ast::ExprCall| {
+                        matched_call_target(call, &imports, module, &allowed).is_some()
+                    },
+                    arg_index,
+                    results: Vec::new(),
+                };
+                finder.visit_stmt(stmt);
+                for arg in finder.results {
+                    out.push((outputs.builder.nodes[owner_idx].clone_ref(py), arg));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Find ``<owner>.<attr>(...)`` calls where ``owner`` is the textual
+    /// prefix (no import resolution — covers pytest fixture conventions
+    /// like ``mocker.patch`` / ``monkeypatch.setattr``).
+    ///
+    /// ``required_positional`` disambiguates fqname-form calls from
+    /// object-form calls when the same method name is overloaded:
+    /// ``monkeypatch.setattr("X.Y", v)`` has 2 positional args
+    /// (fqname + value) while ``monkeypatch.setattr(obj, "name", v)``
+    /// has 3. Pass ``None`` to accept any positional-arg count.
+    ///
+    /// Returns ``(owning_decl, string_literal_arg)`` pairs.
+    #[allow(clippy::type_complexity)]
+    #[pyo3(signature = (owner, attr, arg_index, *, required_positional = None))]
+    fn find_calls_on_var(
+        &self,
+        py: Python<'_>,
+        owner: &str,
+        attr: &str,
+        arg_index: usize,
+        required_positional: Option<usize>,
+    ) -> PyResult<Vec<(Py<NativeNode>, String)>> {
+        let outputs = self.outputs.borrow();
+        let outputs = outputs
+            .as_ref()
+            .ok_or_else(|| not_materialized("find_calls_on_var"))?;
+        let mut out = Vec::new();
+        for &file in &outputs.project_files {
+            let parsed = parsed_module(&self.db, file).load(&self.db);
+            for stmt in &parsed.syntax().body {
+                let Some(owner_idx) = owner_idx_for_stmt(outputs, file, stmt) else {
+                    continue;
+                };
+                let mut finder = StringArgCallFinder {
+                    predicate: |call: &ruff_python_ast::ExprCall| {
+                        call_callee_matches_var(call, owner, attr, required_positional)
+                    },
+                    arg_index,
+                    results: Vec::new(),
+                };
+                finder.visit_stmt(stmt);
+                for arg in finder.results {
+                    out.push((outputs.builder.nodes[owner_idx].clone_ref(py), arg));
                 }
             }
         }
@@ -1435,21 +1573,34 @@ fn collect_module_imports_local(
     module: &str,
     allowed: &HashSet<&str>,
 ) -> HashMap<String, String> {
+    // Submodule binding: ``from <parent> import <last_seg>`` makes
+    // ``last_seg`` a local alias for the queried module (e.g.
+    // ``from unittest import mock`` for module ``unittest.mock``).
+    let parent_last = module.rsplit_once('.');
     let mut out = HashMap::new();
     for stmt in &parsed.syntax().body {
         match stmt {
             Stmt::ImportFrom(im) => {
                 let Some(mod_name) = &im.module else { continue };
-                if mod_name.as_str() != module {
-                    continue;
-                }
-                for alias in &im.names {
-                    let target = alias.name.as_str();
-                    if !allowed.contains(target) {
-                        continue;
+                if mod_name.as_str() == module {
+                    for alias in &im.names {
+                        let target = alias.name.as_str();
+                        if !allowed.contains(target) {
+                            continue;
+                        }
+                        let local = alias.asname.as_ref().map(|n| n.as_str()).unwrap_or(target);
+                        out.insert(local.to_string(), target.to_string());
                     }
-                    let local = alias.asname.as_ref().map(|n| n.as_str()).unwrap_or(target);
-                    out.insert(local.to_string(), target.to_string());
+                } else if let Some((parent, last)) = parent_last {
+                    if mod_name.as_str() == parent {
+                        for alias in &im.names {
+                            if alias.name.as_str() != last {
+                                continue;
+                            }
+                            let local = alias.asname.as_ref().map(|n| n.as_str()).unwrap_or(last);
+                            out.insert(local.to_string(), "<module>".to_string());
+                        }
+                    }
                 }
             }
             Stmt::Import(im) => {
@@ -1467,33 +1618,49 @@ fn collect_module_imports_local(
     out
 }
 
-/// Match an expression against a constructor pattern:
-/// * ``<imported_local>(...)`` where the local binds an allowed name; or
-/// * ``<module_alias>.<allowed_name>(...)`` where the alias binds the module.
+/// Match an expression against a callable-from-module pattern. Three
+/// shapes resolve through ``imports`` to the configured ``module``:
+///
+/// * ``<imported_local>(...)`` — local was bound via ``from <module>
+///   import <name>``;
+/// * ``<module_alias>.<allowed_name>(...)`` — alias bound via
+///   ``import <module> [as <alias>]``;
+/// * ``<m>.<n>.…<allowed_name>(...)`` — literal dotted access of a
+///   multi-segment ``<module>`` (e.g. ``import unittest.mock;
+///   unittest.mock.patch(...)``).
 ///
 /// Returns the matched upstream name (``"Flask"``) on hit, else ``None``.
 fn matched_call_target(
-    expr: &Expr,
+    call: &ruff_python_ast::ExprCall,
     imports: &HashMap<String, String>,
+    module: &str,
     allowed: &HashSet<&str>,
 ) -> Option<String> {
-    let Expr::Call(call) = expr else {
-        return None;
-    };
     match call.func.as_ref() {
         Expr::Name(name) => {
             let target = imports.get(name.id.as_str())?;
             allowed.contains(target.as_str()).then(|| target.clone())
         }
         Expr::Attribute(attr) => {
-            let Expr::Name(prefix) = attr.value.as_ref() else {
-                return None;
-            };
-            if imports.get(prefix.id.as_str()).map(String::as_str) != Some("<module>") {
+            let attr_name = attr.attr.as_str();
+            if !allowed.contains(attr_name) {
                 return None;
             }
-            let attr_name = attr.attr.as_str();
-            allowed.contains(attr_name).then(|| attr_name.to_string())
+            match attr.value.as_ref() {
+                Expr::Name(prefix) => (imports.get(prefix.id.as_str()).map(String::as_str)
+                    == Some("<module>"))
+                .then(|| attr_name.to_string()),
+                _ => {
+                    let (root, segs) = collapse_attribute_chain(attr.value.as_ref())?;
+                    let mut dotted = String::with_capacity(module.len());
+                    dotted.push_str(root.id.as_str());
+                    for seg in &segs {
+                        dotted.push('.');
+                        dotted.push_str(seg);
+                    }
+                    (dotted == module).then(|| attr_name.to_string())
+                }
+            }
         }
         _ => None,
     }
@@ -1528,14 +1695,104 @@ fn top_level_assign_to_name(stmt: &Stmt) -> Option<(TextRange, &Expr)> {
 /// of constructor names called anywhere inside it.
 struct FactoryCallFinder<'a> {
     imports: &'a HashMap<String, String>,
+    module: &'a str,
     allowed: &'a HashSet<&'a str>,
     kinds: HashSet<String>,
 }
 
 impl<'ast, 'a> Visitor<'ast> for FactoryCallFinder<'a> {
     fn visit_expr(&mut self, expr: &'ast Expr) {
-        if let Some(name) = matched_call_target(expr, self.imports, self.allowed) {
-            self.kinds.insert(name);
+        if let Expr::Call(call) = expr {
+            if let Some(name) = matched_call_target(call, self.imports, self.module, self.allowed) {
+                self.kinds.insert(name);
+            }
+        }
+        walk_expr(self, expr);
+    }
+}
+
+/// Owner-resolution helper shared by the call-finder queries.
+/// Top-level ``FunctionDef`` / ``ClassDef`` own calls inside their
+/// subtree (decorators included via the walk); other top-level stmts
+/// attribute their calls to the module node.
+fn owner_idx_for_stmt(outputs: &BuildOutputs, file: File, stmt: &Stmt) -> Option<usize> {
+    let module_idx = outputs.module_nodes_by_file.get(&file).copied();
+    let name_range = match stmt {
+        Stmt::FunctionDef(f) => f.name.range(),
+        Stmt::ClassDef(c) => c.name.range(),
+        _ => return module_idx,
+    };
+    outputs
+        .decl_by_name_range
+        .get(&(file, range_key(name_range)))
+        .copied()
+        .or(module_idx)
+}
+
+/// Extract the string-literal value of a call's ``args[arg_index]``
+/// positional argument. ``None`` when out of range or not a single
+/// string literal — concatenated / f-string / b-string forms don't
+/// project to a static fqname and are deliberately rejected.
+fn nth_positional_string(call: &ruff_python_ast::ExprCall, arg_index: usize) -> Option<String> {
+    match call.arguments.args.get(arg_index)? {
+        Expr::StringLiteral(s) => Some(s.value.to_str().to_string()),
+        _ => None,
+    }
+}
+
+/// Match ``<owner>.<attr>(...)`` where ``<owner>`` is a bare ``Name``
+/// equal to the given owner string and ``<attr>`` matches. No import
+/// resolution — meant for pytest fixture conventions (``mocker``,
+/// ``monkeypatch``) whose names come from function parameters.
+fn call_callee_matches_var(
+    call: &ruff_python_ast::ExprCall,
+    owner: &str,
+    attr: &str,
+    required_positional: Option<usize>,
+) -> bool {
+    let Expr::Attribute(attribute) = call.func.as_ref() else {
+        return false;
+    };
+    if attribute.attr.as_str() != attr {
+        return false;
+    }
+    let Expr::Name(name) = attribute.value.as_ref() else {
+        return false;
+    };
+    if name.id.as_str() != owner {
+        return false;
+    }
+    if let Some(expected) = required_positional {
+        if call.arguments.args.len() != expected {
+            return false;
+        }
+    }
+    true
+}
+
+/// Visit every Call expression in a subtree, push the string-literal
+/// arg at ``arg_index`` whenever ``predicate(call)`` returns ``true``.
+/// Backs both call-finder queries.
+struct StringArgCallFinder<F>
+where
+    F: FnMut(&ruff_python_ast::ExprCall) -> bool,
+{
+    predicate: F,
+    arg_index: usize,
+    results: Vec<String>,
+}
+
+impl<'ast, F> Visitor<'ast> for StringArgCallFinder<F>
+where
+    F: FnMut(&ruff_python_ast::ExprCall) -> bool,
+{
+    fn visit_expr(&mut self, expr: &'ast Expr) {
+        if let Expr::Call(call) = expr {
+            if (self.predicate)(call) {
+                if let Some(value) = nth_positional_string(call, self.arg_index) {
+                    self.results.push(value);
+                }
+            }
         }
         walk_expr(self, expr);
     }
