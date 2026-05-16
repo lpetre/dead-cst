@@ -242,6 +242,11 @@ struct GraphBuilder {
     node_index: HashMap<NodeKey, usize>,
     edges: Vec<(usize, usize, u32)>,
     edge_set: HashSet<(usize, usize, u32)>,
+    /// Per-node forward / reverse adjacency lists kept in sync with
+    /// ``edges``. ``bfs`` reads these so traversals are O(deg(i)) per
+    /// pop instead of O(|edges|).
+    forward_adj: Vec<Vec<(usize, u32)>>,
+    reverse_adj: Vec<Vec<(usize, u32)>>,
 }
 
 impl GraphBuilder {
@@ -251,6 +256,8 @@ impl GraphBuilder {
             node_index: HashMap::new(),
             edges: Vec::new(),
             edge_set: HashSet::new(),
+            forward_adj: Vec::new(),
+            reverse_adj: Vec::new(),
         }
     }
 
@@ -262,6 +269,8 @@ impl GraphBuilder {
         let idx = self.nodes.len();
         self.nodes.push(Py::new(py, node)?);
         self.node_index.insert(key, idx);
+        self.forward_adj.push(Vec::new());
+        self.reverse_adj.push(Vec::new());
         Ok(idx)
     }
 
@@ -269,6 +278,8 @@ impl GraphBuilder {
         let triple = (src, dst, flags);
         if self.edge_set.insert(triple) {
             self.edges.push(triple);
+            self.forward_adj[src].push((dst, flags));
+            self.reverse_adj[dst].push((src, flags));
         }
     }
 }
@@ -580,6 +591,11 @@ struct ProjectContext {
     /// `Some` and error if a plugin (incorrectly) caches the ctx and
     /// uses it after materialize returns.
     outputs: RefCell<Option<BuildOutputs>>,
+    /// Compiled regexes keyed by the source pattern. Plugins call
+    /// :meth:`decls_matching_name` / :meth:`find_comment_patterns`
+    /// repeatedly across files with the same pattern, so caching keeps
+    /// us off the regex compiler in the hot path.
+    regex_cache: RefCell<HashMap<String, regex::Regex>>,
 }
 
 #[pymethods]
@@ -615,6 +631,7 @@ impl ProjectContext {
             root: root.to_string(),
             plugins: Vec::new(),
             outputs: RefCell::new(None),
+            regex_cache: RefCell::new(HashMap::new()),
         })
     }
 
@@ -959,8 +976,7 @@ impl ProjectContext {
     /// :class:`ModuleDundersPlugin` (``__xxx__`` names),
     /// :class:`PytestPlugin` (``test_*`` / ``Test*``), etc.
     fn decls_matching_name(&self, py: Python<'_>, pattern: &str) -> PyResult<Vec<Py<NativeNode>>> {
-        let regex = regex::Regex::new(pattern)
-            .map_err(|e| PyValueError::new_err(format!("invalid regex {pattern:?}: {e}")))?;
+        let regex = self.compile_regex(pattern)?;
         let outputs = self.outputs.borrow();
         let outputs = outputs
             .as_ref()
@@ -998,10 +1014,12 @@ impl ProjectContext {
             .as_ref()
             .ok_or_else(|| not_materialized("descendants"))?;
         let root_idx = lookup_idx(&outputs.builder, root, "root")?;
-        Ok(bfs(outputs, root_idx, Direction::Forward, skip_flags)
-            .into_iter()
-            .map(|i| outputs.builder.nodes[i].clone_ref(py))
-            .collect())
+        Ok(
+            bfs(&outputs.builder, [root_idx], Direction::Forward, skip_flags)
+                .into_iter()
+                .map(|i| outputs.builder.nodes[i].clone_ref(py))
+                .collect(),
+        )
     }
 
     /// Reverse closure: every node that can reach ``decl`` by following
@@ -1018,7 +1036,7 @@ impl ProjectContext {
             .as_ref()
             .ok_or_else(|| not_materialized("ancestors"))?;
         let idx = lookup_idx(&outputs.builder, decl, "decl")?;
-        Ok(bfs(outputs, idx, Direction::Reverse, skip_flags)
+        Ok(bfs(&outputs.builder, [idx], Direction::Reverse, skip_flags)
             .into_iter()
             .map(|i| outputs.builder.nodes[i].clone_ref(py))
             .collect())
@@ -1032,19 +1050,13 @@ impl ProjectContext {
         let outputs = outputs
             .as_ref()
             .ok_or_else(|| not_materialized("reachable"))?;
-        let mut seeds: Vec<usize> = Vec::new();
-        for (idx, node_py) in outputs.builder.nodes.iter().enumerate() {
-            if node_py.borrow(py).flags & NODE_FLAG_ENTRYPOINT != 0 {
-                seeds.push(idx);
-            }
-        }
-        let mut visited = HashSet::new();
-        for seed in seeds {
-            for i in bfs(outputs, seed, Direction::Forward, skip_flags) {
-                visited.insert(i);
-            }
-        }
-        Ok(visited
+        let seeds = outputs
+            .builder
+            .nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, n)| (n.borrow(py).flags & NODE_FLAG_ENTRYPOINT != 0).then_some(idx));
+        Ok(bfs(&outputs.builder, seeds, Direction::Forward, skip_flags)
             .into_iter()
             .map(|i| outputs.builder.nodes[i].clone_ref(py))
             .collect())
@@ -1476,39 +1488,13 @@ impl ProjectContext {
             return Ok(Vec::new());
         };
 
-        // BFS over Types. Each visited entry is a class identified by
-        // `(file, selection_range)` from `TypeHierarchyClass`; we
-        // re-derive the next layer's Type by parsing that file and
-        // asking the StmtClassDef at the matching range for its type.
-        let mut seen: HashSet<(File, (u32, u32))> = HashSet::new();
-        let mut frontier: Vec<TypeHierarchyClass> = type_hierarchy_subtypes(&self.db, seed_ty);
-        let mut out_idx: Vec<usize> = Vec::new();
-        while let Some(thc) = frontier.pop() {
-            let file_key = (thc.file, range_key(thc.selection_range));
-            if !seen.insert(file_key) {
-                continue;
-            }
-            // `selection_range` is the class name range — same key the
-            // class-node was interned under.
-            if let Some(&idx) = outputs.class_by_selection.get(&file_key) {
-                out_idx.push(idx);
-            }
-            // Recurse: ask ty for the next layer.
-            let parsed = parsed_module(&self.db, thc.file).load(&self.db);
-            let Some(class_def) = class_def_at(&parsed, thc.selection_range) else {
-                continue;
-            };
-            let model = SemanticModel::new(&self.db, thc.file);
-            let Some(ty) = class_def.inferred_type(&model) else {
-                continue;
-            };
-            frontier.extend(type_hierarchy_subtypes(&self.db, ty));
-        }
-        let mut out = Vec::with_capacity(out_idx.len());
-        for idx in out_idx {
-            out.push(outputs.builder.nodes[idx].clone_ref(py));
-        }
-        Ok(out)
+        let frontier = type_hierarchy_subtypes(&self.db, seed_ty);
+        let out_idx =
+            collect_subtype_indices(&self.db, frontier, true, &outputs.class_by_selection);
+        Ok(out_idx
+            .into_iter()
+            .map(|idx| outputs.builder.nodes[idx].clone_ref(py))
+            .collect())
     }
 
     // ----- Stage 2: ty-backed semantic queries ---------------------------
@@ -1628,30 +1614,9 @@ impl ProjectContext {
             return Ok(Vec::new());
         };
 
-        let mut out_idx: Vec<usize> = Vec::new();
-        let mut seen: HashSet<(File, (u32, u32))> = HashSet::new();
-        let mut frontier: Vec<TypeHierarchyClass> = type_hierarchy_subtypes(&self.db, seed_ty);
-        while let Some(thc) = frontier.pop() {
-            let file_key = (thc.file, range_key(thc.selection_range));
-            if !seen.insert(file_key) {
-                continue;
-            }
-            if let Some(&idx) = outputs.class_by_selection.get(&file_key) {
-                out_idx.push(idx);
-            }
-            if !transitive {
-                continue;
-            }
-            let parsed = parsed_module(&self.db, thc.file).load(&self.db);
-            let Some(class_def) = class_def_at(&parsed, thc.selection_range) else {
-                continue;
-            };
-            let model = SemanticModel::new(&self.db, thc.file);
-            let Some(ty) = class_def.inferred_type(&model) else {
-                continue;
-            };
-            frontier.extend(type_hierarchy_subtypes(&self.db, ty));
-        }
+        let frontier = type_hierarchy_subtypes(&self.db, seed_ty);
+        let out_idx =
+            collect_subtype_indices(&self.db, frontier, transitive, &outputs.class_by_selection);
         Ok(out_idx
             .into_iter()
             .map(|idx| outputs.builder.nodes[idx].clone_ref(py))
@@ -1670,8 +1635,7 @@ impl ProjectContext {
         py: Python<'_>,
         pattern: &str,
     ) -> PyResult<Vec<(Py<NativeNode>, String)>> {
-        let regex = regex::Regex::new(pattern)
-            .map_err(|e| PyValueError::new_err(format!("invalid regex {pattern:?}: {e}")))?;
+        let regex = self.compile_regex(pattern)?;
         let outputs = self.outputs.borrow();
         let outputs = outputs
             .as_ref()
@@ -1726,6 +1690,23 @@ impl ProjectContext {
         let outputs = self.outputs.borrow();
         let outputs = outputs.as_ref().ok_or_else(|| not_materialized("edges"))?;
         Ok(outputs.builder.edges.clone())
+    }
+}
+
+impl ProjectContext {
+    /// Compile `pattern` once and reuse on subsequent calls. The cache
+    /// is bounded by the (small) number of distinct patterns a plugin
+    /// run uses, so unbounded growth isn't a concern in practice.
+    fn compile_regex(&self, pattern: &str) -> PyResult<regex::Regex> {
+        if let Some(cached) = self.regex_cache.borrow().get(pattern) {
+            return Ok(cached.clone());
+        }
+        let regex = regex::Regex::new(pattern)
+            .map_err(|e| PyValueError::new_err(format!("invalid regex {pattern:?}: {e}")))?;
+        self.regex_cache
+            .borrow_mut()
+            .insert(pattern.to_string(), regex.clone());
+        Ok(regex)
     }
 }
 
@@ -1794,13 +1775,6 @@ fn node_key_of(node: &NativeNode) -> NodeKey {
     }
 }
 
-/// Resolve a `NativeNode` reference to its builder-side index for an
-/// edge endpoint. Surfaces a precise `ValueError` (with `side`) when
-/// the node was never interned in this context.
-/// Dispatch a yielded ``GraphOp`` value to the ``ProjectContext``'s
-/// mutation methods. Plugins under the new model yield these instead
-/// of mutating the graph directly; we apply them after ``run`` returns
-/// so the plugin can't observe partial state mid-yield.
 /// Direction passed to :func:`bfs` — forward follows ``src -> dst``
 /// edges; reverse follows the inverse for ``ancestors``-style queries.
 #[derive(Clone, Copy)]
@@ -1809,41 +1783,67 @@ enum Direction {
     Reverse,
 }
 
+/// BFS over ty's class hierarchy starting from a seeded frontier of
+/// direct subtypes. Returns the project-graph node indices that match
+/// each visited class (via `class_by_selection`); classes outside the
+/// project are skipped. With `transitive = false`, only the seed
+/// frontier is consulted.
+fn collect_subtype_indices(
+    db: &ProjectDatabase,
+    initial_frontier: Vec<TypeHierarchyClass>,
+    transitive: bool,
+    class_by_selection: &HashMap<(File, (u32, u32)), usize>,
+) -> Vec<usize> {
+    let mut out_idx: Vec<usize> = Vec::new();
+    let mut seen: HashSet<(File, (u32, u32))> = HashSet::new();
+    let mut frontier = initial_frontier;
+    while let Some(thc) = frontier.pop() {
+        let file_key = (thc.file, range_key(thc.selection_range));
+        if !seen.insert(file_key) {
+            continue;
+        }
+        if let Some(&idx) = class_by_selection.get(&file_key) {
+            out_idx.push(idx);
+        }
+        if !transitive {
+            continue;
+        }
+        let parsed = parsed_module(db, thc.file).load(db);
+        let Some(class_def) = class_def_at(&parsed, thc.selection_range) else {
+            continue;
+        };
+        let model = SemanticModel::new(db, thc.file);
+        let Some(ty) = class_def.inferred_type(&model) else {
+            continue;
+        };
+        frontier.extend(type_hierarchy_subtypes(db, ty));
+    }
+    out_idx
+}
+
 /// Generic BFS over the build graph. ``skip_flags`` filters edges whose
 /// flag mask intersects (any bit) — pass ``0`` to follow every edge.
 /// Returns the set of reached node indices including ``start``.
 fn bfs(
-    outputs: &BuildOutputs,
-    start: usize,
+    builder: &GraphBuilder,
+    seeds: impl IntoIterator<Item = usize>,
     direction: Direction,
     skip_flags: u32,
 ) -> HashSet<usize> {
     let mut visited: HashSet<usize> = HashSet::new();
-    let mut stack: Vec<usize> = vec![start];
+    let mut stack: Vec<usize> = seeds.into_iter().collect();
     while let Some(i) = stack.pop() {
         if !visited.insert(i) {
             continue;
         }
-        for &(src, dst, flags) in &outputs.builder.edges {
-            if skip_flags != 0 && flags & skip_flags != 0 {
+        let adj = match direction {
+            Direction::Forward => &builder.forward_adj[i],
+            Direction::Reverse => &builder.reverse_adj[i],
+        };
+        for &(next, flags) in adj {
+            if flags & skip_flags != 0 {
                 continue;
             }
-            let next = match direction {
-                Direction::Forward => {
-                    if src == i {
-                        dst
-                    } else {
-                        continue;
-                    }
-                }
-                Direction::Reverse => {
-                    if dst == i {
-                        src
-                    } else {
-                        continue;
-                    }
-                }
-            };
             if !visited.contains(&next) {
                 stack.push(next);
             }
@@ -1856,16 +1856,24 @@ fn apply_graph_op(ctx: &Py<ProjectContext>, py: Python<'_>, op: &Bound<'_, PyAny
     if let Ok(add_edge) = op.extract::<PyRef<AddEdge>>() {
         let src = add_edge.src.borrow(py);
         let dst = add_edge.dst.borrow(py);
-        return ctx.borrow(py).add_edge(&src, &dst);
+        let this = ctx.borrow(py);
+        let mut outputs = this.outputs.borrow_mut();
+        let outputs = outputs
+            .as_mut()
+            .ok_or_else(|| not_materialized("add_edge"))?;
+        let src_idx = lookup_idx(&outputs.builder, &src, "src")?;
+        let dst_idx = lookup_idx(&outputs.builder, &dst, "dst")?;
+        outputs.builder.add_edge(src_idx, dst_idx, add_edge.flags);
+        return Ok(());
     }
     if let Ok(add_ep) = op.extract::<PyRef<AddEntrypoint>>() {
-        // Mint a synthetic "<marker>:<decl.fqname>" entrypoint node and
-        // edge it at the decl so reachability flows in. Mirrors the
-        // existing ``mark_entrypoints`` helper in the libcst pipeline.
-        let decl = add_ep.decl.borrow(py);
-        let marker_fqname = format!("{}:{}", add_ep.marker, decl.fqname);
-        let path = decl.path.clone();
-        drop(decl);
+        let (marker_fqname, path) = {
+            let decl = add_ep.decl.borrow(py);
+            (
+                format!("{}:{}", add_ep.marker, decl.fqname),
+                decl.path.clone(),
+            )
+        };
         let this = ctx.borrow(py);
         let marker = this.add_node(
             py,
@@ -1878,9 +1886,7 @@ fn apply_graph_op(ctx: &Py<ProjectContext>, py: Python<'_>, op: &Bound<'_, PyAny
             0,
             NODE_FLAG_ENTRYPOINT,
         )?;
-        let marker_borrow = marker.borrow(py);
-        let decl = add_ep.decl.borrow(py);
-        this.add_edge(&marker_borrow, &decl)?;
+        this.add_edge(&marker.borrow(py), &add_ep.decl.borrow(py))?;
         return Ok(());
     }
     if let Ok(add_node) = op.extract::<PyRef<AddNode>>() {
@@ -1904,6 +1910,9 @@ fn apply_graph_op(ctx: &Py<ProjectContext>, py: Python<'_>, op: &Bound<'_, PyAny
     )))
 }
 
+/// Resolve a `NativeNode` reference to its builder-side index for an
+/// edge endpoint. Surfaces a precise `ValueError` (with `side`) when
+/// the node was never interned in this context.
 fn lookup_idx(builder: &GraphBuilder, node: &NativeNode, side: &str) -> PyResult<usize> {
     builder
         .node_index
@@ -2064,13 +2073,7 @@ fn locate_class_seed(
                 continue;
             }
             let path = node.path.clone();
-            drop(node);
-            if let Some(seed) = locate_class_def(
-                db,
-                &outputs.path_to_file,
-                &path,
-                &outputs.builder.nodes[idx].borrow(py),
-            ) {
+            if let Some(seed) = locate_class_def(db, &outputs.path_to_file, &path, &node) {
                 return Some(seed);
             }
         }
