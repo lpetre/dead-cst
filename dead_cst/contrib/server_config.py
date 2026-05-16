@@ -91,7 +91,9 @@ class ServerConfigPlugin:
     def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]:
         return ()
 
-    def run(self, ctx: native.ProjectContext) -> None:
+    def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
+        import dead_cst_ty_native as native
+
         targets_by_path: dict[str, list[native.NativeNode]] = {}
         for n in ctx.nodes():
             if Path(n.path).name not in self.filenames:
@@ -103,10 +105,9 @@ class ServerConfigPlugin:
             module = ctx.module_for(path)
             if module is None:
                 continue
-            marker = ctx.add_node(
+            yield native.AddNode(
                 fqname=f"{SERVER_CONFIG_PREFIX}{module.fqname}",
                 path=path,
                 flags=int(NodeFlags.ENTRYPOINT),
+                edges_to=targets,
             )
-            for target in targets:
-                ctx.add_edge(marker, target)

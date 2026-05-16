@@ -242,6 +242,11 @@ struct GraphBuilder {
     node_index: HashMap<NodeKey, usize>,
     edges: Vec<(usize, usize, u32)>,
     edge_set: HashSet<(usize, usize, u32)>,
+    /// Per-node forward / reverse adjacency lists kept in sync with
+    /// ``edges``. ``bfs`` reads these so traversals are O(deg(i)) per
+    /// pop instead of O(|edges|).
+    forward_adj: Vec<Vec<(usize, u32)>>,
+    reverse_adj: Vec<Vec<(usize, u32)>>,
 }
 
 impl GraphBuilder {
@@ -251,6 +256,8 @@ impl GraphBuilder {
             node_index: HashMap::new(),
             edges: Vec::new(),
             edge_set: HashSet::new(),
+            forward_adj: Vec::new(),
+            reverse_adj: Vec::new(),
         }
     }
 
@@ -262,6 +269,8 @@ impl GraphBuilder {
         let idx = self.nodes.len();
         self.nodes.push(Py::new(py, node)?);
         self.node_index.insert(key, idx);
+        self.forward_adj.push(Vec::new());
+        self.reverse_adj.push(Vec::new());
         Ok(idx)
     }
 
@@ -269,6 +278,8 @@ impl GraphBuilder {
         let triple = (src, dst, flags);
         if self.edge_set.insert(triple) {
             self.edges.push(triple);
+            self.forward_adj[src].push((dst, flags));
+            self.reverse_adj[dst].push((src, flags));
         }
     }
 }
@@ -485,14 +496,107 @@ fn build_fqname_indices(
 // ProjectContext — plugin protocol entry point
 // ---------------------------------------------------------------------------
 
+/// Add an edge between two interned nodes.
+///
+/// ``flags`` carries ``DEAD_BRANCH`` / future edge classifications.
+/// Plugins yield this from ``run(ctx)`` instead of mutating the graph
+/// directly so the apply pass is a single atomic step on the rust side.
+#[pyclass(frozen, get_all)]
+struct AddEdge {
+    src: Py<NativeNode>,
+    dst: Py<NativeNode>,
+    flags: u32,
+}
+
+#[pymethods]
+impl AddEdge {
+    #[new]
+    #[pyo3(signature = (src, dst, *, flags = 0))]
+    fn new(src: Py<NativeNode>, dst: Py<NativeNode>, flags: u32) -> Self {
+        Self { src, dst, flags }
+    }
+}
+
+/// Mark ``decl`` as an entrypoint.
+///
+/// ``marker`` is a self-documenting label (``"<celery-worker>"``,
+/// ``"<external-execution>:alembic"``, ...) shown in ``why-alive`` to
+/// explain *why* the decl is alive without minting a synthetic graph
+/// node for the reason.
+#[pyclass(frozen, get_all)]
+struct AddEntrypoint {
+    decl: Py<NativeNode>,
+    marker: String,
+}
+
+#[pymethods]
+impl AddEntrypoint {
+    #[new]
+    #[pyo3(signature = (decl, *, marker))]
+    fn new(decl: Py<NativeNode>, marker: String) -> Self {
+        Self { decl, marker }
+    }
+}
+
+/// Mint a synthetic intermediate node.
+///
+/// ``edges_from`` / ``edges_to`` wire the new node atomically — every
+/// element of ``edges_from`` becomes a ``source -> this`` edge, every
+/// element of ``edges_to`` a ``this -> target`` edge — so a plugin
+/// doesn't need a separate handle to reference the freshly-minted node
+/// from subsequent ops. Set ``flags = NodeFlags.ENTRYPOINT`` to make
+/// the node a seed (``AddEntrypoint`` is the single-target sugar).
+#[pyclass(frozen, get_all)]
+struct AddNode {
+    fqname: String,
+    kind: &'static str,
+    path: String,
+    flags: u32,
+    edges_from: Vec<Py<NativeNode>>,
+    edges_to: Vec<Py<NativeNode>>,
+}
+
+#[pymethods]
+impl AddNode {
+    #[new]
+    #[pyo3(signature = (
+        fqname,
+        *,
+        path,
+        kind = "synthetic",
+        flags = 0,
+        edges_from = Vec::new(),
+        edges_to = Vec::new(),
+    ))]
+    fn new(
+        fqname: String,
+        path: String,
+        kind: &str,
+        flags: u32,
+        edges_from: Vec<Py<NativeNode>>,
+        edges_to: Vec<Py<NativeNode>>,
+    ) -> PyResult<Self> {
+        Ok(Self {
+            fqname,
+            kind: static_kind_str(kind)?,
+            path,
+            flags,
+            edges_from,
+            edges_to,
+        })
+    }
+}
+
 /// Plugin-aware project graph builder.
 ///
 /// Python instantiates a `ProjectContext`, registers Python plugins via
 /// `add_plugin`, then calls `materialize()`. `materialize` runs the
 /// project-wide build in rust, then for each registered plugin calls
 /// `plugin.run(ctx)` back into Python with `ctx` set to the same
-/// `ProjectContext` instance — re-entrant calls invoke the rust
-/// `add_node` / `add_edge` / `find_*` methods listed below.
+/// `ProjectContext` instance. Plugins yield `GraphOp` values
+/// (``AddNode`` / ``AddEdge`` / ``AddEntrypoint``) that we apply to
+/// the graph; the rust `find_*` methods listed below answer queries
+/// against the graph in-progress.
 ///
 /// Queries are answered from ty's semantic index: subclass closure goes
 /// through `type_hierarchy_subtypes`, method-defines walks each class's
@@ -508,10 +612,15 @@ struct ProjectContext {
     root: String,
     plugins: Vec<PyObject>,
     /// Populated by `materialize` before plugins run. `None` outside a
-    /// materialize call — `add_node` / `add_edge` / queries assume it's
+    /// materialize call — `apply_graph_op` / queries assume it's
     /// `Some` and error if a plugin (incorrectly) caches the ctx and
     /// uses it after materialize returns.
     outputs: RefCell<Option<BuildOutputs>>,
+    /// Compiled regexes keyed by the source pattern. Plugins call
+    /// :meth:`decls_matching_name` / :meth:`find_comment_patterns`
+    /// repeatedly across files with the same pattern, so caching keeps
+    /// us off the regex compiler in the hot path.
+    regex_cache: RefCell<HashMap<String, regex::Regex>>,
 }
 
 #[pymethods]
@@ -547,6 +656,7 @@ impl ProjectContext {
             root: root.to_string(),
             plugins: Vec::new(),
             outputs: RefCell::new(None),
+            regex_cache: RefCell::new(HashMap::new()),
         })
     }
 
@@ -566,8 +676,7 @@ impl ProjectContext {
     /// then snapshot the final state.
     ///
     /// Borrows are released between phases so plugin `run` methods can
-    /// re-enter `add_node` / `add_edge` / queries through the same ctx
-    /// without aliasing violations.
+    /// re-enter queries through the same ctx without aliasing violations.
     fn materialize(slf: Py<Self>, py: Python<'_>) -> PyResult<NativeGraph> {
         {
             let this = slf.borrow(py);
@@ -582,7 +691,20 @@ impl ProjectContext {
             .map(|p| p.clone_ref(py))
             .collect();
         for plugin in &plugins {
-            plugin.bind(py).call_method1("run", (slf.clone_ref(py),))?;
+            // ``plugin.run(ctx)`` yields ``GraphOp`` values; we apply
+            // each as it comes off the iterator. The plugin can run
+            // queries against ``ctx`` mid-iteration since each
+            // ``apply_graph_op`` call releases its borrows before
+            // returning control to the generator. ``None`` (a regular
+            // function that ran to completion without yielding) is
+            // allowed for plugins with nothing to do.
+            let result = plugin.bind(py).call_method1("run", (slf.clone_ref(py),))?;
+            if !result.is_none() {
+                for item in result.iter()? {
+                    let op = item?;
+                    apply_graph_op(&slf, py, &op)?;
+                }
+            }
         }
 
         let outputs =
@@ -593,77 +715,6 @@ impl ProjectContext {
             nodes: outputs.builder.nodes,
             edges: outputs.builder.edges,
         })
-    }
-
-    // ----- Mutation -------------------------------------------------------
-
-    /// Intern a synthetic node into the graph.
-    ///
-    /// `path` should be a real source path when the node stands in for a
-    /// specific location (so codemod / why-alive output can reach the
-    /// file); pass the project root for file-agnostic markers.
-    #[pyo3(signature = (
-        fqname,
-        path,
-        *,
-        kind = "synthetic",
-        start_line = 0,
-        start_column = 0,
-        end_line = 0,
-        end_column = 0,
-        flags = 0,
-    ))]
-    #[allow(clippy::too_many_arguments)]
-    fn add_node(
-        &self,
-        py: Python<'_>,
-        fqname: String,
-        path: String,
-        kind: &str,
-        start_line: usize,
-        start_column: usize,
-        end_line: usize,
-        end_column: usize,
-        flags: u32,
-    ) -> PyResult<Py<NativeNode>> {
-        let kind = static_kind_str(kind)?;
-        let mut outputs = self.outputs.borrow_mut();
-        let outputs = outputs
-            .as_mut()
-            .ok_or_else(|| not_materialized("add_node"))?;
-        let idx = outputs.builder.intern_node(
-            py,
-            NativeNode {
-                fqname,
-                kind,
-                path,
-                start_line,
-                start_column,
-                end_line,
-                end_column,
-                flags,
-                imports: None,
-            },
-        )?;
-        Ok(outputs.builder.nodes[idx].clone_ref(py))
-    }
-
-    /// Add an edge between two nodes returned by `add_node` or a query.
-    ///
-    /// Identity is content-based: each side is looked up in the
-    /// builder's intern table via its `(fqname, kind, path, position)`
-    /// key, so two `NativeNode` Python references that wrap the same
-    /// logical node resolve to the same edge endpoint. Passing a node
-    /// that was never interned raises `ValueError`.
-    fn add_edge(&self, src: &NativeNode, dst: &NativeNode) -> PyResult<()> {
-        let mut outputs = self.outputs.borrow_mut();
-        let outputs = outputs
-            .as_mut()
-            .ok_or_else(|| not_materialized("add_edge"))?;
-        let src_idx = lookup_idx(&outputs.builder, src, "src")?;
-        let dst_idx = lookup_idx(&outputs.builder, dst, "dst")?;
-        outputs.builder.add_edge(src_idx, dst_idx, 0);
-        Ok(())
     }
 
     // ----- Queries (rust-resident, results pass back to Python) -----------
@@ -777,6 +828,189 @@ impl ProjectContext {
             return Ok(None);
         };
         Ok(Some(outputs.builder.nodes[idx].clone_ref(py)))
+    }
+
+    /// Resolve a dotted FQN to either a declaration or a module node.
+    ///
+    /// Tries an exact decl match first, then an exact module match,
+    /// then walks back through dotted segments looking for an enclosing
+    /// decl (``pkg.lib.Cls.method`` resolves to ``pkg.lib.Cls`` because
+    /// methods don't get their own graph nodes). Returns ``None`` when
+    /// the fqname can't be found anywhere — never raises.
+    fn resolve(&self, py: Python<'_>, fqname: &str) -> PyResult<Option<Py<NativeNode>>> {
+        let outputs = self.outputs.borrow();
+        let outputs = outputs
+            .as_ref()
+            .ok_or_else(|| not_materialized("resolve"))?;
+        let mut prefix = fqname;
+        loop {
+            if let Some(idxs) = outputs.decl_by_fqname.get(prefix) {
+                if let Some(&idx) = idxs.first() {
+                    return Ok(Some(outputs.builder.nodes[idx].clone_ref(py)));
+                }
+            }
+            if let Some(&idx) = outputs.module_by_fqname.get(prefix) {
+                return Ok(Some(outputs.builder.nodes[idx].clone_ref(py)));
+            }
+            match prefix.rsplit_once('.') {
+                Some((parent, _)) => prefix = parent,
+                None => return Ok(None),
+            }
+        }
+    }
+
+    /// Return the module node + every transitive decl whose fqname
+    /// lives under ``module_fqn``.
+    ///
+    /// Models ``importlib.import_module(module_fqn)``: the module's
+    /// whole top-level surface plus everything its submodules expose.
+    /// Empty list when ``module_fqn`` doesn't resolve to a project
+    /// module.
+    fn module_surface(&self, py: Python<'_>, module_fqn: &str) -> PyResult<Vec<Py<NativeNode>>> {
+        let outputs = self.outputs.borrow();
+        let outputs = outputs
+            .as_ref()
+            .ok_or_else(|| not_materialized("module_surface"))?;
+        let Some(&module_idx) = outputs.module_by_fqname.get(module_fqn) else {
+            return Ok(Vec::new());
+        };
+        let mut out = vec![outputs.builder.nodes[module_idx].clone_ref(py)];
+        let prefix = format!("{module_fqn}.");
+        for (fqname, &idx) in &outputs.module_by_fqname {
+            if fqname.starts_with(&prefix) {
+                out.push(outputs.builder.nodes[idx].clone_ref(py));
+            }
+        }
+        for (fqname, idxs) in &outputs.decl_by_fqname {
+            if fqname.starts_with(&prefix) {
+                for &idx in idxs {
+                    out.push(outputs.builder.nodes[idx].clone_ref(py));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Every node whose ``path`` starts with the given prefix.
+    fn decls_under(&self, py: Python<'_>, path_prefix: &str) -> PyResult<Vec<Py<NativeNode>>> {
+        let outputs = self.outputs.borrow();
+        let outputs = outputs
+            .as_ref()
+            .ok_or_else(|| not_materialized("decls_under"))?;
+        Ok(outputs
+            .builder
+            .nodes
+            .iter()
+            .filter(|n| n.borrow(py).path.starts_with(path_prefix))
+            .map(|n| n.clone_ref(py))
+            .collect())
+    }
+
+    /// Every node whose ``path`` contains ``substring`` anywhere.
+    /// Useful for path-pattern plugins (``alembic/versions/``, ``.ignore.py``).
+    fn decls_matching(&self, py: Python<'_>, substring: &str) -> PyResult<Vec<Py<NativeNode>>> {
+        let outputs = self.outputs.borrow();
+        let outputs = outputs
+            .as_ref()
+            .ok_or_else(|| not_materialized("decls_matching"))?;
+        Ok(outputs
+            .builder
+            .nodes
+            .iter()
+            .filter(|n| n.borrow(py).path.contains(substring))
+            .map(|n| n.clone_ref(py))
+            .collect())
+    }
+
+    /// Every top-level decl whose simple name matches ``regex``.
+    /// Fills the gap the screenshot's API doesn't cover — needed by
+    /// :class:`ModuleDundersPlugin` (``__xxx__`` names),
+    /// :class:`PytestPlugin` (``test_*`` / ``Test*``), etc.
+    fn decls_matching_name(&self, py: Python<'_>, pattern: &str) -> PyResult<Vec<Py<NativeNode>>> {
+        let regex = self.compile_regex(pattern)?;
+        let outputs = self.outputs.borrow();
+        let outputs = outputs
+            .as_ref()
+            .ok_or_else(|| not_materialized("decls_matching_name"))?;
+        let mut out = Vec::new();
+        for node_py in &outputs.builder.nodes {
+            let node = node_py.borrow(py);
+            if !matches!(
+                node.kind,
+                "function" | "class" | "variable" | "import" | "type_alias"
+            ) {
+                continue;
+            }
+            let simple = node.fqname.rsplit('.').next().unwrap_or("");
+            if regex.is_match(simple) {
+                out.push(node_py.clone_ref(py));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Forward closure: every node reachable from ``root`` by following
+    /// graph edges. ``skip_flags`` filters out edges whose flag mask
+    /// matches (pass ``EdgeFlags.DEAD_BRANCH.value`` to compute strict
+    /// reachability excluding dead branches).
+    #[pyo3(signature = (root, *, skip_flags = 0))]
+    fn descendants(
+        &self,
+        py: Python<'_>,
+        root: &NativeNode,
+        skip_flags: u32,
+    ) -> PyResult<Vec<Py<NativeNode>>> {
+        let outputs = self.outputs.borrow();
+        let outputs = outputs
+            .as_ref()
+            .ok_or_else(|| not_materialized("descendants"))?;
+        let root_idx = lookup_idx(&outputs.builder, root, "root")?;
+        Ok(
+            bfs(&outputs.builder, [root_idx], Direction::Forward, skip_flags)
+                .into_iter()
+                .map(|i| outputs.builder.nodes[i].clone_ref(py))
+                .collect(),
+        )
+    }
+
+    /// Reverse closure: every node that can reach ``decl`` by following
+    /// graph edges. Used for ``why-alive`` and blast-radius scoping.
+    #[pyo3(signature = (decl, *, skip_flags = 0))]
+    fn ancestors(
+        &self,
+        py: Python<'_>,
+        decl: &NativeNode,
+        skip_flags: u32,
+    ) -> PyResult<Vec<Py<NativeNode>>> {
+        let outputs = self.outputs.borrow();
+        let outputs = outputs
+            .as_ref()
+            .ok_or_else(|| not_materialized("ancestors"))?;
+        let idx = lookup_idx(&outputs.builder, decl, "decl")?;
+        Ok(bfs(&outputs.builder, [idx], Direction::Reverse, skip_flags)
+            .into_iter()
+            .map(|i| outputs.builder.nodes[i].clone_ref(py))
+            .collect())
+    }
+
+    /// Forward closure from every entrypoint-flagged node. The set of
+    /// dead decls is the complement against ``nodes()``.
+    #[pyo3(signature = (*, skip_flags = 0))]
+    fn reachable(&self, py: Python<'_>, skip_flags: u32) -> PyResult<Vec<Py<NativeNode>>> {
+        let outputs = self.outputs.borrow();
+        let outputs = outputs
+            .as_ref()
+            .ok_or_else(|| not_materialized("reachable"))?;
+        let seeds = outputs
+            .builder
+            .nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, n)| (n.borrow(py).flags & NODE_FLAG_ENTRYPOINT != 0).then_some(idx));
+        Ok(bfs(&outputs.builder, seeds, Direction::Forward, skip_flags)
+            .into_iter()
+            .map(|i| outputs.builder.nodes[i].clone_ref(py))
+            .collect())
     }
 
     /// Return ``(module_node, [decls inside the block])`` for every
@@ -1205,39 +1439,139 @@ impl ProjectContext {
             return Ok(Vec::new());
         };
 
-        // BFS over Types. Each visited entry is a class identified by
-        // `(file, selection_range)` from `TypeHierarchyClass`; we
-        // re-derive the next layer's Type by parsing that file and
-        // asking the StmtClassDef at the matching range for its type.
-        let mut seen: HashSet<(File, (u32, u32))> = HashSet::new();
-        let mut frontier: Vec<TypeHierarchyClass> = type_hierarchy_subtypes(&self.db, seed_ty);
-        let mut out_idx: Vec<usize> = Vec::new();
-        while let Some(thc) = frontier.pop() {
-            let file_key = (thc.file, range_key(thc.selection_range));
-            if !seen.insert(file_key) {
-                continue;
+        let frontier = type_hierarchy_subtypes(&self.db, seed_ty);
+        let out_idx =
+            collect_subtype_indices(&self.db, frontier, true, &outputs.class_by_selection);
+        Ok(out_idx
+            .into_iter()
+            .map(|idx| outputs.builder.nodes[idx].clone_ref(py))
+            .collect())
+    }
+
+    // ----- Stage 2: ty-backed semantic queries ---------------------------
+
+    /// Decls decorated by ``@<decorator_fqn>`` or ``@<decorator_fqn>(...)``.
+    ///
+    /// Resolves through the file's local imports — aliased / dotted /
+    /// module-prefixed forms all match. ``decorator_fqn`` is the
+    /// upstream callable's absolute fqn (``celery.shared_task``,
+    /// ``pytest.fixture``). For instance-method decorators
+    /// (``@app.route(...)`` where ``app`` is a ``flask.Flask``) use
+    /// :meth:`find_decorations_on` instead.
+    fn find_decorated(&self, py: Python<'_>, decorator_fqn: &str) -> PyResult<Vec<Py<NativeNode>>> {
+        let Some((module, name)) = decorator_fqn.rsplit_once('.') else {
+            return Err(PyValueError::new_err(format!(
+                "expected a dotted decorator fqn (e.g. 'pytest.fixture'), got {decorator_fqn:?}"
+            )));
+        };
+        self.find_decorated_decls(py, module, vec![name.to_string()])
+    }
+
+    /// Module-level variables assigned an instance of ``class_fqn``.
+    ///
+    /// e.g. ``find_constructions("flask.Flask")`` → every ``app =
+    /// Flask(...)`` variable node. ``include_subclasses=True`` also
+    /// matches direct constructions of any class that subclasses
+    /// ``class_fqn`` (works for both project subclasses and external
+    /// ones via ty's type hierarchy).
+    #[pyo3(signature = (class_fqn, *, include_subclasses = false))]
+    fn find_constructions(
+        &self,
+        py: Python<'_>,
+        class_fqn: &str,
+        include_subclasses: bool,
+    ) -> PyResult<Vec<Py<NativeNode>>> {
+        let Some((module, name)) = class_fqn.rsplit_once('.') else {
+            return Err(PyValueError::new_err(format!(
+                "expected a dotted class fqn, got {class_fqn:?}"
+            )));
+        };
+        let mut ctors: Vec<String> = vec![name.to_string()];
+        if include_subclasses {
+            for sub in self.find_subclasses(py, class_fqn, true)? {
+                let simple = sub
+                    .borrow(py)
+                    .fqname
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                if !simple.is_empty() && !ctors.contains(&simple) {
+                    ctors.push(simple);
+                }
             }
-            // `selection_range` is the class name range — same key the
-            // class-node was interned under.
-            if let Some(&idx) = outputs.class_by_selection.get(&file_key) {
-                out_idx.push(idx);
-            }
-            // Recurse: ask ty for the next layer.
-            let parsed = parsed_module(&self.db, thc.file).load(&self.db);
-            let Some(class_def) = class_def_at(&parsed, thc.selection_range) else {
-                continue;
-            };
-            let model = SemanticModel::new(&self.db, thc.file);
-            let Some(ty) = class_def.inferred_type(&model) else {
-                continue;
-            };
-            frontier.extend(type_hierarchy_subtypes(&self.db, ty));
         }
-        let mut out = Vec::with_capacity(out_idx.len());
-        for idx in out_idx {
-            out.push(outputs.builder.nodes[idx].clone_ref(py));
+        let pairs = self.find_instance_constructions(py, module, ctors)?;
+        Ok(pairs.into_iter().map(|(node, _)| node).collect())
+    }
+
+    /// Decls decorated by ``@<instance>.<method>(...)`` for ``method``
+    /// in ``method_names``, where ``<instance>`` resolves to the given
+    /// decl in the same file.
+    ///
+    /// Cross-file owners (where ``app = imported_factory()`` and
+    /// ``@app.route`` is in a different file) aren't matched — same
+    /// limitation the rust dispatch-app path has today.
+    fn find_decorations_on(
+        &self,
+        py: Python<'_>,
+        instance: &NativeNode,
+        method_names: Vec<String>,
+    ) -> PyResult<Vec<Py<NativeNode>>> {
+        let instance_simple = instance.fqname.rsplit('.').next().unwrap_or("").to_string();
+        let handlers = self.find_handler_decorators(py, method_names)?;
+        let mut out = Vec::new();
+        for (owner_name, handler) in handlers {
+            if owner_name != instance_simple {
+                continue;
+            }
+            if handler.borrow(py).path != instance.path {
+                continue;
+            }
+            out.push(handler);
         }
         Ok(out)
+    }
+
+    /// Subclasses of the class addressed by ``base_fqn``.
+    ///
+    /// Works for both project classes (where the fqn resolves to a
+    /// graph node) and external classes (``unittest.TestCase``,
+    /// ``pydantic.BaseModel``) via ty's module resolver +
+    /// ``type_hierarchy_subtypes``. ``transitive=True`` (default)
+    /// walks the full subclass closure; ``transitive=False`` returns
+    /// only direct subclasses.
+    #[pyo3(signature = (base_fqn, *, transitive = true))]
+    fn find_subclasses(
+        &self,
+        py: Python<'_>,
+        base_fqn: &str,
+        transitive: bool,
+    ) -> PyResult<Vec<Py<NativeNode>>> {
+        let outputs = self.outputs.borrow();
+        let outputs = outputs
+            .as_ref()
+            .ok_or_else(|| not_materialized("find_subclasses"))?;
+        let Some((seed_file, seed_range)) = locate_class_seed(&self.db, outputs, py, base_fqn)
+        else {
+            return Ok(Vec::new());
+        };
+        let parsed_seed = parsed_module(&self.db, seed_file).load(&self.db);
+        let model_seed = SemanticModel::new(&self.db, seed_file);
+        let Some(seed_class) = class_def_at(&parsed_seed, seed_range) else {
+            return Ok(Vec::new());
+        };
+        let Some(seed_ty) = seed_class.inferred_type(&model_seed) else {
+            return Ok(Vec::new());
+        };
+
+        let frontier = type_hierarchy_subtypes(&self.db, seed_ty);
+        let out_idx =
+            collect_subtype_indices(&self.db, frontier, transitive, &outputs.class_by_selection);
+        Ok(out_idx
+            .into_iter()
+            .map(|idx| outputs.builder.nodes[idx].clone_ref(py))
+            .collect())
     }
 
     /// Return `(decl_node, comment_text)` for every comment in the
@@ -1252,8 +1586,7 @@ impl ProjectContext {
         py: Python<'_>,
         pattern: &str,
     ) -> PyResult<Vec<(Py<NativeNode>, String)>> {
-        let regex = regex::Regex::new(pattern)
-            .map_err(|e| PyValueError::new_err(format!("invalid regex {pattern:?}: {e}")))?;
+        let regex = self.compile_regex(pattern)?;
         let outputs = self.outputs.borrow();
         let outputs = outputs
             .as_ref()
@@ -1308,6 +1641,23 @@ impl ProjectContext {
         let outputs = self.outputs.borrow();
         let outputs = outputs.as_ref().ok_or_else(|| not_materialized("edges"))?;
         Ok(outputs.builder.edges.clone())
+    }
+}
+
+impl ProjectContext {
+    /// Compile `pattern` once and reuse on subsequent calls. The cache
+    /// is bounded by the (small) number of distinct patterns a plugin
+    /// run uses, so unbounded growth isn't a concern in practice.
+    fn compile_regex(&self, pattern: &str) -> PyResult<regex::Regex> {
+        if let Some(cached) = self.regex_cache.borrow().get(pattern) {
+            return Ok(cached.clone());
+        }
+        let regex = regex::Regex::new(pattern)
+            .map_err(|e| PyValueError::new_err(format!("invalid regex {pattern:?}: {e}")))?;
+        self.regex_cache
+            .borrow_mut()
+            .insert(pattern.to_string(), regex.clone());
+        Ok(regex)
     }
 }
 
@@ -1374,6 +1724,150 @@ fn node_key_of(node: &NativeNode) -> NodeKey {
         end_line: node.end_line,
         end_column: node.end_column,
     }
+}
+
+/// Direction passed to :func:`bfs` — forward follows ``src -> dst``
+/// edges; reverse follows the inverse for ``ancestors``-style queries.
+#[derive(Clone, Copy)]
+enum Direction {
+    Forward,
+    Reverse,
+}
+
+/// BFS over ty's class hierarchy starting from a seeded frontier of
+/// direct subtypes. Returns the project-graph node indices that match
+/// each visited class (via `class_by_selection`); classes outside the
+/// project are skipped. With `transitive = false`, only the seed
+/// frontier is consulted.
+fn collect_subtype_indices(
+    db: &ProjectDatabase,
+    initial_frontier: Vec<TypeHierarchyClass>,
+    transitive: bool,
+    class_by_selection: &HashMap<(File, (u32, u32)), usize>,
+) -> Vec<usize> {
+    let mut out_idx: Vec<usize> = Vec::new();
+    let mut seen: HashSet<(File, (u32, u32))> = HashSet::new();
+    let mut frontier = initial_frontier;
+    while let Some(thc) = frontier.pop() {
+        let file_key = (thc.file, range_key(thc.selection_range));
+        if !seen.insert(file_key) {
+            continue;
+        }
+        if let Some(&idx) = class_by_selection.get(&file_key) {
+            out_idx.push(idx);
+        }
+        if !transitive {
+            continue;
+        }
+        let parsed = parsed_module(db, thc.file).load(db);
+        let Some(class_def) = class_def_at(&parsed, thc.selection_range) else {
+            continue;
+        };
+        let model = SemanticModel::new(db, thc.file);
+        let Some(ty) = class_def.inferred_type(&model) else {
+            continue;
+        };
+        frontier.extend(type_hierarchy_subtypes(db, ty));
+    }
+    out_idx
+}
+
+/// Generic BFS over the build graph. ``skip_flags`` filters edges whose
+/// flag mask intersects (any bit) — pass ``0`` to follow every edge.
+/// Returns the set of reached node indices including ``start``.
+fn bfs(
+    builder: &GraphBuilder,
+    seeds: impl IntoIterator<Item = usize>,
+    direction: Direction,
+    skip_flags: u32,
+) -> HashSet<usize> {
+    let mut visited: HashSet<usize> = HashSet::new();
+    let mut stack: Vec<usize> = seeds.into_iter().collect();
+    while let Some(i) = stack.pop() {
+        if !visited.insert(i) {
+            continue;
+        }
+        let adj = match direction {
+            Direction::Forward => &builder.forward_adj[i],
+            Direction::Reverse => &builder.reverse_adj[i],
+        };
+        for &(next, flags) in adj {
+            if flags & skip_flags != 0 {
+                continue;
+            }
+            if !visited.contains(&next) {
+                stack.push(next);
+            }
+        }
+    }
+    visited
+}
+
+fn apply_graph_op(ctx: &Py<ProjectContext>, py: Python<'_>, op: &Bound<'_, PyAny>) -> PyResult<()> {
+    let this = ctx.borrow(py);
+    let mut outputs = this.outputs.borrow_mut();
+    let outputs = outputs
+        .as_mut()
+        .ok_or_else(|| not_materialized("apply_graph_op"))?;
+
+    if let Ok(add_edge) = op.extract::<PyRef<AddEdge>>() {
+        let src_idx = lookup_idx(&outputs.builder, &add_edge.src.borrow(py), "src")?;
+        let dst_idx = lookup_idx(&outputs.builder, &add_edge.dst.borrow(py), "dst")?;
+        outputs.builder.add_edge(src_idx, dst_idx, add_edge.flags);
+        return Ok(());
+    }
+    if let Ok(add_ep) = op.extract::<PyRef<AddEntrypoint>>() {
+        let decl = add_ep.decl.borrow(py);
+        let decl_idx = lookup_idx(&outputs.builder, &decl, "decl")?;
+        let marker_fqname = format!("{}:{}", add_ep.marker, decl.fqname);
+        let path = decl.path.clone();
+        drop(decl);
+        let marker_idx = outputs.builder.intern_node(
+            py,
+            NativeNode {
+                fqname: marker_fqname,
+                kind: "synthetic",
+                path,
+                start_line: 0,
+                start_column: 0,
+                end_line: 0,
+                end_column: 0,
+                flags: NODE_FLAG_ENTRYPOINT,
+                imports: None,
+            },
+        )?;
+        outputs.builder.add_edge(marker_idx, decl_idx, 0);
+        return Ok(());
+    }
+    if let Ok(add_node) = op.extract::<PyRef<AddNode>>() {
+        let node_idx = outputs.builder.intern_node(
+            py,
+            NativeNode {
+                fqname: add_node.fqname.clone(),
+                kind: add_node.kind,
+                path: add_node.path.clone(),
+                start_line: 0,
+                start_column: 0,
+                end_line: 0,
+                end_column: 0,
+                flags: add_node.flags,
+                imports: None,
+            },
+        )?;
+        for src in &add_node.edges_from {
+            let src_idx = lookup_idx(&outputs.builder, &src.borrow(py), "edges_from")?;
+            outputs.builder.add_edge(src_idx, node_idx, 0);
+        }
+        for dst in &add_node.edges_to {
+            let dst_idx = lookup_idx(&outputs.builder, &dst.borrow(py), "edges_to")?;
+            outputs.builder.add_edge(node_idx, dst_idx, 0);
+        }
+        return Ok(());
+    }
+    Err(PyValueError::new_err(format!(
+        "expected a GraphOp (AddEdge / AddEntrypoint / AddNode), got {:?}",
+        op.get_type().name()?,
+    )))
 }
 
 /// Resolve a `NativeNode` reference to its builder-side index for an
@@ -1513,6 +2007,95 @@ fn locate_class_def(
 /// Find a top-level `StmtClassDef` whose name range equals `selection_range`.
 fn class_def_at(parsed: &ParsedModuleRef, selection_range: TextRange) -> Option<&StmtClassDef> {
     iter_top_level_classes(parsed).find(|cls| cls.name.range() == selection_range)
+}
+
+/// Find a top-level ``StmtClassDef`` by its bound name.
+fn class_def_named<'a>(parsed: &'a ParsedModuleRef, name: &str) -> Option<&'a StmtClassDef> {
+    iter_top_level_classes(parsed).find(|cls| cls.name.as_str() == name)
+}
+
+/// Resolve a dotted class fqn to ``(File, name_range)`` so the caller
+/// can fetch the corresponding ``Type`` via ``class_def_at`` +
+/// ``inferred_type``. Handles both project classes (looked up via
+/// ``decl_by_fqname``) and external classes (ty's ``resolve_module``
+/// + AST scan by name in the resolved module).
+fn locate_class_seed(
+    db: &ProjectDatabase,
+    outputs: &BuildOutputs,
+    py: Python<'_>,
+    fqn: &str,
+) -> Option<(File, TextRange)> {
+    // Project class: cheap path through the existing indices.
+    if let Some(idxs) = outputs.decl_by_fqname.get(fqn) {
+        for &idx in idxs {
+            let node = outputs.builder.nodes[idx].borrow(py);
+            if node.kind != "class" {
+                continue;
+            }
+            let path = node.path.clone();
+            if let Some(seed) = locate_class_def(db, &outputs.path_to_file, &path, &node) {
+                return Some(seed);
+            }
+        }
+    }
+    // External class: resolve the module via ty, then follow any
+    // re-export chains until we find the actual class def.
+    let (module_str, class_name) = fqn.rsplit_once('.')?;
+    let module_name = ModuleName::new(module_str)?;
+    let anchor = *outputs.project_files.first()?;
+    let module = resolve_module(db, anchor, &module_name)?;
+    let module_file = module.file(db)?;
+    let mut visited: HashSet<File> = HashSet::new();
+    follow_class_through_module(db, module_file, class_name, &mut visited)
+}
+
+/// Walk through a module looking for ``class_name``. If the module
+/// only re-exports the name (``from .other import class_name as
+/// class_name``), recurse into the source module. Bounded by a
+/// visited-file set so cycles can't loop forever.
+fn follow_class_through_module(
+    db: &ProjectDatabase,
+    start_file: File,
+    class_name: &str,
+    visited: &mut HashSet<File>,
+) -> Option<(File, TextRange)> {
+    if !visited.insert(start_file) {
+        return None;
+    }
+    let parsed = parsed_module(db, start_file).load(db);
+    if let Some(cls) = class_def_named(&parsed, class_name) {
+        return Some((start_file, cls.name.range()));
+    }
+    for stmt in &parsed.syntax().body {
+        let Stmt::ImportFrom(im) = stmt else {
+            continue;
+        };
+        for alias in &im.names {
+            let imported_name = alias.name.as_str();
+            let local_name = alias
+                .asname
+                .as_ref()
+                .map(|n| n.as_str())
+                .unwrap_or(imported_name);
+            if local_name != class_name {
+                continue;
+            }
+            let Ok(module_name) = ModuleName::from_import_statement(db, start_file, im) else {
+                continue;
+            };
+            let Some(resolved) = resolve_module(db, start_file, &module_name) else {
+                continue;
+            };
+            let Some(source_file) = resolved.file(db) else {
+                continue;
+            };
+            if let Some(seed) = follow_class_through_module(db, source_file, imported_name, visited)
+            {
+                return Some(seed);
+            }
+        }
+    }
+    None
 }
 
 /// Locate the top-level ``if __name__ == "__main__":`` block in a
@@ -4267,6 +4850,9 @@ fn dead_cst_ty_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<NativeGraph>()?;
     m.add_class::<Project>()?;
     m.add_class::<ProjectContext>()?;
+    m.add_class::<AddEdge>()?;
+    m.add_class::<AddEntrypoint>()?;
+    m.add_class::<AddNode>()?;
     Ok(())
 }
 

@@ -6,7 +6,20 @@ having to introspect the binary module. Kept hand-written — pyo3
 doesn't generate stubs and the public API is small.
 """
 
-from typing import Any, Iterable, Protocol
+from typing import Any, Iterable, Literal, Protocol
+
+# The set of stable kind strings ``NativeNode.kind`` can carry. Use a
+# ``Literal`` rather than ``str`` so the type checker catches typos at
+# plugin author time.
+NodeKind = Literal[
+    "function",
+    "class",
+    "variable",
+    "import",
+    "type_alias",
+    "module",
+    "synthetic",
+]
 
 class Import:
     module: str
@@ -22,7 +35,7 @@ class Import:
 
 class NativeNode:
     fqname: str
-    kind: str
+    kind: NodeKind
     path: str
     start_line: int
     start_column: int
@@ -30,6 +43,61 @@ class NativeNode:
     end_column: int
     flags: int
     imports: Import | None
+
+# ----- Graph operations (yielded from plugin.run) ------------------------
+
+class AddEdge:
+    """Edge from ``src`` to ``dst``. ``flags`` carries DEAD_BRANCH /
+    future edge classifications."""
+
+    src: NativeNode
+    dst: NativeNode
+    flags: int
+
+    def __init__(self, src: NativeNode, dst: NativeNode, *, flags: int = 0) -> None: ...
+
+class AddEntrypoint:
+    """Mark ``decl`` as an entrypoint. ``marker`` is a self-documenting
+    label for ``why-alive`` (e.g. ``"<celery-worker>"``).
+
+    Sugar for the single-target case; for multi-target
+    (``marker -> [t1, t2, t3]``) or intermediate
+    (``source -> marker -> targets``) markers use ``AddNode`` with
+    ``edges_to`` / ``edges_from``."""
+
+    decl: NativeNode
+    marker: str
+
+    def __init__(self, decl: NativeNode, *, marker: str) -> None: ...
+
+class AddNode:
+    """Mint a synthetic node with optional in/out edges.
+
+    ``edges_from`` becomes one ``source -> this`` edge per element;
+    ``edges_to`` becomes ``this -> target`` edges. Set
+    ``flags = NodeFlags.ENTRYPOINT`` to make the node a reachability
+    seed. For the common single-target entrypoint pattern, prefer
+    ``AddEntrypoint(decl, marker=...)``."""
+
+    fqname: str
+    kind: NodeKind
+    path: str
+    flags: int
+    edges_from: list[NativeNode]
+    edges_to: list[NativeNode]
+
+    def __init__(
+        self,
+        fqname: str,
+        *,
+        path: str,
+        kind: NodeKind = "synthetic",
+        flags: int = 0,
+        edges_from: Iterable[NativeNode] = ...,
+        edges_to: Iterable[NativeNode] = ...,
+    ) -> None: ...
+
+GraphOp = AddEdge | AddEntrypoint | AddNode
 
 class NativeGraph:
     nodes: list[NativeNode]
@@ -49,7 +117,7 @@ class Project:
     def build(self) -> NativeGraph: ...
 
 class _ProjectPluginLike(Protocol):
-    def run(self, ctx: "ProjectContext") -> None: ...
+    def run(self, ctx: "ProjectContext") -> Iterable[GraphOp] | None: ...
 
 class ProjectContext:
     project_root: str
@@ -66,19 +134,22 @@ class ProjectContext:
     ) -> None: ...
     def add_plugin(self, plugin: _ProjectPluginLike | Any) -> None: ...
     def materialize(self) -> NativeGraph: ...
-    def add_node(
-        self,
-        fqname: str,
-        path: str,
-        *,
-        kind: str = ...,
-        start_line: int = ...,
-        start_column: int = ...,
-        end_line: int = ...,
-        end_column: int = ...,
-        flags: int = ...,
-    ) -> NativeNode: ...
-    def add_edge(self, src: NativeNode, dst: NativeNode) -> None: ...
+    def find_decorated(self, decorator_fqn: str) -> list[NativeNode]: ...
+    def find_constructions(
+        self, class_fqn: str, *, include_subclasses: bool = False
+    ) -> list[NativeNode]: ...
+    def find_decorations_on(
+        self, instance: NativeNode, method_names: list[str]
+    ) -> list[NativeNode]: ...
+    def find_subclasses(self, base_fqn: str, *, transitive: bool = True) -> list[NativeNode]: ...
+    def resolve(self, fqname: str) -> NativeNode | None: ...
+    def module_surface(self, module_fqn: str) -> list[NativeNode]: ...
+    def decls_under(self, path_prefix: str) -> list[NativeNode]: ...
+    def decls_matching(self, substring: str) -> list[NativeNode]: ...
+    def decls_matching_name(self, pattern: str) -> list[NativeNode]: ...
+    def descendants(self, root: NativeNode, *, skip_flags: int = 0) -> list[NativeNode]: ...
+    def ancestors(self, decl: NativeNode, *, skip_flags: int = 0) -> list[NativeNode]: ...
+    def reachable(self, *, skip_flags: int = 0) -> list[NativeNode]: ...
     def find_module_dunders(self) -> list[NativeNode]: ...
     def find_imports_of(self, module_name: str) -> list[NativeNode]: ...
     def find_declarations(self, fqname: str) -> list[NativeNode]: ...

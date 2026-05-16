@@ -204,22 +204,21 @@ def test_find_comment_patterns_skips_unmatched_comments(make_ctx):
 
 
 # ---------------------------------------------------------------------------
-# add_node / add_edge / re-entry mechanics
+# AddNode / AddEdge / re-entry mechanics
 # ---------------------------------------------------------------------------
 
 
 def test_add_node_and_add_edge_round_trip(make_ctx):
-    """`add_edge` resolves node identity by content (no idx field needed)."""
+    """`AddEdge` resolves node identity by content (no idx field needed)."""
 
     class MintAndCheck:
         name = "mint_and_check"
 
-        def run(self, ctx: native.ProjectContext) -> None:
+        def run(self, ctx: native.ProjectContext):
             decls = [n for n in ctx.nodes() if n.fqname == "mod.f"]
             assert len(decls) == 1
             decl = decls[0]
-            synth = ctx.add_node(fqname="<seed>", path=decl.path)
-            ctx.add_edge(synth, decl)
+            yield native.AddNode(fqname="<seed>", path=decl.path, edges_to=[decl])
 
     ctx = make_ctx({"mod.py": "def f(): pass\n"})
     ctx.add_plugin(MintAndCheck())
@@ -232,20 +231,16 @@ def test_add_node_and_add_edge_round_trip(make_ctx):
 
 
 def test_add_edge_dedups_by_content(make_ctx):
-    """Two NativeNode refs to the same logical node resolve to one edge."""
+    """Two AddNode ops with the same key alias the same interned node;
+    the resulting edges collapse to one."""
 
     class MintTwice:
         name = "mint_twice"
 
-        def run(self, ctx: native.ProjectContext) -> None:
+        def run(self, ctx: native.ProjectContext):
             decl = next(n for n in ctx.nodes() if n.fqname == "mod.f")
-            # Two `add_node` calls with the same key return refs that
-            # alias the same interned node; `add_edge` from either one
-            # produces the same single edge.
-            synth1 = ctx.add_node(fqname="<seed>", path=decl.path)
-            synth2 = ctx.add_node(fqname="<seed>", path=decl.path)
-            ctx.add_edge(synth1, decl)
-            ctx.add_edge(synth2, decl)
+            yield native.AddNode(fqname="<seed>", path=decl.path, edges_to=[decl])
+            yield native.AddNode(fqname="<seed>", path=decl.path, edges_to=[decl])
 
     ctx = make_ctx({"mod.py": "def f(): pass\n"})
     ctx.add_plugin(MintTwice())
@@ -273,8 +268,8 @@ def test_materialize_is_idempotent(make_ctx):
     class CountAdded:
         name = "count"
 
-        def run(self, ctx: native.ProjectContext) -> None:
-            ctx.add_node(fqname="<seed>", path="/")
+        def run(self, ctx: native.ProjectContext):
+            yield native.AddNode(fqname="<seed>", path="/")
             counts.append(sum(1 for n in ctx.nodes() if n.fqname == "<seed>"))
 
     ctx = make_ctx({"mod.py": "x = 1\n"})

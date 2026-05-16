@@ -189,15 +189,16 @@ class InitSubclassPlugin:
                         continue
                     yield AddEdge(marker, sub)
 
-    def run(self, ctx: native.ProjectContext) -> None:
+    def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
+        import dead_cst_ty_native as native
+
         for parent in ctx.find_classes_defining_method(_INIT_SUBCLASS):
-            marker = ctx.add_node(
+            yield native.AddNode(
                 fqname=f"{INIT_SUBCLASS_PREFIX}{parent.fqname}",
                 path=parent.path,
+                edges_from=[parent],
+                edges_to=ctx.find_subclasses_of(parent),
             )
-            ctx.add_edge(parent, marker)
-            for sub in ctx.find_subclasses_of(parent):
-                ctx.add_edge(marker, sub)
 
 
 def _has_init_subclass(class_def: cst.ClassDef) -> bool:

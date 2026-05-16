@@ -47,15 +47,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Mapping
+from typing import TYPE_CHECKING, Iterable, Mapping
 
 import libcst as cst
 from libcst.metadata import CodeRange
 
 from ..graph import NodeFlags, SymbolNode
-
-if TYPE_CHECKING:
-    import dead_cst_ty_native as native
 from ..plugins._core import (
     SYNTHETIC_POSITION,
     ObserveContext,
@@ -68,6 +65,8 @@ from ..plugins._core import (
 from ..plugins.decl_shapes import DispatchAppPlugin
 
 if TYPE_CHECKING:
+    import dead_cst_ty_native as native
+
     from ..graph import VisitorPayload
 
 # Classes from ``celery`` that produce an app instance. Value records
@@ -116,21 +115,22 @@ class CeleryPlugin(DispatchAppPlugin):
             edges=tuple(base.edges) + tuple(shared.edges),
         )
 
-    def run(self, ctx: "native.ProjectContext") -> None:
-        DispatchAppPlugin.run(self, ctx)
+    def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
+        import dead_cst_ty_native as native
+
+        yield from DispatchAppPlugin.run(self, ctx)
         # ``@shared_task`` is appless and not covered by DispatchAppPlugin.
         funcs = ctx.find_decorated_decls("celery", list(_SHARED_TASK_NAMES))
         by_path: dict[str, list[native.NativeNode]] = {}
         for func in funcs:
             by_path.setdefault(func.path, []).append(func)
         for path, targets in by_path.items():
-            seed = ctx.add_node(
+            yield native.AddNode(
                 fqname=f"{CELERY_SHARED_PREFIX}{Path(path).name}",
                 path=path,
                 flags=int(NodeFlags.ENTRYPOINT),
+                edges_to=targets,
             )
-            for target in targets:
-                ctx.add_edge(seed, target)
 
     def _shared_task_payload(self, ctx: ObserveContext) -> "VisitorPayload | None":
         """Wire ``@shared_task`` decorated top-level functions to a per-file synthetic."""

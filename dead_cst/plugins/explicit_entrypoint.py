@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterable
 
-from ..graph import NodeFlags, SymbolNode
+from ..graph import SymbolNode
 from ._core import GraphOp, ObserveContext, PluginContext, mark_entrypoints
 
 if TYPE_CHECKING:
@@ -51,17 +51,14 @@ class ExplicitEntrypointPlugin:
                 continue
             yield from mark_entrypoints(f"{EXPLICIT_PREFIX}{node.fqname}", node.path, [node])
 
-    def run(self, ctx: native.ProjectContext) -> None:
+    def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
+        import dead_cst_ty_native as native
+
         root = Path(ctx.project_root)
         for node in ctx.nodes():
             if not self._matches_native(node, root):
                 continue
-            marker = ctx.add_node(
-                fqname=f"{EXPLICIT_PREFIX}{node.fqname}",
-                path=node.path,
-                flags=int(NodeFlags.ENTRYPOINT),
-            )
-            ctx.add_edge(marker, node)
+            yield native.AddEntrypoint(node, marker="<entrypoint>")
 
     def _matches_native(self, node: native.NativeNode, root: Path) -> bool:
         path = Path(node.path)

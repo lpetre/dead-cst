@@ -113,7 +113,7 @@ class PytestPlugin:
     def finalize(self, ctx: PluginContext) -> Iterable[GraphOp]:
         return ()
 
-    def run(self, ctx: native.ProjectContext) -> None:
+    def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
         nodes = list(ctx.nodes())
         decls_by_path: dict[str, list[native.NativeNode]] = {}
         for n in nodes:
@@ -127,11 +127,11 @@ class PytestPlugin:
                 continue
             filename = Path(path).name
             if filename == "conftest.py":
-                _mark_seed(ctx, f"{PYTEST_CONFTEST_PREFIX}{module.fqname}", path, decls)
+                yield from _mark_seed(f"{PYTEST_CONFTEST_PREFIX}{module.fqname}", path, decls)
             elif _is_test_filename(filename):
                 test_decls = [d for d in decls if _is_test_decl_native(d)]
                 if test_decls:
-                    _mark_seed(ctx, f"{PYTEST_TESTS_PREFIX}{module.fqname}", path, test_decls)
+                    yield from _mark_seed(f"{PYTEST_TESTS_PREFIX}{module.fqname}", path, test_decls)
 
         fixtures_by_path: dict[str, list[native.NativeNode]] = {}
         for func in ctx.find_decorated_decls("pytest", ["fixture"]):
@@ -140,24 +140,24 @@ class PytestPlugin:
             module = ctx.module_for(path)
             if module is None:
                 continue
-            _mark_seed(ctx, f"{PYTEST_FIXTURES_PREFIX}{module.fqname}", path, fixtures)
+            yield from _mark_seed(f"{PYTEST_FIXTURES_PREFIX}{module.fqname}", path, fixtures)
 
 
 def _mark_seed(
-    ctx: native.ProjectContext,
     fqname: str,
     path: str,
     targets: list[native.NativeNode],
-) -> None:
+) -> Iterable[native.GraphOp]:
+    import dead_cst_ty_native as native
+
     if not targets:
         return
-    marker = ctx.add_node(
+    yield native.AddNode(
         fqname=fqname,
         path=path,
         flags=int(NodeFlags.ENTRYPOINT | NodeFlags.TESTCASE),
+        edges_to=targets,
     )
-    for t in targets:
-        ctx.add_edge(marker, t)
 
 
 def _is_test_decl_native(node: native.NativeNode) -> bool:
