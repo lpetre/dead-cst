@@ -55,6 +55,7 @@ from ..plugins.init_subclass import (
 )
 
 if TYPE_CHECKING:
+    import dead_cst_ty_native as native
     from libcst.metadata import CodeRange
 
     from ..graph import VisitorPayload
@@ -211,6 +212,44 @@ class UnittestPlugin:
             yield AddNode(synth)
             for sub in subs:
                 yield AddEdge(synth, sub)
+
+    def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
+        import dead_cst_ty_native as native
+
+        # Gate hook detection on files that import unittest. The class
+        # subclass walk doesn't need this — ty's type hierarchy only
+        # returns real subclasses of stdlib unittest.TestCase, so a
+        # local ``class TestCase: pass`` followed by ``class X(TestCase)``
+        # never shows up (X inherits from the local class, not stdlib's).
+        importer_paths = {n.path for n in ctx.find_imports_of("unittest")}
+
+        decls_by_path: dict[str, list[native.NativeNode]] = {}
+        for base_fqname in _UNITTEST_BASE_FQNAMES:
+            for sub in ctx.find_subclasses(base_fqname, transitive=True):
+                decls_by_path.setdefault(sub.path, []).append(sub)
+
+        # Module-level hooks (setUpModule / tearDownModule / load_tests)
+        # in any file that imports unittest.
+        for node in ctx.nodes():
+            if node.kind != "function":
+                continue
+            if node.path not in importer_paths:
+                continue
+            simple = node.fqname.rsplit(".", 1)[-1]
+            if simple in _MODULE_HOOKS:
+                decls_by_path.setdefault(node.path, []).append(node)
+
+        flags = int(NodeFlags.ENTRYPOINT | NodeFlags.TESTCASE)
+        for path, decls in decls_by_path.items():
+            module = ctx.module_for(path)
+            if module is None:
+                continue
+            yield native.AddNode(
+                fqname=f"{UNITTEST_PREFIX}{module.fqname}",
+                path=path,
+                flags=flags,
+                edges_to=decls,
+            )
 
 
 def _expand_aliases(ctx: PluginContext, seeds: frozenset[str]) -> set[str]:
