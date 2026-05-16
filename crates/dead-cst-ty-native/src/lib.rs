@@ -1005,7 +1005,28 @@ fn ingest_decls(
         let local_name = symbol.name().as_str().to_string();
 
         let target_range = kind.target_range(&parsed);
-        let (sl, sc, el, ec) = position(&line_index, &source, target_range);
+        let (mut sl, mut sc, el, ec) = position(&line_index, &source, target_range);
+
+        // For Function / Class / TypeAlias, ty's `target_range` is the
+        // bound *name* (e.g. `f` in `def f(): ...`). The libcst
+        // pipeline reports the position of the introducing keyword
+        // (`def` / `class` / `type`) — which is the first non-space
+        // character on the same line as the name (decorators sit on
+        // earlier lines and don't count). Align to libcst by snapping
+        // the start column to the line's indent.
+        if matches!(
+            kind,
+            DefinitionKind::Function(_) | DefinitionKind::Class(_) | DefinitionKind::TypeAlias(_)
+        ) {
+            let name_start = line_index.line_column(target_range.start(), &source);
+            let line_text = &source[line_index.line_range(name_start.line, &source)];
+            let indent = line_text
+                .bytes()
+                .take_while(|b| matches!(*b, b' ' | b'\t'))
+                .count();
+            sl = name_start.line.get();
+            sc = indent;
+        }
 
         let import_spec = if node_kind == "import" {
             Some(import_payload_for(kind, db, file, &parsed))
@@ -1821,8 +1842,11 @@ impl<'a, 'db> RefCollector<'a, 'db> {
         None
     }
 
-    /// Walk the use's scope chain looking for the reaching definition
-    /// of `name`. Returns `None` when no binding is found.
+    /// Walk the use's scope chain looking for the reaching definitions
+    /// of `name`. Returns one entry per reaching def — typically a
+    /// single binding, but `if`/`else` or `try`/`except` branches that
+    /// both bind the name leave multiple defs live at end-of-scope and
+    /// every one gets edges (Principle 3).
     ///
     /// Walks outward through visible scopes until we find one that
     /// *binds* `name` (not merely lists it in its place table — a free
@@ -1830,7 +1854,7 @@ impl<'a, 'db> RefCollector<'a, 'db> {
     /// that case we want to keep walking up to the actual definer).
     /// The first binding scope wins; ty's flow-sensitive
     /// `end_of_scope_symbol_bindings` filters within that scope to the
-    /// reaching def (Principle 3).
+    /// reaching defs.
     ///
     /// Resolutions split on whether the binding has a graph node:
     /// module-scope decls and import aliases give `Alias(idx)`;
@@ -1841,26 +1865,20 @@ impl<'a, 'db> RefCollector<'a, 'db> {
     /// Deliberately does NOT use `definitions_for_name`: that walks
     /// past `from X import y` to the upstream definition in `X`,
     /// flattening the local alias edge Principle 2 requires.
-    fn find_local_binding(&self, name: &ExprName) -> Option<Resolution> {
+    fn find_local_bindings(&self, name: &ExprName) -> Vec<Resolution> {
         let db = self.model.db();
         let index = semantic_index(db, self.file);
-        let file_scope = self.model.scope(name.into())?;
+        let Some(file_scope) = self.model.scope(name.into()) else {
+            return Vec::new();
+        };
         for (scope_id, _scope) in index.visible_ancestor_scopes(file_scope) {
             let place_table = index.place_table(scope_id);
             let Some(symbol_id) = place_table.symbol_id(name.id.as_str()) else {
                 continue;
             };
             let use_def_map = index.use_def_map(scope_id);
-            // The first scope that *binds* this name wins, even if the
-            // binding has no graph node (function parameter, loop
-            // target, except-as, walrus inside a comprehension, …) —
-            // outer scopes are shadowed by this one. Free-variable
-            // references show up in `place_table` without producing
-            // any bindings, and for those we fall through to outer
-            // scopes (handled by `place_table.symbol_id` returning
-            // `Some` but the bindings iterator yielding nothing).
             let mut saw_binding = false;
-            let mut result: Option<Resolution> = None;
+            let mut results: Vec<Resolution> = Vec::new();
             for binding in use_def_map.end_of_scope_symbol_bindings(symbol_id) {
                 let Some(def) = binding.binding.definition() else {
                     continue;
@@ -1869,9 +1887,6 @@ impl<'a, 'db> RefCollector<'a, 'db> {
                     continue;
                 }
                 saw_binding = true;
-                if result.is_some() {
-                    continue;
-                }
                 let kind = def.kind(db);
                 let place_id = def.place(db);
                 let key = (
@@ -1880,7 +1895,7 @@ impl<'a, 'db> RefCollector<'a, 'db> {
                     range_key(kind.target_range(self.parsed)),
                 );
                 if let Some(&idx) = self.global_index.get(&key) {
-                    result = Some(Resolution::Alias(idx));
+                    results.push(Resolution::Alias(idx));
                     continue;
                 }
                 if kind.is_import() {
@@ -1889,14 +1904,14 @@ impl<'a, 'db> RefCollector<'a, 'db> {
                     };
                     let bound_name = sym.name().as_str().to_string();
                     let spec = import_payload_for(kind, db, self.file, self.parsed);
-                    result = Some(Resolution::NestedImport { spec, bound_name });
+                    results.push(Resolution::NestedImport { spec, bound_name });
                 }
             }
             if saw_binding {
-                return result;
+                return results;
             }
         }
-        None
+        Vec::new()
     }
 
     /// Emit edges implied by a use of `name`.
@@ -1909,7 +1924,9 @@ impl<'a, 'db> RefCollector<'a, 'db> {
     /// invariant), then parallel upstream reachability edges from
     /// `alias_imports[idx]` if the binding is an import. For nested
     /// imports there's no alias node — go straight to the parallel
-    /// edges, using the spec ty handed us.
+    /// edges, using the spec ty handed us. When ty reports multiple
+    /// reaching defs (if/else branches, try/except, …), we emit for
+    /// each one.
     fn emit_name_use(&mut self, name: &ExprName, extra_chain: &[&str]) {
         // `Name`s in non-`Load` context are binding sites, not uses:
         // the `x` in `for x in data`, `with y as x`, `except E as x`,
@@ -1920,17 +1937,18 @@ impl<'a, 'db> RefCollector<'a, 'db> {
         if !matches!(name.ctx, ruff_python_ast::ExprContext::Load) {
             return;
         }
-        match self.find_local_binding(name) {
-            Some(Resolution::Alias(alias_idx)) => {
-                self.emit_edge(alias_idx);
-                if let Some(spec) = self.alias_imports.get(&alias_idx).cloned() {
-                    self.emit_upstream(&spec, name.id.as_str(), extra_chain);
+        for resolution in self.find_local_bindings(name) {
+            match resolution {
+                Resolution::Alias(alias_idx) => {
+                    self.emit_edge(alias_idx);
+                    if let Some(spec) = self.alias_imports.get(&alias_idx).cloned() {
+                        self.emit_upstream(&spec, name.id.as_str(), extra_chain);
+                    }
+                }
+                Resolution::NestedImport { spec, bound_name } => {
+                    self.emit_upstream(&spec, &bound_name, extra_chain);
                 }
             }
-            Some(Resolution::NestedImport { spec, bound_name }) => {
-                self.emit_upstream(&spec, &bound_name, extra_chain);
-            }
-            None => {}
         }
     }
 
@@ -2232,6 +2250,17 @@ impl<'ast, 'db> Visitor<'ast> for RefCollector<'_, 'db> {
                 }
                 _ => {}
             }
+        } else if stmt_creates_top_level_definition(stmt) {
+            // At module-level walks (or per-def walks of value
+            // expressions, where Stmt nodes wouldn't appear anyway),
+            // nested top-level-definition statements have already been
+            // processed by the per-def pass with their own owner.
+            // Skipping them here prevents double-attribution when a
+            // compound statement (`if` / `for` / `try` / `with` /
+            // `match`) at module scope contains a definition in its
+            // body — e.g. `if True: f = g` would otherwise emit
+            // `mod -> g` *and* the proper `mod.f -> g`.
+            return;
         }
         walk_stmt(self, stmt);
     }
