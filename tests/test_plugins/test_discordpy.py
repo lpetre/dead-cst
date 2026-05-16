@@ -5,8 +5,8 @@ from __future__ import annotations
 from dead_cst.plugins import DiscordPyPlugin
 
 
-def test_discordpy_plugin_marks_bot_command_handlers(make_analysis, write_files, reachable_fqnames):
-    write_files(
+def test_discordpy_plugin_marks_bot_command_handlers(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "app/__init__.py": "",
             "app/main.py": """
@@ -28,9 +28,9 @@ def test_discordpy_plugin_marks_bot_command_handlers(make_analysis, write_files,
 
             def helper(): pass
             """,
-        }
+        },
+        [DiscordPyPlugin()],
     )
-    graph = make_analysis(plugins=[DiscordPyPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "app.main.bot" in reached
     assert "app.main.ping" in reached
@@ -40,10 +40,8 @@ def test_discordpy_plugin_marks_bot_command_handlers(make_analysis, write_files,
     assert "app.main.helper" not in reached
 
 
-def test_discordpy_plugin_marks_slash_command_tree_handlers(
-    make_analysis, write_files, reachable_fqnames
-):
-    write_files(
+def test_discordpy_plugin_marks_slash_command_tree_handlers(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "app/__init__.py": "",
             "app/main.py": """
@@ -59,16 +57,16 @@ def test_discordpy_plugin_marks_slash_command_tree_handlers(
             async def greet(interaction, member):
                 pass
             """,
-        }
+        },
+        [DiscordPyPlugin()],
     )
-    graph = make_analysis(plugins=[DiscordPyPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "app.main.slash_ping" in reached
     assert "app.main.greet" in reached
 
 
-def test_discordpy_plugin_handles_direct_client(make_analysis, write_files, reachable_fqnames):
-    write_files(
+def test_discordpy_plugin_handles_direct_client(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "app/__init__.py": "",
             "app/main.py": """
@@ -80,18 +78,16 @@ def test_discordpy_plugin_handles_direct_client(make_analysis, write_files, reac
             async def on_ready():
                 pass
             """,
-        }
+        },
+        [DiscordPyPlugin()],
     )
-    graph = make_analysis(plugins=[DiscordPyPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "app.main.client" in reached
     assert "app.main.on_ready" in reached
 
 
-def test_discordpy_plugin_handles_aliased_class_import(
-    make_analysis, write_files, reachable_fqnames
-):
-    write_files(
+def test_discordpy_plugin_handles_aliased_class_import(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "app/__init__.py": "",
             "app/main.py": """
@@ -103,16 +99,14 @@ def test_discordpy_plugin_handles_aliased_class_import(
             async def ping(ctx):
                 pass
             """,
-        }
+        },
+        [DiscordPyPlugin()],
     )
-    graph = make_analysis(plugins=[DiscordPyPlugin()]).materialize_all()
     assert "app.main.ping" in reachable_fqnames(graph)
 
 
-def test_discordpy_plugin_handles_autosharded_variants(
-    make_analysis, write_files, reachable_fqnames
-):
-    write_files(
+def test_discordpy_plugin_handles_autosharded_variants(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "app/__init__.py": "",
             "app/main.py": """
@@ -128,16 +122,16 @@ def test_discordpy_plugin_handles_autosharded_variants(
             @client.event
             async def on_ready(): pass
             """,
-        }
+        },
+        [DiscordPyPlugin()],
     )
-    graph = make_analysis(plugins=[DiscordPyPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "app.main.b_cmd" in reached
     assert "app.main.on_ready" in reached
 
 
-def test_discordpy_plugin_keeps_cog_class_alive(make_analysis, write_files, reachable_fqnames):
-    write_files(
+def test_discordpy_plugin_keeps_cog_class_alive(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "cogs/__init__.py": "",
             "cogs/greetings.py": """
@@ -154,9 +148,9 @@ def test_discordpy_plugin_keeps_cog_class_alive(make_analysis, write_files, reac
             async def setup(bot):
                 await bot.add_cog(Greetings(bot))
             """,
-        }
+        },
+        [DiscordPyPlugin()],
     )
-    graph = make_analysis(plugins=[DiscordPyPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     # Cog class + module-level setup function both kept alive by the
     # cog-module synthetic entrypoint.
@@ -164,10 +158,8 @@ def test_discordpy_plugin_keeps_cog_class_alive(make_analysis, write_files, reac
     assert "cogs.greetings.setup" in reached
 
 
-def test_discordpy_plugin_marks_teardown_alongside_setup(
-    make_analysis, write_files, reachable_fqnames
-):
-    write_files(
+def test_discordpy_plugin_marks_teardown_alongside_setup(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "cogs/__init__.py": "",
             "cogs/admin.py": """
@@ -182,19 +174,17 @@ def test_discordpy_plugin_marks_teardown_alongside_setup(
             async def teardown(bot):
                 await bot.remove_cog("Admin")
             """,
-        }
+        },
+        [DiscordPyPlugin()],
     )
-    graph = make_analysis(plugins=[DiscordPyPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "cogs.admin.Admin" in reached
     assert "cogs.admin.setup" in reached
     assert "cogs.admin.teardown" in reached
 
 
-def test_discordpy_plugin_setup_without_cog_stays_dead(
-    make_analysis, write_files, reachable_fqnames
-):
-    write_files(
+def test_discordpy_plugin_setup_without_cog_stays_dead(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "pkg/__init__.py": "",
             "pkg/helpers.py": """
@@ -205,16 +195,14 @@ def test_discordpy_plugin_setup_without_cog_stays_dead(
             def setup(bot):
                 pass
             """,
-        }
+        },
+        [DiscordPyPlugin()],
     )
-    graph = make_analysis(plugins=[DiscordPyPlugin()]).materialize_all()
     assert "pkg.helpers.setup" not in reachable_fqnames(graph)
 
 
-def test_discordpy_plugin_load_extension_pulls_target_module(
-    make_analysis, write_files, reachable_fqnames
-):
-    write_files(
+def test_discordpy_plugin_load_extension_pulls_target_module(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "app/__init__.py": "",
             "app/main.py": """
@@ -248,9 +236,9 @@ def test_discordpy_plugin_load_extension_pulls_target_module(
             def setup(bot):
                 pass
             """,
-        }
+        },
+        [DiscordPyPlugin()],
     )
-    graph = make_analysis(plugins=[DiscordPyPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "app.cogs.greet" in reached
     assert "app.cogs.greet.setup" in reached
@@ -261,10 +249,8 @@ def test_discordpy_plugin_load_extension_pulls_target_module(
     assert "app.cogs.misc.misc_helper" in reached
 
 
-def test_discordpy_plugin_load_extension_non_literal_dropped(
-    make_analysis, write_files, reachable_fqnames
-):
-    write_files(
+def test_discordpy_plugin_load_extension_non_literal_dropped(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "app/__init__.py": "",
             "app/main.py": """
@@ -282,17 +268,15 @@ def test_discordpy_plugin_load_extension_non_literal_dropped(
             def setup(bot):
                 pass
             """,
-        }
+        },
+        [DiscordPyPlugin()],
     )
-    graph = make_analysis(plugins=[DiscordPyPlugin()]).materialize_all()
     # Non-literal argument is dropped silently; nothing keeps the cog alive.
     assert "app.cogs.dynamic.setup" not in reachable_fqnames(graph)
 
 
-def test_discordpy_plugin_ignores_unrelated_bare_decorators(
-    make_analysis, write_files, reachable_fqnames
-):
-    write_files(
+def test_discordpy_plugin_ignores_unrelated_bare_decorators(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "pkg/__init__.py": "",
             "pkg/mod.py": """
@@ -309,16 +293,16 @@ def test_discordpy_plugin_ignores_unrelated_bare_decorators(
             @t.register
             def not_a_handler(): pass
             """,
-        }
+        },
+        [DiscordPyPlugin()],
     )
-    graph = make_analysis(plugins=[DiscordPyPlugin()]).materialize_all()
     assert "pkg.mod.not_a_handler" not in reachable_fqnames(graph)
 
 
 def test_discordpy_plugin_ignores_files_without_discord_imports(
-    make_analysis, write_files, reachable_fqnames
+    build_plugin_graph, reachable_fqnames
 ):
-    write_files(
+    graph = build_plugin_graph(
         {
             "pkg/__init__.py": "",
             "pkg/mod.py": """
@@ -336,16 +320,14 @@ def test_discordpy_plugin_ignores_files_without_discord_imports(
             def setup(bot):
                 pass
             """,
-        }
+        },
+        [DiscordPyPlugin()],
     )
-    graph = make_analysis(plugins=[DiscordPyPlugin()]).materialize_all()
     assert "pkg.target.setup" not in reachable_fqnames(graph)
 
 
-def test_discordpy_plugin_handler_dependencies_stay_alive(
-    make_analysis, write_files, reachable_fqnames
-):
-    write_files(
+def test_discordpy_plugin_handler_dependencies_stay_alive(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "app/__init__.py": "",
             "app/util.py": """
@@ -365,9 +347,9 @@ def test_discordpy_plugin_handler_dependencies_stay_alive(
             async def hello(ctx):
                 await ctx.send(render_greeting())
             """,
-        }
+        },
+        [DiscordPyPlugin()],
     )
-    graph = make_analysis(plugins=[DiscordPyPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "app.main.hello" in reached
     # Handler transitively pulls render_greeting alive.

@@ -9,8 +9,8 @@ from dead_cst.plugins import (
 )
 
 
-def test_cyclopts_plugin_marks_command_handlers(make_analysis, write_files, reachable_fqnames):
-    write_files(
+def test_cyclopts_plugin_marks_command_handlers(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "cli/__init__.py": "",
             "cli/main.py": """
@@ -32,9 +32,9 @@ def test_cyclopts_plugin_marks_command_handlers(make_analysis, write_files, reac
             if __name__ == "__main__":
                 app()
             """,
-        }
+        },
+        [MainBlockPlugin(), CycloptsPlugin()],
     )
-    graph = make_analysis(plugins=[MainBlockPlugin(), CycloptsPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "cli.main.app" in reached
     assert "cli.main.hello" in reached
@@ -44,10 +44,8 @@ def test_cyclopts_plugin_marks_command_handlers(make_analysis, write_files, reac
     assert "cli.main.helper" not in reached
 
 
-def test_cyclopts_plugin_keeps_handler_dependencies_alive(
-    make_analysis, write_files, reachable_fqnames
-):
-    write_files(
+def test_cyclopts_plugin_keeps_handler_dependencies_alive(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "cli/__init__.py": "",
             "cli/models.py": """
@@ -73,9 +71,9 @@ def test_cyclopts_plugin_keeps_handler_dependencies_alive(
             if __name__ == "__main__":
                 app()
             """,
-        }
+        },
+        [MainBlockPlugin(), CycloptsPlugin()],
     )
-    graph = make_analysis(plugins=[MainBlockPlugin(), CycloptsPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "cli.main.show" in reached
     # Symbols transitively referenced from the handler stay alive
@@ -109,10 +107,10 @@ def test_cyclopts_plugin_reachable_via_explicit_entrypoint(
     assert "cli.main.hello" in reached
 
 
-def test_cyclopts_plugin_does_not_seed_entrypoint(make_analysis, write_files, reachable_fqnames):
+def test_cyclopts_plugin_does_not_seed_entrypoint(build_plugin_graph, reachable_fqnames):
     """Without an external reach (no main block, no project.scripts, no -e),
     the cyclopts instance itself stays dead -- and so do its commands."""
-    write_files(
+    graph = build_plugin_graph(
         {
             "cli/__init__.py": "",
             "cli/main.py": """
@@ -123,18 +121,18 @@ def test_cyclopts_plugin_does_not_seed_entrypoint(make_analysis, write_files, re
             @app.command
             def orphan(): pass
             """,
-        }
+        },
+        [CycloptsPlugin()],
     )
-    graph = make_analysis(plugins=[CycloptsPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "cli.main.app" not in reached
     assert "cli.main.orphan" not in reached
 
 
-def test_cyclopts_plugin_unused_subapp_stays_dead(make_analysis, write_files, reachable_fqnames):
+def test_cyclopts_plugin_unused_subapp_stays_dead(build_plugin_graph, reachable_fqnames):
     """A sub-App that's never registered has no path from the root app and
     stays dead, along with its commands."""
-    write_files(
+    graph = build_plugin_graph(
         {
             "cli/__init__.py": "",
             "cli/sub.py": """
@@ -156,22 +154,20 @@ def test_cyclopts_plugin_unused_subapp_stays_dead(make_analysis, write_files, re
             if __name__ == "__main__":
                 app()
             """,
-        }
+        },
+        [MainBlockPlugin(), CycloptsPlugin()],
     )
-    graph = make_analysis(plugins=[MainBlockPlugin(), CycloptsPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "cli.main.hello" in reached
     assert "cli.sub.sub" not in reached
     assert "cli.sub.orphan" not in reached
 
 
-def test_cyclopts_plugin_subapp_reachable_via_command_attach(
-    make_analysis, write_files, reachable_fqnames
-):
+def test_cyclopts_plugin_subapp_reachable_via_command_attach(build_plugin_graph, reachable_fqnames):
     """``app.command(sub)`` attaches a sub-App by reference -- the analyzer
     tracks that ordinary call argument, so the sub-App becomes reachable
     through the root app and its own ``@sub.command`` handlers go live."""
-    write_files(
+    graph = build_plugin_graph(
         {
             "cli/__init__.py": "",
             "cli/sub.py": """
@@ -195,9 +191,9 @@ def test_cyclopts_plugin_subapp_reachable_via_command_attach(
             if __name__ == "__main__":
                 app()
             """,
-        }
+        },
+        [MainBlockPlugin(), CycloptsPlugin()],
     )
-    graph = make_analysis(plugins=[MainBlockPlugin(), CycloptsPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "cli.main.app" in reached
     assert "cli.sub.sub" in reached
@@ -205,10 +201,8 @@ def test_cyclopts_plugin_subapp_reachable_via_command_attach(
     assert "cli.sub.things" in reached
 
 
-def test_cyclopts_plugin_handles_aliased_class_import(
-    make_analysis, write_files, reachable_fqnames
-):
-    write_files(
+def test_cyclopts_plugin_handles_aliased_class_import(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "cli/__init__.py": "",
             "cli/main.py": """
@@ -222,16 +216,14 @@ def test_cyclopts_plugin_handles_aliased_class_import(
             if __name__ == "__main__":
                 app()
             """,
-        }
+        },
+        [MainBlockPlugin(), CycloptsPlugin()],
     )
-    graph = make_analysis(plugins=[MainBlockPlugin(), CycloptsPlugin()]).materialize_all()
     assert "cli.main.hello" in reachable_fqnames(graph)
 
 
-def test_cyclopts_plugin_handles_aliased_module_import(
-    make_analysis, write_files, reachable_fqnames
-):
-    write_files(
+def test_cyclopts_plugin_handles_aliased_module_import(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "cli/__init__.py": "",
             "cli/main.py": """
@@ -245,16 +237,14 @@ def test_cyclopts_plugin_handles_aliased_module_import(
             if __name__ == "__main__":
                 app()
             """,
-        }
+        },
+        [MainBlockPlugin(), CycloptsPlugin()],
     )
-    graph = make_analysis(plugins=[MainBlockPlugin(), CycloptsPlugin()]).materialize_all()
     assert "cli.main.hello" in reachable_fqnames(graph)
 
 
-def test_cyclopts_plugin_handles_annotated_assignment(
-    make_analysis, write_files, reachable_fqnames
-):
-    write_files(
+def test_cyclopts_plugin_handles_annotated_assignment(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "cli/__init__.py": "",
             "cli/main.py": """
@@ -268,14 +258,14 @@ def test_cyclopts_plugin_handles_annotated_assignment(
             if __name__ == "__main__":
                 app()
             """,
-        }
+        },
+        [MainBlockPlugin(), CycloptsPlugin()],
     )
-    graph = make_analysis(plugins=[MainBlockPlugin(), CycloptsPlugin()]).materialize_all()
     assert "cli.main.hello" in reachable_fqnames(graph)
 
 
-def test_cyclopts_plugin_ignores_bare_decorators(make_analysis, write_files, reachable_fqnames):
-    write_files(
+def test_cyclopts_plugin_ignores_bare_decorators(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "pkg/__init__.py": "",
             "pkg/mod.py": """
@@ -292,18 +282,16 @@ def test_cyclopts_plugin_ignores_bare_decorators(make_analysis, write_files, rea
             if __name__ == "__main__":
                 app()
             """,
-        }
+        },
+        [MainBlockPlugin(), CycloptsPlugin()],
     )
-    graph = make_analysis(plugins=[MainBlockPlugin(), CycloptsPlugin()]).materialize_all()
     # Bare ``@command`` (no attribute access) is not a cyclopts registration --
     # matching it would clobber unrelated decorators with the same name.
     assert "pkg.mod.looks_like_command" not in reachable_fqnames(graph)
 
 
-def test_cyclopts_plugin_ignores_unrelated_decorators(
-    make_analysis, write_files, reachable_fqnames
-):
-    write_files(
+def test_cyclopts_plugin_ignores_unrelated_decorators(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "pkg/__init__.py": "",
             "pkg/mod.py": """
@@ -316,17 +304,17 @@ def test_cyclopts_plugin_ignores_unrelated_decorators(
             @t.command
             def not_a_command(): pass
             """,
-        }
+        },
+        [CycloptsPlugin()],
     )
-    graph = make_analysis(plugins=[CycloptsPlugin()]).materialize_all()
     # ``t`` isn't a cyclopts ``App`` instance, so its ``.command`` decorator is ignored.
     assert "pkg.mod.not_a_command" not in reachable_fqnames(graph)
 
 
 def test_cyclopts_plugin_does_nothing_without_cyclopts_imports(
-    make_analysis, write_files, reachable_fqnames
+    build_plugin_graph, reachable_fqnames
 ):
-    write_files(
+    graph = build_plugin_graph(
         {
             "pkg/__init__.py": "",
             "pkg/mod.py": """
@@ -339,17 +327,15 @@ def test_cyclopts_plugin_does_nothing_without_cyclopts_imports(
             @app.command
             def looks_like_command(): pass
             """,
-        }
+        },
+        [CycloptsPlugin()],
     )
-    graph = make_analysis(plugins=[CycloptsPlugin()]).materialize_all()
     # ``app`` here is not a cyclopts instance -- no ``cyclopts`` import in scope.
     assert "pkg.mod.looks_like_command" not in reachable_fqnames(graph)
 
 
-def test_cyclopts_plugin_multiple_instances_in_one_module(
-    make_analysis, write_files, reachable_fqnames
-):
-    write_files(
+def test_cyclopts_plugin_multiple_instances_in_one_module(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "cli/__init__.py": "",
             "cli/main.py": """
@@ -367,9 +353,9 @@ def test_cyclopts_plugin_multiple_instances_in_one_module(
             if __name__ == "__main__":
                 app()
             """,
-        }
+        },
+        [MainBlockPlugin(), CycloptsPlugin()],
     )
-    graph = make_analysis(plugins=[MainBlockPlugin(), CycloptsPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     # ``app`` is reached via the main block; its command is alive.
     assert "cli.main.from_app" in reached
@@ -379,11 +365,11 @@ def test_cyclopts_plugin_multiple_instances_in_one_module(
     assert "cli.main.from_other" not in reached
 
 
-def test_cyclopts_plugin_ignores_import_star(make_analysis, write_files, reachable_fqnames):
+def test_cyclopts_plugin_ignores_import_star(build_plugin_graph, reachable_fqnames):
     """``from cyclopts import *`` doesn't bind ``App`` for the plugin's
     purposes. The ``import *`` analyzer logic is pessimistic enough on its
     own; the plugin shouldn't infer cyclopts wiring from the star import."""
-    write_files(
+    graph = build_plugin_graph(
         {
             "cli/__init__.py": "",
             "cli/main.py": """
@@ -397,9 +383,9 @@ def test_cyclopts_plugin_ignores_import_star(make_analysis, write_files, reachab
             if __name__ == "__main__":
                 app()
             """,
-        }
+        },
+        [MainBlockPlugin(), CycloptsPlugin()],
     )
-    graph = make_analysis(plugins=[MainBlockPlugin(), CycloptsPlugin()]).materialize_all()
     # No instance edge from ``app`` to ``hello`` because the plugin ignores
     # star imports. ``hello`` is not referenced by anything reachable.
     assert "cli.main.hello" not in reachable_fqnames(graph)

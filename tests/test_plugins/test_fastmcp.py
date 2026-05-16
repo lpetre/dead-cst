@@ -5,8 +5,8 @@ from __future__ import annotations
 from dead_cst.plugins import FastMCPPlugin
 
 
-def test_fastmcp_plugin_marks_tool_handlers(make_analysis, write_files, reachable_fqnames):
-    write_files(
+def test_fastmcp_plugin_marks_tool_handlers(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "server/__init__.py": "",
             "server/main.py": """
@@ -34,9 +34,9 @@ def test_fastmcp_plugin_marks_tool_handlers(make_analysis, write_files, reachabl
 
             def helper(): pass
             """,
-        }
+        },
+        [FastMCPPlugin()],
     )
-    graph = make_analysis(plugins=[FastMCPPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "server.main.mcp" in reached
     assert "server.main.add" in reached
@@ -48,10 +48,8 @@ def test_fastmcp_plugin_marks_tool_handlers(make_analysis, write_files, reachabl
     assert "server.main.helper" not in reached
 
 
-def test_fastmcp_plugin_keeps_handler_dependencies_alive(
-    make_analysis, write_files, reachable_fqnames
-):
-    write_files(
+def test_fastmcp_plugin_keeps_handler_dependencies_alive(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "server/__init__.py": "",
             "server/models.py": """
@@ -74,9 +72,9 @@ def test_fastmcp_plugin_keeps_handler_dependencies_alive(
             def run():
                 return build_result()
             """,
-        }
+        },
+        [FastMCPPlugin()],
     )
-    graph = make_analysis(plugins=[FastMCPPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "server.main.run" in reached
     # Symbols transitively referenced from the handler stay alive
@@ -86,15 +84,13 @@ def test_fastmcp_plugin_keeps_handler_dependencies_alive(
     assert "server.models.Unused" not in reached
 
 
-def test_fastmcp_plugin_auto_seeds_server_as_entrypoint(
-    make_analysis, write_files, reachable_fqnames
-):
+def test_fastmcp_plugin_auto_seeds_server_as_entrypoint(build_plugin_graph, reachable_fqnames):
     """Direct ``X = FastMCP(...)`` is an entrypoint even without a
     ``__main__`` block or ``[project.scripts]`` entry. The ``fastmcp``
     CLI loads ``module:mcp`` by import path, mirroring how ``uvicorn``
     loads a FastAPI ``module:app``, so every FastMCP instance is
     framework-visible the moment it's constructed."""
-    write_files(
+    graph = build_plugin_graph(
         {
             "server/__init__.py": "",
             "server/main.py": """
@@ -105,16 +101,16 @@ def test_fastmcp_plugin_auto_seeds_server_as_entrypoint(
             @mcp.tool()
             def hello(): pass
             """,
-        }
+        },
+        [FastMCPPlugin()],
     )
-    graph = make_analysis(plugins=[FastMCPPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "server.main.mcp" in reached
     assert "server.main.hello" in reached
 
 
-def test_fastmcp_plugin_handles_aliased_class_import(make_analysis, write_files, reachable_fqnames):
-    write_files(
+def test_fastmcp_plugin_handles_aliased_class_import(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "server/__init__.py": "",
             "server/main.py": """
@@ -125,14 +121,14 @@ def test_fastmcp_plugin_handles_aliased_class_import(make_analysis, write_files,
             @mcp.tool()
             def hello(): pass
             """,
-        }
+        },
+        [FastMCPPlugin()],
     )
-    graph = make_analysis(plugins=[FastMCPPlugin()]).materialize_all()
     assert "server.main.hello" in reachable_fqnames(graph)
 
 
-def test_fastmcp_plugin_handles_module_import(make_analysis, write_files, reachable_fqnames):
-    write_files(
+def test_fastmcp_plugin_handles_module_import(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "server/__init__.py": "",
             "server/main.py": """
@@ -143,14 +139,14 @@ def test_fastmcp_plugin_handles_module_import(make_analysis, write_files, reacha
             @mcp.tool()
             def hello(): pass
             """,
-        }
+        },
+        [FastMCPPlugin()],
     )
-    graph = make_analysis(plugins=[FastMCPPlugin()]).materialize_all()
     assert "server.main.hello" in reachable_fqnames(graph)
 
 
-def test_fastmcp_plugin_handles_annotated_assignment(make_analysis, write_files, reachable_fqnames):
-    write_files(
+def test_fastmcp_plugin_handles_annotated_assignment(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "server/__init__.py": "",
             "server/main.py": """
@@ -161,14 +157,14 @@ def test_fastmcp_plugin_handles_annotated_assignment(make_analysis, write_files,
             @mcp.tool()
             def hello(): pass
             """,
-        }
+        },
+        [FastMCPPlugin()],
     )
-    graph = make_analysis(plugins=[FastMCPPlugin()]).materialize_all()
     assert "server.main.hello" in reachable_fqnames(graph)
 
 
-def test_fastmcp_plugin_ignores_bare_decorators(make_analysis, write_files, reachable_fqnames):
-    write_files(
+def test_fastmcp_plugin_ignores_bare_decorators(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "pkg/__init__.py": "",
             "pkg/mod.py": """
@@ -182,16 +178,16 @@ def test_fastmcp_plugin_ignores_bare_decorators(make_analysis, write_files, reac
             @tool
             def looks_like_tool(): pass
             """,
-        }
+        },
+        [FastMCPPlugin()],
     )
-    graph = make_analysis(plugins=[FastMCPPlugin()]).materialize_all()
     # Bare ``@tool`` (no attribute access) is not a FastMCP registration --
     # matching it would clobber unrelated decorators with the same name.
     assert "pkg.mod.looks_like_tool" not in reachable_fqnames(graph)
 
 
-def test_fastmcp_plugin_ignores_unrelated_decorators(make_analysis, write_files, reachable_fqnames):
-    write_files(
+def test_fastmcp_plugin_ignores_unrelated_decorators(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "pkg/__init__.py": "",
             "pkg/mod.py": """
@@ -204,17 +200,15 @@ def test_fastmcp_plugin_ignores_unrelated_decorators(make_analysis, write_files,
             @t.tool
             def not_a_tool(): pass
             """,
-        }
+        },
+        [FastMCPPlugin()],
     )
-    graph = make_analysis(plugins=[FastMCPPlugin()]).materialize_all()
     # ``t`` isn't a ``FastMCP`` instance, so its ``.tool`` decorator is ignored.
     assert "pkg.mod.not_a_tool" not in reachable_fqnames(graph)
 
 
-def test_fastmcp_plugin_does_nothing_without_fastmcp_imports(
-    make_analysis, write_files, reachable_fqnames
-):
-    write_files(
+def test_fastmcp_plugin_does_nothing_without_fastmcp_imports(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "pkg/__init__.py": "",
             "pkg/mod.py": """
@@ -228,18 +222,18 @@ def test_fastmcp_plugin_does_nothing_without_fastmcp_imports(
             @mcp.tool()
             def looks_like_tool(): pass
             """,
-        }
+        },
+        [FastMCPPlugin()],
     )
-    graph = make_analysis(plugins=[FastMCPPlugin()]).materialize_all()
     # ``mcp`` here is not a FastMCP instance -- no ``fastmcp`` import in scope.
     assert "pkg.mod.looks_like_tool" not in reachable_fqnames(graph)
 
 
-def test_fastmcp_plugin_ignores_import_star(make_analysis, write_files, reachable_fqnames):
+def test_fastmcp_plugin_ignores_import_star(build_plugin_graph, reachable_fqnames):
     """``from fastmcp import *`` doesn't bind ``FastMCP`` for the plugin's
     purposes. The ``import *`` analyzer logic is pessimistic enough on its
     own; the plugin shouldn't infer FastMCP wiring from the star import."""
-    write_files(
+    graph = build_plugin_graph(
         {
             "server/__init__.py": "",
             "server/main.py": """
@@ -250,16 +244,16 @@ def test_fastmcp_plugin_ignores_import_star(make_analysis, write_files, reachabl
             @mcp.tool()
             def hello(): pass
             """,
-        }
+        },
+        [FastMCPPlugin()],
     )
-    graph = make_analysis(plugins=[FastMCPPlugin()]).materialize_all()
     # No instance edge from ``mcp`` to ``hello`` because the plugin ignores
     # star imports. ``hello`` is not referenced by anything reachable.
     assert "server.main.hello" not in reachable_fqnames(graph)
 
 
-def test_fastmcp_plugin_handles_factory_function(make_analysis, write_files, reachable_fqnames):
-    write_files(
+def test_fastmcp_plugin_handles_factory_function(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "server/__init__.py": "",
             "server/factory.py": """
@@ -281,18 +275,16 @@ def test_fastmcp_plugin_handles_factory_function(make_analysis, write_files, rea
             def config() -> dict:
                 return {}
             """,
-        }
+        },
+        [FastMCPPlugin()],
     )
-    graph = make_analysis(plugins=[FastMCPPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "server.main.mcp" in reached
     assert "server.main.add" in reached
     assert "server.main.config" in reached
 
 
-def test_fastmcp_plugin_ignores_non_server_fastmcp_users(
-    make_analysis, write_files, reachable_fqnames
-):
+def test_fastmcp_plugin_ignores_non_server_fastmcp_users(build_plugin_graph, reachable_fqnames):
     """Variables that touch ``fastmcp`` for unrelated reasons stay dead.
 
     Walking only to the ``fastmcp`` synthetic isn't enough -- the plugin
@@ -300,7 +292,7 @@ def test_fastmcp_plugin_ignores_non_server_fastmcp_users(
     treating ``X`` as an instance. Otherwise any value derived from some
     other ``fastmcp`` export would get marked as a server.
     """
-    write_files(
+    graph = build_plugin_graph(
         {
             "pkg/__init__.py": "",
             "pkg/mod.py": """
@@ -318,9 +310,9 @@ def test_fastmcp_plugin_ignores_non_server_fastmcp_users(
             @thing.tool()
             def handler(): pass
             """,
-        }
+        },
+        [FastMCPPlugin()],
     )
-    graph = make_analysis(plugins=[FastMCPPlugin()]).materialize_all()
     assert "pkg.mod.handler" not in reachable_fqnames(graph)
 
 
