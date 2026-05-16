@@ -958,6 +958,8 @@ fn ingest_decls(
     let line_index = line_index(db, file);
     let path_str = file_path_string(db, file);
     let module_fqname = module_fqname_for_file(db, file);
+    let (file_pinned_by_noqa, per_line_noqa_pins) =
+        scan_noqa_directives(&parsed, &source, &line_index);
 
     let (msl, msc, mel, mec) = position(&line_index, &source, parsed.syntax().range);
     let module_idx = builder.intern_node(
@@ -1046,6 +1048,17 @@ fn ingest_decls(
             None
         };
 
+        // Pin imports preserved by a `# noqa[: …F401…]` (per-alias)
+        // or by a file-level `# ruff: noqa` / `# flake8: noqa` so
+        // reachability keeps them alive — matching ruff's own
+        // semantics for explicitly-preserved unused-import lines.
+        // We tag both `ENTRYPOINT` (the live-set seed) and `NOQA`
+        // (so the blast-radius query can subtract noqa-only liveness).
+        let mut flags: u32 = 0;
+        if node_kind == "import" && (file_pinned_by_noqa || per_line_noqa_pins.contains(&sl)) {
+            flags |= NODE_FLAGS_NOQA_PIN;
+        }
+
         let node_idx = builder.intern_node(
             py,
             NativeNode {
@@ -1056,7 +1069,7 @@ fn ingest_decls(
                 start_column: sc,
                 end_line: el,
                 end_column: ec,
-                flags: 0,
+                flags,
                 imports,
             },
         )?;
@@ -2272,6 +2285,132 @@ impl<'ast, 'db> Visitor<'ast> for RefCollector<'_, 'db> {
 
 fn rel_path<P: AsRef<str>>(path: P) -> RelativePathBuf {
     RelativePathBuf::cli(SystemPath::new(path.as_ref()))
+}
+
+// ---------------------------------------------------------------------------
+// Noqa parsing
+// ---------------------------------------------------------------------------
+
+/// Bitwise OR of [`NodeFlags::ENTRYPOINT`] and [`NodeFlags::NOQA`], the two
+/// bits stamped on every import alias pinned by a noqa directive.
+///
+/// Keep these constants in sync with `dead_cst.graph.NodeFlags` —
+/// `NodeFlags` is an `enum.IntFlag` with `auto()` assignments, so the
+/// values follow declaration order: NONE=0, SHADOWED=1, ENTRYPOINT=2,
+/// OVERLOAD=4, TESTCASE=8, NOQA=16, …
+const NODE_FLAG_ENTRYPOINT: u32 = 2;
+const NODE_FLAG_NOQA: u32 = 16;
+const NODE_FLAGS_NOQA_PIN: u32 = NODE_FLAG_ENTRYPOINT | NODE_FLAG_NOQA;
+
+/// Result of parsing the `noqa[: codes…]` tail of a comment.
+///
+/// `Bare` means the directive carried no code list and so suppresses
+/// every rule (including F401); `F401Present` means F401 is in the
+/// comma-separated rule list; `OtherOnly` means a rule list was given
+/// but F401 was absent. The first two pin the import alive; the third
+/// doesn't.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoqaKind {
+    Bare,
+    F401Present,
+    OtherOnly,
+}
+
+impl NoqaKind {
+    fn pins_f401(self) -> bool {
+        matches!(self, NoqaKind::Bare | NoqaKind::F401Present)
+    }
+}
+
+/// Parse a `noqa[: codes…]` tail from `content`. Returns `None` if
+/// `content` doesn't start with `noqa` (case-insensitive) after
+/// optional whitespace.
+fn parse_noqa_tail(content: &str) -> Option<NoqaKind> {
+    let trimmed = content.trim_start();
+    if trimmed.len() < 4 || !trimmed[..4].eq_ignore_ascii_case("noqa") {
+        return None;
+    }
+    let after_noqa = &trimmed[4..];
+    let after_colon = after_noqa.trim_start();
+    let Some(rest) = after_colon.strip_prefix(':') else {
+        // Bare `noqa` with no code list.
+        return Some(NoqaKind::Bare);
+    };
+    let rules = rest.trim();
+    if rules.is_empty() {
+        return Some(NoqaKind::Bare);
+    }
+    let has_f401 = rules
+        .split(',')
+        .any(|code| code.trim().eq_ignore_ascii_case("F401"));
+    if has_f401 {
+        Some(NoqaKind::F401Present)
+    } else {
+        Some(NoqaKind::OtherOnly)
+    }
+}
+
+/// Returns `true` when `comment_body` (the text *after* the leading
+/// `#`) is a per-line `# noqa` directive that silences F401.
+fn is_per_line_pin(comment_body: &str) -> bool {
+    parse_noqa_tail(comment_body)
+        .map(NoqaKind::pins_f401)
+        .unwrap_or(false)
+}
+
+/// Returns `true` when `comment_body` is a *file-level*
+/// `# ruff: noqa` / `# flake8: noqa` directive that silences F401.
+///
+/// The `ruff:` / `flake8:` prefix is matched case-sensitively (per
+/// ruff's documented behavior); the `noqa` keyword itself is
+/// case-insensitive.
+fn is_file_pin(comment_body: &str) -> bool {
+    let trimmed = comment_body.trim_start();
+    let after_prefix = trimmed
+        .strip_prefix("ruff:")
+        .or_else(|| trimmed.strip_prefix("flake8:"));
+    let Some(after_prefix) = after_prefix else {
+        return false;
+    };
+    parse_noqa_tail(after_prefix)
+        .map(NoqaKind::pins_f401)
+        .unwrap_or(false)
+}
+
+/// Scan every Comment token in `parsed` and partition the file's
+/// noqa directives into `(file_pinned, per_line_pins)`.
+///
+/// `file_pinned` is true when *any* comment in the file is a
+/// file-level `# ruff: noqa` / `# flake8: noqa` that silences F401 —
+/// ruff scans the whole source, not just the header.
+/// `per_line_pins` collects the (1-indexed) line numbers carrying a
+/// `# noqa[: …F401…]` per-line directive; an import alias on one of
+/// those lines is pinned individually.
+fn scan_noqa_directives(
+    parsed: &ParsedModuleRef,
+    source: &str,
+    line_index: &LineIndex,
+) -> (bool, HashSet<usize>) {
+    let mut file_pinned = false;
+    let mut per_line_pins: HashSet<usize> = HashSet::new();
+    for token in parsed.tokens().iter() {
+        if token.kind() != TokenKind::Comment {
+            continue;
+        }
+        let range = token.range();
+        let text = &source[range];
+        let Some(body) = text.strip_prefix('#') else {
+            continue;
+        };
+        if is_file_pin(body) {
+            file_pinned = true;
+        }
+        if is_per_line_pin(body) {
+            let line = line_index.line_column(range.start(), source).line.get();
+            per_line_pins.insert(line);
+        }
+    }
+    (file_pinned, per_line_pins)
 }
 
 fn position(index: &LineIndex, source: &str, range: TextRange) -> (usize, usize, usize, usize) {
