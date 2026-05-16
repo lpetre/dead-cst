@@ -102,6 +102,15 @@ _MOCK_MODULES = frozenset({"unittest.mock", "mock"})
 _MOCKER_NAME = "mocker"
 _MONKEYPATCH_NAME = "monkeypatch"
 
+# Methods of pytest's ``monkeypatch`` fixture whose first arg can be a
+# fully-qualified string name. The value is the positional-argument
+# count for the string-fqname form (the object form takes one extra
+# positional arg, which is how we disambiguate).
+_MONKEYPATCH_FQNAME_METHODS: dict[str, int] = {
+    "setattr": 2,  # setattr("X.Y", value)              [vs setattr(obj, "name", value)]
+    "delattr": 1,  # delattr("X.Y")                     [vs delattr(obj, "name")]
+}
+
 
 @dataclass
 class MockPatchPlugin:
@@ -181,16 +190,8 @@ class MockPatchPlugin:
                 ctx.find_calls_on_var(_MONKEYPATCH_NAME, attr, 0, required_positional=required)
             )
 
-        # Dedupe per (owner, fqname) to mirror the libcst plugin's
-        # ``dict.fromkeys`` collapse across multiple patch calls in the
-        # same owner.
-        seen: set[tuple[str, str, str]] = set()
         markers: dict[str, native.NativeNode] = {}
         for owner, fqname in pairs:
-            key = (owner.path, owner.fqname, fqname)
-            if key in seen:
-                continue
-            seen.add(key)
             marker = markers.get(fqname)
             if marker is None:
                 marker = ctx.add_node(
@@ -200,7 +201,6 @@ class MockPatchPlugin:
                 markers[fqname] = marker
             ctx.add_edge(owner, marker)
 
-        # Resolve each marker's fqname to first-party decls / modules.
         for fqname, marker in markers.items():
             for decl in ctx.find_declarations(fqname):
                 ctx.add_edge(marker, decl)
@@ -318,16 +318,6 @@ def _first_string_arg(call: cst.Call) -> str | None:
     if first.keyword is not None:
         return None
     return string_value(first.value)
-
-
-# Methods of pytest's ``monkeypatch`` fixture whose first arg can be a
-# fully-qualified string name. The value is the positional-argument
-# count for the *string-fqname* form (the object form takes one extra
-# positional arg, which is how we disambiguate).
-_MONKEYPATCH_FQNAME_METHODS: dict[str, int] = {
-    "setattr": 2,  # setattr("X.Y", value)              [vs setattr(obj, "name", value)]
-    "delattr": 1,  # delattr("X.Y")                     [vs delattr(obj, "name")]
-}
 
 
 def _monkeypatch_target(call: cst.Call) -> str | None:
