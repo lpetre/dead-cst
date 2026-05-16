@@ -2708,7 +2708,11 @@ impl NoqaKind {
 /// optional whitespace.
 fn parse_noqa_tail(content: &str) -> Option<NoqaKind> {
     let trimmed = content.trim_start();
-    if trimmed.len() < 4 || !trimmed[..4].eq_ignore_ascii_case("noqa") {
+    // `str::get` short-circuits when byte 4 isn't a char boundary —
+    // e.g. a comment that starts with the 3-byte `─` box-drawing char
+    // (common in section banners). Direct slicing would panic.
+    let prefix = trimmed.get(..4)?;
+    if !prefix.eq_ignore_ascii_case("noqa") {
         return None;
     }
     let after_noqa = &trimmed[4..];
