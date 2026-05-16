@@ -485,6 +485,74 @@ fn build_fqname_indices(
 // ProjectContext — plugin protocol entry point
 // ---------------------------------------------------------------------------
 
+/// Add an edge between two interned nodes.
+///
+/// ``flags`` carries ``DEAD_BRANCH`` / future edge classifications.
+/// Plugins yield this from ``run(ctx)`` instead of mutating the graph
+/// directly so the apply pass is a single atomic step on the rust side.
+#[pyclass(frozen, get_all)]
+struct AddEdge {
+    src: Py<NativeNode>,
+    dst: Py<NativeNode>,
+    flags: u32,
+}
+
+#[pymethods]
+impl AddEdge {
+    #[new]
+    #[pyo3(signature = (src, dst, *, flags = 0))]
+    fn new(src: Py<NativeNode>, dst: Py<NativeNode>, flags: u32) -> Self {
+        Self { src, dst, flags }
+    }
+}
+
+/// Mark ``decl`` as an entrypoint.
+///
+/// ``marker`` is a self-documenting label (``"<celery-worker>"``,
+/// ``"<external-execution>:alembic"``, ...) shown in ``why-alive`` to
+/// explain *why* the decl is alive without minting a synthetic graph
+/// node for the reason.
+#[pyclass(frozen, get_all)]
+struct AddEntrypoint {
+    decl: Py<NativeNode>,
+    marker: String,
+}
+
+#[pymethods]
+impl AddEntrypoint {
+    #[new]
+    #[pyo3(signature = (decl, *, marker))]
+    fn new(decl: Py<NativeNode>, marker: String) -> Self {
+        Self { decl, marker }
+    }
+}
+
+/// Mint a synthetic intermediate node.
+///
+/// Rare under the new model — the ``AddEntrypoint`` marker covers
+/// "this is alive because of X" without a graph node. Use ``AddNode``
+/// only when you genuinely need an intermediate the codemod / patches
+/// can reference (e.g. the ``<subclass-of>:`` bucket pattern).
+#[pyclass(frozen, get_all)]
+struct AddNode {
+    fqname: String,
+    kind: &'static str,
+    path: String,
+}
+
+#[pymethods]
+impl AddNode {
+    #[new]
+    #[pyo3(signature = (fqname, *, path, kind = "synthetic"))]
+    fn new(fqname: String, path: String, kind: &str) -> PyResult<Self> {
+        Ok(Self {
+            fqname,
+            kind: static_kind_str(kind)?,
+            path,
+        })
+    }
+}
+
 /// Plugin-aware project graph builder.
 ///
 /// Python instantiates a `ProjectContext`, registers Python plugins via
@@ -582,7 +650,22 @@ impl ProjectContext {
             .map(|p| p.clone_ref(py))
             .collect();
         for plugin in &plugins {
-            plugin.bind(py).call_method1("run", (slf.clone_ref(py),))?;
+            // ``plugin.run(ctx)`` may either mutate the graph through
+            // ``ctx.add_node`` / ``ctx.add_edge`` (the legacy direct-
+            // mutation style) *or* yield ``GraphOp`` instances we apply
+            // here. Returning ``None`` from a non-generator ``run`` is
+            // the direct-mutation path; returning an iterable opts into
+            // the new yield model. Both can coexist during the migration.
+            let result = plugin.bind(py).call_method1("run", (slf.clone_ref(py),))?;
+            if result.is_none() {
+                continue;
+            }
+            if let Ok(iter) = result.iter() {
+                for item in iter {
+                    let op = item?;
+                    apply_graph_op(&slf, py, &op)?;
+                }
+            }
         }
 
         let outputs =
@@ -777,6 +860,194 @@ impl ProjectContext {
             return Ok(None);
         };
         Ok(Some(outputs.builder.nodes[idx].clone_ref(py)))
+    }
+
+    /// Resolve a dotted FQN to either a declaration or a module node.
+    ///
+    /// Tries an exact decl match first, then an exact module match,
+    /// then walks back through dotted segments looking for an enclosing
+    /// decl (``pkg.lib.Cls.method`` resolves to ``pkg.lib.Cls`` because
+    /// methods don't get their own graph nodes). Returns ``None`` when
+    /// the fqname can't be found anywhere — never raises.
+    fn resolve(&self, py: Python<'_>, fqname: &str) -> PyResult<Option<Py<NativeNode>>> {
+        let outputs = self.outputs.borrow();
+        let outputs = outputs
+            .as_ref()
+            .ok_or_else(|| not_materialized("resolve"))?;
+        let mut prefix = fqname;
+        loop {
+            if let Some(idxs) = outputs.decl_by_fqname.get(prefix) {
+                if let Some(&idx) = idxs.first() {
+                    return Ok(Some(outputs.builder.nodes[idx].clone_ref(py)));
+                }
+            }
+            if let Some(&idx) = outputs.module_by_fqname.get(prefix) {
+                return Ok(Some(outputs.builder.nodes[idx].clone_ref(py)));
+            }
+            match prefix.rsplit_once('.') {
+                Some((parent, _)) => prefix = parent,
+                None => return Ok(None),
+            }
+        }
+    }
+
+    /// Return the module node + every transitive decl whose fqname
+    /// lives under ``module_fqn``.
+    ///
+    /// Models ``importlib.import_module(module_fqn)``: the module's
+    /// whole top-level surface plus everything its submodules expose.
+    /// Empty list when ``module_fqn`` doesn't resolve to a project
+    /// module.
+    fn module_surface(&self, py: Python<'_>, module_fqn: &str) -> PyResult<Vec<Py<NativeNode>>> {
+        let outputs = self.outputs.borrow();
+        let outputs = outputs
+            .as_ref()
+            .ok_or_else(|| not_materialized("module_surface"))?;
+        let Some(&module_idx) = outputs.module_by_fqname.get(module_fqn) else {
+            return Ok(Vec::new());
+        };
+        let mut out = vec![outputs.builder.nodes[module_idx].clone_ref(py)];
+        let prefix = format!("{module_fqn}.");
+        for (fqname, &idx) in &outputs.module_by_fqname {
+            if fqname.starts_with(&prefix) {
+                out.push(outputs.builder.nodes[idx].clone_ref(py));
+            }
+        }
+        for (fqname, idxs) in &outputs.decl_by_fqname {
+            if fqname.starts_with(&prefix) {
+                for &idx in idxs {
+                    out.push(outputs.builder.nodes[idx].clone_ref(py));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Every node whose ``path`` starts with the given prefix.
+    fn decls_under(&self, py: Python<'_>, path_prefix: &str) -> PyResult<Vec<Py<NativeNode>>> {
+        let outputs = self.outputs.borrow();
+        let outputs = outputs
+            .as_ref()
+            .ok_or_else(|| not_materialized("decls_under"))?;
+        Ok(outputs
+            .builder
+            .nodes
+            .iter()
+            .filter(|n| n.borrow(py).path.starts_with(path_prefix))
+            .map(|n| n.clone_ref(py))
+            .collect())
+    }
+
+    /// Every node whose ``path`` contains ``substring`` anywhere.
+    /// Useful for path-pattern plugins (``alembic/versions/``, ``.ignore.py``).
+    fn decls_matching(&self, py: Python<'_>, substring: &str) -> PyResult<Vec<Py<NativeNode>>> {
+        let outputs = self.outputs.borrow();
+        let outputs = outputs
+            .as_ref()
+            .ok_or_else(|| not_materialized("decls_matching"))?;
+        Ok(outputs
+            .builder
+            .nodes
+            .iter()
+            .filter(|n| n.borrow(py).path.contains(substring))
+            .map(|n| n.clone_ref(py))
+            .collect())
+    }
+
+    /// Every top-level decl whose simple name matches ``regex``.
+    /// Fills the gap the screenshot's API doesn't cover — needed by
+    /// :class:`ModuleDundersPlugin` (``__xxx__`` names),
+    /// :class:`PytestPlugin` (``test_*`` / ``Test*``), etc.
+    fn decls_matching_name(&self, py: Python<'_>, pattern: &str) -> PyResult<Vec<Py<NativeNode>>> {
+        let regex = regex::Regex::new(pattern)
+            .map_err(|e| PyValueError::new_err(format!("invalid regex {pattern:?}: {e}")))?;
+        let outputs = self.outputs.borrow();
+        let outputs = outputs
+            .as_ref()
+            .ok_or_else(|| not_materialized("decls_matching_name"))?;
+        let mut out = Vec::new();
+        for node_py in &outputs.builder.nodes {
+            let node = node_py.borrow(py);
+            if !matches!(
+                node.kind,
+                "function" | "class" | "variable" | "import" | "type_alias"
+            ) {
+                continue;
+            }
+            let simple = node.fqname.rsplit('.').next().unwrap_or("");
+            if regex.is_match(simple) {
+                out.push(node_py.clone_ref(py));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Forward closure: every node reachable from ``root`` by following
+    /// graph edges. ``skip_flags`` filters out edges whose flag mask
+    /// matches (pass ``EdgeFlags.DEAD_BRANCH.value`` to compute strict
+    /// reachability excluding dead branches).
+    #[pyo3(signature = (root, *, skip_flags = 0))]
+    fn descendants(
+        &self,
+        py: Python<'_>,
+        root: &NativeNode,
+        skip_flags: u32,
+    ) -> PyResult<Vec<Py<NativeNode>>> {
+        let outputs = self.outputs.borrow();
+        let outputs = outputs
+            .as_ref()
+            .ok_or_else(|| not_materialized("descendants"))?;
+        let root_idx = lookup_idx(&outputs.builder, root, "root")?;
+        Ok(bfs(outputs, root_idx, Direction::Forward, skip_flags)
+            .into_iter()
+            .map(|i| outputs.builder.nodes[i].clone_ref(py))
+            .collect())
+    }
+
+    /// Reverse closure: every node that can reach ``decl`` by following
+    /// graph edges. Used for ``why-alive`` and blast-radius scoping.
+    #[pyo3(signature = (decl, *, skip_flags = 0))]
+    fn ancestors(
+        &self,
+        py: Python<'_>,
+        decl: &NativeNode,
+        skip_flags: u32,
+    ) -> PyResult<Vec<Py<NativeNode>>> {
+        let outputs = self.outputs.borrow();
+        let outputs = outputs
+            .as_ref()
+            .ok_or_else(|| not_materialized("ancestors"))?;
+        let idx = lookup_idx(&outputs.builder, decl, "decl")?;
+        Ok(bfs(outputs, idx, Direction::Reverse, skip_flags)
+            .into_iter()
+            .map(|i| outputs.builder.nodes[i].clone_ref(py))
+            .collect())
+    }
+
+    /// Forward closure from every entrypoint-flagged node. The set of
+    /// dead decls is the complement against ``nodes()``.
+    #[pyo3(signature = (*, skip_flags = 0))]
+    fn reachable(&self, py: Python<'_>, skip_flags: u32) -> PyResult<Vec<Py<NativeNode>>> {
+        let outputs = self.outputs.borrow();
+        let outputs = outputs
+            .as_ref()
+            .ok_or_else(|| not_materialized("reachable"))?;
+        let mut seeds: Vec<usize> = Vec::new();
+        for (idx, node_py) in outputs.builder.nodes.iter().enumerate() {
+            if node_py.borrow(py).flags & NODE_FLAG_ENTRYPOINT != 0 {
+                seeds.push(idx);
+            }
+        }
+        let mut visited = HashSet::new();
+        for seed in seeds {
+            for i in bfs(outputs, seed, Direction::Forward, skip_flags) {
+                visited.insert(i);
+            }
+        }
+        Ok(visited
+            .into_iter()
+            .map(|i| outputs.builder.nodes[i].clone_ref(py))
+            .collect())
     }
 
     /// Return ``(module_node, [decls inside the block])`` for every
@@ -1379,6 +1650,113 @@ fn node_key_of(node: &NativeNode) -> NodeKey {
 /// Resolve a `NativeNode` reference to its builder-side index for an
 /// edge endpoint. Surfaces a precise `ValueError` (with `side`) when
 /// the node was never interned in this context.
+/// Dispatch a yielded ``GraphOp`` value to the ``ProjectContext``'s
+/// mutation methods. Plugins under the new model yield these instead
+/// of mutating the graph directly; we apply them after ``run`` returns
+/// so the plugin can't observe partial state mid-yield.
+/// Direction passed to :func:`bfs` — forward follows ``src -> dst``
+/// edges; reverse follows the inverse for ``ancestors``-style queries.
+#[derive(Clone, Copy)]
+enum Direction {
+    Forward,
+    Reverse,
+}
+
+/// Generic BFS over the build graph. ``skip_flags`` filters edges whose
+/// flag mask intersects (any bit) — pass ``0`` to follow every edge.
+/// Returns the set of reached node indices including ``start``.
+fn bfs(
+    outputs: &BuildOutputs,
+    start: usize,
+    direction: Direction,
+    skip_flags: u32,
+) -> HashSet<usize> {
+    let mut visited: HashSet<usize> = HashSet::new();
+    let mut stack: Vec<usize> = vec![start];
+    while let Some(i) = stack.pop() {
+        if !visited.insert(i) {
+            continue;
+        }
+        for &(src, dst, flags) in &outputs.builder.edges {
+            if skip_flags != 0 && flags & skip_flags != 0 {
+                continue;
+            }
+            let next = match direction {
+                Direction::Forward => {
+                    if src == i {
+                        dst
+                    } else {
+                        continue;
+                    }
+                }
+                Direction::Reverse => {
+                    if dst == i {
+                        src
+                    } else {
+                        continue;
+                    }
+                }
+            };
+            if !visited.contains(&next) {
+                stack.push(next);
+            }
+        }
+    }
+    visited
+}
+
+fn apply_graph_op(ctx: &Py<ProjectContext>, py: Python<'_>, op: &Bound<'_, PyAny>) -> PyResult<()> {
+    if let Ok(add_edge) = op.extract::<PyRef<AddEdge>>() {
+        let src = add_edge.src.borrow(py);
+        let dst = add_edge.dst.borrow(py);
+        return ctx.borrow(py).add_edge(&src, &dst);
+    }
+    if let Ok(add_ep) = op.extract::<PyRef<AddEntrypoint>>() {
+        // Mint a synthetic "<marker>:<decl.fqname>" entrypoint node and
+        // edge it at the decl so reachability flows in. Mirrors the
+        // existing ``mark_entrypoints`` helper in the libcst pipeline.
+        let decl = add_ep.decl.borrow(py);
+        let marker_fqname = format!("{}:{}", add_ep.marker, decl.fqname);
+        let path = decl.path.clone();
+        drop(decl);
+        let this = ctx.borrow(py);
+        let marker = this.add_node(
+            py,
+            marker_fqname,
+            path,
+            "synthetic",
+            0,
+            0,
+            0,
+            0,
+            NODE_FLAG_ENTRYPOINT,
+        )?;
+        let marker_borrow = marker.borrow(py);
+        let decl = add_ep.decl.borrow(py);
+        this.add_edge(&marker_borrow, &decl)?;
+        return Ok(());
+    }
+    if let Ok(add_node) = op.extract::<PyRef<AddNode>>() {
+        let this = ctx.borrow(py);
+        this.add_node(
+            py,
+            add_node.fqname.clone(),
+            add_node.path.clone(),
+            add_node.kind,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )?;
+        return Ok(());
+    }
+    Err(PyValueError::new_err(format!(
+        "expected a GraphOp (AddEdge / AddEntrypoint / AddNode), got {:?}",
+        op.get_type().name()?,
+    )))
+}
+
 fn lookup_idx(builder: &GraphBuilder, node: &NativeNode, side: &str) -> PyResult<usize> {
     builder
         .node_index
@@ -4267,6 +4645,9 @@ fn dead_cst_ty_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<NativeGraph>()?;
     m.add_class::<Project>()?;
     m.add_class::<ProjectContext>()?;
+    m.add_class::<AddEdge>()?;
+    m.add_class::<AddEntrypoint>()?;
+    m.add_class::<AddNode>()?;
     Ok(())
 }
 

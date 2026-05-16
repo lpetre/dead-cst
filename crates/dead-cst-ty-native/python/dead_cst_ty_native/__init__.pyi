@@ -6,7 +6,20 @@ having to introspect the binary module. Kept hand-written — pyo3
 doesn't generate stubs and the public API is small.
 """
 
-from typing import Any, Iterable, Protocol
+from typing import Any, Iterable, Literal, Protocol
+
+# The set of stable kind strings ``NativeNode.kind`` can carry. Use a
+# ``Literal`` rather than ``str`` so the type checker catches typos at
+# plugin author time.
+NodeKind = Literal[
+    "function",
+    "class",
+    "variable",
+    "import",
+    "type_alias",
+    "module",
+    "synthetic",
+]
 
 class Import:
     module: str
@@ -22,7 +35,7 @@ class Import:
 
 class NativeNode:
     fqname: str
-    kind: str
+    kind: NodeKind
     path: str
     start_line: int
     start_column: int
@@ -30,6 +43,40 @@ class NativeNode:
     end_column: int
     flags: int
     imports: Import | None
+
+# ----- Graph operations (yielded from plugin.run) ------------------------
+
+class AddEdge:
+    """Edge from ``src`` to ``dst``. ``flags`` carries DEAD_BRANCH /
+    future edge classifications."""
+
+    src: NativeNode
+    dst: NativeNode
+    flags: int
+
+    def __init__(self, src: NativeNode, dst: NativeNode, *, flags: int = 0) -> None: ...
+
+class AddEntrypoint:
+    """Mark ``decl`` as an entrypoint. ``marker`` is a self-documenting
+    label for ``why-alive`` (e.g. ``"<celery-worker>"``)."""
+
+    decl: NativeNode
+    marker: str
+
+    def __init__(self, decl: NativeNode, *, marker: str) -> None: ...
+
+class AddNode:
+    """Mint a synthetic intermediate node. Use rarely — ``AddEntrypoint``
+    covers the common "this is alive because of X" pattern without
+    needing a graph node for the reason."""
+
+    fqname: str
+    kind: NodeKind
+    path: str
+
+    def __init__(self, fqname: str, *, path: str, kind: NodeKind = "synthetic") -> None: ...
+
+GraphOp = AddEdge | AddEntrypoint | AddNode
 
 class NativeGraph:
     nodes: list[NativeNode]
@@ -49,7 +96,7 @@ class Project:
     def build(self) -> NativeGraph: ...
 
 class _ProjectPluginLike(Protocol):
-    def run(self, ctx: "ProjectContext") -> None: ...
+    def run(self, ctx: "ProjectContext") -> Iterable[GraphOp] | None: ...
 
 class ProjectContext:
     project_root: str
@@ -79,6 +126,14 @@ class ProjectContext:
         flags: int = ...,
     ) -> NativeNode: ...
     def add_edge(self, src: NativeNode, dst: NativeNode) -> None: ...
+    def resolve(self, fqname: str) -> NativeNode | None: ...
+    def module_surface(self, module_fqn: str) -> list[NativeNode]: ...
+    def decls_under(self, path_prefix: str) -> list[NativeNode]: ...
+    def decls_matching(self, substring: str) -> list[NativeNode]: ...
+    def decls_matching_name(self, pattern: str) -> list[NativeNode]: ...
+    def descendants(self, root: NativeNode, *, skip_flags: int = 0) -> list[NativeNode]: ...
+    def ancestors(self, decl: NativeNode, *, skip_flags: int = 0) -> list[NativeNode]: ...
+    def reachable(self, *, skip_flags: int = 0) -> list[NativeNode]: ...
     def find_module_dunders(self) -> list[NativeNode]: ...
     def find_imports_of(self, module_name: str) -> list[NativeNode]: ...
     def find_declarations(self, fqname: str) -> list[NativeNode]: ...
