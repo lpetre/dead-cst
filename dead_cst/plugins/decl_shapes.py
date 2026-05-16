@@ -154,19 +154,22 @@ class DecoratedDeclPlugin:
 
         decorated = ctx.find_decorated_decls(self.decorator_module, names)
         constructed = ctx.find_instance_constructions(self.decorator_module, names)
+        prefix = self.package_prefix
 
-        def in_scope(node: "native.NativeNode") -> bool:
-            if not self.package_prefix:
+        def in_scope(path: str) -> bool:
+            if not prefix:
                 return True
-            prefix = self.package_prefix
-            return node.fqname == prefix or node.fqname.startswith(prefix + ".")
+            module = ctx.module_for(path)
+            if module is None:
+                return False
+            return module.fqname == prefix or module.fqname.startswith(prefix + ".")
 
         seeds_by_path: dict[str, list[native.NativeNode]] = {}
         for node in decorated:
-            if in_scope(_module_for(node, ctx)):
+            if in_scope(node.path):
                 seeds_by_path.setdefault(node.path, []).append(node)
         for var_node, _kind in constructed:
-            if in_scope(_module_for(var_node, ctx)):
+            if in_scope(var_node.path):
                 seeds_by_path.setdefault(var_node.path, []).append(var_node)
 
         for path, targets in seeds_by_path.items():
@@ -486,7 +489,7 @@ class DispatchAppPlugin:
         targets = self._targets
         if not targets:
             return
-        target_names = list(targets) if isinstance(targets, dict) else list(targets)
+        target_names = list(targets)
         decorator_attrs = list(self.registration_decorators)
 
         direct = ctx.find_instance_constructions(self.app_module, target_names)
@@ -521,21 +524,8 @@ class DispatchAppPlugin:
                     ctx.add_edge(decl_node, marker)
 
         for owner_name, handler_func in handlers:
-            owners = direct_by_owner.get((handler_func.path, owner_name), [])
-            for var_node, _kind in owners:
+            for var_node, _kind in direct_by_owner.get((handler_func.path, owner_name), []):
                 ctx.add_edge(var_node, handler_func)
-            # Cross-file factory-resolved owners are not handled on the
-            # rust path yet; same-file direct constructions cover the
-            # bulk of tests.
-
-
-def _module_for(node: "native.NativeNode", ctx: "native.ProjectContext") -> "native.NativeNode":
-    """Return the module node owning ``node``'s file, or the node itself
-    when no module sibling is found (defensive — every decl has one)."""
-    for n in ctx.nodes():
-        if n.kind == "module" and n.path == node.path:
-            return n
-    return node
 
 
 def _read_string_list_with_positions(

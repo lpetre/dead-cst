@@ -46,6 +46,7 @@ recognized.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Mapping
 
 import libcst as cst
@@ -116,18 +117,9 @@ class CeleryPlugin(DispatchAppPlugin):
         )
 
     def run(self, ctx: "native.ProjectContext") -> None:
-        # The base class's run() handles ``X = Celery(...)`` + ``@app.task``.
         DispatchAppPlugin.run(self, ctx)
-
-        # ``@shared_task`` / ``@shared_task(...)`` adds an appless channel
-        # not covered by DispatchAppPlugin. Group by file so the synthetic
-        # shape matches the libcst payload (one ``<celery-shared>:<basename>``
-        # synth per file).
-        from pathlib import Path
-
+        # ``@shared_task`` is appless and not covered by DispatchAppPlugin.
         funcs = ctx.find_decorated_decls("celery", list(_SHARED_TASK_NAMES))
-        if not funcs:
-            return
         by_path: dict[str, list[native.NativeNode]] = {}
         for func in funcs:
             by_path.setdefault(func.path, []).append(func)

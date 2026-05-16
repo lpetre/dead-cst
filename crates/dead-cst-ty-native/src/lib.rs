@@ -677,6 +677,23 @@ impl ProjectContext {
         Ok(None)
     }
 
+    /// Return the module node owning ``path``, if any. O(1) — backed
+    /// by the same ``module_nodes_by_file`` index `find_main_blocks`
+    /// uses, so plugins don't have to scan ``nodes()`` per call.
+    fn module_for(&self, py: Python<'_>, path: &str) -> PyResult<Option<Py<NativeNode>>> {
+        let outputs = self.outputs.borrow();
+        let outputs = outputs
+            .as_ref()
+            .ok_or_else(|| not_materialized("module_for"))?;
+        let Some(&file) = outputs.path_to_file.get(path) else {
+            return Ok(None);
+        };
+        let Some(&idx) = outputs.module_nodes_by_file.get(&file) else {
+            return Ok(None);
+        };
+        Ok(Some(outputs.builder.nodes[idx].clone_ref(py)))
+    }
+
     /// Return ``(module_node, [decls inside the block])`` for every
     /// file with a top-level ``if __name__ == "__main__":`` block.
     ///

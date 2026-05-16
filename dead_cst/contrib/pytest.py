@@ -3,11 +3,12 @@ functions alive."""
 
 from __future__ import annotations
 
-from libcst.metadata import CodeRange
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Iterable
 
 import libcst as cst
+from libcst.metadata import CodeRange
 
 from ..graph import NodeFlags, SymbolNode
 from ..plugins._core import (
@@ -113,14 +114,7 @@ class PytestPlugin:
         return ()
 
     def run(self, ctx: native.ProjectContext) -> None:
-        from pathlib import Path
-
-        # Group decls by their module so we can emit one synthetic per
-        # conftest / test file rather than per-decl.
         nodes = list(ctx.nodes())
-        modules_by_path: dict[str, native.NativeNode] = {
-            n.path: n for n in nodes if n.kind == "module"
-        }
         decls_by_path: dict[str, list[native.NativeNode]] = {}
         for n in nodes:
             if n.kind not in ("function", "class", "variable"):
@@ -128,7 +122,7 @@ class PytestPlugin:
             decls_by_path.setdefault(n.path, []).append(n)
 
         for path, decls in decls_by_path.items():
-            module = modules_by_path.get(path)
+            module = ctx.module_for(path)
             if module is None:
                 continue
             filename = Path(path).name
@@ -139,14 +133,11 @@ class PytestPlugin:
                 if test_decls:
                     _mark_seed(ctx, f"{PYTEST_TESTS_PREFIX}{module.fqname}", path, test_decls)
 
-        # ``@pytest.fixture`` (and bare ``@fixture``) decorators
-        # anywhere in the project. Group by module so the synthetic
-        # mirrors the libcst payload shape.
         fixtures_by_path: dict[str, list[native.NativeNode]] = {}
         for func in ctx.find_decorated_decls("pytest", ["fixture"]):
             fixtures_by_path.setdefault(func.path, []).append(func)
         for path, fixtures in fixtures_by_path.items():
-            module = modules_by_path.get(path)
+            module = ctx.module_for(path)
             if module is None:
                 continue
             _mark_seed(ctx, f"{PYTEST_FIXTURES_PREFIX}{module.fqname}", path, fixtures)

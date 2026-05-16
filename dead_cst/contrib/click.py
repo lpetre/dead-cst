@@ -124,18 +124,10 @@ class ClickPlugin(DecoratedDeclPlugin):
         return make_payload(edges=edges)
 
     def run(self, ctx: "native.ProjectContext") -> None:
-        # Discover click groups (no entrypoint seeding — groups stay
-        # alive via project.scripts / __main__ / explicit -e).
         decorated = ctx.find_decorated_decls(self.decorator_module, list(self.decorator_names))
         constructed = ctx.find_instance_constructions(
             self.decorator_module, list(self.constructor_names)
         )
-        # ``(path, simple_name) → [var/func nodes]`` for owner-name lookup
-        # at handler time. The libcst plugin's fixpoint expansion (nested
-        # ``@<group>.group(...)`` discovers new groups) is reproduced
-        # here by iterating over handler edges: a handler decorated
-        # ``@<group>.group(...)`` becomes a group itself, eligible to own
-        # further handlers, repeat until stable.
         groups_by_owner: dict[tuple[str, str], list[native.NativeNode]] = {}
 
         def add_group(node: "native.NativeNode") -> None:
@@ -148,23 +140,27 @@ class ClickPlugin(DecoratedDeclPlugin):
             add_group(var_node)
 
         handlers = ctx.find_handler_decorators(list(_REGISTRATION_DECORATORS))
-        emitted: set[tuple[int, int]] = set()
+        # Precompute the set of (path, fqname, owner_name) triples for
+        # handlers decorated with the subgroup decorator — used inside
+        # the fixpoint to upgrade a handler to a group when its owner
+        # is already known. Querying inside the loop would be O(N²).
+        subgroup_links: set[tuple[str, str, str]] = {
+            (h.path, h.fqname, owner)
+            for owner, h in ctx.find_handler_decorators(list(_SUBGROUP_DECORATOR))
+        }
+
+        emitted: set[tuple[str, str, str, str]] = set()
         changed = True
         while changed:
             changed = False
             for owner_name, handler_func in handlers:
-                owners = groups_by_owner.get((handler_func.path, owner_name), [])
-                if not owners:
-                    continue
-                for owner in owners:
-                    key = (id(owner), id(handler_func))
+                for owner in groups_by_owner.get((handler_func.path, owner_name), []):
+                    key = (owner.path, owner.fqname, handler_func.path, handler_func.fqname)
                     if key in emitted:
                         continue
                     emitted.add(key)
                     ctx.add_edge(owner, handler_func)
-                    # A handler decorated ``@<known>.group(...)`` becomes
-                    # a group itself — check the decorator name.
-                    if _decorated_with_subgroup(ctx, handler_func, owner_name):
+                    if (handler_func.path, handler_func.fqname, owner_name) in subgroup_links:
                         add_group(handler_func)
                         changed = True
 
@@ -193,15 +189,3 @@ class ClickPlugin(DecoratedDeclPlugin):
                         changed = True
                         break
         return instances
-
-
-def _decorated_with_subgroup(
-    ctx: "native.ProjectContext", func: "native.NativeNode", owner_name: str
-) -> bool:
-    """Did ``@<owner_name>.group(...)`` register ``func``? Re-walks the
-    handler-decorator list; small N (one function call), so the linear
-    scan is fine for the prototype."""
-    for o, h in ctx.find_handler_decorators(list(_SUBGROUP_DECORATOR)):
-        if h.fqname == func.fqname and h.path == func.path and o == owner_name:
-            return True
-    return False

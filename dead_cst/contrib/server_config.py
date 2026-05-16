@@ -92,23 +92,15 @@ class ServerConfigPlugin:
         return ()
 
     def run(self, ctx: native.ProjectContext) -> None:
-        nodes = list(ctx.nodes())
-        # Group decls by their module so we can mint one synthetic per
-        # config file rather than per-decl.
-        modules_by_path: dict[str, native.NativeNode] = {
-            n.path: n for n in nodes if n.kind == "module"
-        }
         targets_by_path: dict[str, list[native.NativeNode]] = {}
-        for n in nodes:
+        for n in ctx.nodes():
             if Path(n.path).name not in self.filenames:
                 continue
-            if n.kind == "module":
-                targets_by_path.setdefault(n.path, []).append(n)
-            elif n.kind in ("function", "class", "variable", "import"):
+            if n.kind in ("module", "function", "class", "variable", "import"):
                 targets_by_path.setdefault(n.path, []).append(n)
 
         for path, targets in targets_by_path.items():
-            module = modules_by_path.get(path)
+            module = ctx.module_for(path)
             if module is None:
                 continue
             marker = ctx.add_node(
