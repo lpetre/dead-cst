@@ -145,32 +145,42 @@ def _ensure_flux0_venv(flux0_root: Path) -> Path:
 
 
 if HAS_RUST:
+    _NO_NODE_FLAGS = NodeFlags(0)
+    _NO_EDGE_FLAGS = EdgeFlags(0)
 
     def _bridge_materialize(graph: "native.NativeGraph") -> "SymbolGraph":
         """Same as ``tests/prototype/_bridge.materialize``, inlined here."""
         out = SymbolGraph()
-        symbol_nodes = [
-            SymbolNode(
-                fqname=n.fqname,
-                type=n.kind,  # type: ignore[arg-type]
-                path=Path(n.path),
-                position=CodeRange(
-                    CodePosition(n.start_line, n.start_column),
-                    CodePosition(n.end_line, n.end_column),
-                ),
-                imports=(
-                    DCImport(module=n.imports.module, decl=n.imports.decl, star=n.imports.star)
-                    if n.imports is not None
-                    else None
-                ),
-                flags=NodeFlags(n.flags),
+        path_cache: dict[str, Path] = {}
+        symbol_nodes: list[SymbolNode] = []
+        for n in graph.nodes:
+            path = path_cache.get(n.path)
+            if path is None:
+                path = Path(n.path)
+                path_cache[n.path] = path
+            flags = _NO_NODE_FLAGS if n.flags == 0 else NodeFlags(n.flags)
+            symbol_nodes.append(
+                SymbolNode(
+                    fqname=n.fqname,
+                    type=n.kind,  # type: ignore[arg-type]
+                    path=path,
+                    position=CodeRange(
+                        CodePosition(n.start_line, n.start_column),
+                        CodePosition(n.end_line, n.end_column),
+                    ),
+                    imports=(
+                        DCImport(module=n.imports.module, decl=n.imports.decl, star=n.imports.star)
+                        if n.imports is not None
+                        else None
+                    ),
+                    flags=flags,
+                )
             )
-            for n in graph.nodes
-        ]
         for sn in symbol_nodes:
             out.add(sn)
         for src, dst, flags in graph.edges:
-            out.add_edge(symbol_nodes[src], symbol_nodes[dst], EdgeFlags(flags))
+            edge_flags = _NO_EDGE_FLAGS if flags == 0 else EdgeFlags(flags)
+            out.add_edge(symbol_nodes[src], symbol_nodes[dst], edge_flags)
         return out
 
 
