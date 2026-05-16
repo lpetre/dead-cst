@@ -364,12 +364,31 @@ STAR_REEXPORT_EDGES = frozenset(
         ),
         pytest.param(
             "from p.functions import *\ndef a(): f()",
-            STAR_REEXPORT_EDGES
-            | {
-                "p.x -> p.functions",
-                "p.x -> p.functions.f",
-                "p.x -> p.functions.g",
-                "p.x.a -> p.x",
+            {
+                # libcst's per-name synthetic aliases — a workaround
+                # for its inability to resolve uses *through* a star
+                # import.
+                "libcst": STAR_REEXPORT_EDGES
+                | {
+                    "p.x -> p.functions",
+                    "p.x -> p.functions.f",
+                    "p.x -> p.functions.g",
+                    "p.x.a -> p.x",
+                },
+                # The rust backend mints one node per `from X import *`
+                # statement (named `<mod>.*<src>`), with a single
+                # outgoing edge to the upstream module. Use sites
+                # route through this node (alias edge) and emit the
+                # standard parallel upstream module/decl edges via
+                # ty's name resolution (Principle 2).
+                "rust": {
+                    "p.x.*p.functions -> p.x",
+                    "p.x.*p.functions -> p.functions",
+                    "p.x.a -> p.x",
+                    "p.x.a -> p.x.*p.functions",
+                    "p.x.a -> p.functions",
+                    "p.x.a -> p.functions.f",
+                },
             },
             id="star-import-fans-out-to-all-decls",
         ),
@@ -475,9 +494,20 @@ STAR_REEXPORT_EDGES = frozenset(
         ),
     ],
 )
-def test_imports(build_decl_graph, assert_edges, src, expected_extra_edges):
+def test_imports(build_decl_graph, assert_edges, backend, src, expected_extra_edges):
+    # A case can declare divergent expectations per backend by passing
+    # a `{"libcst": {...}, "rust": {...}}` dict instead of a single
+    # set — the libcst pipeline minted per-name synthetic aliases for
+    # star imports as a workaround for its inability to resolve uses
+    # through `from X import *`, but the rust backend leans on ty's
+    # name resolution and only mints one node per star statement.
+    extras = (
+        expected_extra_edges[backend]
+        if isinstance(expected_extra_edges, dict)
+        else expected_extra_edges
+    )
     graph = build_decl_graph({**IMPORT_TEST_FILES, "p/x.py": src})
-    assert_edges(graph, IMPORT_BASE_EDGES | expected_extra_edges)
+    assert_edges(graph, IMPORT_BASE_EDGES | extras)
 
 
 @pytest.mark.parametrize(
@@ -872,20 +902,38 @@ def test_star_reexport_shadowed_by_real_decl(build_decl_graph, assert_edges):
     assert "consumer.g -> other.g" not in edge_strs
 
 
-def test_star_reexport_is_skipped_by_codemod(build_decl_graph, tmp_path, assert_edges):
-    """Star re-export synthetics carry ``STAR_REEXPORT`` and stay out of the codemod's hands."""
-    from dead_cst.graph import NodeFlags
+def test_star_reexport_is_skipped_by_codemod(build_decl_graph, backend):
+    """Star re-export imports surface as a single node per statement,
+    distinguishable from regular imports so the codemod doesn't try
+    to drop them as normal `unused import` candidates.
 
+    The libcst pipeline minted per-name synthetic aliases and flagged
+    them with `NodeFlags.STAR_REEXPORT`; the rust backend mints one
+    node per statement named `<mod>.*<src>` with `kind="import"` and
+    an `imports.star=True` payload — the `*` prefix is the marker.
+    """
     graph = build_decl_graph(
         {
             "pkg/__init__.py": "from pkg._internal import *\n",
             "pkg/_internal.py": "def g(): pass\n",
         }
     )
-    reexports = [
-        n for n in graph.nodes if n.fqname == "pkg.g" and n.flags & NodeFlags.STAR_REEXPORT
-    ]
-    assert len(reexports) == 1, [n.fqname for n in graph.nodes if "pkg" in n.fqname]
+    if backend == "rust":
+        # One star node per `from X import *`, named `*<src>`.
+        star_nodes = [
+            n for n in graph.nodes if n.fqname == "pkg.*pkg._internal" and n.type == "import"
+        ]
+        assert len(star_nodes) == 1, [n.fqname for n in graph.nodes if "pkg" in n.fqname]
+        assert star_nodes[0].imports is not None
+        assert star_nodes[0].imports.star is True
+        assert star_nodes[0].imports.module == "pkg._internal"
+    else:
+        from dead_cst.graph import NodeFlags
+
+        reexports = [
+            n for n in graph.nodes if n.fqname == "pkg.g" and n.flags & NodeFlags.STAR_REEXPORT
+        ]
+        assert len(reexports) == 1, [n.fqname for n in graph.nodes if "pkg" in n.fqname]
 
 
 def test_star_reexport_inherits_exported_from_importing_module(tmp_path, make_analysis):

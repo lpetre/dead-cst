@@ -1885,7 +1885,40 @@ fn ingest_decls(
         let PlaceExprRef::Symbol(symbol) = place_table.place(place_id) else {
             continue;
         };
-        let local_name = symbol.name().as_str().to_string();
+        // The per-name binding (e.g. `f`, `g`) ty sees. We keep this
+        // for the `globals_by_name` / `star_reexports` maps that
+        // Phase 2's cross-module chain walk uses to chase a
+        // `from A import g` through A's `from B import *`.
+        let per_name = symbol.name().as_str().to_string();
+
+        // `from X import *` — ty produces one `StarImport` definition
+        // per name brought in, but the graph holds *one* node per
+        // statement: the import statement itself is the local thing
+        // that should be kept alive by use sites, and ty's name
+        // resolution still routes each use to its specific upstream.
+        // The libcst per-name synthetic alias was a workaround for
+        // libcst's inability to resolve uses through star imports —
+        // we don't need it here.
+        //
+        // Collapse by giving every per-name `StarImport` from the
+        // same statement a shared `*<source>` local name; combined
+        // with the shared `target_range` (the `*` token), they all
+        // intern to the same `NodeKey` and therefore the same
+        // `node_idx`. The per-name lookup maps (`globals_by_name`,
+        // `star_reexports`) keep using each per-name as their key,
+        // all pointing at this single node — so a downstream
+        // `from A import g` still finds the star alias by name and
+        // can chase through it to B.
+        let local_name = match kind {
+            DefinitionKind::StarImport(k) => {
+                let stmt = k.import(&parsed);
+                let src = ModuleName::from_import_statement(db, file, stmt)
+                    .map(|n| n.as_str().to_string())
+                    .unwrap_or_default();
+                format!("*{src}")
+            }
+            _ => per_name.clone(),
+        };
 
         let target_range = kind.target_range(&parsed);
         let (mut sl, mut sc, el, ec) = position(&line_index, &source, target_range);
@@ -1964,7 +1997,13 @@ fn ingest_decls(
         // and the query callers care about the end-of-scope live binding.
         decl_by_name_range.insert((file, range_key(target_range)), node_idx);
 
-        let name_key = (file, local_name.clone());
+        // Lookup maps key by the *per-name* (the actual bound symbol
+        // each ty `StarImport` corresponds to), not the node's
+        // `local_name` — the star node's collapsed `*<src>` fqname
+        // would otherwise miss `from A import g` chains that probe
+        // for the per-name `"g"`. For non-star imports `per_name`
+        // and `local_name` are identical so this is a no-op there.
+        let name_key = (file, per_name.clone());
         if let Some(spec) = import_spec {
             // Star-reexport synthetics need their upstream tracked so
             // Phase 2 can walk a `from A import g` resolution through
@@ -2175,17 +2214,18 @@ fn emit_import_edges(
                 globals_by_name,
                 star_reexports,
             )?,
-            DefinitionKind::StarImport(k) => resolve_from_imported(
-                py,
-                db,
-                file,
-                k.import(&parsed),
-                place_table.symbol(k.symbol_id()).name().as_str(),
-                builder,
-                module_nodes,
-                globals_by_name,
-                star_reexports,
-            )?,
+            // `from X import *` — no per-name fan-out edge. ty's
+            // `definitions_for_imported_symbol` would resolve each
+            // per-name `StarImport` to its specific upstream decl,
+            // but we collapse the per-name aliases to one node per
+            // statement (see `ingest_decls`) and don't want N edges
+            // pointing at the same alias. The from-style parallel
+            // path below still emits `alias → upstream module` once,
+            // which is exactly what carries reachability under the
+            // new model — uses of star-bound names emit their own
+            // parallel `use → upstream module / upstream decl` edges
+            // via `emit_upstream` and ty's name resolution.
+            DefinitionKind::StarImport(_) => None,
             _ => continue,
         };
         if let Some(target_idx) = target {
