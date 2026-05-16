@@ -7,15 +7,19 @@ import re
 from dead_cst.plugins import ExplicitEntrypointPlugin
 
 
-def test_explicit_entrypoint_by_fqname(make_analysis, write_files, reachable_fqnames):
-    write_files({"pkg/__init__.py": "", "pkg/a.py": "def f(): pass"})
-    graph = make_analysis(plugins=[ExplicitEntrypointPlugin(specs=["pkg.a.f"])]).materialize_all()
+def test_explicit_entrypoint_by_fqname(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
+        {"pkg/__init__.py": "", "pkg/a.py": "def f(): pass"},
+        [ExplicitEntrypointPlugin(specs=["pkg.a.f"])],
+    )
     assert "pkg.a.f" in reachable_fqnames(graph)
 
 
-def test_explicit_entrypoint_by_relpath(make_analysis, write_files, reachable_fqnames):
-    write_files({"pkg/__init__.py": "", "pkg/a.py": "def f(): pass"})
-    graph = make_analysis(plugins=[ExplicitEntrypointPlugin(specs=["pkg/a.py"])]).materialize_all()
+def test_explicit_entrypoint_by_relpath(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
+        {"pkg/__init__.py": "", "pkg/a.py": "def f(): pass"},
+        [ExplicitEntrypointPlugin(specs=["pkg/a.py"])],
+    )
     assert {"pkg.a", "pkg.a.f"} <= reachable_fqnames(graph)
 
 

@@ -45,6 +45,8 @@ from ..plugins._core import (
 from ..plugins.decl_shapes import DecoratedDeclPlugin
 
 if TYPE_CHECKING:
+    import dead_cst_ty_native as native
+
     from ..graph import VisitorPayload
 
 # Attribute names a Click ``Group`` uses to register a callable. Matched
@@ -120,6 +122,47 @@ class ClickPlugin(DecoratedDeclPlugin):
         if not edges:
             return None
         return make_payload(edges=edges)
+
+    def run(self, ctx: "native.ProjectContext") -> None:
+        decorated = ctx.find_decorated_decls(self.decorator_module, list(self.decorator_names))
+        constructed = ctx.find_instance_constructions(
+            self.decorator_module, list(self.constructor_names)
+        )
+        groups_by_owner: dict[tuple[str, str], list[native.NativeNode]] = {}
+
+        def add_group(node: "native.NativeNode") -> None:
+            simple = node.fqname.rsplit(".", 1)[-1]
+            groups_by_owner.setdefault((node.path, simple), []).append(node)
+
+        for node in decorated:
+            add_group(node)
+        for var_node, _kind in constructed:
+            add_group(var_node)
+
+        handlers = ctx.find_handler_decorators(list(_REGISTRATION_DECORATORS))
+        # Precompute the set of (path, fqname, owner_name) triples for
+        # handlers decorated with the subgroup decorator — used inside
+        # the fixpoint to upgrade a handler to a group when its owner
+        # is already known. Querying inside the loop would be O(N²).
+        subgroup_links: set[tuple[str, str, str]] = {
+            (h.path, h.fqname, owner)
+            for owner, h in ctx.find_handler_decorators(list(_SUBGROUP_DECORATOR))
+        }
+
+        emitted: set[tuple[str, str, str, str]] = set()
+        changed = True
+        while changed:
+            changed = False
+            for owner_name, handler_func in handlers:
+                for owner in groups_by_owner.get((handler_func.path, owner_name), []):
+                    key = (owner.path, owner.fqname, handler_func.path, handler_func.fqname)
+                    if key in emitted:
+                        continue
+                    emitted.add(key)
+                    ctx.add_edge(owner, handler_func)
+                    if (handler_func.path, handler_func.fqname, owner_name) in subgroup_links:
+                        add_group(handler_func)
+                        changed = True
 
     def _find_names(self, module: cst.Module, imports: dict[str, str]) -> set[str]:
         """Find Click groups, including nested ``@<known_group>.group(...)``.

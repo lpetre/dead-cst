@@ -1,13 +1,20 @@
-"""Tests for :class:`ModuleDundersPlugin`."""
+"""Tests for :class:`ModuleDundersPlugin`.
+
+Runs against both backends via :func:`build_plugin_graph` so the rust
+``ProjectContext`` plugin protocol is exercised against the same scenarios
+as libcst's ``observe`` / ``finalize`` pair.
+"""
 
 from __future__ import annotations
 
 from dead_cst.plugins import ModuleDundersPlugin
 
 
-def test_keeps_all_alive(make_analysis, write_files, reachable_fqnames):
-    write_files({"pkg/__init__.py": '__all__ = ["a"]\na = 1'})
-    graph = make_analysis(plugins=[ModuleDundersPlugin()]).materialize_all()
+def test_keeps_all_alive(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
+        {"pkg/__init__.py": '__all__ = ["a"]\na = 1'},
+        [ModuleDundersPlugin()],
+    )
     reached = reachable_fqnames(graph)
     assert "pkg.__all__" in reached
     # The visitor wires __all__ -> decl edges for string-literal entries,
@@ -15,30 +22,30 @@ def test_keeps_all_alive(make_analysis, write_files, reachable_fqnames):
     assert "pkg.a" in reached
 
 
-def test_keeps_other_dunders_alive(make_analysis, write_files, reachable_fqnames):
-    write_files(
+def test_keeps_other_dunders_alive(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "pkg/__init__.py": (
                 '__version__ = "1.0.0"\n__author__ = "someone"\n__license__ = "MIT"\nunused = 1\n'
             ),
-        }
+        },
+        [ModuleDundersPlugin()],
     )
-    graph = make_analysis(plugins=[ModuleDundersPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert {"pkg.__version__", "pkg.__author__", "pkg.__license__"} <= reached
     # plain (non-dunder) variables are still dead absent another entrypoint
     assert "pkg.unused" not in reached
 
 
-def test_keeps_future_imports_alive(make_analysis, write_files, reachable_fqnames):
-    write_files(
+def test_keeps_future_imports_alive(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "pkg/__init__.py": (
                 "from __future__ import annotations\nfrom __future__ import division\nunused = 1\n"
             ),
-        }
+        },
+        [ModuleDundersPlugin()],
     )
-    graph = make_analysis(plugins=[ModuleDundersPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     # The local bindings of ``from __future__ import X`` are kept alive
     # even though ``X`` is not a dunder name -- the import itself is a
@@ -47,29 +54,27 @@ def test_keeps_future_imports_alive(make_analysis, write_files, reachable_fqname
     assert "pkg.unused" not in reached
 
 
-def test_ignores_non_future_imports_with_plain_names(make_analysis, write_files, reachable_fqnames):
-    write_files(
-        {
-            "pkg/__init__.py": "from os import path\n",
-        }
+def test_ignores_non_future_imports_with_plain_names(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
+        {"pkg/__init__.py": "from os import path\n"},
+        [ModuleDundersPlugin()],
     )
-    graph = make_analysis(plugins=[ModuleDundersPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     # Non-``__future__`` imports of plain names stay dead absent another entrypoint.
     assert "pkg.path" not in reached
 
 
-def test_ignores_non_dunder_underscore_names(make_analysis, write_files, reachable_fqnames):
-    write_files(
+def test_ignores_non_dunder_underscore_names(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "pkg/__init__.py": (
                 "_private = 1\n"
                 "__mangled = 2\n"  # leading dunder only
                 "trailing__ = 3\n"  # trailing dunder only
             ),
-        }
+        },
+        [ModuleDundersPlugin()],
     )
-    graph = make_analysis(plugins=[ModuleDundersPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "pkg._private" not in reached
     assert "pkg.__mangled" not in reached

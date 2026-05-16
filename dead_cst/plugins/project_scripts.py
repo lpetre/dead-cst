@@ -8,10 +8,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterable
 
+from ..graph import NodeFlags
 from ..resolvers import load_toml
 from ._core import GraphOp, ObserveContext, PluginContext, mark_entrypoints
 
 if TYPE_CHECKING:
+    import dead_cst_ty_native as native
+
     from ..graph import VisitorPayload
 
 PROJECT_SCRIPTS_PREFIX = "<project.scripts>:"
@@ -69,3 +72,33 @@ class ProjectScriptsPlugin:
             yield from mark_entrypoints(
                 f"{PROJECT_SCRIPTS_PREFIX}{script_name}", pyproject, target_nodes
             )
+
+    def run(self, ctx: native.ProjectContext) -> None:
+        pyproject = self.pyproject_path or Path(ctx.project_root) / "pyproject.toml"
+        data = load_toml(pyproject)
+        if data is None:
+            return
+
+        scripts = data.get("project", {}).get("scripts", {})
+        for script_name, target in scripts.items():
+            module_part, _, decl_part = target.partition(":")
+            fqname = f"{module_part}.{decl_part}" if decl_part else module_part
+            targets = ctx.find_declarations(fqname)
+            if not targets:
+                module_node = ctx.find_module(module_part)
+                if module_node is not None:
+                    targets = [module_node]
+            if not targets:
+                logger.warning(
+                    "ProjectScriptsPlugin: %s -> %r not found in symbol graph",
+                    script_name,
+                    target,
+                )
+                continue
+            marker = ctx.add_node(
+                fqname=f"{PROJECT_SCRIPTS_PREFIX}{script_name}",
+                path=str(pyproject),
+                flags=int(NodeFlags.ENTRYPOINT),
+            )
+            for t in targets:
+                ctx.add_edge(marker, t)

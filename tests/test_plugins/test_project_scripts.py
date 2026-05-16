@@ -5,8 +5,8 @@ from __future__ import annotations
 from dead_cst.plugins import ProjectScriptsPlugin
 
 
-def test_project_scripts_plugin(make_analysis, write_files, reachable_fqnames):
-    write_files(
+def test_project_scripts_plugin(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "pkg/__init__.py": "",
             "pkg/cli.py": "def main(): pass",
@@ -16,7 +16,7 @@ def test_project_scripts_plugin(make_analysis, write_files, reachable_fqnames):
             [project.scripts]
             mytool = "pkg.cli:main"
             """,
-        }
+        },
+        [ProjectScriptsPlugin()],
     )
-    graph = make_analysis(plugins=[ProjectScriptsPlugin()]).materialize_all()
     assert "pkg.cli.main" in reachable_fqnames(graph)

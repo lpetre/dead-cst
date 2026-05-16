@@ -180,6 +180,11 @@ struct ImportSpec {
 /// non-`SHADOWED` decl.
 type LiveDeclIndex = HashMap<(File, String), usize>;
 
+/// Return type of `ProjectContext.find_main_blocks`: one entry per
+/// file with a top-level ``if __name__ == "__main__":`` block, paired
+/// with the decls that fall inside it.
+type MainBlock = (Py<NativeNode>, Vec<Py<NativeNode>>);
+
 /// Outcome of resolving a `Name` use to its reaching definition.
 ///
 /// `Alias` is the module-scope path: the use has a local graph node
@@ -319,6 +324,15 @@ struct BuildOutputs {
     /// `find_subclasses_of` map ty's `TypeHierarchyClass.selection_range`
     /// back to a graph node in O(1).
     class_by_selection: HashMap<(File, (u32, u32)), usize>,
+    /// `file -> module node idx`. Lets `find_main_blocks` reach the
+    /// file's module node without a linear scan over `builder.nodes`.
+    module_nodes_by_file: HashMap<File, usize>,
+    /// `(file, target_range_key) -> node idx`. Sister of
+    /// ``class_by_selection`` but for every top-level decl ingest minted
+    /// (function / class / variable / import). Lets ``find_decorated_decls``
+    /// and the dispatch-app queries map an AST node's target range to a
+    /// graph node in O(1) instead of scanning the full ``global_index``.
+    decl_by_name_range: HashMap<(File, (u32, u32)), usize>,
 }
 
 /// Run the three build phases (ingest → hierarchy+imports → references)
@@ -330,6 +344,7 @@ fn build_project_graph(py: Python<'_>, db: &ProjectDatabase) -> PyResult<BuildOu
     let mut alias_imports: HashMap<usize, ImportSpec> = HashMap::new();
     let mut live_decls: LiveDeclIndex = HashMap::new();
     let mut class_by_selection: HashMap<(File, (u32, u32)), usize> = HashMap::new();
+    let mut decl_by_name_range: HashMap<(File, (u32, u32)), usize> = HashMap::new();
 
     let project_files: Vec<File> = (&db.project().files(db)).into_iter().collect();
     let mut path_to_file: HashMap<String, File> = HashMap::with_capacity(project_files.len());
@@ -347,6 +362,7 @@ fn build_project_graph(py: Python<'_>, db: &ProjectDatabase) -> PyResult<BuildOu
             &mut alias_imports,
             &mut live_decls,
             &mut class_by_selection,
+            &mut decl_by_name_range,
         )?;
     }
     for file in &project_files {
@@ -377,6 +393,8 @@ fn build_project_graph(py: Python<'_>, db: &ProjectDatabase) -> PyResult<BuildOu
         global_index,
         path_to_file,
         class_by_selection,
+        module_nodes_by_file: module_nodes,
+        decl_by_name_range,
     })
 }
 
@@ -400,6 +418,11 @@ fn build_project_graph(py: Python<'_>, db: &ProjectDatabase) -> PyResult<BuildOu
 #[pyclass(unsendable)]
 struct ProjectContext {
     db: ProjectDatabase,
+    /// Absolute path of the project root, echoed back to Python via the
+    /// :attr:`project_root` getter. Plugins use it to compute paths
+    /// relative to the project (e.g. ``ExplicitEntrypointPlugin`` matching
+    /// path specs).
+    root: String,
     plugins: Vec<PyObject>,
     /// Populated by `materialize` before plugins run. `None` outside a
     /// materialize call — `add_node` / `add_edge` / queries assume it's
@@ -438,9 +461,16 @@ impl ProjectContext {
         )?;
         Ok(Self {
             db,
+            root: root.to_string(),
             plugins: Vec::new(),
             outputs: RefCell::new(None),
         })
+    }
+
+    /// Absolute project root passed at construction.
+    #[getter]
+    fn project_root(&self) -> &str {
+        &self.root
     }
 
     /// Register a Python plugin. Order of registration is order of
@@ -578,8 +608,338 @@ impl ProjectContext {
         Ok(out)
     }
 
+    /// Return every import-kind node whose upstream `module` matches.
+    ///
+    /// Covers both `import <module_name>` and
+    /// `from <module_name> import ...` styles — both bind import-kind
+    /// nodes whose `Import.module` is the absolute dotted name. Star
+    /// reexports synthesized from `from <module_name> import *` are
+    /// also included.
+    fn find_imports_of(&self, py: Python<'_>, module_name: &str) -> PyResult<Vec<Py<NativeNode>>> {
+        let outputs = self.outputs.borrow();
+        let outputs = outputs
+            .as_ref()
+            .ok_or_else(|| not_materialized("find_imports_of"))?;
+        let mut out = Vec::new();
+        for node_py in &outputs.builder.nodes {
+            let node = node_py.borrow(py);
+            if node.kind != "import" {
+                continue;
+            }
+            let Some(import_py) = node.imports.as_ref() else {
+                continue;
+            };
+            if import_py.borrow(py).module == module_name {
+                out.push(node_py.clone_ref(py));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Return every declaration (function / class / variable / import)
+    /// whose fully qualified name matches ``fqname``.
+    ///
+    /// Multiple results are returned when the same fqname has more
+    /// than one reaching definition (e.g. ``try: import X; except:
+    /// import Y as X``). Modules are not returned — use
+    /// :meth:`find_module` for that.
+    fn find_declarations(&self, py: Python<'_>, fqname: &str) -> PyResult<Vec<Py<NativeNode>>> {
+        let outputs = self.outputs.borrow();
+        let outputs = outputs
+            .as_ref()
+            .ok_or_else(|| not_materialized("find_declarations"))?;
+        let mut out = Vec::new();
+        for node_py in &outputs.builder.nodes {
+            let node = node_py.borrow(py);
+            if !matches!(node.kind, "function" | "class" | "variable" | "import") {
+                continue;
+            }
+            if node.fqname == fqname {
+                out.push(node_py.clone_ref(py));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Return the module node for the given dotted fqname, if it
+    /// exists in the project graph.
+    fn find_module(&self, py: Python<'_>, fqname: &str) -> PyResult<Option<Py<NativeNode>>> {
+        let outputs = self.outputs.borrow();
+        let outputs = outputs
+            .as_ref()
+            .ok_or_else(|| not_materialized("find_module"))?;
+        for node_py in &outputs.builder.nodes {
+            let node = node_py.borrow(py);
+            if node.kind == "module" && node.fqname == fqname {
+                return Ok(Some(node_py.clone_ref(py)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Return the module node owning ``path``, if any. O(1) — backed
+    /// by the same ``module_nodes_by_file`` index `find_main_blocks`
+    /// uses, so plugins don't have to scan ``nodes()`` per call.
+    fn module_for(&self, py: Python<'_>, path: &str) -> PyResult<Option<Py<NativeNode>>> {
+        let outputs = self.outputs.borrow();
+        let outputs = outputs
+            .as_ref()
+            .ok_or_else(|| not_materialized("module_for"))?;
+        let Some(&file) = outputs.path_to_file.get(path) else {
+            return Ok(None);
+        };
+        let Some(&idx) = outputs.module_nodes_by_file.get(&file) else {
+            return Ok(None);
+        };
+        Ok(Some(outputs.builder.nodes[idx].clone_ref(py)))
+    }
+
+    /// Return ``(module_node, [decls inside the block])`` for every
+    /// file with a top-level ``if __name__ == "__main__":`` block.
+    ///
+    /// The decls list contains the file's class / function / variable
+    /// / import nodes whose source position falls inside the block's
+    /// range — same shape ``MainBlockPlugin``'s libcst path computes
+    /// from the visitor's payload.
+    fn find_main_blocks(&self, py: Python<'_>) -> PyResult<Vec<MainBlock>> {
+        let outputs = self.outputs.borrow();
+        let outputs = outputs
+            .as_ref()
+            .ok_or_else(|| not_materialized("find_main_blocks"))?;
+        let mut out: Vec<MainBlock> = Vec::new();
+        for (&file, &module_idx) in &outputs.module_nodes_by_file {
+            let parsed = parsed_module(&self.db, file).load(&self.db);
+            let Some(block_range) = find_main_block_range(&parsed) else {
+                continue;
+            };
+            // Collect decls whose target_range falls within block_range.
+            let mut decls: Vec<Py<NativeNode>> = Vec::new();
+            for ((entry_file, _place_id, (start, end)), idx) in &outputs.global_index {
+                if *entry_file != file {
+                    continue;
+                }
+                let block_start = block_range.start().to_u32();
+                let block_end = block_range.end().to_u32();
+                if *start >= block_start && *end <= block_end {
+                    decls.push(outputs.builder.nodes[*idx].clone_ref(py));
+                }
+            }
+            out.push((outputs.builder.nodes[module_idx].clone_ref(py), decls));
+        }
+        Ok(out)
+    }
+
     /// Return every class that defines a method with the given name.
     ///
+    /// Return every top-level function decorated with ``@<decorator_module>.<name>``
+    /// or ``@<name>`` for any ``name`` in ``decorator_names``.
+    ///
+    /// Both ``@<name>`` (bare) and ``@<name>(...)`` (called) forms
+    /// match — the function call is unwrapped before the pattern is
+    /// checked. Identity for the attribute prefix is literal
+    /// (``@pytest.fixture`` matches; ``@p.fixture`` with
+    /// ``import pytest as p`` does not). Bare-name decorators
+    /// (``@fixture``) match purely by attribute name regardless of
+    /// what the local ``fixture`` refers to — this mirrors the libcst
+    /// plugin helpers used by ``PytestPlugin`` etc., which intentionally
+    /// keep a loose pattern match rather than trying to chase decorator
+    /// imports through ty's resolver.
+    fn find_decorated_decls(
+        &self,
+        py: Python<'_>,
+        decorator_module: &str,
+        decorator_names: Vec<String>,
+    ) -> PyResult<Vec<Py<NativeNode>>> {
+        let outputs = self.outputs.borrow();
+        let outputs = outputs
+            .as_ref()
+            .ok_or_else(|| not_materialized("find_decorated_decls"))?;
+        let names: HashSet<&str> = decorator_names.iter().map(String::as_str).collect();
+        let mut out = Vec::new();
+        for &file in &outputs.project_files {
+            let parsed = parsed_module(&self.db, file).load(&self.db);
+            // The file's import map for ``decorator_module`` — if it
+            // doesn't import anything from there, no decorator can
+            // match. Skips the body walk for the common case.
+            let imports = collect_module_imports_local(&parsed, decorator_module, &names);
+            if imports.is_empty() {
+                continue;
+            }
+            for stmt in &parsed.syntax().body {
+                let Stmt::FunctionDef(func) = stmt else {
+                    continue;
+                };
+                if !decorators_match_imports(&func.decorator_list, &imports, &names) {
+                    continue;
+                }
+                let key = (file, range_key(func.name.range()));
+                if let Some(&idx) = outputs.decl_by_name_range.get(&key) {
+                    out.push(outputs.builder.nodes[idx].clone_ref(py));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Find top-level ``<var> = <Ctor>(...)`` constructions where
+    /// ``Ctor`` is imported from ``module`` and is one of ``ctor_names``.
+    ///
+    /// Recognized shapes (mirroring the libcst plugin helpers):
+    /// * ``from <module> import <Ctor>; X = Ctor(...)``
+    /// * ``from <module> import <Ctor> as A; X = A(...)``
+    /// * ``import <module>; X = <module>.Ctor(...)``
+    /// * ``import <module> as m; X = m.Ctor(...)``
+    /// * ``X: T = Ctor(...)`` annotated form
+    ///
+    /// Returns ``[(var_node, ctor_name)]``; ``ctor_name`` is the
+    /// upstream constructor's bare name (``"Flask"`` even when imported
+    /// as ``F``).
+    #[allow(clippy::type_complexity)]
+    fn find_instance_constructions(
+        &self,
+        py: Python<'_>,
+        module: &str,
+        ctor_names: Vec<String>,
+    ) -> PyResult<Vec<(Py<NativeNode>, String)>> {
+        let outputs = self.outputs.borrow();
+        let outputs = outputs
+            .as_ref()
+            .ok_or_else(|| not_materialized("find_instance_constructions"))?;
+        let allowed: HashSet<&str> = ctor_names.iter().map(String::as_str).collect();
+        let mut out = Vec::new();
+        for &file in &outputs.project_files {
+            let parsed = parsed_module(&self.db, file).load(&self.db);
+            let imports = collect_module_imports_local(&parsed, module, &allowed);
+            if imports.is_empty() {
+                continue;
+            }
+            for stmt in &parsed.syntax().body {
+                let (target_range, value) = match top_level_assign_to_name(stmt) {
+                    Some(pair) => pair,
+                    None => continue,
+                };
+                if let Some(matched) = matched_call_target(value, &imports, &allowed) {
+                    let key = (file, range_key(target_range));
+                    if let Some(&idx) = outputs.decl_by_name_range.get(&key) {
+                        out.push((outputs.builder.nodes[idx].clone_ref(py), matched));
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Find top-level functions decorated with ``@<owner>.<attr>(...)``
+    /// where ``attr`` is in ``decorator_attrs``.
+    ///
+    /// Returns ``[(owner_name, function_node)]``. ``owner_name`` is the
+    /// raw textual prefix of the decorator (``"app"`` for ``@app.route``),
+    /// not resolved to a graph node — the caller decides which owners
+    /// correspond to real framework instances. Multiple decorators on
+    /// the same function emit multiple entries.
+    #[allow(clippy::type_complexity)]
+    fn find_handler_decorators(
+        &self,
+        py: Python<'_>,
+        decorator_attrs: Vec<String>,
+    ) -> PyResult<Vec<(String, Py<NativeNode>)>> {
+        let outputs = self.outputs.borrow();
+        let outputs = outputs
+            .as_ref()
+            .ok_or_else(|| not_materialized("find_handler_decorators"))?;
+        let attrs: HashSet<&str> = decorator_attrs.iter().map(String::as_str).collect();
+        let mut out = Vec::new();
+        for &file in &outputs.project_files {
+            let parsed = parsed_module(&self.db, file).load(&self.db);
+            for stmt in &parsed.syntax().body {
+                let Stmt::FunctionDef(func) = stmt else {
+                    continue;
+                };
+                let mut seen_owners: HashSet<String> = HashSet::new();
+                for dec in &func.decorator_list {
+                    let mut expr = &dec.expression;
+                    if let Expr::Call(call) = expr {
+                        expr = &call.func;
+                    }
+                    let Expr::Attribute(attr) = expr else {
+                        continue;
+                    };
+                    if !attrs.contains(attr.attr.as_str()) {
+                        continue;
+                    }
+                    let Expr::Name(owner) = attr.value.as_ref() else {
+                        continue;
+                    };
+                    let owner_name = owner.id.as_str().to_string();
+                    if !seen_owners.insert(owner_name.clone()) {
+                        continue;
+                    }
+                    let key = (file, range_key(func.name.range()));
+                    if let Some(&idx) = outputs.decl_by_name_range.get(&key) {
+                        out.push((owner_name, outputs.builder.nodes[idx].clone_ref(py)));
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Find top-level def/class statements whose body constructs one
+    /// of ``ctor_names`` imported from ``module``.
+    ///
+    /// Recursively walks each candidate's body looking for ``<Ctor>(...)``
+    /// or ``<module>.<Ctor>(...)`` call expressions. Returns
+    /// ``[(decl_node, [kind, ...])]`` where ``kind`` is the matched
+    /// constructor's bare name; multiple kinds appear when a single
+    /// factory constructs more than one (e.g. a function that returns a
+    /// ``Flask`` after mounting several ``Blueprint``s).
+    #[allow(clippy::type_complexity)]
+    fn find_factory_decls(
+        &self,
+        py: Python<'_>,
+        module: &str,
+        ctor_names: Vec<String>,
+    ) -> PyResult<Vec<(Py<NativeNode>, Vec<String>)>> {
+        let outputs = self.outputs.borrow();
+        let outputs = outputs
+            .as_ref()
+            .ok_or_else(|| not_materialized("find_factory_decls"))?;
+        let allowed: HashSet<&str> = ctor_names.iter().map(String::as_str).collect();
+        let mut out = Vec::new();
+        for &file in &outputs.project_files {
+            let parsed = parsed_module(&self.db, file).load(&self.db);
+            let imports = collect_module_imports_local(&parsed, module, &allowed);
+            if imports.is_empty() {
+                continue;
+            }
+            for stmt in &parsed.syntax().body {
+                let (name_range, body): (TextRange, &[Stmt]) = match stmt {
+                    Stmt::FunctionDef(f) => (f.name.range(), &f.body),
+                    Stmt::ClassDef(c) => (c.name.range(), &c.body),
+                    _ => continue,
+                };
+                let mut finder = FactoryCallFinder {
+                    imports: &imports,
+                    allowed: &allowed,
+                    kinds: HashSet::new(),
+                };
+                for inner in body {
+                    finder.visit_stmt(inner);
+                }
+                if finder.kinds.is_empty() {
+                    continue;
+                }
+                let key = (file, range_key(name_range));
+                if let Some(&idx) = outputs.decl_by_name_range.get(&key) {
+                    let mut kinds_vec: Vec<String> = finder.kinds.into_iter().collect();
+                    kinds_vec.sort();
+                    out.push((outputs.builder.nodes[idx].clone_ref(py), kinds_vec));
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Walks each class's `DefinitionKind::Class` body for an
     /// `Stmt::FunctionDef` whose name matches. ty's `parsed_module` is
     /// Salsa-cached, so this is just a body scan per class.
@@ -882,6 +1242,52 @@ fn class_body_defines_method(class_def: &StmtClassDef, method_name: &str) -> boo
     })
 }
 
+/// Return ``true`` if any decorator in ``decorators`` matches
+/// ``@<module>.<name>`` (literal module name) or ``@<name>`` for
+/// any ``name`` in ``names``. Trailing ``(...)`` is unwrapped before
+/// the pattern check.
+/// Resolves decorator references through the file's local imports map
+/// (built by :func:`collect_module_imports_local`) — mirrors the libcst
+/// helpers' ``matched_attr_call`` shape. Recognized forms:
+///
+/// * ``@<name>(...)`` / ``@<name>`` where ``imports[name]`` is in ``names``
+///   (covers ``from module import name`` and aliased variants).
+/// * ``@<alias>.<attr>(...)`` / ``@<alias>.<attr>`` where
+///   ``imports[alias] == "<module>"`` and ``attr`` is in ``names``
+///   (covers ``import module`` and ``import module as alias``).
+fn decorators_match_imports(
+    decorators: &[ruff_python_ast::Decorator],
+    imports: &HashMap<String, String>,
+    names: &HashSet<&str>,
+) -> bool {
+    for dec in decorators {
+        let mut expr = &dec.expression;
+        if let Expr::Call(call) = expr {
+            expr = &call.func;
+        }
+        match expr {
+            Expr::Name(n) => {
+                if let Some(target) = imports.get(n.id.as_str()) {
+                    if names.contains(target.as_str()) {
+                        return true;
+                    }
+                }
+            }
+            Expr::Attribute(attr) => {
+                if let Expr::Name(prefix) = attr.value.as_ref() {
+                    if imports.get(prefix.id.as_str()).map(String::as_str) == Some("<module>")
+                        && names.contains(attr.attr.as_str())
+                    {
+                        return true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 fn iter_top_level_classes(parsed: &ParsedModuleRef) -> impl Iterator<Item = &StmtClassDef> {
     parsed.syntax().body.iter().filter_map(|stmt| match stmt {
         Stmt::ClassDef(cls) => Some(cls),
@@ -893,8 +1299,15 @@ fn iter_top_level_classes(parsed: &ParsedModuleRef) -> impl Iterator<Item = &Stm
 ///
 /// We don't store ty `Definition<'db>` references across plugin calls
 /// (the `'db` lifetime is tied to the active borrow), so this re-walks
-/// the matching file's top-level classes for one whose name range
-/// projects to the same `(start_line, start_column)` as the node.
+/// Locate a class's File + name TextRange from its NativeNode positions.
+///
+/// We don't store ty `Definition<'db>` references across plugin calls
+/// (the `'db` lifetime is tied to the active borrow), so this re-walks
+/// the matching file's top-level classes for one whose name lands on
+/// the node's start line. Match-by-line (not line+column) because
+/// Function / Class / TypeAlias node columns are snapped to the line's
+/// indent — not the bound name's column — to align with libcst, and
+/// two top-level classes can't share a source line.
 fn locate_class_def(
     db: &ProjectDatabase,
     path_to_file: &HashMap<String, File>,
@@ -907,8 +1320,8 @@ fn locate_class_def(
     let line_index = line_index(db, file);
     for cls in iter_top_level_classes(&parsed) {
         let name_range = cls.name.range();
-        let (sl, sc, _, _) = position(&line_index, &source, name_range);
-        if sl == class_node.start_line && sc == class_node.start_column {
+        let (sl, _, _, _) = position(&line_index, &source, name_range);
+        if sl == class_node.start_line {
             return Some((file, name_range));
         }
     }
@@ -918,6 +1331,170 @@ fn locate_class_def(
 /// Find a top-level `StmtClassDef` whose name range equals `selection_range`.
 fn class_def_at(parsed: &ParsedModuleRef, selection_range: TextRange) -> Option<&StmtClassDef> {
     iter_top_level_classes(parsed).find(|cls| cls.name.range() == selection_range)
+}
+
+/// Locate the top-level ``if __name__ == "__main__":`` block in a
+/// parsed module and return its source range. Both orderings
+/// (``__name__ == "__main__"`` and ``"__main__" == __name__``) are
+/// recognized; the ``elif`` / ``else`` branches are not matched.
+fn find_main_block_range(parsed: &ParsedModuleRef) -> Option<TextRange> {
+    for stmt in &parsed.syntax().body {
+        let Stmt::If(if_stmt) = stmt else {
+            continue;
+        };
+        if is_name_eq_main(&if_stmt.test) {
+            return Some(if_stmt.range);
+        }
+    }
+    None
+}
+
+/// Match ``__name__ == "__main__"`` or its reverse.
+fn is_name_eq_main(expr: &Expr) -> bool {
+    let Expr::Compare(cmp) = expr else {
+        return false;
+    };
+    if cmp.ops.len() != 1 {
+        return false;
+    }
+    if !matches!(cmp.ops[0], ruff_python_ast::CmpOp::Eq) {
+        return false;
+    }
+    let comparators = &cmp.comparators;
+    if comparators.len() != 1 {
+        return false;
+    }
+    let left = &*cmp.left;
+    let right = &comparators[0];
+    (is_name(left, "__name__") && is_string_literal(right, "__main__"))
+        || (is_string_literal(left, "__main__") && is_name(right, "__name__"))
+}
+
+fn is_name(expr: &Expr, value: &str) -> bool {
+    matches!(expr, Expr::Name(n) if n.id.as_str() == value)
+}
+
+fn is_string_literal(expr: &Expr, value: &str) -> bool {
+    matches!(expr, Expr::StringLiteral(s) if s.value.to_str() == value)
+}
+
+/// Build the file-local imports map ``{local_name: target}`` for
+/// names imported from ``module``. ``target`` is the upstream
+/// constructor / decl name (e.g. ``"Flask"`` when bound via
+/// ``from flask import Flask``) or the sentinel ``"<module>"``
+/// when bound via ``import flask`` / ``import flask as f``.
+///
+/// Only entries whose target is in ``allowed`` survive — keeps the
+/// map small and lets call-site matchers do a cheap second check.
+fn collect_module_imports_local(
+    parsed: &ParsedModuleRef,
+    module: &str,
+    allowed: &HashSet<&str>,
+) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for stmt in &parsed.syntax().body {
+        match stmt {
+            Stmt::ImportFrom(im) => {
+                let Some(mod_name) = &im.module else { continue };
+                if mod_name.as_str() != module {
+                    continue;
+                }
+                for alias in &im.names {
+                    let target = alias.name.as_str();
+                    if !allowed.contains(target) {
+                        continue;
+                    }
+                    let local = alias.asname.as_ref().map(|n| n.as_str()).unwrap_or(target);
+                    out.insert(local.to_string(), target.to_string());
+                }
+            }
+            Stmt::Import(im) => {
+                for alias in &im.names {
+                    if alias.name.as_str() != module {
+                        continue;
+                    }
+                    let local = alias.asname.as_ref().map(|n| n.as_str()).unwrap_or(module);
+                    out.insert(local.to_string(), "<module>".to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Match an expression against a constructor pattern:
+/// * ``<imported_local>(...)`` where the local binds an allowed name; or
+/// * ``<module_alias>.<allowed_name>(...)`` where the alias binds the module.
+///
+/// Returns the matched upstream name (``"Flask"``) on hit, else ``None``.
+fn matched_call_target(
+    expr: &Expr,
+    imports: &HashMap<String, String>,
+    allowed: &HashSet<&str>,
+) -> Option<String> {
+    let Expr::Call(call) = expr else {
+        return None;
+    };
+    match call.func.as_ref() {
+        Expr::Name(name) => {
+            let target = imports.get(name.id.as_str())?;
+            allowed.contains(target.as_str()).then(|| target.clone())
+        }
+        Expr::Attribute(attr) => {
+            let Expr::Name(prefix) = attr.value.as_ref() else {
+                return None;
+            };
+            if imports.get(prefix.id.as_str()).map(String::as_str) != Some("<module>") {
+                return None;
+            }
+            let attr_name = attr.attr.as_str();
+            allowed.contains(attr_name).then(|| attr_name.to_string())
+        }
+        _ => None,
+    }
+}
+
+/// Top-level ``X = <expr>`` / ``X: T = <expr>`` where the target is a
+/// bare ``Name``. Returns ``(name_range, &expr)`` so the caller can
+/// look up ``X``'s node and inspect the RHS.
+fn top_level_assign_to_name(stmt: &Stmt) -> Option<(TextRange, &Expr)> {
+    match stmt {
+        Stmt::Assign(assign) => {
+            if assign.targets.len() != 1 {
+                return None;
+            }
+            let Expr::Name(name) = &assign.targets[0] else {
+                return None;
+            };
+            Some((name.range, assign.value.as_ref()))
+        }
+        Stmt::AnnAssign(assign) => {
+            let value = assign.value.as_deref()?;
+            let Expr::Name(name) = assign.target.as_ref() else {
+                return None;
+            };
+            Some((name.range, value))
+        }
+        _ => None,
+    }
+}
+
+/// Recursive visitor: walk a function / class body collecting the set
+/// of constructor names called anywhere inside it.
+struct FactoryCallFinder<'a> {
+    imports: &'a HashMap<String, String>,
+    allowed: &'a HashSet<&'a str>,
+    kinds: HashSet<String>,
+}
+
+impl<'ast, 'a> Visitor<'ast> for FactoryCallFinder<'a> {
+    fn visit_expr(&mut self, expr: &'ast Expr) {
+        if let Some(name) = matched_call_target(expr, self.imports, self.allowed) {
+            self.kinds.insert(name);
+        }
+        walk_expr(self, expr);
+    }
 }
 
 /// Per-file sorted list of `(target_start_offset, node_idx)` for the
@@ -952,6 +1529,7 @@ fn ingest_decls(
     alias_imports: &mut HashMap<usize, ImportSpec>,
     live_decls: &mut LiveDeclIndex,
     class_by_selection: &mut HashMap<(File, (u32, u32)), usize>,
+    decl_by_name_range: &mut HashMap<(File, (u32, u32)), usize>,
 ) -> PyResult<()> {
     let parsed = parsed_module(db, file).load(db);
     let source = source_text(db, file);
@@ -1078,6 +1656,10 @@ fn ingest_decls(
         if node_kind == "class" {
             class_by_selection.insert((file, range_key(target_range)), node_idx);
         }
+        // Last-write-wins matches ``live_decls``: a single (file, range)
+        // can host multiple bindings (try/except rebind, star imports),
+        // and the query callers care about the end-of-scope live binding.
+        decl_by_name_range.insert((file, range_key(target_range)), node_idx);
 
         if let Some(spec) = import_spec {
             alias_imports.insert(node_idx, spec);
@@ -3264,9 +3846,27 @@ fn file_path_string(db: &dyn ProjectDb, file: File) -> String {
 }
 
 fn module_fqname_for_file(db: &dyn ProjectDb, file: File) -> String {
-    file_to_module(db, file)
-        .map(|m| m.name(db).as_str().to_string())
-        .unwrap_or_else(|| file_path_string(db, file))
+    if let Some(module) = file_to_module(db, file) {
+        return module.name(db).as_str().to_string();
+    }
+    // Fallback for files ty doesn't classify (e.g. ``gunicorn.conf.py`` at
+    // the project root — there's no ``__init__.py`` and the stem contains
+    // a dot, so ty's module resolver returns ``None``). Mirror the libcst
+    // pipeline's ``strip .py / replace / with .`` derivation so plugins
+    // like ``ServerConfigPlugin`` can address the file by its conventional
+    // dotted name.
+    let path_str = file_path_string(db, file);
+    let root_str = db.project().root(db).as_str();
+    let rel = path_str
+        .strip_prefix(root_str)
+        .unwrap_or(&path_str)
+        .trim_start_matches('/')
+        .trim_start_matches('\\');
+    let stem = rel
+        .strip_suffix(".pyi")
+        .or_else(|| rel.strip_suffix(".py"))
+        .unwrap_or(rel);
+    stem.replace(['/', '\\'], ".")
 }
 
 // ---------------------------------------------------------------------------

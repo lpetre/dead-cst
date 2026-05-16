@@ -39,8 +39,8 @@ def test_no_plugins_means_nothing_reachable(make_analysis, write_files):
     assert find_reachable(graph, _entrypoint_seeds(graph)) == set()
 
 
-def test_plugins_compose(make_analysis, write_files, reachable_fqnames):
-    write_files(
+def test_plugins_compose(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "pkg/__init__.py": "",
             "pkg/cli.py": "def main(): pass",
@@ -55,9 +55,9 @@ def test_plugins_compose(make_analysis, write_files, reachable_fqnames):
             [project.scripts]
             mytool = "pkg.cli:main"
             """,
-        }
+        },
+        [MainBlockPlugin(), ProjectScriptsPlugin()],
     )
-    graph = make_analysis(plugins=[MainBlockPlugin(), ProjectScriptsPlugin()]).materialize_all()
     assert {"pkg.runner", "pkg.cli", "pkg.cli.main"} <= reachable_fqnames(graph)
 
 

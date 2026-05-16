@@ -82,12 +82,10 @@ def test_init_subclass_transitive_subclasses(make_analysis, write_files, reachab
     assert "pkg.mod.Leaf" in reached
 
 
-def test_init_subclass_does_not_seed_parent_entrypoint(
-    make_analysis, write_files, reachable_fqnames
-):
+def test_init_subclass_does_not_seed_parent_entrypoint(build_plugin_graph, reachable_fqnames):
     """The plugin only emits inverse edges; if nothing else keeps the parent
     alive, neither parent nor subclasses become reachable."""
-    write_files(
+    graph = build_plugin_graph(
         {
             "pkg/__init__.py": "",
             "pkg/base.py": """
@@ -101,17 +99,17 @@ def test_init_subclass_does_not_seed_parent_entrypoint(
             class Foo(Plugin):
                 pass
             """,
-        }
+        },
+        [InitSubclassPlugin()],
     )
-    graph = make_analysis(plugins=[InitSubclassPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "pkg.base.Plugin" not in reached
     assert "pkg.impls.Foo" not in reached
 
 
-def test_init_subclass_via_main_block(make_analysis, write_files, reachable_fqnames):
+def test_init_subclass_via_main_block(build_plugin_graph, reachable_fqnames):
     """End-to-end: parent reached via a __main__ block, subclasses come along."""
-    write_files(
+    graph = build_plugin_graph(
         {
             "pkg/__init__.py": "",
             "pkg/base.py": """
@@ -142,9 +140,9 @@ def test_init_subclass_via_main_block(make_analysis, write_files, reachable_fqna
             if __name__ == "__main__":
                 run()
             """,
-        }
+        },
+        [MainBlockPlugin(), InitSubclassPlugin()],
     )
-    graph = make_analysis(plugins=[MainBlockPlugin(), InitSubclassPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "pkg.base.Handler" in reached
     assert "pkg.impls.JSONHandler" in reached
