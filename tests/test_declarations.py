@@ -1798,3 +1798,104 @@ def test_main_module_relative_import(build_decl_graph, assert_edges):
             "pkg.util.helper -> pkg.util",
         },
     )
+
+
+# ---------------------------------------------------------------------------
+# Peer ``.pyi`` files and Jupyter notebooks. Naming differences (fqname
+# containing ``.ipynb`` on rust, duplicate module nodes for peer pyi)
+# are intentionally not asserted — only the behaviors that affect
+# reachability or codemod safety.
+# ---------------------------------------------------------------------------
+
+
+PEER_STUB_FILES = {
+    "foo.py": "def runtime_only(): pass\ndef shared(): pass",
+    "foo.pyi": "def stub_only() -> None: ...\ndef shared() -> None: ...",
+    "bar.py": "from foo import shared, stub_only\nshared()\nstub_only()",
+}
+
+
+# libcst drops peer ``.pyi`` files at ``enumerate_files`` time, so the
+# stub never appears in the graph and the rust-specific stub→runtime
+# bookkeeping is observable only on the rust backend. Each rule below
+# is the rust path's interpretation of "use ty's resolution, document
+# stub→runtime edges, flag stub-only decls".
+
+
+@pytest.mark.skip_when_backend("libcst")
+def test_peer_stub_emits_edge_to_matching_runtime_decl_rust(build_decl_graph):
+    """Rule 2: for each ``.pyi`` decl with a same-name decl in the
+    ``.py`` twin, emit a ``pyi_decl -> py_decl`` edge. The stub
+    documents the relationship in the graph so reachability that lands
+    on the stub decl (because ty's module resolver preferred the
+    ``.pyi``) flows through to the runtime."""
+    graph = build_decl_graph(PEER_STUB_FILES)
+    # ``foo.shared`` exists in both files; the rust path mints two
+    # nodes (one per file) sharing the fqname, so disambiguating
+    # requires walking the underlying node paths.
+    raw_edges = [(graph.node(u), graph.node(v)) for u, v in graph.raw.edge_list()]
+    stub_runtime_pairs = {
+        (str(s.path).rsplit("/", 1)[-1], str(t.path).rsplit("/", 1)[-1])
+        for s, t in raw_edges
+        if s.fqname == "foo.shared" and t.fqname == "foo.shared"
+    }
+    assert ("foo.pyi", "foo.py") in stub_runtime_pairs, (
+        f"expected foo.pyi:foo.shared -> foo.py:foo.shared edge; got: {stub_runtime_pairs}"
+    )
+    # The stub-only decl has no matching runtime, so no stub->runtime
+    # edge for ``stub_only`` — only the self-module edge.
+    stub_only_outgoing = [(s, t) for s, t in raw_edges if s.fqname == "foo.stub_only"]
+    assert {(s.fqname, t.fqname) for s, t in stub_only_outgoing} == {("foo.stub_only", "foo")}, (
+        f"unexpected outgoing edges from foo.stub_only: {stub_only_outgoing}"
+    )
+
+
+@pytest.mark.skip_when_backend("libcst")
+def test_stub_only_decl_flagged_entrypoint_rust(build_decl_graph):
+    """Rule 3: a ``.pyi`` decl with no matching ``.py`` decl is
+    ``ENTRYPOINT``-flagged so it stays alive even when no consumer
+    references it. Covers native-extension stubs (``_native.pyi`` next
+    to ``_native.so``) and protobuf ``_pb2.pyi`` (peer ``.py`` is
+    opaque-generated, has no static decls). Decls that DO have a
+    matching runtime stay un-flagged — their liveness flows through
+    the stub→runtime edge instead."""
+    from dead_cst.graph import NodeFlags
+
+    graph = build_decl_graph(PEER_STUB_FILES)
+    by_fqname = {}
+    for n in graph.raw.nodes():
+        if str(n.path).endswith("foo.pyi") and n.type == "function":
+            by_fqname[n.fqname] = NodeFlags(int(n.flags))
+    assert by_fqname.get("foo.stub_only", NodeFlags.NONE) & NodeFlags.ENTRYPOINT, (
+        f"stub-only decl missing ENTRYPOINT; flags = {by_fqname.get('foo.stub_only')!r}"
+    )
+    assert not (by_fqname.get("foo.shared", NodeFlags.NONE) & NodeFlags.ENTRYPOINT), (
+        f"stub decl with matching runtime unexpectedly ENTRYPOINT-flagged; "
+        f"flags = {by_fqname.get('foo.shared')!r}"
+    )
+
+
+def test_notebook_decls_carry_notebook_and_entrypoint_flags(write_notebook, build_decl_graph):
+    """Every node minted from an ``.ipynb`` carries both
+    ``NodeFlags.NOTEBOOK`` and ``NodeFlags.ENTRYPOINT``:
+
+    * ``ENTRYPOINT`` keeps the cells alive (notebooks are executed
+      top-to-bottom, not imported).
+    * ``NOTEBOOK`` tells the codemod to skip these nodes — it can't
+      rewrite cell JSON envelopes safely.
+
+    The libcst pipeline ORs the flags via ``default_flags`` in
+    ``_refresh._process_one_file``; the rust path mirrors that via
+    ``file_default_flags`` consulted by every per-file node mint.
+    """
+    from dead_cst.graph import NodeFlags
+
+    write_notebook("analysis.ipynb", ["def helper():\n    return 42", "helper()"])
+    graph = build_decl_graph({})
+
+    required = NodeFlags.NOTEBOOK | NodeFlags.ENTRYPOINT
+    notebook_nodes = [n for n in graph.raw.nodes() if str(n.path).endswith(".ipynb")]
+    assert notebook_nodes, "expected at least one decl minted from the .ipynb file"
+    for n in notebook_nodes:
+        missing = required & ~NodeFlags(int(n.flags))
+        assert not missing, f"{n.fqname!r} missing flags: {missing!r}"
