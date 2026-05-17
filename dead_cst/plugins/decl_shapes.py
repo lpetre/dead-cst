@@ -506,6 +506,15 @@ class DispatchAppPlugin:
             simple = var_node.fqname.rsplit(".", 1)[-1]
             direct_by_owner.setdefault((var_node.path, simple), []).append((var_node, kind))
 
+        # Top-level vars keyed by (path, simple_name) so handler-edge
+        # emission and the pending-factory walk both have O(1) lookup.
+        vars_by_file: dict[tuple[str, str], native.NativeNode] = {}
+        for n in ctx.nodes():
+            if n.kind != "variable":
+                continue
+            simple = n.fqname.rsplit(".", 1)[-1]
+            vars_by_file.setdefault((n.path, simple), n)
+
         app_prefix = self._prefix("app")
         factory_prefix = self._prefix("factory")
 
@@ -526,9 +535,63 @@ class DispatchAppPlugin:
                         edges_from=[decl_node],
                     )
 
-        for owner_name, handler_func in handlers:
-            for var_node, _kind in direct_by_owner.get((handler_func.path, owner_name), []):
-                yield native.AddEdge(var_node, handler_func)
+        # Handler edges. Factory-aware plugins (Flask / FastAPI /
+        # FastMCP / Celery) emit edges for every top-level var named as
+        # a decorator owner, regardless of whether the var was directly
+        # constructed — pending vars need the edge so reachability
+        # flows from the entrypoint marker through the var to the
+        # handler once the factory walk classifies them. Pure-dispatch
+        # plugins (Typer / Cyclopts / Click) only wire owners that were
+        # directly classified; that gating is what lets the
+        # ``from typer import *`` limitation hold (the star import
+        # binds ``app`` but ``find_instance_constructions`` doesn't
+        # resolve through star imports, so ``app`` stays unclassified
+        # and its handlers stay dead).
+        if self._factory_aware:
+            for owner_name, handler_func in handlers:
+                var = vars_by_file.get((handler_func.path, owner_name))
+                if var is not None:
+                    yield native.AddEdge(var, handler_func)
+        else:
+            for owner_name, handler_func in handlers:
+                for var_node, _kind in direct_by_owner.get((handler_func.path, owner_name), []):
+                    yield native.AddEdge(var_node, handler_func)
+
+        if self._factory_aware:
+            # Cross-file factory classification: for every decorator-owned
+            # var that wasn't directly constructed as a known kind, walk
+            # forward through the graph until we hit a factory marker
+            # that classifies the var's kind. The forward closure of a
+            # factory-pattern var passes through its assignment RHS to
+            # the factory decl to that decl's body's references to the
+            # framework class — and to the factory marker we emitted on
+            # the factory decl. Same logic as the libcst plugin's
+            # ``walk_to_instance_kind``, but using ``ctx.descendants``
+            # for the BFS so the work is rust-side.
+            classified: set[tuple[str, str]] = set()
+            for owner_name, handler in handlers:
+                key = (handler.path, owner_name)
+                if key in direct_by_owner or key in classified:
+                    continue
+                var = vars_by_file.get(key)
+                if var is None:
+                    continue
+                for desc in ctx.descendants(var):
+                    if desc.kind != "synthetic":
+                        continue
+                    if not desc.fqname.startswith(factory_prefix):
+                        continue
+                    kind = desc.fqname[len(factory_prefix) :].split(":", 1)[0]
+                    if not self.instance_kinds.get(kind):
+                        continue
+                    classified.add(key)
+                    yield native.AddNode(
+                        fqname=f"{app_prefix}{var.fqname}",
+                        path=var.path,
+                        flags=int(NodeFlags.ENTRYPOINT),
+                        edges_to=[var],
+                    )
+                    break
 
 
 def _read_string_list_with_positions(
