@@ -270,15 +270,17 @@ class DiscordPyPlugin:
                 yield native.AddEdge(owner_node, handler)
 
         # 4. Cog subclasses + module-level setup / teardown hooks.
-        # Use the syntactic ``find_classes_subclassing`` query rather
-        # than ty's ``find_subclasses``: discord usually isn't in the
-        # analyzer's venv, so ty can't resolve ``discord.ext.commands.Cog``
-        # as a seed type. The syntactic walk matches the libcst plugin's
-        # behavior (direct ``commands.Cog`` / ``Cog`` references through
-        # known imports).
+        # Uses ty's type hierarchy via ``find_subclasses`` — requires
+        # ``discord.py`` to be resolvable in the analyzer's environment
+        # (installed in the project venv, or pointed at via the
+        # ``python_env`` ``ProjectContext`` argument). This catches
+        # transitive subclass chains the libcst plugin's syntactic
+        # walker misses (``class MyCogBase(commands.Cog); class
+        # Foo(MyCogBase)``).
         cogs_by_path: dict[str, list[native.NativeNode]] = {}
-        for cog, _base in ctx.find_classes_subclassing("discord.ext.commands", sorted(_COG_BASES)):
-            cogs_by_path.setdefault(cog.path, []).append(cog)
+        for base in ("discord.ext.commands.Cog", "discord.ext.commands.GroupCog"):
+            for cog in ctx.find_subclasses(base, transitive=True):
+                cogs_by_path.setdefault(cog.path, []).append(cog)
 
         if cogs_by_path:
             hook_funcs_by_path: dict[str, list[native.NativeNode]] = {}

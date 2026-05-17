@@ -1149,71 +1149,6 @@ impl ProjectContext {
         Ok(out)
     }
 
-    /// Find top-level classes whose base list mentions one of
-    /// ``base_names`` imported from ``module``. Syntactic — doesn't
-    /// require the upstream package to be installed (so it works on
-    /// classes from third-party deps that aren't in the test env).
-    /// Returns one entry per (class, matched_base_name) pair; a class
-    /// inheriting from two recognized bases produces two entries.
-    ///
-    /// Use ``find_subclasses(fqn)`` instead when the upstream class
-    /// is resolvable via ty — that path walks transitive subclasses
-    /// through the type hierarchy, which catches project-local
-    /// intermediates this syntactic query misses.
-    #[allow(clippy::type_complexity)]
-    fn find_classes_subclassing(
-        &self,
-        py: Python<'_>,
-        module: &str,
-        base_names: Vec<String>,
-    ) -> PyResult<Vec<(Py<NativeNode>, String)>> {
-        let outputs = self.outputs.borrow();
-        let outputs = outputs
-            .as_ref()
-            .ok_or_else(|| not_materialized("find_classes_subclassing"))?;
-        let allowed: HashSet<&str> = base_names.iter().map(String::as_str).collect();
-        let mut out = Vec::new();
-        for &file in &outputs.project_files {
-            let parsed = parsed_module(&self.db, file).load(&self.db);
-            let imports = collect_module_imports_local(&parsed, module, &allowed);
-            if imports.is_empty() {
-                continue;
-            }
-            for stmt in &parsed.syntax().body {
-                let Stmt::ClassDef(class_def) = stmt else {
-                    continue;
-                };
-                let Some(arguments) = &class_def.arguments else {
-                    continue;
-                };
-                let mut matched: HashSet<String> = HashSet::new();
-                for arg in &arguments.args {
-                    let mut base_expr = arg;
-                    // ``class Foo(commands.Cog[Generic[T]])`` -- unwrap.
-                    if let Expr::Subscript(sub) = base_expr {
-                        base_expr = &sub.value;
-                    }
-                    if let Some(name) = base_name_matches(base_expr, &imports, module, &allowed) {
-                        matched.insert(name);
-                    }
-                }
-                if matched.is_empty() {
-                    continue;
-                }
-                let key = (file, range_key(class_def.name.range()));
-                if let Some(&idx) = outputs.decl_by_name_range.get(&key) {
-                    let node = outputs.builder.nodes[idx].clone_ref(py);
-                    let mut sorted: Vec<String> = matched.into_iter().collect();
-                    sorted.sort();
-                    for name in sorted {
-                        out.push((node.clone_ref(py), name));
-                    }
-                }
-            }
-        }
-        Ok(out)
-    }
-
     /// Find top-level functions decorated with ``@<owner>.<attr>(...)``
     /// where ``attr`` is in ``decorator_attrs``.
     ///
@@ -2215,9 +2150,11 @@ fn locate_class_seed(
     follow_class_through_module(db, module_file, class_name, &mut visited)
 }
 
-/// Walk through a module looking for ``class_name``. If the module
-/// only re-exports the name (``from .other import class_name as
-/// class_name``), recurse into the source module. Bounded by a
+/// Walk through a module looking for ``class_name``. Handles three
+/// re-export shapes: a direct ``class class_name: ...`` definition,
+/// an explicit ``from .other import class_name [as class_name]``
+/// re-export, and ``from .other import *`` (which exposes everything
+/// the source module defines at the top level). Bounded by a
 /// visited-file set so cycles can't loop forever.
 fn follow_class_through_module(
     db: &ProjectDatabase,
@@ -2236,8 +2173,25 @@ fn follow_class_through_module(
         let Stmt::ImportFrom(im) = stmt else {
             continue;
         };
+        let Ok(module_name) = ModuleName::from_import_statement(db, start_file, im) else {
+            continue;
+        };
+        let Some(resolved) = resolve_module(db, start_file, &module_name) else {
+            continue;
+        };
+        let Some(source_file) = resolved.file(db) else {
+            continue;
+        };
         for alias in &im.names {
             let imported_name = alias.name.as_str();
+            if imported_name == "*" {
+                if let Some(seed) =
+                    follow_class_through_module(db, source_file, class_name, visited)
+                {
+                    return Some(seed);
+                }
+                continue;
+            }
             let local_name = alias
                 .asname
                 .as_ref()
@@ -2246,15 +2200,6 @@ fn follow_class_through_module(
             if local_name != class_name {
                 continue;
             }
-            let Ok(module_name) = ModuleName::from_import_statement(db, start_file, im) else {
-                continue;
-            };
-            let Some(resolved) = resolve_module(db, start_file, &module_name) else {
-                continue;
-            };
-            let Some(source_file) = resolved.file(db) else {
-                continue;
-            };
             if let Some(seed) = follow_class_through_module(db, source_file, imported_name, visited)
             {
                 return Some(seed);
@@ -2385,21 +2330,7 @@ fn matched_call_target(
     module: &str,
     allowed: &HashSet<&str>,
 ) -> Option<String> {
-    base_name_matches(call.func.as_ref(), imports, module, allowed)
-}
-
-/// Match an expression — typically a class base or a call callee —
-/// against a name-from-module pattern. Same three shapes as
-/// :func:`matched_call_target`, but operating on the post-``Call``
-/// expression directly so it composes with base-list walks
-/// (``class Foo(commands.Cog)``) and with call-target probes.
-fn base_name_matches(
-    expr: &Expr,
-    imports: &HashMap<String, String>,
-    module: &str,
-    allowed: &HashSet<&str>,
-) -> Option<String> {
-    match expr {
+    match call.func.as_ref() {
         Expr::Name(name) => {
             let target = imports.get(name.id.as_str())?;
             allowed.contains(target.as_str()).then(|| target.clone())
