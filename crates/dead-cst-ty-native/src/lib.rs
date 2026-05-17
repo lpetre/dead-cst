@@ -3005,9 +3005,14 @@ fn ingest_decls(
             let key = (file, def.place(db), range_key(kind.target_range(&parsed)));
             if let Some(&idx) = global_index.get(&key) {
                 live.push(idx);
-                if !kind.is_import() {
-                    live_real_decls.push(idx);
-                }
+                // ``live_decls`` mirrors what's reachable as a decl-like
+                // target in the module's namespace — an import alias is
+                // still a decl from the consumer's standpoint, so it
+                // belongs here too. Filtering on ``!kind.is_import()``
+                // would skip ``mod -> lib.f@2:18`` when ``lib.f`` is
+                // ``from a import f`` (Principle 2's parallel-upstream
+                // edge from the use site to the decl in ``lib``).
+                live_real_decls.push(idx);
             }
         }
         let key = (file, name);
