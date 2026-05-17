@@ -1830,18 +1830,9 @@ def test_peer_stub_emits_edge_to_matching_runtime_decl_rust(build_decl_graph):
     on the stub decl (because ty's module resolver preferred the
     ``.pyi``) flows through to the runtime."""
     graph = build_decl_graph(PEER_STUB_FILES)
-    edges = {(graph.node(u).fqname, graph.node(v).fqname) for u, v in graph.raw.edge_list()}
     # ``foo.shared`` exists in both files; the rust path mints two
-    # nodes (one per file) but they share the fqname, so the edge set
-    # reads as ``foo.shared -> foo.shared``.
-    stub_to_runtime = [
-        (u, v)
-        for (u, v) in edges
-        if u == "foo.shared" and v == "foo.shared"
-        # Filter using the source-file path on the underlying nodes
-        # — same fqname both ends, so we have to dig into node paths.
-    ]
-    # Use raw edge_list with node path lookups to disambiguate.
+    # nodes (one per file) sharing the fqname, so disambiguating
+    # requires walking the underlying node paths.
     raw_edges = [(graph.node(u), graph.node(v)) for u, v in graph.raw.edge_list()]
     stub_runtime_pairs = {
         (str(s.path).rsplit("/", 1)[-1], str(t.path).rsplit("/", 1)[-1])
