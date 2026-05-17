@@ -3005,9 +3005,14 @@ fn ingest_decls(
             let key = (file, def.place(db), range_key(kind.target_range(&parsed)));
             if let Some(&idx) = global_index.get(&key) {
                 live.push(idx);
-                if !kind.is_import() {
-                    live_real_decls.push(idx);
-                }
+                // ``live_decls`` mirrors what's reachable as a decl-like
+                // target in the module's namespace — an import alias is
+                // still a decl from the consumer's standpoint, so it
+                // belongs here too. Filtering on ``!kind.is_import()``
+                // would skip ``mod -> lib.f@2:18`` when ``lib.f`` is
+                // ``from a import f`` (Principle 2's parallel-upstream
+                // edge from the use site to the decl in ``lib``).
+                live_real_decls.push(idx);
             }
         }
         let key = (file, name);
@@ -4779,6 +4784,26 @@ impl<'ast, 'db> Visitor<'ast> for RefCollector<'_, 'db> {
     fn visit_expr(&mut self, expr: &'ast Expr) {
         if let Expr::Name(n) = expr {
             self.emit_name_use(n, &[]);
+            return;
+        }
+        if let Expr::Named(named) = expr {
+            // Walrus `(y := expr)` at module scope has its own
+            // ``DefinitionKind::NamedExpression`` entry in ty's global
+            // scope. ``walk_owned`` walks the inner expression and
+            // attributes uses to `y`; walking it again here would
+            // double-attribute every reference (once to the walrus
+            // target, once to whatever owns the enclosing expression).
+            // Skip into the walrus and leave its body to its own walk.
+            //
+            // Inside function / class bodies (``nested_context``), the
+            // walrus's Definition lives in the nested scope and isn't
+            // covered by ``ingest_top_level``'s per-def loop, so we
+            // still need to walk the inner value here — attributing to
+            // the enclosing top-level decl.
+            if !self.nested_context {
+                return;
+            }
+            self.visit_expr(&named.value);
             return;
         }
         if matches!(expr, Expr::Attribute(_)) {
