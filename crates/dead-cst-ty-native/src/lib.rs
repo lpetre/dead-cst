@@ -49,7 +49,7 @@ use ty_project::metadata::options::{EnvironmentOptions, Options};
 use ty_project::metadata::python_version::SupportedPythonVersion;
 use ty_project::metadata::value::{RangedValue, RelativePathBuf};
 use ty_project::{Db as ProjectDb, ProjectDatabase, ProjectMetadata};
-use ty_python_core::definition::{DefinitionKind, DefinitionState};
+use ty_python_core::definition::{DefinitionKind, DefinitionState, TargetKind};
 use ty_python_core::place::{PlaceExprRef, ScopedPlaceId};
 use ty_python_core::program::UseDefaultStrategy;
 use ty_python_core::scope::FileScopeId;
@@ -3402,6 +3402,20 @@ fn walk_owned(kind: &DefinitionKind<'_>, parsed: &ParsedModuleRef, v: &mut RefCo
             let value = a.value(parsed);
             if target_is_dunder_all(a.target(parsed)) {
                 emit_dunder_all_edges(v, value);
+            } else if let TargetKind::Sequence(_, unpack) = a.target_kind() {
+                // ``c, d = a, b`` produces one Definition per LHS
+                // name, each with ``value`` set to the whole RHS
+                // ``(a, b)``. Walking the full RHS for both ``c`` and
+                // ``d`` over-approximates (``c -> b``, ``d -> a``);
+                // when both sides are flat sequences of matching
+                // arity, pair index-by-index instead.
+                let db = v.model.db();
+                let lhs = unpack.target(db, parsed);
+                if let Some(paired) = paired_unpack_rhs(lhs, a.target(parsed), value) {
+                    v.visit_expr(paired);
+                } else {
+                    v.visit_expr(value);
+                }
             } else {
                 v.visit_expr(value);
             }
@@ -3491,6 +3505,42 @@ fn walk_type_params(type_params: &ruff_python_ast::TypeParams, v: &mut RefCollec
             }
         }
     }
+}
+
+/// Pair a tuple-unpack target with the RHS element at the same
+/// position, so each LHS name only collects edges from the value it
+/// actually receives.
+///
+/// Returns the paired RHS element when:
+/// * the full LHS (the parent unpack target) is a flat `Tuple` /
+///   `List` literal with no starred element, and
+/// * the RHS is a flat `Tuple` / `List` literal with the same arity,
+///   and
+/// * the bare `target` name appears as one of the LHS elements.
+///
+/// Returns `None` otherwise so the caller falls back to walking the
+/// whole RHS (the safe over-approximation for non-literal RHS values
+/// like `c, d = f()` and starred-target patterns).
+fn paired_unpack_rhs<'ast>(lhs: &Expr, target: &Expr, rhs: &'ast Expr) -> Option<&'ast Expr> {
+    let lhs_elts = match lhs {
+        Expr::Tuple(t) => &t.elts,
+        Expr::List(l) => &l.elts,
+        _ => return None,
+    };
+    let rhs_elts = match rhs {
+        Expr::Tuple(t) => &t.elts,
+        Expr::List(l) => &l.elts,
+        _ => return None,
+    };
+    if lhs_elts.len() != rhs_elts.len() {
+        return None;
+    }
+    if lhs_elts.iter().any(|e| matches!(e, Expr::Starred(_))) {
+        return None;
+    }
+    let target_range = target.range();
+    let pos = lhs_elts.iter().position(|e| e.range() == target_range)?;
+    Some(&rhs_elts[pos])
 }
 
 /// True iff `target` is the bare `Name("__all__")` LHS of an

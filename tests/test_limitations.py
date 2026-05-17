@@ -5,9 +5,17 @@ the ideal behaviour. When the analyser is improved these tests will
 start producing the commented-out edges and will begin to fail -- that
 is the signal to promote them into ``test_declarations`` or
 ``test_imports``.
+
+Every case here documents a *libcst-specific* gap; the rust backend
+either handles the shape correctly (per-access edges through star
+imports, source-order star resolution) or expresses a different edge
+set entirely. Each case is tagged ``skip="rust"`` so the rust suite
+stays clean while we keep the documented libcst behavior pinned.
 """
 
 import pytest
+
+from tests.conftest import case
 
 
 @pytest.mark.parametrize(
@@ -16,7 +24,7 @@ import pytest
         # ------------------------------------------------------------------
         # Dynamic / runtime features
         # ------------------------------------------------------------------
-        pytest.param(
+        case(
             {
                 "other.py": "def g(): pass\n",
                 "mod.py": """
@@ -32,7 +40,9 @@ import pytest
             # ``mod.a -> other.g`` would also be present, but
             # ScopeProvider cannot bind the bare ``g`` reference back to
             # the star import, so the visitor never emits anything for
-            # the call site.
+            # the call site. The rust backend resolves through star
+            # imports via ty's type hierarchy and does emit per-access
+            # edges.
             {
                 "mod -> mod.g",
                 "mod -> other",
@@ -43,9 +53,10 @@ import pytest
                 "mod.g -> other.g",
                 "other.g -> other",
             },
+            skip="rust",
             id="star-import-fans-out-but-misses-per-access-edge",
         ),
-        pytest.param(
+        case(
             {
                 "mod.py": """
                 x = 1
@@ -59,9 +70,10 @@ import pytest
                 "mod -> mod.x",
                 "mod.x -> mod",
             },
+            skip="rust",
             id="del-does-not-remove-declaration",
         ),
-        pytest.param(
+        case(
             {
                 "mod.py": """
                 x = 1
@@ -103,9 +115,10 @@ import pytest
                 "mod.f -> mod",
                 "mod.x -> mod",
             },
+            skip="rust",
             id="global-rebind-misattributes-outer-read",
         ),
-        pytest.param(
+        case(
             {
                 "a.py": 'def g(): return "a"\n',
                 "b.py": 'def g(): return "b"\n',
@@ -136,6 +149,11 @@ import pytest
             # requires propagating each star's source position into
             # ``star_records`` and replacing-on-collision in source
             # order rather than alphabetic-by-target order.
+            #
+            # The rust backend mints one node per star statement
+            # rather than per name, so this libcst-specific bug
+            # doesn't apply — there's no synthetic ``mod.g`` to
+            # mis-route through.
             {
                 "a.g -> a",
                 "b.g -> b",
@@ -156,6 +174,7 @@ import pytest
                 "mod.g -> a.g",
                 "mod.g -> mod",
             },
+            skip="rust",
             id="last-star-wins-not-implemented",
         ),
     ],
