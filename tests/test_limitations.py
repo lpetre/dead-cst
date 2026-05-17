@@ -6,11 +6,12 @@ start producing the commented-out edges and will begin to fail -- that
 is the signal to promote them into ``test_declarations`` or
 ``test_imports``.
 
-Every case here documents a *libcst-specific* gap; the rust backend
-either handles the shape correctly (per-access edges through star
-imports, source-order star resolution) or expresses a different edge
-set entirely. Each case is tagged ``skip="rust"`` so the rust suite
-stays clean while we keep the documented libcst behavior pinned.
+Most cases document *libcst-specific* gaps the rust backend doesn't
+share (per-access edges through star imports, source-order star
+resolution, ...); they're tagged ``skip="rust"`` so the rust suite
+stays clean. Cases tagged ``skip="libcst"`` are the inverse — gaps
+unique to the rust backend (typically blocked on an upstream ty
+TODO) where libcst handles the shape correctly.
 """
 
 import pytest
@@ -176,6 +177,47 @@ from tests.conftest import case
             },
             skip="rust",
             id="last-star-wins-not-implemented",
+        ),
+        # ------------------------------------------------------------------
+        # Rust-specific gaps (blocked on upstream ty TODOs).
+        # ------------------------------------------------------------------
+        case(
+            {
+                "mod.py": """
+                nums = [1, 2, 3]
+                result = [last := n for n in nums]
+                def use(): return last
+                """,
+            },
+            # Per PEP 572, a walrus inside a comprehension binds its
+            # target in the *containing* scope -- ``mod.last`` should
+            # surface as a top-level decl and ``use``'s reference to
+            # ``last`` should route to it.
+            #
+            # ty has a ``// TODO walrus in comprehensions is implicitly
+            # nonlocal`` at
+            # ``vendor/ruff/crates/ty_python_core/src/builder.rs:3605``,
+            # so the walrus's ``DefinitionKind::NamedExpression``
+            # currently lives in the comprehension scope rather than
+            # the enclosing module scope. Our ``ingest_decls`` loop
+            # iterates the module's global scope and so doesn't see
+            # the leaked binding -- ``mod.last`` is never minted, the
+            # ``use``-site reference goes unresolved, and reachability
+            # treats ``last`` as if it were never written.
+            #
+            # When ty grows the binding-in-enclosing-scope handling,
+            # ``ingest_decls`` will pick the leaked binding up for
+            # free and this test should be dropped (the libcst-side
+            # already pins the ideal shape via
+            # ``test_declarations`` ``walrus-comprehension-toplevel-leak-captured``).
+            {
+                "mod.nums -> mod",
+                "mod.result -> mod",
+                "mod.result -> mod.nums",
+                "mod.use -> mod",
+            },
+            skip="libcst",
+            id="comprehension-walrus-doesnt-leak-to-enclosing-scope",
         ),
     ],
 )
