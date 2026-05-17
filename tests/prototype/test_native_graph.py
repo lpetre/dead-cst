@@ -145,9 +145,17 @@ def test_aliased_import_binds_asname(project_factory):
     assert "pkg.mod.gee -> pkg.other.g" in _edges(g)
 
 
-def test_star_import_binds_each_exported_name(project_factory):
-    """`from foo import *` mints one *implicit* `kind=import` node per
-    name `foo` exports — Principle 2 applied to star imports."""
+def test_star_import_mints_one_node_per_statement(project_factory):
+    """`from X import *` mints exactly one `kind=import` node per
+    statement (named `<importing_module>.*<source>`), not one per
+    name `X` exports — ty already resolves uses of star-bound names
+    to their specific upstream definitions, so the per-name aliases
+    libcst minted as a workaround aren't needed here. The single
+    star node carries one outgoing edge to the upstream module; uses
+    of star-bound names emit `use → star_node` plus the standard
+    parallel `use → upstream_module` / `use → upstream_decl` edges
+    via Principle 2.
+    """
     proj, _ = project_factory(
         {
             "pkg/__init__.py": "",
@@ -157,16 +165,23 @@ def test_star_import_binds_each_exported_name(project_factory):
     )
     g = proj.build()
     fqs = _fqnames(g)
-    assert "pkg.mod.g" in fqs and "pkg.mod.h" in fqs
-    assert "pkg.mod._private" not in fqs  # underscore-prefixed not star-exported
+    # One star node per statement — the underscored-private decl
+    # didn't matter for node count, and per-name `pkg.mod.g` /
+    # `pkg.mod.h` aliases are gone.
+    assert "pkg.mod.*pkg.other" in fqs
+    assert "pkg.mod.g" not in fqs
+    assert "pkg.mod.h" not in fqs
     edges = _edges(g)
-    assert "pkg.mod.g -> pkg.other.g" in edges
-    assert "pkg.mod.h -> pkg.other.h" in edges
-    assert "pkg.mod.use -> pkg.mod.g" in edges
-    assert "pkg.mod.use -> pkg.mod.h" in edges
+    # Star alias's one outgoing edge: to the upstream module.
+    assert "pkg.mod.*pkg.other -> pkg.other" in edges
+    # Use sites: alias edge through the star + parallel upstream
+    # (ty's resolution finds `g` / `h` in `pkg.other`).
+    assert "pkg.mod.use -> pkg.mod.*pkg.other" in edges
+    assert "pkg.mod.use -> pkg.other.g" in edges
+    assert "pkg.mod.use -> pkg.other.h" in edges
 
 
-def test_star_import_node_is_flagged_as_star(project_factory):
+def test_star_import_node_carries_star_spec(project_factory):
     proj, _ = project_factory(
         {
             "pkg/__init__.py": "",
@@ -175,7 +190,8 @@ def test_star_import_node_is_flagged_as_star(project_factory):
         }
     )
     g = proj.build()
-    [node] = [n for n in g.nodes if n.fqname == "pkg.mod.g"]
+    [node] = [n for n in g.nodes if n.fqname == "pkg.mod.*pkg.other"]
+    assert node.kind == "import"
     assert node.imports is not None
     assert node.imports.star is True
     assert node.imports.module == "pkg.other"
