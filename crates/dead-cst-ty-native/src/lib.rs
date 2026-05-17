@@ -502,11 +502,13 @@ fn build_project_graph(py: Python<'_>, db: &ProjectDatabase) -> PyResult<BuildOu
         let pyi_decls: Vec<(String, usize)> = globals_by_name
             .iter()
             .filter(|((file, _), _)| *file == pyi_file)
-            .map(|((_, name), &idx)| (name.clone(), idx))
+            .flat_map(|((_, name), idxs)| idxs.iter().map(move |&idx| (name.clone(), idx)))
             .collect();
         for (name, pyi_idx) in pyi_decls {
-            if let Some(&py_idx) = globals_by_name.get(&(py_twin, name)) {
-                builder.add_edge(pyi_idx, py_idx, 0);
+            if let Some(py_idxs) = globals_by_name.get(&(py_twin, name)) {
+                for &py_idx in py_idxs {
+                    builder.add_edge(pyi_idx, py_idx, 0);
+                }
             }
         }
     }
