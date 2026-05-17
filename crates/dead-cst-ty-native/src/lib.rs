@@ -1864,6 +1864,14 @@ fn ingest_decls(
     let global = FileScopeId::global();
     let place_table = index.place_table(global);
     let use_def_map = index.use_def_map(global);
+    // ty emits one `StarImport` definition per imported name, but
+    // every per-name def from the same `from X import *` statement
+    // shares the `*` token's range — so the `*<src>` local name we
+    // synthesize is identical across all of them. Cache by that
+    // shared range to avoid re-resolving `from_module_string` and
+    // re-allocating the format string N times for a star statement
+    // that brings in N names.
+    let mut star_local_name_cache: HashMap<TextRange, String> = HashMap::new();
 
     for (_def_id, state, _used) in use_def_map.all_definitions_with_usage() {
         let DefinitionState::Defined(def) = state else {
@@ -1909,18 +1917,18 @@ fn ingest_decls(
         // all pointing at this single node — so a downstream
         // `from A import g` still finds the star alias by name and
         // can chase through it to B.
+        let target_range = kind.target_range(&parsed);
         let local_name = match kind {
-            DefinitionKind::StarImport(k) => {
-                let stmt = k.import(&parsed);
-                let src = ModuleName::from_import_statement(db, file, stmt)
-                    .map(|n| n.as_str().to_string())
-                    .unwrap_or_default();
-                format!("*{src}")
-            }
+            DefinitionKind::StarImport(k) => star_local_name_cache
+                .entry(target_range)
+                .or_insert_with(|| {
+                    let src = from_module_string(db, file, k.import(&parsed));
+                    format!("*{src}")
+                })
+                .clone(),
             _ => per_name.clone(),
         };
 
-        let target_range = kind.target_range(&parsed);
         let (mut sl, mut sc, el, ec) = position(&line_index, &source, target_range);
 
         // For Function / Class / TypeAlias, ty's `target_range` is the
@@ -2003,7 +2011,7 @@ fn ingest_decls(
         // would otherwise miss `from A import g` chains that probe
         // for the per-name `"g"`. For non-star imports `per_name`
         // and `local_name` are identical so this is a no-op there.
-        let name_key = (file, per_name.clone());
+        let name_key = (file, per_name);
         if let Some(spec) = import_spec {
             // Star-reexport synthetics need their upstream tracked so
             // Phase 2 can walk a `from A import g` resolution through
