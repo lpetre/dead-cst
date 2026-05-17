@@ -2886,17 +2886,34 @@ fn resolve_import_target(
 
 /// Resolve `from <stmt> import <symbol>` to its upstream target node.
 ///
-/// Tries, in order:
-/// 1. **Submodule** — `<module>.<symbol>` resolves as a module (so
-///    `from p import q` where `p/q.py` exists).
-/// 2. **Direct global lookup** — walks `globals_by_name` through any
-///    star-reexport chain (`A → B → C`) until it hits a non-reexport
-///    binding (a decl or non-star import alias). For the shadow case
-///    (`from other import *; def g():` in mod), the last-write-wins
-///    `globals_by_name` returns the local def directly. Cycle-safe via
-///    a `seen` set in `walk_globals_chain`.
+/// Mirrors CPython's `_handle_fromlist` (`Lib/importlib/_bootstrap.py`):
+/// check the package's namespace first, fall back to a submodule only
+/// when nothing's bound. Concretely:
+///
+/// 1. **Namespace lookup** — walks `globals_by_name` for the target
+///    module, through any star-reexport chain (`A → B → C`), until it
+///    hits a non-reexport binding (a decl or non-star import alias).
+///    This is CPython's `hasattr(module, name)` step: if a name is
+///    bound in `p/__init__.py` (whether by `q = 42` or by
+///    `from . import q`), that binding wins — *even* if a submodule
+///    `p/q.py` also exists. The shadow case
+///    (`from other import *; def g():` in mod) also lands here via
+///    last-write-wins `globals_by_name`.
+/// 2. **Submodule fallback** — `<module>.<symbol>` resolves as a
+///    module (`from p import q` where `p/q.py` exists and nothing is
+///    bound to `q` in `p/__init__.py`). This is CPython's
+///    `__import__(f"{p}.{name}")` branch.
 /// 3. **Module fallback** — alias still gets an out-edge to the
 ///    upstream module so reachability propagates.
+///
+/// Why namespace-first (the CPython order) matters: for `from p
+/// import q` where `p/__init__.py` does `q = 42` *and* `p/q.py`
+/// exists, CPython binds `q` to the int — the submodule never
+/// executes. A submodule-first analyzer would wrongly keep `p/q.py`
+/// alive and miss the real binding. The reorder fixes this case and
+/// agrees with CPython semantics on every other case (including
+/// `from . import q` aliases that bind the submodule to the package
+/// namespace explicitly).
 ///
 /// Deliberately does NOT use ty's `definitions_for_imported_symbol`,
 /// which recursively chases alias chains across files. Per Principle 2
@@ -2920,25 +2937,8 @@ fn resolve_from_imported(
         return Ok(None);
     };
 
-    // 1. Try `<module>.<symbol>` as a submodule first.
-    if let Some(submodule_name) = ModuleName::new(symbol_name) {
-        let mut combined = module_name.clone();
-        combined.extend(&submodule_name);
-        if let Some(sub_module) = resolve_module(db, importing_file, &combined) {
-            if let Some(sub_file) = sub_module.file(db) {
-                return Ok(Some(mint_module_node(
-                    py,
-                    db,
-                    sub_file,
-                    builder,
-                    module_nodes,
-                )?));
-            }
-        }
-    }
-
-    // 2. Resolve the target module's file, then walk globals_by_name
-    //    through any star-reexport chain.
+    // 1. Resolve the target module's file and probe its namespace —
+    //    CPython's `hasattr(module, name)`.
     let Some(module) = resolve_module(db, importing_file, &module_name) else {
         return Ok(None);
     };
@@ -2953,6 +2953,24 @@ fn resolve_from_imported(
         star_reexports,
     ) {
         return Ok(Some(idx));
+    }
+
+    // 2. Namespace miss — fall back to importing `<module>.<symbol>`
+    //    as a submodule. CPython's `__import__(f"{p}.{name}")`.
+    if let Some(submodule_name) = ModuleName::new(symbol_name) {
+        let mut combined = module_name.clone();
+        combined.extend(&submodule_name);
+        if let Some(sub_module) = resolve_module(db, importing_file, &combined) {
+            if let Some(sub_file) = sub_module.file(db) {
+                return Ok(Some(mint_module_node(
+                    py,
+                    db,
+                    sub_file,
+                    builder,
+                    module_nodes,
+                )?));
+            }
+        }
     }
 
     // 3. Fallback: link the alias to the upstream module node.
