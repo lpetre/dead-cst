@@ -293,6 +293,7 @@ STAR_REEXPORT_EDGES = frozenset(
             "from p.chain import functions as g\ndef a(): g.f()",
             {
                 "p.x.a -> p.chain",
+                "p.x.a -> p.chain.functions",
                 "p.x.a -> p.x",
                 "p.x.a -> p.x.g",
                 "p.x.g -> p.chain",
@@ -373,6 +374,7 @@ STAR_REEXPORT_EDGES = frozenset(
             "from p.chain import functions\ndef a(): functions.f()",
             {
                 "p.x.a -> p.chain",
+                "p.x.a -> p.chain.functions",
                 "p.x.a -> p.x",
                 "p.x.a -> p.x.functions",
                 "p.x.functions -> p.chain",
@@ -1028,10 +1030,13 @@ def test_cyclic_reexport_terminates_rust(build_decl_graph, assert_edges):
     """Re-export cycle terminates without spinning (rust behavior).
 
     The rust backend resolves each alias once and stops — no
-    reexport-chain self-edges (``A.x -> A.x``), no use-site fan-out
-    through the cycle (``main -> A.x`` / ``main -> B.x``). The cycle
-    itself is still represented (``A.x -> B.x``, ``B.x -> A.x``) so
-    reachability from `main` can still walk it.
+    reexport-chain self-edges (``A.x -> A.x``), no transitive walk
+    through the cycle (no ``main -> B.x``). The cycle itself is still
+    represented (``A.x -> B.x``, ``B.x -> A.x``) so reachability from
+    `main` can still walk it. The use-site does emit the standard
+    Principle 2 parallel-upstream edge to ``A.x`` (the decl in A's
+    namespace that the import resolved to) — same shape as
+    ``main -> A`` for the upstream module.
     """
     graph = build_decl_graph(
         {
@@ -1051,6 +1056,7 @@ def test_cyclic_reexport_terminates_rust(build_decl_graph, assert_edges):
             "B.x -> A.x",
             "B.x -> B",
             "main -> A",
+            "main -> A.x",
             "main -> main.x",
             "main.x -> A",
             "main.x -> A.x",
