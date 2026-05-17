@@ -891,6 +891,82 @@ impl ProjectContext {
         Ok(out)
     }
 
+    /// Return ``module_fqn``'s immediate top-level decls — every
+    /// function / class / variable / import bound at its module scope.
+    ///
+    /// Models ``from module_fqn import *``: only the names that
+    /// statement would bind into the importing scope. Unlike
+    /// :meth:`module_surface`, submodules and their decls are
+    /// excluded — a `from p.functions import *` doesn't pull in
+    /// `p.functions.sub.x`. Empty list when ``module_fqn`` doesn't
+    /// resolve to a project module.
+    fn find_module_top_level_decls(
+        &self,
+        py: Python<'_>,
+        module_fqn: &str,
+    ) -> PyResult<Vec<Py<NativeNode>>> {
+        let outputs = self.outputs.borrow();
+        let outputs = outputs
+            .as_ref()
+            .ok_or_else(|| not_materialized("find_module_top_level_decls"))?;
+        if !outputs.module_by_fqname.contains_key(module_fqn) {
+            return Ok(Vec::new());
+        }
+        let prefix = format!("{module_fqn}.");
+        let mut out = Vec::new();
+        for (fqname, idxs) in &outputs.decl_by_fqname {
+            let Some(rest) = fqname.strip_prefix(&prefix) else {
+                continue;
+            };
+            // Skip transitive decls (`pkg.mod.sub.x` under `pkg.mod`).
+            if rest.contains('.') {
+                continue;
+            }
+            for &idx in idxs {
+                out.push(outputs.builder.nodes[idx].clone_ref(py));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Return the decls listed in ``module_fqn``'s ``__all__``, or
+    /// ``None`` when the module doesn't declare ``__all__``.
+    ///
+    /// The visitor's ``emit_dunder_all_edges`` already wires
+    /// ``__all__`` → each string-listed decl as a regular edge; this
+    /// query walks those successor edges, filters out the default
+    /// ``decl -> parent_module`` edge, and returns the rest. The
+    /// distinction between "no ``__all__``" (``None``) and "empty
+    /// ``__all__``" (``Some([])``) matters: callers that want
+    /// CPython's ``from X import *`` semantics should fall back to
+    /// the non-underscore decl list only in the ``None`` case.
+    fn find_module_dunder_all_exports(
+        &self,
+        py: Python<'_>,
+        module_fqn: &str,
+    ) -> PyResult<Option<Vec<Py<NativeNode>>>> {
+        let outputs = self.outputs.borrow();
+        let outputs = outputs
+            .as_ref()
+            .ok_or_else(|| not_materialized("find_module_dunder_all_exports"))?;
+        let all_fqn = format!("{module_fqn}.__all__");
+        let Some(idxs) = outputs.decl_by_fqname.get(&all_fqn) else {
+            return Ok(None);
+        };
+        let module_idx = outputs.module_by_fqname.get(module_fqn).copied();
+        let mut out: Vec<Py<NativeNode>> = Vec::new();
+        for &all_idx in idxs {
+            for &(dst, _flags) in &outputs.builder.forward_adj[all_idx] {
+                if Some(dst) == module_idx {
+                    // Skip the default ``decl -> parent_module`` edge.
+                    continue;
+                }
+                out.push(outputs.builder.nodes[dst].clone_ref(py));
+            }
+        }
+        Ok(Some(out))
+    }
+
     /// Every node whose ``path`` starts with the given prefix.
     fn decls_under(&self, py: Python<'_>, path_prefix: &str) -> PyResult<Vec<Py<NativeNode>>> {
         let outputs = self.outputs.borrow();

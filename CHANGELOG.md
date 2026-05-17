@@ -10,6 +10,41 @@ two versions.
 ## [Unreleased]
 
 ### Added
+- :class:`dead_cst.plugins.DynamicImportFallbackPlugin` — a plugin
+  that reads :attr:`EdgeFlags.DYNAMIC_IMPORT` edges and fans each
+  flagged ``src -> module`` edge out to the module's exports. Gives
+  projects that prefer the conservative "import-by-name keeps every
+  export alive" semantic an opt-in path without baking the fan-out
+  into the visitor — pass ``DynamicImportFallbackPlugin()`` to
+  :class:`Analysis` or to ``native.ProjectContext.add_plugin`` to
+  enable. Six options spanning the three intended rollout stages:
+
+  * **Catch-all shape** (stage 1): ``include_underscore=False``
+    (default) skips ``_private`` names matching
+    ``from X import *`` runtime semantics, and
+    ``respect_dunder_all=True`` (default) uses the target module's
+    ``__all__`` list as the export set when present.
+  * **Targeted excludes** (stage 2, after focused per-feature
+    plugins land): ``exclude_sources`` (path globs matched against
+    each call site's source path) and ``exclude_targets`` (fnmatch
+    patterns matched against the target module fqname) opt specific
+    files / module trees *out* of the catch-all so the focused
+    plugin owns them.
+  * **Targeted includes** (stage 3, when the exclude list gets
+    unwieldy): ``include_sources`` / ``include_targets`` flip the
+    semantics — when non-empty, only matching call sites
+    participate. Composes with the exclude lists as
+    ``include AND NOT exclude``.
+
+  The plugin implements both the libcst-side ``finalize`` and the
+  rust-backend ``run(ctx)`` protocols. On the libcst pipeline (which
+  inlines fan-out at visit time without setting the
+  ``DYNAMIC_IMPORT`` flag) the plugin sees no flagged edges and is a
+  no-op. On the rust backend it walks ``ctx.edges()`` and uses the
+  new :meth:`ProjectContext.find_module_top_level_decls` /
+  :meth:`find_module_dunder_all_exports` queries to enumerate
+  exports.
+
 - ``from <pkg> import <name>`` now resolves through ``from <other> import *``
   re-exports. ``build_contribution`` runs a second pass over each
   package after its per-file payloads are applied: for every
