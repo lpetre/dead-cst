@@ -10,6 +10,24 @@ two versions.
 ## [Unreleased]
 
 ### Added
+- :class:`dead_cst.plugins.DynamicImportFallbackPlugin` — a finalize
+  plugin that reads :attr:`EdgeFlags.DYNAMIC_IMPORT` edges and fans
+  each flagged ``src -> module`` edge out to the module's exports.
+  Gives projects that prefer the conservative "import-by-name keeps
+  every export alive" semantic an opt-in path without baking the
+  fan-out into the visitor — pass ``DynamicImportFallbackPlugin()`` to
+  :class:`Analysis` to enable. Two options:
+  ``include_underscore=False`` (default) skips ``_private`` names
+  matching ``from X import *`` runtime semantics, and
+  ``respect_dunder_all=True`` (default) uses the target module's
+  ``__all__`` list as the export set when present. The plugin is
+  rust-backend-only in practice today — the libcst pipeline already
+  inlines fan-out at visit time without setting the
+  ``DYNAMIC_IMPORT`` flag, so the plugin is a no-op there. Authors
+  who want tighter targeting for a specific dynamic-import idiom
+  (Click loaders, Celery beat schedules, ...) should write a focused
+  custom plugin and leave this fallback off.
+
 - ``from <pkg> import <name>`` now resolves through ``from <other> import *``
   re-exports. ``build_contribution`` runs a second pass over each
   package after its per-file payloads are applied: for every

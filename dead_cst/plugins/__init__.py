@@ -97,6 +97,7 @@ from ..contrib.server_config import ServerConfigPlugin
 from ..contrib.typer import TyperPlugin
 from ..contrib.unittest import UnittestPlugin
 from .decl_shapes import DecoratedDeclPlugin, LiteralListPlugin
+from .dynamic_import import DynamicImportFallbackPlugin
 from .explicit_entrypoint import ExplicitEntrypointPlugin
 from .init_subclass import InitSubclassPlugin
 from .main_block import MainBlockPlugin
@@ -121,6 +122,7 @@ BUILTIN_PLUGINS: dict[str, type] = {
     CeleryPlugin.name: CeleryPlugin,
     DiscordPyPlugin.name: DiscordPyPlugin,
     InitSubclassPlugin.name: InitSubclassPlugin,
+    DynamicImportFallbackPlugin.name: DynamicImportFallbackPlugin,
 }
 
 
@@ -147,6 +149,7 @@ __all__ = [
     "CycloptsPlugin",
     "DecoratedDeclPlugin",
     "DiscordPyPlugin",
+    "DynamicImportFallbackPlugin",
     "EXTERNAL_DIST_PREFIX",
     "EXTERNAL_FILE_PREFIX",
     "EXTERNAL_PREFIXES",
