@@ -30,7 +30,15 @@ from ..graph import EdgeFlags, SymbolNode
 from ._core import AddEdge, GraphOp, ObserveContext, PluginContext, simple_name
 
 if TYPE_CHECKING:
+    import dead_cst_ty_native as native
+
     from ..graph import VisitorPayload
+
+# Mirror of ``EdgeFlags.DYNAMIC_IMPORT`` (``enum.auto()`` = 2) for use
+# against the rust backend's raw edge tuples. The two constants are
+# pinned together in :class:`EdgeFlags` and in
+# ``crates/dead-cst-ty-native/src/lib.rs::EDGE_FLAG_DYNAMIC_IMPORT``.
+_DYNAMIC_IMPORT_FLAG: int = int(EdgeFlags.DYNAMIC_IMPORT)
 
 
 @dataclass
@@ -122,6 +130,52 @@ class DynamicImportFallbackPlugin:
         else:
             exports = [d for d in decls if not simple_name(d.fqname).startswith("_")]
         self._export_cache[module.fqname] = exports
+        return exports
+
+    def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
+        """Rust-backend counterpart of :meth:`finalize`.
+
+        Walks ``ctx.edges()`` for ``DYNAMIC_IMPORT``-flagged triples,
+        looks up each target module's exports via
+        :meth:`ProjectContext.find_module_dunder_all_exports` /
+        :meth:`find_module_top_level_decls`, and yields
+        :class:`native.AddEdge` per fan-out target. The per-pass cache
+        keeps the export query at one lookup per module even when
+        several call sites import the same one.
+        """
+        import dead_cst_ty_native as native
+
+        nodes = ctx.nodes()
+        cache: dict[str, list] = {}
+        for src_idx, dst_idx, flags in ctx.edges():
+            if not (flags & _DYNAMIC_IMPORT_FLAG):
+                continue
+            dst = nodes[dst_idx]
+            if dst.kind != "module":
+                continue
+            src = nodes[src_idx]
+            for export in self._native_exports_for(ctx, dst.fqname, cache):
+                yield native.AddEdge(src=src, dst=export)
+
+    def _native_exports_for(
+        self,
+        ctx: native.ProjectContext,
+        module_fqname: str,
+        cache: dict[str, list],
+    ) -> list:
+        cached = cache.get(module_fqname)
+        if cached is not None:
+            return cached
+        exports = None
+        if self.respect_dunder_all:
+            exports = ctx.find_module_dunder_all_exports(module_fqname)
+        if exports is None:
+            decls = ctx.find_module_top_level_decls(module_fqname)
+            if self.include_underscore:
+                exports = decls
+            else:
+                exports = [d for d in decls if not simple_name(d.fqname).startswith("_")]
+        cache[module_fqname] = exports
         return exports
 
 

@@ -10,8 +10,15 @@ inject ``DYNAMIC_IMPORT`` edges, and exercise the plugin's
 
 from __future__ import annotations
 
+import pytest
+
 from dead_cst.graph import EdgeFlags
-from dead_cst.plugins import DynamicImportFallbackPlugin, PluginContext, apply_ops
+from dead_cst.plugins import (
+    DynamicImportFallbackPlugin,
+    MainBlockPlugin,
+    PluginContext,
+    apply_ops,
+)
 
 
 def _run_finalize(plugin, analysis, graph):
@@ -218,3 +225,103 @@ def test_libcst_pipeline_no_op(make_analysis, write_files):
     # Re-run finalize and confirm the edge set is unchanged.
     _run_finalize(DynamicImportFallbackPlugin(), analysis, graph)
     assert {(u, v) for u, v in graph.raw.edge_list()} == edges
+
+
+# ---------------------------------------------------------------------------
+# Rust backend integration — run(ctx) end-to-end via build_plugin_graph.
+# The rust path emits DYNAMIC_IMPORT-flagged edges for __import__ /
+# importlib.import_module calls, so this is where the plugin's effect
+# is observable without hand-injection.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skip_when_backend("libcst")
+def test_run_fans_importlib_call_to_module_exports(build_plugin_graph, reachable_fqnames):
+    """``importlib.import_module('pkg.target')`` on the rust backend
+    emits one DYN-flagged edge to ``pkg.target``. The plugin's
+    ``run(ctx)`` should fan that edge out to every non-underscore
+    top-level decl of the module, keeping them alive under
+    reachability."""
+    graph = build_plugin_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/loader.py": (
+                "import importlib\n"
+                "def main(): importlib.import_module('pkg.target')\n"
+                "if __name__ == '__main__': main()\n"
+            ),
+            "pkg/target.py": ("def public(): pass\ndef _private(): pass\ndef other(): pass\n"),
+        },
+        [DynamicImportFallbackPlugin(), MainBlockPlugin()],
+    )
+    reached = reachable_fqnames(graph)
+    assert "pkg.target.public" in reached
+    assert "pkg.target.other" in reached
+    # Underscore name skipped by the default `include_underscore=False`.
+    assert "pkg.target._private" not in reached
+
+
+@pytest.mark.skip_when_backend("libcst")
+def test_run_respects_dunder_all(build_plugin_graph, reachable_fqnames):
+    """When the target module declares ``__all__``, only the listed
+    names participate in the fan-out."""
+    graph = build_plugin_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/loader.py": (
+                "import importlib\n"
+                "def main(): importlib.import_module('pkg.target')\n"
+                "if __name__ == '__main__': main()\n"
+            ),
+            "pkg/target.py": ("__all__ = ['kept']\ndef kept(): pass\ndef dropped(): pass\n"),
+        },
+        [DynamicImportFallbackPlugin(), MainBlockPlugin()],
+    )
+    reached = reachable_fqnames(graph)
+    assert "pkg.target.kept" in reached
+    assert "pkg.target.dropped" not in reached
+
+
+@pytest.mark.skip_when_backend("libcst")
+def test_run_include_underscore_picks_private_names(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/loader.py": (
+                "import importlib\n"
+                "def main(): importlib.import_module('pkg.target')\n"
+                "if __name__ == '__main__': main()\n"
+            ),
+            "pkg/target.py": "def public(): pass\ndef _private(): pass\n",
+        },
+        [
+            DynamicImportFallbackPlugin(include_underscore=True),
+            MainBlockPlugin(),
+        ],
+    )
+    reached = reachable_fqnames(graph)
+    assert "pkg.target.public" in reached
+    assert "pkg.target._private" in reached
+
+
+@pytest.mark.skip_when_backend("libcst")
+def test_run_no_op_without_dynamic_imports(build_plugin_graph, reachable_fqnames):
+    """With no ``__import__`` / ``importlib.import_module`` calls there
+    are no DYN-flagged edges; the plugin emits nothing."""
+    graph = build_plugin_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/loader.py": (
+                "from pkg.target import public\n"
+                "def main(): public()\n"
+                "if __name__ == '__main__': main()\n"
+            ),
+            "pkg/target.py": "def public(): pass\ndef other(): pass\n",
+        },
+        [DynamicImportFallbackPlugin(), MainBlockPlugin()],
+    )
+    reached = reachable_fqnames(graph)
+    # Direct import of `public` — alive. `other` was never named, so
+    # it stays dead.
+    assert "pkg.target.public" in reached
+    assert "pkg.target.other" not in reached
