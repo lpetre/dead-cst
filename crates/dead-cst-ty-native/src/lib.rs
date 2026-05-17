@@ -247,6 +247,23 @@ struct GraphBuilder {
     /// pop instead of O(|edges|).
     forward_adj: Vec<Vec<(usize, u32)>>,
     reverse_adj: Vec<Vec<(usize, u32)>>,
+    /// `{ pyi_file -> py_twin_file }` for peer ``.pyi`` files whose
+    /// ``.py`` twin is also in the project. Both files get ingested
+    /// independently (the rust path differs from libcst here — we
+    /// trust ty's per-source-type understanding). The map drives two
+    /// behaviors that close the liveness gap when ty's module
+    /// resolver prefers the stub:
+    ///
+    /// * ``resolve_from_imported`` falls back to the .py twin's
+    ///   namespace when the .pyi lookup misses, so the consumer's
+    ///   ``alias -> upstream decl`` parallel edge lands on the
+    ///   runtime decl instead of being dropped.
+    /// * ``file_default_flags`` distinguishes peer ``.pyi`` (no
+    ///   default flag; liveness flows via the fallback) from
+    ///   stub-only ``.pyi`` (no .py twin -> flagged ``ENTRYPOINT``
+    ///   so native-extension / protobuf-style stubs stay alive
+    ///   artificially even when no consumer references them).
+    peer_pyi_to_py: HashMap<File, File>,
 }
 
 impl GraphBuilder {
@@ -258,6 +275,7 @@ impl GraphBuilder {
             edge_set: HashSet::new(),
             forward_adj: Vec::new(),
             reverse_adj: Vec::new(),
+            peer_pyi_to_py: HashMap::new(),
         }
     }
 
@@ -390,9 +408,39 @@ fn build_project_graph(py: Python<'_>, db: &ProjectDatabase) -> PyResult<BuildOu
     for &file in &project_files {
         path_to_file.insert(file_path_string(db, file), file);
     }
+    // Peer ``.pyi`` files: register the ``.pyi -> .py twin`` mapping
+    // so import resolution can fall back when the stub lookup misses
+    // and so ``file_default_flags`` can tell peer .pyi (decls reach
+    // their runtime via the fallback) from stub-only .pyi (decls
+    // need an artificial ENTRYPOINT to stay alive — native extension
+    // stubs and protobuf-style _pb2.pyi shapes).
+    let py_files_by_stem: HashMap<String, File> = project_files
+        .iter()
+        .filter_map(|&f| {
+            file_path_string(db, f)
+                .strip_suffix(".py")
+                .map(|stem| (stem.to_string(), f))
+        })
+        .collect();
+    for &f in &project_files {
+        let path = file_path_string(db, f);
+        if let Some(stem) = path.strip_suffix(".pyi") {
+            if let Some(&py_twin) = py_files_by_stem.get(stem) {
+                builder.peer_pyi_to_py.insert(f, py_twin);
+            }
+        }
+    }
     let t_enum = t0.elapsed();
     let t1 = std::time::Instant::now();
+    // Two-pass ingest so the per-decl ``.pyi`` stub flagging in
+    // ``ingest_decls`` has the .py twin's ``globals_by_name`` entries
+    // to probe. Pass 1 = everything that isn't a .pyi; pass 2 = .pyi.
+    // The split doesn't change the graph for non-peer files; it's
+    // ordering for the peer-stub flag-check only.
     for file in &project_files {
+        if file_path_string(db, *file).ends_with(".pyi") {
+            continue;
+        }
         ingest_decls(
             py,
             db,
@@ -407,6 +455,50 @@ fn build_project_graph(py: Python<'_>, db: &ProjectDatabase) -> PyResult<BuildOu
             &mut class_by_selection,
             &mut decl_by_name_range,
         )?;
+    }
+    for file in &project_files {
+        if !file_path_string(db, *file).ends_with(".pyi") {
+            continue;
+        }
+        ingest_decls(
+            py,
+            db,
+            *file,
+            &mut builder,
+            &mut global_index,
+            &mut module_nodes,
+            &mut alias_imports,
+            &mut live_decls,
+            &mut globals_by_name,
+            &mut star_reexports,
+            &mut class_by_selection,
+            &mut decl_by_name_range,
+        )?;
+    }
+    // Per-decl ``pyi_decl -> py_decl`` edges for each peer .pyi whose
+    // matching .py defines the same simple name. The edge documents
+    // the stub-runtime relationship in the graph: consumers that ty
+    // resolved through the stub get reachability into the runtime
+    // decl via ``alias -> pyi_decl -> py_decl`` rather than stopping
+    // at the stub. Stub-only decls (no matching .py decl) are
+    // separately kept alive by the per-decl ENTRYPOINT flag set in
+    // ``ingest_decls``.
+    let peer_stubs: Vec<(File, File)> = builder
+        .peer_pyi_to_py
+        .iter()
+        .map(|(&pyi, &py)| (pyi, py))
+        .collect();
+    for (pyi_file, py_twin) in peer_stubs {
+        let pyi_decls: Vec<(String, usize)> = globals_by_name
+            .iter()
+            .filter(|((file, _), _)| *file == pyi_file)
+            .map(|((_, name), &idx)| (name.clone(), idx))
+            .collect();
+        for (name, pyi_idx) in pyi_decls {
+            if let Some(&py_idx) = globals_by_name.get(&(py_twin, name)) {
+                builder.add_edge(pyi_idx, py_idx, 0);
+            }
+        }
     }
     let t_phase1 = t1.elapsed();
     let t2 = std::time::Instant::now();
@@ -2654,6 +2746,20 @@ fn ingest_decls(
     let line_index = line_index(db, file);
     let path_str = file_path_string(db, file);
     let module_fqname = module_fqname_for_file(db, file);
+    let default_flags = file_default_flags(db, file);
+    // Per-decl stub flagging context. For .pyi files we OR in
+    // ``NODE_FLAG_ENTRYPOINT`` for any decl whose name has no
+    // matching runtime decl in the .py twin (or has no twin at all
+    // — native-extension and protobuf-style stubs). Decls that DO
+    // have a runtime counterpart stay un-flagged; reachability flows
+    // through them via the stub-runtime edge emitted in
+    // ``emit_stub_runtime_edges`` after both files have ingested.
+    let is_stub = path_str.ends_with(".pyi");
+    let stub_py_twin: Option<File> = if is_stub {
+        builder.peer_pyi_to_py.get(&file).copied()
+    } else {
+        None
+    };
     let (file_pinned_by_noqa, per_line_noqa_pins) =
         scan_noqa_directives(&parsed, &source, &line_index);
 
@@ -2668,7 +2774,7 @@ fn ingest_decls(
             start_column: msc,
             end_line: mel,
             end_column: mec,
-            flags: 0,
+            flags: default_flags,
             imports: None,
         },
     )?;
@@ -2791,9 +2897,17 @@ fn ingest_decls(
         // semantics for explicitly-preserved unused-import lines.
         // We tag both `ENTRYPOINT` (the live-set seed) and `NOQA`
         // (so the blast-radius query can subtract noqa-only liveness).
-        let mut flags: u32 = 0;
+        let mut flags: u32 = default_flags;
         if node_kind == "import" && (file_pinned_by_noqa || per_line_noqa_pins.contains(&sl)) {
             flags |= NODE_FLAGS_NOQA_PIN;
+        }
+        if is_stub {
+            let has_runtime = stub_py_twin
+                .map(|py| globals_by_name.contains_key(&(py, local_name.clone())))
+                .unwrap_or(false);
+            if !has_runtime {
+                flags |= NODE_FLAG_ENTRYPOINT;
+            }
         }
 
         let node_idx = builder.intern_node(
@@ -3306,6 +3420,7 @@ fn mint_module_node(
     let (sl, sc, el, ec) = position(&line_index, &source, parsed.syntax().range);
     let fqname = module_fqname_for_file(db, file);
     let path_str = file_path_string(db, file);
+    let flags = file_default_flags(db, file);
     let idx = builder.intern_node(
         py,
         NativeNode {
@@ -3316,7 +3431,7 @@ fn mint_module_node(
             start_column: sc,
             end_line: el,
             end_column: ec,
-            flags: 0,
+            flags,
             imports: None,
         },
     )?;
@@ -4675,7 +4790,12 @@ fn rel_path<P: AsRef<str>>(path: P) -> RelativePathBuf {
 /// OVERLOAD=4, TESTCASE=8, NOQA=16, …
 const NODE_FLAG_ENTRYPOINT: u32 = 2;
 const NODE_FLAG_NOQA: u32 = 16;
+const NODE_FLAG_NOTEBOOK: u32 = 32;
 const NODE_FLAGS_NOQA_PIN: u32 = NODE_FLAG_ENTRYPOINT | NODE_FLAG_NOQA;
+/// Per-source-type default flags for ``.ipynb``: notebook decls are
+/// always alive (cells run top-to-bottom, not imported) and the
+/// codemod must skip them (it can't rewrite the cell JSON envelope).
+const NODE_FLAGS_NOTEBOOK_DEFAULT: u32 = NODE_FLAG_ENTRYPOINT | NODE_FLAG_NOTEBOOK;
 
 /// `EdgeFlags::DEAD_BRANCH = enum.auto()` in `dead_cst.graph` —
 /// first non-`NONE` bit, value `1`. Stamped on every edge produced
@@ -5220,6 +5340,21 @@ fn file_path_string(db: &dyn ProjectDb, file: File) -> String {
         FilePath::System(p) => p.to_string(),
         FilePath::SystemVirtual(p) => p.to_string(),
         FilePath::Vendored(p) => p.to_string(),
+    }
+}
+
+/// Per-source-type default flag mask ORed into every node minted from
+/// this file. Only ``.ipynb`` opts in today — cells are inherently
+/// entrypoints (run top-to-bottom, not imported) and the codemod must
+/// skip the JSON envelope. ``.pyi`` decls get per-decl flagging in
+/// ``ingest_decls`` (the flag depends on whether a matching ``.py``
+/// runtime decl exists), so the file-level helper returns ``0`` for
+/// them.
+fn file_default_flags(db: &dyn ProjectDb, file: File) -> u32 {
+    if file_path_string(db, file).ends_with(".ipynb") {
+        NODE_FLAGS_NOTEBOOK_DEFAULT
+    } else {
+        0
     }
 }
 
