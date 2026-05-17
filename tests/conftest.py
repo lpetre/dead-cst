@@ -25,6 +25,39 @@ def pytest_addoption(parser):
     )
 
 
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "skip_when_backend(name): skip the test when --backend matches `name`. "
+        "Pair two `pytest.param(..., marks=pytest.mark.skip_when_backend('rust'))` / "
+        "`pytest.mark.skip_when_backend('libcst')` entries (or use the `case(..., skip=...)` "
+        "helper) for cases where the two backends diverge.",
+    )
+
+
+def pytest_collection_modifyitems(config, items):
+    backend = config.getoption("--backend")
+    for item in items:
+        marker = item.get_closest_marker("skip_when_backend")
+        if marker and marker.args and marker.args[0] == backend:
+            item.add_marker(pytest.mark.skip(reason=f"diverges on --backend={backend}"))
+
+
+def case(*args, skip=None, **kwargs):
+    """Like :func:`pytest.param` with an optional ``skip="rust"`` /
+    ``skip="libcst"`` that drops the case when that backend is the
+    one under test. For diverging cases, write two `case(...)`
+    entries side-by-side — one skipping each backend — keeping the
+    expected data per-line readable.
+    """
+    if skip is not None:
+        marks = kwargs.pop("marks", ())
+        if not isinstance(marks, (list, tuple)):
+            marks = (marks,)
+        kwargs["marks"] = (*marks, pytest.mark.skip_when_backend(skip))
+    return pytest.param(*args, **kwargs)
+
+
 @pytest.fixture(scope="session")
 def backend(request) -> str:
     return request.config.getoption("--backend")

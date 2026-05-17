@@ -11,6 +11,7 @@ import logging
 import pytest
 
 from dead_cst.plugins._core import EXTERNAL_PREFIXES, STDLIB_PREFIX, UNRESOLVED_PREFIX
+from tests.conftest import case
 
 IMPORT_TEST_FILES = {
     "p/__init__.py": "",
@@ -267,7 +268,13 @@ STAR_REEXPORT_EDGES = frozenset(
             },
             id="relative-import",
         ),
-        pytest.param(
+        # libcst follows the reexport chain at the use site, so `g.f()`
+        # picks up parallel `p.x.a -> p.chain.functions` /
+        # `p.x.a -> p.functions.f` edges (in addition to the alias
+        # edges on `p.x.g`). The rust backend stops at the alias edge
+        # — `p.x.g` already points at `p.chain.functions`, but no
+        # parallel use-site edges fan through that chain.
+        case(
             "from p.chain import functions as g\ndef a(): g.f()",
             {
                 "p.x.a -> p.chain",
@@ -279,7 +286,21 @@ STAR_REEXPORT_EDGES = frozenset(
                 "p.x.g -> p.chain.functions",
                 "p.x.g -> p.x",
             },
-            id="import-chain-via-reexport",
+            skip="rust",
+            id="import-chain-via-reexport-libcst",
+        ),
+        case(
+            "from p.chain import functions as g\ndef a(): g.f()",
+            {
+                "p.x.a -> p.chain",
+                "p.x.a -> p.x",
+                "p.x.a -> p.x.g",
+                "p.x.g -> p.chain",
+                "p.x.g -> p.chain.functions",
+                "p.x.g -> p.x",
+            },
+            skip="libcst",
+            id="import-chain-via-reexport-rust",
         ),
         pytest.param(
             "from p.functions import f\nfrom p.classes import C\ndef a(): f(); C()",
@@ -329,7 +350,11 @@ STAR_REEXPORT_EDGES = frozenset(
             },
             id="module-level-call-of-imported-symbol",
         ),
-        pytest.param(
+        # Same reexport-chain divergence as `import-chain-via-reexport`
+        # above: libcst emits parallel use-site edges through the
+        # chain (`p.x.a -> p.chain.functions`, `p.x.a -> p.functions.f`),
+        # rust stops at the alias edge on `p.x.functions`.
+        case(
             "from p.chain import functions\ndef a(): functions.f()",
             {
                 "p.x.a -> p.chain",
@@ -341,7 +366,21 @@ STAR_REEXPORT_EDGES = frozenset(
                 "p.x.functions -> p.chain.functions",
                 "p.x.functions -> p.x",
             },
-            id="reexport-through-package-init",
+            skip="rust",
+            id="reexport-through-package-init-libcst",
+        ),
+        case(
+            "from p.chain import functions\ndef a(): functions.f()",
+            {
+                "p.x.a -> p.chain",
+                "p.x.a -> p.x",
+                "p.x.a -> p.x.functions",
+                "p.x.functions -> p.chain",
+                "p.x.functions -> p.chain.functions",
+                "p.x.functions -> p.x",
+            },
+            skip="libcst",
+            id="reexport-through-package-init-rust",
         ),
         pytest.param(
             "import p\ndef a(): p.functions.f()",
@@ -362,35 +401,38 @@ STAR_REEXPORT_EDGES = frozenset(
             },
             id="import-package-then-dotted-access",
         ),
-        pytest.param(
+        # libcst minted per-name synthetic aliases as a workaround for
+        # its inability to resolve uses *through* a star import; the
+        # rust backend leans on ty and mints one node per
+        # `from X import *` statement (named `<mod>.*<src>`) with a
+        # single outgoing edge to the upstream module. Use sites
+        # route through this node and emit the standard parallel
+        # upstream module/decl edges via ty's name resolution
+        # (Principle 2).
+        case(
+            "from p.functions import *\ndef a(): f()",
+            STAR_REEXPORT_EDGES
+            | {
+                "p.x -> p.functions",
+                "p.x -> p.functions.f",
+                "p.x -> p.functions.g",
+                "p.x.a -> p.x",
+            },
+            skip="rust",
+            id="star-import-fans-out-to-all-decls-libcst",
+        ),
+        case(
             "from p.functions import *\ndef a(): f()",
             {
-                # libcst's per-name synthetic aliases — a workaround
-                # for its inability to resolve uses *through* a star
-                # import.
-                "libcst": STAR_REEXPORT_EDGES
-                | {
-                    "p.x -> p.functions",
-                    "p.x -> p.functions.f",
-                    "p.x -> p.functions.g",
-                    "p.x.a -> p.x",
-                },
-                # The rust backend mints one node per `from X import *`
-                # statement (named `<mod>.*<src>`), with a single
-                # outgoing edge to the upstream module. Use sites
-                # route through this node (alias edge) and emit the
-                # standard parallel upstream module/decl edges via
-                # ty's name resolution (Principle 2).
-                "rust": {
-                    "p.x.*p.functions -> p.x",
-                    "p.x.*p.functions -> p.functions",
-                    "p.x.a -> p.x",
-                    "p.x.a -> p.x.*p.functions",
-                    "p.x.a -> p.functions",
-                    "p.x.a -> p.functions.f",
-                },
+                "p.x.*p.functions -> p.x",
+                "p.x.*p.functions -> p.functions",
+                "p.x.a -> p.x",
+                "p.x.a -> p.x.*p.functions",
+                "p.x.a -> p.functions",
+                "p.x.a -> p.functions.f",
             },
-            id="star-import-fans-out-to-all-decls",
+            skip="libcst",
+            id="star-import-fans-out-to-all-decls-rust",
         ),
         # ------------------------------------------------------------------
         # Dynamic imports (`__import__` / `importlib.import_module`).
@@ -401,173 +443,198 @@ STAR_REEXPORT_EDGES = frozenset(
         # with `EdgeFlags.DYNAMIC_IMPORT` so a contrib plugin can fan
         # out further if a project wants the old semantic.
         # ------------------------------------------------------------------
-        pytest.param(
+        case(
             "__import__('p.functions')",
-            {
-                "libcst": STAR_REEXPORT_EDGES
-                | {
-                    "p.x -> p.functions",
-                    "p.x -> p.functions.f",
-                    "p.x -> p.functions.g",
-                },
-                "rust": {"p.x -> p.functions"},
+            STAR_REEXPORT_EDGES
+            | {
+                "p.x -> p.functions",
+                "p.x -> p.functions.f",
+                "p.x -> p.functions.g",
             },
-            id="dunder-import-call-fans-out-like-star",
+            skip="rust",
+            id="dunder-import-call-fans-out-like-star-libcst",
         ),
-        pytest.param(
+        case(
+            "__import__('p.functions')",
+            {"p.x -> p.functions"},
+            skip="libcst",
+            id="dunder-import-call-fans-out-like-star-rust",
+        ),
+        case(
             "def a(): getattr(__import__('p.functions'), 'f')()",
             {
-                "libcst": {
-                    "p.x.a -> p.functions",
-                    "p.x.a -> p.functions.f",
-                    "p.x.a -> p.functions.g",
-                    "p.x.a -> p.x",
-                },
-                "rust": {
-                    "p.x.a -> p.functions",
-                    "p.x.a -> p.x",
-                },
+                "p.x.a -> p.functions",
+                "p.x.a -> p.functions.f",
+                "p.x.a -> p.functions.g",
+                "p.x.a -> p.x",
             },
-            id="dunder-import-call-inside-function-attributes-to-enclosing-decl",
+            skip="rust",
+            id="dunder-import-call-inside-function-attributes-to-enclosing-decl-libcst",
         ),
-        pytest.param(
+        case(
+            "def a(): getattr(__import__('p.functions'), 'f')()",
+            {
+                "p.x.a -> p.functions",
+                "p.x.a -> p.x",
+            },
+            skip="libcst",
+            id="dunder-import-call-inside-function-attributes-to-enclosing-decl-rust",
+        ),
+        case(
+            "import importlib\nimportlib.import_module('p.functions')",
+            STAR_REEXPORT_EDGES
+            | {
+                "p.x -> p.functions",
+                "p.x -> p.functions.f",
+                "p.x -> p.functions.g",
+                "p.x -> p.x.importlib",
+                "p.x.importlib -> p.x",
+            },
+            skip="rust",
+            id="importlib-import-module-fans-out-like-star-libcst",
+        ),
+        case(
             "import importlib\nimportlib.import_module('p.functions')",
             {
-                "libcst": STAR_REEXPORT_EDGES
-                | {
-                    "p.x -> p.functions",
-                    "p.x -> p.functions.f",
-                    "p.x -> p.functions.g",
-                    "p.x -> p.x.importlib",
-                    "p.x.importlib -> p.x",
-                },
-                "rust": {
-                    "p.x -> p.functions",
-                    "p.x -> p.x.importlib",
-                    "p.x.importlib -> p.x",
-                },
+                "p.x -> p.functions",
+                "p.x -> p.x.importlib",
+                "p.x.importlib -> p.x",
             },
-            id="importlib-import-module-fans-out-like-star",
+            skip="libcst",
+            id="importlib-import-module-fans-out-like-star-rust",
         ),
-        pytest.param(
+        case(
             "import importlib\ndef a(): importlib.import_module('p.functions')",
             {
-                "libcst": {
-                    "p.x.a -> p.functions",
-                    "p.x.a -> p.functions.f",
-                    "p.x.a -> p.functions.g",
-                    "p.x.a -> p.x",
-                    "p.x.a -> p.x.importlib",
-                    "p.x.importlib -> p.x",
-                },
-                "rust": {
-                    "p.x.a -> p.functions",
-                    "p.x.a -> p.x",
-                    "p.x.a -> p.x.importlib",
-                    "p.x.importlib -> p.x",
-                },
+                "p.x.a -> p.functions",
+                "p.x.a -> p.functions.f",
+                "p.x.a -> p.functions.g",
+                "p.x.a -> p.x",
+                "p.x.a -> p.x.importlib",
+                "p.x.importlib -> p.x",
             },
-            id="importlib-import-module-inside-function",
+            skip="rust",
+            id="importlib-import-module-inside-function-libcst",
         ),
-        pytest.param(
+        case(
+            "import importlib\ndef a(): importlib.import_module('p.functions')",
+            {
+                "p.x.a -> p.functions",
+                "p.x.a -> p.x",
+                "p.x.a -> p.x.importlib",
+                "p.x.importlib -> p.x",
+            },
+            skip="libcst",
+            id="importlib-import-module-inside-function-rust",
+        ),
+        case(
+            "import importlib\nimportlib.import_module('.functions', 'p')",
+            STAR_REEXPORT_EDGES
+            | {
+                "p.x -> p.functions",
+                "p.x -> p.functions.f",
+                "p.x -> p.functions.g",
+                "p.x -> p.x.importlib",
+                "p.x.importlib -> p.x",
+            },
+            skip="rust",
+            id="importlib-import-module-relative-positional-package-libcst",
+        ),
+        case(
             "import importlib\nimportlib.import_module('.functions', 'p')",
             {
-                "libcst": STAR_REEXPORT_EDGES
-                | {
-                    "p.x -> p.functions",
-                    "p.x -> p.functions.f",
-                    "p.x -> p.functions.g",
-                    "p.x -> p.x.importlib",
-                    "p.x.importlib -> p.x",
-                },
-                "rust": {
-                    "p.x -> p.functions",
-                    "p.x -> p.x.importlib",
-                    "p.x.importlib -> p.x",
-                },
+                "p.x -> p.functions",
+                "p.x -> p.x.importlib",
+                "p.x.importlib -> p.x",
             },
-            id="importlib-import-module-relative-positional-package",
+            skip="libcst",
+            id="importlib-import-module-relative-positional-package-rust",
         ),
-        pytest.param(
+        case(
+            "import importlib\nimportlib.import_module('.functions', package='p')",
+            STAR_REEXPORT_EDGES
+            | {
+                "p.x -> p.functions",
+                "p.x -> p.functions.f",
+                "p.x -> p.functions.g",
+                "p.x -> p.x.importlib",
+                "p.x.importlib -> p.x",
+            },
+            skip="rust",
+            id="importlib-import-module-relative-keyword-package-libcst",
+        ),
+        case(
             "import importlib\nimportlib.import_module('.functions', package='p')",
             {
-                "libcst": STAR_REEXPORT_EDGES
-                | {
-                    "p.x -> p.functions",
-                    "p.x -> p.functions.f",
-                    "p.x -> p.functions.g",
-                    "p.x -> p.x.importlib",
-                    "p.x.importlib -> p.x",
-                },
-                "rust": {
-                    "p.x -> p.functions",
-                    "p.x -> p.x.importlib",
-                    "p.x.importlib -> p.x",
-                },
+                "p.x -> p.functions",
+                "p.x -> p.x.importlib",
+                "p.x.importlib -> p.x",
             },
-            id="importlib-import-module-relative-keyword-package",
+            skip="libcst",
+            id="importlib-import-module-relative-keyword-package-rust",
         ),
-        pytest.param(
+        case(
+            "import importlib\nimportlib.import_module('.functions')",
+            STAR_REEXPORT_EDGES
+            | {
+                "p.x -> p.functions",
+                "p.x -> p.functions.f",
+                "p.x -> p.functions.g",
+                "p.x -> p.x.importlib",
+                "p.x.importlib -> p.x",
+            },
+            skip="rust",
+            id="importlib-import-module-relative-uses-enclosing-package-libcst",
+        ),
+        case(
             "import importlib\nimportlib.import_module('.functions')",
             {
-                "libcst": STAR_REEXPORT_EDGES
-                | {
-                    "p.x -> p.functions",
-                    "p.x -> p.functions.f",
-                    "p.x -> p.functions.g",
-                    "p.x -> p.x.importlib",
-                    "p.x.importlib -> p.x",
-                },
-                "rust": {
-                    "p.x -> p.functions",
-                    "p.x -> p.x.importlib",
-                    "p.x.importlib -> p.x",
-                },
+                "p.x -> p.functions",
+                "p.x -> p.x.importlib",
+                "p.x.importlib -> p.x",
             },
-            id="importlib-import-module-relative-uses-enclosing-package",
+            skip="libcst",
+            id="importlib-import-module-relative-uses-enclosing-package-rust",
         ),
-        pytest.param(
+        case(
             "__import__('functions', globals(), locals(), [], 1)",
-            {
-                "libcst": STAR_REEXPORT_EDGES
-                | {
-                    "p.x -> p.functions",
-                    "p.x -> p.functions.f",
-                    "p.x -> p.functions.g",
-                },
-                "rust": {"p.x -> p.functions"},
+            STAR_REEXPORT_EDGES
+            | {
+                "p.x -> p.functions",
+                "p.x -> p.functions.f",
+                "p.x -> p.functions.g",
             },
-            id="dunder-import-positional-level-resolves-relative",
+            skip="rust",
+            id="dunder-import-positional-level-resolves-relative-libcst",
         ),
-        pytest.param(
+        case(
+            "__import__('functions', globals(), locals(), [], 1)",
+            {"p.x -> p.functions"},
+            skip="libcst",
+            id="dunder-import-positional-level-resolves-relative-rust",
+        ),
+        case(
             "__import__('functions', level=1)",
-            {
-                "libcst": STAR_REEXPORT_EDGES
-                | {
-                    "p.x -> p.functions",
-                    "p.x -> p.functions.f",
-                    "p.x -> p.functions.g",
-                },
-                "rust": {"p.x -> p.functions"},
+            STAR_REEXPORT_EDGES
+            | {
+                "p.x -> p.functions",
+                "p.x -> p.functions.f",
+                "p.x -> p.functions.g",
             },
-            id="dunder-import-keyword-level-resolves-relative",
+            skip="rust",
+            id="dunder-import-keyword-level-resolves-relative-libcst",
+        ),
+        case(
+            "__import__('functions', level=1)",
+            {"p.x -> p.functions"},
+            skip="libcst",
+            id="dunder-import-keyword-level-resolves-relative-rust",
         ),
     ],
 )
-def test_imports(build_decl_graph, assert_edges, backend, src, expected_extra_edges):
-    # A case can declare divergent expectations per backend by passing
-    # a `{"libcst": {...}, "rust": {...}}` dict instead of a single
-    # set — the libcst pipeline minted per-name synthetic aliases for
-    # star imports as a workaround for its inability to resolve uses
-    # through `from X import *`, but the rust backend leans on ty's
-    # name resolution and only mints one node per star statement.
-    extras = (
-        expected_extra_edges[backend]
-        if isinstance(expected_extra_edges, dict)
-        else expected_extra_edges
-    )
+def test_imports(build_decl_graph, assert_edges, src, expected_extra_edges):
     graph = build_decl_graph({**IMPORT_TEST_FILES, "p/x.py": src})
-    assert_edges(graph, IMPORT_BASE_EDGES | extras)
+    assert_edges(graph, IMPORT_BASE_EDGES | expected_extra_edges)
 
 
 @pytest.mark.parametrize(
@@ -668,58 +735,89 @@ def test_dynamic_import_non_literal_warns(build_decl_graph, visitor_warnings):
         pytest.param("__import__('p', fromlist=['functions'])", id="fromlist-keyword"),
     ],
 )
-def test_dunder_import_fromlist_resolves_submodules(build_decl_graph, assert_edges, backend, src):
-    """Literal ``fromlist`` entries that resolve as submodules get edges too.
-
-    libcst's per-name fan-out emitted ``mod → upstream.export`` for every
-    name the upstream module exposed (via the synthetic star-reexport
-    aliases). The rust backend emits one edge per explicit symbol the
-    call mentions: the base module plus each literal fromlist entry that
-    resolves as a submodule, all tagged ``EdgeFlags.DYNAMIC_IMPORT``.
-    """
+@pytest.mark.skip_when_backend("rust")
+def test_dunder_import_fromlist_resolves_submodules_libcst(build_decl_graph, assert_edges, src):
+    """Literal ``fromlist`` entries that resolve as submodules are fanned
+    out via libcst's per-name synthetic star-reexport aliases."""
     graph = build_decl_graph({**IMPORT_TEST_FILES, "p/x.py": src})
-    if backend == "rust":
-        extras = {
-            "p.x -> p",
-            "p.x -> p.functions",
-        }
-    else:
-        extras = STAR_REEXPORT_EDGES | {
+    assert_edges(
+        graph,
+        IMPORT_BASE_EDGES
+        | STAR_REEXPORT_EDGES
+        | {
             "p.x -> p.functions",
             "p.x -> p.functions.f",
             "p.x -> p.functions.g",
-        }
-    assert_edges(graph, IMPORT_BASE_EDGES | extras)
+        },
+    )
 
 
-def test_dunder_import_fromlist_attribute_entries_silent(
-    build_decl_graph, assert_edges, visitor_warnings, backend
+@pytest.mark.parametrize(
+    "src",
+    [
+        pytest.param("__import__('p', None, None, ['functions'])", id="fromlist-positional"),
+        pytest.param("__import__('p', fromlist=['functions'])", id="fromlist-keyword"),
+    ],
+)
+@pytest.mark.skip_when_backend("libcst")
+def test_dunder_import_fromlist_resolves_submodules_rust(build_decl_graph, assert_edges, src):
+    """Rust emits one edge per explicit symbol the call mentions: the
+    base module plus each literal fromlist entry that resolves as a
+    submodule, all tagged ``EdgeFlags.DYNAMIC_IMPORT``."""
+    graph = build_decl_graph({**IMPORT_TEST_FILES, "p/x.py": src})
+    assert_edges(
+        graph,
+        IMPORT_BASE_EDGES
+        | {
+            "p.x -> p",
+            "p.x -> p.functions",
+        },
+    )
+
+
+@pytest.mark.skip_when_backend("rust")
+def test_dunder_import_fromlist_attribute_entries_silent_libcst(
+    build_decl_graph, assert_edges, visitor_warnings
 ):
-    """Fromlist entries that are not submodules don't warn.
-
-    libcst still emitted module-level export edges (via per-name aliases);
-    the rust backend looks each entry up as a global-scope decl in the
-    base module and emits an edge if found, otherwise drops silently.
-    """
+    """libcst's per-name fan-out emits module-level export edges via
+    the synthetic star-reexport aliases; the non-submodule fromlist
+    entry doesn't warn since it's already covered by the fan-out."""
     graph = build_decl_graph(
         {**IMPORT_TEST_FILES, "p/x.py": "__import__('p.functions', fromlist=['f', ''])"}
     )
-
     assert visitor_warnings() == []
-    if backend == "rust":
-        # `f` resolves as a decl in p.functions → edge to p.functions.f;
-        # the empty-string entry is silently skipped. No fan-out to g.
-        extras = {
-            "p.x -> p.functions",
-            "p.x -> p.functions.f",
-        }
-    else:
-        extras = STAR_REEXPORT_EDGES | {
+    assert_edges(
+        graph,
+        IMPORT_BASE_EDGES
+        | STAR_REEXPORT_EDGES
+        | {
             "p.x -> p.functions",
             "p.x -> p.functions.f",
             "p.x -> p.functions.g",
-        }
-    assert_edges(graph, IMPORT_BASE_EDGES | extras)
+        },
+    )
+
+
+@pytest.mark.skip_when_backend("libcst")
+def test_dunder_import_fromlist_attribute_entries_silent_rust(
+    build_decl_graph, assert_edges, visitor_warnings
+):
+    """The rust backend looks each entry up as a global-scope decl in
+    the base module and emits an edge if found (no fan-out to g),
+    otherwise drops silently — and never warns on attribute-style
+    entries."""
+    graph = build_decl_graph(
+        {**IMPORT_TEST_FILES, "p/x.py": "__import__('p.functions', fromlist=['f', ''])"}
+    )
+    assert visitor_warnings() == []
+    assert_edges(
+        graph,
+        IMPORT_BASE_EDGES
+        | {
+            "p.x -> p.functions",
+            "p.x -> p.functions.f",
+        },
+    )
 
 
 @pytest.mark.parametrize(
@@ -761,6 +859,7 @@ def test_dunder_import_fromlist_non_literal_warns(build_decl_graph, visitor_warn
     assert any("fromlist is not a literal" in m and "'p'" in m for m in messages), messages
 
 
+@pytest.mark.skip_when_backend("rust")
 def test_third_party_import_creates_synthetic_node(build_decl_graph):
     graph = build_decl_graph(
         {
@@ -810,6 +909,7 @@ def test_stdlib_imports_are_silent(build_decl_graph, caplog):
     assert f"{UNRESOLVED_PREFIX}collections" not in synthetics
 
 
+@pytest.mark.skip_when_backend("rust")
 def test_unresolved_import_emits_synthetic_silently(build_decl_graph, caplog):
     """A genuinely-missing top-level import gets a ``[unresolved]`` node, no warning."""
     with caplog.at_level(logging.WARNING, logger="dead_cst._edges"):
@@ -884,8 +984,14 @@ def test_dunder_on_imported_symbol_strips_dunder_tail(build_decl_graph, assert_e
     assert "pkg.uses.DOCSTR -> pkg.lib.Cls" in edge_strs
 
 
-def test_cyclic_reexport_terminates(build_decl_graph, assert_edges):
-    """Re-export cycle (``A.x: from B import x``, ``B.x: from A import x``) terminates with both legs emitted."""
+@pytest.mark.skip_when_backend("rust")
+def test_cyclic_reexport_terminates_libcst(build_decl_graph, assert_edges):
+    """Re-export cycle terminates with both legs emitted (libcst behavior).
+
+    libcst follows each leg of the ``A.x <-> B.x`` cycle and emits the
+    use-site fan-out (``main -> A.x`` / ``main -> B.x``) plus
+    reexport-target self-edges (``A.x -> A.x`` / ``B.x -> B.x``).
+    """
     graph = build_decl_graph(
         {
             "A.py": "from B import x",
@@ -917,8 +1023,50 @@ def test_cyclic_reexport_terminates(build_decl_graph, assert_edges):
     )
 
 
-def test_import_resolves_through_star_reexport(build_decl_graph, assert_edges):
-    """``from pkg import g`` resolves through ``from pkg._internal import *``."""
+@pytest.mark.skip_when_backend("libcst")
+def test_cyclic_reexport_terminates_rust(build_decl_graph, assert_edges):
+    """Re-export cycle terminates without spinning (rust behavior).
+
+    The rust backend resolves each alias once and stops — no
+    reexport-chain self-edges (``A.x -> A.x``), no use-site fan-out
+    through the cycle (``main -> A.x`` / ``main -> B.x``). The cycle
+    itself is still represented (``A.x -> B.x``, ``B.x -> A.x``) so
+    reachability from `main` can still walk it.
+    """
+    graph = build_decl_graph(
+        {
+            "A.py": "from B import x",
+            "B.py": "from A import x",
+            "main.py": "from A import x\nx()",
+        }
+    )
+
+    assert_edges(
+        graph,
+        {
+            "A.x -> A",
+            "A.x -> B",
+            "A.x -> B.x",
+            "B.x -> A",
+            "B.x -> A.x",
+            "B.x -> B",
+            "main -> A",
+            "main -> main.x",
+            "main.x -> A",
+            "main.x -> A.x",
+            "main.x -> main",
+        },
+    )
+
+
+@pytest.mark.skip_when_backend("rust")
+def test_import_resolves_through_star_reexport_libcst(build_decl_graph, assert_edges):
+    """``from pkg import g`` resolves through ``from pkg._internal import *``.
+
+    libcst's star-import handling mints a per-name synthetic alias
+    (``pkg.g``) so an external import of ``pkg.g`` resolves into the
+    package, producing the chain ``consumer.g -> pkg.g -> pkg._internal.g``.
+    """
     graph = build_decl_graph(
         {
             "pkg/__init__.py": "from pkg._internal import *\n",
@@ -931,6 +1079,33 @@ def test_import_resolves_through_star_reexport(build_decl_graph, assert_edges):
     }
     assert "consumer.g -> pkg._internal.g" in edge_strs
     assert "consumer.g -> pkg.g" in edge_strs
+
+
+@pytest.mark.skip_when_backend("libcst")
+def test_import_resolves_through_star_reexport_rust(build_decl_graph, assert_edges):
+    """``from pkg import g`` resolves through the star node to ``pkg._internal.g``.
+
+    The rust backend mints one ``*pkg._internal`` node per
+    ``from pkg._internal import *`` statement rather than a per-name
+    ``pkg.g`` alias; ty resolves ``from pkg import g`` straight to
+    ``pkg._internal.g``, so the consumer alias edges directly to the
+    upstream decl (no intermediate ``pkg.g``).
+    """
+    graph = build_decl_graph(
+        {
+            "pkg/__init__.py": "from pkg._internal import *\n",
+            "pkg/_internal.py": "def g(): pass\n",
+            "consumer.py": "from pkg import g\ng()\n",
+        }
+    )
+    edge_strs = {
+        f"{graph.node(u).fqname} -> {graph.node(v).fqname}" for u, v in graph.raw.edge_list()
+    }
+    assert "consumer.g -> pkg._internal.g" in edge_strs
+    assert "consumer.g -> pkg" in edge_strs
+    # No `pkg.g` alias is minted; the star node carries the reexport.
+    assert "consumer.g -> pkg.g" not in edge_strs
+    assert any(n.fqname == "pkg.*pkg._internal" for n in graph.nodes)
 
 
 def test_import_resolves_through_chained_star_reexports(build_decl_graph, assert_edges):
@@ -980,7 +1155,8 @@ def test_star_reexport_shadowed_by_real_decl(build_decl_graph, assert_edges):
     assert "consumer.g -> other.g" not in edge_strs
 
 
-def test_from_import_prefers_namespace_binding_over_submodule(build_decl_graph, backend):
+@pytest.mark.skip_when_backend("libcst")
+def test_from_import_prefers_namespace_binding_over_submodule(build_decl_graph):
     """``from p import q`` where ``p/__init__.py`` binds ``q`` (e.g. to an
     int) and ``p/q.py`` *also* exists: CPython's ``_handle_fromlist``
     binds ``q`` to the int via the namespace, the submodule is never
@@ -994,14 +1170,6 @@ def test_from_import_prefers_namespace_binding_over_submodule(build_decl_graph, 
     case — when libcst is updated this test should drop the
     backend-skip and start enforcing the assertion everywhere.
     """
-    if backend == "libcst":
-        import pytest
-
-        pytest.skip(
-            "libcst's `_edges.py` canonicalization is submodule-first; "
-            "see corresponding rust-side fix matching CPython's "
-            "`_handle_fromlist`."
-        )
     graph = build_decl_graph(
         {
             "p/__init__.py": "q = 42\n",
@@ -1026,38 +1194,40 @@ def test_from_import_prefers_namespace_binding_over_submodule(build_decl_graph, 
     assert ("p.q", "module") not in targets, targets
 
 
-def test_star_reexport_is_skipped_by_codemod(build_decl_graph, backend):
-    """Star re-export imports surface as a single node per statement,
-    distinguishable from regular imports so the codemod doesn't try
-    to drop them as normal `unused import` candidates.
+@pytest.mark.skip_when_backend("rust")
+def test_star_reexport_is_skipped_by_codemod_libcst(build_decl_graph):
+    """libcst mints per-name synthetic star-reexport aliases and flags
+    each with ``NodeFlags.STAR_REEXPORT`` so the codemod skips them."""
+    from dead_cst.graph import NodeFlags
 
-    The libcst pipeline minted per-name synthetic aliases and flagged
-    them with `NodeFlags.STAR_REEXPORT`; the rust backend mints one
-    node per statement named `<mod>.*<src>` with `kind="import"` and
-    an `imports.star=True` payload — the `*` prefix is the marker.
-    """
     graph = build_decl_graph(
         {
             "pkg/__init__.py": "from pkg._internal import *\n",
             "pkg/_internal.py": "def g(): pass\n",
         }
     )
-    if backend == "rust":
-        # One star node per `from X import *`, named `*<src>`.
-        star_nodes = [
-            n for n in graph.nodes if n.fqname == "pkg.*pkg._internal" and n.type == "import"
-        ]
-        assert len(star_nodes) == 1, [n.fqname for n in graph.nodes if "pkg" in n.fqname]
-        assert star_nodes[0].imports is not None
-        assert star_nodes[0].imports.star is True
-        assert star_nodes[0].imports.module == "pkg._internal"
-    else:
-        from dead_cst.graph import NodeFlags
+    reexports = [
+        n for n in graph.nodes if n.fqname == "pkg.g" and n.flags & NodeFlags.STAR_REEXPORT
+    ]
+    assert len(reexports) == 1, [n.fqname for n in graph.nodes if "pkg" in n.fqname]
 
-        reexports = [
-            n for n in graph.nodes if n.fqname == "pkg.g" and n.flags & NodeFlags.STAR_REEXPORT
-        ]
-        assert len(reexports) == 1, [n.fqname for n in graph.nodes if "pkg" in n.fqname]
+
+@pytest.mark.skip_when_backend("libcst")
+def test_star_reexport_is_skipped_by_codemod_rust(build_decl_graph):
+    """The rust backend mints one node per ``from X import *`` named
+    ``<mod>.*<src>`` with ``kind="import"`` and an ``imports.star=True``
+    payload — the ``*`` prefix is the codemod's marker."""
+    graph = build_decl_graph(
+        {
+            "pkg/__init__.py": "from pkg._internal import *\n",
+            "pkg/_internal.py": "def g(): pass\n",
+        }
+    )
+    star_nodes = [n for n in graph.nodes if n.fqname == "pkg.*pkg._internal" and n.type == "import"]
+    assert len(star_nodes) == 1, [n.fqname for n in graph.nodes if "pkg" in n.fqname]
+    assert star_nodes[0].imports is not None
+    assert star_nodes[0].imports.star is True
+    assert star_nodes[0].imports.module == "pkg._internal"
 
 
 def test_star_reexport_inherits_exported_from_importing_module(tmp_path, make_analysis):
