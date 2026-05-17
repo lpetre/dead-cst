@@ -79,6 +79,8 @@ from ..plugins._core import (
 )
 
 if TYPE_CHECKING:
+    import dead_cst_ty_native as native
+
     from ..graph import VisitorPayload
 
 
@@ -221,6 +223,103 @@ class DiscordPyPlugin:
             captured = synth.fqname[len(DISCORDPY_EXTENSION_PREFIX) :]
             for target in ctx.module_surface(captured):
                 yield AddEdge(synth, target)
+
+    def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
+        import dead_cst_ty_native as native
+
+        # Per-file gate: only fire on files that import discord. Mirrors
+        # the libcst-side ``payload_imports_module("discord")`` check.
+        discord_paths: set[str] = set()
+        for module in ("discord", "discord.ext", "discord.ext.commands"):
+            for imp in ctx.find_imports_of(module):
+                discord_paths.add(imp.path)
+        if not discord_paths:
+            return
+
+        # 1. Bot / Client constructions. find_instance_constructions
+        # handles `from X import Y`, `from X import Y as Z`, and
+        # `import X.Y; X.Y.Z(...)` through syntactic import resolution.
+        bot_constructions: list[tuple[native.NativeNode, str]] = []
+        bot_constructions.extend(
+            ctx.find_instance_constructions("discord.ext.commands", sorted(_COMMANDS_BOT_KINDS))
+        )
+        bot_constructions.extend(
+            ctx.find_instance_constructions("discord", sorted(_DISCORD_CLIENT_KINDS))
+        )
+
+        bot_vars_by_file: dict[str, dict[str, native.NativeNode]] = {}
+        for var_node, _kind in bot_constructions:
+            if var_node.path not in discord_paths:
+                continue
+            simple = var_node.fqname.rsplit(".", 1)[-1]
+            bot_vars_by_file.setdefault(var_node.path, {})[simple] = var_node
+            yield native.AddEntrypoint(var_node, marker="<discordpy-app>")
+
+        # 2. Single-attr decorators @<bot>.<verb>(...).
+        for owner_name, handler in ctx.find_handler_decorators(sorted(_BOT_DECORATORS)):
+            owner_node = bot_vars_by_file.get(handler.path, {}).get(owner_name)
+            if owner_node is not None:
+                yield native.AddEdge(owner_node, handler)
+
+        # 3. Two-level slash-command decorators @<bot>.tree.<verb>(...).
+        for owner_name, handler in ctx.find_handler_decorators_via(
+            "tree", sorted(_TREE_DECORATORS)
+        ):
+            owner_node = bot_vars_by_file.get(handler.path, {}).get(owner_name)
+            if owner_node is not None:
+                yield native.AddEdge(owner_node, handler)
+
+        # 4. Cog subclasses + module-level setup / teardown hooks.
+        # Use the syntactic ``find_classes_subclassing`` query rather
+        # than ty's ``find_subclasses``: discord usually isn't in the
+        # analyzer's venv, so ty can't resolve ``discord.ext.commands.Cog``
+        # as a seed type. The syntactic walk matches the libcst plugin's
+        # behavior (direct ``commands.Cog`` / ``Cog`` references through
+        # known imports).
+        cogs_by_path: dict[str, list[native.NativeNode]] = {}
+        for cog, _base in ctx.find_classes_subclassing("discord.ext.commands", sorted(_COG_BASES)):
+            cogs_by_path.setdefault(cog.path, []).append(cog)
+
+        if cogs_by_path:
+            hook_funcs_by_path: dict[str, list[native.NativeNode]] = {}
+            for n in ctx.nodes():
+                if n.kind != "function" or n.path not in cogs_by_path:
+                    continue
+                if n.fqname.rsplit(".", 1)[-1] in ("setup", "teardown"):
+                    hook_funcs_by_path.setdefault(n.path, []).append(n)
+
+            for path, cogs in cogs_by_path.items():
+                targets = list(cogs) + hook_funcs_by_path.get(path, [])
+                filename = path.rsplit("/", 1)[-1]
+                yield native.AddNode(
+                    fqname=f"{DISCORDPY_COG_PREFIX}{filename}",
+                    path=path,
+                    flags=int(NodeFlags.ENTRYPOINT),
+                    edges_to=targets,
+                )
+
+        # 5. load_extension / load_extensions string-literal targets.
+        # The receiver doesn't matter (could be bot / client / self.bot
+        # / a local in async def main()); the per-file discord-import
+        # gate above is what keeps unrelated `loader.load_extension`
+        # calls from firing.
+        seen_extensions: set[str] = set()
+        for attr in ("load_extension", "load_extensions"):
+            for owner, fqname in ctx.find_calls_on_attr(attr, 0):
+                if owner.path not in discord_paths:
+                    continue
+                if fqname in seen_extensions:
+                    continue
+                targets = list(ctx.module_surface(fqname))
+                if not targets:
+                    continue
+                seen_extensions.add(fqname)
+                yield native.AddNode(
+                    fqname=f"{DISCORDPY_EXTENSION_PREFIX}{fqname}",
+                    path=owner.path,
+                    flags=int(NodeFlags.ENTRYPOINT),
+                    edges_to=targets,
+                )
 
 
 # --- helpers ----------------------------------------------------------------

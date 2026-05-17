@@ -1149,6 +1149,71 @@ impl ProjectContext {
         Ok(out)
     }
 
+    /// Find top-level classes whose base list mentions one of
+    /// ``base_names`` imported from ``module``. Syntactic — doesn't
+    /// require the upstream package to be installed (so it works on
+    /// classes from third-party deps that aren't in the test env).
+    /// Returns one entry per (class, matched_base_name) pair; a class
+    /// inheriting from two recognized bases produces two entries.
+    ///
+    /// Use ``find_subclasses(fqn)`` instead when the upstream class
+    /// is resolvable via ty — that path walks transitive subclasses
+    /// through the type hierarchy, which catches project-local
+    /// intermediates this syntactic query misses.
+    #[allow(clippy::type_complexity)]
+    fn find_classes_subclassing(
+        &self,
+        py: Python<'_>,
+        module: &str,
+        base_names: Vec<String>,
+    ) -> PyResult<Vec<(Py<NativeNode>, String)>> {
+        let outputs = self.outputs.borrow();
+        let outputs = outputs
+            .as_ref()
+            .ok_or_else(|| not_materialized("find_classes_subclassing"))?;
+        let allowed: HashSet<&str> = base_names.iter().map(String::as_str).collect();
+        let mut out = Vec::new();
+        for &file in &outputs.project_files {
+            let parsed = parsed_module(&self.db, file).load(&self.db);
+            let imports = collect_module_imports_local(&parsed, module, &allowed);
+            if imports.is_empty() {
+                continue;
+            }
+            for stmt in &parsed.syntax().body {
+                let Stmt::ClassDef(class_def) = stmt else {
+                    continue;
+                };
+                let Some(arguments) = &class_def.arguments else {
+                    continue;
+                };
+                let mut matched: HashSet<String> = HashSet::new();
+                for arg in &arguments.args {
+                    let mut base_expr = arg;
+                    // ``class Foo(commands.Cog[Generic[T]])`` -- unwrap.
+                    if let Expr::Subscript(sub) = base_expr {
+                        base_expr = &sub.value;
+                    }
+                    if let Some(name) = base_name_matches(base_expr, &imports, module, &allowed) {
+                        matched.insert(name);
+                    }
+                }
+                if matched.is_empty() {
+                    continue;
+                }
+                let key = (file, range_key(class_def.name.range()));
+                if let Some(&idx) = outputs.decl_by_name_range.get(&key) {
+                    let node = outputs.builder.nodes[idx].clone_ref(py);
+                    let mut sorted: Vec<String> = matched.into_iter().collect();
+                    sorted.sort();
+                    for name in sorted {
+                        out.push((node.clone_ref(py), name));
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Find top-level functions decorated with ``@<owner>.<attr>(...)``
     /// where ``attr`` is in ``decorator_attrs``.
     ///
@@ -1204,8 +1269,109 @@ impl ProjectContext {
         Ok(out)
     }
 
-    /// Find top-level def/class statements whose body constructs one
-    /// of ``ctor_names`` imported from ``module``.
+    /// Like ``find_handler_decorators`` but matches the two-level form
+    /// ``@<owner>.<via_attr>.<attr>(...)`` (e.g. ``@bot.tree.command()``
+    /// for discord.py's slash commands). Returns the same
+    /// ``[(owner_name, function_node)]`` shape, where ``owner_name`` is
+    /// the leftmost ``Name`` in the decorator chain.
+    #[allow(clippy::type_complexity)]
+    fn find_handler_decorators_via(
+        &self,
+        py: Python<'_>,
+        via_attr: &str,
+        decorator_attrs: Vec<String>,
+    ) -> PyResult<Vec<(String, Py<NativeNode>)>> {
+        let outputs = self.outputs.borrow();
+        let outputs = outputs
+            .as_ref()
+            .ok_or_else(|| not_materialized("find_handler_decorators_via"))?;
+        let attrs: HashSet<&str> = decorator_attrs.iter().map(String::as_str).collect();
+        let mut out = Vec::new();
+        for &file in &outputs.project_files {
+            let parsed = parsed_module(&self.db, file).load(&self.db);
+            for stmt in &parsed.syntax().body {
+                let Stmt::FunctionDef(func) = stmt else {
+                    continue;
+                };
+                let mut seen_owners: HashSet<String> = HashSet::new();
+                for dec in &func.decorator_list {
+                    let mut expr = &dec.expression;
+                    if let Expr::Call(call) = expr {
+                        expr = &call.func;
+                    }
+                    // Match: Attribute(Attribute(Name(owner), via_attr), attr)
+                    let Expr::Attribute(outer) = expr else {
+                        continue;
+                    };
+                    if !attrs.contains(outer.attr.as_str()) {
+                        continue;
+                    }
+                    let Expr::Attribute(middle) = outer.value.as_ref() else {
+                        continue;
+                    };
+                    if middle.attr.as_str() != via_attr {
+                        continue;
+                    }
+                    let Expr::Name(owner) = middle.value.as_ref() else {
+                        continue;
+                    };
+                    let owner_name = owner.id.as_str().to_string();
+                    if !seen_owners.insert(owner_name.clone()) {
+                        continue;
+                    }
+                    let key = (file, range_key(func.name.range()));
+                    if let Some(&idx) = outputs.decl_by_name_range.get(&key) {
+                        out.push((owner_name, outputs.builder.nodes[idx].clone_ref(py)));
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Find calls of the form ``<expr>.<attr>(...)`` regardless of
+    /// receiver, where the positional arg at ``arg_index`` is either a
+    /// string literal **or** a list/tuple of string literals. Returns
+    /// ``[(owning_decl, captured_string)]`` — one row per captured
+    /// string, so ``load_extensions(["a", "b"])`` yields two rows.
+    ///
+    /// Unlike ``find_calls_on_var``, this matches any receiver shape:
+    /// ``bot.load_extension(...)``, ``self.bot.load_extension(...)``,
+    /// ``get_bot().load_extension(...)``, etc. Use this when the call
+    /// pattern is keyed on the method name and the receiver is the
+    /// plugin's concern (typically gated by a per-file import check).
+    #[allow(clippy::type_complexity)]
+    fn find_calls_on_attr(
+        &self,
+        py: Python<'_>,
+        attr: &str,
+        arg_index: usize,
+    ) -> PyResult<Vec<(Py<NativeNode>, String)>> {
+        let outputs = self.outputs.borrow();
+        let outputs = outputs
+            .as_ref()
+            .ok_or_else(|| not_materialized("find_calls_on_attr"))?;
+        let mut out = Vec::new();
+        for &file in &outputs.project_files {
+            let parsed = parsed_module(&self.db, file).load(&self.db);
+            for stmt in &parsed.syntax().body {
+                let Some(owner_idx) = owner_idx_for_stmt(outputs, file, stmt) else {
+                    continue;
+                };
+                let mut finder = AttrCallFinder {
+                    attr,
+                    arg_index,
+                    results: Vec::new(),
+                };
+                finder.visit_stmt(stmt);
+                for arg in finder.results {
+                    out.push((outputs.builder.nodes[owner_idx].clone_ref(py), arg));
+                }
+            }
+        }
+        Ok(out)
+    }
+
     ///
     /// Recursively walks each candidate's body looking for ``<Ctor>(...)``
     /// or ``<module>.<Ctor>(...)`` call expressions. Returns
@@ -2219,7 +2385,21 @@ fn matched_call_target(
     module: &str,
     allowed: &HashSet<&str>,
 ) -> Option<String> {
-    match call.func.as_ref() {
+    base_name_matches(call.func.as_ref(), imports, module, allowed)
+}
+
+/// Match an expression — typically a class base or a call callee —
+/// against a name-from-module pattern. Same three shapes as
+/// :func:`matched_call_target`, but operating on the post-``Call``
+/// expression directly so it composes with base-list walks
+/// (``class Foo(commands.Cog)``) and with call-target probes.
+fn base_name_matches(
+    expr: &Expr,
+    imports: &HashMap<String, String>,
+    module: &str,
+    allowed: &HashSet<&str>,
+) -> Option<String> {
+    match expr {
         Expr::Name(name) => {
             let target = imports.get(name.id.as_str())?;
             allowed.contains(target.as_str()).then(|| target.clone())
@@ -2374,6 +2554,51 @@ where
             if (self.predicate)(call) {
                 if let Some(value) = nth_positional_string(call, self.arg_index) {
                     self.results.push(value);
+                }
+            }
+        }
+        walk_expr(self, expr);
+    }
+}
+
+/// Visit every Call expression in a subtree, capture string-literal
+/// args at ``arg_index`` for calls whose callee is ``<expr>.<attr>(...)``
+/// regardless of receiver shape. The captured arg can be a single
+/// string literal **or** a list/tuple of string literals (the latter
+/// produces multiple results for one call). Backs ``find_calls_on_attr``.
+struct AttrCallFinder<'a> {
+    attr: &'a str,
+    arg_index: usize,
+    results: Vec<String>,
+}
+
+impl<'ast, 'a> Visitor<'ast> for AttrCallFinder<'a> {
+    fn visit_expr(&mut self, expr: &'ast Expr) {
+        if let Expr::Call(call) = expr {
+            if let Expr::Attribute(attribute) = call.func.as_ref() {
+                if attribute.attr.as_str() == self.attr {
+                    if let Some(arg) = call.arguments.args.get(self.arg_index) {
+                        match arg {
+                            Expr::StringLiteral(s) => {
+                                self.results.push(s.value.to_str().to_string());
+                            }
+                            Expr::List(list) => {
+                                for elt in &list.elts {
+                                    if let Expr::StringLiteral(s) = elt {
+                                        self.results.push(s.value.to_str().to_string());
+                                    }
+                                }
+                            }
+                            Expr::Tuple(tup) => {
+                                for elt in &tup.elts {
+                                    if let Expr::StringLiteral(s) = elt {
+                                        self.results.push(s.value.to_str().to_string());
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
                 }
             }
         }
