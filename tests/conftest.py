@@ -213,3 +213,18 @@ def assert_dead_branch_edges():
         assert actual == expected_edges
 
     return _check
+
+
+@pytest.fixture
+def assert_dynamic_import_edges():
+    """Assert on edges flagged ``EdgeFlags.DYNAMIC_IMPORT`` as ``"src.fqname -> dst.fqname"``."""
+
+    def _check(graph: SymbolGraph, expected_edges: set[str]):
+        actual = {
+            f"{graph.node(u).fqname} -> {graph.node(v).fqname}"
+            for u, v, payload in graph.raw.weighted_edge_list()
+            if payload & EdgeFlags.DYNAMIC_IMPORT
+        }
+        assert actual == expected_edges
+
+    return _check

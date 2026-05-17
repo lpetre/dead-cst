@@ -3883,26 +3883,7 @@ impl<'a, 'db> RefCollector<'a, 'db> {
                 let file_pkg = file_package_name(db, self.file);
                 let pkg = explicit_package.or(file_pkg.as_deref());
                 match resolve_dynamic_target(kind, &name, explicit_level, pkg) {
-                    Ok(target) => {
-                        if let Some(module_name) = ModuleName::new(&target) {
-                            self.emit_nested_star(&module_name);
-                            // Literal fromlist entries that themselves
-                            // resolve as submodules of the target get
-                            // fanned out too — they correspond to a
-                            // child `from target.entry import *`.
-                            for entry in &fromlist {
-                                if entry.is_empty() {
-                                    continue;
-                                }
-                                let sub = format!("{target}.{entry}");
-                                if let Some(sub_mn) = ModuleName::new(&sub) {
-                                    if module_name_resolves(&sub, self.file, db) {
-                                        self.emit_nested_star(&sub_mn);
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    Ok(target) => self.emit_dynamic_edges(&target, &fromlist),
                     Err(message) => emit_visitor_warning(py, &message),
                 }
                 true
@@ -3912,6 +3893,78 @@ impl<'a, 'db> RefCollector<'a, 'db> {
                 true
             }
             DynamicParseResult::NotApplicable => false,
+        }
+    }
+
+    /// Emit `owner → target` (and `owner → target.entry` for each
+    /// fromlist entry that resolves) for a dynamic import, each
+    /// tagged with `EDGE_FLAG_DYNAMIC_IMPORT`. The visitor stays
+    /// minimal: one edge per literal symbol the call mentioned. A
+    /// contrib plugin can read the flag and fan out further.
+    fn emit_dynamic_edges(&mut self, target: &str, fromlist: &[&str]) {
+        let db = self.model.db();
+        let saved = self.current_flags;
+        self.current_flags |= EDGE_FLAG_DYNAMIC_IMPORT;
+
+        // Edge to the literal name's module — but only when there's
+        // no fromlist, since with a fromlist the base module is just
+        // a stepping stone to the named entries.
+        if fromlist.is_empty() {
+            self.emit_resolved_module(target);
+        } else {
+            // With a non-empty fromlist Python still loads the base
+            // module (`__import__('p', fromlist=[…])` returns `p`),
+            // so emit the base edge and then resolve each entry as
+            // either a submodule or a global-scope decl in that
+            // module.
+            self.emit_resolved_module(target);
+            for entry in fromlist {
+                if entry.is_empty() {
+                    continue;
+                }
+                let candidate = format!("{target}.{entry}");
+                if module_name_resolves(&candidate, self.file, db) {
+                    self.emit_resolved_module(&candidate);
+                    continue;
+                }
+                let target_file = ModuleName::new(target)
+                    .and_then(|n| resolve_module(db, self.file, &n))
+                    .and_then(|m| m.file(db));
+                if let Some(target_file) = target_file {
+                    if let Some(&decl_idx) =
+                        self.live_decls.get(&(target_file, (*entry).to_string()))
+                    {
+                        self.emit_edge(decl_idx);
+                    }
+                }
+                // Entries that don't resolve as either submodule or
+                // decl are dropped silently — the libcst pipeline
+                // does the same.
+            }
+        }
+
+        self.current_flags = saved;
+    }
+
+    fn emit_resolved_module(&mut self, dotted: &str) {
+        let db = self.model.db();
+        let Some(mn) = ModuleName::new(dotted) else {
+            return;
+        };
+        let Some(module) = resolve_module(db, self.file, &mn) else {
+            return;
+        };
+        if module
+            .search_path(db)
+            .is_some_and(|sp| sp.is_standard_library())
+        {
+            return;
+        }
+        let Some(target_file) = module.file(db) else {
+            return;
+        };
+        if let Some(&idx) = self.module_nodes.get(&target_file) {
+            self.emit_edge(idx);
         }
     }
 }
@@ -4328,6 +4381,13 @@ const NODE_FLAGS_NOQA_PIN: u32 = NODE_FLAG_ENTRYPOINT | NODE_FLAG_NOQA;
 /// first non-`NONE` bit, value `1`. Stamped on every edge produced
 /// by a use site that lives inside a statically-dead region.
 const EDGE_FLAG_DEAD_BRANCH: u32 = 1;
+
+/// `EdgeFlags::DYNAMIC_IMPORT = enum.auto()` in `dead_cst.graph` —
+/// second non-`NONE` bit, value `2`. Stamped on each edge emitted
+/// from a runtime-import call (`__import__('X')` /
+/// `importlib.import_module('X')`) to keep the visitor's resolution
+/// minimal — plugins can read the flag and choose to fan out.
+const EDGE_FLAG_DYNAMIC_IMPORT: u32 = 2;
 
 // ---------------------------------------------------------------------------
 // Dead-region detection

@@ -105,10 +105,19 @@ class EdgeFlags(enum.IntFlag):
     liveness through the enclosing decl, is preserved. The opt-in
     :func:`dead_cst.find_kept_alive_by_dead_branches` returns the
     "blast radius" of removing every dead suite by skipping these edges.
+
+    ``DYNAMIC_IMPORT`` flags an edge emitted from a runtime-import
+    call (``__import__('X')`` / ``importlib.import_module('X')``).
+    Visitor behavior is minimal — one edge per *explicit symbol* the
+    call mentions, no fan-out to upstream decls — so reachability
+    captures only what the literal call expresses. A contrib plugin
+    can extend the graph by reading the flag and fanning each
+    flagged module-edge out to its exports.
     """
 
     NONE = 0
     DEAD_BRANCH = enum.auto()
+    DYNAMIC_IMPORT = enum.auto()
 
 
 @dataclass(frozen=True, slots=True)
