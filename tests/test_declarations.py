@@ -1798,3 +1798,118 @@ def test_main_module_relative_import(build_decl_graph, assert_edges):
             "pkg.util.helper -> pkg.util",
         },
     )
+
+
+# ---------------------------------------------------------------------------
+# Backend-divergent behavior: peer ``.pyi`` files and Jupyter notebooks.
+# Paired libcst / rust tests pin both states in CI so the divergence is
+# visible at test time rather than buried in a docs note. Naming
+# differences (e.g. fqname containing ``.ipynb`` on rust) are
+# intentionally not asserted — only the behaviors that affect
+# reachability or codemod safety.
+# ---------------------------------------------------------------------------
+
+
+PEER_STUB_FILES = {
+    "foo.py": "def runtime_only(): pass",
+    "foo.pyi": "def stub_only() -> None: ...",
+    "bar.py": "from foo import runtime_only\nruntime_only()",
+}
+
+
+@pytest.mark.skip_when_backend("rust")
+def test_peer_stub_does_not_intercept_runtime_decl_libcst(build_decl_graph, assert_edges):
+    """libcst drops peer ``.pyi`` files at ``enumerate_files`` time
+    precisely to avoid this case: the consumer's ``from foo import
+    runtime_only`` edges through to the actual runtime decl. The stub
+    is not parsed; ``stub_only`` doesn't appear in the graph at all.
+    """
+    graph = build_decl_graph(PEER_STUB_FILES)
+    assert_edges(
+        graph,
+        {
+            "foo.runtime_only -> foo",
+            "bar -> foo",
+            "bar -> foo.runtime_only",
+            "bar -> bar.runtime_only",
+            "bar.runtime_only -> bar",
+            "bar.runtime_only -> foo",
+            "bar.runtime_only -> foo.runtime_only",
+        },
+    )
+
+
+@pytest.mark.skip_when_backend("libcst")
+def test_peer_stub_intercepts_runtime_decl_rust(build_decl_graph):
+    """Currently-observed rust behavior (pinned so a future fix breaks
+    the test loudly): ty's module resolver prefers ``foo.pyi`` over
+    ``foo.py``, so the consumer's ``from foo import runtime_only``
+    routes through the stub's module. ``foo.py:foo.runtime_only`` has
+    no incoming edges — it appears dead even though the consumer calls
+    it at runtime. The codemod would happily delete the runtime decl
+    based on this graph.
+    """
+    graph = build_decl_graph(PEER_STUB_FILES)
+    edges = {(graph.node(u).fqname, graph.node(v).fqname) for u, v in graph.raw.edge_list()}
+    # Both module nodes exist for the same fqname "foo" — the libcst
+    # path drops the .pyi at enumerate time, rust ingests both.
+    foo_modules = [n for n in graph.raw.nodes() if n.fqname == "foo"]
+    assert {str(n.path).rsplit("/", 1)[-1] for n in foo_modules} == {"foo.py", "foo.pyi"}
+    # The runtime decl has zero incoming edges (its only edge is the
+    # outgoing self-module link). The consumer's import is misrouted
+    # through the stub, leaving the runtime decl orphaned.
+    incoming_runtime = {(u, v) for (u, v) in edges if v == "foo.runtime_only"}
+    assert incoming_runtime == set(), (
+        "expected zero incoming edges on foo.runtime_only; the consumer's import "
+        "is misrouted through the stub. Edges found: " + repr(incoming_runtime)
+    )
+
+
+@pytest.mark.skip_when_backend("rust")
+def test_notebook_decls_carry_notebook_and_entrypoint_flags_libcst(
+    write_notebook, build_decl_graph
+):
+    """Every node minted from an ``.ipynb`` carries both
+    ``NodeFlags.NOTEBOOK`` and ``NodeFlags.ENTRYPOINT``:
+
+    * ``ENTRYPOINT`` keeps the cells alive (notebooks are executed
+      top-to-bottom, not imported).
+    * ``NOTEBOOK`` tells the codemod to skip these nodes — it can't
+      rewrite cell JSON envelopes safely.
+    """
+    from dead_cst.graph import NodeFlags
+
+    write_notebook("analysis.ipynb", ["def helper():\n    return 42", "helper()"])
+    graph = build_decl_graph({})
+
+    required = NodeFlags.NOTEBOOK | NodeFlags.ENTRYPOINT
+    notebook_nodes = [n for n in graph.raw.nodes() if str(n.path).endswith(".ipynb")]
+    assert notebook_nodes, "expected at least one decl minted from the .ipynb file"
+    for n in notebook_nodes:
+        missing = required & ~NodeFlags(int(n.flags))
+        assert not missing, f"{n.fqname!r} missing flags: {missing!r}"
+
+
+@pytest.mark.skip_when_backend("libcst")
+def test_notebook_decls_missing_notebook_and_entrypoint_flags_rust(
+    write_notebook, build_decl_graph
+):
+    """Currently-observed rust behavior (pinned so a future fix breaks
+    the test loudly): ty parses the ``.ipynb`` natively (cells
+    concatenated, magics neutralized) but the rust backend doesn't tag
+    the resulting nodes with ``NOTEBOOK`` / ``ENTRYPOINT``. They look
+    like ordinary decls — reachability would mark them dead and the
+    codemod would treat them as deletable even though it can't safely
+    rewrite cell JSON envelopes.
+    """
+    from dead_cst.graph import NodeFlags
+
+    write_notebook("analysis.ipynb", ["def helper():\n    return 42", "helper()"])
+    graph = build_decl_graph({})
+
+    notebook_nodes = [n for n in graph.raw.nodes() if str(n.path).endswith(".ipynb")]
+    assert notebook_nodes, "expected ty to parse the .ipynb file"
+    for n in notebook_nodes:
+        flags = NodeFlags(int(n.flags))
+        assert not (flags & NodeFlags.NOTEBOOK), f"{n.fqname!r} unexpectedly has NOTEBOOK"
+        assert not (flags & NodeFlags.ENTRYPOINT), f"{n.fqname!r} unexpectedly has ENTRYPOINT"
