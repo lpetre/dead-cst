@@ -42,6 +42,21 @@ two versions.
   this contract is upheld regardless of how ``refresh`` is invoked.
 
 ### Changed
+- Rust backend: ``resolve_from_imported`` now matches CPython's
+  ``_handle_fromlist`` semantics — namespace lookup first, submodule
+  fallback only when nothing's bound. Previously the submodule was
+  tried first, which gave the wrong answer for ``from p import q``
+  when ``p/__init__.py`` bound ``q`` (e.g. ``q = 42``) *and* a
+  ``p/q.py`` file also existed; CPython binds ``q`` to the int and
+  the submodule never runs, but the old order linked the consumer to
+  the submodule and would have kept dead code in ``p/q.py`` alive.
+  No test in the suite exercises that exact shape today, so the
+  pytest delta is zero failures either way; the change is for
+  correctness on real-world ``__init__.py`` aliasing patterns. Perf
+  is a wash — the work shifts between Phase 2 and Phase 3 but Salsa
+  caching keeps the total cost identical (≈ ±5 ms on flux0 workspace
+  cold, inside measurement noise).
+
 - ``tests/prototype/_bridge.materialize`` (and the inlined copy in
   ``scripts/profile_backends.py``) interns ``pathlib.Path`` objects per
   build and reuses the ``NodeFlags(0)`` / ``EdgeFlags(0)`` singletons

@@ -902,6 +902,52 @@ def test_star_reexport_shadowed_by_real_decl(build_decl_graph, assert_edges):
     assert "consumer.g -> other.g" not in edge_strs
 
 
+def test_from_import_prefers_namespace_binding_over_submodule(build_decl_graph, backend):
+    """``from p import q`` where ``p/__init__.py`` binds ``q`` (e.g. to an
+    int) and ``p/q.py`` *also* exists: CPython's ``_handle_fromlist``
+    binds ``q`` to the int via the namespace, the submodule is never
+    imported, and dead code in ``p/q.py`` stays dead.
+
+    Pins the rust backend's matching behavior (``resolve_from_imported``
+    probes ``globals_by_name`` before falling back to the submodule
+    lookup). The libcst path canonicalizes the import the other way
+    (`_edges.py` pushes ``q`` into the module name as long as it
+    resolves as a submodule in the trie) and is wrong for this corner
+    case — when libcst is updated this test should drop the
+    backend-skip and start enforcing the assertion everywhere.
+    """
+    if backend == "libcst":
+        import pytest
+
+        pytest.skip(
+            "libcst's `_edges.py` canonicalization is submodule-first; "
+            "see corresponding rust-side fix matching CPython's "
+            "`_handle_fromlist`."
+        )
+    graph = build_decl_graph(
+        {
+            "p/__init__.py": "q = 42\n",
+            "p/q.py": "def dead(): pass\n",
+            "consumer.py": "from p import q\nprint(q)\n",
+        }
+    )
+    # Same fqname appears twice (the `q` variable in p/__init__.py and
+    # the `q` module from p/q.py), so we have to disambiguate on type.
+    consumer_q_alias = next(
+        n for n in graph.nodes if n.fqname == "consumer.q" and n.type == "import"
+    )
+    targets = {
+        (graph.node(v).fqname, graph.node(v).type)
+        for u, v in graph.raw.edge_list()
+        if graph.index(consumer_q_alias) == u
+    }
+    assert ("p.q", "variable") in targets, targets
+    # Crucial: the submodule must NOT be linked. The old submodule-first
+    # order would wrongly add ("p.q", "module"); the namespace-first
+    # order matches CPython and skips it.
+    assert ("p.q", "module") not in targets, targets
+
+
 def test_star_reexport_is_skipped_by_codemod(build_decl_graph, backend):
     """Star re-export imports surface as a single node per statement,
     distinguishable from regular imports so the codemod doesn't try
