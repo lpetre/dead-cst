@@ -49,6 +49,7 @@ use ty_project::metadata::options::{EnvironmentOptions, Options};
 use ty_project::metadata::python_version::SupportedPythonVersion;
 use ty_project::metadata::value::{RangedValue, RelativePathBuf};
 use ty_project::{Db as ProjectDb, ProjectDatabase, ProjectMetadata};
+use ty_python_core::ast_ids::HasScopedUseId;
 use ty_python_core::definition::{DefinitionKind, DefinitionState, TargetKind};
 use ty_python_core::place::{PlaceExprRef, ScopedPlaceId};
 use ty_python_core::program::UseDefaultStrategy;
@@ -172,11 +173,13 @@ struct ImportSpec {
 /// (upstream_file, local_decl_name) -> upstream decl node idx.
 ///
 /// Populated during `ingest_decls` for every non-import, non-module
-/// node. The last write wins, so the entry tracks the *end-of-scope
-/// live* binding for any name that gets rebound during the module's
-/// body — matching how the libcst pipeline's trie only keeps the
-/// non-`SHADOWED` decl.
-type LiveDeclIndex = HashMap<(File, String), usize>;
+/// node. The value is a `Vec` so branch-bound names (try/except,
+/// if/else where both branches assign) keep every live binding;
+/// sequentially-rebound names collapse to the latest via the
+/// post-pass that populates this from ty's
+/// `end_of_scope_symbol_bindings`. Mirrors how the libcst pipeline's
+/// trie excludes `SHADOWED` decls but keeps multi-branch ones.
+type LiveDeclIndex = HashMap<(File, String), Vec<usize>>;
 
 /// (file, name) -> idx of *any* live module-scope binding, decl or
 /// import alias. Last-write-wins like `LiveDeclIndex`.
@@ -184,7 +187,14 @@ type LiveDeclIndex = HashMap<(File, String), usize>;
 /// Used by `resolve_from_imported` so it can shortcut ty's full
 /// `definitions_for_imported_symbol` walk (which recursively chases
 /// alias chains across files) into a single hashmap probe.
-type GlobalsByName = HashMap<(File, String), usize>;
+///
+/// The value is a `Vec` so that branch-bound names (try/except, if/else
+/// where both branches assign) keep every live binding instead of
+/// the last-write only. A cross-module `from lib import f` then
+/// resolves to every reaching def of `f` in `lib`, matching the
+/// libcst pipeline's `SHADOWED`-excluding trie merge over multiple
+/// bindings.
+type GlobalsByName = HashMap<(File, String), Vec<usize>>;
 
 /// (file, name) -> upstream module name when `name` in `file` is bound
 /// by `from <upstream> import *`. Populated alongside `GlobalsByName`
@@ -2840,17 +2850,57 @@ fn ingest_decls(
             }
             alias_imports.insert(node_idx, spec);
         } else if node_kind != "module" {
-            // Last-write-wins so the map ends up with the end-of-scope
-            // live binding (mirrors libcst's `SHADOWED`-excluding trie).
-            // A later real decl also kills any earlier star reexport
-            // for the same name.
+            // Star-reexport gets killed by any later real decl; the
+            // multi-binding `live_decls` is populated by the post-pass
+            // below from ty's end-of-scope view, which already encodes
+            // sequential-rebind / branch-bind semantics correctly.
             star_reexports.remove(&name_key);
-            live_decls.insert(name_key.clone(), node_idx);
         }
-        // Track every binding (decl + import) by name so Phase 2's
-        // `from X import Y` lookup can probe directly without ty's
-        // recursive alias-resolution walk.
-        globals_by_name.insert(name_key, node_idx);
+    }
+
+    // Post-pass: populate `globals_by_name` (every binding kind) and
+    // `live_decls` (real decls only) from ty's end-of-scope live
+    // bindings per symbol. We can't do this inside the loop above
+    // because that loop iterates `all_definitions_with_usage`, which
+    // includes *every* binding — including dead ones superseded by a
+    // later sequential rebind (`def f; def f` keeps only the second
+    // as the live one). The end-of-scope query already encodes ty's
+    // flow analysis: it preserves both branches of `if/else` and
+    // `try/except` when each is a real bind, and collapses sequential
+    // rebinds to the latest. Walking it once here keeps cross-module
+    // `from lib import f` resolution and `emit_upstream`'s decl probe
+    // multi-binding-aware without having to re-derive shadowing rules
+    // at lookup time.
+    for (symbol_id, bindings) in use_def_map.all_end_of_scope_symbol_bindings() {
+        let PlaceExprRef::Symbol(sym) = place_table.place(ScopedPlaceId::Symbol(symbol_id)) else {
+            continue;
+        };
+        let name = sym.name().as_str().to_string();
+        let mut live: Vec<usize> = Vec::new();
+        let mut live_real_decls: Vec<usize> = Vec::new();
+        for binding in bindings {
+            let Some(def) = binding.binding.definition() else {
+                continue;
+            };
+            if def.file(db) != file || def.file_scope(db) != global {
+                continue;
+            }
+            let kind = def.kind(db);
+            let key = (file, def.place(db), range_key(kind.target_range(&parsed)));
+            if let Some(&idx) = global_index.get(&key) {
+                live.push(idx);
+                if !kind.is_import() {
+                    live_real_decls.push(idx);
+                }
+            }
+        }
+        let key = (file, name);
+        if !live.is_empty() {
+            globals_by_name.insert(key.clone(), live);
+        }
+        if !live_real_decls.is_empty() {
+            live_decls.insert(key, live_real_decls);
+        }
     }
 
     Ok(())
@@ -3006,7 +3056,7 @@ fn emit_import_edges(
             _ => None,
         };
 
-        let target = match kind {
+        let targets: Vec<usize> = match kind {
             DefinitionKind::Import(k) => resolve_import_target(
                 py,
                 db,
@@ -3014,7 +3064,9 @@ fn emit_import_edges(
                 file,
                 builder,
                 module_nodes,
-            )?,
+            )?
+            .into_iter()
+            .collect(),
             DefinitionKind::ImportFrom(k) => resolve_from_imported(
                 py,
                 db,
@@ -3048,29 +3100,31 @@ fn emit_import_edges(
             // new model — uses of star-bound names emit their own
             // parallel `use → upstream module / upstream decl` edges
             // via `emit_upstream` and ty's name resolution.
-            DefinitionKind::StarImport(_) => None,
+            DefinitionKind::StarImport(_) => Vec::new(),
             _ => continue,
         };
-        if let Some(target_idx) = target {
-            builder.add_edge(alias_idx, target_idx, 0);
+        let module_idx_set: HashSet<usize> = module_nodes.values().copied().collect();
+        let all_targets_are_modules =
+            !targets.is_empty() && targets.iter().all(|idx| module_idx_set.contains(idx));
+        for target_idx in &targets {
+            builder.add_edge(alias_idx, *target_idx, 0);
         }
 
         // Parallel reachability edge: when `from X import Y` resolved
         // to a *decl* (Y in module X), also link the alias to the
         // upstream module X so reachability can see the file's
-        // module-level dependency. Skip when the target is itself a
-        // module (the `from X import sub` case where `sub` is a
-        // submodule of X) — the submodule's parent-module edge
-        // already keeps X alive.
+        // module-level dependency. Skip when *every* resolved target
+        // is itself a module (the `from X import sub` case where
+        // `sub` is a submodule of X) — the submodule's parent-module
+        // edge already keeps X alive. When at least one target is a
+        // decl, the upstream-module edge is still useful for the
+        // others' reachability.
         if let Some(stmt) = from_stmt {
-            let target_is_module = target
-                .map(|idx| module_nodes.values().any(|&m| m == idx))
-                .unwrap_or(false);
-            if !target_is_module {
+            if !all_targets_are_modules {
                 if let Some(upstream_module_idx) =
                     from_import_module_node(py, db, file, stmt, builder, module_nodes)?
                 {
-                    if Some(upstream_module_idx) != target && upstream_module_idx != alias_idx {
+                    if !targets.contains(&upstream_module_idx) && upstream_module_idx != alias_idx {
                         builder.add_edge(alias_idx, upstream_module_idx, 0);
                     }
                 }
@@ -3164,27 +3218,30 @@ fn resolve_from_imported(
     module_nodes: &mut HashMap<File, usize>,
     globals_by_name: &GlobalsByName,
     star_reexports: &StarReexports,
-) -> PyResult<Option<usize>> {
+) -> PyResult<Vec<usize>> {
     let Ok(module_name) = ModuleName::from_import_statement(db, importing_file, stmt) else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
 
     // 1. Resolve the target module's file and probe its namespace —
-    //    CPython's `hasattr(module, name)`.
+    //    CPython's `hasattr(module, name)`. May return multiple
+    //    bindings when the name is branch-bound (try/except, if/else
+    //    with both branches assigning).
     let Some(module) = resolve_module(db, importing_file, &module_name) else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
     let Some(target_file) = module.file(db) else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
-    if let Some(idx) = walk_globals_chain(
+    let chain = walk_globals_chain(
         db,
         target_file,
         symbol_name,
         globals_by_name,
         star_reexports,
-    ) {
-        return Ok(Some(idx));
+    );
+    if !chain.is_empty() {
+        return Ok(chain);
     }
 
     // 2. Namespace miss — fall back to importing `<module>.<symbol>`
@@ -3194,69 +3251,76 @@ fn resolve_from_imported(
         combined.extend(&submodule_name);
         if let Some(sub_module) = resolve_module(db, importing_file, &combined) {
             if let Some(sub_file) = sub_module.file(db) {
-                return Ok(Some(mint_module_node(
+                return Ok(vec![mint_module_node(
                     py,
                     db,
                     sub_file,
                     builder,
                     module_nodes,
-                )?));
+                )?]);
             }
         }
     }
 
     // 3. Fallback: link the alias to the upstream module node.
-    Ok(Some(mint_module_node(
+    Ok(vec![mint_module_node(
         py,
         db,
         target_file,
         builder,
         module_nodes,
-    )?))
+    )?])
 }
 
-/// Walk `(file, name)` through star-reexport chains. Returns the first
-/// non-star-reexport binding (a decl, or a non-star import alias).
+/// Walk `(file, name)` through star-reexport chains. Returns every
+/// non-star-reexport binding reachable from `(target_file, symbol_name)`
+/// — a decl, a non-star import alias, or several of either when the
+/// name has multiple live bindings (try/except, if/else where both
+/// branches assign).
 ///
 /// `from A import g` where A has `from B import *` lands on A's star
 /// alias for `g`; we resolve B → file, look up `g` there, and recurse.
-/// Stops on a decl, on a non-star import, on a missed lookup (returns
-/// the prior idx), or on a cycle (revisit of an already-seen key).
+/// Stops on a decl, on a non-star import, on a missed lookup (yields
+/// nothing past it), or on a cycle (revisit of an already-seen key).
 fn walk_globals_chain(
     db: &ProjectDatabase,
     target_file: File,
     symbol_name: &str,
     globals_by_name: &GlobalsByName,
     star_reexports: &StarReexports,
-) -> Option<usize> {
+) -> Vec<usize> {
     let mut seen: HashSet<(File, String)> = HashSet::new();
-    let mut current_file = target_file;
-    let current_name = symbol_name.to_string();
-    let mut last_idx: Option<usize> = None;
-    loop {
-        let key = (current_file, current_name.clone());
+    let mut out: Vec<usize> = Vec::new();
+    let mut stack: Vec<(File, String)> = vec![(target_file, symbol_name.to_string())];
+    while let Some(key) = stack.pop() {
         if !seen.insert(key.clone()) {
-            return last_idx;
+            continue;
         }
-        let &idx = globals_by_name.get(&key)?;
-        last_idx = Some(idx);
-        // If this binding is a `from <upstream> import *` reexport,
-        // step into the upstream file and look up the same name there.
-        let Some(upstream_module) = star_reexports.get(&key) else {
-            return Some(idx);
+        let Some(idxs) = globals_by_name.get(&key) else {
+            continue;
         };
-        let Some(mn) = ModuleName::new(upstream_module) else {
-            return Some(idx);
-        };
-        let Some(upstream) = resolve_module(db, current_file, &mn) else {
-            return Some(idx);
-        };
-        let Some(upstream_file) = upstream.file(db) else {
-            return Some(idx);
-        };
-        current_file = upstream_file;
-        // current_name stays the same — star reexport carries the name through unchanged.
+        // If `key` is a `from <upstream> import *` reexport, step
+        // into the upstream file's same-name lookup. Star reexports
+        // carry the name unchanged. Otherwise the binding(s) are the
+        // terminal answer.
+        if let Some(upstream_module) = star_reexports.get(&key) {
+            if let Some(mn) = ModuleName::new(upstream_module) {
+                if let Some(upstream) = resolve_module(db, key.0, &mn) {
+                    if let Some(upstream_file) = upstream.file(db) {
+                        stack.push((upstream_file, key.1.clone()));
+                        // The star-alias node itself isn't a useful
+                        // target — uses should land on the upstream
+                        // decl. Skip emitting it.
+                        continue;
+                    }
+                }
+            }
+        }
+        for &idx in idxs {
+            out.push(idx);
+        }
     }
+    out
 }
 
 /// Resolve the upstream module of a `from <stmt> import ...` and
@@ -3803,17 +3867,18 @@ impl<'a, 'db> RefCollector<'a, 'db> {
 
     /// Walk the use's scope chain looking for the reaching definitions
     /// of `name`. Returns one entry per reaching def — typically a
-    /// single binding, but `if`/`else` or `try`/`except` branches that
-    /// both bind the name leave multiple defs live at end-of-scope and
-    /// every one gets edges (Principle 3).
+    /// single binding, but `try`/`except` branches that both bind the
+    /// name leave multiple defs reaching the use and every one gets
+    /// edges (Principle 3).
     ///
-    /// Walks outward through visible scopes until we find one that
-    /// *binds* `name` (not merely lists it in its place table — a free
-    /// variable can show up there without any local binding, and in
-    /// that case we want to keep walking up to the actual definer).
-    /// The first binding scope wins; ty's flow-sensitive
-    /// `end_of_scope_symbol_bindings` filters within that scope to the
-    /// reaching defs.
+    /// The use's own scope is queried with
+    /// :meth:`UseDefMap::bindings_at_use`, which is position-sensitive
+    /// — for `a = 1; a = a + 1`, the RHS `a` resolves to the line-1
+    /// def even though the line-2 def has already been registered in
+    /// the scope's place table. For free variables (used in a scope
+    /// that doesn't bind the name), walks outward through
+    /// `visible_ancestor_scopes` and falls back to that scope's
+    /// end-of-scope bindings.
     ///
     /// Resolutions split on whether the binding has a graph node:
     /// module-scope decls and import aliases give `Alias(idx)`;
@@ -3829,15 +3894,26 @@ impl<'a, 'db> RefCollector<'a, 'db> {
         let Some(file_scope) = self.model.scope(name.into()) else {
             return Vec::new();
         };
+        let mut first = true;
         for (scope_id, _scope) in self.index.visible_ancestor_scopes(file_scope) {
             let place_table = self.index.place_table(scope_id);
             let Some(symbol_id) = place_table.symbol_id(name.id.as_str()) else {
+                first = false;
                 continue;
             };
             let use_def_map = self.index.use_def_map(scope_id);
+            // Position-sensitive query for the use's own scope; fall
+            // back to end-of-scope bindings for enclosing scopes (where
+            // the use isn't recorded under any specific position).
+            let bindings = if first {
+                let use_id = name.scoped_use_id(db, scope_id.to_scope_id(db, self.file));
+                use_def_map.bindings_at_use(use_id)
+            } else {
+                use_def_map.end_of_scope_symbol_bindings(symbol_id)
+            };
             let mut saw_binding = false;
             let mut results: Vec<Resolution> = Vec::new();
-            for binding in use_def_map.end_of_scope_symbol_bindings(symbol_id) {
+            for binding in bindings {
                 let Some(def) = binding.binding.definition() else {
                     continue;
                 };
@@ -3868,6 +3944,7 @@ impl<'a, 'db> RefCollector<'a, 'db> {
             if saw_binding {
                 return results;
             }
+            first = false;
         }
         Vec::new()
     }
@@ -4022,8 +4099,10 @@ impl<'a, 'db> RefCollector<'a, 'db> {
             if let Some(&idx) = self.module_nodes.get(&start_file) {
                 self.emit_edge(idx);
             }
-            if let Some(&idx) = self.live_decls.get(&(start_file, decl_name)) {
-                self.emit_edge(idx);
+            if let Some(idxs) = self.live_decls.get(&(start_file, decl_name)) {
+                for &idx in idxs {
+                    self.emit_edge(idx);
+                }
             }
             return;
         }
@@ -4036,7 +4115,7 @@ impl<'a, 'db> RefCollector<'a, 'db> {
         // as long as they resolve as submodules.
         let mut current_file = start_file;
         let mut current_path = loading_target.clone();
-        let mut terminal_decl_idx: Option<usize> = None;
+        let mut terminal_decl_idxs: Vec<usize> = Vec::new();
         for seg in &adjusted_chain {
             let candidate = format!("{current_path}.{seg}");
             let submodule_file = ModuleName::new(&candidate)
@@ -4047,17 +4126,18 @@ impl<'a, 'db> RefCollector<'a, 'db> {
                 current_path = candidate;
                 continue;
             }
-            terminal_decl_idx = self
+            terminal_decl_idxs = self
                 .live_decls
                 .get(&(current_file, (*seg).to_string()))
-                .copied();
+                .cloned()
+                .unwrap_or_default();
             break;
         }
 
         if let Some(&idx) = self.module_nodes.get(&current_file) {
             self.emit_edge(idx);
         }
-        if let Some(idx) = terminal_decl_idx {
+        for idx in terminal_decl_idxs {
             self.emit_edge(idx);
         }
     }
@@ -4152,7 +4232,7 @@ impl<'a, 'db> RefCollector<'a, 'db> {
             .live_decls
             .iter()
             .filter(|((file, name), _)| *file == target_file && !name.starts_with('_'))
-            .map(|(_, &idx)| idx)
+            .flat_map(|(_, idxs)| idxs.iter().copied())
             .collect();
         for idx in targets {
             self.emit_edge(idx);
@@ -4231,10 +4311,10 @@ impl<'a, 'db> RefCollector<'a, 'db> {
                     .and_then(|n| resolve_module(db, self.file, &n))
                     .and_then(|m| m.file(db));
                 if let Some(target_file) = target_file {
-                    if let Some(&decl_idx) =
-                        self.live_decls.get(&(target_file, (*entry).to_string()))
-                    {
-                        self.emit_edge(decl_idx);
+                    if let Some(idxs) = self.live_decls.get(&(target_file, (*entry).to_string())) {
+                        for &decl_idx in idxs {
+                            self.emit_edge(decl_idx);
+                        }
                     }
                 }
                 // Entries that don't resolve as either submodule or
