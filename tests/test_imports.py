@@ -861,7 +861,6 @@ def test_dunder_import_fromlist_non_literal_warns(build_decl_graph, visitor_warn
     assert any("fromlist is not a literal" in m and "'p'" in m for m in messages), messages
 
 
-@pytest.mark.skip_when_backend("rust")
 def test_third_party_import_creates_synthetic_node(build_decl_graph):
     graph = build_decl_graph(
         {
@@ -911,7 +910,6 @@ def test_stdlib_imports_are_silent(build_decl_graph, caplog):
     assert f"{UNRESOLVED_PREFIX}collections" not in synthetics
 
 
-@pytest.mark.skip_when_backend("rust")
 def test_unresolved_import_emits_synthetic_silently(build_decl_graph, caplog):
     """A genuinely-missing top-level import gets a ``[unresolved]`` node, no warning."""
     with caplog.at_level(logging.WARNING, logger="dead_cst._edges"):
