@@ -4781,6 +4781,26 @@ impl<'ast, 'db> Visitor<'ast> for RefCollector<'_, 'db> {
             self.emit_name_use(n, &[]);
             return;
         }
+        if let Expr::Named(named) = expr {
+            // Walrus `(y := expr)` at module scope has its own
+            // ``DefinitionKind::NamedExpression`` entry in ty's global
+            // scope. ``walk_owned`` walks the inner expression and
+            // attributes uses to `y`; walking it again here would
+            // double-attribute every reference (once to the walrus
+            // target, once to whatever owns the enclosing expression).
+            // Skip into the walrus and leave its body to its own walk.
+            //
+            // Inside function / class bodies (``nested_context``), the
+            // walrus's Definition lives in the nested scope and isn't
+            // covered by ``ingest_top_level``'s per-def loop, so we
+            // still need to walk the inner value here — attributing to
+            // the enclosing top-level decl.
+            if !self.nested_context {
+                return;
+            }
+            self.visit_expr(&named.value);
+            return;
+        }
         if matches!(expr, Expr::Attribute(_)) {
             if let Some((root, segments)) = collapse_attribute_chain(expr) {
                 self.emit_name_use(root, &segments);
