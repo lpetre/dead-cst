@@ -70,6 +70,7 @@ dev = [
     "fastapi>=0.110",
     "fastmcp>=2.0",
     "flask>=3.0",
+    "discord-py>=2.7.1",
 ]
 
 [tool.pytest.ini_options]
