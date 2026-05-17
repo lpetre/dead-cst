@@ -786,7 +786,15 @@ from tests.conftest import case
             },
             id="walrus-toplevel-binding-captured",
         ),
-        pytest.param(
+        # Skipped on rust: ty has a `// TODO walrus in comprehensions
+        # is implicitly nonlocal` (see
+        # ``vendor/ruff/crates/ty_python_core/src/builder.rs:3605``),
+        # so the leaked ``last`` binding isn't surfaced in the module
+        # scope's place table. ``test_limitations`` pins rust's
+        # current edge set; when ty grows the leak-to-enclosing-scope
+        # support, this test should pass on both backends and the
+        # limitation entry can be dropped.
+        case(
             """
             nums = [1, 2, 3]
             result = [last := n for n in nums]
@@ -805,6 +813,7 @@ from tests.conftest import case
                 "mod.use -> mod",
                 "mod.use -> mod.last",
             },
+            skip="rust",
             id="walrus-comprehension-toplevel-leak-captured",
         ),
         pytest.param(
