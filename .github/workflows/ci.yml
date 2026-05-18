@@ -22,6 +22,12 @@ jobs:
         with:
           path: ~/.cache/prek
           key: prek-${{ hashFiles('.pre-commit-config.yaml') }}
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+      # ``uv sync`` runs maturin (the project's build backend) and
+      # compiles ``native/`` so ``ty check`` can resolve
+      # ``dead_cst._native`` while type-checking.
       - run: uv sync --frozen
       - run: uv run prek run --show-diff-on-failure --color=always --all-files
         env:
