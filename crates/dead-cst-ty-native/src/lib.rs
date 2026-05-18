@@ -31,6 +31,7 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::str::FromStr;
 
 use pyo3::exceptions::{PyOSError, PyRuntimeError, PyValueError};
@@ -44,7 +45,9 @@ use ruff_python_ast::visitor::{walk_expr, walk_stmt, Visitor};
 use ruff_python_ast::{Expr, ExprName, Stmt, StmtClassDef};
 use ruff_source_file::LineIndex;
 use ruff_text_size::{Ranged, TextRange};
-use ty_module_resolver::{file_to_module, resolve_module, ModuleName};
+use ty_module_resolver::{
+    file_to_module, resolve_module, search_paths, ModuleName, ModuleResolveMode,
+};
 use ty_project::metadata::options::{EnvironmentOptions, Options};
 use ty_project::metadata::python_version::SupportedPythonVersion;
 use ty_project::metadata::value::{RangedValue, RelativePathBuf};
@@ -550,6 +553,12 @@ fn build_project_graph(py: Python<'_>, db: &ProjectDatabase) -> PyResult<BuildOu
         }
     }
     let t_phase1 = t1.elapsed();
+    // Walk every site-packages search path's ``*.dist-info/`` to build
+    // the file -> canonical-dist-name map. Cheap (one read_dir + a
+    // couple of read_to_string per installed dist), runs once per
+    // ``materialize`` call. Both Phase 2 (alias minting) and Phase 3
+    // (use-site emit_upstream) need the same map.
+    let dist_lookup = build_dist_lookup(db);
     let t2 = std::time::Instant::now();
     for file in &project_files {
         emit_module_hierarchy(db, *file, &module_nodes, &mut builder);
@@ -562,6 +571,7 @@ fn build_project_graph(py: Python<'_>, db: &ProjectDatabase) -> PyResult<BuildOu
             &mut module_nodes,
             &globals_by_name,
             &star_reexports,
+            &dist_lookup,
         )?;
     }
     let t_phase2 = t2.elapsed();
@@ -574,6 +584,7 @@ fn build_project_graph(py: Python<'_>, db: &ProjectDatabase) -> PyResult<BuildOu
             &module_nodes,
             &alias_imports,
             &live_decls,
+            &dist_lookup,
             &mut builder,
         );
     }
@@ -3181,6 +3192,7 @@ fn emit_import_edges(
     module_nodes: &mut HashMap<File, usize>,
     globals_by_name: &GlobalsByName,
     star_reexports: &StarReexports,
+    dist_lookup: &DistLookup,
 ) -> PyResult<()> {
     let parsed = parsed_module(db, file).load(db);
     let index = semantic_index(db, file);
@@ -3222,6 +3234,7 @@ fn emit_import_edges(
                 file,
                 builder,
                 module_nodes,
+                dist_lookup,
             )?
             .into_iter()
             .collect(),
@@ -3235,6 +3248,7 @@ fn emit_import_edges(
                 module_nodes,
                 globals_by_name,
                 star_reexports,
+                dist_lookup,
             )?,
             DefinitionKind::ImportFromSubmodule(k) => resolve_from_imported(
                 py,
@@ -3246,6 +3260,7 @@ fn emit_import_edges(
                 module_nodes,
                 globals_by_name,
                 star_reexports,
+                dist_lookup,
             )?,
             // `from X import *` — no per-name fan-out edge. ty's
             // `definitions_for_imported_symbol` would resolve each
@@ -3280,7 +3295,7 @@ fn emit_import_edges(
         if let Some(stmt) = from_stmt {
             if !all_targets_are_modules {
                 if let Some(upstream_module_idx) =
-                    from_import_module_node(py, db, file, stmt, builder, module_nodes)?
+                    from_import_module_node(py, db, file, stmt, builder, module_nodes, dist_lookup)?
                 {
                     if !targets.contains(&upstream_module_idx) && upstream_module_idx != alias_idx {
                         builder.add_edge(alias_idx, upstream_module_idx, 0);
@@ -3311,16 +3326,131 @@ fn emit_import_edges(
 enum ImportTarget {
     Stdlib,
     FirstParty(File),
-    External(String),
+    /// A site-packages file owned by an installed distribution's
+    /// ``RECORD``. Carries the PEP 503-canonical dist name (e.g.
+    /// ``"pillow"`` for an ``import PIL``).
+    ExternalDist(String),
+    /// A site-packages file (or editable / extra search-path file)
+    /// not claimed by any installed distribution's ``RECORD``.
+    /// Carries the top-level module name. Mirrors libcst's
+    /// ``[external file]`` bucket for editable installs and orphan
+    /// files in ``site-packages``.
+    ExternalFile(String),
     Unresolved(String),
+}
+
+/// ``abs_file_path -> PEP 503-canonical dist name``. Populated once
+/// per ``materialize`` call by walking every ``*.dist-info/`` directory
+/// under each ``is_site_packages()`` search path that ty knows about
+/// and indexing the files listed in the distribution's ``RECORD``.
+///
+/// Mirrors ``dead_cst.resolvers._imports.distribution_lookup`` from
+/// the libcst pipeline but reads dist-info directly off the
+/// filesystem — no Python callback, so the same lookup works in
+/// pyo3 contexts where issuing ``importlib.metadata.distributions()``
+/// would round-trip through the runtime.
+type DistLookup = HashMap<PathBuf, String>;
+
+/// PEP 503 normalization. Replaces every run of ``[-_.]`` with a
+/// single ``-`` and lowercases the rest. Equivalent to Python's
+/// ``re.sub(r"[-_.]+", "-", name).lower()`` from libcst's
+/// ``_canonical_dist_name``.
+fn pep503_canonicalize(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut prev_sep = false;
+    for ch in name.chars() {
+        if matches!(ch, '-' | '_' | '.') {
+            if !prev_sep {
+                out.push('-');
+                prev_sep = true;
+            }
+        } else {
+            out.push(ch.to_ascii_lowercase());
+            prev_sep = false;
+        }
+    }
+    out
+}
+
+/// Build the dist-file lookup by walking ``*.dist-info/`` under every
+/// site-packages search path ty's resolver is configured with.
+///
+/// For each dist-info directory:
+///
+/// 1. Read ``METADATA`` for the ``Name:`` header (the project's PyPI
+///    name pre-canonicalization). Stop at the blank line that
+///    separates headers from the long description.
+/// 2. Apply PEP 503 normalization so casing / separators don't matter
+///    at lookup time.
+/// 3. Read ``RECORD`` for the comma-separated ``path,hash,size``
+///    entries, take the path (relative to the site-packages dir),
+///    join + canonicalize against the dist-info parent, and map each
+///    resolved absolute path to the canonical name.
+///
+/// Failures (missing METADATA, malformed RECORD, unreadable site-
+/// packages) are silently skipped — the file just won't appear in
+/// the lookup and the caller falls through to ``[external file]``.
+fn build_dist_lookup(db: &dyn ty_python_semantic::Db) -> DistLookup {
+    let mut out: DistLookup = HashMap::new();
+    for sp in search_paths(db, ModuleResolveMode::StubsAllowed) {
+        if !sp.is_site_packages() {
+            continue;
+        }
+        let Some(system_path) = sp.as_system_path() else {
+            continue;
+        };
+        let sp_root = std::fs::canonicalize(system_path.as_str())
+            .unwrap_or_else(|_| PathBuf::from(system_path.as_str()));
+        let Ok(entries) = std::fs::read_dir(&sp_root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let dist_info = entry.path();
+            if dist_info.extension().is_none_or(|e| e != "dist-info") {
+                continue;
+            }
+            // METADATA — find the ``Name:`` header.
+            let Ok(metadata) = std::fs::read_to_string(dist_info.join("METADATA")) else {
+                continue;
+            };
+            let mut canonical = None;
+            for line in metadata.lines() {
+                if line.is_empty() {
+                    break;
+                }
+                if let Some(value) = line.strip_prefix("Name:") {
+                    canonical = Some(pep503_canonicalize(value.trim()));
+                    break;
+                }
+            }
+            let Some(canonical) = canonical else {
+                continue;
+            };
+            // RECORD — index every owned file's absolute path.
+            let Ok(record) = std::fs::read_to_string(dist_info.join("RECORD")) else {
+                continue;
+            };
+            for line in record.lines() {
+                let Some((rel, _)) = line.split_once(',') else {
+                    continue;
+                };
+                let joined = sp_root.join(rel);
+                let abs = std::fs::canonicalize(&joined).unwrap_or(joined);
+                out.insert(abs, canonical.clone());
+            }
+        }
+    }
+    out
 }
 
 /// Classify a dotted module name relative to the file that imports it.
 ///
 /// * Resolved + stdlib → ``Stdlib``
 /// * Resolved + first-party + file present → ``FirstParty(file)``
-/// * Resolved + non-first-party (site-packages, editable, extra) →
-///   ``External(top-level-module-name)``
+/// * Resolved + non-first-party, file in some dist's ``RECORD`` →
+///   ``ExternalDist(canonical-dist-name)``
+/// * Resolved + non-first-party, file not in any ``RECORD`` →
+///   ``ExternalFile(top-level-module-name)``
 /// * Resolved + namespace package (no file) → ``Unresolved(name)``
 /// * Unresolved → ``Unresolved(top-level-module-name)``, with a fix-up
 ///   for dotted-child stdlib misses (``collections.abc`` shouldn't
@@ -3330,6 +3460,7 @@ fn classify_import_target(
     db: &dyn ty_python_semantic::Db,
     importing_file: File,
     module_name: &ModuleName,
+    dist_lookup: &DistLookup,
 ) -> ImportTarget {
     let dotted = module_name.as_str();
     let top_level = dotted.split('.').next().unwrap_or(dotted);
@@ -3349,20 +3480,38 @@ fn classify_import_target(
         }
         return ImportTarget::Unresolved(top_level.to_string());
     };
-    match module.search_path(db) {
-        Some(sp) if sp.is_standard_library() => ImportTarget::Stdlib,
-        Some(sp) if sp.is_first_party() => match module.file(db) {
+    let search_path = module.search_path(db);
+    if search_path.is_some_and(|sp| sp.is_standard_library()) {
+        return ImportTarget::Stdlib;
+    }
+    if search_path.is_some_and(|sp| sp.is_first_party()) {
+        return match module.file(db) {
             Some(f) => ImportTarget::FirstParty(f),
             None => ImportTarget::Unresolved(top_level.to_string()),
-        },
-        Some(_) => ImportTarget::External(top_level.to_string()),
-        None => ImportTarget::Unresolved(top_level.to_string()),
+        };
+    }
+    // Non-first-party, non-stdlib: site-packages, editable, extra,
+    // or namespace package. Probe the dist-RECORD lookup for the
+    // resolved file's canonical name; fall back to ``[external file]``
+    // when the file isn't owned by any installed distribution.
+    let Some(file) = module.file(db) else {
+        return ImportTarget::Unresolved(top_level.to_string());
+    };
+    let path_str = match file.path(db) {
+        FilePath::System(p) => p.to_string(),
+        _ => return ImportTarget::ExternalFile(top_level.to_string()),
+    };
+    let path = std::fs::canonicalize(&path_str).unwrap_or_else(|_| PathBuf::from(&path_str));
+    if let Some(canonical) = dist_lookup.get(&path) {
+        ImportTarget::ExternalDist(canonical.clone())
+    } else {
+        ImportTarget::ExternalFile(top_level.to_string())
     }
 }
 
 /// Mint (or look up) the graph node a target classification should
 /// resolve to. ``Stdlib`` returns ``None`` (silent drop); the other
-/// three return a node index.
+/// four return a node index.
 fn target_to_node(
     py: Python<'_>,
     db: &ProjectDatabase,
@@ -3375,8 +3524,11 @@ fn target_to_node(
         ImportTarget::FirstParty(file) => {
             Ok(Some(mint_module_node(py, db, file, builder, module_nodes)?))
         }
-        ImportTarget::External(top) => Ok(Some(
-            builder.intern_synthetic(py, format!("[external dist] {top}"))?,
+        ImportTarget::ExternalDist(name) => Ok(Some(
+            builder.intern_synthetic(py, format!("[external dist] {name}"))?,
+        )),
+        ImportTarget::ExternalFile(name) => Ok(Some(
+            builder.intern_synthetic(py, format!("[external file] {name}"))?,
         )),
         ImportTarget::Unresolved(top) => Ok(Some(
             builder.intern_synthetic(py, format!("[unresolved] {top}"))?,
@@ -3391,11 +3543,12 @@ fn resolve_import_target(
     importing_file: File,
     builder: &mut GraphBuilder,
     module_nodes: &mut HashMap<File, usize>,
+    dist_lookup: &DistLookup,
 ) -> PyResult<Option<usize>> {
     let Some(module_name) = ModuleName::new(dotted) else {
         return Ok(None);
     };
-    let target = classify_import_target(db, importing_file, &module_name);
+    let target = classify_import_target(db, importing_file, &module_name, dist_lookup);
     target_to_node(py, db, target, builder, module_nodes)
 }
 
@@ -3447,20 +3600,23 @@ fn resolve_from_imported(
     module_nodes: &mut HashMap<File, usize>,
     globals_by_name: &GlobalsByName,
     star_reexports: &StarReexports,
+    dist_lookup: &DistLookup,
 ) -> PyResult<Vec<usize>> {
     let Ok(module_name) = ModuleName::from_import_statement(db, importing_file, stmt) else {
         return Ok(Vec::new());
     };
 
-    let target = classify_import_target(db, importing_file, &module_name);
+    let target = classify_import_target(db, importing_file, &module_name, dist_lookup);
     // External / unresolved targets short-circuit at the module level —
     // we don't have file-level namespace info, so the alias edges to
-    // the ``[external dist] X`` / ``[unresolved] X`` synthetic.
-    // Stdlib drops silently.
+    // the ``[external dist] X`` / ``[external file] X`` / ``[unresolved] X``
+    // synthetic. Stdlib drops silently.
     let target_file = match target {
         ImportTarget::Stdlib => return Ok(Vec::new()),
         ImportTarget::FirstParty(f) => f,
-        ImportTarget::External(_) | ImportTarget::Unresolved(_) => {
+        ImportTarget::ExternalDist(_)
+        | ImportTarget::ExternalFile(_)
+        | ImportTarget::Unresolved(_) => {
             return Ok(target_to_node(py, db, target, builder, module_nodes)?
                 .into_iter()
                 .collect());
@@ -3487,7 +3643,7 @@ fn resolve_from_imported(
     if let Some(submodule_name) = ModuleName::new(symbol_name) {
         let mut combined = module_name.clone();
         combined.extend(&submodule_name);
-        let sub_target = classify_import_target(db, importing_file, &combined);
+        let sub_target = classify_import_target(db, importing_file, &combined, dist_lookup);
         if !matches!(sub_target, ImportTarget::Unresolved(_)) {
             // Stdlib silent-drop / first-party submodule / external
             // submodule all land here. ``Unresolved`` falls through to
@@ -3573,11 +3729,12 @@ fn from_import_module_node(
     stmt: &ruff_python_ast::StmtImportFrom,
     builder: &mut GraphBuilder,
     module_nodes: &mut HashMap<File, usize>,
+    dist_lookup: &DistLookup,
 ) -> PyResult<Option<usize>> {
     let Ok(module_name) = ModuleName::from_import_statement(db, importing_file, stmt) else {
         return Ok(None);
     };
-    let target = classify_import_target(db, importing_file, &module_name);
+    let target = classify_import_target(db, importing_file, &module_name, dist_lookup);
     target_to_node(py, db, target, builder, module_nodes)
 }
 
@@ -3628,6 +3785,7 @@ fn emit_reference_edges(
     module_nodes: &HashMap<File, usize>,
     alias_imports: &HashMap<usize, ImportSpec>,
     live_decls: &LiveDeclIndex,
+    dist_lookup: &DistLookup,
     builder: &mut GraphBuilder,
 ) {
     let Some(&module_idx) = module_nodes.get(&file) else {
@@ -3673,6 +3831,7 @@ fn emit_reference_edges(
             alias_imports,
             live_decls,
             &synthetic_nodes,
+            dist_lookup,
             &dead_ranges,
         );
         walk_owned(kind, &parsed, &mut coll);
@@ -3696,6 +3855,7 @@ fn emit_reference_edges(
             alias_imports,
             live_decls,
             &synthetic_nodes,
+            dist_lookup,
             &dead_ranges,
         );
         coll.visit_stmt(stmt);
@@ -3994,13 +4154,16 @@ struct RefCollector<'a, 'db> {
     dead_ranges: &'a [TextRange],
     /// `{ synthetic_fqname -> node idx }` mirrored from
     /// ``GraphBuilder::synthetic_nodes`` so the collector can route
-    /// upstream edges through pre-minted ``[external dist] X`` and
-    /// ``[unresolved] X`` synthetics without holding the mutable
-    /// builder. Populated by ``emit_import_edges`` before the
-    /// collector pass runs; every alias-side resolution mints its
-    /// synthetic up-front, so the use-site walk only needs read
-    /// access here.
+    /// upstream edges through pre-minted ``[external dist] X``,
+    /// ``[external file] X``, and ``[unresolved] X`` synthetics
+    /// without holding the mutable builder. Populated by
+    /// ``emit_import_edges`` before the collector pass runs.
     synthetic_nodes: &'a HashMap<String, usize>,
+    /// ``abs_file_path -> PEP 503-canonical dist name`` built once
+    /// per ``materialize`` call. The collector re-classifies
+    /// ``emit_upstream``'s loading target to compute the same
+    /// synthetic fqname ``emit_import_edges`` used at mint time.
+    dist_lookup: &'a DistLookup,
     /// Edges accumulated for this collector pass. The value is the
     /// AND of the flags contributed by each reference that produced
     /// this `(src, dst)` pair — so a `(src, dst)` reachable from both
@@ -4034,6 +4197,7 @@ impl<'a, 'db> RefCollector<'a, 'db> {
         alias_imports: &'a HashMap<usize, ImportSpec>,
         live_decls: &'a LiveDeclIndex,
         synthetic_nodes: &'a HashMap<String, usize>,
+        dist_lookup: &'a DistLookup,
         dead_ranges: &'a [TextRange],
     ) -> Self {
         Self {
@@ -4047,6 +4211,7 @@ impl<'a, 'db> RefCollector<'a, 'db> {
             alias_imports,
             live_decls,
             synthetic_nodes,
+            dist_lookup,
             dead_ranges,
             edges: HashMap::new(),
             nested_context: false,
@@ -4325,12 +4490,18 @@ impl<'a, 'db> RefCollector<'a, 'db> {
         let Some(start_mn) = ModuleName::new(&loading_target) else {
             return;
         };
-        let target = classify_import_target(db, self.file, &start_mn);
+        let target = classify_import_target(db, self.file, &start_mn, self.dist_lookup);
         let start_file = match target {
             ImportTarget::Stdlib => return,
             ImportTarget::FirstParty(f) => f,
-            ImportTarget::External(top) => {
-                if let Some(&idx) = self.synthetic_nodes.get(&format!("[external dist] {top}")) {
+            ImportTarget::ExternalDist(name) => {
+                if let Some(&idx) = self.synthetic_nodes.get(&format!("[external dist] {name}")) {
+                    self.emit_edge(idx);
+                }
+                return;
+            }
+            ImportTarget::ExternalFile(name) => {
+                if let Some(&idx) = self.synthetic_nodes.get(&format!("[external file] {name}")) {
                     self.emit_edge(idx);
                 }
                 return;

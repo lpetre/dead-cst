@@ -886,6 +886,24 @@ def test_third_party_import_creates_synthetic_node(build_decl_graph):
     assert {"p.uses_rx.rx", "p.uses_rx.build"} <= edge_srcs
 
 
+def test_third_party_import_uses_canonical_dist_name(build_decl_graph):
+    """``import yaml`` lands on ``[external dist] pyyaml`` (PEP 503).
+
+    The distribution's top-level module (``yaml``) and its canonical
+    PyPI name (``PyYAML`` → ``pyyaml``) differ. Plugins query by the
+    canonical name so the synthetic must match what
+    :data:`importlib.metadata`'s ``Name:`` header normalizes to.
+    """
+    graph = build_decl_graph(
+        {
+            "p/__init__.py": "",
+            "p/uses_yaml.py": "import yaml\nDATA = yaml.safe_load('a: 1')\n",
+        }
+    )
+    fqnames = {n.fqname for n in graph.nodes if n.type == "synthetic"}
+    assert "[external dist] pyyaml" in fqnames, fqnames
+
+
 def test_stdlib_imports_are_silent(build_decl_graph, caplog):
     """Stdlib imports drop without surfacing a synthetic node or a warning."""
     with caplog.at_level(logging.WARNING, logger="dead_cst._edges"):
