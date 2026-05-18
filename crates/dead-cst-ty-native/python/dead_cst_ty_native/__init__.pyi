@@ -633,12 +633,21 @@ class DecoratorRef:
       ``@<owner>.<attr>`` prefix).
     * ``where_owner_attr_via`` additionally fills ``decorator_via``
       with the middle attribute name.
+
+    ``args`` and ``kwargs`` are populated from the decorator's
+    ``Call`` form (``@dec(a, b, k=v)``). Bare-attribute decorators
+    (``@app.route`` without ``()``) get empty containers. Each value
+    is either a Python literal, a :class:`NativeNode` (when the
+    expression statically resolves to a project decl), or ``None``
+    (for both literal ``None`` and unresolvable expressions).
     """
 
     decorated: NativeNode
     decorator_name: str | None
     decorator_owner: str | None
     decorator_via: str | None
+    args: list[Any]
+    kwargs: dict[str, Any]
 
     @property
     def path(self) -> str: ...
@@ -661,10 +670,18 @@ class CallRef:
 
     ``string_arg`` is the positional string literal at the index
     passed to :meth:`CallQuery.string_arg_at`.
+
+    ``args`` and ``kwargs`` carry the call's full positional /
+    keyword argument shape. Each value is either a Python literal,
+    a :class:`NativeNode` (when the expression statically resolves
+    to a project decl), or ``None`` (for both literal ``None`` and
+    unresolvable expressions).
     """
 
     owner: NativeNode
     string_arg: str
+    args: list[Any]
+    kwargs: dict[str, Any]
 
     @property
     def path(self) -> str: ...
@@ -771,6 +788,18 @@ class DecoratorQuery:
     ) -> DecoratorQuery: ...
     def in_decl(self, node: NativeNode) -> DecoratorQuery: ...
     def where_path(self, regex: str) -> DecoratorQuery: ...
+    def where_kwarg(self, name: str, value: Any) -> DecoratorQuery:
+        """Filter to decorator calls whose ``name=value`` kwarg matches.
+
+        Multiple ``.where_kwarg`` calls AND together. ``value`` is
+        either a Python literal (``None`` / ``bool`` / ``int`` /
+        ``float`` / ``str`` / ``list`` / ``tuple``) or a
+        :class:`NativeNode` (matched by ``fqname``). A missing kwarg
+        on the call never matches. An unresolvable kwarg expression
+        never matches a value-based filter.
+        """
+        ...
+
     def collect(self) -> list[DecoratorRef]: ...
     def first(self) -> DecoratorRef | None: ...
     def count(self) -> int: ...
@@ -802,6 +831,18 @@ class CallQuery:
     def string_arg_at(self, index: int) -> CallQuery: ...
     def where_required_positional(self, n: int | None = ...) -> CallQuery: ...
     def where_path(self, regex: str) -> CallQuery: ...
+    def where_kwarg(self, name: str, value: Any) -> CallQuery:
+        """Filter to call sites whose ``name=value`` kwarg matches.
+
+        Multiple ``.where_kwarg`` calls AND together. ``value`` is
+        either a Python literal (``None`` / ``bool`` / ``int`` /
+        ``float`` / ``str`` / ``list`` / ``tuple``) or a
+        :class:`NativeNode` (matched by ``fqname``). A missing kwarg
+        on the call never matches. An unresolvable kwarg expression
+        never matches a value-based filter.
+        """
+        ...
+
     def collect(self) -> list[CallRef]: ...
     def first(self) -> CallRef | None: ...
     def count(self) -> int: ...
