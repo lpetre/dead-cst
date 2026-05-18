@@ -188,8 +188,9 @@ cython_debug/
 #  you could uncomment the following to ignore the entire vscode folder
 # .vscode/
 
-# hatch-vcs generated version file
-dead_cst/_version.py
+# Compiled native extension (maturin output)
+dead_cst/_native*.so
+dead_cst/_native*.pyd
 
 # Ruff stuff:
 .ruff_cache/

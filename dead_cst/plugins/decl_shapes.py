@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING, Iterable, Mapping
 from ..graph import NodeFlags
 
 if TYPE_CHECKING:
-    import dead_cst_ty_native as native
+    from dead_cst import _native as native
 
 
 @dataclass(kw_only=True)
@@ -49,7 +49,7 @@ class DecoratedDeclPlugin:
     constructor_names: frozenset[str] = frozenset()
 
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
-        import dead_cst_ty_native as native
+        from dead_cst import _native as native
 
         if not self.decorator_module:
             return
@@ -125,7 +125,7 @@ class DispatchAppPlugin:
         return f"<{self.name}-{kind}>:"
 
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
-        import dead_cst_ty_native as native
+        from dead_cst import _native as native
 
         if not (self.app_module and self.registration_decorators):
             return
@@ -233,7 +233,7 @@ class LiteralListPlugin:
     variable_name: str = ""
 
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
-        import dead_cst_ty_native as native
+        from dead_cst import _native as native
 
         if not self.owner_fqname or not self.variable_name:
             return

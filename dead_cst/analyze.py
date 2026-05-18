@@ -150,7 +150,7 @@ class Analysis:
     """Lazy entrypoint to the dead-cst pipeline.
 
     Builds the project's symbol graph via the rust backend
-    (:mod:`dead_cst_ty_native`), which uses ty's ``SemanticIndex`` to
+    (:mod:`dead_cst._native`), which uses ty's ``SemanticIndex`` to
     resolve every cross-file reference in one pass. Construction reads
     the resolver's :meth:`PathResolver.resolve` to enumerate first-party
     packages; no source is read or parsed until you ask a question
@@ -223,7 +223,7 @@ class Analysis:
         """
         if self._full_graph is not None:
             return self._full_graph
-        from ._native import materialize_project
+        from ._backend import materialize_project
 
         # Pass each first-party package's path as a src_root so the
         # rust backend mounts files at the right module fqname

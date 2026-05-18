@@ -1,4 +1,4 @@
-# CLAUDE.md (crates/dead-cst-ty-native)
+# CLAUDE.md (native/)
 
 Scoped to the ty-backed native crate. Reads in addition to the
 top-level `CLAUDE.md`. Where the two disagree, this file wins inside

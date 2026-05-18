@@ -38,14 +38,14 @@ repos:
         require_serial: true
       - id: cargo-fmt
         name: cargo fmt
-        entry: cargo fmt --manifest-path crates/dead-cst-ty-native/Cargo.toml --
+        entry: cargo fmt --manifest-path native/Cargo.toml --
         language: system
-        files: ^crates/.*\.rs$
+        files: ^native/.*\.rs$
         pass_filenames: false
       - id: cargo-clippy
         name: cargo clippy
-        entry: cargo clippy --manifest-path crates/dead-cst-ty-native/Cargo.toml --all-targets --locked -- -D warnings
+        entry: cargo clippy --manifest-path native/Cargo.toml --all-targets --locked -- -D warnings
         language: system
-        files: ^crates/.*\.(rs|toml|lock)$
+        files: ^native/.*\.(rs|toml|lock)$
         pass_filenames: false
         require_serial: true

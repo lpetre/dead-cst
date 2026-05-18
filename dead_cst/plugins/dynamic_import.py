@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING, Iterable
 from ..graph import EdgeFlags
 
 if TYPE_CHECKING:
-    import dead_cst_ty_native as native
+    from dead_cst import _native as native
 
 _DYNAMIC_IMPORT_FLAG: int = int(EdgeFlags.DYNAMIC_IMPORT)
 
@@ -47,7 +47,7 @@ class DynamicImportFallbackPlugin:
     include_targets: tuple[str, ...] = ()
 
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
-        import dead_cst_ty_native as native
+        from dead_cst import _native as native
 
         nodes = ctx.nodes()
         cache: dict[str, list] = {}

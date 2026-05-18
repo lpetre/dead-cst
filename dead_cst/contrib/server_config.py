@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Iterable
 from ..graph import NodeFlags
 
 if TYPE_CHECKING:
-    import dead_cst_ty_native as native
+    from dead_cst import _native as native
 
 SERVER_CONFIG_PREFIX = "<server-config>:"
 
@@ -38,7 +38,7 @@ class ServerConfigPlugin:
     version: int = 1778573528
 
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
-        import dead_cst_ty_native as native
+        from dead_cst import _native as native
 
         targets_by_path: dict[str, list[native.NativeNode]] = {}
         for n in ctx.nodes():

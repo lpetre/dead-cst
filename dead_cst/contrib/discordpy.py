@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Iterable
 from ..graph import NodeFlags
 
 if TYPE_CHECKING:
-    import dead_cst_ty_native as native
+    from dead_cst import _native as native
 
 
 _COMMANDS_BOT_KINDS: frozenset[str] = frozenset({"Bot", "AutoShardedBot"})
@@ -45,7 +45,7 @@ class DiscordPyPlugin:
     version: int = 1778566342
 
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
-        import dead_cst_ty_native as native
+        from dead_cst import _native as native
 
         # Per-file gate: only fire on files that import discord.
         discord_paths: set[str] = set()

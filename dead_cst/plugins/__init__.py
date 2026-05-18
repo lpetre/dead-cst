@@ -1,7 +1,7 @@
 """Pluggable edge contributors.
 
 A plugin implements ``run(ctx)`` against a
-:class:`dead_cst_ty_native.ProjectContext`, yielding
+:class:`dead_cst._native.ProjectContext`, yielding
 :class:`AddNode` / :class:`AddEdge` / :class:`AddEntrypoint` ops the
 rust backend applies to the in-progress project graph.
 

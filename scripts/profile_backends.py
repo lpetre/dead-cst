@@ -29,7 +29,7 @@ Usage:
     uv run python scripts/profile_backends.py --repeats 5 --targets dead_cst
     uv run python scripts/profile_backends.py --no-flux0   # skip the clone
 
-Rust path requires ``dead_cst_ty_native``; if not importable the rust
+Rust path requires ``dead_cst._native``; if not importable the rust
 columns print ``SKIP`` and the script continues with libcst only.
 """
 
@@ -59,7 +59,7 @@ logging.getLogger("dead_cst").setLevel(logging.ERROR)
 # Rust path is optional. The native extension may not be installed in
 # the active venv (CI lint job doesn't build it); fall back to libcst-only.
 try:
-    import dead_cst_ty_native as native
+    from dead_cst import _native as native
     from libcst.metadata import CodePosition, CodeRange
 
     from dead_cst._graphstore import SymbolGraph
@@ -305,7 +305,7 @@ def _run_target(cfg: TargetConfig, repeats: int) -> None:
         print(f"  rust   cold : {_fmt_ms(_bench_rust_cold(cfg, repeats))}")
         print(f"  rust   warm : {_fmt_ms(_bench_rust_warm(cfg, repeats))}")
     else:
-        print(f"  rust   cold : SKIP (dead_cst_ty_native: {_RUST_IMPORT_ERROR})")
+        print(f"  rust   cold : SKIP (dead_cst._native: {_RUST_IMPORT_ERROR})")
         print("  rust   warm : SKIP")
 
 
