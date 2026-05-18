@@ -70,14 +70,16 @@ class DynamicImportFallbackPlugin:
         module_fqname: str,
         cache: dict[str, list],
     ) -> list:
+        import dead_cst_ty_native as native
+
         cached = cache.get(module_fqname)
         if cached is not None:
             return cached
         exports = None
         if self.respect_dunder_all:
-            exports = ctx.find_module_dunder_all_exports(module_fqname)
+            exports = native.query(ctx).module_dunder_all_exports(module_fqname)
         if exports is None:
-            decls = ctx.find_module_top_level_decls(module_fqname)
+            decls = native.query(ctx).module_top_level_decls(module_fqname)
             if self.include_underscore:
                 exports = decls
             else:

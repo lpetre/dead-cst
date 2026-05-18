@@ -27,5 +27,8 @@ class ModuleDundersPlugin:
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
         import dead_cst_ty_native as native
 
-        for target in [*ctx.find_module_dunders(), *ctx.find_imports_of("__future__")]:
+        for target in [
+            *native.query(ctx).module_dunders(),
+            *native.query(ctx).imports().of("__future__").collect(),
+        ]:
             yield native.AddEntrypoint(target, marker="<dunder>")

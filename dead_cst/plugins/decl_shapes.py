@@ -140,7 +140,15 @@ class DispatchAppPlugin:
         )
         handlers = list(native.query(ctx).decorators().where_owner_attr(decorator_attrs))
         factory_decls = (
-            ctx.find_factory_decls(self.app_module, target_names) if self._factory_aware else []
+            list(
+                native.query(ctx)
+                .factories()
+                .of_module(self.app_module)
+                .where_name(target_names)
+                .collect()
+            )
+            if self._factory_aware
+            else []
         )
 
         direct_by_owner: dict[tuple[str, str], list[tuple["native.NativeNode", str]]] = {}
@@ -167,12 +175,12 @@ class DispatchAppPlugin:
                         flags=int(NodeFlags.ENTRYPOINT),
                         edges_to=[ref.var],
                     )
-            for decl_node, kinds in factory_decls:
-                for kind in kinds:
+            for fref in factory_decls:
+                for kind in fref.kinds:
                     yield native.AddNode(
-                        fqname=f"{factory_prefix}{kind}:{decl_node.fqname}",
-                        path=decl_node.path,
-                        edges_from=[decl_node],
+                        fqname=f"{factory_prefix}{kind}:{fref.decl.fqname}",
+                        path=fref.decl.path,
+                        edges_from=[fref.decl],
                     )
 
         if self._factory_aware:
@@ -242,7 +250,7 @@ class LiteralListPlugin:
         # — instead resolve the literal list by reading the dunder all
         # exports machinery (if used). Simpler: look up declarations and
         # walk successors via the visitor's ``X = ['...']`` edges.
-        decls = ctx.find_declarations(var_fqname)
+        decls = native.query(ctx).declarations(var_fqname)
         if not decls:
             return
 

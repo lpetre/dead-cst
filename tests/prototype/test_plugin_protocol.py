@@ -70,7 +70,7 @@ def test_plugin_runs_once_per_project(make_ctx):
         name = "counter"
 
         def run(self, ctx: native.ProjectContext) -> None:
-            calls.append(len(ctx.find_module_dunders()))
+            calls.append(len(native.query(ctx).module_dunders()))
 
     ctx = make_ctx(
         {
@@ -156,7 +156,7 @@ def test_find_subclasses_of_returns_empty_for_non_class(make_ctx):
         def run(self, ctx: native.ProjectContext) -> None:
             for node in ctx.nodes():
                 if node.fqname == "mod.f":
-                    captured.append(ctx.find_subclasses_of(node))
+                    captured.append(native.query(ctx).subclasses().of_node(node).collect())
 
     ctx.add_plugin(Inspect())
     ctx.materialize()
@@ -257,8 +257,8 @@ def test_add_edge_dedups_by_content(make_ctx):
 def test_query_outside_materialize_raises(make_ctx):
     """Calling a query method on an un-materialized context errors clearly."""
     ctx = make_ctx({"mod.py": "x = 1\n"})
-    with pytest.raises(RuntimeError, match="ProjectContext.find_module_dunders"):
-        ctx.find_module_dunders()
+    with pytest.raises(RuntimeError, match="find_module_dunders"):
+        native.query(ctx).module_dunders()
 
 
 def test_materialize_is_idempotent(make_ctx):

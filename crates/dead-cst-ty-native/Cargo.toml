@@ -9,7 +9,7 @@ name = "dead_cst_ty_native"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "0.22", features = ["extension-module", "abi3-py311"] }
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py311", "multiple-pymethods"] }
 ty_project = { path = "../../vendor/ruff/crates/ty_project" }
 ty_python_core = { path = "../../vendor/ruff/crates/ty_python_core" }
 ty_python_semantic = { path = "../../vendor/ruff/crates/ty_python_semantic" }

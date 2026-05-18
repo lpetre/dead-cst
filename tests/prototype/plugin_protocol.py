@@ -11,7 +11,7 @@ Demonstrates a new plugin shape distinct from the libcst-side
 
 * The **context is the rust pyclass** (`dead_cst_ty_native.ProjectContext`).
   Plugins ``yield`` ``GraphOp`` values (``AddNode`` / ``AddEdge`` /
-  ``AddEntrypoint``) to extend the graph, and call ``ctx.find_*`` to
+  ``AddEntrypoint``) to extend the graph, and call ``native.query(ctx).*`` to
   ask structured questions (``find_module_dunders``,
   ``find_classes_defining_method``, ``find_subclasses_of``,
   ``find_comment_patterns``). Queries return ``NativeNode`` Python
@@ -43,7 +43,7 @@ class ProjectPlugin(Protocol):
     """One project-scoped pass over the rust-built graph.
 
     Implementations yield ``GraphOp`` values (``AddNode`` / ``AddEdge``
-    / ``AddEntrypoint``) to extend the graph and call ``ctx.find_*``
+    / ``AddEntrypoint``) to extend the graph and call ``native.query(ctx).*``
     to query it. Both groups round-trip through rust — queries execute
     against ty's semantic index; ``apply_graph_op`` lands each yielded
     op in the same builder the snapshot reads at the end.
@@ -95,5 +95,5 @@ class KeepAliveCommentPlugin:
     name = "keep_alive_comment"
 
     def run(self, ctx: "native.ProjectContext") -> "Iterable[native.GraphOp]":
-        for decl, _comment in ctx.find_comment_patterns(r"#\s*dead-cst:\s*keep\b"):
+        for decl, _comment in native.query(ctx).comment_patterns(r"#\s*dead-cst:\s*keep\b"):
             yield native.AddEntrypoint(decl, marker="<keep>")

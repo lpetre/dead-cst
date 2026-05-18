@@ -50,7 +50,7 @@ class DiscordPyPlugin:
         # Per-file gate: only fire on files that import discord.
         discord_paths: set[str] = set()
         for module in ("discord", "discord.ext", "discord.ext.commands"):
-            for imp in ctx.find_imports_of(module):
+            for imp in native.query(ctx).imports().of(module).collect():
                 discord_paths.add(imp.path)
         if not discord_paths:
             return
@@ -95,7 +95,7 @@ class DiscordPyPlugin:
         # 4. Cog subclasses + module-level setup / teardown hooks.
         cogs_by_path: dict[str, list[native.NativeNode]] = {}
         for base in ("discord.ext.commands.Cog", "discord.ext.commands.GroupCog"):
-            for cog in ctx.find_subclasses(base, transitive=True):
+            for cog in native.query(ctx).subclasses().of_fqn(base).transitive(True).collect():
                 cogs_by_path.setdefault(cog.path, []).append(cog)
 
         if cogs_by_path:

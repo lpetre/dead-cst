@@ -828,6 +828,74 @@ impl QueryBuilder {
     fn calls(&self, py: Python<'_>) -> CallQuery {
         CallQuery::new(self.ctx.clone_ref(py))
     }
+    fn subclasses(&self, py: Python<'_>) -> SubclassQuery {
+        SubclassQuery::new(self.ctx.clone_ref(py))
+    }
+    fn imports(&self, py: Python<'_>) -> ImportQuery {
+        ImportQuery::new(self.ctx.clone_ref(py))
+    }
+    fn classes(&self, py: Python<'_>) -> ClassQuery {
+        ClassQuery::new(self.ctx.clone_ref(py))
+    }
+    fn factories(&self, py: Python<'_>) -> FactoryQuery {
+        FactoryQuery::new(self.ctx.clone_ref(py))
+    }
+
+    // ----- Point lookups (no filter chain) ------------------------------
+
+    /// Look up a module's synthetic node by dotted fqname. Mirrors
+    /// :meth:`ProjectContext.find_module`.
+    fn module(&self, py: Python<'_>, fqname: &str) -> PyResult<Option<Py<NativeNode>>> {
+        self.ctx.borrow(py).find_module(py, fqname)
+    }
+    /// All top-level declarations bound to the given dotted fqname.
+    /// Mirrors :meth:`ProjectContext.find_declarations`.
+    fn declarations(&self, py: Python<'_>, fqname: &str) -> PyResult<Vec<Py<NativeNode>>> {
+        self.ctx.borrow(py).find_declarations(py, fqname)
+    }
+    /// Every top-level declaration node of the named module.
+    /// Mirrors :meth:`ProjectContext.find_module_top_level_decls`.
+    fn module_top_level_decls(
+        &self,
+        py: Python<'_>,
+        fqname: &str,
+    ) -> PyResult<Vec<Py<NativeNode>>> {
+        self.ctx.borrow(py).find_module_top_level_decls(py, fqname)
+    }
+    /// The exported names listed in a module's ``__all__`` (when
+    /// statically resolvable), or ``None`` when the module has no
+    /// ``__all__``.
+    /// Mirrors :meth:`ProjectContext.find_module_dunder_all_exports`.
+    fn module_dunder_all_exports(
+        &self,
+        py: Python<'_>,
+        fqname: &str,
+    ) -> PyResult<Option<Vec<Py<NativeNode>>>> {
+        self.ctx
+            .borrow(py)
+            .find_module_dunder_all_exports(py, fqname)
+    }
+    /// All top-level ``__dunder__`` declarations across the project.
+    /// Mirrors :meth:`ProjectContext.find_module_dunders`.
+    fn module_dunders(&self, py: Python<'_>) -> PyResult<Vec<Py<NativeNode>>> {
+        self.ctx.borrow(py).find_module_dunders(py)
+    }
+    /// Every ``if __name__ == "__main__":`` block in the project,
+    /// paired with the module and the decls inside.
+    /// Mirrors :meth:`ProjectContext.find_main_blocks`.
+    fn main_blocks(&self, py: Python<'_>) -> PyResult<Vec<MainBlock>> {
+        self.ctx.borrow(py).find_main_blocks(py)
+    }
+    /// Comments matching ``pattern`` paired with the next
+    /// declaration. Mirrors :meth:`ProjectContext.find_comment_patterns`.
+    #[allow(clippy::type_complexity)]
+    fn comment_patterns(
+        &self,
+        py: Python<'_>,
+        pattern: &str,
+    ) -> PyResult<Vec<(Py<NativeNode>, String)>> {
+        self.ctx.borrow(py).find_comment_patterns(py, pattern)
+    }
 }
 
 fn _extract_str_or_list(py: Python<'_>, obj: PyObject) -> PyResult<Vec<String>> {
@@ -1351,6 +1419,222 @@ impl CallQuery {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Subclass / Import / Class / Factory queries
+// ---------------------------------------------------------------------------
+
+/// Walk transitive subclasses of a base class. Pick exactly one of:
+/// * ``of_fqn(fqn)`` — base by dotted name (external classes ok —
+///   ``unittest.TestCase`` etc.).
+/// * ``of_node(class_node)`` — base by project-local class node.
+/// ``transitive(bool)`` controls whether the BFS walks past the
+/// direct subclass frontier (default ``True``; for ``of_node`` the
+/// BFS is always transitive).
+#[pyclass(unsendable)]
+struct SubclassQuery {
+    ctx: Py<ProjectContext>,
+    base_fqn: Option<String>,
+    base_node: Option<Py<NativeNode>>,
+    transitive: bool,
+}
+
+impl SubclassQuery {
+    fn new(ctx: Py<ProjectContext>) -> Self {
+        Self {
+            ctx,
+            base_fqn: None,
+            base_node: None,
+            transitive: true,
+        }
+    }
+}
+
+#[pymethods]
+impl SubclassQuery {
+    fn of_fqn<'py>(mut slf: PyRefMut<'py, Self>, fqn: String) -> PyRefMut<'py, Self> {
+        slf.base_fqn = Some(fqn);
+        slf
+    }
+    fn of_node<'py>(mut slf: PyRefMut<'py, Self>, node: Py<NativeNode>) -> PyRefMut<'py, Self> {
+        slf.base_node = Some(node);
+        slf
+    }
+    fn transitive<'py>(mut slf: PyRefMut<'py, Self>, value: bool) -> PyRefMut<'py, Self> {
+        slf.transitive = value;
+        slf
+    }
+
+    fn collect(&self, py: Python<'_>) -> PyResult<Vec<Py<NativeNode>>> {
+        let ctx = self.ctx.borrow(py);
+        if let Some(fqn) = &self.base_fqn {
+            ctx.find_subclasses(py, fqn, self.transitive)
+        } else if let Some(node) = &self.base_node {
+            ctx.find_subclasses_of(py, &node.borrow(py))
+        } else {
+            Err(PyValueError::new_err(
+                "SubclassQuery requires .of_fqn(...) or .of_node(...)",
+            ))
+        }
+    }
+    fn count(&self, py: Python<'_>) -> PyResult<usize> {
+        Ok(self.collect(py)?.len())
+    }
+    fn __iter__(&self, py: Python<'_>) -> PyResult<PyObject> {
+        _to_iter(py, self.collect(py)?)
+    }
+}
+
+/// Enumerate the ``kind="import"`` nodes that bind a name from a
+/// given module. Requires ``of(module)``.
+#[pyclass(unsendable)]
+struct ImportQuery {
+    ctx: Py<ProjectContext>,
+    module: Option<String>,
+}
+
+impl ImportQuery {
+    fn new(ctx: Py<ProjectContext>) -> Self {
+        Self { ctx, module: None }
+    }
+}
+
+#[pymethods]
+impl ImportQuery {
+    fn of<'py>(mut slf: PyRefMut<'py, Self>, module: String) -> PyRefMut<'py, Self> {
+        slf.module = Some(module);
+        slf
+    }
+    fn collect(&self, py: Python<'_>) -> PyResult<Vec<Py<NativeNode>>> {
+        let ctx = self.ctx.borrow(py);
+        let module = self
+            .module
+            .as_deref()
+            .ok_or_else(|| PyValueError::new_err("ImportQuery requires .of(module)"))?;
+        ctx.find_imports_of(py, module)
+    }
+    fn count(&self, py: Python<'_>) -> PyResult<usize> {
+        Ok(self.collect(py)?.len())
+    }
+    fn __iter__(&self, py: Python<'_>) -> PyResult<PyObject> {
+        _to_iter(py, self.collect(py)?)
+    }
+}
+
+/// Enumerate classes by structural property. Today the only filter
+/// is ``defining_method(name)`` (matches classes whose body has a
+/// ``FunctionDef`` with that name); easy to extend later.
+#[pyclass(unsendable)]
+struct ClassQuery {
+    ctx: Py<ProjectContext>,
+    defining_method: Option<String>,
+}
+
+impl ClassQuery {
+    fn new(ctx: Py<ProjectContext>) -> Self {
+        Self {
+            ctx,
+            defining_method: None,
+        }
+    }
+}
+
+#[pymethods]
+impl ClassQuery {
+    fn defining_method<'py>(mut slf: PyRefMut<'py, Self>, name: String) -> PyRefMut<'py, Self> {
+        slf.defining_method = Some(name);
+        slf
+    }
+    fn collect(&self, py: Python<'_>) -> PyResult<Vec<Py<NativeNode>>> {
+        let ctx = self.ctx.borrow(py);
+        let name = self
+            .defining_method
+            .as_deref()
+            .ok_or_else(|| PyValueError::new_err("ClassQuery requires .defining_method(name)"))?;
+        ctx.find_classes_defining_method(py, name)
+    }
+    fn count(&self, py: Python<'_>) -> PyResult<usize> {
+        Ok(self.collect(py)?.len())
+    }
+    fn __iter__(&self, py: Python<'_>) -> PyResult<PyObject> {
+        _to_iter(py, self.collect(py)?)
+    }
+}
+
+/// One result row from :class:`FactoryQuery`. ``decl`` is the
+/// owning top-level function or class; ``kinds`` is the sorted set
+/// of constructor bare-names matched inside its body.
+#[pyclass(frozen, get_all)]
+struct FactoryRef {
+    decl: Py<NativeNode>,
+    kinds: Vec<String>,
+}
+
+#[pymethods]
+impl FactoryRef {
+    #[getter]
+    fn path(&self, py: Python<'_>) -> String {
+        self.decl.borrow(py).path.clone()
+    }
+}
+
+/// Walk function / class bodies for ``<Ctor>(...)`` calls where
+/// ``Ctor`` is imported from ``of_module(...)`` and matches one of
+/// ``where_name(...)``. Both filters are required.
+#[pyclass(unsendable)]
+struct FactoryQuery {
+    ctx: Py<ProjectContext>,
+    module: Option<String>,
+    names: Option<Vec<String>>,
+}
+
+impl FactoryQuery {
+    fn new(ctx: Py<ProjectContext>) -> Self {
+        Self {
+            ctx,
+            module: None,
+            names: None,
+        }
+    }
+}
+
+#[pymethods]
+impl FactoryQuery {
+    fn of_module<'py>(mut slf: PyRefMut<'py, Self>, module: String) -> PyRefMut<'py, Self> {
+        slf.module = Some(module);
+        slf
+    }
+    fn where_name<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        names: PyObject,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let py = slf.py();
+        slf.names = Some(_extract_str_or_list(py, names)?);
+        Ok(slf)
+    }
+    fn collect(&self, py: Python<'_>) -> PyResult<Vec<Py<FactoryRef>>> {
+        let ctx = self.ctx.borrow(py);
+        let module = self
+            .module
+            .as_deref()
+            .ok_or_else(|| PyValueError::new_err("FactoryQuery requires .of_module(...)"))?;
+        let names = self
+            .names
+            .clone()
+            .ok_or_else(|| PyValueError::new_err("FactoryQuery requires .where_name(...)"))?;
+        let pairs = ctx.find_factory_decls(py, module, names)?;
+        pairs
+            .into_iter()
+            .map(|(decl, kinds)| Py::new(py, FactoryRef { decl, kinds }))
+            .collect()
+    }
+    fn count(&self, py: Python<'_>) -> PyResult<usize> {
+        Ok(self.collect(py)?.len())
+    }
+    fn __iter__(&self, py: Python<'_>) -> PyResult<PyObject> {
+        _to_iter(py, self.collect(py)?)
+    }
+}
+
 /// Plugin-aware project graph builder.
 ///
 /// Python instantiates a `ProjectContext`, registers Python plugins via
@@ -1491,9 +1775,11 @@ impl ProjectContext {
             edges: outputs.builder.edges,
         })
     }
+}
 
-    // ----- Queries (rust-resident, results pass back to Python) -----------
+// ----- Queries (rust-only, exposed to Python via the chainable QueryBuilder) -
 
+impl ProjectContext {
     /// Return every top-level variable node whose name matches `__xxx__`.
     ///
     /// Pure scan over already-interned nodes — no ty re-query needed —
@@ -1587,7 +1873,10 @@ impl ProjectContext {
             .get(fqname)
             .map(|&idx| outputs.builder.nodes[idx].clone_ref(py)))
     }
+}
 
+#[pymethods]
+impl ProjectContext {
     /// Return the module node owning ``path``, if any. O(1) — backed
     /// by the same ``module_nodes_by_file`` index `find_main_blocks`
     /// uses, so plugins don't have to scan ``nodes()`` per call.
@@ -1665,7 +1954,9 @@ impl ProjectContext {
         }
         Ok(out)
     }
+}
 
+impl ProjectContext {
     /// Return ``module_fqn``'s immediate top-level decls — every
     /// function / class / variable / import bound at its module scope.
     ///
@@ -1741,7 +2032,10 @@ impl ProjectContext {
         }
         Ok(Some(out))
     }
+}
 
+#[pymethods]
+impl ProjectContext {
     /// Every node whose ``path`` starts with the given prefix.
     fn decls_under(&self, py: Python<'_>, path_prefix: &str) -> PyResult<Vec<Py<NativeNode>>> {
         let outputs = self.outputs.borrow();
@@ -1863,7 +2157,9 @@ impl ProjectContext {
             .map(|i| outputs.builder.nodes[i].clone_ref(py))
             .collect())
     }
+}
 
+impl ProjectContext {
     /// Return ``(module_node, [decls inside the block])`` for every
     /// file with a top-level ``if __name__ == "__main__":`` block.
     ///
@@ -1921,7 +2217,6 @@ impl ProjectContext {
     /// plugin helpers used by ``PytestPlugin`` etc., which intentionally
     /// keep a loose pattern match rather than trying to chase decorator
     /// imports through ty's resolver.
-    #[pyo3(signature = (decorator_module, decorator_names, *, path_regex = None))]
     fn find_decorated_decls(
         &self,
         py: Python<'_>,
@@ -1995,7 +2290,6 @@ impl ProjectContext {
     /// upstream constructor's bare name (``"Flask"`` even when imported
     /// as ``F``).
     #[allow(clippy::type_complexity)]
-    #[pyo3(signature = (module, ctor_names, *, path_regex = None))]
     fn find_instance_constructions(
         &self,
         py: Python<'_>,
@@ -2061,7 +2355,6 @@ impl ProjectContext {
     /// correspond to real framework instances. Multiple decorators on
     /// the same function emit multiple entries.
     #[allow(clippy::type_complexity)]
-    #[pyo3(signature = (decorator_attrs, *, path_regex = None))]
     fn find_handler_decorators(
         &self,
         py: Python<'_>,
@@ -2133,7 +2426,6 @@ impl ProjectContext {
     /// ``[(owner_name, function_node)]`` shape, where ``owner_name`` is
     /// the leftmost ``Name`` in the decorator chain.
     #[allow(clippy::type_complexity)]
-    #[pyo3(signature = (via_attr, decorator_attrs, *, path_regex = None))]
     fn find_handler_decorators_via(
         &self,
         py: Python<'_>,
@@ -2218,7 +2510,6 @@ impl ProjectContext {
     /// pattern is keyed on the method name and the receiver is the
     /// plugin's concern (typically gated by a per-file import check).
     #[allow(clippy::type_complexity)]
-    #[pyo3(signature = (attr, arg_index, *, path_regex = None))]
     fn find_calls_on_attr(
         &self,
         py: Python<'_>,
@@ -2351,7 +2642,6 @@ impl ProjectContext {
     /// the call lives under (including its decorator subtree); calls
     /// at module scope attribute to the module node.
     #[allow(clippy::type_complexity)]
-    #[pyo3(signature = (module, name, arg_index, *, path_regex = None))]
     fn find_calls_to_imported(
         &self,
         py: Python<'_>,
@@ -2426,7 +2716,6 @@ impl ProjectContext {
     ///
     /// Returns ``(owning_decl, string_literal_arg)`` pairs.
     #[allow(clippy::type_complexity)]
-    #[pyo3(signature = (owner, attr, arg_index, *, required_positional = None, path_regex = None))]
     fn find_calls_on_var(
         &self,
         py: Python<'_>,
@@ -2581,17 +2870,8 @@ impl ProjectContext {
             .collect())
     }
 
-    // ----- Stage 2: ty-backed semantic queries ---------------------------
+    // ----- Convenience helpers used by the chainable QueryBuilder ----------
 
-    /// Decls decorated by ``@<decorator_fqn>`` or ``@<decorator_fqn>(...)``.
-    ///
-    /// Resolves through the file's local imports — aliased / dotted /
-    /// module-prefixed forms all match. ``decorator_fqn`` is the
-    /// upstream callable's absolute fqn (``celery.shared_task``,
-    /// ``pytest.fixture``). For instance-method decorators
-    /// (``@app.route(...)`` where ``app`` is a ``flask.Flask``) use
-    /// :meth:`find_decorations_on` instead.
-    #[pyo3(signature = (decorator_fqn, *, path_regex = None))]
     fn find_decorated(
         &self,
         py: Python<'_>,
@@ -2606,14 +2886,6 @@ impl ProjectContext {
         self.find_decorated_decls(py, module, vec![name.to_string()], path_regex)
     }
 
-    /// Module-level variables assigned an instance of ``class_fqn``.
-    ///
-    /// e.g. ``find_constructions("flask.Flask")`` → every ``app =
-    /// Flask(...)`` variable node. ``include_subclasses=True`` also
-    /// matches direct constructions of any class that subclasses
-    /// ``class_fqn`` (works for both project subclasses and external
-    /// ones via ty's type hierarchy).
-    #[pyo3(signature = (class_fqn, *, include_subclasses = false, path_regex = None))]
     fn find_constructions(
         &self,
         py: Python<'_>,
@@ -2645,14 +2917,6 @@ impl ProjectContext {
         Ok(pairs.into_iter().map(|(node, _)| node).collect())
     }
 
-    /// Decls decorated by ``@<instance>.<method>(...)`` for ``method``
-    /// in ``method_names``, where ``<instance>`` resolves to the given
-    /// decl in the same file.
-    ///
-    /// Cross-file owners (where ``app = imported_factory()`` and
-    /// ``@app.route`` is in a different file) aren't matched — same
-    /// limitation the rust dispatch-app path has today.
-    #[pyo3(signature = (instance, method_names, *, path_regex = None))]
     fn find_decorations_on(
         &self,
         py: Python<'_>,
@@ -2683,7 +2947,6 @@ impl ProjectContext {
     /// ``type_hierarchy_subtypes``. ``transitive=True`` (default)
     /// walks the full subclass closure; ``transitive=False`` returns
     /// only direct subclasses.
-    #[pyo3(signature = (base_fqn, *, transitive = true))]
     fn find_subclasses(
         &self,
         py: Python<'_>,
@@ -2753,7 +3016,10 @@ impl ProjectContext {
         }
         Ok(out)
     }
+}
 
+#[pymethods]
+impl ProjectContext {
     // ----- Read-only accessors -------------------------------------------
 
     /// Live nodes in the in-progress graph. Cheap, no copy.
@@ -6793,6 +7059,11 @@ fn dead_cst_ty_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<DecoratorQuery>()?;
     m.add_class::<ConstructionQuery>()?;
     m.add_class::<CallQuery>()?;
+    m.add_class::<SubclassQuery>()?;
+    m.add_class::<ImportQuery>()?;
+    m.add_class::<ClassQuery>()?;
+    m.add_class::<FactoryQuery>()?;
+    m.add_class::<FactoryRef>()?;
     m.add_function(wrap_pyfunction!(query, m)?)?;
     Ok(())
 }
