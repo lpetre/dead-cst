@@ -27,8 +27,8 @@ jobs:
         with:
           rustflags: ""
       # ``uv sync`` runs maturin (the project's build backend) and
-      # compiles ``native/`` so ``ty check`` can resolve
-      # ``dead_cst._native`` while type-checking.
+      # compiles the Rust crate at the repo root so ``ty check`` can
+      # resolve ``dead_cst._native`` while type-checking.
       - run: uv sync --frozen
       - run: uv run prek run --show-diff-on-failure --color=always --all-files
         env:
@@ -56,12 +56,12 @@ jobs:
         with:
           rustflags: ""
       # ``uv sync`` runs maturin (the project's build backend), which
-      # compiles ``native/`` and drops ``_native.abi3.so`` next to the
-      # Python sources -- the test suite can't import ``dead_cst._native``
-      # without this step.
+      # compiles the Rust crate at the repo root and drops
+      # ``_native.abi3.so`` next to ``python/dead_cst/`` -- the test
+      # suite can't import ``dead_cst._native`` without this step.
       - run: uv sync --frozen
       - name: Run tests
-        run: uv run pytest ${{ matrix.python-version == '3.13' && '--cov=dead_cst --cov-branch --cov-report=xml' || '' }}
+        run: uv run pytest ${{ matrix.python-version == '3.13' && '--cov=python/dead_cst --cov-branch --cov-report=xml' || '' }}
       - name: Upload coverage to Codecov
         if: matrix.python-version == '3.13'
         uses: codecov/codecov-action@v5
@@ -72,9 +72,6 @@ jobs:
 
   rust:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: native
     steps:
       - uses: actions/checkout@v6
         with:

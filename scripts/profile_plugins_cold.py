@@ -51,7 +51,7 @@ except ImportError as exc:
     sys.exit(
         f"ERROR: dead_cst._native not importable ({exc}). "
         "Build with: uv run maturin develop --release "
-        "--manifest-path native/Cargo.toml"
+        "--manifest-path Cargo.toml"
     )
 
 FLUX0_URL = "https://github.com/flux0-ai/flux0.git"

@@ -1,6 +1,6 @@
 [project]
 name = "dead-cst"
-dynamic = ["version"]
+version = "0.10.0"
 description = "Python dead code analysis backed by a Rust extension (ty + ruff)"
 readme = "README.md"
 license = "MIT"
@@ -41,17 +41,17 @@ requires = ["maturin>=1.7,<2"]
 build-backend = "maturin"
 
 [tool.maturin]
-# Single-wheel layout mirroring libcst: the Rust ``cdylib`` is compiled and
-# embedded inside the ``dead_cst`` Python package as ``dead_cst/_native.*.so``.
-# No separate Python distribution for the native bits.
-manifest-path = "native/Cargo.toml"
+# Mixed Rust/Python layout per the maturin user guide and pydantic-core's
+# template: ``Cargo.toml`` + ``src/`` at the repo root, Python sources under
+# ``python/dead_cst/``. The Rust ``cdylib`` is compiled and embedded inside
+# the ``dead_cst`` package as ``dead_cst/_native.*.so`` — one wheel ships
+# both halves.
 module-name = "dead_cst._native"
-python-source = "."
+python-source = "python"
 features = ["pyo3/extension-module"]
-# Include the type stubs and py.typed marker that ship alongside the
-# compiled extension. (Source files under ``dead_cst/`` are picked up
-# automatically via ``python-source``.)
-include = ["dead_cst/_native.pyi", "dead_cst/py.typed"]
+# Type stub + ``py.typed`` marker that ship alongside the compiled extension.
+# Other ``.py`` sources under ``python/dead_cst/`` are picked up automatically.
+include = ["python/dead_cst/_native.pyi", "python/dead_cst/py.typed"]
 
 [dependency-groups]
 dev = [
@@ -91,7 +91,7 @@ markers = [
 
 [tool.coverage.run]
 branch = true
-source = ["dead_cst"]
+source = ["python/dead_cst"]
 # ProcessPoolExecutor workers (used by ``build_symbol_graph(workers=...)``)
 # must run with the multiprocessing tracer or coverage's import-time
 # instrumentation drifts the class identity of ``_CallItem`` and causes
@@ -123,7 +123,7 @@ known-first-party = ["dead_cst"]
 # fixtures intentionally exercise untyped third-party internals and the
 # unresolved-import case the analyzer is meant to detect, so they aren't
 # meaningful targets for ty.
-include = ["dead_cst"]
-# The rust extension is shipped as ``dead_cst/_native.pyi`` (peer to the
-# compiled ``.so``); ty picks it up via the package layout without any
+include = ["python/dead_cst"]
+# The rust extension is shipped as ``python/dead_cst/_native.pyi`` (peer to
+# the compiled ``.so``); ty picks it up via the package layout without any
 # extra-paths shim.

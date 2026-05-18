@@ -189,8 +189,8 @@ cython_debug/
 # .vscode/
 
 # Compiled native extension (maturin output)
-dead_cst/_native*.so
-dead_cst/_native*.pyd
+python/dead_cst/_native*.so
+python/dead_cst/_native*.pyd
 
 # Ruff stuff:
 .ruff_cache/
