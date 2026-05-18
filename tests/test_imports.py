@@ -861,7 +861,6 @@ def test_dunder_import_fromlist_non_literal_warns(build_decl_graph, visitor_warn
     assert any("fromlist is not a literal" in m and "'p'" in m for m in messages), messages
 
 
-@pytest.mark.skip_when_backend("rust")
 def test_third_party_import_creates_synthetic_node(build_decl_graph):
     graph = build_decl_graph(
         {
@@ -885,6 +884,24 @@ def test_third_party_import_creates_synthetic_node(build_decl_graph):
         graph.node(u).fqname for u, v in graph.raw.edge_list() if graph.node(v) in rx_nodes
     }
     assert {"p.uses_rx.rx", "p.uses_rx.build"} <= edge_srcs
+
+
+def test_third_party_import_uses_canonical_dist_name(build_decl_graph):
+    """``import yaml`` lands on ``[external dist] pyyaml`` (PEP 503).
+
+    The distribution's top-level module (``yaml``) and its canonical
+    PyPI name (``PyYAML`` → ``pyyaml``) differ. Plugins query by the
+    canonical name so the synthetic must match what
+    :data:`importlib.metadata`'s ``Name:`` header normalizes to.
+    """
+    graph = build_decl_graph(
+        {
+            "p/__init__.py": "",
+            "p/uses_yaml.py": "import yaml\nDATA = yaml.safe_load('a: 1')\n",
+        }
+    )
+    fqnames = {n.fqname for n in graph.nodes if n.type == "synthetic"}
+    assert "[external dist] pyyaml" in fqnames, fqnames
 
 
 def test_stdlib_imports_are_silent(build_decl_graph, caplog):
@@ -911,7 +928,6 @@ def test_stdlib_imports_are_silent(build_decl_graph, caplog):
     assert f"{UNRESOLVED_PREFIX}collections" not in synthetics
 
 
-@pytest.mark.skip_when_backend("rust")
 def test_unresolved_import_emits_synthetic_silently(build_decl_graph, caplog):
     """A genuinely-missing top-level import gets a ``[unresolved]`` node, no warning."""
     with caplog.at_level(logging.WARNING, logger="dead_cst._edges"):
