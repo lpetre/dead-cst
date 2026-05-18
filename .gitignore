@@ -6,6 +6,8 @@ __pycache__/
 # C extensions
 *.so
 
+# Build-time generated version stamp (maturin/hatch-vcs style).
+dead_cst/_version.py
 # Distribution / packaging
 .Python
 build/
