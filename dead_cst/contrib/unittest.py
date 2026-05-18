@@ -35,11 +35,13 @@ class UnittestPlugin:
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
         from dead_cst import _native as native
 
-        importer_paths = {n.path for n in ctx.find_imports_of("unittest")}
+        importer_paths = {n.path for n in native.query(ctx).imports().of("unittest").collect()}
 
         decls_by_path: dict[str, list[native.NativeNode]] = {}
         for base_fqname in _UNITTEST_BASE_FQNAMES:
-            for sub in ctx.find_subclasses(base_fqname, transitive=True):
+            for sub in (
+                native.query(ctx).subclasses().of_fqn(base_fqname).transitive(True).collect()
+            ):
                 decls_by_path.setdefault(sub.path, []).append(sub)
 
         for node in ctx.nodes():

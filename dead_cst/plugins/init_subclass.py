@@ -28,10 +28,10 @@ class InitSubclassPlugin:
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
         from dead_cst import _native as native
 
-        for parent in ctx.find_classes_defining_method(_INIT_SUBCLASS):
+        for parent in native.query(ctx).classes().defining_method(_INIT_SUBCLASS).collect():
             yield native.AddNode(
                 fqname=f"{INIT_SUBCLASS_PREFIX}{parent.fqname}",
                 path=parent.path,
                 edges_from=[parent],
-                edges_to=ctx.find_subclasses_of(parent),
+                edges_to=native.query(ctx).subclasses().of_node(parent).collect(),
             )

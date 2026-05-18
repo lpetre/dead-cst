@@ -835,6 +835,14 @@ struct DecoratorRef {
     decorator_name: Option<String>,
     decorator_owner: Option<String>,
     decorator_via: Option<String>,
+    /// Positional arguments of the decorator's ``Call`` form. Empty
+    /// for bare attribute decorators (``@app.route`` without ``()``).
+    /// Each entry is a Python literal, a :class:`NativeNode` (when the
+    /// expression resolves to a project decl), or ``None``.
+    args: Vec<Py<PyAny>>,
+    /// Keyword arguments of the decorator's ``Call`` form. Same value
+    /// shape as ``args``.
+    kwargs: HashMap<String, Py<PyAny>>,
 }
 
 #[pymethods]
@@ -872,6 +880,14 @@ impl ConstructionRef {
 struct CallRef {
     owner: Py<NativeNode>,
     string_arg: String,
+    /// Positional arguments of the matched call, one entry per source
+    /// positional arg. Each entry is a Python literal, a
+    /// :class:`NativeNode` (when the expression resolves to a project
+    /// decl), or ``None``.
+    args: Vec<Py<PyAny>>,
+    /// Keyword arguments of the matched call. Same value shape as
+    /// ``args``.
+    kwargs: HashMap<String, Py<PyAny>>,
 }
 
 #[pymethods]
@@ -904,6 +920,74 @@ impl QueryBuilder {
     }
     fn calls(&self, py: Python<'_>) -> CallQuery {
         CallQuery::new(self.ctx.clone_ref(py))
+    }
+    fn subclasses(&self, py: Python<'_>) -> SubclassQuery {
+        SubclassQuery::new(self.ctx.clone_ref(py))
+    }
+    fn imports(&self, py: Python<'_>) -> ImportQuery {
+        ImportQuery::new(self.ctx.clone_ref(py))
+    }
+    fn classes(&self, py: Python<'_>) -> ClassQuery {
+        ClassQuery::new(self.ctx.clone_ref(py))
+    }
+    fn factories(&self, py: Python<'_>) -> FactoryQuery {
+        FactoryQuery::new(self.ctx.clone_ref(py))
+    }
+
+    // ----- Point lookups (no filter chain) ------------------------------
+
+    /// Look up a module's synthetic node by dotted fqname. Mirrors
+    /// :meth:`ProjectContext.find_module`.
+    fn module(&self, py: Python<'_>, fqname: &str) -> PyResult<Option<Py<NativeNode>>> {
+        self.ctx.borrow(py).find_module(py, fqname)
+    }
+    /// All top-level declarations bound to the given dotted fqname.
+    /// Mirrors :meth:`ProjectContext.find_declarations`.
+    fn declarations(&self, py: Python<'_>, fqname: &str) -> PyResult<Vec<Py<NativeNode>>> {
+        self.ctx.borrow(py).find_declarations(py, fqname)
+    }
+    /// Every top-level declaration node of the named module.
+    /// Mirrors :meth:`ProjectContext.find_module_top_level_decls`.
+    fn module_top_level_decls(
+        &self,
+        py: Python<'_>,
+        fqname: &str,
+    ) -> PyResult<Vec<Py<NativeNode>>> {
+        self.ctx.borrow(py).find_module_top_level_decls(py, fqname)
+    }
+    /// The exported names listed in a module's ``__all__`` (when
+    /// statically resolvable), or ``None`` when the module has no
+    /// ``__all__``.
+    /// Mirrors :meth:`ProjectContext.find_module_dunder_all_exports`.
+    fn module_dunder_all_exports(
+        &self,
+        py: Python<'_>,
+        fqname: &str,
+    ) -> PyResult<Option<Vec<Py<NativeNode>>>> {
+        self.ctx
+            .borrow(py)
+            .find_module_dunder_all_exports(py, fqname)
+    }
+    /// All top-level ``__dunder__`` declarations across the project.
+    /// Mirrors :meth:`ProjectContext.find_module_dunders`.
+    fn module_dunders(&self, py: Python<'_>) -> PyResult<Vec<Py<NativeNode>>> {
+        self.ctx.borrow(py).find_module_dunders(py)
+    }
+    /// Every ``if __name__ == "__main__":`` block in the project,
+    /// paired with the module and the decls inside.
+    /// Mirrors :meth:`ProjectContext.find_main_blocks`.
+    fn main_blocks(&self, py: Python<'_>) -> PyResult<Vec<MainBlock>> {
+        self.ctx.borrow(py).find_main_blocks(py)
+    }
+    /// Comments matching ``pattern`` paired with the next
+    /// declaration. Mirrors :meth:`ProjectContext.find_comment_patterns`.
+    #[allow(clippy::type_complexity)]
+    fn comment_patterns(
+        &self,
+        py: Python<'_>,
+        pattern: &str,
+    ) -> PyResult<Vec<(Py<NativeNode>, String)>> {
+        self.ctx.borrow(py).find_comment_patterns(py, pattern)
     }
 }
 
@@ -1054,6 +1138,7 @@ struct DecoratorQuery {
     via_attr: Option<String>,
     in_decl: Option<Py<NativeNode>>,
     path_regex: Option<String>,
+    kwarg_matchers: Vec<(String, KwargMatcher)>,
 }
 
 impl DecoratorQuery {
@@ -1067,6 +1152,7 @@ impl DecoratorQuery {
             via_attr: None,
             in_decl: None,
             path_regex: None,
+            kwarg_matchers: Vec::new(),
         }
     }
 }
@@ -1116,17 +1202,40 @@ impl DecoratorQuery {
         slf
     }
 
+    /// Add a kwarg matcher. Multiple calls AND together.
+    ///
+    /// ``value`` must be a Python literal (``None`` / ``bool`` /
+    /// ``int`` / ``float`` / ``str`` / ``list`` / ``tuple``). Passing
+    /// any other type — including a :class:`NativeNode` — raises
+    /// ``ValueError``.
+    fn where_kwarg<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        name: String,
+        value: Py<PyAny>,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let py = slf.py();
+        let matcher = kwarg_matcher_from_py(py, &value)?;
+        slf.kwarg_matchers.push((name, matcher));
+        Ok(slf)
+    }
+
     fn collect(&self, py: Python<'_>) -> PyResult<Vec<Py<DecoratorRef>>> {
         let ctx = self.ctx.borrow(py);
         let path_regex = self.path_regex.as_deref();
         let mut refs: Vec<Py<DecoratorRef>> = Vec::new();
+        let kwarg_matchers = &self.kwarg_matchers;
         if let Some(owner_attrs) = &self.owner_attrs {
-            let pairs = if let Some(via) = &self.via_attr {
+            let triples = if let Some(via) = &self.via_attr {
                 ctx.find_handler_decorators_via(py, via, owner_attrs.clone(), path_regex)?
             } else {
                 ctx.find_handler_decorators(py, owner_attrs.clone(), path_regex)?
             };
-            for (owner_name, decorated) in pairs {
+            for (owner_name, decorated, call_args) in triples {
+                if !call_args_match_kwargs(&call_args, kwarg_matchers) {
+                    continue;
+                }
+                let args = args_to_py_vec(py, &call_args.args);
+                let kwargs = kwargs_to_py_map(py, &call_args.kwargs);
                 refs.push(Py::new(
                     py,
                     DecoratorRef {
@@ -1134,6 +1243,8 @@ impl DecoratorQuery {
                         decorator_name: None,
                         decorator_owner: Some(owner_name),
                         decorator_via: self.via_attr.clone(),
+                        args,
+                        kwargs,
                     },
                 )?);
             }
@@ -1150,7 +1261,12 @@ impl DecoratorQuery {
                 .unwrap_or("")
                 .to_string();
             drop(in_decl_ref);
-            for d in decls {
+            for (d, call_args) in decls {
+                if !call_args_match_kwargs(&call_args, kwarg_matchers) {
+                    continue;
+                }
+                let args = args_to_py_vec(py, &call_args.args);
+                let kwargs = kwargs_to_py_map(py, &call_args.kwargs);
                 refs.push(Py::new(
                     py,
                     DecoratorRef {
@@ -1158,12 +1274,19 @@ impl DecoratorQuery {
                         decorator_name: None,
                         decorator_owner: Some(owner_simple.clone()),
                         decorator_via: None,
+                        args,
+                        kwargs,
                     },
                 )?);
             }
         } else if let Some(fqn) = &self.callee_fqn {
             let decls = ctx.find_decorated(py, fqn, path_regex)?;
-            for d in decls {
+            for (d, call_args) in decls {
+                if !call_args_match_kwargs(&call_args, kwarg_matchers) {
+                    continue;
+                }
+                let args = args_to_py_vec(py, &call_args.args);
+                let kwargs = kwargs_to_py_map(py, &call_args.kwargs);
                 refs.push(Py::new(
                     py,
                     DecoratorRef {
@@ -1171,12 +1294,19 @@ impl DecoratorQuery {
                         decorator_name: None,
                         decorator_owner: None,
                         decorator_via: None,
+                        args,
+                        kwargs,
                     },
                 )?);
             }
         } else if let (Some(module), Some(names)) = (&self.module, &self.names) {
             let decls = ctx.find_decorated_decls(py, module, names.clone(), path_regex)?;
-            for d in decls {
+            for (d, call_args) in decls {
+                if !call_args_match_kwargs(&call_args, kwarg_matchers) {
+                    continue;
+                }
+                let args = args_to_py_vec(py, &call_args.args);
+                let kwargs = kwargs_to_py_map(py, &call_args.kwargs);
                 refs.push(Py::new(
                     py,
                     DecoratorRef {
@@ -1184,6 +1314,8 @@ impl DecoratorQuery {
                         decorator_name: None,
                         decorator_owner: None,
                         decorator_via: None,
+                        args,
+                        kwargs,
                     },
                 )?);
             }
@@ -1327,6 +1459,7 @@ struct CallQuery {
     arg_index: Option<usize>,
     required_positional: Option<usize>,
     path_regex: Option<String>,
+    kwarg_matchers: Vec<(String, KwargMatcher)>,
 }
 
 impl CallQuery {
@@ -1340,6 +1473,7 @@ impl CallQuery {
             arg_index: None,
             required_positional: None,
             path_regex: None,
+            kwarg_matchers: Vec::new(),
         }
     }
 }
@@ -1379,13 +1513,30 @@ impl CallQuery {
         slf
     }
 
+    /// Add a kwarg matcher. Multiple calls AND together.
+    ///
+    /// ``value`` must be a Python literal (``None`` / ``bool`` /
+    /// ``int`` / ``float`` / ``str`` / ``list`` / ``tuple``). Passing
+    /// any other type — including a :class:`NativeNode` — raises
+    /// ``ValueError``.
+    fn where_kwarg<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        name: String,
+        value: Py<PyAny>,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let py = slf.py();
+        let matcher = kwarg_matcher_from_py(py, &value)?;
+        slf.kwarg_matchers.push((name, matcher));
+        Ok(slf)
+    }
+
     fn collect(&self, py: Python<'_>) -> PyResult<Vec<Py<CallRef>>> {
         let ctx = self.ctx.borrow(py);
         let arg_index = self
             .arg_index
             .ok_or_else(|| PyValueError::new_err("CallQuery: .string_arg_at(index) is required"))?;
         let path_regex = self.path_regex.as_deref();
-        let pairs = if let (Some(module), Some(name)) = (&self.module, &self.name) {
+        let triples = if let (Some(module), Some(name)) = (&self.module, &self.name) {
             ctx.find_calls_to_imported(py, module, name, arg_index, path_regex)?
         } else if let (Some(owner), Some(attr)) = (&self.owner, &self.attr) {
             ctx.find_calls_on_var(
@@ -1404,13 +1555,21 @@ impl CallQuery {
                  where_owner(...) + where_attr(...); or where_attr(...)",
             ));
         };
+        let kwarg_matchers = &self.kwarg_matchers;
         let mut refs: Vec<Py<CallRef>> = Vec::new();
-        for (owner_node, s) in pairs {
+        for (owner_node, s, call_args) in triples {
+            if !call_args_match_kwargs(&call_args, kwarg_matchers) {
+                continue;
+            }
+            let args = args_to_py_vec(py, &call_args.args);
+            let kwargs = kwargs_to_py_map(py, &call_args.kwargs);
             refs.push(Py::new(
                 py,
                 CallRef {
                     owner: owner_node,
                     string_arg: s,
+                    args,
+                    kwargs,
                 },
             )?);
         }
@@ -1419,6 +1578,222 @@ impl CallQuery {
 
     fn first(&self, py: Python<'_>) -> PyResult<Option<Py<CallRef>>> {
         Ok(self.collect(py)?.into_iter().next())
+    }
+    fn count(&self, py: Python<'_>) -> PyResult<usize> {
+        Ok(self.collect(py)?.len())
+    }
+    fn __iter__(&self, py: Python<'_>) -> PyResult<PyObject> {
+        _to_iter(py, self.collect(py)?)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Subclass / Import / Class / Factory queries
+// ---------------------------------------------------------------------------
+
+/// Walk transitive subclasses of a base class. Pick exactly one of:
+/// * ``of_fqn(fqn)`` — base by dotted name (external classes ok —
+///   ``unittest.TestCase`` etc.).
+/// * ``of_node(class_node)`` — base by project-local class node.
+/// ``transitive(bool)`` controls whether the BFS walks past the
+/// direct subclass frontier (default ``True``; for ``of_node`` the
+/// BFS is always transitive).
+#[pyclass(unsendable)]
+struct SubclassQuery {
+    ctx: Py<ProjectContext>,
+    base_fqn: Option<String>,
+    base_node: Option<Py<NativeNode>>,
+    transitive: bool,
+}
+
+impl SubclassQuery {
+    fn new(ctx: Py<ProjectContext>) -> Self {
+        Self {
+            ctx,
+            base_fqn: None,
+            base_node: None,
+            transitive: true,
+        }
+    }
+}
+
+#[pymethods]
+impl SubclassQuery {
+    fn of_fqn<'py>(mut slf: PyRefMut<'py, Self>, fqn: String) -> PyRefMut<'py, Self> {
+        slf.base_fqn = Some(fqn);
+        slf
+    }
+    fn of_node<'py>(mut slf: PyRefMut<'py, Self>, node: Py<NativeNode>) -> PyRefMut<'py, Self> {
+        slf.base_node = Some(node);
+        slf
+    }
+    fn transitive<'py>(mut slf: PyRefMut<'py, Self>, value: bool) -> PyRefMut<'py, Self> {
+        slf.transitive = value;
+        slf
+    }
+
+    fn collect(&self, py: Python<'_>) -> PyResult<Vec<Py<NativeNode>>> {
+        let ctx = self.ctx.borrow(py);
+        if let Some(fqn) = &self.base_fqn {
+            ctx.find_subclasses(py, fqn, self.transitive)
+        } else if let Some(node) = &self.base_node {
+            ctx.find_subclasses_of(py, &node.borrow(py))
+        } else {
+            Err(PyValueError::new_err(
+                "SubclassQuery requires .of_fqn(...) or .of_node(...)",
+            ))
+        }
+    }
+    fn count(&self, py: Python<'_>) -> PyResult<usize> {
+        Ok(self.collect(py)?.len())
+    }
+    fn __iter__(&self, py: Python<'_>) -> PyResult<PyObject> {
+        _to_iter(py, self.collect(py)?)
+    }
+}
+
+/// Enumerate the ``kind="import"`` nodes that bind a name from a
+/// given module. Requires ``of(module)``.
+#[pyclass(unsendable)]
+struct ImportQuery {
+    ctx: Py<ProjectContext>,
+    module: Option<String>,
+}
+
+impl ImportQuery {
+    fn new(ctx: Py<ProjectContext>) -> Self {
+        Self { ctx, module: None }
+    }
+}
+
+#[pymethods]
+impl ImportQuery {
+    fn of<'py>(mut slf: PyRefMut<'py, Self>, module: String) -> PyRefMut<'py, Self> {
+        slf.module = Some(module);
+        slf
+    }
+    fn collect(&self, py: Python<'_>) -> PyResult<Vec<Py<NativeNode>>> {
+        let ctx = self.ctx.borrow(py);
+        let module = self
+            .module
+            .as_deref()
+            .ok_or_else(|| PyValueError::new_err("ImportQuery requires .of(module)"))?;
+        ctx.find_imports_of(py, module)
+    }
+    fn count(&self, py: Python<'_>) -> PyResult<usize> {
+        Ok(self.collect(py)?.len())
+    }
+    fn __iter__(&self, py: Python<'_>) -> PyResult<PyObject> {
+        _to_iter(py, self.collect(py)?)
+    }
+}
+
+/// Enumerate classes by structural property. Today the only filter
+/// is ``defining_method(name)`` (matches classes whose body has a
+/// ``FunctionDef`` with that name); easy to extend later.
+#[pyclass(unsendable)]
+struct ClassQuery {
+    ctx: Py<ProjectContext>,
+    defining_method: Option<String>,
+}
+
+impl ClassQuery {
+    fn new(ctx: Py<ProjectContext>) -> Self {
+        Self {
+            ctx,
+            defining_method: None,
+        }
+    }
+}
+
+#[pymethods]
+impl ClassQuery {
+    fn defining_method<'py>(mut slf: PyRefMut<'py, Self>, name: String) -> PyRefMut<'py, Self> {
+        slf.defining_method = Some(name);
+        slf
+    }
+    fn collect(&self, py: Python<'_>) -> PyResult<Vec<Py<NativeNode>>> {
+        let ctx = self.ctx.borrow(py);
+        let name = self
+            .defining_method
+            .as_deref()
+            .ok_or_else(|| PyValueError::new_err("ClassQuery requires .defining_method(name)"))?;
+        ctx.find_classes_defining_method(py, name)
+    }
+    fn count(&self, py: Python<'_>) -> PyResult<usize> {
+        Ok(self.collect(py)?.len())
+    }
+    fn __iter__(&self, py: Python<'_>) -> PyResult<PyObject> {
+        _to_iter(py, self.collect(py)?)
+    }
+}
+
+/// One result row from :class:`FactoryQuery`. ``decl`` is the
+/// owning top-level function or class; ``kinds`` is the sorted set
+/// of constructor bare-names matched inside its body.
+#[pyclass(frozen, get_all)]
+struct FactoryRef {
+    decl: Py<NativeNode>,
+    kinds: Vec<String>,
+}
+
+#[pymethods]
+impl FactoryRef {
+    #[getter]
+    fn path(&self, py: Python<'_>) -> String {
+        self.decl.borrow(py).path.clone()
+    }
+}
+
+/// Walk function / class bodies for ``<Ctor>(...)`` calls where
+/// ``Ctor`` is imported from ``of_module(...)`` and matches one of
+/// ``where_name(...)``. Both filters are required.
+#[pyclass(unsendable)]
+struct FactoryQuery {
+    ctx: Py<ProjectContext>,
+    module: Option<String>,
+    names: Option<Vec<String>>,
+}
+
+impl FactoryQuery {
+    fn new(ctx: Py<ProjectContext>) -> Self {
+        Self {
+            ctx,
+            module: None,
+            names: None,
+        }
+    }
+}
+
+#[pymethods]
+impl FactoryQuery {
+    fn of_module<'py>(mut slf: PyRefMut<'py, Self>, module: String) -> PyRefMut<'py, Self> {
+        slf.module = Some(module);
+        slf
+    }
+    fn where_name<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        names: PyObject,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let py = slf.py();
+        slf.names = Some(_extract_str_or_list(py, names)?);
+        Ok(slf)
+    }
+    fn collect(&self, py: Python<'_>) -> PyResult<Vec<Py<FactoryRef>>> {
+        let ctx = self.ctx.borrow(py);
+        let module = self
+            .module
+            .as_deref()
+            .ok_or_else(|| PyValueError::new_err("FactoryQuery requires .of_module(...)"))?;
+        let names = self
+            .names
+            .clone()
+            .ok_or_else(|| PyValueError::new_err("FactoryQuery requires .where_name(...)"))?;
+        let pairs = ctx.find_factory_decls(py, module, names)?;
+        pairs
+            .into_iter()
+            .map(|(decl, kinds)| Py::new(py, FactoryRef { decl, kinds }))
+            .collect()
     }
     fn count(&self, py: Python<'_>) -> PyResult<usize> {
         Ok(self.collect(py)?.len())
@@ -1588,9 +1963,11 @@ impl ProjectContext {
             edges: outputs.builder.edges,
         })
     }
+}
 
-    // ----- Queries (rust-resident, results pass back to Python) -----------
+// ----- Queries (rust-only, exposed to Python via the chainable QueryBuilder) -
 
+impl ProjectContext {
     /// Return every top-level variable node whose name matches `__xxx__`.
     ///
     /// Pure scan over already-interned nodes — no ty re-query needed —
@@ -1684,7 +2061,10 @@ impl ProjectContext {
             .get(fqname)
             .map(|&idx| outputs.builder.nodes[idx].clone_ref(py)))
     }
+}
 
+#[pymethods]
+impl ProjectContext {
     /// Return the module node owning ``path``, if any. O(1) — backed
     /// by the same ``module_nodes_by_file`` index `find_main_blocks`
     /// uses, so plugins don't have to scan ``nodes()`` per call.
@@ -1762,7 +2142,9 @@ impl ProjectContext {
         }
         Ok(out)
     }
+}
 
+impl ProjectContext {
     /// Return ``module_fqn``'s immediate top-level decls — every
     /// function / class / variable / import bound at its module scope.
     ///
@@ -1838,7 +2220,10 @@ impl ProjectContext {
         }
         Ok(Some(out))
     }
+}
 
+#[pymethods]
+impl ProjectContext {
     /// Every node whose ``path`` starts with the given prefix.
     fn decls_under(&self, py: Python<'_>, path_prefix: &str) -> PyResult<Vec<Py<NativeNode>>> {
         let outputs = self.outputs.borrow();
@@ -1960,7 +2345,9 @@ impl ProjectContext {
             .map(|i| outputs.builder.nodes[i].clone_ref(py))
             .collect())
     }
+}
 
+impl ProjectContext {
     /// Return ``(module_node, [decls inside the block])`` for every
     /// file with a top-level ``if __name__ == "__main__":`` block.
     ///
@@ -2018,14 +2405,14 @@ impl ProjectContext {
     /// plugin helpers used by ``PytestPlugin`` etc., which intentionally
     /// keep a loose pattern match rather than trying to chase decorator
     /// imports through ty's resolver.
-    #[pyo3(signature = (decorator_module, decorator_names, *, path_regex = None))]
+    #[allow(clippy::type_complexity)]
     fn find_decorated_decls(
         &self,
         py: Python<'_>,
         decorator_module: &str,
         decorator_names: Vec<String>,
         path_regex: Option<&str>,
-    ) -> PyResult<Vec<Py<NativeNode>>> {
+    ) -> PyResult<Vec<(Py<NativeNode>, CallArgs)>> {
         let outputs = self.outputs.borrow();
         let outputs = outputs
             .as_ref()
@@ -2045,7 +2432,7 @@ impl ProjectContext {
         let path_re_ref = &path_re;
         let names_ref = &names;
         let needles_ref: &[&str] = &needle_strs;
-        let indices: Vec<usize> = py.allow_threads(move || {
+        let pairs: Vec<(usize, CallArgs)> = py.allow_threads(move || {
             par_scan_files(db_handle, project_files, path_re_ref, |db, file| {
                 let source = source_text(db, file);
                 if !_contains_any_identifier(&source, needles_ref) {
@@ -2061,20 +2448,23 @@ impl ProjectContext {
                     let Stmt::FunctionDef(func) = stmt else {
                         continue;
                     };
-                    if !decorators_match_imports(&func.decorator_list, &imports, names_ref) {
+                    let Some(call_form) =
+                        decorators_match_imports(&func.decorator_list, &imports, names_ref)
+                    else {
                         continue;
-                    }
+                    };
                     let key = (file, range_key(func.name.range()));
                     if let Some(&idx) = decl_by_name_range.get(&key) {
-                        local.push(idx);
+                        let call_args = call_form.map(extract_call_args_kwargs).unwrap_or_default();
+                        local.push((idx, call_args));
                     }
                 }
                 local
             })
         });
-        Ok(indices
+        Ok(pairs
             .into_iter()
-            .map(|idx| outputs.builder.nodes[idx].clone_ref(py))
+            .map(|(idx, call_args)| (outputs.builder.nodes[idx].clone_ref(py), call_args))
             .collect())
     }
 
@@ -2092,7 +2482,6 @@ impl ProjectContext {
     /// upstream constructor's bare name (``"Flask"`` even when imported
     /// as ``F``).
     #[allow(clippy::type_complexity)]
-    #[pyo3(signature = (module, ctor_names, *, path_regex = None))]
     fn find_instance_constructions(
         &self,
         py: Python<'_>,
@@ -2158,13 +2547,12 @@ impl ProjectContext {
     /// correspond to real framework instances. Multiple decorators on
     /// the same function emit multiple entries.
     #[allow(clippy::type_complexity)]
-    #[pyo3(signature = (decorator_attrs, *, path_regex = None))]
     fn find_handler_decorators(
         &self,
         py: Python<'_>,
         decorator_attrs: Vec<String>,
         path_regex: Option<&str>,
-    ) -> PyResult<Vec<(String, Py<NativeNode>)>> {
+    ) -> PyResult<Vec<(String, Py<NativeNode>, CallArgs)>> {
         let outputs = self.outputs.borrow();
         let outputs = outputs
             .as_ref()
@@ -2178,25 +2566,26 @@ impl ProjectContext {
         let path_re_ref = &path_re;
         let attrs_ref = &attrs;
         let needles_ref: &[&str] = &needle_strs;
-        let pairs: Vec<(String, usize)> = py.allow_threads(move || {
+        let triples: Vec<(String, usize, CallArgs)> = py.allow_threads(move || {
             par_scan_files(db_handle, project_files, path_re_ref, |db, file| {
                 let source = source_text(db, file);
                 if !_contains_any_identifier(&source, needles_ref) {
                     return Vec::new();
                 }
                 let parsed = parsed_module(db, file).load(db);
-                let mut local: Vec<(String, usize)> = Vec::new();
+                let mut local: Vec<(String, usize, CallArgs)> = Vec::new();
                 for stmt in &parsed.syntax().body {
                     let Stmt::FunctionDef(func) = stmt else {
                         continue;
                     };
                     let mut seen_owners: HashSet<String> = HashSet::new();
                     for dec in &func.decorator_list {
-                        let mut expr = &dec.expression;
-                        if let Expr::Call(call) = expr {
-                            expr = &call.func;
-                        }
-                        let Expr::Attribute(attr) = expr else {
+                        let (root_expr, call_form): (&Expr, Option<&ruff_python_ast::ExprCall>) =
+                            match &dec.expression {
+                                Expr::Call(call) => (&*call.func, Some(call)),
+                                other => (other, None),
+                            };
+                        let Expr::Attribute(attr) = root_expr else {
                             continue;
                         };
                         if !attrs_ref.contains(attr.attr.as_str()) {
@@ -2211,16 +2600,20 @@ impl ProjectContext {
                         }
                         let key = (file, range_key(func.name.range()));
                         if let Some(&idx) = decl_by_name_range.get(&key) {
-                            local.push((owner_name, idx));
+                            let call_args =
+                                call_form.map(extract_call_args_kwargs).unwrap_or_default();
+                            local.push((owner_name, idx, call_args));
                         }
                     }
                 }
                 local
             })
         });
-        Ok(pairs
+        Ok(triples
             .into_iter()
-            .map(|(name, idx)| (name, outputs.builder.nodes[idx].clone_ref(py)))
+            .map(|(name, idx, call_args)| {
+                (name, outputs.builder.nodes[idx].clone_ref(py), call_args)
+            })
             .collect())
     }
 
@@ -2230,14 +2623,13 @@ impl ProjectContext {
     /// ``[(owner_name, function_node)]`` shape, where ``owner_name`` is
     /// the leftmost ``Name`` in the decorator chain.
     #[allow(clippy::type_complexity)]
-    #[pyo3(signature = (via_attr, decorator_attrs, *, path_regex = None))]
     fn find_handler_decorators_via(
         &self,
         py: Python<'_>,
         via_attr: &str,
         decorator_attrs: Vec<String>,
         path_regex: Option<&str>,
-    ) -> PyResult<Vec<(String, Py<NativeNode>)>> {
+    ) -> PyResult<Vec<(String, Py<NativeNode>, CallArgs)>> {
         let outputs = self.outputs.borrow();
         let outputs = outputs
             .as_ref()
@@ -2249,7 +2641,7 @@ impl ProjectContext {
         let db_handle: Box<dyn ProjectDb> = ProjectDb::dyn_clone(&self.db);
         let path_re_ref = &path_re;
         let attrs_ref = &attrs;
-        let pairs: Vec<(String, usize)> = py.allow_threads(move || {
+        let triples: Vec<(String, usize, CallArgs)> = py.allow_threads(move || {
             par_scan_files(db_handle, project_files, path_re_ref, |db, file| {
                 // ``via_attr`` is the more selective needle ("tree" for
                 // discord.py slash commands) than the attr set.
@@ -2258,18 +2650,19 @@ impl ProjectContext {
                     return Vec::new();
                 }
                 let parsed = parsed_module(db, file).load(db);
-                let mut local: Vec<(String, usize)> = Vec::new();
+                let mut local: Vec<(String, usize, CallArgs)> = Vec::new();
                 for stmt in &parsed.syntax().body {
                     let Stmt::FunctionDef(func) = stmt else {
                         continue;
                     };
                     let mut seen_owners: HashSet<String> = HashSet::new();
                     for dec in &func.decorator_list {
-                        let mut expr = &dec.expression;
-                        if let Expr::Call(call) = expr {
-                            expr = &call.func;
-                        }
-                        let Expr::Attribute(outer) = expr else {
+                        let (root_expr, call_form): (&Expr, Option<&ruff_python_ast::ExprCall>) =
+                            match &dec.expression {
+                                Expr::Call(call) => (&*call.func, Some(call)),
+                                other => (other, None),
+                            };
+                        let Expr::Attribute(outer) = root_expr else {
                             continue;
                         };
                         if !attrs_ref.contains(outer.attr.as_str()) {
@@ -2290,16 +2683,20 @@ impl ProjectContext {
                         }
                         let key = (file, range_key(func.name.range()));
                         if let Some(&idx) = decl_by_name_range.get(&key) {
-                            local.push((owner_name, idx));
+                            let call_args =
+                                call_form.map(extract_call_args_kwargs).unwrap_or_default();
+                            local.push((owner_name, idx, call_args));
                         }
                     }
                 }
                 local
             })
         });
-        Ok(pairs
+        Ok(triples
             .into_iter()
-            .map(|(name, idx)| (name, outputs.builder.nodes[idx].clone_ref(py)))
+            .map(|(name, idx, call_args)| {
+                (name, outputs.builder.nodes[idx].clone_ref(py), call_args)
+            })
             .collect())
     }
 
@@ -2315,14 +2712,13 @@ impl ProjectContext {
     /// pattern is keyed on the method name and the receiver is the
     /// plugin's concern (typically gated by a per-file import check).
     #[allow(clippy::type_complexity)]
-    #[pyo3(signature = (attr, arg_index, *, path_regex = None))]
     fn find_calls_on_attr(
         &self,
         py: Python<'_>,
         attr: &str,
         arg_index: usize,
         path_regex: Option<&str>,
-    ) -> PyResult<Vec<(Py<NativeNode>, String)>> {
+    ) -> PyResult<Vec<(Py<NativeNode>, String, CallArgs)>> {
         let outputs = self.outputs.borrow();
         let outputs = outputs
             .as_ref()
@@ -2333,14 +2729,14 @@ impl ProjectContext {
         let project_files: &[File] = &outputs.project_files;
         let db_handle: Box<dyn ProjectDb> = ProjectDb::dyn_clone(&self.db);
         let path_re_ref = &path_re;
-        let pairs: Vec<(usize, String)> = py.allow_threads(move || {
+        let triples: Vec<(usize, String, CallArgs)> = py.allow_threads(move || {
             par_scan_files(db_handle, project_files, path_re_ref, |db, file| {
                 let source = source_text(db, file);
                 if !_contains_identifier(&source, attr) {
                     return Vec::new();
                 }
                 let parsed = parsed_module(db, file).load(db);
-                let mut local: Vec<(usize, String)> = Vec::new();
+                let mut local: Vec<(usize, String, CallArgs)> = Vec::new();
                 for stmt in &parsed.syntax().body {
                     let Some(owner_idx) = owner_idx_for_stmt_with(
                         decl_by_name_range,
@@ -2356,16 +2752,16 @@ impl ProjectContext {
                         results: Vec::new(),
                     };
                     finder.visit_stmt(stmt);
-                    for arg in finder.results {
-                        local.push((owner_idx, arg));
+                    for (arg, call_args) in finder.results {
+                        local.push((owner_idx, arg, call_args));
                     }
                 }
                 local
             })
         });
-        Ok(pairs
+        Ok(triples
             .into_iter()
-            .map(|(idx, arg)| (outputs.builder.nodes[idx].clone_ref(py), arg))
+            .map(|(idx, arg, call_args)| (outputs.builder.nodes[idx].clone_ref(py), arg, call_args))
             .collect())
     }
 
@@ -2448,7 +2844,6 @@ impl ProjectContext {
     /// the call lives under (including its decorator subtree); calls
     /// at module scope attribute to the module node.
     #[allow(clippy::type_complexity)]
-    #[pyo3(signature = (module, name, arg_index, *, path_regex = None))]
     fn find_calls_to_imported(
         &self,
         py: Python<'_>,
@@ -2456,7 +2851,7 @@ impl ProjectContext {
         name: &str,
         arg_index: usize,
         path_regex: Option<&str>,
-    ) -> PyResult<Vec<(Py<NativeNode>, String)>> {
+    ) -> PyResult<Vec<(Py<NativeNode>, String, CallArgs)>> {
         let outputs = self.outputs.borrow();
         let outputs = outputs
             .as_ref()
@@ -2469,7 +2864,7 @@ impl ProjectContext {
         let db_handle: Box<dyn ProjectDb> = ProjectDb::dyn_clone(&self.db);
         let path_re_ref = &path_re;
         let allowed_ref = &allowed;
-        let pairs: Vec<(usize, String)> = py.allow_threads(move || {
+        let triples: Vec<(usize, String, CallArgs)> = py.allow_threads(move || {
             par_scan_files(db_handle, project_files, path_re_ref, |db, file| {
                 let source = source_text(db, file);
                 if !_contains_identifier(&source, name) {
@@ -2480,7 +2875,7 @@ impl ProjectContext {
                 if imports.is_empty() {
                     return Vec::new();
                 }
-                let mut local: Vec<(usize, String)> = Vec::new();
+                let mut local: Vec<(usize, String, CallArgs)> = Vec::new();
                 for stmt in &parsed.syntax().body {
                     let Some(owner_idx) = owner_idx_for_stmt_with(
                         decl_by_name_range,
@@ -2498,16 +2893,16 @@ impl ProjectContext {
                         results: Vec::new(),
                     };
                     finder.visit_stmt(stmt);
-                    for arg in finder.results {
-                        local.push((owner_idx, arg));
+                    for (arg, call_args) in finder.results {
+                        local.push((owner_idx, arg, call_args));
                     }
                 }
                 local
             })
         });
-        Ok(pairs
+        Ok(triples
             .into_iter()
-            .map(|(idx, arg)| (outputs.builder.nodes[idx].clone_ref(py), arg))
+            .map(|(idx, arg, call_args)| (outputs.builder.nodes[idx].clone_ref(py), arg, call_args))
             .collect())
     }
 
@@ -2523,7 +2918,6 @@ impl ProjectContext {
     ///
     /// Returns ``(owning_decl, string_literal_arg)`` pairs.
     #[allow(clippy::type_complexity)]
-    #[pyo3(signature = (owner, attr, arg_index, *, required_positional = None, path_regex = None))]
     fn find_calls_on_var(
         &self,
         py: Python<'_>,
@@ -2532,7 +2926,7 @@ impl ProjectContext {
         arg_index: usize,
         required_positional: Option<usize>,
         path_regex: Option<&str>,
-    ) -> PyResult<Vec<(Py<NativeNode>, String)>> {
+    ) -> PyResult<Vec<(Py<NativeNode>, String, CallArgs)>> {
         let outputs = self.outputs.borrow();
         let outputs = outputs
             .as_ref()
@@ -2543,7 +2937,7 @@ impl ProjectContext {
         let project_files: &[File] = &outputs.project_files;
         let db_handle: Box<dyn ProjectDb> = ProjectDb::dyn_clone(&self.db);
         let path_re_ref = &path_re;
-        let pairs: Vec<(usize, String)> = py.allow_threads(move || {
+        let triples: Vec<(usize, String, CallArgs)> = py.allow_threads(move || {
             par_scan_files(db_handle, project_files, path_re_ref, |db, file| {
                 // ``owner`` is typically the more selective needle
                 // (e.g. ``mocker`` / ``monkeypatch`` show up in far
@@ -2553,7 +2947,7 @@ impl ProjectContext {
                     return Vec::new();
                 }
                 let parsed = parsed_module(db, file).load(db);
-                let mut local: Vec<(usize, String)> = Vec::new();
+                let mut local: Vec<(usize, String, CallArgs)> = Vec::new();
                 for stmt in &parsed.syntax().body {
                     let Some(owner_idx) = owner_idx_for_stmt_with(
                         decl_by_name_range,
@@ -2571,16 +2965,16 @@ impl ProjectContext {
                         results: Vec::new(),
                     };
                     finder.visit_stmt(stmt);
-                    for arg in finder.results {
-                        local.push((owner_idx, arg));
+                    for (arg, call_args) in finder.results {
+                        local.push((owner_idx, arg, call_args));
                     }
                 }
                 local
             })
         });
-        Ok(pairs
+        Ok(triples
             .into_iter()
-            .map(|(idx, arg)| (outputs.builder.nodes[idx].clone_ref(py), arg))
+            .map(|(idx, arg, call_args)| (outputs.builder.nodes[idx].clone_ref(py), arg, call_args))
             .collect())
     }
 
@@ -2678,23 +3072,15 @@ impl ProjectContext {
             .collect())
     }
 
-    // ----- Stage 2: ty-backed semantic queries ---------------------------
+    // ----- Convenience helpers used by the chainable QueryBuilder ----------
 
-    /// Decls decorated by ``@<decorator_fqn>`` or ``@<decorator_fqn>(...)``.
-    ///
-    /// Resolves through the file's local imports — aliased / dotted /
-    /// module-prefixed forms all match. ``decorator_fqn`` is the
-    /// upstream callable's absolute fqn (``celery.shared_task``,
-    /// ``pytest.fixture``). For instance-method decorators
-    /// (``@app.route(...)`` where ``app`` is a ``flask.Flask``) use
-    /// :meth:`find_decorations_on` instead.
-    #[pyo3(signature = (decorator_fqn, *, path_regex = None))]
+    #[allow(clippy::type_complexity)]
     fn find_decorated(
         &self,
         py: Python<'_>,
         decorator_fqn: &str,
         path_regex: Option<&str>,
-    ) -> PyResult<Vec<Py<NativeNode>>> {
+    ) -> PyResult<Vec<(Py<NativeNode>, CallArgs)>> {
         let Some((module, name)) = decorator_fqn.rsplit_once('.') else {
             return Err(PyValueError::new_err(format!(
                 "expected a dotted decorator fqn (e.g. 'pytest.fixture'), got {decorator_fqn:?}"
@@ -2703,14 +3089,6 @@ impl ProjectContext {
         self.find_decorated_decls(py, module, vec![name.to_string()], path_regex)
     }
 
-    /// Module-level variables assigned an instance of ``class_fqn``.
-    ///
-    /// e.g. ``find_constructions("flask.Flask")`` → every ``app =
-    /// Flask(...)`` variable node. ``include_subclasses=True`` also
-    /// matches direct constructions of any class that subclasses
-    /// ``class_fqn`` (works for both project subclasses and external
-    /// ones via ty's type hierarchy).
-    #[pyo3(signature = (class_fqn, *, include_subclasses = false, path_regex = None))]
     fn find_constructions(
         &self,
         py: Python<'_>,
@@ -2742,32 +3120,25 @@ impl ProjectContext {
         Ok(pairs.into_iter().map(|(node, _)| node).collect())
     }
 
-    /// Decls decorated by ``@<instance>.<method>(...)`` for ``method``
-    /// in ``method_names``, where ``<instance>`` resolves to the given
-    /// decl in the same file.
-    ///
-    /// Cross-file owners (where ``app = imported_factory()`` and
-    /// ``@app.route`` is in a different file) aren't matched — same
-    /// limitation the rust dispatch-app path has today.
-    #[pyo3(signature = (instance, method_names, *, path_regex = None))]
+    #[allow(clippy::type_complexity)]
     fn find_decorations_on(
         &self,
         py: Python<'_>,
         instance: &NativeNode,
         method_names: Vec<String>,
         path_regex: Option<&str>,
-    ) -> PyResult<Vec<Py<NativeNode>>> {
+    ) -> PyResult<Vec<(Py<NativeNode>, CallArgs)>> {
         let instance_simple = instance.fqname.rsplit('.').next().unwrap_or("").to_string();
         let handlers = self.find_handler_decorators(py, method_names, path_regex)?;
         let mut out = Vec::new();
-        for (owner_name, handler) in handlers {
+        for (owner_name, handler, call_args) in handlers {
             if owner_name != instance_simple {
                 continue;
             }
             if handler.borrow(py).path != instance.path {
                 continue;
             }
-            out.push(handler);
+            out.push((handler, call_args));
         }
         Ok(out)
     }
@@ -2780,7 +3151,6 @@ impl ProjectContext {
     /// ``type_hierarchy_subtypes``. ``transitive=True`` (default)
     /// walks the full subclass closure; ``transitive=False`` returns
     /// only direct subclasses.
-    #[pyo3(signature = (base_fqn, *, transitive = true))]
     fn find_subclasses(
         &self,
         py: Python<'_>,
@@ -2850,7 +3220,10 @@ impl ProjectContext {
         }
         Ok(out)
     }
+}
 
+#[pymethods]
+impl ProjectContext {
     // ----- Read-only accessors -------------------------------------------
 
     /// Live nodes in the in-progress graph. Cheap, no copy.
@@ -3122,21 +3495,21 @@ fn class_body_defines_method(class_def: &StmtClassDef, method_name: &str) -> boo
 /// * ``@<alias>.<attr>(...)`` / ``@<alias>.<attr>`` where
 ///   ``imports[alias] == "<module>"`` and ``attr`` is in ``names``
 ///   (covers ``import module`` and ``import module as alias``).
-fn decorators_match_imports(
-    decorators: &[ruff_python_ast::Decorator],
+fn decorators_match_imports<'ast>(
+    decorators: &'ast [ruff_python_ast::Decorator],
     imports: &HashMap<String, String>,
     names: &HashSet<&str>,
-) -> bool {
+) -> Option<Option<&'ast ruff_python_ast::ExprCall>> {
     for dec in decorators {
-        let mut expr = &dec.expression;
-        if let Expr::Call(call) = expr {
-            expr = &call.func;
-        }
-        match expr {
+        let (root_expr, call_form) = match &dec.expression {
+            Expr::Call(call) => (&*call.func, Some(call)),
+            other => (other, None),
+        };
+        match root_expr {
             Expr::Name(n) => {
                 if let Some(target) = imports.get(n.id.as_str()) {
                     if names.contains(target.as_str()) {
-                        return true;
+                        return Some(call_form);
                     }
                 }
             }
@@ -3145,14 +3518,14 @@ fn decorators_match_imports(
                     if imports.get(prefix.id.as_str()).map(String::as_str) == Some("<module>")
                         && names.contains(attr.attr.as_str())
                     {
-                        return true;
+                        return Some(call_form);
                     }
                 }
             }
             _ => {}
         }
     }
-    false
+    None
 }
 
 fn iter_top_level_classes(parsed: &ParsedModuleRef) -> impl Iterator<Item = &StmtClassDef> {
@@ -3658,6 +4031,220 @@ fn nth_positional_string(call: &ruff_python_ast::ExprCall, arg_index: usize) -> 
     }
 }
 
+// ---------------------------------------------------------------------------
+// Arg / kwarg extraction for the chainable Ref payloads
+// ---------------------------------------------------------------------------
+
+/// Send-able value extracted from an AST expression.
+///
+/// ``Unknown`` is reported when the expression is neither a recognized
+/// literal shape nor (presently) anything else — it surfaces to Python
+/// as ``None``. Callers who care about the difference between "literal
+/// None" and "unresolvable" should also inspect the original source.
+#[derive(Clone, Debug)]
+enum ArgValue {
+    None,
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    Str(String),
+    List(Vec<ArgValue>),
+    Tuple(Vec<ArgValue>),
+    Unknown,
+}
+
+#[derive(Clone, Debug, Default)]
+struct CallArgs {
+    args: Vec<ArgValue>,
+    kwargs: HashMap<String, ArgValue>,
+}
+
+/// Convert one AST argument expression to an ``ArgValue``. Only
+/// recognized literal shapes (None / bool / int / float / str / list
+/// of literals / tuple of literals) round-trip; everything else
+/// (Name / Attribute / Call / etc.) maps to ``Unknown``.
+fn extract_arg_value(expr: &Expr) -> ArgValue {
+    match expr {
+        Expr::NoneLiteral(_) => ArgValue::None,
+        Expr::BooleanLiteral(b) => ArgValue::Bool(b.value),
+        Expr::StringLiteral(s) => ArgValue::Str(s.value.to_str().to_string()),
+        Expr::NumberLiteral(n) => match &n.value {
+            ruff_python_ast::Number::Int(i) => match i.as_i64() {
+                Some(v) => ArgValue::Int(v),
+                None => ArgValue::Unknown,
+            },
+            ruff_python_ast::Number::Float(f) => ArgValue::Float(*f),
+            ruff_python_ast::Number::Complex { .. } => ArgValue::Unknown,
+        },
+        Expr::List(list) => ArgValue::List(list.elts.iter().map(extract_arg_value).collect()),
+        Expr::Tuple(tup) => ArgValue::Tuple(tup.elts.iter().map(extract_arg_value).collect()),
+        _ => ArgValue::Unknown,
+    }
+}
+
+/// Extract positional + keyword arguments from a call.
+fn extract_call_args_kwargs(call: &ruff_python_ast::ExprCall) -> CallArgs {
+    let args: Vec<ArgValue> = call.arguments.args.iter().map(extract_arg_value).collect();
+    let mut kwargs: HashMap<String, ArgValue> = HashMap::new();
+    for kw in &call.arguments.keywords {
+        let Some(name) = kw.arg.as_ref() else {
+            continue;
+        };
+        kwargs.insert(name.as_str().to_string(), extract_arg_value(&kw.value));
+    }
+    CallArgs { args, kwargs }
+}
+
+/// Materialize one ``ArgValue`` into a Python object.
+fn arg_value_to_py(py: Python<'_>, v: &ArgValue) -> PyObject {
+    match v {
+        ArgValue::None => py.None(),
+        ArgValue::Bool(b) => b.into_py(py),
+        ArgValue::Int(i) => i.into_py(py),
+        ArgValue::Float(f) => f.into_py(py),
+        ArgValue::Str(s) => s.into_py(py),
+        ArgValue::List(items) => {
+            let py_items: Vec<PyObject> = items.iter().map(|v| arg_value_to_py(py, v)).collect();
+            pyo3::types::PyList::new_bound(py, py_items).into_py(py)
+        }
+        ArgValue::Tuple(items) => {
+            let py_items: Vec<PyObject> = items.iter().map(|v| arg_value_to_py(py, v)).collect();
+            pyo3::types::PyTuple::new_bound(py, py_items).into_py(py)
+        }
+        ArgValue::Unknown => py.None(),
+    }
+}
+
+/// Convert a list of ``ArgValue`` to a `Vec<Py<PyAny>>` ready for a
+/// frozen pyclass field.
+fn args_to_py_vec(py: Python<'_>, args: &[ArgValue]) -> Vec<Py<PyAny>> {
+    args.iter().map(|v| arg_value_to_py(py, v)).collect()
+}
+
+/// Convert a kwargs map to ``HashMap<String, Py<PyAny>>``.
+fn kwargs_to_py_map(
+    py: Python<'_>,
+    kwargs: &HashMap<String, ArgValue>,
+) -> HashMap<String, Py<PyAny>> {
+    kwargs
+        .iter()
+        .map(|(k, v)| (k.clone(), arg_value_to_py(py, v)))
+        .collect()
+}
+
+/// A user-supplied kwarg matcher. Only literal-value equality is
+/// supported; ``NativeNode``-valued matchers are rejected at
+/// ``where_kwarg`` call time.
+#[derive(Clone, Debug)]
+enum KwargMatcher {
+    Literal(ArgValue),
+}
+
+/// True iff two ``ArgValue``s are equal as literals. ``Unknown`` never
+/// compares equal to anything.
+fn arg_value_eq_literal(a: &ArgValue, b: &ArgValue) -> bool {
+    match (a, b) {
+        (ArgValue::None, ArgValue::None) => true,
+        (ArgValue::Bool(x), ArgValue::Bool(y)) => x == y,
+        (ArgValue::Int(x), ArgValue::Int(y)) => x == y,
+        (ArgValue::Float(x), ArgValue::Float(y)) => x == y,
+        // Allow mixed int/float comparison for ergonomic matching.
+        (ArgValue::Int(x), ArgValue::Float(y)) => (*x as f64) == *y,
+        (ArgValue::Float(x), ArgValue::Int(y)) => *x == (*y as f64),
+        (ArgValue::Str(x), ArgValue::Str(y)) => x == y,
+        (ArgValue::List(xs), ArgValue::List(ys))
+        | (ArgValue::Tuple(xs), ArgValue::Tuple(ys))
+        | (ArgValue::List(xs), ArgValue::Tuple(ys))
+        | (ArgValue::Tuple(xs), ArgValue::List(ys)) => {
+            xs.len() == ys.len()
+                && xs
+                    .iter()
+                    .zip(ys.iter())
+                    .all(|(a, b)| arg_value_eq_literal(a, b))
+        }
+        _ => false,
+    }
+}
+
+/// Extract a ``KwargMatcher`` from a Python value supplied at
+/// ``.where_kwarg(name, value)`` call time. Accepts only Python
+/// literals (``None``, ``bool``, ``int``, ``float``, ``str``,
+/// ``list[...]``, ``tuple[...]``); passing a ``NativeNode`` (or any
+/// other unsupported type) raises ``PyValueError``.
+fn kwarg_matcher_from_py(py: Python<'_>, value: &Py<PyAny>) -> PyResult<KwargMatcher> {
+    let bound = value.bind(py);
+    // Reject NativeNode explicitly with a targeted error so callers
+    // see the dropped feature rather than the generic "unknown type"
+    // message from `py_to_arg_value`.
+    if bound.extract::<PyRef<'_, NativeNode>>().is_ok() {
+        return Err(PyValueError::new_err(
+            "where_kwarg value must be a Python literal (str/int/float/bool/None/list/tuple), got NativeNode",
+        ));
+    }
+    Ok(KwargMatcher::Literal(py_to_arg_value(bound)?))
+}
+
+/// Convert a Python value to an ``ArgValue`` literal. Errors when the
+/// value isn't a recognized literal shape (so the matcher never
+/// silently matches "anything").
+fn py_to_arg_value(value: &Bound<'_, PyAny>) -> PyResult<ArgValue> {
+    if value.is_none() {
+        return Ok(ArgValue::None);
+    }
+    // Order matters: bool is a subclass of int in Python, so we must
+    // check bool BEFORE int. ``extract::<bool>()`` succeeds for both
+    // True/False and the literal ints 0/1 — the strict ``is_instance_of``
+    // guard distinguishes a real bool from a coerced int.
+    if value.is_instance_of::<pyo3::types::PyBool>() {
+        return Ok(ArgValue::Bool(value.extract::<bool>()?));
+    }
+    if let Ok(i) = value.extract::<i64>() {
+        return Ok(ArgValue::Int(i));
+    }
+    if let Ok(f) = value.extract::<f64>() {
+        return Ok(ArgValue::Float(f));
+    }
+    if let Ok(s) = value.extract::<String>() {
+        return Ok(ArgValue::Str(s));
+    }
+    if let Ok(list) = value.downcast::<pyo3::types::PyList>() {
+        let mut out = Vec::with_capacity(list.len());
+        for item in list.iter() {
+            out.push(py_to_arg_value(&item)?);
+        }
+        return Ok(ArgValue::List(out));
+    }
+    if let Ok(tup) = value.downcast::<pyo3::types::PyTuple>() {
+        let mut out = Vec::with_capacity(tup.len());
+        for item in tup.iter() {
+            out.push(py_to_arg_value(&item)?);
+        }
+        return Ok(ArgValue::Tuple(out));
+    }
+    Err(PyValueError::new_err(format!(
+        "where_kwarg value must be a literal (None / bool / int / float / str / list / tuple); got {}",
+        value.get_type().name()?,
+    )))
+}
+
+/// True iff every ``(name, matcher)`` pair holds against the call's
+/// ``kwargs``. A missing kwarg never matches.
+fn call_args_match_kwargs(call_args: &CallArgs, matchers: &[(String, KwargMatcher)]) -> bool {
+    for (name, matcher) in matchers {
+        let Some(av) = call_args.kwargs.get(name) else {
+            return false;
+        };
+        match matcher {
+            KwargMatcher::Literal(expected) => {
+                if !arg_value_eq_literal(av, expected) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
 /// Match ``<owner>.<attr>(...)`` where ``<owner>`` is a bare ``Name``
 /// equal to the given owner string and ``<attr>`` matches. No import
 /// resolution — meant for pytest fixture conventions (``mocker``,
@@ -3688,16 +4275,16 @@ fn call_callee_matches_var(
     true
 }
 
-/// Visit every Call expression in a subtree, push the string-literal
-/// arg at ``arg_index`` whenever ``predicate(call)`` returns ``true``.
-/// Backs both call-finder queries.
+/// Visit every Call expression in a subtree, push
+/// ``(string_arg_at_index, CallArgs)`` whenever ``predicate(call)``
+/// returns ``true``. Backs both call-finder queries.
 struct StringArgCallFinder<F>
 where
     F: FnMut(&ruff_python_ast::ExprCall) -> bool,
 {
     predicate: F,
     arg_index: usize,
-    results: Vec<String>,
+    results: Vec<(String, CallArgs)>,
 }
 
 impl<'ast, F> Visitor<'ast> for StringArgCallFinder<F>
@@ -3708,7 +4295,8 @@ where
         if let Expr::Call(call) = expr {
             if (self.predicate)(call) {
                 if let Some(value) = nth_positional_string(call, self.arg_index) {
-                    self.results.push(value);
+                    let call_args = extract_call_args_kwargs(call);
+                    self.results.push((value, call_args));
                 }
             }
         }
@@ -3721,10 +4309,13 @@ where
 /// regardless of receiver shape. The captured arg can be a single
 /// string literal **or** a list/tuple of string literals (the latter
 /// produces multiple results for one call). Backs ``find_calls_on_attr``.
+///
+/// Each emitted row is ``(captured_string, CallArgs)``. Multiple rows
+/// from one call (list/tuple shape) share the same ``CallArgs``.
 struct AttrCallFinder<'a> {
     attr: &'a str,
     arg_index: usize,
-    results: Vec<String>,
+    results: Vec<(String, CallArgs)>,
 }
 
 impl<'ast, 'a> Visitor<'ast> for AttrCallFinder<'a> {
@@ -3733,25 +4324,32 @@ impl<'ast, 'a> Visitor<'ast> for AttrCallFinder<'a> {
             if let Expr::Attribute(attribute) = call.func.as_ref() {
                 if attribute.attr.as_str() == self.attr {
                     if let Some(arg) = call.arguments.args.get(self.arg_index) {
+                        let mut hits: Vec<String> = Vec::new();
                         match arg {
                             Expr::StringLiteral(s) => {
-                                self.results.push(s.value.to_str().to_string());
+                                hits.push(s.value.to_str().to_string());
                             }
                             Expr::List(list) => {
                                 for elt in &list.elts {
                                     if let Expr::StringLiteral(s) = elt {
-                                        self.results.push(s.value.to_str().to_string());
+                                        hits.push(s.value.to_str().to_string());
                                     }
                                 }
                             }
                             Expr::Tuple(tup) => {
                                 for elt in &tup.elts {
                                     if let Expr::StringLiteral(s) = elt {
-                                        self.results.push(s.value.to_str().to_string());
+                                        hits.push(s.value.to_str().to_string());
                                     }
                                 }
                             }
                             _ => {}
+                        }
+                        if !hits.is_empty() {
+                            let call_args = extract_call_args_kwargs(call);
+                            for s in hits {
+                                self.results.push((s, call_args.clone()));
+                            }
                         }
                     }
                 }
@@ -6874,7 +7472,7 @@ fn module_fqname_for_file(db: &dyn ProjectDb, file: File) -> String {
 // ---------------------------------------------------------------------------
 
 /// Module-level alias for ``ctx.query()`` — exists for the ergonomic
-/// ``from dead_cst_ty_native import query; query(ctx).decorators()...``
+/// ``from dead_cst import _native as native; native.query(ctx)...``
 /// idiom that the plugins rely on.
 #[pyfunction]
 fn query(slf: Py<ProjectContext>, _py: Python<'_>) -> QueryBuilder {
@@ -6901,6 +7499,11 @@ fn dead_cst_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<DecoratorQuery>()?;
     m.add_class::<ConstructionQuery>()?;
     m.add_class::<CallQuery>()?;
+    m.add_class::<SubclassQuery>()?;
+    m.add_class::<ImportQuery>()?;
+    m.add_class::<ClassQuery>()?;
+    m.add_class::<FactoryQuery>()?;
+    m.add_class::<FactoryRef>()?;
     m.add_function(wrap_pyfunction!(query, m)?)?;
     Ok(())
 }

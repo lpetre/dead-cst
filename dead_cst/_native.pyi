@@ -639,12 +639,20 @@ class DecoratorRef:
       ``@<owner>.<attr>`` prefix).
     * ``where_owner_attr_via`` additionally fills ``decorator_via``
       with the middle attribute name.
+
+    ``args`` and ``kwargs`` are populated from the decorator's
+    ``Call`` form (``@dec(a, b, k=v)``). Bare-attribute decorators
+    (``@app.route`` without ``()``) get empty containers. Each value
+    is either a Python literal (str / int / float / bool / None /
+    list / tuple) or ``None`` for any non-literal expression.
     """
 
     decorated: NativeNode
     decorator_name: str | None
     decorator_owner: str | None
     decorator_via: str | None
+    args: list[Any]
+    kwargs: dict[str, Any]
 
     @property
     def path(self) -> str: ...
@@ -667,10 +675,17 @@ class CallRef:
 
     ``string_arg`` is the positional string literal at the index
     passed to :meth:`CallQuery.string_arg_at`.
+
+    ``args`` and ``kwargs`` carry the call's full positional /
+    keyword argument shape. Each value is either a Python literal
+    (str / int / float / bool / None / list / tuple) or ``None``
+    for any non-literal expression.
     """
 
     owner: NativeNode
     string_arg: str
+    args: list[Any]
+    kwargs: dict[str, Any]
 
     @property
     def path(self) -> str: ...
@@ -685,13 +700,83 @@ def query(ctx: ProjectContext) -> QueryBuilder:
     ...
 
 class QueryBuilder:
-    """Entry point for the chainable query API. Pick one of
-    :meth:`decorators` / :meth:`constructions` / :meth:`calls` to
-    choose the result-type stream."""
+    """Entry point for the chainable query API.
+
+    Filtered streams (terminated by ``.collect()``):
+    :meth:`decorators` / :meth:`constructions` / :meth:`calls` /
+    :meth:`subclasses` / :meth:`imports` / :meth:`classes` /
+    :meth:`factories`.
+
+    Point lookups (no ``.collect()`` — direct methods returning
+    ``NativeNode`` / ``list[NativeNode]`` / etc.):
+    :meth:`module` / :meth:`declarations` /
+    :meth:`module_top_level_decls` / :meth:`module_dunder_all_exports` /
+    :meth:`module_dunders` / :meth:`main_blocks` /
+    :meth:`comment_patterns`.
+    """
 
     def decorators(self) -> DecoratorQuery: ...
     def constructions(self) -> ConstructionQuery: ...
     def calls(self) -> CallQuery: ...
+    def subclasses(self) -> SubclassQuery: ...
+    def imports(self) -> ImportQuery: ...
+    def classes(self) -> ClassQuery: ...
+    def factories(self) -> FactoryQuery: ...
+
+    # ----- Point lookups (no filter chain) ------------------------------
+
+    def module(self, fqname: str) -> NativeNode | None:
+        """Look up a module's synthetic node by dotted fqname.
+
+        Mirrors :meth:`ProjectContext.find_module`.
+        """
+        ...
+
+    def declarations(self, fqname: str) -> list[NativeNode]:
+        """All top-level declarations bound to the given dotted fqname.
+
+        Mirrors :meth:`ProjectContext.find_declarations`.
+        """
+        ...
+
+    def module_top_level_decls(self, fqname: str) -> list[NativeNode]:
+        """Every top-level declaration node of the named module.
+
+        Mirrors :meth:`ProjectContext.find_module_top_level_decls`.
+        """
+        ...
+
+    def module_dunder_all_exports(self, fqname: str) -> list[NativeNode] | None:
+        """Exported names listed in a module's ``__all__``, or
+        ``None`` when the module declares no ``__all__``.
+
+        Mirrors :meth:`ProjectContext.find_module_dunder_all_exports`.
+        """
+        ...
+
+    def module_dunders(self) -> list[NativeNode]:
+        """All top-level ``__dunder__`` declarations across the
+        project.
+
+        Mirrors :meth:`ProjectContext.find_module_dunders`.
+        """
+        ...
+
+    def main_blocks(self) -> list[tuple[NativeNode, list[NativeNode]]]:
+        """Every ``if __name__ == "__main__":`` block, paired with
+        the module and the decls inside.
+
+        Mirrors :meth:`ProjectContext.find_main_blocks`.
+        """
+        ...
+
+    def comment_patterns(self, pattern: str) -> list[tuple[NativeNode, str]]:
+        """Comments matching ``pattern`` paired with the next
+        declaration.
+
+        Mirrors :meth:`ProjectContext.find_comment_patterns`.
+        """
+        ...
 
 class DecoratorQuery:
     """Find decorated top-level functions / classes. Pick exactly one
@@ -707,6 +792,17 @@ class DecoratorQuery:
     ) -> DecoratorQuery: ...
     def in_decl(self, node: NativeNode) -> DecoratorQuery: ...
     def where_path(self, regex: str) -> DecoratorQuery: ...
+    def where_kwarg(self, name: str, value: Any) -> DecoratorQuery:
+        """Filter to decorator calls whose ``name=value`` kwarg matches.
+
+        Multiple ``.where_kwarg`` calls AND together. ``value`` must
+        be a Python literal (``None`` / ``bool`` / ``int`` /
+        ``float`` / ``str`` / ``list`` / ``tuple``). A missing kwarg
+        on the call never matches. A non-literal kwarg expression
+        never matches.
+        """
+        ...
+
     def collect(self) -> list[DecoratorRef]: ...
     def first(self) -> DecoratorRef | None: ...
     def count(self) -> int: ...
@@ -738,7 +834,89 @@ class CallQuery:
     def string_arg_at(self, index: int) -> CallQuery: ...
     def where_required_positional(self, n: int | None = ...) -> CallQuery: ...
     def where_path(self, regex: str) -> CallQuery: ...
+    def where_kwarg(self, name: str, value: Any) -> CallQuery:
+        """Filter to call sites whose ``name=value`` kwarg matches.
+
+        Multiple ``.where_kwarg`` calls AND together. ``value`` must
+        be a Python literal (``None`` / ``bool`` / ``int`` /
+        ``float`` / ``str`` / ``list`` / ``tuple``). A missing kwarg
+        on the call never matches. A non-literal kwarg expression
+        never matches.
+        """
+        ...
+
     def collect(self) -> list[CallRef]: ...
     def first(self) -> CallRef | None: ...
     def count(self) -> int: ...
     def __iter__(self) -> Iterator[CallRef]: ...
+
+class SubclassQuery:
+    """Walk the subclass closure of a class.
+
+    Pick exactly one of :meth:`of_fqn` / :meth:`of_node`. The
+    default :meth:`transitive` is ``True``; flip to ``False`` for
+    direct subclasses only. Mirrors the union of
+    ``ProjectContext.find_subclasses`` and ``find_subclasses_of``.
+    """
+
+    def of_fqn(self, fqn: str) -> SubclassQuery: ...
+    def of_node(self, node: NativeNode) -> SubclassQuery: ...
+    def transitive(self, value: bool) -> SubclassQuery: ...
+    def collect(self) -> list[NativeNode]: ...
+    def count(self) -> int: ...
+    def __iter__(self) -> Iterator[NativeNode]: ...
+
+class ImportQuery:
+    """Enumerate the ``kind="import"`` nodes that bind a name from a
+    given module. Requires :meth:`of` (the upstream module name).
+
+    Mirrors :meth:`ProjectContext.find_imports_of`.
+    """
+
+    def of(self, module: str) -> ImportQuery: ...
+    def collect(self) -> list[NativeNode]: ...
+    def count(self) -> int: ...
+    def __iter__(self) -> Iterator[NativeNode]: ...
+
+class ClassQuery:
+    """Enumerate classes by structural property. Today the only filter
+    is :meth:`defining_method` (matches classes whose body has a
+    ``FunctionDef`` with that name).
+
+    Mirrors :meth:`ProjectContext.find_classes_defining_method`.
+    """
+
+    def defining_method(self, name: str) -> ClassQuery: ...
+    def collect(self) -> list[NativeNode]: ...
+    def count(self) -> int: ...
+    def __iter__(self) -> Iterator[NativeNode]: ...
+
+class FactoryRef:
+    """One result row from :class:`FactoryQuery`.
+
+    ``decl`` is the owning top-level function or class; ``kinds`` is
+    the sorted set of constructor bare-names matched inside its body
+    (multiple kinds appear when a single factory constructs more than
+    one — e.g. a function that returns a ``Flask`` after mounting
+    several ``Blueprint``\\ s).
+    """
+
+    decl: NativeNode
+    kinds: list[str]
+
+    @property
+    def path(self) -> str: ...
+
+class FactoryQuery:
+    """Walk function / class bodies for ``<Ctor>(...)`` calls where
+    ``Ctor`` is imported from :meth:`of_module` and matches one of
+    :meth:`where_name`. Both filters are required.
+
+    Mirrors :meth:`ProjectContext.find_factory_decls`.
+    """
+
+    def of_module(self, module: str) -> FactoryQuery: ...
+    def where_name(self, names: str | list[str] | tuple[str, ...]) -> FactoryQuery: ...
+    def collect(self) -> list[FactoryRef]: ...
+    def count(self) -> int: ...
+    def __iter__(self) -> Iterator[FactoryRef]: ...
