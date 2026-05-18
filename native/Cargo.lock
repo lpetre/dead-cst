@@ -331,12 +331,14 @@ name = "dead-cst-native"
 version = "0.0.0"
 dependencies = [
  "pyo3",
+ "rayon",
  "regex",
  "ruff_db",
  "ruff_python_ast",
  "ruff_python_parser",
  "ruff_source_file",
  "ruff_text_size",
+ "ty_ide",
  "ty_module_resolver",
  "ty_project",
  "ty_python_core",
@@ -1558,6 +1560,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "ruff_python_codegen"
+version = "0.0.0"
+dependencies = [
+ "ruff_python_ast",
+ "ruff_python_literal",
+ "ruff_python_parser",
+ "ruff_source_file",
+ "ruff_text_size",
+]
+
+[[package]]
+name = "ruff_python_importer"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "ruff_diagnostics",
+ "ruff_python_ast",
+ "ruff_python_codegen",
+ "ruff_python_trivia",
+ "ruff_source_file",
+ "ruff_text_size",
+]
+
+[[package]]
 name = "ruff_python_literal"
 version = "0.0.0"
 dependencies = [
@@ -2077,6 +2103,39 @@ dependencies = [
  "ordermap",
  "ruff_db",
  "ruff_python_ast",
+]
+
+[[package]]
+name = "ty_ide"
+version = "0.0.0"
+dependencies = [
+ "bitflags",
+ "compact_str",
+ "get-size2",
+ "itertools",
+ "memchr",
+ "rayon",
+ "regex",
+ "ruff_db",
+ "ruff_diagnostics",
+ "ruff_index",
+ "ruff_memory_usage",
+ "ruff_python_ast",
+ "ruff_python_codegen",
+ "ruff_python_importer",
+ "ruff_python_literal",
+ "ruff_python_trivia",
+ "ruff_source_file",
+ "ruff_text_size",
+ "rustc-hash",
+ "salsa",
+ "smallvec",
+ "tracing",
+ "ty_module_resolver",
+ "ty_project",
+ "ty_python_core",
+ "ty_python_semantic",
+ "ty_vendored",
 ]
 
 [[package]]
