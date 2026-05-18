@@ -134,8 +134,8 @@ class PytestPlugin:
                     yield from _mark_seed(f"{PYTEST_TESTS_PREFIX}{module.fqname}", path, test_decls)
 
         fixtures_by_path: dict[str, list[native.NativeNode]] = {}
-        for func in ctx.find_decorated_decls("pytest", ["fixture"]):
-            fixtures_by_path.setdefault(func.path, []).append(func)
+        for ref in native.query(ctx).decorators().where_module("pytest").where_name("fixture"):
+            fixtures_by_path.setdefault(ref.path, []).append(ref.decorated)
         for path, fixtures in fixtures_by_path.items():
             module = ctx.module_for(path)
             if module is None:

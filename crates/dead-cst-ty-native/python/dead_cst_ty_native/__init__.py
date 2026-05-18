@@ -6,9 +6,29 @@ provide static information ty needs when checking
 ``dead_cst/plugins/*.py``.
 """
 
-from .dead_cst_ty_native import *  # noqa: F401, F403
 from . import dead_cst_ty_native as _native
+from ._query import (
+    CallQuery,
+    CallRef,
+    ConstructionQuery,
+    ConstructionRef,
+    DecoratorQuery,
+    DecoratorRef,
+    QueryBuilder,
+    query,
+)
+from .dead_cst_ty_native import *  # noqa: F401, F403, E402
 
 __doc__ = _native.__doc__
 if hasattr(_native, "__all__"):
-    __all__ = _native.__all__
+    __all__ = [
+        *_native.__all__,
+        "query",
+        "QueryBuilder",
+        "DecoratorQuery",
+        "ConstructionQuery",
+        "CallQuery",
+        "DecoratorRef",
+        "ConstructionRef",
+        "CallRef",
+    ]
