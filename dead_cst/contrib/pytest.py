@@ -114,6 +114,8 @@ class PytestPlugin:
         return ()
 
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
+        import dead_cst_ty_native as native
+
         nodes = list(ctx.nodes())
         decls_by_path: dict[str, list[native.NativeNode]] = {}
         for n in nodes:
