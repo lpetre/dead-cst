@@ -4,12 +4,12 @@ from __future__ import annotations
 
 
 from dead_cst._graphstore import SymbolGraph
-from dead_cst.analyze import _entrypoint_seeds, _find_reachable as find_reachable
+from dead_cst.analyze import _find_reachable as find_reachable, _keepalive_seeds
 from dead_cst.codemod import generate_patch
-from dead_cst.graph import NodeFlags
+from dead_cst.graph import KEEPALIVE_DEFAULT, NodeFlags
 
 
-def test_every_notebook_node_is_notebook_and_entrypoint(write_notebook, make_analysis):
+def test_every_notebook_node_carries_notebook_flag(write_notebook, make_analysis):
     write_notebook(
         "explore.ipynb",
         [
@@ -20,15 +20,17 @@ def test_every_notebook_node_is_notebook_and_entrypoint(write_notebook, make_ana
     graph = make_analysis().materialize_all()
     notebook_nodes = [n for n in graph.nodes if n.flags & NodeFlags.NOTEBOOK]
     assert notebook_nodes
-    for n in notebook_nodes:
-        assert n.flags & NodeFlags.ENTRYPOINT, f"{n.fqname} missing ENTRYPOINT"
+    # ``NOTEBOOK`` alone is enough — it's a keepalive bit in
+    # ``KEEPALIVE_DEFAULT``, so the BFS seeds from these nodes by default
+    # without needing an explicit ``ENTRYPOINT`` overlay.
+    assert _keepalive_seeds(graph, KEEPALIVE_DEFAULT), "notebook nodes should be keepalive seeds"
 
 
 def test_notebook_keeps_referenced_py_code_alive(write_notebook, write_files, make_analysis):
     write_files({"lib.py": "def used(): return 1\ndef unused(): return 2\n"})
     write_notebook("use.ipynb", ["from lib import used\nused()\n"])
     graph = make_analysis().materialize_all()
-    reachable = find_reachable(graph, _entrypoint_seeds(graph))
+    reachable = find_reachable(graph, _keepalive_seeds(graph, KEEPALIVE_DEFAULT))
     used = next(n for n in graph.nodes if n.fqname == "lib.used")
     unused = next(n for n in graph.nodes if n.fqname == "lib.unused")
     assert used in reachable

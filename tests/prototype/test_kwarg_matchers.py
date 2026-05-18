@@ -14,7 +14,7 @@ from typing import Any
 
 import pytest
 
-native = pytest.importorskip("dead_cst_ty_native")
+native = pytest.importorskip("dead_cst._native")
 
 
 @pytest.fixture

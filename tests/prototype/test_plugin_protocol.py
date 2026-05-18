@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-native = pytest.importorskip("dead_cst_ty_native")
+native = pytest.importorskip("dead_cst._native")
 
 from dead_cst.plugins import InitSubclassPlugin, ModuleDundersPlugin  # noqa: E402
 

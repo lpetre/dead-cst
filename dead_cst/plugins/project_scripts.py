@@ -12,7 +12,7 @@ from ..graph import NodeFlags
 from ..resolvers import load_toml
 
 if TYPE_CHECKING:
-    import dead_cst_ty_native as native
+    from dead_cst import _native as native
 
 PROJECT_SCRIPTS_PREFIX = "<project.scripts>:"
 
@@ -33,7 +33,7 @@ class ProjectScriptsPlugin:
     pyproject_path: Path | None = None
 
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
-        import dead_cst_ty_native as native
+        from dead_cst import _native as native
 
         pyproject = self.pyproject_path or Path(ctx.project_root) / "pyproject.toml"
         data = load_toml(pyproject)

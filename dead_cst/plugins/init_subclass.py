@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Iterable
 
 if TYPE_CHECKING:
-    import dead_cst_ty_native as native
+    from dead_cst import _native as native
 
 _INIT_SUBCLASS = "__init_subclass__"
 INIT_SUBCLASS_PREFIX = "<__init_subclass__>:"
@@ -26,7 +26,7 @@ class InitSubclassPlugin:
     version: int = 1777760307
 
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
-        import dead_cst_ty_native as native
+        from dead_cst import _native as native
 
         for parent in native.query(ctx).classes().defining_method(_INIT_SUBCLASS).collect():
             yield native.AddNode(

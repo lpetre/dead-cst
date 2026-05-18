@@ -6892,12 +6892,17 @@ fn rel_path<P: AsRef<str>>(path: P) -> RelativePathBuf {
 /// Per-source-type default flags for ``.ipynb``: notebook decls are
 /// always alive (cells run top-to-bottom, not imported) and the
 /// codemod must skip them (it can't rewrite the cell JSON envelope).
-const NODE_FLAGS_NOTEBOOK_DEFAULT: u32 = NodeFlags::ENTRYPOINT | NodeFlags::NOTEBOOK;
+/// The `NOTEBOOK` bit alone is enough — the Python-side
+/// `KEEPALIVE_DEFAULT` mask includes `NOTEBOOK`, so reachability seeds
+/// from notebook nodes without needing the `ENTRYPOINT` overlay.
+const NODE_FLAGS_NOTEBOOK_DEFAULT: u32 = NodeFlags::NOTEBOOK;
 
-/// Bits stamped on every import alias pinned by a noqa directive — both
-/// `ENTRYPOINT` (so reachability keeps it alive) and `NOQA` (so the
-/// `kept_alive_by_flags_only(NOQA)` blast-radius query can find it).
-const NODE_FLAGS_NOQA_PIN: u32 = NodeFlags::ENTRYPOINT | NodeFlags::NOQA;
+/// Bits stamped on every import alias pinned by a noqa directive. The
+/// `NOQA` bit alone is enough — the Python-side `KEEPALIVE_DEFAULT`
+/// mask includes `NOQA`, so reachability seeds from noqa-pinned
+/// aliases and the `kept_alive_by_flags_only(NOQA)` blast-radius query
+/// isolates them.
+const NODE_FLAGS_NOQA_PIN: u32 = NodeFlags::NOQA;
 
 /// Internal aliases for the pyclass classattrs used by the call sites
 /// scattered through this file. Read as bare constants rather than
@@ -6927,8 +6932,11 @@ impl NodeFlags {
     /// the live binding.
     #[classattr]
     const SHADOWED: u32 = 1;
-    /// Reachability seed. BFS for "what's live" starts from every node
-    /// carrying this bit.
+    /// Explicit entrypoint — plugin-emitted seeds, the CLI's `-e`
+    /// flag, `[project.scripts]` targets, factory-app synthetics, etc.
+    /// One of the keepalive bits ORed into `KEEPALIVE_DEFAULT` on the
+    /// Python side, so reachability seeds from `ENTRYPOINT`-flagged
+    /// nodes by default.
     #[classattr]
     const ENTRYPOINT: u32 = 2;
     /// `typing.overload` stub (or any same-name decl whose lifetime is
@@ -6936,21 +6944,23 @@ impl NodeFlags {
     /// `SHADOWED`; kept alive by an explicit `impl -> overload` edge.
     #[classattr]
     const OVERLOAD: u32 = 4;
-    /// Tags an entrypoint as test-only (pytest / unittest fixtures and
-    /// test methods). Layered on top of `ENTRYPOINT` so the
-    /// `kept_alive_by_flags_only(TESTCASE)` query can ask "what's only
-    /// alive because of tests".
+    /// Pytest / unittest test discoveries. One of the keepalive bits in
+    /// `KEEPALIVE_DEFAULT`, so tests are alive by default. The
+    /// `kept_alive_by_flags_only(TESTCASE)` blast-radius query isolates
+    /// "what's only alive because of tests" by computing the diff
+    /// against `reachable(seed_flags=KEEPALIVE_DEFAULT & ~TESTCASE)`.
     #[classattr]
     const TESTCASE: u32 = 8;
-    /// Tags an entrypoint as preserved by an explicit user noqa
-    /// directive (bare `# noqa`, `# noqa: F401`, multi-rule
-    /// `# noqa: E501, F401`, or the file-level `# ruff: noqa` /
-    /// `# flake8: noqa`).
+    /// Import alias preserved by a user noqa directive (bare `# noqa`,
+    /// `# noqa: F401`, multi-rule `# noqa: E501, F401`, or the
+    /// file-level `# ruff: noqa` / `# flake8: noqa`). One of the
+    /// keepalive bits in `KEEPALIVE_DEFAULT`.
     #[classattr]
     const NOQA: u32 = 16;
-    /// Every node sourced from a Jupyter `.ipynb` file. Combined with
-    /// `ENTRYPOINT` via `NODE_FLAGS_NOTEBOOK_DEFAULT` because cells run
-    /// top-to-bottom rather than being imported, and the codemod skips
+    /// Every node sourced from a Jupyter `.ipynb` file. Cells run
+    /// top-to-bottom rather than being imported, so the bit alone keeps
+    /// the node alive (no `ENTRYPOINT` overlay needed — `NOTEBOOK` is in
+    /// `KEEPALIVE_DEFAULT`). The codemod also reads the bit to skip
     /// notebook nodes (it can't rewrite the cell JSON envelope).
     #[classattr]
     const NOTEBOOK: u32 = 32;
@@ -7569,7 +7579,7 @@ fn module_fqname_for_file(db: &dyn ProjectDb, file: File) -> String {
 // ---------------------------------------------------------------------------
 
 /// Module-level alias for ``ctx.query()`` — exists for the ergonomic
-/// ``from dead_cst_ty_native import query; query(ctx).decorators()...``
+/// ``from dead_cst import _native as native; native.query(ctx)...``
 /// idiom that the plugins rely on.
 #[pyfunction]
 fn query(slf: Py<ProjectContext>, _py: Python<'_>) -> QueryBuilder {
@@ -7577,7 +7587,8 @@ fn query(slf: Py<ProjectContext>, _py: Python<'_>) -> QueryBuilder {
 }
 
 #[pymodule]
-fn dead_cst_ty_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
+#[pyo3(name = "_native")]
+fn dead_cst_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Import>()?;
     m.add_class::<NativeNode>()?;
     m.add_class::<NativeGraph>()?;

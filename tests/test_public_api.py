@@ -24,6 +24,7 @@ EXPECTED_PUBLIC_API: dict[str, list[str]] = {
     "dead_cst.graph": [
         "EdgeFlags",
         "Import",
+        "KEEPALIVE_DEFAULT",
         "NodeFlags",
         "SymbolNode",
     ],

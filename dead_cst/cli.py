@@ -13,9 +13,9 @@ from typing import Annotated, Sequence
 import typer
 
 from ._graphstore import SymbolGraph
-from .analyze import Analysis, _count_nodes_by_prefix, _entrypoint_seeds, _find_reachable
+from .analyze import Analysis, _count_nodes_by_prefix, _find_reachable, _keepalive_seeds
 from .codemod import generate_patch
-from .graph import NodeFlags, SymbolNode
+from .graph import KEEPALIVE_DEFAULT, SymbolNode
 from .plugins import (
     EXTERNAL_PREFIXES,
     ExplicitEntrypointPlugin,
@@ -148,7 +148,7 @@ def analyze(
     )
     analysis = Analysis(root, resolver=path_resolver, plugins=plugins)
     graph = analysis.materialize_all()
-    reachable = _find_reachable(graph, _entrypoint_seeds(graph))
+    reachable = _find_reachable(graph, _keepalive_seeds(graph, KEEPALIVE_DEFAULT))
 
     unreachable_graph = graph.subgraph([n for n in graph.nodes if n not in reachable])
 
@@ -397,13 +397,13 @@ def unused_exports(
         plugin_names=plugin or [],
     )
     graph = Analysis(root, resolver=path_resolver, plugins=plugins).materialize_all()
-    reachable = _find_reachable(graph, _entrypoint_seeds(graph))
+    reachable = _find_reachable(graph, _keepalive_seeds(graph, KEEPALIVE_DEFAULT))
 
     def _is_dunder_seed(node: SymbolNode) -> bool:
         return node.type == "synthetic" and node.fqname.startswith(DUNDER_PREFIX)
 
     visited_idx: set[int] = set()
-    stack: list[int] = [graph.index(n) for n in graph.nodes if n.flags & NodeFlags.ENTRYPOINT]
+    stack: list[int] = _keepalive_seeds(graph, KEEPALIVE_DEFAULT)
     while stack:
         i = stack.pop()
         if i in visited_idx:
@@ -484,7 +484,7 @@ def remove(
     )
     analysis = Analysis(root, resolver=path_resolver, plugins=plugins)
     graph = analysis.materialize_all()
-    reachable = _find_reachable(graph, _entrypoint_seeds(graph))
+    reachable = _find_reachable(graph, _keepalive_seeds(graph, KEEPALIVE_DEFAULT))
 
     unreachable_graph = graph.subgraph([n for n in graph.nodes if n not in reachable])
 

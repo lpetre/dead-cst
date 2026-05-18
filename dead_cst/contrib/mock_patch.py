@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Iterable
 
 if TYPE_CHECKING:
-    import dead_cst_ty_native as native
+    from dead_cst import _native as native
 
 PATCH_TARGET_PREFIX = "<patch-target>:"
 
@@ -37,7 +37,7 @@ class MockPatchPlugin:
     version: int = 1778025601
 
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
-        import dead_cst_ty_native as native
+        from dead_cst import _native as native
 
         refs: list[native.CallRef] = []
         for module in _MOCK_MODULES:

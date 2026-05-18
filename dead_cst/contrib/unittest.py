@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Iterable
 from ..graph import NodeFlags
 
 if TYPE_CHECKING:
-    import dead_cst_ty_native as native
+    from dead_cst import _native as native
 
 UNITTEST_PREFIX = "<unittest>:"
 
@@ -33,7 +33,7 @@ class UnittestPlugin:
     version: int = 1778248994
 
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
-        import dead_cst_ty_native as native
+        from dead_cst import _native as native
 
         importer_paths = {n.path for n in native.query(ctx).imports().of("unittest").collect()}
 
@@ -53,7 +53,7 @@ class UnittestPlugin:
             if simple in _MODULE_HOOKS:
                 decls_by_path.setdefault(node.path, []).append(node)
 
-        flags = int(NodeFlags.ENTRYPOINT | NodeFlags.TESTCASE)
+        flags = int(NodeFlags.TESTCASE)
         for path, decls in decls_by_path.items():
             module = ctx.module_for(path)
             if module is None:

@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Iterable
 from ..plugins.decl_shapes import DecoratedDeclPlugin
 
 if TYPE_CHECKING:
-    import dead_cst_ty_native as native
+    from dead_cst import _native as native
 
 _REGISTRATION_DECORATORS: frozenset[str] = frozenset({"command", "group", "result_callback"})
 _SUBGROUP_DECORATOR: frozenset[str] = frozenset({"group"})
@@ -31,7 +31,7 @@ class ClickPlugin(DecoratedDeclPlugin):
     constructor_names: frozenset[str] = _GROUP_CONSTRUCTOR_NAMES
 
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
-        import dead_cst_ty_native as native
+        from dead_cst import _native as native
 
         groups_by_owner: dict[tuple[str, str], list[native.NativeNode]] = {}
 

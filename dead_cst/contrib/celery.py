@@ -10,7 +10,7 @@ from ..graph import NodeFlags
 from ..plugins.decl_shapes import DispatchAppPlugin
 
 if TYPE_CHECKING:
-    import dead_cst_ty_native as native
+    from dead_cst import _native as native
 
 _INSTANCE_KINDS: Mapping[str, bool] = {"Celery": True}
 _SHARED_TASK_NAMES: frozenset[str] = frozenset({"shared_task"})
@@ -35,7 +35,7 @@ class CeleryPlugin(DispatchAppPlugin):
     instance_kinds: Mapping[str, bool] = field(default_factory=lambda: dict(_INSTANCE_KINDS))
 
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
-        import dead_cst_ty_native as native
+        from dead_cst import _native as native
 
         yield from DispatchAppPlugin.run(self, ctx)
         # ``@shared_task`` is appless and not covered by DispatchAppPlugin.

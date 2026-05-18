@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Iterable
 from ..graph import NodeFlags
 
 if TYPE_CHECKING:
-    import dead_cst_ty_native as native
+    from dead_cst import _native as native
 
 PYTEST_CONFTEST_PREFIX = "<pytest:conftest>:"
 PYTEST_TESTS_PREFIX = "<pytest:tests>:"
@@ -31,7 +31,7 @@ class PytestPlugin:
     version: int = 1778228682
 
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
-        import dead_cst_ty_native as native
+        from dead_cst import _native as native
 
         nodes = list(ctx.nodes())
         decls_by_path: dict[str, list[native.NativeNode]] = {}
@@ -67,14 +67,14 @@ def _mark_seed(
     path: str,
     targets: list[native.NativeNode],
 ) -> Iterable[native.GraphOp]:
-    import dead_cst_ty_native as native
+    from dead_cst import _native as native
 
     if not targets:
         return
     yield native.AddNode(
         fqname=fqname,
         path=path,
-        flags=int(NodeFlags.ENTRYPOINT | NodeFlags.TESTCASE),
+        flags=int(NodeFlags.TESTCASE),
         edges_to=targets,
     )
 

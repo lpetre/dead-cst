@@ -327,7 +327,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "dead-cst-ty-native"
+name = "dead-cst-native"
 version = "0.0.0"
 dependencies = [
  "pyo3",

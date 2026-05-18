@@ -9,7 +9,7 @@ Demonstrates a new plugin shape distinct from the libcst-side
   passing a `ProjectContext` whose mutation + query methods are
   implemented in rust against ty's `SemanticIndex` / `parsed_module`.
 
-* The **context is the rust pyclass** (`dead_cst_ty_native.ProjectContext`).
+* The **context is the rust pyclass** (`dead_cst._native.ProjectContext`).
   Plugins ``yield`` ``GraphOp`` values (``AddNode`` / ``AddEdge`` /
   ``AddEntrypoint``) to extend the graph, and call ``native.query(ctx).*`` to
   ask structured questions (``find_module_dunders``,
@@ -35,7 +35,7 @@ from __future__ import annotations
 
 from typing import Iterable, Protocol, runtime_checkable
 
-import dead_cst_ty_native as native
+from dead_cst import _native as native
 
 
 @runtime_checkable
