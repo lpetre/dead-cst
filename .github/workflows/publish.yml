@@ -33,9 +33,13 @@ jobs:
       - uses: actions/checkout@v6
         with:
           submodules: recursive
+          fetch-depth: 0
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+      - name: Stamp version from git
+        shell: bash
+        run: python scripts/inject_version.py
       - uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.platform.target }}
@@ -52,9 +56,12 @@ jobs:
       - uses: actions/checkout@v6
         with:
           submodules: recursive
+          fetch-depth: 0
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+      - name: Stamp version from git
+        run: python scripts/inject_version.py
       - uses: PyO3/maturin-action@v1
         with:
           command: sdist

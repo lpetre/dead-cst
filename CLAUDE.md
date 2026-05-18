@@ -99,7 +99,7 @@ Implement `PathResolver`: `resolve(project_root) -> tuple[Package, ...]`. Drop g
 
 - **Python 3.11+**. Ruff line length 100. `known-first-party = ["dead_cst"]`. `from __future__ import annotations` is used throughout the package.
 - **`ty` type-checks `dead_cst/` only** — tests, examples, and workspace fixtures intentionally exercise untyped third-party internals.
-- **Versioning is tag-driven via `hatch-vcs`** — never hand-edit a version.
+- **Versioning is tag-driven**. `pyproject.toml` is `dynamic = ["version"]`; maturin reads the version from `Cargo.toml`'s `[package].version`. CI runs `scripts/inject_version.py` before each build to stamp that field from `git describe`: on a `v1.2.3` tag → `1.2.3`; between tags → `<last-tag>.dev<N>` where `N` is `git rev-list --count <tag>..HEAD`. Local builds use whatever's checked into `Cargo.toml`. Never hand-edit a version.
 - **No optional arguments without a real reason.** When a parameter would be supplied by every caller anyway, make it required. The project is pre-1.0 and breaking the public API is fine.
 - **PRs**: one logical change per PR, add/update tests, add a `[Unreleased]` `CHANGELOG.md` entry for user-visible changes.
 
