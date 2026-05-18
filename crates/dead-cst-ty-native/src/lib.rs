@@ -839,14 +839,24 @@ fn _extract_str_or_list(py: Python<'_>, obj: PyObject) -> PyResult<Vec<String>> 
     }
 }
 
-fn _path_matches(regex_str: &Option<String>, path: &str) -> PyResult<bool> {
-    match regex_str {
-        None => Ok(true),
-        Some(pat) => {
-            let re = regex::Regex::new(pat)
-                .map_err(|e| PyValueError::new_err(format!("invalid path regex {pat:?}: {e}")))?;
-            Ok(re.is_match(path))
-        }
+/// Compile an optional path regex once for a query's file-iteration
+/// loop. Centralized so every ``find_*`` method that takes a
+/// ``path_regex`` parameter shares the same error reporting.
+fn _compile_path_regex(re_str: Option<&str>) -> PyResult<Option<regex::Regex>> {
+    match re_str {
+        None => Ok(None),
+        Some(s) => regex::Regex::new(s)
+            .map(Some)
+            .map_err(|e| PyValueError::new_err(format!("invalid path regex {s:?}: {e}"))),
+    }
+}
+
+/// Per-file predicate-fusion check. ``true`` when the file should be
+/// processed (no regex, or regex matches its absolute path).
+fn _path_re_matches(re: &Option<regex::Regex>, db: &ProjectDatabase, file: File) -> bool {
+    match re {
+        None => true,
+        Some(re) => re.is_match(&file_path_string(db, file)),
     }
 }
 
@@ -940,18 +950,15 @@ impl DecoratorQuery {
 
     fn collect(&self, py: Python<'_>) -> PyResult<Vec<Py<DecoratorRef>>> {
         let ctx = self.ctx.borrow(py);
+        let path_regex = self.path_regex.as_deref();
         let mut refs: Vec<Py<DecoratorRef>> = Vec::new();
         if let Some(owner_attrs) = &self.owner_attrs {
             let pairs = if let Some(via) = &self.via_attr {
-                ctx.find_handler_decorators_via(py, via, owner_attrs.clone())?
+                ctx.find_handler_decorators_via(py, via, owner_attrs.clone(), path_regex)?
             } else {
-                ctx.find_handler_decorators(py, owner_attrs.clone())?
+                ctx.find_handler_decorators(py, owner_attrs.clone(), path_regex)?
             };
             for (owner_name, decorated) in pairs {
-                let path = decorated.borrow(py).path.clone();
-                if !_path_matches(&self.path_regex, &path)? {
-                    continue;
-                }
                 refs.push(Py::new(
                     py,
                     DecoratorRef {
@@ -967,7 +974,7 @@ impl DecoratorQuery {
                 PyValueError::new_err("DecoratorQuery.in_decl(...) requires .where_name(...)")
             })?;
             let in_decl_ref = in_decl_node.borrow(py);
-            let decls = ctx.find_decorations_on(py, &in_decl_ref, names.clone())?;
+            let decls = ctx.find_decorations_on(py, &in_decl_ref, names.clone(), path_regex)?;
             let owner_simple = in_decl_ref
                 .fqname
                 .rsplit('.')
@@ -976,10 +983,6 @@ impl DecoratorQuery {
                 .to_string();
             drop(in_decl_ref);
             for d in decls {
-                let path = d.borrow(py).path.clone();
-                if !_path_matches(&self.path_regex, &path)? {
-                    continue;
-                }
                 refs.push(Py::new(
                     py,
                     DecoratorRef {
@@ -991,12 +994,8 @@ impl DecoratorQuery {
                 )?);
             }
         } else if let Some(fqn) = &self.callee_fqn {
-            let decls = ctx.find_decorated(py, fqn)?;
+            let decls = ctx.find_decorated(py, fqn, path_regex)?;
             for d in decls {
-                let path = d.borrow(py).path.clone();
-                if !_path_matches(&self.path_regex, &path)? {
-                    continue;
-                }
                 refs.push(Py::new(
                     py,
                     DecoratorRef {
@@ -1008,12 +1007,8 @@ impl DecoratorQuery {
                 )?);
             }
         } else if let (Some(module), Some(names)) = (&self.module, &self.names) {
-            let decls = ctx.find_decorated_decls(py, module, names.clone())?;
+            let decls = ctx.find_decorated_decls(py, module, names.clone(), path_regex)?;
             for d in decls {
-                let path = d.borrow(py).path.clone();
-                if !_path_matches(&self.path_regex, &path)? {
-                    continue;
-                }
                 refs.push(Py::new(
                     py,
                     DecoratorRef {
@@ -1102,15 +1097,12 @@ impl ConstructionQuery {
 
     fn collect(&self, py: Python<'_>) -> PyResult<Vec<Py<ConstructionRef>>> {
         let ctx = self.ctx.borrow(py);
+        let path_regex = self.path_regex.as_deref();
         let mut refs: Vec<Py<ConstructionRef>> = Vec::new();
         if let Some(fqn) = &self.class_fqn {
-            let decls = ctx.find_constructions(py, fqn, self.include_subclasses)?;
+            let decls = ctx.find_constructions(py, fqn, self.include_subclasses, path_regex)?;
             let cls_name = fqn.rsplit('.').next().unwrap_or("").to_string();
             for d in decls {
-                let path = d.borrow(py).path.clone();
-                if !_path_matches(&self.path_regex, &path)? {
-                    continue;
-                }
                 refs.push(Py::new(
                     py,
                     ConstructionRef {
@@ -1120,12 +1112,8 @@ impl ConstructionQuery {
                 )?);
             }
         } else if let (Some(module), Some(names)) = (&self.module, &self.names) {
-            let pairs = ctx.find_instance_constructions(py, module, names.clone())?;
+            let pairs = ctx.find_instance_constructions(py, module, names.clone(), path_regex)?;
             for (var, name) in pairs {
-                let path = var.borrow(py).path.clone();
-                if !_path_matches(&self.path_regex, &path)? {
-                    continue;
-                }
                 refs.push(Py::new(
                     py,
                     ConstructionRef {
@@ -1228,12 +1216,20 @@ impl CallQuery {
         let arg_index = self
             .arg_index
             .ok_or_else(|| PyValueError::new_err("CallQuery: .string_arg_at(index) is required"))?;
+        let path_regex = self.path_regex.as_deref();
         let pairs = if let (Some(module), Some(name)) = (&self.module, &self.name) {
-            ctx.find_calls_to_imported(py, module, name, arg_index)?
+            ctx.find_calls_to_imported(py, module, name, arg_index, path_regex)?
         } else if let (Some(owner), Some(attr)) = (&self.owner, &self.attr) {
-            ctx.find_calls_on_var(py, owner, attr, arg_index, self.required_positional)?
+            ctx.find_calls_on_var(
+                py,
+                owner,
+                attr,
+                arg_index,
+                self.required_positional,
+                path_regex,
+            )?
         } else if let Some(attr) = &self.attr {
-            ctx.find_calls_on_attr(py, attr, arg_index)?
+            ctx.find_calls_on_attr(py, attr, arg_index, path_regex)?
         } else {
             return Err(PyValueError::new_err(
                 "CallQuery requires one of: where_module(...) + where_name(...); \
@@ -1242,10 +1238,6 @@ impl CallQuery {
         };
         let mut refs: Vec<Py<CallRef>> = Vec::new();
         for (owner_node, s) in pairs {
-            let path = owner_node.borrow(py).path.clone();
-            if !_path_matches(&self.path_regex, &path)? {
-                continue;
-            }
             refs.push(Py::new(
                 py,
                 CallRef {
@@ -1831,19 +1823,25 @@ impl ProjectContext {
     /// plugin helpers used by ``PytestPlugin`` etc., which intentionally
     /// keep a loose pattern match rather than trying to chase decorator
     /// imports through ty's resolver.
+    #[pyo3(signature = (decorator_module, decorator_names, *, path_regex = None))]
     fn find_decorated_decls(
         &self,
         py: Python<'_>,
         decorator_module: &str,
         decorator_names: Vec<String>,
+        path_regex: Option<&str>,
     ) -> PyResult<Vec<Py<NativeNode>>> {
         let outputs = self.outputs.borrow();
         let outputs = outputs
             .as_ref()
             .ok_or_else(|| not_materialized("find_decorated_decls"))?;
+        let path_re = _compile_path_regex(path_regex)?;
         let names: HashSet<&str> = decorator_names.iter().map(String::as_str).collect();
         let mut out = Vec::new();
         for &file in &outputs.project_files {
+            if !_path_re_matches(&path_re, &self.db, file) {
+                continue;
+            }
             let parsed = parsed_module(&self.db, file).load(&self.db);
             // The file's import map for ``decorator_module`` — if it
             // doesn't import anything from there, no decorator can
@@ -1882,19 +1880,25 @@ impl ProjectContext {
     /// upstream constructor's bare name (``"Flask"`` even when imported
     /// as ``F``).
     #[allow(clippy::type_complexity)]
+    #[pyo3(signature = (module, ctor_names, *, path_regex = None))]
     fn find_instance_constructions(
         &self,
         py: Python<'_>,
         module: &str,
         ctor_names: Vec<String>,
+        path_regex: Option<&str>,
     ) -> PyResult<Vec<(Py<NativeNode>, String)>> {
         let outputs = self.outputs.borrow();
         let outputs = outputs
             .as_ref()
             .ok_or_else(|| not_materialized("find_instance_constructions"))?;
+        let path_re = _compile_path_regex(path_regex)?;
         let allowed: HashSet<&str> = ctor_names.iter().map(String::as_str).collect();
         let mut out = Vec::new();
         for &file in &outputs.project_files {
+            if !_path_re_matches(&path_re, &self.db, file) {
+                continue;
+            }
             let parsed = parsed_module(&self.db, file).load(&self.db);
             let imports = collect_module_imports_local(&parsed, module, &allowed);
             if imports.is_empty() {
@@ -1926,18 +1930,24 @@ impl ProjectContext {
     /// correspond to real framework instances. Multiple decorators on
     /// the same function emit multiple entries.
     #[allow(clippy::type_complexity)]
+    #[pyo3(signature = (decorator_attrs, *, path_regex = None))]
     fn find_handler_decorators(
         &self,
         py: Python<'_>,
         decorator_attrs: Vec<String>,
+        path_regex: Option<&str>,
     ) -> PyResult<Vec<(String, Py<NativeNode>)>> {
         let outputs = self.outputs.borrow();
         let outputs = outputs
             .as_ref()
             .ok_or_else(|| not_materialized("find_handler_decorators"))?;
+        let path_re = _compile_path_regex(path_regex)?;
         let attrs: HashSet<&str> = decorator_attrs.iter().map(String::as_str).collect();
         let mut out = Vec::new();
         for &file in &outputs.project_files {
+            if !_path_re_matches(&path_re, &self.db, file) {
+                continue;
+            }
             let parsed = parsed_module(&self.db, file).load(&self.db);
             for stmt in &parsed.syntax().body {
                 let Stmt::FunctionDef(func) = stmt else {
@@ -1978,19 +1988,25 @@ impl ProjectContext {
     /// ``[(owner_name, function_node)]`` shape, where ``owner_name`` is
     /// the leftmost ``Name`` in the decorator chain.
     #[allow(clippy::type_complexity)]
+    #[pyo3(signature = (via_attr, decorator_attrs, *, path_regex = None))]
     fn find_handler_decorators_via(
         &self,
         py: Python<'_>,
         via_attr: &str,
         decorator_attrs: Vec<String>,
+        path_regex: Option<&str>,
     ) -> PyResult<Vec<(String, Py<NativeNode>)>> {
         let outputs = self.outputs.borrow();
         let outputs = outputs
             .as_ref()
             .ok_or_else(|| not_materialized("find_handler_decorators_via"))?;
+        let path_re = _compile_path_regex(path_regex)?;
         let attrs: HashSet<&str> = decorator_attrs.iter().map(String::as_str).collect();
         let mut out = Vec::new();
         for &file in &outputs.project_files {
+            if !_path_re_matches(&path_re, &self.db, file) {
+                continue;
+            }
             let parsed = parsed_module(&self.db, file).load(&self.db);
             for stmt in &parsed.syntax().body {
                 let Stmt::FunctionDef(func) = stmt else {
@@ -2044,18 +2060,24 @@ impl ProjectContext {
     /// pattern is keyed on the method name and the receiver is the
     /// plugin's concern (typically gated by a per-file import check).
     #[allow(clippy::type_complexity)]
+    #[pyo3(signature = (attr, arg_index, *, path_regex = None))]
     fn find_calls_on_attr(
         &self,
         py: Python<'_>,
         attr: &str,
         arg_index: usize,
+        path_regex: Option<&str>,
     ) -> PyResult<Vec<(Py<NativeNode>, String)>> {
         let outputs = self.outputs.borrow();
         let outputs = outputs
             .as_ref()
             .ok_or_else(|| not_materialized("find_calls_on_attr"))?;
+        let path_re = _compile_path_regex(path_regex)?;
         let mut out = Vec::new();
         for &file in &outputs.project_files {
+            if !_path_re_matches(&path_re, &self.db, file) {
+                continue;
+            }
             let parsed = parsed_module(&self.db, file).load(&self.db);
             for stmt in &parsed.syntax().body {
                 let Some(owner_idx) = owner_idx_for_stmt(outputs, file, stmt) else {
@@ -2138,20 +2160,26 @@ impl ProjectContext {
     /// the call lives under (including its decorator subtree); calls
     /// at module scope attribute to the module node.
     #[allow(clippy::type_complexity)]
+    #[pyo3(signature = (module, name, arg_index, *, path_regex = None))]
     fn find_calls_to_imported(
         &self,
         py: Python<'_>,
         module: &str,
         name: &str,
         arg_index: usize,
+        path_regex: Option<&str>,
     ) -> PyResult<Vec<(Py<NativeNode>, String)>> {
         let outputs = self.outputs.borrow();
         let outputs = outputs
             .as_ref()
             .ok_or_else(|| not_materialized("find_calls_to_imported"))?;
+        let path_re = _compile_path_regex(path_regex)?;
         let allowed: HashSet<&str> = [name].into_iter().collect();
         let mut out = Vec::new();
         for &file in &outputs.project_files {
+            if !_path_re_matches(&path_re, &self.db, file) {
+                continue;
+            }
             let parsed = parsed_module(&self.db, file).load(&self.db);
             let imports = collect_module_imports_local(&parsed, module, &allowed);
             if imports.is_empty() {
@@ -2189,7 +2217,7 @@ impl ProjectContext {
     ///
     /// Returns ``(owning_decl, string_literal_arg)`` pairs.
     #[allow(clippy::type_complexity)]
-    #[pyo3(signature = (owner, attr, arg_index, *, required_positional = None))]
+    #[pyo3(signature = (owner, attr, arg_index, *, required_positional = None, path_regex = None))]
     fn find_calls_on_var(
         &self,
         py: Python<'_>,
@@ -2197,13 +2225,18 @@ impl ProjectContext {
         attr: &str,
         arg_index: usize,
         required_positional: Option<usize>,
+        path_regex: Option<&str>,
     ) -> PyResult<Vec<(Py<NativeNode>, String)>> {
         let outputs = self.outputs.borrow();
         let outputs = outputs
             .as_ref()
             .ok_or_else(|| not_materialized("find_calls_on_var"))?;
+        let path_re = _compile_path_regex(path_regex)?;
         let mut out = Vec::new();
         for &file in &outputs.project_files {
+            if !_path_re_matches(&path_re, &self.db, file) {
+                continue;
+            }
             let parsed = parsed_module(&self.db, file).load(&self.db);
             for stmt in &parsed.syntax().body {
                 let Some(owner_idx) = owner_idx_for_stmt(outputs, file, stmt) else {
@@ -2327,13 +2360,19 @@ impl ProjectContext {
     /// ``pytest.fixture``). For instance-method decorators
     /// (``@app.route(...)`` where ``app`` is a ``flask.Flask``) use
     /// :meth:`find_decorations_on` instead.
-    fn find_decorated(&self, py: Python<'_>, decorator_fqn: &str) -> PyResult<Vec<Py<NativeNode>>> {
+    #[pyo3(signature = (decorator_fqn, *, path_regex = None))]
+    fn find_decorated(
+        &self,
+        py: Python<'_>,
+        decorator_fqn: &str,
+        path_regex: Option<&str>,
+    ) -> PyResult<Vec<Py<NativeNode>>> {
         let Some((module, name)) = decorator_fqn.rsplit_once('.') else {
             return Err(PyValueError::new_err(format!(
                 "expected a dotted decorator fqn (e.g. 'pytest.fixture'), got {decorator_fqn:?}"
             )));
         };
-        self.find_decorated_decls(py, module, vec![name.to_string()])
+        self.find_decorated_decls(py, module, vec![name.to_string()], path_regex)
     }
 
     /// Module-level variables assigned an instance of ``class_fqn``.
@@ -2343,12 +2382,13 @@ impl ProjectContext {
     /// matches direct constructions of any class that subclasses
     /// ``class_fqn`` (works for both project subclasses and external
     /// ones via ty's type hierarchy).
-    #[pyo3(signature = (class_fqn, *, include_subclasses = false))]
+    #[pyo3(signature = (class_fqn, *, include_subclasses = false, path_regex = None))]
     fn find_constructions(
         &self,
         py: Python<'_>,
         class_fqn: &str,
         include_subclasses: bool,
+        path_regex: Option<&str>,
     ) -> PyResult<Vec<Py<NativeNode>>> {
         let Some((module, name)) = class_fqn.rsplit_once('.') else {
             return Err(PyValueError::new_err(format!(
@@ -2370,7 +2410,7 @@ impl ProjectContext {
                 }
             }
         }
-        let pairs = self.find_instance_constructions(py, module, ctors)?;
+        let pairs = self.find_instance_constructions(py, module, ctors, path_regex)?;
         Ok(pairs.into_iter().map(|(node, _)| node).collect())
     }
 
@@ -2381,14 +2421,16 @@ impl ProjectContext {
     /// Cross-file owners (where ``app = imported_factory()`` and
     /// ``@app.route`` is in a different file) aren't matched — same
     /// limitation the rust dispatch-app path has today.
+    #[pyo3(signature = (instance, method_names, *, path_regex = None))]
     fn find_decorations_on(
         &self,
         py: Python<'_>,
         instance: &NativeNode,
         method_names: Vec<String>,
+        path_regex: Option<&str>,
     ) -> PyResult<Vec<Py<NativeNode>>> {
         let instance_simple = instance.fqname.rsplit('.').next().unwrap_or("").to_string();
-        let handlers = self.find_handler_decorators(py, method_names)?;
+        let handlers = self.find_handler_decorators(py, method_names, path_regex)?;
         let mut out = Vec::new();
         for (owner_name, handler) in handlers {
             if owner_name != instance_simple {

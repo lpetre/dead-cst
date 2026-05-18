@@ -308,46 +308,15 @@ class ProjectContext:
         ``__init__.py`` from the rust module surface."""
         ...
 
-    # ----- Decorator / construction queries ------------------------------
-
-    def find_decorated(self, decorator_fqn: str) -> list[NativeNode]:
-        """Decls decorated by ``@<decorator_fqn>`` or
-        ``@<decorator_fqn>(...)``.
-
-        Resolves through the file's local imports — aliased / dotted /
-        module-prefixed forms all match. ``decorator_fqn`` is the
-        upstream callable's absolute fqn
-        (``celery.shared_task``, ``pytest.fixture``). For
-        instance-method decorators (``@app.route(...)`` where ``app``
-        is a ``flask.Flask``) use :meth:`find_decorations_on`.
-        """
-        ...
-
-    def find_constructions(
-        self, class_fqn: str, *, include_subclasses: bool = False
-    ) -> list[NativeNode]:
-        """Module-level variables assigned an instance of ``class_fqn``.
-
-        e.g. ``find_constructions("flask.Flask")`` → every
-        ``app = Flask(...)`` variable node.
-        ``include_subclasses=True`` also matches direct constructions
-        of any class that subclasses ``class_fqn`` (works for both
-        project subclasses and external ones via ty's type hierarchy).
-        """
-        ...
-
-    def find_decorations_on(
-        self, instance: NativeNode, method_names: list[str]
-    ) -> list[NativeNode]:
-        """Decls decorated by ``@<instance>.<method>(...)`` for
-        ``method`` in ``method_names``, where ``<instance>`` resolves
-        to the given decl in the same file.
-
-        Cross-file owners (where ``app = imported_factory()`` and
-        ``@app.route`` is in a different file) aren't matched — same
-        limitation the rust dispatch-app path has today.
-        """
-        ...
+    # Decorator / construction / call queries route through
+    # :meth:`query` and the builder API (``DecoratorQuery`` /
+    # ``ConstructionQuery`` / ``CallQuery`` below). The legacy
+    # ``find_decorated`` / ``find_constructions`` / ``find_decorations_on``
+    # / ``find_decorated_decls`` / ``find_instance_constructions`` /
+    # ``find_handler_decorators`` / ``find_handler_decorators_via`` /
+    # ``find_calls_on_attr`` / ``find_calls_to_imported`` /
+    # ``find_calls_on_var`` methods are no longer part of the public
+    # type-stub contract; use ``query(ctx)`` instead.
 
     def find_subclasses(self, base_fqn: str, *, transitive: bool = True) -> list[NativeNode]:
         """Subclasses of the class addressed by ``base_fqn``.
@@ -582,135 +551,22 @@ class ProjectContext:
     # path would catch something the syntactic path misses; today no
     # plugin needs that.
 
-    def find_decorated_decls(
-        self, decorator_module: str, decorator_names: list[str]
-    ) -> list[NativeNode]:
-        """Every top-level function decorated with
-        ``@<decorator_module>.<name>`` or ``@<name>`` for any ``name``
-        in ``decorator_names``.
-
-        Both ``@<name>`` (bare) and ``@<name>(...)`` (called) forms
-        match — the function call is unwrapped before the pattern is
-        checked. Identity for the attribute prefix is literal
-        (``@pytest.fixture`` matches; ``@p.fixture`` with
-        ``import pytest as p`` does not, but the import-aliased
-        ``@fixture`` does because the file's ``from pytest import
-        fixture`` brings ``fixture`` into local scope).
-
-        Syntactic — see the section comment above for why this query
-        does not route through ty's module resolver.
-        """
-        ...
-
-    def find_instance_constructions(
-        self, module: str, ctor_names: list[str]
-    ) -> list[tuple[NativeNode, str]]:
-        """Top-level ``<var> = <Ctor>(...)`` constructions where
-        ``Ctor`` is imported from ``module`` and is one of
-        ``ctor_names``.
-
-        Recognized shapes (mirroring the libcst plugin helpers):
-
-        * ``from <module> import <Ctor>; X = Ctor(...)``
-        * ``from <module> import <Ctor> as A; X = A(...)``
-        * ``import <module>; X = <module>.Ctor(...)``
-        * ``import <module> as m; X = m.Ctor(...)``
-        * ``X: T = Ctor(...)`` annotated form
-
-        Returns ``[(var_node, ctor_name)]``; ``ctor_name`` is the
-        upstream constructor's bare name (``"Flask"`` even when
-        imported as ``F``).
-
-        Syntactic — see the section comment above for why this query
-        does not route through ty's module resolver.
-        """
-        ...
-
-    def find_calls_to_imported(
-        self, module: str, name: str, arg_index: int
-    ) -> list[tuple[NativeNode, str]]:
-        """Calls to a callable imported from ``module`` with the name
-        ``name``. Returns ``(owning_decl, string_literal_arg)`` pairs
-        where the call resolves through the file's local imports and
-        the positional arg at ``arg_index`` is a string literal.
-
-        The owning decl is the top-level ``FunctionDef`` / ``ClassDef``
-        the call lives under (including its decorator subtree); calls
-        at module scope attribute to the module node.
-
-        Syntactic — see the section comment above for why this query
-        does not route through ty's module resolver.
-        """
-        ...
-
-    # ----- Decorator / call patterns keyed on attribute names -----------
-
-    def find_handler_decorators(self, decorator_attrs: list[str]) -> list[tuple[str, NativeNode]]:
-        """Top-level functions decorated with ``@<owner>.<attr>(...)``
-        where ``attr`` is in ``decorator_attrs``.
-
-        Returns ``[(owner_name, function_node)]``. ``owner_name`` is
-        the raw textual prefix of the decorator (``"app"`` for
-        ``@app.route``), not resolved to a graph node — the caller
-        decides which owners correspond to real framework instances.
-        Multiple decorators on the same function emit multiple
-        entries.
-        """
-        ...
-
-    def find_handler_decorators_via(
-        self, via_attr: str, decorator_attrs: list[str]
-    ) -> list[tuple[str, NativeNode]]:
-        """Like :meth:`find_handler_decorators` but matches the
-        two-level form ``@<owner>.<via_attr>.<attr>(...)``
-        (e.g. ``@bot.tree.command()`` for discord.py's slash commands).
-
-        Returns the same ``[(owner_name, function_node)]`` shape,
-        where ``owner_name`` is the leftmost ``Name`` in the
-        decorator chain.
-        """
-        ...
-
-    def find_calls_on_attr(self, attr: str, arg_index: int) -> list[tuple[NativeNode, str]]:
-        """Calls of the form ``<expr>.<attr>(...)`` regardless of
-        receiver, where the positional arg at ``arg_index`` is either
-        a string literal **or** a list/tuple of string literals.
-
-        Returns ``[(owning_decl, captured_string)]`` — one row per
-        captured string, so ``load_extensions(["a", "b"])`` yields two
-        rows.
-
-        Unlike :meth:`find_calls_on_var`, this matches any receiver
-        shape: ``bot.load_extension(...)``,
-        ``self.bot.load_extension(...)``,
-        ``get_bot().load_extension(...)``, etc. Use this when the call
-        pattern is keyed on the method name and the receiver is the
-        plugin's concern (typically gated by a per-file import check).
-        """
-        ...
-
-    def find_calls_on_var(
-        self,
-        owner: str,
-        attr: str,
-        arg_index: int,
-        *,
-        required_positional: int | None = ...,
-    ) -> list[tuple[NativeNode, str]]:
-        """``<owner>.<attr>(...)`` calls where ``owner`` is the
-        textual prefix (no import resolution — covers pytest fixture
-        conventions like ``mocker.patch`` / ``monkeypatch.setattr``).
-
-        ``required_positional`` disambiguates fqname-form calls from
-        object-form calls when the same method name is overloaded:
-        ``monkeypatch.setattr("X.Y", v)`` has 2 positional args
-        (fqname + value) while
-        ``monkeypatch.setattr(obj, "name", v)`` has 3. Pass ``None``
-        to accept any positional-arg count.
-
-        Returns ``(owning_decl, string_literal_arg)`` pairs.
-        """
-        ...
+    # The decorator / construction / call queries that used to live
+    # here (``find_decorated_decls``, ``find_instance_constructions``,
+    # ``find_handler_decorators``, ``find_handler_decorators_via``,
+    # ``find_calls_on_attr``, ``find_calls_to_imported``,
+    # ``find_calls_on_var``) are no longer part of the public type-stub
+    # contract. Use the builder API instead:
+    # ``query(ctx).decorators().where_module(...).where_name(...)``,
+    # ``query(ctx).constructions().where_module(...).where_name(...)``,
+    # ``query(ctx).calls().where_module(...).where_name(...).string_arg_at(...)``,
+    # etc. See :class:`DecoratorQuery` / :class:`ConstructionQuery` /
+    # :class:`CallQuery` below for the full predicate vocabulary.
+    #
+    # The rust pyo3 methods still exist at runtime — they're the
+    # underlying impl the builder dispatches into — but they aren't
+    # exposed in this stub. A follow-up cleanup will move them out of
+    # ``#[pymethods]`` so they're rust-internal too.
 
     def find_factory_decls(
         self, module: str, ctor_names: list[str]
@@ -724,6 +580,11 @@ class ProjectContext:
         matched constructor's bare name; multiple kinds appear when a
         single factory constructs more than one (e.g. a function that
         returns a ``Flask`` after mounting several ``Blueprint``\\ s).
+
+        Not yet wrapped by the builder API — the only caller is
+        :class:`DispatchAppPlugin` and it uses this shape directly.
+        Likely candidate for a ``ConstructionQuery.inside_factory()``
+        predicate in a follow-up.
         """
         ...
 
@@ -752,12 +613,13 @@ class ProjectContext:
 
 # ---------- Builder query API ---------------------------------------------
 #
-# Phase 2: rust pyclasses with the chainable predicate API. ``collect()``
-# walks ``project_files`` and delegates the per-file match to the
-# corresponding ``find_*`` helper above; ``where_path(regex)`` filters
-# the file path *before* the parse so unrelated files skip parsing
-# entirely. Phase 3 (a follow-up) inlines the walks and deletes the
-# top-level ``find_*`` methods.
+# Phase 3 surface: rust pyclasses with the chainable predicate API.
+# ``collect()`` walks ``project_files`` via the underlying ``find_*``
+# pyo3 helpers (now internal — removed from the public stub above) and
+# ``where_path(regex)`` is fused into each helper's file-iteration
+# loop so unrelated files skip parsing entirely. A follow-up will
+# also move the ``find_*`` methods out of ``#[pymethods]`` and inline
+# their bodies into each query's ``collect()`` directly.
 
 class DecoratorRef:
     """One decorator application on a top-level function or class.
