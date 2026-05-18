@@ -126,29 +126,38 @@ class ClickPlugin(DecoratedDeclPlugin):
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
         import dead_cst_ty_native as native
 
-        decorated = ctx.find_decorated_decls(self.decorator_module, list(self.decorator_names))
-        constructed = ctx.find_instance_constructions(
-            self.decorator_module, list(self.constructor_names)
-        )
         groups_by_owner: dict[tuple[str, str], list[native.NativeNode]] = {}
 
         def add_group(node: "native.NativeNode") -> None:
             simple = node.fqname.rsplit(".", 1)[-1]
             groups_by_owner.setdefault((node.path, simple), []).append(node)
 
-        for node in decorated:
-            add_group(node)
-        for var_node, _kind in constructed:
-            add_group(var_node)
+        for dec_ref in (
+            native.query(ctx)
+            .decorators()
+            .where_module(self.decorator_module)
+            .where_name(list(self.decorator_names))
+        ):
+            add_group(dec_ref.decorated)
+        for cons_ref in (
+            native.query(ctx)
+            .constructions()
+            .where_module(self.decorator_module)
+            .where_name(list(self.constructor_names))
+        ):
+            add_group(cons_ref.var)
 
-        handlers = ctx.find_handler_decorators(list(_REGISTRATION_DECORATORS))
+        handlers: list[tuple[str, native.NativeNode]] = [
+            (h.decorator_owner or "", h.decorated)
+            for h in native.query(ctx).decorators().where_owner_attr(list(_REGISTRATION_DECORATORS))
+        ]
         # Precompute the set of (path, fqname, owner_name) triples for
         # handlers decorated with the subgroup decorator — used inside
         # the fixpoint to upgrade a handler to a group when its owner
         # is already known. Querying inside the loop would be O(N²).
         subgroup_links: set[tuple[str, str, str]] = {
-            (h.path, h.fqname, owner)
-            for owner, h in ctx.find_handler_decorators(list(_SUBGROUP_DECORATOR))
+            (h.decorated.path, h.decorated.fqname, h.decorator_owner or "")
+            for h in native.query(ctx).decorators().where_owner_attr(list(_SUBGROUP_DECORATOR))
         }
 
         emitted: set[tuple[str, str, str, str]] = set()

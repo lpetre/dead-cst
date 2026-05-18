@@ -236,38 +236,44 @@ class DiscordPyPlugin:
         if not discord_paths:
             return
 
-        # 1. Bot / Client constructions. find_instance_constructions
-        # handles `from X import Y`, `from X import Y as Z`, and
+        # 1. Bot / Client constructions. The construction query handles
+        # `from X import Y`, `from X import Y as Z`, and
         # `import X.Y; X.Y.Z(...)` through syntactic import resolution.
-        bot_constructions: list[tuple[native.NativeNode, str]] = []
+        bot_constructions: list[native.ConstructionRef] = []
         bot_constructions.extend(
-            ctx.find_instance_constructions("discord.ext.commands", sorted(_COMMANDS_BOT_KINDS))
+            native.query(ctx)
+            .constructions()
+            .where_module("discord.ext.commands")
+            .where_name(sorted(_COMMANDS_BOT_KINDS))
         )
         bot_constructions.extend(
-            ctx.find_instance_constructions("discord", sorted(_DISCORD_CLIENT_KINDS))
+            native.query(ctx)
+            .constructions()
+            .where_module("discord")
+            .where_name(sorted(_DISCORD_CLIENT_KINDS))
         )
 
         bot_vars_by_file: dict[str, dict[str, native.NativeNode]] = {}
-        for var_node, _kind in bot_constructions:
-            if var_node.path not in discord_paths:
+        for cref in bot_constructions:
+            if cref.path not in discord_paths:
                 continue
-            simple = var_node.fqname.rsplit(".", 1)[-1]
-            bot_vars_by_file.setdefault(var_node.path, {})[simple] = var_node
-            yield native.AddEntrypoint(var_node, marker="<discordpy-app>")
+            simple = cref.var.fqname.rsplit(".", 1)[-1]
+            bot_vars_by_file.setdefault(cref.path, {})[simple] = cref.var
+            yield native.AddEntrypoint(cref.var, marker="<discordpy-app>")
 
         # 2. Single-attr decorators @<bot>.<verb>(...).
-        for owner_name, handler in ctx.find_handler_decorators(sorted(_BOT_DECORATORS)):
-            owner_node = bot_vars_by_file.get(handler.path, {}).get(owner_name)
+        for h in native.query(ctx).decorators().where_owner_attr(sorted(_BOT_DECORATORS)):
+            owner_node = bot_vars_by_file.get(h.decorated.path, {}).get(h.decorator_owner or "")
             if owner_node is not None:
-                yield native.AddEdge(owner_node, handler)
+                yield native.AddEdge(owner_node, h.decorated)
 
         # 3. Two-level slash-command decorators @<bot>.tree.<verb>(...).
-        for owner_name, handler in ctx.find_handler_decorators_via(
-            "tree", sorted(_TREE_DECORATORS)
+        for h in (
+            native.query(ctx).decorators().where_owner_attr_via("tree", sorted(_TREE_DECORATORS))
         ):
-            owner_node = bot_vars_by_file.get(handler.path, {}).get(owner_name)
+            owner_node = bot_vars_by_file.get(h.decorated.path, {}).get(h.decorator_owner or "")
             if owner_node is not None:
-                yield native.AddEdge(owner_node, handler)
+                yield native.AddEdge(owner_node, h.decorated)
 
         # 4. Cog subclasses + module-level setup / teardown hooks.
         # Uses ty's type hierarchy via ``find_subclasses`` — requires
@@ -307,18 +313,18 @@ class DiscordPyPlugin:
         # calls from firing.
         seen_extensions: set[str] = set()
         for attr in ("load_extension", "load_extensions"):
-            for owner, fqname in ctx.find_calls_on_attr(attr, 0):
-                if owner.path not in discord_paths:
+            for cref in native.query(ctx).calls().where_attr(attr).string_arg_at(0):
+                if cref.owner.path not in discord_paths:
                     continue
-                if fqname in seen_extensions:
+                if cref.string_arg in seen_extensions:
                     continue
-                targets = list(ctx.module_surface(fqname))
+                targets = list(ctx.module_surface(cref.string_arg))
                 if not targets:
                     continue
-                seen_extensions.add(fqname)
+                seen_extensions.add(cref.string_arg)
                 yield native.AddNode(
-                    fqname=f"{DISCORDPY_EXTENSION_PREFIX}{fqname}",
-                    path=owner.path,
+                    fqname=f"{DISCORDPY_EXTENSION_PREFIX}{cref.string_arg}",
+                    path=cref.owner.path,
                     flags=int(NodeFlags.ENTRYPOINT),
                     edges_to=targets,
                 )
