@@ -18,7 +18,7 @@ backend-agnostic and keeps working unchanged.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, Sequence, cast
+from typing import TYPE_CHECKING, Sequence
 
 from libcst.metadata import CodePosition, CodeRange
 
@@ -86,7 +86,7 @@ def _bridge(graph: "native.NativeGraph") -> SymbolGraph:
         symbol_nodes.append(
             SymbolNode(
                 fqname=n.fqname,
-                type=cast("SymbolNode.type", n.kind),
+                type=n.kind,
                 path=path,
                 position=CodeRange(
                     CodePosition(n.start_line, n.start_column),
