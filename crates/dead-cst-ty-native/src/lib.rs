@@ -36,6 +36,7 @@ use std::str::FromStr;
 
 use pyo3::exceptions::{PyOSError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
+use pyo3::PyClass;
 use ruff_db::files::{File, FilePath};
 use ruff_db::parsed::{parsed_module, ParsedModuleRef};
 use ruff_db::source::{line_index, source_text};
@@ -739,6 +740,534 @@ impl AddNode {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Builder query API: result types
+// ---------------------------------------------------------------------------
+
+/// One decorator application on a top-level function or class.
+///
+/// Field nullability follows the query shape that produced the ref:
+/// * ``where_module + where_name`` populates ``decorated`` only.
+/// * ``where_owner_attr`` fills ``decorator_owner`` (the textual
+///   ``@<owner>.<attr>`` prefix).
+/// * ``where_owner_attr_via`` additionally fills ``decorator_via``
+///   with the middle attribute name.
+#[pyclass(frozen, get_all)]
+struct DecoratorRef {
+    decorated: Py<NativeNode>,
+    decorator_name: Option<String>,
+    decorator_owner: Option<String>,
+    decorator_via: Option<String>,
+}
+
+#[pymethods]
+impl DecoratorRef {
+    /// File path of the decorated decl. Read off ``decorated.path`` —
+    /// surfaced as a top-level attribute for ergonomics in path-keyed
+    /// dispatch.
+    #[getter]
+    fn path(&self, py: Python<'_>) -> String {
+        self.decorated.borrow(py).path.clone()
+    }
+}
+
+/// One ``<var> = <Ctor>(...)`` construction at module scope.
+///
+/// ``class_name`` is the upstream constructor's bare name
+/// (``"Flask"`` even when imported as ``F``).
+#[pyclass(frozen, get_all)]
+struct ConstructionRef {
+    var: Py<NativeNode>,
+    class_name: String,
+}
+
+#[pymethods]
+impl ConstructionRef {
+    #[getter]
+    fn path(&self, py: Python<'_>) -> String {
+        self.var.borrow(py).path.clone()
+    }
+}
+
+/// One matched call site. ``string_arg`` is the literal at the
+/// positional index passed to :meth:`CallQuery.string_arg_at`.
+#[pyclass(frozen, get_all)]
+struct CallRef {
+    owner: Py<NativeNode>,
+    string_arg: String,
+}
+
+#[pymethods]
+impl CallRef {
+    #[getter]
+    fn path(&self, py: Python<'_>) -> String {
+        self.owner.borrow(py).path.clone()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Builder query API: builders
+// ---------------------------------------------------------------------------
+
+/// Entry point for the chainable query API. Returned by
+/// :meth:`ProjectContext.query`. Pick a stream type:
+/// :meth:`decorators`, :meth:`constructions`, or :meth:`calls`.
+#[pyclass(unsendable)]
+struct QueryBuilder {
+    ctx: Py<ProjectContext>,
+}
+
+#[pymethods]
+impl QueryBuilder {
+    fn decorators(&self, py: Python<'_>) -> DecoratorQuery {
+        DecoratorQuery::new(self.ctx.clone_ref(py))
+    }
+    fn constructions(&self, py: Python<'_>) -> ConstructionQuery {
+        ConstructionQuery::new(self.ctx.clone_ref(py))
+    }
+    fn calls(&self, py: Python<'_>) -> CallQuery {
+        CallQuery::new(self.ctx.clone_ref(py))
+    }
+}
+
+fn _extract_str_or_list(py: Python<'_>, obj: PyObject) -> PyResult<Vec<String>> {
+    let bound = obj.bind(py);
+    if let Ok(s) = bound.extract::<String>() {
+        Ok(vec![s])
+    } else {
+        bound.extract::<Vec<String>>()
+    }
+}
+
+fn _path_matches(regex_str: &Option<String>, path: &str) -> PyResult<bool> {
+    match regex_str {
+        None => Ok(true),
+        Some(pat) => {
+            let re = regex::Regex::new(pat)
+                .map_err(|e| PyValueError::new_err(format!("invalid path regex {pat:?}: {e}")))?;
+            Ok(re.is_match(path))
+        }
+    }
+}
+
+fn _to_iter(py: Python<'_>, items: Vec<Py<impl PyClass>>) -> PyResult<PyObject> {
+    let list = pyo3::types::PyList::new_bound(py, items);
+    let iter_obj = list.call_method0("__iter__")?;
+    Ok(iter_obj.unbind())
+}
+
+/// Find decorated top-level functions / classes. Pick exactly one of:
+/// * ``where_module(m).where_name(n)`` — ``@m.x`` / ``@x`` where ``x``
+///   is imported from ``m``.
+/// * ``where_callee(fqn)`` — fqn-form ``@<fqn>``.
+/// * ``where_owner_attr(attrs)`` — ``@<owner>.<attr>(...)``;
+///   ``decorator_owner`` carries the textual prefix.
+/// * ``where_owner_attr_via(via, attrs)`` —
+///   ``@<owner>.<via>.<attr>(...)`` two-level chain.
+/// * ``in_decl(node).where_name(names)`` — ``@<node>.<name>``
+///   same-file instance-method decorators.
+#[pyclass(unsendable)]
+struct DecoratorQuery {
+    ctx: Py<ProjectContext>,
+    module: Option<String>,
+    callee_fqn: Option<String>,
+    names: Option<Vec<String>>,
+    owner_attrs: Option<Vec<String>>,
+    via_attr: Option<String>,
+    in_decl: Option<Py<NativeNode>>,
+    path_regex: Option<String>,
+}
+
+impl DecoratorQuery {
+    fn new(ctx: Py<ProjectContext>) -> Self {
+        Self {
+            ctx,
+            module: None,
+            callee_fqn: None,
+            names: None,
+            owner_attrs: None,
+            via_attr: None,
+            in_decl: None,
+            path_regex: None,
+        }
+    }
+}
+
+#[pymethods]
+impl DecoratorQuery {
+    fn where_module<'py>(mut slf: PyRefMut<'py, Self>, module: String) -> PyRefMut<'py, Self> {
+        slf.module = Some(module);
+        slf
+    }
+    fn where_callee<'py>(mut slf: PyRefMut<'py, Self>, fqn: String) -> PyRefMut<'py, Self> {
+        slf.callee_fqn = Some(fqn);
+        slf
+    }
+    fn where_name<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        names: PyObject,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let py = slf.py();
+        slf.names = Some(_extract_str_or_list(py, names)?);
+        Ok(slf)
+    }
+    fn where_owner_attr<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        attrs: PyObject,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let py = slf.py();
+        slf.owner_attrs = Some(_extract_str_or_list(py, attrs)?);
+        Ok(slf)
+    }
+    fn where_owner_attr_via<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        via: String,
+        attrs: PyObject,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let py = slf.py();
+        slf.via_attr = Some(via);
+        slf.owner_attrs = Some(_extract_str_or_list(py, attrs)?);
+        Ok(slf)
+    }
+    fn in_decl<'py>(mut slf: PyRefMut<'py, Self>, node: Py<NativeNode>) -> PyRefMut<'py, Self> {
+        slf.in_decl = Some(node);
+        slf
+    }
+    fn where_path<'py>(mut slf: PyRefMut<'py, Self>, regex: String) -> PyRefMut<'py, Self> {
+        slf.path_regex = Some(regex);
+        slf
+    }
+
+    fn collect(&self, py: Python<'_>) -> PyResult<Vec<Py<DecoratorRef>>> {
+        let ctx = self.ctx.borrow(py);
+        let mut refs: Vec<Py<DecoratorRef>> = Vec::new();
+        if let Some(owner_attrs) = &self.owner_attrs {
+            let pairs = if let Some(via) = &self.via_attr {
+                ctx.find_handler_decorators_via(py, via, owner_attrs.clone())?
+            } else {
+                ctx.find_handler_decorators(py, owner_attrs.clone())?
+            };
+            for (owner_name, decorated) in pairs {
+                let path = decorated.borrow(py).path.clone();
+                if !_path_matches(&self.path_regex, &path)? {
+                    continue;
+                }
+                refs.push(Py::new(
+                    py,
+                    DecoratorRef {
+                        decorated,
+                        decorator_name: None,
+                        decorator_owner: Some(owner_name),
+                        decorator_via: self.via_attr.clone(),
+                    },
+                )?);
+            }
+        } else if let Some(in_decl_node) = &self.in_decl {
+            let names = self.names.as_ref().ok_or_else(|| {
+                PyValueError::new_err("DecoratorQuery.in_decl(...) requires .where_name(...)")
+            })?;
+            let in_decl_ref = in_decl_node.borrow(py);
+            let decls = ctx.find_decorations_on(py, &in_decl_ref, names.clone())?;
+            let owner_simple = in_decl_ref
+                .fqname
+                .rsplit('.')
+                .next()
+                .unwrap_or("")
+                .to_string();
+            drop(in_decl_ref);
+            for d in decls {
+                let path = d.borrow(py).path.clone();
+                if !_path_matches(&self.path_regex, &path)? {
+                    continue;
+                }
+                refs.push(Py::new(
+                    py,
+                    DecoratorRef {
+                        decorated: d,
+                        decorator_name: None,
+                        decorator_owner: Some(owner_simple.clone()),
+                        decorator_via: None,
+                    },
+                )?);
+            }
+        } else if let Some(fqn) = &self.callee_fqn {
+            let decls = ctx.find_decorated(py, fqn)?;
+            for d in decls {
+                let path = d.borrow(py).path.clone();
+                if !_path_matches(&self.path_regex, &path)? {
+                    continue;
+                }
+                refs.push(Py::new(
+                    py,
+                    DecoratorRef {
+                        decorated: d,
+                        decorator_name: None,
+                        decorator_owner: None,
+                        decorator_via: None,
+                    },
+                )?);
+            }
+        } else if let (Some(module), Some(names)) = (&self.module, &self.names) {
+            let decls = ctx.find_decorated_decls(py, module, names.clone())?;
+            for d in decls {
+                let path = d.borrow(py).path.clone();
+                if !_path_matches(&self.path_regex, &path)? {
+                    continue;
+                }
+                refs.push(Py::new(
+                    py,
+                    DecoratorRef {
+                        decorated: d,
+                        decorator_name: None,
+                        decorator_owner: None,
+                        decorator_via: None,
+                    },
+                )?);
+            }
+        } else {
+            return Err(PyValueError::new_err(
+                "DecoratorQuery requires one of: where_callee(...); \
+                 where_module(...) + where_name(...); where_owner_attr(...); \
+                 where_owner_attr_via(via, attrs); or in_decl(node) + where_name(...)",
+            ));
+        }
+        Ok(refs)
+    }
+
+    fn first(&self, py: Python<'_>) -> PyResult<Option<Py<DecoratorRef>>> {
+        Ok(self.collect(py)?.into_iter().next())
+    }
+    fn count(&self, py: Python<'_>) -> PyResult<usize> {
+        Ok(self.collect(py)?.len())
+    }
+    fn __iter__(&self, py: Python<'_>) -> PyResult<PyObject> {
+        _to_iter(py, self.collect(py)?)
+    }
+}
+
+/// Find module-scope ``<var> = <Ctor>(...)`` sites. Pick exactly one
+/// of ``where_module + where_name`` or
+/// ``where_class(fqn, include_subclasses=...)``.
+#[pyclass(unsendable)]
+struct ConstructionQuery {
+    ctx: Py<ProjectContext>,
+    module: Option<String>,
+    names: Option<Vec<String>>,
+    class_fqn: Option<String>,
+    include_subclasses: bool,
+    path_regex: Option<String>,
+}
+
+impl ConstructionQuery {
+    fn new(ctx: Py<ProjectContext>) -> Self {
+        Self {
+            ctx,
+            module: None,
+            names: None,
+            class_fqn: None,
+            include_subclasses: false,
+            path_regex: None,
+        }
+    }
+}
+
+#[pymethods]
+impl ConstructionQuery {
+    fn where_module<'py>(mut slf: PyRefMut<'py, Self>, module: String) -> PyRefMut<'py, Self> {
+        slf.module = Some(module);
+        slf
+    }
+    fn where_name<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        names: PyObject,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let py = slf.py();
+        slf.names = Some(_extract_str_or_list(py, names)?);
+        Ok(slf)
+    }
+    #[pyo3(signature = (fqn, *, include_subclasses = false))]
+    fn where_class<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        fqn: String,
+        include_subclasses: bool,
+    ) -> PyRefMut<'py, Self> {
+        slf.class_fqn = Some(fqn);
+        slf.include_subclasses = include_subclasses;
+        slf
+    }
+    fn where_path<'py>(mut slf: PyRefMut<'py, Self>, regex: String) -> PyRefMut<'py, Self> {
+        slf.path_regex = Some(regex);
+        slf
+    }
+
+    fn collect(&self, py: Python<'_>) -> PyResult<Vec<Py<ConstructionRef>>> {
+        let ctx = self.ctx.borrow(py);
+        let mut refs: Vec<Py<ConstructionRef>> = Vec::new();
+        if let Some(fqn) = &self.class_fqn {
+            let decls = ctx.find_constructions(py, fqn, self.include_subclasses)?;
+            let cls_name = fqn.rsplit('.').next().unwrap_or("").to_string();
+            for d in decls {
+                let path = d.borrow(py).path.clone();
+                if !_path_matches(&self.path_regex, &path)? {
+                    continue;
+                }
+                refs.push(Py::new(
+                    py,
+                    ConstructionRef {
+                        var: d,
+                        class_name: cls_name.clone(),
+                    },
+                )?);
+            }
+        } else if let (Some(module), Some(names)) = (&self.module, &self.names) {
+            let pairs = ctx.find_instance_constructions(py, module, names.clone())?;
+            for (var, name) in pairs {
+                let path = var.borrow(py).path.clone();
+                if !_path_matches(&self.path_regex, &path)? {
+                    continue;
+                }
+                refs.push(Py::new(
+                    py,
+                    ConstructionRef {
+                        var,
+                        class_name: name,
+                    },
+                )?);
+            }
+        } else {
+            return Err(PyValueError::new_err(
+                "ConstructionQuery requires either where_class(...) \
+                 or where_module(...) + where_name(...)",
+            ));
+        }
+        Ok(refs)
+    }
+
+    fn first(&self, py: Python<'_>) -> PyResult<Option<Py<ConstructionRef>>> {
+        Ok(self.collect(py)?.into_iter().next())
+    }
+    fn count(&self, py: Python<'_>) -> PyResult<usize> {
+        Ok(self.collect(py)?.len())
+    }
+    fn __iter__(&self, py: Python<'_>) -> PyResult<PyObject> {
+        _to_iter(py, self.collect(py)?)
+    }
+}
+
+/// Find call sites whose positional string-literal at the configured
+/// index is captured. :meth:`string_arg_at` is required. Pick one of:
+/// * ``where_module(m).where_name(n)`` — call to ``n`` imported from
+///   ``m``.
+/// * ``where_owner(o).where_attr(a)`` — ``<o>.<a>(...)`` literal
+///   receiver match.
+/// * ``where_attr(a)`` — ``<expr>.<a>(...)`` any receiver.
+#[pyclass(unsendable)]
+struct CallQuery {
+    ctx: Py<ProjectContext>,
+    module: Option<String>,
+    name: Option<String>,
+    owner: Option<String>,
+    attr: Option<String>,
+    arg_index: Option<usize>,
+    required_positional: Option<usize>,
+    path_regex: Option<String>,
+}
+
+impl CallQuery {
+    fn new(ctx: Py<ProjectContext>) -> Self {
+        Self {
+            ctx,
+            module: None,
+            name: None,
+            owner: None,
+            attr: None,
+            arg_index: None,
+            required_positional: None,
+            path_regex: None,
+        }
+    }
+}
+
+#[pymethods]
+impl CallQuery {
+    fn where_module<'py>(mut slf: PyRefMut<'py, Self>, module: String) -> PyRefMut<'py, Self> {
+        slf.module = Some(module);
+        slf
+    }
+    fn where_name<'py>(mut slf: PyRefMut<'py, Self>, name: String) -> PyRefMut<'py, Self> {
+        slf.name = Some(name);
+        slf
+    }
+    fn where_owner<'py>(mut slf: PyRefMut<'py, Self>, owner: String) -> PyRefMut<'py, Self> {
+        slf.owner = Some(owner);
+        slf
+    }
+    fn where_attr<'py>(mut slf: PyRefMut<'py, Self>, attr: String) -> PyRefMut<'py, Self> {
+        slf.attr = Some(attr);
+        slf
+    }
+    fn string_arg_at<'py>(mut slf: PyRefMut<'py, Self>, index: usize) -> PyRefMut<'py, Self> {
+        slf.arg_index = Some(index);
+        slf
+    }
+    #[pyo3(signature = (n=None))]
+    fn where_required_positional<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        n: Option<usize>,
+    ) -> PyRefMut<'py, Self> {
+        slf.required_positional = n;
+        slf
+    }
+    fn where_path<'py>(mut slf: PyRefMut<'py, Self>, regex: String) -> PyRefMut<'py, Self> {
+        slf.path_regex = Some(regex);
+        slf
+    }
+
+    fn collect(&self, py: Python<'_>) -> PyResult<Vec<Py<CallRef>>> {
+        let ctx = self.ctx.borrow(py);
+        let arg_index = self
+            .arg_index
+            .ok_or_else(|| PyValueError::new_err("CallQuery: .string_arg_at(index) is required"))?;
+        let pairs = if let (Some(module), Some(name)) = (&self.module, &self.name) {
+            ctx.find_calls_to_imported(py, module, name, arg_index)?
+        } else if let (Some(owner), Some(attr)) = (&self.owner, &self.attr) {
+            ctx.find_calls_on_var(py, owner, attr, arg_index, self.required_positional)?
+        } else if let Some(attr) = &self.attr {
+            ctx.find_calls_on_attr(py, attr, arg_index)?
+        } else {
+            return Err(PyValueError::new_err(
+                "CallQuery requires one of: where_module(...) + where_name(...); \
+                 where_owner(...) + where_attr(...); or where_attr(...)",
+            ));
+        };
+        let mut refs: Vec<Py<CallRef>> = Vec::new();
+        for (owner_node, s) in pairs {
+            let path = owner_node.borrow(py).path.clone();
+            if !_path_matches(&self.path_regex, &path)? {
+                continue;
+            }
+            refs.push(Py::new(
+                py,
+                CallRef {
+                    owner: owner_node,
+                    string_arg: s,
+                },
+            )?);
+        }
+        Ok(refs)
+    }
+
+    fn first(&self, py: Python<'_>) -> PyResult<Option<Py<CallRef>>> {
+        Ok(self.collect(py)?.into_iter().next())
+    }
+    fn count(&self, py: Python<'_>) -> PyResult<usize> {
+        Ok(self.collect(py)?.len())
+    }
+    fn __iter__(&self, py: Python<'_>) -> PyResult<PyObject> {
+        _to_iter(py, self.collect(py)?)
+    }
+}
+
 /// Plugin-aware project graph builder.
 ///
 /// Python instantiates a `ProjectContext`, registers Python plugins via
@@ -822,6 +1351,17 @@ impl ProjectContext {
     /// invocation during `materialize`.
     fn add_plugin(&mut self, plugin: PyObject) {
         self.plugins.push(plugin);
+    }
+
+    /// Open a chainable query builder against this context.
+    ///
+    /// Equivalent to the top-level :func:`query` function; both return
+    /// a :class:`QueryBuilder` that can chain into
+    /// :class:`DecoratorQuery` / :class:`ConstructionQuery` /
+    /// :class:`CallQuery`. See the result-type docstrings for the
+    /// predicate vocabulary.
+    fn query(slf: Py<Self>, _py: Python<'_>) -> QueryBuilder {
+        QueryBuilder { ctx: slf }
     }
 
     /// Build the project-wide graph, run each plugin's `run(ctx)`,
@@ -5867,6 +6407,14 @@ fn module_fqname_for_file(db: &dyn ProjectDb, file: File) -> String {
 // Module entry point
 // ---------------------------------------------------------------------------
 
+/// Module-level alias for ``ctx.query()`` — exists for the ergonomic
+/// ``from dead_cst_ty_native import query; query(ctx).decorators()...``
+/// idiom that the plugins rely on.
+#[pyfunction]
+fn query(slf: Py<ProjectContext>, _py: Python<'_>) -> QueryBuilder {
+    QueryBuilder { ctx: slf }
+}
+
 #[pymodule]
 fn dead_cst_ty_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Import>()?;
@@ -5879,6 +6427,14 @@ fn dead_cst_ty_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<AddNode>()?;
     m.add_class::<NodeFlags>()?;
     m.add_class::<EdgeFlags>()?;
+    m.add_class::<DecoratorRef>()?;
+    m.add_class::<ConstructionRef>()?;
+    m.add_class::<CallRef>()?;
+    m.add_class::<QueryBuilder>()?;
+    m.add_class::<DecoratorQuery>()?;
+    m.add_class::<ConstructionQuery>()?;
+    m.add_class::<CallQuery>()?;
+    m.add_function(wrap_pyfunction!(query, m)?)?;
     Ok(())
 }
 

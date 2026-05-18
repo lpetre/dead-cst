@@ -301,6 +301,13 @@ class ProjectContext:
         """
         ...
 
+    def query(self) -> QueryBuilder:
+        """Open a chainable query builder against this context.
+
+        Sugar for ``query(ctx)`` — same return value, picked up by
+        ``__init__.py`` from the rust module surface."""
+        ...
+
     # ----- Decorator / construction queries ------------------------------
 
     def find_decorated(self, decorator_fqn: str) -> list[NativeNode]:
@@ -745,22 +752,25 @@ class ProjectContext:
 
 # ---------- Builder query API ---------------------------------------------
 #
-# Phase 1: pure-Python wrappers in ``_query.py`` that delegate to the
-# ``find_*`` methods above. Phase 2 will port these to rust for
-# predicate fusion (path / module filters that prune file iteration
-# before parsing). Plugin imports won't change across phases — the
-# public surface is the stable contract.
+# Phase 2: rust pyclasses with the chainable predicate API. ``collect()``
+# walks ``project_files`` and delegates the per-file match to the
+# corresponding ``find_*`` helper above; ``where_path(regex)`` filters
+# the file path *before* the parse so unrelated files skip parsing
+# entirely. Phase 3 (a follow-up) inlines the walks and deletes the
+# top-level ``find_*`` methods.
 
-from dataclasses import dataclass  # noqa: E402
-
-@dataclass(frozen=True)
 class DecoratorRef:
     """One decorator application on a top-level function or class.
 
-    See :meth:`DecoratorQuery.collect` for which fields each predicate
-    shape populates; ``decorator_name`` is ``None`` in Phase 1 for the
-    ``where_module + where_name`` shape because the underlying rust
-    API doesn't surface which of the names matched.
+    Field nullability follows the query shape that produced the ref:
+
+    * ``where_module + where_name`` populates ``decorated`` only;
+      ``decorator_name`` is ``None`` because the underlying walk
+      doesn't surface which of the queried names matched.
+    * ``where_owner_attr`` fills ``decorator_owner`` (the textual
+      ``@<owner>.<attr>`` prefix).
+    * ``where_owner_attr_via`` additionally fills ``decorator_via``
+      with the middle attribute name.
     """
 
     decorated: NativeNode
@@ -771,12 +781,11 @@ class DecoratorRef:
     @property
     def path(self) -> str: ...
 
-@dataclass(frozen=True)
 class ConstructionRef:
     """One ``<var> = <Ctor>(...)`` construction at module scope.
 
     ``class_name`` is the upstream constructor's bare name
-    (``"Flask"``, even when imported as ``F``).
+    (``"Flask"`` even when imported as ``F``).
     """
 
     var: NativeNode
@@ -785,7 +794,6 @@ class ConstructionRef:
     @property
     def path(self) -> str: ...
 
-@dataclass(frozen=True)
 class CallRef:
     """One matched call site.
 
@@ -800,7 +808,12 @@ class CallRef:
     def path(self) -> str: ...
 
 def query(ctx: ProjectContext) -> QueryBuilder:
-    """Open a chainable query builder against ``ctx``."""
+    """Open a chainable query builder against ``ctx``.
+
+    Equivalent to :meth:`ProjectContext.query`; exists so plugins can
+    write ``query(ctx).decorators()...`` without first dereferencing
+    the method.
+    """
     ...
 
 class QueryBuilder:
@@ -808,7 +821,6 @@ class QueryBuilder:
     :meth:`decorators` / :meth:`constructions` / :meth:`calls` to
     choose the result-type stream."""
 
-    def __init__(self, ctx: ProjectContext) -> None: ...
     def decorators(self) -> DecoratorQuery: ...
     def constructions(self) -> ConstructionQuery: ...
     def calls(self) -> CallQuery: ...
@@ -818,7 +830,6 @@ class DecoratorQuery:
     of the four decorator-shape predicates per chain — mixing raises
     ``ValueError`` at ``collect()`` time."""
 
-    def __init__(self, ctx: ProjectContext) -> None: ...
     def where_module(self, module: str) -> DecoratorQuery: ...
     def where_callee(self, fqn: str) -> DecoratorQuery: ...
     def where_name(self, names: str | list[str] | tuple[str, ...]) -> DecoratorQuery: ...
@@ -836,7 +847,6 @@ class DecoratorQuery:
 class ConstructionQuery:
     """Find module-scope ``<var> = <Ctor>(...)`` sites."""
 
-    def __init__(self, ctx: ProjectContext) -> None: ...
     def where_module(self, module: str) -> ConstructionQuery: ...
     def where_name(self, names: str | list[str] | tuple[str, ...]) -> ConstructionQuery: ...
     def where_class(self, fqn: str, *, include_subclasses: bool = False) -> ConstructionQuery: ...
@@ -853,13 +863,12 @@ class CallQuery:
     index. Pick one of the three receiver shapes per chain.
     """
 
-    def __init__(self, ctx: ProjectContext) -> None: ...
     def where_module(self, module: str) -> CallQuery: ...
     def where_name(self, name: str) -> CallQuery: ...
     def where_owner(self, owner: str) -> CallQuery: ...
     def where_attr(self, attr: str) -> CallQuery: ...
     def string_arg_at(self, index: int) -> CallQuery: ...
-    def where_required_positional(self, n: int | None) -> CallQuery: ...
+    def where_required_positional(self, n: int | None = ...) -> CallQuery: ...
     def where_path(self, regex: str) -> CallQuery: ...
     def collect(self) -> list[CallRef]: ...
     def first(self) -> CallRef | None: ...
