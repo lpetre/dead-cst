@@ -4888,33 +4888,107 @@ fn rel_path<P: AsRef<str>>(path: P) -> RelativePathBuf {
 // Noqa parsing
 // ---------------------------------------------------------------------------
 
-/// Bitwise OR of [`NodeFlags::ENTRYPOINT`] and [`NodeFlags::NOQA`], the two
-/// bits stamped on every import alias pinned by a noqa directive.
-///
-/// Keep these constants in sync with `dead_cst.graph.NodeFlags` —
-/// `NodeFlags` is an `enum.IntFlag` with `auto()` assignments, so the
-/// values follow declaration order: NONE=0, SHADOWED=1, ENTRYPOINT=2,
-/// OVERLOAD=4, TESTCASE=8, NOQA=16, …
-const NODE_FLAG_ENTRYPOINT: u32 = 2;
-const NODE_FLAG_NOQA: u32 = 16;
-const NODE_FLAG_NOTEBOOK: u32 = 32;
-const NODE_FLAGS_NOQA_PIN: u32 = NODE_FLAG_ENTRYPOINT | NODE_FLAG_NOQA;
 /// Per-source-type default flags for ``.ipynb``: notebook decls are
 /// always alive (cells run top-to-bottom, not imported) and the
 /// codemod must skip them (it can't rewrite the cell JSON envelope).
-const NODE_FLAGS_NOTEBOOK_DEFAULT: u32 = NODE_FLAG_ENTRYPOINT | NODE_FLAG_NOTEBOOK;
+const NODE_FLAGS_NOTEBOOK_DEFAULT: u32 = NodeFlags::ENTRYPOINT | NodeFlags::NOTEBOOK;
 
-/// `EdgeFlags::DEAD_BRANCH = enum.auto()` in `dead_cst.graph` —
-/// first non-`NONE` bit, value `1`. Stamped on every edge produced
-/// by a use site that lives inside a statically-dead region.
-const EDGE_FLAG_DEAD_BRANCH: u32 = 1;
+/// Bits stamped on every import alias pinned by a noqa directive — both
+/// `ENTRYPOINT` (so reachability keeps it alive) and `NOQA` (so the
+/// `kept_alive_by_flags_only(NOQA)` blast-radius query can find it).
+const NODE_FLAGS_NOQA_PIN: u32 = NodeFlags::ENTRYPOINT | NodeFlags::NOQA;
 
-/// `EdgeFlags::DYNAMIC_IMPORT = enum.auto()` in `dead_cst.graph` —
-/// second non-`NONE` bit, value `2`. Stamped on each edge emitted
-/// from a runtime-import call (`__import__('X')` /
-/// `importlib.import_module('X')`) to keep the visitor's resolution
-/// minimal — plugins can read the flag and choose to fan out.
-const EDGE_FLAG_DYNAMIC_IMPORT: u32 = 2;
+/// Internal aliases for the pyclass classattrs used by the call sites
+/// scattered through this file. Read as bare constants rather than
+/// `NodeFlags::ENTRYPOINT` (which would force every reader to chase the
+/// `pyclass` macro to decide whether it's a runtime lookup or a const).
+const NODE_FLAG_ENTRYPOINT: u32 = NodeFlags::ENTRYPOINT;
+const EDGE_FLAG_DEAD_BRANCH: u32 = EdgeFlags::DEAD_BRANCH;
+const EDGE_FLAG_DYNAMIC_IMPORT: u32 = EdgeFlags::DYNAMIC_IMPORT;
+
+/// Bit values stamped into [`NativeNode::flags`]. Mirrors
+/// `dead_cst.graph.NodeFlags` exactly so plugin code can mix
+/// rust-emitted and libcst-emitted nodes.
+///
+/// Exposed as Python class attributes — the classattr values are plain
+/// `int`s so `NodeFlags.ENTRYPOINT | NodeFlags.NOQA` works the same as
+/// the libcst `IntFlag` (just without the `.name` / `.value` surface).
+#[pyclass(frozen)]
+struct NodeFlags;
+
+#[pymethods]
+impl NodeFlags {
+    #[classattr]
+    const NONE: u32 = 0;
+    /// Decl rebound by a later assignment in the same file. Kept in the
+    /// graph (with its parent-module edge) but excluded from the
+    /// cross-module lookup so consumers of an exported name route to
+    /// the live binding.
+    #[classattr]
+    const SHADOWED: u32 = 1;
+    /// Reachability seed. BFS for "what's live" starts from every node
+    /// carrying this bit.
+    #[classattr]
+    const ENTRYPOINT: u32 = 2;
+    /// `typing.overload` stub (or any same-name decl whose lifetime is
+    /// anchored to a matching impl). Excluded from the lookup trie like
+    /// `SHADOWED`; kept alive by an explicit `impl -> overload` edge.
+    #[classattr]
+    const OVERLOAD: u32 = 4;
+    /// Tags an entrypoint as test-only (pytest / unittest fixtures and
+    /// test methods). Layered on top of `ENTRYPOINT` so the
+    /// `kept_alive_by_flags_only(TESTCASE)` query can ask "what's only
+    /// alive because of tests".
+    #[classattr]
+    const TESTCASE: u32 = 8;
+    /// Tags an entrypoint as preserved by an explicit user noqa
+    /// directive (bare `# noqa`, `# noqa: F401`, multi-rule
+    /// `# noqa: E501, F401`, or the file-level `# ruff: noqa` /
+    /// `# flake8: noqa`).
+    #[classattr]
+    const NOQA: u32 = 16;
+    /// Every node sourced from a Jupyter `.ipynb` file. Combined with
+    /// `ENTRYPOINT` via `NODE_FLAGS_NOTEBOOK_DEFAULT` because cells run
+    /// top-to-bottom rather than being imported, and the codemod skips
+    /// notebook nodes (it can't rewrite the cell JSON envelope).
+    #[classattr]
+    const NOTEBOOK: u32 = 32;
+    /// Every node sourced from a file under the package's `exported`
+    /// glob. Used by the cross-package merge to filter to entries the
+    /// owning package opts into exposing.
+    #[classattr]
+    const EXPORTED: u32 = 64;
+    /// Import decl synthesized from `from X import *` — one per name
+    /// the star statement brought in. Set so the cross-module trie can
+    /// distinguish "real" import aliases from per-name star fan-out.
+    #[classattr]
+    const STAR_REEXPORT: u32 = 128;
+}
+
+/// Bit values stamped into the third tuple slot of each `NativeGraph`
+/// edge. Mirrors `dead_cst.graph.EdgeFlags`.
+#[pyclass(frozen)]
+struct EdgeFlags;
+
+#[pymethods]
+impl EdgeFlags {
+    #[classattr]
+    const NONE: u32 = 0;
+    /// Reference originated inside a statically-dead region (the body of
+    /// `if False:`, the else of `if True:`, after an unconditional
+    /// `return` / `raise` / `break` / `continue`, …). Metadata only —
+    /// the edge still participates in default reachability; pass to
+    /// `descendants(..., skip_flags=EdgeFlags.DEAD_BRANCH)` to compute
+    /// the kept-alive-only-by-dead-branches set.
+    #[classattr]
+    const DEAD_BRANCH: u32 = 1;
+    /// Edge emitted from a runtime-import call (`__import__('X')` /
+    /// `importlib.import_module('X')`). Lets plugins read which edges
+    /// the visitor produced from dynamic-import shapes and choose to
+    /// fan out / specialize.
+    #[classattr]
+    const DYNAMIC_IMPORT: u32 = 2;
+}
 
 // ---------------------------------------------------------------------------
 // Dead-region detection
@@ -5503,6 +5577,8 @@ fn dead_cst_ty_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<AddEdge>()?;
     m.add_class::<AddEntrypoint>()?;
     m.add_class::<AddNode>()?;
+    m.add_class::<NodeFlags>()?;
+    m.add_class::<EdgeFlags>()?;
     Ok(())
 }
 
