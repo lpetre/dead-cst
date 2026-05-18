@@ -7,8 +7,6 @@ missing edge fails the test.
 
 import pytest
 
-from tests.conftest import case
-
 
 @pytest.mark.parametrize(
     "src, expected_edges",
@@ -794,28 +792,6 @@ from tests.conftest import case
         # current edge set; when ty grows the leak-to-enclosing-scope
         # support, this test should pass on both backends and the
         # limitation entry can be dropped.
-        case(
-            """
-            nums = [1, 2, 3]
-            result = [last := n for n in nums]
-            def use(): return last
-            """,
-            # A walrus inside a comprehension leaks its binding to the
-            # enclosing (module) scope per PEP 572. ``mod.last`` is
-            # surfaced as a top-level decl and ``use``'s reference is
-            # routed to it via the unresolved-access fixup in
-            # ``SymbolVisitor.on_leave``.
-            {
-                "mod.nums -> mod",
-                "mod.result -> mod",
-                "mod.result -> mod.nums",
-                "mod.last -> mod",
-                "mod.use -> mod",
-                "mod.use -> mod.last",
-            },
-            skip="rust",
-            id="walrus-comprehension-toplevel-leak-captured",
-        ),
         pytest.param(
             """
             def src(): return 1
@@ -1346,52 +1322,6 @@ def test_declarations(build_decl_graph, assert_edges, src, expected_edges):
         # Rust's behavior is more accurate for the code as written —
         # rewriting these tests with ``if x:`` for a non-literal ``x``
         # would have them pass on both backends.
-        case(
-            """
-            def f(): pass
-            def g(): pass
-            if True: f = g
-            f()
-            """,
-            # ``f = g`` creates a second ``mod.f`` variable node at
-            # column 9 (after ``if True: ``). The alias edge lives on
-            # that node.
-            {
-                "mod -> mod.f@1:0",
-                "mod -> mod.f@3:9",
-                "mod.f@1:0 -> mod",
-                "mod.f@3:9 -> mod",
-                "mod.f@3:9 -> mod.g@2:0",
-                "mod.g@2:0 -> mod",
-            },
-            skip="rust",
-            id="conditional-rebind-to-alias",
-        ),
-        case(
-            """
-            def a(): pass
-            def b(): pass
-            if True:
-                def f(): a()
-            else:
-                def f(): b()
-            f()
-            """,
-            # Each branch's ``def f`` is its own node with its own body
-            # edge. ``f()`` resolves to both.
-            {
-                "mod -> mod.f@4:4",
-                "mod -> mod.f@6:4",
-                "mod.a@1:0 -> mod",
-                "mod.b@2:0 -> mod",
-                "mod.f@4:4 -> mod",
-                "mod.f@4:4 -> mod.a@1:0",
-                "mod.f@6:4 -> mod",
-                "mod.f@6:4 -> mod.b@2:0",
-            },
-            skip="rust",
-            id="if-else-function-redefinition",
-        ),
         pytest.param(
             """
             def f(): return 1
@@ -1606,34 +1536,6 @@ def test_shadowed_declarations(build_decl_graph, assert_positional_edges, files,
         # definitely-taken and drops the else branch from end-of-scope
         # live bindings (matching pyright). Rewriting with ``if x:`` for
         # a non-literal ``x`` would pass on both backends.
-        case(
-            {
-                "lib.py": """
-                if True:
-                    def f(): pass
-                else:
-                    def f(): pass
-                """,
-                "mod.py": """
-                from lib import f
-                f()
-                """,
-            },
-            {
-                "lib.f@2:4 -> lib",
-                "lib.f@4:4 -> lib",
-                "mod -> lib",
-                "mod -> lib.f@2:4",
-                "mod -> lib.f@4:4",
-                "mod -> mod.f@1:16",
-                "mod.f@1:16 -> lib",
-                "mod.f@1:16 -> lib.f@2:4",
-                "mod.f@1:16 -> lib.f@4:4",
-                "mod.f@1:16 -> mod",
-            },
-            skip="rust",
-            id="cross-module-import-of-if-else-binding",
-        ),
         # Conditional re-export through an intermediate module: each
         # branch imports from a different upstream, so resolving
         # ``mod -> compat.f`` forks the worklist into both upstreams.
@@ -1643,46 +1545,6 @@ def test_shadowed_declarations(build_decl_graph, assert_positional_edges, files,
         # chases the alias chain transitively to emit ``mod -> a.f`` /
         # ``mod -> b.f``. Reachability is preserved either way
         # (``mod -> mod.f -> compat.f -> a.f`` still walks).
-        case(
-            {
-                "a.py": "def f(): pass\n",
-                "b.py": "def f(): pass\n",
-                "compat.py": """
-                if True:
-                    from a import f
-                else:
-                    from b import f
-                """,
-                "mod.py": """
-                from compat import f
-                f()
-                """,
-            },
-            {
-                "a.f@1:0 -> a",
-                "b.f@1:0 -> b",
-                "compat.f@2:18 -> a",
-                "compat.f@2:18 -> a.f@1:0",
-                "compat.f@2:18 -> compat",
-                "compat.f@4:18 -> b",
-                "compat.f@4:18 -> b.f@1:0",
-                "compat.f@4:18 -> compat",
-                "mod -> a.f@1:0",
-                "mod -> b.f@1:0",
-                "mod -> compat",
-                "mod -> compat.f@2:18",
-                "mod -> compat.f@4:18",
-                "mod -> mod.f@1:19",
-                "mod.f@1:19 -> a.f@1:0",
-                "mod.f@1:19 -> b.f@1:0",
-                "mod.f@1:19 -> compat",
-                "mod.f@1:19 -> compat.f@2:18",
-                "mod.f@1:19 -> compat.f@4:18",
-                "mod.f@1:19 -> mod",
-            },
-            skip="rust",
-            id="cross-module-import-through-conditional-reexport",
-        ),
         # ``try`` body and ``except`` handler both bind ``f``; both are
         # live at exit (a handler can run before *or* instead of the
         # body completing), so both must be importable. Skipped on rust
@@ -1692,40 +1554,6 @@ def test_shadowed_declarations(build_decl_graph, assert_positional_edges, files,
         # one-hop Principle 2 edges only. All structural edges
         # (``mod -> lib.f@2:18``, ``mod -> lib.f@4:4``, etc.) are
         # present on rust; reachability is preserved.
-        case(
-            {
-                "lib.py": """
-                try:
-                    from a import f
-                except ImportError:
-                    def f(): pass
-                """,
-                "a.py": "def f(): pass\n",
-                "mod.py": """
-                from lib import f
-                f()
-                """,
-            },
-            {
-                "a.f@1:0 -> a",
-                "lib.f@2:18 -> a",
-                "lib.f@2:18 -> a.f@1:0",
-                "lib.f@2:18 -> lib",
-                "lib.f@4:4 -> lib",
-                "mod -> a.f@1:0",
-                "mod -> lib",
-                "mod -> lib.f@2:18",
-                "mod -> lib.f@4:4",
-                "mod -> mod.f@1:16",
-                "mod.f@1:16 -> a.f@1:0",
-                "mod.f@1:16 -> lib",
-                "mod.f@1:16 -> lib.f@2:18",
-                "mod.f@1:16 -> lib.f@4:4",
-                "mod.f@1:16 -> mod",
-            },
-            skip="rust",
-            id="try-except-both-branches-exported",
-        ),
     ],
 )
 def test_branch_bindings_exported(build_decl_graph, assert_positional_edges, files, expected_edges):
@@ -1861,7 +1689,6 @@ PEER_STUB_FILES = {
 # stub→runtime edges, flag stub-only decls".
 
 
-@pytest.mark.skip_when_backend("libcst")
 def test_peer_stub_emits_edge_to_matching_runtime_decl_rust(build_decl_graph):
     """Rule 2: for each ``.pyi`` decl with a same-name decl in the
     ``.py`` twin, emit a ``pyi_decl -> py_decl`` edge. The stub
@@ -1889,7 +1716,6 @@ def test_peer_stub_emits_edge_to_matching_runtime_decl_rust(build_decl_graph):
     )
 
 
-@pytest.mark.skip_when_backend("libcst")
 def test_stub_only_decl_flagged_entrypoint_rust(build_decl_graph):
     """Rule 3: a ``.pyi`` decl with no matching ``.py`` decl is
     ``ENTRYPOINT``-flagged so it stays alive even when no consumer

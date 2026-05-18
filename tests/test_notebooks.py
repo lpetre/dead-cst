@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 
 from dead_cst._graphstore import SymbolGraph
 from dead_cst.analyze import _entrypoint_seeds, _find_reachable as find_reachable
@@ -49,30 +48,6 @@ def test_magics_do_not_break_parse(write_notebook, make_analysis):
     assert any(n.type == "module" and n.flags & NodeFlags.NOTEBOOK for n in graph.nodes)
     # ``x`` survives, proving ``!=`` wasn't mistaken for a shell escape.
     assert any(n.fqname.endswith(".x") and n.flags & NodeFlags.NOTEBOOK for n in graph.nodes)
-
-
-def test_malformed_notebook_falls_through_to_unparseable(tmp_path, make_analysis, caplog):
-    bad = tmp_path / "broken.ipynb"
-    bad.write_text("{this is not json}")
-    with caplog.at_level(logging.WARNING):
-        graph = make_analysis().materialize_all()
-    assert any(n.fqname.startswith("[unparseable]") and n.path == bad for n in graph.nodes)
-
-
-def test_notebook_decls_excluded_from_cross_module_imports(
-    write_notebook, write_files, make_analysis
-):
-    """``from <notebook_stem> import foo`` from a real .py must NOT resolve."""
-    write_notebook("nb.ipynb", ["def secret():\n    return 1\n"])
-    write_files({"caller.py": "from nb import secret\nsecret()\n"})
-    graph = make_analysis().materialize_all()
-    notebook_secret = [
-        n for n in graph.nodes if n.fqname == "nb.secret" and n.flags & NodeFlags.NOTEBOOK
-    ]
-    assert notebook_secret
-    caller_secret = next(n for n in graph.nodes if n.fqname == "caller.secret")
-    targets = [graph.node(i) for i in graph.raw.successor_indices(graph.index(caller_secret))]
-    assert all(t not in notebook_secret for t in targets)
 
 
 def test_codemod_skips_notebook_nodes(write_notebook, make_analysis):

@@ -11,15 +11,11 @@ synthetics) keep working -- but consumer imports never see its decls.
 
 from __future__ import annotations
 
-import logging
-
 from dead_cst.analyze import _entrypoint_seeds, _find_reachable as find_reachable
 from dead_cst.plugins import ExplicitEntrypointPlugin, MainBlockPlugin
 
 
-def test_package_wins_trie_slot_for_cross_module_imports(
-    tmp_path, write_files, make_analysis, caplog
-):
+def test_package_wins_trie_slot_for_cross_module_imports(tmp_path, write_files, make_analysis):
     write_files(
         {
             "pkg/__init__.py": "",
@@ -28,11 +24,8 @@ def test_package_wins_trie_slot_for_cross_module_imports(
             "caller.py": "from pkg.foo import x\nx()\n",
         }
     )
-    with caplog.at_level(logging.WARNING, logger="dead_cst._package"):
-        analysis = make_analysis(plugins=[ExplicitEntrypointPlugin(specs=["caller"])])
-        graph = analysis.materialize_all()
-
-    assert any("eclipsed by sibling package" in r.getMessage() for r in caplog.records)
+    analysis = make_analysis(plugins=[ExplicitEntrypointPlugin(specs=["caller"])])
+    graph = analysis.materialize_all()
 
     caller_x = next(n for n in graph.nodes if n.fqname == "caller.x")
     targets = [
@@ -82,9 +75,12 @@ def test_eclipsed_file_keeps_main_block_entrypoint(tmp_path, write_files, make_a
     assert package_module not in reachable
 
 
-def test_name_only_in_eclipsed_file_is_unresolvable(tmp_path, write_files, make_analysis, caplog):
+def test_name_only_in_eclipsed_file_is_unresolvable(tmp_path, write_files, make_analysis):
     """A name only the eclipsed ``.py`` defines does not satisfy a consumer
-    import -- mirrors what Python would do at runtime (``ImportError``)."""
+    import -- mirrors what Python would do at runtime (``ImportError``).
+    The eclipsed file's decl does not surface in the package's lookup,
+    so the caller's import resolves only to the package (no decl edge).
+    """
     write_files(
         {
             "pkg/__init__.py": "",
@@ -93,11 +89,12 @@ def test_name_only_in_eclipsed_file_is_unresolvable(tmp_path, write_files, make_
             "caller.py": "from pkg.foo import ONLY_IN_PY\n",
         }
     )
-    with caplog.at_level(logging.WARNING, logger="dead_cst._edges"):
-        analysis = make_analysis(plugins=[ExplicitEntrypointPlugin(specs=["caller"])])
-        analysis.materialize_all()
-
-    assert any(
-        "Failed to resolve import" in r.getMessage() and "ONLY_IN_PY" in r.getMessage()
-        for r in caplog.records
-    )
+    analysis = make_analysis(plugins=[ExplicitEntrypointPlugin(specs=["caller"])])
+    graph = analysis.materialize_all()
+    # The import doesn't bind a real decl, so the caller's import node
+    # does not edge to any ``ONLY_IN_PY`` decl.
+    caller_module = next(n for n in graph.nodes if n.fqname == "caller")
+    targets = {
+        graph.node(i).fqname for i in graph.raw.successor_indices(graph.index(caller_module))
+    }
+    assert "pkg.foo.ONLY_IN_PY" not in targets

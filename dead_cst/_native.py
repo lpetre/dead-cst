@@ -28,8 +28,6 @@ from .graph import EdgeFlags, Import, NodeFlags, SymbolNode
 if TYPE_CHECKING:
     import dead_cst_ty_native as native
 
-    from .plugins._core import EdgePlugin
-
 # Most nodes carry no flags and most edges have flags=0; reusing the
 # zero singletons avoids ~5k IntFlag constructor calls per warm build
 # on ``dead_cst`` itself.
@@ -39,7 +37,8 @@ _NO_EDGE_FLAGS = EdgeFlags(0)
 
 def materialize_project(
     project_root: Path,
-    plugins: Sequence["EdgePlugin"] = (),
+    plugins: Sequence[object] = (),
+    src_roots: Sequence[Path] = (),
 ) -> SymbolGraph:
     """Materialize ``project_root`` end-to-end via the rust backend.
 
@@ -47,12 +46,14 @@ def materialize_project(
     registers each plugin's ``run(ctx)`` callback, calls
     :meth:`materialize`, and bridges the resulting :class:`NativeGraph`
     into a :class:`SymbolGraph`. Plugins that don't implement the
-    rust ``run(ctx)`` protocol are silently skipped — there's no
-    libcst-side ``observe`` / ``finalize`` fallback in this path.
+    rust ``run(ctx)`` protocol are silently skipped.
     """
     import dead_cst_ty_native as native
 
-    ctx = native.ProjectContext(str(project_root))
+    kwargs = {}
+    if src_roots:
+        kwargs["src_roots"] = [str(p) for p in src_roots]
+    ctx = native.ProjectContext(str(project_root), **kwargs)
     for plugin in plugins:
         if hasattr(plugin, "run"):
             ctx.add_plugin(plugin)

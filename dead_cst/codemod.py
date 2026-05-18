@@ -6,7 +6,7 @@ from pathlib import Path
 import libcst as cst
 from libcst.codemod import CodemodContext
 from libcst.codemod.visitors import RemoveImportsVisitor
-from libcst.metadata import CodeRange, FullRepoManager, PositionProvider, QualifiedNameSource
+from libcst.metadata import FullRepoManager, PositionProvider, QualifiedNameSource
 
 from ._fqn import FixedFullyQualifiedNameProvider
 from ._graphstore import SymbolGraph
@@ -16,18 +16,20 @@ from .graph import NodeFlags, SymbolNode
 class RemoveDeadSymbols(cst.CSTTransformer):
     METADATA_DEPENDENCIES = (FixedFullyQualifiedNameProvider, PositionProvider)
 
-    def __init__(self, dead_decls: set[tuple[str, CodeRange]]):
-        # ``(fqname, position)`` pairs. The position disambiguates same-name
-        # decls so a shadowed dead binding does not drag its live sibling
-        # out with it (and vice versa).
+    def __init__(self, dead_decls: set[tuple[str, int]]):
+        # ``(fqname, start_line)`` pairs. The line number disambiguates
+        # same-name decls so a shadowed dead binding does not drag its
+        # live sibling out with it (and vice versa).
         self.dead_decls = dead_decls
-        self._dead_positions = {pos for _, pos in dead_decls}
+        self._dead_lines = {line for _, line in dead_decls}
 
     def _should_remove(self, node: cst.CSTNode) -> bool:
         fqnames = self.get_metadata(FixedFullyQualifiedNameProvider, node, default=[])
         pos = self.get_metadata(PositionProvider, node, default=None)
+        if pos is None:
+            return False
         return any(
-            (qn.name, pos) in self.dead_decls
+            (qn.name, pos.start.line) in self.dead_decls
             for qn in fqnames
             if qn.source == QualifiedNameSource.LOCAL
         )
@@ -60,12 +62,9 @@ class RemoveDeadSymbols(cst.CSTTransformer):
 
     def leave_TypeAlias(self, original_node: cst.TypeAlias, updated_node: cst.TypeAlias):
         # ``FixedFullyQualifiedNameProvider`` does not name-bind ``cst.TypeAlias``,
-        # so ``_should_remove``'s FQN-based lookup misses. Match on position alone:
-        # a top-level decl's ``Name`` position is unique within the file, and this
-        # method only fires on TypeAlias nodes, so cross-shape collisions are not
-        # possible.
+        # so ``_should_remove``'s FQN-based lookup misses. Match on line alone.
         pos = self.get_metadata(PositionProvider, original_node.name, default=None)
-        if pos in self._dead_positions:
+        if pos is not None and pos.start.line in self._dead_lines:
             return cst.RemoveFromParent()
         return updated_node
 
@@ -97,11 +96,7 @@ def _select_files(G: SymbolGraph, base: Path) -> tuple[dict[Path, list[SymbolNod
     ignored implicitly -- they don't appear in the type ``match``.
 
     ``NodeFlags.NOTEBOOK`` nodes are dropped: cell-aware writeback into
-    the notebook JSON envelope is not implemented today. Star-import
-    re-export synthetics (:data:`NodeFlags.STAR_REEXPORT`) are skipped
-    for a similar reason -- the importing file has a literal
-    ``from <target> import *`` line, not the per-name ``from <target>
-    import <decl>`` the import remover would chase.
+    the notebook JSON envelope is not implemented today.
     """
     by_file: dict[Path, list[SymbolNode]] = {}
     deleted_modules: list[Path] = []
@@ -110,7 +105,7 @@ def _select_files(G: SymbolGraph, base: Path) -> tuple[dict[Path, list[SymbolNod
             continue
         if not node.path.exists():
             continue
-        if node.flags & (NodeFlags.NOTEBOOK | NodeFlags.STAR_REEXPORT):
+        if node.flags & NodeFlags.NOTEBOOK:
             continue
         match node.type:
             case "function" | "class" | "variable" | "type_alias" | "import":
@@ -135,7 +130,7 @@ def _rewrite_one(wrapper, nodes: list[SymbolNode]) -> tuple[str, str]:
     Module passes through unchanged.
     """
     original = wrapper.module.code
-    dead_decls = {(n.fqname, n.position) for n in nodes if n.type != "import"}
+    dead_decls = {(n.fqname, n.position.start.line) for n in nodes if n.type != "import"}
     result = wrapper.visit(RemoveDeadSymbols(dead_decls))
 
     dead_imports = [n for n in nodes if n.type == "import"]

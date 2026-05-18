@@ -2,30 +2,22 @@
 
 from __future__ import annotations
 
-import contextlib
 import json
 import logging
 import re
 import sys
 from enum import Enum
 from pathlib import Path
-from typing import Annotated, Iterator, Mapping, Sequence
+from typing import Annotated, Sequence
 
 import typer
-from libcst.metadata import CodeRange
 
 from ._graphstore import SymbolGraph
 from .analyze import Analysis, _count_nodes_by_prefix, _entrypoint_seeds, _find_reachable
-from .cache import (
-    GraphCache,
-    clear_cache,
-    default_cache_path,
-)
 from .codemod import generate_patch
 from .graph import NodeFlags, SymbolNode
 from .plugins import (
     EXTERNAL_PREFIXES,
-    EdgePlugin,
     ExplicitEntrypointPlugin,
     ModuleDundersPlugin,
     load_plugin,
@@ -39,17 +31,7 @@ from .resolvers import (
 )
 
 
-app = typer.Typer(help="Dead code analysis for Python using libcst.")
-
-
-WorkersOption = Annotated[
-    int | None,
-    typer.Option(
-        "--workers",
-        "-j",
-        help="Run cache-miss visitor passes in this many worker processes (>=2 enables it).",
-    ),
-]
+app = typer.Typer(help="Dead code analysis for Python.")
 
 
 class OutputFormat(str, Enum):
@@ -73,7 +55,6 @@ def parse_entrypoint(ep: str) -> str | re.Pattern[str]:
 
 
 def _rel_path(path: Path, root: Path) -> Path:
-    """``path`` made relative to ``root`` if possible, else ``path`` unchanged."""
     try:
         return path.relative_to(root)
     except ValueError:
@@ -84,14 +65,9 @@ def build_plugins(
     *,
     entrypoints: list[str],
     plugin_names: list[str],
-) -> list[EdgePlugin]:
-    """Compose the plugin list from CLI flags.
-
-    Order: user-specified plugins first, then ``ModuleDundersPlugin``, then
-    ``ExplicitEntrypointPlugin`` with the ``-e`` specs. ``-e`` runs last so
-    it can hang entrypoints off any synthetic nodes contributed upstream.
-    """
-    plugins: list[EdgePlugin] = []
+) -> list[object]:
+    """Compose the plugin list from CLI flags."""
+    plugins: list[object] = []
     for name in plugin_names:
         plugins.append(load_plugin(name))
     plugins.append(ModuleDundersPlugin())
@@ -101,35 +77,7 @@ def build_plugins(
     return plugins
 
 
-@contextlib.contextmanager
-def _maybe_cache(
-    root: Path,
-    no_cache: bool,
-) -> Iterator[GraphCache | None]:
-    """Yield a per-run :class:`GraphCache`, or ``None`` when ``--no-cache`` is set.
-
-    The analysis fingerprint (computed inside :class:`Analysis`) gates
-    individual cache rows, so this just opens the database. A
-    schema-version mismatch on open wipes ``file_cache`` automatically.
-    The context manager closes the SQLite connection on exit, even
-    when the analysis raises.
-    """
-    if no_cache:
-        yield None
-        return
-    with GraphCache(default_cache_path(root)) as cache:
-        yield cache
-
-
 def build_resolver(path_specs: list[str], resolver_name: str | None) -> PathResolver:
-    """Pick the single resolver from ``-p`` specs or ``--resolver``.
-
-    The two flags are mutually exclusive: ``-p`` becomes a
-    :class:`ManualResolver`, ``--resolver`` loads a named resolver, and
-    passing both is a usage error. With neither flag supplied, falls
-    back to a :class:`ManualResolver` that treats the project root
-    itself as the only package.
-    """
     if path_specs and resolver_name is not None:
         raise typer.BadParameter("`-p`/`--path` and `--resolver` are mutually exclusive.")
     if resolver_name is not None:
@@ -154,7 +102,7 @@ def main(
         typer.Option("--version", callback=version_callback, is_eager=True, help="Show version."),
     ] = None,
 ) -> None:
-    """Dead code analysis for Python using libcst."""
+    """Dead code analysis for Python."""
 
 
 @app.command()
@@ -186,10 +134,6 @@ def analyze(
     output_format: Annotated[
         OutputFormat, typer.Option("--format", help="Output format.")
     ] = OutputFormat.text,
-    no_cache: Annotated[
-        bool, typer.Option("--no-cache", help="Bypass the per-file VisitorPayload cache.")
-    ] = False,
-    workers: WorkersOption = None,
 ) -> None:
     """Analyze a Python codebase for dead code."""
     setup_logging(verbose)
@@ -202,25 +146,17 @@ def analyze(
         entrypoints=entrypoint or [],
         plugin_names=plugin or [],
     )
-    with _maybe_cache(root, no_cache) as cache:
-        analysis = Analysis(
-            root,
-            resolver=path_resolver,
-            plugins=plugins,
-            cache=cache,
-            workers=workers,
-        )
-        graph = analysis.materialize_all()
+    analysis = Analysis(root, resolver=path_resolver, plugins=plugins)
+    graph = analysis.materialize_all()
     reachable = _find_reachable(graph, _entrypoint_seeds(graph))
 
     unreachable_graph = graph.subgraph([n for n in graph.nodes if n not in reachable])
 
     package_paths = [p.path for p in analysis.packages]
-    dead_suites = analysis.dead_suites()
     if output_format == OutputFormat.json:
-        _output_json(graph, unreachable_graph, root, package_paths, dead_suites)
+        _output_json(graph, unreachable_graph, root, package_paths)
     else:
-        _output_text(graph, unreachable_graph, root, package_paths, dead_suites)
+        _output_text(graph, unreachable_graph, root, package_paths)
 
     if len(unreachable_graph) > 0:
         raise typer.Exit(1)
@@ -231,7 +167,6 @@ def _output_text(
     unreachable: SymbolGraph,
     root: Path,
     package_paths: Sequence[Path],
-    dead_suites: Mapping[Path, tuple[CodeRange, ...]],
 ) -> None:
     total_by_path = _count_nodes_by_prefix(graph.nodes, package_paths)
     unreachable_by_path = _count_nodes_by_prefix(unreachable.nodes, package_paths)
@@ -240,10 +175,6 @@ def _output_text(
         total_counts = total_by_path[path]
         unreachable_counts = unreachable_by_path[path]
         for kind in sorted(total_counts):
-            # Synthetic nodes (entrypoint sentinels, external-dist markers,
-            # dunder-all stand-ins) don't represent user-visible
-            # declarations; reporting them alongside functions/classes
-            # would be misleading.
             if kind == "synthetic":
                 continue
             total = total_counts[kind]
@@ -259,43 +190,9 @@ def _output_text(
         for node in sorted(dead_real, key=lambda n: (str(n.path), n.fqname)):
             typer.echo(f"  {node.fqname} ({node.type}) at {_rel_path(node.path, root)}")
 
-    branches = _dead_suite_locations(dead_suites, package_paths)
-    if branches:
-        typer.echo(f"\nUnreachable branches ({len(branches)}):")
-        for path, pos in branches:
-            rel = _rel_path(path, root)
-            start = pos.start
-            end = pos.end
-            typer.echo(f"  {rel}:{start.line}:{start.column}-{end.line}:{end.column}")
-
 
 def _dead_real(unreachable: SymbolGraph) -> list[SymbolNode]:
-    """Return real (non-synthetic) dead nodes from ``unreachable``.
-
-    Synthetic nodes -- entrypoint sentinels, external-dist markers,
-    dunder-all stand-ins -- are excluded; they don't represent
-    user-visible declarations and would confuse the dead-code report.
-    """
     return [n for n in unreachable.nodes if n.type != "synthetic"]
-
-
-def _dead_suite_locations(
-    dead_suites: Mapping[Path, tuple[CodeRange, ...]], package_paths: Sequence[Path]
-) -> list[tuple[Path, CodeRange]]:
-    """Flatten :meth:`Analysis.dead_suites` into a sorted ``(path, pos)`` list.
-
-    Restricted to files under one of the analyzed packages' paths so
-    the report doesn't surface dead suites in workspace dependencies
-    that the user isn't asking about.
-    """
-    out: list[tuple[Path, CodeRange]] = []
-    for path, suites in dead_suites.items():
-        if not any(path.is_relative_to(p) for p in package_paths):
-            continue
-        for pos in suites:
-            out.append((path, pos))
-    out.sort(key=lambda entry: (str(entry[0]), entry[1].start.line, entry[1].start.column))
-    return out
 
 
 def _output_json(
@@ -303,12 +200,10 @@ def _output_json(
     unreachable: SymbolGraph,
     root: Path,
     package_paths: Sequence[Path],
-    dead_suites: Mapping[Path, tuple[CodeRange, ...]],
 ) -> None:
     result: dict = {
         "summary": {},
         "dead_symbols": [],
-        "unreachable_branches": [],
     }
 
     total_by_path = _count_nodes_by_prefix(graph.nodes, package_paths)
@@ -317,9 +212,6 @@ def _output_json(
         path_str = str(path)
         total_counts = total_by_path[path]
         unreachable_counts = unreachable_by_path[path]
-        # Same rationale as the text output: synthetic nodes are reported
-        # via ``unreachable_branches`` (and entrypoint sentinels), not as
-        # part of the per-kind summary.
         result["summary"][path_str] = {
             kind: {"total": total_counts[kind], "dead": unreachable_counts.get(kind, 0)}
             for kind in total_counts
@@ -332,15 +224,6 @@ def _output_json(
                 "fqname": node.fqname,
                 "type": node.type,
                 "path": str(_rel_path(node.path, root)),
-            }
-        )
-
-    for path, pos in _dead_suite_locations(dead_suites, package_paths):
-        result["unreachable_branches"].append(
-            {
-                "path": str(_rel_path(path, root)),
-                "start": {"line": pos.start.line, "column": pos.start.column},
-                "end": {"line": pos.end.line, "column": pos.end.column},
             }
         )
 
@@ -366,10 +249,6 @@ def why_alive(
     verbose: Annotated[
         bool, typer.Option("-v", "--verbose", help="Enable verbose output.")
     ] = False,
-    no_cache: Annotated[
-        bool, typer.Option("--no-cache", help="Bypass the per-file VisitorPayload cache.")
-    ] = False,
-    workers: WorkersOption = None,
 ) -> None:
     """Show why a symbol is considered alive (reachable)."""
     setup_logging(verbose)
@@ -382,14 +261,7 @@ def why_alive(
         entrypoints=[],
         plugin_names=plugin or [],
     )
-    with _maybe_cache(root, no_cache) as cache:
-        graph = Analysis(
-            root,
-            resolver=path_resolver,
-            plugins=plugins,
-            cache=cache,
-            workers=workers,
-        ).materialize_all()
+    graph = Analysis(root, resolver=path_resolver, plugins=plugins).materialize_all()
 
     target_node: SymbolNode | None = None
     for node in graph.nodes:
@@ -443,10 +315,6 @@ def dependencies(
     output_format: Annotated[
         OutputFormat, typer.Option("--format", help="Output format.")
     ] = OutputFormat.text,
-    no_cache: Annotated[
-        bool, typer.Option("--no-cache", help="Bypass the per-file VisitorPayload cache.")
-    ] = False,
-    workers: WorkersOption = None,
 ) -> None:
     """List third-party dependencies imported by the codebase."""
     setup_logging(verbose)
@@ -455,21 +323,23 @@ def dependencies(
     path_resolver = build_resolver(path or [], resolver)
 
     typer.echo(f"Building symbol graph for {root}...", err=True)
-    with _maybe_cache(root, no_cache) as cache:
-        analysis = Analysis(
-            root,
-            resolver=path_resolver,
-            cache=cache,
-            workers=workers,
-        )
-        graph = analysis.materialize_all()
+    analysis = Analysis(root, resolver=path_resolver)
+    graph = analysis.materialize_all()
 
     deps_by_package: dict[Path, list[SymbolNode]] = {p.path: [] for p in analysis.packages}
     for node in graph.nodes:
         if not _is_external_dep(node):
             continue
-        if node.path in deps_by_package:
-            deps_by_package[node.path].append(node)
+        # Synthetic dep nodes carry an empty path. Attribute them to
+        # each package that imports them by walking back through the
+        # graph's predecessor edges.
+        importer_paths: set[Path] = set()
+        for j in graph.raw.predecessor_indices(graph.index(node)):
+            importer_paths.add(graph.node(j).path)
+        for pkg_path in deps_by_package:
+            if any(p.is_relative_to(pkg_path) for p in importer_paths):
+                if node not in deps_by_package[pkg_path]:
+                    deps_by_package[pkg_path].append(node)
 
     if output_format == OutputFormat.json:
         result = {
@@ -514,10 +384,6 @@ def unused_exports(
     verbose: Annotated[
         bool, typer.Option("-v", "--verbose", help="Enable verbose output.")
     ] = False,
-    no_cache: Annotated[
-        bool, typer.Option("--no-cache", help="Bypass the per-file VisitorPayload cache.")
-    ] = False,
-    workers: WorkersOption = None,
 ) -> None:
     """Report __all__ entries whose targets are only alive because of __all__."""
     setup_logging(verbose)
@@ -530,20 +396,9 @@ def unused_exports(
         entrypoints=entrypoint or [],
         plugin_names=plugin or [],
     )
-    with _maybe_cache(root, no_cache) as cache:
-        graph = Analysis(
-            root,
-            resolver=path_resolver,
-            plugins=plugins,
-            cache=cache,
-            workers=workers,
-        ).materialize_all()
+    graph = Analysis(root, resolver=path_resolver, plugins=plugins).materialize_all()
     reachable = _find_reachable(graph, _entrypoint_seeds(graph))
 
-    # ModuleDundersPlugin keeps each ``__all__`` alive via a synthetic
-    # entrypoint node ``<dunder>:<fqname>``. Re-run reachability while
-    # skipping edges from such synthetics into ``__all__`` variables;
-    # whatever drops out was alive only because of __all__.
     def _is_dunder_seed(node: SymbolNode) -> bool:
         return node.type == "synthetic" and node.fqname.startswith(DUNDER_PREFIX)
 
@@ -615,22 +470,8 @@ def remove(
             help="Write patch to this file instead of stdout.",
         ),
     ] = None,
-    no_cache: Annotated[
-        bool, typer.Option("--no-cache", help="Bypass the per-file VisitorPayload cache.")
-    ] = False,
-    workers: WorkersOption = None,
 ) -> None:
-    """Emit a unified diff that removes dead code; pipe to ``git apply``.
-
-    Writes the patch to stdout (or to ``--output``) without touching any
-    source files. Apply with::
-
-        dead-cst remove . | git apply
-
-    or, with an explicit output path::
-
-        dead-cst remove . -o dead.patch && git apply dead.patch
-    """
+    """Emit a unified diff that removes dead code; pipe to ``git apply``."""
     setup_logging(verbose)
     root = root.resolve()
 
@@ -641,15 +482,8 @@ def remove(
         entrypoints=entrypoint or [],
         plugin_names=plugin or [],
     )
-    with _maybe_cache(root, no_cache) as cache:
-        analysis = Analysis(
-            root,
-            resolver=path_resolver,
-            plugins=plugins,
-            cache=cache,
-            workers=workers,
-        )
-        graph = analysis.materialize_all()
+    analysis = Analysis(root, resolver=path_resolver, plugins=plugins)
+    graph = analysis.materialize_all()
     reachable = _find_reachable(graph, _entrypoint_seeds(graph))
 
     unreachable_graph = graph.subgraph([n for n in graph.nodes if n not in reachable])
@@ -666,26 +500,6 @@ def remove(
     else:
         sys.stdout.write(patch)
         typer.echo("Apply with: dead-cst remove ... | git apply", err=True)
-
-
-cache_app = typer.Typer(help="Manage the on-disk analysis cache.")
-app.add_typer(cache_app, name="cache")
-
-
-@cache_app.command("clear")
-def cache_clear(
-    root: Annotated[
-        Path,
-        typer.Argument(help="Project root whose .dead-cst-cache directory should be removed."),
-    ] = Path("."),
-) -> None:
-    """Delete the cached :class:`VisitorPayload` database for ``root``."""
-    db = default_cache_path(root.resolve())
-    removed = clear_cache(db)
-    if removed:
-        typer.echo(f"Removed {db}.")
-    else:
-        typer.echo(f"No cache found at {db}.")
 
 
 def main_cli() -> None:
