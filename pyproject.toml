@@ -1,6 +1,6 @@
 [project]
 name = "dead-cst"
-version = "0.10.0"
+dynamic = ["version"]
 description = "Python dead code analysis backed by a Rust extension (ty + ruff)"
 readme = "README.md"
 license = "MIT"

@@ -671,7 +671,6 @@ wheels = [
 
 [[package]]
 name = "dead-cst"
-version = "0.10.0"
 source = { editable = "." }
 dependencies = [
     { name = "libcst" },
