@@ -51,7 +51,7 @@ class UnittestPlugin:
             if simple in _MODULE_HOOKS:
                 decls_by_path.setdefault(node.path, []).append(node)
 
-        flags = int(NodeFlags.ENTRYPOINT | NodeFlags.TESTCASE)
+        flags = int(NodeFlags.TESTCASE)
         for path, decls in decls_by_path.items():
             module = ctx.module_for(path)
             if module is None:

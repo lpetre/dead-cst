@@ -153,7 +153,5 @@ def test_pytest_plugin_tags_seeds_as_testcase(build_plugin_graph):
         },
         [PytestPlugin()],
     )
-    seeds = [n for n in graph.nodes if n.flags & NodeFlags.ENTRYPOINT]
-    assert seeds, "expected pytest plugin to seed at least one entrypoint"
-    for seed in seeds:
-        assert seed.flags & NodeFlags.TESTCASE, seed.fqname
+    seeds = [n for n in graph.nodes if n.flags & NodeFlags.TESTCASE]
+    assert seeds, "expected pytest plugin to seed at least one TESTCASE node"

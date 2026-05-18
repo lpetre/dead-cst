@@ -11,15 +11,16 @@ from __future__ import annotations
 
 from dead_cst import NodeFlags
 from dead_cst.analyze import (
-    _entrypoint_seeds,
     _find_kept_alive_by_flags_only,
     _find_reachable as find_reachable,
+    _keepalive_seeds,
 )
+from dead_cst.graph import KEEPALIVE_DEFAULT
 from dead_cst.plugins import PytestPlugin, UnittestPlugin
 
 
 def find_reachable_excluding_tests(graph):
-    return find_reachable(graph, _entrypoint_seeds(graph, NodeFlags.TESTCASE))
+    return find_reachable(graph, _keepalive_seeds(graph, KEEPALIVE_DEFAULT & ~NodeFlags.TESTCASE))
 
 
 def find_kept_alive_by_tests_only(graph):
@@ -45,7 +46,7 @@ def test_test_only_helper_is_kept_alive_by_tests(make_analysis, write_files):
     )
     graph = make_analysis(plugins=[PytestPlugin()]).materialize_all()
     helper = next(n for n in graph.nodes if n.fqname == "pkg.lib.helper")
-    assert helper in find_reachable(graph, _entrypoint_seeds(graph))
+    assert helper in find_reachable(graph, _keepalive_seeds(graph, KEEPALIVE_DEFAULT))
     assert helper not in find_reachable_excluding_tests(graph)
     assert helper in find_kept_alive_by_tests_only(graph)
 
@@ -95,7 +96,7 @@ def test_unittest_kept_alive_by_tests(make_analysis, write_files):
     )
     graph = make_analysis(plugins=[UnittestPlugin()]).materialize_all()
     helper = next(n for n in graph.nodes if n.fqname == "pkg.lib.helper")
-    assert helper in find_reachable(graph, _entrypoint_seeds(graph))
+    assert helper in find_reachable(graph, _keepalive_seeds(graph, KEEPALIVE_DEFAULT))
     assert helper in find_kept_alive_by_tests_only(graph)
 
 

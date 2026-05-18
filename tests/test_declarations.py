@@ -1740,27 +1740,24 @@ def test_stub_only_decl_flagged_entrypoint_rust(build_decl_graph):
     )
 
 
-def test_notebook_decls_carry_notebook_and_entrypoint_flags(write_notebook, build_decl_graph):
-    """Every node minted from an ``.ipynb`` carries both
-    ``NodeFlags.NOTEBOOK`` and ``NodeFlags.ENTRYPOINT``:
+def test_notebook_decls_carry_notebook_flag(write_notebook, build_decl_graph):
+    """Every node minted from an ``.ipynb`` carries ``NodeFlags.NOTEBOOK``.
 
-    * ``ENTRYPOINT`` keeps the cells alive (notebooks are executed
-      top-to-bottom, not imported).
-    * ``NOTEBOOK`` tells the codemod to skip these nodes — it can't
-      rewrite cell JSON envelopes safely.
+    ``NOTEBOOK`` does two jobs:
 
-    The libcst pipeline ORs the flags via ``default_flags`` in
-    ``_refresh._process_one_file``; the rust path mirrors that via
-    ``file_default_flags`` consulted by every per-file node mint.
+    * It's a keepalive bit in :data:`KEEPALIVE_DEFAULT` so cells stay
+      alive (notebooks are executed top-to-bottom, not imported).
+    * It tells the codemod to skip these nodes — it can't rewrite cell
+      JSON envelopes safely.
     """
     from dead_cst.graph import NodeFlags
 
     write_notebook("analysis.ipynb", ["def helper():\n    return 42", "helper()"])
     graph = build_decl_graph({})
 
-    required = NodeFlags.NOTEBOOK | NodeFlags.ENTRYPOINT
     notebook_nodes = [n for n in graph.raw.nodes() if str(n.path).endswith(".ipynb")]
     assert notebook_nodes, "expected at least one decl minted from the .ipynb file"
     for n in notebook_nodes:
-        missing = required & ~NodeFlags(int(n.flags))
-        assert not missing, f"{n.fqname!r} missing flags: {missing!r}"
+        assert NodeFlags(int(n.flags)) & NodeFlags.NOTEBOOK, (
+            f"{n.fqname!r} missing NOTEBOOK flag (got {NodeFlags(int(n.flags))!r})"
+        )

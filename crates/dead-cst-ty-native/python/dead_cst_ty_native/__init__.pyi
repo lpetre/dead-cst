@@ -45,8 +45,11 @@ class NodeFlags:
     live binding."""
 
     ENTRYPOINT: int
-    """Reachability seed. BFS for "what's live" starts from every node
-    carrying this bit."""
+    """Explicit entrypoint — plugin-emitted seeds, the CLI's ``-e`` flag,
+    ``[project.scripts]`` targets, factory-app synthetics, etc. One of
+    the keepalive bits ORed into ``KEEPALIVE_DEFAULT`` on the Python
+    side, so reachability seeds from ``ENTRYPOINT``-flagged nodes by
+    default."""
 
     OVERLOAD: int
     """``typing.overload`` stub (or any same-name decl anchored to a
@@ -54,22 +57,24 @@ class NodeFlags:
     kept alive by an explicit ``impl -> overload`` edge."""
 
     TESTCASE: int
-    """Tags an entrypoint as test-only (pytest / unittest fixtures and
-    test methods). Layered on top of ``ENTRYPOINT`` so the
-    ``kept_alive_by_flags_only(TESTCASE)`` blast-radius query can ask
-    "what's only alive because of tests"."""
+    """Pytest / unittest test discoveries. One of the keepalive bits in
+    ``KEEPALIVE_DEFAULT``, so tests are alive by default. The
+    ``kept_alive_by_flags_only(TESTCASE)`` blast-radius query isolates
+    "what's only alive because of tests" by computing the diff against
+    ``reachable(seed_flags=KEEPALIVE_DEFAULT & ~TESTCASE)``."""
 
     NOQA: int
-    """Tags an entrypoint as preserved by an explicit user noqa
-    directive (bare ``# noqa``, ``# noqa: F401``, multi-rule
-    ``# noqa: E501, F401``, or the file-level ``# ruff: noqa`` /
-    ``# flake8: noqa``)."""
+    """Import alias preserved by a user noqa directive (bare
+    ``# noqa``, ``# noqa: F401``, multi-rule ``# noqa: E501, F401``, or
+    the file-level ``# ruff: noqa`` / ``# flake8: noqa``). One of the
+    keepalive bits in ``KEEPALIVE_DEFAULT``."""
 
     NOTEBOOK: int
-    """Every node sourced from a Jupyter ``.ipynb`` file. Combined with
-    ``ENTRYPOINT`` because cells run top-to-bottom rather than being
-    imported, and the codemod skips notebook nodes (it can't rewrite
-    the cell JSON envelope)."""
+    """Every node sourced from a Jupyter ``.ipynb`` file. Cells run
+    top-to-bottom rather than being imported, so the bit alone keeps
+    the node alive (no ``ENTRYPOINT`` overlay needed — ``NOTEBOOK`` is
+    in ``KEEPALIVE_DEFAULT``). The codemod also reads the bit to skip
+    notebook nodes (it can't rewrite the cell JSON envelope)."""
 
     EXPORTED: int
     """Every node sourced from a file under the package's ``exported``
