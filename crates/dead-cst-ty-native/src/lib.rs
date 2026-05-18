@@ -860,6 +860,52 @@ fn _path_re_matches(re: &Option<regex::Regex>, db: &ProjectDatabase, file: File)
     }
 }
 
+/// Cheap text prefilter for identifier references before AST/semantic
+/// validation. Mirrors `ty_ide::references::contains_identifier`
+/// (vendor/ruff/crates/ty_ide/src/references.rs:198) so per-file
+/// queries can skip the parse + walk when the file source doesn't
+/// even mention the target identifier.
+///
+/// Matches an ASCII approximation of `\b<name>\b`: every occurrence
+/// of `needle` in `source` whose surrounding bytes aren't identifier
+/// continuations. Used by every decorator / construction / call /
+/// method query that walks ``project_files``; saves the parse on the
+/// (typically large) majority of files that don't reference the
+/// query's target name at all.
+fn _contains_identifier(source: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let bytes = source.as_bytes();
+    let needle_bytes = needle.as_bytes();
+    let mut start = 0;
+    while let Some(rel) = source[start..].find(needle) {
+        let pos = start + rel;
+        let after = pos + needle_bytes.len();
+        let boundary_before = pos == 0 || !_is_ident_continue(bytes[pos - 1]);
+        let boundary_after = bytes
+            .get(after)
+            .is_none_or(|byte| !_is_ident_continue(*byte));
+        if boundary_before && boundary_after {
+            return true;
+        }
+        start = pos + 1;
+    }
+    false
+}
+
+fn _is_ident_continue(byte: u8) -> bool {
+    byte == b'_' || byte.is_ascii_alphanumeric()
+}
+
+/// Multi-needle variant of [`_contains_identifier`]: returns ``true``
+/// as soon as any one of ``needles`` is found. Used by queries that
+/// take a list of names (decorator name set, ctor name set, …) so the
+/// per-file prefilter passes when the file mentions any of them.
+fn _contains_any_identifier(source: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|n| _contains_identifier(source, n))
+}
+
 fn _to_iter(py: Python<'_>, items: Vec<Py<impl PyClass>>) -> PyResult<PyObject> {
     let list = pyo3::types::PyList::new_bound(py, items);
     let iter_obj = list.call_method0("__iter__")?;
@@ -1787,6 +1833,13 @@ impl ProjectContext {
             .ok_or_else(|| not_materialized("find_main_blocks"))?;
         let mut out: Vec<MainBlock> = Vec::new();
         for (&file, &module_idx) in &outputs.module_nodes_by_file {
+            // Prefilter: ``if __name__ == "__main__":`` always has the
+            // literal string ``__main__`` in source. Skip the parse
+            // for files that don't even mention it.
+            let source = source_text(&self.db, file);
+            if !source.contains("__main__") {
+                continue;
+            }
             let parsed = parsed_module(&self.db, file).load(&self.db);
             let Some(block_range) = find_main_block_range(&parsed) else {
                 continue;
@@ -1837,9 +1890,20 @@ impl ProjectContext {
             .ok_or_else(|| not_materialized("find_decorated_decls"))?;
         let path_re = _compile_path_regex(path_regex)?;
         let names: HashSet<&str> = decorator_names.iter().map(String::as_str).collect();
+        let needle_strs: Vec<&str> = decorator_names.iter().map(String::as_str).collect();
         let mut out = Vec::new();
         for &file in &outputs.project_files {
             if !_path_re_matches(&path_re, &self.db, file) {
+                continue;
+            }
+            // Text prefilter: if the file source doesn't even mention
+            // any of the decorator names, the parse + import-map walk
+            // can't possibly find a match. Mirrors the LSP's
+            // find_references prefilter and cuts cold-run work by a
+            // big factor (most files don't mention any one plugin's
+            // decorators).
+            let source = source_text(&self.db, file);
+            if !_contains_any_identifier(&source, &needle_strs) {
                 continue;
             }
             let parsed = parsed_module(&self.db, file).load(&self.db);
@@ -1894,9 +1958,14 @@ impl ProjectContext {
             .ok_or_else(|| not_materialized("find_instance_constructions"))?;
         let path_re = _compile_path_regex(path_regex)?;
         let allowed: HashSet<&str> = ctor_names.iter().map(String::as_str).collect();
+        let needle_strs: Vec<&str> = ctor_names.iter().map(String::as_str).collect();
         let mut out = Vec::new();
         for &file in &outputs.project_files {
             if !_path_re_matches(&path_re, &self.db, file) {
+                continue;
+            }
+            let source = source_text(&self.db, file);
+            if !_contains_any_identifier(&source, &needle_strs) {
                 continue;
             }
             let parsed = parsed_module(&self.db, file).load(&self.db);
@@ -1943,9 +2012,14 @@ impl ProjectContext {
             .ok_or_else(|| not_materialized("find_handler_decorators"))?;
         let path_re = _compile_path_regex(path_regex)?;
         let attrs: HashSet<&str> = decorator_attrs.iter().map(String::as_str).collect();
+        let needle_strs: Vec<&str> = decorator_attrs.iter().map(String::as_str).collect();
         let mut out = Vec::new();
         for &file in &outputs.project_files {
             if !_path_re_matches(&path_re, &self.db, file) {
+                continue;
+            }
+            let source = source_text(&self.db, file);
+            if !_contains_any_identifier(&source, &needle_strs) {
                 continue;
             }
             let parsed = parsed_module(&self.db, file).load(&self.db);
@@ -2005,6 +2079,13 @@ impl ProjectContext {
         let mut out = Vec::new();
         for &file in &outputs.project_files {
             if !_path_re_matches(&path_re, &self.db, file) {
+                continue;
+            }
+            // ``via_attr`` is the more selective needle ("tree" for
+            // discord.py slash commands) than the attr set; require it
+            // in source before parsing.
+            let source = source_text(&self.db, file);
+            if !_contains_identifier(&source, via_attr) {
                 continue;
             }
             let parsed = parsed_module(&self.db, file).load(&self.db);
@@ -2078,6 +2159,10 @@ impl ProjectContext {
             if !_path_re_matches(&path_re, &self.db, file) {
                 continue;
             }
+            let source = source_text(&self.db, file);
+            if !_contains_identifier(&source, attr) {
+                continue;
+            }
             let parsed = parsed_module(&self.db, file).load(&self.db);
             for stmt in &parsed.syntax().body {
                 let Some(owner_idx) = owner_idx_for_stmt(outputs, file, stmt) else {
@@ -2116,8 +2201,13 @@ impl ProjectContext {
             .as_ref()
             .ok_or_else(|| not_materialized("find_factory_decls"))?;
         let allowed: HashSet<&str> = ctor_names.iter().map(String::as_str).collect();
+        let needle_strs: Vec<&str> = ctor_names.iter().map(String::as_str).collect();
         let mut out = Vec::new();
         for &file in &outputs.project_files {
+            let source = source_text(&self.db, file);
+            if !_contains_any_identifier(&source, &needle_strs) {
+                continue;
+            }
             let parsed = parsed_module(&self.db, file).load(&self.db);
             let imports = collect_module_imports_local(&parsed, module, &allowed);
             if imports.is_empty() {
@@ -2180,6 +2270,10 @@ impl ProjectContext {
             if !_path_re_matches(&path_re, &self.db, file) {
                 continue;
             }
+            let source = source_text(&self.db, file);
+            if !_contains_identifier(&source, name) {
+                continue;
+            }
             let parsed = parsed_module(&self.db, file).load(&self.db);
             let imports = collect_module_imports_local(&parsed, module, &allowed);
             if imports.is_empty() {
@@ -2237,6 +2331,13 @@ impl ProjectContext {
             if !_path_re_matches(&path_re, &self.db, file) {
                 continue;
             }
+            // ``owner`` is typically the more selective needle
+            // (e.g. ``mocker`` / ``monkeypatch`` show up in far fewer
+            // files than common method names like ``patch``).
+            let source = source_text(&self.db, file);
+            if !_contains_identifier(&source, owner) {
+                continue;
+            }
             let parsed = parsed_module(&self.db, file).load(&self.db);
             for stmt in &parsed.syntax().body {
                 let Some(owner_idx) = owner_idx_for_stmt(outputs, file, stmt) else {
@@ -2272,6 +2373,15 @@ impl ProjectContext {
             .ok_or_else(|| not_materialized("find_classes_defining_method"))?;
         let mut out = Vec::new();
         for &file in &outputs.project_files {
+            // Prefilter: if the file source doesn't even contain the
+            // method name as an identifier, no class in it can define
+            // a method by that name. Avoids the per-file
+            // ``semantic_index`` + use-def walk on files that can't
+            // contribute.
+            let source = source_text(&self.db, file);
+            if !_contains_identifier(&source, method_name) {
+                continue;
+            }
             let parsed = parsed_module(&self.db, file).load(&self.db);
             let index = semantic_index(&self.db, file);
             let global = FileScopeId::global();
