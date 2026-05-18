@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Iterable
 
 if TYPE_CHECKING:
-    import dead_cst_ty_native as native
+    from dead_cst import _native as native
 
 DUNDER_PREFIX = "<dunder>:"
 
@@ -25,7 +25,7 @@ class ModuleDundersPlugin:
     version: int = 1777760307
 
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
-        import dead_cst_ty_native as native
+        from dead_cst import _native as native
 
         for target in [*ctx.find_module_dunders(), *ctx.find_imports_of("__future__")]:
             yield native.AddEntrypoint(target, marker="<dunder>")

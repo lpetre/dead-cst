@@ -46,12 +46,12 @@ from dead_cst.plugins import BUILTIN_PLUGINS
 logging.getLogger("dead_cst").setLevel(logging.ERROR)
 
 try:
-    import dead_cst_ty_native as native
+    from dead_cst import _native as native
 except ImportError as exc:
     sys.exit(
-        f"ERROR: dead_cst_ty_native not importable ({exc}). "
+        f"ERROR: dead_cst._native not importable ({exc}). "
         "Build with: uv run maturin develop --release "
-        "--manifest-path crates/dead-cst-ty-native/Cargo.toml"
+        "--manifest-path native/Cargo.toml"
     )
 
 FLUX0_URL = "https://github.com/flux0-ai/flux0.git"

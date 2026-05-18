@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Iterable
 
 if TYPE_CHECKING:
-    import dead_cst_ty_native as native
+    from dead_cst import _native as native
 
 EXPLICIT_PREFIX = "<entrypoint>:"
 
@@ -32,7 +32,7 @@ class ExplicitEntrypointPlugin:
     version: int = 1777760307
 
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
-        import dead_cst_ty_native as native
+        from dead_cst import _native as native
 
         root = Path(ctx.project_root)
         for node in ctx.nodes():

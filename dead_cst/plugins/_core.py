@@ -1,7 +1,7 @@
 """Shared constants and helpers for edge plugins.
 
 Plugins implement :meth:`run(ctx)` against a
-:class:`dead_cst_ty_native.ProjectContext`. The rust backend invokes
+:class:`dead_cst._native.ProjectContext`. The rust backend invokes
 each plugin's ``run`` once after building the project's symbol graph,
 collecting the yielded ``GraphOp`` values and applying them to the
 in-progress graph.

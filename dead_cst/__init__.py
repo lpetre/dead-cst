@@ -1,7 +1,7 @@
 """Dead code analysis for Python.
 
 ``dead-cst`` builds a symbol-level reachability graph of a Python
-codebase via the rust-backed :mod:`dead_cst_ty_native` crate (which
+codebase via a rust-backed extension (:mod:`dead_cst._native`, which
 uses ty's ``SemanticIndex``) and reports (or removes) anything not
 reachable from a configurable set of entrypoints.
 
@@ -25,9 +25,15 @@ The deeper public surface lives in focused sub-packages:
 ``dead-cst`` is alpha; APIs, CLI flags, and output formats may change.
 """
 
-from ._version import __version__
+from importlib.metadata import PackageNotFoundError, version as _pkg_version
+
 from .analyze import Analysis, PackageView
 from .graph import EdgeFlags, Import, NodeFlags, SymbolNode
+
+try:
+    __version__: str = _pkg_version("dead-cst")
+except PackageNotFoundError:  # editable / source-tree fallback
+    __version__ = "0.0.0+unknown"
 
 __all__ = [
     "Analysis",

@@ -1,7 +1,7 @@
 """End-to-end tests for `Project.build()` in the ty-backed native crate.
 
 The crate is governed by the three principles in
-`crates/dead-cst-ty-native/CLAUDE.md`. These tests assert that the
+`native/CLAUDE.md`. These tests assert that the
 project-wide graph respects each one:
 
 * ty drives every piece of semantics (decl enumeration, module
@@ -18,11 +18,11 @@ from pathlib import Path
 
 import pytest
 
-native = pytest.importorskip("dead_cst_ty_native")
+native = pytest.importorskip("dead_cst._native")
 
 from dead_cst.graph import EdgeFlags, NodeFlags  # noqa: E402
 
-from dead_cst._native import _bridge as materialize  # noqa: E402
+from dead_cst._backend import _bridge as materialize  # noqa: E402
 
 
 @pytest.fixture

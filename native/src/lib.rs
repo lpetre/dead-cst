@@ -6578,7 +6578,8 @@ fn query(slf: Py<ProjectContext>, _py: Python<'_>) -> QueryBuilder {
 }
 
 #[pymodule]
-fn dead_cst_ty_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
+#[pyo3(name = "_native")]
+fn dead_cst_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Import>()?;
     m.add_class::<NativeNode>()?;
     m.add_class::<NativeGraph>()?;

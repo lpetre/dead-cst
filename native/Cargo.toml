@@ -1,0 +1,22 @@
+[package]
+name = "dead-cst-native"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "dead_cst_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py311"] }
+ty_project = { path = "../vendor/ruff/crates/ty_project" }
+ty_python_core = { path = "../vendor/ruff/crates/ty_python_core" }
+ty_python_semantic = { path = "../vendor/ruff/crates/ty_python_semantic" }
+ty_module_resolver = { path = "../vendor/ruff/crates/ty_module_resolver" }
+ruff_db = { path = "../vendor/ruff/crates/ruff_db", features = ["os"] }
+ruff_python_ast = { path = "../vendor/ruff/crates/ruff_python_ast" }
+ruff_python_parser = { path = "../vendor/ruff/crates/ruff_python_parser" }
+ruff_source_file = { path = "../vendor/ruff/crates/ruff_source_file" }
+ruff_text_size = { path = "../vendor/ruff/crates/ruff_text_size" }
+regex = "1"

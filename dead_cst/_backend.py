@@ -1,6 +1,6 @@
 """Native (rust) backend bridge.
 
-The rust crate (``dead_cst_ty_native``) builds the project graph
+The rust crate (``dead_cst._native``) builds the project graph
 end-to-end using ty's ``SemanticIndex`` instead of libcst's per-file
 visitor + cross-file edge stitcher. This module bridges the
 rust-shaped ``NativeGraph`` envelope back into the
@@ -26,7 +26,7 @@ from ._graphstore import SymbolGraph
 from .graph import EdgeFlags, Import, NodeFlags, SymbolNode
 
 if TYPE_CHECKING:
-    import dead_cst_ty_native as native
+    from dead_cst import _native as native
 
 # Most nodes carry no flags and most edges have flags=0; reusing the
 # zero singletons avoids ~5k IntFlag constructor calls per warm build
@@ -48,7 +48,7 @@ def materialize_project(
     into a :class:`SymbolGraph`. Plugins that don't implement the
     rust ``run(ctx)`` protocol are silently skipped.
     """
-    import dead_cst_ty_native as native
+    from dead_cst import _native as native
 
     kwargs = {}
     if src_roots:
