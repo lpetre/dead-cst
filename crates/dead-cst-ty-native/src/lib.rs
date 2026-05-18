@@ -60,7 +60,7 @@ use ty_python_core::program::UseDefaultStrategy;
 use ty_python_core::scope::FileScopeId;
 use ty_python_core::semantic_index;
 use ty_python_core::SemanticIndex;
-use ty_python_semantic::{type_hierarchy_subtypes, HasType, SemanticModel, TypeHierarchyClass};
+use ty_python_semantic::SemanticModel;
 
 // ---------------------------------------------------------------------------
 // Public Python data classes
@@ -853,7 +853,7 @@ fn _compile_path_regex(re_str: Option<&str>) -> PyResult<Option<regex::Regex>> {
 
 /// Per-file predicate-fusion check. ``true`` when the file should be
 /// processed (no regex, or regex matches its absolute path).
-fn _path_re_matches(re: &Option<regex::Regex>, db: &ProjectDatabase, file: File) -> bool {
+fn _path_re_matches(re: &Option<regex::Regex>, db: &dyn ProjectDb, file: File) -> bool {
     match re {
         None => true,
         Some(re) => re.is_match(&file_path_string(db, file)),
@@ -904,6 +904,51 @@ fn _is_ident_continue(byte: u8) -> bool {
 /// per-file prefilter passes when the file mentions any of them.
 fn _contains_any_identifier(source: &str, needles: &[&str]) -> bool {
     needles.iter().any(|n| _contains_identifier(source, n))
+}
+
+/// Generic parallel per-file walk. ``per_file`` runs on a Salsa
+/// snapshot of ``db`` (one ``Db::dyn_clone`` per worker, mirroring
+/// the ty_ide find_references pattern at
+/// ``vendor/ruff/crates/ty_ide/src/references.rs:107-130``) and
+/// returns a ``Vec<T>`` of opaque per-file results.
+///
+/// Caller is responsible for releasing the GIL with
+/// :meth:`pyo3::Python::allow_threads` — the closure passed in must
+/// be ``Send + Sync`` and ``T`` must be ``Send``. Materializing
+/// ``Py<NativeNode>`` values (which are GIL-bound) belongs in the
+/// caller AFTER ``allow_threads`` returns.
+fn par_scan_files<T, F>(
+    db: Box<dyn ProjectDb>,
+    files: &[File],
+    path_re: &Option<regex::Regex>,
+    per_file: F,
+) -> Vec<T>
+where
+    T: Send,
+    F: Fn(&dyn ProjectDb, File) -> Vec<T> + Send + Sync,
+{
+    let result = std::sync::Mutex::new(Vec::<T>::new());
+    let per_file_ref = &per_file;
+    let result_ref = &result;
+    // `move` captures `db: Box<dyn ProjectDb>` by value — `dyn Db`
+    // has a `Send` supertrait via `salsa::Database`, so the box is
+    // Send, but `&dyn Db` is NOT Send (the trait isn't Sync), which
+    // is why the box can't be borrowed across the rayon scope.
+    rayon::scope(move |s| {
+        for &file in files {
+            if !_path_re_matches(path_re, &*db, file) {
+                continue;
+            }
+            let db_t: Box<dyn ProjectDb> = ProjectDb::dyn_clone(&*db);
+            s.spawn(move |_| {
+                let local = per_file_ref(&*db_t, file);
+                if !local.is_empty() {
+                    result_ref.lock().unwrap().extend(local);
+                }
+            });
+        }
+    });
+    result.into_inner().unwrap_or_default()
 }
 
 fn _to_iter(py: Python<'_>, items: Vec<Py<impl PyClass>>) -> PyResult<PyObject> {
@@ -1891,43 +1936,49 @@ impl ProjectContext {
         let path_re = _compile_path_regex(path_regex)?;
         let names: HashSet<&str> = decorator_names.iter().map(String::as_str).collect();
         let needle_strs: Vec<&str> = decorator_names.iter().map(String::as_str).collect();
-        let mut out = Vec::new();
-        for &file in &outputs.project_files {
-            if !_path_re_matches(&path_re, &self.db, file) {
-                continue;
-            }
-            // Text prefilter: if the file source doesn't even mention
-            // any of the decorator names, the parse + import-map walk
-            // can't possibly find a match. Mirrors the LSP's
-            // find_references prefilter and cuts cold-run work by a
-            // big factor (most files don't mention any one plugin's
-            // decorators).
-            let source = source_text(&self.db, file);
-            if !_contains_any_identifier(&source, &needle_strs) {
-                continue;
-            }
-            let parsed = parsed_module(&self.db, file).load(&self.db);
-            // The file's import map for ``decorator_module`` — if it
-            // doesn't import anything from there, no decorator can
-            // match. Skips the body walk for the common case.
-            let imports = collect_module_imports_local(&parsed, decorator_module, &names);
-            if imports.is_empty() {
-                continue;
-            }
-            for stmt in &parsed.syntax().body {
-                let Stmt::FunctionDef(func) = stmt else {
-                    continue;
-                };
-                if !decorators_match_imports(&func.decorator_list, &imports, &names) {
-                    continue;
+        let decl_by_name_range = &outputs.decl_by_name_range;
+        let project_files = &outputs.project_files;
+        // Text prefilter inside the parallel walk mirrors the LSP's
+        // find_references — skip files that don't even mention any
+        // of the decorator names. The rayon::scope here parallelizes
+        // the per-file parse + walk across project files; we release
+        // the GIL for the duration and re-acquire only to materialize
+        // Py<NativeNode> handles from the collected indices.
+        let db_handle: Box<dyn ProjectDb> = ProjectDb::dyn_clone(&self.db);
+        let path_re_ref = &path_re;
+        let names_ref = &names;
+        let needles_ref: &[&str] = &needle_strs;
+        let indices: Vec<usize> = py.allow_threads(move || {
+            par_scan_files(db_handle, project_files, path_re_ref, |db, file| {
+                let source = source_text(db, file);
+                if !_contains_any_identifier(&source, needles_ref) {
+                    return Vec::new();
                 }
-                let key = (file, range_key(func.name.range()));
-                if let Some(&idx) = outputs.decl_by_name_range.get(&key) {
-                    out.push(outputs.builder.nodes[idx].clone_ref(py));
+                let parsed = parsed_module(db, file).load(db);
+                let imports = collect_module_imports_local(&parsed, decorator_module, names_ref);
+                if imports.is_empty() {
+                    return Vec::new();
                 }
-            }
-        }
-        Ok(out)
+                let mut local = Vec::new();
+                for stmt in &parsed.syntax().body {
+                    let Stmt::FunctionDef(func) = stmt else {
+                        continue;
+                    };
+                    if !decorators_match_imports(&func.decorator_list, &imports, names_ref) {
+                        continue;
+                    }
+                    let key = (file, range_key(func.name.range()));
+                    if let Some(&idx) = decl_by_name_range.get(&key) {
+                        local.push(idx);
+                    }
+                }
+                local
+            })
+        });
+        Ok(indices
+            .into_iter()
+            .map(|idx| outputs.builder.nodes[idx].clone_ref(py))
+            .collect())
     }
 
     /// Find top-level ``<var> = <Ctor>(...)`` constructions where
@@ -1959,34 +2010,45 @@ impl ProjectContext {
         let path_re = _compile_path_regex(path_regex)?;
         let allowed: HashSet<&str> = ctor_names.iter().map(String::as_str).collect();
         let needle_strs: Vec<&str> = ctor_names.iter().map(String::as_str).collect();
-        let mut out = Vec::new();
-        for &file in &outputs.project_files {
-            if !_path_re_matches(&path_re, &self.db, file) {
-                continue;
-            }
-            let source = source_text(&self.db, file);
-            if !_contains_any_identifier(&source, &needle_strs) {
-                continue;
-            }
-            let parsed = parsed_module(&self.db, file).load(&self.db);
-            let imports = collect_module_imports_local(&parsed, module, &allowed);
-            if imports.is_empty() {
-                continue;
-            }
-            for stmt in &parsed.syntax().body {
-                let (target_range, value) = match top_level_assign_to_name(stmt) {
-                    Some(pair) => pair,
-                    None => continue,
-                };
-                let Expr::Call(call) = value else { continue };
-                if let Some(matched) = matched_call_target(call, &imports, module, &allowed) {
-                    let key = (file, range_key(target_range));
-                    if let Some(&idx) = outputs.decl_by_name_range.get(&key) {
-                        out.push((outputs.builder.nodes[idx].clone_ref(py), matched));
+        let decl_by_name_range = &outputs.decl_by_name_range;
+        let project_files: &[File] = &outputs.project_files;
+        let db_handle: Box<dyn ProjectDb> = ProjectDb::dyn_clone(&self.db);
+        let path_re_ref = &path_re;
+        let allowed_ref = &allowed;
+        let needles_ref: &[&str] = &needle_strs;
+        let pairs: Vec<(usize, String)> = py.allow_threads(move || {
+            par_scan_files(db_handle, project_files, path_re_ref, |db, file| {
+                let source = source_text(db, file);
+                if !_contains_any_identifier(&source, needles_ref) {
+                    return Vec::new();
+                }
+                let parsed = parsed_module(db, file).load(db);
+                let imports = collect_module_imports_local(&parsed, module, allowed_ref);
+                if imports.is_empty() {
+                    return Vec::new();
+                }
+                let mut local: Vec<(usize, String)> = Vec::new();
+                for stmt in &parsed.syntax().body {
+                    let (target_range, value) = match top_level_assign_to_name(stmt) {
+                        Some(pair) => pair,
+                        None => continue,
+                    };
+                    let Expr::Call(call) = value else { continue };
+                    if let Some(matched) = matched_call_target(call, &imports, module, allowed_ref)
+                    {
+                        let key = (file, range_key(target_range));
+                        if let Some(&idx) = decl_by_name_range.get(&key) {
+                            local.push((idx, matched));
+                        }
                     }
                 }
-            }
-        }
+                local
+            })
+        });
+        let out: Vec<(Py<NativeNode>, String)> = pairs
+            .into_iter()
+            .map(|(idx, name)| (outputs.builder.nodes[idx].clone_ref(py), name))
+            .collect();
         Ok(out)
     }
 
@@ -2013,47 +2075,56 @@ impl ProjectContext {
         let path_re = _compile_path_regex(path_regex)?;
         let attrs: HashSet<&str> = decorator_attrs.iter().map(String::as_str).collect();
         let needle_strs: Vec<&str> = decorator_attrs.iter().map(String::as_str).collect();
-        let mut out = Vec::new();
-        for &file in &outputs.project_files {
-            if !_path_re_matches(&path_re, &self.db, file) {
-                continue;
-            }
-            let source = source_text(&self.db, file);
-            if !_contains_any_identifier(&source, &needle_strs) {
-                continue;
-            }
-            let parsed = parsed_module(&self.db, file).load(&self.db);
-            for stmt in &parsed.syntax().body {
-                let Stmt::FunctionDef(func) = stmt else {
-                    continue;
-                };
-                let mut seen_owners: HashSet<String> = HashSet::new();
-                for dec in &func.decorator_list {
-                    let mut expr = &dec.expression;
-                    if let Expr::Call(call) = expr {
-                        expr = &call.func;
-                    }
-                    let Expr::Attribute(attr) = expr else {
+        let decl_by_name_range = &outputs.decl_by_name_range;
+        let project_files: &[File] = &outputs.project_files;
+        let db_handle: Box<dyn ProjectDb> = ProjectDb::dyn_clone(&self.db);
+        let path_re_ref = &path_re;
+        let attrs_ref = &attrs;
+        let needles_ref: &[&str] = &needle_strs;
+        let pairs: Vec<(String, usize)> = py.allow_threads(move || {
+            par_scan_files(db_handle, project_files, path_re_ref, |db, file| {
+                let source = source_text(db, file);
+                if !_contains_any_identifier(&source, needles_ref) {
+                    return Vec::new();
+                }
+                let parsed = parsed_module(db, file).load(db);
+                let mut local: Vec<(String, usize)> = Vec::new();
+                for stmt in &parsed.syntax().body {
+                    let Stmt::FunctionDef(func) = stmt else {
                         continue;
                     };
-                    if !attrs.contains(attr.attr.as_str()) {
-                        continue;
-                    }
-                    let Expr::Name(owner) = attr.value.as_ref() else {
-                        continue;
-                    };
-                    let owner_name = owner.id.as_str().to_string();
-                    if !seen_owners.insert(owner_name.clone()) {
-                        continue;
-                    }
-                    let key = (file, range_key(func.name.range()));
-                    if let Some(&idx) = outputs.decl_by_name_range.get(&key) {
-                        out.push((owner_name, outputs.builder.nodes[idx].clone_ref(py)));
+                    let mut seen_owners: HashSet<String> = HashSet::new();
+                    for dec in &func.decorator_list {
+                        let mut expr = &dec.expression;
+                        if let Expr::Call(call) = expr {
+                            expr = &call.func;
+                        }
+                        let Expr::Attribute(attr) = expr else {
+                            continue;
+                        };
+                        if !attrs_ref.contains(attr.attr.as_str()) {
+                            continue;
+                        }
+                        let Expr::Name(owner) = attr.value.as_ref() else {
+                            continue;
+                        };
+                        let owner_name = owner.id.as_str().to_string();
+                        if !seen_owners.insert(owner_name.clone()) {
+                            continue;
+                        }
+                        let key = (file, range_key(func.name.range()));
+                        if let Some(&idx) = decl_by_name_range.get(&key) {
+                            local.push((owner_name, idx));
+                        }
                     }
                 }
-            }
-        }
-        Ok(out)
+                local
+            })
+        });
+        Ok(pairs
+            .into_iter()
+            .map(|(name, idx)| (name, outputs.builder.nodes[idx].clone_ref(py)))
+            .collect())
     }
 
     /// Like ``find_handler_decorators`` but matches the two-level form
@@ -2076,57 +2147,63 @@ impl ProjectContext {
             .ok_or_else(|| not_materialized("find_handler_decorators_via"))?;
         let path_re = _compile_path_regex(path_regex)?;
         let attrs: HashSet<&str> = decorator_attrs.iter().map(String::as_str).collect();
-        let mut out = Vec::new();
-        for &file in &outputs.project_files {
-            if !_path_re_matches(&path_re, &self.db, file) {
-                continue;
-            }
-            // ``via_attr`` is the more selective needle ("tree" for
-            // discord.py slash commands) than the attr set; require it
-            // in source before parsing.
-            let source = source_text(&self.db, file);
-            if !_contains_identifier(&source, via_attr) {
-                continue;
-            }
-            let parsed = parsed_module(&self.db, file).load(&self.db);
-            for stmt in &parsed.syntax().body {
-                let Stmt::FunctionDef(func) = stmt else {
-                    continue;
-                };
-                let mut seen_owners: HashSet<String> = HashSet::new();
-                for dec in &func.decorator_list {
-                    let mut expr = &dec.expression;
-                    if let Expr::Call(call) = expr {
-                        expr = &call.func;
-                    }
-                    // Match: Attribute(Attribute(Name(owner), via_attr), attr)
-                    let Expr::Attribute(outer) = expr else {
+        let decl_by_name_range = &outputs.decl_by_name_range;
+        let project_files: &[File] = &outputs.project_files;
+        let db_handle: Box<dyn ProjectDb> = ProjectDb::dyn_clone(&self.db);
+        let path_re_ref = &path_re;
+        let attrs_ref = &attrs;
+        let pairs: Vec<(String, usize)> = py.allow_threads(move || {
+            par_scan_files(db_handle, project_files, path_re_ref, |db, file| {
+                // ``via_attr`` is the more selective needle ("tree" for
+                // discord.py slash commands) than the attr set.
+                let source = source_text(db, file);
+                if !_contains_identifier(&source, via_attr) {
+                    return Vec::new();
+                }
+                let parsed = parsed_module(db, file).load(db);
+                let mut local: Vec<(String, usize)> = Vec::new();
+                for stmt in &parsed.syntax().body {
+                    let Stmt::FunctionDef(func) = stmt else {
                         continue;
                     };
-                    if !attrs.contains(outer.attr.as_str()) {
-                        continue;
-                    }
-                    let Expr::Attribute(middle) = outer.value.as_ref() else {
-                        continue;
-                    };
-                    if middle.attr.as_str() != via_attr {
-                        continue;
-                    }
-                    let Expr::Name(owner) = middle.value.as_ref() else {
-                        continue;
-                    };
-                    let owner_name = owner.id.as_str().to_string();
-                    if !seen_owners.insert(owner_name.clone()) {
-                        continue;
-                    }
-                    let key = (file, range_key(func.name.range()));
-                    if let Some(&idx) = outputs.decl_by_name_range.get(&key) {
-                        out.push((owner_name, outputs.builder.nodes[idx].clone_ref(py)));
+                    let mut seen_owners: HashSet<String> = HashSet::new();
+                    for dec in &func.decorator_list {
+                        let mut expr = &dec.expression;
+                        if let Expr::Call(call) = expr {
+                            expr = &call.func;
+                        }
+                        let Expr::Attribute(outer) = expr else {
+                            continue;
+                        };
+                        if !attrs_ref.contains(outer.attr.as_str()) {
+                            continue;
+                        }
+                        let Expr::Attribute(middle) = outer.value.as_ref() else {
+                            continue;
+                        };
+                        if middle.attr.as_str() != via_attr {
+                            continue;
+                        }
+                        let Expr::Name(owner) = middle.value.as_ref() else {
+                            continue;
+                        };
+                        let owner_name = owner.id.as_str().to_string();
+                        if !seen_owners.insert(owner_name.clone()) {
+                            continue;
+                        }
+                        let key = (file, range_key(func.name.range()));
+                        if let Some(&idx) = decl_by_name_range.get(&key) {
+                            local.push((owner_name, idx));
+                        }
                     }
                 }
-            }
-        }
-        Ok(out)
+                local
+            })
+        });
+        Ok(pairs
+            .into_iter()
+            .map(|(name, idx)| (name, outputs.builder.nodes[idx].clone_ref(py)))
+            .collect())
     }
 
     /// Find calls of the form ``<expr>.<attr>(...)`` regardless of
@@ -2154,32 +2231,45 @@ impl ProjectContext {
             .as_ref()
             .ok_or_else(|| not_materialized("find_calls_on_attr"))?;
         let path_re = _compile_path_regex(path_regex)?;
-        let mut out = Vec::new();
-        for &file in &outputs.project_files {
-            if !_path_re_matches(&path_re, &self.db, file) {
-                continue;
-            }
-            let source = source_text(&self.db, file);
-            if !_contains_identifier(&source, attr) {
-                continue;
-            }
-            let parsed = parsed_module(&self.db, file).load(&self.db);
-            for stmt in &parsed.syntax().body {
-                let Some(owner_idx) = owner_idx_for_stmt(outputs, file, stmt) else {
-                    continue;
-                };
-                let mut finder = AttrCallFinder {
-                    attr,
-                    arg_index,
-                    results: Vec::new(),
-                };
-                finder.visit_stmt(stmt);
-                for arg in finder.results {
-                    out.push((outputs.builder.nodes[owner_idx].clone_ref(py), arg));
+        let decl_by_name_range = &outputs.decl_by_name_range;
+        let module_nodes_by_file = &outputs.module_nodes_by_file;
+        let project_files: &[File] = &outputs.project_files;
+        let db_handle: Box<dyn ProjectDb> = ProjectDb::dyn_clone(&self.db);
+        let path_re_ref = &path_re;
+        let pairs: Vec<(usize, String)> = py.allow_threads(move || {
+            par_scan_files(db_handle, project_files, path_re_ref, |db, file| {
+                let source = source_text(db, file);
+                if !_contains_identifier(&source, attr) {
+                    return Vec::new();
                 }
-            }
-        }
-        Ok(out)
+                let parsed = parsed_module(db, file).load(db);
+                let mut local: Vec<(usize, String)> = Vec::new();
+                for stmt in &parsed.syntax().body {
+                    let Some(owner_idx) = owner_idx_for_stmt_with(
+                        decl_by_name_range,
+                        module_nodes_by_file,
+                        file,
+                        stmt,
+                    ) else {
+                        continue;
+                    };
+                    let mut finder = AttrCallFinder {
+                        attr,
+                        arg_index,
+                        results: Vec::new(),
+                    };
+                    finder.visit_stmt(stmt);
+                    for arg in finder.results {
+                        local.push((owner_idx, arg));
+                    }
+                }
+                local
+            })
+        });
+        Ok(pairs
+            .into_iter()
+            .map(|(idx, arg)| (outputs.builder.nodes[idx].clone_ref(py), arg))
+            .collect())
     }
 
     ///
@@ -2202,44 +2292,55 @@ impl ProjectContext {
             .ok_or_else(|| not_materialized("find_factory_decls"))?;
         let allowed: HashSet<&str> = ctor_names.iter().map(String::as_str).collect();
         let needle_strs: Vec<&str> = ctor_names.iter().map(String::as_str).collect();
-        let mut out = Vec::new();
-        for &file in &outputs.project_files {
-            let source = source_text(&self.db, file);
-            if !_contains_any_identifier(&source, &needle_strs) {
-                continue;
-            }
-            let parsed = parsed_module(&self.db, file).load(&self.db);
-            let imports = collect_module_imports_local(&parsed, module, &allowed);
-            if imports.is_empty() {
-                continue;
-            }
-            for stmt in &parsed.syntax().body {
-                let (name_range, body): (TextRange, &[Stmt]) = match stmt {
-                    Stmt::FunctionDef(f) => (f.name.range(), &f.body),
-                    Stmt::ClassDef(c) => (c.name.range(), &c.body),
-                    _ => continue,
-                };
-                let mut finder = FactoryCallFinder {
-                    imports: &imports,
-                    module,
-                    allowed: &allowed,
-                    kinds: HashSet::new(),
-                };
-                for inner in body {
-                    finder.visit_stmt(inner);
+        let decl_by_name_range = &outputs.decl_by_name_range;
+        let project_files: &[File] = &outputs.project_files;
+        let db_handle: Box<dyn ProjectDb> = ProjectDb::dyn_clone(&self.db);
+        let allowed_ref = &allowed;
+        let needles_ref: &[&str] = &needle_strs;
+        let pairs: Vec<(usize, Vec<String>)> = py.allow_threads(move || {
+            par_scan_files(db_handle, project_files, &None, |db, file| {
+                let source = source_text(db, file);
+                if !_contains_any_identifier(&source, needles_ref) {
+                    return Vec::new();
                 }
-                if finder.kinds.is_empty() {
-                    continue;
+                let parsed = parsed_module(db, file).load(db);
+                let imports = collect_module_imports_local(&parsed, module, allowed_ref);
+                if imports.is_empty() {
+                    return Vec::new();
                 }
-                let key = (file, range_key(name_range));
-                if let Some(&idx) = outputs.decl_by_name_range.get(&key) {
-                    let mut kinds_vec: Vec<String> = finder.kinds.into_iter().collect();
-                    kinds_vec.sort();
-                    out.push((outputs.builder.nodes[idx].clone_ref(py), kinds_vec));
+                let mut local: Vec<(usize, Vec<String>)> = Vec::new();
+                for stmt in &parsed.syntax().body {
+                    let (name_range, body): (TextRange, &[Stmt]) = match stmt {
+                        Stmt::FunctionDef(f) => (f.name.range(), &f.body),
+                        Stmt::ClassDef(c) => (c.name.range(), &c.body),
+                        _ => continue,
+                    };
+                    let mut finder = FactoryCallFinder {
+                        imports: &imports,
+                        module,
+                        allowed: allowed_ref,
+                        kinds: HashSet::new(),
+                    };
+                    for inner in body {
+                        finder.visit_stmt(inner);
+                    }
+                    if finder.kinds.is_empty() {
+                        continue;
+                    }
+                    let key = (file, range_key(name_range));
+                    if let Some(&idx) = decl_by_name_range.get(&key) {
+                        let mut kinds_vec: Vec<String> = finder.kinds.into_iter().collect();
+                        kinds_vec.sort();
+                        local.push((idx, kinds_vec));
+                    }
                 }
-            }
-        }
-        Ok(out)
+                local
+            })
+        });
+        Ok(pairs
+            .into_iter()
+            .map(|(idx, kinds)| (outputs.builder.nodes[idx].clone_ref(py), kinds))
+            .collect())
     }
 
     /// Find calls to a callable imported from ``module`` with the name
@@ -2265,38 +2366,52 @@ impl ProjectContext {
             .ok_or_else(|| not_materialized("find_calls_to_imported"))?;
         let path_re = _compile_path_regex(path_regex)?;
         let allowed: HashSet<&str> = [name].into_iter().collect();
-        let mut out = Vec::new();
-        for &file in &outputs.project_files {
-            if !_path_re_matches(&path_re, &self.db, file) {
-                continue;
-            }
-            let source = source_text(&self.db, file);
-            if !_contains_identifier(&source, name) {
-                continue;
-            }
-            let parsed = parsed_module(&self.db, file).load(&self.db);
-            let imports = collect_module_imports_local(&parsed, module, &allowed);
-            if imports.is_empty() {
-                continue;
-            }
-            for stmt in &parsed.syntax().body {
-                let Some(owner_idx) = owner_idx_for_stmt(outputs, file, stmt) else {
-                    continue;
-                };
-                let mut finder = StringArgCallFinder {
-                    predicate: |call: &ruff_python_ast::ExprCall| {
-                        matched_call_target(call, &imports, module, &allowed).is_some()
-                    },
-                    arg_index,
-                    results: Vec::new(),
-                };
-                finder.visit_stmt(stmt);
-                for arg in finder.results {
-                    out.push((outputs.builder.nodes[owner_idx].clone_ref(py), arg));
+        let decl_by_name_range = &outputs.decl_by_name_range;
+        let module_nodes_by_file = &outputs.module_nodes_by_file;
+        let project_files: &[File] = &outputs.project_files;
+        let db_handle: Box<dyn ProjectDb> = ProjectDb::dyn_clone(&self.db);
+        let path_re_ref = &path_re;
+        let allowed_ref = &allowed;
+        let pairs: Vec<(usize, String)> = py.allow_threads(move || {
+            par_scan_files(db_handle, project_files, path_re_ref, |db, file| {
+                let source = source_text(db, file);
+                if !_contains_identifier(&source, name) {
+                    return Vec::new();
                 }
-            }
-        }
-        Ok(out)
+                let parsed = parsed_module(db, file).load(db);
+                let imports = collect_module_imports_local(&parsed, module, allowed_ref);
+                if imports.is_empty() {
+                    return Vec::new();
+                }
+                let mut local: Vec<(usize, String)> = Vec::new();
+                for stmt in &parsed.syntax().body {
+                    let Some(owner_idx) = owner_idx_for_stmt_with(
+                        decl_by_name_range,
+                        module_nodes_by_file,
+                        file,
+                        stmt,
+                    ) else {
+                        continue;
+                    };
+                    let mut finder = StringArgCallFinder {
+                        predicate: |call: &ruff_python_ast::ExprCall| {
+                            matched_call_target(call, &imports, module, allowed_ref).is_some()
+                        },
+                        arg_index,
+                        results: Vec::new(),
+                    };
+                    finder.visit_stmt(stmt);
+                    for arg in finder.results {
+                        local.push((owner_idx, arg));
+                    }
+                }
+                local
+            })
+        });
+        Ok(pairs
+            .into_iter()
+            .map(|(idx, arg)| (outputs.builder.nodes[idx].clone_ref(py), arg))
+            .collect())
     }
 
     /// Find ``<owner>.<attr>(...)`` calls where ``owner`` is the textual
@@ -2326,37 +2441,50 @@ impl ProjectContext {
             .as_ref()
             .ok_or_else(|| not_materialized("find_calls_on_var"))?;
         let path_re = _compile_path_regex(path_regex)?;
-        let mut out = Vec::new();
-        for &file in &outputs.project_files {
-            if !_path_re_matches(&path_re, &self.db, file) {
-                continue;
-            }
-            // ``owner`` is typically the more selective needle
-            // (e.g. ``mocker`` / ``monkeypatch`` show up in far fewer
-            // files than common method names like ``patch``).
-            let source = source_text(&self.db, file);
-            if !_contains_identifier(&source, owner) {
-                continue;
-            }
-            let parsed = parsed_module(&self.db, file).load(&self.db);
-            for stmt in &parsed.syntax().body {
-                let Some(owner_idx) = owner_idx_for_stmt(outputs, file, stmt) else {
-                    continue;
-                };
-                let mut finder = StringArgCallFinder {
-                    predicate: |call: &ruff_python_ast::ExprCall| {
-                        call_callee_matches_var(call, owner, attr, required_positional)
-                    },
-                    arg_index,
-                    results: Vec::new(),
-                };
-                finder.visit_stmt(stmt);
-                for arg in finder.results {
-                    out.push((outputs.builder.nodes[owner_idx].clone_ref(py), arg));
+        let decl_by_name_range = &outputs.decl_by_name_range;
+        let module_nodes_by_file = &outputs.module_nodes_by_file;
+        let project_files: &[File] = &outputs.project_files;
+        let db_handle: Box<dyn ProjectDb> = ProjectDb::dyn_clone(&self.db);
+        let path_re_ref = &path_re;
+        let pairs: Vec<(usize, String)> = py.allow_threads(move || {
+            par_scan_files(db_handle, project_files, path_re_ref, |db, file| {
+                // ``owner`` is typically the more selective needle
+                // (e.g. ``mocker`` / ``monkeypatch`` show up in far
+                // fewer files than common method names like ``patch``).
+                let source = source_text(db, file);
+                if !_contains_identifier(&source, owner) {
+                    return Vec::new();
                 }
-            }
-        }
-        Ok(out)
+                let parsed = parsed_module(db, file).load(db);
+                let mut local: Vec<(usize, String)> = Vec::new();
+                for stmt in &parsed.syntax().body {
+                    let Some(owner_idx) = owner_idx_for_stmt_with(
+                        decl_by_name_range,
+                        module_nodes_by_file,
+                        file,
+                        stmt,
+                    ) else {
+                        continue;
+                    };
+                    let mut finder = StringArgCallFinder {
+                        predicate: |call: &ruff_python_ast::ExprCall| {
+                            call_callee_matches_var(call, owner, attr, required_positional)
+                        },
+                        arg_index,
+                        results: Vec::new(),
+                    };
+                    finder.visit_stmt(stmt);
+                    for arg in finder.results {
+                        local.push((owner_idx, arg));
+                    }
+                }
+                local
+            })
+        });
+        Ok(pairs
+            .into_iter()
+            .map(|(idx, arg)| (outputs.builder.nodes[idx].clone_ref(py), arg))
+            .collect())
     }
 
     /// Walks each class's `DefinitionKind::Class` body for an
@@ -2371,47 +2499,52 @@ impl ProjectContext {
         let outputs = outputs
             .as_ref()
             .ok_or_else(|| not_materialized("find_classes_defining_method"))?;
-        let mut out = Vec::new();
-        for &file in &outputs.project_files {
-            // Prefilter: if the file source doesn't even contain the
-            // method name as an identifier, no class in it can define
-            // a method by that name. Avoids the per-file
-            // ``semantic_index`` + use-def walk on files that can't
-            // contribute.
-            let source = source_text(&self.db, file);
-            if !_contains_identifier(&source, method_name) {
-                continue;
-            }
-            let parsed = parsed_module(&self.db, file).load(&self.db);
-            let index = semantic_index(&self.db, file);
-            let global = FileScopeId::global();
-            let use_def_map = index.use_def_map(global);
-            for (_def_id, state, _used) in use_def_map.all_definitions_with_usage() {
-                let DefinitionState::Defined(def) = state else {
-                    continue;
-                };
-                if def.file(&self.db) != file || def.file_scope(&self.db) != global {
-                    continue;
+        let global_index = &outputs.global_index;
+        let project_files: &[File] = &outputs.project_files;
+        let db_handle: Box<dyn ProjectDb> = ProjectDb::dyn_clone(&self.db);
+        let indices: Vec<usize> = py.allow_threads(move || {
+            par_scan_files(db_handle, project_files, &None, |db, file| {
+                // Prefilter: if the file source doesn't even contain
+                // the method name as an identifier, no class in it
+                // can define a method by that name. Avoids the
+                // per-file ``semantic_index`` + use-def walk on files
+                // that can't contribute.
+                let source = source_text(db, file);
+                if !_contains_identifier(&source, method_name) {
+                    return Vec::new();
                 }
-                let kind = def.kind(&self.db);
-                let Some(class_ref) = kind.as_class() else {
-                    continue;
-                };
-                let class_def = class_ref.node(&parsed);
-                if !class_body_defines_method(class_def, method_name) {
-                    continue;
+                let parsed = parsed_module(db, file).load(db);
+                let index = semantic_index(db, file);
+                let global = FileScopeId::global();
+                let use_def_map = index.use_def_map(global);
+                let mut local: Vec<usize> = Vec::new();
+                for (_def_id, state, _used) in use_def_map.all_definitions_with_usage() {
+                    let DefinitionState::Defined(def) = state else {
+                        continue;
+                    };
+                    if def.file(db) != file || def.file_scope(db) != global {
+                        continue;
+                    }
+                    let kind = def.kind(db);
+                    let Some(class_ref) = kind.as_class() else {
+                        continue;
+                    };
+                    let class_def = class_ref.node(&parsed);
+                    if !class_body_defines_method(class_def, method_name) {
+                        continue;
+                    }
+                    let key = (file, def.place(db), range_key(kind.target_range(&parsed)));
+                    if let Some(&idx) = global_index.get(&key) {
+                        local.push(idx);
+                    }
                 }
-                let key = (
-                    file,
-                    def.place(&self.db),
-                    range_key(kind.target_range(&parsed)),
-                );
-                if let Some(&idx) = outputs.global_index.get(&key) {
-                    out.push(outputs.builder.nodes[idx].clone_ref(py));
-                }
-            }
-        }
-        Ok(out)
+                local
+            })
+        });
+        Ok(indices
+            .into_iter()
+            .map(|idx| outputs.builder.nodes[idx].clone_ref(py))
+            .collect())
     }
 
     /// Return every transitive subclass of the given class node.
@@ -2432,8 +2565,6 @@ impl ProjectContext {
             .as_ref()
             .ok_or_else(|| not_materialized("find_subclasses_of"))?;
 
-        // Locate the seed class's File + name range, then ask ty for
-        // its inferred Type via the StmtClassDef at that range.
         let Some((seed_file, seed_range)) = locate_class_def(
             &self.db,
             &outputs.path_to_file,
@@ -2442,18 +2573,8 @@ impl ProjectContext {
         ) else {
             return Ok(Vec::new());
         };
-        let parsed_seed = parsed_module(&self.db, seed_file).load(&self.db);
-        let model_seed = SemanticModel::new(&self.db, seed_file);
-        let Some(seed_class) = class_def_at(&parsed_seed, seed_range) else {
-            return Ok(Vec::new());
-        };
-        let Some(seed_ty) = seed_class.inferred_type(&model_seed) else {
-            return Ok(Vec::new());
-        };
-
-        let frontier = type_hierarchy_subtypes(&self.db, seed_ty);
         let out_idx =
-            collect_subtype_indices(&self.db, frontier, true, &outputs.class_by_selection);
+            find_subclass_indices_via_refs(&self.db, outputs, seed_file, seed_range, true);
         Ok(out_idx
             .into_iter()
             .map(|idx| outputs.builder.nodes[idx].clone_ref(py))
@@ -2577,18 +2698,8 @@ impl ProjectContext {
         else {
             return Ok(Vec::new());
         };
-        let parsed_seed = parsed_module(&self.db, seed_file).load(&self.db);
-        let model_seed = SemanticModel::new(&self.db, seed_file);
-        let Some(seed_class) = class_def_at(&parsed_seed, seed_range) else {
-            return Ok(Vec::new());
-        };
-        let Some(seed_ty) = seed_class.inferred_type(&model_seed) else {
-            return Ok(Vec::new());
-        };
-
-        let frontier = type_hierarchy_subtypes(&self.db, seed_ty);
         let out_idx =
-            collect_subtype_indices(&self.db, frontier, transitive, &outputs.class_by_selection);
+            find_subclass_indices_via_refs(&self.db, outputs, seed_file, seed_range, transitive);
         Ok(out_idx
             .into_iter()
             .map(|idx| outputs.builder.nodes[idx].clone_ref(py))
@@ -2753,44 +2864,6 @@ fn node_key_of(node: &NativeNode) -> NodeKey {
 enum Direction {
     Forward,
     Reverse,
-}
-
-/// BFS over ty's class hierarchy starting from a seeded frontier of
-/// direct subtypes. Returns the project-graph node indices that match
-/// each visited class (via `class_by_selection`); classes outside the
-/// project are skipped. With `transitive = false`, only the seed
-/// frontier is consulted.
-fn collect_subtype_indices(
-    db: &ProjectDatabase,
-    initial_frontier: Vec<TypeHierarchyClass>,
-    transitive: bool,
-    class_by_selection: &HashMap<(File, (u32, u32)), usize>,
-) -> Vec<usize> {
-    let mut out_idx: Vec<usize> = Vec::new();
-    let mut seen: HashSet<(File, (u32, u32))> = HashSet::new();
-    let mut frontier = initial_frontier;
-    while let Some(thc) = frontier.pop() {
-        let file_key = (thc.file, range_key(thc.selection_range));
-        if !seen.insert(file_key) {
-            continue;
-        }
-        if let Some(&idx) = class_by_selection.get(&file_key) {
-            out_idx.push(idx);
-        }
-        if !transitive {
-            continue;
-        }
-        let parsed = parsed_module(db, thc.file).load(db);
-        let Some(class_def) = class_def_at(&parsed, thc.selection_range) else {
-            continue;
-        };
-        let model = SemanticModel::new(db, thc.file);
-        let Some(ty) = class_def.inferred_type(&model) else {
-            continue;
-        };
-        frontier.extend(type_hierarchy_subtypes(db, ty));
-    }
-    out_idx
 }
 
 /// Generic BFS over the build graph. ``skip_flags`` filters edges whose
@@ -3026,8 +3099,133 @@ fn locate_class_def(
 }
 
 /// Find a top-level `StmtClassDef` whose name range equals `selection_range`.
-fn class_def_at(parsed: &ParsedModuleRef, selection_range: TextRange) -> Option<&StmtClassDef> {
-    iter_top_level_classes(parsed).find(|cls| cls.name.range() == selection_range)
+/// Return the top-level ``StmtClassDef`` (if any) that uses
+/// ``ref_range`` as one of its direct base-list arguments.
+///
+/// Used by the find_references-based subclass walk: each
+/// :func:`ty_ide::find_references` hit gives us a ``(File, range)``
+/// for a use of the seed class; if that range falls inside a top-level
+/// class's ``arguments.args`` list, the surrounding class is a direct
+/// subclass.
+///
+/// Note: this is a syntactic match (range containment), so a use of
+/// ``TestCase`` inside a parameterized generic base
+/// (``class X(SomeGeneric[TestCase]):``) will falsely flag ``X`` as a
+/// subclass of ``TestCase``. ty's :func:`type_hierarchy_subtypes`
+/// avoids that via real type inference; we trade that accuracy for
+/// the prefilter+rayon scan ty_ide's find_references provides.
+fn class_base_arg_owner(parsed: &ParsedModuleRef, ref_range: TextRange) -> Option<&StmtClassDef> {
+    for stmt in &parsed.syntax().body {
+        let Stmt::ClassDef(class_def) = stmt else {
+            continue;
+        };
+        let Some(arguments) = &class_def.arguments else {
+            continue;
+        };
+        for arg in &arguments.args {
+            if arg.range().contains_range(ref_range) {
+                return Some(class_def);
+            }
+        }
+    }
+    None
+}
+
+/// If ``ref_range`` covers the "original name" of an aliased
+/// ``from M import Name as Alias`` (or ``import M as Alias``), return
+/// the alias's local-binding name range so the BFS can follow the
+/// re-binding to its uses.
+///
+/// ty_ide's :func:`find_references` is designed for IDE rename
+/// semantics: it does NOT follow aliased imports across the
+/// re-binding (renaming ``TestCase`` should not rename uses of
+/// ``TC`` from ``from unittest import TestCase as TC``). For our
+/// subclass walk we DO want the alias's uses — they're the
+/// subclasses we'd otherwise miss — so we seed the BFS with the
+/// alias's local name range and call find_references on that.
+fn aliased_import_local_name_range(
+    parsed: &ParsedModuleRef,
+    ref_range: TextRange,
+) -> Option<TextRange> {
+    for stmt in &parsed.syntax().body {
+        let aliases: &[ruff_python_ast::Alias] = match stmt {
+            Stmt::ImportFrom(import_from) => &import_from.names,
+            Stmt::Import(import) => &import.names,
+            _ => continue,
+        };
+        for alias in aliases {
+            let Some(asname) = &alias.asname else {
+                continue;
+            };
+            if alias.name.range() == ref_range {
+                return Some(asname.range());
+            }
+        }
+    }
+    None
+}
+
+/// Walk transitive subclasses of the seed class via
+/// :func:`ty_ide::find_references`, which carries an
+/// identifier-aware text prefilter and per-file rayon parallelism for
+/// free. Each find_references hit is filtered to "syntactically in a
+/// class base list"; matched classes seed the next round when
+/// ``transitive`` is set.
+///
+/// Returns ``Vec<usize>`` of indices into
+/// ``BuildOutputs::builder.nodes`` (only project classes — typeshed
+/// / external matches are dropped because they don't have a
+/// :attr:`class_by_selection` entry).
+fn find_subclass_indices_via_refs(
+    db: &ProjectDatabase,
+    outputs: &BuildOutputs,
+    seed_file: File,
+    seed_name_range: TextRange,
+    transitive: bool,
+) -> Vec<usize> {
+    let mut out_idx: HashSet<usize> = HashSet::new();
+    let mut visited_seeds: HashSet<(File, (u32, u32))> = HashSet::new();
+    let mut queue: Vec<(File, TextRange)> = vec![(seed_file, seed_name_range)];
+
+    while let Some((cur_file, cur_range)) = queue.pop() {
+        if !visited_seeds.insert((cur_file, range_key(cur_range))) {
+            continue;
+        }
+        // Cursor offset inside the identifier (start can sit on the
+        // token boundary and ty_ide's tokens.at_offset has edge-cases
+        // there). Anywhere inside the identifier resolves the same
+        // goto target.
+        let offset =
+            cur_range.start() + ruff_text_size::TextSize::from(u32::from(cur_range.len()) / 2);
+        // Pass include_declaration=true: skip-declaration mode filters
+        // out re-binding declarations like `from M import Name as Alias`
+        // alongside the seed itself. We need that import-line entry to
+        // detect the alias and recurse, so we take the full list and
+        // drop the seed in class_base_arg_owner / via the visited_seeds
+        // dedup.
+        let Some(refs) = ty_ide::find_references(db, cur_file, offset, true) else {
+            continue;
+        };
+        for r in refs {
+            let r_file = r.file();
+            let r_range = r.range();
+            let parsed = parsed_module(db, r_file).load(db);
+            if let Some(class_def) = class_base_arg_owner(&parsed, r_range) {
+                let class_name_range = class_def.name.range();
+                let key = (r_file, range_key(class_name_range));
+                let Some(&idx) = outputs.class_by_selection.get(&key) else {
+                    continue;
+                };
+                if out_idx.insert(idx) && transitive {
+                    queue.push((r_file, class_name_range));
+                }
+            } else if let Some(alias_range) = aliased_import_local_name_range(&parsed, r_range) {
+                queue.push((r_file, alias_range));
+            }
+        }
+    }
+
+    out_idx.into_iter().collect()
 }
 
 /// Find a top-level ``StmtClassDef`` by its bound name.
@@ -3329,15 +3527,24 @@ impl<'ast, 'a> Visitor<'ast> for FactoryCallFinder<'a> {
 /// Top-level ``FunctionDef`` / ``ClassDef`` own calls inside their
 /// subtree (decorators included via the walk); other top-level stmts
 /// attribute their calls to the module node.
-fn owner_idx_for_stmt(outputs: &BuildOutputs, file: File, stmt: &Stmt) -> Option<usize> {
-    let module_idx = outputs.module_nodes_by_file.get(&file).copied();
+/// Look up the owning decl index for a top-level statement. Takes
+/// the two hashmaps directly (rather than ``&BuildOutputs``) because
+/// ``BuildOutputs`` carries ``Vec<Py<NativeNode>>`` and is therefore
+/// ``!Sync`` — these maps are ``Sync`` on their own, which lets the
+/// callers borrow them across rayon thread boundaries.
+fn owner_idx_for_stmt_with(
+    decl_by_name_range: &HashMap<(File, (u32, u32)), usize>,
+    module_nodes_by_file: &HashMap<File, usize>,
+    file: File,
+    stmt: &Stmt,
+) -> Option<usize> {
+    let module_idx = module_nodes_by_file.get(&file).copied();
     let name_range = match stmt {
         Stmt::FunctionDef(f) => f.name.range(),
         Stmt::ClassDef(c) => c.name.range(),
         _ => return module_idx,
     };
-    outputs
-        .decl_by_name_range
+    decl_by_name_range
         .get(&(file, range_key(name_range)))
         .copied()
         .or(module_idx)
