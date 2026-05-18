@@ -1,7 +1,6 @@
 import json
 import logging
 import textwrap
-from pathlib import Path
 
 import pytest
 
@@ -96,8 +95,13 @@ def make_analysis(tmp_path):
     ``["."]`` so the most common single-base case is just
     ``make_analysis()``. Any extra keyword arguments flow straight
     through to :class:`Analysis` (``plugins``, ``cache``,
-    ``unreachable_detector``, ``workers``, or an explicit
+    ``unreachable_detector``, ``workers``, ``backend``, or an explicit
     ``resolver=...`` to bypass :class:`ManualResolver` entirely).
+    Defaults to the libcst backend so tests that exercise libcst-only
+    machinery (cache, parallel worker pool, unreachable detector,
+    codemod-position assumptions) keep using it; the ``--backend``-
+    aware ``build_decl_graph`` fixture is the entry point for tests
+    that care about cross-backend parity.
     """
 
     def _make(specs: list[str] | None = None, **kwargs) -> Analysis:
@@ -109,12 +113,12 @@ def make_analysis(tmp_path):
 
 
 @pytest.fixture
-def build_decl_graph(tmp_path, make_analysis, backend):
+def build_decl_graph(tmp_path, backend):
     """Build a SymbolGraph from inline ``{relpath: source}`` files.
 
-    Dispatches to the configured ``--backend``. ``libcst`` (default) runs
-    today's :class:`Analysis` pipeline; ``rust`` routes through the
-    ``dead_cst_ty_native`` prototype to surface its feature gaps.
+    Routes through :class:`Analysis(backend=...)`, dispatching to the
+    libcst or rust pipeline as the ``--backend`` pytest flag selects.
+    Both backends are exercised by the same test source.
     """
 
     def _make_graph(files: dict[str, str]) -> SymbolGraph:
@@ -122,29 +126,13 @@ def build_decl_graph(tmp_path, make_analysis, backend):
             full_path = tmp_path / filename
             full_path.parent.mkdir(parents=True, exist_ok=True)
             full_path.write_text(textwrap.dedent(content).strip())
-        if backend == "rust":
-            return _build_rust_graph(tmp_path)
-        return make_analysis().materialize_all()
+        return Analysis(
+            tmp_path,
+            resolver=ManualResolver(specs=["."]),
+            backend=backend,
+        ).materialize_all()
 
     return _make_graph
-
-
-def _build_rust_graph(root: Path) -> SymbolGraph:
-    """Build a SymbolGraph by routing the whole project through Rust.
-
-    Tests that hit this path are expected to fail wherever the rust
-    backend doesn't yet emit the edges / nodes the libcst visitor
-    would — that is the whole point of the abstraction.
-    """
-    pytest.importorskip(
-        "dead_cst_ty_native",
-        reason="Run `maturin develop --manifest-path crates/dead-cst-ty-native/Cargo.toml` "
-        "to build the prototype rust backend.",
-    )
-    from tests.prototype._bridge import materialize
-    import dead_cst_ty_native as native
-
-    return materialize(native.Project(str(root)).build())
 
 
 @pytest.fixture
