@@ -1204,10 +1204,10 @@ impl DecoratorQuery {
 
     /// Add a kwarg matcher. Multiple calls AND together.
     ///
-    /// ``value`` is either a Python literal (``None`` / ``bool`` /
-    /// ``int`` / ``float`` / ``str`` / ``list`` / ``tuple``) or a
-    /// :class:`NativeNode` (matched by ``fqname`` equality against the
-    /// decl the kwarg expression resolves to).
+    /// ``value`` must be a Python literal (``None`` / ``bool`` /
+    /// ``int`` / ``float`` / ``str`` / ``list`` / ``tuple``). Passing
+    /// any other type — including a :class:`NativeNode` — raises
+    /// ``ValueError``.
     fn where_kwarg<'py>(
         mut slf: PyRefMut<'py, Self>,
         name: String,
@@ -1223,14 +1223,6 @@ impl DecoratorQuery {
         let ctx = self.ctx.borrow(py);
         let path_regex = self.path_regex.as_deref();
         let mut refs: Vec<Py<DecoratorRef>> = Vec::new();
-        // Cache a snapshot of the build's node pool for arg materialization +
-        // KwargMatcher::DeclRefFqname lookups. Keep the borrow alive for the
-        // duration of the loop so we don't reborrow on every iteration.
-        let outputs_borrow = ctx.outputs.borrow();
-        let outputs = outputs_borrow
-            .as_ref()
-            .ok_or_else(|| not_materialized("DecoratorQuery.collect"))?;
-        let nodes: &[Py<NativeNode>] = &outputs.builder.nodes;
         let kwarg_matchers = &self.kwarg_matchers;
         if let Some(owner_attrs) = &self.owner_attrs {
             let triples = if let Some(via) = &self.via_attr {
@@ -1239,11 +1231,11 @@ impl DecoratorQuery {
                 ctx.find_handler_decorators(py, owner_attrs.clone(), path_regex)?
             };
             for (owner_name, decorated, call_args) in triples {
-                if !call_args_match_kwargs(py, &call_args, kwarg_matchers, nodes) {
+                if !call_args_match_kwargs(&call_args, kwarg_matchers) {
                     continue;
                 }
-                let args = args_to_py_vec(py, &call_args.args, nodes);
-                let kwargs = kwargs_to_py_map(py, &call_args.kwargs, nodes);
+                let args = args_to_py_vec(py, &call_args.args);
+                let kwargs = kwargs_to_py_map(py, &call_args.kwargs);
                 refs.push(Py::new(
                     py,
                     DecoratorRef {
@@ -1270,11 +1262,11 @@ impl DecoratorQuery {
                 .to_string();
             drop(in_decl_ref);
             for (d, call_args) in decls {
-                if !call_args_match_kwargs(py, &call_args, kwarg_matchers, nodes) {
+                if !call_args_match_kwargs(&call_args, kwarg_matchers) {
                     continue;
                 }
-                let args = args_to_py_vec(py, &call_args.args, nodes);
-                let kwargs = kwargs_to_py_map(py, &call_args.kwargs, nodes);
+                let args = args_to_py_vec(py, &call_args.args);
+                let kwargs = kwargs_to_py_map(py, &call_args.kwargs);
                 refs.push(Py::new(
                     py,
                     DecoratorRef {
@@ -1290,11 +1282,11 @@ impl DecoratorQuery {
         } else if let Some(fqn) = &self.callee_fqn {
             let decls = ctx.find_decorated(py, fqn, path_regex)?;
             for (d, call_args) in decls {
-                if !call_args_match_kwargs(py, &call_args, kwarg_matchers, nodes) {
+                if !call_args_match_kwargs(&call_args, kwarg_matchers) {
                     continue;
                 }
-                let args = args_to_py_vec(py, &call_args.args, nodes);
-                let kwargs = kwargs_to_py_map(py, &call_args.kwargs, nodes);
+                let args = args_to_py_vec(py, &call_args.args);
+                let kwargs = kwargs_to_py_map(py, &call_args.kwargs);
                 refs.push(Py::new(
                     py,
                     DecoratorRef {
@@ -1310,11 +1302,11 @@ impl DecoratorQuery {
         } else if let (Some(module), Some(names)) = (&self.module, &self.names) {
             let decls = ctx.find_decorated_decls(py, module, names.clone(), path_regex)?;
             for (d, call_args) in decls {
-                if !call_args_match_kwargs(py, &call_args, kwarg_matchers, nodes) {
+                if !call_args_match_kwargs(&call_args, kwarg_matchers) {
                     continue;
                 }
-                let args = args_to_py_vec(py, &call_args.args, nodes);
-                let kwargs = kwargs_to_py_map(py, &call_args.kwargs, nodes);
+                let args = args_to_py_vec(py, &call_args.args);
+                let kwargs = kwargs_to_py_map(py, &call_args.kwargs);
                 refs.push(Py::new(
                     py,
                     DecoratorRef {
@@ -1523,10 +1515,10 @@ impl CallQuery {
 
     /// Add a kwarg matcher. Multiple calls AND together.
     ///
-    /// ``value`` is either a Python literal (``None`` / ``bool`` /
-    /// ``int`` / ``float`` / ``str`` / ``list`` / ``tuple``) or a
-    /// :class:`NativeNode` (matched by ``fqname`` equality against the
-    /// decl the kwarg expression resolves to).
+    /// ``value`` must be a Python literal (``None`` / ``bool`` /
+    /// ``int`` / ``float`` / ``str`` / ``list`` / ``tuple``). Passing
+    /// any other type — including a :class:`NativeNode` — raises
+    /// ``ValueError``.
     fn where_kwarg<'py>(
         mut slf: PyRefMut<'py, Self>,
         name: String,
@@ -1563,19 +1555,14 @@ impl CallQuery {
                  where_owner(...) + where_attr(...); or where_attr(...)",
             ));
         };
-        let outputs_borrow = ctx.outputs.borrow();
-        let outputs = outputs_borrow
-            .as_ref()
-            .ok_or_else(|| not_materialized("CallQuery.collect"))?;
-        let nodes: &[Py<NativeNode>] = &outputs.builder.nodes;
         let kwarg_matchers = &self.kwarg_matchers;
         let mut refs: Vec<Py<CallRef>> = Vec::new();
         for (owner_node, s, call_args) in triples {
-            if !call_args_match_kwargs(py, &call_args, kwarg_matchers, nodes) {
+            if !call_args_match_kwargs(&call_args, kwarg_matchers) {
                 continue;
             }
-            let args = args_to_py_vec(py, &call_args.args, nodes);
-            let kwargs = kwargs_to_py_map(py, &call_args.kwargs, nodes);
+            let args = args_to_py_vec(py, &call_args.args);
+            let kwargs = kwargs_to_py_map(py, &call_args.kwargs);
             refs.push(Py::new(
                 py,
                 CallRef {
@@ -2434,7 +2421,6 @@ impl ProjectContext {
         let names: HashSet<&str> = decorator_names.iter().map(String::as_str).collect();
         let needle_strs: Vec<&str> = decorator_names.iter().map(String::as_str).collect();
         let decl_by_name_range = &outputs.decl_by_name_range;
-        let decl_by_fqname = &outputs.decl_by_fqname;
         let project_files = &outputs.project_files;
         // Text prefilter inside the parallel walk mirrors the LSP's
         // find_references — skip files that don't even mention any
@@ -2457,7 +2443,6 @@ impl ProjectContext {
                 if imports.is_empty() {
                     return Vec::new();
                 }
-                let file_imports = collect_all_imports_local(&parsed);
                 let mut local = Vec::new();
                 for stmt in &parsed.syntax().body {
                     let Stmt::FunctionDef(func) = stmt else {
@@ -2470,9 +2455,7 @@ impl ProjectContext {
                     };
                     let key = (file, range_key(func.name.range()));
                     if let Some(&idx) = decl_by_name_range.get(&key) {
-                        let call_args = call_form
-                            .map(|c| extract_call_args_kwargs(c, &file_imports, decl_by_fqname))
-                            .unwrap_or_default();
+                        let call_args = call_form.map(extract_call_args_kwargs).unwrap_or_default();
                         local.push((idx, call_args));
                     }
                 }
@@ -2578,7 +2561,6 @@ impl ProjectContext {
         let attrs: HashSet<&str> = decorator_attrs.iter().map(String::as_str).collect();
         let needle_strs: Vec<&str> = decorator_attrs.iter().map(String::as_str).collect();
         let decl_by_name_range = &outputs.decl_by_name_range;
-        let decl_by_fqname = &outputs.decl_by_fqname;
         let project_files: &[File] = &outputs.project_files;
         let db_handle: Box<dyn ProjectDb> = ProjectDb::dyn_clone(&self.db);
         let path_re_ref = &path_re;
@@ -2591,7 +2573,6 @@ impl ProjectContext {
                     return Vec::new();
                 }
                 let parsed = parsed_module(db, file).load(db);
-                let file_imports = collect_all_imports_local(&parsed);
                 let mut local: Vec<(String, usize, CallArgs)> = Vec::new();
                 for stmt in &parsed.syntax().body {
                     let Stmt::FunctionDef(func) = stmt else {
@@ -2619,9 +2600,8 @@ impl ProjectContext {
                         }
                         let key = (file, range_key(func.name.range()));
                         if let Some(&idx) = decl_by_name_range.get(&key) {
-                            let call_args = call_form
-                                .map(|c| extract_call_args_kwargs(c, &file_imports, decl_by_fqname))
-                                .unwrap_or_default();
+                            let call_args =
+                                call_form.map(extract_call_args_kwargs).unwrap_or_default();
                             local.push((owner_name, idx, call_args));
                         }
                     }
@@ -2657,7 +2637,6 @@ impl ProjectContext {
         let path_re = _compile_path_regex(path_regex)?;
         let attrs: HashSet<&str> = decorator_attrs.iter().map(String::as_str).collect();
         let decl_by_name_range = &outputs.decl_by_name_range;
-        let decl_by_fqname = &outputs.decl_by_fqname;
         let project_files: &[File] = &outputs.project_files;
         let db_handle: Box<dyn ProjectDb> = ProjectDb::dyn_clone(&self.db);
         let path_re_ref = &path_re;
@@ -2671,7 +2650,6 @@ impl ProjectContext {
                     return Vec::new();
                 }
                 let parsed = parsed_module(db, file).load(db);
-                let file_imports = collect_all_imports_local(&parsed);
                 let mut local: Vec<(String, usize, CallArgs)> = Vec::new();
                 for stmt in &parsed.syntax().body {
                     let Stmt::FunctionDef(func) = stmt else {
@@ -2705,9 +2683,8 @@ impl ProjectContext {
                         }
                         let key = (file, range_key(func.name.range()));
                         if let Some(&idx) = decl_by_name_range.get(&key) {
-                            let call_args = call_form
-                                .map(|c| extract_call_args_kwargs(c, &file_imports, decl_by_fqname))
-                                .unwrap_or_default();
+                            let call_args =
+                                call_form.map(extract_call_args_kwargs).unwrap_or_default();
                             local.push((owner_name, idx, call_args));
                         }
                     }
@@ -2748,7 +2725,6 @@ impl ProjectContext {
             .ok_or_else(|| not_materialized("find_calls_on_attr"))?;
         let path_re = _compile_path_regex(path_regex)?;
         let decl_by_name_range = &outputs.decl_by_name_range;
-        let decl_by_fqname = &outputs.decl_by_fqname;
         let module_nodes_by_file = &outputs.module_nodes_by_file;
         let project_files: &[File] = &outputs.project_files;
         let db_handle: Box<dyn ProjectDb> = ProjectDb::dyn_clone(&self.db);
@@ -2760,7 +2736,6 @@ impl ProjectContext {
                     return Vec::new();
                 }
                 let parsed = parsed_module(db, file).load(db);
-                let file_imports = collect_all_imports_local(&parsed);
                 let mut local: Vec<(usize, String, CallArgs)> = Vec::new();
                 for stmt in &parsed.syntax().body {
                     let Some(owner_idx) = owner_idx_for_stmt_with(
@@ -2774,8 +2749,6 @@ impl ProjectContext {
                     let mut finder = AttrCallFinder {
                         attr,
                         arg_index,
-                        file_imports: &file_imports,
-                        decl_by_fqname,
                         results: Vec::new(),
                     };
                     finder.visit_stmt(stmt);
@@ -2886,7 +2859,6 @@ impl ProjectContext {
         let path_re = _compile_path_regex(path_regex)?;
         let allowed: HashSet<&str> = [name].into_iter().collect();
         let decl_by_name_range = &outputs.decl_by_name_range;
-        let decl_by_fqname = &outputs.decl_by_fqname;
         let module_nodes_by_file = &outputs.module_nodes_by_file;
         let project_files: &[File] = &outputs.project_files;
         let db_handle: Box<dyn ProjectDb> = ProjectDb::dyn_clone(&self.db);
@@ -2903,7 +2875,6 @@ impl ProjectContext {
                 if imports.is_empty() {
                     return Vec::new();
                 }
-                let file_imports = collect_all_imports_local(&parsed);
                 let mut local: Vec<(usize, String, CallArgs)> = Vec::new();
                 for stmt in &parsed.syntax().body {
                     let Some(owner_idx) = owner_idx_for_stmt_with(
@@ -2919,8 +2890,6 @@ impl ProjectContext {
                             matched_call_target(call, &imports, module, allowed_ref).is_some()
                         },
                         arg_index,
-                        file_imports: &file_imports,
-                        decl_by_fqname,
                         results: Vec::new(),
                     };
                     finder.visit_stmt(stmt);
@@ -2964,7 +2933,6 @@ impl ProjectContext {
             .ok_or_else(|| not_materialized("find_calls_on_var"))?;
         let path_re = _compile_path_regex(path_regex)?;
         let decl_by_name_range = &outputs.decl_by_name_range;
-        let decl_by_fqname = &outputs.decl_by_fqname;
         let module_nodes_by_file = &outputs.module_nodes_by_file;
         let project_files: &[File] = &outputs.project_files;
         let db_handle: Box<dyn ProjectDb> = ProjectDb::dyn_clone(&self.db);
@@ -2979,7 +2947,6 @@ impl ProjectContext {
                     return Vec::new();
                 }
                 let parsed = parsed_module(db, file).load(db);
-                let file_imports = collect_all_imports_local(&parsed);
                 let mut local: Vec<(usize, String, CallArgs)> = Vec::new();
                 for stmt in &parsed.syntax().body {
                     let Some(owner_idx) = owner_idx_for_stmt_with(
@@ -2995,8 +2962,6 @@ impl ProjectContext {
                             call_callee_matches_var(call, owner, attr, required_positional)
                         },
                         arg_index,
-                        file_imports: &file_imports,
-                        decl_by_fqname,
                         results: Vec::new(),
                     };
                     finder.visit_stmt(stmt);
@@ -4072,16 +4037,10 @@ fn nth_positional_string(call: &ruff_python_ast::ExprCall, arg_index: usize) -> 
 
 /// Send-able value extracted from an AST expression.
 ///
-/// ``DeclRef(idx)`` holds an index into ``BuildOutputs.builder.nodes``.
-/// The ``Py<NativeNode>`` materialization runs in the GIL-holding
-/// caller after :fn:`par_scan_files` returns (the rust extractor must
-/// stay ``Send``).
-///
 /// ``Unknown`` is reported when the expression is neither a recognized
-/// literal nor a name/attribute that resolves through the file's
-/// imports to a project decl. It surfaces to Python as ``None`` —
-/// callers who care about the difference between "literal None" and
-/// "unresolvable" should also inspect the original source.
+/// literal shape nor (presently) anything else — it surfaces to Python
+/// as ``None``. Callers who care about the difference between "literal
+/// None" and "unresolvable" should also inspect the original source.
 #[derive(Clone, Debug)]
 enum ArgValue {
     None,
@@ -4091,7 +4050,6 @@ enum ArgValue {
     Str(String),
     List(Vec<ArgValue>),
     Tuple(Vec<ArgValue>),
-    DeclRef(usize),
     Unknown,
 }
 
@@ -4101,36 +4059,11 @@ struct CallArgs {
     kwargs: HashMap<String, ArgValue>,
 }
 
-/// Resolve a dotted Name / Attribute chain to a project decl index
-/// using the file's imports map. Returns the matching node index when
-/// the leftmost ``Name`` is a known local import and the resulting
-/// dotted upstream fqname (``upstream + remaining attrs``) is present
-/// in ``decl_by_fqname``. Picks the first index when multiple bindings
-/// exist.
-fn resolve_dotted_name_to_decl(
-    root: &str,
-    segs: &[&str],
-    file_imports: &HashMap<String, String>,
-    decl_by_fqname: &HashMap<String, Vec<usize>>,
-) -> Option<usize> {
-    let upstream = file_imports.get(root)?;
-    let mut fqn =
-        String::with_capacity(upstream.len() + segs.iter().map(|s| s.len() + 1).sum::<usize>());
-    fqn.push_str(upstream);
-    for seg in segs {
-        fqn.push('.');
-        fqn.push_str(seg);
-    }
-    let idxs = decl_by_fqname.get(&fqn)?;
-    idxs.first().copied()
-}
-
-/// Convert one AST argument expression to an ``ArgValue``.
-fn extract_arg_value(
-    expr: &Expr,
-    file_imports: &HashMap<String, String>,
-    decl_by_fqname: &HashMap<String, Vec<usize>>,
-) -> ArgValue {
+/// Convert one AST argument expression to an ``ArgValue``. Only
+/// recognized literal shapes (None / bool / int / float / str / list
+/// of literals / tuple of literals) round-trip; everything else
+/// (Name / Attribute / Call / etc.) maps to ``Unknown``.
+fn extract_arg_value(expr: &Expr) -> ArgValue {
     match expr {
         Expr::NoneLiteral(_) => ArgValue::None,
         Expr::BooleanLiteral(b) => ArgValue::Bool(b.value),
@@ -4143,72 +4076,27 @@ fn extract_arg_value(
             ruff_python_ast::Number::Float(f) => ArgValue::Float(*f),
             ruff_python_ast::Number::Complex { .. } => ArgValue::Unknown,
         },
-        Expr::List(list) => ArgValue::List(
-            list.elts
-                .iter()
-                .map(|e| extract_arg_value(e, file_imports, decl_by_fqname))
-                .collect(),
-        ),
-        Expr::Tuple(tup) => ArgValue::Tuple(
-            tup.elts
-                .iter()
-                .map(|e| extract_arg_value(e, file_imports, decl_by_fqname))
-                .collect(),
-        ),
-        Expr::Name(n) => {
-            if let Some(idx) =
-                resolve_dotted_name_to_decl(n.id.as_str(), &[], file_imports, decl_by_fqname)
-            {
-                ArgValue::DeclRef(idx)
-            } else {
-                ArgValue::Unknown
-            }
-        }
-        Expr::Attribute(_) => {
-            if let Some((root, segs)) = collapse_attribute_chain(expr) {
-                if let Some(idx) = resolve_dotted_name_to_decl(
-                    root.id.as_str(),
-                    &segs,
-                    file_imports,
-                    decl_by_fqname,
-                ) {
-                    return ArgValue::DeclRef(idx);
-                }
-            }
-            ArgValue::Unknown
-        }
+        Expr::List(list) => ArgValue::List(list.elts.iter().map(extract_arg_value).collect()),
+        Expr::Tuple(tup) => ArgValue::Tuple(tup.elts.iter().map(extract_arg_value).collect()),
         _ => ArgValue::Unknown,
     }
 }
 
 /// Extract positional + keyword arguments from a call.
-fn extract_call_args_kwargs(
-    call: &ruff_python_ast::ExprCall,
-    file_imports: &HashMap<String, String>,
-    decl_by_fqname: &HashMap<String, Vec<usize>>,
-) -> CallArgs {
-    let args: Vec<ArgValue> = call
-        .arguments
-        .args
-        .iter()
-        .map(|a| extract_arg_value(a, file_imports, decl_by_fqname))
-        .collect();
+fn extract_call_args_kwargs(call: &ruff_python_ast::ExprCall) -> CallArgs {
+    let args: Vec<ArgValue> = call.arguments.args.iter().map(extract_arg_value).collect();
     let mut kwargs: HashMap<String, ArgValue> = HashMap::new();
     for kw in &call.arguments.keywords {
         let Some(name) = kw.arg.as_ref() else {
             continue;
         };
-        kwargs.insert(
-            name.as_str().to_string(),
-            extract_arg_value(&kw.value, file_imports, decl_by_fqname),
-        );
+        kwargs.insert(name.as_str().to_string(), extract_arg_value(&kw.value));
     }
     CallArgs { args, kwargs }
 }
 
-/// Materialize one ``ArgValue`` into a Python object. ``DeclRef``
-/// resolves through the build's ``Py<NativeNode>`` pool.
-fn arg_value_to_py(py: Python<'_>, v: &ArgValue, nodes: &[Py<NativeNode>]) -> PyObject {
+/// Materialize one ``ArgValue`` into a Python object.
+fn arg_value_to_py(py: Python<'_>, v: &ArgValue) -> PyObject {
     match v {
         ArgValue::None => py.None(),
         ArgValue::Bool(b) => b.into_py(py),
@@ -4216,57 +4104,44 @@ fn arg_value_to_py(py: Python<'_>, v: &ArgValue, nodes: &[Py<NativeNode>]) -> Py
         ArgValue::Float(f) => f.into_py(py),
         ArgValue::Str(s) => s.into_py(py),
         ArgValue::List(items) => {
-            let py_items: Vec<PyObject> = items
-                .iter()
-                .map(|v| arg_value_to_py(py, v, nodes))
-                .collect();
+            let py_items: Vec<PyObject> = items.iter().map(|v| arg_value_to_py(py, v)).collect();
             pyo3::types::PyList::new_bound(py, py_items).into_py(py)
         }
         ArgValue::Tuple(items) => {
-            let py_items: Vec<PyObject> = items
-                .iter()
-                .map(|v| arg_value_to_py(py, v, nodes))
-                .collect();
+            let py_items: Vec<PyObject> = items.iter().map(|v| arg_value_to_py(py, v)).collect();
             pyo3::types::PyTuple::new_bound(py, py_items).into_py(py)
         }
-        ArgValue::DeclRef(idx) => match nodes.get(*idx) {
-            Some(node) => node.clone_ref(py).into_py(py),
-            None => py.None(),
-        },
         ArgValue::Unknown => py.None(),
     }
 }
 
 /// Convert a list of ``ArgValue`` to a `Vec<Py<PyAny>>` ready for a
 /// frozen pyclass field.
-fn args_to_py_vec(py: Python<'_>, args: &[ArgValue], nodes: &[Py<NativeNode>]) -> Vec<Py<PyAny>> {
-    args.iter().map(|v| arg_value_to_py(py, v, nodes)).collect()
+fn args_to_py_vec(py: Python<'_>, args: &[ArgValue]) -> Vec<Py<PyAny>> {
+    args.iter().map(|v| arg_value_to_py(py, v)).collect()
 }
 
 /// Convert a kwargs map to ``HashMap<String, Py<PyAny>>``.
 fn kwargs_to_py_map(
     py: Python<'_>,
     kwargs: &HashMap<String, ArgValue>,
-    nodes: &[Py<NativeNode>],
 ) -> HashMap<String, Py<PyAny>> {
     kwargs
         .iter()
-        .map(|(k, v)| (k.clone(), arg_value_to_py(py, v, nodes)))
+        .map(|(k, v)| (k.clone(), arg_value_to_py(py, v)))
         .collect()
 }
 
-/// A user-supplied kwarg matcher. ``Literal`` matches by deep value
-/// equality against the AST expression's ``ArgValue``. ``DeclRefFqname``
-/// matches when the AST expression resolves to a project decl with the
-/// given fqname.
+/// A user-supplied kwarg matcher. Only literal-value equality is
+/// supported; ``NativeNode``-valued matchers are rejected at
+/// ``where_kwarg`` call time.
 #[derive(Clone, Debug)]
 enum KwargMatcher {
     Literal(ArgValue),
-    DeclRefFqname(String),
 }
 
-/// True iff two ``ArgValue``s are equal as literals. ``DeclRef`` /
-/// ``Unknown`` never compare equal to anything via the literal path.
+/// True iff two ``ArgValue``s are equal as literals. ``Unknown`` never
+/// compares equal to anything.
 fn arg_value_eq_literal(a: &ArgValue, b: &ArgValue) -> bool {
     match (a, b) {
         (ArgValue::None, ArgValue::None) => true,
@@ -4292,17 +4167,19 @@ fn arg_value_eq_literal(a: &ArgValue, b: &ArgValue) -> bool {
 }
 
 /// Extract a ``KwargMatcher`` from a Python value supplied at
-/// ``.where_kwarg(name, value)`` call time. Accepts:
-/// * ``NativeNode`` — captured by ``fqname``.
-/// * Python literals: ``None``, ``bool``, ``int``, ``float``, ``str``,
-///   ``list[...]``, ``tuple[...]``.
+/// ``.where_kwarg(name, value)`` call time. Accepts only Python
+/// literals (``None``, ``bool``, ``int``, ``float``, ``str``,
+/// ``list[...]``, ``tuple[...]``); passing a ``NativeNode`` (or any
+/// other unsupported type) raises ``PyValueError``.
 fn kwarg_matcher_from_py(py: Python<'_>, value: &Py<PyAny>) -> PyResult<KwargMatcher> {
     let bound = value.bind(py);
-    // NativeNode first — pyo3's `extract::<bool>()` for instance would
-    // happily succeed on a NativeNode if NativeNode happened to be
-    // truthy, so try the strict downcast first.
-    if let Ok(node) = bound.extract::<PyRef<'_, NativeNode>>() {
-        return Ok(KwargMatcher::DeclRefFqname(node.fqname.clone()));
+    // Reject NativeNode explicitly with a targeted error so callers
+    // see the dropped feature rather than the generic "unknown type"
+    // message from `py_to_arg_value`.
+    if bound.extract::<PyRef<'_, NativeNode>>().is_ok() {
+        return Err(PyValueError::new_err(
+            "where_kwarg value must be a Python literal (str/int/float/bool/None/list/tuple), got NativeNode",
+        ));
     }
     Ok(KwargMatcher::Literal(py_to_arg_value(bound)?))
 }
@@ -4345,19 +4222,14 @@ fn py_to_arg_value(value: &Bound<'_, PyAny>) -> PyResult<ArgValue> {
         return Ok(ArgValue::Tuple(out));
     }
     Err(PyValueError::new_err(format!(
-        "where_kwarg value must be a NativeNode or a literal (None / bool / int / float / str / list / tuple); got {}",
+        "where_kwarg value must be a literal (None / bool / int / float / str / list / tuple); got {}",
         value.get_type().name()?,
     )))
 }
 
 /// True iff every ``(name, matcher)`` pair holds against the call's
 /// ``kwargs``. A missing kwarg never matches.
-fn call_args_match_kwargs(
-    py: Python<'_>,
-    call_args: &CallArgs,
-    matchers: &[(String, KwargMatcher)],
-    nodes: &[Py<NativeNode>],
-) -> bool {
+fn call_args_match_kwargs(call_args: &CallArgs, matchers: &[(String, KwargMatcher)]) -> bool {
     for (name, matcher) in matchers {
         let Some(av) = call_args.kwargs.get(name) else {
             return false;
@@ -4368,76 +4240,9 @@ fn call_args_match_kwargs(
                     return false;
                 }
             }
-            KwargMatcher::DeclRefFqname(fqn) => {
-                let ArgValue::DeclRef(idx) = av else {
-                    return false;
-                };
-                let Some(node) = nodes.get(*idx) else {
-                    return false;
-                };
-                if node.borrow(py).fqname != *fqn {
-                    return false;
-                }
-            }
         }
     }
     true
-}
-
-/// Walk every `Stmt::Import` / `Stmt::ImportFrom` in `parsed` and
-/// produce `local_name -> upstream_fqname` for every alias.
-///
-/// Unlike :fn:`collect_module_imports_local` (which filters to a single
-/// `module` + `allowed` name set), this captures every top-level
-/// import so callers can resolve arbitrary names referenced in
-/// arg / kwarg positions.
-///
-/// Mappings produced:
-/// * ``from foo.bar import Baz`` → ``"Baz" -> "foo.bar.Baz"``
-/// * ``from foo.bar import Baz as B`` → ``"B" -> "foo.bar.Baz"``
-/// * ``import foo`` → ``"foo" -> "foo"``
-/// * ``import foo.bar as fb`` → ``"fb" -> "foo.bar"``
-/// * ``import foo.bar`` → ``"foo" -> "foo"`` (Python binds the
-///   leftmost segment; the runtime module ``foo`` is what the name
-///   resolves to).
-fn collect_all_imports_local(parsed: &ParsedModuleRef) -> HashMap<String, String> {
-    let mut out: HashMap<String, String> = HashMap::new();
-    for stmt in &parsed.syntax().body {
-        match stmt {
-            Stmt::ImportFrom(im) => {
-                let Some(mod_name) = &im.module else { continue };
-                let module = mod_name.as_str();
-                for alias in &im.names {
-                    let target = alias.name.as_str();
-                    let local = alias.asname.as_ref().map(|n| n.as_str()).unwrap_or(target);
-                    let upstream = if module.is_empty() {
-                        target.to_string()
-                    } else {
-                        format!("{module}.{target}")
-                    };
-                    out.insert(local.to_string(), upstream);
-                }
-            }
-            Stmt::Import(im) => {
-                for alias in &im.names {
-                    let name = alias.name.as_str();
-                    if let Some(asname) = alias.asname.as_ref() {
-                        // ``import foo.bar as fb`` binds ``fb`` to the
-                        // ``foo.bar`` module object.
-                        out.insert(asname.as_str().to_string(), name.to_string());
-                    } else {
-                        // ``import foo`` binds ``foo``.
-                        // ``import foo.bar`` binds ``foo`` (Python
-                        // binds the leftmost segment).
-                        let leftmost = name.split('.').next().unwrap_or(name);
-                        out.insert(leftmost.to_string(), leftmost.to_string());
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    out
 }
 
 /// Match ``<owner>.<attr>(...)`` where ``<owner>`` is a bare ``Name``
@@ -4473,18 +4278,16 @@ fn call_callee_matches_var(
 /// Visit every Call expression in a subtree, push
 /// ``(string_arg_at_index, CallArgs)`` whenever ``predicate(call)``
 /// returns ``true``. Backs both call-finder queries.
-struct StringArgCallFinder<'a, F>
+struct StringArgCallFinder<F>
 where
     F: FnMut(&ruff_python_ast::ExprCall) -> bool,
 {
     predicate: F,
     arg_index: usize,
-    file_imports: &'a HashMap<String, String>,
-    decl_by_fqname: &'a HashMap<String, Vec<usize>>,
     results: Vec<(String, CallArgs)>,
 }
 
-impl<'ast, 'a, F> Visitor<'ast> for StringArgCallFinder<'a, F>
+impl<'ast, F> Visitor<'ast> for StringArgCallFinder<F>
 where
     F: FnMut(&ruff_python_ast::ExprCall) -> bool,
 {
@@ -4492,8 +4295,7 @@ where
         if let Expr::Call(call) = expr {
             if (self.predicate)(call) {
                 if let Some(value) = nth_positional_string(call, self.arg_index) {
-                    let call_args =
-                        extract_call_args_kwargs(call, self.file_imports, self.decl_by_fqname);
+                    let call_args = extract_call_args_kwargs(call);
                     self.results.push((value, call_args));
                 }
             }
@@ -4513,8 +4315,6 @@ where
 struct AttrCallFinder<'a> {
     attr: &'a str,
     arg_index: usize,
-    file_imports: &'a HashMap<String, String>,
-    decl_by_fqname: &'a HashMap<String, Vec<usize>>,
     results: Vec<(String, CallArgs)>,
 }
 
@@ -4546,11 +4346,7 @@ impl<'ast, 'a> Visitor<'ast> for AttrCallFinder<'a> {
                             _ => {}
                         }
                         if !hits.is_empty() {
-                            let call_args = extract_call_args_kwargs(
-                                call,
-                                self.file_imports,
-                                self.decl_by_fqname,
-                            );
+                            let call_args = extract_call_args_kwargs(call);
                             for s in hits {
                                 self.results.push((s, call_args.clone()));
                             }

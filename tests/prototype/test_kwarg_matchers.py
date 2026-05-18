@@ -331,102 +331,41 @@ def test_call_ref_args_kwargs_populated(make_ctx):
 
 
 # ---------------------------------------------------------------------------
-# Where_kwarg with NativeNode value (DeclRef matching)
+# Error paths
 # ---------------------------------------------------------------------------
 
 
-def test_call_query_where_kwarg_native_node(make_ctx):
-    """A ``mocker.patch("X", new_callable=Replacement)`` call where
-    ``Replacement`` is a project-local imported decl is matched by
-    ``.where_kwarg("new_callable", replacement_node)``."""
+def test_where_kwarg_with_nativenode_raises(make_ctx):
+    """``where_kwarg`` is literal-only; passing a ``NativeNode`` errors."""
+
+    captured: list[Exception] = []
 
     def capture(ctx):
-        # Resolve a project-local decl. The decl lives in ``mocks.py``,
-        # so its fqname is ``mocks.Replacement``.
-        repls = native.query(ctx).declarations("mocks.Replacement")
-        assert repls, "expected Replacement to be resolvable via declarations()"
-        repl_node = repls[0]
-        refs = (
-            native.query(ctx)
-            .calls()
-            .where_owner("mocker")
-            .where_attr("patch")
-            .string_arg_at(0)
-            .where_kwarg("new_callable", repl_node)
-            .collect()
-        )
-        # The matched kwarg should also surface as the same NativeNode
-        # in ``ref.kwargs["new_callable"]``.
-        kwarg_fqns = [
-            r.kwargs["new_callable"].fqname
-            for r in refs
-            if r.kwargs.get("new_callable") is not None
-            and hasattr(r.kwargs["new_callable"], "fqname")
-        ]
-        return {
-            "matched": [r.string_arg for r in refs],
-            "kwarg_fqns": kwarg_fqns,
-        }
+        mod = native.query(ctx).module("tests")
+        assert mod is not None
+        try:
+            (
+                native.query(ctx)
+                .calls()
+                .where_owner("mocker")
+                .where_attr("patch")
+                .string_arg_at(0)
+                .where_kwarg("new_callable", mod)
+            )
+        except Exception as exc:
+            captured.append(exc)
+        return None
 
-    ctx = make_ctx(
-        {
-            "mocks.py": "class Replacement: pass\n",
-            "tests.py": (
-                "from mocks import Replacement\n"
-                "\n"
-                "def test_a(mocker):\n"
-                "    mocker.patch('pkg.a', new_callable=Replacement)\n"
-                "def test_b(mocker):\n"
-                "    mocker.patch('pkg.b')\n"
-            ),
-        }
-    )
+    ctx = make_ctx({"tests.py": "x = 1\n"})
     plugin = _CapturePlugin(capture)
     ctx.add_plugin(plugin)
     ctx.materialize()
-    assert plugin.result["matched"] == ["pkg.a"]
-    assert plugin.result["kwarg_fqns"] == ["mocks.Replacement"]
-
-
-def test_call_query_where_kwarg_native_node_does_not_match_literal(make_ctx):
-    """A literal kwarg value never matches a ``NativeNode`` filter."""
-
-    def capture(ctx):
-        repls = native.query(ctx).declarations("mocks.Replacement")
-        assert repls
-        repl_node = repls[0]
-        refs = (
-            native.query(ctx)
-            .calls()
-            .where_owner("mocker")
-            .where_attr("patch")
-            .string_arg_at(0)
-            .where_kwarg("new_callable", repl_node)
-            .collect()
-        )
-        return [r.string_arg for r in refs]
-
-    ctx = make_ctx(
-        {
-            "mocks.py": "class Replacement: pass\n",
-            "tests.py": (
-                "from mocks import Replacement\n"
-                "\n"
-                "def test_a(mocker):\n"
-                # ``new_callable=None`` — literal, not the imported decl.
-                "    mocker.patch('pkg.a', new_callable=None)\n"
-            ),
-        }
-    )
-    plugin = _CapturePlugin(capture)
-    ctx.add_plugin(plugin)
-    ctx.materialize()
-    assert plugin.result == []
+    assert captured, "expected an error from where_kwarg(NativeNode)"
+    assert "where_kwarg value must be" in str(captured[0])
 
 
 def test_where_kwarg_rejects_unknown_value_type(make_ctx):
-    """``where_kwarg`` errors on a Python value that's neither a
-    literal nor a ``NativeNode``."""
+    """``where_kwarg`` errors on a Python value that's not a literal."""
 
     captured: list[Exception] = []
 

@@ -643,9 +643,8 @@ class DecoratorRef:
     ``args`` and ``kwargs`` are populated from the decorator's
     ``Call`` form (``@dec(a, b, k=v)``). Bare-attribute decorators
     (``@app.route`` without ``()``) get empty containers. Each value
-    is either a Python literal, a :class:`NativeNode` (when the
-    expression statically resolves to a project decl), or ``None``
-    (for both literal ``None`` and unresolvable expressions).
+    is either a Python literal (str / int / float / bool / None /
+    list / tuple) or ``None`` for any non-literal expression.
     """
 
     decorated: NativeNode
@@ -678,10 +677,9 @@ class CallRef:
     passed to :meth:`CallQuery.string_arg_at`.
 
     ``args`` and ``kwargs`` carry the call's full positional /
-    keyword argument shape. Each value is either a Python literal,
-    a :class:`NativeNode` (when the expression statically resolves
-    to a project decl), or ``None`` (for both literal ``None`` and
-    unresolvable expressions).
+    keyword argument shape. Each value is either a Python literal
+    (str / int / float / bool / None / list / tuple) or ``None``
+    for any non-literal expression.
     """
 
     owner: NativeNode
@@ -797,12 +795,11 @@ class DecoratorQuery:
     def where_kwarg(self, name: str, value: Any) -> DecoratorQuery:
         """Filter to decorator calls whose ``name=value`` kwarg matches.
 
-        Multiple ``.where_kwarg`` calls AND together. ``value`` is
-        either a Python literal (``None`` / ``bool`` / ``int`` /
-        ``float`` / ``str`` / ``list`` / ``tuple``) or a
-        :class:`NativeNode` (matched by ``fqname``). A missing kwarg
-        on the call never matches. An unresolvable kwarg expression
-        never matches a value-based filter.
+        Multiple ``.where_kwarg`` calls AND together. ``value`` must
+        be a Python literal (``None`` / ``bool`` / ``int`` /
+        ``float`` / ``str`` / ``list`` / ``tuple``). A missing kwarg
+        on the call never matches. A non-literal kwarg expression
+        never matches.
         """
         ...
 
@@ -840,12 +837,11 @@ class CallQuery:
     def where_kwarg(self, name: str, value: Any) -> CallQuery:
         """Filter to call sites whose ``name=value`` kwarg matches.
 
-        Multiple ``.where_kwarg`` calls AND together. ``value`` is
-        either a Python literal (``None`` / ``bool`` / ``int`` /
-        ``float`` / ``str`` / ``list`` / ``tuple``) or a
-        :class:`NativeNode` (matched by ``fqname``). A missing kwarg
-        on the call never matches. An unresolvable kwarg expression
-        never matches a value-based filter.
+        Multiple ``.where_kwarg`` calls AND together. ``value`` must
+        be a Python literal (``None`` / ``bool`` / ``int`` /
+        ``float`` / ``str`` / ``list`` / ``tuple``). A missing kwarg
+        on the call never matches. A non-literal kwarg expression
+        never matches.
         """
         ...
 
