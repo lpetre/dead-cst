@@ -20,5 +20,6 @@ ruff_python_parser = { path = "../vendor/ruff/crates/ruff_python_parser" }
 ruff_source_file = { path = "../vendor/ruff/crates/ruff_source_file" }
 ruff_text_size = { path = "../vendor/ruff/crates/ruff_text_size" }
 ty_ide = { path = "../vendor/ruff/crates/ty_ide" }
+indicatif = "0.17"
 rayon = "1.10"
 regex = "1"

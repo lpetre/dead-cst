@@ -290,6 +290,7 @@ class ProjectContext:
         python_env: str | None = ...,
         python_version: str | None = ...,
         typeshed: str | None = ...,
+        show_progress: bool = ...,
     ) -> None: ...
     def add_plugin(self, plugin: _ProjectPluginLike | Any) -> None:
         """Register a plugin. Order of registration is order of
