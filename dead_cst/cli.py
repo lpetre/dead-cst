@@ -146,7 +146,7 @@ def analyze(
         entrypoints=entrypoint or [],
         plugin_names=plugin or [],
     )
-    analysis = Analysis(root, resolver=path_resolver, plugins=plugins)
+    analysis = Analysis(root, resolver=path_resolver, plugins=plugins, show_progress=True)
     graph = analysis.materialize_all()
     reachable = _find_reachable(graph, _keepalive_seeds(graph, KEEPALIVE_DEFAULT))
 
@@ -261,7 +261,9 @@ def why_alive(
         entrypoints=[],
         plugin_names=plugin or [],
     )
-    graph = Analysis(root, resolver=path_resolver, plugins=plugins).materialize_all()
+    graph = Analysis(
+        root, resolver=path_resolver, plugins=plugins, show_progress=True
+    ).materialize_all()
 
     target_node: SymbolNode | None = None
     for node in graph.nodes:
@@ -323,7 +325,7 @@ def dependencies(
     path_resolver = build_resolver(path or [], resolver)
 
     typer.echo(f"Building symbol graph for {root}...", err=True)
-    analysis = Analysis(root, resolver=path_resolver)
+    analysis = Analysis(root, resolver=path_resolver, show_progress=True)
     graph = analysis.materialize_all()
 
     deps_by_package: dict[Path, list[SymbolNode]] = {p.path: [] for p in analysis.packages}
@@ -396,7 +398,9 @@ def unused_exports(
         entrypoints=entrypoint or [],
         plugin_names=plugin or [],
     )
-    graph = Analysis(root, resolver=path_resolver, plugins=plugins).materialize_all()
+    graph = Analysis(
+        root, resolver=path_resolver, plugins=plugins, show_progress=True
+    ).materialize_all()
     reachable = _find_reachable(graph, _keepalive_seeds(graph, KEEPALIVE_DEFAULT))
 
     def _is_dunder_seed(node: SymbolNode) -> bool:
@@ -482,7 +486,7 @@ def remove(
         entrypoints=entrypoint or [],
         plugin_names=plugin or [],
     )
-    analysis = Analysis(root, resolver=path_resolver, plugins=plugins)
+    analysis = Analysis(root, resolver=path_resolver, plugins=plugins, show_progress=True)
     graph = analysis.materialize_all()
     reachable = _find_reachable(graph, _keepalive_seeds(graph, KEEPALIVE_DEFAULT))
 

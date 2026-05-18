@@ -163,6 +163,7 @@ class Analysis:
         *,
         resolver: PathResolver,
         plugins: Sequence[object] = (),
+        show_progress: bool = False,
     ) -> None:
         self._project_root: Path = project_root
         validated = _validate_packages(resolver.resolve(project_root))
@@ -179,6 +180,7 @@ class Analysis:
             path: tuple(sorted(cs)) for path, cs in consumers.items()
         }
         self._plugins: tuple[object, ...] = tuple(plugins)
+        self._show_progress: bool = show_progress
         self._full_graph: SymbolGraph | None = None
         self._reverse_closures: dict[Path, frozenset[Path]] = {}
 
@@ -230,7 +232,10 @@ class Analysis:
         # (``pkg_a/A/__init__.py`` -> ``A``, not ``pkg_a.A``).
         src_roots = tuple(p.path for p in self.packages)
         self._full_graph = materialize_project(
-            self._project_root, self._plugins, src_roots=src_roots
+            self._project_root,
+            self._plugins,
+            src_roots=src_roots,
+            show_progress=self._show_progress,
         )
         return self._full_graph
 
