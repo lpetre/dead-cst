@@ -183,18 +183,27 @@ class MockPatchPlugin:
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
         import dead_cst_ty_native as native
 
-        pairs: list[tuple[native.NativeNode, str]] = []
+        refs: list[native.CallRef] = []
         for module in _MOCK_MODULES:
-            pairs.extend(ctx.find_calls_to_imported(module, "patch", 0))
-        pairs.extend(ctx.find_calls_on_var(_MOCKER_NAME, "patch", 0, required_positional=None))
+            refs.extend(
+                native.query(ctx).calls().where_module(module).where_name("patch").string_arg_at(0)
+            )
+        refs.extend(
+            native.query(ctx).calls().where_owner(_MOCKER_NAME).where_attr("patch").string_arg_at(0)
+        )
         for attr, required in _MONKEYPATCH_FQNAME_METHODS.items():
-            pairs.extend(
-                ctx.find_calls_on_var(_MONKEYPATCH_NAME, attr, 0, required_positional=required)
+            refs.extend(
+                native.query(ctx)
+                .calls()
+                .where_owner(_MONKEYPATCH_NAME)
+                .where_attr(attr)
+                .string_arg_at(0)
+                .where_required_positional(required)
             )
 
         owners_by_fqname: dict[str, list[native.NativeNode]] = {}
-        for owner, fqname in pairs:
-            owners_by_fqname.setdefault(fqname, []).append(owner)
+        for ref in refs:
+            owners_by_fqname.setdefault(ref.string_arg, []).append(ref.owner)
 
         for fqname, owners in owners_by_fqname.items():
             targets = list(ctx.find_declarations(fqname))

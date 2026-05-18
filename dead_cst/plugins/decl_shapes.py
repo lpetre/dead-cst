@@ -154,8 +154,6 @@ class DecoratedDeclPlugin:
             return
         names = sorted(self.decorator_names | self.constructor_names)
 
-        decorated = ctx.find_decorated_decls(self.decorator_module, names)
-        constructed = ctx.find_instance_constructions(self.decorator_module, names)
         prefix = self.package_prefix
 
         def in_scope(path: str) -> bool:
@@ -167,12 +165,16 @@ class DecoratedDeclPlugin:
             return module.fqname == prefix or module.fqname.startswith(prefix + ".")
 
         seeds_by_path: dict[str, list[native.NativeNode]] = {}
-        for node in decorated:
-            if in_scope(node.path):
-                seeds_by_path.setdefault(node.path, []).append(node)
-        for var_node, _kind in constructed:
-            if in_scope(var_node.path):
-                seeds_by_path.setdefault(var_node.path, []).append(var_node)
+        for dec_ref in (
+            native.query(ctx).decorators().where_module(self.decorator_module).where_name(names)
+        ):
+            if in_scope(dec_ref.path):
+                seeds_by_path.setdefault(dec_ref.path, []).append(dec_ref.decorated)
+        for cons_ref in (
+            native.query(ctx).constructions().where_module(self.decorator_module).where_name(names)
+        ):
+            if in_scope(cons_ref.path):
+                seeds_by_path.setdefault(cons_ref.path, []).append(cons_ref.var)
 
         for path, targets in seeds_by_path.items():
             yield native.AddNode(
@@ -495,16 +497,18 @@ class DispatchAppPlugin:
         target_names = list(targets)
         decorator_attrs = list(self.registration_decorators)
 
-        direct = ctx.find_instance_constructions(self.app_module, target_names)
-        handlers = ctx.find_handler_decorators(decorator_attrs)
+        direct = list(
+            native.query(ctx).constructions().where_module(self.app_module).where_name(target_names)
+        )
+        handlers = list(native.query(ctx).decorators().where_owner_attr(decorator_attrs))
         factory_decls = (
             ctx.find_factory_decls(self.app_module, target_names) if self._factory_aware else []
         )
 
         direct_by_owner: dict[tuple[str, str], list[tuple["native.NativeNode", str]]] = {}
-        for var_node, kind in direct:
-            simple = var_node.fqname.rsplit(".", 1)[-1]
-            direct_by_owner.setdefault((var_node.path, simple), []).append((var_node, kind))
+        for ref in direct:
+            simple = ref.var.fqname.rsplit(".", 1)[-1]
+            direct_by_owner.setdefault((ref.var.path, simple), []).append((ref.var, ref.class_name))
 
         # Top-level vars keyed by (path, simple_name) so handler-edge
         # emission and the pending-factory walk both have O(1) lookup.
@@ -519,13 +523,13 @@ class DispatchAppPlugin:
         factory_prefix = self._prefix("factory")
 
         if self._factory_aware:
-            for var_node, kind in direct:
-                if self.instance_kinds.get(kind):
+            for ref in direct:
+                if self.instance_kinds.get(ref.class_name):
                     yield native.AddNode(
-                        fqname=f"{app_prefix}{var_node.fqname}",
-                        path=var_node.path,
+                        fqname=f"{app_prefix}{ref.var.fqname}",
+                        path=ref.var.path,
                         flags=int(NodeFlags.ENTRYPOINT),
-                        edges_to=[var_node],
+                        edges_to=[ref.var],
                     )
             for decl_node, kinds in factory_decls:
                 for kind in kinds:
@@ -544,18 +548,20 @@ class DispatchAppPlugin:
         # plugins (Typer / Cyclopts / Click) only wire owners that were
         # directly classified; that gating is what lets the
         # ``from typer import *`` limitation hold (the star import
-        # binds ``app`` but ``find_instance_constructions`` doesn't
-        # resolve through star imports, so ``app`` stays unclassified
-        # and its handlers stay dead).
+        # binds ``app`` but the construction query doesn't resolve
+        # through star imports, so ``app`` stays unclassified and its
+        # handlers stay dead).
         if self._factory_aware:
-            for owner_name, handler_func in handlers:
-                var = vars_by_file.get((handler_func.path, owner_name))
+            for h in handlers:
+                var = vars_by_file.get((h.decorated.path, h.decorator_owner or ""))
                 if var is not None:
-                    yield native.AddEdge(var, handler_func)
+                    yield native.AddEdge(var, h.decorated)
         else:
-            for owner_name, handler_func in handlers:
-                for var_node, _kind in direct_by_owner.get((handler_func.path, owner_name), []):
-                    yield native.AddEdge(var_node, handler_func)
+            for h in handlers:
+                for var_node, _kind in direct_by_owner.get(
+                    (h.decorated.path, h.decorator_owner or ""), []
+                ):
+                    yield native.AddEdge(var_node, h.decorated)
 
         if self._factory_aware:
             # Cross-file factory classification: for every decorator-owned
@@ -569,8 +575,8 @@ class DispatchAppPlugin:
             # ``walk_to_instance_kind``, but using ``ctx.descendants``
             # for the BFS so the work is rust-side.
             classified: set[tuple[str, str]] = set()
-            for owner_name, handler in handlers:
-                key = (handler.path, owner_name)
+            for h in handlers:
+                key = (h.decorated.path, h.decorator_owner or "")
                 if key in direct_by_owner or key in classified:
                     continue
                 var = vars_by_file.get(key)

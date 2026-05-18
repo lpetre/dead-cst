@@ -120,10 +120,14 @@ class CeleryPlugin(DispatchAppPlugin):
 
         yield from DispatchAppPlugin.run(self, ctx)
         # ``@shared_task`` is appless and not covered by DispatchAppPlugin.
-        funcs = ctx.find_decorated_decls("celery", list(_SHARED_TASK_NAMES))
         by_path: dict[str, list[native.NativeNode]] = {}
-        for func in funcs:
-            by_path.setdefault(func.path, []).append(func)
+        for ref in (
+            native.query(ctx)
+            .decorators()
+            .where_module("celery")
+            .where_name(list(_SHARED_TASK_NAMES))
+        ):
+            by_path.setdefault(ref.path, []).append(ref.decorated)
         for path, targets in by_path.items():
             yield native.AddNode(
                 fqname=f"{CELERY_SHARED_PREFIX}{Path(path).name}",
