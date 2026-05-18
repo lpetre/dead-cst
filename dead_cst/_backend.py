@@ -39,6 +39,8 @@ def materialize_project(
     project_root: Path,
     plugins: Sequence[object] = (),
     src_roots: Sequence[Path] = (),
+    *,
+    show_progress: bool = False,
 ) -> SymbolGraph:
     """Materialize ``project_root`` end-to-end via the rust backend.
 
@@ -47,13 +49,19 @@ def materialize_project(
     :meth:`materialize`, and bridges the resulting :class:`NativeGraph`
     into a :class:`SymbolGraph`. Plugins that don't implement the
     rust ``run(ctx)`` protocol are silently skipped.
+
+    ``show_progress=True`` makes the rust backend draw indicatif progress
+    bars to stderr for each of the three per-file phases plus the
+    plugin pass. The CLI sets this; the library API leaves it off.
+    indicatif auto-hides on non-TTY stderr.
     """
     from dead_cst import _native as native
 
-    kwargs = {}
-    if src_roots:
-        kwargs["src_roots"] = [str(p) for p in src_roots]
-    ctx = native.ProjectContext(str(project_root), **kwargs)
+    ctx = native.ProjectContext(
+        str(project_root),
+        src_roots=[str(p) for p in src_roots] if src_roots else None,
+        show_progress=show_progress,
+    )
     for plugin in plugins:
         if hasattr(plugin, "run"):
             ctx.add_plugin(plugin)

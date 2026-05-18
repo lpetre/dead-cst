@@ -34,6 +34,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::str::FromStr;
 
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use pyo3::exceptions::{PyOSError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::PyClass;
@@ -396,7 +397,7 @@ impl Project {
 
     /// Build the project-wide symbol graph.
     fn build(&self, py: Python<'_>) -> PyResult<NativeGraph> {
-        let outputs = build_project_graph(py, &self.db)?;
+        let outputs = build_project_graph(py, &self.db, false)?;
         Ok(NativeGraph {
             nodes: outputs.builder.nodes,
             edges: outputs.builder.edges,
@@ -441,7 +442,75 @@ struct BuildOutputs {
 
 /// Run the three build phases (ingest → hierarchy+imports → references)
 /// and return every index the plugin queries need.
-fn build_project_graph(py: Python<'_>, db: &ProjectDatabase) -> PyResult<BuildOutputs> {
+/// Indicatif bars for the three per-file phases of ``build_project_graph``.
+///
+/// When ``show_progress`` is true, draws to stderr with one bar per phase.
+/// indicatif auto-downgrades to a hidden target on non-TTY stderr, so the
+/// CLI can always pass ``True`` without checking ``isatty`` itself.
+///
+/// When ``show_progress`` is false, every bar uses ``ProgressDrawTarget::hidden()``
+/// so ``inc(1)`` / ``finish`` are cheap no-ops — no allocation of a render
+/// thread, no stderr writes.
+struct ProgressBars {
+    ingest: ProgressBar,
+    imports: ProgressBar,
+    references: ProgressBar,
+}
+
+impl ProgressBars {
+    fn new(show_progress: bool, total_files: u64) -> Self {
+        let multi = MultiProgress::with_draw_target(if show_progress {
+            ProgressDrawTarget::stderr()
+        } else {
+            ProgressDrawTarget::hidden()
+        });
+        let style = ProgressStyle::with_template(
+            "  {prefix:<10} [{bar:30.cyan/blue}] {pos:>6}/{len:<6} {msg}",
+        )
+        .expect("static template parses")
+        .progress_chars("=> ");
+        let mk = |prefix: &'static str| {
+            let bar = multi.add(ProgressBar::new(total_files));
+            bar.set_style(style.clone());
+            bar.set_prefix(prefix);
+            bar
+        };
+        Self {
+            ingest: mk("ingest"),
+            imports: mk("imports"),
+            references: mk("refs"),
+        }
+    }
+
+    /// Single bar for the plugin pass — sits on its own draw target since
+    /// it's created after ``build_project_graph`` returns (the file-pass
+    /// bars are already finished by then).
+    fn plugin_bar(show_progress: bool, total_plugins: u64) -> ProgressBar {
+        let bar = ProgressBar::with_draw_target(
+            Some(total_plugins),
+            if show_progress {
+                ProgressDrawTarget::stderr()
+            } else {
+                ProgressDrawTarget::hidden()
+            },
+        );
+        bar.set_style(
+            ProgressStyle::with_template(
+                "  {prefix:<10} [{bar:30.cyan/blue}] {pos:>6}/{len:<6} {msg}",
+            )
+            .expect("static template parses")
+            .progress_chars("=> "),
+        );
+        bar.set_prefix("plugins");
+        bar
+    }
+}
+
+fn build_project_graph(
+    py: Python<'_>,
+    db: &ProjectDatabase,
+    show_progress: bool,
+) -> PyResult<BuildOutputs> {
     let timing = std::env::var_os("DEAD_CST_TIMING").is_some();
     let mut builder = GraphBuilder::new();
     let mut global_index: DeclIndex = HashMap::new();
@@ -488,6 +557,7 @@ fn build_project_graph(py: Python<'_>, db: &ProjectDatabase) -> PyResult<BuildOu
     // to probe. Pass 1 = everything that isn't a .pyi; pass 2 = .pyi.
     // The split doesn't change the graph for non-peer files; it's
     // ordering for the peer-stub flag-check only.
+    let progress = ProgressBars::new(show_progress, project_files.len() as u64);
     for file in &project_files {
         if file_path_string(db, *file).ends_with(".pyi") {
             continue;
@@ -506,6 +576,7 @@ fn build_project_graph(py: Python<'_>, db: &ProjectDatabase) -> PyResult<BuildOu
             &mut class_by_selection,
             &mut decl_by_name_range,
         )?;
+        progress.ingest.inc(1);
     }
     for file in &project_files {
         if !file_path_string(db, *file).ends_with(".pyi") {
@@ -525,7 +596,9 @@ fn build_project_graph(py: Python<'_>, db: &ProjectDatabase) -> PyResult<BuildOu
             &mut class_by_selection,
             &mut decl_by_name_range,
         )?;
+        progress.ingest.inc(1);
     }
+    progress.ingest.finish_and_clear();
     // Per-decl ``pyi_decl -> py_decl`` edges for each peer .pyi whose
     // matching .py defines the same simple name. The edge documents
     // the stub-runtime relationship in the graph: consumers that ty
@@ -574,7 +647,9 @@ fn build_project_graph(py: Python<'_>, db: &ProjectDatabase) -> PyResult<BuildOu
             &star_reexports,
             &dist_lookup,
         )?;
+        progress.imports.inc(1);
     }
+    progress.imports.finish_and_clear();
     let t_phase2 = t2.elapsed();
     let t3 = std::time::Instant::now();
     for file in &project_files {
@@ -588,7 +663,9 @@ fn build_project_graph(py: Python<'_>, db: &ProjectDatabase) -> PyResult<BuildOu
             &dist_lookup,
             &mut builder,
         );
+        progress.references.inc(1);
     }
+    progress.references.finish_and_clear();
     let t_phase3 = t3.elapsed();
     let t4 = std::time::Instant::now();
     let (decl_by_fqname, module_by_fqname) = build_fqname_indices(py, &builder);
@@ -1773,6 +1850,12 @@ struct ProjectContext {
     /// repeatedly across files with the same pattern, so caching keeps
     /// us off the regex compiler in the hot path.
     regex_cache: RefCell<HashMap<String, regex::Regex>>,
+    /// When true, ``materialize`` and ``build_project_graph`` draw
+    /// indicatif progress bars to stderr. Off by default (library use);
+    /// the CLI's ``dead-cst analyze`` flips it on. indicatif itself
+    /// downgrades to a hidden draw target when stderr isn't a TTY, so
+    /// passing ``True`` is safe in CI / pipes.
+    show_progress: bool,
 }
 
 #[pymethods]
@@ -1786,6 +1869,7 @@ impl ProjectContext {
         python_env = None,
         python_version = None,
         typeshed = None,
+        show_progress = false,
     ))]
     fn new(
         root: &str,
@@ -1794,6 +1878,7 @@ impl ProjectContext {
         python_env: Option<&str>,
         python_version: Option<&str>,
         typeshed: Option<&str>,
+        show_progress: bool,
     ) -> PyResult<Self> {
         let db = make_db(
             root,
@@ -1809,6 +1894,7 @@ impl ProjectContext {
             plugins: Vec::new(),
             outputs: RefCell::new(None),
             regex_cache: RefCell::new(HashMap::new()),
+            show_progress,
         })
     }
 
@@ -1841,9 +1927,10 @@ impl ProjectContext {
     /// Borrows are released between phases so plugin `run` methods can
     /// re-enter queries through the same ctx without aliasing violations.
     fn materialize(slf: Py<Self>, py: Python<'_>) -> PyResult<NativeGraph> {
+        let show_progress = slf.borrow(py).show_progress;
         {
             let this = slf.borrow(py);
-            let outputs = build_project_graph(py, &this.db)?;
+            let outputs = build_project_graph(py, &this.db, show_progress)?;
             *this.outputs.borrow_mut() = Some(outputs);
         }
 
@@ -1853,6 +1940,7 @@ impl ProjectContext {
             .iter()
             .map(|p| p.clone_ref(py))
             .collect();
+        let plugin_bar = ProgressBars::plugin_bar(show_progress, plugins.len() as u64);
         for plugin in &plugins {
             // ``plugin.run(ctx)`` yields ``GraphOp`` values; we apply
             // each as it comes off the iterator. The plugin can run
@@ -1861,6 +1949,13 @@ impl ProjectContext {
             // returning control to the generator. ``None`` (a regular
             // function that ran to completion without yielding) is
             // allowed for plugins with nothing to do.
+            let plugin_name: String = plugin
+                .bind(py)
+                .getattr("name")
+                .ok()
+                .and_then(|n| n.extract().ok())
+                .unwrap_or_else(|| "<unnamed>".to_string());
+            plugin_bar.set_message(plugin_name);
             let result = plugin.bind(py).call_method1("run", (slf.clone_ref(py),))?;
             if !result.is_none() {
                 for item in result.iter()? {
@@ -1868,7 +1963,9 @@ impl ProjectContext {
                     apply_graph_op(&slf, py, &op)?;
                 }
             }
+            plugin_bar.inc(1);
         }
+        plugin_bar.finish_and_clear();
 
         let outputs =
             slf.borrow(py).outputs.borrow_mut().take().ok_or_else(|| {
