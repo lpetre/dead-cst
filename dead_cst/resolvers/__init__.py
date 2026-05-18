@@ -1,47 +1,19 @@
-"""Pluggable resolvers that discover sys.path-like search paths for a project.
+"""Pluggable resolvers that discover the first-party packages of a project.
 
-A :class:`PathResolver` returns a tuple of :class:`Package` objects (one
-per first-party workspace member) plus an import resolver. An
-:class:`~dead_cst.analyze.Analysis` takes exactly one resolver -- callers
-that need to combine layouts pick a single resolver that describes the
-whole project, or write a custom :class:`PathResolver`.
+A :class:`PathResolver` returns a tuple of :class:`Package` objects
+(one per first-party workspace member). An
+:class:`~dead_cst.analyze.Analysis` takes exactly one resolver.
 
-Each builtin resolver lives in its own submodule. Third-party resolvers
-can register under the ``dead_cst.resolvers`` entry-point group;
-:func:`load_resolver` checks builtins first, then falls back to entry points.
-
-In addition, :func:`exported_roots` -- not a resolver itself -- inspects a
-single package's ``pyproject.toml`` to determine which subdirs the build
-backend would actually ship. The shipped resolvers call it at
-:meth:`PathResolver.resolve` time to populate
-:attr:`Package.exported`, so internal dirs like ``tests/`` stay scoped
-to their owning member when other packages import from this one.
-
-Custom resolvers re-implementing :meth:`PathResolver.resolve_import`
-can call :func:`default_resolve_import` (the shipped sys.path /
-importlib implementation) directly, or compose with the lower-level
-:func:`safe_resolve_module`, :func:`distribution_lookup`, and
-:func:`editable_distribution_roots` helpers plus the :data:`STDLIB` /
-:data:`SITE_PACKAGES_MARKERS` classification constants.
-:func:`load_toml` is provided for resolvers that read
-``pyproject.toml``-style config.
+Builtins: :class:`ManualResolver` (explicit ``-p`` specs) and
+:class:`UvResolver` (workspace members discovered from ``uv.lock``).
+Third-party resolvers register under the ``dead_cst.resolvers``
+entry-point group; :func:`load_resolver` checks builtins first.
 """
 
 from __future__ import annotations
 
 from ..contrib.uv import UvResolver
-from ._core import ImportResolver, Package, PathResolver, load_toml
-from ._exports import exported_roots
-from ._imports import (
-    SITE_PACKAGES_MARKERS,
-    STDLIB,
-    clear_module_specs_cache,
-    clear_path_caches,
-    default_resolve_import,
-    distribution_lookup,
-    editable_distribution_roots,
-    safe_resolve_module,
-)
+from ._core import Package, PathResolver, load_toml
 from .manual import ManualResolver
 
 BUILTIN_RESOLVERS: dict[str, type[PathResolver]] = {
@@ -65,20 +37,10 @@ def load_resolver(name: str) -> PathResolver:
 
 __all__ = [
     "BUILTIN_RESOLVERS",
-    "ImportResolver",
     "ManualResolver",
     "Package",
     "PathResolver",
-    "SITE_PACKAGES_MARKERS",
-    "STDLIB",
     "UvResolver",
-    "clear_module_specs_cache",
-    "clear_path_caches",
-    "default_resolve_import",
-    "distribution_lookup",
-    "editable_distribution_roots",
-    "exported_roots",
     "load_resolver",
     "load_toml",
-    "safe_resolve_module",
 ]

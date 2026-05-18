@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
 
 from dead_cst.graph import NodeFlags
 from dead_cst.plugins import UnittestPlugin
@@ -150,33 +149,9 @@ def test_unittest_plugin_skips_files_not_importing_unittest(build_plugin_graph, 
     assert "pkg.things.MyThings" not in reachable_fqnames(graph)
 
 
-@pytest.mark.skip_when_backend("rust")
-def test_unittest_plugin_skips_pure_star_import_libcst(build_plugin_graph, reachable_fqnames):
-    """Documented libcst limitation: the visitor doesn't bind individual
-    names from a star import, so ``class X(TestCase)`` after
-    ``from unittest import *`` doesn't resolve. Users should
-    ``from unittest import TestCase`` instead.
-    """
-    graph = build_plugin_graph(
-        {
-            "pkg/__init__.py": "",
-            "pkg/things.py": """
-            from unittest import *
-
-            class MyThings(TestCase):
-                def test_one(self): pass
-            """,
-        },
-        [UnittestPlugin()],
-    )
-    assert "pkg.things.MyThings" not in reachable_fqnames(graph)
-
-
-@pytest.mark.skip_when_backend("libcst")
-def test_unittest_plugin_resolves_through_star_import_rust(build_plugin_graph, reachable_fqnames):
-    """ty's type hierarchy follows star imports, so the rust backend
-    picks up ``class X(TestCase)`` after ``from unittest import *`` —
-    superseding the libcst-side limitation pinned by the sibling test.
+def test_unittest_plugin_resolves_through_star_import(build_plugin_graph, reachable_fqnames):
+    """ty's type hierarchy follows star imports, so ``class X(TestCase)``
+    after ``from unittest import *`` resolves.
     """
     graph = build_plugin_graph(
         {

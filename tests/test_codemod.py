@@ -49,7 +49,9 @@ def apply_transformer(tmp_path, make_analysis):
         path = tmp_path / "mod.py"
         path.write_text(_normalise(src))
         graph = make_analysis().materialize_all()
-        dead_decls = {(n.fqname, n.position) for n in graph.nodes if n.fqname in dead_fqnames}
+        dead_decls = {
+            (n.fqname, n.position.start.line) for n in graph.nodes if n.fqname in dead_fqnames
+        }
         mgr = FullRepoManager(str(tmp_path), [str(path)], {FixedFullyQualifiedNameProvider})
         wrapper: MetadataWrapper = mgr.get_metadata_wrapper_for_path(str(path))
         return wrapper.visit(RemoveDeadSymbols(dead_decls)).code
@@ -70,7 +72,9 @@ def apply_transformer_at_lines(tmp_path, make_analysis):
         path.write_text(_normalise(src))
         graph = make_analysis().materialize_all()
         dead_decls = {
-            (n.fqname, n.position) for n in graph.nodes if (n.fqname, n.position.start.line) in dead
+            (n.fqname, n.position.start.line)
+            for n in graph.nodes
+            if (n.fqname, n.position.start.line) in dead
         }
         mgr = FullRepoManager(str(tmp_path), [str(path)], {FixedFullyQualifiedNameProvider})
         wrapper: MetadataWrapper = mgr.get_metadata_wrapper_for_path(str(path))

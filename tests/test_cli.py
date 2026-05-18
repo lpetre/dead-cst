@@ -383,26 +383,6 @@ def test_analyze_no_entrypoints_marks_everything_dead(runner, project):
     assert "function: 1 total, 1 dead" in result.stdout
 
 
-def test_analyze_unreachable_branch_reported(runner, project):
-    root = project(
-        {
-            "mod.py": """
-            def used():
-                pass
-
-            if False:
-                dead_branch = 1
-
-            used()
-            """,
-        }
-    )
-    result = runner.invoke(app, ["analyze", str(root), "-e", "mod.used"])
-    assert result.exit_code == 1
-    assert "Unreachable branches (1):" in result.stdout
-    assert re.search(r"mod\.py:\d+:\d+-\d+:\d+", result.stdout)
-
-
 def test_analyze_synthetic_kind_excluded_from_summary(runner, project):
     # ``synthetic`` nodes show up internally for the dead branch, but
     # the per-kind summary suppresses them so users don't see e.g.
@@ -430,33 +410,9 @@ def test_analyze_json_output_has_expected_shape(runner, project):
     result = runner.invoke(app, ["analyze", str(root), "-e", "mod.used", "--format", "json"])
     assert result.exit_code == 1
     payload = json.loads(result.stdout)
-    assert set(payload) == {"summary", "dead_symbols", "unreachable_branches"}
+    assert set(payload) == {"summary", "dead_symbols"}
     assert payload["summary"][str(root.resolve())]["function"] == {"total": 2, "dead": 1}
     assert payload["dead_symbols"] == [{"fqname": "mod.dead", "type": "function", "path": "mod.py"}]
-    assert payload["unreachable_branches"] == []
-
-
-def test_analyze_json_output_includes_branch_positions(runner, project):
-    root = project(
-        {
-            "mod.py": """
-            def used():
-                pass
-
-            if False:
-                x = 1
-
-            used()
-            """,
-        }
-    )
-    result = runner.invoke(app, ["analyze", str(root), "-e", "mod.used", "--format", "json"])
-    payload = json.loads(result.stdout)
-    assert len(payload["unreachable_branches"]) == 1
-    branch = payload["unreachable_branches"][0]
-    assert branch["path"] == "mod.py"
-    assert {"line", "column"} <= set(branch["start"])
-    assert {"line", "column"} <= set(branch["end"])
 
 
 def test_analyze_regex_entrypoint_keeps_module_alive(runner, project):

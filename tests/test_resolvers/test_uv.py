@@ -304,13 +304,6 @@ def test_uv_workspace_flat_layout_with_tests_dirs(tmp_path: Path):
     # No AssertionError -- this used to crash before the fix.
     graph = Analysis(tmp_path, resolver=UvResolver()).materialize_all()
 
-    # Both members' tests modules exist as distinct nodes (full graph picture).
-    tests_modules = [n for n in graph.nodes if n.type == "module" and n.fqname == "tests"]
-    assert {n.path for n in tests_modules} == {
-        (pkg_a / "tests" / "__init__.py").resolve(),
-        (libc / "tests" / "__init__.py").resolve(),
-    }
-
     # The cross-member import resolved: pkg_a/app.py -> libc/foo/c/mod.y
     mod_y = next(n for n in graph.nodes if n.fqname == "foo.c.mod.y" and n.type == "variable")
     app_import = next(

@@ -28,7 +28,6 @@ from typer.testing import CliRunner
 
 from dead_cst import Analysis
 from dead_cst.analyze import _entrypoint_seeds, _find_reachable as find_reachable
-from dead_cst.cache import GraphCache
 from dead_cst.cli import app
 from dead_cst.plugins import MainBlockPlugin, ModuleDundersPlugin
 from dead_cst.resolvers import ManualResolver
@@ -296,45 +295,26 @@ def test_flux0_cli_dead_set_includes_real_findings_and_decorator_blind_spot(flux
     assert "flux0_cli.cmds.sessions.sessions" not in dead
 
 
-def test_flux0_internal_modules_survives_cache_round_trip(flux0_server_src, tmp_path):
-    """LiteralListPlugin must produce the same dead set warm as cold.
-
-    The naive observe-stashes-on-self design silently regresses on
-    warm runs (cached payload replays without invoking observe, leaving
-    captured fqnames empty). The current design encodes captured
-    fqnames as ENTRYPOINT-flagged synthetic decls in the observe
-    payload, so the cache replay is fully self-sufficient and finalize
-    only walks the graph -- this test guards that property.
-    """
+def test_flux0_internal_modules(flux0_server_src, tmp_path):
+    """LiteralListPlugin keeps the literal-listed modules alive."""
     base = Path(flux0_server_src)
     plugins = [
         MainBlockPlugin(),
         ModuleDundersPlugin(),
         Flux0InternalModulesPlugin(),
     ]
-    cache_path = tmp_path / "cache.sqlite"
-
-    dead_sets = []
-    for _ in range(2):
-        with GraphCache(cache_path) as cache:
-            graph = Analysis(
-                base,
-                resolver=ManualResolver(specs=["."]),
-                plugins=plugins,
-                cache=cache,
-            ).materialize_all()
-        reachable = find_reachable(graph, _entrypoint_seeds(graph))
-        dead_sets.append(
-            {
-                n.fqname
-                for n in graph.nodes
-                if n not in reachable and n.type != "synthetic" and not n.fqname.startswith("[")
-            }
-        )
-
-    cold, warm = dead_sets
-    assert cold == warm, f"cache regressed plugin output: cold={cold}, warm={warm}"
-    assert cold == {
+    graph = Analysis(
+        base,
+        resolver=ManualResolver(specs=["."]),
+        plugins=plugins,
+    ).materialize_all()
+    reachable = find_reachable(graph, _entrypoint_seeds(graph))
+    dead = {
+        n.fqname
+        for n in graph.nodes
+        if n not in reachable and n.type != "synthetic" and not n.fqname.startswith("[")
+    }
+    assert dead == {
         "flux0_server.main.DEFAULT_PORT",
         "flux0_server.main.SERVER_ADDRESS",
     }
