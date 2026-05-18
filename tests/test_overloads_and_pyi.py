@@ -7,7 +7,8 @@ import textwrap
 
 
 from dead_cst import NodeFlags
-from dead_cst.analyze import _entrypoint_seeds, _find_reachable as find_reachable
+from dead_cst.analyze import _find_reachable as find_reachable, _keepalive_seeds
+from dead_cst.graph import KEEPALIVE_DEFAULT
 from dead_cst.codemod import remove_code
 from dead_cst.plugins import ExplicitEntrypointPlugin
 
@@ -100,7 +101,7 @@ def test_live_overloads_survive_codemod(tmp_path, make_analysis):
     )
     a = make_analysis(plugins=[ExplicitEntrypointPlugin(specs=["mod.f"])])
     graph = a.materialize_all()
-    reachable = find_reachable(graph, _entrypoint_seeds(graph))
+    reachable = find_reachable(graph, _keepalive_seeds(graph, KEEPALIVE_DEFAULT))
     unreachable = graph.subgraph([n for n in graph.nodes if n not in reachable])
     remove_code(unreachable, tmp_path)
 
@@ -126,7 +127,7 @@ def test_orphan_pyi_stub_uses_runtime_fqname(tmp_path, make_analysis):
 
     a = make_analysis(plugins=[ExplicitEntrypointPlugin(specs=["main"])])
     graph = a.materialize_all()
-    reachable = find_reachable(graph, _entrypoint_seeds(graph))
+    reachable = find_reachable(graph, _keepalive_seeds(graph, KEEPALIVE_DEFAULT))
 
     stub_compute = next(
         n for n in graph.nodes if n.fqname == "mypkg._native.compute" and n.type == "function"

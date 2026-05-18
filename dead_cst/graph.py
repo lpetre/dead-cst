@@ -21,7 +21,20 @@ logger = logging.getLogger(__name__)
 
 
 class NodeFlags(enum.IntFlag):
-    """Analyzer-internal marker on :class:`SymbolNode`."""
+    """Analyzer-internal marker on :class:`SymbolNode`.
+
+    Each ``KEEPALIVE`` bit (:data:`ENTRYPOINT`, :data:`TESTCASE`,
+    :data:`NOQA`, :data:`NOTEBOOK`) independently says "the reachability
+    BFS seeds from nodes carrying this bit." :data:`KEEPALIVE_DEFAULT`
+    ORs all of them; pass a subset to
+    :meth:`Analysis.reachable(seed_flags=...)` /
+    :meth:`Analysis.dead(seed_flags=...)` to restrict the seeds.
+
+    The bits are independent metadata — ``TESTCASE`` alone keeps a node
+    alive; it does not have to be ORed with ``ENTRYPOINT``. That lets
+    callers ask focused questions: "what's alive ignoring tests?" is
+    ``reachable(seed_flags=KEEPALIVE_DEFAULT & ~NodeFlags.TESTCASE)``.
+    """
 
     NONE = 0
     SHADOWED = enum.auto()
@@ -30,6 +43,26 @@ class NodeFlags(enum.IntFlag):
     TESTCASE = enum.auto()
     NOQA = enum.auto()
     NOTEBOOK = enum.auto()
+
+
+#: Default seed mask for reachability queries. ORs together every
+#: :class:`NodeFlags` bit that semantically "keeps a node alive":
+#:
+#: * :data:`NodeFlags.ENTRYPOINT` — explicit entrypoints (plugin-emitted
+#:   seeds, ``-e`` CLI flag, ``[project.scripts]`` targets, ...).
+#: * :data:`NodeFlags.TESTCASE` — pytest / unittest discoveries.
+#: * :data:`NodeFlags.NOQA` — imports pinned by a ``# noqa: F401``
+#:   directive.
+#: * :data:`NodeFlags.NOTEBOOK` — notebook cells (run top-to-bottom,
+#:   never imported, always alive).
+#:
+#: :meth:`Analysis.reachable` / :meth:`Analysis.dead` default to this
+#: mask. Pass a subset to scope the question — e.g.
+#: ``reachable(seed_flags=NodeFlags.ENTRYPOINT)`` asks "what would be
+#: alive if the test suite, ``noqa`` pins, and notebooks didn't exist."
+KEEPALIVE_DEFAULT: NodeFlags = (
+    NodeFlags.ENTRYPOINT | NodeFlags.TESTCASE | NodeFlags.NOQA | NodeFlags.NOTEBOOK
+)
 
 
 class EdgeFlags(enum.IntFlag):
@@ -83,6 +116,7 @@ class SymbolNode:
 
 
 __all__ = [
+    "KEEPALIVE_DEFAULT",
     "EdgeFlags",
     "Import",
     "NodeFlags",

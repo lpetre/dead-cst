@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Iterable, Iterator, Mapping, Sequence
 
 from ._graphstore import SymbolGraph
-from .graph import EdgeFlags, NodeFlags, SymbolNode
+from .graph import KEEPALIVE_DEFAULT, EdgeFlags, NodeFlags, SymbolNode
 from .resolvers import Package, PathResolver
 from .resolvers._core import _validate_packages
 
@@ -31,12 +31,16 @@ def _bfs_order(seeds: Iterable[Path], neighbors: Mapping[Path, Sequence[Path]]) 
 _NON_DECL_TYPES: frozenset[str] = frozenset({"module", "synthetic"})
 
 
-def _entrypoint_seeds(graph: SymbolGraph, exclude_flags: NodeFlags = NodeFlags.NONE) -> list[int]:
-    return [
-        graph.index(n)
-        for n in graph.nodes
-        if n.flags & NodeFlags.ENTRYPOINT and not (n.flags & exclude_flags)
-    ]
+def _keepalive_seeds(graph: SymbolGraph, seed_flags: NodeFlags) -> list[int]:
+    """Indices of every node whose flags intersect ``seed_flags``.
+
+    Each bit in ``seed_flags`` is a keepalive criterion -- a node
+    carrying any of them is a reachability seed. Pass
+    :data:`KEEPALIVE_DEFAULT` for the standard behaviour, or a narrower
+    mask to ask focused questions (e.g. ``NodeFlags.ENTRYPOINT`` alone
+    excludes tests / noqa pins / notebooks from the seed set).
+    """
+    return [graph.index(n) for n in graph.nodes if n.flags & seed_flags]
 
 
 def _find_reachable(
@@ -67,26 +71,41 @@ def _find_reachable(
 
 
 def _find_kept_alive_by_dead_branches(
-    graph: SymbolGraph, *, prefix: Path | None = None
+    graph: SymbolGraph,
+    *,
+    seed_flags: NodeFlags = KEEPALIVE_DEFAULT,
+    prefix: Path | None = None,
 ) -> set[SymbolNode]:
-    seeds = _entrypoint_seeds(graph)
+    seeds = _keepalive_seeds(graph, seed_flags)
     return _find_reachable(graph, seeds, prefix=prefix) - _find_reachable(
         graph, seeds, prefix=prefix, skip_dead_branches=True
     )
 
 
 def _find_kept_alive_by_flags_only(
-    graph: SymbolGraph, flags: NodeFlags, *, prefix: Path | None = None
+    graph: SymbolGraph,
+    flags: NodeFlags,
+    *,
+    seed_flags: NodeFlags = KEEPALIVE_DEFAULT,
+    prefix: Path | None = None,
 ) -> set[SymbolNode]:
-    all_seeds = _entrypoint_seeds(graph)
-    kept_seeds = [i for i in all_seeds if not (graph.node(i).flags & flags)]
+    """Diff between ``reachable(seed_flags)`` and
+    ``reachable(seed_flags & ~flags)`` -- the blast radius of dropping
+    every seed whose flags carry any bit in ``flags``."""
+    all_seeds = _keepalive_seeds(graph, seed_flags)
+    kept_seeds = _keepalive_seeds(graph, seed_flags & ~flags)
     return _find_reachable(graph, all_seeds, prefix=prefix) - _find_reachable(
         graph, kept_seeds, prefix=prefix
     )
 
 
-def _iter_dead(graph: SymbolGraph, *, prefix: Path | None = None) -> Iterator[SymbolNode]:
-    reachable = _find_reachable(graph, _entrypoint_seeds(graph))
+def _iter_dead(
+    graph: SymbolGraph,
+    *,
+    seed_flags: NodeFlags = KEEPALIVE_DEFAULT,
+    prefix: Path | None = None,
+) -> Iterator[SymbolNode]:
+    reachable = _find_reachable(graph, _keepalive_seeds(graph, seed_flags))
     for n in graph.nodes:
         if prefix is not None and not n.path.is_relative_to(prefix):
             continue
@@ -224,18 +243,30 @@ class Analysis:
         """
         return self.materialize_all()
 
-    def reachable(self) -> set[SymbolNode]:
+    def reachable(self, *, seed_flags: NodeFlags = KEEPALIVE_DEFAULT) -> set[SymbolNode]:
+        """Set of every decl reachable from any seed in ``seed_flags``.
+
+        ``seed_flags`` defaults to :data:`KEEPALIVE_DEFAULT` (every
+        keepalive bit ORed together). Pass a subset to scope the
+        question -- e.g. ``seed_flags=NodeFlags.ENTRYPOINT`` excludes
+        tests, ``noqa``-pinned imports, and notebooks from the seed set.
+        """
         g = self.materialize_all()
-        return _find_reachable(g, _entrypoint_seeds(g))
+        return _find_reachable(g, _keepalive_seeds(g, seed_flags))
 
-    def dead(self) -> Iterator[SymbolNode]:
-        return _iter_dead(self.materialize_all())
+    def dead(self, *, seed_flags: NodeFlags = KEEPALIVE_DEFAULT) -> Iterator[SymbolNode]:
+        """Yield every decl that no seed in ``seed_flags`` reaches."""
+        return _iter_dead(self.materialize_all(), seed_flags=seed_flags)
 
-    def kept_alive_by_dead_branches(self) -> set[SymbolNode]:
-        return _find_kept_alive_by_dead_branches(self.materialize_all())
+    def kept_alive_by_dead_branches(
+        self, *, seed_flags: NodeFlags = KEEPALIVE_DEFAULT
+    ) -> set[SymbolNode]:
+        return _find_kept_alive_by_dead_branches(self.materialize_all(), seed_flags=seed_flags)
 
-    def kept_alive_by_flags_only(self, flags: NodeFlags) -> set[SymbolNode]:
-        return _find_kept_alive_by_flags_only(self.materialize_all(), flags)
+    def kept_alive_by_flags_only(
+        self, flags: NodeFlags, *, seed_flags: NodeFlags = KEEPALIVE_DEFAULT
+    ) -> set[SymbolNode]:
+        return _find_kept_alive_by_flags_only(self.materialize_all(), flags, seed_flags=seed_flags)
 
     def count_nodes(self, prefix: Path | None = None) -> dict[str, int]:
         return _count_nodes(self.materialize_all().nodes, prefix)
@@ -278,21 +309,34 @@ class PackageView:
     def graph(self) -> SymbolGraph:
         return self._analysis.materialize_all()
 
-    def reachable(self) -> set[SymbolNode]:
+    def reachable(self, *, seed_flags: NodeFlags = KEEPALIVE_DEFAULT) -> set[SymbolNode]:
         g = self._analysis.materialize_all()
-        return _find_reachable(g, _entrypoint_seeds(g), prefix=self._package.path)
+        return _find_reachable(g, _keepalive_seeds(g, seed_flags), prefix=self._package.path)
 
-    def dead(self) -> Iterator[SymbolNode]:
-        return _iter_dead(self._analysis.materialize_all(), prefix=self._package.path)
-
-    def kept_alive_by_dead_branches(self) -> set[SymbolNode]:
-        return _find_kept_alive_by_dead_branches(
-            self._analysis.materialize_all(), prefix=self._package.path
+    def dead(self, *, seed_flags: NodeFlags = KEEPALIVE_DEFAULT) -> Iterator[SymbolNode]:
+        return _iter_dead(
+            self._analysis.materialize_all(),
+            seed_flags=seed_flags,
+            prefix=self._package.path,
         )
 
-    def kept_alive_by_flags_only(self, flags: NodeFlags) -> set[SymbolNode]:
+    def kept_alive_by_dead_branches(
+        self, *, seed_flags: NodeFlags = KEEPALIVE_DEFAULT
+    ) -> set[SymbolNode]:
+        return _find_kept_alive_by_dead_branches(
+            self._analysis.materialize_all(),
+            seed_flags=seed_flags,
+            prefix=self._package.path,
+        )
+
+    def kept_alive_by_flags_only(
+        self, flags: NodeFlags, *, seed_flags: NodeFlags = KEEPALIVE_DEFAULT
+    ) -> set[SymbolNode]:
         return _find_kept_alive_by_flags_only(
-            self._analysis.materialize_all(), flags, prefix=self._package.path
+            self._analysis.materialize_all(),
+            flags,
+            seed_flags=seed_flags,
+            prefix=self._package.path,
         )
 
     def count_nodes(self) -> dict[str, int]:
@@ -305,11 +349,11 @@ class PackageView:
             prefix=None,
         )
 
-    def remove_dead_code(self) -> None:
+    def remove_dead_code(self, *, seed_flags: NodeFlags = KEEPALIVE_DEFAULT) -> None:
         from .codemod import remove_code
 
         g = self._analysis.materialize_all()
-        reachable = _find_reachable(g, _entrypoint_seeds(g))
+        reachable = _find_reachable(g, _keepalive_seeds(g, seed_flags))
         dead_nodes = [
             n for n in g.nodes if n not in reachable and n.path.is_relative_to(self._package.path)
         ]

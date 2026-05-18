@@ -6,7 +6,8 @@ import pytest
 
 from dead_cst import Analysis
 from dead_cst._graphstore import SymbolGraph
-from dead_cst.analyze import _entrypoint_seeds, _find_reachable as find_reachable
+from dead_cst.analyze import _find_reachable as find_reachable, _keepalive_seeds
+from dead_cst.graph import KEEPALIVE_DEFAULT
 from dead_cst.resolvers import ManualResolver
 
 
@@ -15,7 +16,7 @@ def reachable_fqnames():
     """Return ``{fqname for n in find_reachable(graph) if not synthetic}``."""
 
     def _reachable(graph) -> set[str]:
-        reached = find_reachable(graph, _entrypoint_seeds(graph))
+        reached = find_reachable(graph, _keepalive_seeds(graph, KEEPALIVE_DEFAULT))
         return {n.fqname for n in reached if n.type != "synthetic"}
 
     return _reachable

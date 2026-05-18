@@ -74,7 +74,7 @@ def _mark_seed(
     yield native.AddNode(
         fqname=fqname,
         path=path,
-        flags=int(NodeFlags.ENTRYPOINT | NodeFlags.TESTCASE),
+        flags=int(NodeFlags.TESTCASE),
         edges_to=targets,
     )
 
