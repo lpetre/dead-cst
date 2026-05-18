@@ -365,7 +365,11 @@ class Analysis:
         cache: GraphCache | None = None,
         unreachable_detector: UnreachableRegionDetector | None = None,
         workers: int | None = None,
+        backend: str = "libcst",
     ) -> None:
+        if backend not in ("rust", "libcst"):
+            raise ValueError(f"Analysis(backend={backend!r}) — must be 'rust' or 'libcst'")
+        self._backend: str = backend
         self._project_root: Path = project_root
         validated = _validate_packages(resolver.resolve(project_root))
         self._packages_by_path: dict[Path, Package] = {p.path: p for p in validated}
@@ -559,9 +563,15 @@ class Analysis:
         for a whole-project cache refresh in callers that don't refresh
         explicitly.
         """
-        if self._full_graph is None:
-            self.refresh()
-            self._full_graph = self._materialize(included=frozenset(p.path for p in self.packages))
+        if self._full_graph is not None:
+            return self._full_graph
+        if self._backend == "rust":
+            from ._native import materialize_project
+
+            self._full_graph = materialize_project(self._project_root, self._plugins)
+            return self._full_graph
+        self.refresh()
+        self._full_graph = self._materialize(included=frozenset(p.path for p in self.packages))
         return self._full_graph
 
     def materialize_closure(self, package: Path) -> SymbolGraph:
@@ -579,6 +589,12 @@ class Analysis:
         """
         if self._full_graph is not None:
             return self._full_graph
+        if self._backend == "rust":
+            # The rust backend builds the whole project graph in one
+            # pass via ty's Salsa db — there's no cheaper per-package
+            # closure to compute. Fall through to the full materialize
+            # and memoize as the full graph.
+            return self.materialize_all()
         if package not in self._closure_graphs:
             included = self._interesting_set(package)
             self.refresh(packages=included)

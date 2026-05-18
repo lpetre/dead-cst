@@ -22,7 +22,7 @@ native = pytest.importorskip("dead_cst_ty_native")
 
 from dead_cst.graph import EdgeFlags, NodeFlags  # noqa: E402
 
-from ._bridge import materialize  # noqa: E402
+from dead_cst._native import _bridge as materialize  # noqa: E402
 
 
 @pytest.fixture
