@@ -31,8 +31,7 @@ the factory-aware :class:`DispatchAppPlugin` base:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Mapping
+from dataclasses import dataclass
 
 from ..plugins.decl_shapes import DispatchAppPlugin
 
@@ -56,13 +55,6 @@ _REGISTRATION_DECORATORS: frozenset[str] = frozenset(
         "on_event",
     }
 )
-
-# Classes whose instances we treat specially. Value records whether the
-# instance should be seeded as an entrypoint.
-_INSTANCE_KINDS: Mapping[str, bool] = {
-    "FastAPI": True,  # uvicorn loads ``module:app`` -- always an entrypoint
-    "APIRouter": False,  # only alive if reached via ``include_router``
-}
 
 
 @dataclass
@@ -100,6 +92,5 @@ class FastAPIPlugin(DispatchAppPlugin):
 
     name: str = "fastapi"
     version: int = 1778973600
-    app_modules: tuple[str, ...] = ("fastapi",)
+    app_classes: tuple[str, ...] = ("fastapi.FastAPI",)
     registration_decorators: frozenset[str] = _REGISTRATION_DECORATORS
-    instance_kinds: Mapping[str, bool] = field(default_factory=lambda: dict(_INSTANCE_KINDS))

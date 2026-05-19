@@ -3,11 +3,12 @@
 Strategy: find top-level ``App()`` instances in each module and emit
 inverse edges (instance -> handler) for every ``@<instance>.command(...)``
 and ``@<instance>.default(...)`` decorator. Cyclopts apps are *not*
-seeded as entrypoints; reachability is expected to flow through
-``[project.scripts]`` (handled by :class:`ProjectScriptsPlugin`) or an
-``if __name__ == "__main__": app()`` block (handled by
-:class:`MainBlockPlugin`). Sub-apps attached via ``app.command(sub)``
-are kept alive through the ordinary reference tracked on that call.
+seeded as entrypoints (``seed_as_entrypoint=False``); reachability is
+expected to flow through ``[project.scripts]`` (handled by
+:class:`ProjectScriptsPlugin`) or an ``if __name__ == "__main__":
+app()`` block (handled by :class:`MainBlockPlugin`). Sub-apps attached
+via ``app.command(sub)`` are kept alive through the ordinary reference
+tracked on that call.
 """
 
 from __future__ import annotations
@@ -31,6 +32,6 @@ class CycloptsPlugin(DispatchAppPlugin):
 
     name: str = "cyclopts"
     version: int = 1778020575
-    app_modules: tuple[str, ...] = ("cyclopts",)
-    constructor_targets: frozenset[str] = frozenset({"App"})
+    app_classes: tuple[str, ...] = ("cyclopts.App",)
     registration_decorators: frozenset[str] = frozenset({"command", "default"})
+    seed_as_entrypoint: bool = False
