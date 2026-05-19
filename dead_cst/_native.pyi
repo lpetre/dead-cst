@@ -643,8 +643,10 @@ class DecoratorRef:
     ``args`` and ``kwargs`` are populated from the decorator's
     ``Call`` form (``@dec(a, b, k=v)``). Bare-attribute decorators
     (``@app.route`` without ``()``) get empty containers. Each value
-    is either a Python literal (str / int / float / bool / None /
-    list / tuple) or ``None`` for any non-literal expression.
+    is a Python literal (str / int / float / bool / None / list /
+    tuple), a :class:`NativeNode` when the expression statically
+    resolves to a project decl, or ``None`` for any other non-literal
+    expression.
     """
 
     decorated: NativeNode
@@ -677,9 +679,10 @@ class CallRef:
     passed to :meth:`CallQuery.string_arg_at`.
 
     ``args`` and ``kwargs`` carry the call's full positional /
-    keyword argument shape. Each value is either a Python literal
-    (str / int / float / bool / None / list / tuple) or ``None``
-    for any non-literal expression.
+    keyword argument shape. Each value is a Python literal (str /
+    int / float / bool / None / list / tuple), a :class:`NativeNode`
+    when the expression statically resolves to a project decl, or
+    ``None`` for any other non-literal expression.
     """
 
     owner: NativeNode
