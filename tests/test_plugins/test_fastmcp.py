@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from dead_cst.plugins import DispatchAppPlugin, fastmcp_plugin
 
 
@@ -109,11 +111,11 @@ def test_fastmcp_plugin_auto_seeds_server_as_entrypoint(build_plugin_graph, reac
     assert "server.main.hello" in reached
 
 
-def test_fastmcp_plugin_handles_aliased_class_import(build_plugin_graph, reachable_fqnames):
-    graph = build_plugin_graph(
-        {
-            "server/__init__.py": "",
-            "server/main.py": """
+@pytest.mark.parametrize(
+    "src",
+    [
+        pytest.param(
+            """
             from fastmcp import FastMCP as Server
 
             mcp = Server("demo")
@@ -121,17 +123,10 @@ def test_fastmcp_plugin_handles_aliased_class_import(build_plugin_graph, reachab
             @mcp.tool()
             def hello(): pass
             """,
-        },
-        [fastmcp_plugin()],
-    )
-    assert "server.main.hello" in reachable_fqnames(graph)
-
-
-def test_fastmcp_plugin_handles_module_import(build_plugin_graph, reachable_fqnames):
-    graph = build_plugin_graph(
-        {
-            "server/__init__.py": "",
-            "server/main.py": """
+            id="aliased-class-import",
+        ),
+        pytest.param(
+            """
             import fastmcp
 
             mcp = fastmcp.FastMCP("demo")
@@ -139,17 +134,10 @@ def test_fastmcp_plugin_handles_module_import(build_plugin_graph, reachable_fqna
             @mcp.tool()
             def hello(): pass
             """,
-        },
-        [fastmcp_plugin()],
-    )
-    assert "server.main.hello" in reachable_fqnames(graph)
-
-
-def test_fastmcp_plugin_handles_annotated_assignment(build_plugin_graph, reachable_fqnames):
-    graph = build_plugin_graph(
-        {
-            "server/__init__.py": "",
-            "server/main.py": """
+            id="module-import",
+        ),
+        pytest.param(
+            """
             from fastmcp import FastMCP
 
             mcp: FastMCP = FastMCP("demo")
@@ -157,7 +145,13 @@ def test_fastmcp_plugin_handles_annotated_assignment(build_plugin_graph, reachab
             @mcp.tool()
             def hello(): pass
             """,
-        },
+            id="annotated-assignment",
+        ),
+    ],
+)
+def test_fastmcp_plugin_handles_import_variants(build_plugin_graph, reachable_fqnames, src):
+    graph = build_plugin_graph(
+        {"server/__init__.py": "", "server/main.py": src},
         [fastmcp_plugin()],
     )
     assert "server.main.hello" in reachable_fqnames(graph)

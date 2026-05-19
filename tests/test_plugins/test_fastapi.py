@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from dead_cst.plugins import DispatchAppPlugin, fastapi_plugin
 
 
@@ -208,11 +210,11 @@ def test_fastapi_plugin_router_reachable_via_include_router(build_plugin_graph, 
     assert "app.routes.things" in reached
 
 
-def test_fastapi_plugin_handles_aliased_class_import(build_plugin_graph, reachable_fqnames):
-    graph = build_plugin_graph(
-        {
-            "app/__init__.py": "",
-            "app/main.py": """
+@pytest.mark.parametrize(
+    "src",
+    [
+        pytest.param(
+            """
             from fastapi import FastAPI as F
 
             app = F()
@@ -220,17 +222,10 @@ def test_fastapi_plugin_handles_aliased_class_import(build_plugin_graph, reachab
             @app.get("/")
             def index(): pass
             """,
-        },
-        [fastapi_plugin()],
-    )
-    assert "app.main.index" in reachable_fqnames(graph)
-
-
-def test_fastapi_plugin_handles_module_import(build_plugin_graph, reachable_fqnames):
-    graph = build_plugin_graph(
-        {
-            "app/__init__.py": "",
-            "app/main.py": """
+            id="aliased-class-import",
+        ),
+        pytest.param(
+            """
             import fastapi
 
             app = fastapi.FastAPI()
@@ -238,17 +233,10 @@ def test_fastapi_plugin_handles_module_import(build_plugin_graph, reachable_fqna
             @app.get("/")
             def index(): pass
             """,
-        },
-        [fastapi_plugin()],
-    )
-    assert "app.main.index" in reachable_fqnames(graph)
-
-
-def test_fastapi_plugin_handles_annotated_assignment(build_plugin_graph, reachable_fqnames):
-    graph = build_plugin_graph(
-        {
-            "app/__init__.py": "",
-            "app/main.py": """
+            id="module-import",
+        ),
+        pytest.param(
+            """
             from fastapi import FastAPI
 
             app: FastAPI = FastAPI()
@@ -256,7 +244,13 @@ def test_fastapi_plugin_handles_annotated_assignment(build_plugin_graph, reachab
             @app.get("/")
             def index(): pass
             """,
-        },
+            id="annotated-assignment",
+        ),
+    ],
+)
+def test_fastapi_plugin_handles_import_variants(build_plugin_graph, reachable_fqnames, src):
+    graph = build_plugin_graph(
+        {"app/__init__.py": "", "app/main.py": src},
         [fastapi_plugin()],
     )
     assert "app.main.index" in reachable_fqnames(graph)
