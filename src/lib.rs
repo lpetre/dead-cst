@@ -39,7 +39,7 @@ mod query;
 use pyo3::prelude::*;
 
 use crate::builder::{AddEdge, AddEntrypoint, AddNode};
-use crate::graph::{EdgeFlags, Import, NativeGraph, SymbolNode, NodeFlags};
+use crate::graph::{EdgeFlags, Import, NativeGraph, NodeFlags, SymbolNode};
 use crate::project::{Project, ProjectContext};
 use crate::query::{
     CallQuery, CallRef, ClassQuery, ConstructionQuery, ConstructionRef, DecoratorQuery,

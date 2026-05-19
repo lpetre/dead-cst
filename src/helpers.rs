@@ -20,7 +20,7 @@ use ty_module_resolver::{file_to_module, resolve_module, ModuleName};
 use ty_project::metadata::value::RelativePathBuf;
 use ty_project::{Db as ProjectDb, ProjectDatabase};
 
-use crate::graph::{DeclIndex, EdgeFlags, SymbolNode, NodeFlags};
+use crate::graph::{DeclIndex, EdgeFlags, NodeFlags, SymbolNode};
 use crate::ingest::collapse_attribute_chain;
 use crate::project::BuildOutputs;
 
