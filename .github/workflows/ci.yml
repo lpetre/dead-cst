@@ -77,12 +77,14 @@ jobs:
           name: dead-cst-wheel
           path: dist/*.whl
 
-  # Rust unit tests. Runs in parallel with ``build`` -- they don't share
-  # a target dir because clippy uses default features (extension-module
-  # on; cdylib expects Python to supply symbols at runtime) while
-  # ``cargo test`` needs ``--no-default-features`` so the test binary
-  # can link libpython itself.
+  # Rust unit tests. Downstream of ``build`` so ``~/.cargo/registry``
+  # (200+ deps) is warm from build's cache restore; the target/ on top
+  # is partially shared too (cargo's feature-fingerprint keeps the
+  # default-features artifacts from build separate from the
+  # no-default-features artifacts here, but they coexist in the same
+  # target/ tree).
   rust-test:
+    needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -93,7 +95,7 @@ jobs:
           rustflags: ""
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: ci-rust-test
+          shared-key: ci-build
       - run: cargo test --no-default-features --locked
 
   # Install the prebuilt wheel into each Python version's venv and run
