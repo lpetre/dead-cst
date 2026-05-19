@@ -427,6 +427,21 @@ class ProjectContext:
         """
         ...
 
+    def find_literal_list_entries(self, var_fqn: str) -> list[str] | None:
+        """Read the literal-list value of a top-level variable
+        assignment (``X = ["a", "b"]`` / ``X: tuple[str, ...] = (...)``)
+        and return the entries as strings.
+
+        Returns ``None`` when the variable isn't found, when its
+        assignment value isn't a list / tuple of string literals, or
+        when any element is a non-literal (``[*BASE, "c"]``,
+        ``list(...)``, etc.). Targeted read used by
+        :class:`dead_cst.plugins.decl_shapes.LiteralListPlugin` to
+        stay independent of the visitor's ``__all__``-only string-list
+        edge emission.
+        """
+        ...
+
     # ----- Path / name filters ------------------------------------------
 
     def decls_under(self, path_prefix: str) -> list[NativeNode]:
@@ -754,6 +769,14 @@ class QueryBuilder:
         ``None`` when the module declares no ``__all__``.
 
         Mirrors :meth:`ProjectContext.find_module_dunder_all_exports`.
+        """
+        ...
+
+    def literal_list_entries(self, var_fqn: str) -> list[str] | None:
+        """Read the literal-list value of a top-level variable
+        assignment and return the entries as strings.
+
+        Mirrors :meth:`ProjectContext.find_literal_list_entries`.
         """
         ...
 

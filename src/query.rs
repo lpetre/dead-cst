@@ -165,6 +165,14 @@ impl QueryBuilder {
             .borrow(py)
             .find_module_dunder_all_exports(py, fqname)
     }
+    /// Read the literal-list value of a top-level variable assignment
+    /// (``X = ["a", "b"]``) and return the entries as strings.
+    /// Returns ``None`` when the variable isn't a list / tuple of
+    /// string literals.
+    /// Mirrors :meth:`ProjectContext.find_literal_list_entries`.
+    fn literal_list_entries(&self, py: Python<'_>, var_fqn: &str) -> PyResult<Option<Vec<String>>> {
+        self.ctx.borrow(py).find_literal_list_entries(var_fqn)
+    }
     /// All top-level ``__dunder__`` declarations across the project.
     /// Mirrors :meth:`ProjectContext.find_module_dunders`.
     fn module_dunders(&self, py: Python<'_>) -> PyResult<Vec<Py<NativeNode>>> {

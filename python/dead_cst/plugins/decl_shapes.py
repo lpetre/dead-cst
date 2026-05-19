@@ -300,27 +300,28 @@ class LiteralListPlugin:
         if not self.owner_fqname or not self.variable_name:
             return
         var_fqname = f"{self.owner_fqname}.{self.variable_name}"
-        # Use a calls-style approach via reading the source isn't possible
-        # — instead resolve the literal list by reading the dunder all
-        # exports machinery (if used). Simpler: look up declarations and
-        # walk successors via the visitor's ``X = ['...']`` edges.
-        decls = native.query(ctx).declarations(var_fqname)
-        if not decls:
+        # Read the variable's RHS directly via the targeted query.
+        # The visitor doesn't emit ``var -> referent`` edges for
+        # non-``__all__`` string-list assignments, so the plugin can't
+        # rely on a descendant walk.
+        entries = native.query(ctx).literal_list_entries(var_fqname)
+        if not entries:
             return
 
-        # Walk forward from each variable decl: the visitor wires
-        # ``var -> referent`` edges for every string-literal entry that
-        # named a project decl (via __all__-style emission), so the
-        # successors of the variable node are the targets.
         prefix = f"<{self.name}>:"
-        for decl in decls:
-            for desc in ctx.descendants(decl):
-                if desc is decl:
-                    continue
-                if desc.kind in ("module", "function", "class", "variable"):
-                    yield native.AddNode(
-                        fqname=f"{prefix}{desc.fqname}",
-                        path=decl.path,
-                        flags=int(NodeFlags.ENTRYPOINT),
-                        edges_to=[desc],
-                    )
+        for entry in entries:
+            # Each entry resolves as either a module fqname (revive the
+            # whole surface, mirroring ``importlib.import_module``) or a
+            # single decl fqname. Try both; some entries may match both
+            # (e.g. ``pkg.foo`` where ``foo`` is also a re-exported decl
+            # in ``pkg/__init__.py``).
+            targets: list[native.NativeNode] = list(ctx.module_surface(entry))
+            targets.extend(native.query(ctx).declarations(entry))
+            if not targets:
+                continue
+            yield native.AddNode(
+                fqname=f"{prefix}{entry}",
+                path=targets[0].path,
+                flags=int(NodeFlags.ENTRYPOINT),
+                edges_to=targets,
+            )
