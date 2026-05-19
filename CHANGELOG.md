@@ -48,6 +48,8 @@ two versions.
   :class:`DecoratorRef`). Constructors are calls, and their argument
   shape is now surfaced to plugins.
 
+## [0.10.0] - 2026-05-15
+
 ### Added
 - :class:`dead_cst.plugins.DynamicImportFallbackPlugin` — a plugin
   that reads :attr:`EdgeFlags.DYNAMIC_IMPORT` edges and fans each
@@ -1513,7 +1515,9 @@ versions until the first stable release.
 - `README.md`, `CONTRIBUTING.md`, `CHANGELOG.md`, and `ROADMAP.md` with a
   stack-ranked plan from alpha to 1.0.
 
-[Unreleased]: https://github.com/lpetre/dead-cst/compare/v0.9.3...HEAD
+[Unreleased]: https://github.com/lpetre/dead-cst/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/lpetre/dead-cst/compare/v0.9.4...v0.10.0
+[0.9.4]: https://github.com/lpetre/dead-cst/compare/v0.9.3...v0.9.4
 [0.9.3]: https://github.com/lpetre/dead-cst/compare/v0.9.2...v0.9.3
 [0.9.2]: https://github.com/lpetre/dead-cst/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/lpetre/dead-cst/compare/v0.9.0...v0.9.1
