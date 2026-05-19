@@ -23,7 +23,7 @@ use ruff_db::files::{File, FilePath};
 use ruff_db::parsed::{parsed_module, ParsedModuleRef};
 use ruff_db::source::{line_index, source_text};
 use ruff_python_ast::visitor::{walk_expr, walk_stmt, Visitor};
-use ruff_python_ast::{Expr, ExprName, Stmt};
+use ruff_python_ast::{Expr, ExprName, ExprStringLiteral, Stmt};
 use ruff_text_size::{Ranged, TextRange};
 use ty_module_resolver::{
     file_to_module, resolve_module, search_paths, ModuleName, ModuleResolveMode,
@@ -468,6 +468,21 @@ pub(crate) fn emit_import_edges(
     let place_table = index.place_table(global);
     let use_def_map = index.use_def_map(global);
 
+    // ``from .submod import X`` inside a package ``__init__.py`` mints
+    // both an ``ImportFrom`` alias for ``X`` and an ``ImportFromSubmodule``
+    // alias for the side-effect attribute ``submod`` on the current
+    // package. Nothing in the importing file references the bare name
+    // ``submod`` (only ``X``), so without help the submodule alias has
+    // zero in-edges and looks dead — but the statement is one
+    // inseparable syntactic unit. Collect per-statement aliases so we
+    // can wire ``sibling → submodule_alias`` edges at the end.
+    #[derive(Default)]
+    struct StmtAliases {
+        submodule: Option<usize>,
+        siblings: Vec<usize>,
+    }
+    let mut by_stmt: HashMap<TextRange, StmtAliases> = HashMap::new();
+
     // The "is this target idx a module node?" check below used to
     // rebuild this set on every iteration. Hoist it; the resolve_*
     // calls below can add new module nodes, so refresh only when
@@ -495,8 +510,20 @@ pub(crate) fn emit_import_edges(
             };
 
         let from_stmt = match kind {
-            DefinitionKind::ImportFrom(k) => Some(k.import(&parsed)),
-            DefinitionKind::ImportFromSubmodule(k) => Some(k.import(&parsed)),
+            DefinitionKind::ImportFrom(k) => {
+                let stmt = k.import(&parsed);
+                by_stmt
+                    .entry(stmt.range())
+                    .or_default()
+                    .siblings
+                    .push(alias_idx);
+                Some(stmt)
+            }
+            DefinitionKind::ImportFromSubmodule(k) => {
+                let stmt = k.import(&parsed);
+                by_stmt.entry(stmt.range()).or_default().submodule = Some(alias_idx);
+                Some(stmt)
+            }
             DefinitionKind::StarImport(k) => Some(k.import(&parsed)),
             _ => None,
         };
@@ -582,6 +609,21 @@ pub(crate) fn emit_import_edges(
             }
         }
     }
+
+    // Drag the submodule-attribute alias alive whenever any sibling
+    // alias from the same ``from .submod import X, Y`` statement is.
+    // See the comment on ``by_stmt`` above.
+    for entry in by_stmt.into_values() {
+        let Some(sub_idx) = entry.submodule else {
+            continue;
+        };
+        for sibling_idx in entry.siblings {
+            if sibling_idx != sub_idx {
+                builder.add_edge(sibling_idx, sub_idx, 0);
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -1201,7 +1243,7 @@ pub(crate) fn walk_owned(
             }
             walk_parameters(&node.parameters, v);
             if let Some(returns) = &node.returns {
-                v.visit_expr(returns);
+                v.visit_annotation(returns);
             }
             v.nested_context = true;
             for s in &node.body {
@@ -1252,7 +1294,7 @@ pub(crate) fn walk_owned(
             }
         }
         DefinitionKind::AnnotatedAssignment(a) => {
-            v.visit_expr(a.annotation(parsed));
+            v.visit_annotation(a.annotation(parsed));
             if let Some(val) = a.value(parsed) {
                 if target_is_dunder_all(a.target(parsed)) {
                     emit_dunder_all_edges(v, val);
@@ -1267,7 +1309,7 @@ pub(crate) fn walk_owned(
             if let Some(type_params) = &node.type_params {
                 walk_type_params(type_params, v);
             }
-            v.visit_expr(node.value.as_ref());
+            v.visit_annotation(node.value.as_ref());
         }
         // For / WithItem / ExceptHandler / MatchPattern bindings are
         // not modeled as top-level decls (see `decl_kind_str`), so
@@ -1301,7 +1343,7 @@ pub(crate) fn walk_parameters(
         .chain(&parameters.kwonlyargs)
     {
         if let Some(annotation) = &p.parameter.annotation {
-            v.visit_expr(annotation);
+            v.visit_annotation(annotation);
         }
         if let Some(default) = &p.default {
             v.visit_expr(default);
@@ -1309,12 +1351,12 @@ pub(crate) fn walk_parameters(
     }
     if let Some(vararg) = &parameters.vararg {
         if let Some(annotation) = &vararg.annotation {
-            v.visit_expr(annotation);
+            v.visit_annotation(annotation);
         }
     }
     if let Some(kwarg) = &parameters.kwarg {
         if let Some(annotation) = &kwarg.annotation {
-            v.visit_expr(annotation);
+            v.visit_annotation(annotation);
         }
     }
 }
@@ -1327,20 +1369,20 @@ pub(crate) fn walk_type_params(
         match tp {
             ruff_python_ast::TypeParam::TypeVar(t) => {
                 if let Some(bound) = &t.bound {
-                    v.visit_expr(bound);
+                    v.visit_annotation(bound);
                 }
                 if let Some(default) = &t.default {
-                    v.visit_expr(default);
+                    v.visit_annotation(default);
                 }
             }
             ruff_python_ast::TypeParam::TypeVarTuple(t) => {
                 if let Some(default) = &t.default {
-                    v.visit_expr(default);
+                    v.visit_annotation(default);
                 }
             }
             ruff_python_ast::TypeParam::ParamSpec(t) => {
                 if let Some(default) = &t.default {
-                    v.visit_expr(default);
+                    v.visit_annotation(default);
                 }
             }
         }
@@ -1485,6 +1527,22 @@ pub(crate) struct RefCollector<'a, 'db> {
     /// double-emit for imports that `emit_import_edges` already
     /// processed via their proper alias nodes.
     nested_context: bool,
+    /// Recursive depth of "inside a type annotation expression" — bumped
+    /// by [`Self::visit_annotation`] around the walk of each annotation
+    /// position (parameter / return / `AnnotatedAssignment`). Gates
+    /// string-annotation parsing in [`Self::visit_expr`]: only string
+    /// literals encountered while ``in_annotation > 0`` go through ty's
+    /// [`SemanticModel::enter_string_annotation`] (which itself runs
+    /// scope-type inference before its predicate check, so we don't
+    /// want to pay that cost on every dict-key / log-message / docstring
+    /// literal).
+    in_annotation: u32,
+    /// `true` only inside the sub-collector spawned by
+    /// [`Self::walk_string_annotation`] for the parsed sub-AST. Names
+    /// in that sub-AST are not registered in the file's ``uses_map``,
+    /// so [`Self::find_local_bindings`] must skip the position-sensitive
+    /// `bindings_at_use` lookup that would otherwise panic.
+    in_string_annotation: bool,
     /// Flags stamped on each edge emitted by the current reference
     /// (set by `emit_name_use` / nested-import handlers based on the
     /// reference's source position; cleared afterward).
@@ -1526,6 +1584,8 @@ impl<'a, 'db> RefCollector<'a, 'db> {
             dead_ranges: inputs.dead_ranges,
             edges: HashMap::new(),
             nested_context: false,
+            in_annotation: 0,
+            in_string_annotation: false,
             current_flags: 0,
         }
     }
@@ -1533,6 +1593,52 @@ impl<'a, 'db> RefCollector<'a, 'db> {
     fn flush(self, builder: &mut GraphBuilder) {
         for ((src, dst), flags) in self.edges {
             builder.add_edge(src, dst, flags);
+        }
+    }
+
+    /// Walk an annotation expression, marking the recursion so any
+    /// string literal encountered inside gets parsed as a deferred
+    /// annotation (see [`Self::walk_string_annotation`]).
+    fn visit_annotation(&mut self, expr: &Expr) {
+        self.in_annotation += 1;
+        self.visit_expr(expr);
+        self.in_annotation -= 1;
+    }
+
+    /// Parse a string-typed annotation through ty's
+    /// [`SemanticModel::enter_string_annotation`] and walk the parsed
+    /// sub-AST for name uses. Returns silently if ty hasn't classified
+    /// the literal as an annotation. Edges accumulated by the sub-walk
+    /// are merged with the same AND-of-flags rule as ordinary references.
+    fn walk_string_annotation(&mut self, string_expr: &ExprStringLiteral) {
+        let Some((parsed_expr, sub_model)) = self.model.enter_string_annotation(string_expr) else {
+            return;
+        };
+        let mut sub = RefCollector {
+            owner: self.owner,
+            model: &sub_model,
+            file: self.file,
+            parsed: self.parsed,
+            index: self.index,
+            global_index: self.global_index,
+            module_nodes: self.module_nodes,
+            alias_imports: self.alias_imports,
+            live_decls: self.live_decls,
+            synthetic_nodes: self.synthetic_nodes,
+            dist_lookup: self.dist_lookup,
+            dead_ranges: self.dead_ranges,
+            edges: HashMap::new(),
+            nested_context: self.nested_context,
+            in_annotation: self.in_annotation,
+            in_string_annotation: true,
+            current_flags: 0,
+        };
+        sub.visit_expr(parsed_expr.expr());
+        for ((src, dst), flags) in sub.edges {
+            self.edges
+                .entry((src, dst))
+                .and_modify(|f| *f &= flags)
+                .or_insert(flags);
         }
     }
 
@@ -1629,7 +1735,10 @@ impl<'a, 'db> RefCollector<'a, 'db> {
             // Position-sensitive query for the use's own scope; fall
             // back to end-of-scope bindings for enclosing scopes (where
             // the use isn't recorded under any specific position).
-            let bindings = if first {
+            // Names parsed out of a string annotation aren't in the
+            // file's ``uses_map``, so ``scoped_use_id`` would panic;
+            // fall back to end-of-scope there too.
+            let bindings = if first && !self.in_string_annotation {
                 let use_id = name.scoped_use_id(db, scope_id.to_scope_id(db, self.file));
                 use_def_map.bindings_at_use(use_id)
             } else {
@@ -2419,6 +2528,15 @@ pub(crate) fn module_name_resolves(
 
 impl<'ast, 'db> Visitor<'ast> for RefCollector<'_, 'db> {
     fn visit_expr(&mut self, expr: &'ast Expr) {
+        if self.in_annotation > 0 {
+            if let Expr::StringLiteral(s) = expr {
+                // Gating on ``in_annotation`` avoids paying
+                // ``enter_string_annotation``'s scope-type-inference cost
+                // for every dict-key / log-message / docstring literal.
+                self.walk_string_annotation(s);
+                return;
+            }
+        }
         if let Expr::Name(n) = expr {
             self.emit_name_use(n, &[]);
             return;

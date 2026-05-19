@@ -34,7 +34,7 @@ class ClickPlugin(DecoratedDeclPlugin):
 
         groups_by_owner: dict[tuple[str, str], list[native.SymbolNode]] = {}
 
-        def add_group(node: "native.SymbolNode") -> None:
+        def add_group(node: native.SymbolNode) -> None:
             simple = node.fqname.rsplit(".", 1)[-1]
             groups_by_owner.setdefault((node.path, simple), []).append(node)
 

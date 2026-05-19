@@ -48,7 +48,7 @@ def _filter_under(nodes: Iterable[SymbolNode], prefix: Path | None) -> set[Symbo
 
 
 def _iter_dead(
-    ctx: "native.ProjectContext",
+    ctx: native.ProjectContext,
     reachable: set[SymbolNode],
     *,
     prefix: Path | None = None,
@@ -135,7 +135,7 @@ class Analysis:
         # (:meth:`reachable`, :meth:`dead`, :meth:`descendants`,
         # :meth:`ancestors`) and node/edge enumeration can run against
         # the live context without re-building the project graph.
-        self._ctx: "native.ProjectContext | None" = None
+        self._ctx: native.ProjectContext | None = None
         self._reverse_closures: dict[Path, frozenset[Path]] = {}
 
     @property
@@ -169,7 +169,7 @@ class Analysis:
         for package in self.packages:
             yield PackageView(self, package)
 
-    def materialize_all(self) -> "native.ProjectContext":
+    def materialize_all(self) -> native.ProjectContext:
         """Build the project-wide graph (memoized).
 
         Routes through the rust backend
@@ -199,7 +199,7 @@ class Analysis:
         )
         return self._ctx
 
-    def materialize_closure(self, package: Path) -> "native.ProjectContext":
+    def materialize_closure(self, package: Path) -> native.ProjectContext:
         """Return the project-wide context.
 
         The rust backend builds the whole project at once via ty's
@@ -300,7 +300,7 @@ class PackageView:
                 continue
             yield n
 
-    def graph(self) -> "native.ProjectContext":
+    def graph(self) -> native.ProjectContext:
         return self._analysis.materialize_all()
 
     def reachable(self, *, seed_flags: int = KEEPALIVE_DEFAULT) -> set[SymbolNode]:

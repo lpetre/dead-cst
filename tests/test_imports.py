@@ -83,6 +83,63 @@ STAR_REEXPORT_EDGES = frozenset(
             id="cst.ImportFrom-function",
         ),
         pytest.param(
+            # Bare-name reference inside a quoted annotation. ty parses
+            # the string in annotation position and re-runs name
+            # resolution; the rust ingest hands the parsed sub-AST to a
+            # sub-collector so each Name inside contributes the same
+            # alias + upstream edges it would unquoted. Edges match the
+            # ``f()`` call case above exactly — annotations are uses.
+            "from p.functions import f\ndef a(x: 'f') -> None: pass",
+            {
+                "p.x.a -> p.functions",
+                "p.x.a -> p.functions.f",
+                "p.x.a -> p.x",
+                "p.x.a -> p.x.f",
+                "p.x.f -> p.functions",
+                "p.x.f -> p.functions.f",
+                "p.x.f -> p.x",
+            },
+            id="string-annotation-emits-use-edge",
+        ),
+        pytest.param(
+            # Quoted name *inside* a non-quoted annotation
+            # (``Container['f']``). ty registers the inner string as an
+            # annotation; we walk it just like the standalone case.
+            (
+                "from typing import List\n"
+                "from p.functions import f\n"
+                "def a(x: List['f']) -> None: pass\n"
+            ),
+            {
+                "p.x.List -> p.x",
+                "p.x.a -> p.functions",
+                "p.x.a -> p.functions.f",
+                "p.x.a -> p.x",
+                "p.x.a -> p.x.List",
+                "p.x.a -> p.x.f",
+                "p.x.f -> p.functions",
+                "p.x.f -> p.functions.f",
+                "p.x.f -> p.x",
+            },
+            id="string-annotation-inside-subscript",
+        ),
+        pytest.param(
+            # Belt-and-braces: a bare string literal in a *non*-annotation
+            # position must NOT emit use edges. ty never marks it as a
+            # string annotation, so ``enter_string_annotation`` returns
+            # ``None`` and the walker leaves it alone. The expected
+            # edge set lists no ``p.x.label -> p.x.f`` — pinning that
+            # absence is the point of this case.
+            "from p.functions import f\nlabel = 'f'\n",
+            {
+                "p.x.f -> p.functions",
+                "p.x.f -> p.functions.f",
+                "p.x.f -> p.x",
+                "p.x.label -> p.x",
+            },
+            id="regular-string-literal-not-walked",
+        ),
+        pytest.param(
             "from p.classes import C\ndef a(): C.f()",
             {
                 "p.x.C -> p.classes",
@@ -589,16 +646,16 @@ def test_third_party_import_creates_synthetic_node(build_decl_graph):
     graph = build_decl_graph(
         {
             "p/__init__.py": "",
-            "p/uses_rx.py": "import tqdm as rx\ndef build(): return rx.tqdm()",
+            "p/uses_rx.py": "import click as rx\ndef build(): return rx.click()",
         }
     )
     rx_nodes = {
         n
         for n in graph.nodes()
-        if n.kind == "synthetic" and n.fqname.startswith(EXTERNAL_PREFIXES) and "tqdm" in n.fqname
+        if n.kind == "synthetic" and n.fqname.startswith(EXTERNAL_PREFIXES) and "click" in n.fqname
     }
     assert rx_nodes, (
-        "expected an external-dep synthetic node for tqdm, got "
+        "expected an external-dep synthetic node for click, got "
         f"{[n.fqname for n in graph.nodes() if n.kind == 'synthetic']}"
     )
 
@@ -930,3 +987,129 @@ def test_cross_dep_submodule_import(tmp_path, make_analysis, assert_edges):
             "B.sub -> B",
         },
     )
+
+
+# ---------------------------------------------------------------------------
+# Submodule attribute alias kept alive by sibling aliases
+# ---------------------------------------------------------------------------
+
+
+def _find_node(graph, *, fqname, kind, path_substring):
+    """Disambiguate nodes that share an fqname (e.g. the submodule
+    attribute alias ``pkg.sub`` in ``__init__.py`` vs. the module
+    ``pkg.sub`` itself in ``pkg/sub.py``).
+    """
+    matches = [
+        n
+        for n in graph.nodes()
+        if n.fqname == fqname and n.kind == kind and path_substring in str(n.path)
+    ]
+    assert len(matches) == 1, f"expected unique match for {fqname}/{kind}/{path_substring}"
+    return matches[0]
+
+
+def test_from_relative_import_in_init_keeps_submodule_alias_alive(
+    build_decl_graph, predecessors_of, successors_of
+):
+    """``from .sub import X`` inside an ``__init__.py`` mints both a
+    normal ``ImportFrom`` alias for ``X`` and an
+    ``ImportFromSubmodule`` alias for the side-effect attribute
+    ``sub`` on the current package — Python rebinds ``pkg.sub`` to
+    the submodule whenever the statement runs. The two are one
+    inseparable syntactic unit, so reachability must drag the
+    submodule alias alive whenever any sibling alias is — otherwise
+    the analyzer would falsely flag the submodule attribute as dead
+    every time it's not also referenced by name in the same file.
+    """
+    graph = build_decl_graph(
+        {
+            "pkg/__init__.py": "from .sub import X, Y\n",
+            "pkg/sub.py": "class X: pass\nclass Y: pass\n",
+        }
+    )
+    sub_alias = _find_node(graph, fqname="pkg.sub", kind="import", path_substring="pkg/__init__.py")
+    x_alias = _find_node(graph, fqname="pkg.X", kind="import", path_substring="pkg/__init__.py")
+    y_alias = _find_node(graph, fqname="pkg.Y", kind="import", path_substring="pkg/__init__.py")
+
+    preds = set(predecessors_of(graph, sub_alias))
+    # Sibling aliases drag the submodule attribute alias alive.
+    assert x_alias in preds
+    assert y_alias in preds
+
+
+def test_submodule_alias_dies_when_all_siblings_dead(build_decl_graph):
+    """When every sibling alias from a ``from .sub import X`` statement
+    is dead, the submodule-attribute alias dies too — there's no
+    longer any reason to keep the import line. The sibling edges only
+    rescue the submodule alias *from being singled out as unique
+    noise*, not from a legitimate sweep of the whole statement.
+    """
+    graph = build_decl_graph(
+        {
+            "pkg/__init__.py": "from .sub import X\n",
+            "pkg/sub.py": "class X: pass\n",
+        }
+    )
+    sub_alias = _find_node(graph, fqname="pkg.sub", kind="import", path_substring="pkg/__init__.py")
+    x_alias = _find_node(graph, fqname="pkg.X", kind="import", path_substring="pkg/__init__.py")
+
+    # Nothing references X (the only sibling), so neither the sibling
+    # nor the submodule-attribute alias is reachable.
+    reachable = set(graph.reachable())
+    assert x_alias not in reachable
+    assert sub_alias not in reachable
+
+
+def test_submodule_alias_not_minted_in_non_init_file(build_decl_graph):
+    """``from .sub import X`` inside a non-``__init__`` module does NOT
+    create the ``ImportFromSubmodule`` side-effect binding (the
+    ``pkg.sub`` attribute is only rebound when the containing module
+    *is* ``pkg``). Verify we don't emit a spurious sibling edge or
+    a spurious submodule alias for the ordinary case.
+    """
+    graph = build_decl_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/sub.py": "class X: pass\n",
+            "pkg/consumer.py": "from .sub import X\nuse = X\n",
+        }
+    )
+    # Only ONE node with fqname=pkg.consumer.X exists (the regular
+    # alias) — no extra "submodule attribute" alias on pkg.consumer.
+    consumer_aliases = [
+        n for n in graph.nodes() if n.kind == "import" and "pkg/consumer.py" in str(n.path)
+    ]
+    fqnames = {n.fqname for n in consumer_aliases}
+    assert fqnames == {"pkg.consumer.X"}
+
+
+# ---------------------------------------------------------------------------
+# TYPE_CHECKING-guarded import referenced from a string annotation.
+#
+# The basic mechanics (string annotations are uses; regular string
+# literals are not) are pinned by parametrized ``test_imports`` cases
+# above. This composition test covers the practical motivator: an
+# import that lives under a dead branch *and* is referenced only from
+# a quoted annotation in live code must still pick up the use edge.
+# ---------------------------------------------------------------------------
+
+
+def test_type_checking_import_used_only_in_string_annotation(build_decl_graph, predecessors_of):
+    graph = build_decl_graph(
+        {
+            "mod.py": (
+                "from __future__ import annotations\n"
+                "from typing import TYPE_CHECKING\n"
+                "if TYPE_CHECKING:\n"
+                "    from helpers import Helper\n"
+                "def f(x: 'Helper') -> 'Helper':\n"
+                "    return x\n"
+            ),
+            "helpers.py": "class Helper: pass\n",
+        }
+    )
+    helper_alias = next(n for n in graph.nodes() if n.fqname == "mod.Helper" and n.kind == "import")
+    # ``f`` (the only top-level decl using Helper via a string annotation)
+    # should be in the import alias's in-edges.
+    preds = {n.fqname for n in predecessors_of(graph, helper_alias)}
+    assert "mod.f" in preds
