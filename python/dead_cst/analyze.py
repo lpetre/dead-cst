@@ -134,10 +134,9 @@ class Analysis:
     def materialize_all(self) -> native.ProjectContext:
         """Build the project-wide graph (memoized).
 
-        Routes through the rust backend
-        (:func:`dead_cst._native.materialize_project`), which uses ty's
-        ``SemanticIndex`` to assemble the graph in one pass. Each
-        registered plugin's ``run(ctx)`` is invoked during this pass.
+        Uses ty's ``SemanticIndex`` (via :mod:`dead_cst._native`) to
+        assemble the graph in one pass. Each registered plugin's
+        ``run(ctx)`` is invoked during this pass.
 
         Returns the live :class:`native.ProjectContext`. Bulk
         reachability queries on the analysis (:meth:`reachable`,
@@ -147,19 +146,30 @@ class Analysis:
         """
         if self._ctx is not None:
             return self._ctx
-        from ._backend import materialize_project
+        from dead_cst import _native
+
+        from .plugins import Plugin
 
         # Pass each first-party package's path as a src_root so the
         # rust backend mounts files at the right module fqname
         # (``pkg_a/A/__init__.py`` -> ``A``, not ``pkg_a.A``).
-        src_roots = tuple(p.path for p in self.packages)
-        self._ctx = materialize_project(
-            self._project_root,
-            self._plugins,
-            src_roots=src_roots,
+        ctx = _native.ProjectContext(
+            str(self._project_root),
+            src_roots=[str(p.path) for p in self.packages] or None,
             show_progress=self._show_progress,
         )
-        return self._ctx
+        for plugin in self._plugins:
+            # Catch ``Pluign()`` typos and bare dicts before the rust
+            # side silently drops them.
+            if not isinstance(plugin, Plugin):
+                raise TypeError(
+                    f"Expected a dead_cst.plugins.Plugin instance, got "
+                    f"{type(plugin).__name__!r}: {plugin!r}"
+                )
+            ctx.add_plugin(plugin)
+        ctx.materialize()
+        self._ctx = ctx
+        return ctx
 
     def reachable(self, *, seed_flags: int = KEEPALIVE_DEFAULT) -> set[SymbolNode]:
         """Set of every decl reachable from any seed in ``seed_flags``.
