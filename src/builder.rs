@@ -10,7 +10,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use ruff_db::files::File;
 
-use crate::graph::SymbolNode;
+use crate::graph::{intern_kind, SymbolNode};
 use crate::helpers::NODE_FLAG_ENTRYPOINT;
 use crate::project::ProjectContext;
 
@@ -106,18 +106,7 @@ impl GraphBuilder {
         }
         let idx = self.intern_node(
             py,
-            SymbolNode {
-                fqname: fqname.clone(),
-                kind: "synthetic",
-                path: String::new(),
-                start_line: 0,
-                start_column: 0,
-                end_line: 0,
-                end_column: 0,
-                flags: 0,
-                imports: None,
-                cached_hash: OnceLock::new(),
-            },
+            synthetic_node(fqname.clone(), "synthetic", String::new(), 0),
         )?;
         self.synthetic_nodes.insert(fqname, idx);
         Ok(idx)
@@ -215,7 +204,7 @@ impl AddNode {
     ) -> PyResult<Self> {
         Ok(Self {
             fqname,
-            kind: static_kind_str(kind)?,
+            kind: intern_kind(kind)?,
             path,
             flags,
             edges_from,
@@ -285,6 +274,30 @@ pub(crate) fn bfs(
     visited
 }
 
+/// Construct a position-less `SymbolNode` (start/end zeroed, `imports`
+/// absent) for ops minted at plugin-apply time. The four
+/// caller-supplied fields are the only ones that vary across the
+/// synthetic / entrypoint / `AddNode` shapes.
+pub(crate) fn synthetic_node(
+    fqname: String,
+    kind: &'static str,
+    path: String,
+    flags: u32,
+) -> SymbolNode {
+    SymbolNode {
+        fqname,
+        kind,
+        path,
+        start_line: 0,
+        start_column: 0,
+        end_line: 0,
+        end_column: 0,
+        flags,
+        imports: None,
+        cached_hash: OnceLock::new(),
+    }
+}
+
 pub(crate) fn apply_graph_op(
     ctx: &Py<ProjectContext>,
     py: Python<'_>,
@@ -310,18 +323,7 @@ pub(crate) fn apply_graph_op(
         drop(decl);
         let marker_idx = outputs.builder.intern_node(
             py,
-            SymbolNode {
-                fqname: marker_fqname,
-                kind: "synthetic",
-                path,
-                start_line: 0,
-                start_column: 0,
-                end_line: 0,
-                end_column: 0,
-                flags: NODE_FLAG_ENTRYPOINT,
-                imports: None,
-                cached_hash: OnceLock::new(),
-            },
+            synthetic_node(marker_fqname, "synthetic", path, NODE_FLAG_ENTRYPOINT),
         )?;
         outputs.builder.add_edge(marker_idx, decl_idx, 0);
         return Ok(());
@@ -329,18 +331,12 @@ pub(crate) fn apply_graph_op(
     if let Ok(add_node) = op.extract::<PyRef<AddNode>>() {
         let node_idx = outputs.builder.intern_node(
             py,
-            SymbolNode {
-                fqname: add_node.fqname.clone(),
-                kind: add_node.kind,
-                path: add_node.path.clone(),
-                start_line: 0,
-                start_column: 0,
-                end_line: 0,
-                end_column: 0,
-                flags: add_node.flags,
-                imports: None,
-                cached_hash: OnceLock::new(),
-            },
+            synthetic_node(
+                add_node.fqname.clone(),
+                add_node.kind,
+                add_node.path.clone(),
+                add_node.flags,
+            ),
         )?;
         for src in &add_node.edges_from {
             let src_idx = lookup_idx(&outputs.builder, &src.borrow(py), "edges_from")?;
@@ -372,24 +368,4 @@ pub(crate) fn lookup_idx(builder: &GraphBuilder, node: &SymbolNode, side: &str) 
                 node.fqname
             ))
         })
-}
-
-/// Map a plugin-supplied `kind` string to one of the stable `&'static
-/// str` kinds SymbolNode carries.
-pub(crate) fn static_kind_str(kind: &str) -> PyResult<&'static str> {
-    Ok(match kind {
-        "synthetic" => "synthetic",
-        "module" => "module",
-        "import" => "import",
-        "function" => "function",
-        "class" => "class",
-        "variable" => "variable",
-        "type_alias" => "type_alias",
-        other => {
-            return Err(PyValueError::new_err(format!(
-                "unknown node kind {other:?} — expected one of synthetic, module, import, \
-                 function, class, variable, type_alias"
-            )))
-        }
-    })
 }

@@ -24,6 +24,14 @@ use crate::graph::{DeclIndex, EdgeFlags, NodeFlags, SymbolNode};
 use crate::ingest::collapse_attribute_chain;
 use crate::project::BuildOutputs;
 
+/// Sentinel value stored in a file's local imports map (the value half
+/// of ``{local_name: target}`` returned by
+/// [`collect_module_imports_local`]) when the local binding is the
+/// module object itself (`import flask` / `import flask as f`), not a
+/// specific name from inside it. Matchers test against this exact
+/// string when classifying attribute-style decorator / call references.
+pub(crate) const MODULE_ALIAS_MARKER: &str = "<module>";
+
 pub(crate) fn is_dunder_name(fqname: &str) -> bool {
     let name = fqname.rsplit('.').next().unwrap_or("");
     name.len() > 4 && name.starts_with("__") && name.ends_with("__")
@@ -47,7 +55,7 @@ pub(crate) fn class_body_defines_method(class_def: &StmtClassDef, method_name: &
 /// * ``@<name>(...)`` / ``@<name>`` where ``imports[name]`` is in ``names``
 ///   (covers ``from module import name`` and aliased variants).
 /// * ``@<alias>.<attr>(...)`` / ``@<alias>.<attr>`` where
-///   ``imports[alias] == "<module>"`` and ``attr`` is in ``names``
+///   ``imports[alias] == MODULE_ALIAS_MARKER`` and ``attr`` is in ``names``
 ///   (covers ``import module`` and ``import module as alias``).
 pub(crate) fn decorators_match_imports<'ast>(
     decorators: &'ast [ruff_python_ast::Decorator],
@@ -69,7 +77,8 @@ pub(crate) fn decorators_match_imports<'ast>(
             }
             Expr::Attribute(attr) => {
                 if let Expr::Name(prefix) = attr.value.as_ref() {
-                    if imports.get(prefix.id.as_str()).map(String::as_str) == Some("<module>")
+                    if imports.get(prefix.id.as_str()).map(String::as_str)
+                        == Some(MODULE_ALIAS_MARKER)
                         && names.contains(attr.attr.as_str())
                     {
                         return Some(call_form);
@@ -91,10 +100,6 @@ pub(crate) fn iter_top_level_classes(
     })
 }
 
-/// Locate a class's File + name TextRange from its SymbolNode positions.
-///
-/// We don't store ty `Definition<'db>` references across plugin calls
-/// (the `'db` lifetime is tied to the active borrow), so this re-walks
 /// Locate a class's File + name TextRange from its SymbolNode positions.
 ///
 /// We don't store ty `Definition<'db>` references across plugin calls
@@ -463,8 +468,8 @@ pub(crate) fn collect_all_imports_local(parsed: &ParsedModuleRef) -> HashMap<Str
 /// Build the file-local imports map ``{local_name: target}`` for
 /// names imported from ``module``. ``target`` is the upstream
 /// constructor / decl name (e.g. ``"Flask"`` when bound via
-/// ``from flask import Flask``) or the sentinel ``"<module>"``
-/// when bound via ``import flask`` / ``import flask as f``.
+/// ``from flask import Flask``) or [`MODULE_ALIAS_MARKER`] when bound
+/// via ``import flask`` / ``import flask as f``.
 ///
 /// Only entries whose target is in ``allowed`` survive — keeps the
 /// map small and lets call-site matchers do a cheap second check.
@@ -498,7 +503,7 @@ pub(crate) fn collect_module_imports_local(
                                 continue;
                             }
                             let local = alias.asname.as_ref().map(|n| n.as_str()).unwrap_or(last);
-                            out.insert(local.to_string(), "<module>".to_string());
+                            out.insert(local.to_string(), MODULE_ALIAS_MARKER.to_string());
                         }
                     }
                 }
@@ -509,7 +514,7 @@ pub(crate) fn collect_module_imports_local(
                         continue;
                     }
                     let local = alias.asname.as_ref().map(|n| n.as_str()).unwrap_or(module);
-                    out.insert(local.to_string(), "<module>".to_string());
+                    out.insert(local.to_string(), MODULE_ALIAS_MARKER.to_string());
                 }
             }
             _ => {}
@@ -548,7 +553,7 @@ pub(crate) fn matched_call_target(
             }
             match attr.value.as_ref() {
                 Expr::Name(prefix) => (imports.get(prefix.id.as_str()).map(String::as_str)
-                    == Some("<module>"))
+                    == Some(MODULE_ALIAS_MARKER))
                 .then(|| attr_name.to_string()),
                 _ => {
                     let (root, segs) = collapse_attribute_chain(attr.value.as_ref())?;

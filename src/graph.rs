@@ -107,14 +107,15 @@ const VALID_KINDS: &[&str] = &[
 ];
 
 pub(crate) fn intern_kind(kind: &str) -> PyResult<&'static str> {
-    for valid in VALID_KINDS {
-        if *valid == kind {
-            return Ok(*valid);
-        }
-    }
-    Err(pyo3::exceptions::PyValueError::new_err(format!(
-        "invalid SymbolNode.kind: {kind:?}"
-    )))
+    VALID_KINDS
+        .iter()
+        .find(|&&v| v == kind)
+        .copied()
+        .ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "invalid SymbolNode.kind: {kind:?} — expected one of {VALID_KINDS:?}"
+            ))
+        })
 }
 
 #[pymethods]

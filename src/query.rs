@@ -274,6 +274,54 @@ pub(crate) fn _to_iter(py: Python<'_>, items: Vec<Py<impl PyClass>>) -> PyResult
     Ok(iter_obj.unbind())
 }
 
+/// Generate the `first` / `count` / `__iter__` boilerplate that every
+/// chainable query exposes. Each variant is what the query's `.collect()`
+/// supports — see the three call sites below.
+///
+/// `with_first $Q, $R`: query whose `collect()` returns `Vec<Py<$R>>`
+/// and that wants a typed `.first() -> Option<Py<$R>>` shortcut.
+///
+/// `no_first $Q`: query that wants only `.count()` + `.__iter__()`
+/// (typically returns plain `Py<SymbolNode>`).
+///
+/// `iter_only $Q`: query with a custom `.count()` (cheaper than
+/// materializing `.collect()`); just gets `.__iter__()`.
+macro_rules! impl_query_methods {
+    (with_first $q:ty, $r:ty) => {
+        #[pymethods]
+        impl $q {
+            fn first(&self, py: Python<'_>) -> PyResult<Option<Py<$r>>> {
+                Ok(self.collect(py)?.into_iter().next())
+            }
+            fn count(&self, py: Python<'_>) -> PyResult<usize> {
+                Ok(self.collect(py)?.len())
+            }
+            fn __iter__(&self, py: Python<'_>) -> PyResult<PyObject> {
+                _to_iter(py, self.collect(py)?)
+            }
+        }
+    };
+    (no_first $q:ty) => {
+        #[pymethods]
+        impl $q {
+            fn count(&self, py: Python<'_>) -> PyResult<usize> {
+                Ok(self.collect(py)?.len())
+            }
+            fn __iter__(&self, py: Python<'_>) -> PyResult<PyObject> {
+                _to_iter(py, self.collect(py)?)
+            }
+        }
+    };
+    (iter_only $q:ty) => {
+        #[pymethods]
+        impl $q {
+            fn __iter__(&self, py: Python<'_>) -> PyResult<PyObject> {
+                _to_iter(py, self.collect(py)?)
+            }
+        }
+    };
+}
+
 /// Find decorated top-level functions / classes. Pick exactly one of:
 /// * ``where_module(m).where_name(n)`` — ``@m.x`` / ``@x`` where ``x``
 ///   is imported from ``m``.
@@ -492,17 +540,9 @@ impl DecoratorQuery {
         }
         Ok(refs)
     }
-
-    fn first(&self, py: Python<'_>) -> PyResult<Option<Py<DecoratorRef>>> {
-        Ok(self.collect(py)?.into_iter().next())
-    }
-    fn count(&self, py: Python<'_>) -> PyResult<usize> {
-        Ok(self.collect(py)?.len())
-    }
-    fn __iter__(&self, py: Python<'_>) -> PyResult<PyObject> {
-        _to_iter(py, self.collect(py)?)
-    }
 }
+
+impl_query_methods!(with_first DecoratorQuery, DecoratorRef);
 
 /// Find module-scope ``<var> = <Ctor>(...)`` sites. Pick exactly one
 /// of ``where_module + where_name`` or
@@ -607,17 +647,9 @@ impl ConstructionQuery {
         }
         Ok(refs)
     }
-
-    fn first(&self, py: Python<'_>) -> PyResult<Option<Py<ConstructionRef>>> {
-        Ok(self.collect(py)?.into_iter().next())
-    }
-    fn count(&self, py: Python<'_>) -> PyResult<usize> {
-        Ok(self.collect(py)?.len())
-    }
-    fn __iter__(&self, py: Python<'_>) -> PyResult<PyObject> {
-        _to_iter(py, self.collect(py)?)
-    }
 }
+
+impl_query_methods!(with_first ConstructionQuery, ConstructionRef);
 
 /// Find call sites whose positional string-literal at the configured
 /// index is captured. :meth:`string_arg_at` is required. Pick one of:
@@ -757,17 +789,9 @@ impl CallQuery {
         }
         Ok(refs)
     }
-
-    fn first(&self, py: Python<'_>) -> PyResult<Option<Py<CallRef>>> {
-        Ok(self.collect(py)?.into_iter().next())
-    }
-    fn count(&self, py: Python<'_>) -> PyResult<usize> {
-        Ok(self.collect(py)?.len())
-    }
-    fn __iter__(&self, py: Python<'_>) -> PyResult<PyObject> {
-        _to_iter(py, self.collect(py)?)
-    }
 }
+
+impl_query_methods!(with_first CallQuery, CallRef);
 
 // ---------------------------------------------------------------------------
 // Subclass / Import / Class / Factory queries
@@ -826,13 +850,9 @@ impl SubclassQuery {
             ))
         }
     }
-    fn count(&self, py: Python<'_>) -> PyResult<usize> {
-        Ok(self.collect(py)?.len())
-    }
-    fn __iter__(&self, py: Python<'_>) -> PyResult<PyObject> {
-        _to_iter(py, self.collect(py)?)
-    }
 }
+
+impl_query_methods!(no_first SubclassQuery);
 
 /// Enumerate the ``kind="import"`` nodes that bind a name from a
 /// given module. Requires ``of(module)``.
@@ -846,6 +866,12 @@ impl ImportQuery {
     fn new(ctx: Py<ProjectContext>) -> Self {
         Self { ctx, module: None }
     }
+
+    fn module_or_err(&self) -> PyResult<&str> {
+        self.module
+            .as_deref()
+            .ok_or_else(|| PyValueError::new_err("ImportQuery requires .of(module)"))
+    }
 }
 
 #[pymethods]
@@ -855,39 +881,25 @@ impl ImportQuery {
         slf
     }
     fn collect(&self, py: Python<'_>) -> PyResult<Vec<Py<SymbolNode>>> {
-        let ctx = self.ctx.borrow(py);
-        let module = self
-            .module
-            .as_deref()
-            .ok_or_else(|| PyValueError::new_err("ImportQuery requires .of(module)"))?;
-        ctx.find_imports_of(py, module)
+        self.ctx
+            .borrow(py)
+            .find_imports_of(py, self.module_or_err()?)
     }
     /// O(1) presence probe — does any project file import the
     /// configured module? Short-circuits on the first match without
     /// materialising a Python list. Preferred over ``.count() > 0`` /
     /// ``.collect()`` for plugin guards that just need a boolean.
     fn exists(&self, py: Python<'_>) -> PyResult<bool> {
-        let ctx = self.ctx.borrow(py);
-        let module = self
-            .module
-            .as_deref()
-            .ok_or_else(|| PyValueError::new_err("ImportQuery requires .of(module)"))?;
-        ctx.has_imports_of(module)
+        self.ctx.borrow(py).has_imports_of(self.module_or_err()?)
     }
+    /// Count without allocating `Py<SymbolNode>` clones — read the
+    /// length of the pre-built index entry directly.
     fn count(&self, py: Python<'_>) -> PyResult<usize> {
-        let ctx = self.ctx.borrow(py);
-        let module = self
-            .module
-            .as_deref()
-            .ok_or_else(|| PyValueError::new_err("ImportQuery requires .of(module)"))?;
-        // Count without allocating Py<SymbolNode> clones — read the
-        // length of the pre-built index entry directly.
-        Ok(ctx.imports_of_count(module))
-    }
-    fn __iter__(&self, py: Python<'_>) -> PyResult<PyObject> {
-        _to_iter(py, self.collect(py)?)
+        Ok(self.ctx.borrow(py).imports_of_count(self.module_or_err()?))
     }
 }
+
+impl_query_methods!(iter_only ImportQuery);
 
 /// Enumerate classes by structural property. Today the only filter
 /// is ``defining_method(name)`` (matches classes whose body has a
@@ -921,13 +933,9 @@ impl ClassQuery {
             .ok_or_else(|| PyValueError::new_err("ClassQuery requires .defining_method(name)"))?;
         ctx.find_classes_defining_method(py, name)
     }
-    fn count(&self, py: Python<'_>) -> PyResult<usize> {
-        Ok(self.collect(py)?.len())
-    }
-    fn __iter__(&self, py: Python<'_>) -> PyResult<PyObject> {
-        _to_iter(py, self.collect(py)?)
-    }
 }
+
+impl_query_methods!(no_first ClassQuery);
 
 /// One result row from :class:`FactoryQuery`. ``decl`` is the
 /// owning top-level function or class; ``kinds`` is the sorted set
@@ -996,10 +1004,6 @@ impl FactoryQuery {
             .map(|(decl, kinds)| Py::new(py, FactoryRef { decl, kinds }))
             .collect()
     }
-    fn count(&self, py: Python<'_>) -> PyResult<usize> {
-        Ok(self.collect(py)?.len())
-    }
-    fn __iter__(&self, py: Python<'_>) -> PyResult<PyObject> {
-        _to_iter(py, self.collect(py)?)
-    }
 }
+
+impl_query_methods!(no_first FactoryQuery);

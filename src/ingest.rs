@@ -468,6 +468,13 @@ pub(crate) fn emit_import_edges(
     let place_table = index.place_table(global);
     let use_def_map = index.use_def_map(global);
 
+    // The "is this target idx a module node?" check below used to
+    // rebuild this set on every iteration. Hoist it; the resolve_*
+    // calls below can add new module nodes, so refresh only when
+    // module_nodes actually grew.
+    let mut module_idx_set: HashSet<usize> = module_nodes.values().copied().collect();
+    let mut module_nodes_len = module_nodes.len();
+
     for (_def_id, state, _used) in use_def_map.all_definitions_with_usage() {
         let DefinitionState::Defined(def) = state else {
             continue;
@@ -544,7 +551,10 @@ pub(crate) fn emit_import_edges(
             DefinitionKind::StarImport(_) => Vec::new(),
             _ => continue,
         };
-        let module_idx_set: HashSet<usize> = module_nodes.values().copied().collect();
+        if module_nodes.len() != module_nodes_len {
+            module_idx_set.extend(module_nodes.values().copied());
+            module_nodes_len = module_nodes.len();
+        }
         let all_targets_are_modules =
             !targets.is_empty() && targets.iter().all(|idx| module_idx_set.contains(idx));
         for target_idx in &targets {
