@@ -207,6 +207,57 @@ def test_decorator_ref_args_kwargs_empty_for_bare_decorator(make_ctx):
     assert plugin.result == {"args": [], "kwargs": {}}
 
 
+def test_kwarg_payload_surfaces_nativenode_for_imported_symbol(make_ctx):
+    """``@register(handler=ImportedClass)`` exposes ImportedClass as a
+    NativeNode in ``ref.kwargs["handler"]`` so plugins can anchor inverted
+    edges off the resolved decl."""
+
+    def capture(ctx):
+        refs = native.query(ctx).decorators().where_owner_attr(["register"]).collect()
+        out = []
+        for r in refs:
+            handler = r.kwargs.get("handler")
+            out.append(
+                {
+                    "decorated": r.decorated.fqname,
+                    "handler_fqname": getattr(handler, "fqname", None),
+                }
+            )
+        return out
+
+    ctx = make_ctx(
+        {
+            "events.py": "class UserCreated: pass\n",
+            "registry.py": (
+                "class Registry:\n"
+                "    def register(self, *_a, **_kw):\n"
+                "        def deco(f): return f\n"
+                "        return deco\n"
+                "registry = Registry()\n"
+            ),
+            "handlers.py": (
+                "from events import UserCreated\n"
+                "from registry import registry\n"
+                "\n"
+                "@registry.register(handler=UserCreated)\n"
+                "def on_user_created(evt): pass\n"
+            ),
+        }
+    )
+    plugin = _CapturePlugin(capture)
+    ctx.add_plugin(plugin)
+    ctx.materialize()
+    # NativeNode resolution finds the local import alias (handlers.UserCreated),
+    # not the upstream class (events.UserCreated) — the alias is the codemod
+    # invariant target. Either is acceptable; the test asserts the fqname is one
+    # of those two so the resolution succeeded.
+    assert plugin.result[0]["decorated"] == "handlers.on_user_created"
+    assert plugin.result[0]["handler_fqname"] in {
+        "handlers.UserCreated",
+        "events.UserCreated",
+    }
+
+
 # ---------------------------------------------------------------------------
 # CallQuery.where_kwarg with literal values
 # ---------------------------------------------------------------------------

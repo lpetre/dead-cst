@@ -32,12 +32,12 @@ use crate::graph::{
     StarReexports,
 };
 use crate::helpers::{
-    call_callee_matches_var, class_body_defines_method, collect_module_imports_local,
-    decorators_match_imports, extract_call_args_kwargs, file_decl_sites, file_path_string,
-    find_main_block_range, find_subclass_indices_via_refs, is_dunder_name, locate_class_def,
-    locate_class_seed, matched_call_target, owner_idx_for_stmt_with, range_key, rel_path,
-    top_level_assign_to_name, AttrCallFinder, CallArgs, FactoryCallFinder, StringArgCallFinder,
-    NODE_FLAG_ENTRYPOINT,
+    call_callee_matches_var, class_body_defines_method, collect_all_imports_local,
+    collect_module_imports_local, decorators_match_imports, extract_call_args_kwargs,
+    file_decl_sites, file_path_string, find_main_block_range, find_subclass_indices_via_refs,
+    is_dunder_name, locate_class_def, locate_class_seed, matched_call_target,
+    owner_idx_for_stmt_with, range_key, rel_path, top_level_assign_to_name, AttrCallFinder,
+    CallArgs, FactoryCallFinder, StringArgCallFinder, NODE_FLAG_ENTRYPOINT,
 };
 use crate::ingest::{
     build_dist_lookup, emit_import_edges, emit_module_hierarchy, emit_reference_edges, ingest_decls,
@@ -1065,6 +1065,7 @@ impl ProjectContext {
         let names: HashSet<&str> = decorator_names.iter().map(String::as_str).collect();
         let needle_strs: Vec<&str> = decorator_names.iter().map(String::as_str).collect();
         let decl_by_name_range = &outputs.decl_by_name_range;
+        let decl_by_fqname = &outputs.decl_by_fqname;
         let project_files = &outputs.project_files;
         // Text prefilter inside the parallel walk mirrors the LSP's
         // find_references — skip files that don't even mention any
@@ -1087,6 +1088,7 @@ impl ProjectContext {
                 if imports.is_empty() {
                     return Vec::new();
                 }
+                let file_imports = collect_all_imports_local(&parsed);
                 let mut local = Vec::new();
                 for stmt in &parsed.syntax().body {
                     let Stmt::FunctionDef(func) = stmt else {
@@ -1099,7 +1101,9 @@ impl ProjectContext {
                     };
                     let key = (file, range_key(func.name.range()));
                     if let Some(&idx) = decl_by_name_range.get(&key) {
-                        let call_args = call_form.map(extract_call_args_kwargs).unwrap_or_default();
+                        let call_args = call_form
+                            .map(|c| extract_call_args_kwargs(c, &file_imports, decl_by_fqname))
+                            .unwrap_or_default();
                         local.push((idx, call_args));
                     }
                 }
@@ -1205,6 +1209,7 @@ impl ProjectContext {
         let attrs: HashSet<&str> = decorator_attrs.iter().map(String::as_str).collect();
         let needle_strs: Vec<&str> = decorator_attrs.iter().map(String::as_str).collect();
         let decl_by_name_range = &outputs.decl_by_name_range;
+        let decl_by_fqname = &outputs.decl_by_fqname;
         let project_files: &[File] = &outputs.project_files;
         let db_handle: Box<dyn ProjectDb> = ProjectDb::dyn_clone(&self.db);
         let path_re_ref = &path_re;
@@ -1217,6 +1222,7 @@ impl ProjectContext {
                     return Vec::new();
                 }
                 let parsed = parsed_module(db, file).load(db);
+                let file_imports = collect_all_imports_local(&parsed);
                 let mut local: Vec<(String, usize, CallArgs)> = Vec::new();
                 for stmt in &parsed.syntax().body {
                     let Stmt::FunctionDef(func) = stmt else {
@@ -1244,8 +1250,9 @@ impl ProjectContext {
                         }
                         let key = (file, range_key(func.name.range()));
                         if let Some(&idx) = decl_by_name_range.get(&key) {
-                            let call_args =
-                                call_form.map(extract_call_args_kwargs).unwrap_or_default();
+                            let call_args = call_form
+                                .map(|c| extract_call_args_kwargs(c, &file_imports, decl_by_fqname))
+                                .unwrap_or_default();
                             local.push((owner_name, idx, call_args));
                         }
                     }
@@ -1281,6 +1288,7 @@ impl ProjectContext {
         let path_re = _compile_path_regex(path_regex)?;
         let attrs: HashSet<&str> = decorator_attrs.iter().map(String::as_str).collect();
         let decl_by_name_range = &outputs.decl_by_name_range;
+        let decl_by_fqname = &outputs.decl_by_fqname;
         let project_files: &[File] = &outputs.project_files;
         let db_handle: Box<dyn ProjectDb> = ProjectDb::dyn_clone(&self.db);
         let path_re_ref = &path_re;
@@ -1294,6 +1302,7 @@ impl ProjectContext {
                     return Vec::new();
                 }
                 let parsed = parsed_module(db, file).load(db);
+                let file_imports = collect_all_imports_local(&parsed);
                 let mut local: Vec<(String, usize, CallArgs)> = Vec::new();
                 for stmt in &parsed.syntax().body {
                     let Stmt::FunctionDef(func) = stmt else {
@@ -1327,8 +1336,9 @@ impl ProjectContext {
                         }
                         let key = (file, range_key(func.name.range()));
                         if let Some(&idx) = decl_by_name_range.get(&key) {
-                            let call_args =
-                                call_form.map(extract_call_args_kwargs).unwrap_or_default();
+                            let call_args = call_form
+                                .map(|c| extract_call_args_kwargs(c, &file_imports, decl_by_fqname))
+                                .unwrap_or_default();
                             local.push((owner_name, idx, call_args));
                         }
                     }
@@ -1369,6 +1379,7 @@ impl ProjectContext {
             .ok_or_else(|| not_materialized("find_calls_on_attr"))?;
         let path_re = _compile_path_regex(path_regex)?;
         let decl_by_name_range = &outputs.decl_by_name_range;
+        let decl_by_fqname = &outputs.decl_by_fqname;
         let module_nodes_by_file = &outputs.module_nodes_by_file;
         let project_files: &[File] = &outputs.project_files;
         let db_handle: Box<dyn ProjectDb> = ProjectDb::dyn_clone(&self.db);
@@ -1380,6 +1391,7 @@ impl ProjectContext {
                     return Vec::new();
                 }
                 let parsed = parsed_module(db, file).load(db);
+                let file_imports = collect_all_imports_local(&parsed);
                 let mut local: Vec<(usize, String, CallArgs)> = Vec::new();
                 for stmt in &parsed.syntax().body {
                     let Some(owner_idx) = owner_idx_for_stmt_with(
@@ -1393,6 +1405,8 @@ impl ProjectContext {
                     let mut finder = AttrCallFinder {
                         attr,
                         arg_index,
+                        file_imports: &file_imports,
+                        decl_by_fqname,
                         results: Vec::new(),
                     };
                     finder.visit_stmt(stmt);
@@ -1503,6 +1517,7 @@ impl ProjectContext {
         let path_re = _compile_path_regex(path_regex)?;
         let allowed: HashSet<&str> = [name].into_iter().collect();
         let decl_by_name_range = &outputs.decl_by_name_range;
+        let decl_by_fqname = &outputs.decl_by_fqname;
         let module_nodes_by_file = &outputs.module_nodes_by_file;
         let project_files: &[File] = &outputs.project_files;
         let db_handle: Box<dyn ProjectDb> = ProjectDb::dyn_clone(&self.db);
@@ -1519,6 +1534,7 @@ impl ProjectContext {
                 if imports.is_empty() {
                     return Vec::new();
                 }
+                let file_imports = collect_all_imports_local(&parsed);
                 let mut local: Vec<(usize, String, CallArgs)> = Vec::new();
                 for stmt in &parsed.syntax().body {
                     let Some(owner_idx) = owner_idx_for_stmt_with(
@@ -1534,6 +1550,8 @@ impl ProjectContext {
                             matched_call_target(call, &imports, module, allowed_ref).is_some()
                         },
                         arg_index,
+                        file_imports: &file_imports,
+                        decl_by_fqname,
                         results: Vec::new(),
                     };
                     finder.visit_stmt(stmt);
@@ -1577,6 +1595,7 @@ impl ProjectContext {
             .ok_or_else(|| not_materialized("find_calls_on_var"))?;
         let path_re = _compile_path_regex(path_regex)?;
         let decl_by_name_range = &outputs.decl_by_name_range;
+        let decl_by_fqname = &outputs.decl_by_fqname;
         let module_nodes_by_file = &outputs.module_nodes_by_file;
         let project_files: &[File] = &outputs.project_files;
         let db_handle: Box<dyn ProjectDb> = ProjectDb::dyn_clone(&self.db);
@@ -1591,6 +1610,7 @@ impl ProjectContext {
                     return Vec::new();
                 }
                 let parsed = parsed_module(db, file).load(db);
+                let file_imports = collect_all_imports_local(&parsed);
                 let mut local: Vec<(usize, String, CallArgs)> = Vec::new();
                 for stmt in &parsed.syntax().body {
                     let Some(owner_idx) = owner_idx_for_stmt_with(
@@ -1606,6 +1626,8 @@ impl ProjectContext {
                             call_callee_matches_var(call, owner, attr, required_positional)
                         },
                         arg_index,
+                        file_imports: &file_imports,
+                        decl_by_fqname,
                         results: Vec::new(),
                     };
                     finder.visit_stmt(stmt);

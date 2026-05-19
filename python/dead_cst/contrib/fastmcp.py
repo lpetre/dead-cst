@@ -29,15 +29,13 @@ plugin reuses those reference edges via the factory-aware
    :func:`resolve_edges` drops the ``decl='FastMCP'`` half.
 
 This mirrors :class:`FastAPIPlugin`'s shape; the only difference is
-that FastMCP has a single kind today, so ``instance_kinds`` is a
-one-entry map rather than the FastAPI / Flask two-kind map (no
-``Router`` / ``Blueprint`` peer to disambiguate).
+that FastMCP has a single app class today (``fastmcp.FastMCP``) with
+no ``Router`` / ``Blueprint`` peer.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Mapping
+from dataclasses import dataclass
 
 from ..plugins.decl_shapes import DispatchAppPlugin
 
@@ -53,12 +51,6 @@ _REGISTRATION_DECORATORS: frozenset[str] = frozenset(
         "completion",
     }
 )
-
-# Classes whose instances we treat specially. Value records whether the
-# instance should be seeded as an entrypoint.
-_INSTANCE_KINDS: Mapping[str, bool] = {
-    "FastMCP": True,  # ``fastmcp run module:mcp`` -- always an entrypoint
-}
 
 
 @dataclass
@@ -93,6 +85,5 @@ class FastMCPPlugin(DispatchAppPlugin):
 
     name: str = "fastmcp"
     version: int = 1778671880
-    app_module: str = "fastmcp"
+    app_classes: tuple[str, ...] = ("fastmcp.FastMCP",)
     registration_decorators: frozenset[str] = _REGISTRATION_DECORATORS
-    instance_kinds: Mapping[str, bool] = field(default_factory=lambda: dict(_INSTANCE_KINDS))

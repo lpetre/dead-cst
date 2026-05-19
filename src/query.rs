@@ -10,6 +10,7 @@ use pyo3::PyClass;
 use ruff_db::files::File;
 use ty_project::Db as ProjectDb;
 
+use crate::builder::not_materialized;
 use crate::graph::{MainBlock, NativeNode};
 use crate::helpers::{
     args_to_py_vec, call_args_match_kwargs, file_path_string, kwarg_matcher_from_py,
@@ -419,6 +420,14 @@ impl DecoratorQuery {
         let ctx = self.ctx.borrow(py);
         let path_regex = self.path_regex.as_deref();
         let mut refs: Vec<Py<DecoratorRef>> = Vec::new();
+        // Cache a snapshot of the build's node pool for arg materialization.
+        // Keep the borrow alive for the duration of the loop so we don't
+        // reborrow on every iteration.
+        let outputs_borrow = ctx.outputs.borrow();
+        let outputs = outputs_borrow
+            .as_ref()
+            .ok_or_else(|| not_materialized("DecoratorQuery.collect"))?;
+        let nodes: &[Py<NativeNode>] = &outputs.builder.nodes;
         let kwarg_matchers = &self.kwarg_matchers;
         if let Some(owner_attrs) = &self.owner_attrs {
             let triples = if let Some(via) = &self.via_attr {
@@ -430,8 +439,8 @@ impl DecoratorQuery {
                 if !call_args_match_kwargs(&call_args, kwarg_matchers) {
                     continue;
                 }
-                let args = args_to_py_vec(py, &call_args.args);
-                let kwargs = kwargs_to_py_map(py, &call_args.kwargs);
+                let args = args_to_py_vec(py, &call_args.args, nodes);
+                let kwargs = kwargs_to_py_map(py, &call_args.kwargs, nodes);
                 refs.push(Py::new(
                     py,
                     DecoratorRef {
@@ -461,8 +470,8 @@ impl DecoratorQuery {
                 if !call_args_match_kwargs(&call_args, kwarg_matchers) {
                     continue;
                 }
-                let args = args_to_py_vec(py, &call_args.args);
-                let kwargs = kwargs_to_py_map(py, &call_args.kwargs);
+                let args = args_to_py_vec(py, &call_args.args, nodes);
+                let kwargs = kwargs_to_py_map(py, &call_args.kwargs, nodes);
                 refs.push(Py::new(
                     py,
                     DecoratorRef {
@@ -481,8 +490,8 @@ impl DecoratorQuery {
                 if !call_args_match_kwargs(&call_args, kwarg_matchers) {
                     continue;
                 }
-                let args = args_to_py_vec(py, &call_args.args);
-                let kwargs = kwargs_to_py_map(py, &call_args.kwargs);
+                let args = args_to_py_vec(py, &call_args.args, nodes);
+                let kwargs = kwargs_to_py_map(py, &call_args.kwargs, nodes);
                 refs.push(Py::new(
                     py,
                     DecoratorRef {
@@ -501,8 +510,8 @@ impl DecoratorQuery {
                 if !call_args_match_kwargs(&call_args, kwarg_matchers) {
                     continue;
                 }
-                let args = args_to_py_vec(py, &call_args.args);
-                let kwargs = kwargs_to_py_map(py, &call_args.kwargs);
+                let args = args_to_py_vec(py, &call_args.args, nodes);
+                let kwargs = kwargs_to_py_map(py, &call_args.kwargs, nodes);
                 refs.push(Py::new(
                     py,
                     DecoratorRef {
@@ -751,14 +760,19 @@ impl CallQuery {
                  where_owner(...) + where_attr(...); or where_attr(...)",
             ));
         };
+        let outputs_borrow = ctx.outputs.borrow();
+        let outputs = outputs_borrow
+            .as_ref()
+            .ok_or_else(|| not_materialized("CallQuery.collect"))?;
+        let nodes: &[Py<NativeNode>] = &outputs.builder.nodes;
         let kwarg_matchers = &self.kwarg_matchers;
         let mut refs: Vec<Py<CallRef>> = Vec::new();
         for (owner_node, s, call_args) in triples {
             if !call_args_match_kwargs(&call_args, kwarg_matchers) {
                 continue;
             }
-            let args = args_to_py_vec(py, &call_args.args);
-            let kwargs = kwargs_to_py_map(py, &call_args.kwargs);
+            let args = args_to_py_vec(py, &call_args.args, nodes);
+            let kwargs = kwargs_to_py_map(py, &call_args.kwargs, nodes);
             refs.push(Py::new(
                 py,
                 CallRef {

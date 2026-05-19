@@ -3,11 +3,12 @@
 Strategy: find top-level ``Typer()`` instances in each module and emit
 inverse edges (instance -> handler) for every ``@<instance>.command(...)``
 and ``@<instance>.callback(...)`` decorator. Typer instances are *not*
-seeded as entrypoints; reachability is expected to flow through
-``[project.scripts]`` (handled by :class:`ProjectScriptsPlugin`) or an
-``if __name__ == "__main__": app()`` block (handled by
-:class:`MainBlockPlugin`). Sub-typers attached via ``app.add_typer(sub)``
-are kept alive through the ordinary reference tracked on that call.
+seeded as entrypoints (``seed_as_entrypoint=False``); reachability is
+expected to flow through ``[project.scripts]`` (handled by
+:class:`ProjectScriptsPlugin`) or an ``if __name__ == "__main__":
+app()`` block (handled by :class:`MainBlockPlugin`). Sub-typers
+attached via ``app.add_typer(sub)`` are kept alive through the
+ordinary reference tracked on that call.
 
 This routes ``why-alive`` chains through the Typer app variable users
 recognize ("alive because it's a command on ``app``") and lets a
@@ -35,6 +36,6 @@ class TyperPlugin(DispatchAppPlugin):
 
     name: str = "typer"
     version: int = 1777760307
-    app_module: str = "typer"
-    constructor_targets: frozenset[str] = frozenset({"Typer"})
+    app_classes: tuple[str, ...] = ("typer.Typer",)
     registration_decorators: frozenset[str] = frozenset({"command", "callback"})
+    seed_as_entrypoint: bool = False

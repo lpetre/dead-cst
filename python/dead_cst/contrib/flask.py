@@ -16,8 +16,7 @@ classification and the import-node check alone misses the case.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Mapping
+from dataclasses import dataclass
 
 from ..plugins.decl_shapes import DispatchAppPlugin
 
@@ -63,13 +62,6 @@ _REGISTRATION_DECORATORS: frozenset[str] = frozenset(
     }
 )
 
-# Classes whose instances we treat specially. Value records whether the
-# instance should be seeded as an entrypoint.
-_INSTANCE_KINDS: Mapping[str, bool] = {
-    "Flask": True,  # WSGI servers load ``module:app`` -- always an entrypoint
-    "Blueprint": False,  # only alive if reached via ``register_blueprint``
-}
-
 
 @dataclass
 class FlaskPlugin(DispatchAppPlugin):
@@ -95,6 +87,5 @@ class FlaskPlugin(DispatchAppPlugin):
 
     name: str = "flask"
     version: int = 1778973600
-    app_module: str = "flask"
+    app_classes: tuple[str, ...] = ("flask.Flask",)
     registration_decorators: frozenset[str] = _REGISTRATION_DECORATORS
-    instance_kinds: Mapping[str, bool] = field(default_factory=lambda: dict(_INSTANCE_KINDS))

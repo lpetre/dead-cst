@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterable, Mapping
+from typing import TYPE_CHECKING, Iterable
 
 from ..graph import NodeFlags
 from ..plugins.decl_shapes import DispatchAppPlugin
@@ -12,7 +12,6 @@ from ..plugins.decl_shapes import DispatchAppPlugin
 if TYPE_CHECKING:
     from dead_cst import _native as native
 
-_INSTANCE_KINDS: Mapping[str, bool] = {"Celery": True}
 _SHARED_TASK_NAMES: frozenset[str] = frozenset({"shared_task"})
 
 CELERY_SHARED_PREFIX = "<celery-shared>:"
@@ -30,9 +29,8 @@ class CeleryPlugin(DispatchAppPlugin):
 
     name: str = "celery"
     version: int = 1779000000
-    app_module: str = "celery"
+    app_classes: tuple[str, ...] = ("celery.Celery",)
     registration_decorators: frozenset[str] = frozenset({"task"})
-    instance_kinds: Mapping[str, bool] = field(default_factory=lambda: dict(_INSTANCE_KINDS))
 
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
         from dead_cst import _native as native

@@ -13,16 +13,17 @@ keep stumbling into:
 
   :class:`DispatchAppPlugin`
     "Find top-level ``X = Ctor(...)`` apps and wire decorated handlers
-    through them." Concrete subclasses configure the framework module
-    name (``flask`` / ``fastapi`` / ...), the constructor names, and
-    the per-instance registration decorators.
+    through them." Concrete subclasses configure the fully-qualified
+    app-class names (``flask.Flask`` / ``fastapi.FastAPI`` / ...) and
+    the per-instance registration decorators. Discovery is transitive
+    over subclasses.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterable, Mapping
+from typing import TYPE_CHECKING, Iterable
 
 from ..graph import NodeFlags
 
@@ -92,69 +93,113 @@ class DecoratedDeclPlugin:
 class DispatchAppPlugin:
     """Wire ``@<instance>.<reg_decorator>(...)`` handlers to their app instance.
 
-    Two modes:
+    Subclasses configure ``app_classes`` -- the fully-qualified class
+    names that the plugin treats as "app constructors". Discovery is
+    transitive: any subclass of a listed class also counts, so
+    ``("flask.Flask",)`` covers ``flask.Flask`` AND any project-level
+    ``CustomFlask(Flask)`` AND third-party Flask extensions for free.
 
-    * **Pure dispatch** (``instance_kinds`` empty -- Typer / Cyclopts /
-      Click): only direct ``X = Ctor(...)`` constructions are tracked;
-      handlers register through them. App instances are not auto-marked
-      as entrypoints.
-    * **Factory-aware** (``instance_kinds`` non-empty -- Flask /
-      FastAPI / FastMCP / Celery): each kind in the mapping is
-      recognized as a constructor, and the boolean value tells us
-      whether direct hits get promoted to entrypoints. Variables that
-      receive decorators but aren't directly constructed get a factory
-      walk through the assembled graph.
+    Handler wiring (``@instance.deco(...) -> instance``) always fires
+    for owners whose name matches a top-level variable in the same
+    file. Entrypoint promotion is gated on ``seed_as_entrypoint``:
+
+    * ``seed_as_entrypoint=True`` (default, factory-aware frameworks
+      like Flask / FastAPI / Celery / FastMCP):
+      every direct ``X = <app_class>(...)`` becomes an entrypoint, and
+      a factory walk promotes vars assigned from a function that
+      returns an ``app_class`` instance.
+    * ``seed_as_entrypoint=False`` (pure-dispatch frameworks like
+      Cyclopts / Typer / Click): apps are NOT entrypoint-promoted;
+      reachability is expected to flow through ``[project.scripts]``
+      / ``if __name__ == "__main__": app()`` / explicit ``-e``. Lets
+      unused sub-apps surface as dead code.
+
+    Result-level dedup: if the same construction site is reachable
+    from two ``app_classes`` entries (e.g. one is a base of the
+    other), it only emits one entrypoint marker.
     """
 
     name: str
     version: int
-    app_module: str = ""
-    constructor_targets: frozenset[str] = frozenset()
+    app_classes: tuple[str, ...] = ()
     registration_decorators: frozenset[str] = frozenset()
-    instance_kinds: Mapping[str, bool] = field(default_factory=dict)
-
-    @property
-    def _factory_aware(self) -> bool:
-        return bool(self.instance_kinds)
-
-    @property
-    def _targets(self) -> Mapping[str, bool] | frozenset[str]:
-        return self.instance_kinds if self._factory_aware else self.constructor_targets
+    seed_as_entrypoint: bool = True
 
     def _prefix(self, kind: str) -> str:
         return f"<{self.name}-{kind}>:"
 
+    def _module_to_names(self, ctx: native.ProjectContext) -> dict[str, set[str]]:
+        """Expand each ``app_class`` into ``{module: {simple_name, ...}}``,
+        walking subclasses transitively. Lets module-keyed queries
+        (``where_module(...).where_name(...)``,
+        ``of_module(...).where_name(...)``) discover project / third-party
+        subclasses whose import module differs from the base class.
+        """
+        from dead_cst import _native as native
+
+        out: dict[str, set[str]] = {}
+        for fqn in self.app_classes:
+            module, _, name = fqn.rpartition(".")
+            if not module or not name:
+                continue
+            out.setdefault(module, set()).add(name)
+            for sub in native.query(ctx).subclasses().of_fqn(fqn).transitive(True).collect():
+                sub_module, _, sub_name = sub.fqname.rpartition(".")
+                if sub_module and sub_name:
+                    out.setdefault(sub_module, set()).add(sub_name)
+        return out
+
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
         from dead_cst import _native as native
 
-        if not (self.app_module and self.registration_decorators):
+        if not (self.app_classes and self.registration_decorators):
             return
-        targets = self._targets
-        if not targets:
-            return
-        target_names = list(targets)
         decorator_attrs = list(self.registration_decorators)
 
-        direct = list(
-            native.query(ctx).constructions().where_module(self.app_module).where_name(target_names)
-        )
-        handlers = list(native.query(ctx).decorators().where_owner_attr(decorator_attrs))
-        factory_decls = (
-            list(
-                native.query(ctx)
-                .factories()
-                .of_module(self.app_module)
-                .where_name(target_names)
-                .collect()
-            )
-            if self._factory_aware
-            else []
-        )
+        module_to_names = self._module_to_names(ctx)
+        if not module_to_names:
+            return
 
-        direct_by_owner: dict[tuple[str, str], list[tuple["native.NativeNode", str]]] = {}
+        # 1. Direct constructions, deduped by (path, start_line).
+        direct_seen: set[tuple[str, int]] = set()
+        direct: list = []
+        for module, names in module_to_names.items():
+            for ref in (
+                native.query(ctx).constructions().where_module(module).where_name(sorted(names))
+            ):
+                key = (ref.var.path, ref.var.start_line)
+                if key in direct_seen:
+                    continue
+                direct_seen.add(key)
+                direct.append(ref)
+
+        # 2. Factory functions returning one of the listed classes,
+        # deduped by (decl path, decl line, kind). Only relevant when
+        # we'd actually do something with the markers in step 6.
+        factory_seen: set[tuple[str, int, str]] = set()
+        factory_decls: list = []
+        if self.seed_as_entrypoint:
+            for module, names in module_to_names.items():
+                for fref in (
+                    native.query(ctx)
+                    .factories()
+                    .of_module(module)
+                    .where_name(sorted(names))
+                    .collect()
+                ):
+                    for kind in fref.kinds:
+                        key = (fref.decl.path, fref.decl.start_line, kind)
+                        if key in factory_seen:
+                            continue
+                        factory_seen.add(key)
+                        factory_decls.append((fref, kind))
+
+        handlers = list(native.query(ctx).decorators().where_owner_attr(decorator_attrs))
+
+        direct_by_owner: dict[tuple[str, str], list["native.NativeNode"]] = {}
         for ref in direct:
             simple = ref.var.fqname.rsplit(".", 1)[-1]
-            direct_by_owner.setdefault((ref.var.path, simple), []).append((ref.var, ref.class_name))
+            direct_by_owner.setdefault((ref.var.path, simple), []).append(ref.var)
 
         vars_by_file: dict[tuple[str, str], native.NativeNode] = {}
         for n in ctx.nodes():
@@ -166,36 +211,48 @@ class DispatchAppPlugin:
         app_prefix = self._prefix("app")
         factory_prefix = self._prefix("factory")
 
-        if self._factory_aware:
+        # 3. Entrypoint-promote every direct construction (when enabled).
+        if self.seed_as_entrypoint:
             for ref in direct:
-                if self.instance_kinds.get(ref.class_name):
-                    yield native.AddNode(
-                        fqname=f"{app_prefix}{ref.var.fqname}",
-                        path=ref.var.path,
-                        flags=int(NodeFlags.ENTRYPOINT),
-                        edges_to=[ref.var],
-                    )
-            for fref in factory_decls:
-                for kind in fref.kinds:
-                    yield native.AddNode(
-                        fqname=f"{factory_prefix}{kind}:{fref.decl.fqname}",
-                        path=fref.decl.path,
-                        edges_from=[fref.decl],
-                    )
+                yield native.AddNode(
+                    fqname=f"{app_prefix}{ref.var.fqname}",
+                    path=ref.var.path,
+                    flags=int(NodeFlags.ENTRYPOINT),
+                    edges_to=[ref.var],
+                )
 
-        if self._factory_aware:
-            for h in handlers:
-                var = vars_by_file.get((h.decorated.path, h.decorator_owner or ""))
+        # 4. Emit factory markers so the descendant walk in step 6 can
+        # find them.
+        for fref, kind in factory_decls:
+            yield native.AddNode(
+                fqname=f"{factory_prefix}{kind}:{fref.decl.fqname}",
+                path=fref.decl.path,
+                edges_from=[fref.decl],
+            )
+
+        # 5. Wire decorator handlers to their owner var.
+        # When seed_as_entrypoint=False (pure dispatch), only wire to
+        # vars that came from a direct construction -- this is what
+        # makes ``from cyclopts import *; app = App()`` stay invisible
+        # to the plugin (the star import never resolves the App name,
+        # so direct_by_owner has no entry for ``app``).
+        # When seed_as_entrypoint=True (factory-aware), use vars_by_file
+        # so ``app = create_app()`` factory chains also pick up
+        # handler edges.
+        for h in handlers:
+            key = (h.decorated.path, h.decorator_owner or "")
+            if self.seed_as_entrypoint:
+                var = vars_by_file.get(key)
                 if var is not None:
                     yield native.AddEdge(var, h.decorated)
-        else:
-            for h in handlers:
-                for var_node, _kind in direct_by_owner.get(
-                    (h.decorated.path, h.decorator_owner or ""), []
-                ):
-                    yield native.AddEdge(var_node, h.decorated)
+            else:
+                for var in direct_by_owner.get(key, []):
+                    yield native.AddEdge(var, h.decorated)
 
-        if self._factory_aware:
+        # 6. Factory walk: vars that aren't directly constructed but
+        # whose descendant graph reaches a factory marker get
+        # entrypoint-promoted too. Skipped under seed_as_entrypoint=False.
+        if self.seed_as_entrypoint:
             classified: set[tuple[str, str]] = set()
             for h in handlers:
                 key = (h.decorated.path, h.decorator_owner or "")
@@ -208,9 +265,6 @@ class DispatchAppPlugin:
                     if desc.kind != "synthetic":
                         continue
                     if not desc.fqname.startswith(factory_prefix):
-                        continue
-                    kind = desc.fqname[len(factory_prefix) :].split(":", 1)[0]
-                    if not self.instance_kinds.get(kind):
                         continue
                     classified.add(key)
                     yield native.AddNode(
