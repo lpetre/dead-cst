@@ -1106,6 +1106,20 @@ pub(crate) fn emit_reference_edges(
     // this phase and isn't mutated here, so swap-out / swap-in is safe.
     let synthetic_nodes = std::mem::take(&mut builder.synthetic_nodes);
 
+    let inputs = RefCollectorInputs {
+        model: &model,
+        file,
+        parsed: &parsed,
+        index,
+        global_index,
+        module_nodes,
+        alias_imports,
+        live_decls,
+        synthetic_nodes: &synthetic_nodes,
+        dist_lookup,
+        dead_ranges: &dead_ranges,
+    };
+
     // (a) Definitions that own an expression / body — attribute their
     //     contained Names to the owning decl.
     for (_def_id, state, _used) in use_def_map.all_definitions_with_usage() {
@@ -1122,20 +1136,7 @@ pub(crate) fn emit_reference_edges(
             continue;
         };
 
-        let mut coll = RefCollector::new(
-            owner_idx,
-            &model,
-            file,
-            &parsed,
-            index,
-            global_index,
-            module_nodes,
-            alias_imports,
-            live_decls,
-            &synthetic_nodes,
-            dist_lookup,
-            &dead_ranges,
-        );
+        let mut coll = RefCollector::new(inputs, owner_idx);
         walk_owned(kind, &parsed, &mut coll);
         coll.flush(builder);
     }
@@ -1146,20 +1147,7 @@ pub(crate) fn emit_reference_edges(
         if stmt_creates_top_level_definition(stmt) {
             continue;
         }
-        let mut coll = RefCollector::new(
-            module_idx,
-            &model,
-            file,
-            &parsed,
-            index,
-            global_index,
-            module_nodes,
-            alias_imports,
-            live_decls,
-            &synthetic_nodes,
-            dist_lookup,
-            &dead_ranges,
-        );
+        let mut coll = RefCollector::new(inputs, module_idx);
         coll.visit_stmt(stmt);
         coll.flush(builder);
     }
@@ -1503,35 +1491,39 @@ pub(crate) struct RefCollector<'a, 'db> {
     current_flags: u32,
 }
 
+/// All read-only inputs `RefCollector::new` needs apart from the owner.
+/// Built once per file in `emit_reference_edges` and reused for every
+/// owner walked in that file. Cheap to `Copy` — it's a bag of borrows.
+#[derive(Clone, Copy)]
+pub(crate) struct RefCollectorInputs<'a, 'db> {
+    pub(crate) model: &'a SemanticModel<'db>,
+    pub(crate) file: File,
+    pub(crate) parsed: &'a ParsedModuleRef,
+    pub(crate) index: &'a SemanticIndex<'db>,
+    pub(crate) global_index: &'a DeclIndex,
+    pub(crate) module_nodes: &'a HashMap<File, usize>,
+    pub(crate) alias_imports: &'a HashMap<usize, ImportSpec>,
+    pub(crate) live_decls: &'a LiveDeclIndex,
+    pub(crate) synthetic_nodes: &'a HashMap<String, usize>,
+    pub(crate) dist_lookup: &'a DistLookup,
+    pub(crate) dead_ranges: &'a [TextRange],
+}
+
 impl<'a, 'db> RefCollector<'a, 'db> {
-    #[allow(clippy::too_many_arguments)]
-    fn new(
-        owner: usize,
-        model: &'a SemanticModel<'db>,
-        file: File,
-        parsed: &'a ParsedModuleRef,
-        index: &'a SemanticIndex<'db>,
-        global_index: &'a DeclIndex,
-        module_nodes: &'a HashMap<File, usize>,
-        alias_imports: &'a HashMap<usize, ImportSpec>,
-        live_decls: &'a LiveDeclIndex,
-        synthetic_nodes: &'a HashMap<String, usize>,
-        dist_lookup: &'a DistLookup,
-        dead_ranges: &'a [TextRange],
-    ) -> Self {
+    fn new(inputs: RefCollectorInputs<'a, 'db>, owner: usize) -> Self {
         Self {
             owner,
-            model,
-            file,
-            parsed,
-            index,
-            global_index,
-            module_nodes,
-            alias_imports,
-            live_decls,
-            synthetic_nodes,
-            dist_lookup,
-            dead_ranges,
+            model: inputs.model,
+            file: inputs.file,
+            parsed: inputs.parsed,
+            index: inputs.index,
+            global_index: inputs.global_index,
+            module_nodes: inputs.module_nodes,
+            alias_imports: inputs.alias_imports,
+            live_decls: inputs.live_decls,
+            synthetic_nodes: inputs.synthetic_nodes,
+            dist_lookup: inputs.dist_lookup,
+            dead_ranges: inputs.dead_ranges,
             edges: HashMap::new(),
             nested_context: false,
             current_flags: 0,
