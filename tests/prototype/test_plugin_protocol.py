@@ -105,12 +105,19 @@ def test_module_dunders_plugin_marks_each_dunder(make_ctx):
     assert "<dunder>:pkg.mod._private -> pkg.mod._private" not in edges
 
 
-def test_module_dunders_skips_function_with_dunder_name(make_ctx):
-    """`def __init_subclass__` at module scope is not a variable dunder."""
-    ctx = make_ctx({"mod.py": "def __init__(): pass\n__version__ = '1'\n"})
+def test_module_dunders_keeps_function_with_dunder_name(make_ctx):
+    """Module-level dunder *functions* (PEP 562 ``__getattr__`` /
+    ``__dir__``) are observable to the import machinery and must be
+    pinned the same way module-level dunder variables are.
+    """
+    ctx = make_ctx(
+        {"mod.py": ("def __getattr__(name): ...\ndef __dir__(): return []\n__version__ = '1'\n")}
+    )
     graph = run_plugins(ctx, [ModuleDundersPlugin()])
-    assert "<dunder>:mod.__version__ -> mod.__version__" in _edges(graph)
-    assert "<dunder>:mod.__init__ -> mod.__init__" not in _edges(graph)
+    edges = _edges(graph)
+    assert "<dunder>:mod.__version__ -> mod.__version__" in edges
+    assert "<dunder>:mod.__getattr__ -> mod.__getattr__" in edges
+    assert "<dunder>:mod.__dir__ -> mod.__dir__" in edges
 
 
 # ---------------------------------------------------------------------------

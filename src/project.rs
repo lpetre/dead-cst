@@ -642,17 +642,19 @@ impl ProjectContext {
 
 #[pymethods]
 impl ProjectContext {
-    /// Return every top-level variable node whose name matches `__xxx__`.
+    /// Return every top-level binding whose name matches `__xxx__`.
     ///
-    /// Pure scan over already-interned nodes — no ty re-query needed —
-    /// because the visitor's decl pass already minted one node per
-    /// global-scope variable binding.
+    /// Covers module-scope variables (``__all__``, ``__version__``, …)
+    /// and module-scope PEP 562 dunder functions (``__getattr__``,
+    /// ``__dir__``) — both are observable to import / attribute-access
+    /// machinery and must be kept alive even when no source reference
+    /// points at them.
     pub(crate) fn find_module_dunders(&self, py: Python<'_>) -> PyResult<Vec<Py<SymbolNode>>> {
         let outputs = self.materialized("find_module_dunders")?;
         let mut out = Vec::new();
         for node_py in &outputs.builder.nodes {
             let node = node_py.borrow(py);
-            if node.kind != "variable" {
+            if !matches!(node.kind, "variable" | "function") {
                 continue;
             }
             if is_dunder_name(&node.fqname) {

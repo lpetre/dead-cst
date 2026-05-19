@@ -133,7 +133,7 @@ def _edge_iterable(obj: object) -> list[tuple[int, int, int]]:
 
 def write_graph(
     path: Path | str,
-    graph: "native.ProjectContext | LoadedGraph",
+    graph: native.ProjectContext | LoadedGraph,
     meta: Sequence[tuple[str, str]] = (),
 ) -> None:
     """Persist ``graph`` to ``path`` as a bincode-encoded file.

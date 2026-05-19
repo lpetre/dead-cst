@@ -12,12 +12,15 @@ DUNDER_PREFIX = "<dunder>:"
 
 @dataclass
 class ModuleDundersPlugin(Plugin):
-    """Keep module-level dunder variables and ``__future__`` imports alive.
+    """Keep module-level dunder names and ``__future__`` imports alive.
 
     Variables named ``__xxx__`` at module scope (``__all__``, ``__version__``,
-    ``__author__``, ``__license__``, ...) are read by external tooling and
-    ``from __future__ import ...`` statements are compile-time directives;
-    removing either would be observable even when no source references them.
+    ``__author__``, ``__license__``, ...) are read by external tooling, and
+    PEP 562 module-level dunder *functions* (``__getattr__``, ``__dir__``)
+    are called by the import / attribute-access machinery. ``from __future__
+    import ...`` statements are compile-time directives. All three are
+    observable even when no source reference points at them, so the plugin
+    pins them as entrypoints.
     """
 
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
