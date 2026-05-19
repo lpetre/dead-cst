@@ -9,6 +9,52 @@ two versions.
 
 ## [Unreleased]
 
+### Added
+- **`dead-cst build`** materializes the project graph and persists it
+  to disk in a bincode-encoded binary file (header + node / edge lists
+  + a small metadata block). Subsequent `dead-cst analyze` and
+  `dead-cst remove` runs can then skip the build with
+  `--graph PATH`, which is useful for CI shapes that run multiple
+  reachability queries against the same code state. Plugins
+  intentionally do *not* round-trip — only the materialized adjacency
+  is captured, so a project that needs plugin-emitted edges must
+  rebuild rather than load.
+- **`--meta key=value`** on `build` stashes arbitrary user-supplied
+  metadata (branch name, commit SHA, etc.) into the graph file's
+  metadata block alongside the auto-recorded `created_at`, node /
+  edge / file / line counts.
+- **`--query {dead,test-only}`** on `analyze` and `remove`. The
+  default `dead` reproduces the previous behaviour; `test-only` runs
+  `kept_alive_by_flags_only(NodeFlags.TESTCASE)` and returns the
+  blast-radius set — code that goes dead the moment you drop the
+  test suite. Plumbs through to the patch emitter, so
+  `dead-cst remove ROOT --query test-only` is the one-shot "delete
+  the test suite and every helper that backed it" workflow.
+- **`--entrypoint-regex REGEX`** as an explicit replacement for the
+  old `-e re:<pattern>` magic prefix.
+- **`--exit-zero`** on `analyze` makes the command always exit 0 even
+  when dead code is found.
+- **Public Python API** for graph persistence:
+  :func:`dead_cst.graph.write_graph`,
+  :func:`dead_cst.graph.read_graph`, and
+  :class:`dead_cst.graph.GraphMetadata`. All I/O lives in the rust
+  crate (`dead_cst._native.write_graph` / `.read_graph`); the Python
+  wrappers handle `SymbolGraph` ↔ `NativeGraph` translation. The
+  on-disk format has a hard-versioned header — version mismatch is a
+  fatal error, with no migration path (rebuilding a graph is cheap).
+
+### Changed (breaking)
+- **CLI trimmed to three commands.** `dead-cst why-alive`,
+  `dead-cst dependencies`, and `dead-cst unused-exports` are
+  removed; the data they exposed is still available through the
+  Python API (:meth:`Analysis.ancestors`, the synthetic external-dep
+  nodes under :data:`EXTERNAL_PREFIXES`, and the `__all__`-only
+  blast-radius query, respectively). The supported surface is
+  `dead-cst build` / `dead-cst analyze` / `dead-cst remove`.
+- **`-e re:<pattern>` magic prefix** is no longer recognized. Use
+  `--entrypoint-regex <pattern>` instead. The plain `-e` flag now
+  treats its argument as a file path or FQN literal.
+
 ### Changed (breaking)
 - **Dropped the Python ``SymbolGraph`` adjacency facade.**
   ``Analysis.materialize_all()`` and ``PackageView.graph()`` now return

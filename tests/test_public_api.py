@@ -23,10 +23,14 @@ EXPECTED_PUBLIC_API: dict[str, list[str]] = {
     "dead_cst.codemod": ["generate_patch", "remove_code"],
     "dead_cst.graph": [
         "EdgeFlags",
+        "GraphMetadata",
         "Import",
         "KEEPALIVE_DEFAULT",
+        "LoadedGraph",
         "NodeFlags",
         "SymbolNode",
+        "read_graph",
+        "write_graph",
     ],
     "dead_cst.plugins": [
         "BUILTIN_PLUGINS",

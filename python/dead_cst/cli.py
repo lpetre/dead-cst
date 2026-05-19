@@ -1,4 +1,20 @@
-"""Command-line interface for dead-cst."""
+"""Command-line interface for dead-cst.
+
+Three commands cover the surface:
+
+* ``dead-cst build ROOT -o PATH`` — materialize the project graph and
+  persist it to disk for reuse by later ``analyze`` / ``remove`` runs.
+* ``dead-cst analyze ROOT`` — list dead code in text or JSON.
+* ``dead-cst remove ROOT`` — emit a ``git apply``-compatible patch
+  that drops dead code.
+
+``analyze`` and ``remove`` each take either build inputs (resolver /
+plugins / entrypoints) or a pre-built ``--graph PATH`` from a prior
+``build`` invocation, and a ``--query`` selector that picks the
+reachability question — ``dead`` (the default) or ``test-only`` (code
+kept alive only by the test suite, via
+:meth:`Analysis.kept_alive_by_flags_only` with ``NodeFlags.TESTCASE``).
+"""
 
 from __future__ import annotations
 
@@ -8,22 +24,27 @@ import re
 import sys
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Iterable, Sequence
+from typing import TYPE_CHECKING, Annotated, Iterable, Sequence, Union
 
 import typer
 
 from .analyze import Analysis, _count_nodes_by_prefix
 from .codemod import generate_patch
-from .graph import KEEPALIVE_DEFAULT, SymbolNode
+from .graph import (
+    KEEPALIVE_DEFAULT,
+    GraphMetadata,
+    LoadedGraph,
+    NodeFlags,
+    SymbolNode,
+    read_graph,
+    write_graph,
+)
 from .plugins import (
-    EXTERNAL_PREFIXES,
     ExplicitEntrypointPlugin,
     ModuleDundersPlugin,
     Plugin,
     load_plugin,
-    simple_name,
 )
-from .plugins.module_dunders import DUNDER_PREFIX
 from .resolvers import (
     ManualResolver,
     PathResolver,
@@ -33,6 +54,12 @@ from .resolvers import (
 if TYPE_CHECKING:
     from dead_cst import _native as native
 
+# A graph view the CLI can query for "what's alive": either the live
+# rust context (built this run) or the in-memory wrapper around a
+# loaded graph file. Both expose ``nodes()`` and
+# ``reachable(seed_flags=...)``.
+GraphView = Union["native.ProjectContext", LoadedGraph]
+
 
 app = typer.Typer(help="Dead code analysis for Python.")
 
@@ -40,6 +67,11 @@ app = typer.Typer(help="Dead code analysis for Python.")
 class OutputFormat(str, Enum):
     text = "text"
     json = "json"
+
+
+class Query(str, Enum):
+    dead = "dead"
+    test_only = "test-only"
 
 
 def setup_logging(verbose: bool) -> None:
@@ -51,10 +83,14 @@ def setup_logging(verbose: bool) -> None:
     )
 
 
-def parse_entrypoint(ep: str) -> str | re.Pattern[str]:
-    if ep.startswith("re:"):
-        return re.compile(ep[3:])
-    return ep
+def parse_meta(spec: str) -> tuple[str, str]:
+    if "=" not in spec:
+        raise typer.BadParameter(f"--meta expects 'key=value', got {spec!r}")
+    key, _, value = spec.partition("=")
+    key = key.strip()
+    if not key:
+        raise typer.BadParameter(f"--meta expects 'key=value', got {spec!r}")
+    return key, value
 
 
 def _rel_path(path: Path | str, root: Path) -> Path:
@@ -68,15 +104,21 @@ def _rel_path(path: Path | str, root: Path) -> Path:
 def build_plugins(
     *,
     entrypoints: list[str],
+    entrypoint_regexes: list[str],
     plugin_names: list[str],
 ) -> list[Plugin]:
-    """Compose the plugin list from CLI flags."""
-    plugins: list[Plugin] = []
-    for name in plugin_names:
-        plugins.append(load_plugin(name))
+    """Compose the plugin list from CLI flags.
+
+    Plain ``-e`` values are passed through as strings (file paths or
+    FQNs); ``--entrypoint-regex`` values are compiled to
+    :class:`re.Pattern`. The explicit-entrypoint plugin runs last so
+    it can pin nodes contributed by upstream plugins.
+    """
+    plugins: list[Plugin] = [load_plugin(name) for name in plugin_names]
     plugins.append(ModuleDundersPlugin())
-    if entrypoints:
-        specs = [parse_entrypoint(ep) for ep in entrypoints]
+    specs: list[str | Path | re.Pattern[str]] = list(entrypoints)
+    specs.extend(re.compile(p) for p in entrypoint_regexes)
+    if specs:
         plugins.append(ExplicitEntrypointPlugin(specs=specs))
     return plugins
 
@@ -89,6 +131,111 @@ def build_resolver(path_specs: list[str], resolver_name: str | None) -> PathReso
     if path_specs:
         return ManualResolver(specs=path_specs)
     return ManualResolver(specs=["."])
+
+
+def _materialize(
+    root: Path,
+    *,
+    path_specs: list[str],
+    resolver_name: str | None,
+    plugin_names: list[str],
+    entrypoints: list[str],
+    entrypoint_regexes: list[str],
+    show_progress: bool,
+) -> "tuple[native.ProjectContext, Analysis]":
+    """Build the project graph from CLI inputs."""
+    path_resolver = build_resolver(path_specs, resolver_name)
+    plugins = build_plugins(
+        entrypoints=entrypoints,
+        entrypoint_regexes=entrypoint_regexes,
+        plugin_names=plugin_names,
+    )
+    analysis = Analysis(root, resolver=path_resolver, plugins=plugins, show_progress=show_progress)
+    ctx = analysis.materialize_all()
+    return ctx, analysis
+
+
+def _reject_build_inputs_with_graph(
+    *,
+    graph_path: Path | None,
+    path_specs: list[str],
+    resolver_name: str | None,
+    plugin_names: list[str],
+    entrypoints: list[str],
+    entrypoint_regexes: list[str],
+) -> None:
+    if graph_path is None:
+        return
+    offending: list[str] = []
+    if path_specs:
+        offending.append("`-p`/`--path`")
+    if resolver_name is not None:
+        offending.append("`--resolver`")
+    if plugin_names:
+        offending.append("`--plugin`")
+    if entrypoints:
+        offending.append("`-e`/`--entrypoint`")
+    if entrypoint_regexes:
+        offending.append("`--entrypoint-regex`")
+    if offending:
+        raise typer.BadParameter(
+            f"--graph loads a pre-built graph; build inputs are not allowed: {', '.join(offending)}"
+        )
+
+
+def _load_or_build(
+    root: Path,
+    *,
+    graph_path: Path | None,
+    path_specs: list[str],
+    resolver_name: str | None,
+    plugin_names: list[str],
+    entrypoints: list[str],
+    entrypoint_regexes: list[str],
+) -> tuple[GraphView, list[Path], GraphMetadata | None]:
+    _reject_build_inputs_with_graph(
+        graph_path=graph_path,
+        path_specs=path_specs,
+        resolver_name=resolver_name,
+        plugin_names=plugin_names,
+        entrypoints=entrypoints,
+        entrypoint_regexes=entrypoint_regexes,
+    )
+    if graph_path is not None:
+        typer.echo(f"Loading symbol graph from {graph_path}...", err=True)
+        loaded, meta = read_graph(graph_path)
+        # Without resolver context, scope summaries to the project root.
+        return loaded, [root], meta
+    typer.echo(f"Building symbol graph for {root}...", err=True)
+    ctx, analysis = _materialize(
+        root,
+        path_specs=path_specs,
+        resolver_name=resolver_name,
+        plugin_names=plugin_names,
+        entrypoints=entrypoints,
+        entrypoint_regexes=entrypoint_regexes,
+        show_progress=True,
+    )
+    return ctx, [p.path for p in analysis.packages], None
+
+
+def _select_dead(view: GraphView, query: Query) -> list[SymbolNode]:
+    """Return the node set that the requested ``--query`` flags as dead.
+
+    * ``dead`` — the complement of ``reachable(KEEPALIVE_DEFAULT)``.
+    * ``test-only`` — the blast-radius diff between
+      ``reachable(KEEPALIVE_DEFAULT)`` and the same query with the
+      ``TESTCASE`` bit cleared from the seed mask. Test functions
+      themselves are in the result (they carry ``TESTCASE``).
+    """
+    if query is Query.dead:
+        reachable = set(view.reachable(seed_flags=KEEPALIVE_DEFAULT))
+        return [n for n in view.nodes() if n not in reachable]
+    if query is Query.test_only:
+        full = set(view.reachable(seed_flags=KEEPALIVE_DEFAULT))
+        without_tests = set(view.reachable(seed_flags=KEEPALIVE_DEFAULT & ~NodeFlags.TESTCASE))
+        return list(full - without_tests)
+    raise typer.BadParameter(f"unknown --query value: {query!r}")
 
 
 def version_callback(value: bool) -> None:
@@ -109,16 +256,89 @@ def main(
     """Dead code analysis for Python."""
 
 
+# ---------------------------------------------------------------------------
+# build
+# ---------------------------------------------------------------------------
+
+
+@app.command()
+def build(
+    root: Annotated[Path, typer.Argument(help="Root directory to analyze.")],
+    output: Annotated[
+        Path,
+        typer.Option("-o", "--output", help="Write the graph to this file."),
+    ],
+    entrypoint: Annotated[
+        list[str] | None,
+        typer.Option("-e", "--entrypoint", help="Entrypoint as a file path or FQN."),
+    ] = None,
+    entrypoint_regex: Annotated[
+        list[str] | None,
+        typer.Option("--entrypoint-regex", help="Entrypoint as a regex over FQNs / file paths."),
+    ] = None,
+    path: Annotated[
+        list[str] | None,
+        typer.Option("-p", "--path", help="Search path spec: 'package:dep1,dep2' or 'package'."),
+    ] = None,
+    resolver: Annotated[
+        str | None,
+        typer.Option("--resolver", help="Path resolver to run (e.g. uv)."),
+    ] = None,
+    plugin: Annotated[
+        list[str] | None,
+        typer.Option("--plugin", help="Edge plugin to run (e.g. main_block, project_scripts)."),
+    ] = None,
+    meta: Annotated[
+        list[str] | None,
+        typer.Option("--meta", help="Stash key=value metadata in the graph file (repeatable)."),
+    ] = None,
+    verbose: Annotated[
+        bool, typer.Option("-v", "--verbose", help="Enable verbose output.")
+    ] = False,
+) -> None:
+    """Build the project graph and persist it to disk."""
+    setup_logging(verbose)
+    root = root.resolve()
+    ctx, _ = _materialize(
+        root,
+        path_specs=path or [],
+        resolver_name=resolver,
+        plugin_names=plugin or [],
+        entrypoints=entrypoint or [],
+        entrypoint_regexes=entrypoint_regex or [],
+        show_progress=True,
+    )
+    meta_pairs = [parse_meta(s) for s in (meta or [])]
+    write_graph(output, ctx, meta_pairs)
+    typer.echo(
+        f"Wrote graph to {output} ({len(ctx.nodes())} nodes, {len(ctx.edges())} edges).",
+        err=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# analyze
+# ---------------------------------------------------------------------------
+
+
 @app.command()
 def analyze(
     root: Annotated[Path, typer.Argument(help="Root directory to analyze.")],
+    graph: Annotated[
+        Path | None,
+        typer.Option("--graph", help="Load a pre-built graph instead of materializing."),
+    ] = None,
+    query: Annotated[
+        Query,
+        typer.Option("--query", help="Reachability question: 'dead' or 'test-only'."),
+    ] = Query.dead,
     entrypoint: Annotated[
         list[str] | None,
-        typer.Option(
-            "-e",
-            "--entrypoint",
-            help="Entrypoint: file path, FQN, or 're:pattern' for regex.",
-        ),
+        typer.Option("-e", "--entrypoint", help="Entrypoint as a file path or FQN."),
+    ] = None,
+    entrypoint_regex: Annotated[
+        list[str] | None,
+        typer.Option("--entrypoint-regex", help="Entrypoint as a regex over FQNs / file paths."),
     ] = None,
     path: Annotated[
         list[str] | None,
@@ -138,31 +358,33 @@ def analyze(
     output_format: Annotated[
         OutputFormat, typer.Option("--format", help="Output format.")
     ] = OutputFormat.text,
+    exit_zero: Annotated[
+        bool,
+        typer.Option("--exit-zero", help="Always exit 0 even when dead code is found."),
+    ] = False,
 ) -> None:
-    """Analyze a Python codebase for dead code."""
+    """Report dead code for a Python codebase."""
     setup_logging(verbose)
     root = root.resolve()
 
-    path_resolver = build_resolver(path or [], resolver)
-
-    typer.echo(f"Building symbol graph for {root}...", err=True)
-    plugins = build_plugins(
-        entrypoints=entrypoint or [],
+    view, package_paths, _ = _load_or_build(
+        root,
+        graph_path=graph,
+        path_specs=path or [],
+        resolver_name=resolver,
         plugin_names=plugin or [],
+        entrypoints=entrypoint or [],
+        entrypoint_regexes=entrypoint_regex or [],
     )
-    analysis = Analysis(root, resolver=path_resolver, plugins=plugins, show_progress=True)
-    ctx = analysis.materialize_all()
-    reachable = set(ctx.reachable(seed_flags=KEEPALIVE_DEFAULT))
-    all_nodes = ctx.nodes()
-    dead_nodes = [n for n in all_nodes if n not in reachable]
+    all_nodes = view.nodes()
+    dead_nodes = _select_dead(view, query)
 
-    package_paths = [p.path for p in analysis.packages]
     if output_format == OutputFormat.json:
         _output_json(all_nodes, dead_nodes, root, package_paths)
     else:
         _output_text(all_nodes, dead_nodes, root, package_paths)
 
-    if dead_nodes:
+    if not exit_zero and dead_nodes:
         raise typer.Exit(1)
 
 
@@ -234,256 +456,29 @@ def _output_json(
     typer.echo(json.dumps(result, indent=2))
 
 
-def _build_predecessor_map(
-    ctx: "native.ProjectContext",
-) -> dict[int, list[int]]:
-    """Build a Python-side ``dst_idx -> [src_idx, ...]`` map from
-    ``ctx.edges()`` in a single pass.
-
-    Used by CLI commands that need one-hop predecessor walks
-    (``dependencies``, ``unused-exports``). One pass per command keeps
-    the rust surface lean — the production reachability path uses
-    :meth:`ProjectContext.reachable` and never builds this.
-    """
-    preds: dict[int, list[int]] = {}
-    for u, v, _flags in ctx.edges():
-        preds.setdefault(v, []).append(u)
-    return preds
-
-
-def _build_successor_map(
-    ctx: "native.ProjectContext",
-) -> dict[int, list[int]]:
-    succs: dict[int, list[int]] = {}
-    for u, v, _flags in ctx.edges():
-        succs.setdefault(u, []).append(v)
-    return succs
-
-
-@app.command("why-alive")
-def why_alive(
-    root: Annotated[Path, typer.Argument(help="Root directory to analyze.")],
-    fqname: Annotated[str, typer.Argument(help="Fully qualified name of the symbol to check.")],
-    path: Annotated[
-        list[str] | None,
-        typer.Option("-p", "--path", help="Search path spec: 'package:dep1,dep2' or 'package'."),
-    ] = None,
-    resolver: Annotated[
-        str | None,
-        typer.Option("--resolver", help="Path resolver to run (e.g. uv)."),
-    ] = None,
-    plugin: Annotated[
-        list[str] | None,
-        typer.Option("--plugin", help="Edge plugin to run (e.g. main_block, project_scripts)."),
-    ] = None,
-    verbose: Annotated[
-        bool, typer.Option("-v", "--verbose", help="Enable verbose output.")
-    ] = False,
-) -> None:
-    """Show why a symbol is considered alive (reachable)."""
-    setup_logging(verbose)
-    root = root.resolve()
-
-    path_resolver = build_resolver(path or [], resolver)
-
-    typer.echo(f"Building symbol graph for {root}...", err=True)
-    plugins = build_plugins(
-        entrypoints=[],
-        plugin_names=plugin or [],
-    )
-    analysis = Analysis(root, resolver=path_resolver, plugins=plugins, show_progress=True)
-    ctx = analysis.materialize_all()
-
-    nodes = ctx.nodes()
-    target_idx: int | None = None
-    for i, node in enumerate(nodes):
-        if node.fqname == fqname:
-            target_idx = i
-            break
-
-    if target_idx is None:
-        typer.echo(f"Symbol not found: {fqname}", err=True)
-        raise typer.Exit(1)
-    target_node = nodes[target_idx]
-
-    in_degree = sum(1 for _u, v, _f in ctx.edges() if v == target_idx)
-
-    typer.echo(f"\nSymbol: {target_node.fqname} ({target_node.kind})")
-    typer.echo(f"Path: {_rel_path(target_node.path, root)}")
-    typer.echo(f"In-degree: {in_degree}")
-    typer.echo("\nPredecessor chain:")
-
-    # Delegate the reverse-closure walk to the rust BFS.
-    for node in analysis.ancestors(target_node):
-        typer.echo(f"  <- {node.fqname} ({node.kind}) at {_rel_path(node.path, root)}")
-
-
-def _is_dunder_all(node: SymbolNode) -> bool:
-    return node.kind == "variable" and simple_name(node.fqname) == "__all__"
-
-
-def _is_external_dep(node: SymbolNode) -> bool:
-    return node.kind == "synthetic" and node.fqname.startswith(EXTERNAL_PREFIXES)
-
-
-@app.command()
-def dependencies(
-    root: Annotated[Path, typer.Argument(help="Root directory to analyze.")],
-    path: Annotated[
-        list[str] | None,
-        typer.Option("-p", "--path", help="Search path spec: 'package:dep1,dep2' or 'package'."),
-    ] = None,
-    resolver: Annotated[
-        str | None,
-        typer.Option("--resolver", help="Path resolver to run (e.g. uv)."),
-    ] = None,
-    verbose: Annotated[
-        bool, typer.Option("-v", "--verbose", help="Enable verbose output.")
-    ] = False,
-    output_format: Annotated[
-        OutputFormat, typer.Option("--format", help="Output format.")
-    ] = OutputFormat.text,
-) -> None:
-    """List third-party dependencies imported by the codebase."""
-    setup_logging(verbose)
-    root = root.resolve()
-
-    path_resolver = build_resolver(path or [], resolver)
-
-    typer.echo(f"Building symbol graph for {root}...", err=True)
-    analysis = Analysis(root, resolver=path_resolver, show_progress=True)
-    ctx = analysis.materialize_all()
-    nodes = ctx.nodes()
-    preds = _build_predecessor_map(ctx)
-
-    deps_by_package: dict[Path, list[SymbolNode]] = {p.path: [] for p in analysis.packages}
-    for idx, node in enumerate(nodes):
-        if not _is_external_dep(node):
-            continue
-        # Synthetic dep nodes carry an empty path. Attribute them to
-        # each package that imports them by walking back through the
-        # graph's predecessor edges.
-        importer_paths: set[Path] = {Path(nodes[i].path) for i in preds.get(idx, [])}
-        for pkg_path in deps_by_package:
-            if any(p.is_relative_to(pkg_path) for p in importer_paths):
-                if node not in deps_by_package[pkg_path]:
-                    deps_by_package[pkg_path].append(node)
-
-    if output_format == OutputFormat.json:
-        result = {
-            str(pkg_path): sorted(n.fqname for n in nodes_list)
-            for pkg_path, nodes_list in deps_by_package.items()
-        }
-        typer.echo(json.dumps(result, indent=2))
-        return
-
-    for pkg_path, nodes_list in deps_by_package.items():
-        typer.echo(f"\n{pkg_path}:")
-        if not nodes_list:
-            typer.echo("  (no third-party dependencies found)")
-            continue
-        for node in sorted(nodes_list, key=lambda n: n.fqname):
-            typer.echo(f"  {node.fqname}")
-
-
-@app.command("unused-exports")
-def unused_exports(
-    root: Annotated[Path, typer.Argument(help="Root directory to analyze.")],
-    entrypoint: Annotated[
-        list[str] | None,
-        typer.Option(
-            "-e",
-            "--entrypoint",
-            help="Entrypoint: file path, FQN, or 're:pattern' for regex.",
-        ),
-    ] = None,
-    path: Annotated[
-        list[str] | None,
-        typer.Option("-p", "--path", help="Search path spec: 'package:dep1,dep2' or 'package'."),
-    ] = None,
-    resolver: Annotated[
-        str | None,
-        typer.Option("--resolver", help="Path resolver to run (e.g. uv)."),
-    ] = None,
-    plugin: Annotated[
-        list[str] | None,
-        typer.Option("--plugin", help="Edge plugin to run (e.g. main_block, project_scripts)."),
-    ] = None,
-    verbose: Annotated[
-        bool, typer.Option("-v", "--verbose", help="Enable verbose output.")
-    ] = False,
-) -> None:
-    """Report __all__ entries whose targets are only alive because of __all__."""
-    setup_logging(verbose)
-    root = root.resolve()
-
-    path_resolver = build_resolver(path or [], resolver)
-
-    typer.echo(f"Building symbol graph for {root}...", err=True)
-    plugins = build_plugins(
-        entrypoints=entrypoint or [],
-        plugin_names=plugin or [],
-    )
-    analysis = Analysis(root, resolver=path_resolver, plugins=plugins, show_progress=True)
-    ctx = analysis.materialize_all()
-    nodes = ctx.nodes()
-    reachable = set(ctx.reachable(seed_flags=KEEPALIVE_DEFAULT))
-
-    def _is_dunder_seed(node: SymbolNode) -> bool:
-        return node.kind == "synthetic" and node.fqname.startswith(DUNDER_PREFIX)
-
-    succs = _build_successor_map(ctx)
-
-    # Walk reachability one more time, but treat the
-    # ``dunder_seed -> __all__`` step as a dead end. The diff against
-    # the default reachable set is the set of nodes only kept alive by
-    # ``__all__`` lookups.
-    visited_idx: set[int] = set()
-    stack: list[int] = [i for i, n in enumerate(nodes) if n.flags & KEEPALIVE_DEFAULT]
-    while stack:
-        i = stack.pop()
-        if i in visited_idx:
-            continue
-        visited_idx.add(i)
-        is_seed = _is_dunder_seed(nodes[i])
-        for j in succs.get(i, ()):
-            if is_seed and _is_dunder_all(nodes[j]):
-                continue
-            stack.append(j)
-    visited = {nodes[i] for i in visited_idx}
-    only_via_all = reachable - visited
-
-    preds = _build_predecessor_map(ctx)
-    by_all: dict[SymbolNode, list[SymbolNode]] = {}
-    for sym in only_via_all:
-        if _is_dunder_all(sym):
-            continue
-        sym_idx = nodes.index(sym)
-        for j in preds.get(sym_idx, ()):
-            pred = nodes[j]
-            if _is_dunder_all(pred):
-                by_all.setdefault(pred, []).append(sym)
-
-    if not by_all:
-        typer.echo("No __all__ entries are kept alive only by __all__.")
-        return
-
-    for all_sym in sorted(by_all, key=lambda n: n.fqname):
-        typer.echo(f"\n{all_sym.fqname} at {_rel_path(all_sym.path, root)}:")
-        for sym in sorted(by_all[all_sym], key=lambda n: n.fqname):
-            typer.echo(f"  {sym.fqname} ({sym.kind})")
+# ---------------------------------------------------------------------------
+# remove
+# ---------------------------------------------------------------------------
 
 
 @app.command()
 def remove(
     root: Annotated[Path, typer.Argument(help="Root directory to analyze.")],
+    graph: Annotated[
+        Path | None,
+        typer.Option("--graph", help="Load a pre-built graph instead of materializing."),
+    ] = None,
+    query: Annotated[
+        Query,
+        typer.Option("--query", help="Reachability question: 'dead' or 'test-only'."),
+    ] = Query.dead,
     entrypoint: Annotated[
         list[str] | None,
-        typer.Option(
-            "-e",
-            "--entrypoint",
-            help="Entrypoint: file path, FQN, or 're:pattern' for regex.",
-        ),
+        typer.Option("-e", "--entrypoint", help="Entrypoint as a file path or FQN."),
+    ] = None,
+    entrypoint_regex: Annotated[
+        list[str] | None,
+        typer.Option("--entrypoint-regex", help="Entrypoint as a regex over FQNs / file paths."),
     ] = None,
     path: Annotated[
         list[str] | None,
@@ -513,18 +508,16 @@ def remove(
     setup_logging(verbose)
     root = root.resolve()
 
-    path_resolver = build_resolver(path or [], resolver)
-
-    typer.echo(f"Building symbol graph for {root}...", err=True)
-    plugins = build_plugins(
-        entrypoints=entrypoint or [],
+    view, _, _ = _load_or_build(
+        root,
+        graph_path=graph,
+        path_specs=path or [],
+        resolver_name=resolver,
         plugin_names=plugin or [],
+        entrypoints=entrypoint or [],
+        entrypoint_regexes=entrypoint_regex or [],
     )
-    analysis = Analysis(root, resolver=path_resolver, plugins=plugins, show_progress=True)
-    ctx = analysis.materialize_all()
-    reachable = set(ctx.reachable(seed_flags=KEEPALIVE_DEFAULT))
-    dead_nodes = [n for n in ctx.nodes() if n not in reachable]
-
+    dead_nodes = _select_dead(view, query)
     patch = generate_patch(dead_nodes, root)
 
     if not patch:

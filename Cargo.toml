@@ -33,3 +33,5 @@ ty_ide = { path = "vendor/ruff/crates/ty_ide" }
 indicatif = "0.17"
 rayon = "1.10"
 regex = "1"
+serde = { version = "1", features = ["derive"] }
+bincode = "1.3"

@@ -106,7 +106,7 @@ const VALID_KINDS: &[&str] = &[
     "synthetic",
 ];
 
-fn intern_kind(kind: &str) -> PyResult<&'static str> {
+pub(crate) fn intern_kind(kind: &str) -> PyResult<&'static str> {
     for valid in VALID_KINDS {
         if *valid == kind {
             return Ok(*valid);
