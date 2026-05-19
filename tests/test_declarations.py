@@ -1527,46 +1527,6 @@ def test_shadowed_declarations(build_decl_graph, assert_positional_edges, files,
     assert_positional_edges(graph, expected_edges)
 
 
-@pytest.mark.parametrize(
-    "files, expected_edges",
-    [
-        # Both branches define ``f``; both are live at module exit, so a
-        # cross-module ``from lib import f`` must reach each one.
-        # Skipped on rust: ty's reachability folds ``if True:`` to
-        # definitely-taken and drops the else branch from end-of-scope
-        # live bindings (matching pyright). Rewriting with ``if x:`` for
-        # a non-literal ``x`` would pass on both backends.
-        # Conditional re-export through an intermediate module: each
-        # branch imports from a different upstream, so resolving
-        # ``mod -> compat.f`` forks the worklist into both upstreams.
-        # Skipped on rust for two reasons: (1) ty folds ``if True:`` and
-        # drops the else branch's import alias, and (2) rust emits
-        # Principle 2 parallel-upstream edges one hop only; libcst
-        # chases the alias chain transitively to emit ``mod -> a.f`` /
-        # ``mod -> b.f``. Reachability is preserved either way
-        # (``mod -> mod.f -> compat.f -> a.f`` still walks).
-        # ``try`` body and ``except`` handler both bind ``f``; both are
-        # live at exit (a handler can run before *or* instead of the
-        # body completing), so both must be importable. Skipped on rust
-        # only because of the transitive ``mod -> a.f`` /
-        # ``mod.f -> a.f`` edges libcst emits by chasing through
-        # ``lib.f@2:18``'s own ``from a import f`` alias — rust emits
-        # one-hop Principle 2 edges only. All structural edges
-        # (``mod -> lib.f@2:18``, ``mod -> lib.f@4:4``, etc.) are
-        # present on rust; reachability is preserved.
-    ],
-)
-def test_branch_bindings_exported(build_decl_graph, assert_positional_edges, files, expected_edges):
-    """Decls bound on every reachable path to module exit are importable.
-
-    Plain shadowing keeps single-survivor semantics, but conditional
-    bindings (``if/else``, ``try/except``, ...) where multiple branches
-    bind the same name should expose every branch to importing modules.
-    """
-    graph = build_decl_graph(files)
-    assert_positional_edges(graph, expected_edges)
-
-
 def test_cross_module_type_alias_import(build_decl_graph, assert_edges):
     """Importing a PEP 695 ``type`` alias from another module resolves cleanly.
 
