@@ -10,43 +10,59 @@ two versions.
 ## [Unreleased]
 
 ### Changed (breaking)
-- **Plugin protocol.** Every plugin now subclasses
-  :class:`dead_cst.plugins.Plugin`. The backend uses
-  ``isinstance(plugin, Plugin)`` instead of a permissive
-  ``hasattr(plugin, "run")`` check, so passing in a non-plugin (a typo
-  like ``Pluign()``, a bare function) raises :class:`TypeError`
-  instead of being silently skipped.
-- **Dropped ``name`` and ``version`` fields** from every plugin. Neither
-  was read by reachability or the cache layer; the rust progress bar
-  now derives its label from ``type(plugin).__qualname__``. The three
+- **Rust-native graph builder.** The libcst CST visitor pipeline, SQLite
+  per-file cache, and networkx graph are all replaced by a pyo3 native
+  extension built on ty's ``SemanticIndex``. Graph construction, import
+  resolution, and reachability walks run entirely in Rust. The only
+  remaining libcst usage is the codemod source rewriter.
+- **Build system.** Switched from hatchling to maturin. The Rust crate
+  lives in ``src/``, Python sources under ``python/dead_cst/``, and the
+  wheel ships ``_native.{abi3.so,pyd}`` alongside the Python code.
+- **``networkx`` → ``rustworkx``.** ``SymbolNode`` and ``Import`` are
+  now frozen pyo3 classes, not Python dataclasses.
+- **Plugin protocol.** Plugins subclass :class:`~dead_cst.plugins.Plugin`
+  and implement a single ``run(ctx: ProjectContext)`` that yields
+  :class:`~dead_cst._native.GraphOp` values (``AddNode`` / ``AddEdge`` /
+  ``AddEntrypoint``). The old ``observe()`` / ``finalize()`` two-phase
+  split and per-file caching are gone.
+- **Plugin ``name`` / ``version`` fields dropped.** The Rust progress bar
+  derives its label from ``type(plugin).__qualname__``. The three
   declarative bases (:class:`DecoratedDeclPlugin`,
   :class:`DispatchAppPlugin`, :class:`LiteralListPlugin`) gained a
   required ``marker_prefix: str`` field that controls the synthetic
-  fqname prefix the plugin emits (it replaces the previous
-  ``self.name``-derived ``<{name}>:`` markers).
-- **``BUILTIN_PLUGINS``** is now a ``list[Plugin]`` of fully-configured
-  instances instead of a ``dict[str, type]`` keyed by ``name``. CLI
-  ``--plugin <key>`` lookup is preserved via the new
-  :data:`dead_cst.plugins._BUILTIN_BY_CLI_KEY` map; the public CLI keys
-  (``main_block``, ``project_scripts``, ``fastapi``, ``flask``, ...)
-  are unchanged.
+  fqname prefix.
+- **``BUILTIN_PLUGINS``** is now a ``list[Plugin]`` of instances instead
+  of a ``dict[str, type]``. CLI ``--plugin <key>`` lookup is unchanged.
 - **Framework plugins are factory functions.** ``FastAPIPlugin``,
-  ``FastMCPPlugin``, ``FlaskPlugin``, ``TyperPlugin``, ``CycloptsPlugin``
-  no longer exist as subclasses — they were pure configuration over
-  :class:`DispatchAppPlugin`. Use the lowercase factory functions
-  instead: :func:`dead_cst.plugins.fastapi_plugin`,
-  :func:`fastmcp_plugin`, :func:`flask_plugin`, :func:`typer_plugin`,
-  :func:`cyclopts_plugin`. ``CeleryPlugin``, ``ClickPlugin``,
-  ``DiscordPyPlugin``, ``MockPatchPlugin``, ``UnittestPlugin``,
-  ``PytestPlugin``, ``ServerConfigPlugin``, ``InitSubclassPlugin``,
-  ``MainBlockPlugin``, ``ProjectScriptsPlugin``,
-  ``ExplicitEntrypointPlugin``, ``ModuleDundersPlugin``,
-  ``DynamicImportFallbackPlugin`` remain classes (they either carry
-  custom ``run()`` logic or take per-instance configuration).
-- :class:`native.ConstructionRef` gained ``args: list[Any]`` and
-  ``kwargs: dict[str, Any]`` fields (mirroring :class:`CallRef` and
-  :class:`DecoratorRef`). Constructors are calls, and their argument
-  shape is now surfaced to plugins.
+  ``FastMCPPlugin``, ``FlaskPlugin``, ``TyperPlugin``,
+  ``CycloptsPlugin`` are replaced by lowercase factory functions
+  (e.g. :func:`~dead_cst.plugins.fastapi_plugin`). Plugins with custom
+  ``run()`` logic or per-instance configuration remain classes.
+- **Plugin query API.** ``ctx.find_*`` helpers replaced by a chainable
+  builder (``query(ctx).decorators().where_module(...).collect()``) with
+  Rust-backed cross-file lookups, subclass closures, and
+  decorator/call matching.
+- **Reachability queries.** ``ctx.reachable()`` / ``ctx.descendants()`` /
+  ``ctx.ancestors()`` delegate to a Rust BFS in a single FFI call
+  instead of per-node Python ↔ networkx round-trips.
+
+### Added
+- **Dead-branch detection.** Edges from statically-dead code regions
+  (``if False:``, post-``return``) carry :attr:`EdgeFlags.DEAD_BRANCH`,
+  identified via ty's reachability constraints instead of a custom
+  ``TruthinessResolver``.
+- **Dynamic-import edges.** ``__import__()`` and
+  ``importlib.import_module()`` calls with string-literal args emit
+  :attr:`EdgeFlags.DYNAMIC_IMPORT` edges.
+- **Stub-file support.** ``.pyi`` stubs are ingested for
+  compiled-extension layouts (``_native.so`` + ``_native.pyi`` with no
+  ``.py`` twin).
+- ``ConstructionRef`` gained ``args`` and ``kwargs`` fields (mirroring
+  ``CallRef`` and ``DecoratorRef``).
+
+### Removed
+- The libcst graph builder, ``TruthinessResolver``, SQLite per-file
+  cache, and ``networkx`` dependency.
 
 ## [0.10.0] - 2026-05-15
 
