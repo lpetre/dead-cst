@@ -14,11 +14,6 @@ if TYPE_CHECKING:
     from .plugins import Plugin
 
 
-def _path_under(node_path: str, prefix: Path) -> bool:
-    """Return True if ``node_path`` (the rust-side string) lives under ``prefix``."""
-    return Path(node_path).is_relative_to(prefix)
-
-
 def _bfs_order(seeds: Iterable[Path], neighbors: Mapping[Path, Sequence[Path]]) -> list[Path]:
     visited: set[Path] = set()
     order: list[Path] = []
@@ -36,34 +31,15 @@ def _bfs_order(seeds: Iterable[Path], neighbors: Mapping[Path, Sequence[Path]]) 
 _NON_DECL_TYPES: frozenset[str] = frozenset({"module", "synthetic"})
 
 
-def _filter_under(nodes: Iterable[SymbolNode], prefix: Path | None) -> set[SymbolNode]:
-    if prefix is None:
-        return set(nodes)
-    return {n for n in nodes if _path_under(n.path, prefix)}
-
-
 def _iter_dead(
     ctx: native.ProjectContext,
     reachable: set[SymbolNode],
-    *,
-    prefix: Path | None = None,
 ) -> Iterator[SymbolNode]:
     for n in ctx.nodes():
-        if prefix is not None and not _path_under(n.path, prefix):
-            continue
         if n.kind in _NON_DECL_TYPES:
             continue
         if n not in reachable:
             yield n
-
-
-def _count_nodes(nodes: Iterable[SymbolNode], prefix: Path | None) -> dict[str, int]:
-    counts: dict[str, int] = {}
-    for node in nodes:
-        if prefix and not _path_under(node.path, prefix):
-            continue
-        counts[node.kind] = counts.get(node.kind, 0) + 1
-    return counts
 
 
 def _count_nodes_by_prefix(
@@ -155,15 +131,6 @@ class Analysis:
             self._reverse_closures[package] = cached
         return cached
 
-    def package(self, path: Path) -> PackageView:
-        if path not in self._packages_by_path:
-            raise KeyError(path)
-        return PackageView(self, self._packages_by_path[path])
-
-    def views(self) -> Iterator[PackageView]:
-        for package in self.packages:
-            yield PackageView(self, package)
-
     def materialize_all(self) -> native.ProjectContext:
         """Build the project-wide graph (memoized).
 
@@ -193,15 +160,6 @@ class Analysis:
             show_progress=self._show_progress,
         )
         return self._ctx
-
-    def materialize_closure(self, package: Path) -> native.ProjectContext:
-        """Return the project-wide context.
-
-        The rust backend builds the whole project at once via ty's
-        Salsa db; there is no cheaper per-package closure path. Kept
-        for API parity with :class:`PackageView` callers.
-        """
-        return self.materialize_all()
 
     def reachable(self, *, seed_flags: int = KEEPALIVE_DEFAULT) -> set[SymbolNode]:
         """Set of every decl reachable from any seed in ``seed_flags``.
@@ -257,91 +215,7 @@ class Analysis:
         without = set(ctx.reachable(seed_flags=seed_flags & ~flags))
         return full - without
 
-    def count_nodes(self, prefix: Path | None = None) -> dict[str, int]:
-        return _count_nodes(self.materialize_all().nodes(), prefix)
-
-
-class PackageView:
-    """Lazy view onto a single package within an :class:`Analysis`."""
-
-    __slots__ = ("_analysis", "_package")
-
-    def __init__(self, analysis: Analysis, package: Package) -> None:
-        self._analysis = analysis
-        self._package = package
-
-    @property
-    def package(self) -> Package:
-        return self._package
-
-    @property
-    def path(self) -> Path:
-        return self._package.path
-
-    @property
-    def analysis(self) -> Analysis:
-        return self._analysis
-
-    def reverse_closure(self) -> frozenset[Path]:
-        return self._analysis.reverse_closure(self._package.path)
-
-    def declarations(self, name: str | None = None) -> Iterator[SymbolNode]:
-        for n in self._analysis.materialize_all().nodes():
-            if not _path_under(n.path, self._package.path):
-                continue
-            if n.kind in ("module", "synthetic"):
-                continue
-            if name is not None and n.fqname.rpartition(".")[2] != name:
-                continue
-            yield n
-
-    def graph(self) -> native.ProjectContext:
-        return self._analysis.materialize_all()
-
-    def reachable(self, *, seed_flags: int = KEEPALIVE_DEFAULT) -> set[SymbolNode]:
-        return _filter_under(self._analysis.reachable(seed_flags=seed_flags), self._package.path)
-
-    def dead(self, *, seed_flags: int = KEEPALIVE_DEFAULT) -> Iterator[SymbolNode]:
-        return _iter_dead(
-            self._analysis.materialize_all(),
-            self._analysis.reachable(seed_flags=seed_flags),
-            prefix=self._package.path,
-        )
-
-    def kept_alive_by_dead_branches(
-        self, *, seed_flags: int = KEEPALIVE_DEFAULT
-    ) -> set[SymbolNode]:
-        return _filter_under(
-            self._analysis.kept_alive_by_dead_branches(seed_flags=seed_flags),
-            self._package.path,
-        )
-
-    def kept_alive_by_flags_only(
-        self, flags: int, *, seed_flags: int = KEEPALIVE_DEFAULT
-    ) -> set[SymbolNode]:
-        return _filter_under(
-            self._analysis.kept_alive_by_flags_only(flags, seed_flags=seed_flags),
-            self._package.path,
-        )
-
-    def count_nodes(self) -> dict[str, int]:
-        return _count_nodes(
-            (
-                n
-                for n in self._analysis.materialize_all().nodes()
-                if _path_under(n.path, self._package.path)
-            ),
-            prefix=None,
-        )
-
-    def remove_dead_code(self, *, seed_flags: int = KEEPALIVE_DEFAULT) -> None:
-        from .codemod import remove_code
-
-        dead_nodes = list(self.dead(seed_flags=seed_flags))
-        remove_code(dead_nodes, self._package.path)
-
 
 __all__ = [
     "Analysis",
-    "PackageView",
 ]

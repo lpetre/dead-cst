@@ -20,10 +20,12 @@ from typing import TYPE_CHECKING, Sequence
 if TYPE_CHECKING:
     from dead_cst import _native as native
 
+    from .plugins import Plugin
+
 
 def materialize_project(
     project_root: Path,
-    plugins: Sequence[object] = (),
+    plugins: Sequence[Plugin] = (),
     src_roots: Sequence[Path] = (),
     *,
     show_progress: bool = False,

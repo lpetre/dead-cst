@@ -51,6 +51,16 @@ two versions.
 - **``dead_cst._notebooks`` helper module.** Notebook ingestion lives
   in the rust crate (``src/helpers.rs``); the Python helper that
   preceded it had no callers.
+- **``PackageView`` class (and its accessors).** The per-package view
+  was a thin filter over ``Analysis`` results; ``Analysis.package(p)``,
+  ``Analysis.views()``, and ``Analysis.materialize_closure(p)`` are
+  gone with it. Callers that need a per-package slice filter the
+  project-wide query inline (e.g.
+  ``[n for n in analysis.dead() if Path(n.path).is_relative_to(pkg)]``).
+  ``Analysis.count_nodes()`` and ``PackageView.count_nodes()`` had no
+  external callers and were removed in the same pass; the CLI's
+  per-package histograms go through ``analyze._count_nodes_by_prefix``
+  directly.
 
 ### Changed
 - **Annotation references to native types are unquoted.** With
