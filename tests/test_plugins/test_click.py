@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from dead_cst.plugins import (
     ClickPlugin,
     ExplicitEntrypointPlugin,
@@ -237,11 +239,11 @@ def test_click_plugin_subgroup_via_decorator(build_plugin_graph, reachable_fqnam
     assert "cli.main.reset" in reached
 
 
-def test_click_plugin_handles_from_click_import_group(build_plugin_graph, reachable_fqnames):
-    graph = build_plugin_graph(
-        {
-            "cli/__init__.py": "",
-            "cli/main.py": """
+@pytest.mark.parametrize(
+    "src",
+    [
+        pytest.param(
+            """
             from click import group
 
             @group()
@@ -253,17 +255,10 @@ def test_click_plugin_handles_from_click_import_group(build_plugin_graph, reacha
             if __name__ == "__main__":
                 cli()
             """,
-        },
-        [MainBlockPlugin(), ClickPlugin()],
-    )
-    assert "cli.main.hello" in reachable_fqnames(graph)
-
-
-def test_click_plugin_handles_aliased_module_import(build_plugin_graph, reachable_fqnames):
-    graph = build_plugin_graph(
-        {
-            "cli/__init__.py": "",
-            "cli/main.py": """
+            id="from-click-import-group",
+        ),
+        pytest.param(
+            """
             import click as c
 
             @c.group()
@@ -275,17 +270,10 @@ def test_click_plugin_handles_aliased_module_import(build_plugin_graph, reachabl
             if __name__ == "__main__":
                 cli()
             """,
-        },
-        [MainBlockPlugin(), ClickPlugin()],
-    )
-    assert "cli.main.hello" in reachable_fqnames(graph)
-
-
-def test_click_plugin_handles_aliased_decorator_import(build_plugin_graph, reachable_fqnames):
-    graph = build_plugin_graph(
-        {
-            "cli/__init__.py": "",
-            "cli/main.py": """
+            id="aliased-module-import",
+        ),
+        pytest.param(
+            """
             from click import group as g
 
             @g()
@@ -297,17 +285,10 @@ def test_click_plugin_handles_aliased_decorator_import(build_plugin_graph, reach
             if __name__ == "__main__":
                 cli()
             """,
-        },
-        [MainBlockPlugin(), ClickPlugin()],
-    )
-    assert "cli.main.hello" in reachable_fqnames(graph)
-
-
-def test_click_plugin_handles_explicit_constructor(build_plugin_graph, reachable_fqnames):
-    graph = build_plugin_graph(
-        {
-            "cli/__init__.py": "",
-            "cli/main.py": """
+            id="aliased-decorator-import",
+        ),
+        pytest.param(
+            """
             from click import Group
 
             cli = Group("cli")
@@ -318,7 +299,13 @@ def test_click_plugin_handles_explicit_constructor(build_plugin_graph, reachable
             if __name__ == "__main__":
                 cli()
             """,
-        },
+            id="explicit-constructor",
+        ),
+    ],
+)
+def test_click_plugin_handles_import_variants(build_plugin_graph, reachable_fqnames, src):
+    graph = build_plugin_graph(
+        {"cli/__init__.py": "", "cli/main.py": src},
         [MainBlockPlugin(), ClickPlugin()],
     )
     assert "cli.main.hello" in reachable_fqnames(graph)

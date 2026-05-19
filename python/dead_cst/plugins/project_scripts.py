@@ -1,5 +1,4 @@
-"""Plugin: treat every ``[project.scripts]`` entry in ``pyproject.toml`` as
-an entrypoint."""
+"""Plugin: mark every ``[project.scripts]`` entry in ``pyproject.toml`` as an entrypoint."""
 
 from __future__ import annotations
 
@@ -19,8 +18,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ProjectScriptsPlugin(Plugin):
-    """Treat every ``[project.scripts]`` entry in ``pyproject.toml`` as an
-    entrypoint.
+    """Mark every ``[project.scripts]`` entry in ``pyproject.toml`` as an entrypoint.
 
     For each ``name = "pkg.mod:func"`` mapping, look up ``pkg.mod.func`` in
     the project graph and wire a synthetic entrypoint node to it.

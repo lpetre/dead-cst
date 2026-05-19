@@ -1,4 +1,4 @@
-"""Plugin: treat WSGI/ASGI server config modules as entrypoints."""
+"""Plugin: mark WSGI/ASGI server config modules as entrypoints."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ _DEFAULT_FILENAMES: tuple[str, ...] = (
 
 @dataclass
 class ServerConfigPlugin(Plugin):
-    """Treat WSGI/ASGI server config modules as entrypoints.
+    """Mark WSGI/ASGI server config modules as entrypoints.
 
     Files like ``gunicorn.conf.py`` and ``hypercorn.conf.py`` are loaded
     by the server process at startup -- nothing in the project imports

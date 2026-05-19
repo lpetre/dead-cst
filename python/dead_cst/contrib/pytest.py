@@ -1,5 +1,4 @@
-"""Plugin: keep pytest-discovered tests, conftest decls, and ``@pytest.fixture``
-functions alive."""
+"""Plugin: keep pytest-discovered tests, conftest decls, and ``@pytest.fixture`` functions alive."""
 
 from __future__ import annotations
 

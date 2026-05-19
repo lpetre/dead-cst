@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from dead_cst.plugins import (
     DispatchAppPlugin,
     ExplicitEntrypointPlugin,
@@ -200,11 +202,11 @@ def test_typer_plugin_subapp_reachable_via_add_typer(build_plugin_graph, reachab
     assert "cli.sub.things" in reached
 
 
-def test_typer_plugin_handles_aliased_class_import(build_plugin_graph, reachable_fqnames):
-    graph = build_plugin_graph(
-        {
-            "cli/__init__.py": "",
-            "cli/main.py": """
+@pytest.mark.parametrize(
+    "src",
+    [
+        pytest.param(
+            """
             from typer import Typer as T
 
             app = T()
@@ -215,17 +217,10 @@ def test_typer_plugin_handles_aliased_class_import(build_plugin_graph, reachable
             if __name__ == "__main__":
                 app()
             """,
-        },
-        [MainBlockPlugin(), typer_plugin()],
-    )
-    assert "cli.main.hello" in reachable_fqnames(graph)
-
-
-def test_typer_plugin_handles_aliased_module_import(build_plugin_graph, reachable_fqnames):
-    graph = build_plugin_graph(
-        {
-            "cli/__init__.py": "",
-            "cli/main.py": """
+            id="aliased-class-import",
+        ),
+        pytest.param(
+            """
             import typer as ty
 
             app = ty.Typer()
@@ -236,17 +231,10 @@ def test_typer_plugin_handles_aliased_module_import(build_plugin_graph, reachabl
             if __name__ == "__main__":
                 app()
             """,
-        },
-        [MainBlockPlugin(), typer_plugin()],
-    )
-    assert "cli.main.hello" in reachable_fqnames(graph)
-
-
-def test_typer_plugin_handles_annotated_assignment(build_plugin_graph, reachable_fqnames):
-    graph = build_plugin_graph(
-        {
-            "cli/__init__.py": "",
-            "cli/main.py": """
+            id="aliased-module-import",
+        ),
+        pytest.param(
+            """
             import typer
 
             app: typer.Typer = typer.Typer()
@@ -257,7 +245,13 @@ def test_typer_plugin_handles_annotated_assignment(build_plugin_graph, reachable
             if __name__ == "__main__":
                 app()
             """,
-        },
+            id="annotated-assignment",
+        ),
+    ],
+)
+def test_typer_plugin_handles_import_variants(build_plugin_graph, reachable_fqnames, src):
+    graph = build_plugin_graph(
+        {"cli/__init__.py": "", "cli/main.py": src},
         [MainBlockPlugin(), typer_plugin()],
     )
     assert "cli.main.hello" in reachable_fqnames(graph)

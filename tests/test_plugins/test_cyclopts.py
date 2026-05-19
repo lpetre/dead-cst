@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from dead_cst.plugins import (
     DispatchAppPlugin,
     ExplicitEntrypointPlugin,
@@ -202,11 +204,11 @@ def test_cyclopts_plugin_subapp_reachable_via_command_attach(build_plugin_graph,
     assert "cli.sub.things" in reached
 
 
-def test_cyclopts_plugin_handles_aliased_class_import(build_plugin_graph, reachable_fqnames):
-    graph = build_plugin_graph(
-        {
-            "cli/__init__.py": "",
-            "cli/main.py": """
+@pytest.mark.parametrize(
+    "src",
+    [
+        pytest.param(
+            """
             from cyclopts import App as A
 
             app = A()
@@ -217,17 +219,10 @@ def test_cyclopts_plugin_handles_aliased_class_import(build_plugin_graph, reacha
             if __name__ == "__main__":
                 app()
             """,
-        },
-        [MainBlockPlugin(), cyclopts_plugin()],
-    )
-    assert "cli.main.hello" in reachable_fqnames(graph)
-
-
-def test_cyclopts_plugin_handles_aliased_module_import(build_plugin_graph, reachable_fqnames):
-    graph = build_plugin_graph(
-        {
-            "cli/__init__.py": "",
-            "cli/main.py": """
+            id="aliased-class-import",
+        ),
+        pytest.param(
+            """
             import cyclopts as cy
 
             app = cy.App()
@@ -238,17 +233,10 @@ def test_cyclopts_plugin_handles_aliased_module_import(build_plugin_graph, reach
             if __name__ == "__main__":
                 app()
             """,
-        },
-        [MainBlockPlugin(), cyclopts_plugin()],
-    )
-    assert "cli.main.hello" in reachable_fqnames(graph)
-
-
-def test_cyclopts_plugin_handles_annotated_assignment(build_plugin_graph, reachable_fqnames):
-    graph = build_plugin_graph(
-        {
-            "cli/__init__.py": "",
-            "cli/main.py": """
+            id="aliased-module-import",
+        ),
+        pytest.param(
+            """
             import cyclopts
 
             app: cyclopts.App = cyclopts.App()
@@ -259,7 +247,13 @@ def test_cyclopts_plugin_handles_annotated_assignment(build_plugin_graph, reacha
             if __name__ == "__main__":
                 app()
             """,
-        },
+            id="annotated-assignment",
+        ),
+    ],
+)
+def test_cyclopts_plugin_handles_import_variants(build_plugin_graph, reachable_fqnames, src):
+    graph = build_plugin_graph(
+        {"cli/__init__.py": "", "cli/main.py": src},
         [MainBlockPlugin(), cyclopts_plugin()],
     )
     assert "cli.main.hello" in reachable_fqnames(graph)
