@@ -4,6 +4,7 @@
 //! generic BFS walker, and the `apply_graph_op` apply pass.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -115,6 +116,7 @@ impl GraphBuilder {
                 end_column: 0,
                 flags: 0,
                 imports: None,
+                cached_hash: OnceLock::new(),
             },
         )?;
         self.synthetic_nodes.insert(fqname, idx);
@@ -318,6 +320,7 @@ pub(crate) fn apply_graph_op(
                 end_column: 0,
                 flags: NODE_FLAG_ENTRYPOINT,
                 imports: None,
+                cached_hash: OnceLock::new(),
             },
         )?;
         outputs.builder.add_edge(marker_idx, decl_idx, 0);
@@ -336,6 +339,7 @@ pub(crate) fn apply_graph_op(
                 end_column: 0,
                 flags: add_node.flags,
                 imports: None,
+                cached_hash: OnceLock::new(),
             },
         )?;
         for src in &add_node.edges_from {

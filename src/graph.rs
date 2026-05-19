@@ -7,6 +7,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::sync::OnceLock;
 
 use pyo3::prelude::*;
 use pyo3::types::PyAnyMethods;
@@ -67,17 +68,32 @@ impl Import {
 /// `imports` is populated for `kind="import"` nodes only (one per
 /// alias, plus one per name brought in by `from X import *`). All
 /// other kinds carry `None`.
-#[pyclass(get_all, frozen)]
+///
+/// `cached_hash` memoizes `__hash__` so repeated hashing (graph
+/// builds, set membership, codemod walks) pays the full SipHash cost
+/// once per node instead of on every call. `OnceLock<u64>` is the
+/// minimal `Send + Sync` cell that's compatible with `#[pyclass(frozen)]`.
+#[pyclass(frozen)]
 pub(crate) struct SymbolNode {
+    #[pyo3(get)]
     pub(crate) fqname: String,
+    #[pyo3(get)]
     pub(crate) kind: &'static str,
+    #[pyo3(get)]
     pub(crate) path: String,
+    #[pyo3(get)]
     pub(crate) start_line: usize,
+    #[pyo3(get)]
     pub(crate) start_column: usize,
+    #[pyo3(get)]
     pub(crate) end_line: usize,
+    #[pyo3(get)]
     pub(crate) end_column: usize,
+    #[pyo3(get)]
     pub(crate) flags: u32,
+    #[pyo3(get)]
     pub(crate) imports: Option<Py<Import>>,
+    pub(crate) cached_hash: OnceLock<u64>,
 }
 
 const VALID_KINDS: &[&str] = &[
@@ -138,6 +154,7 @@ impl SymbolNode {
             end_column,
             flags,
             imports,
+            cached_hash: OnceLock::new(),
         })
     }
 
@@ -156,25 +173,27 @@ impl SymbolNode {
     }
 
     fn __hash__(&self, py: Python<'_>) -> u64 {
-        let mut hasher = DefaultHasher::new();
-        self.fqname.hash(&mut hasher);
-        self.kind.hash(&mut hasher);
-        self.path.hash(&mut hasher);
-        self.start_line.hash(&mut hasher);
-        self.start_column.hash(&mut hasher);
-        self.end_line.hash(&mut hasher);
-        self.end_column.hash(&mut hasher);
-        self.flags.hash(&mut hasher);
-        if let Some(imp) = &self.imports {
-            let imp_ref = imp.borrow(py);
-            imp_ref.module.hash(&mut hasher);
-            imp_ref.decl.hash(&mut hasher);
-            imp_ref.star.hash(&mut hasher);
-        } else {
-            // Discriminate "no imports" from "imports = ()".
-            0u8.hash(&mut hasher);
-        }
-        hasher.finish()
+        *self.cached_hash.get_or_init(|| {
+            let mut hasher = DefaultHasher::new();
+            self.fqname.hash(&mut hasher);
+            self.kind.hash(&mut hasher);
+            self.path.hash(&mut hasher);
+            self.start_line.hash(&mut hasher);
+            self.start_column.hash(&mut hasher);
+            self.end_line.hash(&mut hasher);
+            self.end_column.hash(&mut hasher);
+            self.flags.hash(&mut hasher);
+            if let Some(imp) = &self.imports {
+                let imp_ref = imp.borrow(py);
+                imp_ref.module.hash(&mut hasher);
+                imp_ref.decl.hash(&mut hasher);
+                imp_ref.star.hash(&mut hasher);
+            } else {
+                // Discriminate "no imports" from "imports = ()".
+                0u8.hash(&mut hasher);
+            }
+            hasher.finish()
+        })
     }
 
     fn __eq__(&self, other: &Bound<'_, PyAny>) -> bool {
