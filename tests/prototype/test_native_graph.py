@@ -1,7 +1,7 @@
 """End-to-end tests for `Project.build()` in the ty-backed native crate.
 
 The crate is governed by the three principles in
-`native/CLAUDE.md`. These tests assert that the
+`src/CLAUDE.md`. These tests assert that the
 project-wide graph respects each one:
 
 * ty drives every piece of semantics (decl enumeration, module

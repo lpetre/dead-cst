@@ -41,7 +41,7 @@ component_management:
     - component_id: cli
       name: cli
       paths:
-        - dead_cst/cli.py
+        - python/dead_cst/cli.py
       statuses:
         - type: project
           target: 80%
