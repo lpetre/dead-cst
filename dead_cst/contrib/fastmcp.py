@@ -93,6 +93,6 @@ class FastMCPPlugin(DispatchAppPlugin):
 
     name: str = "fastmcp"
     version: int = 1778671880
-    app_module: str = "fastmcp"
+    app_modules: tuple[str, ...] = ("fastmcp",)
     registration_decorators: frozenset[str] = _REGISTRATION_DECORATORS
     instance_kinds: Mapping[str, bool] = field(default_factory=lambda: dict(_INSTANCE_KINDS))

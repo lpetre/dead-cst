@@ -35,6 +35,6 @@ class TyperPlugin(DispatchAppPlugin):
 
     name: str = "typer"
     version: int = 1777760307
-    app_module: str = "typer"
+    app_modules: tuple[str, ...] = ("typer",)
     constructor_targets: frozenset[str] = frozenset({"Typer"})
     registration_decorators: frozenset[str] = frozenset({"command", "callback"})

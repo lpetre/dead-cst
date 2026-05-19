@@ -100,6 +100,6 @@ class FastAPIPlugin(DispatchAppPlugin):
 
     name: str = "fastapi"
     version: int = 1778973600
-    app_module: str = "fastapi"
+    app_modules: tuple[str, ...] = ("fastapi",)
     registration_decorators: frozenset[str] = _REGISTRATION_DECORATORS
     instance_kinds: Mapping[str, bool] = field(default_factory=lambda: dict(_INSTANCE_KINDS))

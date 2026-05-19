@@ -30,7 +30,7 @@ class CeleryPlugin(DispatchAppPlugin):
 
     name: str = "celery"
     version: int = 1779000000
-    app_module: str = "celery"
+    app_modules: tuple[str, ...] = ("celery",)
     registration_decorators: frozenset[str] = frozenset({"task"})
     instance_kinds: Mapping[str, bool] = field(default_factory=lambda: dict(_INSTANCE_KINDS))
 

@@ -31,6 +31,6 @@ class CycloptsPlugin(DispatchAppPlugin):
 
     name: str = "cyclopts"
     version: int = 1778020575
-    app_module: str = "cyclopts"
+    app_modules: tuple[str, ...] = ("cyclopts",)
     constructor_targets: frozenset[str] = frozenset({"App"})
     registration_decorators: frozenset[str] = frozenset({"command", "default"})

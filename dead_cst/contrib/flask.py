@@ -95,6 +95,6 @@ class FlaskPlugin(DispatchAppPlugin):
 
     name: str = "flask"
     version: int = 1778973600
-    app_module: str = "flask"
+    app_modules: tuple[str, ...] = ("flask",)
     registration_decorators: frozenset[str] = _REGISTRATION_DECORATORS
     instance_kinds: Mapping[str, bool] = field(default_factory=lambda: dict(_INSTANCE_KINDS))

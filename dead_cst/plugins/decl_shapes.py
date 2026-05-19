@@ -108,7 +108,7 @@ class DispatchAppPlugin:
 
     name: str
     version: int
-    app_module: str = ""
+    app_modules: tuple[str, ...] = ()
     constructor_targets: frozenset[str] = frozenset()
     registration_decorators: frozenset[str] = frozenset()
     instance_kinds: Mapping[str, bool] = field(default_factory=dict)
@@ -127,7 +127,7 @@ class DispatchAppPlugin:
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
         from dead_cst import _native as native
 
-        if not (self.app_module and self.registration_decorators):
+        if not (self.app_modules and self.registration_decorators):
             return
         targets = self._targets
         if not targets:
@@ -135,21 +135,22 @@ class DispatchAppPlugin:
         target_names = list(targets)
         decorator_attrs = list(self.registration_decorators)
 
-        direct = list(
-            native.query(ctx).constructions().where_module(self.app_module).where_name(target_names)
-        )
-        handlers = list(native.query(ctx).decorators().where_owner_attr(decorator_attrs))
-        factory_decls = (
-            list(
-                native.query(ctx)
-                .factories()
-                .of_module(self.app_module)
-                .where_name(target_names)
-                .collect()
+        direct: list = []
+        for module in self.app_modules:
+            direct.extend(
+                native.query(ctx).constructions().where_module(module).where_name(target_names)
             )
-            if self._factory_aware
-            else []
-        )
+        handlers = list(native.query(ctx).decorators().where_owner_attr(decorator_attrs))
+        factory_decls: list = []
+        if self._factory_aware:
+            for module in self.app_modules:
+                factory_decls.extend(
+                    native.query(ctx)
+                    .factories()
+                    .of_module(module)
+                    .where_name(target_names)
+                    .collect()
+                )
 
         direct_by_owner: dict[tuple[str, str], list[tuple["native.NativeNode", str]]] = {}
         for ref in direct:
