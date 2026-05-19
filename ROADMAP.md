@@ -119,18 +119,7 @@ undiscovered. A short Sphinx site with one tutorial each ("write a custom
 that's already built. The docstring pass already in place gives the API
 reference for free.
 
-### 10. `examples/flag_audit/` recipe
-
-A working example, not a CLI command. Ships a `flags.toml` mapping flag-name
-→ fixed truthiness, a `FlagAuditDetector(DefaultUnreachableRegionDetector)`
-whose `resolve()` answers `check_flag("foo")` calls per the toml config, and
-a `main()` that builds the analysis, calls `Analysis.kept_alive_by_dead_branches()`,
-and prints "removing flag X would delete N symbols / M LOC". Item 2 makes
-this much cleaner: a one-line wrapper `def is_new_auth(): return
-check_flag("new-auth")` folds without the detector having to recognize the
-wrapper directly.
-
-### 11. Interactive TUI (`dead-cst review`)
+### 10. Interactive TUI (`dead-cst review`)
 
 Speculative; only promote if `git add -p` over item 7's output proves
 insufficient. Design direction when promoted: walk the cluster condensation
@@ -144,7 +133,7 @@ shape carries over.
 
 ## Tier 4 — Speculative, wait for signal
 
-### 12. Multiple reachability frontiers
+### 11. Multiple reachability frontiers
 
 Splitting "reachable from tests" vs. "reachable from production entrypoints"
 is interesting and would enable rules like "no production code reachable only

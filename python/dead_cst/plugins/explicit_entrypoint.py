@@ -1,5 +1,4 @@
-"""Plugin: mark user-specified symbols (file paths, FQNs, regexes) as
-entrypoints."""
+"""Plugin: mark user-specified symbols (file paths, FQNs, regexes) as entrypoints."""
 
 from __future__ import annotations
 

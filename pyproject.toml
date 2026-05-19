@@ -78,11 +78,6 @@ dev = [
 ]
 
 [tool.pytest.ini_options]
-# Scope collection to the project's own suite. Without this, pytest also
-# walks ``examples/uv-workspace/packages/*/tests/``, where two ``tests/``
-# packages share the same ``tests.conftest`` module name and fail
-# collection with ``ImportPathMismatchError`` (the very layout the
-# uv-workspace example exists to demonstrate).
 testpaths = ["tests"]
 # E2E tests clone real repos from GitHub and are deselected by default
 # so the standard ``uv run pytest`` invocation stays hermetic. Run them
