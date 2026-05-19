@@ -29,7 +29,7 @@ class ClickPlugin(DecoratedDeclPlugin):
 
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
         # Cheap import-presence guard, see ``DecoratedDeclPlugin.run``.
-        if not native.query(ctx).imports().of(self.decorator_module).count():
+        if not native.query(ctx).imports().of(self.decorator_module).exists():
             return
 
         groups_by_owner: dict[tuple[str, str], list[native.SymbolNode]] = {}
