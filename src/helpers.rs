@@ -1046,27 +1046,7 @@ impl<'ast, 'a> Visitor<'ast> for AttrCallFinder<'a> {
             if let Expr::Attribute(attribute) = call.func.as_ref() {
                 if attribute.attr.as_str() == self.attr {
                     if let Some(arg) = call.arguments.args.get(self.arg_index) {
-                        let mut hits: Vec<String> = Vec::new();
-                        match arg {
-                            Expr::StringLiteral(s) => {
-                                hits.push(s.value.to_str().to_string());
-                            }
-                            Expr::List(list) => {
-                                for elt in &list.elts {
-                                    if let Expr::StringLiteral(s) = elt {
-                                        hits.push(s.value.to_str().to_string());
-                                    }
-                                }
-                            }
-                            Expr::Tuple(tup) => {
-                                for elt in &tup.elts {
-                                    if let Expr::StringLiteral(s) = elt {
-                                        hits.push(s.value.to_str().to_string());
-                                    }
-                                }
-                            }
-                            _ => {}
-                        }
+                        let hits = string_or_string_collection(arg);
                         if !hits.is_empty() {
                             let call_args = extract_call_args_kwargs(
                                 call,
@@ -1082,6 +1062,23 @@ impl<'ast, 'a> Visitor<'ast> for AttrCallFinder<'a> {
             }
         }
         walk_expr(self, expr);
+    }
+}
+
+/// Pull string-literal values out of either a single ``"..."`` or a
+/// homogeneous list/tuple of string literals. Non-string elements in a
+/// list/tuple are silently dropped; non-matching expressions yield an
+/// empty vec.
+fn string_or_string_collection(arg: &Expr) -> Vec<String> {
+    let lit = |e: &Expr| match e {
+        Expr::StringLiteral(s) => Some(s.value.to_str().to_string()),
+        _ => None,
+    };
+    match arg {
+        Expr::StringLiteral(s) => vec![s.value.to_str().to_string()],
+        Expr::List(list) => list.elts.iter().filter_map(lit).collect(),
+        Expr::Tuple(tup) => tup.elts.iter().filter_map(lit).collect(),
+        _ => Vec::new(),
     }
 }
 

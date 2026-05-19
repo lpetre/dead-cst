@@ -617,6 +617,23 @@ pub(crate) enum ImportTarget {
     Unresolved(String),
 }
 
+impl ImportTarget {
+    /// Synthetic node fqname for the non-first-party variants, or
+    /// `None` for `Stdlib` / `FirstParty`. Single source of truth for
+    /// the ``[external dist] X`` / ``[external file] X`` /
+    /// ``[unresolved] X`` synthetic prefixes — both mint
+    /// (``target_to_node``) and lookup (``emit_upstream``) go through
+    /// this so the format strings can't drift apart.
+    pub(crate) fn synthetic_fqname(&self) -> Option<String> {
+        match self {
+            ImportTarget::Stdlib | ImportTarget::FirstParty(_) => None,
+            ImportTarget::ExternalDist(name) => Some(format!("[external dist] {name}")),
+            ImportTarget::ExternalFile(name) => Some(format!("[external file] {name}")),
+            ImportTarget::Unresolved(name) => Some(format!("[unresolved] {name}")),
+        }
+    }
+}
+
 /// ``abs_file_path -> PEP 503-canonical dist name``. Populated once
 /// per ``materialize`` call by walking every ``*.dist-info/`` directory
 /// under each ``is_site_packages()`` search path that ty knows about
@@ -811,15 +828,12 @@ pub(crate) fn target_to_node(
         ImportTarget::FirstParty(file) => {
             Ok(Some(mint_module_node(py, db, file, builder, module_nodes)?))
         }
-        ImportTarget::ExternalDist(name) => Ok(Some(
-            builder.intern_synthetic(py, format!("[external dist] {name}"))?,
-        )),
-        ImportTarget::ExternalFile(name) => Ok(Some(
-            builder.intern_synthetic(py, format!("[external file] {name}"))?,
-        )),
-        ImportTarget::Unresolved(top) => Ok(Some(
-            builder.intern_synthetic(py, format!("[unresolved] {top}"))?,
-        )),
+        ref t @ (ImportTarget::ExternalDist(_)
+        | ImportTarget::ExternalFile(_)
+        | ImportTarget::Unresolved(_)) => {
+            let fqname = t.synthetic_fqname().expect("non-stdlib non-first-party");
+            Ok(Some(builder.intern_synthetic(py, fqname)?))
+        }
     }
 }
 
@@ -1829,21 +1843,13 @@ impl<'a, 'db> RefCollector<'a, 'db> {
         let start_file = match target {
             ImportTarget::Stdlib => return,
             ImportTarget::FirstParty(f) => f,
-            ImportTarget::ExternalDist(name) => {
-                if let Some(&idx) = self.synthetic_nodes.get(&format!("[external dist] {name}")) {
-                    self.emit_edge(idx);
-                }
-                return;
-            }
-            ImportTarget::ExternalFile(name) => {
-                if let Some(&idx) = self.synthetic_nodes.get(&format!("[external file] {name}")) {
-                    self.emit_edge(idx);
-                }
-                return;
-            }
-            ImportTarget::Unresolved(top) => {
-                if let Some(&idx) = self.synthetic_nodes.get(&format!("[unresolved] {top}")) {
-                    self.emit_edge(idx);
+            t @ (ImportTarget::ExternalDist(_)
+            | ImportTarget::ExternalFile(_)
+            | ImportTarget::Unresolved(_)) => {
+                if let Some(fqname) = t.synthetic_fqname() {
+                    if let Some(&idx) = self.synthetic_nodes.get(&fqname) {
+                        self.emit_edge(idx);
+                    }
                 }
                 return;
             }
