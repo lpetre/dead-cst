@@ -46,7 +46,5 @@ class ExplicitEntrypointPlugin(Plugin):
                 abs_paths.append(str(spec))
             elif isinstance(spec, str):
                 str_specs.append(spec)
-        for node in native.query(ctx).nodes_matching_specs(
-            ctx.project_root, regexes, str_specs, abs_paths
-        ):
+        for node in ctx.find_nodes_matching_specs(ctx.project_root, regexes, str_specs, abs_paths):
             yield native.AddEntrypoint(node, marker="<entrypoint>")

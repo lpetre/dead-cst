@@ -68,9 +68,9 @@ class DynamicImportFallbackPlugin(Plugin):
             return cached
         exports = None
         if self.respect_dunder_all:
-            exports = native.query(ctx).module_dunder_all_exports(module_fqname)
+            exports = ctx.find_module_dunder_all_exports(module_fqname)
         if exports is None:
-            decls = native.query(ctx).module_top_level_decls(module_fqname)
+            decls = ctx.find_module_top_level_decls(module_fqname)
             if self.include_underscore:
                 exports = decls
             else:

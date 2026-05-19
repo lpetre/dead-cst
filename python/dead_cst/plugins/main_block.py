@@ -22,7 +22,7 @@ class MainBlockPlugin(Plugin):
     """
 
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
-        for module, block_decls in native.query(ctx).main_blocks():
+        for module, block_decls in ctx.find_main_blocks():
             yield native.AddNode(
                 fqname=f"{MAIN_BLOCK_PREFIX}{module.fqname}",
                 path=module.path,

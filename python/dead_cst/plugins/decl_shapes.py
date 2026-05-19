@@ -312,7 +312,7 @@ class LiteralListPlugin(Plugin):
         # The visitor doesn't emit ``var -> referent`` edges for
         # non-``__all__`` string-list assignments, so the plugin can't
         # rely on a descendant walk.
-        entries = native.query(ctx).literal_list_entries(var_fqname)
+        entries = ctx.find_literal_list_entries(var_fqname)
         if not entries:
             return
 
@@ -324,7 +324,7 @@ class LiteralListPlugin(Plugin):
             # (e.g. ``pkg.foo`` where ``foo`` is also a re-exported decl
             # in ``pkg/__init__.py``).
             targets: list[native.SymbolNode] = list(ctx.module_surface(entry))
-            targets.extend(native.query(ctx).declarations(entry))
+            targets.extend(ctx.find_declarations(entry))
             if not targets:
                 continue
             yield native.AddNode(
