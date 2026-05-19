@@ -48,7 +48,11 @@ build-backend = "maturin"
 # both halves.
 module-name = "dead_cst._native"
 python-source = "python"
-features = ["pyo3/extension-module"]
+# Enables the ``extension-module`` feature defined in ``Cargo.toml``,
+# which forwards to ``pyo3/extension-module`` (skip libpython linkage --
+# Python loads the cdylib at runtime). Tests turn this off via
+# ``cargo test --no-default-features``.
+features = ["extension-module"]
 # Type stub + ``py.typed`` marker that ship alongside the compiled extension.
 # Other ``.py`` sources under ``python/dead_cst/`` are picked up automatically.
 include = ["python/dead_cst/_native.pyi", "python/dead_cst/py.typed"]

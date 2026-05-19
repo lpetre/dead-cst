@@ -46,10 +46,11 @@ jobs:
           RUFF_OUTPUT_FORMAT: github
           CONFTEST_OUTPUT: github
 
-  # Single rust compile per CI run. Runs cargo fmt/clippy/test on the
-  # same target dir maturin uses, then builds the wheel and uploads it
-  # for the ``test`` matrix to consume. The wheel is abi3-py311, so one
-  # build covers every Python in the matrix.
+  # Single wheel build per CI run. Also runs cargo fmt/clippy on the
+  # same target dir so we get rust lint signal for free. The wheel is
+  # abi3-py311 -- one build covers every Python in the test matrix.
+  # ``rust-test`` runs as a peer (no shared target dir; different
+  # feature flags) and ``test`` / ``e2e`` consume the uploaded wheel.
   build:
     runs-on: ubuntu-latest
     steps:
@@ -70,17 +71,30 @@ jobs:
           shared-key: ci-build
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
-      # ``cargo test`` is deferred until ``extension-module`` is moved
-      # behind a Cargo feature -- today the test binary fails to link
-      # because ``pyo3/extension-module`` suppresses ``libpython``
-      # linkage (cdylib expects Python to provide the symbols at load
-      # time). Run via ``cargo test --no-default-features`` after that
-      # restructure lands.
       - run: uv build --wheel --out-dir dist
       - uses: actions/upload-artifact@v4
         with:
           name: dead-cst-wheel
           path: dist/*.whl
+
+  # Rust unit tests. Runs in parallel with ``build`` -- they don't share
+  # a target dir because clippy uses default features (extension-module
+  # on; cdylib expects Python to supply symbols at runtime) while
+  # ``cargo test`` needs ``--no-default-features`` so the test binary
+  # can link libpython itself.
+  rust-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-rust-test
+      - run: cargo test --no-default-features --locked
 
   # Install the prebuilt wheel into each Python version's venv and run
   # pytest. No maturin invocation in this job -- the wheel slots in via
@@ -115,3 +129,26 @@ jobs:
           files: ./coverage.xml
           fail_ci_if_error: false
           token: ${{ secrets.CODECOV_TOKEN }}
+
+  # End-to-end tests against pinned third-party repos. Same wheel-install
+  # pattern as the ``test`` job, but runs ``pytest -m e2e`` instead. The
+  # suite skips (rather than fails) on missing ``git`` or network errors,
+  # so transient flakes don't block PRs.
+  e2e:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: 3.12
+          activate-environment: true
+          enable-cache: true
+          cache-dependency-glob: "**/uv.lock"
+      - uses: actions/download-artifact@v4
+        with:
+          name: dead-cst-wheel
+          path: dist/
+      - run: uv sync --no-install-project --frozen
+      - run: uv pip install --no-deps --force-reinstall dist/*.whl
+      - run: uv run --no-sync pytest -m e2e
