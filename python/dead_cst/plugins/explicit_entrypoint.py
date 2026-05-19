@@ -6,16 +6,15 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterable
+from typing import Iterable
 
-if TYPE_CHECKING:
-    from dead_cst import _native as native
+from ._base import Plugin, native
 
 EXPLICIT_PREFIX = "<entrypoint>:"
 
 
 @dataclass
-class ExplicitEntrypointPlugin:
+class ExplicitEntrypointPlugin(Plugin):
     """Mark user-specified symbols as entrypoints.
 
     ``specs`` accepts:
@@ -28,12 +27,8 @@ class ExplicitEntrypointPlugin:
     """
 
     specs: list[str | Path | re.Pattern[str]] = field(default_factory=list)
-    name: str = "explicit"
-    version: int = 1777760307
 
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
-        from dead_cst import _native as native
-
         if not self.specs:
             return
         # Push the per-node match loop into rust: bucket specs by type

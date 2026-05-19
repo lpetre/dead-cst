@@ -5,12 +5,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterable
+from typing import Iterable
 
 from ..graph import NodeFlags
-
-if TYPE_CHECKING:
-    from dead_cst import _native as native
+from ..plugins._base import Plugin, native
 
 PYTEST_CONFTEST_PREFIX = "<pytest:conftest>:"
 PYTEST_TESTS_PREFIX = "<pytest:tests>:"
@@ -18,7 +16,7 @@ PYTEST_FIXTURES_PREFIX = "<pytest:fixtures>:"
 
 
 @dataclass
-class PytestPlugin:
+class PytestPlugin(Plugin):
     """Mark pytest-discovered symbols as entrypoints.
 
     * ``conftest.py``: every top-level function / class / variable.
@@ -27,12 +25,7 @@ class PytestPlugin:
     * Top-level functions decorated with ``@pytest.fixture``.
     """
 
-    name: str = "pytest"
-    version: int = 1778228682
-
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
-        from dead_cst import _native as native
-
         nodes = list(ctx.nodes())
         decls_by_path: dict[str, list[native.NativeNode]] = {}
         for n in nodes:
@@ -67,8 +60,6 @@ def _mark_seed(
     path: str,
     targets: list[native.NativeNode],
 ) -> Iterable[native.GraphOp]:
-    from dead_cst import _native as native
-
     if not targets:
         return
     yield native.AddNode(

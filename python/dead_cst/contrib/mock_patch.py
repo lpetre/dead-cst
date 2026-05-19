@@ -9,10 +9,9 @@ strings to their target decls and emits keep-alive edges.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Iterable
+from typing import Iterable
 
-if TYPE_CHECKING:
-    from dead_cst import _native as native
+from ..plugins._base import Plugin, native
 
 PATCH_TARGET_PREFIX = "<patch-target>:"
 
@@ -30,15 +29,10 @@ _MONKEYPATCH_FQNAME_METHODS: dict[str, int] = {
 
 
 @dataclass
-class MockPatchPlugin:
+class MockPatchPlugin(Plugin):
     """Resolve string-fqname ``patch(...)`` calls to their target decl."""
 
-    name: str = "mock_patch"
-    version: int = 1778025601
-
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
-        from dead_cst import _native as native
-
         refs: list[native.CallRef] = []
         for module in _MOCK_MODULES:
             refs.extend(

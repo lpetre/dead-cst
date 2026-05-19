@@ -4,12 +4,15 @@ import logging
 from collections import deque
 from functools import cached_property
 from pathlib import Path
-from typing import Iterable, Iterator, Mapping, Sequence
+from typing import TYPE_CHECKING, Iterable, Iterator, Mapping, Sequence
 
 from ._graphstore import SymbolGraph
 from .graph import KEEPALIVE_DEFAULT, EdgeFlags, NodeFlags, SymbolNode
 from .resolvers import Package, PathResolver
 from .resolvers._core import _validate_packages
+
+if TYPE_CHECKING:
+    from .plugins import Plugin
 
 logger = logging.getLogger(__name__)
 
@@ -162,7 +165,7 @@ class Analysis:
         project_root: Path,
         *,
         resolver: PathResolver,
-        plugins: Sequence[object] = (),
+        plugins: Sequence[Plugin] = (),
         show_progress: bool = False,
     ) -> None:
         self._project_root: Path = project_root
@@ -179,7 +182,7 @@ class Analysis:
         self._consumers_by_package: dict[Path, tuple[Path, ...]] = {
             path: tuple(sorted(cs)) for path, cs in consumers.items()
         }
-        self._plugins: tuple[object, ...] = tuple(plugins)
+        self._plugins: tuple[Plugin, ...] = tuple(plugins)
         self._show_progress: bool = show_progress
         self._full_graph: SymbolGraph | None = None
         self._reverse_closures: dict[Path, frozenset[Path]] = {}

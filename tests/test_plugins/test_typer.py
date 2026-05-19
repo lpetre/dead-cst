@@ -1,11 +1,12 @@
-"""Tests for :class:`TyperPlugin`."""
+"""Tests for :func:`typer_plugin`."""
 
 from __future__ import annotations
 
 from dead_cst.plugins import (
+    DispatchAppPlugin,
     ExplicitEntrypointPlugin,
     MainBlockPlugin,
-    TyperPlugin,
+    typer_plugin,
 )
 
 
@@ -33,7 +34,7 @@ def test_typer_plugin_marks_command_handlers(build_plugin_graph, reachable_fqnam
                 app()
             """,
         },
-        [MainBlockPlugin(), TyperPlugin()],
+        [MainBlockPlugin(), typer_plugin()],
     )
     reached = reachable_fqnames(graph)
     assert "cli.main.app" in reached
@@ -72,7 +73,7 @@ def test_typer_plugin_keeps_handler_dependencies_alive(build_plugin_graph, reach
                 app()
             """,
         },
-        [MainBlockPlugin(), TyperPlugin()],
+        [MainBlockPlugin(), typer_plugin()],
     )
     reached = reachable_fqnames(graph)
     assert "cli.main.show" in reached
@@ -100,7 +101,7 @@ def test_typer_plugin_reachable_via_explicit_entrypoint(
         }
     )
     graph = make_analysis(
-        plugins=[ExplicitEntrypointPlugin(specs=["cli.main.app"]), TyperPlugin()]
+        plugins=[ExplicitEntrypointPlugin(specs=["cli.main.app"]), typer_plugin()]
     ).materialize_all()
     reached = reachable_fqnames(graph)
     assert "cli.main.app" in reached
@@ -123,7 +124,7 @@ def test_typer_plugin_does_not_seed_entrypoint(build_plugin_graph, reachable_fqn
             def orphan(): pass
             """,
         },
-        [TyperPlugin()],
+        [typer_plugin()],
     )
     reached = reachable_fqnames(graph)
     assert "cli.main.app" not in reached
@@ -156,7 +157,7 @@ def test_typer_plugin_unused_subapp_stays_dead(build_plugin_graph, reachable_fqn
                 app()
             """,
         },
-        [MainBlockPlugin(), TyperPlugin()],
+        [MainBlockPlugin(), typer_plugin()],
     )
     reached = reachable_fqnames(graph)
     assert "cli.main.hello" in reached
@@ -190,7 +191,7 @@ def test_typer_plugin_subapp_reachable_via_add_typer(build_plugin_graph, reachab
                 app()
             """,
         },
-        [MainBlockPlugin(), TyperPlugin()],
+        [MainBlockPlugin(), typer_plugin()],
     )
     reached = reachable_fqnames(graph)
     assert "cli.main.app" in reached
@@ -215,7 +216,7 @@ def test_typer_plugin_handles_aliased_class_import(build_plugin_graph, reachable
                 app()
             """,
         },
-        [MainBlockPlugin(), TyperPlugin()],
+        [MainBlockPlugin(), typer_plugin()],
     )
     assert "cli.main.hello" in reachable_fqnames(graph)
 
@@ -236,7 +237,7 @@ def test_typer_plugin_handles_aliased_module_import(build_plugin_graph, reachabl
                 app()
             """,
         },
-        [MainBlockPlugin(), TyperPlugin()],
+        [MainBlockPlugin(), typer_plugin()],
     )
     assert "cli.main.hello" in reachable_fqnames(graph)
 
@@ -257,7 +258,7 @@ def test_typer_plugin_handles_annotated_assignment(build_plugin_graph, reachable
                 app()
             """,
         },
-        [MainBlockPlugin(), TyperPlugin()],
+        [MainBlockPlugin(), typer_plugin()],
     )
     assert "cli.main.hello" in reachable_fqnames(graph)
 
@@ -281,7 +282,7 @@ def test_typer_plugin_ignores_bare_decorators(build_plugin_graph, reachable_fqna
                 app()
             """,
         },
-        [MainBlockPlugin(), TyperPlugin()],
+        [MainBlockPlugin(), typer_plugin()],
     )
     # Bare ``@command`` (no attribute access) is not a Typer registration --
     # matching it would clobber unrelated decorators with the same name.
@@ -303,7 +304,7 @@ def test_typer_plugin_ignores_unrelated_decorators(build_plugin_graph, reachable
             def not_a_command(): pass
             """,
         },
-        [TyperPlugin()],
+        [typer_plugin()],
     )
     # ``t`` isn't a ``Typer`` instance, so its ``.command`` decorator is ignored.
     assert "pkg.mod.not_a_command" not in reachable_fqnames(graph)
@@ -325,7 +326,7 @@ def test_typer_plugin_does_nothing_without_typer_imports(build_plugin_graph, rea
             def looks_like_command(): pass
             """,
         },
-        [TyperPlugin()],
+        [typer_plugin()],
     )
     # ``app`` here is not a Typer instance -- no ``typer`` import in scope.
     assert "pkg.mod.looks_like_command" not in reachable_fqnames(graph)
@@ -351,7 +352,7 @@ def test_typer_plugin_multiple_instances_in_one_module(build_plugin_graph, reach
                 app()
             """,
         },
-        [MainBlockPlugin(), TyperPlugin()],
+        [MainBlockPlugin(), typer_plugin()],
     )
     reached = reachable_fqnames(graph)
     # ``app`` is reached via the main block; its command is alive.
@@ -381,16 +382,16 @@ def test_typer_plugin_ignores_import_star(build_plugin_graph, reachable_fqnames)
                 app()
             """,
         },
-        [MainBlockPlugin(), TyperPlugin()],
+        [MainBlockPlugin(), typer_plugin()],
     )
     # No instance edge from ``app`` to ``hello`` because the plugin ignores
     # star imports. ``hello`` is not referenced by anything reachable.
     assert "cli.main.hello" not in reachable_fqnames(graph)
 
 
-def test_typer_plugin_loads_via_load_plugin():
-    from dead_cst.plugins import load_plugin
-
-    plugin = load_plugin("typer")
-    assert isinstance(plugin, TyperPlugin)
-    assert plugin.name == "typer"
+def test_typer_plugin_factory_returns_configured_dispatch_app():
+    plugin = typer_plugin()
+    assert isinstance(plugin, DispatchAppPlugin)
+    assert plugin.marker_prefix == "typer"
+    assert plugin.app_classes == ("typer.Typer",)
+    assert plugin.seed_as_entrypoint is False
