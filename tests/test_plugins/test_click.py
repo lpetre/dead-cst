@@ -582,4 +582,3 @@ def test_click_plugin_loads_via_load_plugin():
 
     plugin = load_plugin("click")
     assert isinstance(plugin, ClickPlugin)
-    assert plugin.name == "click"

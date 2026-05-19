@@ -694,10 +694,18 @@ class ConstructionRef:
 
     ``class_name`` is the upstream constructor's bare name
     (``"Flask"`` even when imported as ``F``).
+
+    ``args`` and ``kwargs`` carry the construction's full positional /
+    keyword argument shape. Each value is a Python literal (str / int
+    / float / bool / None / list / tuple), a :class:`SymbolNode` when
+    the expression statically resolves to a project decl, or ``None``
+    for any other non-literal expression.
     """
 
     var: SymbolNode
     class_name: str
+    args: list[Any]
+    kwargs: dict[str, Any]
 
     @property
     def path(self) -> str: ...

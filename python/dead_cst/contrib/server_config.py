@@ -4,12 +4,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterable
+from typing import Iterable
 
 from ..graph import NodeFlags
-
-if TYPE_CHECKING:
-    from dead_cst import _native as native
+from ..plugins._base import Plugin, native
 
 SERVER_CONFIG_PREFIX = "<server-config>:"
 
@@ -23,7 +21,7 @@ _DEFAULT_FILENAMES: tuple[str, ...] = (
 
 
 @dataclass
-class ServerConfigPlugin:
+class ServerConfigPlugin(Plugin):
     """Treat WSGI/ASGI server config modules as entrypoints.
 
     Files like ``gunicorn.conf.py`` and ``hypercorn.conf.py`` are loaded
@@ -34,12 +32,8 @@ class ServerConfigPlugin:
     """
 
     filenames: tuple[str, ...] = _DEFAULT_FILENAMES
-    name: str = "server_config"
-    version: int = 1778573528
 
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
-        from dead_cst import _native as native
-
         targets_by_path: dict[str, list[native.SymbolNode]] = {}
         for n in ctx.nodes():
             if Path(n.path).name not in self.filenames:

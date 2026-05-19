@@ -57,10 +57,21 @@ impl DecoratorRef {
 ///
 /// ``class_name`` is the upstream constructor's bare name
 /// (``"Flask"`` even when imported as ``F``).
+///
+/// ``args`` and ``kwargs`` carry the construction's full positional /
+/// keyword argument shape (same Python-side value shape as
+/// :class:`CallRef`).
 #[pyclass(frozen, get_all)]
 pub(crate) struct ConstructionRef {
     pub(crate) var: Py<SymbolNode>,
     pub(crate) class_name: String,
+    /// Positional arguments of the constructor call. Each entry is a
+    /// Python literal, a :class:`SymbolNode` (when the expression
+    /// resolves to a project decl), or ``None``.
+    pub(crate) args: Vec<Py<PyAny>>,
+    /// Keyword arguments of the constructor call. Same value shape as
+    /// ``args``.
+    pub(crate) kwargs: HashMap<String, Py<PyAny>>,
 }
 
 #[pymethods]
@@ -631,26 +642,39 @@ impl ConstructionQuery {
         let ctx = self.ctx.borrow(py);
         let path_regex = self.path_regex.as_deref();
         let mut refs: Vec<Py<ConstructionRef>> = Vec::new();
+        let outputs_borrow = ctx.outputs.borrow();
+        let outputs = outputs_borrow
+            .as_ref()
+            .ok_or_else(|| not_materialized("ConstructionQuery.collect"))?;
+        let nodes: &[Py<SymbolNode>] = &outputs.builder.nodes;
         if let Some(fqn) = &self.class_fqn {
-            let decls = ctx.find_constructions(py, fqn, self.include_subclasses, path_regex)?;
+            let pairs = ctx.find_constructions(py, fqn, self.include_subclasses, path_regex)?;
             let cls_name = fqn.rsplit('.').next().unwrap_or("").to_string();
-            for d in decls {
+            for (d, call_args) in pairs {
+                let args = args_to_py_vec(py, &call_args.args, nodes);
+                let kwargs = kwargs_to_py_map(py, &call_args.kwargs, nodes);
                 refs.push(Py::new(
                     py,
                     ConstructionRef {
                         var: d,
                         class_name: cls_name.clone(),
+                        args,
+                        kwargs,
                     },
                 )?);
             }
         } else if let (Some(module), Some(names)) = (&self.module, &self.names) {
-            let pairs = ctx.find_instance_constructions(py, module, names.clone(), path_regex)?;
-            for (var, name) in pairs {
+            let triples = ctx.find_instance_constructions(py, module, names.clone(), path_regex)?;
+            for (var, name, call_args) in triples {
+                let args = args_to_py_vec(py, &call_args.args, nodes);
+                let kwargs = kwargs_to_py_map(py, &call_args.kwargs, nodes);
                 refs.push(Py::new(
                     py,
                     ConstructionRef {
                         var,
                         class_name: name,
+                        args,
+                        kwargs,
                     },
                 )?);
             }

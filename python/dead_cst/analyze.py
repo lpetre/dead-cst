@@ -14,6 +14,8 @@ from .resolvers._core import _validate_packages
 if TYPE_CHECKING:
     from dead_cst import _native as native
 
+    from .plugins import Plugin
+
 
 def _path_under(node_path: str, prefix: Path) -> bool:
     """Return True if ``node_path`` (the rust-side string) lives under ``prefix``."""
@@ -175,7 +177,7 @@ class Analysis:
         project_root: Path,
         *,
         resolver: PathResolver,
-        plugins: Sequence[object] = (),
+        plugins: Sequence[Plugin] = (),
         show_progress: bool = False,
     ) -> None:
         self._project_root: Path = project_root
@@ -192,7 +194,7 @@ class Analysis:
         self._consumers_by_package: dict[Path, tuple[Path, ...]] = {
             path: tuple(sorted(cs)) for path, cs in consumers.items()
         }
-        self._plugins: tuple[object, ...] = tuple(plugins)
+        self._plugins: tuple[Plugin, ...] = tuple(plugins)
         self._show_progress: bool = show_progress
         self._full_graph: SymbolGraph | None = None
         # Held past ``materialize_all`` so the rust BFS queries

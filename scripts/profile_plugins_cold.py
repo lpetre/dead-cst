@@ -144,27 +144,34 @@ def _file_count(target_root: Path) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _rust_capable_plugins(filter_names: set[str] | None) -> list[tuple[str, type]]:
-    """Return ``[(name, cls)]`` for every builtin plugin with a
-    ``run(ctx)`` method. Optionally filtered by name."""
-    out: list[tuple[str, type]] = []
-    for name, cls in BUILTIN_PLUGINS.items():
-        if filter_names is not None and name not in filter_names:
+def _plugin_label(plugin: object) -> str:
+    """Human-readable label for one builtin plugin instance."""
+    return type(plugin).__qualname__
+
+
+def _rust_capable_plugins(filter_names: set[str] | None) -> list[tuple[str, object]]:
+    """Return ``[(label, plugin_instance)]`` for every builtin plugin
+    with a ``run(ctx)`` method. Optionally filtered by class qualname."""
+    out: list[tuple[str, object]] = []
+    for plugin in BUILTIN_PLUGINS:
+        label = _plugin_label(plugin)
+        if filter_names is not None and label not in filter_names:
             continue
-        if not hasattr(cls, "run"):
+        if not hasattr(plugin, "run"):
             continue
-        out.append((name, cls))
+        out.append((label, plugin))
     return out
 
 
 def _skipped_plugins(filter_names: set[str] | None) -> list[str]:
     """Builtin plugins explicitly missing rust support."""
     out: list[str] = []
-    for name, cls in BUILTIN_PLUGINS.items():
-        if filter_names is not None and name not in filter_names:
+    for plugin in BUILTIN_PLUGINS:
+        label = _plugin_label(plugin)
+        if filter_names is not None and label not in filter_names:
             continue
-        if not hasattr(cls, "run"):
-            out.append(name)
+        if not hasattr(plugin, "run"):
+            out.append(label)
     return out
 
 
@@ -173,31 +180,31 @@ def _skipped_plugins(filter_names: set[str] | None) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def _materialize_once(target: TargetConfig, plugin_cls: type | None) -> float:
+def _materialize_once(target: TargetConfig, plugin: object | None) -> float:
     """One cold iteration: fresh ProjectContext, optionally one plugin,
     materialize(), return wall-clock seconds.
 
-    Constructs the plugin with no args. Every rust-capable builtin has
-    either a no-arg constructor or all-defaults
+    Reuses the configured ``BUILTIN_PLUGINS`` instance — each rust-capable
+    builtin is already a ready-to-use, default-configured plugin
     (``ExplicitEntrypointPlugin`` has ``specs=[]``, which makes it a
     no-op but still pays the ``run()`` dispatch cost — that's what we
     want to measure)."""
     ctx = native.ProjectContext(str(target.root), **target.project_kwargs)
-    if plugin_cls is not None:
-        ctx.add_plugin(plugin_cls())
+    if plugin is not None:
+        ctx.add_plugin(plugin)
     t0 = time.perf_counter()
     ctx.materialize()
     return time.perf_counter() - t0
 
 
 def _bench_configuration(
-    target: TargetConfig, plugin_cls: type | None, repeats: int
+    target: TargetConfig, plugin: object | None, repeats: int
 ) -> tuple[float, list[float]]:
     """Run ``repeats + 1`` cold iterations. Returns ``(warmup_iter1,
     steady_iters)``. The first iter is segregated because it includes
     process-global typeshed loading."""
-    iter1 = _materialize_once(target, plugin_cls)
-    steady = [_materialize_once(target, plugin_cls) for _ in range(repeats)]
+    iter1 = _materialize_once(target, plugin)
+    steady = [_materialize_once(target, plugin) for _ in range(repeats)]
     return iter1, steady
 
 
@@ -216,7 +223,7 @@ def _fmt_delta(seconds: float) -> str:
     return f"{sign}{ms:5.1f}"
 
 
-def _run_target(target: TargetConfig, plugins: list[tuple[str, type]], repeats: int) -> None:
+def _run_target(target: TargetConfig, plugins: list[tuple[str, object]], repeats: int) -> None:
     files = _file_count(target.root)
     print(f"\n=== {target.name} === ({files} files)")
     print(f"  path: {target.root}")
@@ -228,9 +235,9 @@ def _run_target(target: TargetConfig, plugins: list[tuple[str, type]], repeats: 
     base_mean = statistics.fmean(base_steady)
 
     rows: list[tuple[str, float, float, float]] = []
-    for name, cls in plugins:
+    for name, plugin in plugins:
         print(f"  measuring {name}…", flush=True)
-        _, steady = _bench_configuration(target, cls, repeats)
+        _, steady = _bench_configuration(target, plugin, repeats)
         best = min(steady)
         mean = statistics.fmean(steady)
         rows.append((name, best, mean, best - base_best))

@@ -352,4 +352,3 @@ def test_init_subclass_loads_via_load_plugin():
 
     plugin = load_plugin("init_subclass")
     assert isinstance(plugin, InitSubclassPlugin)
-    assert plugin.name == "init_subclass"

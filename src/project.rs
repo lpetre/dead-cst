@@ -545,9 +545,13 @@ impl ProjectContext {
             // returning control to the generator. ``None`` (a regular
             // function that ran to completion without yielding) is
             // allowed for plugins with nothing to do.
+            // Progress-bar label: use the plugin's class qualname.
+            // Falls back to ``<unnamed>`` if anything goes wrong (e.g.
+            // a plain function passed in by mistake).
             let plugin_name: String = plugin
                 .bind(py)
-                .getattr("name")
+                .get_type()
+                .getattr("__qualname__")
                 .ok()
                 .and_then(|n| n.extract().ok())
                 .unwrap_or_else(|| "<unnamed>".to_string());
@@ -1277,13 +1281,14 @@ impl ProjectContext {
     /// upstream constructor's bare name (``"Flask"`` even when imported
     /// as ``F``).
     #[allow(clippy::type_complexity)]
+    #[allow(clippy::type_complexity)]
     pub(crate) fn find_instance_constructions(
         &self,
         py: Python<'_>,
         module: &str,
         ctor_names: Vec<String>,
         path_regex: Option<&str>,
-    ) -> PyResult<Vec<(Py<SymbolNode>, String)>> {
+    ) -> PyResult<Vec<(Py<SymbolNode>, String, CallArgs)>> {
         let outputs = self.outputs.borrow();
         let outputs = outputs
             .as_ref()
@@ -1292,12 +1297,13 @@ impl ProjectContext {
         let allowed: HashSet<&str> = ctor_names.iter().map(String::as_str).collect();
         let needle_strs: Vec<&str> = ctor_names.iter().map(String::as_str).collect();
         let decl_by_name_range = &outputs.decl_by_name_range;
+        let decl_by_fqname = &outputs.decl_by_fqname;
         let project_files: &[File] = &outputs.project_files;
         let db_handle: Box<dyn ProjectDb> = ProjectDb::dyn_clone(&self.db);
         let path_re_ref = &path_re;
         let allowed_ref = &allowed;
         let needles_ref: &[&str] = &needle_strs;
-        let pairs: Vec<(usize, String)> = py.allow_threads(move || {
+        let pairs: Vec<(usize, String, CallArgs)> = py.allow_threads(move || {
             par_scan_files(db_handle, project_files, path_re_ref, |db, file| {
                 let source = source_text(db, file);
                 if !_contains_any_identifier(&source, needles_ref) {
@@ -1308,7 +1314,8 @@ impl ProjectContext {
                 if imports.is_empty() {
                     return Vec::new();
                 }
-                let mut local: Vec<(usize, String)> = Vec::new();
+                let file_imports = collect_all_imports_local(&parsed);
+                let mut local: Vec<(usize, String, CallArgs)> = Vec::new();
                 for stmt in &parsed.syntax().body {
                     let (target_range, value) = match top_level_assign_to_name(stmt) {
                         Some(pair) => pair,
@@ -1319,16 +1326,20 @@ impl ProjectContext {
                     {
                         let key = (file, range_key(target_range));
                         if let Some(&idx) = decl_by_name_range.get(&key) {
-                            local.push((idx, matched));
+                            let call_args =
+                                extract_call_args_kwargs(call, &file_imports, decl_by_fqname);
+                            local.push((idx, matched, call_args));
                         }
                     }
                 }
                 local
             })
         });
-        let out: Vec<(Py<SymbolNode>, String)> = pairs
+        let out: Vec<(Py<SymbolNode>, String, CallArgs)> = pairs
             .into_iter()
-            .map(|(idx, name)| (outputs.builder.nodes[idx].clone_ref(py), name))
+            .map(|(idx, name, call_args)| {
+                (outputs.builder.nodes[idx].clone_ref(py), name, call_args)
+            })
             .collect();
         Ok(out)
     }
@@ -1902,13 +1913,14 @@ impl ProjectContext {
         self.find_decorated_decls(py, module, vec![name.to_string()], path_regex)
     }
 
+    #[allow(clippy::type_complexity)]
     pub(crate) fn find_constructions(
         &self,
         py: Python<'_>,
         class_fqn: &str,
         include_subclasses: bool,
         path_regex: Option<&str>,
-    ) -> PyResult<Vec<Py<SymbolNode>>> {
+    ) -> PyResult<Vec<(Py<SymbolNode>, CallArgs)>> {
         let Some((module, name)) = class_fqn.rsplit_once('.') else {
             return Err(PyValueError::new_err(format!(
                 "expected a dotted class fqn, got {class_fqn:?}"
@@ -1929,8 +1941,11 @@ impl ProjectContext {
                 }
             }
         }
-        let pairs = self.find_instance_constructions(py, module, ctors, path_regex)?;
-        Ok(pairs.into_iter().map(|(node, _)| node).collect())
+        let triples = self.find_instance_constructions(py, module, ctors, path_regex)?;
+        Ok(triples
+            .into_iter()
+            .map(|(node, _name, call_args)| (node, call_args))
+            .collect())
     }
 
     #[allow(clippy::type_complexity)]

@@ -9,25 +9,19 @@ plugin makes every transitive subclass alive whenever its parent is.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Iterable
+from typing import Iterable
 
-if TYPE_CHECKING:
-    from dead_cst import _native as native
+from ._base import Plugin, native
 
 _INIT_SUBCLASS = "__init_subclass__"
 INIT_SUBCLASS_PREFIX = "<__init_subclass__>:"
 
 
 @dataclass
-class InitSubclassPlugin:
+class InitSubclassPlugin(Plugin):
     """Wire subclasses of ``__init_subclass__``-defining classes through a marker."""
 
-    name: str = "init_subclass"
-    version: int = 1777760307
-
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
-        from dead_cst import _native as native
-
         for parent in native.query(ctx).classes().defining_method(_INIT_SUBCLASS).collect():
             yield native.AddNode(
                 fqname=f"{INIT_SUBCLASS_PREFIX}{parent.fqname}",

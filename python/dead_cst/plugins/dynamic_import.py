@@ -22,22 +22,17 @@ from __future__ import annotations
 import fnmatch
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Iterable
+from typing import Iterable
 
 from ..graph import EdgeFlags
-
-if TYPE_CHECKING:
-    from dead_cst import _native as native
+from ._base import Plugin, native
 
 _DYNAMIC_IMPORT_FLAG: int = int(EdgeFlags.DYNAMIC_IMPORT)
 
 
 @dataclass
-class DynamicImportFallbackPlugin:
+class DynamicImportFallbackPlugin(Plugin):
     """Fan out ``DYNAMIC_IMPORT``-flagged edges to the target module's exports."""
-
-    name: str = "dynamic_import_fallback"
-    version: int = 1779200000
 
     include_underscore: bool = False
     respect_dunder_all: bool = True
@@ -47,8 +42,6 @@ class DynamicImportFallbackPlugin:
     include_targets: tuple[str, ...] = ()
 
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
-        from dead_cst import _native as native
-
         nodes = ctx.nodes()
         cache: dict[str, list] = {}
         project_root = Path(ctx.project_root)
@@ -70,8 +63,6 @@ class DynamicImportFallbackPlugin:
         module_fqname: str,
         cache: dict[str, list],
     ) -> list:
-        from dead_cst import _native as native
-
         cached = cache.get(module_fqname)
         if cached is not None:
             return cached

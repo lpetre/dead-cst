@@ -3,18 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Iterable
+from typing import Iterable
 
 from ..graph import NodeFlags
-
-if TYPE_CHECKING:
-    from dead_cst import _native as native
+from ._base import Plugin, native
 
 MAIN_BLOCK_PREFIX = "<__main__>:"
 
 
 @dataclass
-class MainBlockPlugin:
+class MainBlockPlugin(Plugin):
     """Treat ``if __name__ == "__main__":`` blocks as entrypoints.
 
     For each module containing a top-level ``if __name__ == "__main__":``
@@ -23,12 +21,7 @@ class MainBlockPlugin:
     the block's source range.
     """
 
-    name: str = "main_block"
-    version: int = 1777760307
-
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
-        from dead_cst import _native as native
-
         for module, block_decls in native.query(ctx).main_blocks():
             yield native.AddNode(
                 fqname=f"{MAIN_BLOCK_PREFIX}{module.fqname}",
