@@ -7,7 +7,6 @@ import textwrap
 
 
 from dead_cst import NodeFlags
-from dead_cst.analyze import _find_reachable as find_reachable, _keepalive_seeds
 from dead_cst.graph import KEEPALIVE_DEFAULT
 from dead_cst.codemod import remove_code
 from dead_cst.plugins import ExplicitEntrypointPlugin
@@ -23,7 +22,7 @@ def _normalise(s: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def test_overloads_are_excluded_from_cross_module_lookup(tmp_path, make_analysis):
+def test_overloads_are_excluded_from_cross_module_lookup(tmp_path, make_analysis, successors_of):
     """``from mod import f`` must reach the impl, never an overload."""
     (tmp_path / "mod.py").write_text(
         _normalise(
@@ -40,10 +39,10 @@ def test_overloads_are_excluded_from_cross_module_lookup(tmp_path, make_analysis
     (tmp_path / "main.py").write_text("from mod import f\nf(1)\n")
     graph = make_analysis().materialize_all()
 
-    main_f_import = next(n for n in graph.nodes if n.fqname == "main.f")
+    main_f_import = next(n for n in graph.nodes() if n.fqname == "main.f")
     targets = [
         s
-        for s in (graph.node(i) for i in graph.raw.successor_indices(graph.index(main_f_import)))
+        for s in successors_of(graph, main_f_import)
         if s.fqname == "mod.f" and s.kind == "function"
     ]
     assert targets, "main.f should reach mod.f"
@@ -72,9 +71,9 @@ def test_dead_overloads_are_removed_with_impl(tmp_path, make_analysis):
         )
     )
     graph = make_analysis().materialize_all()
-    seeds = [graph.index(n) for n in graph.nodes if n.fqname == "mod.keep"]
-    reachable = find_reachable(graph, seeds)
-    unreachable = graph.subgraph([n for n in graph.nodes if n not in reachable])
+    keep = next(n for n in graph.nodes() if n.fqname == "mod.keep")
+    reachable = set(graph.descendants(keep)) | {keep}
+    unreachable = [n for n in graph.nodes() if n not in reachable]
     remove_code(unreachable, tmp_path)
 
     rewritten = (tmp_path / "mod.py").read_text()
@@ -101,8 +100,8 @@ def test_live_overloads_survive_codemod(tmp_path, make_analysis):
     )
     a = make_analysis(plugins=[ExplicitEntrypointPlugin(specs=["mod.f"])])
     graph = a.materialize_all()
-    reachable = find_reachable(graph, _keepalive_seeds(graph, KEEPALIVE_DEFAULT))
-    unreachable = graph.subgraph([n for n in graph.nodes if n not in reachable])
+    reachable = set(graph.reachable(seed_flags=KEEPALIVE_DEFAULT))
+    unreachable = [n for n in graph.nodes() if n not in reachable]
     remove_code(unreachable, tmp_path)
 
     rewritten = (tmp_path / "mod.py").read_text()
@@ -115,7 +114,7 @@ def test_live_overloads_survive_codemod(tmp_path, make_analysis):
 # ---------------------------------------------------------------------------
 
 
-def test_orphan_pyi_stub_uses_runtime_fqname(tmp_path, make_analysis):
+def test_orphan_pyi_stub_uses_runtime_fqname(tmp_path, make_analysis, successors_of):
     """Compiled-extension shape: ``from mypkg._native import compute``
     must resolve to the stub decl when no ``.py`` twin exists."""
     pkg = tmp_path / "mypkg"
@@ -127,15 +126,13 @@ def test_orphan_pyi_stub_uses_runtime_fqname(tmp_path, make_analysis):
 
     a = make_analysis(plugins=[ExplicitEntrypointPlugin(specs=["main"])])
     graph = a.materialize_all()
-    reachable = find_reachable(graph, _keepalive_seeds(graph, KEEPALIVE_DEFAULT))
+    reachable = set(graph.reachable(seed_flags=KEEPALIVE_DEFAULT))
 
     stub_compute = next(
-        n for n in graph.nodes if n.fqname == "mypkg._native.compute" and n.kind == "function"
+        n for n in graph.nodes() if n.fqname == "mypkg._native.compute" and n.kind == "function"
     )
     assert stub_compute.path.endswith("/_native.pyi")
     assert stub_compute in reachable, "orphan stub decl should be alive when imported"
 
-    pkg_compute = next(n for n in graph.nodes if n.fqname == "mypkg.compute")
-    assert stub_compute in (
-        graph.node(i) for i in graph.raw.successor_indices(graph.index(pkg_compute))
-    )
+    pkg_compute = next(n for n in graph.nodes() if n.fqname == "mypkg.compute")
+    assert stub_compute in successors_of(graph, pkg_compute)

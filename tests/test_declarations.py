@@ -1677,7 +1677,7 @@ def test_peer_stub_emits_edge_to_matching_runtime_decl_rust(build_decl_graph):
     # ``foo.shared`` exists in both files; the rust path mints two
     # nodes (one per file) sharing the fqname, so disambiguating
     # requires walking the underlying node paths.
-    raw_edges = [(graph.node(u), graph.node(v)) for u, v in graph.raw.edge_list()]
+    raw_edges = [(graph.nodes()[u], graph.nodes()[v]) for u, v, _ in graph.edges()]
     stub_runtime_pairs = {
         (str(s.path).rsplit("/", 1)[-1], str(t.path).rsplit("/", 1)[-1])
         for s, t in raw_edges
@@ -1706,7 +1706,7 @@ def test_stub_only_decl_flagged_entrypoint_rust(build_decl_graph):
 
     graph = build_decl_graph(PEER_STUB_FILES)
     by_fqname = {}
-    for n in graph.raw.nodes():
+    for n in graph.nodes():
         if str(n.path).endswith("foo.pyi") and n.kind == "function":
             by_fqname[n.fqname] = int(n.flags)
     assert by_fqname.get("foo.stub_only", NodeFlags.NONE) & NodeFlags.ENTRYPOINT, (
@@ -1733,7 +1733,7 @@ def test_notebook_decls_carry_notebook_flag(write_notebook, build_decl_graph):
     write_notebook("analysis.ipynb", ["def helper():\n    return 42", "helper()"])
     graph = build_decl_graph({})
 
-    notebook_nodes = [n for n in graph.raw.nodes() if str(n.path).endswith(".ipynb")]
+    notebook_nodes = [n for n in graph.nodes() if str(n.path).endswith(".ipynb")]
     assert notebook_nodes, "expected at least one decl minted from the .ipynb file"
     for n in notebook_nodes:
         assert int(n.flags) & NodeFlags.NOTEBOOK, (

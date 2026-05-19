@@ -308,7 +308,7 @@ def test_init_subclass_subscripted_base(make_analysis, write_files, reachable_fq
     assert "pkg.impls.Foo" in reachable_fqnames(graph)
 
 
-def test_init_subclass_marker_in_predecessor_chain(make_analysis, write_files):
+def test_init_subclass_marker_in_predecessor_chain(make_analysis, write_files, predecessors_of):
     """Reachability of a subclass routes through a labeled marker node so
     ``why-alive`` chains read ``Foo <- <__init_subclass__>:Plugin <- Plugin``."""
     write_files(
@@ -333,8 +333,8 @@ def test_init_subclass_marker_in_predecessor_chain(make_analysis, write_files):
             InitSubclassPlugin(),
         ]
     ).materialize_all()
-    foo = next(n for n in graph.nodes if n.fqname == "pkg.impls.Foo")
-    preds = [graph.node(i) for i in graph.raw.predecessor_indices(graph.index(foo))]
+    foo = next(n for n in graph.nodes() if n.fqname == "pkg.impls.Foo")
+    preds = predecessors_of(graph, foo)
     marker = next(
         (p for p in preds if p.kind == "synthetic" and p.fqname.startswith(INIT_SUBCLASS_PREFIX)),
         None,
@@ -342,7 +342,7 @@ def test_init_subclass_marker_in_predecessor_chain(make_analysis, write_files):
     assert marker is not None, f"expected a marker predecessor, got {preds!r}"
     assert marker.fqname == f"{INIT_SUBCLASS_PREFIX}pkg.base.Plugin"
 
-    marker_preds = [graph.node(i) for i in graph.raw.predecessor_indices(graph.index(marker))]
+    marker_preds = predecessors_of(graph, marker)
     parent = next(p for p in marker_preds if p.fqname == "pkg.base.Plugin")
     assert parent.kind == "class"
 

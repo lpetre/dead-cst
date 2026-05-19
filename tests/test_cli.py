@@ -277,22 +277,14 @@ def test_dead_real_filters_synthetic_nodes():
     """Synthetic nodes (entrypoint sentinels, external markers) are
     excluded from the dead-symbol report so we don't surface them
     alongside user-visible declarations."""
-    from dead_cst._graphstore import SymbolGraph
-
     real = _make_node("pkg.f", "function", "/a.py")
     entrypoint_synth = _make_node(f"{EXPLICIT_PREFIX}pkg.f", "synthetic", "/a.py")
 
-    g = SymbolGraph()
-    for n in (real, entrypoint_synth):
-        g.add(n)
-
-    assert _dead_real(g) == [real]
+    assert _dead_real([real, entrypoint_synth]) == [real]
 
 
 def test_dead_real_empty_graph_returns_empty_list():
-    from dead_cst._graphstore import SymbolGraph
-
-    assert _dead_real(SymbolGraph()) == []
+    assert _dead_real([]) == []
 
 
 # ---------------------------------------------------------------------------

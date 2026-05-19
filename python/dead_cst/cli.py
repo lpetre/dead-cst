@@ -8,12 +8,11 @@ import re
 import sys
 from enum import Enum
 from pathlib import Path
-from typing import Annotated, Sequence
+from typing import TYPE_CHECKING, Annotated, Iterable, Sequence
 
 import typer
 
-from ._graphstore import SymbolGraph
-from .analyze import Analysis, _count_nodes_by_prefix, _find_reachable, _keepalive_seeds
+from .analyze import Analysis, _count_nodes_by_prefix
 from .codemod import generate_patch
 from .graph import KEEPALIVE_DEFAULT, SymbolNode
 from .plugins import (
@@ -30,6 +29,9 @@ from .resolvers import (
     PathResolver,
     load_resolver,
 )
+
+if TYPE_CHECKING:
+    from dead_cst import _native as native
 
 
 app = typer.Typer(help="Dead code analysis for Python.")
@@ -149,29 +151,29 @@ def analyze(
         plugin_names=plugin or [],
     )
     analysis = Analysis(root, resolver=path_resolver, plugins=plugins, show_progress=True)
-    graph = analysis.materialize_all()
-    reachable = _find_reachable(graph, _keepalive_seeds(graph, KEEPALIVE_DEFAULT))
-
-    unreachable_graph = graph.subgraph([n for n in graph.nodes if n not in reachable])
+    ctx = analysis.materialize_all()
+    reachable = set(ctx.reachable(seed_flags=KEEPALIVE_DEFAULT))
+    all_nodes = ctx.nodes()
+    dead_nodes = [n for n in all_nodes if n not in reachable]
 
     package_paths = [p.path for p in analysis.packages]
     if output_format == OutputFormat.json:
-        _output_json(graph, unreachable_graph, root, package_paths)
+        _output_json(all_nodes, dead_nodes, root, package_paths)
     else:
-        _output_text(graph, unreachable_graph, root, package_paths)
+        _output_text(all_nodes, dead_nodes, root, package_paths)
 
-    if len(unreachable_graph) > 0:
+    if dead_nodes:
         raise typer.Exit(1)
 
 
 def _output_text(
-    graph: SymbolGraph,
-    unreachable: SymbolGraph,
+    all_nodes: Sequence[SymbolNode],
+    dead_nodes: Sequence[SymbolNode],
     root: Path,
     package_paths: Sequence[Path],
 ) -> None:
-    total_by_path = _count_nodes_by_prefix(graph.nodes, package_paths)
-    unreachable_by_path = _count_nodes_by_prefix(unreachable.nodes, package_paths)
+    total_by_path = _count_nodes_by_prefix(all_nodes, package_paths)
+    unreachable_by_path = _count_nodes_by_prefix(dead_nodes, package_paths)
     for path in package_paths:
         typer.echo(f"\n{path}:")
         total_counts = total_by_path[path]
@@ -186,20 +188,20 @@ def _output_text(
             else:
                 typer.echo(f"  {kind}: {total} total")
 
-    dead_real = _dead_real(unreachable)
+    dead_real = _dead_real(dead_nodes)
     if dead_real:
         typer.echo(f"\nDead symbols ({len(dead_real)}):")
         for node in sorted(dead_real, key=lambda n: (str(n.path), n.fqname)):
             typer.echo(f"  {node.fqname} ({node.kind}) at {_rel_path(node.path, root)}")
 
 
-def _dead_real(unreachable: SymbolGraph) -> list[SymbolNode]:
-    return [n for n in unreachable.nodes if n.kind != "synthetic"]
+def _dead_real(dead_nodes: Iterable[SymbolNode]) -> list[SymbolNode]:
+    return [n for n in dead_nodes if n.kind != "synthetic"]
 
 
 def _output_json(
-    graph: SymbolGraph,
-    unreachable: SymbolGraph,
+    all_nodes: Sequence[SymbolNode],
+    dead_nodes: Sequence[SymbolNode],
     root: Path,
     package_paths: Sequence[Path],
 ) -> None:
@@ -208,8 +210,8 @@ def _output_json(
         "dead_symbols": [],
     }
 
-    total_by_path = _count_nodes_by_prefix(graph.nodes, package_paths)
-    unreachable_by_path = _count_nodes_by_prefix(unreachable.nodes, package_paths)
+    total_by_path = _count_nodes_by_prefix(all_nodes, package_paths)
+    unreachable_by_path = _count_nodes_by_prefix(dead_nodes, package_paths)
     for path in package_paths:
         path_str = str(path)
         total_counts = total_by_path[path]
@@ -220,7 +222,7 @@ def _output_json(
             if kind != "synthetic"
         }
 
-    for node in sorted(_dead_real(unreachable), key=lambda n: (str(n.path), n.fqname)):
+    for node in sorted(_dead_real(dead_nodes), key=lambda n: (str(n.path), n.fqname)):
         result["dead_symbols"].append(
             {
                 "fqname": node.fqname,
@@ -230,6 +232,32 @@ def _output_json(
         )
 
     typer.echo(json.dumps(result, indent=2))
+
+
+def _build_predecessor_map(
+    ctx: "native.ProjectContext",
+) -> dict[int, list[int]]:
+    """Build a Python-side ``dst_idx -> [src_idx, ...]`` map from
+    ``ctx.edges()`` in a single pass.
+
+    Used by CLI commands that need one-hop predecessor walks
+    (``dependencies``, ``unused-exports``). One pass per command keeps
+    the rust surface lean — the production reachability path uses
+    :meth:`ProjectContext.reachable` and never builds this.
+    """
+    preds: dict[int, list[int]] = {}
+    for u, v, _flags in ctx.edges():
+        preds.setdefault(v, []).append(u)
+    return preds
+
+
+def _build_successor_map(
+    ctx: "native.ProjectContext",
+) -> dict[int, list[int]]:
+    succs: dict[int, list[int]] = {}
+    for u, v, _flags in ctx.edges():
+        succs.setdefault(u, []).append(v)
+    return succs
 
 
 @app.command("why-alive")
@@ -264,21 +292,25 @@ def why_alive(
         plugin_names=plugin or [],
     )
     analysis = Analysis(root, resolver=path_resolver, plugins=plugins, show_progress=True)
-    graph = analysis.materialize_all()
+    ctx = analysis.materialize_all()
 
-    target_node: SymbolNode | None = None
-    for node in graph.nodes:
+    nodes = ctx.nodes()
+    target_idx: int | None = None
+    for i, node in enumerate(nodes):
         if node.fqname == fqname:
-            target_node = node
+            target_idx = i
             break
 
-    if target_node is None:
+    if target_idx is None:
         typer.echo(f"Symbol not found: {fqname}", err=True)
         raise typer.Exit(1)
+    target_node = nodes[target_idx]
+
+    in_degree = sum(1 for _u, v, _f in ctx.edges() if v == target_idx)
 
     typer.echo(f"\nSymbol: {target_node.fqname} ({target_node.kind})")
     typer.echo(f"Path: {_rel_path(target_node.path, root)}")
-    typer.echo(f"In-degree: {graph.in_degree(graph.index(target_node))}")
+    typer.echo(f"In-degree: {in_degree}")
     typer.echo("\nPredecessor chain:")
 
     # Delegate the reverse-closure walk to the rust BFS.
@@ -320,18 +352,18 @@ def dependencies(
 
     typer.echo(f"Building symbol graph for {root}...", err=True)
     analysis = Analysis(root, resolver=path_resolver, show_progress=True)
-    graph = analysis.materialize_all()
+    ctx = analysis.materialize_all()
+    nodes = ctx.nodes()
+    preds = _build_predecessor_map(ctx)
 
     deps_by_package: dict[Path, list[SymbolNode]] = {p.path: [] for p in analysis.packages}
-    for node in graph.nodes:
+    for idx, node in enumerate(nodes):
         if not _is_external_dep(node):
             continue
         # Synthetic dep nodes carry an empty path. Attribute them to
         # each package that imports them by walking back through the
         # graph's predecessor edges.
-        importer_paths: set[Path] = set()
-        for j in graph.predecessor_indices(graph.index(node)):
-            importer_paths.add(Path(graph.node(j).path))
+        importer_paths: set[Path] = {Path(nodes[i].path) for i in preds.get(idx, [])}
         for pkg_path in deps_by_package:
             if any(p.is_relative_to(pkg_path) for p in importer_paths):
                 if node not in deps_by_package[pkg_path]:
@@ -339,18 +371,18 @@ def dependencies(
 
     if output_format == OutputFormat.json:
         result = {
-            str(pkg_path): sorted(n.fqname for n in nodes)
-            for pkg_path, nodes in deps_by_package.items()
+            str(pkg_path): sorted(n.fqname for n in nodes_list)
+            for pkg_path, nodes_list in deps_by_package.items()
         }
         typer.echo(json.dumps(result, indent=2))
         return
 
-    for pkg_path, nodes in deps_by_package.items():
+    for pkg_path, nodes_list in deps_by_package.items():
         typer.echo(f"\n{pkg_path}:")
-        if not nodes:
+        if not nodes_list:
             typer.echo("  (no third-party dependencies found)")
             continue
-        for node in sorted(nodes, key=lambda n: n.fqname):
+        for node in sorted(nodes_list, key=lambda n: n.fqname):
             typer.echo(f"  {node.fqname}")
 
 
@@ -392,35 +424,43 @@ def unused_exports(
         entrypoints=entrypoint or [],
         plugin_names=plugin or [],
     )
-    graph = Analysis(
-        root, resolver=path_resolver, plugins=plugins, show_progress=True
-    ).materialize_all()
-    reachable = _find_reachable(graph, _keepalive_seeds(graph, KEEPALIVE_DEFAULT))
+    analysis = Analysis(root, resolver=path_resolver, plugins=plugins, show_progress=True)
+    ctx = analysis.materialize_all()
+    nodes = ctx.nodes()
+    reachable = set(ctx.reachable(seed_flags=KEEPALIVE_DEFAULT))
 
     def _is_dunder_seed(node: SymbolNode) -> bool:
         return node.kind == "synthetic" and node.fqname.startswith(DUNDER_PREFIX)
 
+    succs = _build_successor_map(ctx)
+
+    # Walk reachability one more time, but treat the
+    # ``dunder_seed -> __all__`` step as a dead end. The diff against
+    # the default reachable set is the set of nodes only kept alive by
+    # ``__all__`` lookups.
     visited_idx: set[int] = set()
-    stack: list[int] = _keepalive_seeds(graph, KEEPALIVE_DEFAULT)
+    stack: list[int] = [i for i, n in enumerate(nodes) if n.flags & KEEPALIVE_DEFAULT]
     while stack:
         i = stack.pop()
         if i in visited_idx:
             continue
         visited_idx.add(i)
-        is_seed = _is_dunder_seed(graph.node(i))
-        for j in graph.successor_indices(i):
-            if is_seed and _is_dunder_all(graph.node(j)):
+        is_seed = _is_dunder_seed(nodes[i])
+        for j in succs.get(i, ()):
+            if is_seed and _is_dunder_all(nodes[j]):
                 continue
             stack.append(j)
-    visited = {graph.node(i) for i in visited_idx}
+    visited = {nodes[i] for i in visited_idx}
     only_via_all = reachable - visited
 
+    preds = _build_predecessor_map(ctx)
     by_all: dict[SymbolNode, list[SymbolNode]] = {}
     for sym in only_via_all:
         if _is_dunder_all(sym):
             continue
-        for j in graph.predecessor_indices(graph.index(sym)):
-            pred = graph.node(j)
+        sym_idx = nodes.index(sym)
+        for j in preds.get(sym_idx, ()):
+            pred = nodes[j]
             if _is_dunder_all(pred):
                 by_all.setdefault(pred, []).append(sym)
 
@@ -481,12 +521,11 @@ def remove(
         plugin_names=plugin or [],
     )
     analysis = Analysis(root, resolver=path_resolver, plugins=plugins, show_progress=True)
-    graph = analysis.materialize_all()
-    reachable = _find_reachable(graph, _keepalive_seeds(graph, KEEPALIVE_DEFAULT))
+    ctx = analysis.materialize_all()
+    reachable = set(ctx.reachable(seed_flags=KEEPALIVE_DEFAULT))
+    dead_nodes = [n for n in ctx.nodes() if n not in reachable]
 
-    unreachable_graph = graph.subgraph([n for n in graph.nodes if n not in reachable])
-
-    patch = generate_patch(unreachable_graph, root)
+    patch = generate_patch(dead_nodes, root)
 
     if not patch:
         typer.echo("No dead code found.", err=True)

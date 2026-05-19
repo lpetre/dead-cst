@@ -226,7 +226,7 @@ def test_uv_resolver_explicit_lock_path(tmp_path: Path):
     assert result  # non-empty -- lock_path override took effect
 
 
-def test_uv_workspace_flat_layout_with_tests_dirs(tmp_path: Path):
+def test_uv_workspace_flat_layout_with_tests_dirs(tmp_path: Path, has_edge):
     """Regression for the AssertionError in the issue: two members with
     ``tests/`` packages used to collide when their tries were merged.
 
@@ -305,16 +305,16 @@ def test_uv_workspace_flat_layout_with_tests_dirs(tmp_path: Path):
     graph = Analysis(tmp_path, resolver=UvResolver()).materialize_all()
 
     # The cross-member import resolved: pkg_a/app.py -> libc/foo/c/mod.y
-    mod_y = next(n for n in graph.nodes if n.fqname == "foo.c.mod.y" and n.kind == "variable")
+    mod_y = next(n for n in graph.nodes() if n.fqname == "foo.c.mod.y" and n.kind == "variable")
     app_import = next(
         n
-        for n in graph.nodes
+        for n in graph.nodes()
         if n.kind == "import" and n.path == str((pkg_a / "pkg_a" / "app.py").resolve())
     )
-    assert graph.raw.has_edge(graph.index(app_import), graph.index(mod_y))
+    assert has_edge(graph, app_import, mod_y)
 
 
-def test_uv_workspace_shared_namespace_package(tmp_path: Path):
+def test_uv_workspace_shared_namespace_package(tmp_path: Path, has_edge):
     """PEP 420 namespace shared across workspace members (Google-style monorepo).
 
     Two distributions contribute submodules to the same top-level ``foo``
@@ -398,8 +398,8 @@ def test_uv_workspace_shared_namespace_package(tmp_path: Path):
 
     # foo.a.value (in foo-a) and foo.b.result (in foo-b) both made it into
     # the graph as distinct variables under the shared ``foo`` namespace.
-    value = next(n for n in graph.nodes if n.fqname == "foo.a.value" and n.kind == "variable")
-    result = next(n for n in graph.nodes if n.fqname == "foo.b.result" and n.kind == "variable")
+    value = next(n for n in graph.nodes() if n.fqname == "foo.a.value" and n.kind == "variable")
+    result = next(n for n in graph.nodes() if n.fqname == "foo.b.result" and n.kind == "variable")
     assert value.path == str((foo_a / "foo" / "a" / "__init__.py").resolve())
     assert result.path == str((foo_b / "foo" / "b" / "__init__.py").resolve())
 
@@ -407,7 +407,7 @@ def test_uv_workspace_shared_namespace_package(tmp_path: Path):
     # the namespace boundary back to foo-a's declaration.
     b_import = next(
         n
-        for n in graph.nodes
+        for n in graph.nodes()
         if n.kind == "import" and n.path == str((foo_b / "foo" / "b" / "__init__.py").resolve())
     )
-    assert graph.raw.has_edge(graph.index(b_import), graph.index(value))
+    assert has_edge(graph, b_import, value)
