@@ -10,8 +10,8 @@ synthetic nodes, which is fine for these checks).
 Levels:
 - **0**: ``analyze`` runs to completion without raising; exit code is
   the documented 0 / 1.
-- **1**: ``why-alive`` finds the pinned ``main`` symbol and reports
-  the ``MainBlockPlugin`` synthetic in its predecessor chain.
+- **1**: :meth:`Analysis.ancestors` on the pinned ``main`` symbol
+  reports the ``MainBlockPlugin`` synthetic in its predecessor chain.
 - **2**: project-specific plugins from :mod:`._flux0_plugins` close
   flux0's two ``importlib``-driven blind spots. Each is a tiny
   subclass of an abstract base (:class:`SubpackageDiscoveryPlugin` /
@@ -88,44 +88,33 @@ def test_analyze_flux0_cli_runs_to_completion(flux0_cli_src):
 # ---------------------------------------------------------------------------
 
 
+def _ancestor_fqnames(base: Path, target_fqname: str) -> list[str]:
+    """Run the Python equivalent of ``why-alive``.
+
+    Materializes the graph, finds the target node, and returns the
+    predecessor chain's fqnames — the same data the dropped CLI
+    command rendered, exposed through :meth:`Analysis.ancestors`.
+    """
+    analysis = Analysis(base, resolver=ManualResolver(specs=["."]), plugins=[MainBlockPlugin()])
+    graph = analysis.materialize_all()
+    target = next((n for n in graph.nodes if n.fqname == target_fqname), None)
+    assert target is not None, f"{target_fqname} not in graph"
+    return [n.fqname for n in analysis.ancestors(target)]
+
+
 def test_why_alive_flux0_server_main(flux0_server_src):
     """Level 1: ``main`` is reached via the module's ``if __name__ ...`` block.
 
-    The MainBlockPlugin attaches a synthetic ``<__main__>:<module>`` node
-    as a predecessor of every top-level call inside the guard, so we
-    expect to see that synthetic in the chain.
+    The MainBlockPlugin attaches a synthetic ``<__main__>:<module>``
+    node as a predecessor of every top-level call inside the guard.
     """
-    result = CliRunner().invoke(
-        app,
-        [
-            "why-alive",
-            flux0_server_src,
-            "flux0_server.main.main",
-            "--plugin",
-            "main_block",
-        ],
-    )
-    assert result.exception is None, result.exception
-    assert result.exit_code == 0, result.output
-    assert "Symbol: flux0_server.main.main (function)" in result.stdout
-    assert "<__main__>:flux0_server.main" in result.stdout
+    ancestors = _ancestor_fqnames(Path(flux0_server_src), "flux0_server.main.main")
+    assert any(a.startswith("<__main__>:flux0_server.main") for a in ancestors)
 
 
 def test_why_alive_flux0_cli_main(flux0_cli_src):
-    result = CliRunner().invoke(
-        app,
-        [
-            "why-alive",
-            flux0_cli_src,
-            "flux0_cli.main.main",
-            "--plugin",
-            "main_block",
-        ],
-    )
-    assert result.exception is None, result.exception
-    assert result.exit_code == 0, result.output
-    assert "Symbol: flux0_cli.main.main (function)" in result.stdout
-    assert "<__main__>:flux0_cli.main" in result.stdout
+    ancestors = _ancestor_fqnames(Path(flux0_cli_src), "flux0_cli.main.main")
+    assert any(a.startswith("<__main__>:flux0_cli.main") for a in ancestors)
 
 
 # ---------------------------------------------------------------------------

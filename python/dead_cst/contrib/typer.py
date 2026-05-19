@@ -10,10 +10,11 @@ app()`` block (handled by :class:`MainBlockPlugin`). Sub-typers
 attached via ``app.add_typer(sub)`` are kept alive through the
 ordinary reference tracked on that call.
 
-This routes ``why-alive`` chains through the Typer app variable users
-recognize ("alive because it's a command on ``app``") and lets a
-sub-typer that's never ``add_typer``'d surface as dead code, mirroring
-the behavior of :func:`fastapi_plugin` for ``APIRouter``.
+This routes predecessor-chain walks (``Analysis.ancestors``) through
+the Typer app variable users recognize ("alive because it's a command
+on ``app``") and lets a sub-typer that's never ``add_typer``'d surface
+as dead code, mirroring the behavior of :func:`fastapi_plugin` for
+``APIRouter``.
 """
 
 from __future__ import annotations

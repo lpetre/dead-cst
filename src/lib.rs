@@ -33,6 +33,7 @@ mod builder;
 mod graph;
 mod helpers;
 mod ingest;
+mod io;
 mod project;
 mod query;
 
@@ -40,6 +41,7 @@ use pyo3::prelude::*;
 
 use crate::builder::{AddEdge, AddEntrypoint, AddNode};
 use crate::graph::{EdgeFlags, Import, NativeGraph, NodeFlags, SymbolNode};
+use crate::io::{read_graph, write_graph, GraphMetadata};
 use crate::project::{Project, ProjectContext};
 use crate::query::{
     CallQuery, CallRef, ClassQuery, ConstructionQuery, ConstructionRef, DecoratorQuery,
@@ -83,7 +85,10 @@ fn dead_cst_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ClassQuery>()?;
     m.add_class::<FactoryQuery>()?;
     m.add_class::<FactoryRef>()?;
+    m.add_class::<GraphMetadata>()?;
     m.add_function(wrap_pyfunction!(query_fn, m)?)?;
+    m.add_function(wrap_pyfunction!(write_graph, m)?)?;
+    m.add_function(wrap_pyfunction!(read_graph, m)?)?;
     Ok(())
 }
 

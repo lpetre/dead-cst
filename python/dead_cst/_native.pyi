@@ -188,9 +188,9 @@ class AddEntrypoint:
     """Mark ``decl`` as an entrypoint.
 
     ``marker`` is a self-documenting label (``"<celery-worker>"``,
-    ``"<external-execution>:alembic"``, …) shown in ``why-alive`` to
-    explain *why* the decl is alive without minting a synthetic graph
-    node for the reason.
+    ``"<external-execution>:alembic"``, …) used in the
+    :meth:`Analysis.ancestors` chain to explain *why* the decl is
+    alive without minting a synthetic graph node for the reason.
 
     Sugar for the single-target case; for multi-target
     (``marker -> [t1, t2, t3]``) or intermediate
@@ -496,8 +496,8 @@ class ProjectContext:
         """Reverse closure: every node that can reach ``decl`` by
         following graph edges.
 
-        Used for ``why-alive`` and blast-radius scoping. ``skip_flags``
-        works the same as in :meth:`descendants`.
+        Used for predecessor-chain walks and blast-radius scoping.
+        ``skip_flags`` works the same as in :meth:`descendants`.
         """
         ...
 
@@ -989,3 +989,46 @@ class FactoryQuery:
     def collect(self) -> list[FactoryRef]: ...
     def count(self) -> int: ...
     def __iter__(self) -> Iterator[FactoryRef]: ...
+
+# ---------- Graph persistence --------------------------------------------
+
+class GraphMetadata:
+    """Header block returned by :func:`read_graph` alongside the graph.
+
+    ``created_at`` is unix-epoch seconds at write time. ``user_meta``
+    is the list of ``(key, value)`` pairs the writer passed (from
+    ``dead-cst build --meta key=value``). The counts mirror the
+    graph stamped into the file and double as a sanity check against
+    the deserialized payload.
+    """
+
+    format_version: int
+    created_at: int
+    node_count: int
+    edge_count: int
+    file_count: int
+    line_count: int
+    user_meta: list[tuple[str, str]]
+
+def write_graph(
+    path: str,
+    nodes: list[SymbolNode],
+    edges: list[tuple[int, int, int]],
+    meta: list[tuple[str, str]],
+) -> None:
+    """Persist ``nodes`` + ``edges`` to ``path`` as a bincode-encoded
+    graph file. ``meta`` is the user-supplied list of ``(key, value)``
+    pairs (from ``--meta`` on the CLI); they are stored verbatim in
+    the file's metadata block.
+    """
+    ...
+
+def read_graph(path: str) -> tuple[NativeGraph, GraphMetadata]:
+    """Load a graph file written by :func:`write_graph`.
+
+    Raises ``ValueError`` when the magic bytes or the on-disk format
+    version don't match the one this build knows how to read — the
+    library never silently migrates an older file, since rebuilding
+    a graph is cheap.
+    """
+    ...
