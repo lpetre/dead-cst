@@ -107,14 +107,15 @@ const VALID_KINDS: &[&str] = &[
 ];
 
 pub(crate) fn intern_kind(kind: &str) -> PyResult<&'static str> {
-    for valid in VALID_KINDS {
-        if *valid == kind {
-            return Ok(*valid);
-        }
-    }
-    Err(pyo3::exceptions::PyValueError::new_err(format!(
-        "invalid SymbolNode.kind: {kind:?}"
-    )))
+    VALID_KINDS
+        .iter()
+        .find(|&&v| v == kind)
+        .copied()
+        .ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "invalid SymbolNode.kind: {kind:?} — expected one of {VALID_KINDS:?}"
+            ))
+        })
 }
 
 #[pymethods]
@@ -409,4 +410,81 @@ impl EdgeFlags {
     /// fan out / specialize.
     #[classattr]
     pub(crate) const DYNAMIC_IMPORT: u32 = 2;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn intern_kind_accepts_every_known_kind() {
+        for kind in [
+            "function",
+            "class",
+            "variable",
+            "import",
+            "type_alias",
+            "module",
+            "synthetic",
+        ] {
+            let interned = intern_kind(kind).expect("known kinds must intern");
+            // The returned string is the static slice — pointer-equal to
+            // the entry in VALID_KINDS — so equality on bytes is enough.
+            assert_eq!(interned, kind);
+        }
+    }
+
+    #[test]
+    fn intern_kind_rejects_unknown_kinds() {
+        // pyo3 PyResult requires GIL to inspect the err; we can still
+        // assert that the call returns Err without a Python interpreter
+        // attached — the error construction itself doesn't touch the GIL
+        // (only message formatting does).
+        assert!(intern_kind("").is_err());
+        assert!(intern_kind("Function").is_err()); // case-sensitive
+        assert!(intern_kind("functio").is_err());
+        assert!(intern_kind("functions").is_err());
+        assert!(intern_kind("decorator").is_err());
+    }
+
+    #[test]
+    fn node_flags_constants_are_distinct_bits() {
+        // Each flag should be a single distinct bit (or zero for NONE).
+        let flags = [
+            NodeFlags::SHADOWED,
+            NodeFlags::ENTRYPOINT,
+            NodeFlags::OVERLOAD,
+            NodeFlags::TESTCASE,
+            NodeFlags::NOQA,
+            NodeFlags::NOTEBOOK,
+            NodeFlags::EXPORTED,
+            NodeFlags::STAR_REEXPORT,
+        ];
+        assert_eq!(NodeFlags::NONE, 0);
+        for &f in &flags {
+            // Single-bit invariant.
+            assert!(f.is_power_of_two(), "flag {f} is not a single bit");
+        }
+        // All distinct.
+        let mut seen = std::collections::HashSet::new();
+        for &f in &flags {
+            assert!(seen.insert(f), "duplicate flag value {f}");
+        }
+    }
+
+    #[test]
+    fn node_flags_combine_via_bitwise_or() {
+        let combo = NodeFlags::ENTRYPOINT | NodeFlags::NOQA;
+        assert!(combo & NodeFlags::ENTRYPOINT != 0);
+        assert!(combo & NodeFlags::NOQA != 0);
+        assert!(combo & NodeFlags::TESTCASE == 0);
+    }
+
+    #[test]
+    fn edge_flags_are_distinct_bits() {
+        assert_eq!(EdgeFlags::NONE, 0);
+        assert!(EdgeFlags::DEAD_BRANCH.is_power_of_two());
+        assert!(EdgeFlags::DYNAMIC_IMPORT.is_power_of_two());
+        assert_ne!(EdgeFlags::DEAD_BRANCH, EdgeFlags::DYNAMIC_IMPORT);
+    }
 }

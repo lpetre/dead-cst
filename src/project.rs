@@ -2,7 +2,7 @@
 //! `build_project_graph` pipeline entrypoint. This module owns the
 //! Salsa-backed analysis context that the rest of the crate operates on.
 
-use std::cell::RefCell;
+use std::cell::{Ref, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
@@ -625,6 +625,19 @@ impl ProjectContext {
     }
 }
 
+impl ProjectContext {
+    /// Borrow the active `BuildOutputs` or raise the standard
+    /// "not materialized" error. Threads the `op` label into the
+    /// error message so the caller name appears in the traceback.
+    ///
+    /// The returned `Ref` keeps the `RefCell` borrow alive for the
+    /// lifetime of the receiver, so callers can hold it across an
+    /// entire query body without re-borrowing.
+    pub(crate) fn materialized(&self, op: &str) -> PyResult<Ref<'_, BuildOutputs>> {
+        Ref::filter_map(self.outputs.borrow(), Option::as_ref).map_err(|_| not_materialized(op))
+    }
+}
+
 // ----- Point-lookup queries (exposed to Python directly on ProjectContext) -
 
 #[pymethods]
@@ -635,10 +648,7 @@ impl ProjectContext {
     /// because the visitor's decl pass already minted one node per
     /// global-scope variable binding.
     pub(crate) fn find_module_dunders(&self, py: Python<'_>) -> PyResult<Vec<Py<SymbolNode>>> {
-        let outputs = self.outputs.borrow();
-        let outputs = outputs
-            .as_ref()
-            .ok_or_else(|| not_materialized("find_module_dunders"))?;
+        let outputs = self.materialized("find_module_dunders")?;
         let mut out = Vec::new();
         for node_py in &outputs.builder.nodes {
             let node = node_py.borrow(py);
@@ -695,10 +705,7 @@ impl ProjectContext {
         let abs_set: std::collections::HashSet<&str> =
             abs_paths.iter().map(String::as_str).collect();
 
-        let outputs = self.outputs.borrow();
-        let outputs = outputs
-            .as_ref()
-            .ok_or_else(|| not_materialized("find_nodes_matching_specs"))?;
+        let outputs = self.materialized("find_nodes_matching_specs")?;
         let mut out = Vec::new();
         for node_py in &outputs.builder.nodes {
             let node = node_py.borrow(py);
@@ -736,10 +743,7 @@ impl ProjectContext {
         py: Python<'_>,
         module_name: &str,
     ) -> PyResult<Vec<Py<SymbolNode>>> {
-        let outputs = self.outputs.borrow();
-        let outputs = outputs
-            .as_ref()
-            .ok_or_else(|| not_materialized("find_imports_of"))?;
+        let outputs = self.materialized("find_imports_of")?;
         // O(1) lookup against the pre-built ``imports_by_module``
         // index — no scan over all interned nodes. Empty when nothing
         // imports the module.
@@ -770,10 +774,7 @@ impl ProjectContext {
     /// project doesn't use it. O(1) — single hashmap probe against
     /// ``imports_by_module``, no node iteration, no PyObject clone.
     pub(crate) fn has_imports_of(&self, module_name: &str) -> PyResult<bool> {
-        let outputs = self.outputs.borrow();
-        let outputs = outputs
-            .as_ref()
-            .ok_or_else(|| not_materialized("has_imports_of"))?;
+        let outputs = self.materialized("has_imports_of")?;
         Ok(outputs
             .imports_by_module
             .get(module_name)
@@ -794,10 +795,7 @@ impl ProjectContext {
         py: Python<'_>,
         fqname: &str,
     ) -> PyResult<Vec<Py<SymbolNode>>> {
-        let outputs = self.outputs.borrow();
-        let outputs = outputs
-            .as_ref()
-            .ok_or_else(|| not_materialized("find_declarations"))?;
+        let outputs = self.materialized("find_declarations")?;
         // Try exact match first, then strip trailing segments.
         let mut prefix = fqname;
         loop {
@@ -821,10 +819,7 @@ impl ProjectContext {
         py: Python<'_>,
         fqname: &str,
     ) -> PyResult<Option<Py<SymbolNode>>> {
-        let outputs = self.outputs.borrow();
-        let outputs = outputs
-            .as_ref()
-            .ok_or_else(|| not_materialized("find_module"))?;
+        let outputs = self.materialized("find_module")?;
         Ok(outputs
             .module_by_fqname
             .get(fqname)
@@ -842,10 +837,7 @@ impl ProjectContext {
         py: Python<'_>,
         path: &str,
     ) -> PyResult<Option<Py<SymbolNode>>> {
-        let outputs = self.outputs.borrow();
-        let outputs = outputs
-            .as_ref()
-            .ok_or_else(|| not_materialized("module_for"))?;
+        let outputs = self.materialized("module_for")?;
         let Some(&file) = outputs.path_to_file.get(path) else {
             return Ok(None);
         };
@@ -863,10 +855,7 @@ impl ProjectContext {
     /// methods don't get their own graph nodes). Returns ``None`` when
     /// the fqname can't be found anywhere — never raises.
     pub(crate) fn resolve(&self, py: Python<'_>, fqname: &str) -> PyResult<Option<Py<SymbolNode>>> {
-        let outputs = self.outputs.borrow();
-        let outputs = outputs
-            .as_ref()
-            .ok_or_else(|| not_materialized("resolve"))?;
+        let outputs = self.materialized("resolve")?;
         let mut prefix = fqname;
         loop {
             if let Some(idxs) = outputs.decl_by_fqname.get(prefix) {
@@ -896,10 +885,7 @@ impl ProjectContext {
         py: Python<'_>,
         module_fqn: &str,
     ) -> PyResult<Vec<Py<SymbolNode>>> {
-        let outputs = self.outputs.borrow();
-        let outputs = outputs
-            .as_ref()
-            .ok_or_else(|| not_materialized("module_surface"))?;
+        let outputs = self.materialized("module_surface")?;
         let Some(&module_idx) = outputs.module_by_fqname.get(module_fqn) else {
             return Ok(Vec::new());
         };
@@ -937,10 +923,7 @@ impl ProjectContext {
         py: Python<'_>,
         module_fqn: &str,
     ) -> PyResult<Vec<Py<SymbolNode>>> {
-        let outputs = self.outputs.borrow();
-        let outputs = outputs
-            .as_ref()
-            .ok_or_else(|| not_materialized("find_module_top_level_decls"))?;
+        let outputs = self.materialized("find_module_top_level_decls")?;
         if !outputs.module_by_fqname.contains_key(module_fqn) {
             return Ok(Vec::new());
         }
@@ -985,10 +968,7 @@ impl ProjectContext {
         let Some(entries) = self.find_literal_list_entries(&all_fqn)? else {
             return Ok(None);
         };
-        let outputs = self.outputs.borrow();
-        let outputs = outputs
-            .as_ref()
-            .ok_or_else(|| not_materialized("find_module_dunder_all_exports"))?;
+        let outputs = self.materialized("find_module_dunder_all_exports")?;
         let mut out: Vec<Py<SymbolNode>> = Vec::new();
         for entry in entries {
             let entry_fqn = format!("{module_fqn}.{entry}");
@@ -1016,10 +996,7 @@ impl ProjectContext {
     /// stay independent of the visitor's ``__all__``-only string-list
     /// edge emission.
     pub(crate) fn find_literal_list_entries(&self, var_fqn: &str) -> PyResult<Option<Vec<String>>> {
-        let outputs = self.outputs.borrow();
-        let outputs = outputs
-            .as_ref()
-            .ok_or_else(|| not_materialized("find_literal_list_entries"))?;
+        let outputs = self.materialized("find_literal_list_entries")?;
         let Some(idxs) = outputs.decl_by_fqname.get(var_fqn) else {
             return Ok(None);
         };
@@ -1069,10 +1046,7 @@ impl ProjectContext {
         py: Python<'_>,
         path_prefix: &str,
     ) -> PyResult<Vec<Py<SymbolNode>>> {
-        let outputs = self.outputs.borrow();
-        let outputs = outputs
-            .as_ref()
-            .ok_or_else(|| not_materialized("decls_under"))?;
+        let outputs = self.materialized("decls_under")?;
         Ok(outputs
             .builder
             .nodes
@@ -1089,10 +1063,7 @@ impl ProjectContext {
         py: Python<'_>,
         substring: &str,
     ) -> PyResult<Vec<Py<SymbolNode>>> {
-        let outputs = self.outputs.borrow();
-        let outputs = outputs
-            .as_ref()
-            .ok_or_else(|| not_materialized("decls_matching"))?;
+        let outputs = self.materialized("decls_matching")?;
         Ok(outputs
             .builder
             .nodes
@@ -1112,10 +1083,7 @@ impl ProjectContext {
         pattern: &str,
     ) -> PyResult<Vec<Py<SymbolNode>>> {
         let regex = self.compile_regex(pattern)?;
-        let outputs = self.outputs.borrow();
-        let outputs = outputs
-            .as_ref()
-            .ok_or_else(|| not_materialized("decls_matching_name"))?;
+        let outputs = self.materialized("decls_matching_name")?;
         let mut out = Vec::new();
         for node_py in &outputs.builder.nodes {
             let node = node_py.borrow(py);
@@ -1144,10 +1112,7 @@ impl ProjectContext {
         root: &SymbolNode,
         skip_flags: u32,
     ) -> PyResult<Vec<Py<SymbolNode>>> {
-        let outputs = self.outputs.borrow();
-        let outputs = outputs
-            .as_ref()
-            .ok_or_else(|| not_materialized("descendants"))?;
+        let outputs = self.materialized("descendants")?;
         let root_idx = lookup_idx(&outputs.builder, root, "root")?;
         Ok(
             bfs(&outputs.builder, [root_idx], Direction::Forward, skip_flags)
@@ -1166,10 +1131,7 @@ impl ProjectContext {
         decl: &SymbolNode,
         skip_flags: u32,
     ) -> PyResult<Vec<Py<SymbolNode>>> {
-        let outputs = self.outputs.borrow();
-        let outputs = outputs
-            .as_ref()
-            .ok_or_else(|| not_materialized("ancestors"))?;
+        let outputs = self.materialized("ancestors")?;
         let idx = lookup_idx(&outputs.builder, decl, "decl")?;
         Ok(bfs(&outputs.builder, [idx], Direction::Reverse, skip_flags)
             .into_iter()
@@ -1188,10 +1150,7 @@ impl ProjectContext {
         skip_flags: u32,
         seed_flags: u32,
     ) -> PyResult<Vec<Py<SymbolNode>>> {
-        let outputs = self.outputs.borrow();
-        let outputs = outputs
-            .as_ref()
-            .ok_or_else(|| not_materialized("reachable"))?;
+        let outputs = self.materialized("reachable")?;
         let seeds = outputs
             .builder
             .nodes
@@ -1215,10 +1174,7 @@ impl ProjectContext {
     /// range — same shape ``MainBlockPlugin``'s libcst path computes
     /// from the visitor's payload.
     pub(crate) fn find_main_blocks(&self, py: Python<'_>) -> PyResult<Vec<MainBlock>> {
-        let outputs = self.outputs.borrow();
-        let outputs = outputs
-            .as_ref()
-            .ok_or_else(|| not_materialized("find_main_blocks"))?;
+        let outputs = self.materialized("find_main_blocks")?;
         let mut out: Vec<MainBlock> = Vec::new();
         for (&file, &module_idx) in &outputs.module_nodes_by_file {
             // Prefilter: ``if __name__ == "__main__":`` always has the
@@ -1272,10 +1228,7 @@ impl ProjectContext {
         decorator_names: Vec<String>,
         path_regex: Option<&str>,
     ) -> PyResult<Vec<(Py<SymbolNode>, CallArgs)>> {
-        let outputs = self.outputs.borrow();
-        let outputs = outputs
-            .as_ref()
-            .ok_or_else(|| not_materialized("find_decorated_decls"))?;
+        let outputs = self.materialized("find_decorated_decls")?;
         let path_re = _compile_path_regex(path_regex)?;
         let names: HashSet<&str> = decorator_names.iter().map(String::as_str).collect();
         let needle_strs: Vec<&str> = decorator_names.iter().map(String::as_str).collect();
@@ -1353,10 +1306,7 @@ impl ProjectContext {
         ctor_names: Vec<String>,
         path_regex: Option<&str>,
     ) -> PyResult<Vec<(Py<SymbolNode>, String, CallArgs)>> {
-        let outputs = self.outputs.borrow();
-        let outputs = outputs
-            .as_ref()
-            .ok_or_else(|| not_materialized("find_instance_constructions"))?;
+        let outputs = self.materialized("find_instance_constructions")?;
         let path_re = _compile_path_regex(path_regex)?;
         let allowed: HashSet<&str> = ctor_names.iter().map(String::as_str).collect();
         let needle_strs: Vec<&str> = ctor_names.iter().map(String::as_str).collect();
@@ -1423,10 +1373,7 @@ impl ProjectContext {
         decorator_attrs: Vec<String>,
         path_regex: Option<&str>,
     ) -> PyResult<Vec<(String, Py<SymbolNode>, CallArgs)>> {
-        let outputs = self.outputs.borrow();
-        let outputs = outputs
-            .as_ref()
-            .ok_or_else(|| not_materialized("find_handler_decorators"))?;
+        let outputs = self.materialized("find_handler_decorators")?;
         let path_re = _compile_path_regex(path_regex)?;
         let attrs: HashSet<&str> = decorator_attrs.iter().map(String::as_str).collect();
         let needle_strs: Vec<&str> = decorator_attrs.iter().map(String::as_str).collect();
@@ -1503,10 +1450,7 @@ impl ProjectContext {
         decorator_attrs: Vec<String>,
         path_regex: Option<&str>,
     ) -> PyResult<Vec<(String, Py<SymbolNode>, CallArgs)>> {
-        let outputs = self.outputs.borrow();
-        let outputs = outputs
-            .as_ref()
-            .ok_or_else(|| not_materialized("find_handler_decorators_via"))?;
+        let outputs = self.materialized("find_handler_decorators_via")?;
         let path_re = _compile_path_regex(path_regex)?;
         let attrs: HashSet<&str> = decorator_attrs.iter().map(String::as_str).collect();
         let decl_by_name_range = &outputs.decl_by_name_range;
@@ -1595,10 +1539,7 @@ impl ProjectContext {
         arg_index: usize,
         path_regex: Option<&str>,
     ) -> PyResult<Vec<(Py<SymbolNode>, String, CallArgs)>> {
-        let outputs = self.outputs.borrow();
-        let outputs = outputs
-            .as_ref()
-            .ok_or_else(|| not_materialized("find_calls_on_attr"))?;
+        let outputs = self.materialized("find_calls_on_attr")?;
         let path_re = _compile_path_regex(path_regex)?;
         let decl_by_name_range = &outputs.decl_by_name_range;
         let decl_by_fqname = &outputs.decl_by_fqname;
@@ -1664,10 +1605,7 @@ impl ProjectContext {
         module: &str,
         ctor_names: Vec<String>,
     ) -> PyResult<Vec<(Py<SymbolNode>, Vec<String>)>> {
-        let outputs = self.outputs.borrow();
-        let outputs = outputs
-            .as_ref()
-            .ok_or_else(|| not_materialized("find_factory_decls"))?;
+        let outputs = self.materialized("find_factory_decls")?;
         let allowed: HashSet<&str> = ctor_names.iter().map(String::as_str).collect();
         let needle_strs: Vec<&str> = ctor_names.iter().map(String::as_str).collect();
         let decl_by_name_range = &outputs.decl_by_name_range;
@@ -1739,10 +1677,7 @@ impl ProjectContext {
         arg_index: usize,
         path_regex: Option<&str>,
     ) -> PyResult<Vec<(Py<SymbolNode>, String, CallArgs)>> {
-        let outputs = self.outputs.borrow();
-        let outputs = outputs
-            .as_ref()
-            .ok_or_else(|| not_materialized("find_calls_to_imported"))?;
+        let outputs = self.materialized("find_calls_to_imported")?;
         let path_re = _compile_path_regex(path_regex)?;
         let allowed: HashSet<&str> = [name].into_iter().collect();
         let decl_by_name_range = &outputs.decl_by_name_range;
@@ -1818,10 +1753,7 @@ impl ProjectContext {
         required_positional: Option<usize>,
         path_regex: Option<&str>,
     ) -> PyResult<Vec<(Py<SymbolNode>, String, CallArgs)>> {
-        let outputs = self.outputs.borrow();
-        let outputs = outputs
-            .as_ref()
-            .ok_or_else(|| not_materialized("find_calls_on_var"))?;
+        let outputs = self.materialized("find_calls_on_var")?;
         let path_re = _compile_path_regex(path_regex)?;
         let decl_by_name_range = &outputs.decl_by_name_range;
         let decl_by_fqname = &outputs.decl_by_fqname;
@@ -1886,10 +1818,7 @@ impl ProjectContext {
         py: Python<'_>,
         method_name: &str,
     ) -> PyResult<Vec<Py<SymbolNode>>> {
-        let outputs = self.outputs.borrow();
-        let outputs = outputs
-            .as_ref()
-            .ok_or_else(|| not_materialized("find_classes_defining_method"))?;
+        let outputs = self.materialized("find_classes_defining_method")?;
         let global_index = &outputs.global_index;
         let project_files: &[File] = &outputs.project_files;
         let db_handle: Box<dyn ProjectDb> = ProjectDb::dyn_clone(&self.db);
@@ -1951,10 +1880,7 @@ impl ProjectContext {
         if class_node.kind != "class" {
             return Ok(Vec::new());
         }
-        let outputs = self.outputs.borrow();
-        let outputs = outputs
-            .as_ref()
-            .ok_or_else(|| not_materialized("find_subclasses_of"))?;
+        let outputs = self.materialized("find_subclasses_of")?;
 
         let Some((seed_file, seed_range)) = locate_class_def(
             &self.db,
@@ -1965,7 +1891,7 @@ impl ProjectContext {
             return Ok(Vec::new());
         };
         let out_idx =
-            find_subclass_indices_via_refs(&self.db, outputs, seed_file, seed_range, true);
+            find_subclass_indices_via_refs(&self.db, &outputs, seed_file, seed_range, true);
         Ok(out_idx
             .into_iter()
             .map(|idx| outputs.builder.nodes[idx].clone_ref(py))
@@ -2067,16 +1993,13 @@ impl ProjectContext {
         base_fqn: &str,
         transitive: bool,
     ) -> PyResult<Vec<Py<SymbolNode>>> {
-        let outputs = self.outputs.borrow();
-        let outputs = outputs
-            .as_ref()
-            .ok_or_else(|| not_materialized("find_subclasses"))?;
-        let Some((seed_file, seed_range)) = locate_class_seed(&self.db, outputs, py, base_fqn)
+        let outputs = self.materialized("find_subclasses")?;
+        let Some((seed_file, seed_range)) = locate_class_seed(&self.db, &outputs, py, base_fqn)
         else {
             return Ok(Vec::new());
         };
         let out_idx =
-            find_subclass_indices_via_refs(&self.db, outputs, seed_file, seed_range, transitive);
+            find_subclass_indices_via_refs(&self.db, &outputs, seed_file, seed_range, transitive);
         Ok(out_idx
             .into_iter()
             .map(|idx| outputs.builder.nodes[idx].clone_ref(py))
@@ -2096,10 +2019,7 @@ impl ProjectContext {
         pattern: &str,
     ) -> PyResult<Vec<(Py<SymbolNode>, String)>> {
         let regex = self.compile_regex(pattern)?;
-        let outputs = self.outputs.borrow();
-        let outputs = outputs
-            .as_ref()
-            .ok_or_else(|| not_materialized("find_comment_patterns"))?;
+        let outputs = self.materialized("find_comment_patterns")?;
         let mut out = Vec::new();
         for &file in &outputs.project_files {
             let parsed = parsed_module(&self.db, file).load(&self.db);
@@ -2138,8 +2058,7 @@ impl ProjectContext {
 
     /// Live nodes in the in-progress graph. Cheap, no copy.
     pub(crate) fn nodes(&self, py: Python<'_>) -> PyResult<Vec<Py<SymbolNode>>> {
-        let outputs = self.outputs.borrow();
-        let outputs = outputs.as_ref().ok_or_else(|| not_materialized("nodes"))?;
+        let outputs = self.materialized("nodes")?;
         Ok(outputs
             .builder
             .nodes
@@ -2150,9 +2069,7 @@ impl ProjectContext {
 
     /// Live edges as `(src_idx, dst_idx, flags)` triples.
     pub(crate) fn edges(&self) -> PyResult<Vec<(usize, usize, u32)>> {
-        let outputs = self.outputs.borrow();
-        let outputs = outputs.as_ref().ok_or_else(|| not_materialized("edges"))?;
-        Ok(outputs.builder.edges.clone())
+        Ok(self.materialized("edges")?.builder.edges.clone())
     }
 }
 

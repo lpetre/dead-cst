@@ -10,7 +10,6 @@ use pyo3::PyClass;
 use ruff_db::files::File;
 use ty_project::Db as ProjectDb;
 
-use crate::builder::not_materialized;
 use crate::graph::SymbolNode;
 use crate::helpers::{
     args_to_py_vec, call_args_match_kwargs, file_path_string, kwarg_matcher_from_py,
@@ -274,6 +273,54 @@ pub(crate) fn _to_iter(py: Python<'_>, items: Vec<Py<impl PyClass>>) -> PyResult
     Ok(iter_obj.unbind())
 }
 
+/// Generate the `first` / `count` / `__iter__` boilerplate that every
+/// chainable query exposes. Each variant is what the query's `.collect()`
+/// supports — see the three call sites below.
+///
+/// `with_first $Q, $R`: query whose `collect()` returns `Vec<Py<$R>>`
+/// and that wants a typed `.first() -> Option<Py<$R>>` shortcut.
+///
+/// `no_first $Q`: query that wants only `.count()` + `.__iter__()`
+/// (typically returns plain `Py<SymbolNode>`).
+///
+/// `iter_only $Q`: query with a custom `.count()` (cheaper than
+/// materializing `.collect()`); just gets `.__iter__()`.
+macro_rules! impl_query_methods {
+    (with_first $q:ty, $r:ty) => {
+        #[pymethods]
+        impl $q {
+            fn first(&self, py: Python<'_>) -> PyResult<Option<Py<$r>>> {
+                Ok(self.collect(py)?.into_iter().next())
+            }
+            fn count(&self, py: Python<'_>) -> PyResult<usize> {
+                Ok(self.collect(py)?.len())
+            }
+            fn __iter__(&self, py: Python<'_>) -> PyResult<PyObject> {
+                _to_iter(py, self.collect(py)?)
+            }
+        }
+    };
+    (no_first $q:ty) => {
+        #[pymethods]
+        impl $q {
+            fn count(&self, py: Python<'_>) -> PyResult<usize> {
+                Ok(self.collect(py)?.len())
+            }
+            fn __iter__(&self, py: Python<'_>) -> PyResult<PyObject> {
+                _to_iter(py, self.collect(py)?)
+            }
+        }
+    };
+    (iter_only $q:ty) => {
+        #[pymethods]
+        impl $q {
+            fn __iter__(&self, py: Python<'_>) -> PyResult<PyObject> {
+                _to_iter(py, self.collect(py)?)
+            }
+        }
+    };
+}
+
 /// Find decorated top-level functions / classes. Pick exactly one of:
 /// * ``where_module(m).where_name(n)`` — ``@m.x`` / ``@x`` where ``x``
 ///   is imported from ``m``.
@@ -382,10 +429,7 @@ impl DecoratorQuery {
         // Cache a snapshot of the build's node pool for arg materialization.
         // Keep the borrow alive for the duration of the loop so we don't
         // reborrow on every iteration.
-        let outputs_borrow = ctx.outputs.borrow();
-        let outputs = outputs_borrow
-            .as_ref()
-            .ok_or_else(|| not_materialized("DecoratorQuery.collect"))?;
+        let outputs = ctx.materialized("DecoratorQuery.collect")?;
         let nodes: &[Py<SymbolNode>] = &outputs.builder.nodes;
         let kwarg_matchers = &self.kwarg_matchers;
         if let Some(owner_attrs) = &self.owner_attrs {
@@ -492,17 +536,9 @@ impl DecoratorQuery {
         }
         Ok(refs)
     }
-
-    fn first(&self, py: Python<'_>) -> PyResult<Option<Py<DecoratorRef>>> {
-        Ok(self.collect(py)?.into_iter().next())
-    }
-    fn count(&self, py: Python<'_>) -> PyResult<usize> {
-        Ok(self.collect(py)?.len())
-    }
-    fn __iter__(&self, py: Python<'_>) -> PyResult<PyObject> {
-        _to_iter(py, self.collect(py)?)
-    }
 }
+
+impl_query_methods!(with_first DecoratorQuery, DecoratorRef);
 
 /// Find module-scope ``<var> = <Ctor>(...)`` sites. Pick exactly one
 /// of ``where_module + where_name`` or
@@ -563,10 +599,7 @@ impl ConstructionQuery {
         let ctx = self.ctx.borrow(py);
         let path_regex = self.path_regex.as_deref();
         let mut refs: Vec<Py<ConstructionRef>> = Vec::new();
-        let outputs_borrow = ctx.outputs.borrow();
-        let outputs = outputs_borrow
-            .as_ref()
-            .ok_or_else(|| not_materialized("ConstructionQuery.collect"))?;
+        let outputs = ctx.materialized("ConstructionQuery.collect")?;
         let nodes: &[Py<SymbolNode>] = &outputs.builder.nodes;
         if let Some(fqn) = &self.class_fqn {
             let pairs = ctx.find_constructions(py, fqn, self.include_subclasses, path_regex)?;
@@ -607,17 +640,9 @@ impl ConstructionQuery {
         }
         Ok(refs)
     }
-
-    fn first(&self, py: Python<'_>) -> PyResult<Option<Py<ConstructionRef>>> {
-        Ok(self.collect(py)?.into_iter().next())
-    }
-    fn count(&self, py: Python<'_>) -> PyResult<usize> {
-        Ok(self.collect(py)?.len())
-    }
-    fn __iter__(&self, py: Python<'_>) -> PyResult<PyObject> {
-        _to_iter(py, self.collect(py)?)
-    }
 }
+
+impl_query_methods!(with_first ConstructionQuery, ConstructionRef);
 
 /// Find call sites whose positional string-literal at the configured
 /// index is captured. :meth:`string_arg_at` is required. Pick one of:
@@ -732,10 +757,7 @@ impl CallQuery {
                  where_owner(...) + where_attr(...); or where_attr(...)",
             ));
         };
-        let outputs_borrow = ctx.outputs.borrow();
-        let outputs = outputs_borrow
-            .as_ref()
-            .ok_or_else(|| not_materialized("CallQuery.collect"))?;
+        let outputs = ctx.materialized("CallQuery.collect")?;
         let nodes: &[Py<SymbolNode>] = &outputs.builder.nodes;
         let kwarg_matchers = &self.kwarg_matchers;
         let mut refs: Vec<Py<CallRef>> = Vec::new();
@@ -757,17 +779,9 @@ impl CallQuery {
         }
         Ok(refs)
     }
-
-    fn first(&self, py: Python<'_>) -> PyResult<Option<Py<CallRef>>> {
-        Ok(self.collect(py)?.into_iter().next())
-    }
-    fn count(&self, py: Python<'_>) -> PyResult<usize> {
-        Ok(self.collect(py)?.len())
-    }
-    fn __iter__(&self, py: Python<'_>) -> PyResult<PyObject> {
-        _to_iter(py, self.collect(py)?)
-    }
 }
+
+impl_query_methods!(with_first CallQuery, CallRef);
 
 // ---------------------------------------------------------------------------
 // Subclass / Import / Class / Factory queries
@@ -826,13 +840,9 @@ impl SubclassQuery {
             ))
         }
     }
-    fn count(&self, py: Python<'_>) -> PyResult<usize> {
-        Ok(self.collect(py)?.len())
-    }
-    fn __iter__(&self, py: Python<'_>) -> PyResult<PyObject> {
-        _to_iter(py, self.collect(py)?)
-    }
 }
+
+impl_query_methods!(no_first SubclassQuery);
 
 /// Enumerate the ``kind="import"`` nodes that bind a name from a
 /// given module. Requires ``of(module)``.
@@ -846,6 +856,12 @@ impl ImportQuery {
     fn new(ctx: Py<ProjectContext>) -> Self {
         Self { ctx, module: None }
     }
+
+    fn module_or_err(&self) -> PyResult<&str> {
+        self.module
+            .as_deref()
+            .ok_or_else(|| PyValueError::new_err("ImportQuery requires .of(module)"))
+    }
 }
 
 #[pymethods]
@@ -855,39 +871,25 @@ impl ImportQuery {
         slf
     }
     fn collect(&self, py: Python<'_>) -> PyResult<Vec<Py<SymbolNode>>> {
-        let ctx = self.ctx.borrow(py);
-        let module = self
-            .module
-            .as_deref()
-            .ok_or_else(|| PyValueError::new_err("ImportQuery requires .of(module)"))?;
-        ctx.find_imports_of(py, module)
+        self.ctx
+            .borrow(py)
+            .find_imports_of(py, self.module_or_err()?)
     }
     /// O(1) presence probe — does any project file import the
     /// configured module? Short-circuits on the first match without
     /// materialising a Python list. Preferred over ``.count() > 0`` /
     /// ``.collect()`` for plugin guards that just need a boolean.
     fn exists(&self, py: Python<'_>) -> PyResult<bool> {
-        let ctx = self.ctx.borrow(py);
-        let module = self
-            .module
-            .as_deref()
-            .ok_or_else(|| PyValueError::new_err("ImportQuery requires .of(module)"))?;
-        ctx.has_imports_of(module)
+        self.ctx.borrow(py).has_imports_of(self.module_or_err()?)
     }
+    /// Count without allocating `Py<SymbolNode>` clones — read the
+    /// length of the pre-built index entry directly.
     fn count(&self, py: Python<'_>) -> PyResult<usize> {
-        let ctx = self.ctx.borrow(py);
-        let module = self
-            .module
-            .as_deref()
-            .ok_or_else(|| PyValueError::new_err("ImportQuery requires .of(module)"))?;
-        // Count without allocating Py<SymbolNode> clones — read the
-        // length of the pre-built index entry directly.
-        Ok(ctx.imports_of_count(module))
-    }
-    fn __iter__(&self, py: Python<'_>) -> PyResult<PyObject> {
-        _to_iter(py, self.collect(py)?)
+        Ok(self.ctx.borrow(py).imports_of_count(self.module_or_err()?))
     }
 }
+
+impl_query_methods!(iter_only ImportQuery);
 
 /// Enumerate classes by structural property. Today the only filter
 /// is ``defining_method(name)`` (matches classes whose body has a
@@ -921,13 +923,9 @@ impl ClassQuery {
             .ok_or_else(|| PyValueError::new_err("ClassQuery requires .defining_method(name)"))?;
         ctx.find_classes_defining_method(py, name)
     }
-    fn count(&self, py: Python<'_>) -> PyResult<usize> {
-        Ok(self.collect(py)?.len())
-    }
-    fn __iter__(&self, py: Python<'_>) -> PyResult<PyObject> {
-        _to_iter(py, self.collect(py)?)
-    }
 }
+
+impl_query_methods!(no_first ClassQuery);
 
 /// One result row from :class:`FactoryQuery`. ``decl`` is the
 /// owning top-level function or class; ``kinds`` is the sorted set
@@ -996,10 +994,149 @@ impl FactoryQuery {
             .map(|(decl, kinds)| Py::new(py, FactoryRef { decl, kinds }))
             .collect()
     }
-    fn count(&self, py: Python<'_>) -> PyResult<usize> {
-        Ok(self.collect(py)?.len())
+}
+
+impl_query_methods!(no_first FactoryQuery);
+
+#[cfg(test)]
+mod tests {
+    //! Pure-rust tests for the identifier-prefilter helpers used by
+    //! every per-file query loop. The chainable query types themselves
+    //! depend on `Python<'_>` / `Py<ProjectContext>` and are covered
+    //! end-to-end by the python suite.
+    use super::*;
+
+    // -- _is_ident_continue -----------------------------------------------
+
+    #[test]
+    fn is_ident_continue_recognizes_word_bytes() {
+        for byte in b'a'..=b'z' {
+            assert!(_is_ident_continue(byte), "{byte} should be ident continue");
+        }
+        for byte in b'A'..=b'Z' {
+            assert!(_is_ident_continue(byte));
+        }
+        for byte in b'0'..=b'9' {
+            assert!(_is_ident_continue(byte));
+        }
+        assert!(_is_ident_continue(b'_'));
     }
-    fn __iter__(&self, py: Python<'_>) -> PyResult<PyObject> {
-        _to_iter(py, self.collect(py)?)
+
+    #[test]
+    fn is_ident_continue_rejects_punctuation_and_whitespace() {
+        for byte in [b'.', b',', b' ', b'\t', b'\n', b'(', b')', b'-', b'#', b':'] {
+            assert!(!_is_ident_continue(byte));
+        }
+    }
+
+    // -- _contains_identifier ---------------------------------------------
+
+    #[test]
+    fn contains_identifier_finds_isolated_match() {
+        assert!(_contains_identifier("foo", "foo"));
+        assert!(_contains_identifier("call(foo)", "foo"));
+        assert!(_contains_identifier(" foo ", "foo"));
+        assert!(_contains_identifier("foo.bar", "foo"));
+        assert!(_contains_identifier("a.foo", "foo"));
+    }
+
+    #[test]
+    fn contains_identifier_rejects_substring_inside_other_word() {
+        assert!(!_contains_identifier("foobar", "foo"));
+        assert!(!_contains_identifier("xfoo", "foo"));
+        assert!(!_contains_identifier("foo_bar", "foo"));
+        assert!(!_contains_identifier("foo1", "foo"));
+        // Underscore prefix is also an identifier continuation.
+        assert!(!_contains_identifier("_foo", "foo"));
+        // Digit prefix
+        assert!(!_contains_identifier("1foo", "foo"));
+    }
+
+    #[test]
+    fn contains_identifier_handles_match_at_boundaries() {
+        assert!(_contains_identifier("foo()", "foo"));
+        assert!(_contains_identifier("(foo)", "foo"));
+        assert!(_contains_identifier("foo+bar", "foo"));
+    }
+
+    #[test]
+    fn contains_identifier_empty_needle_returns_false() {
+        // Empty needle would otherwise match everywhere — explicitly handled.
+        assert!(!_contains_identifier("anything", ""));
+        assert!(!_contains_identifier("", ""));
+    }
+
+    #[test]
+    fn contains_identifier_empty_source_returns_false() {
+        assert!(!_contains_identifier("", "foo"));
+    }
+
+    #[test]
+    fn contains_identifier_multiple_occurrences_one_valid() {
+        // The first ("xfoo") is invalid; the second (" foo") matches.
+        assert!(_contains_identifier("xfoo foo", "foo"));
+        // Both fail.
+        assert!(!_contains_identifier("xfooy zfoow", "foo"));
+    }
+
+    #[test]
+    fn contains_identifier_handles_overlapping_advance() {
+        // Even when the first start position fails the boundary check,
+        // the scan must advance and try subsequent occurrences.
+        assert!(_contains_identifier("aaa a", "a"));
+    }
+
+    #[test]
+    fn contains_identifier_unicode_source_does_not_panic() {
+        // The function uses byte indexing for the boundary check. ASCII
+        // identifier continuations are all single-byte, and the
+        // multi-byte UTF-8 leading/continuation bytes all have the high
+        // bit set (>= 0x80), so they fail `_is_ident_continue` and the
+        // boundary holds — which makes `foo` adjacent to emoji a hit,
+        // even though Python would treat the unicode chars as
+        // identifier-continuation. The prefilter is approximate by
+        // design (`ty_ide::references::contains_identifier` has the
+        // same shape) — we exercise the byte path here to lock in the
+        // documented behavior.
+        assert!(_contains_identifier("héllo foo", "foo"));
+        assert!(_contains_identifier("foo🙂bar", "foo"));
+        // No needle present.
+        assert!(!_contains_identifier("héllo", "foo"));
+        // ASCII boundary still wins over surrounding unicode.
+        assert!(_contains_identifier(" foo ", "foo"));
+    }
+
+    #[test]
+    fn contains_identifier_multi_char_needle() {
+        assert!(_contains_identifier("def my_func(): pass", "my_func"));
+        assert!(!_contains_identifier("def my_function(): pass", "my_func"));
+        assert!(!_contains_identifier("my_funcx", "my_func"));
+    }
+
+    // -- _contains_any_identifier -----------------------------------------
+
+    #[test]
+    fn contains_any_identifier_returns_true_on_first_hit() {
+        assert!(_contains_any_identifier("call(foo)", &["bar", "foo"]));
+        assert!(_contains_any_identifier("foo()", &["foo"]));
+    }
+
+    #[test]
+    fn contains_any_identifier_empty_list_returns_false() {
+        assert!(!_contains_any_identifier("anything", &[]));
+        assert!(!_contains_any_identifier("", &[]));
+    }
+
+    #[test]
+    fn contains_any_identifier_returns_false_when_no_match() {
+        assert!(!_contains_any_identifier("this has none", &["foo", "bar"]));
+    }
+
+    #[test]
+    fn contains_any_identifier_respects_boundaries() {
+        // Same substring-inside-word rule as _contains_identifier.
+        assert!(!_contains_any_identifier("foobar", &["foo", "bar"]));
+        // But the standalone "foo" still hits if present.
+        assert!(_contains_any_identifier("foobar foo", &["foo"]));
     }
 }
