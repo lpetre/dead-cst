@@ -10,7 +10,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use ruff_db::files::File;
 
-use crate::graph::SymbolNode;
+use crate::graph::{intern_kind, SymbolNode};
 use crate::helpers::NODE_FLAG_ENTRYPOINT;
 use crate::project::ProjectContext;
 
@@ -106,18 +106,7 @@ impl GraphBuilder {
         }
         let idx = self.intern_node(
             py,
-            SymbolNode {
-                fqname: fqname.clone(),
-                kind: "synthetic",
-                path: String::new(),
-                start_line: 0,
-                start_column: 0,
-                end_line: 0,
-                end_column: 0,
-                flags: 0,
-                imports: None,
-                cached_hash: OnceLock::new(),
-            },
+            synthetic_node(fqname.clone(), "synthetic", String::new(), 0),
         )?;
         self.synthetic_nodes.insert(fqname, idx);
         Ok(idx)
@@ -215,7 +204,7 @@ impl AddNode {
     ) -> PyResult<Self> {
         Ok(Self {
             fqname,
-            kind: static_kind_str(kind)?,
+            kind: intern_kind(kind)?,
             path,
             flags,
             edges_from,
@@ -285,6 +274,30 @@ pub(crate) fn bfs(
     visited
 }
 
+/// Construct a position-less `SymbolNode` (start/end zeroed, `imports`
+/// absent) for ops minted at plugin-apply time. The four
+/// caller-supplied fields are the only ones that vary across the
+/// synthetic / entrypoint / `AddNode` shapes.
+pub(crate) fn synthetic_node(
+    fqname: String,
+    kind: &'static str,
+    path: String,
+    flags: u32,
+) -> SymbolNode {
+    SymbolNode {
+        fqname,
+        kind,
+        path,
+        start_line: 0,
+        start_column: 0,
+        end_line: 0,
+        end_column: 0,
+        flags,
+        imports: None,
+        cached_hash: OnceLock::new(),
+    }
+}
+
 pub(crate) fn apply_graph_op(
     ctx: &Py<ProjectContext>,
     py: Python<'_>,
@@ -310,18 +323,7 @@ pub(crate) fn apply_graph_op(
         drop(decl);
         let marker_idx = outputs.builder.intern_node(
             py,
-            SymbolNode {
-                fqname: marker_fqname,
-                kind: "synthetic",
-                path,
-                start_line: 0,
-                start_column: 0,
-                end_line: 0,
-                end_column: 0,
-                flags: NODE_FLAG_ENTRYPOINT,
-                imports: None,
-                cached_hash: OnceLock::new(),
-            },
+            synthetic_node(marker_fqname, "synthetic", path, NODE_FLAG_ENTRYPOINT),
         )?;
         outputs.builder.add_edge(marker_idx, decl_idx, 0);
         return Ok(());
@@ -329,18 +331,12 @@ pub(crate) fn apply_graph_op(
     if let Ok(add_node) = op.extract::<PyRef<AddNode>>() {
         let node_idx = outputs.builder.intern_node(
             py,
-            SymbolNode {
-                fqname: add_node.fqname.clone(),
-                kind: add_node.kind,
-                path: add_node.path.clone(),
-                start_line: 0,
-                start_column: 0,
-                end_line: 0,
-                end_column: 0,
-                flags: add_node.flags,
-                imports: None,
-                cached_hash: OnceLock::new(),
-            },
+            synthetic_node(
+                add_node.fqname.clone(),
+                add_node.kind,
+                add_node.path.clone(),
+                add_node.flags,
+            ),
         )?;
         for src in &add_node.edges_from {
             let src_idx = lookup_idx(&outputs.builder, &src.borrow(py), "edges_from")?;
@@ -374,22 +370,272 @@ pub(crate) fn lookup_idx(builder: &GraphBuilder, node: &SymbolNode, side: &str) 
         })
 }
 
-/// Map a plugin-supplied `kind` string to one of the stable `&'static
-/// str` kinds SymbolNode carries.
-pub(crate) fn static_kind_str(kind: &str) -> PyResult<&'static str> {
-    Ok(match kind {
-        "synthetic" => "synthetic",
-        "module" => "module",
-        "import" => "import",
-        "function" => "function",
-        "class" => "class",
-        "variable" => "variable",
-        "type_alias" => "type_alias",
-        other => {
-            return Err(PyValueError::new_err(format!(
-                "unknown node kind {other:?} — expected one of synthetic, module, import, \
-                 function, class, variable, type_alias"
-            )))
+#[cfg(test)]
+mod tests {
+    //! Pure-rust tests for the graph-building primitives.
+    //!
+    //! The interning surface mints `Py<SymbolNode>` and so requires
+    //! pyo3-init / a GIL; those paths are exercised by the python suite
+    //! end-to-end. Here we cover the data-only pieces:
+    //!
+    //! * `NodeKey` equality / hashing (flags excluded from identity).
+    //! * `node_key_of` projection.
+    //! * `synthetic_node` field defaults.
+    //! * `bfs` traversal — direction switch + `skip_flags` filtering.
+    use super::*;
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    /// Build a bare `SymbolNode` for projection tests. Avoids pyo3
+    /// because the helper doesn't need to be reachable from Python.
+    fn raw_symbol(
+        fqname: &str,
+        kind: &'static str,
+        path: &str,
+        start_line: usize,
+        flags: u32,
+    ) -> SymbolNode {
+        SymbolNode {
+            fqname: fqname.to_string(),
+            kind,
+            path: path.to_string(),
+            start_line,
+            start_column: 0,
+            end_line: start_line,
+            end_column: 0,
+            flags,
+            imports: None,
+            cached_hash: OnceLock::new(),
         }
-    })
+    }
+
+    fn hash_of(key: &NodeKey) -> u64 {
+        let mut h = DefaultHasher::new();
+        key.hash(&mut h);
+        h.finish()
+    }
+
+    // -- node_key_of / NodeKey -------------------------------------------
+
+    #[test]
+    fn node_key_of_projects_identity_fields() {
+        let n = raw_symbol("pkg.mod.f", "function", "pkg/mod.py", 12, 0);
+        let key = node_key_of(&n);
+        assert_eq!(key.fqname, "pkg.mod.f");
+        assert_eq!(key.kind, "function");
+        assert_eq!(key.path, "pkg/mod.py");
+        assert_eq!(key.start_line, 12);
+        assert_eq!(key.end_line, 12);
+    }
+
+    #[test]
+    fn node_key_excludes_flags_from_identity() {
+        // Principle 3 from CLAUDE.md: two nodes for the same
+        // (fqname, kind, path, position) are the same node regardless
+        // of which path computed their flags.
+        let a = node_key_of(&raw_symbol("m.f", "function", "m.py", 1, 0));
+        let b = node_key_of(&raw_symbol("m.f", "function", "m.py", 1, 7));
+        assert!(a == b);
+        assert_eq!(hash_of(&a), hash_of(&b));
+    }
+
+    #[test]
+    fn node_key_distinguishes_by_position() {
+        // Two `def f` at different lines must be distinct nodes
+        // (shadowing semantics).
+        let a = node_key_of(&raw_symbol("m.f", "function", "m.py", 1, 0));
+        let b = node_key_of(&raw_symbol("m.f", "function", "m.py", 9, 0));
+        assert!(a != b);
+    }
+
+    #[test]
+    fn node_key_distinguishes_by_kind() {
+        let a = node_key_of(&raw_symbol("m.X", "class", "m.py", 1, 0));
+        let b = node_key_of(&raw_symbol("m.X", "variable", "m.py", 1, 0));
+        assert!(a != b);
+    }
+
+    #[test]
+    fn node_key_distinguishes_by_path() {
+        let a = node_key_of(&raw_symbol("X", "class", "a/m.py", 1, 0));
+        let b = node_key_of(&raw_symbol("X", "class", "b/m.py", 1, 0));
+        assert!(a != b);
+    }
+
+    // -- synthetic_node ---------------------------------------------------
+
+    #[test]
+    fn synthetic_node_zeroes_positions_and_omits_imports() {
+        let n = synthetic_node(
+            "pkg".to_string(),
+            "synthetic",
+            "p.py".to_string(),
+            NODE_FLAG_ENTRYPOINT,
+        );
+        assert_eq!(n.fqname, "pkg");
+        assert_eq!(n.kind, "synthetic");
+        assert_eq!(n.path, "p.py");
+        assert_eq!(n.start_line, 0);
+        assert_eq!(n.start_column, 0);
+        assert_eq!(n.end_line, 0);
+        assert_eq!(n.end_column, 0);
+        assert_eq!(n.flags, NODE_FLAG_ENTRYPOINT);
+        assert!(n.imports.is_none());
+    }
+
+    #[test]
+    fn synthetic_node_accepts_arbitrary_kind() {
+        // The signature takes a `&'static str` so callers pass already-interned values.
+        let n = synthetic_node(String::from("m"), "module", String::new(), 0);
+        assert_eq!(n.kind, "module");
+        assert!(n.path.is_empty());
+    }
+
+    // -- GraphBuilder construction (no pyo3) -----------------------------
+
+    #[test]
+    fn graph_builder_new_starts_empty() {
+        let b = GraphBuilder::new();
+        assert!(b.nodes.is_empty());
+        assert!(b.node_index.is_empty());
+        assert!(b.edges.is_empty());
+        assert!(b.edge_set.is_empty());
+        assert!(b.forward_adj.is_empty());
+        assert!(b.reverse_adj.is_empty());
+        assert!(b.synthetic_nodes.is_empty());
+        assert!(b.peer_pyi_to_py.is_empty());
+    }
+
+    // -- bfs --------------------------------------------------------------
+
+    /// Build a `GraphBuilder` with `n` allocated adjacency slots so we
+    /// can push edges by hand for `bfs` tests.
+    fn empty_builder_with_n_slots(n: usize) -> GraphBuilder {
+        let mut b = GraphBuilder::new();
+        for _ in 0..n {
+            b.forward_adj.push(Vec::new());
+            b.reverse_adj.push(Vec::new());
+        }
+        b
+    }
+
+    /// Append a forward+reverse adjacency entry. The plain `Vec::push`
+    /// path is enough because `bfs` only reads `forward_adj` /
+    /// `reverse_adj` — it never inspects `edges` / `edge_set` / `nodes`.
+    fn add_edge_manual(b: &mut GraphBuilder, src: usize, dst: usize, flags: u32) {
+        b.forward_adj[src].push((dst, flags));
+        b.reverse_adj[dst].push((src, flags));
+    }
+
+    #[test]
+    fn bfs_forward_walks_descendants_from_single_seed() {
+        // 0 -> 1 -> 2 ;  0 -> 3
+        let mut b = empty_builder_with_n_slots(4);
+        add_edge_manual(&mut b, 0, 1, 0);
+        add_edge_manual(&mut b, 1, 2, 0);
+        add_edge_manual(&mut b, 0, 3, 0);
+        let reachable = bfs(&b, [0], Direction::Forward, 0);
+        let expected: HashSet<usize> = [0, 1, 2, 3].into_iter().collect();
+        assert_eq!(reachable, expected);
+    }
+
+    #[test]
+    fn bfs_reverse_walks_ancestors() {
+        let mut b = empty_builder_with_n_slots(4);
+        add_edge_manual(&mut b, 0, 1, 0);
+        add_edge_manual(&mut b, 1, 2, 0);
+        add_edge_manual(&mut b, 3, 2, 0);
+        let ancestors = bfs(&b, [2], Direction::Reverse, 0);
+        let expected: HashSet<usize> = [0, 1, 2, 3].into_iter().collect();
+        assert_eq!(ancestors, expected);
+    }
+
+    #[test]
+    fn bfs_skip_flags_filters_edges_by_any_intersecting_bit() {
+        // Dead-branch edge gates 0 -> 1.
+        let mut b = empty_builder_with_n_slots(3);
+        add_edge_manual(&mut b, 0, 1, 1 /* DEAD_BRANCH */);
+        add_edge_manual(&mut b, 0, 2, 0);
+        // With skip_flags = 1, the 0 -> 1 edge is filtered out.
+        let reachable = bfs(&b, [0], Direction::Forward, 1);
+        let expected: HashSet<usize> = [0, 2].into_iter().collect();
+        assert_eq!(reachable, expected);
+
+        // skip_flags = 0 keeps every edge.
+        let reachable_all = bfs(&b, [0], Direction::Forward, 0);
+        let expected_all: HashSet<usize> = [0, 1, 2].into_iter().collect();
+        assert_eq!(reachable_all, expected_all);
+    }
+
+    #[test]
+    fn bfs_skip_flags_intersects_any_bit() {
+        // flags = 0b11; skipping any of the bits should drop the edge.
+        let mut b = empty_builder_with_n_slots(2);
+        add_edge_manual(&mut b, 0, 1, 0b11);
+        for mask in [0b01, 0b10, 0b11, 0b100 | 0b01] {
+            let r = bfs(&b, [0], Direction::Forward, mask);
+            assert_eq!(
+                r,
+                [0].into_iter().collect::<HashSet<_>>(),
+                "skip_flags=0b{mask:b} should drop the edge"
+            );
+        }
+        // mask=0b100 doesn't intersect — edge survives.
+        let r = bfs(&b, [0], Direction::Forward, 0b100);
+        assert_eq!(r, [0, 1].into_iter().collect::<HashSet<_>>());
+    }
+
+    #[test]
+    fn bfs_handles_cycles_without_looping() {
+        let mut b = empty_builder_with_n_slots(3);
+        add_edge_manual(&mut b, 0, 1, 0);
+        add_edge_manual(&mut b, 1, 2, 0);
+        add_edge_manual(&mut b, 2, 0, 0);
+        let reachable = bfs(&b, [0], Direction::Forward, 0);
+        let expected: HashSet<usize> = [0, 1, 2].into_iter().collect();
+        assert_eq!(reachable, expected);
+    }
+
+    #[test]
+    fn bfs_empty_seeds_returns_empty_set() {
+        let b = empty_builder_with_n_slots(5);
+        let reachable = bfs(&b, std::iter::empty::<usize>(), Direction::Forward, 0);
+        assert!(reachable.is_empty());
+    }
+
+    #[test]
+    fn bfs_isolated_seed_returns_just_itself() {
+        let b = empty_builder_with_n_slots(3);
+        let r = bfs(&b, [2], Direction::Forward, 0);
+        assert_eq!(r, [2].into_iter().collect::<HashSet<_>>());
+    }
+
+    #[test]
+    fn bfs_multiple_seeds_unions_reachable() {
+        let mut b = empty_builder_with_n_slots(5);
+        add_edge_manual(&mut b, 0, 1, 0);
+        add_edge_manual(&mut b, 2, 3, 0);
+        let r = bfs(&b, [0, 2], Direction::Forward, 0);
+        let expected: HashSet<usize> = [0, 1, 2, 3].into_iter().collect();
+        assert_eq!(r, expected);
+    }
+
+    #[test]
+    fn bfs_includes_seed_node_in_result() {
+        let b = empty_builder_with_n_slots(1);
+        let r = bfs(&b, [0], Direction::Forward, 0);
+        assert!(r.contains(&0));
+        assert_eq!(r.len(), 1);
+    }
+
+    #[test]
+    fn bfs_reverse_skip_flags_also_filters() {
+        // Sanity check: skip_flags applies to reverse BFS too.
+        let mut b = empty_builder_with_n_slots(3);
+        add_edge_manual(&mut b, 0, 2, 1);
+        add_edge_manual(&mut b, 1, 2, 0);
+        let r = bfs(&b, [2], Direction::Reverse, 1);
+        let expected: HashSet<usize> = [1, 2].into_iter().collect();
+        assert_eq!(r, expected);
+    }
 }

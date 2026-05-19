@@ -480,6 +480,13 @@ pub(crate) fn emit_import_edges(
     let mut submodule_alias_by_stmt: HashMap<TextRange, usize> = HashMap::new();
     let mut sibling_aliases_by_stmt: HashMap<TextRange, Vec<usize>> = HashMap::new();
 
+    // The "is this target idx a module node?" check below used to
+    // rebuild this set on every iteration. Hoist it; the resolve_*
+    // calls below can add new module nodes, so refresh only when
+    // module_nodes actually grew.
+    let mut module_idx_set: HashSet<usize> = module_nodes.values().copied().collect();
+    let mut module_nodes_len = module_nodes.len();
+
     for (_def_id, state, _used) in use_def_map.all_definitions_with_usage() {
         let DefinitionState::Defined(def) = state else {
             continue;
@@ -569,7 +576,10 @@ pub(crate) fn emit_import_edges(
             DefinitionKind::StarImport(_) => Vec::new(),
             _ => continue,
         };
-        let module_idx_set: HashSet<usize> = module_nodes.values().copied().collect();
+        if module_nodes.len() != module_nodes_len {
+            module_idx_set.extend(module_nodes.values().copied());
+            module_nodes_len = module_nodes.len();
+        }
         let all_targets_are_modules =
             !targets.is_empty() && targets.iter().all(|idx| module_idx_set.contains(idx));
         for target_idx in &targets {
@@ -645,6 +655,23 @@ pub(crate) enum ImportTarget {
     /// files in ``site-packages``.
     ExternalFile(String),
     Unresolved(String),
+}
+
+impl ImportTarget {
+    /// Synthetic node fqname for the non-first-party variants, or
+    /// `None` for `Stdlib` / `FirstParty`. Single source of truth for
+    /// the ``[external dist] X`` / ``[external file] X`` /
+    /// ``[unresolved] X`` synthetic prefixes — both mint
+    /// (``target_to_node``) and lookup (``emit_upstream``) go through
+    /// this so the format strings can't drift apart.
+    pub(crate) fn synthetic_fqname(&self) -> Option<String> {
+        match self {
+            ImportTarget::Stdlib | ImportTarget::FirstParty(_) => None,
+            ImportTarget::ExternalDist(name) => Some(format!("[external dist] {name}")),
+            ImportTarget::ExternalFile(name) => Some(format!("[external file] {name}")),
+            ImportTarget::Unresolved(name) => Some(format!("[unresolved] {name}")),
+        }
+    }
 }
 
 /// ``abs_file_path -> PEP 503-canonical dist name``. Populated once
@@ -841,15 +868,12 @@ pub(crate) fn target_to_node(
         ImportTarget::FirstParty(file) => {
             Ok(Some(mint_module_node(py, db, file, builder, module_nodes)?))
         }
-        ImportTarget::ExternalDist(name) => Ok(Some(
-            builder.intern_synthetic(py, format!("[external dist] {name}"))?,
-        )),
-        ImportTarget::ExternalFile(name) => Ok(Some(
-            builder.intern_synthetic(py, format!("[external file] {name}"))?,
-        )),
-        ImportTarget::Unresolved(top) => Ok(Some(
-            builder.intern_synthetic(py, format!("[unresolved] {top}"))?,
-        )),
+        ref t @ (ImportTarget::ExternalDist(_)
+        | ImportTarget::ExternalFile(_)
+        | ImportTarget::Unresolved(_)) => {
+            let fqname = t.synthetic_fqname().expect("non-stdlib non-first-party");
+            Ok(Some(builder.intern_synthetic(py, fqname)?))
+        }
     }
 }
 
@@ -1122,6 +1146,20 @@ pub(crate) fn emit_reference_edges(
     // this phase and isn't mutated here, so swap-out / swap-in is safe.
     let synthetic_nodes = std::mem::take(&mut builder.synthetic_nodes);
 
+    let inputs = RefCollectorInputs {
+        model: &model,
+        file,
+        parsed: &parsed,
+        index,
+        global_index,
+        module_nodes,
+        alias_imports,
+        live_decls,
+        synthetic_nodes: &synthetic_nodes,
+        dist_lookup,
+        dead_ranges: &dead_ranges,
+    };
+
     // (a) Definitions that own an expression / body — attribute their
     //     contained Names to the owning decl.
     for (_def_id, state, _used) in use_def_map.all_definitions_with_usage() {
@@ -1138,20 +1176,7 @@ pub(crate) fn emit_reference_edges(
             continue;
         };
 
-        let mut coll = RefCollector::new(
-            owner_idx,
-            &model,
-            file,
-            &parsed,
-            index,
-            global_index,
-            module_nodes,
-            alias_imports,
-            live_decls,
-            &synthetic_nodes,
-            dist_lookup,
-            &dead_ranges,
-        );
+        let mut coll = RefCollector::new(inputs, owner_idx);
         walk_owned(kind, &parsed, &mut coll);
         coll.flush(builder);
     }
@@ -1162,20 +1187,7 @@ pub(crate) fn emit_reference_edges(
         if stmt_creates_top_level_definition(stmt) {
             continue;
         }
-        let mut coll = RefCollector::new(
-            module_idx,
-            &model,
-            file,
-            &parsed,
-            index,
-            global_index,
-            module_nodes,
-            alias_imports,
-            live_decls,
-            &synthetic_nodes,
-            dist_lookup,
-            &dead_ranges,
-        );
+        let mut coll = RefCollector::new(inputs, module_idx);
         coll.visit_stmt(stmt);
         coll.flush(builder);
     }
@@ -1543,35 +1555,39 @@ pub(crate) struct RefCollector<'a, 'db> {
     current_flags: u32,
 }
 
+/// All read-only inputs `RefCollector::new` needs apart from the owner.
+/// Built once per file in `emit_reference_edges` and reused for every
+/// owner walked in that file. Cheap to `Copy` — it's a bag of borrows.
+#[derive(Clone, Copy)]
+pub(crate) struct RefCollectorInputs<'a, 'db> {
+    pub(crate) model: &'a SemanticModel<'db>,
+    pub(crate) file: File,
+    pub(crate) parsed: &'a ParsedModuleRef,
+    pub(crate) index: &'a SemanticIndex<'db>,
+    pub(crate) global_index: &'a DeclIndex,
+    pub(crate) module_nodes: &'a HashMap<File, usize>,
+    pub(crate) alias_imports: &'a HashMap<usize, ImportSpec>,
+    pub(crate) live_decls: &'a LiveDeclIndex,
+    pub(crate) synthetic_nodes: &'a HashMap<String, usize>,
+    pub(crate) dist_lookup: &'a DistLookup,
+    pub(crate) dead_ranges: &'a [TextRange],
+}
+
 impl<'a, 'db> RefCollector<'a, 'db> {
-    #[allow(clippy::too_many_arguments)]
-    fn new(
-        owner: usize,
-        model: &'a SemanticModel<'db>,
-        file: File,
-        parsed: &'a ParsedModuleRef,
-        index: &'a SemanticIndex<'db>,
-        global_index: &'a DeclIndex,
-        module_nodes: &'a HashMap<File, usize>,
-        alias_imports: &'a HashMap<usize, ImportSpec>,
-        live_decls: &'a LiveDeclIndex,
-        synthetic_nodes: &'a HashMap<String, usize>,
-        dist_lookup: &'a DistLookup,
-        dead_ranges: &'a [TextRange],
-    ) -> Self {
+    fn new(inputs: RefCollectorInputs<'a, 'db>, owner: usize) -> Self {
         Self {
             owner,
-            model: SemModel::Borrowed(model),
-            file,
-            parsed,
-            index,
-            global_index,
-            module_nodes,
-            alias_imports,
-            live_decls,
-            synthetic_nodes,
-            dist_lookup,
-            dead_ranges,
+            model: SemModel::Borrowed(inputs.model),
+            file: inputs.file,
+            parsed: inputs.parsed,
+            index: inputs.index,
+            global_index: inputs.global_index,
+            module_nodes: inputs.module_nodes,
+            alias_imports: inputs.alias_imports,
+            live_decls: inputs.live_decls,
+            synthetic_nodes: inputs.synthetic_nodes,
+            dist_lookup: inputs.dist_lookup,
+            dead_ranges: inputs.dead_ranges,
             edges: HashMap::new(),
             nested_context: false,
             current_flags: 0,
@@ -1930,21 +1946,13 @@ impl<'a, 'db> RefCollector<'a, 'db> {
         let start_file = match target {
             ImportTarget::Stdlib => return,
             ImportTarget::FirstParty(f) => f,
-            ImportTarget::ExternalDist(name) => {
-                if let Some(&idx) = self.synthetic_nodes.get(&format!("[external dist] {name}")) {
-                    self.emit_edge(idx);
-                }
-                return;
-            }
-            ImportTarget::ExternalFile(name) => {
-                if let Some(&idx) = self.synthetic_nodes.get(&format!("[external file] {name}")) {
-                    self.emit_edge(idx);
-                }
-                return;
-            }
-            ImportTarget::Unresolved(top) => {
-                if let Some(&idx) = self.synthetic_nodes.get(&format!("[unresolved] {top}")) {
-                    self.emit_edge(idx);
+            t @ (ImportTarget::ExternalDist(_)
+            | ImportTarget::ExternalFile(_)
+            | ImportTarget::Unresolved(_)) => {
+                if let Some(fqname) = t.synthetic_fqname() {
+                    if let Some(&idx) = self.synthetic_nodes.get(&fqname) {
+                        self.emit_edge(idx);
+                    }
                 }
                 return;
             }
