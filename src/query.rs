@@ -941,8 +941,27 @@ impl ImportQuery {
             .ok_or_else(|| PyValueError::new_err("ImportQuery requires .of(module)"))?;
         ctx.find_imports_of(py, module)
     }
+    /// O(1) presence probe — does any project file import the
+    /// configured module? Short-circuits on the first match without
+    /// materialising a Python list. Preferred over ``.count() > 0`` /
+    /// ``.collect()`` for plugin guards that just need a boolean.
+    fn exists(&self, py: Python<'_>) -> PyResult<bool> {
+        let ctx = self.ctx.borrow(py);
+        let module = self
+            .module
+            .as_deref()
+            .ok_or_else(|| PyValueError::new_err("ImportQuery requires .of(module)"))?;
+        ctx.has_imports_of(module)
+    }
     fn count(&self, py: Python<'_>) -> PyResult<usize> {
-        Ok(self.collect(py)?.len())
+        let ctx = self.ctx.borrow(py);
+        let module = self
+            .module
+            .as_deref()
+            .ok_or_else(|| PyValueError::new_err("ImportQuery requires .of(module)"))?;
+        // Count without allocating Py<SymbolNode> clones — read the
+        // length of the pre-built index entry directly.
+        Ok(ctx.imports_of_count(module))
     }
     fn __iter__(&self, py: Python<'_>) -> PyResult<PyObject> {
         _to_iter(py, self.collect(py)?)

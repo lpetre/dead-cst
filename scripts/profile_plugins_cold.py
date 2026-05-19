@@ -145,8 +145,23 @@ def _file_count(target_root: Path) -> int:
 
 
 def _plugin_label(plugin: object) -> str:
-    """Human-readable label for one builtin plugin instance."""
-    return type(plugin).__qualname__
+    """Human-readable label for one builtin plugin instance.
+
+    Class name alone is ambiguous for the shared
+    :class:`DispatchAppPlugin` / :class:`DecoratedDeclPlugin` shapes —
+    multiple frameworks reuse the same class with different field
+    values. Suffix with the most identifying field so the report
+    distinguishes ``DispatchAppPlugin(fastapi.FastAPI)`` from
+    ``DispatchAppPlugin(flask.Flask)`` etc.
+    """
+    base = type(plugin).__qualname__
+    app_classes = getattr(plugin, "app_classes", None)
+    if app_classes:
+        return f"{base}({app_classes[0]})"
+    decorator_module = getattr(plugin, "decorator_module", None)
+    if decorator_module:
+        return f"{base}({decorator_module})"
+    return base
 
 
 def _rust_capable_plugins(filter_names: set[str] | None) -> list[tuple[str, object]]:

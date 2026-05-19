@@ -40,13 +40,20 @@ class DiscordPyPlugin(Plugin):
     """Wire discord.py bots, Cogs, and extension hooks into reachability."""
 
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
+        # Cheap presence probe — O(1) hashmap lookup per module name
+        # against the pre-built ``imports_by_module`` index. Short-
+        # circuits before paying for the per-file path scan below.
+        if not any(
+            native.query(ctx).imports().of(m).exists()
+            for m in ("discord", "discord.ext", "discord.ext.commands")
+        ):
+            return
+
         # Per-file gate: only fire on files that import discord.
         discord_paths: set[str] = set()
         for module in ("discord", "discord.ext", "discord.ext.commands"):
             for imp in native.query(ctx).imports().of(module).collect():
                 discord_paths.add(imp.path)
-        if not discord_paths:
-            return
 
         # 1. Bot / Client constructions.
         bot_constructions: list[native.ConstructionRef] = []
