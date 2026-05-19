@@ -328,6 +328,24 @@ import pytest
         ),
         pytest.param(
             """
+            class T: pass
+            X: T
+            def use():
+                print(X)
+            use()
+            """,
+            {
+                "mod.T -> mod",
+                "mod.X -> mod",
+                "mod.use -> mod",
+                "mod.X -> mod.T",
+                "mod.use -> mod.X",
+                "mod -> mod.use",
+            },
+            id="annotation-only-decl-read-from-nested-function",
+        ),
+        pytest.param(
+            """
             a, b = 1, 2
             c, d = a, b
             """,
