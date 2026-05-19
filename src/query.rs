@@ -184,6 +184,25 @@ impl QueryBuilder {
     fn main_blocks(&self, py: Python<'_>) -> PyResult<Vec<MainBlock>> {
         self.ctx.borrow(py).find_main_blocks(py)
     }
+    /// Match nodes against pre-classified path / fqname specs without
+    /// crossing the FFI boundary per node.
+    /// Mirrors :meth:`ProjectContext.find_nodes_matching_specs`.
+    fn nodes_matching_specs(
+        &self,
+        py: Python<'_>,
+        project_root: &str,
+        regexes: Vec<String>,
+        str_specs: Vec<String>,
+        abs_paths: Vec<String>,
+    ) -> PyResult<Vec<Py<NativeNode>>> {
+        self.ctx.borrow(py).find_nodes_matching_specs(
+            py,
+            project_root,
+            regexes,
+            str_specs,
+            abs_paths,
+        )
+    }
     /// Comments matching ``pattern`` paired with the next
     /// declaration. Mirrors :meth:`ProjectContext.find_comment_patterns`.
     #[allow(clippy::type_complexity)]

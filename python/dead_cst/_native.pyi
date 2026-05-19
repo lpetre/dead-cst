@@ -796,6 +796,26 @@ class QueryBuilder:
         """
         ...
 
+    def nodes_matching_specs(
+        self,
+        project_root: str,
+        regexes: list[str],
+        str_specs: list[str],
+        abs_paths: list[str],
+    ) -> list[NativeNode]:
+        """Match nodes against pre-classified path / fqname specs.
+
+        Avoids the per-node FFI hop + ``pathlib.Path`` allocation that
+        a ``for node in ctx.nodes(): ...`` loop pays. ``regexes`` are
+        anchored at the start of input (``re.Pattern.match`` semantics).
+        ``str_specs`` match exactly against the relative path OR the
+        node's fqname. ``abs_paths`` match exactly against the
+        absolute path.
+
+        Mirrors :meth:`ProjectContext.find_nodes_matching_specs`.
+        """
+        ...
+
     def comment_patterns(self, pattern: str) -> list[tuple[NativeNode, str]]:
         """Comments matching ``pattern`` paired with the next
         declaration.

@@ -34,26 +34,24 @@ class ExplicitEntrypointPlugin:
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
         from dead_cst import _native as native
 
-        root = Path(ctx.project_root)
-        for node in ctx.nodes():
-            if not self._matches(node, root):
-                continue
-            yield native.AddEntrypoint(node, marker="<entrypoint>")
-
-    def _matches(self, node: native.NativeNode, root: Path) -> bool:
-        path = Path(node.path)
-        try:
-            rel = str(path.relative_to(root))
-        except ValueError:
-            rel = node.path
+        if not self.specs:
+            return
+        # Push the per-node match loop into rust: bucket specs by type
+        # once on the Python side and hand the buckets across the FFI
+        # boundary in one call. Avoids the previous
+        # ``for node in ctx.nodes(): Path(node.path).relative_to(root)``
+        # pattern which paid ~25-50 µs per node.
+        regexes: list[str] = []
+        str_specs: list[str] = []
+        abs_paths: list[str] = []
         for spec in self.specs:
             if isinstance(spec, re.Pattern):
-                if spec.match(rel):
-                    return True
+                regexes.append(spec.pattern)
             elif isinstance(spec, Path):
-                if spec == path:
-                    return True
+                abs_paths.append(str(spec))
             elif isinstance(spec, str):
-                if spec == rel or spec == node.fqname:
-                    return True
-        return False
+                str_specs.append(spec)
+        for node in native.query(ctx).nodes_matching_specs(
+            ctx.project_root, regexes, str_specs, abs_paths
+        ):
+            yield native.AddEntrypoint(node, marker="<entrypoint>")
