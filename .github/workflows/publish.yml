@@ -41,7 +41,10 @@ jobs:
       - name: Stamp dev version
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         shell: bash
-        run: sed -i.bak 's/^version = .*/version = "0.10.0.dev${{ github.run_number }}"/' Cargo.toml && rm Cargo.toml.bak
+        run: |
+          base=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)
+          sed -i.bak "s/^version = .*/version = \"${base}-dev${{ github.run_number }}\"/" Cargo.toml
+          rm Cargo.toml.bak
       - uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.platform.target }}
@@ -66,7 +69,10 @@ jobs:
           cache-dependency-glob: "**/uv.lock"
       - name: Stamp dev version
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        run: sed -i.bak 's/^version = .*/version = "0.10.0.dev${{ github.run_number }}"/' Cargo.toml && rm Cargo.toml.bak
+        run: |
+          base=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)
+          sed -i.bak "s/^version = .*/version = \"${base}-dev${{ github.run_number }}\"/" Cargo.toml
+          rm Cargo.toml.bak
       - uses: PyO3/maturin-action@v1
         with:
           command: sdist
