@@ -29,15 +29,18 @@ from __future__ import annotations
 
 import argparse
 import logging
-import shutil
 import statistics
-import subprocess
 import sys
-import tempfile
 import time
-from dataclasses import dataclass, field
-from pathlib import Path
 
+from _bench_common import (
+    TargetConfig,
+    add_common_target_args,
+    file_count,
+    gather_flux0_targets,
+    require_native,
+    stage_dead_cst,
+)
 from dead_cst.plugins import BUILTIN_PLUGINS
 
 # Silence the visitor's WARNING-level breadcrumbs (e.g.
@@ -45,98 +48,8 @@ from dead_cst.plugins import BUILTIN_PLUGINS
 # runs, pure noise when we want a clean timing table.
 logging.getLogger("dead_cst").setLevel(logging.ERROR)
 
-try:
-    from dead_cst import _native as native
-except ImportError as exc:
-    sys.exit(
-        f"ERROR: dead_cst._native not importable ({exc}). "
-        "Build with: uv run maturin develop --release "
-        "--manifest-path Cargo.toml"
-    )
-
-FLUX0_URL = "https://github.com/flux0-ai/flux0.git"
-FLUX0_SHA = "8d04176642b091ddb5c5020486f353d4e824460b"
-
-
-# ---------------------------------------------------------------------------
-# Target staging
-# ---------------------------------------------------------------------------
-
-
-def _stage_dead_cst() -> Path:
-    """Copy ``dead_cst/`` into a fresh tempdir as a clean project root.
-
-    Mirrors ``profile_backends.py``: a flat copy of the package gives
-    the analyzer a project root that contains exactly one package.
-    """
-    stage = Path(tempfile.mkdtemp(prefix="dead-cst-plugin-bench-"))
-    src = Path(__file__).resolve().parent.parent / "dead_cst"
-    shutil.copytree(src, stage / "dead_cst", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
-    return stage
-
-
-def _clone_flux0(cache_root: Path) -> Path:
-    """Shallow-clone flux0 at the pinned SHA. Same protocol as
-    ``profile_backends.py``."""
-    if shutil.which("git") is None:
-        raise RuntimeError("git not on PATH")
-    dest = cache_root / "flux0"
-    marker = dest / ".sha"
-    if marker.is_file() and marker.read_text().strip() == FLUX0_SHA:
-        return dest
-    if dest.exists():
-        shutil.rmtree(dest)
-    dest.mkdir(parents=True)
-
-    def _git(*args: str) -> None:
-        subprocess.run(["git", *args], cwd=dest, check=True, capture_output=True)
-
-    _git("init", "-q")
-    _git("remote", "add", "origin", FLUX0_URL)
-    _git("fetch", "--depth=1", "-q", "--filter=blob:none", "origin", FLUX0_SHA)
-    _git("checkout", "-q", FLUX0_SHA)
-    marker.write_text(FLUX0_SHA + "\n")
-    return dest
-
-
-def _ensure_flux0_venv(flux0_root: Path) -> Path:
-    """Run ``uv sync --all-packages`` so :class:`UvResolver` and ty's
-    workspace module resolver find a ``.venv``. Idempotent."""
-    venv = flux0_root / ".venv"
-    if venv.is_dir():
-        return venv
-    if shutil.which("uv") is None:
-        raise RuntimeError("uv not on PATH; cannot create flux0 workspace venv")
-    print(f"  (one-time setup: uv sync --all-packages in {flux0_root})")
-    subprocess.run(["uv", "sync", "--all-packages"], cwd=flux0_root, check=True)
-    return venv
-
-
-# ---------------------------------------------------------------------------
-# Targets
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class TargetConfig:
-    """Cold-rust target. ``project_kwargs`` are forwarded to
-    ``native.ProjectContext`` — typically ``python_env`` for workspace
-    targets so ty's module resolver picks up third-party packages from
-    the workspace's own ``.venv``."""
-
-    name: str
-    root: Path
-    project_kwargs: dict[str, object] = field(default_factory=dict)
-
-
-def _file_count(target_root: Path) -> int:
-    import os
-
-    count = 0
-    for dirpath, dirnames, filenames in os.walk(target_root, followlinks=True):
-        dirnames[:] = [d for d in dirnames if d not in ("__pycache__", ".venv")]
-        count += sum(1 for f in filenames if f.endswith(".py"))
-    return count
+require_native()
+from dead_cst import _native as native  # noqa: E402  (require_native gates this)
 
 
 # ---------------------------------------------------------------------------
@@ -239,7 +152,7 @@ def _fmt_delta(seconds: float) -> str:
 
 
 def _run_target(target: TargetConfig, plugins: list[tuple[str, object]], repeats: int) -> None:
-    files = _file_count(target.root)
+    files = file_count(target.root)
     print(f"\n=== {target.name} === ({files} files)")
     print(f"  path: {target.root}")
 
@@ -278,9 +191,6 @@ def _run_target(target: TargetConfig, plugins: list[tuple[str, object]], repeats
 # ---------------------------------------------------------------------------
 
 
-TARGET_NAMES = ("dead_cst", "flux0_server", "flux0_cli", "flux0_workspace")
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -292,29 +202,12 @@ def main() -> None:
         help="Steady-state iterations per (target, plugin) combo (default 3). "
         "One extra warm-up iteration is always run and reported separately.",
     )
-    parser.add_argument(
-        "--targets",
-        nargs="+",
-        default=["dead_cst", "flux0_server"],
-        choices=TARGET_NAMES,
-        help="Which targets to profile (default: dead_cst flux0_server)",
-    )
+    add_common_target_args(parser, default_targets=["dead_cst", "flux0_server"])
     parser.add_argument(
         "--plugins",
         nargs="+",
         default=None,
         help="Restrict to a subset of plugins by name (default: all rust-capable builtins)",
-    )
-    parser.add_argument(
-        "--no-flux0",
-        action="store_true",
-        help="Skip flux0 targets even if requested (offline / no git)",
-    )
-    parser.add_argument(
-        "--cache-root",
-        type=Path,
-        default=Path.home() / ".cache" / "dead-cst-bench",
-        help="Where to cache the flux0 clone (default ~/.cache/dead-cst-bench)",
     )
     args = parser.parse_args()
 
@@ -330,41 +223,9 @@ def main() -> None:
 
     targets: list[TargetConfig] = []
     if "dead_cst" in args.targets:
-        targets.append(TargetConfig(name="dead_cst (self)", root=_stage_dead_cst()))
-
-    flux0_requested = [t for t in args.targets if t.startswith("flux0_")]
-    if flux0_requested and not args.no_flux0:
-        args.cache_root.mkdir(parents=True, exist_ok=True)
-        try:
-            flux0_root = _clone_flux0(args.cache_root)
-        except (RuntimeError, subprocess.CalledProcessError) as exc:
-            print(f"\nflux0 SKIP: {exc}")
-            flux0_root = None
-        if flux0_root is not None:
-            if "flux0_server" in flux0_requested:
-                targets.append(
-                    TargetConfig(
-                        name="flux0 server",
-                        root=flux0_root / "packages" / "server" / "src",
-                    )
-                )
-            if "flux0_cli" in flux0_requested:
-                targets.append(
-                    TargetConfig(name="flux0 cli", root=flux0_root / "packages" / "cli" / "src")
-                )
-            if "flux0_workspace" in flux0_requested:
-                try:
-                    venv = _ensure_flux0_venv(flux0_root)
-                except (RuntimeError, subprocess.CalledProcessError) as exc:
-                    print(f"\nflux0_workspace SKIP: {exc}")
-                else:
-                    targets.append(
-                        TargetConfig(
-                            name="flux0 workspace (uv)",
-                            root=flux0_root,
-                            project_kwargs={"python_env": str(venv)},
-                        )
-                    )
+        targets.append(TargetConfig(name="dead_cst (self)", root=stage_dead_cst()))
+    if not args.no_flux0:
+        targets.extend(gather_flux0_targets(args.targets, args.cache_root))
 
     if not targets:
         sys.exit("no targets to profile")

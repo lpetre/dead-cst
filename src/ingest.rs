@@ -15,7 +15,7 @@
 //! `emit_visitor_warning`) round out the dynamic-import lane.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use pyo3::prelude::*;
@@ -640,8 +640,19 @@ pub(crate) fn pep503_canonicalize(name: &str) -> String {
     out
 }
 
+/// Site-packages roots ty's resolver is configured with, canonicalised
+/// upfront so the worker thread that runs ``build_dist_lookup`` doesn't
+/// need to borrow ``db`` (Salsa's ``ProjectDatabase`` is !Sync).
+pub(crate) fn site_packages_roots(db: &dyn ty_python_semantic::Db) -> Vec<PathBuf> {
+    search_paths(db, ModuleResolveMode::StubsAllowed)
+        .filter(|sp| sp.is_site_packages())
+        .filter_map(|sp| sp.as_system_path().map(|p| p.as_str()))
+        .map(|s| std::fs::canonicalize(s).unwrap_or_else(|_| PathBuf::from(s)))
+        .collect()
+}
+
 /// Build the dist-file lookup by walking ``*.dist-info/`` under every
-/// site-packages search path ty's resolver is configured with.
+/// site-packages search path.
 ///
 /// For each dist-info directory:
 ///
@@ -658,57 +669,55 @@ pub(crate) fn pep503_canonicalize(name: &str) -> String {
 /// Failures (missing METADATA, malformed RECORD, unreadable site-
 /// packages) are silently skipped — the file just won't appear in
 /// the lookup and the caller falls through to ``[external file]``.
-pub(crate) fn build_dist_lookup(db: &dyn ty_python_semantic::Db) -> DistLookup {
-    let mut out: DistLookup = HashMap::new();
-    for sp in search_paths(db, ModuleResolveMode::StubsAllowed) {
-        if !sp.is_site_packages() {
-            continue;
-        }
-        let Some(system_path) = sp.as_system_path() else {
-            continue;
-        };
-        let sp_root = std::fs::canonicalize(system_path.as_str())
-            .unwrap_or_else(|_| PathBuf::from(system_path.as_str()));
-        let Ok(entries) = std::fs::read_dir(&sp_root) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let dist_info = entry.path();
-            if dist_info.extension().is_none_or(|e| e != "dist-info") {
-                continue;
-            }
-            // METADATA — find the ``Name:`` header.
-            let Ok(metadata) = std::fs::read_to_string(dist_info.join("METADATA")) else {
-                continue;
-            };
-            let mut canonical = None;
-            for line in metadata.lines() {
-                if line.is_empty() {
-                    break;
-                }
-                if let Some(value) = line.strip_prefix("Name:") {
-                    canonical = Some(pep503_canonicalize(value.trim()));
-                    break;
-                }
-            }
-            let Some(canonical) = canonical else {
-                continue;
-            };
-            // RECORD — index every owned file's absolute path.
-            let Ok(record) = std::fs::read_to_string(dist_info.join("RECORD")) else {
-                continue;
-            };
-            for line in record.lines() {
-                let Some((rel, _)) = line.split_once(',') else {
-                    continue;
-                };
+///
+/// Per-dist work is dispatched across a rayon pool: a typical venv
+/// has dozens of dists and the per-RECORD ``canonicalize`` syscalls
+/// (~2.5k in dead-cst's own dev venv) dominate everything else.
+pub(crate) fn build_dist_lookup(site_packages: &[PathBuf]) -> DistLookup {
+    use rayon::prelude::*;
+
+    site_packages
+        .iter()
+        .flat_map(|sp_root| {
+            std::fs::read_dir(sp_root)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|e| e == "dist-info"))
+                .map(move |dist_info| (dist_info, sp_root.as_path()))
+        })
+        .collect::<Vec<_>>()
+        .par_iter()
+        .filter_map(|(dist_info, sp_root)| process_dist_info(dist_info, sp_root))
+        .flatten()
+        .collect()
+}
+
+/// One ``*.dist-info/`` directory's ``(absolute file path, canonical
+/// dist name)`` pairs. ``None`` when METADATA / RECORD are missing or
+/// the ``Name:`` header isn't found.
+fn process_dist_info(dist_info: &Path, sp_root: &Path) -> Option<Vec<(PathBuf, String)>> {
+    let metadata = std::fs::read_to_string(dist_info.join("METADATA")).ok()?;
+    let canonical = metadata
+        .lines()
+        .take_while(|l| !l.is_empty())
+        .find_map(|line| {
+            line.strip_prefix("Name:")
+                .map(|v| pep503_canonicalize(v.trim()))
+        })?;
+    let record = std::fs::read_to_string(dist_info.join("RECORD")).ok()?;
+    Some(
+        record
+            .lines()
+            .filter_map(|line| {
+                let (rel, _) = line.split_once(',')?;
                 let joined = sp_root.join(rel);
                 let abs = std::fs::canonicalize(&joined).unwrap_or(joined);
-                out.insert(abs, canonical.clone());
-            }
-        }
-    }
-    out
+                Some((abs, canonical.clone()))
+            })
+            .collect(),
+    )
 }
 
 /// Classify a dotted module name relative to the file that imports it.

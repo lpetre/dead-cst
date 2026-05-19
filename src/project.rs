@@ -246,88 +246,100 @@ pub(crate) fn build_project_graph(
         }
     }
     let t_enum = t0.elapsed();
-    let t1 = std::time::Instant::now();
-    // Two-pass ingest so the per-decl ``.pyi`` stub flagging in
-    // ``ingest_decls`` has the .py twin's ``globals_by_name`` entries
-    // to probe. Pass 1 = everything that isn't a .pyi; pass 2 = .pyi.
-    // The split doesn't change the graph for non-peer files; it's
-    // ordering for the peer-stub flag-check only.
+    // Phase 1 (per-file decl ingest) doesn't read ``dist_lookup``, so
+    // it overlaps with the site-packages walk on a worker thread.
+    // ``ProjectDatabase`` is !Sync (Salsa's per-thread query stack),
+    // so we pre-extract just the search paths the walk needs.
+    let site_packages = crate::ingest::site_packages_roots(db);
+
     let progress = ProgressBars::new(show_progress, project_files.len() as u64);
-    for file in &project_files {
-        if file_path_string(db, *file).ends_with(".pyi") {
-            continue;
+    let t1 = std::time::Instant::now();
+    let (dist_lookup, t_phase1, t_dist_lookup) = std::thread::scope(|s| -> PyResult<_> {
+        let sp_ref = &site_packages;
+        let lookup_handle = s.spawn(move || {
+            let t = std::time::Instant::now();
+            (build_dist_lookup(sp_ref), t.elapsed())
+        });
+
+        // Two-pass ingest so the per-decl ``.pyi`` stub flagging in
+        // ``ingest_decls`` has the .py twin's ``globals_by_name`` entries
+        // to probe. Pass 1 = everything that isn't a .pyi; pass 2 = .pyi.
+        // The split doesn't change the graph for non-peer files; it's
+        // ordering for the peer-stub flag-check only.
+        for file in &project_files {
+            if file_path_string(db, *file).ends_with(".pyi") {
+                continue;
+            }
+            ingest_decls(
+                py,
+                db,
+                *file,
+                &mut builder,
+                &mut global_index,
+                &mut module_nodes,
+                &mut alias_imports,
+                &mut live_decls,
+                &mut globals_by_name,
+                &mut star_reexports,
+                &mut class_by_selection,
+                &mut decl_by_name_range,
+            )?;
+            progress.ingest.inc(1);
         }
-        ingest_decls(
-            py,
-            db,
-            *file,
-            &mut builder,
-            &mut global_index,
-            &mut module_nodes,
-            &mut alias_imports,
-            &mut live_decls,
-            &mut globals_by_name,
-            &mut star_reexports,
-            &mut class_by_selection,
-            &mut decl_by_name_range,
-        )?;
-        progress.ingest.inc(1);
-    }
-    for file in &project_files {
-        if !file_path_string(db, *file).ends_with(".pyi") {
-            continue;
+        for file in &project_files {
+            if !file_path_string(db, *file).ends_with(".pyi") {
+                continue;
+            }
+            ingest_decls(
+                py,
+                db,
+                *file,
+                &mut builder,
+                &mut global_index,
+                &mut module_nodes,
+                &mut alias_imports,
+                &mut live_decls,
+                &mut globals_by_name,
+                &mut star_reexports,
+                &mut class_by_selection,
+                &mut decl_by_name_range,
+            )?;
+            progress.ingest.inc(1);
         }
-        ingest_decls(
-            py,
-            db,
-            *file,
-            &mut builder,
-            &mut global_index,
-            &mut module_nodes,
-            &mut alias_imports,
-            &mut live_decls,
-            &mut globals_by_name,
-            &mut star_reexports,
-            &mut class_by_selection,
-            &mut decl_by_name_range,
-        )?;
-        progress.ingest.inc(1);
-    }
-    progress.ingest.finish_and_clear();
-    // Per-decl ``pyi_decl -> py_decl`` edges for each peer .pyi whose
-    // matching .py defines the same simple name. The edge documents
-    // the stub-runtime relationship in the graph: consumers that ty
-    // resolved through the stub get reachability into the runtime
-    // decl via ``alias -> pyi_decl -> py_decl`` rather than stopping
-    // at the stub. Stub-only decls (no matching .py decl) are
-    // separately kept alive by the per-decl ENTRYPOINT flag set in
-    // ``ingest_decls``.
-    let peer_stubs: Vec<(File, File)> = builder
-        .peer_pyi_to_py
-        .iter()
-        .map(|(&pyi, &py)| (pyi, py))
-        .collect();
-    for (pyi_file, py_twin) in peer_stubs {
-        let pyi_decls: Vec<(String, usize)> = globals_by_name
+        progress.ingest.finish_and_clear();
+        // Per-decl ``pyi_decl -> py_decl`` edges for each peer .pyi whose
+        // matching .py defines the same simple name. The edge documents
+        // the stub-runtime relationship in the graph: consumers that ty
+        // resolved through the stub get reachability into the runtime
+        // decl via ``alias -> pyi_decl -> py_decl`` rather than stopping
+        // at the stub. Stub-only decls (no matching .py decl) are
+        // separately kept alive by the per-decl ENTRYPOINT flag set in
+        // ``ingest_decls``.
+        let peer_stubs: Vec<(File, File)> = builder
+            .peer_pyi_to_py
             .iter()
-            .filter(|((file, _), _)| *file == pyi_file)
-            .flat_map(|((_, name), idxs)| idxs.iter().map(move |&idx| (name.clone(), idx)))
+            .map(|(&pyi, &py)| (pyi, py))
             .collect();
-        for (name, pyi_idx) in pyi_decls {
-            if let Some(py_idxs) = globals_by_name.get(&(py_twin, name)) {
-                for &py_idx in py_idxs {
-                    builder.add_edge(pyi_idx, py_idx, 0);
+        for (pyi_file, py_twin) in peer_stubs {
+            let pyi_decls: Vec<(String, usize)> = globals_by_name
+                .iter()
+                .filter(|((file, _), _)| *file == pyi_file)
+                .flat_map(|((_, name), idxs)| idxs.iter().map(move |&idx| (name.clone(), idx)))
+                .collect();
+            for (name, pyi_idx) in pyi_decls {
+                if let Some(py_idxs) = globals_by_name.get(&(py_twin, name)) {
+                    for &py_idx in py_idxs {
+                        builder.add_edge(pyi_idx, py_idx, 0);
+                    }
                 }
             }
         }
-    }
-    let t_phase1 = t1.elapsed();
-    // Walk every site-packages search path's ``*.dist-info/`` to build
-    // the file -> canonical-dist-name map. Cheap (one read_dir + a
-    // couple of read_to_string per installed dist), runs once per
-    // ``materialize`` call. Both Phase 2 (alias minting) and Phase 3
-    // (use-site emit_upstream) need the same map.
-    let dist_lookup = build_dist_lookup(db);
+        let t_phase1 = t1.elapsed();
+        // Block on the dist-info walker (no-op when Phase 1 finished
+        // last, which is the common case on medium-to-large projects).
+        let (lookup, t_dist) = lookup_handle.join().expect("dist_lookup thread panicked");
+        Ok((lookup, t_phase1, t_dist))
+    })?;
     let t2 = std::time::Instant::now();
     for file in &project_files {
         emit_module_hierarchy(db, *file, &module_nodes, &mut builder);
@@ -367,12 +379,13 @@ pub(crate) fn build_project_graph(
     let t_fqname = t4.elapsed();
     if timing {
         eprintln!(
-            "[dead-cst-timing] files={} nodes={} edges={} enum={:?} phase1={:?} phase2={:?} phase3={:?} fqname={:?} total={:?}",
+            "[dead-cst-timing] files={} nodes={} edges={} enum={:?} phase1={:?} dist_lookup={:?} phase2={:?} phase3={:?} fqname={:?} total={:?}",
             project_files.len(),
             builder.nodes.len(),
             builder.edges.len(),
             t_enum,
             t_phase1,
+            t_dist_lookup,
             t_phase2,
             t_phase3,
             t_fqname,
