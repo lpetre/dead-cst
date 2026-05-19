@@ -10,6 +10,15 @@ two versions.
 ## [Unreleased]
 
 ### Changed (breaking)
+- **Dropped the Python ``SymbolGraph`` adjacency facade.**
+  ``Analysis.materialize_all()`` and ``PackageView.graph()`` now return
+  the live :class:`native.ProjectContext` directly — no Python-side
+  dict-of-lists copy, no per-node ``_idx`` allocation. Callers iterate
+  ``ctx.nodes()`` / ``ctx.edges()`` and route adjacency walks through
+  ``ctx.reachable(...)`` / ``ctx.descendants(...)`` / ``ctx.ancestors(...)``.
+  ``codemod.remove_code`` and ``codemod.generate_patch`` now take an
+  iterable of dead ``SymbolNode``\ s instead of a graph; edges were
+  ignored anyway.
 - **Rust-native graph builder.** The libcst CST visitor pipeline, SQLite
   per-file cache, and networkx graph are all replaced by a pyo3 native
   extension built on ty's ``SemanticIndex``. Graph construction, import

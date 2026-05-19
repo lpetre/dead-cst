@@ -6,7 +6,6 @@ from functools import cached_property
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterable, Iterator, Mapping, Sequence
 
-from ._graphstore import SymbolGraph
 from .graph import KEEPALIVE_DEFAULT, EdgeFlags, SymbolNode
 from .resolvers import Package, PathResolver
 from .resolvers._core import _validate_packages
@@ -42,83 +41,19 @@ def _bfs_order(seeds: Iterable[Path], neighbors: Mapping[Path, Sequence[Path]]) 
 _NON_DECL_TYPES: frozenset[str] = frozenset({"module", "synthetic"})
 
 
-def _keepalive_seeds(graph: SymbolGraph, seed_flags: int) -> list[int]:
-    """Indices of every node whose flags intersect ``seed_flags``.
-
-    Each bit in ``seed_flags`` is a keepalive criterion -- a node
-    carrying any of them is a reachability seed. Pass
-    :data:`KEEPALIVE_DEFAULT` for the standard behaviour, or a narrower
-    mask to ask focused questions (e.g. ``NodeFlags.ENTRYPOINT`` alone
-    excludes tests / noqa pins / notebooks from the seed set).
-    """
-    return [graph.index(n) for n in graph.nodes if n.flags & seed_flags]
-
-
-def _find_reachable(
-    graph: SymbolGraph,
-    seeds: Iterable[int],
-    *,
-    prefix: Path | None = None,
-    skip_dead_branches: bool = False,
-) -> set[SymbolNode]:
-    visited_idx: set[int] = set()
-    stack: list[int] = list(seeds)
-    while stack:
-        i = stack.pop()
-        if i in visited_idx:
-            continue
-        visited_idx.add(i)
-        if skip_dead_branches:
-            for _, dst_i, payload in graph.out_edges(i):
-                if not (payload & EdgeFlags.DEAD_BRANCH):
-                    stack.append(dst_i)
-        else:
-            stack.extend(graph.successor_indices(i))
-    visited = {graph.node(i) for i in visited_idx}
+def _filter_under(nodes: Iterable[SymbolNode], prefix: Path | None) -> set[SymbolNode]:
     if prefix is None:
-        return visited
-    return {n for n in visited if _path_under(n.path, prefix)}
-
-
-def _find_kept_alive_by_dead_branches(
-    graph: SymbolGraph,
-    *,
-    seed_flags: int = KEEPALIVE_DEFAULT,
-    prefix: Path | None = None,
-) -> set[SymbolNode]:
-    seeds = _keepalive_seeds(graph, seed_flags)
-    return _find_reachable(graph, seeds, prefix=prefix) - _find_reachable(
-        graph, seeds, prefix=prefix, skip_dead_branches=True
-    )
-
-
-def _find_kept_alive_by_flags_only(
-    graph: SymbolGraph,
-    flags: int,
-    *,
-    seed_flags: int = KEEPALIVE_DEFAULT,
-    prefix: Path | None = None,
-) -> set[SymbolNode]:
-    """Diff between ``reachable(seed_flags)`` and
-    ``reachable(seed_flags & ~flags)`` -- the blast radius of dropping
-    every seed whose flags carry any bit in ``flags``."""
-    all_seeds = _keepalive_seeds(graph, seed_flags)
-    kept_seeds = _keepalive_seeds(graph, seed_flags & ~flags)
-    return _find_reachable(graph, all_seeds, prefix=prefix) - _find_reachable(
-        graph, kept_seeds, prefix=prefix
-    )
+        return set(nodes)
+    return {n for n in nodes if _path_under(n.path, prefix)}
 
 
 def _iter_dead(
-    graph: SymbolGraph,
+    ctx: "native.ProjectContext",
+    reachable: set[SymbolNode],
     *,
-    seed_flags: int = KEEPALIVE_DEFAULT,
     prefix: Path | None = None,
-    reachable: set[SymbolNode] | None = None,
 ) -> Iterator[SymbolNode]:
-    if reachable is None:
-        reachable = _find_reachable(graph, _keepalive_seeds(graph, seed_flags))
-    for n in graph.nodes:
+    for n in ctx.nodes():
         if prefix is not None and not _path_under(n.path, prefix):
             continue
         if n.kind in _NON_DECL_TYPES:
@@ -196,11 +131,10 @@ class Analysis:
         }
         self._plugins: tuple[Plugin, ...] = tuple(plugins)
         self._show_progress: bool = show_progress
-        self._full_graph: SymbolGraph | None = None
         # Held past ``materialize_all`` so the rust BFS queries
         # (:meth:`reachable`, :meth:`dead`, :meth:`descendants`,
-        # :meth:`ancestors`) can run against the live ``ProjectContext``
-        # without re-building the project graph.
+        # :meth:`ancestors`) and node/edge enumeration can run against
+        # the live context without re-building the project graph.
         self._ctx: "native.ProjectContext | None" = None
         self._reverse_closures: dict[Path, frozenset[Path]] = {}
 
@@ -235,7 +169,7 @@ class Analysis:
         for package in self.packages:
             yield PackageView(self, package)
 
-    def materialize_all(self) -> SymbolGraph:
+    def materialize_all(self) -> "native.ProjectContext":
         """Build the project-wide graph (memoized).
 
         Routes through the rust backend
@@ -243,28 +177,30 @@ class Analysis:
         ``SemanticIndex`` to assemble the graph in one pass. Each
         registered plugin's ``run(ctx)`` is invoked during this pass.
 
-        Stashes the underlying :class:`native.ProjectContext` on the
-        analysis so the bulk reachability queries can delegate to its
-        rust BFS instead of walking the Python adjacency list.
+        Returns the live :class:`native.ProjectContext`. Bulk
+        reachability queries on the analysis (:meth:`reachable`,
+        :meth:`dead`, :meth:`descendants`, :meth:`ancestors`) delegate
+        to its rust BFS; ``ctx.nodes()`` / ``ctx.edges()`` enumerate
+        the graph without copying into a Python adjacency list.
         """
-        if self._full_graph is not None:
-            return self._full_graph
+        if self._ctx is not None:
+            return self._ctx
         from ._backend import materialize_project
 
         # Pass each first-party package's path as a src_root so the
         # rust backend mounts files at the right module fqname
         # (``pkg_a/A/__init__.py`` -> ``A``, not ``pkg_a.A``).
         src_roots = tuple(p.path for p in self.packages)
-        self._ctx, self._full_graph = materialize_project(
+        self._ctx = materialize_project(
             self._project_root,
             self._plugins,
             src_roots=src_roots,
             show_progress=self._show_progress,
         )
-        return self._full_graph
+        return self._ctx
 
-    def materialize_closure(self, package: Path) -> SymbolGraph:
-        """Return the project-wide graph.
+    def materialize_closure(self, package: Path) -> "native.ProjectContext":
+        """Return the project-wide context.
 
         The rust backend builds the whole project at once via ty's
         Salsa db; there is no cheaper per-package closure path. Kept
@@ -281,44 +217,53 @@ class Analysis:
         tests, ``noqa``-pinned imports, and notebooks from the seed set.
 
         Delegates to :meth:`native.ProjectContext.reachable` — one FFI
-        hop instead of a Python-side BFS over the dict-of-lists.
+        hop, no Python-side adjacency walk.
         """
-        self.materialize_all()
-        assert self._ctx is not None
-        return set(self._ctx.reachable(seed_flags=seed_flags))
+        ctx = self.materialize_all()
+        return set(ctx.reachable(seed_flags=seed_flags))
 
     def dead(self, *, seed_flags: int = KEEPALIVE_DEFAULT) -> Iterator[SymbolNode]:
         """Yield every decl that no seed in ``seed_flags`` reaches."""
-        return _iter_dead(
-            self.materialize_all(),
-            seed_flags=seed_flags,
-            reachable=self.reachable(seed_flags=seed_flags),
-        )
+        ctx = self.materialize_all()
+        return _iter_dead(ctx, self.reachable(seed_flags=seed_flags))
 
     def descendants(self, root: SymbolNode, *, skip_flags: int = 0) -> list[SymbolNode]:
         """Forward closure from ``root`` (rust BFS, single FFI hop)."""
-        self.materialize_all()
-        assert self._ctx is not None
-        return list(self._ctx.descendants(root, skip_flags=skip_flags))
+        ctx = self.materialize_all()
+        return list(ctx.descendants(root, skip_flags=skip_flags))
 
     def ancestors(self, decl: SymbolNode, *, skip_flags: int = 0) -> list[SymbolNode]:
         """Reverse closure into ``decl`` (rust BFS, single FFI hop)."""
-        self.materialize_all()
-        assert self._ctx is not None
-        return list(self._ctx.ancestors(decl, skip_flags=skip_flags))
+        ctx = self.materialize_all()
+        return list(ctx.ancestors(decl, skip_flags=skip_flags))
 
     def kept_alive_by_dead_branches(
         self, *, seed_flags: int = KEEPALIVE_DEFAULT
     ) -> set[SymbolNode]:
-        return _find_kept_alive_by_dead_branches(self.materialize_all(), seed_flags=seed_flags)
+        """Decls reachable only via ``EdgeFlags.DEAD_BRANCH`` edges.
+
+        Diff of the default closure against the strict closure that
+        skips dead-branch edges — same BFS path both queries take in
+        rust.
+        """
+        ctx = self.materialize_all()
+        full = set(ctx.reachable(seed_flags=seed_flags))
+        strict = set(ctx.reachable(seed_flags=seed_flags, skip_flags=EdgeFlags.DEAD_BRANCH))
+        return full - strict
 
     def kept_alive_by_flags_only(
         self, flags: int, *, seed_flags: int = KEEPALIVE_DEFAULT
     ) -> set[SymbolNode]:
-        return _find_kept_alive_by_flags_only(self.materialize_all(), flags, seed_flags=seed_flags)
+        """Blast radius of dropping every seed whose flags carry any
+        bit in ``flags`` — the diff between ``reachable(seed_flags)``
+        and ``reachable(seed_flags & ~flags)``."""
+        ctx = self.materialize_all()
+        full = set(ctx.reachable(seed_flags=seed_flags))
+        without = set(ctx.reachable(seed_flags=seed_flags & ~flags))
+        return full - without
 
     def count_nodes(self, prefix: Path | None = None) -> dict[str, int]:
-        return _count_nodes(self.materialize_all().nodes, prefix)
+        return _count_nodes(self.materialize_all().nodes(), prefix)
 
 
 class PackageView:
@@ -346,7 +291,7 @@ class PackageView:
         return self._analysis.reverse_closure(self._package.path)
 
     def declarations(self, name: str | None = None) -> Iterator[SymbolNode]:
-        for n in self._analysis.materialize_all().nodes:
+        for n in self._analysis.materialize_all().nodes():
             if not _path_under(n.path, self._package.path):
                 continue
             if n.kind in ("module", "synthetic"):
@@ -355,49 +300,40 @@ class PackageView:
                 continue
             yield n
 
-    def graph(self) -> SymbolGraph:
+    def graph(self) -> "native.ProjectContext":
         return self._analysis.materialize_all()
 
     def reachable(self, *, seed_flags: int = KEEPALIVE_DEFAULT) -> set[SymbolNode]:
-        prefix = self._package.path
-        return {
-            n
-            for n in self._analysis.reachable(seed_flags=seed_flags)
-            if _path_under(n.path, prefix)
-        }
+        return _filter_under(self._analysis.reachable(seed_flags=seed_flags), self._package.path)
 
     def dead(self, *, seed_flags: int = KEEPALIVE_DEFAULT) -> Iterator[SymbolNode]:
         return _iter_dead(
             self._analysis.materialize_all(),
-            seed_flags=seed_flags,
+            self._analysis.reachable(seed_flags=seed_flags),
             prefix=self._package.path,
-            reachable=self._analysis.reachable(seed_flags=seed_flags),
         )
 
     def kept_alive_by_dead_branches(
         self, *, seed_flags: int = KEEPALIVE_DEFAULT
     ) -> set[SymbolNode]:
-        return _find_kept_alive_by_dead_branches(
-            self._analysis.materialize_all(),
-            seed_flags=seed_flags,
-            prefix=self._package.path,
+        return _filter_under(
+            self._analysis.kept_alive_by_dead_branches(seed_flags=seed_flags),
+            self._package.path,
         )
 
     def kept_alive_by_flags_only(
         self, flags: int, *, seed_flags: int = KEEPALIVE_DEFAULT
     ) -> set[SymbolNode]:
-        return _find_kept_alive_by_flags_only(
-            self._analysis.materialize_all(),
-            flags,
-            seed_flags=seed_flags,
-            prefix=self._package.path,
+        return _filter_under(
+            self._analysis.kept_alive_by_flags_only(flags, seed_flags=seed_flags),
+            self._package.path,
         )
 
     def count_nodes(self) -> dict[str, int]:
         return _count_nodes(
             (
                 n
-                for n in self._analysis.materialize_all().nodes
+                for n in self._analysis.materialize_all().nodes()
                 if _path_under(n.path, self._package.path)
             ),
             prefix=None,
@@ -406,12 +342,8 @@ class PackageView:
     def remove_dead_code(self, *, seed_flags: int = KEEPALIVE_DEFAULT) -> None:
         from .codemod import remove_code
 
-        g = self._analysis.materialize_all()
-        reachable = _find_reachable(g, _keepalive_seeds(g, seed_flags))
-        dead_nodes = [
-            n for n in g.nodes if n not in reachable and _path_under(n.path, self._package.path)
-        ]
-        remove_code(g.subgraph(dead_nodes), self._package.path)
+        dead_nodes = list(self.dead(seed_flags=seed_flags))
+        remove_code(dead_nodes, self._package.path)
 
 
 __all__ = [

@@ -27,7 +27,6 @@ import pytest
 from typer.testing import CliRunner
 
 from dead_cst import Analysis
-from dead_cst.analyze import _find_reachable as find_reachable, _keepalive_seeds
 from dead_cst.graph import KEEPALIVE_DEFAULT
 from dead_cst.cli import app
 from dead_cst.plugins import MainBlockPlugin, ModuleDundersPlugin
@@ -135,7 +134,7 @@ def test_why_alive_flux0_cli_main(flux0_cli_src):
 
 def _module_node(graph, fqname):
     return next(
-        (n for n in graph.nodes if n.kind == "module" and n.fqname == fqname),
+        (n for n in graph.nodes() if n.kind == "module" and n.fqname == fqname),
         None,
     )
 
@@ -150,7 +149,7 @@ def test_flux0_cli_cmds_dead_without_plugin(flux0_cli_src):
     """Sanity: without the dynamic-loader plugin, the cmds modules are dead."""
     base = Path(flux0_cli_src)
     graph = _build_graph(base, MainBlockPlugin())
-    reachable = find_reachable(graph, _keepalive_seeds(graph, KEEPALIVE_DEFAULT))
+    reachable = graph.reachable(seed_flags=KEEPALIVE_DEFAULT)
 
     cmds_agents = _module_node(graph, "flux0_cli.cmds.agents")
     assert cmds_agents is not None, "cmds.agents module should be in the graph"
@@ -177,7 +176,7 @@ def test_flux0_cli_commands_revives_click_groups(flux0_cli_src):
     """
     base = Path(flux0_cli_src)
     graph = _build_graph(base, MainBlockPlugin(), Flux0CliCommandsPlugin())
-    reachable = find_reachable(graph, _keepalive_seeds(graph, KEEPALIVE_DEFAULT))
+    reachable = graph.reachable(seed_flags=KEEPALIVE_DEFAULT)
 
     for fqname in (
         "flux0_cli.cmds.agents.agents",  # @click.group() in agents.py
@@ -185,7 +184,7 @@ def test_flux0_cli_commands_revives_click_groups(flux0_cli_src):
         "flux0_cli.cmds.agents",  # module stays alive via the Group decl
         "flux0_cli.cmds.sessions",
     ):
-        node = next((n for n in graph.nodes if n.fqname == fqname), None)
+        node = next((n for n in graph.nodes() if n.fqname == fqname), None)
         assert node is not None, f"{fqname} not in graph"
         assert node in reachable, f"{fqname} should be alive once the plugin runs"
 
@@ -195,7 +194,7 @@ def test_flux0_cli_commands_revives_click_groups(flux0_cli_src):
     # in the new plugin -- a future ``Flux0CustomDecoratorsPlugin`` would
     # be the right place to close that gap.
     handler_fqname = "flux0_cli.cmds.agents.list_agents"
-    handler = next((n for n in graph.nodes if n.fqname == handler_fqname), None)
+    handler = next((n for n in graph.nodes() if n.fqname == handler_fqname), None)
     assert handler is not None
     assert handler not in reachable, (
         "list_agents should still appear dead -- @get_options is a flux0-"
@@ -212,7 +211,7 @@ def test_flux0_internal_modules_revives_replay_agent(flux0_server_src):
     """
     base = Path(flux0_server_src)
     graph = _build_graph(base, MainBlockPlugin(), Flux0InternalModulesPlugin())
-    reachable = find_reachable(graph, _keepalive_seeds(graph, KEEPALIVE_DEFAULT))
+    reachable = graph.reachable(seed_flags=KEEPALIVE_DEFAULT)
 
     for fqname in (
         "flux0_server.replay_agent",  # __init__ module
@@ -221,7 +220,7 @@ def test_flux0_internal_modules_revives_replay_agent(flux0_server_src):
         "flux0_server.replay_agent.replay_agent",  # nested module imported by __init__
         "flux0_server.replay_agent.replay_agent.ReplayAgentRunner",  # decl
     ):
-        node = next((n for n in graph.nodes if n.fqname == fqname), None)
+        node = next((n for n in graph.nodes() if n.fqname == fqname), None)
         assert node is not None, f"{fqname} not in graph"
         assert node in reachable, f"{fqname} should be alive via INTERNAL_MODULES"
 
@@ -240,10 +239,10 @@ def test_flux0_server_dead_set_pins_to_real_findings(flux0_server_src):
         ModuleDundersPlugin(),
         Flux0InternalModulesPlugin(),
     )
-    reachable = find_reachable(graph, _keepalive_seeds(graph, KEEPALIVE_DEFAULT))
+    reachable = graph.reachable(seed_flags=KEEPALIVE_DEFAULT)
     dead = {
         n.fqname
-        for n in graph.nodes
+        for n in graph.nodes()
         if n not in reachable and n.kind != "synthetic" and not n.fqname.startswith("[")
     }
     assert dead == {
@@ -269,10 +268,10 @@ def test_flux0_cli_dead_set_includes_real_findings_and_decorator_blind_spot(flux
         ModuleDundersPlugin(),
         Flux0CliCommandsPlugin(),
     )
-    reachable = find_reachable(graph, _keepalive_seeds(graph, KEEPALIVE_DEFAULT))
+    reachable = graph.reachable(seed_flags=KEEPALIVE_DEFAULT)
     dead = {
         n.fqname
-        for n in graph.nodes
+        for n in graph.nodes()
         if n not in reachable and n.kind != "synthetic" and not n.fqname.startswith("[")
     }
     # Real findings: present.
@@ -307,10 +306,10 @@ def test_flux0_internal_modules(flux0_server_src, tmp_path):
         resolver=ManualResolver(specs=["."]),
         plugins=plugins,
     ).materialize_all()
-    reachable = find_reachable(graph, _keepalive_seeds(graph, KEEPALIVE_DEFAULT))
+    reachable = graph.reachable(seed_flags=KEEPALIVE_DEFAULT)
     dead = {
         n.fqname
-        for n in graph.nodes
+        for n in graph.nodes()
         if n not in reachable and n.kind != "synthetic" and not n.fqname.startswith("[")
     }
     assert dead == {

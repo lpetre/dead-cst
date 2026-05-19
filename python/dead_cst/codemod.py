@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import difflib
 from pathlib import Path
+from typing import Iterable
 
 import libcst as cst
 from libcst.codemod import CodemodContext
@@ -9,7 +10,6 @@ from libcst.codemod.visitors import RemoveImportsVisitor
 from libcst.metadata import FullRepoManager, PositionProvider, QualifiedNameSource
 
 from ._fqn import FixedFullyQualifiedNameProvider
-from ._graphstore import SymbolGraph
 from .graph import NodeFlags, SymbolNode
 
 
@@ -87,8 +87,10 @@ def _import_remove_args(node: SymbolNode) -> tuple[str, str | None, str | None]:
     return module, obj, asname
 
 
-def _select_files(G: SymbolGraph, base: Path) -> tuple[dict[Path, list[SymbolNode]], list[Path]]:
-    """Group ``G``'s nodes under ``base`` into files-to-rewrite vs. files-to-delete.
+def _select_files(
+    dead_nodes: Iterable[SymbolNode], base: Path
+) -> tuple[dict[Path, list[SymbolNode]], list[Path]]:
+    """Group ``dead_nodes`` under ``base`` into files-to-rewrite vs. files-to-delete.
 
     Used by both :func:`remove_code` and :func:`generate_patch`. Symbols
     outside ``base`` (other packages, vendored deps) are dropped, as are
@@ -100,7 +102,7 @@ def _select_files(G: SymbolGraph, base: Path) -> tuple[dict[Path, list[SymbolNod
     """
     by_file: dict[Path, list[SymbolNode]] = {}
     deleted_modules: list[Path] = []
-    for node in G.nodes:
+    for node in dead_nodes:
         path = Path(node.path)
         if not path.is_relative_to(base):
             continue
@@ -145,8 +147,8 @@ def _rewrite_one(wrapper, nodes: list[SymbolNode]) -> tuple[str, str]:
     return original, result.code
 
 
-def remove_code(G: SymbolGraph, package_path: Path) -> None:
-    """Delete every symbol in ``G`` from the source files under ``package_path``.
+def remove_code(dead_nodes: Iterable[SymbolNode], package_path: Path) -> None:
+    """Delete every node in ``dead_nodes`` from the source files under ``package_path``.
 
     Modules are removed by unlinking the file. Functions, classes, and
     top-level variables are dropped by a LibCST transformer matching on
@@ -159,14 +161,14 @@ def remove_code(G: SymbolGraph, package_path: Path) -> None:
     anything still referenced (defensive -- the graph already classifies
     these as dead, but the scope check is cheap insurance).
 
-    ``G`` is typically the unreachable subgraph of the graph from
-    :func:`build_symbol_graph`; only the nodes are inspected, edges are
-    ignored. Symbols whose path is not under ``package_path`` are
-    skipped, so call once per package when analysing several packages
-    together. The transformation is destructive -- back the files up
-    first, or run on a clean working tree.
+    ``dead_nodes`` is typically the set of unreachable nodes from
+    :class:`Analysis`; the codemod does not look at edges. Symbols
+    whose path is not under ``package_path`` are skipped, so call once
+    per package when analysing several packages together. The
+    transformation is destructive -- back the files up first, or run on
+    a clean working tree.
     """
-    by_file, deleted_modules = _select_files(G, package_path)
+    by_file, deleted_modules = _select_files(dead_nodes, package_path)
 
     for path in deleted_modules:
         path.unlink()
@@ -184,8 +186,8 @@ def remove_code(G: SymbolGraph, package_path: Path) -> None:
             path.write_text(new)
 
 
-def generate_patch(G: SymbolGraph, root: Path) -> str:
-    """Return a ``git apply``-compatible unified diff that removes ``G``'s nodes.
+def generate_patch(dead_nodes: Iterable[SymbolNode], root: Path) -> str:
+    """Return a ``git apply``-compatible unified diff that removes ``dead_nodes``.
 
     Same selection logic as :func:`remove_code` -- group dead nodes by
     file, run :class:`RemoveDeadSymbols` then :class:`RemoveImportsVisitor`
@@ -199,9 +201,8 @@ def generate_patch(G: SymbolGraph, root: Path) -> str:
     run from that same directory. Nodes whose source path is not under
     ``root`` are skipped.
 
-    Selection is driven entirely by ``G.nodes`` -- only those nodes are
-    candidates for removal -- so callers can slice the unreachable
-    graph however they like (e.g. ``G.subgraph(scc)`` for one SCC at a
+    Selection is driven entirely by the input iterable, so callers can
+    slice the unreachable set however they like (e.g. one SCC at a
     time) to review a big codebase as a series of focused patches. The
     underlying file rewrite still uses ``FullRepoManager`` against the
     real source, so a partial slice removes only the decls in the slice
@@ -211,7 +212,7 @@ def generate_patch(G: SymbolGraph, root: Path) -> str:
     The returned string is the concatenation of every per-file diff,
     sorted by path. An empty string means there was nothing to remove.
     """
-    by_file, deleted_modules = _select_files(G, root)
+    by_file, deleted_modules = _select_files(dead_nodes, root)
     chunks: list[str] = []
 
     for path in sorted(deleted_modules):

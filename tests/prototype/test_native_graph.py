@@ -22,8 +22,6 @@ native = pytest.importorskip("dead_cst._native")
 
 from dead_cst.graph import EdgeFlags, NodeFlags  # noqa: E402
 
-from dead_cst._backend import _bridge as materialize  # noqa: E402
-
 
 @pytest.fixture
 def project_factory(tmp_path: Path):
@@ -261,28 +259,28 @@ def test_shadowed_def_has_no_in_edges_from_use(project_factory):
 
 
 # ---------------------------------------------------------------------------
-# Round-trip into SymbolGraph (smoke)
+# NativeGraph smoke
 # ---------------------------------------------------------------------------
 
 
-def test_materialize_into_symbol_graph(project_factory):
+def test_native_graph_exposes_nodes_and_edges(project_factory):
     proj, _ = project_factory({"mod.py": "def f(): pass\nclass C: pass\n"})
-    graph = materialize(proj.build())
+    graph = proj.build()
     fqnames = {n.fqname for n in graph.nodes}
     assert fqnames == {"mod", "mod.f", "mod.C"}
 
 
 def test_default_flags_are_none(project_factory):
     proj, _ = project_factory({"mod.py": "X = 1\n"})
-    graph = materialize(proj.build())
+    graph = proj.build()
     for n in graph.nodes:
         assert n.flags == NodeFlags.NONE
 
 
 def test_edge_flags_are_none(project_factory):
     proj, _ = project_factory({"mod.py": "def f(): pass\n"})
-    graph = materialize(proj.build())
-    f = next(n for n in graph.nodes if n.fqname == "mod.f")
-    m = next(n for n in graph.nodes if n.fqname == "mod")
-    edge_flags = graph.raw.get_all_edge_data(graph.index(f), graph.index(m))
+    graph = proj.build()
+    f_idx = next(i for i, n in enumerate(graph.nodes) if n.fqname == "mod.f")
+    m_idx = next(i for i, n in enumerate(graph.nodes) if n.fqname == "mod")
+    edge_flags = [f for u, v, f in graph.edges if u == f_idx and v == m_idx]
     assert edge_flags == [EdgeFlags.NONE]
