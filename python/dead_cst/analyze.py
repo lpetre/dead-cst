@@ -1,6 +1,4 @@
 from __future__ import annotations
-
-import logging
 from collections import deque
 from functools import cached_property
 from pathlib import Path
@@ -19,9 +17,6 @@ if TYPE_CHECKING:
 def _path_under(node_path: str, prefix: Path) -> bool:
     """Return True if ``node_path`` (the rust-side string) lives under ``prefix``."""
     return Path(node_path).is_relative_to(prefix)
-
-
-logger = logging.getLogger(__name__)
 
 
 def _bfs_order(seeds: Iterable[Path], neighbors: Mapping[Path, Sequence[Path]]) -> list[Path]:

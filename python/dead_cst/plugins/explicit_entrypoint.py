@@ -9,8 +9,6 @@ from typing import Iterable
 
 from ._base import Plugin, native
 
-EXPLICIT_PREFIX = "<entrypoint>:"
-
 
 @dataclass
 class ExplicitEntrypointPlugin(Plugin):
