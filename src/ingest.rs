@@ -102,6 +102,7 @@ pub(crate) fn ingest_decls(
             end_column: mec,
             flags: default_flags,
             imports: None,
+            tag: None,
             cached_hash: OnceLock::new(),
         },
     )?;
@@ -249,6 +250,7 @@ pub(crate) fn ingest_decls(
                 end_column: ec,
                 flags,
                 imports,
+                tag: None,
                 cached_hash: OnceLock::new(),
             },
         )?;
@@ -1035,6 +1037,7 @@ pub(crate) fn mint_module_node(
             end_column: ec,
             flags,
             imports: None,
+            tag: None,
             cached_hash: OnceLock::new(),
         },
     )?;

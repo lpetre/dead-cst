@@ -65,4 +65,9 @@ class MockPatchPlugin(Plugin):
                 path=owners[0].path,
                 edges_from=owners,
                 edges_to=targets,
+                tag=native.SyntheticTag(
+                    plugin="mock_patch",
+                    kind="target",
+                    payload=fqname,
+                ),
             )

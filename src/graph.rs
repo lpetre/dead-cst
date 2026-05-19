@@ -63,11 +63,81 @@ impl Import {
     }
 }
 
+/// Structured metadata stamped onto a synthetic node by the plugin
+/// that emitted it. Lets plugins find their own markers by *role*
+/// rather than parsing the marker fqname string.
+///
+/// `plugin` is the emitting plugin's short marker label (``"flask"``,
+/// ``"celery"``, ``"discordpy"``, …). `kind` is the role of the
+/// synthetic within that plugin (``"app"`` / ``"factory"`` /
+/// ``"per-file"`` / ``"entry"`` / …). `payload` is free-form
+/// per-plugin context (typically the decl fqname, file basename, or
+/// constructor name). The synthetic node's `fqname` string is still
+/// produced and is still the user-facing label ``why-alive`` reads
+/// from; the tag is *parallel* metadata used for structured lookup,
+/// not a replacement.
+///
+/// Frozen + hashable: tags participate in the node intern key, so two
+/// `AddNode` ops with identical fqname/path but different tags
+/// produce distinct synthetic nodes.
+#[pyclass(get_all, frozen)]
+#[derive(Clone)]
+pub(crate) struct SyntheticTag {
+    pub(crate) plugin: String,
+    pub(crate) kind: String,
+    pub(crate) payload: String,
+}
+
+#[pymethods]
+impl SyntheticTag {
+    #[new]
+    #[pyo3(signature = (*, plugin, kind, payload))]
+    fn new(plugin: String, kind: String, payload: String) -> Self {
+        Self {
+            plugin,
+            kind,
+            payload,
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "SyntheticTag(plugin={:?}, kind={:?}, payload={:?})",
+            self.plugin, self.kind, self.payload,
+        )
+    }
+
+    fn __hash__(&self) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        self.plugin.hash(&mut hasher);
+        self.kind.hash(&mut hasher);
+        self.payload.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn __eq__(&self, other: &Bound<'_, PyAny>) -> bool {
+        match other.extract::<PyRef<SyntheticTag>>() {
+            Ok(other) => {
+                self.plugin == other.plugin
+                    && self.kind == other.kind
+                    && self.payload == other.payload
+            }
+            Err(_) => false,
+        }
+    }
+}
+
 /// A single node in a `NativeGraph`.
 ///
 /// `imports` is populated for `kind="import"` nodes only (one per
 /// alias, plus one per name brought in by `from X import *`). All
 /// other kinds carry `None`.
+///
+/// `tag` is populated only for synthetic nodes minted via
+/// `AddNode(..., tag=SyntheticTag(...))`; all other nodes carry
+/// `None`. It is structured metadata about *which plugin emitted the
+/// synthetic and in what role*, queryable via
+/// `ProjectContext.find_synthetic(plugin, kind)`.
 ///
 /// `cached_hash` memoizes `__hash__` so repeated hashing (graph
 /// builds, set membership, codemod walks) pays the full SipHash cost
@@ -93,6 +163,8 @@ pub(crate) struct SymbolNode {
     pub(crate) flags: u32,
     #[pyo3(get)]
     pub(crate) imports: Option<Py<Import>>,
+    #[pyo3(get)]
+    pub(crate) tag: Option<Py<SyntheticTag>>,
     pub(crate) cached_hash: OnceLock<u64>,
 }
 
@@ -131,6 +203,7 @@ impl SymbolNode {
         end_column = 0,
         flags = 0,
         imports = None,
+        tag = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -143,6 +216,7 @@ impl SymbolNode {
         end_column: usize,
         flags: u32,
         imports: Option<Py<Import>>,
+        tag: Option<Py<SyntheticTag>>,
     ) -> PyResult<Self> {
         Ok(Self {
             fqname,
@@ -154,6 +228,7 @@ impl SymbolNode {
             end_column,
             flags,
             imports,
+            tag,
             cached_hash: OnceLock::new(),
         })
     }
@@ -192,6 +267,15 @@ impl SymbolNode {
                 // Discriminate "no imports" from "imports = ()".
                 0u8.hash(&mut hasher);
             }
+            if let Some(tag) = &self.tag {
+                let tag_ref = tag.borrow(py);
+                1u8.hash(&mut hasher);
+                tag_ref.plugin.hash(&mut hasher);
+                tag_ref.kind.hash(&mut hasher);
+                tag_ref.payload.hash(&mut hasher);
+            } else {
+                0u8.hash(&mut hasher);
+            }
             hasher.finish()
         })
     }
@@ -212,12 +296,24 @@ impl SymbolNode {
             return false;
         }
         let py = other.py();
-        match (&self.imports, &other.imports) {
+        let imports_eq = match (&self.imports, &other.imports) {
             (None, None) => true,
             (Some(a), Some(b)) => {
                 let a = a.borrow(py);
                 let b = b.borrow(py);
                 a.module == b.module && a.decl == b.decl && a.star == b.star
+            }
+            _ => false,
+        };
+        if !imports_eq {
+            return false;
+        }
+        match (&self.tag, &other.tag) {
+            (None, None) => true,
+            (Some(a), Some(b)) => {
+                let a = a.borrow(py);
+                let b = b.borrow(py);
+                a.plugin == b.plugin && a.kind == b.kind && a.payload == b.payload
             }
             _ => false,
         }

@@ -128,6 +128,14 @@ pub(crate) struct BuildOutputs {
     /// `module_fqname -> node idx`. Lets ``find_module`` answer in
     /// O(1) instead of scanning all nodes.
     pub(crate) module_by_fqname: HashMap<String, usize>,
+    /// `(plugin_marker, Some(kind)) -> [node idx]` plus a parallel
+    /// `(plugin_marker, None) -> [node idx]` rollup. Backs
+    /// :meth:`ProjectContext.find_synthetic` so plugins can query for
+    /// their own tagged synthetics in O(1) without parsing fqname
+    /// strings. Populated by ``apply_graph_op`` as ``AddNode`` ops with
+    /// a ``tag`` land in the builder; emission order is preserved
+    /// so callers get a stable result list.
+    pub(crate) synthetic_by_tag: HashMap<(String, Option<String>), Vec<usize>>,
 }
 
 /// Run the three build phases (ingest → hierarchy+imports → references)
@@ -384,6 +392,7 @@ pub(crate) fn build_project_graph(
         decl_by_name_range,
         decl_by_fqname,
         module_by_fqname,
+        synthetic_by_tag: HashMap::new(),
     })
 }
 
@@ -769,6 +778,41 @@ impl ProjectContext {
             .get(fqname)
             .map(|&idx| outputs.builder.nodes[idx].clone_ref(py)))
     }
+
+    /// Return every synthetic node tagged with the given
+    /// ``plugin`` marker (and optional ``kind`` role).
+    ///
+    /// Plugins use this to find their own markers without parsing the
+    /// node ``fqname`` string: each :class:`AddNode` op that carries a
+    /// :class:`SyntheticTag` lands in an index keyed by
+    /// ``(plugin, Some(kind))`` and ``(plugin, None)``. ``kind=None``
+    /// returns every tagged synthetic for the plugin regardless of
+    /// role; ``kind="factory"`` filters to that one role.
+    ///
+    /// Results are returned in emission order — the order ``AddNode``
+    /// ops carrying the tag were applied to the graph.
+    #[pyo3(signature = (plugin, kind = None))]
+    pub(crate) fn find_synthetic(
+        &self,
+        py: Python<'_>,
+        plugin: &str,
+        kind: Option<&str>,
+    ) -> PyResult<Vec<Py<SymbolNode>>> {
+        let outputs = self.outputs.borrow();
+        let outputs = outputs
+            .as_ref()
+            .ok_or_else(|| not_materialized("find_synthetic"))?;
+        let key = (plugin.to_string(), kind.map(str::to_string));
+        Ok(outputs
+            .synthetic_by_tag
+            .get(&key)
+            .map(|idxs| {
+                idxs.iter()
+                    .map(|&i| outputs.builder.nodes[i].clone_ref(py))
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
 }
 
 #[pymethods]
@@ -1087,7 +1131,7 @@ impl ProjectContext {
         let outputs = outputs
             .as_ref()
             .ok_or_else(|| not_materialized("descendants"))?;
-        let root_idx = lookup_idx(&outputs.builder, root, "root")?;
+        let root_idx = lookup_idx(py, &outputs.builder, root, "root")?;
         Ok(
             bfs(&outputs.builder, [root_idx], Direction::Forward, skip_flags)
                 .into_iter()
@@ -1109,7 +1153,7 @@ impl ProjectContext {
         let outputs = outputs
             .as_ref()
             .ok_or_else(|| not_materialized("ancestors"))?;
-        let idx = lookup_idx(&outputs.builder, decl, "decl")?;
+        let idx = lookup_idx(py, &outputs.builder, decl, "decl")?;
         Ok(bfs(&outputs.builder, [idx], Direction::Reverse, skip_flags)
             .into_iter()
             .map(|i| outputs.builder.nodes[i].clone_ref(py))

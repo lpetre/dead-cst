@@ -107,6 +107,11 @@ class DiscordPyPlugin(Plugin):
                     path=path,
                     flags=int(NodeFlags.ENTRYPOINT),
                     edges_to=targets,
+                    tag=native.SyntheticTag(
+                        plugin="discordpy",
+                        kind="cog",
+                        payload=filename,
+                    ),
                 )
 
         # 5. load_extension / load_extensions string-literal targets.
@@ -126,4 +131,9 @@ class DiscordPyPlugin(Plugin):
                     path=cref.owner.path,
                     flags=int(NodeFlags.ENTRYPOINT),
                     edges_to=targets,
+                    tag=native.SyntheticTag(
+                        plugin="discordpy",
+                        kind="extension",
+                        payload=cref.string_arg,
+                    ),
                 )

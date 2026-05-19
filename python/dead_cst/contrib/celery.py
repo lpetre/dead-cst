@@ -46,4 +46,9 @@ class CeleryPlugin(DispatchAppPlugin):
                 path=path,
                 flags=int(NodeFlags.ENTRYPOINT),
                 edges_to=targets,
+                tag=native.SyntheticTag(
+                    plugin="celery",
+                    kind="shared",
+                    payload=Path(path).name,
+                ),
             )

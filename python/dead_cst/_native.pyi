@@ -130,6 +130,34 @@ class Import:
         star: bool = ...,
     ) -> None: ...
 
+class SyntheticTag:
+    """Structured metadata stamped onto a synthetic node by the plugin
+    that emitted it. Lets plugins find their own markers by *role*
+    rather than parsing the marker fqname string.
+
+    ``plugin`` is the emitting plugin's short marker label
+    (``"flask"`` / ``"celery"`` / ``"discordpy"`` / …). ``kind`` is
+    the role of the synthetic within that plugin (``"app"`` /
+    ``"factory"`` / ``"per-file"`` / ``"entry"`` / …). ``payload`` is
+    free-form per-plugin context (typically the decl fqname, file
+    basename, or constructor name).
+
+    The synthetic node's ``fqname`` string is still produced and is
+    still the user-facing label ``why-alive`` reads from; the tag is
+    *parallel* metadata used for structured lookup via
+    :meth:`ProjectContext.find_synthetic`.
+
+    Frozen + hashable. Participates in the node intern key, so two
+    ``AddNode`` ops with identical ``fqname`` / ``path`` / position
+    but different tags produce distinct synthetic nodes.
+    """
+
+    plugin: str
+    kind: str
+    payload: str
+
+    def __init__(self, *, plugin: str, kind: str, payload: str) -> None: ...
+
 class SymbolNode:
     """A single node in a ``NativeGraph``.
 
@@ -141,6 +169,9 @@ class SymbolNode:
     ``NodeFlags`` values. ``imports`` is populated only for
     ``kind="import"`` nodes (one per alias, plus one per name brought
     in by ``from X import *``); all other kinds carry ``None``.
+    ``tag`` is populated only for synthetic nodes minted via
+    ``AddNode(..., tag=SyntheticTag(...))``; all other nodes carry
+    ``None``.
     """
 
     fqname: str
@@ -152,6 +183,7 @@ class SymbolNode:
     end_column: int
     flags: int
     imports: Import | None
+    tag: SyntheticTag | None
 
     def __init__(
         self,
@@ -165,6 +197,7 @@ class SymbolNode:
         end_column: int = ...,
         flags: int = ...,
         imports: Import | None = ...,
+        tag: SyntheticTag | None = ...,
     ) -> None: ...
 
 # ----- Graph operations (yielded from plugin.run) ------------------------
@@ -214,6 +247,12 @@ class AddNode:
     ``flags = NodeFlags.ENTRYPOINT`` to make the node a reachability
     seed; for the common single-target entrypoint pattern, prefer
     ``AddEntrypoint(decl, marker=...)``.
+
+    ``tag`` attaches structured per-plugin metadata to the resulting
+    node, queryable via :meth:`ProjectContext.find_synthetic`. Two
+    ``AddNode`` ops with the same ``fqname`` / ``path`` / position but
+    different tags mint distinct nodes — the tag participates in the
+    intern key.
     """
 
     fqname: str
@@ -222,6 +261,7 @@ class AddNode:
     flags: int
     edges_from: list[SymbolNode]
     edges_to: list[SymbolNode]
+    tag: SyntheticTag | None
 
     def __init__(
         self,
@@ -232,6 +272,7 @@ class AddNode:
         flags: int = 0,
         edges_from: Iterable[SymbolNode] = ...,
         edges_to: Iterable[SymbolNode] = ...,
+        tag: SyntheticTag | None = ...,
     ) -> None: ...
 
 GraphOp = AddEdge | AddEntrypoint | AddNode
@@ -391,6 +432,22 @@ class ProjectContext:
     def find_module(self, fqname: str) -> SymbolNode | None:
         """Return the module node for the given dotted fqname, if one
         exists in the project graph."""
+        ...
+
+    def find_synthetic(self, plugin: str, kind: str | None = None) -> list[SymbolNode]:
+        """Every synthetic node tagged with the given ``plugin`` marker
+        (and optional ``kind`` role).
+
+        Plugins use this to find their own markers without parsing the
+        node ``fqname`` string: each :class:`AddNode` op that carries a
+        :class:`SyntheticTag` lands in an index keyed by
+        ``(plugin, kind)``. ``kind=None`` (the default) returns every
+        tagged synthetic for the plugin regardless of role; passing a
+        ``kind`` narrows to that one role.
+
+        Results are returned in emission order — the order the
+        ``AddNode`` ops carrying the tag were applied to the graph.
+        """
         ...
 
     def module_for(self, path: str) -> SymbolNode | None:

@@ -89,6 +89,11 @@ class DecoratedDeclPlugin(Plugin):
                 path=path,
                 flags=int(NodeFlags.ENTRYPOINT),
                 edges_to=targets,
+                tag=native.SyntheticTag(
+                    plugin=self.marker_prefix,
+                    kind="per-file",
+                    payload=Path(path).name,
+                ),
             )
 
 
@@ -230,6 +235,11 @@ class DispatchAppPlugin(Plugin):
                     path=ref.var.path,
                     flags=int(NodeFlags.ENTRYPOINT),
                     edges_to=[ref.var],
+                    tag=native.SyntheticTag(
+                        plugin=self.marker_prefix,
+                        kind="app",
+                        payload=ref.var.fqname,
+                    ),
                 )
 
         # 4. Emit factory markers so the descendant walk in step 6 can
@@ -239,6 +249,11 @@ class DispatchAppPlugin(Plugin):
                 fqname=f"{factory_prefix}{kind}:{fref.decl.fqname}",
                 path=fref.decl.path,
                 edges_from=[fref.decl],
+                tag=native.SyntheticTag(
+                    plugin=self.marker_prefix,
+                    kind="factory",
+                    payload=f"{kind}:{fref.decl.fqname}",
+                ),
             )
 
         # 5. Wire decorator handlers to their owner var.
@@ -264,6 +279,11 @@ class DispatchAppPlugin(Plugin):
         # whose descendant graph reaches a factory marker get
         # entrypoint-promoted too. Skipped under seed_as_entrypoint=False.
         if self.seed_as_entrypoint:
+            # Tag-based lookup: the factory markers emitted in step 4
+            # carry ``SyntheticTag(plugin=marker_prefix, kind="factory")``.
+            # Pre-collect them into a set for O(1) descendant filtering
+            # instead of parsing each descendant's fqname string.
+            factory_synthetics = set(ctx.find_synthetic(plugin=self.marker_prefix, kind="factory"))
             classified: set[tuple[str, str]] = set()
             for h in handlers:
                 key = (h.decorated.path, h.decorator_owner or "")
@@ -273,9 +293,7 @@ class DispatchAppPlugin(Plugin):
                 if var is None:
                     continue
                 for desc in ctx.descendants(var):
-                    if desc.kind != "synthetic":
-                        continue
-                    if not desc.fqname.startswith(factory_prefix):
+                    if desc not in factory_synthetics:
                         continue
                     classified.add(key)
                     yield native.AddNode(
@@ -283,6 +301,11 @@ class DispatchAppPlugin(Plugin):
                         path=var.path,
                         flags=int(NodeFlags.ENTRYPOINT),
                         edges_to=[var],
+                        tag=native.SyntheticTag(
+                            plugin=self.marker_prefix,
+                            kind="app",
+                            payload=var.fqname,
+                        ),
                     )
                     break
 
@@ -332,4 +355,9 @@ class LiteralListPlugin(Plugin):
                 path=targets[0].path,
                 flags=int(NodeFlags.ENTRYPOINT),
                 edges_to=targets,
+                tag=native.SyntheticTag(
+                    plugin=self.marker_prefix,
+                    kind="entry",
+                    payload=entry,
+                ),
             )

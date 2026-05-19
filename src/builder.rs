@@ -10,15 +10,28 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use ruff_db::files::File;
 
-use crate::graph::SymbolNode;
+use crate::graph::{SymbolNode, SyntheticTag};
 use crate::helpers::NODE_FLAG_ENTRYPOINT;
 use crate::project::ProjectContext;
+
+/// Plain hashable triple of a `SyntheticTag`'s three string fields,
+/// for participation in `NodeKey`. Reading the `Py<SyntheticTag>` to
+/// hash it requires the GIL; this triple is the GIL-free projection
+/// used as a `HashMap` key.
+pub(crate) type TagKey = (String, String, String);
 
 /// Positional identity for a node.
 ///
 /// Per `CLAUDE.md` principle 3, `flags` is deliberately *not* part of
 /// the key: two nodes for the same `(fqname, kind, path, position)` are
 /// the same node regardless of which path computed their flags.
+///
+/// `tag` *does* participate: two `AddNode` ops with the same
+/// fqname/path/position but different `SyntheticTag` payloads are
+/// distinct nodes. This keeps the intern table consistent with
+/// `SymbolNode.__eq__` (which also includes the tag) and lets a
+/// plugin emit multiple synthetics that share an fqname template but
+/// differ in their structured payload.
 #[derive(Hash, Eq, PartialEq, Clone)]
 pub(crate) struct NodeKey {
     pub(crate) fqname: String,
@@ -28,6 +41,7 @@ pub(crate) struct NodeKey {
     pub(crate) start_column: usize,
     pub(crate) end_line: usize,
     pub(crate) end_column: usize,
+    pub(crate) tag: Option<TagKey>,
 }
 
 pub(crate) struct GraphBuilder {
@@ -81,7 +95,7 @@ impl GraphBuilder {
     }
 
     pub(crate) fn intern_node(&mut self, py: Python<'_>, node: SymbolNode) -> PyResult<usize> {
-        let key = node_key_of(&node);
+        let key = node_key_of(py, &node);
         if let Some(&idx) = self.node_index.get(&key) {
             return Ok(idx);
         }
@@ -116,6 +130,7 @@ impl GraphBuilder {
                 end_column: 0,
                 flags: 0,
                 imports: None,
+                tag: None,
                 cached_hash: OnceLock::new(),
             },
         )?;
@@ -183,6 +198,12 @@ impl AddEntrypoint {
 /// doesn't need a separate handle to reference the freshly-minted node
 /// from subsequent ops. Set ``flags = NodeFlags.ENTRYPOINT`` to make
 /// the node a seed (``AddEntrypoint`` is the single-target sugar).
+///
+/// ``tag`` attaches a structured :class:`SyntheticTag` to the resulting
+/// node, queryable via ``ProjectContext.find_synthetic(plugin, kind)``.
+/// When two ``AddNode`` ops share fqname / path / position but have
+/// different tags they mint distinct nodes (the tag participates in
+/// the intern key).
 #[pyclass(frozen, get_all)]
 pub(crate) struct AddNode {
     pub(crate) fqname: String,
@@ -191,6 +212,7 @@ pub(crate) struct AddNode {
     pub(crate) flags: u32,
     pub(crate) edges_from: Vec<Py<SymbolNode>>,
     pub(crate) edges_to: Vec<Py<SymbolNode>>,
+    pub(crate) tag: Option<Py<SyntheticTag>>,
 }
 
 #[pymethods]
@@ -204,6 +226,7 @@ impl AddNode {
         flags = 0,
         edges_from = Vec::new(),
         edges_to = Vec::new(),
+        tag = None,
     ))]
     fn new(
         fqname: String,
@@ -212,6 +235,7 @@ impl AddNode {
         flags: u32,
         edges_from: Vec<Py<SymbolNode>>,
         edges_to: Vec<Py<SymbolNode>>,
+        tag: Option<Py<SyntheticTag>>,
     ) -> PyResult<Self> {
         Ok(Self {
             fqname,
@@ -220,6 +244,7 @@ impl AddNode {
             flags,
             edges_from,
             edges_to,
+            tag,
         })
     }
 }
@@ -232,9 +257,11 @@ pub(crate) fn not_materialized(op: &str) -> PyErr {
 }
 
 /// Project a `SymbolNode` onto the `NodeKey` used for intern-table
-/// identity. Clones the two `String` fields (`fqname`, `path`); the
-/// rest are `Copy`.
-pub(crate) fn node_key_of(node: &SymbolNode) -> NodeKey {
+/// identity. Clones the two `String` fields (`fqname`, `path`) plus
+/// the three `SyntheticTag` strings when the node carries a tag; the
+/// rest are `Copy`. Needs the GIL because reading the tag goes
+/// through `Py<SyntheticTag>::borrow`.
+pub(crate) fn node_key_of(py: Python<'_>, node: &SymbolNode) -> NodeKey {
     NodeKey {
         fqname: node.fqname.clone(),
         kind: node.kind,
@@ -243,6 +270,10 @@ pub(crate) fn node_key_of(node: &SymbolNode) -> NodeKey {
         start_column: node.start_column,
         end_line: node.end_line,
         end_column: node.end_column,
+        tag: node.tag.as_ref().map(|t| {
+            let t = t.borrow(py);
+            (t.plugin.clone(), t.kind.clone(), t.payload.clone())
+        }),
     }
 }
 
@@ -297,14 +328,14 @@ pub(crate) fn apply_graph_op(
         .ok_or_else(|| not_materialized("apply_graph_op"))?;
 
     if let Ok(add_edge) = op.extract::<PyRef<AddEdge>>() {
-        let src_idx = lookup_idx(&outputs.builder, &add_edge.src.borrow(py), "src")?;
-        let dst_idx = lookup_idx(&outputs.builder, &add_edge.dst.borrow(py), "dst")?;
+        let src_idx = lookup_idx(py, &outputs.builder, &add_edge.src.borrow(py), "src")?;
+        let dst_idx = lookup_idx(py, &outputs.builder, &add_edge.dst.borrow(py), "dst")?;
         outputs.builder.add_edge(src_idx, dst_idx, add_edge.flags);
         return Ok(());
     }
     if let Ok(add_ep) = op.extract::<PyRef<AddEntrypoint>>() {
         let decl = add_ep.decl.borrow(py);
-        let decl_idx = lookup_idx(&outputs.builder, &decl, "decl")?;
+        let decl_idx = lookup_idx(py, &outputs.builder, &decl, "decl")?;
         let marker_fqname = format!("{}:{}", add_ep.marker, decl.fqname);
         let path = decl.path.clone();
         drop(decl);
@@ -320,6 +351,7 @@ pub(crate) fn apply_graph_op(
                 end_column: 0,
                 flags: NODE_FLAG_ENTRYPOINT,
                 imports: None,
+                tag: None,
                 cached_hash: OnceLock::new(),
             },
         )?;
@@ -327,6 +359,7 @@ pub(crate) fn apply_graph_op(
         return Ok(());
     }
     if let Ok(add_node) = op.extract::<PyRef<AddNode>>() {
+        let tag = add_node.tag.as_ref().map(|t| t.clone_ref(py));
         let node_idx = outputs.builder.intern_node(
             py,
             SymbolNode {
@@ -339,15 +372,36 @@ pub(crate) fn apply_graph_op(
                 end_column: 0,
                 flags: add_node.flags,
                 imports: None,
+                tag,
                 cached_hash: OnceLock::new(),
             },
         )?;
+        // Index the new node by its tag (if any) so
+        // ``ProjectContext.find_synthetic`` can answer in O(1) instead
+        // of scanning every node. Mirrors the per-fqname dedup map for
+        // visitor-synth nodes, but at the tag granularity plugins
+        // coordinate on.
+        if let Some(tag_py) = &add_node.tag {
+            let tag_ref = tag_py.borrow(py);
+            let key = (tag_ref.plugin.clone(), Some(tag_ref.kind.clone()));
+            outputs
+                .synthetic_by_tag
+                .entry(key)
+                .or_default()
+                .push(node_idx);
+            let key_all = (tag_ref.plugin.clone(), None);
+            outputs
+                .synthetic_by_tag
+                .entry(key_all)
+                .or_default()
+                .push(node_idx);
+        }
         for src in &add_node.edges_from {
-            let src_idx = lookup_idx(&outputs.builder, &src.borrow(py), "edges_from")?;
+            let src_idx = lookup_idx(py, &outputs.builder, &src.borrow(py), "edges_from")?;
             outputs.builder.add_edge(src_idx, node_idx, 0);
         }
         for dst in &add_node.edges_to {
-            let dst_idx = lookup_idx(&outputs.builder, &dst.borrow(py), "edges_to")?;
+            let dst_idx = lookup_idx(py, &outputs.builder, &dst.borrow(py), "edges_to")?;
             outputs.builder.add_edge(node_idx, dst_idx, 0);
         }
         return Ok(());
@@ -361,10 +415,15 @@ pub(crate) fn apply_graph_op(
 /// Resolve a `SymbolNode` reference to its builder-side index for an
 /// edge endpoint. Surfaces a precise `ValueError` (with `side`) when
 /// the node was never interned in this context.
-pub(crate) fn lookup_idx(builder: &GraphBuilder, node: &SymbolNode, side: &str) -> PyResult<usize> {
+pub(crate) fn lookup_idx(
+    py: Python<'_>,
+    builder: &GraphBuilder,
+    node: &SymbolNode,
+    side: &str,
+) -> PyResult<usize> {
     builder
         .node_index
-        .get(&node_key_of(node))
+        .get(&node_key_of(py, node))
         .copied()
         .ok_or_else(|| {
             PyValueError::new_err(format!(

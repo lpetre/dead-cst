@@ -49,6 +49,20 @@ two versions.
   shape is now surfaced to plugins.
 
 ### Added
+- :class:`native.SyntheticTag` (frozen pyclass) and a
+  ``tag: SyntheticTag | None`` field on both :class:`native.AddNode`
+  and :class:`native.SymbolNode`. Plugins can now stamp structured
+  metadata onto each synthetic node they emit (``plugin`` /
+  ``kind`` / ``payload``) and look those markers up via the new
+  :meth:`native.ProjectContext.find_synthetic(plugin, kind=None)`
+  query — instead of parsing the node's ``fqname`` string with
+  ``startswith(...)``. The tag participates in the node intern key,
+  so two ``AddNode`` ops that share fqname/path but differ in their
+  tag mint distinct nodes. Migrated :class:`DispatchAppPlugin`'s
+  factory-walk lookup, :class:`DecoratedDeclPlugin`,
+  :class:`LiteralListPlugin`, :class:`CeleryPlugin` (``shared_task``
+  markers), :class:`MockPatchPlugin`, and :class:`DiscordPyPlugin`
+  (cog + extension markers) to emit tags.
 - :class:`dead_cst.plugins.DynamicImportFallbackPlugin` — a plugin
   that reads :attr:`EdgeFlags.DYNAMIC_IMPORT` edges and fans each
   flagged ``src -> module`` edge out to the module's exports. Gives
