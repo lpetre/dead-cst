@@ -589,18 +589,16 @@ def test_third_party_import_creates_synthetic_node(build_decl_graph):
     graph = build_decl_graph(
         {
             "p/__init__.py": "",
-            "p/uses_rx.py": "import rustworkx as rx\ndef build(): return rx.PyDiGraph()",
+            "p/uses_rx.py": "import tqdm as rx\ndef build(): return rx.tqdm()",
         }
     )
     rx_nodes = {
         n
         for n in graph.nodes
-        if n.kind == "synthetic"
-        and n.fqname.startswith(EXTERNAL_PREFIXES)
-        and "rustworkx" in n.fqname
+        if n.kind == "synthetic" and n.fqname.startswith(EXTERNAL_PREFIXES) and "tqdm" in n.fqname
     }
     assert rx_nodes, (
-        "expected an external-dep synthetic node for rustworkx, got "
+        "expected an external-dep synthetic node for tqdm, got "
         f"{[n.fqname for n in graph.nodes if n.kind == 'synthetic']}"
     )
 

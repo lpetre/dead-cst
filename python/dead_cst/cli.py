@@ -278,7 +278,7 @@ def why_alive(
 
     typer.echo(f"\nSymbol: {target_node.fqname} ({target_node.kind})")
     typer.echo(f"Path: {_rel_path(target_node.path, root)}")
-    typer.echo(f"In-degree: {graph.raw.in_degree(graph.index(target_node))}")
+    typer.echo(f"In-degree: {graph.in_degree(graph.index(target_node))}")
     typer.echo("\nPredecessor chain:")
 
     seen_idx: set[int] = set()
@@ -290,7 +290,7 @@ def why_alive(
         seen_idx.add(i)
         node = graph.node(i)
         typer.echo(f"  <- {node.fqname} ({node.kind}) at {_rel_path(node.path, root)}")
-        stack.extend(graph.raw.predecessor_indices(i))
+        stack.extend(graph.predecessor_indices(i))
 
 
 def _is_dunder_all(node: SymbolNode) -> bool:
@@ -337,7 +337,7 @@ def dependencies(
         # each package that imports them by walking back through the
         # graph's predecessor edges.
         importer_paths: set[Path] = set()
-        for j in graph.raw.predecessor_indices(graph.index(node)):
+        for j in graph.predecessor_indices(graph.index(node)):
             importer_paths.add(Path(graph.node(j).path))
         for pkg_path in deps_by_package:
             if any(p.is_relative_to(pkg_path) for p in importer_paths):
@@ -415,7 +415,7 @@ def unused_exports(
             continue
         visited_idx.add(i)
         is_seed = _is_dunder_seed(graph.node(i))
-        for j in graph.raw.successor_indices(i):
+        for j in graph.successor_indices(i):
             if is_seed and _is_dunder_all(graph.node(j)):
                 continue
             stack.append(j)
@@ -426,7 +426,7 @@ def unused_exports(
     for sym in only_via_all:
         if _is_dunder_all(sym):
             continue
-        for j in graph.raw.predecessor_indices(graph.index(sym)):
+        for j in graph.predecessor_indices(graph.index(sym)):
             pred = graph.node(j)
             if _is_dunder_all(pred):
                 by_all.setdefault(pred, []).append(sym)

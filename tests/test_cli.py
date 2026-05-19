@@ -489,17 +489,17 @@ def test_dependencies_no_third_party(runner, project):
 
 
 def test_dependencies_third_party_listed(runner, project):
-    root = project({"mod.py": "import rustworkx\n_x = rustworkx\n"})
+    root = project({"mod.py": "import tqdm\n_x = tqdm\n"})
     result = runner.invoke(app, ["dependencies", str(root)])
     assert result.exit_code == 0
-    assert "[external dist] rustworkx" in result.stdout
+    assert "[external dist] tqdm" in result.stdout
 
 
 def test_dependencies_json_output_groups_by_base(runner, project):
-    root = project({"mod.py": "import rustworkx\n_x = rustworkx\n"})
+    root = project({"mod.py": "import tqdm\n_x = tqdm\n"})
     result = runner.invoke(app, ["dependencies", str(root), "--format", "json"])
     assert result.exit_code == 0
-    assert json.loads(result.stdout) == {str(root.resolve()): ["[external dist] rustworkx"]}
+    assert json.loads(result.stdout) == {str(root.resolve()): ["[external dist] tqdm"]}
 
 
 def test_dependencies_json_output_empty_when_no_deps(runner, project):

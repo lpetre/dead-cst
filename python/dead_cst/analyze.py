@@ -56,7 +56,6 @@ def _find_reachable(
     prefix: Path | None = None,
     skip_dead_branches: bool = False,
 ) -> set[SymbolNode]:
-    raw = graph.raw
     visited_idx: set[int] = set()
     stack: list[int] = list(seeds)
     while stack:
@@ -65,12 +64,12 @@ def _find_reachable(
             continue
         visited_idx.add(i)
         if skip_dead_branches:
-            for _, dst_i, payload in raw.out_edges(i):
+            for _, dst_i, payload in graph.out_edges(i):
                 if not (payload & EdgeFlags.DEAD_BRANCH):
                     stack.append(dst_i)
         else:
-            stack.extend(raw.successor_indices(i))
-    visited = {raw[i] for i in visited_idx}
+            stack.extend(graph.successor_indices(i))
+    visited = {graph.node(i) for i in visited_idx}
     if prefix is None:
         return visited
     return {n for n in visited if _path_under(n.path, prefix)}
