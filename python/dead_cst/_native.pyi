@@ -486,9 +486,12 @@ class ProjectContext:
         """
         ...
 
-    def reachable(self, *, skip_flags: int = 0) -> list[NativeNode]:
-        """Forward closure from every entrypoint-flagged node. The set
-        of dead decls is the complement against :meth:`nodes`."""
+    def reachable(
+        self, *, skip_flags: int = 0, seed_flags: int = ...
+    ) -> list[NativeNode]:
+        """Forward closure from every node carrying any bit in
+        ``seed_flags`` (defaults to :data:`NodeFlags.ENTRYPOINT`). The
+        set of dead decls is the complement against :meth:`nodes`."""
         ...
 
     # ----- Pure scans over the in-progress graph ------------------------

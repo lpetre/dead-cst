@@ -11,6 +11,12 @@ Nodes / imports / flags are no longer translated — :class:`SymbolNode`
 *is* :class:`native.NativeNode`, :class:`Import` *is*
 :class:`native.Import`, etc. The "bridge" today is one pass that
 copies the rust node list and edge triples into the adjacency map.
+
+:func:`materialize_project` returns a ``(ctx, graph)`` pair: the
+``ctx`` is held by :class:`Analysis` so bulk reachability queries
+(:meth:`Analysis.reachable`, :meth:`Analysis.dead`, etc.) can delegate
+to the rust BFS one FFI hop at a time instead of walking the Python
+adjacency list per node.
 """
 
 from __future__ import annotations
@@ -30,7 +36,7 @@ def materialize_project(
     src_roots: Sequence[Path] = (),
     *,
     show_progress: bool = False,
-) -> SymbolGraph:
+) -> tuple["native.ProjectContext", SymbolGraph]:
     """Materialize ``project_root`` end-to-end via the rust backend.
 
     Builds a :class:`native.ProjectContext` rooted at ``project_root``,
@@ -38,6 +44,11 @@ def materialize_project(
     :meth:`materialize`, and bridges the resulting :class:`NativeGraph`
     into a :class:`SymbolGraph`. Plugins that don't implement the
     rust ``run(ctx)`` protocol are silently skipped.
+
+    Returns the ``(ctx, graph)`` pair so the caller (typically
+    :class:`Analysis`) can route bulk reachability queries through the
+    rust BFS via :meth:`native.ProjectContext.reachable` /
+    :meth:`descendants` / :meth:`ancestors`.
 
     ``show_progress=True`` makes the rust backend draw indicatif progress
     bars to stderr for each of the three per-file phases plus the
@@ -54,7 +65,8 @@ def materialize_project(
     for plugin in plugins:
         if hasattr(plugin, "run"):
             ctx.add_plugin(plugin)
-    return _bridge(ctx.materialize())
+    graph = _bridge(ctx.materialize())
+    return ctx, graph
 
 
 def _bridge(graph: "native.NativeGraph") -> SymbolGraph:

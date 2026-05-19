@@ -562,13 +562,23 @@ impl ProjectContext {
         }
         plugin_bar.finish_and_clear();
 
-        let outputs =
-            slf.borrow(py).outputs.borrow_mut().take().ok_or_else(|| {
-                PyRuntimeError::new_err("ProjectContext was already materialized")
-            })?;
+        // Keep ``outputs`` alive past materialize so post-materialize
+        // queries (``descendants`` / ``ancestors`` / ``reachable``) still
+        // see the graph. Snapshot a fresh ``NativeGraph`` from the
+        // builder's interned node + edge vecs; the originals stay put.
+        let this = slf.borrow(py);
+        let outputs_ref = this.outputs.borrow();
+        let outputs = outputs_ref
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("ProjectContext lost its outputs"))?;
         Ok(NativeGraph {
-            nodes: outputs.builder.nodes,
-            edges: outputs.builder.edges,
+            nodes: outputs
+                .builder
+                .nodes
+                .iter()
+                .map(|n| n.clone_ref(py))
+                .collect(),
+            edges: outputs.builder.edges.clone(),
         })
     }
 }
@@ -966,13 +976,16 @@ impl ProjectContext {
             .collect())
     }
 
-    /// Forward closure from every entrypoint-flagged node. The set of
-    /// dead decls is the complement against ``nodes()``.
-    #[pyo3(signature = (*, skip_flags = 0))]
+    /// Forward closure from every node carrying any bit in
+    /// ``seed_flags`` (defaults to ``NODE_FLAG_ENTRYPOINT`` for the
+    /// classic "alive from entrypoints" question). The set of dead
+    /// decls is the complement against ``nodes()``.
+    #[pyo3(signature = (*, skip_flags = 0, seed_flags = NODE_FLAG_ENTRYPOINT))]
     pub(crate) fn reachable(
         &self,
         py: Python<'_>,
         skip_flags: u32,
+        seed_flags: u32,
     ) -> PyResult<Vec<Py<NativeNode>>> {
         let outputs = self.outputs.borrow();
         let outputs = outputs
@@ -983,7 +996,7 @@ impl ProjectContext {
             .nodes
             .iter()
             .enumerate()
-            .filter_map(|(idx, n)| (n.borrow(py).flags & NODE_FLAG_ENTRYPOINT != 0).then_some(idx));
+            .filter_map(|(idx, n)| (n.borrow(py).flags & seed_flags != 0).then_some(idx));
         Ok(bfs(&outputs.builder, seeds, Direction::Forward, skip_flags)
             .into_iter()
             .map(|i| outputs.builder.nodes[i].clone_ref(py))

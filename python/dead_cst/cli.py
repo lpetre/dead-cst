@@ -262,9 +262,8 @@ def why_alive(
         entrypoints=[],
         plugin_names=plugin or [],
     )
-    graph = Analysis(
-        root, resolver=path_resolver, plugins=plugins, show_progress=True
-    ).materialize_all()
+    analysis = Analysis(root, resolver=path_resolver, plugins=plugins, show_progress=True)
+    graph = analysis.materialize_all()
 
     target_node: SymbolNode | None = None
     for node in graph.nodes:
@@ -281,16 +280,9 @@ def why_alive(
     typer.echo(f"In-degree: {graph.in_degree(graph.index(target_node))}")
     typer.echo("\nPredecessor chain:")
 
-    seen_idx: set[int] = set()
-    stack: list[int] = [graph.index(target_node)]
-    while stack:
-        i = stack.pop()
-        if i in seen_idx:
-            continue
-        seen_idx.add(i)
-        node = graph.node(i)
+    # Delegate the reverse-closure walk to the rust BFS.
+    for node in analysis.ancestors(target_node):
         typer.echo(f"  <- {node.fqname} ({node.kind}) at {_rel_path(node.path, root)}")
-        stack.extend(graph.predecessor_indices(i))
 
 
 def _is_dunder_all(node: SymbolNode) -> bool:

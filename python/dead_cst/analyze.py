@@ -4,12 +4,15 @@ import logging
 from collections import deque
 from functools import cached_property
 from pathlib import Path
-from typing import Iterable, Iterator, Mapping, Sequence
+from typing import TYPE_CHECKING, Iterable, Iterator, Mapping, Sequence
 
 from ._graphstore import SymbolGraph
 from .graph import KEEPALIVE_DEFAULT, EdgeFlags, SymbolNode
 from .resolvers import Package, PathResolver
 from .resolvers._core import _validate_packages
+
+if TYPE_CHECKING:
+    from dead_cst import _native as native
 
 
 def _path_under(node_path: str, prefix: Path) -> bool:
@@ -109,8 +112,10 @@ def _iter_dead(
     *,
     seed_flags: int = KEEPALIVE_DEFAULT,
     prefix: Path | None = None,
+    reachable: set[SymbolNode] | None = None,
 ) -> Iterator[SymbolNode]:
-    reachable = _find_reachable(graph, _keepalive_seeds(graph, seed_flags))
+    if reachable is None:
+        reachable = _find_reachable(graph, _keepalive_seeds(graph, seed_flags))
     for n in graph.nodes:
         if prefix is not None and not _path_under(n.path, prefix):
             continue
@@ -190,6 +195,11 @@ class Analysis:
         self._plugins: tuple[object, ...] = tuple(plugins)
         self._show_progress: bool = show_progress
         self._full_graph: SymbolGraph | None = None
+        # Held past ``materialize_all`` so the rust BFS queries
+        # (:meth:`reachable`, :meth:`dead`, :meth:`descendants`,
+        # :meth:`ancestors`) can run against the live ``ProjectContext``
+        # without re-building the project graph.
+        self._ctx: "native.ProjectContext | None" = None
         self._reverse_closures: dict[Path, frozenset[Path]] = {}
 
     @property
@@ -230,6 +240,10 @@ class Analysis:
         (:func:`dead_cst._native.materialize_project`), which uses ty's
         ``SemanticIndex`` to assemble the graph in one pass. Each
         registered plugin's ``run(ctx)`` is invoked during this pass.
+
+        Stashes the underlying :class:`native.ProjectContext` on the
+        analysis so the bulk reachability queries can delegate to its
+        rust BFS instead of walking the Python adjacency list.
         """
         if self._full_graph is not None:
             return self._full_graph
@@ -239,7 +253,7 @@ class Analysis:
         # rust backend mounts files at the right module fqname
         # (``pkg_a/A/__init__.py`` -> ``A``, not ``pkg_a.A``).
         src_roots = tuple(p.path for p in self.packages)
-        self._full_graph = materialize_project(
+        self._ctx, self._full_graph = materialize_project(
             self._project_root,
             self._plugins,
             src_roots=src_roots,
@@ -263,13 +277,33 @@ class Analysis:
         keepalive bit ORed together). Pass a subset to scope the
         question -- e.g. ``seed_flags=NodeFlags.ENTRYPOINT`` excludes
         tests, ``noqa``-pinned imports, and notebooks from the seed set.
+
+        Delegates to :meth:`native.ProjectContext.reachable` — one FFI
+        hop instead of a Python-side BFS over the dict-of-lists.
         """
-        g = self.materialize_all()
-        return _find_reachable(g, _keepalive_seeds(g, seed_flags))
+        self.materialize_all()
+        assert self._ctx is not None
+        return set(self._ctx.reachable(seed_flags=seed_flags))
 
     def dead(self, *, seed_flags: int = KEEPALIVE_DEFAULT) -> Iterator[SymbolNode]:
         """Yield every decl that no seed in ``seed_flags`` reaches."""
-        return _iter_dead(self.materialize_all(), seed_flags=seed_flags)
+        return _iter_dead(
+            self.materialize_all(),
+            seed_flags=seed_flags,
+            reachable=self.reachable(seed_flags=seed_flags),
+        )
+
+    def descendants(self, root: SymbolNode, *, skip_flags: int = 0) -> list[SymbolNode]:
+        """Forward closure from ``root`` (rust BFS, single FFI hop)."""
+        self.materialize_all()
+        assert self._ctx is not None
+        return list(self._ctx.descendants(root, skip_flags=skip_flags))
+
+    def ancestors(self, decl: SymbolNode, *, skip_flags: int = 0) -> list[SymbolNode]:
+        """Reverse closure into ``decl`` (rust BFS, single FFI hop)."""
+        self.materialize_all()
+        assert self._ctx is not None
+        return list(self._ctx.ancestors(decl, skip_flags=skip_flags))
 
     def kept_alive_by_dead_branches(
         self, *, seed_flags: int = KEEPALIVE_DEFAULT
@@ -323,14 +357,19 @@ class PackageView:
         return self._analysis.materialize_all()
 
     def reachable(self, *, seed_flags: int = KEEPALIVE_DEFAULT) -> set[SymbolNode]:
-        g = self._analysis.materialize_all()
-        return _find_reachable(g, _keepalive_seeds(g, seed_flags), prefix=self._package.path)
+        prefix = self._package.path
+        return {
+            n
+            for n in self._analysis.reachable(seed_flags=seed_flags)
+            if _path_under(n.path, prefix)
+        }
 
     def dead(self, *, seed_flags: int = KEEPALIVE_DEFAULT) -> Iterator[SymbolNode]:
         return _iter_dead(
             self._analysis.materialize_all(),
             seed_flags=seed_flags,
             prefix=self._package.path,
+            reachable=self._analysis.reachable(seed_flags=seed_flags),
         )
 
     def kept_alive_by_dead_branches(
