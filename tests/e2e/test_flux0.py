@@ -66,7 +66,7 @@ def test_analyze_flux0_server_runs_to_completion(flux0_server_src):
     """Level 0: dead-cst should walk the whole package without crashing."""
     result = CliRunner().invoke(
         app,
-        ["analyze", flux0_server_src, "--plugin", "main_block", "--no-cache"],
+        ["analyze", flux0_server_src, "--plugin", "main_block"],
     )
     # Typer raises SystemExit on non-zero exit; anything else means we crashed.
     assert result.exception is None or isinstance(result.exception, SystemExit), result.exception
@@ -77,7 +77,7 @@ def test_analyze_flux0_server_runs_to_completion(flux0_server_src):
 def test_analyze_flux0_cli_runs_to_completion(flux0_cli_src):
     result = CliRunner().invoke(
         app,
-        ["analyze", flux0_cli_src, "--plugin", "main_block", "--no-cache"],
+        ["analyze", flux0_cli_src, "--plugin", "main_block"],
     )
     assert result.exception is None or isinstance(result.exception, SystemExit), result.exception
     assert result.exit_code in (0, 1), (result.exit_code, result.output)
@@ -103,7 +103,6 @@ def test_why_alive_flux0_server_main(flux0_server_src):
             "flux0_server.main.main",
             "--plugin",
             "main_block",
-            "--no-cache",
         ],
     )
     assert result.exception is None, result.exception
@@ -121,7 +120,6 @@ def test_why_alive_flux0_cli_main(flux0_cli_src):
             "flux0_cli.main.main",
             "--plugin",
             "main_block",
-            "--no-cache",
         ],
     )
     assert result.exception is None, result.exception
