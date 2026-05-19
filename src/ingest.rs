@@ -16,6 +16,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use pyo3::prelude::*;
 use ruff_db::files::{File, FilePath};
@@ -38,8 +39,8 @@ use ty_python_semantic::SemanticModel;
 
 use crate::builder::GraphBuilder;
 use crate::graph::{
-    DeclIndex, GlobalsByName, Import, ImportSpec, LiveDeclIndex, NativeNode, Resolution,
-    StarReexports,
+    DeclIndex, GlobalsByName, Import, ImportSpec, LiveDeclIndex, Resolution, StarReexports,
+    SymbolNode,
 };
 use crate::helpers::{
     detect_dead_ranges, file_default_flags, file_path_string, module_fqname_for_file, position,
@@ -91,7 +92,7 @@ pub(crate) fn ingest_decls(
     let (msl, msc, mel, mec) = position(&line_index, &source, parsed.syntax().range);
     let module_idx = builder.intern_node(
         py,
-        NativeNode {
+        SymbolNode {
             fqname: module_fqname.clone(),
             kind: "module",
             path: path_str.clone(),
@@ -101,6 +102,7 @@ pub(crate) fn ingest_decls(
             end_column: mec,
             flags: default_flags,
             imports: None,
+            cached_hash: OnceLock::new(),
         },
     )?;
     module_nodes.insert(file, module_idx);
@@ -237,7 +239,7 @@ pub(crate) fn ingest_decls(
 
         let node_idx = builder.intern_node(
             py,
-            NativeNode {
+            SymbolNode {
                 fqname: format!("{module_fqname}.{local_name}"),
                 kind: node_kind,
                 path: path_str.clone(),
@@ -247,6 +249,7 @@ pub(crate) fn ingest_decls(
                 end_column: ec,
                 flags,
                 imports,
+                cached_hash: OnceLock::new(),
             },
         )?;
         builder.add_edge(node_idx, module_idx, 0);
@@ -1022,7 +1025,7 @@ pub(crate) fn mint_module_node(
     let flags = file_default_flags(db, file);
     let idx = builder.intern_node(
         py,
-        NativeNode {
+        SymbolNode {
             fqname,
             kind: "module",
             path: path_str,
@@ -1032,6 +1035,7 @@ pub(crate) fn mint_module_node(
             end_column: ec,
             flags,
             imports: None,
+            cached_hash: OnceLock::new(),
         },
     )?;
     module_nodes.insert(file, idx);

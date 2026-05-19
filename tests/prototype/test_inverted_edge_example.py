@@ -11,7 +11,7 @@ reachability:
   resolved event class anywhere in the project.
 
 The plugin walks decorator refs, reads the resolved ``event`` kwarg
-as a :class:`NativeNode` (the payload-side declref resolution
+as a :class:`SymbolNode` (the payload-side declref resolution
 re-added on top of literal-only matchers), and emits an
 ``event_class → decorated_function`` edge — the *inverse* of the
 natural ``decorated → event_class`` use edge that already exists.
@@ -45,7 +45,7 @@ class HandlerByKwargPlugin:
     """For every ``@<owner>.<attr>(<kwarg>=<ImportedClass>)`` decorator,
     emit an ``ImportedClass -> decorated_function`` edge.
 
-    Reads the resolved kwarg as a :class:`native.NativeNode` from
+    Reads the resolved kwarg as a :class:`native.SymbolNode` from
     ``ref.kwargs``. Non-literal expressions that don't statically
     resolve (anonymous lambdas, runtime objects, etc.) surface as
     ``None`` and are skipped silently.
@@ -118,7 +118,7 @@ def test_inverted_edge_from_kwarg_imported_symbol(make_ctx):
 def test_no_inverted_edge_when_kwarg_is_a_literal(make_ctx):
     """``@registry.on(event="user.created")`` (string literal, not a
     resolvable name) emits no inverted edge — the plugin skips refs
-    whose kwarg payload isn't a NativeNode."""
+    whose kwarg payload isn't a SymbolNode."""
 
     ctx = make_ctx(
         {

@@ -305,11 +305,11 @@ def test_uv_workspace_flat_layout_with_tests_dirs(tmp_path: Path):
     graph = Analysis(tmp_path, resolver=UvResolver()).materialize_all()
 
     # The cross-member import resolved: pkg_a/app.py -> libc/foo/c/mod.y
-    mod_y = next(n for n in graph.nodes if n.fqname == "foo.c.mod.y" and n.type == "variable")
+    mod_y = next(n for n in graph.nodes if n.fqname == "foo.c.mod.y" and n.kind == "variable")
     app_import = next(
         n
         for n in graph.nodes
-        if n.type == "import" and n.path == (pkg_a / "pkg_a" / "app.py").resolve()
+        if n.kind == "import" and n.path == str((pkg_a / "pkg_a" / "app.py").resolve())
     )
     assert graph.raw.has_edge(graph.index(app_import), graph.index(mod_y))
 
@@ -398,16 +398,16 @@ def test_uv_workspace_shared_namespace_package(tmp_path: Path):
 
     # foo.a.value (in foo-a) and foo.b.result (in foo-b) both made it into
     # the graph as distinct variables under the shared ``foo`` namespace.
-    value = next(n for n in graph.nodes if n.fqname == "foo.a.value" and n.type == "variable")
-    result = next(n for n in graph.nodes if n.fqname == "foo.b.result" and n.type == "variable")
-    assert value.path == (foo_a / "foo" / "a" / "__init__.py").resolve()
-    assert result.path == (foo_b / "foo" / "b" / "__init__.py").resolve()
+    value = next(n for n in graph.nodes if n.fqname == "foo.a.value" and n.kind == "variable")
+    result = next(n for n in graph.nodes if n.fqname == "foo.b.result" and n.kind == "variable")
+    assert value.path == str((foo_a / "foo" / "a" / "__init__.py").resolve())
+    assert result.path == str((foo_b / "foo" / "b" / "__init__.py").resolve())
 
     # The cross-member ``from foo.a import value`` in foo-b resolved across
     # the namespace boundary back to foo-a's declaration.
     b_import = next(
         n
         for n in graph.nodes
-        if n.type == "import" and n.path == (foo_b / "foo" / "b" / "__init__.py").resolve()
+        if n.kind == "import" and n.path == str((foo_b / "foo" / "b" / "__init__.py").resolve())
     )
     assert graph.raw.has_edge(graph.index(b_import), graph.index(value))

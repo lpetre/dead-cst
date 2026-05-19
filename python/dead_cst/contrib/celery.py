@@ -32,7 +32,7 @@ class CeleryPlugin(DispatchAppPlugin):
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
         yield from DispatchAppPlugin.run(self, ctx)
         # ``@shared_task`` is appless and not covered by DispatchAppPlugin.
-        by_path: dict[str, list[native.NativeNode]] = {}
+        by_path: dict[str, list[native.SymbolNode]] = {}
         for ref in (
             native.query(ctx)
             .decorators()

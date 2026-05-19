@@ -1548,7 +1548,7 @@ def test_shadowed_declarations(build_decl_graph, assert_positional_edges, files,
 def test_cross_module_type_alias_import(build_decl_graph, assert_edges):
     """Importing a PEP 695 ``type`` alias from another module resolves cleanly.
 
-    Regression: ``_edges.resolve_edges`` hit ``assert decl.type == "import"``
+    Regression: ``_edges.resolve_edges`` hit ``assert decl.kind == "import"``
     when a ``type_alias`` declaration was the re-export target, because it
     was not included in the concrete-type guard alongside function/class/variable.
     """
@@ -1707,8 +1707,8 @@ def test_stub_only_decl_flagged_entrypoint_rust(build_decl_graph):
     graph = build_decl_graph(PEER_STUB_FILES)
     by_fqname = {}
     for n in graph.raw.nodes():
-        if str(n.path).endswith("foo.pyi") and n.type == "function":
-            by_fqname[n.fqname] = NodeFlags(int(n.flags))
+        if str(n.path).endswith("foo.pyi") and n.kind == "function":
+            by_fqname[n.fqname] = int(n.flags)
     assert by_fqname.get("foo.stub_only", NodeFlags.NONE) & NodeFlags.ENTRYPOINT, (
         f"stub-only decl missing ENTRYPOINT; flags = {by_fqname.get('foo.stub_only')!r}"
     )
@@ -1736,6 +1736,6 @@ def test_notebook_decls_carry_notebook_flag(write_notebook, build_decl_graph):
     notebook_nodes = [n for n in graph.raw.nodes() if str(n.path).endswith(".ipynb")]
     assert notebook_nodes, "expected at least one decl minted from the .ipynb file"
     for n in notebook_nodes:
-        assert NodeFlags(int(n.flags)) & NodeFlags.NOTEBOOK, (
-            f"{n.fqname!r} missing NOTEBOOK flag (got {NodeFlags(int(n.flags))!r})"
+        assert int(n.flags) & NodeFlags.NOTEBOOK, (
+            f"{n.fqname!r} missing NOTEBOOK flag (got {int(n.flags)!r})"
         )

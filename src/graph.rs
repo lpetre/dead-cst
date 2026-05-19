@@ -1,12 +1,16 @@
-//! Public Python data classes (`Import`, `NativeNode`, `NativeGraph`),
+//! Public Python data classes (`Import`, `SymbolNode`, `NativeGraph`),
 //! the type aliases that describe graph indices, and the `NodeFlags`/
 //! `EdgeFlags` constant catalogs exposed to plugins.
 //!
 //! See `src/CLAUDE.md` for the architectural rules these types follow.
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::sync::OnceLock;
 
 use pyo3::prelude::*;
+use pyo3::types::PyAnyMethods;
 use ruff_db::files::File;
 use ty_python_core::place::ScopedPlaceId;
 
@@ -40,6 +44,23 @@ impl Import {
             self.module, self.decl, self.star,
         )
     }
+
+    fn __hash__(&self) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        self.module.hash(&mut hasher);
+        self.decl.hash(&mut hasher);
+        self.star.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn __eq__(&self, other: &Bound<'_, PyAny>) -> bool {
+        match other.extract::<PyRef<Import>>() {
+            Ok(other) => {
+                self.module == other.module && self.decl == other.decl && self.star == other.star
+            }
+            Err(_) => false,
+        }
+    }
 }
 
 /// A single node in a `NativeGraph`.
@@ -47,24 +68,99 @@ impl Import {
 /// `imports` is populated for `kind="import"` nodes only (one per
 /// alias, plus one per name brought in by `from X import *`). All
 /// other kinds carry `None`.
-#[pyclass(get_all, frozen)]
-pub(crate) struct NativeNode {
+///
+/// `cached_hash` memoizes `__hash__` so repeated hashing (graph
+/// builds, set membership, codemod walks) pays the full SipHash cost
+/// once per node instead of on every call. `OnceLock<u64>` is the
+/// minimal `Send + Sync` cell that's compatible with `#[pyclass(frozen)]`.
+#[pyclass(frozen)]
+pub(crate) struct SymbolNode {
+    #[pyo3(get)]
     pub(crate) fqname: String,
+    #[pyo3(get)]
     pub(crate) kind: &'static str,
+    #[pyo3(get)]
     pub(crate) path: String,
+    #[pyo3(get)]
     pub(crate) start_line: usize,
+    #[pyo3(get)]
     pub(crate) start_column: usize,
+    #[pyo3(get)]
     pub(crate) end_line: usize,
+    #[pyo3(get)]
     pub(crate) end_column: usize,
+    #[pyo3(get)]
     pub(crate) flags: u32,
+    #[pyo3(get)]
     pub(crate) imports: Option<Py<Import>>,
+    pub(crate) cached_hash: OnceLock<u64>,
+}
+
+const VALID_KINDS: &[&str] = &[
+    "function",
+    "class",
+    "variable",
+    "import",
+    "type_alias",
+    "module",
+    "synthetic",
+];
+
+fn intern_kind(kind: &str) -> PyResult<&'static str> {
+    for valid in VALID_KINDS {
+        if *valid == kind {
+            return Ok(*valid);
+        }
+    }
+    Err(pyo3::exceptions::PyValueError::new_err(format!(
+        "invalid SymbolNode.kind: {kind:?}"
+    )))
 }
 
 #[pymethods]
-impl NativeNode {
+impl SymbolNode {
+    #[new]
+    #[pyo3(signature = (
+        fqname,
+        kind,
+        path,
+        *,
+        start_line = 0,
+        start_column = 0,
+        end_line = 0,
+        end_column = 0,
+        flags = 0,
+        imports = None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        fqname: String,
+        kind: &str,
+        path: String,
+        start_line: usize,
+        start_column: usize,
+        end_line: usize,
+        end_column: usize,
+        flags: u32,
+        imports: Option<Py<Import>>,
+    ) -> PyResult<Self> {
+        Ok(Self {
+            fqname,
+            kind: intern_kind(kind)?,
+            path,
+            start_line,
+            start_column,
+            end_line,
+            end_column,
+            flags,
+            imports,
+            cached_hash: OnceLock::new(),
+        })
+    }
+
     fn __repr__(&self) -> String {
         format!(
-            "NativeNode(fqname={:?}, kind={:?}, path={:?}, start=({}, {}), end=({}, {}), flags={})",
+            "SymbolNode(fqname={:?}, kind={:?}, path={:?}, start=({}, {}), end=({}, {}), flags={})",
             self.fqname,
             self.kind,
             self.path,
@@ -75,12 +171,63 @@ impl NativeNode {
             self.flags,
         )
     }
+
+    fn __hash__(&self, py: Python<'_>) -> u64 {
+        *self.cached_hash.get_or_init(|| {
+            let mut hasher = DefaultHasher::new();
+            self.fqname.hash(&mut hasher);
+            self.kind.hash(&mut hasher);
+            self.path.hash(&mut hasher);
+            self.start_line.hash(&mut hasher);
+            self.start_column.hash(&mut hasher);
+            self.end_line.hash(&mut hasher);
+            self.end_column.hash(&mut hasher);
+            self.flags.hash(&mut hasher);
+            if let Some(imp) = &self.imports {
+                let imp_ref = imp.borrow(py);
+                imp_ref.module.hash(&mut hasher);
+                imp_ref.decl.hash(&mut hasher);
+                imp_ref.star.hash(&mut hasher);
+            } else {
+                // Discriminate "no imports" from "imports = ()".
+                0u8.hash(&mut hasher);
+            }
+            hasher.finish()
+        })
+    }
+
+    fn __eq__(&self, other: &Bound<'_, PyAny>) -> bool {
+        let Ok(other) = other.extract::<PyRef<SymbolNode>>() else {
+            return false;
+        };
+        if self.fqname != other.fqname
+            || self.kind != other.kind
+            || self.path != other.path
+            || self.start_line != other.start_line
+            || self.start_column != other.start_column
+            || self.end_line != other.end_line
+            || self.end_column != other.end_column
+            || self.flags != other.flags
+        {
+            return false;
+        }
+        let py = other.py();
+        match (&self.imports, &other.imports) {
+            (None, None) => true,
+            (Some(a), Some(b)) => {
+                let a = a.borrow(py);
+                let b = b.borrow(py);
+                a.module == b.module && a.decl == b.decl && a.star == b.star
+            }
+            _ => false,
+        }
+    }
 }
 
 /// One project-wide graph contribution, packed for one FFI hop.
 #[pyclass(get_all, frozen)]
 pub(crate) struct NativeGraph {
-    pub(crate) nodes: Vec<Py<NativeNode>>,
+    pub(crate) nodes: Vec<Py<SymbolNode>>,
     pub(crate) edges: Vec<(usize, usize, u32)>,
 }
 
@@ -157,7 +304,7 @@ pub(crate) type StarReexports = HashMap<(File, String), String>;
 /// Return type of `ProjectContext.find_main_blocks`: one entry per
 /// file with a top-level ``if __name__ == "__main__":`` block, paired
 /// with the decls that fall inside it.
-pub(crate) type MainBlock = (Py<NativeNode>, Vec<Py<NativeNode>>);
+pub(crate) type MainBlock = (Py<SymbolNode>, Vec<Py<SymbolNode>>);
 
 /// Outcome of resolving a `Name` use to its reaching definition.
 ///
@@ -175,7 +322,7 @@ pub(crate) enum Resolution {
     },
 }
 
-/// Bit values stamped into [`NativeNode::flags`]. Mirrors
+/// Bit values stamped into [`SymbolNode::flags`]. Mirrors
 /// `dead_cst.graph.NodeFlags` exactly so plugin code can mix
 /// rust-emitted and libcst-emitted nodes.
 ///

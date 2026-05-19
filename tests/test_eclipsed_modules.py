@@ -35,13 +35,15 @@ def test_package_wins_trie_slot_for_cross_module_imports(tmp_path, write_files, 
         if s.fqname == "pkg.foo.x"
     ]
     assert len(targets) == 1
-    assert targets[0].path.name == "__init__.py"
+    assert targets[0].path.endswith("/__init__.py")
 
     reachable = find_reachable(graph, _keepalive_seeds(graph, KEEPALIVE_DEFAULT))
     package_x = next(
-        n for n in graph.nodes if n.fqname == "pkg.foo.x" and n.path.name == "__init__.py"
+        n for n in graph.nodes if n.fqname == "pkg.foo.x" and n.path.endswith("/__init__.py")
     )
-    eclipsed_x = next(n for n in graph.nodes if n.fqname == "pkg.foo.x" and n.path.name == "foo.py")
+    eclipsed_x = next(
+        n for n in graph.nodes if n.fqname == "pkg.foo.x" and n.path.endswith("/foo.py")
+    )
     assert package_x in reachable
     assert eclipsed_x not in reachable
 
@@ -60,13 +62,13 @@ def test_eclipsed_file_keeps_main_block_entrypoint(tmp_path, write_files, make_a
 
     helper = next(n for n in graph.nodes if n.fqname == "pkg.foo.helper")
     eclipsed_module = next(
-        n for n in graph.nodes if n.fqname == "pkg.foo" and n.path.name == "foo.py"
+        n for n in graph.nodes if n.fqname == "pkg.foo" and n.path.endswith("/foo.py")
     )
     package_module = next(
-        n for n in graph.nodes if n.fqname == "pkg.foo" and n.path.name == "__init__.py"
+        n for n in graph.nodes if n.fqname == "pkg.foo" and n.path.endswith("/__init__.py")
     )
     main_synth = next(
-        n for n in graph.nodes if n.type == "synthetic" and n.fqname.endswith(":pkg.foo")
+        n for n in graph.nodes if n.kind == "synthetic" and n.fqname.endswith(":pkg.foo")
     )
 
     assert main_synth in reachable, "MainBlockPlugin synthetic must seed reachability"

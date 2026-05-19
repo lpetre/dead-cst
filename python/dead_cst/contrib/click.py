@@ -32,9 +32,9 @@ class ClickPlugin(DecoratedDeclPlugin):
         if not native.query(ctx).imports().of(self.decorator_module).count():
             return
 
-        groups_by_owner: dict[tuple[str, str], list[native.NativeNode]] = {}
+        groups_by_owner: dict[tuple[str, str], list[native.SymbolNode]] = {}
 
-        def add_group(node: "native.NativeNode") -> None:
+        def add_group(node: "native.SymbolNode") -> None:
             simple = node.fqname.rsplit(".", 1)[-1]
             groups_by_owner.setdefault((node.path, simple), []).append(node)
 
@@ -53,7 +53,7 @@ class ClickPlugin(DecoratedDeclPlugin):
         ):
             add_group(cons_ref.var)
 
-        handlers: list[tuple[str, native.NativeNode]] = [
+        handlers: list[tuple[str, native.SymbolNode]] = [
             (h.decorator_owner or "", h.decorated)
             for h in native.query(ctx).decorators().where_owner_attr(list(_REGISTRATION_DECORATORS))
         ]

@@ -34,7 +34,7 @@ class ServerConfigPlugin(Plugin):
     filenames: tuple[str, ...] = _DEFAULT_FILENAMES
 
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
-        targets_by_path: dict[str, list[native.NativeNode]] = {}
+        targets_by_path: dict[str, list[native.SymbolNode]] = {}
         for n in ctx.nodes():
             if Path(n.path).name not in self.filenames:
                 continue

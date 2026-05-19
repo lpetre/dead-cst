@@ -19,7 +19,6 @@ from pathlib import Path
 
 import pytest
 import typer
-from libcst.metadata import CodePosition, CodeRange
 from typer.testing import CliRunner
 
 from dead_cst.plugins import (
@@ -78,8 +77,16 @@ def project(tmp_path):
     return _make
 
 
-def _pos() -> CodeRange:
-    return CodeRange(start=CodePosition(line=1, column=0), end=CodePosition(line=1, column=1))
+def _make_node(fqname: str, kind: str, path: str = "/x.py") -> SymbolNode:
+    return SymbolNode(
+        fqname,
+        kind,
+        path,
+        start_line=1,
+        start_column=0,
+        end_line=1,
+        end_column=1,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -235,7 +242,7 @@ def test_build_plugins_unknown_plugin_name_raises():
     ],
 )
 def test_is_dunder_all(fqname, type_, expected):
-    node = SymbolNode(fqname, type_, Path("/x.py"), _pos())
+    node = _make_node(fqname, type_)
     assert _is_dunder_all(node) is expected
 
 
@@ -248,7 +255,7 @@ def test_is_dunder_all(fqname, type_, expected):
     ],
 )
 def test_is_external_dep(fqname, type_, expected):
-    node = SymbolNode(fqname, type_, Path("/x.py"), _pos())
+    node = _make_node(fqname, type_)
     assert _is_external_dep(node) is expected
 
 
@@ -272,8 +279,8 @@ def test_dead_real_filters_synthetic_nodes():
     alongside user-visible declarations."""
     from dead_cst._graphstore import SymbolGraph
 
-    real = SymbolNode("pkg.f", "function", Path("/a.py"), _pos())
-    entrypoint_synth = SymbolNode(f"{EXPLICIT_PREFIX}pkg.f", "synthetic", Path("/a.py"), _pos())
+    real = _make_node("pkg.f", "function", "/a.py")
+    entrypoint_synth = _make_node(f"{EXPLICIT_PREFIX}pkg.f", "synthetic", "/a.py")
 
     g = SymbolGraph()
     for n in (real, entrypoint_synth):
@@ -482,17 +489,17 @@ def test_dependencies_no_third_party(runner, project):
 
 
 def test_dependencies_third_party_listed(runner, project):
-    root = project({"mod.py": "import rustworkx\n_x = rustworkx\n"})
+    root = project({"mod.py": "import tqdm\n_x = tqdm\n"})
     result = runner.invoke(app, ["dependencies", str(root)])
     assert result.exit_code == 0
-    assert "[external dist] rustworkx" in result.stdout
+    assert "[external dist] tqdm" in result.stdout
 
 
 def test_dependencies_json_output_groups_by_base(runner, project):
-    root = project({"mod.py": "import rustworkx\n_x = rustworkx\n"})
+    root = project({"mod.py": "import tqdm\n_x = tqdm\n"})
     result = runner.invoke(app, ["dependencies", str(root), "--format", "json"])
     assert result.exit_code == 0
-    assert json.loads(result.stdout) == {str(root.resolve()): ["[external dist] rustworkx"]}
+    assert json.loads(result.stdout) == {str(root.resolve()): ["[external dist] tqdm"]}
 
 
 def test_dependencies_json_output_empty_when_no_deps(runner, project):

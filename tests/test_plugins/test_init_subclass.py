@@ -336,7 +336,7 @@ def test_init_subclass_marker_in_predecessor_chain(make_analysis, write_files):
     foo = next(n for n in graph.nodes if n.fqname == "pkg.impls.Foo")
     preds = [graph.node(i) for i in graph.raw.predecessor_indices(graph.index(foo))]
     marker = next(
-        (p for p in preds if p.type == "synthetic" and p.fqname.startswith(INIT_SUBCLASS_PREFIX)),
+        (p for p in preds if p.kind == "synthetic" and p.fqname.startswith(INIT_SUBCLASS_PREFIX)),
         None,
     )
     assert marker is not None, f"expected a marker predecessor, got {preds!r}"
@@ -344,7 +344,7 @@ def test_init_subclass_marker_in_predecessor_chain(make_analysis, write_files):
 
     marker_preds = [graph.node(i) for i in graph.raw.predecessor_indices(graph.index(marker))]
     parent = next(p for p in marker_preds if p.fqname == "pkg.base.Plugin")
-    assert parent.type == "class"
+    assert parent.kind == "class"
 
 
 def test_init_subclass_loads_via_load_plugin():

@@ -37,7 +37,7 @@ class UnittestPlugin(Plugin):
         if not importer_paths:
             return
 
-        decls_by_path: dict[str, list[native.NativeNode]] = {}
+        decls_by_path: dict[str, list[native.SymbolNode]] = {}
         for base_fqname in _UNITTEST_BASE_FQNAMES:
             for sub in (
                 native.query(ctx).subclasses().of_fqn(base_fqname).transitive(True).collect()

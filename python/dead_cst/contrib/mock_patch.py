@@ -51,7 +51,7 @@ class MockPatchPlugin(Plugin):
                 .where_required_positional(required)
             )
 
-        owners_by_fqname: dict[str, list[native.NativeNode]] = {}
+        owners_by_fqname: dict[str, list[native.SymbolNode]] = {}
         for ref in refs:
             owners_by_fqname.setdefault(ref.string_arg, []).append(ref.owner)
 

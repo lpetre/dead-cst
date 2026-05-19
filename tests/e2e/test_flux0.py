@@ -135,7 +135,7 @@ def test_why_alive_flux0_cli_main(flux0_cli_src):
 
 def _module_node(graph, fqname):
     return next(
-        (n for n in graph.nodes if n.type == "module" and n.fqname == fqname),
+        (n for n in graph.nodes if n.kind == "module" and n.fqname == fqname),
         None,
     )
 
@@ -244,7 +244,7 @@ def test_flux0_server_dead_set_pins_to_real_findings(flux0_server_src):
     dead = {
         n.fqname
         for n in graph.nodes
-        if n not in reachable and n.type != "synthetic" and not n.fqname.startswith("[")
+        if n not in reachable and n.kind != "synthetic" and not n.fqname.startswith("[")
     }
     assert dead == {
         "flux0_server.main.DEFAULT_PORT",
@@ -273,7 +273,7 @@ def test_flux0_cli_dead_set_includes_real_findings_and_decorator_blind_spot(flux
     dead = {
         n.fqname
         for n in graph.nodes
-        if n not in reachable and n.type != "synthetic" and not n.fqname.startswith("[")
+        if n not in reachable and n.kind != "synthetic" and not n.fqname.startswith("[")
     }
     # Real findings: present.
     assert {"flux0_cli.main.F", "flux0_cli.main.TypeVar"} <= dead
@@ -311,7 +311,7 @@ def test_flux0_internal_modules(flux0_server_src, tmp_path):
     dead = {
         n.fqname
         for n in graph.nodes
-        if n not in reachable and n.type != "synthetic" and not n.fqname.startswith("[")
+        if n not in reachable and n.kind != "synthetic" and not n.fqname.startswith("[")
     }
     assert dead == {
         "flux0_server.main.DEFAULT_PORT",

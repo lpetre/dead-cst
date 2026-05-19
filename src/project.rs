@@ -28,8 +28,8 @@ use ty_python_core::semantic_index;
 
 use crate::builder::{apply_graph_op, bfs, lookup_idx, not_materialized, Direction, GraphBuilder};
 use crate::graph::{
-    DeclIndex, GlobalsByName, ImportSpec, LiveDeclIndex, MainBlock, NativeGraph, NativeNode,
-    StarReexports,
+    DeclIndex, GlobalsByName, ImportSpec, LiveDeclIndex, MainBlock, NativeGraph, StarReexports,
+    SymbolNode,
 };
 use crate::helpers::{
     call_callee_matches_var, class_body_defines_method, collect_all_imports_local,
@@ -567,13 +567,23 @@ impl ProjectContext {
         }
         plugin_bar.finish_and_clear();
 
-        let outputs =
-            slf.borrow(py).outputs.borrow_mut().take().ok_or_else(|| {
-                PyRuntimeError::new_err("ProjectContext was already materialized")
-            })?;
+        // Keep ``outputs`` alive past materialize so post-materialize
+        // queries (``descendants`` / ``ancestors`` / ``reachable``) still
+        // see the graph. Snapshot a fresh ``NativeGraph`` from the
+        // builder's interned node + edge vecs; the originals stay put.
+        let this = slf.borrow(py);
+        let outputs_ref = this.outputs.borrow();
+        let outputs = outputs_ref
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("ProjectContext lost its outputs"))?;
         Ok(NativeGraph {
-            nodes: outputs.builder.nodes,
-            edges: outputs.builder.edges,
+            nodes: outputs
+                .builder
+                .nodes
+                .iter()
+                .map(|n| n.clone_ref(py))
+                .collect(),
+            edges: outputs.builder.edges.clone(),
         })
     }
 }
@@ -586,7 +596,7 @@ impl ProjectContext {
     /// Pure scan over already-interned nodes — no ty re-query needed —
     /// because the visitor's decl pass already minted one node per
     /// global-scope variable binding.
-    pub(crate) fn find_module_dunders(&self, py: Python<'_>) -> PyResult<Vec<Py<NativeNode>>> {
+    pub(crate) fn find_module_dunders(&self, py: Python<'_>) -> PyResult<Vec<Py<SymbolNode>>> {
         let outputs = self.outputs.borrow();
         let outputs = outputs
             .as_ref()
@@ -627,7 +637,7 @@ impl ProjectContext {
         regexes: Vec<String>,
         str_specs: Vec<String>,
         abs_paths: Vec<String>,
-    ) -> PyResult<Vec<Py<NativeNode>>> {
+    ) -> PyResult<Vec<Py<SymbolNode>>> {
         let compiled: Vec<regex::Regex> = regexes
             .iter()
             .map(|p| {
@@ -687,7 +697,7 @@ impl ProjectContext {
         &self,
         py: Python<'_>,
         module_name: &str,
-    ) -> PyResult<Vec<Py<NativeNode>>> {
+    ) -> PyResult<Vec<Py<SymbolNode>>> {
         let outputs = self.outputs.borrow();
         let outputs = outputs
             .as_ref()
@@ -721,7 +731,7 @@ impl ProjectContext {
         &self,
         py: Python<'_>,
         fqname: &str,
-    ) -> PyResult<Vec<Py<NativeNode>>> {
+    ) -> PyResult<Vec<Py<SymbolNode>>> {
         let outputs = self.outputs.borrow();
         let outputs = outputs
             .as_ref()
@@ -748,7 +758,7 @@ impl ProjectContext {
         &self,
         py: Python<'_>,
         fqname: &str,
-    ) -> PyResult<Option<Py<NativeNode>>> {
+    ) -> PyResult<Option<Py<SymbolNode>>> {
         let outputs = self.outputs.borrow();
         let outputs = outputs
             .as_ref()
@@ -769,7 +779,7 @@ impl ProjectContext {
         &self,
         py: Python<'_>,
         path: &str,
-    ) -> PyResult<Option<Py<NativeNode>>> {
+    ) -> PyResult<Option<Py<SymbolNode>>> {
         let outputs = self.outputs.borrow();
         let outputs = outputs
             .as_ref()
@@ -790,7 +800,7 @@ impl ProjectContext {
     /// decl (``pkg.lib.Cls.method`` resolves to ``pkg.lib.Cls`` because
     /// methods don't get their own graph nodes). Returns ``None`` when
     /// the fqname can't be found anywhere — never raises.
-    pub(crate) fn resolve(&self, py: Python<'_>, fqname: &str) -> PyResult<Option<Py<NativeNode>>> {
+    pub(crate) fn resolve(&self, py: Python<'_>, fqname: &str) -> PyResult<Option<Py<SymbolNode>>> {
         let outputs = self.outputs.borrow();
         let outputs = outputs
             .as_ref()
@@ -823,7 +833,7 @@ impl ProjectContext {
         &self,
         py: Python<'_>,
         module_fqn: &str,
-    ) -> PyResult<Vec<Py<NativeNode>>> {
+    ) -> PyResult<Vec<Py<SymbolNode>>> {
         let outputs = self.outputs.borrow();
         let outputs = outputs
             .as_ref()
@@ -863,7 +873,7 @@ impl ProjectContext {
         &self,
         py: Python<'_>,
         module_fqn: &str,
-    ) -> PyResult<Vec<Py<NativeNode>>> {
+    ) -> PyResult<Vec<Py<SymbolNode>>> {
         let outputs = self.outputs.borrow();
         let outputs = outputs
             .as_ref()
@@ -907,7 +917,7 @@ impl ProjectContext {
         &self,
         py: Python<'_>,
         module_fqn: &str,
-    ) -> PyResult<Option<Vec<Py<NativeNode>>>> {
+    ) -> PyResult<Option<Vec<Py<SymbolNode>>>> {
         let all_fqn = format!("{module_fqn}.__all__");
         let Some(entries) = self.find_literal_list_entries(&all_fqn)? else {
             return Ok(None);
@@ -916,7 +926,7 @@ impl ProjectContext {
         let outputs = outputs
             .as_ref()
             .ok_or_else(|| not_materialized("find_module_dunder_all_exports"))?;
-        let mut out: Vec<Py<NativeNode>> = Vec::new();
+        let mut out: Vec<Py<SymbolNode>> = Vec::new();
         for entry in entries {
             let entry_fqn = format!("{module_fqn}.{entry}");
             if let Some(idxs) = outputs.decl_by_fqname.get(&entry_fqn) {
@@ -995,7 +1005,7 @@ impl ProjectContext {
         &self,
         py: Python<'_>,
         path_prefix: &str,
-    ) -> PyResult<Vec<Py<NativeNode>>> {
+    ) -> PyResult<Vec<Py<SymbolNode>>> {
         let outputs = self.outputs.borrow();
         let outputs = outputs
             .as_ref()
@@ -1015,7 +1025,7 @@ impl ProjectContext {
         &self,
         py: Python<'_>,
         substring: &str,
-    ) -> PyResult<Vec<Py<NativeNode>>> {
+    ) -> PyResult<Vec<Py<SymbolNode>>> {
         let outputs = self.outputs.borrow();
         let outputs = outputs
             .as_ref()
@@ -1037,7 +1047,7 @@ impl ProjectContext {
         &self,
         py: Python<'_>,
         pattern: &str,
-    ) -> PyResult<Vec<Py<NativeNode>>> {
+    ) -> PyResult<Vec<Py<SymbolNode>>> {
         let regex = self.compile_regex(pattern)?;
         let outputs = self.outputs.borrow();
         let outputs = outputs
@@ -1068,9 +1078,9 @@ impl ProjectContext {
     pub(crate) fn descendants(
         &self,
         py: Python<'_>,
-        root: &NativeNode,
+        root: &SymbolNode,
         skip_flags: u32,
-    ) -> PyResult<Vec<Py<NativeNode>>> {
+    ) -> PyResult<Vec<Py<SymbolNode>>> {
         let outputs = self.outputs.borrow();
         let outputs = outputs
             .as_ref()
@@ -1090,9 +1100,9 @@ impl ProjectContext {
     pub(crate) fn ancestors(
         &self,
         py: Python<'_>,
-        decl: &NativeNode,
+        decl: &SymbolNode,
         skip_flags: u32,
-    ) -> PyResult<Vec<Py<NativeNode>>> {
+    ) -> PyResult<Vec<Py<SymbolNode>>> {
         let outputs = self.outputs.borrow();
         let outputs = outputs
             .as_ref()
@@ -1104,14 +1114,17 @@ impl ProjectContext {
             .collect())
     }
 
-    /// Forward closure from every entrypoint-flagged node. The set of
-    /// dead decls is the complement against ``nodes()``.
-    #[pyo3(signature = (*, skip_flags = 0))]
+    /// Forward closure from every node carrying any bit in
+    /// ``seed_flags`` (defaults to ``NODE_FLAG_ENTRYPOINT`` for the
+    /// classic "alive from entrypoints" question). The set of dead
+    /// decls is the complement against ``nodes()``.
+    #[pyo3(signature = (*, skip_flags = 0, seed_flags = NODE_FLAG_ENTRYPOINT))]
     pub(crate) fn reachable(
         &self,
         py: Python<'_>,
         skip_flags: u32,
-    ) -> PyResult<Vec<Py<NativeNode>>> {
+        seed_flags: u32,
+    ) -> PyResult<Vec<Py<SymbolNode>>> {
         let outputs = self.outputs.borrow();
         let outputs = outputs
             .as_ref()
@@ -1121,7 +1134,7 @@ impl ProjectContext {
             .nodes
             .iter()
             .enumerate()
-            .filter_map(|(idx, n)| (n.borrow(py).flags & NODE_FLAG_ENTRYPOINT != 0).then_some(idx));
+            .filter_map(|(idx, n)| (n.borrow(py).flags & seed_flags != 0).then_some(idx));
         Ok(bfs(&outputs.builder, seeds, Direction::Forward, skip_flags)
             .into_iter()
             .map(|i| outputs.builder.nodes[i].clone_ref(py))
@@ -1156,7 +1169,7 @@ impl ProjectContext {
                 continue;
             };
             // Collect decls whose target_range falls within block_range.
-            let mut decls: Vec<Py<NativeNode>> = Vec::new();
+            let mut decls: Vec<Py<SymbolNode>> = Vec::new();
             for ((entry_file, _place_id, (start, end)), idx) in &outputs.global_index {
                 if *entry_file != file {
                     continue;
@@ -1194,7 +1207,7 @@ impl ProjectContext {
         decorator_module: &str,
         decorator_names: Vec<String>,
         path_regex: Option<&str>,
-    ) -> PyResult<Vec<(Py<NativeNode>, CallArgs)>> {
+    ) -> PyResult<Vec<(Py<SymbolNode>, CallArgs)>> {
         let outputs = self.outputs.borrow();
         let outputs = outputs
             .as_ref()
@@ -1210,7 +1223,7 @@ impl ProjectContext {
         // of the decorator names. The rayon::scope here parallelizes
         // the per-file parse + walk across project files; we release
         // the GIL for the duration and re-acquire only to materialize
-        // Py<NativeNode> handles from the collected indices.
+        // Py<SymbolNode> handles from the collected indices.
         let db_handle: Box<dyn ProjectDb> = ProjectDb::dyn_clone(&self.db);
         let path_re_ref = &path_re;
         let names_ref = &names;
@@ -1275,7 +1288,7 @@ impl ProjectContext {
         module: &str,
         ctor_names: Vec<String>,
         path_regex: Option<&str>,
-    ) -> PyResult<Vec<(Py<NativeNode>, String, CallArgs)>> {
+    ) -> PyResult<Vec<(Py<SymbolNode>, String, CallArgs)>> {
         let outputs = self.outputs.borrow();
         let outputs = outputs
             .as_ref()
@@ -1322,7 +1335,7 @@ impl ProjectContext {
                 local
             })
         });
-        let out: Vec<(Py<NativeNode>, String, CallArgs)> = pairs
+        let out: Vec<(Py<SymbolNode>, String, CallArgs)> = pairs
             .into_iter()
             .map(|(idx, name, call_args)| {
                 (outputs.builder.nodes[idx].clone_ref(py), name, call_args)
@@ -1345,7 +1358,7 @@ impl ProjectContext {
         py: Python<'_>,
         decorator_attrs: Vec<String>,
         path_regex: Option<&str>,
-    ) -> PyResult<Vec<(String, Py<NativeNode>, CallArgs)>> {
+    ) -> PyResult<Vec<(String, Py<SymbolNode>, CallArgs)>> {
         let outputs = self.outputs.borrow();
         let outputs = outputs
             .as_ref()
@@ -1425,7 +1438,7 @@ impl ProjectContext {
         via_attr: &str,
         decorator_attrs: Vec<String>,
         path_regex: Option<&str>,
-    ) -> PyResult<Vec<(String, Py<NativeNode>, CallArgs)>> {
+    ) -> PyResult<Vec<(String, Py<SymbolNode>, CallArgs)>> {
         let outputs = self.outputs.borrow();
         let outputs = outputs
             .as_ref()
@@ -1517,7 +1530,7 @@ impl ProjectContext {
         attr: &str,
         arg_index: usize,
         path_regex: Option<&str>,
-    ) -> PyResult<Vec<(Py<NativeNode>, String, CallArgs)>> {
+    ) -> PyResult<Vec<(Py<SymbolNode>, String, CallArgs)>> {
         let outputs = self.outputs.borrow();
         let outputs = outputs
             .as_ref()
@@ -1581,7 +1594,7 @@ impl ProjectContext {
         py: Python<'_>,
         module: &str,
         ctor_names: Vec<String>,
-    ) -> PyResult<Vec<(Py<NativeNode>, Vec<String>)>> {
+    ) -> PyResult<Vec<(Py<SymbolNode>, Vec<String>)>> {
         let outputs = self.outputs.borrow();
         let outputs = outputs
             .as_ref()
@@ -1654,7 +1667,7 @@ impl ProjectContext {
         name: &str,
         arg_index: usize,
         path_regex: Option<&str>,
-    ) -> PyResult<Vec<(Py<NativeNode>, String, CallArgs)>> {
+    ) -> PyResult<Vec<(Py<SymbolNode>, String, CallArgs)>> {
         let outputs = self.outputs.borrow();
         let outputs = outputs
             .as_ref()
@@ -1733,7 +1746,7 @@ impl ProjectContext {
         arg_index: usize,
         required_positional: Option<usize>,
         path_regex: Option<&str>,
-    ) -> PyResult<Vec<(Py<NativeNode>, String, CallArgs)>> {
+    ) -> PyResult<Vec<(Py<SymbolNode>, String, CallArgs)>> {
         let outputs = self.outputs.borrow();
         let outputs = outputs
             .as_ref()
@@ -1796,7 +1809,7 @@ impl ProjectContext {
         &self,
         py: Python<'_>,
         method_name: &str,
-    ) -> PyResult<Vec<Py<NativeNode>>> {
+    ) -> PyResult<Vec<Py<SymbolNode>>> {
         let outputs = self.outputs.borrow();
         let outputs = outputs
             .as_ref()
@@ -1857,8 +1870,8 @@ impl ProjectContext {
     pub(crate) fn find_subclasses_of(
         &self,
         py: Python<'_>,
-        class_node: &NativeNode,
-    ) -> PyResult<Vec<Py<NativeNode>>> {
+        class_node: &SymbolNode,
+    ) -> PyResult<Vec<Py<SymbolNode>>> {
         if class_node.kind != "class" {
             return Ok(Vec::new());
         }
@@ -1891,7 +1904,7 @@ impl ProjectContext {
         py: Python<'_>,
         decorator_fqn: &str,
         path_regex: Option<&str>,
-    ) -> PyResult<Vec<(Py<NativeNode>, CallArgs)>> {
+    ) -> PyResult<Vec<(Py<SymbolNode>, CallArgs)>> {
         let Some((module, name)) = decorator_fqn.rsplit_once('.') else {
             return Err(PyValueError::new_err(format!(
                 "expected a dotted decorator fqn (e.g. 'pytest.fixture'), got {decorator_fqn:?}"
@@ -1907,7 +1920,7 @@ impl ProjectContext {
         class_fqn: &str,
         include_subclasses: bool,
         path_regex: Option<&str>,
-    ) -> PyResult<Vec<(Py<NativeNode>, CallArgs)>> {
+    ) -> PyResult<Vec<(Py<SymbolNode>, CallArgs)>> {
         let Some((module, name)) = class_fqn.rsplit_once('.') else {
             return Err(PyValueError::new_err(format!(
                 "expected a dotted class fqn, got {class_fqn:?}"
@@ -1939,10 +1952,10 @@ impl ProjectContext {
     pub(crate) fn find_decorations_on(
         &self,
         py: Python<'_>,
-        instance: &NativeNode,
+        instance: &SymbolNode,
         method_names: Vec<String>,
         path_regex: Option<&str>,
-    ) -> PyResult<Vec<(Py<NativeNode>, CallArgs)>> {
+    ) -> PyResult<Vec<(Py<SymbolNode>, CallArgs)>> {
         let instance_simple = instance.fqname.rsplit('.').next().unwrap_or("").to_string();
         let handlers = self.find_handler_decorators(py, method_names, path_regex)?;
         let mut out = Vec::new();
@@ -1971,7 +1984,7 @@ impl ProjectContext {
         py: Python<'_>,
         base_fqn: &str,
         transitive: bool,
-    ) -> PyResult<Vec<Py<NativeNode>>> {
+    ) -> PyResult<Vec<Py<SymbolNode>>> {
         let outputs = self.outputs.borrow();
         let outputs = outputs
             .as_ref()
@@ -1999,7 +2012,7 @@ impl ProjectContext {
         &self,
         py: Python<'_>,
         pattern: &str,
-    ) -> PyResult<Vec<(Py<NativeNode>, String)>> {
+    ) -> PyResult<Vec<(Py<SymbolNode>, String)>> {
         let regex = self.compile_regex(pattern)?;
         let outputs = self.outputs.borrow();
         let outputs = outputs
@@ -2042,7 +2055,7 @@ impl ProjectContext {
     // ----- Read-only accessors -------------------------------------------
 
     /// Live nodes in the in-progress graph. Cheap, no copy.
-    pub(crate) fn nodes(&self, py: Python<'_>) -> PyResult<Vec<Py<NativeNode>>> {
+    pub(crate) fn nodes(&self, py: Python<'_>) -> PyResult<Vec<Py<SymbolNode>>> {
         let outputs = self.outputs.borrow();
         let outputs = outputs.as_ref().ok_or_else(|| not_materialized("nodes"))?;
         Ok(outputs

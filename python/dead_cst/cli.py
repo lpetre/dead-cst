@@ -55,11 +55,12 @@ def parse_entrypoint(ep: str) -> str | re.Pattern[str]:
     return ep
 
 
-def _rel_path(path: Path, root: Path) -> Path:
+def _rel_path(path: Path | str, root: Path) -> Path:
+    p = Path(path) if isinstance(path, str) else path
     try:
-        return path.relative_to(root)
+        return p.relative_to(root)
     except ValueError:
-        return path
+        return p
 
 
 def build_plugins(
@@ -189,11 +190,11 @@ def _output_text(
     if dead_real:
         typer.echo(f"\nDead symbols ({len(dead_real)}):")
         for node in sorted(dead_real, key=lambda n: (str(n.path), n.fqname)):
-            typer.echo(f"  {node.fqname} ({node.type}) at {_rel_path(node.path, root)}")
+            typer.echo(f"  {node.fqname} ({node.kind}) at {_rel_path(node.path, root)}")
 
 
 def _dead_real(unreachable: SymbolGraph) -> list[SymbolNode]:
-    return [n for n in unreachable.nodes if n.type != "synthetic"]
+    return [n for n in unreachable.nodes if n.kind != "synthetic"]
 
 
 def _output_json(
@@ -223,7 +224,7 @@ def _output_json(
         result["dead_symbols"].append(
             {
                 "fqname": node.fqname,
-                "type": node.type,
+                "type": node.kind,
                 "path": str(_rel_path(node.path, root)),
             }
         )
@@ -262,9 +263,8 @@ def why_alive(
         entrypoints=[],
         plugin_names=plugin or [],
     )
-    graph = Analysis(
-        root, resolver=path_resolver, plugins=plugins, show_progress=True
-    ).materialize_all()
+    analysis = Analysis(root, resolver=path_resolver, plugins=plugins, show_progress=True)
+    graph = analysis.materialize_all()
 
     target_node: SymbolNode | None = None
     for node in graph.nodes:
@@ -276,29 +276,22 @@ def why_alive(
         typer.echo(f"Symbol not found: {fqname}", err=True)
         raise typer.Exit(1)
 
-    typer.echo(f"\nSymbol: {target_node.fqname} ({target_node.type})")
+    typer.echo(f"\nSymbol: {target_node.fqname} ({target_node.kind})")
     typer.echo(f"Path: {_rel_path(target_node.path, root)}")
-    typer.echo(f"In-degree: {graph.raw.in_degree(graph.index(target_node))}")
+    typer.echo(f"In-degree: {graph.in_degree(graph.index(target_node))}")
     typer.echo("\nPredecessor chain:")
 
-    seen_idx: set[int] = set()
-    stack: list[int] = [graph.index(target_node)]
-    while stack:
-        i = stack.pop()
-        if i in seen_idx:
-            continue
-        seen_idx.add(i)
-        node = graph.node(i)
-        typer.echo(f"  <- {node.fqname} ({node.type}) at {_rel_path(node.path, root)}")
-        stack.extend(graph.raw.predecessor_indices(i))
+    # Delegate the reverse-closure walk to the rust BFS.
+    for node in analysis.ancestors(target_node):
+        typer.echo(f"  <- {node.fqname} ({node.kind}) at {_rel_path(node.path, root)}")
 
 
 def _is_dunder_all(node: SymbolNode) -> bool:
-    return node.type == "variable" and simple_name(node.fqname) == "__all__"
+    return node.kind == "variable" and simple_name(node.fqname) == "__all__"
 
 
 def _is_external_dep(node: SymbolNode) -> bool:
-    return node.type == "synthetic" and node.fqname.startswith(EXTERNAL_PREFIXES)
+    return node.kind == "synthetic" and node.fqname.startswith(EXTERNAL_PREFIXES)
 
 
 @app.command()
@@ -337,8 +330,8 @@ def dependencies(
         # each package that imports them by walking back through the
         # graph's predecessor edges.
         importer_paths: set[Path] = set()
-        for j in graph.raw.predecessor_indices(graph.index(node)):
-            importer_paths.add(graph.node(j).path)
+        for j in graph.predecessor_indices(graph.index(node)):
+            importer_paths.add(Path(graph.node(j).path))
         for pkg_path in deps_by_package:
             if any(p.is_relative_to(pkg_path) for p in importer_paths):
                 if node not in deps_by_package[pkg_path]:
@@ -405,7 +398,7 @@ def unused_exports(
     reachable = _find_reachable(graph, _keepalive_seeds(graph, KEEPALIVE_DEFAULT))
 
     def _is_dunder_seed(node: SymbolNode) -> bool:
-        return node.type == "synthetic" and node.fqname.startswith(DUNDER_PREFIX)
+        return node.kind == "synthetic" and node.fqname.startswith(DUNDER_PREFIX)
 
     visited_idx: set[int] = set()
     stack: list[int] = _keepalive_seeds(graph, KEEPALIVE_DEFAULT)
@@ -415,7 +408,7 @@ def unused_exports(
             continue
         visited_idx.add(i)
         is_seed = _is_dunder_seed(graph.node(i))
-        for j in graph.raw.successor_indices(i):
+        for j in graph.successor_indices(i):
             if is_seed and _is_dunder_all(graph.node(j)):
                 continue
             stack.append(j)
@@ -426,7 +419,7 @@ def unused_exports(
     for sym in only_via_all:
         if _is_dunder_all(sym):
             continue
-        for j in graph.raw.predecessor_indices(graph.index(sym)):
+        for j in graph.predecessor_indices(graph.index(sym)):
             pred = graph.node(j)
             if _is_dunder_all(pred):
                 by_all.setdefault(pred, []).append(sym)
@@ -438,7 +431,7 @@ def unused_exports(
     for all_sym in sorted(by_all, key=lambda n: n.fqname):
         typer.echo(f"\n{all_sym.fqname} at {_rel_path(all_sym.path, root)}:")
         for sym in sorted(by_all[all_sym], key=lambda n: n.fqname):
-            typer.echo(f"  {sym.fqname} ({sym.type})")
+            typer.echo(f"  {sym.fqname} ({sym.kind})")
 
 
 @app.command()

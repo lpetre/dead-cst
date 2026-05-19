@@ -63,7 +63,7 @@ class DiscordPyPlugin(Plugin):
             .where_name(sorted(_DISCORD_CLIENT_KINDS))
         )
 
-        bot_vars_by_file: dict[str, dict[str, native.NativeNode]] = {}
+        bot_vars_by_file: dict[str, dict[str, native.SymbolNode]] = {}
         for cref in bot_constructions:
             if cref.path not in discord_paths:
                 continue
@@ -86,13 +86,13 @@ class DiscordPyPlugin(Plugin):
                 yield native.AddEdge(owner_node, h.decorated)
 
         # 4. Cog subclasses + module-level setup / teardown hooks.
-        cogs_by_path: dict[str, list[native.NativeNode]] = {}
+        cogs_by_path: dict[str, list[native.SymbolNode]] = {}
         for base in ("discord.ext.commands.Cog", "discord.ext.commands.GroupCog"):
             for cog in native.query(ctx).subclasses().of_fqn(base).transitive(True).collect():
                 cogs_by_path.setdefault(cog.path, []).append(cog)
 
         if cogs_by_path:
-            hook_funcs_by_path: dict[str, list[native.NativeNode]] = {}
+            hook_funcs_by_path: dict[str, list[native.SymbolNode]] = {}
             for n in ctx.nodes():
                 if n.kind != "function" or n.path not in cogs_by_path:
                     continue

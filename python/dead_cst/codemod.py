@@ -101,17 +101,18 @@ def _select_files(G: SymbolGraph, base: Path) -> tuple[dict[Path, list[SymbolNod
     by_file: dict[Path, list[SymbolNode]] = {}
     deleted_modules: list[Path] = []
     for node in G.nodes:
-        if not node.path.is_relative_to(base):
+        path = Path(node.path)
+        if not path.is_relative_to(base):
             continue
-        if not node.path.exists():
+        if not path.exists():
             continue
         if node.flags & NodeFlags.NOTEBOOK:
             continue
-        match node.type:
+        match node.kind:
             case "function" | "class" | "variable" | "type_alias" | "import":
-                by_file.setdefault(node.path, []).append(node)
+                by_file.setdefault(path, []).append(node)
             case "module":
-                deleted_modules.append(node.path)
+                deleted_modules.append(path)
     # A file marked for outright deletion needs no per-decl rewrite on top.
     for path in deleted_modules:
         by_file.pop(path, None)
@@ -130,10 +131,10 @@ def _rewrite_one(wrapper, nodes: list[SymbolNode]) -> tuple[str, str]:
     Module passes through unchanged.
     """
     original = wrapper.module.code
-    dead_decls = {(n.fqname, n.position.start.line) for n in nodes if n.type != "import"}
+    dead_decls = {(n.fqname, n.start_line) for n in nodes if n.kind != "import"}
     result = wrapper.visit(RemoveDeadSymbols(dead_decls))
 
-    dead_imports = [n for n in nodes if n.type == "import"]
+    dead_imports = [n for n in nodes if n.kind == "import"]
     if dead_imports:
         ctx = CodemodContext()
         for imp in dead_imports:

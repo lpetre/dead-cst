@@ -589,19 +589,17 @@ def test_third_party_import_creates_synthetic_node(build_decl_graph):
     graph = build_decl_graph(
         {
             "p/__init__.py": "",
-            "p/uses_rx.py": "import rustworkx as rx\ndef build(): return rx.PyDiGraph()",
+            "p/uses_rx.py": "import tqdm as rx\ndef build(): return rx.tqdm()",
         }
     )
     rx_nodes = {
         n
         for n in graph.nodes
-        if n.type == "synthetic"
-        and n.fqname.startswith(EXTERNAL_PREFIXES)
-        and "rustworkx" in n.fqname
+        if n.kind == "synthetic" and n.fqname.startswith(EXTERNAL_PREFIXES) and "tqdm" in n.fqname
     }
     assert rx_nodes, (
-        "expected an external-dep synthetic node for rustworkx, got "
-        f"{[n.fqname for n in graph.nodes if n.type == 'synthetic']}"
+        "expected an external-dep synthetic node for tqdm, got "
+        f"{[n.fqname for n in graph.nodes if n.kind == 'synthetic']}"
     )
 
     edge_srcs = {
@@ -624,7 +622,7 @@ def test_third_party_import_uses_canonical_dist_name(build_decl_graph):
             "p/uses_yaml.py": "import yaml\nDATA = yaml.safe_load('a: 1')\n",
         }
     )
-    fqnames = {n.fqname for n in graph.nodes if n.type == "synthetic"}
+    fqnames = {n.fqname for n in graph.nodes if n.kind == "synthetic"}
     assert "[external dist] pyyaml" in fqnames, fqnames
 
 
@@ -644,7 +642,7 @@ def test_stdlib_imports_are_silent(build_decl_graph, caplog):
         )
 
     assert [r.getMessage() for r in caplog.records] == []
-    synthetics = {n.fqname for n in graph.nodes if n.type == "synthetic"}
+    synthetics = {n.fqname for n in graph.nodes if n.kind == "synthetic"}
     # No stdlib ever surfaces as a graph node, and ``collections.abc``
     # must not fall through to ``[unresolved] collections`` (regression
     # against the synthesized-submodule parent-fallback).
@@ -664,7 +662,7 @@ def test_unresolved_import_emits_synthetic_silently(build_decl_graph, caplog):
 
     assert [r.getMessage() for r in caplog.records] == []
     assert any(
-        n.type == "synthetic" and n.fqname == f"{UNRESOLVED_PREFIX}unknown_pkg_xyz"
+        n.kind == "synthetic" and n.fqname == f"{UNRESOLVED_PREFIX}unknown_pkg_xyz"
         for n in graph.nodes
     )
 
@@ -862,10 +860,10 @@ def test_from_import_prefers_namespace_binding_over_submodule(build_decl_graph):
     # Same fqname appears twice (the `q` variable in p/__init__.py and
     # the `q` module from p/q.py), so we have to disambiguate on type.
     consumer_q_alias = next(
-        n for n in graph.nodes if n.fqname == "consumer.q" and n.type == "import"
+        n for n in graph.nodes if n.fqname == "consumer.q" and n.kind == "import"
     )
     targets = {
-        (graph.node(v).fqname, graph.node(v).type)
+        (graph.node(v).fqname, graph.node(v).kind)
         for u, v in graph.raw.edge_list()
         if graph.index(consumer_q_alias) == u
     }
@@ -886,7 +884,7 @@ def test_star_reexport_is_skipped_by_codemod_rust(build_decl_graph):
             "pkg/_internal.py": "def g(): pass\n",
         }
     )
-    star_nodes = [n for n in graph.nodes if n.fqname == "pkg.*pkg._internal" and n.type == "import"]
+    star_nodes = [n for n in graph.nodes if n.fqname == "pkg.*pkg._internal" and n.kind == "import"]
     assert len(star_nodes) == 1, [n.fqname for n in graph.nodes if "pkg" in n.fqname]
     assert star_nodes[0].imports is not None
     assert star_nodes[0].imports.star is True

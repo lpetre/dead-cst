@@ -47,7 +47,7 @@ def test_magics_do_not_break_parse(write_notebook, make_analysis):
         ],
     )
     graph = make_analysis().materialize_all()
-    assert any(n.type == "module" and n.flags & NodeFlags.NOTEBOOK for n in graph.nodes)
+    assert any(n.kind == "module" and n.flags & NodeFlags.NOTEBOOK for n in graph.nodes)
     # ``x`` survives, proving ``!=`` wasn't mistaken for a shell escape.
     assert any(n.fqname.endswith(".x") and n.flags & NodeFlags.NOTEBOOK for n in graph.nodes)
 
