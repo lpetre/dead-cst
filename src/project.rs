@@ -604,6 +604,78 @@ impl ProjectContext {
         Ok(out)
     }
 
+    /// Return every interned node whose path or fqname matches at
+    /// least one of the supplied specs.
+    ///
+    /// Folds the per-node match loop down into a single rust pass for
+    /// callers (like `ExplicitEntrypointPlugin`) that would otherwise
+    /// pay an FFI hop + `pathlib.Path` allocation per node. Specs are
+    /// pre-classified Python-side:
+    ///
+    /// * `regexes` — pattern strings applied to the path *relative to
+    ///   `project_root`* (or to the absolute path when the node lives
+    ///   outside `project_root`). Each pattern is anchored at the
+    ///   start of input, mirroring Python's `re.Pattern.match()`.
+    /// * `str_specs` — exact equality match against the relative path
+    ///   OR the node's fqname.
+    /// * `abs_paths` — exact equality match against the node's
+    ///   absolute path.
+    pub(crate) fn find_nodes_matching_specs(
+        &self,
+        py: Python<'_>,
+        project_root: &str,
+        regexes: Vec<String>,
+        str_specs: Vec<String>,
+        abs_paths: Vec<String>,
+    ) -> PyResult<Vec<Py<NativeNode>>> {
+        let compiled: Vec<regex::Regex> = regexes
+            .iter()
+            .map(|p| {
+                // `^`-anchor for `re.match` semantics. Idempotent if
+                // the caller already supplied a leading `^`.
+                let anchored = if p.starts_with('^') {
+                    p.clone()
+                } else {
+                    format!("^{p}")
+                };
+                regex::Regex::new(&anchored)
+                    .map_err(|e| PyValueError::new_err(format!("invalid regex {p:?}: {e}")))
+            })
+            .collect::<PyResult<_>>()?;
+        let str_set: std::collections::HashSet<&str> =
+            str_specs.iter().map(String::as_str).collect();
+        let abs_set: std::collections::HashSet<&str> =
+            abs_paths.iter().map(String::as_str).collect();
+
+        let outputs = self.outputs.borrow();
+        let outputs = outputs
+            .as_ref()
+            .ok_or_else(|| not_materialized("find_nodes_matching_specs"))?;
+        let mut out = Vec::new();
+        for node_py in &outputs.builder.nodes {
+            let node = node_py.borrow(py);
+            let path = node.path.as_str();
+            if abs_set.contains(path) {
+                out.push(node_py.clone_ref(py));
+                continue;
+            }
+            // Mirror Python's ``path.relative_to(root)`` ⇒ ``str(...)``
+            // with the ``except ValueError: rel = node.path`` fallback.
+            let rel = path
+                .strip_prefix(project_root)
+                .map(|s| s.trim_start_matches(['/', '\\']))
+                .unwrap_or(path);
+            if str_set.contains(rel) || str_set.contains(node.fqname.as_str()) {
+                out.push(node_py.clone_ref(py));
+                continue;
+            }
+            if compiled.iter().any(|r| r.is_match(rel)) {
+                out.push(node_py.clone_ref(py));
+            }
+        }
+        Ok(out)
+    }
+
     /// Return every import-kind node whose upstream `module` matches.
     ///
     /// Covers both `import <module_name>` and

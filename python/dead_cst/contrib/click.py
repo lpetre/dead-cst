@@ -28,6 +28,10 @@ class ClickPlugin(DecoratedDeclPlugin):
     constructor_names: frozenset[str] = _GROUP_CONSTRUCTOR_NAMES
 
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
+        # Cheap import-presence guard, see ``DecoratedDeclPlugin.run``.
+        if not native.query(ctx).imports().of(self.decorator_module).count():
+            return
+
         groups_by_owner: dict[tuple[str, str], list[native.NativeNode]] = {}
 
         def add_group(node: "native.NativeNode") -> None:
