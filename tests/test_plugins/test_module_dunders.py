@@ -64,6 +64,53 @@ def test_ignores_non_future_imports_with_plain_names(build_plugin_graph, reachab
     assert "pkg.path" not in reached
 
 
+def test_keeps_module_level_dunder_functions_alive(build_plugin_graph, reachable_fqnames):
+    """PEP 562 ``__getattr__`` and ``__dir__`` are module-level *functions*
+    called by the import / attribute-access machinery — observable side
+    effects with no source reference, exactly like module dunder
+    *variables*. The plugin must pin them too.
+    """
+    graph = build_plugin_graph(
+        {
+            "pkg/__init__.py": (
+                "_EXPORTS = {'Foo': '.foo'}\n"
+                "def __getattr__(name):\n"
+                "    return _EXPORTS[name]\n"
+                "def __dir__():\n"
+                "    return list(_EXPORTS)\n"
+                "def regular():\n"
+                "    return _EXPORTS\n"
+            ),
+        },
+        [ModuleDundersPlugin()],
+    )
+    reached = reachable_fqnames(graph)
+    assert {"pkg.__getattr__", "pkg.__dir__"} <= reached
+    # The supporting variable they reference rides along.
+    assert "pkg._EXPORTS" in reached
+    # Plain functions with non-dunder names stay dead absent another
+    # entrypoint — the plugin only pins the dunder names.
+    assert "pkg.regular" not in reached
+
+
+def test_does_not_pin_class_dunder_methods(build_plugin_graph, reachable_fqnames):
+    """Dunder *methods* inside a class (``__init__``, ``__call__``) are
+    not module-level decls — they ride on their enclosing class's
+    reachability. The plugin must not pin them as separate entrypoints.
+    """
+    graph = build_plugin_graph(
+        {
+            "pkg/__init__.py": (
+                "class C:\n    def __init__(self): pass\n    def __call__(self): pass\n"
+            ),
+        },
+        [ModuleDundersPlugin()],
+    )
+    reached = reachable_fqnames(graph)
+    # The class itself isn't pinned absent another entrypoint.
+    assert "pkg.C" not in reached
+
+
 def test_ignores_non_dunder_underscore_names(build_plugin_graph, reachable_fqnames):
     graph = build_plugin_graph(
         {

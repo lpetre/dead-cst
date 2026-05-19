@@ -43,6 +43,31 @@ two versions.
   on-disk format has a hard-versioned header — version mismatch is a
   fatal error, with no migration path (rebuilding a graph is cheap).
 
+### Fixed
+- **`ModuleDundersPlugin` now pins module-level dunder *functions*.**
+  PEP 562 ``__getattr__`` / ``__dir__`` defined at module scope are
+  observable to the import / attribute-access machinery, the same way
+  module dunder *variables* are. The plugin previously filtered to
+  ``kind == "variable"`` only, so these functions (and any imports /
+  helper vars they depended on) were falsely reported dead. Dunder
+  *methods* inside a class are unaffected — they ride on their
+  enclosing class's reachability.
+- **Quoted type annotations contribute use edges.** Names that appear
+  only inside a string annotation (``"Helper"`` in
+  ``def f(x: "Helper")``, common under ``if TYPE_CHECKING:`` /
+  ``from __future__ import annotations``) now resolve through ty's
+  ``enter_string_annotation`` sub-model and emit the same alias /
+  upstream edges they would unquoted. Regular string literals in
+  non-annotation positions are untouched.
+- **``from .submod import X`` inside ``__init__.py`` no longer reports
+  the submodule attribute as dead.** ty mints an extra
+  ``ImportFromSubmodule`` binding for the side-effect ``pkg.submod``
+  attribute that Python rebinds whenever the statement executes; the
+  graph now wires ``sibling_alias → submodule_alias`` edges so the
+  attribute alias stays alive as long as any sibling alias from the
+  same statement does. When every sibling is dead, the whole statement
+  collapses normally.
+
 ### Changed (breaking)
 - **CLI trimmed to three commands.** `dead-cst why-alive`,
   `dead-cst dependencies`, and `dead-cst unused-exports` are

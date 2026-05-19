@@ -23,7 +23,7 @@ use ruff_db::files::{File, FilePath};
 use ruff_db::parsed::{parsed_module, ParsedModuleRef};
 use ruff_db::source::{line_index, source_text};
 use ruff_python_ast::visitor::{walk_expr, walk_stmt, Visitor};
-use ruff_python_ast::{Expr, ExprName, Stmt};
+use ruff_python_ast::{Expr, ExprName, ExprStringLiteral, Stmt};
 use ruff_text_size::{Ranged, TextRange};
 use ty_module_resolver::{
     file_to_module, resolve_module, search_paths, ModuleName, ModuleResolveMode,
@@ -468,6 +468,18 @@ pub(crate) fn emit_import_edges(
     let place_table = index.place_table(global);
     let use_def_map = index.use_def_map(global);
 
+    // ``from .submod import X`` mints an ``ImportFromSubmodule`` binding
+    // for the side-effect attribute ``submod`` on the current package,
+    // plus a normal ``ImportFrom`` binding for ``X``. Nothing in the
+    // importing file references the bare name ``submod`` (only ``X``),
+    // so the submodule alias would otherwise have zero in-edges and be
+    // reported dead — but the import statement is one inseparable
+    // syntactic unit, so the submodule attribute is alive iff any
+    // sibling alias from the same statement is. Wire ``sibling →
+    // submodule_alias`` edges so reachability tracks that.
+    let mut submodule_alias_by_stmt: HashMap<TextRange, usize> = HashMap::new();
+    let mut sibling_aliases_by_stmt: HashMap<TextRange, Vec<usize>> = HashMap::new();
+
     for (_def_id, state, _used) in use_def_map.all_definitions_with_usage() {
         let DefinitionState::Defined(def) = state else {
             continue;
@@ -486,6 +498,19 @@ pub(crate) fn emit_import_edges(
                 Some(&idx) => idx,
                 None => continue,
             };
+
+        match kind {
+            DefinitionKind::ImportFromSubmodule(k) => {
+                submodule_alias_by_stmt.insert(k.import(&parsed).range(), alias_idx);
+            }
+            DefinitionKind::ImportFrom(k) => {
+                sibling_aliases_by_stmt
+                    .entry(k.import(&parsed).range())
+                    .or_default()
+                    .push(alias_idx);
+            }
+            _ => {}
+        }
 
         let from_stmt = match kind {
             DefinitionKind::ImportFrom(k) => Some(k.import(&parsed)),
@@ -572,6 +597,21 @@ pub(crate) fn emit_import_edges(
             }
         }
     }
+
+    // Drag the submodule-attribute alias alive whenever any sibling
+    // alias from the same ``from .submod import X, Y`` statement is.
+    // See the comment on ``submodule_alias_by_stmt`` above.
+    for (stmt_range, sub_idx) in &submodule_alias_by_stmt {
+        let Some(siblings) = sibling_aliases_by_stmt.get(stmt_range) else {
+            continue;
+        };
+        for &sibling_idx in siblings {
+            if sibling_idx != *sub_idx {
+                builder.add_edge(sibling_idx, *sub_idx, 0);
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -1427,9 +1467,33 @@ pub(crate) fn emit_dunder_all_edges(v: &mut RefCollector<'_, '_>, value: &Expr) 
 /// modules (`foo.bar.f()`) are walked segment by segment, emitting
 /// edges to each module / decl reached. Shadow handling falls out of
 /// ty's flow-sensitive use-def chain (Principle 3).
+/// Borrowed-or-owned wrapper around [`SemanticModel`].
+///
+/// The reference-collecting walk normally borrows a single model
+/// constructed once per file. When it descends into a string-typed
+/// annotation (``"native.ProjectContext"``), it needs ty's
+/// "sub-model" — the one returned by
+/// [`SemanticModel::enter_string_annotation`] — to resolve names
+/// inside the parsed sub-AST. The sub-model is owned, not borrowed,
+/// so this enum lets the collector hold either kind.
+pub(crate) enum SemModel<'a, 'db> {
+    Borrowed(&'a SemanticModel<'db>),
+    Owned(SemanticModel<'db>),
+}
+
+impl<'db> std::ops::Deref for SemModel<'_, 'db> {
+    type Target = SemanticModel<'db>;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Borrowed(m) => m,
+            Self::Owned(m) => m,
+        }
+    }
+}
+
 pub(crate) struct RefCollector<'a, 'db> {
     owner: usize,
-    model: &'a SemanticModel<'db>,
+    model: SemModel<'a, 'db>,
     file: File,
     parsed: &'a ParsedModuleRef,
     /// Cached `&SemanticIndex` for `self.file`. Avoids re-doing the
@@ -1497,7 +1561,7 @@ impl<'a, 'db> RefCollector<'a, 'db> {
     ) -> Self {
         Self {
             owner,
-            model,
+            model: SemModel::Borrowed(model),
             file,
             parsed,
             index,
@@ -1517,6 +1581,45 @@ impl<'a, 'db> RefCollector<'a, 'db> {
     fn flush(self, builder: &mut GraphBuilder) {
         for ((src, dst), flags) in self.edges {
             builder.add_edge(src, dst, flags);
+        }
+    }
+
+    /// If ``string_expr`` is a string annotation (per ty's classification),
+    /// parse it and walk the resulting expression for name uses.
+    ///
+    /// Uses ty's [`SemanticModel::enter_string_annotation`] both as the
+    /// gate (it returns ``None`` unless ty has already inferred the
+    /// string as an annotation) and as the source of the sub-model
+    /// that's needed to resolve names inside the parsed sub-AST.
+    /// Edges accumulated by the sub-walk are merged into ``self.edges``
+    /// with the same AND-of-flags rule as ordinary references.
+    fn walk_string_annotation(&mut self, string_expr: &ExprStringLiteral) {
+        let Some((parsed_expr, sub_model)) = self.model.enter_string_annotation(string_expr) else {
+            return;
+        };
+        let mut sub = RefCollector {
+            owner: self.owner,
+            model: SemModel::Owned(sub_model),
+            file: self.file,
+            parsed: self.parsed,
+            index: self.index,
+            global_index: self.global_index,
+            module_nodes: self.module_nodes,
+            alias_imports: self.alias_imports,
+            live_decls: self.live_decls,
+            synthetic_nodes: self.synthetic_nodes,
+            dist_lookup: self.dist_lookup,
+            dead_ranges: self.dead_ranges,
+            edges: HashMap::new(),
+            nested_context: self.nested_context,
+            current_flags: 0,
+        };
+        sub.visit_expr(parsed_expr.expr());
+        for ((src, dst), flags) in sub.edges {
+            self.edges
+                .entry((src, dst))
+                .and_modify(|f| *f &= flags)
+                .or_insert(flags);
         }
     }
 
@@ -1613,7 +1716,15 @@ impl<'a, 'db> RefCollector<'a, 'db> {
             // Position-sensitive query for the use's own scope; fall
             // back to end-of-scope bindings for enclosing scopes (where
             // the use isn't recorded under any specific position).
-            let bindings = if first {
+            // Names parsed out of a string annotation aren't registered
+            // in the file's ``uses_map`` (they live in a sub-AST that
+            // didn't exist at index time), so ``scoped_use_id`` would
+            // panic — fall back to end-of-scope semantics there too.
+            // The sub-walk loses flow-sensitivity for the use site,
+            // which is fine: string annotations are deferred and only
+            // care about the end-of-scope binding anyway.
+            let in_string_annotation = matches!(self.model, SemModel::Owned(_));
+            let bindings = if first && !in_string_annotation {
                 let use_id = name.scoped_use_id(db, scope_id.to_scope_id(db, self.file));
                 use_def_map.bindings_at_use(use_id)
             } else {
@@ -2411,6 +2522,16 @@ pub(crate) fn module_name_resolves(
 
 impl<'ast, 'db> Visitor<'ast> for RefCollector<'_, 'db> {
     fn visit_expr(&mut self, expr: &'ast Expr) {
+        if let Expr::StringLiteral(s) = expr {
+            // ``TYPE_CHECKING``-guarded imports often appear only inside
+            // string annotations (``"native.ProjectContext"``). ty parses
+            // those strings and registers them as annotations; ask it,
+            // and if it agrees, walk the parsed sub-AST so the names
+            // inside contribute use edges. Regular string literals fall
+            // through to the no-op default walk.
+            self.walk_string_annotation(s);
+            return;
+        }
         if let Expr::Name(n) = expr {
             self.emit_name_use(n, &[]);
             return;

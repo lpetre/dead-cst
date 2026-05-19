@@ -930,3 +930,211 @@ def test_cross_dep_submodule_import(tmp_path, make_analysis, assert_edges):
             "B.sub -> B",
         },
     )
+
+
+# ---------------------------------------------------------------------------
+# Submodule attribute alias kept alive by sibling aliases
+# ---------------------------------------------------------------------------
+
+
+def _find_node(graph, *, fqname, kind, path_substring):
+    """Disambiguate nodes that share an fqname (e.g. the submodule
+    attribute alias ``pkg.sub`` in ``__init__.py`` vs. the module
+    ``pkg.sub`` itself in ``pkg/sub.py``).
+    """
+    matches = [
+        n
+        for n in graph.nodes()
+        if n.fqname == fqname and n.kind == kind and path_substring in str(n.path)
+    ]
+    assert len(matches) == 1, f"expected unique match for {fqname}/{kind}/{path_substring}"
+    return matches[0]
+
+
+def test_from_relative_import_in_init_keeps_submodule_alias_alive(
+    build_decl_graph, predecessors_of, successors_of
+):
+    """``from .sub import X`` inside an ``__init__.py`` mints both a
+    normal ``ImportFrom`` alias for ``X`` and an
+    ``ImportFromSubmodule`` alias for the side-effect attribute
+    ``sub`` on the current package — Python rebinds ``pkg.sub`` to
+    the submodule whenever the statement runs. The two are one
+    inseparable syntactic unit, so reachability must drag the
+    submodule alias alive whenever any sibling alias is — otherwise
+    the analyzer would falsely flag the submodule attribute as dead
+    every time it's not also referenced by name in the same file.
+    """
+    graph = build_decl_graph(
+        {
+            "pkg/__init__.py": "from .sub import X, Y\n",
+            "pkg/sub.py": "class X: pass\nclass Y: pass\n",
+        }
+    )
+    sub_alias = _find_node(graph, fqname="pkg.sub", kind="import", path_substring="pkg/__init__.py")
+    x_alias = _find_node(graph, fqname="pkg.X", kind="import", path_substring="pkg/__init__.py")
+    y_alias = _find_node(graph, fqname="pkg.Y", kind="import", path_substring="pkg/__init__.py")
+
+    preds = set(predecessors_of(graph, sub_alias))
+    # Sibling aliases drag the submodule attribute alias alive.
+    assert x_alias in preds
+    assert y_alias in preds
+
+
+def test_submodule_alias_dies_when_all_siblings_dead(build_decl_graph):
+    """When every sibling alias from a ``from .sub import X`` statement
+    is dead, the submodule-attribute alias dies too — there's no
+    longer any reason to keep the import line. The sibling edges only
+    rescue the submodule alias *from being singled out as unique
+    noise*, not from a legitimate sweep of the whole statement.
+    """
+    graph = build_decl_graph(
+        {
+            "pkg/__init__.py": "from .sub import X\n",
+            "pkg/sub.py": "class X: pass\n",
+        }
+    )
+    sub_alias = _find_node(graph, fqname="pkg.sub", kind="import", path_substring="pkg/__init__.py")
+    x_alias = _find_node(graph, fqname="pkg.X", kind="import", path_substring="pkg/__init__.py")
+
+    # Nothing references X (the only sibling), so neither the sibling
+    # nor the submodule-attribute alias is reachable.
+    reachable = set(graph.reachable())
+    assert x_alias not in reachable
+    assert sub_alias not in reachable
+
+
+def test_submodule_alias_not_minted_in_non_init_file(build_decl_graph):
+    """``from .sub import X`` inside a non-``__init__`` module does NOT
+    create the ``ImportFromSubmodule`` side-effect binding (the
+    ``pkg.sub`` attribute is only rebound when the containing module
+    *is* ``pkg``). Verify we don't emit a spurious sibling edge or
+    a spurious submodule alias for the ordinary case.
+    """
+    graph = build_decl_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/sub.py": "class X: pass\n",
+            "pkg/consumer.py": "from .sub import X\nuse = X\n",
+        }
+    )
+    # Only ONE node with fqname=pkg.consumer.X exists (the regular
+    # alias) — no extra "submodule attribute" alias on pkg.consumer.
+    consumer_aliases = [
+        n for n in graph.nodes() if n.kind == "import" and "pkg/consumer.py" in str(n.path)
+    ]
+    fqnames = {n.fqname for n in consumer_aliases}
+    assert fqnames == {"pkg.consumer.X"}
+
+
+# ---------------------------------------------------------------------------
+# String annotations / TYPE_CHECKING imports
+# ---------------------------------------------------------------------------
+
+
+def test_string_annotation_emits_use_edge(build_decl_graph, assert_edges):
+    """Names that appear only inside a quoted type annotation must still
+    count as uses. ``ty`` parses the string in annotation position and
+    re-runs name resolution; the rust ingest passes the parsed sub-AST
+    through a sub-collector so each ``Name`` inside contributes its
+    normal ``use → alias`` edge.
+    """
+    graph = build_decl_graph(
+        {
+            "mod.py": (
+                "from helpers import Helper\ndef f(x: 'Helper') -> 'Helper':\n    return x\n"
+            ),
+            "helpers.py": "class Helper: pass\n",
+        }
+    )
+    assert_edges(
+        graph,
+        {
+            "helpers.Helper -> helpers",
+            "mod.Helper -> helpers",
+            "mod.Helper -> helpers.Helper",
+            "mod.Helper -> mod",
+            # The two string annotations both reference Helper. Edges
+            # collapse to one parallel pair (alias + upstream chain).
+            "mod.f -> helpers",
+            "mod.f -> helpers.Helper",
+            "mod.f -> mod",
+            "mod.f -> mod.Helper",
+        },
+    )
+
+
+def test_type_checking_import_used_only_in_string_annotation(build_decl_graph, predecessors_of):
+    """The classic pattern: import lives under ``if TYPE_CHECKING:`` and
+    is referenced only inside a quoted annotation. Without
+    string-annotation walking, the import gets zero in-edges and is
+    falsely reported dead. With it, the use site emits the same edge
+    it would for an unquoted annotation.
+    """
+    graph = build_decl_graph(
+        {
+            "mod.py": (
+                "from __future__ import annotations\n"
+                "from typing import TYPE_CHECKING\n"
+                "if TYPE_CHECKING:\n"
+                "    from helpers import Helper\n"
+                "def f(x: 'Helper') -> 'Helper':\n"
+                "    return x\n"
+            ),
+            "helpers.py": "class Helper: pass\n",
+        }
+    )
+    helper_alias = next(n for n in graph.nodes() if n.fqname == "mod.Helper" and n.kind == "import")
+    # ``f`` (the only top-level decl using Helper via a string annotation)
+    # should be in the import alias's in-edges.
+    preds = {n.fqname for n in predecessors_of(graph, helper_alias)}
+    assert "mod.f" in preds
+
+
+def test_string_annotation_inside_subscript(build_decl_graph, predecessors_of):
+    """Quoted name *inside* a non-quoted annotation (``list["Helper"]``)
+    also resolves. ty registers the sub-string as an annotation and
+    we walk it.
+    """
+    graph = build_decl_graph(
+        {
+            "mod.py": (
+                "from typing import List\n"
+                "from helpers import Helper\n"
+                "def f(x: List['Helper']) -> None:\n"
+                "    pass\n"
+            ),
+            "helpers.py": "class Helper: pass\n",
+        }
+    )
+    helper_alias = next(n for n in graph.nodes() if n.fqname == "mod.Helper" and n.kind == "import")
+    preds = {n.fqname for n in predecessors_of(graph, helper_alias)}
+    assert "mod.f" in preds
+
+
+def test_regular_string_literal_not_walked(build_decl_graph):
+    """A bare string literal in a non-annotation position must NOT be
+    parsed as an annotation. ``"Helper"`` assigned to a variable or
+    passed to a regular function call is just data — walking it would
+    invent edges out of thin air.
+    """
+    graph = build_decl_graph(
+        {
+            "mod.py": (
+                "from helpers import Helper\n"
+                "label = 'Helper'\n"  # not an annotation; must not edge to Helper
+                "def f(): pass\n"
+            ),
+            "helpers.py": "class Helper: pass\n",
+        }
+    )
+    helper_alias = next(n for n in graph.nodes() if n.fqname == "mod.Helper" and n.kind == "import")
+    label_var = next(n for n in graph.nodes() if n.fqname == "mod.label")
+    # ``label`` does NOT depend on Helper — its value is a runtime string.
+    edges = {
+        (u.fqname, v.fqname)
+        for u, v in ((graph.nodes()[u], graph.nodes()[v]) for u, v, _ in graph.edges())
+    }
+    assert ("mod.label", "mod.Helper") not in edges
+    # Belt-and-braces: label_var isn't in the import alias's predecessors.
+    helper_preds = set(graph.ancestors(helper_alias))
+    assert label_var not in helper_preds
