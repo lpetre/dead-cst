@@ -5,14 +5,25 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
+# Cancel in-flight CI runs on the same PR when new commits land; keep
+# main-branch runs untouched (no overlap to cancel anyway).
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
+  # Pure-Python lint pass. ``--no-install-project`` installs every dev
+  # dep (ruff, ty, prek, libcst, ...) without invoking maturin -- ``ty
+  # check`` resolves ``dead_cst._native`` to the checked-in ``.pyi``
+  # stub, so the compiled extension is never needed here. ``cargo fmt``
+  # and ``cargo clippy`` are owned by the ``build`` job below.
   lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-          submodules: recursive
       - uses: astral-sh/setup-uv@v7
         with:
           python-version: 3.12
@@ -23,45 +34,96 @@ jobs:
         with:
           path: ~/.cache/prek
           key: prek-${{ hashFiles('.pre-commit-config.yaml') }}
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          rustflags: ""
-      # ``uv sync`` runs maturin (the project's build backend) and
-      # compiles the Rust crate at the repo root so ``ty check`` can
-      # resolve ``dead_cst._native`` while type-checking.
-      - run: uv sync --frozen
-      - run: uv run prek run --show-diff-on-failure --color=always --all-files
+      - run: uv sync --no-install-project --frozen
+      - run: uv run --no-sync prek run --show-diff-on-failure --color=always --all-files
         env:
+          # Stops every nested ``uv run`` (in particular the ``ty`` hook
+          # in .pre-commit-config.yaml, which does ``uv run --frozen ty
+          # check``) from re-triggering ``uv sync`` and trying to
+          # install the project -- this job has no rust toolchain.
+          UV_NO_SYNC: "1"
           SKIP: cargo-fmt,cargo-clippy
           RUFF_OUTPUT_FORMAT: github
           CONFTEST_OUTPUT: github
 
+  # Single wheel build per CI run. Also runs cargo fmt/clippy on the
+  # same target dir so we get rust lint signal for free. The wheel is
+  # abi3-py311 -- one build covers every Python in the test matrix.
+  # ``rust-test`` runs as a peer (no shared target dir; different
+  # feature flags) and ``test`` / ``e2e`` consume the uploaded wheel.
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: 3.12
+          enable-cache: true
+          cache-dependency-glob: "**/uv.lock"
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-build
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: uv build --wheel --out-dir dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dead-cst-wheel
+          path: dist/*.whl
+
+  # Rust unit tests. Downstream of ``build`` so ``~/.cargo/registry``
+  # (200+ deps) is warm from build's cache restore; the target/ on top
+  # is partially shared too (cargo's feature-fingerprint keeps the
+  # default-features artifacts from build separate from the
+  # no-default-features artifacts here, but they coexist in the same
+  # target/ tree).
+  rust-test:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-build
+      - run: cargo test --no-default-features --locked
+
+  # Install the prebuilt wheel into each Python version's venv and run
+  # pytest. No maturin invocation in this job -- the wheel slots in via
+  # ``uv pip install --no-deps`` after ``--no-install-project`` puts the
+  # dep tree in place.
   test:
+    needs: build
     runs-on: ubuntu-latest
     strategy:
       matrix:
         python-version: ["3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-          submodules: recursive
       - uses: astral-sh/setup-uv@v7
         with:
           python-version: ${{ matrix.python-version }}
           activate-environment: true
           enable-cache: true
           cache-dependency-glob: "**/uv.lock"
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions/download-artifact@v4
         with:
-          rustflags: ""
-      # ``uv sync`` runs maturin (the project's build backend), which
-      # compiles the Rust crate at the repo root and drops
-      # ``_native.abi3.so`` next to ``python/dead_cst/`` -- the test
-      # suite can't import ``dead_cst._native`` without this step.
-      - run: uv sync --frozen
+          name: dead-cst-wheel
+          path: dist/
+      - run: uv sync --no-install-project --frozen
+      - run: uv pip install --no-deps --force-reinstall dist/*.whl
       - name: Run tests
-        run: uv run pytest ${{ matrix.python-version == '3.13' && '--cov=python/dead_cst --cov-branch --cov-report=xml' || '' }}
+        run: uv run --no-sync pytest ${{ matrix.python-version == '3.13' && '--cov=python/dead_cst --cov-branch --cov-report=xml' || '' }}
       - name: Upload coverage to Codecov
         if: matrix.python-version == '3.13'
         uses: codecov/codecov-action@v5
@@ -70,17 +132,25 @@ jobs:
           fail_ci_if_error: false
           token: ${{ secrets.CODECOV_TOKEN }}
 
-  rust:
+  # End-to-end tests against pinned third-party repos. Same wheel-install
+  # pattern as the ``test`` job, but runs ``pytest -m e2e`` instead. The
+  # suite skips (rather than fails) on missing ``git`` or network errors,
+  # so transient flakes don't block PRs.
+  e2e:
+    needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v7
         with:
-          submodules: recursive
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+          python-version: 3.12
+          activate-environment: true
+          enable-cache: true
+          cache-dependency-glob: "**/uv.lock"
+      - uses: actions/download-artifact@v4
         with:
-          rustflags: ""
-          components: rustfmt, clippy
-      - name: cargo fmt
-        run: cargo fmt --check
-      - name: cargo clippy
-        run: cargo clippy --all-targets --locked -- -D warnings
+          name: dead-cst-wheel
+          path: dist/
+      - run: uv sync --no-install-project --frozen
+      - run: uv pip install --no-deps --force-reinstall dist/*.whl
+      - run: uv run --no-sync pytest -m e2e

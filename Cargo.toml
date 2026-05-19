@@ -8,8 +8,18 @@ publish = false
 name = "dead_cst_native"
 crate-type = ["cdylib"]
 
+# ``extension-module`` is what tells pyo3 to skip linking against
+# libpython (Python loads the cdylib and provides the symbols at
+# runtime). Production builds (uv build -> maturin) keep it on via the
+# default feature; ``cargo test --no-default-features`` turns it off
+# so the rust test binary can resolve PyDict_Next / PySequence_Check
+# / etc. at link time.
+[features]
+default = ["extension-module"]
+extension-module = ["pyo3/extension-module"]
+
 [dependencies]
-pyo3 = { version = "0.22", features = ["extension-module", "abi3-py311", "multiple-pymethods"] }
+pyo3 = { version = "0.22", features = ["abi3-py311", "multiple-pymethods"] }
 ty_project = { path = "vendor/ruff/crates/ty_project" }
 ty_python_core = { path = "vendor/ruff/crates/ty_python_core" }
 ty_python_semantic = { path = "vendor/ruff/crates/ty_python_semantic" }
