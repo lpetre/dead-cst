@@ -83,6 +83,63 @@ STAR_REEXPORT_EDGES = frozenset(
             id="cst.ImportFrom-function",
         ),
         pytest.param(
+            # Bare-name reference inside a quoted annotation. ty parses
+            # the string in annotation position and re-runs name
+            # resolution; the rust ingest hands the parsed sub-AST to a
+            # sub-collector so each Name inside contributes the same
+            # alias + upstream edges it would unquoted. Edges match the
+            # ``f()`` call case above exactly — annotations are uses.
+            "from p.functions import f\ndef a(x: 'f') -> None: pass",
+            {
+                "p.x.a -> p.functions",
+                "p.x.a -> p.functions.f",
+                "p.x.a -> p.x",
+                "p.x.a -> p.x.f",
+                "p.x.f -> p.functions",
+                "p.x.f -> p.functions.f",
+                "p.x.f -> p.x",
+            },
+            id="string-annotation-emits-use-edge",
+        ),
+        pytest.param(
+            # Quoted name *inside* a non-quoted annotation
+            # (``Container['f']``). ty registers the inner string as an
+            # annotation; we walk it just like the standalone case.
+            (
+                "from typing import List\n"
+                "from p.functions import f\n"
+                "def a(x: List['f']) -> None: pass\n"
+            ),
+            {
+                "p.x.List -> p.x",
+                "p.x.a -> p.functions",
+                "p.x.a -> p.functions.f",
+                "p.x.a -> p.x",
+                "p.x.a -> p.x.List",
+                "p.x.a -> p.x.f",
+                "p.x.f -> p.functions",
+                "p.x.f -> p.functions.f",
+                "p.x.f -> p.x",
+            },
+            id="string-annotation-inside-subscript",
+        ),
+        pytest.param(
+            # Belt-and-braces: a bare string literal in a *non*-annotation
+            # position must NOT emit use edges. ty never marks it as a
+            # string annotation, so ``enter_string_annotation`` returns
+            # ``None`` and the walker leaves it alone. The expected
+            # edge set lists no ``p.x.label -> p.x.f`` — pinning that
+            # absence is the point of this case.
+            "from p.functions import f\nlabel = 'f'\n",
+            {
+                "p.x.f -> p.functions",
+                "p.x.f -> p.functions.f",
+                "p.x.f -> p.x",
+                "p.x.label -> p.x",
+            },
+            id="regular-string-literal-not-walked",
+        ),
+        pytest.param(
             "from p.classes import C\ndef a(): C.f()",
             {
                 "p.x.C -> p.classes",
@@ -1027,49 +1084,17 @@ def test_submodule_alias_not_minted_in_non_init_file(build_decl_graph):
 
 
 # ---------------------------------------------------------------------------
-# String annotations / TYPE_CHECKING imports
+# TYPE_CHECKING-guarded import referenced from a string annotation.
+#
+# The basic mechanics (string annotations are uses; regular string
+# literals are not) are pinned by parametrized ``test_imports`` cases
+# above. This composition test covers the practical motivator: an
+# import that lives under a dead branch *and* is referenced only from
+# a quoted annotation in live code must still pick up the use edge.
 # ---------------------------------------------------------------------------
 
 
-def test_string_annotation_emits_use_edge(build_decl_graph, assert_edges):
-    """Names that appear only inside a quoted type annotation must still
-    count as uses. ``ty`` parses the string in annotation position and
-    re-runs name resolution; the rust ingest passes the parsed sub-AST
-    through a sub-collector so each ``Name`` inside contributes its
-    normal ``use → alias`` edge.
-    """
-    graph = build_decl_graph(
-        {
-            "mod.py": (
-                "from helpers import Helper\ndef f(x: 'Helper') -> 'Helper':\n    return x\n"
-            ),
-            "helpers.py": "class Helper: pass\n",
-        }
-    )
-    assert_edges(
-        graph,
-        {
-            "helpers.Helper -> helpers",
-            "mod.Helper -> helpers",
-            "mod.Helper -> helpers.Helper",
-            "mod.Helper -> mod",
-            # The two string annotations both reference Helper. Edges
-            # collapse to one parallel pair (alias + upstream chain).
-            "mod.f -> helpers",
-            "mod.f -> helpers.Helper",
-            "mod.f -> mod",
-            "mod.f -> mod.Helper",
-        },
-    )
-
-
 def test_type_checking_import_used_only_in_string_annotation(build_decl_graph, predecessors_of):
-    """The classic pattern: import lives under ``if TYPE_CHECKING:`` and
-    is referenced only inside a quoted annotation. Without
-    string-annotation walking, the import gets zero in-edges and is
-    falsely reported dead. With it, the use site emits the same edge
-    it would for an unquoted annotation.
-    """
     graph = build_decl_graph(
         {
             "mod.py": (
@@ -1088,53 +1113,3 @@ def test_type_checking_import_used_only_in_string_annotation(build_decl_graph, p
     # should be in the import alias's in-edges.
     preds = {n.fqname for n in predecessors_of(graph, helper_alias)}
     assert "mod.f" in preds
-
-
-def test_string_annotation_inside_subscript(build_decl_graph, predecessors_of):
-    """Quoted name *inside* a non-quoted annotation (``list["Helper"]``)
-    also resolves. ty registers the sub-string as an annotation and
-    we walk it.
-    """
-    graph = build_decl_graph(
-        {
-            "mod.py": (
-                "from typing import List\n"
-                "from helpers import Helper\n"
-                "def f(x: List['Helper']) -> None:\n"
-                "    pass\n"
-            ),
-            "helpers.py": "class Helper: pass\n",
-        }
-    )
-    helper_alias = next(n for n in graph.nodes() if n.fqname == "mod.Helper" and n.kind == "import")
-    preds = {n.fqname for n in predecessors_of(graph, helper_alias)}
-    assert "mod.f" in preds
-
-
-def test_regular_string_literal_not_walked(build_decl_graph):
-    """A bare string literal in a non-annotation position must NOT be
-    parsed as an annotation. ``"Helper"`` assigned to a variable or
-    passed to a regular function call is just data — walking it would
-    invent edges out of thin air.
-    """
-    graph = build_decl_graph(
-        {
-            "mod.py": (
-                "from helpers import Helper\n"
-                "label = 'Helper'\n"  # not an annotation; must not edge to Helper
-                "def f(): pass\n"
-            ),
-            "helpers.py": "class Helper: pass\n",
-        }
-    )
-    helper_alias = next(n for n in graph.nodes() if n.fqname == "mod.Helper" and n.kind == "import")
-    label_var = next(n for n in graph.nodes() if n.fqname == "mod.label")
-    # ``label`` does NOT depend on Helper — its value is a runtime string.
-    edges = {
-        (u.fqname, v.fqname)
-        for u, v in ((graph.nodes()[u], graph.nodes()[v]) for u, v, _ in graph.edges())
-    }
-    assert ("mod.label", "mod.Helper") not in edges
-    # Belt-and-braces: label_var isn't in the import alias's predecessors.
-    helper_preds = set(graph.ancestors(helper_alias))
-    assert label_var not in helper_preds
