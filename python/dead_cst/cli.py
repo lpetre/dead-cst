@@ -24,7 +24,7 @@ import re
 import sys
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Iterable, Sequence, Union
+from typing import TYPE_CHECKING, Annotated, Iterable, Sequence
 
 import typer
 
@@ -54,11 +54,13 @@ from .resolvers import (
 if TYPE_CHECKING:
     from dead_cst import _native as native
 
-# A graph view the CLI can query for "what's alive": either the live
-# rust context (built this run) or the in-memory wrapper around a
-# loaded graph file. Both expose ``nodes()`` and
-# ``reachable(seed_flags=...)``.
-GraphView = Union["native.ProjectContext", LoadedGraph]
+    # A graph view the CLI can query for "what's alive": either the
+    # live rust context (built this run) or the in-memory wrapper
+    # around a loaded graph file. Both expose ``nodes()`` and
+    # ``reachable(seed_flags=...)``. Only used as a type alias, so it
+    # can live entirely inside ``TYPE_CHECKING`` — references to it
+    # in annotations are deferred by ``from __future__ import annotations``.
+    GraphView = native.ProjectContext | LoadedGraph
 
 
 app = typer.Typer(help="Dead code analysis for Python.")
@@ -142,7 +144,7 @@ def _materialize(
     entrypoints: list[str],
     entrypoint_regexes: list[str],
     show_progress: bool,
-) -> "tuple[native.ProjectContext, Analysis]":
+) -> tuple[native.ProjectContext, Analysis]:
     """Build the project graph from CLI inputs."""
     path_resolver = build_resolver(path_specs, resolver_name)
     plugins = build_plugins(

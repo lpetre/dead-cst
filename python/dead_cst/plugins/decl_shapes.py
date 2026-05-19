@@ -207,7 +207,7 @@ class DispatchAppPlugin(Plugin):
 
         handlers = list(native.query(ctx).decorators().where_owner_attr(decorator_attrs))
 
-        direct_by_owner: dict[tuple[str, str], list["native.SymbolNode"]] = {}
+        direct_by_owner: dict[tuple[str, str], list[native.SymbolNode]] = {}
         for ref in direct:
             simple = ref.var.fqname.rsplit(".", 1)[-1]
             direct_by_owner.setdefault((ref.var.path, simple), []).append(ref.var)

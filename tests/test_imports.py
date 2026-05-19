@@ -646,16 +646,16 @@ def test_third_party_import_creates_synthetic_node(build_decl_graph):
     graph = build_decl_graph(
         {
             "p/__init__.py": "",
-            "p/uses_rx.py": "import tqdm as rx\ndef build(): return rx.tqdm()",
+            "p/uses_rx.py": "import click as rx\ndef build(): return rx.click()",
         }
     )
     rx_nodes = {
         n
         for n in graph.nodes()
-        if n.kind == "synthetic" and n.fqname.startswith(EXTERNAL_PREFIXES) and "tqdm" in n.fqname
+        if n.kind == "synthetic" and n.fqname.startswith(EXTERNAL_PREFIXES) and "click" in n.fqname
     }
     assert rx_nodes, (
-        "expected an external-dep synthetic node for tqdm, got "
+        "expected an external-dep synthetic node for click, got "
         f"{[n.fqname for n in graph.nodes() if n.kind == 'synthetic']}"
     )
 

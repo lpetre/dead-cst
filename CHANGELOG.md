@@ -43,6 +43,25 @@ two versions.
   on-disk format has a hard-versioned header — version mismatch is a
   fatal error, with no migration path (rebuilding a graph is cheap).
 
+### Removed
+- **``tqdm`` runtime dependency.** Progress reporting moved entirely
+  to the rust crate's ``indicatif`` bars during the rust refactor;
+  the Python ``dead_cst._progress`` shim that wrapped ``tqdm`` had
+  no callers left.
+- **``dead_cst._notebooks`` helper module.** Notebook ingestion lives
+  in the rust crate (``src/helpers.rs``); the Python helper that
+  preceded it had no callers.
+
+### Changed
+- **Annotation references to native types are unquoted.** With
+  ``from __future__ import annotations`` already in place across the
+  package, ``"native.ProjectContext"``-style string annotations in
+  function signatures and variable annotations are no longer needed —
+  they're plain ``native.ProjectContext`` references that the
+  ``TYPE_CHECKING``-guarded import satisfies for type-checkers and
+  that runtime never evaluates. The CLI's ``GraphView`` type alias
+  moves inside the ``TYPE_CHECKING`` block for the same reason.
+
 ### Fixed
 - **`ModuleDundersPlugin` now pins module-level dunder *functions*.**
   PEP 562 ``__getattr__`` / ``__dir__`` defined at module scope are

@@ -27,7 +27,7 @@ def materialize_project(
     src_roots: Sequence[Path] = (),
     *,
     show_progress: bool = False,
-) -> "native.ProjectContext":
+) -> native.ProjectContext:
     """Materialize ``project_root`` end-to-end via the rust backend.
 
     Builds a :class:`native.ProjectContext` rooted at ``project_root``,
