@@ -1704,3 +1704,939 @@ pub(crate) fn module_fqname_for_file(db: &dyn ProjectDb, file: File) -> String {
         .unwrap_or(rel);
     stem.replace(['/', '\\'], ".")
 }
+
+#[cfg(test)]
+mod tests {
+    //! Pure-rust tests for the AST / string helpers.
+    //!
+    //! Anything that takes a `Python<'_>` GIL token, a `Py<SymbolNode>`,
+    //! a `Bound<'_, PyAny>`, a Salsa `ProjectDatabase`, a `File`, or a
+    //! `ParsedModuleRef` (which is also DB-backed) is intentionally NOT
+    //! covered here — the FFI surface is exercised end-to-end by the
+    //! python suite. We focus on pure functions over primitives + raw
+    //! AST nodes built from `parse_module(...)` / `parse_expression(...)`.
+    use super::*;
+    use ruff_python_parser::{parse_expression, parse_module};
+
+    fn parse_expr(source: &str) -> Box<Expr> {
+        parse_expression(source).unwrap().into_syntax().body
+    }
+
+    fn parse_stmts(source: &str) -> Vec<Stmt> {
+        parse_module(source).unwrap().into_syntax().body
+    }
+
+    // -- is_dunder_name ----------------------------------------------------
+
+    #[test]
+    fn is_dunder_name_true_for_typical_dunders() {
+        assert!(is_dunder_name("__init__"));
+        assert!(is_dunder_name("__repr__"));
+        assert!(is_dunder_name("mod.cls.__init__"));
+    }
+
+    #[test]
+    fn is_dunder_name_false_for_single_underscore() {
+        assert!(!is_dunder_name("_x"));
+        assert!(!is_dunder_name("__x"));
+        assert!(!is_dunder_name("x__"));
+    }
+
+    #[test]
+    fn is_dunder_name_false_for_short_dunder() {
+        // ``__`` and ``____`` are <= 4 chars after stripping `__` —
+        // the helper requires len() > 4 so the dunder body is at least 1 char.
+        assert!(!is_dunder_name("__"));
+        assert!(!is_dunder_name("____"));
+    }
+
+    #[test]
+    fn is_dunder_name_empty_string_ok() {
+        assert!(!is_dunder_name(""));
+        assert!(!is_dunder_name("foo.bar.baz"));
+    }
+
+    // -- rel_path ----------------------------------------------------------
+
+    #[test]
+    fn rel_path_roundtrips_unix_path() {
+        let p = rel_path("foo/bar.py");
+        assert_eq!(p.path().as_str(), "foo/bar.py");
+    }
+
+    #[test]
+    fn rel_path_handles_empty_input() {
+        // Should not panic on empty input — the `SystemPath::new` path
+        // accepts zero-length strings.
+        let p = rel_path("");
+        assert_eq!(p.path().as_str(), "");
+    }
+
+    // -- is_name / is_string_literal --------------------------------------
+
+    #[test]
+    fn is_name_matches_bare_name() {
+        let expr = parse_expr("foo");
+        assert!(is_name(&expr, "foo"));
+        assert!(!is_name(&expr, "bar"));
+    }
+
+    #[test]
+    fn is_name_rejects_non_name_exprs() {
+        let expr = parse_expr("foo.bar");
+        assert!(!is_name(&expr, "foo"));
+        assert!(!is_name(&expr, "bar"));
+        let expr = parse_expr("123");
+        assert!(!is_name(&expr, "123"));
+    }
+
+    #[test]
+    fn is_string_literal_matches_exact_value() {
+        let expr = parse_expr("'__main__'");
+        assert!(is_string_literal(&expr, "__main__"));
+        assert!(!is_string_literal(&expr, "other"));
+    }
+
+    #[test]
+    fn is_string_literal_rejects_non_string() {
+        let expr = parse_expr("123");
+        assert!(!is_string_literal(&expr, "123"));
+        let expr = parse_expr("foo");
+        assert!(!is_string_literal(&expr, "foo"));
+    }
+
+    // -- is_name_eq_main --------------------------------------------------
+
+    #[test]
+    fn is_name_eq_main_matches_both_orderings() {
+        let a = parse_expr("__name__ == '__main__'");
+        let b = parse_expr("'__main__' == __name__");
+        assert!(is_name_eq_main(&a));
+        assert!(is_name_eq_main(&b));
+    }
+
+    #[test]
+    fn is_name_eq_main_rejects_wrong_constant() {
+        let expr = parse_expr("__name__ == 'main'");
+        assert!(!is_name_eq_main(&expr));
+    }
+
+    #[test]
+    fn is_name_eq_main_rejects_other_comparisons() {
+        // !=, multiple comparators, non-name LHS, non-string RHS, etc.
+        assert!(!is_name_eq_main(&parse_expr("__name__ != '__main__'")));
+        assert!(!is_name_eq_main(&parse_expr("x == y == z")));
+        assert!(!is_name_eq_main(&parse_expr("foo == '__main__'")));
+        assert!(!is_name_eq_main(&parse_expr("123 == 456")));
+    }
+
+    // -- top_level_assign_to_name -----------------------------------------
+
+    #[test]
+    fn top_level_assign_to_name_matches_simple_assignment() {
+        let stmts = parse_stmts("x = 42\n");
+        let got = top_level_assign_to_name(&stmts[0]);
+        assert!(got.is_some());
+        let (_, expr) = got.unwrap();
+        assert!(matches!(expr, Expr::NumberLiteral(_)));
+    }
+
+    #[test]
+    fn top_level_assign_to_name_matches_ann_assignment() {
+        let stmts = parse_stmts("x: int = 42\n");
+        let got = top_level_assign_to_name(&stmts[0]);
+        assert!(got.is_some());
+    }
+
+    #[test]
+    fn top_level_assign_to_name_rejects_tuple_target() {
+        let stmts = parse_stmts("x, y = 1, 2\n");
+        assert!(top_level_assign_to_name(&stmts[0]).is_none());
+    }
+
+    #[test]
+    fn top_level_assign_to_name_rejects_attribute_target() {
+        let stmts = parse_stmts("obj.attr = 1\n");
+        assert!(top_level_assign_to_name(&stmts[0]).is_none());
+    }
+
+    #[test]
+    fn top_level_assign_to_name_rejects_ann_without_value() {
+        let stmts = parse_stmts("x: int\n");
+        assert!(top_level_assign_to_name(&stmts[0]).is_none());
+    }
+
+    #[test]
+    fn top_level_assign_to_name_rejects_non_assign() {
+        let stmts = parse_stmts("def foo(): pass\n");
+        assert!(top_level_assign_to_name(&stmts[0]).is_none());
+    }
+
+    // -- class_body_defines_method -----------------------------------------
+
+    #[test]
+    fn class_body_defines_method_finds_named_method() {
+        let stmts = parse_stmts("class C:\n    def m(self): pass\n    def n(self): pass\n");
+        let cls = match &stmts[0] {
+            Stmt::ClassDef(c) => c,
+            _ => unreachable!(),
+        };
+        assert!(class_body_defines_method(cls, "m"));
+        assert!(class_body_defines_method(cls, "n"));
+        assert!(!class_body_defines_method(cls, "missing"));
+    }
+
+    #[test]
+    fn class_body_defines_method_ignores_non_function_members() {
+        let stmts = parse_stmts("class C:\n    x = 1\n    class Inner: pass\n");
+        let cls = match &stmts[0] {
+            Stmt::ClassDef(c) => c,
+            _ => unreachable!(),
+        };
+        assert!(!class_body_defines_method(cls, "x"));
+        assert!(!class_body_defines_method(cls, "Inner"));
+    }
+
+    // -- nth_positional_string --------------------------------------------
+
+    fn first_call(source: &str) -> ruff_python_ast::ExprCall {
+        let expr = parse_expr(source);
+        match *expr {
+            Expr::Call(c) => c,
+            _ => panic!("expected a call expression"),
+        }
+    }
+
+    #[test]
+    fn nth_positional_string_returns_literal_value() {
+        let call = first_call("f('hello', 'world')");
+        assert_eq!(nth_positional_string(&call, 0), Some("hello".to_string()));
+        assert_eq!(nth_positional_string(&call, 1), Some("world".to_string()));
+    }
+
+    #[test]
+    fn nth_positional_string_returns_none_for_non_string() {
+        let call = first_call("f(42, foo)");
+        assert_eq!(nth_positional_string(&call, 0), None);
+        assert_eq!(nth_positional_string(&call, 1), None);
+    }
+
+    #[test]
+    fn nth_positional_string_out_of_range_returns_none() {
+        let call = first_call("f('a')");
+        assert_eq!(nth_positional_string(&call, 5), None);
+    }
+
+    #[test]
+    fn nth_positional_string_rejects_f_string() {
+        // f-strings are not StringLiteral nodes — should be rejected.
+        let call = first_call("f(f'value-{x}')");
+        assert_eq!(nth_positional_string(&call, 0), None);
+    }
+
+    // -- call_callee_matches_var ------------------------------------------
+
+    #[test]
+    fn call_callee_matches_var_matches_owner_attr() {
+        let call = first_call("mocker.patch('x')");
+        assert!(call_callee_matches_var(&call, "mocker", "patch", None));
+        assert!(call_callee_matches_var(&call, "mocker", "patch", Some(1)));
+        assert!(!call_callee_matches_var(&call, "mocker", "patch", Some(2)));
+    }
+
+    #[test]
+    fn call_callee_matches_var_rejects_wrong_owner_or_attr() {
+        let call = first_call("mocker.patch('x')");
+        assert!(!call_callee_matches_var(&call, "other", "patch", None));
+        assert!(!call_callee_matches_var(&call, "mocker", "spy", None));
+    }
+
+    #[test]
+    fn call_callee_matches_var_rejects_non_attribute_callee() {
+        let call = first_call("f('x')");
+        assert!(!call_callee_matches_var(&call, "f", "patch", None));
+    }
+
+    #[test]
+    fn call_callee_matches_var_rejects_chained_receiver() {
+        // ``a.b.patch(...)`` has ``a.b`` (Attribute) as the receiver, not
+        // a bare Name — should not match.
+        let call = first_call("a.b.patch('x')");
+        assert!(!call_callee_matches_var(&call, "b", "patch", None));
+    }
+
+    // -- range_key ---------------------------------------------------------
+
+    #[test]
+    fn range_key_packs_start_end() {
+        use ruff_text_size::TextSize;
+        let range = TextRange::new(TextSize::from(5), TextSize::from(12));
+        assert_eq!(range_key(range), (5, 12));
+    }
+
+    // -- arg_value_eq_literal ---------------------------------------------
+
+    #[test]
+    fn arg_value_eq_literal_compares_simple_scalars() {
+        assert!(arg_value_eq_literal(&ArgValue::None, &ArgValue::None));
+        assert!(arg_value_eq_literal(
+            &ArgValue::Bool(true),
+            &ArgValue::Bool(true)
+        ));
+        assert!(!arg_value_eq_literal(
+            &ArgValue::Bool(true),
+            &ArgValue::Bool(false)
+        ));
+        assert!(arg_value_eq_literal(&ArgValue::Int(42), &ArgValue::Int(42)));
+        assert!(arg_value_eq_literal(
+            &ArgValue::Str("hi".into()),
+            &ArgValue::Str("hi".into())
+        ));
+        assert!(!arg_value_eq_literal(
+            &ArgValue::Str("hi".into()),
+            &ArgValue::Str("ho".into())
+        ));
+    }
+
+    #[test]
+    fn arg_value_eq_literal_int_float_cross_compares() {
+        // The helper opts into mixed int/float equality (ergonomic match).
+        assert!(arg_value_eq_literal(
+            &ArgValue::Int(5),
+            &ArgValue::Float(5.0)
+        ));
+        assert!(arg_value_eq_literal(
+            &ArgValue::Float(5.0),
+            &ArgValue::Int(5)
+        ));
+        assert!(!arg_value_eq_literal(
+            &ArgValue::Int(5),
+            &ArgValue::Float(5.5)
+        ));
+    }
+
+    #[test]
+    fn arg_value_eq_literal_unknown_never_matches() {
+        assert!(!arg_value_eq_literal(
+            &ArgValue::Unknown,
+            &ArgValue::Unknown
+        ));
+        assert!(!arg_value_eq_literal(&ArgValue::Unknown, &ArgValue::None));
+    }
+
+    #[test]
+    fn arg_value_eq_literal_list_tuple_interchangeable() {
+        let list = ArgValue::List(vec![ArgValue::Int(1), ArgValue::Int(2)]);
+        let tup = ArgValue::Tuple(vec![ArgValue::Int(1), ArgValue::Int(2)]);
+        let diff = ArgValue::List(vec![ArgValue::Int(1), ArgValue::Int(3)]);
+        let short = ArgValue::List(vec![ArgValue::Int(1)]);
+        assert!(arg_value_eq_literal(&list, &tup));
+        assert!(arg_value_eq_literal(&tup, &list));
+        assert!(!arg_value_eq_literal(&list, &diff));
+        assert!(!arg_value_eq_literal(&list, &short));
+    }
+
+    #[test]
+    fn arg_value_eq_literal_mixed_types_rejected() {
+        assert!(!arg_value_eq_literal(
+            &ArgValue::Int(0),
+            &ArgValue::Bool(false)
+        ));
+        assert!(!arg_value_eq_literal(&ArgValue::None, &ArgValue::Int(0)));
+        assert!(!arg_value_eq_literal(
+            &ArgValue::Str("".into()),
+            &ArgValue::List(vec![])
+        ));
+    }
+
+    // -- evaluate_truthiness ----------------------------------------------
+
+    #[test]
+    fn evaluate_truthiness_literals() {
+        let empty: NameTable = HashMap::new();
+        assert_eq!(evaluate_truthiness(&parse_expr("True"), &empty), Some(true));
+        assert_eq!(
+            evaluate_truthiness(&parse_expr("False"), &empty),
+            Some(false)
+        );
+        assert_eq!(
+            evaluate_truthiness(&parse_expr("None"), &empty),
+            Some(false)
+        );
+        assert_eq!(evaluate_truthiness(&parse_expr("..."), &empty), Some(true));
+        assert_eq!(evaluate_truthiness(&parse_expr("0"), &empty), Some(false));
+        assert_eq!(evaluate_truthiness(&parse_expr("1"), &empty), Some(true));
+        assert_eq!(evaluate_truthiness(&parse_expr("0.0"), &empty), Some(false));
+        assert_eq!(evaluate_truthiness(&parse_expr("3.14"), &empty), Some(true));
+        assert_eq!(evaluate_truthiness(&parse_expr("''"), &empty), Some(false));
+        assert_eq!(evaluate_truthiness(&parse_expr("'x'"), &empty), Some(true));
+        assert_eq!(evaluate_truthiness(&parse_expr("[]"), &empty), Some(false));
+        assert_eq!(evaluate_truthiness(&parse_expr("[1]"), &empty), Some(true));
+        assert_eq!(evaluate_truthiness(&parse_expr("()"), &empty), Some(false));
+        assert_eq!(evaluate_truthiness(&parse_expr("(1,)"), &empty), Some(true));
+        assert_eq!(evaluate_truthiness(&parse_expr("{}"), &empty), Some(false));
+        assert_eq!(
+            evaluate_truthiness(&parse_expr("{'a': 1}"), &empty),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn evaluate_truthiness_names_via_table() {
+        let mut table: NameTable = HashMap::new();
+        table.insert("DEBUG".into(), true);
+        table.insert("RELEASE".into(), false);
+        assert_eq!(
+            evaluate_truthiness(&parse_expr("DEBUG"), &table),
+            Some(true)
+        );
+        assert_eq!(
+            evaluate_truthiness(&parse_expr("RELEASE"), &table),
+            Some(false)
+        );
+        assert_eq!(evaluate_truthiness(&parse_expr("OTHER"), &table), None);
+    }
+
+    #[test]
+    fn evaluate_truthiness_unary_not() {
+        let empty: NameTable = HashMap::new();
+        assert_eq!(
+            evaluate_truthiness(&parse_expr("not True"), &empty),
+            Some(false)
+        );
+        assert_eq!(
+            evaluate_truthiness(&parse_expr("not False"), &empty),
+            Some(true)
+        );
+        assert_eq!(
+            evaluate_truthiness(&parse_expr("not unknown_name"), &empty),
+            None
+        );
+        // Other unary ops aren't folded.
+        assert_eq!(evaluate_truthiness(&parse_expr("-1"), &empty), None);
+    }
+
+    #[test]
+    fn evaluate_truthiness_bool_ops_short_circuit_or() {
+        let empty: NameTable = HashMap::new();
+        assert_eq!(
+            evaluate_truthiness(&parse_expr("True or unknown"), &empty),
+            Some(true)
+        );
+        assert_eq!(
+            evaluate_truthiness(&parse_expr("False or unknown"), &empty),
+            None
+        );
+        assert_eq!(
+            evaluate_truthiness(&parse_expr("False or False"), &empty),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn evaluate_truthiness_bool_ops_short_circuit_and() {
+        let empty: NameTable = HashMap::new();
+        assert_eq!(
+            evaluate_truthiness(&parse_expr("False and unknown"), &empty),
+            Some(false)
+        );
+        assert_eq!(
+            evaluate_truthiness(&parse_expr("True and unknown"), &empty),
+            None
+        );
+        assert_eq!(
+            evaluate_truthiness(&parse_expr("True and True"), &empty),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn evaluate_truthiness_returns_none_for_unsupported() {
+        let empty: NameTable = HashMap::new();
+        assert_eq!(evaluate_truthiness(&parse_expr("f()"), &empty), None);
+        assert_eq!(evaluate_truthiness(&parse_expr("a.b"), &empty), None);
+        assert_eq!(evaluate_truthiness(&parse_expr("a == b"), &empty), None);
+    }
+
+    #[test]
+    fn evaluate_truthiness_walrus_unwraps_value() {
+        let empty: NameTable = HashMap::new();
+        // ``(x := True)`` should fold to True (the walrus's value).
+        assert_eq!(
+            evaluate_truthiness(&parse_expr("(x := True)"), &empty),
+            Some(true)
+        );
+    }
+
+    // -- stmt_is_terminator / suite_terminates ----------------------------
+
+    #[test]
+    fn stmt_is_terminator_basic_terminators() {
+        let empty: NameTable = HashMap::new();
+        let stmts = parse_stmts("def f():\n    return 1\n");
+        let body = match &stmts[0] {
+            Stmt::FunctionDef(f) => &f.body,
+            _ => unreachable!(),
+        };
+        assert!(stmt_is_terminator(&body[0], &empty));
+
+        let stmts = parse_stmts("def f():\n    raise X\n");
+        let body = match &stmts[0] {
+            Stmt::FunctionDef(f) => &f.body,
+            _ => unreachable!(),
+        };
+        assert!(stmt_is_terminator(&body[0], &empty));
+    }
+
+    #[test]
+    fn stmt_is_terminator_break_continue_inside_loop() {
+        let empty: NameTable = HashMap::new();
+        let stmts = parse_stmts("for _ in []:\n    break\n");
+        let body = match &stmts[0] {
+            Stmt::For(f) => &f.body,
+            _ => unreachable!(),
+        };
+        assert!(stmt_is_terminator(&body[0], &empty));
+
+        let stmts = parse_stmts("for _ in []:\n    continue\n");
+        let body = match &stmts[0] {
+            Stmt::For(f) => &f.body,
+            _ => unreachable!(),
+        };
+        assert!(stmt_is_terminator(&body[0], &empty));
+    }
+
+    #[test]
+    fn stmt_is_terminator_assert_falsy() {
+        let empty: NameTable = HashMap::new();
+        // `assert False` is a terminator; `assert True` is not.
+        let stmts = parse_stmts("assert False\n");
+        assert!(stmt_is_terminator(&stmts[0], &empty));
+        let stmts = parse_stmts("assert True\n");
+        assert!(!stmt_is_terminator(&stmts[0], &empty));
+        let stmts = parse_stmts("assert 0\n");
+        assert!(stmt_is_terminator(&stmts[0], &empty));
+        let stmts = parse_stmts("assert unknown_var\n");
+        assert!(!stmt_is_terminator(&stmts[0], &empty));
+    }
+
+    #[test]
+    fn stmt_is_terminator_if_constant_truthy_body_terminates() {
+        let empty: NameTable = HashMap::new();
+        let stmts = parse_stmts("if True:\n    return\n");
+        assert!(stmt_is_terminator(&stmts[0], &empty));
+    }
+
+    #[test]
+    fn stmt_is_terminator_if_without_else_not_terminator() {
+        let empty: NameTable = HashMap::new();
+        // No else clause + a non-constant test means the if might be
+        // skipped — not a terminator.
+        let stmts = parse_stmts("if cond:\n    return\n");
+        assert!(!stmt_is_terminator(&stmts[0], &empty));
+    }
+
+    #[test]
+    fn stmt_is_terminator_if_else_both_terminate() {
+        let empty: NameTable = HashMap::new();
+        let stmts = parse_stmts("if cond:\n    return\nelse:\n    raise X\n");
+        assert!(stmt_is_terminator(&stmts[0], &empty));
+    }
+
+    #[test]
+    fn stmt_is_terminator_if_else_one_falls_through() {
+        let empty: NameTable = HashMap::new();
+        let stmts = parse_stmts("if cond:\n    return\nelse:\n    pass\n");
+        assert!(!stmt_is_terminator(&stmts[0], &empty));
+    }
+
+    #[test]
+    fn stmt_is_terminator_try_finally_terminates() {
+        let empty: NameTable = HashMap::new();
+        let stmts =
+            parse_stmts("try:\n    x = 1\nexcept Exception:\n    pass\nfinally:\n    return\n");
+        assert!(stmt_is_terminator(&stmts[0], &empty));
+    }
+
+    #[test]
+    fn stmt_is_terminator_try_body_and_all_handlers_terminate() {
+        let empty: NameTable = HashMap::new();
+        let stmts = parse_stmts("try:\n    return\nexcept Exception:\n    raise\n");
+        assert!(stmt_is_terminator(&stmts[0], &empty));
+    }
+
+    #[test]
+    fn stmt_is_terminator_try_handler_falls_through_not_terminator() {
+        let empty: NameTable = HashMap::new();
+        let stmts = parse_stmts("try:\n    return\nexcept Exception:\n    pass\n");
+        assert!(!stmt_is_terminator(&stmts[0], &empty));
+    }
+
+    #[test]
+    fn stmt_is_terminator_with_body_terminates() {
+        let empty: NameTable = HashMap::new();
+        let stmts = parse_stmts("with cm as c:\n    return\n");
+        assert!(stmt_is_terminator(&stmts[0], &empty));
+        let stmts = parse_stmts("with cm as c:\n    pass\n");
+        assert!(!stmt_is_terminator(&stmts[0], &empty));
+    }
+
+    #[test]
+    fn stmt_is_terminator_pass_is_not() {
+        let empty: NameTable = HashMap::new();
+        let stmts = parse_stmts("pass\n");
+        assert!(!stmt_is_terminator(&stmts[0], &empty));
+    }
+
+    #[test]
+    fn suite_terminates_finds_any_terminator() {
+        let empty: NameTable = HashMap::new();
+        let stmts = parse_stmts("def f():\n    x = 1\n    return 2\n    y = 3\n");
+        let body = match &stmts[0] {
+            Stmt::FunctionDef(f) => &f.body,
+            _ => unreachable!(),
+        };
+        assert!(suite_terminates(body, &empty));
+
+        let stmts = parse_stmts("def f():\n    x = 1\n    y = 2\n");
+        let body = match &stmts[0] {
+            Stmt::FunctionDef(f) => &f.body,
+            _ => unreachable!(),
+        };
+        assert!(!suite_terminates(body, &empty));
+    }
+
+    // -- walk_suite_for_dead / detect_dead_ranges (via module body) -------
+
+    #[test]
+    fn walk_suite_for_dead_marks_post_terminator_statements() {
+        let empty: NameTable = HashMap::new();
+        let stmts = parse_stmts("def f():\n    return 1\n    x = 2\n    y = 3\n");
+        let body = match &stmts[0] {
+            Stmt::FunctionDef(f) => f.body.clone(),
+            _ => unreachable!(),
+        };
+        let mut dead = Vec::new();
+        walk_suite_for_dead(&body, &empty, &mut dead);
+        // x = 2 and y = 3 should both be marked.
+        assert_eq!(dead.len(), 2);
+    }
+
+    #[test]
+    fn walk_suite_for_dead_handles_if_false() {
+        let empty: NameTable = HashMap::new();
+        let stmts = parse_stmts("if False:\n    x = 1\n    y = 2\n");
+        let mut dead = Vec::new();
+        walk_suite_for_dead(&stmts, &empty, &mut dead);
+        // Both statements in the False body are marked individually.
+        assert_eq!(dead.len(), 2);
+    }
+
+    #[test]
+    fn walk_suite_for_dead_handles_if_true_drops_else() {
+        let empty: NameTable = HashMap::new();
+        let stmts = parse_stmts("if True:\n    x = 1\nelse:\n    y = 2\n");
+        let mut dead = Vec::new();
+        walk_suite_for_dead(&stmts, &empty, &mut dead);
+        // The else clause is dead.
+        assert_eq!(dead.len(), 1);
+    }
+
+    #[test]
+    fn walk_suite_for_dead_recurses_into_function_body() {
+        let empty: NameTable = HashMap::new();
+        let stmts = parse_stmts("def outer():\n    return\n    nested = 1\n");
+        let mut dead = Vec::new();
+        walk_suite_for_dead(&stmts, &empty, &mut dead);
+        assert_eq!(dead.len(), 1);
+    }
+
+    #[test]
+    fn walk_suite_for_dead_empty_input_yields_nothing() {
+        let empty: NameTable = HashMap::new();
+        let mut dead = Vec::new();
+        walk_suite_for_dead(&[], &empty, &mut dead);
+        assert!(dead.is_empty());
+    }
+
+    // -- build_scope_table / collect_scope_bindings -----------------------
+
+    #[test]
+    fn build_scope_table_folds_simple_constant() {
+        let empty: NameTable = HashMap::new();
+        let stmts = parse_stmts("DEBUG = True\nX = False\n");
+        let table = build_scope_table(&stmts, &empty);
+        assert_eq!(table.get("DEBUG"), Some(&true));
+        assert_eq!(table.get("X"), Some(&false));
+    }
+
+    #[test]
+    fn build_scope_table_handles_chained_constants() {
+        let empty: NameTable = HashMap::new();
+        let stmts = parse_stmts("A = False\nB = A or False\nC = B\n");
+        let table = build_scope_table(&stmts, &empty);
+        assert_eq!(table.get("A"), Some(&false));
+        assert_eq!(table.get("B"), Some(&false));
+        assert_eq!(table.get("C"), Some(&false));
+    }
+
+    #[test]
+    fn build_scope_table_drops_conflicting_bindings() {
+        let empty: NameTable = HashMap::new();
+        let stmts = parse_stmts("X = True\nX = False\n");
+        let table = build_scope_table(&stmts, &empty);
+        assert!(!table.contains_key("X"));
+    }
+
+    #[test]
+    fn build_scope_table_inherits_enclosing_table() {
+        let mut enclosing: NameTable = HashMap::new();
+        enclosing.insert("OUTER".into(), true);
+        let stmts = parse_stmts("INNER = False\n");
+        let table = build_scope_table(&stmts, &enclosing);
+        assert_eq!(table.get("OUTER"), Some(&true));
+        assert_eq!(table.get("INNER"), Some(&false));
+    }
+
+    #[test]
+    fn build_scope_table_ignores_nested_function_bindings() {
+        let empty: NameTable = HashMap::new();
+        let stmts = parse_stmts("def f():\n    X = True\n");
+        let table = build_scope_table(&stmts, &empty);
+        // ``X`` is defined inside ``f`` — separate scope.
+        assert!(!table.contains_key("X"));
+    }
+
+    // -- collect_walrus_in_expr -------------------------------------------
+
+    #[test]
+    fn collect_walrus_in_expr_picks_up_assignment_target() {
+        let expr = parse_expr("(x := 5)");
+        let mut out: HashMap<String, Vec<&Expr>> = HashMap::new();
+        collect_walrus_in_expr(&expr, &mut out);
+        assert!(out.contains_key("x"));
+    }
+
+    #[test]
+    fn collect_walrus_in_expr_descends_compound_exprs() {
+        let expr = parse_expr("(a := 1) or (b := 2) and (c := 3)");
+        let mut out: HashMap<String, Vec<&Expr>> = HashMap::new();
+        collect_walrus_in_expr(&expr, &mut out);
+        assert!(out.contains_key("a"));
+        assert!(out.contains_key("b"));
+        assert!(out.contains_key("c"));
+    }
+
+    #[test]
+    fn collect_walrus_in_expr_no_walrus_yields_empty() {
+        let expr = parse_expr("a + b");
+        let mut out: HashMap<String, Vec<&Expr>> = HashMap::new();
+        collect_walrus_in_expr(&expr, &mut out);
+        assert!(out.is_empty());
+    }
+
+    // -- noqa helpers (extending the existing parse_noqa_tail tests) ------
+
+    #[test]
+    fn parse_noqa_tail_case_insensitive_prefix() {
+        assert_eq!(parse_noqa_tail("noqa"), Some(NoqaKind::Bare));
+        assert_eq!(parse_noqa_tail("NoQa"), Some(NoqaKind::Bare));
+        assert_eq!(parse_noqa_tail("nOqA"), Some(NoqaKind::Bare));
+    }
+
+    #[test]
+    fn parse_noqa_tail_rejects_non_noqa_comment() {
+        assert_eq!(parse_noqa_tail("type: ignore"), None);
+        assert_eq!(parse_noqa_tail("comment about noqa"), None);
+    }
+
+    #[test]
+    fn parse_noqa_tail_codes_are_trimmed_and_case_insensitive() {
+        assert_eq!(parse_noqa_tail("noqa: f401"), Some(NoqaKind::F401Present));
+        assert_eq!(
+            parse_noqa_tail("noqa:  F401  ,  E501"),
+            Some(NoqaKind::F401Present)
+        );
+        assert_eq!(
+            parse_noqa_tail("noqa: E501,  E502"),
+            Some(NoqaKind::OtherOnly)
+        );
+    }
+
+    #[test]
+    fn parse_noqa_tail_handles_leading_whitespace() {
+        assert_eq!(
+            parse_noqa_tail("    noqa: F401"),
+            Some(NoqaKind::F401Present)
+        );
+    }
+
+    #[test]
+    fn is_per_line_pin_basic() {
+        assert!(is_per_line_pin(" noqa"));
+        assert!(is_per_line_pin(" noqa: F401"));
+        assert!(is_per_line_pin(" noqa: E501, F401"));
+        assert!(!is_per_line_pin(" noqa: E501"));
+        assert!(!is_per_line_pin(" type: ignore"));
+        assert!(!is_per_line_pin(""));
+    }
+
+    #[test]
+    fn is_file_pin_recognizes_ruff_and_flake8_prefixes() {
+        assert!(is_file_pin(" ruff: noqa"));
+        assert!(is_file_pin(" ruff: noqa: F401"));
+        assert!(is_file_pin(" flake8: noqa"));
+        assert!(is_file_pin(" flake8: noqa: F401"));
+    }
+
+    #[test]
+    fn is_file_pin_other_codes_dont_pin_f401() {
+        assert!(!is_file_pin(" ruff: noqa: E501"));
+        assert!(!is_file_pin(" flake8: noqa: W292, E303"));
+    }
+
+    #[test]
+    fn is_file_pin_unrelated_comments_rejected() {
+        assert!(!is_file_pin(" pyright: ignore"));
+        assert!(!is_file_pin(" type: ignore"));
+        assert!(!is_file_pin(" noqa"));
+        assert!(!is_file_pin(""));
+    }
+
+    #[test]
+    fn is_file_pin_prefix_is_case_sensitive() {
+        // ``ruff:`` / ``flake8:`` are matched case-sensitively per ruff's docs.
+        assert!(!is_file_pin(" Ruff: noqa"));
+        assert!(!is_file_pin(" FLAKE8: noqa"));
+    }
+
+    // -- decorators_match_imports -----------------------------------------
+
+    #[test]
+    fn decorators_match_imports_via_local_alias() {
+        let stmts = parse_stmts("@register\ndef f(): pass\n");
+        let decorators = match &stmts[0] {
+            Stmt::FunctionDef(f) => &f.decorator_list,
+            _ => unreachable!(),
+        };
+        let mut imports: HashMap<String, String> = HashMap::new();
+        imports.insert("register".into(), "register".into());
+        let mut allowed: HashSet<&str> = HashSet::new();
+        allowed.insert("register");
+        let got = decorators_match_imports(decorators, &imports, &allowed);
+        assert!(got.is_some());
+    }
+
+    #[test]
+    fn decorators_match_imports_via_module_attr() {
+        let stmts = parse_stmts("@flask.route('/x')\ndef f(): pass\n");
+        let decorators = match &stmts[0] {
+            Stmt::FunctionDef(f) => &f.decorator_list,
+            _ => unreachable!(),
+        };
+        let mut imports: HashMap<String, String> = HashMap::new();
+        imports.insert("flask".into(), MODULE_ALIAS_MARKER.into());
+        let mut allowed: HashSet<&str> = HashSet::new();
+        allowed.insert("route");
+        let got = decorators_match_imports(decorators, &imports, &allowed);
+        // Has a call form.
+        assert!(matches!(got, Some(Some(_))));
+    }
+
+    #[test]
+    fn decorators_match_imports_bare_attribute() {
+        let stmts = parse_stmts("@app.task\ndef f(): pass\n");
+        let decorators = match &stmts[0] {
+            Stmt::FunctionDef(f) => &f.decorator_list,
+            _ => unreachable!(),
+        };
+        let mut imports: HashMap<String, String> = HashMap::new();
+        imports.insert("app".into(), MODULE_ALIAS_MARKER.into());
+        let mut allowed: HashSet<&str> = HashSet::new();
+        allowed.insert("task");
+        let got = decorators_match_imports(decorators, &imports, &allowed);
+        // Bare (no call) — outer Some, inner None.
+        assert!(matches!(got, Some(None)));
+    }
+
+    #[test]
+    fn decorators_match_imports_returns_none_when_no_match() {
+        let stmts = parse_stmts("@other\ndef f(): pass\n");
+        let decorators = match &stmts[0] {
+            Stmt::FunctionDef(f) => &f.decorator_list,
+            _ => unreachable!(),
+        };
+        let imports: HashMap<String, String> = HashMap::new();
+        let allowed: HashSet<&str> = HashSet::new();
+        assert!(decorators_match_imports(decorators, &imports, &allowed).is_none());
+    }
+
+    // -- matched_call_target ----------------------------------------------
+
+    #[test]
+    fn matched_call_target_via_local_name() {
+        let call = first_call("Flask(__name__)");
+        let mut imports: HashMap<String, String> = HashMap::new();
+        imports.insert("Flask".into(), "Flask".into());
+        let mut allowed: HashSet<&str> = HashSet::new();
+        allowed.insert("Flask");
+        assert_eq!(
+            matched_call_target(&call, &imports, "flask", &allowed),
+            Some("Flask".into())
+        );
+    }
+
+    #[test]
+    fn matched_call_target_via_module_alias_attr() {
+        let call = first_call("flask.Flask(__name__)");
+        let mut imports: HashMap<String, String> = HashMap::new();
+        imports.insert("flask".into(), MODULE_ALIAS_MARKER.into());
+        let mut allowed: HashSet<&str> = HashSet::new();
+        allowed.insert("Flask");
+        assert_eq!(
+            matched_call_target(&call, &imports, "flask", &allowed),
+            Some("Flask".into())
+        );
+    }
+
+    #[test]
+    fn matched_call_target_via_multi_seg_module() {
+        let call = first_call("unittest.mock.patch('x')");
+        // No file imports entry for the leftmost name — fallback to the
+        // literal dotted match against ``module``.
+        let imports: HashMap<String, String> = HashMap::new();
+        let mut allowed: HashSet<&str> = HashSet::new();
+        allowed.insert("patch");
+        assert_eq!(
+            matched_call_target(&call, &imports, "unittest.mock", &allowed),
+            Some("patch".into())
+        );
+    }
+
+    #[test]
+    fn matched_call_target_rejects_unknown_name() {
+        let call = first_call("unrelated()");
+        let imports: HashMap<String, String> = HashMap::new();
+        let allowed: HashSet<&str> = HashSet::new();
+        assert!(matched_call_target(&call, &imports, "x", &allowed).is_none());
+    }
+
+    #[test]
+    fn matched_call_target_rejects_disallowed_name() {
+        let call = first_call("Flask()");
+        let mut imports: HashMap<String, String> = HashMap::new();
+        imports.insert("Flask".into(), "Flask".into());
+        // Empty allowed set: target is present but not allowed.
+        let allowed: HashSet<&str> = HashSet::new();
+        assert!(matched_call_target(&call, &imports, "flask", &allowed).is_none());
+    }
+
+    // -- NoqaKind helper --------------------------------------------------
+
+    #[test]
+    fn noqakind_pins_f401() {
+        assert!(NoqaKind::Bare.pins_f401());
+        assert!(NoqaKind::F401Present.pins_f401());
+        assert!(!NoqaKind::OtherOnly.pins_f401());
+    }
+}

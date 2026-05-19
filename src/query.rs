@@ -1007,3 +1007,146 @@ impl FactoryQuery {
 }
 
 impl_query_methods!(no_first FactoryQuery);
+
+#[cfg(test)]
+mod tests {
+    //! Pure-rust tests for the identifier-prefilter helpers used by
+    //! every per-file query loop. The chainable query types themselves
+    //! depend on `Python<'_>` / `Py<ProjectContext>` and are covered
+    //! end-to-end by the python suite.
+    use super::*;
+
+    // -- _is_ident_continue -----------------------------------------------
+
+    #[test]
+    fn is_ident_continue_recognizes_word_bytes() {
+        for byte in b'a'..=b'z' {
+            assert!(_is_ident_continue(byte), "{byte} should be ident continue");
+        }
+        for byte in b'A'..=b'Z' {
+            assert!(_is_ident_continue(byte));
+        }
+        for byte in b'0'..=b'9' {
+            assert!(_is_ident_continue(byte));
+        }
+        assert!(_is_ident_continue(b'_'));
+    }
+
+    #[test]
+    fn is_ident_continue_rejects_punctuation_and_whitespace() {
+        for byte in [b'.', b',', b' ', b'\t', b'\n', b'(', b')', b'-', b'#', b':'] {
+            assert!(!_is_ident_continue(byte));
+        }
+    }
+
+    // -- _contains_identifier ---------------------------------------------
+
+    #[test]
+    fn contains_identifier_finds_isolated_match() {
+        assert!(_contains_identifier("foo", "foo"));
+        assert!(_contains_identifier("call(foo)", "foo"));
+        assert!(_contains_identifier(" foo ", "foo"));
+        assert!(_contains_identifier("foo.bar", "foo"));
+        assert!(_contains_identifier("a.foo", "foo"));
+    }
+
+    #[test]
+    fn contains_identifier_rejects_substring_inside_other_word() {
+        assert!(!_contains_identifier("foobar", "foo"));
+        assert!(!_contains_identifier("xfoo", "foo"));
+        assert!(!_contains_identifier("foo_bar", "foo"));
+        assert!(!_contains_identifier("foo1", "foo"));
+        // Underscore prefix is also an identifier continuation.
+        assert!(!_contains_identifier("_foo", "foo"));
+        // Digit prefix
+        assert!(!_contains_identifier("1foo", "foo"));
+    }
+
+    #[test]
+    fn contains_identifier_handles_match_at_boundaries() {
+        assert!(_contains_identifier("foo()", "foo"));
+        assert!(_contains_identifier("(foo)", "foo"));
+        assert!(_contains_identifier("foo+bar", "foo"));
+    }
+
+    #[test]
+    fn contains_identifier_empty_needle_returns_false() {
+        // Empty needle would otherwise match everywhere — explicitly handled.
+        assert!(!_contains_identifier("anything", ""));
+        assert!(!_contains_identifier("", ""));
+    }
+
+    #[test]
+    fn contains_identifier_empty_source_returns_false() {
+        assert!(!_contains_identifier("", "foo"));
+    }
+
+    #[test]
+    fn contains_identifier_multiple_occurrences_one_valid() {
+        // The first ("xfoo") is invalid; the second (" foo") matches.
+        assert!(_contains_identifier("xfoo foo", "foo"));
+        // Both fail.
+        assert!(!_contains_identifier("xfooy zfoow", "foo"));
+    }
+
+    #[test]
+    fn contains_identifier_handles_overlapping_advance() {
+        // Even when the first start position fails the boundary check,
+        // the scan must advance and try subsequent occurrences.
+        assert!(_contains_identifier("aaa a", "a"));
+    }
+
+    #[test]
+    fn contains_identifier_unicode_source_does_not_panic() {
+        // The function uses byte indexing for the boundary check. ASCII
+        // identifier continuations are all single-byte, and the
+        // multi-byte UTF-8 leading/continuation bytes all have the high
+        // bit set (>= 0x80), so they fail `_is_ident_continue` and the
+        // boundary holds — which makes `foo` adjacent to emoji a hit,
+        // even though Python would treat the unicode chars as
+        // identifier-continuation. The prefilter is approximate by
+        // design (`ty_ide::references::contains_identifier` has the
+        // same shape) — we exercise the byte path here to lock in the
+        // documented behavior.
+        assert!(_contains_identifier("héllo foo", "foo"));
+        assert!(_contains_identifier("foo🙂bar", "foo"));
+        // No needle present.
+        assert!(!_contains_identifier("héllo", "foo"));
+        // ASCII boundary still wins over surrounding unicode.
+        assert!(_contains_identifier(" foo ", "foo"));
+    }
+
+    #[test]
+    fn contains_identifier_multi_char_needle() {
+        assert!(_contains_identifier("def my_func(): pass", "my_func"));
+        assert!(!_contains_identifier("def my_function(): pass", "my_func"));
+        assert!(!_contains_identifier("my_funcx", "my_func"));
+    }
+
+    // -- _contains_any_identifier -----------------------------------------
+
+    #[test]
+    fn contains_any_identifier_returns_true_on_first_hit() {
+        assert!(_contains_any_identifier("call(foo)", &["bar", "foo"]));
+        assert!(_contains_any_identifier("foo()", &["foo"]));
+    }
+
+    #[test]
+    fn contains_any_identifier_empty_list_returns_false() {
+        assert!(!_contains_any_identifier("anything", &[]));
+        assert!(!_contains_any_identifier("", &[]));
+    }
+
+    #[test]
+    fn contains_any_identifier_returns_false_when_no_match() {
+        assert!(!_contains_any_identifier("this has none", &["foo", "bar"]));
+    }
+
+    #[test]
+    fn contains_any_identifier_respects_boundaries() {
+        // Same substring-inside-word rule as _contains_identifier.
+        assert!(!_contains_any_identifier("foobar", &["foo", "bar"]));
+        // But the standalone "foo" still hits if present.
+        assert!(_contains_any_identifier("foobar foo", &["foo"]));
+    }
+}
