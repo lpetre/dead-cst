@@ -209,3 +209,6 @@ python/dead_cst/_native*.pyd
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Claude Code worktrees (per-agent ephemeral)
+.claude/worktrees/
