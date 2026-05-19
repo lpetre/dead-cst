@@ -11,7 +11,7 @@ use ruff_db::files::File;
 use ty_project::Db as ProjectDb;
 
 use crate::builder::not_materialized;
-use crate::graph::{MainBlock, SymbolNode};
+use crate::graph::SymbolNode;
 use crate::helpers::{
     args_to_py_vec, call_args_match_kwargs, file_path_string, kwarg_matcher_from_py,
     kwargs_to_py_map, KwargMatcher,
@@ -112,7 +112,11 @@ impl CallRef {
 
 /// Entry point for the chainable query API. Returned by
 /// :meth:`ProjectContext.query`. Pick a stream type:
-/// :meth:`decorators`, :meth:`constructions`, or :meth:`calls`.
+/// :meth:`decorators`, :meth:`constructions`, :meth:`calls`,
+/// :meth:`subclasses`, :meth:`imports`, :meth:`classes`, or
+/// :meth:`factories`. Point lookups (``module``, ``declarations``,
+/// ``main_blocks``, etc.) live directly on
+/// :class:`ProjectContext`.
 #[pyclass(unsendable)]
 pub(crate) struct QueryBuilder {
     pub(crate) ctx: Py<ProjectContext>,
@@ -140,89 +144,6 @@ impl QueryBuilder {
     }
     fn factories(&self, py: Python<'_>) -> FactoryQuery {
         FactoryQuery::new(self.ctx.clone_ref(py))
-    }
-
-    // ----- Point lookups (no filter chain) ------------------------------
-
-    /// Look up a module's synthetic node by dotted fqname. Mirrors
-    /// :meth:`ProjectContext.find_module`.
-    fn module(&self, py: Python<'_>, fqname: &str) -> PyResult<Option<Py<SymbolNode>>> {
-        self.ctx.borrow(py).find_module(py, fqname)
-    }
-    /// All top-level declarations bound to the given dotted fqname.
-    /// Mirrors :meth:`ProjectContext.find_declarations`.
-    fn declarations(&self, py: Python<'_>, fqname: &str) -> PyResult<Vec<Py<SymbolNode>>> {
-        self.ctx.borrow(py).find_declarations(py, fqname)
-    }
-    /// Every top-level declaration node of the named module.
-    /// Mirrors :meth:`ProjectContext.find_module_top_level_decls`.
-    fn module_top_level_decls(
-        &self,
-        py: Python<'_>,
-        fqname: &str,
-    ) -> PyResult<Vec<Py<SymbolNode>>> {
-        self.ctx.borrow(py).find_module_top_level_decls(py, fqname)
-    }
-    /// The exported names listed in a module's ``__all__`` (when
-    /// statically resolvable), or ``None`` when the module has no
-    /// ``__all__``.
-    /// Mirrors :meth:`ProjectContext.find_module_dunder_all_exports`.
-    fn module_dunder_all_exports(
-        &self,
-        py: Python<'_>,
-        fqname: &str,
-    ) -> PyResult<Option<Vec<Py<SymbolNode>>>> {
-        self.ctx
-            .borrow(py)
-            .find_module_dunder_all_exports(py, fqname)
-    }
-    /// Read the literal-list value of a top-level variable assignment
-    /// (``X = ["a", "b"]``) and return the entries as strings.
-    /// Returns ``None`` when the variable isn't a list / tuple of
-    /// string literals.
-    /// Mirrors :meth:`ProjectContext.find_literal_list_entries`.
-    fn literal_list_entries(&self, py: Python<'_>, var_fqn: &str) -> PyResult<Option<Vec<String>>> {
-        self.ctx.borrow(py).find_literal_list_entries(var_fqn)
-    }
-    /// All top-level ``__dunder__`` declarations across the project.
-    /// Mirrors :meth:`ProjectContext.find_module_dunders`.
-    fn module_dunders(&self, py: Python<'_>) -> PyResult<Vec<Py<SymbolNode>>> {
-        self.ctx.borrow(py).find_module_dunders(py)
-    }
-    /// Every ``if __name__ == "__main__":`` block in the project,
-    /// paired with the module and the decls inside.
-    /// Mirrors :meth:`ProjectContext.find_main_blocks`.
-    fn main_blocks(&self, py: Python<'_>) -> PyResult<Vec<MainBlock>> {
-        self.ctx.borrow(py).find_main_blocks(py)
-    }
-    /// Match nodes against pre-classified path / fqname specs without
-    /// crossing the FFI boundary per node.
-    /// Mirrors :meth:`ProjectContext.find_nodes_matching_specs`.
-    fn nodes_matching_specs(
-        &self,
-        py: Python<'_>,
-        project_root: &str,
-        regexes: Vec<String>,
-        str_specs: Vec<String>,
-        abs_paths: Vec<String>,
-    ) -> PyResult<Vec<Py<SymbolNode>>> {
-        self.ctx.borrow(py).find_nodes_matching_specs(
-            py,
-            project_root,
-            regexes,
-            str_specs,
-            abs_paths,
-        )
-    }
-    /// Comments matching ``pattern`` paired with the next
-    /// declaration. Mirrors :meth:`ProjectContext.find_comment_patterns`.
-    #[allow(clippy::type_complexity)]
-    fn comment_patterns(
-        &self,
-        py: Python<'_>,
-        pattern: &str,
-    ) -> PyResult<Vec<(Py<SymbolNode>, String)>> {
-        self.ctx.borrow(py).find_comment_patterns(py, pattern)
     }
 }
 

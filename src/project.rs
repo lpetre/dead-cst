@@ -588,8 +588,9 @@ impl ProjectContext {
     }
 }
 
-// ----- Queries (rust-only, exposed to Python via the chainable QueryBuilder) -
+// ----- Point-lookup queries (exposed to Python directly on ProjectContext) -
 
+#[pymethods]
 impl ProjectContext {
     /// Return every top-level variable node whose name matches `__xxx__`.
     ///
@@ -859,6 +860,7 @@ impl ProjectContext {
     }
 }
 
+#[pymethods]
 impl ProjectContext {
     /// Return ``module_fqn``'s immediate top-level decls — every
     /// function / class / variable / import bound at its module scope.
@@ -1142,6 +1144,7 @@ impl ProjectContext {
     }
 }
 
+#[pymethods]
 impl ProjectContext {
     /// Return ``(module_node, [decls inside the block])`` for every
     /// file with a top-level ``if __name__ == "__main__":`` block.
@@ -1184,9 +1187,9 @@ impl ProjectContext {
         }
         Ok(out)
     }
+}
 
-    /// Return every class that defines a method with the given name.
-    ///
+impl ProjectContext {
     /// Return every top-level function decorated with ``@<decorator_module>.<name>``
     /// or ``@<name>`` for any ``name`` in ``decorator_names``.
     ///
@@ -1580,7 +1583,12 @@ impl ProjectContext {
             .map(|(idx, arg, call_args)| (outputs.builder.nodes[idx].clone_ref(py), arg, call_args))
             .collect())
     }
+}
 
+#[pymethods]
+impl ProjectContext {
+    /// Top-level functions / classes whose body constructs one of
+    /// ``ctor_names`` imported from ``module``.
     ///
     /// Recursively walks each candidate's body looking for ``<Ctor>(...)``
     /// or ``<module>.<Ctor>(...)`` call expressions. Returns
@@ -1651,7 +1659,9 @@ impl ProjectContext {
             .map(|(idx, kinds)| (outputs.builder.nodes[idx].clone_ref(py), kinds))
             .collect())
     }
+}
 
+impl ProjectContext {
     /// Find calls to a callable imported from ``module`` with the name
     /// ``name``. Returns ``(owning_decl, string_literal_arg)`` pairs
     /// where the call resolves through the file's local imports.
@@ -1801,7 +1811,12 @@ impl ProjectContext {
             .map(|(idx, arg, call_args)| (outputs.builder.nodes[idx].clone_ref(py), arg, call_args))
             .collect())
     }
+}
 
+#[pymethods]
+impl ProjectContext {
+    /// Every class that defines a method with the given name.
+    ///
     /// Walks each class's `DefinitionKind::Class` body for an
     /// `Stmt::FunctionDef` whose name matches. ty's `parsed_module` is
     /// Salsa-cached, so this is just a body scan per class.
@@ -1895,7 +1910,9 @@ impl ProjectContext {
             .map(|idx| outputs.builder.nodes[idx].clone_ref(py))
             .collect())
     }
+}
 
+impl ProjectContext {
     // ----- Convenience helpers used by the chainable QueryBuilder ----------
 
     #[allow(clippy::type_complexity)]
@@ -1970,7 +1987,10 @@ impl ProjectContext {
         }
         Ok(out)
     }
+}
 
+#[pymethods]
+impl ProjectContext {
     /// Subclasses of the class addressed by ``base_fqn``.
     ///
     /// Works for both project classes (where the fqn resolves to a
@@ -1979,6 +1999,7 @@ impl ProjectContext {
     /// ``type_hierarchy_subtypes``. ``transitive=True`` (default)
     /// walks the full subclass closure; ``transitive=False`` returns
     /// only direct subclasses.
+    #[pyo3(signature = (base_fqn, *, transitive = true))]
     pub(crate) fn find_subclasses(
         &self,
         py: Python<'_>,
