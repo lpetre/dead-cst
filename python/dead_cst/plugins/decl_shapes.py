@@ -57,7 +57,7 @@ class DecoratedDeclPlugin(Plugin):
         # ~100-400ms per framework on a typical project. If nothing
         # imports the module, no decorated decl can exist, so skip
         # the entire query path.
-        if not native.query(ctx).imports().of(self.decorator_module).count():
+        if not native.query(ctx).imports().of(self.decorator_module).exists():
             return
         names = sorted(self.decorator_names | self.constructor_names)
 
@@ -163,7 +163,7 @@ class DispatchAppPlugin(Plugin):
         # the project can't possibly contain an instance of an
         # ``app_class``, so skip the work.
         app_modules = {fqn.rpartition(".")[0] for fqn in self.app_classes if "." in fqn}
-        if not any(native.query(ctx).imports().of(m).count() for m in app_modules if m):
+        if not any(native.query(ctx).imports().of(m).exists() for m in app_modules if m):
             return
         decorator_attrs = list(self.registration_decorators)
 
@@ -312,7 +312,7 @@ class LiteralListPlugin(Plugin):
         # The visitor doesn't emit ``var -> referent`` edges for
         # non-``__all__`` string-list assignments, so the plugin can't
         # rely on a descendant walk.
-        entries = native.query(ctx).literal_list_entries(var_fqname)
+        entries = ctx.find_literal_list_entries(var_fqname)
         if not entries:
             return
 
@@ -324,7 +324,7 @@ class LiteralListPlugin(Plugin):
             # (e.g. ``pkg.foo`` where ``foo`` is also a re-exported decl
             # in ``pkg/__init__.py``).
             targets: list[native.SymbolNode] = list(ctx.module_surface(entry))
-            targets.extend(native.query(ctx).declarations(entry))
+            targets.extend(ctx.find_declarations(entry))
             if not targets:
                 continue
             yield native.AddNode(

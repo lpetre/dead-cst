@@ -594,16 +594,16 @@ def test_third_party_import_creates_synthetic_node(build_decl_graph):
     )
     rx_nodes = {
         n
-        for n in graph.nodes
+        for n in graph.nodes()
         if n.kind == "synthetic" and n.fqname.startswith(EXTERNAL_PREFIXES) and "tqdm" in n.fqname
     }
     assert rx_nodes, (
         "expected an external-dep synthetic node for tqdm, got "
-        f"{[n.fqname for n in graph.nodes if n.kind == 'synthetic']}"
+        f"{[n.fqname for n in graph.nodes() if n.kind == 'synthetic']}"
     )
 
     edge_srcs = {
-        graph.node(u).fqname for u, v in graph.raw.edge_list() if graph.node(v) in rx_nodes
+        graph.nodes()[u].fqname for u, v, _ in graph.edges() if graph.nodes()[v] in rx_nodes
     }
     assert {"p.uses_rx.rx", "p.uses_rx.build"} <= edge_srcs
 
@@ -622,7 +622,7 @@ def test_third_party_import_uses_canonical_dist_name(build_decl_graph):
             "p/uses_yaml.py": "import yaml\nDATA = yaml.safe_load('a: 1')\n",
         }
     )
-    fqnames = {n.fqname for n in graph.nodes if n.kind == "synthetic"}
+    fqnames = {n.fqname for n in graph.nodes() if n.kind == "synthetic"}
     assert "[external dist] pyyaml" in fqnames, fqnames
 
 
@@ -642,7 +642,7 @@ def test_stdlib_imports_are_silent(build_decl_graph, caplog):
         )
 
     assert [r.getMessage() for r in caplog.records] == []
-    synthetics = {n.fqname for n in graph.nodes if n.kind == "synthetic"}
+    synthetics = {n.fqname for n in graph.nodes() if n.kind == "synthetic"}
     # No stdlib ever surfaces as a graph node, and ``collections.abc``
     # must not fall through to ``[unresolved] collections`` (regression
     # against the synthesized-submodule parent-fallback).
@@ -663,7 +663,7 @@ def test_unresolved_import_emits_synthetic_silently(build_decl_graph, caplog):
     assert [r.getMessage() for r in caplog.records] == []
     assert any(
         n.kind == "synthetic" and n.fqname == f"{UNRESOLVED_PREFIX}unknown_pkg_xyz"
-        for n in graph.nodes
+        for n in graph.nodes()
     )
 
 
@@ -693,10 +693,10 @@ def test_module_runtime_dunder_access_is_module_dep(build_decl_graph, assert_edg
 
     assert [r.getMessage() for r in caplog.records] == []
     # No synthetic was minted for the missing-dunder lookup.
-    assert not [n.fqname for n in graph.nodes if n.fqname.endswith(".__file__")]
+    assert not [n.fqname for n in graph.nodes() if n.fqname.endswith(".__file__")]
     # The module-level dependency edges remain intact for each user of a dunder.
     edge_strs = {
-        f"{graph.node(u).fqname} -> {graph.node(v).fqname}" for u, v in graph.raw.edge_list()
+        f"{graph.nodes()[u].fqname} -> {graph.nodes()[v].fqname}" for u, v, _ in graph.edges()
     }
     assert "pkg.config.FILE_PATH -> pkg" in edge_strs
     assert "pkg.config.NAME -> pkg" in edge_strs
@@ -718,7 +718,7 @@ def test_dunder_on_imported_symbol_strips_dunder_tail(build_decl_graph, assert_e
         }
     )
     edge_strs = {
-        f"{graph.node(u).fqname} -> {graph.node(v).fqname}" for u, v in graph.raw.edge_list()
+        f"{graph.nodes()[u].fqname} -> {graph.nodes()[v].fqname}" for u, v, _ in graph.edges()
     }
     assert "pkg.uses.WHO -> pkg.lib.Cls" in edge_strs
     assert "pkg.uses.DOCSTR -> pkg.lib.Cls" in edge_strs
@@ -780,13 +780,13 @@ def test_import_resolves_through_star_reexport_rust(build_decl_graph, assert_edg
         }
     )
     edge_strs = {
-        f"{graph.node(u).fqname} -> {graph.node(v).fqname}" for u, v in graph.raw.edge_list()
+        f"{graph.nodes()[u].fqname} -> {graph.nodes()[v].fqname}" for u, v, _ in graph.edges()
     }
     assert "consumer.g -> pkg._internal.g" in edge_strs
     assert "consumer.g -> pkg" in edge_strs
     # No `pkg.g` alias is minted; the star node carries the reexport.
     assert "consumer.g -> pkg.g" not in edge_strs
-    assert any(n.fqname == "pkg.*pkg._internal" for n in graph.nodes)
+    assert any(n.fqname == "pkg.*pkg._internal" for n in graph.nodes())
 
 
 def test_import_resolves_through_chained_star_reexports(build_decl_graph, assert_edges):
@@ -800,7 +800,7 @@ def test_import_resolves_through_chained_star_reexports(build_decl_graph, assert
         }
     )
     edge_strs = {
-        f"{graph.node(u).fqname} -> {graph.node(v).fqname}" for u, v in graph.raw.edge_list()
+        f"{graph.nodes()[u].fqname} -> {graph.nodes()[v].fqname}" for u, v, _ in graph.edges()
     }
     assert "consumer.g -> C.g" in edge_strs
 
@@ -815,7 +815,7 @@ def test_star_reexport_cycle_terminates(build_decl_graph, assert_edges):
         }
     )
     edge_strs = {
-        f"{graph.node(u).fqname} -> {graph.node(v).fqname}" for u, v in graph.raw.edge_list()
+        f"{graph.nodes()[u].fqname} -> {graph.nodes()[v].fqname}" for u, v, _ in graph.edges()
     }
     assert "consumer.b -> B.b" in edge_strs
 
@@ -830,7 +830,7 @@ def test_star_reexport_shadowed_by_real_decl(build_decl_graph, assert_edges):
         }
     )
     edge_strs = {
-        f"{graph.node(u).fqname} -> {graph.node(v).fqname}" for u, v in graph.raw.edge_list()
+        f"{graph.nodes()[u].fqname} -> {graph.nodes()[v].fqname}" for u, v, _ in graph.edges()
     }
     assert "consumer.g -> mod.g" in edge_strs
     assert "consumer.g -> other.g" not in edge_strs
@@ -860,12 +860,12 @@ def test_from_import_prefers_namespace_binding_over_submodule(build_decl_graph):
     # Same fqname appears twice (the `q` variable in p/__init__.py and
     # the `q` module from p/q.py), so we have to disambiguate on type.
     consumer_q_alias = next(
-        n for n in graph.nodes if n.fqname == "consumer.q" and n.kind == "import"
+        n for n in graph.nodes() if n.fqname == "consumer.q" and n.kind == "import"
     )
     targets = {
-        (graph.node(v).fqname, graph.node(v).kind)
-        for u, v in graph.raw.edge_list()
-        if graph.index(consumer_q_alias) == u
+        (graph.nodes()[v].fqname, graph.nodes()[v].kind)
+        for u, v, _ in graph.edges()
+        if graph.nodes().index(consumer_q_alias) == u
     }
     assert ("p.q", "variable") in targets, targets
     # Crucial: the submodule must NOT be linked. The old submodule-first
@@ -884,8 +884,10 @@ def test_star_reexport_is_skipped_by_codemod_rust(build_decl_graph):
             "pkg/_internal.py": "def g(): pass\n",
         }
     )
-    star_nodes = [n for n in graph.nodes if n.fqname == "pkg.*pkg._internal" and n.kind == "import"]
-    assert len(star_nodes) == 1, [n.fqname for n in graph.nodes if "pkg" in n.fqname]
+    star_nodes = [
+        n for n in graph.nodes() if n.fqname == "pkg.*pkg._internal" and n.kind == "import"
+    ]
+    assert len(star_nodes) == 1, [n.fqname for n in graph.nodes() if "pkg" in n.fqname]
     assert star_nodes[0].imports is not None
     assert star_nodes[0].imports.star is True
     assert star_nodes[0].imports.module == "pkg._internal"

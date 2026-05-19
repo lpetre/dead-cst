@@ -337,13 +337,10 @@ def test_celery_plugin_handles_factory_function(build_plugin_graph, reachable_fq
         },
         [CeleryPlugin()],
     )
-    from dead_cst.analyze import _find_reachable as find_reachable, _keepalive_seeds
     from dead_cst.graph import KEEPALIVE_DEFAULT
 
     reached = {
-        n.fqname
-        for n in find_reachable(graph, _keepalive_seeds(graph, KEEPALIVE_DEFAULT))
-        if n.kind != "synthetic"
+        n.fqname for n in graph.reachable(seed_flags=KEEPALIVE_DEFAULT) if n.kind != "synthetic"
     }
     assert "app.celery.app" in reached
     assert "app.celery.run" in reached

@@ -13,20 +13,16 @@ from __future__ import annotations
 from pathlib import Path
 
 from dead_cst import NodeFlags
-from dead_cst.analyze import (
-    _find_kept_alive_by_flags_only,
-    _find_reachable as find_reachable,
-    _keepalive_seeds,
-)
 from dead_cst.graph import KEEPALIVE_DEFAULT
 
 
 def find_reachable_excluding_noqa(graph):
-    return find_reachable(graph, _keepalive_seeds(graph, KEEPALIVE_DEFAULT & ~NodeFlags.NOQA))
+    return set(graph.reachable(seed_flags=KEEPALIVE_DEFAULT & ~NodeFlags.NOQA))
 
 
 def find_kept_alive_by_noqa_only(graph):
-    return _find_kept_alive_by_flags_only(graph, NodeFlags.NOQA)
+    full = set(graph.reachable(seed_flags=KEEPALIVE_DEFAULT))
+    return full - find_reachable_excluding_noqa(graph)
 
 
 def test_noqa_pin_keeps_module_alive_only_via_noqa(make_analysis, write_files):
@@ -43,8 +39,8 @@ def test_noqa_pin_keeps_module_alive_only_via_noqa(make_analysis, write_files):
         }
     )
     graph = make_analysis().materialize_all()
-    side = next(n for n in graph.nodes if n.fqname == "pkg.side_effect")
-    assert side in find_reachable(graph, _keepalive_seeds(graph, KEEPALIVE_DEFAULT))
+    side = next(n for n in graph.nodes() if n.fqname == "pkg.side_effect")
+    assert side in set(graph.reachable(seed_flags=KEEPALIVE_DEFAULT))
     assert side not in find_reachable_excluding_noqa(graph)
     assert side in find_kept_alive_by_noqa_only(graph)
 
@@ -66,7 +62,7 @@ def test_production_only_decl_survives_strict_pass(make_analysis, write_files):
     from dead_cst.plugins import MainBlockPlugin
 
     graph = make_analysis(plugins=[MainBlockPlugin()]).materialize_all()
-    helper = next(n for n in graph.nodes if n.fqname == "pkg.lib.helper")
+    helper = next(n for n in graph.nodes() if n.fqname == "pkg.lib.helper")
     assert helper in find_reachable_excluding_noqa(graph)
     assert helper not in find_kept_alive_by_noqa_only(graph)
 
@@ -74,7 +70,7 @@ def test_production_only_decl_survives_strict_pass(make_analysis, write_files):
 def test_pinned_import_carries_noqa_flag(build_decl_graph):
     """Per-line ``# noqa: F401`` stamps the NOQA keepalive bit on the import node."""
     graph = build_decl_graph({"m.py": "import os  # noqa: F401\n"})
-    pinned = next(n for n in graph.nodes if n.fqname == "m.os")
+    pinned = next(n for n in graph.nodes() if n.fqname == "m.os")
     assert pinned.flags & NodeFlags.NOQA
 
 
@@ -83,19 +79,19 @@ def test_file_level_directive_stamps_noqa(build_decl_graph):
     src = "# ruff: noqa\nimport os\nimport sys\n"
     graph = build_decl_graph({"m.py": src})
     for fqn in ("m.os", "m.sys"):
-        node = next(n for n in graph.nodes if n.fqname == fqn)
+        node = next(n for n in graph.nodes() if n.fqname == fqn)
         assert node.flags & NodeFlags.NOQA, fqn
 
 
 def test_unpinned_import_has_no_noqa_flag(build_decl_graph):
     graph = build_decl_graph({"m.py": "import os\n"})
-    node = next(n for n in graph.nodes if n.fqname == "m.os")
+    node = next(n for n in graph.nodes() if n.fqname == "m.os")
     assert not (node.flags & NodeFlags.NOQA)
 
 
 def test_excluding_multiple_flags_in_one_pass(make_analysis, write_files):
-    """``_find_reachable`` accepts a combined ``IntFlag`` value so
-    callers can drop several entrypoint classes at once."""
+    """``reachable(seed_flags=...)`` accepts a combined ``IntFlag``
+    value so callers can drop several entrypoint classes at once."""
     write_files(
         {
             "pkg/__init__.py": """
@@ -113,10 +109,10 @@ def test_excluding_multiple_flags_in_one_pass(make_analysis, write_files):
     from dead_cst.plugins import PytestPlugin
 
     graph = make_analysis(plugins=[PytestPlugin()]).materialize_all()
-    side = next(n for n in graph.nodes if n.fqname == "pkg.side_effect")
-    assert side in find_reachable(graph, _keepalive_seeds(graph, KEEPALIVE_DEFAULT))
-    excluded = find_reachable(
-        graph, _keepalive_seeds(graph, KEEPALIVE_DEFAULT & ~(NodeFlags.TESTCASE | NodeFlags.NOQA))
+    side = next(n for n in graph.nodes() if n.fqname == "pkg.side_effect")
+    assert side in set(graph.reachable(seed_flags=KEEPALIVE_DEFAULT))
+    excluded = set(
+        graph.reachable(seed_flags=KEEPALIVE_DEFAULT & ~(NodeFlags.TESTCASE | NodeFlags.NOQA))
     )
     assert side not in excluded
 

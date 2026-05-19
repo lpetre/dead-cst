@@ -164,7 +164,7 @@ def test_seeds_are_not_tagged_testcase(build_plugin_graph):
         },
         [ServerConfigPlugin()],
     )
-    seeds = [n for n in graph.nodes if n.flags & NodeFlags.ENTRYPOINT]
+    seeds = [n for n in graph.nodes() if n.flags & NodeFlags.ENTRYPOINT]
     server_seeds = [s for s in seeds if s.fqname.startswith("<server-config>:")]
     assert server_seeds
     for seed in server_seeds:

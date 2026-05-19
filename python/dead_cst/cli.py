@@ -24,22 +24,16 @@ import re
 import sys
 from enum import Enum
 from pathlib import Path
-from typing import Annotated, Sequence
+from typing import TYPE_CHECKING, Annotated, Iterable, Sequence, Union
 
 import typer
 
-from ._graphstore import SymbolGraph
-from .analyze import (
-    Analysis,
-    _count_nodes_by_prefix,
-    _find_kept_alive_by_flags_only,
-    _find_reachable,
-    _keepalive_seeds,
-)
+from .analyze import Analysis, _count_nodes_by_prefix
 from .codemod import generate_patch
 from .graph import (
     KEEPALIVE_DEFAULT,
     GraphMetadata,
+    LoadedGraph,
     NodeFlags,
     SymbolNode,
     read_graph,
@@ -56,6 +50,15 @@ from .resolvers import (
     PathResolver,
     load_resolver,
 )
+
+if TYPE_CHECKING:
+    from dead_cst import _native as native
+
+# A graph view the CLI can query for "what's alive": either the live
+# rust context (built this run) or the in-memory wrapper around a
+# loaded graph file. Both expose ``nodes()`` and
+# ``reachable(seed_flags=...)``.
+GraphView = Union["native.ProjectContext", LoadedGraph]
 
 
 app = typer.Typer(help="Dead code analysis for Python.")
@@ -78,10 +81,6 @@ def setup_logging(verbose: bool) -> None:
         format="%(name)s: %(message)s",
         stream=sys.stderr,
     )
-
-
-def parse_entrypoint(ep: str) -> str | re.Pattern[str]:
-    return ep
 
 
 def parse_meta(spec: str) -> tuple[str, str]:
@@ -143,7 +142,7 @@ def _materialize(
     entrypoints: list[str],
     entrypoint_regexes: list[str],
     show_progress: bool,
-) -> tuple[SymbolGraph, list[Path]]:
+) -> "tuple[native.ProjectContext, Analysis]":
     """Build the project graph from CLI inputs."""
     path_resolver = build_resolver(path_specs, resolver_name)
     plugins = build_plugins(
@@ -152,8 +151,8 @@ def _materialize(
         plugin_names=plugin_names,
     )
     analysis = Analysis(root, resolver=path_resolver, plugins=plugins, show_progress=show_progress)
-    graph = analysis.materialize_all()
-    return graph, [p.path for p in analysis.packages]
+    ctx = analysis.materialize_all()
+    return ctx, analysis
 
 
 def _reject_build_inputs_with_graph(
@@ -193,7 +192,7 @@ def _load_or_build(
     plugin_names: list[str],
     entrypoints: list[str],
     entrypoint_regexes: list[str],
-) -> tuple[SymbolGraph, list[Path], GraphMetadata | None]:
+) -> tuple[GraphView, list[Path], GraphMetadata | None]:
     _reject_build_inputs_with_graph(
         graph_path=graph_path,
         path_specs=path_specs,
@@ -204,11 +203,11 @@ def _load_or_build(
     )
     if graph_path is not None:
         typer.echo(f"Loading symbol graph from {graph_path}...", err=True)
-        graph, meta = read_graph(graph_path)
+        loaded, meta = read_graph(graph_path)
         # Without resolver context, scope summaries to the project root.
-        return graph, [root], meta
+        return loaded, [root], meta
     typer.echo(f"Building symbol graph for {root}...", err=True)
-    graph, package_paths = _materialize(
+    ctx, analysis = _materialize(
         root,
         path_specs=path_specs,
         resolver_name=resolver_name,
@@ -217,15 +216,25 @@ def _load_or_build(
         entrypoint_regexes=entrypoint_regexes,
         show_progress=True,
     )
-    return graph, package_paths, None
+    return ctx, [p.path for p in analysis.packages], None
 
 
-def _select_dead(graph: SymbolGraph, query: Query) -> set[SymbolNode]:
+def _select_dead(view: GraphView, query: Query) -> list[SymbolNode]:
+    """Return the node set that the requested ``--query`` flags as dead.
+
+    * ``dead`` — the complement of ``reachable(KEEPALIVE_DEFAULT)``.
+    * ``test-only`` — the blast-radius diff between
+      ``reachable(KEEPALIVE_DEFAULT)`` and the same query with the
+      ``TESTCASE`` bit cleared from the seed mask. Test functions
+      themselves are in the result (they carry ``TESTCASE``).
+    """
     if query is Query.dead:
-        reachable = _find_reachable(graph, _keepalive_seeds(graph, KEEPALIVE_DEFAULT))
-        return {n for n in graph.nodes if n not in reachable}
+        reachable = set(view.reachable(seed_flags=KEEPALIVE_DEFAULT))
+        return [n for n in view.nodes() if n not in reachable]
     if query is Query.test_only:
-        return _find_kept_alive_by_flags_only(graph, NodeFlags.TESTCASE)
+        full = set(view.reachable(seed_flags=KEEPALIVE_DEFAULT))
+        without_tests = set(view.reachable(seed_flags=KEEPALIVE_DEFAULT & ~NodeFlags.TESTCASE))
+        return list(full - without_tests)
     raise typer.BadParameter(f"unknown --query value: {query!r}")
 
 
@@ -290,7 +299,7 @@ def build(
     """Build the project graph and persist it to disk."""
     setup_logging(verbose)
     root = root.resolve()
-    graph, _ = _materialize(
+    ctx, _ = _materialize(
         root,
         path_specs=path or [],
         resolver_name=resolver,
@@ -300,9 +309,9 @@ def build(
         show_progress=True,
     )
     meta_pairs = [parse_meta(s) for s in (meta or [])]
-    write_graph(output, graph, meta_pairs)
+    write_graph(output, ctx, meta_pairs)
     typer.echo(
-        f"Wrote graph to {output} ({len(graph.nodes)} nodes, {len(graph.weighted_edge_list())} edges).",
+        f"Wrote graph to {output} ({len(ctx.nodes())} nodes, {len(ctx.edges())} edges).",
         err=True,
     )
 
@@ -321,10 +330,7 @@ def analyze(
     ] = None,
     query: Annotated[
         Query,
-        typer.Option(
-            "--query",
-            help="Reachability question: 'dead' or 'test-only'.",
-        ),
+        typer.Option("--query", help="Reachability question: 'dead' or 'test-only'."),
     ] = Query.dead,
     entrypoint: Annotated[
         list[str] | None,
@@ -361,7 +367,7 @@ def analyze(
     setup_logging(verbose)
     root = root.resolve()
 
-    g, package_paths, _ = _load_or_build(
+    view, package_paths, _ = _load_or_build(
         root,
         graph_path=graph,
         path_specs=path or [],
@@ -370,26 +376,26 @@ def analyze(
         entrypoints=entrypoint or [],
         entrypoint_regexes=entrypoint_regex or [],
     )
-    dead = _select_dead(g, query)
-    dead_graph = g.subgraph(list(dead))
+    all_nodes = view.nodes()
+    dead_nodes = _select_dead(view, query)
 
     if output_format == OutputFormat.json:
-        _output_json(g, dead_graph, root, package_paths)
+        _output_json(all_nodes, dead_nodes, root, package_paths)
     else:
-        _output_text(g, dead_graph, root, package_paths)
+        _output_text(all_nodes, dead_nodes, root, package_paths)
 
-    if not exit_zero and len(dead_graph) > 0:
+    if not exit_zero and dead_nodes:
         raise typer.Exit(1)
 
 
 def _output_text(
-    graph: SymbolGraph,
-    unreachable: SymbolGraph,
+    all_nodes: Sequence[SymbolNode],
+    dead_nodes: Sequence[SymbolNode],
     root: Path,
     package_paths: Sequence[Path],
 ) -> None:
-    total_by_path = _count_nodes_by_prefix(graph.nodes, package_paths)
-    unreachable_by_path = _count_nodes_by_prefix(unreachable.nodes, package_paths)
+    total_by_path = _count_nodes_by_prefix(all_nodes, package_paths)
+    unreachable_by_path = _count_nodes_by_prefix(dead_nodes, package_paths)
     for path in package_paths:
         typer.echo(f"\n{path}:")
         total_counts = total_by_path[path]
@@ -404,20 +410,20 @@ def _output_text(
             else:
                 typer.echo(f"  {kind}: {total} total")
 
-    dead_real = _dead_real(unreachable)
+    dead_real = _dead_real(dead_nodes)
     if dead_real:
         typer.echo(f"\nDead symbols ({len(dead_real)}):")
         for node in sorted(dead_real, key=lambda n: (str(n.path), n.fqname)):
             typer.echo(f"  {node.fqname} ({node.kind}) at {_rel_path(node.path, root)}")
 
 
-def _dead_real(unreachable: SymbolGraph) -> list[SymbolNode]:
-    return [n for n in unreachable.nodes if n.kind != "synthetic"]
+def _dead_real(dead_nodes: Iterable[SymbolNode]) -> list[SymbolNode]:
+    return [n for n in dead_nodes if n.kind != "synthetic"]
 
 
 def _output_json(
-    graph: SymbolGraph,
-    unreachable: SymbolGraph,
+    all_nodes: Sequence[SymbolNode],
+    dead_nodes: Sequence[SymbolNode],
     root: Path,
     package_paths: Sequence[Path],
 ) -> None:
@@ -426,8 +432,8 @@ def _output_json(
         "dead_symbols": [],
     }
 
-    total_by_path = _count_nodes_by_prefix(graph.nodes, package_paths)
-    unreachable_by_path = _count_nodes_by_prefix(unreachable.nodes, package_paths)
+    total_by_path = _count_nodes_by_prefix(all_nodes, package_paths)
+    unreachable_by_path = _count_nodes_by_prefix(dead_nodes, package_paths)
     for path in package_paths:
         path_str = str(path)
         total_counts = total_by_path[path]
@@ -438,7 +444,7 @@ def _output_json(
             if kind != "synthetic"
         }
 
-    for node in sorted(_dead_real(unreachable), key=lambda n: (str(n.path), n.fqname)):
+    for node in sorted(_dead_real(dead_nodes), key=lambda n: (str(n.path), n.fqname)):
         result["dead_symbols"].append(
             {
                 "fqname": node.fqname,
@@ -464,10 +470,7 @@ def remove(
     ] = None,
     query: Annotated[
         Query,
-        typer.Option(
-            "--query",
-            help="Reachability question: 'dead' or 'test-only'.",
-        ),
+        typer.Option("--query", help="Reachability question: 'dead' or 'test-only'."),
     ] = Query.dead,
     entrypoint: Annotated[
         list[str] | None,
@@ -505,7 +508,7 @@ def remove(
     setup_logging(verbose)
     root = root.resolve()
 
-    g, _, _ = _load_or_build(
+    view, _, _ = _load_or_build(
         root,
         graph_path=graph,
         path_specs=path or [],
@@ -514,10 +517,8 @@ def remove(
         entrypoints=entrypoint or [],
         entrypoint_regexes=entrypoint_regex or [],
     )
-    dead = _select_dead(g, query)
-    dead_graph = g.subgraph(list(dead))
-
-    patch = generate_patch(dead_graph, root)
+    dead_nodes = _select_dead(view, query)
+    patch = generate_patch(dead_nodes, root)
 
     if not patch:
         typer.echo("No dead code found.", err=True)

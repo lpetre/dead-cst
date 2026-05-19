@@ -1,30 +1,21 @@
 """Native (rust) backend bridge.
 
 The rust crate (``dead_cst._native``) builds the project graph
-end-to-end using ty's ``SemanticIndex``. This module is a thin
-adapter: it instantiates a :class:`native.ProjectContext`, wires
-plugins, calls :meth:`materialize`, and folds the rust-shaped
-:class:`NativeGraph` envelope into a :class:`SymbolGraph` (a plain
-dict-of-lists adjacency keyed on :class:`SymbolNode`).
+end-to-end using ty's ``SemanticIndex``. This module instantiates a
+:class:`native.ProjectContext`, wires plugins, calls :meth:`materialize`,
+and returns the live context.
 
-Nodes / imports / flags are no longer translated — :class:`SymbolNode`
-*is* :class:`native.SymbolNode`, :class:`Import` *is*
-:class:`native.Import`, etc. The "bridge" today is one pass that
-copies the rust node list and edge triples into the adjacency map.
-
-:func:`materialize_project` returns a ``(ctx, graph)`` pair: the
-``ctx`` is held by :class:`Analysis` so bulk reachability queries
-(:meth:`Analysis.reachable`, :meth:`Analysis.dead`, etc.) can delegate
-to the rust BFS one FFI hop at a time instead of walking the Python
-adjacency list per node.
+Bulk reachability queries (:meth:`Analysis.reachable`,
+:meth:`Analysis.dead`, :meth:`Analysis.descendants`,
+:meth:`Analysis.ancestors`) and node/edge enumeration
+(:meth:`ProjectContext.nodes`, :meth:`ProjectContext.edges`) are served
+directly from the context — there is no Python-side adjacency copy.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 from typing import TYPE_CHECKING, Sequence
-
-from ._graphstore import SymbolGraph
 
 if TYPE_CHECKING:
     from dead_cst import _native as native
@@ -36,21 +27,21 @@ def materialize_project(
     src_roots: Sequence[Path] = (),
     *,
     show_progress: bool = False,
-) -> tuple["native.ProjectContext", SymbolGraph]:
+) -> "native.ProjectContext":
     """Materialize ``project_root`` end-to-end via the rust backend.
 
     Builds a :class:`native.ProjectContext` rooted at ``project_root``,
-    registers each plugin's ``run(ctx)`` callback, calls
-    :meth:`materialize`, and bridges the resulting :class:`NativeGraph`
-    into a :class:`SymbolGraph`. Every plugin must be an instance of
+    registers each plugin's ``run(ctx)`` callback, and calls
+    :meth:`materialize`. Every plugin must be an instance of
     :class:`dead_cst.plugins.Plugin`; anything else raises
     :class:`TypeError` so typos (``Pluign()``) surface immediately
     instead of being silently dropped.
 
-    Returns the ``(ctx, graph)`` pair so the caller (typically
-    :class:`Analysis`) can route bulk reachability queries through the
-    rust BFS via :meth:`native.ProjectContext.reachable` /
-    :meth:`descendants` / :meth:`ancestors`.
+    Returns the live :class:`native.ProjectContext` so the caller
+    (typically :class:`Analysis`) can route bulk reachability queries
+    through the rust BFS via :meth:`reachable` / :meth:`descendants` /
+    :meth:`ancestors`, and enumerate nodes/edges via :meth:`nodes` /
+    :meth:`edges`.
 
     ``show_progress=True`` makes the rust backend draw indicatif progress
     bars to stderr for each of the three per-file phases plus the
@@ -72,18 +63,5 @@ def materialize_project(
                 f"{type(plugin).__name__!r}: {plugin!r}"
             )
         ctx.add_plugin(plugin)
-    graph = _bridge(ctx.materialize())
-    return ctx, graph
-
-
-def _bridge(graph: "native.NativeGraph") -> SymbolGraph:
-    """Convert a project-wide :class:`NativeGraph` into a fresh :class:`SymbolGraph`.
-
-    Uses :meth:`SymbolGraph._populate_from_native` so the edge fan-out
-    works in integer-index space and never re-hashes endpoint nodes --
-    on a 10^6-node / 10^7-edge graph that's the difference between
-    ~4 s and ~150 ms.
-    """
-    out = SymbolGraph()
-    out._populate_from_native(list(graph.nodes), graph.edges)
-    return out
+    ctx.materialize()
+    return ctx

@@ -198,16 +198,17 @@ def test_rel_path_outside_root_returned_unchanged():
 
 
 def test_dead_real_filters_synthetic_nodes():
-    from dead_cst._graphstore import SymbolGraph
-
+    """Synthetic nodes (entrypoint sentinels, external markers) are
+    excluded from the dead-symbol report so we don't surface them
+    alongside user-visible declarations."""
     real = _make_node("pkg.f", "function", "/a.py")
     synth = _make_node("<entrypoint>:pkg.f", "synthetic", "/a.py")
 
-    g = SymbolGraph()
-    for n in (real, synth):
-        g.add(n)
+    assert _dead_real([real, synth]) == [real]
 
-    assert _dead_real(g) == [real]
+
+def test_dead_real_empty_input_returns_empty_list():
+    assert _dead_real([]) == []
 
 
 # ---------------------------------------------------------------------------
@@ -506,8 +507,8 @@ def test_build_writes_file_with_metadata(runner, project, tmp_path):
 
     sg, meta = read_graph(graph_path)
     assert isinstance(meta, GraphMetadata)
-    assert meta.node_count == len(sg.nodes)
-    assert meta.edge_count == len(sg.weighted_edge_list())
+    assert meta.node_count == len(sg.nodes())
+    assert meta.edge_count == len(sg.edges())
     assert ("branch", "feature/x") in meta.user_meta
     assert ("sha", "abc123") in meta.user_meta
 

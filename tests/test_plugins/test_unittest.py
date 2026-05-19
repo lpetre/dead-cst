@@ -188,7 +188,7 @@ def test_unittest_plugin_tags_seeds_as_testcase(build_plugin_graph):
         },
         [UnittestPlugin()],
     )
-    seeds = [n for n in graph.nodes if n.flags & NodeFlags.TESTCASE]
+    seeds = [n for n in graph.nodes() if n.flags & NodeFlags.TESTCASE]
     assert seeds, "expected unittest plugin to seed at least one TESTCASE node"
 
 

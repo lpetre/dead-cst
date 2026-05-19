@@ -480,6 +480,24 @@ class ProjectContext:
         """
         ...
 
+    def find_nodes_matching_specs(
+        self,
+        project_root: str,
+        regexes: list[str],
+        str_specs: list[str],
+        abs_paths: list[str],
+    ) -> list[SymbolNode]:
+        """Match nodes against pre-classified path / fqname specs.
+
+        Avoids the per-node FFI hop + ``pathlib.Path`` allocation that
+        a ``for node in ctx.nodes(): ...`` loop pays. ``regexes`` are
+        anchored at the start of input (``re.Pattern.match`` semantics).
+        ``str_specs`` match exactly against the relative path OR the
+        node's fqname. ``abs_paths`` match exactly against the
+        absolute path.
+        """
+        ...
+
     # ----- Traversal -----------------------------------------------------
 
     def descendants(self, root: SymbolNode, *, skip_flags: int = 0) -> list[SymbolNode]:
@@ -748,12 +766,13 @@ class QueryBuilder:
     :meth:`subclasses` / :meth:`imports` / :meth:`classes` /
     :meth:`factories`.
 
-    Point lookups (no ``.collect()`` — direct methods returning
-    ``SymbolNode`` / ``list[SymbolNode]`` / etc.):
-    :meth:`module` / :meth:`declarations` /
-    :meth:`module_top_level_decls` / :meth:`module_dunder_all_exports` /
-    :meth:`module_dunders` / :meth:`main_blocks` /
-    :meth:`comment_patterns`.
+    Point lookups (e.g. :meth:`ProjectContext.find_module`,
+    :meth:`ProjectContext.find_declarations`,
+    :meth:`ProjectContext.find_main_blocks`,
+    :meth:`ProjectContext.find_comment_patterns`,
+    :meth:`ProjectContext.find_module_dunders`,
+    :meth:`ProjectContext.find_literal_list_entries`) live directly on
+    :class:`ProjectContext`.
     """
 
     def decorators(self) -> DecoratorQuery: ...
@@ -763,89 +782,6 @@ class QueryBuilder:
     def imports(self) -> ImportQuery: ...
     def classes(self) -> ClassQuery: ...
     def factories(self) -> FactoryQuery: ...
-
-    # ----- Point lookups (no filter chain) ------------------------------
-
-    def module(self, fqname: str) -> SymbolNode | None:
-        """Look up a module's synthetic node by dotted fqname.
-
-        Mirrors :meth:`ProjectContext.find_module`.
-        """
-        ...
-
-    def declarations(self, fqname: str) -> list[SymbolNode]:
-        """All top-level declarations bound to the given dotted fqname.
-
-        Mirrors :meth:`ProjectContext.find_declarations`.
-        """
-        ...
-
-    def module_top_level_decls(self, fqname: str) -> list[SymbolNode]:
-        """Every top-level declaration node of the named module.
-
-        Mirrors :meth:`ProjectContext.find_module_top_level_decls`.
-        """
-        ...
-
-    def module_dunder_all_exports(self, fqname: str) -> list[SymbolNode] | None:
-        """Exported names listed in a module's ``__all__``, or
-        ``None`` when the module declares no ``__all__``.
-
-        Mirrors :meth:`ProjectContext.find_module_dunder_all_exports`.
-        """
-        ...
-
-    def literal_list_entries(self, var_fqn: str) -> list[str] | None:
-        """Read the literal-list value of a top-level variable
-        assignment and return the entries as strings.
-
-        Mirrors :meth:`ProjectContext.find_literal_list_entries`.
-        """
-        ...
-
-    def module_dunders(self) -> list[SymbolNode]:
-        """All top-level ``__dunder__`` declarations across the
-        project.
-
-        Mirrors :meth:`ProjectContext.find_module_dunders`.
-        """
-        ...
-
-    def main_blocks(self) -> list[tuple[SymbolNode, list[SymbolNode]]]:
-        """Every ``if __name__ == "__main__":`` block, paired with
-        the module and the decls inside.
-
-        Mirrors :meth:`ProjectContext.find_main_blocks`.
-        """
-        ...
-
-    def nodes_matching_specs(
-        self,
-        project_root: str,
-        regexes: list[str],
-        str_specs: list[str],
-        abs_paths: list[str],
-    ) -> list[SymbolNode]:
-        """Match nodes against pre-classified path / fqname specs.
-
-        Avoids the per-node FFI hop + ``pathlib.Path`` allocation that
-        a ``for node in ctx.nodes(): ...`` loop pays. ``regexes`` are
-        anchored at the start of input (``re.Pattern.match`` semantics).
-        ``str_specs`` match exactly against the relative path OR the
-        node's fqname. ``abs_paths`` match exactly against the
-        absolute path.
-
-        Mirrors :meth:`ProjectContext.find_nodes_matching_specs`.
-        """
-        ...
-
-    def comment_patterns(self, pattern: str) -> list[tuple[SymbolNode, str]]:
-        """Comments matching ``pattern`` paired with the next
-        declaration.
-
-        Mirrors :meth:`ProjectContext.find_comment_patterns`.
-        """
-        ...
 
 class DecoratorQuery:
     """Find decorated top-level functions / classes. Pick exactly one
@@ -945,6 +881,14 @@ class ImportQuery:
     def of(self, module: str) -> ImportQuery: ...
     def collect(self) -> list[SymbolNode]: ...
     def count(self) -> int: ...
+    def exists(self) -> bool:
+        """O(1) presence probe — does any project file import the
+        configured module? Short-circuits without materialising a
+        Python list. Preferred over ``.count() > 0`` / ``.collect()``
+        for plugin guards that just need a boolean.
+        """
+        ...
+
     def __iter__(self) -> Iterator[SymbolNode]: ...
 
 class ClassQuery:

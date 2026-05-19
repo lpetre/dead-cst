@@ -128,6 +128,11 @@ pub(crate) struct BuildOutputs {
     /// `module_fqname -> node idx`. Lets ``find_module`` answer in
     /// O(1) instead of scanning all nodes.
     pub(crate) module_by_fqname: HashMap<String, usize>,
+    /// `Import.module -> [import node idx]`. Lets ``find_imports_of``
+    /// answer in O(1) lookup + O(matches) walk instead of scanning all
+    /// nodes — and a cheap ``imports_of_exists`` short-circuit for
+    /// plugins that just need a per-module presence check.
+    pub(crate) imports_by_module: HashMap<String, Vec<usize>>,
 }
 
 /// Run the three build phases (ingest → hierarchy+imports → references)
@@ -358,7 +363,7 @@ pub(crate) fn build_project_graph(
     progress.references.finish_and_clear();
     let t_phase3 = t3.elapsed();
     let t4 = std::time::Instant::now();
-    let (decl_by_fqname, module_by_fqname) = build_fqname_indices(py, &builder);
+    let (decl_by_fqname, module_by_fqname, imports_by_module) = build_fqname_indices(py, &builder);
     let t_fqname = t4.elapsed();
     if timing {
         eprintln!(
@@ -384,32 +389,51 @@ pub(crate) fn build_project_graph(
         decl_by_name_range,
         decl_by_fqname,
         module_by_fqname,
+        imports_by_module,
     })
 }
 
-/// Pre-build the fqname -> idx maps used by ``find_declarations`` and
-/// ``find_module``. One pass over interned nodes; module entries are
-/// 1:1 (one module node per fqname) while decl entries can have
-/// multiple binders for the same fqname (try/except rebind etc.).
+/// Pre-build the fqname -> idx maps used by ``find_declarations``,
+/// ``find_module``, and ``find_imports_of``. One pass over interned
+/// nodes; module entries are 1:1 (one module node per fqname) while
+/// decl entries (and per-upstream-module import entries) can have
+/// multiple binders for the same key — try/except rebinds,
+/// conditional re-imports, and multiple ``from X import Y, Z`` aliases
+/// all bind into the same upstream module.
+#[allow(clippy::type_complexity)]
 pub(crate) fn build_fqname_indices(
     py: Python<'_>,
     builder: &GraphBuilder,
-) -> (HashMap<String, Vec<usize>>, HashMap<String, usize>) {
+) -> (
+    HashMap<String, Vec<usize>>,
+    HashMap<String, usize>,
+    HashMap<String, Vec<usize>>,
+) {
     let mut decls: HashMap<String, Vec<usize>> = HashMap::new();
     let mut modules: HashMap<String, usize> = HashMap::new();
+    let mut imports_by_module: HashMap<String, Vec<usize>> = HashMap::new();
     for (idx, node_py) in builder.nodes.iter().enumerate() {
         let node = node_py.borrow(py);
         match node.kind {
             "module" => {
                 modules.insert(node.fqname.clone(), idx);
             }
-            "function" | "class" | "variable" | "import" => {
+            "function" | "class" | "variable" => {
                 decls.entry(node.fqname.clone()).or_default().push(idx);
+            }
+            "import" => {
+                decls.entry(node.fqname.clone()).or_default().push(idx);
+                if let Some(import_py) = node.imports.as_ref() {
+                    imports_by_module
+                        .entry(import_py.borrow(py).module.clone())
+                        .or_default()
+                        .push(idx);
+                }
             }
             _ => {}
         }
     }
-    (decls, modules)
+    (decls, modules, imports_by_module)
 }
 
 /// Plugin-aware project graph builder.
@@ -588,8 +612,9 @@ impl ProjectContext {
     }
 }
 
-// ----- Queries (rust-only, exposed to Python via the chainable QueryBuilder) -
+// ----- Point-lookup queries (exposed to Python directly on ProjectContext) -
 
+#[pymethods]
 impl ProjectContext {
     /// Return every top-level variable node whose name matches `__xxx__`.
     ///
@@ -702,20 +727,44 @@ impl ProjectContext {
         let outputs = outputs
             .as_ref()
             .ok_or_else(|| not_materialized("find_imports_of"))?;
-        let mut out = Vec::new();
-        for node_py in &outputs.builder.nodes {
-            let node = node_py.borrow(py);
-            if node.kind != "import" {
-                continue;
-            }
-            let Some(import_py) = node.imports.as_ref() else {
-                continue;
-            };
-            if import_py.borrow(py).module == module_name {
-                out.push(node_py.clone_ref(py));
-            }
+        // O(1) lookup against the pre-built ``imports_by_module``
+        // index — no scan over all interned nodes. Empty when nothing
+        // imports the module.
+        let Some(idxs) = outputs.imports_by_module.get(module_name) else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::with_capacity(idxs.len());
+        for &idx in idxs {
+            out.push(outputs.builder.nodes[idx].clone_ref(py));
         }
         Ok(out)
+    }
+
+    /// O(1) count of how many project import nodes target
+    /// ``module_name`` — pre-built index lookup, no Py allocation.
+    pub(crate) fn imports_of_count(&self, module_name: &str) -> usize {
+        self.outputs
+            .borrow()
+            .as_ref()
+            .and_then(|o| o.imports_by_module.get(module_name).map(Vec::len))
+            .unwrap_or(0)
+    }
+
+    /// Cheap "does any project file import ``module_name``?" check.
+    ///
+    /// Plugins use this as an early-exit guard so they don't pay the
+    /// cost of resolving the framework module out of the venv when the
+    /// project doesn't use it. O(1) — single hashmap probe against
+    /// ``imports_by_module``, no node iteration, no PyObject clone.
+    pub(crate) fn has_imports_of(&self, module_name: &str) -> PyResult<bool> {
+        let outputs = self.outputs.borrow();
+        let outputs = outputs
+            .as_ref()
+            .ok_or_else(|| not_materialized("has_imports_of"))?;
+        Ok(outputs
+            .imports_by_module
+            .get(module_name)
+            .is_some_and(|v| !v.is_empty()))
     }
 
     /// Return every declaration (function / class / variable / import)
@@ -859,6 +908,7 @@ impl ProjectContext {
     }
 }
 
+#[pymethods]
 impl ProjectContext {
     /// Return ``module_fqn``'s immediate top-level decls — every
     /// function / class / variable / import bound at its module scope.
@@ -1142,6 +1192,7 @@ impl ProjectContext {
     }
 }
 
+#[pymethods]
 impl ProjectContext {
     /// Return ``(module_node, [decls inside the block])`` for every
     /// file with a top-level ``if __name__ == "__main__":`` block.
@@ -1184,9 +1235,9 @@ impl ProjectContext {
         }
         Ok(out)
     }
+}
 
-    /// Return every class that defines a method with the given name.
-    ///
+impl ProjectContext {
     /// Return every top-level function decorated with ``@<decorator_module>.<name>``
     /// or ``@<name>`` for any ``name`` in ``decorator_names``.
     ///
@@ -1580,7 +1631,12 @@ impl ProjectContext {
             .map(|(idx, arg, call_args)| (outputs.builder.nodes[idx].clone_ref(py), arg, call_args))
             .collect())
     }
+}
 
+#[pymethods]
+impl ProjectContext {
+    /// Top-level functions / classes whose body constructs one of
+    /// ``ctor_names`` imported from ``module``.
     ///
     /// Recursively walks each candidate's body looking for ``<Ctor>(...)``
     /// or ``<module>.<Ctor>(...)`` call expressions. Returns
@@ -1651,7 +1707,9 @@ impl ProjectContext {
             .map(|(idx, kinds)| (outputs.builder.nodes[idx].clone_ref(py), kinds))
             .collect())
     }
+}
 
+impl ProjectContext {
     /// Find calls to a callable imported from ``module`` with the name
     /// ``name``. Returns ``(owning_decl, string_literal_arg)`` pairs
     /// where the call resolves through the file's local imports.
@@ -1801,7 +1859,12 @@ impl ProjectContext {
             .map(|(idx, arg, call_args)| (outputs.builder.nodes[idx].clone_ref(py), arg, call_args))
             .collect())
     }
+}
 
+#[pymethods]
+impl ProjectContext {
+    /// Every class that defines a method with the given name.
+    ///
     /// Walks each class's `DefinitionKind::Class` body for an
     /// `Stmt::FunctionDef` whose name matches. ty's `parsed_module` is
     /// Salsa-cached, so this is just a body scan per class.
@@ -1895,7 +1958,9 @@ impl ProjectContext {
             .map(|idx| outputs.builder.nodes[idx].clone_ref(py))
             .collect())
     }
+}
 
+impl ProjectContext {
     // ----- Convenience helpers used by the chainable QueryBuilder ----------
 
     #[allow(clippy::type_complexity)]
@@ -1970,7 +2035,10 @@ impl ProjectContext {
         }
         Ok(out)
     }
+}
 
+#[pymethods]
+impl ProjectContext {
     /// Subclasses of the class addressed by ``base_fqn``.
     ///
     /// Works for both project classes (where the fqn resolves to a
@@ -1979,6 +2047,7 @@ impl ProjectContext {
     /// ``type_hierarchy_subtypes``. ``transitive=True`` (default)
     /// walks the full subclass closure; ``transitive=False`` returns
     /// only direct subclasses.
+    #[pyo3(signature = (base_fqn, *, transitive = true))]
     pub(crate) fn find_subclasses(
         &self,
         py: Python<'_>,

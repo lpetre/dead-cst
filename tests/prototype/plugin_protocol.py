@@ -95,5 +95,5 @@ class KeepAliveCommentPlugin:
     name = "keep_alive_comment"
 
     def run(self, ctx: "native.ProjectContext") -> "Iterable[native.GraphOp]":
-        for decl, _comment in native.query(ctx).comment_patterns(r"#\s*dead-cst:\s*keep\b"):
+        for decl, _comment in ctx.find_comment_patterns(r"#\s*dead-cst:\s*keep\b"):
             yield native.AddEntrypoint(decl, marker="<keep>")
