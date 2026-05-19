@@ -56,6 +56,14 @@ class DecoratedDeclPlugin:
             return
         if not (self.decorator_names or self.constructor_names):
             return
+        # Cheap import-presence guard. Querying decorator/construction
+        # types forces ty to resolve ``decorator_module`` out of the
+        # venv (parse, build SemanticIndex, walk type hierarchy) —
+        # ~100-400ms per framework on a typical project. If nothing
+        # imports the module, no decorated decl can exist, so skip
+        # the entire query path.
+        if not native.query(ctx).imports().of(self.decorator_module).count():
+            return
         names = sorted(self.decorator_names | self.constructor_names)
 
         prefix = self.package_prefix
@@ -153,6 +161,16 @@ class DispatchAppPlugin:
         from dead_cst import _native as native
 
         if not (self.app_classes and self.registration_decorators):
+            return
+        # Cheap import-presence guard. ``_module_to_names`` triggers
+        # ``subclasses().of_fqn(...)`` for every ``app_class``, which
+        # forces ty to load the framework from the venv (parse + build
+        # SemanticIndex + walk the class hierarchy) — ~100-400ms per
+        # framework. If nothing imports the framework's root package,
+        # the project can't possibly contain an instance of an
+        # ``app_class``, so skip the work.
+        app_modules = {fqn.rpartition(".")[0] for fqn in self.app_classes if "." in fqn}
+        if not any(native.query(ctx).imports().of(m).count() for m in app_modules if m):
             return
         decorator_attrs = list(self.registration_decorators)
 
@@ -300,27 +318,28 @@ class LiteralListPlugin:
         if not self.owner_fqname or not self.variable_name:
             return
         var_fqname = f"{self.owner_fqname}.{self.variable_name}"
-        # Use a calls-style approach via reading the source isn't possible
-        # — instead resolve the literal list by reading the dunder all
-        # exports machinery (if used). Simpler: look up declarations and
-        # walk successors via the visitor's ``X = ['...']`` edges.
-        decls = native.query(ctx).declarations(var_fqname)
-        if not decls:
+        # Read the variable's RHS directly via the targeted query.
+        # The visitor doesn't emit ``var -> referent`` edges for
+        # non-``__all__`` string-list assignments, so the plugin can't
+        # rely on a descendant walk.
+        entries = native.query(ctx).literal_list_entries(var_fqname)
+        if not entries:
             return
 
-        # Walk forward from each variable decl: the visitor wires
-        # ``var -> referent`` edges for every string-literal entry that
-        # named a project decl (via __all__-style emission), so the
-        # successors of the variable node are the targets.
         prefix = f"<{self.name}>:"
-        for decl in decls:
-            for desc in ctx.descendants(decl):
-                if desc is decl:
-                    continue
-                if desc.kind in ("module", "function", "class", "variable"):
-                    yield native.AddNode(
-                        fqname=f"{prefix}{desc.fqname}",
-                        path=decl.path,
-                        flags=int(NodeFlags.ENTRYPOINT),
-                        edges_to=[desc],
-                    )
+        for entry in entries:
+            # Each entry resolves as either a module fqname (revive the
+            # whole surface, mirroring ``importlib.import_module``) or a
+            # single decl fqname. Try both; some entries may match both
+            # (e.g. ``pkg.foo`` where ``foo`` is also a re-exported decl
+            # in ``pkg/__init__.py``).
+            targets: list[native.SymbolNode] = list(ctx.module_surface(entry))
+            targets.extend(native.query(ctx).declarations(entry))
+            if not targets:
+                continue
+            yield native.AddNode(
+                fqname=f"{prefix}{entry}",
+                path=targets[0].path,
+                flags=int(NodeFlags.ENTRYPOINT),
+                edges_to=targets,
+            )

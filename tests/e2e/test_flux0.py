@@ -203,15 +203,6 @@ def test_flux0_cli_commands_revives_click_groups(flux0_cli_src):
     )
 
 
-@pytest.mark.xfail(
-    reason=(
-        "LiteralListPlugin regression on the rust backend: "
-        "Flux0InternalModulesPlugin doesn't surface entries from "
-        "flux0_server.main.INTERNAL_MODULES, so the named submodules stay "
-        "unreachable. Pre-existed this PR; tracked separately."
-    ),
-    strict=False,
-)
 def test_flux0_internal_modules_revives_replay_agent(flux0_server_src):
     """Flux0InternalModulesPlugin reads the literal list and revives every entry.
 
@@ -235,14 +226,6 @@ def test_flux0_internal_modules_revives_replay_agent(flux0_server_src):
         assert node in reachable, f"{fqname} should be alive via INTERNAL_MODULES"
 
 
-@pytest.mark.xfail(
-    reason=(
-        "Same root cause as test_flux0_internal_modules_revives_replay_agent: "
-        "LiteralListPlugin regression on the rust backend leaves the "
-        "INTERNAL_MODULES surface dead, so the pinned dead-set under-matches."
-    ),
-    strict=False,
-)
 def test_flux0_server_dead_set_pins_to_real_findings(flux0_server_src):
     """Server side has a tight, durable dead set: just two unused constants.
 
@@ -311,13 +294,6 @@ def test_flux0_cli_dead_set_includes_real_findings_and_decorator_blind_spot(flux
     assert "flux0_cli.cmds.sessions.sessions" not in dead
 
 
-@pytest.mark.xfail(
-    reason=(
-        "Same root cause as the other Flux0InternalModulesPlugin tests: "
-        "LiteralListPlugin regression on the rust backend."
-    ),
-    strict=False,
-)
 def test_flux0_internal_modules(flux0_server_src, tmp_path):
     """LiteralListPlugin keeps the literal-listed modules alive."""
     base = Path(flux0_server_src)

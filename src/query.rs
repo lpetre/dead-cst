@@ -165,6 +165,14 @@ impl QueryBuilder {
             .borrow(py)
             .find_module_dunder_all_exports(py, fqname)
     }
+    /// Read the literal-list value of a top-level variable assignment
+    /// (``X = ["a", "b"]``) and return the entries as strings.
+    /// Returns ``None`` when the variable isn't a list / tuple of
+    /// string literals.
+    /// Mirrors :meth:`ProjectContext.find_literal_list_entries`.
+    fn literal_list_entries(&self, py: Python<'_>, var_fqn: &str) -> PyResult<Option<Vec<String>>> {
+        self.ctx.borrow(py).find_literal_list_entries(var_fqn)
+    }
     /// All top-level ``__dunder__`` declarations across the project.
     /// Mirrors :meth:`ProjectContext.find_module_dunders`.
     fn module_dunders(&self, py: Python<'_>) -> PyResult<Vec<Py<SymbolNode>>> {
@@ -175,6 +183,25 @@ impl QueryBuilder {
     /// Mirrors :meth:`ProjectContext.find_main_blocks`.
     fn main_blocks(&self, py: Python<'_>) -> PyResult<Vec<MainBlock>> {
         self.ctx.borrow(py).find_main_blocks(py)
+    }
+    /// Match nodes against pre-classified path / fqname specs without
+    /// crossing the FFI boundary per node.
+    /// Mirrors :meth:`ProjectContext.find_nodes_matching_specs`.
+    fn nodes_matching_specs(
+        &self,
+        py: Python<'_>,
+        project_root: &str,
+        regexes: Vec<String>,
+        str_specs: Vec<String>,
+        abs_paths: Vec<String>,
+    ) -> PyResult<Vec<Py<SymbolNode>>> {
+        self.ctx.borrow(py).find_nodes_matching_specs(
+            py,
+            project_root,
+            regexes,
+            str_specs,
+            abs_paths,
+        )
     }
     /// Comments matching ``pattern`` paired with the next
     /// declaration. Mirrors :meth:`ProjectContext.find_comment_patterns`.

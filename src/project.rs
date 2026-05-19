@@ -28,8 +28,8 @@ use ty_python_core::semantic_index;
 
 use crate::builder::{apply_graph_op, bfs, lookup_idx, not_materialized, Direction, GraphBuilder};
 use crate::graph::{
-    DeclIndex, GlobalsByName, ImportSpec, LiveDeclIndex, MainBlock, NativeGraph, SymbolNode,
-    StarReexports,
+    DeclIndex, GlobalsByName, ImportSpec, LiveDeclIndex, MainBlock, NativeGraph, StarReexports,
+    SymbolNode,
 };
 use crate::helpers::{
     call_callee_matches_var, class_body_defines_method, collect_all_imports_local,
@@ -40,7 +40,8 @@ use crate::helpers::{
     CallArgs, FactoryCallFinder, StringArgCallFinder, NODE_FLAG_ENTRYPOINT,
 };
 use crate::ingest::{
-    build_dist_lookup, emit_import_edges, emit_module_hierarchy, emit_reference_edges, ingest_decls,
+    build_dist_lookup, emit_import_edges, emit_module_hierarchy, emit_reference_edges,
+    ingest_decls, string_literal_list,
 };
 use crate::query::{
     _compile_path_regex, _contains_any_identifier, _contains_identifier, par_scan_files,
@@ -609,6 +610,78 @@ impl ProjectContext {
         Ok(out)
     }
 
+    /// Return every interned node whose path or fqname matches at
+    /// least one of the supplied specs.
+    ///
+    /// Folds the per-node match loop down into a single rust pass for
+    /// callers (like `ExplicitEntrypointPlugin`) that would otherwise
+    /// pay an FFI hop + `pathlib.Path` allocation per node. Specs are
+    /// pre-classified Python-side:
+    ///
+    /// * `regexes` — pattern strings applied to the path *relative to
+    ///   `project_root`* (or to the absolute path when the node lives
+    ///   outside `project_root`). Each pattern is anchored at the
+    ///   start of input, mirroring Python's `re.Pattern.match()`.
+    /// * `str_specs` — exact equality match against the relative path
+    ///   OR the node's fqname.
+    /// * `abs_paths` — exact equality match against the node's
+    ///   absolute path.
+    pub(crate) fn find_nodes_matching_specs(
+        &self,
+        py: Python<'_>,
+        project_root: &str,
+        regexes: Vec<String>,
+        str_specs: Vec<String>,
+        abs_paths: Vec<String>,
+    ) -> PyResult<Vec<Py<SymbolNode>>> {
+        let compiled: Vec<regex::Regex> = regexes
+            .iter()
+            .map(|p| {
+                // `^`-anchor for `re.match` semantics. Idempotent if
+                // the caller already supplied a leading `^`.
+                let anchored = if p.starts_with('^') {
+                    p.clone()
+                } else {
+                    format!("^{p}")
+                };
+                regex::Regex::new(&anchored)
+                    .map_err(|e| PyValueError::new_err(format!("invalid regex {p:?}: {e}")))
+            })
+            .collect::<PyResult<_>>()?;
+        let str_set: std::collections::HashSet<&str> =
+            str_specs.iter().map(String::as_str).collect();
+        let abs_set: std::collections::HashSet<&str> =
+            abs_paths.iter().map(String::as_str).collect();
+
+        let outputs = self.outputs.borrow();
+        let outputs = outputs
+            .as_ref()
+            .ok_or_else(|| not_materialized("find_nodes_matching_specs"))?;
+        let mut out = Vec::new();
+        for node_py in &outputs.builder.nodes {
+            let node = node_py.borrow(py);
+            let path = node.path.as_str();
+            if abs_set.contains(path) {
+                out.push(node_py.clone_ref(py));
+                continue;
+            }
+            // Mirror Python's ``path.relative_to(root)`` ⇒ ``str(...)``
+            // with the ``except ValueError: rel = node.path`` fallback.
+            let rel = path
+                .strip_prefix(project_root)
+                .map(|s| s.trim_start_matches(['/', '\\']))
+                .unwrap_or(path);
+            if str_set.contains(rel) || str_set.contains(node.fqname.as_str()) {
+                out.push(node_py.clone_ref(py));
+                continue;
+            }
+            if compiled.iter().any(|r| r.is_match(rel)) {
+                out.push(node_py.clone_ref(py));
+            }
+        }
+        Ok(out)
+    }
+
     /// Return every import-kind node whose upstream `module` matches.
     ///
     /// Covers both `import <module_name>` and
@@ -824,39 +897,100 @@ impl ProjectContext {
     /// Return the decls listed in ``module_fqn``'s ``__all__``, or
     /// ``None`` when the module doesn't declare ``__all__``.
     ///
-    /// The visitor's ``emit_dunder_all_edges`` already wires
-    /// ``__all__`` → each string-listed decl as a regular edge; this
-    /// query walks those successor edges, filters out the default
-    /// ``decl -> parent_module`` edge, and returns the rest. The
-    /// distinction between "no ``__all__``" (``None``) and "empty
-    /// ``__all__``" (``Some([])``) matters: callers that want
-    /// CPython's ``from X import *`` semantics should fall back to
-    /// the non-underscore decl list only in the ``None`` case.
+    /// Composed on top of :meth:`find_literal_list_entries`: read the
+    /// string entries from ``__all__``'s RHS, then resolve each name
+    /// against ``module_fqn``'s scope via :attr:`decl_by_fqname`.
+    /// Names that don't resolve in the module's global scope are
+    /// skipped silently (``__all__ = ["missing"]`` is a runtime error
+    /// at import time, not a static dep).
+    ///
+    /// The distinction between "no ``__all__``" (``None``) and "empty
+    /// / unresolvable ``__all__``" (``Some([])``) matters: callers
+    /// that want CPython's ``from X import *`` semantics should fall
+    /// back to the non-underscore decl list only in the ``None``
+    /// case.
     pub(crate) fn find_module_dunder_all_exports(
         &self,
         py: Python<'_>,
         module_fqn: &str,
     ) -> PyResult<Option<Vec<Py<SymbolNode>>>> {
+        let all_fqn = format!("{module_fqn}.__all__");
+        let Some(entries) = self.find_literal_list_entries(&all_fqn)? else {
+            return Ok(None);
+        };
         let outputs = self.outputs.borrow();
         let outputs = outputs
             .as_ref()
             .ok_or_else(|| not_materialized("find_module_dunder_all_exports"))?;
-        let all_fqn = format!("{module_fqn}.__all__");
-        let Some(idxs) = outputs.decl_by_fqname.get(&all_fqn) else {
-            return Ok(None);
-        };
-        let module_idx = outputs.module_by_fqname.get(module_fqn).copied();
         let mut out: Vec<Py<SymbolNode>> = Vec::new();
-        for &all_idx in idxs {
-            for &(dst, _flags) in &outputs.builder.forward_adj[all_idx] {
-                if Some(dst) == module_idx {
-                    // Skip the default ``decl -> parent_module`` edge.
-                    continue;
+        for entry in entries {
+            let entry_fqn = format!("{module_fqn}.{entry}");
+            if let Some(idxs) = outputs.decl_by_fqname.get(&entry_fqn) {
+                for &idx in idxs {
+                    out.push(outputs.builder.nodes[idx].clone_ref(py));
                 }
-                out.push(outputs.builder.nodes[dst].clone_ref(py));
             }
         }
         Ok(Some(out))
+    }
+
+    /// Read the literal-list value of a top-level variable assignment
+    /// (``X = ["a", "b"]`` / ``X: tuple[str, ...] = ("a", "b")``) and
+    /// return the entries as owned strings.
+    ///
+    /// Returns ``None`` when the variable isn't found, when its
+    /// assignment value isn't a list / tuple of string literals, or
+    /// when any element is a non-literal (e.g. ``[*BASE, "c"]``).
+    /// Each declaration of the variable that satisfies the pattern
+    /// contributes its entries; multiple decls (e.g. conditional
+    /// rebinding) get concatenated in declaration order.
+    ///
+    /// This is the targeted read the ``LiteralListPlugin`` uses to
+    /// stay independent of the visitor's ``__all__``-only string-list
+    /// edge emission.
+    pub(crate) fn find_literal_list_entries(&self, var_fqn: &str) -> PyResult<Option<Vec<String>>> {
+        let outputs = self.outputs.borrow();
+        let outputs = outputs
+            .as_ref()
+            .ok_or_else(|| not_materialized("find_literal_list_entries"))?;
+        let Some(idxs) = outputs.decl_by_fqname.get(var_fqn) else {
+            return Ok(None);
+        };
+        let bare_name = var_fqn.rsplit('.').next().unwrap_or("");
+        if bare_name.is_empty() {
+            return Ok(None);
+        }
+        let mut out: Vec<String> = Vec::new();
+        let mut found_any = false;
+        for &idx in idxs {
+            let path =
+                pyo3::Python::with_gil(|py| outputs.builder.nodes[idx].borrow(py).path.clone());
+            let Some(&file) = outputs.path_to_file.get(&path) else {
+                continue;
+            };
+            let source = source_text(&self.db, file);
+            let parsed = parsed_module(&self.db, file).load(&self.db);
+            for stmt in &parsed.syntax().body {
+                let Some((target_range, value)) = top_level_assign_to_name(stmt) else {
+                    continue;
+                };
+                let start: usize = target_range.start().to_usize();
+                let end: usize = target_range.end().to_usize();
+                if &source[start..end] != bare_name {
+                    continue;
+                }
+                let Some(entries) = string_literal_list(value) else {
+                    continue;
+                };
+                found_any = true;
+                out.extend(entries.into_iter().map(String::from));
+            }
+        }
+        if found_any {
+            Ok(Some(out))
+        } else {
+            Ok(None)
+        }
     }
 }
 

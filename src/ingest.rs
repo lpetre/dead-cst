@@ -1643,6 +1643,36 @@ impl<'a, 'db> RefCollector<'a, 'db> {
             if saw_binding {
                 return results;
             }
+            // ``X: T`` (annotation-only assignment) is a *declaration*
+            // in ty's model, not a runtime binding, so it doesn't
+            // appear in ``bindings_at_use`` /
+            // ``end_of_scope_symbol_bindings``. For dead-code purposes
+            // an annotation-only decl is still the only "this name
+            // exists" signal for that symbol, so when no bindings
+            // reach the use, fall back to end-of-scope declarations.
+            // Declarations aren't flow-sensitive the way bindings are,
+            // so we don't need a position-keyed variant here.
+            for declaration in use_def_map.end_of_scope_symbol_declarations(symbol_id) {
+                let Some(def) = declaration.declaration.definition() else {
+                    continue;
+                };
+                if def.file(db) != self.file {
+                    continue;
+                }
+                let kind = def.kind(db);
+                let place_id = def.place(db);
+                let key = (
+                    self.file,
+                    place_id,
+                    range_key(kind.target_range(self.parsed)),
+                );
+                if let Some(&idx) = self.global_index.get(&key) {
+                    results.push(Resolution::Alias(idx));
+                }
+            }
+            if !results.is_empty() {
+                return results;
+            }
             first = false;
         }
         Vec::new()
