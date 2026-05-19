@@ -50,7 +50,7 @@ def apply_transformer(tmp_path, make_analysis):
         path.write_text(_normalise(src))
         graph = make_analysis().materialize_all()
         dead_decls = {
-            (n.fqname, n.position.start.line) for n in graph.nodes if n.fqname in dead_fqnames
+            (n.fqname, n.start_line) for n in graph.nodes if n.fqname in dead_fqnames
         }
         mgr = FullRepoManager(str(tmp_path), [str(path)], {FixedFullyQualifiedNameProvider})
         wrapper: MetadataWrapper = mgr.get_metadata_wrapper_for_path(str(path))
@@ -72,9 +72,9 @@ def apply_transformer_at_lines(tmp_path, make_analysis):
         path.write_text(_normalise(src))
         graph = make_analysis().materialize_all()
         dead_decls = {
-            (n.fqname, n.position.start.line)
+            (n.fqname, n.start_line)
             for n in graph.nodes
-            if (n.fqname, n.position.start.line) in dead
+            if (n.fqname, n.start_line) in dead
         }
         mgr = FullRepoManager(str(tmp_path), [str(path)], {FixedFullyQualifiedNameProvider})
         wrapper: MetadataWrapper = mgr.get_metadata_wrapper_for_path(str(path))

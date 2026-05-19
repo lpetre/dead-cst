@@ -28,7 +28,7 @@ def test_package_declarations_filter_by_simple_name(tmp_path, make_analysis):
     pv = a.package(tmp_path)
     foos = list(pv.declarations("Foo"))
     assert {n.fqname for n in foos} == {"pkg.m.Foo"}
-    assert {n.type for n in foos} == {"function", "class"}
+    assert {n.kind for n in foos} == {"function", "class"}
 
 
 def test_reverse_closure_includes_self_and_consumers(tmp_path, make_analysis):
@@ -71,7 +71,7 @@ def test_package_dead_matches_full_dead_slice(tmp_path, make_analysis):
     )
     plugins = [ExplicitEntrypointPlugin(specs=["pkg.main"])]
     a_full = make_analysis(["core", "app:core"], plugins=plugins)
-    full_dead_in_core = {n.fqname for n in a_full.dead() if n.path.is_relative_to(core)}
+    full_dead_in_core = {n.fqname for n in a_full.dead() if Path(n.path).is_relative_to(core)}
     a_pkg = make_analysis(["core", "app:core"], plugins=plugins)
     pkg_dead = {n.fqname for n in a_pkg.package(core).dead()}
     assert pkg_dead == full_dead_in_core

@@ -18,11 +18,11 @@ from dead_cst import NodeFlags
 
 
 def _import_nodes(graph):
-    return [n for n in graph.nodes if n.type == "import"]
+    return [n for n in graph.nodes if n.kind == "import"]
 
 
 def _entrypoint_imports(graph) -> set[str]:
-    return {n.fqname for n in graph.nodes if n.type == "import" and n.flags & NodeFlags.NOQA}
+    return {n.fqname for n in graph.nodes if n.kind == "import" and n.flags & NodeFlags.NOQA}
 
 
 @pytest.mark.parametrize(

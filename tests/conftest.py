@@ -98,10 +98,9 @@ def assert_edges():
 @pytest.fixture
 def assert_positional_edges():
     def _fmt(sym):
-        if sym.type == "module":
+        if sym.kind == "module":
             return sym.fqname
-        start = sym.position.start
-        return f"{sym.fqname}@{start.line}:{start.column}"
+        return f"{sym.fqname}@{sym.start_line}:{sym.start_column}"
 
     def _check(graph: SymbolGraph, expected_edges: set[str]):
         actual_edges = {

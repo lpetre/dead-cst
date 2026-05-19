@@ -4,9 +4,12 @@
 //!
 //! See `src/CLAUDE.md` for the architectural rules these types follow.
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 
 use pyo3::prelude::*;
+use pyo3::types::PyAnyMethods;
 use ruff_db::files::File;
 use ty_python_core::place::ScopedPlaceId;
 
@@ -40,6 +43,23 @@ impl Import {
             self.module, self.decl, self.star,
         )
     }
+
+    fn __hash__(&self) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        self.module.hash(&mut hasher);
+        self.decl.hash(&mut hasher);
+        self.star.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn __eq__(&self, other: &Bound<'_, PyAny>) -> bool {
+        match other.extract::<PyRef<Import>>() {
+            Ok(other) => {
+                self.module == other.module && self.decl == other.decl && self.star == other.star
+            }
+            Err(_) => false,
+        }
+    }
 }
 
 /// A single node in a `NativeGraph`.
@@ -60,8 +80,67 @@ pub(crate) struct NativeNode {
     pub(crate) imports: Option<Py<Import>>,
 }
 
+const VALID_KINDS: &[&str] = &[
+    "function",
+    "class",
+    "variable",
+    "import",
+    "type_alias",
+    "module",
+    "synthetic",
+];
+
+fn intern_kind(kind: &str) -> PyResult<&'static str> {
+    for valid in VALID_KINDS {
+        if *valid == kind {
+            return Ok(*valid);
+        }
+    }
+    Err(pyo3::exceptions::PyValueError::new_err(format!(
+        "invalid NativeNode.kind: {kind:?}"
+    )))
+}
+
 #[pymethods]
 impl NativeNode {
+    #[new]
+    #[pyo3(signature = (
+        fqname,
+        kind,
+        path,
+        *,
+        start_line = 0,
+        start_column = 0,
+        end_line = 0,
+        end_column = 0,
+        flags = 0,
+        imports = None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        fqname: String,
+        kind: &str,
+        path: String,
+        start_line: usize,
+        start_column: usize,
+        end_line: usize,
+        end_column: usize,
+        flags: u32,
+        imports: Option<Py<Import>>,
+    ) -> PyResult<Self> {
+        Ok(Self {
+            fqname,
+            kind: intern_kind(kind)?,
+            path,
+            start_line,
+            start_column,
+            end_line,
+            end_column,
+            flags,
+            imports,
+        })
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "NativeNode(fqname={:?}, kind={:?}, path={:?}, start=({}, {}), end=({}, {}), flags={})",
@@ -74,6 +153,55 @@ impl NativeNode {
             self.end_column,
             self.flags,
         )
+    }
+
+    fn __hash__(&self, py: Python<'_>) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        self.fqname.hash(&mut hasher);
+        self.kind.hash(&mut hasher);
+        self.path.hash(&mut hasher);
+        self.start_line.hash(&mut hasher);
+        self.start_column.hash(&mut hasher);
+        self.end_line.hash(&mut hasher);
+        self.end_column.hash(&mut hasher);
+        self.flags.hash(&mut hasher);
+        if let Some(imp) = &self.imports {
+            let imp_ref = imp.borrow(py);
+            imp_ref.module.hash(&mut hasher);
+            imp_ref.decl.hash(&mut hasher);
+            imp_ref.star.hash(&mut hasher);
+        } else {
+            // Discriminate "no imports" from "imports = ()".
+            0u8.hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
+    fn __eq__(&self, other: &Bound<'_, PyAny>) -> bool {
+        let Ok(other) = other.extract::<PyRef<NativeNode>>() else {
+            return false;
+        };
+        if self.fqname != other.fqname
+            || self.kind != other.kind
+            || self.path != other.path
+            || self.start_line != other.start_line
+            || self.start_column != other.start_column
+            || self.end_line != other.end_line
+            || self.end_column != other.end_column
+            || self.flags != other.flags
+        {
+            return false;
+        }
+        let py = other.py();
+        match (&self.imports, &other.imports) {
+            (None, None) => true,
+            (Some(a), Some(b)) => {
+                let a = a.borrow(py);
+                let b = b.borrow(py);
+                a.module == b.module && a.decl == b.decl && a.star == b.star
+            }
+            _ => false,
+        }
     }
 }
 

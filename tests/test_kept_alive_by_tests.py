@@ -9,6 +9,8 @@ still touch it.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from dead_cst import NodeFlags
 from dead_cst.analyze import (
     _find_kept_alive_by_flags_only,
@@ -139,4 +141,4 @@ def test_package_view_kept_alive_by_tests_only(make_analysis, write_files):
     assert "pkg.lib.helper" in fqnames
     # Filtered to nodes under this package.
     for n in blast:
-        assert n.path.is_relative_to(package_path)
+        assert Path(n.path).is_relative_to(package_path)

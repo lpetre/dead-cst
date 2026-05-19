@@ -44,7 +44,7 @@ def test_overloads_are_excluded_from_cross_module_lookup(tmp_path, make_analysis
     targets = [
         s
         for s in (graph.node(i) for i in graph.raw.successor_indices(graph.index(main_f_import)))
-        if s.fqname == "mod.f" and s.type == "function"
+        if s.fqname == "mod.f" and s.kind == "function"
     ]
     assert targets, "main.f should reach mod.f"
     assert all(not (t.flags & NodeFlags.OVERLOAD) for t in targets), (
@@ -130,9 +130,9 @@ def test_orphan_pyi_stub_uses_runtime_fqname(tmp_path, make_analysis):
     reachable = find_reachable(graph, _keepalive_seeds(graph, KEEPALIVE_DEFAULT))
 
     stub_compute = next(
-        n for n in graph.nodes if n.fqname == "mypkg._native.compute" and n.type == "function"
+        n for n in graph.nodes if n.fqname == "mypkg._native.compute" and n.kind == "function"
     )
-    assert stub_compute.path.name == "_native.pyi"
+    assert stub_compute.path.endswith("/_native.pyi")
     assert stub_compute in reachable, "orphan stub decl should be alive when imported"
 
     pkg_compute = next(n for n in graph.nodes if n.fqname == "mypkg.compute")

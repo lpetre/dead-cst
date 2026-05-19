@@ -153,6 +153,20 @@ class NativeNode:
     flags: int
     imports: Import | None
 
+    def __init__(
+        self,
+        fqname: str,
+        kind: NodeKind,
+        path: str,
+        *,
+        start_line: int = ...,
+        start_column: int = ...,
+        end_line: int = ...,
+        end_column: int = ...,
+        flags: int = ...,
+        imports: Import | None = ...,
+    ) -> None: ...
+
 # ----- Graph operations (yielded from plugin.run) ------------------------
 
 class AddEdge:

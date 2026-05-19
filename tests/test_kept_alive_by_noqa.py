@@ -10,6 +10,8 @@ kept alive only because of those pinned imports.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from dead_cst import NodeFlags
 from dead_cst.analyze import (
     _find_kept_alive_by_flags_only,
@@ -147,4 +149,4 @@ def test_packageview_kept_alive_by_flags_only_noqa_filters_to_package(make_analy
     (view,) = analysis.views()
     diff = view.kept_alive_by_flags_only(NodeFlags.NOQA)
     assert {n.fqname for n in diff} >= {"pkg.side_effect"}
-    assert all(n.path.is_relative_to(view.path) for n in diff)
+    assert all(Path(n.path).is_relative_to(view.path) for n in diff)

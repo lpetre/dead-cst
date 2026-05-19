@@ -17,7 +17,7 @@ def reachable_fqnames():
 
     def _reachable(graph) -> set[str]:
         reached = find_reachable(graph, _keepalive_seeds(graph, KEEPALIVE_DEFAULT))
-        return {n.fqname for n in reached if n.type != "synthetic"}
+        return {n.fqname for n in reached if n.kind != "synthetic"}
 
     return _reachable
 

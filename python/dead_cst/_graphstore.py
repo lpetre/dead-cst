@@ -22,7 +22,7 @@ from typing import Iterable, Iterator
 
 import rustworkx as rx
 
-from .graph import EdgeFlags, SymbolNode
+from .graph import SymbolNode
 
 
 class SymbolGraph:
@@ -41,7 +41,7 @@ class SymbolGraph:
             self._idx[node] = i
         return i
 
-    def add_edge(self, src: SymbolNode, dst: SymbolNode, flags: EdgeFlags = EdgeFlags.NONE) -> None:
+    def add_edge(self, src: SymbolNode, dst: SymbolNode, flags: int = 0) -> None:
         # Auto-insert missing endpoints: matches networkx behavior the
         # callers relied on. ``resolve_edges`` emits edges to synthetic
         # external nodes that are never explicitly added.

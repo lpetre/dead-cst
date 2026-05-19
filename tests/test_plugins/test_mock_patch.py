@@ -308,7 +308,7 @@ def test_monkeypatch_setattr_object_form_not_treated_as_fqname(
         },
         [MockPatchPlugin(), PytestPlugin()],
     )
-    synthetics = {n.fqname for n in graph.nodes if n.type == "synthetic"}
+    synthetics = {n.fqname for n in graph.nodes if n.kind == "synthetic"}
     assert f"{PATCH_TARGET_PREFIX}helper" not in synthetics
 
 
