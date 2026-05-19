@@ -1,12 +1,17 @@
+from __future__ import annotations
+
 import json
 import logging
 import textwrap
+from typing import TYPE_CHECKING
 
 import pytest
 
 from dead_cst import Analysis, EdgeFlags
-from dead_cst._graphstore import SymbolGraph
 from dead_cst.resolvers import ManualResolver
+
+if TYPE_CHECKING:
+    from dead_cst import _native as native
 
 
 @pytest.fixture
@@ -27,24 +32,8 @@ def write_files(tmp_path):
 
 
 @pytest.fixture
-def visitor_warnings(caplog):
-    """Capture WARNING records from the visitor and yield a message getter."""
-    with caplog.at_level(logging.WARNING, logger="dead_cst._visitor"):
-        yield lambda: [r.getMessage() for r in caplog.records]
-
-
-@pytest.fixture
 def make_analysis(tmp_path):
-    """Build an :class:`Analysis` rooted at ``tmp_path`` with minimal boilerplate.
-
-    The single positional argument is a list of :class:`ManualResolver`
-    spec strings (``"."``, ``"pkg_a:pkg_b"``, etc.); defaults to
-    ``["."]`` so the most common single-base case is just
-    ``make_analysis()``. Any extra keyword arguments flow straight
-    through to :class:`Analysis` (``plugins``, ``cache``,
-    ``unreachable_detector``, ``workers``, or an explicit
-    ``resolver=...`` to bypass :class:`ManualResolver` entirely).
-    """
+    """Build an :class:`Analysis` rooted at ``tmp_path`` with minimal boilerplate."""
 
     def _make(specs: list[str] | None = None, **kwargs) -> Analysis:
         if "resolver" not in kwargs:
@@ -55,25 +44,25 @@ def make_analysis(tmp_path):
 
 
 @pytest.fixture
-def build_decl_graph(tmp_path, make_analysis):
-    def _make_graph(files: dict[str, str]) -> SymbolGraph:
+def build_decl_graph(tmp_path):
+    """Materialise inline ``{relpath: source}`` files and return the live
+    :class:`native.ProjectContext` — same value
+    :meth:`Analysis.materialize_all` returns to production callers.
+    """
+
+    def _make_graph(files: dict[str, str]) -> "native.ProjectContext":
         for filename, content in files.items():
             full_path = tmp_path / filename
             full_path.parent.mkdir(parents=True, exist_ok=True)
             full_path.write_text(textwrap.dedent(content).strip())
-        return make_analysis().materialize_all()
+        return Analysis(tmp_path, resolver=ManualResolver(specs=["."])).materialize_all()
 
     return _make_graph
 
 
 @pytest.fixture
 def write_notebook(tmp_path):
-    """Write an nbformat-4 notebook to ``tmp_path``.
-
-    Each entry in ``cells`` is either a ``str`` (becomes a code cell with
-    that source, dedented) or a ``dict`` (written through unmodified, for
-    testing markdown / raw / malformed shapes).
-    """
+    """Write an nbformat-4 notebook to ``tmp_path``."""
 
     def _write(relpath: str, cells: list) -> None:
         nb_cells = []
@@ -105,20 +94,9 @@ def write_notebook(tmp_path):
 
 @pytest.fixture
 def assert_edges():
-    def _check(graph: SymbolGraph, expected_edges: set[str]):
-        """Compare graph edges to expected 'a -> b' strings.
-
-        Iterates the full edge set, including ``DEAD_BRANCH``-flagged
-        edges. The flag is metadata-only -- default ``find_reachable``
-        traverses these edges, and the live-graph view should reflect
-        them. Tests that want only the dead-code references use
-        :func:`assert_dead_branch_edges`. Parallel edges (same
-        ``(u, v)`` pair, different attrs) collapse to one assertion
-        entry; ``set`` deduping handles that automatically.
-        """
-        actual_edges = {
-            f"{graph.node(u).fqname} -> {graph.node(v).fqname}" for u, v in graph.raw.edge_list()
-        }
+    def _check(graph: "native.ProjectContext", expected_edges: set[str]):
+        nodes = graph.nodes()
+        actual_edges = {f"{nodes[u].fqname} -> {nodes[v].fqname}" for u, v, _ in graph.edges()}
         assert actual_edges == expected_edges
 
     return _check
@@ -126,27 +104,14 @@ def assert_edges():
 
 @pytest.fixture
 def assert_positional_edges():
-    """Like ``assert_edges`` but disambiguates nodes by source position.
-
-    Formats each node as ``fqname@line:col`` when a position is available
-    (module nodes keep their bare fqname). Use this for tests where
-    multiple top-level decls share a fqname -- e.g. redeclarations and
-    shadowing -- so the per-textual-decl identity is visible in the
-    assertion.
-    """
-
     def _fmt(sym):
-        # Module nodes have a position too (covering the whole file) but
-        # rendering it would just be noise. Leave modules as bare fqnames.
-        if sym.type == "module":
+        if sym.kind == "module":
             return sym.fqname
-        start = sym.position.start
-        return f"{sym.fqname}@{start.line}:{start.column}"
+        return f"{sym.fqname}@{sym.start_line}:{sym.start_column}"
 
-    def _check(graph: SymbolGraph, expected_edges: set[str]):
-        actual_edges = {
-            f"{_fmt(graph.node(u))} -> {_fmt(graph.node(v))}" for u, v in graph.raw.edge_list()
-        }
+    def _check(graph: "native.ProjectContext", expected_edges: set[str]):
+        nodes = graph.nodes()
+        actual_edges = {f"{_fmt(nodes[u])} -> {_fmt(nodes[v])}" for u, v, _ in graph.edges()}
         assert actual_edges == expected_edges
 
     return _check
@@ -154,14 +119,78 @@ def assert_positional_edges():
 
 @pytest.fixture
 def assert_dead_branch_edges():
-    """Assert on edges flagged ``EdgeFlags.DEAD_BRANCH`` as ``"src.fqname -> dst.fqname"``."""
-
-    def _check(graph: SymbolGraph, expected_edges: set[str]):
+    def _check(graph: "native.ProjectContext", expected_edges: set[str]):
+        nodes = graph.nodes()
         actual = {
-            f"{graph.node(u).fqname} -> {graph.node(v).fqname}"
-            for u, v, payload in graph.raw.weighted_edge_list()
+            f"{nodes[u].fqname} -> {nodes[v].fqname}"
+            for u, v, payload in graph.edges()
             if payload & EdgeFlags.DEAD_BRANCH
         }
         assert actual == expected_edges
 
     return _check
+
+
+@pytest.fixture
+def assert_dynamic_import_edges():
+    def _check(graph: "native.ProjectContext", expected_edges: set[str]):
+        nodes = graph.nodes()
+        actual = {
+            f"{nodes[u].fqname} -> {nodes[v].fqname}"
+            for u, v, payload in graph.edges()
+            if payload & EdgeFlags.DYNAMIC_IMPORT
+        }
+        assert actual == expected_edges
+
+    return _check
+
+
+@pytest.fixture
+def successors_of():
+    """Return the one-hop successors of ``node`` in ``ctx`` (test-only).
+
+    Production code uses :meth:`ProjectContext.descendants` for the
+    transitive closure; the one-hop accessor lives here because only
+    tests reach for it.
+    """
+
+    def _of(ctx: "native.ProjectContext", node) -> list:
+        nodes = ctx.nodes()
+        idx = nodes.index(node)
+        return [nodes[v] for u, v, _ in ctx.edges() if u == idx]
+
+    return _of
+
+
+@pytest.fixture
+def predecessors_of():
+    def _of(ctx: "native.ProjectContext", node) -> list:
+        nodes = ctx.nodes()
+        idx = nodes.index(node)
+        return [nodes[u] for u, v, _ in ctx.edges() if v == idx]
+
+    return _of
+
+
+@pytest.fixture
+def has_edge():
+    def _has(ctx: "native.ProjectContext", src, dst) -> bool:
+        nodes = ctx.nodes()
+        s, d = nodes.index(src), nodes.index(dst)
+        return any(u == s and v == d for u, v, _ in ctx.edges())
+
+    return _has
+
+
+@pytest.fixture
+def edge_flags_between():
+    def _flags(ctx: "native.ProjectContext", src, dst) -> list[int]:
+        nodes = ctx.nodes()
+        s, d = nodes.index(src), nodes.index(dst)
+        return [f for u, v, f in ctx.edges() if u == s and v == d]
+
+    return _flags
+
+
+# Suppress logging configured in tests
+_ = logging

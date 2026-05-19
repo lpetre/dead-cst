@@ -21,12 +21,11 @@ class Flux0CliCommandsPlugin(DecoratedDeclPlugin):
     https://github.com/flux0-ai/flux0/blob/8d04176642b091ddb5c5020486f353d4e824460b/packages/cli/src/flux0_cli/main.py#L61
     """
 
+    marker_prefix: str = "flux0_cli_cmds"
     package_prefix: str = "flux0_cli.cmds"
     decorator_module: str = "click"
     decorator_names: frozenset[str] = frozenset({"group", "Group"})
     constructor_names: frozenset[str] = frozenset({"Group"})
-    name: str = "flux0_cli_cmds"
-    version: int = 1777760307  # epoch; bump when this subclass's config changes
 
 
 @dataclass
@@ -36,7 +35,6 @@ class Flux0InternalModulesPlugin(LiteralListPlugin):
     https://github.com/flux0-ai/flux0/blob/8d04176642b091ddb5c5020486f353d4e824460b/packages/server/src/flux0_server/main.py#L51
     """
 
+    marker_prefix: str = "flux0_internal_modules"
     owner_fqname: str = "flux0_server.main"
     variable_name: str = "INTERNAL_MODULES"
-    name: str = "flux0_internal_modules"
-    version: int = 1777760307  # epoch; bump when this subclass's config changes

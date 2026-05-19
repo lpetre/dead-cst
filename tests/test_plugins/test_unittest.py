@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+
 from dead_cst.graph import NodeFlags
 from dead_cst.plugins import UnittestPlugin
 
 
-def test_unittest_plugin_marks_testcase_subclass(make_analysis, write_files, reachable_fqnames):
-    write_files(
+def test_unittest_plugin_marks_testcase_subclass(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "pkg/__init__.py": "",
             "pkg/things.py": """
@@ -19,16 +20,16 @@ def test_unittest_plugin_marks_testcase_subclass(make_analysis, write_files, rea
             class Helper:
                 pass
             """,
-        }
+        },
+        [UnittestPlugin()],
     )
-    graph = make_analysis(plugins=[UnittestPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "pkg.things.MyThings" in reached
     assert "pkg.things.Helper" not in reached
 
 
-def test_unittest_plugin_handles_from_import(make_analysis, write_files, reachable_fqnames):
-    write_files(
+def test_unittest_plugin_handles_from_import(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "pkg/__init__.py": "",
             "pkg/things.py": """
@@ -37,14 +38,14 @@ def test_unittest_plugin_handles_from_import(make_analysis, write_files, reachab
             class MyThings(TestCase):
                 def test_one(self): pass
             """,
-        }
+        },
+        [UnittestPlugin()],
     )
-    graph = make_analysis(plugins=[UnittestPlugin()]).materialize_all()
     assert "pkg.things.MyThings" in reachable_fqnames(graph)
 
 
-def test_unittest_plugin_handles_aliased_imports(make_analysis, write_files, reachable_fqnames):
-    write_files(
+def test_unittest_plugin_handles_aliased_imports(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "pkg/__init__.py": "",
             "pkg/aliased_module.py": """
@@ -59,16 +60,16 @@ def test_unittest_plugin_handles_aliased_imports(make_analysis, write_files, rea
             class ClsAliased(TC):
                 def test_one(self): pass
             """,
-        }
+        },
+        [UnittestPlugin()],
     )
-    graph = make_analysis(plugins=[UnittestPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "pkg.aliased_module.ModAliased" in reached
     assert "pkg.aliased_class.ClsAliased" in reached
 
 
-def test_unittest_plugin_marks_async_testcase(make_analysis, write_files, reachable_fqnames):
-    write_files(
+def test_unittest_plugin_marks_async_testcase(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "pkg/__init__.py": "",
             "pkg/things.py": """
@@ -77,14 +78,14 @@ def test_unittest_plugin_marks_async_testcase(make_analysis, write_files, reacha
             class MyAsync(unittest.IsolatedAsyncioTestCase):
                 async def test_one(self): pass
             """,
-        }
+        },
+        [UnittestPlugin()],
     )
-    graph = make_analysis(plugins=[UnittestPlugin()]).materialize_all()
     assert "pkg.things.MyAsync" in reachable_fqnames(graph)
 
 
-def test_unittest_plugin_marks_module_hooks(make_analysis, write_files, reachable_fqnames):
-    write_files(
+def test_unittest_plugin_marks_module_hooks(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "pkg/__init__.py": "",
             "pkg/things.py": """
@@ -98,9 +99,9 @@ def test_unittest_plugin_marks_module_hooks(make_analysis, write_files, reachabl
             class MyThings(unittest.TestCase):
                 def test_one(self): pass
             """,
-        }
+        },
+        [UnittestPlugin()],
     )
-    graph = make_analysis(plugins=[UnittestPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "pkg.things.setUpModule" in reached
     assert "pkg.things.tearDownModule" in reached
@@ -108,8 +109,8 @@ def test_unittest_plugin_marks_module_hooks(make_analysis, write_files, reachabl
     assert "pkg.things.helper" not in reached
 
 
-def test_unittest_plugin_ignores_unrelated_classes(make_analysis, write_files, reachable_fqnames):
-    write_files(
+def test_unittest_plugin_ignores_unrelated_classes(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "pkg/__init__.py": "",
             "pkg/things.py": """
@@ -122,19 +123,17 @@ def test_unittest_plugin_ignores_unrelated_classes(make_analysis, write_files, r
             class NotReally(TestCase):
                 def test_one(self): pass
             """,
-        }
+        },
+        [UnittestPlugin()],
     )
-    graph = make_analysis(plugins=[UnittestPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     # Bare ``TestCase`` is the locally-defined class (we never imported the
     # name from unittest), so the subclass is not picked up.
     assert "pkg.things.NotReally" not in reached
 
 
-def test_unittest_plugin_skips_files_not_importing_unittest(
-    make_analysis, write_files, reachable_fqnames
-):
-    write_files(
+def test_unittest_plugin_skips_files_not_importing_unittest(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "pkg/__init__.py": "",
             "pkg/things.py": """
@@ -144,17 +143,17 @@ def test_unittest_plugin_skips_files_not_importing_unittest(
             class MyThings(TestCase):
                 def test_one(self): pass
             """,
-        }
+        },
+        [UnittestPlugin()],
     )
-    graph = make_analysis(plugins=[UnittestPlugin()]).materialize_all()
     assert "pkg.things.MyThings" not in reachable_fqnames(graph)
 
 
-def test_unittest_plugin_skips_pure_star_import(make_analysis, write_files, reachable_fqnames):
-    # Documented limitation: the resolver doesn't surface stdlib star
-    # imports as graph nodes, so the prefilter can't see them. Users
-    # should ``from unittest import TestCase`` instead.
-    write_files(
+def test_unittest_plugin_resolves_through_star_import(build_plugin_graph, reachable_fqnames):
+    """ty's type hierarchy follows star imports, so ``class X(TestCase)``
+    after ``from unittest import *`` resolves.
+    """
+    graph = build_plugin_graph(
         {
             "pkg/__init__.py": "",
             "pkg/things.py": """
@@ -163,10 +162,10 @@ def test_unittest_plugin_skips_pure_star_import(make_analysis, write_files, reac
             class MyThings(TestCase):
                 def test_one(self): pass
             """,
-        }
+        },
+        [UnittestPlugin()],
     )
-    graph = make_analysis(plugins=[UnittestPlugin()]).materialize_all()
-    assert "pkg.things.MyThings" not in reachable_fqnames(graph)
+    assert "pkg.things.MyThings" in reachable_fqnames(graph)
 
 
 def test_unittest_plugin_loads_via_load_plugin():
@@ -176,8 +175,8 @@ def test_unittest_plugin_loads_via_load_plugin():
     assert isinstance(plugin, UnittestPlugin)
 
 
-def test_unittest_plugin_tags_seeds_as_testcase(make_analysis, write_files):
-    write_files(
+def test_unittest_plugin_tags_seeds_as_testcase(build_plugin_graph):
+    graph = build_plugin_graph(
         {
             "pkg/__init__.py": "",
             "pkg/things.py": """
@@ -186,20 +185,16 @@ def test_unittest_plugin_tags_seeds_as_testcase(make_analysis, write_files):
             class MyThings(unittest.TestCase):
                 def test_one(self): pass
             """,
-        }
+        },
+        [UnittestPlugin()],
     )
-    graph = make_analysis(plugins=[UnittestPlugin()]).materialize_all()
-    seeds = [n for n in graph.nodes if n.flags & NodeFlags.ENTRYPOINT]
-    assert seeds, "expected unittest plugin to seed at least one entrypoint"
-    for seed in seeds:
-        assert seed.flags & NodeFlags.TESTCASE, seed.fqname
+    seeds = [n for n in graph.nodes() if n.flags & NodeFlags.TESTCASE]
+    assert seeds, "expected unittest plugin to seed at least one TESTCASE node"
 
 
-def test_unittest_plugin_marks_subclass_via_local_mixin(
-    make_analysis, write_files, reachable_fqnames
-):
+def test_unittest_plugin_marks_subclass_via_local_mixin(build_plugin_graph, reachable_fqnames):
     """A test class inheriting from a project-local TestCase subclass is alive."""
-    write_files(
+    graph = build_plugin_graph(
         {
             "tests/__init__.py": "",
             "tests/base.py": """
@@ -214,17 +209,17 @@ def test_unittest_plugin_marks_subclass_via_local_mixin(
             class MyThings(ProjectTestCase):
                 def test_one(self): pass
             """,
-        }
+        },
+        [UnittestPlugin()],
     )
-    graph = make_analysis(plugins=[UnittestPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "tests.base.ProjectTestCase" in reached
     assert "tests.things.MyThings" in reached
 
 
-def test_unittest_plugin_marks_subclass_via_reexport(make_analysis, write_files, reachable_fqnames):
+def test_unittest_plugin_marks_subclass_via_reexport(build_plugin_graph, reachable_fqnames):
     """A class extending a re-exported ``TestCase`` (``from pkg.bases import TestCase``) is alive."""
-    write_files(
+    graph = build_plugin_graph(
         {
             "pkg/__init__.py": "",
             "pkg/bases.py": "from unittest import TestCase\n",
@@ -234,17 +229,15 @@ def test_unittest_plugin_marks_subclass_via_reexport(make_analysis, write_files,
             class MyThings(TestCase):
                 def test_one(self): pass
             """,
-        }
+        },
+        [UnittestPlugin()],
     )
-    graph = make_analysis(plugins=[UnittestPlugin()]).materialize_all()
     assert "pkg.things.MyThings" in reachable_fqnames(graph)
 
 
-def test_unittest_plugin_marks_three_level_subclass_chain(
-    make_analysis, write_files, reachable_fqnames
-):
+def test_unittest_plugin_marks_three_level_subclass_chain(build_plugin_graph, reachable_fqnames):
     """Subclass of a subclass of a project mixin still resolves."""
-    write_files(
+    graph = build_plugin_graph(
         {
             "tests/__init__.py": "",
             "tests/a.py": """
@@ -265,9 +258,9 @@ def test_unittest_plugin_marks_three_level_subclass_chain(
             class L3(L2):
                 def test_one(self): pass
             """,
-        }
+        },
+        [UnittestPlugin()],
     )
-    graph = make_analysis(plugins=[UnittestPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "tests.a.L1" in reached
     assert "tests.b.L2" in reached

@@ -10,8 +10,8 @@ synthetic nodes, which is fine for these checks).
 Levels:
 - **0**: ``analyze`` runs to completion without raising; exit code is
   the documented 0 / 1.
-- **1**: ``why-alive`` finds the pinned ``main`` symbol and reports
-  the ``MainBlockPlugin`` synthetic in its predecessor chain.
+- **1**: :meth:`Analysis.ancestors` on the pinned ``main`` symbol
+  reports the ``MainBlockPlugin`` synthetic in its predecessor chain.
 - **2**: project-specific plugins from :mod:`._flux0_plugins` close
   flux0's two ``importlib``-driven blind spots. Each is a tiny
   subclass of an abstract base (:class:`SubpackageDiscoveryPlugin` /
@@ -27,8 +27,7 @@ import pytest
 from typer.testing import CliRunner
 
 from dead_cst import Analysis
-from dead_cst.analyze import _entrypoint_seeds, _find_reachable as find_reachable
-from dead_cst.cache import GraphCache
+from dead_cst.graph import KEEPALIVE_DEFAULT
 from dead_cst.cli import app
 from dead_cst.plugins import MainBlockPlugin, ModuleDundersPlugin
 from dead_cst.resolvers import ManualResolver
@@ -66,7 +65,7 @@ def test_analyze_flux0_server_runs_to_completion(flux0_server_src):
     """Level 0: dead-cst should walk the whole package without crashing."""
     result = CliRunner().invoke(
         app,
-        ["analyze", flux0_server_src, "--plugin", "main_block", "--no-cache"],
+        ["analyze", flux0_server_src, "--plugin", "main_block"],
     )
     # Typer raises SystemExit on non-zero exit; anything else means we crashed.
     assert result.exception is None or isinstance(result.exception, SystemExit), result.exception
@@ -77,7 +76,7 @@ def test_analyze_flux0_server_runs_to_completion(flux0_server_src):
 def test_analyze_flux0_cli_runs_to_completion(flux0_cli_src):
     result = CliRunner().invoke(
         app,
-        ["analyze", flux0_cli_src, "--plugin", "main_block", "--no-cache"],
+        ["analyze", flux0_cli_src, "--plugin", "main_block"],
     )
     assert result.exception is None or isinstance(result.exception, SystemExit), result.exception
     assert result.exit_code in (0, 1), (result.exit_code, result.output)
@@ -88,46 +87,33 @@ def test_analyze_flux0_cli_runs_to_completion(flux0_cli_src):
 # ---------------------------------------------------------------------------
 
 
+def _ancestor_fqnames(base: Path, target_fqname: str) -> list[str]:
+    """Run the Python equivalent of ``why-alive``.
+
+    Materializes the graph, finds the target node, and returns the
+    predecessor chain's fqnames — the same data the dropped CLI
+    command rendered, exposed through :meth:`Analysis.ancestors`.
+    """
+    analysis = Analysis(base, resolver=ManualResolver(specs=["."]), plugins=[MainBlockPlugin()])
+    ctx = analysis.materialize_all()
+    target = next((n for n in ctx.nodes() if n.fqname == target_fqname), None)
+    assert target is not None, f"{target_fqname} not in graph"
+    return [n.fqname for n in analysis.ancestors(target)]
+
+
 def test_why_alive_flux0_server_main(flux0_server_src):
     """Level 1: ``main`` is reached via the module's ``if __name__ ...`` block.
 
-    The MainBlockPlugin attaches a synthetic ``<__main__>:<module>`` node
-    as a predecessor of every top-level call inside the guard, so we
-    expect to see that synthetic in the chain.
+    The MainBlockPlugin attaches a synthetic ``<__main__>:<module>``
+    node as a predecessor of every top-level call inside the guard.
     """
-    result = CliRunner().invoke(
-        app,
-        [
-            "why-alive",
-            flux0_server_src,
-            "flux0_server.main.main",
-            "--plugin",
-            "main_block",
-            "--no-cache",
-        ],
-    )
-    assert result.exception is None, result.exception
-    assert result.exit_code == 0, result.output
-    assert "Symbol: flux0_server.main.main (function)" in result.stdout
-    assert "<__main__>:flux0_server.main" in result.stdout
+    ancestors = _ancestor_fqnames(Path(flux0_server_src), "flux0_server.main.main")
+    assert any(a.startswith("<__main__>:flux0_server.main") for a in ancestors)
 
 
 def test_why_alive_flux0_cli_main(flux0_cli_src):
-    result = CliRunner().invoke(
-        app,
-        [
-            "why-alive",
-            flux0_cli_src,
-            "flux0_cli.main.main",
-            "--plugin",
-            "main_block",
-            "--no-cache",
-        ],
-    )
-    assert result.exception is None, result.exception
-    assert result.exit_code == 0, result.output
-    assert "Symbol: flux0_cli.main.main (function)" in result.stdout
-    assert "<__main__>:flux0_cli.main" in result.stdout
+    ancestors = _ancestor_fqnames(Path(flux0_cli_src), "flux0_cli.main.main")
+    assert any(a.startswith("<__main__>:flux0_cli.main") for a in ancestors)
 
 
 # ---------------------------------------------------------------------------
@@ -137,7 +123,7 @@ def test_why_alive_flux0_cli_main(flux0_cli_src):
 
 def _module_node(graph, fqname):
     return next(
-        (n for n in graph.nodes if n.type == "module" and n.fqname == fqname),
+        (n for n in graph.nodes() if n.kind == "module" and n.fqname == fqname),
         None,
     )
 
@@ -152,7 +138,7 @@ def test_flux0_cli_cmds_dead_without_plugin(flux0_cli_src):
     """Sanity: without the dynamic-loader plugin, the cmds modules are dead."""
     base = Path(flux0_cli_src)
     graph = _build_graph(base, MainBlockPlugin())
-    reachable = find_reachable(graph, _entrypoint_seeds(graph))
+    reachable = graph.reachable(seed_flags=KEEPALIVE_DEFAULT)
 
     cmds_agents = _module_node(graph, "flux0_cli.cmds.agents")
     assert cmds_agents is not None, "cmds.agents module should be in the graph"
@@ -179,7 +165,7 @@ def test_flux0_cli_commands_revives_click_groups(flux0_cli_src):
     """
     base = Path(flux0_cli_src)
     graph = _build_graph(base, MainBlockPlugin(), Flux0CliCommandsPlugin())
-    reachable = find_reachable(graph, _entrypoint_seeds(graph))
+    reachable = graph.reachable(seed_flags=KEEPALIVE_DEFAULT)
 
     for fqname in (
         "flux0_cli.cmds.agents.agents",  # @click.group() in agents.py
@@ -187,7 +173,7 @@ def test_flux0_cli_commands_revives_click_groups(flux0_cli_src):
         "flux0_cli.cmds.agents",  # module stays alive via the Group decl
         "flux0_cli.cmds.sessions",
     ):
-        node = next((n for n in graph.nodes if n.fqname == fqname), None)
+        node = next((n for n in graph.nodes() if n.fqname == fqname), None)
         assert node is not None, f"{fqname} not in graph"
         assert node in reachable, f"{fqname} should be alive once the plugin runs"
 
@@ -197,7 +183,7 @@ def test_flux0_cli_commands_revives_click_groups(flux0_cli_src):
     # in the new plugin -- a future ``Flux0CustomDecoratorsPlugin`` would
     # be the right place to close that gap.
     handler_fqname = "flux0_cli.cmds.agents.list_agents"
-    handler = next((n for n in graph.nodes if n.fqname == handler_fqname), None)
+    handler = next((n for n in graph.nodes() if n.fqname == handler_fqname), None)
     assert handler is not None
     assert handler not in reachable, (
         "list_agents should still appear dead -- @get_options is a flux0-"
@@ -214,7 +200,7 @@ def test_flux0_internal_modules_revives_replay_agent(flux0_server_src):
     """
     base = Path(flux0_server_src)
     graph = _build_graph(base, MainBlockPlugin(), Flux0InternalModulesPlugin())
-    reachable = find_reachable(graph, _entrypoint_seeds(graph))
+    reachable = graph.reachable(seed_flags=KEEPALIVE_DEFAULT)
 
     for fqname in (
         "flux0_server.replay_agent",  # __init__ module
@@ -223,7 +209,7 @@ def test_flux0_internal_modules_revives_replay_agent(flux0_server_src):
         "flux0_server.replay_agent.replay_agent",  # nested module imported by __init__
         "flux0_server.replay_agent.replay_agent.ReplayAgentRunner",  # decl
     ):
-        node = next((n for n in graph.nodes if n.fqname == fqname), None)
+        node = next((n for n in graph.nodes() if n.fqname == fqname), None)
         assert node is not None, f"{fqname} not in graph"
         assert node in reachable, f"{fqname} should be alive via INTERNAL_MODULES"
 
@@ -242,11 +228,11 @@ def test_flux0_server_dead_set_pins_to_real_findings(flux0_server_src):
         ModuleDundersPlugin(),
         Flux0InternalModulesPlugin(),
     )
-    reachable = find_reachable(graph, _entrypoint_seeds(graph))
+    reachable = graph.reachable(seed_flags=KEEPALIVE_DEFAULT)
     dead = {
         n.fqname
-        for n in graph.nodes
-        if n not in reachable and n.type != "synthetic" and not n.fqname.startswith("[")
+        for n in graph.nodes()
+        if n not in reachable and n.kind != "synthetic" and not n.fqname.startswith("[")
     }
     assert dead == {
         "flux0_server.main.DEFAULT_PORT",
@@ -271,11 +257,11 @@ def test_flux0_cli_dead_set_includes_real_findings_and_decorator_blind_spot(flux
         ModuleDundersPlugin(),
         Flux0CliCommandsPlugin(),
     )
-    reachable = find_reachable(graph, _entrypoint_seeds(graph))
+    reachable = graph.reachable(seed_flags=KEEPALIVE_DEFAULT)
     dead = {
         n.fqname
-        for n in graph.nodes
-        if n not in reachable and n.type != "synthetic" and not n.fqname.startswith("[")
+        for n in graph.nodes()
+        if n not in reachable and n.kind != "synthetic" and not n.fqname.startswith("[")
     }
     # Real findings: present.
     assert {"flux0_cli.main.F", "flux0_cli.main.TypeVar"} <= dead
@@ -296,45 +282,26 @@ def test_flux0_cli_dead_set_includes_real_findings_and_decorator_blind_spot(flux
     assert "flux0_cli.cmds.sessions.sessions" not in dead
 
 
-def test_flux0_internal_modules_survives_cache_round_trip(flux0_server_src, tmp_path):
-    """LiteralListPlugin must produce the same dead set warm as cold.
-
-    The naive observe-stashes-on-self design silently regresses on
-    warm runs (cached payload replays without invoking observe, leaving
-    captured fqnames empty). The current design encodes captured
-    fqnames as ENTRYPOINT-flagged synthetic decls in the observe
-    payload, so the cache replay is fully self-sufficient and finalize
-    only walks the graph -- this test guards that property.
-    """
+def test_flux0_internal_modules(flux0_server_src, tmp_path):
+    """LiteralListPlugin keeps the literal-listed modules alive."""
     base = Path(flux0_server_src)
     plugins = [
         MainBlockPlugin(),
         ModuleDundersPlugin(),
         Flux0InternalModulesPlugin(),
     ]
-    cache_path = tmp_path / "cache.sqlite"
-
-    dead_sets = []
-    for _ in range(2):
-        with GraphCache(cache_path) as cache:
-            graph = Analysis(
-                base,
-                resolver=ManualResolver(specs=["."]),
-                plugins=plugins,
-                cache=cache,
-            ).materialize_all()
-        reachable = find_reachable(graph, _entrypoint_seeds(graph))
-        dead_sets.append(
-            {
-                n.fqname
-                for n in graph.nodes
-                if n not in reachable and n.type != "synthetic" and not n.fqname.startswith("[")
-            }
-        )
-
-    cold, warm = dead_sets
-    assert cold == warm, f"cache regressed plugin output: cold={cold}, warm={warm}"
-    assert cold == {
+    graph = Analysis(
+        base,
+        resolver=ManualResolver(specs=["."]),
+        plugins=plugins,
+    ).materialize_all()
+    reachable = graph.reachable(seed_flags=KEEPALIVE_DEFAULT)
+    dead = {
+        n.fqname
+        for n in graph.nodes()
+        if n not in reachable and n.kind != "synthetic" and not n.fqname.startswith("[")
+    }
+    assert dead == {
         "flux0_server.main.DEFAULT_PORT",
         "flux0_server.main.SERVER_ADDRESS",
     }

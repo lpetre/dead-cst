@@ -9,9 +9,154 @@ two versions.
 
 ## [Unreleased]
 
+### Added
+- **`dead-cst build`** materializes the project graph and persists it
+  to disk in a bincode-encoded binary file (header + node / edge lists
+  + a small metadata block). Subsequent `dead-cst analyze` and
+  `dead-cst remove` runs can then skip the build with
+  `--graph PATH`, which is useful for CI shapes that run multiple
+  reachability queries against the same code state. Plugins
+  intentionally do *not* round-trip — only the materialized adjacency
+  is captured, so a project that needs plugin-emitted edges must
+  rebuild rather than load.
+- **`--meta key=value`** on `build` stashes arbitrary user-supplied
+  metadata (branch name, commit SHA, etc.) into the graph file's
+  metadata block alongside the auto-recorded `created_at`, node /
+  edge / file / line counts.
+- **`--query {dead,test-only}`** on `analyze` and `remove`. The
+  default `dead` reproduces the previous behaviour; `test-only` runs
+  `kept_alive_by_flags_only(NodeFlags.TESTCASE)` and returns the
+  blast-radius set — code that goes dead the moment you drop the
+  test suite. Plumbs through to the patch emitter, so
+  `dead-cst remove ROOT --query test-only` is the one-shot "delete
+  the test suite and every helper that backed it" workflow.
+- **`--entrypoint-regex REGEX`** as an explicit replacement for the
+  old `-e re:<pattern>` magic prefix.
+- **`--exit-zero`** on `analyze` makes the command always exit 0 even
+  when dead code is found.
+- **Public Python API** for graph persistence:
+  :func:`dead_cst.graph.write_graph`,
+  :func:`dead_cst.graph.read_graph`, and
+  :class:`dead_cst.graph.GraphMetadata`. All I/O lives in the rust
+  crate (`dead_cst._native.write_graph` / `.read_graph`); the Python
+  wrappers handle `SymbolGraph` ↔ `NativeGraph` translation. The
+  on-disk format has a hard-versioned header — version mismatch is a
+  fatal error, with no migration path (rebuilding a graph is cheap).
+
+### Changed (breaking)
+- **CLI trimmed to three commands.** `dead-cst why-alive`,
+  `dead-cst dependencies`, and `dead-cst unused-exports` are
+  removed; the data they exposed is still available through the
+  Python API (:meth:`Analysis.ancestors`, the synthetic external-dep
+  nodes under :data:`EXTERNAL_PREFIXES`, and the `__all__`-only
+  blast-radius query, respectively). The supported surface is
+  `dead-cst build` / `dead-cst analyze` / `dead-cst remove`.
+- **`-e re:<pattern>` magic prefix** is no longer recognized. Use
+  `--entrypoint-regex <pattern>` instead. The plain `-e` flag now
+  treats its argument as a file path or FQN literal.
+
+### Changed (breaking)
+- **Dropped the Python ``SymbolGraph`` adjacency facade.**
+  ``Analysis.materialize_all()`` and ``PackageView.graph()`` now return
+  the live :class:`native.ProjectContext` directly — no Python-side
+  dict-of-lists copy, no per-node ``_idx`` allocation. Callers iterate
+  ``ctx.nodes()`` / ``ctx.edges()`` and route adjacency walks through
+  ``ctx.reachable(...)`` / ``ctx.descendants(...)`` / ``ctx.ancestors(...)``.
+  ``codemod.remove_code`` and ``codemod.generate_patch`` now take an
+  iterable of dead ``SymbolNode``\ s instead of a graph; edges were
+  ignored anyway.
+- **Rust-native graph builder.** The libcst CST visitor pipeline, SQLite
+  per-file cache, and networkx graph are all replaced by a pyo3 native
+  extension built on ty's ``SemanticIndex``. Graph construction, import
+  resolution, and reachability walks run entirely in Rust. The only
+  remaining libcst usage is the codemod source rewriter.
+- **Build system.** Switched from hatchling to maturin. The Rust crate
+  lives in ``src/``, Python sources under ``python/dead_cst/``, and the
+  wheel ships ``_native.{abi3.so,pyd}`` alongside the Python code.
+- **``networkx`` → ``rustworkx``.** ``SymbolNode`` and ``Import`` are
+  now frozen pyo3 classes, not Python dataclasses.
+- **Plugin protocol.** Plugins subclass :class:`~dead_cst.plugins.Plugin`
+  and implement a single ``run(ctx: ProjectContext)`` that yields
+  :class:`~dead_cst._native.GraphOp` values (``AddNode`` / ``AddEdge`` /
+  ``AddEntrypoint``). The old ``observe()`` / ``finalize()`` two-phase
+  split and per-file caching are gone.
+- **Plugin ``name`` / ``version`` fields dropped.** The Rust progress bar
+  derives its label from ``type(plugin).__qualname__``. The three
+  declarative bases (:class:`DecoratedDeclPlugin`,
+  :class:`DispatchAppPlugin`, :class:`LiteralListPlugin`) gained a
+  required ``marker_prefix: str`` field that controls the synthetic
+  fqname prefix.
+- **``BUILTIN_PLUGINS``** is now a ``list[Plugin]`` of instances instead
+  of a ``dict[str, type]``. CLI ``--plugin <key>`` lookup is unchanged.
+- **Framework plugins are factory functions.** ``FastAPIPlugin``,
+  ``FastMCPPlugin``, ``FlaskPlugin``, ``TyperPlugin``,
+  ``CycloptsPlugin`` are replaced by lowercase factory functions
+  (e.g. :func:`~dead_cst.plugins.fastapi_plugin`). Plugins with custom
+  ``run()`` logic or per-instance configuration remain classes.
+- **Plugin query API.** ``ctx.find_*`` helpers replaced by a chainable
+  builder (``query(ctx).decorators().where_module(...).collect()``) with
+  Rust-backed cross-file lookups, subclass closures, and
+  decorator/call matching.
+- **Reachability queries.** ``ctx.reachable()`` / ``ctx.descendants()`` /
+  ``ctx.ancestors()`` delegate to a Rust BFS in a single FFI call
+  instead of per-node Python ↔ networkx round-trips.
+
+### Added
+- **Dead-branch detection.** Edges from statically-dead code regions
+  (``if False:``, post-``return``) carry :attr:`EdgeFlags.DEAD_BRANCH`,
+  identified via ty's reachability constraints instead of a custom
+  ``TruthinessResolver``.
+- **Dynamic-import edges.** ``__import__()`` and
+  ``importlib.import_module()`` calls with string-literal args emit
+  :attr:`EdgeFlags.DYNAMIC_IMPORT` edges.
+- **Stub-file support.** ``.pyi`` stubs are ingested for
+  compiled-extension layouts (``_native.so`` + ``_native.pyi`` with no
+  ``.py`` twin).
+- ``ConstructionRef`` gained ``args`` and ``kwargs`` fields (mirroring
+  ``CallRef`` and ``DecoratorRef``).
+
+### Removed
+- The libcst graph builder, ``TruthinessResolver``, SQLite per-file
+  cache, and ``networkx`` dependency.
+
 ## [0.10.0] - 2026-05-15
 
 ### Added
+- :class:`dead_cst.plugins.DynamicImportFallbackPlugin` — a plugin
+  that reads :attr:`EdgeFlags.DYNAMIC_IMPORT` edges and fans each
+  flagged ``src -> module`` edge out to the module's exports. Gives
+  projects that prefer the conservative "import-by-name keeps every
+  export alive" semantic an opt-in path without baking the fan-out
+  into the visitor — pass ``DynamicImportFallbackPlugin()`` to
+  :class:`Analysis` or to ``native.ProjectContext.add_plugin`` to
+  enable. Six options spanning the three intended rollout stages:
+
+  * **Catch-all shape** (stage 1): ``include_underscore=False``
+    (default) skips ``_private`` names matching
+    ``from X import *`` runtime semantics, and
+    ``respect_dunder_all=True`` (default) uses the target module's
+    ``__all__`` list as the export set when present.
+  * **Targeted excludes** (stage 2, after focused per-feature
+    plugins land): ``exclude_sources`` (path globs matched against
+    each call site's source path) and ``exclude_targets`` (fnmatch
+    patterns matched against the target module fqname) opt specific
+    files / module trees *out* of the catch-all so the focused
+    plugin owns them.
+  * **Targeted includes** (stage 3, when the exclude list gets
+    unwieldy): ``include_sources`` / ``include_targets`` flip the
+    semantics — when non-empty, only matching call sites
+    participate. Composes with the exclude lists as
+    ``include AND NOT exclude``.
+
+  The plugin implements both the libcst-side ``finalize`` and the
+  rust-backend ``run(ctx)`` protocols. On the libcst pipeline (which
+  inlines fan-out at visit time without setting the
+  ``DYNAMIC_IMPORT`` flag) the plugin sees no flagged edges and is a
+  no-op. On the rust backend it walks ``ctx.edges()`` and uses the
+  new :meth:`ProjectContext.find_module_top_level_decls` /
+  :meth:`find_module_dunder_all_exports` queries to enumerate
+  exports.
+
 - ``from <pkg> import <name>`` now resolves through ``from <other> import *``
   re-exports. ``build_contribution`` runs a second pass over each
   package after its per-file payloads are applied: for every
@@ -44,6 +189,29 @@ two versions.
   this contract is upheld regardless of how ``refresh`` is invoked.
 
 ### Changed
+- Rust backend: ``resolve_from_imported`` now matches CPython's
+  ``_handle_fromlist`` semantics — namespace lookup first, submodule
+  fallback only when nothing's bound. Previously the submodule was
+  tried first, which gave the wrong answer for ``from p import q``
+  when ``p/__init__.py`` bound ``q`` (e.g. ``q = 42``) *and* a
+  ``p/q.py`` file also existed; CPython binds ``q`` to the int and
+  the submodule never runs, but the old order linked the consumer to
+  the submodule and would have kept dead code in ``p/q.py`` alive.
+  No test in the suite exercises that exact shape today, so the
+  pytest delta is zero failures either way; the change is for
+  correctness on real-world ``__init__.py`` aliasing patterns. Perf
+  is a wash — the work shifts between Phase 2 and Phase 3 but Salsa
+  caching keeps the total cost identical (≈ ±5 ms on flux0 workspace
+  cold, inside measurement noise).
+
+- ``tests/prototype/_bridge.materialize`` (and the inlined copy in
+  ``scripts/profile_backends.py``) interns ``pathlib.Path`` objects per
+  build and reuses the ``NodeFlags(0)`` / ``EdgeFlags(0)`` singletons
+  instead of constructing fresh enum instances per node/edge. Halves
+  the warm-path bridge cost (``dead_cst`` self: 15.0 ms → 7.5 ms;
+  flux0 server: 2.2 ms → 1.0 ms), which is the dominant cost on warm
+  rust runs now that ty's Salsa db keeps ``Project.build()`` at 10 ms.
+
 - Swapped the graph backend from `networkx.MultiDiGraph` to a minimal
   `rustworkx.PyDiGraph` wrapper (`dead_cst._graphstore.SymbolGraph`).
   The wrapper exposes the `SymbolNode <-> int` index bookkeeping

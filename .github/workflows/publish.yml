@@ -11,42 +11,105 @@ permissions:
   contents: read
 
 jobs:
-  build:
+  # One platform-specific wheel per target. Maturin handles the
+  # cdylib build (abi3-py311, so a single wheel covers every Python
+  # >=3.11) and produces a manylinux/macos/windows wheel with the
+  # ``.so`` / ``.pyd`` embedded inside ``python/dead_cst/``.
+  # The package version is read straight from ``Cargo.toml``; bump
+  # manually per release (pydantic-core style).
+  wheels:
+    name: Build wheel (${{ matrix.platform.target }})
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - { runner: ubuntu-latest,  target: x86_64-unknown-linux-gnu,  manylinux: "2_28" }
+          - { runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, manylinux: "2_28" }
+          - { runner: macos-13,       target: x86_64-apple-darwin,        manylinux: "auto" }
+          - { runner: macos-14,       target: aarch64-apple-darwin,       manylinux: "auto" }
+          - { runner: windows-latest, target: x86_64-pc-windows-msvc,     manylinux: "auto" }
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: "**/uv.lock"
+      - name: Stamp dev version
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: bash
+        run: sed -i.bak 's/^version = .*/version = "0.10.0.dev${{ github.run_number }}"/' Cargo.toml && rm Cargo.toml.bak
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.platform.target }}
+          manylinux: ${{ matrix.platform.manylinux }}
+          args: --release --out dist --interpreter 3.11
+          sccache: true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.platform.target }}
+          path: dist/
+
+  sdist:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
         with:
-          fetch-depth: 0
+          submodules: recursive
       - uses: astral-sh/setup-uv@v7
-      - run: uv build
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: "**/uv.lock"
+      - name: Stamp dev version
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: sed -i.bak 's/^version = .*/version = "0.10.0.dev${{ github.run_number }}"/' Cargo.toml && rm Cargo.toml.bak
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
       - uses: actions/upload-artifact@v4
         with:
-          name: dist
+          name: sdist
           path: dist/
 
   publish-testpypi:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: build
+    needs: [wheels, sdist]
     runs-on: ubuntu-latest
     environment: testpypi
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: dist
+          pattern: "wheel-*"
+          merge-multiple: true
+          path: dist/
+      - uses: actions/download-artifact@v4
+        with:
+          name: sdist
           path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           repository-url: https://test.pypi.org/legacy/
+          skip-existing: true
 
   publish-pypi:
     if: github.event_name == 'release'
-    needs: build
+    needs: [wheels, sdist]
     runs-on: ubuntu-latest
     environment: pypi
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: dist
+          pattern: "wheel-*"
+          merge-multiple: true
+          path: dist/
+      - uses: actions/download-artifact@v4
+        with:
+          name: sdist
           path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1
 
@@ -59,7 +122,12 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: dist
+          pattern: "wheel-*"
+          merge-multiple: true
+          path: dist/
+      - uses: actions/download-artifact@v4
+        with:
+          name: sdist
           path: dist/
       - uses: softprops/action-gh-release@v2
         with:

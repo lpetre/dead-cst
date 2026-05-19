@@ -5,8 +5,8 @@ from __future__ import annotations
 from dead_cst.plugins import MainBlockPlugin
 
 
-def test_main_block_plugin_marks_module_entrypoint(make_analysis, write_files, reachable_fqnames):
-    write_files(
+def test_main_block_plugin_marks_module_entrypoint(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "pkg/__init__.py": "",
             "pkg/script.py": """
@@ -16,9 +16,9 @@ def test_main_block_plugin_marks_module_entrypoint(make_analysis, write_files, r
                 main()
             """,
             "pkg/other.py": "def g(): pass",
-        }
+        },
+        [MainBlockPlugin()],
     )
-    graph = make_analysis(plugins=[MainBlockPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "pkg.script" in reached
     assert "pkg.script.main" in reached
@@ -28,13 +28,13 @@ def test_main_block_plugin_marks_module_entrypoint(make_analysis, write_files, r
     assert "pkg.other" not in reached
 
 
-def test_main_block_keeps_block_decls_alive(make_analysis, write_files, reachable_fqnames):
+def test_main_block_keeps_block_decls_alive(build_plugin_graph, reachable_fqnames):
     # ``app`` is bound inside the block but never read elsewhere in the
     # module, so the only edges pointing in are the visitor's
     # ``app -> Foo`` / ``app -> main`` from the assignment frame. Without
     # a direct ``synth -> app`` edge from the plugin, the chain is
     # unreachable and ``Foo`` / ``main`` look dead.
-    write_files(
+    graph = build_plugin_graph(
         {
             "pkg/__init__.py": "",
             "pkg/script.py": """
@@ -49,19 +49,19 @@ def test_main_block_keeps_block_decls_alive(make_analysis, write_files, reachabl
             if __name__ == "__main__":
                 app = Foo(fn=main).cli()
             """,
-        }
+        },
+        [MainBlockPlugin()],
     )
-    graph = make_analysis(plugins=[MainBlockPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert {"pkg.script", "pkg.script.app", "pkg.script.Foo", "pkg.script.main"} <= reached
     assert "pkg.script.Unused" not in reached
 
 
-def test_main_block_keeps_nested_block_decls_alive(make_analysis, write_files, reachable_fqnames):
+def test_main_block_keeps_nested_block_decls_alive(build_plugin_graph, reachable_fqnames):
     # Nested compound statements inside the main block still hold
     # top-level decls (the visitor doesn't push a frame for if/for/with),
     # so position-based filtering catches them too.
-    write_files(
+    graph = build_plugin_graph(
         {
             "pkg/__init__.py": "",
             "pkg/script.py": """
@@ -72,16 +72,16 @@ def test_main_block_keeps_nested_block_decls_alive(make_analysis, write_files, r
                 if True:
                     app = Foo()
             """,
-        }
+        },
+        [MainBlockPlugin()],
     )
-    graph = make_analysis(plugins=[MainBlockPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert {"pkg.script.app", "pkg.script.Foo"} <= reached
     assert "pkg.script.Unused" not in reached
 
 
-def test_main_block_reversed_comparison(make_analysis, write_files, reachable_fqnames):
-    write_files(
+def test_main_block_reversed_comparison(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "pkg/__init__.py": "",
             "pkg/script.py": """
@@ -89,7 +89,7 @@ def test_main_block_reversed_comparison(make_analysis, write_files, reachable_fq
             if "__main__" == __name__:
                 main()
             """,
-        }
+        },
+        [MainBlockPlugin()],
     )
-    graph = make_analysis(plugins=[MainBlockPlugin()]).materialize_all()
     assert "pkg.script" in reachable_fqnames(graph)

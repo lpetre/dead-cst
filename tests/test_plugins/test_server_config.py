@@ -6,8 +6,8 @@ from dead_cst.graph import NodeFlags
 from dead_cst.plugins import ServerConfigPlugin
 
 
-def test_gunicorn_conf_module_stays_alive(make_analysis, write_files, reachable_fqnames):
-    write_files(
+def test_gunicorn_conf_module_stays_alive(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "pkg/__init__.py": "",
             "gunicorn.conf.py": """
@@ -20,9 +20,9 @@ def test_gunicorn_conf_module_stays_alive(make_analysis, write_files, reachable_
             def post_fork(server, worker):
                 pass
             """,
-        }
+        },
+        [ServerConfigPlugin()],
     )
-    graph = make_analysis(plugins=[ServerConfigPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "gunicorn.conf" in reached
     assert "gunicorn.conf.bind" in reached
@@ -31,8 +31,8 @@ def test_gunicorn_conf_module_stays_alive(make_analysis, write_files, reachable_
     assert "gunicorn.conf.post_fork" in reached
 
 
-def test_hypercorn_conf_module_stays_alive(make_analysis, write_files, reachable_fqnames):
-    write_files(
+def test_hypercorn_conf_module_stays_alive(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "pkg/__init__.py": "",
             "hypercorn.conf.py": """
@@ -41,34 +41,34 @@ def test_hypercorn_conf_module_stays_alive(make_analysis, write_files, reachable
             async def shutdown_trigger():
                 pass
             """,
-        }
+        },
+        [ServerConfigPlugin()],
     )
-    graph = make_analysis(plugins=[ServerConfigPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "hypercorn.conf" in reached
     assert "hypercorn.conf.bind" in reached
     assert "hypercorn.conf.shutdown_trigger" in reached
 
 
-def test_underscore_naming_variants_match(make_analysis, write_files, reachable_fqnames):
-    write_files(
+def test_underscore_naming_variants_match(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "pkg/__init__.py": "",
             "gunicorn_conf.py": "workers = 4",
             "hypercorn_conf.py": "bind = ['0.0.0.0:8000']",
-        }
+        },
+        [ServerConfigPlugin()],
     )
-    graph = make_analysis(plugins=[ServerConfigPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "gunicorn_conf.workers" in reached
     assert "hypercorn_conf.bind" in reached
 
 
-def test_imports_used_only_in_config_stay_alive(make_analysis, write_files, reachable_fqnames):
+def test_imports_used_only_in_config_stay_alive(build_plugin_graph, reachable_fqnames):
     # ``helpers.read_env`` is referenced only from ``gunicorn.conf.py``;
     # without the plugin marking the config module's imports as alive,
     # the cross-file edge would dead-end at an unreachable import node.
-    write_files(
+    graph = build_plugin_graph(
         {
             "pkg/__init__.py": "",
             "pkg/helpers.py": """
@@ -80,25 +80,25 @@ def test_imports_used_only_in_config_stay_alive(make_analysis, write_files, reac
 
             workers = read_env("WORKERS", 4)
             """,
-        }
+        },
+        [ServerConfigPlugin()],
     )
-    graph = make_analysis(plugins=[ServerConfigPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "pkg.helpers.read_env" in reached
 
 
-def test_unrelated_modules_are_not_affected(make_analysis, write_files, reachable_fqnames):
+def test_unrelated_modules_are_not_affected(build_plugin_graph, reachable_fqnames):
     # A file whose stem happens to be ``gunicorn`` but isn't the config
     # module shouldn't get any free entrypoints.
-    write_files(
+    graph = build_plugin_graph(
         {
             "pkg/__init__.py": "",
             "pkg/gunicorn.py": """
             def helper(): pass
             """,
-        }
+        },
+        [ServerConfigPlugin()],
     )
-    graph = make_analysis(plugins=[ServerConfigPlugin()]).materialize_all()
     assert "pkg.gunicorn.helper" not in reachable_fqnames(graph)
 
 
@@ -126,10 +126,10 @@ def test_filenames_override(make_analysis, write_files, reachable_fqnames):
     assert "deploy.prod_gunicorn.workers" in reached_override
 
 
-def test_classes_in_config_stay_alive(make_analysis, write_files, reachable_fqnames):
+def test_classes_in_config_stay_alive(build_plugin_graph, reachable_fqnames):
     # A common gunicorn pattern: define a custom logging class inline
     # and reference it via ``logger_class``.
-    write_files(
+    graph = build_plugin_graph(
         {
             "pkg/__init__.py": "",
             "gunicorn.conf.py": """
@@ -138,9 +138,9 @@ def test_classes_in_config_stay_alive(make_analysis, write_files, reachable_fqna
 
             logger_class = CustomLogger
             """,
-        }
+        },
+        [ServerConfigPlugin()],
     )
-    graph = make_analysis(plugins=[ServerConfigPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "gunicorn.conf.CustomLogger" in reached
     assert "gunicorn.conf.logger_class" in reached
@@ -153,18 +153,18 @@ def test_server_config_plugin_loads_via_load_plugin():
     assert isinstance(plugin, ServerConfigPlugin)
 
 
-def test_seeds_are_not_tagged_testcase(make_analysis, write_files):
+def test_seeds_are_not_tagged_testcase(build_plugin_graph):
     # Server-config entrypoints are production code, not tests -- they
     # should seed reachability but not get filtered by
     # ``kept_alive_by_flags_only(NodeFlags.TESTCASE)``.
-    write_files(
+    graph = build_plugin_graph(
         {
             "pkg/__init__.py": "",
             "gunicorn.conf.py": "workers = 4",
-        }
+        },
+        [ServerConfigPlugin()],
     )
-    graph = make_analysis(plugins=[ServerConfigPlugin()]).materialize_all()
-    seeds = [n for n in graph.nodes if n.flags & NodeFlags.ENTRYPOINT]
+    seeds = [n for n in graph.nodes() if n.flags & NodeFlags.ENTRYPOINT]
     server_seeds = [s for s in seeds if s.fqname.startswith("<server-config>:")]
     assert server_seeds
     for seed in server_seeds:

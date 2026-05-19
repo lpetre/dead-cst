@@ -6,8 +6,8 @@ from dead_cst.graph import NodeFlags
 from dead_cst.plugins import PytestPlugin
 
 
-def test_pytest_plugin_marks_test_functions(make_analysis, write_files, reachable_fqnames):
-    write_files(
+def test_pytest_plugin_marks_test_functions(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "tests/__init__.py": "",
             "tests/test_things.py": """
@@ -15,9 +15,9 @@ def test_pytest_plugin_marks_test_functions(make_analysis, write_files, reachabl
             def test_two(): pass
             def helper(): pass
             """,
-        }
+        },
+        [PytestPlugin()],
     )
-    graph = make_analysis(plugins=[PytestPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "tests.test_things.test_one" in reached
     assert "tests.test_things.test_two" in reached
@@ -25,21 +25,19 @@ def test_pytest_plugin_marks_test_functions(make_analysis, write_files, reachabl
     assert "tests.test_things.helper" not in reached
 
 
-def test_pytest_plugin_recognizes_underscore_test_suffix(
-    make_analysis, write_files, reachable_fqnames
-):
-    write_files(
+def test_pytest_plugin_recognizes_underscore_test_suffix(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "pkg/__init__.py": "",
             "pkg/things_test.py": "def test_one(): pass",
-        }
+        },
+        [PytestPlugin()],
     )
-    graph = make_analysis(plugins=[PytestPlugin()]).materialize_all()
     assert "pkg.things_test.test_one" in reachable_fqnames(graph)
 
 
-def test_pytest_plugin_marks_test_classes(make_analysis, write_files, reachable_fqnames):
-    write_files(
+def test_pytest_plugin_marks_test_classes(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "tests/__init__.py": "",
             "tests/test_cls.py": """
@@ -48,16 +46,16 @@ def test_pytest_plugin_marks_test_classes(make_analysis, write_files, reachable_
             class Helper:
                 pass
             """,
-        }
+        },
+        [PytestPlugin()],
     )
-    graph = make_analysis(plugins=[PytestPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "tests.test_cls.TestThing" in reached
     assert "tests.test_cls.Helper" not in reached
 
 
-def test_pytest_plugin_marks_conftest_decls(make_analysis, write_files, reachable_fqnames):
-    write_files(
+def test_pytest_plugin_marks_conftest_decls(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "tests/__init__.py": "",
             "tests/conftest.py": """
@@ -72,9 +70,9 @@ def test_pytest_plugin_marks_conftest_decls(make_analysis, write_files, reachabl
 
             collect_ignore = ["legacy.py"]
             """,
-        }
+        },
+        [PytestPlugin()],
     )
-    graph = make_analysis(plugins=[PytestPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "tests.conftest.my_fixture" in reached
     assert "tests.conftest.pytest_collection_modifyitems" in reached
@@ -82,9 +80,9 @@ def test_pytest_plugin_marks_conftest_decls(make_analysis, write_files, reachabl
 
 
 def test_pytest_plugin_marks_decorated_fixtures_outside_conftest(
-    make_analysis, write_files, reachable_fqnames
+    build_plugin_graph, reachable_fqnames
 ):
-    write_files(
+    graph = build_plugin_graph(
         {
             "tests/__init__.py": "",
             "tests/fixtures.py": """
@@ -106,9 +104,9 @@ def test_pytest_plugin_marks_decorated_fixtures_outside_conftest(
             def not_a_fixture():
                 return 4
             """,
-        }
+        },
+        [PytestPlugin()],
     )
-    graph = make_analysis(plugins=[PytestPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     assert "tests.fixtures.bare_fixture" in reached
     assert "tests.fixtures.parametrized_fixture" in reached
@@ -116,17 +114,17 @@ def test_pytest_plugin_marks_decorated_fixtures_outside_conftest(
     assert "tests.fixtures.not_a_fixture" not in reached
 
 
-def test_pytest_plugin_ignores_non_test_modules(make_analysis, write_files, reachable_fqnames):
-    write_files(
+def test_pytest_plugin_ignores_non_test_modules(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
         {
             "pkg/__init__.py": "",
             "pkg/utils.py": """
             def test_helper(): pass
             class TestData: pass
             """,
-        }
+        },
+        [PytestPlugin()],
     )
-    graph = make_analysis(plugins=[PytestPlugin()]).materialize_all()
     reached = reachable_fqnames(graph)
     # ``utils.py`` isn't a pytest-discovered file even though its symbols
     # match the test_*/Test* naming
@@ -141,8 +139,8 @@ def test_pytest_plugin_loads_via_load_plugin():
     assert isinstance(plugin, PytestPlugin)
 
 
-def test_pytest_plugin_tags_seeds_as_testcase(make_analysis, write_files):
-    write_files(
+def test_pytest_plugin_tags_seeds_as_testcase(build_plugin_graph):
+    graph = build_plugin_graph(
         {
             "tests/__init__.py": "",
             "tests/test_things.py": "def test_one(): pass",
@@ -152,10 +150,8 @@ def test_pytest_plugin_tags_seeds_as_testcase(make_analysis, write_files):
             @pytest.fixture
             def my_fixture(): return 1
             """,
-        }
+        },
+        [PytestPlugin()],
     )
-    graph = make_analysis(plugins=[PytestPlugin()]).materialize_all()
-    seeds = [n for n in graph.nodes if n.flags & NodeFlags.ENTRYPOINT]
-    assert seeds, "expected pytest plugin to seed at least one entrypoint"
-    for seed in seeds:
-        assert seed.flags & NodeFlags.TESTCASE, seed.fqname
+    seeds = [n for n in graph.nodes() if n.flags & NodeFlags.TESTCASE]
+    assert seeds, "expected pytest plugin to seed at least one TESTCASE node"

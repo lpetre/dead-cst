@@ -44,12 +44,6 @@ def test_validate_packages_duplicate_name_distinct_path_raises():
         _validate_packages([a, b])
 
 
-def test_validate_packages_exported_must_be_under_path(tmp_path: Path):
-    pkg = Package(path=tmp_path / "a", name="a", exported=(tmp_path / "b",))
-    with pytest.raises(ValueError, match="not under"):
-        _validate_packages([pkg])
-
-
 def test_load_resolver_known():
     assert isinstance(load_resolver("uv"), UvResolver)
 

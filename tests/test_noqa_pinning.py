@@ -1,6 +1,7 @@
 """Imports flagged with a ruff/pyflakes ``# noqa`` directive that silences
-F401 are pinned alive (treated as :data:`NodeFlags.ENTRYPOINT`), matching
-the semantics ruff itself uses for the unused-import rule.
+F401 are pinned alive (flagged with :data:`NodeFlags.NOQA`, which is one
+of the keepalive bits in :data:`KEEPALIVE_DEFAULT`), matching the
+semantics ruff itself uses for the unused-import rule.
 
 Both per-line directives (``# noqa``, ``# noqa: F401``, multi-rule
 ``# noqa: E501, F401``, case-insensitive ``noqa`` keyword) and file-level
@@ -17,11 +18,11 @@ from dead_cst import NodeFlags
 
 
 def _import_nodes(graph):
-    return [n for n in graph.nodes if n.type == "import"]
+    return [n for n in graph.nodes() if n.kind == "import"]
 
 
 def _entrypoint_imports(graph) -> set[str]:
-    return {n.fqname for n in graph.nodes if n.type == "import" and n.flags & NodeFlags.ENTRYPOINT}
+    return {n.fqname for n in graph.nodes() if n.kind == "import" and n.flags & NodeFlags.NOQA}
 
 
 @pytest.mark.parametrize(
@@ -142,7 +143,7 @@ def test_unpinned_import_in_dead_module_stays_dead(make_analysis, write_files):
     assert "m.os" in dead_fqs
 
 
-def test_pinned_node_carries_entrypoint_flag(build_decl_graph):
+def test_pinned_node_carries_noqa_flag(build_decl_graph):
     graph = build_decl_graph({"m.py": "import os  # noqa: F401\n"})
     pinned = [n for n in _import_nodes(graph) if n.fqname == "m.os"]
-    assert pinned and pinned[0].flags & NodeFlags.ENTRYPOINT
+    assert pinned and pinned[0].flags & NodeFlags.NOQA

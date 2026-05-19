@@ -36,3 +36,16 @@ repos:
         types_or: [python, pyi]
         pass_filenames: false
         require_serial: true
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt --
+        language: system
+        files: ^src/.*\.rs$
+        pass_filenames: false
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: cargo clippy --all-targets --locked -- -D warnings
+        language: system
+        files: ^(src/.*\.rs|Cargo\.(toml|lock))$
+        pass_filenames: false
+        require_serial: true

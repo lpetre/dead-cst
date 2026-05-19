@@ -19,7 +19,6 @@ import textwrap
 import pytest
 from libcst.metadata import FullRepoManager, MetadataWrapper
 
-from dead_cst.analyze import _find_reachable as find_reachable
 from dead_cst.codemod import RemoveDeadSymbols, generate_patch, remove_code
 from dead_cst._fqn import FixedFullyQualifiedNameProvider
 
@@ -48,8 +47,8 @@ def apply_transformer(tmp_path, make_analysis):
     def _apply(src: str, dead_fqnames: set[str]) -> str:
         path = tmp_path / "mod.py"
         path.write_text(_normalise(src))
-        graph = make_analysis().materialize_all()
-        dead_decls = {(n.fqname, n.position) for n in graph.nodes if n.fqname in dead_fqnames}
+        ctx = make_analysis().materialize_all()
+        dead_decls = {(n.fqname, n.start_line) for n in ctx.nodes() if n.fqname in dead_fqnames}
         mgr = FullRepoManager(str(tmp_path), [str(path)], {FixedFullyQualifiedNameProvider})
         wrapper: MetadataWrapper = mgr.get_metadata_wrapper_for_path(str(path))
         return wrapper.visit(RemoveDeadSymbols(dead_decls)).code
@@ -68,9 +67,9 @@ def apply_transformer_at_lines(tmp_path, make_analysis):
     def _apply(src: str, dead: set[tuple[str, int]]) -> str:
         path = tmp_path / "mod.py"
         path.write_text(_normalise(src))
-        graph = make_analysis().materialize_all()
+        ctx = make_analysis().materialize_all()
         dead_decls = {
-            (n.fqname, n.position) for n in graph.nodes if (n.fqname, n.position.start.line) in dead
+            (n.fqname, n.start_line) for n in ctx.nodes() if (n.fqname, n.start_line) in dead
         }
         mgr = FullRepoManager(str(tmp_path), [str(path)], {FixedFullyQualifiedNameProvider})
         wrapper: MetadataWrapper = mgr.get_metadata_wrapper_for_path(str(path))
@@ -80,33 +79,36 @@ def apply_transformer_at_lines(tmp_path, make_analysis):
 
 
 @pytest.fixture
-def build_unreachable_graph(tmp_path, make_analysis):
-    """Materialise ``files`` under ``tmp_path`` and return the unreachable subgraph.
+def build_unreachable_nodes(tmp_path, make_analysis):
+    """Materialise ``files`` under ``tmp_path`` and return the list of dead nodes.
 
     ``entrypoints`` is the set of FQNs to seed reachability with. Used
     by both ``run_remove_code`` and the ``generate_patch`` tests below;
     tests that need the full graph can call this directly.
     """
 
-    def _build(files: dict[str, str], entrypoints: set[str]):
+    def _build(files: dict[str, str], entrypoints: set[str]) -> list:
         for name, src in files.items():
             path = tmp_path / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(_normalise(src))
-        graph = make_analysis().materialize_all()
-        seeds = [graph.index(n) for n in graph.nodes if n.fqname in entrypoints]
-        reachable = find_reachable(graph, seeds)
-        return graph.subgraph([n for n in graph.nodes if n not in reachable])
+        ctx = make_analysis().materialize_all()
+        seeds = [n for n in ctx.nodes() if n.fqname in entrypoints]
+        reachable: set = set()
+        for seed in seeds:
+            reachable.update(ctx.descendants(seed))
+            reachable.add(seed)
+        return [n for n in ctx.nodes() if n not in reachable]
 
     return _build
 
 
 @pytest.fixture
-def run_remove_code(tmp_path, build_unreachable_graph):
+def run_remove_code(tmp_path, build_unreachable_nodes):
     """Materialise ``files`` under ``tmp_path`` and run ``remove_code``."""
 
     def _run(files: dict[str, str], entrypoints: set[str]) -> None:
-        remove_code(build_unreachable_graph(files, entrypoints), tmp_path)
+        remove_code(build_unreachable_nodes(files, entrypoints), tmp_path)
 
     return _run
 
@@ -745,8 +747,8 @@ def test_remove_code_unlinks_dead_module_files(
 # ---------------------------------------------------------------------------
 
 
-def test_generate_patch_emits_git_diff_for_dead_function(build_unreachable_graph, tmp_path):
-    unreachable = build_unreachable_graph(
+def test_generate_patch_emits_git_diff_for_dead_function(build_unreachable_nodes, tmp_path):
+    unreachable = build_unreachable_nodes(
         {
             "mod.py": """
             def used():
@@ -770,9 +772,9 @@ def test_generate_patch_emits_git_diff_for_dead_function(build_unreachable_graph
 
 
 def test_generate_patch_emits_deleted_file_header_for_dead_module(
-    build_unreachable_graph, tmp_path
+    build_unreachable_nodes, tmp_path
 ):
-    unreachable = build_unreachable_graph(
+    unreachable = build_unreachable_nodes(
         {
             "kept.py": "def main(): pass\n",
             "dropped.py": "def helper(): pass\n",
@@ -787,9 +789,9 @@ def test_generate_patch_emits_deleted_file_header_for_dead_module(
     assert (tmp_path / "dropped.py").exists()
 
 
-def test_generate_patch_per_subgraph_slice_isolates_decls(build_unreachable_graph, tmp_path):
+def test_generate_patch_per_subgraph_slice_isolates_decls(build_unreachable_nodes, tmp_path):
     """Caller-supplied subgraphs (e.g. one SCC at a time) limit the diff."""
-    unreachable = build_unreachable_graph(
+    unreachable = build_unreachable_nodes(
         {
             "mod.py": """
             def used():
@@ -806,7 +808,7 @@ def test_generate_patch_per_subgraph_slice_isolates_decls(build_unreachable_grap
         },
         {"mod.used"},
     )
-    one_only = unreachable.subgraph([n for n in unreachable.nodes if n.fqname == "mod.dead_one"])
+    one_only = [n for n in unreachable if n.fqname == "mod.dead_one"]
     patch = generate_patch(one_only, tmp_path)
 
     assert "-def dead_one():" in patch

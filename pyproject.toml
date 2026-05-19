@@ -1,14 +1,14 @@
 [project]
 name = "dead-cst"
 dynamic = ["version"]
-description = "Python dead code analysis using libcst"
+description = "Python dead code analysis backed by a Rust extension (ty + ruff)"
 readme = "README.md"
 license = "MIT"
 authors = [
     { name = "Luke Petre", email = "lpetre@gmail.com" }
 ]
 requires-python = ">=3.11"
-keywords = ["dead-code", "libcst", "static-analysis", "linting"]
+keywords = ["dead-code", "static-analysis", "linting"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -22,7 +22,6 @@ classifiers = [
 ]
 dependencies = [
     "libcst>=1.8.6",
-    "rustworkx>=0.15",
     "tqdm>=4.66",
     "typer>=0.12",
 ]
@@ -37,20 +36,25 @@ Changelog = "https://github.com/lpetre/dead-cst/blob/main/CHANGELOG.md"
 dead-cst = "dead_cst.cli:main_cli"
 
 [build-system]
-requires = ["hatchling", "hatch-vcs"]
-build-backend = "hatchling.build"
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
 
-[tool.hatch.version]
-source = "vcs"
-# PyPI and TestPyPI reject PEP 440 local version identifiers (+gSHA),
-# which hatch-vcs adds to between-tag builds by default. hatch-vcs passes
-# raw-options as kwargs to setuptools_scm.get_version, so this is the only
-# place the scheme can be configured — SETUPTOOLS_SCM_OVERRIDES_FOR_* is
-# ignored because that env var is only read by Configuration.from_file().
-raw-options = { local_scheme = "no-local-version" }
-
-[tool.hatch.build.hooks.vcs]
-version-file = "dead_cst/_version.py"
+[tool.maturin]
+# Mixed Rust/Python layout per the maturin user guide and pydantic-core's
+# template: ``Cargo.toml`` + ``src/`` at the repo root, Python sources under
+# ``python/dead_cst/``. The Rust ``cdylib`` is compiled and embedded inside
+# the ``dead_cst`` package as ``dead_cst/_native.*.so`` — one wheel ships
+# both halves.
+module-name = "dead_cst._native"
+python-source = "python"
+# Enables the ``extension-module`` feature defined in ``Cargo.toml``,
+# which forwards to ``pyo3/extension-module`` (skip libpython linkage --
+# Python loads the cdylib at runtime). Tests turn this off via
+# ``cargo test --no-default-features``.
+features = ["extension-module"]
+# Type stub + ``py.typed`` marker that ship alongside the compiled extension.
+# Other ``.py`` sources under ``python/dead_cst/`` are picked up automatically.
+include = ["python/dead_cst/_native.pyi", "python/dead_cst/py.typed"]
 
 [dependency-groups]
 dev = [
@@ -70,6 +74,7 @@ dev = [
     "fastapi>=0.110",
     "fastmcp>=2.0",
     "flask>=3.0",
+    "discord-py>=2.7.1",
 ]
 
 [tool.pytest.ini_options]
@@ -89,8 +94,7 @@ markers = [
 
 [tool.coverage.run]
 branch = true
-source = ["dead_cst"]
-omit = ["dead_cst/_version.py"]
+source = ["python/dead_cst"]
 # ProcessPoolExecutor workers (used by ``build_symbol_graph(workers=...)``)
 # must run with the multiprocessing tracer or coverage's import-time
 # instrumentation drifts the class identity of ``_CallItem`` and causes
@@ -119,7 +123,10 @@ known-first-party = ["dead_cst"]
 
 [tool.ty.src]
 # Type-check only the package itself. Tests, examples, and the workspace
-# fixtures intentionally exercise untyped LibCST internals and the
+# fixtures intentionally exercise untyped third-party internals and the
 # unresolved-import case the analyzer is meant to detect, so they aren't
 # meaningful targets for ty.
-include = ["dead_cst"]
+include = ["python/dead_cst"]
+# The rust extension is shipped as ``python/dead_cst/_native.pyi`` (peer to
+# the compiled ``.so``); ty picks it up via the package layout without any
+# extra-paths shim.
