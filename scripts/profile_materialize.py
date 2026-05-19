@@ -82,7 +82,7 @@ def _make_analysis(
         specs.append(f"base_{p}:base_{p - 1}")
     plugins: list = []
     if with_plugins:
-        plugins = [cls() for name, cls in BUILTIN_PLUGINS.items() if name != "explicit_entrypoint"]
+        plugins = [p for p in BUILTIN_PLUGINS if not isinstance(p, ExplicitEntrypointPlugin)]
         plugins.append(ExplicitEntrypointPlugin(specs=["base_0.pkg_0"]))
     return Analysis(
         project_root=root,
@@ -129,7 +129,7 @@ def main() -> None:
 
         with_plugins = not args.no_plugins
         plugin_count = (
-            len([c for n, c in BUILTIN_PLUGINS.items() if n != "explicit_entrypoint"]) + 1
+            len([p for p in BUILTIN_PLUGINS if not isinstance(p, ExplicitEntrypointPlugin)]) + 1
         )
         n_files = args.packages * (args.files + 1)
         print(f"workspace: {args.packages} packages × {args.files + 1} files = {n_files} files")

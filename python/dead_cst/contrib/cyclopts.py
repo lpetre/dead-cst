@@ -13,13 +13,10 @@ tracked on that call.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 from ..plugins.decl_shapes import DispatchAppPlugin
 
 
-@dataclass
-class CycloptsPlugin(DispatchAppPlugin):
+def cyclopts_plugin() -> DispatchAppPlugin:
     """Wire cyclopts command and default handlers through their app instance.
 
     Limitations: only top-level ``X = App(...)`` assignments with a
@@ -29,9 +26,9 @@ class CycloptsPlugin(DispatchAppPlugin):
     such as ``@app.meta.default`` are not recognized -- ``app.meta`` is
     not itself a tracked instance.
     """
-
-    name: str = "cyclopts"
-    version: int = 1778020575
-    app_classes: tuple[str, ...] = ("cyclopts.App",)
-    registration_decorators: frozenset[str] = frozenset({"command", "default"})
-    seed_as_entrypoint: bool = False
+    return DispatchAppPlugin(
+        marker_prefix="cyclopts",
+        app_classes=("cyclopts.App",),
+        registration_decorators=frozenset({"command", "default"}),
+        seed_as_entrypoint=False,
+    )

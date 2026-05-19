@@ -21,17 +21,17 @@ from importlib import import_module
 _EXPORTS: dict[str, str] = {
     "CeleryPlugin": ".celery",
     "ClickPlugin": ".click",
-    "CycloptsPlugin": ".cyclopts",
     "DiscordPyPlugin": ".discordpy",
-    "FastAPIPlugin": ".fastapi",
-    "FastMCPPlugin": ".fastmcp",
-    "FlaskPlugin": ".flask",
     "MockPatchPlugin": ".mock_patch",
     "PytestPlugin": ".pytest",
     "ServerConfigPlugin": ".server_config",
-    "TyperPlugin": ".typer",
     "UnittestPlugin": ".unittest",
     "UvResolver": ".uv",
+    "cyclopts_plugin": ".cyclopts",
+    "fastapi_plugin": ".fastapi",
+    "fastmcp_plugin": ".fastmcp",
+    "flask_plugin": ".flask",
+    "typer_plugin": ".typer",
 }
 
 __all__ = sorted(_EXPORTS)

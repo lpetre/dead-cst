@@ -13,18 +13,15 @@ ordinary reference tracked on that call.
 This routes ``why-alive`` chains through the Typer app variable users
 recognize ("alive because it's a command on ``app``") and lets a
 sub-typer that's never ``add_typer``'d surface as dead code, mirroring
-the behavior of :class:`FastAPIPlugin` for ``APIRouter``.
+the behavior of :func:`fastapi_plugin` for ``APIRouter``.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 from ..plugins.decl_shapes import DispatchAppPlugin
 
 
-@dataclass
-class TyperPlugin(DispatchAppPlugin):
+def typer_plugin() -> DispatchAppPlugin:
     """Wire Typer command and callback handlers through their app instance.
 
     Limitations: only top-level ``X = Typer(...)`` assignments with a
@@ -33,9 +30,9 @@ class TyperPlugin(DispatchAppPlugin):
     (``self.app = Typer()``) are not handled; users can still keep those
     alive with explicit ``-e`` entrypoints.
     """
-
-    name: str = "typer"
-    version: int = 1777760307
-    app_classes: tuple[str, ...] = ("typer.Typer",)
-    registration_decorators: frozenset[str] = frozenset({"command", "callback"})
-    seed_as_entrypoint: bool = False
+    return DispatchAppPlugin(
+        marker_prefix="typer",
+        app_classes=("typer.Typer",),
+        registration_decorators=frozenset({"command", "callback"}),
+        seed_as_entrypoint=False,
+    )

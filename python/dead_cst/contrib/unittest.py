@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Iterable
+from typing import Iterable
 
 from ..graph import NodeFlags
-
-if TYPE_CHECKING:
-    from dead_cst import _native as native
+from ..plugins._base import Plugin, native
 
 UNITTEST_PREFIX = "<unittest>:"
 
@@ -20,7 +18,7 @@ _UNITTEST_BASE_FQNAMES: frozenset[str] = frozenset(
 
 
 @dataclass
-class UnittestPlugin:
+class UnittestPlugin(Plugin):
     """Mark stdlib ``unittest`` discoveries as entrypoints.
 
     Walks ty's type hierarchy to find every transitive subclass of
@@ -29,12 +27,7 @@ class UnittestPlugin:
     that imports ``unittest`` as additional hooks.
     """
 
-    name: str = "unittest"
-    version: int = 1778248994
-
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
-        from dead_cst import _native as native
-
         importer_paths = {n.path for n in native.query(ctx).imports().of("unittest").collect()}
 
         decls_by_path: dict[str, list[native.NativeNode]] = {}

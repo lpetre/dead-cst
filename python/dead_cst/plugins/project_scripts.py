@@ -6,13 +6,11 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterable
+from typing import Iterable
 
 from ..graph import NodeFlags
 from ..resolvers import load_toml
-
-if TYPE_CHECKING:
-    from dead_cst import _native as native
+from ._base import Plugin, native
 
 PROJECT_SCRIPTS_PREFIX = "<project.scripts>:"
 
@@ -20,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class ProjectScriptsPlugin:
+class ProjectScriptsPlugin(Plugin):
     """Treat every ``[project.scripts]`` entry in ``pyproject.toml`` as an
     entrypoint.
 
@@ -28,13 +26,9 @@ class ProjectScriptsPlugin:
     the project graph and wire a synthetic entrypoint node to it.
     """
 
-    name: str = "project_scripts"
-    version: int = 1777760307
     pyproject_path: Path | None = None
 
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
-        from dead_cst import _native as native
-
         pyproject = self.pyproject_path or Path(ctx.project_root) / "pyproject.toml"
         data = load_toml(pyproject)
         if data is None:

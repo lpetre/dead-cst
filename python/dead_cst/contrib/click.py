@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Iterable
+from typing import Iterable
 
+from ..plugins._base import native
 from ..plugins.decl_shapes import DecoratedDeclPlugin
-
-if TYPE_CHECKING:
-    from dead_cst import _native as native
 
 _REGISTRATION_DECORATORS: frozenset[str] = frozenset({"command", "group", "result_callback"})
 _SUBGROUP_DECORATOR: frozenset[str] = frozenset({"group"})
@@ -24,15 +22,12 @@ class ClickPlugin(DecoratedDeclPlugin):
     through ``[project.scripts]`` / ``__main__`` / ``add_command``.
     """
 
-    name: str = "click"
-    version: int = 1777760307
+    marker_prefix: str = "click"
     decorator_module: str = "click"
     decorator_names: frozenset[str] = _GROUP_DECORATOR_NAMES
     constructor_names: frozenset[str] = _GROUP_CONSTRUCTOR_NAMES
 
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
-        from dead_cst import _native as native
-
         groups_by_owner: dict[tuple[str, str], list[native.NativeNode]] = {}
 
         def add_group(node: "native.NativeNode") -> None:

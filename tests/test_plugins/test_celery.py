@@ -494,4 +494,3 @@ def test_celery_plugin_loads_via_load_plugin():
 
     plugin = load_plugin("celery")
     assert isinstance(plugin, CeleryPlugin)
-    assert plugin.name == "celery"

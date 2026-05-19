@@ -47,8 +47,10 @@ def materialize_project(
     Builds a :class:`native.ProjectContext` rooted at ``project_root``,
     registers each plugin's ``run(ctx)`` callback, calls
     :meth:`materialize`, and bridges the resulting :class:`NativeGraph`
-    into a :class:`SymbolGraph`. Plugins that don't implement the
-    rust ``run(ctx)`` protocol are silently skipped.
+    into a :class:`SymbolGraph`. Every plugin must be an instance of
+    :class:`dead_cst.plugins.Plugin`; anything else raises
+    :class:`TypeError` so typos (``Pluign()``) surface immediately
+    instead of being silently dropped.
 
     ``show_progress=True`` makes the rust backend draw indicatif progress
     bars to stderr for each of the three per-file phases plus the
@@ -56,6 +58,7 @@ def materialize_project(
     indicatif auto-hides on non-TTY stderr.
     """
     from dead_cst import _native as native
+    from .plugins import Plugin
 
     ctx = native.ProjectContext(
         str(project_root),
@@ -63,8 +66,12 @@ def materialize_project(
         show_progress=show_progress,
     )
     for plugin in plugins:
-        if hasattr(plugin, "run"):
-            ctx.add_plugin(plugin)
+        if not isinstance(plugin, Plugin):
+            raise TypeError(
+                f"Expected a dead_cst.plugins.Plugin instance, got "
+                f"{type(plugin).__name__!r}: {plugin!r}"
+            )
+        ctx.add_plugin(plugin)
     return _bridge(ctx.materialize())
 
 

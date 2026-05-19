@@ -20,6 +20,7 @@ from .plugins import (
     EXTERNAL_PREFIXES,
     ExplicitEntrypointPlugin,
     ModuleDundersPlugin,
+    Plugin,
     load_plugin,
     simple_name,
 )
@@ -65,9 +66,9 @@ def build_plugins(
     *,
     entrypoints: list[str],
     plugin_names: list[str],
-) -> list[object]:
+) -> list[Plugin]:
     """Compose the plugin list from CLI flags."""
-    plugins: list[object] = []
+    plugins: list[Plugin] = []
     for name in plugin_names:
         plugins.append(load_plugin(name))
     plugins.append(ModuleDundersPlugin())

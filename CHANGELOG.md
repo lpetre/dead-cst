@@ -9,6 +9,45 @@ two versions.
 
 ## [Unreleased]
 
+### Changed (breaking)
+- **Plugin protocol.** Every plugin now subclasses
+  :class:`dead_cst.plugins.Plugin`. The backend uses
+  ``isinstance(plugin, Plugin)`` instead of a permissive
+  ``hasattr(plugin, "run")`` check, so passing in a non-plugin (a typo
+  like ``Pluign()``, a bare function) raises :class:`TypeError`
+  instead of being silently skipped.
+- **Dropped ``name`` and ``version`` fields** from every plugin. Neither
+  was read by reachability or the cache layer; the rust progress bar
+  now derives its label from ``type(plugin).__qualname__``. The three
+  declarative bases (:class:`DecoratedDeclPlugin`,
+  :class:`DispatchAppPlugin`, :class:`LiteralListPlugin`) gained a
+  required ``marker_prefix: str`` field that controls the synthetic
+  fqname prefix the plugin emits (it replaces the previous
+  ``self.name``-derived ``<{name}>:`` markers).
+- **``BUILTIN_PLUGINS``** is now a ``list[Plugin]`` of fully-configured
+  instances instead of a ``dict[str, type]`` keyed by ``name``. CLI
+  ``--plugin <key>`` lookup is preserved via the new
+  :data:`dead_cst.plugins._BUILTIN_BY_CLI_KEY` map; the public CLI keys
+  (``main_block``, ``project_scripts``, ``fastapi``, ``flask``, ...)
+  are unchanged.
+- **Framework plugins are factory functions.** ``FastAPIPlugin``,
+  ``FastMCPPlugin``, ``FlaskPlugin``, ``TyperPlugin``, ``CycloptsPlugin``
+  no longer exist as subclasses — they were pure configuration over
+  :class:`DispatchAppPlugin`. Use the lowercase factory functions
+  instead: :func:`dead_cst.plugins.fastapi_plugin`,
+  :func:`fastmcp_plugin`, :func:`flask_plugin`, :func:`typer_plugin`,
+  :func:`cyclopts_plugin`. ``CeleryPlugin``, ``ClickPlugin``,
+  ``DiscordPyPlugin``, ``MockPatchPlugin``, ``UnittestPlugin``,
+  ``PytestPlugin``, ``ServerConfigPlugin``, ``InitSubclassPlugin``,
+  ``MainBlockPlugin``, ``ProjectScriptsPlugin``,
+  ``ExplicitEntrypointPlugin``, ``ModuleDundersPlugin``,
+  ``DynamicImportFallbackPlugin`` remain classes (they either carry
+  custom ``run()`` logic or take per-instance configuration).
+- :class:`native.ConstructionRef` gained ``args: list[Any]`` and
+  ``kwargs: dict[str, Any]`` fields (mirroring :class:`CallRef` and
+  :class:`DecoratorRef`). Constructors are calls, and their argument
+  shape is now surfaced to plugins.
+
 ### Added
 - :class:`dead_cst.plugins.DynamicImportFallbackPlugin` — a plugin
   that reads :attr:`EdgeFlags.DYNAMIC_IMPORT` edges and fans each

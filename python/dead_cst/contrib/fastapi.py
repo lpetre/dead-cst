@@ -31,8 +31,6 @@ the factory-aware :class:`DispatchAppPlugin` base:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 from ..plugins.decl_shapes import DispatchAppPlugin
 
 # Attribute names FastAPI / APIRouter use to register a callable. Matched as
@@ -57,8 +55,7 @@ _REGISTRATION_DECORATORS: frozenset[str] = frozenset(
 )
 
 
-@dataclass
-class FastAPIPlugin(DispatchAppPlugin):
+def fastapi_plugin() -> DispatchAppPlugin:
     """Mark FastAPI apps as entrypoints and wire route handlers through them.
 
     Concrete configuration of the factory-aware
@@ -89,8 +86,8 @@ class FastAPIPlugin(DispatchAppPlugin):
       survives cross-package walks where the external edge would
       otherwise lose ``decl='FastAPI'`` info.
     """
-
-    name: str = "fastapi"
-    version: int = 1778973600
-    app_classes: tuple[str, ...] = ("fastapi.FastAPI",)
-    registration_decorators: frozenset[str] = _REGISTRATION_DECORATORS
+    return DispatchAppPlugin(
+        marker_prefix="fastapi",
+        app_classes=("fastapi.FastAPI",),
+        registration_decorators=_REGISTRATION_DECORATORS,
+    )

@@ -28,14 +28,12 @@ plugin reuses those reference edges via the factory-aware
    lands as a bare ``[external dist] fastmcp`` edge after
    :func:`resolve_edges` drops the ``decl='FastMCP'`` half.
 
-This mirrors :class:`FastAPIPlugin`'s shape; the only difference is
+This mirrors :func:`fastapi_plugin`'s shape; the only difference is
 that FastMCP has a single app class today (``fastmcp.FastMCP``) with
 no ``Router`` / ``Blueprint`` peer.
 """
 
 from __future__ import annotations
-
-from dataclasses import dataclass
 
 from ..plugins.decl_shapes import DispatchAppPlugin
 
@@ -53,8 +51,7 @@ _REGISTRATION_DECORATORS: frozenset[str] = frozenset(
 )
 
 
-@dataclass
-class FastMCPPlugin(DispatchAppPlugin):
+def fastmcp_plugin() -> DispatchAppPlugin:
     """Mark FastMCP servers as entrypoints and wire handlers through them.
 
     Concrete configuration of the factory-aware
@@ -82,8 +79,8 @@ class FastMCPPlugin(DispatchAppPlugin):
     (``from mcp.server.fastmcp import FastMCP``) can keep their handlers
     alive with explicit ``-e`` entrypoints or a project-local plugin.
     """
-
-    name: str = "fastmcp"
-    version: int = 1778671880
-    app_classes: tuple[str, ...] = ("fastmcp.FastMCP",)
-    registration_decorators: frozenset[str] = _REGISTRATION_DECORATORS
+    return DispatchAppPlugin(
+        marker_prefix="fastmcp",
+        app_classes=("fastmcp.FastMCP",),
+        registration_decorators=_REGISTRATION_DECORATORS,
+    )

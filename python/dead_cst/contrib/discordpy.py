@@ -3,13 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Iterable
+from pathlib import Path
+from typing import Iterable
 
 from ..graph import NodeFlags
-
-if TYPE_CHECKING:
-    from dead_cst import _native as native
-
+from ..plugins._base import Plugin, native
 
 _COMMANDS_BOT_KINDS: frozenset[str] = frozenset({"Bot", "AutoShardedBot"})
 _DISCORD_CLIENT_KINDS: frozenset[str] = frozenset({"Client", "AutoShardedClient"})
@@ -38,15 +36,10 @@ DISCORDPY_EXTENSION_PREFIX = "<discordpy-extension>:"
 
 
 @dataclass
-class DiscordPyPlugin:
+class DiscordPyPlugin(Plugin):
     """Wire discord.py bots, Cogs, and extension hooks into reachability."""
 
-    name: str = "discordpy"
-    version: int = 1778566342
-
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
-        from dead_cst import _native as native
-
         # Per-file gate: only fire on files that import discord.
         discord_paths: set[str] = set()
         for module in ("discord", "discord.ext", "discord.ext.commands"):
@@ -108,7 +101,7 @@ class DiscordPyPlugin:
 
             for path, cogs in cogs_by_path.items():
                 targets = list(cogs) + hook_funcs_by_path.get(path, [])
-                filename = path.rsplit("/", 1)[-1]
+                filename = Path(path).name
                 yield native.AddNode(
                     fqname=f"{DISCORDPY_COG_PREFIX}{filename}",
                     path=path,

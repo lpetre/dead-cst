@@ -1,6 +1,6 @@
 """Plugin: keep Flask route handlers and lifecycle hooks alive.
 
-Mirrors :class:`FastAPIPlugin`: direct ``X = Flask(...)`` /
+Mirrors :func:`fastapi_plugin`: direct ``X = Flask(...)`` /
 ``X = Blueprint(...)`` assignments are classified per-file in
 :meth:`DispatchAppPlugin.observe`, while factory-style apps
 (``X = create_app()``) are deferred to :meth:`DispatchAppPlugin.finalize`
@@ -15,8 +15,6 @@ classification and the import-node check alone misses the case.
 """
 
 from __future__ import annotations
-
-from dataclasses import dataclass
 
 from ..plugins.decl_shapes import DispatchAppPlugin
 
@@ -63,8 +61,7 @@ _REGISTRATION_DECORATORS: frozenset[str] = frozenset(
 )
 
 
-@dataclass
-class FlaskPlugin(DispatchAppPlugin):
+def flask_plugin() -> DispatchAppPlugin:
     """Mark Flask apps as entrypoints and wire route handlers through them.
 
     Concrete configuration of the factory-aware
@@ -84,8 +81,8 @@ class FlaskPlugin(DispatchAppPlugin):
       ``flask.Flask()`` and the external-edge classifier drops the
       ``decl='Flask'`` half.
     """
-
-    name: str = "flask"
-    version: int = 1778973600
-    app_classes: tuple[str, ...] = ("flask.Flask",)
-    registration_decorators: frozenset[str] = _REGISTRATION_DECORATORS
+    return DispatchAppPlugin(
+        marker_prefix="flask",
+        app_classes=("flask.Flask",),
+        registration_decorators=_REGISTRATION_DECORATORS,
+    )

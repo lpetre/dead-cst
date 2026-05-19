@@ -23,35 +23,30 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterable
+from typing import Iterable
 
 from ..graph import NodeFlags
-
-if TYPE_CHECKING:
-    from dead_cst import _native as native
+from ._base import Plugin, native
 
 
 @dataclass(kw_only=True)
-class DecoratedDeclPlugin:
+class DecoratedDeclPlugin(Plugin):
     """Mark decls as entrypoints when they bind to a name imported from
     ``decorator_module`` either via decorator (``@<module>.<name>(...)``
     on a function) or constructor (``X = <module>.<ctor>(...)``).
 
-    Subclasses must set ``name`` and ``version``. The cache fingerprint
-    is ``(name, version)`` — every concrete plugin needs a unique
-    ``name``.
+    ``marker_prefix`` controls the synthetic node fqname emitted per
+    file — each concrete plugin should pick a unique short string so
+    its markers don't collide with other plugins'.
     """
 
-    name: str
-    version: int
+    marker_prefix: str
     package_prefix: str = ""
     decorator_module: str = ""
     decorator_names: frozenset[str] = frozenset()
     constructor_names: frozenset[str] = frozenset()
 
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
-        from dead_cst import _native as native
-
         if not self.decorator_module:
             return
         if not (self.decorator_names or self.constructor_names):
@@ -82,7 +77,7 @@ class DecoratedDeclPlugin:
 
         for path, targets in seeds_by_path.items():
             yield native.AddNode(
-                fqname=f"<{self.name}>:{Path(path).name}",
+                fqname=f"<{self.marker_prefix}>:{Path(path).name}",
                 path=path,
                 flags=int(NodeFlags.ENTRYPOINT),
                 edges_to=targets,
@@ -90,7 +85,7 @@ class DecoratedDeclPlugin:
 
 
 @dataclass(kw_only=True)
-class DispatchAppPlugin:
+class DispatchAppPlugin(Plugin):
     """Wire ``@<instance>.<reg_decorator>(...)`` handlers to their app instance.
 
     Subclasses configure ``app_classes`` -- the fully-qualified class
@@ -114,19 +109,21 @@ class DispatchAppPlugin:
       / ``if __name__ == "__main__": app()`` / explicit ``-e``. Lets
       unused sub-apps surface as dead code.
 
+    ``marker_prefix`` is the short label used in the ``<{marker}-app>:``
+    and ``<{marker}-factory>:`` synthetic fqnames the plugin emits.
+
     Result-level dedup: if the same construction site is reachable
     from two ``app_classes`` entries (e.g. one is a base of the
     other), it only emits one entrypoint marker.
     """
 
-    name: str
-    version: int
+    marker_prefix: str
     app_classes: tuple[str, ...] = ()
     registration_decorators: frozenset[str] = frozenset()
     seed_as_entrypoint: bool = True
 
     def _prefix(self, kind: str) -> str:
-        return f"<{self.name}-{kind}>:"
+        return f"<{self.marker_prefix}-{kind}>:"
 
     def _module_to_names(self, ctx: native.ProjectContext) -> dict[str, set[str]]:
         """Expand each ``app_class`` into ``{module: {simple_name, ...}}``,
@@ -135,8 +132,6 @@ class DispatchAppPlugin:
         ``of_module(...).where_name(...)``) discover project / third-party
         subclasses whose import module differs from the base class.
         """
-        from dead_cst import _native as native
-
         out: dict[str, set[str]] = {}
         for fqn in self.app_classes:
             module, _, name = fqn.rpartition(".")
@@ -150,8 +145,6 @@ class DispatchAppPlugin:
         return out
 
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
-        from dead_cst import _native as native
-
         if not (self.app_classes and self.registration_decorators):
             return
         decorator_attrs = list(self.registration_decorators)
@@ -277,7 +270,7 @@ class DispatchAppPlugin:
 
 
 @dataclass(kw_only=True)
-class LiteralListPlugin:
+class LiteralListPlugin(Plugin):
     """Read ``<owner_fqname>.<variable_name>`` (a top-level list/tuple of
     string literals) and treat each entry as a fqname to keep alive.
 
@@ -285,18 +278,15 @@ class LiteralListPlugin:
     fqname (whole module surface revived, mirroring
     ``importlib.import_module``) or a single decl fqname.
 
-    Subclasses must set ``name`` and ``version``. The cache fingerprint
-    is ``(name, version)`` — every concrete plugin needs a unique ``name``.
+    ``marker_prefix`` is the short label used in the ``<{marker}>:``
+    synthetic fqname the plugin emits.
     """
 
-    name: str
-    version: int
+    marker_prefix: str
     owner_fqname: str = ""
     variable_name: str = ""
 
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
-        from dead_cst import _native as native
-
         if not self.owner_fqname or not self.variable_name:
             return
         var_fqname = f"{self.owner_fqname}.{self.variable_name}"
@@ -308,7 +298,7 @@ class LiteralListPlugin:
         if not entries:
             return
 
-        prefix = f"<{self.name}>:"
+        prefix = f"<{self.marker_prefix}>:"
         for entry in entries:
             # Each entry resolves as either a module fqname (revive the
             # whole surface, mirroring ``importlib.import_module``) or a
