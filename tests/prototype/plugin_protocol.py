@@ -14,7 +14,7 @@ Demonstrates a new plugin shape distinct from the libcst-side
   ``AddEntrypoint``) to extend the graph, and call ``native.query(ctx).*`` to
   ask structured questions (``find_module_dunders``,
   ``find_classes_defining_method``, ``find_subclasses_of``,
-  ``find_comment_patterns``). Queries return ``NativeNode`` Python
+  ``find_comment_patterns``). Queries return ``SymbolNode`` Python
   objects whose ``idx`` carries the graph identity edges need.
 
 * Configuration mirrors the existing `Project` constructor today

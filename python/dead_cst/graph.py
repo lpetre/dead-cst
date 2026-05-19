@@ -15,8 +15,8 @@ from __future__ import annotations
 from dead_cst._native import (
     EdgeFlags,
     Import,
-    NativeNode as SymbolNode,
     NodeFlags,
+    SymbolNode,
 )
 
 #: Default seed mask for reachability queries. ORs together every

@@ -34,7 +34,7 @@ class PytestPlugin:
         from dead_cst import _native as native
 
         nodes = list(ctx.nodes())
-        decls_by_path: dict[str, list[native.NativeNode]] = {}
+        decls_by_path: dict[str, list[native.SymbolNode]] = {}
         for n in nodes:
             if n.kind not in ("function", "class", "variable"):
                 continue
@@ -52,7 +52,7 @@ class PytestPlugin:
                 if test_decls:
                     yield from _mark_seed(f"{PYTEST_TESTS_PREFIX}{module.fqname}", path, test_decls)
 
-        fixtures_by_path: dict[str, list[native.NativeNode]] = {}
+        fixtures_by_path: dict[str, list[native.SymbolNode]] = {}
         for ref in native.query(ctx).decorators().where_module("pytest").where_name("fixture"):
             fixtures_by_path.setdefault(ref.path, []).append(ref.decorated)
         for path, fixtures in fixtures_by_path.items():
@@ -65,7 +65,7 @@ class PytestPlugin:
 def _mark_seed(
     fqname: str,
     path: str,
-    targets: list[native.NativeNode],
+    targets: list[native.SymbolNode],
 ) -> Iterable[native.GraphOp]:
     from dead_cst import _native as native
 
@@ -79,7 +79,7 @@ def _mark_seed(
     )
 
 
-def _is_test_decl(node: native.NativeNode) -> bool:
+def _is_test_decl(node: native.SymbolNode) -> bool:
     simple = node.fqname.rsplit(".", 1)[-1]
     if node.kind == "function" and simple.startswith("test_"):
         return True

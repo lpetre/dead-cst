@@ -1,4 +1,4 @@
-//! Public Python data classes (`Import`, `NativeNode`, `NativeGraph`),
+//! Public Python data classes (`Import`, `SymbolNode`, `NativeGraph`),
 //! the type aliases that describe graph indices, and the `NodeFlags`/
 //! `EdgeFlags` constant catalogs exposed to plugins.
 //!
@@ -68,7 +68,7 @@ impl Import {
 /// alias, plus one per name brought in by `from X import *`). All
 /// other kinds carry `None`.
 #[pyclass(get_all, frozen)]
-pub(crate) struct NativeNode {
+pub(crate) struct SymbolNode {
     pub(crate) fqname: String,
     pub(crate) kind: &'static str,
     pub(crate) path: String,
@@ -97,12 +97,12 @@ fn intern_kind(kind: &str) -> PyResult<&'static str> {
         }
     }
     Err(pyo3::exceptions::PyValueError::new_err(format!(
-        "invalid NativeNode.kind: {kind:?}"
+        "invalid SymbolNode.kind: {kind:?}"
     )))
 }
 
 #[pymethods]
-impl NativeNode {
+impl SymbolNode {
     #[new]
     #[pyo3(signature = (
         fqname,
@@ -143,7 +143,7 @@ impl NativeNode {
 
     fn __repr__(&self) -> String {
         format!(
-            "NativeNode(fqname={:?}, kind={:?}, path={:?}, start=({}, {}), end=({}, {}), flags={})",
+            "SymbolNode(fqname={:?}, kind={:?}, path={:?}, start=({}, {}), end=({}, {}), flags={})",
             self.fqname,
             self.kind,
             self.path,
@@ -178,7 +178,7 @@ impl NativeNode {
     }
 
     fn __eq__(&self, other: &Bound<'_, PyAny>) -> bool {
-        let Ok(other) = other.extract::<PyRef<NativeNode>>() else {
+        let Ok(other) = other.extract::<PyRef<SymbolNode>>() else {
             return false;
         };
         if self.fqname != other.fqname
@@ -208,7 +208,7 @@ impl NativeNode {
 /// One project-wide graph contribution, packed for one FFI hop.
 #[pyclass(get_all, frozen)]
 pub(crate) struct NativeGraph {
-    pub(crate) nodes: Vec<Py<NativeNode>>,
+    pub(crate) nodes: Vec<Py<SymbolNode>>,
     pub(crate) edges: Vec<(usize, usize, u32)>,
 }
 
@@ -285,7 +285,7 @@ pub(crate) type StarReexports = HashMap<(File, String), String>;
 /// Return type of `ProjectContext.find_main_blocks`: one entry per
 /// file with a top-level ``if __name__ == "__main__":`` block, paired
 /// with the decls that fall inside it.
-pub(crate) type MainBlock = (Py<NativeNode>, Vec<Py<NativeNode>>);
+pub(crate) type MainBlock = (Py<SymbolNode>, Vec<Py<SymbolNode>>);
 
 /// Outcome of resolving a `Name` use to its reaching definition.
 ///
@@ -303,7 +303,7 @@ pub(crate) enum Resolution {
     },
 }
 
-/// Bit values stamped into [`NativeNode::flags`]. Mirrors
+/// Bit values stamped into [`SymbolNode::flags`]. Mirrors
 /// `dead_cst.graph.NodeFlags` exactly so plugin code can mix
 /// rust-emitted and libcst-emitted nodes.
 ///

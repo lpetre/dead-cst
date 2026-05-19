@@ -68,7 +68,7 @@ class DecoratedDeclPlugin:
                 return False
             return module.fqname == prefix or module.fqname.startswith(prefix + ".")
 
-        seeds_by_path: dict[str, list[native.NativeNode]] = {}
+        seeds_by_path: dict[str, list[native.SymbolNode]] = {}
         for dec_ref in (
             native.query(ctx).decorators().where_module(self.decorator_module).where_name(names)
         ):
@@ -196,12 +196,12 @@ class DispatchAppPlugin:
 
         handlers = list(native.query(ctx).decorators().where_owner_attr(decorator_attrs))
 
-        direct_by_owner: dict[tuple[str, str], list["native.NativeNode"]] = {}
+        direct_by_owner: dict[tuple[str, str], list["native.SymbolNode"]] = {}
         for ref in direct:
             simple = ref.var.fqname.rsplit(".", 1)[-1]
             direct_by_owner.setdefault((ref.var.path, simple), []).append(ref.var)
 
-        vars_by_file: dict[tuple[str, str], native.NativeNode] = {}
+        vars_by_file: dict[tuple[str, str], native.SymbolNode] = {}
         for n in ctx.nodes():
             if n.kind != "variable":
                 continue

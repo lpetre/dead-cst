@@ -20,7 +20,7 @@ use ty_module_resolver::{file_to_module, resolve_module, ModuleName};
 use ty_project::metadata::value::RelativePathBuf;
 use ty_project::{Db as ProjectDb, ProjectDatabase};
 
-use crate::graph::{DeclIndex, EdgeFlags, NativeNode, NodeFlags};
+use crate::graph::{DeclIndex, EdgeFlags, SymbolNode, NodeFlags};
 use crate::ingest::collapse_attribute_chain;
 use crate::project::BuildOutputs;
 
@@ -91,11 +91,11 @@ pub(crate) fn iter_top_level_classes(
     })
 }
 
-/// Locate a class's File + name TextRange from its NativeNode positions.
+/// Locate a class's File + name TextRange from its SymbolNode positions.
 ///
 /// We don't store ty `Definition<'db>` references across plugin calls
 /// (the `'db` lifetime is tied to the active borrow), so this re-walks
-/// Locate a class's File + name TextRange from its NativeNode positions.
+/// Locate a class's File + name TextRange from its SymbolNode positions.
 ///
 /// We don't store ty `Definition<'db>` references across plugin calls
 /// (the `'db` lifetime is tied to the active borrow), so this re-walks
@@ -108,7 +108,7 @@ pub(crate) fn locate_class_def(
     db: &ProjectDatabase,
     path_to_file: &HashMap<String, File>,
     path: &str,
-    class_node: &NativeNode,
+    class_node: &SymbolNode,
 ) -> Option<(File, TextRange)> {
     let &file = path_to_file.get(path)?;
     let parsed = parsed_module(db, file).load(db);
@@ -617,7 +617,7 @@ impl<'ast, 'a> Visitor<'ast> for FactoryCallFinder<'a> {
 /// attribute their calls to the module node.
 /// Look up the owning decl index for a top-level statement. Takes
 /// the two hashmaps directly (rather than ``&BuildOutputs``) because
-/// ``BuildOutputs`` carries ``Vec<Py<NativeNode>>`` and is therefore
+/// ``BuildOutputs`` carries ``Vec<Py<SymbolNode>>`` and is therefore
 /// ``!Sync`` — these maps are ``Sync`` on their own, which lets the
 /// callers borrow them across rayon thread boundaries.
 pub(crate) fn owner_idx_for_stmt_with(
@@ -655,7 +655,7 @@ pub(crate) fn nth_positional_string(
 /// Send-able value extracted from an AST expression.
 ///
 /// ``DeclRef(idx)`` holds an index into ``BuildOutputs.builder.nodes``.
-/// The ``Py<NativeNode>`` materialization runs in the GIL-holding
+/// The ``Py<SymbolNode>`` materialization runs in the GIL-holding
 /// caller after :fn:`par_scan_files` returns (the rust extractor must
 /// stay ``Send``).
 ///
@@ -789,8 +789,8 @@ pub(crate) fn extract_call_args_kwargs(
 }
 
 /// Materialize one ``ArgValue`` into a Python object. ``DeclRef``
-/// resolves through the build's ``Py<NativeNode>`` pool.
-pub(crate) fn arg_value_to_py(py: Python<'_>, v: &ArgValue, nodes: &[Py<NativeNode>]) -> PyObject {
+/// resolves through the build's ``Py<SymbolNode>`` pool.
+pub(crate) fn arg_value_to_py(py: Python<'_>, v: &ArgValue, nodes: &[Py<SymbolNode>]) -> PyObject {
     match v {
         ArgValue::None => py.None(),
         ArgValue::Bool(b) => b.into_py(py),
@@ -824,7 +824,7 @@ pub(crate) fn arg_value_to_py(py: Python<'_>, v: &ArgValue, nodes: &[Py<NativeNo
 pub(crate) fn args_to_py_vec(
     py: Python<'_>,
     args: &[ArgValue],
-    nodes: &[Py<NativeNode>],
+    nodes: &[Py<SymbolNode>],
 ) -> Vec<Py<PyAny>> {
     args.iter().map(|v| arg_value_to_py(py, v, nodes)).collect()
 }
@@ -833,7 +833,7 @@ pub(crate) fn args_to_py_vec(
 pub(crate) fn kwargs_to_py_map(
     py: Python<'_>,
     kwargs: &HashMap<String, ArgValue>,
-    nodes: &[Py<NativeNode>],
+    nodes: &[Py<SymbolNode>],
 ) -> HashMap<String, Py<PyAny>> {
     kwargs
         .iter()
@@ -842,7 +842,7 @@ pub(crate) fn kwargs_to_py_map(
 }
 
 /// A user-supplied kwarg matcher. Only literal-value equality is
-/// supported; ``NativeNode``-valued matchers are rejected at
+/// supported; ``SymbolNode``-valued matchers are rejected at
 /// ``where_kwarg`` call time.
 #[derive(Clone, Debug)]
 pub(crate) enum KwargMatcher {
@@ -878,16 +878,16 @@ pub(crate) fn arg_value_eq_literal(a: &ArgValue, b: &ArgValue) -> bool {
 /// Extract a ``KwargMatcher`` from a Python value supplied at
 /// ``.where_kwarg(name, value)`` call time. Accepts only Python
 /// literals (``None``, ``bool``, ``int``, ``float``, ``str``,
-/// ``list[...]``, ``tuple[...]``); passing a ``NativeNode`` (or any
+/// ``list[...]``, ``tuple[...]``); passing a ``SymbolNode`` (or any
 /// other unsupported type) raises ``PyValueError``.
 pub(crate) fn kwarg_matcher_from_py(py: Python<'_>, value: &Py<PyAny>) -> PyResult<KwargMatcher> {
     let bound = value.bind(py);
-    // Reject NativeNode explicitly with a targeted error so callers
+    // Reject SymbolNode explicitly with a targeted error so callers
     // see the dropped feature rather than the generic "unknown type"
     // message from `py_to_arg_value`.
-    if bound.extract::<PyRef<'_, NativeNode>>().is_ok() {
+    if bound.extract::<PyRef<'_, SymbolNode>>().is_ok() {
         return Err(PyValueError::new_err(
-            "where_kwarg value must be a Python literal (str/int/float/bool/None/list/tuple), got NativeNode",
+            "where_kwarg value must be a Python literal (str/int/float/bool/None/list/tuple), got SymbolNode",
         ));
     }
     Ok(KwargMatcher::Literal(py_to_arg_value(bound)?))

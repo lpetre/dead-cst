@@ -5,10 +5,10 @@ end-to-end using ty's ``SemanticIndex``. This module is a thin
 adapter: it instantiates a :class:`native.ProjectContext`, wires
 plugins, calls :meth:`materialize`, and folds the rust-shaped
 :class:`NativeGraph` envelope into a :class:`SymbolGraph` (a plain
-dict-of-lists adjacency keyed on :class:`NativeNode`).
+dict-of-lists adjacency keyed on :class:`SymbolNode`).
 
 Nodes / imports / flags are no longer translated — :class:`SymbolNode`
-*is* :class:`native.NativeNode`, :class:`Import` *is*
+*is* :class:`native.SymbolNode`, :class:`Import` *is*
 :class:`native.Import`, etc. The "bridge" today is one pass that
 copies the rust node list and edge triples into the adjacency map.
 

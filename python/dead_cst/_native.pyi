@@ -12,7 +12,7 @@ should land in both places at once.
 
 from typing import Any, Iterable, Iterator, Literal, Protocol
 
-# The set of stable kind strings ``NativeNode.kind`` can carry. Use a
+# The set of stable kind strings ``SymbolNode.kind`` can carry. Use a
 # ``Literal`` rather than ``str`` so the type checker catches typos at
 # plugin author time.
 NodeKind = Literal[
@@ -26,7 +26,7 @@ NodeKind = Literal[
 ]
 
 class NodeFlags:
-    """Bit values stamped into ``NativeNode.flags``.
+    """Bit values stamped into ``SymbolNode.flags``.
 
     Mirrors ``dead_cst.graph.NodeFlags`` exactly — same values, same
     semantics — so plugin code can interoperate with libcst-emitted
@@ -130,7 +130,7 @@ class Import:
         star: bool = ...,
     ) -> None: ...
 
-class NativeNode:
+class SymbolNode:
     """A single node in a ``NativeGraph``.
 
     ``fqname`` is the dotted absolute name (``pkg.mod.MyClass``);
@@ -178,11 +178,11 @@ class AddEdge:
     side.
     """
 
-    src: NativeNode
-    dst: NativeNode
+    src: SymbolNode
+    dst: SymbolNode
     flags: int
 
-    def __init__(self, src: NativeNode, dst: NativeNode, *, flags: int = 0) -> None: ...
+    def __init__(self, src: SymbolNode, dst: SymbolNode, *, flags: int = 0) -> None: ...
 
 class AddEntrypoint:
     """Mark ``decl`` as an entrypoint.
@@ -198,10 +198,10 @@ class AddEntrypoint:
     ``edges_to`` / ``edges_from``.
     """
 
-    decl: NativeNode
+    decl: SymbolNode
     marker: str
 
-    def __init__(self, decl: NativeNode, *, marker: str) -> None: ...
+    def __init__(self, decl: SymbolNode, *, marker: str) -> None: ...
 
 class AddNode:
     """Mint a synthetic intermediate node, optionally wiring it with
@@ -220,8 +220,8 @@ class AddNode:
     kind: NodeKind
     path: str
     flags: int
-    edges_from: list[NativeNode]
-    edges_to: list[NativeNode]
+    edges_from: list[SymbolNode]
+    edges_to: list[SymbolNode]
 
     def __init__(
         self,
@@ -230,8 +230,8 @@ class AddNode:
         path: str,
         kind: NodeKind = "synthetic",
         flags: int = 0,
-        edges_from: Iterable[NativeNode] = ...,
-        edges_to: Iterable[NativeNode] = ...,
+        edges_from: Iterable[SymbolNode] = ...,
+        edges_to: Iterable[SymbolNode] = ...,
     ) -> None: ...
 
 GraphOp = AddEdge | AddEntrypoint | AddNode
@@ -244,7 +244,7 @@ class NativeGraph:
     it). ``edges`` is ``(src_idx, dst_idx, flags)`` triples.
     """
 
-    nodes: list[NativeNode]
+    nodes: list[SymbolNode]
     edges: list[tuple[int, int, int]]
 
 class Project:
@@ -338,7 +338,7 @@ class ProjectContext:
     # ``find_calls_on_var`` methods are no longer part of the public
     # type-stub contract; use ``query(ctx)`` instead.
 
-    def find_subclasses(self, base_fqn: str, *, transitive: bool = True) -> list[NativeNode]:
+    def find_subclasses(self, base_fqn: str, *, transitive: bool = True) -> list[SymbolNode]:
         """Subclasses of the class addressed by ``base_fqn``.
 
         Works for both project classes (where the fqn resolves to a
@@ -350,10 +350,10 @@ class ProjectContext:
         """
         ...
 
-    def find_subclasses_of(self, class_node: NativeNode) -> list[NativeNode]:
+    def find_subclasses_of(self, class_node: SymbolNode) -> list[SymbolNode]:
         """Transitive subclasses of a class already in the graph.
 
-        Like :meth:`find_subclasses` but takes a ``NativeNode`` rather
+        Like :meth:`find_subclasses` but takes a ``SymbolNode`` rather
         than a fqn — useful when you already have the seed in hand and
         don't want to round-trip through a string. Direct subtypes
         come from ty's ``type_hierarchy_subtypes``; results that don't
@@ -363,7 +363,7 @@ class ProjectContext:
 
     # ----- FQN resolution ------------------------------------------------
 
-    def resolve(self, fqname: str) -> NativeNode | None:
+    def resolve(self, fqname: str) -> SymbolNode | None:
         """Resolve a dotted FQN to either a declaration or a module
         node.
 
@@ -376,7 +376,7 @@ class ProjectContext:
         """
         ...
 
-    def find_declarations(self, fqname: str) -> list[NativeNode]:
+    def find_declarations(self, fqname: str) -> list[SymbolNode]:
         """Every declaration matching ``fqname``, walking back through
         dotted segments to find the enclosing top-level decl when the
         exact name doesn't match.
@@ -388,12 +388,12 @@ class ProjectContext:
         """
         ...
 
-    def find_module(self, fqname: str) -> NativeNode | None:
+    def find_module(self, fqname: str) -> SymbolNode | None:
         """Return the module node for the given dotted fqname, if one
         exists in the project graph."""
         ...
 
-    def module_for(self, path: str) -> NativeNode | None:
+    def module_for(self, path: str) -> SymbolNode | None:
         """Return the module node owning ``path``, if any.
 
         O(1) — backed by the same ``module_nodes_by_file`` index
@@ -402,7 +402,7 @@ class ProjectContext:
         """
         ...
 
-    def module_surface(self, module_fqn: str) -> list[NativeNode]:
+    def module_surface(self, module_fqn: str) -> list[SymbolNode]:
         """Module node + every transitive decl whose fqname lives
         under ``module_fqn``.
 
@@ -413,7 +413,7 @@ class ProjectContext:
         """
         ...
 
-    def find_module_top_level_decls(self, module_fqn: str) -> list[NativeNode]:
+    def find_module_top_level_decls(self, module_fqn: str) -> list[SymbolNode]:
         """``module_fqn``'s immediate top-level decls — every
         function / class / variable / import bound at its module scope.
 
@@ -426,7 +426,7 @@ class ProjectContext:
         """
         ...
 
-    def find_module_dunder_all_exports(self, module_fqn: str) -> list[NativeNode] | None:
+    def find_module_dunder_all_exports(self, module_fqn: str) -> list[SymbolNode] | None:
         """Decls listed in ``module_fqn``'s ``__all__``, or ``None``
         when the module doesn't declare ``__all__``.
 
@@ -443,11 +443,11 @@ class ProjectContext:
 
     # ----- Path / name filters ------------------------------------------
 
-    def decls_under(self, path_prefix: str) -> list[NativeNode]:
+    def decls_under(self, path_prefix: str) -> list[SymbolNode]:
         """Every node whose ``path`` starts with the given prefix."""
         ...
 
-    def decls_matching(self, substring: str) -> list[NativeNode]:
+    def decls_matching(self, substring: str) -> list[SymbolNode]:
         """Every node whose ``path`` contains ``substring`` anywhere.
 
         Useful for path-pattern plugins (``alembic/versions/``,
@@ -455,7 +455,7 @@ class ProjectContext:
         """
         ...
 
-    def decls_matching_name(self, pattern: str) -> list[NativeNode]:
+    def decls_matching_name(self, pattern: str) -> list[SymbolNode]:
         """Every top-level decl whose simple name matches ``pattern``
         (a regex).
 
@@ -467,7 +467,7 @@ class ProjectContext:
 
     # ----- Traversal -----------------------------------------------------
 
-    def descendants(self, root: NativeNode, *, skip_flags: int = 0) -> list[NativeNode]:
+    def descendants(self, root: SymbolNode, *, skip_flags: int = 0) -> list[SymbolNode]:
         """Forward closure: every node reachable from ``root`` by
         following graph edges.
 
@@ -477,7 +477,7 @@ class ProjectContext:
         """
         ...
 
-    def ancestors(self, decl: NativeNode, *, skip_flags: int = 0) -> list[NativeNode]:
+    def ancestors(self, decl: SymbolNode, *, skip_flags: int = 0) -> list[SymbolNode]:
         """Reverse closure: every node that can reach ``decl`` by
         following graph edges.
 
@@ -486,7 +486,7 @@ class ProjectContext:
         """
         ...
 
-    def reachable(self, *, skip_flags: int = 0, seed_flags: int = ...) -> list[NativeNode]:
+    def reachable(self, *, skip_flags: int = 0, seed_flags: int = ...) -> list[SymbolNode]:
         """Forward closure from every node carrying any bit in
         ``seed_flags`` (defaults to :data:`NodeFlags.ENTRYPOINT`). The
         set of dead decls is the complement against :meth:`nodes`."""
@@ -494,7 +494,7 @@ class ProjectContext:
 
     # ----- Pure scans over the in-progress graph ------------------------
 
-    def find_module_dunders(self) -> list[NativeNode]:
+    def find_module_dunders(self) -> list[SymbolNode]:
         """Every top-level variable node whose name matches ``__xxx__``.
 
         Pure scan over already-interned nodes — no ty re-query needed
@@ -503,7 +503,7 @@ class ProjectContext:
         """
         ...
 
-    def find_imports_of(self, module_name: str) -> list[NativeNode]:
+    def find_imports_of(self, module_name: str) -> list[SymbolNode]:
         """Every import-kind node whose upstream ``module`` matches.
 
         Covers both ``import <module_name>`` and
@@ -514,7 +514,7 @@ class ProjectContext:
         """
         ...
 
-    def find_main_blocks(self) -> list[tuple[NativeNode, list[NativeNode]]]:
+    def find_main_blocks(self) -> list[tuple[SymbolNode, list[SymbolNode]]]:
         """``(module_node, [decls inside the block])`` for every file
         with a top-level ``if __name__ == "__main__":`` block.
 
@@ -525,7 +525,7 @@ class ProjectContext:
         """
         ...
 
-    def find_classes_defining_method(self, method_name: str) -> list[NativeNode]:
+    def find_classes_defining_method(self, method_name: str) -> list[SymbolNode]:
         """Every class that defines a method with the given name.
 
         Walks each class's ``DefinitionKind::Class`` body for an
@@ -591,7 +591,7 @@ class ProjectContext:
 
     def find_factory_decls(
         self, module: str, ctor_names: list[str]
-    ) -> list[tuple[NativeNode, list[str]]]:
+    ) -> list[tuple[SymbolNode, list[str]]]:
         """Top-level functions / classes whose body constructs one of
         ``ctor_names`` imported from ``module``.
 
@@ -611,7 +611,7 @@ class ProjectContext:
 
     # ----- Comment-driven patterns --------------------------------------
 
-    def find_comment_patterns(self, pattern: str) -> list[tuple[NativeNode, str]]:
+    def find_comment_patterns(self, pattern: str) -> list[tuple[SymbolNode, str]]:
         """``(decl_node, comment_text)`` for every comment in the
         project matching ``pattern`` (a regex), paired with the next
         declaration that follows it in the same file.
@@ -624,7 +624,7 @@ class ProjectContext:
 
     # ----- Read-only graph accessors ------------------------------------
 
-    def nodes(self) -> list[NativeNode]:
+    def nodes(self) -> list[SymbolNode]:
         """Live nodes in the in-progress graph. Cheap, no copy."""
         ...
 
@@ -659,12 +659,12 @@ class DecoratorRef:
     ``Call`` form (``@dec(a, b, k=v)``). Bare-attribute decorators
     (``@app.route`` without ``()``) get empty containers. Each value
     is a Python literal (str / int / float / bool / None / list /
-    tuple), a :class:`NativeNode` when the expression statically
+    tuple), a :class:`SymbolNode` when the expression statically
     resolves to a project decl, or ``None`` for any other non-literal
     expression.
     """
 
-    decorated: NativeNode
+    decorated: SymbolNode
     decorator_name: str | None
     decorator_owner: str | None
     decorator_via: str | None
@@ -681,7 +681,7 @@ class ConstructionRef:
     (``"Flask"`` even when imported as ``F``).
     """
 
-    var: NativeNode
+    var: SymbolNode
     class_name: str
 
     @property
@@ -695,12 +695,12 @@ class CallRef:
 
     ``args`` and ``kwargs`` carry the call's full positional /
     keyword argument shape. Each value is a Python literal (str /
-    int / float / bool / None / list / tuple), a :class:`NativeNode`
+    int / float / bool / None / list / tuple), a :class:`SymbolNode`
     when the expression statically resolves to a project decl, or
     ``None`` for any other non-literal expression.
     """
 
-    owner: NativeNode
+    owner: SymbolNode
     string_arg: str
     args: list[Any]
     kwargs: dict[str, Any]
@@ -726,7 +726,7 @@ class QueryBuilder:
     :meth:`factories`.
 
     Point lookups (no ``.collect()`` — direct methods returning
-    ``NativeNode`` / ``list[NativeNode]`` / etc.):
+    ``SymbolNode`` / ``list[SymbolNode]`` / etc.):
     :meth:`module` / :meth:`declarations` /
     :meth:`module_top_level_decls` / :meth:`module_dunder_all_exports` /
     :meth:`module_dunders` / :meth:`main_blocks` /
@@ -743,28 +743,28 @@ class QueryBuilder:
 
     # ----- Point lookups (no filter chain) ------------------------------
 
-    def module(self, fqname: str) -> NativeNode | None:
+    def module(self, fqname: str) -> SymbolNode | None:
         """Look up a module's synthetic node by dotted fqname.
 
         Mirrors :meth:`ProjectContext.find_module`.
         """
         ...
 
-    def declarations(self, fqname: str) -> list[NativeNode]:
+    def declarations(self, fqname: str) -> list[SymbolNode]:
         """All top-level declarations bound to the given dotted fqname.
 
         Mirrors :meth:`ProjectContext.find_declarations`.
         """
         ...
 
-    def module_top_level_decls(self, fqname: str) -> list[NativeNode]:
+    def module_top_level_decls(self, fqname: str) -> list[SymbolNode]:
         """Every top-level declaration node of the named module.
 
         Mirrors :meth:`ProjectContext.find_module_top_level_decls`.
         """
         ...
 
-    def module_dunder_all_exports(self, fqname: str) -> list[NativeNode] | None:
+    def module_dunder_all_exports(self, fqname: str) -> list[SymbolNode] | None:
         """Exported names listed in a module's ``__all__``, or
         ``None`` when the module declares no ``__all__``.
 
@@ -772,7 +772,7 @@ class QueryBuilder:
         """
         ...
 
-    def module_dunders(self) -> list[NativeNode]:
+    def module_dunders(self) -> list[SymbolNode]:
         """All top-level ``__dunder__`` declarations across the
         project.
 
@@ -780,7 +780,7 @@ class QueryBuilder:
         """
         ...
 
-    def main_blocks(self) -> list[tuple[NativeNode, list[NativeNode]]]:
+    def main_blocks(self) -> list[tuple[SymbolNode, list[SymbolNode]]]:
         """Every ``if __name__ == "__main__":`` block, paired with
         the module and the decls inside.
 
@@ -788,7 +788,7 @@ class QueryBuilder:
         """
         ...
 
-    def comment_patterns(self, pattern: str) -> list[tuple[NativeNode, str]]:
+    def comment_patterns(self, pattern: str) -> list[tuple[SymbolNode, str]]:
         """Comments matching ``pattern`` paired with the next
         declaration.
 
@@ -808,7 +808,7 @@ class DecoratorQuery:
     def where_owner_attr_via(
         self, via: str, attrs: str | list[str] | tuple[str, ...]
     ) -> DecoratorQuery: ...
-    def in_decl(self, node: NativeNode) -> DecoratorQuery: ...
+    def in_decl(self, node: SymbolNode) -> DecoratorQuery: ...
     def where_path(self, regex: str) -> DecoratorQuery: ...
     def where_kwarg(self, name: str, value: Any) -> DecoratorQuery:
         """Filter to decorator calls whose ``name=value`` kwarg matches.
@@ -878,11 +878,11 @@ class SubclassQuery:
     """
 
     def of_fqn(self, fqn: str) -> SubclassQuery: ...
-    def of_node(self, node: NativeNode) -> SubclassQuery: ...
+    def of_node(self, node: SymbolNode) -> SubclassQuery: ...
     def transitive(self, value: bool) -> SubclassQuery: ...
-    def collect(self) -> list[NativeNode]: ...
+    def collect(self) -> list[SymbolNode]: ...
     def count(self) -> int: ...
-    def __iter__(self) -> Iterator[NativeNode]: ...
+    def __iter__(self) -> Iterator[SymbolNode]: ...
 
 class ImportQuery:
     """Enumerate the ``kind="import"`` nodes that bind a name from a
@@ -892,9 +892,9 @@ class ImportQuery:
     """
 
     def of(self, module: str) -> ImportQuery: ...
-    def collect(self) -> list[NativeNode]: ...
+    def collect(self) -> list[SymbolNode]: ...
     def count(self) -> int: ...
-    def __iter__(self) -> Iterator[NativeNode]: ...
+    def __iter__(self) -> Iterator[SymbolNode]: ...
 
 class ClassQuery:
     """Enumerate classes by structural property. Today the only filter
@@ -905,9 +905,9 @@ class ClassQuery:
     """
 
     def defining_method(self, name: str) -> ClassQuery: ...
-    def collect(self) -> list[NativeNode]: ...
+    def collect(self) -> list[SymbolNode]: ...
     def count(self) -> int: ...
-    def __iter__(self) -> Iterator[NativeNode]: ...
+    def __iter__(self) -> Iterator[SymbolNode]: ...
 
 class FactoryRef:
     """One result row from :class:`FactoryQuery`.
@@ -919,7 +919,7 @@ class FactoryRef:
     several ``Blueprint``\\ s).
     """
 
-    decl: NativeNode
+    decl: SymbolNode
     kinds: list[str]
 
     @property

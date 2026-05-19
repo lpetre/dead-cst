@@ -40,7 +40,7 @@ class ExplicitEntrypointPlugin:
                 continue
             yield native.AddEntrypoint(node, marker="<entrypoint>")
 
-    def _matches(self, node: native.NativeNode, root: Path) -> bool:
+    def _matches(self, node: native.SymbolNode, root: Path) -> bool:
         path = Path(node.path)
         try:
             rel = str(path.relative_to(root))

@@ -9,7 +9,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use ruff_db::files::File;
 
-use crate::graph::NativeNode;
+use crate::graph::SymbolNode;
 use crate::helpers::NODE_FLAG_ENTRYPOINT;
 use crate::project::ProjectContext;
 
@@ -30,7 +30,7 @@ pub(crate) struct NodeKey {
 }
 
 pub(crate) struct GraphBuilder {
-    pub(crate) nodes: Vec<Py<NativeNode>>,
+    pub(crate) nodes: Vec<Py<SymbolNode>>,
     pub(crate) node_index: HashMap<NodeKey, usize>,
     pub(crate) edges: Vec<(usize, usize, u32)>,
     pub(crate) edge_set: HashSet<(usize, usize, u32)>,
@@ -79,7 +79,7 @@ impl GraphBuilder {
         }
     }
 
-    pub(crate) fn intern_node(&mut self, py: Python<'_>, node: NativeNode) -> PyResult<usize> {
+    pub(crate) fn intern_node(&mut self, py: Python<'_>, node: SymbolNode) -> PyResult<usize> {
         let key = node_key_of(&node);
         if let Some(&idx) = self.node_index.get(&key) {
             return Ok(idx);
@@ -105,7 +105,7 @@ impl GraphBuilder {
         }
         let idx = self.intern_node(
             py,
-            NativeNode {
+            SymbolNode {
                 fqname: fqname.clone(),
                 kind: "synthetic",
                 path: String::new(),
@@ -138,8 +138,8 @@ impl GraphBuilder {
 /// directly so the apply pass is a single atomic step on the rust side.
 #[pyclass(frozen, get_all)]
 pub(crate) struct AddEdge {
-    pub(crate) src: Py<NativeNode>,
-    pub(crate) dst: Py<NativeNode>,
+    pub(crate) src: Py<SymbolNode>,
+    pub(crate) dst: Py<SymbolNode>,
     pub(crate) flags: u32,
 }
 
@@ -147,7 +147,7 @@ pub(crate) struct AddEdge {
 impl AddEdge {
     #[new]
     #[pyo3(signature = (src, dst, *, flags = 0))]
-    fn new(src: Py<NativeNode>, dst: Py<NativeNode>, flags: u32) -> Self {
+    fn new(src: Py<SymbolNode>, dst: Py<SymbolNode>, flags: u32) -> Self {
         Self { src, dst, flags }
     }
 }
@@ -160,7 +160,7 @@ impl AddEdge {
 /// node for the reason.
 #[pyclass(frozen, get_all)]
 pub(crate) struct AddEntrypoint {
-    pub(crate) decl: Py<NativeNode>,
+    pub(crate) decl: Py<SymbolNode>,
     pub(crate) marker: String,
 }
 
@@ -168,7 +168,7 @@ pub(crate) struct AddEntrypoint {
 impl AddEntrypoint {
     #[new]
     #[pyo3(signature = (decl, *, marker))]
-    fn new(decl: Py<NativeNode>, marker: String) -> Self {
+    fn new(decl: Py<SymbolNode>, marker: String) -> Self {
         Self { decl, marker }
     }
 }
@@ -187,8 +187,8 @@ pub(crate) struct AddNode {
     pub(crate) kind: &'static str,
     pub(crate) path: String,
     pub(crate) flags: u32,
-    pub(crate) edges_from: Vec<Py<NativeNode>>,
-    pub(crate) edges_to: Vec<Py<NativeNode>>,
+    pub(crate) edges_from: Vec<Py<SymbolNode>>,
+    pub(crate) edges_to: Vec<Py<SymbolNode>>,
 }
 
 #[pymethods]
@@ -208,8 +208,8 @@ impl AddNode {
         path: String,
         kind: &str,
         flags: u32,
-        edges_from: Vec<Py<NativeNode>>,
-        edges_to: Vec<Py<NativeNode>>,
+        edges_from: Vec<Py<SymbolNode>>,
+        edges_to: Vec<Py<SymbolNode>>,
     ) -> PyResult<Self> {
         Ok(Self {
             fqname,
@@ -229,10 +229,10 @@ pub(crate) fn not_materialized(op: &str) -> PyErr {
     ))
 }
 
-/// Project a `NativeNode` onto the `NodeKey` used for intern-table
+/// Project a `SymbolNode` onto the `NodeKey` used for intern-table
 /// identity. Clones the two `String` fields (`fqname`, `path`); the
 /// rest are `Copy`.
-pub(crate) fn node_key_of(node: &NativeNode) -> NodeKey {
+pub(crate) fn node_key_of(node: &SymbolNode) -> NodeKey {
     NodeKey {
         fqname: node.fqname.clone(),
         kind: node.kind,
@@ -308,7 +308,7 @@ pub(crate) fn apply_graph_op(
         drop(decl);
         let marker_idx = outputs.builder.intern_node(
             py,
-            NativeNode {
+            SymbolNode {
                 fqname: marker_fqname,
                 kind: "synthetic",
                 path,
@@ -326,7 +326,7 @@ pub(crate) fn apply_graph_op(
     if let Ok(add_node) = op.extract::<PyRef<AddNode>>() {
         let node_idx = outputs.builder.intern_node(
             py,
-            NativeNode {
+            SymbolNode {
                 fqname: add_node.fqname.clone(),
                 kind: add_node.kind,
                 path: add_node.path.clone(),
@@ -354,10 +354,10 @@ pub(crate) fn apply_graph_op(
     )))
 }
 
-/// Resolve a `NativeNode` reference to its builder-side index for an
+/// Resolve a `SymbolNode` reference to its builder-side index for an
 /// edge endpoint. Surfaces a precise `ValueError` (with `side`) when
 /// the node was never interned in this context.
-pub(crate) fn lookup_idx(builder: &GraphBuilder, node: &NativeNode, side: &str) -> PyResult<usize> {
+pub(crate) fn lookup_idx(builder: &GraphBuilder, node: &SymbolNode, side: &str) -> PyResult<usize> {
     builder
         .node_index
         .get(&node_key_of(node))
@@ -371,7 +371,7 @@ pub(crate) fn lookup_idx(builder: &GraphBuilder, node: &NativeNode, side: &str) 
 }
 
 /// Map a plugin-supplied `kind` string to one of the stable `&'static
-/// str` kinds NativeNode carries.
+/// str` kinds SymbolNode carries.
 pub(crate) fn static_kind_str(kind: &str) -> PyResult<&'static str> {
     Ok(match kind {
         "synthetic" => "synthetic",

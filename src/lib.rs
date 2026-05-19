@@ -39,7 +39,7 @@ mod query;
 use pyo3::prelude::*;
 
 use crate::builder::{AddEdge, AddEntrypoint, AddNode};
-use crate::graph::{EdgeFlags, Import, NativeGraph, NativeNode, NodeFlags};
+use crate::graph::{EdgeFlags, Import, NativeGraph, SymbolNode, NodeFlags};
 use crate::project::{Project, ProjectContext};
 use crate::query::{
     CallQuery, CallRef, ClassQuery, ConstructionQuery, ConstructionRef, DecoratorQuery,
@@ -62,7 +62,7 @@ fn query_fn(slf: Py<ProjectContext>, _py: Python<'_>) -> QueryBuilder {
 #[pyo3(name = "_native")]
 fn dead_cst_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Import>()?;
-    m.add_class::<NativeNode>()?;
+    m.add_class::<SymbolNode>()?;
     m.add_class::<NativeGraph>()?;
     m.add_class::<Project>()?;
     m.add_class::<ProjectContext>()?;

@@ -38,7 +38,7 @@ use ty_python_semantic::SemanticModel;
 
 use crate::builder::GraphBuilder;
 use crate::graph::{
-    DeclIndex, GlobalsByName, Import, ImportSpec, LiveDeclIndex, NativeNode, Resolution,
+    DeclIndex, GlobalsByName, Import, ImportSpec, LiveDeclIndex, SymbolNode, Resolution,
     StarReexports,
 };
 use crate::helpers::{
@@ -91,7 +91,7 @@ pub(crate) fn ingest_decls(
     let (msl, msc, mel, mec) = position(&line_index, &source, parsed.syntax().range);
     let module_idx = builder.intern_node(
         py,
-        NativeNode {
+        SymbolNode {
             fqname: module_fqname.clone(),
             kind: "module",
             path: path_str.clone(),
@@ -237,7 +237,7 @@ pub(crate) fn ingest_decls(
 
         let node_idx = builder.intern_node(
             py,
-            NativeNode {
+            SymbolNode {
                 fqname: format!("{module_fqname}.{local_name}"),
                 kind: node_kind,
                 path: path_str.clone(),
@@ -1022,7 +1022,7 @@ pub(crate) fn mint_module_node(
     let flags = file_default_flags(db, file);
     let idx = builder.intern_node(
         py,
-        NativeNode {
+        SymbolNode {
             fqname,
             kind: "module",
             path: path_str,

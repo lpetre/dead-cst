@@ -209,7 +209,7 @@ def test_decorator_ref_args_kwargs_empty_for_bare_decorator(make_ctx):
 
 def test_kwarg_payload_surfaces_nativenode_for_imported_symbol(make_ctx):
     """``@register(handler=ImportedClass)`` exposes ImportedClass as a
-    NativeNode in ``ref.kwargs["handler"]`` so plugins can anchor inverted
+    SymbolNode in ``ref.kwargs["handler"]`` so plugins can anchor inverted
     edges off the resolved decl."""
 
     def capture(ctx):
@@ -247,7 +247,7 @@ def test_kwarg_payload_surfaces_nativenode_for_imported_symbol(make_ctx):
     plugin = _CapturePlugin(capture)
     ctx.add_plugin(plugin)
     ctx.materialize()
-    # NativeNode resolution finds the local import alias (handlers.UserCreated),
+    # SymbolNode resolution finds the local import alias (handlers.UserCreated),
     # not the upstream class (events.UserCreated) — the alias is the codemod
     # invariant target. Either is acceptable; the test asserts the fqname is one
     # of those two so the resolution succeeded.
@@ -387,7 +387,7 @@ def test_call_ref_args_kwargs_populated(make_ctx):
 
 
 def test_where_kwarg_with_nativenode_raises(make_ctx):
-    """``where_kwarg`` is literal-only; passing a ``NativeNode`` errors."""
+    """``where_kwarg`` is literal-only; passing a ``SymbolNode`` errors."""
 
     captured: list[Exception] = []
 
@@ -411,7 +411,7 @@ def test_where_kwarg_with_nativenode_raises(make_ctx):
     plugin = _CapturePlugin(capture)
     ctx.add_plugin(plugin)
     ctx.materialize()
-    assert captured, "expected an error from where_kwarg(NativeNode)"
+    assert captured, "expected an error from where_kwarg(SymbolNode)"
     assert "where_kwarg value must be" in str(captured[0])
 
 

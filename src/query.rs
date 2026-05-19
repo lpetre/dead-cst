@@ -11,7 +11,7 @@ use ruff_db::files::File;
 use ty_project::Db as ProjectDb;
 
 use crate::builder::not_materialized;
-use crate::graph::{MainBlock, NativeNode};
+use crate::graph::{MainBlock, SymbolNode};
 use crate::helpers::{
     args_to_py_vec, call_args_match_kwargs, file_path_string, kwarg_matcher_from_py,
     kwargs_to_py_map, KwargMatcher,
@@ -28,13 +28,13 @@ use crate::project::ProjectContext;
 ///   with the middle attribute name.
 #[pyclass(frozen, get_all)]
 pub(crate) struct DecoratorRef {
-    pub(crate) decorated: Py<NativeNode>,
+    pub(crate) decorated: Py<SymbolNode>,
     pub(crate) decorator_name: Option<String>,
     pub(crate) decorator_owner: Option<String>,
     pub(crate) decorator_via: Option<String>,
     /// Positional arguments of the decorator's ``Call`` form. Empty
     /// for bare attribute decorators (``@app.route`` without ``()``).
-    /// Each entry is a Python literal, a :class:`NativeNode` (when the
+    /// Each entry is a Python literal, a :class:`SymbolNode` (when the
     /// expression resolves to a project decl), or ``None``.
     pub(crate) args: Vec<Py<PyAny>>,
     /// Keyword arguments of the decorator's ``Call`` form. Same value
@@ -59,7 +59,7 @@ impl DecoratorRef {
 /// (``"Flask"`` even when imported as ``F``).
 #[pyclass(frozen, get_all)]
 pub(crate) struct ConstructionRef {
-    pub(crate) var: Py<NativeNode>,
+    pub(crate) var: Py<SymbolNode>,
     pub(crate) class_name: String,
 }
 
@@ -75,11 +75,11 @@ impl ConstructionRef {
 /// positional index passed to :meth:`CallQuery.string_arg_at`.
 #[pyclass(frozen, get_all)]
 pub(crate) struct CallRef {
-    pub(crate) owner: Py<NativeNode>,
+    pub(crate) owner: Py<SymbolNode>,
     pub(crate) string_arg: String,
     /// Positional arguments of the matched call, one entry per source
     /// positional arg. Each entry is a Python literal, a
-    /// :class:`NativeNode` (when the expression resolves to a project
+    /// :class:`SymbolNode` (when the expression resolves to a project
     /// decl), or ``None``.
     pub(crate) args: Vec<Py<PyAny>>,
     /// Keyword arguments of the matched call. Same value shape as
@@ -135,12 +135,12 @@ impl QueryBuilder {
 
     /// Look up a module's synthetic node by dotted fqname. Mirrors
     /// :meth:`ProjectContext.find_module`.
-    fn module(&self, py: Python<'_>, fqname: &str) -> PyResult<Option<Py<NativeNode>>> {
+    fn module(&self, py: Python<'_>, fqname: &str) -> PyResult<Option<Py<SymbolNode>>> {
         self.ctx.borrow(py).find_module(py, fqname)
     }
     /// All top-level declarations bound to the given dotted fqname.
     /// Mirrors :meth:`ProjectContext.find_declarations`.
-    fn declarations(&self, py: Python<'_>, fqname: &str) -> PyResult<Vec<Py<NativeNode>>> {
+    fn declarations(&self, py: Python<'_>, fqname: &str) -> PyResult<Vec<Py<SymbolNode>>> {
         self.ctx.borrow(py).find_declarations(py, fqname)
     }
     /// Every top-level declaration node of the named module.
@@ -149,7 +149,7 @@ impl QueryBuilder {
         &self,
         py: Python<'_>,
         fqname: &str,
-    ) -> PyResult<Vec<Py<NativeNode>>> {
+    ) -> PyResult<Vec<Py<SymbolNode>>> {
         self.ctx.borrow(py).find_module_top_level_decls(py, fqname)
     }
     /// The exported names listed in a module's ``__all__`` (when
@@ -160,14 +160,14 @@ impl QueryBuilder {
         &self,
         py: Python<'_>,
         fqname: &str,
-    ) -> PyResult<Option<Vec<Py<NativeNode>>>> {
+    ) -> PyResult<Option<Vec<Py<SymbolNode>>>> {
         self.ctx
             .borrow(py)
             .find_module_dunder_all_exports(py, fqname)
     }
     /// All top-level ``__dunder__`` declarations across the project.
     /// Mirrors :meth:`ProjectContext.find_module_dunders`.
-    fn module_dunders(&self, py: Python<'_>) -> PyResult<Vec<Py<NativeNode>>> {
+    fn module_dunders(&self, py: Python<'_>) -> PyResult<Vec<Py<SymbolNode>>> {
         self.ctx.borrow(py).find_module_dunders(py)
     }
     /// Every ``if __name__ == "__main__":`` block in the project,
@@ -183,7 +183,7 @@ impl QueryBuilder {
         &self,
         py: Python<'_>,
         pattern: &str,
-    ) -> PyResult<Vec<(Py<NativeNode>, String)>> {
+    ) -> PyResult<Vec<(Py<SymbolNode>, String)>> {
         self.ctx.borrow(py).find_comment_patterns(py, pattern)
     }
 }
@@ -273,7 +273,7 @@ pub(crate) fn _contains_any_identifier(source: &str, needles: &[&str]) -> bool {
 /// Caller is responsible for releasing the GIL with
 /// :meth:`pyo3::Python::allow_threads` — the closure passed in must
 /// be ``Send + Sync`` and ``T`` must be ``Send``. Materializing
-/// ``Py<NativeNode>`` values (which are GIL-bound) belongs in the
+/// ``Py<SymbolNode>`` values (which are GIL-bound) belongs in the
 /// caller AFTER ``allow_threads`` returns.
 pub(crate) fn par_scan_files<T, F>(
     db: Box<dyn ProjectDb>,
@@ -333,7 +333,7 @@ pub(crate) struct DecoratorQuery {
     pub(crate) names: Option<Vec<String>>,
     pub(crate) owner_attrs: Option<Vec<String>>,
     pub(crate) via_attr: Option<String>,
-    pub(crate) in_decl: Option<Py<NativeNode>>,
+    pub(crate) in_decl: Option<Py<SymbolNode>>,
     pub(crate) path_regex: Option<String>,
     pub(crate) kwarg_matchers: Vec<(String, KwargMatcher)>,
 }
@@ -390,7 +390,7 @@ impl DecoratorQuery {
         slf.owner_attrs = Some(_extract_str_or_list(py, attrs)?);
         Ok(slf)
     }
-    fn in_decl<'py>(mut slf: PyRefMut<'py, Self>, node: Py<NativeNode>) -> PyRefMut<'py, Self> {
+    fn in_decl<'py>(mut slf: PyRefMut<'py, Self>, node: Py<SymbolNode>) -> PyRefMut<'py, Self> {
         slf.in_decl = Some(node);
         slf
     }
@@ -403,7 +403,7 @@ impl DecoratorQuery {
     ///
     /// ``value`` must be a Python literal (``None`` / ``bool`` /
     /// ``int`` / ``float`` / ``str`` / ``list`` / ``tuple``). Passing
-    /// any other type — including a :class:`NativeNode` — raises
+    /// any other type — including a :class:`SymbolNode` — raises
     /// ``ValueError``.
     fn where_kwarg<'py>(
         mut slf: PyRefMut<'py, Self>,
@@ -427,7 +427,7 @@ impl DecoratorQuery {
         let outputs = outputs_borrow
             .as_ref()
             .ok_or_else(|| not_materialized("DecoratorQuery.collect"))?;
-        let nodes: &[Py<NativeNode>] = &outputs.builder.nodes;
+        let nodes: &[Py<SymbolNode>] = &outputs.builder.nodes;
         let kwarg_matchers = &self.kwarg_matchers;
         if let Some(owner_attrs) = &self.owner_attrs {
             let triples = if let Some(via) = &self.via_attr {
@@ -722,7 +722,7 @@ impl CallQuery {
     ///
     /// ``value`` must be a Python literal (``None`` / ``bool`` /
     /// ``int`` / ``float`` / ``str`` / ``list`` / ``tuple``). Passing
-    /// any other type — including a :class:`NativeNode` — raises
+    /// any other type — including a :class:`SymbolNode` — raises
     /// ``ValueError``.
     fn where_kwarg<'py>(
         mut slf: PyRefMut<'py, Self>,
@@ -764,7 +764,7 @@ impl CallQuery {
         let outputs = outputs_borrow
             .as_ref()
             .ok_or_else(|| not_materialized("CallQuery.collect"))?;
-        let nodes: &[Py<NativeNode>] = &outputs.builder.nodes;
+        let nodes: &[Py<SymbolNode>] = &outputs.builder.nodes;
         let kwarg_matchers = &self.kwarg_matchers;
         let mut refs: Vec<Py<CallRef>> = Vec::new();
         for (owner_node, s, call_args) in triples {
@@ -812,7 +812,7 @@ impl CallQuery {
 pub(crate) struct SubclassQuery {
     pub(crate) ctx: Py<ProjectContext>,
     pub(crate) base_fqn: Option<String>,
-    pub(crate) base_node: Option<Py<NativeNode>>,
+    pub(crate) base_node: Option<Py<SymbolNode>>,
     pub(crate) transitive: bool,
 }
 
@@ -833,7 +833,7 @@ impl SubclassQuery {
         slf.base_fqn = Some(fqn);
         slf
     }
-    fn of_node<'py>(mut slf: PyRefMut<'py, Self>, node: Py<NativeNode>) -> PyRefMut<'py, Self> {
+    fn of_node<'py>(mut slf: PyRefMut<'py, Self>, node: Py<SymbolNode>) -> PyRefMut<'py, Self> {
         slf.base_node = Some(node);
         slf
     }
@@ -842,7 +842,7 @@ impl SubclassQuery {
         slf
     }
 
-    fn collect(&self, py: Python<'_>) -> PyResult<Vec<Py<NativeNode>>> {
+    fn collect(&self, py: Python<'_>) -> PyResult<Vec<Py<SymbolNode>>> {
         let ctx = self.ctx.borrow(py);
         if let Some(fqn) = &self.base_fqn {
             ctx.find_subclasses(py, fqn, self.transitive)
@@ -882,7 +882,7 @@ impl ImportQuery {
         slf.module = Some(module);
         slf
     }
-    fn collect(&self, py: Python<'_>) -> PyResult<Vec<Py<NativeNode>>> {
+    fn collect(&self, py: Python<'_>) -> PyResult<Vec<Py<SymbolNode>>> {
         let ctx = self.ctx.borrow(py);
         let module = self
             .module
@@ -922,7 +922,7 @@ impl ClassQuery {
         slf.defining_method = Some(name);
         slf
     }
-    fn collect(&self, py: Python<'_>) -> PyResult<Vec<Py<NativeNode>>> {
+    fn collect(&self, py: Python<'_>) -> PyResult<Vec<Py<SymbolNode>>> {
         let ctx = self.ctx.borrow(py);
         let name = self
             .defining_method
@@ -943,7 +943,7 @@ impl ClassQuery {
 /// of constructor bare-names matched inside its body.
 #[pyclass(frozen, get_all)]
 pub(crate) struct FactoryRef {
-    pub(crate) decl: Py<NativeNode>,
+    pub(crate) decl: Py<SymbolNode>,
     pub(crate) kinds: Vec<String>,
 }
 

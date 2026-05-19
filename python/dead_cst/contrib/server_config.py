@@ -40,7 +40,7 @@ class ServerConfigPlugin:
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
         from dead_cst import _native as native
 
-        targets_by_path: dict[str, list[native.NativeNode]] = {}
+        targets_by_path: dict[str, list[native.SymbolNode]] = {}
         for n in ctx.nodes():
             if Path(n.path).name not in self.filenames:
                 continue
