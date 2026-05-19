@@ -48,10 +48,10 @@ def require_native() -> None:
     """Exit early when the rust extension isn't importable — measuring
     a libcst fallback isn't useful for a rust-focused profile."""
     try:
-        from dead_cst import _native  # noqa: F401
+        from dead_cst import native  # noqa: F401
     except ImportError as exc:
         sys.exit(
-            f"ERROR: dead_cst._native not importable ({exc}). "
+            f"ERROR: dead_cst.native not importable ({exc}). "
             "Build with: uv run maturin develop --release"
         )
 

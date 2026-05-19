@@ -49,7 +49,7 @@ from dead_cst.plugins import BUILTIN_PLUGINS
 logging.getLogger("dead_cst").setLevel(logging.ERROR)
 
 require_native()
-from dead_cst import _native as native  # noqa: E402  (require_native gates this)
+from dead_cst import native  # noqa: E402  (require_native gates this)
 
 
 # ---------------------------------------------------------------------------

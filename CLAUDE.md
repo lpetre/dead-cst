@@ -8,7 +8,7 @@ This project uses [uv](https://github.com/astral-sh/uv); always run tools throug
 
 ```bash
 uv sync                                # install package + dev group; triggers maturin
-                                       # to compile src/ → python/dead_cst/_native.*.so
+                                       # to compile src/ → python/dead_cst/native.*.so
 uv run pytest                          # full suite (e2e is deselected by default)
 uv run pytest tests/test_imports.py    # one file
 uv run pytest -k name_substring        # one test by name
@@ -24,18 +24,18 @@ CI runs `prek run --all-files` and the matrix `pytest` (Python 3.11–3.14) on e
 
 ## Architecture
 
-`dead-cst` builds a symbol-level reachability graph of a Python codebase via the rust-backed [`dead_cst._native`](src/) crate (which uses [ty's](https://github.com/astral-sh/ruff) `SemanticIndex`), walks from configured entrypoints, and reports (or removes) anything unreachable.
+`dead-cst` builds a symbol-level reachability graph of a Python codebase via the rust-backed [`dead_cst.native`](src/) crate (which uses [ty's](https://github.com/astral-sh/ruff) `SemanticIndex`), walks from configured entrypoints, and reports (or removes) anything unreachable.
 
 ### Pipeline (top-down)
 
 1. **Path resolution** (`dead_cst/resolvers/`). A `PathResolver` returns a `tuple[Package, ...]` (`Package(path, name, deps)`; deps reference other packages by name). Builtins: `ManualResolver` (explicit `package:dep1,dep2` specs from the CLI's `-p`) and `UvResolver` (parses `uv.lock` to discover workspace members + inter-member dep edges; lives in `dead_cst/contrib/uv.py` and is re-exported from `dead_cst.resolvers`). `Analysis(project_root, resolver=...)` takes exactly one resolver. Construction calls `resolver.resolve(project_root)` and validates the output via `_validate_packages`.
-2. **Graph materialization** (rust crate `dead_cst._native`). `Analysis.materialize_all()` instantiates a `native.ProjectContext` rooted at the project root (each package's path is passed as a `src_root`), registers each plugin's `run(ctx)` callback, and calls `materialize()`. The rust backend uses ty's `SemanticIndex` to:
+2. **Graph materialization** (rust crate `dead_cst.native`). `Analysis.materialize_all()` instantiates a `native.ProjectContext` rooted at the project root (each package's path is passed as a `src_root`), registers each plugin's `run(ctx)` callback, and calls `materialize()`. The rust backend uses ty's `SemanticIndex` to:
    - Parse every `.py` file under the project root and per-package `src_roots`.
    - Resolve every cross-file reference through ty's module resolver and use-def chains.
    - Emit one `kind="import"` node per import alias (and one per name pulled in by `from X import *`).
    - Mark dead-suite branches (`if False:`, code after `return`/`raise`, etc.) with `EdgeFlags.DEAD_BRANCH`.
    - Surface non-first-party imports as `[external dist] X` / `[external file] X` / `[unresolved] X` / `[stdlib] X` synthetic nodes.
-3. **Plugin pass** (rust-side, during `materialize()`). Each registered plugin's `run(ctx)` is invoked with the in-progress `ProjectContext`. Plugins yield `AddNode` / `AddEdge` / `AddEntrypoint` ops; the rust apply pass folds them into the graph in one atomic step. After `materialize()` returns, `Analysis` holds the live `ProjectContext` — there is no Python-side adjacency copy. `SymbolNode`, `Import`, `NodeFlags`, and `EdgeFlags` are re-exports of the rust pyclasses. The compiled rust extension lives at `python/dead_cst/_native.{abi3.so,pyd}` (built by maturin from `src/`) and is imported as `from dead_cst import _native as native`.
+3. **Plugin pass** (rust-side, during `materialize()`). Each registered plugin's `run(ctx)` is invoked with the in-progress `ProjectContext`. Plugins yield `AddNode` / `AddEdge` / `AddEntrypoint` ops; the rust apply pass folds them into the graph in one atomic step. After `materialize()` returns, `Analysis` holds the live `ProjectContext` — there is no Python-side adjacency copy. `SymbolNode`, `Import`, `NodeFlags`, and `EdgeFlags` are re-exports of the rust pyclasses. The compiled rust extension lives at `python/dead_cst/native.{abi3.so,pyd}` (built by maturin from `src/`) and is imported as `from dead_cst import native`.
 4. **Reachability** (`Analysis.reachable` / `PackageView.reachable`). Bulk queries (`reachable` / `dead` / `descendants` / `ancestors` / `kept_alive_by_flags_only`) delegate to `ctx.reachable(...)` / `ctx.descendants(...)` / `ctx.ancestors(...)` — one FFI call per query, no per-node Python ↔ rust round-trips. Default traversal **does** follow `DEAD_BRANCH` edges (preserving today's behavior); `Analysis.kept_alive_by_dead_branches` is the opt-in inverse. `Analysis.kept_alive_by_flags_only(flags)` is the blast-radius query for any `NodeFlags` combination (`TESTCASE`, `NOQA`, or both).
 5. **Codemod** (`dead_cst/codemod.py`). `remove_code(dead_nodes, package_path)` runs a LibCST `RemoveDeadSymbols` transformer keyed on `(fqname, start_line)` pairs (line disambiguates shadowed decls), then prunes now-unused imports via `RemoveImportsVisitor`. The codemod is the only remaining libcst-using stage — it's a pure source rewriter, not a graph builder. `generate_patch(dead_nodes, root)` is the non-destructive twin: returns a `git apply`-compatible unified diff. The `dead-cst remove` CLI uses `generate_patch` exclusively. Both functions take an iterable of dead `SymbolNode`s — edges are ignored, so callers can slice the unreachable set however they like (per SCC, per file, …) without rebuilding a graph.
 
@@ -61,6 +61,7 @@ The supported surface is whatever is re-exported from a module named without a l
 - `dead_cst.plugins` — the synthetic-node prefix constants and every built-in plugin.
 - `dead_cst.resolvers` — `PathResolver`, `ManualResolver`, `UvResolver`.
 - `dead_cst.contrib` — third-party-aware extensions.
+- `dead_cst.native` — the rust-backed extension (re-exported from the top-level package as `dead_cst.native`). Plugin authors doing a deep integration import it as `from dead_cst import native` to construct `GraphOp`s and query the in-progress `ProjectContext`.
 
 `tests/test_public_api.py` pins each public module's `__all__` against a snapshot.
 
@@ -88,7 +89,7 @@ def test_something(build_decl_graph, assert_edges):
 3. Drop generic-Python plugins in `dead_cst/plugins/<name>.py`. Drop framework / third-party-aware plugins in `dead_cst/contrib/<name>.py` and re-export from `dead_cst/plugins/__init__.py`. Register in `BUILTIN_PLUGINS` (`plugins/__init__.py`).
 4. Out-of-tree plugins register under the `dead_cst.plugins` entry-point group; `load_plugin` checks builtins first.
 
-The plugin queries live on `native.ProjectContext` — `find_subclasses`, `find_module`, `find_declarations`, `module_for`, `find_main_blocks`, etc. — plus the chainable `query(ctx).decorators()...` / `.constructions()...` / `.calls()...` builder. See `python/dead_cst/_native.pyi` for the full surface.
+The plugin queries live on `native.ProjectContext` — `find_subclasses`, `find_module`, `find_declarations`, `module_for`, `find_main_blocks`, etc. — plus the chainable `query(ctx).decorators()...` / `.constructions()...` / `.calls()...` builder. See `python/dead_cst/native.pyi` for the full surface.
 
 ## Adding a resolver
 

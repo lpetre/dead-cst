@@ -53,15 +53,15 @@ use crate::query::{
 // ---------------------------------------------------------------------------
 
 /// Module-level alias for ``ctx.query()`` — exists for the ergonomic
-/// ``from dead_cst import _native as native; native.query(ctx)...``
-/// idiom that the plugins rely on.
+/// ``from dead_cst import native; native.query(ctx)...`` idiom that
+/// the plugins rely on.
 #[pyfunction(name = "query")]
 fn query_fn(slf: Py<ProjectContext>, _py: Python<'_>) -> QueryBuilder {
     QueryBuilder { ctx: slf }
 }
 
 #[pymodule]
-#[pyo3(name = "_native")]
+#[pyo3(name = "native")]
 fn dead_cst_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Import>()?;
     m.add_class::<SymbolNode>()?;

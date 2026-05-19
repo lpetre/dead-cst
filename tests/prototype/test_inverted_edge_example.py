@@ -25,7 +25,7 @@ from typing import Iterable
 
 import pytest
 
-native = pytest.importorskip("dead_cst._native")
+native = pytest.importorskip("dead_cst.native")
 
 
 @pytest.fixture
@@ -58,7 +58,7 @@ class HandlerByKwargPlugin:
     kwarg_name: str = ""
 
     def run(self, ctx: "native.ProjectContext") -> Iterable["native.GraphOp"]:
-        from dead_cst import _native as native
+        from dead_cst import native
 
         refs = native.query(ctx).decorators().where_owner_attr([self.decorator_attr]).collect()
         for ref in refs:

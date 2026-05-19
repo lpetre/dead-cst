@@ -15,6 +15,7 @@ EXPECTED_PUBLIC_API: dict[str, list[str]] = {
         "PackageView",
         "SymbolNode",
         "__version__",
+        "native",
     ],
     "dead_cst.analyze": [
         "Analysis",

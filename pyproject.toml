@@ -42,9 +42,9 @@ build-backend = "maturin"
 # Mixed Rust/Python layout per the maturin user guide and pydantic-core's
 # template: ``Cargo.toml`` + ``src/`` at the repo root, Python sources under
 # ``python/dead_cst/``. The Rust ``cdylib`` is compiled and embedded inside
-# the ``dead_cst`` package as ``dead_cst/_native.*.so`` — one wheel ships
+# the ``dead_cst`` package as ``dead_cst/native.*.so`` — one wheel ships
 # both halves.
-module-name = "dead_cst._native"
+module-name = "dead_cst.native"
 python-source = "python"
 # Enables the ``extension-module`` feature defined in ``Cargo.toml``,
 # which forwards to ``pyo3/extension-module`` (skip libpython linkage --
@@ -53,7 +53,7 @@ python-source = "python"
 features = ["extension-module"]
 # Type stub + ``py.typed`` marker that ship alongside the compiled extension.
 # Other ``.py`` sources under ``python/dead_cst/`` are picked up automatically.
-include = ["python/dead_cst/_native.pyi", "python/dead_cst/py.typed"]
+include = ["python/dead_cst/native.pyi", "python/dead_cst/py.typed"]
 
 [dependency-groups]
 dev = [
@@ -126,6 +126,6 @@ known-first-party = ["dead_cst"]
 # unresolved-import case the analyzer is meant to detect, so they aren't
 # meaningful targets for ty.
 include = ["python/dead_cst"]
-# The rust extension is shipped as ``python/dead_cst/_native.pyi`` (peer to
+# The rust extension is shipped as ``python/dead_cst/native.pyi`` (peer to
 # the compiled ``.so``); ty picks it up via the package layout without any
 # extra-paths shim.

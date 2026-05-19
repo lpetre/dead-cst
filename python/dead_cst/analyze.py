@@ -11,7 +11,7 @@ from .resolvers import Package, PathResolver
 from .resolvers._core import _validate_packages
 
 if TYPE_CHECKING:
-    from dead_cst import _native as native
+    from dead_cst import native
 
     from .plugins import Plugin
 
@@ -100,7 +100,7 @@ class Analysis:
     """Lazy entrypoint to the dead-cst pipeline.
 
     Builds the project's symbol graph via the rust backend
-    (:mod:`dead_cst._native`), which uses ty's ``SemanticIndex`` to
+    (:mod:`dead_cst.native`), which uses ty's ``SemanticIndex`` to
     resolve every cross-file reference in one pass. Construction reads
     the resolver's :meth:`PathResolver.resolve` to enumerate first-party
     packages; no source is read or parsed until you ask a question
@@ -173,7 +173,7 @@ class Analysis:
         """Build the project-wide graph (memoized).
 
         Routes through the rust backend
-        (:func:`dead_cst._native.materialize_project`), which uses ty's
+        (:func:`dead_cst.native.materialize_project`), which uses ty's
         ``SemanticIndex`` to assemble the graph in one pass. Each
         registered plugin's ``run(ctx)`` is invoked during this pass.
 

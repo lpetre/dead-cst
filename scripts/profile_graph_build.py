@@ -69,7 +69,7 @@ from _bench_common import (
 logging.getLogger("dead_cst").setLevel(logging.ERROR)
 
 require_native()
-from dead_cst import _native as native  # noqa: E402  (require_native gates this)
+from dead_cst import native  # noqa: E402  (require_native gates this)
 
 
 def _generate_synthetic(num_files: int) -> Path:
@@ -191,7 +191,7 @@ def _bench_with_phases(target: TargetConfig, repeats: int) -> list[dict[str, flo
     Returns ``repeats`` steady-state dicts (drops iter 1)."""
     code = (
         "from pathlib import Path\n"
-        "from dead_cst import _native as native\n"
+        "from dead_cst import native\n"
         f"target_root = {str(target.root)!r}\n"
         f"kwargs = {target.project_kwargs!r}\n"
         f"for _ in range({repeats + 1}):\n"

@@ -7,7 +7,7 @@ mark structural attributes (``SHADOWED`` decls, ``DEAD_BRANCH`` edges,
 explicit ``ENTRYPOINT``\\s).
 
 All four are re-exported straight from the rust extension
-(:mod:`dead_cst._native`) — there is no parallel Python copy anymore.
+(:mod:`dead_cst.native`) — there is no parallel Python copy anymore.
 
 :func:`write_graph` and :func:`read_graph` persist a built graph to
 disk. The on-disk format is one header + a bincode body holding the
@@ -20,19 +20,16 @@ needs plugin-emitted edges must rebuild rather than load.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, Sequence
+from typing import Sequence
 
-from dead_cst import _native as _native_mod
-from dead_cst._native import (
+from dead_cst import native
+from dead_cst.native import (
     EdgeFlags,
     GraphMetadata,
     Import,
     NodeFlags,
     SymbolNode,
 )
-
-if TYPE_CHECKING:
-    from dead_cst import _native as native
 
 #: Default seed mask for reachability queries. ORs together every
 #: :class:`NodeFlags` bit that semantically "keeps a node alive":
@@ -149,7 +146,7 @@ def write_graph(
     """
     nodes = _node_iterable(graph)
     edges = _edge_iterable(graph)
-    _native_mod.write_graph(str(path), nodes, edges, list(meta))
+    native.write_graph(str(path), nodes, edges, list(meta))
 
 
 def read_graph(path: Path | str) -> tuple[LoadedGraph, GraphMetadata]:
@@ -160,7 +157,7 @@ def read_graph(path: Path | str) -> tuple[LoadedGraph, GraphMetadata]:
     so the loader is intentionally strict instead of attempting
     in-place migrations.
     """
-    native_graph, metadata = _native_mod.read_graph(str(path))
+    native_graph, metadata = native.read_graph(str(path))
     return LoadedGraph(list(native_graph.nodes), list(native_graph.edges)), metadata
 
 

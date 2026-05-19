@@ -52,7 +52,7 @@ from .resolvers import (
 )
 
 if TYPE_CHECKING:
-    from dead_cst import _native as native
+    from dead_cst import native
 
     # A graph view the CLI can query for "what's alive": either the
     # live rust context (built this run) or the in-memory wrapper

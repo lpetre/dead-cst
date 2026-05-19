@@ -38,10 +38,20 @@ two versions.
   :func:`dead_cst.graph.write_graph`,
   :func:`dead_cst.graph.read_graph`, and
   :class:`dead_cst.graph.GraphMetadata`. All I/O lives in the rust
-  crate (`dead_cst._native.write_graph` / `.read_graph`); the Python
+  crate (`dead_cst.native.write_graph` / `.read_graph`); the Python
   wrappers handle `SymbolGraph` ↔ `NativeGraph` translation. The
   on-disk format has a hard-versioned header — version mismatch is a
   fatal error, with no migration path (rebuilding a graph is cheap).
+- **`dead_cst.native` is now public.** The rust extension previously
+  shipped as the underscore-prefixed `dead_cst._native`; plugin
+  authors doing a deep integration had to reach into that private
+  path (and into `dead_cst.plugins._base`) to get at
+  `ProjectContext`, `AddNode` / `AddEdge` / `AddEntrypoint`, the
+  `query()` builder, and friends. The module is renamed to
+  `dead_cst.native` and re-exported from the top-level package, so
+  the supported idiom is now ``from dead_cst import native``. The
+  compiled artifact moves accordingly (`python/dead_cst/native.*.so`
+  + `native.pyi`).
 
 ### Removed
 - **``tqdm`` runtime dependency.** Progress reporting moved entirely
@@ -53,6 +63,12 @@ two versions.
   preceded it had no callers.
 
 ### Changed
+- **Breaking: `dead_cst._native` → `dead_cst.native`.** Imports of the
+  form `from dead_cst import _native as native`,
+  `from dead_cst._native import ...`, or
+  `pytest.importorskip("dead_cst._native")` must be rewritten to use
+  the new public path. No compatibility shim is provided —
+  ``dead-cst`` is still alpha.
 - **Annotation references to native types are unquoted.** With
   ``from __future__ import annotations`` already in place across the
   package, ``"native.ProjectContext"``-style string annotations in

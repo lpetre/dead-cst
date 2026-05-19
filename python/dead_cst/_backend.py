@@ -1,6 +1,6 @@
 """Native (rust) backend bridge.
 
-The rust crate (``dead_cst._native``) builds the project graph
+The rust crate (``dead_cst.native``) builds the project graph
 end-to-end using ty's ``SemanticIndex``. This module instantiates a
 :class:`native.ProjectContext`, wires plugins, calls :meth:`materialize`,
 and returns the live context.
@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Sequence
 
 if TYPE_CHECKING:
-    from dead_cst import _native as native
+    from dead_cst import native
 
 
 def materialize_project(
@@ -48,7 +48,7 @@ def materialize_project(
     plugin pass. The CLI sets this; the library API leaves it off.
     indicatif auto-hides on non-TTY stderr.
     """
-    from dead_cst import _native as native
+    from dead_cst import native
     from .plugins import Plugin
 
     ctx = native.ProjectContext(

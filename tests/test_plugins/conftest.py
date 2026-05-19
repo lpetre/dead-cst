@@ -11,7 +11,7 @@ from dead_cst.graph import KEEPALIVE_DEFAULT
 from dead_cst.resolvers import ManualResolver
 
 if TYPE_CHECKING:
-    from dead_cst import _native as native
+    from dead_cst import native
 
 
 @pytest.fixture
