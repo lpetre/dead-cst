@@ -1,5 +1,4 @@
-"""Plugin: mark user-specified symbols (file paths, FQNs, regexes) as
-entrypoints."""
+"""Plugin: mark user-specified symbols (file paths, FQNs, regexes) as entrypoints."""
 
 from __future__ import annotations
 
@@ -9,8 +8,6 @@ from pathlib import Path
 from typing import Iterable
 
 from ._base import Plugin, native
-
-EXPLICIT_PREFIX = "<entrypoint>:"
 
 
 @dataclass

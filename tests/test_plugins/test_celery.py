@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from dead_cst.plugins import CeleryPlugin
 
 
@@ -71,11 +73,11 @@ def test_celery_plugin_keeps_handler_dependencies_alive(build_plugin_graph, reac
     assert "app.models.Unused" not in reached
 
 
-def test_celery_plugin_handles_aliased_class_import(build_plugin_graph, reachable_fqnames):
-    graph = build_plugin_graph(
-        {
-            "app/__init__.py": "",
-            "app/celery.py": """
+@pytest.mark.parametrize(
+    "src",
+    [
+        pytest.param(
+            """
             from celery import Celery as C
 
             app = C("worker")
@@ -83,17 +85,10 @@ def test_celery_plugin_handles_aliased_class_import(build_plugin_graph, reachabl
             @app.task
             def run(): pass
             """,
-        },
-        [CeleryPlugin()],
-    )
-    assert "app.celery.run" in reachable_fqnames(graph)
-
-
-def test_celery_plugin_handles_module_import(build_plugin_graph, reachable_fqnames):
-    graph = build_plugin_graph(
-        {
-            "app/__init__.py": "",
-            "app/celery.py": """
+            id="aliased-class-import",
+        ),
+        pytest.param(
+            """
             import celery
 
             app = celery.Celery("worker")
@@ -101,17 +96,10 @@ def test_celery_plugin_handles_module_import(build_plugin_graph, reachable_fqnam
             @app.task
             def run(): pass
             """,
-        },
-        [CeleryPlugin()],
-    )
-    assert "app.celery.run" in reachable_fqnames(graph)
-
-
-def test_celery_plugin_handles_annotated_assignment(build_plugin_graph, reachable_fqnames):
-    graph = build_plugin_graph(
-        {
-            "app/__init__.py": "",
-            "app/celery.py": """
+            id="module-import",
+        ),
+        pytest.param(
+            """
             from celery import Celery
 
             app: Celery = Celery("worker")
@@ -119,7 +107,13 @@ def test_celery_plugin_handles_annotated_assignment(build_plugin_graph, reachabl
             @app.task
             def run(): pass
             """,
-        },
+            id="annotated-assignment",
+        ),
+    ],
+)
+def test_celery_plugin_handles_import_variants(build_plugin_graph, reachable_fqnames, src):
+    graph = build_plugin_graph(
+        {"app/__init__.py": "", "app/celery.py": src},
         [CeleryPlugin()],
     )
     assert "app.celery.run" in reachable_fqnames(graph)
@@ -155,46 +149,45 @@ def test_celery_plugin_marks_shared_tasks(build_plugin_graph, reachable_fqnames)
     assert "app.tasks.helper" not in reached
 
 
-def test_celery_plugin_shared_task_aliased(build_plugin_graph, reachable_fqnames):
-    graph = build_plugin_graph(
-        {
-            "app/__init__.py": "",
-            "app/tasks.py": """
+@pytest.mark.parametrize(
+    "src, expected",
+    [
+        pytest.param(
+            """
             from celery import shared_task as task
 
             @task
-            def alias_bare(): pass
+            def bare(): pass
 
             @task(bind=True)
-            def alias_called(): pass
+            def called(): pass
             """,
-        },
-        [CeleryPlugin()],
-    )
-    reached = reachable_fqnames(graph)
-    assert "app.tasks.alias_bare" in reached
-    assert "app.tasks.alias_called" in reached
-
-
-def test_celery_plugin_shared_task_module_form(build_plugin_graph, reachable_fqnames):
-    graph = build_plugin_graph(
-        {
-            "app/__init__.py": "",
-            "app/tasks.py": """
+            {"app.tasks.bare", "app.tasks.called"},
+            id="aliased-import",
+        ),
+        pytest.param(
+            """
             import celery
 
             @celery.shared_task
-            def via_module(): pass
+            def bare(): pass
 
             @celery.shared_task(bind=True)
-            def via_module_called(self): pass
+            def called(self): pass
             """,
-        },
+            {"app.tasks.bare", "app.tasks.called"},
+            id="module-import",
+        ),
+    ],
+)
+def test_celery_plugin_shared_task_import_variants(
+    build_plugin_graph, reachable_fqnames, src, expected
+):
+    graph = build_plugin_graph(
+        {"app/__init__.py": "", "app/tasks.py": src},
         [CeleryPlugin()],
     )
-    reached = reachable_fqnames(graph)
-    assert "app.tasks.via_module" in reached
-    assert "app.tasks.via_module_called" in reached
+    assert expected <= reachable_fqnames(graph)
 
 
 def test_celery_plugin_ignores_unrelated_task_decorators(build_plugin_graph, reachable_fqnames):

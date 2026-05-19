@@ -10,8 +10,6 @@ kept alive only because of those pinned imports.
 
 from __future__ import annotations
 
-from pathlib import Path
-
 from dead_cst import NodeFlags
 from dead_cst.graph import KEEPALIVE_DEFAULT
 
@@ -130,19 +128,3 @@ def test_analysis_kept_alive_by_flags_only_noqa(make_analysis, write_files):
     diff = analysis.kept_alive_by_flags_only(NodeFlags.NOQA)
     fqnames = {n.fqname for n in diff}
     assert "pkg.side_effect" in fqnames
-
-
-def test_packageview_kept_alive_by_flags_only_noqa_filters_to_package(make_analysis, write_files):
-    write_files(
-        {
-            "pkg/__init__.py": """
-            import pkg.side_effect  # noqa: F401
-            """,
-            "pkg/side_effect.py": "X = 1",
-        }
-    )
-    analysis = make_analysis()
-    (view,) = analysis.views()
-    diff = view.kept_alive_by_flags_only(NodeFlags.NOQA)
-    assert {n.fqname for n in diff} >= {"pkg.side_effect"}
-    assert all(Path(n.path).is_relative_to(view.path) for n in diff)

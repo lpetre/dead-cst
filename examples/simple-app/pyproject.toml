@@ -1,9 +1,0 @@
-[project]
-name = "simple-app"
-version = "0.0.0"
-description = "Tiny app that demonstrates dead-cst's MainBlockPlugin."
-requires-python = ">=3.11"
-
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"

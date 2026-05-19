@@ -36,7 +36,7 @@ CI runs `prek run --all-files` and the matrix `pytest` (Python 3.11–3.14) on e
    - Mark dead-suite branches (`if False:`, code after `return`/`raise`, etc.) with `EdgeFlags.DEAD_BRANCH`.
    - Surface non-first-party imports as `[external dist] X` / `[external file] X` / `[unresolved] X` / `[stdlib] X` synthetic nodes.
 3. **Plugin pass** (rust-side, during `materialize()`). Each registered plugin's `run(ctx)` is invoked with the in-progress `ProjectContext`. Plugins yield `AddNode` / `AddEdge` / `AddEntrypoint` ops; the rust apply pass folds them into the graph in one atomic step. After `materialize()` returns, `Analysis` holds the live `ProjectContext` — there is no Python-side adjacency copy. `SymbolNode`, `Import`, `NodeFlags`, and `EdgeFlags` are re-exports of the rust pyclasses. The compiled rust extension lives at `python/dead_cst/native.{abi3.so,pyd}` (built by maturin from `src/`) and is imported as `from dead_cst import native`.
-4. **Reachability** (`Analysis.reachable` / `PackageView.reachable`). Bulk queries (`reachable` / `dead` / `descendants` / `ancestors` / `kept_alive_by_flags_only`) delegate to `ctx.reachable(...)` / `ctx.descendants(...)` / `ctx.ancestors(...)` — one FFI call per query, no per-node Python ↔ rust round-trips. Default traversal **does** follow `DEAD_BRANCH` edges (preserving today's behavior); `Analysis.kept_alive_by_dead_branches` is the opt-in inverse. `Analysis.kept_alive_by_flags_only(flags)` is the blast-radius query for any `NodeFlags` combination (`TESTCASE`, `NOQA`, or both).
+4. **Reachability** (`Analysis.reachable` / `Analysis.dead` / `Analysis.descendants` / `Analysis.ancestors`). Bulk queries delegate to `ctx.reachable(...)` / `ctx.descendants(...)` / `ctx.ancestors(...)` — one FFI call per query, no per-node Python ↔ rust round-trips. Default traversal **does** follow `DEAD_BRANCH` edges (preserving today's behavior); `Analysis.kept_alive_by_dead_branches` is the opt-in inverse. `Analysis.kept_alive_by_flags_only(flags)` is the blast-radius query for any `NodeFlags` combination (`TESTCASE`, `NOQA`, or both). Path scoping is the caller's job: filter `analysis.dead()` by `Path(n.path).is_relative_to(pkg)` when you need a per-package slice.
 5. **Codemod** (`dead_cst/codemod.py`). `remove_code(dead_nodes, package_path)` runs a LibCST `RemoveDeadSymbols` transformer keyed on `(fqname, start_line)` pairs (line disambiguates shadowed decls), then prunes now-unused imports via `RemoveImportsVisitor`. The codemod is the only remaining libcst-using stage — it's a pure source rewriter, not a graph builder. `generate_patch(dead_nodes, root)` is the non-destructive twin: returns a `git apply`-compatible unified diff. The `dead-cst remove` CLI uses `generate_patch` exclusively. Both functions take an iterable of dead `SymbolNode`s — edges are ignored, so callers can slice the unreachable set however they like (per SCC, per file, …) without rebuilding a graph.
 
 ### Graph model invariants
@@ -53,10 +53,10 @@ CI runs `prek run --all-files` and the matrix `pytest` (Python 3.11–3.14) on e
 
 ### Public API surface
 
-The supported surface is whatever is re-exported from a module named without a leading `_`. The top-level `dead_cst/__init__.py` re-exports the highlights (`Analysis`, `PackageView`, the graph data types). Deeper symbols live in focused public submodules:
+The supported surface is whatever is re-exported from a module named without a leading `_`. The top-level `dead_cst/__init__.py` re-exports the highlights (`Analysis` plus the graph data types). Deeper symbols live in focused public submodules:
 
 - `dead_cst.graph` — `SymbolNode`, `Import`, `NodeFlags`, `EdgeFlags`.
-- `dead_cst.analyze` — `Analysis` and `PackageView`.
+- `dead_cst.analyze` — `Analysis`.
 - `dead_cst.codemod` — `remove_code` and `generate_patch`.
 - `dead_cst.plugins` — the synthetic-node prefix constants and every built-in plugin.
 - `dead_cst.resolvers` — `PathResolver`, `ManualResolver`, `UvResolver`.

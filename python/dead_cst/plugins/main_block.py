@@ -1,4 +1,4 @@
-"""Plugin: treat ``if __name__ == "__main__":`` blocks as entrypoints."""
+"""Plugin: mark ``if __name__ == "__main__":`` blocks as entrypoints."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ MAIN_BLOCK_PREFIX = "<__main__>:"
 
 @dataclass
 class MainBlockPlugin(Plugin):
-    """Treat ``if __name__ == "__main__":`` blocks as entrypoints.
+    """Mark ``if __name__ == "__main__":`` blocks as entrypoints.
 
     For each module containing a top-level ``if __name__ == "__main__":``
     block, emit a synthetic entrypoint with edges to (a) the containing

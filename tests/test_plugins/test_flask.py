@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from dead_cst.plugins import DispatchAppPlugin, flask_plugin
 
 
@@ -247,11 +249,11 @@ def test_flask_plugin_blueprint_reachable_via_register_blueprint(
     assert "app.routes.things" in reached
 
 
-def test_flask_plugin_handles_aliased_class_import(build_plugin_graph, reachable_fqnames):
-    graph = build_plugin_graph(
-        {
-            "app/__init__.py": "",
-            "app/main.py": """
+@pytest.mark.parametrize(
+    "src",
+    [
+        pytest.param(
+            """
             from flask import Flask as F
 
             app = F(__name__)
@@ -259,17 +261,10 @@ def test_flask_plugin_handles_aliased_class_import(build_plugin_graph, reachable
             @app.route("/")
             def index(): pass
             """,
-        },
-        [flask_plugin()],
-    )
-    assert "app.main.index" in reachable_fqnames(graph)
-
-
-def test_flask_plugin_handles_module_import(build_plugin_graph, reachable_fqnames):
-    graph = build_plugin_graph(
-        {
-            "app/__init__.py": "",
-            "app/main.py": """
+            id="aliased-class-import",
+        ),
+        pytest.param(
+            """
             import flask
 
             app = flask.Flask(__name__)
@@ -277,17 +272,10 @@ def test_flask_plugin_handles_module_import(build_plugin_graph, reachable_fqname
             @app.route("/")
             def index(): pass
             """,
-        },
-        [flask_plugin()],
-    )
-    assert "app.main.index" in reachable_fqnames(graph)
-
-
-def test_flask_plugin_handles_annotated_assignment(build_plugin_graph, reachable_fqnames):
-    graph = build_plugin_graph(
-        {
-            "app/__init__.py": "",
-            "app/main.py": """
+            id="module-import",
+        ),
+        pytest.param(
+            """
             from flask import Flask
 
             app: Flask = Flask(__name__)
@@ -295,7 +283,13 @@ def test_flask_plugin_handles_annotated_assignment(build_plugin_graph, reachable
             @app.route("/")
             def index(): pass
             """,
-        },
+            id="annotated-assignment",
+        ),
+    ],
+)
+def test_flask_plugin_handles_import_variants(build_plugin_graph, reachable_fqnames, src):
+    graph = build_plugin_graph(
+        {"app/__init__.py": "", "app/main.py": src},
         [flask_plugin()],
     )
     assert "app.main.index" in reachable_fqnames(graph)

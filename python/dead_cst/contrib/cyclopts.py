@@ -1,15 +1,4 @@
-"""Plugin: keep cyclopts command and default handlers alive.
-
-Strategy: find top-level ``App()`` instances in each module and emit
-inverse edges (instance -> handler) for every ``@<instance>.command(...)``
-and ``@<instance>.default(...)`` decorator. Cyclopts apps are *not*
-seeded as entrypoints (``seed_as_entrypoint=False``); reachability is
-expected to flow through ``[project.scripts]`` (handled by
-:class:`ProjectScriptsPlugin`) or an ``if __name__ == "__main__":
-app()`` block (handled by :class:`MainBlockPlugin`). Sub-apps attached
-via ``app.command(sub)`` are kept alive through the ordinary reference
-tracked on that call.
-"""
+"""Plugin: keep cyclopts command and default handlers alive."""
 
 from __future__ import annotations
 
@@ -18,6 +7,13 @@ from ..plugins.decl_shapes import DispatchAppPlugin
 
 def cyclopts_plugin() -> DispatchAppPlugin:
     """Wire cyclopts command and default handlers through their app instance.
+
+    Cyclopts apps are not seeded as entrypoints; reachability flows
+    through ``[project.scripts]`` (:class:`ProjectScriptsPlugin`) or an
+    ``if __name__ == "__main__": app()`` block
+    (:class:`MainBlockPlugin`). Sub-apps attached via
+    ``app.command(sub)`` are kept alive through the ordinary reference
+    on that call.
 
     Limitations: only top-level ``X = App(...)`` assignments with a
     single ``Name`` target are detected. Factory-style apps

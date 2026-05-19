@@ -1,18 +1,4 @@
-"""Plugin: keep Flask route handlers and lifecycle hooks alive.
-
-Mirrors :func:`fastapi_plugin`: direct ``X = Flask(...)`` /
-``X = Blueprint(...)`` assignments are classified per-file in
-:meth:`DispatchAppPlugin.observe`, while factory-style apps
-(``X = create_app()``) are deferred to :meth:`DispatchAppPlugin.finalize`
-via ``<flask-pending>:`` markers that the graph walk resolves once
-cross-file edges are in place. Factory functions / classes whose body
-constructs a Flask / Blueprint instance also get a
-``<flask-factory>:<kind>:<owner.fqname>`` marker so the cross-package
-walk has a discriminator even when the factory uses the
-``import flask; flask.Flask()`` attribute form -- in that shape
-:func:`resolve_edges` drops the ``decl='Flask'`` half of the external
-classification and the import-node check alone misses the case.
-"""
+"""Plugin: keep Flask route handlers and lifecycle hooks alive."""
 
 from __future__ import annotations
 
@@ -64,22 +50,12 @@ _REGISTRATION_DECORATORS: frozenset[str] = frozenset(
 def flask_plugin() -> DispatchAppPlugin:
     """Mark Flask apps as entrypoints and wire route handlers through them.
 
-    Concrete configuration of the factory-aware
-    :class:`DispatchAppPlugin` shape:
-
-    * Direct ``X = Flask(...)`` / ``X = Blueprint(...)`` assignments are
-      classified per-file. Direct ``Flask`` hits get a ``<flask-app>:``
-      synthetic entrypoint pointed at the variable.
-    * ``@<X>.<verb>(...)`` decorators emit ``X -> handler`` edges.
-      Variables that have handlers but no direct kind get a
-      ``<flask-pending>:`` marker the cross-package finalize pass
-      resolves, supporting the ``X = create_app()`` factory shape.
-    * Top-level decls whose body constructs a Flask / Blueprint
-      instance get a ``<flask-factory>:<kind>:<owner.fqname>`` marker so
-      the pending walk can classify cross-package factory chains where
-      the framework class is reached via the attribute-form
-      ``flask.Flask()`` and the external-edge classifier drops the
-      ``decl='Flask'`` half.
+    Handles direct (``X = Flask(...)``), aliased
+    (``from flask import Flask as F; X = F(...)``), module-prefixed
+    (``import flask; X = flask.Flask(...)``), and factory-style
+    (``X = create_app()``) construction. ``Blueprint`` instances are
+    wired but not seeded as entrypoints, so a blueprint that nothing
+    ``register_blueprint``s stays dead.
     """
     return DispatchAppPlugin(
         marker_prefix="flask",
