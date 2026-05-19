@@ -344,9 +344,7 @@ Two phases per `EdgePlugin`:
   `AddNode` / `AddEdge` / `RemoveEdge` ops.
 
 `PluginContext` provides helpers (`find_module`, `find_declarations`,
-`module_surface`, …; cross-package "who imports X" is
-`analysis.package(path).importers_of(target)`, not a context method)
-and exposes the current package's raw build product via
+`module_surface`, …) and exposes the current package's raw build product via
 `ctx.contribution: PackageContribution` — the
 `Package`, the package-local `SymbolTrie`, the contributed
 `frozenset[SymbolNode]` (`ctx.contribution.nodes`), the raw edge and
@@ -377,15 +375,14 @@ scaffolding (`plugins/decl_shapes.py`):
   cross-package finalize walk that classifies factory chains (`X = create_app()`) and
   promotes auto-entrypoint kinds.
 
-### 7. Reachability — `Analysis.reachable` / `PackageView.reachable`
+### 7. Reachability — `Analysis.reachable`
 
 BFS from every node with `entrypoint=True`. Default traversal **does**
 follow `DEAD_BRANCH` edges (preserving today's behavior).
 `Analysis.kept_alive_by_dead_branches()` is the opt-in inverse, returning
 the blast radius of removing every dead suite by skipping those edges.
-`Analysis.kept_alive_by_flags_only(flags)` / the per-package
-`PackageView` twin returns the blast radius of dropping every
-entrypoint carrying any of those flag bits. Pass `NodeFlags.TESTCASE`
+`Analysis.kept_alive_by_flags_only(flags)` returns the blast radius of
+dropping every entrypoint carrying any of those flag bits. Pass `NodeFlags.TESTCASE`
 for "production code currently kept alive only because tests still
 touch it" (`PytestPlugin` / `UnittestPlugin` stamp `ENTRYPOINT |
 TESTCASE`); pass `NodeFlags.NOQA` for "decls kept alive only by an
@@ -394,11 +391,8 @@ preserved by a per-line or file-level ruff/pyflakes directive); OR
 the bits to combine.
 
 For the raw dead-suite positions themselves (the input to the
-`EdgeFlags.DEAD_BRANCH` flagging from stage 3), call
-`Analysis.dead_suites()` for the merged `{file: tuple[CodeRange, ...]}`
-across every package, or `PackageView.dead_suites()` for one
-package's slice. Both read straight off the per-package contribution
-— no graph materialization required.
+`EdgeFlags.DEAD_BRANCH` flagging from stage 3), iterate
+`ctx.edges()` and filter on `EdgeFlags.DEAD_BRANCH`.
 
 ### 8. Codemod — `dead_cst/codemod.py`
 
@@ -407,9 +401,8 @@ package's slice. Both read straight off the per-package contribution
 then prunes now-unused imports via `RemoveImportsVisitor`. Position
 keying is critical — losing it conflates a dead decl with a live shadow.
 
-The high-level entry point is `PackageView.remove_dead_code()`, which
-materializes the package's interesting-set closure, computes
-reachability, and feeds the unreachable subgraph into `remove_code`.
+Callers feed the unreachable subgraph in directly, e.g.
+`remove_code(list(analysis.dead()), project_root)`.
 
 `generate_patch(G, root)` is the non-destructive twin: same selection
 logic, same two-pass LibCST pipeline (a private `_rewrite_one` helper
@@ -438,17 +431,9 @@ stages happen on demand:
    positions) + the unresolved cross-file import set. Built once per
    package from the payloads above by `dead_cst._package.build_contribution`,
    memoized for the lifetime of the `Analysis`.
-3. **Cross-package composition** — `materialize_all()` (every package)
-   or `materialize_closure(package)` (the "interesting set" of one
-   package — the forward dep closure of that package's reverse-consumer
-   closure). Composing a graph is much cheaper than recomputing
-   payloads, so warm per-package queries stay fast.
-
-Per-package queries that don't need the assembled graph
-(`PackageView.declarations` / `PackageView.count_nodes` /
-`PackageView.dead_suites`) skip stage 3 entirely.
-`Analysis.dead_suites()` also stops at stage 2 — it merges the
-per-package contribution maps without composing a graph.
+3. **Cross-package composition** — `materialize_all()`. The rust
+   backend assembles the whole project graph in one pass via ty's
+   Salsa db; there is no cheaper per-package closure path.
 
 ## Graph model invariants
 
@@ -471,9 +456,9 @@ per-package contribution maps without composing a graph.
   per-import-statement `SimpleStatementLine` walk, so per-alias
   comments inside a parenthesized `from x import (a, b)` are honored.
   The `NOQA` bit is metadata layered on `ENTRYPOINT` (parallel to
-  `TESTCASE`); the single `kept_alive_by_flags_only(flags)` method on
-  `Analysis` / `PackageView` takes either flag (or both ORed) to
-  return the blast radius of dropping the matching entrypoints.
+  `TESTCASE`); the single `Analysis.kept_alive_by_flags_only(flags)`
+  method takes either flag (or both ORed) to return the blast radius
+  of dropping the matching entrypoints.
 * Submodules edge to their parent package, so `__init__.py` stays alive
   as long as anything in the package does.
 * `EdgeFlags.DEAD_BRANCH` is metadata only.

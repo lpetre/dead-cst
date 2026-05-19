@@ -34,6 +34,7 @@ dead-cst analyze ./src --entrypoint-regex ".*__main__\.py"
 
 # Generate a patch that removes dead code, then apply it
 dead-cst remove ./src --entrypoint-regex ".*__main__\.py" | git apply
+# Or, outside a git checkout: dead-cst remove ./src ... | patch -p1
 
 # Drop the test suite and every helper it kept alive
 dead-cst remove ./src --plugin pytest --query test-only | git apply
@@ -97,7 +98,7 @@ Without `--exit-zero`, the exit code is 1 if dead code is found, 0 otherwise.
 
 ### `dead-cst remove`
 
-Emit a `git apply`-compatible unified diff that removes the dead code. The command never touches source files itself — pipe the patch into `git apply` (or write it to a file with `-o` and apply later).
+Emit a unified diff that removes the dead code. The command never touches source files itself — pipe the patch into `git apply` (preferred in a git checkout) or POSIX `patch -p1` (handy when running from a subdirectory or outside git), or write it to a file with `-o` and apply later.
 
 ```
 dead-cst remove ROOT [OPTIONS]
@@ -118,6 +119,9 @@ dead-cst remove ROOT [OPTIONS]
 ```bash
 dead-cst remove ./src -e mypkg.__main__ | git apply
 dead-cst remove ./src -e mypkg.__main__ -o dead.patch && git apply dead.patch
+
+# Outside git, or when running from a sub-directory whose CWD is the patch root:
+dead-cst remove . -e mypkg.__main__ | patch -p1
 ```
 
 ## Python API
@@ -149,10 +153,9 @@ from dead_cst.graph import NodeFlags
 for node in analysis.kept_alive_by_flags_only(NodeFlags.TESTCASE):
     print(f"test-only: {node.fqname}")
 
-# Per-package queries scope work to one package; useful when several
-# packages share a project root.
-pkg = analysis.package(root)
-pkg.remove_dead_code()  # codemod, scoped to this package
+# Rewrite source files to drop every unreachable decl + now-unused import.
+from dead_cst.codemod import remove_code
+remove_code(list(analysis.dead()), root)
 ```
 
 For non-destructive review, `dead_cst.codemod.generate_patch(G, root)` returns the same removal as a `git apply`-compatible unified diff. Selection is driven entirely by `G.nodes`, so you can pass any subgraph slice to review a large codebase as a series of focused patches.
@@ -180,10 +183,11 @@ loaded, meta = read_graph("graph.bin")
 print(meta.node_count, meta.edge_count, dict(meta.user_meta))
 ```
 
-`Analysis(...).materialize_all()` returns a
-`dead_cst._graphstore.SymbolGraph` — a thin dict-of-lists adjacency
-wrapper keyed on `SymbolNode`. `analysis.package(path).graph()`
-returns the same graph filtered to one package.
+`Analysis(...).materialize_all()` returns the live
+`dead_cst._native.ProjectContext`; queries on the `Analysis`
+(`reachable` / `dead` / `descendants` / `ancestors` /
+`kept_alive_by_flags_only`) delegate to the rust BFS without copying
+the graph into Python.
 
 Entrypoint detection is fully plugin-driven. Builtins:
 
@@ -228,7 +232,7 @@ A module-level `import` / `from ... import ...` is itself a declaration of type 
 
 Imports whose source line carries a ruff/pyflakes `# noqa` directive that silences F401 (`# noqa`, `# noqa: F401`, multi-rule `# noqa: E501, F401`, case-variant `# NOQA`) are pinned alive. File-level `# ruff: noqa` and `# flake8: noqa` directives (`ruff:` / `flake8:` is matched case-sensitively per ruff; `noqa` is not) pin every import in the file. This matches ruff's own semantics: an import you have explicitly preserved (re-exports, side-effect imports, `TYPE_CHECKING` shims guarded by F401) is not surfaced as dead and `dead-cst remove` will not drop it.
 
-Pinned imports are tagged with `NodeFlags.NOQA` (in addition to `NodeFlags.ENTRYPOINT`). The opt-in `Analysis.kept_alive_by_flags_only(flags)` / `PackageView.kept_alive_by_flags_only(flags)` query takes any `NodeFlags` combination and returns the "blast radius" of dropping every entrypoint with those flag bits. Pass `NodeFlags.NOQA` to audit stale F401 pins ("if I removed every `# noqa: F401`, what would actually become dead?"), `NodeFlags.TESTCASE` for "what would die if you dropped the test suite", or `NodeFlags.TESTCASE | NodeFlags.NOQA` to combine in one pass.
+Pinned imports are tagged with `NodeFlags.NOQA` (in addition to `NodeFlags.ENTRYPOINT`). The opt-in `Analysis.kept_alive_by_flags_only(flags)` query takes any `NodeFlags` combination and returns the "blast radius" of dropping every entrypoint with those flag bits. Pass `NodeFlags.NOQA` to audit stale F401 pins ("if I removed every `# noqa: F401`, what would actually become dead?"), `NodeFlags.TESTCASE` for "what would die if you dropped the test suite", or `NodeFlags.TESTCASE | NodeFlags.NOQA` to combine in one pass.
 
 ## Scope
 
@@ -242,11 +246,12 @@ Jupyter notebooks (`.ipynb`) are ingested too: code cells are concatenated in do
 
 ## Limitations
 
-- `from X import *` is treated pessimistically (every top-level declaration in the target stays alive) **and** materialized: each name the target exposes becomes a synthetic re-export in the importing module's trie, so cross-module `from <importer> import <name>` resolves through to `<name>`'s real source — even across chained `__init__.py` re-exports. When two stars in the same module export the same name, "first writer wins"; Python's runtime "last star wins" semantics is not implemented (see `tests/test_limitations.py::last-star-wins-not-implemented`). Bare-name references inside a function body that rely on a star binding (`from x import *; def a(): g()`) still aren't resolved per-access — LibCST's `ScopeProvider` can't bind them back to the star.
+- `from X import *` is treated pessimistically (every top-level declaration in the target stays alive). Cross-module `from <importer> import <name>` still resolves through to `<name>`'s real source — even across chained `__init__.py` star re-exports — via ty's name resolution, and bare-name uses inside function bodies (`from x import *; def a(): g()`) edge to the upstream decl. When two stars in the same module export the same name, "first writer wins"; Python's runtime "last star wins" semantics is not implemented.
 - `__import__('pkg.mod')` and `importlib.import_module('pkg.mod')` with string-literal arguments emit `EdgeFlags.DYNAMIC_IMPORT` edges to the resolved module / decls; non-literal arguments fall back to opaque external nodes. `DynamicImportFallbackPlugin` opts into per-name fan-out for the dynamic-import case.
 - Dynamic attribute access (`getattr`) and runtime-generated symbols are invisible to static analysis.
 - Only first-party code is analysed; third-party dependencies appear as synthetic `[external dist] <name>` / `[external file] <name>` nodes in the graph (and are the targets of every import that resolves outside the project).
 - `__all__` is followed only when assigned a list/tuple of string literals; dynamic mutation (`__all__.append`, comprehensions, etc.) is not tracked.
+- PEP 572 walrus targets inside a comprehension (`[last := n for n in nums]`) don't surface as top-level decls and module-level uses of the name go unresolved. ty has a `// TODO walrus in comprehensions is implicitly nonlocal`, so the `last` binding stays scoped to the comprehension instead of leaking to the enclosing module per PEP 572 (see `tests/test_limitations.py::comprehension-walrus-doesnt-leak-to-enclosing-scope`).
 
 ## Development
 

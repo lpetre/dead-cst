@@ -128,18 +128,14 @@ def test_pinned_import_keeps_module_alive(make_analysis, write_files):
     """A pinned import is itself an entrypoint, so the module survives reachability."""
     write_files({"m.py": "import os  # noqa: F401\n"})
     analysis = make_analysis()
-    analysis.materialize_all()
-    (view,) = analysis.views()
-    assert list(view.dead()) == []
+    assert list(analysis.dead()) == []
 
 
 def test_unpinned_import_in_dead_module_stays_dead(make_analysis, write_files):
     """Without the directive, an unused import in an otherwise-dead module is dead."""
     write_files({"m.py": "import os\n"})
     analysis = make_analysis()
-    analysis.materialize_all()
-    (view,) = analysis.views()
-    dead_fqs = {n.fqname for n in view.dead()}
+    dead_fqs = {n.fqname for n in analysis.dead()}
     assert "m.os" in dead_fqs
 
 

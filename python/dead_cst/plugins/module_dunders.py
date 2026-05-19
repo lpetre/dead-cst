@@ -7,8 +7,6 @@ from typing import Iterable
 
 from ._base import Plugin, native
 
-DUNDER_PREFIX = "<dunder>:"
-
 
 @dataclass
 class ModuleDundersPlugin(Plugin):

@@ -12,13 +12,11 @@ EXPECTED_PUBLIC_API: dict[str, list[str]] = {
         "EdgeFlags",
         "Import",
         "NodeFlags",
-        "PackageView",
         "SymbolNode",
         "__version__",
     ],
     "dead_cst.analyze": [
         "Analysis",
-        "PackageView",
     ],
     "dead_cst.codemod": ["generate_patch", "remove_code"],
     "dead_cst.graph": [

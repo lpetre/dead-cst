@@ -11,7 +11,6 @@ from ..plugins._base import Plugin, native
 
 _COMMANDS_BOT_KINDS: frozenset[str] = frozenset({"Bot", "AutoShardedBot"})
 _DISCORD_CLIENT_KINDS: frozenset[str] = frozenset({"Client", "AutoShardedClient"})
-_COG_BASES: frozenset[str] = frozenset({"Cog", "GroupCog"})
 
 _BOT_DECORATORS: frozenset[str] = frozenset(
     {
@@ -29,8 +28,6 @@ _BOT_DECORATORS: frozenset[str] = frozenset(
 )
 
 _TREE_DECORATORS: frozenset[str] = frozenset({"command", "context_menu"})
-
-DISCORDPY_APP_PREFIX = "<discordpy-app>:"
 DISCORDPY_COG_PREFIX = "<discordpy-cog>:"
 DISCORDPY_EXTENSION_PREFIX = "<discordpy-extension>:"
 
