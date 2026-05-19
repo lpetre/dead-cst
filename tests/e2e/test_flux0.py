@@ -249,13 +249,6 @@ def test_flux0_server_dead_set_pins_to_real_findings(flux0_server_src):
     assert dead == {
         "flux0_server.main.DEFAULT_PORT",
         "flux0_server.main.SERVER_ADDRESS",
-        # Module-level annotation-only decl (``X: T``) rebound inside a
-        # function via ``global X``. The cross-file uses of the name
-        # route to the function-scope binding, leaving the module-level
-        # decl with zero incoming edges. Known dead-cst limitation, not
-        # a real dead finding -- documenting it here so the test still
-        # pins the durable set.
-        "flux0_server.main.BACKGROUND_TASK_SERVICE",
     }, f"unexpected server dead set: {sorted(dead)}"
 
 
@@ -323,5 +316,4 @@ def test_flux0_internal_modules(flux0_server_src, tmp_path):
     assert dead == {
         "flux0_server.main.DEFAULT_PORT",
         "flux0_server.main.SERVER_ADDRESS",
-        "flux0_server.main.BACKGROUND_TASK_SERVICE",  # See above test.
     }
