@@ -10,7 +10,6 @@ use pyo3::PyClass;
 use ruff_db::files::File;
 use ty_project::Db as ProjectDb;
 
-use crate::builder::not_materialized;
 use crate::graph::SymbolNode;
 use crate::helpers::{
     args_to_py_vec, call_args_match_kwargs, file_path_string, kwarg_matcher_from_py,
@@ -430,10 +429,7 @@ impl DecoratorQuery {
         // Cache a snapshot of the build's node pool for arg materialization.
         // Keep the borrow alive for the duration of the loop so we don't
         // reborrow on every iteration.
-        let outputs_borrow = ctx.outputs.borrow();
-        let outputs = outputs_borrow
-            .as_ref()
-            .ok_or_else(|| not_materialized("DecoratorQuery.collect"))?;
+        let outputs = ctx.materialized("DecoratorQuery.collect")?;
         let nodes: &[Py<SymbolNode>] = &outputs.builder.nodes;
         let kwarg_matchers = &self.kwarg_matchers;
         if let Some(owner_attrs) = &self.owner_attrs {
@@ -603,10 +599,7 @@ impl ConstructionQuery {
         let ctx = self.ctx.borrow(py);
         let path_regex = self.path_regex.as_deref();
         let mut refs: Vec<Py<ConstructionRef>> = Vec::new();
-        let outputs_borrow = ctx.outputs.borrow();
-        let outputs = outputs_borrow
-            .as_ref()
-            .ok_or_else(|| not_materialized("ConstructionQuery.collect"))?;
+        let outputs = ctx.materialized("ConstructionQuery.collect")?;
         let nodes: &[Py<SymbolNode>] = &outputs.builder.nodes;
         if let Some(fqn) = &self.class_fqn {
             let pairs = ctx.find_constructions(py, fqn, self.include_subclasses, path_regex)?;
@@ -764,10 +757,7 @@ impl CallQuery {
                  where_owner(...) + where_attr(...); or where_attr(...)",
             ));
         };
-        let outputs_borrow = ctx.outputs.borrow();
-        let outputs = outputs_borrow
-            .as_ref()
-            .ok_or_else(|| not_materialized("CallQuery.collect"))?;
+        let outputs = ctx.materialized("CallQuery.collect")?;
         let nodes: &[Py<SymbolNode>] = &outputs.builder.nodes;
         let kwarg_matchers = &self.kwarg_matchers;
         let mut refs: Vec<Py<CallRef>> = Vec::new();
