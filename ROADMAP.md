@@ -146,6 +146,46 @@ demand.
 
 Folded down from earlier tiers as they landed:
 
+- **v0.11.0**: Rust-native graph builder. libcst visitor, SQLite cache,
+  and networkx are replaced by a pyo3 extension on ty's ``SemanticIndex``;
+  libcst now only powers the codemod.
+- **v0.11.0**: ``dead-cst build ROOT -o PATH`` persists the materialized
+  graph; ``analyze`` / ``remove --graph PATH`` reuse it. ``--meta``
+  stashes user-supplied metadata. Public Python API:
+  ``dead_cst.graph.write_graph`` / ``read_graph`` / ``LoadedGraph``.
+- **v0.11.0**: CLI trimmed to ``build`` / ``analyze`` / ``remove``.
+  ``why-alive`` / ``dependencies`` / ``unused-exports`` are removed
+  (still in the Python API). ``--query {dead,test-only}`` plumbs the
+  ``NodeFlags.TESTCASE`` blast-radius query through to the codemod.
+  ``--entrypoint-regex`` replaces the ``-e re:`` magic prefix.
+  ``--exit-zero`` keeps the exit code at 0.
+- **v0.11.0**: Build system switched from hatchling to maturin. Rust
+  crate in ``src/``, Python in ``python/dead_cst/``, wheel ships
+  ``_native.{abi3.so,pyd}``.
+- **v0.11.0**: Plugin protocol simplified. Subclass ``Plugin`` and
+  implement ``run(ctx)`` yielding ``AddNode`` / ``AddEdge`` /
+  ``AddEntrypoint``; ``observe()`` / ``finalize()`` are gone. Framework
+  plugins are factory functions (``fastapi_plugin()``, ``flask_plugin()``,
+  etc.). Plugin queries use a chainable builder
+  (``query(ctx).decorators().where_module(...)``); ``ctx.find_*`` helpers
+  are gone.
+- **v0.11.0**: Python ``SymbolGraph`` facade dropped.
+  ``Analysis.materialize_all()`` returns the live
+  ``native.ProjectContext`` directly; reachability walks are a single
+  FFI BFS. ``PackageView`` removed (filter ``analysis.dead()`` by
+  ``Path(n.path).is_relative_to(pkg)`` for per-package slices).
+  ``codemod.remove_code`` / ``generate_patch`` take an iterable of dead
+  ``SymbolNode``\ s instead of a graph.
+- **v0.11.0**: ``EdgeFlags.DEAD_BRANCH`` edges via ty's reachability
+  constraints (replacing ``TruthinessResolver``).
+  ``EdgeFlags.DYNAMIC_IMPORT`` edges for string-literal ``__import__()`` /
+  ``importlib.import_module()``. ``.pyi`` ingestion for
+  compiled-extension layouts.
+- **v0.11.0**: Fixes — ``ModuleDundersPlugin`` pins module-level dunder
+  *functions* (PEP 562 ``__getattr__`` / ``__dir__``); quoted type
+  annotations contribute use edges via ty's
+  ``enter_string_annotation``; ``from .submod import X`` in
+  ``__init__.py`` no longer reports the submodule attribute as dead.
 - **v0.10.0**: ``from <pkg> import <name>`` now resolves through
   ``from <other> import *`` re-exports. ``build_contribution`` runs a
   second pass after applying per-file payloads: for every module-level

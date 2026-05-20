@@ -12,182 +12,78 @@ two versions.
 ## [0.11.0] - 2026-05-20
 
 ### Added
-- **`dead-cst build`** materializes the project graph and persists it
-  to disk in a bincode-encoded binary file (header + node / edge lists
-  + a small metadata block). Subsequent `dead-cst analyze` and
-  `dead-cst remove` runs can then skip the build with
-  `--graph PATH`, which is useful for CI shapes that run multiple
-  reachability queries against the same code state. Plugins
-  intentionally do *not* round-trip — only the materialized adjacency
-  is captured, so a project that needs plugin-emitted edges must
-  rebuild rather than load.
-- **`--meta key=value`** on `build` stashes arbitrary user-supplied
-  metadata (branch name, commit SHA, etc.) into the graph file's
-  metadata block alongside the auto-recorded `created_at`, node /
-  edge / file / line counts.
-- **`--query {dead,test-only}`** on `analyze` and `remove`. The
-  default `dead` reproduces the previous behaviour; `test-only` runs
-  `kept_alive_by_flags_only(NodeFlags.TESTCASE)` and returns the
-  blast-radius set — code that goes dead the moment you drop the
-  test suite. Plumbs through to the patch emitter, so
-  `dead-cst remove ROOT --query test-only` is the one-shot "delete
-  the test suite and every helper that backed it" workflow.
-- **`--entrypoint-regex REGEX`** as an explicit replacement for the
-  old `-e re:<pattern>` magic prefix.
-- **`--exit-zero`** on `analyze` makes the command always exit 0 even
-  when dead code is found.
-- **Public Python API** for graph persistence:
-  :func:`dead_cst.graph.write_graph`,
-  :func:`dead_cst.graph.read_graph`, and
-  :class:`dead_cst.graph.GraphMetadata`. All I/O lives in the rust
-  crate (`dead_cst._native.write_graph` / `.read_graph`); the Python
-  wrappers handle `SymbolGraph` ↔ `NativeGraph` translation. The
-  on-disk format has a hard-versioned header — version mismatch is a
-  fatal error, with no migration path (rebuilding a graph is cheap).
+- `dead-cst build ROOT -o PATH` persists the materialized graph to a
+  bincode file; `analyze` / `remove --graph PATH` reuse it. Plugins
+  don't round-trip; rebuild to re-run them.
+- `--meta key=value` on `build` stashes user-supplied metadata in the
+  graph file alongside auto-recorded counts.
+- `--query {dead,test-only}` on `analyze` / `remove`. `test-only` runs
+  the `NodeFlags.TESTCASE` blast-radius query.
+- `--entrypoint-regex REGEX` replaces the old `-e re:<pattern>` magic
+  prefix.
+- `--exit-zero` on `analyze` always exits 0.
+- Public graph persistence API: `dead_cst.graph.write_graph`,
+  `read_graph`, `GraphMetadata`, `LoadedGraph`. Hard-versioned header;
+  version mismatch fails fast.
+- `EdgeFlags.DEAD_BRANCH` edges (from `if False:`, post-`return`,
+  etc.) via ty's reachability constraints.
+- `EdgeFlags.DYNAMIC_IMPORT` edges for string-literal `__import__()` /
+  `importlib.import_module()` calls.
+- `.pyi` stub ingestion for compiled-extension layouts.
 
-### Removed
-- **``tqdm`` runtime dependency.** Progress reporting moved entirely
-  to the rust crate's ``indicatif`` bars during the rust refactor;
-  the Python ``dead_cst._progress`` shim that wrapped ``tqdm`` had
-  no callers left.
-- **``dead_cst._notebooks`` helper module.** Notebook ingestion lives
-  in the rust crate (``src/helpers.rs``); the Python helper that
-  preceded it had no callers.
-- **``PackageView`` class (and its accessors).** The per-package view
-  was a thin filter over ``Analysis`` results; ``Analysis.package(p)``,
-  ``Analysis.views()``, and ``Analysis.materialize_closure(p)`` are
-  gone with it. Callers that need a per-package slice filter the
-  project-wide query inline (e.g.
-  ``[n for n in analysis.dead() if Path(n.path).is_relative_to(pkg)]``).
-  ``Analysis.count_nodes()`` and ``PackageView.count_nodes()`` had no
-  external callers and were removed in the same pass; the CLI's
-  per-package histograms go through ``analyze._count_nodes_by_prefix``
-  directly.
-
-### Changed
-- **Annotation references to native types are unquoted.** With
-  ``from __future__ import annotations`` already in place across the
-  package, ``"native.ProjectContext"``-style string annotations in
-  function signatures and variable annotations are no longer needed —
-  they're plain ``native.ProjectContext`` references that the
-  ``TYPE_CHECKING``-guarded import satisfies for type-checkers and
-  that runtime never evaluates. The CLI's ``GraphView`` type alias
-  moves inside the ``TYPE_CHECKING`` block for the same reason.
+### Changed (breaking)
+- Rust-native graph builder. libcst visitor, SQLite per-file cache,
+  and networkx are replaced by a pyo3 extension on ty's
+  `SemanticIndex`. libcst is only used by the codemod now.
+- Build system: hatchling → maturin. Crate in `src/`, Python in
+  `python/dead_cst/`, wheel ships `_native.{abi3.so,pyd}`.
+- CLI trimmed to `build` / `analyze` / `remove`. `why-alive`,
+  `dependencies`, `unused-exports` removed (still in the Python API).
+- `Analysis.materialize_all()` returns a live
+  `native.ProjectContext`; the Python `SymbolGraph` facade is gone.
+  Iterate `ctx.nodes()` / `ctx.edges()`; walk via `ctx.reachable()` /
+  `descendants()` / `ancestors()`.
+- `PackageView` removed. Filter `analysis.dead()` by
+  `Path(n.path).is_relative_to(pkg)` for per-package slices.
+- `codemod.remove_code` / `generate_patch` take an iterable of dead
+  `SymbolNode`s (not a graph).
+- Plugin protocol: subclass `Plugin`, implement `run(ctx)` yielding
+  `AddNode` / `AddEdge` / `AddEntrypoint`. `observe()` / `finalize()`
+  and per-file caching are gone.
+- `Plugin.name` / `version` fields dropped. Progress label is
+  `type(plugin).__qualname__`. The three declarative bases
+  (`DecoratedDeclPlugin`, `DispatchAppPlugin`, `LiteralListPlugin`)
+  gained a required `marker_prefix` field.
+- Framework plugins are now factory functions (`fastapi_plugin()`,
+  `flask_plugin()`, `typer_plugin()`, `cyclopts_plugin()`,
+  `fastmcp_plugin()`). Plugins with custom `run()` or per-instance
+  config remain classes.
+- Plugin query API: chainable builder
+  (`query(ctx).decorators().where_module(...).collect()`) replaces
+  `ctx.find_*` helpers.
+- Plugin / resolver registries live in `dead_cst.cli`. Contrib plugin
+  re-exports from `dead_cst.plugins` are gone, as is `UvResolver` from
+  `dead_cst.resolvers` — import from `dead_cst.contrib`.
+- `BUILTIN_PLUGINS` / `BUILTIN_RESOLVERS` / `load_plugin` /
+  `load_resolver` removed.
+- `-e re:<pattern>` magic prefix dropped (use `--entrypoint-regex`);
+  plain `-e` is now path-or-FQN only.
 
 ### Fixed
-- **`ModuleDundersPlugin` now pins module-level dunder *functions*.**
-  PEP 562 ``__getattr__`` / ``__dir__`` defined at module scope are
-  observable to the import / attribute-access machinery, the same way
-  module dunder *variables* are. The plugin previously filtered to
-  ``kind == "variable"`` only, so these functions (and any imports /
-  helper vars they depended on) were falsely reported dead. Dunder
-  *methods* inside a class are unaffected — they ride on their
-  enclosing class's reachability.
-- **Quoted type annotations contribute use edges.** Names that appear
-  only inside a string annotation (``"Helper"`` in
-  ``def f(x: "Helper")``, common under ``if TYPE_CHECKING:`` /
-  ``from __future__ import annotations``) now resolve through ty's
-  ``enter_string_annotation`` sub-model and emit the same alias /
-  upstream edges they would unquoted. Regular string literals in
-  non-annotation positions are untouched.
-- **``from .submod import X`` inside ``__init__.py`` no longer reports
-  the submodule attribute as dead.** ty mints an extra
-  ``ImportFromSubmodule`` binding for the side-effect ``pkg.submod``
-  attribute that Python rebinds whenever the statement executes; the
-  graph now wires ``sibling_alias → submodule_alias`` edges so the
-  attribute alias stays alive as long as any sibling alias from the
-  same statement does. When every sibling is dead, the whole statement
-  collapses normally.
-
-### Changed (breaking)
-- **CLI trimmed to three commands.** `dead-cst why-alive`,
-  `dead-cst dependencies`, and `dead-cst unused-exports` are
-  removed; the data they exposed is still available through the
-  Python API (:meth:`Analysis.ancestors`, the synthetic external-dep
-  nodes under :data:`EXTERNAL_PREFIXES`, and the `__all__`-only
-  blast-radius query, respectively). The supported surface is
-  `dead-cst build` / `dead-cst analyze` / `dead-cst remove`.
-- **`-e re:<pattern>` magic prefix** is no longer recognized. Use
-  `--entrypoint-regex <pattern>` instead. The plain `-e` flag now
-  treats its argument as a file path or FQN literal.
-- **Plugin and resolver registries moved into the CLI.** The CLI's
-  `--plugin` and `--resolver` flags now resolve names against maps
-  declared in :mod:`dead_cst.cli`, populated by direct imports of
-  every builtin; out-of-tree plugins / resolvers still register under
-  the `dead_cst.plugins` / `dead_cst.resolvers` entry-point groups.
-  The public re-exports of contrib plugins from :mod:`dead_cst.plugins`
-  are gone, as is the `UvResolver` re-export from
-  :mod:`dead_cst.resolvers` — import them from :mod:`dead_cst.contrib`
-  (or the specific contrib submodule). `dead_cst.plugins.load_plugin`,
-  `dead_cst.plugins.BUILTIN_PLUGINS`,
-  `dead_cst.resolvers.load_resolver`, and
-  `dead_cst.resolvers.BUILTIN_RESOLVERS` are removed;
-  :mod:`dead_cst.contrib` no longer uses a lazy ``__getattr__``
-  indirection.
-
-### Changed (breaking)
-- **Dropped the Python ``SymbolGraph`` adjacency facade.**
-  ``Analysis.materialize_all()`` and ``PackageView.graph()`` now return
-  the live :class:`native.ProjectContext` directly — no Python-side
-  dict-of-lists copy, no per-node ``_idx`` allocation. Callers iterate
-  ``ctx.nodes()`` / ``ctx.edges()`` and route adjacency walks through
-  ``ctx.reachable(...)`` / ``ctx.descendants(...)`` / ``ctx.ancestors(...)``.
-  ``codemod.remove_code`` and ``codemod.generate_patch`` now take an
-  iterable of dead ``SymbolNode``\ s instead of a graph; edges were
-  ignored anyway.
-- **Rust-native graph builder.** The libcst CST visitor pipeline, SQLite
-  per-file cache, and networkx graph are all replaced by a pyo3 native
-  extension built on ty's ``SemanticIndex``. Graph construction, import
-  resolution, and reachability walks run entirely in Rust. The only
-  remaining libcst usage is the codemod source rewriter.
-- **Build system.** Switched from hatchling to maturin. The Rust crate
-  lives in ``src/``, Python sources under ``python/dead_cst/``, and the
-  wheel ships ``_native.{abi3.so,pyd}`` alongside the Python code.
-- **``networkx`` → ``rustworkx``.** ``SymbolNode`` and ``Import`` are
-  now frozen pyo3 classes, not Python dataclasses.
-- **Plugin protocol.** Plugins subclass :class:`~dead_cst.plugins.Plugin`
-  and implement a single ``run(ctx: ProjectContext)`` that yields
-  :class:`~dead_cst._native.GraphOp` values (``AddNode`` / ``AddEdge`` /
-  ``AddEntrypoint``). The old ``observe()`` / ``finalize()`` two-phase
-  split and per-file caching are gone.
-- **Plugin ``name`` / ``version`` fields dropped.** The Rust progress bar
-  derives its label from ``type(plugin).__qualname__``. The three
-  declarative bases (:class:`DecoratedDeclPlugin`,
-  :class:`DispatchAppPlugin`, :class:`LiteralListPlugin`) gained a
-  required ``marker_prefix: str`` field that controls the synthetic
-  fqname prefix.
-- **``BUILTIN_PLUGINS``** is now a ``list[Plugin]`` of instances instead
-  of a ``dict[str, type]``. CLI ``--plugin <key>`` lookup is unchanged.
-- **Framework plugins are factory functions.** ``FastAPIPlugin``,
-  ``FastMCPPlugin``, ``FlaskPlugin``, ``TyperPlugin``,
-  ``CycloptsPlugin`` are replaced by lowercase factory functions
-  (e.g. :func:`~dead_cst.plugins.fastapi_plugin`). Plugins with custom
-  ``run()`` logic or per-instance configuration remain classes.
-- **Plugin query API.** ``ctx.find_*`` helpers replaced by a chainable
-  builder (``query(ctx).decorators().where_module(...).collect()``) with
-  Rust-backed cross-file lookups, subclass closures, and
-  decorator/call matching.
-- **Reachability queries.** ``ctx.reachable()`` / ``ctx.descendants()`` /
-  ``ctx.ancestors()`` delegate to a Rust BFS in a single FFI call
-  instead of per-node Python ↔ networkx round-trips.
-
-### Added
-- **Dead-branch detection.** Edges from statically-dead code regions
-  (``if False:``, post-``return``) carry :attr:`EdgeFlags.DEAD_BRANCH`,
-  identified via ty's reachability constraints instead of a custom
-  ``TruthinessResolver``.
-- **Dynamic-import edges.** ``__import__()`` and
-  ``importlib.import_module()`` calls with string-literal args emit
-  :attr:`EdgeFlags.DYNAMIC_IMPORT` edges.
-- **Stub-file support.** ``.pyi`` stubs are ingested for
-  compiled-extension layouts (``_native.so`` + ``_native.pyi`` with no
-  ``.py`` twin).
-- ``ConstructionRef`` gained ``args`` and ``kwargs`` fields (mirroring
-  ``CallRef`` and ``DecoratorRef``).
+- `ModuleDundersPlugin` pins module-level dunder *functions*
+  (`__getattr__` / `__dir__` per PEP 562), not just variables.
+- Quoted type annotations (`def f(x: "Helper")`) contribute use edges
+  via ty's `enter_string_annotation`.
+- `from .submod import X` in `__init__.py` no longer reports the
+  submodule attribute as dead; sibling aliases keep it alive.
 
 ### Removed
-- The libcst graph builder, ``TruthinessResolver``, SQLite per-file
-  cache, and ``networkx`` dependency.
+- `tqdm` runtime dep (rust uses `indicatif`).
+- `PackageView`, `Analysis.count_nodes`, `Analysis.materialize_closure`,
+  `Analysis.package`, `Analysis.views`.
+- `dead_cst._notebooks` helper (notebook ingestion is in rust).
+- libcst graph builder, SQLite cache, `TruthinessResolver`,
+  `networkx` / `rustworkx` deps.
 
 ## [0.10.0] - 2026-05-15
 
