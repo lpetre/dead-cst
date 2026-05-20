@@ -42,6 +42,7 @@ from .contrib.pytest import PytestPlugin
 from .contrib.server_config import ServerConfigPlugin
 from .contrib.typer import typer_plugin
 from .contrib.unittest import UnittestPlugin
+from .contrib.uv import UvResolver
 from .graph import (
     KEEPALIVE_DEFAULT,
     GraphMetadata,
@@ -63,7 +64,6 @@ from .plugins import (
 from .resolvers import (
     ManualResolver,
     PathResolver,
-    load_resolver,
 )
 
 if TYPE_CHECKING:
@@ -141,6 +141,35 @@ def _load_plugin(name: str) -> Plugin:
     raise KeyError(f"Unknown edge plugin: {name!r}")
 
 
+# ---------------------------------------------------------------------------
+# Built-in resolver registry.
+#
+# The CLI's ``--resolver`` flag looks resolvers up by their stable string
+# key. Tool-specific resolvers live under :mod:`dead_cst.contrib` and are
+# imported directly here; out-of-tree resolvers register under the
+# ``dead_cst.resolvers`` entry-point group.
+# ---------------------------------------------------------------------------
+
+_BUILTIN_RESOLVERS: dict[str, type[PathResolver]] = {
+    "uv": UvResolver,
+}
+
+
+def _load_resolver(name: str) -> PathResolver:
+    """Resolve a CLI ``--resolver`` value to a :class:`PathResolver` instance."""
+    cls = _BUILTIN_RESOLVERS.get(name)
+    if cls is not None:
+        return cls()
+
+    from importlib.metadata import entry_points
+
+    for ep in entry_points(group="dead_cst.resolvers"):
+        if ep.name == name:
+            loaded = ep.load()
+            return loaded()
+    raise KeyError(f"Unknown path resolver: {name!r}")
+
+
 class OutputFormat(str, Enum):
     text = "text"
     json = "json"
@@ -204,7 +233,7 @@ def build_resolver(path_specs: list[str], resolver_name: str | None) -> PathReso
     if path_specs and resolver_name is not None:
         raise typer.BadParameter("`-p`/`--path` and `--resolver` are mutually exclusive.")
     if resolver_name is not None:
-        return load_resolver(resolver_name)
+        return _load_resolver(resolver_name)
     if path_specs:
         return ManualResolver(specs=path_specs)
     return ManualResolver(specs=["."])

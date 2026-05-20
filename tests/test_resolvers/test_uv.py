@@ -11,8 +11,8 @@ from pathlib import Path
 
 import pytest
 
+from dead_cst.contrib import UvResolver
 from dead_cst.contrib.uv import MissingVenvError
-from dead_cst.resolvers import UvResolver
 
 
 def _make_fake_venv(workspace_root: Path) -> Path:

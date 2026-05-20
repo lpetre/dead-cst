@@ -66,12 +66,9 @@ EXPECTED_PUBLIC_API: dict[str, list[str]] = {
         "typer_plugin",
     ],
     "dead_cst.resolvers": [
-        "BUILTIN_RESOLVERS",
         "ManualResolver",
         "Package",
         "PathResolver",
-        "UvResolver",
-        "load_resolver",
         "load_toml",
     ],
 }

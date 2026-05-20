@@ -118,10 +118,9 @@ Builtins:
 * `ManualResolver` (`dead_cst/resolvers/manual.py`) — explicit
   `package:dep1,dep2` specs from the CLI's `-p` flag. Auto-promotes
   inline dep paths to their own `Package` records.
-* `UvResolver` (`dead_cst/contrib/uv.py`, re-exported from
-  `dead_cst.resolvers`) — parses `uv.lock` to discover workspace
-  members and inter-member edges; lazily splices the workspace
-  `.venv/site-packages` onto `sys.path` inside its own
+* `UvResolver` (`dead_cst/contrib/uv.py`) — parses `uv.lock` to
+  discover workspace members and inter-member edges; lazily splices
+  the workspace `.venv/site-packages` onto `sys.path` inside its own
   `resolve_import`.
 
 `Analysis` takes exactly one resolver — no chain. CLI flags `-p` and
