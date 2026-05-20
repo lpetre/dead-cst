@@ -32,12 +32,14 @@ jobs:
       - uses: actions/checkout@v6
         with:
           submodules: recursive
+          fetch-depth: 0
       - name: Stamp dev version
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         shell: bash
         run: |
-          base=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)
-          sed -i.bak "s/^version = .*/version = \"${base}-dev${{ github.run_number }}\"/" Cargo.toml
+          python -m pip install --quiet setuptools-scm
+          version=$(python -c "from setuptools_scm import get_version; print(get_version(local_scheme='no-local-version'))" | sed 's/\.dev/-dev/')
+          sed -i.bak "s/^version = .*/version = \"$version\"/" Cargo.toml
           rm Cargo.toml.bak
       - uses: PyO3/maturin-action@v1
         with:
@@ -56,11 +58,13 @@ jobs:
       - uses: actions/checkout@v6
         with:
           submodules: recursive
+          fetch-depth: 0
       - name: Stamp dev version
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: |
-          base=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)
-          sed -i.bak "s/^version = .*/version = \"${base}-dev${{ github.run_number }}\"/" Cargo.toml
+          python -m pip install --quiet setuptools-scm
+          version=$(python -c "from setuptools_scm import get_version; print(get_version(local_scheme='no-local-version'))" | sed 's/\.dev/-dev/')
+          sed -i.bak "s/^version = .*/version = \"$version\"/" Cargo.toml
           rm Cargo.toml.bak
       - uses: PyO3/maturin-action@v1
         with:
