@@ -311,6 +311,24 @@ class ProjectContext:
         invocation during :meth:`materialize`."""
         ...
 
+    def set_src_roots(self, roots: list[str]) -> None:
+        """Swap the first-party search paths on the live Salsa db.
+
+        Reuses the env options captured at construction for everything
+        except ``environment.root`` -- ``extra_paths`` / ``python`` /
+        ``typeshed`` / ``python_version`` / ``python_platform`` stay
+        fixed across swaps. The parse and per-file ``semantic_index``
+        Salsa queries are keyed on ``File`` (not on env), so they
+        survive the swap; only ``resolve_module`` / ``file_to_module``
+        answers and the project's file enumeration are invalidated.
+
+        Designed for the per-package pipeline: between iterations, set
+        ``roots = [pkg + transitive_deps]`` so ty's module resolver
+        only finds the deps that the current package's lockfile actually
+        permits, while the heavy parse + index work stays hot.
+        """
+        ...
+
     def materialize(self) -> NativeGraph:
         """Build the project-wide graph, run each registered plugin's
         ``run(ctx)``, then snapshot the final state.

@@ -13,6 +13,7 @@ use ruff_db::files::File;
 use ruff_db::parsed::parsed_module;
 use ruff_db::source::source_text;
 use ruff_db::system::{OsSystem, SystemPathBuf};
+use ruff_db::Db as SourceDb;
 use ruff_python_ast::token::TokenKind;
 use ruff_python_ast::visitor::Visitor;
 use ruff_python_ast::{Expr, Stmt};
@@ -74,14 +75,8 @@ impl Project {
         python_version: Option<&str>,
         typeshed: Option<&str>,
     ) -> PyResult<Self> {
-        let db = make_db(
-            root,
-            src_roots,
-            extra_paths,
-            python_env,
-            python_version,
-            typeshed,
-        )?;
+        let env = build_env_options(src_roots, extra_paths, python_env, python_version, typeshed)?;
+        let db = make_db(root, env)?;
         Ok(Self { db })
     }
 
@@ -489,6 +484,13 @@ pub(crate) struct ProjectContext {
     /// downgrades to a hidden draw target when stderr isn't a TTY, so
     /// passing ``True`` is safe in CI / pipes.
     pub(crate) show_progress: bool,
+    /// Original env options captured at construction, so :meth:`set_src_roots`
+    /// can rebuild the ``ProgramSettings`` with a new ``root`` list while
+    /// keeping ``extra_paths`` / ``python`` / ``typeshed`` / ``python_version``
+    /// constant. Cloning + mutating this is what lets us swap the
+    /// first-party search paths in place on the live Salsa db so the
+    /// parse + semantic_index caches survive across env swaps.
+    pub(crate) base_env: EnvironmentOptions,
 }
 
 #[pymethods]
@@ -513,14 +515,8 @@ impl ProjectContext {
         typeshed: Option<&str>,
         show_progress: bool,
     ) -> PyResult<Self> {
-        let db = make_db(
-            root,
-            src_roots,
-            extra_paths,
-            python_env,
-            python_version,
-            typeshed,
-        )?;
+        let env = build_env_options(src_roots, extra_paths, python_env, python_version, typeshed)?;
+        let db = make_db(root, env.clone())?;
         Ok(Self {
             db,
             root: root.to_string(),
@@ -528,7 +524,44 @@ impl ProjectContext {
             outputs: RefCell::new(None),
             regex_cache: RefCell::new(HashMap::new()),
             show_progress,
+            base_env: env,
         })
+    }
+
+    /// Swap the first-party search paths on the live Salsa db.
+    ///
+    /// Reuses the env options captured at construction for everything
+    /// except ``environment.root`` — ``extra_paths`` / ``python`` /
+    /// ``typeshed`` / ``python_version`` / ``python_platform`` stay
+    /// fixed across swaps. The parse and per-file ``semantic_index``
+    /// Salsa queries are keyed on ``File`` (not on env), so they
+    /// survive the swap; only ``resolve_module`` / ``file_to_module``
+    /// answers and the project's file enumeration are invalidated.
+    ///
+    /// Designed for the per-package pipeline: between iterations, set
+    /// ``src_roots = [pkg + transitive_deps]`` so ty's module resolver
+    /// only finds the deps that the current package's lockfile actually
+    /// permits, while the heavy parse + index work stays hot.
+    pub(crate) fn set_src_roots(&mut self, roots: Vec<String>) -> PyResult<()> {
+        // Mutate the saved env so subsequent swaps build on the same base.
+        self.base_env.root = Some(roots.into_iter().map(rel_path).collect());
+
+        let metadata = make_metadata(&self.root, self.base_env.clone())?;
+        // ``UseDefaultStrategy::Error`` is ``Infallible``, so the result is
+        // unconditionally ``Ok``; ``let Ok(..)`` keeps the type-level
+        // promise explicit without needing a ``match never {}`` dance.
+        let Ok((program_settings, _diagnostics)) =
+            metadata.to_program_settings(self.db.system(), self.db.vendored(), &UseDefaultStrategy);
+
+        let program = ty_python_core::program::Program::get(&self.db);
+        program.update_from_settings(&mut self.db, program_settings);
+
+        // The project's file enumeration is computed from the (now stale)
+        // search paths; mark it lazy so the next ``files(db)`` re-walks
+        // under the new env.
+        self.db.project().reload_files(&mut self.db);
+
+        Ok(())
     }
 
     /// Absolute project root passed at construction.
@@ -2092,16 +2125,18 @@ impl ProjectContext {
     }
 }
 
-pub(crate) fn make_db(
-    root: &str,
+/// Convert the CLI-style configuration strings into an ``EnvironmentOptions``.
+/// Pulled out of ``make_db`` so :meth:`ProjectContext::set_src_roots` can
+/// stash a clone and mutate just ``root`` on each swap without re-parsing
+/// the python_version string.
+pub(crate) fn build_env_options(
     src_roots: Option<Vec<String>>,
     extra_paths: Option<Vec<String>>,
     python_env: Option<&str>,
     python_version: Option<&str>,
     typeshed: Option<&str>,
-) -> PyResult<ProjectDatabase> {
-    let root = SystemPathBuf::from(root);
-    let env = EnvironmentOptions {
+) -> PyResult<EnvironmentOptions> {
+    Ok(EnvironmentOptions {
         root: src_roots.map(|paths| paths.into_iter().map(rel_path).collect()),
         extra_paths: extra_paths.map(|paths| paths.into_iter().map(rel_path).collect()),
         python: python_env.map(rel_path),
@@ -2115,13 +2150,24 @@ pub(crate) fn make_db(
             .map(RangedValue::cli),
         typeshed: typeshed.map(rel_path),
         ..EnvironmentOptions::default()
-    };
+    })
+}
+
+/// Build a fresh ``ProjectMetadata`` from a root + env. Shared by
+/// ``make_db`` (initial construction) and ``set_src_roots`` (rebuilding
+/// program settings for a new root list).
+pub(crate) fn make_metadata(root: &str, env: EnvironmentOptions) -> PyResult<ProjectMetadata> {
+    let root = SystemPathBuf::from(root);
     let options = Options {
         environment: Some(env),
         ..Options::default()
     };
-    let metadata = ProjectMetadata::from_options(options, root.clone(), None, &UseDefaultStrategy)
-        .map_err(|e| PyValueError::new_err(format!("invalid configuration: {e:?}")))?;
+    ProjectMetadata::from_options(options, root, None, &UseDefaultStrategy)
+        .map_err(|e| PyValueError::new_err(format!("invalid configuration: {e:?}")))
+}
+
+pub(crate) fn make_db(root: &str, env: EnvironmentOptions) -> PyResult<ProjectDatabase> {
+    let metadata = make_metadata(root, env)?;
     let cwd =
         std::env::current_dir().map_err(|e| PyOSError::new_err(format!("cwd unavailable: {e}")))?;
     let cwd = SystemPathBuf::from_path_buf(cwd).map_err(|_| {
