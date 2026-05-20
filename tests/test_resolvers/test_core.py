@@ -31,6 +31,34 @@ def test_validate_packages_resolves_paths():
     assert result[0].path == Path("/a").resolve()
 
 
+def test_validate_packages_exported_paths_default_to_path():
+    """An omitted ``exported_paths`` defaults to ``(path,)`` -- the
+    legacy single-dir shape, so existing resolvers / manual specs
+    don't have to opt in to the new field."""
+    a = Package(path=Path("/a"), name="a")
+    result = _validate_packages([a])
+    assert result[0].exported_paths == (Path("/a").resolve(),)
+
+
+def test_validate_packages_exported_paths_explicit_absolutized():
+    """Explicitly-supplied ``exported_paths`` get absolutized just like
+    ``path`` -- the resolver doesn't have to pre-resolve relative
+    member layouts."""
+    a = Package(path=Path("/a"), name="a", exported_paths=(Path("/a/src"),))
+    result = _validate_packages([a])
+    assert result[0].exported_paths == (Path("/a/src").resolve(),)
+
+
+def test_validate_packages_merges_exported_paths_on_duplicate_path():
+    """When the same package shows up twice (a resolver quirk we
+    tolerate), exported_paths union just like deps. Preserves first-seen
+    order; dedup is on identity."""
+    a1 = Package(path=Path("/a"), name="a", exported_paths=(Path("/a/src"),))
+    a2 = Package(path=Path("/a"), name="a", exported_paths=(Path("/a/extra"),))
+    result = _validate_packages([a1, a2])
+    assert result[0].exported_paths == (Path("/a/src").resolve(), Path("/a/extra").resolve())
+
+
 def test_validate_packages_unknown_dep_raises():
     a = Package(path=Path("/a"), name="a", deps=("missing",))
     with pytest.raises(ValueError, match="unknown dep"):

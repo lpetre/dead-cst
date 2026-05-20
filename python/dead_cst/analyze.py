@@ -150,12 +150,16 @@ class Analysis:
 
         from .plugins import Plugin
 
-        # Pass each first-party package's path as a src_root so the
+        # Feed each package's ``exported_paths`` as src_roots so the
         # rust backend mounts files at the right module fqname
-        # (``pkg_a/A/__init__.py`` -> ``A``, not ``pkg_a.A``).
+        # (``pkg_a/src/A/__init__.py`` -> ``A``, not ``src.A``). The
+        # default ``exported_paths`` is ``(path,)`` (set by
+        # ``_validate_packages``), so a single-package or manual-spec
+        # project sees identical behavior to before this split.
+        src_roots = [str(e) for p in self.packages for e in p.exported_paths]
         ctx = _native.ProjectContext(
             str(self._project_root),
-            src_roots=[str(p.path) for p in self.packages] or None,
+            src_roots=src_roots or None,
             show_progress=self._show_progress,
         )
         for plugin in self._plugins:

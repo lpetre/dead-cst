@@ -83,11 +83,19 @@ def test_uv_resolver_src_layout(tmp_path: Path):
     result = UvResolver().resolve(tmp_path)
     by_name = {p.name: p for p in result}
 
+    # ``path`` is the *owned* member dir -- everything the member is
+    # responsible for, including non-shipped dirs like tests/.
+    # ``exported_paths`` is the *published* contents consumers see:
+    # for src-layout, just ``<member>/src``.
+    core_dir = (tmp_path / "packages" / "core").resolve()
+    app_dir = (tmp_path / "packages" / "app").resolve()
     core_src = (tmp_path / "packages" / "core" / "src").resolve()
     app_src = (tmp_path / "packages" / "app" / "src").resolve()
-    assert by_name["core"].path == core_src
+    assert by_name["core"].path == core_dir
+    assert by_name["core"].exported_paths == (core_src,)
     assert by_name["core"].deps == ()
-    assert by_name["app"].path == app_src
+    assert by_name["app"].path == app_dir
+    assert by_name["app"].exported_paths == (app_src,)
     assert by_name["app"].deps == ("core",)
 
 
@@ -98,11 +106,15 @@ def test_uv_resolver_flat_layout(tmp_path: Path):
     result = UvResolver().resolve(tmp_path)
     by_name = {p.name: p for p in result}
 
+    # Flat-layout: ``path`` and ``exported_paths`` coincide -- the
+    # whole member dir IS the wheel's published contents.
     core_dir = (tmp_path / "packages" / "core").resolve()
     app_dir = (tmp_path / "packages" / "app").resolve()
     assert by_name["core"].path == core_dir
+    assert by_name["core"].exported_paths == (core_dir,)
     assert by_name["core"].deps == ()
     assert by_name["app"].path == app_dir
+    assert by_name["app"].exported_paths == (app_dir,)
     assert by_name["app"].deps == ("core",)
 
 
@@ -182,11 +194,15 @@ def test_uv_resolver_includes_virtual_members(tmp_path: Path):
     result = UvResolver().resolve(tmp_path)
     by_name = {p.name: p for p in result}
 
+    lib_dir = (tmp_path / "libs" / "lib-a").resolve()
+    app_dir = (tmp_path / "apps" / "app-a").resolve()
     lib_src = (tmp_path / "libs" / "lib-a" / "src").resolve()
     app_src = (tmp_path / "apps" / "app-a" / "src").resolve()
-    assert by_name["lib-a"].path == lib_src
+    assert by_name["lib-a"].path == lib_dir
+    assert by_name["lib-a"].exported_paths == (lib_src,)
     assert by_name["lib-a"].deps == ()
-    assert by_name["app-a"].path == app_src
+    assert by_name["app-a"].path == app_dir
+    assert by_name["app-a"].exported_paths == (app_src,)
     assert by_name["app-a"].deps == ("lib-a",)
 
 
@@ -389,9 +405,12 @@ def test_uv_workspace_shared_namespace_package(tmp_path: Path, has_edge):
     by_name = {p.name: p for p in packages}
     foo_a_dir = foo_a.resolve()
     foo_b_dir = foo_b.resolve()
+    # Flat-layout members (no ``src/`` dir) -- path == exported.
     assert by_name["foo-a"].path == foo_a_dir
+    assert by_name["foo-a"].exported_paths == (foo_a_dir,)
     assert by_name["foo-a"].deps == ()
     assert by_name["foo-b"].path == foo_b_dir
+    assert by_name["foo-b"].exported_paths == (foo_b_dir,)
     assert by_name["foo-b"].deps == ("foo-a",)
 
     graph = Analysis(tmp_path, resolver=resolver).materialize_all()
