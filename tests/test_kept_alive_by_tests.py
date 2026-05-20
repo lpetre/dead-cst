@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from dead_cst import NodeFlags
 from dead_cst.graph import KEEPALIVE_DEFAULT
-from dead_cst.plugins import PytestPlugin, UnittestPlugin
+from dead_cst.contrib import PytestPlugin, UnittestPlugin
 
 
 def find_reachable_excluding_tests(graph):

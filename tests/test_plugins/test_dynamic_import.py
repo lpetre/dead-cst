@@ -10,9 +10,9 @@ from dead_cst.plugins import DynamicImportFallbackPlugin, MainBlockPlugin
 
 
 def test_plugin_loadable_by_name():
-    from dead_cst.plugins import load_plugin
+    from dead_cst.cli import _load_plugin
 
-    plugin = load_plugin("dynamic_import_fallback")
+    plugin = _load_plugin("dynamic_import_fallback")
     assert isinstance(plugin, DynamicImportFallbackPlugin)
 
 

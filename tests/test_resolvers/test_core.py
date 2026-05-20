@@ -1,4 +1,4 @@
-"""Tests for :mod:`dead_cst.resolvers._core` and :func:`load_resolver`."""
+"""Tests for :mod:`dead_cst.resolvers._core` and the CLI's resolver loader."""
 
 from __future__ import annotations
 
@@ -6,10 +6,10 @@ from pathlib import Path
 
 import pytest
 
+from dead_cst.cli import _load_resolver
+from dead_cst.contrib import UvResolver
 from dead_cst.resolvers import (
     Package,
-    UvResolver,
-    load_resolver,
     load_toml,
 )
 from dead_cst.resolvers._core import _validate_packages
@@ -45,12 +45,12 @@ def test_validate_packages_duplicate_name_distinct_path_raises():
 
 
 def test_load_resolver_known():
-    assert isinstance(load_resolver("uv"), UvResolver)
+    assert isinstance(_load_resolver("uv"), UvResolver)
 
 
 def test_load_resolver_unknown_raises():
     with pytest.raises(KeyError):
-        load_resolver("does-not-exist")
+        _load_resolver("does-not-exist")
 
 
 def test_load_toml_returns_parsed_data(tmp_path):

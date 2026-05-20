@@ -104,7 +104,7 @@ def test_excluding_multiple_flags_in_one_pass(make_analysis, write_files):
             """,
         }
     )
-    from dead_cst.plugins import PytestPlugin
+    from dead_cst.contrib import PytestPlugin
 
     graph = make_analysis(plugins=[PytestPlugin()]).materialize_all()
     side = next(n for n in graph.nodes() if n.fqname == "pkg.side_effect")

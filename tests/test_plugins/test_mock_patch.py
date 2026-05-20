@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
+from dead_cst.contrib import MockPatchPlugin, PytestPlugin, UnittestPlugin
 from dead_cst.contrib.mock_patch import PATCH_TARGET_PREFIX
-from dead_cst.plugins import MockPatchPlugin, PytestPlugin, UnittestPlugin
 
 # Each entry is a ``tests/test_lib.py`` body that should keep
 # ``pkg.lib.helper`` alive via a string-fqname patch reference. The id
@@ -331,8 +331,8 @@ def test_monkeypatch_setitem_not_recognized(build_plugin_graph, reachable_fqname
     assert "pkg.lib.helper" not in reachable_fqnames(graph)
 
 
-def test_mock_patch_loads_via_load_plugin():
-    from dead_cst.plugins import load_plugin
+def test_mock_patch_loads_via_cli_loader():
+    from dead_cst.cli import _load_plugin
 
-    plugin = load_plugin("mock_patch")
+    plugin = _load_plugin("mock_patch")
     assert isinstance(plugin, MockPatchPlugin)

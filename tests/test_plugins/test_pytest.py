@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dead_cst.graph import NodeFlags
-from dead_cst.plugins import PytestPlugin
+from dead_cst.contrib import PytestPlugin
 
 
 def test_pytest_plugin_marks_test_functions(build_plugin_graph, reachable_fqnames):
@@ -132,10 +132,10 @@ def test_pytest_plugin_ignores_non_test_modules(build_plugin_graph, reachable_fq
     assert "pkg.utils.TestData" not in reached
 
 
-def test_pytest_plugin_loads_via_load_plugin():
-    from dead_cst.plugins import load_plugin
+def test_pytest_plugin_loads_via_cli_loader():
+    from dead_cst.cli import _load_plugin
 
-    plugin = load_plugin("pytest")
+    plugin = _load_plugin("pytest")
     assert isinstance(plugin, PytestPlugin)
 
 

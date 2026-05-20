@@ -36,7 +36,8 @@ from dead_cst.plugins import (
     MainBlockPlugin,
     ModuleDundersPlugin,
 )
-from dead_cst.resolvers import ManualResolver, UvResolver
+from dead_cst.contrib import UvResolver
+from dead_cst.resolvers import ManualResolver
 
 
 def _normalise(s: str) -> str:

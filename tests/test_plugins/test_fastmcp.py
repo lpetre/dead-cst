@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from dead_cst.plugins import DispatchAppPlugin, fastmcp_plugin
+from dead_cst.contrib import fastmcp_plugin
+from dead_cst.plugins import DispatchAppPlugin
 
 
 def test_fastmcp_plugin_marks_tool_handlers(build_plugin_graph, reachable_fqnames):

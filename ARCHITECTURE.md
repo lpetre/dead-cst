@@ -118,10 +118,9 @@ Builtins:
 * `ManualResolver` (`dead_cst/resolvers/manual.py`) — explicit
   `package:dep1,dep2` specs from the CLI's `-p` flag. Auto-promotes
   inline dep paths to their own `Package` records.
-* `UvResolver` (`dead_cst/contrib/uv.py`, re-exported from
-  `dead_cst.resolvers`) — parses `uv.lock` to discover workspace
-  members and inter-member edges; lazily splices the workspace
-  `.venv/site-packages` onto `sys.path` inside its own
+* `UvResolver` (`dead_cst/contrib/uv.py`) — parses `uv.lock` to
+  discover workspace members and inter-member edges; lazily splices
+  the workspace `.venv/site-packages` onto `sys.path` inside its own
   `resolve_import`.
 
 `Analysis` takes exactly one resolver — no chain. CLI flags `-p` and
@@ -350,12 +349,13 @@ Two phases per `EdgePlugin`:
 `frozenset[SymbolNode]` (`ctx.contribution.nodes`), the raw edge and
 import-edge triples, and the per-file dead-suite map.
 
-Builtins ship in `BUILTIN_PLUGINS`. Generic-Python plugins live as
-siblings of `plugins/__init__.py` (`MainBlockPlugin`,
+Builtins ship in `cli._BUILTIN_PLUGINS`, a `dict[str, Plugin]`
+populated by direct imports of every shipped plugin. Generic-Python
+plugins live as siblings of `plugins/__init__.py` (`MainBlockPlugin`,
 `ProjectScriptsPlugin`, `ExplicitEntrypointPlugin`,
 `ModuleDundersPlugin`, `InitSubclassPlugin`). Third-party-aware
 plugins live under `dead_cst/contrib/` and are re-exported from
-`dead_cst.plugins`. `CeleryPlugin` is the full-featured reference for
+`dead_cst.contrib`. `CeleryPlugin` is the full-featured reference for
 two-phase plugins (factory-aware `DispatchAppPlugin` plus a per-file
 `@shared_task` channel spliced in via an `observe()` override);
 `FlaskPlugin` / `FastAPIPlugin` for the factory-aware

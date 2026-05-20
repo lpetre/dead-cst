@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import pytest
 
+from dead_cst.contrib import typer_plugin
 from dead_cst.plugins import (
     DispatchAppPlugin,
     ExplicitEntrypointPlugin,
     MainBlockPlugin,
-    typer_plugin,
 )
 
 

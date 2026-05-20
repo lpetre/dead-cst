@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dead_cst.graph import NodeFlags
-from dead_cst.plugins import ServerConfigPlugin
+from dead_cst.contrib import ServerConfigPlugin
 
 
 def test_gunicorn_conf_module_stays_alive(build_plugin_graph, reachable_fqnames):
@@ -146,10 +146,10 @@ def test_classes_in_config_stay_alive(build_plugin_graph, reachable_fqnames):
     assert "gunicorn.conf.logger_class" in reached
 
 
-def test_server_config_plugin_loads_via_load_plugin():
-    from dead_cst.plugins import load_plugin
+def test_server_config_plugin_loads_via_cli_loader():
+    from dead_cst.cli import _load_plugin
 
-    plugin = load_plugin("server_config")
+    plugin = _load_plugin("server_config")
     assert isinstance(plugin, ServerConfigPlugin)
 
 

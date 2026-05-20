@@ -347,8 +347,8 @@ def test_init_subclass_marker_in_predecessor_chain(make_analysis, write_files, p
     assert parent.kind == "class"
 
 
-def test_init_subclass_loads_via_load_plugin():
-    from dead_cst.plugins import load_plugin
+def test_init_subclass_loads_via_cli_loader():
+    from dead_cst.cli import _load_plugin
 
-    plugin = load_plugin("init_subclass")
+    plugin = _load_plugin("init_subclass")
     assert isinstance(plugin, InitSubclassPlugin)

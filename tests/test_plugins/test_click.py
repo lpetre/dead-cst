@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
+from dead_cst.contrib import ClickPlugin
 from dead_cst.plugins import (
-    ClickPlugin,
     ExplicitEntrypointPlugin,
     MainBlockPlugin,
 )
@@ -564,8 +564,8 @@ def test_click_plugin_ignores_non_group_assignment_shapes(build_plugin_graph, re
     assert "cli.main.cfg" not in reached
 
 
-def test_click_plugin_loads_via_load_plugin():
-    from dead_cst.plugins import load_plugin
+def test_click_plugin_loads_via_cli_loader():
+    from dead_cst.cli import _load_plugin
 
-    plugin = load_plugin("click")
+    plugin = _load_plugin("click")
     assert isinstance(plugin, ClickPlugin)

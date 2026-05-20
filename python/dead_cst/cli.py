@@ -30,6 +30,19 @@ import typer
 
 from .analyze import Analysis, _count_nodes_by_prefix
 from .codemod import generate_patch
+from .contrib.celery import CeleryPlugin
+from .contrib.click import ClickPlugin
+from .contrib.cyclopts import cyclopts_plugin
+from .contrib.discordpy import DiscordPyPlugin
+from .contrib.fastapi import fastapi_plugin
+from .contrib.fastmcp import fastmcp_plugin
+from .contrib.flask import flask_plugin
+from .contrib.mock_patch import MockPatchPlugin
+from .contrib.pytest import PytestPlugin
+from .contrib.server_config import ServerConfigPlugin
+from .contrib.typer import typer_plugin
+from .contrib.unittest import UnittestPlugin
+from .contrib.uv import UvResolver
 from .graph import (
     KEEPALIVE_DEFAULT,
     GraphMetadata,
@@ -40,15 +53,17 @@ from .graph import (
     write_graph,
 )
 from .plugins import (
+    DynamicImportFallbackPlugin,
     ExplicitEntrypointPlugin,
+    InitSubclassPlugin,
+    MainBlockPlugin,
     ModuleDundersPlugin,
     Plugin,
-    load_plugin,
+    ProjectScriptsPlugin,
 )
 from .resolvers import (
     ManualResolver,
     PathResolver,
-    load_resolver,
 )
 
 if TYPE_CHECKING:
@@ -64,6 +79,89 @@ if TYPE_CHECKING:
 
 
 app = typer.Typer(help="Dead code analysis for Python.")
+
+
+_BUILTIN_PLUGINS: dict[str, Plugin] = {
+    "main_block": MainBlockPlugin(),
+    "project_scripts": ProjectScriptsPlugin(),
+    "explicit": ExplicitEntrypointPlugin(),
+    "module_dunders": ModuleDundersPlugin(),
+    "pytest": PytestPlugin(),
+    "unittest": UnittestPlugin(),
+    "mock_patch": MockPatchPlugin(),
+    "server_config": ServerConfigPlugin(),
+    "fastapi": fastapi_plugin(),
+    "fastmcp": fastmcp_plugin(),
+    "flask": flask_plugin(),
+    "typer": typer_plugin(),
+    "click": ClickPlugin(),
+    "cyclopts": cyclopts_plugin(),
+    "celery": CeleryPlugin(),
+    "discordpy": DiscordPyPlugin(),
+    "init_subclass": InitSubclassPlugin(),
+    "dynamic_import_fallback": DynamicImportFallbackPlugin(),
+}
+
+
+def _load_plugin(name: str) -> Plugin:
+    """Resolve a CLI ``--plugin`` value to a plugin instance.
+
+    Builtins (see :data:`_BUILTIN_PLUGINS`) win over entry points; out-of-tree
+    plugins register under the ``dead_cst.plugins`` entry-point group and
+    may expose either a :class:`Plugin` instance or a zero-arg factory.
+    """
+    builtin = _BUILTIN_PLUGINS.get(name)
+    if builtin is not None:
+        return builtin
+
+    from importlib.metadata import entry_points
+
+    for ep in entry_points(group="dead_cst.plugins"):
+        if ep.name == name:
+            loaded = ep.load()
+            if isinstance(loaded, Plugin):
+                return loaded
+            if callable(loaded):
+                instance = loaded()
+                if isinstance(instance, Plugin):
+                    return instance
+            raise TypeError(
+                f"Plugin entry point {name!r} did not resolve to a Plugin instance "
+                f"(got {type(loaded).__name__})"
+            )
+    raise KeyError(f"Unknown edge plugin: {name!r}")
+
+
+_BUILTIN_RESOLVERS: dict[str, type[PathResolver]] = {
+    "uv": UvResolver,
+}
+
+
+def _load_resolver(name: str) -> PathResolver:
+    """Resolve a CLI ``--resolver`` value to a :class:`PathResolver` instance.
+
+    Builtins (see :data:`_BUILTIN_RESOLVERS`) win over entry points;
+    out-of-tree resolvers register under the ``dead_cst.resolvers``
+    entry-point group as a zero-arg :class:`PathResolver` subclass.
+    """
+    cls = _BUILTIN_RESOLVERS.get(name)
+    if cls is not None:
+        return cls()
+
+    from importlib.metadata import entry_points
+
+    for ep in entry_points(group="dead_cst.resolvers"):
+        if ep.name == name:
+            loaded = ep.load()
+            if callable(loaded):
+                instance = loaded()
+                if isinstance(instance, PathResolver):
+                    return instance
+            raise TypeError(
+                f"Resolver entry point {name!r} did not resolve to a "
+                f"PathResolver instance (got {type(loaded).__name__})"
+            )
+    raise KeyError(f"Unknown path resolver: {name!r}")
 
 
 class OutputFormat(str, Enum):
@@ -116,7 +214,7 @@ def build_plugins(
     :class:`re.Pattern`. The explicit-entrypoint plugin runs last so
     it can pin nodes contributed by upstream plugins.
     """
-    plugins: list[Plugin] = [load_plugin(name) for name in plugin_names]
+    plugins: list[Plugin] = [_load_plugin(name) for name in plugin_names]
     plugins.append(ModuleDundersPlugin())
     specs: list[str | Path | re.Pattern[str]] = list(entrypoints)
     specs.extend(re.compile(p) for p in entrypoint_regexes)
@@ -129,7 +227,7 @@ def build_resolver(path_specs: list[str], resolver_name: str | None) -> PathReso
     if path_specs and resolver_name is not None:
         raise typer.BadParameter("`-p`/`--path` and `--resolver` are mutually exclusive.")
     if resolver_name is not None:
-        return load_resolver(resolver_name)
+        return _load_resolver(resolver_name)
     if path_specs:
         return ManualResolver(specs=path_specs)
     return ManualResolver(specs=["."])

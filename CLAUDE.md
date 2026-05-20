@@ -28,7 +28,7 @@ CI runs `prek run --all-files` and the matrix `pytest` (Python 3.11–3.14) on e
 
 ### Pipeline (top-down)
 
-1. **Path resolution** (`dead_cst/resolvers/`). A `PathResolver` returns a `tuple[Package, ...]` (`Package(path, name, deps)`; deps reference other packages by name). Builtins: `ManualResolver` (explicit `package:dep1,dep2` specs from the CLI's `-p`) and `UvResolver` (parses `uv.lock` to discover workspace members + inter-member dep edges; lives in `dead_cst/contrib/uv.py` and is re-exported from `dead_cst.resolvers`). `Analysis(project_root, resolver=...)` takes exactly one resolver. Construction calls `resolver.resolve(project_root)` and validates the output via `_validate_packages`.
+1. **Path resolution** (`dead_cst/resolvers/`). A `PathResolver` returns a `tuple[Package, ...]` (`Package(path, name, deps)`; deps reference other packages by name). Builtins: `ManualResolver` (explicit `package:dep1,dep2` specs from the CLI's `-p`) and `UvResolver` (parses `uv.lock` to discover workspace members + inter-member dep edges; lives in `dead_cst/contrib/uv.py`). `Analysis(project_root, resolver=...)` takes exactly one resolver. Construction calls `resolver.resolve(project_root)` and validates the output via `_validate_packages`.
 2. **Graph materialization** (rust crate `dead_cst._native`). `Analysis.materialize_all()` instantiates a `native.ProjectContext` rooted at the project root (each package's path is passed as a `src_root`), registers each plugin's `run(ctx)` callback, and calls `materialize()`. The rust backend uses ty's `SemanticIndex` to:
    - Parse every `.py` file under the project root and per-package `src_roots`.
    - Resolve every cross-file reference through ty's module resolver and use-def chains.
@@ -59,7 +59,7 @@ The supported surface is whatever is re-exported from a module named without a l
 - `dead_cst.analyze` — `Analysis`.
 - `dead_cst.codemod` — `remove_code` and `generate_patch`.
 - `dead_cst.plugins` — the synthetic-node prefix constants and every built-in plugin.
-- `dead_cst.resolvers` — `PathResolver`, `ManualResolver`, `UvResolver`.
+- `dead_cst.resolvers` — `PathResolver`, `ManualResolver`. (`UvResolver` lives under `dead_cst.contrib`.)
 - `dead_cst.contrib` — third-party-aware extensions.
 
 `tests/test_public_api.py` pins each public module's `__all__` against a snapshot.
@@ -85,14 +85,14 @@ def test_something(build_decl_graph, assert_edges):
 
 1. Define a class with `name: str`, `version: int` (epoch), and `run(ctx: native.ProjectContext) -> Iterable[native.GraphOp]`. The plugin yields `AddNode` / `AddEdge` / `AddEntrypoint` ops the rust backend applies.
 2. For common shapes, subclass `DecoratedDeclPlugin`, `DispatchAppPlugin`, or `LiteralListPlugin` from `plugins/decl_shapes.py` and configure with class-level attributes (`app_module`, `decorator_names`, etc.).
-3. Drop generic-Python plugins in `dead_cst/plugins/<name>.py`. Drop framework / third-party-aware plugins in `dead_cst/contrib/<name>.py` and re-export from `dead_cst/plugins/__init__.py`. Register in `BUILTIN_PLUGINS` (`plugins/__init__.py`).
-4. Out-of-tree plugins register under the `dead_cst.plugins` entry-point group; `load_plugin` checks builtins first.
+3. Drop generic-Python plugins in `dead_cst/plugins/<name>.py` (re-exported from `dead_cst/plugins/__init__.py`). Drop framework / third-party-aware plugins in `dead_cst/contrib/<name>.py` (re-exported from `dead_cst/contrib/__init__.py`). Register the CLI key in `_BUILTIN_PLUGINS` (`cli.py`), importing the plugin directly.
+4. Out-of-tree plugins register under the `dead_cst.plugins` entry-point group; the CLI's `_load_plugin` checks `_BUILTIN_PLUGINS` first.
 
 The plugin queries live on `native.ProjectContext` — `find_subclasses`, `find_module`, `find_declarations`, `module_for`, `find_main_blocks`, etc. — plus the chainable `query(ctx).decorators()...` / `.constructions()...` / `.calls()...` builder. See `python/dead_cst/_native.pyi` for the full surface.
 
 ## Adding a resolver
 
-Implement `PathResolver`: `resolve(project_root) -> tuple[Package, ...]`. Drop generic resolvers in `dead_cst/resolvers/<name>.py`; resolvers that target a specific external tool (like `UvResolver` for `uv.lock`) belong in `dead_cst/contrib/<name>.py`, with a re-export in `dead_cst/resolvers/__init__.py`. Built-in resolvers register in `BUILTIN_RESOLVERS` (`dead_cst/resolvers/__init__.py`).
+Implement `PathResolver`: `resolve(project_root) -> tuple[Package, ...]`. Drop generic resolvers in `dead_cst/resolvers/<name>.py` (re-exported from `dead_cst/resolvers/__init__.py`); resolvers that target a specific external tool (like `UvResolver` for `uv.lock`) belong in `dead_cst/contrib/<name>.py` (re-exported from `dead_cst/contrib/__init__.py`). Register the CLI key in `_BUILTIN_RESOLVERS` (`cli.py`), importing the resolver directly.
 
 ## Conventions
 
