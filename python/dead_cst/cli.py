@@ -81,15 +81,6 @@ if TYPE_CHECKING:
 app = typer.Typer(help="Dead code analysis for Python.")
 
 
-# ---------------------------------------------------------------------------
-# Built-in plugin registry.
-#
-# The CLI's ``--plugin`` flag looks plugins up by their stable string key.
-# Every builtin is imported explicitly above and instantiated here; the
-# entry-point fallback in :func:`_load_plugin` is reserved for out-of-tree
-# plugins shipped by third parties under the ``dead_cst.plugins`` group.
-# ---------------------------------------------------------------------------
-
 _BUILTIN_PLUGINS: dict[str, Plugin] = {
     "main_block": MainBlockPlugin(),
     "project_scripts": ProjectScriptsPlugin(),
@@ -141,22 +132,18 @@ def _load_plugin(name: str) -> Plugin:
     raise KeyError(f"Unknown edge plugin: {name!r}")
 
 
-# ---------------------------------------------------------------------------
-# Built-in resolver registry.
-#
-# The CLI's ``--resolver`` flag looks resolvers up by their stable string
-# key. Tool-specific resolvers live under :mod:`dead_cst.contrib` and are
-# imported directly here; out-of-tree resolvers register under the
-# ``dead_cst.resolvers`` entry-point group.
-# ---------------------------------------------------------------------------
-
 _BUILTIN_RESOLVERS: dict[str, type[PathResolver]] = {
     "uv": UvResolver,
 }
 
 
 def _load_resolver(name: str) -> PathResolver:
-    """Resolve a CLI ``--resolver`` value to a :class:`PathResolver` instance."""
+    """Resolve a CLI ``--resolver`` value to a :class:`PathResolver` instance.
+
+    Builtins (see :data:`_BUILTIN_RESOLVERS`) win over entry points;
+    out-of-tree resolvers register under the ``dead_cst.resolvers``
+    entry-point group as a zero-arg :class:`PathResolver` subclass.
+    """
     cls = _BUILTIN_RESOLVERS.get(name)
     if cls is not None:
         return cls()
@@ -166,7 +153,14 @@ def _load_resolver(name: str) -> PathResolver:
     for ep in entry_points(group="dead_cst.resolvers"):
         if ep.name == name:
             loaded = ep.load()
-            return loaded()
+            if callable(loaded):
+                instance = loaded()
+                if isinstance(instance, PathResolver):
+                    return instance
+            raise TypeError(
+                f"Resolver entry point {name!r} did not resolve to a "
+                f"PathResolver instance (got {type(loaded).__name__})"
+            )
     raise KeyError(f"Unknown path resolver: {name!r}")
 
 
