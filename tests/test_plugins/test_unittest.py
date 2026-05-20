@@ -4,7 +4,7 @@ from __future__ import annotations
 
 
 from dead_cst.graph import NodeFlags
-from dead_cst.plugins import UnittestPlugin
+from dead_cst.contrib import UnittestPlugin
 
 
 def test_unittest_plugin_marks_testcase_subclass(build_plugin_graph, reachable_fqnames):
@@ -168,10 +168,10 @@ def test_unittest_plugin_resolves_through_star_import(build_plugin_graph, reacha
     assert "pkg.things.MyThings" in reachable_fqnames(graph)
 
 
-def test_unittest_plugin_loads_via_load_plugin():
-    from dead_cst.plugins import load_plugin
+def test_unittest_plugin_loads_via_cli_loader():
+    from dead_cst.cli import _load_plugin
 
-    plugin = load_plugin("unittest")
+    plugin = _load_plugin("unittest")
     assert isinstance(plugin, UnittestPlugin)
 
 

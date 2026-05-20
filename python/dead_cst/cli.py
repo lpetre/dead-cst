@@ -30,6 +30,18 @@ import typer
 
 from .analyze import Analysis, _count_nodes_by_prefix
 from .codemod import generate_patch
+from .contrib.celery import CeleryPlugin
+from .contrib.click import ClickPlugin
+from .contrib.cyclopts import cyclopts_plugin
+from .contrib.discordpy import DiscordPyPlugin
+from .contrib.fastapi import fastapi_plugin
+from .contrib.fastmcp import fastmcp_plugin
+from .contrib.flask import flask_plugin
+from .contrib.mock_patch import MockPatchPlugin
+from .contrib.pytest import PytestPlugin
+from .contrib.server_config import ServerConfigPlugin
+from .contrib.typer import typer_plugin
+from .contrib.unittest import UnittestPlugin
 from .graph import (
     KEEPALIVE_DEFAULT,
     GraphMetadata,
@@ -40,10 +52,13 @@ from .graph import (
     write_graph,
 )
 from .plugins import (
+    DynamicImportFallbackPlugin,
     ExplicitEntrypointPlugin,
+    InitSubclassPlugin,
+    MainBlockPlugin,
     ModuleDundersPlugin,
     Plugin,
-    load_plugin,
+    ProjectScriptsPlugin,
 )
 from .resolvers import (
     ManualResolver,
@@ -64,6 +79,66 @@ if TYPE_CHECKING:
 
 
 app = typer.Typer(help="Dead code analysis for Python.")
+
+
+# ---------------------------------------------------------------------------
+# Built-in plugin registry.
+#
+# The CLI's ``--plugin`` flag looks plugins up by their stable string key.
+# Every builtin is imported explicitly above and instantiated here; the
+# entry-point fallback in :func:`_load_plugin` is reserved for out-of-tree
+# plugins shipped by third parties under the ``dead_cst.plugins`` group.
+# ---------------------------------------------------------------------------
+
+_BUILTIN_PLUGINS: dict[str, Plugin] = {
+    "main_block": MainBlockPlugin(),
+    "project_scripts": ProjectScriptsPlugin(),
+    "explicit": ExplicitEntrypointPlugin(),
+    "module_dunders": ModuleDundersPlugin(),
+    "pytest": PytestPlugin(),
+    "unittest": UnittestPlugin(),
+    "mock_patch": MockPatchPlugin(),
+    "server_config": ServerConfigPlugin(),
+    "fastapi": fastapi_plugin(),
+    "fastmcp": fastmcp_plugin(),
+    "flask": flask_plugin(),
+    "typer": typer_plugin(),
+    "click": ClickPlugin(),
+    "cyclopts": cyclopts_plugin(),
+    "celery": CeleryPlugin(),
+    "discordpy": DiscordPyPlugin(),
+    "init_subclass": InitSubclassPlugin(),
+    "dynamic_import_fallback": DynamicImportFallbackPlugin(),
+}
+
+
+def _load_plugin(name: str) -> Plugin:
+    """Resolve a CLI ``--plugin`` value to a plugin instance.
+
+    Builtins (see :data:`_BUILTIN_PLUGINS`) win over entry points; out-of-tree
+    plugins register under the ``dead_cst.plugins`` entry-point group and
+    may expose either a :class:`Plugin` instance or a zero-arg factory.
+    """
+    builtin = _BUILTIN_PLUGINS.get(name)
+    if builtin is not None:
+        return builtin
+
+    from importlib.metadata import entry_points
+
+    for ep in entry_points(group="dead_cst.plugins"):
+        if ep.name == name:
+            loaded = ep.load()
+            if isinstance(loaded, Plugin):
+                return loaded
+            if callable(loaded):
+                instance = loaded()
+                if isinstance(instance, Plugin):
+                    return instance
+            raise TypeError(
+                f"Plugin entry point {name!r} did not resolve to a Plugin instance "
+                f"(got {type(loaded).__name__})"
+            )
+    raise KeyError(f"Unknown edge plugin: {name!r}")
 
 
 class OutputFormat(str, Enum):
@@ -116,7 +191,7 @@ def build_plugins(
     :class:`re.Pattern`. The explicit-entrypoint plugin runs last so
     it can pin nodes contributed by upstream plugins.
     """
-    plugins: list[Plugin] = [load_plugin(name) for name in plugin_names]
+    plugins: list[Plugin] = [_load_plugin(name) for name in plugin_names]
     plugins.append(ModuleDundersPlugin())
     specs: list[str | Path | re.Pattern[str]] = list(entrypoints)
     specs.extend(re.compile(p) for p in entrypoint_regexes)

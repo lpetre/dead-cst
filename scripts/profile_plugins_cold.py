@@ -41,7 +41,7 @@ from _bench_common import (
     require_native,
     stage_dead_cst,
 )
-from dead_cst.plugins import BUILTIN_PLUGINS
+from dead_cst.cli import _BUILTIN_PLUGINS as BUILTIN_PLUGINS
 
 # Silence the visitor's WARNING-level breadcrumbs (e.g.
 # ``importlib.import_module(<not-a-literal>)``) — useful in normal
@@ -81,7 +81,7 @@ def _rust_capable_plugins(filter_names: set[str] | None) -> list[tuple[str, obje
     """Return ``[(label, plugin_instance)]`` for every builtin plugin
     with a ``run(ctx)`` method. Optionally filtered by class qualname."""
     out: list[tuple[str, object]] = []
-    for plugin in BUILTIN_PLUGINS:
+    for plugin in BUILTIN_PLUGINS.values():
         label = _plugin_label(plugin)
         if filter_names is not None and label not in filter_names:
             continue
@@ -94,7 +94,7 @@ def _rust_capable_plugins(filter_names: set[str] | None) -> list[tuple[str, obje
 def _skipped_plugins(filter_names: set[str] | None) -> list[str]:
     """Builtin plugins explicitly missing rust support."""
     out: list[str] = []
-    for plugin in BUILTIN_PLUGINS:
+    for plugin in BUILTIN_PLUGINS.values():
         label = _plugin_label(plugin)
         if filter_names is not None and label not in filter_names:
             continue

@@ -108,6 +108,16 @@ two versions.
 - **`-e re:<pattern>` magic prefix** is no longer recognized. Use
   `--entrypoint-regex <pattern>` instead. The plain `-e` flag now
   treats its argument as a file path or FQN literal.
+- **Plugin registry moved into the CLI.** The CLI's `--plugin` flag
+  now resolves names against a map declared in
+  :mod:`dead_cst.cli`, populated by direct imports of every builtin;
+  out-of-tree plugins still register under the `dead_cst.plugins`
+  entry-point group. The public re-exports of contrib plugins from
+  :mod:`dead_cst.plugins` are gone — import them from
+  :mod:`dead_cst.contrib` (or the specific contrib submodule).
+  `dead_cst.plugins.load_plugin` and `dead_cst.plugins.BUILTIN_PLUGINS`
+  are removed; :mod:`dead_cst.contrib` no longer uses a lazy
+  ``__getattr__`` indirection.
 
 ### Changed (breaking)
 - **Dropped the Python ``SymbolGraph`` adjacency facade.**

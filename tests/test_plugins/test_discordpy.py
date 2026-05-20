@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dead_cst.plugins import DiscordPyPlugin
+from dead_cst.contrib import DiscordPyPlugin
 
 
 def test_discordpy_plugin_marks_bot_command_handlers(build_plugin_graph, reachable_fqnames):
@@ -358,8 +358,8 @@ def test_discordpy_plugin_handler_dependencies_stay_alive(build_plugin_graph, re
     assert "app.util.unused_util" not in reached
 
 
-def test_discordpy_plugin_loads_via_load_plugin():
-    from dead_cst.plugins import load_plugin
+def test_discordpy_plugin_loads_via_cli_loader():
+    from dead_cst.cli import _load_plugin
 
-    plugin = load_plugin("discordpy")
+    plugin = _load_plugin("discordpy")
     assert isinstance(plugin, DiscordPyPlugin)

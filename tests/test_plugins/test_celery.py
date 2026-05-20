@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from dead_cst.plugins import CeleryPlugin
+from dead_cst.contrib import CeleryPlugin
 
 
 def test_celery_plugin_marks_task_handlers(build_plugin_graph, reachable_fqnames):
@@ -479,8 +479,8 @@ def test_celery_plugin_ignores_non_app_celery_users(build_plugin_graph, reachabl
     assert "pkg.mod.handler" not in reachable_fqnames(graph)
 
 
-def test_celery_plugin_loads_via_load_plugin():
-    from dead_cst.plugins import load_plugin
+def test_celery_plugin_loads_via_cli_loader():
+    from dead_cst.cli import _load_plugin
 
-    plugin = load_plugin("celery")
+    plugin = _load_plugin("celery")
     assert isinstance(plugin, CeleryPlugin)

@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Iterable
 
 from ..graph import NodeFlags
-from ..resolvers import load_toml
+from ..resolvers._core import load_toml
 from ._base import Plugin, native
 
 PROJECT_SCRIPTS_PREFIX = "<project.scripts>:"

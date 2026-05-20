@@ -5,44 +5,36 @@ Contrib modules know about external systems -- frameworks
 build tools (uv). Anything that handles a generic Python language
 convention lives in :mod:`dead_cst.plugins` or :mod:`dead_cst.resolvers`
 instead.
-
-All exports are loaded lazily through ``__getattr__`` so importing
-:mod:`dead_cst.resolvers` (which only needs ``UvResolver`` from
-contrib) does not pull in every framework plugin's module.
 """
 
 from __future__ import annotations
 
-from importlib import import_module
+from .celery import CeleryPlugin
+from .click import ClickPlugin
+from .cyclopts import cyclopts_plugin
+from .discordpy import DiscordPyPlugin
+from .fastapi import fastapi_plugin
+from .fastmcp import fastmcp_plugin
+from .flask import flask_plugin
+from .mock_patch import MockPatchPlugin
+from .pytest import PytestPlugin
+from .server_config import ServerConfigPlugin
+from .typer import typer_plugin
+from .unittest import UnittestPlugin
+from .uv import UvResolver
 
-# Lazy module lookups so importing one piece of contrib doesn't pull
-# every plugin module — particularly important because plugins import
-# from ``dead_cst.plugins`` which re-exports back through contrib.
-_EXPORTS: dict[str, str] = {
-    "CeleryPlugin": ".celery",
-    "ClickPlugin": ".click",
-    "DiscordPyPlugin": ".discordpy",
-    "MockPatchPlugin": ".mock_patch",
-    "PytestPlugin": ".pytest",
-    "ServerConfigPlugin": ".server_config",
-    "UnittestPlugin": ".unittest",
-    "UvResolver": ".uv",
-    "cyclopts_plugin": ".cyclopts",
-    "fastapi_plugin": ".fastapi",
-    "fastmcp_plugin": ".fastmcp",
-    "flask_plugin": ".flask",
-    "typer_plugin": ".typer",
-}
-
-__all__ = sorted(_EXPORTS)
-
-
-def __getattr__(name: str):
-    module_path = _EXPORTS.get(name)
-    if module_path is None:
-        raise AttributeError(f"module 'dead_cst.contrib' has no attribute {name!r}")
-    return getattr(import_module(module_path, package=__name__), name)
-
-
-def __dir__() -> list[str]:
-    return sorted(__all__)
+__all__ = [
+    "CeleryPlugin",
+    "ClickPlugin",
+    "DiscordPyPlugin",
+    "MockPatchPlugin",
+    "PytestPlugin",
+    "ServerConfigPlugin",
+    "UnittestPlugin",
+    "UvResolver",
+    "cyclopts_plugin",
+    "fastapi_plugin",
+    "fastmcp_plugin",
+    "flask_plugin",
+    "typer_plugin",
+]

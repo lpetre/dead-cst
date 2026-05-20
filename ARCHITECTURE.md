@@ -350,12 +350,13 @@ Two phases per `EdgePlugin`:
 `frozenset[SymbolNode]` (`ctx.contribution.nodes`), the raw edge and
 import-edge triples, and the per-file dead-suite map.
 
-Builtins ship in `BUILTIN_PLUGINS`. Generic-Python plugins live as
-siblings of `plugins/__init__.py` (`MainBlockPlugin`,
+Builtins ship in `cli._BUILTIN_PLUGINS`, a `dict[str, Plugin]`
+populated by direct imports of every shipped plugin. Generic-Python
+plugins live as siblings of `plugins/__init__.py` (`MainBlockPlugin`,
 `ProjectScriptsPlugin`, `ExplicitEntrypointPlugin`,
 `ModuleDundersPlugin`, `InitSubclassPlugin`). Third-party-aware
 plugins live under `dead_cst/contrib/` and are re-exported from
-`dead_cst.plugins`. `CeleryPlugin` is the full-featured reference for
+`dead_cst.contrib`. `CeleryPlugin` is the full-featured reference for
 two-phase plugins (factory-aware `DispatchAppPlugin` plus a per-file
 `@shared_task` channel spliced in via an `observe()` override);
 `FlaskPlugin` / `FastAPIPlugin` for the factory-aware

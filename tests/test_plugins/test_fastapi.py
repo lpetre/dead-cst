@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from dead_cst.plugins import DispatchAppPlugin, fastapi_plugin
+from dead_cst.contrib import fastapi_plugin
+from dead_cst.plugins import DispatchAppPlugin
 
 
 def test_fastapi_plugin_marks_route_handlers(build_plugin_graph, reachable_fqnames):
