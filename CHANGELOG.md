@@ -9,6 +9,8 @@ two versions.
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-05-20
+
 ### Added
 - **`dead-cst build`** materializes the project graph and persists it
   to disk in a bincode-encoded binary file (header + node / edge lists
@@ -1654,7 +1656,8 @@ versions until the first stable release.
 - `README.md`, `CONTRIBUTING.md`, `CHANGELOG.md`, and `ROADMAP.md` with a
   stack-ranked plan from alpha to 1.0.
 
-[Unreleased]: https://github.com/lpetre/dead-cst/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/lpetre/dead-cst/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/lpetre/dead-cst/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/lpetre/dead-cst/compare/v0.9.4...v0.10.0
 [0.9.4]: https://github.com/lpetre/dead-cst/compare/v0.9.3...v0.9.4
 [0.9.3]: https://github.com/lpetre/dead-cst/compare/v0.9.2...v0.9.3
