@@ -1,10 +1,10 @@
 # Architecture / program flow
 
-This doc walks the code path a single `dead-cst` invocation takes, from CLI
-arguments to a written file. It's the developer-facing companion to
-[`README.md`](README.md) (user-facing) and [`CLAUDE.md`](CLAUDE.md) (LLM-
-oriented summary). Read this before adding a plugin, resolver, or detector,
-or before touching the visitor.
+This doc walks the code path a single `dead-cst` invocation takes, from
+CLI arguments to a written patch. It's the developer-facing companion
+to [`README.md`](README.md) (user-facing) and [`CLAUDE.md`](CLAUDE.md)
+(LLM-oriented summary). Read this before adding a plugin, resolver, or
+touching the rust crate.
 
 ## At a glance
 
@@ -15,511 +15,318 @@ or before touching the visitor.
 ┌──────────────────┐
 │   PathResolver   │  resolve(project_root) -> tuple[Package, ...]
 └─────────┬────────┘
-          │ Packages (path, name, exported, deps)
+          │ Packages (path, name, deps)
           ▼
 ┌──────────────────┐
 │     Analysis     │  cheap construction; everything below is lazy
 └─────────┬────────┘
-          │ refresh(packages=…)
+          │ materialize_all()
           ▼
 ┌──────────────────────────────────────────────────────────────┐
-│  per-file pipeline (cached in SQLite by file SHA-256)        │
+│  rust crate: native.ProjectContext.materialize()             │
 │                                                              │
-│   source ─► SymbolVisitor ─► VisitorPayload                  │
-│                  │                                           │
-│                  └─► UnreachableRegionDetector.find_regions  │
-│                                                              │
-│   each EdgePlugin.observe(ctx) -> VisitorPayload | None      │
-│   ────────────────────────────────────────────────────────   │
-│   combined payload pickled into GraphCache                   │
+│   Phase 1 — decls       ty SemanticIndex + ruff AST          │
+│   Phase 2 — chain       parent-module + import edges         │
+│   Phase 3 — references  ty use-def chains for every Name     │
+│   Plugins               plugin.run(ctx) -> AddNode/AddEdge   │
 └────────────────────────────┬─────────────────────────────────┘
-                             │
+                             │ live ProjectContext
                              ▼
-┌──────────────────────────────────────────────────────────────┐
-│  per-package contribution                                    │
-│  (SymbolTrie + package-local graph slice + unresolved imps)  │
-└────────────────────────────┬─────────────────────────────────┘
-                             │
-                             ▼
-┌──────────────────────────────────────────────────────────────┐
-│  cross-package composition (uncached)                        │
-│                                                              │
-│   merge contributions ─► resolve_edges (against merged trie  │
-│                          + PathResolver fallback)            │
-│                                                              │
-│   each EdgePlugin.finalize(ctx) -> Iterable[GraphOp]         │
-└────────────────────────────┬─────────────────────────────────┘
-                             │ SymbolGraph
-                             ▼
-                ┌────────────┴────────────┐
-                ▼                         ▼
-        reachability BFS         codemod (remove_code /
-        from entrypoint=True       generate_patch)
+              ┌──────────────┴──────────────┐
+              ▼                             ▼
+       Analysis queries              codemod (libcst)
+       (reachable / dead /           remove_code,
+        descendants / ancestors      generate_patch
+        — all run in rust)
+              │
+              ▼
+       graph persistence
+       write_graph / read_graph
+       (bincode)
 ```
 
-The cache boundary is the line that matters most when reasoning about
-performance: stages 1–4 ride the per-file SQLite cache; stage 5 onward
-runs every invocation. That's why import classification deliberately
-moved out of the visitor — keeping the cache survival surface as small
-as possible was worth re-stitching edges every run.
+The entire graph build runs inside the rust extension. There is no
+per-file Python cache; ty's Salsa database already provides incremental
+re-analysis. The only stage still in Python is the LibCST codemod, and
+the only stage still in pure Python is `Analysis`'s thin wrapper around
+the rust BFS queries.
 
-The assembled graph at stage 5 and beyond is a `SymbolGraph`
-(`dead_cst/_graphstore.py`) — a thin wrapper around a
-`rustworkx.PyDiGraph` paired with a `SymbolNode <-> int` index map.
-The wrapper exposes the bookkeeping (`add`, `add_edge`, `index`,
-`node`, `subgraph`, `nodes`, `__contains__`/`__iter__`/`__len__`) and
-nothing else; edge-payload-aware iteration, traversal
-(`successor_indices` / `predecessor_indices`), `has_edge`, and every
-algorithm go through `SymbolGraph.raw` directly. BFS-shaped code in
-`analyze.py` / `cli.py` / the plugins operates in index space —
-`set[int]` visited sets, deferred `raw[i]` resolution at the point
-the loop body actually reads payload.
+## The rust crate
 
-## The `Cacheable` contract
+The pyo3 extension lives in `src/` (a maturin-managed cdylib that ships
+as `python/dead_cst/_native.{abi3.so,pyd}`). Type stubs live alongside
+at `python/dead_cst/_native.pyi`.
 
-Four moving parts satisfy `Cacheable` (`dead_cst/_cacheable.py`) — just
-`name: str` + `version: int`:
+Module layout (`src/lib.rs` is the pymodule entry point):
 
-| Component                    | Where                       | In the fingerprint? |
-| ---------------------------- | --------------------------- | ------------------- |
-| `SymbolVisitor`              | `dead_cst/_visitor.py`      | yes                 |
-| `EdgePlugin`                 | `dead_cst/plugins/`         | yes                 |
-| `UnreachableRegionDetector`  | `dead_cst/branches.py`      | yes                 |
-| `PathResolver`               | `dead_cst/resolvers/`       | **no**              |
+| File | Purpose |
+| ---- | ------- |
+| `lib.rs`     | pymodule registration, top-level `query()` helper |
+| `project.rs` | `Project`, `ProjectContext`, the `build()` pipeline |
+| `builder.rs` | `NodeKey`, `GraphBuilder`, `AddNode` / `AddEdge` / `AddEntrypoint`, generic BFS |
+| `graph.rs`   | `SymbolNode`, `Import`, `NativeGraph`, `NodeFlags`, `EdgeFlags` |
+| `ingest.rs`  | the three build phases (decls / chain / references) |
+| `query.rs`   | the plugin-facing `query(ctx).decorators()....collect()` builder |
+| `helpers.rs` | shared utilities (noqa parser, notebook decoder, dist-info lookup, …) |
+| `io.rs`      | `write_graph` / `read_graph` (bincode + a hard-versioned header) |
 
-The visitor / plugin / detector triple plus the package's `exported`
-subdirs (canonicalized relative to `package.path` for cross-machine
-portability) feed `compute_fingerprint` (`dead_cst/cache.py`).
-`Package.exported` enters because it stamps `NodeFlags.EXPORTED` onto
-every node via the visitor's `default_flags`, so editing it changes
-the cached payload; resolver swaps, `search_paths`, and
-`Package.path` / `name` / `deps` re-stitch edges through the
-(uncached) stage 5 pass instead of invalidating the per-file cache.
-`version` is a Unix epoch int *by convention* — concurrent bumps on
-different branches merge with `max()`-wins semantics rather than
-colliding on a re-used label. The package `__version__` is **not** in
-the fingerprint: every component whose output can shift between
-releases owns its own knob.
+The deeper crate-level rules live in `src/CLAUDE.md` — ty is the source
+of truth for every piece of Python semantics, every import binds a
+local declaration, and shadowed declarations are first-class graph
+nodes.
 
 ## The pipeline, top-down
 
 ### 1. Path resolution — `dead_cst/resolvers/`
 
-A `PathResolver` answers two questions about the project layout:
+A `PathResolver` answers one question: what packages exist in this
+project, and which other packages does each depend on?
 
-* `resolve(project_root) -> tuple[Package, ...]` — what packages exist,
-  what subdirs do they export to consumers, and which other packages
-  do they depend on (referenced by `name`).
-* `resolve_import(name, search_paths) -> str | Path | None` — fallback
-  classifier when an import misses the per-package symbol trie.
+```python
+resolve(project_root) -> tuple[Package, ...]
+```
 
-Builtins:
+Each `Package` carries `path`, `name`, and `deps: tuple[str, ...]`
+(referencing other packages by name). Builtins:
 
 * `ManualResolver` (`dead_cst/resolvers/manual.py`) — explicit
-  `package:dep1,dep2` specs from the CLI's `-p` flag. Auto-promotes
-  inline dep paths to their own `Package` records.
+  `package:dep1,dep2` specs from the CLI's `-p` flag.
 * `UvResolver` (`dead_cst/contrib/uv.py`) — parses `uv.lock` to
-  discover workspace members and inter-member edges; lazily splices
-  the workspace `.venv/site-packages` onto `sys.path` inside its own
-  `resolve_import`.
+  discover workspace members and inter-member edges.
 
 `Analysis` takes exactly one resolver — no chain. CLI flags `-p` and
 `--resolver` are mutually exclusive. Construction validates the
-resolver's output (name uniqueness, dep references, `exported` entries
-under `path`) via `_validate_packages`.
+resolver's output (name uniqueness, dep references resolve) via
+`_validate_packages`.
 
-### 2. Per-file visitor — `dead_cst/_visitor.py`
+### 2. `Analysis` — `dead_cst/analyze.py`
 
-`SymbolVisitor` walks one `.py` (or `.pyi`) file and returns a
-`VisitorPayload` (defined in `dead_cst/graph.py`) with four fields:
+Cheap to construct: the resolver runs once at `__init__` and packages
+are sorted into a dep-first BFS order, but nothing else happens until
+you ask a question (`materialize_all`, `reachable`, `dead`,
+`descendants`, `ancestors`, `kept_alive_by_flags_only`,
+`kept_alive_by_dead_branches`).
 
-| Field          | Shape                                          | Notes                                   |
-| -------------- | ---------------------------------------------- | --------------------------------------- |
-| `nodes`        | `tuple[SymbolNode, ...]`                       | every real decl, including `SHADOWED`   |
-| `edges`        | `tuple[(src, dst, EdgeFlags), ...]`            | resolved decl-to-decl refs in this file |
-| `imports`      | `tuple[(src, Import, EdgeFlags), ...]`         | **raw** — just the dotted name written  |
-| `dead_suites`  | `tuple[CodeRange, ...]`                        | every statically-dead suite             |
+`Analysis._ctx` holds the live `native.ProjectContext` after the first
+`materialize_all()` call, so subsequent BFS queries run on the already-
+built graph — one FFI hop per query, no rebuild.
 
-Crucially the visitor never calls a resolver and never reads `sys.path` —
-its output is purely a function of the file's source plus the plugin /
-detector chain. That's what lets the per-file cache survive
-`search_paths` / resolver swaps.
+### 3. Graph materialization — `native.ProjectContext.materialize()`
 
-Heavy lifting comes from LibCST `ScopeProvider`,
-`FullyQualifiedNameProvider` (wrapped via `_fqn.FixedFullyQualifiedNameProvider`),
-and the flow-sensitive shadowing in `_flow.py`.
+Driven from Python by `Analysis.materialize_all()`:
 
-### 3. Unreachable-region detection — `dead_cst/branches.py`
-
-Invoked once per file from inside `SymbolVisitor.visit_Module` reusing
-the analyzer's resolved `PositionProvider`. The shipped
-`DefaultUnreachableRegionDetector` is a two-pass design:
-
-1. A single `cst.CSTVisitor` walk collects every `If` / `While` plus
-   every statement-bearing suite (module body and every
-   `IndentedBlock`).
-2. A `TruthinessResolver` (also in `branches.py`) answers truthiness
-   queries on demand: `unreachable_suites` for the conditional sites,
-   plus a per-suite scan that marks statements after an unconditional
-   `return` / `raise` / `break` / `continue` / `assert <falsy>` as
-   dead *within the same suite* — a `raise` in a `try` body doesn't
-   kill the matching `except`. Compound statements (`if` / `with` /
-   `try`) themselves count as terminators when every reachable path
-   inside them terminates, so a constant-folded `if True: return`
-   (and its `FLAG = True` / `if cond: return; else: return` cousins)
-   kills the rest of the enclosing suite. The resolver is goal-directed: it
-   lazily resolves `ScopeProvider` / `ParentNodeProvider` only when
-   the first `Name` query lands, walks `live_referents` only for the
-   names that actually feed a query, memoizes by access node id, and
-   uses a `_PENDING` sentinel to bottom out cyclic references like
-   `a = b; b = a`.
-
-The apply step compares each `access_pos` in `edges` against
-`dead_suites` to flag `EdgeFlags.DEAD_BRANCH`. Reachability still
-follows those edges by default; `Analysis.kept_alive_by_dead_branches`
-is the opt-in inverse.
-
-To layer in domain knowledge, subclass `DefaultUnreachableRegionDetector`
-and override `resolve(self, expr) -> bool | None` — it gets first crack
-at every non-keyword expression routed through the resolver chain. Pass
-an instance via `Analysis(unreachable_detector=...)`. Bump `version`
-whenever the override's logic changes. From-scratch detectors that
-need name-aware truthiness construct `TruthinessResolver(wrapper,
-resolve_expr=...)` once per file and pass `resolver.evaluate` as the
-`resolve_expr` callback to `unreachable_suites` / `evaluate_truthiness`.
-
-### 4. Visitor + observe cache — `dead_cst/cache.py`
-
-SQLite-backed `GraphCache` at `<root>/.dead-cst-cache/cache.db` stores
-pickled per-file payloads keyed by file SHA-256. Each row carries a
-per-package fingerprint over Python version, schema version, every
-visitor / plugin / detector `(name, version)` pair, and the package's
-`exported` setting (canonicalized relative to `package.path`).
-`Package.exported` enters because it feeds `NodeFlags.EXPORTED` into
-every node via the visitor's `default_flags`; editing it invalidates
-only the affected package's rows.
-
-A cache row covers both the visitor's payload **and** every plugin's
-`observe()` output for that file — warm runs skip both. Bypass with
-`--no-cache`; force-clear with `dead-cst cache clear`.
-
-The orchestration around this stage — file enumeration, stale detection,
-the parallel worker pool — lives in `dead_cst/_refresh.py`; the
-per-package apply step (`PackageContribution`, `build_contribution`,
-`_apply_payload`, `eclipsed_paths`) lives in `dead_cst/_package.py`
-so `analyze.py` can stay focused on cross-package composition. File enumeration walks the tree
-once via `Path.rglob("*")` and dispatches by suffix into `.py` /
-`.pyi` / `.ipynb` buckets — directory I/O dominates the per-name
-fnmatch cost on large repos, so one walk beats three suffix-specific
-globs. Jupyter notebooks are converted to a single Python source
-string by `_notebooks.notebook_to_module` before the visitor sees
-them, and the visitor is constructed with
-`default_flags=NodeFlags.NOTEBOOK | NodeFlags.ENTRYPOINT` so every
-emitted node carries those flags from the start. When `libcst`
-rejects a file's syntax (or a notebook's JSON is malformed), the
-per-file work logs a warning and substitutes a placeholder payload
-pairing the real module node with a `[unparseable] <module>`
-synthetic flagged `ENTRYPOINT` — the file stays alive in reachability
-and rides the per-file cache like any other miss, so a fresh source
-SHA picks up the fix automatically. The pool consumes worker results via
-`concurrent.futures.as_completed`, so cache writes land in completion
-order — a single slow file does not block the cache from warming with
-the fast files behind it. Per-task failures other than the in-band
-`OSError` / parse cases are collected and re-raised as a single
-`ExceptionGroup` after the run drains, so one bad file does not waste
-the rest of the work; successful payloads are cache-warmed before the
-group is raised. The pool installs SIGTERM/SIGINT handlers for its
-lifetime, so a signal cancels pending futures and re-raises
-`KeyboardInterrupt`; files that completed before the signal stay
-cache-warmed.
-
-`build_contribution` runs two passes per package. Pass 1 is the
-per-file apply step above (visitor payloads land in `trie`, `nodes`,
-`edges`, `import_edges`). Pass 2 — `_materialize_star_reexports` —
-walks every module-level `from X import *` in `import_edges`, looks
-`X` up in `compose_lookup(own_trie, dep_contributions)` (the own
-trie plus each dep's exported view, the same recipe
-`Analysis._build_symbol_lookup` uses at compose time), and
-synthesizes one `"import"`-typed `SymbolNode` per re-exported name
-in the importing module. Each synthetic gets `STAR_REEXPORT` (so the
-codemod skips it), `EXPORTED` inherited from the importing module
-(so `merge_exported` flows it to consumers), parent edges, a
-`module -> synthetic` keep-alive edge, and its own entry in
-`import_edges` so `resolve_edges` later stitches the
-`synthetic -> target.<name>` chain. Star chains converge via
-fixed-point iteration with a `(importer, target, name)` `seen` set
-breaking cycles. The refresh loop walks packages in
-`Analysis.packages` (dep-first) order, so by the time pass 2 runs
-on a dependent each dep's contribution is already in
-`self._contributions`.
-
-### 5. Edge stitching — `dead_cst/_edges.py`
-
-`resolve_edges` runs **unconditionally** every analysis (it isn't
-cached). It walks the raw `(src, Import, flags)` triples against the
-per-package `SymbolTrie`, **canonicalizing** each `Import` first by
-pushing decl parts into `module` while they resolve as submodules in
-the trie:
-
-```
-from p import functions
-   trie has p.functions as a submodule?
-   -> module="p.functions", decl=None
+```python
+ctx = native.ProjectContext(project_root, src_roots=[pkg.path, ...])
+for plugin in self._plugins:
+    ctx.add_plugin(plugin)
+ctx.materialize()
 ```
 
-Trie misses fall back to the `PathResolver` chain for stdlib /
-external-dist / external-file / unresolved classification — the *only*
-place that reads `sys.path` and the resolver LRU caches.
-`Analysis._materialize` rebinds `sys.path` to each package's
-`(path, *deps)` view before composing it and calls
-`clear_module_specs_cache()` at every transition, restoring `sys.path`
-on the way out. That narrow clear drops only the fullname-keyed
-`safe_resolve_module` cache; `distribution_lookup` and
-`editable_distribution_roots` are keyed on the dist-bearing slice of
-`sys.path` (site-packages / dist-packages / purelib / platlib entries)
-so they survive the rebind for free — only the first-party prefix
-moves, and that prefix never enters the key. A real venv change (uv
-splicing in a workspace `.venv`) flips the key and triggers a single
-rebuild. `clear_path_caches()` is still available as the heavy-hammer
-full reset for callers that mutate the venv slice themselves.
+Each package's path is registered as a `src_root` so the rust backend
+mounts files at the right module FQN (`pkg_a/A/__init__.py` → `A`, not
+`pkg_a.A`). Inside `materialize()` the rust pipeline runs in three
+phases (see `src/lib.rs` for the canonical comment):
 
-Stdlib imports drop silently — they aren't surfaced as graph nodes.
-External-dist / external-file / unresolved misses produce one synthetic
-node per group so plugins can still answer "which files imported X?".
-A dotted name whose own `find_spec` returns nothing (`collections.abc`
-and friends, synthesized in their parent's `__init__`) falls back to
-the parent's classification, so the child inherits stdlib / dist
-attribution instead of being misfiled as `[unresolved]`.
+**Phase 1 — decls.** For every project file, iterate every binding in
+the file's global scope via `UseDefMap::all_definitions_with_usage`,
+minting a `SymbolNode` per binding (including each name brought in by
+`from foo import *`). Each node lands in a global
+`(File, target_range) → node_idx` index so cross-file edges can find
+it later. Shadowed declarations are first-class — two `def f` at
+different lines stay as distinct nodes, distinguished by their
+positional `NodeKey`.
 
-Star imports follow the same path; `Import.speculative` (set on
-`__import__` fromlist synthesis) drops a trie+resolver miss without
-emitting an `[unresolved]` node. Module-level first-party stars are
-also routed through synthetics by `_materialize_star_reexports`
-(stage 4.5 above); the fan-out here covers the non-module-level case
-(`def a(): __import__('p.functions')`), where the materializer can't
-attach synthetics because they need a module home.
+**Phase 2 — chain.** For every module node, emit the parent-module
+edge so `__init__.py` stays alive as long as anything in the package
+does. For every import-kind binding, resolve the upstream target via
+`ty_module_resolver::resolve_module` and emit `alias_node →
+upstream_node`. Targets outside the project (stdlib, site-packages)
+get lazily minted module-only nodes under the
+`[stdlib] X` / `[external dist] X` / `[external file] X` /
+`[unresolved] X` synthetic prefixes.
 
-Re-running this every analysis is what makes single-file edits cheap:
-only the edited file's payload is recomputed; importers re-stitch for
-free.
+**Phase 3 — references.** For every `Definition` that owns an
+expression (function body, class body, assignment RHS, annotation),
+walk the contained `Name`s and resolve each to its reaching def via
+ty's `visible_ancestor_scopes` + `end_of_scope_symbol_bindings`. The
+local alias is the target, not the upstream definition. Module-level
+non-definition statements attribute to the module node itself.
+Statically-dead regions identified by ty's reachability constraints
+get their outgoing edges flagged `EdgeFlags.DEAD_BRANCH`.
 
-Resolution is memoized at three nested layers per call so the per-
-package compose loop stays additive in importer count: equal-spelling
-`Import` instances (the visitor builds fresh objects per file but they
-hash equal because `Import` is frozen) share one `_resolve_targets`
-entry; different `Import` shapes that canonicalize to the same trie
-state share one `_walk` entry; and the resolver fallback runs once per
-unique `(module, speculative)` external. The walk's worklist DFS is
-cycle-protected via a per-walk `visited` set keyed on
-`(id(SymbolTrie), parts_tail)`, so a pathological re-export cycle
-(`A.x: from B import x` / `B.x: from A import x`) terminates after one
-trip with the encountered decls still emitted.
+### 4. Plugins — `dead_cst/plugins/` and `dead_cst/contrib/`
 
-Edge deduplication is centralized in the compose pass: one
-`emitted: set[(src, dst, EdgeFlags)]` owned by
-`Analysis._materialize` is threaded through `_compose_contribution`
-into all three edge sources — contribution edges, `resolve_edges`
-import resolution, and `apply_ops` (plugin `AddEdge`). The shared
-`graph._claim_edge` helper records each triple once, so cross-source
-and cross-package duplicates (e.g. two packages re-exporting the
-same external) collapse to one edge instead of accumulating as
-parallel multigraph edges. Plugin edges carry no flags, so they
-key as `(src, dst, EdgeFlags.NONE)`; `RemoveEdge` drops that key so
-remove-then-add still re-adds the edge.
+After the three phases, each registered plugin's `run(ctx)` is invoked
+with the in-progress `ProjectContext`. Plugins yield `AddNode` /
+`AddEdge` / `AddEntrypoint` ops; the rust apply pass folds them into
+the graph atomically before `materialize()` returns. There is no
+two-phase observe/finalize split anymore — one method, one pass.
 
-### 6. Plugins — `dead_cst/plugins/`
+The plugin contract:
 
-Two phases per `EdgePlugin`:
+```python
+class Plugin:
+    def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
+        ...
+```
 
-* `observe(ctx: ObserveContext) -> VisitorPayload | None` — runs once
-  per file inside the visitor loop, with the parsed `cst.Module` and
-  the visitor's just-built payload. Returns a new payload (or `None`)
-  whose `nodes` / `edges` extend the file's contribution; the result
-  is cached alongside the visitor's output. **Cross-file work does
-  not belong here.**
-* `finalize(ctx: PluginContext) -> Iterable[GraphOp]` — runs once per
-  package after `resolve_edges` has stitched cross-file imports.
-  Operates purely on the assembled graph (no CST access) and emits
-  `AddNode` / `AddEdge` / `RemoveEdge` ops.
+Plugin queries live on `native.ProjectContext`. For common shapes use
+the chainable builder:
 
-`PluginContext` provides helpers (`find_module`, `find_declarations`,
-`module_surface`, …) and exposes the current package's raw build product via
-`ctx.contribution: PackageContribution` — the
-`Package`, the package-local `SymbolTrie`, the contributed
-`frozenset[SymbolNode]` (`ctx.contribution.nodes`), the raw edge and
-import-edge triples, and the per-file dead-suite map.
+```python
+for ref in query(ctx).decorators().where_module("flask").collect():
+    yield AddEdge(...)
+```
 
-Builtins ship in `cli._BUILTIN_PLUGINS`, a `dict[str, Plugin]`
-populated by direct imports of every shipped plugin. Generic-Python
-plugins live as siblings of `plugins/__init__.py` (`MainBlockPlugin`,
-`ProjectScriptsPlugin`, `ExplicitEntrypointPlugin`,
-`ModuleDundersPlugin`, `InitSubclassPlugin`). Third-party-aware
-plugins live under `dead_cst/contrib/` and are re-exported from
-`dead_cst.contrib`. `CeleryPlugin` is the full-featured reference for
-two-phase plugins (factory-aware `DispatchAppPlugin` plus a per-file
-`@shared_task` channel spliced in via an `observe()` override);
-`FlaskPlugin` / `FastAPIPlugin` for the factory-aware
-`DispatchAppPlugin` shape; `TyperPlugin` / `CycloptsPlugin` for the
-pure-dispatch `DispatchAppPlugin` shape; `ClickPlugin` for the
-`DecoratedDeclPlugin` subclass shape.
+Direct accessors (`find_module`, `find_declarations`, `module_for`,
+`find_main_blocks`, …) cover the rest. See `python/dead_cst/_native.pyi`
+for the full surface.
 
-For the common dynamic-import idioms, three abstract bases ship as
-scaffolding (`plugins/decl_shapes.py`):
+Three declarative bases ship as scaffolding for common shapes
+(`plugins/decl_shapes.py`):
 
-* `DecoratedDeclPlugin` — "decorated decls in files matching a search path."
-* `LiteralListPlugin` — "read `<owner>.<var> = ['fqn', ...]` and revive each entry."
-* `DispatchAppPlugin` — "wire `@<instance>.<reg>(...)` handlers to an app instance."
-  Pure-dispatch by default (Typer / Cyclopts: `X = App(); @X.command(...)`); opt into
-  factory-aware mode (Flask / FastAPI / Celery) by setting `instance_kinds: Mapping[str, bool]`
-  to emit `<{name}-app>` / `<{name}-pending>` / `<{name}-factory>` synthetics and run a
-  cross-package finalize walk that classifies factory chains (`X = create_app()`) and
-  promotes auto-entrypoint kinds.
+* `DecoratedDeclPlugin` — decorated decls in files matching a search
+  path.
+* `LiteralListPlugin` — `<owner>.<var> = ['fqn', ...]` registries.
+* `DispatchAppPlugin` — `@<instance>.<reg>(...)` handlers wired to an
+  app instance. Pure-dispatch by default (Typer / Cyclopts); opt into
+  factory-aware mode by setting `instance_kinds: Mapping[str, bool]`
+  (Flask / FastAPI / Celery) — the plugin then emits
+  `<{name}-app>` / `<{name}-pending>` / `<{name}-factory>` synthetics
+  and classifies factory chains across files.
 
-### 7. Reachability — `Analysis.reachable`
+Builtins ship in `cli._BUILTIN_PLUGINS`. Generic-Python plugins live
+in `dead_cst/plugins/` (`MainBlockPlugin`, `ProjectScriptsPlugin`,
+`ExplicitEntrypointPlugin`, `ModuleDundersPlugin`,
+`InitSubclassPlugin`, `DynamicImportFallbackPlugin`); framework-aware
+plugins live in `dead_cst/contrib/` (FastAPI, Flask, Typer, Click,
+Cyclopts, pytest, unittest, Celery, FastMCP, DiscordPy, MockPatch,
+ServerConfig).
 
-BFS from every node with `entrypoint=True`. Default traversal **does**
-follow `DEAD_BRANCH` edges (preserving today's behavior).
-`Analysis.kept_alive_by_dead_branches()` is the opt-in inverse, returning
-the blast radius of removing every dead suite by skipping those edges.
-`Analysis.kept_alive_by_flags_only(flags)` returns the blast radius of
-dropping every entrypoint carrying any of those flag bits. Pass `NodeFlags.TESTCASE`
-for "production code currently kept alive only because tests still
-touch it" (`PytestPlugin` / `UnittestPlugin` stamp `ENTRYPOINT |
-TESTCASE`); pass `NodeFlags.NOQA` for "decls kept alive only by an
-F401 pin" (the visitor stamps `ENTRYPOINT | NOQA` on imports
-preserved by a per-line or file-level ruff/pyflakes directive); OR
-the bits to combine.
+### 5. Reachability — `Analysis.reachable` and friends
 
-For the raw dead-suite positions themselves (the input to the
-`EdgeFlags.DEAD_BRANCH` flagging from stage 3), iterate
-`ctx.edges()` and filter on `EdgeFlags.DEAD_BRANCH`.
+BFS from every node whose flags overlap `seed_flags`. Default seed
+mask is `KEEPALIVE_DEFAULT = ENTRYPOINT | TESTCASE | NOQA | NOTEBOOK`.
+Default traversal **does** follow `DEAD_BRANCH` edges (preserving
+historical behavior). Three queries cover the standard slicing:
 
-### 8. Codemod — `dead_cst/codemod.py`
+* `Analysis.dead(seed_flags=...)` — every decl not reached from any
+  seed in the mask.
+* `Analysis.kept_alive_by_dead_branches()` — diff of the default
+  closure against the strict closure that skips dead-branch edges.
+* `Analysis.kept_alive_by_flags_only(flags, ...)` — diff of
+  `reachable(seed_flags)` against `reachable(seed_flags & ~flags)`.
+  Pass `NodeFlags.TESTCASE` for the "what dies if the test suite goes
+  away" question, `NodeFlags.NOQA` for the stale-F401 audit, or OR
+  them together.
 
-`remove_code` runs a LibCST `RemoveDeadSymbols` transformer keyed on
-`(fqname, CodeRange)` pairs (position disambiguates shadowed decls),
-then prunes now-unused imports via `RemoveImportsVisitor`. Position
-keying is critical — losing it conflates a dead decl with a live shadow.
+All four delegate to a rust BFS in one FFI call — there is no Python
+adjacency walk on the hot path.
 
-Callers feed the unreachable subgraph in directly, e.g.
-`remove_code(list(analysis.dead()), project_root)`.
+### 6. Graph persistence — `dead_cst.graph.write_graph` / `read_graph`
 
-`generate_patch(G, root)` is the non-destructive twin: same selection
-logic, same two-pass LibCST pipeline (a private `_rewrite_one` helper
-keeps the two functions from drifting), but instead of writing back it
-emits a `git apply`-compatible unified diff with `diff --git` headers
-and a `deleted file mode 100644` extended header for module-node
-deletions. Selection is driven entirely by `G.nodes`, so callers can
-slice the unreachable graph however they like (e.g. one SCC at a time)
-to review a big codebase as a series of focused patches. The
-`dead-cst remove` CLI uses `generate_patch` exclusively — it emits a
+`dead-cst build ROOT -o PATH` materializes the graph once and writes it
+to disk as a bincode blob prefixed with the magic bytes `DEADCSTG` and
+a `u32` format version. `dead-cst analyze --graph PATH` /
+`dead-cst remove --graph PATH` skip the build entirely and load the
+file instead.
+
+The library-level twin:
+
+```python
+from dead_cst.graph import write_graph, read_graph
+
+graph = Analysis(root, resolver=...).materialize_all()
+write_graph("graph.bin", graph, meta=[("branch", "main")])
+
+loaded, metadata = read_graph("graph.bin")
+loaded.reachable(seed_flags=NodeFlags.ENTRYPOINT)  # pure-Python BFS
+```
+
+Loaders are strict — a version mismatch is a fatal error with no
+migration path (rebuilding is cheap). The metadata block records
+`created_at`, node / edge / file / line counts, and any
+user-supplied `(key, value)` pairs the CLI's `--meta` flag threads
+through.
+
+Plugins deliberately do **not** round-trip. Loading a graph gives you
+a `LoadedGraph` (not a `ProjectContext`), and only the materialized
+adjacency is captured — a project that needs plugin-emitted edges has
+to rebuild rather than load.
+
+### 7. Codemod — `dead_cst/codemod.py`
+
+`remove_code(dead_nodes, package_path)` runs a LibCST
+`RemoveDeadSymbols` transformer keyed on `(fqname, start_line)` pairs
+(line disambiguates shadowed decls), then prunes now-unused imports
+via libcst's `RemoveImportsVisitor`. Position keying is critical —
+losing it conflates a dead decl with a live shadow.
+
+`generate_patch(dead_nodes, root)` is the non-destructive twin: same
+selection logic, same two-pass LibCST pipeline, but emits a
+`git apply`-compatible unified diff with `diff --git` headers (and
+`deleted file mode 100644` for module-node deletions) instead of
+writing back. Selection is driven entirely by the input iterable, so
+callers can slice the unreachable set however they like (e.g. one SCC
+at a time) to review a big codebase as a series of focused patches.
+`dead-cst remove` uses `generate_patch` exclusively — it emits the
 patch to stdout (or `--output PATH`) and never mutates source.
 
-## Lazy materialization on `Analysis`
-
-`Analysis` is cheap to construct — the resolver runs once at `__init__`,
-but no source files are read or parsed until you ask. Three coarse
-stages happen on demand:
-
-1. **File enumeration + visitor pass** — `refresh()`. Walks each
-   requested package's tree, collapses every package's cache misses
-   into one global stale-file list, and runs the visitor + observe
-   pass once across the whole batch.
-2. **Per-package contribution build** — the per-package
-   `SymbolTrie` + raw `frozenset[SymbolNode]` / `frozenset[(src, dst,
-   EdgeFlags)]` / `Mapping[Path, tuple[CodeRange, ...]]` (dead-suite
-   positions) + the unresolved cross-file import set. Built once per
-   package from the payloads above by `dead_cst._package.build_contribution`,
-   memoized for the lifetime of the `Analysis`.
-3. **Cross-package composition** — `materialize_all()`. The rust
-   backend assembles the whole project graph in one pass via ty's
-   Salsa db; there is no cheaper per-package closure path.
+The codemod is the only stage that still uses LibCST.
 
 ## Graph model invariants
 
-* One node per top-level declaration plus one synthetic module node per
-  file. Nested defs (inner functions, methods, nested classes) are
+* One node per top-level declaration plus one synthetic module node
+  per file. Nested defs (inner functions, methods, nested classes) are
   deliberately not given their own nodes — refs from inside them
   attribute to the enclosing top-level decl.
 * A module-level `import` / `from ... import ...` is itself a node of
-  type `"import"`. Local uses of an imported name go through the import
-  node, which points at the upstream module / symbol. This is how
-  `dead-cst remove` knows to drop now-unused imports.
-* Imports whose source line carries a ruff/pyflakes `# noqa` directive
-  that silences F401 (bare `# noqa`, `# noqa: F401`, multi-rule
-  `# noqa: E501, F401`, case-variant `# NOQA`) are flagged
-  `NodeFlags.ENTRYPOINT | NodeFlags.NOQA` so reachability keeps them
-  alive — matching ruff's own semantics. File-level `# ruff: noqa` and
-  `# flake8: noqa` directives (`ruff:` / `flake8:` matched
-  case-sensitively per ruff; `noqa` is not) pin every import in the
-  file. The visitor scans for these in `visit_Comment` plus a
-  per-import-statement `SimpleStatementLine` walk, so per-alias
-  comments inside a parenthesized `from x import (a, b)` are honored.
-  The `NOQA` bit is metadata layered on `ENTRYPOINT` (parallel to
-  `TESTCASE`); the single `Analysis.kept_alive_by_flags_only(flags)`
-  method takes either flag (or both ORed) to return the blast radius
-  of dropping the matching entrypoints.
-* Submodules edge to their parent package, so `__init__.py` stays alive
+  type `"import"`. Local uses of an imported name always edge to the
+  local alias (the codemod invariant: an unused import has zero
+  in-edges). When ty's module resolver / global-scope lookup can pin
+  the use to specific upstream targets, the use *also* emits direct
+  edges to each of them.
+* Submodules edge to their parent package so `__init__.py` stays alive
   as long as anything in the package does.
-* `EdgeFlags.DEAD_BRANCH` is metadata only.
-* `NodeFlags.SHADOWED` decls are emitted into the graph but excluded
-  from the trie, so cross-module imports never resolve to them.
-  `NodeFlags.OVERLOAD` follows the same trie-exclusion rule but its
-  lifetime is anchored to the matching same-file impl via explicit
-  `impl -> overload` edges.
-* `.pyi` stubs are ingested only for the compiled-extension layout
-  (`_native.so` + `_native.pyi`, no `.py` twin). Peer-mode `.pyi` is
-  dropped at file-enumeration time — the runtime always wins.
-* `.ipynb` (Jupyter) files are concatenated cell-by-cell into one
-  parseable Python module by `_notebooks.notebook_to_module`. IPython
-  magics, shell escapes, and trailing-help forms are rewritten to
-  `pass  # <line>` so libcst accepts the source. The visitor is
-  constructed with `default_flags=NodeFlags.NOTEBOOK | NodeFlags.ENTRYPOINT`
-  so every node carries those flags from the start; `NOTEBOOK` also
-  keeps the decl out of the cross-module lookup trie alongside
-  `SHADOWED` / `OVERLOAD`. The codemod skips any node flagged
-  `NOTEBOOK`.
-* A `foo.py` next to a `foo/__init__.py` is **eclipsed** by the package
-  (mirroring CPython's `FileFinder`). `_package.eclipsed_paths` flags
-  the `.py` before `_apply_payload` runs, and the apply pass skips its
-  trie additions only — its nodes still land in the contribution so
-  observe-time entrypoints (`__main__`, plugin synthetics) keep
-  working, but cross-module imports of `pkg.foo` route to the
-  package's `__init__.py` alone. Disambiguates from
-  `NodeFlags.SHADOWED` (intra-file decl rebinding) and the `.pyi`
-  peer-stub filter.
-* `NodeFlags.EXPORTED` tags every node from a file under
-  `Package.exported`. The visitor's `default_flags` mechanism stamps
-  it at construction; the single per-package lookup trie holds every
-  visible decl, and consumer-side merges use `SymbolTrie.merge_exported`
-  to filter to entries with this bit set (the package's own self-lookup
-  uses plain `merge` and sees everything). `Package.exported` is in
-  the per-package fingerprint, so editing it invalidates that
-  package's cache.
-* `NodeFlags.STAR_REEXPORT` tags synthetic `"import"`-typed decls
-  that `_materialize_star_reexports` synthesizes for every name a
-  `from X import *` re-exports. They live in the trie like real
-  re-export imports (so cross-module lookups resolve through them)
-  and inherit `EXPORTED` from their importing module. The codemod
-  skips them: the file has only `from X import *`, not the per-name
-  `from X import <decl>` line `RemoveImportsVisitor` would otherwise
-  chase.
-* `[unparseable] <module>` synthetics stand in for files `libcst`
-  cannot parse. They carry `NodeFlags.ENTRYPOINT` and edge at the real
-  module node, so the file stays alive even though its decls are
-  invisible.
+* `EdgeFlags.DEAD_BRANCH` is metadata only; default reachability still
+  follows the edge.
+* `NodeFlags.SHADOWED` decls (a `def f` rebound later in the same
+  file) are kept in the graph but excluded from the cross-module
+  lookup so consumer imports route to the live binding.
+* `NodeFlags.OVERLOAD` follows the same trie-exclusion rule as
+  `SHADOWED`; lifetime is anchored to the matching same-file impl via
+  explicit `impl -> overload` edges.
+* `NodeFlags.NOQA` flags import aliases preserved by a user
+  ruff/pyflakes noqa directive (per-line `# noqa`, `# noqa: F401`,
+  `# noqa: E501, F401`, or file-level `# ruff: noqa` / `# flake8:
+  noqa`). Layered on `ENTRYPOINT`.
+* `NodeFlags.NOTEBOOK` tags every node sourced from a Jupyter
+  `.ipynb` file. Notebook cells run top-to-bottom rather than being
+  imported, so the bit alone keeps the node alive (no `ENTRYPOINT`
+  overlay needed — `NOTEBOOK` is in `KEEPALIVE_DEFAULT`). The codemod
+  skips notebook nodes (cell-aware writeback into the JSON envelope is
+  out of scope today).
+* `NodeFlags.STAR_REEXPORT` tags synthetic `kind="import"` nodes
+  minted for each name brought in by `from X import *`. They live in
+  the cross-module lookup like real re-export imports; the codemod
+  skips them (there is no per-name source line to remove).
+* `.pyi` stubs are ingested only for the **compiled-extension** layout
+  (`_native.so` + `_native.pyi`, no `.py` twin). Peer-mode stubs
+  alongside a real `.py` are dropped — the runtime always wins.
 
 ## Where to make changes
 
-| If you want to…                                          | Touch                                          |
-| -------------------------------------------------------- | ---------------------------------------------- |
-| Recognize a new decl shape                               | `_visitor.py` (bump `SymbolVisitor.version`)   |
-| Fold a domain-specific expression to a known truthiness  | subclass `DefaultUnreachableRegionDetector`    |
-| Keep alive symbols a framework registers dynamically     | new `EdgePlugin` under `contrib/`              |
-| Support a new project layout / lockfile                  | new `PathResolver` under `contrib/`            |
-| Change how cross-file imports get classified             | `_edges.resolve_edges` + the resolver fallback |
-| Change how `from X import *` re-exports are materialized | `_package._materialize_star_reexports`         |
-| Change codemod output shape                              | `codemod.py` (`RemoveDeadSymbols` / `_rewrite_one`) |
-| Change patch format / per-SCC patch slicing              | `codemod.generate_patch`                       |
+| If you want to…                                                | Touch                                              |
+| -------------------------------------------------------------- | -------------------------------------------------- |
+| Recognize a new decl shape                                     | `src/ingest.rs` (Phase 1)                          |
+| Tweak how imports resolve                                      | `src/ingest.rs` (Phase 2, `emit_import_edges`)     |
+| Tweak how references attribute                                 | `src/ingest.rs` (Phase 3, `emit_reference_edges`)  |
+| Add a new plugin query                                         | `src/query.rs` (extend `QueryBuilder`)             |
+| Keep alive symbols a framework registers dynamically           | new `Plugin` under `dead_cst/contrib/`             |
+| Support a new project layout / lockfile                        | new `PathResolver` under `dead_cst/contrib/`       |
+| Change graph persistence format                                | `src/io.rs` (bump the format version)              |
+| Change codemod output shape                                    | `dead_cst/codemod.py` (`RemoveDeadSymbols` / `_rewrite_one`) |
+| Change patch format / per-SCC patch slicing                    | `dead_cst/codemod.py` (`generate_patch`)           |
 
-See `CLAUDE.md` for the per-stage cache-invalidation discipline.
+See `CLAUDE.md` for the top-level invariants and `src/CLAUDE.md` for
+the rust crate's principles.

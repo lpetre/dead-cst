@@ -17,8 +17,9 @@ The deeper public surface lives in focused sub-packages:
 * :mod:`dead_cst.codemod` -- the LibCST-based source rewriter.
 * :mod:`dead_cst.plugins` -- the synthetic-node prefix constants and
   every built-in plugin.
-* :mod:`dead_cst.resolvers` -- the :class:`PathResolver` protocol,
-  :class:`ManualResolver`, :class:`UvResolver`.
+* :mod:`dead_cst.resolvers` -- the :class:`PathResolver` protocol and
+  :class:`ManualResolver`. (:class:`UvResolver` lives under
+  :mod:`dead_cst.contrib`.)
 * :mod:`dead_cst.contrib` -- third-party-aware extensions.
 
 ``dead-cst`` is alpha; APIs, CLI flags, and output formats may change.
