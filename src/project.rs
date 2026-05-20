@@ -12,7 +12,7 @@ use pyo3::prelude::*;
 use ruff_db::files::File;
 use ruff_db::parsed::parsed_module;
 use ruff_db::source::source_text;
-use ruff_db::system::{OsSystem, SystemPathBuf};
+use ruff_db::system::{OsSystem, SystemPath, SystemPathBuf};
 use ruff_db::Db as SourceDb;
 use ruff_python_ast::token::TokenKind;
 use ruff_python_ast::visitor::Visitor;
@@ -53,6 +53,7 @@ use crate::query::{
 #[pyclass(unsendable)]
 pub(crate) struct Project {
     pub(crate) db: ProjectDatabase,
+    pub(crate) package_owned_paths: Vec<SystemPathBuf>,
 }
 
 #[pymethods]
@@ -62,14 +63,17 @@ impl Project {
         root,
         *,
         src_roots = None,
+        package_owned_paths = None,
         extra_paths = None,
         python_env = None,
         python_version = None,
         typeshed = None,
     ))]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         root: &str,
         src_roots: Option<Vec<String>>,
+        package_owned_paths: Option<Vec<String>>,
         extra_paths: Option<Vec<String>>,
         python_env: Option<&str>,
         python_version: Option<&str>,
@@ -77,12 +81,20 @@ impl Project {
     ) -> PyResult<Self> {
         let env = build_env_options(src_roots, extra_paths, python_env, python_version, typeshed)?;
         let db = make_db(root, env)?;
-        Ok(Self { db })
+        let owned = package_owned_paths
+            .unwrap_or_default()
+            .into_iter()
+            .map(SystemPathBuf::from)
+            .collect::<Vec<_>>();
+        Ok(Self {
+            db,
+            package_owned_paths: owned,
+        })
     }
 
     /// Build the project-wide symbol graph.
     pub(crate) fn build(&self, py: Python<'_>) -> PyResult<NativeGraph> {
-        let outputs = build_project_graph(py, &self.db, false)?;
+        let outputs = build_project_graph(py, &self.db, false, &self.package_owned_paths)?;
         Ok(NativeGraph {
             nodes: outputs.builder.nodes,
             edges: outputs.builder.edges,
@@ -128,6 +140,23 @@ pub(crate) struct BuildOutputs {
     /// nodes — and a cheap ``imports_of_exists`` short-circuit for
     /// plugins that just need a per-module presence check.
     pub(crate) imports_by_module: HashMap<String, Vec<usize>>,
+    /// `package_owned_path -> files under that prefix`, in
+    /// ``project_files`` order. Each ``File`` is assigned to the
+    /// LONGEST owned-path prefix it lives under, so a workspace where
+    /// one member's owned dir sits inside another's still partitions
+    /// cleanly. Files outside every owned path land in
+    /// ``unowned_files``. Drives the per-package edge pass: each
+    /// iteration scopes the resolver via ``set_src_roots`` and
+    /// processes only that package's bucket.
+    pub(crate) files_by_package: HashMap<SystemPathBuf, Vec<File>>,
+    /// Files enumerated by ty that don't fall under any owned-package
+    /// path. Empty for a well-formed monorepo (every first-party file
+    /// belongs to *some* package); non-empty when the project root
+    /// holds stray modules outside the resolver's package list. These
+    /// still need to be processed somewhere, so the build runs them
+    /// in a final catch-all pass under the union of all exported
+    /// paths.
+    pub(crate) unowned_files: Vec<File>,
 }
 
 /// Run the three build phases (ingest → hierarchy+imports → references)
@@ -200,6 +229,7 @@ pub(crate) fn build_project_graph(
     py: Python<'_>,
     db: &ProjectDatabase,
     show_progress: bool,
+    package_owned_paths: &[SystemPathBuf],
 ) -> PyResult<BuildOutputs> {
     let timing = std::env::var_os("DEAD_CST_TIMING").is_some();
     let mut builder = GraphBuilder::new();
@@ -218,6 +248,8 @@ pub(crate) fn build_project_graph(
     for &file in &project_files {
         path_to_file.insert(file_path_string(db, file), file);
     }
+    let (files_by_package, unowned_files) =
+        partition_files_by_package(db, &project_files, package_owned_paths);
     // Peer ``.pyi`` files: register the ``.pyi -> .py twin`` mapping
     // so import resolution can fall back when the stub lookup misses
     // and so ``file_default_flags`` can tell peer .pyi (decls reach
@@ -398,7 +430,63 @@ pub(crate) fn build_project_graph(
         decl_by_fqname,
         module_by_fqname,
         imports_by_module,
+        files_by_package,
+        unowned_files,
     })
+}
+
+/// Bucket ``project_files`` by which owned-package prefix each file
+/// lives under. Each file is assigned to the LONGEST matching prefix
+/// so workspaces where one member's owned dir is nested inside
+/// another's still partition cleanly. Files outside every owned path
+/// land in the ``unowned`` bucket -- well-formed monorepos with a
+/// proper resolver should have an empty unowned set, but stray
+/// project-root scripts and conftest.py files outside any member dir
+/// are surfaced here rather than silently lost.
+fn partition_files_by_package(
+    db: &ProjectDatabase,
+    project_files: &[File],
+    package_owned_paths: &[SystemPathBuf],
+) -> (HashMap<SystemPathBuf, Vec<File>>, Vec<File>) {
+    let mut buckets: HashMap<SystemPathBuf, Vec<File>> = package_owned_paths
+        .iter()
+        .map(|p| (p.clone(), Vec::new()))
+        .collect();
+    let mut unowned: Vec<File> = Vec::new();
+
+    if package_owned_paths.is_empty() {
+        // No package partition info -- every file is "unowned"
+        // (preserves today's flat semantics for single-package and
+        // legacy callers that don't pass package_owned_paths).
+        unowned.extend(project_files.iter().copied());
+        return (buckets, unowned);
+    }
+
+    // Pre-compute lengths once; longest-prefix match is a stable tie
+    // breaker for nested-owned-dir layouts. We compare path components
+    // (not byte length) so a parent dir like ``/repo/pkg`` doesn't
+    // outrank a deeper ``/repo/pkg2`` purely on character count.
+    for &file in project_files {
+        let path = file_path_string(db, file);
+        let file_path = SystemPath::new(&path);
+        let mut best: Option<(&SystemPathBuf, usize)> = None;
+        for owned in package_owned_paths {
+            if file_path.starts_with(owned) {
+                let depth = owned.components().count();
+                if best.is_none_or(|(_, d)| depth > d) {
+                    best = Some((owned, depth));
+                }
+            }
+        }
+        match best {
+            Some((owned, _)) => buckets
+                .get_mut(owned)
+                .expect("owned key present")
+                .push(file),
+            None => unowned.push(file),
+        }
+    }
+    (buckets, unowned)
 }
 
 /// Pre-build the fqname -> idx maps used by ``find_declarations``,
@@ -491,6 +579,13 @@ pub(crate) struct ProjectContext {
     /// first-party search paths in place on the live Salsa db so the
     /// parse + semantic_index caches survive across env swaps.
     pub(crate) base_env: EnvironmentOptions,
+    /// Owned directories (one per ``Package.path``) used to partition
+    /// the enumerated file list. The build computes a longest-prefix
+    /// match against these to assign each ``File`` to a package.
+    /// Empty when constructed without packages -- the build then
+    /// treats every file as ``unowned``, which is identical to
+    /// today's flat "single bucket" semantics.
+    pub(crate) package_owned_paths: Vec<SystemPathBuf>,
 }
 
 #[pymethods]
@@ -500,15 +595,18 @@ impl ProjectContext {
         root,
         *,
         src_roots = None,
+        package_owned_paths = None,
         extra_paths = None,
         python_env = None,
         python_version = None,
         typeshed = None,
         show_progress = false,
     ))]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         root: &str,
         src_roots: Option<Vec<String>>,
+        package_owned_paths: Option<Vec<String>>,
         extra_paths: Option<Vec<String>>,
         python_env: Option<&str>,
         python_version: Option<&str>,
@@ -517,6 +615,11 @@ impl ProjectContext {
     ) -> PyResult<Self> {
         let env = build_env_options(src_roots, extra_paths, python_env, python_version, typeshed)?;
         let db = make_db(root, env.clone())?;
+        let owned = package_owned_paths
+            .unwrap_or_default()
+            .into_iter()
+            .map(SystemPathBuf::from)
+            .collect();
         Ok(Self {
             db,
             root: root.to_string(),
@@ -525,6 +628,7 @@ impl ProjectContext {
             regex_cache: RefCell::new(HashMap::new()),
             show_progress,
             base_env: env,
+            package_owned_paths: owned,
         })
     }
 
@@ -570,6 +674,43 @@ impl ProjectContext {
         &self.root
     }
 
+    /// File paths owned by a given package, in ``project_files`` order.
+    ///
+    /// Looks up the partition computed once after file enumeration:
+    /// each ``File`` was assigned to the package whose ``path`` is
+    /// the longest matching prefix. ``owned_path`` must be one of the
+    /// ``package_owned_paths`` passed at construction (matched
+    /// verbatim, no resolution). Returns an empty list for a package
+    /// that owns no files; raises if the build hasn't run yet.
+    pub(crate) fn files_for_package(&self, owned_path: &str) -> PyResult<Vec<String>> {
+        let outputs = self.materialized("files_for_package")?;
+        let key = SystemPathBuf::from(owned_path);
+        Ok(outputs
+            .files_by_package
+            .get(&key)
+            .map(|files| {
+                files
+                    .iter()
+                    .map(|f| file_path_string(&self.db, *f))
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    /// File paths enumerated by ty that fall under no package's owned
+    /// prefix. Empty for a well-formed monorepo; non-empty when the
+    /// project root holds stray modules outside the resolver's
+    /// package list. The catch-all per-package pass processes these
+    /// under the union of all exported paths.
+    pub(crate) fn unowned_files(&self) -> PyResult<Vec<String>> {
+        let outputs = self.materialized("unowned_files")?;
+        Ok(outputs
+            .unowned_files
+            .iter()
+            .map(|f| file_path_string(&self.db, *f))
+            .collect())
+    }
+
     /// Register a Python plugin. Order of registration is order of
     /// invocation during `materialize`.
     pub(crate) fn add_plugin(&mut self, plugin: PyObject) {
@@ -596,7 +737,8 @@ impl ProjectContext {
         let show_progress = slf.borrow(py).show_progress;
         {
             let this = slf.borrow(py);
-            let outputs = build_project_graph(py, &this.db, show_progress)?;
+            let outputs =
+                build_project_graph(py, &this.db, show_progress, &this.package_owned_paths)?;
             *this.outputs.borrow_mut() = Some(outputs);
         }
 

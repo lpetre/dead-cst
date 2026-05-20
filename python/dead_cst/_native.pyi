@@ -260,6 +260,7 @@ class Project:
         root: str,
         *,
         src_roots: Iterable[str] | None = ...,
+        package_owned_paths: Iterable[str] | None = ...,
         extra_paths: Iterable[str] | None = ...,
         python_env: str | None = ...,
         python_version: str | None = ...,
@@ -300,6 +301,7 @@ class ProjectContext:
         root: str,
         *,
         src_roots: Iterable[str] | None = ...,
+        package_owned_paths: Iterable[str] | None = ...,
         extra_paths: Iterable[str] | None = ...,
         python_env: str | None = ...,
         python_version: str | None = ...,
@@ -309,6 +311,26 @@ class ProjectContext:
     def add_plugin(self, plugin: _ProjectPluginLike | Any) -> None:
         """Register a plugin. Order of registration is order of
         invocation during :meth:`materialize`."""
+        ...
+
+    def files_for_package(self, owned_path: str) -> list[str]:
+        """File paths owned by a given package, in ``project_files`` order.
+
+        Looks up the partition computed once after file enumeration:
+        each ``File`` was assigned to the package whose ``path`` is
+        the longest matching prefix. ``owned_path`` must match one of
+        the ``package_owned_paths`` passed at construction (verbatim,
+        no resolution). Returns an empty list for a package that owns
+        no files; raises if :meth:`materialize` hasn't run.
+        """
+        ...
+
+    def unowned_files(self) -> list[str]:
+        """File paths enumerated by ty that fall under no package's
+        owned prefix. Empty for a well-formed monorepo; non-empty
+        when the project root holds stray modules outside the
+        resolver's package list.
+        """
         ...
 
     def set_src_roots(self, roots: list[str]) -> None:

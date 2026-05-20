@@ -157,9 +157,16 @@ class Analysis:
         # ``_validate_packages``), so a single-package or manual-spec
         # project sees identical behavior to before this split.
         src_roots = [str(e) for p in self.packages for e in p.exported_paths]
+        # Owned paths (one per ``Package.path``) drive the rust-side
+        # file partition that backs ``ctx.files_for_package(...)``. The
+        # default ``exported_paths == (path,)`` means most projects
+        # pass identical lists; multi-export and src-layout uv members
+        # are where the two diverge.
+        owned_paths = [str(p.path) for p in self.packages]
         ctx = _native.ProjectContext(
             str(self._project_root),
             src_roots=src_roots or None,
+            package_owned_paths=owned_paths or None,
             show_progress=self._show_progress,
         )
         for plugin in self._plugins:
