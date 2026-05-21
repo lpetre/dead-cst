@@ -23,8 +23,13 @@ class UvResolver:
     :class:`~dead_cst.resolvers.Package`. The workspace root itself
     (``virtual = "."``) is skipped.
 
-    The src root for a member is ``<member_dir>/src`` if that directory
-    exists, else ``<member_dir>`` itself.
+    * ``Package.path`` is the *member directory* (everything the
+      member owns -- ``src/``, ``tests/``, ``scripts/``, ...).
+    * ``Package.exported_paths`` is the *published* dirs that
+      consumers see when they depend on the member:
+      ``(<member_dir>/src,)`` for src-layout (the wheel's contents) or
+      ``(<member_dir>,)`` for flat-layout. This keeps a member's
+      ``tests/`` package out of consumers' module-resolution namespace.
 
     Requires the workspace's shared venv to be present (uv puts a
     single ``.venv`` at the workspace root). If no venv is found,
@@ -60,20 +65,38 @@ class UvResolver:
             member_dirs[name] = member_dir
             member_deps[name] = [d["name"] for d in pkg.get("dependencies", [])]
 
-        src_roots: dict[str, Path] = {}
+        # Each member contributes (owned_dir, exported_dir) -- they
+        # differ for src-layout and coincide for flat. Members whose
+        # dir doesn't exist are dropped (matches today's behavior: an
+        # editable entry pointing at a deleted path can't be analyzed).
+        layouts: dict[str, tuple[Path, Path]] = {}
         for name, member_dir in member_dirs.items():
-            src_root = _src_root_for(member_dir)
-            if src_root is not None:
-                src_roots[name] = src_root
+            exported = _exported_for(member_dir)
+            if exported is None:
+                continue
+            layouts[name] = (member_dir, exported)
 
         out: list[Package] = []
-        for name, src_root in src_roots.items():
-            dep_names = [d for d in member_deps[name] if d in src_roots]
-            out.append(Package(path=src_root, name=name, deps=tuple(dep_names)))
+        for name, (owned, exported) in layouts.items():
+            dep_names = [d for d in member_deps[name] if d in layouts]
+            out.append(
+                Package(
+                    path=owned,
+                    name=name,
+                    deps=tuple(dep_names),
+                    exported_paths=(exported,),
+                )
+            )
         return tuple(out)
 
 
-def _src_root_for(member_dir: Path) -> Path | None:
+def _exported_for(member_dir: Path) -> Path | None:
+    """Return the directory consumers should put on their search path.
+
+    Mirrors uv's wheel-build conventions: a ``<member>/src/`` if it
+    exists (src-layout), otherwise the member dir itself (flat layout).
+    ``None`` if the member directory is missing entirely.
+    """
     if (member_dir / "src").is_dir():
         return member_dir / "src"
     if member_dir.is_dir():

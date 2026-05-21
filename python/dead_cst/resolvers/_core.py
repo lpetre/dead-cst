@@ -17,18 +17,33 @@ class Package:
 
     A resolver returns a list of these to describe a project layout.
 
-    * ``path`` -- the package directory. Resolved (absolute) by
-      :class:`~dead_cst.analyze.Analysis` at construction time.
+    * ``path`` -- the package's *owned* directory. Every source file
+      under this prefix is the package's responsibility (so it gets
+      processed during the package's edge pass and bucketed under it
+      for per-package dead-code reporting). Includes things the wheel
+      doesn't ship -- e.g. for an src-layout uv member, ``path`` is
+      the member dir and covers both ``src/`` and ``tests/``.
     * ``name`` -- a stable identifier for this package, unique within
       one :class:`~dead_cst.analyze.Analysis`. Other packages refer to
       it by name in :attr:`deps`.
     * ``deps`` -- names of other packages this one imports from.
       Cycles are tolerated.
+    * ``exported_paths`` -- directories *consumers* put on their
+      search path when they depend on this package. Defaults to
+      ``(path,)`` if the resolver doesn't specify them. For an
+      src-layout uv member this is ``(member_dir / "src",)`` -- the
+      wheel's published contents, NOT the whole member dir. This is
+      what keeps a member's ``tests/`` package from bleeding into a
+      consumer's lookup namespace.
+
+    All paths are resolved (absolute) by
+    :class:`~dead_cst.analyze.Analysis` at construction time.
     """
 
     path: Path
     name: str
     deps: tuple[str, ...] = ()
+    exported_paths: tuple[Path, ...] = ()
 
 
 @runtime_checkable
@@ -58,6 +73,9 @@ def _validate_packages(packages: Iterable[Package]) -> tuple[Package, ...]:
     name_to_path: dict[str, Path] = {}
     for pkg in packages:
         path = _absolute(pkg.path)
+        exported = (
+            tuple(_absolute(p) for p in pkg.exported_paths) if pkg.exported_paths else (path,)
+        )
         existing = by_path.get(path)
         if existing is None:
             claimed = name_to_path.get(pkg.name)
@@ -66,12 +84,16 @@ def _validate_packages(packages: Iterable[Package]) -> tuple[Package, ...]:
                     f"Duplicate package name {pkg.name!r}: both {claimed} and {path} claim it"
                 )
             name_to_path[pkg.name] = path
-            by_path[path] = Package(path=path, name=pkg.name, deps=pkg.deps)
+            by_path[path] = Package(
+                path=path, name=pkg.name, deps=pkg.deps, exported_paths=exported
+            )
         else:
+            merged_exports = tuple(dict.fromkeys((*existing.exported_paths, *exported)))
             by_path[path] = Package(
                 path=path,
                 name=existing.name,
                 deps=tuple(dict.fromkeys((*existing.deps, *pkg.deps))),
+                exported_paths=merged_exports,
             )
 
     for pkg in by_path.values():

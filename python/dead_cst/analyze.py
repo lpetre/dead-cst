@@ -150,12 +150,27 @@ class Analysis:
 
         from .plugins import Plugin
 
-        # Pass each first-party package's path as a src_root so the
-        # rust backend mounts files at the right module fqname
-        # (``pkg_a/A/__init__.py`` -> ``A``, not ``pkg_a.A``).
+        src_roots = [str(e) for p in self.packages for e in p.exported_paths]
+        owned_paths = [str(p.path) for p in self.packages]
+        # Per-package env roots. Order matters: package's own
+        # ``exported_paths`` first (longest-match priority for fqname
+        # derivation), then ``path`` (catch-all for non-exported owned
+        # files like src-layout ``tests/``), then deps' ``exported_paths``
+        # (so cross-package imports resolve into deps but not non-deps).
+        env_roots_per_package: list[list[str]] = []
+        for p in self.packages:
+            dep_exports = (
+                str(e)
+                for dep_path in self._dep_paths_by_package.get(p.path, ())
+                for e in self._packages_by_path[dep_path].exported_paths
+            )
+            entries = [*(str(e) for e in p.exported_paths), str(p.path), *dep_exports]
+            env_roots_per_package.append(list(dict.fromkeys(entries)))
         ctx = _native.ProjectContext(
             str(self._project_root),
-            src_roots=[str(p.path) for p in self.packages] or None,
+            src_roots=src_roots or None,
+            package_owned_paths=owned_paths or None,
+            package_env_roots=env_roots_per_package or None,
             show_progress=self._show_progress,
         )
         for plugin in self._plugins:
