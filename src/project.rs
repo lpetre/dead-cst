@@ -344,16 +344,31 @@ pub(crate) fn build_project_graph(
     progress.imports.finish_and_clear();
     let t_phase2 = t2.elapsed();
     let t3 = std::time::Instant::now();
-    // Phase 3 is read-only over ``db`` + the per-build indices, which
-    // makes it parallelization-ready in principle. However: any
-    // attempt to call ``collect_reference_edges`` from a spawned
-    // thread (rayon::scope, std::thread::scope, into_par_iter -- all
-    // tried) deadlocks a few files in. ProjectDatabase::clone produces
-    // a snapshot but ty's resolve_module / parsed_module queries
-    // appear to require thread affinity that isn't documented; ty's
-    // own check_all_with_reporter uses the same per-task clone
-    // pattern without hanging, so the difference is subtle.
-    // TODO: figure out why and reinstate parallelism here.
+    // Phase 3 is read-only over ``db`` + the per-build indices and
+    // structurally parallelizable. Two pieces are needed before
+    // spawning workers actually wins:
+    //
+    // 1. Each worker must wrap its body in ``salsa::Database::attach``
+    //    so its snapshot db lands in salsa's thread-local storage.
+    //    Without that, calls to salsa-tracked queries from a fresh
+    //    thread deadlock waiting on TLS context that never arrives.
+    //
+    // 2. Per-file work has to be heavy enough to amortize salsa's
+    //    parallel-coordination locks. ty's ``check_file_impl`` is
+    //    itself ``#[salsa::tracked]``, which is what makes ty's
+    //    check parallelize well -- the lock-coordination is
+    //    rolled into salsa's query machinery, and per-file work
+    //    is ~200ms (full type-check). Our per-file ref-collect is
+    //    ~1ms; even with ``attach``, the salsa locks dominate when
+    //    several workers contend on the same queries, and parallel
+    //    becomes slower than sequential.
+    //
+    // Path to actual parallel speedup: make the per-file ref-collect
+    // a ``#[salsa::tracked]`` function (so salsa owns the parallel
+    // coordination). That requires splitting the function so its
+    // inputs are db+File only -- the per-build indices the current
+    // version reads would need to be either ``salsa::Input`` types or
+    // resolved after the tracked phase returns.
     let synthetic_nodes = std::mem::take(&mut builder.synthetic_nodes);
     let mut edge_batches: Vec<Vec<(usize, usize, u32)>> = Vec::with_capacity(project_files.len());
     for &file in &project_files {
