@@ -40,8 +40,7 @@ use crate::helpers::{
     CallArgs, FactoryCallFinder, StringArgCallFinder, NODE_FLAG_ENTRYPOINT,
 };
 use crate::ingest::{
-    build_dist_lookup, emit_import_edges, emit_module_hierarchy, emit_reference_edges,
-    ingest_decls, string_literal_list,
+    build_dist_lookup, emit_import_edges, emit_module_hierarchy, ingest_decls, string_literal_list,
 };
 use crate::query::{
     _compile_path_regex, _contains_any_identifier, _contains_identifier, par_scan_files,
@@ -345,18 +344,37 @@ pub(crate) fn build_project_graph(
     progress.imports.finish_and_clear();
     let t_phase2 = t2.elapsed();
     let t3 = std::time::Instant::now();
-    for file in &project_files {
-        emit_reference_edges(
+    // Phase 3 is read-only over ``db`` + the per-build indices, which
+    // makes it parallelization-ready in principle. However: any
+    // attempt to call ``collect_reference_edges`` from a spawned
+    // thread (rayon::scope, std::thread::scope, into_par_iter -- all
+    // tried) deadlocks a few files in. ProjectDatabase::clone produces
+    // a snapshot but ty's resolve_module / parsed_module queries
+    // appear to require thread affinity that isn't documented; ty's
+    // own check_all_with_reporter uses the same per-task clone
+    // pattern without hanging, so the difference is subtle.
+    // TODO: figure out why and reinstate parallelism here.
+    let synthetic_nodes = std::mem::take(&mut builder.synthetic_nodes);
+    let mut edge_batches: Vec<Vec<(usize, usize, u32)>> = Vec::with_capacity(project_files.len());
+    for &file in &project_files {
+        let edges = crate::ingest::collect_reference_edges(
             db,
-            *file,
+            file,
             &global_index,
             &module_nodes,
             &alias_imports,
             &live_decls,
+            &synthetic_nodes,
             &dist_lookup,
-            &mut builder,
         );
+        edge_batches.push(edges);
         progress.references.inc(1);
+    }
+    builder.synthetic_nodes = synthetic_nodes;
+    for batch in edge_batches {
+        for (src, dst, flags) in batch {
+            builder.add_edge(src, dst, flags);
+        }
     }
     progress.references.finish_and_clear();
     let t_phase3 = t3.elapsed();

@@ -1125,19 +1125,25 @@ pub(crate) fn mint_module_node(
 // Phase 3: same-file Name→decl reference edges
 // ---------------------------------------------------------------------------
 
+/// Collect every reference edge a file contributes. Pure read of
+/// the db + the per-build indices; returns ``(src_idx, dst_idx, flags)``
+/// triples for the caller to fold into the graph. Phase 3 today
+/// drives this serially; the structure (return-value-only, no
+/// builder mutation) is the shape that lets a future parallel
+/// orchestrator run it on snapshot dbs.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn emit_reference_edges(
-    db: &ProjectDatabase,
+pub(crate) fn collect_reference_edges(
+    db: &dyn ty_project::Db,
     file: File,
     global_index: &DeclIndex,
     module_nodes: &HashMap<File, usize>,
     alias_imports: &HashMap<usize, ImportSpec>,
     live_decls: &LiveDeclIndex,
+    synthetic_nodes: &HashMap<String, usize>,
     dist_lookup: &DistLookup,
-    builder: &mut GraphBuilder,
-) {
+) -> Vec<(usize, usize, u32)> {
     let Some(&module_idx) = module_nodes.get(&file) else {
-        return;
+        return Vec::new();
     };
     let parsed = parsed_module(db, file).load(db);
     let dead_ranges = detect_dead_ranges(&parsed);
@@ -1145,12 +1151,6 @@ pub(crate) fn emit_reference_edges(
     let global = FileScopeId::global();
     let use_def_map = index.use_def_map(global);
     let model = SemanticModel::new(db, file);
-    // Move ``synthetic_nodes`` out of the builder for the duration of
-    // this pass: the per-statement walks need a long-lived immutable
-    // borrow while ``coll.flush(builder)`` takes ``&mut builder``.
-    // The synthetic map is populated by ``emit_import_edges`` ahead of
-    // this phase and isn't mutated here, so swap-out / swap-in is safe.
-    let synthetic_nodes = std::mem::take(&mut builder.synthetic_nodes);
 
     let inputs = RefCollectorInputs {
         model: &model,
@@ -1161,10 +1161,12 @@ pub(crate) fn emit_reference_edges(
         module_nodes,
         alias_imports,
         live_decls,
-        synthetic_nodes: &synthetic_nodes,
+        synthetic_nodes,
         dist_lookup,
         dead_ranges: &dead_ranges,
     };
+
+    let mut out: Vec<(usize, usize, u32)> = Vec::new();
 
     // (a) Definitions that own an expression / body — attribute their
     //     contained Names to the owning decl.
@@ -1184,7 +1186,9 @@ pub(crate) fn emit_reference_edges(
 
         let mut coll = RefCollector::new(inputs, owner_idx);
         walk_owned(kind, &parsed, &mut coll);
-        coll.flush(builder);
+        for ((src, dst), flags) in coll.edges {
+            out.push((src, dst, flags));
+        }
     }
 
     // (b) Module-level statements that don't carry a Definition (and
@@ -1195,9 +1199,11 @@ pub(crate) fn emit_reference_edges(
         }
         let mut coll = RefCollector::new(inputs, module_idx);
         coll.visit_stmt(stmt);
-        coll.flush(builder);
+        for ((src, dst), flags) in coll.edges {
+            out.push((src, dst, flags));
+        }
     }
-    builder.synthetic_nodes = synthetic_nodes;
+    out
 }
 
 /// True iff this top-level statement is a binding form whose Names
@@ -1591,12 +1597,6 @@ impl<'a, 'db> RefCollector<'a, 'db> {
             in_annotation: 0,
             in_string_annotation: false,
             current_flags: 0,
-        }
-    }
-
-    fn flush(self, builder: &mut GraphBuilder) {
-        for ((src, dst), flags) in self.edges {
-            builder.add_edge(src, dst, flags);
         }
     }
 
