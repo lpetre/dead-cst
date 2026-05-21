@@ -73,10 +73,6 @@ def _validate_packages(packages: Iterable[Package]) -> tuple[Package, ...]:
     name_to_path: dict[str, Path] = {}
     for pkg in packages:
         path = _absolute(pkg.path)
-        # ``exported_paths`` defaults to ``(path,)`` so resolvers that
-        # don't care about the owned-vs-exported split (manual specs,
-        # single-package layouts) get today's behavior for free. We
-        # absolutize each entry the same way ``path`` is normalized.
         exported = (
             tuple(_absolute(p) for p in pkg.exported_paths) if pkg.exported_paths else (path,)
         )
@@ -92,9 +88,6 @@ def _validate_packages(packages: Iterable[Package]) -> tuple[Package, ...]:
                 path=path, name=pkg.name, deps=pkg.deps, exported_paths=exported
             )
         else:
-            # Merge deps + union exported_paths on duplicates -- a
-            # resolver that emits the same package twice with extra
-            # info gets both sets honored.
             merged_exports = tuple(dict.fromkeys((*existing.exported_paths, *exported)))
             by_path[path] = Package(
                 path=path,

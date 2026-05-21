@@ -55,7 +55,6 @@ pub(crate) struct Project {
     pub(crate) db: ProjectDatabase,
     pub(crate) root: String,
     pub(crate) base_env: EnvironmentOptions,
-    pub(crate) package_owned_paths: Vec<SystemPathBuf>,
 }
 
 #[pymethods]
@@ -65,17 +64,14 @@ impl Project {
         root,
         *,
         src_roots = None,
-        package_owned_paths = None,
         extra_paths = None,
         python_env = None,
         python_version = None,
         typeshed = None,
     ))]
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         root: &str,
         src_roots: Option<Vec<String>>,
-        package_owned_paths: Option<Vec<String>>,
         extra_paths: Option<Vec<String>>,
         python_env: Option<&str>,
         python_version: Option<&str>,
@@ -83,32 +79,22 @@ impl Project {
     ) -> PyResult<Self> {
         let env = build_env_options(src_roots, extra_paths, python_env, python_version, typeshed)?;
         let db = make_db(root, env.clone())?;
-        let owned = package_owned_paths
-            .unwrap_or_default()
-            .into_iter()
-            .map(SystemPathBuf::from)
-            .collect::<Vec<_>>();
         Ok(Self {
             db,
             root: root.to_string(),
             base_env: env,
-            package_owned_paths: owned,
         })
     }
 
-    /// Build the project-wide symbol graph.
+    /// Build the project-wide symbol graph (single-pass, no plugins).
     pub(crate) fn build(&mut self, py: Python<'_>) -> PyResult<NativeGraph> {
-        // Project::build is the lean (no-plugin) entrypoint -- no
-        // per-package envs supplied, so the build runs as a single
-        // pass under the current env (legacy behavior).
-        let owned = self.package_owned_paths.clone();
         let outputs = build_project_graph(
             py,
             &mut self.db,
             false,
             &self.root,
             &mut self.base_env,
-            &owned,
+            &[],
             &[],
         )?;
         Ok(NativeGraph {
@@ -241,24 +227,6 @@ impl ProgressBars {
     }
 }
 
-/// Per-package configuration the build loop consumes.
-///
-/// One entry per package the resolver returned (plus an extra
-/// "unowned" pseudo-entry the build appends for files outside every
-/// owned path). Index-aligned with ``package_owned_paths`` so the
-/// loop can pair ``files_by_package[i]`` with ``env_roots[i]`` in
-/// O(1).
-pub(crate) struct PackageEnv {
-    /// Search paths to install via ``swap_src_roots`` before
-    /// processing this package's files. Format:
-    /// ``[*pkg.exported_paths, pkg.path, *flatten(dep.exported_paths)]``
-    /// -- exports first for fqname-derivation priority, owned ``path``
-    /// next as a catch-all for non-exported owned files (e.g.
-    /// src-layout ``tests/``), deps last so cross-package imports
-    /// resolve.
-    pub(crate) env_roots: Vec<String>,
-}
-
 pub(crate) fn build_project_graph(
     py: Python<'_>,
     db: &mut ProjectDatabase,
@@ -266,7 +234,7 @@ pub(crate) fn build_project_graph(
     root: &str,
     base_env: &mut EnvironmentOptions,
     package_owned_paths: &[SystemPathBuf],
-    package_envs: &[PackageEnv],
+    package_env_roots: &[Vec<String>],
 ) -> PyResult<BuildOutputs> {
     let timing = std::env::var_os("DEAD_CST_TIMING").is_some();
     let mut builder = GraphBuilder::new();
@@ -312,107 +280,76 @@ pub(crate) fn build_project_graph(
     let t_enum = t0.elapsed();
     let site_packages = crate::ingest::site_packages_roots(db);
 
-    // ``dist_lookup`` is env-independent (just walks site_packages
-    // roots), so we compute it once upfront. Previously it ran on a
-    // worker thread overlapped with phase 1; the per-package loop's
-    // env swaps between iterations need ``&mut db``, which is
-    // incompatible with the scoped thread that held ``&db``. The
-    // serial cost is a small fixed overhead on cold builds.
-    let t_dl = std::time::Instant::now();
-    let dist_lookup = build_dist_lookup(&site_packages);
-    let t_dist_lookup = t_dl.elapsed();
-
-    // Build the (env_roots, files) pairs the per-package phase loop
-    // iterates over. Single-pass legacy mode = one pair with no env
-    // swap (just process every file under whatever env was set at
-    // construction). Per-package mode = one pair per package (env
-    // scoped to its exports + deps) plus a catch-all pair for
-    // ``unowned_files`` under the union of every package's env.
-    let phase_pairs: Vec<(Option<Vec<String>>, Vec<File>)> = if package_envs.is_empty() {
-        vec![(None, project_files.clone())]
+    // Pre-partition each step's files into (.py, .pyi). Phase 1 needs
+    // .py before .pyi within a step (for the peer-stub probe);
+    // pre-splitting cuts phase 1 from 2N swaps to N. Legacy = one
+    // no-swap pair holding every project file.
+    let phase_pairs: Vec<PhasePair> = if package_env_roots.is_empty() {
+        let (non_pyi, pyi) = split_by_pyi(db, &project_files);
+        vec![(None, non_pyi, pyi)]
     } else {
-        let mut pairs: Vec<(Option<Vec<String>>, Vec<File>)> =
-            Vec::with_capacity(package_owned_paths.len() + 1);
-        for (owned, env) in package_owned_paths.iter().zip(package_envs.iter()) {
+        let mut pairs = Vec::with_capacity(package_owned_paths.len() + 1);
+        for (owned, env_roots) in package_owned_paths.iter().zip(package_env_roots.iter()) {
             let files = files_by_package.get(owned).cloned().unwrap_or_default();
-            pairs.push((Some(env.env_roots.clone()), files));
+            let (non_pyi, pyi) = split_by_pyi(db, &files);
+            pairs.push((Some(env_roots.clone()), non_pyi, pyi));
         }
-        // The catch-all bucket runs under the union of every package's
-        // env so cross-cutting unowned files (root conftest.py, scripts)
-        // can resolve into any first-party package they import from.
-        let mut seen: HashMap<String, ()> = HashMap::new();
+        // Unowned catch-all runs under the union of every package's
+        // env so cross-cutting files (root conftest.py, scripts) can
+        // resolve into any first-party package they import from.
+        let mut seen: HashSet<&str> = HashSet::new();
         let mut union_env: Vec<String> = Vec::new();
-        for env in package_envs {
-            for r in &env.env_roots {
-                if seen.insert(r.clone(), ()).is_none() {
+        for env_roots in package_env_roots {
+            for r in env_roots {
+                if seen.insert(r.as_str()) {
                     union_env.push(r.clone());
                 }
             }
         }
-        pairs.push((Some(union_env), unowned_files.clone()));
+        let (non_pyi, pyi) = split_by_pyi(db, &unowned_files);
+        pairs.push((Some(union_env), non_pyi, pyi));
         pairs
     };
 
     let progress = ProgressBars::new(show_progress, project_files.len() as u64);
 
-    // Phase 1 (decl ingest): two outer passes over the pairs --
-    // non-pyi first, then pyi -- so the per-decl peer-stub probe in
-    // ``ingest_decls`` always sees the .py twin's globals_by_name
-    // entries before the .pyi is ingested. Within each outer pass we
-    // swap env once per pair.
+    // Phase 1 overlaps with the env-independent dist_lookup walk on a
+    // worker thread (joined before phase 2 where dist_lookup is first
+    // read). The scoped thread only borrows ``site_packages``, so
+    // phase 1 keeps its ``&mut db`` for ``swap_src_roots``.
     let t1 = std::time::Instant::now();
-    for (env_roots_opt, files) in &phase_pairs {
-        if let Some(roots) = env_roots_opt {
-            swap_src_roots(db, root, base_env, roots.clone())?;
-        }
-        for file in files {
-            if file_path_string(db, *file).ends_with(".pyi") {
-                continue;
+    let (dist_lookup, t_dist_lookup) = std::thread::scope(|s| -> PyResult<_> {
+        let sp_ref = &site_packages;
+        let lookup_handle = s.spawn(move || {
+            let t = std::time::Instant::now();
+            (build_dist_lookup(sp_ref), t.elapsed())
+        });
+
+        for (env_roots_opt, non_pyi, pyi) in &phase_pairs {
+            if let Some(roots) = env_roots_opt {
+                swap_src_roots(db, root, base_env, roots)?;
             }
-            ingest_decls(
-                py,
-                db,
-                *file,
-                &mut builder,
-                &mut global_index,
-                &mut module_nodes,
-                &mut alias_imports,
-                &mut live_decls,
-                &mut globals_by_name,
-                &mut star_reexports,
-                &mut class_by_selection,
-                &mut decl_by_name_range,
-            )?;
-            progress.ingest.inc(1);
-        }
-    }
-    for (env_roots_opt, files) in &phase_pairs {
-        if let Some(roots) = env_roots_opt {
-            swap_src_roots(db, root, base_env, roots.clone())?;
-        }
-        for file in files {
-            if !file_path_string(db, *file).ends_with(".pyi") {
-                continue;
+            for file in non_pyi.iter().chain(pyi.iter()) {
+                ingest_decls(
+                    py,
+                    db,
+                    *file,
+                    &mut builder,
+                    &mut global_index,
+                    &mut module_nodes,
+                    &mut alias_imports,
+                    &mut live_decls,
+                    &mut globals_by_name,
+                    &mut star_reexports,
+                    &mut class_by_selection,
+                    &mut decl_by_name_range,
+                )?;
+                progress.ingest.inc(1);
             }
-            ingest_decls(
-                py,
-                db,
-                *file,
-                &mut builder,
-                &mut global_index,
-                &mut module_nodes,
-                &mut alias_imports,
-                &mut live_decls,
-                &mut globals_by_name,
-                &mut star_reexports,
-                &mut class_by_selection,
-                &mut decl_by_name_range,
-            )?;
-            progress.ingest.inc(1);
         }
-    }
-    progress.ingest.finish_and_clear();
-    // Peer-stub edges (env-independent: pure builder bookkeeping).
+        progress.ingest.finish_and_clear();
+        Ok(lookup_handle.join().expect("dist_lookup thread panicked"))
+    })?;
     let peer_stubs: Vec<(File, File)> = builder
         .peer_pyi_to_py
         .iter()
@@ -435,11 +372,11 @@ pub(crate) fn build_project_graph(
     let t_phase1 = t1.elapsed();
 
     let t2 = std::time::Instant::now();
-    for (env_roots_opt, files) in &phase_pairs {
+    for (env_roots_opt, non_pyi, pyi) in &phase_pairs {
         if let Some(roots) = env_roots_opt {
-            swap_src_roots(db, root, base_env, roots.clone())?;
+            swap_src_roots(db, root, base_env, roots)?;
         }
-        for file in files {
+        for file in non_pyi.iter().chain(pyi.iter()) {
             emit_module_hierarchy(db, *file, &module_nodes, &mut builder);
             emit_import_edges(
                 py,
@@ -458,11 +395,11 @@ pub(crate) fn build_project_graph(
     progress.imports.finish_and_clear();
     let t_phase2 = t2.elapsed();
     let t3 = std::time::Instant::now();
-    for (env_roots_opt, files) in &phase_pairs {
+    for (env_roots_opt, non_pyi, pyi) in &phase_pairs {
         if let Some(roots) = env_roots_opt {
-            swap_src_roots(db, root, base_env, roots.clone())?;
+            swap_src_roots(db, root, base_env, roots)?;
         }
-        for file in files {
+        for file in non_pyi.iter().chain(pyi.iter()) {
             emit_reference_edges(
                 db,
                 *file,
@@ -478,10 +415,6 @@ pub(crate) fn build_project_graph(
     }
     progress.references.finish_and_clear();
     let t_phase3 = t3.elapsed();
-
-    // Final env state for plugins: the last per-package pair we
-    // installed was the unowned-catch-all under the union env, so the
-    // resolver is already permissive. No extra swap needed.
     let t4 = std::time::Instant::now();
     let (decl_by_fqname, module_by_fqname, imports_by_module) = build_fqname_indices(py, &builder);
     let t_fqname = t4.elapsed();
@@ -524,6 +457,25 @@ pub(crate) fn build_project_graph(
 /// proper resolver should have an empty unowned set, but stray
 /// project-root scripts and conftest.py files outside any member dir
 /// are surfaced here rather than silently lost.
+/// One iteration of the per-package phase loop: optional env_roots
+/// (None = no swap, legacy single-pass) plus the package's files
+/// pre-partitioned into ``.py`` and ``.pyi`` so phase 1 can run each
+/// step in a single swap rather than two outer passes.
+type PhasePair = (Option<Vec<String>>, Vec<File>, Vec<File>);
+
+fn split_by_pyi(db: &ProjectDatabase, files: &[File]) -> (Vec<File>, Vec<File>) {
+    let mut non_pyi = Vec::new();
+    let mut pyi = Vec::new();
+    for &f in files {
+        if file_path_string(db, f).ends_with(".pyi") {
+            pyi.push(f);
+        } else {
+            non_pyi.push(f);
+        }
+    }
+    (non_pyi, pyi)
+}
+
 fn partition_files_by_package(
     db: &ProjectDatabase,
     project_files: &[File],
@@ -653,28 +605,18 @@ pub(crate) struct ProjectContext {
     /// downgrades to a hidden draw target when stderr isn't a TTY, so
     /// passing ``True`` is safe in CI / pipes.
     pub(crate) show_progress: bool,
-    /// Original env options captured at construction, so :meth:`set_src_roots`
-    /// can rebuild the ``ProgramSettings`` with a new ``root`` list while
-    /// keeping ``extra_paths`` / ``python`` / ``typeshed`` / ``python_version``
-    /// constant. Cloning + mutating this is what lets us swap the
-    /// first-party search paths in place on the live Salsa db so the
-    /// parse + semantic_index caches survive across env swaps.
+    /// Env options captured at construction so ``swap_src_roots`` can
+    /// rebuild ``ProgramSettings`` with a mutated ``root`` while
+    /// keeping the rest constant.
     pub(crate) base_env: EnvironmentOptions,
-    /// Owned directories (one per ``Package.path``) used to partition
-    /// the enumerated file list. The build computes a longest-prefix
-    /// match against these to assign each ``File`` to a package.
-    /// Empty when constructed without packages -- the build then
-    /// treats every file as ``unowned``, which is identical to
-    /// today's flat "single bucket" semantics.
+    /// One owned dir per package (BFS dep order), used to partition
+    /// the project file set by longest-prefix match. Empty = no
+    /// partition, every file is unowned.
     pub(crate) package_owned_paths: Vec<SystemPathBuf>,
-    /// Per-package env-roots, index-aligned with
-    /// ``package_owned_paths``. ``package_envs[i].env_roots`` is the
-    /// search-path list installed via ``swap_src_roots`` before
-    /// processing files owned by ``package_owned_paths[i]``. Empty
-    /// = single-pass build under the current env (today's
-    /// behavior); non-empty = per-package phase loop with env swaps
-    /// between iterations.
-    pub(crate) package_envs: Vec<PackageEnv>,
+    /// Index-aligned with ``package_owned_paths``. Empty = single-pass
+    /// legacy build; non-empty = per-package phase loop with env
+    /// swaps between iterations.
+    pub(crate) package_env_roots: Vec<Vec<String>>,
 }
 
 #[pymethods]
@@ -711,11 +653,7 @@ impl ProjectContext {
             .into_iter()
             .map(SystemPathBuf::from)
             .collect();
-        let envs: Vec<PackageEnv> = package_env_roots
-            .unwrap_or_default()
-            .into_iter()
-            .map(|env_roots| PackageEnv { env_roots })
-            .collect();
+        let envs: Vec<Vec<String>> = package_env_roots.unwrap_or_default();
         if !envs.is_empty() && envs.len() != owned.len() {
             return Err(PyValueError::new_err(format!(
                 "package_env_roots length {} does not match package_owned_paths length {}",
@@ -732,7 +670,7 @@ impl ProjectContext {
             show_progress,
             base_env: env,
             package_owned_paths: owned,
-            package_envs: envs,
+            package_env_roots: envs,
         })
     }
 
@@ -751,7 +689,7 @@ impl ProjectContext {
     /// only finds the deps that the current package's lockfile actually
     /// permits, while the heavy parse + index work stays hot.
     pub(crate) fn set_src_roots(&mut self, roots: Vec<String>) -> PyResult<()> {
-        swap_src_roots(&mut self.db, &self.root, &mut self.base_env, roots)
+        swap_src_roots(&mut self.db, &self.root, &mut self.base_env, &roots)
     }
 
     /// Absolute project root passed at construction.
@@ -823,20 +761,9 @@ impl ProjectContext {
         let show_progress = slf.borrow(py).show_progress;
         {
             let mut this = slf.borrow_mut(py);
-            // Split-borrow: ``build_project_graph`` needs ``&mut db``
-            // and ``&mut base_env`` simultaneously, plus an
-            // immutable slice of ``package_owned_paths``. Reborrowing
-            // through ``&mut *this`` would conflict on field access;
-            // taking fields by pointer is the idiomatic split.
             let this_ref: &mut ProjectContext = &mut this;
             let owned = this_ref.package_owned_paths.clone();
-            let envs: Vec<PackageEnv> = this_ref
-                .package_envs
-                .iter()
-                .map(|e| PackageEnv {
-                    env_roots: e.env_roots.clone(),
-                })
-                .collect();
+            let envs = this_ref.package_env_roots.clone();
             let outputs = build_project_graph(
                 py,
                 &mut this_ref.db,
@@ -2428,33 +2355,32 @@ pub(crate) fn make_db(root: &str, env: EnvironmentOptions) -> PyResult<ProjectDa
 
 /// Swap the first-party search paths on a live Salsa db.
 ///
-/// Shared by :meth:`ProjectContext::set_src_roots` (the Python-facing
-/// setter) and the per-package phase loop in :fn:`build_project_graph`
-/// (which calls it between package iterations). Mutates ``base_env``
-/// in place so successive calls compose -- e.g. the loop's
-/// "set to pkg A's env, then to pkg B's env, then to the union for
-/// the plugin pass" pattern reuses the same base options each time.
+/// Shared by :meth:`ProjectContext::set_src_roots` and the
+/// per-package phase loop. Mutates ``base_env`` so successive calls
+/// compose. Returns early when ``roots`` already matches
+/// ``base_env.root`` so back-to-back identical envs (common in the
+/// per-package loop's catch-all pair) skip the metadata rebuild.
 pub(crate) fn swap_src_roots(
     db: &mut ProjectDatabase,
     root: &str,
     base_env: &mut EnvironmentOptions,
-    roots: Vec<String>,
+    roots: &[String],
 ) -> PyResult<()> {
-    base_env.root = Some(roots.into_iter().map(rel_path).collect());
+    let new_root: Vec<_> = roots.iter().map(|r| rel_path(r.clone())).collect();
+    if base_env.root.as_ref() == Some(&new_root) {
+        return Ok(());
+    }
+    base_env.root = Some(new_root);
 
     let metadata = make_metadata(root, base_env.clone())?;
-    // ``UseDefaultStrategy::Error`` is ``Infallible``, so the result is
-    // unconditionally ``Ok``; ``let Ok(..)`` keeps the type-level
-    // promise explicit without needing a ``match never {}`` dance.
     let Ok((program_settings, _diagnostics)) =
         metadata.to_program_settings(db.system(), db.vendored(), &UseDefaultStrategy);
 
     let program = ty_python_core::program::Program::get(db);
     program.update_from_settings(db, program_settings);
 
-    // The project's file enumeration is computed from the (now stale)
-    // search paths; mark it lazy so the next ``files(db)`` re-walks
-    // under the new env.
+    // File enumeration was computed under the stale roots; mark lazy
+    // so the next ``files(db)`` re-walks.
     db.project().reload_files(db);
 
     Ok(())

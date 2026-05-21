@@ -39,31 +39,24 @@ def test_files_partition_assigns_each_file_to_owning_package(tmp_path):
             "pkg_b/m1.py": "z = 3",
         },
     )
-    a = str(tmp_path / "pkg_a")
-    b = str(tmp_path / "pkg_b")
+    a = tmp_path / "pkg_a"
+    b = tmp_path / "pkg_b"
     ctx = native.ProjectContext(
         str(tmp_path),
-        src_roots=[a, b],
-        package_owned_paths=[a, b],
+        src_roots=[str(a), str(b)],
+        package_owned_paths=[str(a), str(b)],
     )
     ctx.materialize()
 
-    a_files = set(ctx.files_for_package(a))
-    b_files = set(ctx.files_for_package(b))
-
-    # Every pkg_a file is in A's bucket, no pkg_b leak.
-    assert any(p.endswith("pkg_a/m1.py") for p in a_files)
-    assert any(p.endswith("pkg_a/m2.py") for p in a_files)
-    assert any(p.endswith("pkg_a/__init__.py") for p in a_files)
-    assert not any("pkg_b" in p for p in a_files)
-
-    # Same for pkg_b.
-    assert any(p.endswith("pkg_b/m1.py") for p in b_files)
-    assert any(p.endswith("pkg_b/__init__.py") for p in b_files)
-    assert not any("pkg_a" in p for p in b_files)
-
-    # Disjoint partitions.
-    assert a_files.isdisjoint(b_files)
+    assert set(ctx.files_for_package(str(a))) == {
+        str(a / "__init__.py"),
+        str(a / "m1.py"),
+        str(a / "m2.py"),
+    }
+    assert set(ctx.files_for_package(str(b))) == {
+        str(b / "__init__.py"),
+        str(b / "m1.py"),
+    }
 
 
 def test_files_partition_longest_prefix_wins_for_nested_owned_dirs(tmp_path):
@@ -84,78 +77,64 @@ def test_files_partition_longest_prefix_wins_for_nested_owned_dirs(tmp_path):
             "lib/internal/deep.py": "y = 2",
         },
     )
-    outer = str(tmp_path / "lib")
-    inner = str(tmp_path / "lib" / "internal")
+    outer = tmp_path / "lib"
+    inner = tmp_path / "lib" / "internal"
     ctx = native.ProjectContext(
         str(tmp_path),
-        src_roots=[outer],
-        package_owned_paths=[outer, inner],
+        src_roots=[str(outer)],
+        package_owned_paths=[str(outer), str(inner)],
     )
     ctx.materialize()
 
-    outer_files = set(ctx.files_for_package(outer))
-    inner_files = set(ctx.files_for_package(inner))
-
-    # The deep file belongs to the inner package (longest prefix), not
-    # the outer one -- otherwise per-package processing would double-
-    # count it or miss it under the wrong scope.
-    assert any(p.endswith("lib/internal/deep.py") for p in inner_files)
-    assert any(p.endswith("lib/internal/__init__.py") for p in inner_files)
-    assert not any("internal" in p for p in outer_files)
-
-    # The outer package keeps its own top-level files.
-    assert any(p.endswith("lib/top.py") for p in outer_files)
+    assert set(ctx.files_for_package(str(outer))) == {
+        str(outer / "__init__.py"),
+        str(outer / "top.py"),
+    }
+    assert set(ctx.files_for_package(str(inner))) == {
+        str(inner / "__init__.py"),
+        str(inner / "deep.py"),
+    }
 
 
 def test_files_partition_unowned_bucket_catches_stray_files(tmp_path):
     """Files outside every owned path land in ``unowned_files``.
     Common shape: ``conftest.py`` at the project root, scripts in
-    ``./scripts/`` that aren't anyone's owned dir, etc. The build
-    still has to process them somewhere -- the catch-all pass uses
-    the union of all exported paths.
+    ``./scripts/`` that aren't anyone's owned dir.
     """
     _write(
         tmp_path,
         {
             "pkg_a/__init__.py": "",
             "pkg_a/mod.py": "x = 1",
-            "conftest.py": "",  # root-level, no owner
-            "scripts/build.py": "y = 2",  # not under pkg_a
+            "conftest.py": "",
+            "scripts/build.py": "y = 2",
         },
     )
-    a = str(tmp_path / "pkg_a")
+    a = tmp_path / "pkg_a"
     ctx = native.ProjectContext(
         str(tmp_path),
-        src_roots=[a],
-        package_owned_paths=[a],
+        src_roots=[str(a)],
+        package_owned_paths=[str(a)],
     )
     ctx.materialize()
 
-    a_files = set(ctx.files_for_package(a))
-    unowned = set(ctx.unowned_files())
-
-    assert any(p.endswith("pkg_a/mod.py") for p in a_files)
-    # The strays show up in the unowned bucket, NOT in pkg_a's.
-    assert any(p.endswith("conftest.py") for p in unowned)
-    assert any(p.endswith("scripts/build.py") for p in unowned)
-    assert not any("conftest.py" in p for p in a_files)
-    assert a_files.isdisjoint(unowned)
+    assert set(ctx.files_for_package(str(a))) == {
+        str(a / "__init__.py"),
+        str(a / "mod.py"),
+    }
+    assert set(ctx.unowned_files()) == {
+        str(tmp_path / "conftest.py"),
+        str(tmp_path / "scripts" / "build.py"),
+    }
 
 
 def test_files_partition_no_owned_paths_puts_everything_in_unowned(tmp_path):
-    """Backward-compat: when no owned paths are passed (legacy or
-    single-package shape), the partition is still computed -- every
-    file lands in ``unowned``, no per-package buckets exist. Pins
-    that today's callers (which don't pass ``package_owned_paths``)
-    keep working without surprises."""
+    """When no owned paths are passed (legacy shape), every file
+    lands in ``unowned``. Pins that today's callers (which don't
+    pass ``package_owned_paths``) keep working."""
     _write(tmp_path, {"m.py": "x = 1", "n.py": "y = 2"})
     ctx = native.ProjectContext(str(tmp_path), src_roots=[str(tmp_path)])
     ctx.materialize()
 
-    # No owned paths -> every project file is unowned.
-    unowned = set(ctx.unowned_files())
-    assert any(p.endswith("m.py") for p in unowned)
-    assert any(p.endswith("n.py") for p in unowned)
-
-    # Looking up an unknown owned path returns an empty list (no crash).
+    assert set(ctx.unowned_files()) == {str(tmp_path / "m.py"), str(tmp_path / "n.py")}
     assert ctx.files_for_package(str(tmp_path / "nonexistent")) == []
