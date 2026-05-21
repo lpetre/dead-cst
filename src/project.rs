@@ -313,43 +313,97 @@ pub(crate) fn build_project_graph(
 
     let progress = ProgressBars::new(show_progress, project_files.len() as u64);
 
-    // Phase 1 overlaps with the env-independent dist_lookup walk on a
-    // worker thread (joined before phase 2 where dist_lookup is first
-    // read). The scoped thread only borrows ``site_packages``, so
-    // phase 1 keeps its ``&mut db`` for ``swap_src_roots``.
-    let t1 = std::time::Instant::now();
-    let (dist_lookup, t_dist_lookup) = std::thread::scope(|s| -> PyResult<_> {
-        let sp_ref = &site_packages;
-        let lookup_handle = s.spawn(move || {
-            let t = std::time::Instant::now();
-            (build_dist_lookup(sp_ref), t.elapsed())
-        });
+    // ``dist_lookup`` runs in a worker thread while we set up the
+    // per-package loop. It's env-independent so it can run any time
+    // before phase 2's first ``emit_import_edges`` call, which now
+    // happens inside the same per-pair iteration as ingest -- so we
+    // join before the main loop starts. ``site_packages`` is cloned
+    // into the thread so the join can move both halves out cleanly.
+    let site_packages_clone = site_packages.clone();
+    let lookup_handle = std::thread::spawn(move || {
+        let t = std::time::Instant::now();
+        (build_dist_lookup(&site_packages_clone), t.elapsed())
+    });
 
-        for (env_roots_opt, non_pyi, pyi) in &phase_pairs {
-            if let Some(roots) = env_roots_opt {
-                swap_src_roots(db, root, base_env, roots)?;
-            }
-            for file in non_pyi.iter().chain(pyi.iter()) {
-                ingest_decls(
-                    py,
-                    db,
-                    *file,
-                    &mut builder,
-                    &mut global_index,
-                    &mut module_nodes,
-                    &mut alias_imports,
-                    &mut live_decls,
-                    &mut globals_by_name,
-                    &mut star_reexports,
-                    &mut class_by_selection,
-                    &mut decl_by_name_range,
-                )?;
-                progress.ingest.inc(1);
-            }
+    // Per-package iteration: each pair gets ONE ``swap_src_roots``
+    // followed by all three phases (ingest → imports → refs) under
+    // that env. Cuts swaps from 3N to N, which is where the win
+    // comes from: each swap invalidates ty's ``resolve_module``
+    // salsa cache, and the flamegraph showed ~59% of build time
+    // spent re-resolving modules after invalidation. BFS dep order
+    // (deps processed before consumers, set by ``Analysis.packages``)
+    // means each consumer's emit_* phases see its deps' decls in
+    // ``globals_by_name`` already.
+    let t1 = std::time::Instant::now();
+    let mut t_phase1 = std::time::Duration::ZERO;
+    let mut t_phase2 = std::time::Duration::ZERO;
+    let mut t_phase3 = std::time::Duration::ZERO;
+    let (dist_lookup, t_dist_lookup) = lookup_handle.join().expect("dist_lookup thread panicked");
+    for (env_roots_opt, non_pyi, pyi) in &phase_pairs {
+        if let Some(roots) = env_roots_opt {
+            swap_src_roots(db, root, base_env, roots)?;
         }
-        progress.ingest.finish_and_clear();
-        Ok(lookup_handle.join().expect("dist_lookup thread panicked"))
-    })?;
+        let p1_start = std::time::Instant::now();
+        for file in non_pyi.iter().chain(pyi.iter()) {
+            ingest_decls(
+                py,
+                db,
+                *file,
+                &mut builder,
+                &mut global_index,
+                &mut module_nodes,
+                &mut alias_imports,
+                &mut live_decls,
+                &mut globals_by_name,
+                &mut star_reexports,
+                &mut class_by_selection,
+                &mut decl_by_name_range,
+            )?;
+            progress.ingest.inc(1);
+        }
+        t_phase1 += p1_start.elapsed();
+        let p2_start = std::time::Instant::now();
+        for file in non_pyi.iter().chain(pyi.iter()) {
+            emit_module_hierarchy(db, *file, &module_nodes, &mut builder);
+            emit_import_edges(
+                py,
+                db,
+                *file,
+                &mut builder,
+                &mut global_index,
+                &mut module_nodes,
+                &globals_by_name,
+                &star_reexports,
+                &dist_lookup,
+            )?;
+            progress.imports.inc(1);
+        }
+        t_phase2 += p2_start.elapsed();
+        let p3_start = std::time::Instant::now();
+        for file in non_pyi.iter().chain(pyi.iter()) {
+            emit_reference_edges(
+                db,
+                *file,
+                &global_index,
+                &module_nodes,
+                &alias_imports,
+                &live_decls,
+                &dist_lookup,
+                &mut builder,
+            );
+            progress.references.inc(1);
+        }
+        t_phase3 += p3_start.elapsed();
+    }
+    progress.ingest.finish_and_clear();
+    progress.imports.finish_and_clear();
+    progress.references.finish_and_clear();
+
+    // Peer-stub edges (env-independent, pure builder bookkeeping).
+    // Run after the per-package loop so every package's decls are in
+    // ``globals_by_name`` -- a peer-pyi in one package can still edge
+    // to its .py twin in another (rare, but ingest registered them
+    // in ``peer_pyi_to_py`` during the file enumeration walk).
     let peer_stubs: Vec<(File, File)> = builder
         .peer_pyi_to_py
         .iter()
@@ -369,52 +423,7 @@ pub(crate) fn build_project_graph(
             }
         }
     }
-    let t_phase1 = t1.elapsed();
-
-    let t2 = std::time::Instant::now();
-    for (env_roots_opt, non_pyi, pyi) in &phase_pairs {
-        if let Some(roots) = env_roots_opt {
-            swap_src_roots(db, root, base_env, roots)?;
-        }
-        for file in non_pyi.iter().chain(pyi.iter()) {
-            emit_module_hierarchy(db, *file, &module_nodes, &mut builder);
-            emit_import_edges(
-                py,
-                db,
-                *file,
-                &mut builder,
-                &mut global_index,
-                &mut module_nodes,
-                &globals_by_name,
-                &star_reexports,
-                &dist_lookup,
-            )?;
-            progress.imports.inc(1);
-        }
-    }
-    progress.imports.finish_and_clear();
-    let t_phase2 = t2.elapsed();
-    let t3 = std::time::Instant::now();
-    for (env_roots_opt, non_pyi, pyi) in &phase_pairs {
-        if let Some(roots) = env_roots_opt {
-            swap_src_roots(db, root, base_env, roots)?;
-        }
-        for file in non_pyi.iter().chain(pyi.iter()) {
-            emit_reference_edges(
-                db,
-                *file,
-                &global_index,
-                &module_nodes,
-                &alias_imports,
-                &live_decls,
-                &dist_lookup,
-                &mut builder,
-            );
-            progress.references.inc(1);
-        }
-    }
-    progress.references.finish_and_clear();
-    let t_phase3 = t3.elapsed();
+    let _t_loop_total = t1.elapsed();
     let t4 = std::time::Instant::now();
     let (decl_by_fqname, module_by_fqname, imports_by_module) = build_fqname_indices(py, &builder);
     let t_fqname = t4.elapsed();
