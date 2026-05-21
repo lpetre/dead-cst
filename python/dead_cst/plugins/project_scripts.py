@@ -3,13 +3,24 @@
 from __future__ import annotations
 
 import logging
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 from ..graph import NodeFlags
-from ..resolvers import load_toml
 from ._base import Plugin, native
+
+
+def load_toml(path: Path) -> dict[str, Any] | None:
+    """Read ``path`` as TOML; ``None`` if the file is missing."""
+    try:
+        f = path.open("rb")
+    except OSError:
+        return None
+    with f:
+        return tomllib.load(f)
+
 
 PROJECT_SCRIPTS_PREFIX = "<project.scripts>:"
 

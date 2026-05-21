@@ -30,7 +30,6 @@ from dead_cst import Analysis
 from dead_cst.graph import KEEPALIVE_DEFAULT
 from dead_cst.cli import app
 from dead_cst.plugins import MainBlockPlugin, ModuleDundersPlugin
-from dead_cst.resolvers import ManualResolver
 
 from ._flux0_plugins import Flux0CliCommandsPlugin, Flux0InternalModulesPlugin
 
@@ -94,7 +93,7 @@ def _ancestor_fqnames(base: Path, target_fqname: str) -> list[str]:
     predecessor chain's fqnames — the same data the dropped CLI
     command rendered, exposed through :meth:`Analysis.ancestors`.
     """
-    analysis = Analysis(base, resolver=ManualResolver(specs=["."]), plugins=[MainBlockPlugin()])
+    analysis = Analysis(base, plugins=[MainBlockPlugin()])
     ctx = analysis.materialize_all()
     target = next((n for n in ctx.nodes() if n.fqname == target_fqname), None)
     assert target is not None, f"{target_fqname} not in graph"
@@ -129,9 +128,7 @@ def _module_node(graph, fqname):
 
 
 def _build_graph(base: Path, *plugins):
-    return Analysis(
-        base, resolver=ManualResolver(specs=["."]), plugins=list(plugins)
-    ).materialize_all()
+    return Analysis(base, plugins=list(plugins)).materialize_all()
 
 
 def test_flux0_cli_cmds_dead_without_plugin(flux0_cli_src):
@@ -292,7 +289,6 @@ def test_flux0_internal_modules(flux0_server_src, tmp_path):
     ]
     graph = Analysis(
         base,
-        resolver=ManualResolver(specs=["."]),
         plugins=plugins,
     ).materialize_all()
     reachable = graph.reachable(seed_flags=KEEPALIVE_DEFAULT)

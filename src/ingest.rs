@@ -830,16 +830,20 @@ pub(crate) fn classify_import_target(
     if search_path.is_some_and(|sp| sp.is_standard_library()) {
         return ImportTarget::Stdlib;
     }
-    if search_path.is_some_and(|sp| sp.is_first_party()) {
+    // First-party = anything that isn't stdlib or site-packages.
+    // Covers ty's ``FirstParty`` (env.root entries), ``Editable``
+    // (``.pth``-derived entries from the venv, which is how
+    // ``uv sync --all-packages`` exposes first-party members), and
+    // ``ExtraPath`` (user-supplied extra search paths).
+    if search_path.is_some_and(|sp| sp.is_first_party() || !sp.is_site_packages()) {
         return match module.file(db) {
             Some(f) => ImportTarget::FirstParty(f),
             None => ImportTarget::Unresolved(top_level.to_string()),
         };
     }
-    // Non-first-party, non-stdlib: site-packages, editable, extra,
-    // or namespace package. Probe the dist-RECORD lookup for the
-    // resolved file's canonical name; fall back to ``[external file]``
-    // when the file isn't owned by any installed distribution.
+    // Site-packages: probe the dist-RECORD lookup for the resolved
+    // file's canonical name; fall back to ``[external file]`` when
+    // the file isn't owned by any installed distribution.
     let Some(file) = module.file(db) else {
         return ImportTarget::Unresolved(top_level.to_string());
     };
