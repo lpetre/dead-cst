@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 import textwrap
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
 
 from dead_cst import Analysis, EdgeFlags
-from dead_cst.resolvers import ManualResolver
 
 if TYPE_CHECKING:
     from dead_cst import _native as native
@@ -16,11 +17,7 @@ if TYPE_CHECKING:
 
 @pytest.fixture
 def write_files(tmp_path):
-    """Write a ``{relpath: source}`` mapping under ``tmp_path``.
-
-    Each value is dedented and stripped, with a trailing newline appended,
-    matching the inline-source convention used across the test suite.
-    """
+    """Write a ``{relpath: source}`` mapping under ``tmp_path``."""
 
     def _write(files: dict[str, str]) -> None:
         for name, src in files.items():
@@ -31,13 +28,76 @@ def write_files(tmp_path):
     return _write
 
 
+def _python_version_tag() -> str:
+    return f"python{sys.version_info.major}.{sys.version_info.minor}"
+
+
 @pytest.fixture
-def make_analysis(tmp_path):
-    """Build an :class:`Analysis` rooted at ``tmp_path`` with minimal boilerplate."""
+def make_workspace_venv(tmp_path):
+    """Create a fake venv populated with editable ``.pth`` entries.
+
+    Mirrors what ``uv sync --all-packages`` produces: one ``.pth``
+    file per first-party member, each containing the absolute path
+    to that member's published source dir. ty reads these on
+    site-packages traversal and uses them as module-resolution
+    search paths, which is what makes ``from libx import foo``
+    resolve to ``packages/libx/src/libx/__init__.py`` (and what
+    makes the file at that path mount as module ``libx`` rather
+    than ``packages.libx.src.libx``).
+
+    ``members`` maps each member name to its published dir, given
+    as a path RELATIVE to ``tmp_path``. The dir is what consumers
+    put on their search path -- e.g. for ``packages/libx/src/libx/``
+    (where ``libx/__init__.py`` lives), the published dir is
+    ``packages/libx/src``.
+
+    Returns the absolute path of the new ``.venv`` directory.
+    """
+
+    def _make(members: dict[str, str]) -> Path:
+        site_packages = tmp_path / ".venv" / "lib" / _python_version_tag() / "site-packages"
+        site_packages.mkdir(parents=True)
+        for name, exported in members.items():
+            exported_abs = (tmp_path / exported).resolve()
+            (site_packages / f"_editable_impl_{name}.pth").write_text(f"{exported_abs}\n")
+        return tmp_path / ".venv"
+
+    return _make
+
+
+def _members_from_specs(specs: list[str]) -> dict[str, str]:
+    """Parse legacy ``"name:dep1,dep2"`` specs into a ``{name: <name>}``
+    mapping (deps ignored -- the new model encodes them via the venv's
+    ``.pth`` files, not the resolver). Each member's published dir is
+    just ``tmp_path / name`` -- if a test writes ``pkg_a/A/...``, the
+    wheel content is ``A`` and ``pkg_a/`` is what consumers put on
+    their search path."""
+    members: dict[str, str] = {}
+    for spec in specs:
+        name = spec.split(":", 1)[0].strip()
+        if not name or name == ".":
+            continue
+        members[name] = name
+    return members
+
+
+@pytest.fixture
+def make_analysis(tmp_path, make_workspace_venv):
+    """Build an :class:`Analysis` rooted at ``tmp_path``.
+
+    Accepts a legacy ``specs`` positional arg (a list like
+    ``["pkg_a", "pkg_b:pkg_a"]``) for multi-package tests -- each
+    entry's first segment becomes a ``.pth``-registered member with
+    its published dir at ``tmp_path / name``. Deps are ignored (the
+    venv-driven model has no dep concept). Single-package callers
+    just pass ``Analysis``-kwargs.
+    """
 
     def _make(specs: list[str] | None = None, **kwargs) -> Analysis:
-        if "resolver" not in kwargs:
-            kwargs["resolver"] = ManualResolver(specs=list(specs) if specs else ["."])
+        if specs:
+            members = _members_from_specs(specs)
+            if members and "venv" not in kwargs:
+                kwargs["venv"] = make_workspace_venv(members)
         return Analysis(tmp_path, **kwargs)
 
     return _make
@@ -46,8 +106,9 @@ def make_analysis(tmp_path):
 @pytest.fixture
 def build_decl_graph(tmp_path):
     """Materialise inline ``{relpath: source}`` files and return the live
-    :class:`native.ProjectContext` — same value
+    :class:`native.ProjectContext` -- same value
     :meth:`Analysis.materialize_all` returns to production callers.
+    Single-package shape: no venv, ty auto-discovers ``project_root``.
     """
 
     def _make_graph(files: dict[str, str]) -> "native.ProjectContext":
@@ -55,7 +116,7 @@ def build_decl_graph(tmp_path):
             full_path = tmp_path / filename
             full_path.parent.mkdir(parents=True, exist_ok=True)
             full_path.write_text(textwrap.dedent(content).strip())
-        return Analysis(tmp_path, resolver=ManualResolver(specs=["."])).materialize_all()
+        return Analysis(tmp_path).materialize_all()
 
     return _make_graph
 

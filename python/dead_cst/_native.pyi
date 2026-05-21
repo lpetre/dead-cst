@@ -300,8 +300,6 @@ class ProjectContext:
         root: str,
         *,
         src_roots: Iterable[str] | None = ...,
-        package_owned_paths: Iterable[str] | None = ...,
-        package_env_roots: Iterable[Iterable[str]] | None = ...,
         extra_paths: Iterable[str] | None = ...,
         python_env: str | None = ...,
         python_version: str | None = ...,
@@ -311,44 +309,6 @@ class ProjectContext:
     def add_plugin(self, plugin: _ProjectPluginLike | Any) -> None:
         """Register a plugin. Order of registration is order of
         invocation during :meth:`materialize`."""
-        ...
-
-    def files_for_package(self, owned_path: str) -> list[str]:
-        """File paths owned by a given package, in ``project_files`` order.
-
-        Looks up the partition computed once after file enumeration:
-        each ``File`` was assigned to the package whose ``path`` is
-        the longest matching prefix. ``owned_path`` must match one of
-        the ``package_owned_paths`` passed at construction (verbatim,
-        no resolution). Returns an empty list for a package that owns
-        no files; raises if :meth:`materialize` hasn't run.
-        """
-        ...
-
-    def unowned_files(self) -> list[str]:
-        """File paths enumerated by ty that fall under no package's
-        owned prefix. Empty for a well-formed monorepo; non-empty
-        when the project root holds stray modules outside the
-        resolver's package list.
-        """
-        ...
-
-    def set_src_roots(self, roots: list[str]) -> None:
-        """Swap the first-party search paths on the live Salsa db.
-
-        Reuses the env options captured at construction for everything
-        except ``environment.root`` -- ``extra_paths`` / ``python`` /
-        ``typeshed`` / ``python_version`` / ``python_platform`` stay
-        fixed across swaps. The parse and per-file ``semantic_index``
-        Salsa queries are keyed on ``File`` (not on env), so they
-        survive the swap; only ``resolve_module`` / ``file_to_module``
-        answers and the project's file enumeration are invalidated.
-
-        Designed for the per-package pipeline: between iterations, set
-        ``roots = [pkg + transitive_deps]`` so ty's module resolver
-        only finds the deps that the current package's lockfile actually
-        permits, while the heavy parse + index work stays hot.
-        """
         ...
 
     def materialize(self) -> NativeGraph:

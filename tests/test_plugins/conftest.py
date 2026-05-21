@@ -8,7 +8,6 @@ import pytest
 
 from dead_cst import Analysis
 from dead_cst.graph import KEEPALIVE_DEFAULT
-from dead_cst.resolvers import ManualResolver
 
 if TYPE_CHECKING:
     from dead_cst import _native as native
@@ -32,10 +31,6 @@ def build_plugin_graph(tmp_path, write_files):
 
     def _build(files: dict[str, str], plugins: list) -> "native.ProjectContext":
         write_files(files)
-        return Analysis(
-            tmp_path,
-            resolver=ManualResolver(specs=["."]),
-            plugins=plugins,
-        ).materialize_all()
+        return Analysis(tmp_path, plugins=plugins).materialize_all()
 
     return _build

@@ -17,10 +17,12 @@ The deeper public surface lives in focused sub-packages:
 * :mod:`dead_cst.codemod` -- the LibCST-based source rewriter.
 * :mod:`dead_cst.plugins` -- the synthetic-node prefix constants and
   every built-in plugin.
-* :mod:`dead_cst.resolvers` -- the :class:`PathResolver` protocol and
-  :class:`ManualResolver`. (:class:`UvResolver` lives under
-  :mod:`dead_cst.contrib`.)
-* :mod:`dead_cst.contrib` -- third-party-aware extensions.
+
+For multi-package monorepos, the caller is responsible for setting
+up a venv with editable ``.pth`` entries pointing at each member's
+published source dir (``uv sync --all-packages`` produces this
+layout). Pass the venv path to :class:`Analysis` and ty's resolver
+discovers every member via the ``.pth`` files.
 
 ``dead-cst`` is alpha; APIs, CLI flags, and output formats may change.
 """

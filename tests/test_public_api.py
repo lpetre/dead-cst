@@ -58,18 +58,11 @@ EXPECTED_PUBLIC_API: dict[str, list[str]] = {
         "PytestPlugin",
         "ServerConfigPlugin",
         "UnittestPlugin",
-        "UvResolver",
         "cyclopts_plugin",
         "fastapi_plugin",
         "fastmcp_plugin",
         "flask_plugin",
         "typer_plugin",
-    ],
-    "dead_cst.resolvers": [
-        "ManualResolver",
-        "Package",
-        "PathResolver",
-        "load_toml",
     ],
 }
 

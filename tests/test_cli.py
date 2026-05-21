@@ -26,7 +26,6 @@ from dead_cst.cli import (
     _rel_path,
     app,
     build_plugins,
-    build_resolver,
     parse_meta,
     setup_logging,
 )
@@ -36,8 +35,6 @@ from dead_cst.plugins import (
     MainBlockPlugin,
     ModuleDundersPlugin,
 )
-from dead_cst.contrib import UvResolver
-from dead_cst.resolvers import ManualResolver
 
 
 def _normalise(s: str) -> str:
@@ -107,42 +104,6 @@ def test_parse_meta_missing_equals_raises():
 def test_parse_meta_empty_key_raises():
     with pytest.raises(typer.BadParameter):
         parse_meta("=v")
-
-
-@pytest.mark.parametrize(
-    "specs, expected_packages",
-    [
-        pytest.param(["src"], {"src": ()}, id="base-only"),
-        pytest.param(
-            ["src:dep1,dep2"],
-            {"src": ("dep1", "dep2"), "dep1": (), "dep2": ()},
-            id="base-with-deps-auto-promoted",
-        ),
-    ],
-)
-def test_manual_resolver_parses_specs(tmp_path, specs, expected_packages):
-    result = ManualResolver(specs=specs).resolve(tmp_path)
-    by_name = {p.name: p for p in result}
-    assert set(by_name) == set(expected_packages)
-    for name, deps in expected_packages.items():
-        assert by_name[name].deps == deps
-        assert by_name[name].path == (tmp_path / name).resolve()
-
-
-def test_build_resolver_no_specs_returns_default_manual():
-    resolver = build_resolver([], None)
-    assert isinstance(resolver, ManualResolver)
-    assert resolver.specs == ["."]
-
-
-def test_build_resolver_named_resolver_only():
-    resolver = build_resolver([], "uv")
-    assert isinstance(resolver, UvResolver)
-
-
-def test_build_resolver_path_and_name_are_mutually_exclusive():
-    with pytest.raises(typer.BadParameter, match="mutually exclusive"):
-        build_resolver(["src"], "uv")
 
 
 def test_build_plugins_default_only_includes_module_dunders():
@@ -334,7 +295,7 @@ def test_analyze_json_output_has_expected_shape(runner, project):
     assert result.exit_code == 1
     payload = json.loads(result.stdout)
     assert set(payload) == {"summary", "dead_symbols"}
-    assert payload["summary"][str(root.resolve())]["function"] == {"total": 2, "dead": 1}
+    assert payload["summary"]["function"] == {"total": 2, "dead": 1}
     assert payload["dead_symbols"] == [{"fqname": "mod.dead", "type": "function", "path": "mod.py"}]
 
 

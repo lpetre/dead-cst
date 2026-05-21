@@ -8,12 +8,11 @@ Three commands cover the surface:
 * ``dead-cst remove ROOT`` — emit a ``git apply``-compatible patch
   that drops dead code.
 
-``analyze`` and ``remove`` each take either build inputs (resolver /
-plugins / entrypoints) or a pre-built ``--graph PATH`` from a prior
-``build`` invocation, and a ``--query`` selector that picks the
-reachability question — ``dead`` (the default) or ``test-only`` (code
-kept alive only by the test suite, via
-:meth:`Analysis.kept_alive_by_flags_only` with ``NodeFlags.TESTCASE``).
+For multi-package monorepos, pass ``--venv PATH`` pointing at a venv
+populated with ``uv sync --all-packages`` (or any equivalent editable
+install layout). ty reads the venv's ``.pth`` files to discover
+where each first-party member's published source lives and uses
+them as additional module-resolution search paths.
 """
 
 from __future__ import annotations
@@ -28,7 +27,7 @@ from typing import TYPE_CHECKING, Annotated, Iterable, Sequence
 
 import typer
 
-from .analyze import Analysis, _count_nodes_by_prefix
+from .analyze import Analysis
 from .codemod import generate_patch
 from .contrib.celery import CeleryPlugin
 from .contrib.click import ClickPlugin
@@ -42,7 +41,6 @@ from .contrib.pytest import PytestPlugin
 from .contrib.server_config import ServerConfigPlugin
 from .contrib.typer import typer_plugin
 from .contrib.unittest import UnittestPlugin
-from .contrib.uv import UvResolver
 from .graph import (
     KEEPALIVE_DEFAULT,
     GraphMetadata,
@@ -61,20 +59,10 @@ from .plugins import (
     Plugin,
     ProjectScriptsPlugin,
 )
-from .resolvers import (
-    ManualResolver,
-    PathResolver,
-)
 
 if TYPE_CHECKING:
     from dead_cst import _native as native
 
-    # A graph view the CLI can query for "what's alive": either the
-    # live rust context (built this run) or the in-memory wrapper
-    # around a loaded graph file. Both expose ``nodes()`` and
-    # ``reachable(seed_flags=...)``. Only used as a type alias, so it
-    # can live entirely inside ``TYPE_CHECKING`` — references to it
-    # in annotations are deferred by ``from __future__ import annotations``.
     GraphView = native.ProjectContext | LoadedGraph
 
 
@@ -104,12 +92,6 @@ _BUILTIN_PLUGINS: dict[str, Plugin] = {
 
 
 def _load_plugin(name: str) -> Plugin:
-    """Resolve a CLI ``--plugin`` value to a plugin instance.
-
-    Builtins (see :data:`_BUILTIN_PLUGINS`) win over entry points; out-of-tree
-    plugins register under the ``dead_cst.plugins`` entry-point group and
-    may expose either a :class:`Plugin` instance or a zero-arg factory.
-    """
     builtin = _BUILTIN_PLUGINS.get(name)
     if builtin is not None:
         return builtin
@@ -130,38 +112,6 @@ def _load_plugin(name: str) -> Plugin:
                 f"(got {type(loaded).__name__})"
             )
     raise KeyError(f"Unknown edge plugin: {name!r}")
-
-
-_BUILTIN_RESOLVERS: dict[str, type[PathResolver]] = {
-    "uv": UvResolver,
-}
-
-
-def _load_resolver(name: str) -> PathResolver:
-    """Resolve a CLI ``--resolver`` value to a :class:`PathResolver` instance.
-
-    Builtins (see :data:`_BUILTIN_RESOLVERS`) win over entry points;
-    out-of-tree resolvers register under the ``dead_cst.resolvers``
-    entry-point group as a zero-arg :class:`PathResolver` subclass.
-    """
-    cls = _BUILTIN_RESOLVERS.get(name)
-    if cls is not None:
-        return cls()
-
-    from importlib.metadata import entry_points
-
-    for ep in entry_points(group="dead_cst.resolvers"):
-        if ep.name == name:
-            loaded = ep.load()
-            if callable(loaded):
-                instance = loaded()
-                if isinstance(instance, PathResolver):
-                    return instance
-            raise TypeError(
-                f"Resolver entry point {name!r} did not resolve to a "
-                f"PathResolver instance (got {type(loaded).__name__})"
-            )
-    raise KeyError(f"Unknown path resolver: {name!r}")
 
 
 class OutputFormat(str, Enum):
@@ -207,13 +157,6 @@ def build_plugins(
     entrypoint_regexes: list[str],
     plugin_names: list[str],
 ) -> list[Plugin]:
-    """Compose the plugin list from CLI flags.
-
-    Plain ``-e`` values are passed through as strings (file paths or
-    FQNs); ``--entrypoint-regex`` values are compiled to
-    :class:`re.Pattern`. The explicit-entrypoint plugin runs last so
-    it can pin nodes contributed by upstream plugins.
-    """
     plugins: list[Plugin] = [_load_plugin(name) for name in plugin_names]
     plugins.append(ModuleDundersPlugin())
     specs: list[str | Path | re.Pattern[str]] = list(entrypoints)
@@ -223,43 +166,28 @@ def build_plugins(
     return plugins
 
 
-def build_resolver(path_specs: list[str], resolver_name: str | None) -> PathResolver:
-    if path_specs and resolver_name is not None:
-        raise typer.BadParameter("`-p`/`--path` and `--resolver` are mutually exclusive.")
-    if resolver_name is not None:
-        return _load_resolver(resolver_name)
-    if path_specs:
-        return ManualResolver(specs=path_specs)
-    return ManualResolver(specs=["."])
-
-
 def _materialize(
     root: Path,
     *,
-    path_specs: list[str],
-    resolver_name: str | None,
+    venv: Path | None,
     plugin_names: list[str],
     entrypoints: list[str],
     entrypoint_regexes: list[str],
     show_progress: bool,
-) -> tuple[native.ProjectContext, Analysis]:
-    """Build the project graph from CLI inputs."""
-    path_resolver = build_resolver(path_specs, resolver_name)
+) -> native.ProjectContext:
     plugins = build_plugins(
         entrypoints=entrypoints,
         entrypoint_regexes=entrypoint_regexes,
         plugin_names=plugin_names,
     )
-    analysis = Analysis(root, resolver=path_resolver, plugins=plugins, show_progress=show_progress)
-    ctx = analysis.materialize_all()
-    return ctx, analysis
+    analysis = Analysis(root, venv=venv, plugins=plugins, show_progress=show_progress)
+    return analysis.materialize_all()
 
 
 def _reject_build_inputs_with_graph(
     *,
     graph_path: Path | None,
-    path_specs: list[str],
-    resolver_name: str | None,
+    venv: Path | None,
     plugin_names: list[str],
     entrypoints: list[str],
     entrypoint_regexes: list[str],
@@ -267,10 +195,8 @@ def _reject_build_inputs_with_graph(
     if graph_path is None:
         return
     offending: list[str] = []
-    if path_specs:
-        offending.append("`-p`/`--path`")
-    if resolver_name is not None:
-        offending.append("`--resolver`")
+    if venv is not None:
+        offending.append("`--venv`")
     if plugin_names:
         offending.append("`--plugin`")
     if entrypoints:
@@ -287,16 +213,14 @@ def _load_or_build(
     root: Path,
     *,
     graph_path: Path | None,
-    path_specs: list[str],
-    resolver_name: str | None,
+    venv: Path | None,
     plugin_names: list[str],
     entrypoints: list[str],
     entrypoint_regexes: list[str],
-) -> tuple[GraphView, list[Path], GraphMetadata | None]:
+) -> tuple[GraphView, GraphMetadata | None]:
     _reject_build_inputs_with_graph(
         graph_path=graph_path,
-        path_specs=path_specs,
-        resolver_name=resolver_name,
+        venv=venv,
         plugin_names=plugin_names,
         entrypoints=entrypoints,
         entrypoint_regexes=entrypoint_regexes,
@@ -304,30 +228,20 @@ def _load_or_build(
     if graph_path is not None:
         typer.echo(f"Loading symbol graph from {graph_path}...", err=True)
         loaded, meta = read_graph(graph_path)
-        # Without resolver context, scope summaries to the project root.
-        return loaded, [root], meta
+        return loaded, meta
     typer.echo(f"Building symbol graph for {root}...", err=True)
-    ctx, analysis = _materialize(
+    ctx = _materialize(
         root,
-        path_specs=path_specs,
-        resolver_name=resolver_name,
+        venv=venv,
         plugin_names=plugin_names,
         entrypoints=entrypoints,
         entrypoint_regexes=entrypoint_regexes,
         show_progress=True,
     )
-    return ctx, [p.path for p in analysis.packages], None
+    return ctx, None
 
 
 def _select_dead(view: GraphView, query: Query) -> list[SymbolNode]:
-    """Return the node set that the requested ``--query`` flags as dead.
-
-    * ``dead`` — the complement of ``reachable(KEEPALIVE_DEFAULT)``.
-    * ``test-only`` — the blast-radius diff between
-      ``reachable(KEEPALIVE_DEFAULT)`` and the same query with the
-      ``TESTCASE`` bit cleared from the seed mask. Test functions
-      themselves are in the result (they carry ``TESTCASE``).
-    """
     if query is Query.dead:
         reachable = set(view.reachable(seed_flags=KEEPALIVE_DEFAULT))
         return [n for n in view.nodes() if n not in reachable]
@@ -336,6 +250,13 @@ def _select_dead(view: GraphView, query: Query) -> list[SymbolNode]:
         without_tests = set(view.reachable(seed_flags=KEEPALIVE_DEFAULT & ~NodeFlags.TESTCASE))
         return list(full - without_tests)
     raise typer.BadParameter(f"unknown --query value: {query!r}")
+
+
+def _count_by_kind(nodes: Iterable[SymbolNode]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for node in nodes:
+        counts[node.kind] = counts.get(node.kind, 0) + 1
+    return counts
 
 
 def version_callback(value: bool) -> None:
@@ -368,6 +289,10 @@ def build(
         Path,
         typer.Option("-o", "--output", help="Write the graph to this file."),
     ],
+    venv: Annotated[
+        Path | None,
+        typer.Option("--venv", help="Venv with editable .pth entries for first-party members."),
+    ] = None,
     entrypoint: Annotated[
         list[str] | None,
         typer.Option("-e", "--entrypoint", help="Entrypoint as a file path or FQN."),
@@ -375,14 +300,6 @@ def build(
     entrypoint_regex: Annotated[
         list[str] | None,
         typer.Option("--entrypoint-regex", help="Entrypoint as a regex over FQNs / file paths."),
-    ] = None,
-    path: Annotated[
-        list[str] | None,
-        typer.Option("-p", "--path", help="Search path spec: 'package:dep1,dep2' or 'package'."),
-    ] = None,
-    resolver: Annotated[
-        str | None,
-        typer.Option("--resolver", help="Path resolver to run (e.g. uv)."),
     ] = None,
     plugin: Annotated[
         list[str] | None,
@@ -399,10 +316,9 @@ def build(
     """Build the project graph and persist it to disk."""
     setup_logging(verbose)
     root = root.resolve()
-    ctx, _ = _materialize(
+    ctx = _materialize(
         root,
-        path_specs=path or [],
-        resolver_name=resolver,
+        venv=venv,
         plugin_names=plugin or [],
         entrypoints=entrypoint or [],
         entrypoint_regexes=entrypoint_regex or [],
@@ -432,6 +348,10 @@ def analyze(
         Query,
         typer.Option("--query", help="Reachability question: 'dead' or 'test-only'."),
     ] = Query.dead,
+    venv: Annotated[
+        Path | None,
+        typer.Option("--venv", help="Venv with editable .pth entries for first-party members."),
+    ] = None,
     entrypoint: Annotated[
         list[str] | None,
         typer.Option("-e", "--entrypoint", help="Entrypoint as a file path or FQN."),
@@ -439,14 +359,6 @@ def analyze(
     entrypoint_regex: Annotated[
         list[str] | None,
         typer.Option("--entrypoint-regex", help="Entrypoint as a regex over FQNs / file paths."),
-    ] = None,
-    path: Annotated[
-        list[str] | None,
-        typer.Option("-p", "--path", help="Search path spec: 'package:dep1,dep2' or 'package'."),
-    ] = None,
-    resolver: Annotated[
-        str | None,
-        typer.Option("--resolver", help="Path resolver to run (e.g. uv)."),
     ] = None,
     plugin: Annotated[
         list[str] | None,
@@ -467,11 +379,10 @@ def analyze(
     setup_logging(verbose)
     root = root.resolve()
 
-    view, package_paths, _ = _load_or_build(
+    view, _ = _load_or_build(
         root,
         graph_path=graph,
-        path_specs=path or [],
-        resolver_name=resolver,
+        venv=venv,
         plugin_names=plugin or [],
         entrypoints=entrypoint or [],
         entrypoint_regexes=entrypoint_regex or [],
@@ -480,9 +391,9 @@ def analyze(
     dead_nodes = _select_dead(view, query)
 
     if output_format == OutputFormat.json:
-        _output_json(all_nodes, dead_nodes, root, package_paths)
+        _output_json(all_nodes, dead_nodes, root)
     else:
-        _output_text(all_nodes, dead_nodes, root, package_paths)
+        _output_text(all_nodes, dead_nodes, root)
 
     if not exit_zero and dead_nodes:
         raise typer.Exit(1)
@@ -492,23 +403,19 @@ def _output_text(
     all_nodes: Sequence[SymbolNode],
     dead_nodes: Sequence[SymbolNode],
     root: Path,
-    package_paths: Sequence[Path],
 ) -> None:
-    total_by_path = _count_nodes_by_prefix(all_nodes, package_paths)
-    unreachable_by_path = _count_nodes_by_prefix(dead_nodes, package_paths)
-    for path in package_paths:
-        typer.echo(f"\n{path}:")
-        total_counts = total_by_path[path]
-        unreachable_counts = unreachable_by_path[path]
-        for kind in sorted(total_counts):
-            if kind == "synthetic":
-                continue
-            total = total_counts[kind]
-            dead = unreachable_counts.get(kind, 0)
-            if dead > 0:
-                typer.echo(f"  {kind}: {total} total, {dead} dead")
-            else:
-                typer.echo(f"  {kind}: {total} total")
+    total_counts = _count_by_kind(all_nodes)
+    dead_counts = _count_by_kind(dead_nodes)
+    typer.echo(f"\n{root}:")
+    for kind in sorted(total_counts):
+        if kind == "synthetic":
+            continue
+        total = total_counts[kind]
+        dead = dead_counts.get(kind, 0)
+        if dead > 0:
+            typer.echo(f"  {kind}: {total} total, {dead} dead")
+        else:
+            typer.echo(f"  {kind}: {total} total")
 
     dead_real = _dead_real(dead_nodes)
     if dead_real:
@@ -525,25 +432,17 @@ def _output_json(
     all_nodes: Sequence[SymbolNode],
     dead_nodes: Sequence[SymbolNode],
     root: Path,
-    package_paths: Sequence[Path],
 ) -> None:
+    total_counts = _count_by_kind(all_nodes)
+    dead_counts = _count_by_kind(dead_nodes)
     result: dict = {
-        "summary": {},
-        "dead_symbols": [],
-    }
-
-    total_by_path = _count_nodes_by_prefix(all_nodes, package_paths)
-    unreachable_by_path = _count_nodes_by_prefix(dead_nodes, package_paths)
-    for path in package_paths:
-        path_str = str(path)
-        total_counts = total_by_path[path]
-        unreachable_counts = unreachable_by_path[path]
-        result["summary"][path_str] = {
-            kind: {"total": total_counts[kind], "dead": unreachable_counts.get(kind, 0)}
+        "summary": {
+            kind: {"total": total_counts[kind], "dead": dead_counts.get(kind, 0)}
             for kind in total_counts
             if kind != "synthetic"
-        }
-
+        },
+        "dead_symbols": [],
+    }
     for node in sorted(_dead_real(dead_nodes), key=lambda n: (str(n.path), n.fqname)):
         result["dead_symbols"].append(
             {
@@ -552,7 +451,6 @@ def _output_json(
                 "path": str(_rel_path(node.path, root)),
             }
         )
-
     typer.echo(json.dumps(result, indent=2))
 
 
@@ -572,6 +470,10 @@ def remove(
         Query,
         typer.Option("--query", help="Reachability question: 'dead' or 'test-only'."),
     ] = Query.dead,
+    venv: Annotated[
+        Path | None,
+        typer.Option("--venv", help="Venv with editable .pth entries for first-party members."),
+    ] = None,
     entrypoint: Annotated[
         list[str] | None,
         typer.Option("-e", "--entrypoint", help="Entrypoint as a file path or FQN."),
@@ -579,14 +481,6 @@ def remove(
     entrypoint_regex: Annotated[
         list[str] | None,
         typer.Option("--entrypoint-regex", help="Entrypoint as a regex over FQNs / file paths."),
-    ] = None,
-    path: Annotated[
-        list[str] | None,
-        typer.Option("-p", "--path", help="Search path spec: 'package:dep1,dep2' or 'package'."),
-    ] = None,
-    resolver: Annotated[
-        str | None,
-        typer.Option("--resolver", help="Path resolver to run (e.g. uv)."),
     ] = None,
     plugin: Annotated[
         list[str] | None,
@@ -597,22 +491,17 @@ def remove(
     ] = False,
     output: Annotated[
         Path | None,
-        typer.Option(
-            "-o",
-            "--output",
-            help="Write patch to this file instead of stdout.",
-        ),
+        typer.Option("-o", "--output", help="Write patch to this file instead of stdout."),
     ] = None,
 ) -> None:
     """Emit a unified diff that removes dead code; pipe to ``git apply``."""
     setup_logging(verbose)
     root = root.resolve()
 
-    view, _, _ = _load_or_build(
+    view, _ = _load_or_build(
         root,
         graph_path=graph,
-        path_specs=path or [],
-        resolver_name=resolver,
+        venv=venv,
         plugin_names=plugin or [],
         entrypoints=entrypoint or [],
         entrypoint_regexes=entrypoint_regex or [],
