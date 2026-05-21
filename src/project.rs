@@ -243,6 +243,38 @@ pub(crate) fn build_project_graph(
 
     let progress = ProgressBars::new(show_progress, project_files.len() as u64);
 
+    // Pre-warm: in parallel, force salsa's ``parsed_module`` and
+    // ``semantic_index`` queries to fill for every project file.
+    // The body is a ``#[salsa::tracked]`` function, so salsa owns
+    // the parallel coordination (lock-free fast paths, not the
+    // parking_lot contention plain-Rust callers hit). After this,
+    // phase 1's serial ``ingest_decls`` loop hits warm caches.
+    let t_warm = std::time::Instant::now();
+    {
+        let parent_db: ProjectDatabase = db.clone();
+        let files_ref: &[File] = &project_files;
+        let num_workers = std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(4);
+        let chunk_size = files_ref.len().div_ceil(num_workers).max(1);
+        py.allow_threads(move || {
+            std::thread::scope(|s| {
+                for chunk in files_ref.chunks(chunk_size) {
+                    let local_db = parent_db.clone();
+                    s.spawn(move || {
+                        use salsa::Database as _;
+                        local_db.attach(|local_db| {
+                            for &file in chunk {
+                                crate::ingest::prewarm_file(local_db, file);
+                            }
+                        });
+                    });
+                }
+            });
+        });
+    }
+    let t_prewarm = t_warm.elapsed();
+
     // Phase 1 overlaps with the env-independent ``dist_lookup`` walk
     // on a worker thread. The scope only borrows ``site_packages``,
     // so the main thread's ``&mut db`` for ingest is fine.
@@ -398,11 +430,12 @@ pub(crate) fn build_project_graph(
     let t_fqname = t4.elapsed();
     if timing {
         eprintln!(
-            "[dead-cst-timing] files={} nodes={} edges={} enum={:?} phase1={:?} dist_lookup={:?} phase2={:?} phase3={:?} fqname={:?} total={:?}",
+            "[dead-cst-timing] files={} nodes={} edges={} enum={:?} prewarm={:?} phase1={:?} dist_lookup={:?} phase2={:?} phase3={:?} fqname={:?} total={:?}",
             project_files.len(),
             builder.nodes.len(),
             builder.edges.len(),
             t_enum,
+            t_prewarm,
             t_phase1,
             t_dist_lookup,
             t_phase2,

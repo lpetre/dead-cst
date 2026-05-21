@@ -52,6 +52,27 @@ use crate::helpers::{
 // Phase 1: decl enumeration via ty's SemanticIndex
 // ---------------------------------------------------------------------------
 
+/// Salsa-tracked per-file "pre-warm" -- forces ``parsed_module`` +
+/// ``semantic_index`` to be cached for ``file`` so subsequent
+/// serial reads in ``ingest_decls`` hit the cache instead of
+/// blocking on a fill. Returns the body length only to keep salsa's
+/// signature non-trivial; the body's side effect (cache fill) is
+/// what matters.
+///
+/// Calling this in parallel via ``rayon::scope`` lets salsa's
+/// tracked-function machinery handle the lock-free coordination
+/// between workers, instead of the parking_lot lock contention
+/// plain-Rust callers hit. Experiment to confirm whether the
+/// tracked-function path actually scales for this codebase before
+/// committing to the larger ``extract_decls``-returning-NodeData
+/// refactor for phase 1.
+#[salsa::tracked]
+pub(crate) fn prewarm_file(db: &dyn ty_project::Db, file: File) -> usize {
+    let parsed = parsed_module(db, file).load(db);
+    let _ = semantic_index(db, file);
+    parsed.syntax().body.len()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn ingest_decls(
     py: Python<'_>,
