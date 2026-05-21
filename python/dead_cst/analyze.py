@@ -158,15 +158,37 @@ class Analysis:
         # project sees identical behavior to before this split.
         src_roots = [str(e) for p in self.packages for e in p.exported_paths]
         # Owned paths (one per ``Package.path``) drive the rust-side
-        # file partition that backs ``ctx.files_for_package(...)``. The
+        # file partition that backs the per-package phase loop. The
         # default ``exported_paths == (path,)`` means most projects
-        # pass identical lists; multi-export and src-layout uv members
-        # are where the two diverge.
+        # pass identical owned/exported lists; multi-export and
+        # src-layout uv members are where the two diverge.
         owned_paths = [str(p.path) for p in self.packages]
+        # Per-package env roots, index-aligned with ``owned_paths``.
+        # Order matters: a package's own ``exported_paths`` come first
+        # (longest-match priority for fqname derivation), then its
+        # ``path`` (catch-all for owned-but-non-exported files like
+        # src-layout ``tests/``), then each dep's ``exported_paths``
+        # (so cross-package imports resolve into deps but not into
+        # non-dep packages). Single-package projects get a one-entry
+        # list = the same flat env as before; the per-package loop
+        # then has a single iteration with one ``set_src_roots`` call.
+        env_roots_per_package: list[list[str]] = []
+        for p in self.packages:
+            roots: list[str] = [str(e) for e in p.exported_paths]
+            if str(p.path) not in roots:
+                roots.append(str(p.path))
+            for dep_path in self._dep_paths_by_package.get(p.path, ()):
+                dep_pkg = self._packages_by_path[dep_path]
+                for e in dep_pkg.exported_paths:
+                    se = str(e)
+                    if se not in roots:
+                        roots.append(se)
+            env_roots_per_package.append(roots)
         ctx = _native.ProjectContext(
             str(self._project_root),
             src_roots=src_roots or None,
             package_owned_paths=owned_paths or None,
+            package_env_roots=env_roots_per_package or None,
             show_progress=self._show_progress,
         )
         for plugin in self._plugins:

@@ -302,6 +302,7 @@ class ProjectContext:
         *,
         src_roots: Iterable[str] | None = ...,
         package_owned_paths: Iterable[str] | None = ...,
+        package_env_roots: Iterable[Iterable[str]] | None = ...,
         extra_paths: Iterable[str] | None = ...,
         python_env: str | None = ...,
         python_version: str | None = ...,
