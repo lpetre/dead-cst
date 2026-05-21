@@ -751,13 +751,27 @@ def test_module_runtime_dunder_access_is_module_dep(build_decl_graph, assert_edg
     assert [r.getMessage() for r in caplog.records] == []
     # No synthetic was minted for the missing-dunder lookup.
     assert not [n.fqname for n in graph.nodes() if n.fqname.endswith(".__file__")]
-    # The module-level dependency edges remain intact for each user of a dunder.
-    edge_strs = {
-        f"{graph.nodes()[u].fqname} -> {graph.nodes()[v].fqname}" for u, v, _ in graph.edges()
-    }
-    assert "pkg.config.FILE_PATH -> pkg" in edge_strs
-    assert "pkg.config.NAME -> pkg" in edge_strs
-    assert "pkg.config.SPEC -> pkg" in edge_strs
+    # The module-level dependency edges remain intact for each user of a dunder
+    # (FILE_PATH / NAME / SPEC all edge to ``pkg`` directly).
+    assert_edges(
+        graph,
+        {
+            "pkg.config -> pkg",
+            "pkg.config.FILE_PATH -> pkg",
+            "pkg.config.FILE_PATH -> pkg.config",
+            "pkg.config.FILE_PATH -> pkg.config.Path",
+            "pkg.config.FILE_PATH -> pkg.config.pkg_alias",
+            "pkg.config.NAME -> pkg",
+            "pkg.config.NAME -> pkg.config",
+            "pkg.config.NAME -> pkg.config.pkg_alias",
+            "pkg.config.Path -> pkg.config",
+            "pkg.config.SPEC -> pkg",
+            "pkg.config.SPEC -> pkg.config",
+            "pkg.config.SPEC -> pkg.config.pkg_alias",
+            "pkg.config.pkg_alias -> pkg",
+            "pkg.config.pkg_alias -> pkg.config",
+        },
+    )
 
 
 def test_dunder_on_imported_symbol_strips_dunder_tail(build_decl_graph, assert_edges):
@@ -774,11 +788,25 @@ def test_dunder_on_imported_symbol_strips_dunder_tail(build_decl_graph, assert_e
             "pkg/uses.py": ("from pkg.lib import Cls\nWHO = Cls.__name__\nDOCSTR = Cls.__doc__\n"),
         }
     )
-    edge_strs = {
-        f"{graph.nodes()[u].fqname} -> {graph.nodes()[v].fqname}" for u, v, _ in graph.edges()
-    }
-    assert "pkg.uses.WHO -> pkg.lib.Cls" in edge_strs
-    assert "pkg.uses.DOCSTR -> pkg.lib.Cls" in edge_strs
+    assert_edges(
+        graph,
+        {
+            "pkg.lib -> pkg",
+            "pkg.lib.Cls -> pkg.lib",
+            "pkg.uses -> pkg",
+            "pkg.uses.Cls -> pkg.lib",
+            "pkg.uses.Cls -> pkg.lib.Cls",
+            "pkg.uses.Cls -> pkg.uses",
+            "pkg.uses.DOCSTR -> pkg.lib",
+            "pkg.uses.DOCSTR -> pkg.lib.Cls",
+            "pkg.uses.DOCSTR -> pkg.uses",
+            "pkg.uses.DOCSTR -> pkg.uses.Cls",
+            "pkg.uses.WHO -> pkg.lib",
+            "pkg.uses.WHO -> pkg.lib.Cls",
+            "pkg.uses.WHO -> pkg.uses",
+            "pkg.uses.WHO -> pkg.uses.Cls",
+        },
+    )
 
 
 def test_cyclic_reexport_terminates_rust(build_decl_graph, assert_edges):
@@ -827,7 +855,9 @@ def test_import_resolves_through_star_reexport_rust(build_decl_graph, assert_edg
     ``from pkg._internal import *`` statement rather than a per-name
     ``pkg.g`` alias; ty resolves ``from pkg import g`` straight to
     ``pkg._internal.g``, so the consumer alias edges directly to the
-    upstream decl (no intermediate ``pkg.g``).
+    upstream decl (no intermediate ``pkg.g``). The absence of any
+    ``consumer.g -> pkg.g`` edge from the full set below is the codified
+    "no per-name alias is minted" invariant.
     """
     graph = build_decl_graph(
         {
@@ -836,14 +866,23 @@ def test_import_resolves_through_star_reexport_rust(build_decl_graph, assert_edg
             "consumer.py": "from pkg import g\ng()\n",
         }
     )
-    edge_strs = {
-        f"{graph.nodes()[u].fqname} -> {graph.nodes()[v].fqname}" for u, v, _ in graph.edges()
-    }
-    assert "consumer.g -> pkg._internal.g" in edge_strs
-    assert "consumer.g -> pkg" in edge_strs
-    # No `pkg.g` alias is minted; the star node carries the reexport.
-    assert "consumer.g -> pkg.g" not in edge_strs
     assert any(n.fqname == "pkg.*pkg._internal" for n in graph.nodes())
+    assert_edges(
+        graph,
+        {
+            "consumer -> consumer.g",
+            "consumer -> pkg",
+            "consumer -> pkg.*pkg._internal",
+            "consumer.g -> consumer",
+            "consumer.g -> pkg",
+            "consumer.g -> pkg._internal.g",
+            "pkg.*pkg._internal -> pkg",
+            "pkg.*pkg._internal -> pkg._internal",
+            "pkg._internal -> pkg",
+            "pkg._internal -> pkg._internal",
+            "pkg._internal.g -> pkg._internal",
+        },
+    )
 
 
 def test_import_resolves_through_chained_star_reexports(build_decl_graph, assert_edges):
@@ -856,10 +895,22 @@ def test_import_resolves_through_chained_star_reexports(build_decl_graph, assert
             "consumer.py": "from A import g\ng()\n",
         }
     )
-    edge_strs = {
-        f"{graph.nodes()[u].fqname} -> {graph.nodes()[v].fqname}" for u, v, _ in graph.edges()
-    }
-    assert "consumer.g -> C.g" in edge_strs
+    assert_edges(
+        graph,
+        {
+            "A.*B -> A",
+            "A.*B -> B",
+            "B.*C -> B",
+            "B.*C -> C",
+            "C.g -> C",
+            "consumer -> A",
+            "consumer -> A.*B",
+            "consumer -> consumer.g",
+            "consumer.g -> A",
+            "consumer.g -> C.g",
+            "consumer.g -> consumer",
+        },
+    )
 
 
 def test_star_reexport_cycle_terminates(build_decl_graph, assert_edges):
@@ -871,14 +922,29 @@ def test_star_reexport_cycle_terminates(build_decl_graph, assert_edges):
             "consumer.py": "from A import b\n",
         }
     )
-    edge_strs = {
-        f"{graph.nodes()[u].fqname} -> {graph.nodes()[v].fqname}" for u, v, _ in graph.edges()
-    }
-    assert "consumer.b -> B.b" in edge_strs
+    assert_edges(
+        graph,
+        {
+            "A.*B -> A",
+            "A.*B -> B",
+            "A.a -> A",
+            "B.*A -> A",
+            "B.*A -> B",
+            "B.b -> B",
+            "consumer.b -> A",
+            "consumer.b -> B.b",
+            "consumer.b -> consumer",
+        },
+    )
 
 
 def test_star_reexport_shadowed_by_real_decl(build_decl_graph, assert_edges):
-    """A real decl in the importing module wins over a star re-export of the same name."""
+    """A real decl in the importing module wins over a star re-export of the same name.
+
+    The absence of ``consumer.g -> other.g`` from the full edge set
+    below codifies that the consumer's ``g`` resolves to ``mod.g``
+    (not through the star re-export to ``other.g``).
+    """
     graph = build_decl_graph(
         {
             "other.py": "def g(): pass\n",
@@ -886,11 +952,21 @@ def test_star_reexport_shadowed_by_real_decl(build_decl_graph, assert_edges):
             "consumer.py": "from mod import g\ng()\n",
         }
     )
-    edge_strs = {
-        f"{graph.nodes()[u].fqname} -> {graph.nodes()[v].fqname}" for u, v, _ in graph.edges()
-    }
-    assert "consumer.g -> mod.g" in edge_strs
-    assert "consumer.g -> other.g" not in edge_strs
+    assert_edges(
+        graph,
+        {
+            "consumer -> consumer.g",
+            "consumer -> mod",
+            "consumer -> mod.g",
+            "consumer.g -> consumer",
+            "consumer.g -> mod",
+            "consumer.g -> mod.g",
+            "mod.*other -> mod",
+            "mod.*other -> other",
+            "mod.g -> mod",
+            "other.g -> other",
+        },
+    )
 
 
 def test_from_import_prefers_namespace_binding_over_submodule(build_decl_graph):
@@ -1008,9 +1084,7 @@ def _find_node(graph, *, fqname, kind, path_substring):
     return matches[0]
 
 
-def test_from_relative_import_in_init_keeps_submodule_alias_alive(
-    build_decl_graph, predecessors_of, successors_of
-):
+def test_from_relative_import_in_init_keeps_submodule_alias_alive(build_decl_graph, assert_edges):
     """``from .sub import X`` inside an ``__init__.py`` mints both a
     normal ``ImportFrom`` alias for ``X`` and an
     ``ImportFromSubmodule`` alias for the side-effect attribute
@@ -1020,6 +1094,13 @@ def test_from_relative_import_in_init_keeps_submodule_alias_alive(
     submodule alias alive whenever any sibling alias is — otherwise
     the analyzer would falsely flag the submodule attribute as dead
     every time it's not also referenced by name in the same file.
+
+    The ``pkg.X -> pkg.sub`` and ``pkg.Y -> pkg.sub`` edges in the full
+    set below are the sibling-rescue edges that drag the submodule
+    attribute alias alive whenever ``X`` or ``Y`` is reached. (Both the
+    submodule attribute alias and the module itself share the fqname
+    ``pkg.sub`` — the duplicate ``pkg.sub -> pkg.sub`` edge is the
+    attribute alias edging to the module it shadows.)
     """
     graph = build_decl_graph(
         {
@@ -1027,14 +1108,21 @@ def test_from_relative_import_in_init_keeps_submodule_alias_alive(
             "pkg/sub.py": "class X: pass\nclass Y: pass\n",
         }
     )
-    sub_alias = _find_node(graph, fqname="pkg.sub", kind="import", path_substring="pkg/__init__.py")
-    x_alias = _find_node(graph, fqname="pkg.X", kind="import", path_substring="pkg/__init__.py")
-    y_alias = _find_node(graph, fqname="pkg.Y", kind="import", path_substring="pkg/__init__.py")
-
-    preds = set(predecessors_of(graph, sub_alias))
-    # Sibling aliases drag the submodule attribute alias alive.
-    assert x_alias in preds
-    assert y_alias in preds
+    assert_edges(
+        graph,
+        {
+            "pkg.X -> pkg",
+            "pkg.X -> pkg.sub",
+            "pkg.X -> pkg.sub.X",
+            "pkg.Y -> pkg",
+            "pkg.Y -> pkg.sub",
+            "pkg.Y -> pkg.sub.Y",
+            "pkg.sub -> pkg",
+            "pkg.sub -> pkg.sub",
+            "pkg.sub.X -> pkg.sub",
+            "pkg.sub.Y -> pkg.sub",
+        },
+    )
 
 
 def test_submodule_alias_dies_when_all_siblings_dead(build_decl_graph):
@@ -1094,7 +1182,12 @@ def test_submodule_alias_not_minted_in_non_init_file(build_decl_graph):
 # ---------------------------------------------------------------------------
 
 
-def test_type_checking_import_used_only_in_string_annotation(build_decl_graph, predecessors_of):
+def test_type_checking_import_used_only_in_string_annotation(build_decl_graph, assert_edges):
+    """``f`` (the only top-level decl using ``Helper`` via a string
+    annotation) appears as ``mod.f -> mod.Helper`` in the full edge set
+    — string annotations are uses even when the import lives under a
+    dead ``if TYPE_CHECKING:`` branch.
+    """
     graph = build_decl_graph(
         {
             "mod.py": (
@@ -1108,8 +1201,19 @@ def test_type_checking_import_used_only_in_string_annotation(build_decl_graph, p
             "helpers.py": "class Helper: pass\n",
         }
     )
-    helper_alias = next(n for n in graph.nodes() if n.fqname == "mod.Helper" and n.kind == "import")
-    # ``f`` (the only top-level decl using Helper via a string annotation)
-    # should be in the import alias's in-edges.
-    preds = {n.fqname for n in predecessors_of(graph, helper_alias)}
-    assert "mod.f" in preds
+    assert_edges(
+        graph,
+        {
+            "helpers.Helper -> helpers",
+            "mod -> mod.TYPE_CHECKING",
+            "mod.Helper -> helpers",
+            "mod.Helper -> helpers.Helper",
+            "mod.Helper -> mod",
+            "mod.TYPE_CHECKING -> mod",
+            "mod.annotations -> mod",
+            "mod.f -> helpers",
+            "mod.f -> helpers.Helper",
+            "mod.f -> mod",
+            "mod.f -> mod.Helper",
+        },
+    )
