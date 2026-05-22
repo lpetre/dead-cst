@@ -30,6 +30,7 @@
 #![allow(clippy::useless_conversion)]
 
 mod builder;
+mod file_payload;
 mod graph;
 mod helpers;
 mod ingest;
