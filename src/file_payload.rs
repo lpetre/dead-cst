@@ -48,23 +48,41 @@ use crate::ingest::{decl_kind_str, from_module_string};
 /// `NodeRef` to its final `u32` graph index after all per-file
 /// payloads are collected.
 ///
-/// `NodeRef::Def` covers every binding ty enumerates as a `Definition`
-/// (functions, classes, variables, type aliases, all import flavours,
-/// star-reexport synthetics). `NodeRef::Module` covers the synthetic
-/// `kind="module"` node per file — `File` is itself a salsa input
-/// ingredient, so its handle is stable and `Hash + Eq + Copy` just
-/// like `Definition`.
-///
-/// `NodeRef::External` (the synthetic `[external dist] X` /
-/// `[stdlib] X` / `[unresolved] X` nodes) will land alongside
-/// `file_to_edges` — minted at cross-file resolution time, not by
-/// `file_to_nodes`. Adding the variant later is a localized change;
-/// keeping it out of this PR keeps the diff focused.
+/// `NodeRef::Def` covers every binding ty enumerates as a `Definition`.
+/// `NodeRef::Module` covers the synthetic `kind="module"` node per
+/// file — `File` is itself a salsa input ingredient, so its handle is
+/// stable and `Hash + Eq + Copy` just like `Definition`.
+/// `NodeRef::External` covers the synthetic `[external] X` /
+/// `[stdlib] X` / `[unresolved] X` nodes via a globally-interned
+/// `ExternalKey` — same fqname produces the same key, dedup is free.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, salsa::Update, get_size2::GetSize)]
 pub(crate) enum NodeRef<'db> {
     Def(Definition<'db>),
     Module(File),
+    External(ExternalKey<'db>),
 }
+
+/// Globally-interned synthetic external node identity. Same `fqname`
+/// → same key → same final graph node, regardless of which file
+/// emitted the edge.
+///
+/// Today's fqname conventions (simplified — full dist classification
+/// is a separate follow-up):
+///
+/// * `[stdlib] X` — module X resolves to ty's standard library
+///   search path.
+/// * `[external] X` — module X resolves to a non-stdlib non-first-
+///   party search path (site-packages). `X` is the *top-level*
+///   module name; canonicalising to a PEP 503 dist name needs a
+///   project-wide dist_lookup which lands later.
+/// * `[unresolved] X` — module X doesn't resolve at all.
+#[salsa::interned(debug)]
+pub(crate) struct ExternalKey<'db> {
+    pub(crate) fqname: String,
+}
+
+// Salsa tracks the interned heap separately; report 0 from GetSize.
+impl get_size2::GetSize for ExternalKey<'_> {}
 
 /// One graph node's data without the `Py<SymbolNode>` envelope.
 ///
@@ -182,17 +200,34 @@ pub(crate) struct FileNodes<'db> {
 /// `d` at module scope). Both indicate a contract violation upstream;
 /// surface the bug loudly.
 #[allow(dead_code)]
-pub(crate) fn ref_to_node<'db>(db: &'db dyn ProjectDb, r: NodeRef<'db>) -> &'db NodeData {
-    let file = match r {
-        NodeRef::Def(d) => d.file(db),
-        NodeRef::Module(f) => f,
-    };
-    let payload = file_to_nodes(db, file);
-    let idx = *payload
-        .ref_to_local
-        .get(&r)
-        .expect("NodeRef does not belong to its claimed file's payload") as usize;
-    &payload.nodes[idx]
+pub(crate) fn ref_to_node<'db>(db: &'db dyn ProjectDb, r: NodeRef<'db>) -> NodeData {
+    match r {
+        NodeRef::Def(d) => {
+            let file = d.file(db);
+            let payload = file_to_nodes(db, file);
+            let idx = *payload
+                .ref_to_local
+                .get(&r)
+                .expect("NodeRef::Def does not belong to its claimed file's payload")
+                as usize;
+            payload.nodes[idx].clone()
+        }
+        NodeRef::Module(f) => {
+            let payload = file_to_nodes(db, f);
+            payload.nodes[0].clone()
+        }
+        NodeRef::External(k) => NodeData {
+            fqname: k.fqname(db).clone(),
+            kind: NodeKind::Synthetic,
+            path: String::new(),
+            start_line: 0,
+            start_column: 0,
+            end_line: 0,
+            end_column: 0,
+            flags: 0,
+            imports: None,
+        },
+    }
 }
 
 /// Build the per-file node payload. Salsa-tracked so it's memoized and
@@ -598,14 +633,55 @@ pub(crate) fn file_to_edges<'db>(db: &'db dyn ProjectDb, file: File) -> FileEdge
             continue;
         }
         let Some(target_module_name) = ModuleName::new(&target_module_str) else {
+            // Bad module name (relative-dots overflow, etc.). Route
+            // to a synthetic `[unresolved] X` external node.
+            let top_level = target_module_str
+                .split('.')
+                .next()
+                .unwrap_or(&target_module_str);
+            let key = ExternalKey::new(db, format!("[unresolved] {top_level}"));
+            edges.insert((alias_ref, NodeRef::External(key), 0));
             continue;
         };
         let Some(target_module) = resolve_module(db, file, &target_module_name) else {
+            let top_level = target_module_str
+                .split('.')
+                .next()
+                .unwrap_or(&target_module_str);
+            let key = ExternalKey::new(db, format!("[unresolved] {top_level}"));
+            edges.insert((alias_ref, NodeRef::External(key), 0));
             continue;
         };
+        // Stdlib targets drop silently — matches existing pipeline.
+        if target_module
+            .search_path(db)
+            .is_some_and(|sp| sp.is_standard_library())
+        {
+            continue;
+        }
         let Some(target_file) = target_module.file(db) else {
+            let top_level = target_module_str
+                .split('.')
+                .next()
+                .unwrap_or(&target_module_str);
+            let key = ExternalKey::new(db, format!("[unresolved] {top_level}"));
+            edges.insert((alias_ref, NodeRef::External(key), 0));
             continue;
         };
+        // Non-first-party (site-packages) → External node keyed on
+        // top-level module name. TODO: dist_lookup canonicalisation.
+        if target_module
+            .search_path(db)
+            .is_some_and(|sp| !sp.is_first_party() && sp.is_site_packages())
+        {
+            let top_level = target_module_str
+                .split('.')
+                .next()
+                .unwrap_or(&target_module_str);
+            let key = ExternalKey::new(db, format!("[external] {top_level}"));
+            edges.insert((alias_ref, NodeRef::External(key), 0));
+            continue;
+        }
         // Self-imports (re-importing from the same file) don't
         // produce meaningful cross-file edges — skip to avoid the
         // trivial alias → self-module cycle.
