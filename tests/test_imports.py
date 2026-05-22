@@ -525,16 +525,46 @@ STAR_REEXPORT_EDGES = frozenset(
             {"p.x -> p.functions"},
             id="dunder-import-keyword-level-resolves-relative-rust",
         ),
-    ],
-)
-def test_imports(build_decl_graph, assert_edges, src, expected_extra_edges):
-    graph = build_decl_graph({**IMPORT_TEST_FILES, "p/x.py": src})
-    assert_edges(graph, IMPORT_BASE_EDGES | expected_extra_edges)
-
-
-@pytest.mark.parametrize(
-    "src, expected_extra_edges",
-    [
+        # ------------------------------------------------------------------
+        # ``__import__`` fromlist: rust emits one edge per explicit symbol
+        # the call mentions (base module plus each literal fromlist entry
+        # that resolves as a submodule or global-scope decl), all tagged
+        # ``EdgeFlags.DYNAMIC_IMPORT``. Attribute-style entries that don't
+        # resolve drop silently — no warning.
+        # ------------------------------------------------------------------
+        pytest.param(
+            "__import__('p', None, None, ['functions'])",
+            {
+                "p.x -> p",
+                "p.x -> p.functions",
+            },
+            id="dunder-import-fromlist-positional-resolves-submodule",
+        ),
+        pytest.param(
+            "__import__('p', fromlist=['functions'])",
+            {
+                "p.x -> p",
+                "p.x -> p.functions",
+            },
+            id="dunder-import-fromlist-keyword-resolves-submodule",
+        ),
+        pytest.param(
+            # Mixed: ``f`` resolves as a global-scope decl in p.functions
+            # (one edge, no fan-out to ``g``); the empty string entry
+            # drops silently with no warning.
+            "__import__('p.functions', fromlist=['f', ''])",
+            {
+                "p.x -> p.functions",
+                "p.x -> p.functions.f",
+            },
+            id="dunder-import-fromlist-attribute-entries-silent",
+        ),
+        # ------------------------------------------------------------------
+        # ``__all__`` is followed when assigned a list/tuple of string
+        # literals; each named entry becomes an outgoing edge from the
+        # ``__all__`` synthetic node to the local decl (or import alias).
+        # Unknown names are ignored silently.
+        # ------------------------------------------------------------------
         pytest.param(
             'from p.functions import f\n__all__ = ["f"]',
             {
@@ -597,49 +627,9 @@ def test_imports(build_decl_graph, assert_edges, src, expected_extra_edges):
         ),
     ],
 )
-def test_dunder_all_edges(build_decl_graph, assert_edges, src, expected_extra_edges):
+def test_imports(build_decl_graph, assert_edges, src, expected_extra_edges):
     graph = build_decl_graph({**IMPORT_TEST_FILES, "p/x.py": src})
     assert_edges(graph, IMPORT_BASE_EDGES | expected_extra_edges)
-
-
-@pytest.mark.parametrize(
-    "src",
-    [
-        pytest.param("__import__('p', None, None, ['functions'])", id="fromlist-positional"),
-        pytest.param("__import__('p', fromlist=['functions'])", id="fromlist-keyword"),
-    ],
-)
-def test_dunder_import_fromlist_resolves_submodules_rust(build_decl_graph, assert_edges, src):
-    """Rust emits one edge per explicit symbol the call mentions: the
-    base module plus each literal fromlist entry that resolves as a
-    submodule, all tagged ``EdgeFlags.DYNAMIC_IMPORT``."""
-    graph = build_decl_graph({**IMPORT_TEST_FILES, "p/x.py": src})
-    assert_edges(
-        graph,
-        IMPORT_BASE_EDGES
-        | {
-            "p.x -> p",
-            "p.x -> p.functions",
-        },
-    )
-
-
-def test_dunder_import_fromlist_attribute_entries_silent_rust(build_decl_graph, assert_edges):
-    """The rust backend looks each entry up as a global-scope decl in
-    the base module and emits an edge if found (no fan-out to g),
-    otherwise drops silently — and never warns on attribute-style
-    entries."""
-    graph = build_decl_graph(
-        {**IMPORT_TEST_FILES, "p/x.py": "__import__('p.functions', fromlist=['f', ''])"}
-    )
-    assert_edges(
-        graph,
-        IMPORT_BASE_EDGES
-        | {
-            "p.x -> p.functions",
-            "p.x -> p.functions.f",
-        },
-    )
 
 
 @pytest.mark.parametrize(
