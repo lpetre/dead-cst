@@ -632,6 +632,21 @@ pub(crate) fn file_to_edges<'db>(db: &'db dyn ProjectDb, file: File) -> FileEdge
         if target_module_str.is_empty() {
             continue;
         }
+
+        // Submodule disambiguation: `from p import functions` where
+        // `p.functions` is itself a submodule should point at the
+        // submodule file, not at `p` with a decl lookup. Mirror
+        // emit_upstream's `module_name_resolves` check.
+        let (target_module_str, decl_name) = if let Some(decl) = &decl_name {
+            let candidate = format!("{target_module_str}.{decl}");
+            if crate::ingest::module_name_resolves(&candidate, file, db) {
+                (candidate, None)
+            } else {
+                (target_module_str, Some(decl.clone()))
+            }
+        } else {
+            (target_module_str, decl_name)
+        };
         let Some(target_module_name) = ModuleName::new(&target_module_str) else {
             // Bad module name (relative-dots overflow, etc.). Route
             // to a synthetic `[unresolved] X` external node.
