@@ -36,7 +36,7 @@
 use ruff_db::files::File;
 use ruff_db::parsed::{parsed_module, ParsedModuleRef};
 use ruff_python_ast::visitor::{walk_expr, walk_stmt, Visitor};
-use ruff_python_ast::{Expr, ExprName, Stmt};
+use ruff_python_ast::{Expr, ExprName, ExprStringLiteral, Stmt};
 use ruff_text_size::{Ranged, TextRange};
 use rustc_hash::FxHashSet;
 use ty_module_resolver::{resolve_module, ModuleName};
@@ -118,6 +118,8 @@ pub(crate) fn file_to_ref_edges<'db>(db: &'db dyn ProjectDb, file: File) -> File
             warnings: &mut warnings,
             nested_context: false,
             current_flags: 0,
+            in_annotation: 0,
+            in_string_annotation: false,
         };
         walk_owned(kind, &parsed, &mut walker);
     }
@@ -144,6 +146,8 @@ pub(crate) fn file_to_ref_edges<'db>(db: &'db dyn ProjectDb, file: File) -> File
             warnings: &mut warnings,
             nested_context: false,
             current_flags: 0,
+            in_annotation: 0,
+            in_string_annotation: false,
         };
         walker.visit_stmt(stmt);
     }
@@ -175,6 +179,18 @@ struct RefWalker<'a, 'db> {
     /// driver flushes them to Python logging from the main thread.
     warnings: &'a mut Vec<String>,
     nested_context: bool,
+    /// Recursive depth of "inside a type annotation". Bumped by
+    /// `visit_annotation` around each annotation walk; gates the
+    /// string-annotation parsing in `visit_expr` so we don't pay
+    /// `enter_string_annotation`'s scope-type-inference cost on
+    /// every dict-key / log-message / docstring literal.
+    in_annotation: u32,
+    /// True only inside the sub-walker spawned by
+    /// `walk_string_annotation` for the parsed sub-AST. Names there
+    /// aren't in the file's uses_map, so `find_local_bindings` must
+    /// skip the position-sensitive `scoped_use_id` lookup that would
+    /// otherwise panic.
+    in_string_annotation: bool,
     /// Flags stamped on each edge emitted by the current reference
     /// (set by `emit_name_use` / nested-import handlers from
     /// `flags_for_range` on the reference's source position;
@@ -240,7 +256,14 @@ impl<'a, 'db> RefWalker<'a, 'db> {
                 continue;
             };
             let use_def_map = self.index.use_def_map(scope_id);
-            let bindings = if first {
+            // Position-sensitive query for the use's own scope; fall
+            // back to end-of-scope for enclosing scopes (where the use
+            // isn't recorded under any specific position). Names from
+            // a string-annotation sub-AST aren't in the file's
+            // uses_map, so `scoped_use_id` would panic; the
+            // `in_string_annotation` flag routes them through the
+            // end-of-scope fallback.
+            let bindings = if first && !self.in_string_annotation {
                 let use_id = name.scoped_use_id(db, scope_id.to_scope_id(db, self.file));
                 use_def_map.bindings_at_use(use_id)
             } else {
@@ -399,6 +422,50 @@ impl<'a, 'db> RefWalker<'a, 'db> {
                 self.emit_edge(target_nodes.refs[local_idx as usize]);
             }
         }
+    }
+
+    /// Walk an annotation expression, marking the recursion so any
+    /// string literal inside gets parsed as a deferred annotation
+    /// via [`walk_string_annotation`].
+    fn visit_annotation(&mut self, expr: &Expr) {
+        self.in_annotation += 1;
+        self.visit_expr(expr);
+        self.in_annotation -= 1;
+    }
+
+    /// Parse a string-typed annotation via ty's
+    /// `enter_string_annotation` and walk the parsed sub-AST for
+    /// name uses. The sub-walker shares `&mut edges` / `&mut warnings`
+    /// indirectly via local Vecs that get merged back; this keeps the
+    /// borrow checker happy and matches today's pipeline's
+    /// AND-of-flags merge with set-semantics dedup at the outer level.
+    fn walk_string_annotation(&mut self, string_expr: &ExprStringLiteral) {
+        let Some((parsed_expr, sub_model)) = self.model.enter_string_annotation(string_expr) else {
+            return;
+        };
+        let mut sub_edges: FxHashSet<(NodeRef<'db>, NodeRef<'db>, u32)> = FxHashSet::default();
+        let mut sub_warnings: Vec<String> = Vec::new();
+        {
+            let mut sub = RefWalker {
+                owner: self.owner,
+                file: self.file,
+                db: self.db,
+                parsed: self.parsed,
+                index: self.index,
+                self_nodes: self.self_nodes,
+                model: &sub_model,
+                dead_ranges: self.dead_ranges,
+                edges: &mut sub_edges,
+                warnings: &mut sub_warnings,
+                nested_context: self.nested_context,
+                current_flags: 0,
+                in_annotation: self.in_annotation,
+                in_string_annotation: true,
+            };
+            sub.visit_expr(parsed_expr.expr());
+        }
+        self.edges.extend(sub_edges);
+        self.warnings.append(&mut sub_warnings);
     }
 
     /// Recognize and emit edges for a dynamic-import call. Returns
@@ -695,6 +762,17 @@ impl<'a, 'db> RefWalker<'a, 'db> {
 
 impl<'ast, 'db> Visitor<'ast> for RefWalker<'_, 'db> {
     fn visit_expr(&mut self, expr: &'ast Expr) {
+        // Inside an annotation context, route string literals through
+        // ty's `enter_string_annotation` so `List["Foo"]`-style refs
+        // resolve. Gating on `in_annotation` avoids paying the
+        // scope-type-inference cost for every dict-key / log-message /
+        // docstring literal.
+        if self.in_annotation > 0 {
+            if let Expr::StringLiteral(s) = expr {
+                self.walk_string_annotation(s);
+                return;
+            }
+        }
         if let Expr::Name(n) = expr {
             self.emit_name_use(n, &[]);
             return;
@@ -730,8 +808,6 @@ impl<'ast, 'db> Visitor<'ast> for RefWalker<'_, 'db> {
                 return;
             }
         }
-        // TODO(file_to_ref_edges follow-up): handle string annotations
-        // (visit_annotation + walk_string_annotation).
         if let Expr::Named(named) = expr {
             // Walrus visibility: at module scope, the walrus has its own
             // Definition with its own owned-expression walk (covered by
@@ -793,7 +869,7 @@ fn walk_owned<'a, 'db>(
             }
             walk_parameters(&node.parameters, v);
             if let Some(returns) = &node.returns {
-                v.visit_expr(returns);
+                v.visit_annotation(returns);
             }
             v.nested_context = true;
             for s in &node.body {
@@ -832,7 +908,7 @@ fn walk_owned<'a, 'db>(
             }
         }
         DefinitionKind::AnnotatedAssignment(a) => {
-            v.visit_expr(a.annotation(parsed));
+            v.visit_annotation(a.annotation(parsed));
             if let Some(val) = a.value(parsed) {
                 if target_is_dunder_all(a.target(parsed)) {
                     v.emit_dunder_all_edges(val);
@@ -847,7 +923,7 @@ fn walk_owned<'a, 'db>(
             if let Some(type_params) = &node.type_params {
                 walk_type_params(type_params, v);
             }
-            v.visit_expr(node.value.as_ref());
+            v.visit_annotation(node.value.as_ref());
         }
         // Imports, parameters, loop / with / except / match bindings:
         // either no walk-worthy expression or handled at module-level.
@@ -858,7 +934,7 @@ fn walk_owned<'a, 'db>(
 fn walk_parameters<'a, 'db>(params: &'a ruff_python_ast::Parameters, v: &mut RefWalker<'a, 'db>) {
     let walk_one = |p: &'a ruff_python_ast::Parameter, v: &mut RefWalker<'a, 'db>| {
         if let Some(ann) = &p.annotation {
-            v.visit_expr(ann);
+            v.visit_annotation(ann);
         }
     };
     let walk_with_default = |p: &'a ruff_python_ast::ParameterWithDefault,
