@@ -650,17 +650,18 @@ pub(crate) fn file_to_edges<'db>(db: &'db dyn ProjectDb, file: File) -> FileEdge
                 (module, Some(alias.name.id.as_str().to_string()))
             }
             DefinitionKind::ImportFromSubmodule(k) => {
-                // `from <parent_pkg> import <submod>` — the binding
-                // attribute is `<submod>` on the parent package. The
-                // upstream FILE is `<parent_pkg>.<submod>`'s file.
-                let parent = from_module_string(db, file, k.import(&parsed));
-                let segment = k.module(&parsed).id.as_str().to_string();
-                let full = if parent.is_empty() {
-                    segment
-                } else {
-                    format!("{parent}.{segment}")
-                };
-                (full, None)
+                // ImportFromSubmodule binds a submodule attribute on
+                // the containing package as a side effect of a
+                // `from X import …` statement inside __init__.py.
+                // The bound NAME (k.module) is the attribute, but the
+                // TARGET module is the from-clause itself — for
+                // `from pkg._internal import *` in pkg/__init__.py
+                // the side-effect attribute `_internal` on pkg
+                // points at the file `pkg._internal`, not at
+                // `pkg._internal._internal`. The from-clause module
+                // is what resolves.
+                let target = from_module_string(db, file, k.import(&parsed));
+                (target, None)
             }
             DefinitionKind::StarImport(k) => {
                 // `from X import *` — emit only the module-level
