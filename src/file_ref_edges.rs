@@ -233,18 +233,16 @@ impl<'a, 'db> RefWalker<'a, 'db> {
         }
     }
 
-    /// Emit an edge from `self.owner` to a synthetic External node
-    /// keyed on the module fqname. Top-level segment only — multiple
-    /// imports from the same dist collapse to one node via salsa
-    /// interning. Simplified vs the existing pipeline: no dist_lookup
-    /// canonicalisation, so `[external] X` is the bucket for
-    /// everything site-packages-resolved.
-    fn emit_external(&mut self, dotted: &str, unresolved: bool) {
+    /// Emit an edge from `self.owner` to a synthetic External node.
+    /// `target_file` Some when the import resolved to a file
+    /// (drives `[external dist] X` PEP 503 canonicalisation via
+    /// project_dist_lookup); None for genuinely-unresolved imports
+    /// (`[unresolved] X`).
+    fn emit_external(&mut self, dotted: &str, target_file: Option<File>) {
         let top_level = dotted.split('.').next().unwrap_or(dotted);
-        let fqname = if unresolved {
-            format!("[unresolved] {top_level}")
-        } else {
-            format!("[external] {top_level}")
+        let fqname = match target_file {
+            Some(f) => crate::file_payload::external_fqname_for(self.db, f, top_level),
+            None => format!("[unresolved] {top_level}"),
         };
         let key = ExternalKey::new(self.db, fqname);
         self.emit_edge(NodeRef::External(key));
@@ -583,7 +581,7 @@ impl<'a, 'db> RefWalker<'a, 'db> {
             return;
         };
         let Some(module) = resolve_module(self.db, self.file, &mn) else {
-            self.emit_external(dotted, /*unresolved=*/ true);
+            self.emit_external(dotted, None);
             return;
         };
         if module
@@ -593,14 +591,14 @@ impl<'a, 'db> RefWalker<'a, 'db> {
             return;
         }
         let Some(target_file) = module.file(self.db) else {
-            self.emit_external(dotted, /*unresolved=*/ true);
+            self.emit_external(dotted, None);
             return;
         };
         if module
             .search_path(self.db)
             .is_some_and(|sp| !sp.is_first_party() && sp.is_site_packages())
         {
-            self.emit_external(dotted, /*unresolved=*/ false);
+            self.emit_external(dotted, Some(target_file));
             return;
         }
         self.emit_edge(NodeRef::Module(target_file));
@@ -724,11 +722,11 @@ impl<'a, 'db> RefWalker<'a, 'db> {
         // and stop (no submodule chain walk through them, since they
         // don't have file_to_nodes payloads to look up against).
         let Some(start_mn) = ModuleName::new(&loading_target) else {
-            self.emit_external(&loading_target, /*unresolved=*/ true);
+            self.emit_external(&loading_target, None);
             return;
         };
         let Some(start_module) = resolve_module(db, self.file, &start_mn) else {
-            self.emit_external(&loading_target, /*unresolved=*/ true);
+            self.emit_external(&loading_target, None);
             return;
         };
         if start_module
@@ -739,17 +737,18 @@ impl<'a, 'db> RefWalker<'a, 'db> {
             return;
         }
         let Some(start_file) = start_module.file(db) else {
-            self.emit_external(&loading_target, /*unresolved=*/ true);
+            self.emit_external(&loading_target, None);
             return;
         };
-        // Non-first-party (site-packages / external paths). Mint an
-        // External node keyed on the top-level module name. TODO:
-        // proper dist_lookup canonicalisation for `[external dist] X`.
+        // Non-first-party (site-packages / external paths). Mint a
+        // synthetic External node keyed by PEP 503 canonical dist
+        // name via project_dist_lookup; falls back to
+        // `[external file] X` for orphan site-packages files.
         if start_module
             .search_path(db)
             .is_some_and(|sp| !sp.is_first_party() && sp.is_site_packages())
         {
-            self.emit_external(&loading_target, /*unresolved=*/ false);
+            self.emit_external(&loading_target, Some(start_file));
             return;
         }
 

@@ -84,6 +84,46 @@ pub(crate) struct ExternalKey<'db> {
 // Salsa tracks the interned heap separately; report 0 from GetSize.
 impl get_size2::GetSize for ExternalKey<'_> {}
 
+/// Project-wide PEP 503 distribution lookup, salsa-tracked so it's
+/// memoized + accessible from per-file salsa-tracked queries. Wraps
+/// `crate::ingest::DistLookup` (HashMap<PathBuf, String>) with the
+/// derives needed for salsa-tracked return.
+#[derive(Debug, Eq, PartialEq, salsa::Update, get_size2::GetSize)]
+pub(crate) struct ProjectDistLookup {
+    pub(crate) map: std::collections::HashMap<std::path::PathBuf, String>,
+}
+
+#[salsa::tracked(returns(ref), heap_size = ruff_memory_usage::heap_size)]
+pub(crate) fn project_dist_lookup<'db>(db: &'db dyn ProjectDb) -> ProjectDistLookup {
+    let site_packages = crate::ingest::site_packages_roots(db);
+    ProjectDistLookup {
+        map: crate::ingest::build_dist_lookup(&site_packages),
+    }
+}
+
+/// Compute the canonical synthetic-node fqname for a non-first-party
+/// target: `[external dist] {dist_name}` if dist_lookup knows the
+/// file (PEP 503 canonical name), else `[external file] {top_level}`
+/// for orphan site-packages files or editable installs.
+pub(crate) fn external_fqname_for(
+    db: &dyn ProjectDb,
+    target_file: ruff_db::files::File,
+    fallback_top_level: &str,
+) -> String {
+    use ruff_db::files::FilePath;
+    let path_str = match target_file.path(db) {
+        FilePath::System(p) => p.to_string(),
+        _ => return format!("[external file] {fallback_top_level}"),
+    };
+    let canonical =
+        std::fs::canonicalize(&path_str).unwrap_or_else(|_| std::path::PathBuf::from(&path_str));
+    let lookup = project_dist_lookup(db);
+    match lookup.map.get(&canonical) {
+        Some(dist_name) => format!("[external dist] {dist_name}"),
+        None => format!("[external file] {fallback_top_level}"),
+    }
+}
+
 /// One graph node's data without the `Py<SymbolNode>` envelope.
 ///
 /// Pure rust so it can live inside a salsa-tracked function's return
@@ -760,7 +800,8 @@ pub(crate) fn file_to_edges<'db>(db: &'db dyn ProjectDb, file: File) -> FileEdge
                 .split('.')
                 .next()
                 .unwrap_or(&target_module_str);
-            let key = ExternalKey::new(db, format!("[external] {top_level}"));
+            let fqname = external_fqname_for(db, target_file, top_level);
+            let key = ExternalKey::new(db, fqname);
             edges.insert((alias_ref, NodeRef::External(key), 0));
             continue;
         }
