@@ -278,9 +278,16 @@ pub(crate) fn build_project_graph(
     // pattern as prewarm above. The salsa cache is populated for the
     // serial assembly pass below; nothing here directly mutates the
     // graph builder.
+    //
+    // project_dist_lookup is also populated here on its own thread.
+    // The old pipeline overlapped build_dist_lookup with phase 1; we
+    // do the same so the first per-file worker that needs it (for
+    // PEP 503 canonical [external dist] X classification) hits a
+    // warm salsa cache instead of paying the ~100ms walk inline.
     let t_populate = std::time::Instant::now();
     {
         let parent_db: ProjectDatabase = db.clone();
+        let dist_db: ProjectDatabase = db.clone();
         let files_ref: &[File] = &project_files;
         let num_workers = std::thread::available_parallelism()
             .map(std::num::NonZeroUsize::get)
@@ -288,6 +295,14 @@ pub(crate) fn build_project_graph(
         let chunk_size = files_ref.len().div_ceil(num_workers).max(1);
         py.allow_threads(move || {
             std::thread::scope(|s| {
+                // dist_lookup on its own thread — overlapped with
+                // the file_to_* work below.
+                s.spawn(move || {
+                    use salsa::Database as _;
+                    dist_db.attach(|local_db| {
+                        let _ = crate::file_payload::project_dist_lookup(local_db);
+                    });
+                });
                 for chunk in files_ref.chunks(chunk_size) {
                     let local_db = parent_db.clone();
                     s.spawn(move || {
