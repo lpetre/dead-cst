@@ -42,7 +42,7 @@ use rustc_hash::FxHashSet;
 use ty_module_resolver::{resolve_module, ModuleName};
 use ty_project::Db as ProjectDb;
 use ty_python_core::ast_ids::HasScopedUseId;
-use ty_python_core::definition::{DefinitionKind, DefinitionState};
+use ty_python_core::definition::{DefinitionKind, DefinitionState, TargetKind};
 use ty_python_core::place::PlaceExprRef;
 use ty_python_core::scope::FileScopeId;
 use ty_python_core::{semantic_index, SemanticIndex};
@@ -71,7 +71,7 @@ enum Resolution<'db> {
 use crate::helpers::{detect_dead_ranges, EDGE_FLAG_DEAD_BRANCH, EDGE_FLAG_DYNAMIC_IMPORT};
 use crate::ingest::{
     collapse_attribute_chain, detect_dynamic_call, file_package_name, from_module_string,
-    module_name_resolves, parse_dynamic_args, resolve_dynamic_target,
+    module_name_resolves, paired_unpack_rhs, parse_dynamic_args, resolve_dynamic_target,
     stmt_creates_top_level_definition, target_is_dunder_all, DynamicParseResult,
 };
 
@@ -947,6 +947,19 @@ fn walk_owned<'a, 'db>(
             let value = a.value(parsed);
             if target_is_dunder_all(a.target(parsed)) {
                 v.emit_dunder_all_edges(value);
+            } else if let TargetKind::Sequence(_, unpack) = a.target_kind() {
+                // `c, d = a, b` produces one Definition per LHS
+                // name, each with `value` set to the whole RHS
+                // `(a, b)`. Walk only the matching RHS element when
+                // both sides are flat sequences of the same arity;
+                // otherwise fall back to walking the full RHS.
+                let db = v.model.db();
+                let lhs = unpack.target(db, parsed);
+                if let Some(paired) = paired_unpack_rhs(lhs, a.target(parsed), value) {
+                    v.visit_expr(paired);
+                } else {
+                    v.visit_expr(value);
+                }
             } else {
                 v.visit_expr(value);
             }
