@@ -757,6 +757,11 @@ impl<'a, 'db> RefWalker<'a, 'db> {
         // decl inside it. Attribute access past a decl is field access
         // on the decl's value, which we don't model.
         if let Some(decl_name) = decl_tail {
+            // Use sites land on whatever's in exports_by_name
+            // (including star-reexport aliases). Don't walk through
+            // star aliases here — the from-import binding side uses
+            // walk_exports_chain to skip past stars; this is the
+            // *use* side, which should reach the star alias itself.
             self.emit_edge(NodeRef::Module(start_file));
             let target_nodes = file_to_nodes(self.db, start_file);
             if let Some(locals) = target_nodes.exports_by_name.get(&decl_name) {

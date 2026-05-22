@@ -430,6 +430,53 @@ pub(crate) fn file_to_nodes<'db>(db: &'db dyn ProjectDb, file: File) -> FileNode
 /// Pure-rust variant of `ingest::import_payload_for`. Returns the same
 /// three fields but as the per-file payload's `ImportPayload`, no
 /// `ImportSpec` allocation.
+/// Walk `(file, name)` through star-reexport chains. Returns every
+/// non-star-reexport NodeRef reachable from `(target_file,
+/// symbol_name)` — a decl, a non-star import alias, or several of
+/// either when the name has multiple live bindings. Mirrors today's
+/// `ingest::walk_globals_chain`.
+///
+/// `from A import g` where A has `from B import *` lands on A's
+/// star alias for `g`; we resolve B → file, look up `g` there, and
+/// recurse. Stops on a decl, on a non-star import, on a missed
+/// lookup (yields nothing past it), or on a cycle.
+pub(crate) fn walk_exports_chain<'db>(
+    db: &'db dyn ProjectDb,
+    target_file: File,
+    symbol_name: &str,
+) -> Vec<NodeRef<'db>> {
+    let mut seen: std::collections::HashSet<(File, String)> = std::collections::HashSet::new();
+    let mut out: Vec<NodeRef<'db>> = Vec::new();
+    let mut stack: Vec<(File, String)> = vec![(target_file, symbol_name.to_string())];
+    while let Some(key) = stack.pop() {
+        if !seen.insert(key.clone()) {
+            continue;
+        }
+        let target_nodes = file_to_nodes(db, key.0);
+        // If `key` is a `from <upstream> import *` reexport, step
+        // into the upstream file's same-name lookup. The star alias
+        // itself isn't useful as a target — uses should land on the
+        // upstream decl. Skip emitting it here.
+        if let Some(upstream_module) = target_nodes.star_reexports.get(&key.1) {
+            if let Some(mn) = ty_module_resolver::ModuleName::new(upstream_module) {
+                if let Some(upstream) = ty_module_resolver::resolve_module(db, key.0, &mn) {
+                    if let Some(upstream_file) = upstream.file(db) {
+                        stack.push((upstream_file, key.1.clone()));
+                        continue;
+                    }
+                }
+            }
+        }
+        let Some(locals) = target_nodes.exports_by_name.get(&key.1) else {
+            continue;
+        };
+        for &local_idx in locals {
+            out.push(target_nodes.refs[local_idx as usize]);
+        }
+    }
+    out
+}
+
 pub(crate) fn import_payload_for_pure<'db>(
     kind: &DefinitionKind<'db>,
     db: &'db dyn ty_python_semantic::Db,
@@ -616,15 +663,18 @@ pub(crate) fn file_to_edges<'db>(db: &'db dyn ProjectDb, file: File) -> FileEdge
                 (full, None)
             }
             DefinitionKind::StarImport(k) => {
-                // ty mints one StarImport Definition per name the
-                // star brought in. The per-name lives in the symbol;
-                // the upstream module lives on the statement.
+                // `from X import *` — emit only the module-level
+                // edge (`alias → Module(X)`); no per-name decl
+                // fan-out. We collapse the per-name aliases to one
+                // node per statement (see file_to_nodes), and the
+                // existing pipeline matches this by returning
+                // Vec::new() in resolve_from_imported's StarImport
+                // branch. Uses of star-bound names still get
+                // resolved via walk_exports_chain on the consumer's
+                // from-import lookup; the chain walk takes care of
+                // them.
                 let module = from_module_string(db, file, k.import(&parsed));
-                let place_id = def.place(db);
-                let PlaceExprRef::Symbol(symbol) = place_table.place(place_id) else {
-                    continue;
-                };
-                (module, Some(symbol.name().as_str().to_string()))
+                (module, None)
             }
             _ => continue,
         };
@@ -707,17 +757,14 @@ pub(crate) fn file_to_edges<'db>(db: &'db dyn ProjectDb, file: File) -> FileEdge
         // Module-level edge.
         edges.insert((alias_ref, NodeRef::Module(target_file), 0));
 
-        // Named-decl edge for from-imports. Goes through
-        // `file_to_nodes(target_file).exports_by_name` — salsa
-        // memoizes the target's payload, so this is the cross-file
-        // call that's "free" if the target's worker already ran.
+        // Named-decl edge for from-imports. Walks the star-reexport
+        // chain so `from A import g` where A re-exports from B lands
+        // on B's real `g` rather than A's star alias node. salsa
+        // memoizes each file's payload on the way through, so the
+        // chain walk is hashmap lookups + a `seen` set.
         if let Some(decl_name) = decl_name {
-            let target_nodes = file_to_nodes(db, target_file);
-            if let Some(target_locals) = target_nodes.exports_by_name.get(&decl_name) {
-                for &local_idx in target_locals {
-                    let target_ref = target_nodes.refs[local_idx as usize];
-                    edges.insert((alias_ref, target_ref, 0));
-                }
+            for target_ref in walk_exports_chain(db, target_file, &decl_name) {
+                edges.insert((alias_ref, target_ref, 0));
             }
         }
     }
