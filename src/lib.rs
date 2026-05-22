@@ -31,6 +31,7 @@
 
 mod builder;
 mod file_payload;
+mod file_ref_edges;
 mod graph;
 mod helpers;
 mod ingest;

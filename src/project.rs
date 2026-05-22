@@ -290,6 +290,7 @@ pub(crate) fn build_project_graph(
         let total_imports = std::sync::atomic::AtomicUsize::new(0);
         let total_exports = std::sync::atomic::AtomicUsize::new(0);
         let total_edges = std::sync::atomic::AtomicUsize::new(0);
+        let total_ref_edges = std::sync::atomic::AtomicUsize::new(0);
 
         // Phase A: file_to_nodes only.
         let t_ftn = std::time::Instant::now();
@@ -367,10 +368,42 @@ pub(crate) fn build_project_graph(
         }
         let t_fte_elapsed = t_fte.elapsed();
 
+        // Phase C: file_to_ref_edges (Phase 3 port, first cut — covers
+        // only `use → local-alias` codemod-invariant edges; deferred
+        // categories documented in file_ref_edges.rs).
+        let t_ref = std::time::Instant::now();
+        {
+            let parent_db: ProjectDatabase = db.clone();
+            let files_ref: &[File] = &project_files;
+            let ref_edges_ref = &total_ref_edges;
+            py.allow_threads(move || {
+                std::thread::scope(|s| {
+                    for chunk in files_ref.chunks(chunk_size) {
+                        let local_db = parent_db.clone();
+                        s.spawn(move || {
+                            use salsa::Database as _;
+                            local_db.attach(|local_db| {
+                                for &file in chunk {
+                                    let payload =
+                                        crate::file_ref_edges::file_to_ref_edges(local_db, file);
+                                    ref_edges_ref.fetch_add(
+                                        payload.edges.len(),
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    );
+                                }
+                            });
+                        });
+                    }
+                });
+            });
+        }
+        let t_ref_elapsed = t_ref.elapsed();
+
         let d = total_decls.load(std::sync::atomic::Ordering::Relaxed);
         let i = total_imports.load(std::sync::atomic::Ordering::Relaxed);
         let e = total_exports.load(std::sync::atomic::Ordering::Relaxed);
         let edg = total_edges.load(std::sync::atomic::Ordering::Relaxed);
+        let ref_edg = total_ref_edges.load(std::sync::atomic::Ordering::Relaxed);
         eprintln!(
             "[dead-cst-profile] file_to_nodes parallel: files={} workers={} took={:?} decls={} imports={} export-keys={}",
             project_files.len(),
@@ -386,6 +419,13 @@ pub(crate) fn build_project_graph(
             num_workers,
             t_fte_elapsed,
             edg,
+        );
+        eprintln!(
+            "[dead-cst-profile] file_to_ref_edges parallel: files={} workers={} took={:?} ref_edges={}",
+            project_files.len(),
+            num_workers,
+            t_ref_elapsed,
+            ref_edg,
         );
     }
 
