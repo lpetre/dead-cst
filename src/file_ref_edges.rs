@@ -43,13 +43,31 @@ use ty_module_resolver::{resolve_module, ModuleName};
 use ty_project::Db as ProjectDb;
 use ty_python_core::ast_ids::HasScopedUseId;
 use ty_python_core::definition::{DefinitionKind, DefinitionState};
+use ty_python_core::place::PlaceExprRef;
 use ty_python_core::scope::FileScopeId;
 use ty_python_core::{semantic_index, SemanticIndex};
 use ty_python_semantic::SemanticModel;
 
 use crate::file_payload::{
-    file_to_nodes, ExternalKey, FileNodes, ImportPayload, NodeKind, NodeRef,
+    file_to_nodes, import_payload_for_pure as import_payload_for, ExternalKey, FileNodes,
+    ImportPayload, NodeKind, NodeRef,
 };
+
+/// Outcome of resolving a `Name` use to its reaching definition.
+///
+/// `Alias` is the module-scope path: the use has a local graph node
+/// (an import alias or a top-level decl) that takes the in-edge.
+/// `NestedImport` is the function-/class-scope path: ty saw an
+/// import binding in a non-global scope, so no graph node was
+/// minted, and the use's parallel upstream edges flow from the
+/// enclosing top-level owner instead.
+enum Resolution<'db> {
+    Alias(NodeRef<'db>),
+    NestedImport {
+        spec: ImportPayload,
+        bound_name: String,
+    },
+}
 use crate::helpers::{detect_dead_ranges, EDGE_FLAG_DEAD_BRANCH, EDGE_FLAG_DYNAMIC_IMPORT};
 use crate::ingest::{
     collapse_attribute_chain, detect_dynamic_call, file_package_name, from_module_string,
@@ -243,7 +261,7 @@ impl<'a, 'db> RefWalker<'a, 'db> {
     ///   silently dropped.
     /// * No `in_string_annotation` plumbing — string annotations
     ///   aren't entered yet.
-    fn find_local_bindings(&self, name: &ExprName) -> Vec<NodeRef<'db>> {
+    fn find_local_bindings(&self, name: &ExprName) -> Vec<Resolution<'db>> {
         let db = self.model.db();
         let Some(file_scope) = self.model.scope(name.into()) else {
             return Vec::new();
@@ -270,7 +288,7 @@ impl<'a, 'db> RefWalker<'a, 'db> {
                 use_def_map.end_of_scope_symbol_bindings(symbol_id)
             };
             let mut saw_binding = false;
-            let mut results: Vec<NodeRef<'db>> = Vec::new();
+            let mut results: Vec<Resolution<'db>> = Vec::new();
             for binding in bindings {
                 let Some(def) = binding.binding.definition() else {
                     continue;
@@ -281,12 +299,25 @@ impl<'a, 'db> RefWalker<'a, 'db> {
                 saw_binding = true;
                 let candidate = NodeRef::Def(def);
                 if self.self_nodes.ref_to_local.contains_key(&candidate) {
-                    results.push(candidate);
+                    results.push(Resolution::Alias(candidate));
+                    continue;
                 }
-                // TODO(file_to_ref_edges follow-up): when the binding
-                // is an import in a nested scope (no graph node minted),
-                // resolve its upstream via `emit_upstream` and emit
-                // parallel reachability edges from `self.owner`.
+                // Nested-context import: ty sees an import binding in
+                // a non-global scope, so no graph node was minted. The
+                // use's parallel upstream edges flow from the
+                // enclosing top-level owner via emit_upstream; we
+                // package the spec + bound name into a NestedImport
+                // resolution so emit_name_use can drive that.
+                let kind = def.kind(db);
+                if kind.is_import() {
+                    let place_id = def.place(db);
+                    let PlaceExprRef::Symbol(sym) = place_table.place(place_id) else {
+                        continue;
+                    };
+                    let bound_name = sym.name().as_str().to_string();
+                    let spec = import_payload_for(kind, db, self.file, self.parsed);
+                    results.push(Resolution::NestedImport { spec, bound_name });
+                }
             }
             if saw_binding {
                 return results;
@@ -302,7 +333,7 @@ impl<'a, 'db> RefWalker<'a, 'db> {
                 }
                 let candidate = NodeRef::Def(def);
                 if self.self_nodes.ref_to_local.contains_key(&candidate) {
-                    results.push(candidate);
+                    results.push(Resolution::Alias(candidate));
                 }
             }
             if !results.is_empty() {
@@ -320,25 +351,33 @@ impl<'a, 'db> RefWalker<'a, 'db> {
             return;
         }
         self.current_flags = self.flags_for_range(name.range());
-        for dst in self.find_local_bindings(name) {
-            self.emit_edge(dst);
-            // If the resolved alias is an import, emit parallel
-            // reachability edges through it (Principle 2).
-            let import_spec: Option<ImportPayload> = self
-                .self_nodes
-                .ref_to_local
-                .get(&dst)
-                .copied()
-                .and_then(|idx| {
-                    let node_data = &self.self_nodes.nodes[idx as usize];
-                    if matches!(node_data.kind, NodeKind::Import) {
-                        node_data.imports.clone()
-                    } else {
-                        None
+        for resolution in self.find_local_bindings(name) {
+            match resolution {
+                Resolution::Alias(dst) => {
+                    self.emit_edge(dst);
+                    // If the resolved alias is an import, emit
+                    // parallel reachability edges through it
+                    // (Principle 2).
+                    let import_spec: Option<ImportPayload> = self
+                        .self_nodes
+                        .ref_to_local
+                        .get(&dst)
+                        .copied()
+                        .and_then(|idx| {
+                            let node_data = &self.self_nodes.nodes[idx as usize];
+                            if matches!(node_data.kind, NodeKind::Import) {
+                                node_data.imports.clone()
+                            } else {
+                                None
+                            }
+                        });
+                    if let Some(spec) = import_spec {
+                        self.emit_upstream(&spec, name.id.as_str(), extra_chain);
                     }
-                });
-            if let Some(spec) = import_spec {
-                self.emit_upstream(&spec, name.id.as_str(), extra_chain);
+                }
+                Resolution::NestedImport { spec, bound_name } => {
+                    self.emit_upstream(&spec, &bound_name, extra_chain);
+                }
             }
         }
         self.current_flags = 0;

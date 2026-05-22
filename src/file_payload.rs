@@ -430,7 +430,7 @@ pub(crate) fn file_to_nodes<'db>(db: &'db dyn ProjectDb, file: File) -> FileNode
 /// Pure-rust variant of `ingest::import_payload_for`. Returns the same
 /// three fields but as the per-file payload's `ImportPayload`, no
 /// `ImportSpec` allocation.
-fn import_payload_for_pure<'db>(
+pub(crate) fn import_payload_for_pure<'db>(
     kind: &DefinitionKind<'db>,
     db: &'db dyn ty_python_semantic::Db,
     file: File,
