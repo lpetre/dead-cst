@@ -686,12 +686,28 @@ pub(crate) fn file_to_edges<'db>(db: &'db dyn ProjectDb, file: File) -> FileEdge
 
         // Submodule disambiguation: `from p import functions` where
         // `p.functions` is itself a submodule should point at the
-        // submodule file, not at `p` with a decl lookup. Mirror
-        // emit_upstream's `module_name_resolves` check.
+        // submodule file, not at `p` with a decl lookup. BUT: per
+        // CPython's `_handle_fromlist`, namespace bindings WIN over
+        // submodule lookups when both exist (e.g. `q = 42` in
+        // p/__init__.py with a sibling p/q.py — the int binds, not
+        // the submodule). Check namespace first; only switch to
+        // submodule when the namespace doesn't already export decl.
         let (target_module_str, decl_name) = if let Some(decl) = &decl_name {
             let candidate = format!("{target_module_str}.{decl}");
             if crate::ingest::module_name_resolves(&candidate, file, db) {
-                (candidate, None)
+                let namespace_has_decl = ModuleName::new(&target_module_str)
+                    .and_then(|mn| resolve_module(db, file, &mn))
+                    .and_then(|m| m.file(db))
+                    .map(|f| {
+                        let nodes = file_to_nodes(db, f);
+                        nodes.exports_by_name.contains_key(decl)
+                    })
+                    .unwrap_or(false);
+                if namespace_has_decl {
+                    (target_module_str, Some(decl.clone()))
+                } else {
+                    (candidate, None)
+                }
             } else {
                 (target_module_str, Some(decl.clone()))
             }
