@@ -275,6 +275,71 @@ pub(crate) fn build_project_graph(
     }
     let t_prewarm = t_warm.elapsed();
 
+    // Optional profiling hook for the new `file_to_nodes` salsa-tracked
+    // query. Runs in parallel across all project files via the same
+    // attach-per-thread pattern as prewarm, sums total node count to
+    // force materialization, and prints timing. Has no side effect on
+    // the rest of the build — the cached output is discarded for now;
+    // the future driver swap will consume it via the assembly pass.
+    if std::env::var_os("DEAD_CST_PROFILE_FILE_TO_NODES").is_some() {
+        let num_workers = std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(4);
+        let chunk_size = project_files.len().div_ceil(num_workers).max(1);
+        let t_ftn = std::time::Instant::now();
+        let total_decls = std::sync::atomic::AtomicUsize::new(0);
+        let total_imports = std::sync::atomic::AtomicUsize::new(0);
+        let total_exports = std::sync::atomic::AtomicUsize::new(0);
+        let parent_db: ProjectDatabase = db.clone();
+        let files_ref: &[File] = &project_files;
+        let decls_ref = &total_decls;
+        let imports_ref = &total_imports;
+        let exports_ref = &total_exports;
+        py.allow_threads(move || {
+            std::thread::scope(|s| {
+                for chunk in files_ref.chunks(chunk_size) {
+                    let local_db = parent_db.clone();
+                    s.spawn(move || {
+                        use salsa::Database as _;
+                        local_db.attach(|local_db| {
+                            for &file in chunk {
+                                let payload = crate::file_payload::file_to_nodes(local_db, file);
+                                decls_ref.fetch_add(
+                                    payload.defs.len(),
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                let imports = payload
+                                    .defs
+                                    .iter()
+                                    .filter(|(_, n)| n.imports.is_some())
+                                    .count();
+                                imports_ref
+                                    .fetch_add(imports, std::sync::atomic::Ordering::Relaxed);
+                                exports_ref.fetch_add(
+                                    payload.exports_by_name.len(),
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                            }
+                        });
+                    });
+                }
+            });
+        });
+        let t = t_ftn.elapsed();
+        let d = total_decls.load(std::sync::atomic::Ordering::Relaxed);
+        let i = total_imports.load(std::sync::atomic::Ordering::Relaxed);
+        let e = total_exports.load(std::sync::atomic::Ordering::Relaxed);
+        eprintln!(
+            "[dead-cst-profile] file_to_nodes parallel: files={} workers={} took={:?} decls={} imports={} export-keys={}",
+            project_files.len(),
+            num_workers,
+            t,
+            d,
+            i,
+            e,
+        );
+    }
+
     // Phase 1 overlaps with the env-independent ``dist_lookup`` walk
     // on a worker thread. The scope only borrows ``site_packages``,
     // so the main thread's ``&mut db`` for ingest is fine.
