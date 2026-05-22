@@ -41,6 +41,30 @@ use crate::helpers::{
 };
 use crate::ingest::{decl_kind_str, from_module_string};
 
+/// Stable handle for a graph node, used as the public identity across
+/// the fan-out pipeline. Edge endpoints in `file_to_edges` are
+/// `(NodeRef, NodeRef, flags)`; the assembly pass translates each
+/// `NodeRef` to its final `u32` graph index after all per-file
+/// payloads are collected.
+///
+/// `NodeRef::Def` covers every binding ty enumerates as a `Definition`
+/// (functions, classes, variables, type aliases, all import flavours,
+/// star-reexport synthetics). `NodeRef::Module` covers the synthetic
+/// `kind="module"` node per file — `File` is itself a salsa input
+/// ingredient, so its handle is stable and `Hash + Eq + Copy` just
+/// like `Definition`.
+///
+/// `NodeRef::External` (the synthetic `[external dist] X` /
+/// `[stdlib] X` / `[unresolved] X` nodes) will land alongside
+/// `file_to_edges` — minted at cross-file resolution time, not by
+/// `file_to_nodes`. Adding the variant later is a localized change;
+/// keeping it out of this PR keeps the diff focused.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, salsa::Update, get_size2::GetSize)]
+pub(crate) enum NodeRef<'db> {
+    Def(Definition<'db>),
+    Module(File),
+}
+
 /// One graph node's data without the `Py<SymbolNode>` envelope.
 ///
 /// Pure rust so it can live inside a salsa-tracked function's return
@@ -114,37 +138,60 @@ pub(crate) struct ImportPayload {
     pub(crate) star: bool,
 }
 
-/// Salsa-tracked output of [`file_to_nodes`]. All data is pure rust;
-/// the only salsa references are the `Definition<'db>` keys, which
-/// require the `'db` lifetime parameter and the `salsa::Update` derive.
+/// Salsa-tracked output of [`file_to_nodes`]. Parallel arrays plus a
+/// reverse lookup map make every per-file node addressable in O(1)
+/// either by index (assembly pass) or by `NodeRef` identity
+/// (cross-file edge resolution via [`ref_to_node`]).
 ///
-/// Field shapes mirror the seven HashMaps `build_project_graph`
-/// threads through `ingest_decls` today, restricted to the per-file
-/// slice:
+/// Indexing convention: `nodes[0]` is the synthetic `kind="module"`
+/// node for the file; `nodes[1..]` are global-scope definitions in
+/// `use_def_map.all_definitions_with_usage()` iteration order.
+/// `refs[i]` identifies `nodes[i]` (`Module(file)` at index 0,
+/// `Def(definition)` at indices 1..).
 ///
-/// * `module` — the kind="module" `NodeData` for this file. Reachability
-///   anchors the file via it (every per-file decl gets a `decl → module`
-///   edge in `file_to_edges`).
-/// * `defs` — every global-scope `Definition` with its `NodeData`, in
-///   `use_def_map.all_definitions_with_usage()` iteration order.
-///   `def_to_local[def] = i` matches `defs[i].0 == def`.
-/// * `def_to_local` — `Definition → local_idx` for cross-file lookups
-///   (`file_to_edges` needs this to translate a `from M import bar`
-///   alias's target into a NodeRef on `bar`).
-/// * `exports_by_name` — per-name → list of live local indices, computed
-///   from `use_def_map.all_end_of_scope_symbol_bindings()`. This is the
-///   `globals_by_name` shortcut a consumer's `from <thisfile> import x`
-///   uses to find the live binding(s).
+/// * `exports_by_name` — per-name → live local indices into `nodes`.
+///   Populated from ty's `all_end_of_scope_symbol_bindings()`; collapses
+///   sequential rebinds while preserving branch-bound multi-binding
+///   cases (try/except, if/else where each branch assigns).
+///   This is the per-file slice of today's `globals_by_name`
+///   shortcut a consumer's `from <thisfile> import x` uses.
 /// * `star_reexports` — per-name → upstream absolute module name when
-///   `name` in this file is bound by a `from <upstream> import *`.
-///   Lets a downstream chain walk hop through this file.
+///   `name` is bound in this file by `from <upstream> import *`. Lets
+///   downstream chain walks hop through this file.
 #[derive(Debug, Eq, PartialEq, salsa::Update, get_size2::GetSize)]
 pub(crate) struct FileNodes<'db> {
-    pub(crate) module: NodeData,
-    pub(crate) defs: Box<[(Definition<'db>, NodeData)]>,
-    pub(crate) def_to_local: FxHashMap<Definition<'db>, u32>,
+    pub(crate) nodes: Box<[NodeData]>,
+    pub(crate) refs: Box<[NodeRef<'db>]>,
+    pub(crate) ref_to_local: FxHashMap<NodeRef<'db>, u32>,
     pub(crate) exports_by_name: FxHashMap<String, SmallVec<[u32; 2]>>,
     pub(crate) star_reexports: FxHashMap<String, String>,
+}
+
+/// Resolve a `NodeRef` to its `NodeData` payload.
+///
+/// Thin accessor (not salsa-tracked — see PR discussion): one
+/// `file_to_nodes` lookup (memoized, ~ns) plus one HashMap probe.
+/// Keeps the public identity model (callers traffic in `NodeRef`,
+/// fetch `NodeData` on demand) without paying the ~200–400MB of
+/// salsa ingredient overhead a `#[salsa::tracked] ref_to_node` would
+/// cost at 4M-node scale.
+///
+/// Panics if the `NodeRef` doesn't belong to the project (file not
+/// in the project, or `Def(d)` whose `d.file(db)` doesn't enumerate
+/// `d` at module scope). Both indicate a contract violation upstream;
+/// surface the bug loudly.
+#[allow(dead_code)]
+pub(crate) fn ref_to_node<'db>(db: &'db dyn ProjectDb, r: NodeRef<'db>) -> &'db NodeData {
+    let file = match r {
+        NodeRef::Def(d) => d.file(db),
+        NodeRef::Module(f) => f,
+    };
+    let payload = file_to_nodes(db, file);
+    let idx = *payload
+        .ref_to_local
+        .get(&r)
+        .expect("NodeRef does not belong to its claimed file's payload") as usize;
+    &payload.nodes[idx]
 }
 
 /// Build the per-file node payload. Salsa-tracked so it's memoized and
@@ -168,7 +215,15 @@ pub(crate) fn file_to_nodes<'db>(db: &'db dyn ProjectDb, file: File) -> FileNode
         scan_noqa_directives(&parsed, &source, &line_index);
 
     let (msl, msc, mel, mec) = position(&line_index, &source, parsed.syntax().range);
-    let module = NodeData {
+
+    let mut nodes: Vec<NodeData> = Vec::new();
+    let mut refs: Vec<NodeRef<'db>> = Vec::new();
+    let mut ref_to_local: FxHashMap<NodeRef<'db>, u32> = FxHashMap::default();
+
+    // Index 0: the synthetic module node. Anchors reachability for
+    // every per-file decl via the `decl → module` edge `file_to_edges`
+    // will emit.
+    nodes.push(NodeData {
         fqname: module_fqname.clone(),
         kind: NodeKind::Module,
         path: path_str.clone(),
@@ -178,7 +233,9 @@ pub(crate) fn file_to_nodes<'db>(db: &'db dyn ProjectDb, file: File) -> FileNode
         end_column: mec,
         flags: default_flags,
         imports: None,
-    };
+    });
+    refs.push(NodeRef::Module(file));
+    ref_to_local.insert(NodeRef::Module(file), 0);
 
     let index = semantic_index(db, file);
     let global = FileScopeId::global();
@@ -193,12 +250,8 @@ pub(crate) fn file_to_nodes<'db>(db: &'db dyn ProjectDb, file: File) -> FileNode
     // dedup happens naturally at assembly time.
     let mut star_local_name_cache: HashMap<TextRange, String> = HashMap::new();
 
-    // (Definition, NodeData, per_name) collected so we can populate
-    // exports_by_name from end_of_scope bindings in a single post-pass
-    // using the def-keyed local indices.
-    let mut defs: Vec<(Definition<'db>, NodeData)> = Vec::new();
-    let mut def_to_local: FxHashMap<Definition<'db>, u32> = FxHashMap::default();
     let mut star_reexports: FxHashMap<String, String> = FxHashMap::default();
+
     for (_def_id, state, _used) in use_def_map.all_definitions_with_usage() {
         let DefinitionState::Defined(def) = state else {
             continue;
@@ -280,9 +333,10 @@ pub(crate) fn file_to_nodes<'db>(db: &'db dyn ProjectDb, file: File) -> FileNode
             flags,
             imports: import_spec.clone(),
         };
-        let local_idx = defs.len() as u32;
-        def_to_local.insert(def, local_idx);
-        defs.push((def, node));
+        let local_idx = nodes.len() as u32;
+        nodes.push(node);
+        refs.push(NodeRef::Def(def));
+        ref_to_local.insert(NodeRef::Def(def), local_idx);
 
         // Star-reexport tracking: mirror `ingest_decls`'s logic — a
         // later non-star binding for the same name clears the star
@@ -303,7 +357,8 @@ pub(crate) fn file_to_nodes<'db>(db: &'db dyn ProjectDb, file: File) -> FileNode
     // symbol bindings. This collapses sequential rebinds to the latest
     // while preserving branch-bound multi-binding cases (try/except,
     // if/else where each branch assigns). Mirrors `globals_by_name` in
-    // today's pipeline.
+    // today's pipeline. Values are indices into `nodes` (≥ 1, since
+    // index 0 is the module node which can't be bound to a name).
     let mut exports_by_name: FxHashMap<String, SmallVec<[u32; 2]>> = FxHashMap::default();
     for (symbol_id, bindings) in use_def_map.all_end_of_scope_symbol_bindings() {
         let PlaceExprRef::Symbol(sym) = place_table.place(ScopedPlaceId::Symbol(symbol_id)) else {
@@ -318,7 +373,7 @@ pub(crate) fn file_to_nodes<'db>(db: &'db dyn ProjectDb, file: File) -> FileNode
             if def.file(db) != file || def.file_scope(db) != global {
                 continue;
             }
-            if let Some(&local_idx) = def_to_local.get(&def) {
+            if let Some(&local_idx) = ref_to_local.get(&NodeRef::Def(def)) {
                 live.push(local_idx);
             }
         }
@@ -328,9 +383,9 @@ pub(crate) fn file_to_nodes<'db>(db: &'db dyn ProjectDb, file: File) -> FileNode
     }
 
     FileNodes {
-        module,
-        defs: defs.into_boxed_slice(),
-        def_to_local,
+        nodes: nodes.into_boxed_slice(),
+        refs: refs.into_boxed_slice(),
+        ref_to_local,
         exports_by_name,
         star_reexports,
     }

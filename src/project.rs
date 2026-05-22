@@ -304,14 +304,16 @@ pub(crate) fn build_project_graph(
                         local_db.attach(|local_db| {
                             for &file in chunk {
                                 let payload = crate::file_payload::file_to_nodes(local_db, file);
+                                // nodes[0] is the module node; defs start at nodes[1..]
                                 decls_ref.fetch_add(
-                                    payload.defs.len(),
+                                    payload.nodes.len().saturating_sub(1),
                                     std::sync::atomic::Ordering::Relaxed,
                                 );
                                 let imports = payload
-                                    .defs
+                                    .nodes
                                     .iter()
-                                    .filter(|(_, n)| n.imports.is_some())
+                                    .skip(1)
+                                    .filter(|n| n.imports.is_some())
                                     .count();
                                 imports_ref
                                     .fetch_add(imports, std::sync::atomic::Ordering::Relaxed);
