@@ -38,6 +38,7 @@ use ruff_db::parsed::{parsed_module, ParsedModuleRef};
 use ruff_python_ast::visitor::{walk_expr, walk_stmt, Visitor};
 use ruff_python_ast::{Expr, ExprName, Stmt};
 use rustc_hash::FxHashSet;
+use ty_module_resolver::{resolve_module, ModuleName};
 use ty_project::Db as ProjectDb;
 use ty_python_core::ast_ids::HasScopedUseId;
 use ty_python_core::definition::{DefinitionKind, DefinitionState};
@@ -45,8 +46,10 @@ use ty_python_core::scope::FileScopeId;
 use ty_python_core::{semantic_index, SemanticIndex};
 use ty_python_semantic::SemanticModel;
 
-use crate::file_payload::{file_to_nodes, FileNodes, NodeRef};
-use crate::ingest::stmt_creates_top_level_definition;
+use crate::file_payload::{file_to_nodes, FileNodes, ImportPayload, NodeKind, NodeRef};
+use crate::ingest::{
+    collapse_attribute_chain, module_name_resolves, stmt_creates_top_level_definition,
+};
 
 /// Salsa-tracked output of [`file_to_ref_edges`]. Set semantics so
 /// duplicate emissions (a name used twice resolving to the same
@@ -90,6 +93,7 @@ pub(crate) fn file_to_ref_edges<'db>(db: &'db dyn ProjectDb, file: File) -> File
         let mut walker = RefWalker {
             owner: owner_ref,
             file,
+            db,
             parsed: &parsed,
             index,
             self_nodes,
@@ -112,6 +116,7 @@ pub(crate) fn file_to_ref_edges<'db>(db: &'db dyn ProjectDb, file: File) -> File
         let mut walker = RefWalker {
             owner: module_ref,
             file,
+            db,
             parsed: &parsed,
             index,
             self_nodes,
@@ -130,9 +135,11 @@ pub(crate) fn file_to_ref_edges<'db>(db: &'db dyn ProjectDb, file: File) -> File
 struct RefWalker<'a, 'db> {
     owner: NodeRef<'db>,
     file: File,
-    // Held for attribute-chain walking (`collapse_attribute_chain` +
-    // emit_upstream re-walks of submodule files) once that follow-up
-    // lands. Unused in the first cut.
+    /// The project db. We can't go through `self.model.db()` for
+    /// `file_to_nodes` calls because that returns `&dyn
+    /// ty_python_semantic::Db` and our salsa-tracked queries are
+    /// defined over `&dyn ty_project::Db` (a super-trait).
+    db: &'db dyn ProjectDb,
     #[allow(dead_code)]
     parsed: &'a ParsedModuleRef,
     index: &'a SemanticIndex<'db>,
@@ -223,7 +230,7 @@ impl<'a, 'db> RefWalker<'a, 'db> {
         Vec::new()
     }
 
-    fn emit_name_use(&mut self, name: &ExprName) {
+    fn emit_name_use(&mut self, name: &ExprName, extra_chain: &[&str]) {
         // Names in non-Load context (LHS of `=`, `for x in …`, etc.)
         // are binding sites, not uses — skip to match today's pipeline.
         if !matches!(name.ctx, ruff_python_ast::ExprContext::Load) {
@@ -231,23 +238,172 @@ impl<'a, 'db> RefWalker<'a, 'db> {
         }
         for dst in self.find_local_bindings(name) {
             self.emit_edge(dst);
+            // If the resolved alias is an import, emit parallel
+            // reachability edges through it (Principle 2).
+            let import_spec: Option<ImportPayload> = self
+                .self_nodes
+                .ref_to_local
+                .get(&dst)
+                .copied()
+                .and_then(|idx| {
+                    let node_data = &self.self_nodes.nodes[idx as usize];
+                    if matches!(node_data.kind, NodeKind::Import) {
+                        node_data.imports.clone()
+                    } else {
+                        None
+                    }
+                });
+            if let Some(spec) = import_spec {
+                self.emit_upstream(&spec, name.id.as_str(), extra_chain);
+            }
         }
-        // TODO(file_to_ref_edges follow-up): parallel upstream edges
-        // through `alias_imports[idx].emit_upstream(…)`. For now only
-        // the local-alias edge is emitted.
+    }
+
+    /// Emit parallel reachability edges past a local import alias.
+    /// First-party path only — stdlib / external / unresolved targets
+    /// silently drop. Synthetic external nodes land with
+    /// `NodeRef::External` in a follow-up.
+    ///
+    /// Mirrors today's `ingest::RefCollector::emit_upstream` (lines
+    /// 1880–2032): classify the loading target, walk the submodule
+    /// chain, emit edges to the deepest module reached plus any
+    /// terminal decl.
+    fn emit_upstream(&mut self, spec: &ImportPayload, bound_name: &str, extra_chain: &[&str]) {
+        if spec.module.is_empty() {
+            return;
+        }
+        let db = self.model.db();
+        let module_first_seg = spec.module.split('.').next().unwrap_or("").to_string();
+
+        let mut adjusted_chain: Vec<&str> = extra_chain.to_vec();
+        let loading_target: String;
+        let mut decl_tail: Option<String> = None;
+
+        if spec.star {
+            let candidate = format!("{}.{}", spec.module, bound_name);
+            if module_name_resolves(&candidate, self.file, db) {
+                loading_target = candidate;
+            } else {
+                loading_target = spec.module.clone();
+                decl_tail = Some(bound_name.to_string());
+            }
+        } else {
+            match &spec.decl {
+                Some(decl) => {
+                    let candidate = format!("{}.{}", spec.module, decl);
+                    if module_name_resolves(&candidate, self.file, db) {
+                        loading_target = candidate;
+                    } else {
+                        loading_target = spec.module.clone();
+                        decl_tail = Some(decl.clone());
+                    }
+                }
+                None => {
+                    let no_asname = bound_name == module_first_seg;
+                    if no_asname && spec.module != module_first_seg {
+                        let loading_extras: Vec<&str> = spec.module.split('.').skip(1).collect();
+                        let n = loading_extras.len();
+                        let prefix_matches = adjusted_chain.len() >= n
+                            && adjusted_chain
+                                .iter()
+                                .take(n)
+                                .zip(&loading_extras)
+                                .all(|(a, b)| *a == *b);
+                        if prefix_matches {
+                            adjusted_chain.drain(..n);
+                            loading_target = spec.module.clone();
+                        } else {
+                            loading_target = module_first_seg;
+                        }
+                    } else {
+                        loading_target = spec.module.clone();
+                    }
+                }
+            }
+        }
+
+        // Classify the loading target. TODO(file_to_ref_edges followup):
+        // route stdlib/external/unresolved targets to `NodeRef::External`.
+        // For now they drop silently — the test suite swap will be
+        // missing those parallel-reachability edges until External
+        // lands.
+        let Some(start_mn) = ModuleName::new(&loading_target) else {
+            return;
+        };
+        let Some(start_module) = resolve_module(db, self.file, &start_mn) else {
+            return;
+        };
+        if start_module
+            .search_path(db)
+            .is_some_and(|sp| sp.is_standard_library())
+        {
+            return;
+        }
+        let Some(start_file) = start_module.file(db) else {
+            return;
+        };
+
+        // Decl-style alias: emit edge to the upstream module and the
+        // decl inside it. Attribute access past a decl is field access
+        // on the decl's value, which we don't model.
+        if let Some(decl_name) = decl_tail {
+            self.emit_edge(NodeRef::Module(start_file));
+            let target_nodes = file_to_nodes(self.db, start_file);
+            if let Some(locals) = target_nodes.exports_by_name.get(&decl_name) {
+                for &local_idx in locals {
+                    self.emit_edge(target_nodes.refs[local_idx as usize]);
+                }
+            }
+            return;
+        }
+
+        // Module-style alias: walk the chain submodule-by-submodule,
+        // emit one module edge (deepest reached) plus at most one
+        // terminal decl edge.
+        let mut current_file = start_file;
+        let mut current_path = loading_target.clone();
+        let mut terminal_decl_refs: Vec<NodeRef<'db>> = Vec::new();
+        for seg in &adjusted_chain {
+            let candidate = format!("{current_path}.{seg}");
+            let submodule_file = ModuleName::new(&candidate)
+                .and_then(|mn| resolve_module(db, self.file, &mn))
+                .and_then(|m| m.file(db));
+            if let Some(sub_file) = submodule_file {
+                current_file = sub_file;
+                current_path = candidate;
+                continue;
+            }
+            // Not a submodule — check for decl in current_file's exports.
+            let target_nodes = file_to_nodes(self.db, current_file);
+            if let Some(locals) = target_nodes.exports_by_name.get(*seg) {
+                for &local_idx in locals {
+                    terminal_decl_refs.push(target_nodes.refs[local_idx as usize]);
+                }
+            }
+            break;
+        }
+        self.emit_edge(NodeRef::Module(current_file));
+        for r in terminal_decl_refs {
+            self.emit_edge(r);
+        }
     }
 }
 
 impl<'ast, 'db> Visitor<'ast> for RefWalker<'_, 'db> {
     fn visit_expr(&mut self, expr: &'ast Expr) {
         if let Expr::Name(n) = expr {
-            self.emit_name_use(n);
+            self.emit_name_use(n, &[]);
             return;
         }
-        // TODO(file_to_ref_edges follow-up): collapse Attribute chains
-        // via `collapse_attribute_chain` and feed extra_chain segments
-        // into `emit_name_use` so attribute-chain reachability through
-        // aliased modules works.
+        // Collapse attribute chains rooted at a `Name`. The chain
+        // segments past the root become `extra_chain` so emit_upstream
+        // can walk submodule segments past an aliased module.
+        if matches!(expr, Expr::Attribute(_)) {
+            if let Some((root, segments)) = collapse_attribute_chain(expr) {
+                self.emit_name_use(root, &segments);
+                return;
+            }
+        }
         // TODO(file_to_ref_edges follow-up): handle string annotations
         // (visit_annotation + walk_string_annotation), dynamic imports
         // (try_emit_dynamic_import).
