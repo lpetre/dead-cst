@@ -29,10 +29,7 @@ use ty_python_core::semantic_index;
 use crate::builder::{apply_graph_op, bfs, lookup_idx, not_materialized, Direction, GraphBuilder};
 use crate::file_payload::{file_to_edges, file_to_nodes, NodeKind, NodeRef};
 use crate::file_ref_edges::file_to_ref_edges;
-use crate::graph::{
-    intern_kind, DeclIndex, GlobalsByName, Import, ImportSpec, LiveDeclIndex, MainBlock,
-    NativeGraph, StarReexports, SymbolNode,
-};
+use crate::graph::{intern_kind, DeclIndex, Import, MainBlock, NativeGraph, SymbolNode};
 use crate::helpers::{
     call_callee_matches_var, class_body_defines_method, collect_all_imports_local,
     collect_module_imports_local, decorators_match_imports, extract_call_args_kwargs,
@@ -41,10 +38,7 @@ use crate::helpers::{
     owner_idx_for_stmt_with, range_key, rel_path, top_level_assign_to_name, AttrCallFinder,
     CallArgs, FactoryCallFinder, StringArgCallFinder, NODE_FLAG_ENTRYPOINT,
 };
-use crate::ingest::{
-    build_dist_lookup, emit_import_edges, emit_module_hierarchy, emit_visitor_warning,
-    ingest_decls, string_literal_list,
-};
+use crate::ingest::{emit_visitor_warning, string_literal_list};
 use crate::query::{
     _compile_path_regex, _contains_any_identifier, _contains_identifier, par_scan_files,
     QueryBuilder,

@@ -652,7 +652,6 @@ pub(crate) fn file_to_edges<'db>(db: &'db dyn ProjectDb, file: File) -> FileEdge
     let global = FileScopeId::global();
     let use_def_map = index.use_def_map(global);
     let parsed = parsed_module(db, file).load(db);
-    let place_table = index.place_table(global);
 
     for (_def_id, state, _used) in use_def_map.all_definitions_with_usage() {
         let DefinitionState::Defined(def) = state else {
