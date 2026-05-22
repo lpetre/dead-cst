@@ -50,10 +50,11 @@ use ty_python_semantic::SemanticModel;
 use crate::file_payload::{
     file_to_nodes, ExternalKey, FileNodes, ImportPayload, NodeKind, NodeRef,
 };
-use crate::helpers::{detect_dead_ranges, EDGE_FLAG_DEAD_BRANCH};
+use crate::helpers::{detect_dead_ranges, EDGE_FLAG_DEAD_BRANCH, EDGE_FLAG_DYNAMIC_IMPORT};
 use crate::ingest::{
-    collapse_attribute_chain, from_module_string, module_name_resolves,
-    stmt_creates_top_level_definition,
+    collapse_attribute_chain, detect_dynamic_call, file_package_name, from_module_string,
+    module_name_resolves, parse_dynamic_args, resolve_dynamic_target,
+    stmt_creates_top_level_definition, target_is_dunder_all, DynamicParseResult,
 };
 
 /// Salsa-tracked output of [`file_to_ref_edges`]. Set semantics so
@@ -61,9 +62,16 @@ use crate::ingest::{
 /// target) collapse to a single entry. Edges are unresolved
 /// (`NodeRef` endpoints, not `u32` graph indices) — the assembly
 /// pass translates at the end.
+///
+/// `warnings` are visitor messages (e.g. "Skipping dynamic import …")
+/// buffered per-file in pure rust. The driver flushes them to the
+/// `dead_cst._visitor` Python logger from the main thread once all
+/// per-file workers have finished — keeps `file_to_ref_edges` itself
+/// GIL-free so workers run inside `py.allow_threads` cleanly.
 #[derive(Debug, Eq, PartialEq, salsa::Update, get_size2::GetSize)]
 pub(crate) struct FileRefEdges<'db> {
     pub(crate) edges: FxHashSet<(NodeRef<'db>, NodeRef<'db>, u32)>,
+    pub(crate) warnings: Vec<String>,
 }
 
 /// Per-file reference-edge collection. Salsa-tracked so the AST
@@ -73,6 +81,7 @@ pub(crate) struct FileRefEdges<'db> {
 pub(crate) fn file_to_ref_edges<'db>(db: &'db dyn ProjectDb, file: File) -> FileRefEdges<'db> {
     let self_nodes = file_to_nodes(db, file);
     let mut edges: FxHashSet<(NodeRef<'db>, NodeRef<'db>, u32)> = FxHashSet::default();
+    let mut warnings: Vec<String> = Vec::new();
 
     let parsed = parsed_module(db, file).load(db);
     let dead_ranges = detect_dead_ranges(&parsed);
@@ -106,6 +115,7 @@ pub(crate) fn file_to_ref_edges<'db>(db: &'db dyn ProjectDb, file: File) -> File
             model: &model,
             dead_ranges: &dead_ranges,
             edges: &mut edges,
+            warnings: &mut warnings,
             nested_context: false,
             current_flags: 0,
         };
@@ -131,13 +141,14 @@ pub(crate) fn file_to_ref_edges<'db>(db: &'db dyn ProjectDb, file: File) -> File
             model: &model,
             dead_ranges: &dead_ranges,
             edges: &mut edges,
+            warnings: &mut warnings,
             nested_context: false,
             current_flags: 0,
         };
         walker.visit_stmt(stmt);
     }
 
-    FileRefEdges { edges }
+    FileRefEdges { edges, warnings }
 }
 
 /// Per-owner walker. Mirrors today's `RefCollector` but with
@@ -160,6 +171,9 @@ struct RefWalker<'a, 'db> {
     /// every edge they emit.
     dead_ranges: &'a [TextRange],
     edges: &'a mut FxHashSet<(NodeRef<'db>, NodeRef<'db>, u32)>,
+    /// Per-file warnings buffer. Workers push pure-rust strings; the
+    /// driver flushes them to Python logging from the main thread.
+    warnings: &'a mut Vec<String>,
     nested_context: bool,
     /// Flags stamped on each edge emitted by the current reference
     /// (set by `emit_name_use` / nested-import handlers from
@@ -387,6 +401,154 @@ impl<'a, 'db> RefWalker<'a, 'db> {
         }
     }
 
+    /// Recognize and emit edges for a dynamic-import call. Returns
+    /// `true` if the call was a dynamic-import shape (so the visitor
+    /// doesn't fall through to walk its arguments as ordinary names).
+    /// Mirrors today's `RefCollector::try_emit_dynamic_import` +
+    /// `emit_dynamic_edges` + `emit_resolved_module`.
+    fn try_emit_dynamic_import(&mut self, call: &ruff_python_ast::ExprCall) -> bool {
+        let Some(kind) = detect_dynamic_call(&call.func) else {
+            return false;
+        };
+        match parse_dynamic_args(kind, call) {
+            DynamicParseResult::Ok {
+                name,
+                fromlist,
+                explicit_package,
+                explicit_level,
+            } => {
+                let file_pkg = file_package_name(self.model.db(), self.file);
+                let pkg = explicit_package.or(file_pkg.as_deref());
+                match resolve_dynamic_target(kind, &name, explicit_level, pkg) {
+                    Ok(target) => self.emit_dynamic_edges(&target, &fromlist),
+                    Err(message) => self.warnings.push(message),
+                }
+                true
+            }
+            DynamicParseResult::Warn(message) => {
+                self.warnings.push(message);
+                true
+            }
+            DynamicParseResult::NotApplicable => false,
+        }
+    }
+
+    /// Emit `owner → target` plus per-fromlist-entry edges for a
+    /// dynamic import, each tagged with `EDGE_FLAG_DYNAMIC_IMPORT`.
+    fn emit_dynamic_edges(&mut self, target: &str, fromlist: &[&str]) {
+        let saved = self.current_flags;
+        self.current_flags |= EDGE_FLAG_DYNAMIC_IMPORT;
+        if fromlist.is_empty() {
+            self.emit_resolved_module(target);
+        } else {
+            self.emit_resolved_module(target);
+            for entry in fromlist {
+                if entry.is_empty() {
+                    continue;
+                }
+                let candidate = format!("{target}.{entry}");
+                if module_name_resolves(&candidate, self.file, self.model.db()) {
+                    self.emit_resolved_module(&candidate);
+                    continue;
+                }
+                // Treat as decl-style: resolve target to file, look up
+                // entry in its exports_by_name.
+                let target_file = ModuleName::new(target)
+                    .and_then(|n| resolve_module(self.db, self.file, &n))
+                    .and_then(|m| m.file(self.db));
+                if let Some(target_file) = target_file {
+                    let target_nodes = file_to_nodes(self.db, target_file);
+                    if let Some(locals) = target_nodes.exports_by_name.get(*entry) {
+                        for &local_idx in locals {
+                            self.emit_edge(target_nodes.refs[local_idx as usize]);
+                        }
+                    }
+                }
+            }
+        }
+        self.current_flags = saved;
+    }
+
+    /// Emit a single edge to the resolved module's NodeRef. Stdlib
+    /// drops silently; otherwise routes to first-party (Module) or
+    /// External as appropriate.
+    fn emit_resolved_module(&mut self, dotted: &str) {
+        let Some(mn) = ModuleName::new(dotted) else {
+            return;
+        };
+        let Some(module) = resolve_module(self.db, self.file, &mn) else {
+            self.emit_external(dotted, /*unresolved=*/ true);
+            return;
+        };
+        if module
+            .search_path(self.db)
+            .is_some_and(|sp| sp.is_standard_library())
+        {
+            return;
+        }
+        let Some(target_file) = module.file(self.db) else {
+            self.emit_external(dotted, /*unresolved=*/ true);
+            return;
+        };
+        if module
+            .search_path(self.db)
+            .is_some_and(|sp| !sp.is_first_party() && sp.is_site_packages())
+        {
+            self.emit_external(dotted, /*unresolved=*/ false);
+            return;
+        }
+        self.emit_edge(NodeRef::Module(target_file));
+    }
+
+    /// `__all__ = ["foo", "bar"]`: each string literal resolves to a
+    /// module-scope binding; emit edges to each one. Mirrors today's
+    /// `emit_dunder_all_edges`. Computed-`__all__` shapes (concat,
+    /// `list(...)`) silently skip.
+    fn emit_dunder_all_edges(&mut self, value: &Expr) {
+        let elements = match value {
+            Expr::List(l) => &l.elts,
+            Expr::Tuple(t) => &t.elts,
+            _ => return,
+        };
+        for elem in elements {
+            if let Expr::StringLiteral(s) = elem {
+                if let Some(dst) = self.lookup_module_scope_name(s.value.to_str()) {
+                    self.emit_edge(dst);
+                }
+            }
+        }
+    }
+
+    /// Resolve a bare name to its module-scope live binding's NodeRef.
+    /// Used by [`emit_dunder_all_edges`]; mirrors today's
+    /// `RefCollector::lookup_module_scope_name`.
+    fn lookup_module_scope_name(&self, name: &str) -> Option<NodeRef<'db>> {
+        let global = FileScopeId::global();
+        let place_table = self.index.place_table(global);
+        let symbol_id = place_table.symbol_id(name)?;
+        if let Some(locals) = self.self_nodes.exports_by_name.get(name) {
+            if let Some(&local_idx) = locals.first() {
+                return Some(self.self_nodes.refs[local_idx as usize]);
+            }
+        }
+        // Fallback: walk end-of-scope bindings (matches today's
+        // pipeline behavior when exports_by_name misses).
+        let use_def_map = self.index.use_def_map(global);
+        for binding in use_def_map.end_of_scope_symbol_bindings(symbol_id) {
+            let Some(def) = binding.binding.definition() else {
+                continue;
+            };
+            if def.file(self.model.db()) != self.file {
+                continue;
+            }
+            let candidate = NodeRef::Def(def);
+            if self.self_nodes.ref_to_local.contains_key(&candidate) {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
     /// Emit parallel reachability edges past a local import alias.
     /// First-party path only — stdlib / external / unresolved targets
     /// silently drop. Synthetic external nodes land with
@@ -546,9 +708,30 @@ impl<'ast, 'db> Visitor<'ast> for RefWalker<'_, 'db> {
                 return;
             }
         }
+        // Recognize dynamic-import calls before falling through to a
+        // normal Call walk. Matches today's RefCollector::visit_expr
+        // sequencing — receiver gets its own emit_name_use, args walk
+        // normally, but the literal name/fromlist are handled by
+        // emit_dynamic_edges so they don't get attributed as string
+        // refs to something else.
+        if let Expr::Call(call) = expr {
+            if self.try_emit_dynamic_import(call) {
+                if let Expr::Attribute(attr) = &*call.func {
+                    if let Expr::Name(receiver) = &*attr.value {
+                        self.emit_name_use(receiver, &[]);
+                    }
+                }
+                for arg in &call.arguments.args {
+                    self.visit_expr(arg);
+                }
+                for kw in &call.arguments.keywords {
+                    self.visit_expr(&kw.value);
+                }
+                return;
+            }
+        }
         // TODO(file_to_ref_edges follow-up): handle string annotations
-        // (visit_annotation + walk_string_annotation), dynamic imports
-        // (try_emit_dynamic_import).
+        // (visit_annotation + walk_string_annotation).
         if let Expr::Named(named) = expr {
             // Walrus visibility: at module scope, the walrus has its own
             // Definition with its own owned-expression walk (covered by
@@ -641,12 +824,21 @@ fn walk_owned<'a, 'db>(
             v.nested_context = false;
         }
         DefinitionKind::Assignment(a) => {
-            v.visit_expr(a.value(parsed));
+            let value = a.value(parsed);
+            if target_is_dunder_all(a.target(parsed)) {
+                v.emit_dunder_all_edges(value);
+            } else {
+                v.visit_expr(value);
+            }
         }
         DefinitionKind::AnnotatedAssignment(a) => {
             v.visit_expr(a.annotation(parsed));
             if let Some(val) = a.value(parsed) {
-                v.visit_expr(val);
+                if target_is_dunder_all(a.target(parsed)) {
+                    v.emit_dunder_all_edges(val);
+                } else {
+                    v.visit_expr(val);
+                }
             }
         }
         DefinitionKind::NamedExpression(named) => v.visit_expr(named.node(parsed).value.as_ref()),
