@@ -232,44 +232,12 @@ pub(crate) fn build_project_graph(
 
     let progress = ProgressBars::new(show_progress, project_files.len() as u64);
 
-    // Pre-warm: in parallel, force salsa's ``parsed_module`` and
-    // ``semantic_index`` queries to fill for every project file.
-    // The body is a ``#[salsa::tracked]`` function, so salsa owns
-    // the parallel coordination (lock-free fast paths, not the
-    // parking_lot contention plain-Rust callers hit). After this,
-    // phase 1's serial ``ingest_decls`` loop hits warm caches.
-    //
-    // DEAD_CST_SKIP_PREWARM=1 disables this so the per-file populate
-    // workers below fault parsed_module + semantic_index in
-    // themselves. Used for the "does prewarm still buy us anything?"
-    // A/B experiment; the populate phase is already parallel, so the
-    // hypothesis is that prewarm is now redundant.
-    let t_warm = std::time::Instant::now();
-    let skip_prewarm = std::env::var_os("DEAD_CST_SKIP_PREWARM").is_some();
-    if !skip_prewarm {
-        let parent_db: ProjectDatabase = db.clone();
-        let files_ref: &[File] = &project_files;
-        let num_workers = std::thread::available_parallelism()
-            .map(std::num::NonZeroUsize::get)
-            .unwrap_or(4);
-        let chunk_size = files_ref.len().div_ceil(num_workers).max(1);
-        py.allow_threads(move || {
-            std::thread::scope(|s| {
-                for chunk in files_ref.chunks(chunk_size) {
-                    let local_db = parent_db.clone();
-                    s.spawn(move || {
-                        use salsa::Database as _;
-                        local_db.attach(|local_db| {
-                            for &file in chunk {
-                                crate::ingest::prewarm_file(local_db, file);
-                            }
-                        });
-                    });
-                }
-            });
-        });
-    }
-    let t_prewarm = t_warm.elapsed();
+    // (prewarm phase deleted — confirmed redundant after the
+    // fan-out refactor. The populate phase below already
+    // parallelises parsed_module + semantic_index loading inside
+    // its own attach-per-thread scope; pre-warming them in a
+    // separate parallel pass was a no-op at every corpus size we
+    // measured. See PR #226 follow-up for the A/B data.)
 
     // Parallel pre-populate: run file_to_nodes, file_to_edges, and
     // file_to_ref_edges as #[salsa::tracked] queries across all
@@ -346,12 +314,11 @@ pub(crate) fn build_project_graph(
     let t_fqname = t4.elapsed();
     if timing {
         eprintln!(
-            "[dead-cst-timing] files={} nodes={} edges={} enum={:?} prewarm={:?} populate={:?} assemble={:?} fqname={:?} total={:?} rss={}MB",
+            "[dead-cst-timing] files={} nodes={} edges={} enum={:?} populate={:?} assemble={:?} fqname={:?} total={:?} rss={}MB",
             project_files.len(),
             builder.nodes.len(),
             builder.edges.len(),
             t_enum,
-            t_prewarm,
             t_populate_elapsed,
             t_assemble_elapsed,
             t_fqname,

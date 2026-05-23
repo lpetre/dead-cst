@@ -4,8 +4,6 @@
 //! of pure-function helpers the per-file salsa-tracked queries in
 //! `file_payload.rs` and `file_ref_edges.rs` call into:
 //!
-//! * `prewarm_file` — parallel salsa cache fill for `parsed_module` +
-//!   `semantic_index` before the per-file workers run.
 //! * `decl_kind_str`, `from_module_string` — small classifiers used
 //!   when building per-file node payloads.
 //! * `stmt_creates_top_level_definition`, `target_is_dunder_all`,
@@ -27,39 +25,12 @@ use std::path::{Path, PathBuf};
 
 use pyo3::prelude::*;
 use ruff_db::files::{File, FilePath};
-use ruff_db::parsed::parsed_module;
 use ruff_python_ast::{Expr, ExprName, Stmt};
 use ruff_text_size::Ranged;
 use ty_module_resolver::{
     file_to_module, resolve_module, search_paths, ModuleName, ModuleResolveMode,
 };
 use ty_python_core::definition::DefinitionKind;
-use ty_python_core::semantic_index;
-
-// ---------------------------------------------------------------------------
-// Phase 1: decl enumeration via ty's SemanticIndex
-// ---------------------------------------------------------------------------
-
-/// Salsa-tracked per-file "pre-warm" -- forces ``parsed_module`` +
-/// ``semantic_index`` to be cached for ``file`` so subsequent
-/// serial reads in ``ingest_decls`` hit the cache instead of
-/// blocking on a fill. Returns the body length only to keep salsa's
-/// signature non-trivial; the body's side effect (cache fill) is
-/// what matters.
-///
-/// Calling this in parallel via ``rayon::scope`` lets salsa's
-/// tracked-function machinery handle the lock-free coordination
-/// between workers, instead of the parking_lot lock contention
-/// plain-Rust callers hit. Experiment to confirm whether the
-/// tracked-function path actually scales for this codebase before
-/// committing to the larger ``extract_decls``-returning-NodeData
-/// refactor for phase 1.
-#[salsa::tracked]
-pub(crate) fn prewarm_file(db: &dyn ty_project::Db, file: File) -> usize {
-    let parsed = parsed_module(db, file).load(db);
-    let _ = semantic_index(db, file);
-    parsed.syntax().body.len()
-}
 
 pub(crate) fn decl_kind_str(kind: &DefinitionKind<'_>) -> Option<&'static str> {
     if kind.is_import() {
