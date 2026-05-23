@@ -261,8 +261,23 @@ impl<'a, 'db> RefWalker<'a, 'db> {
     ///   aren't entered yet.
     fn find_local_bindings(&self, name: &ExprName) -> Vec<Resolution<'db>> {
         let db = self.model.db();
-        let Some(file_scope) = self.model.scope(name.into()) else {
-            return Vec::new();
+        // For names from a string-annotation sub-AST, ty doesn't know
+        // their scope (we parsed them ourselves rather than going
+        // through enter_string_annotation). Fall back to the file's
+        // global scope — typing references inside annotations almost
+        // always resolve via global-scope imports, and the
+        // ancestor-scope walk below still climbs from global to find
+        // them. Loses precision for "T defined inside def f, used in
+        // f's annotation as string" which is rare.
+        let file_scope = if self.in_string_annotation {
+            self.model
+                .scope(name.into())
+                .unwrap_or(FileScopeId::global())
+        } else {
+            let Some(s) = self.model.scope(name.into()) else {
+                return Vec::new();
+            };
+            s
         };
         let mut first = true;
         for (scope_id, _scope) in self.index.visible_ancestor_scopes(file_scope) {
@@ -470,39 +485,37 @@ impl<'a, 'db> RefWalker<'a, 'db> {
         self.in_annotation -= 1;
     }
 
-    /// Parse a string-typed annotation via ty's
-    /// `enter_string_annotation` and walk the parsed sub-AST for
-    /// name uses. The sub-walker shares `&mut edges` / `&mut warnings`
-    /// indirectly via local Vecs that get merged back; this keeps the
-    /// borrow checker happy and matches today's pipeline's
-    /// AND-of-flags merge with set-semantics dedup at the outer level.
+    /// Parse a string-typed annotation as a Python expression and
+    /// walk it for name uses.
+    ///
+    /// Uses `ruff_python_parser::parse_expression` directly instead
+    /// of `SemanticModel::enter_string_annotation`. The latter calls
+    /// `infer_complete_scope_types`, which triggers ty's full type
+    /// inference for the enclosing scope — that fault-loads typeshed
+    /// (`typing.pyi`, `builtins.pyi`, …) and on typing-heavy
+    /// codebases adds tens of GB of `parsed_module` storage to
+    /// salsa's cache at 200k-file scale.
+    ///
+    /// Trade-off: we lose ty's `is_string_annotation` syntactic
+    /// gate (which would distinguish a typing-relevant string from
+    /// e.g. a `Callable[["unused param doc"], int]` shape). Names
+    /// inside the parsed sub-AST resolve via `in_string_annotation`'s
+    /// global-scope fallback in `find_local_bindings`; sub-AST
+    /// nodes aren't in the file's `uses_map`, so the
+    /// position-sensitive `scoped_use_id` path is skipped and
+    /// resolution falls through to `end_of_scope_symbol_bindings`.
     fn walk_string_annotation(&mut self, string_expr: &ExprStringLiteral) {
-        let Some((parsed_expr, sub_model)) = self.model.enter_string_annotation(string_expr) else {
+        let Some(string_literal) = string_expr.as_single_part_string() else {
             return;
         };
-        let mut sub_edges: FxHashSet<(NodeRef<'db>, NodeRef<'db>, u32)> = FxHashSet::default();
-        let mut sub_warnings: Vec<String> = Vec::new();
-        {
-            let mut sub = RefWalker {
-                owner: self.owner,
-                file: self.file,
-                db: self.db,
-                parsed: self.parsed,
-                index: self.index,
-                self_nodes: self.self_nodes,
-                model: &sub_model,
-                dead_ranges: self.dead_ranges,
-                edges: &mut sub_edges,
-                warnings: &mut sub_warnings,
-                nested_context: self.nested_context,
-                current_flags: 0,
-                in_annotation: self.in_annotation,
-                in_string_annotation: true,
-            };
-            sub.visit_expr(parsed_expr.expr());
-        }
-        self.edges.extend(sub_edges);
-        self.warnings.append(&mut sub_warnings);
+        let parsed = match ruff_python_parser::parse_expression(string_literal.as_str()) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let prev = self.in_string_annotation;
+        self.in_string_annotation = true;
+        self.visit_expr(parsed.expr());
+        self.in_string_annotation = prev;
     }
 
     /// Recognize and emit edges for a dynamic-import call. Returns
