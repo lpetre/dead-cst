@@ -31,6 +31,10 @@ ruff_python_parser = { path = "vendor/ruff/crates/ruff_python_parser" }
 ruff_source_file = { path = "vendor/ruff/crates/ruff_source_file" }
 ruff_text_size = { path = "vendor/ruff/crates/ruff_text_size" }
 ty_ide = { path = "vendor/ruff/crates/ty_ide" }
+ruff_memory_usage = { path = "vendor/ruff/crates/ruff_memory_usage" }
+get-size2 = { version = "0.8.0", features = ["smallvec"] }
+rustc-hash = "2.0"
+smallvec = { version = "1.13", features = ["union", "const_generics", "const_new"] }
 indicatif = "0.17"
 rayon = "1.10"
 regex = "1"

@@ -27,10 +27,9 @@ use ty_python_core::scope::FileScopeId;
 use ty_python_core::semantic_index;
 
 use crate::builder::{apply_graph_op, bfs, lookup_idx, not_materialized, Direction, GraphBuilder};
-use crate::graph::{
-    DeclIndex, GlobalsByName, ImportSpec, LiveDeclIndex, MainBlock, NativeGraph, StarReexports,
-    SymbolNode,
-};
+use crate::file_payload::{file_to_edges, file_to_nodes, NodeKind, NodeRef};
+use crate::file_ref_edges::file_to_ref_edges;
+use crate::graph::{intern_kind, DeclIndex, Import, MainBlock, NativeGraph, SymbolNode};
 use crate::helpers::{
     call_callee_matches_var, class_body_defines_method, collect_all_imports_local,
     collect_module_imports_local, decorators_match_imports, extract_call_args_kwargs,
@@ -39,13 +38,13 @@ use crate::helpers::{
     owner_idx_for_stmt_with, range_key, rel_path, top_level_assign_to_name, AttrCallFinder,
     CallArgs, FactoryCallFinder, StringArgCallFinder, NODE_FLAG_ENTRYPOINT,
 };
-use crate::ingest::{
-    build_dist_lookup, emit_import_edges, emit_module_hierarchy, ingest_decls, string_literal_list,
-};
+use crate::ingest::{emit_visitor_warning, string_literal_list};
 use crate::query::{
     _compile_path_regex, _contains_any_identifier, _contains_identifier, par_scan_files,
     QueryBuilder,
 };
+use rustc_hash::FxHashMap;
+use std::sync::OnceLock as StdOnceLock;
 
 /// A ty-backed analysis project with explicitly-injected configuration.
 #[pyclass(unsendable)]
@@ -200,15 +199,6 @@ pub(crate) fn build_project_graph(
     show_progress: bool,
 ) -> PyResult<BuildOutputs> {
     let timing = std::env::var_os("DEAD_CST_TIMING").is_some();
-    let mut builder = GraphBuilder::new();
-    let mut global_index: DeclIndex = HashMap::new();
-    let mut module_nodes: HashMap<File, usize> = HashMap::new();
-    let mut alias_imports: HashMap<usize, ImportSpec> = HashMap::new();
-    let mut live_decls: LiveDeclIndex = HashMap::new();
-    let mut globals_by_name: GlobalsByName = HashMap::new();
-    let mut star_reexports: StarReexports = HashMap::new();
-    let mut class_by_selection: HashMap<(File, (u32, u32)), usize> = HashMap::new();
-    let mut decl_by_name_range: HashMap<(File, (u32, u32)), usize> = HashMap::new();
 
     let t0 = std::time::Instant::now();
     let project_files: Vec<File> = (&db.project().files(db)).into_iter().collect();
@@ -216,12 +206,11 @@ pub(crate) fn build_project_graph(
     for &file in &project_files {
         path_to_file.insert(file_path_string(db, file), file);
     }
-    // Peer ``.pyi`` files: register the ``.pyi -> .py twin`` mapping
-    // so import resolution can fall back when the stub lookup misses
-    // and so ``file_default_flags`` can tell peer .pyi (decls reach
-    // their runtime via the fallback) from stub-only .pyi (decls
-    // need an artificial ENTRYPOINT to stay alive — native extension
-    // stubs and protobuf-style _pb2.pyi shapes).
+    // Peer ``.pyi`` <-> ``.py`` twin map. Used at assembly time for
+    // ``pyi_decl -> py_decl`` reachability edges + the stub-only
+    // ENTRYPOINT flag fixup (.pyi decls without a runtime twin need
+    // ENTRYPOINT so native-extension / protobuf-style stubs stay
+    // alive even with no consumer reference).
     let py_files_by_stem: HashMap<String, File> = project_files
         .iter()
         .filter_map(|&f| {
@@ -230,16 +219,16 @@ pub(crate) fn build_project_graph(
                 .map(|stem| (stem.to_string(), f))
         })
         .collect();
+    let mut peer_pyi_to_py: HashMap<File, File> = HashMap::new();
     for &f in &project_files {
         let path = file_path_string(db, f);
         if let Some(stem) = path.strip_suffix(".pyi") {
             if let Some(&py_twin) = py_files_by_stem.get(stem) {
-                builder.peer_pyi_to_py.insert(f, py_twin);
+                peer_pyi_to_py.insert(f, py_twin);
             }
         }
     }
     let t_enum = t0.elapsed();
-    let site_packages = crate::ingest::site_packages_roots(db);
 
     let progress = ProgressBars::new(show_progress, project_files.len() as u64);
 
@@ -275,187 +264,348 @@ pub(crate) fn build_project_graph(
     }
     let t_prewarm = t_warm.elapsed();
 
-    // Phase 1 overlaps with the env-independent ``dist_lookup`` walk
-    // on a worker thread. The scope only borrows ``site_packages``,
-    // so the main thread's ``&mut db`` for ingest is fine.
-    let t1 = std::time::Instant::now();
-    let (dist_lookup, t_phase1, t_dist_lookup) = std::thread::scope(|s| -> PyResult<_> {
-        let sp_ref = &site_packages;
-        let lookup_handle = s.spawn(move || {
-            let t = std::time::Instant::now();
-            (build_dist_lookup(sp_ref), t.elapsed())
-        });
-
-        // Two-pass ingest: ``.py`` before ``.pyi`` so the per-decl
-        // peer-stub probe in ``ingest_decls`` sees the .py twin's
-        // ``globals_by_name`` entries before the .pyi is ingested.
-        for file in &project_files {
-            if file_path_string(db, *file).ends_with(".pyi") {
-                continue;
-            }
-            ingest_decls(
-                py,
-                db,
-                *file,
-                &mut builder,
-                &mut global_index,
-                &mut module_nodes,
-                &mut alias_imports,
-                &mut live_decls,
-                &mut globals_by_name,
-                &mut star_reexports,
-                &mut class_by_selection,
-                &mut decl_by_name_range,
-            )?;
-            progress.ingest.inc(1);
-        }
-        for file in &project_files {
-            if !file_path_string(db, *file).ends_with(".pyi") {
-                continue;
-            }
-            ingest_decls(
-                py,
-                db,
-                *file,
-                &mut builder,
-                &mut global_index,
-                &mut module_nodes,
-                &mut alias_imports,
-                &mut live_decls,
-                &mut globals_by_name,
-                &mut star_reexports,
-                &mut class_by_selection,
-                &mut decl_by_name_range,
-            )?;
-            progress.ingest.inc(1);
-        }
-        progress.ingest.finish_and_clear();
-        // Peer-stub ``pyi_decl -> py_decl`` edges document the
-        // stub-runtime relationship so consumers ty resolved through
-        // the stub reach the runtime decl via
-        // ``alias -> pyi_decl -> py_decl``.
-        let peer_stubs: Vec<(File, File)> = builder
-            .peer_pyi_to_py
-            .iter()
-            .map(|(&pyi, &py)| (pyi, py))
-            .collect();
-        for (pyi_file, py_twin) in peer_stubs {
-            let pyi_decls: Vec<(String, usize)> = globals_by_name
-                .iter()
-                .filter(|((file, _), _)| *file == pyi_file)
-                .flat_map(|((_, name), idxs)| idxs.iter().map(move |&idx| (name.clone(), idx)))
-                .collect();
-            for (name, pyi_idx) in pyi_decls {
-                if let Some(py_idxs) = globals_by_name.get(&(py_twin, name)) {
-                    for &py_idx in py_idxs {
-                        builder.add_edge(pyi_idx, py_idx, 0);
-                    }
+    // Parallel pre-populate: run file_to_nodes, file_to_edges, and
+    // file_to_ref_edges as #[salsa::tracked] queries across all
+    // project files. Workers are pure-rust (GIL released via
+    // py.allow_threads). Each chunk attaches a cloned db so salsa's
+    // tracked-fn machinery can do lock-free coordination — same
+    // pattern as prewarm above. The salsa cache is populated for the
+    // serial assembly pass below; nothing here directly mutates the
+    // graph builder.
+    //
+    // project_dist_lookup is also populated here on its own thread.
+    // The old pipeline overlapped build_dist_lookup with phase 1; we
+    // do the same so the first per-file worker that needs it (for
+    // PEP 503 canonical [external dist] X classification) hits a
+    // warm salsa cache instead of paying the ~100ms walk inline.
+    let t_populate = std::time::Instant::now();
+    {
+        let parent_db: ProjectDatabase = db.clone();
+        let dist_db: ProjectDatabase = db.clone();
+        let files_ref: &[File] = &project_files;
+        let num_workers = std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(4);
+        let chunk_size = files_ref.len().div_ceil(num_workers).max(1);
+        py.allow_threads(move || {
+            std::thread::scope(|s| {
+                // dist_lookup on its own thread — overlapped with
+                // the file_to_* work below.
+                s.spawn(move || {
+                    use salsa::Database as _;
+                    dist_db.attach(|local_db| {
+                        let _ = crate::file_payload::project_dist_lookup(local_db);
+                    });
+                });
+                for chunk in files_ref.chunks(chunk_size) {
+                    let local_db = parent_db.clone();
+                    s.spawn(move || {
+                        use salsa::Database as _;
+                        local_db.attach(|local_db| {
+                            for &file in chunk {
+                                let _ = file_to_nodes(local_db, file);
+                                let _ = file_to_edges(local_db, file);
+                                let _ = file_to_ref_edges(local_db, file);
+                            }
+                        });
+                    });
                 }
-            }
-        }
-        let t_phase1 = t1.elapsed();
-        let (lookup, t_dist) = lookup_handle.join().expect("dist_lookup thread panicked");
-        Ok((lookup, t_phase1, t_dist))
-    })?;
-    let t2 = std::time::Instant::now();
-    for file in &project_files {
-        emit_module_hierarchy(db, *file, &module_nodes, &mut builder);
-        emit_import_edges(
-            py,
-            db,
-            *file,
-            &mut builder,
-            &mut global_index,
-            &mut module_nodes,
-            &globals_by_name,
-            &star_reexports,
-            &dist_lookup,
-        )?;
-        progress.imports.inc(1);
+            });
+        });
     }
+    let t_populate_elapsed = t_populate.elapsed();
+    progress.ingest.finish_and_clear();
     progress.imports.finish_and_clear();
-    let t_phase2 = t2.elapsed();
-    let t3 = std::time::Instant::now();
-    // Phase 3 is read-only over ``db`` + the per-build indices and
-    // structurally parallelizable. Two pieces are needed before
-    // spawning workers actually wins:
-    //
-    // 1. Each worker must wrap its body in ``salsa::Database::attach``
-    //    so its snapshot db lands in salsa's thread-local storage.
-    //    Without that, calls to salsa-tracked queries from a fresh
-    //    thread deadlock waiting on TLS context that never arrives.
-    //
-    // 2. Per-file work has to be heavy enough to amortize salsa's
-    //    parallel-coordination locks. ty's ``check_file_impl`` is
-    //    itself ``#[salsa::tracked]``, which is what makes ty's
-    //    check parallelize well -- the lock-coordination is
-    //    rolled into salsa's query machinery, and per-file work
-    //    is ~200ms (full type-check). Our per-file ref-collect is
-    //    ~1ms; even with ``attach``, the salsa locks dominate when
-    //    several workers contend on the same queries, and parallel
-    //    becomes slower than sequential.
-    //
-    // Path to actual parallel speedup: make the per-file ref-collect
-    // a ``#[salsa::tracked]`` function (so salsa owns the parallel
-    // coordination). That requires splitting the function so its
-    // inputs are db+File only -- the per-build indices the current
-    // version reads would need to be either ``salsa::Input`` types or
-    // resolved after the tracked phase returns.
-    let synthetic_nodes = std::mem::take(&mut builder.synthetic_nodes);
-    let mut edge_batches: Vec<Vec<(usize, usize, u32)>> = Vec::with_capacity(project_files.len());
-    for &file in &project_files {
-        let edges = crate::ingest::collect_reference_edges(
-            db,
-            file,
-            &global_index,
-            &module_nodes,
-            &alias_imports,
-            &live_decls,
-            &synthetic_nodes,
-            &dist_lookup,
-        );
-        edge_batches.push(edges);
-        progress.references.inc(1);
-    }
-    builder.synthetic_nodes = synthetic_nodes;
-    for batch in edge_batches {
-        for (src, dst, flags) in batch {
-            builder.add_edge(src, dst, flags);
-        }
-    }
     progress.references.finish_and_clear();
-    let t_phase3 = t3.elapsed();
+
+    // Serial assembly pass: walk files in deterministic order,
+    // assign global graph node indices to each NodeRef, translate
+    // edges, mint synthetic External nodes, build Py<SymbolNode>
+    // wrappers, flush warnings. All salsa-tracked queries are
+    // memoized from the parallel pre-populate above so this pass
+    // is pure hashmap/index work plus the GIL-bound Py creation.
+    let t_assemble = std::time::Instant::now();
+    let assembled = assemble_graph(py, db, &project_files, &peer_pyi_to_py)?;
+    let t_assemble_elapsed = t_assemble.elapsed();
+
+    let mut builder = assembled.builder;
+    let global_index = assembled.global_index;
+    let module_nodes_by_file = assembled.module_nodes_by_file;
+    let class_by_selection = assembled.class_by_selection;
+    let decl_by_name_range = assembled.decl_by_name_range;
+
     let t4 = std::time::Instant::now();
     let (decl_by_fqname, module_by_fqname, imports_by_module) = build_fqname_indices(py, &builder);
     let t_fqname = t4.elapsed();
     if timing {
         eprintln!(
-            "[dead-cst-timing] files={} nodes={} edges={} enum={:?} prewarm={:?} phase1={:?} dist_lookup={:?} phase2={:?} phase3={:?} fqname={:?} total={:?}",
+            "[dead-cst-timing] files={} nodes={} edges={} enum={:?} prewarm={:?} populate={:?} assemble={:?} fqname={:?} total={:?}",
             project_files.len(),
             builder.nodes.len(),
             builder.edges.len(),
             t_enum,
             t_prewarm,
-            t_phase1,
-            t_dist_lookup,
-            t_phase2,
-            t_phase3,
+            t_populate_elapsed,
+            t_assemble_elapsed,
             t_fqname,
             t0.elapsed(),
         );
     }
+    builder.peer_pyi_to_py = peer_pyi_to_py;
     Ok(BuildOutputs {
         builder,
         project_files,
         global_index,
         path_to_file,
         class_by_selection,
-        module_nodes_by_file: module_nodes,
+        module_nodes_by_file,
         decl_by_name_range,
         decl_by_fqname,
         module_by_fqname,
         imports_by_module,
     })
+}
+
+/// Output of the [`assemble_graph`] pass. The fields are exactly the
+/// pieces of `BuildOutputs` that the assembly pass computes from the
+/// salsa-tracked per-file payloads; the driver adds `project_files`,
+/// `path_to_file`, and the fqname indices.
+struct AssembledGraph {
+    builder: GraphBuilder,
+    global_index: DeclIndex,
+    module_nodes_by_file: HashMap<File, usize>,
+    class_by_selection: HashMap<(File, (u32, u32)), usize>,
+    decl_by_name_range: HashMap<(File, (u32, u32)), usize>,
+}
+
+/// Serial pass that converts the salsa-tracked per-file payloads
+/// (`file_to_nodes` / `file_to_edges` / `file_to_ref_edges`) into a
+/// fully-populated `GraphBuilder`.
+///
+/// Three sub-passes:
+///
+/// 1. **Node mint** — walk `project_files` in order, intern each
+///    file's payload `NodeData` into the builder. Build the
+///    `NodeRef -> global_idx` map and the assorted secondary
+///    indices (`global_index`, `module_nodes_by_file`,
+///    `class_by_selection`, `decl_by_name_range`). Apply the
+///    stub-only `ENTRYPOINT` flag fixup for `.pyi` decls whose
+///    runtime twin doesn't expose the same name.
+///
+/// 2. **Edge translation** — walk each file's `FileEdges` and
+///    `FileRefEdges`, translate every `NodeRef` to its `usize`
+///    index via the map. Synthetic External nodes get lazily
+///    minted as encountered. Edges whose endpoint isn't recognised
+///    (e.g. a Definition in a non-project file that ty's resolver
+///    reached but we didn't enumerate) silently drop.
+///
+/// 3. **Peer .pyi/.py edges** — for each peer pair, walk both
+///    files' `exports_by_name` and emit `pyi_decl -> py_decl`
+///    edges for any name present in both.
+///
+/// Warnings buffered in each `FileRefEdges.warnings` are flushed to
+/// the `dead_cst._visitor` Python logger at the end — once per
+/// warning, on the main thread, with the GIL we already hold.
+fn assemble_graph<'db>(
+    py: Python<'_>,
+    db: &'db ProjectDatabase,
+    project_files: &[File],
+    peer_pyi_to_py: &HashMap<File, File>,
+) -> PyResult<AssembledGraph> {
+    let mut builder = GraphBuilder::new();
+    let mut global_index: DeclIndex = HashMap::new();
+    let mut module_nodes_by_file: HashMap<File, usize> = HashMap::new();
+    let mut class_by_selection: HashMap<(File, (u32, u32)), usize> = HashMap::new();
+    let mut decl_by_name_range: HashMap<(File, (u32, u32)), usize> = HashMap::new();
+    let mut ref_to_global: FxHashMap<NodeRef<'db>, usize> = FxHashMap::default();
+    let mut all_warnings: Vec<String> = Vec::new();
+
+    // Pass 1: node mint.
+    for &file in project_files {
+        let payload = file_to_nodes(db, file);
+        let parsed = parsed_module(db, file).load(db);
+
+        // Stub-only ENTRYPOINT context: if this is a .pyi without a
+        // .py twin, every decl needs ENTRYPOINT. If it has a twin,
+        // only decls whose name isn't in the twin's exports need it.
+        let path_str = file_path_string(db, file);
+        let is_stub = path_str.ends_with(".pyi");
+        let stub_twin: Option<File> = if is_stub {
+            peer_pyi_to_py.get(&file).copied()
+        } else {
+            None
+        };
+
+        for (local_idx, &node_ref) in payload.refs.iter().enumerate() {
+            let node_data = &payload.nodes[local_idx];
+
+            // Apply stub-only ENTRYPOINT flag if needed.
+            let mut flags = node_data.flags;
+            if is_stub && matches!(node_ref, NodeRef::Def(_)) {
+                let has_runtime = match stub_twin {
+                    Some(py_file) => {
+                        let py_payload = file_to_nodes(db, py_file);
+                        let name = node_data.fqname.rsplit('.').next().unwrap_or("");
+                        py_payload.exports_by_name.contains_key(name)
+                    }
+                    None => false,
+                };
+                if !has_runtime {
+                    flags |= NODE_FLAG_ENTRYPOINT;
+                }
+            }
+
+            let imports = node_data
+                .imports
+                .as_ref()
+                .map(|ip| {
+                    Py::new(
+                        py,
+                        Import {
+                            module: ip.module.clone(),
+                            decl: ip.decl.clone(),
+                            star: ip.star,
+                        },
+                    )
+                })
+                .transpose()?;
+
+            let symbol = SymbolNode {
+                fqname: node_data.fqname.clone(),
+                kind: intern_kind(node_data.kind.as_static_str())?,
+                path: node_data.path.clone(),
+                start_line: node_data.start_line,
+                start_column: node_data.start_column,
+                end_line: node_data.end_line,
+                end_column: node_data.end_column,
+                flags,
+                imports,
+                cached_hash: StdOnceLock::new(),
+            };
+            let global_idx = builder.intern_node(py, symbol)?;
+            ref_to_global.insert(node_ref, global_idx);
+
+            match node_ref {
+                NodeRef::Module(_) => {
+                    module_nodes_by_file.insert(file, global_idx);
+                }
+                NodeRef::Def(d) => {
+                    let place_id = d.place(db);
+                    let kind = d.kind(db);
+                    let tr = kind.target_range(&parsed);
+                    let rk = (tr.start().to_u32(), tr.end().to_u32());
+                    global_index.insert((file, place_id, rk), global_idx);
+                    if matches!(node_data.kind, NodeKind::Class) {
+                        class_by_selection.insert((file, rk), global_idx);
+                    }
+                    decl_by_name_range.insert((file, rk), global_idx);
+                }
+                NodeRef::External(_) => {
+                    // External NodeRefs never appear in FileNodes.refs;
+                    // they're only emitted as edge endpoints. This
+                    // branch is unreachable in practice but kept
+                    // exhaustive so a future variant addition fails
+                    // loudly instead of silently dropping.
+                }
+            }
+        }
+    }
+
+    // Pass 2: edge translation. Skip edges with unrecognized
+    // endpoints — those reference Definitions in non-project files.
+    for &file in project_files {
+        let edges_payload = file_to_edges(db, file);
+        for &(src, dst, flags) in &edges_payload.edges {
+            let Some(src_idx) = lookup_or_mint_ref(py, db, &mut builder, &mut ref_to_global, src)?
+            else {
+                continue;
+            };
+            let Some(dst_idx) = lookup_or_mint_ref(py, db, &mut builder, &mut ref_to_global, dst)?
+            else {
+                continue;
+            };
+            builder.add_edge(src_idx, dst_idx, flags);
+        }
+
+        let ref_edges_payload = file_to_ref_edges(db, file);
+        for &(src, dst, flags) in &ref_edges_payload.edges {
+            let Some(src_idx) = lookup_or_mint_ref(py, db, &mut builder, &mut ref_to_global, src)?
+            else {
+                continue;
+            };
+            let Some(dst_idx) = lookup_or_mint_ref(py, db, &mut builder, &mut ref_to_global, dst)?
+            else {
+                continue;
+            };
+            builder.add_edge(src_idx, dst_idx, flags);
+        }
+        all_warnings.extend(ref_edges_payload.warnings.iter().cloned());
+    }
+
+    // Pass 3: peer .pyi/.py reachability edges.
+    for (&pyi_file, &py_twin) in peer_pyi_to_py {
+        let pyi_payload = file_to_nodes(db, pyi_file);
+        let py_payload = file_to_nodes(db, py_twin);
+        for (name, pyi_locals) in &pyi_payload.exports_by_name {
+            let Some(py_locals) = py_payload.exports_by_name.get(name) else {
+                continue;
+            };
+            for &pyi_local in pyi_locals {
+                let pyi_ref = pyi_payload.refs[pyi_local as usize];
+                let Some(&pyi_idx) = ref_to_global.get(&pyi_ref) else {
+                    continue;
+                };
+                for &py_local in py_locals {
+                    let py_ref = py_payload.refs[py_local as usize];
+                    let Some(&py_idx) = ref_to_global.get(&py_ref) else {
+                        continue;
+                    };
+                    builder.add_edge(pyi_idx, py_idx, 0);
+                }
+            }
+        }
+    }
+
+    // Flush warnings to Python logger from the main thread (we hold
+    // the GIL here; workers don't).
+    for msg in &all_warnings {
+        emit_visitor_warning(py, msg);
+    }
+
+    Ok(AssembledGraph {
+        builder,
+        global_index,
+        module_nodes_by_file,
+        class_by_selection,
+        decl_by_name_range,
+    })
+}
+
+/// Translate a `NodeRef` into its global graph index. For `Def` /
+/// `Module` already-minted nodes, this is a hashmap probe. For
+/// `External`, lazily mint the synthetic node via the builder.
+/// Returns `Ok(None)` when the NodeRef is a `Def`/`Module` whose
+/// owning file wasn't enumerated (cross-project edge endpoint that
+/// ty resolved past the project boundary).
+fn lookup_or_mint_ref<'db>(
+    py: Python<'_>,
+    db: &'db ProjectDatabase,
+    builder: &mut GraphBuilder,
+    ref_to_global: &mut FxHashMap<NodeRef<'db>, usize>,
+    r: NodeRef<'db>,
+) -> PyResult<Option<usize>> {
+    if let Some(&idx) = ref_to_global.get(&r) {
+        return Ok(Some(idx));
+    }
+    match r {
+        NodeRef::External(key) => {
+            let fqname = key.fqname(db).clone();
+            let idx = builder.intern_synthetic(py, fqname)?;
+            ref_to_global.insert(r, idx);
+            Ok(Some(idx))
+        }
+        _ => Ok(None),
+    }
 }
 
 /// Pre-build the fqname -> idx maps used by ``find_declarations``,

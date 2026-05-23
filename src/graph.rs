@@ -254,74 +254,10 @@ pub(crate) type DeclKey = (File, ScopedPlaceId, (u32, u32));
 
 pub(crate) type DeclIndex = HashMap<DeclKey, usize>;
 
-/// Cloneable snapshot of an alias's import payload.
-///
-/// Lives in `alias_imports` (alias_node_idx -> spec) so the reference
-/// collector can emit *parallel reachability edges* through an alias
-/// without holding a PyO3 reference. Mirrors `Import`'s three fields.
-#[derive(Clone, Debug)]
-pub(crate) struct ImportSpec {
-    pub(crate) module: String,
-    pub(crate) decl: Option<String>,
-    pub(crate) star: bool,
-}
-
-/// (upstream_file, local_decl_name) -> upstream decl node idx.
-///
-/// Populated during `ingest_decls` for every non-import, non-module
-/// node. The value is a `Vec` so branch-bound names (try/except,
-/// if/else where both branches assign) keep every live binding;
-/// sequentially-rebound names collapse to the latest via the
-/// post-pass that populates this from ty's
-/// `end_of_scope_symbol_bindings`. Mirrors how the libcst pipeline's
-/// trie excludes `SHADOWED` decls but keeps multi-branch ones.
-pub(crate) type LiveDeclIndex = HashMap<(File, String), Vec<usize>>;
-
-/// (file, name) -> idx of *any* live module-scope binding, decl or
-/// import alias. Last-write-wins like `LiveDeclIndex`.
-///
-/// Used by `resolve_from_imported` so it can shortcut ty's full
-/// `definitions_for_imported_symbol` walk (which recursively chases
-/// alias chains across files) into a single hashmap probe.
-///
-/// The value is a `Vec` so that branch-bound names (try/except, if/else
-/// where both branches assign) keep every live binding instead of
-/// the last-write only. A cross-module `from lib import f` then
-/// resolves to every reaching def of `f` in `lib`, matching the
-/// libcst pipeline's `SHADOWED`-excluding trie merge over multiple
-/// bindings.
-pub(crate) type GlobalsByName = HashMap<(File, String), Vec<usize>>;
-
-/// (file, name) -> upstream module name when `name` in `file` is bound
-/// by `from <upstream> import *`. Populated alongside `GlobalsByName`
-/// during Phase 1.
-///
-/// Lets `resolve_from_imported` walk a star-reexport chain
-/// `A → B → C` and emit `consumer → C.g` directly when `from A import g`
-/// resolves through the chain, matching the libcst pipeline's
-/// fixed-point trie merge. Cycle-safe via a `seen` set in the caller.
-pub(crate) type StarReexports = HashMap<(File, String), String>;
-
 /// Return type of `ProjectContext.find_main_blocks`: one entry per
 /// file with a top-level ``if __name__ == "__main__":`` block, paired
 /// with the decls that fall inside it.
 pub(crate) type MainBlock = (Py<SymbolNode>, Vec<Py<SymbolNode>>);
-
-/// Outcome of resolving a `Name` use to its reaching definition.
-///
-/// `Alias` is the module-scope path: the use has a local graph node
-/// (an import alias or a top-level decl) that takes the in-edge.
-/// `NestedImport` is the function-/class-scope path: ty saw an import
-/// binding in a non-global scope, so no graph node was minted, and
-/// the use's parallel upstream edges flow from the enclosing top-level
-/// owner instead.
-pub(crate) enum Resolution {
-    Alias(usize),
-    NestedImport {
-        spec: ImportSpec,
-        bound_name: String,
-    },
-}
 
 /// Bit values stamped into [`SymbolNode::flags`]. Mirrors
 /// `dead_cst.graph.NodeFlags` exactly so plugin code can mix
