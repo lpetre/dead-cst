@@ -238,8 +238,15 @@ pub(crate) fn build_project_graph(
     // the parallel coordination (lock-free fast paths, not the
     // parking_lot contention plain-Rust callers hit). After this,
     // phase 1's serial ``ingest_decls`` loop hits warm caches.
+    //
+    // DEAD_CST_SKIP_PREWARM=1 disables this so the per-file populate
+    // workers below fault parsed_module + semantic_index in
+    // themselves. Used for the "does prewarm still buy us anything?"
+    // A/B experiment; the populate phase is already parallel, so the
+    // hypothesis is that prewarm is now redundant.
     let t_warm = std::time::Instant::now();
-    {
+    let skip_prewarm = std::env::var_os("DEAD_CST_SKIP_PREWARM").is_some();
+    if !skip_prewarm {
         let parent_db: ProjectDatabase = db.clone();
         let files_ref: &[File] = &project_files;
         let num_workers = std::thread::available_parallelism()
@@ -339,7 +346,7 @@ pub(crate) fn build_project_graph(
     let t_fqname = t4.elapsed();
     if timing {
         eprintln!(
-            "[dead-cst-timing] files={} nodes={} edges={} enum={:?} prewarm={:?} populate={:?} assemble={:?} fqname={:?} total={:?}",
+            "[dead-cst-timing] files={} nodes={} edges={} enum={:?} prewarm={:?} populate={:?} assemble={:?} fqname={:?} total={:?} rss={}MB",
             project_files.len(),
             builder.nodes.len(),
             builder.edges.len(),
@@ -349,7 +356,16 @@ pub(crate) fn build_project_graph(
             t_assemble_elapsed,
             t_fqname,
             t0.elapsed(),
+            current_rss_mb(),
         );
+    }
+    if let Some(mode) = std::env::var_os("DEAD_CST_DUMP_HEAP") {
+        let dump = db.salsa_memory_dump();
+        if mode == "full" {
+            eprintln!("{}", dump.display_full());
+        } else {
+            eprintln!("{}", dump.display_short());
+        }
     }
     builder.peer_pyi_to_py = peer_pyi_to_py;
     Ok(BuildOutputs {
@@ -364,6 +380,23 @@ pub(crate) fn build_project_graph(
         module_by_fqname,
         imports_by_module,
     })
+}
+
+/// Read VmRSS from /proc/self/status. Returns 0 on non-Linux or on
+/// parse failure. Used by the timing dump for a cheap "what's the
+/// resident set after the build" signal without needing
+/// /usr/bin/time or external sampling.
+fn current_rss_mb() -> usize {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("VmRSS:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|n| n.parse::<usize>().ok())
+        })
+        .map(|kb| kb / 1024)
+        .unwrap_or(0)
 }
 
 /// Output of the [`assemble_graph`] pass. The fields are exactly the
