@@ -25,7 +25,6 @@ These tests pin the two endpoints of the fix from #222:
 
 from __future__ import annotations
 
-from pathlib import Path
 
 from dead_cst import Analysis
 
