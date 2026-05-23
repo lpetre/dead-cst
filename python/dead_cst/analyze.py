@@ -62,9 +62,8 @@ class Analysis:
         self._plugins: tuple[Plugin, ...] = tuple(plugins)
         self._show_progress: bool = show_progress
         # Buffered until ``materialize_all`` constructs the ctx.
-        # ``None`` means "use the rust-side default" (32 MiB at the
-        # time of writing — see ``DEFAULT_RAYON_STACK_SIZE`` in the
-        # rust crate).
+        # ``None`` means "no override" — the rust side uses rayon's
+        # global pool with rayon's own default stack.
         self._stack_size: int | None = None
         # Held past ``materialize_all`` so the rust BFS queries
         # (:meth:`reachable`, :meth:`dead`, :meth:`descendants`,
@@ -78,10 +77,13 @@ class Analysis:
         after the graph is materialized have no effect on the
         already-built graph.
 
-        Defaults to 32 MiB on the rust side, which is generous for
-        typical Python code. Raise this if you see a stack overflow
-        on deeply-nested generated code (e.g. protobuf modules,
-        ML-generated ASTs, or large nested literal dicts) — the
+        With no override set, the populate phase uses rayon's global
+        pool with rayon's own default stack (2 MiB unless
+        ``RAYON_STACK_SIZE`` / ``RUST_MIN_STACK`` are set
+        process-wide), which is sufficient for typical Python code.
+        Call this on projects with deeply-nested generated code
+        (e.g. protobuf modules, ML-generated ASTs, or large nested
+        literal dicts) that stack-overflow at the default — the
         declared size is virtual address space on Linux, so going
         much higher costs no resident memory unless actually used.
         """

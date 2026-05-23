@@ -79,7 +79,7 @@ impl Project {
 
     /// Build the project-wide symbol graph (single-pass, no plugins).
     pub(crate) fn build(&mut self, py: Python<'_>) -> PyResult<NativeGraph> {
-        let outputs = build_project_graph(py, &mut self.db, false, DEFAULT_RAYON_STACK_SIZE)?;
+        let outputs = build_project_graph(py, &mut self.db, false, None)?;
         Ok(NativeGraph {
             nodes: outputs.builder.nodes,
             edges: outputs.builder.edges,
@@ -197,7 +197,7 @@ pub(crate) fn build_project_graph(
     py: Python<'_>,
     db: &mut ProjectDatabase,
     show_progress: bool,
-    stack_size: usize,
+    stack_size: Option<usize>,
 ) -> PyResult<BuildOutputs> {
     let timing = std::env::var_os("DEAD_CST_TIMING").is_some();
 
@@ -264,57 +264,60 @@ pub(crate) fn build_project_graph(
         // is Send-but-not-Sync so a shared db can't cross task
         // boundaries — channel transfer is the closest match.
         //
-        // Custom rayon pool with a larger stack: the default 2MB
-        // overflows on deeply-nested generated code (protobuf
-        // modules, big literal dicts, long star-reexport chains).
-        // See `rayon_worker_stack_size` for the resolution order
-        // (DEAD_CST_STACK_SIZE > RUST_MIN_STACK > 32MB default).
-        // The declared size is virtual address space — Linux
-        // commits stack pages lazily, so 32MB × N workers costs no
-        // resident memory until a worker actually recurses into
-        // those pages.
+        // When `stack_size` is `Some`, build a local rayon pool
+        // with that stack size and run the work inside `install`.
+        // Otherwise use the global rayon pool — rayon's default
+        // stack (2 MiB) is sufficient for typical Python code;
+        // callers with deeply-nested generated code call
+        // `ProjectContext.set_stack_size` to opt in to a bigger
+        // stack. Linux commits stack pages lazily, so the declared
+        // size is virtual address space, not resident memory.
         let num_workers = std::thread::available_parallelism()
             .map(std::num::NonZeroUsize::get)
             .unwrap_or(4);
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(num_workers)
-            .stack_size(stack_size)
-            .build()
-            .expect("build rayon thread pool");
         let (db_tx, db_rx) = crossbeam_channel::bounded::<ProjectDatabase>(num_workers);
         for _ in 0..num_workers {
             db_tx.send(db.clone()).expect("channel open");
         }
-        // dist_lookup ALSO runs inside pool.install so its
-        // par_extend sub-tasks land on the custom-stack workers
-        // (otherwise they'd hit rayon's global pool with the
-        // default stack). Serialized before the rayon::scope below
-        // to avoid the "Cannot change database mid-query" salsa
-        // panic — see the prior commit's message for the hazard.
+        // dist_lookup runs inside the same pool (custom or global)
+        // so its par_extend sub-tasks share that pool's workers,
+        // not stray onto unrelated rayon usage. Serialized before
+        // the rayon::scope below to avoid the "Cannot change
+        // database mid-query" salsa panic — see the prior PR's
+        // commit message for the hazard.
         let dist_db: ProjectDatabase = db.clone();
         let files_ref: &[File] = &project_files;
-        py.allow_threads(move || {
-            pool.install(move || {
-                use salsa::Database as _;
-                dist_db.attach(|local_db| {
-                    let _ = crate::file_payload::project_dist_lookup(local_db);
-                });
-                rayon::scope(|s| {
-                    for &file in files_ref {
-                        let db_tx = db_tx.clone();
-                        let db_rx = db_rx.clone();
-                        s.spawn(move |_| {
-                            let local_db = db_rx.recv().expect("snapshot available");
-                            local_db.attach(|local_db| {
-                                let _ = file_to_nodes(local_db, file);
-                                let _ = file_to_edges(local_db, file);
-                                let _ = file_to_ref_edges(local_db, file);
-                            });
-                            db_tx.send(local_db).expect("channel open");
-                        });
-                    }
-                });
+        let run_populate = move || {
+            use salsa::Database as _;
+            dist_db.attach(|local_db| {
+                let _ = crate::file_payload::project_dist_lookup(local_db);
             });
+            rayon::scope(|s| {
+                for &file in files_ref {
+                    let db_tx = db_tx.clone();
+                    let db_rx = db_rx.clone();
+                    s.spawn(move |_| {
+                        let local_db = db_rx.recv().expect("snapshot available");
+                        local_db.attach(|local_db| {
+                            let _ = file_to_nodes(local_db, file);
+                            let _ = file_to_edges(local_db, file);
+                            let _ = file_to_ref_edges(local_db, file);
+                        });
+                        db_tx.send(local_db).expect("channel open");
+                    });
+                }
+            });
+        };
+        py.allow_threads(move || match stack_size {
+            Some(n) => {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(num_workers)
+                    .stack_size(n)
+                    .build()
+                    .expect("build rayon thread pool");
+                pool.install(run_populate);
+            }
+            None => run_populate(),
         });
     }
     let t_populate_elapsed = t_populate.elapsed();
@@ -377,16 +380,6 @@ pub(crate) fn build_project_graph(
         imports_by_module,
     })
 }
-
-/// Default rayon worker stack size for the populate phase, in bytes.
-/// 32 MiB covers ~32k recursive frames at ~1 KB/frame — well past
-/// any AST CPython can parse (default recursion limit is 1000) and
-/// generous headroom for auto-generated protobuf, ML-generated
-/// code, etc. Linux commits stack pages lazily, so the declared
-/// size is virtual address space, not resident memory.
-///
-/// Override per-build via [`ProjectContext::set_stack_size`].
-pub(crate) const DEFAULT_RAYON_STACK_SIZE: usize = 32 * 1024 * 1024;
 
 /// Read VmRSS from /proc/self/status. Returns 0 on non-Linux or on
 /// parse failure. Used by the timing dump for a cheap "what's the
@@ -726,14 +719,15 @@ pub(crate) struct ProjectContext {
     /// When true, ``materialize`` and ``build_project_graph`` draw
     /// indicatif progress bars to stderr.
     pub(crate) show_progress: bool,
-    /// Stack size (bytes) for the rayon workers that run the
-    /// per-file populate phase. Defaults to
-    /// [`DEFAULT_RAYON_STACK_SIZE`] (32 MiB); override via
-    /// [`Self::set_stack_size`] before calling `materialize`.
-    /// Sized for deeply-nested generated code (protobuf modules,
-    /// long star-reexport chains) where rayon's default 2 MiB
-    /// stack has been observed to overflow on large repos.
-    pub(crate) stack_size: usize,
+    /// Optional override for the rayon worker stack size (bytes)
+    /// used by the populate phase. `None` (the default) uses the
+    /// global rayon pool, which honours rayon's own size (2 MiB
+    /// unless `RAYON_STACK_SIZE` / `RUST_MIN_STACK` are set in the
+    /// process env). `Some(n)` builds a local pool with stack_size
+    /// `n`. Set via [`Self::set_stack_size`] for projects with
+    /// deeply-nested generated code (protobuf modules, long
+    /// star-reexport chains) that overflow the default.
+    pub(crate) stack_size: Option<usize>,
 }
 
 #[pymethods]
@@ -767,7 +761,7 @@ impl ProjectContext {
             outputs: RefCell::new(None),
             regex_cache: RefCell::new(HashMap::new()),
             show_progress,
-            stack_size: DEFAULT_RAYON_STACK_SIZE,
+            stack_size: None,
         })
     }
 
@@ -779,26 +773,27 @@ impl ProjectContext {
 
     /// Override the rayon worker stack size (bytes) used by the
     /// populate phase. Call BEFORE `materialize`; later calls don't
-    /// affect a build already in progress. Useful for projects with
+    /// affect a build already in progress. By default no override
+    /// is set — populate runs on rayon's global pool with rayon's
+    /// own default stack (2 MiB). Set this on projects with
     /// deeply-nested generated code (protobuf modules, ML-generated
-    /// asts) where rayon's default 2 MiB stack — or our 32 MiB
-    /// default — isn't enough. Passing 0 is invalid and raises
-    /// ValueError.
+    /// ASTs, big literal dicts) that overflow the default. Passing
+    /// 0 is invalid and raises ValueError.
     pub(crate) fn set_stack_size(&mut self, bytes: usize) -> PyResult<()> {
         if bytes == 0 {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "stack_size must be > 0",
             ));
         }
-        self.stack_size = bytes;
+        self.stack_size = Some(bytes);
         Ok(())
     }
 
-    /// Current rayon worker stack size (bytes). Defaults to 32 MiB
-    /// (see [`DEFAULT_RAYON_STACK_SIZE`]); can be raised or lowered
-    /// via [`Self::set_stack_size`].
+    /// Current rayon worker stack size override in bytes, or `None`
+    /// if no override is set (in which case the populate phase uses
+    /// rayon's global pool with its own default stack).
     #[getter]
-    pub(crate) fn stack_size(&self) -> usize {
+    pub(crate) fn stack_size(&self) -> Option<usize> {
         self.stack_size
     }
 
