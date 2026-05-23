@@ -9,6 +9,14 @@ two versions.
 
 ## [Unreleased]
 
+### Fixed
+- `build_scope_table` (dead-branch detector) no longer livelocks on
+  scopes that rebind an inherited name to a flipped version of itself
+  — e.g. a function whose body is `global foo; foo = not foo` when
+  the enclosing module has `foo = False`. The fixed-point loop would
+  oscillate the table forever between `True` and `False`; it now
+  poisons such names so they drop out of the table on the first flip.
+
 ## [0.11.0] - 2026-05-20
 
 ### Added
