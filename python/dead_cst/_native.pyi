@@ -306,6 +306,18 @@ class ProjectContext:
         typeshed: str | None = ...,
         show_progress: bool = ...,
     ) -> None: ...
+    @property
+    def stack_size(self) -> int:
+        """Rayon worker stack size (bytes) for the populate phase.
+        Defaults to 32 MiB; override via :meth:`set_stack_size`."""
+
+    def set_stack_size(self, bytes_: int) -> None:
+        """Override the rayon worker stack size (bytes) used by the
+        populate phase. Call BEFORE :meth:`materialize`; calls after
+        the graph is materialized have no effect on the already-
+        built graph. Raises :class:`ValueError` if ``bytes_`` is
+        not positive."""
+
     def add_plugin(self, plugin: _ProjectPluginLike | Any) -> None:
         """Register a plugin. Order of registration is order of
         invocation during :meth:`materialize`."""

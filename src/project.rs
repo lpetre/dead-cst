@@ -79,7 +79,7 @@ impl Project {
 
     /// Build the project-wide symbol graph (single-pass, no plugins).
     pub(crate) fn build(&mut self, py: Python<'_>) -> PyResult<NativeGraph> {
-        let outputs = build_project_graph(py, &mut self.db, false)?;
+        let outputs = build_project_graph(py, &mut self.db, false, DEFAULT_RAYON_STACK_SIZE)?;
         Ok(NativeGraph {
             nodes: outputs.builder.nodes,
             edges: outputs.builder.edges,
@@ -197,6 +197,7 @@ pub(crate) fn build_project_graph(
     py: Python<'_>,
     db: &mut ProjectDatabase,
     show_progress: bool,
+    stack_size: usize,
 ) -> PyResult<BuildOutputs> {
     let timing = std::env::var_os("DEAD_CST_TIMING").is_some();
 
@@ -277,7 +278,7 @@ pub(crate) fn build_project_graph(
             .unwrap_or(4);
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(num_workers)
-            .stack_size(rayon_worker_stack_size())
+            .stack_size(stack_size)
             .build()
             .expect("build rayon thread pool");
         let (db_tx, db_rx) = crossbeam_channel::bounded::<ProjectDatabase>(num_workers);
@@ -377,39 +378,15 @@ pub(crate) fn build_project_graph(
     })
 }
 
-/// Stack size (bytes) for rayon worker threads in the populate-phase
-/// pool. Resolution order:
-///
-/// 1. `DEAD_CST_STACK_SIZE`, if set and parseable as a non-zero
-///    `usize`. Lets users override our default without touching the
-///    process-wide `RUST_MIN_STACK` (which rayon / `std::thread`
-///    also honour, so it can have ripple effects on other code).
-/// 2. `RUST_MIN_STACK`, if set and parseable. Same env var rayon /
-///    `std::thread` already read — picked up so users who've sized
-///    it up for one tool's deep recursion don't get silently capped
-///    by our default.
-/// 3. 32 MiB default.
-///
+/// Default rayon worker stack size for the populate phase, in bytes.
 /// 32 MiB covers ~32k recursive frames at ~1 KB/frame — well past
 /// any AST CPython can parse (default recursion limit is 1000) and
 /// generous headroom for auto-generated protobuf, ML-generated
 /// code, etc. Linux commits stack pages lazily, so the declared
 /// size is virtual address space, not resident memory.
-fn rayon_worker_stack_size() -> usize {
-    const DEFAULT: usize = 32 * 1024 * 1024;
-    if let Some(n) = std::env::var("DEAD_CST_STACK_SIZE")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&n| n > 0)
-    {
-        return n;
-    }
-    std::env::var("RUST_MIN_STACK")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(DEFAULT)
-}
+///
+/// Override per-build via [`ProjectContext::set_stack_size`].
+pub(crate) const DEFAULT_RAYON_STACK_SIZE: usize = 32 * 1024 * 1024;
 
 /// Read VmRSS from /proc/self/status. Returns 0 on non-Linux or on
 /// parse failure. Used by the timing dump for a cheap "what's the
@@ -749,6 +726,14 @@ pub(crate) struct ProjectContext {
     /// When true, ``materialize`` and ``build_project_graph`` draw
     /// indicatif progress bars to stderr.
     pub(crate) show_progress: bool,
+    /// Stack size (bytes) for the rayon workers that run the
+    /// per-file populate phase. Defaults to
+    /// [`DEFAULT_RAYON_STACK_SIZE`] (32 MiB); override via
+    /// [`Self::set_stack_size`] before calling `materialize`.
+    /// Sized for deeply-nested generated code (protobuf modules,
+    /// long star-reexport chains) where rayon's default 2 MiB
+    /// stack has been observed to overflow on large repos.
+    pub(crate) stack_size: usize,
 }
 
 #[pymethods]
@@ -782,6 +767,7 @@ impl ProjectContext {
             outputs: RefCell::new(None),
             regex_cache: RefCell::new(HashMap::new()),
             show_progress,
+            stack_size: DEFAULT_RAYON_STACK_SIZE,
         })
     }
 
@@ -789,6 +775,31 @@ impl ProjectContext {
     #[getter]
     pub(crate) fn project_root(&self) -> &str {
         &self.root
+    }
+
+    /// Override the rayon worker stack size (bytes) used by the
+    /// populate phase. Call BEFORE `materialize`; later calls don't
+    /// affect a build already in progress. Useful for projects with
+    /// deeply-nested generated code (protobuf modules, ML-generated
+    /// asts) where rayon's default 2 MiB stack — or our 32 MiB
+    /// default — isn't enough. Passing 0 is invalid and raises
+    /// ValueError.
+    pub(crate) fn set_stack_size(&mut self, bytes: usize) -> PyResult<()> {
+        if bytes == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "stack_size must be > 0",
+            ));
+        }
+        self.stack_size = bytes;
+        Ok(())
+    }
+
+    /// Current rayon worker stack size (bytes). Defaults to 32 MiB
+    /// (see [`DEFAULT_RAYON_STACK_SIZE`]); can be raised or lowered
+    /// via [`Self::set_stack_size`].
+    #[getter]
+    pub(crate) fn stack_size(&self) -> usize {
+        self.stack_size
     }
 
     /// Register a Python plugin. Order of registration is order of
@@ -815,9 +826,10 @@ impl ProjectContext {
     /// re-enter queries through the same ctx without aliasing violations.
     pub(crate) fn materialize(slf: Py<Self>, py: Python<'_>) -> PyResult<NativeGraph> {
         let show_progress = slf.borrow(py).show_progress;
+        let stack_size = slf.borrow(py).stack_size;
         {
             let mut this = slf.borrow_mut(py);
-            let outputs = build_project_graph(py, &mut this.db, show_progress)?;
+            let outputs = build_project_graph(py, &mut this.db, show_progress, stack_size)?;
             *this.outputs.borrow_mut() = Some(outputs);
         }
 

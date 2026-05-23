@@ -61,11 +61,33 @@ class Analysis:
         self._venv: Path | None = venv
         self._plugins: tuple[Plugin, ...] = tuple(plugins)
         self._show_progress: bool = show_progress
+        # Buffered until ``materialize_all`` constructs the ctx.
+        # ``None`` means "use the rust-side default" (32 MiB at the
+        # time of writing — see ``DEFAULT_RAYON_STACK_SIZE`` in the
+        # rust crate).
+        self._stack_size: int | None = None
         # Held past ``materialize_all`` so the rust BFS queries
         # (:meth:`reachable`, :meth:`dead`, :meth:`descendants`,
         # :meth:`ancestors`) and node/edge enumeration can run against
         # the live context without re-building the project graph.
         self._ctx: native.ProjectContext | None = None
+
+    def set_stack_size(self, bytes_: int) -> None:
+        """Override the rayon worker stack size (bytes) used by the
+        populate phase. Call BEFORE :meth:`materialize_all`; calls
+        after the graph is materialized have no effect on the
+        already-built graph.
+
+        Defaults to 32 MiB on the rust side, which is generous for
+        typical Python code. Raise this if you see a stack overflow
+        on deeply-nested generated code (e.g. protobuf modules,
+        ML-generated ASTs, or large nested literal dicts) — the
+        declared size is virtual address space on Linux, so going
+        much higher costs no resident memory unless actually used.
+        """
+        if bytes_ <= 0:
+            raise ValueError(f"stack_size must be > 0, got {bytes_}")
+        self._stack_size = bytes_
 
     @property
     def project_root(self) -> Path:
@@ -100,6 +122,8 @@ class Analysis:
             python_env=venv_str,
             show_progress=self._show_progress,
         )
+        if self._stack_size is not None:
+            ctx.set_stack_size(self._stack_size)
         for plugin in self._plugins:
             # Catch ``Pluign()`` typos and bare dicts before the rust
             # side silently drops them.
