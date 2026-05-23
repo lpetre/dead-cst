@@ -10,6 +10,19 @@ two versions.
 ## [Unreleased]
 
 ### Fixed
+- `Analysis(..., venv=...)` no longer drops `project_root` from ty's
+  static search paths when a venv is given. The previous suppression
+  relied on `.pth`-derived dynamic paths to cover every first-party
+  package, which failed silently for setuptools' default PEP 660
+  editable install (`__editable__.<dist>.pth` is a finder stub, not a
+  flat path). Every cross-file first-party import resolved to an
+  `[unresolved]` synthetic and the whole graph fell apart — see #222
+  for the `FastAPIPlugin` symptom. `project_root` is now always on
+  the search list; a new specificity-aware reverse module lookup
+  (`helpers::canonical_module_name_for_file`) makes a deeper `.pth`
+  path still win the fqname for files it covers, so monorepo layouts
+  (`packages/lib_a/src/lib_a/`) keep their short `lib_a` fqname
+  instead of regressing to `packages.lib_a.src.lib_a`.
 - `build_scope_table` (dead-branch detector) no longer livelocks on
   scopes that rebind an inherited name to a flipped version of itself
   — e.g. a function whose body is `global foo; foo = not foo` when

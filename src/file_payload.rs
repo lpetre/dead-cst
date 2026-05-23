@@ -29,7 +29,7 @@ use ruff_text_size::TextRange;
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use std::collections::HashMap;
-use ty_module_resolver::{file_to_module, resolve_module, ModuleName};
+use ty_module_resolver::{resolve_module, ModuleName};
 use ty_project::Db as ProjectDb;
 use ty_python_core::definition::{Definition, DefinitionKind, DefinitionState};
 use ty_python_core::place::{PlaceExprRef, ScopedPlaceId};
@@ -835,7 +835,7 @@ pub(crate) fn file_to_edges<'db>(db: &'db dyn ProjectDb, file: File) -> FileEdge
 /// top-level packages (no parent) and for parents that live outside
 /// the project (the cross-file hierarchy edge has nowhere to land).
 fn parent_module_file(db: &dyn ProjectDb, file: File) -> Option<File> {
-    let module = file_to_module(db, file)?;
+    let module = crate::helpers::canonical_module_for_file(db, file)?;
     let parent_name = module.name(db).parent()?;
     let parent_module = resolve_module(db, file, &parent_name)?;
     parent_module.file(db)

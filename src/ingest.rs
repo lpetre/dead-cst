@@ -27,9 +27,7 @@ use pyo3::prelude::*;
 use ruff_db::files::{File, FilePath};
 use ruff_python_ast::{Expr, ExprName, Stmt};
 use ruff_text_size::Ranged;
-use ty_module_resolver::{
-    file_to_module, resolve_module, search_paths, ModuleName, ModuleResolveMode,
-};
+use ty_module_resolver::{resolve_module, search_paths, ModuleName, ModuleResolveMode};
 use ty_python_core::definition::DefinitionKind;
 
 pub(crate) fn decl_kind_str(kind: &DefinitionKind<'_>) -> Option<&'static str> {
@@ -515,7 +513,7 @@ pub(crate) fn resolve_dynamic_target(
 /// `pkg/__init__.py` this is `"pkg"`; for `pkg/sub.py` this is
 /// `"pkg"`; for a top-level `mod.py` this is `None`.
 pub(crate) fn file_package_name(db: &dyn ty_python_semantic::Db, file: File) -> Option<String> {
-    let module = file_to_module(db, file)?;
+    let module = crate::helpers::canonical_module_for_file(db, file)?;
     let name = module.name(db);
     let path_str = match file.path(db) {
         FilePath::System(p) => p.to_string(),

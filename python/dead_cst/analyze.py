@@ -109,18 +109,18 @@ class Analysis:
 
         from .plugins import Plugin
 
-        # When a venv is provided, suppress ty's auto-discovery of
-        # ``env.root`` (which would put ``project_root`` in static
-        # search paths, shadowing the .pth-derived per-member paths
-        # that come via ``python_env``). With ``env.root = []``,
-        # static_paths is empty; ty falls through to
-        # ``dynamic_resolution_paths`` (site-packages + .pth) for
-        # first-party resolution.
+        # Always keep ``project_root`` in ty's static search paths
+        # alongside any ``.pth``-derived dynamic paths from the venv.
+        # ``helpers::canonical_module_for_file`` (rust side) does a
+        # specificity-aware reverse lookup so a deep ``.pth`` path
+        # still wins the fqname for files it covers, while the
+        # project root becomes a safe fallback for single-package
+        # setups whose editable install uses a PEP 660 ``MetaPathFinder``
+        # (no flat ``.pth``) — the case that #222 reproduced as
+        # ``[unresolved]`` synthetics.
         venv_str = str(self._venv) if self._venv is not None else None
-        suppress_autodetect = self._venv is not None
         ctx = _native.ProjectContext(
             str(self._project_root),
-            src_roots=[] if suppress_autodetect else None,
             python_env=venv_str,
             show_progress=self._show_progress,
         )
