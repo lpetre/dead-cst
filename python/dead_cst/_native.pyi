@@ -306,6 +306,25 @@ class ProjectContext:
         typeshed: str | None = ...,
         show_progress: bool = ...,
     ) -> None: ...
+    @property
+    def stack_size(self) -> int | None:
+        """Rayon worker stack size override (bytes) for the populate
+        phase, or ``None`` if no override is set (in which case the
+        populate phase runs on rayon's global pool with rayon's own
+        default stack — 2 MiB unless ``RAYON_STACK_SIZE`` /
+        ``RUST_MIN_STACK`` are set process-wide)."""
+
+    def set_stack_size(self, bytes_: int) -> None:
+        """Override the rayon worker stack size (bytes) used by the
+        populate phase. Call BEFORE :meth:`materialize`; calls after
+        the graph is materialized have no effect on the already-
+        built graph. Raises :class:`ValueError` if ``bytes_`` is
+        not positive.
+
+        Set this on projects with deeply-nested generated code
+        (protobuf modules, ML-generated ASTs, big literal dicts)
+        that overflow rayon's default 2 MiB stack."""
+
     def add_plugin(self, plugin: _ProjectPluginLike | Any) -> None:
         """Register a plugin. Order of registration is order of
         invocation during :meth:`materialize`."""

@@ -79,7 +79,7 @@ impl Project {
 
     /// Build the project-wide symbol graph (single-pass, no plugins).
     pub(crate) fn build(&mut self, py: Python<'_>) -> PyResult<NativeGraph> {
-        let outputs = build_project_graph(py, &mut self.db, false)?;
+        let outputs = build_project_graph(py, &mut self.db, false, None)?;
         Ok(NativeGraph {
             nodes: outputs.builder.nodes,
             edges: outputs.builder.edges,
@@ -197,6 +197,7 @@ pub(crate) fn build_project_graph(
     py: Python<'_>,
     db: &mut ProjectDatabase,
     show_progress: bool,
+    stack_size: Option<usize>,
 ) -> PyResult<BuildOutputs> {
     let timing = std::env::var_os("DEAD_CST_TIMING").is_some();
 
@@ -257,36 +258,20 @@ pub(crate) fn build_project_graph(
     // the ~100ms walk inline.
     let t_populate = std::time::Instant::now();
     {
-        // Compute dist_lookup BEFORE the rayon::scope below. Two
-        // reasons it can't overlap on rayon:
-        //   (a) project_dist_lookup is a salsa-tracked query whose
-        //       body calls build_dist_lookup, which uses
-        //       rayon::par_extend internally. If we ran dist_lookup
-        //       on a rayon worker (or on a std::thread that submits
-        //       to the global rayon pool), its par_extend sub-tasks
-        //       would land on workers already running file_to_*
-        //       calls with a *different* db attached — salsa panics
-        //       with "Cannot change database mid-query".
-        //   (b) Once dist_lookup is cached, the per-file
-        //       file_to_edges call hits salsa's cache cheaply; no
-        //       cost penalty for serializing it first.
-        // The dist_lookup walk is ~100ms cold on a typical venv;
-        // file-work parallelism more than makes up for it on
-        // anything beyond a tiny corpus.
-        {
-            use salsa::Database as _;
-            let dist_db: ProjectDatabase = db.clone();
-            py.allow_threads(move || {
-                dist_db.attach(|local_db| {
-                    let _ = crate::file_payload::project_dist_lookup(local_db);
-                });
-            });
-        }
         // Per-file work-stealing on rayon: pre-clone N salsa
         // snapshots into a bounded MPMC channel; each task pulls a
         // snapshot, processes ONE file, returns it. ProjectDatabase
         // is Send-but-not-Sync so a shared db can't cross task
         // boundaries — channel transfer is the closest match.
+        //
+        // When `stack_size` is `Some`, build a local rayon pool
+        // with that stack size and run the work inside `install`.
+        // Otherwise use the global rayon pool — rayon's default
+        // stack (2 MiB) is sufficient for typical Python code;
+        // callers with deeply-nested generated code call
+        // `ProjectContext.set_stack_size` to opt in to a bigger
+        // stack. Linux commits stack pages lazily, so the declared
+        // size is virtual address space, not resident memory.
         let num_workers = std::thread::available_parallelism()
             .map(std::num::NonZeroUsize::get)
             .unwrap_or(4);
@@ -294,14 +279,24 @@ pub(crate) fn build_project_graph(
         for _ in 0..num_workers {
             db_tx.send(db.clone()).expect("channel open");
         }
+        // dist_lookup runs inside the same pool (custom or global)
+        // so its par_extend sub-tasks share that pool's workers,
+        // not stray onto unrelated rayon usage. Serialized before
+        // the rayon::scope below to avoid the "Cannot change
+        // database mid-query" salsa panic — see the prior PR's
+        // commit message for the hazard.
+        let dist_db: ProjectDatabase = db.clone();
         let files_ref: &[File] = &project_files;
-        py.allow_threads(move || {
+        let run_populate = move || {
+            use salsa::Database as _;
+            dist_db.attach(|local_db| {
+                let _ = crate::file_payload::project_dist_lookup(local_db);
+            });
             rayon::scope(|s| {
                 for &file in files_ref {
                     let db_tx = db_tx.clone();
                     let db_rx = db_rx.clone();
                     s.spawn(move |_| {
-                        use salsa::Database as _;
                         let local_db = db_rx.recv().expect("snapshot available");
                         local_db.attach(|local_db| {
                             let _ = file_to_nodes(local_db, file);
@@ -312,6 +307,17 @@ pub(crate) fn build_project_graph(
                     });
                 }
             });
+        };
+        py.allow_threads(move || match stack_size {
+            Some(n) => {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(num_workers)
+                    .stack_size(n)
+                    .build()
+                    .expect("build rayon thread pool");
+                pool.install(run_populate);
+            }
+            None => run_populate(),
         });
     }
     let t_populate_elapsed = t_populate.elapsed();
@@ -713,6 +719,15 @@ pub(crate) struct ProjectContext {
     /// When true, ``materialize`` and ``build_project_graph`` draw
     /// indicatif progress bars to stderr.
     pub(crate) show_progress: bool,
+    /// Optional override for the rayon worker stack size (bytes)
+    /// used by the populate phase. `None` (the default) uses the
+    /// global rayon pool, which honours rayon's own size (2 MiB
+    /// unless `RAYON_STACK_SIZE` / `RUST_MIN_STACK` are set in the
+    /// process env). `Some(n)` builds a local pool with stack_size
+    /// `n`. Set via [`Self::set_stack_size`] for projects with
+    /// deeply-nested generated code (protobuf modules, long
+    /// star-reexport chains) that overflow the default.
+    pub(crate) stack_size: Option<usize>,
 }
 
 #[pymethods]
@@ -746,6 +761,7 @@ impl ProjectContext {
             outputs: RefCell::new(None),
             regex_cache: RefCell::new(HashMap::new()),
             show_progress,
+            stack_size: None,
         })
     }
 
@@ -753,6 +769,32 @@ impl ProjectContext {
     #[getter]
     pub(crate) fn project_root(&self) -> &str {
         &self.root
+    }
+
+    /// Override the rayon worker stack size (bytes) used by the
+    /// populate phase. Call BEFORE `materialize`; later calls don't
+    /// affect a build already in progress. By default no override
+    /// is set — populate runs on rayon's global pool with rayon's
+    /// own default stack (2 MiB). Set this on projects with
+    /// deeply-nested generated code (protobuf modules, ML-generated
+    /// ASTs, big literal dicts) that overflow the default. Passing
+    /// 0 is invalid and raises ValueError.
+    pub(crate) fn set_stack_size(&mut self, bytes: usize) -> PyResult<()> {
+        if bytes == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "stack_size must be > 0",
+            ));
+        }
+        self.stack_size = Some(bytes);
+        Ok(())
+    }
+
+    /// Current rayon worker stack size override in bytes, or `None`
+    /// if no override is set (in which case the populate phase uses
+    /// rayon's global pool with its own default stack).
+    #[getter]
+    pub(crate) fn stack_size(&self) -> Option<usize> {
+        self.stack_size
     }
 
     /// Register a Python plugin. Order of registration is order of
@@ -779,9 +821,10 @@ impl ProjectContext {
     /// re-enter queries through the same ctx without aliasing violations.
     pub(crate) fn materialize(slf: Py<Self>, py: Python<'_>) -> PyResult<NativeGraph> {
         let show_progress = slf.borrow(py).show_progress;
+        let stack_size = slf.borrow(py).stack_size;
         {
             let mut this = slf.borrow_mut(py);
-            let outputs = build_project_graph(py, &mut this.db, show_progress)?;
+            let outputs = build_project_graph(py, &mut this.db, show_progress, stack_size)?;
             *this.outputs.borrow_mut() = Some(outputs);
         }
 

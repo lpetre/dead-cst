@@ -61,11 +61,35 @@ class Analysis:
         self._venv: Path | None = venv
         self._plugins: tuple[Plugin, ...] = tuple(plugins)
         self._show_progress: bool = show_progress
+        # Buffered until ``materialize_all`` constructs the ctx.
+        # ``None`` means "no override" — the rust side uses rayon's
+        # global pool with rayon's own default stack.
+        self._stack_size: int | None = None
         # Held past ``materialize_all`` so the rust BFS queries
         # (:meth:`reachable`, :meth:`dead`, :meth:`descendants`,
         # :meth:`ancestors`) and node/edge enumeration can run against
         # the live context without re-building the project graph.
         self._ctx: native.ProjectContext | None = None
+
+    def set_stack_size(self, bytes_: int) -> None:
+        """Override the rayon worker stack size (bytes) used by the
+        populate phase. Call BEFORE :meth:`materialize_all`; calls
+        after the graph is materialized have no effect on the
+        already-built graph.
+
+        With no override set, the populate phase uses rayon's global
+        pool with rayon's own default stack (2 MiB unless
+        ``RAYON_STACK_SIZE`` / ``RUST_MIN_STACK`` are set
+        process-wide), which is sufficient for typical Python code.
+        Call this on projects with deeply-nested generated code
+        (e.g. protobuf modules, ML-generated ASTs, or large nested
+        literal dicts) that stack-overflow at the default — the
+        declared size is virtual address space on Linux, so going
+        much higher costs no resident memory unless actually used.
+        """
+        if bytes_ <= 0:
+            raise ValueError(f"stack_size must be > 0, got {bytes_}")
+        self._stack_size = bytes_
 
     @property
     def project_root(self) -> Path:
@@ -100,6 +124,8 @@ class Analysis:
             python_env=venv_str,
             show_progress=self._show_progress,
         )
+        if self._stack_size is not None:
+            ctx.set_stack_size(self._stack_size)
         for plugin in self._plugins:
             # Catch ``Pluign()`` typos and bare dicts before the rust
             # side silently drops them.
