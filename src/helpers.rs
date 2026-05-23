@@ -16,7 +16,10 @@ use ruff_python_ast::visitor::{walk_expr, Visitor};
 use ruff_python_ast::{Expr, Stmt, StmtClassDef};
 use ruff_source_file::LineIndex;
 use ruff_text_size::{Ranged, TextRange};
-use ty_module_resolver::{file_to_module, resolve_module, ModuleName};
+use ty_module_resolver::Module;
+use ty_module_resolver::{
+    file_to_module, resolve_module, search_paths, ModuleName, ModuleResolveMode,
+};
 use ty_project::metadata::value::RelativePathBuf;
 use ty_project::{Db as ProjectDb, ProjectDatabase};
 
@@ -1691,9 +1694,139 @@ pub(crate) fn file_default_flags(db: &dyn ProjectDb, file: File) -> u32 {
     }
 }
 
+/// Convert a search-path-relative path into a dotted module name.
+///
+/// `rel` is the file's path relative to a search root (e.g.
+/// `"lib_a/__init__.py"` or `"handlers/job.py"`). Strips `.py` / `.pyi`
+/// extensions and any trailing `__init__` segment so a package's
+/// `__init__.py` collapses to the package's dotted name.
+///
+/// Returns `None` for paths that aren't valid module containers — most
+/// commonly a bare `__init__.py` whose search path *is* the package
+/// directory itself (a layout no `.pth` install would produce, but we
+/// reject it for safety: there's no name to bind).
+fn relative_to_module_name(rel: &str) -> Option<String> {
+    let stem = rel
+        .strip_suffix(".pyi")
+        .or_else(|| rel.strip_suffix(".py"))
+        .unwrap_or(rel);
+    if stem == "__init__" {
+        return None;
+    }
+    let stem = stem
+        .strip_suffix("/__init__")
+        .or_else(|| stem.strip_suffix("\\__init__"))
+        .unwrap_or(stem);
+    if stem.is_empty() {
+        return None;
+    }
+    Some(stem.replace(['/', '\\'], "."))
+}
+
+/// Specificity-aware reverse module lookup: which fqname would Python
+/// import to reach this file?
+///
+/// `ty_module_resolver::file_to_module` takes the *first* search path
+/// that contains the file. That's correct when search paths reflect
+/// Python's resolution order — but when project_root is on the list
+/// alongside a `.pth`-derived path inside it, the first match yields a
+/// workspace-relative dotted name (`libs.lib_a.src.lib_a`) instead of
+/// the import-time name (`lib_a`). The forward resolver still picks
+/// the right file via the `.pth`, so cross-file edges built against
+/// the workspace-relative fqname never connect.
+///
+/// This walks every containing search path, builds a candidate
+/// module name from each, round-trips it through `resolve_module`, and
+/// returns the candidate whose search path is *most* specific (largest
+/// component count). The specificity tiebreak picks `lib_a` over
+/// `libs.lib_a.src.lib_a` whenever both round-trip — i.e. when both a
+/// `.pth` entry and the project root cover the file.
+///
+/// Returns `None` when no candidate round-trips (the file is shadowed
+/// by another module of the same name in a higher-priority search
+/// path) or when the file isn't on any search path at all. Callers
+/// should fall back to a path-mangle in that case.
+pub(crate) fn canonical_module_for_file<'db>(
+    db: &'db dyn ty_module_resolver::Db,
+    file: File,
+) -> Option<Module<'db>> {
+    let name = canonical_module_name_for_file(db, file)?;
+    resolve_module(db, file, &name)
+}
+
+/// Same logic as :func:`canonical_module_for_file` but stops at the
+/// ``ModuleName``. Saves one ``resolve_module`` call per file in the
+/// common single-package case where ``module_fqname_for_file`` only
+/// needs the dotted name. Callers that go on to walk the parent module
+/// (``parent_module_file``, ``file_package_name``) still go through
+/// the ``Module``-returning wrapper above.
+pub(crate) fn canonical_module_name_for_file(
+    db: &dyn ty_module_resolver::Db,
+    file: File,
+) -> Option<ModuleName> {
+    let file_path = match file.path(db) {
+        FilePath::System(p) => p,
+        _ => return file_to_module(db, file).map(|m| m.name(db).clone()),
+    };
+
+    // Collect every search path that physically contains the file.
+    // Typical projects have ≤ 5 search paths and a file usually lives
+    // under 1–2 of them, so the SmallVec stays inline.
+    let mut candidates: smallvec::SmallVec<[(usize, ModuleName); 4]> = smallvec::SmallVec::new();
+    for sp in search_paths(db, ModuleResolveMode::StubsAllowed) {
+        let Some(sp_path) = sp.as_system_path() else {
+            continue;
+        };
+        let Ok(rel) = file_path.strip_prefix(sp_path) else {
+            continue;
+        };
+        let Some(name_str) = relative_to_module_name(rel.as_str()) else {
+            continue;
+        };
+        let Some(name) = ModuleName::new(&name_str) else {
+            continue;
+        };
+        candidates.push((sp_path.components().count(), name));
+    }
+
+    // Fast path: a single containing search path means no ambiguity —
+    // skip the ``resolve_module`` round-trip entirely. This is the
+    // single-package shape (just ``project_root`` on the search list)
+    // and accounts for the bulk of first-party files in typical
+    // codebases. Without this short-circuit, the round-trip would cost
+    // one ``resolve_module`` call per project file at cold start.
+    //
+    // Correctness note: ``file_to_module`` round-trips to reject files
+    // shadowed by a same-named package (``foo.py`` next to
+    // ``foo/__init__.py``). We deliberately don't reject here — the
+    // current code path falls back to a path-mangle for those files
+    // anyway, returning the same fqname we would. Shadowing precedence
+    // for import-edge routing lives in ``file_payload`` / the trie,
+    // not here.
+    if candidates.len() == 1 {
+        // No ambiguity, no round-trip needed.
+        return candidates.into_iter().next().map(|(_, name)| name);
+    }
+
+    // Multiple containing paths -- specificity tiebreak with round-trip.
+    candidates.sort_by_key(|c| std::cmp::Reverse(c.0));
+    for (_, name) in candidates {
+        let Some(resolved) = resolve_module(db, file, &name) else {
+            continue;
+        };
+        let Some(resolved_file) = resolved.file(db) else {
+            continue;
+        };
+        if resolved_file == file {
+            return Some(name);
+        }
+    }
+    None
+}
+
 pub(crate) fn module_fqname_for_file(db: &dyn ProjectDb, file: File) -> String {
-    if let Some(module) = file_to_module(db, file) {
-        return module.name(db).as_str().to_string();
+    if let Some(name) = canonical_module_name_for_file(db, file) {
+        return name.as_str().to_string();
     }
     // Fallback for files ty doesn't classify (e.g. ``gunicorn.conf.py`` at
     // the project root — there's no ``__init__.py`` and the stem contains
