@@ -1395,15 +1395,27 @@ pub(crate) fn evaluate_truthiness(expr: &Expr, table: &NameTable) -> Option<bool
 /// binding whose RHS we can't fold, drops out of the table. That
 /// matches the libcst pipeline's "only fold when every binding
 /// agrees" rule and is what keeps the `does_not_fold_*` tests honest.
+///
+/// Non-monotonic flips poison the name. A binding like `foo = not foo`
+/// in a scope that inherits `foo = False` from the enclosing scope
+/// would otherwise oscillate the table between true/false forever
+/// (`not false → true → not true → false → ...`). The poison set is
+/// the convergence guarantee: once a name produces a different
+/// resolved value than the table already holds, we drop it and
+/// refuse to re-fold it for the rest of this scope.
 pub(crate) fn build_scope_table(stmts: &[Stmt], enclosing: &NameTable) -> NameTable {
     let mut table = enclosing.clone();
     let mut bindings: HashMap<String, Vec<&Expr>> = HashMap::new();
     collect_scope_bindings(stmts, &mut bindings);
 
+    let mut poisoned: HashSet<String> = HashSet::new();
     let mut changed = true;
     while changed {
         changed = false;
         for (name, exprs) in &bindings {
+            if poisoned.contains(name) {
+                continue;
+            }
             let values: Vec<Option<bool>> = exprs
                 .iter()
                 .map(|e| evaluate_truthiness(e, &table))
@@ -1418,15 +1430,16 @@ pub(crate) fn build_scope_table(stmts: &[Stmt], enclosing: &NameTable) -> NameTa
                 None
             };
             match (resolved, table.get(name).copied()) {
-                (Some(v), prev) if prev != Some(v) => {
+                (Some(v), None) => {
                     table.insert(name.clone(), v);
                     changed = true;
                 }
+                (Some(new), Some(prev)) if prev != new => {
+                    table.remove(name);
+                    poisoned.insert(name.clone());
+                    changed = true;
+                }
                 (None, Some(_)) => {
-                    // Previously folded, now conflicting / unknown:
-                    // drop it. Don't fall back to the enclosing
-                    // scope's value because a same-name binding in
-                    // this scope shadows it.
                     table.remove(name);
                     changed = true;
                 }
@@ -2393,6 +2406,46 @@ mod tests {
         let table = build_scope_table(&stmts, &enclosing);
         assert_eq!(table.get("OUTER"), Some(&true));
         assert_eq!(table.get("INNER"), Some(&false));
+    }
+
+    #[test]
+    fn build_scope_table_self_negation_does_not_loop() {
+        // Inheriting ``foo`` from the enclosing scope and then evaluating
+        // ``foo = not foo`` would oscillate the table between true/false
+        // forever before the poison set was added.
+        let mut enclosing: NameTable = HashMap::new();
+        enclosing.insert("foo".into(), false);
+        let stmts = parse_stmts("foo = not foo\n");
+        let table = build_scope_table(&stmts, &enclosing);
+        assert!(!table.contains_key("foo"));
+    }
+
+    #[test]
+    fn build_scope_table_detect_dead_ranges_terminates_for_global_flipper() {
+        // End-to-end: module-level ``foo = False`` plus a function that
+        // does ``global foo; foo = not foo``. ``detect_dead_ranges``
+        // recurses into the function body via ``build_scope_table``,
+        // which used to spin forever on the ``not foo`` binding.
+        let parsed = ruff_python_parser::parse_module(
+            "foo = False\ndef flip():\n    global foo\n    foo = not foo\n",
+        )
+        .unwrap();
+        let mut bindings: HashMap<String, Vec<&Expr>> = HashMap::new();
+        let body = parsed.syntax().body.clone();
+        collect_scope_bindings(&body, &mut bindings);
+        // Sanity: module sees ``foo = False`` only, not the in-function rebind.
+        assert!(bindings.contains_key("foo"));
+
+        // The inner ``flip`` body inherits ``foo = false``; building its
+        // table must terminate and drop ``foo`` rather than fold it.
+        let mut enclosing: NameTable = HashMap::new();
+        enclosing.insert("foo".into(), false);
+        if let Stmt::FunctionDef(f) = &body[1] {
+            let nested = build_scope_table(&f.body, &enclosing);
+            assert!(!nested.contains_key("foo"));
+        } else {
+            panic!("second stmt should be a FunctionDef");
+        }
     }
 
     #[test]
