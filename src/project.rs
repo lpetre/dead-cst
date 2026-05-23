@@ -266,11 +266,12 @@ pub(crate) fn build_project_graph(
         // Custom rayon pool with a larger stack: the default 2MB
         // overflows on deeply-nested generated code (protobuf
         // modules, big literal dicts, long star-reexport chains).
-        // RUST_MIN_STACK overrides if set — same env var name rayon
-        // / std::thread already honour, so users who've sized it up
-        // for one tool's deep recursion get the same setting here.
-        // 8MB matches rustc's own thread stack default for compiler
-        // recursion and is conservative for our workload.
+        // See `rayon_worker_stack_size` for the resolution order
+        // (DEAD_CST_STACK_SIZE > RUST_MIN_STACK > 32MB default).
+        // The declared size is virtual address space — Linux
+        // commits stack pages lazily, so 32MB × N workers costs no
+        // resident memory until a worker actually recurses into
+        // those pages.
         let num_workers = std::thread::available_parallelism()
             .map(std::num::NonZeroUsize::get)
             .unwrap_or(4);
@@ -376,20 +377,37 @@ pub(crate) fn build_project_graph(
     })
 }
 
-/// Stack size for rayon worker threads in the populate-phase pool.
-/// Honours `RUST_MIN_STACK` (same env var rayon / `std::thread`
-/// already read) so users who've sized it up for one tool's deep
-/// recursion get the same setting here. Defaults to 8 MiB —
-/// generous headroom for deeply-nested generated code (protobuf
-/// modules, big literal dicts) and long star-reexport chains
-/// where rayon's default 2 MiB stack has been observed to
-/// overflow on large repos.
+/// Stack size (bytes) for rayon worker threads in the populate-phase
+/// pool. Resolution order:
+///
+/// 1. `DEAD_CST_STACK_SIZE`, if set and parseable as a non-zero
+///    `usize`. Lets users override our default without touching the
+///    process-wide `RUST_MIN_STACK` (which rayon / `std::thread`
+///    also honour, so it can have ripple effects on other code).
+/// 2. `RUST_MIN_STACK`, if set and parseable. Same env var rayon /
+///    `std::thread` already read — picked up so users who've sized
+///    it up for one tool's deep recursion don't get silently capped
+///    by our default.
+/// 3. 32 MiB default.
+///
+/// 32 MiB covers ~32k recursive frames at ~1 KB/frame — well past
+/// any AST CPython can parse (default recursion limit is 1000) and
+/// generous headroom for auto-generated protobuf, ML-generated
+/// code, etc. Linux commits stack pages lazily, so the declared
+/// size is virtual address space, not resident memory.
 fn rayon_worker_stack_size() -> usize {
-    const DEFAULT: usize = 8 * 1024 * 1024;
+    const DEFAULT: usize = 32 * 1024 * 1024;
+    if let Some(n) = std::env::var("DEAD_CST_STACK_SIZE")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+    {
+        return n;
+    }
     std::env::var("RUST_MIN_STACK")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
-        .map(|n| n.max(DEFAULT))
+        .filter(|&n| n > 0)
         .unwrap_or(DEFAULT)
 }
 
