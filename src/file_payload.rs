@@ -94,7 +94,7 @@ pub(crate) struct ProjectDistLookup {
 }
 
 #[salsa::tracked(returns(ref), heap_size = ruff_memory_usage::heap_size)]
-pub(crate) fn project_dist_lookup<'db>(db: &'db dyn ProjectDb) -> ProjectDistLookup {
+pub(crate) fn project_dist_lookup(db: &dyn ProjectDb) -> ProjectDistLookup {
     let site_packages = crate::ingest::site_packages_roots(db);
     ProjectDistLookup {
         map: crate::ingest::build_dist_lookup(&site_packages),
