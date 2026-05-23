@@ -353,6 +353,7 @@ name = "dead-cst-native"
 version = "0.11.0"
 dependencies = [
  "bincode",
+ "crossbeam-channel",
  "get-size2",
  "indicatif",
  "pyo3",

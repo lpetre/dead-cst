@@ -242,47 +242,73 @@ pub(crate) fn build_project_graph(
     // Parallel pre-populate: run file_to_nodes, file_to_edges, and
     // file_to_ref_edges as #[salsa::tracked] queries across all
     // project files. Workers are pure-rust (GIL released via
-    // py.allow_threads). Each chunk attaches a cloned db so salsa's
-    // tracked-fn machinery can do lock-free coordination — same
-    // pattern as prewarm above. The salsa cache is populated for the
-    // serial assembly pass below; nothing here directly mutates the
-    // graph builder.
+    // py.allow_threads). Each file's three queries are attached on
+    // whatever rayon worker thread picks them up — work-stealing
+    // distributes load across cores; salsa-tracked machinery owns
+    // the lock-free coordination between workers. The salsa cache
+    // is populated for the serial assembly pass below; nothing here
+    // directly mutates the graph builder.
     //
-    // project_dist_lookup is also populated here on its own thread.
-    // The old pipeline overlapped build_dist_lookup with phase 1; we
-    // do the same so the first per-file worker that needs it (for
-    // PEP 503 canonical [external dist] X classification) hits a
-    // warm salsa cache instead of paying the ~100ms walk inline.
+    // project_dist_lookup runs in parallel with the file work via
+    // rayon::join. The old pipeline overlapped build_dist_lookup
+    // with phase 1; we keep the same shape so the first per-file
+    // worker that needs it (for PEP 503 canonical [external dist] X
+    // classification) hits a warm salsa cache instead of paying
+    // the ~100ms walk inline.
     let t_populate = std::time::Instant::now();
     {
-        let parent_db: ProjectDatabase = db.clone();
-        let dist_db: ProjectDatabase = db.clone();
-        let files_ref: &[File] = &project_files;
+        // Compute dist_lookup BEFORE the rayon::scope below. Two
+        // reasons it can't overlap on rayon:
+        //   (a) project_dist_lookup is a salsa-tracked query whose
+        //       body calls build_dist_lookup, which uses
+        //       rayon::par_extend internally. If we ran dist_lookup
+        //       on a rayon worker (or on a std::thread that submits
+        //       to the global rayon pool), its par_extend sub-tasks
+        //       would land on workers already running file_to_*
+        //       calls with a *different* db attached — salsa panics
+        //       with "Cannot change database mid-query".
+        //   (b) Once dist_lookup is cached, the per-file
+        //       file_to_edges call hits salsa's cache cheaply; no
+        //       cost penalty for serializing it first.
+        // The dist_lookup walk is ~100ms cold on a typical venv;
+        // file-work parallelism more than makes up for it on
+        // anything beyond a tiny corpus.
+        {
+            use salsa::Database as _;
+            let dist_db: ProjectDatabase = db.clone();
+            py.allow_threads(move || {
+                dist_db.attach(|local_db| {
+                    let _ = crate::file_payload::project_dist_lookup(local_db);
+                });
+            });
+        }
+        // Per-file work-stealing on rayon: pre-clone N salsa
+        // snapshots into a bounded MPMC channel; each task pulls a
+        // snapshot, processes ONE file, returns it. ProjectDatabase
+        // is Send-but-not-Sync so a shared db can't cross task
+        // boundaries — channel transfer is the closest match.
         let num_workers = std::thread::available_parallelism()
             .map(std::num::NonZeroUsize::get)
             .unwrap_or(4);
-        let chunk_size = files_ref.len().div_ceil(num_workers).max(1);
+        let (db_tx, db_rx) = crossbeam_channel::bounded::<ProjectDatabase>(num_workers);
+        for _ in 0..num_workers {
+            db_tx.send(db.clone()).expect("channel open");
+        }
+        let files_ref: &[File] = &project_files;
         py.allow_threads(move || {
-            std::thread::scope(|s| {
-                // dist_lookup on its own thread — overlapped with
-                // the file_to_* work below.
-                s.spawn(move || {
-                    use salsa::Database as _;
-                    dist_db.attach(|local_db| {
-                        let _ = crate::file_payload::project_dist_lookup(local_db);
-                    });
-                });
-                for chunk in files_ref.chunks(chunk_size) {
-                    let local_db = parent_db.clone();
-                    s.spawn(move || {
+            rayon::scope(|s| {
+                for &file in files_ref {
+                    let db_tx = db_tx.clone();
+                    let db_rx = db_rx.clone();
+                    s.spawn(move |_| {
                         use salsa::Database as _;
+                        let local_db = db_rx.recv().expect("snapshot available");
                         local_db.attach(|local_db| {
-                            for &file in chunk {
-                                let _ = file_to_nodes(local_db, file);
-                                let _ = file_to_edges(local_db, file);
-                                let _ = file_to_ref_edges(local_db, file);
-                            }
+                            let _ = file_to_nodes(local_db, file);
+                            let _ = file_to_edges(local_db, file);
+                            let _ = file_to_ref_edges(local_db, file);
                         });
+                        db_tx.send(local_db).expect("channel open");
                     });
                 }
             });
