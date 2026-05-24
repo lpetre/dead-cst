@@ -3,7 +3,6 @@
 //! Salsa-backed analysis context that the rest of the crate operates on.
 
 use std::cell::{Ref, RefCell};
-use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
@@ -43,7 +42,7 @@ use crate::query::{
     _compile_path_regex, _contains_any_identifier, _contains_identifier, par_scan_files,
     QueryBuilder,
 };
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::OnceLock as StdOnceLock;
 
 /// A ty-backed analysis project with explicitly-injected configuration.
@@ -98,33 +97,33 @@ pub(crate) struct BuildOutputs {
     pub(crate) global_index: DeclIndex,
     /// `file_path_string(file) -> File` so seed lookups don't have to
     /// linear-scan `project_files`. Populated alongside ingest.
-    pub(crate) path_to_file: HashMap<String, File>,
+    pub(crate) path_to_file: FxHashMap<String, File>,
     /// `(file, class_target_range_key) -> class node idx`. Lets
     /// `find_subclasses_of` map ty's `TypeHierarchyClass.selection_range`
     /// back to a graph node in O(1).
-    pub(crate) class_by_selection: HashMap<(File, (u32, u32)), usize>,
+    pub(crate) class_by_selection: FxHashMap<(File, (u32, u32)), usize>,
     /// `file -> module node idx`. Lets `find_main_blocks` reach the
     /// file's module node without a linear scan over `builder.nodes`.
-    pub(crate) module_nodes_by_file: HashMap<File, usize>,
+    pub(crate) module_nodes_by_file: FxHashMap<File, usize>,
     /// `(file, target_range_key) -> node idx`. Sister of
     /// ``class_by_selection`` but for every top-level decl ingest minted
     /// (function / class / variable / import). Lets ``find_decorated_decls``
     /// and the dispatch-app queries map an AST node's target range to a
     /// graph node in O(1) instead of scanning the full ``global_index``.
-    pub(crate) decl_by_name_range: HashMap<(File, (u32, u32)), usize>,
+    pub(crate) decl_by_name_range: FxHashMap<(File, (u32, u32)), usize>,
     /// `decl_fqname -> [node idx]`. Lets ``find_declarations`` answer
     /// in O(parts) instead of O(parts × all_nodes). Multiple entries
     /// per fqname arise from try/except rebinds and conditional
     /// re-imports.
-    pub(crate) decl_by_fqname: HashMap<String, Vec<usize>>,
+    pub(crate) decl_by_fqname: FxHashMap<String, Vec<usize>>,
     /// `module_fqname -> node idx`. Lets ``find_module`` answer in
     /// O(1) instead of scanning all nodes.
-    pub(crate) module_by_fqname: HashMap<String, usize>,
+    pub(crate) module_by_fqname: FxHashMap<String, usize>,
     /// `Import.module -> [import node idx]`. Lets ``find_imports_of``
     /// answer in O(1) lookup + O(matches) walk instead of scanning all
     /// nodes — and a cheap ``imports_of_exists`` short-circuit for
     /// plugins that just need a per-module presence check.
-    pub(crate) imports_by_module: HashMap<String, Vec<usize>>,
+    pub(crate) imports_by_module: FxHashMap<String, Vec<usize>>,
 }
 
 /// Run the three build phases (ingest → hierarchy+imports → references)
@@ -203,7 +202,8 @@ pub(crate) fn build_project_graph(
 
     let t0 = std::time::Instant::now();
     let project_files: Vec<File> = (&db.project().files(db)).into_iter().collect();
-    let mut path_to_file: HashMap<String, File> = HashMap::with_capacity(project_files.len());
+    let mut path_to_file: FxHashMap<String, File> =
+        FxHashMap::with_capacity_and_hasher(project_files.len(), Default::default());
     for &file in &project_files {
         path_to_file.insert(file_path_string(db, file), file);
     }
@@ -212,7 +212,7 @@ pub(crate) fn build_project_graph(
     // ENTRYPOINT flag fixup (.pyi decls without a runtime twin need
     // ENTRYPOINT so native-extension / protobuf-style stubs stay
     // alive even with no consumer reference).
-    let py_files_by_stem: HashMap<String, File> = project_files
+    let py_files_by_stem: FxHashMap<String, File> = project_files
         .iter()
         .filter_map(|&f| {
             file_path_string(db, f)
@@ -220,7 +220,7 @@ pub(crate) fn build_project_graph(
                 .map(|stem| (stem.to_string(), f))
         })
         .collect();
-    let mut peer_pyi_to_py: HashMap<File, File> = HashMap::new();
+    let mut peer_pyi_to_py: FxHashMap<File, File> = FxHashMap::default();
     for &f in &project_files {
         let path = file_path_string(db, f);
         if let Some(stem) = path.strip_suffix(".pyi") {
@@ -405,9 +405,9 @@ fn current_rss_mb() -> usize {
 struct AssembledGraph {
     builder: GraphBuilder,
     global_index: DeclIndex,
-    module_nodes_by_file: HashMap<File, usize>,
-    class_by_selection: HashMap<(File, (u32, u32)), usize>,
-    decl_by_name_range: HashMap<(File, (u32, u32)), usize>,
+    module_nodes_by_file: FxHashMap<File, usize>,
+    class_by_selection: FxHashMap<(File, (u32, u32)), usize>,
+    decl_by_name_range: FxHashMap<(File, (u32, u32)), usize>,
 }
 
 /// Serial pass that converts the salsa-tracked per-file payloads
@@ -442,13 +442,13 @@ fn assemble_graph<'db>(
     py: Python<'_>,
     db: &'db ProjectDatabase,
     project_files: &[File],
-    peer_pyi_to_py: &HashMap<File, File>,
+    peer_pyi_to_py: &FxHashMap<File, File>,
 ) -> PyResult<AssembledGraph> {
     let mut builder = GraphBuilder::new();
-    let mut global_index: DeclIndex = HashMap::new();
-    let mut module_nodes_by_file: HashMap<File, usize> = HashMap::new();
-    let mut class_by_selection: HashMap<(File, (u32, u32)), usize> = HashMap::new();
-    let mut decl_by_name_range: HashMap<(File, (u32, u32)), usize> = HashMap::new();
+    let mut global_index: DeclIndex = FxHashMap::default();
+    let mut module_nodes_by_file: FxHashMap<File, usize> = FxHashMap::default();
+    let mut class_by_selection: FxHashMap<(File, (u32, u32)), usize> = FxHashMap::default();
+    let mut decl_by_name_range: FxHashMap<(File, (u32, u32)), usize> = FxHashMap::default();
     let mut ref_to_global: FxHashMap<NodeRef<'db>, usize> = FxHashMap::default();
     let mut all_warnings: Vec<String> = Vec::new();
 
@@ -652,13 +652,13 @@ pub(crate) fn build_fqname_indices(
     py: Python<'_>,
     builder: &GraphBuilder,
 ) -> (
-    HashMap<String, Vec<usize>>,
-    HashMap<String, usize>,
-    HashMap<String, Vec<usize>>,
+    FxHashMap<String, Vec<usize>>,
+    FxHashMap<String, usize>,
+    FxHashMap<String, Vec<usize>>,
 ) {
-    let mut decls: HashMap<String, Vec<usize>> = HashMap::new();
-    let mut modules: HashMap<String, usize> = HashMap::new();
-    let mut imports_by_module: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut decls: FxHashMap<String, Vec<usize>> = FxHashMap::default();
+    let mut modules: FxHashMap<String, usize> = FxHashMap::default();
+    let mut imports_by_module: FxHashMap<String, Vec<usize>> = FxHashMap::default();
     for (idx, node_py) in builder.nodes.iter().enumerate() {
         let node = node_py.borrow(py);
         match node.kind {
@@ -715,7 +715,7 @@ pub(crate) struct ProjectContext {
     /// :meth:`decls_matching_name` / :meth:`find_comment_patterns`
     /// repeatedly across files with the same pattern, so caching keeps
     /// us off the regex compiler in the hot path.
-    pub(crate) regex_cache: RefCell<HashMap<String, regex::Regex>>,
+    pub(crate) regex_cache: RefCell<FxHashMap<String, regex::Regex>>,
     /// When true, ``materialize`` and ``build_project_graph`` draw
     /// indicatif progress bars to stderr.
     pub(crate) show_progress: bool,
@@ -759,7 +759,7 @@ impl ProjectContext {
             root: root.to_string(),
             plugins: Vec::new(),
             outputs: RefCell::new(None),
-            regex_cache: RefCell::new(HashMap::new()),
+            regex_cache: RefCell::new(FxHashMap::default()),
             show_progress,
             stack_size: None,
         })
@@ -963,10 +963,8 @@ impl ProjectContext {
                     .map_err(|e| PyValueError::new_err(format!("invalid regex {p:?}: {e}")))
             })
             .collect::<PyResult<_>>()?;
-        let str_set: std::collections::HashSet<&str> =
-            str_specs.iter().map(String::as_str).collect();
-        let abs_set: std::collections::HashSet<&str> =
-            abs_paths.iter().map(String::as_str).collect();
+        let str_set: FxHashSet<&str> = str_specs.iter().map(String::as_str).collect();
+        let abs_set: FxHashSet<&str> = abs_paths.iter().map(String::as_str).collect();
 
         let outputs = self.materialized("find_nodes_matching_specs")?;
         let mut out = Vec::new();
@@ -1493,7 +1491,7 @@ impl ProjectContext {
     ) -> PyResult<Vec<(Py<SymbolNode>, CallArgs)>> {
         let outputs = self.materialized("find_decorated_decls")?;
         let path_re = _compile_path_regex(path_regex)?;
-        let names: HashSet<&str> = decorator_names.iter().map(String::as_str).collect();
+        let names: FxHashSet<&str> = decorator_names.iter().map(String::as_str).collect();
         let needle_strs: Vec<&str> = decorator_names.iter().map(String::as_str).collect();
         let decl_by_name_range = &outputs.decl_by_name_range;
         let decl_by_fqname = &outputs.decl_by_fqname;
@@ -1571,7 +1569,7 @@ impl ProjectContext {
     ) -> PyResult<Vec<(Py<SymbolNode>, String, CallArgs)>> {
         let outputs = self.materialized("find_instance_constructions")?;
         let path_re = _compile_path_regex(path_regex)?;
-        let allowed: HashSet<&str> = ctor_names.iter().map(String::as_str).collect();
+        let allowed: FxHashSet<&str> = ctor_names.iter().map(String::as_str).collect();
         let needle_strs: Vec<&str> = ctor_names.iter().map(String::as_str).collect();
         let decl_by_name_range = &outputs.decl_by_name_range;
         let decl_by_fqname = &outputs.decl_by_fqname;
@@ -1638,7 +1636,7 @@ impl ProjectContext {
     ) -> PyResult<Vec<(String, Py<SymbolNode>, CallArgs)>> {
         let outputs = self.materialized("find_handler_decorators")?;
         let path_re = _compile_path_regex(path_regex)?;
-        let attrs: HashSet<&str> = decorator_attrs.iter().map(String::as_str).collect();
+        let attrs: FxHashSet<&str> = decorator_attrs.iter().map(String::as_str).collect();
         let needle_strs: Vec<&str> = decorator_attrs.iter().map(String::as_str).collect();
         let decl_by_name_range = &outputs.decl_by_name_range;
         let decl_by_fqname = &outputs.decl_by_fqname;
@@ -1660,7 +1658,7 @@ impl ProjectContext {
                     let Stmt::FunctionDef(func) = stmt else {
                         continue;
                     };
-                    let mut seen_owners: HashSet<String> = HashSet::new();
+                    let mut seen_owners: FxHashSet<String> = FxHashSet::default();
                     for dec in &func.decorator_list {
                         let (root_expr, call_form): (&Expr, Option<&ruff_python_ast::ExprCall>) =
                             match &dec.expression {
@@ -1715,7 +1713,7 @@ impl ProjectContext {
     ) -> PyResult<Vec<(String, Py<SymbolNode>, CallArgs)>> {
         let outputs = self.materialized("find_handler_decorators_via")?;
         let path_re = _compile_path_regex(path_regex)?;
-        let attrs: HashSet<&str> = decorator_attrs.iter().map(String::as_str).collect();
+        let attrs: FxHashSet<&str> = decorator_attrs.iter().map(String::as_str).collect();
         let decl_by_name_range = &outputs.decl_by_name_range;
         let decl_by_fqname = &outputs.decl_by_fqname;
         let project_files: &[File] = &outputs.project_files;
@@ -1737,7 +1735,7 @@ impl ProjectContext {
                     let Stmt::FunctionDef(func) = stmt else {
                         continue;
                     };
-                    let mut seen_owners: HashSet<String> = HashSet::new();
+                    let mut seen_owners: FxHashSet<String> = FxHashSet::default();
                     for dec in &func.decorator_list {
                         let (root_expr, call_form): (&Expr, Option<&ruff_python_ast::ExprCall>) =
                             match &dec.expression {
@@ -1869,7 +1867,7 @@ impl ProjectContext {
         ctor_names: Vec<String>,
     ) -> PyResult<Vec<(Py<SymbolNode>, Vec<String>)>> {
         let outputs = self.materialized("find_factory_decls")?;
-        let allowed: HashSet<&str> = ctor_names.iter().map(String::as_str).collect();
+        let allowed: FxHashSet<&str> = ctor_names.iter().map(String::as_str).collect();
         let needle_strs: Vec<&str> = ctor_names.iter().map(String::as_str).collect();
         let decl_by_name_range = &outputs.decl_by_name_range;
         let project_files: &[File] = &outputs.project_files;
@@ -1898,7 +1896,7 @@ impl ProjectContext {
                         imports: &imports,
                         module,
                         allowed: allowed_ref,
-                        kinds: HashSet::new(),
+                        kinds: FxHashSet::default(),
                     };
                     for inner in body {
                         finder.visit_stmt(inner);
@@ -1942,7 +1940,7 @@ impl ProjectContext {
     ) -> PyResult<Vec<(Py<SymbolNode>, String, CallArgs)>> {
         let outputs = self.materialized("find_calls_to_imported")?;
         let path_re = _compile_path_regex(path_regex)?;
-        let allowed: HashSet<&str> = [name].into_iter().collect();
+        let allowed: FxHashSet<&str> = [name].into_iter().collect();
         let decl_by_name_range = &outputs.decl_by_name_range;
         let decl_by_fqname = &outputs.decl_by_fqname;
         let module_nodes_by_file = &outputs.module_nodes_by_file;

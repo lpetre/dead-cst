@@ -2,12 +2,11 @@
 //! Result types (`DecoratorRef`/`ConstructionRef`/`CallRef`/`FactoryRef`),
 //! the `QueryBuilder` entry point, and the per-stream `Query` builders.
 
-use std::collections::HashMap;
-
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::PyClass;
 use ruff_db::files::File;
+use rustc_hash::FxHashMap;
 use ty_project::Db as ProjectDb;
 
 use crate::graph::SymbolNode;
@@ -38,7 +37,7 @@ pub(crate) struct DecoratorRef {
     pub(crate) args: Vec<Py<PyAny>>,
     /// Keyword arguments of the decorator's ``Call`` form. Same value
     /// shape as ``args``.
-    pub(crate) kwargs: HashMap<String, Py<PyAny>>,
+    pub(crate) kwargs: FxHashMap<String, Py<PyAny>>,
 }
 
 #[pymethods]
@@ -70,7 +69,7 @@ pub(crate) struct ConstructionRef {
     pub(crate) args: Vec<Py<PyAny>>,
     /// Keyword arguments of the constructor call. Same value shape as
     /// ``args``.
-    pub(crate) kwargs: HashMap<String, Py<PyAny>>,
+    pub(crate) kwargs: FxHashMap<String, Py<PyAny>>,
 }
 
 #[pymethods]
@@ -94,7 +93,7 @@ pub(crate) struct CallRef {
     pub(crate) args: Vec<Py<PyAny>>,
     /// Keyword arguments of the matched call. Same value shape as
     /// ``args``.
-    pub(crate) kwargs: HashMap<String, Py<PyAny>>,
+    pub(crate) kwargs: FxHashMap<String, Py<PyAny>>,
 }
 
 #[pymethods]

@@ -3,12 +3,12 @@
 //! plugin-facing graph ops (`AddNode`/`AddEdge`/`AddEntrypoint`), the
 //! generic BFS walker, and the `apply_graph_op` apply pass.
 
-use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use ruff_db::files::File;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::graph::{intern_kind, SymbolNode};
 use crate::helpers::NODE_FLAG_ENTRYPOINT;
@@ -32,9 +32,9 @@ pub(crate) struct NodeKey {
 
 pub(crate) struct GraphBuilder {
     pub(crate) nodes: Vec<Py<SymbolNode>>,
-    pub(crate) node_index: HashMap<NodeKey, usize>,
+    pub(crate) node_index: FxHashMap<NodeKey, usize>,
     pub(crate) edges: Vec<(usize, usize, u32)>,
-    pub(crate) edge_set: HashSet<(usize, usize, u32)>,
+    pub(crate) edge_set: FxHashSet<(usize, usize, u32)>,
     /// Per-node forward / reverse adjacency lists kept in sync with
     /// ``edges``. ``bfs`` reads these so traversals are O(deg(i)) per
     /// pop instead of O(|edges|).
@@ -56,27 +56,27 @@ pub(crate) struct GraphBuilder {
     ///   stub-only ``.pyi`` (no .py twin -> flagged ``ENTRYPOINT``
     ///   so native-extension / protobuf-style stubs stay alive
     ///   artificially even when no consumer references them).
-    pub(crate) peer_pyi_to_py: HashMap<File, File>,
+    pub(crate) peer_pyi_to_py: FxHashMap<File, File>,
     /// `{ synthetic_fqname -> node idx }` for ``[external dist] X`` and
     /// ``[unresolved] X`` synthetics. Synthetics are deduplicated by
     /// fqname project-wide: every site that imports ``rustworkx``
     /// resolves to the same ``[external dist] rustworkx`` node, so
     /// reachability and the codemod's "this import has no
     /// dependents" query both work on a single anchor.
-    pub(crate) synthetic_nodes: HashMap<String, usize>,
+    pub(crate) synthetic_nodes: FxHashMap<String, usize>,
 }
 
 impl GraphBuilder {
     pub(crate) fn new() -> Self {
         Self {
             nodes: Vec::new(),
-            node_index: HashMap::new(),
+            node_index: FxHashMap::default(),
             edges: Vec::new(),
-            edge_set: HashSet::new(),
+            edge_set: FxHashSet::default(),
             forward_adj: Vec::new(),
             reverse_adj: Vec::new(),
-            peer_pyi_to_py: HashMap::new(),
-            synthetic_nodes: HashMap::new(),
+            peer_pyi_to_py: FxHashMap::default(),
+            synthetic_nodes: FxHashMap::default(),
         }
     }
 
@@ -251,8 +251,8 @@ pub(crate) fn bfs(
     seeds: impl IntoIterator<Item = usize>,
     direction: Direction,
     skip_flags: u32,
-) -> HashSet<usize> {
-    let mut visited: HashSet<usize> = HashSet::new();
+) -> FxHashSet<usize> {
+    let mut visited: FxHashSet<usize> = FxHashSet::default();
     let mut stack: Vec<usize> = seeds.into_iter().collect();
     while let Some(i) = stack.pop() {
         if !visited.insert(i) {
@@ -535,7 +535,7 @@ mod tests {
         add_edge_manual(&mut b, 1, 2, 0);
         add_edge_manual(&mut b, 0, 3, 0);
         let reachable = bfs(&b, [0], Direction::Forward, 0);
-        let expected: HashSet<usize> = [0, 1, 2, 3].into_iter().collect();
+        let expected: FxHashSet<usize> = [0, 1, 2, 3].into_iter().collect();
         assert_eq!(reachable, expected);
     }
 
@@ -546,7 +546,7 @@ mod tests {
         add_edge_manual(&mut b, 1, 2, 0);
         add_edge_manual(&mut b, 3, 2, 0);
         let ancestors = bfs(&b, [2], Direction::Reverse, 0);
-        let expected: HashSet<usize> = [0, 1, 2, 3].into_iter().collect();
+        let expected: FxHashSet<usize> = [0, 1, 2, 3].into_iter().collect();
         assert_eq!(ancestors, expected);
     }
 
@@ -558,12 +558,12 @@ mod tests {
         add_edge_manual(&mut b, 0, 2, 0);
         // With skip_flags = 1, the 0 -> 1 edge is filtered out.
         let reachable = bfs(&b, [0], Direction::Forward, 1);
-        let expected: HashSet<usize> = [0, 2].into_iter().collect();
+        let expected: FxHashSet<usize> = [0, 2].into_iter().collect();
         assert_eq!(reachable, expected);
 
         // skip_flags = 0 keeps every edge.
         let reachable_all = bfs(&b, [0], Direction::Forward, 0);
-        let expected_all: HashSet<usize> = [0, 1, 2].into_iter().collect();
+        let expected_all: FxHashSet<usize> = [0, 1, 2].into_iter().collect();
         assert_eq!(reachable_all, expected_all);
     }
 
@@ -576,13 +576,13 @@ mod tests {
             let r = bfs(&b, [0], Direction::Forward, mask);
             assert_eq!(
                 r,
-                [0].into_iter().collect::<HashSet<_>>(),
+                [0].into_iter().collect::<FxHashSet<_>>(),
                 "skip_flags=0b{mask:b} should drop the edge"
             );
         }
         // mask=0b100 doesn't intersect — edge survives.
         let r = bfs(&b, [0], Direction::Forward, 0b100);
-        assert_eq!(r, [0, 1].into_iter().collect::<HashSet<_>>());
+        assert_eq!(r, [0, 1].into_iter().collect::<FxHashSet<_>>());
     }
 
     #[test]
@@ -592,7 +592,7 @@ mod tests {
         add_edge_manual(&mut b, 1, 2, 0);
         add_edge_manual(&mut b, 2, 0, 0);
         let reachable = bfs(&b, [0], Direction::Forward, 0);
-        let expected: HashSet<usize> = [0, 1, 2].into_iter().collect();
+        let expected: FxHashSet<usize> = [0, 1, 2].into_iter().collect();
         assert_eq!(reachable, expected);
     }
 
@@ -607,7 +607,7 @@ mod tests {
     fn bfs_isolated_seed_returns_just_itself() {
         let b = empty_builder_with_n_slots(3);
         let r = bfs(&b, [2], Direction::Forward, 0);
-        assert_eq!(r, [2].into_iter().collect::<HashSet<_>>());
+        assert_eq!(r, [2].into_iter().collect::<FxHashSet<_>>());
     }
 
     #[test]
@@ -616,7 +616,7 @@ mod tests {
         add_edge_manual(&mut b, 0, 1, 0);
         add_edge_manual(&mut b, 2, 3, 0);
         let r = bfs(&b, [0, 2], Direction::Forward, 0);
-        let expected: HashSet<usize> = [0, 1, 2, 3].into_iter().collect();
+        let expected: FxHashSet<usize> = [0, 1, 2, 3].into_iter().collect();
         assert_eq!(r, expected);
     }
 
@@ -635,7 +635,7 @@ mod tests {
         add_edge_manual(&mut b, 0, 2, 1);
         add_edge_manual(&mut b, 1, 2, 0);
         let r = bfs(&b, [2], Direction::Reverse, 1);
-        let expected: HashSet<usize> = [1, 2].into_iter().collect();
+        let expected: FxHashSet<usize> = [1, 2].into_iter().collect();
         assert_eq!(r, expected);
     }
 }
