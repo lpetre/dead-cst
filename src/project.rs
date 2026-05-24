@@ -26,18 +26,19 @@ use ty_python_core::scope::FileScopeId;
 use ty_python_core::semantic_index;
 
 use crate::builder::{apply_graph_op, bfs, lookup_idx, not_materialized, Direction, GraphBuilder};
-use crate::file_payload::{file_to_edges, file_to_nodes, NodeKind, NodeRef};
-use crate::file_ref_edges::file_to_ref_edges;
+use crate::file_payload::{file_to_edges, file_to_nodes, FileEdges, NodeKind, NodeRef};
+use crate::file_ref_edges::{file_to_ref_edges, FileRefEdges};
 use crate::graph::{intern_kind, DeclIndex, Import, MainBlock, NativeGraph, SymbolNode};
 use crate::helpers::{
     call_callee_matches_var, class_body_defines_method, collect_all_imports_local,
-    collect_module_imports_local, decorators_match_imports, extract_call_args_kwargs,
-    file_decl_sites, file_path_string, find_main_block_range, find_subclass_indices_via_refs,
-    is_dunder_name, locate_class_def, locate_class_seed, matched_call_target,
-    owner_idx_for_stmt_with, range_key, rel_path, top_level_assign_to_name, AttrCallFinder,
-    CallArgs, FactoryCallFinder, StringArgCallFinder, NODE_FLAG_ENTRYPOINT,
+    collect_modules_imports_local, decorators_match_imports, extract_call_args_kwargs,
+    file_path_string, find_external_seed_direct_subclasses_par, find_main_block_range,
+    find_subclass_indices_via_refs_with_queue, is_dunder_name, locate_class_def, locate_class_seed,
+    matched_call_target_any, owner_idx_for_stmt_with, range_key, rel_path, resolve_base_fqn,
+    top_level_assign_to_name, unwrap_subscripted_callee, AttrCallFinder, CallArgs,
+    FactoryCallFinder, StringArgCallFinder, NODE_FLAG_ENTRYPOINT,
 };
-use crate::ingest::{emit_visitor_warning, string_literal_list};
+use crate::ingest::{emit_visitor_warning, file_package_name, string_literal_list};
 use crate::query::{
     _compile_path_regex, _contains_any_identifier, _contains_identifier, par_scan_files,
     QueryBuilder,
@@ -124,6 +125,19 @@ pub(crate) struct BuildOutputs {
     /// nodes — and a cheap ``imports_of_exists`` short-circuit for
     /// plugins that just need a per-module presence check.
     pub(crate) imports_by_module: FxHashMap<String, Vec<usize>>,
+    /// PROTOTYPE: project-wide class hierarchy.
+    /// `class_idx -> [direct subclass class_idx]`. Built post-assembly
+    /// by walking each top-level class def's base list and resolving
+    /// each base Name expression via per-file `exports_by_name` and the
+    /// import-alias `forward_adj` chains.
+    ///
+    /// Lets ``UnittestPlugin`` / ``InitSubclassPlugin`` do an O(N) BFS
+    /// over this map instead of calling ``find_references`` per class.
+    /// External seeds (e.g. ``unittest.TestCase``) still need
+    /// ``find_subclass_indices_via_refs`` for the first hop into the
+    /// project; once a project class is found, transitive walks use
+    /// this map.
+    pub(crate) class_children: FxHashMap<usize, Vec<usize>>,
 }
 
 /// Run the three build phases (ingest → hierarchy+imports → references)
@@ -340,19 +354,35 @@ pub(crate) fn build_project_graph(
     let module_nodes_by_file = assembled.module_nodes_by_file;
     let class_by_selection = assembled.class_by_selection;
     let decl_by_name_range = assembled.decl_by_name_range;
+    let ref_to_global = assembled.ref_to_global;
+
+    // PROTOTYPE: build the project-wide class hierarchy index.
+    let t_hierarchy = std::time::Instant::now();
+    let class_children = build_class_children(
+        db,
+        &project_files,
+        &path_to_file,
+        &class_by_selection,
+        &ref_to_global,
+        &builder.forward_adj,
+        py,
+        &builder.nodes,
+    );
+    let t_hierarchy_elapsed = t_hierarchy.elapsed();
 
     let t4 = std::time::Instant::now();
     let (decl_by_fqname, module_by_fqname, imports_by_module) = build_fqname_indices(py, &builder);
     let t_fqname = t4.elapsed();
     if timing {
         eprintln!(
-            "[dead-cst-timing] files={} nodes={} edges={} enum={:?} populate={:?} assemble={:?} fqname={:?} total={:?} rss={}MB",
+            "[dead-cst-timing] files={} nodes={} edges={} enum={:?} populate={:?} assemble={:?} class_hier={:?} fqname={:?} total={:?} rss={}MB",
             project_files.len(),
             builder.nodes.len(),
             builder.edges.len(),
             t_enum,
             t_populate_elapsed,
             t_assemble_elapsed,
+            t_hierarchy_elapsed,
             t_fqname,
             t0.elapsed(),
             current_rss_mb(),
@@ -378,6 +408,7 @@ pub(crate) fn build_project_graph(
         decl_by_fqname,
         module_by_fqname,
         imports_by_module,
+        class_children,
     })
 }
 
@@ -402,12 +433,15 @@ fn current_rss_mb() -> usize {
 /// pieces of `BuildOutputs` that the assembly pass computes from the
 /// salsa-tracked per-file payloads; the driver adds `project_files`,
 /// `path_to_file`, and the fqname indices.
-struct AssembledGraph {
+struct AssembledGraph<'db> {
     builder: GraphBuilder,
     global_index: DeclIndex,
     module_nodes_by_file: FxHashMap<File, usize>,
     class_by_selection: FxHashMap<(File, (u32, u32)), usize>,
     decl_by_name_range: FxHashMap<(File, (u32, u32)), usize>,
+    /// PROTOTYPE: kept around so the class-hierarchy builder can map
+    /// `NodeRef -> global idx`.
+    ref_to_global: FxHashMap<NodeRef<'db>, usize>,
 }
 
 /// Serial pass that converts the salsa-tracked per-file payloads
@@ -443,13 +477,37 @@ fn assemble_graph<'db>(
     db: &'db ProjectDatabase,
     project_files: &[File],
     peer_pyi_to_py: &FxHashMap<File, File>,
-) -> PyResult<AssembledGraph> {
-    let mut builder = GraphBuilder::new();
-    let mut global_index: DeclIndex = FxHashMap::default();
-    let mut module_nodes_by_file: FxHashMap<File, usize> = FxHashMap::default();
-    let mut class_by_selection: FxHashMap<(File, (u32, u32)), usize> = FxHashMap::default();
-    let mut decl_by_name_range: FxHashMap<(File, (u32, u32)), usize> = FxHashMap::default();
-    let mut ref_to_global: FxHashMap<NodeRef<'db>, usize> = FxHashMap::default();
+) -> PyResult<AssembledGraph<'db>> {
+    // Pre-count total nodes across project_files. file_to_nodes is
+    // salsa-memoized from the parallel populate phase, so this is a
+    // ~ns probe per file. Use the exact count to size the hashmaps
+    // that grow one-per-node (ref_to_global, global_index,
+    // decl_by_name_range) and skip rehashing entirely. The Vec-backed
+    // builder fields get pre-allocated too.
+    let mut total_nodes: usize = 0;
+    let mut total_decls: usize = 0;
+    for &file in project_files {
+        let nodes_len = file_to_nodes(db, file).nodes.len();
+        total_nodes += nodes_len;
+        // Index 0 of every file's nodes is the synthetic module node;
+        // everything else is a decl. So decls = nodes - 1 per file.
+        total_decls += nodes_len.saturating_sub(1);
+    }
+
+    let mut builder = GraphBuilder::with_capacity(total_nodes);
+    let mut global_index: DeclIndex =
+        FxHashMap::with_capacity_and_hasher(total_decls, Default::default());
+    let mut module_nodes_by_file: FxHashMap<File, usize> =
+        FxHashMap::with_capacity_and_hasher(project_files.len(), Default::default());
+    // class_by_selection only sees class decls — typically a small
+    // fraction of all decls, so size to a modest fraction (1/4) to
+    // dodge initial growth without wasting space.
+    let mut class_by_selection: FxHashMap<(File, (u32, u32)), usize> =
+        FxHashMap::with_capacity_and_hasher(total_decls / 4 + 1, Default::default());
+    let mut decl_by_name_range: FxHashMap<(File, (u32, u32)), usize> =
+        FxHashMap::with_capacity_and_hasher(total_decls, Default::default());
+    let mut ref_to_global: FxHashMap<NodeRef<'db>, usize> =
+        FxHashMap::with_capacity_and_hasher(total_nodes, Default::default());
     let mut all_warnings: Vec<String> = Vec::new();
 
     // Pass 1: node mint.
@@ -543,35 +601,156 @@ fn assemble_graph<'db>(
         }
     }
 
-    // Pass 2: edge translation. Skip edges with unrecognized
-    // endpoints — those reference Definitions in non-project files.
+    // Pass 2: edge translation.
+    //
+    // The pipeline is three sub-phases, designed so the heavy
+    // FxHashMap-probe loop runs without the GIL on rayon workers:
+    //
+    //   2a. Serial fetch of every file's salsa-tracked `FileEdges` /
+    //       `FileRefEdges`. Salsa returns `&'db` refs valid for the
+    //       whole assemble call; we stash them in a `Vec`.
+    //   2b. Serial pre-mint of every `NodeRef::External` endpoint
+    //       referenced by any payload. This pulls the fqname out of
+    //       salsa under the GIL and interns the synthetic node so
+    //       the parallel phase only has to read `ref_to_global`.
+    //   2c. `Python::allow_threads` + `par_iter().flat_map(...)` to
+    //       translate every `(NodeRef, NodeRef, flags)` triple into
+    //       `(usize, usize, u32)` via two `ref_to_global` probes.
+    //       Drops endpoints whose owning file wasn't enumerated.
+    //
+    // After the parallel phase, sort + dedup the triple list and
+    // bulk-insert via `extend_edges` (which still probes `edge_set`
+    // so any pre-existing edges merge cleanly).
+    //
+    // Skipped endpoints reference Definitions in non-project files.
+    //
+    // The `DEAD_CST_PASS2_SERIAL=1` env var falls back to the
+    // pre-parallel serial implementation. Kept around as a kill switch
+    // and as the baseline for the perf-bench comparison.
+
+    let t_pass2_start = std::time::Instant::now();
+    let serial_pass2 = std::env::var_os("DEAD_CST_PASS2_SERIAL").is_some();
+
+    // 2a: serial fetch. Hold borrows for the whole pass.
+    let mut edge_payloads: Vec<&FileEdges<'db>> = Vec::with_capacity(project_files.len());
+    let mut ref_edge_payloads: Vec<&FileRefEdges<'db>> = Vec::with_capacity(project_files.len());
     for &file in project_files {
-        let edges_payload = file_to_edges(db, file);
-        for &(src, dst, flags) in &edges_payload.edges {
-            let Some(src_idx) = lookup_or_mint_ref(py, db, &mut builder, &mut ref_to_global, src)?
-            else {
-                continue;
-            };
-            let Some(dst_idx) = lookup_or_mint_ref(py, db, &mut builder, &mut ref_to_global, dst)?
-            else {
-                continue;
-            };
-            builder.add_edge(src_idx, dst_idx, flags);
+        edge_payloads.push(file_to_edges(db, file));
+        ref_edge_payloads.push(file_to_ref_edges(db, file));
+    }
+
+    if serial_pass2 {
+        // Original serial path: lazy-mint Externals as encountered.
+        for payload in &edge_payloads {
+            for &(src, dst, flags) in &payload.edges {
+                let Some(src_idx) =
+                    serial_lookup_or_mint(py, db, &mut builder, &mut ref_to_global, src)?
+                else {
+                    continue;
+                };
+                let Some(dst_idx) =
+                    serial_lookup_or_mint(py, db, &mut builder, &mut ref_to_global, dst)?
+                else {
+                    continue;
+                };
+                builder.add_edge(src_idx, dst_idx, flags);
+            }
+        }
+        for payload in &ref_edge_payloads {
+            for &(src, dst, flags) in &payload.edges {
+                let Some(src_idx) =
+                    serial_lookup_or_mint(py, db, &mut builder, &mut ref_to_global, src)?
+                else {
+                    continue;
+                };
+                let Some(dst_idx) =
+                    serial_lookup_or_mint(py, db, &mut builder, &mut ref_to_global, dst)?
+                else {
+                    continue;
+                };
+                builder.add_edge(src_idx, dst_idx, flags);
+            }
+        }
+    } else {
+        // 2b: pre-mint synthetic External nodes. Walk both payload
+        // streams once and intern every `External` endpoint we
+        // haven't seen. Synthetics dedup by fqname project-wide, so
+        // this is at most `O(distinct externals)` GIL-bound interns.
+        let mut external_keys: FxHashSet<NodeRef<'db>> = FxHashSet::default();
+        for payload in &edge_payloads {
+            for &(src, dst, _) in &payload.edges {
+                if matches!(src, NodeRef::External(_)) && !ref_to_global.contains_key(&src) {
+                    external_keys.insert(src);
+                }
+                if matches!(dst, NodeRef::External(_)) && !ref_to_global.contains_key(&dst) {
+                    external_keys.insert(dst);
+                }
+            }
+        }
+        for payload in &ref_edge_payloads {
+            for &(src, dst, _) in &payload.edges {
+                if matches!(src, NodeRef::External(_)) && !ref_to_global.contains_key(&src) {
+                    external_keys.insert(src);
+                }
+                if matches!(dst, NodeRef::External(_)) && !ref_to_global.contains_key(&dst) {
+                    external_keys.insert(dst);
+                }
+            }
+        }
+        for r in external_keys {
+            if let NodeRef::External(key) = r {
+                let fqname = key.fqname(db).clone();
+                let idx = builder.intern_synthetic(py, fqname)?;
+                ref_to_global.insert(r, idx);
+            }
         }
 
-        let ref_edges_payload = file_to_ref_edges(db, file);
-        for &(src, dst, flags) in &ref_edges_payload.edges {
-            let Some(src_idx) = lookup_or_mint_ref(py, db, &mut builder, &mut ref_to_global, src)?
-            else {
-                continue;
-            };
-            let Some(dst_idx) = lookup_or_mint_ref(py, db, &mut builder, &mut ref_to_global, dst)?
-            else {
-                continue;
-            };
-            builder.add_edge(src_idx, dst_idx, flags);
-        }
-        all_warnings.extend(ref_edges_payload.warnings.iter().cloned());
+        // 2c: parallel translation. `ref_to_global` is owned + read-
+        // only from here; no GIL needed. We release the GIL with
+        // `Python::allow_threads` so rayon workers don't contend with
+        // anyone else holding it. The closure is pure-Rust HashMap
+        // probes, no salsa DB access, no Py allocations.
+        let ref_to_global_ref = &ref_to_global;
+        let edge_payloads_ref = &edge_payloads;
+        let ref_edge_payloads_ref = &ref_edge_payloads;
+        let mut triples: Vec<(usize, usize, u32)> = py.allow_threads(|| {
+            use rayon::prelude::*;
+            let from_edges = edge_payloads_ref.par_iter().flat_map_iter(|payload| {
+                payload.edges.iter().filter_map(|&(src, dst, flags)| {
+                    let src_idx = *ref_to_global_ref.get(&src)?;
+                    let dst_idx = *ref_to_global_ref.get(&dst)?;
+                    Some((src_idx, dst_idx, flags))
+                })
+            });
+            let from_refs = ref_edge_payloads_ref.par_iter().flat_map_iter(|payload| {
+                payload.edges.iter().filter_map(|&(src, dst, flags)| {
+                    let src_idx = *ref_to_global_ref.get(&src)?;
+                    let dst_idx = *ref_to_global_ref.get(&dst)?;
+                    Some((src_idx, dst_idx, flags))
+                })
+            });
+            let mut t: Vec<(usize, usize, u32)> = from_edges.chain(from_refs).collect();
+            t.par_sort_unstable();
+            t.dedup();
+            t
+        });
+
+        // Bulk-insert the translated triples. `extend_edges` keeps
+        // the `edge_set` dedup so any prior edges merge correctly.
+        builder.extend_edges(std::mem::take(&mut triples));
+    }
+
+    // Warnings are still serial — they live on `FileRefEdges` only.
+    for payload in &ref_edge_payloads {
+        all_warnings.extend(payload.warnings.iter().cloned());
+    }
+
+    if std::env::var_os("DEAD_CST_TIMING").is_some() {
+        eprintln!(
+            "[dead-cst-timing] pass2_mode={} pass2={:?}",
+            if serial_pass2 { "serial" } else { "parallel" },
+            t_pass2_start.elapsed()
+        );
     }
 
     // Pass 3: peer .pyi/.py reachability edges.
@@ -610,16 +789,175 @@ fn assemble_graph<'db>(
         module_nodes_by_file,
         class_by_selection,
         decl_by_name_range,
+        ref_to_global,
     })
 }
 
-/// Translate a `NodeRef` into its global graph index. For `Def` /
-/// `Module` already-minted nodes, this is a hashmap probe. For
-/// `External`, lazily mint the synthetic node via the builder.
-/// Returns `Ok(None)` when the NodeRef is a `Def`/`Module` whose
-/// owning file wasn't enumerated (cross-project edge endpoint that
-/// ty resolved past the project boundary).
-fn lookup_or_mint_ref<'db>(
+/// PROTOTYPE: build `class_idx -> [direct subclass class_idx]` map.
+///
+/// For each project file's top-level class definition, resolve each
+/// base expression's head Name to a graph node (via per-file
+/// `exports_by_name`), follow the resulting alias chain to a class
+/// node (via `builder.forward_adj`), and record the
+/// (class_idx, parent_class_idx) edge.
+///
+/// Limitations of this prototype:
+///
+/// * Only handles `Name(...)` and `Attribute(...)` bases with a Name
+///   root. Complex bases like `Generic[T]` aren't walked beyond the
+///   head Name.
+/// * Local-binding resolution goes through `exports_by_name` which
+///   returns the end-of-scope binding(s); we don't honour
+///   per-statement use-def chains. For simple linear files this
+///   matches `SemanticModel::resolve_name`.
+/// * If a base resolves to an import alias, we walk the alias's
+///   `forward_adj` and keep the first class target found. Doesn't
+///   cover ``from a import C as D; class X(D): ...`` chains with more
+///   than one alias hop.
+#[allow(clippy::too_many_arguments)]
+fn build_class_children<'db>(
+    db: &'db ProjectDatabase,
+    project_files: &[File],
+    path_to_file: &FxHashMap<String, File>,
+    class_by_selection: &FxHashMap<(File, (u32, u32)), usize>,
+    ref_to_global: &FxHashMap<NodeRef<'db>, usize>,
+    forward_adj: &[Vec<(usize, u32)>],
+    py: Python<'_>,
+    nodes: &[Py<SymbolNode>],
+) -> FxHashMap<usize, Vec<usize>> {
+    use crate::helpers::iter_top_level_classes;
+    let mut children: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
+
+    for &file in project_files {
+        let parsed = parsed_module(db, file).load(db);
+        let payload = file_to_nodes(db, file);
+
+        for cls in iter_top_level_classes(&parsed) {
+            let name_r = cls.name.range();
+            let rk = (name_r.start().to_u32(), name_r.end().to_u32());
+            let Some(&child_idx) = class_by_selection.get(&(file, rk)) else {
+                continue;
+            };
+
+            let Some(args) = &cls.arguments else {
+                continue;
+            };
+
+            for base in &args.args {
+                // Find the head Name + optional trailing attribute name
+                // for this base expression. Two shapes we handle:
+                //
+                // * `Cls` -> head=Cls, trailing=None
+                // * `module.Cls` -> head=module, trailing=Some("Cls")
+                // * `Generic[T]` / `Protocol[T]` -> head=Generic
+                let (head_name, trailing_attr): (Option<&str>, Option<&str>) = match base {
+                    Expr::Name(n) => (Some(n.id.as_str()), None),
+                    Expr::Attribute(a) => {
+                        if let Expr::Name(root) = a.value.as_ref() {
+                            (Some(root.id.as_str()), Some(a.attr.as_str()))
+                        } else {
+                            (None, None)
+                        }
+                    }
+                    Expr::Subscript(s) => match s.value.as_ref() {
+                        Expr::Name(n) => (Some(n.id.as_str()), None),
+                        Expr::Attribute(a) => {
+                            if let Expr::Name(root) = a.value.as_ref() {
+                                (Some(root.id.as_str()), Some(a.attr.as_str()))
+                            } else {
+                                (None, None)
+                            }
+                        }
+                        _ => (None, None),
+                    },
+                    _ => (None, None),
+                };
+                let Some(head) = head_name else {
+                    continue;
+                };
+
+                // Resolve `head` in the file's global namespace.
+                let Some(locals) = payload.exports_by_name.get(head) else {
+                    continue;
+                };
+                for &local_idx in locals {
+                    let r = payload.refs[local_idx as usize];
+                    let Some(&parent_idx) = ref_to_global.get(&r) else {
+                        continue;
+                    };
+                    let parent_kind = nodes[parent_idx].borrow(py).kind;
+                    if parent_kind == "class" && trailing_attr.is_none() {
+                        children.entry(parent_idx).or_default().push(child_idx);
+                    } else if parent_kind == "import" {
+                        match trailing_attr {
+                            None => {
+                                // `Cls` resolved to an alias node;
+                                // follow alias's forward edges to a
+                                // class target.
+                                for &(adj_idx, _) in &forward_adj[parent_idx] {
+                                    if nodes[adj_idx].borrow(py).kind == "class" {
+                                        children.entry(adj_idx).or_default().push(child_idx);
+                                        break;
+                                    }
+                                }
+                            }
+                            Some(attr_name) => {
+                                // `module.Cls`: alias likely points at
+                                // a module node; look up `attr_name` in
+                                // that target module's
+                                // exports_by_name and follow.
+                                for &(adj_idx, _) in &forward_adj[parent_idx] {
+                                    let adj_node = nodes[adj_idx].borrow(py);
+                                    if adj_node.kind != "module" {
+                                        continue;
+                                    }
+                                    // Recover the target module's `File`
+                                    // via the project-wide `path_to_file`
+                                    // index (O(1) probe) instead of a
+                                    // linear scan over `project_files`.
+                                    let target_path = adj_node.path.clone();
+                                    drop(adj_node);
+                                    let Some(&target_file) = path_to_file.get(&target_path) else {
+                                        continue;
+                                    };
+                                    let target_payload = file_to_nodes(db, target_file);
+                                    let Some(attr_locals) =
+                                        target_payload.exports_by_name.get(attr_name)
+                                    else {
+                                        continue;
+                                    };
+                                    for &al in attr_locals {
+                                        let ar = target_payload.refs[al as usize];
+                                        let Some(&attr_idx) = ref_to_global.get(&ar) else {
+                                            continue;
+                                        };
+                                        if nodes[attr_idx].borrow(py).kind == "class" {
+                                            children.entry(attr_idx).or_default().push(child_idx);
+                                        }
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Dedup each children vec — multiple bases or alias hops can
+    // produce the same edge.
+    for v in children.values_mut() {
+        v.sort_unstable();
+        v.dedup();
+    }
+    children
+}
+
+/// Serial pre-parallel Pass-2 helper: lookup-or-mint a `NodeRef` into
+/// its global graph index. Only used when `DEAD_CST_PASS2_SERIAL=1`
+/// is set (kept for A/B comparison and as a kill switch).
+fn serial_lookup_or_mint<'db>(
     py: Python<'_>,
     db: &'db ProjectDatabase,
     builder: &mut GraphBuilder,
@@ -1436,11 +1774,16 @@ impl ProjectContext {
     /// from the visitor's payload.
     pub(crate) fn find_main_blocks(&self, py: Python<'_>) -> PyResult<Vec<MainBlock>> {
         let outputs = self.materialized("find_main_blocks")?;
-        let mut out: Vec<MainBlock> = Vec::new();
+
+        // First pass: identify files that actually contain a top-level
+        // ``if __name__ == "__main__":`` block. The cheap ``__main__``
+        // substring check filters >99% of modules out before we touch
+        // the parsed AST. Only matched files contribute to the per-file
+        // decl bucketing below, so the bucket build itself is bounded
+        // by O(decls_in_matched_files) — typically a tiny fraction of
+        // the full ``global_index``.
+        let mut hits: Vec<(File, usize, (u32, u32))> = Vec::new();
         for (&file, &module_idx) in &outputs.module_nodes_by_file {
-            // Prefilter: ``if __name__ == "__main__":`` always has the
-            // literal string ``__main__`` in source. Skip the parse
-            // for files that don't even mention it.
             let source = source_text(&self.db, file);
             if !source.contains("__main__") {
                 continue;
@@ -1449,16 +1792,40 @@ impl ProjectContext {
             let Some(block_range) = find_main_block_range(&parsed) else {
                 continue;
             };
-            // Collect decls whose target_range falls within block_range.
+            hits.push((
+                file,
+                module_idx,
+                (block_range.start().to_u32(), block_range.end().to_u32()),
+            ));
+        }
+        if hits.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Build a per-file bucket of (start, end, node_idx) for just the
+        // matched files. Previously we linearly scanned the entire
+        // ``global_index`` for *every* matched file, giving us
+        // O(F_with_main × N_global_decls) — death on large projects.
+        // One sweep here turns the inner loop into a bucket lookup.
+        let matched_files: FxHashSet<File> = hits.iter().map(|(f, _, _)| *f).collect();
+        let mut decls_by_file: FxHashMap<File, Vec<(u32, u32, usize)>> = FxHashMap::default();
+        for ((entry_file, _place_id, (start, end)), idx) in &outputs.global_index {
+            if matched_files.contains(entry_file) {
+                decls_by_file
+                    .entry(*entry_file)
+                    .or_default()
+                    .push((*start, *end, *idx));
+            }
+        }
+
+        let mut out: Vec<MainBlock> = Vec::with_capacity(hits.len());
+        for (file, module_idx, (block_start, block_end)) in hits {
             let mut decls: Vec<Py<SymbolNode>> = Vec::new();
-            for ((entry_file, _place_id, (start, end)), idx) in &outputs.global_index {
-                if *entry_file != file {
-                    continue;
-                }
-                let block_start = block_range.start().to_u32();
-                let block_end = block_range.end().to_u32();
-                if *start >= block_start && *end <= block_end {
-                    decls.push(outputs.builder.nodes[*idx].clone_ref(py));
+            if let Some(file_decls) = decls_by_file.get(&file) {
+                for &(start, end, idx) in file_decls {
+                    if start >= block_start && end <= block_end {
+                        decls.push(outputs.builder.nodes[idx].clone_ref(py));
+                    }
                 }
             }
             out.push((outputs.builder.nodes[module_idx].clone_ref(py), decls));
@@ -1485,7 +1852,7 @@ impl ProjectContext {
     pub(crate) fn find_decorated_decls(
         &self,
         py: Python<'_>,
-        decorator_module: &str,
+        decorator_modules: &[String],
         decorator_names: Vec<String>,
         path_regex: Option<&str>,
     ) -> PyResult<Vec<(Py<SymbolNode>, CallArgs)>> {
@@ -1506,6 +1873,7 @@ impl ProjectContext {
         let path_re_ref = &path_re;
         let names_ref = &names;
         let needles_ref: &[&str] = &needle_strs;
+        let modules_ref: &[String] = decorator_modules;
         let pairs: Vec<(usize, CallArgs)> = py.allow_threads(move || {
             par_scan_files(db_handle, project_files, path_re_ref, |db, file| {
                 let source = source_text(db, file);
@@ -1513,7 +1881,13 @@ impl ProjectContext {
                     return Vec::new();
                 }
                 let parsed = parsed_module(db, file).load(db);
-                let imports = collect_module_imports_local(&parsed, decorator_module, names_ref);
+                let file_package = file_package_name(db, file);
+                let imports = collect_modules_imports_local(
+                    &parsed,
+                    modules_ref,
+                    names_ref,
+                    file_package.as_deref(),
+                );
                 if imports.is_empty() {
                     return Vec::new();
                 }
@@ -1563,7 +1937,7 @@ impl ProjectContext {
     pub(crate) fn find_instance_constructions(
         &self,
         py: Python<'_>,
-        module: &str,
+        modules: &[String],
         ctor_names: Vec<String>,
         path_regex: Option<&str>,
     ) -> PyResult<Vec<(Py<SymbolNode>, String, CallArgs)>> {
@@ -1578,6 +1952,7 @@ impl ProjectContext {
         let path_re_ref = &path_re;
         let allowed_ref = &allowed;
         let needles_ref: &[&str] = &needle_strs;
+        let modules_ref: &[String] = modules;
         let pairs: Vec<(usize, String, CallArgs)> = py.allow_threads(move || {
             par_scan_files(db_handle, project_files, path_re_ref, |db, file| {
                 let source = source_text(db, file);
@@ -1585,7 +1960,13 @@ impl ProjectContext {
                     return Vec::new();
                 }
                 let parsed = parsed_module(db, file).load(db);
-                let imports = collect_module_imports_local(&parsed, module, allowed_ref);
+                let file_package = file_package_name(db, file);
+                let imports = collect_modules_imports_local(
+                    &parsed,
+                    modules_ref,
+                    allowed_ref,
+                    file_package.as_deref(),
+                );
                 if imports.is_empty() {
                     return Vec::new();
                 }
@@ -1597,7 +1978,8 @@ impl ProjectContext {
                         None => continue,
                     };
                     let Expr::Call(call) = value else { continue };
-                    if let Some(matched) = matched_call_target(call, &imports, module, allowed_ref)
+                    if let Some(matched) =
+                        matched_call_target_any(call, &imports, modules_ref, allowed_ref)
                     {
                         let key = (file, range_key(target_range));
                         if let Some(&idx) = decl_by_name_range.get(&key) {
@@ -1665,6 +2047,10 @@ impl ProjectContext {
                                 Expr::Call(call) => (&*call.func, Some(call)),
                                 other => (other, None),
                             };
+                        // ``@app.route[T]()`` — unwrap the leading
+                        // subscript so the attribute walk matches the
+                        // bare ``@app.route(...)`` shape.
+                        let root_expr = unwrap_subscripted_callee(root_expr);
                         let Expr::Attribute(attr) = root_expr else {
                             continue;
                         };
@@ -1742,6 +2128,7 @@ impl ProjectContext {
                                 Expr::Call(call) => (&*call.func, Some(call)),
                                 other => (other, None),
                             };
+                        let root_expr = unwrap_subscripted_callee(root_expr);
                         let Expr::Attribute(outer) = root_expr else {
                             continue;
                         };
@@ -1848,10 +2235,9 @@ impl ProjectContext {
     }
 }
 
-#[pymethods]
 impl ProjectContext {
     /// Top-level functions / classes whose body constructs one of
-    /// ``ctor_names`` imported from ``module``.
+    /// ``ctor_names`` imported from any of ``modules``.
     ///
     /// Recursively walks each candidate's body looking for ``<Ctor>(...)``
     /// or ``<module>.<Ctor>(...)`` call expressions. Returns
@@ -1863,7 +2249,7 @@ impl ProjectContext {
     pub(crate) fn find_factory_decls(
         &self,
         py: Python<'_>,
-        module: &str,
+        modules: &[String],
         ctor_names: Vec<String>,
     ) -> PyResult<Vec<(Py<SymbolNode>, Vec<String>)>> {
         let outputs = self.materialized("find_factory_decls")?;
@@ -1874,6 +2260,7 @@ impl ProjectContext {
         let db_handle: Box<dyn ProjectDb> = ProjectDb::dyn_clone(&self.db);
         let allowed_ref = &allowed;
         let needles_ref: &[&str] = &needle_strs;
+        let modules_ref: &[String] = modules;
         let pairs: Vec<(usize, Vec<String>)> = py.allow_threads(move || {
             par_scan_files(db_handle, project_files, &None, |db, file| {
                 let source = source_text(db, file);
@@ -1881,7 +2268,13 @@ impl ProjectContext {
                     return Vec::new();
                 }
                 let parsed = parsed_module(db, file).load(db);
-                let imports = collect_module_imports_local(&parsed, module, allowed_ref);
+                let file_package = file_package_name(db, file);
+                let imports = collect_modules_imports_local(
+                    &parsed,
+                    modules_ref,
+                    allowed_ref,
+                    file_package.as_deref(),
+                );
                 if imports.is_empty() {
                     return Vec::new();
                 }
@@ -1894,7 +2287,7 @@ impl ProjectContext {
                     };
                     let mut finder = FactoryCallFinder {
                         imports: &imports,
-                        module,
+                        modules: modules_ref,
                         allowed: allowed_ref,
                         kinds: FxHashSet::default(),
                     };
@@ -1933,7 +2326,7 @@ impl ProjectContext {
     pub(crate) fn find_calls_to_imported(
         &self,
         py: Python<'_>,
-        module: &str,
+        modules: &[String],
         name: &str,
         arg_index: usize,
         path_regex: Option<&str>,
@@ -1948,6 +2341,7 @@ impl ProjectContext {
         let db_handle: Box<dyn ProjectDb> = ProjectDb::dyn_clone(&self.db);
         let path_re_ref = &path_re;
         let allowed_ref = &allowed;
+        let modules_ref: &[String] = modules;
         let triples: Vec<(usize, String, CallArgs)> = py.allow_threads(move || {
             par_scan_files(db_handle, project_files, path_re_ref, |db, file| {
                 let source = source_text(db, file);
@@ -1955,7 +2349,13 @@ impl ProjectContext {
                     return Vec::new();
                 }
                 let parsed = parsed_module(db, file).load(db);
-                let imports = collect_module_imports_local(&parsed, module, allowed_ref);
+                let file_package = file_package_name(db, file);
+                let imports = collect_modules_imports_local(
+                    &parsed,
+                    modules_ref,
+                    allowed_ref,
+                    file_package.as_deref(),
+                );
                 if imports.is_empty() {
                     return Vec::new();
                 }
@@ -1972,7 +2372,8 @@ impl ProjectContext {
                     };
                     let mut finder = StringArgCallFinder {
                         predicate: |call: &ruff_python_ast::ExprCall| {
-                            matched_call_target(call, &imports, module, allowed_ref).is_some()
+                            matched_call_target_any(call, &imports, modules_ref, allowed_ref)
+                                .is_some()
                         },
                         arg_index,
                         file_imports: &file_imports,
@@ -2143,21 +2544,49 @@ impl ProjectContext {
         }
         let outputs = self.materialized("find_subclasses_of")?;
 
-        let Some((seed_file, seed_range)) = locate_class_def(
+        // PROTOTYPE: try the in-memory class-hierarchy index first.
+        // The seed is a project class node, so we can locate it
+        // directly in `class_by_selection` without an AST walk.
+        if let Some((seed_file, seed_range)) = locate_class_def(
             &self.db,
             &outputs.path_to_file,
             &class_node.path,
             class_node,
-        ) else {
-            return Ok(Vec::new());
-        };
-        let out_idx =
-            find_subclass_indices_via_refs(&self.db, &outputs, seed_file, seed_range, true);
-        Ok(out_idx
-            .into_iter()
-            .map(|idx| outputs.builder.nodes[idx].clone_ref(py))
-            .collect())
+        ) {
+            let rk = (seed_range.start().to_u32(), seed_range.end().to_u32());
+            if let Some(&seed_idx) = outputs.class_by_selection.get(&(seed_file, rk)) {
+                let out_idx = transitive_subclasses_via_index(seed_idx, &outputs.class_children);
+                return Ok(out_idx
+                    .into_iter()
+                    .map(|idx| outputs.builder.nodes[idx].clone_ref(py))
+                    .collect());
+            }
+        }
+        Ok(Vec::new())
     }
+}
+
+/// PROTOTYPE: BFS from `seed_idx` through `class_children`. Returns
+/// the transitive closure (excluding the seed itself).
+fn transitive_subclasses_via_index(
+    seed_idx: usize,
+    class_children: &FxHashMap<usize, Vec<usize>>,
+) -> Vec<usize> {
+    let mut seen: FxHashSet<usize> = FxHashSet::default();
+    let mut out: Vec<usize> = Vec::new();
+    let mut stack: Vec<usize> = vec![seed_idx];
+    while let Some(cur) = stack.pop() {
+        let Some(kids) = class_children.get(&cur) else {
+            continue;
+        };
+        for &k in kids {
+            if seen.insert(k) {
+                out.push(k);
+                stack.push(k);
+            }
+        }
+    }
+    out
 }
 
 impl ProjectContext {
@@ -2175,7 +2604,8 @@ impl ProjectContext {
                 "expected a dotted decorator fqn (e.g. 'pytest.fixture'), got {decorator_fqn:?}"
             )));
         };
-        self.find_decorated_decls(py, module, vec![name.to_string()], path_regex)
+        let modules = [module.to_string()];
+        self.find_decorated_decls(py, &modules, vec![name.to_string()], path_regex)
     }
 
     #[allow(clippy::type_complexity)]
@@ -2206,7 +2636,8 @@ impl ProjectContext {
                 }
             }
         }
-        let triples = self.find_instance_constructions(py, module, ctors, path_regex)?;
+        let modules = [module.to_string()];
+        let triples = self.find_instance_constructions(py, &modules, ctors, path_regex)?;
         Ok(triples
             .into_iter()
             .map(|(node, _name, call_args)| (node, call_args))
@@ -2259,9 +2690,269 @@ impl ProjectContext {
         else {
             return Ok(Vec::new());
         };
-        let out_idx =
-            find_subclass_indices_via_refs(&self.db, &outputs, seed_file, seed_range, transitive);
+        // Project seeds: use the in-memory class-hierarchy index for
+        // an O(deg) BFS. Built once at the end of ``assemble_graph``
+        // (see ``build_class_children``); short-circuits every
+        // intra-project subclass query.
+        let rk = (seed_range.start().to_u32(), seed_range.end().to_u32());
+        if let Some(&seed_idx) = outputs.class_by_selection.get(&(seed_file, rk)) {
+            let out_idx = if transitive {
+                transitive_subclasses_via_index(seed_idx, &outputs.class_children)
+            } else {
+                outputs
+                    .class_children
+                    .get(&seed_idx)
+                    .cloned()
+                    .unwrap_or_default()
+            };
+            return Ok(out_idx
+                .into_iter()
+                .map(|idx| outputs.builder.nodes[idx].clone_ref(py))
+                .collect());
+        }
+
+        // External seeds (seed file lives outside the project, e.g.
+        // ``typer.Typer``'s definition in the typer package): the
+        // first ``ty_ide::find_references`` hop dominates and is what
+        // every dispatch-app plugin pays for. Pre-collect the direct
+        // first-hop subclasses via a parallel per-file AST scan over
+        // project files (text-prefiltered on the seed's bare name),
+        // and skip ``find_references`` entirely when no project file
+        // even imports the seed module.
+        //
+        // The ``Python::allow_threads`` wrap releases the GIL so the
+        // internal ``rayon::scope`` inside ``find_references`` (and
+        // the ``par_scan_files`` helper used for the fast path) can
+        // run without GIL contention, matching the pattern used by
+        // ``find_decorated_decls``.
+        let class_by_selection = &outputs.class_by_selection;
+        let class_children = &outputs.class_children;
+        let project_files: &[File] = &outputs.project_files;
+        // ``base_fqn`` splits into ``(seed_module, seed_simple_name)``;
+        // both halves are required for the fast path.
+        let seed_split: Option<(String, String)> = base_fqn
+            .rsplit_once('.')
+            .map(|(m, n)| (m.to_string(), n.to_string()));
+        // ``ProjectDatabase`` is ``!Sync`` (salsa's per-thread query
+        // stack lives in a ``RefCell``), so we can't move ``&self.db``
+        // into the ``allow_threads`` closure directly. Hand out a
+        // ``Box<dyn ProjectDb>`` snapshot — the ``ProjectDb`` trait
+        // object carries ``Send``, and ``find_references`` already
+        // takes ``&dyn Db``.
+        let db_handle: Box<dyn ProjectDb> = ProjectDb::dyn_clone(&self.db);
+        let direct: Vec<usize> = py.allow_threads(move || {
+            let db: &dyn ProjectDb = &*db_handle;
+            // Parallel AST-scan + import-presence sweep over project
+            // files serves two roles:
+            //
+            //   1. **Fast-path direct subclasses.** Identifies the
+            //      common ``from <module> import <Name>; class
+            //      X(<Name>):`` shape without paying ty's expensive
+            //      ``find_references`` setup. Those classes are
+            //      pre-recorded as hits and seeded into the BFS.
+            //
+            //   2. **"Re-export possible?" presence check.** If no
+            //      project file imports ``<seed_module>`` in any
+            //      form, there's no chain through which a re-export
+            //      could surface — we can skip the find_references
+            //      walk on the external seed entirely. This is the
+            //      main optimization for plugins like
+            //      ``DispatchAppPlugin(typer.Typer)`` /
+            //      ``DispatchAppPlugin(fastapi.FastAPI)`` where the
+            //      project usually has zero subclasses of the
+            //      framework class.
+            type FileRangeList = Vec<(File, TextRange)>;
+            let (initial_queue, prefound): (FileRangeList, FileRangeList) =
+                if let Some((module, name)) = seed_split.as_ref() {
+                    let res =
+                        find_external_seed_direct_subclasses_par(db, project_files, module, name);
+                    let initial = if res.any_project_file_imports_seed_module {
+                        vec![(seed_file, seed_range)]
+                    } else {
+                        Vec::new()
+                    };
+                    (initial, res.direct_classes)
+                } else {
+                    (vec![(seed_file, seed_range)], Vec::new())
+                };
+            find_subclass_indices_via_refs_with_queue(
+                db,
+                class_by_selection,
+                initial_queue,
+                &prefound,
+                /*transitive=*/ false,
+            )
+        });
+        // BFS the in-memory class-hierarchy index from each direct hit
+        // for the transitive walk — cheaper than recursing back through
+        // ``find_references``.
+        let mut out_idx: FxHashSet<usize> = direct.iter().copied().collect();
+        if transitive {
+            for &d in &direct {
+                for idx in transitive_subclasses_via_index(d, class_children) {
+                    out_idx.insert(idx);
+                }
+            }
+        }
         Ok(out_idx
+            .into_iter()
+            .map(|idx| outputs.builder.nodes[idx].clone_ref(py))
+            .collect())
+    }
+
+    /// Find every project class that transitively inherits from any
+    /// fqname in ``base_fqns``, by inverting the search: instead of
+    /// asking ty's ``find_references`` to walk down from each base
+    /// (which has to load + parse the framework module out of the
+    /// venv), do a single parallel scan over project files, read each
+    /// top-level class's base list, resolve each base against the
+    /// file's imports, and check membership in the target set.
+    ///
+    /// Returns project class nodes (transitive closure). External
+    /// targets are matched by fqname only — the framework module is
+    /// never loaded. This is the cold-path complement of
+    /// :meth:`find_subclasses` for the common "do any project classes
+    /// extend ``flask.Flask``?" question.
+    ///
+    /// Match shapes per base expression in the class header:
+    /// * ``Name(X)`` where ``X`` is imported via
+    ///   ``from <module> import X [as alias]`` resolving the import
+    ///   to ``<module>.X``;
+    /// * ``Attribute(Name(M).N)`` where ``M`` is bound via
+    ///   ``import <module> [as M]``, matching ``<module>.N``;
+    /// * Dotted-path ``a.b.c.N`` matching when the full path equals a
+    ///   target fqname (rare, but handles ``import flask;
+    ///   class X(flask.Flask): ...`` literally).
+    /// Generic parameterizations (``class X(Foo[T])``) are not
+    /// supported — matches a syntactic base name only.
+    pub(crate) fn find_subclasses_via_bases(
+        &self,
+        py: Python<'_>,
+        base_fqns: Vec<String>,
+    ) -> PyResult<Vec<Py<SymbolNode>>> {
+        let outputs = self.materialized("find_subclasses_via_bases")?;
+        // Build set of target fqnames and (module → {simple_names})
+        // for fast per-base resolution.
+        if base_fqns.is_empty() {
+            return Ok(Vec::new());
+        }
+        // No text prefilter: a file containing a transitive subclass
+        // (``class GrandApp(MyApp): ...``) might not mention the
+        // framework's simple name at all. We need to parse every
+        // project file once and capture every ``ClassDef``'s base
+        // list — then the BFS over the collected (child, base_fqn)
+        // pairs handles transitive closure without re-scanning.
+        // Parsing is cheap (and already done during materialize), so
+        // this stays competitive with the ty find_references path.
+        let decl_by_name_range = &outputs.decl_by_name_range;
+        let class_by_selection = &outputs.class_by_selection;
+        let project_files: &[File] = &outputs.project_files;
+        let db_handle: Box<dyn ProjectDb> = ProjectDb::dyn_clone(&self.db);
+
+        // Materialize idx → fqname BEFORE allow_threads so the
+        // parallel scan can use it without the GIL.
+        let idx_fqname: Vec<String> = outputs
+            .builder
+            .nodes
+            .iter()
+            .map(|n| n.borrow(py).fqname.clone())
+            .collect();
+        let idx_fqname_ref = &idx_fqname;
+
+        // Per-file output: list of (child_class_idx, base_fqn).
+        // base_fqn is whatever the class header resolves to (project
+        // class fqname OR external fqname OR module.simple — anything
+        // a syntactic resolution can produce). The caller filters to
+        // the target set + BFS for transitive closure.
+        let pairs: Vec<(usize, String)> = py.allow_threads(move || {
+            par_scan_files(db_handle, project_files, &None, |db, file| {
+                let parsed = parsed_module(db, file).load(db);
+                // Cheap pre-walk filter: skip files with no
+                // top-level ClassDef at all.
+                if !parsed
+                    .syntax()
+                    .body
+                    .iter()
+                    .any(|s| matches!(s, Stmt::ClassDef(_)))
+                {
+                    return Vec::new();
+                }
+                let file_imports = collect_all_imports_local(&parsed);
+                // Same-file top-level classes — base references that
+                // are bare ``Name`` and not imported can resolve to a
+                // class defined earlier in this file.
+                let file_local_classes: FxHashMap<&str, usize> = parsed
+                    .syntax()
+                    .body
+                    .iter()
+                    .filter_map(|stmt| {
+                        let Stmt::ClassDef(cls) = stmt else {
+                            return None;
+                        };
+                        let key = (file, range_key(cls.name.range()));
+                        let idx = class_by_selection
+                            .get(&key)
+                            .copied()
+                            .or_else(|| decl_by_name_range.get(&key).copied())?;
+                        Some((cls.name.as_str(), idx))
+                    })
+                    .collect();
+                let mut local: Vec<(usize, String)> = Vec::new();
+                for stmt in &parsed.syntax().body {
+                    let Stmt::ClassDef(cls) = stmt else { continue };
+                    let Some(args) = &cls.arguments else { continue };
+                    let child_key = (file, range_key(cls.name.range()));
+                    let Some(&child_idx) = class_by_selection
+                        .get(&child_key)
+                        .or_else(|| decl_by_name_range.get(&child_key))
+                    else {
+                        continue;
+                    };
+                    for arg in &args.args {
+                        // Try import resolution first.
+                        if let Some(base_fqn) = resolve_base_fqn(arg, &file_imports) {
+                            local.push((child_idx, base_fqn));
+                            continue;
+                        }
+                        // Fallback: same-file class name reference.
+                        if let ruff_python_ast::Expr::Name(name) = arg {
+                            if let Some(&base_idx) = file_local_classes.get(name.id.as_str()) {
+                                let base_fqn = idx_fqname_ref[base_idx].clone();
+                                local.push((child_idx, base_fqn));
+                            }
+                        }
+                    }
+                }
+                local
+            })
+        });
+
+        // Build base_fqn → [child_class_idx] index. Drives both the
+        // direct-target filter AND the transitive BFS — pairs already
+        // covers every base→child edge we saw in the project, not
+        // just target hits.
+        let mut by_base: FxHashMap<String, Vec<usize>> = FxHashMap::default();
+        for (idx, base_fqn) in pairs {
+            by_base.entry(base_fqn).or_default().push(idx);
+        }
+
+        // BFS from each target fqname through `by_base`.
+        let mut visited: FxHashSet<usize> = FxHashSet::default();
+        let mut frontier: Vec<String> = base_fqns.into_iter().collect();
+        while let Some(seed_fqn) = frontier.pop() {
+            let Some(children) = by_base.get(&seed_fqn) else {
+                continue;
+            };
+            for &child in children {
+                if visited.insert(child) {
+                    // Next round: walk subclasses of this project
+                    // class via its own fqname.
+                    frontier.push(idx_fqname[child].clone());
+                }
+            }
+        }
+
+        Ok(visited
             .into_iter()
             .map(|idx| outputs.builder.nodes[idx].clone_ref(py))
             .collect())
@@ -2282,11 +2973,14 @@ impl ProjectContext {
         let regex = self.compile_regex(pattern)?;
         let outputs = self.materialized("find_comment_patterns")?;
         let mut out = Vec::new();
+        // Per-file bucketed view of `global_index`, materialized lazily on
+        // the first matching comment anywhere in the project. The naive
+        // approach filtered `global_index` once per matched file — O(F × N).
+        // Bucketing once flips that to O(N) + O(1) per matched file.
+        let mut decls_by_file: Option<FxHashMap<File, Vec<(u32, usize)>>> = None;
         for &file in &outputs.project_files {
             let parsed = parsed_module(&self.db, file).load(&self.db);
             let source = source_text(&self.db, file);
-            // Lazy — files with no matching comments skip the decl scan.
-            let mut file_decls: Option<Vec<(u32, usize)>> = None;
             for token in parsed.tokens() {
                 if token.kind() != TokenKind::Comment {
                     continue;
@@ -2296,8 +2990,19 @@ impl ProjectContext {
                 if !regex.is_match(text) {
                     continue;
                 }
-                let decls =
-                    file_decls.get_or_insert_with(|| file_decl_sites(file, &outputs.global_index));
+                let bucket = decls_by_file.get_or_insert_with(|| {
+                    let mut m: FxHashMap<File, Vec<(u32, usize)>> = FxHashMap::default();
+                    for ((f, _, (start, _)), &idx) in &outputs.global_index {
+                        m.entry(*f).or_default().push((*start, idx));
+                    }
+                    for sites in m.values_mut() {
+                        sites.sort_by_key(|(s, _)| *s);
+                    }
+                    m
+                });
+                let Some(decls) = bucket.get(&file) else {
+                    continue;
+                };
                 let comment_end = range.end().to_u32();
                 let i = decls.partition_point(|(start, _)| *start < comment_end);
                 let Some(&(_, decl_idx)) = decls.get(i) else {

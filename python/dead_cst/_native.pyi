@@ -10,7 +10,8 @@ mirrors the rust-side rustdoc, and a behavior change in the crate
 should land in both places at once.
 """
 
-from typing import Any, Iterable, Iterator, Literal, Protocol
+import re
+from typing import Any, Iterable, Iterator, Literal, Protocol, Sequence
 
 # The set of stable kind strings ``SymbolNode.kind`` can carry. Use a
 # ``Literal`` rather than ``str`` so the type checker catches typos at
@@ -377,6 +378,37 @@ class ProjectContext:
         don't want to round-trip through a string. Direct subtypes
         come from ty's ``type_hierarchy_subtypes``; results that don't
         land in the project (stdlib / external classes) are dropped.
+        """
+        ...
+
+    def find_subclasses_via_bases(self, base_fqns: list[str]) -> list[SymbolNode]:
+        """Every project class that transitively inherits from any
+        fqname in ``base_fqns``, computed by walking the project's
+        ``ClassDef`` base lists directly instead of asking ty's
+        ``find_references`` to walk down from each base.
+
+        Roughly equivalent to calling :meth:`find_subclasses` once per
+        ``base_fqn`` and unioning the results — but the framework
+        modules are never loaded out of the venv, so cold-cache cost
+        scales with project file count rather than venv parse cost.
+        Useful when the targets are external classes that ty would
+        otherwise force-load (``flask.Flask``, ``typer.Typer``, …).
+
+        Match shapes per base expression in a class header:
+
+        * ``Name(X)`` where ``X`` is imported via
+          ``from <module> import X [as alias]`` resolves to
+          ``<module>.X``;
+        * ``Attribute(Name(M).N)`` where ``M`` is bound via
+          ``import <module> [as M]`` resolves to ``<module>.N``;
+        * dotted ``a.b.c.N`` rooted at an imported name resolves to
+          ``<a-upstream>.b.c.N``;
+        * a bare ``Name(X)`` referring to a class defined in the same
+          file (``class Sub(Local): ...``).
+
+        Generic parameterizations (``class C(Foo[T])``) and other
+        non-identifier base expressions are skipped — accept that
+        cost; it matches the libcst pipeline's behavior.
         """
         ...
 
@@ -783,7 +815,7 @@ class QueryBuilder:
     Filtered streams (terminated by ``.collect()``):
     :meth:`decorators` / :meth:`constructions` / :meth:`calls` /
     :meth:`subclasses` / :meth:`imports` / :meth:`classes` /
-    :meth:`factories`.
+    :meth:`factories` / :meth:`edges`.
 
     Point lookups (e.g. :meth:`ProjectContext.find_module`,
     :meth:`ProjectContext.find_declarations`,
@@ -801,13 +833,23 @@ class QueryBuilder:
     def imports(self) -> ImportQuery: ...
     def classes(self) -> ClassQuery: ...
     def factories(self) -> FactoryQuery: ...
+    def edges(self) -> EdgeQuery: ...
+    def decls(self) -> DeclQuery: ...
 
 class DecoratorQuery:
     """Find decorated top-level functions / classes. Pick exactly one
     of the four decorator-shape predicates per chain — mixing raises
     ``ValueError`` at ``collect()`` time."""
 
-    def where_module(self, module: str) -> DecoratorQuery: ...
+    def where_module(self, module: str | list[str]) -> DecoratorQuery:
+        """Filter decorators to those resolved through an import of
+        ``module``. Pass a list to match any of several modules (OR
+        semantics — useful for framework-family predicates like
+        ``["flask", "quart"]``). A single string is the common case
+        and stays supported.
+        """
+        ...
+
     def where_callee(self, fqn: str) -> DecoratorQuery: ...
     def where_name(self, names: str | list[str] | tuple[str, ...]) -> DecoratorQuery: ...
     def where_owner_attr(self, attrs: str | list[str] | tuple[str, ...]) -> DecoratorQuery: ...
@@ -835,7 +877,13 @@ class DecoratorQuery:
 class ConstructionQuery:
     """Find module-scope ``<var> = <Ctor>(...)`` sites."""
 
-    def where_module(self, module: str) -> ConstructionQuery: ...
+    def where_module(self, module: str | list[str]) -> ConstructionQuery:
+        """Filter constructions to those whose constructor is imported
+        from ``module``. Pass a list to match any of several modules
+        (OR semantics).
+        """
+        ...
+
     def where_name(self, names: str | list[str] | tuple[str, ...]) -> ConstructionQuery: ...
     def where_class(self, fqn: str, *, include_subclasses: bool = False) -> ConstructionQuery: ...
     def where_path(self, regex: str) -> ConstructionQuery: ...
@@ -851,7 +899,13 @@ class CallQuery:
     index. Pick one of the three receiver shapes per chain.
     """
 
-    def where_module(self, module: str) -> CallQuery: ...
+    def where_module(self, module: str | list[str]) -> CallQuery:
+        """Filter calls to those whose callee is imported from
+        ``module``. Pass a list to match any of several modules (OR
+        semantics).
+        """
+        ...
+
     def where_name(self, name: str) -> CallQuery: ...
     def where_owner(self, owner: str) -> CallQuery: ...
     def where_attr(self, attr: str) -> CallQuery: ...
@@ -947,11 +1001,104 @@ class FactoryQuery:
     Mirrors :meth:`ProjectContext.find_factory_decls`.
     """
 
-    def of_module(self, module: str) -> FactoryQuery: ...
+    def of_module(self, module: str | list[str]) -> FactoryQuery:
+        """Filter to factories whose constructed type is imported from
+        ``module``. Pass a list to match any of several modules (OR
+        semantics).
+        """
+        ...
+
     def where_name(self, names: str | list[str] | tuple[str, ...]) -> FactoryQuery: ...
     def collect(self) -> list[FactoryRef]: ...
     def count(self) -> int: ...
     def __iter__(self) -> Iterator[FactoryRef]: ...
+
+class EdgeRef:
+    """One graph edge with both endpoint nodes resolved.
+
+    Avoids the ``nodes[src_idx]`` / ``nodes[dst_idx]`` ping-pong that a
+    Python-side ``for src_idx, dst_idx, flags in ctx.edges()`` loop pays.
+    """
+
+    src: SymbolNode
+    dst: SymbolNode
+    flags: int
+
+class EdgeQuery:
+    """Filtered enumeration over the in-progress graph's edges.
+
+    Predicates AND together; any unset predicate doesn't filter. The
+    entire filter runs rust-side and only the surviving rows are
+    materialized into ``Py<SymbolNode>``.
+    """
+
+    def with_flags(self, mask: int) -> EdgeQuery:
+        """Keep edges where ``flags & mask != 0``. Pass an
+        :class:`EdgeFlags` constant (or OR of constants) to filter to
+        a specific edge classification.
+        """
+        ...
+
+    def with_src_kind(self, kind: str) -> EdgeQuery:
+        """Keep edges whose ``src`` node has the given ``kind``
+        (``"module"``, ``"function"``, ``"import"``, …). Matches by
+        exact string compare against :attr:`SymbolNode.kind`.
+        """
+        ...
+
+    def with_dst_kind(self, kind: str) -> EdgeQuery:
+        """Keep edges whose ``dst`` node has the given ``kind``."""
+        ...
+
+    def collect(self) -> list[EdgeRef]: ...
+    def first(self) -> EdgeRef | None: ...
+    def count(self) -> int: ...
+    def __iter__(self) -> Iterator[EdgeRef]: ...
+
+class DeclQuery:
+    """Generic filter over every interned node in the in-progress graph.
+
+    Folds the per-node Python filter loops that show up in plugins
+    (filter on ``kind``, basename, simple-name, flag mask, path set,
+    path regex) down into one rust pass. All configured predicates are
+    AND-ed; an empty predicate set yields every node.
+    """
+
+    def with_kind(self, kind: str) -> DeclQuery: ...
+    def with_kinds(self, kinds: str | list[str] | tuple[str, ...]) -> DeclQuery: ...
+    def with_filename(self, name: str) -> DeclQuery: ...
+    def with_filenames(self, names: str | list[str] | tuple[str, ...]) -> DeclQuery: ...
+    def with_simple_name(self, name: str) -> DeclQuery: ...
+    def with_simple_names(self, names: str | list[str] | tuple[str, ...]) -> DeclQuery: ...
+    def with_paths(self, paths: str | list[str] | tuple[str, ...]) -> DeclQuery: ...
+    def with_path_regex(self, regex: str) -> DeclQuery: ...
+    def with_flags(self, mask: int) -> DeclQuery:
+        """Restrict to nodes whose ``flags & mask == mask`` (all bits set)."""
+        ...
+
+    def with_any_flag(self, mask: int) -> DeclQuery:
+        """Restrict to nodes whose ``flags & mask != 0`` (any bit set)."""
+        ...
+
+    def with_fqname_prefix(self, prefix: str) -> DeclQuery: ...
+    def where_fqname(
+        self,
+        value: str | re.Pattern[str] | Sequence[str | re.Pattern[str]],
+    ) -> DeclQuery:
+        """Restrict to nodes whose ``fqname`` matches the predicate.
+
+        Accepts any combination of ``str`` (literal equality) and
+        ``re.Pattern`` (regex match). A sequence value matches when
+        the node's ``fqname`` matches any element. ``re.Pattern``
+        instances are recompiled rust-side using rust's ``regex``
+        crate, so any PCRE-only syntax raises ``ValueError`` at the
+        call site (not later at ``collect``).
+        """
+        ...
+
+    def collect(self) -> list[SymbolNode]: ...
+    def count(self) -> int: ...
+    def __iter__(self) -> Iterator[SymbolNode]: ...
 
 # ---------- Graph persistence --------------------------------------------
 

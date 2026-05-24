@@ -9,6 +9,122 @@ two versions.
 
 ## [Unreleased]
 
+## [0.12.1] - 2026-05-24
+
+### Changed
+- `ProjectContext.find_comment_patterns` no longer rescans the
+  project-wide `global_index` once per file with a matching comment.
+  The per-file `(start, decl_idx)` list is now bucketed lazily on the
+  first match anywhere in the project (O(N) once instead of
+  O(matched_files × N)). The internal `file_decl_sites` helper is
+  removed; it had only one caller and was the source of the quadratic
+  scan.
+- `ProjectContext.find_main_blocks` (powering `MainBlockPlugin`) has
+  the same O(matched_files × all_decls) anti-pattern fixed. A cheap
+  text + AST prefilter identifies the matched-file set first, then
+  one sweep of `global_index` buckets only those files. On a
+  synthetic 1000-file project where every file carries a `__main__`
+  block, the plugin's cold delta drops from +3.3 ms to noise; at
+  2000 files it drops from +13.8 ms to +5.1 ms.
+- The `assemble_graph` pass now pre-counts the total node population
+  from the salsa-memoized `file_to_nodes` payloads and uses the sum
+  to `with_capacity_and_hasher` its five FxHashMaps + the `GraphBuilder`
+  Vec-backed fields, eliminating rehash work as the maps grow.
+- `build_class_children` resolves Attribute-base modules
+  (`module.Cls`) via the `path_to_file` index instead of a linear
+  `project_files.iter().find(...)` scan keyed on path-string
+  equality.
+- Pass 2 (edge translation) in `assemble_graph` now runs
+  GIL-free under `Python::allow_threads` + rayon
+  `par_iter().flat_map_iter().filter_map()` + `par_sort_unstable() +
+  dedup()`. Externals are pre-minted serially first so the parallel
+  section is pure FxHashMap probing — no `unsafe`, no salsa
+  snapshotting. On a 5000-file synthetic the `pass2` phase drops
+  from ~5.6 ms to ~3.4 ms (~40 %) and its stdev compresses ~2.5×.
+  Small-N (~200 files) pays a ~150 µs dispatch tax that's
+  invisible in wall-clock; serial path retained behind
+  `DEAD_CST_PASS2_SERIAL=1` as an A/B knob + kill switch.
+- Subclass queries (`find_subclasses`, `find_subclasses_of`, powering
+  `UnittestPlugin`, `InitSubclassPlugin`, and `DispatchAppPlugin`'s
+  `include_subclasses=True` path) build a project-wide
+  parent→children index once at the end of `assemble_graph` and BFS
+  the index, instead of calling `ty_ide::find_references` per BFS
+  seed. On an 800-file / 3,200-class synthetic project,
+  `InitSubclassPlugin`'s cold delta drops from +1129 ms to +4 ms
+  (~280×); `UnittestPlugin` drops from +302 ms to +22 ms (~14×).
+  Index build cost is ~125 µs at 200 files / ~700 µs at 800 files
+  (~0.5 % of cold materialize).
+- External-seed subclass queries (`DispatchAppPlugin(typer.Typer)`,
+  `DispatchAppPlugin(fastapi.FastAPI)`, …) now do a parallel
+  AST-scan over project files for direct subclasses and skip the
+  expensive `find_references` walk entirely when no project file
+  imports the seed module. On `flux0_server` (no typer imports)
+  `DispatchAppPlugin(typer.Typer)` drops from +117.9 ms to
+  +26.2 ms; on `dead_cst` self (no fastapi imports)
+  `DispatchAppPlugin(fastapi.FastAPI)` drops from +16.7 ms to
+  noise. Synthetic 100-file project with every file importing
+  `typer`: +605 ms → +540 ms.
+- `DispatchAppPlugin`'s framework-subclass discovery is inverted:
+  instead of asking ty "what subclasses framework class F" (which
+  loads F's module from the venv to run `find_references`), the
+  plugin now uses a new `ctx.find_subclasses_via_bases(base_fqns)`
+  query that walks project files in parallel, resolves each class's
+  base list against local imports, and builds a `base_fqn →
+  children` index — never touching the venv. On a 333-file
+  synthetic with `flask`: +171 ms → +19 ms; 663-file with
+  `typer`: +369 ms → +33 ms (11×); the subclass walk itself
+  collapses 154 ms → 0.4 ms (~385×).
+
+### Fixed
+- `where_module` / `of_module` now accept `str | list[str]` on every
+  chainable that has them (`DecoratorQuery`, `ConstructionQuery`,
+  `CallQuery`, `FactoryQuery`, `SubclassQuery`). List semantics is
+  OR — match if the row's module is any element. Empty list silently
+  matches nothing.
+- Syntactic matchers (`query.decorators` / `.constructions` /
+  `.calls` / `.factories`) now resolve relative imports. Decorators
+  / constructions / calls imported via `from .foo import N` or
+  `from ..pkg import N` no longer slip through `where_module(...)
+  .where_name(N)` filters.
+- `query.constructions.where_name(N)` now matches subscripted
+  constructors (`Generic[T]()`, `Logger[Self]("name")`, …). The
+  callee classifier strips one level of `Expr::Subscript` before
+  matching, mirroring how Python evaluates them.
+
+### Added
+- `Plugin.prepare(self, repo_root: Path) -> None` pre-graph hook.
+  Called once per plugin per `Analysis.materialize_all` invocation,
+  before any graph construction. Default is a no-op; plugins that
+  need to scan the repo for config files (`pyproject.toml`,
+  framework manifests, etc.) or compute setup state independent of
+  the graph should override. Exceptions raised inside propagate
+  before the `ProjectContext` is constructed.
+- `ctx.query().edges()` chainable query with `.with_flags(mask)`,
+  `.with_src_kind(kind)`, `.with_dst_kind(kind)` predicates and
+  `.collect()` / `.first()` / `.count()` terminals. Returns
+  `EdgeRef` rows with `src` / `dst` `SymbolNode`s already resolved.
+  `DynamicImportFallbackPlugin` migrated to use it — on a synthetic
+  project with 1,800 dynamic-import edges, the filter loop is 3.06×
+  faster (1.235 ms → 0.403 ms best-of-12).
+- `ctx.query().decls()` chainable query with `.with_kind` /
+  `.with_kinds`, `.with_filename` / `.with_filenames`,
+  `.with_simple_name` / `.with_simple_names`, `.with_paths`,
+  `.with_path_regex`, `.with_flags` / `.with_any_flag`,
+  `.with_fqname_prefix`, and `.where_fqname` predicates. Returns
+  `SymbolNode` rows directly. `where_fqname` accepts `str`,
+  `list[str]`, `re.Pattern`, `list[re.Pattern]`, or any mixed
+  sequence — literal equality and regex search OR together,
+  empty list is the matches-nothing sentinel.
+  Five plugins migrated off Python-side `ctx.nodes()`
+  filter loops with the following warm-best-of-12 wins on the
+  flux0 workspace (1,933 nodes):
+  * `ServerConfigPlugin`: 36.55 ms → 0.24 ms (~153×, the
+    `pathlib.Path(...).name` Python hop was the killer).
+  * `DiscordPyPlugin`: 1.32 ms → 0.07 ms (~18.8×).
+  * `UnittestPlugin`: 0.87 ms → 0.09 ms (~9.9×).
+  * `DispatchAppPlugin` vars-by-file scan: 0.68 ms → 0.27 ms (~2.5×).
+  * `PytestPlugin`: 1.00 ms → 0.46 ms (~2.2×).
+
 ## [0.12.0] - 2026-05-24
 
 ### Changed
@@ -1583,7 +1699,8 @@ versions until the first stable release.
 - `README.md`, `CONTRIBUTING.md`, `CHANGELOG.md`, and `ROADMAP.md` with a
   stack-ranked plan from alpha to 1.0.
 
-[Unreleased]: https://github.com/lpetre/dead-cst/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/lpetre/dead-cst/compare/v0.12.1...HEAD
+[0.12.1]: https://github.com/lpetre/dead-cst/compare/v0.12.0...v0.12.1
 [0.12.0]: https://github.com/lpetre/dead-cst/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/lpetre/dead-cst/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/lpetre/dead-cst/compare/v0.9.4...v0.10.0

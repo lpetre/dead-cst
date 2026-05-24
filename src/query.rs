@@ -6,7 +6,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::PyClass;
 use ruff_db::files::File;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use ty_project::Db as ProjectDb;
 
 use crate::graph::SymbolNode;
@@ -111,9 +111,9 @@ impl CallRef {
 /// Entry point for the chainable query API. Returned by
 /// :meth:`ProjectContext.query`. Pick a stream type:
 /// :meth:`decorators`, :meth:`constructions`, :meth:`calls`,
-/// :meth:`subclasses`, :meth:`imports`, :meth:`classes`, or
-/// :meth:`factories`. Point lookups (``module``, ``declarations``,
-/// ``main_blocks``, etc.) live directly on
+/// :meth:`subclasses`, :meth:`imports`, :meth:`classes`,
+/// :meth:`factories`, or :meth:`edges`. Point lookups (``module``,
+/// ``declarations``, ``main_blocks``, etc.) live directly on
 /// :class:`ProjectContext`.
 #[pyclass(unsendable)]
 pub(crate) struct QueryBuilder {
@@ -143,6 +143,12 @@ impl QueryBuilder {
     fn factories(&self, py: Python<'_>) -> FactoryQuery {
         FactoryQuery::new(self.ctx.clone_ref(py))
     }
+    fn edges(&self, py: Python<'_>) -> EdgeQuery {
+        EdgeQuery::new(self.ctx.clone_ref(py))
+    }
+    fn decls(&self, py: Python<'_>) -> DeclQuery {
+        DeclQuery::new(self.ctx.clone_ref(py))
+    }
 }
 
 pub(crate) fn _extract_str_or_list(py: Python<'_>, obj: PyObject) -> PyResult<Vec<String>> {
@@ -152,6 +158,63 @@ pub(crate) fn _extract_str_or_list(py: Python<'_>, obj: PyObject) -> PyResult<Ve
     } else {
         bound.extract::<Vec<String>>()
     }
+}
+
+/// Extract either a single ``str``, a single ``re.Pattern``, a
+/// ``list[str]``, a ``list[re.Pattern]``, or a mixed sequence of both,
+/// returning ``(literals, compiled_regexes)``. Empty lists yield two
+/// empty vecs. Anything else raises ``TypeError``; invalid regex
+/// patterns raise ``ValueError`` with the pattern in the message.
+///
+/// Used by ``DeclQuery::where_fqname`` so the predicate accepts the
+/// same four input shapes ``re.fullmatch`` callers reach for.
+pub(crate) fn _extract_str_or_regex_or_list(
+    py: Python<'_>,
+    obj: PyObject,
+) -> PyResult<(Vec<String>, Vec<regex::Regex>)> {
+    let bound = obj.bind(py);
+    let mut literals: Vec<String> = Vec::new();
+    let mut regexes: Vec<regex::Regex> = Vec::new();
+    let pattern_type = py.import_bound("re")?.getattr("Pattern")?;
+
+    // Single str.
+    if let Ok(s) = bound.extract::<String>() {
+        literals.push(s);
+        return Ok((literals, regexes));
+    }
+    // Single ``re.Pattern``.
+    if bound.is_instance(&pattern_type)? {
+        let pat: String = bound.getattr("pattern")?.extract()?;
+        regexes.push(
+            regex::Regex::new(&pat)
+                .map_err(|e| PyValueError::new_err(format!("invalid regex {pat:?}: {e}")))?,
+        );
+        return Ok((literals, regexes));
+    }
+    // List / tuple / any iterable of str | re.Pattern.
+    if let Ok(seq) = bound.iter() {
+        for item in seq {
+            let item = item?;
+            if let Ok(s) = item.extract::<String>() {
+                literals.push(s);
+            } else if item.is_instance(&pattern_type)? {
+                let pat: String = item.getattr("pattern")?.extract()?;
+                regexes.push(
+                    regex::Regex::new(&pat).map_err(|e| {
+                        PyValueError::new_err(format!("invalid regex {pat:?}: {e}"))
+                    })?,
+                );
+            } else {
+                return Err(pyo3::exceptions::PyTypeError::new_err(
+                    "expected str | re.Pattern in sequence",
+                ));
+            }
+        }
+        return Ok((literals, regexes));
+    }
+    Err(pyo3::exceptions::PyTypeError::new_err(
+        "expected str | list[str] | re.Pattern | list[re.Pattern]",
+    ))
 }
 
 /// Compile an optional path regex once for a query's file-iteration
@@ -322,7 +385,9 @@ macro_rules! impl_query_methods {
 
 /// Find decorated top-level functions / classes. Pick exactly one of:
 /// * ``where_module(m).where_name(n)`` — ``@m.x`` / ``@x`` where ``x``
-///   is imported from ``m``.
+///   is imported from ``m``. ``m`` may be a single module string or a
+///   list of modules (OR semantics — keep the row if its decorator
+///   resolves through an import of any module in the list).
 /// * ``where_callee(fqn)`` — fqn-form ``@<fqn>``.
 /// * ``where_owner_attr(attrs)`` — ``@<owner>.<attr>(...)``;
 ///   ``decorator_owner`` carries the textual prefix.
@@ -333,7 +398,7 @@ macro_rules! impl_query_methods {
 #[pyclass(unsendable)]
 pub(crate) struct DecoratorQuery {
     pub(crate) ctx: Py<ProjectContext>,
-    pub(crate) module: Option<String>,
+    pub(crate) modules: Option<Vec<String>>,
     pub(crate) callee_fqn: Option<String>,
     pub(crate) names: Option<Vec<String>>,
     pub(crate) owner_attrs: Option<Vec<String>>,
@@ -347,7 +412,7 @@ impl DecoratorQuery {
     fn new(ctx: Py<ProjectContext>) -> Self {
         Self {
             ctx,
-            module: None,
+            modules: None,
             callee_fqn: None,
             names: None,
             owner_attrs: None,
@@ -361,9 +426,13 @@ impl DecoratorQuery {
 
 #[pymethods]
 impl DecoratorQuery {
-    fn where_module<'py>(mut slf: PyRefMut<'py, Self>, module: String) -> PyRefMut<'py, Self> {
-        slf.module = Some(module);
-        slf
+    fn where_module<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        module: PyObject,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let py = slf.py();
+        slf.modules = Some(_extract_str_or_list(py, module)?);
+        Ok(slf)
     }
     fn where_callee<'py>(mut slf: PyRefMut<'py, Self>, fqn: String) -> PyRefMut<'py, Self> {
         slf.callee_fqn = Some(fqn);
@@ -506,8 +575,8 @@ impl DecoratorQuery {
                     },
                 )?);
             }
-        } else if let (Some(module), Some(names)) = (&self.module, &self.names) {
-            let decls = ctx.find_decorated_decls(py, module, names.clone(), path_regex)?;
+        } else if let (Some(modules), Some(names)) = (&self.modules, &self.names) {
+            let decls = ctx.find_decorated_decls(py, modules, names.clone(), path_regex)?;
             for (d, call_args) in decls {
                 if !call_args_match_kwargs(&call_args, kwarg_matchers) {
                     continue;
@@ -542,10 +611,14 @@ impl_query_methods!(with_first DecoratorQuery, DecoratorRef);
 /// Find module-scope ``<var> = <Ctor>(...)`` sites. Pick exactly one
 /// of ``where_module + where_name`` or
 /// ``where_class(fqn, include_subclasses=...)``.
+///
+/// ``where_module`` accepts either a single module string or a list of
+/// modules (OR semantics — match if the constructor is imported from
+/// any of them).
 #[pyclass(unsendable)]
 pub(crate) struct ConstructionQuery {
     pub(crate) ctx: Py<ProjectContext>,
-    pub(crate) module: Option<String>,
+    pub(crate) modules: Option<Vec<String>>,
     pub(crate) names: Option<Vec<String>>,
     pub(crate) class_fqn: Option<String>,
     pub(crate) include_subclasses: bool,
@@ -556,7 +629,7 @@ impl ConstructionQuery {
     fn new(ctx: Py<ProjectContext>) -> Self {
         Self {
             ctx,
-            module: None,
+            modules: None,
             names: None,
             class_fqn: None,
             include_subclasses: false,
@@ -567,9 +640,13 @@ impl ConstructionQuery {
 
 #[pymethods]
 impl ConstructionQuery {
-    fn where_module<'py>(mut slf: PyRefMut<'py, Self>, module: String) -> PyRefMut<'py, Self> {
-        slf.module = Some(module);
-        slf
+    fn where_module<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        module: PyObject,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let py = slf.py();
+        slf.modules = Some(_extract_str_or_list(py, module)?);
+        Ok(slf)
     }
     fn where_name<'py>(
         mut slf: PyRefMut<'py, Self>,
@@ -616,8 +693,9 @@ impl ConstructionQuery {
                     },
                 )?);
             }
-        } else if let (Some(module), Some(names)) = (&self.module, &self.names) {
-            let triples = ctx.find_instance_constructions(py, module, names.clone(), path_regex)?;
+        } else if let (Some(modules), Some(names)) = (&self.modules, &self.names) {
+            let triples =
+                ctx.find_instance_constructions(py, modules, names.clone(), path_regex)?;
             for (var, name, call_args) in triples {
                 let args = args_to_py_vec(py, &call_args.args, nodes);
                 let kwargs = kwargs_to_py_map(py, &call_args.kwargs, nodes);
@@ -646,14 +724,15 @@ impl_query_methods!(with_first ConstructionQuery, ConstructionRef);
 /// Find call sites whose positional string-literal at the configured
 /// index is captured. :meth:`string_arg_at` is required. Pick one of:
 /// * ``where_module(m).where_name(n)`` — call to ``n`` imported from
-///   ``m``.
+///   ``m``. ``m`` may be a single string or a list of modules (OR
+///   semantics).
 /// * ``where_owner(o).where_attr(a)`` — ``<o>.<a>(...)`` literal
 ///   receiver match.
 /// * ``where_attr(a)`` — ``<expr>.<a>(...)`` any receiver.
 #[pyclass(unsendable)]
 pub(crate) struct CallQuery {
     pub(crate) ctx: Py<ProjectContext>,
-    pub(crate) module: Option<String>,
+    pub(crate) modules: Option<Vec<String>>,
     pub(crate) name: Option<String>,
     pub(crate) owner: Option<String>,
     pub(crate) attr: Option<String>,
@@ -667,7 +746,7 @@ impl CallQuery {
     fn new(ctx: Py<ProjectContext>) -> Self {
         Self {
             ctx,
-            module: None,
+            modules: None,
             name: None,
             owner: None,
             attr: None,
@@ -681,9 +760,13 @@ impl CallQuery {
 
 #[pymethods]
 impl CallQuery {
-    fn where_module<'py>(mut slf: PyRefMut<'py, Self>, module: String) -> PyRefMut<'py, Self> {
-        slf.module = Some(module);
-        slf
+    fn where_module<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        module: PyObject,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let py = slf.py();
+        slf.modules = Some(_extract_str_or_list(py, module)?);
+        Ok(slf)
     }
     fn where_name<'py>(mut slf: PyRefMut<'py, Self>, name: String) -> PyRefMut<'py, Self> {
         slf.name = Some(name);
@@ -737,8 +820,8 @@ impl CallQuery {
             .arg_index
             .ok_or_else(|| PyValueError::new_err("CallQuery: .string_arg_at(index) is required"))?;
         let path_regex = self.path_regex.as_deref();
-        let triples = if let (Some(module), Some(name)) = (&self.module, &self.name) {
-            ctx.find_calls_to_imported(py, module, name, arg_index, path_regex)?
+        let triples = if let (Some(modules), Some(name)) = (&self.modules, &self.name) {
+            ctx.find_calls_to_imported(py, modules, name, arg_index, path_regex)?
         } else if let (Some(owner), Some(attr)) = (&self.owner, &self.attr) {
             ctx.find_calls_on_var(
                 py,
@@ -946,10 +1029,13 @@ impl FactoryRef {
 /// Walk function / class bodies for ``<Ctor>(...)`` calls where
 /// ``Ctor`` is imported from ``of_module(...)`` and matches one of
 /// ``where_name(...)``. Both filters are required.
+///
+/// ``of_module`` accepts either a single module string or a list of
+/// modules (OR semantics).
 #[pyclass(unsendable)]
 pub(crate) struct FactoryQuery {
     pub(crate) ctx: Py<ProjectContext>,
-    pub(crate) module: Option<String>,
+    pub(crate) modules: Option<Vec<String>>,
     pub(crate) names: Option<Vec<String>>,
 }
 
@@ -957,7 +1043,7 @@ impl FactoryQuery {
     fn new(ctx: Py<ProjectContext>) -> Self {
         Self {
             ctx,
-            module: None,
+            modules: None,
             names: None,
         }
     }
@@ -965,9 +1051,13 @@ impl FactoryQuery {
 
 #[pymethods]
 impl FactoryQuery {
-    fn of_module<'py>(mut slf: PyRefMut<'py, Self>, module: String) -> PyRefMut<'py, Self> {
-        slf.module = Some(module);
-        slf
+    fn of_module<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        module: PyObject,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let py = slf.py();
+        slf.modules = Some(_extract_str_or_list(py, module)?);
+        Ok(slf)
     }
     fn where_name<'py>(
         mut slf: PyRefMut<'py, Self>,
@@ -979,15 +1069,15 @@ impl FactoryQuery {
     }
     fn collect(&self, py: Python<'_>) -> PyResult<Vec<Py<FactoryRef>>> {
         let ctx = self.ctx.borrow(py);
-        let module = self
-            .module
-            .as_deref()
+        let modules = self
+            .modules
+            .as_ref()
             .ok_or_else(|| PyValueError::new_err("FactoryQuery requires .of_module(...)"))?;
         let names = self
             .names
             .clone()
             .ok_or_else(|| PyValueError::new_err("FactoryQuery requires .where_name(...)"))?;
-        let pairs = ctx.find_factory_decls(py, module, names)?;
+        let pairs = ctx.find_factory_decls(py, modules, names)?;
         pairs
             .into_iter()
             .map(|(decl, kinds)| Py::new(py, FactoryRef { decl, kinds }))
@@ -996,6 +1086,397 @@ impl FactoryQuery {
 }
 
 impl_query_methods!(no_first FactoryQuery);
+
+// ---------------------------------------------------------------------------
+// EdgeQuery — filtered enumeration over the in-progress graph's edges
+// ---------------------------------------------------------------------------
+
+/// One graph edge with both endpoint nodes resolved. Avoids the
+/// `nodes[src_idx]` / `nodes[dst_idx]` ping-pong that a Python-side
+/// ``for src_idx, dst_idx, flags in ctx.edges()`` loop pays.
+#[pyclass(frozen, get_all)]
+pub(crate) struct EdgeRef {
+    pub(crate) src: Py<SymbolNode>,
+    pub(crate) dst: Py<SymbolNode>,
+    pub(crate) flags: u32,
+}
+
+/// Filtered enumeration over the in-progress graph's edges. Predicates
+/// AND together; any unset predicate doesn't filter.
+///
+/// * ``with_flags(mask)`` — keep edges where ``flags & mask != 0``.
+/// * ``with_src_kind(kind)`` / ``with_dst_kind(kind)`` — keep edges
+///   whose endpoint ``SymbolNode.kind`` matches the given string.
+///
+/// Avoids the per-edge Python ↔ rust FFI hop that a
+/// ``for src_idx, dst_idx, flags in ctx.edges()`` plus
+/// ``nodes = ctx.nodes(); nodes[src_idx]`` pattern pays — the entire
+/// filter runs rust-side and only the surviving rows are materialized
+/// into ``Py<SymbolNode>``.
+#[pyclass(unsendable)]
+pub(crate) struct EdgeQuery {
+    pub(crate) ctx: Py<ProjectContext>,
+    pub(crate) flag_mask: Option<u32>,
+    pub(crate) src_kind: Option<String>,
+    pub(crate) dst_kind: Option<String>,
+}
+
+impl EdgeQuery {
+    fn new(ctx: Py<ProjectContext>) -> Self {
+        Self {
+            ctx,
+            flag_mask: None,
+            src_kind: None,
+            dst_kind: None,
+        }
+    }
+}
+
+#[pymethods]
+impl EdgeQuery {
+    /// Keep edges where ``flags & mask != 0``. Pass an
+    /// ``EdgeFlags`` constant (or OR of constants) to filter to a
+    /// specific edge classification.
+    fn with_flags<'py>(mut slf: PyRefMut<'py, Self>, mask: u32) -> PyRefMut<'py, Self> {
+        slf.flag_mask = Some(mask);
+        slf
+    }
+    /// Keep edges whose ``src`` node has the given ``kind`` (``"module"``,
+    /// ``"function"``, ``"import"``, …). Matches by exact string compare
+    /// against ``SymbolNode.kind``.
+    fn with_src_kind<'py>(mut slf: PyRefMut<'py, Self>, kind: String) -> PyRefMut<'py, Self> {
+        slf.src_kind = Some(kind);
+        slf
+    }
+    /// Keep edges whose ``dst`` node has the given ``kind``.
+    fn with_dst_kind<'py>(mut slf: PyRefMut<'py, Self>, kind: String) -> PyRefMut<'py, Self> {
+        slf.dst_kind = Some(kind);
+        slf
+    }
+
+    fn collect(&self, py: Python<'_>) -> PyResult<Vec<Py<EdgeRef>>> {
+        let ctx = self.ctx.borrow(py);
+        let outputs = ctx.materialized("EdgeQuery.collect")?;
+        let nodes: &[Py<SymbolNode>] = &outputs.builder.nodes;
+        let edges: &[(usize, usize, u32)] = &outputs.builder.edges;
+        let flag_mask = self.flag_mask;
+        let src_kind = self.src_kind.as_deref();
+        let dst_kind = self.dst_kind.as_deref();
+        let mut refs: Vec<Py<EdgeRef>> = Vec::new();
+        for &(src_idx, dst_idx, flags) in edges {
+            if let Some(mask) = flag_mask {
+                if flags & mask == 0 {
+                    continue;
+                }
+            }
+            // Endpoint-kind predicates: borrow only the side(s) the
+            // caller actually filtered on so the common
+            // ``with_flags(...)`` shape pays nothing for kind checks.
+            if let Some(needle) = src_kind {
+                if nodes[src_idx].borrow(py).kind != needle {
+                    continue;
+                }
+            }
+            if let Some(needle) = dst_kind {
+                if nodes[dst_idx].borrow(py).kind != needle {
+                    continue;
+                }
+            }
+            refs.push(Py::new(
+                py,
+                EdgeRef {
+                    src: nodes[src_idx].clone_ref(py),
+                    dst: nodes[dst_idx].clone_ref(py),
+                    flags,
+                },
+            )?);
+        }
+        Ok(refs)
+    }
+}
+
+impl_query_methods!(with_first EdgeQuery, EdgeRef);
+
+// ---------------------------------------------------------------------------
+// DeclQuery — generic node-stream filter
+// ---------------------------------------------------------------------------
+
+/// Generic filter over every interned node in the in-progress graph.
+///
+/// Folds the per-node Python filter loops that show up in plugins
+/// (filter on ``kind``, basename, simple-name, flag mask, path set,
+/// path regex) down into one rust pass. All configured predicates are
+/// AND-ed; an empty predicate set yields every node.
+///
+/// Pick the predicate(s) you need and call ``.collect()`` /
+/// ``.first()`` / ``.count()`` / iterate. Predicates that take a
+/// ``list[str]`` short-circuit on length-1 to avoid the hashset
+/// overhead; pass a single ``str`` to the singular form when you
+/// already know it's one.
+#[pyclass(unsendable)]
+pub(crate) struct DeclQuery {
+    pub(crate) ctx: Py<ProjectContext>,
+    pub(crate) kinds: Option<Vec<String>>,
+    pub(crate) filenames: Option<Vec<String>>,
+    pub(crate) simple_names: Option<Vec<String>>,
+    pub(crate) paths: Option<Vec<String>>,
+    pub(crate) path_regex: Option<String>,
+    pub(crate) flags_mask: Option<u32>,
+    pub(crate) flags_match_any: bool,
+    pub(crate) fqname_prefix: Option<String>,
+    /// `where_fqname` literal-string candidates. ``None`` if the
+    /// predicate isn't configured; ``Some(vec)`` if at least one
+    /// literal was passed. Combined with ``fqname_regexes`` via OR.
+    pub(crate) fqname_literals: Option<Vec<String>>,
+    /// `where_fqname` compiled-regex candidates. ``None`` if the
+    /// predicate isn't configured; ``Some(vec)`` if at least one
+    /// ``re.Pattern`` was passed. Combined with ``fqname_literals``
+    /// via OR.
+    pub(crate) fqname_regexes: Option<Vec<regex::Regex>>,
+}
+
+impl DeclQuery {
+    fn new(ctx: Py<ProjectContext>) -> Self {
+        Self {
+            ctx,
+            kinds: None,
+            filenames: None,
+            simple_names: None,
+            paths: None,
+            path_regex: None,
+            flags_mask: None,
+            flags_match_any: false,
+            fqname_prefix: None,
+            fqname_literals: None,
+            fqname_regexes: None,
+        }
+    }
+}
+
+#[pymethods]
+impl DeclQuery {
+    /// Restrict to nodes with this ``kind`` string (``"function"`` /
+    /// ``"class"`` / ``"variable"`` / ``"import"`` / ``"module"`` /
+    /// ``"synthetic"`` / ``"type_alias"``).
+    fn with_kind<'py>(mut slf: PyRefMut<'py, Self>, kind: String) -> PyRefMut<'py, Self> {
+        slf.kinds = Some(vec![kind]);
+        slf
+    }
+    /// Restrict to nodes whose ``kind`` is in ``kinds``.
+    fn with_kinds<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        kinds: PyObject,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let py = slf.py();
+        slf.kinds = Some(_extract_str_or_list(py, kinds)?);
+        Ok(slf)
+    }
+    /// Restrict to nodes whose file basename equals ``name``.
+    fn with_filename<'py>(mut slf: PyRefMut<'py, Self>, name: String) -> PyRefMut<'py, Self> {
+        slf.filenames = Some(vec![name]);
+        slf
+    }
+    /// Restrict to nodes whose file basename is in ``names``.
+    fn with_filenames<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        names: PyObject,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let py = slf.py();
+        slf.filenames = Some(_extract_str_or_list(py, names)?);
+        Ok(slf)
+    }
+    /// Restrict to nodes whose ``fqname.rsplit('.', 1)[-1]`` equals
+    /// ``name`` (i.e. the trailing segment).
+    fn with_simple_name<'py>(mut slf: PyRefMut<'py, Self>, name: String) -> PyRefMut<'py, Self> {
+        slf.simple_names = Some(vec![name]);
+        slf
+    }
+    /// Restrict to nodes whose trailing fqname segment is in ``names``.
+    fn with_simple_names<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        names: PyObject,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let py = slf.py();
+        slf.simple_names = Some(_extract_str_or_list(py, names)?);
+        Ok(slf)
+    }
+    /// Restrict to nodes whose absolute path is in ``paths``.
+    fn with_paths<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        paths: PyObject,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let py = slf.py();
+        slf.paths = Some(_extract_str_or_list(py, paths)?);
+        Ok(slf)
+    }
+    /// Restrict to nodes whose absolute path matches ``regex``.
+    fn with_path_regex<'py>(mut slf: PyRefMut<'py, Self>, regex: String) -> PyRefMut<'py, Self> {
+        slf.path_regex = Some(regex);
+        slf
+    }
+    /// Restrict to nodes whose ``flags & mask == mask`` (all bits in
+    /// ``mask`` are set).
+    fn with_flags<'py>(mut slf: PyRefMut<'py, Self>, mask: u32) -> PyRefMut<'py, Self> {
+        slf.flags_mask = Some(mask);
+        slf.flags_match_any = false;
+        slf
+    }
+    /// Restrict to nodes whose ``flags & mask != 0`` (any bit in
+    /// ``mask`` is set).
+    fn with_any_flag<'py>(mut slf: PyRefMut<'py, Self>, mask: u32) -> PyRefMut<'py, Self> {
+        slf.flags_mask = Some(mask);
+        slf.flags_match_any = true;
+        slf
+    }
+    /// Restrict to nodes whose ``fqname`` starts with ``prefix``.
+    fn with_fqname_prefix<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        prefix: String,
+    ) -> PyRefMut<'py, Self> {
+        slf.fqname_prefix = Some(prefix);
+        slf
+    }
+
+    /// Restrict to nodes whose ``fqname`` matches the predicate.
+    /// Accepts ``str`` (literal equality), ``list[str]`` (literal
+    /// equality against any element), ``re.Pattern`` (full-string
+    /// regex search), ``list[re.Pattern]`` (any-of regex search),
+    /// or a mixed sequence of ``str`` and ``re.Pattern`` (literal
+    /// equality OR regex search). ``re.Pattern`` instances are
+    /// recompiled rust-side using rust's ``regex`` crate, so any
+    /// PCRE-only syntax is rejected with ``ValueError`` at this
+    /// call.
+    fn where_fqname<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        value: PyObject,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let py = slf.py();
+        let (literals, regexes) = _extract_str_or_regex_or_list(py, value)?;
+        slf.fqname_literals = if literals.is_empty() {
+            // An empty literal vec is the "matches-nothing" sentinel —
+            // consistent with ``where_name([])`` semantics elsewhere in
+            // the DSL. We still need to flip ``Some`` so the collect
+            // predicate kicks in (otherwise a sole empty list would
+            // match everything).
+            Some(Vec::new())
+        } else {
+            Some(literals)
+        };
+        slf.fqname_regexes = if regexes.is_empty() {
+            None
+        } else {
+            Some(regexes)
+        };
+        Ok(slf)
+    }
+
+    fn collect(&self, py: Python<'_>) -> PyResult<Vec<Py<SymbolNode>>> {
+        let ctx = self.ctx.borrow(py);
+        let outputs = ctx.materialized("DeclQuery.collect")?;
+        let path_regex = _compile_path_regex(self.path_regex.as_deref())?;
+
+        // Pre-compute hashsets for predicates that take lists. Singular
+        // forms reuse the same vec (length 1) so the hashset cost is
+        // amortized over the per-node loop.
+        let kinds_set: Option<FxHashSet<&str>> = self
+            .kinds
+            .as_ref()
+            .map(|v| v.iter().map(String::as_str).collect());
+        let filenames_set: Option<FxHashSet<&str>> = self
+            .filenames
+            .as_ref()
+            .map(|v| v.iter().map(String::as_str).collect());
+        let simple_set: Option<FxHashSet<&str>> = self
+            .simple_names
+            .as_ref()
+            .map(|v| v.iter().map(String::as_str).collect());
+        let paths_set: Option<FxHashSet<&str>> = self
+            .paths
+            .as_ref()
+            .map(|v| v.iter().map(String::as_str).collect());
+        let fqname_literals_set: Option<FxHashSet<&str>> = self
+            .fqname_literals
+            .as_ref()
+            .map(|v| v.iter().map(String::as_str).collect());
+
+        let mut out = Vec::new();
+        for node_py in &outputs.builder.nodes {
+            let node = node_py.borrow(py);
+            // kind
+            if let Some(k) = &kinds_set {
+                if !k.contains(node.kind) {
+                    continue;
+                }
+            }
+            // paths (exact set match against absolute path)
+            if let Some(p) = &paths_set {
+                if !p.contains(node.path.as_str()) {
+                    continue;
+                }
+            }
+            // filename basename
+            if let Some(f) = &filenames_set {
+                let path = node.path.as_str();
+                let basename = path
+                    .rsplit_once(std::path::MAIN_SEPARATOR)
+                    .map(|(_, name)| name)
+                    .unwrap_or(path);
+                if !f.contains(basename) {
+                    continue;
+                }
+            }
+            // simple name (last fqname segment)
+            if let Some(s) = &simple_set {
+                let fq = node.fqname.as_str();
+                let simple = fq.rsplit_once('.').map(|(_, n)| n).unwrap_or(fq);
+                if !s.contains(simple) {
+                    continue;
+                }
+            }
+            // flags mask
+            if let Some(mask) = self.flags_mask {
+                if self.flags_match_any {
+                    if node.flags & mask == 0 {
+                        continue;
+                    }
+                } else if node.flags & mask != mask {
+                    continue;
+                }
+            }
+            // fqname prefix
+            if let Some(prefix) = &self.fqname_prefix {
+                if !node.fqname.starts_with(prefix.as_str()) {
+                    continue;
+                }
+            }
+            // where_fqname: any literal-equality OR any regex match.
+            // ``literals=Some(vec![])`` is the "matches-nothing"
+            // sentinel — preserved here so empty calls behave like
+            // ``where_name([])``.
+            if self.fqname_literals.is_some() || self.fqname_regexes.is_some() {
+                let fq = node.fqname.as_str();
+                let lit_match = fqname_literals_set.as_ref().is_some_and(|s| s.contains(fq));
+                let re_match = self
+                    .fqname_regexes
+                    .as_ref()
+                    .is_some_and(|v| v.iter().any(|r| r.is_match(fq)));
+                if !lit_match && !re_match {
+                    continue;
+                }
+            }
+            // path regex
+            if let Some(re) = &path_regex {
+                if !re.is_match(node.path.as_str()) {
+                    continue;
+                }
+            }
+            out.push(node_py.clone_ref(py));
+        }
+        Ok(out)
+    }
+}
+
+impl_query_methods!(no_first DeclQuery);
 
 #[cfg(test)]
 mod tests {

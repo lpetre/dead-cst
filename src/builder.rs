@@ -67,14 +67,20 @@ pub(crate) struct GraphBuilder {
 }
 
 impl GraphBuilder {
-    pub(crate) fn new() -> Self {
+    /// Reserves capacity for `expected_nodes`-many interned nodes
+    /// up-front. The assemble pass cheaply pre-counts the total node
+    /// population via the salsa-memoized `file_to_nodes` payloads and
+    /// passes the sum here, saving the rehash chain the four-doubling
+    /// growth path of an unsized hashmap pays. Pass `0` when no
+    /// estimate is available (e.g. from tests).
+    pub(crate) fn with_capacity(expected_nodes: usize) -> Self {
         Self {
-            nodes: Vec::new(),
-            node_index: FxHashMap::default(),
+            nodes: Vec::with_capacity(expected_nodes),
+            node_index: FxHashMap::with_capacity_and_hasher(expected_nodes, Default::default()),
             edges: Vec::new(),
             edge_set: FxHashSet::default(),
-            forward_adj: Vec::new(),
-            reverse_adj: Vec::new(),
+            forward_adj: Vec::with_capacity(expected_nodes),
+            reverse_adj: Vec::with_capacity(expected_nodes),
             peer_pyi_to_py: FxHashMap::default(),
             synthetic_nodes: FxHashMap::default(),
         }
@@ -118,6 +124,31 @@ impl GraphBuilder {
             self.edges.push(triple);
             self.forward_adj[src].push((dst, flags));
             self.reverse_adj[dst].push((src, flags));
+        }
+    }
+
+    /// Bulk-insert a batch of pre-sorted, pre-deduplicated edge triples.
+    ///
+    /// The caller is responsible for ordering / dedup'ing `triples`
+    /// (e.g. via `sort_unstable` + `dedup`); this method still probes
+    /// `edge_set` per triple to merge against any edges already present
+    /// (so a second `extend_edges` call won't double-insert). Compared
+    /// with looping `add_edge`, the win is amortising the per-edge
+    /// branch / hash overhead and pre-reserving capacity on `edges`
+    /// and the per-node adjacency vectors.
+    pub(crate) fn extend_edges(&mut self, triples: Vec<(usize, usize, u32)>) {
+        if triples.is_empty() {
+            return;
+        }
+        self.edge_set.reserve(triples.len());
+        self.edges.reserve(triples.len());
+        for triple in triples {
+            if self.edge_set.insert(triple) {
+                let (src, dst, flags) = triple;
+                self.edges.push(triple);
+                self.forward_adj[src].push((dst, flags));
+                self.reverse_adj[dst].push((src, flags));
+            }
         }
     }
 }
@@ -494,8 +525,8 @@ mod tests {
     // -- GraphBuilder construction (no pyo3) -----------------------------
 
     #[test]
-    fn graph_builder_new_starts_empty() {
-        let b = GraphBuilder::new();
+    fn graph_builder_with_capacity_starts_empty() {
+        let b = GraphBuilder::with_capacity(0);
         assert!(b.nodes.is_empty());
         assert!(b.node_index.is_empty());
         assert!(b.edges.is_empty());
@@ -511,7 +542,7 @@ mod tests {
     /// Build a `GraphBuilder` with `n` allocated adjacency slots so we
     /// can push edges by hand for `bfs` tests.
     fn empty_builder_with_n_slots(n: usize) -> GraphBuilder {
-        let mut b = GraphBuilder::new();
+        let mut b = GraphBuilder::with_capacity(0);
         for _ in 0..n {
             b.forward_adj.push(Vec::new());
             b.reverse_adj.push(Vec::new());
