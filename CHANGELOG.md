@@ -32,6 +32,17 @@ two versions.
   `GraphBuilder::append_node` that skips the get-before-insert
   (positional identity is unique by construction in this pass).
   Net: `assemble` phase −13% on 1000 files, −19% on 200 files.
+- Subclass queries (`find_subclasses`, `find_subclasses_of`, powering
+  `UnittestPlugin`, `InitSubclassPlugin`, and `DispatchAppPlugin`'s
+  `include_subclasses=True` path) build a project-wide
+  parent→children index once at the end of `assemble_graph` and BFS
+  the index, instead of calling `ty_ide::find_references` per BFS
+  seed. External seeds (e.g. `unittest.TestCase`) still pay one
+  `find_references` call for the first project hop. On an 800-file
+  / 3,200-class synthetic project, `InitSubclassPlugin`'s cold delta
+  drops from +1129 ms to +4 ms (~280×); `UnittestPlugin` drops from
+  +302 ms to +22 ms (~14×). Index build cost is ~125 µs at 200 files
+  / ~700 µs at 800 files (~0.5 % of cold materialize).
 
 ## [0.12.0] - 2026-05-24
 
