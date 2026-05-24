@@ -62,6 +62,16 @@ two versions.
   `DispatchAppPlugin(fastapi.FastAPI)` drops from +16.7 ms to
   noise. Synthetic 100-file project with every file importing
   `typer`: +605 ms → +540 ms.
+- `DispatchAppPlugin`'s framework-subclass discovery is inverted:
+  instead of asking ty "what subclasses framework class F" (which
+  loads F's module from the venv to run `find_references`), the
+  plugin now uses a new `ctx.find_subclasses_via_bases(base_fqns)`
+  query that walks project files in parallel, resolves each class's
+  base list against local imports, and builds a `base_fqn →
+  children` index — never touching the venv. On a 333-file
+  synthetic with `flask`: +171 ms → +19 ms; 663-file with
+  `typer`: +369 ms → +33 ms (11×); the subclass walk itself
+  collapses 154 ms → 0.4 ms (~385×).
 
 ### Fixed
 - `where_module` / `of_module` now accept `str | list[str]` on every
