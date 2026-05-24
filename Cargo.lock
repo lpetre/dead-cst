@@ -2223,11 +2223,13 @@ name = "ty_project"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "bitvec",
  "camino",
  "colored",
  "crossbeam",
  "get-size2",
  "globset",
+ "ignore",
  "notify",
  "ordermap",
  "pep440_rs",
