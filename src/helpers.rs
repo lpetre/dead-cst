@@ -643,6 +643,48 @@ pub(crate) fn is_string_literal(expr: &Expr, value: &str) -> bool {
     matches!(expr, Expr::StringLiteral(s) if s.value.to_str() == value)
 }
 
+/// Resolve a class-base expression to an upstream fqname using the
+/// file's full imports map (as produced by
+/// :func:`collect_all_imports_local`).
+///
+/// Supported expression shapes:
+/// * ``Name(X)`` — looked up in ``file_imports``; returns the upstream
+///   fqname when ``X`` is an imported name.
+/// * ``Attribute(Name(M).N)`` — when ``M`` is bound to a module via
+///   ``import <module> [as M]``, returns ``<module>.N``.
+/// * Deeper attribute chain ``a.b.c.N`` rooted at an imported name
+///   ``a`` — appends segments to reach ``<a-upstream>.b.c.N``.
+///
+/// Returns ``None`` when the expression doesn't have a single
+/// recognized identifier shape, the root isn't imported, or the chain
+/// can't be resolved. Generics (``Base[T]``) are not supported (the
+/// caller is matching against `class C(Base[T]): ...` only to the
+/// extent ``ruff_python_ast`` exposes ``Base[T]`` as an
+/// ``ExprSubscript`` — those drop here, which is the correct
+/// behavior).
+pub(crate) fn resolve_base_fqn(
+    expr: &Expr,
+    file_imports: &FxHashMap<String, String>,
+) -> Option<String> {
+    match expr {
+        Expr::Name(name) => file_imports.get(name.id.as_str()).cloned(),
+        Expr::Attribute(_) => {
+            let (root, segs) = collapse_attribute_chain(expr)?;
+            let root_target = file_imports.get(root.id.as_str())?;
+            let mut out = String::with_capacity(
+                root_target.len() + segs.iter().map(|s| s.len() + 1).sum::<usize>(),
+            );
+            out.push_str(root_target);
+            for seg in &segs {
+                out.push('.');
+                out.push_str(seg);
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
 /// Walk every `Stmt::Import` / `Stmt::ImportFrom` in `parsed` and
 /// produce `local_name -> upstream_fqname` for every alias.
 ///

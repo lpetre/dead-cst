@@ -34,7 +34,7 @@ use crate::helpers::{
     collect_modules_imports_local, decorators_match_imports, extract_call_args_kwargs,
     file_path_string, find_external_seed_direct_subclasses_par, find_main_block_range,
     find_subclass_indices_via_refs_with_queue, is_dunder_name, locate_class_def, locate_class_seed,
-    matched_call_target_any, owner_idx_for_stmt_with, range_key, rel_path,
+    matched_call_target_any, owner_idx_for_stmt_with, range_key, rel_path, resolve_base_fqn,
     top_level_assign_to_name, unwrap_subscripted_callee, AttrCallFinder, CallArgs,
     FactoryCallFinder, StringArgCallFinder, NODE_FLAG_ENTRYPOINT,
 };
@@ -2795,6 +2795,164 @@ impl ProjectContext {
             }
         }
         Ok(out_idx
+            .into_iter()
+            .map(|idx| outputs.builder.nodes[idx].clone_ref(py))
+            .collect())
+    }
+
+    /// Find every project class that transitively inherits from any
+    /// fqname in ``base_fqns``, by inverting the search: instead of
+    /// asking ty's ``find_references`` to walk down from each base
+    /// (which has to load + parse the framework module out of the
+    /// venv), do a single parallel scan over project files, read each
+    /// top-level class's base list, resolve each base against the
+    /// file's imports, and check membership in the target set.
+    ///
+    /// Returns project class nodes (transitive closure). External
+    /// targets are matched by fqname only — the framework module is
+    /// never loaded. This is the cold-path complement of
+    /// :meth:`find_subclasses` for the common "do any project classes
+    /// extend ``flask.Flask``?" question.
+    ///
+    /// Match shapes per base expression in the class header:
+    /// * ``Name(X)`` where ``X`` is imported via
+    ///   ``from <module> import X [as alias]`` resolving the import
+    ///   to ``<module>.X``;
+    /// * ``Attribute(Name(M).N)`` where ``M`` is bound via
+    ///   ``import <module> [as M]``, matching ``<module>.N``;
+    /// * Dotted-path ``a.b.c.N`` matching when the full path equals a
+    ///   target fqname (rare, but handles ``import flask;
+    ///   class X(flask.Flask): ...`` literally).
+    /// Generic parameterizations (``class X(Foo[T])``) are not
+    /// supported — matches a syntactic base name only.
+    pub(crate) fn find_subclasses_via_bases(
+        &self,
+        py: Python<'_>,
+        base_fqns: Vec<String>,
+    ) -> PyResult<Vec<Py<SymbolNode>>> {
+        let outputs = self.materialized("find_subclasses_via_bases")?;
+        // Build set of target fqnames and (module → {simple_names})
+        // for fast per-base resolution.
+        if base_fqns.is_empty() {
+            return Ok(Vec::new());
+        }
+        // No text prefilter: a file containing a transitive subclass
+        // (``class GrandApp(MyApp): ...``) might not mention the
+        // framework's simple name at all. We need to parse every
+        // project file once and capture every ``ClassDef``'s base
+        // list — then the BFS over the collected (child, base_fqn)
+        // pairs handles transitive closure without re-scanning.
+        // Parsing is cheap (and already done during materialize), so
+        // this stays competitive with the ty find_references path.
+        let decl_by_name_range = &outputs.decl_by_name_range;
+        let class_by_selection = &outputs.class_by_selection;
+        let project_files: &[File] = &outputs.project_files;
+        let db_handle: Box<dyn ProjectDb> = ProjectDb::dyn_clone(&self.db);
+
+        // Materialize idx → fqname BEFORE allow_threads so the
+        // parallel scan can use it without the GIL.
+        let idx_fqname: Vec<String> = outputs
+            .builder
+            .nodes
+            .iter()
+            .map(|n| n.borrow(py).fqname.clone())
+            .collect();
+        let idx_fqname_ref = &idx_fqname;
+
+        // Per-file output: list of (child_class_idx, base_fqn).
+        // base_fqn is whatever the class header resolves to (project
+        // class fqname OR external fqname OR module.simple — anything
+        // a syntactic resolution can produce). The caller filters to
+        // the target set + BFS for transitive closure.
+        let pairs: Vec<(usize, String)> = py.allow_threads(move || {
+            par_scan_files(db_handle, project_files, &None, |db, file| {
+                let parsed = parsed_module(db, file).load(db);
+                // Cheap pre-walk filter: skip files with no
+                // top-level ClassDef at all.
+                if !parsed
+                    .syntax()
+                    .body
+                    .iter()
+                    .any(|s| matches!(s, Stmt::ClassDef(_)))
+                {
+                    return Vec::new();
+                }
+                let file_imports = collect_all_imports_local(&parsed);
+                // Same-file top-level classes — base references that
+                // are bare ``Name`` and not imported can resolve to a
+                // class defined earlier in this file.
+                let file_local_classes: FxHashMap<&str, usize> = parsed
+                    .syntax()
+                    .body
+                    .iter()
+                    .filter_map(|stmt| {
+                        let Stmt::ClassDef(cls) = stmt else {
+                            return None;
+                        };
+                        let key = (file, range_key(cls.name.range()));
+                        let idx = class_by_selection
+                            .get(&key)
+                            .copied()
+                            .or_else(|| decl_by_name_range.get(&key).copied())?;
+                        Some((cls.name.as_str(), idx))
+                    })
+                    .collect();
+                let mut local: Vec<(usize, String)> = Vec::new();
+                for stmt in &parsed.syntax().body {
+                    let Stmt::ClassDef(cls) = stmt else { continue };
+                    let Some(args) = &cls.arguments else { continue };
+                    let child_key = (file, range_key(cls.name.range()));
+                    let Some(&child_idx) = class_by_selection
+                        .get(&child_key)
+                        .or_else(|| decl_by_name_range.get(&child_key))
+                    else {
+                        continue;
+                    };
+                    for arg in &args.args {
+                        // Try import resolution first.
+                        if let Some(base_fqn) = resolve_base_fqn(arg, &file_imports) {
+                            local.push((child_idx, base_fqn));
+                            continue;
+                        }
+                        // Fallback: same-file class name reference.
+                        if let ruff_python_ast::Expr::Name(name) = arg {
+                            if let Some(&base_idx) = file_local_classes.get(name.id.as_str()) {
+                                let base_fqn = idx_fqname_ref[base_idx].clone();
+                                local.push((child_idx, base_fqn));
+                            }
+                        }
+                    }
+                }
+                local
+            })
+        });
+
+        // Build base_fqn → [child_class_idx] index. Drives both the
+        // direct-target filter AND the transitive BFS — pairs already
+        // covers every base→child edge we saw in the project, not
+        // just target hits.
+        let mut by_base: FxHashMap<String, Vec<usize>> = FxHashMap::default();
+        for (idx, base_fqn) in pairs {
+            by_base.entry(base_fqn).or_default().push(idx);
+        }
+
+        // BFS from each target fqname through `by_base`.
+        let mut visited: FxHashSet<usize> = FxHashSet::default();
+        let mut frontier: Vec<String> = base_fqns.into_iter().collect();
+        while let Some(seed_fqn) = frontier.pop() {
+            let Some(children) = by_base.get(&seed_fqn) else {
+                continue;
+            };
+            for &child in children {
+                if visited.insert(child) {
+                    // Next round: walk subclasses of this project
+                    // class via its own fqname.
+                    frontier.push(idx_fqname[child].clone());
+                }
+            }
+        }
+
+        Ok(visited
             .into_iter()
             .map(|idx| outputs.builder.nodes[idx].clone_ref(py))
             .collect())

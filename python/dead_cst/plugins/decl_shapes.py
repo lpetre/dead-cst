@@ -139,6 +139,14 @@ class DispatchAppPlugin(Plugin):
         (``where_module(...).where_name(...)``,
         ``of_module(...).where_name(...)``) discover project / third-party
         subclasses whose import module differs from the base class.
+
+        Subclasses are resolved by inverting the search: instead of
+        asking ty's ``find_references`` to walk down from each
+        framework class (which forces ty to load + parse the framework
+        out of the venv — ~100-400ms per framework on cold cache), we
+        do one parallel pass over project files reading each
+        ``ClassDef``'s base list and matching against the configured
+        app-class fqnames. The framework module is never loaded.
         """
         out: dict[str, set[str]] = {}
         for fqn in self.app_classes:
@@ -146,10 +154,12 @@ class DispatchAppPlugin(Plugin):
             if not module or not name:
                 continue
             out.setdefault(module, set()).add(name)
-            for sub in native.query(ctx).subclasses().of_fqn(fqn).transitive(True).collect():
-                sub_module, _, sub_name = sub.fqname.rpartition(".")
-                if sub_module and sub_name:
-                    out.setdefault(sub_module, set()).add(sub_name)
+        if not self.app_classes:
+            return out
+        for sub in ctx.find_subclasses_via_bases(list(self.app_classes)):
+            sub_module, _, sub_name = sub.fqname.rpartition(".")
+            if sub_module and sub_name:
+                out.setdefault(sub_module, set()).add(sub_name)
         return out
 
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
