@@ -47,12 +47,21 @@ two versions.
   `include_subclasses=True` path) build a project-wide
   parent→children index once at the end of `assemble_graph` and BFS
   the index, instead of calling `ty_ide::find_references` per BFS
-  seed. External seeds (e.g. `unittest.TestCase`) still pay one
-  `find_references` call for the first project hop. On an 800-file
-  / 3,200-class synthetic project, `InitSubclassPlugin`'s cold delta
-  drops from +1129 ms to +4 ms (~280×); `UnittestPlugin` drops from
-  +302 ms to +22 ms (~14×). Index build cost is ~125 µs at 200 files
-  / ~700 µs at 800 files (~0.5 % of cold materialize).
+  seed. On an 800-file / 3,200-class synthetic project,
+  `InitSubclassPlugin`'s cold delta drops from +1129 ms to +4 ms
+  (~280×); `UnittestPlugin` drops from +302 ms to +22 ms (~14×).
+  Index build cost is ~125 µs at 200 files / ~700 µs at 800 files
+  (~0.5 % of cold materialize).
+- External-seed subclass queries (`DispatchAppPlugin(typer.Typer)`,
+  `DispatchAppPlugin(fastapi.FastAPI)`, …) now do a parallel
+  AST-scan over project files for direct subclasses and skip the
+  expensive `find_references` walk entirely when no project file
+  imports the seed module. On `flux0_server` (no typer imports)
+  `DispatchAppPlugin(typer.Typer)` drops from +117.9 ms to
+  +26.2 ms; on `dead_cst` self (no fastapi imports)
+  `DispatchAppPlugin(fastapi.FastAPI)` drops from +16.7 ms to
+  noise. Synthetic 100-file project with every file importing
+  `typer`: +605 ms → +540 ms.
 
 ### Fixed
 - `where_module` / `of_module` now accept `str | list[str]` on every
