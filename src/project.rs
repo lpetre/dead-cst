@@ -32,10 +32,11 @@ use crate::graph::{intern_kind, DeclIndex, Import, MainBlock, NativeGraph, Symbo
 use crate::helpers::{
     call_callee_matches_var, class_body_defines_method, collect_all_imports_local,
     collect_modules_imports_local, decorators_match_imports, extract_call_args_kwargs,
-    file_path_string, find_main_block_range, find_subclass_indices_via_refs, is_dunder_name,
-    locate_class_def, locate_class_seed, matched_call_target_any, owner_idx_for_stmt_with,
-    range_key, rel_path, top_level_assign_to_name, unwrap_subscripted_callee, AttrCallFinder,
-    CallArgs, FactoryCallFinder, StringArgCallFinder, NODE_FLAG_ENTRYPOINT,
+    file_path_string, find_external_seed_direct_subclasses_par, find_main_block_range,
+    find_subclass_indices_via_refs_with_queue, is_dunder_name, locate_class_def, locate_class_seed,
+    matched_call_target_any, owner_idx_for_stmt_with, range_key, rel_path,
+    top_level_assign_to_name, unwrap_subscripted_callee, AttrCallFinder, CallArgs,
+    FactoryCallFinder, StringArgCallFinder, NODE_FLAG_ENTRYPOINT,
 };
 use crate::ingest::{emit_visitor_warning, file_package_name, string_literal_list};
 use crate::query::{
@@ -2689,10 +2690,10 @@ impl ProjectContext {
         else {
             return Ok(Vec::new());
         };
-        // PROTOTYPE: if the seed lands on a project class, use the
-        // in-memory hierarchy index for a O(N) BFS. Otherwise (or for
-        // `transitive=false` external seeds), fall back to
-        // `find_subclass_indices_via_refs`.
+        // Project seeds: use the in-memory class-hierarchy index for
+        // an O(deg) BFS. Built once at the end of ``assemble_graph``
+        // (see ``build_class_children``); short-circuits every
+        // intra-project subclass query.
         let rk = (seed_range.start().to_u32(), seed_range.end().to_u32());
         if let Some(&seed_idx) = outputs.class_by_selection.get(&(seed_file, rk)) {
             let out_idx = if transitive {
@@ -2710,18 +2711,85 @@ impl ProjectContext {
                 .collect());
         }
 
-        // External seed (typeshed / site-packages). Use the existing
-        // find_references walk to get DIRECT project subclasses, then —
-        // if transitive — BFS through the in-memory hierarchy from
-        // those direct hits. This pays for one find_references seed
-        // walk instead of N.
-        let direct = find_subclass_indices_via_refs(
-            &self.db, &outputs, seed_file, seed_range, /*transitive=*/ false,
-        );
+        // External seeds (seed file lives outside the project, e.g.
+        // ``typer.Typer``'s definition in the typer package): the
+        // first ``ty_ide::find_references`` hop dominates and is what
+        // every dispatch-app plugin pays for. Pre-collect the direct
+        // first-hop subclasses via a parallel per-file AST scan over
+        // project files (text-prefiltered on the seed's bare name),
+        // and skip ``find_references`` entirely when no project file
+        // even imports the seed module.
+        //
+        // The ``Python::allow_threads`` wrap releases the GIL so the
+        // internal ``rayon::scope`` inside ``find_references`` (and
+        // the ``par_scan_files`` helper used for the fast path) can
+        // run without GIL contention, matching the pattern used by
+        // ``find_decorated_decls``.
+        let class_by_selection = &outputs.class_by_selection;
+        let class_children = &outputs.class_children;
+        let project_files: &[File] = &outputs.project_files;
+        // ``base_fqn`` splits into ``(seed_module, seed_simple_name)``;
+        // both halves are required for the fast path.
+        let seed_split: Option<(String, String)> = base_fqn
+            .rsplit_once('.')
+            .map(|(m, n)| (m.to_string(), n.to_string()));
+        // ``ProjectDatabase`` is ``!Sync`` (salsa's per-thread query
+        // stack lives in a ``RefCell``), so we can't move ``&self.db``
+        // into the ``allow_threads`` closure directly. Hand out a
+        // ``Box<dyn ProjectDb>`` snapshot — the ``ProjectDb`` trait
+        // object carries ``Send``, and ``find_references`` already
+        // takes ``&dyn Db``.
+        let db_handle: Box<dyn ProjectDb> = ProjectDb::dyn_clone(&self.db);
+        let direct: Vec<usize> = py.allow_threads(move || {
+            let db: &dyn ProjectDb = &*db_handle;
+            // Parallel AST-scan + import-presence sweep over project
+            // files serves two roles:
+            //
+            //   1. **Fast-path direct subclasses.** Identifies the
+            //      common ``from <module> import <Name>; class
+            //      X(<Name>):`` shape without paying ty's expensive
+            //      ``find_references`` setup. Those classes are
+            //      pre-recorded as hits and seeded into the BFS.
+            //
+            //   2. **"Re-export possible?" presence check.** If no
+            //      project file imports ``<seed_module>`` in any
+            //      form, there's no chain through which a re-export
+            //      could surface — we can skip the find_references
+            //      walk on the external seed entirely. This is the
+            //      main optimization for plugins like
+            //      ``DispatchAppPlugin(typer.Typer)`` /
+            //      ``DispatchAppPlugin(fastapi.FastAPI)`` where the
+            //      project usually has zero subclasses of the
+            //      framework class.
+            type FileRangeList = Vec<(File, TextRange)>;
+            let (initial_queue, prefound): (FileRangeList, FileRangeList) =
+                if let Some((module, name)) = seed_split.as_ref() {
+                    let res =
+                        find_external_seed_direct_subclasses_par(db, project_files, module, name);
+                    let initial = if res.any_project_file_imports_seed_module {
+                        vec![(seed_file, seed_range)]
+                    } else {
+                        Vec::new()
+                    };
+                    (initial, res.direct_classes)
+                } else {
+                    (vec![(seed_file, seed_range)], Vec::new())
+                };
+            find_subclass_indices_via_refs_with_queue(
+                db,
+                class_by_selection,
+                initial_queue,
+                &prefound,
+                /*transitive=*/ false,
+            )
+        });
+        // BFS the in-memory class-hierarchy index from each direct hit
+        // for the transitive walk — cheaper than recursing back through
+        // ``find_references``.
         let mut out_idx: FxHashSet<usize> = direct.iter().copied().collect();
         if transitive {
             for &d in &direct {
-                for idx in transitive_subclasses_via_index(d, &outputs.class_children) {
+                for idx in transitive_subclasses_via_index(d, class_children) {
                     out_idx.insert(idx);
                 }
             }

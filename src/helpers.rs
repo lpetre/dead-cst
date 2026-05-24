@@ -216,6 +216,7 @@ pub(crate) fn aliased_import_local_name_range(
 /// ``BuildOutputs::builder.nodes`` (only project classes — typeshed
 /// / external matches are dropped because they don't have a
 /// :attr:`class_by_selection` entry).
+#[allow(dead_code)]
 pub(crate) fn find_subclass_indices_via_refs(
     db: &ProjectDatabase,
     outputs: &BuildOutputs,
@@ -223,9 +224,52 @@ pub(crate) fn find_subclass_indices_via_refs(
     seed_name_range: TextRange,
     transitive: bool,
 ) -> Vec<usize> {
+    find_subclass_indices_via_refs_with_queue(
+        db,
+        &outputs.class_by_selection,
+        vec![(seed_file, seed_name_range)],
+        &[],
+        transitive,
+    )
+}
+
+/// Lower-level entry point for [`find_subclass_indices_via_refs`] that
+/// takes a pre-built initial BFS queue + a "pre-found" set of direct
+/// subclasses and just the ``class_by_selection`` index. Used by
+/// [`find_subclasses`](crate::project::ProjectContext::find_subclasses)
+/// after the fast-path parallel scan has produced the first-hop
+/// frontier from an external seed.
+///
+/// ``prefound_direct_subclasses`` is the list of
+/// ``(File, class_name_range)`` pairs the fast path already classified
+/// as direct subclasses; they're recorded as hits up-front *and*
+/// seeded into the BFS so transitive subclasses + alias chains are
+/// still walked through find_references. ``initial_queue`` is the
+/// remaining seeds to run find_references on (typically the original
+/// external seed range, so re-exports through project modules / star
+/// imports are still caught).
+pub(crate) fn find_subclass_indices_via_refs_with_queue(
+    db: &dyn ProjectDb,
+    class_by_selection: &FxHashMap<(File, (u32, u32)), usize>,
+    initial_queue: Vec<(File, TextRange)>,
+    prefound_direct_subclasses: &[(File, TextRange)],
+    transitive: bool,
+) -> Vec<usize> {
     let mut out_idx: FxHashSet<usize> = FxHashSet::default();
     let mut visited_seeds: FxHashSet<(File, (u32, u32))> = FxHashSet::default();
-    let mut queue: Vec<(File, TextRange)> = vec![(seed_file, seed_name_range)];
+    let mut queue: Vec<(File, TextRange)> = initial_queue;
+
+    // Record the fast-path direct subclasses as hits up-front. When
+    // transitive=true also seed the BFS with them so subclasses of
+    // these local classes get walked through find_references.
+    for &(f, r) in prefound_direct_subclasses {
+        let key = (f, range_key(r));
+        if let Some(&idx) = class_by_selection.get(&key) {
+            if out_idx.insert(idx) && transitive {
+                queue.push((f, r));
+            }
+        }
+    }
 
     while let Some((cur_file, cur_range)) = queue.pop() {
         if !visited_seeds.insert((cur_file, range_key(cur_range))) {
@@ -253,7 +297,7 @@ pub(crate) fn find_subclass_indices_via_refs(
             if let Some(class_def) = class_base_arg_owner(&parsed, r_range) {
                 let class_name_range = class_def.name.range();
                 let key = (r_file, range_key(class_name_range));
-                let Some(&idx) = outputs.class_by_selection.get(&key) else {
+                let Some(&idx) = class_by_selection.get(&key) else {
                     continue;
                 };
                 if out_idx.insert(idx) && transitive {
@@ -266,6 +310,190 @@ pub(crate) fn find_subclass_indices_via_refs(
     }
 
     out_idx.into_iter().collect()
+}
+
+/// Fast first-hop scan for the external-seed branch of
+/// [`crate::project::ProjectContext::find_subclasses`]. Returns the
+/// ``(File, class_name_range)`` of every top-level project class whose
+/// base-arg list resolves (through the file's local imports) to
+/// ``<seed_module>.<seed_simple_name>``.
+///
+/// This intentionally bypasses [`ty_ide::find_references`] (which is
+/// the dominant cost when the seed is in an external package — e.g.
+/// ``typer.Typer`` or ``fastapi.FastAPI``) and instead does a parallel
+/// per-file text-prefilter + AST walk over project files. The result
+/// seeds the BFS so transitive subclasses + alias chains are still
+/// walked through the existing find_references path.
+///
+/// Recognized base shapes (mirroring
+/// [`decorators_match_imports`]'s import-aware matcher):
+///
+/// * ``class X(SimpleName): ...`` where the file has
+///   ``from <seed_module> import <seed_simple_name>`` (with or without
+///   an ``as`` alias, so ``SimpleName`` may be the alias).
+/// * ``class X(<alias>.<simple_name>): ...`` where ``<alias>`` is
+///   bound to ``seed_module`` via ``import <seed_module>`` or
+///   ``import <seed_module> as <alias>``.
+///
+/// Subscripted generics (``class X(SomeGeneric[<base>]): ...``) and
+/// nested attribute chains are NOT matched — these are the rare
+/// shapes the upstream ``find_references`` walk would catch via
+/// semantic resolution. Callers run the historic find_references
+/// path as a fallback when the fast path returns empty.
+///
+/// Trade-off vs the find_references walk: this is a *syntactic*
+/// match against the file's import map. It can miss a subclass
+/// whose base is bound via a re-export through an intermediate
+/// project module (``from my_lib import Typer`` where ``my_lib``
+/// re-exports ``typer.Typer``). Callers wishing to keep that path
+/// must compose with find_references.
+///
+/// Caller must wrap in [`pyo3::Python::allow_threads`] — the inner
+/// per-file scan uses rayon and is GIL-free.
+/// Per-file fast-path result. ``direct_classes`` is the list of
+/// class-name ranges identified as direct subclasses of the external
+/// seed. ``has_module_import`` is ``true`` if this file imports the
+/// seed module in any form (``from <module> import ...``,
+/// ``import <module>``, ``from <module> import *``) — used by the
+/// caller as a presence signal: if no file in the project has a
+/// module import, the find_references fallback can be skipped (a
+/// re-export chain through a project module would still surface here).
+pub(crate) struct ExternalSeedFastPathResult {
+    pub(crate) direct_classes: Vec<(File, TextRange)>,
+    pub(crate) any_project_file_imports_seed_module: bool,
+}
+
+pub(crate) fn find_external_seed_direct_subclasses_par(
+    db: &dyn ProjectDb,
+    project_files: &[File],
+    seed_module: &str,
+    seed_simple_name: &str,
+) -> ExternalSeedFastPathResult {
+    use crate::query::{_contains_identifier, par_scan_files};
+    let db_handle: Box<dyn ProjectDb> = ProjectDb::dyn_clone(db);
+    let needle: &str = seed_simple_name;
+    let module: &str = seed_module;
+    // Per-file output: (class subclass ranges, file-imports-seed-module).
+    let per_file: Vec<(Vec<(File, TextRange)>, bool)> =
+        par_scan_files(db_handle, project_files, &None, |db, file| {
+            // Cheap text prefilter on the seed module's leftmost
+            // segment — every form of seed-module import (``import
+            // <module>``, ``from <module> import …``, ``from <module>
+            // import *``) mentions that segment in the source.
+            let source = source_text(db, file);
+            let module_root = module.split('.').next().unwrap_or(module);
+            if !_contains_identifier(&source, module_root) {
+                return Vec::new();
+            }
+            let parsed = parsed_module(db, file).load(db);
+            let has_module_import = file_imports_module(&parsed, module);
+            let mentions_name = _contains_identifier(&source, needle);
+            // Only build the imports map + walk class bases when the
+            // file textually mentions the simple name — the typical
+            // shortcut.
+            let direct: Vec<(File, TextRange)> = if mentions_name {
+                let allowed: FxHashSet<&str> = std::iter::once(needle).collect();
+                // ``file_package`` is `None`: relative imports of
+                // external framework names (``from .foo import
+                // Typer``) are vanishingly rare; the
+                // ``find_references`` fallback covers them when
+                // ``any_project_file_imports_seed_module`` flips on.
+                let imports = collect_module_imports_local(&parsed, module, &allowed, None);
+                if imports.is_empty() {
+                    Vec::new()
+                } else {
+                    let mut out: Vec<(File, TextRange)> = Vec::new();
+                    for cls in iter_top_level_classes(&parsed) {
+                        let Some(arguments) = &cls.arguments else {
+                            continue;
+                        };
+                        for arg in &arguments.args {
+                            if base_arg_resolves_to_seed(arg, &imports, needle) {
+                                out.push((file, cls.name.range()));
+                                break;
+                            }
+                        }
+                    }
+                    out
+                }
+            } else {
+                Vec::new()
+            };
+            vec![(direct, has_module_import)]
+        });
+    let mut direct_classes: Vec<(File, TextRange)> = Vec::new();
+    let mut any_project_file_imports_seed_module = false;
+    for (per, imports_seed) in per_file {
+        direct_classes.extend(per);
+        any_project_file_imports_seed_module |= imports_seed;
+    }
+    ExternalSeedFastPathResult {
+        direct_classes,
+        any_project_file_imports_seed_module,
+    }
+}
+
+/// Returns ``true`` if ``parsed`` imports ``module`` in any of:
+/// ``from <module> import …``, ``from <module> import *``,
+/// ``import <module>``, or ``import <module> as …``. Used as the
+/// presence-signal for the fast-path "no project file imports the
+/// seed module" shortcut.
+fn file_imports_module(parsed: &ParsedModuleRef, module: &str) -> bool {
+    for stmt in &parsed.syntax().body {
+        match stmt {
+            Stmt::ImportFrom(im) => {
+                if let Some(name) = &im.module {
+                    if name.as_str() == module {
+                        return true;
+                    }
+                }
+            }
+            Stmt::Import(im) => {
+                for alias in &im.names {
+                    if alias.name.as_str() == module {
+                        return true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Return ``true`` if ``arg`` is a base-list reference that, after
+/// resolving through the file's local imports, names the seed class.
+/// Recognized shapes (matching what
+/// [`find_external_seed_direct_subclasses_par`] documents):
+///
+/// * ``Name(local)`` where ``imports[local] == seed_simple_name``
+///   (the local binding is the imported class).
+/// * ``Attribute(Name(local).attr)`` where ``imports[local] ==
+///   MODULE_ALIAS_MARKER`` and ``attr == seed_simple_name`` (the
+///   local binding is the module alias and we're accessing the class
+///   through it).
+fn base_arg_resolves_to_seed(
+    arg: &Expr,
+    imports: &FxHashMap<String, String>,
+    seed_simple_name: &str,
+) -> bool {
+    match arg {
+        Expr::Name(n) => imports
+            .get(n.id.as_str())
+            .is_some_and(|target| target == seed_simple_name),
+        Expr::Attribute(attr) => {
+            if attr.attr.as_str() != seed_simple_name {
+                return false;
+            }
+            let Expr::Name(prefix) = attr.value.as_ref() else {
+                return false;
+            };
+            imports
+                .get(prefix.id.as_str())
+                .is_some_and(|t| t == MODULE_ALIAS_MARKER)
+        }
+        _ => false,
+    }
 }
 
 /// Find a top-level ``StmtClassDef`` by its bound name.
