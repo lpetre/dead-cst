@@ -69,6 +69,10 @@ pub(crate) fn decorators_match_imports<'ast>(
             Expr::Call(call) => (&*call.func, Some(call)),
             other => (other, None),
         };
+        // Unwrap subscripted-generic callees so ``@route[T]`` /
+        // ``@route[T]()`` are classified the same as ``@route`` /
+        // ``@route()``.
+        let root_expr = unwrap_subscripted_callee(root_expr);
         match root_expr {
             Expr::Name(n) => {
                 if let Some(target) = imports.get(n.id.as_str()) {
@@ -467,6 +471,70 @@ pub(crate) fn collect_all_imports_local(parsed: &ParsedModuleRef) -> FxHashMap<S
     out
 }
 
+/// Convenience: build the file-local imports map for names imported
+/// from any of ``modules`` (OR semantics — merged into a single map).
+/// Later modules win on local-name collisions, which doesn't matter in
+/// practice since callers route the matched ``target`` (the upstream
+/// constructor name) against an ``allowed`` set; identical targets
+/// across modules collapse to the same value.
+///
+/// ``file_package`` is the importing file's enclosing package (e.g.
+/// ``Some("pkg")`` for ``pkg/handlers.py``, ``Some("pkg")`` for
+/// ``pkg/__init__.py``, ``None`` for a top-level ``mod.py``). It is
+/// used to resolve ``from .foo import N`` / ``from ..bar import N``
+/// relative imports against ``modules``.
+pub(crate) fn collect_modules_imports_local(
+    parsed: &ParsedModuleRef,
+    modules: &[String],
+    allowed: &FxHashSet<&str>,
+    file_package: Option<&str>,
+) -> FxHashMap<String, String> {
+    let mut out: FxHashMap<String, String> = FxHashMap::default();
+    for module in modules {
+        let one = collect_module_imports_local(parsed, module, allowed, file_package);
+        out.extend(one);
+    }
+    out
+}
+
+/// Compute the absolute module path for a relative ``from`` import.
+///
+/// ``level`` is the count of leading dots on the ``from`` statement
+/// (1 for ``from .x``, 2 for ``from ..x``, ...); ``tail`` is the
+/// dotted suffix after the dots (``"x"`` for ``from .x``,
+/// ``"x.y"`` for ``from .x.y``, empty for ``from . import name``).
+/// ``file_package`` is the importing file's enclosing package.
+///
+/// Mirrors CPython's relative-import resolution: ``level=1`` anchors
+/// at ``file_package``, each additional level strips one trailing
+/// segment. Returns ``None`` when the resolution would walk past the
+/// top of ``file_package`` (or when ``file_package`` is ``None`` but
+/// ``level > 0``).
+pub(crate) fn resolve_relative_import(
+    level: u32,
+    tail: &str,
+    file_package: Option<&str>,
+) -> Option<String> {
+    if level == 0 {
+        return None;
+    }
+    let pkg = file_package?;
+    let segments: Vec<&str> = pkg.split('.').filter(|s| !s.is_empty()).collect();
+    let levels_up = (level - 1) as usize;
+    if levels_up > segments.len() {
+        return None;
+    }
+    let base = &segments[..segments.len() - levels_up];
+    let mut parts: Vec<&str> = base.to_vec();
+    if !tail.is_empty() {
+        parts.push(tail);
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(parts.join("."))
+}
+
 /// Build the file-local imports map ``{local_name: target}`` for
 /// names imported from ``module``. ``target`` is the upstream
 /// constructor / decl name (e.g. ``"Flask"`` when bound via
@@ -479,6 +547,7 @@ pub(crate) fn collect_module_imports_local(
     parsed: &ParsedModuleRef,
     module: &str,
     allowed: &FxHashSet<&str>,
+    file_package: Option<&str>,
 ) -> FxHashMap<String, String> {
     // Submodule binding: ``from <parent> import <last_seg>`` makes
     // ``last_seg`` a local alias for the queried module (e.g.
@@ -488,8 +557,22 @@ pub(crate) fn collect_module_imports_local(
     for stmt in &parsed.syntax().body {
         match stmt {
             Stmt::ImportFrom(im) => {
-                let Some(mod_name) = &im.module else { continue };
-                if mod_name.as_str() == module {
+                // Compute the import's effective absolute module path,
+                // resolving relative dots against the importing file's
+                // package. ``mod_name`` is just the dotted suffix; ty
+                // exposes the dot count via ``im.level``.
+                let tail = im.module.as_ref().map(|n| n.as_str()).unwrap_or("");
+                let absolute: Option<String> = if im.level == 0 {
+                    if tail.is_empty() {
+                        None
+                    } else {
+                        Some(tail.to_string())
+                    }
+                } else {
+                    resolve_relative_import(im.level, tail, file_package)
+                };
+                let Some(absolute) = absolute else { continue };
+                if absolute == module {
                     for alias in &im.names {
                         let target = alias.name.as_str();
                         if !allowed.contains(target) {
@@ -499,7 +582,7 @@ pub(crate) fn collect_module_imports_local(
                         out.insert(local.to_string(), target.to_string());
                     }
                 } else if let Some((parent, last)) = parent_last {
-                    if mod_name.as_str() == parent {
+                    if absolute == parent {
                         for alias in &im.names {
                             if alias.name.as_str() != last {
                                 continue;
@@ -525,6 +608,33 @@ pub(crate) fn collect_module_imports_local(
     out
 }
 
+/// Unwrap a leading ``Expr::Subscript`` once so subscripted-generic
+/// callees (``Worker[int]``, ``app.route[Self]``) classify the same as
+/// their bare form. Returns the inner expression for any other shape.
+pub(crate) fn unwrap_subscripted_callee(expr: &Expr) -> &Expr {
+    match expr {
+        Expr::Subscript(sub) => sub.value.as_ref(),
+        other => other,
+    }
+}
+
+/// Multi-module variant of [`matched_call_target`]: returns the matched
+/// upstream name as soon as any of ``modules`` produces a hit. Used by
+/// the multi-module ``where_module([...])`` query forms.
+pub(crate) fn matched_call_target_any(
+    call: &ruff_python_ast::ExprCall,
+    imports: &FxHashMap<String, String>,
+    modules: &[String],
+    allowed: &FxHashSet<&str>,
+) -> Option<String> {
+    for module in modules {
+        if let Some(name) = matched_call_target(call, imports, module, allowed) {
+            return Some(name);
+        }
+    }
+    None
+}
+
 /// Match an expression against a callable-from-module pattern. Three
 /// shapes resolve through ``imports`` to the configured ``module``:
 ///
@@ -543,7 +653,14 @@ pub(crate) fn matched_call_target(
     module: &str,
     allowed: &FxHashSet<&str>,
 ) -> Option<String> {
-    match call.func.as_ref() {
+    // Unwrap a leading ``Expr::Subscript`` once so subscripted-generic
+    // constructors (``Worker[int](...)``, ``Logger[Self]("foo")``)
+    // classify the same as their bare ``Worker(...)`` form. Generics
+    // applied to imported classes are syntactically a ``Subscript``
+    // whose ``value`` is the bare ``Name`` / ``Attribute`` we already
+    // know how to resolve.
+    let callee = unwrap_subscripted_callee(call.func.as_ref());
+    match callee {
         Expr::Name(name) => {
             let target = imports.get(name.id.as_str())?;
             allowed.contains(target.as_str()).then(|| target.clone())
@@ -599,10 +716,12 @@ pub(crate) fn top_level_assign_to_name(stmt: &Stmt) -> Option<(TextRange, &Expr)
 }
 
 /// Recursive visitor: walk a function / class body collecting the set
-/// of constructor names called anywhere inside it.
+/// of constructor names called anywhere inside it. Matches against any
+/// of ``modules`` (OR semantics — for single-module callers pass a
+/// one-element slice).
 pub(crate) struct FactoryCallFinder<'a> {
     pub(crate) imports: &'a FxHashMap<String, String>,
-    pub(crate) module: &'a str,
+    pub(crate) modules: &'a [String],
     pub(crate) allowed: &'a FxHashSet<&'a str>,
     pub(crate) kinds: FxHashSet<String>,
 }
@@ -610,7 +729,9 @@ pub(crate) struct FactoryCallFinder<'a> {
 impl<'ast, 'a> Visitor<'ast> for FactoryCallFinder<'a> {
     fn visit_expr(&mut self, expr: &'ast Expr) {
         if let Expr::Call(call) = expr {
-            if let Some(name) = matched_call_target(call, self.imports, self.module, self.allowed) {
+            if let Some(name) =
+                matched_call_target_any(call, self.imports, self.modules, self.allowed)
+            {
                 self.kinds.insert(name);
             }
         }
@@ -974,7 +1095,7 @@ pub(crate) fn call_callee_matches_var(
     attr: &str,
     required_positional: Option<usize>,
 ) -> bool {
-    let Expr::Attribute(attribute) = call.func.as_ref() else {
+    let Expr::Attribute(attribute) = unwrap_subscripted_callee(call.func.as_ref()) else {
         return false;
     };
     if attribute.attr.as_str() != attr {
@@ -1045,7 +1166,7 @@ pub(crate) struct AttrCallFinder<'a> {
 impl<'ast, 'a> Visitor<'ast> for AttrCallFinder<'a> {
     fn visit_expr(&mut self, expr: &'ast Expr) {
         if let Expr::Call(call) = expr {
-            if let Expr::Attribute(attribute) = call.func.as_ref() {
+            if let Expr::Attribute(attribute) = unwrap_subscripted_callee(call.func.as_ref()) {
                 if attribute.attr.as_str() == self.attr {
                     if let Some(arg) = call.arguments.args.get(self.arg_index) {
                         let hits = string_or_string_collection(arg);

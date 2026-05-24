@@ -31,13 +31,13 @@ use crate::file_ref_edges::{file_to_ref_edges, FileRefEdges};
 use crate::graph::{intern_kind, DeclIndex, Import, MainBlock, NativeGraph, SymbolNode};
 use crate::helpers::{
     call_callee_matches_var, class_body_defines_method, collect_all_imports_local,
-    collect_module_imports_local, decorators_match_imports, extract_call_args_kwargs,
+    collect_modules_imports_local, decorators_match_imports, extract_call_args_kwargs,
     file_path_string, find_main_block_range, find_subclass_indices_via_refs, is_dunder_name,
-    locate_class_def, locate_class_seed, matched_call_target, owner_idx_for_stmt_with, range_key,
-    rel_path, top_level_assign_to_name, AttrCallFinder, CallArgs, FactoryCallFinder,
-    StringArgCallFinder, NODE_FLAG_ENTRYPOINT,
+    locate_class_def, locate_class_seed, matched_call_target_any, owner_idx_for_stmt_with,
+    range_key, rel_path, top_level_assign_to_name, unwrap_subscripted_callee, AttrCallFinder,
+    CallArgs, FactoryCallFinder, StringArgCallFinder, NODE_FLAG_ENTRYPOINT,
 };
-use crate::ingest::{emit_visitor_warning, string_literal_list};
+use crate::ingest::{emit_visitor_warning, file_package_name, string_literal_list};
 use crate::query::{
     _compile_path_regex, _contains_any_identifier, _contains_identifier, par_scan_files,
     QueryBuilder,
@@ -1851,7 +1851,7 @@ impl ProjectContext {
     pub(crate) fn find_decorated_decls(
         &self,
         py: Python<'_>,
-        decorator_module: &str,
+        decorator_modules: &[String],
         decorator_names: Vec<String>,
         path_regex: Option<&str>,
     ) -> PyResult<Vec<(Py<SymbolNode>, CallArgs)>> {
@@ -1872,6 +1872,7 @@ impl ProjectContext {
         let path_re_ref = &path_re;
         let names_ref = &names;
         let needles_ref: &[&str] = &needle_strs;
+        let modules_ref: &[String] = decorator_modules;
         let pairs: Vec<(usize, CallArgs)> = py.allow_threads(move || {
             par_scan_files(db_handle, project_files, path_re_ref, |db, file| {
                 let source = source_text(db, file);
@@ -1879,7 +1880,13 @@ impl ProjectContext {
                     return Vec::new();
                 }
                 let parsed = parsed_module(db, file).load(db);
-                let imports = collect_module_imports_local(&parsed, decorator_module, names_ref);
+                let file_package = file_package_name(db, file);
+                let imports = collect_modules_imports_local(
+                    &parsed,
+                    modules_ref,
+                    names_ref,
+                    file_package.as_deref(),
+                );
                 if imports.is_empty() {
                     return Vec::new();
                 }
@@ -1929,7 +1936,7 @@ impl ProjectContext {
     pub(crate) fn find_instance_constructions(
         &self,
         py: Python<'_>,
-        module: &str,
+        modules: &[String],
         ctor_names: Vec<String>,
         path_regex: Option<&str>,
     ) -> PyResult<Vec<(Py<SymbolNode>, String, CallArgs)>> {
@@ -1944,6 +1951,7 @@ impl ProjectContext {
         let path_re_ref = &path_re;
         let allowed_ref = &allowed;
         let needles_ref: &[&str] = &needle_strs;
+        let modules_ref: &[String] = modules;
         let pairs: Vec<(usize, String, CallArgs)> = py.allow_threads(move || {
             par_scan_files(db_handle, project_files, path_re_ref, |db, file| {
                 let source = source_text(db, file);
@@ -1951,7 +1959,13 @@ impl ProjectContext {
                     return Vec::new();
                 }
                 let parsed = parsed_module(db, file).load(db);
-                let imports = collect_module_imports_local(&parsed, module, allowed_ref);
+                let file_package = file_package_name(db, file);
+                let imports = collect_modules_imports_local(
+                    &parsed,
+                    modules_ref,
+                    allowed_ref,
+                    file_package.as_deref(),
+                );
                 if imports.is_empty() {
                     return Vec::new();
                 }
@@ -1963,7 +1977,8 @@ impl ProjectContext {
                         None => continue,
                     };
                     let Expr::Call(call) = value else { continue };
-                    if let Some(matched) = matched_call_target(call, &imports, module, allowed_ref)
+                    if let Some(matched) =
+                        matched_call_target_any(call, &imports, modules_ref, allowed_ref)
                     {
                         let key = (file, range_key(target_range));
                         if let Some(&idx) = decl_by_name_range.get(&key) {
@@ -2031,6 +2046,10 @@ impl ProjectContext {
                                 Expr::Call(call) => (&*call.func, Some(call)),
                                 other => (other, None),
                             };
+                        // ``@app.route[T]()`` — unwrap the leading
+                        // subscript so the attribute walk matches the
+                        // bare ``@app.route(...)`` shape.
+                        let root_expr = unwrap_subscripted_callee(root_expr);
                         let Expr::Attribute(attr) = root_expr else {
                             continue;
                         };
@@ -2108,6 +2127,7 @@ impl ProjectContext {
                                 Expr::Call(call) => (&*call.func, Some(call)),
                                 other => (other, None),
                             };
+                        let root_expr = unwrap_subscripted_callee(root_expr);
                         let Expr::Attribute(outer) = root_expr else {
                             continue;
                         };
@@ -2214,10 +2234,9 @@ impl ProjectContext {
     }
 }
 
-#[pymethods]
 impl ProjectContext {
     /// Top-level functions / classes whose body constructs one of
-    /// ``ctor_names`` imported from ``module``.
+    /// ``ctor_names`` imported from any of ``modules``.
     ///
     /// Recursively walks each candidate's body looking for ``<Ctor>(...)``
     /// or ``<module>.<Ctor>(...)`` call expressions. Returns
@@ -2229,7 +2248,7 @@ impl ProjectContext {
     pub(crate) fn find_factory_decls(
         &self,
         py: Python<'_>,
-        module: &str,
+        modules: &[String],
         ctor_names: Vec<String>,
     ) -> PyResult<Vec<(Py<SymbolNode>, Vec<String>)>> {
         let outputs = self.materialized("find_factory_decls")?;
@@ -2240,6 +2259,7 @@ impl ProjectContext {
         let db_handle: Box<dyn ProjectDb> = ProjectDb::dyn_clone(&self.db);
         let allowed_ref = &allowed;
         let needles_ref: &[&str] = &needle_strs;
+        let modules_ref: &[String] = modules;
         let pairs: Vec<(usize, Vec<String>)> = py.allow_threads(move || {
             par_scan_files(db_handle, project_files, &None, |db, file| {
                 let source = source_text(db, file);
@@ -2247,7 +2267,13 @@ impl ProjectContext {
                     return Vec::new();
                 }
                 let parsed = parsed_module(db, file).load(db);
-                let imports = collect_module_imports_local(&parsed, module, allowed_ref);
+                let file_package = file_package_name(db, file);
+                let imports = collect_modules_imports_local(
+                    &parsed,
+                    modules_ref,
+                    allowed_ref,
+                    file_package.as_deref(),
+                );
                 if imports.is_empty() {
                     return Vec::new();
                 }
@@ -2260,7 +2286,7 @@ impl ProjectContext {
                     };
                     let mut finder = FactoryCallFinder {
                         imports: &imports,
-                        module,
+                        modules: modules_ref,
                         allowed: allowed_ref,
                         kinds: FxHashSet::default(),
                     };
@@ -2299,7 +2325,7 @@ impl ProjectContext {
     pub(crate) fn find_calls_to_imported(
         &self,
         py: Python<'_>,
-        module: &str,
+        modules: &[String],
         name: &str,
         arg_index: usize,
         path_regex: Option<&str>,
@@ -2314,6 +2340,7 @@ impl ProjectContext {
         let db_handle: Box<dyn ProjectDb> = ProjectDb::dyn_clone(&self.db);
         let path_re_ref = &path_re;
         let allowed_ref = &allowed;
+        let modules_ref: &[String] = modules;
         let triples: Vec<(usize, String, CallArgs)> = py.allow_threads(move || {
             par_scan_files(db_handle, project_files, path_re_ref, |db, file| {
                 let source = source_text(db, file);
@@ -2321,7 +2348,13 @@ impl ProjectContext {
                     return Vec::new();
                 }
                 let parsed = parsed_module(db, file).load(db);
-                let imports = collect_module_imports_local(&parsed, module, allowed_ref);
+                let file_package = file_package_name(db, file);
+                let imports = collect_modules_imports_local(
+                    &parsed,
+                    modules_ref,
+                    allowed_ref,
+                    file_package.as_deref(),
+                );
                 if imports.is_empty() {
                     return Vec::new();
                 }
@@ -2338,7 +2371,8 @@ impl ProjectContext {
                     };
                     let mut finder = StringArgCallFinder {
                         predicate: |call: &ruff_python_ast::ExprCall| {
-                            matched_call_target(call, &imports, module, allowed_ref).is_some()
+                            matched_call_target_any(call, &imports, modules_ref, allowed_ref)
+                                .is_some()
                         },
                         arg_index,
                         file_imports: &file_imports,
@@ -2569,7 +2603,8 @@ impl ProjectContext {
                 "expected a dotted decorator fqn (e.g. 'pytest.fixture'), got {decorator_fqn:?}"
             )));
         };
-        self.find_decorated_decls(py, module, vec![name.to_string()], path_regex)
+        let modules = [module.to_string()];
+        self.find_decorated_decls(py, &modules, vec![name.to_string()], path_regex)
     }
 
     #[allow(clippy::type_complexity)]
@@ -2600,7 +2635,8 @@ impl ProjectContext {
                 }
             }
         }
-        let triples = self.find_instance_constructions(py, module, ctors, path_regex)?;
+        let modules = [module.to_string()];
+        let triples = self.find_instance_constructions(py, &modules, ctors, path_regex)?;
         Ok(triples
             .into_iter()
             .map(|(node, _name, call_args)| (node, call_args))

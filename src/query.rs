@@ -325,7 +325,9 @@ macro_rules! impl_query_methods {
 
 /// Find decorated top-level functions / classes. Pick exactly one of:
 /// * ``where_module(m).where_name(n)`` — ``@m.x`` / ``@x`` where ``x``
-///   is imported from ``m``.
+///   is imported from ``m``. ``m`` may be a single module string or a
+///   list of modules (OR semantics — keep the row if its decorator
+///   resolves through an import of any module in the list).
 /// * ``where_callee(fqn)`` — fqn-form ``@<fqn>``.
 /// * ``where_owner_attr(attrs)`` — ``@<owner>.<attr>(...)``;
 ///   ``decorator_owner`` carries the textual prefix.
@@ -336,7 +338,7 @@ macro_rules! impl_query_methods {
 #[pyclass(unsendable)]
 pub(crate) struct DecoratorQuery {
     pub(crate) ctx: Py<ProjectContext>,
-    pub(crate) module: Option<String>,
+    pub(crate) modules: Option<Vec<String>>,
     pub(crate) callee_fqn: Option<String>,
     pub(crate) names: Option<Vec<String>>,
     pub(crate) owner_attrs: Option<Vec<String>>,
@@ -350,7 +352,7 @@ impl DecoratorQuery {
     fn new(ctx: Py<ProjectContext>) -> Self {
         Self {
             ctx,
-            module: None,
+            modules: None,
             callee_fqn: None,
             names: None,
             owner_attrs: None,
@@ -364,9 +366,13 @@ impl DecoratorQuery {
 
 #[pymethods]
 impl DecoratorQuery {
-    fn where_module<'py>(mut slf: PyRefMut<'py, Self>, module: String) -> PyRefMut<'py, Self> {
-        slf.module = Some(module);
-        slf
+    fn where_module<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        module: PyObject,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let py = slf.py();
+        slf.modules = Some(_extract_str_or_list(py, module)?);
+        Ok(slf)
     }
     fn where_callee<'py>(mut slf: PyRefMut<'py, Self>, fqn: String) -> PyRefMut<'py, Self> {
         slf.callee_fqn = Some(fqn);
@@ -509,8 +515,8 @@ impl DecoratorQuery {
                     },
                 )?);
             }
-        } else if let (Some(module), Some(names)) = (&self.module, &self.names) {
-            let decls = ctx.find_decorated_decls(py, module, names.clone(), path_regex)?;
+        } else if let (Some(modules), Some(names)) = (&self.modules, &self.names) {
+            let decls = ctx.find_decorated_decls(py, modules, names.clone(), path_regex)?;
             for (d, call_args) in decls {
                 if !call_args_match_kwargs(&call_args, kwarg_matchers) {
                     continue;
@@ -545,10 +551,14 @@ impl_query_methods!(with_first DecoratorQuery, DecoratorRef);
 /// Find module-scope ``<var> = <Ctor>(...)`` sites. Pick exactly one
 /// of ``where_module + where_name`` or
 /// ``where_class(fqn, include_subclasses=...)``.
+///
+/// ``where_module`` accepts either a single module string or a list of
+/// modules (OR semantics — match if the constructor is imported from
+/// any of them).
 #[pyclass(unsendable)]
 pub(crate) struct ConstructionQuery {
     pub(crate) ctx: Py<ProjectContext>,
-    pub(crate) module: Option<String>,
+    pub(crate) modules: Option<Vec<String>>,
     pub(crate) names: Option<Vec<String>>,
     pub(crate) class_fqn: Option<String>,
     pub(crate) include_subclasses: bool,
@@ -559,7 +569,7 @@ impl ConstructionQuery {
     fn new(ctx: Py<ProjectContext>) -> Self {
         Self {
             ctx,
-            module: None,
+            modules: None,
             names: None,
             class_fqn: None,
             include_subclasses: false,
@@ -570,9 +580,13 @@ impl ConstructionQuery {
 
 #[pymethods]
 impl ConstructionQuery {
-    fn where_module<'py>(mut slf: PyRefMut<'py, Self>, module: String) -> PyRefMut<'py, Self> {
-        slf.module = Some(module);
-        slf
+    fn where_module<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        module: PyObject,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let py = slf.py();
+        slf.modules = Some(_extract_str_or_list(py, module)?);
+        Ok(slf)
     }
     fn where_name<'py>(
         mut slf: PyRefMut<'py, Self>,
@@ -619,8 +633,9 @@ impl ConstructionQuery {
                     },
                 )?);
             }
-        } else if let (Some(module), Some(names)) = (&self.module, &self.names) {
-            let triples = ctx.find_instance_constructions(py, module, names.clone(), path_regex)?;
+        } else if let (Some(modules), Some(names)) = (&self.modules, &self.names) {
+            let triples =
+                ctx.find_instance_constructions(py, modules, names.clone(), path_regex)?;
             for (var, name, call_args) in triples {
                 let args = args_to_py_vec(py, &call_args.args, nodes);
                 let kwargs = kwargs_to_py_map(py, &call_args.kwargs, nodes);
@@ -649,14 +664,15 @@ impl_query_methods!(with_first ConstructionQuery, ConstructionRef);
 /// Find call sites whose positional string-literal at the configured
 /// index is captured. :meth:`string_arg_at` is required. Pick one of:
 /// * ``where_module(m).where_name(n)`` — call to ``n`` imported from
-///   ``m``.
+///   ``m``. ``m`` may be a single string or a list of modules (OR
+///   semantics).
 /// * ``where_owner(o).where_attr(a)`` — ``<o>.<a>(...)`` literal
 ///   receiver match.
 /// * ``where_attr(a)`` — ``<expr>.<a>(...)`` any receiver.
 #[pyclass(unsendable)]
 pub(crate) struct CallQuery {
     pub(crate) ctx: Py<ProjectContext>,
-    pub(crate) module: Option<String>,
+    pub(crate) modules: Option<Vec<String>>,
     pub(crate) name: Option<String>,
     pub(crate) owner: Option<String>,
     pub(crate) attr: Option<String>,
@@ -670,7 +686,7 @@ impl CallQuery {
     fn new(ctx: Py<ProjectContext>) -> Self {
         Self {
             ctx,
-            module: None,
+            modules: None,
             name: None,
             owner: None,
             attr: None,
@@ -684,9 +700,13 @@ impl CallQuery {
 
 #[pymethods]
 impl CallQuery {
-    fn where_module<'py>(mut slf: PyRefMut<'py, Self>, module: String) -> PyRefMut<'py, Self> {
-        slf.module = Some(module);
-        slf
+    fn where_module<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        module: PyObject,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let py = slf.py();
+        slf.modules = Some(_extract_str_or_list(py, module)?);
+        Ok(slf)
     }
     fn where_name<'py>(mut slf: PyRefMut<'py, Self>, name: String) -> PyRefMut<'py, Self> {
         slf.name = Some(name);
@@ -740,8 +760,8 @@ impl CallQuery {
             .arg_index
             .ok_or_else(|| PyValueError::new_err("CallQuery: .string_arg_at(index) is required"))?;
         let path_regex = self.path_regex.as_deref();
-        let triples = if let (Some(module), Some(name)) = (&self.module, &self.name) {
-            ctx.find_calls_to_imported(py, module, name, arg_index, path_regex)?
+        let triples = if let (Some(modules), Some(name)) = (&self.modules, &self.name) {
+            ctx.find_calls_to_imported(py, modules, name, arg_index, path_regex)?
         } else if let (Some(owner), Some(attr)) = (&self.owner, &self.attr) {
             ctx.find_calls_on_var(
                 py,
@@ -949,10 +969,13 @@ impl FactoryRef {
 /// Walk function / class bodies for ``<Ctor>(...)`` calls where
 /// ``Ctor`` is imported from ``of_module(...)`` and matches one of
 /// ``where_name(...)``. Both filters are required.
+///
+/// ``of_module`` accepts either a single module string or a list of
+/// modules (OR semantics).
 #[pyclass(unsendable)]
 pub(crate) struct FactoryQuery {
     pub(crate) ctx: Py<ProjectContext>,
-    pub(crate) module: Option<String>,
+    pub(crate) modules: Option<Vec<String>>,
     pub(crate) names: Option<Vec<String>>,
 }
 
@@ -960,7 +983,7 @@ impl FactoryQuery {
     fn new(ctx: Py<ProjectContext>) -> Self {
         Self {
             ctx,
-            module: None,
+            modules: None,
             names: None,
         }
     }
@@ -968,9 +991,13 @@ impl FactoryQuery {
 
 #[pymethods]
 impl FactoryQuery {
-    fn of_module<'py>(mut slf: PyRefMut<'py, Self>, module: String) -> PyRefMut<'py, Self> {
-        slf.module = Some(module);
-        slf
+    fn of_module<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        module: PyObject,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let py = slf.py();
+        slf.modules = Some(_extract_str_or_list(py, module)?);
+        Ok(slf)
     }
     fn where_name<'py>(
         mut slf: PyRefMut<'py, Self>,
@@ -982,15 +1009,15 @@ impl FactoryQuery {
     }
     fn collect(&self, py: Python<'_>) -> PyResult<Vec<Py<FactoryRef>>> {
         let ctx = self.ctx.borrow(py);
-        let module = self
-            .module
-            .as_deref()
+        let modules = self
+            .modules
+            .as_ref()
             .ok_or_else(|| PyValueError::new_err("FactoryQuery requires .of_module(...)"))?;
         let names = self
             .names
             .clone()
             .ok_or_else(|| PyValueError::new_err("FactoryQuery requires .where_name(...)"))?;
-        let pairs = ctx.find_factory_decls(py, module, names)?;
+        let pairs = ctx.find_factory_decls(py, modules, names)?;
         pairs
             .into_iter()
             .map(|(decl, kinds)| Py::new(py, FactoryRef { decl, kinds }))
