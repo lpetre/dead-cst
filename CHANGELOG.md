@@ -54,6 +54,22 @@ two versions.
   +302 ms to +22 ms (~14×). Index build cost is ~125 µs at 200 files
   / ~700 µs at 800 files (~0.5 % of cold materialize).
 
+### Fixed
+- `where_module` / `of_module` now accept `str | list[str]` on every
+  chainable that has them (`DecoratorQuery`, `ConstructionQuery`,
+  `CallQuery`, `FactoryQuery`, `SubclassQuery`). List semantics is
+  OR — match if the row's module is any element. Empty list silently
+  matches nothing.
+- Syntactic matchers (`query.decorators` / `.constructions` /
+  `.calls` / `.factories`) now resolve relative imports. Decorators
+  / constructions / calls imported via `from .foo import N` or
+  `from ..pkg import N` no longer slip through `where_module(...)
+  .where_name(N)` filters.
+- `query.constructions.where_name(N)` now matches subscripted
+  constructors (`Generic[T]()`, `Logger[Self]("name")`, …). The
+  callee classifier strips one level of `Expr::Subscript` before
+  matching, mirroring how Python evaluates them.
+
 ### Added
 - `ctx.query().edges()` chainable query with `.with_flags(mask)`,
   `.with_src_kind(kind)`, `.with_dst_kind(kind)` predicates and
