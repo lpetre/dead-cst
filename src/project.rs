@@ -813,6 +813,7 @@ fn assemble_graph<'db>(
 ///   `forward_adj` and keep the first class target found. Doesn't
 ///   cover ``from a import C as D; class X(D): ...`` chains with more
 ///   than one alias hop.
+#[allow(clippy::too_many_arguments)]
 fn build_class_children<'db>(
     db: &'db ProjectDatabase,
     project_files: &[File],
