@@ -25,7 +25,7 @@
 use ruff_db::files::File;
 use ruff_db::parsed::parsed_module;
 use ruff_db::source::{line_index, source_text};
-use ruff_text_size::TextRange;
+use ruff_text_size::{Ranged, TextRange};
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use std::collections::HashMap;
@@ -37,7 +37,8 @@ use ty_python_core::scope::FileScopeId;
 use ty_python_core::semantic_index;
 
 use crate::helpers::{
-    file_default_flags, file_path_string, module_fqname_for_file, position, scan_noqa_directives,
+    collect_all_imports_local, file_default_flags, file_path_string, iter_top_level_classes,
+    module_fqname_for_file, position, range_key, resolve_base_fqn, scan_noqa_directives,
     NODE_FLAGS_NOQA_PIN,
 };
 use crate::ingest::{decl_kind_str, from_module_string};
@@ -217,6 +218,15 @@ pub(crate) struct ImportPayload {
 /// * `star_reexports` — per-name → upstream absolute module name when
 ///   `name` is bound in this file by `from <upstream> import *`. Lets
 ///   downstream chain walks hop through this file.
+/// * `class_bases` — per top-level class declaration, the resolved
+///   base list. Each entry is `(name_range_key, bases)` where
+///   `name_range_key` matches the `(start, end)` `u32` pair the
+///   assemble pass stores in `class_by_selection`, and `bases` is a
+///   small-vec of [`ResolvedBase`] entries. Drives the project-wide
+///   class-hierarchy fan-in at assemble time without a second AST
+///   walk. Same-file `LocalSameFileClass(local_idx)` bases reference
+///   the file's own `refs[local_idx]`; assemble translates them via
+///   the same `NodeRef -> global_idx` map used for edges.
 #[derive(Debug, Eq, PartialEq, salsa::Update, get_size2::GetSize)]
 pub(crate) struct FileNodes<'db> {
     pub(crate) nodes: Box<[NodeData]>,
@@ -224,6 +234,49 @@ pub(crate) struct FileNodes<'db> {
     pub(crate) ref_to_local: FxHashMap<NodeRef<'db>, u32>,
     pub(crate) exports_by_name: FxHashMap<String, SmallVec<[u32; 2]>>,
     pub(crate) star_reexports: FxHashMap<String, String>,
+    pub(crate) class_bases: Vec<ClassBaseEntry>,
+}
+
+/// `(name_range_key, resolved_bases)` pair stored in
+/// [`FileNodes::class_bases`]. The range key matches what the
+/// assemble pass writes into `class_by_selection`, so the project-wide
+/// fan-in is a hashmap probe.
+pub(crate) type ClassBaseEntry = ((u32, u32), SmallVec<[ResolvedBase; 2]>);
+
+/// One base-class expression resolved against a single file's
+/// imports + same-file class bindings. Computed purely from per-file
+/// state so it lives inside the salsa-tracked [`FileNodes`] payload —
+/// project-wide fan-in happens at assemble time.
+///
+/// Four shapes cover today's class headers:
+///
+/// * `LocalSameFileClass(local_idx)` — `class Sub(Base): ...` where
+///   `Base` is a top-level class earlier in the same file. The
+///   `local_idx` indexes into the per-file `refs`/`nodes` arrays;
+///   assemble translates it to a global graph index via the same
+///   `ref_to_global` map used for edges.
+/// * `ImportedFqn(fqn)` — `from <module> import Base` (or aliased)
+///   followed by `class Sub(Base): ...`. The fqn is fully qualified
+///   after relative-import resolution. Matches both project and
+///   external bases by string equality with no per-file state.
+/// * `Attribute { module_fqn, attr_name }` — `import <module> [as M];
+///   class Sub(M.Base): ...`. We resolve `M` to its absolute module
+///   name via the file's imports and keep `attr_name` separate so the
+///   assemble pass can probe the target module's `exports_by_name`
+///   (project-side) and synthesize the canonical `<module>.<attr>`
+///   fqn (external-side) without re-parsing.
+/// * `Unresolvable` — `Generic[T]`, dynamic constructions, any base
+///   shape outside the static-resolution contract. Kept as an entry
+///   so the parent class still appears in the index.
+#[derive(Debug, Clone, Eq, PartialEq, Hash, salsa::Update, get_size2::GetSize)]
+pub(crate) enum ResolvedBase {
+    LocalSameFileClass(u32),
+    ImportedFqn(String),
+    Attribute {
+        module_fqn: String,
+        attr_name: String,
+    },
+    Unresolvable,
 }
 
 /// Resolve a `NodeRef` to its `NodeData` payload.
@@ -458,13 +511,131 @@ pub(crate) fn file_to_nodes<'db>(db: &'db dyn ProjectDb, file: File) -> FileNode
         }
     }
 
+    // Build per-file `class_bases`: walk every top-level ClassDef and
+    // resolve each base expression against the file's imports + the
+    // same-file class name table. No project-wide state needed; the
+    // assemble pass turns these into the global `children_by_node` /
+    // `children_by_fqn` indices.
+    let class_bases = build_class_bases(&parsed, &exports_by_name, &nodes);
+
     FileNodes {
         nodes: nodes.into_boxed_slice(),
         refs: refs.into_boxed_slice(),
         ref_to_local,
         exports_by_name,
         star_reexports,
+        class_bases,
     }
+}
+
+/// Per-file class-hierarchy producer used by [`file_to_nodes`].
+///
+/// For each top-level `ClassDef`, locate its corresponding graph node
+/// (via `exports_by_name` + `nodes[..]` kind probe) and resolve each
+/// base expression to a [`ResolvedBase`]. The result is a flat list of
+/// `(local_class_idx, bases)` pairs the assemble pass folds into the
+/// project-wide hierarchy without re-parsing.
+///
+/// Resolution mirrors today's `build_class_children` + `resolve_base_fqn`
+/// helpers but reads everything from the per-file state:
+///
+/// * `Name(Foo)` where `Foo` is in `file_imports` → `ImportedFqn`.
+/// * `Name(Foo)` where `Foo` is a top-level class earlier in this
+///   file → `LocalSameFileClass(local_idx)`.
+/// * `Attribute(Name(M).N)` where `M` is in `file_imports` →
+///   `Attribute { module_fqn, attr_name: N }`.
+/// * Deeper `a.b.c.N` chains rooted at an import → flattened into
+///   `ImportedFqn("<a-upstream>.b.c.N")` (matches today's
+///   `resolve_base_fqn` behaviour for the `find_subclasses_via_bases`
+///   path).
+/// * Anything else → `ResolvedBase::Unresolvable`.
+fn build_class_bases(
+    parsed: &ruff_db::parsed::ParsedModuleRef,
+    exports_by_name: &FxHashMap<String, SmallVec<[u32; 2]>>,
+    nodes: &[NodeData],
+) -> Vec<ClassBaseEntry> {
+    use ruff_python_ast::Expr;
+    let file_imports = collect_all_imports_local(parsed);
+
+    // Build name → local class idx for same-file class references.
+    // Multiple top-level `class Foo` rebinds at the same name keep
+    // the *first* (matching the historical libcst behaviour where a
+    // syntactic base reference resolves to the lexically-earliest
+    // class with that name). The cross-module case is unaffected —
+    // `subclasses_of_fqn` indexes by fqname, so shadowed declarations
+    // resolve through the import path, not this map.
+    let mut same_file_classes: FxHashMap<&str, u32> = FxHashMap::default();
+    for (name, locals) in exports_by_name {
+        for &local_idx in locals {
+            if matches!(nodes[local_idx as usize].kind, NodeKind::Class) {
+                same_file_classes.entry(name.as_str()).or_insert(local_idx);
+                break;
+            }
+        }
+    }
+
+    let mut out: Vec<ClassBaseEntry> = Vec::new();
+    for cls in iter_top_level_classes(parsed) {
+        // Key on the class name's `(start, end)` byte range — same
+        // tuple the assemble pass uses to populate `class_by_selection`,
+        // so the assemble-side fan-in is an O(1) hashmap probe.
+        let cls_rk = range_key(cls.name.range());
+
+        let Some(args) = &cls.arguments else {
+            out.push((cls_rk, SmallVec::new()));
+            continue;
+        };
+        let mut bases: SmallVec<[ResolvedBase; 2]> = SmallVec::new();
+        for raw_base in &args.args {
+            // Unwrap `Foo[T]`, `Generic[T]`, `Protocol[T]`, etc.
+            // The original `build_class_children` matched these
+            // before the fqn-aware resolver ran; preserve that
+            // behaviour so subscripted generic bases still feed
+            // the class hierarchy.
+            let base = match raw_base {
+                Expr::Subscript(s) => s.value.as_ref(),
+                other => other,
+            };
+            // First-pass: try the fqn-aware resolver. It returns an
+            // upstream fqname for Name/Attribute chains rooted at an
+            // imported name. For a single Attribute(Name(M).N) we
+            // override to the `Attribute` variant so the assemble pass
+            // can probe the target module's `exports_by_name` for the
+            // project-side class lookup.
+            if let Some(fqn) = resolve_base_fqn(base, &file_imports) {
+                match base {
+                    Expr::Attribute(a) => {
+                        if let Expr::Name(root) = a.value.as_ref() {
+                            if let Some(module_fqn) = file_imports.get(root.id.as_str()) {
+                                bases.push(ResolvedBase::Attribute {
+                                    module_fqn: module_fqn.clone(),
+                                    attr_name: a.attr.as_str().to_string(),
+                                });
+                                continue;
+                            }
+                        }
+                        // Deeper chains: keep the flat fqn — used by
+                        // the fqn-keyed lookup.
+                        bases.push(ResolvedBase::ImportedFqn(fqn));
+                    }
+                    _ => {
+                        bases.push(ResolvedBase::ImportedFqn(fqn));
+                    }
+                }
+                continue;
+            }
+            // Fallback: same-file bare-name class reference.
+            if let Expr::Name(name) = base {
+                if let Some(&local_idx) = same_file_classes.get(name.id.as_str()) {
+                    bases.push(ResolvedBase::LocalSameFileClass(local_idx));
+                    continue;
+                }
+            }
+            bases.push(ResolvedBase::Unresolvable);
+        }
+        out.push((cls_rk, bases));
+    }
+    out
 }
 
 /// Pure-rust variant of `ingest::import_payload_for`. Returns the same

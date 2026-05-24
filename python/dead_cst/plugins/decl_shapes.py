@@ -156,10 +156,11 @@ class DispatchAppPlugin(Plugin):
             out.setdefault(module, set()).add(name)
         if not self.app_classes:
             return out
-        for sub in ctx.find_subclasses_via_bases(list(self.app_classes)):
-            sub_module, _, sub_name = sub.fqname.rpartition(".")
-            if sub_module and sub_name:
-                out.setdefault(sub_module, set()).add(sub_name)
+        for fqn in self.app_classes:
+            for sub in ctx.subclasses_of_fqn(fqn):
+                sub_module, _, sub_name = sub.fqname.rpartition(".")
+                if sub_module and sub_name:
+                    out.setdefault(sub_module, set()).add(sub_name)
         return out
 
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:

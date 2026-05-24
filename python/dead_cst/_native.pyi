@@ -381,34 +381,44 @@ class ProjectContext:
         """
         ...
 
-    def find_subclasses_via_bases(self, base_fqns: list[str]) -> list[SymbolNode]:
-        """Every project class that transitively inherits from any
-        fqname in ``base_fqns``, computed by walking the project's
-        ``ClassDef`` base lists directly instead of asking ty's
-        ``find_references`` to walk down from each base.
+    def subclasses_of_fqn(self, fqn: str, *, transitive: bool = True) -> list[SymbolNode]:
+        """Project classes that inherit from the class identified by
+        ``fqn``. ``fqn`` may name a project or external class.
 
-        Roughly equivalent to calling :meth:`find_subclasses` once per
-        ``base_fqn`` and unioning the results — but the framework
-        modules are never loaded out of the venv, so cold-cache cost
-        scales with project file count rather than venv parse cost.
-        Useful when the targets are external classes that ty would
-        otherwise force-load (``flask.Flask``, ``typer.Typer``, …).
+        Backed by a project-wide index built once at materialize time
+        from each file's per-class resolved base list, so external
+        seeds (``flask.Flask``, ``typer.Typer``) are answered without
+        loading the framework out of the venv. ``transitive=True``
+        (default) walks the full subclass closure; ``transitive=False``
+        returns only direct subclasses.
 
         Match shapes per base expression in a class header:
 
         * ``Name(X)`` where ``X`` is imported via
-          ``from <module> import X [as alias]`` resolves to
+          ``from <module> import X [as alias]`` matches
           ``<module>.X``;
         * ``Attribute(Name(M).N)`` where ``M`` is bound via
-          ``import <module> [as M]`` resolves to ``<module>.N``;
-        * dotted ``a.b.c.N`` rooted at an imported name resolves to
-          ``<a-upstream>.b.c.N``;
+          ``import <module> [as M]`` matches ``<module>.N``;
+        * dotted ``a.b.c.N`` rooted at an imported name matches the
+          flat ``<a-upstream>.b.c.N`` fqname;
         * a bare ``Name(X)`` referring to a class defined in the same
-          file (``class Sub(Local): ...``).
+          file participates in node-keyed walks.
 
         Generic parameterizations (``class C(Foo[T])``) and other
-        non-identifier base expressions are skipped — accept that
-        cost; it matches the libcst pipeline's behavior.
+        non-identifier base expressions are skipped — matches the
+        libcst pipeline's behavior.
+        """
+        ...
+
+    def subclasses_of_node(
+        self, class_node: SymbolNode, *, transitive: bool = True
+    ) -> list[SymbolNode]:
+        """Project classes that inherit from ``class_node``.
+
+        Sibling of :meth:`subclasses_of_fqn` for callers that already
+        hold the seed as a ``SymbolNode``. Returns an empty list when
+        ``class_node`` isn't of class kind or isn't found in the
+        project's class-by-selection index.
         """
         ...
 
