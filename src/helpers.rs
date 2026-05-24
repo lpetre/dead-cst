@@ -3,8 +3,6 @@
 //! dead-region detection, noqa scanning, position/file helpers, and the
 //! shared `NodeFlags`/`EdgeFlags` constant aliases.
 
-use std::collections::{HashMap, HashSet};
-
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use ruff_db::files::{File, FilePath};
@@ -16,6 +14,7 @@ use ruff_python_ast::visitor::{walk_expr, Visitor};
 use ruff_python_ast::{Expr, Stmt, StmtClassDef};
 use ruff_source_file::LineIndex;
 use ruff_text_size::{Ranged, TextRange};
+use rustc_hash::{FxHashMap, FxHashSet};
 use ty_module_resolver::Module;
 use ty_module_resolver::{
     file_to_module, resolve_module, search_paths, ModuleName, ModuleResolveMode,
@@ -62,8 +61,8 @@ pub(crate) fn class_body_defines_method(class_def: &StmtClassDef, method_name: &
 ///   (covers ``import module`` and ``import module as alias``).
 pub(crate) fn decorators_match_imports<'ast>(
     decorators: &'ast [ruff_python_ast::Decorator],
-    imports: &HashMap<String, String>,
-    names: &HashSet<&str>,
+    imports: &FxHashMap<String, String>,
+    names: &FxHashSet<&str>,
 ) -> Option<Option<&'ast ruff_python_ast::ExprCall>> {
     for dec in decorators {
         let (root_expr, call_form) = match &dec.expression {
@@ -114,7 +113,7 @@ pub(crate) fn iter_top_level_classes(
 /// two top-level classes can't share a source line.
 pub(crate) fn locate_class_def(
     db: &ProjectDatabase,
-    path_to_file: &HashMap<String, File>,
+    path_to_file: &FxHashMap<String, File>,
     path: &str,
     class_node: &SymbolNode,
 ) -> Option<(File, TextRange)> {
@@ -220,8 +219,8 @@ pub(crate) fn find_subclass_indices_via_refs(
     seed_name_range: TextRange,
     transitive: bool,
 ) -> Vec<usize> {
-    let mut out_idx: HashSet<usize> = HashSet::new();
-    let mut visited_seeds: HashSet<(File, (u32, u32))> = HashSet::new();
+    let mut out_idx: FxHashSet<usize> = FxHashSet::default();
+    let mut visited_seeds: FxHashSet<(File, (u32, u32))> = FxHashSet::default();
     let mut queue: Vec<(File, TextRange)> = vec![(seed_file, seed_name_range)];
 
     while let Some((cur_file, cur_range)) = queue.pop() {
@@ -304,7 +303,7 @@ pub(crate) fn locate_class_seed(
     let anchor = *outputs.project_files.first()?;
     let module = resolve_module(db, anchor, &module_name)?;
     let module_file = module.file(db)?;
-    let mut visited: HashSet<File> = HashSet::new();
+    let mut visited: FxHashSet<File> = FxHashSet::default();
     follow_class_through_module(db, module_file, class_name, &mut visited)
 }
 
@@ -318,7 +317,7 @@ pub(crate) fn follow_class_through_module(
     db: &ProjectDatabase,
     start_file: File,
     class_name: &str,
-    visited: &mut HashSet<File>,
+    visited: &mut FxHashSet<File>,
 ) -> Option<(File, TextRange)> {
     if !visited.insert(start_file) {
         return None;
@@ -428,8 +427,8 @@ pub(crate) fn is_string_literal(expr: &Expr, value: &str) -> bool {
 /// * ``import foo.bar`` → ``"foo" -> "foo"`` (Python binds the
 ///   leftmost segment; the runtime module ``foo`` is what the name
 ///   resolves to).
-pub(crate) fn collect_all_imports_local(parsed: &ParsedModuleRef) -> HashMap<String, String> {
-    let mut out: HashMap<String, String> = HashMap::new();
+pub(crate) fn collect_all_imports_local(parsed: &ParsedModuleRef) -> FxHashMap<String, String> {
+    let mut out: FxHashMap<String, String> = FxHashMap::default();
     for stmt in &parsed.syntax().body {
         match stmt {
             Stmt::ImportFrom(im) => {
@@ -479,13 +478,13 @@ pub(crate) fn collect_all_imports_local(parsed: &ParsedModuleRef) -> HashMap<Str
 pub(crate) fn collect_module_imports_local(
     parsed: &ParsedModuleRef,
     module: &str,
-    allowed: &HashSet<&str>,
-) -> HashMap<String, String> {
+    allowed: &FxHashSet<&str>,
+) -> FxHashMap<String, String> {
     // Submodule binding: ``from <parent> import <last_seg>`` makes
     // ``last_seg`` a local alias for the queried module (e.g.
     // ``from unittest import mock`` for module ``unittest.mock``).
     let parent_last = module.rsplit_once('.');
-    let mut out = HashMap::new();
+    let mut out = FxHashMap::default();
     for stmt in &parsed.syntax().body {
         match stmt {
             Stmt::ImportFrom(im) => {
@@ -540,9 +539,9 @@ pub(crate) fn collect_module_imports_local(
 /// Returns the matched upstream name (``"Flask"``) on hit, else ``None``.
 pub(crate) fn matched_call_target(
     call: &ruff_python_ast::ExprCall,
-    imports: &HashMap<String, String>,
+    imports: &FxHashMap<String, String>,
     module: &str,
-    allowed: &HashSet<&str>,
+    allowed: &FxHashSet<&str>,
 ) -> Option<String> {
     match call.func.as_ref() {
         Expr::Name(name) => {
@@ -602,10 +601,10 @@ pub(crate) fn top_level_assign_to_name(stmt: &Stmt) -> Option<(TextRange, &Expr)
 /// Recursive visitor: walk a function / class body collecting the set
 /// of constructor names called anywhere inside it.
 pub(crate) struct FactoryCallFinder<'a> {
-    pub(crate) imports: &'a HashMap<String, String>,
+    pub(crate) imports: &'a FxHashMap<String, String>,
     pub(crate) module: &'a str,
-    pub(crate) allowed: &'a HashSet<&'a str>,
-    pub(crate) kinds: HashSet<String>,
+    pub(crate) allowed: &'a FxHashSet<&'a str>,
+    pub(crate) kinds: FxHashSet<String>,
 }
 
 impl<'ast, 'a> Visitor<'ast> for FactoryCallFinder<'a> {
@@ -629,8 +628,8 @@ impl<'ast, 'a> Visitor<'ast> for FactoryCallFinder<'a> {
 /// ``!Sync`` — these maps are ``Sync`` on their own, which lets the
 /// callers borrow them across rayon thread boundaries.
 pub(crate) fn owner_idx_for_stmt_with(
-    decl_by_name_range: &HashMap<(File, (u32, u32)), usize>,
-    module_nodes_by_file: &HashMap<File, usize>,
+    decl_by_name_range: &FxHashMap<(File, (u32, u32)), usize>,
+    module_nodes_by_file: &FxHashMap<File, usize>,
     file: File,
     stmt: &Stmt,
 ) -> Option<usize> {
@@ -688,7 +687,7 @@ pub(crate) enum ArgValue {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CallArgs {
     pub(crate) args: Vec<ArgValue>,
-    pub(crate) kwargs: HashMap<String, ArgValue>,
+    pub(crate) kwargs: FxHashMap<String, ArgValue>,
 }
 
 /// Resolve a dotted Name / Attribute chain to a project decl index
@@ -700,8 +699,8 @@ pub(crate) struct CallArgs {
 pub(crate) fn resolve_dotted_name_to_decl(
     root: &str,
     segs: &[&str],
-    file_imports: &HashMap<String, String>,
-    decl_by_fqname: &HashMap<String, Vec<usize>>,
+    file_imports: &FxHashMap<String, String>,
+    decl_by_fqname: &FxHashMap<String, Vec<usize>>,
 ) -> Option<usize> {
     let upstream = file_imports.get(root)?;
     let mut fqn =
@@ -718,8 +717,8 @@ pub(crate) fn resolve_dotted_name_to_decl(
 /// Convert one AST argument expression to an ``ArgValue``.
 pub(crate) fn extract_arg_value(
     expr: &Expr,
-    file_imports: &HashMap<String, String>,
-    decl_by_fqname: &HashMap<String, Vec<usize>>,
+    file_imports: &FxHashMap<String, String>,
+    decl_by_fqname: &FxHashMap<String, Vec<usize>>,
 ) -> ArgValue {
     match expr {
         Expr::NoneLiteral(_) => ArgValue::None,
@@ -774,8 +773,8 @@ pub(crate) fn extract_arg_value(
 /// Extract positional + keyword arguments from a call.
 pub(crate) fn extract_call_args_kwargs(
     call: &ruff_python_ast::ExprCall,
-    file_imports: &HashMap<String, String>,
-    decl_by_fqname: &HashMap<String, Vec<usize>>,
+    file_imports: &FxHashMap<String, String>,
+    decl_by_fqname: &FxHashMap<String, Vec<usize>>,
 ) -> CallArgs {
     let args: Vec<ArgValue> = call
         .arguments
@@ -783,7 +782,7 @@ pub(crate) fn extract_call_args_kwargs(
         .iter()
         .map(|a| extract_arg_value(a, file_imports, decl_by_fqname))
         .collect();
-    let mut kwargs: HashMap<String, ArgValue> = HashMap::new();
+    let mut kwargs: FxHashMap<String, ArgValue> = FxHashMap::default();
     for kw in &call.arguments.keywords {
         let Some(name) = kw.arg.as_ref() else {
             continue;
@@ -837,12 +836,12 @@ pub(crate) fn args_to_py_vec(
     args.iter().map(|v| arg_value_to_py(py, v, nodes)).collect()
 }
 
-/// Convert a kwargs map to ``HashMap<String, Py<PyAny>>``.
+/// Convert a kwargs map to ``FxHashMap<String, Py<PyAny>>``.
 pub(crate) fn kwargs_to_py_map(
     py: Python<'_>,
-    kwargs: &HashMap<String, ArgValue>,
+    kwargs: &FxHashMap<String, ArgValue>,
     nodes: &[Py<SymbolNode>],
-) -> HashMap<String, Py<PyAny>> {
+) -> FxHashMap<String, Py<PyAny>> {
     kwargs
         .iter()
         .map(|(k, v)| (k.clone(), arg_value_to_py(py, v, nodes)))
@@ -1004,8 +1003,8 @@ where
 {
     pub(crate) predicate: F,
     pub(crate) arg_index: usize,
-    pub(crate) file_imports: &'a HashMap<String, String>,
-    pub(crate) decl_by_fqname: &'a HashMap<String, Vec<usize>>,
+    pub(crate) file_imports: &'a FxHashMap<String, String>,
+    pub(crate) decl_by_fqname: &'a FxHashMap<String, Vec<usize>>,
     pub(crate) results: Vec<(String, CallArgs)>,
 }
 
@@ -1038,8 +1037,8 @@ where
 pub(crate) struct AttrCallFinder<'a> {
     pub(crate) attr: &'a str,
     pub(crate) arg_index: usize,
-    pub(crate) file_imports: &'a HashMap<String, String>,
-    pub(crate) decl_by_fqname: &'a HashMap<String, Vec<usize>>,
+    pub(crate) file_imports: &'a FxHashMap<String, String>,
+    pub(crate) decl_by_fqname: &'a FxHashMap<String, Vec<usize>>,
     pub(crate) results: Vec<(String, CallArgs)>,
 }
 
@@ -1144,11 +1143,11 @@ pub(crate) const EDGE_FLAG_DYNAMIC_IMPORT: u32 = EdgeFlags::DYNAMIC_IMPORT;
 /// `build_scope_table` from the scope's literal assignments,
 /// annotated assignments, and walrus expressions. Function and class
 /// bodies inherit and override their enclosing scope's table.
-pub(crate) type NameTable = HashMap<String, bool>;
+pub(crate) type NameTable = FxHashMap<String, bool>;
 
 pub(crate) fn detect_dead_ranges(parsed: &ParsedModuleRef) -> Vec<TextRange> {
     let mut dead = Vec::new();
-    let empty: NameTable = HashMap::new();
+    let empty: NameTable = FxHashMap::default();
     let module_table = build_scope_table(&parsed.syntax().body, &empty);
     walk_suite_for_dead(&parsed.syntax().body, &module_table, &mut dead);
     dead
@@ -1408,10 +1407,10 @@ pub(crate) fn evaluate_truthiness(expr: &Expr, table: &NameTable) -> Option<bool
 /// refuse to re-fold it for the rest of this scope.
 pub(crate) fn build_scope_table(stmts: &[Stmt], enclosing: &NameTable) -> NameTable {
     let mut table = enclosing.clone();
-    let mut bindings: HashMap<String, Vec<&Expr>> = HashMap::new();
+    let mut bindings: FxHashMap<String, Vec<&Expr>> = FxHashMap::default();
     collect_scope_bindings(stmts, &mut bindings);
 
-    let mut poisoned: HashSet<String> = HashSet::new();
+    let mut poisoned: FxHashSet<String> = FxHashSet::default();
     let mut changed = true;
     while changed {
         changed = false;
@@ -1460,7 +1459,7 @@ pub(crate) fn build_scope_table(stmts: &[Stmt], enclosing: &NameTable) -> NameTa
 /// scopes with their own tables.
 pub(crate) fn collect_scope_bindings<'a>(
     stmts: &'a [Stmt],
-    out: &mut HashMap<String, Vec<&'a Expr>>,
+    out: &mut FxHashMap<String, Vec<&'a Expr>>,
 ) {
     for stmt in stmts {
         match stmt {
@@ -1507,7 +1506,10 @@ pub(crate) fn collect_scope_bindings<'a>(
 
 /// Scan `expr` for walrus (`:=`) targets that bind names in the
 /// enclosing scope.
-pub(crate) fn collect_walrus_in_expr<'a>(expr: &'a Expr, out: &mut HashMap<String, Vec<&'a Expr>>) {
+pub(crate) fn collect_walrus_in_expr<'a>(
+    expr: &'a Expr,
+    out: &mut FxHashMap<String, Vec<&'a Expr>>,
+) {
     match expr {
         Expr::Named(named) => {
             if let Expr::Name(target) = &*named.target {
@@ -1629,9 +1631,9 @@ pub(crate) fn scan_noqa_directives(
     parsed: &ParsedModuleRef,
     source: &str,
     line_index: &LineIndex,
-) -> (bool, HashSet<usize>) {
+) -> (bool, FxHashSet<usize>) {
     let mut file_pinned = false;
-    let mut per_line_pins: HashSet<usize> = HashSet::new();
+    let mut per_line_pins: FxHashSet<usize> = FxHashSet::default();
     for token in parsed.tokens().iter() {
         if token.kind() != TokenKind::Comment {
             continue;
@@ -2196,7 +2198,7 @@ mod tests {
 
     #[test]
     fn evaluate_truthiness_literals() {
-        let empty: NameTable = HashMap::new();
+        let empty: NameTable = FxHashMap::default();
         assert_eq!(evaluate_truthiness(&parse_expr("True"), &empty), Some(true));
         assert_eq!(
             evaluate_truthiness(&parse_expr("False"), &empty),
@@ -2226,7 +2228,7 @@ mod tests {
 
     #[test]
     fn evaluate_truthiness_names_via_table() {
-        let mut table: NameTable = HashMap::new();
+        let mut table: NameTable = FxHashMap::default();
         table.insert("DEBUG".into(), true);
         table.insert("RELEASE".into(), false);
         assert_eq!(
@@ -2242,7 +2244,7 @@ mod tests {
 
     #[test]
     fn evaluate_truthiness_unary_not() {
-        let empty: NameTable = HashMap::new();
+        let empty: NameTable = FxHashMap::default();
         assert_eq!(
             evaluate_truthiness(&parse_expr("not True"), &empty),
             Some(false)
@@ -2261,7 +2263,7 @@ mod tests {
 
     #[test]
     fn evaluate_truthiness_bool_ops_short_circuit_or() {
-        let empty: NameTable = HashMap::new();
+        let empty: NameTable = FxHashMap::default();
         assert_eq!(
             evaluate_truthiness(&parse_expr("True or unknown"), &empty),
             Some(true)
@@ -2278,7 +2280,7 @@ mod tests {
 
     #[test]
     fn evaluate_truthiness_bool_ops_short_circuit_and() {
-        let empty: NameTable = HashMap::new();
+        let empty: NameTable = FxHashMap::default();
         assert_eq!(
             evaluate_truthiness(&parse_expr("False and unknown"), &empty),
             Some(false)
@@ -2295,7 +2297,7 @@ mod tests {
 
     #[test]
     fn evaluate_truthiness_returns_none_for_unsupported() {
-        let empty: NameTable = HashMap::new();
+        let empty: NameTable = FxHashMap::default();
         assert_eq!(evaluate_truthiness(&parse_expr("f()"), &empty), None);
         assert_eq!(evaluate_truthiness(&parse_expr("a.b"), &empty), None);
         assert_eq!(evaluate_truthiness(&parse_expr("a == b"), &empty), None);
@@ -2303,7 +2305,7 @@ mod tests {
 
     #[test]
     fn evaluate_truthiness_walrus_unwraps_value() {
-        let empty: NameTable = HashMap::new();
+        let empty: NameTable = FxHashMap::default();
         // ``(x := True)`` should fold to True (the walrus's value).
         assert_eq!(
             evaluate_truthiness(&parse_expr("(x := True)"), &empty),
@@ -2315,7 +2317,7 @@ mod tests {
 
     #[test]
     fn stmt_is_terminator_basic_terminators() {
-        let empty: NameTable = HashMap::new();
+        let empty: NameTable = FxHashMap::default();
         let stmts = parse_stmts("def f():\n    return 1\n");
         let body = match &stmts[0] {
             Stmt::FunctionDef(f) => &f.body,
@@ -2333,7 +2335,7 @@ mod tests {
 
     #[test]
     fn stmt_is_terminator_break_continue_inside_loop() {
-        let empty: NameTable = HashMap::new();
+        let empty: NameTable = FxHashMap::default();
         let stmts = parse_stmts("for _ in []:\n    break\n");
         let body = match &stmts[0] {
             Stmt::For(f) => &f.body,
@@ -2351,7 +2353,7 @@ mod tests {
 
     #[test]
     fn stmt_is_terminator_assert_falsy() {
-        let empty: NameTable = HashMap::new();
+        let empty: NameTable = FxHashMap::default();
         // `assert False` is a terminator; `assert True` is not.
         let stmts = parse_stmts("assert False\n");
         assert!(stmt_is_terminator(&stmts[0], &empty));
@@ -2365,14 +2367,14 @@ mod tests {
 
     #[test]
     fn stmt_is_terminator_if_constant_truthy_body_terminates() {
-        let empty: NameTable = HashMap::new();
+        let empty: NameTable = FxHashMap::default();
         let stmts = parse_stmts("if True:\n    return\n");
         assert!(stmt_is_terminator(&stmts[0], &empty));
     }
 
     #[test]
     fn stmt_is_terminator_if_without_else_not_terminator() {
-        let empty: NameTable = HashMap::new();
+        let empty: NameTable = FxHashMap::default();
         // No else clause + a non-constant test means the if might be
         // skipped — not a terminator.
         let stmts = parse_stmts("if cond:\n    return\n");
@@ -2381,21 +2383,21 @@ mod tests {
 
     #[test]
     fn stmt_is_terminator_if_else_both_terminate() {
-        let empty: NameTable = HashMap::new();
+        let empty: NameTable = FxHashMap::default();
         let stmts = parse_stmts("if cond:\n    return\nelse:\n    raise X\n");
         assert!(stmt_is_terminator(&stmts[0], &empty));
     }
 
     #[test]
     fn stmt_is_terminator_if_else_one_falls_through() {
-        let empty: NameTable = HashMap::new();
+        let empty: NameTable = FxHashMap::default();
         let stmts = parse_stmts("if cond:\n    return\nelse:\n    pass\n");
         assert!(!stmt_is_terminator(&stmts[0], &empty));
     }
 
     #[test]
     fn stmt_is_terminator_try_finally_terminates() {
-        let empty: NameTable = HashMap::new();
+        let empty: NameTable = FxHashMap::default();
         let stmts =
             parse_stmts("try:\n    x = 1\nexcept Exception:\n    pass\nfinally:\n    return\n");
         assert!(stmt_is_terminator(&stmts[0], &empty));
@@ -2403,21 +2405,21 @@ mod tests {
 
     #[test]
     fn stmt_is_terminator_try_body_and_all_handlers_terminate() {
-        let empty: NameTable = HashMap::new();
+        let empty: NameTable = FxHashMap::default();
         let stmts = parse_stmts("try:\n    return\nexcept Exception:\n    raise\n");
         assert!(stmt_is_terminator(&stmts[0], &empty));
     }
 
     #[test]
     fn stmt_is_terminator_try_handler_falls_through_not_terminator() {
-        let empty: NameTable = HashMap::new();
+        let empty: NameTable = FxHashMap::default();
         let stmts = parse_stmts("try:\n    return\nexcept Exception:\n    pass\n");
         assert!(!stmt_is_terminator(&stmts[0], &empty));
     }
 
     #[test]
     fn stmt_is_terminator_with_body_terminates() {
-        let empty: NameTable = HashMap::new();
+        let empty: NameTable = FxHashMap::default();
         let stmts = parse_stmts("with cm as c:\n    return\n");
         assert!(stmt_is_terminator(&stmts[0], &empty));
         let stmts = parse_stmts("with cm as c:\n    pass\n");
@@ -2426,14 +2428,14 @@ mod tests {
 
     #[test]
     fn stmt_is_terminator_pass_is_not() {
-        let empty: NameTable = HashMap::new();
+        let empty: NameTable = FxHashMap::default();
         let stmts = parse_stmts("pass\n");
         assert!(!stmt_is_terminator(&stmts[0], &empty));
     }
 
     #[test]
     fn suite_terminates_finds_any_terminator() {
-        let empty: NameTable = HashMap::new();
+        let empty: NameTable = FxHashMap::default();
         let stmts = parse_stmts("def f():\n    x = 1\n    return 2\n    y = 3\n");
         let body = match &stmts[0] {
             Stmt::FunctionDef(f) => &f.body,
@@ -2453,7 +2455,7 @@ mod tests {
 
     #[test]
     fn walk_suite_for_dead_marks_post_terminator_statements() {
-        let empty: NameTable = HashMap::new();
+        let empty: NameTable = FxHashMap::default();
         let stmts = parse_stmts("def f():\n    return 1\n    x = 2\n    y = 3\n");
         let body = match &stmts[0] {
             Stmt::FunctionDef(f) => f.body.clone(),
@@ -2467,7 +2469,7 @@ mod tests {
 
     #[test]
     fn walk_suite_for_dead_handles_if_false() {
-        let empty: NameTable = HashMap::new();
+        let empty: NameTable = FxHashMap::default();
         let stmts = parse_stmts("if False:\n    x = 1\n    y = 2\n");
         let mut dead = Vec::new();
         walk_suite_for_dead(&stmts, &empty, &mut dead);
@@ -2477,7 +2479,7 @@ mod tests {
 
     #[test]
     fn walk_suite_for_dead_handles_if_true_drops_else() {
-        let empty: NameTable = HashMap::new();
+        let empty: NameTable = FxHashMap::default();
         let stmts = parse_stmts("if True:\n    x = 1\nelse:\n    y = 2\n");
         let mut dead = Vec::new();
         walk_suite_for_dead(&stmts, &empty, &mut dead);
@@ -2487,7 +2489,7 @@ mod tests {
 
     #[test]
     fn walk_suite_for_dead_recurses_into_function_body() {
-        let empty: NameTable = HashMap::new();
+        let empty: NameTable = FxHashMap::default();
         let stmts = parse_stmts("def outer():\n    return\n    nested = 1\n");
         let mut dead = Vec::new();
         walk_suite_for_dead(&stmts, &empty, &mut dead);
@@ -2496,7 +2498,7 @@ mod tests {
 
     #[test]
     fn walk_suite_for_dead_empty_input_yields_nothing() {
-        let empty: NameTable = HashMap::new();
+        let empty: NameTable = FxHashMap::default();
         let mut dead = Vec::new();
         walk_suite_for_dead(&[], &empty, &mut dead);
         assert!(dead.is_empty());
@@ -2506,7 +2508,7 @@ mod tests {
 
     #[test]
     fn build_scope_table_folds_simple_constant() {
-        let empty: NameTable = HashMap::new();
+        let empty: NameTable = FxHashMap::default();
         let stmts = parse_stmts("DEBUG = True\nX = False\n");
         let table = build_scope_table(&stmts, &empty);
         assert_eq!(table.get("DEBUG"), Some(&true));
@@ -2515,7 +2517,7 @@ mod tests {
 
     #[test]
     fn build_scope_table_handles_chained_constants() {
-        let empty: NameTable = HashMap::new();
+        let empty: NameTable = FxHashMap::default();
         let stmts = parse_stmts("A = False\nB = A or False\nC = B\n");
         let table = build_scope_table(&stmts, &empty);
         assert_eq!(table.get("A"), Some(&false));
@@ -2525,7 +2527,7 @@ mod tests {
 
     #[test]
     fn build_scope_table_drops_conflicting_bindings() {
-        let empty: NameTable = HashMap::new();
+        let empty: NameTable = FxHashMap::default();
         let stmts = parse_stmts("X = True\nX = False\n");
         let table = build_scope_table(&stmts, &empty);
         assert!(!table.contains_key("X"));
@@ -2533,7 +2535,7 @@ mod tests {
 
     #[test]
     fn build_scope_table_inherits_enclosing_table() {
-        let mut enclosing: NameTable = HashMap::new();
+        let mut enclosing: NameTable = FxHashMap::default();
         enclosing.insert("OUTER".into(), true);
         let stmts = parse_stmts("INNER = False\n");
         let table = build_scope_table(&stmts, &enclosing);
@@ -2546,7 +2548,7 @@ mod tests {
         // Inheriting ``foo`` from the enclosing scope and then evaluating
         // ``foo = not foo`` would oscillate the table between true/false
         // forever before the poison set was added.
-        let mut enclosing: NameTable = HashMap::new();
+        let mut enclosing: NameTable = FxHashMap::default();
         enclosing.insert("foo".into(), false);
         let stmts = parse_stmts("foo = not foo\n");
         let table = build_scope_table(&stmts, &enclosing);
@@ -2563,7 +2565,7 @@ mod tests {
             "foo = False\ndef flip():\n    global foo\n    foo = not foo\n",
         )
         .unwrap();
-        let mut bindings: HashMap<String, Vec<&Expr>> = HashMap::new();
+        let mut bindings: FxHashMap<String, Vec<&Expr>> = FxHashMap::default();
         let body = parsed.syntax().body.clone();
         collect_scope_bindings(&body, &mut bindings);
         // Sanity: module sees ``foo = False`` only, not the in-function rebind.
@@ -2571,7 +2573,7 @@ mod tests {
 
         // The inner ``flip`` body inherits ``foo = false``; building its
         // table must terminate and drop ``foo`` rather than fold it.
-        let mut enclosing: NameTable = HashMap::new();
+        let mut enclosing: NameTable = FxHashMap::default();
         enclosing.insert("foo".into(), false);
         if let Stmt::FunctionDef(f) = &body[1] {
             let nested = build_scope_table(&f.body, &enclosing);
@@ -2583,7 +2585,7 @@ mod tests {
 
     #[test]
     fn build_scope_table_ignores_nested_function_bindings() {
-        let empty: NameTable = HashMap::new();
+        let empty: NameTable = FxHashMap::default();
         let stmts = parse_stmts("def f():\n    X = True\n");
         let table = build_scope_table(&stmts, &empty);
         // ``X`` is defined inside ``f`` — separate scope.
@@ -2595,7 +2597,7 @@ mod tests {
     #[test]
     fn collect_walrus_in_expr_picks_up_assignment_target() {
         let expr = parse_expr("(x := 5)");
-        let mut out: HashMap<String, Vec<&Expr>> = HashMap::new();
+        let mut out: FxHashMap<String, Vec<&Expr>> = FxHashMap::default();
         collect_walrus_in_expr(&expr, &mut out);
         assert!(out.contains_key("x"));
     }
@@ -2603,7 +2605,7 @@ mod tests {
     #[test]
     fn collect_walrus_in_expr_descends_compound_exprs() {
         let expr = parse_expr("(a := 1) or (b := 2) and (c := 3)");
-        let mut out: HashMap<String, Vec<&Expr>> = HashMap::new();
+        let mut out: FxHashMap<String, Vec<&Expr>> = FxHashMap::default();
         collect_walrus_in_expr(&expr, &mut out);
         assert!(out.contains_key("a"));
         assert!(out.contains_key("b"));
@@ -2613,7 +2615,7 @@ mod tests {
     #[test]
     fn collect_walrus_in_expr_no_walrus_yields_empty() {
         let expr = parse_expr("a + b");
-        let mut out: HashMap<String, Vec<&Expr>> = HashMap::new();
+        let mut out: FxHashMap<String, Vec<&Expr>> = FxHashMap::default();
         collect_walrus_in_expr(&expr, &mut out);
         assert!(out.is_empty());
     }
@@ -2702,9 +2704,9 @@ mod tests {
             Stmt::FunctionDef(f) => &f.decorator_list,
             _ => unreachable!(),
         };
-        let mut imports: HashMap<String, String> = HashMap::new();
+        let mut imports: FxHashMap<String, String> = FxHashMap::default();
         imports.insert("register".into(), "register".into());
-        let mut allowed: HashSet<&str> = HashSet::new();
+        let mut allowed: FxHashSet<&str> = FxHashSet::default();
         allowed.insert("register");
         let got = decorators_match_imports(decorators, &imports, &allowed);
         assert!(got.is_some());
@@ -2717,9 +2719,9 @@ mod tests {
             Stmt::FunctionDef(f) => &f.decorator_list,
             _ => unreachable!(),
         };
-        let mut imports: HashMap<String, String> = HashMap::new();
+        let mut imports: FxHashMap<String, String> = FxHashMap::default();
         imports.insert("flask".into(), MODULE_ALIAS_MARKER.into());
-        let mut allowed: HashSet<&str> = HashSet::new();
+        let mut allowed: FxHashSet<&str> = FxHashSet::default();
         allowed.insert("route");
         let got = decorators_match_imports(decorators, &imports, &allowed);
         // Has a call form.
@@ -2733,9 +2735,9 @@ mod tests {
             Stmt::FunctionDef(f) => &f.decorator_list,
             _ => unreachable!(),
         };
-        let mut imports: HashMap<String, String> = HashMap::new();
+        let mut imports: FxHashMap<String, String> = FxHashMap::default();
         imports.insert("app".into(), MODULE_ALIAS_MARKER.into());
-        let mut allowed: HashSet<&str> = HashSet::new();
+        let mut allowed: FxHashSet<&str> = FxHashSet::default();
         allowed.insert("task");
         let got = decorators_match_imports(decorators, &imports, &allowed);
         // Bare (no call) — outer Some, inner None.
@@ -2749,8 +2751,8 @@ mod tests {
             Stmt::FunctionDef(f) => &f.decorator_list,
             _ => unreachable!(),
         };
-        let imports: HashMap<String, String> = HashMap::new();
-        let allowed: HashSet<&str> = HashSet::new();
+        let imports: FxHashMap<String, String> = FxHashMap::default();
+        let allowed: FxHashSet<&str> = FxHashSet::default();
         assert!(decorators_match_imports(decorators, &imports, &allowed).is_none());
     }
 
@@ -2759,9 +2761,9 @@ mod tests {
     #[test]
     fn matched_call_target_via_local_name() {
         let call = first_call("Flask(__name__)");
-        let mut imports: HashMap<String, String> = HashMap::new();
+        let mut imports: FxHashMap<String, String> = FxHashMap::default();
         imports.insert("Flask".into(), "Flask".into());
-        let mut allowed: HashSet<&str> = HashSet::new();
+        let mut allowed: FxHashSet<&str> = FxHashSet::default();
         allowed.insert("Flask");
         assert_eq!(
             matched_call_target(&call, &imports, "flask", &allowed),
@@ -2772,9 +2774,9 @@ mod tests {
     #[test]
     fn matched_call_target_via_module_alias_attr() {
         let call = first_call("flask.Flask(__name__)");
-        let mut imports: HashMap<String, String> = HashMap::new();
+        let mut imports: FxHashMap<String, String> = FxHashMap::default();
         imports.insert("flask".into(), MODULE_ALIAS_MARKER.into());
-        let mut allowed: HashSet<&str> = HashSet::new();
+        let mut allowed: FxHashSet<&str> = FxHashSet::default();
         allowed.insert("Flask");
         assert_eq!(
             matched_call_target(&call, &imports, "flask", &allowed),
@@ -2787,8 +2789,8 @@ mod tests {
         let call = first_call("unittest.mock.patch('x')");
         // No file imports entry for the leftmost name — fallback to the
         // literal dotted match against ``module``.
-        let imports: HashMap<String, String> = HashMap::new();
-        let mut allowed: HashSet<&str> = HashSet::new();
+        let imports: FxHashMap<String, String> = FxHashMap::default();
+        let mut allowed: FxHashSet<&str> = FxHashSet::default();
         allowed.insert("patch");
         assert_eq!(
             matched_call_target(&call, &imports, "unittest.mock", &allowed),
@@ -2799,18 +2801,18 @@ mod tests {
     #[test]
     fn matched_call_target_rejects_unknown_name() {
         let call = first_call("unrelated()");
-        let imports: HashMap<String, String> = HashMap::new();
-        let allowed: HashSet<&str> = HashSet::new();
+        let imports: FxHashMap<String, String> = FxHashMap::default();
+        let allowed: FxHashSet<&str> = FxHashSet::default();
         assert!(matched_call_target(&call, &imports, "x", &allowed).is_none());
     }
 
     #[test]
     fn matched_call_target_rejects_disallowed_name() {
         let call = first_call("Flask()");
-        let mut imports: HashMap<String, String> = HashMap::new();
+        let mut imports: FxHashMap<String, String> = FxHashMap::default();
         imports.insert("Flask".into(), "Flask".into());
         // Empty allowed set: target is present but not allowed.
-        let allowed: HashSet<&str> = HashSet::new();
+        let allowed: FxHashSet<&str> = FxHashSet::default();
         assert!(matched_call_target(&call, &imports, "flask", &allowed).is_none());
     }
 

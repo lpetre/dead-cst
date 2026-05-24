@@ -5,13 +5,13 @@
 //! See `src/CLAUDE.md` for the architectural rules these types follow.
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::OnceLock;
 
 use pyo3::prelude::*;
 use pyo3::types::PyAnyMethods;
 use ruff_db::files::File;
+use rustc_hash::FxHashMap;
 use ty_python_core::place::ScopedPlaceId;
 
 /// Raw record of one cross-file import reference, attached to a
@@ -252,7 +252,7 @@ impl NativeGraph {
 /// distinct target ranges.
 pub(crate) type DeclKey = (File, ScopedPlaceId, (u32, u32));
 
-pub(crate) type DeclIndex = HashMap<DeclKey, usize>;
+pub(crate) type DeclIndex = FxHashMap<DeclKey, usize>;
 
 /// Return type of `ProjectContext.find_main_blocks`: one entry per
 /// file with a top-level ``if __name__ == "__main__":`` block, paired

@@ -9,6 +9,14 @@ two versions.
 
 ## [Unreleased]
 
+### Changed
+- Bumped vendored `ruff` (ty) submodule to `18448938c8` and switched
+  the upstream URL to the `lpetre/ruff` fork. Picks up 159 ty commits
+  including a search-path cache keyed by top-level module-name
+  component, plus a long tail of upstream ty resolution fixes
+  (enum/class-decorator handling, TypedDict union fallbacks,
+  fall-through narrowing, cycle-recovery panics).
+
 ### Fixed
 - `Analysis(..., venv=...)` no longer drops `project_root` from ty's
   static search paths when a venv is given. The previous suppression
