@@ -38,9 +38,7 @@ def test_decorator_where_module_accepts_single_string(build_decl_graph):
             """,
         }
     )
-    refs = list(
-        native.query(ctx).decorators().where_module("flask").where_name("route")
-    )
+    refs = list(native.query(ctx).decorators().where_module("flask").where_name("route"))
     fqnames = {r.decorated.fqname for r in refs}
     assert "pkg.mod.handler" in fqnames
 
@@ -57,9 +55,7 @@ def test_decorator_where_module_accepts_single_element_list(build_decl_graph):
             """,
         }
     )
-    refs = list(
-        native.query(ctx).decorators().where_module(["flask"]).where_name("route")
-    )
+    refs = list(native.query(ctx).decorators().where_module(["flask"]).where_name("route"))
     fqnames = {r.decorated.fqname for r in refs}
     assert "pkg.mod.handler" in fqnames
 
@@ -85,12 +81,7 @@ def test_decorator_where_module_accepts_multi_element_list(build_decl_graph):
             """,
         }
     )
-    refs = list(
-        native.query(ctx)
-        .decorators()
-        .where_module(["flask", "quart"])
-        .where_name("route")
-    )
+    refs = list(native.query(ctx).decorators().where_module(["flask", "quart"]).where_name("route"))
     fqnames = {r.decorated.fqname for r in refs}
     assert "pkg.flask_app.f_handler" in fqnames
     assert "pkg.quart_app.q_handler" in fqnames
@@ -108,9 +99,7 @@ def test_decorator_where_module_empty_list_matches_nothing(build_decl_graph):
             """,
         }
     )
-    refs = list(
-        native.query(ctx).decorators().where_module([]).where_name("route")
-    )
+    refs = list(native.query(ctx).decorators().where_module([]).where_name("route"))
     assert refs == []
 
 
@@ -184,10 +173,7 @@ def test_factory_of_module_accepts_list(build_decl_graph):
         }
     )
     refs = list(
-        native.query(ctx)
-        .factories()
-        .of_module(["flask", "quart"])
-        .where_name(["Flask", "Quart"])
+        native.query(ctx).factories().of_module(["flask", "quart"]).where_name(["Flask", "Quart"])
     )
     by_fq = {r.decl.fqname: r.kinds for r in refs}
     assert "pkg.factories.make_flask" in by_fq
@@ -218,12 +204,7 @@ def test_decorator_matches_relative_import(build_decl_graph):
             """,
         }
     )
-    refs = list(
-        native.query(ctx)
-        .decorators()
-        .where_module("pkg.foo")
-        .where_name("route")
-    )
+    refs = list(native.query(ctx).decorators().where_module("pkg.foo").where_name("route"))
     fqnames = {r.decorated.fqname for r in refs}
     assert "pkg.handlers.handler" in fqnames
 
@@ -241,12 +222,7 @@ def test_construction_matches_relative_import(build_decl_graph):
             """,
         }
     )
-    refs = list(
-        native.query(ctx)
-        .constructions()
-        .where_module("pkg.foo")
-        .where_name("Worker")
-    )
+    refs = list(native.query(ctx).constructions().where_module("pkg.foo").where_name("Worker"))
     fqnames = {r.var.fqname for r in refs}
     assert "pkg.handlers.w" in fqnames
 
@@ -270,12 +246,7 @@ def test_construction_matches_subscripted_generic(build_decl_graph):
             """,
         }
     )
-    refs = list(
-        native.query(ctx)
-        .constructions()
-        .where_module("pkg.lib")
-        .where_name("Worker")
-    )
+    refs = list(native.query(ctx).constructions().where_module("pkg.lib").where_name("Worker"))
     fqnames = {r.var.fqname for r in refs}
     assert "pkg.uses.w" in fqnames
 
@@ -293,11 +264,6 @@ def test_construction_matches_subscripted_generic_via_module_attr(build_decl_gra
             """,
         }
     )
-    refs = list(
-        native.query(ctx)
-        .constructions()
-        .where_module("pkg.lib")
-        .where_name("Worker")
-    )
+    refs = list(native.query(ctx).constructions().where_module("pkg.lib").where_name("Worker"))
     fqnames = {r.var.fqname for r in refs}
     assert "pkg.uses.w" in fqnames

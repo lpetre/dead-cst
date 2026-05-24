@@ -28,9 +28,7 @@ class PytestPlugin(Plugin):
         # Rust-side fold of the ``kind in {function, class, variable}``
         # filter — one FFI hop, no per-node Python attribute access.
         decls_by_path: dict[str, list[native.SymbolNode]] = {}
-        for n in (
-            native.query(ctx).decls().with_kinds(["function", "class", "variable"]).collect()
-        ):
+        for n in native.query(ctx).decls().with_kinds(["function", "class", "variable"]).collect():
             decls_by_path.setdefault(n.path, []).append(n)
 
         for path, decls in decls_by_path.items():
