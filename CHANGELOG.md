@@ -9,6 +9,8 @@ two versions.
 
 ## [Unreleased]
 
+## [0.12.1] - 2026-05-24
+
 ### Changed
 - `ProjectContext.find_comment_patterns` no longer rescans the
   project-wide `global_index` once per file with a matching comment.
@@ -1697,7 +1699,8 @@ versions until the first stable release.
 - `README.md`, `CONTRIBUTING.md`, `CHANGELOG.md`, and `ROADMAP.md` with a
   stack-ranked plan from alpha to 1.0.
 
-[Unreleased]: https://github.com/lpetre/dead-cst/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/lpetre/dead-cst/compare/v0.12.1...HEAD
+[0.12.1]: https://github.com/lpetre/dead-cst/compare/v0.12.0...v0.12.1
 [0.12.0]: https://github.com/lpetre/dead-cst/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/lpetre/dead-cst/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/lpetre/dead-cst/compare/v0.9.4...v0.10.0
