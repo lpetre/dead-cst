@@ -273,28 +273,37 @@ class DispatchAppPlugin(Plugin):
         # 6. Factory walk: vars that aren't directly constructed but
         # whose descendant graph reaches a factory marker get
         # entrypoint-promoted too. Skipped under seed_as_entrypoint=False.
-        if self.seed_as_entrypoint:
+        #
+        # Inverted from the naive ``ctx.descendants(var)`` per unclassified
+        # handler (O(handlers × graph_size)) to one reverse BFS per
+        # factory decl plus an O(1) set lookup per handler. The factory
+        # markers emitted in step 4 each have one incoming edge from
+        # their ``fref.decl`` — so a var that reaches the marker also
+        # reaches the decl, and ``ancestors(fref.decl)`` is the exact
+        # set of vars (and intermediate nodes) we care about. K factory
+        # decls is typically O(framework_count) and never large; handler
+        # count grows with project size.
+        if self.seed_as_entrypoint and factory_decls:
+            factory_reachers: set[native.SymbolNode] = set()
+            for fref, _kind in factory_decls:
+                factory_reachers.update(ctx.ancestors(fref.decl))
+                factory_reachers.add(fref.decl)
+
             classified: set[tuple[str, str]] = set()
             for h in handlers:
                 key = (h.decorated.path, h.decorator_owner or "")
                 if key in direct_by_owner or key in classified:
                     continue
                 var = vars_by_file.get(key)
-                if var is None:
+                if var is None or var not in factory_reachers:
                     continue
-                for desc in ctx.descendants(var):
-                    if desc.kind != "synthetic":
-                        continue
-                    if not desc.fqname.startswith(factory_prefix):
-                        continue
-                    classified.add(key)
-                    yield native.AddNode(
-                        fqname=f"{app_prefix}{var.fqname}",
-                        path=var.path,
-                        flags=int(NodeFlags.ENTRYPOINT),
-                        edges_to=[var],
-                    )
-                    break
+                classified.add(key)
+                yield native.AddNode(
+                    fqname=f"{app_prefix}{var.fqname}",
+                    path=var.path,
+                    flags=int(NodeFlags.ENTRYPOINT),
+                    edges_to=[var],
+                )
 
 
 @dataclass(kw_only=True)
