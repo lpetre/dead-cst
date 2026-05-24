@@ -496,6 +496,52 @@ def test_flask_plugin_handles_factory_function(build_plugin_graph, reachable_fqn
     assert "app.main.create_item" in reached
 
 
+def test_flask_plugin_factory_walk_requires_direct_successor(build_plugin_graph, reachable_fqnames):
+    """Step 6's factory-walk must be 1-hop: only the var whose *direct*
+    successor is the factory function gets promoted.
+
+    Regression for the over-promotion bug: ``wrapper = app`` puts
+    ``create_app`` in ``wrapper``'s transitive descendants, but
+    ``wrapper`` is two hops from the factory. Promoting it would also
+    revive its handlers, masking dead code.
+
+    Only ``app`` (whose direct successor is ``create_app``) promotes;
+    handlers attached to ``wrapper`` stay dead.
+    """
+    graph = build_plugin_graph(
+        {
+            "app/__init__.py": "",
+            "app/factory.py": """
+            from flask import Flask
+
+            def create_app() -> Flask:
+                return Flask(__name__)
+            """,
+            "app/main.py": """
+            from app.factory import create_app
+
+            app = create_app()
+            wrapper = app
+
+            @app.route("/things")
+            def list_things(): pass
+
+            @wrapper.route("/items")
+            def list_items(): pass
+            """,
+        },
+        [flask_plugin()],
+    )
+    reached = reachable_fqnames(graph)
+    # The direct factory chain promotes ``app`` and its handler.
+    assert "app.main.app" in reached
+    assert "app.main.list_things" in reached
+    # ``wrapper`` is two hops from ``create_app`` — must NOT promote,
+    # so handlers attached to it stay dead.
+    assert "app.main.wrapper" not in reached
+    assert "app.main.list_items" not in reached
+
+
 def test_flask_plugin_factory_returning_blueprint_stays_dead(build_plugin_graph, reachable_fqnames):
     """Factory-produced Blueprint is treated like a literal Blueprint --
     never auto-seeded as an entrypoint, so an unregistered one stays dead."""

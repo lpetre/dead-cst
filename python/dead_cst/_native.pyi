@@ -599,6 +599,21 @@ class ProjectContext:
         """
         ...
 
+    def direct_predecessors(
+        self, node: SymbolNode, *, skip_flags: int = 0
+    ) -> list[SymbolNode]:
+        """One-hop reverse step: every node with an edge directly into
+        ``node``.
+
+        Unlike :meth:`ancestors`, this does *not* take the transitive
+        closure — it only returns the immediate predecessors. Dedups by
+        source node, so a pair of parallel edges with different
+        :class:`EdgeFlags` between the same two nodes only produces one
+        entry. ``skip_flags`` filters edges by intersecting flag mask —
+        same semantics as :meth:`ancestors`.
+        """
+        ...
+
     def reachable(self, *, skip_flags: int = 0, seed_flags: int = ...) -> list[SymbolNode]:
         """Forward closure from every node carrying any bit in
         ``seed_flags`` (defaults to :data:`NodeFlags.ENTRYPOINT`). The

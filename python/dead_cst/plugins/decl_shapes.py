@@ -271,24 +271,23 @@ class DispatchAppPlugin(Plugin):
                 for var in direct_by_owner.get(key, []):
                     yield native.AddEdge(var, h.decorated)
 
-        # 6. Factory walk: vars that aren't directly constructed but
-        # whose descendant graph reaches a factory marker get
-        # entrypoint-promoted too. Skipped under seed_as_entrypoint=False.
+        # 6. Factory walk: vars whose *direct* successor is one of the
+        # factory decls get entrypoint-promoted. Skipped under
+        # seed_as_entrypoint=False.
         #
-        # Inverted from the naive ``ctx.descendants(var)`` per unclassified
-        # handler (O(handlers × graph_size)) to one reverse BFS per
-        # factory decl plus an O(1) set lookup per handler. The factory
-        # markers emitted in step 4 each have one incoming edge from
-        # their ``fref.decl`` — so a var that reaches the marker also
-        # reaches the decl, and ``ancestors(fref.decl)`` is the exact
-        # set of vars (and intermediate nodes) we care about. K factory
-        # decls is typically O(framework_count) and never large; handler
-        # count grows with project size.
+        # We invert the question: rather than walk each var's
+        # descendants looking for a factory marker, we collect the
+        # direct predecessors of every factory decl into a single set
+        # and check ``var in factory_reachers``. This rules out the
+        # over-promotion case ``wrapper = app; app = create_app()`` —
+        # ``wrapper -> app -> create_app`` is two hops, so ``wrapper``
+        # doesn't reach the factory directly and stays unclassified.
+        # Only ``app`` (whose direct successor *is* ``create_app``)
+        # promotes.
         if self.seed_as_entrypoint and factory_decls:
             factory_reachers: set[native.SymbolNode] = set()
             for fref, _kind in factory_decls:
-                factory_reachers.update(ctx.ancestors(fref.decl))
-                factory_reachers.add(fref.decl)
+                factory_reachers.update(ctx.direct_predecessors(fref.decl))
 
             classified: set[tuple[str, str]] = set()
             for h in handlers:

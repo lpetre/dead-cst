@@ -1710,6 +1710,36 @@ impl ProjectContext {
             .collect())
     }
 
+    /// One-hop reverse step: every node with an edge directly into
+    /// ``node`` (i.e. the immediate predecessors, *not* the transitive
+    /// closure :meth:`ancestors` returns). ``skip_flags`` filters edges
+    /// by intersecting flag mask — same semantics as :meth:`ancestors`.
+    ///
+    /// Dedups by source index, so a pair of parallel edges with
+    /// different ``EdgeFlags`` between the same two nodes only produces
+    /// one entry in the result. Result order is unspecified.
+    #[pyo3(signature = (node, *, skip_flags = 0))]
+    pub(crate) fn direct_predecessors(
+        &self,
+        py: Python<'_>,
+        node: &SymbolNode,
+        skip_flags: u32,
+    ) -> PyResult<Vec<Py<SymbolNode>>> {
+        let outputs = self.materialized("direct_predecessors")?;
+        let idx = lookup_idx(&outputs.builder, node, "node")?;
+        let mut seen: FxHashSet<usize> = FxHashSet::default();
+        let mut out: Vec<Py<SymbolNode>> = Vec::new();
+        for &(src, flags) in &outputs.builder.reverse_adj[idx] {
+            if flags & skip_flags != 0 {
+                continue;
+            }
+            if seen.insert(src) {
+                out.push(outputs.builder.nodes[src].clone_ref(py));
+            }
+        }
+        Ok(out)
+    }
+
     /// Forward closure from every node carrying any bit in
     /// ``seed_flags`` (defaults to ``NODE_FLAG_ENTRYPOINT`` for the
     /// classic "alive from entrypoints" question). The set of dead
