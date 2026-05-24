@@ -1436,11 +1436,16 @@ impl ProjectContext {
     /// from the visitor's payload.
     pub(crate) fn find_main_blocks(&self, py: Python<'_>) -> PyResult<Vec<MainBlock>> {
         let outputs = self.materialized("find_main_blocks")?;
-        let mut out: Vec<MainBlock> = Vec::new();
+
+        // First pass: identify files that actually contain a top-level
+        // ``if __name__ == "__main__":`` block. The cheap ``__main__``
+        // substring check filters >99% of modules out before we touch
+        // the parsed AST. Only matched files contribute to the per-file
+        // decl bucketing below, so the bucket build itself is bounded
+        // by O(decls_in_matched_files) — typically a tiny fraction of
+        // the full ``global_index``.
+        let mut hits: Vec<(File, usize, (u32, u32))> = Vec::new();
         for (&file, &module_idx) in &outputs.module_nodes_by_file {
-            // Prefilter: ``if __name__ == "__main__":`` always has the
-            // literal string ``__main__`` in source. Skip the parse
-            // for files that don't even mention it.
             let source = source_text(&self.db, file);
             if !source.contains("__main__") {
                 continue;
@@ -1449,16 +1454,40 @@ impl ProjectContext {
             let Some(block_range) = find_main_block_range(&parsed) else {
                 continue;
             };
-            // Collect decls whose target_range falls within block_range.
+            hits.push((
+                file,
+                module_idx,
+                (block_range.start().to_u32(), block_range.end().to_u32()),
+            ));
+        }
+        if hits.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Build a per-file bucket of (start, end, node_idx) for just the
+        // matched files. Previously we linearly scanned the entire
+        // ``global_index`` for *every* matched file, giving us
+        // O(F_with_main × N_global_decls) — death on large projects.
+        // One sweep here turns the inner loop into a bucket lookup.
+        let matched_files: FxHashSet<File> = hits.iter().map(|(f, _, _)| *f).collect();
+        let mut decls_by_file: FxHashMap<File, Vec<(u32, u32, usize)>> = FxHashMap::default();
+        for ((entry_file, _place_id, (start, end)), idx) in &outputs.global_index {
+            if matched_files.contains(entry_file) {
+                decls_by_file
+                    .entry(*entry_file)
+                    .or_default()
+                    .push((*start, *end, *idx));
+            }
+        }
+
+        let mut out: Vec<MainBlock> = Vec::with_capacity(hits.len());
+        for (file, module_idx, (block_start, block_end)) in hits {
             let mut decls: Vec<Py<SymbolNode>> = Vec::new();
-            for ((entry_file, _place_id, (start, end)), idx) in &outputs.global_index {
-                if *entry_file != file {
-                    continue;
-                }
-                let block_start = block_range.start().to_u32();
-                let block_end = block_range.end().to_u32();
-                if *start >= block_start && *end <= block_end {
-                    decls.push(outputs.builder.nodes[*idx].clone_ref(py));
+            if let Some(file_decls) = decls_by_file.get(&file) {
+                for &(start, end, idx) in file_decls {
+                    if start >= block_start && end <= block_end {
+                        decls.push(outputs.builder.nodes[idx].clone_ref(py));
+                    }
                 }
             }
             out.push((outputs.builder.nodes[module_idx].clone_ref(py), decls));
