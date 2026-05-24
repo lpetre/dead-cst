@@ -599,9 +599,7 @@ class ProjectContext:
         """
         ...
 
-    def direct_predecessors(
-        self, node: SymbolNode, *, skip_flags: int = 0
-    ) -> list[SymbolNode]:
+    def direct_predecessors(self, node: SymbolNode, *, skip_flags: int = 0) -> list[SymbolNode]:
         """One-hop reverse step: every node with an edge directly into
         ``node``.
 

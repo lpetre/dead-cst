@@ -48,13 +48,7 @@ def test_decl_query_indices_predicate_combos(build_decl_graph):
         }
     )
     # kind + path filename narrows to just pkg.svc.handler.
-    indices = (
-        native.query(ctx)
-        .decls()
-        .with_kind("function")
-        .with_filename("svc.py")
-        .indices()
-    )
+    indices = native.query(ctx).decls().with_kind("function").with_filename("svc.py").indices()
     nodes = ctx.nodes_at(indices)
     fqnames = {n.fqname for n in nodes}
     assert fqnames == {"pkg.svc.handler"}
@@ -293,7 +287,8 @@ def test_add_edge_by_idx_carries_flags(tmp_path):
     f_idx = fqnames.index("mod.f")
     g_idx = fqnames.index("mod.g")
     matching = [
-        (s, d, f) for (s, d, f) in ctx.edges()
+        (s, d, f)
+        for (s, d, f) in ctx.edges()
         if s == f_idx and d == g_idx and f == native.EdgeFlags.DEAD_BRANCH
     ]
     assert matching
