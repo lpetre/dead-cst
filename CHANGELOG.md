@@ -78,6 +78,20 @@ two versions.
   `DynamicImportFallbackPlugin` migrated to use it — on a synthetic
   project with 1,800 dynamic-import edges, the filter loop is 3.06×
   faster (1.235 ms → 0.403 ms best-of-12).
+- `ctx.query().decls()` chainable query with `.with_kind` /
+  `.with_kinds`, `.with_filename` / `.with_filenames`,
+  `.with_simple_name` / `.with_simple_names`, `.with_paths`,
+  `.with_path_regex`, `.with_flags` / `.with_any_flag`, and
+  `.with_fqname_prefix` predicates. Returns `SymbolNode` rows
+  directly. Five plugins migrated off Python-side `ctx.nodes()`
+  filter loops with the following warm-best-of-12 wins on the
+  flux0 workspace (1,933 nodes):
+  * `ServerConfigPlugin`: 36.55 ms → 0.24 ms (~153×, the
+    `pathlib.Path(...).name` Python hop was the killer).
+  * `DiscordPyPlugin`: 1.32 ms → 0.07 ms (~18.8×).
+  * `UnittestPlugin`: 0.87 ms → 0.09 ms (~9.9×).
+  * `DispatchAppPlugin` vars-by-file scan: 0.68 ms → 0.27 ms (~2.5×).
+  * `PytestPlugin`: 1.00 ms → 0.46 ms (~2.2×).
 
 ## [0.12.0] - 2026-05-24
 
