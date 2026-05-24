@@ -90,9 +90,13 @@ two versions.
 - `ctx.query().decls()` chainable query with `.with_kind` /
   `.with_kinds`, `.with_filename` / `.with_filenames`,
   `.with_simple_name` / `.with_simple_names`, `.with_paths`,
-  `.with_path_regex`, `.with_flags` / `.with_any_flag`, and
-  `.with_fqname_prefix` predicates. Returns `SymbolNode` rows
-  directly. Five plugins migrated off Python-side `ctx.nodes()`
+  `.with_path_regex`, `.with_flags` / `.with_any_flag`,
+  `.with_fqname_prefix`, and `.where_fqname` predicates. Returns
+  `SymbolNode` rows directly. `where_fqname` accepts `str`,
+  `list[str]`, `re.Pattern`, `list[re.Pattern]`, or any mixed
+  sequence — literal equality and regex search OR together,
+  empty list is the matches-nothing sentinel.
+  Five plugins migrated off Python-side `ctx.nodes()`
   filter loops with the following warm-best-of-12 wins on the
   flux0 workspace (1,933 nodes):
   * `ServerConfigPlugin`: 36.55 ms → 0.24 ms (~153×, the
