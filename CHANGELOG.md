@@ -80,6 +80,13 @@ two versions.
   matching, mirroring how Python evaluates them.
 
 ### Added
+- `Plugin.prepare(self, repo_root: Path) -> None` pre-graph hook.
+  Called once per plugin per `Analysis.materialize_all` invocation,
+  before any graph construction. Default is a no-op; plugins that
+  need to scan the repo for config files (`pyproject.toml`,
+  framework manifests, etc.) or compute setup state independent of
+  the graph should override. Exceptions raised inside propagate
+  before the `ProjectContext` is constructed.
 - `ctx.query().edges()` chainable query with `.with_flags(mask)`,
   `.with_src_kind(kind)`, `.with_dst_kind(kind)` predicates and
   `.collect()` / `.first()` / `.count()` terminals. Returns
