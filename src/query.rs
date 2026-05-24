@@ -922,6 +922,22 @@ impl SubclassQuery {
             ))
         }
     }
+
+    /// Index-returning terminal. Same lookup as :meth:`collect`, but
+    /// emits each subclass's positional index into ``ctx.nodes()``
+    /// instead of allocating one ``Py<SymbolNode>`` per row.
+    fn indices(&self, py: Python<'_>) -> PyResult<Vec<usize>> {
+        let ctx = self.ctx.borrow(py);
+        if let Some(fqn) = &self.base_fqn {
+            ctx.find_subclasses_indices(py, fqn, self.transitive)
+        } else if let Some(node) = &self.base_node {
+            ctx.find_subclasses_of_indices(&node.borrow(py))
+        } else {
+            Err(PyValueError::new_err(
+                "SubclassQuery requires .of_fqn(...) or .of_node(...)",
+            ))
+        }
+    }
 }
 
 impl_query_methods!(no_first SubclassQuery);
@@ -956,6 +972,14 @@ impl ImportQuery {
         self.ctx
             .borrow(py)
             .find_imports_of(py, self.module_or_err()?)
+    }
+    /// Index-returning terminal. Reads positional indices straight
+    /// out of the pre-built ``imports_by_module`` index — no Python
+    /// allocation per row.
+    fn indices(&self, py: Python<'_>) -> PyResult<Vec<usize>> {
+        self.ctx
+            .borrow(py)
+            .find_imports_of_indices(self.module_or_err()?)
     }
     /// O(1) presence probe — does any project file import the
     /// configured module? Short-circuits on the first match without
@@ -1004,6 +1028,19 @@ impl ClassQuery {
             .as_deref()
             .ok_or_else(|| PyValueError::new_err("ClassQuery requires .defining_method(name)"))?;
         ctx.find_classes_defining_method(py, name)
+    }
+
+    /// Index-returning terminal. Same per-file parallel walk as
+    /// :meth:`collect`, but emits each class node's positional index
+    /// into ``ctx.nodes()`` instead of allocating ``Py<SymbolNode>``
+    /// clones.
+    fn indices(&self, py: Python<'_>) -> PyResult<Vec<usize>> {
+        let ctx = self.ctx.borrow(py);
+        let name = self
+            .defining_method
+            .as_deref()
+            .ok_or_else(|| PyValueError::new_err("ClassQuery requires .defining_method(name)"))?;
+        ctx.find_classes_defining_method_indices(py, name)
     }
 }
 
@@ -1193,6 +1230,45 @@ impl EdgeQuery {
         }
         Ok(refs)
     }
+
+    /// Index-returning terminal for edges. Same per-edge predicate
+    /// pipeline as :meth:`collect`, but emits ``(src_idx, dst_idx,
+    /// flags)`` triples instead of materialising one :class:`EdgeRef`
+    /// (and two ``Py<SymbolNode>`` clones) per row.
+    ///
+    /// Faster than :meth:`collect` when you only need set-membership
+    /// or counting over edge endpoints; pair with
+    /// :meth:`ProjectContext.nodes_at` to revive the surviving
+    /// endpoints on demand.
+    fn index_triples(&self, py: Python<'_>) -> PyResult<Vec<(usize, usize, u32)>> {
+        let ctx = self.ctx.borrow(py);
+        let outputs = ctx.materialized("EdgeQuery.index_triples")?;
+        let nodes: &[Py<SymbolNode>] = &outputs.builder.nodes;
+        let edges: &[(usize, usize, u32)] = &outputs.builder.edges;
+        let flag_mask = self.flag_mask;
+        let src_kind = self.src_kind.as_deref();
+        let dst_kind = self.dst_kind.as_deref();
+        let mut out: Vec<(usize, usize, u32)> = Vec::new();
+        for &(src_idx, dst_idx, flags) in edges {
+            if let Some(mask) = flag_mask {
+                if flags & mask == 0 {
+                    continue;
+                }
+            }
+            if let Some(needle) = src_kind {
+                if nodes[src_idx].borrow(py).kind != needle {
+                    continue;
+                }
+            }
+            if let Some(needle) = dst_kind {
+                if nodes[dst_idx].borrow(py).kind != needle {
+                    continue;
+                }
+            }
+            out.push((src_idx, dst_idx, flags));
+        }
+        Ok(out)
+    }
 }
 
 impl_query_methods!(with_first EdgeQuery, EdgeRef);
@@ -1371,8 +1447,27 @@ impl DeclQuery {
     }
 
     fn collect(&self, py: Python<'_>) -> PyResult<Vec<Py<SymbolNode>>> {
+        let indices = self.indices(py)?;
         let ctx = self.ctx.borrow(py);
         let outputs = ctx.materialized("DeclQuery.collect")?;
+        Ok(indices
+            .into_iter()
+            .map(|i| outputs.builder.nodes[i].clone_ref(py))
+            .collect())
+    }
+
+    /// Index-returning terminal. Same predicate semantics as
+    /// :meth:`collect`, but emits each surviving node's positional
+    /// index into ``ctx.nodes()`` (a plain ``list[int]``) instead of
+    /// allocating one ``Py<SymbolNode>`` per row.
+    ///
+    /// Use when you only need set membership / counting on the
+    /// surviving nodes (or want to feed an index-keyed
+    /// :class:`AddEdgeByIdx`); call :meth:`ProjectContext.nodes_at`
+    /// to materialize back to ``SymbolNode`` later.
+    fn indices(&self, py: Python<'_>) -> PyResult<Vec<usize>> {
+        let ctx = self.ctx.borrow(py);
+        let outputs = ctx.materialized("DeclQuery.indices")?;
         let path_regex = _compile_path_regex(self.path_regex.as_deref())?;
 
         // Pre-compute hashsets for predicates that take lists. Singular
@@ -1400,7 +1495,7 @@ impl DeclQuery {
             .map(|v| v.iter().map(String::as_str).collect());
 
         let mut out = Vec::new();
-        for node_py in &outputs.builder.nodes {
+        for (idx, node_py) in outputs.builder.nodes.iter().enumerate() {
             let node = node_py.borrow(py);
             // kind
             if let Some(k) = &kinds_set {
@@ -1470,7 +1565,7 @@ impl DeclQuery {
                     continue;
                 }
             }
-            out.push(node_py.clone_ref(py));
+            out.push(idx);
         }
         Ok(out)
     }

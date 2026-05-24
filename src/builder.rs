@@ -174,6 +174,37 @@ impl AddEdge {
     }
 }
 
+/// Index-keyed variant of :class:`AddEdge`. Accepts positional
+/// indices into ``ctx.nodes()`` instead of ``SymbolNode`` references.
+///
+/// Lets plugins that already work in index space (e.g. paired with
+/// :meth:`DeclQuery.indices` or :meth:`ProjectContext.indices_where`)
+/// emit edges without ever round-tripping through ``Py<SymbolNode>``.
+/// The apply pass treats it identically to :class:`AddEdge` once the
+/// indices land in :meth:`GraphBuilder::add_edge`.
+///
+/// Raises :class:`IndexError` at apply time when either endpoint is
+/// out of range for the current graph snapshot.
+#[pyclass(frozen, get_all)]
+pub(crate) struct AddEdgeByIdx {
+    pub(crate) src_idx: usize,
+    pub(crate) dst_idx: usize,
+    pub(crate) flags: u32,
+}
+
+#[pymethods]
+impl AddEdgeByIdx {
+    #[new]
+    #[pyo3(signature = (src_idx, dst_idx, *, flags = 0))]
+    fn new(src_idx: usize, dst_idx: usize, flags: u32) -> Self {
+        Self {
+            src_idx,
+            dst_idx,
+            flags,
+        }
+    }
+}
+
 /// Mark ``decl`` as an entrypoint.
 ///
 /// ``marker`` is a self-documenting label (``"<celery-worker>"``,
@@ -346,6 +377,27 @@ pub(crate) fn apply_graph_op(
         outputs.builder.add_edge(src_idx, dst_idx, add_edge.flags);
         return Ok(());
     }
+    if let Ok(add_edge_idx) = op.extract::<PyRef<AddEdgeByIdx>>() {
+        let len = outputs.builder.nodes.len();
+        if add_edge_idx.src_idx >= len {
+            return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                "AddEdgeByIdx: src_idx {} out of range (len={})",
+                add_edge_idx.src_idx, len
+            )));
+        }
+        if add_edge_idx.dst_idx >= len {
+            return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                "AddEdgeByIdx: dst_idx {} out of range (len={})",
+                add_edge_idx.dst_idx, len
+            )));
+        }
+        outputs.builder.add_edge(
+            add_edge_idx.src_idx,
+            add_edge_idx.dst_idx,
+            add_edge_idx.flags,
+        );
+        return Ok(());
+    }
     if let Ok(add_ep) = op.extract::<PyRef<AddEntrypoint>>() {
         let decl = add_ep.decl.borrow(py);
         let decl_idx = lookup_idx(&outputs.builder, &decl, "decl")?;
@@ -380,7 +432,7 @@ pub(crate) fn apply_graph_op(
         return Ok(());
     }
     Err(PyValueError::new_err(format!(
-        "expected a GraphOp (AddEdge / AddEntrypoint / AddNode), got {:?}",
+        "expected a GraphOp (AddEdge / AddEdgeByIdx / AddEntrypoint / AddNode), got {:?}",
         op.get_type().name()?,
     )))
 }

@@ -185,6 +185,25 @@ class AddEdge:
 
     def __init__(self, src: SymbolNode, dst: SymbolNode, *, flags: int = 0) -> None: ...
 
+class AddEdgeByIdx:
+    """Index-keyed variant of :class:`AddEdge`. Accepts positional
+    indices into ``ctx.nodes()`` instead of ``SymbolNode`` references.
+
+    Lets plugins that already work in index space (paired with the
+    ``.indices()`` query terminals or
+    :meth:`ProjectContext.indices_where`) emit edges without ever
+    round-tripping through ``Py<SymbolNode>``. The apply pass treats
+    it identically to :class:`AddEdge` once the indices land in the
+    builder. Raises :class:`IndexError` at apply time when either
+    endpoint is out of range.
+    """
+
+    src_idx: int
+    dst_idx: int
+    flags: int
+
+    def __init__(self, src_idx: int, dst_idx: int, *, flags: int = 0) -> None: ...
+
 class AddEntrypoint:
     """Mark ``decl`` as an entrypoint.
 
@@ -235,7 +254,7 @@ class AddNode:
         edges_to: Iterable[SymbolNode] = ...,
     ) -> None: ...
 
-GraphOp = AddEdge | AddEntrypoint | AddNode
+GraphOp = AddEdge | AddEdgeByIdx | AddEntrypoint | AddNode
 
 class NativeGraph:
     """The project-wide graph snapshot returned by ``Project.build()``
@@ -584,6 +603,52 @@ class ProjectContext:
         """Forward closure from every node carrying any bit in
         ``seed_flags`` (defaults to :data:`NodeFlags.ENTRYPOINT`). The
         set of dead decls is the complement against :meth:`nodes`."""
+        ...
+
+    def reachable_indices(self, *, skip_flags: int = 0, seed_flags: int = ...) -> list[int]:
+        """Idx-only sibling of :meth:`reachable`. Same semantics, but
+        returns positional indices into :meth:`nodes` instead of
+        materialising ``SymbolNode`` clones. Use when you only need
+        set-membership / counting on the reached set — pair with
+        :meth:`nodes_at` to revive specific nodes on demand.
+        """
+        ...
+
+    def indices_where(
+        self,
+        *,
+        kind: str | None = None,
+        kinds: list[str] | None = None,
+        filename: str | None = None,
+        filenames: list[str] | None = None,
+        simple_name: str | None = None,
+        simple_names: list[str] | None = None,
+        paths: list[str] | None = None,
+        path_regex: str | None = None,
+        flags: int | None = None,
+        flags_any: int | None = None,
+        fqname_prefix: str | None = None,
+    ) -> list[int]:
+        """Flat-form predicate filter returning positional indices into
+        :meth:`nodes`. Mirrors the :class:`DeclQuery` predicate
+        vocabulary but skips the builder construction — useful when
+        you only have one filter step and just need a ``list[int]``.
+
+        Every parameter is keyword-only and optional; unset arguments
+        don't filter. ``kind`` / ``kinds`` (and similarly the
+        ``filename`` / ``simple_name`` pairs) are merged; pass either
+        form. All set predicates AND together. ``flags`` is the
+        all-bits-set form (``node.flags & mask == mask``);
+        ``flags_any`` is the any-bit form (``node.flags & mask != 0``).
+        """
+        ...
+
+    def nodes_at(self, indices: Sequence[int]) -> list[SymbolNode]:
+        """Inverse of the ``.indices()`` terminals: materialize
+        specific nodes by their positional indices into :meth:`nodes`.
+        Validates bounds and raises :class:`IndexError` when any index
+        is out of range.
+        """
         ...
 
     # ----- Pure scans over the in-progress graph ------------------------
@@ -953,6 +1018,13 @@ class SubclassQuery:
     def collect(self) -> list[SymbolNode]: ...
     def count(self) -> int: ...
     def __iter__(self) -> Iterator[SymbolNode]: ...
+    def indices(self) -> list[int]:
+        """Index-returning terminal. Same lookup as :meth:`collect`,
+        but emits each subclass's positional index into
+        :meth:`ProjectContext.nodes` instead of allocating
+        ``SymbolNode`` clones.
+        """
+        ...
 
 class ImportQuery:
     """Enumerate the ``kind="import"`` nodes that bind a name from a
@@ -963,6 +1035,13 @@ class ImportQuery:
 
     def of(self, module: str) -> ImportQuery: ...
     def collect(self) -> list[SymbolNode]: ...
+    def indices(self) -> list[int]:
+        """Index-returning terminal. Reads positional indices straight
+        out of the pre-built ``imports_by_module`` index — no Python
+        allocation per row.
+        """
+        ...
+
     def count(self) -> int: ...
     def exists(self) -> bool:
         """O(1) presence probe — does any project file import the
@@ -986,6 +1065,13 @@ class ClassQuery:
     def collect(self) -> list[SymbolNode]: ...
     def count(self) -> int: ...
     def __iter__(self) -> Iterator[SymbolNode]: ...
+    def indices(self) -> list[int]:
+        """Index-returning terminal. Same per-file parallel walk as
+        :meth:`collect`, but emits positional indices into
+        :meth:`ProjectContext.nodes` instead of allocating
+        ``SymbolNode`` clones.
+        """
+        ...
 
 class FactoryRef:
     """One result row from :class:`FactoryQuery`.
@@ -1064,6 +1150,18 @@ class EdgeQuery:
     def first(self) -> EdgeRef | None: ...
     def count(self) -> int: ...
     def __iter__(self) -> Iterator[EdgeRef]: ...
+    def index_triples(self) -> list[tuple[int, int, int]]:
+        """Index-returning terminal for edges. Same per-edge predicate
+        pipeline as :meth:`collect`, but emits ``(src_idx, dst_idx,
+        flags)`` triples instead of materialising one :class:`EdgeRef`
+        (and two ``SymbolNode`` clones) per row.
+
+        Faster than :meth:`collect` when you only need set-membership
+        / counting over edge endpoints; pair with
+        :meth:`ProjectContext.nodes_at` to revive the surviving
+        endpoints on demand.
+        """
+        ...
 
 class DeclQuery:
     """Generic filter over every interned node in the in-progress graph.
@@ -1109,6 +1207,20 @@ class DeclQuery:
     def collect(self) -> list[SymbolNode]: ...
     def count(self) -> int: ...
     def __iter__(self) -> Iterator[SymbolNode]: ...
+    def indices(self) -> list[int]:
+        """Index-returning terminal. Same predicate semantics as
+        :meth:`collect`, but emits each surviving node's positional
+        index into :meth:`ProjectContext.nodes` (a plain
+        ``list[int]``) instead of allocating one ``SymbolNode`` per
+        row.
+
+        Use when you only need set membership / counting on the
+        surviving nodes (or want to feed an index-keyed
+        :class:`AddEdgeByIdx`); call
+        :meth:`ProjectContext.nodes_at` to materialize back to
+        ``SymbolNode`` later.
+        """
+        ...
 
 # ---------- Graph persistence --------------------------------------------
 

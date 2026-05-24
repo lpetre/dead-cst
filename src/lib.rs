@@ -41,7 +41,7 @@ mod query;
 
 use pyo3::prelude::*;
 
-use crate::builder::{AddEdge, AddEntrypoint, AddNode};
+use crate::builder::{AddEdge, AddEdgeByIdx, AddEntrypoint, AddNode};
 use crate::graph::{EdgeFlags, Import, NativeGraph, NodeFlags, SymbolNode};
 use crate::io::{read_graph, write_graph, GraphMetadata};
 use crate::project::{Project, ProjectContext};
@@ -72,6 +72,7 @@ fn dead_cst_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Project>()?;
     m.add_class::<ProjectContext>()?;
     m.add_class::<AddEdge>()?;
+    m.add_class::<AddEdgeByIdx>()?;
     m.add_class::<AddEntrypoint>()?;
     m.add_class::<AddNode>()?;
     m.add_class::<NodeFlags>()?;

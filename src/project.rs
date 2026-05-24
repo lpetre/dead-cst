@@ -1315,6 +1315,19 @@ impl ProjectContext {
         Ok(out)
     }
 
+    /// Idx-only variant of :meth:`find_imports_of`. Same lookup, but
+    /// returns the positional indices into ``ctx.nodes()`` rather than
+    /// materializing ``Py<SymbolNode>`` clones — drives the
+    /// :meth:`ImportQuery.indices` terminal.
+    pub(crate) fn find_imports_of_indices(&self, module_name: &str) -> PyResult<Vec<usize>> {
+        let outputs = self.materialized("find_imports_of_indices")?;
+        Ok(outputs
+            .imports_by_module
+            .get(module_name)
+            .cloned()
+            .unwrap_or_default())
+    }
+
     /// O(1) count of how many project import nodes target
     /// ``module_name`` — pre-built index lookup, no Py allocation.
     pub(crate) fn imports_of_count(&self, module_name: &str) -> usize {
@@ -2439,7 +2452,25 @@ impl ProjectContext {
         py: Python<'_>,
         method_name: &str,
     ) -> PyResult<Vec<Py<SymbolNode>>> {
+        let indices = self.find_classes_defining_method_indices(py, method_name)?;
         let outputs = self.materialized("find_classes_defining_method")?;
+        Ok(indices
+            .into_iter()
+            .map(|idx| outputs.builder.nodes[idx].clone_ref(py))
+            .collect())
+    }
+}
+
+impl ProjectContext {
+    /// Idx-only variant of :meth:`find_classes_defining_method`. Same
+    /// per-file parallel walk, but returns positional indices into
+    /// ``ctx.nodes()`` instead of allocating ``Py<SymbolNode>`` clones.
+    pub(crate) fn find_classes_defining_method_indices(
+        &self,
+        py: Python<'_>,
+        method_name: &str,
+    ) -> PyResult<Vec<usize>> {
+        let outputs = self.materialized("find_classes_defining_method_indices")?;
         let global_index = &outputs.global_index;
         let project_files: &[File] = &outputs.project_files;
         let db_handle: Box<dyn ProjectDb> = ProjectDb::dyn_clone(&self.db);
@@ -2482,12 +2513,13 @@ impl ProjectContext {
                 local
             })
         });
-        Ok(indices
-            .into_iter()
-            .map(|idx| outputs.builder.nodes[idx].clone_ref(py))
-            .collect())
+        drop(outputs);
+        Ok(indices)
     }
+}
 
+#[pymethods]
+impl ProjectContext {
     /// Return every transitive subclass of the given class node.
     ///
     /// Direct subtypes come from ty's `type_hierarchy_subtypes`; we BFS
@@ -2498,14 +2530,27 @@ impl ProjectContext {
         py: Python<'_>,
         class_node: &SymbolNode,
     ) -> PyResult<Vec<Py<SymbolNode>>> {
+        let indices = self.find_subclasses_of_indices(class_node)?;
+        let outputs = self.materialized("find_subclasses_of")?;
+        Ok(indices
+            .into_iter()
+            .map(|idx| outputs.builder.nodes[idx].clone_ref(py))
+            .collect())
+    }
+}
+
+impl ProjectContext {
+    /// Idx-only variant of :meth:`find_subclasses_of`. Same lookup,
+    /// returns positional indices into ``ctx.nodes()`` rather than
+    /// allocating ``Py<SymbolNode>`` clones.
+    pub(crate) fn find_subclasses_of_indices(
+        &self,
+        class_node: &SymbolNode,
+    ) -> PyResult<Vec<usize>> {
         if class_node.kind != "class" {
             return Ok(Vec::new());
         }
-        let outputs = self.materialized("find_subclasses_of")?;
-
-        // PROTOTYPE: try the in-memory class-hierarchy index first.
-        // The seed is a project class node, so we can locate it
-        // directly in `class_by_selection` without an AST walk.
+        let outputs = self.materialized("find_subclasses_of_indices")?;
         if let Some((seed_file, seed_range)) = locate_class_def(
             &self.db,
             &outputs.path_to_file,
@@ -2514,11 +2559,10 @@ impl ProjectContext {
         ) {
             let rk = (seed_range.start().to_u32(), seed_range.end().to_u32());
             if let Some(&seed_idx) = outputs.class_by_selection.get(&(seed_file, rk)) {
-                let out_idx = transitive_subclasses_via_index(seed_idx, &outputs.children_by_node);
-                return Ok(out_idx
-                    .into_iter()
-                    .map(|idx| outputs.builder.nodes[idx].clone_ref(py))
-                    .collect());
+                return Ok(transitive_subclasses_via_index(
+                    seed_idx,
+                    &outputs.children_by_node,
+                ));
             }
         }
         Ok(Vec::new())
@@ -2644,7 +2688,26 @@ impl ProjectContext {
         base_fqn: &str,
         transitive: bool,
     ) -> PyResult<Vec<Py<SymbolNode>>> {
+        let indices = self.find_subclasses_indices(py, base_fqn, transitive)?;
         let outputs = self.materialized("find_subclasses")?;
+        Ok(indices
+            .into_iter()
+            .map(|idx| outputs.builder.nodes[idx].clone_ref(py))
+            .collect())
+    }
+}
+
+impl ProjectContext {
+    /// Idx-only variant of :meth:`find_subclasses`. Same lookup,
+    /// returns positional indices into ``ctx.nodes()`` rather than
+    /// allocating ``Py<SymbolNode>`` clones.
+    pub(crate) fn find_subclasses_indices(
+        &self,
+        py: Python<'_>,
+        base_fqn: &str,
+        transitive: bool,
+    ) -> PyResult<Vec<usize>> {
+        let outputs = self.materialized("find_subclasses_indices")?;
         let Some((seed_file, seed_range)) = locate_class_seed(&self.db, &outputs, py, base_fqn)
         else {
             return Ok(Vec::new());
@@ -2664,10 +2727,7 @@ impl ProjectContext {
                     .cloned()
                     .unwrap_or_default()
             };
-            return Ok(out_idx
-                .into_iter()
-                .map(|idx| outputs.builder.nodes[idx].clone_ref(py))
-                .collect());
+            return Ok(out_idx);
         }
 
         // External seeds (seed file lives outside the project, e.g.
@@ -2753,12 +2813,12 @@ impl ProjectContext {
                 }
             }
         }
-        Ok(out_idx
-            .into_iter()
-            .map(|idx| outputs.builder.nodes[idx].clone_ref(py))
-            .collect())
+        Ok(out_idx.into_iter().collect())
     }
+}
 
+#[pymethods]
+impl ProjectContext {
     /// Project classes that inherit (directly or transitively) from
     /// the class identified by ``fqn``. ``fqn`` may name a project
     /// class (e.g. ``pkg.module.MyBase``) or an external one
@@ -2932,6 +2992,209 @@ impl ProjectContext {
     /// Live edges as `(src_idx, dst_idx, flags)` triples.
     pub(crate) fn edges(&self) -> PyResult<Vec<(usize, usize, u32)>> {
         Ok(self.materialized("edges")?.builder.edges.clone())
+    }
+
+    /// Idx-only sibling of :meth:`reachable`. Same semantics: forward
+    /// closure from every node carrying any bit in ``seed_flags``,
+    /// filtering edges by ``skip_flags``. Returns positional indices
+    /// into ``ctx.nodes()`` rather than materialising
+    /// ``Py<SymbolNode>`` clones.
+    ///
+    /// Use when you only need set membership / counting on the
+    /// reached set — pair with :meth:`nodes_at` to revive specific
+    /// nodes on demand.
+    #[pyo3(signature = (*, skip_flags = 0, seed_flags = NODE_FLAG_ENTRYPOINT))]
+    pub(crate) fn reachable_indices(
+        &self,
+        py: Python<'_>,
+        skip_flags: u32,
+        seed_flags: u32,
+    ) -> PyResult<Vec<usize>> {
+        let outputs = self.materialized("reachable_indices")?;
+        let seeds = outputs
+            .builder
+            .nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, n)| (n.borrow(py).flags & seed_flags != 0).then_some(idx));
+        Ok(bfs(&outputs.builder, seeds, Direction::Forward, skip_flags)
+            .into_iter()
+            .collect())
+    }
+
+    /// Flat-form predicate filter returning positional indices into
+    /// ``ctx.nodes()``. Mirrors the :class:`DeclQuery` predicate
+    /// vocabulary (``kind`` / ``kinds`` / ``filename`` /
+    /// ``filenames`` / ``simple_name`` / ``simple_names`` / ``paths``
+    /// / ``path_regex`` / ``flags`` / ``flags_any`` /
+    /// ``fqname_prefix``) but skips the builder construction —
+    /// useful when you only have one filter step and just need a
+    /// ``list[int]`` of indices.
+    ///
+    /// Every parameter is keyword-only and optional; unset arguments
+    /// don't filter. ``kind`` and ``kinds`` (and similarly ``filename``
+    /// / ``filenames``, ``simple_name`` / ``simple_names``) are merged
+    /// — pass either form. All set predicates AND together.
+    #[pyo3(signature = (
+        *,
+        kind = None,
+        kinds = None,
+        filename = None,
+        filenames = None,
+        simple_name = None,
+        simple_names = None,
+        paths = None,
+        path_regex = None,
+        flags = None,
+        flags_any = None,
+        fqname_prefix = None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn indices_where(
+        &self,
+        py: Python<'_>,
+        kind: Option<String>,
+        kinds: Option<Vec<String>>,
+        filename: Option<String>,
+        filenames: Option<Vec<String>>,
+        simple_name: Option<String>,
+        simple_names: Option<Vec<String>>,
+        paths: Option<Vec<String>>,
+        path_regex: Option<String>,
+        flags: Option<u32>,
+        flags_any: Option<u32>,
+        fqname_prefix: Option<String>,
+    ) -> PyResult<Vec<usize>> {
+        let outputs = self.materialized("indices_where")?;
+        // Merge singular + plural forms once up front.
+        let kinds_vec: Option<Vec<String>> = match (kind, kinds) {
+            (None, None) => None,
+            (Some(s), None) => Some(vec![s]),
+            (None, Some(v)) => Some(v),
+            (Some(s), Some(mut v)) => {
+                v.push(s);
+                Some(v)
+            }
+        };
+        let filenames_vec: Option<Vec<String>> = match (filename, filenames) {
+            (None, None) => None,
+            (Some(s), None) => Some(vec![s]),
+            (None, Some(v)) => Some(v),
+            (Some(s), Some(mut v)) => {
+                v.push(s);
+                Some(v)
+            }
+        };
+        let simple_vec: Option<Vec<String>> = match (simple_name, simple_names) {
+            (None, None) => None,
+            (Some(s), None) => Some(vec![s]),
+            (None, Some(v)) => Some(v),
+            (Some(s), Some(mut v)) => {
+                v.push(s);
+                Some(v)
+            }
+        };
+
+        let kinds_set: Option<rustc_hash::FxHashSet<&str>> = kinds_vec
+            .as_ref()
+            .map(|v| v.iter().map(String::as_str).collect());
+        let filenames_set: Option<rustc_hash::FxHashSet<&str>> = filenames_vec
+            .as_ref()
+            .map(|v| v.iter().map(String::as_str).collect());
+        let simple_set: Option<rustc_hash::FxHashSet<&str>> = simple_vec
+            .as_ref()
+            .map(|v| v.iter().map(String::as_str).collect());
+        let paths_set: Option<rustc_hash::FxHashSet<&str>> = paths
+            .as_ref()
+            .map(|v| v.iter().map(String::as_str).collect());
+
+        let re_compiled: Option<regex::Regex> = match path_regex.as_deref() {
+            None => None,
+            Some(s) => Some(
+                regex::Regex::new(s)
+                    .map_err(|e| PyValueError::new_err(format!("invalid path regex {s:?}: {e}")))?,
+            ),
+        };
+
+        // ``flags`` (all-set) and ``flags_any`` (any-bit) — at most one
+        // should be passed; if both are given, AND them (require all
+        // bits in ``flags`` AND any bit in ``flags_any``).
+        let mut out: Vec<usize> = Vec::new();
+        for (idx, node_py) in outputs.builder.nodes.iter().enumerate() {
+            let node = node_py.borrow(py);
+            if let Some(k) = &kinds_set {
+                if !k.contains(node.kind) {
+                    continue;
+                }
+            }
+            if let Some(p) = &paths_set {
+                if !p.contains(node.path.as_str()) {
+                    continue;
+                }
+            }
+            if let Some(f) = &filenames_set {
+                let path = node.path.as_str();
+                let basename = path
+                    .rsplit_once(std::path::MAIN_SEPARATOR)
+                    .map(|(_, name)| name)
+                    .unwrap_or(path);
+                if !f.contains(basename) {
+                    continue;
+                }
+            }
+            if let Some(s) = &simple_set {
+                let fq = node.fqname.as_str();
+                let simple = fq.rsplit_once('.').map(|(_, n)| n).unwrap_or(fq);
+                if !s.contains(simple) {
+                    continue;
+                }
+            }
+            if let Some(mask) = flags {
+                if node.flags & mask != mask {
+                    continue;
+                }
+            }
+            if let Some(mask) = flags_any {
+                if node.flags & mask == 0 {
+                    continue;
+                }
+            }
+            if let Some(prefix) = &fqname_prefix {
+                if !node.fqname.starts_with(prefix.as_str()) {
+                    continue;
+                }
+            }
+            if let Some(re) = &re_compiled {
+                if !re.is_match(node.path.as_str()) {
+                    continue;
+                }
+            }
+            out.push(idx);
+        }
+        Ok(out)
+    }
+
+    /// Inverse of the ``.indices()`` terminals: materialize specific
+    /// nodes by their positional indices into ``ctx.nodes()``.
+    /// Validates bounds and raises :class:`IndexError` when any index
+    /// is out of range.
+    pub(crate) fn nodes_at(
+        &self,
+        py: Python<'_>,
+        indices: Vec<usize>,
+    ) -> PyResult<Vec<Py<SymbolNode>>> {
+        let outputs = self.materialized("nodes_at")?;
+        let len = outputs.builder.nodes.len();
+        let mut out: Vec<Py<SymbolNode>> = Vec::with_capacity(indices.len());
+        for idx in indices {
+            if idx >= len {
+                return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                    "node index {idx} out of range (len={len})"
+                )));
+            }
+            out.push(outputs.builder.nodes[idx].clone_ref(py));
+        }
+        Ok(out)
     }
 }
 
