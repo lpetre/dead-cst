@@ -17,6 +17,21 @@ two versions.
   O(matched_files × N)). The internal `file_decl_sites` helper is
   removed; it had only one caller and was the source of the quadratic
   scan.
+- `ProjectContext.find_main_blocks` (powering `MainBlockPlugin`) has
+  the same O(matched_files × all_decls) anti-pattern fixed. A cheap
+  text + AST prefilter identifies the matched-file set first, then
+  one sweep of `global_index` buckets only those files. On a
+  synthetic 1000-file project where every file carries a `__main__`
+  block, the plugin's cold delta drops from +3.3 ms to noise; at
+  2000 files it drops from +13.8 ms to +5.1 ms.
+- The `assemble_graph` pass now pre-counts the total node population
+  from the salsa-memoized `file_to_nodes` payloads and uses the sum
+  to `with_capacity_and_hasher` its five FxHashMaps + the `GraphBuilder`
+  Vec-backed fields, eliminating rehash work as the maps grow. Pass 1
+  also flips from `intern_node`'s dedup probe to a new
+  `GraphBuilder::append_node` that skips the get-before-insert
+  (positional identity is unique by construction in this pass).
+  Net: `assemble` phase −13% on 1000 files, −19% on 200 files.
 
 ## [0.12.0] - 2026-05-24
 
