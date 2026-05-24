@@ -67,14 +67,20 @@ pub(crate) struct GraphBuilder {
 }
 
 impl GraphBuilder {
-    pub(crate) fn new() -> Self {
+    /// Reserves capacity for `expected_nodes`-many interned nodes
+    /// up-front. The assemble pass cheaply pre-counts the total node
+    /// population via the salsa-memoized `file_to_nodes` payloads and
+    /// passes the sum here, saving the rehash chain the four-doubling
+    /// growth path of an unsized hashmap pays. Pass `0` when no
+    /// estimate is available (e.g. from tests).
+    pub(crate) fn with_capacity(expected_nodes: usize) -> Self {
         Self {
-            nodes: Vec::new(),
-            node_index: FxHashMap::default(),
+            nodes: Vec::with_capacity(expected_nodes),
+            node_index: FxHashMap::with_capacity_and_hasher(expected_nodes, Default::default()),
             edges: Vec::new(),
             edge_set: FxHashSet::default(),
-            forward_adj: Vec::new(),
-            reverse_adj: Vec::new(),
+            forward_adj: Vec::with_capacity(expected_nodes),
+            reverse_adj: Vec::with_capacity(expected_nodes),
             peer_pyi_to_py: FxHashMap::default(),
             synthetic_nodes: FxHashMap::default(),
         }
@@ -85,6 +91,25 @@ impl GraphBuilder {
         if let Some(&idx) = self.node_index.get(&key) {
             return Ok(idx);
         }
+        let idx = self.nodes.len();
+        self.nodes.push(Py::new(py, node)?);
+        self.node_index.insert(key, idx);
+        self.forward_adj.push(Vec::new());
+        self.reverse_adj.push(Vec::new());
+        Ok(idx)
+    }
+
+    /// Like ``intern_node`` but skips the get-before-insert dedup
+    /// probe. Caller guarantees the node is fresh: ``assemble_graph``
+    /// iterates each file's ``FileNodes`` payload (which is already
+    /// deduped within the file) exactly once, so positional identity
+    /// is unique by construction. Saves one hashmap probe per node
+    /// (~5–10ns); over a 5k-node graph that adds up. Still inserts
+    /// into ``node_index`` because the assemble's Pass 2/3 + plugin
+    /// ops use ``lookup_idx`` to resolve a `SymbolNode` back to its
+    /// index.
+    pub(crate) fn append_node(&mut self, py: Python<'_>, node: SymbolNode) -> PyResult<usize> {
+        let key = node_key_of(&node);
         let idx = self.nodes.len();
         self.nodes.push(Py::new(py, node)?);
         self.node_index.insert(key, idx);
@@ -494,8 +519,8 @@ mod tests {
     // -- GraphBuilder construction (no pyo3) -----------------------------
 
     #[test]
-    fn graph_builder_new_starts_empty() {
-        let b = GraphBuilder::new();
+    fn graph_builder_with_capacity_starts_empty() {
+        let b = GraphBuilder::with_capacity(0);
         assert!(b.nodes.is_empty());
         assert!(b.node_index.is_empty());
         assert!(b.edges.is_empty());
@@ -511,7 +536,7 @@ mod tests {
     /// Build a `GraphBuilder` with `n` allocated adjacency slots so we
     /// can push edges by hand for `bfs` tests.
     fn empty_builder_with_n_slots(n: usize) -> GraphBuilder {
-        let mut b = GraphBuilder::new();
+        let mut b = GraphBuilder::with_capacity(0);
         for _ in 0..n {
             b.forward_adj.push(Vec::new());
             b.reverse_adj.push(Vec::new());

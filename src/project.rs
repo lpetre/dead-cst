@@ -444,12 +444,36 @@ fn assemble_graph<'db>(
     project_files: &[File],
     peer_pyi_to_py: &FxHashMap<File, File>,
 ) -> PyResult<AssembledGraph> {
-    let mut builder = GraphBuilder::new();
-    let mut global_index: DeclIndex = FxHashMap::default();
-    let mut module_nodes_by_file: FxHashMap<File, usize> = FxHashMap::default();
-    let mut class_by_selection: FxHashMap<(File, (u32, u32)), usize> = FxHashMap::default();
-    let mut decl_by_name_range: FxHashMap<(File, (u32, u32)), usize> = FxHashMap::default();
-    let mut ref_to_global: FxHashMap<NodeRef<'db>, usize> = FxHashMap::default();
+    // Pre-count total nodes across project_files. file_to_nodes is
+    // salsa-memoized from the parallel populate phase, so this is a
+    // ~ns probe per file. Use the exact count to size the hashmaps
+    // that grow one-per-node (ref_to_global, global_index,
+    // decl_by_name_range) and skip rehashing entirely. The Vec-backed
+    // builder fields get pre-allocated too.
+    let mut total_nodes: usize = 0;
+    let mut total_decls: usize = 0;
+    for &file in project_files {
+        let nodes_len = file_to_nodes(db, file).nodes.len();
+        total_nodes += nodes_len;
+        // Index 0 of every file's nodes is the synthetic module node;
+        // everything else is a decl. So decls = nodes - 1 per file.
+        total_decls += nodes_len.saturating_sub(1);
+    }
+
+    let mut builder = GraphBuilder::with_capacity(total_nodes);
+    let mut global_index: DeclIndex =
+        FxHashMap::with_capacity_and_hasher(total_decls, Default::default());
+    let mut module_nodes_by_file: FxHashMap<File, usize> =
+        FxHashMap::with_capacity_and_hasher(project_files.len(), Default::default());
+    // class_by_selection only sees class decls — typically a small
+    // fraction of all decls, so size to a modest fraction (1/4) to
+    // dodge initial growth without wasting space.
+    let mut class_by_selection: FxHashMap<(File, (u32, u32)), usize> =
+        FxHashMap::with_capacity_and_hasher(total_decls / 4 + 1, Default::default());
+    let mut decl_by_name_range: FxHashMap<(File, (u32, u32)), usize> =
+        FxHashMap::with_capacity_and_hasher(total_decls, Default::default());
+    let mut ref_to_global: FxHashMap<NodeRef<'db>, usize> =
+        FxHashMap::with_capacity_and_hasher(total_nodes, Default::default());
     let mut all_warnings: Vec<String> = Vec::new();
 
     // Pass 1: node mint.
@@ -514,7 +538,7 @@ fn assemble_graph<'db>(
                 imports,
                 cached_hash: StdOnceLock::new(),
             };
-            let global_idx = builder.intern_node(py, symbol)?;
+            let global_idx = builder.append_node(py, symbol)?;
             ref_to_global.insert(node_ref, global_idx);
 
             match node_ref {
