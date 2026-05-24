@@ -97,11 +97,18 @@ class DiscordPyPlugin(Plugin):
 
         if cogs_by_path:
             hook_funcs_by_path: dict[str, list[native.SymbolNode]] = {}
-            for n in ctx.nodes():
-                if n.kind != "function" or n.path not in cogs_by_path:
-                    continue
-                if n.fqname.rsplit(".", 1)[-1] in ("setup", "teardown"):
-                    hook_funcs_by_path.setdefault(n.path, []).append(n)
+            # Push the path-set + kind + simple-name filter down into
+            # rust — saves the per-node ``rsplit`` + dict lookup in
+            # Python.
+            for n in (
+                native.query(ctx)
+                .decls()
+                .with_kind("function")
+                .with_paths(list(cogs_by_path.keys()))
+                .with_simple_names(["setup", "teardown"])
+                .collect()
+            ):
+                hook_funcs_by_path.setdefault(n.path, []).append(n)
 
             for path, cogs in cogs_by_path.items():
                 targets = list(cogs) + hook_funcs_by_path.get(path, [])

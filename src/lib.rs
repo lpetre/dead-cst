@@ -46,7 +46,7 @@ use crate::graph::{EdgeFlags, Import, NativeGraph, NodeFlags, SymbolNode};
 use crate::io::{read_graph, write_graph, GraphMetadata};
 use crate::project::{Project, ProjectContext};
 use crate::query::{
-    CallQuery, CallRef, ClassQuery, ConstructionQuery, ConstructionRef, DecoratorQuery,
+    CallQuery, CallRef, ClassQuery, ConstructionQuery, ConstructionRef, DeclQuery, DecoratorQuery,
     DecoratorRef, EdgeQuery, EdgeRef, FactoryQuery, FactoryRef, ImportQuery, QueryBuilder,
     SubclassQuery,
 };
@@ -90,6 +90,7 @@ fn dead_cst_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<FactoryRef>()?;
     m.add_class::<EdgeQuery>()?;
     m.add_class::<EdgeRef>()?;
+    m.add_class::<DeclQuery>()?;
     m.add_class::<GraphMetadata>()?;
     m.add_function(wrap_pyfunction!(query_fn, m)?)?;
     m.add_function(wrap_pyfunction!(write_graph, m)?)?;

@@ -6,7 +6,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::PyClass;
 use ruff_db::files::File;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use ty_project::Db as ProjectDb;
 
 use crate::graph::SymbolNode;
@@ -145,6 +145,9 @@ impl QueryBuilder {
     }
     fn edges(&self, py: Python<'_>) -> EdgeQuery {
         EdgeQuery::new(self.ctx.clone_ref(py))
+    }
+    fn decls(&self, py: Python<'_>) -> DeclQuery {
+        DeclQuery::new(self.ctx.clone_ref(py))
     }
 }
 
@@ -1136,6 +1139,224 @@ impl EdgeQuery {
 }
 
 impl_query_methods!(with_first EdgeQuery, EdgeRef);
+
+// ---------------------------------------------------------------------------
+// DeclQuery — generic node-stream filter
+// ---------------------------------------------------------------------------
+
+/// Generic filter over every interned node in the in-progress graph.
+///
+/// Folds the per-node Python filter loops that show up in plugins
+/// (filter on ``kind``, basename, simple-name, flag mask, path set,
+/// path regex) down into one rust pass. All configured predicates are
+/// AND-ed; an empty predicate set yields every node.
+///
+/// Pick the predicate(s) you need and call ``.collect()`` /
+/// ``.first()`` / ``.count()`` / iterate. Predicates that take a
+/// ``list[str]`` short-circuit on length-1 to avoid the hashset
+/// overhead; pass a single ``str`` to the singular form when you
+/// already know it's one.
+#[pyclass(unsendable)]
+pub(crate) struct DeclQuery {
+    pub(crate) ctx: Py<ProjectContext>,
+    pub(crate) kinds: Option<Vec<String>>,
+    pub(crate) filenames: Option<Vec<String>>,
+    pub(crate) simple_names: Option<Vec<String>>,
+    pub(crate) paths: Option<Vec<String>>,
+    pub(crate) path_regex: Option<String>,
+    pub(crate) flags_mask: Option<u32>,
+    pub(crate) flags_match_any: bool,
+    pub(crate) fqname_prefix: Option<String>,
+}
+
+impl DeclQuery {
+    fn new(ctx: Py<ProjectContext>) -> Self {
+        Self {
+            ctx,
+            kinds: None,
+            filenames: None,
+            simple_names: None,
+            paths: None,
+            path_regex: None,
+            flags_mask: None,
+            flags_match_any: false,
+            fqname_prefix: None,
+        }
+    }
+}
+
+#[pymethods]
+impl DeclQuery {
+    /// Restrict to nodes with this ``kind`` string (``"function"`` /
+    /// ``"class"`` / ``"variable"`` / ``"import"`` / ``"module"`` /
+    /// ``"synthetic"`` / ``"type_alias"``).
+    fn with_kind<'py>(mut slf: PyRefMut<'py, Self>, kind: String) -> PyRefMut<'py, Self> {
+        slf.kinds = Some(vec![kind]);
+        slf
+    }
+    /// Restrict to nodes whose ``kind`` is in ``kinds``.
+    fn with_kinds<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        kinds: PyObject,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let py = slf.py();
+        slf.kinds = Some(_extract_str_or_list(py, kinds)?);
+        Ok(slf)
+    }
+    /// Restrict to nodes whose file basename equals ``name``.
+    fn with_filename<'py>(mut slf: PyRefMut<'py, Self>, name: String) -> PyRefMut<'py, Self> {
+        slf.filenames = Some(vec![name]);
+        slf
+    }
+    /// Restrict to nodes whose file basename is in ``names``.
+    fn with_filenames<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        names: PyObject,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let py = slf.py();
+        slf.filenames = Some(_extract_str_or_list(py, names)?);
+        Ok(slf)
+    }
+    /// Restrict to nodes whose ``fqname.rsplit('.', 1)[-1]`` equals
+    /// ``name`` (i.e. the trailing segment).
+    fn with_simple_name<'py>(mut slf: PyRefMut<'py, Self>, name: String) -> PyRefMut<'py, Self> {
+        slf.simple_names = Some(vec![name]);
+        slf
+    }
+    /// Restrict to nodes whose trailing fqname segment is in ``names``.
+    fn with_simple_names<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        names: PyObject,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let py = slf.py();
+        slf.simple_names = Some(_extract_str_or_list(py, names)?);
+        Ok(slf)
+    }
+    /// Restrict to nodes whose absolute path is in ``paths``.
+    fn with_paths<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        paths: PyObject,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let py = slf.py();
+        slf.paths = Some(_extract_str_or_list(py, paths)?);
+        Ok(slf)
+    }
+    /// Restrict to nodes whose absolute path matches ``regex``.
+    fn with_path_regex<'py>(mut slf: PyRefMut<'py, Self>, regex: String) -> PyRefMut<'py, Self> {
+        slf.path_regex = Some(regex);
+        slf
+    }
+    /// Restrict to nodes whose ``flags & mask == mask`` (all bits in
+    /// ``mask`` are set).
+    fn with_flags<'py>(mut slf: PyRefMut<'py, Self>, mask: u32) -> PyRefMut<'py, Self> {
+        slf.flags_mask = Some(mask);
+        slf.flags_match_any = false;
+        slf
+    }
+    /// Restrict to nodes whose ``flags & mask != 0`` (any bit in
+    /// ``mask`` is set).
+    fn with_any_flag<'py>(mut slf: PyRefMut<'py, Self>, mask: u32) -> PyRefMut<'py, Self> {
+        slf.flags_mask = Some(mask);
+        slf.flags_match_any = true;
+        slf
+    }
+    /// Restrict to nodes whose ``fqname`` starts with ``prefix``.
+    fn with_fqname_prefix<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        prefix: String,
+    ) -> PyRefMut<'py, Self> {
+        slf.fqname_prefix = Some(prefix);
+        slf
+    }
+
+    fn collect(&self, py: Python<'_>) -> PyResult<Vec<Py<SymbolNode>>> {
+        let ctx = self.ctx.borrow(py);
+        let outputs = ctx.materialized("DeclQuery.collect")?;
+        let path_regex = _compile_path_regex(self.path_regex.as_deref())?;
+
+        // Pre-compute hashsets for predicates that take lists. Singular
+        // forms reuse the same vec (length 1) so the hashset cost is
+        // amortized over the per-node loop.
+        let kinds_set: Option<FxHashSet<&str>> = self
+            .kinds
+            .as_ref()
+            .map(|v| v.iter().map(String::as_str).collect());
+        let filenames_set: Option<FxHashSet<&str>> = self
+            .filenames
+            .as_ref()
+            .map(|v| v.iter().map(String::as_str).collect());
+        let simple_set: Option<FxHashSet<&str>> = self
+            .simple_names
+            .as_ref()
+            .map(|v| v.iter().map(String::as_str).collect());
+        let paths_set: Option<FxHashSet<&str>> = self
+            .paths
+            .as_ref()
+            .map(|v| v.iter().map(String::as_str).collect());
+
+        let mut out = Vec::new();
+        for node_py in &outputs.builder.nodes {
+            let node = node_py.borrow(py);
+            // kind
+            if let Some(k) = &kinds_set {
+                if !k.contains(node.kind) {
+                    continue;
+                }
+            }
+            // paths (exact set match against absolute path)
+            if let Some(p) = &paths_set {
+                if !p.contains(node.path.as_str()) {
+                    continue;
+                }
+            }
+            // filename basename
+            if let Some(f) = &filenames_set {
+                let path = node.path.as_str();
+                let basename = path
+                    .rsplit_once(std::path::MAIN_SEPARATOR)
+                    .map(|(_, name)| name)
+                    .unwrap_or(path);
+                if !f.contains(basename) {
+                    continue;
+                }
+            }
+            // simple name (last fqname segment)
+            if let Some(s) = &simple_set {
+                let fq = node.fqname.as_str();
+                let simple = fq.rsplit_once('.').map(|(_, n)| n).unwrap_or(fq);
+                if !s.contains(simple) {
+                    continue;
+                }
+            }
+            // flags mask
+            if let Some(mask) = self.flags_mask {
+                if self.flags_match_any {
+                    if node.flags & mask == 0 {
+                        continue;
+                    }
+                } else if node.flags & mask != mask {
+                    continue;
+                }
+            }
+            // fqname prefix
+            if let Some(prefix) = &self.fqname_prefix {
+                if !node.fqname.starts_with(prefix.as_str()) {
+                    continue;
+                }
+            }
+            // path regex
+            if let Some(re) = &path_regex {
+                if !re.is_match(node.path.as_str()) {
+                    continue;
+                }
+            }
+            out.push(node_py.clone_ref(py));
+        }
+        Ok(out)
+    }
+}
+
+impl_query_methods!(no_first DeclQuery);
 
 #[cfg(test)]
 mod tests {

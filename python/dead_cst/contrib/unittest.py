@@ -46,14 +46,18 @@ class UnittestPlugin(Plugin):
             ):
                 decls_by_path.setdefault(sub.path, []).append(sub)
 
-        for node in ctx.nodes():
-            if node.kind != "function":
-                continue
-            if node.path not in importer_paths:
-                continue
-            simple = node.fqname.rsplit(".", 1)[-1]
-            if simple in _MODULE_HOOKS:
-                decls_by_path.setdefault(node.path, []).append(node)
+        # Push the ``kind == function`` + path-set + simple-name-in-set
+        # filter down into rust — folds three Python predicates into one
+        # rust pass over the node pool.
+        for node in (
+            native.query(ctx)
+            .decls()
+            .with_kind("function")
+            .with_paths(list(importer_paths))
+            .with_simple_names(list(_MODULE_HOOKS))
+            .collect()
+        ):
+            decls_by_path.setdefault(node.path, []).append(node)
 
         flags = int(NodeFlags.TESTCASE)
         for path, decls in decls_by_path.items():

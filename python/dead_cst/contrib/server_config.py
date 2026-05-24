@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Iterable
 
 from ..graph import NodeFlags
@@ -18,6 +17,8 @@ _DEFAULT_FILENAMES: tuple[str, ...] = (
     "hypercorn.conf.py",
     "hypercorn_conf.py",
 )
+
+_TARGET_KINDS: tuple[str, ...] = ("module", "function", "class", "variable", "import")
 
 
 @dataclass
@@ -35,11 +36,17 @@ class ServerConfigPlugin(Plugin):
 
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
         targets_by_path: dict[str, list[native.SymbolNode]] = {}
-        for n in ctx.nodes():
-            if Path(n.path).name not in self.filenames:
-                continue
-            if n.kind in ("module", "function", "class", "variable", "import"):
-                targets_by_path.setdefault(n.path, []).append(n)
+        # Rust-side fold of the per-node basename + kind filter — saves
+        # the ``pathlib.Path(...).name`` allocation that dominates the
+        # Python-side loop on real codebases.
+        for n in (
+            native.query(ctx)
+            .decls()
+            .with_filenames(list(self.filenames))
+            .with_kinds(list(_TARGET_KINDS))
+            .collect()
+        ):
+            targets_by_path.setdefault(n.path, []).append(n)
 
         for path, targets in targets_by_path.items():
             module = ctx.module_for(path)

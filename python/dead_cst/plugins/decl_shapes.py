@@ -213,9 +213,9 @@ class DispatchAppPlugin(Plugin):
             direct_by_owner.setdefault((ref.var.path, simple), []).append(ref.var)
 
         vars_by_file: dict[tuple[str, str], native.SymbolNode] = {}
-        for n in ctx.nodes():
-            if n.kind != "variable":
-                continue
+        # Rust-side fold of the ``kind == variable`` filter — drops the
+        # FFI overhead of materialising every non-variable node.
+        for n in native.query(ctx).decls().with_kind("variable").collect():
             simple = n.fqname.rsplit(".", 1)[-1]
             vars_by_file.setdefault((n.path, simple), n)
 
