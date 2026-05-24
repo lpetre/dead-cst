@@ -360,6 +360,7 @@ pub(crate) fn build_project_graph(
     let class_children = build_class_children(
         db,
         &project_files,
+        &path_to_file,
         &class_by_selection,
         &ref_to_global,
         &builder.forward_adj,
@@ -694,6 +695,7 @@ fn assemble_graph<'db>(
 fn build_class_children<'db>(
     db: &'db ProjectDatabase,
     project_files: &[File],
+    path_to_file: &FxHashMap<String, File>,
     class_by_selection: &FxHashMap<(File, (u32, u32)), usize>,
     ref_to_global: &FxHashMap<NodeRef<'db>, usize>,
     forward_adj: &[Vec<(usize, u32)>],
@@ -786,20 +788,16 @@ fn build_class_children<'db>(
                                     if adj_node.kind != "module" {
                                         continue;
                                     }
-                                    // The module's File is recoverable
-                                    // from its path -- but we have a
-                                    // simpler hook: look up the
-                                    // attribute via the path -> File ->
-                                    // file_to_nodes chain. Reuse the
-                                    // existing edge target's path.
+                                    // Recover the target module's `File`
+                                    // via the project-wide `path_to_file`
+                                    // index (O(1) probe) instead of a
+                                    // linear scan over `project_files`.
                                     let target_path = adj_node.path.clone();
                                     drop(adj_node);
-                                    let Some(target_file) = project_files.iter().find(|&&f| {
-                                        crate::helpers::file_path_string(db, f) == target_path
-                                    }) else {
+                                    let Some(&target_file) = path_to_file.get(&target_path) else {
                                         continue;
                                     };
-                                    let target_payload = file_to_nodes(db, *target_file);
+                                    let target_payload = file_to_nodes(db, target_file);
                                     let Some(attr_locals) =
                                         target_payload.exports_by_name.get(attr_name)
                                     else {
