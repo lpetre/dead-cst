@@ -44,6 +44,15 @@ two versions.
   +302 ms to +22 ms (~14×). Index build cost is ~125 µs at 200 files
   / ~700 µs at 800 files (~0.5 % of cold materialize).
 
+### Added
+- `ctx.query().edges()` chainable query with `.with_flags(mask)`,
+  `.with_src_kind(kind)`, `.with_dst_kind(kind)` predicates and
+  `.collect()` / `.first()` / `.count()` terminals. Returns
+  `EdgeRef` rows with `src` / `dst` `SymbolNode`s already resolved.
+  `DynamicImportFallbackPlugin` migrated to use it — on a synthetic
+  project with 1,800 dynamic-import edges, the filter loop is 3.06×
+  faster (1.235 ms → 0.403 ms best-of-12).
+
 ## [0.12.0] - 2026-05-24
 
 ### Changed
