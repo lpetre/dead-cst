@@ -99,25 +99,6 @@ impl GraphBuilder {
         Ok(idx)
     }
 
-    /// Like ``intern_node`` but skips the get-before-insert dedup
-    /// probe. Caller guarantees the node is fresh: ``assemble_graph``
-    /// iterates each file's ``FileNodes`` payload (which is already
-    /// deduped within the file) exactly once, so positional identity
-    /// is unique by construction. Saves one hashmap probe per node
-    /// (~5–10ns); over a 5k-node graph that adds up. Still inserts
-    /// into ``node_index`` because the assemble's Pass 2/3 + plugin
-    /// ops use ``lookup_idx`` to resolve a `SymbolNode` back to its
-    /// index.
-    pub(crate) fn append_node(&mut self, py: Python<'_>, node: SymbolNode) -> PyResult<usize> {
-        let key = node_key_of(&node);
-        let idx = self.nodes.len();
-        self.nodes.push(Py::new(py, node)?);
-        self.node_index.insert(key, idx);
-        self.forward_adj.push(Vec::new());
-        self.reverse_adj.push(Vec::new());
-        Ok(idx)
-    }
-
     /// Get (or mint) the deduplicated synthetic node with the given
     /// fully qualified name. Synthetics anchor edges to imports the
     /// project doesn't own — stdlib stays silent, ``[external dist] X``

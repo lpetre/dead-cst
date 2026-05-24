@@ -570,7 +570,7 @@ fn assemble_graph<'db>(
                 imports,
                 cached_hash: StdOnceLock::new(),
             };
-            let global_idx = builder.append_node(py, symbol)?;
+            let global_idx = builder.intern_node(py, symbol)?;
             ref_to_global.insert(node_ref, global_idx);
 
             match node_ref {
