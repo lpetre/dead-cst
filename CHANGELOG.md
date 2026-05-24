@@ -27,11 +27,11 @@ two versions.
 - The `assemble_graph` pass now pre-counts the total node population
   from the salsa-memoized `file_to_nodes` payloads and uses the sum
   to `with_capacity_and_hasher` its five FxHashMaps + the `GraphBuilder`
-  Vec-backed fields, eliminating rehash work as the maps grow. Pass 1
-  also flips from `intern_node`'s dedup probe to a new
-  `GraphBuilder::append_node` that skips the get-before-insert
-  (positional identity is unique by construction in this pass).
-  Net: `assemble` phase −13% on 1000 files, −19% on 200 files.
+  Vec-backed fields, eliminating rehash work as the maps grow.
+- `build_class_children` resolves Attribute-base modules
+  (`module.Cls`) via the `path_to_file` index instead of a linear
+  `project_files.iter().find(...)` scan keyed on path-string
+  equality.
 - Subclass queries (`find_subclasses`, `find_subclasses_of`, powering
   `UnittestPlugin`, `InitSubclassPlugin`, and `DispatchAppPlugin`'s
   `include_subclasses=True` path) build a project-wide
