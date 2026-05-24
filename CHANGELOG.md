@@ -9,6 +9,15 @@ two versions.
 
 ## [Unreleased]
 
+### Changed
+- `ProjectContext.find_comment_patterns` no longer rescans the
+  project-wide `global_index` once per file with a matching comment.
+  The per-file `(start, decl_idx)` list is now bucketed lazily on the
+  first match anywhere in the project (O(N) once instead of
+  O(matched_files × N)). The internal `file_decl_sites` helper is
+  removed; it had only one caller and was the source of the quadratic
+  scan.
+
 ## [0.12.0] - 2026-05-24
 
 ### Changed

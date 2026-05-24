@@ -32,10 +32,10 @@ use crate::graph::{intern_kind, DeclIndex, Import, MainBlock, NativeGraph, Symbo
 use crate::helpers::{
     call_callee_matches_var, class_body_defines_method, collect_all_imports_local,
     collect_module_imports_local, decorators_match_imports, extract_call_args_kwargs,
-    file_decl_sites, file_path_string, find_main_block_range, find_subclass_indices_via_refs,
-    is_dunder_name, locate_class_def, locate_class_seed, matched_call_target,
-    owner_idx_for_stmt_with, range_key, rel_path, top_level_assign_to_name, AttrCallFinder,
-    CallArgs, FactoryCallFinder, StringArgCallFinder, NODE_FLAG_ENTRYPOINT,
+    file_path_string, find_main_block_range, find_subclass_indices_via_refs, is_dunder_name,
+    locate_class_def, locate_class_seed, matched_call_target, owner_idx_for_stmt_with, range_key,
+    rel_path, top_level_assign_to_name, AttrCallFinder, CallArgs, FactoryCallFinder,
+    StringArgCallFinder, NODE_FLAG_ENTRYPOINT,
 };
 use crate::ingest::{emit_visitor_warning, string_literal_list};
 use crate::query::{
@@ -2282,11 +2282,14 @@ impl ProjectContext {
         let regex = self.compile_regex(pattern)?;
         let outputs = self.materialized("find_comment_patterns")?;
         let mut out = Vec::new();
+        // Per-file bucketed view of `global_index`, materialized lazily on
+        // the first matching comment anywhere in the project. The naive
+        // approach filtered `global_index` once per matched file — O(F × N).
+        // Bucketing once flips that to O(N) + O(1) per matched file.
+        let mut decls_by_file: Option<FxHashMap<File, Vec<(u32, usize)>>> = None;
         for &file in &outputs.project_files {
             let parsed = parsed_module(&self.db, file).load(&self.db);
             let source = source_text(&self.db, file);
-            // Lazy — files with no matching comments skip the decl scan.
-            let mut file_decls: Option<Vec<(u32, usize)>> = None;
             for token in parsed.tokens() {
                 if token.kind() != TokenKind::Comment {
                     continue;
@@ -2296,8 +2299,19 @@ impl ProjectContext {
                 if !regex.is_match(text) {
                     continue;
                 }
-                let decls =
-                    file_decls.get_or_insert_with(|| file_decl_sites(file, &outputs.global_index));
+                let bucket = decls_by_file.get_or_insert_with(|| {
+                    let mut m: FxHashMap<File, Vec<(u32, usize)>> = FxHashMap::default();
+                    for ((f, _, (start, _)), &idx) in &outputs.global_index {
+                        m.entry(*f).or_default().push((*start, idx));
+                    }
+                    for sites in m.values_mut() {
+                        sites.sort_by_key(|(s, _)| *s);
+                    }
+                    m
+                });
+                let Some(decls) = bucket.get(&file) else {
+                    continue;
+                };
                 let comment_end = range.end().to_u32();
                 let i = decls.partition_point(|(start, _)| *start < comment_end);
                 let Some(&(_, decl_idx)) = decls.get(i) else {

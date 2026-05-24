@@ -22,7 +22,7 @@ use ty_module_resolver::{
 use ty_project::metadata::value::RelativePathBuf;
 use ty_project::{Db as ProjectDb, ProjectDatabase};
 
-use crate::graph::{DeclIndex, EdgeFlags, NodeFlags, SymbolNode};
+use crate::graph::{EdgeFlags, NodeFlags, SymbolNode};
 use crate::ingest::collapse_attribute_chain;
 use crate::project::BuildOutputs;
 
@@ -1082,23 +1082,6 @@ fn string_or_string_collection(arg: &Expr) -> Vec<String> {
         Expr::Tuple(tup) => tup.elts.iter().filter_map(lit).collect(),
         _ => Vec::new(),
     }
-}
-
-/// Per-file sorted list of `(target_start_offset, node_idx)` for the
-/// file's top-level decls. Sorted ascending so callers can binary-search
-/// for the next decl after a comment.
-///
-/// Reads straight from `global_index` — every key in there already
-/// carries the decl's `(start, end)` range tuple, and `ingest_decls`
-/// populated it from the same `all_definitions_with_usage()` walk.
-pub(crate) fn file_decl_sites(file: File, global_index: &DeclIndex) -> Vec<(u32, usize)> {
-    let mut out: Vec<(u32, usize)> = global_index
-        .iter()
-        .filter(|((f, _, _), _)| *f == file)
-        .map(|((_, _, (start, _)), idx)| (*start, *idx))
-        .collect();
-    out.sort_by_key(|(start, _)| *start);
-    out
 }
 
 pub(crate) fn rel_path<P: AsRef<str>>(path: P) -> RelativePathBuf {
