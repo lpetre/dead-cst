@@ -26,8 +26,8 @@ use ty_python_core::scope::FileScopeId;
 use ty_python_core::semantic_index;
 
 use crate::builder::{apply_graph_op, bfs, lookup_idx, not_materialized, Direction, GraphBuilder};
-use crate::file_payload::{file_to_edges, file_to_nodes, NodeKind, NodeRef};
-use crate::file_ref_edges::file_to_ref_edges;
+use crate::file_payload::{file_to_edges, file_to_nodes, FileEdges, NodeKind, NodeRef};
+use crate::file_ref_edges::{file_to_ref_edges, FileRefEdges};
 use crate::graph::{intern_kind, DeclIndex, Import, MainBlock, NativeGraph, SymbolNode};
 use crate::helpers::{
     call_callee_matches_var, class_body_defines_method, collect_all_imports_local,
@@ -600,35 +600,156 @@ fn assemble_graph<'db>(
         }
     }
 
-    // Pass 2: edge translation. Skip edges with unrecognized
-    // endpoints — those reference Definitions in non-project files.
+    // Pass 2: edge translation.
+    //
+    // The pipeline is three sub-phases, designed so the heavy
+    // FxHashMap-probe loop runs without the GIL on rayon workers:
+    //
+    //   2a. Serial fetch of every file's salsa-tracked `FileEdges` /
+    //       `FileRefEdges`. Salsa returns `&'db` refs valid for the
+    //       whole assemble call; we stash them in a `Vec`.
+    //   2b. Serial pre-mint of every `NodeRef::External` endpoint
+    //       referenced by any payload. This pulls the fqname out of
+    //       salsa under the GIL and interns the synthetic node so
+    //       the parallel phase only has to read `ref_to_global`.
+    //   2c. `Python::allow_threads` + `par_iter().flat_map(...)` to
+    //       translate every `(NodeRef, NodeRef, flags)` triple into
+    //       `(usize, usize, u32)` via two `ref_to_global` probes.
+    //       Drops endpoints whose owning file wasn't enumerated.
+    //
+    // After the parallel phase, sort + dedup the triple list and
+    // bulk-insert via `extend_edges` (which still probes `edge_set`
+    // so any pre-existing edges merge cleanly).
+    //
+    // Skipped endpoints reference Definitions in non-project files.
+    //
+    // The `DEAD_CST_PASS2_SERIAL=1` env var falls back to the
+    // pre-parallel serial implementation. Kept around as a kill switch
+    // and as the baseline for the perf-bench comparison.
+
+    let t_pass2_start = std::time::Instant::now();
+    let serial_pass2 = std::env::var_os("DEAD_CST_PASS2_SERIAL").is_some();
+
+    // 2a: serial fetch. Hold borrows for the whole pass.
+    let mut edge_payloads: Vec<&FileEdges<'db>> = Vec::with_capacity(project_files.len());
+    let mut ref_edge_payloads: Vec<&FileRefEdges<'db>> = Vec::with_capacity(project_files.len());
     for &file in project_files {
-        let edges_payload = file_to_edges(db, file);
-        for &(src, dst, flags) in &edges_payload.edges {
-            let Some(src_idx) = lookup_or_mint_ref(py, db, &mut builder, &mut ref_to_global, src)?
-            else {
-                continue;
-            };
-            let Some(dst_idx) = lookup_or_mint_ref(py, db, &mut builder, &mut ref_to_global, dst)?
-            else {
-                continue;
-            };
-            builder.add_edge(src_idx, dst_idx, flags);
+        edge_payloads.push(file_to_edges(db, file));
+        ref_edge_payloads.push(file_to_ref_edges(db, file));
+    }
+
+    if serial_pass2 {
+        // Original serial path: lazy-mint Externals as encountered.
+        for payload in &edge_payloads {
+            for &(src, dst, flags) in &payload.edges {
+                let Some(src_idx) =
+                    serial_lookup_or_mint(py, db, &mut builder, &mut ref_to_global, src)?
+                else {
+                    continue;
+                };
+                let Some(dst_idx) =
+                    serial_lookup_or_mint(py, db, &mut builder, &mut ref_to_global, dst)?
+                else {
+                    continue;
+                };
+                builder.add_edge(src_idx, dst_idx, flags);
+            }
+        }
+        for payload in &ref_edge_payloads {
+            for &(src, dst, flags) in &payload.edges {
+                let Some(src_idx) =
+                    serial_lookup_or_mint(py, db, &mut builder, &mut ref_to_global, src)?
+                else {
+                    continue;
+                };
+                let Some(dst_idx) =
+                    serial_lookup_or_mint(py, db, &mut builder, &mut ref_to_global, dst)?
+                else {
+                    continue;
+                };
+                builder.add_edge(src_idx, dst_idx, flags);
+            }
+        }
+    } else {
+        // 2b: pre-mint synthetic External nodes. Walk both payload
+        // streams once and intern every `External` endpoint we
+        // haven't seen. Synthetics dedup by fqname project-wide, so
+        // this is at most `O(distinct externals)` GIL-bound interns.
+        let mut external_keys: FxHashSet<NodeRef<'db>> = FxHashSet::default();
+        for payload in &edge_payloads {
+            for &(src, dst, _) in &payload.edges {
+                if matches!(src, NodeRef::External(_)) && !ref_to_global.contains_key(&src) {
+                    external_keys.insert(src);
+                }
+                if matches!(dst, NodeRef::External(_)) && !ref_to_global.contains_key(&dst) {
+                    external_keys.insert(dst);
+                }
+            }
+        }
+        for payload in &ref_edge_payloads {
+            for &(src, dst, _) in &payload.edges {
+                if matches!(src, NodeRef::External(_)) && !ref_to_global.contains_key(&src) {
+                    external_keys.insert(src);
+                }
+                if matches!(dst, NodeRef::External(_)) && !ref_to_global.contains_key(&dst) {
+                    external_keys.insert(dst);
+                }
+            }
+        }
+        for r in external_keys {
+            if let NodeRef::External(key) = r {
+                let fqname = key.fqname(db).clone();
+                let idx = builder.intern_synthetic(py, fqname)?;
+                ref_to_global.insert(r, idx);
+            }
         }
 
-        let ref_edges_payload = file_to_ref_edges(db, file);
-        for &(src, dst, flags) in &ref_edges_payload.edges {
-            let Some(src_idx) = lookup_or_mint_ref(py, db, &mut builder, &mut ref_to_global, src)?
-            else {
-                continue;
-            };
-            let Some(dst_idx) = lookup_or_mint_ref(py, db, &mut builder, &mut ref_to_global, dst)?
-            else {
-                continue;
-            };
-            builder.add_edge(src_idx, dst_idx, flags);
-        }
-        all_warnings.extend(ref_edges_payload.warnings.iter().cloned());
+        // 2c: parallel translation. `ref_to_global` is owned + read-
+        // only from here; no GIL needed. We release the GIL with
+        // `Python::allow_threads` so rayon workers don't contend with
+        // anyone else holding it. The closure is pure-Rust HashMap
+        // probes, no salsa DB access, no Py allocations.
+        let ref_to_global_ref = &ref_to_global;
+        let edge_payloads_ref = &edge_payloads;
+        let ref_edge_payloads_ref = &ref_edge_payloads;
+        let mut triples: Vec<(usize, usize, u32)> = py.allow_threads(|| {
+            use rayon::prelude::*;
+            let from_edges = edge_payloads_ref.par_iter().flat_map_iter(|payload| {
+                payload.edges.iter().filter_map(|&(src, dst, flags)| {
+                    let src_idx = *ref_to_global_ref.get(&src)?;
+                    let dst_idx = *ref_to_global_ref.get(&dst)?;
+                    Some((src_idx, dst_idx, flags))
+                })
+            });
+            let from_refs = ref_edge_payloads_ref.par_iter().flat_map_iter(|payload| {
+                payload.edges.iter().filter_map(|&(src, dst, flags)| {
+                    let src_idx = *ref_to_global_ref.get(&src)?;
+                    let dst_idx = *ref_to_global_ref.get(&dst)?;
+                    Some((src_idx, dst_idx, flags))
+                })
+            });
+            let mut t: Vec<(usize, usize, u32)> = from_edges.chain(from_refs).collect();
+            t.par_sort_unstable();
+            t.dedup();
+            t
+        });
+
+        // Bulk-insert the translated triples. `extend_edges` keeps
+        // the `edge_set` dedup so any prior edges merge correctly.
+        builder.extend_edges(std::mem::take(&mut triples));
+    }
+
+    // Warnings are still serial — they live on `FileRefEdges` only.
+    for payload in &ref_edge_payloads {
+        all_warnings.extend(payload.warnings.iter().cloned());
+    }
+
+    if std::env::var_os("DEAD_CST_TIMING").is_some() {
+        eprintln!(
+            "[dead-cst-timing] pass2_mode={} pass2={:?}",
+            if serial_pass2 { "serial" } else { "parallel" },
+            t_pass2_start.elapsed()
+        );
     }
 
     // Pass 3: peer .pyi/.py reachability edges.
@@ -831,13 +952,10 @@ fn build_class_children<'db>(
     children
 }
 
-/// Translate a `NodeRef` into its global graph index. For `Def` /
-/// `Module` already-minted nodes, this is a hashmap probe. For
-/// `External`, lazily mint the synthetic node via the builder.
-/// Returns `Ok(None)` when the NodeRef is a `Def`/`Module` whose
-/// owning file wasn't enumerated (cross-project edge endpoint that
-/// ty resolved past the project boundary).
-fn lookup_or_mint_ref<'db>(
+/// Serial pre-parallel Pass-2 helper: lookup-or-mint a `NodeRef` into
+/// its global graph index. Only used when `DEAD_CST_PASS2_SERIAL=1`
+/// is set (kept for A/B comparison and as a kill switch).
+fn serial_lookup_or_mint<'db>(
     py: Python<'_>,
     db: &'db ProjectDatabase,
     builder: &mut GraphBuilder,

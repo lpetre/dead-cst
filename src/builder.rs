@@ -126,6 +126,31 @@ impl GraphBuilder {
             self.reverse_adj[dst].push((src, flags));
         }
     }
+
+    /// Bulk-insert a batch of pre-sorted, pre-deduplicated edge triples.
+    ///
+    /// The caller is responsible for ordering / dedup'ing `triples`
+    /// (e.g. via `sort_unstable` + `dedup`); this method still probes
+    /// `edge_set` per triple to merge against any edges already present
+    /// (so a second `extend_edges` call won't double-insert). Compared
+    /// with looping `add_edge`, the win is amortising the per-edge
+    /// branch / hash overhead and pre-reserving capacity on `edges`
+    /// and the per-node adjacency vectors.
+    pub(crate) fn extend_edges(&mut self, triples: Vec<(usize, usize, u32)>) {
+        if triples.is_empty() {
+            return;
+        }
+        self.edge_set.reserve(triples.len());
+        self.edges.reserve(triples.len());
+        for triple in triples {
+            if self.edge_set.insert(triple) {
+                let (src, dst, flags) = triple;
+                self.edges.push(triple);
+                self.forward_adj[src].push((dst, flags));
+                self.reverse_adj[dst].push((src, flags));
+            }
+        }
+    }
 }
 
 /// Add an edge between two interned nodes.
