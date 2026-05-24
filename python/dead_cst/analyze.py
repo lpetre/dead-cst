@@ -109,6 +109,20 @@ class Analysis:
 
         from .plugins import Plugin
 
+        # Pre-graph plugin hook. Plugins may scan ``project_root`` for
+        # config files / framework manifests / etc. before any graph
+        # construction happens. Type-validate each plugin here so
+        # ``Pluign()`` typos and bare dicts fail with a clean
+        # ``TypeError`` instead of being silently dropped by the rust
+        # ``add_plugin`` loop below.
+        for plugin in self._plugins:
+            if not isinstance(plugin, Plugin):
+                raise TypeError(
+                    f"Expected a dead_cst.plugins.Plugin instance, got "
+                    f"{type(plugin).__name__!r}: {plugin!r}"
+                )
+            plugin.prepare(self._project_root)
+
         # Always keep ``project_root`` in ty's static search paths
         # alongside any ``.pth``-derived dynamic paths from the venv.
         # ``helpers::canonical_module_for_file`` (rust side) does a
@@ -127,13 +141,6 @@ class Analysis:
         if self._stack_size is not None:
             ctx.set_stack_size(self._stack_size)
         for plugin in self._plugins:
-            # Catch ``Pluign()`` typos and bare dicts before the rust
-            # side silently drops them.
-            if not isinstance(plugin, Plugin):
-                raise TypeError(
-                    f"Expected a dead_cst.plugins.Plugin instance, got "
-                    f"{type(plugin).__name__!r}: {plugin!r}"
-                )
             ctx.add_plugin(plugin)
         ctx.materialize()
         self._ctx = ctx
