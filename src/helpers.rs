@@ -6,7 +6,6 @@
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use ruff_db::files::{File, FilePath};
-use rustc_hash::{FxHashMap, FxHashSet};
 use ruff_db::parsed::{parsed_module, ParsedModuleRef};
 use ruff_db::source::{line_index, source_text};
 use ruff_db::system::SystemPath;
@@ -15,6 +14,7 @@ use ruff_python_ast::visitor::{walk_expr, Visitor};
 use ruff_python_ast::{Expr, Stmt, StmtClassDef};
 use ruff_source_file::LineIndex;
 use ruff_text_size::{Ranged, TextRange};
+use rustc_hash::{FxHashMap, FxHashSet};
 use ty_module_resolver::Module;
 use ty_module_resolver::{
     file_to_module, resolve_module, search_paths, ModuleName, ModuleResolveMode,
@@ -1506,7 +1506,10 @@ pub(crate) fn collect_scope_bindings<'a>(
 
 /// Scan `expr` for walrus (`:=`) targets that bind names in the
 /// enclosing scope.
-pub(crate) fn collect_walrus_in_expr<'a>(expr: &'a Expr, out: &mut FxHashMap<String, Vec<&'a Expr>>) {
+pub(crate) fn collect_walrus_in_expr<'a>(
+    expr: &'a Expr,
+    out: &mut FxHashMap<String, Vec<&'a Expr>>,
+) {
     match expr {
         Expr::Named(named) => {
             if let Expr::Name(target) = &*named.target {
