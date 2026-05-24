@@ -13,6 +13,7 @@ Covers the three correctness fixes documented in
 
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING
 
 from dead_cst import _native as native
@@ -267,3 +268,90 @@ def test_construction_matches_subscripted_generic_via_module_attr(build_decl_gra
     refs = list(native.query(ctx).constructions().where_module("pkg.lib").where_name("Worker"))
     fqnames = {r.var.fqname for r in refs}
     assert "pkg.uses.w" in fqnames
+
+
+# ---------------------------------------------------------------------------
+# DeclQuery.where_fqname — str | list[str] | re.Pattern | list[re.Pattern]
+# ---------------------------------------------------------------------------
+
+
+def test_where_fqname_str_literal(build_decl_graph):
+    """Single str matches by exact fqname equality."""
+    ctx = build_decl_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/a.py": "def foo(): ...\ndef bar(): ...\n",
+            "pkg/b.py": "def foo(): ...\n",
+        }
+    )
+    refs = list(native.query(ctx).decls().where_fqname("pkg.a.foo"))
+    assert {r.fqname for r in refs} == {"pkg.a.foo"}
+
+
+def test_where_fqname_list_of_str(build_decl_graph):
+    """List of strs matches if fqname equals any element."""
+    ctx = build_decl_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/a.py": "def foo(): ...\ndef bar(): ...\n",
+            "pkg/b.py": "def baz(): ...\n",
+        }
+    )
+    refs = list(native.query(ctx).decls().where_fqname(["pkg.a.foo", "pkg.b.baz"]))
+    assert {r.fqname for r in refs} == {"pkg.a.foo", "pkg.b.baz"}
+
+
+def test_where_fqname_regex(build_decl_graph):
+    """A single ``re.Pattern`` matches by regex search."""
+    ctx = build_decl_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/a.py": "def foo(): ...\ndef foobar(): ...\ndef bar(): ...\n",
+        }
+    )
+    refs = list(native.query(ctx).decls().where_fqname(re.compile(r"^pkg\.a\.foo")))
+    assert {r.fqname for r in refs} == {"pkg.a.foo", "pkg.a.foobar"}
+
+
+def test_where_fqname_list_of_regex(build_decl_graph):
+    """List of ``re.Pattern`` matches if fqname matches any pattern."""
+    ctx = build_decl_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/a.py": "def foo(): ...\ndef bar(): ...\ndef baz(): ...\n",
+        }
+    )
+    refs = list(
+        native.query(ctx).decls().where_fqname([re.compile(r"\.foo$"), re.compile(r"\.bar$")])
+    )
+    assert {r.fqname for r in refs} == {"pkg.a.foo", "pkg.a.bar"}
+
+
+def test_where_fqname_mixed_str_and_regex(build_decl_graph):
+    """A mixed sequence applies literal-equality OR regex-search."""
+    ctx = build_decl_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/a.py": "def foo(): ...\ndef bar(): ...\ndef baz(): ...\n",
+        }
+    )
+    refs = list(native.query(ctx).decls().where_fqname(["pkg.a.foo", re.compile(r"\.baz$")]))
+    assert {r.fqname for r in refs} == {"pkg.a.foo", "pkg.a.baz"}
+
+
+def test_where_fqname_empty_list_matches_nothing(build_decl_graph):
+    """``where_fqname([])`` is the matches-nothing sentinel."""
+    ctx = build_decl_graph({"pkg/__init__.py": "", "pkg/a.py": "def foo(): ...\n"})
+    refs = list(native.query(ctx).decls().where_fqname([]))
+    assert refs == []
+
+
+def test_where_fqname_invalid_type_raises(build_decl_graph):
+    """Non-str / non-Pattern raises ``TypeError`` at the call site."""
+    import pytest
+
+    ctx = build_decl_graph({"pkg/__init__.py": "", "pkg/a.py": "def foo(): ...\n"})
+    with pytest.raises(TypeError):
+        native.query(ctx).decls().where_fqname(123)
+    with pytest.raises(TypeError):
+        native.query(ctx).decls().where_fqname(["ok", 42])

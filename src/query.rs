@@ -160,6 +160,63 @@ pub(crate) fn _extract_str_or_list(py: Python<'_>, obj: PyObject) -> PyResult<Ve
     }
 }
 
+/// Extract either a single ``str``, a single ``re.Pattern``, a
+/// ``list[str]``, a ``list[re.Pattern]``, or a mixed sequence of both,
+/// returning ``(literals, compiled_regexes)``. Empty lists yield two
+/// empty vecs. Anything else raises ``TypeError``; invalid regex
+/// patterns raise ``ValueError`` with the pattern in the message.
+///
+/// Used by ``DeclQuery::where_fqname`` so the predicate accepts the
+/// same four input shapes ``re.fullmatch`` callers reach for.
+pub(crate) fn _extract_str_or_regex_or_list(
+    py: Python<'_>,
+    obj: PyObject,
+) -> PyResult<(Vec<String>, Vec<regex::Regex>)> {
+    let bound = obj.bind(py);
+    let mut literals: Vec<String> = Vec::new();
+    let mut regexes: Vec<regex::Regex> = Vec::new();
+    let pattern_type = py.import_bound("re")?.getattr("Pattern")?;
+
+    // Single str.
+    if let Ok(s) = bound.extract::<String>() {
+        literals.push(s);
+        return Ok((literals, regexes));
+    }
+    // Single ``re.Pattern``.
+    if bound.is_instance(&pattern_type)? {
+        let pat: String = bound.getattr("pattern")?.extract()?;
+        regexes.push(
+            regex::Regex::new(&pat)
+                .map_err(|e| PyValueError::new_err(format!("invalid regex {pat:?}: {e}")))?,
+        );
+        return Ok((literals, regexes));
+    }
+    // List / tuple / any iterable of str | re.Pattern.
+    if let Ok(seq) = bound.iter() {
+        for item in seq {
+            let item = item?;
+            if let Ok(s) = item.extract::<String>() {
+                literals.push(s);
+            } else if item.is_instance(&pattern_type)? {
+                let pat: String = item.getattr("pattern")?.extract()?;
+                regexes.push(
+                    regex::Regex::new(&pat).map_err(|e| {
+                        PyValueError::new_err(format!("invalid regex {pat:?}: {e}"))
+                    })?,
+                );
+            } else {
+                return Err(pyo3::exceptions::PyTypeError::new_err(
+                    "expected str | re.Pattern in sequence",
+                ));
+            }
+        }
+        return Ok((literals, regexes));
+    }
+    Err(pyo3::exceptions::PyTypeError::new_err(
+        "expected str | list[str] | re.Pattern | list[re.Pattern]",
+    ))
+}
+
 /// Compile an optional path regex once for a query's file-iteration
 /// loop. Centralized so every ``find_*`` method that takes a
 /// ``path_regex`` parameter shares the same error reporting.
@@ -1167,6 +1224,15 @@ pub(crate) struct DeclQuery {
     pub(crate) flags_mask: Option<u32>,
     pub(crate) flags_match_any: bool,
     pub(crate) fqname_prefix: Option<String>,
+    /// `where_fqname` literal-string candidates. ``None`` if the
+    /// predicate isn't configured; ``Some(vec)`` if at least one
+    /// literal was passed. Combined with ``fqname_regexes`` via OR.
+    pub(crate) fqname_literals: Option<Vec<String>>,
+    /// `where_fqname` compiled-regex candidates. ``None`` if the
+    /// predicate isn't configured; ``Some(vec)`` if at least one
+    /// ``re.Pattern`` was passed. Combined with ``fqname_literals``
+    /// via OR.
+    pub(crate) fqname_regexes: Option<Vec<regex::Regex>>,
 }
 
 impl DeclQuery {
@@ -1181,6 +1247,8 @@ impl DeclQuery {
             flags_mask: None,
             flags_match_any: false,
             fqname_prefix: None,
+            fqname_literals: None,
+            fqname_regexes: None,
         }
     }
 }
@@ -1269,6 +1337,39 @@ impl DeclQuery {
         slf
     }
 
+    /// Restrict to nodes whose ``fqname`` matches the predicate.
+    /// Accepts ``str`` (literal equality), ``list[str]`` (literal
+    /// equality against any element), ``re.Pattern`` (full-string
+    /// regex search), ``list[re.Pattern]`` (any-of regex search),
+    /// or a mixed sequence of ``str`` and ``re.Pattern`` (literal
+    /// equality OR regex search). ``re.Pattern`` instances are
+    /// recompiled rust-side using rust's ``regex`` crate, so any
+    /// PCRE-only syntax is rejected with ``ValueError`` at this
+    /// call.
+    fn where_fqname<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        value: PyObject,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let py = slf.py();
+        let (literals, regexes) = _extract_str_or_regex_or_list(py, value)?;
+        slf.fqname_literals = if literals.is_empty() {
+            // An empty literal vec is the "matches-nothing" sentinel —
+            // consistent with ``where_name([])`` semantics elsewhere in
+            // the DSL. We still need to flip ``Some`` so the collect
+            // predicate kicks in (otherwise a sole empty list would
+            // match everything).
+            Some(Vec::new())
+        } else {
+            Some(literals)
+        };
+        slf.fqname_regexes = if regexes.is_empty() {
+            None
+        } else {
+            Some(regexes)
+        };
+        Ok(slf)
+    }
+
     fn collect(&self, py: Python<'_>) -> PyResult<Vec<Py<SymbolNode>>> {
         let ctx = self.ctx.borrow(py);
         let outputs = ctx.materialized("DeclQuery.collect")?;
@@ -1291,6 +1392,10 @@ impl DeclQuery {
             .map(|v| v.iter().map(String::as_str).collect());
         let paths_set: Option<FxHashSet<&str>> = self
             .paths
+            .as_ref()
+            .map(|v| v.iter().map(String::as_str).collect());
+        let fqname_literals_set: Option<FxHashSet<&str>> = self
+            .fqname_literals
             .as_ref()
             .map(|v| v.iter().map(String::as_str).collect());
 
@@ -1341,6 +1446,21 @@ impl DeclQuery {
             // fqname prefix
             if let Some(prefix) = &self.fqname_prefix {
                 if !node.fqname.starts_with(prefix.as_str()) {
+                    continue;
+                }
+            }
+            // where_fqname: any literal-equality OR any regex match.
+            // ``literals=Some(vec![])`` is the "matches-nothing"
+            // sentinel — preserved here so empty calls behave like
+            // ``where_name([])``.
+            if self.fqname_literals.is_some() || self.fqname_regexes.is_some() {
+                let fq = node.fqname.as_str();
+                let lit_match = fqname_literals_set.as_ref().is_some_and(|s| s.contains(fq));
+                let re_match = self
+                    .fqname_regexes
+                    .as_ref()
+                    .is_some_and(|v| v.iter().any(|r| r.is_match(fq)));
+                if !lit_match && !re_match {
                     continue;
                 }
             }

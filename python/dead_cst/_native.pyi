@@ -10,7 +10,8 @@ mirrors the rust-side rustdoc, and a behavior change in the crate
 should land in both places at once.
 """
 
-from typing import Any, Iterable, Iterator, Literal, Protocol
+import re
+from typing import Any, Iterable, Iterator, Literal, Protocol, Sequence
 
 # The set of stable kind strings ``SymbolNode.kind`` can carry. Use a
 # ``Literal`` rather than ``str`` so the type checker catches typos at
@@ -1049,6 +1050,21 @@ class DeclQuery:
         ...
 
     def with_fqname_prefix(self, prefix: str) -> DeclQuery: ...
+    def where_fqname(
+        self,
+        value: str | re.Pattern[str] | Sequence[str | re.Pattern[str]],
+    ) -> DeclQuery:
+        """Restrict to nodes whose ``fqname`` matches the predicate.
+
+        Accepts any combination of ``str`` (literal equality) and
+        ``re.Pattern`` (regex match). A sequence value matches when
+        the node's ``fqname`` matches any element. ``re.Pattern``
+        instances are recompiled rust-side using rust's ``regex``
+        crate, so any PCRE-only syntax raises ``ValueError`` at the
+        call site (not later at ``collect``).
+        """
+        ...
+
     def collect(self) -> list[SymbolNode]: ...
     def count(self) -> int: ...
     def __iter__(self) -> Iterator[SymbolNode]: ...
