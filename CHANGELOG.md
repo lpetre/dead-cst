@@ -9,7 +9,7 @@ two versions.
 
 ## [Unreleased]
 
-## [0.11.1] - 2026-05-24
+## [0.12.0] - 2026-05-24
 
 ### Changed
 - Bumped vendored `ruff` (ty) submodule to `18448938c8` and switched
@@ -1583,8 +1583,8 @@ versions until the first stable release.
 - `README.md`, `CONTRIBUTING.md`, `CHANGELOG.md`, and `ROADMAP.md` with a
   stack-ranked plan from alpha to 1.0.
 
-[Unreleased]: https://github.com/lpetre/dead-cst/compare/v0.11.1...HEAD
-[0.11.1]: https://github.com/lpetre/dead-cst/compare/v0.11.0...v0.11.1
+[Unreleased]: https://github.com/lpetre/dead-cst/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/lpetre/dead-cst/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/lpetre/dead-cst/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/lpetre/dead-cst/compare/v0.9.4...v0.10.0
 [0.9.4]: https://github.com/lpetre/dead-cst/compare/v0.9.3...v0.9.4
