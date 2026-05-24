@@ -124,6 +124,19 @@ pub(crate) struct BuildOutputs {
     /// nodes — and a cheap ``imports_of_exists`` short-circuit for
     /// plugins that just need a per-module presence check.
     pub(crate) imports_by_module: FxHashMap<String, Vec<usize>>,
+    /// PROTOTYPE: project-wide class hierarchy.
+    /// `class_idx -> [direct subclass class_idx]`. Built post-assembly
+    /// by walking each top-level class def's base list and resolving
+    /// each base Name expression via per-file `exports_by_name` and the
+    /// import-alias `forward_adj` chains.
+    ///
+    /// Lets ``UnittestPlugin`` / ``InitSubclassPlugin`` do an O(N) BFS
+    /// over this map instead of calling ``find_references`` per class.
+    /// External seeds (e.g. ``unittest.TestCase``) still need
+    /// ``find_subclass_indices_via_refs`` for the first hop into the
+    /// project; once a project class is found, transitive walks use
+    /// this map.
+    pub(crate) class_children: FxHashMap<usize, Vec<usize>>,
 }
 
 /// Run the three build phases (ingest → hierarchy+imports → references)
@@ -340,19 +353,34 @@ pub(crate) fn build_project_graph(
     let module_nodes_by_file = assembled.module_nodes_by_file;
     let class_by_selection = assembled.class_by_selection;
     let decl_by_name_range = assembled.decl_by_name_range;
+    let ref_to_global = assembled.ref_to_global;
+
+    // PROTOTYPE: build the project-wide class hierarchy index.
+    let t_hierarchy = std::time::Instant::now();
+    let class_children = build_class_children(
+        db,
+        &project_files,
+        &class_by_selection,
+        &ref_to_global,
+        &builder.forward_adj,
+        py,
+        &builder.nodes,
+    );
+    let t_hierarchy_elapsed = t_hierarchy.elapsed();
 
     let t4 = std::time::Instant::now();
     let (decl_by_fqname, module_by_fqname, imports_by_module) = build_fqname_indices(py, &builder);
     let t_fqname = t4.elapsed();
     if timing {
         eprintln!(
-            "[dead-cst-timing] files={} nodes={} edges={} enum={:?} populate={:?} assemble={:?} fqname={:?} total={:?} rss={}MB",
+            "[dead-cst-timing] files={} nodes={} edges={} enum={:?} populate={:?} assemble={:?} class_hier={:?} fqname={:?} total={:?} rss={}MB",
             project_files.len(),
             builder.nodes.len(),
             builder.edges.len(),
             t_enum,
             t_populate_elapsed,
             t_assemble_elapsed,
+            t_hierarchy_elapsed,
             t_fqname,
             t0.elapsed(),
             current_rss_mb(),
@@ -378,6 +406,7 @@ pub(crate) fn build_project_graph(
         decl_by_fqname,
         module_by_fqname,
         imports_by_module,
+        class_children,
     })
 }
 
@@ -402,12 +431,15 @@ fn current_rss_mb() -> usize {
 /// pieces of `BuildOutputs` that the assembly pass computes from the
 /// salsa-tracked per-file payloads; the driver adds `project_files`,
 /// `path_to_file`, and the fqname indices.
-struct AssembledGraph {
+struct AssembledGraph<'db> {
     builder: GraphBuilder,
     global_index: DeclIndex,
     module_nodes_by_file: FxHashMap<File, usize>,
     class_by_selection: FxHashMap<(File, (u32, u32)), usize>,
     decl_by_name_range: FxHashMap<(File, (u32, u32)), usize>,
+    /// PROTOTYPE: kept around so the class-hierarchy builder can map
+    /// `NodeRef -> global idx`.
+    ref_to_global: FxHashMap<NodeRef<'db>, usize>,
 }
 
 /// Serial pass that converts the salsa-tracked per-file payloads
@@ -443,7 +475,7 @@ fn assemble_graph<'db>(
     db: &'db ProjectDatabase,
     project_files: &[File],
     peer_pyi_to_py: &FxHashMap<File, File>,
-) -> PyResult<AssembledGraph> {
+) -> PyResult<AssembledGraph<'db>> {
     // Pre-count total nodes across project_files. file_to_nodes is
     // salsa-memoized from the parallel populate phase, so this is a
     // ~ns probe per file. Use the exact count to size the hashmaps
@@ -634,7 +666,171 @@ fn assemble_graph<'db>(
         module_nodes_by_file,
         class_by_selection,
         decl_by_name_range,
+        ref_to_global,
     })
+}
+
+/// PROTOTYPE: build `class_idx -> [direct subclass class_idx]` map.
+///
+/// For each project file's top-level class definition, resolve each
+/// base expression's head Name to a graph node (via per-file
+/// `exports_by_name`), follow the resulting alias chain to a class
+/// node (via `builder.forward_adj`), and record the
+/// (class_idx, parent_class_idx) edge.
+///
+/// Limitations of this prototype:
+///
+/// * Only handles `Name(...)` and `Attribute(...)` bases with a Name
+///   root. Complex bases like `Generic[T]` aren't walked beyond the
+///   head Name.
+/// * Local-binding resolution goes through `exports_by_name` which
+///   returns the end-of-scope binding(s); we don't honour
+///   per-statement use-def chains. For simple linear files this
+///   matches `SemanticModel::resolve_name`.
+/// * If a base resolves to an import alias, we walk the alias's
+///   `forward_adj` and keep the first class target found. Doesn't
+///   cover ``from a import C as D; class X(D): ...`` chains with more
+///   than one alias hop.
+fn build_class_children<'db>(
+    db: &'db ProjectDatabase,
+    project_files: &[File],
+    class_by_selection: &FxHashMap<(File, (u32, u32)), usize>,
+    ref_to_global: &FxHashMap<NodeRef<'db>, usize>,
+    forward_adj: &[Vec<(usize, u32)>],
+    py: Python<'_>,
+    nodes: &[Py<SymbolNode>],
+) -> FxHashMap<usize, Vec<usize>> {
+    use crate::helpers::iter_top_level_classes;
+    let mut children: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
+
+    for &file in project_files {
+        let parsed = parsed_module(db, file).load(db);
+        let payload = file_to_nodes(db, file);
+
+        for cls in iter_top_level_classes(&parsed) {
+            let name_r = cls.name.range();
+            let rk = (name_r.start().to_u32(), name_r.end().to_u32());
+            let Some(&child_idx) = class_by_selection.get(&(file, rk)) else {
+                continue;
+            };
+
+            let Some(args) = &cls.arguments else {
+                continue;
+            };
+
+            for base in &args.args {
+                // Find the head Name + optional trailing attribute name
+                // for this base expression. Two shapes we handle:
+                //
+                // * `Cls` -> head=Cls, trailing=None
+                // * `module.Cls` -> head=module, trailing=Some("Cls")
+                // * `Generic[T]` / `Protocol[T]` -> head=Generic
+                let (head_name, trailing_attr): (Option<&str>, Option<&str>) = match base {
+                    Expr::Name(n) => (Some(n.id.as_str()), None),
+                    Expr::Attribute(a) => {
+                        if let Expr::Name(root) = a.value.as_ref() {
+                            (Some(root.id.as_str()), Some(a.attr.as_str()))
+                        } else {
+                            (None, None)
+                        }
+                    }
+                    Expr::Subscript(s) => match s.value.as_ref() {
+                        Expr::Name(n) => (Some(n.id.as_str()), None),
+                        Expr::Attribute(a) => {
+                            if let Expr::Name(root) = a.value.as_ref() {
+                                (Some(root.id.as_str()), Some(a.attr.as_str()))
+                            } else {
+                                (None, None)
+                            }
+                        }
+                        _ => (None, None),
+                    },
+                    _ => (None, None),
+                };
+                let Some(head) = head_name else {
+                    continue;
+                };
+
+                // Resolve `head` in the file's global namespace.
+                let Some(locals) = payload.exports_by_name.get(head) else {
+                    continue;
+                };
+                for &local_idx in locals {
+                    let r = payload.refs[local_idx as usize];
+                    let Some(&parent_idx) = ref_to_global.get(&r) else {
+                        continue;
+                    };
+                    let parent_kind = nodes[parent_idx].borrow(py).kind;
+                    if parent_kind == "class" && trailing_attr.is_none() {
+                        children.entry(parent_idx).or_default().push(child_idx);
+                    } else if parent_kind == "import" {
+                        match trailing_attr {
+                            None => {
+                                // `Cls` resolved to an alias node;
+                                // follow alias's forward edges to a
+                                // class target.
+                                for &(adj_idx, _) in &forward_adj[parent_idx] {
+                                    if nodes[adj_idx].borrow(py).kind == "class" {
+                                        children.entry(adj_idx).or_default().push(child_idx);
+                                        break;
+                                    }
+                                }
+                            }
+                            Some(attr_name) => {
+                                // `module.Cls`: alias likely points at
+                                // a module node; look up `attr_name` in
+                                // that target module's
+                                // exports_by_name and follow.
+                                for &(adj_idx, _) in &forward_adj[parent_idx] {
+                                    let adj_node = nodes[adj_idx].borrow(py);
+                                    if adj_node.kind != "module" {
+                                        continue;
+                                    }
+                                    // The module's File is recoverable
+                                    // from its path -- but we have a
+                                    // simpler hook: look up the
+                                    // attribute via the path -> File ->
+                                    // file_to_nodes chain. Reuse the
+                                    // existing edge target's path.
+                                    let target_path = adj_node.path.clone();
+                                    drop(adj_node);
+                                    let Some(target_file) = project_files.iter().find(|&&f| {
+                                        crate::helpers::file_path_string(db, f) == target_path
+                                    }) else {
+                                        continue;
+                                    };
+                                    let target_payload = file_to_nodes(db, *target_file);
+                                    let Some(attr_locals) =
+                                        target_payload.exports_by_name.get(attr_name)
+                                    else {
+                                        continue;
+                                    };
+                                    for &al in attr_locals {
+                                        let ar = target_payload.refs[al as usize];
+                                        let Some(&attr_idx) = ref_to_global.get(&ar) else {
+                                            continue;
+                                        };
+                                        if nodes[attr_idx].borrow(py).kind == "class" {
+                                            children.entry(attr_idx).or_default().push(child_idx);
+                                        }
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Dedup each children vec — multiple bases or alias hops can
+    // produce the same edge.
+    for v in children.values_mut() {
+        v.sort_unstable();
+        v.dedup();
+    }
+    children
 }
 
 /// Translate a `NodeRef` into its global graph index. For `Def` /
@@ -2196,21 +2392,49 @@ impl ProjectContext {
         }
         let outputs = self.materialized("find_subclasses_of")?;
 
-        let Some((seed_file, seed_range)) = locate_class_def(
+        // PROTOTYPE: try the in-memory class-hierarchy index first.
+        // The seed is a project class node, so we can locate it
+        // directly in `class_by_selection` without an AST walk.
+        if let Some((seed_file, seed_range)) = locate_class_def(
             &self.db,
             &outputs.path_to_file,
             &class_node.path,
             class_node,
-        ) else {
-            return Ok(Vec::new());
-        };
-        let out_idx =
-            find_subclass_indices_via_refs(&self.db, &outputs, seed_file, seed_range, true);
-        Ok(out_idx
-            .into_iter()
-            .map(|idx| outputs.builder.nodes[idx].clone_ref(py))
-            .collect())
+        ) {
+            let rk = (seed_range.start().to_u32(), seed_range.end().to_u32());
+            if let Some(&seed_idx) = outputs.class_by_selection.get(&(seed_file, rk)) {
+                let out_idx = transitive_subclasses_via_index(seed_idx, &outputs.class_children);
+                return Ok(out_idx
+                    .into_iter()
+                    .map(|idx| outputs.builder.nodes[idx].clone_ref(py))
+                    .collect());
+            }
+        }
+        Ok(Vec::new())
     }
+}
+
+/// PROTOTYPE: BFS from `seed_idx` through `class_children`. Returns
+/// the transitive closure (excluding the seed itself).
+fn transitive_subclasses_via_index(
+    seed_idx: usize,
+    class_children: &FxHashMap<usize, Vec<usize>>,
+) -> Vec<usize> {
+    let mut seen: FxHashSet<usize> = FxHashSet::default();
+    let mut out: Vec<usize> = Vec::new();
+    let mut stack: Vec<usize> = vec![seed_idx];
+    while let Some(cur) = stack.pop() {
+        let Some(kids) = class_children.get(&cur) else {
+            continue;
+        };
+        for &k in kids {
+            if seen.insert(k) {
+                out.push(k);
+                stack.push(k);
+            }
+        }
+    }
+    out
 }
 
 impl ProjectContext {
@@ -2312,8 +2536,43 @@ impl ProjectContext {
         else {
             return Ok(Vec::new());
         };
-        let out_idx =
-            find_subclass_indices_via_refs(&self.db, &outputs, seed_file, seed_range, transitive);
+        // PROTOTYPE: if the seed lands on a project class, use the
+        // in-memory hierarchy index for a O(N) BFS. Otherwise (or for
+        // `transitive=false` external seeds), fall back to
+        // `find_subclass_indices_via_refs`.
+        let rk = (seed_range.start().to_u32(), seed_range.end().to_u32());
+        if let Some(&seed_idx) = outputs.class_by_selection.get(&(seed_file, rk)) {
+            let out_idx = if transitive {
+                transitive_subclasses_via_index(seed_idx, &outputs.class_children)
+            } else {
+                outputs
+                    .class_children
+                    .get(&seed_idx)
+                    .cloned()
+                    .unwrap_or_default()
+            };
+            return Ok(out_idx
+                .into_iter()
+                .map(|idx| outputs.builder.nodes[idx].clone_ref(py))
+                .collect());
+        }
+
+        // External seed (typeshed / site-packages). Use the existing
+        // find_references walk to get DIRECT project subclasses, then —
+        // if transitive — BFS through the in-memory hierarchy from
+        // those direct hits. This pays for one find_references seed
+        // walk instead of N.
+        let direct = find_subclass_indices_via_refs(
+            &self.db, &outputs, seed_file, seed_range, /*transitive=*/ false,
+        );
+        let mut out_idx: FxHashSet<usize> = direct.iter().copied().collect();
+        if transitive {
+            for &d in &direct {
+                for idx in transitive_subclasses_via_index(d, &outputs.class_children) {
+                    out_idx.insert(idx);
+                }
+            }
+        }
         Ok(out_idx
             .into_iter()
             .map(|idx| outputs.builder.nodes[idx].clone_ref(py))
