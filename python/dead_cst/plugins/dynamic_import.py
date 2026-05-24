@@ -42,16 +42,25 @@ class DynamicImportFallbackPlugin(Plugin):
     include_targets: tuple[str, ...] = ()
 
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
-        nodes = ctx.nodes()
         cache: dict[str, list] = {}
         project_root = Path(ctx.project_root)
-        for src_idx, dst_idx, flags in ctx.edges():
-            if not (flags & _DYNAMIC_IMPORT_FLAG):
-                continue
-            dst = nodes[dst_idx]
-            if dst.kind != "module":
-                continue
-            src = nodes[src_idx]
+        # Rust-side edge filter: ``with_flags`` masks edges whose
+        # flags don't intersect ``DYNAMIC_IMPORT`` and ``with_dst_kind``
+        # masks edges whose ``dst.kind`` isn't ``"module"``. We get
+        # endpoint ``SymbolNode``s pre-resolved, so the Python loop
+        # only sees rows it actually needs to act on — no per-edge
+        # Python ↔ rust FFI hops over the (typically large) full
+        # edge list.
+        edges = (
+            native.query(ctx)
+            .edges()
+            .with_flags(_DYNAMIC_IMPORT_FLAG)
+            .with_dst_kind("module")
+            .collect()
+        )
+        for edge in edges:
+            src = edge.src
+            dst = edge.dst
             if not self._allowed(Path(src.path), project_root, dst.fqname):
                 continue
             for export in self._exports_for(ctx, dst.fqname, cache):

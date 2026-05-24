@@ -111,9 +111,9 @@ impl CallRef {
 /// Entry point for the chainable query API. Returned by
 /// :meth:`ProjectContext.query`. Pick a stream type:
 /// :meth:`decorators`, :meth:`constructions`, :meth:`calls`,
-/// :meth:`subclasses`, :meth:`imports`, :meth:`classes`, or
-/// :meth:`factories`. Point lookups (``module``, ``declarations``,
-/// ``main_blocks``, etc.) live directly on
+/// :meth:`subclasses`, :meth:`imports`, :meth:`classes`,
+/// :meth:`factories`, or :meth:`edges`. Point lookups (``module``,
+/// ``declarations``, ``main_blocks``, etc.) live directly on
 /// :class:`ProjectContext`.
 #[pyclass(unsendable)]
 pub(crate) struct QueryBuilder {
@@ -142,6 +142,9 @@ impl QueryBuilder {
     }
     fn factories(&self, py: Python<'_>) -> FactoryQuery {
         FactoryQuery::new(self.ctx.clone_ref(py))
+    }
+    fn edges(&self, py: Python<'_>) -> EdgeQuery {
+        EdgeQuery::new(self.ctx.clone_ref(py))
     }
 }
 
@@ -996,6 +999,116 @@ impl FactoryQuery {
 }
 
 impl_query_methods!(no_first FactoryQuery);
+
+// ---------------------------------------------------------------------------
+// EdgeQuery — filtered enumeration over the in-progress graph's edges
+// ---------------------------------------------------------------------------
+
+/// One graph edge with both endpoint nodes resolved. Avoids the
+/// `nodes[src_idx]` / `nodes[dst_idx]` ping-pong that a Python-side
+/// ``for src_idx, dst_idx, flags in ctx.edges()`` loop pays.
+#[pyclass(frozen, get_all)]
+pub(crate) struct EdgeRef {
+    pub(crate) src: Py<SymbolNode>,
+    pub(crate) dst: Py<SymbolNode>,
+    pub(crate) flags: u32,
+}
+
+/// Filtered enumeration over the in-progress graph's edges. Predicates
+/// AND together; any unset predicate doesn't filter.
+///
+/// * ``with_flags(mask)`` — keep edges where ``flags & mask != 0``.
+/// * ``with_src_kind(kind)`` / ``with_dst_kind(kind)`` — keep edges
+///   whose endpoint ``SymbolNode.kind`` matches the given string.
+///
+/// Avoids the per-edge Python ↔ rust FFI hop that a
+/// ``for src_idx, dst_idx, flags in ctx.edges()`` plus
+/// ``nodes = ctx.nodes(); nodes[src_idx]`` pattern pays — the entire
+/// filter runs rust-side and only the surviving rows are materialized
+/// into ``Py<SymbolNode>``.
+#[pyclass(unsendable)]
+pub(crate) struct EdgeQuery {
+    pub(crate) ctx: Py<ProjectContext>,
+    pub(crate) flag_mask: Option<u32>,
+    pub(crate) src_kind: Option<String>,
+    pub(crate) dst_kind: Option<String>,
+}
+
+impl EdgeQuery {
+    fn new(ctx: Py<ProjectContext>) -> Self {
+        Self {
+            ctx,
+            flag_mask: None,
+            src_kind: None,
+            dst_kind: None,
+        }
+    }
+}
+
+#[pymethods]
+impl EdgeQuery {
+    /// Keep edges where ``flags & mask != 0``. Pass an
+    /// ``EdgeFlags`` constant (or OR of constants) to filter to a
+    /// specific edge classification.
+    fn with_flags<'py>(mut slf: PyRefMut<'py, Self>, mask: u32) -> PyRefMut<'py, Self> {
+        slf.flag_mask = Some(mask);
+        slf
+    }
+    /// Keep edges whose ``src`` node has the given ``kind`` (``"module"``,
+    /// ``"function"``, ``"import"``, …). Matches by exact string compare
+    /// against ``SymbolNode.kind``.
+    fn with_src_kind<'py>(mut slf: PyRefMut<'py, Self>, kind: String) -> PyRefMut<'py, Self> {
+        slf.src_kind = Some(kind);
+        slf
+    }
+    /// Keep edges whose ``dst`` node has the given ``kind``.
+    fn with_dst_kind<'py>(mut slf: PyRefMut<'py, Self>, kind: String) -> PyRefMut<'py, Self> {
+        slf.dst_kind = Some(kind);
+        slf
+    }
+
+    fn collect(&self, py: Python<'_>) -> PyResult<Vec<Py<EdgeRef>>> {
+        let ctx = self.ctx.borrow(py);
+        let outputs = ctx.materialized("EdgeQuery.collect")?;
+        let nodes: &[Py<SymbolNode>] = &outputs.builder.nodes;
+        let edges: &[(usize, usize, u32)] = &outputs.builder.edges;
+        let flag_mask = self.flag_mask;
+        let src_kind = self.src_kind.as_deref();
+        let dst_kind = self.dst_kind.as_deref();
+        let mut refs: Vec<Py<EdgeRef>> = Vec::new();
+        for &(src_idx, dst_idx, flags) in edges {
+            if let Some(mask) = flag_mask {
+                if flags & mask == 0 {
+                    continue;
+                }
+            }
+            // Endpoint-kind predicates: borrow only the side(s) the
+            // caller actually filtered on so the common
+            // ``with_flags(...)`` shape pays nothing for kind checks.
+            if let Some(needle) = src_kind {
+                if nodes[src_idx].borrow(py).kind != needle {
+                    continue;
+                }
+            }
+            if let Some(needle) = dst_kind {
+                if nodes[dst_idx].borrow(py).kind != needle {
+                    continue;
+                }
+            }
+            refs.push(Py::new(
+                py,
+                EdgeRef {
+                    src: nodes[src_idx].clone_ref(py),
+                    dst: nodes[dst_idx].clone_ref(py),
+                    flags,
+                },
+            )?);
+        }
+        Ok(refs)
+    }
+}
+
+impl_query_methods!(with_first EdgeQuery, EdgeRef);
 
 #[cfg(test)]
 mod tests {

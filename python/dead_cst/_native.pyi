@@ -783,7 +783,7 @@ class QueryBuilder:
     Filtered streams (terminated by ``.collect()``):
     :meth:`decorators` / :meth:`constructions` / :meth:`calls` /
     :meth:`subclasses` / :meth:`imports` / :meth:`classes` /
-    :meth:`factories`.
+    :meth:`factories` / :meth:`edges`.
 
     Point lookups (e.g. :meth:`ProjectContext.find_module`,
     :meth:`ProjectContext.find_declarations`,
@@ -801,6 +801,7 @@ class QueryBuilder:
     def imports(self) -> ImportQuery: ...
     def classes(self) -> ClassQuery: ...
     def factories(self) -> FactoryQuery: ...
+    def edges(self) -> EdgeQuery: ...
 
 class DecoratorQuery:
     """Find decorated top-level functions / classes. Pick exactly one
@@ -952,6 +953,48 @@ class FactoryQuery:
     def collect(self) -> list[FactoryRef]: ...
     def count(self) -> int: ...
     def __iter__(self) -> Iterator[FactoryRef]: ...
+
+class EdgeRef:
+    """One graph edge with both endpoint nodes resolved.
+
+    Avoids the ``nodes[src_idx]`` / ``nodes[dst_idx]`` ping-pong that a
+    Python-side ``for src_idx, dst_idx, flags in ctx.edges()`` loop pays.
+    """
+
+    src: SymbolNode
+    dst: SymbolNode
+    flags: int
+
+class EdgeQuery:
+    """Filtered enumeration over the in-progress graph's edges.
+
+    Predicates AND together; any unset predicate doesn't filter. The
+    entire filter runs rust-side and only the surviving rows are
+    materialized into ``Py<SymbolNode>``.
+    """
+
+    def with_flags(self, mask: int) -> EdgeQuery:
+        """Keep edges where ``flags & mask != 0``. Pass an
+        :class:`EdgeFlags` constant (or OR of constants) to filter to
+        a specific edge classification.
+        """
+        ...
+
+    def with_src_kind(self, kind: str) -> EdgeQuery:
+        """Keep edges whose ``src`` node has the given ``kind``
+        (``"module"``, ``"function"``, ``"import"``, …). Matches by
+        exact string compare against :attr:`SymbolNode.kind`.
+        """
+        ...
+
+    def with_dst_kind(self, kind: str) -> EdgeQuery:
+        """Keep edges whose ``dst`` node has the given ``kind``."""
+        ...
+
+    def collect(self) -> list[EdgeRef]: ...
+    def first(self) -> EdgeRef | None: ...
+    def count(self) -> int: ...
+    def __iter__(self) -> Iterator[EdgeRef]: ...
 
 # ---------- Graph persistence --------------------------------------------
 
