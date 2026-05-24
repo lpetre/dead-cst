@@ -32,6 +32,16 @@ two versions.
   (`module.Cls`) via the `path_to_file` index instead of a linear
   `project_files.iter().find(...)` scan keyed on path-string
   equality.
+- Pass 2 (edge translation) in `assemble_graph` now runs
+  GIL-free under `Python::allow_threads` + rayon
+  `par_iter().flat_map_iter().filter_map()` + `par_sort_unstable() +
+  dedup()`. Externals are pre-minted serially first so the parallel
+  section is pure FxHashMap probing — no `unsafe`, no salsa
+  snapshotting. On a 5000-file synthetic the `pass2` phase drops
+  from ~5.6 ms to ~3.4 ms (~40 %) and its stdev compresses ~2.5×.
+  Small-N (~200 files) pays a ~150 µs dispatch tax that's
+  invisible in wall-clock; serial path retained behind
+  `DEAD_CST_PASS2_SERIAL=1` as an A/B knob + kill switch.
 - Subclass queries (`find_subclasses`, `find_subclasses_of`, powering
   `UnittestPlugin`, `InitSubclassPlugin`, and `DispatchAppPlugin`'s
   `include_subclasses=True` path) build a project-wide
