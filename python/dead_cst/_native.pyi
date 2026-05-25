@@ -417,14 +417,18 @@ class ProjectContext:
         without re-running :meth:`materialize`."""
         ...
 
-    def read_progress_snapshot(self) -> dict[str, int]:
+    def read_progress_snapshot(self) -> dict[str, object]:
         """Atomic snapshot of the build-progress counters as a plain
         :class:`dict`. Drives :class:`dead_cst.Analysis`'s polling
         thread; user code should prefer the structured
         ``progress_callback`` API on :class:`dead_cst.Analysis`.
 
-        The dict has integer values; the ``phase`` discriminant maps
-        to one of :data:`dead_cst.analyze.PROGRESS_PHASES`.
+        Most values are integers; the ``phase`` discriminant maps to
+        one of :data:`dead_cst.analyze.PROGRESS_PHASES`. The
+        ``plugin_states`` value is a ``list[tuple[str, int, int]]``
+        of ``(name, started_us, finished_us)`` triples in
+        registration order — ``started_us == 0`` means "not yet
+        running", ``finished_us == 0`` means "still running".
 
         ``materialize`` holds the context's ``borrow_mut`` for the
         whole build, so a concurrent polling thread calling this
@@ -455,10 +459,27 @@ class ProjectContext:
         signal per-plugin completion to the polling thread."""
         ...
 
-    def progress_plugins_start(self, total: int) -> None:
-        """Stamp the plugins phase as started + record its total.
-        Called by :class:`dead_cst.Analysis` before launching the
+    def progress_plugins_start(self, names: list[str]) -> None:
+        """Stamp the plugins phase as started + allocate per-plugin
+        counter slabs keyed by registration order. ``names`` is
+        the plugin list (``type(plugin).__qualname__`` per entry);
+        indices passed to :meth:`progress_plugin_started` /
+        :meth:`progress_plugin_finished` match. Called by
+        :class:`dead_cst.Analysis` before launching the
         :class:`concurrent.futures.ThreadPoolExecutor`."""
+        ...
+
+    def progress_plugin_started(self, idx: int) -> None:
+        """Stamp the indexed plugin's start time. Called by the
+        :class:`concurrent.futures.ThreadPoolExecutor` worker on
+        entry so the per-plugin slot snapshot reflects the actual
+        start order (not the registration order)."""
+        ...
+
+    def progress_plugin_finished(self, idx: int) -> None:
+        """Stamp the indexed plugin's finish time. Called by the
+        :class:`concurrent.futures.ThreadPoolExecutor` worker on
+        exit (both success and exception paths)."""
         ...
 
     def progress_plugins_finish(self) -> None:

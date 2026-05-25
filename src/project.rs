@@ -1254,19 +1254,27 @@ impl ProjectContext {
             .map(|p| p.clone_ref(py))
             .collect();
         let plugin_bar = ProgressBars::plugin_bar(show_progress, plugins.len() as u64);
-        counters.start_phase(PHASE_PLUGINS, Some(plugins.len()));
-        let plugin_result = (|| -> PyResult<()> {
-            let mut prepared: Vec<PreparedOp> = Vec::new();
-            for plugin in &plugins {
-                let plugin_name: String = plugin
-                    .bind(py)
+        let plugin_names: Vec<String> = plugins
+            .iter()
+            .map(|p| {
+                p.bind(py)
                     .get_type()
                     .getattr("__qualname__")
                     .ok()
                     .and_then(|n| n.extract().ok())
-                    .unwrap_or_else(|| "<unnamed>".to_string());
-                plugin_bar.set_message(plugin_name);
-                collect_prepared_plugin_ops(py, &slf, plugin, &mut prepared)?;
+                    .unwrap_or_else(|| "<unnamed>".to_string())
+            })
+            .collect();
+        counters.init_plugin_slots(plugin_names.clone());
+        counters.start_phase(PHASE_PLUGINS, Some(plugins.len()));
+        let plugin_result = (|| -> PyResult<()> {
+            let mut prepared: Vec<PreparedOp> = Vec::new();
+            for (idx, plugin) in plugins.iter().enumerate() {
+                plugin_bar.set_message(plugin_names[idx].clone());
+                counters.plugin_started(idx);
+                let res = collect_prepared_plugin_ops(py, &slf, plugin, &mut prepared);
+                counters.plugin_finished(idx);
+                res?;
                 plugin_bar.inc(1);
                 counters.plugins_inc();
             }
@@ -1445,11 +1453,29 @@ impl ProjectContext {
         self.progress.plugins_inc();
     }
 
-    /// Stamp the plugins phase as started + record its total. Called
-    /// from Python before launching the
-    /// :class:`concurrent.futures.ThreadPoolExecutor`.
-    pub(crate) fn progress_plugins_start(&self, total: usize) {
+    /// Stamp the plugins phase as started + record its total + name
+    /// the registered plugins. ``names`` is the plugin list in
+    /// registration order (``type(plugin).__qualname__`` per entry);
+    /// indices passed to :meth:`progress_plugin_started` /
+    /// :meth:`progress_plugin_finished` match.
+    pub(crate) fn progress_plugins_start(&self, names: Vec<String>) {
+        let total = names.len();
+        self.progress.init_plugin_slots(names);
         self.progress.start_phase(PHASE_PLUGINS, Some(total));
+    }
+
+    /// Stamp the indexed plugin's start time. Called on worker-thread
+    /// entry. Idempotent on out-of-range indices — the
+    /// [`crate::progress::ProgressCounters`] no-ops a missing slot.
+    pub(crate) fn progress_plugin_started(&self, idx: usize) {
+        self.progress.plugin_started(idx);
+    }
+
+    /// Stamp the indexed plugin's finish time. Called on worker-thread
+    /// exit (both the success and exception paths — the Python driver
+    /// wraps the call in ``try/finally``).
+    pub(crate) fn progress_plugin_finished(&self, idx: usize) {
+        self.progress.plugin_finished(idx);
     }
 
     /// Stamp the plugins phase as finished + mark the whole pipeline

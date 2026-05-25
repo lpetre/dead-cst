@@ -200,6 +200,15 @@ def test_progress_callback_with_concurrent_plugins(tmp_path: Path) -> None:
     # The two plugin class qualnames should both have surfaced.
     assert "ExplicitEntrypointPlugin" in names
     assert "ModuleDundersPlugin" in names
+    # With per-plugin counter slabs, each ``plugin_end`` carries the
+    # plugin's actual name (not the registration-order approximation
+    # the old global-counter path used) and a real elapsed_ms.
+    end_names = [k["name"] for k in plugin_ends]
+    assert sorted(end_names) == sorted(names)
+    # Each plugin's slot index in ``plugin_start`` matches its
+    # registration order.
+    indices = sorted(k["index"] for k in plugin_starts)
+    assert indices == [0, 1]
 
 
 def test_progress_snapshot_dict_shape(tmp_path: Path) -> None:

@@ -314,11 +314,14 @@ class _ProgressPoller:
                         total=(total if total > 0 else None),
                     )
 
-                # Plugin start/end synthesis. Treat each
-                # ``plugins_done`` increment as the end of the
-                # plugin whose index equals the old count.
-                if name == "plugins" and self._plugin_names:
-                    self._emit_plugin_events(done, total)
+                # Plugin start/end synthesis. The rust side
+                # publishes a per-plugin slot snapshot — one
+                # ``(name, started_us, finished_us)`` triple per
+                # registered plugin, in registration order. The
+                # poller diffs them against ``_plugin_states_seen``
+                # so each transition fires exactly one event.
+                if name == "plugins":
+                    self._emit_plugin_events_from_slots(snap, total)
 
             # ``phase_end`` fires when the rust side has moved past
             # this phase (current_phase_id > phase_id), or when the
@@ -351,28 +354,30 @@ class _ProgressPoller:
                     elapsed_ms=elapsed_us // 1000,
                 )
 
-    def _emit_plugin_events(self, done: int, total: int) -> None:
-        """Translate ``plugins_done`` increments into per-plugin
-        ``plugin_start`` / ``plugin_end`` events.
+    def _emit_plugin_events_from_slots(self, snap: dict[str, object], total: int) -> None:
+        """Diff the rust per-plugin slot snapshot against
+        ``_plugins_signalled_{start,end}`` and fire one event per
+        observed transition.
 
-        The rust side reports plugin completion *count* but not which
-        plugin finished — we infer order from the registration order
-        Python stashed in ``plugin_names``. With the concurrent
-        ``ThreadPoolExecutor`` plugin pass this is best-effort:
-        completions may arrive out of registration order, so the
-        reported ``name`` is the next-unseen plugin in registration
-        order rather than the actual one. This is documented as a
-        known limitation in the callback contract.
+        Each slot is a ``(name, started_us, finished_us)`` triple:
+
+        * ``started_us > 0`` and ``idx`` not in signalled-start →
+          fire ``plugin_start(name=..., index=idx, total=...)``.
+        * ``finished_us > 0`` and ``idx`` not in signalled-end →
+          fire ``plugin_end(name=..., elapsed_ms=...)`` with the
+          per-plugin elapsed time computed from the slot pair.
+
+        Slot order is registration order, so ``idx`` is meaningful;
+        completion order across slots can interleave freely under the
+        parallel ``ThreadPoolExecutor`` pass — each slot writes only
+        to its own atomic so attribution is exact.
         """
-        plugin_total = total if total > 0 else len(self._plugin_names)
-        # Fire ``plugin_start`` for any plugin whose index <= done
-        # but hasn't been signalled yet.
-        for idx in range(min(done, plugin_total)):
-            if idx not in self._plugins_signalled_start:
+        states = snap.get("plugin_states") or []
+        plugin_total = total if total > 0 else len(states)
+        for idx, triple in enumerate(states):
+            name, started_us, finished_us = triple
+            if started_us > 0 and idx not in self._plugins_signalled_start:
                 self._plugins_signalled_start.add(idx)
-                name = (
-                    self._plugin_names[idx] if idx < len(self._plugin_names) else f"<plugin {idx}>"
-                )
                 _safe_invoke_callback(
                     self._cb,
                     "plugin_start",
@@ -380,20 +385,15 @@ class _ProgressPoller:
                     index=idx,
                     total=plugin_total,
                 )
-            if idx not in self._plugins_signalled_end:
+            if finished_us > 0 and idx not in self._plugins_signalled_end:
                 self._plugins_signalled_end.add(idx)
-                name = (
-                    self._plugin_names[idx] if idx < len(self._plugin_names) else f"<plugin {idx}>"
-                )
-                # ops_emitted is not tracked per-plugin yet; report 0
-                # as a placeholder so the callback contract stays
-                # stable.
+                elapsed_us = finished_us - started_us if finished_us >= started_us else 0
                 _safe_invoke_callback(
                     self._cb,
                     "plugin_end",
                     name=name,
                     ops_emitted=0,
-                    elapsed_ms=0,
+                    elapsed_ms=elapsed_us // 1000,
                 )
 
 
@@ -595,7 +595,8 @@ class Analysis:
             else:
                 ctx.build_only()
                 workers = _plugin_worker_count(len(self._plugins))
-                ctx.progress_plugins_start(len(self._plugins))
+                plugin_names = [type(p).__qualname__ for p in self._plugins]
+                ctx.progress_plugins_start(plugin_names)
                 try:
                     # Plugins are scheduled in registration order;
                     # ``.result()`` waits in the same order. Errors
@@ -604,17 +605,29 @@ class Analysis:
                     # handle (no graph mutation); the main thread
                     # folds every handle into the graph in registration
                     # order via one ``apply_ops_batched`` call.
-                    def _run_collect(plugin: Plugin):
+                    #
+                    # The per-plugin ``progress_plugin_started`` /
+                    # ``progress_plugin_finished`` stamps live in this
+                    # worker so the rust per-plugin counter slabs see
+                    # the actual completion order (the polling thread
+                    # uses those to attribute ``plugin_end`` events to
+                    # the right plugin even when futures resolve out of
+                    # registration order).
+                    def _run_collect(idx: int, plugin: Plugin):
+                        ctx.progress_plugin_started(idx)
                         try:
                             return ctx.run_plugin_collect(plugin)
                         finally:
+                            ctx.progress_plugin_finished(idx)
                             ctx.progress_plugin_done()
 
                     with ThreadPoolExecutor(
                         max_workers=workers,
                         thread_name_prefix="dead-cst-plugin",
                     ) as pool:
-                        futures = [pool.submit(_run_collect, p) for p in self._plugins]
+                        futures = [
+                            pool.submit(_run_collect, idx, p) for idx, p in enumerate(self._plugins)
+                        ]
                         collected = [fut.result() for fut in futures]
                     ctx.apply_ops_batched(collected)
                 finally:

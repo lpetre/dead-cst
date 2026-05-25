@@ -14,7 +14,7 @@
 //! ``Analysis.materialize_all``.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use pyo3::prelude::*;
@@ -91,9 +91,35 @@ pub(crate) struct ProgressCounters {
     pub(crate) plugins_started_us: AtomicU64,
     pub(crate) plugins_elapsed_us: AtomicU64,
 
+    /// Per-plugin slabs initialised once at the start of the plugin
+    /// pass via [`Self::init_plugin_slots`]. Each plugin worker writes
+    /// only to its own slot, so the parallel ``ThreadPoolExecutor``
+    /// path can attribute completions to the actual plugin (not the
+    /// "next-unseen plugin in registration order" approximation the
+    /// global counter forces).
+    pub(crate) plugin_slots: OnceLock<PluginSlots>,
+
     /// Process-wide monotonic clock anchor used to compute the
     /// `*_started_us` markers. Set at construction.
     start: Instant,
+}
+
+/// Pre-sized per-plugin counter slabs. The Python driver stamps each
+/// plugin's index when it calls
+/// [`crate::project::ProjectContext::run_plugin_collect`]; the rust
+/// side writes the started / finished timestamps into the matching
+/// slot. All three vectors are the same length and indexed by the
+/// plugin's registration order.
+pub(crate) struct PluginSlots {
+    /// Display names — ``type(plugin).__qualname__`` (or a fallback).
+    /// Read-only after [`ProgressCounters::init_plugin_slots`] returns.
+    pub(crate) names: Vec<String>,
+    /// Microseconds (relative to [`ProgressCounters::start`]) at which
+    /// the indexed plugin's ``run`` entered. `0` until stamped.
+    pub(crate) started_us: Box<[AtomicU64]>,
+    /// Microseconds at which the indexed plugin's ``run`` returned.
+    /// `0` while still running.
+    pub(crate) finished_us: Box<[AtomicU64]>,
 }
 
 impl ProgressCounters {
@@ -121,7 +147,48 @@ impl ProgressCounters {
             plugins_total: AtomicUsize::new(0),
             plugins_started_us: AtomicU64::new(0),
             plugins_elapsed_us: AtomicU64::new(0),
+            plugin_slots: OnceLock::new(),
             start: Instant::now(),
+        }
+    }
+
+    /// Allocate the per-plugin counter slabs once. ``names`` is the
+    /// plugin list in registration order; indices passed to
+    /// [`Self::plugin_started`] / [`Self::plugin_finished`] match.
+    /// Calls after the first are silently ignored (the
+    /// [`OnceLock`] preserves the first set) — a [`ProjectContext`]
+    /// drives at most one materialize pass, so this matches the
+    /// expected lifecycle.
+    pub(crate) fn init_plugin_slots(&self, names: Vec<String>) {
+        let n = names.len();
+        let _ = self.plugin_slots.set(PluginSlots {
+            names,
+            started_us: (0..n).map(|_| AtomicU64::new(0)).collect(),
+            finished_us: (0..n).map(|_| AtomicU64::new(0)).collect(),
+        });
+    }
+
+    /// Stamp the per-plugin start time. Called by
+    /// [`crate::project::ProjectContext::run_plugin_collect`] on
+    /// worker-thread entry. No-op if the slot wasn't pre-allocated
+    /// (e.g. a caller that skipped [`Self::init_plugin_slots`]).
+    pub(crate) fn plugin_started(&self, idx: usize) {
+        if let Some(slots) = self.plugin_slots.get() {
+            if let Some(cell) = slots.started_us.get(idx) {
+                cell.store(self.now_us(), Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Stamp the per-plugin finish time. Called by
+    /// [`crate::project::ProjectContext::run_plugin_collect`] on
+    /// worker-thread exit (success path or exception path — the
+    /// Python driver wraps the call in a ``try/finally``).
+    pub(crate) fn plugin_finished(&self, idx: usize) {
+        if let Some(slots) = self.plugin_slots.get() {
+            if let Some(cell) = slots.finished_us.get(idx) {
+                cell.store(self.now_us(), Ordering::Relaxed);
+            }
         }
     }
 
@@ -204,6 +271,22 @@ impl ProgressCounters {
     /// helper and `Analysis._poll_progress` — do not reorder without
     /// updating both sides.
     pub(crate) fn snapshot(&self) -> ProgressSnapshot {
+        let plugin_states = self
+            .plugin_slots
+            .get()
+            .map(|slots| {
+                slots
+                    .names
+                    .iter()
+                    .enumerate()
+                    .map(|(i, name)| PluginState {
+                        name: name.clone(),
+                        started_us: slots.started_us[i].load(Ordering::Relaxed),
+                        finished_us: slots.finished_us[i].load(Ordering::Relaxed),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         ProgressSnapshot {
             phase: self.phase.load(Ordering::Relaxed),
             finished: self.finished.load(Ordering::Relaxed),
@@ -222,6 +305,7 @@ impl ProgressCounters {
             plugins_done: self.plugins_done.load(Ordering::Relaxed),
             plugins_total: self.plugins_total.load(Ordering::Relaxed),
             plugins_elapsed_us: self.plugins_elapsed_us.load(Ordering::Relaxed),
+            plugin_states,
         }
     }
 
@@ -260,7 +344,7 @@ impl ProgressCounters {
 /// [`crate::project::ProjectContext::read_progress_snapshot`] returns
 /// to Python. All fields are `usize` / `u64` / `bool` so the pyo3
 /// conversion is a cheap memcpy.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct ProgressSnapshot {
     pub(crate) phase: usize,
     pub(crate) finished: bool,
@@ -279,12 +363,25 @@ pub(crate) struct ProgressSnapshot {
     pub(crate) plugins_done: usize,
     pub(crate) plugins_total: usize,
     pub(crate) plugins_elapsed_us: u64,
+    /// Per-plugin slot snapshot in registration order. Empty when
+    /// [`ProgressCounters::init_plugin_slots`] hasn't been called
+    /// (e.g. mid-build during a phase that precedes plugins).
+    pub(crate) plugin_states: Vec<PluginState>,
+}
+
+/// One plugin's slot at snapshot time. ``started_us == 0`` ⇔ not yet
+/// running; ``finished_us == 0`` ⇔ still running (or never ran).
+#[derive(Clone, Debug)]
+pub(crate) struct PluginState {
+    pub(crate) name: String,
+    pub(crate) started_us: u64,
+    pub(crate) finished_us: u64,
 }
 
 impl ProgressSnapshot {
     /// Convert the snapshot to a Python dict. The key set is the
     /// public contract that ``Analysis._ProgressPoller`` reads.
-    pub(crate) fn to_pydict<'py>(self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+    pub(crate) fn to_pydict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let dict = PyDict::new_bound(py);
         dict.set_item("phase", self.phase)?;
         dict.set_item("finished", self.finished)?;
@@ -303,6 +400,16 @@ impl ProgressSnapshot {
         dict.set_item("plugins_done", self.plugins_done)?;
         dict.set_item("plugins_total", self.plugins_total)?;
         dict.set_item("plugins_elapsed_us", self.plugins_elapsed_us)?;
+        // Per-plugin slot snapshot. ``[(name, started_us, finished_us), ...]``
+        // in registration order. The polling thread uses these to fire
+        // ``plugin_start`` / ``plugin_end`` with accurate attribution
+        // when plugins run concurrently.
+        let plugin_states: Vec<(String, u64, u64)> = self
+            .plugin_states
+            .iter()
+            .map(|s| (s.name.clone(), s.started_us, s.finished_us))
+            .collect();
+        dict.set_item("plugin_states", plugin_states)?;
         Ok(dict)
     }
 }
