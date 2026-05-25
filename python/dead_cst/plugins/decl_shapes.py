@@ -177,86 +177,57 @@ class DispatchAppPlugin(Plugin):
         return out
 
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
-        if not (self.app_classes and self.registration_decorators):
+        if not self._is_active(ctx):
             return
-        # Cheap import-presence guard. ``_module_to_names`` triggers
-        # ``subclasses().of_fqn(...)`` for every ``app_class``, which
-        # forces ty to load the framework from the venv (parse + build
-        # SemanticIndex + walk the class hierarchy) — ~100-400ms per
-        # framework. If nothing imports the framework's root package,
-        # the project can't possibly contain an instance of an
-        # ``app_class``, so skip the work.
-        app_modules = {fqn.rpartition(".")[0] for fqn in self.app_classes if "." in fqn}
-        if not any(native.query(ctx).imports().of(m).exists() for m in app_modules if m):
-            return
-        decorator_attrs = list(self.registration_decorators)
-
         module_to_names = self._module_to_names(ctx)
         if not module_to_names:
             return
-
-        # 1. Direct constructions, deduped by var_idx (every construction
-        # site has a globally unique node index, so the same physical
-        # site that matches under two ``app_classes`` entries — e.g.
-        # one is a base of the other — collapses on idx).
-        direct_seen: set[int] = set()
-        direct: list[native.ConstructionIdxRef] = []
-        for module, names in module_to_names.items():
-            for ref in (
-                native.query(ctx)
-                .constructions()
-                .where_module(module)
-                .where_name(sorted(names))
-                .row_indices()
-            ):
-                if ref.var_idx in direct_seen:
-                    continue
-                direct_seen.add(ref.var_idx)
-                direct.append(ref)
-
-        # 2. Factory functions returning one of the listed classes,
-        # deduped by (decl_idx, kind). decl_idx is globally unique;
-        # kind is part of the key because one decl can match multiple
-        # kinds. Only relevant when we'd actually do something with the
-        # markers in step 6.
-        factory_seen: set[tuple[int, str]] = set()
-        factory_decls: list[tuple[native.FactoryIdxRef, str]] = []
-        if self.seed_as_entrypoint:
-            for module, names in module_to_names.items():
-                for fref in (
-                    native.query(ctx)
-                    .factories()
-                    .of_module(module)
-                    .where_name(sorted(names))
-                    .row_indices()
-                ):
-                    for kind in fref.kinds:
-                        key = (fref.decl_idx, kind)
-                        if key in factory_seen:
-                            continue
-                        factory_seen.add(key)
-                        factory_decls.append((fref, kind))
-
-        handlers = list(
-            native.query(ctx).decorators().where_owner_attr(decorator_attrs).row_indices()
+        direct = _fetch_direct(ctx, module_to_names)
+        factory_decls = (
+            _fetch_factory_decls(ctx, module_to_names) if self.seed_as_entrypoint else []
+        )
+        handlers = _fetch_handlers(ctx, self.registration_decorators)
+        vars_by_file = _build_vars_by_file(ctx)
+        yield from self._emit_ops(
+            ctx,
+            direct=direct,
+            factory_decls=factory_decls,
+            handlers=handlers,
+            vars_by_file=vars_by_file,
         )
 
+    def _is_active(self, ctx: native.ProjectContext) -> bool:
+        """Cheap import-presence + config-completeness guard. Skips the
+        ~100-400ms ``subclasses().of_fqn(...)`` walk when no file in the
+        project imports the framework's root package.
+        """
+        if not (self.app_classes and self.registration_decorators):
+            return False
+        app_modules = {fqn.rpartition(".")[0] for fqn in self.app_classes if "." in fqn}
+        return any(native.query(ctx).imports().of(m).exists() for m in app_modules if m)
+
+    def _emit_ops(
+        self,
+        ctx: native.ProjectContext,
+        *,
+        direct: list[native.ConstructionIdxRef],
+        factory_decls: list[tuple[native.FactoryIdxRef, str]],
+        handlers: list[native.DecoratorIdxRef],
+        vars_by_file: dict[tuple[str, str], int],
+    ) -> Iterable[native.GraphOp]:
+        """Per-plugin emission, given pre-fetched rows. Shared between
+        ``DispatchAppPlugin.run`` (single-plugin path) and
+        ``BatchDispatchAppPlugin.run`` (fused path); both fetch the
+        inputs differently then call here.
+        """
         # direct_by_owner: (path, simple_name) -> [var_idx, ...]
         direct_by_owner: dict[tuple[str, str], list[int]] = {}
+        direct_attrs: list[tuple[native.NodeKind, str, str, int]] = []
         if direct:
             direct_attrs = ctx.node_attrs([r.var_idx for r in direct])
             for ref, (_kind, _path, fqname, _flags) in zip(direct, direct_attrs, strict=True):
                 simple = fqname.rsplit(".", 1)[-1]
                 direct_by_owner.setdefault((ref.path, simple), []).append(ref.var_idx)
-
-        # vars_by_file: (path, simple_name) -> var_idx. First idx wins.
-        vars_by_file: dict[tuple[str, str], int] = {}
-        var_idxs = native.query(ctx).decls().with_kind("variable").indices()
-        if var_idxs:
-            var_attrs = ctx.node_attrs(var_idxs)
-            for idx, (_kind, path, fqname, _flags) in zip(var_idxs, var_attrs, strict=True):
-                simple = fqname.rsplit(".", 1)[-1]
-                vars_by_file.setdefault((path, simple), idx)
 
         app_prefix = self._prefix("app")
         factory_prefix = self._prefix("factory")
@@ -338,6 +309,239 @@ class DispatchAppPlugin(Plugin):
                     flags=int(NodeFlags.ENTRYPOINT),
                     edges_to_idx=[var_idx],
                 )
+
+
+# ---------------------------------------------------------------------------
+# Shared fetch helpers
+#
+# Pulled out of :class:`DispatchAppPlugin.run` so
+# :class:`BatchDispatchAppPlugin` can call them with fused inputs.
+# ---------------------------------------------------------------------------
+
+
+def _fetch_direct(
+    ctx: native.ProjectContext, module_to_names: dict[str, set[str]]
+) -> list[native.ConstructionIdxRef]:
+    """Run a construction query per distinct module (with the union of
+    requested names) and dedup by ``var_idx``. Identical observable
+    output to the per-plugin loop the legacy ``DispatchAppPlugin.run``
+    used."""
+    direct_seen: set[int] = set()
+    direct: list[native.ConstructionIdxRef] = []
+    for module, names in module_to_names.items():
+        for ref in (
+            native.query(ctx)
+            .constructions()
+            .where_module(module)
+            .where_name(sorted(names))
+            .row_indices()
+        ):
+            if ref.var_idx in direct_seen:
+                continue
+            direct_seen.add(ref.var_idx)
+            direct.append(ref)
+    return direct
+
+
+def _fetch_factory_decls(
+    ctx: native.ProjectContext, module_to_names: dict[str, set[str]]
+) -> list[tuple[native.FactoryIdxRef, str]]:
+    """Run a factory query per distinct module and dedup by
+    ``(decl_idx, kind)``."""
+    factory_seen: set[tuple[int, str]] = set()
+    factory_decls: list[tuple[native.FactoryIdxRef, str]] = []
+    for module, names in module_to_names.items():
+        for fref in (
+            native.query(ctx).factories().of_module(module).where_name(sorted(names)).row_indices()
+        ):
+            for kind in fref.kinds:
+                key = (fref.decl_idx, kind)
+                if key in factory_seen:
+                    continue
+                factory_seen.add(key)
+                factory_decls.append((fref, kind))
+    return factory_decls
+
+
+def _fetch_handlers(
+    ctx: native.ProjectContext, registration_decorators: frozenset[str]
+) -> list[native.DecoratorIdxRef]:
+    return list(
+        native.query(ctx).decorators().where_owner_attr(list(registration_decorators)).row_indices()
+    )
+
+
+def _build_vars_by_file(ctx: native.ProjectContext) -> dict[tuple[str, str], int]:
+    """One project-wide variable scan + one ``node_attrs`` batch fetch.
+    Result is plugin-agnostic, so ``BatchDispatchAppPlugin`` builds it
+    once and hands the same dict to every wrapped plugin."""
+    vars_by_file: dict[tuple[str, str], int] = {}
+    var_idxs = native.query(ctx).decls().with_kind("variable").indices()
+    if not var_idxs:
+        return vars_by_file
+    var_attrs = ctx.node_attrs(var_idxs)
+    for idx, (_kind, path, fqname, _flags) in zip(var_idxs, var_attrs, strict=True):
+        simple = fqname.rsplit(".", 1)[-1]
+        vars_by_file.setdefault((path, simple), idx)
+    return vars_by_file
+
+
+@dataclass(kw_only=True)
+class BatchDispatchAppPlugin(Plugin):
+    """Run multiple :class:`DispatchAppPlugin` instances with fused queries.
+
+    Same observable output as registering every wrapped plugin
+    individually, but the underlying construction / factory / variable
+    queries are fused so each ``par_scan_files`` runs once across the
+    union of all plugins' configs instead of once per plugin.
+
+    Fusion strategy:
+
+    * **Per-distinct-module construction & factory queries.** Two
+      plugins both targeting ``flask.Flask`` (e.g. Flask + a project-
+      level extension) share one query instead of issuing two. Result
+      rows route back to plugins by matching the row's ``class_name``
+      against each plugin's ``{module: {name}}`` map.
+    * **Shared subclass-walk cache.** Each ``app_class`` fqn's
+      transitive-subclass lookup runs at most once regardless of how
+      many plugins request it.
+    * **Single project-wide variable scan.** ``vars_by_file`` is
+      plugin-agnostic, so it's built once and reused.
+
+    Handler (``DecoratorQuery``) and emission stay per-plugin because
+    handler row routing requires knowing which plugin's
+    ``registration_decorators`` matched, and the ref API doesn't carry
+    the matched attribute name. The handler queries are cheap (each is
+    text-prefiltered before any AST parsing), so this is a fine
+    trade-off — the big AST-walk wins are in the construction /
+    factory / variable scans the fusion does collapse.
+    """
+
+    plugins: list[DispatchAppPlugin]
+    name: str = "BatchDispatchApp"
+    version: int = 1
+
+    def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
+        active = [p for p in self.plugins if p._is_active(ctx)]
+        if not active:
+            return
+
+        # Shared subclass-walk cache. ``DispatchAppPlugin._module_to_names``
+        # calls ``ctx.subclasses_of_fqn_indices(fqn)`` once per
+        # ``app_class``; two plugins that share a class would otherwise
+        # walk the same hierarchy twice. Memoise the per-fqn list of
+        # ``(sub_module, sub_name)`` pairs.
+        subclass_cache: dict[str, list[tuple[str, str]]] = {}
+
+        def _subclasses_for(fqn: str) -> list[tuple[str, str]]:
+            cached = subclass_cache.get(fqn)
+            if cached is not None:
+                return cached
+            sub_idxs = ctx.subclasses_of_fqn_indices(fqn)
+            pairs: list[tuple[str, str]] = []
+            if sub_idxs:
+                for _k, _p, sub_fqname, _f in ctx.node_attrs(sub_idxs):
+                    sub_module, _, sub_name = sub_fqname.rpartition(".")
+                    if sub_module and sub_name:
+                        pairs.append((sub_module, sub_name))
+            subclass_cache[fqn] = pairs
+            return pairs
+
+        module_to_names_per_plugin: list[dict[str, set[str]]] = []
+        for plugin in active:
+            mtn: dict[str, set[str]] = {}
+            for fqn in plugin.app_classes:
+                module, _, name = fqn.rpartition(".")
+                if module and name:
+                    mtn.setdefault(module, set()).add(name)
+            for fqn in plugin.app_classes:
+                for sub_module, sub_name in _subclasses_for(fqn):
+                    mtn.setdefault(sub_module, set()).add(sub_name)
+            module_to_names_per_plugin.append(mtn)
+
+        # Drop plugins whose ``_module_to_names`` came back empty — same
+        # short-circuit DispatchAppPlugin.run does.
+        live_indices = [i for i, mtn in enumerate(module_to_names_per_plugin) if mtn]
+        if not live_indices:
+            return
+
+        # Union of (module → names) across every live plugin — drives
+        # the fused construction & factory queries.
+        union_modules: dict[str, set[str]] = {}
+        for i in live_indices:
+            for module, names in module_to_names_per_plugin[i].items():
+                union_modules.setdefault(module, set()).update(names)
+
+        # Per-plugin direct constructions, deduped by var_idx. Each row
+        # routes to plugins whose ``mtn[module]`` contains the row's
+        # ``class_name``.
+        direct_per_plugin: dict[int, list[native.ConstructionIdxRef]] = {
+            i: [] for i in live_indices
+        }
+        direct_seen_per_plugin: dict[int, set[int]] = {i: set() for i in live_indices}
+        for module, all_names in union_modules.items():
+            for ref in (
+                native.query(ctx)
+                .constructions()
+                .where_module(module)
+                .where_name(sorted(all_names))
+                .row_indices()
+            ):
+                for i in live_indices:
+                    if ref.class_name not in module_to_names_per_plugin[i].get(module, ()):
+                        continue
+                    seen = direct_seen_per_plugin[i]
+                    if ref.var_idx in seen:
+                        continue
+                    seen.add(ref.var_idx)
+                    direct_per_plugin[i].append(ref)
+
+        # Factory queries only run for plugins with seed_as_entrypoint —
+        # but they're shared across all such plugins by module.
+        seed_indices = [i for i in live_indices if active[i].seed_as_entrypoint]
+        factory_per_plugin: dict[int, list[tuple[native.FactoryIdxRef, str]]] = {
+            i: [] for i in live_indices
+        }
+        factory_seen_per_plugin: dict[int, set[tuple[int, str]]] = {i: set() for i in live_indices}
+        if seed_indices:
+            seed_union_modules: dict[str, set[str]] = {}
+            for i in seed_indices:
+                for module, names in module_to_names_per_plugin[i].items():
+                    seed_union_modules.setdefault(module, set()).update(names)
+            for module, all_names in seed_union_modules.items():
+                for fref in (
+                    native.query(ctx)
+                    .factories()
+                    .of_module(module)
+                    .where_name(sorted(all_names))
+                    .row_indices()
+                ):
+                    for kind in fref.kinds:
+                        for i in seed_indices:
+                            if kind not in module_to_names_per_plugin[i].get(module, ()):
+                                continue
+                            key = (fref.decl_idx, kind)
+                            if key in factory_seen_per_plugin[i]:
+                                continue
+                            factory_seen_per_plugin[i].add(key)
+                            factory_per_plugin[i].append((fref, kind))
+
+        # Single project-wide variable scan — shared across every plugin.
+        vars_by_file = _build_vars_by_file(ctx)
+
+        # Per-plugin handler query + emission. Handler queries are not
+        # fused because the ref API doesn't carry which attr matched
+        # (see class docstring).
+        for i in live_indices:
+            plugin = active[i]
+            handlers = _fetch_handlers(ctx, plugin.registration_decorators)
+            yield from plugin._emit_ops(
+                ctx,
+                direct=direct_per_plugin[i],
+                factory_decls=factory_per_plugin[i],
+                handlers=handlers,
+                vars_by_file=vars_by_file,
+            )
 
 
 @dataclass(kw_only=True)

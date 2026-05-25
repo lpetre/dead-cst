@@ -31,7 +31,12 @@ from ._core import (
     UNRESOLVED_PREFIX,
     simple_name,
 )
-from .decl_shapes import DecoratedDeclPlugin, DispatchAppPlugin, LiteralListPlugin
+from .decl_shapes import (
+    BatchDispatchAppPlugin,
+    DecoratedDeclPlugin,
+    DispatchAppPlugin,
+    LiteralListPlugin,
+)
 from .dynamic_import import DynamicImportFallbackPlugin
 from .explicit_entrypoint import ExplicitEntrypointPlugin
 from .init_subclass import InitSubclassPlugin
@@ -40,6 +45,7 @@ from .module_dunders import ModuleDundersPlugin
 from .project_scripts import ProjectScriptsPlugin
 
 __all__ = [
+    "BatchDispatchAppPlugin",
     "DecoratedDeclPlugin",
     "DispatchAppPlugin",
     "DynamicImportFallbackPlugin",
