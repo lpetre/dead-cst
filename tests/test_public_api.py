@@ -17,6 +17,9 @@ EXPECTED_PUBLIC_API: dict[str, list[str]] = {
     ],
     "dead_cst.analyze": [
         "Analysis",
+        "PROGRESS_PHASES",
+        "PROGRESS_POLL_INTERVAL_S",
+        "ProgressCallback",
     ],
     "dead_cst.codemod": ["generate_patch", "remove_code"],
     "dead_cst.graph": [

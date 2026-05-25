@@ -45,6 +45,10 @@ use crate::helpers::{
     FactoryCallFinder, StringArgCallFinder, NODE_FLAG_ENTRYPOINT,
 };
 use crate::ingest::{emit_visitor_warning, file_package_name, string_literal_list};
+use crate::progress::{
+    ProgressCounters, ProgressHandle, ProgressSnapshot, PHASE_ASSEMBLE, PHASE_ENUM, PHASE_FQNAME,
+    PHASE_PLUGINS, PHASE_POPULATE,
+};
 use crate::query::{
     _compile_path_regex, _contains_any_identifier, _contains_identifier, par_scan_files,
     QueryBuilder,
@@ -85,7 +89,8 @@ impl Project {
 
     /// Build the project-wide symbol graph (single-pass, no plugins).
     pub(crate) fn build(&mut self, py: Python<'_>) -> PyResult<NativeGraph> {
-        let outputs = build_project_graph(py, &mut self.db, false, None)?;
+        let counters = Arc::new(ProgressCounters::new());
+        let outputs = build_project_graph(py, &mut self.db, false, None, &counters)?;
         Ok(NativeGraph {
             nodes: outputs.builder.nodes,
             edges: outputs.builder.edges,
@@ -236,11 +241,14 @@ pub(crate) fn build_project_graph(
     db: &mut ProjectDatabase,
     show_progress: bool,
     stack_size: Option<usize>,
+    counters: &Arc<ProgressCounters>,
 ) -> PyResult<BuildOutputs> {
     let timing = std::env::var_os("DEAD_CST_TIMING").is_some();
 
+    counters.start_phase(PHASE_ENUM, None);
     let t0 = std::time::Instant::now();
     let project_files: Vec<File> = (&db.project().files(db)).into_iter().collect();
+    counters.set_enum_total(project_files.len());
     let mut path_to_file: FxHashMap<String, File> =
         FxHashMap::with_capacity_and_hasher(project_files.len(), Default::default());
     for &file in &project_files {
@@ -269,8 +277,10 @@ pub(crate) fn build_project_graph(
         }
     }
     let t_enum = t0.elapsed();
+    counters.finish_phase(PHASE_ENUM);
 
     let progress = ProgressBars::new(show_progress, project_files.len() as u64);
+    counters.start_phase(PHASE_POPULATE, Some(project_files.len()));
 
     // (prewarm phase deleted — confirmed redundant after the
     // fan-out refactor. The populate phase below already
@@ -326,6 +336,7 @@ pub(crate) fn build_project_graph(
         // commit message for the hazard.
         let dist_db: ProjectDatabase = db.clone();
         let files_ref: &[File] = &project_files;
+        let counters_ref = Arc::clone(counters);
         let run_populate = move || {
             use salsa::Database as _;
             dist_db.attach(|local_db| {
@@ -335,6 +346,7 @@ pub(crate) fn build_project_graph(
                 for &file in files_ref {
                     let db_tx = db_tx.clone();
                     let db_rx = db_rx.clone();
+                    let counters_inner = Arc::clone(&counters_ref);
                     s.spawn(move |_| {
                         let local_db = db_rx.recv().expect("snapshot available");
                         local_db.attach(|local_db| {
@@ -343,6 +355,7 @@ pub(crate) fn build_project_graph(
                             let _ = file_to_ref_edges(local_db, file);
                         });
                         db_tx.send(local_db).expect("channel open");
+                        counters_inner.populate_inc();
                     });
                 }
             });
@@ -360,9 +373,12 @@ pub(crate) fn build_project_graph(
         });
     }
     let t_populate_elapsed = t_populate.elapsed();
+    counters.finish_phase(PHASE_POPULATE);
     progress.ingest.finish_and_clear();
     progress.imports.finish_and_clear();
     progress.references.finish_and_clear();
+
+    counters.start_phase(PHASE_ASSEMBLE, Some(project_files.len()));
 
     // Serial assembly pass: walk files in deterministic order,
     // assign global graph node indices to each NodeRef, translate
@@ -371,8 +387,9 @@ pub(crate) fn build_project_graph(
     // memoized from the parallel pre-populate above so this pass
     // is pure hashmap/index work plus the GIL-bound Py creation.
     let t_assemble = std::time::Instant::now();
-    let assembled = assemble_graph(py, db, &project_files, &peer_pyi_to_py)?;
+    let assembled = assemble_graph(py, db, &project_files, &peer_pyi_to_py, counters)?;
     let t_assemble_elapsed = t_assemble.elapsed();
+    counters.finish_phase(PHASE_ASSEMBLE);
 
     let mut builder = assembled.builder;
     let global_index = assembled.global_index;
@@ -381,10 +398,12 @@ pub(crate) fn build_project_graph(
     let decl_by_name_range = assembled.decl_by_name_range;
     let ref_to_global = assembled.ref_to_global;
 
+    counters.start_phase(PHASE_FQNAME, Some(builder.nodes.len()));
     let t4 = std::time::Instant::now();
     let (decl_by_fqname, module_by_fqname, imports_by_module, children_by_parent) =
-        build_fqname_indices(py, &builder);
+        build_fqname_indices(py, &builder, counters);
     let t_fqname = t4.elapsed();
+    counters.finish_phase(PHASE_FQNAME);
 
     // Class hierarchy fan-in: fold every file's per-file `class_bases`
     // payload (see `file_payload::FileNodes::class_bases`) into two
@@ -509,6 +528,7 @@ fn assemble_graph<'db>(
     db: &'db ProjectDatabase,
     project_files: &[File],
     peer_pyi_to_py: &FxHashMap<File, File>,
+    counters: &Arc<ProgressCounters>,
 ) -> PyResult<AssembledGraph<'db>> {
     // Pre-count total nodes across project_files. file_to_nodes is
     // salsa-memoized from the parallel populate phase, so this is a
@@ -631,6 +651,7 @@ fn assemble_graph<'db>(
                 }
             }
         }
+        counters.assemble_inc();
     }
 
     // Pass 2: edge translation.
@@ -976,6 +997,7 @@ fn serial_lookup_or_mint<'db>(
 pub(crate) fn build_fqname_indices(
     py: Python<'_>,
     builder: &GraphBuilder,
+    counters: &Arc<ProgressCounters>,
 ) -> (
     FxHashMap<String, Vec<usize>>,
     FxHashMap<String, usize>,
@@ -987,6 +1009,7 @@ pub(crate) fn build_fqname_indices(
     let mut imports_by_module: FxHashMap<String, Vec<usize>> = FxHashMap::default();
     let mut children_by_parent: FxHashMap<String, Vec<usize>> = FxHashMap::default();
     for (idx, node_py) in builder.nodes.iter().enumerate() {
+        counters.fqname_inc();
         let node = node_py.borrow(py);
         // `OVERLOAD`-flagged decls (the `@typing.overload`-decorated
         // stubs of an in-file overload group) are excluded from the
@@ -1083,6 +1106,13 @@ pub(crate) struct ProjectContext {
     /// When true, ``materialize`` and ``build_project_graph`` draw
     /// indicatif progress bars to stderr.
     pub(crate) show_progress: bool,
+    /// GIL-free atomic counters shared between the build pipeline
+    /// and a Python-side polling thread (see
+    /// :func:`crate::progress::ProgressCounters`). Created once per
+    /// ``ProjectContext`` and reset between successive ``materialize``
+    /// calls so callers can re-use a context. The Python polling
+    /// thread reads snapshots via :meth:`read_progress_snapshot`.
+    pub(crate) progress: Arc<ProgressCounters>,
     /// Optional override for the rayon worker stack size (bytes)
     /// used by the populate phase. `None` (the default) uses the
     /// global rayon pool, which honours rayon's own size (2 MiB
@@ -1126,6 +1156,7 @@ impl ProjectContext {
             regex_cache: Mutex::new(FxHashMap::default()),
             show_progress,
             stack_size: None,
+            progress: Arc::new(ProgressCounters::new()),
         })
     }
 
@@ -1197,11 +1228,19 @@ impl ProjectContext {
     pub(crate) fn materialize(slf: Py<Self>, py: Python<'_>) -> PyResult<NativeGraph> {
         let show_progress = slf.borrow(py).show_progress;
         let stack_size = slf.borrow(py).stack_size;
-        {
+        let counters = Arc::clone(&slf.borrow(py).progress);
+        let build_result = {
             let mut this = slf.borrow_mut(py);
-            let outputs = build_project_graph(py, &mut this.db, show_progress, stack_size)?;
-            *this.outputs.write() = Some(outputs);
-        }
+            build_project_graph(py, &mut this.db, show_progress, stack_size, &counters)
+        };
+        let outputs = match build_result {
+            Ok(o) => o,
+            Err(e) => {
+                counters.mark_finished();
+                return Err(e);
+            }
+        };
+        *slf.borrow(py).outputs.write() = Some(outputs);
 
         // Serial plugin pass (legacy / fallback path). Concurrent
         // execution is driven from Python — see
@@ -1215,21 +1254,29 @@ impl ProjectContext {
             .map(|p| p.clone_ref(py))
             .collect();
         let plugin_bar = ProgressBars::plugin_bar(show_progress, plugins.len() as u64);
-        let mut prepared: Vec<PreparedOp> = Vec::new();
-        for plugin in &plugins {
-            let plugin_name: String = plugin
-                .bind(py)
-                .get_type()
-                .getattr("__qualname__")
-                .ok()
-                .and_then(|n| n.extract().ok())
-                .unwrap_or_else(|| "<unnamed>".to_string());
-            plugin_bar.set_message(plugin_name);
-            collect_prepared_plugin_ops(py, &slf, plugin, &mut prepared)?;
-            plugin_bar.inc(1);
-        }
+        counters.start_phase(PHASE_PLUGINS, Some(plugins.len()));
+        let plugin_result = (|| -> PyResult<()> {
+            let mut prepared: Vec<PreparedOp> = Vec::new();
+            for plugin in &plugins {
+                let plugin_name: String = plugin
+                    .bind(py)
+                    .get_type()
+                    .getattr("__qualname__")
+                    .ok()
+                    .and_then(|n| n.extract().ok())
+                    .unwrap_or_else(|| "<unnamed>".to_string());
+                plugin_bar.set_message(plugin_name);
+                collect_prepared_plugin_ops(py, &slf, plugin, &mut prepared)?;
+                plugin_bar.inc(1);
+                counters.plugins_inc();
+            }
+            apply_prepared_batch(&slf, py, prepared)?;
+            Ok(())
+        })();
         plugin_bar.finish_and_clear();
-        apply_prepared_batch(&slf, py, prepared)?;
+        counters.finish_phase(PHASE_PLUGINS);
+        counters.mark_finished();
+        plugin_result?;
 
         // Snapshot a fresh ``NativeGraph`` from the builder's
         // interned node + edge vecs; the originals stay put.
@@ -1332,10 +1379,85 @@ impl ProjectContext {
     pub(crate) fn build_only(slf: Py<Self>, py: Python<'_>) -> PyResult<()> {
         let show_progress = slf.borrow(py).show_progress;
         let stack_size = slf.borrow(py).stack_size;
+        let counters = Arc::clone(&slf.borrow(py).progress);
         let mut this = slf.borrow_mut(py);
-        let outputs = build_project_graph(py, &mut this.db, show_progress, stack_size)?;
-        *this.outputs.write() = Some(outputs);
-        Ok(())
+        match build_project_graph(py, &mut this.db, show_progress, stack_size, &counters) {
+            Ok(outputs) => {
+                *this.outputs.write() = Some(outputs);
+                Ok(())
+            }
+            Err(e) => {
+                counters.mark_finished();
+                Err(e)
+            }
+        }
+    }
+
+    /// Atomic snapshot of the build-progress counters as a Python
+    /// dict. Called from the Python polling thread at ~100 ms cadence
+    /// to drive structured progress events. Field semantics live on
+    /// :class:`crate::progress::ProgressCounters`.
+    ///
+    /// Reading is GIL-bound + non-blocking — every counter is a
+    /// relaxed atomic load. Calling this before
+    /// :meth:`materialize` / :meth:`build_only` returns the
+    /// zero-initialised state (`phase=0`, `finished=False`).
+    ///
+    /// **Note on long-running ``materialize`` calls**: this method
+    /// takes ``&self``, which acquires a pyo3 borrow on the
+    /// ``ProjectContext``. ``materialize`` holds ``borrow_mut`` for
+    /// the full build, so a concurrent reader thread will see
+    /// "Already mutably borrowed" until the build releases. For
+    /// race-free polling, prefer :meth:`progress_handle` (returns a
+    /// shared Arc-backed handle that's read without re-borrowing
+    /// the context).
+    pub(crate) fn read_progress_snapshot<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        let snap: ProgressSnapshot = self.progress.snapshot();
+        snap.to_pydict(py)
+    }
+
+    /// Hand out a borrow-free handle over the progress counters.
+    /// The handle can be polled concurrently with a long-running
+    /// :meth:`materialize` call — it doesn't go through pyo3's
+    /// per-context borrow flag (which materialize holds mutably for
+    /// the full build).
+    pub(crate) fn progress_handle(&self) -> ProgressHandle {
+        ProgressHandle {
+            counters: Arc::clone(&self.progress),
+        }
+    }
+
+    /// Mark progress as finished. Called from Python after a build
+    /// error so the polling thread exits its loop and stops firing
+    /// events. Idempotent.
+    pub(crate) fn mark_progress_finished(&self) {
+        self.progress.mark_finished();
+    }
+
+    /// Bump the per-plugin counter. Called from Python when the
+    /// :class:`concurrent.futures.ThreadPoolExecutor` plugin pass
+    /// finishes a plugin (the rust side can't observe Python-side
+    /// completion ordering without re-entering the GIL).
+    pub(crate) fn progress_plugin_done(&self) {
+        self.progress.plugins_inc();
+    }
+
+    /// Stamp the plugins phase as started + record its total. Called
+    /// from Python before launching the
+    /// :class:`concurrent.futures.ThreadPoolExecutor`.
+    pub(crate) fn progress_plugins_start(&self, total: usize) {
+        self.progress.start_phase(PHASE_PLUGINS, Some(total));
+    }
+
+    /// Stamp the plugins phase as finished + mark the whole pipeline
+    /// finished. Called from Python once every plugin future has
+    /// resolved (or one raised).
+    pub(crate) fn progress_plugins_finish(&self) {
+        self.progress.finish_phase(PHASE_PLUGINS);
+        self.progress.mark_finished();
     }
 }
 

@@ -18,10 +18,8 @@ the env var so we exercise both.
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Iterable
-from unittest.mock import patch
 
 import pytest
 
@@ -105,9 +103,7 @@ def test_plugin_does_not_see_its_own_emission(tmp_path: Path, plugin_mode: str) 
     assert "<frozen-test-own>" in fqnames
 
 
-def test_plugin_does_not_see_other_plugins_emissions(
-    tmp_path: Path, plugin_mode: str
-) -> None:
+def test_plugin_does_not_see_other_plugins_emissions(tmp_path: Path, plugin_mode: str) -> None:
     """Plugin B can't see plugin A's emission during ``run`` —
     every plugin in the cohort starts from the same base graph.
     """
@@ -213,17 +209,12 @@ def test_intra_plugin_yield_order_preserved(tmp_path: Path, plugin_mode: str) ->
         assert m in fqnames, f"missing marker {m!r}"
 
 
-def test_descendants_query_sees_base_graph_not_emissions(
-    tmp_path: Path, plugin_mode: str
-) -> None:
+def test_descendants_query_sees_base_graph_not_emissions(tmp_path: Path, plugin_mode: str) -> None:
     """``ctx.descendants`` issued from inside a plugin walks the
     *base* graph — synthetic markers the plugin emitted earlier in
     its own ``run`` don't influence the walk.
     """
-    (tmp_path / "a.py").write_text(
-        "def f(): pass\n"
-        "def g(): pass\n"
-    )
+    (tmp_path / "a.py").write_text("def f(): pass\ndef g(): pass\n")
 
     walks: list[int] = []
 
@@ -242,9 +233,7 @@ def test_descendants_query_sees_base_graph_not_emissions(
                 edges_from=[f],
                 edges_to=[g],
             )
-            walks.append(
-                sum(1 for d in ctx.descendants(f) if d.fqname == "<frozen-walk-target>")
-            )
+            walks.append(sum(1 for d in ctx.descendants(f) if d.fqname == "<frozen-walk-target>"))
 
     class _Noop(Plugin):
         def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:  # pragma: no cover

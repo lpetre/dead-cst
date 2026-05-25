@@ -417,6 +417,56 @@ class ProjectContext:
         without re-running :meth:`materialize`."""
         ...
 
+    def read_progress_snapshot(self) -> dict[str, int]:
+        """Atomic snapshot of the build-progress counters as a plain
+        :class:`dict`. Drives :class:`dead_cst.Analysis`'s polling
+        thread; user code should prefer the structured
+        ``progress_callback`` API on :class:`dead_cst.Analysis`.
+
+        The dict has integer values; the ``phase`` discriminant maps
+        to one of :data:`dead_cst.analyze.PROGRESS_PHASES`.
+
+        ``materialize`` holds the context's ``borrow_mut`` for the
+        whole build, so a concurrent polling thread calling this
+        method will see ``RuntimeError("Already mutably borrowed")``
+        until the build releases. For race-free polling, use
+        :meth:`progress_handle` instead — the returned handle reads
+        the same atomic counters without touching pyo3's borrow flag."""
+        ...
+
+    def progress_handle(self) -> "ProgressHandle":
+        """Mint a borrow-free handle over the progress counters.
+        The handle holds an :class:`Arc` over the rust-side atomics
+        so the polling thread can call :meth:`ProgressHandle.snapshot`
+        concurrently with a long-running ``materialize`` call (which
+        keeps the context's ``borrow_mut`` token held for the entire
+        build)."""
+        ...
+
+    def mark_progress_finished(self) -> None:
+        """Force the build-progress ``finished`` atomic to ``True``.
+        Used by :class:`dead_cst.Analysis` after a build error so the
+        polling thread exits cleanly. Idempotent."""
+        ...
+
+    def progress_plugin_done(self) -> None:
+        """Bump the plugins-done counter by one. Used by the Python
+        :class:`concurrent.futures.ThreadPoolExecutor` plugin pass to
+        signal per-plugin completion to the polling thread."""
+        ...
+
+    def progress_plugins_start(self, total: int) -> None:
+        """Stamp the plugins phase as started + record its total.
+        Called by :class:`dead_cst.Analysis` before launching the
+        :class:`concurrent.futures.ThreadPoolExecutor`."""
+        ...
+
+    def progress_plugins_finish(self) -> None:
+        """Stamp the plugins phase as finished + mark the whole
+        build pipeline finished. Called by :class:`dead_cst.Analysis`
+        once every plugin future has resolved."""
+        ...
+
     def query(self) -> QueryBuilder:
         """Open a chainable query builder against this context.
 
@@ -1365,6 +1415,24 @@ class GraphMetadata:
     file_count: int
     line_count: int
     user_meta: list[tuple[str, str]]
+
+class ProgressHandle:
+    """Borrow-free view over the build-progress atomic counters.
+
+    Created by :meth:`ProjectContext.progress_handle` — the handle
+    holds a shared ``Arc`` over the rust counters, so calling
+    :meth:`snapshot` is GIL-bound but doesn't go through the pyo3
+    borrow flag that ``materialize`` holds for the entire build. The
+    Python polling thread driving
+    :class:`dead_cst.Analysis`'s ``progress_callback`` API uses this
+    handle to read counters concurrently with a long-running build.
+    """
+
+    def snapshot(self) -> dict[str, int]:
+        """Atomic snapshot of every counter as a plain Python dict
+        (``int`` values; ``finished`` is ``bool``). Same key set as
+        :meth:`ProjectContext.read_progress_snapshot`."""
+        ...
 
 def write_graph(
     path: str,
