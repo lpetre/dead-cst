@@ -10,6 +10,13 @@ two versions.
 ## [Unreleased]
 
 ### Added
+- `BatchDispatchAppPlugin` — composes a list of `DispatchAppPlugin`
+  instances and runs them with fused queries. Same observable output
+  as registering every wrapped plugin individually, but the
+  construction / factory / variable scans run once across the union
+  of all plugins' configs instead of once per plugin. Per-plugin
+  emission stays in `_emit_ops` (newly extracted), called once per
+  wrapped plugin against the shared row/var fetches.
 - `AddEntrypointByIdx` graph op — index-keyed sibling of
   `AddEntrypoint`. Takes a positional index into `ctx.nodes()`; the
   apply pass reads the decl's `fqname` / `path` on the rust side to

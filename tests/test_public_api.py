@@ -34,6 +34,7 @@ EXPECTED_PUBLIC_API: dict[str, list[str]] = {
         "write_graph",
     ],
     "dead_cst.plugins": [
+        "BatchDispatchAppPlugin",
         "DecoratedDeclPlugin",
         "DispatchAppPlugin",
         "DynamicImportFallbackPlugin",
