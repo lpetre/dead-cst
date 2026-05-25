@@ -1449,7 +1449,7 @@ class ProgressHandle:
     handle to read counters concurrently with a long-running build.
     """
 
-    def snapshot(self) -> dict[str, int]:
+    def snapshot(self) -> dict[str, object]:
         """Atomic snapshot of every counter as a plain Python dict
         (``int`` values; ``finished`` is ``bool``). Same key set as
         :meth:`ProjectContext.read_progress_snapshot`."""

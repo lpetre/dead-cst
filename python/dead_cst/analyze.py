@@ -231,36 +231,42 @@ class _ProgressPoller:
                 # without one here to avoid racing against it.
                 return
 
-    def _dispatch(self, snap: dict[str, int]) -> None:
+    def _dispatch(self, snap: dict[str, object]) -> None:
         # Map snapshot fields to per-phase (done, total, elapsed_us).
+        # The snapshot dict is ``dict[str, object]`` since
+        # ``plugin_states`` is a list-of-tuples; every other value is
+        # an int. Read with a per-key ``int(...)`` cast so the type
+        # checker sees the narrow type without giving up the heterogeneous
+        # dict shape.
+        def _i(key: str) -> int:
+            v = snap[key]
+            assert isinstance(v, int), f"expected int for {key!r}, got {type(v).__name__}"
+            return v
+
         phase_stats: dict[str, tuple[int, int, int]] = {
-            "enum": (
-                snap["enum_done"],
-                snap["enum_total"],
-                snap["enum_elapsed_us"],
-            ),
+            "enum": (_i("enum_done"), _i("enum_total"), _i("enum_elapsed_us")),
             "populate": (
-                snap["populate_done"],
-                snap["populate_total"],
-                snap["populate_elapsed_us"],
+                _i("populate_done"),
+                _i("populate_total"),
+                _i("populate_elapsed_us"),
             ),
             "assemble": (
-                snap["assemble_done"],
-                snap["assemble_total"],
-                snap["assemble_elapsed_us"],
+                _i("assemble_done"),
+                _i("assemble_total"),
+                _i("assemble_elapsed_us"),
             ),
             "fqname": (
-                snap["fqname_done"],
-                snap["fqname_total"],
-                snap["fqname_elapsed_us"],
+                _i("fqname_done"),
+                _i("fqname_total"),
+                _i("fqname_elapsed_us"),
             ),
             "plugins": (
-                snap["plugins_done"],
-                snap["plugins_total"],
-                snap["plugins_elapsed_us"],
+                _i("plugins_done"),
+                _i("plugins_total"),
+                _i("plugins_elapsed_us"),
             ),
         }
-        current_phase_id = snap["phase"]
+        current_phase_id = _i("phase")
 
         for name in PROGRESS_PHASES:
             done, total, elapsed_us = phase_stats[name]
@@ -372,10 +378,26 @@ class _ProgressPoller:
         parallel ``ThreadPoolExecutor`` pass — each slot writes only
         to its own atomic so attribution is exact.
         """
-        states = snap.get("plugin_states") or []
-        plugin_total = total if total > 0 else len(states)
-        for idx, triple in enumerate(states):
-            name, started_us, finished_us = triple
+        raw = snap.get("plugin_states")
+        # ``raw`` is a rust-built ``list[tuple[str, u64, u64]]``.
+        # Narrow + flatten into typed locals so ty sees the field
+        # types on the unpacked names rather than ``object``.
+        if not isinstance(raw, list):
+            return
+        plugin_total = total if total > 0 else len(raw)
+        for idx, triple in enumerate(raw):
+            if not isinstance(triple, tuple) or len(triple) != 3:
+                continue
+            name_obj, started_obj, finished_obj = triple
+            if not (
+                isinstance(name_obj, str)
+                and isinstance(started_obj, int)
+                and isinstance(finished_obj, int)
+            ):
+                continue
+            name: str = name_obj
+            started_us: int = started_obj
+            finished_us: int = finished_obj
             if started_us > 0 and idx not in self._plugins_signalled_start:
                 self._plugins_signalled_start.add(idx)
                 _safe_invoke_callback(
