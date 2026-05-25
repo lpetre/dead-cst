@@ -250,7 +250,6 @@ def test_with_fqname_under_composes_with_other_predicates(build_decl_graph):
         }
     )
     fqnames = {
-        r.fqname
-        for r in native.query(ctx).decls().with_fqname_under("pkg").with_kind("function")
+        r.fqname for r in native.query(ctx).decls().with_fqname_under("pkg").with_kind("function")
     }
     assert fqnames == {"pkg.a.foo"}
