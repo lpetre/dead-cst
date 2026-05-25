@@ -42,15 +42,15 @@ mod query;
 
 use pyo3::prelude::*;
 
-use crate::builder::{AddEdge, AddEdgeByIdx, AddEntrypoint, AddNode, CollectedOps};
+use crate::builder::{AddEdge, AddEdgeByIdx, AddEntrypoint, AddNode, AddNodeByIdx, CollectedOps};
 use crate::graph::{EdgeFlags, Import, NativeGraph, NodeFlags, SymbolNode};
 use crate::io::{read_graph, write_graph, GraphMetadata};
 use crate::progress::ProgressHandle;
 use crate::project::{Project, ProjectContext};
 use crate::query::{
-    CallQuery, CallRef, ClassQuery, ConstructionQuery, ConstructionRef, DeclQuery, DecoratorQuery,
-    DecoratorRef, EdgeQuery, EdgeRef, FactoryQuery, FactoryRef, ImportQuery, QueryBuilder,
-    SubclassQuery,
+    CallIdxRef, CallQuery, CallRef, ClassQuery, ConstructionIdxRef, ConstructionQuery,
+    ConstructionRef, DeclQuery, DecoratorIdxRef, DecoratorQuery, DecoratorRef, EdgeQuery, EdgeRef,
+    FactoryIdxRef, FactoryQuery, FactoryRef, ImportQuery, QueryBuilder, SubclassQuery,
 };
 
 // ---------------------------------------------------------------------------
@@ -77,12 +77,16 @@ fn dead_cst_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<AddEdgeByIdx>()?;
     m.add_class::<AddEntrypoint>()?;
     m.add_class::<AddNode>()?;
+    m.add_class::<AddNodeByIdx>()?;
     m.add_class::<CollectedOps>()?;
     m.add_class::<NodeFlags>()?;
     m.add_class::<EdgeFlags>()?;
     m.add_class::<DecoratorRef>()?;
+    m.add_class::<DecoratorIdxRef>()?;
     m.add_class::<ConstructionRef>()?;
+    m.add_class::<ConstructionIdxRef>()?;
     m.add_class::<CallRef>()?;
+    m.add_class::<CallIdxRef>()?;
     m.add_class::<QueryBuilder>()?;
     m.add_class::<DecoratorQuery>()?;
     m.add_class::<ConstructionQuery>()?;
@@ -92,6 +96,7 @@ fn dead_cst_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ClassQuery>()?;
     m.add_class::<FactoryQuery>()?;
     m.add_class::<FactoryRef>()?;
+    m.add_class::<FactoryIdxRef>()?;
     m.add_class::<EdgeQuery>()?;
     m.add_class::<EdgeRef>()?;
     m.add_class::<DeclQuery>()?;

@@ -1766,20 +1766,19 @@ impl ProjectContext {
         fqname: &str,
     ) -> PyResult<Vec<Py<SymbolNode>>> {
         let outputs = self.materialized("find_declarations")?;
-        // Try exact match first, then strip trailing segments.
-        let mut prefix = fqname;
-        loop {
-            if let Some(idxs) = outputs.decl_by_fqname.get(prefix) {
-                return Ok(idxs
-                    .iter()
-                    .map(|&i| outputs.builder.nodes[i].clone_ref(py))
-                    .collect());
-            }
-            match prefix.rsplit_once('.') {
-                Some((parent, _)) => prefix = parent,
-                None => return Ok(Vec::new()),
-            }
-        }
+        let indices = find_declarations_indices_in(&outputs, fqname);
+        Ok(indices
+            .into_iter()
+            .map(|i| outputs.builder.nodes[i].clone_ref(py))
+            .collect())
+    }
+
+    /// Idx-only variant of :meth:`find_declarations`. Same walk-back
+    /// rules, returns positional indices into ``ctx.nodes()`` rather
+    /// than allocating ``Py<SymbolNode>`` clones.
+    pub(crate) fn find_declarations_indices(&self, fqname: &str) -> PyResult<Vec<usize>> {
+        let outputs = self.materialized("find_declarations_indices")?;
+        Ok(find_declarations_indices_in(&outputs, fqname))
     }
 
     /// Return the module node for the given dotted fqname, if it
@@ -1808,13 +1807,28 @@ impl ProjectContext {
         path: &str,
     ) -> PyResult<Option<Py<SymbolNode>>> {
         let outputs = self.materialized("module_for")?;
-        let Some(&file) = outputs.path_to_file.get(path) else {
-            return Ok(None);
-        };
-        let Some(&idx) = outputs.module_nodes_by_file.get(&file) else {
-            return Ok(None);
-        };
-        Ok(Some(outputs.builder.nodes[idx].clone_ref(py)))
+        Ok(module_for_idx_in(&outputs, path).map(|idx| outputs.builder.nodes[idx].clone_ref(py)))
+    }
+
+    /// Idx-only variant of :meth:`module_for`. Same O(1) lookup,
+    /// returns the positional index into ``ctx.nodes()`` (``None`` if
+    /// ``path`` doesn't name a project module).
+    pub(crate) fn module_for_indices(&self, path: &str) -> PyResult<Option<usize>> {
+        let outputs = self.materialized("module_for_indices")?;
+        Ok(module_for_idx_in(&outputs, path))
+    }
+
+    /// Bulk form of :meth:`module_for_indices`. One materialize check
+    /// + one ``path_to_file`` / ``module_nodes_by_file`` lookup per
+    /// path; missing paths map to ``None``. Lets plugins that
+    /// ``module_for(path)`` once per ref row collapse N FFI hops into
+    /// one.
+    pub(crate) fn modules_for_paths(&self, paths: Vec<String>) -> PyResult<Vec<Option<usize>>> {
+        let outputs = self.materialized("modules_for_paths")?;
+        Ok(paths
+            .iter()
+            .map(|p| module_for_idx_in(&outputs, p))
+            .collect())
     }
 
     /// Resolve a dotted FQN to either a declaration or a module node.
@@ -1863,39 +1877,23 @@ impl ProjectContext {
         module_fqn: &str,
     ) -> PyResult<Vec<Py<SymbolNode>>> {
         let outputs = self.materialized("module_surface")?;
-        let Some(&module_idx) = outputs.module_by_fqname.get(module_fqn) else {
-            return Ok(Vec::new());
-        };
-        let mut out = vec![outputs.builder.nodes[module_idx].clone_ref(py)];
-        // BFS over the fqname tree. Recurse only into module children:
-        // a decl ``pkg.foo.MyClass`` doesn't have submodule descendants,
-        // so chasing its sub-fqnames would just be wasted lookups.
-        // Queue holds owned ``String``s because ``children_by_parent``
-        // keys are owned strings and ``SymbolNode.fqname`` lives behind
-        // a ``PyRef`` guard that can't be held across iterations.
-        let mut queue: std::collections::VecDeque<String> =
-            std::collections::VecDeque::from([module_fqn.to_string()]);
-        while let Some(parent) = queue.pop_front() {
-            let Some(children) = outputs.children_by_parent.get(parent.as_str()) else {
-                continue;
-            };
-            for &child_idx in children {
-                let child_py = &outputs.builder.nodes[child_idx];
-                let child = child_py.borrow(py);
-                let is_module = child.kind == "module";
-                let child_fqname = if is_module {
-                    Some(child.fqname.clone())
-                } else {
-                    None
-                };
-                drop(child);
-                out.push(child_py.clone_ref(py));
-                if let Some(fqn) = child_fqname {
-                    queue.push_back(fqn);
-                }
-            }
-        }
-        Ok(out)
+        let indices = module_surface_indices_in(&outputs, py, module_fqn);
+        Ok(indices
+            .into_iter()
+            .map(|i| outputs.builder.nodes[i].clone_ref(py))
+            .collect())
+    }
+
+    /// Idx-only variant of :meth:`module_surface`. Same BFS over the
+    /// fqname tree; returns positional indices into ``ctx.nodes()``
+    /// instead of allocating ``Py<SymbolNode>`` clones.
+    pub(crate) fn module_surface_indices(
+        &self,
+        py: Python<'_>,
+        module_fqn: &str,
+    ) -> PyResult<Vec<usize>> {
+        let outputs = self.materialized("module_surface_indices")?;
+        Ok(module_surface_indices_in(&outputs, py, module_fqn))
     }
 
     /// Batched form of :meth:`module_surface`. Resolves every fqname
@@ -1904,60 +1902,32 @@ impl ProjectContext {
     /// per-call materialize-lookup + N scans collapse to one of each.
     /// Returns a dict keyed by input fqname; missing modules map to
     /// empty lists. Duplicate inputs share the same result list.
+    /// Idx-only variant of :meth:`module_surfaces`. Same single-sweep
+    /// scan; the per-fqname buckets carry positional indices into
+    /// ``ctx.nodes()`` instead of allocated ``Py<SymbolNode>`` clones.
+    pub(crate) fn module_surfaces_indices(
+        &self,
+        module_fqns: Vec<String>,
+    ) -> PyResult<FxHashMap<String, Vec<usize>>> {
+        let outputs = self.materialized("module_surfaces_indices")?;
+        Ok(module_surfaces_indices_in(&outputs, &module_fqns))
+    }
+
     pub(crate) fn module_surfaces(
         &self,
         py: Python<'_>,
         module_fqns: Vec<String>,
     ) -> PyResult<FxHashMap<String, Vec<Py<SymbolNode>>>> {
         let outputs = self.materialized("module_surfaces")?;
-        // Deduplicate the requested fqnames + pre-stage each one's
-        // (prefix, output vec) so a single map iteration can drop
-        // matches into the right bucket. Skip fqnames that don't name
-        // a project module — same per-call short-circuit as the
-        // singular ``module_surface``.
+        let idx_buckets = module_surfaces_indices_in(&outputs, &module_fqns);
         let mut buckets: FxHashMap<String, Vec<Py<SymbolNode>>> =
-            FxHashMap::with_capacity_and_hasher(module_fqns.len(), Default::default());
-        let mut prefixes: Vec<(String, String)> = Vec::with_capacity(module_fqns.len());
-        for fqn in &module_fqns {
-            if buckets.contains_key(fqn) {
-                continue;
-            }
-            let Some(&module_idx) = outputs.module_by_fqname.get(fqn) else {
-                buckets.insert(fqn.clone(), Vec::new());
-                continue;
-            };
-            buckets.insert(
-                fqn.clone(),
-                vec![outputs.builder.nodes[module_idx].clone_ref(py)],
-            );
-            prefixes.push((fqn.clone(), format!("{fqn}.")));
-        }
-        if prefixes.is_empty() {
-            return Ok(buckets);
-        }
-        // Single sweep over each map; per-fqname row goes into every
-        // bucket whose prefix matches. K small (≤ inputs), so the
-        // nested-loop ``starts_with`` is fine — a prefix trie would
-        // only help for K in the hundreds.
-        for (fqname, &idx) in &outputs.module_by_fqname {
-            for (key, prefix) in &prefixes {
-                if fqname.starts_with(prefix) {
-                    buckets
-                        .get_mut(key)
-                        .expect("seeded above")
-                        .push(outputs.builder.nodes[idx].clone_ref(py));
-                }
-            }
-        }
-        for (fqname, idxs) in &outputs.decl_by_fqname {
-            for (key, prefix) in &prefixes {
-                if fqname.starts_with(prefix) {
-                    let bucket = buckets.get_mut(key).expect("seeded above");
-                    for &idx in idxs {
-                        bucket.push(outputs.builder.nodes[idx].clone_ref(py));
-                    }
-                }
-            }
+            FxHashMap::with_capacity_and_hasher(idx_buckets.len(), Default::default());
+        for (key, idxs) in idx_buckets {
+            let nodes = idxs
+                .into_iter()
+                .map(|idx| outputs.builder.nodes[idx].clone_ref(py))
+                .collect();
+            buckets.insert(key, nodes);
         }
         Ok(buckets)
     }
@@ -2296,7 +2266,28 @@ impl ProjectContext {
     /// range — same shape ``MainBlockPlugin``'s libcst path computes
     /// from the visitor's payload.
     pub(crate) fn find_main_blocks(&self, py: Python<'_>) -> PyResult<Vec<MainBlock>> {
+        let indexed = self.find_main_blocks_indices()?;
         let outputs = self.materialized("find_main_blocks")?;
+        Ok(indexed
+            .into_iter()
+            .map(|(module_idx, decl_idxs)| {
+                let module = outputs.builder.nodes[module_idx].clone_ref(py);
+                let decls = decl_idxs
+                    .into_iter()
+                    .map(|i| outputs.builder.nodes[i].clone_ref(py))
+                    .collect();
+                (module, decls)
+            })
+            .collect())
+    }
+
+    /// Idx-only variant of :meth:`find_main_blocks`. Returns
+    /// ``(module_idx, [decl_idx])`` pairs into ``ctx.nodes()`` rather
+    /// than allocating ``Py<SymbolNode>`` clones. Same single-pass
+    /// ``__main__`` substring filter + ``find_main_block_range`` +
+    /// global-index bucketing as the node form.
+    pub(crate) fn find_main_blocks_indices(&self) -> PyResult<Vec<(usize, Vec<usize>)>> {
+        let outputs = self.materialized("find_main_blocks_indices")?;
 
         // First pass: identify files that actually contain a top-level
         // ``if __name__ == "__main__":`` block. The cheap ``__main__``
@@ -2341,17 +2332,17 @@ impl ProjectContext {
             }
         }
 
-        let mut out: Vec<MainBlock> = Vec::with_capacity(hits.len());
+        let mut out: Vec<(usize, Vec<usize>)> = Vec::with_capacity(hits.len());
         for (file, module_idx, (block_start, block_end)) in hits {
-            let mut decls: Vec<Py<SymbolNode>> = Vec::new();
+            let mut decl_idxs: Vec<usize> = Vec::new();
             if let Some(file_decls) = decls_by_file.get(&file) {
                 for &(start, end, idx) in file_decls {
                     if start >= block_start && end <= block_end {
-                        decls.push(outputs.builder.nodes[idx].clone_ref(py));
+                        decl_idxs.push(idx);
                     }
                 }
             }
-            out.push((outputs.builder.nodes[module_idx].clone_ref(py), decls));
+            out.push((module_idx, decl_idxs));
         }
         Ok(out)
     }
@@ -2378,7 +2369,7 @@ impl ProjectContext {
         decorator_modules: &[String],
         decorator_names: Vec<String>,
         path_regex: Option<&str>,
-    ) -> PyResult<Vec<(Py<SymbolNode>, CallArgs)>> {
+    ) -> PyResult<Vec<(usize, CallArgs)>> {
         let outputs = self.materialized("find_decorated_decls")?;
         let path_re = _compile_path_regex(path_regex)?;
         let names: FxHashSet<&str> = decorator_names.iter().map(String::as_str).collect();
@@ -2436,10 +2427,8 @@ impl ProjectContext {
                 local
             })
         });
-        Ok(pairs
-            .into_iter()
-            .map(|(idx, call_args)| (outputs.builder.nodes[idx].clone_ref(py), call_args))
-            .collect())
+        drop(outputs);
+        Ok(pairs)
     }
 
     /// Find top-level ``<var> = <Ctor>(...)`` constructions where
@@ -2463,7 +2452,7 @@ impl ProjectContext {
         modules: &[String],
         ctor_names: Vec<String>,
         path_regex: Option<&str>,
-    ) -> PyResult<Vec<(Py<SymbolNode>, String, CallArgs)>> {
+    ) -> PyResult<Vec<(usize, String, CallArgs)>> {
         let outputs = self.materialized("find_instance_constructions")?;
         let path_re = _compile_path_regex(path_regex)?;
         let allowed: FxHashSet<&str> = ctor_names.iter().map(String::as_str).collect();
@@ -2515,13 +2504,8 @@ impl ProjectContext {
                 local
             })
         });
-        let out: Vec<(Py<SymbolNode>, String, CallArgs)> = pairs
-            .into_iter()
-            .map(|(idx, name, call_args)| {
-                (outputs.builder.nodes[idx].clone_ref(py), name, call_args)
-            })
-            .collect();
-        Ok(out)
+        drop(outputs);
+        Ok(pairs)
     }
 
     /// Find top-level functions decorated with ``@<owner>.<attr>(...)``
@@ -2538,7 +2522,7 @@ impl ProjectContext {
         py: Python<'_>,
         decorator_attrs: Vec<String>,
         path_regex: Option<&str>,
-    ) -> PyResult<Vec<(String, Py<SymbolNode>, CallArgs)>> {
+    ) -> PyResult<Vec<(String, usize, CallArgs)>> {
         let outputs = self.materialized("find_handler_decorators")?;
         let path_re = _compile_path_regex(path_regex)?;
         let attrs: FxHashSet<&str> = decorator_attrs.iter().map(String::as_str).collect();
@@ -2599,12 +2583,8 @@ impl ProjectContext {
                 local
             })
         });
-        Ok(triples
-            .into_iter()
-            .map(|(name, idx, call_args)| {
-                (name, outputs.builder.nodes[idx].clone_ref(py), call_args)
-            })
-            .collect())
+        drop(outputs);
+        Ok(triples)
     }
 
     /// Like ``find_handler_decorators`` but matches the two-level form
@@ -2619,7 +2599,7 @@ impl ProjectContext {
         via_attr: &str,
         decorator_attrs: Vec<String>,
         path_regex: Option<&str>,
-    ) -> PyResult<Vec<(String, Py<SymbolNode>, CallArgs)>> {
+    ) -> PyResult<Vec<(String, usize, CallArgs)>> {
         let outputs = self.materialized("find_handler_decorators_via")?;
         let path_re = _compile_path_regex(path_regex)?;
         let attrs: FxHashSet<&str> = decorator_attrs.iter().map(String::as_str).collect();
@@ -2683,12 +2663,8 @@ impl ProjectContext {
                 local
             })
         });
-        Ok(triples
-            .into_iter()
-            .map(|(name, idx, call_args)| {
-                (name, outputs.builder.nodes[idx].clone_ref(py), call_args)
-            })
-            .collect())
+        drop(outputs);
+        Ok(triples)
     }
 
     /// Find calls of the form ``<expr>.<attr>(...)`` regardless of
@@ -2709,7 +2685,7 @@ impl ProjectContext {
         attr: &str,
         arg_index: usize,
         path_regex: Option<&str>,
-    ) -> PyResult<Vec<(Py<SymbolNode>, String, CallArgs)>> {
+    ) -> PyResult<Vec<(usize, String, CallArgs)>> {
         let outputs = self.materialized("find_calls_on_attr")?;
         let path_re = _compile_path_regex(path_regex)?;
         let decl_by_name_range = &outputs.decl_by_name_range;
@@ -2751,10 +2727,8 @@ impl ProjectContext {
                 local
             })
         });
-        Ok(triples
-            .into_iter()
-            .map(|(idx, arg, call_args)| (outputs.builder.nodes[idx].clone_ref(py), arg, call_args))
-            .collect())
+        drop(outputs);
+        Ok(triples)
     }
 }
 
@@ -2774,7 +2748,7 @@ impl ProjectContext {
         py: Python<'_>,
         modules: &[String],
         ctor_names: Vec<String>,
-    ) -> PyResult<Vec<(Py<SymbolNode>, Vec<String>)>> {
+    ) -> PyResult<Vec<(usize, Vec<String>)>> {
         let outputs = self.materialized("find_factory_decls")?;
         let allowed: FxHashSet<&str> = ctor_names.iter().map(String::as_str).collect();
         let needle_strs: Vec<&str> = ctor_names.iter().map(String::as_str).collect();
@@ -2830,10 +2804,8 @@ impl ProjectContext {
                 local
             })
         });
-        Ok(pairs
-            .into_iter()
-            .map(|(idx, kinds)| (outputs.builder.nodes[idx].clone_ref(py), kinds))
-            .collect())
+        drop(outputs);
+        Ok(pairs)
     }
 }
 
@@ -2853,7 +2825,7 @@ impl ProjectContext {
         name: &str,
         arg_index: usize,
         path_regex: Option<&str>,
-    ) -> PyResult<Vec<(Py<SymbolNode>, String, CallArgs)>> {
+    ) -> PyResult<Vec<(usize, String, CallArgs)>> {
         let outputs = self.materialized("find_calls_to_imported")?;
         let path_re = _compile_path_regex(path_regex)?;
         let allowed: FxHashSet<&str> = [name].into_iter().collect();
@@ -2911,10 +2883,8 @@ impl ProjectContext {
                 local
             })
         });
-        Ok(triples
-            .into_iter()
-            .map(|(idx, arg, call_args)| (outputs.builder.nodes[idx].clone_ref(py), arg, call_args))
-            .collect())
+        drop(outputs);
+        Ok(triples)
     }
 
     /// Find ``<owner>.<attr>(...)`` calls where ``owner`` is the textual
@@ -2937,7 +2907,7 @@ impl ProjectContext {
         arg_index: usize,
         required_positional: Option<usize>,
         path_regex: Option<&str>,
-    ) -> PyResult<Vec<(Py<SymbolNode>, String, CallArgs)>> {
+    ) -> PyResult<Vec<(usize, String, CallArgs)>> {
         let outputs = self.materialized("find_calls_on_var")?;
         let path_re = _compile_path_regex(path_regex)?;
         let decl_by_name_range = &outputs.decl_by_name_range;
@@ -2984,10 +2954,8 @@ impl ProjectContext {
                 local
             })
         });
-        Ok(triples
-            .into_iter()
-            .map(|(idx, arg, call_args)| (outputs.builder.nodes[idx].clone_ref(py), arg, call_args))
-            .collect())
+        drop(outputs);
+        Ok(triples)
     }
 }
 
@@ -3120,6 +3088,117 @@ impl ProjectContext {
     }
 }
 
+/// Shared BFS used by :meth:`ProjectContext::module_surface` and
+/// :meth:`module_surface_indices` — the module index, then every
+/// transitive child node (modules recursed into; non-module decls
+/// surfaced but not chased for sub-fqnames).
+fn module_surface_indices_in(
+    outputs: &BuildOutputs,
+    py: Python<'_>,
+    module_fqn: &str,
+) -> Vec<usize> {
+    let Some(&module_idx) = outputs.module_by_fqname.get(module_fqn) else {
+        return Vec::new();
+    };
+    let mut out: Vec<usize> = vec![module_idx];
+    let mut queue: std::collections::VecDeque<String> =
+        std::collections::VecDeque::from([module_fqn.to_string()]);
+    while let Some(parent) = queue.pop_front() {
+        let Some(children) = outputs.children_by_parent.get(parent.as_str()) else {
+            continue;
+        };
+        for &child_idx in children {
+            let child_py = &outputs.builder.nodes[child_idx];
+            let child = child_py.borrow(py);
+            let is_module = child.kind == "module";
+            let child_fqname = if is_module {
+                Some(child.fqname.clone())
+            } else {
+                None
+            };
+            drop(child);
+            out.push(child_idx);
+            if let Some(fqn) = child_fqname {
+                queue.push_back(fqn);
+            }
+        }
+    }
+    out
+}
+
+/// Shared bulk-resolution loop used by
+/// :meth:`ProjectContext::module_surfaces` and
+/// :meth:`module_surfaces_indices`: dedupe the input fqnames, seed
+/// each requested bucket with its module idx (if any), then sweep
+/// ``module_by_fqname`` + ``decl_by_fqname`` once and drop matches
+/// into every bucket whose prefix lights up.
+fn module_surfaces_indices_in(
+    outputs: &BuildOutputs,
+    module_fqns: &[String],
+) -> FxHashMap<String, Vec<usize>> {
+    let mut buckets: FxHashMap<String, Vec<usize>> =
+        FxHashMap::with_capacity_and_hasher(module_fqns.len(), Default::default());
+    let mut prefixes: Vec<(String, String)> = Vec::with_capacity(module_fqns.len());
+    for fqn in module_fqns {
+        if buckets.contains_key(fqn) {
+            continue;
+        }
+        let Some(&module_idx) = outputs.module_by_fqname.get(fqn) else {
+            buckets.insert(fqn.clone(), Vec::new());
+            continue;
+        };
+        buckets.insert(fqn.clone(), vec![module_idx]);
+        prefixes.push((fqn.clone(), format!("{fqn}.")));
+    }
+    if prefixes.is_empty() {
+        return buckets;
+    }
+    // Single sweep — K small (≤ inputs), so the nested ``starts_with``
+    // is fine. Mirrors the original ``module_surfaces`` body, just
+    // staying in idx-space.
+    for (fqname, &idx) in &outputs.module_by_fqname {
+        for (key, prefix) in &prefixes {
+            if fqname.starts_with(prefix) {
+                buckets.get_mut(key).expect("seeded above").push(idx);
+            }
+        }
+    }
+    for (fqname, idxs) in &outputs.decl_by_fqname {
+        for (key, prefix) in &prefixes {
+            if fqname.starts_with(prefix) {
+                let bucket = buckets.get_mut(key).expect("seeded above");
+                bucket.extend(idxs.iter().copied());
+            }
+        }
+    }
+    buckets
+}
+
+/// `path -> module-node idx`, shared by :meth:`ProjectContext::module_for`,
+/// :meth:`module_for_indices`, and :meth:`modules_for_paths`. Returns
+/// ``None`` when the path doesn't name a project module.
+fn module_for_idx_in(outputs: &BuildOutputs, path: &str) -> Option<usize> {
+    let &file = outputs.path_to_file.get(path)?;
+    outputs.module_nodes_by_file.get(&file).copied()
+}
+
+/// Walk-back lookup shared by :meth:`ProjectContext::find_declarations`
+/// and :meth:`ProjectContext::find_declarations_indices` — try an exact
+/// match first, then strip trailing dotted segments until either a
+/// decl bucket lands or no parent remains.
+fn find_declarations_indices_in(outputs: &BuildOutputs, fqname: &str) -> Vec<usize> {
+    let mut prefix = fqname;
+    loop {
+        if let Some(idxs) = outputs.decl_by_fqname.get(prefix) {
+            return idxs.clone();
+        }
+        match prefix.rsplit_once('.') {
+            Some((parent, _)) => prefix = parent,
+            None => return Vec::new(),
+        }
+    }
+}
+
 /// BFS from `seed_idx` through `children_by_node`. Returns the
 /// transitive closure (excluding the seed itself).
 fn transitive_subclasses_via_index(
@@ -3152,7 +3231,7 @@ impl ProjectContext {
         py: Python<'_>,
         decorator_fqn: &str,
         path_regex: Option<&str>,
-    ) -> PyResult<Vec<(Py<SymbolNode>, CallArgs)>> {
+    ) -> PyResult<Vec<(usize, CallArgs)>> {
         let Some((module, name)) = decorator_fqn.rsplit_once('.') else {
             return Err(PyValueError::new_err(format!(
                 "expected a dotted decorator fqn (e.g. 'pytest.fixture'), got {decorator_fqn:?}"
@@ -3169,7 +3248,7 @@ impl ProjectContext {
         class_fqn: &str,
         include_subclasses: bool,
         path_regex: Option<&str>,
-    ) -> PyResult<Vec<(Py<SymbolNode>, CallArgs)>> {
+    ) -> PyResult<Vec<(usize, CallArgs)>> {
         let Some((module, name)) = class_fqn.rsplit_once('.') else {
             return Err(PyValueError::new_err(format!(
                 "expected a dotted class fqn, got {class_fqn:?}"
@@ -3194,7 +3273,7 @@ impl ProjectContext {
         let triples = self.find_instance_constructions(py, &modules, ctors, path_regex)?;
         Ok(triples
             .into_iter()
-            .map(|(node, _name, call_args)| (node, call_args))
+            .map(|(idx, _name, call_args)| (idx, call_args))
             .collect())
     }
 
@@ -3205,18 +3284,19 @@ impl ProjectContext {
         instance: &SymbolNode,
         method_names: Vec<String>,
         path_regex: Option<&str>,
-    ) -> PyResult<Vec<(Py<SymbolNode>, CallArgs)>> {
+    ) -> PyResult<Vec<(usize, CallArgs)>> {
         let instance_simple = instance.fqname.rsplit('.').next().unwrap_or("").to_string();
         let handlers = self.find_handler_decorators(py, method_names, path_regex)?;
-        let mut out = Vec::new();
-        for (owner_name, handler, call_args) in handlers {
+        let outputs = self.materialized("find_decorations_on")?;
+        let mut out: Vec<(usize, CallArgs)> = Vec::new();
+        for (owner_name, handler_idx, call_args) in handlers {
             if owner_name != instance_simple {
                 continue;
             }
-            if handler.borrow(py).path != instance.path {
+            if outputs.builder.nodes[handler_idx].borrow(py).path != instance.path {
                 continue;
             }
-            out.push((handler, call_args));
+            out.push((handler_idx, call_args));
         }
         Ok(out)
     }
@@ -3744,6 +3824,38 @@ impl ProjectContext {
                 )));
             }
             out.push(outputs.builder.nodes[idx].clone_ref(py));
+        }
+        Ok(out)
+    }
+
+    /// Batched snapshot of ``(kind, path, fqname, flags)`` for each
+    /// index in ``indices``. One FFI hop instead of N per-attribute
+    /// ``borrow`` round-trips — lets plugins that filter / partition by
+    /// these four fields stay GIL-free in the inner loop.
+    ///
+    /// Validates bounds the same way :meth:`nodes_at` does and raises
+    /// :class:`IndexError` when any index is out of range.
+    pub(crate) fn node_attrs(
+        &self,
+        py: Python<'_>,
+        indices: Vec<usize>,
+    ) -> PyResult<Vec<(String, String, String, u32)>> {
+        let outputs = self.materialized("node_attrs")?;
+        let len = outputs.builder.nodes.len();
+        let mut out: Vec<(String, String, String, u32)> = Vec::with_capacity(indices.len());
+        for idx in indices {
+            if idx >= len {
+                return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                    "node index {idx} out of range (len={len})"
+                )));
+            }
+            let node = outputs.builder.nodes[idx].borrow(py);
+            out.push((
+                node.kind.to_string(),
+                node.path.clone(),
+                node.fqname.clone(),
+                node.flags,
+            ));
         }
         Ok(out)
     }

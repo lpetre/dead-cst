@@ -292,3 +292,403 @@ def test_add_edge_by_idx_carries_flags(tmp_path):
         if s == f_idx and d == g_idx and f == native.EdgeFlags.DEAD_BRANCH
     ]
     assert matching
+
+
+# ---------------------------------------------------------------------------
+# AddNodeByIdx — graph op
+# ---------------------------------------------------------------------------
+
+
+def test_add_node_by_idx_round_trip(tmp_path):
+    """``AddNodeByIdx`` mints a synthetic node and wires its edges from
+    positional indices, the same way ``AddNode`` does with
+    ``SymbolNode`` endpoints."""
+    from dead_cst.analyze import Analysis
+    from dead_cst.plugins._base import Plugin
+
+    (tmp_path / "mod.py").write_text("def f(): pass\ndef g(): pass\n")
+
+    class MintByIdx(Plugin):
+        name = "mint_by_idx"
+        version = 1
+
+        def run(self, ctx: native.ProjectContext):
+            f_idx = ctx.indices_where(fqname_prefix="mod.f")[0]
+            g_idx = ctx.indices_where(fqname_prefix="mod.g")[0]
+            yield native.AddNodeByIdx(
+                "<marker>:mint",
+                path="mod.py",
+                edges_from_idx=[f_idx],
+                edges_to_idx=[g_idx],
+            )
+
+    analysis = Analysis(tmp_path, plugins=[MintByIdx()])
+    ctx = analysis.materialize_all()
+    fqnames = [n.fqname for n in ctx.nodes()]
+    assert "<marker>:mint" in fqnames
+
+    marker_idx = fqnames.index("<marker>:mint")
+    f_idx = fqnames.index("mod.f")
+    g_idx = fqnames.index("mod.g")
+    edges = [(s, d) for (s, d, _f) in ctx.edges()]
+    assert (f_idx, marker_idx) in edges
+    assert (marker_idx, g_idx) in edges
+
+
+def test_add_node_by_idx_entrypoint_flag(tmp_path):
+    """``AddNodeByIdx`` honors ``NodeFlags.ENTRYPOINT`` so a multi-target
+    marker (the idiomatic non-sugar reason to prefer it over
+    ``AddEntrypoint``) makes its targets reachable."""
+    from dead_cst.analyze import Analysis
+    from dead_cst.plugins._base import Plugin
+
+    (tmp_path / "mod.py").write_text(
+        "def alive(): pass\ndef also_alive(): pass\ndef dead(): pass\n"
+    )
+
+    class SeedBoth(Plugin):
+        name = "seed_both"
+        version = 1
+
+        def run(self, ctx: native.ProjectContext):
+            a = ctx.indices_where(fqname_prefix="mod.alive")[0]
+            b = ctx.indices_where(fqname_prefix="mod.also_alive")[0]
+            yield native.AddNodeByIdx(
+                "<seed>:multi",
+                path="mod.py",
+                flags=native.NodeFlags.ENTRYPOINT,
+                edges_to_idx=[a, b],
+            )
+
+    analysis = Analysis(tmp_path, plugins=[SeedBoth()])
+    analysis.materialize_all()
+    dead_fqnames = {n.fqname for n in analysis.dead()}
+    assert "mod.alive" not in dead_fqnames
+    assert "mod.also_alive" not in dead_fqnames
+    assert "mod.dead" in dead_fqnames
+
+
+def test_add_node_by_idx_out_of_range_raises(tmp_path):
+    """An out-of-range ``edges_*_idx`` raises ``IndexError`` at apply
+    time and does *not* leave an orphan synthetic node behind."""
+    from dead_cst.analyze import Analysis
+    from dead_cst.plugins._base import Plugin
+
+    (tmp_path / "mod.py").write_text("def f(): pass\n")
+
+    class BadIdx(Plugin):
+        name = "bad_idx"
+        version = 1
+
+        def run(self, ctx: native.ProjectContext):
+            yield native.AddNodeByIdx(
+                "<should-not-land>",
+                path="mod.py",
+                edges_to_idx=[10**9],
+            )
+
+    analysis = Analysis(tmp_path, plugins=[BadIdx()])
+    with pytest.raises(IndexError, match="edges_to_idx"):
+        analysis.materialize_all()
+
+
+def test_add_node_by_idx_default_no_edges(tmp_path):
+    """A bare ``AddNodeByIdx(fqname, path=...)`` with no edges mints a
+    standalone synthetic node — same defaults as ``AddNode``."""
+    from dead_cst.analyze import Analysis
+    from dead_cst.plugins._base import Plugin
+
+    (tmp_path / "mod.py").write_text("x = 1\n")
+
+    class JustMint(Plugin):
+        name = "just_mint"
+        version = 1
+
+        def run(self, ctx: native.ProjectContext):
+            yield native.AddNodeByIdx("<bare>:marker", path="mod.py")
+
+    analysis = Analysis(tmp_path, plugins=[JustMint()])
+    ctx = analysis.materialize_all()
+    fqnames = [n.fqname for n in ctx.nodes()]
+    assert "<bare>:marker" in fqnames
+
+
+# ---------------------------------------------------------------------------
+# ctx.find_declarations_indices
+# ---------------------------------------------------------------------------
+
+
+def test_find_declarations_indices_matches_node_form(build_decl_graph):
+    ctx = build_decl_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/svc.py": "def handler(): pass\nclass Service: pass\n",
+        }
+    )
+    nodes = ctx.find_declarations("pkg.svc.handler")
+    indices = ctx.find_declarations_indices("pkg.svc.handler")
+    assert len(nodes) == len(indices) == 1
+    all_nodes = ctx.nodes()
+    assert all_nodes[indices[0]].fqname == nodes[0].fqname
+
+
+def test_find_declarations_indices_walks_back(build_decl_graph):
+    """``pkg.svc.Cls.method`` resolves to ``pkg.svc.Cls`` — methods don't
+    get their own graph node."""
+    ctx = build_decl_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/svc.py": "class Cls:\n    def method(self): pass\n",
+        }
+    )
+    indices = ctx.find_declarations_indices("pkg.svc.Cls.method")
+    revived = ctx.nodes_at(indices)
+    assert {n.fqname for n in revived} == {"pkg.svc.Cls"}
+
+
+def test_find_declarations_indices_unknown_returns_empty(build_decl_graph):
+    ctx = build_decl_graph({"pkg/__init__.py": "", "pkg/a.py": "x = 1\n"})
+    assert ctx.find_declarations_indices("nothing.here") == []
+
+
+# ---------------------------------------------------------------------------
+# ctx.module_for_indices + modules_for_paths
+# ---------------------------------------------------------------------------
+
+
+def test_module_for_indices_matches_node_form(build_decl_graph):
+    ctx = build_decl_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/svc.py": "def f(): pass\n",
+        }
+    )
+    # ``module_for`` keys on the absolute path stored on the SymbolNode.
+    svc_path = next(n.path for n in ctx.nodes() if n.fqname == "pkg.svc")
+    node = ctx.module_for(svc_path)
+    assert node is not None
+    idx = ctx.module_for_indices(svc_path)
+    assert idx is not None
+    assert ctx.nodes()[idx].fqname == node.fqname
+
+
+def test_module_for_indices_missing_path(build_decl_graph):
+    ctx = build_decl_graph({"pkg/__init__.py": "", "pkg/a.py": "x = 1\n"})
+    assert ctx.module_for_indices("/not/a/real/path.py") is None
+
+
+def test_modules_for_paths_bulk(build_decl_graph):
+    ctx = build_decl_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/svc.py": "def f(): pass\n",
+            "pkg/util.py": "def g(): pass\n",
+        }
+    )
+    svc_path = next(n.path for n in ctx.nodes() if n.fqname == "pkg.svc")
+    util_path = next(n.path for n in ctx.nodes() if n.fqname == "pkg.util")
+    results = ctx.modules_for_paths([svc_path, util_path, "/missing.py"])
+    assert len(results) == 3
+    assert results[0] is not None
+    assert results[1] is not None
+    assert results[2] is None
+    all_nodes = ctx.nodes()
+    assert all_nodes[results[0]].fqname == "pkg.svc"
+    assert all_nodes[results[1]].fqname == "pkg.util"
+
+
+# ---------------------------------------------------------------------------
+# ctx.module_surface_indices + module_surfaces_indices
+# ---------------------------------------------------------------------------
+
+
+def test_module_surface_indices_matches_node_form(build_decl_graph):
+    ctx = build_decl_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/svc.py": "def handler(): pass\nclass Service: pass\n",
+            "pkg/sub/__init__.py": "",
+            "pkg/sub/inner.py": "def deep(): pass\n",
+        }
+    )
+    nodes = ctx.module_surface("pkg")
+    indices = ctx.module_surface_indices("pkg")
+    assert len(nodes) == len(indices)
+    assert {ctx.nodes()[i].fqname for i in indices} == {n.fqname for n in nodes}
+
+
+def test_module_surface_indices_unknown_returns_empty(build_decl_graph):
+    ctx = build_decl_graph({"pkg/__init__.py": "", "pkg/a.py": "x = 1\n"})
+    assert ctx.module_surface_indices("nothing.here") == []
+
+
+def test_module_surfaces_indices_bulk(build_decl_graph):
+    ctx = build_decl_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/svc.py": "def handler(): pass\n",
+            "pkg/util.py": "def helper(): pass\n",
+            "other/__init__.py": "",
+            "other/m.py": "def m(): pass\n",
+        }
+    )
+    node_buckets = ctx.module_surfaces(["pkg", "other", "missing"])
+    idx_buckets = ctx.module_surfaces_indices(["pkg", "other", "missing"])
+    assert set(node_buckets.keys()) == set(idx_buckets.keys())
+    for key in node_buckets:
+        node_fqs = {n.fqname for n in node_buckets[key]}
+        idx_fqs = {ctx.nodes()[i].fqname for i in idx_buckets[key]}
+        assert node_fqs == idx_fqs
+
+
+# ---------------------------------------------------------------------------
+# ctx.find_main_blocks_indices
+# ---------------------------------------------------------------------------
+
+
+def test_find_main_blocks_indices_matches_node_form(build_decl_graph):
+    ctx = build_decl_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/m.py": (
+                'def helper(): pass\nif __name__ == "__main__":\n    helper()\n    x = 1\n'
+            ),
+        }
+    )
+    node_pairs = ctx.find_main_blocks()
+    idx_pairs = ctx.find_main_blocks_indices()
+    assert len(node_pairs) == len(idx_pairs) == 1
+    (mod_node, decls) = node_pairs[0]
+    (mod_idx, decl_idxs) = idx_pairs[0]
+    assert ctx.nodes()[mod_idx].fqname == mod_node.fqname
+    assert {ctx.nodes()[i].fqname for i in decl_idxs} == {d.fqname for d in decls}
+
+
+def test_find_main_blocks_indices_no_main_block(build_decl_graph):
+    ctx = build_decl_graph({"pkg/__init__.py": "", "pkg/a.py": "x = 1\n"})
+    assert ctx.find_main_blocks_indices() == []
+
+
+# ---------------------------------------------------------------------------
+# ctx.node_attrs — batched node-field snapshot
+# ---------------------------------------------------------------------------
+
+
+def test_node_attrs_round_trip(build_decl_graph):
+    ctx = build_decl_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/a.py": "def alpha(): pass\nclass Beta: pass\n",
+        }
+    )
+    all_nodes = ctx.nodes()
+    indices = list(range(len(all_nodes)))
+    rows = ctx.node_attrs(indices)
+    assert len(rows) == len(indices)
+    for idx, (kind, path, fqname, flags) in zip(indices, rows, strict=True):
+        n = all_nodes[idx]
+        assert kind == n.kind
+        assert path == n.path
+        assert fqname == n.fqname
+        assert flags == n.flags
+
+
+def test_node_attrs_subset(build_decl_graph):
+    ctx = build_decl_graph({"pkg/__init__.py": "", "pkg/a.py": "def alpha(): pass\n"})
+    indices = ctx.indices_where(kind="function", fqname_prefix="pkg.a")
+    assert len(indices) == 1
+    [(kind, path, fqname, _flags)] = ctx.node_attrs(indices)
+    assert kind == "function"
+    assert fqname == "pkg.a.alpha"
+    assert path.endswith("a.py")
+
+
+def test_node_attrs_bounds_check(build_decl_graph):
+    ctx = build_decl_graph({"pkg/__init__.py": "", "pkg/a.py": "x = 1\n"})
+    n = len(ctx.nodes())
+    with pytest.raises(IndexError, match="out of range"):
+        ctx.node_attrs([n])
+
+
+# ---------------------------------------------------------------------------
+# *Query.row_indices — index-form row terminals
+# ---------------------------------------------------------------------------
+
+
+def test_decorator_query_row_indices_matches_collect(build_decl_graph):
+    ctx = build_decl_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/svc.py": ("import functools\n@functools.lru_cache\ndef cached(): pass\n"),
+        }
+    )
+    q = native.query(ctx).decorators().where_module("functools").where_name("lru_cache")
+    refs = q.collect()
+    rows = q.row_indices()
+    assert len(refs) == len(rows) == 1
+    all_nodes = ctx.nodes()
+    for ref, row in zip(refs, rows, strict=True):
+        assert all_nodes[row.decorated_idx].fqname == ref.decorated.fqname
+        assert row.decorator_name == ref.decorator_name
+        assert row.decorator_owner == ref.decorator_owner
+        assert row.decorator_via == ref.decorator_via
+
+
+def test_construction_query_row_indices_matches_collect(build_decl_graph):
+    ctx = build_decl_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/app.py": "import flask\napp = flask.Flask(__name__)\n",
+        }
+    )
+    q = native.query(ctx).constructions().where_module("flask").where_name("Flask")
+    refs = q.collect()
+    rows = q.row_indices()
+    assert len(refs) == len(rows) == 1
+    all_nodes = ctx.nodes()
+    for ref, row in zip(refs, rows, strict=True):
+        assert all_nodes[row.var_idx].fqname == ref.var.fqname
+        assert row.class_name == ref.class_name
+
+
+def test_call_query_row_indices_matches_collect(build_decl_graph):
+    ctx = build_decl_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/app.py": (
+                'import flask\napp = flask.Flask(__name__)\napp.config.from_object("settings")\n'
+            ),
+        }
+    )
+    q = (
+        native.query(ctx)
+        .calls()
+        .where_owner("app.config")
+        .where_attr("from_object")
+        .string_arg_at(0)
+    )
+    refs = q.collect()
+    rows = q.row_indices()
+    assert len(refs) == len(rows)
+    if refs:
+        all_nodes = ctx.nodes()
+        for ref, row in zip(refs, rows, strict=True):
+            assert all_nodes[row.owner_idx].fqname == ref.owner.fqname
+            assert row.string_arg == ref.string_arg
+
+
+def test_factory_query_row_indices_matches_collect(build_decl_graph):
+    ctx = build_decl_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/factory.py": ("import flask\ndef make_app():\n    return flask.Flask(__name__)\n"),
+        }
+    )
+    q = native.query(ctx).factories().of_module("flask").where_name("Flask")
+    refs = q.collect()
+    rows = q.row_indices()
+    assert len(refs) == len(rows)
+    all_nodes = ctx.nodes()
+    for ref, row in zip(refs, rows, strict=True):
+        assert all_nodes[row.decl_idx].fqname == ref.decl.fqname
+        assert row.kinds == ref.kinds

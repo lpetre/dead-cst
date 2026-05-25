@@ -9,6 +9,55 @@ two versions.
 
 ## [Unreleased]
 
+### Added
+- Index-form siblings on `ProjectContext`: `find_declarations_indices`,
+  `module_for_indices`, `modules_for_paths`, `module_surface_indices`,
+  `module_surfaces_indices`, `find_main_blocks_indices`. Each returns
+  positional indices into `ctx.nodes()` rather than allocating
+  `Py<SymbolNode>` clones — pair with `AddEdgeByIdx` / `AddNodeByIdx` to
+  stay in idx-space end-to-end.
+- `ProjectContext.node_attrs(indices)` — batched snapshot of
+  `(kind, path, fqname, flags)` per index. One FFI hop instead of N
+  per-attribute `borrow` round-trips. Plugins that filter / partition
+  by these four fields stay GIL-free in the inner loop, which matters
+  once the plugin pass runs concurrently.
+- `.row_indices()` terminal on `DecoratorQuery`, `ConstructionQuery`,
+  `CallQuery`, `FactoryQuery`. Same dispatch as `.collect()`, but each
+  row carries a positional index (`decorated_idx` / `var_idx` /
+  `owner_idx` / `decl_idx`) instead of a `SymbolNode`, and the
+  `args` / `kwargs` row payloads are skipped. Returned rows are new
+  pyclasses `DecoratorIdxRef`, `ConstructionIdxRef`, `CallIdxRef`,
+  `FactoryIdxRef`.
+- `AddNodeByIdx` graph op — index-keyed sibling of `AddNode`.
+  Wires the freshly-minted synthetic node with positional indices
+  into `ctx.nodes()` (`edges_from_idx`, `edges_to_idx`) instead of
+  `SymbolNode` references, so plugins working in index space
+  (paired with the `.indices()` query terminals or
+  `ctx.indices_where`) don't round-trip through `Py<SymbolNode>`
+  just to wire their markers. Bounds-checked at apply time; an
+  out-of-range index raises `IndexError` before the new node is
+  interned, so a bad endpoint never leaves an unconnected
+  synthetic behind.
+
+### Changed
+- `AddNode`'s apply pass now pre-resolves every `edges_from` /
+  `edges_to` key to its builder index *before* minting the
+  synthetic node, matching the discipline `AddNodeByIdx`
+  introduces. A missing key now surfaces as a clean `ValueError`
+  without leaving an orphan node in the graph (previously the
+  synthetic was interned first, then the failing key lookup
+  aborted, stranding the new node).
+- Internal: the `ctx.find_*` helpers backing the chainable query DSL
+  (`find_decorated_decls`, `find_instance_constructions`,
+  `find_handler_decorators`, `find_handler_decorators_via`,
+  `find_calls_to_imported`, `find_calls_on_var`, `find_calls_on_attr`,
+  `find_factory_decls`, plus the `find_decorated`,
+  `find_constructions`, `find_decorations_on` thin wrappers) now
+  return `(idx, …)` tuples instead of `(Py<SymbolNode>, …)`. The
+  `Py<SymbolNode>` materialization moved into the queries' `.collect()`
+  terminals — `.row_indices()` skips it entirely. No public Python API
+  change.
+
 ## [0.12.2] - 2026-05-25
 
 ### Added

@@ -6,7 +6,7 @@
 
 use std::sync::OnceLock;
 
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyIndexError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use ruff_db::files::File;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -276,6 +276,60 @@ impl AddNode {
     }
 }
 
+/// Index-keyed variant of :class:`AddNode`. Wires the freshly-minted
+/// synthetic node with positional indices into ``ctx.nodes()`` instead
+/// of ``SymbolNode`` references for ``edges_from`` / ``edges_to``.
+///
+/// Pairs with the ``.indices()`` query terminals and
+/// :meth:`ProjectContext.indices_where` so plugins that work in index
+/// space don't have to round-trip through ``Py<SymbolNode>`` just to
+/// wire their synthetic markers. The apply pass treats it identically
+/// to :class:`AddNode` once the indices land in the builder.
+///
+/// Raises :class:`IndexError` at apply time when any endpoint is out
+/// of range for the current graph snapshot (pre-intern, so the new
+/// node is not created if any endpoint check fails).
+#[pyclass(frozen, get_all)]
+pub(crate) struct AddNodeByIdx {
+    pub(crate) fqname: String,
+    pub(crate) kind: &'static str,
+    pub(crate) path: String,
+    pub(crate) flags: u32,
+    pub(crate) edges_from_idx: Vec<usize>,
+    pub(crate) edges_to_idx: Vec<usize>,
+}
+
+#[pymethods]
+impl AddNodeByIdx {
+    #[new]
+    #[pyo3(signature = (
+        fqname,
+        *,
+        path,
+        kind = "synthetic",
+        flags = 0,
+        edges_from_idx = Vec::new(),
+        edges_to_idx = Vec::new(),
+    ))]
+    fn new(
+        fqname: String,
+        path: String,
+        kind: &str,
+        flags: u32,
+        edges_from_idx: Vec<usize>,
+        edges_to_idx: Vec<usize>,
+    ) -> PyResult<Self> {
+        Ok(Self {
+            fqname,
+            kind: intern_kind(kind)?,
+            path,
+            flags,
+            edges_from_idx,
+            edges_to_idx,
+        })
+    }
+}
+
 pub(crate) fn not_materialized(op: &str) -> PyErr {
     PyRuntimeError::new_err(format!(
         "ProjectContext.{op}() called outside an active materialize() — \
@@ -393,6 +447,14 @@ pub(crate) enum PreparedOp {
         edges_from: Vec<NodeKey>,
         edges_to: Vec<NodeKey>,
     },
+    NodeByIdx {
+        fqname: String,
+        kind: &'static str,
+        path: String,
+        flags: u32,
+        edges_from_idx: Vec<usize>,
+        edges_to_idx: Vec<usize>,
+    },
 }
 
 /// Opaque Python handle wrapping a plugin's pre-prepared op queue.
@@ -481,9 +543,19 @@ pub(crate) fn prepare_graph_op(py: Python<'_>, op: &Bound<'_, PyAny>) -> PyResul
             edges_from,
             edges_to,
         }
+    } else if let Ok(add_node_idx) = op.extract::<PyRef<AddNodeByIdx>>() {
+        PreparedOp::NodeByIdx {
+            fqname: add_node_idx.fqname.clone(),
+            kind: add_node_idx.kind,
+            path: add_node_idx.path.clone(),
+            flags: add_node_idx.flags,
+            edges_from_idx: add_node_idx.edges_from_idx.clone(),
+            edges_to_idx: add_node_idx.edges_to_idx.clone(),
+        }
     } else {
         return Err(PyValueError::new_err(format!(
-            "expected a GraphOp (AddEdge / AddEdgeByIdx / AddEntrypoint / AddNode), got {:?}",
+            "expected a GraphOp (AddEdge / AddEdgeByIdx / AddEntrypoint / AddNode / AddNodeByIdx), \
+             got {:?}",
             op.get_type().name()?,
         )));
     };
@@ -551,16 +623,8 @@ fn apply_prepared(
             flags,
         } => {
             let len = outputs.builder.nodes.len();
-            if src_idx >= len {
-                return Err(pyo3::exceptions::PyIndexError::new_err(format!(
-                    "AddEdgeByIdx: src_idx {src_idx} out of range (len={len})"
-                )));
-            }
-            if dst_idx >= len {
-                return Err(pyo3::exceptions::PyIndexError::new_err(format!(
-                    "AddEdgeByIdx: dst_idx {dst_idx} out of range (len={len})"
-                )));
-            }
+            check_idx_in_range(len, src_idx, "AddEdgeByIdx", "src_idx")?;
+            check_idx_in_range(len, dst_idx, "AddEdgeByIdx", "dst_idx")?;
             outputs.builder.add_edge(src_idx, dst_idx, flags);
             Ok(())
         }
@@ -587,20 +651,96 @@ fn apply_prepared(
             edges_from,
             edges_to,
         } => {
+            // Resolve endpoint keys to indices *before* minting the
+            // node — a missing key then surfaces as a clean
+            // ``ValueError`` without leaving an unconnected synthetic
+            // behind in the graph. Same pre-validation discipline as
+            // the ``NodeByIdx`` arm below.
+            let from_idxs = resolve_edge_keys(&outputs.builder, &edges_from, "edges_from")?;
+            let to_idxs = resolve_edge_keys(&outputs.builder, &edges_to, "edges_to")?;
             let node_idx = outputs
                 .builder
                 .intern_node(py, synthetic_node(fqname, kind, path, flags))?;
-            for src in &edges_from {
-                let src_idx = lookup_idx_by_key(&outputs.builder, src, "edges_from")?;
-                outputs.builder.add_edge(src_idx, node_idx, 0);
-            }
-            for dst in &edges_to {
-                let dst_idx = lookup_idx_by_key(&outputs.builder, dst, "edges_to")?;
-                outputs.builder.add_edge(node_idx, dst_idx, 0);
-            }
+            wire_synthetic_edges(&mut outputs.builder, node_idx, &from_idxs, &to_idxs);
+            Ok(())
+        }
+        PreparedOp::NodeByIdx {
+            fqname,
+            kind,
+            path,
+            flags,
+            edges_from_idx,
+            edges_to_idx,
+        } => {
+            // Bounds-check every endpoint *before* minting the new
+            // node so that a bad index doesn't leave an unconnected
+            // synthetic in the graph. The check uses the pre-intern
+            // node count: callers cannot reference an idx that
+            // doesn't yet exist (including the about-to-be-minted
+            // node).
+            let len = outputs.builder.nodes.len();
+            check_idx_slice_in_range(len, &edges_from_idx, "AddNodeByIdx", "edges_from_idx")?;
+            check_idx_slice_in_range(len, &edges_to_idx, "AddNodeByIdx", "edges_to_idx")?;
+            let node_idx = outputs
+                .builder
+                .intern_node(py, synthetic_node(fqname, kind, path, flags))?;
+            wire_synthetic_edges(
+                &mut outputs.builder,
+                node_idx,
+                &edges_from_idx,
+                &edges_to_idx,
+            );
             Ok(())
         }
     }
+}
+
+/// Wire a freshly-minted synthetic node into the graph: every entry
+/// of ``edges_from_idx`` becomes ``source -> node``, every entry of
+/// ``edges_to_idx`` becomes ``node -> target``. Endpoints are already
+/// validated indices.
+fn wire_synthetic_edges(
+    builder: &mut GraphBuilder,
+    node_idx: usize,
+    edges_from_idx: &[usize],
+    edges_to_idx: &[usize],
+) {
+    for &src_idx in edges_from_idx {
+        builder.add_edge(src_idx, node_idx, 0);
+    }
+    for &dst_idx in edges_to_idx {
+        builder.add_edge(node_idx, dst_idx, 0);
+    }
+}
+
+/// Resolve every endpoint key to its builder-side index, propagating
+/// the first lookup failure as a ``ValueError`` with the matching
+/// ``side`` label.
+fn resolve_edge_keys(builder: &GraphBuilder, keys: &[NodeKey], side: &str) -> PyResult<Vec<usize>> {
+    keys.iter()
+        .map(|k| lookup_idx_by_key(builder, k, side))
+        .collect()
+}
+
+/// Bounds-check a single index against the builder's current node
+/// count, surfacing an ``IndexError`` matching the existing
+/// ``AddEdgeByIdx`` style.
+fn check_idx_in_range(len: usize, idx: usize, op: &str, side: &str) -> PyResult<()> {
+    if idx >= len {
+        return Err(PyIndexError::new_err(format!(
+            "{op}: {side} {idx} out of range (len={len})"
+        )));
+    }
+    Ok(())
+}
+
+/// Bounds-check every index in a slice. Returns on the first
+/// out-of-range index with the matching ``IndexError``.
+fn check_idx_slice_in_range(len: usize, idxs: &[usize], op: &str, side: &str) -> PyResult<()> {
+    for &idx in idxs {
+        check_idx_in_range(len, idx, op, side)?;
+    }
+    Ok(())
 }
 
 /// Resolve a `SymbolNode` reference to its builder-side index for an
