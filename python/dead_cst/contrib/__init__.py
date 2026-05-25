@@ -18,6 +18,7 @@ from .flask import flask_plugin
 from .mock_patch import MockPatchPlugin
 from .pytest import PytestPlugin
 from .server_config import ServerConfigPlugin
+from .slack_bolt import slack_bolt_plugin
 from .typer import typer_plugin
 from .unittest import UnittestPlugin
 
@@ -33,5 +34,6 @@ __all__ = [
     "fastapi_plugin",
     "fastmcp_plugin",
     "flask_plugin",
+    "slack_bolt_plugin",
     "typer_plugin",
 ]

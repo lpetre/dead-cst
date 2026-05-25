@@ -2,8 +2,11 @@
 //! `build_project_graph` pipeline entrypoint. This module owns the
 //! Salsa-backed analysis context that the rest of the crate operates on.
 
-use std::cell::{Ref, RefCell};
 use std::str::FromStr;
+use std::sync::Arc;
+
+use parking_lot::lock_api::RawRwLockRecursive;
+use parking_lot::{MappedRwLockReadGuard, Mutex, RwLock, RwLockReadGuard};
 
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use pyo3::exceptions::{PyOSError, PyRuntimeError, PyValueError};
@@ -34,7 +37,7 @@ use crate::helpers::{
     collect_modules_imports_local, decorators_match_imports, extract_call_args_kwargs,
     file_path_string, find_external_seed_direct_subclasses_par, find_main_block_range,
     find_subclass_indices_via_refs_with_queue, is_dunder_name, locate_class_def, locate_class_seed,
-    matched_call_target_any, owner_idx_for_stmt_with, range_key, rel_path, resolve_base_fqn,
+    matched_call_target_any, owner_idx_for_stmt_with, range_key, rel_path,
     top_level_assign_to_name, unwrap_subscripted_callee, AttrCallFinder, CallArgs,
     FactoryCallFinder, StringArgCallFinder, NODE_FLAG_ENTRYPOINT,
 };
@@ -125,11 +128,23 @@ pub(crate) struct BuildOutputs {
     /// nodes — and a cheap ``imports_of_exists`` short-circuit for
     /// plugins that just need a per-module presence check.
     pub(crate) imports_by_module: FxHashMap<String, Vec<usize>>,
-    /// PROTOTYPE: project-wide class hierarchy.
-    /// `class_idx -> [direct subclass class_idx]`. Built post-assembly
-    /// by walking each top-level class def's base list and resolving
-    /// each base Name expression via per-file `exports_by_name` and the
-    /// import-alias `forward_adj` chains.
+    /// `parent_fqname -> [child node idx]`. Children are the indices of
+    /// nodes whose fqname's immediate parent (`fqname.rsplit_once('.').0`)
+    /// equals the key. Includes both module and decl nodes; the kind
+    /// can be read from ``builder.nodes[idx].kind`` when filtering.
+    /// Top-level decls (no `.` in fqname) are bucketed under the empty
+    /// string ``""``.
+    ///
+    /// Lets ``module_surface`` BFS the fqname tree (one O(matches)
+    /// hop per parent) instead of linear-scanning ``decl_by_fqname`` /
+    /// ``module_by_fqname`` with a ``starts_with`` filter, and lets
+    /// ``find_module_top_level_decls`` answer with a single
+    /// ``HashMap::get``.
+    pub(crate) children_by_parent: FxHashMap<String, Vec<usize>>,
+    /// Project-wide class hierarchy keyed by parent class graph idx.
+    /// `class_idx -> [direct subclass class_idx]`. Derived in
+    /// `assemble_graph` from each file's per-file `class_bases`
+    /// payload (see [`crate::file_payload::FileNodes::class_bases`]).
     ///
     /// Lets ``UnittestPlugin`` / ``InitSubclassPlugin`` do an O(N) BFS
     /// over this map instead of calling ``find_references`` per class.
@@ -137,7 +152,14 @@ pub(crate) struct BuildOutputs {
     /// ``find_subclass_indices_via_refs`` for the first hop into the
     /// project; once a project class is found, transitive walks use
     /// this map.
-    pub(crate) class_children: FxHashMap<usize, Vec<usize>>,
+    pub(crate) children_by_node: FxHashMap<usize, Vec<usize>>,
+    /// Project-wide class hierarchy keyed by parent fqname (project or
+    /// external). `base_fqn -> [direct subclass class_idx]`. Lets
+    /// ``subclasses_of_fqn`` answer the "any project classes extending
+    /// ``flask.Flask``?" question in O(1) without re-walking the AST
+    /// or re-resolving imports. Built alongside ``children_by_node``
+    /// from the per-file ``class_bases`` payload.
+    pub(crate) children_by_fqn: FxHashMap<String, Vec<usize>>,
 }
 
 /// Run the three build phases (ingest → hierarchy+imports → references)
@@ -356,23 +378,28 @@ pub(crate) fn build_project_graph(
     let decl_by_name_range = assembled.decl_by_name_range;
     let ref_to_global = assembled.ref_to_global;
 
-    // PROTOTYPE: build the project-wide class hierarchy index.
+    let t4 = std::time::Instant::now();
+    let (decl_by_fqname, module_by_fqname, imports_by_module, children_by_parent) =
+        build_fqname_indices(py, &builder);
+    let t_fqname = t4.elapsed();
+
+    // Class hierarchy fan-in: fold every file's per-file `class_bases`
+    // payload (see `file_payload::FileNodes::class_bases`) into two
+    // project-wide indices — node-keyed (intra-project subclass
+    // walks) and fqname-keyed (external seeds + the dispatch-plugin
+    // hot path). One pass over the per-file payloads + one pass per
+    // base; no AST re-walk.
     let t_hierarchy = std::time::Instant::now();
-    let class_children = build_class_children(
+    let (children_by_node, children_by_fqn) = build_class_hierarchy_indices(
         db,
         &project_files,
-        &path_to_file,
         &class_by_selection,
         &ref_to_global,
-        &builder.forward_adj,
+        &decl_by_fqname,
         py,
         &builder.nodes,
     );
     let t_hierarchy_elapsed = t_hierarchy.elapsed();
-
-    let t4 = std::time::Instant::now();
-    let (decl_by_fqname, module_by_fqname, imports_by_module) = build_fqname_indices(py, &builder);
-    let t_fqname = t4.elapsed();
     if timing {
         eprintln!(
             "[dead-cst-timing] files={} nodes={} edges={} enum={:?} populate={:?} assemble={:?} class_hier={:?} fqname={:?} total={:?} rss={}MB",
@@ -408,7 +435,9 @@ pub(crate) fn build_project_graph(
         decl_by_fqname,
         module_by_fqname,
         imports_by_module,
-        class_children,
+        children_by_node,
+        children_by_fqn,
+        children_by_parent,
     })
 }
 
@@ -793,165 +822,113 @@ fn assemble_graph<'db>(
     })
 }
 
-/// PROTOTYPE: build `class_idx -> [direct subclass class_idx]` map.
+/// Fold every file's per-file `class_bases` payload (see
+/// [`crate::file_payload::FileNodes::class_bases`]) into two
+/// project-wide indices used by the subclass queries:
 ///
-/// For each project file's top-level class definition, resolve each
-/// base expression's head Name to a graph node (via per-file
-/// `exports_by_name`), follow the resulting alias chain to a class
-/// node (via `builder.forward_adj`), and record the
-/// (class_idx, parent_class_idx) edge.
+/// * `children_by_node` — parent class graph idx → direct subclass
+///   graph idxs. Drives intra-project BFS for both project and
+///   external seeds (once the first hop lands a project class).
+/// * `children_by_fqn` — base fqname → direct subclass graph idxs.
+///   Lets external seeds (`unittest.TestCase`, `flask.Flask`) be
+///   answered without an AST re-walk and without ty's framework
+///   loader. The same map also serves project bases via the import
+///   path — `class C(Foo): ...` with `from m import Foo` lands as
+///   `ImportedFqn("m.Foo")`, which matches the project's own
+///   `m.Foo` class node when fqname lookup hits `decl_by_fqname`.
 ///
-/// Limitations of this prototype:
+/// Resolution rules per `ResolvedBase` variant:
 ///
-/// * Only handles `Name(...)` and `Attribute(...)` bases with a Name
-///   root. Complex bases like `Generic[T]` aren't walked beyond the
-///   head Name.
-/// * Local-binding resolution goes through `exports_by_name` which
-///   returns the end-of-scope binding(s); we don't honour
-///   per-statement use-def chains. For simple linear files this
-///   matches `SemanticModel::resolve_name`.
-/// * If a base resolves to an import alias, we walk the alias's
-///   `forward_adj` and keep the first class target found. Doesn't
-///   cover ``from a import C as D; class X(D): ...`` chains with more
-///   than one alias hop.
-#[allow(clippy::too_many_arguments)]
-fn build_class_children<'db>(
+/// * `LocalSameFileClass(local_idx)` — translate via the file's
+///   `refs[local_idx]` + `ref_to_global` to a parent class graph idx
+///   and emit a `children_by_node` entry.
+/// * `ImportedFqn(fqn)` — index in `children_by_fqn`. Additionally,
+///   when the fqn resolves in `decl_by_fqname` to a project class
+///   node, emit a `children_by_node` entry too (so a project base
+///   imported via `from m import C` participates in node-keyed
+///   walks).
+/// * `Attribute { module_fqn, attr_name }` — probe `module_fqname`
+///   via `module_by_fqname` (project-side) and resolve the attr in
+///   that module's `exports_by_name`. Project hits emit
+///   `children_by_node` entries; the fqname form
+///   `{module_fqn}.{attr_name}` also lands in `children_by_fqn` so
+///   external `M.N` references are answerable by string match.
+/// * `Unresolvable` — dropped.
+fn build_class_hierarchy_indices<'db>(
     db: &'db ProjectDatabase,
     project_files: &[File],
-    path_to_file: &FxHashMap<String, File>,
     class_by_selection: &FxHashMap<(File, (u32, u32)), usize>,
     ref_to_global: &FxHashMap<NodeRef<'db>, usize>,
-    forward_adj: &[Vec<(usize, u32)>],
+    decl_by_fqname: &FxHashMap<String, Vec<usize>>,
     py: Python<'_>,
     nodes: &[Py<SymbolNode>],
-) -> FxHashMap<usize, Vec<usize>> {
-    use crate::helpers::iter_top_level_classes;
-    let mut children: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
+) -> (FxHashMap<usize, Vec<usize>>, FxHashMap<String, Vec<usize>>) {
+    use crate::file_payload::ResolvedBase;
+    let mut by_node: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
+    let mut by_fqn: FxHashMap<String, Vec<usize>> = FxHashMap::default();
 
     for &file in project_files {
-        let parsed = parsed_module(db, file).load(db);
         let payload = file_to_nodes(db, file);
-
-        for cls in iter_top_level_classes(&parsed) {
-            let name_r = cls.name.range();
-            let rk = (name_r.start().to_u32(), name_r.end().to_u32());
-            let Some(&child_idx) = class_by_selection.get(&(file, rk)) else {
+        for (cls_rk, bases) in &payload.class_bases {
+            let Some(&child_idx) = class_by_selection.get(&(file, *cls_rk)) else {
                 continue;
             };
-
-            let Some(args) = &cls.arguments else {
-                continue;
-            };
-
-            for base in &args.args {
-                // Find the head Name + optional trailing attribute name
-                // for this base expression. Two shapes we handle:
-                //
-                // * `Cls` -> head=Cls, trailing=None
-                // * `module.Cls` -> head=module, trailing=Some("Cls")
-                // * `Generic[T]` / `Protocol[T]` -> head=Generic
-                let (head_name, trailing_attr): (Option<&str>, Option<&str>) = match base {
-                    Expr::Name(n) => (Some(n.id.as_str()), None),
-                    Expr::Attribute(a) => {
-                        if let Expr::Name(root) = a.value.as_ref() {
-                            (Some(root.id.as_str()), Some(a.attr.as_str()))
-                        } else {
-                            (None, None)
+            for base in bases {
+                match base {
+                    ResolvedBase::LocalSameFileClass(local_idx) => {
+                        let r = payload.refs[*local_idx as usize];
+                        if let Some(&parent_idx) = ref_to_global.get(&r) {
+                            if nodes[parent_idx].borrow(py).kind == "class" {
+                                by_node.entry(parent_idx).or_default().push(child_idx);
+                            }
                         }
                     }
-                    Expr::Subscript(s) => match s.value.as_ref() {
-                        Expr::Name(n) => (Some(n.id.as_str()), None),
-                        Expr::Attribute(a) => {
-                            if let Expr::Name(root) = a.value.as_ref() {
-                                (Some(root.id.as_str()), Some(a.attr.as_str()))
-                            } else {
-                                (None, None)
-                            }
-                        }
-                        _ => (None, None),
-                    },
-                    _ => (None, None),
-                };
-                let Some(head) = head_name else {
-                    continue;
-                };
-
-                // Resolve `head` in the file's global namespace.
-                let Some(locals) = payload.exports_by_name.get(head) else {
-                    continue;
-                };
-                for &local_idx in locals {
-                    let r = payload.refs[local_idx as usize];
-                    let Some(&parent_idx) = ref_to_global.get(&r) else {
-                        continue;
-                    };
-                    let parent_kind = nodes[parent_idx].borrow(py).kind;
-                    if parent_kind == "class" && trailing_attr.is_none() {
-                        children.entry(parent_idx).or_default().push(child_idx);
-                    } else if parent_kind == "import" {
-                        match trailing_attr {
-                            None => {
-                                // `Cls` resolved to an alias node;
-                                // follow alias's forward edges to a
-                                // class target.
-                                for &(adj_idx, _) in &forward_adj[parent_idx] {
-                                    if nodes[adj_idx].borrow(py).kind == "class" {
-                                        children.entry(adj_idx).or_default().push(child_idx);
-                                        break;
-                                    }
-                                }
-                            }
-                            Some(attr_name) => {
-                                // `module.Cls`: alias likely points at
-                                // a module node; look up `attr_name` in
-                                // that target module's
-                                // exports_by_name and follow.
-                                for &(adj_idx, _) in &forward_adj[parent_idx] {
-                                    let adj_node = nodes[adj_idx].borrow(py);
-                                    if adj_node.kind != "module" {
-                                        continue;
-                                    }
-                                    // Recover the target module's `File`
-                                    // via the project-wide `path_to_file`
-                                    // index (O(1) probe) instead of a
-                                    // linear scan over `project_files`.
-                                    let target_path = adj_node.path.clone();
-                                    drop(adj_node);
-                                    let Some(&target_file) = path_to_file.get(&target_path) else {
-                                        continue;
-                                    };
-                                    let target_payload = file_to_nodes(db, target_file);
-                                    let Some(attr_locals) =
-                                        target_payload.exports_by_name.get(attr_name)
-                                    else {
-                                        continue;
-                                    };
-                                    for &al in attr_locals {
-                                        let ar = target_payload.refs[al as usize];
-                                        let Some(&attr_idx) = ref_to_global.get(&ar) else {
-                                            continue;
-                                        };
-                                        if nodes[attr_idx].borrow(py).kind == "class" {
-                                            children.entry(attr_idx).or_default().push(child_idx);
-                                        }
-                                    }
-                                    break;
+                    ResolvedBase::ImportedFqn(fqn) => {
+                        by_fqn.entry(fqn.clone()).or_default().push(child_idx);
+                        if let Some(idxs) = decl_by_fqname.get(fqn) {
+                            for &parent_idx in idxs {
+                                if nodes[parent_idx].borrow(py).kind == "class" {
+                                    by_node.entry(parent_idx).or_default().push(child_idx);
                                 }
                             }
                         }
                     }
+                    ResolvedBase::Attribute {
+                        module_fqn,
+                        attr_name,
+                    } => {
+                        // Index by the synthesised fqname for
+                        // external bases + dispatch-plugin matches.
+                        let composed = format!("{module_fqn}.{attr_name}");
+                        by_fqn.entry(composed.clone()).or_default().push(child_idx);
+                        // Project-side: resolve `module_fqn.attr_name`
+                        // via `decl_by_fqname` (handles the common
+                        // case where the target module's class is in
+                        // the project) or via the target module's
+                        // `exports_by_name`.
+                        if let Some(idxs) = decl_by_fqname.get(&composed) {
+                            for &parent_idx in idxs {
+                                if nodes[parent_idx].borrow(py).kind == "class" {
+                                    by_node.entry(parent_idx).or_default().push(child_idx);
+                                }
+                            }
+                        }
+                    }
+                    ResolvedBase::Unresolvable => {}
                 }
             }
         }
     }
 
-    // Dedup each children vec — multiple bases or alias hops can
-    // produce the same edge.
-    for v in children.values_mut() {
+    for v in by_node.values_mut() {
         v.sort_unstable();
         v.dedup();
     }
-    children
+    for v in by_fqn.values_mut() {
+        v.sort_unstable();
+        v.dedup();
+    }
+    (by_node, by_fqn)
 }
 
 /// Serial pre-parallel Pass-2 helper: lookup-or-mint a `NodeRef` into
@@ -979,12 +956,19 @@ fn serial_lookup_or_mint<'db>(
 }
 
 /// Pre-build the fqname -> idx maps used by ``find_declarations``,
-/// ``find_module``, and ``find_imports_of``. One pass over interned
-/// nodes; module entries are 1:1 (one module node per fqname) while
-/// decl entries (and per-upstream-module import entries) can have
-/// multiple binders for the same key — try/except rebinds,
-/// conditional re-imports, and multiple ``from X import Y, Z`` aliases
-/// all bind into the same upstream module.
+/// ``find_module``, ``find_imports_of``, and ``module_surface``. One
+/// pass over interned nodes; module entries are 1:1 (one module node
+/// per fqname) while decl entries (and per-upstream-module import
+/// entries) can have multiple binders for the same key — try/except
+/// rebinds, conditional re-imports, and multiple ``from X import Y, Z``
+/// aliases all bind into the same upstream module.
+///
+/// ``children_by_parent`` is the fqname-tree index used by
+/// :meth:`ProjectContext::module_surface` and
+/// :meth:`ProjectContext::find_module_top_level_decls`: for every
+/// indexed node (module or decl), the entry is bucketed under the
+/// fqname's immediate parent (``rsplit_once('.').0``), with top-level
+/// names keyed under the empty string.
 #[allow(clippy::type_complexity)]
 pub(crate) fn build_fqname_indices(
     py: Python<'_>,
@@ -993,18 +977,31 @@ pub(crate) fn build_fqname_indices(
     FxHashMap<String, Vec<usize>>,
     FxHashMap<String, usize>,
     FxHashMap<String, Vec<usize>>,
+    FxHashMap<String, Vec<usize>>,
 ) {
     let mut decls: FxHashMap<String, Vec<usize>> = FxHashMap::default();
     let mut modules: FxHashMap<String, usize> = FxHashMap::default();
     let mut imports_by_module: FxHashMap<String, Vec<usize>> = FxHashMap::default();
+    let mut children_by_parent: FxHashMap<String, Vec<usize>> = FxHashMap::default();
     for (idx, node_py) in builder.nodes.iter().enumerate() {
         let node = node_py.borrow(py);
+        // `OVERLOAD`-flagged decls (the `@typing.overload`-decorated
+        // stubs of an in-file overload group) are excluded from the
+        // fqname trie so cross-module `from mod import f` resolves to
+        // the impl only. Reachability still anchors them via the
+        // explicit `impl → stub` edge emitted in `file_to_edges`.
+        if node.flags & crate::graph::NodeFlags::OVERLOAD != 0 {
+            continue;
+        }
+        let mut index_child = false;
         match node.kind {
             "module" => {
                 modules.insert(node.fqname.clone(), idx);
+                index_child = true;
             }
             "function" | "class" | "variable" => {
                 decls.entry(node.fqname.clone()).or_default().push(idx);
+                index_child = true;
             }
             "import" => {
                 decls.entry(node.fqname.clone()).or_default().push(idx);
@@ -1014,11 +1011,20 @@ pub(crate) fn build_fqname_indices(
                         .or_default()
                         .push(idx);
                 }
+                index_child = true;
             }
             _ => {}
         }
+        if index_child {
+            let parent = node
+                .fqname
+                .rsplit_once('.')
+                .map(|(p, _)| p.to_string())
+                .unwrap_or_default();
+            children_by_parent.entry(parent).or_default().push(idx);
+        }
     }
-    (decls, modules, imports_by_module)
+    (decls, modules, imports_by_module, children_by_parent)
 }
 
 /// Plugin-aware project graph builder.
@@ -1036,7 +1042,7 @@ pub(crate) fn build_fqname_indices(
 /// through `type_hierarchy_subtypes`, method-defines walks each class's
 /// `DefinitionKind::Class`, module dunders scan global-scope variable
 /// nodes, and comment patterns walk the parser's `Tokens` stream.
-#[pyclass(unsendable)]
+#[pyclass]
 pub(crate) struct ProjectContext {
     pub(crate) db: ProjectDatabase,
     /// Absolute path of the project root, echoed back to Python via the
@@ -1048,12 +1054,29 @@ pub(crate) struct ProjectContext {
     /// materialize call — `apply_graph_op` / queries assume it's
     /// `Some` and error if a plugin (incorrectly) caches the ctx and
     /// uses it after materialize returns.
-    pub(crate) outputs: RefCell<Option<BuildOutputs>>,
+    ///
+    /// Wrapped in [`parking_lot::RwLock`] so plugins can run
+    /// concurrently from a Python `ThreadPoolExecutor` — queries take a
+    /// read guard, the apply pass takes a write guard. ``parking_lot``
+    /// over ``std::sync`` because the former exposes
+    /// ``RwLockReadGuard::map`` for the ``Option`` projection that
+    /// :meth:`materialized` performs.
+    ///
+    /// Held inside an [`Arc`] so the apply path
+    /// (:func:`builder::apply_graph_op`) can clone the handle
+    /// **before** dropping the GIL and then acquire the write lock
+    /// without holding the GIL. Acquiring the write lock while
+    /// still holding the GIL would deadlock against a reader stuck
+    /// on ``take_gil`` (the reader can't drop its read guard until
+    /// it re-attaches).
+    pub(crate) outputs: Arc<RwLock<Option<BuildOutputs>>>,
     /// Compiled regexes keyed by the source pattern. Plugins call
     /// :meth:`decls_matching_name` / :meth:`find_comment_patterns`
     /// repeatedly across files with the same pattern, so caching keeps
-    /// us off the regex compiler in the hot path.
-    pub(crate) regex_cache: RefCell<FxHashMap<String, regex::Regex>>,
+    /// us off the regex compiler in the hot path. Mutex (rather than
+    /// RwLock) because the cache write path is cheap and the hot path
+    /// is a single hashmap lookup either way.
+    pub(crate) regex_cache: Mutex<FxHashMap<String, regex::Regex>>,
     /// When true, ``materialize`` and ``build_project_graph`` draw
     /// indicatif progress bars to stderr.
     pub(crate) show_progress: bool,
@@ -1096,8 +1119,8 @@ impl ProjectContext {
             db,
             root: root.to_string(),
             plugins: Vec::new(),
-            outputs: RefCell::new(None),
-            regex_cache: RefCell::new(FxHashMap::default()),
+            outputs: Arc::new(RwLock::new(None)),
+            regex_cache: Mutex::new(FxHashMap::default()),
             show_progress,
             stack_size: None,
         })
@@ -1155,17 +1178,31 @@ impl ProjectContext {
     /// Build the project-wide graph, run each plugin's `run(ctx)`,
     /// then snapshot the final state.
     ///
-    /// Borrows are released between phases so plugin `run` methods can
-    /// re-enter queries through the same ctx without aliasing violations.
+    /// Plugin execution may run serially in this method (legacy path,
+    /// also forced by `DEAD_CST_PLUGINS_SERIAL=1` in Python) or be
+    /// driven concurrently from Python via a
+    /// :class:`concurrent.futures.ThreadPoolExecutor` calling
+    /// :meth:`build_only` + :meth:`run_plugin` per worker.
+    ///
+    /// Ops are applied as they're yielded from each plugin so that
+    /// later steps inside the *same* plugin can call
+    /// ``ctx.descendants`` etc. and see the effect of earlier
+    /// yields. Across concurrent plugin invocations the
+    /// :class:`parking_lot::RwLock` on ``outputs`` serializes the
+    /// per-op write while letting the GIL-releasing queries run in
+    /// parallel.
     pub(crate) fn materialize(slf: Py<Self>, py: Python<'_>) -> PyResult<NativeGraph> {
         let show_progress = slf.borrow(py).show_progress;
         let stack_size = slf.borrow(py).stack_size;
         {
             let mut this = slf.borrow_mut(py);
             let outputs = build_project_graph(py, &mut this.db, show_progress, stack_size)?;
-            *this.outputs.borrow_mut() = Some(outputs);
+            *this.outputs.write() = Some(outputs);
         }
 
+        // Serial plugin pass (legacy / fallback path). Concurrent
+        // execution is driven from Python — see
+        // ``Analysis.materialize_all``.
         let plugins: Vec<PyObject> = slf
             .borrow(py)
             .plugins
@@ -1174,16 +1211,6 @@ impl ProjectContext {
             .collect();
         let plugin_bar = ProgressBars::plugin_bar(show_progress, plugins.len() as u64);
         for plugin in &plugins {
-            // ``plugin.run(ctx)`` yields ``GraphOp`` values; we apply
-            // each as it comes off the iterator. The plugin can run
-            // queries against ``ctx`` mid-iteration since each
-            // ``apply_graph_op`` call releases its borrows before
-            // returning control to the generator. ``None`` (a regular
-            // function that ran to completion without yielding) is
-            // allowed for plugins with nothing to do.
-            // Progress-bar label: use the plugin's class qualname.
-            // Falls back to ``<unnamed>`` if anything goes wrong (e.g.
-            // a plain function passed in by mistake).
             let plugin_name: String = plugin
                 .bind(py)
                 .get_type()
@@ -1192,23 +1219,15 @@ impl ProjectContext {
                 .and_then(|n| n.extract().ok())
                 .unwrap_or_else(|| "<unnamed>".to_string());
             plugin_bar.set_message(plugin_name);
-            let result = plugin.bind(py).call_method1("run", (slf.clone_ref(py),))?;
-            if !result.is_none() {
-                for item in result.iter()? {
-                    let op = item?;
-                    apply_graph_op(&slf, py, &op)?;
-                }
-            }
+            run_and_apply_plugin(py, &slf, plugin)?;
             plugin_bar.inc(1);
         }
         plugin_bar.finish_and_clear();
 
-        // Keep ``outputs`` alive past materialize so post-materialize
-        // queries (``descendants`` / ``ancestors`` / ``reachable``) still
-        // see the graph. Snapshot a fresh ``NativeGraph`` from the
-        // builder's interned node + edge vecs; the originals stay put.
+        // Snapshot a fresh ``NativeGraph`` from the builder's
+        // interned node + edge vecs; the originals stay put.
         let this = slf.borrow(py);
-        let outputs_ref = this.outputs.borrow();
+        let outputs_ref = this.outputs.read();
         let outputs = outputs_ref
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("ProjectContext lost its outputs"))?;
@@ -1222,6 +1241,112 @@ impl ProjectContext {
             edges: outputs.builder.edges.clone(),
         })
     }
+
+    /// Run a single plugin's ``run(ctx)`` callback, applying each
+    /// yielded op to the graph as it comes off the iterator. Called
+    /// from Python — by the serial fallback in :meth:`materialize`,
+    /// and (one call per plugin) by the
+    /// :class:`concurrent.futures.ThreadPoolExecutor` worker path.
+    ///
+    /// Concurrency note: every yielded op takes the ``outputs``
+    /// write guard briefly; intra-plugin ``ctx.descendants`` /
+    /// ``ctx.find_module`` etc. take read guards. With multiple
+    /// workers each holding read guards via the GIL-released query
+    /// paths, the writes serialize with bounded contention — the
+    /// per-op write window is sub-millisecond and the readers do
+    /// not starve writers under [`parking_lot`]'s fair policy.
+    pub(crate) fn run_plugin(slf: Py<Self>, py: Python<'_>, plugin: PyObject) -> PyResult<()> {
+        run_and_apply_plugin(py, &slf, &plugin)
+    }
+
+    /// Snapshot the current graph as a [`NativeGraph`]. Used after
+    /// concurrent plugin execution to return the final graph without
+    /// going through [`Self::materialize`] (which would re-run the
+    /// build).
+    pub(crate) fn snapshot_graph(&self, py: Python<'_>) -> PyResult<NativeGraph> {
+        let outputs_ref = self.outputs.read();
+        let outputs = outputs_ref
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("ProjectContext lost its outputs"))?;
+        Ok(NativeGraph {
+            nodes: outputs
+                .builder
+                .nodes
+                .iter()
+                .map(|n| n.clone_ref(py))
+                .collect(),
+            edges: outputs.builder.edges.clone(),
+        })
+    }
+
+    /// Run the materialize **build pass only** — populate
+    /// ``outputs`` from a project-wide scan, without running any
+    /// plugins. Python then drives plugins via a ``ThreadPoolExecutor``
+    /// (one :meth:`run_plugin` call per worker) and finishes with
+    /// :meth:`snapshot_graph` to return the final graph to Python.
+    pub(crate) fn build_only(slf: Py<Self>, py: Python<'_>) -> PyResult<()> {
+        let show_progress = slf.borrow(py).show_progress;
+        let stack_size = slf.borrow(py).stack_size;
+        let mut this = slf.borrow_mut(py);
+        let outputs = build_project_graph(py, &mut this.db, show_progress, stack_size)?;
+        *this.outputs.write() = Some(outputs);
+        Ok(())
+    }
+}
+
+/// Invoke ``plugin.run(ctx)`` and apply each yielded op to the graph
+/// in turn. Mirrors the per-yield apply behavior the codebase has
+/// relied on since plugins existed — ops from earlier steps in a
+/// plugin's body are visible to later ``ctx.descendants`` /
+/// ``ctx.find_*`` queries within the same plugin call.
+fn run_and_apply_plugin(
+    py: Python<'_>,
+    ctx: &Py<ProjectContext>,
+    plugin: &PyObject,
+) -> PyResult<()> {
+    let result = plugin.bind(py).call_method1("run", (ctx.clone_ref(py),))?;
+    if result.is_none() {
+        return Ok(());
+    }
+    for item in result.iter()? {
+        let op = item?;
+        apply_graph_op(ctx, py, &op)?;
+    }
+    Ok(())
+}
+
+/// Acquire a read guard on ``lock`` while releasing the GIL during
+/// the (potentially-parking) wait. Used by hot-path readers that
+/// would otherwise dead-lock with a concurrent
+/// :func:`builder::apply_graph_op` writer: the writer drops the GIL
+/// before contending for the write lock, but to call ``Py::new`` /
+/// ``intern_node`` it has to re-attach the GIL once it owns the
+/// guard. A reader that parks on ``read()`` *while holding the GIL*
+/// keeps the writer locked out of the GIL re-attach and the system
+/// hangs.
+///
+/// We use the recursive read path
+/// (:meth:`parking_lot::RwLock::read_recursive_unchecked`) so a
+/// queued writer doesn't starve us indefinitely (parking_lot's
+/// default ``read`` is writer-priority, which leads to a different
+/// deadlock pattern when the writer is itself parked on the GIL
+/// before it can release the queued-writer flag). The "recursive"
+/// name is slightly misleading — we're not actually re-entering;
+/// we just want the writer-priority bypass.
+fn acquire_read_releasing_gil(
+    lock: &RwLock<Option<BuildOutputs>>,
+) -> RwLockReadGuard<'_, Option<BuildOutputs>> {
+    Python::with_gil(|py| {
+        py.allow_threads(|| {
+            // SAFETY: ``lock_shared_recursive`` is the raw lock
+            // primitive that bypasses writer-priority. The matching
+            // ``make_read_guard_unchecked`` reconstructs the public
+            // guard.
+            unsafe { lock.raw() }.lock_shared_recursive();
+        });
+    });
+    // SAFETY: we just took the read lock above.
+    unsafe { lock.make_read_guard_unchecked() }
 }
 
 impl ProjectContext {
@@ -1229,11 +1354,40 @@ impl ProjectContext {
     /// "not materialized" error. Threads the `op` label into the
     /// error message so the caller name appears in the traceback.
     ///
-    /// The returned `Ref` keeps the `RefCell` borrow alive for the
-    /// lifetime of the receiver, so callers can hold it across an
-    /// entire query body without re-borrowing.
-    pub(crate) fn materialized(&self, op: &str) -> PyResult<Ref<'_, BuildOutputs>> {
-        Ref::filter_map(self.outputs.borrow(), Option::as_ref).map_err(|_| not_materialized(op))
+    /// The returned guard keeps the [`RwLock`] read borrow alive for
+    /// the lifetime of the receiver, so callers can hold it across
+    /// an entire query body without re-borrowing.
+    ///
+    /// Concurrent plugin invocations (from
+    /// :class:`concurrent.futures.ThreadPoolExecutor`) all take read
+    /// guards, so they don't serialize on this lock; only the apply
+    /// pass that mutates the graph takes the write side.
+    ///
+    /// **GIL discipline**: when the read lock is contended (a write
+    /// is pending), :func:`parking_lot::RwLock::read` parks. Any
+    /// thread parking while still holding the GIL deadlocks against
+    /// concurrent writers running in the apply path — the writer
+    /// holds the write lock and wants to re-acquire the GIL to call
+    /// ``Py::new`` / ``intern_node``, but can't because we have the
+    /// GIL parked on the read-acquire. This helper accepts ``py``
+    /// and drops the GIL during the acquire so writers can make
+    /// progress, then re-attaches after we own the read guard.
+    pub(crate) fn materialized(
+        &self,
+        op: &str,
+    ) -> PyResult<MappedRwLockReadGuard<'_, BuildOutputs>> {
+        // ``parking_lot::RwLock`` is uncontended by default — the
+        // fast path takes a single CAS and never parks. We only
+        // need the GIL-release dance when there's an actual writer
+        // waiting; ``try_read`` checks without parking.
+        let guard = match self.outputs.try_read() {
+            Some(g) => g,
+            None => acquire_read_releasing_gil(&self.outputs),
+        };
+        if guard.is_none() {
+            return Err(not_materialized(op));
+        }
+        Ok(RwLockReadGuard::map(guard, |o| o.as_ref().unwrap()))
     }
 }
 
@@ -1356,11 +1510,31 @@ impl ProjectContext {
         Ok(out)
     }
 
+    /// Idx-only variant of :meth:`find_imports_of`. Same lookup, but
+    /// returns the positional indices into ``ctx.nodes()`` rather than
+    /// materializing ``Py<SymbolNode>`` clones — drives the
+    /// :meth:`ImportQuery.indices` terminal.
+    pub(crate) fn find_imports_of_indices(&self, module_name: &str) -> PyResult<Vec<usize>> {
+        let outputs = self.materialized("find_imports_of_indices")?;
+        Ok(outputs
+            .imports_by_module
+            .get(module_name)
+            .cloned()
+            .unwrap_or_default())
+    }
+
     /// O(1) count of how many project import nodes target
     /// ``module_name`` — pre-built index lookup, no Py allocation.
     pub(crate) fn imports_of_count(&self, module_name: &str) -> usize {
-        self.outputs
-            .borrow()
+        // Fast path: uncontended read avoids GIL juggling. Slow
+        // path matches the GIL-drop discipline in
+        // :meth:`materialized` — see that method's docstring for
+        // the deadlock rationale.
+        let read_guard = match self.outputs.try_read() {
+            Some(g) => g,
+            None => acquire_read_releasing_gil(&self.outputs),
+        };
+        read_guard
             .as_ref()
             .and_then(|o| o.imports_by_module.get(module_name).map(Vec::len))
             .unwrap_or(0)
@@ -1479,6 +1653,13 @@ impl ProjectContext {
     /// whole top-level surface plus everything its submodules expose.
     /// Empty list when ``module_fqn`` doesn't resolve to a project
     /// module.
+    ///
+    /// Walks the ``children_by_parent`` fqname-tree index breadth-first
+    /// starting from ``module_fqn``. Only module nodes are recursed
+    /// into — a decl ``pkg.foo.MyClass`` is included as a child of
+    /// ``pkg.foo`` but its synthetic sub-fqnames (``pkg.foo.MyClass.method``)
+    /// are not surfaced; nested defs aren't graph nodes anyway, and the
+    /// "module surface" contract is per-module.
     pub(crate) fn module_surface(
         &self,
         py: Python<'_>,
@@ -1489,20 +1670,99 @@ impl ProjectContext {
             return Ok(Vec::new());
         };
         let mut out = vec![outputs.builder.nodes[module_idx].clone_ref(py)];
-        let prefix = format!("{module_fqn}.");
-        for (fqname, &idx) in &outputs.module_by_fqname {
-            if fqname.starts_with(&prefix) {
-                out.push(outputs.builder.nodes[idx].clone_ref(py));
-            }
-        }
-        for (fqname, idxs) in &outputs.decl_by_fqname {
-            if fqname.starts_with(&prefix) {
-                for &idx in idxs {
-                    out.push(outputs.builder.nodes[idx].clone_ref(py));
+        // BFS over the fqname tree. Recurse only into module children:
+        // a decl ``pkg.foo.MyClass`` doesn't have submodule descendants,
+        // so chasing its sub-fqnames would just be wasted lookups.
+        // Queue holds owned ``String``s because ``children_by_parent``
+        // keys are owned strings and ``SymbolNode.fqname`` lives behind
+        // a ``PyRef`` guard that can't be held across iterations.
+        let mut queue: std::collections::VecDeque<String> =
+            std::collections::VecDeque::from([module_fqn.to_string()]);
+        while let Some(parent) = queue.pop_front() {
+            let Some(children) = outputs.children_by_parent.get(parent.as_str()) else {
+                continue;
+            };
+            for &child_idx in children {
+                let child_py = &outputs.builder.nodes[child_idx];
+                let child = child_py.borrow(py);
+                let is_module = child.kind == "module";
+                let child_fqname = if is_module {
+                    Some(child.fqname.clone())
+                } else {
+                    None
+                };
+                drop(child);
+                out.push(child_py.clone_ref(py));
+                if let Some(fqn) = child_fqname {
+                    queue.push_back(fqn);
                 }
             }
         }
         Ok(out)
+    }
+
+    /// Batched form of :meth:`module_surface`. Resolves every fqname
+    /// in ``module_fqns`` in a single scan of ``module_by_fqname`` +
+    /// ``decl_by_fqname`` instead of one scan per fqname. The N
+    /// per-call materialize-lookup + N scans collapse to one of each.
+    /// Returns a dict keyed by input fqname; missing modules map to
+    /// empty lists. Duplicate inputs share the same result list.
+    pub(crate) fn module_surfaces(
+        &self,
+        py: Python<'_>,
+        module_fqns: Vec<String>,
+    ) -> PyResult<FxHashMap<String, Vec<Py<SymbolNode>>>> {
+        let outputs = self.materialized("module_surfaces")?;
+        // Deduplicate the requested fqnames + pre-stage each one's
+        // (prefix, output vec) so a single map iteration can drop
+        // matches into the right bucket. Skip fqnames that don't name
+        // a project module — same per-call short-circuit as the
+        // singular ``module_surface``.
+        let mut buckets: FxHashMap<String, Vec<Py<SymbolNode>>> =
+            FxHashMap::with_capacity_and_hasher(module_fqns.len(), Default::default());
+        let mut prefixes: Vec<(String, String)> = Vec::with_capacity(module_fqns.len());
+        for fqn in &module_fqns {
+            if buckets.contains_key(fqn) {
+                continue;
+            }
+            let Some(&module_idx) = outputs.module_by_fqname.get(fqn) else {
+                buckets.insert(fqn.clone(), Vec::new());
+                continue;
+            };
+            buckets.insert(
+                fqn.clone(),
+                vec![outputs.builder.nodes[module_idx].clone_ref(py)],
+            );
+            prefixes.push((fqn.clone(), format!("{fqn}.")));
+        }
+        if prefixes.is_empty() {
+            return Ok(buckets);
+        }
+        // Single sweep over each map; per-fqname row goes into every
+        // bucket whose prefix matches. K small (≤ inputs), so the
+        // nested-loop ``starts_with`` is fine — a prefix trie would
+        // only help for K in the hundreds.
+        for (fqname, &idx) in &outputs.module_by_fqname {
+            for (key, prefix) in &prefixes {
+                if fqname.starts_with(prefix) {
+                    buckets
+                        .get_mut(key)
+                        .expect("seeded above")
+                        .push(outputs.builder.nodes[idx].clone_ref(py));
+                }
+            }
+        }
+        for (fqname, idxs) in &outputs.decl_by_fqname {
+            for (key, prefix) in &prefixes {
+                if fqname.starts_with(prefix) {
+                    let bucket = buckets.get_mut(key).expect("seeded above");
+                    for &idx in idxs {
+                        bucket.push(outputs.builder.nodes[idx].clone_ref(py));
+                    }
+                }
+            }
+        }
+        Ok(buckets)
     }
 }
 
@@ -1522,22 +1782,37 @@ impl ProjectContext {
         py: Python<'_>,
         module_fqn: &str,
     ) -> PyResult<Vec<Py<SymbolNode>>> {
+        let indices = self.find_module_top_level_decls_indices(py, module_fqn)?;
         let outputs = self.materialized("find_module_top_level_decls")?;
+        Ok(indices
+            .into_iter()
+            .map(|idx| outputs.builder.nodes[idx].clone_ref(py))
+            .collect())
+    }
+
+    /// Idx-only variant of :meth:`find_module_top_level_decls`. Same
+    /// scan, returns positional indices into ``ctx.nodes()`` rather
+    /// than allocating ``Py<SymbolNode>`` clones.
+    pub(crate) fn find_module_top_level_decls_indices(
+        &self,
+        py: Python<'_>,
+        module_fqn: &str,
+    ) -> PyResult<Vec<usize>> {
+        let outputs = self.materialized("find_module_top_level_decls_indices")?;
         if !outputs.module_by_fqname.contains_key(module_fqn) {
             return Ok(Vec::new());
         }
-        let prefix = format!("{module_fqn}.");
-        let mut out = Vec::new();
-        for (fqname, idxs) in &outputs.decl_by_fqname {
-            let Some(rest) = fqname.strip_prefix(&prefix) else {
-                continue;
-            };
-            // Skip transitive decls (`pkg.mod.sub.x` under `pkg.mod`).
-            if rest.contains('.') {
-                continue;
-            }
-            for &idx in idxs {
-                out.push(outputs.builder.nodes[idx].clone_ref(py));
+        // One-level lookup via the ``children_by_parent`` fqname tree.
+        // Filter out module children so `from p.functions import *`
+        // doesn't surface ``p.functions.sub`` (matching the docstring's
+        // "submodules and their decls are excluded" contract).
+        let mut out: Vec<usize> = Vec::new();
+        if let Some(children) = outputs.children_by_parent.get(module_fqn) {
+            for &idx in children {
+                if outputs.builder.nodes[idx].borrow(py).kind == "module" {
+                    continue;
+                }
+                out.push(idx);
             }
         }
         Ok(out)
@@ -1563,18 +1838,39 @@ impl ProjectContext {
         py: Python<'_>,
         module_fqn: &str,
     ) -> PyResult<Option<Vec<Py<SymbolNode>>>> {
+        let Some(indices) = self.find_module_dunder_all_exports_indices(module_fqn)? else {
+            return Ok(None);
+        };
+        let outputs = self.materialized("find_module_dunder_all_exports")?;
+        Ok(Some(
+            indices
+                .into_iter()
+                .map(|idx| outputs.builder.nodes[idx].clone_ref(py))
+                .collect(),
+        ))
+    }
+
+    /// Idx-only variant of :meth:`find_module_dunder_all_exports`.
+    /// Same lookup, returns positional indices into ``ctx.nodes()``
+    /// rather than allocating ``Py<SymbolNode>`` clones. ``None``
+    /// still means "no ``__all__``"; ``Some([])`` means "empty /
+    /// unresolvable ``__all__``" (callers wanting CPython's
+    /// ``from X import *`` semantics fall back to the non-underscore
+    /// decl list only in the ``None`` case).
+    pub(crate) fn find_module_dunder_all_exports_indices(
+        &self,
+        module_fqn: &str,
+    ) -> PyResult<Option<Vec<usize>>> {
         let all_fqn = format!("{module_fqn}.__all__");
         let Some(entries) = self.find_literal_list_entries(&all_fqn)? else {
             return Ok(None);
         };
-        let outputs = self.materialized("find_module_dunder_all_exports")?;
-        let mut out: Vec<Py<SymbolNode>> = Vec::new();
+        let outputs = self.materialized("find_module_dunder_all_exports_indices")?;
+        let mut out: Vec<usize> = Vec::new();
         for entry in entries {
             let entry_fqn = format!("{module_fqn}.{entry}");
             if let Some(idxs) = outputs.decl_by_fqname.get(&entry_fqn) {
-                for &idx in idxs {
-                    out.push(outputs.builder.nodes[idx].clone_ref(py));
-                }
+                out.extend(idxs.iter().copied());
             }
         }
         Ok(Some(out))
@@ -1736,6 +2032,36 @@ impl ProjectContext {
             .into_iter()
             .map(|i| outputs.builder.nodes[i].clone_ref(py))
             .collect())
+    }
+
+    /// One-hop reverse step: every node with an edge directly into
+    /// ``node`` (i.e. the immediate predecessors, *not* the transitive
+    /// closure :meth:`ancestors` returns). ``skip_flags`` filters edges
+    /// by intersecting flag mask — same semantics as :meth:`ancestors`.
+    ///
+    /// Dedups by source index, so a pair of parallel edges with
+    /// different ``EdgeFlags`` between the same two nodes only produces
+    /// one entry in the result. Result order is unspecified.
+    #[pyo3(signature = (node, *, skip_flags = 0))]
+    pub(crate) fn direct_predecessors(
+        &self,
+        py: Python<'_>,
+        node: &SymbolNode,
+        skip_flags: u32,
+    ) -> PyResult<Vec<Py<SymbolNode>>> {
+        let outputs = self.materialized("direct_predecessors")?;
+        let idx = lookup_idx(&outputs.builder, node, "node")?;
+        let mut seen: FxHashSet<usize> = FxHashSet::default();
+        let mut out: Vec<Py<SymbolNode>> = Vec::new();
+        for &(src, flags) in &outputs.builder.reverse_adj[idx] {
+            if flags & skip_flags != 0 {
+                continue;
+            }
+            if seen.insert(src) {
+                out.push(outputs.builder.nodes[src].clone_ref(py));
+            }
+        }
+        Ok(out)
     }
 
     /// Forward closure from every node carrying any bit in
@@ -2480,7 +2806,25 @@ impl ProjectContext {
         py: Python<'_>,
         method_name: &str,
     ) -> PyResult<Vec<Py<SymbolNode>>> {
+        let indices = self.find_classes_defining_method_indices(py, method_name)?;
         let outputs = self.materialized("find_classes_defining_method")?;
+        Ok(indices
+            .into_iter()
+            .map(|idx| outputs.builder.nodes[idx].clone_ref(py))
+            .collect())
+    }
+}
+
+impl ProjectContext {
+    /// Idx-only variant of :meth:`find_classes_defining_method`. Same
+    /// per-file parallel walk, but returns positional indices into
+    /// ``ctx.nodes()`` instead of allocating ``Py<SymbolNode>`` clones.
+    pub(crate) fn find_classes_defining_method_indices(
+        &self,
+        py: Python<'_>,
+        method_name: &str,
+    ) -> PyResult<Vec<usize>> {
+        let outputs = self.materialized("find_classes_defining_method_indices")?;
         let global_index = &outputs.global_index;
         let project_files: &[File] = &outputs.project_files;
         let db_handle: Box<dyn ProjectDb> = ProjectDb::dyn_clone(&self.db);
@@ -2523,12 +2867,13 @@ impl ProjectContext {
                 local
             })
         });
-        Ok(indices
-            .into_iter()
-            .map(|idx| outputs.builder.nodes[idx].clone_ref(py))
-            .collect())
+        drop(outputs);
+        Ok(indices)
     }
+}
 
+#[pymethods]
+impl ProjectContext {
     /// Return every transitive subclass of the given class node.
     ///
     /// Direct subtypes come from ty's `type_hierarchy_subtypes`; we BFS
@@ -2539,14 +2884,27 @@ impl ProjectContext {
         py: Python<'_>,
         class_node: &SymbolNode,
     ) -> PyResult<Vec<Py<SymbolNode>>> {
+        let indices = self.find_subclasses_of_indices(class_node)?;
+        let outputs = self.materialized("find_subclasses_of")?;
+        Ok(indices
+            .into_iter()
+            .map(|idx| outputs.builder.nodes[idx].clone_ref(py))
+            .collect())
+    }
+}
+
+impl ProjectContext {
+    /// Idx-only variant of :meth:`find_subclasses_of`. Same lookup,
+    /// returns positional indices into ``ctx.nodes()`` rather than
+    /// allocating ``Py<SymbolNode>`` clones.
+    pub(crate) fn find_subclasses_of_indices(
+        &self,
+        class_node: &SymbolNode,
+    ) -> PyResult<Vec<usize>> {
         if class_node.kind != "class" {
             return Ok(Vec::new());
         }
-        let outputs = self.materialized("find_subclasses_of")?;
-
-        // PROTOTYPE: try the in-memory class-hierarchy index first.
-        // The seed is a project class node, so we can locate it
-        // directly in `class_by_selection` without an AST walk.
+        let outputs = self.materialized("find_subclasses_of_indices")?;
         if let Some((seed_file, seed_range)) = locate_class_def(
             &self.db,
             &outputs.path_to_file,
@@ -2555,28 +2913,27 @@ impl ProjectContext {
         ) {
             let rk = (seed_range.start().to_u32(), seed_range.end().to_u32());
             if let Some(&seed_idx) = outputs.class_by_selection.get(&(seed_file, rk)) {
-                let out_idx = transitive_subclasses_via_index(seed_idx, &outputs.class_children);
-                return Ok(out_idx
-                    .into_iter()
-                    .map(|idx| outputs.builder.nodes[idx].clone_ref(py))
-                    .collect());
+                return Ok(transitive_subclasses_via_index(
+                    seed_idx,
+                    &outputs.children_by_node,
+                ));
             }
         }
         Ok(Vec::new())
     }
 }
 
-/// PROTOTYPE: BFS from `seed_idx` through `class_children`. Returns
-/// the transitive closure (excluding the seed itself).
+/// BFS from `seed_idx` through `children_by_node`. Returns the
+/// transitive closure (excluding the seed itself).
 fn transitive_subclasses_via_index(
     seed_idx: usize,
-    class_children: &FxHashMap<usize, Vec<usize>>,
+    children_by_node: &FxHashMap<usize, Vec<usize>>,
 ) -> Vec<usize> {
     let mut seen: FxHashSet<usize> = FxHashSet::default();
     let mut out: Vec<usize> = Vec::new();
     let mut stack: Vec<usize> = vec![seed_idx];
     while let Some(cur) = stack.pop() {
-        let Some(kids) = class_children.get(&cur) else {
+        let Some(kids) = children_by_node.get(&cur) else {
             continue;
         };
         for &k in kids {
@@ -2685,30 +3042,46 @@ impl ProjectContext {
         base_fqn: &str,
         transitive: bool,
     ) -> PyResult<Vec<Py<SymbolNode>>> {
+        let indices = self.find_subclasses_indices(py, base_fqn, transitive)?;
         let outputs = self.materialized("find_subclasses")?;
+        Ok(indices
+            .into_iter()
+            .map(|idx| outputs.builder.nodes[idx].clone_ref(py))
+            .collect())
+    }
+}
+
+impl ProjectContext {
+    /// Idx-only variant of :meth:`find_subclasses`. Same lookup,
+    /// returns positional indices into ``ctx.nodes()`` rather than
+    /// allocating ``Py<SymbolNode>`` clones.
+    pub(crate) fn find_subclasses_indices(
+        &self,
+        py: Python<'_>,
+        base_fqn: &str,
+        transitive: bool,
+    ) -> PyResult<Vec<usize>> {
+        let outputs = self.materialized("find_subclasses_indices")?;
         let Some((seed_file, seed_range)) = locate_class_seed(&self.db, &outputs, py, base_fqn)
         else {
             return Ok(Vec::new());
         };
         // Project seeds: use the in-memory class-hierarchy index for
         // an O(deg) BFS. Built once at the end of ``assemble_graph``
-        // (see ``build_class_children``); short-circuits every
+        // (see ``build_class_hierarchy_indices``); short-circuits every
         // intra-project subclass query.
         let rk = (seed_range.start().to_u32(), seed_range.end().to_u32());
         if let Some(&seed_idx) = outputs.class_by_selection.get(&(seed_file, rk)) {
             let out_idx = if transitive {
-                transitive_subclasses_via_index(seed_idx, &outputs.class_children)
+                transitive_subclasses_via_index(seed_idx, &outputs.children_by_node)
             } else {
                 outputs
-                    .class_children
+                    .children_by_node
                     .get(&seed_idx)
                     .cloned()
                     .unwrap_or_default()
             };
-            return Ok(out_idx
-                .into_iter()
-                .map(|idx| outputs.builder.nodes[idx].clone_ref(py))
-                .collect());
+            return Ok(out_idx);
         }
 
         // External seeds (seed file lives outside the project, e.g.
@@ -2726,7 +3099,7 @@ impl ProjectContext {
         // run without GIL contention, matching the pattern used by
         // ``find_decorated_decls``.
         let class_by_selection = &outputs.class_by_selection;
-        let class_children = &outputs.class_children;
+        let children_by_node = &outputs.children_by_node;
         let project_files: &[File] = &outputs.project_files;
         // ``base_fqn`` splits into ``(seed_module, seed_simple_name)``;
         // both halves are required for the fast path.
@@ -2789,170 +3162,107 @@ impl ProjectContext {
         let mut out_idx: FxHashSet<usize> = direct.iter().copied().collect();
         if transitive {
             for &d in &direct {
-                for idx in transitive_subclasses_via_index(d, class_children) {
+                for idx in transitive_subclasses_via_index(d, children_by_node) {
                     out_idx.insert(idx);
                 }
             }
         }
-        Ok(out_idx
+        Ok(out_idx.into_iter().collect())
+    }
+}
+
+#[pymethods]
+impl ProjectContext {
+    /// Project classes that inherit (directly or transitively) from
+    /// the class identified by ``fqn``. ``fqn`` may name a project
+    /// class (e.g. ``pkg.module.MyBase``) or an external one
+    /// (``flask.Flask``, ``typer.Typer``); the lookup is keyed against
+    /// the pre-built ``children_by_fqn`` index (populated at
+    /// materialize time from per-file `class_bases` payloads — see
+    /// `file_payload::ResolvedBase`), so the framework module is
+    /// never loaded out of the venv.
+    ///
+    /// ``transitive=True`` (default) walks the subclass closure via
+    /// ``children_by_node``; ``transitive=False`` returns only direct
+    /// hits. Match shapes per base expression in the class header
+    /// follow the [`ResolvedBase`](crate::file_payload::ResolvedBase)
+    /// contract:
+    ///
+    /// * ``Name(X)`` where ``X`` is imported via
+    ///   ``from <module> import X [as alias]`` → matches when
+    ///   ``<module>.X`` equals ``fqn``.
+    /// * ``Attribute(Name(M).N)`` where ``M`` is bound via
+    ///   ``import <module> [as M]`` → matches when ``<module>.N``
+    ///   equals ``fqn``.
+    /// * ``Name(X)`` referring to a class earlier in the same file →
+    ///   matches when the in-project resolution lands the parent's
+    ///   own fqname or graph idx.
+    ///
+    /// Generics (``class X(Foo[T])``) and other non-identifier
+    /// expressions are skipped — matches the libcst pipeline.
+    #[pyo3(signature = (fqn, *, transitive = true))]
+    pub(crate) fn subclasses_of_fqn(
+        &self,
+        py: Python<'_>,
+        fqn: &str,
+        transitive: bool,
+    ) -> PyResult<Vec<Py<SymbolNode>>> {
+        let outputs = self.materialized("subclasses_of_fqn")?;
+        let Some(direct) = outputs.children_by_fqn.get(fqn) else {
+            return Ok(Vec::new());
+        };
+        let mut visited: FxHashSet<usize> = direct.iter().copied().collect();
+        if transitive {
+            for &d in direct {
+                for idx in transitive_subclasses_via_index(d, &outputs.children_by_node) {
+                    visited.insert(idx);
+                }
+            }
+        }
+        Ok(visited
             .into_iter()
             .map(|idx| outputs.builder.nodes[idx].clone_ref(py))
             .collect())
     }
 
-    /// Find every project class that transitively inherits from any
-    /// fqname in ``base_fqns``, by inverting the search: instead of
-    /// asking ty's ``find_references`` to walk down from each base
-    /// (which has to load + parse the framework module out of the
-    /// venv), do a single parallel scan over project files, read each
-    /// top-level class's base list, resolve each base against the
-    /// file's imports, and check membership in the target set.
-    ///
-    /// Returns project class nodes (transitive closure). External
-    /// targets are matched by fqname only — the framework module is
-    /// never loaded. This is the cold-path complement of
-    /// :meth:`find_subclasses` for the common "do any project classes
-    /// extend ``flask.Flask``?" question.
-    ///
-    /// Match shapes per base expression in the class header:
-    /// * ``Name(X)`` where ``X`` is imported via
-    ///   ``from <module> import X [as alias]`` resolving the import
-    ///   to ``<module>.X``;
-    /// * ``Attribute(Name(M).N)`` where ``M`` is bound via
-    ///   ``import <module> [as M]``, matching ``<module>.N``;
-    /// * Dotted-path ``a.b.c.N`` matching when the full path equals a
-    ///   target fqname (rare, but handles ``import flask;
-    ///   class X(flask.Flask): ...`` literally).
-    /// Generic parameterizations (``class X(Foo[T])``) are not
-    /// supported — matches a syntactic base name only.
-    pub(crate) fn find_subclasses_via_bases(
+    /// Project classes that inherit (directly or transitively) from
+    /// ``class_node``. O(1) probe in ``children_by_node`` plus BFS for
+    /// the transitive walk. Returns an empty vec when ``class_node``
+    /// isn't a class kind. Symmetric to :meth:`subclasses_of_fqn` for
+    /// callers that already hold the seed as a `SymbolNode`.
+    #[pyo3(signature = (class_node, *, transitive = true))]
+    pub(crate) fn subclasses_of_node(
         &self,
         py: Python<'_>,
-        base_fqns: Vec<String>,
+        class_node: &SymbolNode,
+        transitive: bool,
     ) -> PyResult<Vec<Py<SymbolNode>>> {
-        let outputs = self.materialized("find_subclasses_via_bases")?;
-        // Build set of target fqnames and (module → {simple_names})
-        // for fast per-base resolution.
-        if base_fqns.is_empty() {
+        if class_node.kind != "class" {
             return Ok(Vec::new());
         }
-        // No text prefilter: a file containing a transitive subclass
-        // (``class GrandApp(MyApp): ...``) might not mention the
-        // framework's simple name at all. We need to parse every
-        // project file once and capture every ``ClassDef``'s base
-        // list — then the BFS over the collected (child, base_fqn)
-        // pairs handles transitive closure without re-scanning.
-        // Parsing is cheap (and already done during materialize), so
-        // this stays competitive with the ty find_references path.
-        let decl_by_name_range = &outputs.decl_by_name_range;
-        let class_by_selection = &outputs.class_by_selection;
-        let project_files: &[File] = &outputs.project_files;
-        let db_handle: Box<dyn ProjectDb> = ProjectDb::dyn_clone(&self.db);
-
-        // Materialize idx → fqname BEFORE allow_threads so the
-        // parallel scan can use it without the GIL.
-        let idx_fqname: Vec<String> = outputs
-            .builder
-            .nodes
-            .iter()
-            .map(|n| n.borrow(py).fqname.clone())
-            .collect();
-        let idx_fqname_ref = &idx_fqname;
-
-        // Per-file output: list of (child_class_idx, base_fqn).
-        // base_fqn is whatever the class header resolves to (project
-        // class fqname OR external fqname OR module.simple — anything
-        // a syntactic resolution can produce). The caller filters to
-        // the target set + BFS for transitive closure.
-        let pairs: Vec<(usize, String)> = py.allow_threads(move || {
-            par_scan_files(db_handle, project_files, &None, |db, file| {
-                let parsed = parsed_module(db, file).load(db);
-                // Cheap pre-walk filter: skip files with no
-                // top-level ClassDef at all.
-                if !parsed
-                    .syntax()
-                    .body
-                    .iter()
-                    .any(|s| matches!(s, Stmt::ClassDef(_)))
-                {
-                    return Vec::new();
-                }
-                let file_imports = collect_all_imports_local(&parsed);
-                // Same-file top-level classes — base references that
-                // are bare ``Name`` and not imported can resolve to a
-                // class defined earlier in this file.
-                let file_local_classes: FxHashMap<&str, usize> = parsed
-                    .syntax()
-                    .body
-                    .iter()
-                    .filter_map(|stmt| {
-                        let Stmt::ClassDef(cls) = stmt else {
-                            return None;
-                        };
-                        let key = (file, range_key(cls.name.range()));
-                        let idx = class_by_selection
-                            .get(&key)
-                            .copied()
-                            .or_else(|| decl_by_name_range.get(&key).copied())?;
-                        Some((cls.name.as_str(), idx))
-                    })
-                    .collect();
-                let mut local: Vec<(usize, String)> = Vec::new();
-                for stmt in &parsed.syntax().body {
-                    let Stmt::ClassDef(cls) = stmt else { continue };
-                    let Some(args) = &cls.arguments else { continue };
-                    let child_key = (file, range_key(cls.name.range()));
-                    let Some(&child_idx) = class_by_selection
-                        .get(&child_key)
-                        .or_else(|| decl_by_name_range.get(&child_key))
-                    else {
-                        continue;
-                    };
-                    for arg in &args.args {
-                        // Try import resolution first.
-                        if let Some(base_fqn) = resolve_base_fqn(arg, &file_imports) {
-                            local.push((child_idx, base_fqn));
-                            continue;
-                        }
-                        // Fallback: same-file class name reference.
-                        if let ruff_python_ast::Expr::Name(name) = arg {
-                            if let Some(&base_idx) = file_local_classes.get(name.id.as_str()) {
-                                let base_fqn = idx_fqname_ref[base_idx].clone();
-                                local.push((child_idx, base_fqn));
-                            }
-                        }
-                    }
-                }
-                local
-            })
-        });
-
-        // Build base_fqn → [child_class_idx] index. Drives both the
-        // direct-target filter AND the transitive BFS — pairs already
-        // covers every base→child edge we saw in the project, not
-        // just target hits.
-        let mut by_base: FxHashMap<String, Vec<usize>> = FxHashMap::default();
-        for (idx, base_fqn) in pairs {
-            by_base.entry(base_fqn).or_default().push(idx);
-        }
-
-        // BFS from each target fqname through `by_base`.
-        let mut visited: FxHashSet<usize> = FxHashSet::default();
-        let mut frontier: Vec<String> = base_fqns.into_iter().collect();
-        while let Some(seed_fqn) = frontier.pop() {
-            let Some(children) = by_base.get(&seed_fqn) else {
-                continue;
-            };
-            for &child in children {
-                if visited.insert(child) {
-                    // Next round: walk subclasses of this project
-                    // class via its own fqname.
-                    frontier.push(idx_fqname[child].clone());
-                }
-            }
-        }
-
-        Ok(visited
+        let outputs = self.materialized("subclasses_of_node")?;
+        let Some((seed_file, seed_range)) = locate_class_def(
+            &self.db,
+            &outputs.path_to_file,
+            &class_node.path,
+            class_node,
+        ) else {
+            return Ok(Vec::new());
+        };
+        let rk = (seed_range.start().to_u32(), seed_range.end().to_u32());
+        let Some(&seed_idx) = outputs.class_by_selection.get(&(seed_file, rk)) else {
+            return Ok(Vec::new());
+        };
+        let out_idx = if transitive {
+            transitive_subclasses_via_index(seed_idx, &outputs.children_by_node)
+        } else {
+            outputs
+                .children_by_node
+                .get(&seed_idx)
+                .cloned()
+                .unwrap_or_default()
+        };
+        Ok(out_idx
             .into_iter()
             .map(|idx| outputs.builder.nodes[idx].clone_ref(py))
             .collect())
@@ -3037,6 +3347,209 @@ impl ProjectContext {
     pub(crate) fn edges(&self) -> PyResult<Vec<(usize, usize, u32)>> {
         Ok(self.materialized("edges")?.builder.edges.clone())
     }
+
+    /// Idx-only sibling of :meth:`reachable`. Same semantics: forward
+    /// closure from every node carrying any bit in ``seed_flags``,
+    /// filtering edges by ``skip_flags``. Returns positional indices
+    /// into ``ctx.nodes()`` rather than materialising
+    /// ``Py<SymbolNode>`` clones.
+    ///
+    /// Use when you only need set membership / counting on the
+    /// reached set — pair with :meth:`nodes_at` to revive specific
+    /// nodes on demand.
+    #[pyo3(signature = (*, skip_flags = 0, seed_flags = NODE_FLAG_ENTRYPOINT))]
+    pub(crate) fn reachable_indices(
+        &self,
+        py: Python<'_>,
+        skip_flags: u32,
+        seed_flags: u32,
+    ) -> PyResult<Vec<usize>> {
+        let outputs = self.materialized("reachable_indices")?;
+        let seeds = outputs
+            .builder
+            .nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, n)| (n.borrow(py).flags & seed_flags != 0).then_some(idx));
+        Ok(bfs(&outputs.builder, seeds, Direction::Forward, skip_flags)
+            .into_iter()
+            .collect())
+    }
+
+    /// Flat-form predicate filter returning positional indices into
+    /// ``ctx.nodes()``. Mirrors the :class:`DeclQuery` predicate
+    /// vocabulary (``kind`` / ``kinds`` / ``filename`` /
+    /// ``filenames`` / ``simple_name`` / ``simple_names`` / ``paths``
+    /// / ``path_regex`` / ``flags`` / ``flags_any`` /
+    /// ``fqname_prefix``) but skips the builder construction —
+    /// useful when you only have one filter step and just need a
+    /// ``list[int]`` of indices.
+    ///
+    /// Every parameter is keyword-only and optional; unset arguments
+    /// don't filter. ``kind`` and ``kinds`` (and similarly ``filename``
+    /// / ``filenames``, ``simple_name`` / ``simple_names``) are merged
+    /// — pass either form. All set predicates AND together.
+    #[pyo3(signature = (
+        *,
+        kind = None,
+        kinds = None,
+        filename = None,
+        filenames = None,
+        simple_name = None,
+        simple_names = None,
+        paths = None,
+        path_regex = None,
+        flags = None,
+        flags_any = None,
+        fqname_prefix = None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn indices_where(
+        &self,
+        py: Python<'_>,
+        kind: Option<String>,
+        kinds: Option<Vec<String>>,
+        filename: Option<String>,
+        filenames: Option<Vec<String>>,
+        simple_name: Option<String>,
+        simple_names: Option<Vec<String>>,
+        paths: Option<Vec<String>>,
+        path_regex: Option<String>,
+        flags: Option<u32>,
+        flags_any: Option<u32>,
+        fqname_prefix: Option<String>,
+    ) -> PyResult<Vec<usize>> {
+        let outputs = self.materialized("indices_where")?;
+        // Merge singular + plural forms once up front.
+        let kinds_vec: Option<Vec<String>> = match (kind, kinds) {
+            (None, None) => None,
+            (Some(s), None) => Some(vec![s]),
+            (None, Some(v)) => Some(v),
+            (Some(s), Some(mut v)) => {
+                v.push(s);
+                Some(v)
+            }
+        };
+        let filenames_vec: Option<Vec<String>> = match (filename, filenames) {
+            (None, None) => None,
+            (Some(s), None) => Some(vec![s]),
+            (None, Some(v)) => Some(v),
+            (Some(s), Some(mut v)) => {
+                v.push(s);
+                Some(v)
+            }
+        };
+        let simple_vec: Option<Vec<String>> = match (simple_name, simple_names) {
+            (None, None) => None,
+            (Some(s), None) => Some(vec![s]),
+            (None, Some(v)) => Some(v),
+            (Some(s), Some(mut v)) => {
+                v.push(s);
+                Some(v)
+            }
+        };
+
+        let kinds_set: Option<rustc_hash::FxHashSet<&str>> = kinds_vec
+            .as_ref()
+            .map(|v| v.iter().map(String::as_str).collect());
+        let filenames_set: Option<rustc_hash::FxHashSet<&str>> = filenames_vec
+            .as_ref()
+            .map(|v| v.iter().map(String::as_str).collect());
+        let simple_set: Option<rustc_hash::FxHashSet<&str>> = simple_vec
+            .as_ref()
+            .map(|v| v.iter().map(String::as_str).collect());
+        let paths_set: Option<rustc_hash::FxHashSet<&str>> = paths
+            .as_ref()
+            .map(|v| v.iter().map(String::as_str).collect());
+
+        let re_compiled: Option<regex::Regex> = match path_regex.as_deref() {
+            None => None,
+            Some(s) => Some(
+                regex::Regex::new(s)
+                    .map_err(|e| PyValueError::new_err(format!("invalid path regex {s:?}: {e}")))?,
+            ),
+        };
+
+        // ``flags`` (all-set) and ``flags_any`` (any-bit) — at most one
+        // should be passed; if both are given, AND them (require all
+        // bits in ``flags`` AND any bit in ``flags_any``).
+        let mut out: Vec<usize> = Vec::new();
+        for (idx, node_py) in outputs.builder.nodes.iter().enumerate() {
+            let node = node_py.borrow(py);
+            if let Some(k) = &kinds_set {
+                if !k.contains(node.kind) {
+                    continue;
+                }
+            }
+            if let Some(p) = &paths_set {
+                if !p.contains(node.path.as_str()) {
+                    continue;
+                }
+            }
+            if let Some(f) = &filenames_set {
+                let path = node.path.as_str();
+                let basename = path
+                    .rsplit_once(std::path::MAIN_SEPARATOR)
+                    .map(|(_, name)| name)
+                    .unwrap_or(path);
+                if !f.contains(basename) {
+                    continue;
+                }
+            }
+            if let Some(s) = &simple_set {
+                let fq = node.fqname.as_str();
+                let simple = fq.rsplit_once('.').map(|(_, n)| n).unwrap_or(fq);
+                if !s.contains(simple) {
+                    continue;
+                }
+            }
+            if let Some(mask) = flags {
+                if node.flags & mask != mask {
+                    continue;
+                }
+            }
+            if let Some(mask) = flags_any {
+                if node.flags & mask == 0 {
+                    continue;
+                }
+            }
+            if let Some(prefix) = &fqname_prefix {
+                if !node.fqname.starts_with(prefix.as_str()) {
+                    continue;
+                }
+            }
+            if let Some(re) = &re_compiled {
+                if !re.is_match(node.path.as_str()) {
+                    continue;
+                }
+            }
+            out.push(idx);
+        }
+        Ok(out)
+    }
+
+    /// Inverse of the ``.indices()`` terminals: materialize specific
+    /// nodes by their positional indices into ``ctx.nodes()``.
+    /// Validates bounds and raises :class:`IndexError` when any index
+    /// is out of range.
+    pub(crate) fn nodes_at(
+        &self,
+        py: Python<'_>,
+        indices: Vec<usize>,
+    ) -> PyResult<Vec<Py<SymbolNode>>> {
+        let outputs = self.materialized("nodes_at")?;
+        let len = outputs.builder.nodes.len();
+        let mut out: Vec<Py<SymbolNode>> = Vec::with_capacity(indices.len());
+        for idx in indices {
+            if idx >= len {
+                return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                    "node index {idx} out of range (len={len})"
+                )));
+            }
+            out.push(outputs.builder.nodes[idx].clone_ref(py));
+        }
+        Ok(out)
+    }
 }
 
 impl ProjectContext {
@@ -3044,13 +3557,13 @@ impl ProjectContext {
     /// is bounded by the (small) number of distinct patterns a plugin
     /// run uses, so unbounded growth isn't a concern in practice.
     pub(crate) fn compile_regex(&self, pattern: &str) -> PyResult<regex::Regex> {
-        if let Some(cached) = self.regex_cache.borrow().get(pattern) {
+        if let Some(cached) = self.regex_cache.lock().get(pattern) {
             return Ok(cached.clone());
         }
         let regex = regex::Regex::new(pattern)
             .map_err(|e| PyValueError::new_err(format!("invalid regex {pattern:?}: {e}")))?;
         self.regex_cache
-            .borrow_mut()
+            .lock()
             .insert(pattern.to_string(), regex.clone());
         Ok(regex)
     }

@@ -156,10 +156,11 @@ class DispatchAppPlugin(Plugin):
             out.setdefault(module, set()).add(name)
         if not self.app_classes:
             return out
-        for sub in ctx.find_subclasses_via_bases(list(self.app_classes)):
-            sub_module, _, sub_name = sub.fqname.rpartition(".")
-            if sub_module and sub_name:
-                out.setdefault(sub_module, set()).add(sub_name)
+        for fqn in self.app_classes:
+            for sub in ctx.subclasses_of_fqn(fqn):
+                sub_module, _, sub_name = sub.fqname.rpartition(".")
+                if sub_module and sub_name:
+                    out.setdefault(sub_module, set()).add(sub_name)
         return out
 
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
@@ -270,31 +271,39 @@ class DispatchAppPlugin(Plugin):
                 for var in direct_by_owner.get(key, []):
                     yield native.AddEdge(var, h.decorated)
 
-        # 6. Factory walk: vars that aren't directly constructed but
-        # whose descendant graph reaches a factory marker get
-        # entrypoint-promoted too. Skipped under seed_as_entrypoint=False.
-        if self.seed_as_entrypoint:
+        # 6. Factory walk: vars whose *direct* successor is one of the
+        # factory decls get entrypoint-promoted. Skipped under
+        # seed_as_entrypoint=False.
+        #
+        # We invert the question: rather than walk each var's
+        # descendants looking for a factory marker, we collect the
+        # direct predecessors of every factory decl into a single set
+        # and check ``var in factory_reachers``. This rules out the
+        # over-promotion case ``wrapper = app; app = create_app()`` —
+        # ``wrapper -> app -> create_app`` is two hops, so ``wrapper``
+        # doesn't reach the factory directly and stays unclassified.
+        # Only ``app`` (whose direct successor *is* ``create_app``)
+        # promotes.
+        if self.seed_as_entrypoint and factory_decls:
+            factory_reachers: set[native.SymbolNode] = set()
+            for fref, _kind in factory_decls:
+                factory_reachers.update(ctx.direct_predecessors(fref.decl))
+
             classified: set[tuple[str, str]] = set()
             for h in handlers:
                 key = (h.decorated.path, h.decorator_owner or "")
                 if key in direct_by_owner or key in classified:
                     continue
                 var = vars_by_file.get(key)
-                if var is None:
+                if var is None or var not in factory_reachers:
                     continue
-                for desc in ctx.descendants(var):
-                    if desc.kind != "synthetic":
-                        continue
-                    if not desc.fqname.startswith(factory_prefix):
-                        continue
-                    classified.add(key)
-                    yield native.AddNode(
-                        fqname=f"{app_prefix}{var.fqname}",
-                        path=var.path,
-                        flags=int(NodeFlags.ENTRYPOINT),
-                        edges_to=[var],
-                    )
-                    break
+                classified.add(key)
+                yield native.AddNode(
+                    fqname=f"{app_prefix}{var.fqname}",
+                    path=var.path,
+                    flags=int(NodeFlags.ENTRYPOINT),
+                    edges_to=[var],
+                )
 
 
 @dataclass(kw_only=True)
@@ -327,13 +336,16 @@ class LiteralListPlugin(Plugin):
             return
 
         prefix = f"<{self.marker_prefix}>:"
+        # One batched scan of the module / decl index maps for every
+        # entry, instead of N independent scans. Each entry resolves
+        # as either a module fqname (revive the whole surface,
+        # mirroring ``importlib.import_module``) or a single decl
+        # fqname — try both; some entries may match both (e.g.
+        # ``pkg.foo`` where ``foo`` is also a re-exported decl in
+        # ``pkg/__init__.py``).
+        surfaces = ctx.module_surfaces(entries)
         for entry in entries:
-            # Each entry resolves as either a module fqname (revive the
-            # whole surface, mirroring ``importlib.import_module``) or a
-            # single decl fqname. Try both; some entries may match both
-            # (e.g. ``pkg.foo`` where ``foo`` is also a re-exported decl
-            # in ``pkg/__init__.py``).
-            targets: list[native.SymbolNode] = list(ctx.module_surface(entry))
+            targets: list[native.SymbolNode] = list(surfaces.get(entry, ()))
             targets.extend(ctx.find_declarations(entry))
             if not targets:
                 continue

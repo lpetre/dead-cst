@@ -350,12 +350,13 @@ dependencies = [
 
 [[package]]
 name = "dead-cst-native"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "bincode",
  "crossbeam-channel",
  "get-size2",
  "indicatif",
+ "parking_lot",
  "pyo3",
  "rayon",
  "regex",

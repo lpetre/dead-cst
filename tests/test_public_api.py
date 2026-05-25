@@ -62,6 +62,7 @@ EXPECTED_PUBLIC_API: dict[str, list[str]] = {
         "fastapi_plugin",
         "fastmcp_plugin",
         "flask_plugin",
+        "slack_bolt_plugin",
         "typer_plugin",
     ],
 }

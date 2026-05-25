@@ -185,6 +185,25 @@ class AddEdge:
 
     def __init__(self, src: SymbolNode, dst: SymbolNode, *, flags: int = 0) -> None: ...
 
+class AddEdgeByIdx:
+    """Index-keyed variant of :class:`AddEdge`. Accepts positional
+    indices into ``ctx.nodes()`` instead of ``SymbolNode`` references.
+
+    Lets plugins that already work in index space (paired with the
+    ``.indices()`` query terminals or
+    :meth:`ProjectContext.indices_where`) emit edges without ever
+    round-tripping through ``Py<SymbolNode>``. The apply pass treats
+    it identically to :class:`AddEdge` once the indices land in the
+    builder. Raises :class:`IndexError` at apply time when either
+    endpoint is out of range.
+    """
+
+    src_idx: int
+    dst_idx: int
+    flags: int
+
+    def __init__(self, src_idx: int, dst_idx: int, *, flags: int = 0) -> None: ...
+
 class AddEntrypoint:
     """Mark ``decl`` as an entrypoint.
 
@@ -235,7 +254,7 @@ class AddNode:
         edges_to: Iterable[SymbolNode] = ...,
     ) -> None: ...
 
-GraphOp = AddEdge | AddEntrypoint | AddNode
+GraphOp = AddEdge | AddEdgeByIdx | AddEntrypoint | AddNode
 
 class NativeGraph:
     """The project-wide graph snapshot returned by ``Project.build()``
@@ -341,6 +360,28 @@ class ProjectContext:
         """
         ...
 
+    def build_only(self) -> None:
+        """Run only the project-wide build pass, without invoking any
+        registered plugins. Used by :class:`dead_cst.Analysis` to
+        split build from the plugin pass so the latter can run on a
+        Python :class:`concurrent.futures.ThreadPoolExecutor`."""
+        ...
+
+    def run_plugin(self, plugin: _ProjectPluginLike | Any) -> None:
+        """Invoke ``plugin.run(ctx)`` once, applying every yielded
+        op to the graph as it comes off the iterator. Safe to call
+        concurrently from multiple Python threads — graph mutations
+        serialize on the rust-side lock while read-only queries on
+        the in-progress graph run in parallel."""
+        ...
+
+    def snapshot_graph(self) -> NativeGraph:
+        """Snapshot the current graph (post-:meth:`build_only` +
+        any :meth:`run_plugin` calls) as a :class:`NativeGraph`.
+        Used by :class:`dead_cst.Analysis` to return the final graph
+        without re-running :meth:`materialize`."""
+        ...
+
     def query(self) -> QueryBuilder:
         """Open a chainable query builder against this context.
 
@@ -381,34 +422,44 @@ class ProjectContext:
         """
         ...
 
-    def find_subclasses_via_bases(self, base_fqns: list[str]) -> list[SymbolNode]:
-        """Every project class that transitively inherits from any
-        fqname in ``base_fqns``, computed by walking the project's
-        ``ClassDef`` base lists directly instead of asking ty's
-        ``find_references`` to walk down from each base.
+    def subclasses_of_fqn(self, fqn: str, *, transitive: bool = True) -> list[SymbolNode]:
+        """Project classes that inherit from the class identified by
+        ``fqn``. ``fqn`` may name a project or external class.
 
-        Roughly equivalent to calling :meth:`find_subclasses` once per
-        ``base_fqn`` and unioning the results — but the framework
-        modules are never loaded out of the venv, so cold-cache cost
-        scales with project file count rather than venv parse cost.
-        Useful when the targets are external classes that ty would
-        otherwise force-load (``flask.Flask``, ``typer.Typer``, …).
+        Backed by a project-wide index built once at materialize time
+        from each file's per-class resolved base list, so external
+        seeds (``flask.Flask``, ``typer.Typer``) are answered without
+        loading the framework out of the venv. ``transitive=True``
+        (default) walks the full subclass closure; ``transitive=False``
+        returns only direct subclasses.
 
         Match shapes per base expression in a class header:
 
         * ``Name(X)`` where ``X`` is imported via
-          ``from <module> import X [as alias]`` resolves to
+          ``from <module> import X [as alias]`` matches
           ``<module>.X``;
         * ``Attribute(Name(M).N)`` where ``M`` is bound via
-          ``import <module> [as M]`` resolves to ``<module>.N``;
-        * dotted ``a.b.c.N`` rooted at an imported name resolves to
-          ``<a-upstream>.b.c.N``;
+          ``import <module> [as M]`` matches ``<module>.N``;
+        * dotted ``a.b.c.N`` rooted at an imported name matches the
+          flat ``<a-upstream>.b.c.N`` fqname;
         * a bare ``Name(X)`` referring to a class defined in the same
-          file (``class Sub(Local): ...``).
+          file participates in node-keyed walks.
 
         Generic parameterizations (``class C(Foo[T])``) and other
-        non-identifier base expressions are skipped — accept that
-        cost; it matches the libcst pipeline's behavior.
+        non-identifier base expressions are skipped — matches the
+        libcst pipeline's behavior.
+        """
+        ...
+
+    def subclasses_of_node(
+        self, class_node: SymbolNode, *, transitive: bool = True
+    ) -> list[SymbolNode]:
+        """Project classes that inherit from ``class_node``.
+
+        Sibling of :meth:`subclasses_of_fqn` for callers that already
+        hold the seed as a ``SymbolNode``. Returns an empty list when
+        ``class_node`` isn't of class kind or isn't found in the
+        project's class-by-selection index.
         """
         ...
 
@@ -464,6 +515,20 @@ class ProjectContext:
         """
         ...
 
+    def module_surfaces(self, module_fqns: list[str]) -> dict[str, list[SymbolNode]]:
+        """Batched form of :meth:`module_surface`. Resolves every
+        fqname in ``module_fqns`` in a single scan of the internal
+        ``module_by_fqname`` and ``decl_by_fqname`` indices instead
+        of one scan per fqname.
+
+        Returns a dict keyed by input fqname; modules that don't
+        resolve map to empty lists. Duplicate inputs share the same
+        result list. Use when a plugin needs to resolve many module
+        surfaces in one shot (``LiteralListPlugin``'s ``__all__``
+        entries, ``DiscordPyPlugin``'s ``load_extensions`` args, …).
+        """
+        ...
+
     def find_module_top_level_decls(self, module_fqn: str) -> list[SymbolNode]:
         """``module_fqn``'s immediate top-level decls — every
         function / class / variable / import bound at its module scope.
@@ -474,6 +539,16 @@ class ProjectContext:
         excluded — a ``from p.functions import *`` doesn't pull in
         ``p.functions.sub.x``. Empty list when ``module_fqn`` doesn't
         resolve to a project module.
+        """
+        ...
+
+    def find_module_top_level_decls_indices(self, module_fqn: str) -> list[int]:
+        """Idx-only variant of :meth:`find_module_top_level_decls`.
+
+        Returns positional indices into :meth:`nodes` rather than
+        allocating ``SymbolNode`` clones — pair with
+        :class:`AddEdgeByIdx` to skip the ``SymbolNode -> idx``
+        round-trip when emitting edges to every export of a module.
         """
         ...
 
@@ -489,6 +564,15 @@ class ProjectContext:
         matters: callers that want CPython's ``from X import *``
         semantics should fall back to the non-underscore decl list
         only in the ``None`` case.
+        """
+        ...
+
+    def find_module_dunder_all_exports_indices(self, module_fqn: str) -> list[int] | None:
+        """Idx-only variant of :meth:`find_module_dunder_all_exports`.
+
+        ``None`` still means "no ``__all__``"; ``[]`` means "empty /
+        unresolvable ``__all__``" — same semantics as the
+        ``SymbolNode``-returning version.
         """
         ...
 
@@ -570,10 +654,69 @@ class ProjectContext:
         """
         ...
 
+    def direct_predecessors(self, node: SymbolNode, *, skip_flags: int = 0) -> list[SymbolNode]:
+        """One-hop reverse step: every node with an edge directly into
+        ``node``.
+
+        Unlike :meth:`ancestors`, this does *not* take the transitive
+        closure — it only returns the immediate predecessors. Dedups by
+        source node, so a pair of parallel edges with different
+        :class:`EdgeFlags` between the same two nodes only produces one
+        entry. ``skip_flags`` filters edges by intersecting flag mask —
+        same semantics as :meth:`ancestors`.
+        """
+        ...
+
     def reachable(self, *, skip_flags: int = 0, seed_flags: int = ...) -> list[SymbolNode]:
         """Forward closure from every node carrying any bit in
         ``seed_flags`` (defaults to :data:`NodeFlags.ENTRYPOINT`). The
         set of dead decls is the complement against :meth:`nodes`."""
+        ...
+
+    def reachable_indices(self, *, skip_flags: int = 0, seed_flags: int = ...) -> list[int]:
+        """Idx-only sibling of :meth:`reachable`. Same semantics, but
+        returns positional indices into :meth:`nodes` instead of
+        materialising ``SymbolNode`` clones. Use when you only need
+        set-membership / counting on the reached set — pair with
+        :meth:`nodes_at` to revive specific nodes on demand.
+        """
+        ...
+
+    def indices_where(
+        self,
+        *,
+        kind: str | None = None,
+        kinds: list[str] | None = None,
+        filename: str | None = None,
+        filenames: list[str] | None = None,
+        simple_name: str | None = None,
+        simple_names: list[str] | None = None,
+        paths: list[str] | None = None,
+        path_regex: str | None = None,
+        flags: int | None = None,
+        flags_any: int | None = None,
+        fqname_prefix: str | None = None,
+    ) -> list[int]:
+        """Flat-form predicate filter returning positional indices into
+        :meth:`nodes`. Mirrors the :class:`DeclQuery` predicate
+        vocabulary but skips the builder construction — useful when
+        you only have one filter step and just need a ``list[int]``.
+
+        Every parameter is keyword-only and optional; unset arguments
+        don't filter. ``kind`` / ``kinds`` (and similarly the
+        ``filename`` / ``simple_name`` pairs) are merged; pass either
+        form. All set predicates AND together. ``flags`` is the
+        all-bits-set form (``node.flags & mask == mask``);
+        ``flags_any`` is the any-bit form (``node.flags & mask != 0``).
+        """
+        ...
+
+    def nodes_at(self, indices: Sequence[int]) -> list[SymbolNode]:
+        """Inverse of the ``.indices()`` terminals: materialize
+        specific nodes by their positional indices into :meth:`nodes`.
+        Validates bounds and raises :class:`IndexError` when any index
+        is out of range.
+        """
         ...
 
     # ----- Pure scans over the in-progress graph ------------------------
@@ -943,6 +1086,13 @@ class SubclassQuery:
     def collect(self) -> list[SymbolNode]: ...
     def count(self) -> int: ...
     def __iter__(self) -> Iterator[SymbolNode]: ...
+    def indices(self) -> list[int]:
+        """Index-returning terminal. Same lookup as :meth:`collect`,
+        but emits each subclass's positional index into
+        :meth:`ProjectContext.nodes` instead of allocating
+        ``SymbolNode`` clones.
+        """
+        ...
 
 class ImportQuery:
     """Enumerate the ``kind="import"`` nodes that bind a name from a
@@ -953,6 +1103,13 @@ class ImportQuery:
 
     def of(self, module: str) -> ImportQuery: ...
     def collect(self) -> list[SymbolNode]: ...
+    def indices(self) -> list[int]:
+        """Index-returning terminal. Reads positional indices straight
+        out of the pre-built ``imports_by_module`` index — no Python
+        allocation per row.
+        """
+        ...
+
     def count(self) -> int: ...
     def exists(self) -> bool:
         """O(1) presence probe — does any project file import the
@@ -976,6 +1133,13 @@ class ClassQuery:
     def collect(self) -> list[SymbolNode]: ...
     def count(self) -> int: ...
     def __iter__(self) -> Iterator[SymbolNode]: ...
+    def indices(self) -> list[int]:
+        """Index-returning terminal. Same per-file parallel walk as
+        :meth:`collect`, but emits positional indices into
+        :meth:`ProjectContext.nodes` instead of allocating
+        ``SymbolNode`` clones.
+        """
+        ...
 
 class FactoryRef:
     """One result row from :class:`FactoryQuery`.
@@ -1054,6 +1218,18 @@ class EdgeQuery:
     def first(self) -> EdgeRef | None: ...
     def count(self) -> int: ...
     def __iter__(self) -> Iterator[EdgeRef]: ...
+    def index_triples(self) -> list[tuple[int, int, int]]:
+        """Index-returning terminal for edges. Same per-edge predicate
+        pipeline as :meth:`collect`, but emits ``(src_idx, dst_idx,
+        flags)`` triples instead of materialising one :class:`EdgeRef`
+        (and two ``SymbolNode`` clones) per row.
+
+        Faster than :meth:`collect` when you only need set-membership
+        / counting over edge endpoints; pair with
+        :meth:`ProjectContext.nodes_at` to revive the surviving
+        endpoints on demand.
+        """
+        ...
 
 class DeclQuery:
     """Generic filter over every interned node in the in-progress graph.
@@ -1080,7 +1256,28 @@ class DeclQuery:
         """Restrict to nodes whose ``flags & mask != 0`` (any bit set)."""
         ...
 
-    def with_fqname_prefix(self, prefix: str) -> DeclQuery: ...
+    def with_fqname_prefix(self, prefix: str) -> DeclQuery:
+        """Restrict to nodes whose ``fqname`` starts with ``prefix`` —
+        a raw string prefix, not segment-bounded. ``prefix="foo"``
+        matches both ``foo.bar`` and ``foobar``. Use
+        :meth:`with_fqname_under` for the segment-bounded
+        "descendants of this fqname" predicate that walks the fqname
+        tree via the ``children_by_parent`` index.
+        """
+        ...
+
+    def with_fqname_under(self, parent_fqn: str) -> DeclQuery:
+        """Restrict to nodes whose ``fqname`` equals ``parent_fqn``
+        or is a transitive descendant of it in the fqname tree.
+
+        Segment-bounded: ``parent_fqn="pkg.foo"`` matches ``pkg.foo``,
+        ``pkg.foo.bar``, ``pkg.foo.bar.baz`` — but **not** ``pkg.foobar``.
+        Backed by the project's ``children_by_parent`` index, so this
+        is O(matches) instead of the O(all_nodes) scan
+        :meth:`with_fqname_prefix` performs.
+        """
+        ...
+
     def where_fqname(
         self,
         value: str | re.Pattern[str] | Sequence[str | re.Pattern[str]],
@@ -1099,6 +1296,20 @@ class DeclQuery:
     def collect(self) -> list[SymbolNode]: ...
     def count(self) -> int: ...
     def __iter__(self) -> Iterator[SymbolNode]: ...
+    def indices(self) -> list[int]:
+        """Index-returning terminal. Same predicate semantics as
+        :meth:`collect`, but emits each surviving node's positional
+        index into :meth:`ProjectContext.nodes` (a plain
+        ``list[int]``) instead of allocating one ``SymbolNode`` per
+        row.
+
+        Use when you only need set membership / counting on the
+        surviving nodes (or want to feed an index-keyed
+        :class:`AddEdgeByIdx`); call
+        :meth:`ProjectContext.nodes_at` to materialize back to
+        ``SymbolNode`` later.
+        """
+        ...
 
 # ---------- Graph persistence --------------------------------------------
 

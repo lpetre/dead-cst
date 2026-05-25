@@ -388,5 +388,53 @@ def test_fastmcp_plugin_factory_returns_configured_dispatch_app():
     plugin = fastmcp_plugin()
     assert isinstance(plugin, DispatchAppPlugin)
     assert plugin.marker_prefix == "fastmcp"
-    assert plugin.app_classes == ("fastmcp.FastMCP",)
+    assert plugin.app_classes == ("fastmcp.FastMCP", "mcp.server.fastmcp.FastMCP")
     assert plugin.seed_as_entrypoint is True
+
+
+def test_fastmcp_plugin_handles_anthropic_mcp_sdk_import(build_plugin_graph, reachable_fqnames):
+    """The Anthropic MCP SDK ships a compatibility layer at
+    ``mcp.server.fastmcp.FastMCP``. Projects on that path should get
+    the same handler wiring as the standalone ``fastmcp`` package."""
+    graph = build_plugin_graph(
+        {
+            "server/__init__.py": "",
+            "server/main.py": """
+            from mcp.server.fastmcp import FastMCP
+
+            mcp = FastMCP("demo")
+
+            @mcp.tool()
+            def hello(): pass
+
+            @mcp.resource("res://config")
+            def config() -> dict:
+                return {}
+            """,
+        },
+        [fastmcp_plugin()],
+    )
+    reached = reachable_fqnames(graph)
+    assert "server.main.mcp" in reached
+    assert "server.main.hello" in reached
+    assert "server.main.config" in reached
+
+
+def test_fastmcp_plugin_handles_anthropic_sdk_module_import(build_plugin_graph, reachable_fqnames):
+    """``import mcp.server.fastmcp; mcp.server.fastmcp.FastMCP(...)`` —
+    the module-attribute form of the Anthropic SDK import."""
+    graph = build_plugin_graph(
+        {
+            "server/__init__.py": "",
+            "server/main.py": """
+            import mcp.server.fastmcp
+
+            srv = mcp.server.fastmcp.FastMCP("demo")
+
+            @srv.tool()
+            def hello(): pass
+            """,
+        },
+        [fastmcp_plugin()],
+    )
+    assert "server.main.hello" in reachable_fqnames(graph)

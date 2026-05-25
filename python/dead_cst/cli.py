@@ -39,6 +39,7 @@ from .contrib.flask import flask_plugin
 from .contrib.mock_patch import MockPatchPlugin
 from .contrib.pytest import PytestPlugin
 from .contrib.server_config import ServerConfigPlugin
+from .contrib.slack_bolt import slack_bolt_plugin
 from .contrib.typer import typer_plugin
 from .contrib.unittest import UnittestPlugin
 from .graph import (
@@ -86,6 +87,7 @@ _BUILTIN_PLUGINS: dict[str, Plugin] = {
     "cyclopts": cyclopts_plugin(),
     "celery": CeleryPlugin(),
     "discordpy": DiscordPyPlugin(),
+    "slack_bolt": slack_bolt_plugin(),
     "init_subclass": InitSubclassPlugin(),
     "dynamic_import_fallback": DynamicImportFallbackPlugin(),
 }
