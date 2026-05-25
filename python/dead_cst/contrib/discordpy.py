@@ -121,20 +121,28 @@ class DiscordPyPlugin(Plugin):
                 )
 
         # 5. load_extension / load_extensions string-literal targets.
+        # Collect the (owner_path, extension_fqname) pairs in order
+        # first so the module-surface lookup runs in a single batched
+        # scan instead of one scan per call site.
         seen_extensions: set[str] = set()
+        pending: list[tuple[str, str]] = []
         for attr in ("load_extension", "load_extensions"):
             for cref in native.query(ctx).calls().where_attr(attr).string_arg_at(0):
                 if cref.owner.path not in discord_paths:
                     continue
                 if cref.string_arg in seen_extensions:
                     continue
-                targets = list(ctx.module_surface(cref.string_arg))
+                seen_extensions.add(cref.string_arg)
+                pending.append((cref.owner.path, cref.string_arg))
+        if pending:
+            surfaces = ctx.module_surfaces([ext for _, ext in pending])
+            for owner_path, ext_fqname in pending:
+                targets = surfaces.get(ext_fqname, [])
                 if not targets:
                     continue
-                seen_extensions.add(cref.string_arg)
                 yield native.AddNode(
-                    fqname=f"{DISCORDPY_EXTENSION_PREFIX}{cref.string_arg}",
-                    path=cref.owner.path,
+                    fqname=f"{DISCORDPY_EXTENSION_PREFIX}{ext_fqname}",
+                    path=owner_path,
                     flags=int(NodeFlags.ENTRYPOINT),
                     edges_to=targets,
                 )

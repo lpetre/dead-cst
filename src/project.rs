@@ -1634,6 +1634,70 @@ impl ProjectContext {
         }
         Ok(out)
     }
+
+    /// Batched form of :meth:`module_surface`. Resolves every fqname
+    /// in ``module_fqns`` in a single scan of ``module_by_fqname`` +
+    /// ``decl_by_fqname`` instead of one scan per fqname. The N
+    /// per-call materialize-lookup + N scans collapse to one of each.
+    /// Returns a dict keyed by input fqname; missing modules map to
+    /// empty lists. Duplicate inputs share the same result list.
+    pub(crate) fn module_surfaces(
+        &self,
+        py: Python<'_>,
+        module_fqns: Vec<String>,
+    ) -> PyResult<FxHashMap<String, Vec<Py<SymbolNode>>>> {
+        let outputs = self.materialized("module_surfaces")?;
+        // Deduplicate the requested fqnames + pre-stage each one's
+        // (prefix, output vec) so a single map iteration can drop
+        // matches into the right bucket. Skip fqnames that don't name
+        // a project module — same per-call short-circuit as the
+        // singular ``module_surface``.
+        let mut buckets: FxHashMap<String, Vec<Py<SymbolNode>>> =
+            FxHashMap::with_capacity_and_hasher(module_fqns.len(), Default::default());
+        let mut prefixes: Vec<(String, String)> = Vec::with_capacity(module_fqns.len());
+        for fqn in &module_fqns {
+            if buckets.contains_key(fqn) {
+                continue;
+            }
+            let Some(&module_idx) = outputs.module_by_fqname.get(fqn) else {
+                buckets.insert(fqn.clone(), Vec::new());
+                continue;
+            };
+            buckets.insert(
+                fqn.clone(),
+                vec![outputs.builder.nodes[module_idx].clone_ref(py)],
+            );
+            prefixes.push((fqn.clone(), format!("{fqn}.")));
+        }
+        if prefixes.is_empty() {
+            return Ok(buckets);
+        }
+        // Single sweep over each map; per-fqname row goes into every
+        // bucket whose prefix matches. K small (≤ inputs), so the
+        // nested-loop ``starts_with`` is fine — a prefix trie would
+        // only help for K in the hundreds.
+        for (fqname, &idx) in &outputs.module_by_fqname {
+            for (key, prefix) in &prefixes {
+                if fqname.starts_with(prefix) {
+                    buckets
+                        .get_mut(key)
+                        .expect("seeded above")
+                        .push(outputs.builder.nodes[idx].clone_ref(py));
+                }
+            }
+        }
+        for (fqname, idxs) in &outputs.decl_by_fqname {
+            for (key, prefix) in &prefixes {
+                if fqname.starts_with(prefix) {
+                    let bucket = buckets.get_mut(key).expect("seeded above");
+                    for &idx in idxs {
+                        bucket.push(outputs.builder.nodes[idx].clone_ref(py));
+                    }
+                }
+            }
+        }
+        Ok(buckets)
+    }
 }
 
 #[pymethods]

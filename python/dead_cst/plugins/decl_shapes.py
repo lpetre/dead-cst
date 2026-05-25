@@ -336,13 +336,16 @@ class LiteralListPlugin(Plugin):
             return
 
         prefix = f"<{self.marker_prefix}>:"
+        # One batched scan of the module / decl index maps for every
+        # entry, instead of N independent scans. Each entry resolves
+        # as either a module fqname (revive the whole surface,
+        # mirroring ``importlib.import_module``) or a single decl
+        # fqname — try both; some entries may match both (e.g.
+        # ``pkg.foo`` where ``foo`` is also a re-exported decl in
+        # ``pkg/__init__.py``).
+        surfaces = ctx.module_surfaces(entries)
         for entry in entries:
-            # Each entry resolves as either a module fqname (revive the
-            # whole surface, mirroring ``importlib.import_module``) or a
-            # single decl fqname. Try both; some entries may match both
-            # (e.g. ``pkg.foo`` where ``foo`` is also a re-exported decl
-            # in ``pkg/__init__.py``).
-            targets: list[native.SymbolNode] = list(ctx.module_surface(entry))
+            targets: list[native.SymbolNode] = list(surfaces.get(entry, ()))
             targets.extend(ctx.find_declarations(entry))
             if not targets:
                 continue

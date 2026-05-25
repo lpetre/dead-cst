@@ -515,6 +515,20 @@ class ProjectContext:
         """
         ...
 
+    def module_surfaces(self, module_fqns: list[str]) -> dict[str, list[SymbolNode]]:
+        """Batched form of :meth:`module_surface`. Resolves every
+        fqname in ``module_fqns`` in a single scan of the internal
+        ``module_by_fqname`` and ``decl_by_fqname`` indices instead
+        of one scan per fqname.
+
+        Returns a dict keyed by input fqname; modules that don't
+        resolve map to empty lists. Duplicate inputs share the same
+        result list. Use when a plugin needs to resolve many module
+        surfaces in one shot (``LiteralListPlugin``'s ``__all__``
+        entries, ``DiscordPyPlugin``'s ``load_extensions`` args, …).
+        """
+        ...
+
     def find_module_top_level_decls(self, module_fqn: str) -> list[SymbolNode]:
         """``module_fqn``'s immediate top-level decls — every
         function / class / variable / import bound at its module scope.
