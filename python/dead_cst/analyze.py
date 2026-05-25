@@ -5,7 +5,7 @@ import threading
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Iterator, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Sequence, TypedDict
 
 from .graph import KEEPALIVE_DEFAULT, EdgeFlags, SymbolNode
 
@@ -40,6 +40,40 @@ PROGRESS_POLL_INTERVAL_S: float = 0.1
 
 ProgressEvent = str
 ProgressCallback = Callable[..., None]
+
+
+class ProgressSnapshot(TypedDict):
+    """Shape returned by :meth:`native.ProjectContext.read_progress_snapshot`
+    and :meth:`native.ProgressHandle.snapshot`.
+
+    Every counter field is an integer in either microseconds (the
+    ``*_elapsed_us`` keys) or item count (``*_done`` / ``*_total``).
+    The ``phase`` discriminant maps to one of
+    :data:`PROGRESS_PHASES` via :data:`_PHASE_ID_TO_NAME`.
+    ``plugin_states`` carries one ``(name, started_us, finished_us)``
+    triple per registered plugin in registration order; both
+    timestamps are ``0`` until stamped (``started_us == 0`` ⇔ not
+    yet running, ``finished_us == 0`` ⇔ still running).
+    """
+
+    phase: int
+    finished: bool
+    enum_done: int
+    enum_total: int
+    enum_elapsed_us: int
+    populate_done: int
+    populate_total: int
+    populate_elapsed_us: int
+    assemble_done: int
+    assemble_total: int
+    assemble_elapsed_us: int
+    fqname_done: int
+    fqname_total: int
+    fqname_elapsed_us: int
+    plugins_done: int
+    plugins_total: int
+    plugins_elapsed_us: int
+    plugin_states: list[tuple[str, int, int]]
 
 
 _NON_DECL_TYPES: frozenset[str] = frozenset({"module", "synthetic"})
@@ -231,42 +265,36 @@ class _ProgressPoller:
                 # without one here to avoid racing against it.
                 return
 
-    def _dispatch(self, snap: dict[str, object]) -> None:
+    def _dispatch(self, snap: ProgressSnapshot) -> None:
         # Map snapshot fields to per-phase (done, total, elapsed_us).
-        # The snapshot dict is ``dict[str, object]`` since
-        # ``plugin_states`` is a list-of-tuples; every other value is
-        # an int. Read with a per-key ``int(...)`` cast so the type
-        # checker sees the narrow type without giving up the heterogeneous
-        # dict shape.
-        def _i(key: str) -> int:
-            v = snap[key]
-            assert isinstance(v, int), f"expected int for {key!r}, got {type(v).__name__}"
-            return v
-
         phase_stats: dict[str, tuple[int, int, int]] = {
-            "enum": (_i("enum_done"), _i("enum_total"), _i("enum_elapsed_us")),
+            "enum": (
+                snap["enum_done"],
+                snap["enum_total"],
+                snap["enum_elapsed_us"],
+            ),
             "populate": (
-                _i("populate_done"),
-                _i("populate_total"),
-                _i("populate_elapsed_us"),
+                snap["populate_done"],
+                snap["populate_total"],
+                snap["populate_elapsed_us"],
             ),
             "assemble": (
-                _i("assemble_done"),
-                _i("assemble_total"),
-                _i("assemble_elapsed_us"),
+                snap["assemble_done"],
+                snap["assemble_total"],
+                snap["assemble_elapsed_us"],
             ),
             "fqname": (
-                _i("fqname_done"),
-                _i("fqname_total"),
-                _i("fqname_elapsed_us"),
+                snap["fqname_done"],
+                snap["fqname_total"],
+                snap["fqname_elapsed_us"],
             ),
             "plugins": (
-                _i("plugins_done"),
-                _i("plugins_total"),
-                _i("plugins_elapsed_us"),
+                snap["plugins_done"],
+                snap["plugins_total"],
+                snap["plugins_elapsed_us"],
             ),
         }
-        current_phase_id = _i("phase")
+        current_phase_id = snap["phase"]
 
         for name in PROGRESS_PHASES:
             done, total, elapsed_us = phase_stats[name]
@@ -360,7 +388,7 @@ class _ProgressPoller:
                     elapsed_ms=elapsed_us // 1000,
                 )
 
-    def _emit_plugin_events_from_slots(self, snap: dict[str, object], total: int) -> None:
+    def _emit_plugin_events_from_slots(self, snap: ProgressSnapshot, total: int) -> None:
         """Diff the rust per-plugin slot snapshot against
         ``_plugins_signalled_{start,end}`` and fire one event per
         observed transition.
@@ -378,26 +406,9 @@ class _ProgressPoller:
         parallel ``ThreadPoolExecutor`` pass — each slot writes only
         to its own atomic so attribution is exact.
         """
-        raw = snap.get("plugin_states")
-        # ``raw`` is a rust-built ``list[tuple[str, u64, u64]]``.
-        # Narrow + flatten into typed locals so ty sees the field
-        # types on the unpacked names rather than ``object``.
-        if not isinstance(raw, list):
-            return
-        plugin_total = total if total > 0 else len(raw)
-        for idx, triple in enumerate(raw):
-            if not isinstance(triple, tuple) or len(triple) != 3:
-                continue
-            name_obj, started_obj, finished_obj = triple
-            if not (
-                isinstance(name_obj, str)
-                and isinstance(started_obj, int)
-                and isinstance(finished_obj, int)
-            ):
-                continue
-            name: str = name_obj
-            started_us: int = started_obj
-            finished_us: int = finished_obj
+        states = snap["plugin_states"]
+        plugin_total = total if total > 0 else len(states)
+        for idx, (name, started_us, finished_us) in enumerate(states):
             if started_us > 0 and idx not in self._plugins_signalled_start:
                 self._plugins_signalled_start.add(idx)
                 _safe_invoke_callback(

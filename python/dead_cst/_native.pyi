@@ -11,7 +11,10 @@ should land in both places at once.
 """
 
 import re
-from typing import Any, Iterable, Iterator, Literal, Protocol, Sequence
+from typing import TYPE_CHECKING, Any, Iterable, Iterator, Literal, Protocol, Sequence
+
+if TYPE_CHECKING:
+    from dead_cst.analyze import ProgressSnapshot
 
 # The set of stable kind strings ``SymbolNode.kind`` can carry. Use a
 # ``Literal`` rather than ``str`` so the type checker catches typos at
@@ -417,18 +420,12 @@ class ProjectContext:
         without re-running :meth:`materialize`."""
         ...
 
-    def read_progress_snapshot(self) -> dict[str, object]:
-        """Atomic snapshot of the build-progress counters as a plain
-        :class:`dict`. Drives :class:`dead_cst.Analysis`'s polling
-        thread; user code should prefer the structured
-        ``progress_callback`` API on :class:`dead_cst.Analysis`.
-
-        Most values are integers; the ``phase`` discriminant maps to
-        one of :data:`dead_cst.analyze.PROGRESS_PHASES`. The
-        ``plugin_states`` value is a ``list[tuple[str, int, int]]``
-        of ``(name, started_us, finished_us)`` triples in
-        registration order — ``started_us == 0`` means "not yet
-        running", ``finished_us == 0`` means "still running".
+    def read_progress_snapshot(self) -> "ProgressSnapshot":
+        """Atomic snapshot of the build-progress counters as a
+        :class:`dead_cst.analyze.ProgressSnapshot` ``TypedDict``.
+        Drives :class:`dead_cst.Analysis`'s polling thread; user code
+        should prefer the structured ``progress_callback`` API on
+        :class:`dead_cst.Analysis`.
 
         ``materialize`` holds the context's ``borrow_mut`` for the
         whole build, so a concurrent polling thread calling this
@@ -1449,7 +1446,7 @@ class ProgressHandle:
     handle to read counters concurrently with a long-running build.
     """
 
-    def snapshot(self) -> dict[str, object]:
+    def snapshot(self) -> "ProgressSnapshot":
         """Atomic snapshot of every counter as a plain Python dict
         (``int`` values; ``finished`` is ``bool``). Same key set as
         :meth:`ProjectContext.read_progress_snapshot`."""
