@@ -11,7 +11,10 @@ should land in both places at once.
 """
 
 import re
-from typing import Any, Iterable, Iterator, Literal, Protocol, Sequence
+from typing import TYPE_CHECKING, Any, Iterable, Iterator, Literal, Protocol, Sequence
+
+if TYPE_CHECKING:
+    from dead_cst.analyze import ProgressSnapshot
 
 # The set of stable kind strings ``SymbolNode.kind`` can carry. Use a
 # ``Literal`` rather than ``str`` so the type checker catches typos at
@@ -256,6 +259,19 @@ class AddNode:
 
 GraphOp = AddEdge | AddEdgeByIdx | AddEntrypoint | AddNode
 
+class CollectedOps:
+    """Opaque handle to one plugin's collected graph ops.
+
+    Returned by :meth:`ProjectContext.run_plugin_collect`; consumed by
+    :meth:`ProjectContext.apply_ops_batched`. The handle is single-use:
+    a second ``apply_ops_batched`` on the same instance raises
+    :class:`ValueError`.
+
+    There is no Python-side constructor or accessor — the type exists
+    solely as a transport for the (pure-rust) prepared ops between
+    the collect and apply phases of plugin execution.
+    """
+
 class NativeGraph:
     """The project-wide graph snapshot returned by ``Project.build()``
     and ``ProjectContext.materialize()``.
@@ -368,11 +384,33 @@ class ProjectContext:
         ...
 
     def run_plugin(self, plugin: _ProjectPluginLike | Any) -> None:
-        """Invoke ``plugin.run(ctx)`` once, applying every yielded
-        op to the graph as it comes off the iterator. Safe to call
-        concurrently from multiple Python threads — graph mutations
-        serialize on the rust-side lock while read-only queries on
-        the in-progress graph run in parallel."""
+        """Invoke ``plugin.run(ctx)`` once, collecting every yielded
+        op and applying the batch under one write-lock window at
+        the end. The plugin's own emissions are invisible to its
+        own queries — the graph is frozen for the duration of
+        ``run``. Prefer :meth:`run_plugin_collect` +
+        :meth:`apply_ops_batched` when driving multiple plugins
+        concurrently so the apply pass runs once for the full
+        cohort."""
+        ...
+
+    def run_plugin_collect(self, plugin: _ProjectPluginLike | Any) -> CollectedOps:
+        """Invoke ``plugin.run(ctx)`` once and return its yielded ops
+        as an opaque :class:`CollectedOps` handle without mutating
+        the graph. Safe to call concurrently from multiple Python
+        threads — the graph is read-only for the duration. The
+        handle is passed (alongside other plugins' handles) to
+        :meth:`apply_ops_batched`, which folds them all into the
+        graph under one write-lock window."""
+        ...
+
+    def apply_ops_batched(self, ops: list[CollectedOps]) -> None:
+        """Apply a list of :class:`CollectedOps` handles to the graph
+        in list order under a single write-lock window. Each handle
+        is consumed; re-applying the same handle raises
+        :class:`ValueError`. Ops within a handle apply in the order
+        the plugin yielded them; ops across handles apply in
+        ``ops`` order."""
         ...
 
     def snapshot_graph(self) -> NativeGraph:
@@ -380,6 +418,71 @@ class ProjectContext:
         any :meth:`run_plugin` calls) as a :class:`NativeGraph`.
         Used by :class:`dead_cst.Analysis` to return the final graph
         without re-running :meth:`materialize`."""
+        ...
+
+    def read_progress_snapshot(self) -> "ProgressSnapshot":
+        """Atomic snapshot of the build-progress counters as a
+        :class:`dead_cst.analyze.ProgressSnapshot` ``TypedDict``.
+        Drives :class:`dead_cst.Analysis`'s polling thread; user code
+        should prefer the structured ``progress_callback`` API on
+        :class:`dead_cst.Analysis`.
+
+        ``materialize`` holds the context's ``borrow_mut`` for the
+        whole build, so a concurrent polling thread calling this
+        method will see ``RuntimeError("Already mutably borrowed")``
+        until the build releases. For race-free polling, use
+        :meth:`progress_handle` instead — the returned handle reads
+        the same atomic counters without touching pyo3's borrow flag."""
+        ...
+
+    def progress_handle(self) -> "ProgressHandle":
+        """Mint a borrow-free handle over the progress counters.
+        The handle holds an :class:`Arc` over the rust-side atomics
+        so the polling thread can call :meth:`ProgressHandle.snapshot`
+        concurrently with a long-running ``materialize`` call (which
+        keeps the context's ``borrow_mut`` token held for the entire
+        build)."""
+        ...
+
+    def mark_progress_finished(self) -> None:
+        """Force the build-progress ``finished`` atomic to ``True``.
+        Used by :class:`dead_cst.Analysis` after a build error so the
+        polling thread exits cleanly. Idempotent."""
+        ...
+
+    def progress_plugin_done(self) -> None:
+        """Bump the plugins-done counter by one. Used by the Python
+        :class:`concurrent.futures.ThreadPoolExecutor` plugin pass to
+        signal per-plugin completion to the polling thread."""
+        ...
+
+    def progress_plugins_start(self, names: list[str]) -> None:
+        """Stamp the plugins phase as started + allocate per-plugin
+        counter slabs keyed by registration order. ``names`` is
+        the plugin list (``type(plugin).__qualname__`` per entry);
+        indices passed to :meth:`progress_plugin_started` /
+        :meth:`progress_plugin_finished` match. Called by
+        :class:`dead_cst.Analysis` before launching the
+        :class:`concurrent.futures.ThreadPoolExecutor`."""
+        ...
+
+    def progress_plugin_started(self, idx: int) -> None:
+        """Stamp the indexed plugin's start time. Called by the
+        :class:`concurrent.futures.ThreadPoolExecutor` worker on
+        entry so the per-plugin slot snapshot reflects the actual
+        start order (not the registration order)."""
+        ...
+
+    def progress_plugin_finished(self, idx: int) -> None:
+        """Stamp the indexed plugin's finish time. Called by the
+        :class:`concurrent.futures.ThreadPoolExecutor` worker on
+        exit (both success and exception paths)."""
+        ...
+
+    def progress_plugins_finish(self) -> None:
+        """Stamp the plugins phase as finished + mark the whole
+        build pipeline finished. Called by :class:`dead_cst.Analysis`
+        once every plugin future has resolved."""
         ...
 
     def query(self) -> QueryBuilder:
@@ -1330,6 +1433,24 @@ class GraphMetadata:
     file_count: int
     line_count: int
     user_meta: list[tuple[str, str]]
+
+class ProgressHandle:
+    """Borrow-free view over the build-progress atomic counters.
+
+    Created by :meth:`ProjectContext.progress_handle` — the handle
+    holds a shared ``Arc`` over the rust counters, so calling
+    :meth:`snapshot` is GIL-bound but doesn't go through the pyo3
+    borrow flag that ``materialize`` holds for the entire build. The
+    Python polling thread driving
+    :class:`dead_cst.Analysis`'s ``progress_callback`` API uses this
+    handle to read counters concurrently with a long-running build.
+    """
+
+    def snapshot(self) -> "ProgressSnapshot":
+        """Atomic snapshot of every counter as a plain Python dict
+        (``int`` values; ``finished`` is ``bool``). Same key set as
+        :meth:`ProjectContext.read_progress_snapshot`."""
+        ...
 
 def write_graph(
     path: str,

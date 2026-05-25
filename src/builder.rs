@@ -1,7 +1,8 @@
 //! Graph-construction primitives: `NodeKey` (positional identity for an
 //! interned node), `GraphBuilder` (the in-progress graph), the
 //! plugin-facing graph ops (`AddNode`/`AddEdge`/`AddEntrypoint`), the
-//! generic BFS walker, and the `apply_graph_op` apply pass.
+//! generic BFS walker, and the batched `apply_prepared_batch`
+//! apply pass.
 
 use std::sync::OnceLock;
 
@@ -362,11 +363,11 @@ pub(crate) fn synthetic_node(
 
 /// A [`GraphOp`] prepared for application: every Python-owned field
 /// has been hoisted into pure-rust storage so that
-/// [`apply_graph_op`] can drop the GIL before contending for the
-/// write lock on ``outputs``. Edge endpoints are represented as
+/// [`apply_prepared_batch`] can drop the GIL before contending for
+/// the write lock on ``outputs``. Edge endpoints are represented as
 /// [`NodeKey`]s (the positional identity used by the builder's
 /// index) plus the source ``decl.fqname`` for entrypoint markers.
-/// See [`apply_graph_op`] for the concurrency rationale.
+/// See [`apply_prepared_batch`] for the concurrency rationale.
 pub(crate) enum PreparedOp {
     Edge {
         src: NodeKey,
@@ -394,21 +395,53 @@ pub(crate) enum PreparedOp {
     },
 }
 
-pub(crate) fn apply_graph_op(
-    ctx: &Py<ProjectContext>,
-    py: Python<'_>,
-    op: &Bound<'_, PyAny>,
-) -> PyResult<()> {
-    // GIL-required prep: extract everything we need from the
-    // (potentially Python-owned) op into pure-rust state before we
-    // touch the lock. Concurrent plugins running on a Python
-    // :class:`ThreadPoolExecutor` can hold the ``outputs`` read
-    // guard across :meth:`pyo3::Python::allow_threads`; if we
-    // acquired the write lock while still holding the GIL, a reader
-    // returning from ``allow_threads`` would block on
-    // :func:`take_gil`, and the write side would block on
-    // ``wait_for_readers`` — classic deadlock. Dropping the GIL
-    // before contending for the write lock breaks that cycle.
+/// Opaque Python handle wrapping a plugin's pre-prepared op queue.
+///
+/// :meth:`ProjectContext.run_plugin_collect` mints one of these per
+/// plugin (containing the plugin's full yield order in pure-rust
+/// form); :meth:`ProjectContext.apply_ops_batched` takes a list of
+/// these and folds them all into the graph under a single write-lock
+/// window. Holding the prepared ops in an opaque pyclass lets the
+/// Python driver shuttle them through a
+/// :class:`concurrent.futures.ThreadPoolExecutor` without paying
+/// per-op FFI roundtrips and without ``PreparedOp`` having to be a
+/// pyclass itself.
+///
+/// Concurrency: the inner [`Mutex`] is never observed contended by
+/// design — each `CollectedOps` is created on one thread, consumed
+/// on another (the apply pass), and never aliased. The lock is here
+/// so the pyclass can be ``Send``.
+#[pyclass]
+pub(crate) struct CollectedOps {
+    pub(crate) ops: parking_lot::Mutex<Option<Vec<PreparedOp>>>,
+}
+
+impl CollectedOps {
+    pub(crate) fn new(ops: Vec<PreparedOp>) -> Self {
+        Self {
+            ops: parking_lot::Mutex::new(Some(ops)),
+        }
+    }
+
+    /// Drain the inner ops. Returns an error if already drained
+    /// (calling :meth:`apply_ops_batched` twice on the same handle).
+    pub(crate) fn take(&self) -> PyResult<Vec<PreparedOp>> {
+        self.ops.lock().take().ok_or_else(|| {
+            PyValueError::new_err(
+                "CollectedOps already drained: \
+                 apply_ops_batched consumes the handle and it cannot be re-used.",
+            )
+        })
+    }
+}
+
+/// Convert a single Python-owned :class:`GraphOp` into a [`PreparedOp`].
+///
+/// The "prepare" half of the old single-op apply pipeline. Splitting
+/// this out lets the batched-apply pass extract every op's fields
+/// under one GIL window, then drop the GIL once for the full apply
+/// rather than ping-ponging the GIL / write lock per op.
+pub(crate) fn prepare_graph_op(py: Python<'_>, op: &Bound<'_, PyAny>) -> PyResult<PreparedOp> {
     let prepared = if let Ok(add_edge) = op.extract::<PyRef<AddEdge>>() {
         PreparedOp::Edge {
             src: node_key_of(&add_edge.src.borrow(py)),
@@ -454,7 +487,26 @@ pub(crate) fn apply_graph_op(
             op.get_type().name()?,
         )));
     };
+    Ok(prepared)
+}
 
+/// Apply a batch of pre-prepared ops to the graph in a single
+/// write-lock window. The GIL is released before contending for the
+/// write lock and re-acquired only inside [`apply_prepared`] for the
+/// ops that actually need it — amortised across the whole batch
+/// rather than per-op as the legacy single-op apply did.
+///
+/// Ops apply in input order; an error in any op fails the whole
+/// batch with that op's error. Earlier ops in the batch still land
+/// — graph state is not transactional.
+pub(crate) fn apply_prepared_batch(
+    ctx: &Py<ProjectContext>,
+    py: Python<'_>,
+    prepared: Vec<PreparedOp>,
+) -> PyResult<()> {
+    if prepared.is_empty() {
+        return Ok(());
+    }
     // The ``write()`` MUST happen with the GIL released, then the
     // GIL re-acquired *after* we own the write guard. Otherwise a
     // concurrent reader returning from ``allow_threads`` and waiting
@@ -471,11 +523,13 @@ pub(crate) fn apply_graph_op(
         let mut outputs = outputs_lock.write();
         let outputs = outputs
             .as_mut()
-            .ok_or_else(|| not_materialized("apply_graph_op"))?;
-        // With the write guard owned, re-acquire the GIL only for
-        // the calls that genuinely need it (``Py::new`` for the new
-        // node, ``clone_ref(py)`` for refcounted edges).
-        Python::with_gil(|py| apply_prepared(outputs, py, prepared))
+            .ok_or_else(|| not_materialized("apply_ops_batched"))?;
+        Python::with_gil(|py| {
+            for op in prepared {
+                apply_prepared(outputs, py, op)?;
+            }
+            Ok(())
+        })
     })
 }
 
@@ -566,7 +620,7 @@ pub(crate) fn lookup_idx(builder: &GraphBuilder, node: &SymbolNode, side: &str) 
 }
 
 /// Variant of [`lookup_idx`] that takes a [`NodeKey`] directly so it
-/// can be called from [`apply_graph_op`]'s GIL-free post-prepare
+/// can be called from [`apply_prepared_batch`]'s GIL-free post-prepare
 /// section — see [`PreparedOp`] for why the key is pre-extracted.
 pub(crate) fn lookup_idx_by_key(
     builder: &GraphBuilder,

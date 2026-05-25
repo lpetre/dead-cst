@@ -36,14 +36,16 @@ mod graph;
 mod helpers;
 mod ingest;
 mod io;
+mod progress;
 mod project;
 mod query;
 
 use pyo3::prelude::*;
 
-use crate::builder::{AddEdge, AddEdgeByIdx, AddEntrypoint, AddNode};
+use crate::builder::{AddEdge, AddEdgeByIdx, AddEntrypoint, AddNode, CollectedOps};
 use crate::graph::{EdgeFlags, Import, NativeGraph, NodeFlags, SymbolNode};
 use crate::io::{read_graph, write_graph, GraphMetadata};
+use crate::progress::ProgressHandle;
 use crate::project::{Project, ProjectContext};
 use crate::query::{
     CallQuery, CallRef, ClassQuery, ConstructionQuery, ConstructionRef, DeclQuery, DecoratorQuery,
@@ -75,6 +77,7 @@ fn dead_cst_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<AddEdgeByIdx>()?;
     m.add_class::<AddEntrypoint>()?;
     m.add_class::<AddNode>()?;
+    m.add_class::<CollectedOps>()?;
     m.add_class::<NodeFlags>()?;
     m.add_class::<EdgeFlags>()?;
     m.add_class::<DecoratorRef>()?;
@@ -93,6 +96,7 @@ fn dead_cst_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<EdgeRef>()?;
     m.add_class::<DeclQuery>()?;
     m.add_class::<GraphMetadata>()?;
+    m.add_class::<ProgressHandle>()?;
     m.add_function(wrap_pyfunction!(query_fn, m)?)?;
     m.add_function(wrap_pyfunction!(write_graph, m)?)?;
     m.add_function(wrap_pyfunction!(read_graph, m)?)?;

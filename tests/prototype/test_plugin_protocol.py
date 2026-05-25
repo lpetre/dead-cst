@@ -269,7 +269,13 @@ def test_query_outside_materialize_raises(make_ctx):
 
 
 def test_materialize_is_idempotent(make_ctx):
-    """Calling materialize twice rebuilds; the same plugin re-runs once per call."""
+    """Calling materialize twice rebuilds; the same plugin re-runs once per call.
+
+    The frozen-graph contract means a plugin's own emissions are not
+    visible to its own queries during ``run`` (the apply pass runs
+    at end-of-cohort). Both runs therefore see ``0`` during ``run``;
+    the post-materialize graph still has the emission.
+    """
     counts: list[int] = []
 
     class CountAdded:
@@ -283,6 +289,9 @@ def test_materialize_is_idempotent(make_ctx):
     ctx.add_plugin(CountAdded())
     g1 = ctx.materialize()
     g2 = ctx.materialize()
-    # The second run gets a fresh outputs (not the accumulated state).
-    assert counts == [1, 1]
+    # Plugin queries see the *base* graph — own emissions invisible
+    # until the end-of-pass apply lands them.
+    assert counts == [0, 0]
+    # ``<seed>`` does land in the materialized graph snapshot.
+    assert "<seed>" in {n.fqname for n in g1.nodes}
     assert {n.fqname for n in g1.nodes} == {n.fqname for n in g2.nodes}
