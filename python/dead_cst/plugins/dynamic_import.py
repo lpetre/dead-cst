@@ -42,48 +42,60 @@ class DynamicImportFallbackPlugin(Plugin):
     include_targets: tuple[str, ...] = ()
 
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
-        cache: dict[str, list] = {}
+        cache: dict[str, list[int]] = {}
         project_root = Path(ctx.project_root)
-        # Rust-side edge filter: ``with_flags`` masks edges whose
-        # flags don't intersect ``DYNAMIC_IMPORT`` and ``with_dst_kind``
-        # masks edges whose ``dst.kind`` isn't ``"module"``. We get
-        # endpoint ``SymbolNode``s pre-resolved, so the Python loop
-        # only sees rows it actually needs to act on — no per-edge
-        # Python ↔ rust FFI hops over the (typically large) full
-        # edge list.
-        edges = (
+        # Rust-side edge filter via ``with_flags`` (mask out edges whose
+        # flags don't intersect ``DYNAMIC_IMPORT``) + ``with_dst_kind``
+        # (drop edges whose ``dst.kind`` isn't ``"module"``).
+        # ``index_triples()`` returns ``(src_idx, dst_idx, flags)`` —
+        # cheaper than materialising ``EdgeRef`` rows with
+        # ``Py<SymbolNode>`` endpoints up-front. We batch-materialise
+        # only the (src, dst) pair we actually need for the
+        # path / fqname filter via ``ctx.nodes_at``.
+        triples = (
             native.query(ctx)
             .edges()
             .with_flags(_DYNAMIC_IMPORT_FLAG)
             .with_dst_kind("module")
-            .collect()
+            .index_triples()
         )
-        for edge in edges:
-            src = edge.src
-            dst = edge.dst
+        for src_idx, dst_idx, _flags in triples:
+            src, dst = ctx.nodes_at([src_idx, dst_idx])
             if not self._allowed(Path(src.path), project_root, dst.fqname):
                 continue
-            for export in self._exports_for(ctx, dst.fqname, cache):
-                yield native.AddEdge(src=src, dst=export)
+            # Exports are looked up as raw indices so the fan-out yields
+            # ``AddEdgeByIdx`` — skipping the ``Py<SymbolNode> -> idx``
+            # round-trip the rust apply pass would otherwise do for every
+            # edge.
+            for export_idx in self._exports_indices_for(ctx, dst.fqname, cache):
+                yield native.AddEdgeByIdx(src_idx=src_idx, dst_idx=export_idx)
 
-    def _exports_for(
+    def _exports_indices_for(
         self,
         ctx: native.ProjectContext,
         module_fqname: str,
-        cache: dict[str, list],
-    ) -> list:
+        cache: dict[str, list[int]],
+    ) -> list[int]:
         cached = cache.get(module_fqname)
         if cached is not None:
             return cached
-        exports = None
+        exports: list[int] | None = None
         if self.respect_dunder_all:
-            exports = ctx.find_module_dunder_all_exports(module_fqname)
+            exports = ctx.find_module_dunder_all_exports_indices(module_fqname)
         if exports is None:
-            decls = ctx.find_module_top_level_decls(module_fqname)
+            decls_idx = ctx.find_module_top_level_decls_indices(module_fqname)
             if self.include_underscore:
-                exports = decls
+                exports = decls_idx
             else:
-                exports = [d for d in decls if not d.fqname.rsplit(".", 1)[-1].startswith("_")]
+                # Per-export name check still needs to ask the node what
+                # its simple name is. Materialise the candidate decls
+                # once and keep the filtered indices.
+                decls = ctx.nodes_at(decls_idx)
+                exports = [
+                    idx
+                    for idx, decl in zip(decls_idx, decls)
+                    if not decl.fqname.rsplit(".", 1)[-1].startswith("_")
+                ]
         cache[module_fqname] = exports
         return exports
 

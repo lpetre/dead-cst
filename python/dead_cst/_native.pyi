@@ -528,6 +528,16 @@ class ProjectContext:
         """
         ...
 
+    def find_module_top_level_decls_indices(self, module_fqn: str) -> list[int]:
+        """Idx-only variant of :meth:`find_module_top_level_decls`.
+
+        Returns positional indices into :meth:`nodes` rather than
+        allocating ``SymbolNode`` clones — pair with
+        :class:`AddEdgeByIdx` to skip the ``SymbolNode -> idx``
+        round-trip when emitting edges to every export of a module.
+        """
+        ...
+
     def find_module_dunder_all_exports(self, module_fqn: str) -> list[SymbolNode] | None:
         """Decls listed in ``module_fqn``'s ``__all__``, or ``None``
         when the module doesn't declare ``__all__``.
@@ -540,6 +550,15 @@ class ProjectContext:
         matters: callers that want CPython's ``from X import *``
         semantics should fall back to the non-underscore decl list
         only in the ``None`` case.
+        """
+        ...
+
+    def find_module_dunder_all_exports_indices(self, module_fqn: str) -> list[int] | None:
+        """Idx-only variant of :meth:`find_module_dunder_all_exports`.
+
+        ``None`` still means "no ``__all__``"; ``[]`` means "empty /
+        unresolvable ``__all__``" — same semantics as the
+        ``SymbolNode``-returning version.
         """
         ...
 

@@ -1652,12 +1652,27 @@ impl ProjectContext {
         py: Python<'_>,
         module_fqn: &str,
     ) -> PyResult<Vec<Py<SymbolNode>>> {
+        let indices = self.find_module_top_level_decls_indices(module_fqn)?;
         let outputs = self.materialized("find_module_top_level_decls")?;
+        Ok(indices
+            .into_iter()
+            .map(|idx| outputs.builder.nodes[idx].clone_ref(py))
+            .collect())
+    }
+
+    /// Idx-only variant of :meth:`find_module_top_level_decls`. Same
+    /// scan, returns positional indices into ``ctx.nodes()`` rather
+    /// than allocating ``Py<SymbolNode>`` clones.
+    pub(crate) fn find_module_top_level_decls_indices(
+        &self,
+        module_fqn: &str,
+    ) -> PyResult<Vec<usize>> {
+        let outputs = self.materialized("find_module_top_level_decls_indices")?;
         if !outputs.module_by_fqname.contains_key(module_fqn) {
             return Ok(Vec::new());
         }
         let prefix = format!("{module_fqn}.");
-        let mut out = Vec::new();
+        let mut out: Vec<usize> = Vec::new();
         for (fqname, idxs) in &outputs.decl_by_fqname {
             let Some(rest) = fqname.strip_prefix(&prefix) else {
                 continue;
@@ -1666,9 +1681,7 @@ impl ProjectContext {
             if rest.contains('.') {
                 continue;
             }
-            for &idx in idxs {
-                out.push(outputs.builder.nodes[idx].clone_ref(py));
-            }
+            out.extend(idxs.iter().copied());
         }
         Ok(out)
     }
@@ -1693,18 +1706,39 @@ impl ProjectContext {
         py: Python<'_>,
         module_fqn: &str,
     ) -> PyResult<Option<Vec<Py<SymbolNode>>>> {
+        let Some(indices) = self.find_module_dunder_all_exports_indices(module_fqn)? else {
+            return Ok(None);
+        };
+        let outputs = self.materialized("find_module_dunder_all_exports")?;
+        Ok(Some(
+            indices
+                .into_iter()
+                .map(|idx| outputs.builder.nodes[idx].clone_ref(py))
+                .collect(),
+        ))
+    }
+
+    /// Idx-only variant of :meth:`find_module_dunder_all_exports`.
+    /// Same lookup, returns positional indices into ``ctx.nodes()``
+    /// rather than allocating ``Py<SymbolNode>`` clones. ``None``
+    /// still means "no ``__all__``"; ``Some([])`` means "empty /
+    /// unresolvable ``__all__``" (callers wanting CPython's
+    /// ``from X import *`` semantics fall back to the non-underscore
+    /// decl list only in the ``None`` case).
+    pub(crate) fn find_module_dunder_all_exports_indices(
+        &self,
+        module_fqn: &str,
+    ) -> PyResult<Option<Vec<usize>>> {
         let all_fqn = format!("{module_fqn}.__all__");
         let Some(entries) = self.find_literal_list_entries(&all_fqn)? else {
             return Ok(None);
         };
-        let outputs = self.materialized("find_module_dunder_all_exports")?;
-        let mut out: Vec<Py<SymbolNode>> = Vec::new();
+        let outputs = self.materialized("find_module_dunder_all_exports_indices")?;
+        let mut out: Vec<usize> = Vec::new();
         for entry in entries {
             let entry_fqn = format!("{module_fqn}.{entry}");
             if let Some(idxs) = outputs.decl_by_fqname.get(&entry_fqn) {
-                for &idx in idxs {
-                    out.push(outputs.builder.nodes[idx].clone_ref(py));
-                }
+                out.extend(idxs.iter().copied());
             }
         }
         Ok(Some(out))
