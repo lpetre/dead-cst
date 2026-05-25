@@ -34,7 +34,9 @@ from ._core import (
 from .decl_shapes import (
     BatchDispatchAppPlugin,
     DecoratedDeclPlugin,
+    DispatchAppGather,
     DispatchAppPlugin,
+    DispatchAppSpec,
     LiteralListPlugin,
 )
 from .dynamic_import import DynamicImportFallbackPlugin
@@ -47,7 +49,9 @@ from .project_scripts import ProjectScriptsPlugin
 __all__ = [
     "BatchDispatchAppPlugin",
     "DecoratedDeclPlugin",
+    "DispatchAppGather",
     "DispatchAppPlugin",
+    "DispatchAppSpec",
     "DynamicImportFallbackPlugin",
     "EXTERNAL_DIST_PREFIX",
     "EXTERNAL_FILE_PREFIX",

@@ -14,9 +14,18 @@ two versions.
   instances and runs them with fused queries. Same observable output
   as registering every wrapped plugin individually, but the
   construction / factory / variable scans run once across the union
-  of all plugins' configs instead of once per plugin. Per-plugin
-  emission stays in `_emit_ops` (newly extracted), called once per
-  wrapped plugin against the shared row/var fetches.
+  of all plugins' configs instead of once per plugin.
+- `DispatchAppSpec` (frozen dataclass) + `DispatchAppGather`
+  (dataclass) split each plugin into a pure-data spec (what to
+  gather) and a `policy(ctx, gathered)` method (how to emit ops from
+  the gathered data). Subclasses customize behavior by overriding
+  `policy()`; the override is honored uniformly by both the
+  standalone `DispatchAppPlugin.run` path and the batched
+  `BatchDispatchAppPlugin.run` path (the previous batched design
+  invoked the standard emission and skipped subclass extensions).
+  `CeleryPlugin`'s `@shared_task` fan-out moved from a `run()`
+  override to a `policy()` override; it now fires correctly when
+  Celery is wrapped in a batch.
 - `AddEntrypointByIdx` graph op — index-keyed sibling of
   `AddEntrypoint`. Takes a positional index into `ctx.nodes()`; the
   apply pass reads the decl's `fqname` / `path` on the rust side to

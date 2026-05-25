@@ -8,7 +8,7 @@ from typing import Iterable
 
 from ..graph import NodeFlags
 from ..plugins._base import native
-from ..plugins.decl_shapes import DispatchAppPlugin
+from ..plugins.decl_shapes import DispatchAppGather, DispatchAppPlugin
 
 _SHARED_TASK_NAMES: frozenset[str] = frozenset({"shared_task"})
 
@@ -29,9 +29,14 @@ class CeleryPlugin(DispatchAppPlugin):
     app_classes: tuple[str, ...] = ("celery.Celery",)
     registration_decorators: frozenset[str] = frozenset({"task"})
 
-    def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
-        yield from DispatchAppPlugin.run(self, ctx)
-        # ``@shared_task`` is appless and not covered by DispatchAppPlugin.
+    def policy(
+        self, ctx: native.ProjectContext, gathered: DispatchAppGather
+    ) -> Iterable[native.GraphOp]:
+        # Standard dispatch policy first, then Celery's appless
+        # ``@shared_task`` fan-out. Override on ``policy`` (not ``run``)
+        # so :class:`BatchDispatchAppPlugin` honors the extension when
+        # CeleryPlugin is wrapped.
+        yield from super().policy(ctx, gathered)
         by_path: dict[str, list[int]] = {}
         for ref in (
             native.query(ctx)

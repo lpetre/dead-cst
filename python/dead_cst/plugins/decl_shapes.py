@@ -101,6 +101,41 @@ class DecoratedDeclPlugin(Plugin):
             )
 
 
+@dataclass(frozen=True)
+class DispatchAppSpec:
+    """Pure-data description of what a :class:`DispatchAppPlugin` needs
+    the walker to gather. Has no behavior or policy hooks — those live
+    on the plugin's :meth:`DispatchAppPlugin.policy` method.
+
+    Fields mirror the plugin's class attributes: same semantics, just
+    repackaged so the batched walker can take a list of specs and run
+    one fused pass instead of one pass per plugin. Frozen so it's
+    hashable / cacheable.
+    """
+
+    marker_prefix: str
+    app_classes: tuple[str, ...]
+    registration_decorators: frozenset[str]
+    seed_as_entrypoint: bool
+
+
+@dataclass
+class DispatchAppGather:
+    """Pre-walked data, scoped to one plugin's spec.
+
+    Both the standalone single-plugin path and the batched fused-walk
+    path produce one of these per plugin and hand it to
+    :meth:`DispatchAppPlugin.policy`. ``vars_by_file`` is shared
+    across plugins in the batched path (it's plugin-agnostic).
+    """
+
+    spec: DispatchAppSpec
+    direct: list[native.ConstructionIdxRef]
+    factory_decls: list[tuple[native.FactoryIdxRef, str]]
+    handlers: list[native.DecoratorIdxRef]
+    vars_by_file: dict[tuple[str, str], int]
+
+
 @dataclass(kw_only=True)
 class DispatchAppPlugin(Plugin):
     """Wire ``@<instance>.<reg_decorator>(...)`` handlers to their app instance.
@@ -132,6 +167,13 @@ class DispatchAppPlugin(Plugin):
     Result-level dedup: if the same construction site is reachable
     from two ``app_classes`` entries (e.g. one is a base of the
     other), it only emits one entrypoint marker.
+
+    **Spec / policy split.** Subclasses customize behavior by
+    overriding :meth:`policy` — emission is decoupled from the
+    fetch (which is described by :attr:`spec` and performed by the
+    shared walker). The batched driver
+    :class:`BatchDispatchAppPlugin` honors policy overrides for every
+    wrapped plugin by calling each instance's :meth:`policy`.
     """
 
     marker_prefix: str
@@ -139,62 +181,32 @@ class DispatchAppPlugin(Plugin):
     registration_decorators: frozenset[str] = frozenset()
     seed_as_entrypoint: bool = True
 
+    @property
+    def spec(self) -> DispatchAppSpec:
+        """Frozen-dataclass view of this plugin's gather config.
+
+        Override-friendly: subclasses change what's gathered by
+        overriding the underlying class attributes (or this property
+        if a dynamic spec is needed). The batched walker consumes the
+        spec; it never inspects per-plugin fields directly.
+        """
+        return DispatchAppSpec(
+            marker_prefix=self.marker_prefix,
+            app_classes=self.app_classes,
+            registration_decorators=self.registration_decorators,
+            seed_as_entrypoint=self.seed_as_entrypoint,
+        )
+
     def _prefix(self, kind: str) -> str:
         return f"<{self.marker_prefix}-{kind}>:"
-
-    def _module_to_names(self, ctx: native.ProjectContext) -> dict[str, set[str]]:
-        """Expand each ``app_class`` into ``{module: {simple_name, ...}}``,
-        walking subclasses transitively. Lets module-keyed queries
-        (``where_module(...).where_name(...)``,
-        ``of_module(...).where_name(...)``) discover project / third-party
-        subclasses whose import module differs from the base class.
-
-        Subclasses are resolved by inverting the search: instead of
-        asking ty's ``find_references`` to walk down from each
-        framework class (which forces ty to load + parse the framework
-        out of the venv — ~100-400ms per framework on cold cache), we
-        do one parallel pass over project files reading each
-        ``ClassDef``'s base list and matching against the configured
-        app-class fqnames. The framework module is never loaded.
-        """
-        out: dict[str, set[str]] = {}
-        for fqn in self.app_classes:
-            module, _, name = fqn.rpartition(".")
-            if not module or not name:
-                continue
-            out.setdefault(module, set()).add(name)
-        if not self.app_classes:
-            return out
-        # One batched attr fetch per framework's subclass set.
-        for fqn in self.app_classes:
-            sub_idxs = ctx.subclasses_of_fqn_indices(fqn)
-            if not sub_idxs:
-                continue
-            for _kind, _path, sub_fqname, _flags in ctx.node_attrs(sub_idxs):
-                sub_module, _, sub_name = sub_fqname.rpartition(".")
-                if sub_module and sub_name:
-                    out.setdefault(sub_module, set()).add(sub_name)
-        return out
 
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
         if not self._is_active(ctx):
             return
-        module_to_names = self._module_to_names(ctx)
-        if not module_to_names:
+        gathered = _gather_one(ctx, self.spec)
+        if gathered is None:
             return
-        direct = _fetch_direct(ctx, module_to_names)
-        factory_decls = (
-            _fetch_factory_decls(ctx, module_to_names) if self.seed_as_entrypoint else []
-        )
-        handlers = _fetch_handlers(ctx, self.registration_decorators)
-        vars_by_file = _build_vars_by_file(ctx)
-        yield from self._emit_ops(
-            ctx,
-            direct=direct,
-            factory_decls=factory_decls,
-            handlers=handlers,
-            vars_by_file=vars_by_file,
-        )
+        yield from self.policy(ctx, gathered)
 
     def _is_active(self, ctx: native.ProjectContext) -> bool:
         """Cheap import-presence + config-completeness guard. Skips the
@@ -206,20 +218,25 @@ class DispatchAppPlugin(Plugin):
         app_modules = {fqn.rpartition(".")[0] for fqn in self.app_classes if "." in fqn}
         return any(native.query(ctx).imports().of(m).exists() for m in app_modules if m)
 
-    def _emit_ops(
-        self,
-        ctx: native.ProjectContext,
-        *,
-        direct: list[native.ConstructionIdxRef],
-        factory_decls: list[tuple[native.FactoryIdxRef, str]],
-        handlers: list[native.DecoratorIdxRef],
-        vars_by_file: dict[tuple[str, str], int],
+    def policy(
+        self, ctx: native.ProjectContext, gathered: DispatchAppGather
     ) -> Iterable[native.GraphOp]:
-        """Per-plugin emission, given pre-fetched rows. Shared between
-        ``DispatchAppPlugin.run`` (single-plugin path) and
-        ``BatchDispatchAppPlugin.run`` (fused path); both fetch the
-        inputs differently then call here.
+        """Emit ops from pre-gathered data. The override point for
+        subclasses that want to extend or customize emission without
+        changing what gets gathered.
+
+        Subclasses that want to add framework-specific extras should
+        ``yield from super().policy(ctx, gathered)`` first, then yield
+        their additional ops. The standalone :meth:`run` path and the
+        batched :class:`BatchDispatchAppPlugin` path both call this
+        method, so any override is honored uniformly.
         """
+        spec = gathered.spec
+        direct = gathered.direct
+        factory_decls = gathered.factory_decls
+        handlers = gathered.handlers
+        vars_by_file = gathered.vars_by_file
+
         # direct_by_owner: (path, simple_name) -> [var_idx, ...]
         direct_by_owner: dict[tuple[str, str], list[int]] = {}
         direct_attrs: list[tuple[native.NodeKind, str, str, int]] = []
@@ -229,11 +246,11 @@ class DispatchAppPlugin(Plugin):
                 simple = fqname.rsplit(".", 1)[-1]
                 direct_by_owner.setdefault((ref.path, simple), []).append(ref.var_idx)
 
-        app_prefix = self._prefix("app")
-        factory_prefix = self._prefix("factory")
+        app_prefix = f"<{spec.marker_prefix}-app>:"
+        factory_prefix = f"<{spec.marker_prefix}-factory>:"
 
         # 3. Entrypoint-promote every direct construction (when enabled).
-        if self.seed_as_entrypoint and direct:
+        if spec.seed_as_entrypoint and direct:
             # Reuse the direct_attrs computed above.
             for ref, (_kind, _path, fqname, _flags) in zip(direct, direct_attrs, strict=True):
                 yield native.AddNodeByIdx(
@@ -267,7 +284,7 @@ class DispatchAppPlugin(Plugin):
         # handler edges.
         for h in handlers:
             key = (h.path, h.decorator_owner or "")
-            if self.seed_as_entrypoint:
+            if spec.seed_as_entrypoint:
                 var_idx = vars_by_file.get(key)
                 if var_idx is not None:
                     yield native.AddEdgeByIdx(var_idx, h.decorated_idx)
@@ -288,7 +305,7 @@ class DispatchAppPlugin(Plugin):
         # doesn't reach the factory directly and stays unclassified.
         # Only ``app`` (whose direct successor *is* ``create_app``)
         # promotes.
-        if self.seed_as_entrypoint and factory_decls:
+        if spec.seed_as_entrypoint and factory_decls:
             factory_reachers: set[int] = set()
             for fref, _kind in factory_decls:
                 factory_reachers.update(ctx.direct_predecessors_idx(fref.decl_idx))
@@ -312,20 +329,55 @@ class DispatchAppPlugin(Plugin):
 
 
 # ---------------------------------------------------------------------------
-# Shared fetch helpers
+# Walker: spec → gather
 #
-# Pulled out of :class:`DispatchAppPlugin.run` so
-# :class:`BatchDispatchAppPlugin` can call them with fused inputs.
+# The "gather" half of the spec / policy split. Both the standalone
+# ``DispatchAppPlugin.run`` path and the batched
+# ``BatchDispatchAppPlugin.run`` path flow through these helpers; only
+# the fan-out shape differs.
 # ---------------------------------------------------------------------------
+
+
+def _module_to_names(
+    ctx: native.ProjectContext,
+    app_classes: tuple[str, ...],
+    subclass_cache: dict[str, list[tuple[str, str]]] | None = None,
+) -> dict[str, set[str]]:
+    """Expand each ``app_class`` fqn into ``{module: {simple_name, ...}}``,
+    walking subclasses transitively. ``subclass_cache`` (optional) lets
+    the batched walker memoise across plugins that share an app class.
+    """
+    out: dict[str, set[str]] = {}
+    for fqn in app_classes:
+        module, _, name = fqn.rpartition(".")
+        if not module or not name:
+            continue
+        out.setdefault(module, set()).add(name)
+    if not app_classes:
+        return out
+    for fqn in app_classes:
+        if subclass_cache is not None and fqn in subclass_cache:
+            pairs = subclass_cache[fqn]
+        else:
+            sub_idxs = ctx.subclasses_of_fqn_indices(fqn)
+            pairs = []
+            if sub_idxs:
+                for _kind, _path, sub_fqname, _flags in ctx.node_attrs(sub_idxs):
+                    sub_module, _, sub_name = sub_fqname.rpartition(".")
+                    if sub_module and sub_name:
+                        pairs.append((sub_module, sub_name))
+            if subclass_cache is not None:
+                subclass_cache[fqn] = pairs
+        for sub_module, sub_name in pairs:
+            out.setdefault(sub_module, set()).add(sub_name)
+    return out
 
 
 def _fetch_direct(
     ctx: native.ProjectContext, module_to_names: dict[str, set[str]]
 ) -> list[native.ConstructionIdxRef]:
     """Run a construction query per distinct module (with the union of
-    requested names) and dedup by ``var_idx``. Identical observable
-    output to the per-plugin loop the legacy ``DispatchAppPlugin.run``
-    used."""
+    requested names) and dedup by ``var_idx``."""
     direct_seen: set[int] = set()
     direct: list[native.ConstructionIdxRef] = []
     for module, names in module_to_names.items():
@@ -373,8 +425,8 @@ def _fetch_handlers(
 
 def _build_vars_by_file(ctx: native.ProjectContext) -> dict[tuple[str, str], int]:
     """One project-wide variable scan + one ``node_attrs`` batch fetch.
-    Result is plugin-agnostic, so ``BatchDispatchAppPlugin`` builds it
-    once and hands the same dict to every wrapped plugin."""
+    Result is plugin-agnostic, so the batched walker builds it once
+    and hands the same dict to every plugin's gather."""
     vars_by_file: dict[tuple[str, str], int] = {}
     var_idxs = native.query(ctx).decls().with_kind("variable").indices()
     if not var_idxs:
@@ -386,35 +438,148 @@ def _build_vars_by_file(ctx: native.ProjectContext) -> dict[tuple[str, str], int
     return vars_by_file
 
 
-@dataclass(kw_only=True)
-class BatchDispatchAppPlugin(Plugin):
-    """Run multiple :class:`DispatchAppPlugin` instances with fused queries.
+def _gather_one(ctx: native.ProjectContext, spec: DispatchAppSpec) -> DispatchAppGather | None:
+    """Standalone single-plugin gather. Returns ``None`` when the spec's
+    ``app_classes`` resolve to no usable ``{module: names}`` map —
+    matches the legacy short-circuit ``DispatchAppPlugin.run`` did."""
+    module_to_names = _module_to_names(ctx, spec.app_classes)
+    if not module_to_names:
+        return None
+    return DispatchAppGather(
+        spec=spec,
+        direct=_fetch_direct(ctx, module_to_names),
+        factory_decls=_fetch_factory_decls(ctx, module_to_names) if spec.seed_as_entrypoint else [],
+        handlers=_fetch_handlers(ctx, spec.registration_decorators),
+        vars_by_file=_build_vars_by_file(ctx),
+    )
 
-    Same observable output as registering every wrapped plugin
-    individually, but the underlying construction / factory / variable
-    queries are fused so each ``par_scan_files`` runs once across the
-    union of all plugins' configs instead of once per plugin.
+
+def _gather_batched(
+    ctx: native.ProjectContext, specs: list[DispatchAppSpec]
+) -> list[DispatchAppGather | None]:
+    """Fused walker for a batch of specs. Returns one
+    ``DispatchAppGather`` per input spec (in order), or ``None`` for
+    any spec whose ``app_classes`` resolved empty.
 
     Fusion strategy:
 
-    * **Per-distinct-module construction & factory queries.** Two
-      plugins both targeting ``flask.Flask`` (e.g. Flask + a project-
-      level extension) share one query instead of issuing two. Result
-      rows route back to plugins by matching the row's ``class_name``
-      against each plugin's ``{module: {name}}`` map.
-    * **Shared subclass-walk cache.** Each ``app_class`` fqn's
-      transitive-subclass lookup runs at most once regardless of how
-      many plugins request it.
-    * **Single project-wide variable scan.** ``vars_by_file`` is
-      plugin-agnostic, so it's built once and reused.
+    * Shared subclass-walk cache — each ``app_class`` fqn's
+      transitive lookup runs at most once across all specs.
+    * Per-distinct-module construction & factory queries — two specs
+      both targeting ``flask.Flask`` share one query; rows route back
+      to specs by matching ``class_name`` against each spec's map.
+    * Single project-wide ``vars_by_file`` scan shared across specs.
+    * Per-spec handler query (no fusion — the ref API doesn't carry
+      which attr matched, so a fused result can't route to the right
+      spec without further work).
+    """
+    if not specs:
+        return []
+    subclass_cache: dict[str, list[tuple[str, str]]] = {}
+    module_to_names_per_spec: list[dict[str, set[str]]] = [
+        _module_to_names(ctx, spec.app_classes, subclass_cache=subclass_cache) for spec in specs
+    ]
 
-    Handler (``DecoratorQuery``) and emission stay per-plugin because
-    handler row routing requires knowing which plugin's
-    ``registration_decorators`` matched, and the ref API doesn't carry
-    the matched attribute name. The handler queries are cheap (each is
-    text-prefiltered before any AST parsing), so this is a fine
-    trade-off — the big AST-walk wins are in the construction /
-    factory / variable scans the fusion does collapse.
+    # Result slot per input spec; ``None`` for empty-map specs.
+    gathered: list[DispatchAppGather | None] = [None] * len(specs)
+    live_indices = [i for i, mtn in enumerate(module_to_names_per_spec) if mtn]
+    if not live_indices:
+        return gathered
+
+    union_modules: dict[str, set[str]] = {}
+    for i in live_indices:
+        for module, names in module_to_names_per_spec[i].items():
+            union_modules.setdefault(module, set()).update(names)
+
+    # Per-spec direct constructions, deduped by var_idx.
+    direct_per_spec: list[list[native.ConstructionIdxRef]] = [[] for _ in specs]
+    direct_seen_per_spec: list[set[int]] = [set() for _ in specs]
+    for module, all_names in union_modules.items():
+        for ref in (
+            native.query(ctx)
+            .constructions()
+            .where_module(module)
+            .where_name(sorted(all_names))
+            .row_indices()
+        ):
+            for i in live_indices:
+                if ref.class_name not in module_to_names_per_spec[i].get(module, ()):
+                    continue
+                seen = direct_seen_per_spec[i]
+                if ref.var_idx in seen:
+                    continue
+                seen.add(ref.var_idx)
+                direct_per_spec[i].append(ref)
+
+    # Per-spec factory decls (only for seed_as_entrypoint specs).
+    factory_per_spec: list[list[tuple[native.FactoryIdxRef, str]]] = [[] for _ in specs]
+    factory_seen_per_spec: list[set[tuple[int, str]]] = [set() for _ in specs]
+    seed_indices = [i for i in live_indices if specs[i].seed_as_entrypoint]
+    if seed_indices:
+        seed_union_modules: dict[str, set[str]] = {}
+        for i in seed_indices:
+            for module, names in module_to_names_per_spec[i].items():
+                seed_union_modules.setdefault(module, set()).update(names)
+        for module, all_names in seed_union_modules.items():
+            for fref in (
+                native.query(ctx)
+                .factories()
+                .of_module(module)
+                .where_name(sorted(all_names))
+                .row_indices()
+            ):
+                for kind in fref.kinds:
+                    for i in seed_indices:
+                        if kind not in module_to_names_per_spec[i].get(module, ()):
+                            continue
+                        key = (fref.decl_idx, kind)
+                        if key in factory_seen_per_spec[i]:
+                            continue
+                        factory_seen_per_spec[i].add(key)
+                        factory_per_spec[i].append((fref, kind))
+
+    vars_by_file = _build_vars_by_file(ctx)
+
+    for i in live_indices:
+        gathered[i] = DispatchAppGather(
+            spec=specs[i],
+            direct=direct_per_spec[i],
+            factory_decls=factory_per_spec[i],
+            handlers=_fetch_handlers(ctx, specs[i].registration_decorators),
+            vars_by_file=vars_by_file,
+        )
+    return gathered
+
+
+@dataclass(kw_only=True)
+class BatchDispatchAppPlugin(Plugin):
+    """Run multiple :class:`DispatchAppPlugin` instances with a fused
+    gather pass + per-plugin policy.
+
+    Architecture: split each wrapped plugin into a ``spec`` (the
+    pure-data description of what to gather, see
+    :class:`DispatchAppSpec`) and a ``policy(ctx, gathered)`` method
+    (the per-plugin emission, see
+    :meth:`DispatchAppPlugin.policy`). This driver runs a fused walk
+    across every spec, then calls each plugin's :meth:`policy` with
+    its slice of the gather. Subclass overrides of :meth:`policy` are
+    honored uniformly — that's the point of the split.
+
+    Fusion strategy (in the gather phase):
+
+    * Shared subclass-walk cache — each ``app_class`` fqn's
+      transitive lookup runs at most once regardless of how many
+      specs request it.
+    * Per-distinct-module construction & factory queries. Two specs
+      both targeting ``flask.Flask`` (e.g. Flask + a project-level
+      extension) share one query; rows route back to specs by
+      matching ``class_name`` against each spec's map.
+    * Single project-wide variable scan reused across plugins.
+
+    Per-spec handler queries stay un-fused: the ref API doesn't carry
+    which attribute matched, so a fused result can't route to the
+    right spec without further work. Handler queries are
+    text-prefiltered before any AST parse, so this stays cheap.
     """
 
     plugins: list[DispatchAppPlugin]
@@ -425,123 +590,11 @@ class BatchDispatchAppPlugin(Plugin):
         active = [p for p in self.plugins if p._is_active(ctx)]
         if not active:
             return
-
-        # Shared subclass-walk cache. ``DispatchAppPlugin._module_to_names``
-        # calls ``ctx.subclasses_of_fqn_indices(fqn)`` once per
-        # ``app_class``; two plugins that share a class would otherwise
-        # walk the same hierarchy twice. Memoise the per-fqn list of
-        # ``(sub_module, sub_name)`` pairs.
-        subclass_cache: dict[str, list[tuple[str, str]]] = {}
-
-        def _subclasses_for(fqn: str) -> list[tuple[str, str]]:
-            cached = subclass_cache.get(fqn)
-            if cached is not None:
-                return cached
-            sub_idxs = ctx.subclasses_of_fqn_indices(fqn)
-            pairs: list[tuple[str, str]] = []
-            if sub_idxs:
-                for _k, _p, sub_fqname, _f in ctx.node_attrs(sub_idxs):
-                    sub_module, _, sub_name = sub_fqname.rpartition(".")
-                    if sub_module and sub_name:
-                        pairs.append((sub_module, sub_name))
-            subclass_cache[fqn] = pairs
-            return pairs
-
-        module_to_names_per_plugin: list[dict[str, set[str]]] = []
-        for plugin in active:
-            mtn: dict[str, set[str]] = {}
-            for fqn in plugin.app_classes:
-                module, _, name = fqn.rpartition(".")
-                if module and name:
-                    mtn.setdefault(module, set()).add(name)
-            for fqn in plugin.app_classes:
-                for sub_module, sub_name in _subclasses_for(fqn):
-                    mtn.setdefault(sub_module, set()).add(sub_name)
-            module_to_names_per_plugin.append(mtn)
-
-        # Drop plugins whose ``_module_to_names`` came back empty — same
-        # short-circuit DispatchAppPlugin.run does.
-        live_indices = [i for i, mtn in enumerate(module_to_names_per_plugin) if mtn]
-        if not live_indices:
-            return
-
-        # Union of (module → names) across every live plugin — drives
-        # the fused construction & factory queries.
-        union_modules: dict[str, set[str]] = {}
-        for i in live_indices:
-            for module, names in module_to_names_per_plugin[i].items():
-                union_modules.setdefault(module, set()).update(names)
-
-        # Per-plugin direct constructions, deduped by var_idx. Each row
-        # routes to plugins whose ``mtn[module]`` contains the row's
-        # ``class_name``.
-        direct_per_plugin: dict[int, list[native.ConstructionIdxRef]] = {
-            i: [] for i in live_indices
-        }
-        direct_seen_per_plugin: dict[int, set[int]] = {i: set() for i in live_indices}
-        for module, all_names in union_modules.items():
-            for ref in (
-                native.query(ctx)
-                .constructions()
-                .where_module(module)
-                .where_name(sorted(all_names))
-                .row_indices()
-            ):
-                for i in live_indices:
-                    if ref.class_name not in module_to_names_per_plugin[i].get(module, ()):
-                        continue
-                    seen = direct_seen_per_plugin[i]
-                    if ref.var_idx in seen:
-                        continue
-                    seen.add(ref.var_idx)
-                    direct_per_plugin[i].append(ref)
-
-        # Factory queries only run for plugins with seed_as_entrypoint —
-        # but they're shared across all such plugins by module.
-        seed_indices = [i for i in live_indices if active[i].seed_as_entrypoint]
-        factory_per_plugin: dict[int, list[tuple[native.FactoryIdxRef, str]]] = {
-            i: [] for i in live_indices
-        }
-        factory_seen_per_plugin: dict[int, set[tuple[int, str]]] = {i: set() for i in live_indices}
-        if seed_indices:
-            seed_union_modules: dict[str, set[str]] = {}
-            for i in seed_indices:
-                for module, names in module_to_names_per_plugin[i].items():
-                    seed_union_modules.setdefault(module, set()).update(names)
-            for module, all_names in seed_union_modules.items():
-                for fref in (
-                    native.query(ctx)
-                    .factories()
-                    .of_module(module)
-                    .where_name(sorted(all_names))
-                    .row_indices()
-                ):
-                    for kind in fref.kinds:
-                        for i in seed_indices:
-                            if kind not in module_to_names_per_plugin[i].get(module, ()):
-                                continue
-                            key = (fref.decl_idx, kind)
-                            if key in factory_seen_per_plugin[i]:
-                                continue
-                            factory_seen_per_plugin[i].add(key)
-                            factory_per_plugin[i].append((fref, kind))
-
-        # Single project-wide variable scan — shared across every plugin.
-        vars_by_file = _build_vars_by_file(ctx)
-
-        # Per-plugin handler query + emission. Handler queries are not
-        # fused because the ref API doesn't carry which attr matched
-        # (see class docstring).
-        for i in live_indices:
-            plugin = active[i]
-            handlers = _fetch_handlers(ctx, plugin.registration_decorators)
-            yield from plugin._emit_ops(
-                ctx,
-                direct=direct_per_plugin[i],
-                factory_decls=factory_per_plugin[i],
-                handlers=handlers,
-                vars_by_file=vars_by_file,
-            )
+        gathered = _gather_batched(ctx, [p.spec for p in active])
+        for plugin, g in zip(active, gathered, strict=True):
+            if g is None:
+                continue
+            yield from plugin.policy(ctx, g)
 
 
 @dataclass(kw_only=True)
