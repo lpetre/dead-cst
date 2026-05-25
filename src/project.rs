@@ -1883,21 +1883,15 @@ impl ProjectContext {
     /// the fqname can't be found anywhere — never raises.
     pub(crate) fn resolve(&self, py: Python<'_>, fqname: &str) -> PyResult<Option<Py<SymbolNode>>> {
         let outputs = self.materialized("resolve")?;
-        let mut prefix = fqname;
-        loop {
-            if let Some(idxs) = outputs.decl_by_fqname.get(prefix) {
-                if let Some(&idx) = idxs.first() {
-                    return Ok(Some(outputs.builder.nodes[idx].clone_ref(py)));
-                }
-            }
-            if let Some(&idx) = outputs.module_by_fqname.get(prefix) {
-                return Ok(Some(outputs.builder.nodes[idx].clone_ref(py)));
-            }
-            match prefix.rsplit_once('.') {
-                Some((parent, _)) => prefix = parent,
-                None => return Ok(None),
-            }
-        }
+        Ok(resolve_idx_in(&outputs, fqname).map(|i| outputs.builder.nodes[i].clone_ref(py)))
+    }
+
+    /// Idx-only variant of :meth:`resolve`. Same walk-back rules,
+    /// returns the positional index into ``ctx.nodes()`` (``None``
+    /// when the fqname can't be found anywhere).
+    pub(crate) fn resolve_idx(&self, fqname: &str) -> PyResult<Option<usize>> {
+        let outputs = self.materialized("resolve_idx")?;
+        Ok(resolve_idx_in(&outputs, fqname))
     }
 
     /// Return the module node + every transitive decl whose fqname
@@ -2151,13 +2145,30 @@ impl ProjectContext {
         py: Python<'_>,
         path_prefix: &str,
     ) -> PyResult<Vec<Py<SymbolNode>>> {
+        let indices = self.decls_under_indices(py, path_prefix)?;
         let outputs = self.materialized("decls_under")?;
+        Ok(indices
+            .into_iter()
+            .map(|i| outputs.builder.nodes[i].clone_ref(py))
+            .collect())
+    }
+
+    /// Idx-only variant of :meth:`decls_under`. Same scan, returns
+    /// positional indices into ``ctx.nodes()`` rather than allocating
+    /// ``Py<SymbolNode>`` clones.
+    pub(crate) fn decls_under_indices(
+        &self,
+        py: Python<'_>,
+        path_prefix: &str,
+    ) -> PyResult<Vec<usize>> {
+        let outputs = self.materialized("decls_under_indices")?;
         Ok(outputs
             .builder
             .nodes
             .iter()
-            .filter(|n| n.borrow(py).path.starts_with(path_prefix))
-            .map(|n| n.clone_ref(py))
+            .enumerate()
+            .filter(|(_i, n)| n.borrow(py).path.starts_with(path_prefix))
+            .map(|(i, _n)| i)
             .collect())
     }
 
@@ -2168,13 +2179,29 @@ impl ProjectContext {
         py: Python<'_>,
         substring: &str,
     ) -> PyResult<Vec<Py<SymbolNode>>> {
+        let indices = self.decls_matching_indices(py, substring)?;
         let outputs = self.materialized("decls_matching")?;
+        Ok(indices
+            .into_iter()
+            .map(|i| outputs.builder.nodes[i].clone_ref(py))
+            .collect())
+    }
+
+    /// Idx-only variant of :meth:`decls_matching`. Same scan, returns
+    /// positional indices into ``ctx.nodes()``.
+    pub(crate) fn decls_matching_indices(
+        &self,
+        py: Python<'_>,
+        substring: &str,
+    ) -> PyResult<Vec<usize>> {
+        let outputs = self.materialized("decls_matching_indices")?;
         Ok(outputs
             .builder
             .nodes
             .iter()
-            .filter(|n| n.borrow(py).path.contains(substring))
-            .map(|n| n.clone_ref(py))
+            .enumerate()
+            .filter(|(_i, n)| n.borrow(py).path.contains(substring))
+            .map(|(i, _n)| i)
             .collect())
     }
 
@@ -2187,10 +2214,25 @@ impl ProjectContext {
         py: Python<'_>,
         pattern: &str,
     ) -> PyResult<Vec<Py<SymbolNode>>> {
-        let regex = self.compile_regex(pattern)?;
+        let indices = self.decls_matching_name_indices(py, pattern)?;
         let outputs = self.materialized("decls_matching_name")?;
-        let mut out = Vec::new();
-        for node_py in &outputs.builder.nodes {
+        Ok(indices
+            .into_iter()
+            .map(|i| outputs.builder.nodes[i].clone_ref(py))
+            .collect())
+    }
+
+    /// Idx-only variant of :meth:`decls_matching_name`. Same scan and
+    /// kind filter, returns positional indices into ``ctx.nodes()``.
+    pub(crate) fn decls_matching_name_indices(
+        &self,
+        py: Python<'_>,
+        pattern: &str,
+    ) -> PyResult<Vec<usize>> {
+        let regex = self.compile_regex(pattern)?;
+        let outputs = self.materialized("decls_matching_name_indices")?;
+        let mut out: Vec<usize> = Vec::new();
+        for (idx, node_py) in outputs.builder.nodes.iter().enumerate() {
             let node = node_py.borrow(py);
             if !matches!(
                 node.kind,
@@ -2200,7 +2242,7 @@ impl ProjectContext {
             }
             let simple = node.fqname.rsplit('.').next().unwrap_or("");
             if regex.is_match(simple) {
-                out.push(node_py.clone_ref(py));
+                out.push(idx);
             }
         }
         Ok(out)
@@ -2227,6 +2269,30 @@ impl ProjectContext {
         )
     }
 
+    /// Idx-keyed variant of :meth:`descendants`. Takes a positional
+    /// index into ``ctx.nodes()`` and returns descendant indices
+    /// rather than allocating ``Py<SymbolNode>`` clones. Raises
+    /// :class:`IndexError` when ``root_idx`` is out of range.
+    #[pyo3(signature = (root_idx, *, skip_flags = 0))]
+    pub(crate) fn descendants_indices(
+        &self,
+        root_idx: usize,
+        skip_flags: u32,
+    ) -> PyResult<Vec<usize>> {
+        let outputs = self.materialized("descendants_indices")?;
+        let len = outputs.builder.nodes.len();
+        if root_idx >= len {
+            return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                "descendants_indices: root_idx {root_idx} out of range (len={len})"
+            )));
+        }
+        Ok(
+            bfs(&outputs.builder, [root_idx], Direction::Forward, skip_flags)
+                .into_iter()
+                .collect(),
+        )
+    }
+
     /// Reverse closure: every node that can reach ``decl`` by following
     /// graph edges. Used for ``why-alive`` and blast-radius scoping.
     #[pyo3(signature = (decl, *, skip_flags = 0))]
@@ -2242,6 +2308,30 @@ impl ProjectContext {
             .into_iter()
             .map(|i| outputs.builder.nodes[i].clone_ref(py))
             .collect())
+    }
+
+    /// Idx-keyed variant of :meth:`ancestors`. Takes a positional
+    /// index into ``ctx.nodes()`` and returns ancestor indices rather
+    /// than allocating ``Py<SymbolNode>`` clones. Raises
+    /// :class:`IndexError` when ``decl_idx`` is out of range.
+    #[pyo3(signature = (decl_idx, *, skip_flags = 0))]
+    pub(crate) fn ancestors_indices(
+        &self,
+        decl_idx: usize,
+        skip_flags: u32,
+    ) -> PyResult<Vec<usize>> {
+        let outputs = self.materialized("ancestors_indices")?;
+        let len = outputs.builder.nodes.len();
+        if decl_idx >= len {
+            return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                "ancestors_indices: decl_idx {decl_idx} out of range (len={len})"
+            )));
+        }
+        Ok(
+            bfs(&outputs.builder, [decl_idx], Direction::Reverse, skip_flags)
+                .into_iter()
+                .collect(),
+        )
     }
 
     /// One-hop reverse step: every node with an edge directly into
@@ -3287,6 +3377,28 @@ fn module_surfaces_indices_in(
         }
     }
     buckets
+}
+
+/// Shared walk-back lookup for :meth:`ProjectContext::resolve` and
+/// :meth:`resolve_idx`. Tries an exact decl match first, then an
+/// exact module match, then strips dotted segments. Returns the
+/// idx of the first hit or ``None``.
+fn resolve_idx_in(outputs: &BuildOutputs, fqname: &str) -> Option<usize> {
+    let mut prefix = fqname;
+    loop {
+        if let Some(idxs) = outputs.decl_by_fqname.get(prefix) {
+            if let Some(&idx) = idxs.first() {
+                return Some(idx);
+            }
+        }
+        if let Some(&idx) = outputs.module_by_fqname.get(prefix) {
+            return Some(idx);
+        }
+        match prefix.rsplit_once('.') {
+            Some((parent, _)) => prefix = parent,
+            None => return None,
+        }
+    }
 }
 
 /// `path -> module-node idx`, shared by :meth:`ProjectContext::module_for`,

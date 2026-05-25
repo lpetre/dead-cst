@@ -648,6 +648,13 @@ class ProjectContext:
         """
         ...
 
+    def resolve_idx(self, fqname: str) -> int | None:
+        """Idx-only variant of :meth:`resolve`. Same walk-back rules,
+        returns the positional index into :meth:`nodes` (``None`` when
+        the fqname can't be found anywhere).
+        """
+        ...
+
     def find_declarations(self, fqname: str) -> list[SymbolNode]:
         """Every declaration matching ``fqname``, walking back through
         dotted segments to find the enclosing top-level decl when the
@@ -814,11 +821,24 @@ class ProjectContext:
         """Every node whose ``path`` starts with the given prefix."""
         ...
 
+    def decls_under_indices(self, path_prefix: str) -> list[int]:
+        """Idx-only variant of :meth:`decls_under`. Same scan, returns
+        positional indices into :meth:`nodes` rather than allocating
+        ``SymbolNode`` clones.
+        """
+        ...
+
     def decls_matching(self, substring: str) -> list[SymbolNode]:
         """Every node whose ``path`` contains ``substring`` anywhere.
 
         Useful for path-pattern plugins (``alembic/versions/``,
         ``.ignore.py``).
+        """
+        ...
+
+    def decls_matching_indices(self, substring: str) -> list[int]:
+        """Idx-only variant of :meth:`decls_matching`. Same scan,
+        returns positional indices into :meth:`nodes`.
         """
         ...
 
@@ -829,6 +849,12 @@ class ProjectContext:
         Used by plugins that key on naming conventions —
         :class:`ModuleDundersPlugin` (``__xxx__`` names),
         :class:`PytestPlugin` (``test_*`` / ``Test*``), etc.
+        """
+        ...
+
+    def decls_matching_name_indices(self, pattern: str) -> list[int]:
+        """Idx-only variant of :meth:`decls_matching_name`. Same scan
+        and kind filter, returns positional indices into :meth:`nodes`.
         """
         ...
 
@@ -875,12 +901,28 @@ class ProjectContext:
         """
         ...
 
+    def descendants_indices(self, root_idx: int, *, skip_flags: int = 0) -> list[int]:
+        """Idx-keyed variant of :meth:`descendants`. Takes a positional
+        index into :meth:`nodes` and returns descendant indices rather
+        than allocating ``SymbolNode`` clones. Raises
+        :class:`IndexError` when ``root_idx`` is out of range.
+        """
+        ...
+
     def ancestors(self, decl: SymbolNode, *, skip_flags: int = 0) -> list[SymbolNode]:
         """Reverse closure: every node that can reach ``decl`` by
         following graph edges.
 
         Used for predecessor-chain walks and blast-radius scoping.
         ``skip_flags`` works the same as in :meth:`descendants`.
+        """
+        ...
+
+    def ancestors_indices(self, decl_idx: int, *, skip_flags: int = 0) -> list[int]:
+        """Idx-keyed variant of :meth:`ancestors`. Takes a positional
+        index into :meth:`nodes` and returns ancestor indices rather
+        than allocating ``SymbolNode`` clones. Raises
+        :class:`IndexError` when ``decl_idx`` is out of range.
         """
         ...
 

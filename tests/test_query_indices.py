@@ -975,3 +975,164 @@ def test_decorator_query_in_decl_idx_out_of_range_raises(build_decl_graph):
     n = len(ctx.nodes())
     with pytest.raises(IndexError, match="out of range"):
         native.query(ctx).decorators().in_decl_idx(n).where_name("command").row_indices()
+
+
+# ---------------------------------------------------------------------------
+# ctx.resolve_idx
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_idx_matches_node_form(build_decl_graph):
+    ctx = build_decl_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/svc.py": "def handler(): pass\nclass Service: pass\n",
+        }
+    )
+    # Exact decl, exact module, walk-back from method-level fqname.
+    for fqn in ("pkg.svc.handler", "pkg.svc", "pkg.svc.Service.method"):
+        node = ctx.resolve(fqn)
+        idx = ctx.resolve_idx(fqn)
+        assert node is not None
+        assert idx is not None
+        assert ctx.nodes()[idx].fqname == node.fqname
+
+
+def test_resolve_idx_unknown_returns_none(build_decl_graph):
+    ctx = build_decl_graph({"pkg/__init__.py": "", "pkg/a.py": "x = 1\n"})
+    assert ctx.resolve_idx("nothing.here") is None
+
+
+# ---------------------------------------------------------------------------
+# ctx.decls_under_indices / decls_matching_indices / decls_matching_name_indices
+# ---------------------------------------------------------------------------
+
+
+def test_decls_under_indices_matches_node_form(build_decl_graph, tmp_path):
+    ctx = build_decl_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/svc.py": "def handler(): pass\n",
+            "pkg/util.py": "def helper(): pass\n",
+            "other/__init__.py": "",
+            "other/m.py": "def m(): pass\n",
+        }
+    )
+    prefix = str(tmp_path / "pkg")
+    nodes = ctx.decls_under(prefix)
+    indices = ctx.decls_under_indices(prefix)
+    assert len(nodes) == len(indices)
+    revived = ctx.nodes_at(indices)
+    assert {n.fqname for n in revived} == {n.fqname for n in nodes}
+    # Sanity: nothing under "other" leaked into the bucket.
+    assert all(not n.fqname.startswith("other.") for n in revived)
+
+
+def test_decls_matching_indices_matches_node_form(build_decl_graph):
+    ctx = build_decl_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/test_a.py": "def test_one(): pass\n",
+            "pkg/main.py": "def main(): pass\n",
+        }
+    )
+    nodes = ctx.decls_matching("test_a")
+    indices = ctx.decls_matching_indices("test_a")
+    assert len(nodes) == len(indices)
+    revived = ctx.nodes_at(indices)
+    assert {n.fqname for n in revived} == {n.fqname for n in nodes}
+
+
+def test_decls_matching_name_indices_matches_node_form(build_decl_graph):
+    ctx = build_decl_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/a.py": "def test_one(): pass\ndef helper(): pass\nclass TestX: pass\n",
+        }
+    )
+    nodes = ctx.decls_matching_name(r"^(test_|Test)")
+    indices = ctx.decls_matching_name_indices(r"^(test_|Test)")
+    assert len(nodes) == len(indices)
+    revived = ctx.nodes_at(indices)
+    assert {n.fqname for n in revived} == {n.fqname for n in nodes}
+    assert {"pkg.a.test_one", "pkg.a.TestX"} <= {n.fqname for n in revived}
+    # The kind filter excludes module nodes — verify a module's name
+    # isn't accidentally surfaced even though "a" matches no pattern here.
+    assert all(n.kind != "module" for n in revived)
+
+
+# ---------------------------------------------------------------------------
+# ctx.descendants_indices / ancestors_indices
+# ---------------------------------------------------------------------------
+
+
+def test_descendants_indices_matches_node_form(build_decl_graph):
+    ctx = build_decl_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/a.py": ("def leaf(): pass\ndef middle(): leaf()\ndef root(): middle()\nroot()\n"),
+        }
+    )
+    (root_idx,) = ctx.indices_where(fqname_prefix="pkg.a.root", kind="function")
+    root_node = ctx.nodes_at([root_idx])[0]
+    nodes = ctx.descendants(root_node)
+    indices = ctx.descendants_indices(root_idx)
+    assert len(nodes) == len(indices)
+    revived = ctx.nodes_at(indices)
+    assert {n.fqname for n in revived} == {n.fqname for n in nodes}
+    # Sanity: the forward closure includes the transitive targets.
+    assert {"pkg.a.middle", "pkg.a.leaf"} <= {n.fqname for n in revived}
+
+
+def test_descendants_indices_skip_flags(build_decl_graph):
+    """``skip_flags`` parity: DEAD_BRANCH edges are filtered the same
+    way by both forms."""
+    ctx = build_decl_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/a.py": (
+                "def alive_only_in_dead_branch(): pass\n"
+                "def caller():\n"
+                "    if False:\n"
+                "        alive_only_in_dead_branch()\n"
+                "caller()\n"
+            ),
+        }
+    )
+    (caller_idx,) = ctx.indices_where(fqname_prefix="pkg.a.caller", kind="function")
+    caller_node = ctx.nodes_at([caller_idx])[0]
+    skip = int(native.EdgeFlags.DEAD_BRANCH)
+    nodes = ctx.descendants(caller_node, skip_flags=skip)
+    indices = ctx.descendants_indices(caller_idx, skip_flags=skip)
+    assert {n.fqname for n in nodes} == {ctx.nodes()[i].fqname for i in indices}
+
+
+def test_descendants_indices_out_of_range_raises(build_decl_graph):
+    ctx = build_decl_graph({"pkg/__init__.py": "", "pkg/a.py": "def f(): pass\n"})
+    n = len(ctx.nodes())
+    with pytest.raises(IndexError, match="out of range"):
+        ctx.descendants_indices(n)
+
+
+def test_ancestors_indices_matches_node_form(build_decl_graph):
+    ctx = build_decl_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/a.py": ("def leaf(): pass\ndef middle(): leaf()\ndef root(): middle()\nroot()\n"),
+        }
+    )
+    (leaf_idx,) = ctx.indices_where(fqname_prefix="pkg.a.leaf", kind="function")
+    leaf_node = ctx.nodes_at([leaf_idx])[0]
+    nodes = ctx.ancestors(leaf_node)
+    indices = ctx.ancestors_indices(leaf_idx)
+    assert len(nodes) == len(indices)
+    revived = ctx.nodes_at(indices)
+    assert {n.fqname for n in revived} == {n.fqname for n in nodes}
+    assert {"pkg.a.middle", "pkg.a.root"} <= {n.fqname for n in revived}
+
+
+def test_ancestors_indices_out_of_range_raises(build_decl_graph):
+    ctx = build_decl_graph({"pkg/__init__.py": "", "pkg/a.py": "def f(): pass\n"})
+    n = len(ctx.nodes())
+    with pytest.raises(IndexError, match="out of range"):
+        ctx.ancestors_indices(n)

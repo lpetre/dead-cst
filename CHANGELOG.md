@@ -29,6 +29,11 @@ two versions.
   `ctx.find_nodes_matching_specs_indices`,
   `ctx.subclasses_of_fqn_indices`, `ctx.direct_predecessors_idx` —
   the missing idx-form siblings the bundled plugins needed.
+- `ctx.resolve_idx`, `ctx.decls_under_indices`,
+  `ctx.decls_matching_indices`, `ctx.decls_matching_name_indices`,
+  `ctx.descendants_indices`, `ctx.ancestors_indices` — idx-form
+  siblings of the last six lookup / traversal helpers that still
+  allocated ``Py<SymbolNode>`` rows.
 - Index-form siblings on `ProjectContext`: `find_declarations_indices`,
   `module_for_indices`, `modules_for_paths`, `module_surface_indices`,
   `module_surfaces_indices`, `find_main_blocks_indices`. Each returns
