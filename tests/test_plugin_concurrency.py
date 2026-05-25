@@ -60,8 +60,7 @@ def test_plugins_run_concurrently(tmp_path: Path) -> None:
 
     assert len(observed) == 2
     assert observed[0] != observed[1], (
-        f"plugins ran on the same thread {observed[0]} — executor did "
-        "not actually parallelize"
+        f"plugins ran on the same thread {observed[0]} — executor did not actually parallelize"
     )
 
 
@@ -74,9 +73,7 @@ def test_serial_env_falls_back(tmp_path: Path) -> None:
     observed: list[int] = []
 
     class _RecorderPlugin(Plugin):
-        def run(
-            self, ctx: native.ProjectContext
-        ) -> Iterable[native.GraphOp]:  # pragma: no cover
+        def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:  # pragma: no cover
             observed.append(threading.get_ident())
             return ()
 
@@ -86,8 +83,7 @@ def test_serial_env_falls_back(tmp_path: Path) -> None:
 
     assert len(observed) == 3
     assert len(set(observed)) == 1, (
-        f"serial mode should run all plugins on one thread, got "
-        f"{set(observed)}"
+        f"serial mode should run all plugins on one thread, got {set(observed)}"
     )
 
 
@@ -101,9 +97,7 @@ def test_single_plugin_uses_serial_path(tmp_path: Path) -> None:
     observed: list[int] = []
 
     class _RecorderPlugin(Plugin):
-        def run(
-            self, ctx: native.ProjectContext
-        ) -> Iterable[native.GraphOp]:  # pragma: no cover
+        def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:  # pragma: no cover
             observed.append(threading.get_ident())
             return ()
 
@@ -120,9 +114,7 @@ def test_worker_count_env(tmp_path: Path, workers: str) -> None:
     (tmp_path / "a.py").write_text("x = 1\n")
 
     class _NoopPlugin(Plugin):
-        def run(
-            self, ctx: native.ProjectContext
-        ) -> Iterable[native.GraphOp]:  # pragma: no cover
+        def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:  # pragma: no cover
             return ()
 
     plugins = [_NoopPlugin(), _NoopPlugin(), _NoopPlugin()]

@@ -92,9 +92,7 @@ def main() -> None:
             timings = _measure(target, args.repeats, mode)
             best_ms = min(timings) * 1000.0
             med_ms = statistics.median(timings) * 1000.0
-            print(
-                f"{target.name:<28} {mode:<8} {files:>7} {best_ms:>11.1f} {med_ms:>10.1f}"
-            )
+            print(f"{target.name:<28} {mode:<8} {files:>7} {best_ms:>11.1f} {med_ms:>10.1f}")
         print()
 
 
