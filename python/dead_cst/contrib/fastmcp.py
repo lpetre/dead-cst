@@ -26,13 +26,14 @@ def fastmcp_plugin() -> DispatchAppPlugin:
     module-prefixed (``import fastmcp; mcp = fastmcp.FastMCP(...)``),
     and factory-style (``mcp = create_server()``) construction.
 
-    Only the ``fastmcp`` import path is recognized. Users on the
-    Anthropic MCP SDK's compatibility layer
-    (``from mcp.server.fastmcp import FastMCP``) can keep their handlers
-    alive with explicit ``-e`` entrypoints or a project-local plugin.
+    Both import paths are recognized:
+
+    * ``fastmcp.FastMCP`` — the standalone ``fastmcp`` package.
+    * ``mcp.server.fastmcp.FastMCP`` — the Anthropic MCP SDK's
+      compatibility layer (``from mcp.server.fastmcp import FastMCP``).
     """
     return DispatchAppPlugin(
         marker_prefix="fastmcp",
-        app_classes=("fastmcp.FastMCP",),
+        app_classes=("fastmcp.FastMCP", "mcp.server.fastmcp.FastMCP"),
         registration_decorators=_REGISTRATION_DECORATORS,
     )
