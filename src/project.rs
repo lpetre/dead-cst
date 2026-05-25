@@ -28,7 +28,10 @@ use ty_python_core::program::UseDefaultStrategy;
 use ty_python_core::scope::FileScopeId;
 use ty_python_core::semantic_index;
 
-use crate::builder::{apply_graph_op, bfs, lookup_idx, not_materialized, Direction, GraphBuilder};
+use crate::builder::{
+    apply_prepared_batch, bfs, lookup_idx, not_materialized, prepare_graph_op, CollectedOps,
+    Direction, GraphBuilder, PreparedOp,
+};
 use crate::file_payload::{file_to_edges, file_to_nodes, FileEdges, NodeKind, NodeRef};
 use crate::file_ref_edges::{file_to_ref_edges, FileRefEdges};
 use crate::graph::{intern_kind, DeclIndex, Import, MainBlock, NativeGraph, SymbolNode};
@@ -1051,19 +1054,19 @@ pub(crate) struct ProjectContext {
     pub(crate) root: String,
     pub(crate) plugins: Vec<PyObject>,
     /// Populated by `materialize` before plugins run. `None` outside a
-    /// materialize call — `apply_graph_op` / queries assume it's
+    /// materialize call — the apply pass / queries assume it's
     /// `Some` and error if a plugin (incorrectly) caches the ctx and
     /// uses it after materialize returns.
     ///
     /// Wrapped in [`parking_lot::RwLock`] so plugins can run
     /// concurrently from a Python `ThreadPoolExecutor` — queries take a
-    /// read guard, the apply pass takes a write guard. ``parking_lot``
-    /// over ``std::sync`` because the former exposes
+    /// read guard, the end-of-pass apply takes a write guard.
+    /// ``parking_lot`` over ``std::sync`` because the former exposes
     /// ``RwLockReadGuard::map`` for the ``Option`` projection that
     /// :meth:`materialized` performs.
     ///
     /// Held inside an [`Arc`] so the apply path
-    /// (:func:`builder::apply_graph_op`) can clone the handle
+    /// (:func:`builder::apply_prepared_batch`) can clone the handle
     /// **before** dropping the GIL and then acquire the write lock
     /// without holding the GIL. Acquiring the write lock while
     /// still holding the GIL would deadlock against a reader stuck
@@ -1182,15 +1185,15 @@ impl ProjectContext {
     /// also forced by `DEAD_CST_PLUGINS_SERIAL=1` in Python) or be
     /// driven concurrently from Python via a
     /// :class:`concurrent.futures.ThreadPoolExecutor` calling
-    /// :meth:`build_only` + :meth:`run_plugin` per worker.
+    /// :meth:`build_only` + :meth:`run_plugin_collect` per worker
+    /// followed by :meth:`apply_ops_batched`.
     ///
-    /// Ops are applied as they're yielded from each plugin so that
-    /// later steps inside the *same* plugin can call
-    /// ``ctx.descendants`` etc. and see the effect of earlier
-    /// yields. Across concurrent plugin invocations the
-    /// :class:`parking_lot::RwLock` on ``outputs`` serializes the
-    /// per-op write while letting the GIL-releasing queries run in
-    /// parallel.
+    /// Plugins operate on a **frozen graph**: every plugin's
+    /// ``run(ctx)`` sees the same base-graph state, the yielded ops
+    /// accumulate in registration / yield order, and a single
+    /// end-of-pass write-lock window folds the lot into the graph.
+    /// A plugin's own emissions are invisible to its own subsequent
+    /// queries (and to other plugins' queries) during ``run``.
     pub(crate) fn materialize(slf: Py<Self>, py: Python<'_>) -> PyResult<NativeGraph> {
         let show_progress = slf.borrow(py).show_progress;
         let stack_size = slf.borrow(py).stack_size;
@@ -1202,7 +1205,9 @@ impl ProjectContext {
 
         // Serial plugin pass (legacy / fallback path). Concurrent
         // execution is driven from Python — see
-        // ``Analysis.materialize_all``.
+        // ``Analysis.materialize_all``. We collect ops per plugin
+        // then apply once at the end, matching the parallel path's
+        // frozen-graph contract.
         let plugins: Vec<PyObject> = slf
             .borrow(py)
             .plugins
@@ -1210,6 +1215,7 @@ impl ProjectContext {
             .map(|p| p.clone_ref(py))
             .collect();
         let plugin_bar = ProgressBars::plugin_bar(show_progress, plugins.len() as u64);
+        let mut prepared: Vec<PreparedOp> = Vec::new();
         for plugin in &plugins {
             let plugin_name: String = plugin
                 .bind(py)
@@ -1219,10 +1225,11 @@ impl ProjectContext {
                 .and_then(|n| n.extract().ok())
                 .unwrap_or_else(|| "<unnamed>".to_string());
             plugin_bar.set_message(plugin_name);
-            run_and_apply_plugin(py, &slf, plugin)?;
+            collect_prepared_plugin_ops(py, &slf, plugin, &mut prepared)?;
             plugin_bar.inc(1);
         }
         plugin_bar.finish_and_clear();
+        apply_prepared_batch(&slf, py, prepared)?;
 
         // Snapshot a fresh ``NativeGraph`` from the builder's
         // interned node + edge vecs; the originals stay put.
@@ -1242,21 +1249,59 @@ impl ProjectContext {
         })
     }
 
-    /// Run a single plugin's ``run(ctx)`` callback, applying each
-    /// yielded op to the graph as it comes off the iterator. Called
-    /// from Python — by the serial fallback in :meth:`materialize`,
-    /// and (one call per plugin) by the
-    /// :class:`concurrent.futures.ThreadPoolExecutor` worker path.
+    /// Run a single plugin's ``run(ctx)`` callback and apply every
+    /// yielded op to the graph in one end-of-plugin write-lock
+    /// window. The plugin's own emissions are **not** visible to
+    /// queries issued from its own body — the graph is frozen for
+    /// the duration of ``run``.
     ///
-    /// Concurrency note: every yielded op takes the ``outputs``
-    /// write guard briefly; intra-plugin ``ctx.descendants`` /
-    /// ``ctx.find_module`` etc. take read guards. With multiple
-    /// workers each holding read guards via the GIL-released query
-    /// paths, the writes serialize with bounded contention — the
-    /// per-op write window is sub-millisecond and the readers do
-    /// not starve writers under [`parking_lot`]'s fair policy.
+    /// Useful when callers want one plugin's emissions landed before
+    /// the next plugin runs; the Python concurrent driver prefers
+    /// :meth:`run_plugin_collect` + :meth:`apply_ops_batched` so
+    /// every plugin in a pool sees the same frozen base graph.
     pub(crate) fn run_plugin(slf: Py<Self>, py: Python<'_>, plugin: PyObject) -> PyResult<()> {
-        run_and_apply_plugin(py, &slf, &plugin)
+        let mut prepared: Vec<PreparedOp> = Vec::new();
+        collect_prepared_plugin_ops(py, &slf, &plugin, &mut prepared)?;
+        apply_prepared_batch(&slf, py, prepared)
+    }
+
+    /// Run a plugin's ``run(ctx)``, collect every yielded op into a
+    /// :class:`CollectedOps` handle, and return it without touching
+    /// the graph. The handle is fed back to
+    /// :meth:`apply_ops_batched` (one or more handles per call) so
+    /// the apply pass runs in a single write-lock window.
+    ///
+    /// Python's :class:`concurrent.futures.ThreadPoolExecutor` drives
+    /// this concurrently across plugins so query time spent in
+    /// GIL-releasing rust paths (``find_decorated_decls`` etc.)
+    /// overlaps. The graph is read-only during the collect window —
+    /// every plugin sees the same base graph.
+    pub(crate) fn run_plugin_collect(
+        slf: Py<Self>,
+        py: Python<'_>,
+        plugin: PyObject,
+    ) -> PyResult<CollectedOps> {
+        let mut prepared: Vec<PreparedOp> = Vec::new();
+        collect_prepared_plugin_ops(py, &slf, &plugin, &mut prepared)?;
+        Ok(CollectedOps::new(prepared))
+    }
+
+    /// Apply a flat list of :class:`CollectedOps` handles to the
+    /// graph in registration / yield order under one write-lock
+    /// window. Each handle is drained on consumption; calling
+    /// :meth:`apply_ops_batched` twice on the same handle raises
+    /// :class:`ValueError`.
+    pub(crate) fn apply_ops_batched(
+        slf: Py<Self>,
+        py: Python<'_>,
+        ops: Vec<Py<CollectedOps>>,
+    ) -> PyResult<()> {
+        let mut flat: Vec<PreparedOp> = Vec::new();
+        for handle in &ops {
+            let mut taken = handle.borrow(py).take()?;
+            flat.append(&mut taken);
+        }
+        apply_prepared_batch(&slf, py, flat)
     }
 
     /// Snapshot the current graph as a [`NativeGraph`]. Used after
@@ -1294,15 +1339,19 @@ impl ProjectContext {
     }
 }
 
-/// Invoke ``plugin.run(ctx)`` and apply each yielded op to the graph
-/// in turn. Mirrors the per-yield apply behavior the codebase has
-/// relied on since plugins existed — ops from earlier steps in a
-/// plugin's body are visible to later ``ctx.descendants`` /
-/// ``ctx.find_*`` queries within the same plugin call.
-fn run_and_apply_plugin(
+/// Invoke ``plugin.run(ctx)`` and collect every yielded op into
+/// ``sink`` as a [`PreparedOp`]. The graph is read-only for the
+/// duration — the plugin's own emissions never make it into
+/// ``outputs`` until the apply pass runs.
+///
+/// Used by both the serial fallback in :meth:`ProjectContext::materialize`
+/// and the per-plugin :meth:`ProjectContext::run_plugin_collect` worker
+/// driven from Python.
+fn collect_prepared_plugin_ops(
     py: Python<'_>,
     ctx: &Py<ProjectContext>,
     plugin: &PyObject,
+    sink: &mut Vec<PreparedOp>,
 ) -> PyResult<()> {
     let result = plugin.bind(py).call_method1("run", (ctx.clone_ref(py),))?;
     if result.is_none() {
@@ -1310,7 +1359,7 @@ fn run_and_apply_plugin(
     }
     for item in result.iter()? {
         let op = item?;
-        apply_graph_op(ctx, py, &op)?;
+        sink.push(prepare_graph_op(py, &op)?);
     }
     Ok(())
 }
@@ -1318,7 +1367,7 @@ fn run_and_apply_plugin(
 /// Acquire a read guard on ``lock`` while releasing the GIL during
 /// the (potentially-parking) wait. Used by hot-path readers that
 /// would otherwise dead-lock with a concurrent
-/// :func:`builder::apply_graph_op` writer: the writer drops the GIL
+/// :func:`builder::apply_prepared_batch` writer: the writer drops the GIL
 /// before contending for the write lock, but to call ``Py::new`` /
 /// ``intern_node`` it has to re-attach the GIL once it owns the
 /// guard. A reader that parks on ``read()`` *while holding the GIL*

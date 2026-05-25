@@ -256,6 +256,19 @@ class AddNode:
 
 GraphOp = AddEdge | AddEdgeByIdx | AddEntrypoint | AddNode
 
+class CollectedOps:
+    """Opaque handle to one plugin's collected graph ops.
+
+    Returned by :meth:`ProjectContext.run_plugin_collect`; consumed by
+    :meth:`ProjectContext.apply_ops_batched`. The handle is single-use:
+    a second ``apply_ops_batched`` on the same instance raises
+    :class:`ValueError`.
+
+    There is no Python-side constructor or accessor — the type exists
+    solely as a transport for the (pure-rust) prepared ops between
+    the collect and apply phases of plugin execution.
+    """
+
 class NativeGraph:
     """The project-wide graph snapshot returned by ``Project.build()``
     and ``ProjectContext.materialize()``.
@@ -368,11 +381,33 @@ class ProjectContext:
         ...
 
     def run_plugin(self, plugin: _ProjectPluginLike | Any) -> None:
-        """Invoke ``plugin.run(ctx)`` once, applying every yielded
-        op to the graph as it comes off the iterator. Safe to call
-        concurrently from multiple Python threads — graph mutations
-        serialize on the rust-side lock while read-only queries on
-        the in-progress graph run in parallel."""
+        """Invoke ``plugin.run(ctx)`` once, collecting every yielded
+        op and applying the batch under one write-lock window at
+        the end. The plugin's own emissions are invisible to its
+        own queries — the graph is frozen for the duration of
+        ``run``. Prefer :meth:`run_plugin_collect` +
+        :meth:`apply_ops_batched` when driving multiple plugins
+        concurrently so the apply pass runs once for the full
+        cohort."""
+        ...
+
+    def run_plugin_collect(self, plugin: _ProjectPluginLike | Any) -> CollectedOps:
+        """Invoke ``plugin.run(ctx)`` once and return its yielded ops
+        as an opaque :class:`CollectedOps` handle without mutating
+        the graph. Safe to call concurrently from multiple Python
+        threads — the graph is read-only for the duration. The
+        handle is passed (alongside other plugins' handles) to
+        :meth:`apply_ops_batched`, which folds them all into the
+        graph under one write-lock window."""
+        ...
+
+    def apply_ops_batched(self, ops: list[CollectedOps]) -> None:
+        """Apply a list of :class:`CollectedOps` handles to the graph
+        in list order under a single write-lock window. Each handle
+        is consumed; re-applying the same handle raises
+        :class:`ValueError`. Ops within a handle apply in the order
+        the plugin yielded them; ops across handles apply in
+        ``ops`` order."""
         ...
 
     def snapshot_graph(self) -> NativeGraph:

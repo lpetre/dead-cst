@@ -174,14 +174,19 @@ class Analysis:
             ctx.set_stack_size(self._stack_size)
 
         # ``DEAD_CST_PLUGINS_SERIAL=1`` (or no plugins / a single
-        # plugin) keeps the legacy rust-side loop. Otherwise we drive
+        # plugin) keeps the rust-side serial loop. Otherwise we drive
         # plugins from a ``ThreadPoolExecutor`` so any plugin time
         # spent in GIL-releasing rust queries (``find_decorated_decls``,
         # ``find_subclasses_of_class``, ``find_handler_decorators``, ...)
-        # overlaps across workers. Mutations to the graph still
-        # serialize behind the rust-side ``RwLock`` on ``outputs`` —
-        # only one ``apply_graph_op`` write runs at a time — but the
-        # read path is fully concurrent.
+        # overlaps across workers.
+        #
+        # Both paths satisfy the *frozen-graph* contract: every
+        # plugin's ``run(ctx)`` observes the same base-graph state.
+        # Ops collected from each plugin land in registration order
+        # via a single end-of-pass :meth:`apply_ops_batched` call —
+        # a plugin's own emissions are invisible to its own queries,
+        # and to every other plugin's queries, until the apply pass
+        # runs.
         if _serial_mode() or len(self._plugins) <= 1:
             for plugin in self._plugins:
                 ctx.add_plugin(plugin)
@@ -191,14 +196,18 @@ class Analysis:
             workers = _plugin_worker_count(len(self._plugins))
             # Plugins are scheduled in registration order; results
             # ``.result()`` waits in the same order. Errors propagate
-            # via the future's ``.result()`` call.
+            # via the future's ``.result()`` call. We collect each
+            # plugin's ops into a :class:`CollectedOps` handle off
+            # the worker thread, then fold them all into the graph
+            # in registration order via one ``apply_ops_batched``
+            # call on the main thread.
             with ThreadPoolExecutor(
                 max_workers=workers,
                 thread_name_prefix="dead-cst-plugin",
             ) as pool:
-                futures = [pool.submit(ctx.run_plugin, p) for p in self._plugins]
-                for fut in futures:
-                    fut.result()
+                futures = [pool.submit(ctx.run_plugin_collect, p) for p in self._plugins]
+                collected = [fut.result() for fut in futures]
+            ctx.apply_ops_batched(collected)
         self._ctx = ctx
         return ctx
 
