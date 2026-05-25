@@ -109,6 +109,112 @@ def test_live_overloads_survive_codemod(tmp_path, make_analysis):
     assert rewritten.count("@overload") == 2
 
 
+def test_overload_stub_flag_set_on_stubs_only(build_decl_graph):
+    """`NodeFlags.OVERLOAD` is set on `@typing.overload`-decorated stubs and
+    not on the impl. Recognise both `@overload` (from-import / aliased) and
+    the `@typing.overload` attribute form (plain `import typing`)."""
+    graph = build_decl_graph(
+        {
+            "mod.py": """
+            from typing import overload as ovl
+            import typing
+
+            @ovl
+            def f(x: int) -> int: ...
+            @typing.overload
+            def f(x: str) -> str: ...
+            def f(x):
+                return x
+            """
+        }
+    )
+    # After build_decl_graph's dedent+strip the lines are:
+    #   1: from typing import overload as ovl
+    #   2: import typing
+    #   3: (blank)
+    #   4: @ovl
+    #   5: def f(x: int) -> int: ...      <- stub
+    #   6: @typing.overload
+    #   7: def f(x: str) -> str: ...      <- stub
+    #   8: def f(x):                      <- impl
+    f_nodes = [n for n in graph.nodes() if n.fqname == "mod.f" and n.kind == "function"]
+    by_line = {n.start_line: n for n in f_nodes}
+    assert set(by_line) == {5, 7, 8}, f"unexpected lines: {sorted(by_line)}"
+    assert by_line[5].flags & NodeFlags.OVERLOAD
+    assert by_line[7].flags & NodeFlags.OVERLOAD
+    assert not (by_line[8].flags & NodeFlags.OVERLOAD)
+
+
+def test_impl_to_overload_anchor_edges(build_decl_graph):
+    """Each in-file `@overload` stub gets an explicit `impl -> stub` edge,
+    visible in `descendants(impl)`."""
+    graph = build_decl_graph(
+        {
+            "mod.py": """
+            from typing import overload
+
+            @overload
+            def f(x: int) -> int: ...
+            @overload
+            def f(x: str) -> str: ...
+            def f(x):
+                return x
+            """
+        }
+    )
+    # After dedent+strip lines are:
+    #   1: from typing import overload
+    #   2: (blank)
+    #   3: @overload
+    #   4: def f(x: int) -> int: ...
+    #   5: @overload
+    #   6: def f(x: str) -> str: ...
+    #   7: def f(x):
+    impl = next(n for n in graph.nodes() if n.fqname == "mod.f" and n.start_line == 7)
+    stubs = [
+        n
+        for n in graph.nodes()
+        if n.fqname == "mod.f" and n.kind == "function" and n.start_line in (4, 6)
+    ]
+    assert len(stubs) == 2
+    descendants = set(graph.descendants(impl))
+    assert all(s in descendants for s in stubs), (
+        "Each overload stub should be a descendant of the impl via the anchor edge"
+    )
+
+
+def test_cross_module_import_reaches_impl_not_stubs(build_decl_graph):
+    """`from mod import f` should produce exactly one decl edge per consumer
+    use — to the impl, not the stubs (which are deliberately excluded from
+    the cross-module trie via `NodeFlags.OVERLOAD`)."""
+    graph = build_decl_graph(
+        {
+            "mod.py": """
+            from typing import overload
+
+            @overload
+            def f(x: int) -> int: ...
+            @overload
+            def f(x: str) -> str: ...
+            def f(x):
+                return x
+            """,
+            "main.py": "from mod import f\nf(1)\n",
+        }
+    )
+    main_alias = next(n for n in graph.nodes() if n.fqname == "main.f" and n.kind == "import")
+    nodes = graph.nodes()
+    # Direct successors of the import alias: filter to `mod.f` function
+    # decls and assert none of them carry the OVERLOAD flag.
+    targets = [
+        nodes[v]
+        for u, v, _ in graph.edges()
+        if nodes[u] == main_alias and nodes[v].fqname == "mod.f" and nodes[v].kind == "function"
+    ]
+    assert targets, "import alias should reach at least one mod.f decl"
+    assert all(not (t.flags & NodeFlags.OVERLOAD) for t in targets)
+
+
 # ---------------------------------------------------------------------------
 # ``.pyi`` ingestion -- compiled-extension orphan stubs
 # ---------------------------------------------------------------------------

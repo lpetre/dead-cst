@@ -961,6 +961,14 @@ pub(crate) fn build_fqname_indices(
     let mut imports_by_module: FxHashMap<String, Vec<usize>> = FxHashMap::default();
     for (idx, node_py) in builder.nodes.iter().enumerate() {
         let node = node_py.borrow(py);
+        // `OVERLOAD`-flagged decls (the `@typing.overload`-decorated
+        // stubs of an in-file overload group) are excluded from the
+        // fqname trie so cross-module `from mod import f` resolves to
+        // the impl only. Reachability still anchors them via the
+        // explicit `impl → stub` edge emitted in `file_to_edges`.
+        if node.flags & crate::graph::NodeFlags::OVERLOAD != 0 {
+            continue;
+        }
         match node.kind {
             "module" => {
                 modules.insert(node.fqname.clone(), idx);

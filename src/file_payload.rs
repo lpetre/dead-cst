@@ -25,6 +25,7 @@
 use ruff_db::files::File;
 use ruff_db::parsed::parsed_module;
 use ruff_db::source::{line_index, source_text};
+use ruff_python_ast::Stmt;
 use ruff_text_size::{Ranged, TextRange};
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
@@ -36,6 +37,7 @@ use ty_python_core::place::{PlaceExprRef, ScopedPlaceId};
 use ty_python_core::scope::FileScopeId;
 use ty_python_core::semantic_index;
 
+use crate::graph::NodeFlags;
 use crate::helpers::{
     collect_all_imports_local, file_default_flags, file_path_string, iter_top_level_classes,
     module_fqname_for_file, position, range_key, resolve_base_fqn, scan_noqa_directives,
@@ -227,6 +229,13 @@ pub(crate) struct ImportPayload {
 ///   walk. Same-file `LocalSameFileClass(local_idx)` bases reference
 ///   the file's own `refs[local_idx]`; assemble translates them via
 ///   the same `NodeRef -> global_idx` map used for edges.
+/// * `overload_anchors` — `(impl_local_idx, stub_local_idx)` pairs for
+///   in-file `@typing.overload` groups. The assembly pass emits one
+///   `impl → stub` edge per pair so reachability propagates from a
+///   live impl to its stubs (and a dead impl drags its stubs along
+///   for the codemod). Stubs are also flagged `NodeFlags::OVERLOAD`
+///   in `nodes` and excluded from `exports_by_name` so cross-module
+///   `from mod import f` resolves to the impl only.
 #[derive(Debug, Eq, PartialEq, salsa::Update, get_size2::GetSize)]
 pub(crate) struct FileNodes<'db> {
     pub(crate) nodes: Box<[NodeData]>,
@@ -235,6 +244,7 @@ pub(crate) struct FileNodes<'db> {
     pub(crate) exports_by_name: FxHashMap<String, SmallVec<[u32; 2]>>,
     pub(crate) star_reexports: FxHashMap<String, String>,
     pub(crate) class_bases: Vec<ClassBaseEntry>,
+    pub(crate) overload_anchors: Box<[(u32, u32)]>,
 }
 
 /// `(name_range_key, resolved_bases)` pair stored in
@@ -323,6 +333,53 @@ pub(crate) fn ref_to_node<'db>(db: &'db dyn ProjectDb, r: NodeRef<'db>) -> NodeD
     }
 }
 
+/// Modules whose `.overload` attribute marks a function decl as a stub.
+const OVERLOAD_MODULES: &[&str] = &["typing", "typing_extensions"];
+
+/// Return `true` if `dec` references `typing.overload` /
+/// `typing_extensions.overload` in any of its bound forms:
+///
+/// * `@overload` / `@overload(...)` when `imports["overload"]` resolves
+///   to `typing.overload` (or `typing_extensions.overload`).
+/// * `@typing.overload` / `@typing.overload(...)` when `imports["typing"]`
+///   is bound as a module (the `<module>` marker used by
+///   `collect_all_imports_local` for plain `import typing`).
+/// * Aliased forms such as `from typing import overload as ovl` (the
+///   `imports` map already records `"ovl" -> "typing.overload"`).
+fn is_overload_decorator(
+    dec: &ruff_python_ast::Decorator,
+    imports: &rustc_hash::FxHashMap<String, String>,
+) -> bool {
+    // Unwrap call form (`@overload()`) so we look at the callee.
+    let mut expr = &dec.expression;
+    while let ruff_python_ast::Expr::Call(call) = expr {
+        expr = &call.func;
+    }
+    match expr {
+        ruff_python_ast::Expr::Name(n) => imports
+            .get(n.id.as_str())
+            .map(|target| {
+                OVERLOAD_MODULES
+                    .iter()
+                    .any(|m| target.as_str() == format!("{m}.overload"))
+            })
+            .unwrap_or(false),
+        ruff_python_ast::Expr::Attribute(attr) => {
+            if attr.attr.as_str() != "overload" {
+                return false;
+            }
+            let ruff_python_ast::Expr::Name(prefix) = attr.value.as_ref() else {
+                return false;
+            };
+            imports
+                .get(prefix.id.as_str())
+                .map(|target| OVERLOAD_MODULES.iter().any(|m| target == m))
+                .unwrap_or(false)
+        }
+        _ => false,
+    }
+}
+
 /// Build the per-file node payload. Salsa-tracked so it's memoized and
 /// safe to call concurrently from rayon workers; `returns(ref)` so
 /// callers get a borrow into salsa's storage instead of a clone.
@@ -380,6 +437,25 @@ pub(crate) fn file_to_nodes<'db>(db: &'db dyn ProjectDb, file: File) -> FileNode
     let mut star_local_name_cache: HashMap<TextRange, String> = HashMap::new();
 
     let mut star_reexports: FxHashMap<String, String> = FxHashMap::default();
+
+    // Pre-scan top-level `Stmt::FunctionDef` decorator lists to identify
+    // `@typing.overload`-decorated function defs. The set is keyed on the
+    // function's name TextRange (which is what `DefinitionKind::Function`
+    // reports as its `target_range`), so we can flag the matching decl
+    // when ty enumerates it below.
+    let local_imports = collect_all_imports_local(&parsed);
+    let mut overload_decorated: FxHashSet<TextRange> = FxHashSet::default();
+    for stmt in &parsed.syntax().body {
+        if let Stmt::FunctionDef(func) = stmt {
+            if func
+                .decorator_list
+                .iter()
+                .any(|d| is_overload_decorator(d, &local_imports))
+            {
+                overload_decorated.insert(func.name.range());
+            }
+        }
+    }
 
     for (_def_id, state, _used) in use_def_map.all_definitions_with_usage() {
         let DefinitionState::Defined(def) = state else {
@@ -446,6 +522,13 @@ pub(crate) fn file_to_nodes<'db>(db: &'db dyn ProjectDb, file: File) -> FileNode
         {
             flags |= NODE_FLAGS_NOQA_PIN;
         }
+        // `@typing.overload`-decorated function defs: flag now so the
+        // post-pass can partition same-name groups into impl / stubs.
+        // The set is keyed on the function's name TextRange, which is
+        // exactly what `DefinitionKind::Function::target_range` returns.
+        if matches!(node_kind, NodeKind::Function) && overload_decorated.contains(&target_range) {
+            flags |= NodeFlags::OVERLOAD;
+        }
         // Stub-only ENTRYPOINT flagging is deferred to the assembly
         // pass; it needs the project-wide peer-stub map and the .py
         // twin's `exports_by_name`, which aren't visible to this
@@ -482,12 +565,58 @@ pub(crate) fn file_to_nodes<'db>(db: &'db dyn ProjectDb, file: File) -> FileNode
         }
     }
 
+    // Overload-anchor post-pass: for each same-name group of top-level
+    // function defs containing both `@overload`-decorated stubs AND a
+    // non-overload impl, pair each stub with the *last* non-overload
+    // decl (CPython's runtime semantics — the impl is the final one).
+    // Stubs that aren't anchored to an impl (e.g. a .pyi stub file
+    // where every `def f` is `@overload`) keep their OVERLOAD flag
+    // but emit no anchor; reachability falls back to the
+    // module-anchor edge.
+    let mut overload_anchors: Vec<(u32, u32)> = Vec::new();
+    let mut by_name: FxHashMap<String, Vec<u32>> = FxHashMap::default();
+    for (i, node) in nodes.iter().enumerate() {
+        if !matches!(node.kind, NodeKind::Function) {
+            continue;
+        }
+        let simple = node
+            .fqname
+            .rsplit_once('.')
+            .map(|p| p.1)
+            .unwrap_or(&node.fqname);
+        by_name
+            .entry(simple.to_string())
+            .or_default()
+            .push(i as u32);
+    }
+    for group in by_name.values() {
+        // Find the last non-overload entry — that's the impl. Groups
+        // without any non-overload decl emit no anchors (e.g. a .pyi
+        // stub file whose every `def f` is `@overload`).
+        let Some(&impl_idx) = group
+            .iter()
+            .rev()
+            .find(|&&i| nodes[i as usize].flags & NodeFlags::OVERLOAD == 0)
+        else {
+            continue;
+        };
+        for &i in group {
+            if nodes[i as usize].flags & NodeFlags::OVERLOAD != 0 {
+                overload_anchors.push((impl_idx, i));
+            }
+        }
+    }
+
     // Post-pass: populate `exports_by_name` from ty's end-of-scope
     // symbol bindings. This collapses sequential rebinds to the latest
     // while preserving branch-bound multi-binding cases (try/except,
     // if/else where each branch assigns). Mirrors `globals_by_name` in
     // today's pipeline. Values are indices into `nodes` (≥ 1, since
     // index 0 is the module node which can't be bound to a name).
+    // Overload-flagged decls are excluded so `from mod import f`
+    // resolves to the impl only — the impl `def f` shadows them via
+    // ty's end-of-scope binding anyway, but pyi stub files (every
+    // `def f` decorated `@overload`) need the explicit filter.
     let mut exports_by_name: FxHashMap<String, SmallVec<[u32; 2]>> = FxHashMap::default();
     for (symbol_id, bindings) in use_def_map.all_end_of_scope_symbol_bindings() {
         let PlaceExprRef::Symbol(sym) = place_table.place(ScopedPlaceId::Symbol(symbol_id)) else {
@@ -503,6 +632,9 @@ pub(crate) fn file_to_nodes<'db>(db: &'db dyn ProjectDb, file: File) -> FileNode
                 continue;
             }
             if let Some(&local_idx) = ref_to_local.get(&NodeRef::Def(def)) {
+                if nodes[local_idx as usize].flags & NodeFlags::OVERLOAD != 0 {
+                    continue;
+                }
                 live.push(local_idx);
             }
         }
@@ -525,6 +657,7 @@ pub(crate) fn file_to_nodes<'db>(db: &'db dyn ProjectDb, file: File) -> FileNode
         exports_by_name,
         star_reexports,
         class_bases,
+        overload_anchors: overload_anchors.into_boxed_slice(),
     }
 }
 
@@ -796,6 +929,17 @@ pub(crate) fn file_to_edges<'db>(db: &'db dyn ProjectDb, file: File) -> FileEdge
     //    its decls. `refs[0]` is the module itself; skip it.
     for &node_ref in self_nodes.refs.iter().skip(1) {
         edges.insert((node_ref, module_ref, 0));
+    }
+
+    // 1a. `impl → stub` anchor edges for in-file `@typing.overload`
+    //     groups. Lets reachability propagate from a live impl to its
+    //     stubs and lets the codemod drop a dead impl's stubs in the
+    //     same pass. (`NodeFlags::OVERLOAD` on the stub additionally
+    //     excludes it from cross-module `from mod import f` lookups.)
+    for &(impl_local, stub_local) in self_nodes.overload_anchors.iter() {
+        let impl_ref = self_nodes.refs[impl_local as usize];
+        let stub_ref = self_nodes.refs[stub_local as usize];
+        edges.insert((impl_ref, stub_ref, 0));
     }
 
     // 2. Submodule → parent module hierarchy edge. Mirrors today's
