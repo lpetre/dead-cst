@@ -120,10 +120,12 @@ impl CallRef {
 
 /// Index-form sibling of :class:`DecoratorRef`. Same metadata fields,
 /// minus ``args`` / ``kwargs``; ``decorated_idx`` indexes into
-/// ``ctx.nodes()``.
+/// ``ctx.nodes()``. ``path`` is preserved because plugins routinely
+/// bucket by path before any further query.
 #[pyclass(frozen, get_all)]
 pub(crate) struct DecoratorIdxRef {
     pub(crate) decorated_idx: usize,
+    pub(crate) path: String,
     pub(crate) decorator_name: Option<String>,
     pub(crate) decorator_owner: Option<String>,
     pub(crate) decorator_via: Option<String>,
@@ -131,28 +133,34 @@ pub(crate) struct DecoratorIdxRef {
 
 /// Index-form sibling of :class:`ConstructionRef`. Same metadata
 /// fields, minus ``args`` / ``kwargs``; ``var_idx`` indexes into
-/// ``ctx.nodes()``.
+/// ``ctx.nodes()``. ``path`` is preserved as a cheap bucket key for
+/// plugins that fan out per file.
 #[pyclass(frozen, get_all)]
 pub(crate) struct ConstructionIdxRef {
     pub(crate) var_idx: usize,
+    pub(crate) path: String,
     pub(crate) class_name: String,
 }
 
 /// Index-form sibling of :class:`CallRef`. Same metadata fields,
 /// minus ``args`` / ``kwargs``; ``owner_idx`` indexes into
-/// ``ctx.nodes()``.
+/// ``ctx.nodes()``. ``path`` is the owning decl's path.
 #[pyclass(frozen, get_all)]
 pub(crate) struct CallIdxRef {
     pub(crate) owner_idx: usize,
+    pub(crate) path: String,
     pub(crate) string_arg: String,
 }
 
 /// Index-form sibling of :class:`FactoryRef`. ``decl_idx`` indexes
 /// into ``ctx.nodes()``; ``kinds`` is the same sorted set of matched
 /// constructor bare-names the node-returning terminal emits.
+/// ``path`` is preserved as a cheap bucket key for plugins that fan
+/// out per file.
 #[pyclass(frozen, get_all)]
 pub(crate) struct FactoryIdxRef {
     pub(crate) decl_idx: usize,
+    pub(crate) path: String,
     pub(crate) kinds: Vec<String>,
 }
 
@@ -456,6 +464,7 @@ pub(crate) struct DecoratorQuery {
     pub(crate) owner_attrs: Option<Vec<String>>,
     pub(crate) via_attr: Option<String>,
     pub(crate) in_decl: Option<Py<SymbolNode>>,
+    pub(crate) in_decl_idx: Option<usize>,
     pub(crate) path_regex: Option<String>,
     pub(crate) kwarg_matchers: Vec<(String, KwargMatcher)>,
 }
@@ -470,6 +479,7 @@ impl DecoratorQuery {
             owner_attrs: None,
             via_attr: None,
             in_decl: None,
+            in_decl_idx: None,
             path_regex: None,
             kwarg_matchers: Vec::new(),
         }
@@ -518,6 +528,10 @@ impl DecoratorQuery {
     }
     fn in_decl<'py>(mut slf: PyRefMut<'py, Self>, node: Py<SymbolNode>) -> PyRefMut<'py, Self> {
         slf.in_decl = Some(node);
+        slf
+    }
+    fn in_decl_idx<'py>(mut slf: PyRefMut<'py, Self>, idx: usize) -> PyRefMut<'py, Self> {
+        slf.in_decl_idx = Some(idx);
         slf
     }
     fn where_path<'py>(mut slf: PyRefMut<'py, Self>, regex: String) -> PyRefMut<'py, Self> {
@@ -634,6 +648,38 @@ impl DecoratorQuery {
                     call_args,
                 });
             }
+        } else if let Some(in_decl_idx) = self.in_decl_idx {
+            let names = self.names.as_ref().ok_or_else(|| {
+                PyValueError::new_err("DecoratorQuery.in_decl_idx(...) requires .where_name(...)")
+            })?;
+            let outputs = ctx.materialized("DecoratorQuery.in_decl_idx")?;
+            let len = outputs.builder.nodes.len();
+            if in_decl_idx >= len {
+                return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                    "DecoratorQuery.in_decl_idx: idx {in_decl_idx} out of range (len={len})"
+                )));
+            }
+            let in_decl_ref = outputs.builder.nodes[in_decl_idx].borrow(py);
+            let decls = ctx.find_decorations_on(py, &in_decl_ref, names.clone(), path_regex)?;
+            let owner_simple = in_decl_ref
+                .fqname
+                .rsplit('.')
+                .next()
+                .unwrap_or("")
+                .to_string();
+            drop(in_decl_ref);
+            for (decorated_idx, call_args) in decls {
+                if !call_args_match_kwargs(&call_args, kwarg_matchers) {
+                    continue;
+                }
+                out.push(DecoratorRowIdx {
+                    decorated_idx,
+                    decorator_name: None,
+                    decorator_owner: Some(owner_simple.clone()),
+                    decorator_via: None,
+                    call_args,
+                });
+            }
         } else if let Some(fqn) = &self.callee_fqn {
             let decls = ctx.find_decorated(py, fqn, path_regex)?;
             for (decorated_idx, call_args) in decls {
@@ -666,7 +712,8 @@ impl DecoratorQuery {
             return Err(PyValueError::new_err(
                 "DecoratorQuery requires one of: where_callee(...); \
                  where_module(...) + where_name(...); where_owner_attr(...); \
-                 where_owner_attr_via(via, attrs); or in_decl(node) + where_name(...)",
+                 where_owner_attr_via(via, attrs); in_decl(node) + where_name(...); \
+                 or in_decl_idx(idx) + where_name(...)",
             ));
         }
         Ok(out)
@@ -685,19 +732,24 @@ impl DecoratorQuery {
     /// :class:`AddNodeByIdx` to stay GIL-light end-to-end.
     fn row_indices(&self, py: Python<'_>) -> PyResult<Vec<Py<DecoratorIdxRef>>> {
         let rows = self.decorator_rows(py)?;
-        rows.into_iter()
-            .map(|row| {
-                Py::new(
-                    py,
-                    DecoratorIdxRef {
-                        decorated_idx: row.decorated_idx,
-                        decorator_name: row.decorator_name,
-                        decorator_owner: row.decorator_owner,
-                        decorator_via: row.decorator_via,
-                    },
-                )
-            })
-            .collect()
+        let ctx = self.ctx.borrow(py);
+        let outputs = ctx.materialized("DecoratorQuery.row_indices")?;
+        let nodes: &[Py<SymbolNode>] = &outputs.builder.nodes;
+        let mut out: Vec<Py<DecoratorIdxRef>> = Vec::with_capacity(rows.len());
+        for row in rows {
+            let path = nodes[row.decorated_idx].borrow(py).path.clone();
+            out.push(Py::new(
+                py,
+                DecoratorIdxRef {
+                    decorated_idx: row.decorated_idx,
+                    path,
+                    decorator_name: row.decorator_name,
+                    decorator_owner: row.decorator_owner,
+                    decorator_via: row.decorator_via,
+                },
+            )?);
+        }
+        Ok(out)
     }
 }
 
@@ -841,17 +893,22 @@ impl ConstructionQuery {
     /// ``args`` / ``kwargs`` row payloads are skipped.
     fn row_indices(&self, py: Python<'_>) -> PyResult<Vec<Py<ConstructionIdxRef>>> {
         let rows = self.construction_rows(py)?;
-        rows.into_iter()
-            .map(|row| {
-                Py::new(
-                    py,
-                    ConstructionIdxRef {
-                        var_idx: row.var_idx,
-                        class_name: row.class_name,
-                    },
-                )
-            })
-            .collect()
+        let ctx = self.ctx.borrow(py);
+        let outputs = ctx.materialized("ConstructionQuery.row_indices")?;
+        let nodes: &[Py<SymbolNode>] = &outputs.builder.nodes;
+        let mut out: Vec<Py<ConstructionIdxRef>> = Vec::with_capacity(rows.len());
+        for row in rows {
+            let path = nodes[row.var_idx].borrow(py).path.clone();
+            out.push(Py::new(
+                py,
+                ConstructionIdxRef {
+                    var_idx: row.var_idx,
+                    path,
+                    class_name: row.class_name,
+                },
+            )?);
+        }
+        Ok(out)
     }
 }
 
@@ -1034,17 +1091,22 @@ impl CallQuery {
     /// because most call-shape plugins key on it.
     fn row_indices(&self, py: Python<'_>) -> PyResult<Vec<Py<CallIdxRef>>> {
         let rows = self.call_rows(py)?;
-        rows.into_iter()
-            .map(|row| {
-                Py::new(
-                    py,
-                    CallIdxRef {
-                        owner_idx: row.owner_idx,
-                        string_arg: row.string_arg,
-                    },
-                )
-            })
-            .collect()
+        let ctx = self.ctx.borrow(py);
+        let outputs = ctx.materialized("CallQuery.row_indices")?;
+        let nodes: &[Py<SymbolNode>] = &outputs.builder.nodes;
+        let mut out: Vec<Py<CallIdxRef>> = Vec::with_capacity(rows.len());
+        for row in rows {
+            let path = nodes[row.owner_idx].borrow(py).path.clone();
+            out.push(Py::new(
+                py,
+                CallIdxRef {
+                    owner_idx: row.owner_idx,
+                    path,
+                    string_arg: row.string_arg,
+                },
+            )?);
+        }
+        Ok(out)
     }
 }
 
@@ -1056,14 +1118,17 @@ impl CallQuery {
 /// * ``of_fqn(fqn)`` — base by dotted name (external classes ok —
 ///   ``unittest.TestCase`` etc.).
 /// * ``of_node(class_node)`` — base by project-local class node.
+/// * ``of_idx(class_idx)`` — base by positional index into
+///   ``ctx.nodes()`` (idx-form sibling of ``of_node``).
 /// ``transitive(bool)`` controls whether the BFS walks past the
-/// direct subclass frontier (default ``True``; for ``of_node`` the
-/// BFS is always transitive).
+/// direct subclass frontier (default ``True``; for ``of_node`` /
+/// ``of_idx`` the BFS is always transitive).
 #[pyclass(unsendable)]
 pub(crate) struct SubclassQuery {
     pub(crate) ctx: Py<ProjectContext>,
     pub(crate) base_fqn: Option<String>,
     pub(crate) base_node: Option<Py<SymbolNode>>,
+    pub(crate) base_idx: Option<usize>,
     pub(crate) transitive: bool,
 }
 
@@ -1073,6 +1138,7 @@ impl SubclassQuery {
             ctx,
             base_fqn: None,
             base_node: None,
+            base_idx: None,
             transitive: true,
         }
     }
@@ -1088,22 +1154,23 @@ impl SubclassQuery {
         slf.base_node = Some(node);
         slf
     }
+    fn of_idx<'py>(mut slf: PyRefMut<'py, Self>, idx: usize) -> PyRefMut<'py, Self> {
+        slf.base_idx = Some(idx);
+        slf
+    }
     fn transitive<'py>(mut slf: PyRefMut<'py, Self>, value: bool) -> PyRefMut<'py, Self> {
         slf.transitive = value;
         slf
     }
 
     fn collect(&self, py: Python<'_>) -> PyResult<Vec<Py<SymbolNode>>> {
+        let indices = self.indices(py)?;
         let ctx = self.ctx.borrow(py);
-        if let Some(fqn) = &self.base_fqn {
-            ctx.find_subclasses(py, fqn, self.transitive)
-        } else if let Some(node) = &self.base_node {
-            ctx.find_subclasses_of(py, &node.borrow(py))
-        } else {
-            Err(PyValueError::new_err(
-                "SubclassQuery requires .of_fqn(...) or .of_node(...)",
-            ))
-        }
+        let outputs = ctx.materialized("SubclassQuery.collect")?;
+        Ok(indices
+            .into_iter()
+            .map(|i| outputs.builder.nodes[i].clone_ref(py))
+            .collect())
     }
 
     /// Index-returning terminal. Same lookup as :meth:`collect`, but
@@ -1115,9 +1182,11 @@ impl SubclassQuery {
             ctx.find_subclasses_indices(py, fqn, self.transitive)
         } else if let Some(node) = &self.base_node {
             ctx.find_subclasses_of_indices(&node.borrow(py))
+        } else if let Some(idx) = self.base_idx {
+            ctx.find_subclasses_of_idx(py, idx)
         } else {
             Err(PyValueError::new_err(
-                "SubclassQuery requires .of_fqn(...) or .of_node(...)",
+                "SubclassQuery requires .of_fqn(...), .of_node(...), or .of_idx(...)",
             ))
         }
     }
@@ -1335,10 +1404,22 @@ impl FactoryQuery {
     /// node-returning terminal emits.
     fn row_indices(&self, py: Python<'_>) -> PyResult<Vec<Py<FactoryIdxRef>>> {
         let pairs = self.factory_rows(py)?;
-        pairs
-            .into_iter()
-            .map(|(decl_idx, kinds)| Py::new(py, FactoryIdxRef { decl_idx, kinds }))
-            .collect()
+        let ctx = self.ctx.borrow(py);
+        let outputs = ctx.materialized("FactoryQuery.row_indices")?;
+        let nodes: &[Py<SymbolNode>] = &outputs.builder.nodes;
+        let mut out: Vec<Py<FactoryIdxRef>> = Vec::with_capacity(pairs.len());
+        for (decl_idx, kinds) in pairs {
+            let path = nodes[decl_idx].borrow(py).path.clone();
+            out.push(Py::new(
+                py,
+                FactoryIdxRef {
+                    decl_idx,
+                    path,
+                    kinds,
+                },
+            )?);
+        }
+        Ok(out)
     }
 }
 

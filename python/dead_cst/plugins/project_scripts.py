@@ -47,21 +47,21 @@ class ProjectScriptsPlugin(Plugin):
         for script_name, target in scripts.items():
             module_part, _, decl_part = target.partition(":")
             fqname = f"{module_part}.{decl_part}" if decl_part else module_part
-            targets = ctx.find_declarations(fqname)
-            if not targets:
-                module_node = ctx.find_module(module_part)
-                if module_node is not None:
-                    targets = [module_node]
-            if not targets:
+            target_idxs = ctx.find_declarations_indices(fqname)
+            if not target_idxs:
+                module_idx = ctx.find_module_idx(module_part)
+                if module_idx is not None:
+                    target_idxs = [module_idx]
+            if not target_idxs:
                 logger.warning(
                     "ProjectScriptsPlugin: %s -> %r not found in symbol graph",
                     script_name,
                     target,
                 )
                 continue
-            yield native.AddNode(
+            yield native.AddNodeByIdx(
                 fqname=f"{PROJECT_SCRIPTS_PREFIX}{script_name}",
                 path=str(pyproject),
                 flags=int(NodeFlags.ENTRYPOINT),
-                edges_to=targets,
+                edges_to_idx=target_idxs,
             )

@@ -33,36 +33,47 @@ class MockPatchPlugin(Plugin):
     """Resolve string-fqname ``patch(...)`` calls to their target decl."""
 
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
-        refs: list[native.CallRef] = []
+        rows: list[native.CallIdxRef] = []
         for module in _MOCK_MODULES:
-            refs.extend(
-                native.query(ctx).calls().where_module(module).where_name("patch").string_arg_at(0)
+            rows.extend(
+                native.query(ctx)
+                .calls()
+                .where_module(module)
+                .where_name("patch")
+                .string_arg_at(0)
+                .row_indices()
             )
-        refs.extend(
-            native.query(ctx).calls().where_owner(_MOCKER_NAME).where_attr("patch").string_arg_at(0)
+        rows.extend(
+            native.query(ctx)
+            .calls()
+            .where_owner(_MOCKER_NAME)
+            .where_attr("patch")
+            .string_arg_at(0)
+            .row_indices()
         )
         for attr, required in _MONKEYPATCH_FQNAME_METHODS.items():
-            refs.extend(
+            rows.extend(
                 native.query(ctx)
                 .calls()
                 .where_owner(_MONKEYPATCH_NAME)
                 .where_attr(attr)
                 .string_arg_at(0)
                 .where_required_positional(required)
+                .row_indices()
             )
 
-        owners_by_fqname: dict[str, list[native.SymbolNode]] = {}
-        for ref in refs:
-            owners_by_fqname.setdefault(ref.string_arg, []).append(ref.owner)
+        owners_by_fqname: dict[str, list[tuple[int, str]]] = {}
+        for ref in rows:
+            owners_by_fqname.setdefault(ref.string_arg, []).append((ref.owner_idx, ref.path))
 
         for fqname, owners in owners_by_fqname.items():
-            targets = list(ctx.find_declarations(fqname))
-            mod = ctx.find_module(fqname)
-            if mod is not None:
-                targets.append(mod)
-            yield native.AddNode(
+            target_idxs = list(ctx.find_declarations_indices(fqname))
+            mod_idx = ctx.find_module_idx(fqname)
+            if mod_idx is not None:
+                target_idxs.append(mod_idx)
+            yield native.AddNodeByIdx(
                 fqname=f"{PATCH_TARGET_PREFIX}{fqname}",
-                path=owners[0].path,
-                edges_from=owners,
-                edges_to=targets,
+                path=owners[0][1],
+                edges_from_idx=[i for i, _p in owners],
+                edges_to_idx=target_idxs,
             )

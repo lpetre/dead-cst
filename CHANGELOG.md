@@ -10,6 +10,18 @@ two versions.
 ## [Unreleased]
 
 ### Added
+- `AddEntrypointByIdx` graph op — index-keyed sibling of
+  `AddEntrypoint`. Takes a positional index into `ctx.nodes()`; the
+  apply pass reads the decl's `fqname` / `path` on the rust side to
+  mint the marker, so plugins working in idx-space don't pay a
+  `Py<SymbolNode>` allocation to flag a seed.
+- `SubclassQuery.of_idx(idx)` and `ctx.find_subclasses_of_idx(idx)`
+  — idx-keyed siblings of `of_node` / `find_subclasses_of`.
+- `DecoratorQuery.in_decl_idx(idx)` — idx-form sibling of `in_decl`.
+- `ctx.find_module_idx`, `ctx.find_module_dunders_indices`,
+  `ctx.find_nodes_matching_specs_indices`,
+  `ctx.subclasses_of_fqn_indices`, `ctx.direct_predecessors_idx` —
+  the missing idx-form siblings the bundled plugins needed.
 - Index-form siblings on `ProjectContext`: `find_declarations_indices`,
   `module_for_indices`, `modules_for_paths`, `module_surface_indices`,
   `module_surfaces_indices`, `find_main_blocks_indices`. Each returns
@@ -40,6 +52,13 @@ two versions.
   synthetic behind.
 
 ### Changed
+- Every bundled plugin (`plugins/*` and `contrib/*`) ported to the
+  index-form APIs — no plugin in the tree allocates or reads a
+  `Py<SymbolNode>` anymore. Plugins fan out through `row_indices()` /
+  `.indices()` terminals, batch attr fetches via `ctx.node_attrs`,
+  and yield `AddEdgeByIdx` / `AddNodeByIdx` / `AddEntrypointByIdx`
+  exclusively. The legacy node-returning APIs still work for
+  out-of-tree plugins.
 - `AddNode`'s apply pass now pre-resolves every `edges_from` /
   `edges_to` key to its builder index *before* minting the
   synthetic node, matching the discipline `AddNodeByIdx`

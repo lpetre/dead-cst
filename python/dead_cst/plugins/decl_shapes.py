@@ -66,29 +66,38 @@ class DecoratedDeclPlugin(Plugin):
         def in_scope(path: str) -> bool:
             if not prefix:
                 return True
-            module = ctx.module_for(path)
-            if module is None:
+            module_idx = ctx.module_for_indices(path)
+            if module_idx is None:
                 return False
-            return module.fqname == prefix or module.fqname.startswith(prefix + ".")
+            (_kind, _path, fqname, _flags) = ctx.node_attrs([module_idx])[0]
+            return fqname == prefix or fqname.startswith(prefix + ".")
 
-        seeds_by_path: dict[str, list[native.SymbolNode]] = {}
-        for dec_ref in (
-            native.query(ctx).decorators().where_module(self.decorator_module).where_name(names)
+        seeds_by_path: dict[str, list[int]] = {}
+        for dec_row in (
+            native.query(ctx)
+            .decorators()
+            .where_module(self.decorator_module)
+            .where_name(names)
+            .row_indices()
         ):
-            if in_scope(dec_ref.path):
-                seeds_by_path.setdefault(dec_ref.path, []).append(dec_ref.decorated)
-        for cons_ref in (
-            native.query(ctx).constructions().where_module(self.decorator_module).where_name(names)
+            if in_scope(dec_row.path):
+                seeds_by_path.setdefault(dec_row.path, []).append(dec_row.decorated_idx)
+        for cons_row in (
+            native.query(ctx)
+            .constructions()
+            .where_module(self.decorator_module)
+            .where_name(names)
+            .row_indices()
         ):
-            if in_scope(cons_ref.path):
-                seeds_by_path.setdefault(cons_ref.path, []).append(cons_ref.var)
+            if in_scope(cons_row.path):
+                seeds_by_path.setdefault(cons_row.path, []).append(cons_row.var_idx)
 
-        for path, targets in seeds_by_path.items():
-            yield native.AddNode(
+        for path, target_idxs in seeds_by_path.items():
+            yield native.AddNodeByIdx(
                 fqname=f"<{self.marker_prefix}>:{Path(path).name}",
                 path=path,
                 flags=int(NodeFlags.ENTRYPOINT),
-                edges_to=targets,
+                edges_to_idx=target_idxs,
             )
 
 
@@ -156,9 +165,13 @@ class DispatchAppPlugin(Plugin):
             out.setdefault(module, set()).add(name)
         if not self.app_classes:
             return out
+        # One batched attr fetch per framework's subclass set.
         for fqn in self.app_classes:
-            for sub in ctx.subclasses_of_fqn(fqn):
-                sub_module, _, sub_name = sub.fqname.rpartition(".")
+            sub_idxs = ctx.subclasses_of_fqn_indices(fqn)
+            if not sub_idxs:
+                continue
+            for _kind, _path, sub_fqname, _flags in ctx.node_attrs(sub_idxs):
+                sub_module, _, sub_name = sub_fqname.rpartition(".")
                 if sub_module and sub_name:
                     out.setdefault(sub_module, set()).add(sub_name)
         return out
@@ -182,24 +195,32 @@ class DispatchAppPlugin(Plugin):
         if not module_to_names:
             return
 
-        # 1. Direct constructions, deduped by (path, start_line).
-        direct_seen: set[tuple[str, int]] = set()
-        direct: list = []
+        # 1. Direct constructions, deduped by var_idx (every construction
+        # site has a globally unique node index, so the same physical
+        # site that matches under two ``app_classes`` entries — e.g.
+        # one is a base of the other — collapses on idx).
+        direct_seen: set[int] = set()
+        direct: list[native.ConstructionIdxRef] = []
         for module, names in module_to_names.items():
             for ref in (
-                native.query(ctx).constructions().where_module(module).where_name(sorted(names))
+                native.query(ctx)
+                .constructions()
+                .where_module(module)
+                .where_name(sorted(names))
+                .row_indices()
             ):
-                key = (ref.var.path, ref.var.start_line)
-                if key in direct_seen:
+                if ref.var_idx in direct_seen:
                     continue
-                direct_seen.add(key)
+                direct_seen.add(ref.var_idx)
                 direct.append(ref)
 
         # 2. Factory functions returning one of the listed classes,
-        # deduped by (decl path, decl line, kind). Only relevant when
-        # we'd actually do something with the markers in step 6.
-        factory_seen: set[tuple[str, int, str]] = set()
-        factory_decls: list = []
+        # deduped by (decl_idx, kind). decl_idx is globally unique;
+        # kind is part of the key because one decl can match multiple
+        # kinds. Only relevant when we'd actually do something with the
+        # markers in step 6.
+        factory_seen: set[tuple[int, str]] = set()
+        factory_decls: list[tuple[native.FactoryIdxRef, str]] = []
         if self.seed_as_entrypoint:
             for module, names in module_to_names.items():
                 for fref in (
@@ -207,50 +228,62 @@ class DispatchAppPlugin(Plugin):
                     .factories()
                     .of_module(module)
                     .where_name(sorted(names))
-                    .collect()
+                    .row_indices()
                 ):
                     for kind in fref.kinds:
-                        key = (fref.decl.path, fref.decl.start_line, kind)
+                        key = (fref.decl_idx, kind)
                         if key in factory_seen:
                             continue
                         factory_seen.add(key)
                         factory_decls.append((fref, kind))
 
-        handlers = list(native.query(ctx).decorators().where_owner_attr(decorator_attrs))
+        handlers = list(
+            native.query(ctx).decorators().where_owner_attr(decorator_attrs).row_indices()
+        )
 
-        direct_by_owner: dict[tuple[str, str], list[native.SymbolNode]] = {}
-        for ref in direct:
-            simple = ref.var.fqname.rsplit(".", 1)[-1]
-            direct_by_owner.setdefault((ref.var.path, simple), []).append(ref.var)
+        # direct_by_owner: (path, simple_name) -> [var_idx, ...]
+        direct_by_owner: dict[tuple[str, str], list[int]] = {}
+        if direct:
+            direct_attrs = ctx.node_attrs([r.var_idx for r in direct])
+            for ref, (_kind, _path, fqname, _flags) in zip(direct, direct_attrs, strict=True):
+                simple = fqname.rsplit(".", 1)[-1]
+                direct_by_owner.setdefault((ref.path, simple), []).append(ref.var_idx)
 
-        vars_by_file: dict[tuple[str, str], native.SymbolNode] = {}
-        # Rust-side fold of the ``kind == variable`` filter — drops the
-        # FFI overhead of materialising every non-variable node.
-        for n in native.query(ctx).decls().with_kind("variable").collect():
-            simple = n.fqname.rsplit(".", 1)[-1]
-            vars_by_file.setdefault((n.path, simple), n)
+        # vars_by_file: (path, simple_name) -> var_idx. First idx wins.
+        vars_by_file: dict[tuple[str, str], int] = {}
+        var_idxs = native.query(ctx).decls().with_kind("variable").indices()
+        if var_idxs:
+            var_attrs = ctx.node_attrs(var_idxs)
+            for idx, (_kind, path, fqname, _flags) in zip(var_idxs, var_attrs, strict=True):
+                simple = fqname.rsplit(".", 1)[-1]
+                vars_by_file.setdefault((path, simple), idx)
 
         app_prefix = self._prefix("app")
         factory_prefix = self._prefix("factory")
 
         # 3. Entrypoint-promote every direct construction (when enabled).
-        if self.seed_as_entrypoint:
-            for ref in direct:
-                yield native.AddNode(
-                    fqname=f"{app_prefix}{ref.var.fqname}",
-                    path=ref.var.path,
+        if self.seed_as_entrypoint and direct:
+            # Reuse the direct_attrs computed above.
+            for ref, (_kind, _path, fqname, _flags) in zip(direct, direct_attrs, strict=True):
+                yield native.AddNodeByIdx(
+                    fqname=f"{app_prefix}{fqname}",
+                    path=ref.path,
                     flags=int(NodeFlags.ENTRYPOINT),
-                    edges_to=[ref.var],
+                    edges_to_idx=[ref.var_idx],
                 )
 
         # 4. Emit factory markers so the descendant walk in step 6 can
         # find them.
-        for fref, kind in factory_decls:
-            yield native.AddNode(
-                fqname=f"{factory_prefix}{kind}:{fref.decl.fqname}",
-                path=fref.decl.path,
-                edges_from=[fref.decl],
-            )
+        if factory_decls:
+            factory_attrs = ctx.node_attrs([fref.decl_idx for fref, _kind in factory_decls])
+            for (fref, kind), (_k, _p, decl_fqname, _f) in zip(
+                factory_decls, factory_attrs, strict=True
+            ):
+                yield native.AddNodeByIdx(
+                    fqname=f"{factory_prefix}{kind}:{decl_fqname}",
+                    path=fref.path,
+                    edges_from_idx=[fref.decl_idx],
+                )
 
         # 5. Wire decorator handlers to their owner var.
         # When seed_as_entrypoint=False (pure dispatch), only wire to
@@ -262,14 +295,14 @@ class DispatchAppPlugin(Plugin):
         # so ``app = create_app()`` factory chains also pick up
         # handler edges.
         for h in handlers:
-            key = (h.decorated.path, h.decorator_owner or "")
+            key = (h.path, h.decorator_owner or "")
             if self.seed_as_entrypoint:
-                var = vars_by_file.get(key)
-                if var is not None:
-                    yield native.AddEdge(var, h.decorated)
+                var_idx = vars_by_file.get(key)
+                if var_idx is not None:
+                    yield native.AddEdgeByIdx(var_idx, h.decorated_idx)
             else:
-                for var in direct_by_owner.get(key, []):
-                    yield native.AddEdge(var, h.decorated)
+                for var_idx in direct_by_owner.get(key, []):
+                    yield native.AddEdgeByIdx(var_idx, h.decorated_idx)
 
         # 6. Factory walk: vars whose *direct* successor is one of the
         # factory decls get entrypoint-promoted. Skipped under
@@ -285,24 +318,25 @@ class DispatchAppPlugin(Plugin):
         # Only ``app`` (whose direct successor *is* ``create_app``)
         # promotes.
         if self.seed_as_entrypoint and factory_decls:
-            factory_reachers: set[native.SymbolNode] = set()
+            factory_reachers: set[int] = set()
             for fref, _kind in factory_decls:
-                factory_reachers.update(ctx.direct_predecessors(fref.decl))
+                factory_reachers.update(ctx.direct_predecessors_idx(fref.decl_idx))
 
             classified: set[tuple[str, str]] = set()
             for h in handlers:
-                key = (h.decorated.path, h.decorator_owner or "")
+                key = (h.path, h.decorator_owner or "")
                 if key in direct_by_owner or key in classified:
                     continue
-                var = vars_by_file.get(key)
-                if var is None or var not in factory_reachers:
+                var_idx = vars_by_file.get(key)
+                if var_idx is None or var_idx not in factory_reachers:
                     continue
                 classified.add(key)
-                yield native.AddNode(
-                    fqname=f"{app_prefix}{var.fqname}",
-                    path=var.path,
+                (_kind, var_path, var_fqname, _flags) = ctx.node_attrs([var_idx])[0]
+                yield native.AddNodeByIdx(
+                    fqname=f"{app_prefix}{var_fqname}",
+                    path=var_path,
                     flags=int(NodeFlags.ENTRYPOINT),
-                    edges_to=[var],
+                    edges_to_idx=[var_idx],
                 )
 
 
@@ -343,15 +377,16 @@ class LiteralListPlugin(Plugin):
         # fqname — try both; some entries may match both (e.g.
         # ``pkg.foo`` where ``foo`` is also a re-exported decl in
         # ``pkg/__init__.py``).
-        surfaces = ctx.module_surfaces(entries)
+        surfaces = ctx.module_surfaces_indices(entries)
         for entry in entries:
-            targets: list[native.SymbolNode] = list(surfaces.get(entry, ()))
-            targets.extend(ctx.find_declarations(entry))
-            if not targets:
+            target_idxs: list[int] = list(surfaces.get(entry, ()))
+            target_idxs.extend(ctx.find_declarations_indices(entry))
+            if not target_idxs:
                 continue
-            yield native.AddNode(
+            (_kind, marker_path, _fq, _flags) = ctx.node_attrs([target_idxs[0]])[0]
+            yield native.AddNodeByIdx(
                 fqname=f"{prefix}{entry}",
-                path=targets[0].path,
+                path=marker_path,
                 flags=int(NodeFlags.ENTRYPOINT),
-                edges_to=targets,
+                edges_to_idx=target_idxs,
             )

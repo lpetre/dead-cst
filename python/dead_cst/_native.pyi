@@ -226,6 +226,23 @@ class AddEntrypoint:
 
     def __init__(self, decl: SymbolNode, *, marker: str) -> None: ...
 
+class AddEntrypointByIdx:
+    """Index-keyed variant of :class:`AddEntrypoint`. Takes a positional
+    index into :meth:`ProjectContext.nodes` instead of a ``SymbolNode``
+    reference; the apply pass reads the decl's ``fqname`` / ``path``
+    on the rust side to compose the marker, so plugins working in
+    idx-space don't pay the ``Py<SymbolNode>`` allocation just to flag
+    a seed.
+
+    Raises :class:`IndexError` at apply time when ``decl_idx`` is out
+    of range.
+    """
+
+    decl_idx: int
+    marker: str
+
+    def __init__(self, decl_idx: int, *, marker: str) -> None: ...
+
 class AddNode:
     """Mint a synthetic intermediate node, optionally wiring it with
     edges in the same op.
@@ -291,7 +308,7 @@ class AddNodeByIdx:
         edges_to_idx: Iterable[int] = ...,
     ) -> None: ...
 
-GraphOp = AddEdge | AddEdgeByIdx | AddEntrypoint | AddNode | AddNodeByIdx
+GraphOp = AddEdge | AddEdgeByIdx | AddEntrypoint | AddEntrypointByIdx | AddNode | AddNodeByIdx
 
 class CollectedOps:
     """Opaque handle to one plugin's collected graph ops.
@@ -559,6 +576,15 @@ class ProjectContext:
         """
         ...
 
+    def find_subclasses_of_idx(self, class_idx: int) -> list[int]:
+        """Idx-keyed variant of :meth:`find_subclasses_of`. Same lookup,
+        takes a positional index into :meth:`nodes` rather than a
+        ``SymbolNode`` reference; returns indices into :meth:`nodes`
+        instead of allocating ``SymbolNode`` clones. Raises
+        :class:`IndexError` when ``class_idx`` is out of range.
+        """
+        ...
+
     def subclasses_of_fqn(self, fqn: str, *, transitive: bool = True) -> list[SymbolNode]:
         """Project classes that inherit from the class identified by
         ``fqn``. ``fqn`` may name a project or external class.
@@ -585,6 +611,13 @@ class ProjectContext:
         Generic parameterizations (``class C(Foo[T])``) and other
         non-identifier base expressions are skipped — matches the
         libcst pipeline's behavior.
+        """
+        ...
+
+    def subclasses_of_fqn_indices(self, fqn: str, *, transitive: bool = True) -> list[int]:
+        """Idx-only variant of :meth:`subclasses_of_fqn`. Same lookup,
+        returns positional indices into :meth:`nodes` rather than
+        allocating ``SymbolNode`` clones.
         """
         ...
 
@@ -641,6 +674,13 @@ class ProjectContext:
     def find_module(self, fqname: str) -> SymbolNode | None:
         """Return the module node for the given dotted fqname, if one
         exists in the project graph."""
+        ...
+
+    def find_module_idx(self, fqname: str) -> int | None:
+        """Idx-only variant of :meth:`find_module`. Same O(1) lookup,
+        returns the positional index into :meth:`nodes` (``None`` if
+        ``fqname`` doesn't name a project module).
+        """
         ...
 
     def module_for(self, path: str) -> SymbolNode | None:
@@ -810,6 +850,19 @@ class ProjectContext:
         """
         ...
 
+    def find_nodes_matching_specs_indices(
+        self,
+        project_root: str,
+        regexes: list[str],
+        str_specs: list[str],
+        abs_paths: list[str],
+    ) -> list[int]:
+        """Idx-only variant of :meth:`find_nodes_matching_specs`. Same
+        scan, returns positional indices into :meth:`nodes` rather than
+        allocating ``SymbolNode`` clones.
+        """
+        ...
+
     # ----- Traversal -----------------------------------------------------
 
     def descendants(self, root: SymbolNode, *, skip_flags: int = 0) -> list[SymbolNode]:
@@ -841,6 +894,14 @@ class ProjectContext:
         :class:`EdgeFlags` between the same two nodes only produces one
         entry. ``skip_flags`` filters edges by intersecting flag mask —
         same semantics as :meth:`ancestors`.
+        """
+        ...
+
+    def direct_predecessors_idx(self, idx: int, *, skip_flags: int = 0) -> list[int]:
+        """Idx-keyed variant of :meth:`direct_predecessors`. Takes a
+        positional index into :meth:`nodes` and returns predecessor
+        indices rather than allocating ``SymbolNode`` clones. Raises
+        :class:`IndexError` when ``idx`` is out of range.
         """
         ...
 
@@ -916,6 +977,13 @@ class ProjectContext:
         Pure scan over already-interned nodes — no ty re-query needed
         — because the visitor's decl pass already minted one node per
         global-scope variable binding.
+        """
+        ...
+
+    def find_module_dunders_indices(self) -> list[int]:
+        """Idx-only variant of :meth:`find_module_dunders`. Same scan,
+        returns positional indices into :meth:`nodes` rather than
+        allocating ``SymbolNode`` clones.
         """
         ...
 
@@ -1144,14 +1212,16 @@ class CallRef:
 class DecoratorIdxRef:
     """Index-form sibling of :class:`DecoratorRef`. Same metadata
     fields, minus ``args`` / ``kwargs``; ``decorated_idx`` indexes into
-    :meth:`ProjectContext.nodes`.
+    :meth:`ProjectContext.nodes`. ``path`` is preserved because plugins
+    routinely bucket by path before any further query.
 
     Returned by :meth:`DecoratorQuery.row_indices`. Pair with
-    :meth:`ProjectContext.node_attrs` to batch-fetch any node fields
-    the plugin still needs without per-row ``borrow`` ping-pong.
+    :meth:`ProjectContext.node_attrs` to batch-fetch any other node
+    fields the plugin needs without per-row ``borrow`` ping-pong.
     """
 
     decorated_idx: int
+    path: str
     decorator_name: str | None
     decorator_owner: str | None
     decorator_via: str | None
@@ -1159,36 +1229,42 @@ class DecoratorIdxRef:
 class ConstructionIdxRef:
     """Index-form sibling of :class:`ConstructionRef`. Same metadata
     fields, minus ``args`` / ``kwargs``; ``var_idx`` indexes into
-    :meth:`ProjectContext.nodes`.
+    :meth:`ProjectContext.nodes`. ``path`` is preserved as a cheap
+    bucket key for plugins that fan out per file.
 
     Returned by :meth:`ConstructionQuery.row_indices`.
     """
 
     var_idx: int
+    path: str
     class_name: str
 
 class CallIdxRef:
     """Index-form sibling of :class:`CallRef`. Same metadata fields,
     minus ``args`` / ``kwargs``; ``owner_idx`` indexes into
-    :meth:`ProjectContext.nodes`. ``string_arg`` (the literal at the
-    configured positional index) is preserved because most call-shape
-    plugins key on it.
+    :meth:`ProjectContext.nodes`. ``path`` is the owning decl's path;
+    ``string_arg`` (the literal at the configured positional index) is
+    preserved because most call-shape plugins key on it.
 
     Returned by :meth:`CallQuery.row_indices`.
     """
 
     owner_idx: int
+    path: str
     string_arg: str
 
 class FactoryIdxRef:
     """Index-form sibling of :class:`FactoryRef`. ``decl_idx`` indexes
     into :meth:`ProjectContext.nodes`; ``kinds`` is the same sorted set
     of matched constructor bare-names the node-returning terminal emits.
+    ``path`` is preserved as a cheap bucket key for plugins that fan
+    out per file.
 
     Returned by :meth:`FactoryQuery.row_indices`.
     """
 
     decl_idx: int
+    path: str
     kinds: list[str]
 
 def query(ctx: ProjectContext) -> QueryBuilder:
@@ -1248,6 +1324,12 @@ class DecoratorQuery:
         self, via: str, attrs: str | list[str] | tuple[str, ...]
     ) -> DecoratorQuery: ...
     def in_decl(self, node: SymbolNode) -> DecoratorQuery: ...
+    def in_decl_idx(self, idx: int) -> DecoratorQuery:
+        """Idx-form sibling of :meth:`in_decl`. Pass a positional index
+        into :meth:`ProjectContext.nodes` directly so plugins working
+        in idx-space don't round-trip through a ``SymbolNode``.
+        """
+        ...
     def where_path(self, regex: str) -> DecoratorQuery: ...
     def where_kwarg(self, name: str, value: Any) -> DecoratorQuery:
         """Filter to decorator calls whose ``name=value`` kwarg matches.
@@ -1355,6 +1437,13 @@ class SubclassQuery:
 
     def of_fqn(self, fqn: str) -> SubclassQuery: ...
     def of_node(self, node: SymbolNode) -> SubclassQuery: ...
+    def of_idx(self, idx: int) -> SubclassQuery:
+        """Idx-form sibling of :meth:`of_node`. Pass a positional
+        index into :meth:`ProjectContext.nodes` directly so plugins
+        working in idx-space don't round-trip through a ``SymbolNode``.
+        """
+        ...
+
     def transitive(self, value: bool) -> SubclassQuery: ...
     def collect(self) -> list[SymbolNode]: ...
     def count(self) -> int: ...

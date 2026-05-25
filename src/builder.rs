@@ -227,6 +227,30 @@ impl AddEntrypoint {
     }
 }
 
+/// Index-keyed variant of :class:`AddEntrypoint`. Takes a positional
+/// index into ``ctx.nodes()`` instead of a ``SymbolNode`` reference;
+/// the apply pass derefs the decl on the rust side to read its
+/// ``fqname`` / ``path`` for the marker, so plugins working in
+/// idx-space don't pay the ``Py<SymbolNode>`` allocation just to flag
+/// a seed.
+///
+/// Raises :class:`IndexError` at apply time when ``decl_idx`` is out
+/// of range.
+#[pyclass(frozen, get_all)]
+pub(crate) struct AddEntrypointByIdx {
+    pub(crate) decl_idx: usize,
+    pub(crate) marker: String,
+}
+
+#[pymethods]
+impl AddEntrypointByIdx {
+    #[new]
+    #[pyo3(signature = (decl_idx, *, marker))]
+    fn new(decl_idx: usize, marker: String) -> Self {
+        Self { decl_idx, marker }
+    }
+}
+
 /// Mint a synthetic intermediate node.
 ///
 /// ``edges_from`` / ``edges_to`` wire the new node atomically — every
@@ -439,6 +463,10 @@ pub(crate) enum PreparedOp {
         decl_path: String,
         marker: String,
     },
+    EntrypointByIdx {
+        decl_idx: usize,
+        marker: String,
+    },
     Node {
         fqname: String,
         kind: &'static str,
@@ -524,6 +552,11 @@ pub(crate) fn prepare_graph_op(py: Python<'_>, op: &Bound<'_, PyAny>) -> PyResul
             decl_path: decl_ref.path.clone(),
             marker: add_ep.marker.clone(),
         }
+    } else if let Ok(add_ep_idx) = op.extract::<PyRef<AddEntrypointByIdx>>() {
+        PreparedOp::EntrypointByIdx {
+            decl_idx: add_ep_idx.decl_idx,
+            marker: add_ep_idx.marker.clone(),
+        }
     } else if let Ok(add_node) = op.extract::<PyRef<AddNode>>() {
         let edges_from: Vec<NodeKey> = add_node
             .edges_from
@@ -554,8 +587,8 @@ pub(crate) fn prepare_graph_op(py: Python<'_>, op: &Bound<'_, PyAny>) -> PyResul
         }
     } else {
         return Err(PyValueError::new_err(format!(
-            "expected a GraphOp (AddEdge / AddEdgeByIdx / AddEntrypoint / AddNode / AddNodeByIdx), \
-             got {:?}",
+            "expected a GraphOp (AddEdge / AddEdgeByIdx / AddEntrypoint / \
+             AddEntrypointByIdx / AddNode / AddNodeByIdx), got {:?}",
             op.get_type().name()?,
         )));
     };
@@ -635,6 +668,24 @@ fn apply_prepared(
             marker,
         } => {
             let decl_idx = lookup_idx_by_key(&outputs.builder, &decl, "decl")?;
+            let marker_fqname = format!("{marker}:{decl_fqname}");
+            let marker_idx = outputs.builder.intern_node(
+                py,
+                synthetic_node(marker_fqname, "synthetic", decl_path, NODE_FLAG_ENTRYPOINT),
+            )?;
+            outputs.builder.add_edge(marker_idx, decl_idx, 0);
+            Ok(())
+        }
+        PreparedOp::EntrypointByIdx { decl_idx, marker } => {
+            let len = outputs.builder.nodes.len();
+            check_idx_in_range(len, decl_idx, "AddEntrypointByIdx", "decl_idx")?;
+            // Read fqname / path off the existing node — same shape
+            // the ``AddEntrypoint`` arm gets from the prepare step,
+            // but without a ``Py<SymbolNode>`` round-trip.
+            let (decl_fqname, decl_path) = {
+                let node = outputs.builder.nodes[decl_idx].borrow(py);
+                (node.fqname.clone(), node.path.clone())
+            };
             let marker_fqname = format!("{marker}:{decl_fqname}");
             let marker_idx = outputs.builder.intern_node(
                 py,

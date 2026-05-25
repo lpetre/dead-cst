@@ -1600,15 +1600,27 @@ impl ProjectContext {
     /// machinery and must be kept alive even when no source reference
     /// points at them.
     pub(crate) fn find_module_dunders(&self, py: Python<'_>) -> PyResult<Vec<Py<SymbolNode>>> {
+        let indices = self.find_module_dunders_indices(py)?;
         let outputs = self.materialized("find_module_dunders")?;
+        Ok(indices
+            .into_iter()
+            .map(|i| outputs.builder.nodes[i].clone_ref(py))
+            .collect())
+    }
+
+    /// Idx-only variant of :meth:`find_module_dunders`. Same scan,
+    /// returns positional indices into ``ctx.nodes()`` rather than
+    /// allocating ``Py<SymbolNode>`` clones.
+    pub(crate) fn find_module_dunders_indices(&self, py: Python<'_>) -> PyResult<Vec<usize>> {
+        let outputs = self.materialized("find_module_dunders_indices")?;
         let mut out = Vec::new();
-        for node_py in &outputs.builder.nodes {
+        for (idx, node_py) in outputs.builder.nodes.iter().enumerate() {
             let node = node_py.borrow(py);
             if !matches!(node.kind, "variable" | "function") {
                 continue;
             }
             if is_dunder_name(&node.fqname) {
-                out.push(node_py.clone_ref(py));
+                out.push(idx);
             }
         }
         Ok(out)
@@ -1638,6 +1650,31 @@ impl ProjectContext {
         str_specs: Vec<String>,
         abs_paths: Vec<String>,
     ) -> PyResult<Vec<Py<SymbolNode>>> {
+        let indices = self.find_nodes_matching_specs_indices(
+            py,
+            project_root,
+            regexes,
+            str_specs,
+            abs_paths,
+        )?;
+        let outputs = self.materialized("find_nodes_matching_specs")?;
+        Ok(indices
+            .into_iter()
+            .map(|i| outputs.builder.nodes[i].clone_ref(py))
+            .collect())
+    }
+
+    /// Idx-only variant of :meth:`find_nodes_matching_specs`. Same scan,
+    /// returns positional indices into ``ctx.nodes()`` rather than
+    /// allocating ``Py<SymbolNode>`` clones.
+    pub(crate) fn find_nodes_matching_specs_indices(
+        &self,
+        py: Python<'_>,
+        project_root: &str,
+        regexes: Vec<String>,
+        str_specs: Vec<String>,
+        abs_paths: Vec<String>,
+    ) -> PyResult<Vec<usize>> {
         let compiled: Vec<regex::Regex> = regexes
             .iter()
             .map(|p| {
@@ -1655,27 +1692,25 @@ impl ProjectContext {
         let str_set: FxHashSet<&str> = str_specs.iter().map(String::as_str).collect();
         let abs_set: FxHashSet<&str> = abs_paths.iter().map(String::as_str).collect();
 
-        let outputs = self.materialized("find_nodes_matching_specs")?;
-        let mut out = Vec::new();
-        for node_py in &outputs.builder.nodes {
+        let outputs = self.materialized("find_nodes_matching_specs_indices")?;
+        let mut out: Vec<usize> = Vec::new();
+        for (idx, node_py) in outputs.builder.nodes.iter().enumerate() {
             let node = node_py.borrow(py);
             let path = node.path.as_str();
             if abs_set.contains(path) {
-                out.push(node_py.clone_ref(py));
+                out.push(idx);
                 continue;
             }
-            // Mirror Python's ``path.relative_to(root)`` ⇒ ``str(...)``
-            // with the ``except ValueError: rel = node.path`` fallback.
             let rel = path
                 .strip_prefix(project_root)
                 .map(|s| s.trim_start_matches(['/', '\\']))
                 .unwrap_or(path);
             if str_set.contains(rel) || str_set.contains(node.fqname.as_str()) {
-                out.push(node_py.clone_ref(py));
+                out.push(idx);
                 continue;
             }
             if compiled.iter().any(|r| r.is_match(rel)) {
-                out.push(node_py.clone_ref(py));
+                out.push(idx);
             }
         }
         Ok(out)
@@ -1793,6 +1828,14 @@ impl ProjectContext {
             .module_by_fqname
             .get(fqname)
             .map(|&idx| outputs.builder.nodes[idx].clone_ref(py)))
+    }
+
+    /// Idx-only variant of :meth:`find_module`. Same O(1) lookup,
+    /// returns the positional index into ``ctx.nodes()`` (``None`` if
+    /// ``fqname`` doesn't name a project module).
+    pub(crate) fn find_module_idx(&self, fqname: &str) -> PyResult<Option<usize>> {
+        let outputs = self.materialized("find_module_idx")?;
+        Ok(outputs.module_by_fqname.get(fqname).copied())
     }
 }
 
@@ -2218,17 +2261,30 @@ impl ProjectContext {
     ) -> PyResult<Vec<Py<SymbolNode>>> {
         let outputs = self.materialized("direct_predecessors")?;
         let idx = lookup_idx(&outputs.builder, node, "node")?;
-        let mut seen: FxHashSet<usize> = FxHashSet::default();
-        let mut out: Vec<Py<SymbolNode>> = Vec::new();
-        for &(src, flags) in &outputs.builder.reverse_adj[idx] {
-            if flags & skip_flags != 0 {
-                continue;
-            }
-            if seen.insert(src) {
-                out.push(outputs.builder.nodes[src].clone_ref(py));
-            }
+        let indices = direct_predecessors_idxs_in(&outputs, idx, skip_flags);
+        Ok(indices
+            .into_iter()
+            .map(|i| outputs.builder.nodes[i].clone_ref(py))
+            .collect())
+    }
+
+    /// Idx-keyed variant of :meth:`direct_predecessors`. Takes a
+    /// positional index into ``ctx.nodes()``; returns predecessor
+    /// indices rather than allocating ``Py<SymbolNode>`` clones.
+    #[pyo3(signature = (idx, *, skip_flags = 0))]
+    pub(crate) fn direct_predecessors_idx(
+        &self,
+        idx: usize,
+        skip_flags: u32,
+    ) -> PyResult<Vec<usize>> {
+        let outputs = self.materialized("direct_predecessors_idx")?;
+        let len = outputs.builder.nodes.len();
+        if idx >= len {
+            return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                "direct_predecessors_idx: idx {idx} out of range (len={len})"
+            )));
         }
-        Ok(out)
+        Ok(direct_predecessors_idxs_in(&outputs, idx, skip_flags))
     }
 
     /// Forward closure from every node carrying any bit in
@@ -3088,6 +3144,65 @@ impl ProjectContext {
     }
 }
 
+#[pymethods]
+impl ProjectContext {
+    /// Idx-keyed variant of :meth:`find_subclasses_of_indices` —
+    /// resolves the seed class by positional index into ``ctx.nodes()``
+    /// rather than taking a ``Py<SymbolNode>`` reference. Bounds-checks
+    /// the index and raises :class:`IndexError` when out of range.
+    pub(crate) fn find_subclasses_of_idx(
+        &self,
+        py: Python<'_>,
+        class_idx: usize,
+    ) -> PyResult<Vec<usize>> {
+        let outputs = self.materialized("find_subclasses_of_idx")?;
+        let len = outputs.builder.nodes.len();
+        if class_idx >= len {
+            return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                "find_subclasses_of_idx: class_idx {class_idx} out of range (len={len})"
+            )));
+        }
+        // Snapshot the node fields the inner helper reads — same shape
+        // it gets when called from the node-form ``find_subclasses_of``.
+        let class_node = outputs.builder.nodes[class_idx].borrow(py);
+        if class_node.kind != "class" {
+            return Ok(Vec::new());
+        }
+        if let Some((seed_file, seed_range)) = locate_class_def(
+            &self.db,
+            &outputs.path_to_file,
+            &class_node.path,
+            &class_node,
+        ) {
+            let rk = (seed_range.start().to_u32(), seed_range.end().to_u32());
+            if let Some(&seed_idx) = outputs.class_by_selection.get(&(seed_file, rk)) {
+                return Ok(transitive_subclasses_via_index(
+                    seed_idx,
+                    &outputs.children_by_node,
+                ));
+            }
+        }
+        Ok(Vec::new())
+    }
+}
+
+/// Shared one-hop reverse-adjacency walk used by
+/// :meth:`ProjectContext::direct_predecessors` and
+/// :meth:`direct_predecessors_idx`.
+fn direct_predecessors_idxs_in(outputs: &BuildOutputs, idx: usize, skip_flags: u32) -> Vec<usize> {
+    let mut seen: FxHashSet<usize> = FxHashSet::default();
+    let mut out: Vec<usize> = Vec::new();
+    for &(src, flags) in &outputs.builder.reverse_adj[idx] {
+        if flags & skip_flags != 0 {
+            continue;
+        }
+        if seen.insert(src) {
+            out.push(src);
+        }
+    }
+    out
+}
+
 /// Shared BFS used by :meth:`ProjectContext::module_surface` and
 /// :meth:`module_surface_indices` — the module index, then every
 /// transitive child node (modules recursed into; non-module decls
@@ -3484,7 +3599,24 @@ impl ProjectContext {
         fqn: &str,
         transitive: bool,
     ) -> PyResult<Vec<Py<SymbolNode>>> {
+        let indices = self.subclasses_of_fqn_indices(fqn, transitive)?;
         let outputs = self.materialized("subclasses_of_fqn")?;
+        Ok(indices
+            .into_iter()
+            .map(|i| outputs.builder.nodes[i].clone_ref(py))
+            .collect())
+    }
+
+    /// Idx-only variant of :meth:`subclasses_of_fqn`. Same lookup,
+    /// returns positional indices into ``ctx.nodes()`` rather than
+    /// allocating ``Py<SymbolNode>`` clones.
+    #[pyo3(signature = (fqn, *, transitive = true))]
+    pub(crate) fn subclasses_of_fqn_indices(
+        &self,
+        fqn: &str,
+        transitive: bool,
+    ) -> PyResult<Vec<usize>> {
+        let outputs = self.materialized("subclasses_of_fqn_indices")?;
         let Some(direct) = outputs.children_by_fqn.get(fqn) else {
             return Ok(Vec::new());
         };
@@ -3496,10 +3628,7 @@ impl ProjectContext {
                 }
             }
         }
-        Ok(visited
-            .into_iter()
-            .map(|idx| outputs.builder.nodes[idx].clone_ref(py))
-            .collect())
+        Ok(visited.into_iter().collect())
     }
 
     /// Project classes that inherit (directly or transitively) from
