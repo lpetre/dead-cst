@@ -2,8 +2,11 @@
 //! `build_project_graph` pipeline entrypoint. This module owns the
 //! Salsa-backed analysis context that the rest of the crate operates on.
 
-use std::cell::{Ref, RefCell};
 use std::str::FromStr;
+use std::sync::Arc;
+
+use parking_lot::lock_api::RawRwLockRecursive;
+use parking_lot::{MappedRwLockReadGuard, Mutex, RwLock, RwLockReadGuard};
 
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use pyo3::exceptions::{PyOSError, PyRuntimeError, PyValueError};
@@ -995,7 +998,7 @@ pub(crate) fn build_fqname_indices(
 /// through `type_hierarchy_subtypes`, method-defines walks each class's
 /// `DefinitionKind::Class`, module dunders scan global-scope variable
 /// nodes, and comment patterns walk the parser's `Tokens` stream.
-#[pyclass(unsendable)]
+#[pyclass]
 pub(crate) struct ProjectContext {
     pub(crate) db: ProjectDatabase,
     /// Absolute path of the project root, echoed back to Python via the
@@ -1007,12 +1010,29 @@ pub(crate) struct ProjectContext {
     /// materialize call — `apply_graph_op` / queries assume it's
     /// `Some` and error if a plugin (incorrectly) caches the ctx and
     /// uses it after materialize returns.
-    pub(crate) outputs: RefCell<Option<BuildOutputs>>,
+    ///
+    /// Wrapped in [`parking_lot::RwLock`] so plugins can run
+    /// concurrently from a Python `ThreadPoolExecutor` — queries take a
+    /// read guard, the apply pass takes a write guard. ``parking_lot``
+    /// over ``std::sync`` because the former exposes
+    /// ``RwLockReadGuard::map`` for the ``Option`` projection that
+    /// :meth:`materialized` performs.
+    ///
+    /// Held inside an [`Arc`] so the apply path
+    /// (:func:`builder::apply_graph_op`) can clone the handle
+    /// **before** dropping the GIL and then acquire the write lock
+    /// without holding the GIL. Acquiring the write lock while
+    /// still holding the GIL would deadlock against a reader stuck
+    /// on ``take_gil`` (the reader can't drop its read guard until
+    /// it re-attaches).
+    pub(crate) outputs: Arc<RwLock<Option<BuildOutputs>>>,
     /// Compiled regexes keyed by the source pattern. Plugins call
     /// :meth:`decls_matching_name` / :meth:`find_comment_patterns`
     /// repeatedly across files with the same pattern, so caching keeps
-    /// us off the regex compiler in the hot path.
-    pub(crate) regex_cache: RefCell<FxHashMap<String, regex::Regex>>,
+    /// us off the regex compiler in the hot path. Mutex (rather than
+    /// RwLock) because the cache write path is cheap and the hot path
+    /// is a single hashmap lookup either way.
+    pub(crate) regex_cache: Mutex<FxHashMap<String, regex::Regex>>,
     /// When true, ``materialize`` and ``build_project_graph`` draw
     /// indicatif progress bars to stderr.
     pub(crate) show_progress: bool,
@@ -1055,8 +1075,8 @@ impl ProjectContext {
             db,
             root: root.to_string(),
             plugins: Vec::new(),
-            outputs: RefCell::new(None),
-            regex_cache: RefCell::new(FxHashMap::default()),
+            outputs: Arc::new(RwLock::new(None)),
+            regex_cache: Mutex::new(FxHashMap::default()),
             show_progress,
             stack_size: None,
         })
@@ -1114,17 +1134,31 @@ impl ProjectContext {
     /// Build the project-wide graph, run each plugin's `run(ctx)`,
     /// then snapshot the final state.
     ///
-    /// Borrows are released between phases so plugin `run` methods can
-    /// re-enter queries through the same ctx without aliasing violations.
+    /// Plugin execution may run serially in this method (legacy path,
+    /// also forced by `DEAD_CST_PLUGINS_SERIAL=1` in Python) or be
+    /// driven concurrently from Python via a
+    /// :class:`concurrent.futures.ThreadPoolExecutor` calling
+    /// :meth:`build_only` + :meth:`run_plugin` per worker.
+    ///
+    /// Ops are applied as they're yielded from each plugin so that
+    /// later steps inside the *same* plugin can call
+    /// ``ctx.descendants`` etc. and see the effect of earlier
+    /// yields. Across concurrent plugin invocations the
+    /// :class:`parking_lot::RwLock` on ``outputs`` serializes the
+    /// per-op write while letting the GIL-releasing queries run in
+    /// parallel.
     pub(crate) fn materialize(slf: Py<Self>, py: Python<'_>) -> PyResult<NativeGraph> {
         let show_progress = slf.borrow(py).show_progress;
         let stack_size = slf.borrow(py).stack_size;
         {
             let mut this = slf.borrow_mut(py);
             let outputs = build_project_graph(py, &mut this.db, show_progress, stack_size)?;
-            *this.outputs.borrow_mut() = Some(outputs);
+            *this.outputs.write() = Some(outputs);
         }
 
+        // Serial plugin pass (legacy / fallback path). Concurrent
+        // execution is driven from Python — see
+        // ``Analysis.materialize_all``.
         let plugins: Vec<PyObject> = slf
             .borrow(py)
             .plugins
@@ -1133,16 +1167,6 @@ impl ProjectContext {
             .collect();
         let plugin_bar = ProgressBars::plugin_bar(show_progress, plugins.len() as u64);
         for plugin in &plugins {
-            // ``plugin.run(ctx)`` yields ``GraphOp`` values; we apply
-            // each as it comes off the iterator. The plugin can run
-            // queries against ``ctx`` mid-iteration since each
-            // ``apply_graph_op`` call releases its borrows before
-            // returning control to the generator. ``None`` (a regular
-            // function that ran to completion without yielding) is
-            // allowed for plugins with nothing to do.
-            // Progress-bar label: use the plugin's class qualname.
-            // Falls back to ``<unnamed>`` if anything goes wrong (e.g.
-            // a plain function passed in by mistake).
             let plugin_name: String = plugin
                 .bind(py)
                 .get_type()
@@ -1151,23 +1175,15 @@ impl ProjectContext {
                 .and_then(|n| n.extract().ok())
                 .unwrap_or_else(|| "<unnamed>".to_string());
             plugin_bar.set_message(plugin_name);
-            let result = plugin.bind(py).call_method1("run", (slf.clone_ref(py),))?;
-            if !result.is_none() {
-                for item in result.iter()? {
-                    let op = item?;
-                    apply_graph_op(&slf, py, &op)?;
-                }
-            }
+            run_and_apply_plugin(py, &slf, plugin)?;
             plugin_bar.inc(1);
         }
         plugin_bar.finish_and_clear();
 
-        // Keep ``outputs`` alive past materialize so post-materialize
-        // queries (``descendants`` / ``ancestors`` / ``reachable``) still
-        // see the graph. Snapshot a fresh ``NativeGraph`` from the
-        // builder's interned node + edge vecs; the originals stay put.
+        // Snapshot a fresh ``NativeGraph`` from the builder's
+        // interned node + edge vecs; the originals stay put.
         let this = slf.borrow(py);
-        let outputs_ref = this.outputs.borrow();
+        let outputs_ref = this.outputs.read();
         let outputs = outputs_ref
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("ProjectContext lost its outputs"))?;
@@ -1181,6 +1197,112 @@ impl ProjectContext {
             edges: outputs.builder.edges.clone(),
         })
     }
+
+    /// Run a single plugin's ``run(ctx)`` callback, applying each
+    /// yielded op to the graph as it comes off the iterator. Called
+    /// from Python — by the serial fallback in :meth:`materialize`,
+    /// and (one call per plugin) by the
+    /// :class:`concurrent.futures.ThreadPoolExecutor` worker path.
+    ///
+    /// Concurrency note: every yielded op takes the ``outputs``
+    /// write guard briefly; intra-plugin ``ctx.descendants`` /
+    /// ``ctx.find_module`` etc. take read guards. With multiple
+    /// workers each holding read guards via the GIL-released query
+    /// paths, the writes serialize with bounded contention — the
+    /// per-op write window is sub-millisecond and the readers do
+    /// not starve writers under [`parking_lot`]'s fair policy.
+    pub(crate) fn run_plugin(slf: Py<Self>, py: Python<'_>, plugin: PyObject) -> PyResult<()> {
+        run_and_apply_plugin(py, &slf, &plugin)
+    }
+
+    /// Snapshot the current graph as a [`NativeGraph`]. Used after
+    /// concurrent plugin execution to return the final graph without
+    /// going through [`Self::materialize`] (which would re-run the
+    /// build).
+    pub(crate) fn snapshot_graph(&self, py: Python<'_>) -> PyResult<NativeGraph> {
+        let outputs_ref = self.outputs.read();
+        let outputs = outputs_ref
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("ProjectContext lost its outputs"))?;
+        Ok(NativeGraph {
+            nodes: outputs
+                .builder
+                .nodes
+                .iter()
+                .map(|n| n.clone_ref(py))
+                .collect(),
+            edges: outputs.builder.edges.clone(),
+        })
+    }
+
+    /// Run the materialize **build pass only** — populate
+    /// ``outputs`` from a project-wide scan, without running any
+    /// plugins. Python then drives plugins via a ``ThreadPoolExecutor``
+    /// (one :meth:`run_plugin` call per worker) and finishes with
+    /// :meth:`snapshot_graph` to return the final graph to Python.
+    pub(crate) fn build_only(slf: Py<Self>, py: Python<'_>) -> PyResult<()> {
+        let show_progress = slf.borrow(py).show_progress;
+        let stack_size = slf.borrow(py).stack_size;
+        let mut this = slf.borrow_mut(py);
+        let outputs = build_project_graph(py, &mut this.db, show_progress, stack_size)?;
+        *this.outputs.write() = Some(outputs);
+        Ok(())
+    }
+}
+
+/// Invoke ``plugin.run(ctx)`` and apply each yielded op to the graph
+/// in turn. Mirrors the per-yield apply behavior the codebase has
+/// relied on since plugins existed — ops from earlier steps in a
+/// plugin's body are visible to later ``ctx.descendants`` /
+/// ``ctx.find_*`` queries within the same plugin call.
+fn run_and_apply_plugin(
+    py: Python<'_>,
+    ctx: &Py<ProjectContext>,
+    plugin: &PyObject,
+) -> PyResult<()> {
+    let result = plugin.bind(py).call_method1("run", (ctx.clone_ref(py),))?;
+    if result.is_none() {
+        return Ok(());
+    }
+    for item in result.iter()? {
+        let op = item?;
+        apply_graph_op(ctx, py, &op)?;
+    }
+    Ok(())
+}
+
+/// Acquire a read guard on ``lock`` while releasing the GIL during
+/// the (potentially-parking) wait. Used by hot-path readers that
+/// would otherwise dead-lock with a concurrent
+/// :func:`builder::apply_graph_op` writer: the writer drops the GIL
+/// before contending for the write lock, but to call ``Py::new`` /
+/// ``intern_node`` it has to re-attach the GIL once it owns the
+/// guard. A reader that parks on ``read()`` *while holding the GIL*
+/// keeps the writer locked out of the GIL re-attach and the system
+/// hangs.
+///
+/// We use the recursive read path
+/// (:meth:`parking_lot::RwLock::read_recursive_unchecked`) so a
+/// queued writer doesn't starve us indefinitely (parking_lot's
+/// default ``read`` is writer-priority, which leads to a different
+/// deadlock pattern when the writer is itself parked on the GIL
+/// before it can release the queued-writer flag). The "recursive"
+/// name is slightly misleading — we're not actually re-entering;
+/// we just want the writer-priority bypass.
+fn acquire_read_releasing_gil(
+    lock: &RwLock<Option<BuildOutputs>>,
+) -> RwLockReadGuard<'_, Option<BuildOutputs>> {
+    Python::with_gil(|py| {
+        py.allow_threads(|| {
+            // SAFETY: ``lock_shared_recursive`` is the raw lock
+            // primitive that bypasses writer-priority. The matching
+            // ``make_read_guard_unchecked`` reconstructs the public
+            // guard.
+            unsafe { lock.raw() }.lock_shared_recursive();
+        });
+    });
+    // SAFETY: we just took the read lock above.
+    unsafe { lock.make_read_guard_unchecked() }
 }
 
 impl ProjectContext {
@@ -1188,11 +1310,40 @@ impl ProjectContext {
     /// "not materialized" error. Threads the `op` label into the
     /// error message so the caller name appears in the traceback.
     ///
-    /// The returned `Ref` keeps the `RefCell` borrow alive for the
-    /// lifetime of the receiver, so callers can hold it across an
-    /// entire query body without re-borrowing.
-    pub(crate) fn materialized(&self, op: &str) -> PyResult<Ref<'_, BuildOutputs>> {
-        Ref::filter_map(self.outputs.borrow(), Option::as_ref).map_err(|_| not_materialized(op))
+    /// The returned guard keeps the [`RwLock`] read borrow alive for
+    /// the lifetime of the receiver, so callers can hold it across
+    /// an entire query body without re-borrowing.
+    ///
+    /// Concurrent plugin invocations (from
+    /// :class:`concurrent.futures.ThreadPoolExecutor`) all take read
+    /// guards, so they don't serialize on this lock; only the apply
+    /// pass that mutates the graph takes the write side.
+    ///
+    /// **GIL discipline**: when the read lock is contended (a write
+    /// is pending), :func:`parking_lot::RwLock::read` parks. Any
+    /// thread parking while still holding the GIL deadlocks against
+    /// concurrent writers running in the apply path — the writer
+    /// holds the write lock and wants to re-acquire the GIL to call
+    /// ``Py::new`` / ``intern_node``, but can't because we have the
+    /// GIL parked on the read-acquire. This helper accepts ``py``
+    /// and drops the GIL during the acquire so writers can make
+    /// progress, then re-attaches after we own the read guard.
+    pub(crate) fn materialized(
+        &self,
+        op: &str,
+    ) -> PyResult<MappedRwLockReadGuard<'_, BuildOutputs>> {
+        // ``parking_lot::RwLock`` is uncontended by default — the
+        // fast path takes a single CAS and never parks. We only
+        // need the GIL-release dance when there's an actual writer
+        // waiting; ``try_read`` checks without parking.
+        let guard = match self.outputs.try_read() {
+            Some(g) => g,
+            None => acquire_read_releasing_gil(&self.outputs),
+        };
+        if guard.is_none() {
+            return Err(not_materialized(op));
+        }
+        Ok(RwLockReadGuard::map(guard, |o| o.as_ref().unwrap()))
     }
 }
 
@@ -1331,8 +1482,15 @@ impl ProjectContext {
     /// O(1) count of how many project import nodes target
     /// ``module_name`` — pre-built index lookup, no Py allocation.
     pub(crate) fn imports_of_count(&self, module_name: &str) -> usize {
-        self.outputs
-            .borrow()
+        // Fast path: uncontended read avoids GIL juggling. Slow
+        // path matches the GIL-drop discipline in
+        // :meth:`materialized` — see that method's docstring for
+        // the deadlock rationale.
+        let read_guard = match self.outputs.try_read() {
+            Some(g) => g,
+            None => acquire_read_releasing_gil(&self.outputs),
+        };
+        read_guard
             .as_ref()
             .and_then(|o| o.imports_by_module.get(module_name).map(Vec::len))
             .unwrap_or(0)
@@ -3233,13 +3391,13 @@ impl ProjectContext {
     /// is bounded by the (small) number of distinct patterns a plugin
     /// run uses, so unbounded growth isn't a concern in practice.
     pub(crate) fn compile_regex(&self, pattern: &str) -> PyResult<regex::Regex> {
-        if let Some(cached) = self.regex_cache.borrow().get(pattern) {
+        if let Some(cached) = self.regex_cache.lock().get(pattern) {
             return Ok(cached.clone());
         }
         let regex = regex::Regex::new(pattern)
             .map_err(|e| PyValueError::new_err(format!("invalid regex {pattern:?}: {e}")))?;
         self.regex_cache
-            .borrow_mut()
+            .lock()
             .insert(pattern.to_string(), regex.clone());
         Ok(regex)
     }

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterator, Sequence
 
@@ -23,6 +25,36 @@ def _iter_dead(
             continue
         if n not in reachable:
             yield n
+
+
+def _serial_mode() -> bool:
+    """``True`` if ``DEAD_CST_PLUGINS_SERIAL=1`` is set in the env.
+
+    Kill switch for the concurrent plugin executor — falls back to
+    the rust-side serial loop. Useful for debugging plugin races,
+    flaky CI environments, or comparing serial vs parallel timings.
+    """
+    return os.environ.get("DEAD_CST_PLUGINS_SERIAL", "") == "1"
+
+
+def _plugin_worker_count(n_plugins: int) -> int:
+    """Worker count for the plugin :class:`ThreadPoolExecutor`.
+
+    Resolves to ``DEAD_CST_PLUGIN_WORKERS`` if set (clamped to
+    ``[1, n_plugins]``), otherwise ``min(n_plugins, cpu_count or 4)``.
+    Never returns more workers than plugins — extra workers just
+    idle.
+    """
+    raw = os.environ.get("DEAD_CST_PLUGIN_WORKERS", "")
+    if raw:
+        try:
+            requested = int(raw)
+        except ValueError as exc:
+            raise ValueError(f"DEAD_CST_PLUGIN_WORKERS must be an integer, got {raw!r}") from exc
+        if requested < 1:
+            raise ValueError(f"DEAD_CST_PLUGIN_WORKERS must be >= 1, got {requested}")
+        return min(requested, n_plugins)
+    return min(n_plugins, os.cpu_count() or 4)
 
 
 class Analysis:
@@ -140,9 +172,33 @@ class Analysis:
         )
         if self._stack_size is not None:
             ctx.set_stack_size(self._stack_size)
-        for plugin in self._plugins:
-            ctx.add_plugin(plugin)
-        ctx.materialize()
+
+        # ``DEAD_CST_PLUGINS_SERIAL=1`` (or no plugins / a single
+        # plugin) keeps the legacy rust-side loop. Otherwise we drive
+        # plugins from a ``ThreadPoolExecutor`` so any plugin time
+        # spent in GIL-releasing rust queries (``find_decorated_decls``,
+        # ``find_subclasses_of_class``, ``find_handler_decorators``, ...)
+        # overlaps across workers. Mutations to the graph still
+        # serialize behind the rust-side ``RwLock`` on ``outputs`` —
+        # only one ``apply_graph_op`` write runs at a time — but the
+        # read path is fully concurrent.
+        if _serial_mode() or len(self._plugins) <= 1:
+            for plugin in self._plugins:
+                ctx.add_plugin(plugin)
+            ctx.materialize()
+        else:
+            ctx.build_only()
+            workers = _plugin_worker_count(len(self._plugins))
+            # Plugins are scheduled in registration order; results
+            # ``.result()`` waits in the same order. Errors propagate
+            # via the future's ``.result()`` call.
+            with ThreadPoolExecutor(
+                max_workers=workers,
+                thread_name_prefix="dead-cst-plugin",
+            ) as pool:
+                futures = [pool.submit(ctx.run_plugin, p) for p in self._plugins]
+                for fut in futures:
+                    fut.result()
         self._ctx = ctx
         return ctx
 

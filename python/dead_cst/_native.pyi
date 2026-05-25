@@ -360,6 +360,28 @@ class ProjectContext:
         """
         ...
 
+    def build_only(self) -> None:
+        """Run only the project-wide build pass, without invoking any
+        registered plugins. Used by :class:`dead_cst.Analysis` to
+        split build from the plugin pass so the latter can run on a
+        Python :class:`concurrent.futures.ThreadPoolExecutor`."""
+        ...
+
+    def run_plugin(self, plugin: _ProjectPluginLike | Any) -> None:
+        """Invoke ``plugin.run(ctx)`` once, applying every yielded
+        op to the graph as it comes off the iterator. Safe to call
+        concurrently from multiple Python threads — graph mutations
+        serialize on the rust-side lock while read-only queries on
+        the in-progress graph run in parallel."""
+        ...
+
+    def snapshot_graph(self) -> NativeGraph:
+        """Snapshot the current graph (post-:meth:`build_only` +
+        any :meth:`run_plugin` calls) as a :class:`NativeGraph`.
+        Used by :class:`dead_cst.Analysis` to return the final graph
+        without re-running :meth:`materialize`."""
+        ...
+
     def query(self) -> QueryBuilder:
         """Open a chainable query builder against this context.
 

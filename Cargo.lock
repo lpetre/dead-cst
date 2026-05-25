@@ -356,6 +356,7 @@ dependencies = [
  "crossbeam-channel",
  "get-size2",
  "indicatif",
+ "parking_lot",
  "pyo3",
  "rayon",
  "regex",

@@ -360,81 +360,193 @@ pub(crate) fn synthetic_node(
     }
 }
 
+/// A [`GraphOp`] prepared for application: every Python-owned field
+/// has been hoisted into pure-rust storage so that
+/// [`apply_graph_op`] can drop the GIL before contending for the
+/// write lock on ``outputs``. Edge endpoints are represented as
+/// [`NodeKey`]s (the positional identity used by the builder's
+/// index) plus the source ``decl.fqname`` for entrypoint markers.
+/// See [`apply_graph_op`] for the concurrency rationale.
+pub(crate) enum PreparedOp {
+    Edge {
+        src: NodeKey,
+        dst: NodeKey,
+        flags: u32,
+    },
+    EdgeByIdx {
+        src_idx: usize,
+        dst_idx: usize,
+        flags: u32,
+    },
+    Entrypoint {
+        decl: NodeKey,
+        decl_fqname: String,
+        decl_path: String,
+        marker: String,
+    },
+    Node {
+        fqname: String,
+        kind: &'static str,
+        path: String,
+        flags: u32,
+        edges_from: Vec<NodeKey>,
+        edges_to: Vec<NodeKey>,
+    },
+}
+
 pub(crate) fn apply_graph_op(
     ctx: &Py<ProjectContext>,
     py: Python<'_>,
     op: &Bound<'_, PyAny>,
 ) -> PyResult<()> {
-    let this = ctx.borrow(py);
-    let mut outputs = this.outputs.borrow_mut();
-    let outputs = outputs
-        .as_mut()
-        .ok_or_else(|| not_materialized("apply_graph_op"))?;
+    // GIL-required prep: extract everything we need from the
+    // (potentially Python-owned) op into pure-rust state before we
+    // touch the lock. Concurrent plugins running on a Python
+    // :class:`ThreadPoolExecutor` can hold the ``outputs`` read
+    // guard across :meth:`pyo3::Python::allow_threads`; if we
+    // acquired the write lock while still holding the GIL, a reader
+    // returning from ``allow_threads`` would block on
+    // :func:`take_gil`, and the write side would block on
+    // ``wait_for_readers`` — classic deadlock. Dropping the GIL
+    // before contending for the write lock breaks that cycle.
+    let prepared = if let Ok(add_edge) = op.extract::<PyRef<AddEdge>>() {
+        PreparedOp::Edge {
+            src: node_key_of(&add_edge.src.borrow(py)),
+            dst: node_key_of(&add_edge.dst.borrow(py)),
+            flags: add_edge.flags,
+        }
+    } else if let Ok(add_edge_idx) = op.extract::<PyRef<AddEdgeByIdx>>() {
+        PreparedOp::EdgeByIdx {
+            src_idx: add_edge_idx.src_idx,
+            dst_idx: add_edge_idx.dst_idx,
+            flags: add_edge_idx.flags,
+        }
+    } else if let Ok(add_ep) = op.extract::<PyRef<AddEntrypoint>>() {
+        let decl_ref = add_ep.decl.borrow(py);
+        PreparedOp::Entrypoint {
+            decl: node_key_of(&decl_ref),
+            decl_fqname: decl_ref.fqname.clone(),
+            decl_path: decl_ref.path.clone(),
+            marker: add_ep.marker.clone(),
+        }
+    } else if let Ok(add_node) = op.extract::<PyRef<AddNode>>() {
+        let edges_from: Vec<NodeKey> = add_node
+            .edges_from
+            .iter()
+            .map(|n| node_key_of(&n.borrow(py)))
+            .collect();
+        let edges_to: Vec<NodeKey> = add_node
+            .edges_to
+            .iter()
+            .map(|n| node_key_of(&n.borrow(py)))
+            .collect();
+        PreparedOp::Node {
+            fqname: add_node.fqname.clone(),
+            kind: add_node.kind,
+            path: add_node.path.clone(),
+            flags: add_node.flags,
+            edges_from,
+            edges_to,
+        }
+    } else {
+        return Err(PyValueError::new_err(format!(
+            "expected a GraphOp (AddEdge / AddEdgeByIdx / AddEntrypoint / AddNode), got {:?}",
+            op.get_type().name()?,
+        )));
+    };
 
-    if let Ok(add_edge) = op.extract::<PyRef<AddEdge>>() {
-        let src_idx = lookup_idx(&outputs.builder, &add_edge.src.borrow(py), "src")?;
-        let dst_idx = lookup_idx(&outputs.builder, &add_edge.dst.borrow(py), "dst")?;
-        outputs.builder.add_edge(src_idx, dst_idx, add_edge.flags);
-        return Ok(());
-    }
-    if let Ok(add_edge_idx) = op.extract::<PyRef<AddEdgeByIdx>>() {
-        let len = outputs.builder.nodes.len();
-        if add_edge_idx.src_idx >= len {
-            return Err(pyo3::exceptions::PyIndexError::new_err(format!(
-                "AddEdgeByIdx: src_idx {} out of range (len={})",
-                add_edge_idx.src_idx, len
-            )));
+    // The ``write()`` MUST happen with the GIL released, then the
+    // GIL re-acquired *after* we own the write guard. Otherwise a
+    // concurrent reader returning from ``allow_threads`` and waiting
+    // on ``take_gil`` will deadlock against us — we'd be holding the
+    // GIL while blocked on ``wait_for_readers``, and the reader
+    // can't drop its read guard without first re-attaching the GIL.
+    //
+    // We grab an ``Arc<RwLock<Option<BuildOutputs>>>`` from the
+    // pyclass (which is the outputs handle itself) so we can move
+    // it across the ``allow_threads`` boundary — ``Arc`` is Send,
+    // ``PyRef`` is not.
+    let outputs_lock = ctx.borrow(py).outputs.clone();
+    py.allow_threads(move || -> PyResult<()> {
+        let mut outputs = outputs_lock.write();
+        let outputs = outputs
+            .as_mut()
+            .ok_or_else(|| not_materialized("apply_graph_op"))?;
+        // With the write guard owned, re-acquire the GIL only for
+        // the calls that genuinely need it (``Py::new`` for the new
+        // node, ``clone_ref(py)`` for refcounted edges).
+        Python::with_gil(|py| apply_prepared(outputs, py, prepared))
+    })
+}
+
+fn apply_prepared(
+    outputs: &mut crate::project::BuildOutputs,
+    py: Python<'_>,
+    prepared: PreparedOp,
+) -> PyResult<()> {
+    match prepared {
+        PreparedOp::Edge { src, dst, flags } => {
+            let src_idx = lookup_idx_by_key(&outputs.builder, &src, "src")?;
+            let dst_idx = lookup_idx_by_key(&outputs.builder, &dst, "dst")?;
+            outputs.builder.add_edge(src_idx, dst_idx, flags);
+            Ok(())
         }
-        if add_edge_idx.dst_idx >= len {
-            return Err(pyo3::exceptions::PyIndexError::new_err(format!(
-                "AddEdgeByIdx: dst_idx {} out of range (len={})",
-                add_edge_idx.dst_idx, len
-            )));
+        PreparedOp::EdgeByIdx {
+            src_idx,
+            dst_idx,
+            flags,
+        } => {
+            let len = outputs.builder.nodes.len();
+            if src_idx >= len {
+                return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                    "AddEdgeByIdx: src_idx {src_idx} out of range (len={len})"
+                )));
+            }
+            if dst_idx >= len {
+                return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                    "AddEdgeByIdx: dst_idx {dst_idx} out of range (len={len})"
+                )));
+            }
+            outputs.builder.add_edge(src_idx, dst_idx, flags);
+            Ok(())
         }
-        outputs.builder.add_edge(
-            add_edge_idx.src_idx,
-            add_edge_idx.dst_idx,
-            add_edge_idx.flags,
-        );
-        return Ok(());
-    }
-    if let Ok(add_ep) = op.extract::<PyRef<AddEntrypoint>>() {
-        let decl = add_ep.decl.borrow(py);
-        let decl_idx = lookup_idx(&outputs.builder, &decl, "decl")?;
-        let marker_fqname = format!("{}:{}", add_ep.marker, decl.fqname);
-        let path = decl.path.clone();
-        drop(decl);
-        let marker_idx = outputs.builder.intern_node(
-            py,
-            synthetic_node(marker_fqname, "synthetic", path, NODE_FLAG_ENTRYPOINT),
-        )?;
-        outputs.builder.add_edge(marker_idx, decl_idx, 0);
-        return Ok(());
-    }
-    if let Ok(add_node) = op.extract::<PyRef<AddNode>>() {
-        let node_idx = outputs.builder.intern_node(
-            py,
-            synthetic_node(
-                add_node.fqname.clone(),
-                add_node.kind,
-                add_node.path.clone(),
-                add_node.flags,
-            ),
-        )?;
-        for src in &add_node.edges_from {
-            let src_idx = lookup_idx(&outputs.builder, &src.borrow(py), "edges_from")?;
-            outputs.builder.add_edge(src_idx, node_idx, 0);
+        PreparedOp::Entrypoint {
+            decl,
+            decl_fqname,
+            decl_path,
+            marker,
+        } => {
+            let decl_idx = lookup_idx_by_key(&outputs.builder, &decl, "decl")?;
+            let marker_fqname = format!("{marker}:{decl_fqname}");
+            let marker_idx = outputs.builder.intern_node(
+                py,
+                synthetic_node(marker_fqname, "synthetic", decl_path, NODE_FLAG_ENTRYPOINT),
+            )?;
+            outputs.builder.add_edge(marker_idx, decl_idx, 0);
+            Ok(())
         }
-        for dst in &add_node.edges_to {
-            let dst_idx = lookup_idx(&outputs.builder, &dst.borrow(py), "edges_to")?;
-            outputs.builder.add_edge(node_idx, dst_idx, 0);
+        PreparedOp::Node {
+            fqname,
+            kind,
+            path,
+            flags,
+            edges_from,
+            edges_to,
+        } => {
+            let node_idx = outputs
+                .builder
+                .intern_node(py, synthetic_node(fqname, kind, path, flags))?;
+            for src in &edges_from {
+                let src_idx = lookup_idx_by_key(&outputs.builder, src, "edges_from")?;
+                outputs.builder.add_edge(src_idx, node_idx, 0);
+            }
+            for dst in &edges_to {
+                let dst_idx = lookup_idx_by_key(&outputs.builder, dst, "edges_to")?;
+                outputs.builder.add_edge(node_idx, dst_idx, 0);
+            }
+            Ok(())
         }
-        return Ok(());
     }
-    Err(PyValueError::new_err(format!(
-        "expected a GraphOp (AddEdge / AddEdgeByIdx / AddEntrypoint / AddNode), got {:?}",
-        op.get_type().name()?,
-    )))
 }
 
 /// Resolve a `SymbolNode` reference to its builder-side index for an
@@ -451,6 +563,22 @@ pub(crate) fn lookup_idx(builder: &GraphBuilder, node: &SymbolNode, side: &str) 
                 node.fqname
             ))
         })
+}
+
+/// Variant of [`lookup_idx`] that takes a [`NodeKey`] directly so it
+/// can be called from [`apply_graph_op`]'s GIL-free post-prepare
+/// section — see [`PreparedOp`] for why the key is pre-extracted.
+pub(crate) fn lookup_idx_by_key(
+    builder: &GraphBuilder,
+    key: &NodeKey,
+    side: &str,
+) -> PyResult<usize> {
+    builder.node_index.get(key).copied().ok_or_else(|| {
+        PyValueError::new_err(format!(
+            "add_edge: {side} node {:?} is not interned in this ProjectContext",
+            key.fqname
+        ))
+    })
 }
 
 #[cfg(test)]
