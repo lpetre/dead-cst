@@ -1256,7 +1256,28 @@ class DeclQuery:
         """Restrict to nodes whose ``flags & mask != 0`` (any bit set)."""
         ...
 
-    def with_fqname_prefix(self, prefix: str) -> DeclQuery: ...
+    def with_fqname_prefix(self, prefix: str) -> DeclQuery:
+        """Restrict to nodes whose ``fqname`` starts with ``prefix`` —
+        a raw string prefix, not segment-bounded. ``prefix="foo"``
+        matches both ``foo.bar`` and ``foobar``. Use
+        :meth:`with_fqname_under` for the segment-bounded
+        "descendants of this fqname" predicate that walks the fqname
+        tree via the ``children_by_parent`` index.
+        """
+        ...
+
+    def with_fqname_under(self, parent_fqn: str) -> DeclQuery:
+        """Restrict to nodes whose ``fqname`` equals ``parent_fqn``
+        or is a transitive descendant of it in the fqname tree.
+
+        Segment-bounded: ``parent_fqn="pkg.foo"`` matches ``pkg.foo``,
+        ``pkg.foo.bar``, ``pkg.foo.bar.baz`` — but **not** ``pkg.foobar``.
+        Backed by the project's ``children_by_parent`` index, so this
+        is O(matches) instead of the O(all_nodes) scan
+        :meth:`with_fqname_prefix` performs.
+        """
+        ...
+
     def where_fqname(
         self,
         value: str | re.Pattern[str] | Sequence[str | re.Pattern[str]],

@@ -1300,6 +1300,14 @@ pub(crate) struct DeclQuery {
     pub(crate) flags_mask: Option<u32>,
     pub(crate) flags_match_any: bool,
     pub(crate) fqname_prefix: Option<String>,
+    /// Segment-bounded descendant filter, populated by
+    /// :meth:`with_fqname_under`. When ``Some(parent)``, restrict to
+    /// the node whose fqname equals ``parent`` plus every transitive
+    /// descendant of ``parent`` in the fqname tree (modules and decls,
+    /// segment-bounded). Backed by ``children_by_parent`` — see
+    /// :meth:`with_fqname_under` for the contract and comparison
+    /// against the raw-``starts_with`` :meth:`with_fqname_prefix`.
+    pub(crate) fqname_under: Option<String>,
     /// `where_fqname` literal-string candidates. ``None`` if the
     /// predicate isn't configured; ``Some(vec)`` if at least one
     /// literal was passed. Combined with ``fqname_regexes`` via OR.
@@ -1323,6 +1331,7 @@ impl DeclQuery {
             flags_mask: None,
             flags_match_any: false,
             fqname_prefix: None,
+            fqname_under: None,
             fqname_literals: None,
             fqname_regexes: None,
         }
@@ -1404,12 +1413,32 @@ impl DeclQuery {
         slf.flags_match_any = true;
         slf
     }
-    /// Restrict to nodes whose ``fqname`` starts with ``prefix``.
+    /// Restrict to nodes whose ``fqname`` starts with ``prefix`` (raw
+    /// string prefix — not segment-bounded). ``prefix="foo"`` matches
+    /// both ``foo.bar`` and ``foobar``. Use :meth:`with_fqname_under`
+    /// for the segment-bounded "descendants of this fqname" predicate
+    /// that walks the fqname tree.
     fn with_fqname_prefix<'py>(
         mut slf: PyRefMut<'py, Self>,
         prefix: String,
     ) -> PyRefMut<'py, Self> {
         slf.fqname_prefix = Some(prefix);
+        slf
+    }
+
+    /// Restrict to nodes whose ``fqname`` equals ``parent_fqn`` or is
+    /// a transitive descendant of it in the fqname tree.
+    ///
+    /// Segment-bounded: ``parent_fqn="pkg.foo"`` matches ``pkg.foo``,
+    /// ``pkg.foo.bar``, ``pkg.foo.bar.baz`` — but **not** ``pkg.foobar``.
+    /// Backed by the project's ``children_by_parent`` index, so this
+    /// is O(matches) instead of the O(all_nodes) scan
+    /// :meth:`with_fqname_prefix` performs.
+    fn with_fqname_under<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        parent_fqn: String,
+    ) -> PyRefMut<'py, Self> {
+        slf.fqname_under = Some(parent_fqn);
         slf
     }
 
@@ -1494,8 +1523,51 @@ impl DeclQuery {
             .as_ref()
             .map(|v| v.iter().map(String::as_str).collect());
 
+        // For ``with_fqname_under``: BFS the children-by-parent tree
+        // once to materialise the candidate index set, then restrict
+        // the main loop to those indices. Empty set means "parent
+        // unknown" -> the query returns nothing.
+        let fqname_under_indices: Option<FxHashSet<usize>> =
+            self.fqname_under.as_ref().map(|root| {
+                let mut set: FxHashSet<usize> = FxHashSet::default();
+                // The root may be a module or a top-level decl. Include
+                // every direct hit before BFS-ing into modules below.
+                if let Some(&module_idx) = outputs.module_by_fqname.get(root.as_str()) {
+                    set.insert(module_idx);
+                }
+                if let Some(idxs) = outputs.decl_by_fqname.get(root.as_str()) {
+                    for &i in idxs {
+                        set.insert(i);
+                    }
+                }
+                let mut queue: std::collections::VecDeque<String> =
+                    std::collections::VecDeque::from([root.clone()]);
+                while let Some(parent) = queue.pop_front() {
+                    let Some(children) = outputs.children_by_parent.get(parent.as_str()) else {
+                        continue;
+                    };
+                    for &child_idx in children {
+                        if !set.insert(child_idx) {
+                            continue;
+                        }
+                        let child = outputs.builder.nodes[child_idx].borrow(py);
+                        if child.kind == "module" {
+                            queue.push_back(child.fqname.clone());
+                        }
+                    }
+                }
+                set
+            });
+
         let mut out = Vec::new();
-        for (idx, node_py) in outputs.builder.nodes.iter().enumerate() {
+        for (node_idx, node_py) in outputs.builder.nodes.iter().enumerate() {
+            // fqname-under (cheapest gate first when set — restricts
+            // to a tiny candidate set out of all nodes).
+            if let Some(set) = &fqname_under_indices {
+                if !set.contains(&node_idx) {
+                    continue;
+                }
+            }
             let node = node_py.borrow(py);
             // kind
             if let Some(k) = &kinds_set {
@@ -1565,7 +1637,7 @@ impl DeclQuery {
                     continue;
                 }
             }
-            out.push(idx);
+            out.push(node_idx);
         }
         Ok(out)
     }

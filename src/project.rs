@@ -128,6 +128,19 @@ pub(crate) struct BuildOutputs {
     /// nodes — and a cheap ``imports_of_exists`` short-circuit for
     /// plugins that just need a per-module presence check.
     pub(crate) imports_by_module: FxHashMap<String, Vec<usize>>,
+    /// `parent_fqname -> [child node idx]`. Children are the indices of
+    /// nodes whose fqname's immediate parent (`fqname.rsplit_once('.').0`)
+    /// equals the key. Includes both module and decl nodes; the kind
+    /// can be read from ``builder.nodes[idx].kind`` when filtering.
+    /// Top-level decls (no `.` in fqname) are bucketed under the empty
+    /// string ``""``.
+    ///
+    /// Lets ``module_surface`` BFS the fqname tree (one O(matches)
+    /// hop per parent) instead of linear-scanning ``decl_by_fqname`` /
+    /// ``module_by_fqname`` with a ``starts_with`` filter, and lets
+    /// ``find_module_top_level_decls`` answer with a single
+    /// ``HashMap::get``.
+    pub(crate) children_by_parent: FxHashMap<String, Vec<usize>>,
     /// Project-wide class hierarchy keyed by parent class graph idx.
     /// `class_idx -> [direct subclass class_idx]`. Derived in
     /// `assemble_graph` from each file's per-file `class_bases`
@@ -366,7 +379,8 @@ pub(crate) fn build_project_graph(
     let ref_to_global = assembled.ref_to_global;
 
     let t4 = std::time::Instant::now();
-    let (decl_by_fqname, module_by_fqname, imports_by_module) = build_fqname_indices(py, &builder);
+    let (decl_by_fqname, module_by_fqname, imports_by_module, children_by_parent) =
+        build_fqname_indices(py, &builder);
     let t_fqname = t4.elapsed();
 
     // Class hierarchy fan-in: fold every file's per-file `class_bases`
@@ -423,6 +437,7 @@ pub(crate) fn build_project_graph(
         imports_by_module,
         children_by_node,
         children_by_fqn,
+        children_by_parent,
     })
 }
 
@@ -941,12 +956,19 @@ fn serial_lookup_or_mint<'db>(
 }
 
 /// Pre-build the fqname -> idx maps used by ``find_declarations``,
-/// ``find_module``, and ``find_imports_of``. One pass over interned
-/// nodes; module entries are 1:1 (one module node per fqname) while
-/// decl entries (and per-upstream-module import entries) can have
-/// multiple binders for the same key — try/except rebinds,
-/// conditional re-imports, and multiple ``from X import Y, Z`` aliases
-/// all bind into the same upstream module.
+/// ``find_module``, ``find_imports_of``, and ``module_surface``. One
+/// pass over interned nodes; module entries are 1:1 (one module node
+/// per fqname) while decl entries (and per-upstream-module import
+/// entries) can have multiple binders for the same key — try/except
+/// rebinds, conditional re-imports, and multiple ``from X import Y, Z``
+/// aliases all bind into the same upstream module.
+///
+/// ``children_by_parent`` is the fqname-tree index used by
+/// :meth:`ProjectContext::module_surface` and
+/// :meth:`ProjectContext::find_module_top_level_decls`: for every
+/// indexed node (module or decl), the entry is bucketed under the
+/// fqname's immediate parent (``rsplit_once('.').0``), with top-level
+/// names keyed under the empty string.
 #[allow(clippy::type_complexity)]
 pub(crate) fn build_fqname_indices(
     py: Python<'_>,
@@ -955,10 +977,12 @@ pub(crate) fn build_fqname_indices(
     FxHashMap<String, Vec<usize>>,
     FxHashMap<String, usize>,
     FxHashMap<String, Vec<usize>>,
+    FxHashMap<String, Vec<usize>>,
 ) {
     let mut decls: FxHashMap<String, Vec<usize>> = FxHashMap::default();
     let mut modules: FxHashMap<String, usize> = FxHashMap::default();
     let mut imports_by_module: FxHashMap<String, Vec<usize>> = FxHashMap::default();
+    let mut children_by_parent: FxHashMap<String, Vec<usize>> = FxHashMap::default();
     for (idx, node_py) in builder.nodes.iter().enumerate() {
         let node = node_py.borrow(py);
         // `OVERLOAD`-flagged decls (the `@typing.overload`-decorated
@@ -969,12 +993,15 @@ pub(crate) fn build_fqname_indices(
         if node.flags & crate::graph::NodeFlags::OVERLOAD != 0 {
             continue;
         }
+        let mut index_child = false;
         match node.kind {
             "module" => {
                 modules.insert(node.fqname.clone(), idx);
+                index_child = true;
             }
             "function" | "class" | "variable" => {
                 decls.entry(node.fqname.clone()).or_default().push(idx);
+                index_child = true;
             }
             "import" => {
                 decls.entry(node.fqname.clone()).or_default().push(idx);
@@ -984,11 +1011,20 @@ pub(crate) fn build_fqname_indices(
                         .or_default()
                         .push(idx);
                 }
+                index_child = true;
             }
             _ => {}
         }
+        if index_child {
+            let parent = node
+                .fqname
+                .rsplit_once('.')
+                .map(|(p, _)| p.to_string())
+                .unwrap_or_default();
+            children_by_parent.entry(parent).or_default().push(idx);
+        }
     }
-    (decls, modules, imports_by_module)
+    (decls, modules, imports_by_module, children_by_parent)
 }
 
 /// Plugin-aware project graph builder.
@@ -1617,6 +1653,13 @@ impl ProjectContext {
     /// whole top-level surface plus everything its submodules expose.
     /// Empty list when ``module_fqn`` doesn't resolve to a project
     /// module.
+    ///
+    /// Walks the ``children_by_parent`` fqname-tree index breadth-first
+    /// starting from ``module_fqn``. Only module nodes are recursed
+    /// into — a decl ``pkg.foo.MyClass`` is included as a child of
+    /// ``pkg.foo`` but its synthetic sub-fqnames (``pkg.foo.MyClass.method``)
+    /// are not surfaced; nested defs aren't graph nodes anyway, and the
+    /// "module surface" contract is per-module.
     pub(crate) fn module_surface(
         &self,
         py: Python<'_>,
@@ -1627,16 +1670,31 @@ impl ProjectContext {
             return Ok(Vec::new());
         };
         let mut out = vec![outputs.builder.nodes[module_idx].clone_ref(py)];
-        let prefix = format!("{module_fqn}.");
-        for (fqname, &idx) in &outputs.module_by_fqname {
-            if fqname.starts_with(&prefix) {
-                out.push(outputs.builder.nodes[idx].clone_ref(py));
-            }
-        }
-        for (fqname, idxs) in &outputs.decl_by_fqname {
-            if fqname.starts_with(&prefix) {
-                for &idx in idxs {
-                    out.push(outputs.builder.nodes[idx].clone_ref(py));
+        // BFS over the fqname tree. Recurse only into module children:
+        // a decl ``pkg.foo.MyClass`` doesn't have submodule descendants,
+        // so chasing its sub-fqnames would just be wasted lookups.
+        // Queue holds owned ``String``s because ``children_by_parent``
+        // keys are owned strings and ``SymbolNode.fqname`` lives behind
+        // a ``PyRef`` guard that can't be held across iterations.
+        let mut queue: std::collections::VecDeque<String> =
+            std::collections::VecDeque::from([module_fqn.to_string()]);
+        while let Some(parent) = queue.pop_front() {
+            let Some(children) = outputs.children_by_parent.get(parent.as_str()) else {
+                continue;
+            };
+            for &child_idx in children {
+                let child_py = &outputs.builder.nodes[child_idx];
+                let child = child_py.borrow(py);
+                let is_module = child.kind == "module";
+                let child_fqname = if is_module {
+                    Some(child.fqname.clone())
+                } else {
+                    None
+                };
+                drop(child);
+                out.push(child_py.clone_ref(py));
+                if let Some(fqn) = child_fqname {
+                    queue.push_back(fqn);
                 }
             }
         }
@@ -1724,7 +1782,7 @@ impl ProjectContext {
         py: Python<'_>,
         module_fqn: &str,
     ) -> PyResult<Vec<Py<SymbolNode>>> {
-        let indices = self.find_module_top_level_decls_indices(module_fqn)?;
+        let indices = self.find_module_top_level_decls_indices(py, module_fqn)?;
         let outputs = self.materialized("find_module_top_level_decls")?;
         Ok(indices
             .into_iter()
@@ -1737,23 +1795,25 @@ impl ProjectContext {
     /// than allocating ``Py<SymbolNode>`` clones.
     pub(crate) fn find_module_top_level_decls_indices(
         &self,
+        py: Python<'_>,
         module_fqn: &str,
     ) -> PyResult<Vec<usize>> {
         let outputs = self.materialized("find_module_top_level_decls_indices")?;
         if !outputs.module_by_fqname.contains_key(module_fqn) {
             return Ok(Vec::new());
         }
-        let prefix = format!("{module_fqn}.");
+        // One-level lookup via the ``children_by_parent`` fqname tree.
+        // Filter out module children so `from p.functions import *`
+        // doesn't surface ``p.functions.sub`` (matching the docstring's
+        // "submodules and their decls are excluded" contract).
         let mut out: Vec<usize> = Vec::new();
-        for (fqname, idxs) in &outputs.decl_by_fqname {
-            let Some(rest) = fqname.strip_prefix(&prefix) else {
-                continue;
-            };
-            // Skip transitive decls (`pkg.mod.sub.x` under `pkg.mod`).
-            if rest.contains('.') {
-                continue;
+        if let Some(children) = outputs.children_by_parent.get(module_fqn) {
+            for &idx in children {
+                if outputs.builder.nodes[idx].borrow(py).kind == "module" {
+                    continue;
+                }
+                out.push(idx);
             }
-            out.extend(idxs.iter().copied());
         }
         Ok(out)
     }
