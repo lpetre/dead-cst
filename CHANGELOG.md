@@ -9,6 +9,15 @@ two versions.
 
 ## [Unreleased]
 
+### Added
+- `dead_cst.contrib.slack_bolt_plugin` keeps `slack_bolt.App` and
+  `slack_bolt.async_app.AsyncApp` instances alive, treats every
+  `@app.event` / `@app.message` / `@app.command` / `@app.action` /
+  `@app.shortcut` / `@app.view` / `@app.options` / `@app.error` /
+  `@app.step` / `@app.function` handler as an entrypoint, and
+  follows factory-style construction. Registered under the
+  `slack_bolt` CLI plugin key.
+
 ## [0.12.1] - 2026-05-24
 
 ### Changed
