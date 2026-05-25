@@ -692,3 +692,286 @@ def test_factory_query_row_indices_matches_collect(build_decl_graph):
     for ref, row in zip(refs, rows, strict=True):
         assert all_nodes[row.decl_idx].fqname == ref.decl.fqname
         assert row.kinds == ref.kinds
+
+
+# ---------------------------------------------------------------------------
+# AddEntrypointByIdx — graph op
+# ---------------------------------------------------------------------------
+
+
+def test_add_entrypoint_by_idx_promotes_seed(tmp_path):
+    """``AddEntrypointByIdx(idx, marker=...)`` mints the same
+    ``<marker>:<decl.fqname>`` synthetic the node-form ``AddEntrypoint``
+    does, and the decl + everything it reaches stay alive."""
+    from dead_cst.analyze import Analysis
+    from dead_cst.plugins._base import Plugin
+
+    (tmp_path / "mod.py").write_text(
+        "def used_by_seed(): pass\ndef seed(): used_by_seed()\ndef dead(): pass\n"
+    )
+
+    class SeedByIdx(Plugin):
+        name = "seed_by_idx"
+        version = 1
+
+        def run(self, ctx: native.ProjectContext):
+            (seed_idx,) = ctx.indices_where(fqname_prefix="mod.seed")
+            yield native.AddEntrypointByIdx(seed_idx, marker="<seed>")
+
+    analysis = Analysis(tmp_path, plugins=[SeedByIdx()])
+    ctx = analysis.materialize_all()
+    fqnames = [n.fqname for n in ctx.nodes()]
+    # Marker is composed as ``<marker>:<decl.fqname>`` — same shape
+    # ``AddEntrypoint`` uses.
+    assert "<seed>:mod.seed" in fqnames
+    dead_fqnames = {n.fqname for n in analysis.dead()}
+    assert "mod.seed" not in dead_fqnames
+    assert "mod.used_by_seed" not in dead_fqnames
+    assert "mod.dead" in dead_fqnames
+
+
+def test_add_entrypoint_by_idx_out_of_range_raises(tmp_path):
+    from dead_cst.analyze import Analysis
+    from dead_cst.plugins._base import Plugin
+
+    (tmp_path / "mod.py").write_text("def f(): pass\n")
+
+    class BadIdx(Plugin):
+        name = "bad_idx"
+        version = 1
+
+        def run(self, ctx: native.ProjectContext):
+            yield native.AddEntrypointByIdx(10**9, marker="<seed>")
+
+    analysis = Analysis(tmp_path, plugins=[BadIdx()])
+    with pytest.raises(IndexError, match="decl_idx"):
+        analysis.materialize_all()
+
+
+# ---------------------------------------------------------------------------
+# ctx.find_module_idx
+# ---------------------------------------------------------------------------
+
+
+def test_find_module_idx_matches_node_form(build_decl_graph):
+    ctx = build_decl_graph(
+        {"pkg/__init__.py": "", "pkg/sub/__init__.py": "", "pkg/sub/inner.py": "x = 1\n"}
+    )
+    for fqn in ("pkg", "pkg.sub", "pkg.sub.inner"):
+        node = ctx.find_module(fqn)
+        idx = ctx.find_module_idx(fqn)
+        assert node is not None
+        assert idx is not None
+        assert ctx.nodes()[idx].fqname == node.fqname
+
+
+def test_find_module_idx_unknown_returns_none(build_decl_graph):
+    ctx = build_decl_graph({"pkg/__init__.py": "", "pkg/a.py": "x = 1\n"})
+    assert ctx.find_module_idx("nothing.here") is None
+
+
+# ---------------------------------------------------------------------------
+# ctx.find_module_dunders_indices
+# ---------------------------------------------------------------------------
+
+
+def test_find_module_dunders_indices_matches_node_form(build_decl_graph):
+    ctx = build_decl_graph(
+        {
+            "pkg/__init__.py": "__all__ = []\n__version__ = '1.0'\n",
+            "pkg/a.py": "def __getattr__(name): pass\nx = 1\n",
+        }
+    )
+    nodes = ctx.find_module_dunders()
+    indices = ctx.find_module_dunders_indices()
+    assert len(nodes) == len(indices)
+    revived = ctx.nodes_at(indices)
+    assert {n.fqname for n in revived} == {n.fqname for n in nodes}
+    # ``x = 1`` is a plain top-level variable — must not be surfaced.
+    assert all("x" not in n.fqname.rsplit(".", 1)[-1] for n in revived)
+
+
+# ---------------------------------------------------------------------------
+# ctx.find_nodes_matching_specs_indices
+# ---------------------------------------------------------------------------
+
+
+def test_find_nodes_matching_specs_indices_matches_node_form(build_decl_graph, tmp_path):
+    ctx = build_decl_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/svc.py": "def handler(): pass\n",
+            "pkg/util.py": "def helper(): pass\n",
+        }
+    )
+    # Use the same three spec buckets the ExplicitEntrypointPlugin
+    # exercises: regex, str (relative path or fqname), abs path.
+    nodes = ctx.find_nodes_matching_specs(
+        str(tmp_path),
+        regexes=[r"pkg/svc\.py"],
+        str_specs=["pkg.util.helper"],
+        abs_paths=[],
+    )
+    indices = ctx.find_nodes_matching_specs_indices(
+        str(tmp_path),
+        regexes=[r"pkg/svc\.py"],
+        str_specs=["pkg.util.helper"],
+        abs_paths=[],
+    )
+    assert len(nodes) == len(indices)
+    revived = ctx.nodes_at(indices)
+    assert {n.fqname for n in revived} == {n.fqname for n in nodes}
+    assert {"pkg.svc.handler", "pkg.util.helper"} <= {n.fqname for n in revived}
+
+
+# ---------------------------------------------------------------------------
+# ctx.subclasses_of_fqn_indices + SubclassQuery.of_idx +
+# ctx.find_subclasses_of_idx
+# ---------------------------------------------------------------------------
+
+
+def test_subclasses_of_fqn_indices_matches_node_form(build_decl_graph):
+    ctx = build_decl_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/bases.py": "class Base: pass\n",
+            "pkg/sub.py": (
+                "from pkg.bases import Base\nclass Mid(Base): pass\nclass Leaf(Mid): pass\n"
+            ),
+        }
+    )
+    nodes = ctx.subclasses_of_fqn("pkg.bases.Base", transitive=True)
+    indices = ctx.subclasses_of_fqn_indices("pkg.bases.Base", transitive=True)
+    assert len(nodes) == len(indices)
+    revived = ctx.nodes_at(indices)
+    assert {n.fqname for n in revived} == {n.fqname for n in nodes}
+
+
+def test_subclasses_of_fqn_indices_transitive_flag(build_decl_graph):
+    ctx = build_decl_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/bases.py": "class Base: pass\n",
+            "pkg/sub.py": (
+                "from pkg.bases import Base\nclass Mid(Base): pass\nclass Leaf(Mid): pass\n"
+            ),
+        }
+    )
+    direct = ctx.subclasses_of_fqn_indices("pkg.bases.Base", transitive=False)
+    direct_revived = {n.fqname for n in ctx.nodes_at(direct)}
+    assert direct_revived == {"pkg.sub.Mid"}  # Leaf is not a *direct* subclass of Base
+
+
+def test_find_subclasses_of_idx_matches_node_form(build_decl_graph):
+    ctx = build_decl_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/a.py": "class Base: pass\nclass Sub(Base): pass\n",
+        }
+    )
+    (base_idx,) = ctx.indices_where(fqname_prefix="pkg.a.Base", kind="class")
+    base_node = ctx.nodes_at([base_idx])[0]
+    nodes = ctx.find_subclasses_of(base_node)
+    idx_results = ctx.find_subclasses_of_idx(base_idx)
+    assert len(nodes) == len(idx_results)
+    revived = ctx.nodes_at(idx_results)
+    assert {n.fqname for n in revived} == {n.fqname for n in nodes}
+
+
+def test_find_subclasses_of_idx_non_class_returns_empty(build_decl_graph):
+    ctx = build_decl_graph({"pkg/__init__.py": "", "pkg/a.py": "def f(): pass\n"})
+    (f_idx,) = ctx.indices_where(fqname_prefix="pkg.a.f", kind="function")
+    # Same contract as the node-form: non-class seed returns empty.
+    assert ctx.find_subclasses_of_idx(f_idx) == []
+
+
+def test_find_subclasses_of_idx_out_of_range_raises(build_decl_graph):
+    ctx = build_decl_graph({"pkg/__init__.py": "", "pkg/a.py": "class X: pass\n"})
+    n = len(ctx.nodes())
+    with pytest.raises(IndexError, match="out of range"):
+        ctx.find_subclasses_of_idx(n)
+
+
+def test_subclass_query_of_idx_matches_of_node(build_decl_graph):
+    ctx = build_decl_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/a.py": "class Base: pass\nclass Sub(Base): pass\n",
+        }
+    )
+    (base_idx,) = ctx.indices_where(fqname_prefix="pkg.a.Base", kind="class")
+    base_node = ctx.nodes_at([base_idx])[0]
+    by_node = native.query(ctx).subclasses().of_node(base_node).indices()
+    by_idx = native.query(ctx).subclasses().of_idx(base_idx).indices()
+    assert sorted(by_node) == sorted(by_idx)
+
+
+# ---------------------------------------------------------------------------
+# ctx.direct_predecessors_idx
+# ---------------------------------------------------------------------------
+
+
+def test_direct_predecessors_idx_matches_node_form(build_decl_graph):
+    ctx = build_decl_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/a.py": "def callee(): pass\ndef caller(): callee()\ncaller()\n",
+        }
+    )
+    (callee_idx,) = ctx.indices_where(fqname_prefix="pkg.a.callee", kind="function")
+    callee_node = ctx.nodes_at([callee_idx])[0]
+    nodes = ctx.direct_predecessors(callee_node)
+    indices = ctx.direct_predecessors_idx(callee_idx)
+    assert len(nodes) == len(indices)
+    revived = ctx.nodes_at(indices)
+    assert {n.fqname for n in revived} == {n.fqname for n in nodes}
+    # ``caller`` definitely calls ``callee`` — sanity check.
+    assert "pkg.a.caller" in {n.fqname for n in revived}
+
+
+def test_direct_predecessors_idx_out_of_range_raises(build_decl_graph):
+    ctx = build_decl_graph({"pkg/__init__.py": "", "pkg/a.py": "def f(): pass\n"})
+    n = len(ctx.nodes())
+    with pytest.raises(IndexError, match="out of range"):
+        ctx.direct_predecessors_idx(n)
+
+
+# ---------------------------------------------------------------------------
+# DecoratorQuery.in_decl_idx
+# ---------------------------------------------------------------------------
+
+
+def test_decorator_query_in_decl_idx_matches_in_decl(build_decl_graph):
+    ctx = build_decl_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/app.py": (
+                "from cyclopts import App\n"
+                "cli = App()\n"
+                "@cli.command\n"
+                "def hello(): pass\n"
+                "@cli.command\n"
+                "def bye(): pass\n"
+            ),
+        }
+    )
+    (cli_idx,) = ctx.indices_where(fqname_prefix="pkg.app.cli", kind="variable")
+    cli_node = ctx.nodes_at([cli_idx])[0]
+    by_node = native.query(ctx).decorators().in_decl(cli_node).where_name("command").row_indices()
+    by_idx = native.query(ctx).decorators().in_decl_idx(cli_idx).where_name("command").row_indices()
+    assert len(by_node) == len(by_idx)
+    assert sorted(r.decorated_idx for r in by_node) == sorted(r.decorated_idx for r in by_idx)
+
+
+def test_decorator_query_in_decl_idx_requires_where_name(build_decl_graph):
+    ctx = build_decl_graph({"pkg/__init__.py": "", "pkg/a.py": "x = 1\n"})
+    (x_idx,) = ctx.indices_where(fqname_prefix="pkg.a.x", kind="variable")
+    with pytest.raises(ValueError, match="where_name"):
+        native.query(ctx).decorators().in_decl_idx(x_idx).row_indices()
+
+
+def test_decorator_query_in_decl_idx_out_of_range_raises(build_decl_graph):
+    ctx = build_decl_graph({"pkg/__init__.py": "", "pkg/a.py": "x = 1\n"})
+    n = len(ctx.nodes())
+    with pytest.raises(IndexError, match="out of range"):
+        native.query(ctx).decorators().in_decl_idx(n).where_name("command").row_indices()
