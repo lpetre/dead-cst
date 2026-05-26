@@ -44,7 +44,7 @@ class ClickPlugin(DecoratedDeclPlugin):
             .decorators()
             .where_module(self.decorator_module)
             .where_name(list(self.decorator_names))
-            .row_indices()
+            .collect()
         )
         if dec_rows:
             dec_attrs = ctx.node_attrs([r.decorated_idx for r in dec_rows])
@@ -56,7 +56,7 @@ class ClickPlugin(DecoratedDeclPlugin):
             .constructions()
             .where_module(self.decorator_module)
             .where_name(list(self.constructor_names))
-            .row_indices()
+            .collect()
         )
         if cons_rows:
             cons_attrs = ctx.node_attrs([r.var_idx for r in cons_rows])
@@ -67,7 +67,7 @@ class ClickPlugin(DecoratedDeclPlugin):
             native.query(ctx)
             .decorators()
             .where_owner_attr(list(_REGISTRATION_DECORATORS))
-            .row_indices()
+            .collect()
         )
         # Batched fqname fetch for every handler — used both in the
         # fixpoint dispatch and for the subgroup_links key.
@@ -84,7 +84,7 @@ class ClickPlugin(DecoratedDeclPlugin):
             for h in native.query(ctx)
             .decorators()
             .where_owner_attr(list(_SUBGROUP_DECORATOR))
-            .row_indices()
+            .collect()
         }
 
         # Dedup by (owner_idx, handler_idx) — idx is globally unique.

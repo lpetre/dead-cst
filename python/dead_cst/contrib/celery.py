@@ -43,7 +43,7 @@ class CeleryPlugin(DispatchAppPlugin):
             .decorators()
             .where_module("celery")
             .where_name(list(_SHARED_TASK_NAMES))
-            .row_indices()
+            .collect()
         ):
             by_path.setdefault(ref.path, []).append(ref.decorated_idx)
         for path, target_idxs in by_path.items():

@@ -80,11 +80,7 @@ class PytestPlugin(Plugin):
         # fixture.
         fixtures_by_path: dict[str, list[int]] = {}
         for ref in (
-            native.query(ctx)
-            .decorators()
-            .where_module("pytest")
-            .where_name("fixture")
-            .row_indices()
+            native.query(ctx).decorators().where_module("pytest").where_name("fixture").collect()
         ):
             fixtures_by_path.setdefault(ref.path, []).append(ref.decorated_idx)
 

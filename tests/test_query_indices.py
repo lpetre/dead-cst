@@ -647,47 +647,43 @@ def test_node_paths_bounds_check(build_decl_graph):
 
 
 # ---------------------------------------------------------------------------
-# *Query.row_indices — index-form row terminals
+# Ref-query .collect() terminals — idx-shape contract
 # ---------------------------------------------------------------------------
 
 
-def test_decorator_query_row_indices_matches_collect(build_decl_graph):
+def test_decorator_query_collect_returns_idx_rows(build_decl_graph):
     ctx = build_decl_graph(
         {
             "pkg/__init__.py": "",
             "pkg/svc.py": ("import functools\n@functools.lru_cache\ndef cached(): pass\n"),
         }
     )
-    q = native.query(ctx).decorators().where_module("functools").where_name("lru_cache")
-    refs = q.collect()
-    rows = q.row_indices()
-    assert len(refs) == len(rows) == 1
-    all_nodes = ctx.nodes()
-    for ref, row in zip(refs, rows, strict=True):
-        assert all_nodes[row.decorated_idx].fqname == ref.decorated.fqname
-        assert row.decorator_name == ref.decorator_name
-        assert row.decorator_owner == ref.decorator_owner
-        assert row.decorator_via == ref.decorator_via
+    rows = (
+        native.query(ctx).decorators().where_module("functools").where_name("lru_cache").collect()
+    )
+    assert len(rows) == 1
+    [row] = rows
+    assert isinstance(row, native.DecoratorIdxRef)
+    assert ctx.nodes()[row.decorated_idx].fqname == "pkg.svc.cached"
+    assert row.path.endswith("svc.py")
 
 
-def test_construction_query_row_indices_matches_collect(build_decl_graph):
+def test_construction_query_collect_returns_idx_rows(build_decl_graph):
     ctx = build_decl_graph(
         {
             "pkg/__init__.py": "",
             "pkg/app.py": "import flask\napp = flask.Flask(__name__)\n",
         }
     )
-    q = native.query(ctx).constructions().where_module("flask").where_name("Flask")
-    refs = q.collect()
-    rows = q.row_indices()
-    assert len(refs) == len(rows) == 1
-    all_nodes = ctx.nodes()
-    for ref, row in zip(refs, rows, strict=True):
-        assert all_nodes[row.var_idx].fqname == ref.var.fqname
-        assert row.class_name == ref.class_name
+    rows = native.query(ctx).constructions().where_module("flask").where_name("Flask").collect()
+    assert len(rows) == 1
+    [row] = rows
+    assert isinstance(row, native.ConstructionIdxRef)
+    assert ctx.nodes()[row.var_idx].fqname == "pkg.app.app"
+    assert row.class_name == "Flask"
 
 
-def test_call_query_row_indices_matches_collect(build_decl_graph):
+def test_call_query_collect_returns_idx_rows(build_decl_graph):
     ctx = build_decl_graph(
         {
             "pkg/__init__.py": "",
@@ -696,38 +692,34 @@ def test_call_query_row_indices_matches_collect(build_decl_graph):
             ),
         }
     )
-    q = (
+    rows = (
         native.query(ctx)
         .calls()
         .where_owner("app.config")
         .where_attr("from_object")
         .string_arg_at(0)
+        .collect()
     )
-    refs = q.collect()
-    rows = q.row_indices()
-    assert len(refs) == len(rows)
-    if refs:
-        all_nodes = ctx.nodes()
-        for ref, row in zip(refs, rows, strict=True):
-            assert all_nodes[row.owner_idx].fqname == ref.owner.fqname
-            assert row.string_arg == ref.string_arg
+    if rows:
+        [row] = rows
+        assert isinstance(row, native.CallIdxRef)
+        assert ctx.nodes()[row.owner_idx].fqname == "pkg.app"
+        assert row.string_arg == "settings"
 
 
-def test_factory_query_row_indices_matches_collect(build_decl_graph):
+def test_factory_query_collect_returns_idx_rows(build_decl_graph):
     ctx = build_decl_graph(
         {
             "pkg/__init__.py": "",
             "pkg/factory.py": ("import flask\ndef make_app():\n    return flask.Flask(__name__)\n"),
         }
     )
-    q = native.query(ctx).factories().of_module("flask").where_name("Flask")
-    refs = q.collect()
-    rows = q.row_indices()
-    assert len(refs) == len(rows)
-    all_nodes = ctx.nodes()
-    for ref, row in zip(refs, rows, strict=True):
-        assert all_nodes[row.decl_idx].fqname == ref.decl.fqname
-        assert row.kinds == ref.kinds
+    rows = native.query(ctx).factories().of_module("flask").where_name("Flask").collect()
+    assert len(rows) == 1
+    [row] = rows
+    assert isinstance(row, native.FactoryIdxRef)
+    assert ctx.nodes()[row.decl_idx].fqname == "pkg.factory.make_app"
+    assert "Flask" in row.kinds
 
 
 # ---------------------------------------------------------------------------
@@ -993,8 +985,8 @@ def test_decorator_query_in_decl_idx_matches_in_decl(build_decl_graph):
     )
     (cli_idx,) = ctx.indices_where(fqname_prefix="pkg.app.cli", kind="variable")
     cli_node = ctx.nodes_at([cli_idx])[0]
-    by_node = native.query(ctx).decorators().in_decl(cli_node).where_name("command").row_indices()
-    by_idx = native.query(ctx).decorators().in_decl_idx(cli_idx).where_name("command").row_indices()
+    by_node = native.query(ctx).decorators().in_decl(cli_node).where_name("command").collect()
+    by_idx = native.query(ctx).decorators().in_decl_idx(cli_idx).where_name("command").collect()
     assert len(by_node) == len(by_idx)
     assert sorted(r.decorated_idx for r in by_node) == sorted(r.decorated_idx for r in by_idx)
 
@@ -1003,14 +995,14 @@ def test_decorator_query_in_decl_idx_requires_where_name(build_decl_graph):
     ctx = build_decl_graph({"pkg/__init__.py": "", "pkg/a.py": "x = 1\n"})
     (x_idx,) = ctx.indices_where(fqname_prefix="pkg.a.x", kind="variable")
     with pytest.raises(ValueError, match="where_name"):
-        native.query(ctx).decorators().in_decl_idx(x_idx).row_indices()
+        native.query(ctx).decorators().in_decl_idx(x_idx).collect()
 
 
 def test_decorator_query_in_decl_idx_out_of_range_raises(build_decl_graph):
     ctx = build_decl_graph({"pkg/__init__.py": "", "pkg/a.py": "x = 1\n"})
     n = len(ctx.nodes())
     with pytest.raises(IndexError, match="out of range"):
-        native.query(ctx).decorators().in_decl_idx(n).where_name("command").row_indices()
+        native.query(ctx).decorators().in_decl_idx(n).where_name("command").collect()
 
 
 # ---------------------------------------------------------------------------

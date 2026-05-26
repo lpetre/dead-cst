@@ -1059,9 +1059,9 @@ pub(crate) fn nth_positional_string(
 ///
 /// ``Unknown`` is reported when the expression is neither a recognized
 /// literal nor a name/attribute that resolves through the file's
-/// imports to a project decl. It surfaces to Python as ``None`` —
-/// callers who care about the difference between "literal None" and
-/// "unresolvable" should also inspect the original source.
+/// imports to a project decl. Python-side it surfaces as
+/// :class:`ArgOpaque` so callers can distinguish "literal ``None``"
+/// from "unresolvable expression".
 #[derive(Clone, Debug)]
 pub(crate) enum ArgValue {
     None,
@@ -1069,6 +1069,7 @@ pub(crate) enum ArgValue {
     Int(i64),
     Float(f64),
     Str(String),
+    Bytes(Vec<u8>),
     List(Vec<ArgValue>),
     Tuple(Vec<ArgValue>),
     DeclRef(usize),
@@ -1079,6 +1080,154 @@ pub(crate) enum ArgValue {
 pub(crate) struct CallArgs {
     pub(crate) args: Vec<ArgValue>,
     pub(crate) kwargs: FxHashMap<String, ArgValue>,
+}
+
+// ---------------------------------------------------------------------------
+// Python-side discriminated union for ``args`` / ``kwargs`` entries.
+//
+// The rust :enum:`ArgValue` carries everything needed; the Python
+// surface flattens it into a three-way tagged union — :class:`ArgLiteral`
+// (any Python literal), :class:`ArgNodeRef` (resolved decl, carrying
+// just the positional index), :class:`ArgOpaque` (non-literal /
+// non-resolvable). Plugin code uses ``match arg:`` or
+// ``isinstance(arg, ArgLiteral)`` to dispatch.
+//
+// The pyclasses are materialised lazily by the per-ref ``args`` /
+// ``kwargs`` getters — see :class:`DecoratorIdxRef` etc. Plugins that
+// never read ``args`` / ``kwargs`` pay zero Python allocation cost.
+// ---------------------------------------------------------------------------
+
+/// A literal arg / kwarg value. ``value`` is a native Python primitive:
+/// ``str`` / ``int`` / ``float`` / ``bool`` / ``None`` / ``bytes`` /
+/// ``list`` / ``tuple``. Nested collections are recursively native too.
+#[pyclass(frozen, get_all)]
+pub(crate) struct ArgLiteral {
+    pub(crate) value: Py<PyAny>,
+}
+
+/// A decl reference inside an arg / kwarg position — e.g. ``func(some_class)``
+/// where ``some_class`` resolves through the file's imports to a project
+/// decl. ``idx`` is a positional index into ``ctx.nodes()``.
+#[pyclass(frozen, get_all)]
+pub(crate) struct ArgNodeRef {
+    pub(crate) idx: usize,
+}
+
+/// An arg / kwarg expression that's neither a recognised literal nor a
+/// statically-resolvable decl reference (e.g. a function call result,
+/// a complex expression, a name we can't pin to a decl). Carries no
+/// payload — callers who need the source text should fall back to ty's
+/// parsed module.
+#[pyclass(frozen)]
+pub(crate) struct ArgOpaque;
+
+#[pymethods]
+impl ArgOpaque {
+    #[new]
+    fn new() -> Self {
+        Self
+    }
+
+    fn __repr__(&self) -> &'static str {
+        "ArgOpaque()"
+    }
+}
+
+/// Materialize a single :enum:`ArgValue` into the Python discriminated
+/// union (``ArgLiteral`` / ``ArgNodeRef`` / ``ArgOpaque``). Allocates
+/// one pyclass per call; the lazy ``args`` / ``kwargs`` getters on the
+/// ref types call this per-entry on demand.
+pub(crate) fn arg_value_to_py_arg(py: Python<'_>, v: &ArgValue) -> PyResult<Py<PyAny>> {
+    let py_obj: Py<PyAny> = match v {
+        ArgValue::None => Py::new(py, ArgLiteral { value: py.None() })?.into_py(py),
+        ArgValue::Bool(b) => Py::new(
+            py,
+            ArgLiteral {
+                value: b.into_py(py),
+            },
+        )?
+        .into_py(py),
+        ArgValue::Int(i) => Py::new(
+            py,
+            ArgLiteral {
+                value: i.into_py(py),
+            },
+        )?
+        .into_py(py),
+        ArgValue::Float(f) => Py::new(
+            py,
+            ArgLiteral {
+                value: f.into_py(py),
+            },
+        )?
+        .into_py(py),
+        ArgValue::Str(s) => Py::new(
+            py,
+            ArgLiteral {
+                value: s.into_py(py),
+            },
+        )?
+        .into_py(py),
+        ArgValue::Bytes(b) => Py::new(
+            py,
+            ArgLiteral {
+                value: pyo3::types::PyBytes::new_bound(py, b).into_py(py),
+            },
+        )?
+        .into_py(py),
+        // ``List`` / ``Tuple`` recurse through ``arg_value_to_py_arg``
+        // so nested ``DeclRef`` / ``Unknown`` entries surface as
+        // ``ArgNodeRef`` / ``ArgOpaque`` inside the literal container.
+        // The outer ``ArgLiteral.value`` is therefore a Python
+        // ``list`` / ``tuple`` whose elements are themselves
+        // ``ArgLiteral | ArgNodeRef | ArgOpaque``.
+        ArgValue::List(items) => {
+            let py_items: PyResult<Vec<Py<PyAny>>> =
+                items.iter().map(|v| arg_value_to_py_arg(py, v)).collect();
+            Py::new(
+                py,
+                ArgLiteral {
+                    value: pyo3::types::PyList::new_bound(py, py_items?).into_py(py),
+                },
+            )?
+            .into_py(py)
+        }
+        ArgValue::Tuple(items) => {
+            let py_items: PyResult<Vec<Py<PyAny>>> =
+                items.iter().map(|v| arg_value_to_py_arg(py, v)).collect();
+            Py::new(
+                py,
+                ArgLiteral {
+                    value: pyo3::types::PyTuple::new_bound(py, py_items?).into_py(py),
+                },
+            )?
+            .into_py(py)
+        }
+        ArgValue::DeclRef(idx) => Py::new(py, ArgNodeRef { idx: *idx })?.into_py(py),
+        ArgValue::Unknown => Py::new(py, ArgOpaque)?.into_py(py),
+    };
+    Ok(py_obj)
+}
+
+/// Materialize a ``Vec<ArgValue>`` into a Python ``list[ArgLiteral |
+/// ArgNodeRef | ArgOpaque]``. Used by per-ref ``args`` getters.
+pub(crate) fn arg_values_to_py_list(py: Python<'_>, values: &[ArgValue]) -> PyResult<Py<PyAny>> {
+    let items: PyResult<Vec<Py<PyAny>>> =
+        values.iter().map(|v| arg_value_to_py_arg(py, v)).collect();
+    Ok(pyo3::types::PyList::new_bound(py, items?).into_py(py))
+}
+
+/// Materialize a ``FxHashMap<String, ArgValue>`` into a Python
+/// ``dict[str, ArgLiteral | ArgNodeRef | ArgOpaque]``.
+pub(crate) fn arg_kwargs_to_py_dict(
+    py: Python<'_>,
+    kwargs: &FxHashMap<String, ArgValue>,
+) -> PyResult<Py<PyAny>> {
+    let out = pyo3::types::PyDict::new_bound(py);
+    for (k, v) in kwargs {
+        out.set_item(k, arg_value_to_py_arg(py, v)?)?;
+    }
+    Ok(out.into_py(py))
 }
 
 /// Resolve a dotted Name / Attribute chain to a project decl index
@@ -1115,6 +1264,7 @@ pub(crate) fn extract_arg_value(
         Expr::NoneLiteral(_) => ArgValue::None,
         Expr::BooleanLiteral(b) => ArgValue::Bool(b.value),
         Expr::StringLiteral(s) => ArgValue::Str(s.value.to_str().to_string()),
+        Expr::BytesLiteral(b) => ArgValue::Bytes(b.value.bytes().collect()),
         Expr::NumberLiteral(n) => match &n.value {
             ruff_python_ast::Number::Int(i) => match i.as_i64() {
                 Some(v) => ArgValue::Int(v),
@@ -1186,59 +1336,6 @@ pub(crate) fn extract_call_args_kwargs(
     CallArgs { args, kwargs }
 }
 
-/// Materialize one ``ArgValue`` into a Python object. ``DeclRef``
-/// resolves through the build's ``Py<SymbolNode>`` pool.
-pub(crate) fn arg_value_to_py(py: Python<'_>, v: &ArgValue, nodes: &[Py<SymbolNode>]) -> PyObject {
-    match v {
-        ArgValue::None => py.None(),
-        ArgValue::Bool(b) => b.into_py(py),
-        ArgValue::Int(i) => i.into_py(py),
-        ArgValue::Float(f) => f.into_py(py),
-        ArgValue::Str(s) => s.into_py(py),
-        ArgValue::List(items) => {
-            let py_items: Vec<PyObject> = items
-                .iter()
-                .map(|v| arg_value_to_py(py, v, nodes))
-                .collect();
-            pyo3::types::PyList::new_bound(py, py_items).into_py(py)
-        }
-        ArgValue::Tuple(items) => {
-            let py_items: Vec<PyObject> = items
-                .iter()
-                .map(|v| arg_value_to_py(py, v, nodes))
-                .collect();
-            pyo3::types::PyTuple::new_bound(py, py_items).into_py(py)
-        }
-        ArgValue::DeclRef(idx) => match nodes.get(*idx) {
-            Some(node) => node.clone_ref(py).into_py(py),
-            None => py.None(),
-        },
-        ArgValue::Unknown => py.None(),
-    }
-}
-
-/// Convert a list of ``ArgValue`` to a `Vec<Py<PyAny>>` ready for a
-/// frozen pyclass field.
-pub(crate) fn args_to_py_vec(
-    py: Python<'_>,
-    args: &[ArgValue],
-    nodes: &[Py<SymbolNode>],
-) -> Vec<Py<PyAny>> {
-    args.iter().map(|v| arg_value_to_py(py, v, nodes)).collect()
-}
-
-/// Convert a kwargs map to ``FxHashMap<String, Py<PyAny>>``.
-pub(crate) fn kwargs_to_py_map(
-    py: Python<'_>,
-    kwargs: &FxHashMap<String, ArgValue>,
-    nodes: &[Py<SymbolNode>],
-) -> FxHashMap<String, Py<PyAny>> {
-    kwargs
-        .iter()
-        .map(|(k, v)| (k.clone(), arg_value_to_py(py, v, nodes)))
-        .collect()
-}
-
 /// A user-supplied kwarg matcher. Only literal-value equality is
 /// supported; ``SymbolNode``-valued matchers are rejected at
 /// ``where_kwarg`` call time.
@@ -1259,6 +1356,7 @@ pub(crate) fn arg_value_eq_literal(a: &ArgValue, b: &ArgValue) -> bool {
         (ArgValue::Int(x), ArgValue::Float(y)) => (*x as f64) == *y,
         (ArgValue::Float(x), ArgValue::Int(y)) => *x == (*y as f64),
         (ArgValue::Str(x), ArgValue::Str(y)) => x == y,
+        (ArgValue::Bytes(x), ArgValue::Bytes(y)) => x == y,
         (ArgValue::List(xs), ArgValue::List(ys))
         | (ArgValue::Tuple(xs), ArgValue::Tuple(ys))
         | (ArgValue::List(xs), ArgValue::Tuple(ys))
@@ -1314,6 +1412,9 @@ pub(crate) fn py_to_arg_value(value: &Bound<'_, PyAny>) -> PyResult<ArgValue> {
     if let Ok(s) = value.extract::<String>() {
         return Ok(ArgValue::Str(s));
     }
+    if let Ok(b) = value.downcast::<pyo3::types::PyBytes>() {
+        return Ok(ArgValue::Bytes(b.as_bytes().to_vec()));
+    }
     if let Ok(list) = value.downcast::<pyo3::types::PyList>() {
         let mut out = Vec::with_capacity(list.len());
         for item in list.iter() {
@@ -1329,7 +1430,8 @@ pub(crate) fn py_to_arg_value(value: &Bound<'_, PyAny>) -> PyResult<ArgValue> {
         return Ok(ArgValue::Tuple(out));
     }
     Err(PyValueError::new_err(format!(
-        "where_kwarg value must be a literal (None / bool / int / float / str / list / tuple); got {}",
+        "where_kwarg value must be a literal \
+         (None / bool / int / float / str / bytes / list / tuple); got {}",
         value.get_type().name()?,
     )))
 }

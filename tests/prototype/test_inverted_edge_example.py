@@ -65,9 +65,9 @@ class HandlerByKwargPlugin:
             if ref.decorator_owner != self.decorator_owner:
                 continue
             target = ref.kwargs.get(self.kwarg_name)
-            if target is None or not hasattr(target, "fqname"):
+            if not isinstance(target, native.ArgNodeRef):
                 continue
-            yield native.AddEdge(target, ref.decorated)
+            yield native.AddEdgeByIdx(target.idx, ref.decorated_idx)
 
 
 def _edges(graph: "native.NativeGraph") -> set[str]:

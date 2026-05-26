@@ -78,7 +78,7 @@ class DecoratedDeclPlugin(Plugin):
             .decorators()
             .where_module(self.decorator_module)
             .where_name(names)
-            .row_indices()
+            .collect()
         ):
             if in_scope(dec_row.path):
                 seeds_by_path.setdefault(dec_row.path, []).append(dec_row.decorated_idx)
@@ -87,7 +87,7 @@ class DecoratedDeclPlugin(Plugin):
             .constructions()
             .where_module(self.decorator_module)
             .where_name(names)
-            .row_indices()
+            .collect()
         ):
             if in_scope(cons_row.path):
                 seeds_by_path.setdefault(cons_row.path, []).append(cons_row.var_idx)
@@ -386,7 +386,7 @@ def _fetch_direct(
             .constructions()
             .where_module(module)
             .where_name(sorted(names))
-            .row_indices()
+            .collect()
         ):
             if ref.var_idx in direct_seen:
                 continue
@@ -404,7 +404,7 @@ def _fetch_factory_decls(
     factory_decls: list[tuple[native.FactoryIdxRef, str]] = []
     for module, names in module_to_names.items():
         for fref in (
-            native.query(ctx).factories().of_module(module).where_name(sorted(names)).row_indices()
+            native.query(ctx).factories().of_module(module).where_name(sorted(names)).collect()
         ):
             for kind in fref.kinds:
                 key = (fref.decl_idx, kind)
@@ -419,7 +419,7 @@ def _fetch_handlers(
     ctx: native.ProjectContext, registration_decorators: frozenset[str]
 ) -> list[native.DecoratorIdxRef]:
     return list(
-        native.query(ctx).decorators().where_owner_attr(list(registration_decorators)).row_indices()
+        native.query(ctx).decorators().where_owner_attr(list(registration_decorators)).collect()
     )
 
 
@@ -500,7 +500,7 @@ def _gather_batched(
             .constructions()
             .where_module(module)
             .where_name(sorted(all_names))
-            .row_indices()
+            .collect()
         ):
             for i in live_indices:
                 if ref.class_name not in module_to_names_per_spec[i].get(module, ()):
@@ -526,7 +526,7 @@ def _gather_batched(
                 .factories()
                 .of_module(module)
                 .where_name(sorted(all_names))
-                .row_indices()
+                .collect()
             ):
                 for kind in fref.kinds:
                     for i in seed_indices:

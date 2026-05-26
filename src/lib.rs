@@ -46,13 +46,14 @@ use crate::builder::{
     AddEdge, AddEdgeByIdx, AddEntrypoint, AddEntrypointByIdx, AddNode, AddNodeByIdx, CollectedOps,
 };
 use crate::graph::{EdgeFlags, Import, NativeGraph, NodeFlags, SymbolNode};
+use crate::helpers::{ArgLiteral, ArgNodeRef, ArgOpaque};
 use crate::io::{read_graph, write_graph, GraphMetadata};
 use crate::progress::ProgressHandle;
 use crate::project::{Project, ProjectContext};
 use crate::query::{
-    CallIdxRef, CallQuery, CallRef, ClassQuery, ConstructionIdxRef, ConstructionQuery,
-    ConstructionRef, DeclQuery, DecoratorIdxRef, DecoratorQuery, DecoratorRef, EdgeQuery, EdgeRef,
-    FactoryIdxRef, FactoryQuery, FactoryRef, ImportQuery, QueryBuilder, SubclassQuery,
+    CallIdxRef, CallQuery, ClassQuery, ConstructionIdxRef, ConstructionQuery, DeclQuery,
+    DecoratorIdxRef, DecoratorQuery, EdgeQuery, EdgeRef, FactoryIdxRef, FactoryQuery, ImportQuery,
+    QueryBuilder, SubclassQuery,
 };
 
 // ---------------------------------------------------------------------------
@@ -84,12 +85,12 @@ fn dead_cst_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<CollectedOps>()?;
     m.add_class::<NodeFlags>()?;
     m.add_class::<EdgeFlags>()?;
-    m.add_class::<DecoratorRef>()?;
     m.add_class::<DecoratorIdxRef>()?;
-    m.add_class::<ConstructionRef>()?;
     m.add_class::<ConstructionIdxRef>()?;
-    m.add_class::<CallRef>()?;
     m.add_class::<CallIdxRef>()?;
+    m.add_class::<ArgLiteral>()?;
+    m.add_class::<ArgNodeRef>()?;
+    m.add_class::<ArgOpaque>()?;
     m.add_class::<QueryBuilder>()?;
     m.add_class::<DecoratorQuery>()?;
     m.add_class::<ConstructionQuery>()?;
@@ -98,7 +99,6 @@ fn dead_cst_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ImportQuery>()?;
     m.add_class::<ClassQuery>()?;
     m.add_class::<FactoryQuery>()?;
-    m.add_class::<FactoryRef>()?;
     m.add_class::<FactoryIdxRef>()?;
     m.add_class::<EdgeQuery>()?;
     m.add_class::<EdgeRef>()?;

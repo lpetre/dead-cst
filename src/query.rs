@@ -1,170 +1,150 @@
 //! The chainable query DSL exposed to Python via `ProjectContext.query()`.
-//! Result types (`DecoratorRef`/`ConstructionRef`/`CallRef`/`FactoryRef`),
-//! the `QueryBuilder` entry point, and the per-stream `Query` builders.
+//! Result types (`DecoratorIdxRef` / `ConstructionIdxRef` / `CallIdxRef`
+//! / `FactoryIdxRef` / `EdgeRef`), the `QueryBuilder` entry point, and
+//! the per-stream `Query` builders.
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::PyClass;
 use ruff_db::files::File;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashSet;
 use ty_project::Db as ProjectDb;
 
 use crate::graph::SymbolNode;
 use crate::helpers::{
-    args_to_py_vec, call_args_match_kwargs, file_path_string, kwarg_matcher_from_py,
-    kwargs_to_py_map, KwargMatcher,
+    call_args_match_kwargs, file_path_string, kwarg_matcher_from_py, KwargMatcher,
 };
 use crate::project::ProjectContext;
 
+// ---------------------------------------------------------------------------
+// Result row types
+//
+// One pyclass per query stream; all idx-based. Each carries a
+// positional index into ``ctx.nodes()`` for the row's "node identity"
+// field (``decorated_idx`` / ``var_idx`` / ``owner_idx`` / ``decl_idx``),
+// the row's owning ``path`` as a cheap bucket key, and any
+// query-shape-specific metadata strings (``decorator_owner`` etc.).
+//
+// ``DecoratorIdxRef`` / ``ConstructionIdxRef`` / ``CallIdxRef`` also
+// expose ``args`` / ``kwargs`` lazy getters that walk the row's
+// rust-side :struct:`CallArgs` and produce a Python ``list`` / ``dict``
+// of :class:`ArgLiteral` / :class:`ArgNodeRef` / :class:`ArgOpaque`.
+// The walk runs on every access — plugins that never read args/kwargs
+// pay zero Python allocation cost; plugins that read them pay only
+// for what they touch.
+// ---------------------------------------------------------------------------
+
 /// One decorator application on a top-level function or class.
 ///
-/// Field nullability follows the query shape that produced the ref:
-/// * ``where_module + where_name`` populates ``decorated`` only.
+/// Field nullability follows the query shape that produced the row:
+/// * ``where_module + where_name`` populates ``decorated_idx`` only.
 /// * ``where_owner_attr`` fills ``decorator_owner`` (the textual
 ///   ``@<owner>.<attr>`` prefix).
 /// * ``where_owner_attr_via`` additionally fills ``decorator_via``
 ///   with the middle attribute name.
-#[pyclass(frozen, get_all)]
-pub(crate) struct DecoratorRef {
-    pub(crate) decorated: Py<SymbolNode>,
+#[pyclass]
+pub(crate) struct DecoratorIdxRef {
+    #[pyo3(get)]
+    pub(crate) decorated_idx: usize,
+    #[pyo3(get)]
+    pub(crate) path: String,
+    #[pyo3(get)]
     pub(crate) decorator_name: Option<String>,
+    #[pyo3(get)]
     pub(crate) decorator_owner: Option<String>,
+    #[pyo3(get)]
     pub(crate) decorator_via: Option<String>,
-    /// Positional arguments of the decorator's ``Call`` form. Empty
-    /// for bare attribute decorators (``@app.route`` without ``()``).
-    /// Each entry is a Python literal, a :class:`SymbolNode` (when the
-    /// expression resolves to a project decl), or ``None``.
-    pub(crate) args: Vec<Py<PyAny>>,
-    /// Keyword arguments of the decorator's ``Call`` form. Same value
-    /// shape as ``args``.
-    pub(crate) kwargs: FxHashMap<String, Py<PyAny>>,
+    pub(crate) call_args: crate::helpers::CallArgs,
 }
 
 #[pymethods]
-impl DecoratorRef {
-    /// File path of the decorated decl. Read off ``decorated.path`` —
-    /// surfaced as a top-level attribute for ergonomics in path-keyed
-    /// dispatch.
+impl DecoratorIdxRef {
+    /// Positional arguments of the decorator's ``Call`` form, lazily
+    /// materialised on access. Empty for bare attribute decorators
+    /// (``@app.route`` without ``()``). Each entry is one of
+    /// :class:`ArgLiteral`, :class:`ArgNodeRef`, or :class:`ArgOpaque`.
     #[getter]
-    fn path(&self, py: Python<'_>) -> String {
-        self.decorated.borrow(py).path.clone()
+    fn args(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        crate::helpers::arg_values_to_py_list(py, &self.call_args.args)
+    }
+
+    /// Keyword arguments of the decorator's ``Call`` form, lazily
+    /// materialised on access. Same value shape as :meth:`args`.
+    #[getter]
+    fn kwargs(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        crate::helpers::arg_kwargs_to_py_dict(py, &self.call_args.kwargs)
     }
 }
 
 /// One ``<var> = <Ctor>(...)`` construction at module scope.
 ///
-/// ``class_name`` is the upstream constructor's bare name
-/// (``"Flask"`` even when imported as ``F``).
-///
-/// ``args`` and ``kwargs`` carry the construction's full positional /
-/// keyword argument shape (same Python-side value shape as
-/// :class:`CallRef`).
-#[pyclass(frozen, get_all)]
-pub(crate) struct ConstructionRef {
-    pub(crate) var: Py<SymbolNode>,
+/// ``class_name`` is the upstream constructor's bare name (``"Flask"``
+/// even when imported as ``F``).
+#[pyclass]
+pub(crate) struct ConstructionIdxRef {
+    #[pyo3(get)]
+    pub(crate) var_idx: usize,
+    #[pyo3(get)]
+    pub(crate) path: String,
+    #[pyo3(get)]
     pub(crate) class_name: String,
-    /// Positional arguments of the constructor call. Each entry is a
-    /// Python literal, a :class:`SymbolNode` (when the expression
-    /// resolves to a project decl), or ``None``.
-    pub(crate) args: Vec<Py<PyAny>>,
-    /// Keyword arguments of the constructor call. Same value shape as
-    /// ``args``.
-    pub(crate) kwargs: FxHashMap<String, Py<PyAny>>,
+    pub(crate) call_args: crate::helpers::CallArgs,
 }
 
 #[pymethods]
-impl ConstructionRef {
+impl ConstructionIdxRef {
+    /// Positional arguments of the constructor call, lazily
+    /// materialised on access. Each entry is one of
+    /// :class:`ArgLiteral`, :class:`ArgNodeRef`, or :class:`ArgOpaque`.
     #[getter]
-    fn path(&self, py: Python<'_>) -> String {
-        self.var.borrow(py).path.clone()
+    fn args(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        crate::helpers::arg_values_to_py_list(py, &self.call_args.args)
+    }
+
+    /// Keyword arguments of the constructor call, lazily materialised
+    /// on access. Same value shape as :meth:`args`.
+    #[getter]
+    fn kwargs(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        crate::helpers::arg_kwargs_to_py_dict(py, &self.call_args.kwargs)
     }
 }
 
 /// One matched call site. ``string_arg`` is the literal at the
 /// positional index passed to :meth:`CallQuery.string_arg_at`.
-#[pyclass(frozen, get_all)]
-pub(crate) struct CallRef {
-    pub(crate) owner: Py<SymbolNode>,
+#[pyclass]
+pub(crate) struct CallIdxRef {
+    #[pyo3(get)]
+    pub(crate) owner_idx: usize,
+    #[pyo3(get)]
+    pub(crate) path: String,
+    #[pyo3(get)]
     pub(crate) string_arg: String,
-    /// Positional arguments of the matched call, one entry per source
-    /// positional arg. Each entry is a Python literal, a
-    /// :class:`SymbolNode` (when the expression resolves to a project
-    /// decl), or ``None``.
-    pub(crate) args: Vec<Py<PyAny>>,
-    /// Keyword arguments of the matched call. Same value shape as
-    /// ``args``.
-    pub(crate) kwargs: FxHashMap<String, Py<PyAny>>,
+    pub(crate) call_args: crate::helpers::CallArgs,
 }
 
 #[pymethods]
-impl CallRef {
+impl CallIdxRef {
+    /// Positional arguments of the matched call, lazily materialised
+    /// on access. One entry per source positional arg; each is one of
+    /// :class:`ArgLiteral`, :class:`ArgNodeRef`, or :class:`ArgOpaque`.
     #[getter]
-    fn path(&self, py: Python<'_>) -> String {
-        self.owner.borrow(py).path.clone()
+    fn args(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        crate::helpers::arg_values_to_py_list(py, &self.call_args.args)
+    }
+
+    /// Keyword arguments of the matched call, lazily materialised on
+    /// access. Same value shape as :meth:`args`.
+    #[getter]
+    fn kwargs(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        crate::helpers::arg_kwargs_to_py_dict(py, &self.call_args.kwargs)
     }
 }
 
-// ---------------------------------------------------------------------------
-// Index-form result rows
-//
-// Lean siblings of the ref types: same dispatch, but every
-// ``SymbolNode`` field is replaced with a positional index into
-// ``ctx.nodes()`` and the costly ``args`` / ``kwargs`` row payloads
-// are dropped — both because they're expensive to materialise and
-// because entries inside them can be ``SymbolNode`` references that
-// would re-introduce the GIL hops the idx surface is designed to
-// avoid. Plugins that need ``args`` / ``kwargs`` access fall back to
-// the node-form ``.collect()`` terminals; plugins that only need to
-// filter by kwarg keep using ``.where_kwarg(...)``, which operates
-// rust-side before row construction either way.
-//
-// Returned by the ``.row_indices()`` terminals on
-// :class:`DecoratorQuery` / :class:`ConstructionQuery` /
-// :class:`CallQuery` / :class:`FactoryQuery`. Pair with
-// :meth:`ProjectContext.node_attrs` (or :meth:`node_paths` when only
-// ``path`` is needed) to batch-fetch any node fields the plugin still
-// needs without per-row ``borrow`` ping-pong.
-// ---------------------------------------------------------------------------
-
-/// Index-form sibling of :class:`DecoratorRef`. Same metadata fields,
-/// minus ``args`` / ``kwargs``; ``decorated_idx`` indexes into
-/// ``ctx.nodes()``. ``path`` is preserved because plugins routinely
-/// bucket by path before any further query.
-#[pyclass(frozen, get_all)]
-pub(crate) struct DecoratorIdxRef {
-    pub(crate) decorated_idx: usize,
-    pub(crate) path: String,
-    pub(crate) decorator_name: Option<String>,
-    pub(crate) decorator_owner: Option<String>,
-    pub(crate) decorator_via: Option<String>,
-}
-
-/// Index-form sibling of :class:`ConstructionRef`. Same metadata
-/// fields, minus ``args`` / ``kwargs``; ``var_idx`` indexes into
-/// ``ctx.nodes()``. ``path`` is preserved as a cheap bucket key for
-/// plugins that fan out per file.
-#[pyclass(frozen, get_all)]
-pub(crate) struct ConstructionIdxRef {
-    pub(crate) var_idx: usize,
-    pub(crate) path: String,
-    pub(crate) class_name: String,
-}
-
-/// Index-form sibling of :class:`CallRef`. Same metadata fields,
-/// minus ``args`` / ``kwargs``; ``owner_idx`` indexes into
-/// ``ctx.nodes()``. ``path`` is the owning decl's path.
-#[pyclass(frozen, get_all)]
-pub(crate) struct CallIdxRef {
-    pub(crate) owner_idx: usize,
-    pub(crate) path: String,
-    pub(crate) string_arg: String,
-}
-
-/// Index-form sibling of :class:`FactoryRef`. ``decl_idx`` indexes
-/// into ``ctx.nodes()``; ``kinds`` is the same sorted set of matched
-/// constructor bare-names the node-returning terminal emits.
-/// ``path`` is preserved as a cheap bucket key for plugins that fan
-/// out per file.
+/// One factory-function / class hit from :class:`FactoryQuery`.
+/// ``decl_idx`` is the owning top-level decl's positional index into
+/// ``ctx.nodes()``; ``kinds`` is the sorted set of constructor
+/// bare-names matched inside its body. ``path`` is the decl's source
+/// file as a cheap bucket key for per-file fan-out.
 #[pyclass(frozen, get_all)]
 pub(crate) struct FactoryIdxRef {
     pub(crate) decl_idx: usize,
@@ -564,37 +544,43 @@ impl DecoratorQuery {
         Ok(slf)
     }
 
-    fn collect(&self, py: Python<'_>) -> PyResult<Vec<Py<DecoratorRef>>> {
+    /// Materialise every matched decorator row.
+    ///
+    /// Each row is a :class:`DecoratorIdxRef`: the ``decorated``
+    /// position is given as ``decorated_idx`` (a positional index into
+    /// ``ctx.nodes()``); ``path`` is the owning decl's file; the
+    /// query-shape-specific metadata strings (``decorator_owner`` etc.)
+    /// follow the predicate that produced the row; and ``args`` /
+    /// ``kwargs`` are lazy getters that walk the row's pre-extracted
+    /// :struct:`CallArgs` on access.
+    fn collect(&self, py: Python<'_>) -> PyResult<Vec<Py<DecoratorIdxRef>>> {
         let rows = self.decorator_rows(py)?;
         let ctx = self.ctx.borrow(py);
         let outputs = ctx.materialized("DecoratorQuery.collect")?;
         let nodes: &[Py<SymbolNode>] = &outputs.builder.nodes;
-        let mut refs: Vec<Py<DecoratorRef>> = Vec::with_capacity(rows.len());
+        let mut out: Vec<Py<DecoratorIdxRef>> = Vec::with_capacity(rows.len());
         for row in rows {
-            let args = args_to_py_vec(py, &row.call_args.args, nodes);
-            let kwargs = kwargs_to_py_map(py, &row.call_args.kwargs, nodes);
-            refs.push(Py::new(
+            let path = nodes[row.decorated_idx].borrow(py).path.clone();
+            out.push(Py::new(
                 py,
-                DecoratorRef {
-                    decorated: nodes[row.decorated_idx].clone_ref(py),
+                DecoratorIdxRef {
+                    decorated_idx: row.decorated_idx,
+                    path,
                     decorator_name: row.decorator_name,
                     decorator_owner: row.decorator_owner,
                     decorator_via: row.decorator_via,
-                    args,
-                    kwargs,
+                    call_args: row.call_args,
                 },
             )?);
         }
-        Ok(refs)
+        Ok(out)
     }
 }
 
 /// Idx-form intermediate produced by :meth:`DecoratorQuery::decorator_rows`.
-/// Carries the same metadata as :class:`DecoratorRef` minus the
-/// ``Py<SymbolNode>`` allocation — the node identity is just an index
-/// into ``ctx.nodes()``. ``call_args`` is kept so kwarg filtering and
-/// ``collect()``'s ``args`` / ``kwargs`` materialization can both share
-/// the same upstream.
+/// Carries the same metadata as :class:`DecoratorIdxRef` plus the
+/// ``call_args`` upstream that kwarg filtering and the per-ref
+/// ``args`` / ``kwargs`` getters both consume.
 struct DecoratorRowIdx {
     decorated_idx: usize,
     decorator_name: Option<String>,
@@ -604,10 +590,9 @@ struct DecoratorRowIdx {
 }
 
 impl DecoratorQuery {
-    /// Shared dispatch used by both terminals (:meth:`collect` and
-    /// :meth:`row_indices`). Stays in idx-space throughout so
-    /// ``row_indices`` can skip the ``Py<SymbolNode>`` and
-    /// ``args_to_py_vec`` allocations entirely.
+    /// Shared idx-space dispatch backing :meth:`collect`. Applies the
+    /// kwarg-matcher filter rust-side before row construction so the
+    /// terminal stays GIL-light.
     fn decorator_rows(&self, py: Python<'_>) -> PyResult<Vec<DecoratorRowIdx>> {
         let ctx = self.ctx.borrow(py);
         let path_regex = self.path_regex.as_deref();
@@ -728,38 +713,7 @@ impl DecoratorQuery {
     }
 }
 
-impl_query_methods!(with_first DecoratorQuery, DecoratorRef);
-
-#[pymethods]
-impl DecoratorQuery {
-    /// Index-form row terminal. Same dispatch as :meth:`collect`, but
-    /// each row carries ``decorated_idx`` (a positional index into
-    /// ``ctx.nodes()``) instead of a ``Py<SymbolNode>``, and the
-    /// ``args`` / ``kwargs`` row payloads are skipped. Pairs with
-    /// :meth:`ProjectContext.node_attrs` and :class:`AddEdgeByIdx` /
-    /// :class:`AddNodeByIdx` to stay GIL-light end-to-end.
-    fn row_indices(&self, py: Python<'_>) -> PyResult<Vec<Py<DecoratorIdxRef>>> {
-        let rows = self.decorator_rows(py)?;
-        let ctx = self.ctx.borrow(py);
-        let outputs = ctx.materialized("DecoratorQuery.row_indices")?;
-        let nodes: &[Py<SymbolNode>] = &outputs.builder.nodes;
-        let mut out: Vec<Py<DecoratorIdxRef>> = Vec::with_capacity(rows.len());
-        for row in rows {
-            let path = nodes[row.decorated_idx].borrow(py).path.clone();
-            out.push(Py::new(
-                py,
-                DecoratorIdxRef {
-                    decorated_idx: row.decorated_idx,
-                    path,
-                    decorator_name: row.decorator_name,
-                    decorator_owner: row.decorator_owner,
-                    decorator_via: row.decorator_via,
-                },
-            )?);
-        }
-        Ok(out)
-    }
-}
+impl_query_methods!(with_first DecoratorQuery, DecoratorIdxRef);
 
 /// Find module-scope ``<var> = <Ctor>(...)`` sites. Pick exactly one
 /// of ``where_module + where_name`` or
@@ -824,26 +778,31 @@ impl ConstructionQuery {
         slf
     }
 
-    fn collect(&self, py: Python<'_>) -> PyResult<Vec<Py<ConstructionRef>>> {
+    /// Materialise every matched construction row. Each row is a
+    /// :class:`ConstructionIdxRef`: ``var_idx`` is the construction's
+    /// positional index into ``ctx.nodes()``; ``path`` is the owning
+    /// file; ``class_name`` is the upstream constructor's bare name;
+    /// ``args`` / ``kwargs`` are lazy getters over the row's
+    /// pre-extracted :struct:`CallArgs`.
+    fn collect(&self, py: Python<'_>) -> PyResult<Vec<Py<ConstructionIdxRef>>> {
         let rows = self.construction_rows(py)?;
         let ctx = self.ctx.borrow(py);
         let outputs = ctx.materialized("ConstructionQuery.collect")?;
         let nodes: &[Py<SymbolNode>] = &outputs.builder.nodes;
-        let mut refs: Vec<Py<ConstructionRef>> = Vec::with_capacity(rows.len());
+        let mut out: Vec<Py<ConstructionIdxRef>> = Vec::with_capacity(rows.len());
         for row in rows {
-            let args = args_to_py_vec(py, &row.call_args.args, nodes);
-            let kwargs = kwargs_to_py_map(py, &row.call_args.kwargs, nodes);
-            refs.push(Py::new(
+            let path = nodes[row.var_idx].borrow(py).path.clone();
+            out.push(Py::new(
                 py,
-                ConstructionRef {
-                    var: nodes[row.var_idx].clone_ref(py),
+                ConstructionIdxRef {
+                    var_idx: row.var_idx,
+                    path,
                     class_name: row.class_name,
-                    args,
-                    kwargs,
+                    call_args: row.call_args,
                 },
             )?);
         }
-        Ok(refs)
+        Ok(out)
     }
 }
 
@@ -891,34 +850,7 @@ impl ConstructionQuery {
     }
 }
 
-impl_query_methods!(with_first ConstructionQuery, ConstructionRef);
-
-#[pymethods]
-impl ConstructionQuery {
-    /// Index-form row terminal. Same dispatch as :meth:`collect`, but
-    /// each row carries ``var_idx`` (a positional index into
-    /// ``ctx.nodes()``) instead of a ``Py<SymbolNode>``, and the
-    /// ``args`` / ``kwargs`` row payloads are skipped.
-    fn row_indices(&self, py: Python<'_>) -> PyResult<Vec<Py<ConstructionIdxRef>>> {
-        let rows = self.construction_rows(py)?;
-        let ctx = self.ctx.borrow(py);
-        let outputs = ctx.materialized("ConstructionQuery.row_indices")?;
-        let nodes: &[Py<SymbolNode>] = &outputs.builder.nodes;
-        let mut out: Vec<Py<ConstructionIdxRef>> = Vec::with_capacity(rows.len());
-        for row in rows {
-            let path = nodes[row.var_idx].borrow(py).path.clone();
-            out.push(Py::new(
-                py,
-                ConstructionIdxRef {
-                    var_idx: row.var_idx,
-                    path,
-                    class_name: row.class_name,
-                },
-            )?);
-        }
-        Ok(out)
-    }
-}
+impl_query_methods!(with_first ConstructionQuery, ConstructionIdxRef);
 
 /// Find call sites whose positional string-literal at the configured
 /// index is captured. :meth:`string_arg_at` is required. Pick one of:
@@ -1013,26 +945,31 @@ impl CallQuery {
         Ok(slf)
     }
 
-    fn collect(&self, py: Python<'_>) -> PyResult<Vec<Py<CallRef>>> {
+    /// Materialise every matched call row. Each row is a
+    /// :class:`CallIdxRef`: ``owner_idx`` is the owning decl's
+    /// positional index into ``ctx.nodes()``; ``path`` is the owning
+    /// file; ``string_arg`` is the literal at the configured
+    /// positional index; ``args`` / ``kwargs`` are lazy getters over
+    /// the row's pre-extracted :struct:`CallArgs`.
+    fn collect(&self, py: Python<'_>) -> PyResult<Vec<Py<CallIdxRef>>> {
         let rows = self.call_rows(py)?;
         let ctx = self.ctx.borrow(py);
         let outputs = ctx.materialized("CallQuery.collect")?;
         let nodes: &[Py<SymbolNode>] = &outputs.builder.nodes;
-        let mut refs: Vec<Py<CallRef>> = Vec::with_capacity(rows.len());
+        let mut out: Vec<Py<CallIdxRef>> = Vec::with_capacity(rows.len());
         for row in rows {
-            let args = args_to_py_vec(py, &row.call_args.args, nodes);
-            let kwargs = kwargs_to_py_map(py, &row.call_args.kwargs, nodes);
-            refs.push(Py::new(
+            let path = nodes[row.owner_idx].borrow(py).path.clone();
+            out.push(Py::new(
                 py,
-                CallRef {
-                    owner: nodes[row.owner_idx].clone_ref(py),
+                CallIdxRef {
+                    owner_idx: row.owner_idx,
+                    path,
                     string_arg: row.string_arg,
-                    args,
-                    kwargs,
+                    call_args: row.call_args,
                 },
             )?);
         }
-        Ok(refs)
+        Ok(out)
     }
 }
 
@@ -1087,36 +1024,7 @@ impl CallQuery {
     }
 }
 
-impl_query_methods!(with_first CallQuery, CallRef);
-
-#[pymethods]
-impl CallQuery {
-    /// Index-form row terminal. Same dispatch as :meth:`collect`, but
-    /// each row carries ``owner_idx`` (a positional index into
-    /// ``ctx.nodes()``) instead of a ``Py<SymbolNode>``, and the
-    /// ``args`` / ``kwargs`` row payloads are skipped. ``string_arg``
-    /// — the literal at the configured positional index — is preserved
-    /// because most call-shape plugins key on it.
-    fn row_indices(&self, py: Python<'_>) -> PyResult<Vec<Py<CallIdxRef>>> {
-        let rows = self.call_rows(py)?;
-        let ctx = self.ctx.borrow(py);
-        let outputs = ctx.materialized("CallQuery.row_indices")?;
-        let nodes: &[Py<SymbolNode>] = &outputs.builder.nodes;
-        let mut out: Vec<Py<CallIdxRef>> = Vec::with_capacity(rows.len());
-        for row in rows {
-            let path = nodes[row.owner_idx].borrow(py).path.clone();
-            out.push(Py::new(
-                py,
-                CallIdxRef {
-                    owner_idx: row.owner_idx,
-                    path,
-                    string_arg: row.string_arg,
-                },
-            )?);
-        }
-        Ok(out)
-    }
-}
+impl_query_methods!(with_first CallQuery, CallIdxRef);
 
 // ---------------------------------------------------------------------------
 // Subclass / Import / Class / Factory queries
@@ -1307,22 +1215,6 @@ impl ClassQuery {
 impl_query_methods!(no_first ClassQuery);
 
 /// One result row from :class:`FactoryQuery`. ``decl`` is the
-/// owning top-level function or class; ``kinds`` is the sorted set
-/// of constructor bare-names matched inside its body.
-#[pyclass(frozen, get_all)]
-pub(crate) struct FactoryRef {
-    pub(crate) decl: Py<SymbolNode>,
-    pub(crate) kinds: Vec<String>,
-}
-
-#[pymethods]
-impl FactoryRef {
-    #[getter]
-    fn path(&self, py: Python<'_>) -> String {
-        self.decl.borrow(py).path.clone()
-    }
-}
-
 /// Walk function / class bodies for ``<Ctor>(...)`` calls where
 /// ``Ctor`` is imported from ``of_module(...)`` and matches one of
 /// ``where_name(...)``. Both filters are required.
@@ -1364,56 +1256,15 @@ impl FactoryQuery {
         slf.names = Some(_extract_str_or_list(py, names)?);
         Ok(slf)
     }
-    fn collect(&self, py: Python<'_>) -> PyResult<Vec<Py<FactoryRef>>> {
+    /// Materialise every matched factory row. Each row is a
+    /// :class:`FactoryIdxRef`: ``decl_idx`` is the owning decl's
+    /// positional index into ``ctx.nodes()``; ``path`` is the owning
+    /// file; ``kinds`` is the sorted set of constructor bare-names
+    /// matched inside its body.
+    fn collect(&self, py: Python<'_>) -> PyResult<Vec<Py<FactoryIdxRef>>> {
         let pairs = self.factory_rows(py)?;
         let ctx = self.ctx.borrow(py);
         let outputs = ctx.materialized("FactoryQuery.collect")?;
-        let nodes: &[Py<SymbolNode>] = &outputs.builder.nodes;
-        pairs
-            .into_iter()
-            .map(|(decl_idx, kinds)| {
-                Py::new(
-                    py,
-                    FactoryRef {
-                        decl: nodes[decl_idx].clone_ref(py),
-                        kinds,
-                    },
-                )
-            })
-            .collect()
-    }
-}
-
-impl FactoryQuery {
-    /// Shared dispatch used by both terminals (:meth:`collect` and
-    /// :meth:`row_indices`). Stays in idx-space throughout.
-    fn factory_rows(&self, py: Python<'_>) -> PyResult<Vec<(usize, Vec<String>)>> {
-        let ctx = self.ctx.borrow(py);
-        let modules = self
-            .modules
-            .as_ref()
-            .ok_or_else(|| PyValueError::new_err("FactoryQuery requires .of_module(...)"))?;
-        let names = self
-            .names
-            .clone()
-            .ok_or_else(|| PyValueError::new_err("FactoryQuery requires .where_name(...)"))?;
-        ctx.find_factory_decls(py, modules, names)
-    }
-}
-
-impl_query_methods!(no_first FactoryQuery);
-
-#[pymethods]
-impl FactoryQuery {
-    /// Index-form row terminal. Same dispatch as :meth:`collect`;
-    /// each row carries ``decl_idx`` (a positional index into
-    /// ``ctx.nodes()``) instead of a ``Py<SymbolNode>``. ``kinds`` is
-    /// the same sorted set of matched constructor bare-names the
-    /// node-returning terminal emits.
-    fn row_indices(&self, py: Python<'_>) -> PyResult<Vec<Py<FactoryIdxRef>>> {
-        let pairs = self.factory_rows(py)?;
-        let ctx = self.ctx.borrow(py);
-        let outputs = ctx.materialized("FactoryQuery.row_indices")?;
         let nodes: &[Py<SymbolNode>] = &outputs.builder.nodes;
         let mut out: Vec<Py<FactoryIdxRef>> = Vec::with_capacity(pairs.len());
         for (decl_idx, kinds) in pairs {
@@ -1430,6 +1281,24 @@ impl FactoryQuery {
         Ok(out)
     }
 }
+
+impl FactoryQuery {
+    /// Shared idx-space dispatch backing :meth:`collect`.
+    fn factory_rows(&self, py: Python<'_>) -> PyResult<Vec<(usize, Vec<String>)>> {
+        let ctx = self.ctx.borrow(py);
+        let modules = self
+            .modules
+            .as_ref()
+            .ok_or_else(|| PyValueError::new_err("FactoryQuery requires .of_module(...)"))?;
+        let names = self
+            .names
+            .clone()
+            .ok_or_else(|| PyValueError::new_err("FactoryQuery requires .where_name(...)"))?;
+        ctx.find_factory_decls(py, modules, names)
+    }
+}
+
+impl_query_methods!(no_first FactoryQuery);
 
 // ---------------------------------------------------------------------------
 // EdgeQuery — filtered enumeration over the in-progress graph's edges

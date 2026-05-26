@@ -61,14 +61,14 @@ class DiscordPyPlugin(Plugin):
             .constructions()
             .where_module("discord.ext.commands")
             .where_name(sorted(_COMMANDS_BOT_KINDS))
-            .row_indices()
+            .collect()
         )
         bot_rows.extend(
             native.query(ctx)
             .constructions()
             .where_module("discord")
             .where_name(sorted(_DISCORD_CLIENT_KINDS))
-            .row_indices()
+            .collect()
         )
 
         # bot_vars_by_file: path -> {simple_name -> var_idx}.
@@ -83,9 +83,7 @@ class DiscordPyPlugin(Plugin):
                 yield native.AddEntrypointByIdx(row.var_idx, marker="<discordpy-app>")
 
         # 2. Single-attr decorators @<bot>.<verb>(...).
-        for h in (
-            native.query(ctx).decorators().where_owner_attr(sorted(_BOT_DECORATORS)).row_indices()
-        ):
+        for h in native.query(ctx).decorators().where_owner_attr(sorted(_BOT_DECORATORS)).collect():
             owner_idx = bot_vars_by_file.get(h.path, {}).get(h.decorator_owner or "")
             if owner_idx is not None:
                 yield native.AddEdgeByIdx(owner_idx, h.decorated_idx)
@@ -95,7 +93,7 @@ class DiscordPyPlugin(Plugin):
             native.query(ctx)
             .decorators()
             .where_owner_attr_via("tree", sorted(_TREE_DECORATORS))
-            .row_indices()
+            .collect()
         ):
             owner_idx = bot_vars_by_file.get(h.path, {}).get(h.decorator_owner or "")
             if owner_idx is not None:
@@ -141,7 +139,7 @@ class DiscordPyPlugin(Plugin):
         seen_extensions: set[str] = set()
         pending: list[tuple[str, str]] = []
         for attr in ("load_extension", "load_extensions"):
-            for cref in native.query(ctx).calls().where_attr(attr).string_arg_at(0).row_indices():
+            for cref in native.query(ctx).calls().where_attr(attr).string_arg_at(0).collect():
                 if cref.path not in discord_paths:
                     continue
                 if cref.string_arg in seen_extensions:

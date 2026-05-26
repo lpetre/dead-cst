@@ -1194,98 +1194,74 @@ class ProjectContext:
 # also move the ``find_*`` methods out of ``#[pymethods]`` and inline
 # their bodies into each query's ``collect()`` directly.
 
-class DecoratorRef:
+class ArgLiteral:
+    """A literal arg / kwarg value. ``value`` is a native Python
+    primitive: ``str`` / ``int`` / ``float`` / ``bool`` / ``None`` /
+    ``bytes`` / ``list`` / ``tuple``. Nested ``list`` / ``tuple``
+    elements are themselves :class:`ArgLiteral` / :class:`ArgNodeRef`
+    / :class:`ArgOpaque` instances (the discriminated union recurses).
+    """
+
+    value: Any
+
+class ArgNodeRef:
+    """A decl reference inside an arg / kwarg position.
+
+    Materialised when the expression at that position resolves through
+    the file's imports to a project decl — e.g. ``func(SomeClass)``
+    where ``SomeClass`` is imported. ``idx`` is a positional index
+    into :meth:`ProjectContext.nodes`; pair with
+    :meth:`ProjectContext.node_attrs` (or :class:`AddEdgeByIdx`) to
+    consume it without leaving idx-space.
+    """
+
+    idx: int
+
+class ArgOpaque:
+    """An arg / kwarg expression that's neither a recognised literal
+    nor a statically-resolvable decl reference. Callers who need the
+    source text should fall back to ty's parsed module — the rust
+    extractor doesn't preserve unresolved expressions verbatim.
+    """
+
+    def __init__(self) -> None: ...
+
+CallArg = ArgLiteral | ArgNodeRef | ArgOpaque
+"""Discriminated-union type for entries inside the lazy ``args`` /
+``kwargs`` getters on :class:`DecoratorIdxRef` / :class:`ConstructionIdxRef`
+/ :class:`CallIdxRef`. Use ``isinstance`` or ``match`` to dispatch:
+
+.. code-block:: python
+
+    for arg in row.kwargs.values():
+        match arg:
+            case native.ArgLiteral(value=str() as s):
+                ...
+            case native.ArgNodeRef(idx=i):
+                ...
+            case native.ArgOpaque():
+                ...
+"""
+
+class DecoratorIdxRef:
     """One decorator application on a top-level function or class.
 
-    Field nullability follows the query shape that produced the ref:
+    Field nullability follows the query shape that produced the row:
 
-    * ``where_module + where_name`` populates ``decorated`` only;
-      ``decorator_name`` is ``None`` because the underlying walk
-      doesn't surface which of the queried names matched.
+    * ``where_module + where_name`` populates ``decorated_idx`` only.
     * ``where_owner_attr`` fills ``decorator_owner`` (the textual
       ``@<owner>.<attr>`` prefix).
     * ``where_owner_attr_via`` additionally fills ``decorator_via``
       with the middle attribute name.
 
-    ``args`` and ``kwargs`` are populated from the decorator's
-    ``Call`` form (``@dec(a, b, k=v)``). Bare-attribute decorators
-    (``@app.route`` without ``()``) get empty containers. Each value
-    is a Python literal (str / int / float / bool / None / list /
-    tuple), a :class:`SymbolNode` when the expression statically
-    resolves to a project decl, or ``None`` for any other non-literal
-    expression.
-    """
+    ``args`` and ``kwargs`` are **lazy** — accessing them walks the
+    row's rust-side ``CallArgs`` and materialises a Python ``list`` /
+    ``dict`` of :class:`ArgLiteral` / :class:`ArgNodeRef` /
+    :class:`ArgOpaque`. Plugins that never touch them pay zero Python
+    allocation cost for the args payload. Bare-attribute decorators
+    (``@app.route`` without ``()``) get empty containers.
 
-    decorated: SymbolNode
-    decorator_name: str | None
-    decorator_owner: str | None
-    decorator_via: str | None
-    args: list[Any]
-    kwargs: dict[str, Any]
-
-    @property
-    def path(self) -> str: ...
-
-class ConstructionRef:
-    """One ``<var> = <Ctor>(...)`` construction at module scope.
-
-    ``class_name`` is the upstream constructor's bare name
-    (``"Flask"`` even when imported as ``F``).
-
-    ``args`` and ``kwargs`` carry the construction's full positional /
-    keyword argument shape. Each value is a Python literal (str / int
-    / float / bool / None / list / tuple), a :class:`SymbolNode` when
-    the expression statically resolves to a project decl, or ``None``
-    for any other non-literal expression.
-    """
-
-    var: SymbolNode
-    class_name: str
-    args: list[Any]
-    kwargs: dict[str, Any]
-
-    @property
-    def path(self) -> str: ...
-
-class CallRef:
-    """One matched call site.
-
-    ``string_arg`` is the positional string literal at the index
-    passed to :meth:`CallQuery.string_arg_at`.
-
-    ``args`` and ``kwargs`` carry the call's full positional /
-    keyword argument shape. Each value is a Python literal (str /
-    int / float / bool / None / list / tuple), a :class:`SymbolNode`
-    when the expression statically resolves to a project decl, or
-    ``None`` for any other non-literal expression.
-    """
-
-    owner: SymbolNode
-    string_arg: str
-    args: list[Any]
-    kwargs: dict[str, Any]
-
-    @property
-    def path(self) -> str: ...
-
-class DecoratorIdxRef:
-    """Index-form sibling of :class:`DecoratorRef`. Same metadata
-    fields, minus ``args`` / ``kwargs``; ``decorated_idx`` indexes into
-    :meth:`ProjectContext.nodes`. ``path`` is preserved because plugins
-    routinely bucket by path before any further query.
-
-    ``args`` / ``kwargs`` are dropped on the idx form because entries
-    inside them can be :class:`SymbolNode` references that would
-    re-introduce the GIL hops the idx surface is designed to avoid.
-    Plugins that need them fall back to :meth:`DecoratorQuery.collect`;
-    plugins that only need to filter by kwarg keep using
-    :meth:`DecoratorQuery.where_kwarg`, which runs rust-side before
-    row construction either way.
-
-    Returned by :meth:`DecoratorQuery.row_indices`. Pair with
-    :meth:`ProjectContext.node_attrs` (or :meth:`node_paths` when only
-    ``path`` is needed) to batch-fetch any other node fields the
-    plugin needs without per-row ``borrow`` ping-pong.
+    Returned by :meth:`DecoratorQuery.collect`.
     """
 
     decorated_idx: int
@@ -1294,48 +1270,59 @@ class DecoratorIdxRef:
     decorator_owner: str | None
     decorator_via: str | None
 
-class ConstructionIdxRef:
-    """Index-form sibling of :class:`ConstructionRef`. Same metadata
-    fields, minus ``args`` / ``kwargs``; ``var_idx`` indexes into
-    :meth:`ProjectContext.nodes`. ``path`` is preserved as a cheap
-    bucket key for plugins that fan out per file. ``args`` /
-    ``kwargs`` are dropped for the same reason
-    :class:`DecoratorIdxRef` drops them — see its docstring.
+    @property
+    def args(self) -> list[CallArg]: ...
+    @property
+    def kwargs(self) -> dict[str, CallArg]: ...
 
-    Returned by :meth:`ConstructionQuery.row_indices`.
+class ConstructionIdxRef:
+    """One ``<var> = <Ctor>(...)`` construction at module scope.
+
+    ``class_name`` is the upstream constructor's bare name (``"Flask"``
+    even when imported as ``F``). ``args`` / ``kwargs`` are the
+    constructor call's positional / keyword arguments — lazy getters,
+    same discriminated-union shape as :class:`DecoratorIdxRef`.
+
+    Returned by :meth:`ConstructionQuery.collect`.
     """
 
     var_idx: int
     path: str
     class_name: str
 
+    @property
+    def args(self) -> list[CallArg]: ...
+    @property
+    def kwargs(self) -> dict[str, CallArg]: ...
+
 class CallIdxRef:
-    """Index-form sibling of :class:`CallRef`. Same metadata fields,
-    minus ``args`` / ``kwargs``; ``owner_idx`` indexes into
-    :meth:`ProjectContext.nodes`. ``path`` is the owning decl's path;
-    ``string_arg`` (the literal at the configured positional index)
-    is preserved because (a) most call-shape plugins key on it and
-    (b) it's a plain ``str`` with no ``SymbolNode`` content, so it
-    doesn't cost a borrow per row.
+    """One matched call site.
 
-    ``args`` / ``kwargs`` are dropped for the same reason
-    :class:`DecoratorIdxRef` drops them — see its docstring.
+    ``string_arg`` is the positional string literal at the index passed
+    to :meth:`CallQuery.string_arg_at`. ``args`` / ``kwargs`` are the
+    call's full positional / keyword arguments — lazy getters, same
+    discriminated-union shape as :class:`DecoratorIdxRef`.
 
-    Returned by :meth:`CallQuery.row_indices`.
+    Returned by :meth:`CallQuery.collect`.
     """
 
     owner_idx: int
     path: str
     string_arg: str
 
-class FactoryIdxRef:
-    """Index-form sibling of :class:`FactoryRef`. ``decl_idx`` indexes
-    into :meth:`ProjectContext.nodes`; ``kinds`` is the same sorted set
-    of matched constructor bare-names the node-returning terminal emits.
-    ``path`` is preserved as a cheap bucket key for plugins that fan
-    out per file.
+    @property
+    def args(self) -> list[CallArg]: ...
+    @property
+    def kwargs(self) -> dict[str, CallArg]: ...
 
-    Returned by :meth:`FactoryQuery.row_indices`.
+class FactoryIdxRef:
+    """One factory-function / class hit. ``decl_idx`` is the owning
+    top-level decl's positional index into :meth:`ProjectContext.nodes`;
+    ``kinds`` is the sorted set of constructor bare-names matched
+    inside its body. ``path`` is the decl's source file as a cheap
+    bucket key for per-file fan-out.
+
+    Returned by :meth:`FactoryQuery.collect`.
     """
 
     decl_idx: int
@@ -1417,19 +1404,10 @@ class DecoratorQuery:
         """
         ...
 
-    def collect(self) -> list[DecoratorRef]: ...
-    def first(self) -> DecoratorRef | None: ...
+    def collect(self) -> list[DecoratorIdxRef]: ...
+    def first(self) -> DecoratorIdxRef | None: ...
     def count(self) -> int: ...
-    def __iter__(self) -> Iterator[DecoratorRef]: ...
-    def row_indices(self) -> list[DecoratorIdxRef]:
-        """Index-form row terminal. Same dispatch as :meth:`collect`,
-        but each row carries ``decorated_idx`` (a positional index into
-        :meth:`ProjectContext.nodes`) instead of a ``SymbolNode``, and
-        the ``args`` / ``kwargs`` row payloads are skipped. Pair with
-        :meth:`ProjectContext.node_attrs` for plugins that need a few
-        node fields without per-row borrow ping-pong.
-        """
-        ...
+    def __iter__(self) -> Iterator[DecoratorIdxRef]: ...
 
 class ConstructionQuery:
     """Find module-scope ``<var> = <Ctor>(...)`` sites."""
@@ -1444,17 +1422,10 @@ class ConstructionQuery:
     def where_name(self, names: str | list[str] | tuple[str, ...]) -> ConstructionQuery: ...
     def where_class(self, fqn: str, *, include_subclasses: bool = False) -> ConstructionQuery: ...
     def where_path(self, regex: str) -> ConstructionQuery: ...
-    def collect(self) -> list[ConstructionRef]: ...
-    def first(self) -> ConstructionRef | None: ...
+    def collect(self) -> list[ConstructionIdxRef]: ...
+    def first(self) -> ConstructionIdxRef | None: ...
     def count(self) -> int: ...
-    def __iter__(self) -> Iterator[ConstructionRef]: ...
-    def row_indices(self) -> list[ConstructionIdxRef]:
-        """Index-form row terminal. Same dispatch as :meth:`collect`,
-        but each row carries ``var_idx`` (a positional index into
-        :meth:`ProjectContext.nodes`) instead of a ``SymbolNode``, and
-        the ``args`` / ``kwargs`` row payloads are skipped.
-        """
-        ...
+    def __iter__(self) -> Iterator[ConstructionIdxRef]: ...
 
 class CallQuery:
     """Find call sites with a captured positional string-literal arg.
@@ -1487,19 +1458,10 @@ class CallQuery:
         """
         ...
 
-    def collect(self) -> list[CallRef]: ...
-    def first(self) -> CallRef | None: ...
+    def collect(self) -> list[CallIdxRef]: ...
+    def first(self) -> CallIdxRef | None: ...
     def count(self) -> int: ...
-    def __iter__(self) -> Iterator[CallRef]: ...
-    def row_indices(self) -> list[CallIdxRef]:
-        """Index-form row terminal. Same dispatch as :meth:`collect`,
-        but each row carries ``owner_idx`` (a positional index into
-        :meth:`ProjectContext.nodes`) instead of a ``SymbolNode``, and
-        the ``args`` / ``kwargs`` row payloads are skipped.
-        ``string_arg`` is preserved because most call-shape plugins
-        key on it.
-        """
-        ...
+    def __iter__(self) -> Iterator[CallIdxRef]: ...
 
 class SubclassQuery:
     """Walk the subclass closure of a class.
@@ -1578,22 +1540,6 @@ class ClassQuery:
         """
         ...
 
-class FactoryRef:
-    """One result row from :class:`FactoryQuery`.
-
-    ``decl`` is the owning top-level function or class; ``kinds`` is
-    the sorted set of constructor bare-names matched inside its body
-    (multiple kinds appear when a single factory constructs more than
-    one — e.g. a function that returns a ``Flask`` after mounting
-    several ``Blueprint``\\ s).
-    """
-
-    decl: SymbolNode
-    kinds: list[str]
-
-    @property
-    def path(self) -> str: ...
-
 class FactoryQuery:
     """Walk function / class bodies for ``<Ctor>(...)`` calls where
     ``Ctor`` is imported from :meth:`of_module` and matches one of
@@ -1610,15 +1556,9 @@ class FactoryQuery:
         ...
 
     def where_name(self, names: str | list[str] | tuple[str, ...]) -> FactoryQuery: ...
-    def collect(self) -> list[FactoryRef]: ...
+    def collect(self) -> list[FactoryIdxRef]: ...
     def count(self) -> int: ...
-    def __iter__(self) -> Iterator[FactoryRef]: ...
-    def row_indices(self) -> list[FactoryIdxRef]:
-        """Index-form row terminal. Same dispatch as :meth:`collect`;
-        each row carries ``decl_idx`` (a positional index into
-        :meth:`ProjectContext.nodes`) instead of a ``SymbolNode``.
-        """
-        ...
+    def __iter__(self) -> Iterator[FactoryIdxRef]: ...
 
 class EdgeRef:
     """One graph edge with both endpoint nodes resolved.

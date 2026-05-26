@@ -41,7 +41,7 @@ class MockPatchPlugin(Plugin):
                 .where_module(module)
                 .where_name("patch")
                 .string_arg_at(0)
-                .row_indices()
+                .collect()
             )
         rows.extend(
             native.query(ctx)
@@ -49,7 +49,7 @@ class MockPatchPlugin(Plugin):
             .where_owner(_MOCKER_NAME)
             .where_attr("patch")
             .string_arg_at(0)
-            .row_indices()
+            .collect()
         )
         for attr, required in _MONKEYPATCH_FQNAME_METHODS.items():
             rows.extend(
@@ -59,7 +59,7 @@ class MockPatchPlugin(Plugin):
                 .where_attr(attr)
                 .string_arg_at(0)
                 .where_required_positional(required)
-                .row_indices()
+                .collect()
             )
 
         owners_by_fqname: dict[str, list[tuple[int, str]]] = {}

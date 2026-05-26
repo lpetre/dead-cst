@@ -43,6 +43,27 @@ two versions.
   `ctx.descendants_indices`, `ctx.ancestors_indices` — idx-form
   siblings of the last six lookup / traversal helpers that still
   allocated ``Py<SymbolNode>`` rows.
+- `ArgLiteral` / `ArgNodeRef` / `ArgOpaque` pyclasses + `CallArg`
+  discriminated-union alias. The four ref-query terminals now expose
+  `args` / `kwargs` lazily as `list[CallArg]` / `dict[str, CallArg]`,
+  walking each row's rust-side `CallArgs` on access. Plugins that
+  never read args/kwargs pay zero Python allocation cost for the
+  payload; plugins that do read them get a tagged dispatch
+  (``isinstance(a, ArgLiteral)`` / ``match`` patterns) instead of the
+  old `list[Any]` shape that mixed primitives and `SymbolNode` refs.
+  Embedded decl references surface as `ArgNodeRef(idx=...)` rather
+  than `Py<SymbolNode>` — keeps the idx surface honest end-to-end.
+
+### Removed
+- The non-idx result types `DecoratorRef` / `ConstructionRef` /
+  `CallRef` / `FactoryRef` and the `.row_indices()` terminal on the
+  four ref queries. `.collect()` now returns the idx-form rows
+  (`DecoratorIdxRef` etc.) directly. Plugins migrate via
+  `s/row_indices/collect/` + replacing `ref.decorated.fqname` with
+  `ctx.nodes()[ref.decorated_idx].fqname` (and similar). No bundled
+  plugin pulled args/kwargs off the node-form refs, so the
+  discriminated-union args/kwargs change is purely additive for
+  in-tree usage.
 - Index-form siblings on `ProjectContext`: `find_declarations_indices`,
   `module_for_indices`, `modules_for_paths`, `module_surface_indices`,
   `module_surfaces_indices`, `find_main_blocks_indices`. Each returns
