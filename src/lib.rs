@@ -52,9 +52,9 @@ use crate::progress::ProgressHandle;
 use crate::project::{ChangeEvent, Project, ProjectContext};
 use crate::query::{
     CallIdxRef, CallQuery, ClassQuery, ConstructionIdxRef, ConstructionQuery, DeclQuery,
-    DeclarationsQuery, DecoratorIdxRef, DecoratorQuery, EdgeQuery, EdgeRef, FactoryIdxRef,
-    FactoryQuery, ImportQuery, LiteralListQuery, MainBlockQuery, ModuleQuery, QueryBuilder,
-    SubclassQuery, TraverseQuery,
+    DeclarationsQuery, DecoratorIdxRef, DecoratorQuery, EdgeQuery, FactoryIdxRef, FactoryQuery,
+    ImportQuery, LiteralListQuery, MainBlockQuery, ModuleQuery, QueryBuilder, SubclassQuery,
+    TraverseQuery,
 };
 
 // ---------------------------------------------------------------------------
@@ -105,7 +105,6 @@ fn dead_cst_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<FactoryQuery>()?;
     m.add_class::<FactoryIdxRef>()?;
     m.add_class::<EdgeQuery>()?;
-    m.add_class::<EdgeRef>()?;
     m.add_class::<DeclQuery>()?;
     m.add_class::<DeclarationsQuery>()?;
     m.add_class::<MainBlockQuery>()?;

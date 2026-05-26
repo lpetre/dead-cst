@@ -1903,41 +1903,20 @@ impl ProjectContext {
 }
 
 // ``find_imports_of`` / ``_indices`` / ``imports_of_count`` /
-// ``has_imports_of`` back :class:`ImportQuery` and its ``.count()`` /
-// ``.exists()`` shortcuts. NOT exposed to Python — plugin authors use
-// the DSL: ``native.query(ctx).imports().of(module).indices()`` /
-// ``.count()`` / ``.exists()``.
+// ``find_imports_of_indices`` / ``imports_of_count`` / ``has_imports_of``
+// back :class:`ImportQuery` and its ``.count()`` / ``.exists()``
+// shortcuts. NOT exposed to Python — plugin authors use the DSL:
+// ``native.query(ctx).imports().of(module).indices()`` / ``.count()`` /
+// ``.exists()``.
 impl ProjectContext {
-    /// Return every import-kind node whose upstream `module` matches.
+    /// Every import-kind node whose upstream `module` matches, as
+    /// positional indices into ``ctx.nodes()``.
     ///
     /// Covers both `import <module_name>` and
     /// `from <module_name> import ...` styles — both bind import-kind
     /// nodes whose `Import.module` is the absolute dotted name. Star
     /// reexports synthesized from `from <module_name> import *` are
     /// also included.
-    pub(crate) fn find_imports_of(
-        &self,
-        py: Python<'_>,
-        module_name: &str,
-    ) -> PyResult<Vec<Py<SymbolNode>>> {
-        let outputs = self.materialized("find_imports_of")?;
-        // O(1) lookup against the pre-built ``imports_by_module``
-        // index — no scan over all interned nodes. Empty when nothing
-        // imports the module.
-        let Some(idxs) = outputs.imports_by_module.get(module_name) else {
-            return Ok(Vec::new());
-        };
-        let mut out = Vec::with_capacity(idxs.len());
-        for &idx in idxs {
-            out.push(outputs.builder.nodes[idx].clone_ref(py));
-        }
-        Ok(out)
-    }
-
-    /// Idx-only variant of :meth:`find_imports_of`. Same lookup, but
-    /// returns the positional indices into ``ctx.nodes()`` rather than
-    /// materializing ``Py<SymbolNode>`` clones — drives the
-    /// :meth:`ImportQuery.indices` terminal.
     pub(crate) fn find_imports_of_indices(&self, module_name: &str) -> PyResult<Vec<usize>> {
         let outputs = self.materialized("find_imports_of_indices")?;
         Ok(outputs
@@ -3124,33 +3103,17 @@ impl ProjectContext {
     }
 }
 
-// ``find_classes_defining_method`` is the rust-side helper backing
-// :class:`ClassQuery`. It's NOT exposed to Python — plugin authors use
-// the DSL: ``native.query(ctx).classes().defining_method(name).collect()``.
+// ``find_classes_defining_method_indices`` is the rust-side helper
+// backing :class:`ClassQuery`. It's NOT exposed to Python — plugin
+// authors use the DSL:
+// ``native.query(ctx).classes().defining_method(name).indices()``.
 impl ProjectContext {
-    /// Every class that defines a method with the given name.
+    /// Every class that defines a method with the given name, as
+    /// positional indices into ``ctx.nodes()``.
     ///
     /// Walks each class's `DefinitionKind::Class` body for an
     /// `Stmt::FunctionDef` whose name matches. ty's `parsed_module` is
     /// Salsa-cached, so this is just a body scan per class.
-    pub(crate) fn find_classes_defining_method(
-        &self,
-        py: Python<'_>,
-        method_name: &str,
-    ) -> PyResult<Vec<Py<SymbolNode>>> {
-        let indices = self.find_classes_defining_method_indices(py, method_name)?;
-        let outputs = self.materialized("find_classes_defining_method")?;
-        Ok(indices
-            .into_iter()
-            .map(|idx| outputs.builder.nodes[idx].clone_ref(py))
-            .collect())
-    }
-}
-
-impl ProjectContext {
-    /// Idx-only variant of :meth:`find_classes_defining_method`. Same
-    /// per-file parallel walk, but returns positional indices into
-    /// ``ctx.nodes()`` instead of allocating ``Py<SymbolNode>`` clones.
     pub(crate) fn find_classes_defining_method_indices(
         &self,
         py: Python<'_>,
@@ -3204,45 +3167,15 @@ impl ProjectContext {
     }
 }
 
-// ``find_subclasses_of_indices`` / ``_idx`` back :class:`SubclassQuery`.
+// ``find_subclasses_of_idx`` backs :class:`SubclassQuery.of_idx`.
 // NOT exposed to Python — plugin authors use the DSL:
 // ``native.query(ctx).subclasses().of_idx(idx).indices()`` or
 // ``of_fqn(fqn)``.
 impl ProjectContext {
-    /// Idx-only variant of :meth:`find_subclasses_of`. Same lookup,
-    /// returns positional indices into ``ctx.nodes()`` rather than
-    /// allocating ``Py<SymbolNode>`` clones.
-    pub(crate) fn find_subclasses_of_indices(
-        &self,
-        class_node: &SymbolNode,
-    ) -> PyResult<Vec<usize>> {
-        if class_node.kind != "class" {
-            return Ok(Vec::new());
-        }
-        let outputs = self.materialized("find_subclasses_of_indices")?;
-        if let Some((seed_file, seed_range)) = locate_class_def(
-            &self.db,
-            &outputs.path_to_file,
-            &class_node.path,
-            class_node,
-        ) {
-            let rk = (seed_range.start().to_u32(), seed_range.end().to_u32());
-            if let Some(&seed_idx) = outputs.class_by_selection.get(&(seed_file, rk)) {
-                return Ok(transitive_subclasses_via_index(
-                    seed_idx,
-                    &outputs.children_by_node,
-                ));
-            }
-        }
-        Ok(Vec::new())
-    }
-}
-
-impl ProjectContext {
-    /// Idx-keyed variant of :meth:`find_subclasses_of_indices` —
-    /// resolves the seed class by positional index into ``ctx.nodes()``
-    /// rather than taking a ``Py<SymbolNode>`` reference. Bounds-checks
-    /// the index and raises :class:`IndexError` when out of range.
+    /// Subclasses of the class at positional index ``class_idx`` into
+    /// ``ctx.nodes()``. Bounds-checks the index and raises
+    /// :class:`IndexError` when out of range; returns an empty list
+    /// when the seed isn't a class node.
     pub(crate) fn find_subclasses_of_idx(
         &self,
         py: Python<'_>,
@@ -3494,8 +3427,10 @@ impl ProjectContext {
         };
         let mut ctors: Vec<String> = vec![name.to_string()];
         if include_subclasses {
-            for sub in self.find_subclasses(py, class_fqn, true)? {
-                let simple = sub
+            let sub_idxs = self.find_subclasses_indices(py, class_fqn, true)?;
+            let outputs = self.materialized("find_constructions.subclasses")?;
+            for idx in sub_idxs {
+                let simple = outputs.builder.nodes[idx]
                     .borrow(py)
                     .fqname
                     .rsplit('.')
@@ -3542,37 +3477,19 @@ impl ProjectContext {
     }
 }
 
-// ``find_subclasses`` + ``_indices`` back :class:`SubclassQuery`.
+// ``find_subclasses_indices`` backs :class:`SubclassQuery`.
 // NOT exposed to Python — plugin authors use the DSL:
-// ``native.query(ctx).subclasses().of_fqn(fqn).collect()``.
+// ``native.query(ctx).subclasses().of_fqn(fqn).indices()``.
 impl ProjectContext {
-    /// Subclasses of the class addressed by ``base_fqn``.
+    /// Subclasses of the class addressed by ``base_fqn``, as positional
+    /// indices into ``ctx.nodes()``.
     ///
     /// Works for both project classes (where the fqn resolves to a
     /// graph node) and external classes (``unittest.TestCase``,
     /// ``pydantic.BaseModel``) via ty's module resolver +
-    /// ``type_hierarchy_subtypes``. ``transitive=True`` (default)
-    /// walks the full subclass closure; ``transitive=False`` returns
-    /// only direct subclasses.
-    pub(crate) fn find_subclasses(
-        &self,
-        py: Python<'_>,
-        base_fqn: &str,
-        transitive: bool,
-    ) -> PyResult<Vec<Py<SymbolNode>>> {
-        let indices = self.find_subclasses_indices(py, base_fqn, transitive)?;
-        let outputs = self.materialized("find_subclasses")?;
-        Ok(indices
-            .into_iter()
-            .map(|idx| outputs.builder.nodes[idx].clone_ref(py))
-            .collect())
-    }
-}
-
-impl ProjectContext {
-    /// Idx-only variant of :meth:`find_subclasses`. Same lookup,
-    /// returns positional indices into ``ctx.nodes()`` rather than
-    /// allocating ``Py<SymbolNode>`` clones.
+    /// ``type_hierarchy_subtypes``. ``transitive=true`` walks the full
+    /// subclass closure; ``transitive=false`` returns only direct
+    /// subclasses.
     pub(crate) fn find_subclasses_indices(
         &self,
         py: Python<'_>,
@@ -4032,6 +3949,195 @@ impl ProjectContext {
             out.push(outputs.builder.nodes[idx].borrow(py).path.clone());
         }
         Ok(out)
+    }
+
+    /// Batched ``parameter_names`` snapshot for each function-kind
+    /// index in ``indices``. Non-function nodes (and indices that
+    /// don't resolve to a top-level ``FunctionDef`` in the AST)
+    /// surface an empty list at the same position.
+    ///
+    /// Walks the parsed AST once per distinct path; matches each
+    /// top-level ``FunctionDef`` against ``decl_by_name_range`` via
+    /// its name's byte range. Used by ``PytestPlugin`` to discover
+    /// fixture-dependency edges (``test_foo(my_fixture)`` →
+    /// ``test_foo → my_fixture``) — same shape as
+    /// :meth:`node_attrs` / :meth:`node_paths`: one FFI hop per
+    /// batch, validated bounds.
+    ///
+    /// Parameter shape: returns the union of positional-only,
+    /// positional-or-keyword, and keyword-only parameter names in
+    /// declaration order. ``*args`` and ``**kwargs`` are skipped
+    /// (pytest never resolves them as fixture references).
+    pub(crate) fn function_parameters(
+        &self,
+        _py: Python<'_>,
+        indices: Vec<usize>,
+    ) -> PyResult<Vec<Vec<String>>> {
+        let outputs = self.materialized("function_parameters")?;
+        let nodes = &outputs.builder.nodes;
+        let len = nodes.len();
+        for &idx in &indices {
+            if idx >= len {
+                return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                    "node index {idx} out of range (len={len})"
+                )));
+            }
+        }
+        if indices.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Build the wanted set + an idx → (file, name_range) inverse
+        // by scanning ``decl_by_name_range`` once. The decl-by-name
+        // index already has the byte range of every function decl
+        // (the name range, e.g. ``test_foo`` in ``def test_foo``);
+        // we use that as the rendezvous key against the AST below.
+        let wanted: FxHashSet<usize> = indices.iter().copied().collect();
+        let mut idx_to_loc: FxHashMap<usize, (File, (u32, u32))> =
+            FxHashMap::with_capacity_and_hasher(wanted.len(), Default::default());
+        for (&(file, rk), &idx) in &outputs.decl_by_name_range {
+            if wanted.contains(&idx) {
+                idx_to_loc.insert(idx, (file, rk));
+            }
+        }
+
+        // Group wanted ranges by file for a single AST walk per
+        // distinct path.
+        let mut by_file: FxHashMap<File, FxHashMap<(u32, u32), usize>> = FxHashMap::default();
+        for (&idx, &(file, rk)) in &idx_to_loc {
+            by_file.entry(file).or_default().insert(rk, idx);
+        }
+
+        let mut params_for_idx: FxHashMap<usize, Vec<String>> =
+            FxHashMap::with_capacity_and_hasher(wanted.len(), Default::default());
+        for (&file, rk_to_idx) in &by_file {
+            let parsed = parsed_module(&self.db, file).load(&self.db);
+            for stmt in &parsed.syntax().body {
+                let Stmt::FunctionDef(func) = stmt else {
+                    continue;
+                };
+                let rk = crate::helpers::range_key(func.name.range());
+                let Some(&idx) = rk_to_idx.get(&rk) else {
+                    continue;
+                };
+                let params = &func.parameters;
+                let mut names: Vec<String> = Vec::with_capacity(
+                    params.posonlyargs.len() + params.args.len() + params.kwonlyargs.len(),
+                );
+                for p in &params.posonlyargs {
+                    names.push(p.parameter.name.id.to_string());
+                }
+                for p in &params.args {
+                    names.push(p.parameter.name.id.to_string());
+                }
+                for p in &params.kwonlyargs {
+                    names.push(p.parameter.name.id.to_string());
+                }
+                params_for_idx.insert(idx, names);
+            }
+        }
+
+        Ok(indices
+            .into_iter()
+            .map(|idx| params_for_idx.remove(&idx).unwrap_or_default())
+            .collect())
+    }
+
+    /// Batched class-method parameter-name snapshot for each
+    /// class-kind index. For each input class, walks its body's
+    /// top-level ``FunctionDef`` statements and returns the union of
+    /// their parameter names (positional-only + positional-or-keyword
+    /// + keyword-only), deduped in first-seen order, with ``self`` and
+    /// ``cls`` excluded.
+    ///
+    /// Indices that don't resolve to a top-level ``ClassDef`` in the
+    /// AST surface an empty list at the same position. ``*args`` and
+    /// ``**kwargs`` are skipped (pytest never resolves them as
+    /// fixture references).
+    ///
+    /// Used by ``PytestPlugin`` to wire ``class → fixture`` edges for
+    /// ``Test*`` classes whose method signatures mention fixtures.
+    /// We don't represent class methods as their own graph nodes, so
+    /// the class itself is the rendezvous point for any fixture any
+    /// method uses.
+    pub(crate) fn class_method_parameters(
+        &self,
+        _py: Python<'_>,
+        indices: Vec<usize>,
+    ) -> PyResult<Vec<Vec<String>>> {
+        let outputs = self.materialized("class_method_parameters")?;
+        let nodes = &outputs.builder.nodes;
+        let len = nodes.len();
+        for &idx in &indices {
+            if idx >= len {
+                return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                    "node index {idx} out of range (len={len})"
+                )));
+            }
+        }
+        if indices.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Same rendezvous strategy as ``function_parameters``, but
+        // keyed off ``class_by_selection`` (class name-range → idx)
+        // instead of ``decl_by_name_range``.
+        let wanted: FxHashSet<usize> = indices.iter().copied().collect();
+        let mut idx_to_loc: FxHashMap<usize, (File, (u32, u32))> =
+            FxHashMap::with_capacity_and_hasher(wanted.len(), Default::default());
+        for (&(file, rk), &idx) in &outputs.class_by_selection {
+            if wanted.contains(&idx) {
+                idx_to_loc.insert(idx, (file, rk));
+            }
+        }
+
+        let mut by_file: FxHashMap<File, FxHashMap<(u32, u32), usize>> = FxHashMap::default();
+        for (&idx, &(file, rk)) in &idx_to_loc {
+            by_file.entry(file).or_default().insert(rk, idx);
+        }
+
+        let mut params_for_idx: FxHashMap<usize, Vec<String>> =
+            FxHashMap::with_capacity_and_hasher(wanted.len(), Default::default());
+        for (&file, rk_to_idx) in &by_file {
+            let parsed = parsed_module(&self.db, file).load(&self.db);
+            for stmt in &parsed.syntax().body {
+                let Stmt::ClassDef(cls) = stmt else {
+                    continue;
+                };
+                let rk = crate::helpers::range_key(cls.name.range());
+                let Some(&idx) = rk_to_idx.get(&rk) else {
+                    continue;
+                };
+                let mut seen: FxHashSet<String> = FxHashSet::default();
+                let mut names: Vec<String> = Vec::new();
+                for body_stmt in &cls.body {
+                    let Stmt::FunctionDef(method) = body_stmt else {
+                        continue;
+                    };
+                    let params = &method.parameters;
+                    for p in params
+                        .posonlyargs
+                        .iter()
+                        .chain(params.args.iter())
+                        .chain(params.kwonlyargs.iter())
+                    {
+                        let n = p.parameter.name.id.as_str();
+                        if n == "self" || n == "cls" {
+                            continue;
+                        }
+                        if seen.insert(n.to_string()) {
+                            names.push(n.to_string());
+                        }
+                    }
+                }
+                params_for_idx.insert(idx, names);
+            }
+        }
+
+        Ok(indices
+            .into_iter()
+            .map(|idx| params_for_idx.remove(&idx).unwrap_or_default())
+            .collect())
     }
 }
 

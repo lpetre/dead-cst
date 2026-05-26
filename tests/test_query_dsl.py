@@ -284,7 +284,7 @@ def test_where_fqname_str_literal(build_decl_graph):
             "pkg/b.py": "def foo(): ...\n",
         }
     )
-    refs = list(native.query(ctx).decls().where_fqname("pkg.a.foo"))
+    refs = native.query(ctx).decls().where_fqname("pkg.a.foo").attrs()
     assert {r.fqname for r in refs} == {"pkg.a.foo"}
 
 
@@ -297,7 +297,7 @@ def test_where_fqname_list_of_str(build_decl_graph):
             "pkg/b.py": "def baz(): ...\n",
         }
     )
-    refs = list(native.query(ctx).decls().where_fqname(["pkg.a.foo", "pkg.b.baz"]))
+    refs = native.query(ctx).decls().where_fqname(["pkg.a.foo", "pkg.b.baz"]).attrs()
     assert {r.fqname for r in refs} == {"pkg.a.foo", "pkg.b.baz"}
 
 
@@ -309,7 +309,7 @@ def test_where_fqname_regex(build_decl_graph):
             "pkg/a.py": "def foo(): ...\ndef foobar(): ...\ndef bar(): ...\n",
         }
     )
-    refs = list(native.query(ctx).decls().where_fqname(re.compile(r"^pkg\.a\.foo")))
+    refs = native.query(ctx).decls().where_fqname(re.compile(r"^pkg\.a\.foo")).attrs()
     assert {r.fqname for r in refs} == {"pkg.a.foo", "pkg.a.foobar"}
 
 
@@ -321,8 +321,11 @@ def test_where_fqname_list_of_regex(build_decl_graph):
             "pkg/a.py": "def foo(): ...\ndef bar(): ...\ndef baz(): ...\n",
         }
     )
-    refs = list(
-        native.query(ctx).decls().where_fqname([re.compile(r"\.foo$"), re.compile(r"\.bar$")])
+    refs = (
+        native.query(ctx)
+        .decls()
+        .where_fqname([re.compile(r"\.foo$"), re.compile(r"\.bar$")])
+        .attrs()
     )
     assert {r.fqname for r in refs} == {"pkg.a.foo", "pkg.a.bar"}
 
@@ -335,14 +338,14 @@ def test_where_fqname_mixed_str_and_regex(build_decl_graph):
             "pkg/a.py": "def foo(): ...\ndef bar(): ...\ndef baz(): ...\n",
         }
     )
-    refs = list(native.query(ctx).decls().where_fqname(["pkg.a.foo", re.compile(r"\.baz$")]))
+    refs = native.query(ctx).decls().where_fqname(["pkg.a.foo", re.compile(r"\.baz$")]).attrs()
     assert {r.fqname for r in refs} == {"pkg.a.foo", "pkg.a.baz"}
 
 
 def test_where_fqname_empty_list_matches_nothing(build_decl_graph):
     """``where_fqname([])`` is the matches-nothing sentinel."""
     ctx = build_decl_graph({"pkg/__init__.py": "", "pkg/a.py": "def foo(): ...\n"})
-    refs = list(native.query(ctx).decls().where_fqname([]))
+    refs = native.query(ctx).decls().where_fqname([]).attrs()
     assert refs == []
 
 

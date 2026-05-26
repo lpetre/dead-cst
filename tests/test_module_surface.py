@@ -188,7 +188,7 @@ def test_with_fqname_under_segment_bounded(build_decl_graph):
             "pkg/foobar.py": "C = 3\n",
         }
     )
-    fqnames = {r.fqname for r in native.query(ctx).decls().with_fqname_under("pkg.foo")}
+    fqnames = {r.fqname for r in native.query(ctx).decls().with_fqname_under("pkg.foo").attrs()}
     assert "pkg.foo.A" in fqnames
     assert "pkg.foo.inner.B" in fqnames
     assert "pkg.foobar" not in fqnames
@@ -204,10 +204,14 @@ def test_with_fqname_under_includes_root_module(build_decl_graph):
             "pkg/foo/__init__.py": "A = 1\n",
         }
     )
-    nodes = list(
-        native.query(ctx).decls().with_fqname_under("pkg.foo").with_kinds(["module", "variable"])
+    rows = (
+        native.query(ctx)
+        .decls()
+        .with_fqname_under("pkg.foo")
+        .with_kinds(["module", "variable"])
+        .attrs()
     )
-    fqnames = {n.fqname for n in nodes}
+    fqnames = {r.fqname for r in rows}
     assert "pkg.foo" in fqnames
     assert "pkg.foo.A" in fqnames
 
@@ -219,8 +223,8 @@ def test_with_fqname_under_unknown_parent_yields_empty(build_decl_graph):
             "pkg/a.py": "def f(): ...\n",
         }
     )
-    nodes = list(native.query(ctx).decls().with_fqname_under("does.not.exist"))
-    assert nodes == []
+    indices = native.query(ctx).decls().with_fqname_under("does.not.exist").indices()
+    assert indices == []
 
 
 def test_with_fqname_prefix_remains_raw_starts_with(build_decl_graph):
@@ -236,7 +240,7 @@ def test_with_fqname_prefix_remains_raw_starts_with(build_decl_graph):
     )
     fqnames = {
         r.fqname
-        for r in native.query(ctx).decls().with_kind("module").with_fqname_prefix("pkg.foo")
+        for r in native.query(ctx).decls().with_kind("module").with_fqname_prefix("pkg.foo").attrs()
     }
     # Raw starts_with picks up both ``pkg.foo`` AND ``pkg.foobar``.
     assert "pkg.foo" in fqnames
@@ -257,6 +261,7 @@ def test_with_fqname_under_composes_with_other_predicates(build_decl_graph):
         }
     )
     fqnames = {
-        r.fqname for r in native.query(ctx).decls().with_fqname_under("pkg").with_kind("function")
+        r.fqname
+        for r in native.query(ctx).decls().with_fqname_under("pkg").with_kind("function").attrs()
     }
     assert fqnames == {"pkg.a.foo"}
