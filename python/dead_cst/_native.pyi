@@ -418,6 +418,35 @@ class ProjectContext:
         invocation during :meth:`materialize`."""
         ...
 
+    def clear_plugins(self) -> None:
+        """Drop every plugin registered via :meth:`add_plugin`. Used by
+        :class:`dead_cst.Analysis` so a re-materialize doesn't
+        double-register plugins on the rust-serial path."""
+        ...
+
+    def sync_paths(self, paths: Iterable[str]) -> None:
+        """Notify salsa that ``paths`` have changed on disk.
+
+        Bumps each file's revision so any salsa-tracked query that
+        read its contents re-fires on next access; cross-file
+        importers invalidate transitively. Call before re-running
+        :meth:`materialize` (or :meth:`build_only`) to incrementally
+        rebuild after a source edit. Paths may be absolute or relative
+        to the project root.
+        """
+        ...
+
+    def reset_progress(self) -> None:
+        """Reset the progress counter state for a re-run.
+
+        Replaces the rust-side ``ProgressCounters`` with a fresh
+        instance so a subsequent :meth:`materialize` /
+        :meth:`build_only` call starts from zero. Without it, a poller
+        spun up for the second build would observe ``finished=true``
+        from the first build and exit immediately.
+        """
+        ...
+
     def materialize(self) -> NativeGraph:
         """Build the project-wide graph, run each registered plugin's
         ``run(ctx)``, then snapshot the final state.

@@ -9,6 +9,21 @@ two versions.
 
 ## [Unreleased]
 
+### Added
+
+- `Analysis.re_materialize(dirty_files)` — incrementally rebuild the
+  project graph against the existing `native.ProjectContext`. Notifies
+  salsa that the listed files have changed (via the new
+  `native.ProjectContext.sync_paths`), resets progress state (new
+  `reset_progress`), clears plugins (new `clear_plugins`), then
+  re-drives the build + plugin pipeline. The per-file salsa cache for
+  unchanged files survives across calls, so only dirty +
+  transitively-dirty files re-fire — cross-file importers invalidate
+  automatically through salsa's read-tracking on `file_to_nodes`.
+  Plugin `prepare` is a one-shot, not re-run. The assemble pass and
+  plugin pass still execute on every call; they're cheap O(N) walks
+  over a warm cache.
+
 ## [0.13.0] - 2026-05-26
 
 ### Added

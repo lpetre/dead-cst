@@ -1198,6 +1198,52 @@ impl ProjectContext {
         self.plugins.push(plugin);
     }
 
+    /// Drop every plugin registered via :meth:`add_plugin`.
+    ///
+    /// :class:`dead_cst.Analysis` calls this at the top of its build
+    /// driver so a re-materialize doesn't double-register plugins on
+    /// the rust-serial path (where ``add_plugin`` is invoked once per
+    /// :meth:`materialize` call). Idempotent.
+    pub(crate) fn clear_plugins(&mut self) {
+        self.plugins.clear();
+    }
+
+    /// Notify salsa that the listed files have changed on disk.
+    ///
+    /// Bumps each file's revision so any salsa-tracked query that read
+    /// its contents (``file_to_nodes`` / ``file_to_edges`` /
+    /// ``file_to_ref_edges``, ty's ``SemanticIndex`` / ``parsed_module``
+    /// / use-def chains) re-fires on next access. Other files that
+    /// imported the dirty file are invalidated transitively via
+    /// salsa's auto-tracked cross-file reads.
+    ///
+    /// Call before re-running :meth:`materialize` (or
+    /// :meth:`build_only`) to incrementally rebuild the project graph
+    /// after a source edit. The per-file salsa cache for unchanged
+    /// files survives the bump, so only the dirty + transitively-dirty
+    /// files re-fire — the assemble pass still walks every project
+    /// file but reads from a warm cache for the rest.
+    ///
+    /// Paths may be absolute or relative; relative paths are resolved
+    /// against the db's current directory (the project root).
+    pub(crate) fn sync_paths(&mut self, paths: Vec<String>) {
+        use ruff_db::system::SystemPath;
+        for p in paths {
+            let sp = SystemPath::new(&p);
+            File::sync_path(&mut self.db, sp);
+        }
+    }
+
+    /// Reset the progress counter state to a fresh instance so a
+    /// subsequent :meth:`materialize` / :meth:`build_only` call starts
+    /// from zero. Without this, the polling thread on the next run
+    /// would observe ``finished=true`` from the prior run and exit
+    /// immediately. Called by :meth:`dead_cst.Analysis.re_materialize`
+    /// before driving a re-build on the same context.
+    pub(crate) fn reset_progress(&mut self) {
+        self.progress = Arc::new(ProgressCounters::new());
+    }
+
     /// Open a chainable query builder against this context.
     ///
     /// Equivalent to the top-level :func:`query` function; both return
