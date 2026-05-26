@@ -350,7 +350,7 @@ dependencies = [
 
 [[package]]
 name = "dead-cst-native"
-version = "0.12.2"
+version = "0.13.0"
 dependencies = [
  "bincode",
  "crossbeam-channel",
