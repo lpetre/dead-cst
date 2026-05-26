@@ -155,15 +155,15 @@ def test_find_subclasses_of_returns_empty_for_non_class(make_ctx):
     """Asking for subclasses of a function-kind node yields []."""
     ctx = make_ctx({"mod.py": "def f(): pass\n"})
 
-    captured: list[list] = []
+    captured: list[list[int]] = []
 
     class Inspect:
         name = "inspect"
 
         def run(self, ctx: native.ProjectContext) -> None:
-            for node in ctx.nodes():
+            for idx, node in enumerate(ctx.nodes()):
                 if node.fqname == "mod.f":
-                    captured.append(native.query(ctx).subclasses().of_node(node).collect())
+                    captured.append(native.query(ctx).subclasses().of_idx(idx).indices())
 
     ctx.add_plugin(Inspect())
     ctx.materialize()

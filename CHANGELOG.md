@@ -36,6 +36,32 @@ two versions.
   `plugin_end` progress events — their work rolls into the
   `populate` phase counter instead.
 
+### Removed
+
+#### Query DSL — SymbolNode terminals and SymbolNode-taking sugar
+- `SubclassQuery.collect()`, `ImportQuery.collect()`, `ClassQuery.collect()`,
+  `DeclQuery.collect()` (each previously returned `list[SymbolNode]`).
+  Use the existing `.indices()` terminal (positional indices into
+  `ctx.nodes()`), `.attrs()` (`list[NodeAttrs]`), or `.first_idx()`
+  instead — pair with `ctx.nodes_at(indices)` if you need
+  `SymbolNode` rows.
+- `EdgeQuery.collect()` and the `EdgeRef` class (previously returned
+  `list[EdgeRef]` with `SymbolNode` endpoints). Use the existing
+  `.index_triples()` terminal (`list[tuple[src_idx, dst_idx, flags]]`).
+  `EdgeQuery.first()` is gone for the same reason.
+- `SubclassQuery.of_node(node)` and `DecoratorQuery.in_decl(node)`
+  (both took a `SymbolNode`). Use `.of_idx(idx)` / `.in_decl_idx(idx)`
+  with a positional index into `ctx.nodes()`.
+- `__iter__` on `SubclassQuery` / `ImportQuery` / `ClassQuery` /
+  `DeclQuery` / `EdgeQuery` (which iterated `SymbolNode` / `EdgeRef`).
+  Iterate the appropriate idx-form terminal instead.
+
+The chainable query DSL is now fully idx-form: every terminal returns
+positional indices into `ctx.nodes()` (or an `IdxRef` row that carries
+one). This drops a layer of `Py<SymbolNode>` allocations on the hot
+path and removes the parallel-API confusion of having both
+SymbolNode- and idx-form terminals on the same query.
+
 ## [0.13.0] - 2026-05-26
 
 ### Added

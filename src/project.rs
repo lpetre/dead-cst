@@ -1733,41 +1733,20 @@ impl ProjectContext {
 }
 
 // ``find_imports_of`` / ``_indices`` / ``imports_of_count`` /
-// ``has_imports_of`` back :class:`ImportQuery` and its ``.count()`` /
-// ``.exists()`` shortcuts. NOT exposed to Python — plugin authors use
-// the DSL: ``native.query(ctx).imports().of(module).indices()`` /
-// ``.count()`` / ``.exists()``.
+// ``find_imports_of_indices`` / ``imports_of_count`` / ``has_imports_of``
+// back :class:`ImportQuery` and its ``.count()`` / ``.exists()``
+// shortcuts. NOT exposed to Python — plugin authors use the DSL:
+// ``native.query(ctx).imports().of(module).indices()`` / ``.count()`` /
+// ``.exists()``.
 impl ProjectContext {
-    /// Return every import-kind node whose upstream `module` matches.
+    /// Every import-kind node whose upstream `module` matches, as
+    /// positional indices into ``ctx.nodes()``.
     ///
     /// Covers both `import <module_name>` and
     /// `from <module_name> import ...` styles — both bind import-kind
     /// nodes whose `Import.module` is the absolute dotted name. Star
     /// reexports synthesized from `from <module_name> import *` are
     /// also included.
-    pub(crate) fn find_imports_of(
-        &self,
-        py: Python<'_>,
-        module_name: &str,
-    ) -> PyResult<Vec<Py<SymbolNode>>> {
-        let outputs = self.materialized("find_imports_of")?;
-        // O(1) lookup against the pre-built ``imports_by_module``
-        // index — no scan over all interned nodes. Empty when nothing
-        // imports the module.
-        let Some(idxs) = outputs.imports_by_module.get(module_name) else {
-            return Ok(Vec::new());
-        };
-        let mut out = Vec::with_capacity(idxs.len());
-        for &idx in idxs {
-            out.push(outputs.builder.nodes[idx].clone_ref(py));
-        }
-        Ok(out)
-    }
-
-    /// Idx-only variant of :meth:`find_imports_of`. Same lookup, but
-    /// returns the positional indices into ``ctx.nodes()`` rather than
-    /// materializing ``Py<SymbolNode>`` clones — drives the
-    /// :meth:`ImportQuery.indices` terminal.
     pub(crate) fn find_imports_of_indices(&self, module_name: &str) -> PyResult<Vec<usize>> {
         let outputs = self.materialized("find_imports_of_indices")?;
         Ok(outputs
@@ -2954,33 +2933,17 @@ impl ProjectContext {
     }
 }
 
-// ``find_classes_defining_method`` is the rust-side helper backing
-// :class:`ClassQuery`. It's NOT exposed to Python — plugin authors use
-// the DSL: ``native.query(ctx).classes().defining_method(name).collect()``.
+// ``find_classes_defining_method_indices`` is the rust-side helper
+// backing :class:`ClassQuery`. It's NOT exposed to Python — plugin
+// authors use the DSL:
+// ``native.query(ctx).classes().defining_method(name).indices()``.
 impl ProjectContext {
-    /// Every class that defines a method with the given name.
+    /// Every class that defines a method with the given name, as
+    /// positional indices into ``ctx.nodes()``.
     ///
     /// Walks each class's `DefinitionKind::Class` body for an
     /// `Stmt::FunctionDef` whose name matches. ty's `parsed_module` is
     /// Salsa-cached, so this is just a body scan per class.
-    pub(crate) fn find_classes_defining_method(
-        &self,
-        py: Python<'_>,
-        method_name: &str,
-    ) -> PyResult<Vec<Py<SymbolNode>>> {
-        let indices = self.find_classes_defining_method_indices(py, method_name)?;
-        let outputs = self.materialized("find_classes_defining_method")?;
-        Ok(indices
-            .into_iter()
-            .map(|idx| outputs.builder.nodes[idx].clone_ref(py))
-            .collect())
-    }
-}
-
-impl ProjectContext {
-    /// Idx-only variant of :meth:`find_classes_defining_method`. Same
-    /// per-file parallel walk, but returns positional indices into
-    /// ``ctx.nodes()`` instead of allocating ``Py<SymbolNode>`` clones.
     pub(crate) fn find_classes_defining_method_indices(
         &self,
         py: Python<'_>,
@@ -3034,45 +2997,15 @@ impl ProjectContext {
     }
 }
 
-// ``find_subclasses_of_indices`` / ``_idx`` back :class:`SubclassQuery`.
+// ``find_subclasses_of_idx`` backs :class:`SubclassQuery.of_idx`.
 // NOT exposed to Python — plugin authors use the DSL:
 // ``native.query(ctx).subclasses().of_idx(idx).indices()`` or
 // ``of_fqn(fqn)``.
 impl ProjectContext {
-    /// Idx-only variant of :meth:`find_subclasses_of`. Same lookup,
-    /// returns positional indices into ``ctx.nodes()`` rather than
-    /// allocating ``Py<SymbolNode>`` clones.
-    pub(crate) fn find_subclasses_of_indices(
-        &self,
-        class_node: &SymbolNode,
-    ) -> PyResult<Vec<usize>> {
-        if class_node.kind != "class" {
-            return Ok(Vec::new());
-        }
-        let outputs = self.materialized("find_subclasses_of_indices")?;
-        if let Some((seed_file, seed_range)) = locate_class_def(
-            &self.db,
-            &outputs.path_to_file,
-            &class_node.path,
-            class_node,
-        ) {
-            let rk = (seed_range.start().to_u32(), seed_range.end().to_u32());
-            if let Some(&seed_idx) = outputs.class_by_selection.get(&(seed_file, rk)) {
-                return Ok(transitive_subclasses_via_index(
-                    seed_idx,
-                    &outputs.children_by_node,
-                ));
-            }
-        }
-        Ok(Vec::new())
-    }
-}
-
-impl ProjectContext {
-    /// Idx-keyed variant of :meth:`find_subclasses_of_indices` —
-    /// resolves the seed class by positional index into ``ctx.nodes()``
-    /// rather than taking a ``Py<SymbolNode>`` reference. Bounds-checks
-    /// the index and raises :class:`IndexError` when out of range.
+    /// Subclasses of the class at positional index ``class_idx`` into
+    /// ``ctx.nodes()``. Bounds-checks the index and raises
+    /// :class:`IndexError` when out of range; returns an empty list
+    /// when the seed isn't a class node.
     pub(crate) fn find_subclasses_of_idx(
         &self,
         py: Python<'_>,
@@ -3324,8 +3257,10 @@ impl ProjectContext {
         };
         let mut ctors: Vec<String> = vec![name.to_string()];
         if include_subclasses {
-            for sub in self.find_subclasses(py, class_fqn, true)? {
-                let simple = sub
+            let sub_idxs = self.find_subclasses_indices(py, class_fqn, true)?;
+            let outputs = self.materialized("find_constructions.subclasses")?;
+            for idx in sub_idxs {
+                let simple = outputs.builder.nodes[idx]
                     .borrow(py)
                     .fqname
                     .rsplit('.')
@@ -3372,37 +3307,19 @@ impl ProjectContext {
     }
 }
 
-// ``find_subclasses`` + ``_indices`` back :class:`SubclassQuery`.
+// ``find_subclasses_indices`` backs :class:`SubclassQuery`.
 // NOT exposed to Python — plugin authors use the DSL:
-// ``native.query(ctx).subclasses().of_fqn(fqn).collect()``.
+// ``native.query(ctx).subclasses().of_fqn(fqn).indices()``.
 impl ProjectContext {
-    /// Subclasses of the class addressed by ``base_fqn``.
+    /// Subclasses of the class addressed by ``base_fqn``, as positional
+    /// indices into ``ctx.nodes()``.
     ///
     /// Works for both project classes (where the fqn resolves to a
     /// graph node) and external classes (``unittest.TestCase``,
     /// ``pydantic.BaseModel``) via ty's module resolver +
-    /// ``type_hierarchy_subtypes``. ``transitive=True`` (default)
-    /// walks the full subclass closure; ``transitive=False`` returns
-    /// only direct subclasses.
-    pub(crate) fn find_subclasses(
-        &self,
-        py: Python<'_>,
-        base_fqn: &str,
-        transitive: bool,
-    ) -> PyResult<Vec<Py<SymbolNode>>> {
-        let indices = self.find_subclasses_indices(py, base_fqn, transitive)?;
-        let outputs = self.materialized("find_subclasses")?;
-        Ok(indices
-            .into_iter()
-            .map(|idx| outputs.builder.nodes[idx].clone_ref(py))
-            .collect())
-    }
-}
-
-impl ProjectContext {
-    /// Idx-only variant of :meth:`find_subclasses`. Same lookup,
-    /// returns positional indices into ``ctx.nodes()`` rather than
-    /// allocating ``Py<SymbolNode>`` clones.
+    /// ``type_hierarchy_subtypes``. ``transitive=true`` walks the full
+    /// subclass closure; ``transitive=false`` returns only direct
+    /// subclasses.
     pub(crate) fn find_subclasses_indices(
         &self,
         py: Python<'_>,

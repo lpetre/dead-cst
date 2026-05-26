@@ -48,10 +48,8 @@ class DynamicImportFallbackPlugin(Plugin):
         # flags don't intersect ``DYNAMIC_IMPORT``) + ``with_dst_kind``
         # (drop edges whose ``dst.kind`` isn't ``"module"``).
         # ``index_triples()`` returns ``(src_idx, dst_idx, flags)`` —
-        # cheaper than materialising ``EdgeRef`` rows with
-        # ``Py<SymbolNode>`` endpoints up-front. We batch-materialise
-        # only the (src, dst) pair we actually need for the
-        # path / fqname filter via ``ctx.nodes_at``.
+        # we batch-materialise only the (src, dst) pair we actually
+        # need for the path / fqname filter via ``ctx.nodes_at``.
         triples = (
             native.query(ctx)
             .edges()
