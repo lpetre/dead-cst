@@ -1,7 +1,10 @@
 //! The chainable query DSL exposed to Python via `ProjectContext.query()`.
 //! Result types (`DecoratorIdxRef` / `ConstructionIdxRef` / `CallIdxRef`
-//! / `FactoryIdxRef` / `EdgeRef`), the `QueryBuilder` entry point, and
-//! the per-stream `Query` builders.
+//! / `FactoryIdxRef`), the `QueryBuilder` entry point, and the
+//! per-stream `Query` builders. Every terminal returns positional
+//! indices into `ctx.nodes()` (or an `IdxRef` row that carries one);
+//! plugins revive `SymbolNode` / `NodeAttrs` fields via
+//! `ProjectContext::nodes_at` / `node_attrs` on demand.
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -458,18 +461,16 @@ pub(crate) fn _to_iter(py: Python<'_>, items: Vec<Py<impl PyClass>>) -> PyResult
     Ok(iter_obj.unbind())
 }
 
-/// Generate the `first` / `count` / `__iter__` boilerplate that every
-/// chainable query exposes. Each variant is what the query's `.collect()`
-/// supports — see the three call sites below.
+/// Generate the `first` / `count` / `__iter__` boilerplate that the
+/// `IdxRef`-returning chainable queries expose. Each variant is what
+/// the query's `.collect()` supports.
 ///
 /// `with_first $Q, $R`: query whose `collect()` returns `Vec<Py<$R>>`
 /// and that wants a typed `.first() -> Option<Py<$R>>` shortcut.
 ///
-/// `no_first $Q`: query that wants only `.count()` + `.__iter__()`
-/// (typically returns plain `Py<SymbolNode>`).
-///
-/// `iter_only $Q`: query with a custom `.count()` (cheaper than
-/// materializing `.collect()`); just gets `.__iter__()`.
+/// `no_first $Q`: query whose `collect()` returns `Vec<Py<$R>>` for
+/// some `$R` but doesn't want the `.first()` shortcut; gets
+/// `.count()` + `.__iter__()` over `collect()`'s rows.
 macro_rules! impl_query_methods {
     (with_first $q:ty, $r:ty) => {
         #[pymethods]
@@ -496,14 +497,6 @@ macro_rules! impl_query_methods {
             }
         }
     };
-    (iter_only $q:ty) => {
-        #[pymethods]
-        impl $q {
-            fn __iter__(&self, py: Python<'_>) -> PyResult<PyObject> {
-                _to_iter(py, self.collect(py)?)
-            }
-        }
-    };
 }
 
 /// Find decorated top-level functions / classes. Pick exactly one of:
@@ -516,8 +509,9 @@ macro_rules! impl_query_methods {
 ///   ``decorator_owner`` carries the textual prefix.
 /// * ``where_owner_attr_via(via, attrs)`` —
 ///   ``@<owner>.<via>.<attr>(...)`` two-level chain.
-/// * ``in_decl(node).where_name(names)`` — ``@<node>.<name>``
-///   same-file instance-method decorators.
+/// * ``in_decl_idx(idx).where_name(names)`` — ``@<node>.<name>``
+///   same-file instance-method decorators, anchored on a positional
+///   index into ``ctx.nodes()``.
 #[pyclass(unsendable)]
 pub(crate) struct DecoratorQuery {
     pub(crate) ctx: Py<ProjectContext>,
@@ -526,7 +520,6 @@ pub(crate) struct DecoratorQuery {
     pub(crate) names: Option<Vec<String>>,
     pub(crate) owner_attrs: Option<Vec<String>>,
     pub(crate) via_attr: Option<String>,
-    pub(crate) in_decl: Option<Py<SymbolNode>>,
     pub(crate) in_decl_idx: Option<usize>,
     pub(crate) path_regex: Option<String>,
     pub(crate) kwarg_matchers: Vec<(String, KwargMatcher)>,
@@ -548,7 +541,6 @@ impl DecoratorQuery {
             names: None,
             owner_attrs: None,
             via_attr: None,
-            in_decl: None,
             in_decl_idx: None,
             path_regex: None,
             kwarg_matchers: Vec::new(),
@@ -596,10 +588,6 @@ impl DecoratorQuery {
         slf.via_attr = Some(via);
         slf.owner_attrs = Some(_extract_str_or_list(py, attrs)?);
         Ok(slf)
-    }
-    fn in_decl<'py>(mut slf: PyRefMut<'py, Self>, node: Py<SymbolNode>) -> PyRefMut<'py, Self> {
-        slf.in_decl = Some(node);
-        slf
     }
     fn in_decl_idx<'py>(mut slf: PyRefMut<'py, Self>, idx: usize) -> PyRefMut<'py, Self> {
         slf.in_decl_idx = Some(idx);
@@ -736,32 +724,6 @@ impl DecoratorQuery {
                     decorator_name: None,
                     decorator_owner: Some(owner_name),
                     decorator_via: self.via_attr.clone(),
-                    call_args,
-                });
-            }
-        } else if let Some(in_decl_node) = &self.in_decl {
-            let names = self.names.as_ref().ok_or_else(|| {
-                PyValueError::new_err("DecoratorQuery.in_decl(...) requires .where_name(...)")
-            })?;
-            let in_decl_ref = in_decl_node.borrow(py);
-            let decls =
-                ctx.find_decorations_on(py, &in_decl_ref, names.clone(), path_regex, extract_args)?;
-            let owner_simple = in_decl_ref
-                .fqname
-                .rsplit('.')
-                .next()
-                .unwrap_or("")
-                .to_string();
-            drop(in_decl_ref);
-            for (decorated_idx, call_args) in decls {
-                if !call_args_match_kwargs(&call_args, kwarg_matchers) {
-                    continue;
-                }
-                out.push(DecoratorRowIdx {
-                    decorated_idx,
-                    decorator_name: None,
-                    decorator_owner: Some(owner_simple.clone()),
-                    decorator_via: None,
                     call_args,
                 });
             }
@@ -1233,7 +1195,6 @@ impl_query_methods!(with_first CallQuery, CallIdxRef);
 pub(crate) struct SubclassQuery {
     pub(crate) ctx: Py<ProjectContext>,
     pub(crate) base_fqn: Option<String>,
-    pub(crate) base_node: Option<Py<SymbolNode>>,
     pub(crate) base_idx: Option<usize>,
     pub(crate) transitive: bool,
 }
@@ -1243,7 +1204,6 @@ impl SubclassQuery {
         Self {
             ctx,
             base_fqn: None,
-            base_node: None,
             base_idx: None,
             transitive: true,
         }
@@ -1256,10 +1216,6 @@ impl SubclassQuery {
         slf.base_fqn = Some(fqn);
         slf
     }
-    fn of_node<'py>(mut slf: PyRefMut<'py, Self>, node: Py<SymbolNode>) -> PyRefMut<'py, Self> {
-        slf.base_node = Some(node);
-        slf
-    }
     fn of_idx<'py>(mut slf: PyRefMut<'py, Self>, idx: usize) -> PyRefMut<'py, Self> {
         slf.base_idx = Some(idx);
         slf
@@ -1269,30 +1225,19 @@ impl SubclassQuery {
         slf
     }
 
-    fn collect(&self, py: Python<'_>) -> PyResult<Vec<Py<SymbolNode>>> {
-        let indices = self.indices(py)?;
-        let ctx = self.ctx.borrow(py);
-        let outputs = ctx.materialized("SubclassQuery.collect")?;
-        Ok(indices
-            .into_iter()
-            .map(|i| outputs.builder.nodes[i].clone_ref(py))
-            .collect())
-    }
-
-    /// Index-returning terminal. Same lookup as :meth:`collect`, but
-    /// emits each subclass's positional index into ``ctx.nodes()``
-    /// instead of allocating one ``Py<SymbolNode>`` per row.
+    /// Index-returning terminal. Emits each subclass's positional
+    /// index into ``ctx.nodes()``; pair with
+    /// :meth:`ProjectContext.node_attrs` / :meth:`nodes_at` to revive
+    /// the fqname / path / kind / flags fields if you need them.
     fn indices(&self, py: Python<'_>) -> PyResult<Vec<usize>> {
         let ctx = self.ctx.borrow(py);
         if let Some(fqn) = &self.base_fqn {
             ctx.find_subclasses_indices(py, fqn, self.transitive)
-        } else if let Some(node) = &self.base_node {
-            ctx.find_subclasses_of_indices(&node.borrow(py))
         } else if let Some(idx) = self.base_idx {
             ctx.find_subclasses_of_idx(py, idx)
         } else {
             Err(PyValueError::new_err(
-                "SubclassQuery requires .of_fqn(...), .of_node(...), or .of_idx(...)",
+                "SubclassQuery requires .of_fqn(...) or .of_idx(...)",
             ))
         }
     }
@@ -1317,9 +1262,11 @@ impl SubclassQuery {
         let ctx = self.ctx.borrow(py);
         _bucket_indices_by_path(&ctx, py, indices)
     }
-}
 
-impl_query_methods!(no_first SubclassQuery);
+    fn count(&self, py: Python<'_>) -> PyResult<usize> {
+        Ok(self.indices(py)?.len())
+    }
+}
 
 /// Enumerate the ``kind="import"`` nodes that bind a name from a
 /// given module. Requires ``of(module)``.
@@ -1347,11 +1294,6 @@ impl ImportQuery {
         slf.module = Some(module);
         slf
     }
-    fn collect(&self, py: Python<'_>) -> PyResult<Vec<Py<SymbolNode>>> {
-        self.ctx
-            .borrow(py)
-            .find_imports_of(py, self.module_or_err()?)
-    }
     /// Index-returning terminal. Reads positional indices straight
     /// out of the pre-built ``imports_by_module`` index — no Python
     /// allocation per row.
@@ -1367,8 +1309,8 @@ impl ImportQuery {
     fn exists(&self, py: Python<'_>) -> PyResult<bool> {
         self.ctx.borrow(py).has_imports_of(self.module_or_err()?)
     }
-    /// Count without allocating `Py<SymbolNode>` clones — read the
-    /// length of the pre-built index entry directly.
+    /// Count without iterating — reads the length of the pre-built
+    /// index entry directly.
     fn count(&self, py: Python<'_>) -> PyResult<usize> {
         Ok(self.ctx.borrow(py).imports_of_count(self.module_or_err()?))
     }
@@ -1394,8 +1336,6 @@ impl ImportQuery {
         _bucket_indices_by_path(&ctx, py, indices)
     }
 }
-
-impl_query_methods!(iter_only ImportQuery);
 
 /// Enumerate / inspect project module nodes. Pick exactly one filter
 /// (``with_fqn`` / ``with_path`` / ``with_dunders``), optionally
@@ -1591,19 +1531,12 @@ impl ClassQuery {
         slf.defining_method = Some(name);
         slf
     }
-    fn collect(&self, py: Python<'_>) -> PyResult<Vec<Py<SymbolNode>>> {
-        let ctx = self.ctx.borrow(py);
-        let name = self
-            .defining_method
-            .as_deref()
-            .ok_or_else(|| PyValueError::new_err("ClassQuery requires .defining_method(name)"))?;
-        ctx.find_classes_defining_method(py, name)
-    }
 
-    /// Index-returning terminal. Same per-file parallel walk as
-    /// :meth:`collect`, but emits each class node's positional index
-    /// into ``ctx.nodes()`` instead of allocating ``Py<SymbolNode>``
-    /// clones.
+    /// Index-returning terminal. Per-file parallel walk emitting each
+    /// matched class's positional index into ``ctx.nodes()``; pair
+    /// with :meth:`ProjectContext.node_attrs` / :meth:`nodes_at` to
+    /// revive ``kind`` / ``path`` / ``fqname`` / ``flags`` if you
+    /// need them.
     fn indices(&self, py: Python<'_>) -> PyResult<Vec<usize>> {
         let ctx = self.ctx.borrow(py);
         let name = self
@@ -1633,9 +1566,11 @@ impl ClassQuery {
         let ctx = self.ctx.borrow(py);
         _bucket_indices_by_path(&ctx, py, indices)
     }
-}
 
-impl_query_methods!(no_first ClassQuery);
+    fn count(&self, py: Python<'_>) -> PyResult<usize> {
+        Ok(self.indices(py)?.len())
+    }
+}
 
 /// One result row from :class:`FactoryQuery`. ``decl`` is the
 /// Walk function / class bodies for ``<Ctor>(...)`` calls where
@@ -1743,16 +1678,6 @@ impl_query_methods!(no_first FactoryQuery);
 // EdgeQuery — filtered enumeration over the in-progress graph's edges
 // ---------------------------------------------------------------------------
 
-/// One graph edge with both endpoint nodes resolved. Avoids the
-/// `nodes[src_idx]` / `nodes[dst_idx]` ping-pong that a Python-side
-/// ``for src_idx, dst_idx, flags in ctx.edges()`` loop pays.
-#[pyclass(frozen, get_all)]
-pub(crate) struct EdgeRef {
-    pub(crate) src: Py<SymbolNode>,
-    pub(crate) dst: Py<SymbolNode>,
-    pub(crate) flags: u32,
-}
-
 /// Filtered enumeration over the in-progress graph's edges. Predicates
 /// AND together; any unset predicate doesn't filter.
 ///
@@ -1760,11 +1685,10 @@ pub(crate) struct EdgeRef {
 /// * ``with_src_kind(kind)`` / ``with_dst_kind(kind)`` — keep edges
 ///   whose endpoint ``SymbolNode.kind`` matches the given string.
 ///
-/// Avoids the per-edge Python ↔ rust FFI hop that a
-/// ``for src_idx, dst_idx, flags in ctx.edges()`` plus
-/// ``nodes = ctx.nodes(); nodes[src_idx]`` pattern pays — the entire
-/// filter runs rust-side and only the surviving rows are materialized
-/// into ``Py<SymbolNode>``.
+/// The single terminal :meth:`index_triples` returns
+/// ``(src_idx, dst_idx, flags)`` tuples into ``ctx.nodes()``; pair
+/// with :meth:`ProjectContext.nodes_at` if you need to revive the
+/// endpoint nodes.
 #[pyclass(unsendable)]
 pub(crate) struct EdgeQuery {
     pub(crate) ctx: Py<ProjectContext>,
@@ -1806,53 +1730,9 @@ impl EdgeQuery {
         slf
     }
 
-    fn collect(&self, py: Python<'_>) -> PyResult<Vec<Py<EdgeRef>>> {
-        let ctx = self.ctx.borrow(py);
-        let outputs = ctx.materialized("EdgeQuery.collect")?;
-        let nodes: &[Py<SymbolNode>] = &outputs.builder.nodes;
-        let edges: &[(usize, usize, u32)] = &outputs.builder.edges;
-        let flag_mask = self.flag_mask;
-        let src_kind = self.src_kind.as_deref();
-        let dst_kind = self.dst_kind.as_deref();
-        let mut refs: Vec<Py<EdgeRef>> = Vec::new();
-        for &(src_idx, dst_idx, flags) in edges {
-            if let Some(mask) = flag_mask {
-                if flags & mask == 0 {
-                    continue;
-                }
-            }
-            // Endpoint-kind predicates: borrow only the side(s) the
-            // caller actually filtered on so the common
-            // ``with_flags(...)`` shape pays nothing for kind checks.
-            if let Some(needle) = src_kind {
-                if nodes[src_idx].borrow(py).kind != needle {
-                    continue;
-                }
-            }
-            if let Some(needle) = dst_kind {
-                if nodes[dst_idx].borrow(py).kind != needle {
-                    continue;
-                }
-            }
-            refs.push(Py::new(
-                py,
-                EdgeRef {
-                    src: nodes[src_idx].clone_ref(py),
-                    dst: nodes[dst_idx].clone_ref(py),
-                    flags,
-                },
-            )?);
-        }
-        Ok(refs)
-    }
-
-    /// Index-returning terminal for edges. Same per-edge predicate
-    /// pipeline as :meth:`collect`, but emits ``(src_idx, dst_idx,
-    /// flags)`` triples instead of materialising one :class:`EdgeRef`
-    /// (and two ``Py<SymbolNode>`` clones) per row.
-    ///
-    /// Faster than :meth:`collect` when you only need set-membership
-    /// or counting over edge endpoints; pair with
+    /// Index-returning terminal for edges. Emits
+    /// ``(src_idx, dst_idx, flags)`` triples into ``ctx.nodes()``
+    /// after applying every configured predicate. Pair with
     /// :meth:`ProjectContext.nodes_at` to revive the surviving
     /// endpoints on demand.
     fn index_triples(&self, py: Python<'_>) -> PyResult<Vec<(usize, usize, u32)>> {
@@ -1884,9 +1764,11 @@ impl EdgeQuery {
         }
         Ok(out)
     }
-}
 
-impl_query_methods!(with_first EdgeQuery, EdgeRef);
+    fn count(&self, py: Python<'_>) -> PyResult<usize> {
+        Ok(self.index_triples(py)?.len())
+    }
+}
 
 // ---------------------------------------------------------------------------
 // DeclQuery — generic node-stream filter
@@ -2125,25 +2007,14 @@ impl DeclQuery {
         Ok(slf)
     }
 
-    fn collect(&self, py: Python<'_>) -> PyResult<Vec<Py<SymbolNode>>> {
-        let indices = self.indices(py)?;
-        let ctx = self.ctx.borrow(py);
-        let outputs = ctx.materialized("DeclQuery.collect")?;
-        Ok(indices
-            .into_iter()
-            .map(|i| outputs.builder.nodes[i].clone_ref(py))
-            .collect())
-    }
-
-    /// Index-returning terminal. Same predicate semantics as
-    /// :meth:`collect`, but emits each surviving node's positional
-    /// index into ``ctx.nodes()`` (a plain ``list[int]``) instead of
-    /// allocating one ``Py<SymbolNode>`` per row.
+    /// Index-returning terminal. Emits each surviving node's
+    /// positional index into ``ctx.nodes()`` (a plain ``list[int]``)
+    /// after applying every configured predicate.
     ///
     /// Use when you only need set membership / counting on the
     /// surviving nodes (or want to feed an index-keyed
     /// :class:`AddEdgeByIdx`); call :meth:`ProjectContext.nodes_at`
-    /// to materialize back to ``SymbolNode`` later.
+    /// / :meth:`node_attrs` to revive node fields if you need them.
     fn indices(&self, py: Python<'_>) -> PyResult<Vec<usize>> {
         let ctx = self.ctx.borrow(py);
         let outputs = ctx.materialized("DeclQuery.indices")?;
@@ -2345,9 +2216,11 @@ impl DeclQuery {
         let ctx = self.ctx.borrow(py);
         _bucket_indices_by_path(&ctx, py, indices)
     }
-}
 
-impl_query_methods!(no_first DeclQuery);
+    fn count(&self, py: Python<'_>) -> PyResult<usize> {
+        Ok(self.indices(py)?.len())
+    }
+}
 
 // ---------------------------------------------------------------------------
 // TraverseQuery — seeded closure walks

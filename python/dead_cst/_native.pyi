@@ -555,13 +555,10 @@ class ProjectContext:
     # type-stub contract; use ``query(ctx)`` instead.
 
     # The subclass-walk surface lives entirely on
-    # :class:`SubclassQuery`. The point-lookup ``ctx.find_subclasses(fqn)``
-    # / ``find_subclasses_of(node)`` / ``find_subclasses_of_idx(idx)``
-    # methods that used to mirror these queries are now rust-only
-    # (called by :class:`SubclassQuery` internally). Plugin authors:
-    # use the DSL — ``native.query(ctx).subclasses().of_fqn(fqn)`` /
-    # ``.of_idx(idx)`` / ``.of_node(node)`` (legacy node-form input)
-    # with ``.collect()`` or ``.indices()`` terminals.
+    # :class:`SubclassQuery`. The point-lookup helpers that backed it
+    # are rust-internal — plugin authors use the DSL:
+    # ``native.query(ctx).subclasses().of_fqn(fqn).indices()`` or
+    # ``.of_idx(idx).indices()``.
 
     # ----- FQN resolution ------------------------------------------------
     #
@@ -1175,16 +1172,20 @@ def query(ctx: ProjectContext) -> QueryBuilder:
 class QueryBuilder:
     """Entry point for the chainable query API.
 
-    Filtered streams (terminated by ``.collect()``):
+    Every terminal returns positional indices into
+    :meth:`ProjectContext.nodes` (or one of the ``IdxRef`` row types
+    that carry an idx + per-row metadata for decorator / construction
+    / call / factory rows). Pair index returns with
+    :meth:`ProjectContext.nodes_at` / :meth:`node_attrs` to revive
+    :class:`SymbolNode` / :class:`NodeAttrs` fields on demand.
+
+    Filtered streams:
     :meth:`decorators` / :meth:`constructions` / :meth:`calls` /
     :meth:`subclasses` / :meth:`imports` / :meth:`classes` /
     :meth:`factories` / :meth:`edges`.
 
-    Point lookups (e.g. :meth:`ProjectContext.find_module`,
-    :meth:`ProjectContext.find_declarations`,
-    :meth:`ProjectContext.find_main_blocks`,
+    Point lookups (e.g. :meth:`ProjectContext.find_main_blocks`,
     :meth:`ProjectContext.find_comment_patterns`,
-    :meth:`ProjectContext.find_module_dunders`,
     :meth:`ProjectContext.find_literal_list_entries`) live directly on
     :class:`ProjectContext`.
     """
@@ -1258,11 +1259,13 @@ class DecoratorQuery:
     def where_owner_attr_via(
         self, via: str, attrs: str | list[str] | tuple[str, ...]
     ) -> DecoratorQuery: ...
-    def in_decl(self, node: SymbolNode) -> DecoratorQuery: ...
     def in_decl_idx(self, idx: int) -> DecoratorQuery:
-        """Idx-form sibling of :meth:`in_decl`. Pass a positional index
-        into :meth:`ProjectContext.nodes` directly so plugins working
-        in idx-space don't round-trip through a ``SymbolNode``.
+        """Anchor the decorator search on the decl at positional index
+        ``idx`` into :meth:`ProjectContext.nodes`. Pairs with
+        :meth:`where_name` to match ``@<owner>.<name>`` same-file
+        instance-method decorators where ``<owner>`` is the decl at
+        ``idx``. Raises :class:`IndexError` at terminal time when
+        ``idx`` is out of range.
         """
         ...
     def where_path(self, regex: str) -> DecoratorQuery: ...
@@ -1382,30 +1385,27 @@ class CallQuery:
 class SubclassQuery:
     """Walk the subclass closure of a class.
 
-    Pick exactly one of :meth:`of_fqn` / :meth:`of_node`. The
-    default :meth:`transitive` is ``True``; flip to ``False`` for
-    direct subclasses only. Mirrors the union of
-    ``ProjectContext.find_subclasses`` and ``find_subclasses_of``.
+    Pick exactly one of :meth:`of_fqn` / :meth:`of_idx`. The default
+    :meth:`transitive` is ``True``; flip to ``False`` for direct
+    subclasses only.
     """
 
     def of_fqn(self, fqn: str) -> SubclassQuery: ...
-    def of_node(self, node: SymbolNode) -> SubclassQuery: ...
     def of_idx(self, idx: int) -> SubclassQuery:
-        """Idx-form sibling of :meth:`of_node`. Pass a positional
-        index into :meth:`ProjectContext.nodes` directly so plugins
-        working in idx-space don't round-trip through a ``SymbolNode``.
+        """Anchor the walk on the class at positional index ``idx``
+        into :meth:`ProjectContext.nodes`. Raises :class:`IndexError`
+        at terminal time when ``idx`` is out of range; returns an
+        empty list when the seed isn't a class node.
         """
         ...
 
     def transitive(self, value: bool) -> SubclassQuery: ...
-    def collect(self) -> list[SymbolNode]: ...
     def count(self) -> int: ...
-    def __iter__(self) -> Iterator[SymbolNode]: ...
     def indices(self) -> list[int]:
-        """Index-returning terminal. Same lookup as :meth:`collect`,
-        but emits each subclass's positional index into
-        :meth:`ProjectContext.nodes` instead of allocating
-        ``SymbolNode`` clones.
+        """Index-returning terminal. Emits each subclass's positional
+        index into :meth:`ProjectContext.nodes`; pair with
+        :meth:`ProjectContext.node_attrs` / :meth:`nodes_at` to revive
+        ``kind`` / ``path`` / ``fqname`` / ``flags`` on demand.
         """
         ...
 
@@ -1431,12 +1431,9 @@ class SubclassQuery:
 class ImportQuery:
     """Enumerate the ``kind="import"`` nodes that bind a name from a
     given module. Requires :meth:`of` (the upstream module name).
-
-    Mirrors :meth:`ProjectContext.find_imports_of`.
     """
 
     def of(self, module: str) -> ImportQuery: ...
-    def collect(self) -> list[SymbolNode]: ...
     def indices(self) -> list[int]:
         """Index-returning terminal. Reads positional indices straight
         out of the pre-built ``imports_by_module`` index — no Python
@@ -1448,8 +1445,8 @@ class ImportQuery:
     def exists(self) -> bool:
         """O(1) presence probe — does any project file import the
         configured module? Short-circuits without materialising a
-        Python list. Preferred over ``.count() > 0`` / ``.collect()``
-        for plugin guards that just need a boolean.
+        Python list. Preferred over ``.count() > 0`` for plugin
+        guards that just need a boolean.
         """
         ...
 
@@ -1471,8 +1468,6 @@ class ImportQuery:
         path.
         """
         ...
-
-    def __iter__(self) -> Iterator[SymbolNode]: ...
 
 class ModuleQuery:
     """Enumerate / inspect project module nodes.
@@ -1686,19 +1681,16 @@ class ClassQuery:
     """Enumerate classes by structural property. Today the only filter
     is :meth:`defining_method` (matches classes whose body has a
     ``FunctionDef`` with that name).
-
-    Mirrors :meth:`ProjectContext.find_classes_defining_method`.
     """
 
     def defining_method(self, name: str) -> ClassQuery: ...
-    def collect(self) -> list[SymbolNode]: ...
     def count(self) -> int: ...
-    def __iter__(self) -> Iterator[SymbolNode]: ...
     def indices(self) -> list[int]:
-        """Index-returning terminal. Same per-file parallel walk as
-        :meth:`collect`, but emits positional indices into
-        :meth:`ProjectContext.nodes` instead of allocating
-        ``SymbolNode`` clones.
+        """Index-returning terminal. Per-file parallel walk emitting
+        each matched class's positional index into
+        :meth:`ProjectContext.nodes`; pair with
+        :meth:`ProjectContext.node_attrs` / :meth:`nodes_at` to revive
+        ``kind`` / ``path`` / ``fqname`` / ``flags`` on demand.
         """
         ...
 
@@ -1745,23 +1737,12 @@ class FactoryQuery:
         """
         ...
 
-class EdgeRef:
-    """One graph edge with both endpoint nodes resolved.
-
-    Avoids the ``nodes[src_idx]`` / ``nodes[dst_idx]`` ping-pong that a
-    Python-side ``for src_idx, dst_idx, flags in ctx.edges()`` loop pays.
-    """
-
-    src: SymbolNode
-    dst: SymbolNode
-    flags: int
-
 class EdgeQuery:
     """Filtered enumeration over the in-progress graph's edges.
 
     Predicates AND together; any unset predicate doesn't filter. The
-    entire filter runs rust-side and only the surviving rows are
-    materialized into ``Py<SymbolNode>``.
+    entire filter runs rust-side; the only terminal is
+    :meth:`index_triples`.
     """
 
     def with_flags(self, mask: int) -> EdgeQuery:
@@ -1782,20 +1763,13 @@ class EdgeQuery:
         """Keep edges whose ``dst`` node has the given ``kind``."""
         ...
 
-    def collect(self) -> list[EdgeRef]: ...
-    def first(self) -> EdgeRef | None: ...
     def count(self) -> int: ...
-    def __iter__(self) -> Iterator[EdgeRef]: ...
     def index_triples(self) -> list[tuple[int, int, int]]:
-        """Index-returning terminal for edges. Same per-edge predicate
-        pipeline as :meth:`collect`, but emits ``(src_idx, dst_idx,
-        flags)`` triples instead of materialising one :class:`EdgeRef`
-        (and two ``SymbolNode`` clones) per row.
-
-        Faster than :meth:`collect` when you only need set-membership
-        / counting over edge endpoints; pair with
-        :meth:`ProjectContext.nodes_at` to revive the surviving
-        endpoints on demand.
+        """Index-returning terminal for edges. Emits
+        ``(src_idx, dst_idx, flags)`` triples into
+        :meth:`ProjectContext.nodes` after applying every configured
+        predicate. Pair with :meth:`ProjectContext.nodes_at` to revive
+        the surviving endpoints on demand.
         """
         ...
 
@@ -1878,25 +1852,21 @@ class DeclQuery:
         the node's ``fqname`` matches any element. ``re.Pattern``
         instances are recompiled rust-side using rust's ``regex``
         crate, so any PCRE-only syntax raises ``ValueError`` at the
-        call site (not later at ``collect``).
+        call site (not later at the terminal).
         """
         ...
 
-    def collect(self) -> list[SymbolNode]: ...
     def count(self) -> int: ...
-    def __iter__(self) -> Iterator[SymbolNode]: ...
     def indices(self) -> list[int]:
-        """Index-returning terminal. Same predicate semantics as
-        :meth:`collect`, but emits each surviving node's positional
-        index into :meth:`ProjectContext.nodes` (a plain
-        ``list[int]``) instead of allocating one ``SymbolNode`` per
-        row.
+        """Index-returning terminal. Emits each surviving node's
+        positional index into :meth:`ProjectContext.nodes` (a plain
+        ``list[int]``) after applying every configured predicate.
 
         Use when you only need set membership / counting on the
         surviving nodes (or want to feed an index-keyed
         :class:`AddEdgeByIdx`); call
-        :meth:`ProjectContext.nodes_at` to materialize back to
-        ``SymbolNode`` later.
+        :meth:`ProjectContext.nodes_at` / :meth:`node_attrs` to
+        revive ``SymbolNode`` / :class:`NodeAttrs` rows on demand.
         """
         ...
 

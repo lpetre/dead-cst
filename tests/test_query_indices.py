@@ -3,9 +3,9 @@ the ``ctx.reachable_indices`` / ``ctx.indices_where`` / ``ctx.nodes_at``
 sibling helpers on :class:`ProjectContext`, and the
 :class:`AddEdgeByIdx` graph op.
 
-These cover the additive surface added to let plugins do index-level set
-operations without paying the per-row ``Py<SymbolNode>`` allocation that
-``.collect()`` does.
+The chainable query DSL has only idx-form terminals — every query
+returns positional indices into :meth:`ProjectContext.nodes` (or one of
+the ``IdxRef`` row types). These tests pin that idx-form contract.
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ from dead_cst import _native as native
 # ---------------------------------------------------------------------------
 
 
-def test_decl_query_indices_matches_collect(build_decl_graph):
+def test_decl_query_indices_resolves_to_matching_nodes(build_decl_graph):
     ctx = build_decl_graph(
         {
             "pkg/__init__.py": "",
@@ -28,15 +28,10 @@ def test_decl_query_indices_matches_collect(build_decl_graph):
             "pkg/b.py": "def beta(): pass\n",
         }
     )
-    q = native.query(ctx).decls().with_kind("function")
-    nodes = q.collect()
-    indices = q.indices()
-    assert len(nodes) == len(indices)
-    all_nodes = ctx.nodes()
-    for node, idx in zip(nodes, indices, strict=True):
-        assert all_nodes[idx].fqname == node.fqname
-        assert all_nodes[idx].path == node.path
-        assert all_nodes[idx].start_line == node.start_line
+    indices = native.query(ctx).decls().with_kind("function").indices()
+    revived = ctx.nodes_at(indices)
+    assert {n.fqname for n in revived} == {"pkg.a.alpha", "pkg.b.beta"}
+    assert {n.kind for n in revived} == {"function"}
 
 
 def test_decl_query_indices_predicate_combos(build_decl_graph):
@@ -59,7 +54,7 @@ def test_decl_query_indices_predicate_combos(build_decl_graph):
 # ---------------------------------------------------------------------------
 
 
-def test_subclass_query_indices_matches_collect(build_decl_graph):
+def test_subclass_query_indices_walks_transitive_closure(build_decl_graph):
     ctx = build_decl_graph(
         {
             "pkg/__init__.py": "",
@@ -71,13 +66,9 @@ def test_subclass_query_indices_matches_collect(build_decl_graph):
             """,
         }
     )
-    q = native.query(ctx).subclasses().of_fqn("pkg.bases.Base")
-    indices = q.indices()
-    nodes = q.collect()
-    assert len(indices) == len(nodes)
-    # Round-trip back through nodes_at — same fqnames.
+    indices = native.query(ctx).subclasses().of_fqn("pkg.bases.Base").indices()
     revived = ctx.nodes_at(indices)
-    assert {n.fqname for n in revived} == {n.fqname for n in nodes}
+    assert {n.fqname for n in revived} == {"pkg.sub.Mid", "pkg.sub.Leaf"}
 
 
 # ---------------------------------------------------------------------------
@@ -85,7 +76,7 @@ def test_subclass_query_indices_matches_collect(build_decl_graph):
 # ---------------------------------------------------------------------------
 
 
-def test_import_query_indices_matches_collect(build_decl_graph):
+def test_import_query_indices_returns_import_nodes(build_decl_graph):
     ctx = build_decl_graph(
         {
             "pkg/__init__.py": "",
@@ -93,10 +84,7 @@ def test_import_query_indices_matches_collect(build_decl_graph):
             "pkg/b.py": "from os.path import join as j2\n",
         }
     )
-    q = native.query(ctx).imports().of("os.path")
-    indices = q.indices()
-    nodes = q.collect()
-    assert len(indices) == len(nodes)
+    indices = native.query(ctx).imports().of("os.path").indices()
     assert len(indices) >= 2  # at least the two import nodes
     revived = ctx.nodes_at(indices)
     assert {n.kind for n in revived} == {"import"}
@@ -107,7 +95,7 @@ def test_import_query_indices_matches_collect(build_decl_graph):
 # ---------------------------------------------------------------------------
 
 
-def test_class_query_indices_matches_collect(build_decl_graph):
+def test_class_query_indices_filters_by_defining_method(build_decl_graph):
     ctx = build_decl_graph(
         {
             "pkg/__init__.py": "",
@@ -119,12 +107,9 @@ def test_class_query_indices_matches_collect(build_decl_graph):
             """,
         }
     )
-    q = native.query(ctx).classes().defining_method("greet")
-    indices = q.indices()
-    nodes = q.collect()
-    assert len(indices) == len(nodes) == 1
+    indices = native.query(ctx).classes().defining_method("greet").indices()
     revived = ctx.nodes_at(indices)
-    assert revived[0].fqname == "pkg.a.Greeter"
+    assert [n.fqname for n in revived] == ["pkg.a.Greeter"]
 
 
 # ---------------------------------------------------------------------------
@@ -132,22 +117,18 @@ def test_class_query_indices_matches_collect(build_decl_graph):
 # ---------------------------------------------------------------------------
 
 
-def test_edge_query_index_triples_matches_collect(build_decl_graph):
+def test_edge_query_index_triples_filters_by_src_kind(build_decl_graph):
     ctx = build_decl_graph(
         {
             "pkg/__init__.py": "",
             "pkg/a.py": "def f(): pass\ndef g(): f()\n",
         }
     )
-    q = native.query(ctx).edges().with_src_kind("function")
-    triples = q.index_triples()
-    refs = q.collect()
-    assert len(triples) == len(refs)
+    triples = native.query(ctx).edges().with_src_kind("function").index_triples()
     all_nodes = ctx.nodes()
-    for (src_idx, dst_idx, flags), ref in zip(triples, refs, strict=True):
-        assert all_nodes[src_idx].fqname == ref.src.fqname
-        assert all_nodes[dst_idx].fqname == ref.dst.fqname
-        assert flags == ref.flags
+    assert triples  # at least one function-sourced edge
+    for src_idx, _dst_idx, _flags in triples:
+        assert all_nodes[src_idx].kind == "function"
 
 
 # ---------------------------------------------------------------------------
@@ -779,26 +760,12 @@ def test_find_subclasses_of_idx_out_of_range_raises(build_decl_graph):
         native.query(ctx).subclasses().of_idx(n).indices()
 
 
-def test_subclass_query_of_idx_matches_of_node(build_decl_graph):
-    ctx = build_decl_graph(
-        {
-            "pkg/__init__.py": "",
-            "pkg/a.py": "class Base: pass\nclass Sub(Base): pass\n",
-        }
-    )
-    (base_idx,) = ctx.indices_where(fqname_prefix="pkg.a.Base", kind="class")
-    base_node = ctx.nodes_at([base_idx])[0]
-    by_node = native.query(ctx).subclasses().of_node(base_node).indices()
-    by_idx = native.query(ctx).subclasses().of_idx(base_idx).indices()
-    assert sorted(by_node) == sorted(by_idx)
-
-
 # ---------------------------------------------------------------------------
 # DecoratorQuery.in_decl_idx
 # ---------------------------------------------------------------------------
 
 
-def test_decorator_query_in_decl_idx_matches_in_decl(build_decl_graph):
+def test_decorator_query_in_decl_idx_finds_instance_method_decorators(build_decl_graph):
     ctx = build_decl_graph(
         {
             "pkg/__init__.py": "",
@@ -813,11 +780,9 @@ def test_decorator_query_in_decl_idx_matches_in_decl(build_decl_graph):
         }
     )
     (cli_idx,) = ctx.indices_where(fqname_prefix="pkg.app.cli", kind="variable")
-    cli_node = ctx.nodes_at([cli_idx])[0]
-    by_node = native.query(ctx).decorators().in_decl(cli_node).where_name("command").collect()
-    by_idx = native.query(ctx).decorators().in_decl_idx(cli_idx).where_name("command").collect()
-    assert len(by_node) == len(by_idx)
-    assert sorted(r.decorated_idx for r in by_node) == sorted(r.decorated_idx for r in by_idx)
+    rows = native.query(ctx).decorators().in_decl_idx(cli_idx).where_name("command").collect()
+    decorated = ctx.nodes_at([r.decorated_idx for r in rows])
+    assert {n.fqname for n in decorated} == {"pkg.app.hello", "pkg.app.bye"}
 
 
 def test_decorator_query_in_decl_idx_requires_where_name(build_decl_graph):
