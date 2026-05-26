@@ -673,36 +673,44 @@ class Analysis:
         self._ctx = ctx
         return ctx
 
-    def re_materialize(self, dirty_files: Sequence[Path | str]) -> native.ProjectContext:
+    def re_materialize(
+        self, events: Sequence[native.ChangeEvent] | None = None
+    ) -> native.ProjectContext:
         """Incrementally re-run materialize against the existing ctx.
 
-        Notifies salsa that ``dirty_files`` have changed (via
-        :meth:`native.ProjectContext.sync_paths`), then re-drives the
-        build + plugin pipeline on the same :class:`native.ProjectContext`.
-        Salsa's per-file cache survives across calls, so unchanged files
-        skip parsing / ``file_to_nodes`` / ``file_to_edges`` /
+        With no argument, autodetects file-system changes via
+        :meth:`native.ProjectContext.detect_changes` (which today
+        returns a single ``ChangeEvent.rescan()`` — ty stats every
+        known file and only invalidates salsa for the ones whose mtime
+        / size actually changed, then re-walks for new / deleted
+        files). Callers with explicit knowledge of what changed (e.g.
+        an LSP integration consuming ``didChangeWatchedFiles``) can
+        pass a list of :class:`native.ChangeEvent` instances directly.
+
+        Salsa's per-file cache survives across calls, so unchanged
+        files skip parsing / ``file_to_nodes`` / ``file_to_edges`` /
         ``file_to_ref_edges`` recomputation; cross-file importers
         invalidate transitively through salsa's auto-tracked reads.
-
-        The assemble pass and plugin pass still run unconditionally —
-        they're cheap O(N) walks over a warm salsa cache. Plugin
-        ``prepare`` is *not* re-run; plugins are assumed unchanged
-        across the lifetime of the :class:`Analysis`.
+        The assemble pass and plugin pass run unconditionally — cheap
+        O(N) walks over the warm cache. Plugin ``prepare`` is *not*
+        re-run; plugins are assumed unchanged across the lifetime of
+        the :class:`Analysis`.
 
         Returns the same (now-rebuilt) :class:`native.ProjectContext`
         instance that :meth:`materialize_all` returned. Callers that
-        cached :class:`SymbolNode` objects from the previous build must
-        re-fetch them — node identities are rebuilt by the assemble
-        pass.
+        cached :class:`SymbolNode` objects from the previous build
+        must re-fetch them — node identities are rebuilt by the
+        assemble pass.
 
         Raises :class:`RuntimeError` if :meth:`materialize_all` hasn't
-        been called yet (there's no ctx to re-build).
+        been called yet.
         """
         if self._ctx is None:
             raise RuntimeError(
                 "re_materialize() requires a prior materialize_all() call to construct the ctx"
             )
-        self._ctx.sync_paths([str(p) for p in dirty_files])
+        change_events = list(events) if events is not None else self._ctx.detect_changes()
+        self._ctx.apply_changes(change_events)
         self._ctx.reset_progress()
         self._drive_build(self._ctx)
         return self._ctx

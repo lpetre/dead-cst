@@ -49,7 +49,7 @@ use crate::graph::{EdgeFlags, Import, NativeGraph, NodeFlags, SymbolNode};
 use crate::helpers::{ArgLiteral, ArgNodeRef, ArgOpaque, NodeAttrs};
 use crate::io::{read_graph, write_graph, GraphMetadata};
 use crate::progress::ProgressHandle;
-use crate::project::{Project, ProjectContext};
+use crate::project::{ChangeEvent, Project, ProjectContext};
 use crate::query::{
     CallIdxRef, CallQuery, ClassQuery, ConstructionIdxRef, ConstructionQuery, DeclQuery,
     DeclarationsQuery, DecoratorIdxRef, DecoratorQuery, EdgeQuery, EdgeRef, FactoryIdxRef,
@@ -77,6 +77,7 @@ fn dead_cst_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<NativeGraph>()?;
     m.add_class::<Project>()?;
     m.add_class::<ProjectContext>()?;
+    m.add_class::<ChangeEvent>()?;
     m.add_class::<AddEdge>()?;
     m.add_class::<AddEdgeByIdx>()?;
     m.add_class::<AddEntrypoint>()?;

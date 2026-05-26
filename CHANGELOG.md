@@ -11,18 +11,32 @@ two versions.
 
 ### Added
 
-- `Analysis.re_materialize(dirty_files)` — incrementally rebuild the
-  project graph against the existing `native.ProjectContext`. Notifies
-  salsa that the listed files have changed (via the new
-  `native.ProjectContext.sync_paths`), resets progress state (new
-  `reset_progress`), clears plugins (new `clear_plugins`), then
-  re-drives the build + plugin pipeline. The per-file salsa cache for
-  unchanged files survives across calls, so only dirty +
-  transitively-dirty files re-fire — cross-file importers invalidate
-  automatically through salsa's read-tracking on `file_to_nodes`.
-  Plugin `prepare` is a one-shot, not re-run. The assemble pass and
-  plugin pass still execute on every call; they're cheap O(N) walks
-  over a warm cache.
+- `Analysis.re_materialize(events=None)` — incrementally rebuild the
+  project graph against the existing `native.ProjectContext`. With no
+  argument, calls `native.ProjectContext.detect_changes()` to
+  auto-discover what changed on disk (currently emits a single
+  `ChangeEvent.rescan()`); explicit callers (LSP integrations, file
+  watchers) can pass a list of `native.ChangeEvent` instances.
+  `native.ProjectContext.apply_changes(events)` forwards to
+  `ty_project::ProjectDatabase::apply_changes`, which handles each
+  variant correctly — `Changed` bumps the file's salsa revision only
+  if its mtime / size actually differ; `Created` registers brand-new
+  paths with the project file set so they're discovered on the next
+  rebuild; `Deleted` removes them; `Rescan` triggers a full
+  `Files::sync_all` + project re-walk + metadata rediscovery.
+  Configuration files (`pyproject.toml`, ignore files, custom-stdlib
+  `VERSIONS`) trigger a project reload automatically. Salsa's
+  per-file cache for content-unchanged files survives across calls,
+  so the assemble pass and plugin pass run on a warm cache. Plugin
+  `prepare` is a one-shot owned by `materialize_all`, not re-run on
+  re_materialize.
+- `native.ChangeEvent` Python class with `changed(path)`,
+  `created(path)`, `deleted(path)`, and `rescan()` classmethods plus
+  `.kind` / `.path` accessors, exposed for LSP-style integrations
+  that want precise control over what to invalidate.
+- `native.ProjectContext.clear_plugins()` and `reset_progress()` —
+  internal helpers `re_materialize` uses to keep plugin registrations
+  and progress counters from leaking across calls.
 
 ## [0.13.0] - 2026-05-26
 
