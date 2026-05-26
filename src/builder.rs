@@ -258,7 +258,8 @@ impl AddEntrypointByIdx {
 /// element of ``edges_to`` a ``this -> target`` edge — so a plugin
 /// doesn't need a separate handle to reference the freshly-minted node
 /// from subsequent ops. Set ``flags = NodeFlags.ENTRYPOINT`` to make
-/// the node a seed (``AddEntrypoint`` is the single-target sugar).
+/// the node a seed (``AddEntrypoint`` / ``AddEntrypointByIdx`` are the
+/// single-target sugar).
 #[pyclass(frozen, get_all)]
 pub(crate) struct AddNode {
     pub(crate) fqname: String,

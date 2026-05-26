@@ -611,6 +611,42 @@ def test_node_attrs_bounds_check(build_decl_graph):
 
 
 # ---------------------------------------------------------------------------
+# ctx.node_paths — slim variant of node_attrs
+# ---------------------------------------------------------------------------
+
+
+def test_node_paths_matches_node_attrs_path_field(build_decl_graph):
+    """``node_paths(idxs)`` must return the same ``path`` value
+    ``node_attrs(idxs)`` returns at row position 1 — parity is the
+    whole contract; the only difference is allocation count."""
+    ctx = build_decl_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/a.py": "def f(): pass\nclass C: pass\n",
+            "pkg/b.py": "x = 1\n",
+        }
+    )
+    all_idxs = list(range(len(ctx.nodes())))
+    paths = ctx.node_paths(all_idxs)
+    attrs = ctx.node_attrs(all_idxs)
+    assert len(paths) == len(attrs) == len(all_idxs)
+    for path, (_kind, attr_path, _fq, _flags) in zip(paths, attrs, strict=True):
+        assert path == attr_path
+
+
+def test_node_paths_empty(build_decl_graph):
+    ctx = build_decl_graph({"pkg/__init__.py": "", "pkg/a.py": "x = 1\n"})
+    assert ctx.node_paths([]) == []
+
+
+def test_node_paths_bounds_check(build_decl_graph):
+    ctx = build_decl_graph({"pkg/__init__.py": "", "pkg/a.py": "x = 1\n"})
+    n = len(ctx.nodes())
+    with pytest.raises(IndexError, match="out of range"):
+        ctx.node_paths([n])
+
+
+# ---------------------------------------------------------------------------
 # *Query.row_indices — index-form row terminals
 # ---------------------------------------------------------------------------
 

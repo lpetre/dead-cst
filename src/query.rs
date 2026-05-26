@@ -110,12 +110,20 @@ impl CallRef {
 // Lean siblings of the ref types: same dispatch, but every
 // ``SymbolNode`` field is replaced with a positional index into
 // ``ctx.nodes()`` and the costly ``args`` / ``kwargs`` row payloads
-// are dropped. Returned by the ``.row_indices()`` terminals on
+// are dropped — both because they're expensive to materialise and
+// because entries inside them can be ``SymbolNode`` references that
+// would re-introduce the GIL hops the idx surface is designed to
+// avoid. Plugins that need ``args`` / ``kwargs`` access fall back to
+// the node-form ``.collect()`` terminals; plugins that only need to
+// filter by kwarg keep using ``.where_kwarg(...)``, which operates
+// rust-side before row construction either way.
+//
+// Returned by the ``.row_indices()`` terminals on
 // :class:`DecoratorQuery` / :class:`ConstructionQuery` /
 // :class:`CallQuery` / :class:`FactoryQuery`. Pair with
-// :meth:`ProjectContext.node_attrs` to batch-fetch any
-// ``(kind, path, fqname, flags)`` the plugin still needs without
-// per-row ``borrow`` ping-pong.
+// :meth:`ProjectContext.node_attrs` (or :meth:`node_paths` when only
+// ``path`` is needed) to batch-fetch any node fields the plugin still
+// needs without per-row ``borrow`` ping-pong.
 // ---------------------------------------------------------------------------
 
 /// Index-form sibling of :class:`DecoratorRef`. Same metadata fields,

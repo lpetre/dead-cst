@@ -45,7 +45,7 @@ class ServerConfigPlugin(Plugin):
         )
         if not idxs:
             return
-        for idx, (_k, path, _fq, _f) in zip(idxs, ctx.node_attrs(idxs), strict=True):
+        for idx, path in zip(idxs, ctx.node_paths(idxs), strict=True):
             targets_by_path.setdefault(path, []).append(idx)
 
         paths = list(targets_by_path.keys())

@@ -33,7 +33,10 @@ class UnittestPlugin(Plugin):
         if not native.query(ctx).imports().of("unittest").exists():
             return
         import_idxs = native.query(ctx).imports().of("unittest").indices()
-        importer_paths = {path for _k, path, _fq, _f in ctx.node_attrs(import_idxs)}
+        # ``node_paths`` rather than ``node_attrs`` — we only need
+        # path here; kind / fqname / flags would be allocated then
+        # thrown away.
+        importer_paths = set(ctx.node_paths(import_idxs))
 
         # decls_by_path: path -> [decl_idx, ...]
         decls_by_path: dict[str, list[int]] = {}
@@ -41,9 +44,7 @@ class UnittestPlugin(Plugin):
             sub_idxs = native.query(ctx).subclasses().of_fqn(base_fqname).transitive(True).indices()
             if not sub_idxs:
                 continue
-            for sub_idx, (_k, sub_path, _fq, _f) in zip(
-                sub_idxs, ctx.node_attrs(sub_idxs), strict=True
-            ):
+            for sub_idx, sub_path in zip(sub_idxs, ctx.node_paths(sub_idxs), strict=True):
                 decls_by_path.setdefault(sub_path, []).append(sub_idx)
 
         hook_idxs = (
@@ -55,13 +56,12 @@ class UnittestPlugin(Plugin):
             .indices()
         )
         if hook_idxs:
-            for hook_idx, (_k, hook_path, _fq, _f) in zip(
-                hook_idxs, ctx.node_attrs(hook_idxs), strict=True
-            ):
+            for hook_idx, hook_path in zip(hook_idxs, ctx.node_paths(hook_idxs), strict=True):
                 decls_by_path.setdefault(hook_path, []).append(hook_idx)
 
         flags = int(NodeFlags.TESTCASE)
-        # Batched module-fqname fetch — one node_attrs hop per path bucket.
+        # Module-fqname fetch needs ``fqname``, so ``node_attrs`` is
+        # the right tool here — but only for the seed paths.
         paths = list(decls_by_path.keys())
         module_idxs = ctx.modules_for_paths(paths)
         present_modules = [(p, idx) for p, idx in zip(paths, module_idxs) if idx is not None]

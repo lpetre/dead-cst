@@ -46,14 +46,13 @@ class DiscordPyPlugin(Plugin):
         ):
             return
 
-        # Per-file gate: only fire on files that import discord. Fetch
-        # the import nodes' paths in a single batched node_attrs call
-        # rather than per-row borrowing.
+        # Per-file gate: only fire on files that import discord.
+        # ``node_paths`` rather than ``node_attrs`` — we only need
+        # path here; the other fields would be allocated then dropped.
         discord_paths: set[str] = set()
         for module in ("discord", "discord.ext", "discord.ext.commands"):
             idxs = native.query(ctx).imports().of(module).indices()
-            for _kind, path, _fqname, _flags in ctx.node_attrs(idxs):
-                discord_paths.add(path)
+            discord_paths.update(ctx.node_paths(idxs))
 
         # 1. Bot / Client constructions.
         bot_rows: list[native.ConstructionIdxRef] = []
@@ -108,9 +107,7 @@ class DiscordPyPlugin(Plugin):
             cog_idxs = native.query(ctx).subclasses().of_fqn(base).transitive(True).indices()
             if not cog_idxs:
                 continue
-            for cog_idx, (_k, cog_path, _fq, _f) in zip(
-                cog_idxs, ctx.node_attrs(cog_idxs), strict=True
-            ):
+            for cog_idx, cog_path in zip(cog_idxs, ctx.node_paths(cog_idxs), strict=True):
                 cogs_by_path.setdefault(cog_path, []).append(cog_idx)
 
         if cogs_by_path:
@@ -124,9 +121,7 @@ class DiscordPyPlugin(Plugin):
                 .indices()
             )
             if hook_idxs:
-                for hook_idx, (_k, hook_path, _fq, _f) in zip(
-                    hook_idxs, ctx.node_attrs(hook_idxs), strict=True
-                ):
+                for hook_idx, hook_path in zip(hook_idxs, ctx.node_paths(hook_idxs), strict=True):
                     hook_funcs_by_path.setdefault(hook_path, []).append(hook_idx)
 
             for path, cog_idxs in cogs_by_path.items():

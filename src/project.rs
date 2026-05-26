@@ -4074,6 +4074,11 @@ impl ProjectContext {
     /// ``borrow`` round-trips — lets plugins that filter / partition by
     /// these four fields stay GIL-free in the inner loop.
     ///
+    /// When a plugin only needs ``path`` (the common "bucket by file"
+    /// case), prefer :meth:`node_paths` — it skips the per-row
+    /// ``kind`` / ``fqname`` / ``flags`` clones that ``node_attrs`` would
+    /// allocate but the plugin would throw away.
+    ///
     /// Validates bounds the same way :meth:`nodes_at` does and raises
     /// :class:`IndexError` when any index is out of range.
     pub(crate) fn node_attrs(
@@ -4097,6 +4102,29 @@ impl ProjectContext {
                 node.fqname.clone(),
                 node.flags,
             ));
+        }
+        Ok(out)
+    }
+
+    /// Batched ``path``-only snapshot for each index in ``indices``.
+    /// Same FFI shape as :meth:`node_attrs` but allocates only one
+    /// ``str`` per row instead of ``(kind, path, fqname, flags)`` —
+    /// roughly 3× fewer Python allocations on the common "bucket by
+    /// file" path that doesn't need the other three fields.
+    ///
+    /// Validates bounds and raises :class:`IndexError` when any index
+    /// is out of range. Mirrors the contract of :meth:`node_attrs`.
+    pub(crate) fn node_paths(&self, py: Python<'_>, indices: Vec<usize>) -> PyResult<Vec<String>> {
+        let outputs = self.materialized("node_paths")?;
+        let len = outputs.builder.nodes.len();
+        let mut out: Vec<String> = Vec::with_capacity(indices.len());
+        for idx in indices {
+            if idx >= len {
+                return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                    "node index {idx} out of range (len={len})"
+                )));
+            }
+            out.push(outputs.builder.nodes[idx].borrow(py).path.clone());
         }
         Ok(out)
     }

@@ -253,7 +253,8 @@ class AddNode:
     freshly-minted node from subsequent ops. Set
     ``flags = NodeFlags.ENTRYPOINT`` to make the node a reachability
     seed; for the common single-target entrypoint pattern, prefer
-    ``AddEntrypoint(decl, marker=...)``.
+    :class:`AddEntrypoint` (or :class:`AddEntrypointByIdx` from
+    idx-space).
     """
 
     fqname: str
@@ -1006,8 +1007,24 @@ class ProjectContext:
         four fields stay GIL-free in the inner loop, which matters
         once the plugin pass runs concurrently.
 
+        When the plugin only needs ``path`` (the common "bucket by
+        file" case), prefer :meth:`node_paths` — it skips the per-row
+        ``kind`` / ``fqname`` / ``flags`` clones that ``node_attrs``
+        would allocate but the plugin would throw away.
+
         Validates bounds the same way :meth:`nodes_at` does and raises
         :class:`IndexError` when any index is out of range.
+        """
+        ...
+
+    def node_paths(self, indices: Sequence[int]) -> list[str]:
+        """Batched ``path``-only snapshot for each index. Same FFI shape
+        as :meth:`node_attrs` but allocates only one ``str`` per row
+        instead of a 4-tuple — roughly 3× fewer Python allocations on
+        the common "bucket by file" path.
+
+        Validates bounds and raises :class:`IndexError` when any index
+        is out of range.
         """
         ...
 
@@ -1257,9 +1274,18 @@ class DecoratorIdxRef:
     :meth:`ProjectContext.nodes`. ``path`` is preserved because plugins
     routinely bucket by path before any further query.
 
+    ``args`` / ``kwargs`` are dropped on the idx form because entries
+    inside them can be :class:`SymbolNode` references that would
+    re-introduce the GIL hops the idx surface is designed to avoid.
+    Plugins that need them fall back to :meth:`DecoratorQuery.collect`;
+    plugins that only need to filter by kwarg keep using
+    :meth:`DecoratorQuery.where_kwarg`, which runs rust-side before
+    row construction either way.
+
     Returned by :meth:`DecoratorQuery.row_indices`. Pair with
-    :meth:`ProjectContext.node_attrs` to batch-fetch any other node
-    fields the plugin needs without per-row ``borrow`` ping-pong.
+    :meth:`ProjectContext.node_attrs` (or :meth:`node_paths` when only
+    ``path`` is needed) to batch-fetch any other node fields the
+    plugin needs without per-row ``borrow`` ping-pong.
     """
 
     decorated_idx: int
@@ -1272,7 +1298,9 @@ class ConstructionIdxRef:
     """Index-form sibling of :class:`ConstructionRef`. Same metadata
     fields, minus ``args`` / ``kwargs``; ``var_idx`` indexes into
     :meth:`ProjectContext.nodes`. ``path`` is preserved as a cheap
-    bucket key for plugins that fan out per file.
+    bucket key for plugins that fan out per file. ``args`` /
+    ``kwargs`` are dropped for the same reason
+    :class:`DecoratorIdxRef` drops them — see its docstring.
 
     Returned by :meth:`ConstructionQuery.row_indices`.
     """
@@ -1285,8 +1313,13 @@ class CallIdxRef:
     """Index-form sibling of :class:`CallRef`. Same metadata fields,
     minus ``args`` / ``kwargs``; ``owner_idx`` indexes into
     :meth:`ProjectContext.nodes`. ``path`` is the owning decl's path;
-    ``string_arg`` (the literal at the configured positional index) is
-    preserved because most call-shape plugins key on it.
+    ``string_arg`` (the literal at the configured positional index)
+    is preserved because (a) most call-shape plugins key on it and
+    (b) it's a plain ``str`` with no ``SymbolNode`` content, so it
+    doesn't cost a borrow per row.
+
+    ``args`` / ``kwargs`` are dropped for the same reason
+    :class:`DecoratorIdxRef` drops them — see its docstring.
 
     Returned by :meth:`CallQuery.row_indices`.
     """
