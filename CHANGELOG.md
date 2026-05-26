@@ -43,6 +43,14 @@ two versions.
   `ctx.descendants_indices`, `ctx.ancestors_indices` — idx-form
   siblings of the last six lookup / traversal helpers that still
   allocated ``Py<SymbolNode>`` rows.
+- `DecoratorQuery.with_args(bool)` / `ConstructionQuery.with_args(bool)`
+  / `CallQuery.with_args(bool)` — opt out of rust-side
+  `extract_call_args_kwargs` extraction per query. Defaults to `True`.
+  When `False`, the row's lazy `args` / `kwargs` getters surface
+  empty containers; saves the per-row rust-side enum allocation when
+  the plugin doesn't need to inspect args/kwargs. On `CallQuery` /
+  `DecoratorQuery`, auto-forced back to `True` at row-collection time
+  when any `where_kwarg(...)` is set — kwarg filtering needs the data.
 - `ArgLiteral` / `ArgNodeRef` / `ArgOpaque` pyclasses + `CallArg`
   discriminated-union alias. The four ref-query terminals now expose
   `args` / `kwargs` lazily as `list[CallArg]` / `dict[str, CallArg]`,

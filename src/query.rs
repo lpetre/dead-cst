@@ -455,6 +455,13 @@ pub(crate) struct DecoratorQuery {
     pub(crate) in_decl_idx: Option<usize>,
     pub(crate) path_regex: Option<String>,
     pub(crate) kwarg_matchers: Vec<(String, KwargMatcher)>,
+    /// User-controlled args/kwargs extraction gate. Defaults to
+    /// ``true``; flip with ``.with_args(false)`` to skip the rust-side
+    /// :fn:`extract_call_args_kwargs` walk when the plugin doesn't
+    /// read row ``args`` / ``kwargs``. Auto-forced back to ``true``
+    /// at row-collection time when any ``where_kwarg`` is set, since
+    /// kwarg filtering needs the data.
+    pub(crate) with_args: bool,
 }
 
 impl DecoratorQuery {
@@ -470,6 +477,7 @@ impl DecoratorQuery {
             in_decl_idx: None,
             path_regex: None,
             kwarg_matchers: Vec::new(),
+            with_args: true,
         }
     }
 }
@@ -527,12 +535,25 @@ impl DecoratorQuery {
         slf
     }
 
+    /// Opt out of rust-side ``args`` / ``kwargs`` extraction.
+    /// ``with_args(False)`` skips the per-row
+    /// :fn:`extract_call_args_kwargs` walk; row ``args`` / ``kwargs``
+    /// getters then surface empty containers. Useful for plugins that
+    /// only need the row's idx + metadata strings — saves rust-side
+    /// allocation per matched row. Forced back to ``True`` at row-
+    /// collection time when any ``where_kwarg`` is set (kwarg filtering
+    /// needs the data).
+    fn with_args<'py>(mut slf: PyRefMut<'py, Self>, value: bool) -> PyRefMut<'py, Self> {
+        slf.with_args = value;
+        slf
+    }
+
     /// Add a kwarg matcher. Multiple calls AND together.
     ///
     /// ``value`` must be a Python literal (``None`` / ``bool`` /
-    /// ``int`` / ``float`` / ``str`` / ``list`` / ``tuple``). Passing
-    /// any other type — including a :class:`SymbolNode` — raises
-    /// ``ValueError``.
+    /// ``int`` / ``float`` / ``str`` / ``bytes`` / ``list`` /
+    /// ``tuple``). Passing any other type — including a
+    /// :class:`SymbolNode` — raises ``ValueError``.
     fn where_kwarg<'py>(
         mut slf: PyRefMut<'py, Self>,
         name: String,
@@ -597,12 +618,22 @@ impl DecoratorQuery {
         let ctx = self.ctx.borrow(py);
         let path_regex = self.path_regex.as_deref();
         let kwarg_matchers = &self.kwarg_matchers;
+        // ``with_args(False)`` skips the rust-side extraction, but
+        // kwarg filtering needs ``CallArgs`` populated — force it back
+        // to ``true`` when any matcher is set.
+        let extract_args = self.with_args || !kwarg_matchers.is_empty();
         let mut out: Vec<DecoratorRowIdx> = Vec::new();
         if let Some(owner_attrs) = &self.owner_attrs {
             let triples = if let Some(via) = &self.via_attr {
-                ctx.find_handler_decorators_via(py, via, owner_attrs.clone(), path_regex)?
+                ctx.find_handler_decorators_via(
+                    py,
+                    via,
+                    owner_attrs.clone(),
+                    path_regex,
+                    extract_args,
+                )?
             } else {
-                ctx.find_handler_decorators(py, owner_attrs.clone(), path_regex)?
+                ctx.find_handler_decorators(py, owner_attrs.clone(), path_regex, extract_args)?
             };
             for (owner_name, decorated_idx, call_args) in triples {
                 if !call_args_match_kwargs(&call_args, kwarg_matchers) {
@@ -621,7 +652,8 @@ impl DecoratorQuery {
                 PyValueError::new_err("DecoratorQuery.in_decl(...) requires .where_name(...)")
             })?;
             let in_decl_ref = in_decl_node.borrow(py);
-            let decls = ctx.find_decorations_on(py, &in_decl_ref, names.clone(), path_regex)?;
+            let decls =
+                ctx.find_decorations_on(py, &in_decl_ref, names.clone(), path_regex, extract_args)?;
             let owner_simple = in_decl_ref
                 .fqname
                 .rsplit('.')
@@ -653,7 +685,8 @@ impl DecoratorQuery {
                 )));
             }
             let in_decl_ref = outputs.builder.nodes[in_decl_idx].borrow(py);
-            let decls = ctx.find_decorations_on(py, &in_decl_ref, names.clone(), path_regex)?;
+            let decls =
+                ctx.find_decorations_on(py, &in_decl_ref, names.clone(), path_regex, extract_args)?;
             let owner_simple = in_decl_ref
                 .fqname
                 .rsplit('.')
@@ -674,7 +707,7 @@ impl DecoratorQuery {
                 });
             }
         } else if let Some(fqn) = &self.callee_fqn {
-            let decls = ctx.find_decorated(py, fqn, path_regex)?;
+            let decls = ctx.find_decorated(py, fqn, path_regex, extract_args)?;
             for (decorated_idx, call_args) in decls {
                 if !call_args_match_kwargs(&call_args, kwarg_matchers) {
                     continue;
@@ -688,7 +721,8 @@ impl DecoratorQuery {
                 });
             }
         } else if let (Some(modules), Some(names)) = (&self.modules, &self.names) {
-            let decls = ctx.find_decorated_decls(py, modules, names.clone(), path_regex)?;
+            let decls =
+                ctx.find_decorated_decls(py, modules, names.clone(), path_regex, extract_args)?;
             for (decorated_idx, call_args) in decls {
                 if !call_args_match_kwargs(&call_args, kwarg_matchers) {
                     continue;
@@ -730,6 +764,10 @@ pub(crate) struct ConstructionQuery {
     pub(crate) class_fqn: Option<String>,
     pub(crate) include_subclasses: bool,
     pub(crate) path_regex: Option<String>,
+    /// See :class:`DecoratorQuery::with_args`. Defaults to ``true``.
+    /// :class:`ConstructionQuery` doesn't have its own
+    /// ``where_kwarg`` (yet), so this isn't auto-forced.
+    pub(crate) with_args: bool,
 }
 
 impl ConstructionQuery {
@@ -741,6 +779,7 @@ impl ConstructionQuery {
             class_fqn: None,
             include_subclasses: false,
             path_regex: None,
+            with_args: true,
         }
     }
 }
@@ -775,6 +814,13 @@ impl ConstructionQuery {
     }
     fn where_path<'py>(mut slf: PyRefMut<'py, Self>, regex: String) -> PyRefMut<'py, Self> {
         slf.path_regex = Some(regex);
+        slf
+    }
+
+    /// Opt out of rust-side ``args`` / ``kwargs`` extraction; see
+    /// :meth:`DecoratorQuery.with_args` for the trade-off.
+    fn with_args<'py>(mut slf: PyRefMut<'py, Self>, value: bool) -> PyRefMut<'py, Self> {
+        slf.with_args = value;
         slf
     }
 
@@ -814,14 +860,15 @@ struct ConstructionRowIdx {
 }
 
 impl ConstructionQuery {
-    /// Shared dispatch used by both terminals (:meth:`collect` and
-    /// :meth:`row_indices`). Stays in idx-space throughout.
+    /// Shared idx-space dispatch backing :meth:`collect`.
     fn construction_rows(&self, py: Python<'_>) -> PyResult<Vec<ConstructionRowIdx>> {
         let ctx = self.ctx.borrow(py);
         let path_regex = self.path_regex.as_deref();
+        let extract_args = self.with_args;
         let mut out: Vec<ConstructionRowIdx> = Vec::new();
         if let Some(fqn) = &self.class_fqn {
-            let pairs = ctx.find_constructions(py, fqn, self.include_subclasses, path_regex)?;
+            let pairs =
+                ctx.find_constructions(py, fqn, self.include_subclasses, path_regex, extract_args)?;
             let cls_name = fqn.rsplit('.').next().unwrap_or("").to_string();
             for (var_idx, call_args) in pairs {
                 out.push(ConstructionRowIdx {
@@ -831,8 +878,13 @@ impl ConstructionQuery {
                 });
             }
         } else if let (Some(modules), Some(names)) = (&self.modules, &self.names) {
-            let triples =
-                ctx.find_instance_constructions(py, modules, names.clone(), path_regex)?;
+            let triples = ctx.find_instance_constructions(
+                py,
+                modules,
+                names.clone(),
+                path_regex,
+                extract_args,
+            )?;
             for (var_idx, name, call_args) in triples {
                 out.push(ConstructionRowIdx {
                     var_idx,
@@ -871,6 +923,9 @@ pub(crate) struct CallQuery {
     pub(crate) required_positional: Option<usize>,
     pub(crate) path_regex: Option<String>,
     pub(crate) kwarg_matchers: Vec<(String, KwargMatcher)>,
+    /// See :class:`DecoratorQuery::with_args`. Auto-forced to ``true``
+    /// when any ``where_kwarg`` is set.
+    pub(crate) with_args: bool,
 }
 
 impl CallQuery {
@@ -885,6 +940,7 @@ impl CallQuery {
             required_positional: None,
             path_regex: None,
             kwarg_matchers: Vec::new(),
+            with_args: true,
         }
     }
 }
@@ -928,12 +984,20 @@ impl CallQuery {
         slf
     }
 
+    /// Opt out of rust-side ``args`` / ``kwargs`` extraction; see
+    /// :meth:`DecoratorQuery.with_args` for the trade-off. Auto-forced
+    /// back to ``true`` when any ``where_kwarg`` is set.
+    fn with_args<'py>(mut slf: PyRefMut<'py, Self>, value: bool) -> PyRefMut<'py, Self> {
+        slf.with_args = value;
+        slf
+    }
+
     /// Add a kwarg matcher. Multiple calls AND together.
     ///
     /// ``value`` must be a Python literal (``None`` / ``bool`` /
-    /// ``int`` / ``float`` / ``str`` / ``list`` / ``tuple``). Passing
-    /// any other type — including a :class:`SymbolNode` — raises
-    /// ``ValueError``.
+    /// ``int`` / ``float`` / ``str`` / ``bytes`` / ``list`` /
+    /// ``tuple``). Passing any other type — including a
+    /// :class:`SymbolNode` — raises ``ValueError``.
     fn where_kwarg<'py>(
         mut slf: PyRefMut<'py, Self>,
         name: String,
@@ -981,16 +1045,16 @@ struct CallRowIdx {
 }
 
 impl CallQuery {
-    /// Shared dispatch used by both terminals (:meth:`collect` and
-    /// :meth:`row_indices`). Stays in idx-space throughout.
+    /// Shared idx-space dispatch backing :meth:`collect`.
     fn call_rows(&self, py: Python<'_>) -> PyResult<Vec<CallRowIdx>> {
         let ctx = self.ctx.borrow(py);
         let arg_index = self
             .arg_index
             .ok_or_else(|| PyValueError::new_err("CallQuery: .string_arg_at(index) is required"))?;
         let path_regex = self.path_regex.as_deref();
+        let extract_args = self.with_args || !self.kwarg_matchers.is_empty();
         let triples = if let (Some(modules), Some(name)) = (&self.modules, &self.name) {
-            ctx.find_calls_to_imported(py, modules, name, arg_index, path_regex)?
+            ctx.find_calls_to_imported(py, modules, name, arg_index, path_regex, extract_args)?
         } else if let (Some(owner), Some(attr)) = (&self.owner, &self.attr) {
             ctx.find_calls_on_var(
                 py,
@@ -999,9 +1063,10 @@ impl CallQuery {
                 arg_index,
                 self.required_positional,
                 path_regex,
+                extract_args,
             )?
         } else if let Some(attr) = &self.attr {
-            ctx.find_calls_on_attr(py, attr, arg_index, path_regex)?
+            ctx.find_calls_on_attr(py, attr, arg_index, path_regex, extract_args)?
         } else {
             return Err(PyValueError::new_err(
                 "CallQuery requires one of: where_module(...) + where_name(...); \

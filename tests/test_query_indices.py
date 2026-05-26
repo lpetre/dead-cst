@@ -707,6 +707,74 @@ def test_call_query_collect_returns_idx_rows(build_decl_graph):
         assert row.string_arg == "settings"
 
 
+def test_with_args_false_yields_empty_args_kwargs(build_decl_graph):
+    """``with_args(False)`` short-circuits the rust-side
+    ``extract_call_args_kwargs`` walk. Row ``args`` / ``kwargs``
+    getters surface empty containers; node-identity + metadata
+    strings (``decorator_owner``, ``string_arg``, etc.) still populate
+    as normal."""
+    ctx = build_decl_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/svc.py": (
+                "import functools\n@functools.lru_cache(maxsize=128)\ndef cached(): pass\n"
+            ),
+        }
+    )
+    with_args_rows = (
+        native.query(ctx).decorators().where_module("functools").where_name("lru_cache").collect()
+    )
+    assert len(with_args_rows) == 1
+    # Sanity: default extracts args/kwargs.
+    assert dict(with_args_rows[0].kwargs)
+
+    no_args_rows = (
+        native.query(ctx)
+        .decorators()
+        .where_module("functools")
+        .where_name("lru_cache")
+        .with_args(False)
+        .collect()
+    )
+    assert len(no_args_rows) == 1
+    # Empty containers when extraction is skipped.
+    assert list(no_args_rows[0].args) == []
+    assert dict(no_args_rows[0].kwargs) == {}
+    # Identity + metadata fields still populate normally.
+    assert no_args_rows[0].decorated_idx == with_args_rows[0].decorated_idx
+    assert no_args_rows[0].decorator_owner == with_args_rows[0].decorator_owner
+
+
+def test_with_args_false_does_not_disable_kwarg_filter(build_decl_graph):
+    """Even with ``with_args(False)``, ``.where_kwarg(...)`` must still
+    filter — the rust side forces extraction back on when any kwarg
+    matcher is set."""
+    ctx = build_decl_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/svc.py": (
+                "import functools\n"
+                "@functools.lru_cache(maxsize=128)\n"
+                "def big(): pass\n"
+                "@functools.lru_cache(maxsize=1)\n"
+                "def small(): pass\n"
+            ),
+        }
+    )
+    rows = (
+        native.query(ctx)
+        .decorators()
+        .where_module("functools")
+        .where_name("lru_cache")
+        .with_args(False)
+        .where_kwarg("maxsize", 128)
+        .collect()
+    )
+    assert len(rows) == 1
+    fqnames = {ctx.nodes()[r.decorated_idx].fqname for r in rows}
+    assert fqnames == {"pkg.svc.big"}
+
+
 def test_factory_query_collect_returns_idx_rows(build_decl_graph):
     ctx = build_decl_graph(
         {

@@ -1404,6 +1404,20 @@ class DecoratorQuery:
         """
         ...
 
+    def with_args(self, value: bool) -> DecoratorQuery:
+        """Opt out of rust-side ``args`` / ``kwargs`` extraction.
+
+        Defaults to ``True``. When set to ``False`` the per-row
+        :fn:`extract_call_args_kwargs` walk is skipped — the row's
+        ``args`` / ``kwargs`` getters then surface empty containers.
+        Useful for plugins that only need the row's idx + metadata
+        strings; saves rust-side allocation per matched row.
+
+        Auto-forced back to ``True`` at row-collection time when any
+        ``where_kwarg`` is set (kwarg filtering needs the data).
+        """
+        ...
+
     def collect(self) -> list[DecoratorIdxRef]: ...
     def first(self) -> DecoratorIdxRef | None: ...
     def count(self) -> int: ...
@@ -1422,6 +1436,12 @@ class ConstructionQuery:
     def where_name(self, names: str | list[str] | tuple[str, ...]) -> ConstructionQuery: ...
     def where_class(self, fqn: str, *, include_subclasses: bool = False) -> ConstructionQuery: ...
     def where_path(self, regex: str) -> ConstructionQuery: ...
+    def with_args(self, value: bool) -> ConstructionQuery:
+        """Opt out of rust-side ``args`` / ``kwargs`` extraction. See
+        :meth:`DecoratorQuery.with_args`.
+        """
+        ...
+
     def collect(self) -> list[ConstructionIdxRef]: ...
     def first(self) -> ConstructionIdxRef | None: ...
     def count(self) -> int: ...
@@ -1455,6 +1475,13 @@ class CallQuery:
         ``float`` / ``str`` / ``list`` / ``tuple``). A missing kwarg
         on the call never matches. A non-literal kwarg expression
         never matches.
+        """
+        ...
+
+    def with_args(self, value: bool) -> CallQuery:
+        """Opt out of rust-side ``args`` / ``kwargs`` extraction. See
+        :meth:`DecoratorQuery.with_args`. Auto-forced back to ``True``
+        when any ``where_kwarg`` is set.
         """
         ...
 

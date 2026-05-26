@@ -1498,6 +1498,10 @@ where
     pub(crate) arg_index: usize,
     pub(crate) file_imports: &'a FxHashMap<String, String>,
     pub(crate) decl_by_fqname: &'a FxHashMap<String, Vec<usize>>,
+    /// When ``false``, every result row gets a default-constructed
+    /// (empty) :struct:`CallArgs`. The caller pays for the rust-side
+    /// arg / kwarg walk only when ``extract_args = true``.
+    pub(crate) extract_args: bool,
     pub(crate) results: Vec<(String, CallArgs)>,
 }
 
@@ -1509,8 +1513,11 @@ where
         if let Expr::Call(call) = expr {
             if (self.predicate)(call) {
                 if let Some(value) = nth_positional_string(call, self.arg_index) {
-                    let call_args =
-                        extract_call_args_kwargs(call, self.file_imports, self.decl_by_fqname);
+                    let call_args = if self.extract_args {
+                        extract_call_args_kwargs(call, self.file_imports, self.decl_by_fqname)
+                    } else {
+                        CallArgs::default()
+                    };
                     self.results.push((value, call_args));
                 }
             }
@@ -1532,6 +1539,8 @@ pub(crate) struct AttrCallFinder<'a> {
     pub(crate) arg_index: usize,
     pub(crate) file_imports: &'a FxHashMap<String, String>,
     pub(crate) decl_by_fqname: &'a FxHashMap<String, Vec<usize>>,
+    /// See :struct:`StringArgCallFinder` — same gate.
+    pub(crate) extract_args: bool,
     pub(crate) results: Vec<(String, CallArgs)>,
 }
 
@@ -1543,11 +1552,15 @@ impl<'ast, 'a> Visitor<'ast> for AttrCallFinder<'a> {
                     if let Some(arg) = call.arguments.args.get(self.arg_index) {
                         let hits = string_or_string_collection(arg);
                         if !hits.is_empty() {
-                            let call_args = extract_call_args_kwargs(
-                                call,
-                                self.file_imports,
-                                self.decl_by_fqname,
-                            );
+                            let call_args = if self.extract_args {
+                                extract_call_args_kwargs(
+                                    call,
+                                    self.file_imports,
+                                    self.decl_by_fqname,
+                                )
+                            } else {
+                                CallArgs::default()
+                            };
                             for s in hits {
                                 self.results.push((s, call_args.clone()));
                             }

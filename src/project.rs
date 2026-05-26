@@ -2515,6 +2515,7 @@ impl ProjectContext {
         decorator_modules: &[String],
         decorator_names: Vec<String>,
         path_regex: Option<&str>,
+        extract_args: bool,
     ) -> PyResult<Vec<(usize, CallArgs)>> {
         let outputs = self.materialized("find_decorated_decls")?;
         let path_re = _compile_path_regex(path_regex)?;
@@ -2564,9 +2565,13 @@ impl ProjectContext {
                     };
                     let key = (file, range_key(func.name.range()));
                     if let Some(&idx) = decl_by_name_range.get(&key) {
-                        let call_args = call_form
-                            .map(|c| extract_call_args_kwargs(c, &file_imports, decl_by_fqname))
-                            .unwrap_or_default();
+                        let call_args = if extract_args {
+                            call_form
+                                .map(|c| extract_call_args_kwargs(c, &file_imports, decl_by_fqname))
+                                .unwrap_or_default()
+                        } else {
+                            CallArgs::default()
+                        };
                         local.push((idx, call_args));
                     }
                 }
@@ -2598,6 +2603,7 @@ impl ProjectContext {
         modules: &[String],
         ctor_names: Vec<String>,
         path_regex: Option<&str>,
+        extract_args: bool,
     ) -> PyResult<Vec<(usize, String, CallArgs)>> {
         let outputs = self.materialized("find_instance_constructions")?;
         let path_re = _compile_path_regex(path_regex)?;
@@ -2641,8 +2647,11 @@ impl ProjectContext {
                     {
                         let key = (file, range_key(target_range));
                         if let Some(&idx) = decl_by_name_range.get(&key) {
-                            let call_args =
-                                extract_call_args_kwargs(call, &file_imports, decl_by_fqname);
+                            let call_args = if extract_args {
+                                extract_call_args_kwargs(call, &file_imports, decl_by_fqname)
+                            } else {
+                                CallArgs::default()
+                            };
                             local.push((idx, matched, call_args));
                         }
                     }
@@ -2668,6 +2677,7 @@ impl ProjectContext {
         py: Python<'_>,
         decorator_attrs: Vec<String>,
         path_regex: Option<&str>,
+        extract_args: bool,
     ) -> PyResult<Vec<(String, usize, CallArgs)>> {
         let outputs = self.materialized("find_handler_decorators")?;
         let path_re = _compile_path_regex(path_regex)?;
@@ -2719,9 +2729,15 @@ impl ProjectContext {
                         }
                         let key = (file, range_key(func.name.range()));
                         if let Some(&idx) = decl_by_name_range.get(&key) {
-                            let call_args = call_form
-                                .map(|c| extract_call_args_kwargs(c, &file_imports, decl_by_fqname))
-                                .unwrap_or_default();
+                            let call_args = if extract_args {
+                                call_form
+                                    .map(|c| {
+                                        extract_call_args_kwargs(c, &file_imports, decl_by_fqname)
+                                    })
+                                    .unwrap_or_default()
+                            } else {
+                                CallArgs::default()
+                            };
                             local.push((owner_name, idx, call_args));
                         }
                     }
@@ -2745,6 +2761,7 @@ impl ProjectContext {
         via_attr: &str,
         decorator_attrs: Vec<String>,
         path_regex: Option<&str>,
+        extract_args: bool,
     ) -> PyResult<Vec<(String, usize, CallArgs)>> {
         let outputs = self.materialized("find_handler_decorators_via")?;
         let path_re = _compile_path_regex(path_regex)?;
@@ -2799,9 +2816,15 @@ impl ProjectContext {
                         }
                         let key = (file, range_key(func.name.range()));
                         if let Some(&idx) = decl_by_name_range.get(&key) {
-                            let call_args = call_form
-                                .map(|c| extract_call_args_kwargs(c, &file_imports, decl_by_fqname))
-                                .unwrap_or_default();
+                            let call_args = if extract_args {
+                                call_form
+                                    .map(|c| {
+                                        extract_call_args_kwargs(c, &file_imports, decl_by_fqname)
+                                    })
+                                    .unwrap_or_default()
+                            } else {
+                                CallArgs::default()
+                            };
                             local.push((owner_name, idx, call_args));
                         }
                     }
@@ -2831,6 +2854,7 @@ impl ProjectContext {
         attr: &str,
         arg_index: usize,
         path_regex: Option<&str>,
+        extract_args: bool,
     ) -> PyResult<Vec<(usize, String, CallArgs)>> {
         let outputs = self.materialized("find_calls_on_attr")?;
         let path_re = _compile_path_regex(path_regex)?;
@@ -2863,6 +2887,7 @@ impl ProjectContext {
                         arg_index,
                         file_imports: &file_imports,
                         decl_by_fqname,
+                        extract_args,
                         results: Vec::new(),
                     };
                     finder.visit_stmt(stmt);
@@ -2971,6 +2996,7 @@ impl ProjectContext {
         name: &str,
         arg_index: usize,
         path_regex: Option<&str>,
+        extract_args: bool,
     ) -> PyResult<Vec<(usize, String, CallArgs)>> {
         let outputs = self.materialized("find_calls_to_imported")?;
         let path_re = _compile_path_regex(path_regex)?;
@@ -3019,6 +3045,7 @@ impl ProjectContext {
                         arg_index,
                         file_imports: &file_imports,
                         decl_by_fqname,
+                        extract_args,
                         results: Vec::new(),
                     };
                     finder.visit_stmt(stmt);
@@ -3053,6 +3080,7 @@ impl ProjectContext {
         arg_index: usize,
         required_positional: Option<usize>,
         path_regex: Option<&str>,
+        extract_args: bool,
     ) -> PyResult<Vec<(usize, String, CallArgs)>> {
         let outputs = self.materialized("find_calls_on_var")?;
         let path_re = _compile_path_regex(path_regex)?;
@@ -3090,6 +3118,7 @@ impl ProjectContext {
                         arg_index,
                         file_imports: &file_imports,
                         decl_by_fqname,
+                        extract_args,
                         results: Vec::new(),
                     };
                     finder.visit_stmt(stmt);
@@ -3458,6 +3487,7 @@ impl ProjectContext {
         py: Python<'_>,
         decorator_fqn: &str,
         path_regex: Option<&str>,
+        extract_args: bool,
     ) -> PyResult<Vec<(usize, CallArgs)>> {
         let Some((module, name)) = decorator_fqn.rsplit_once('.') else {
             return Err(PyValueError::new_err(format!(
@@ -3465,7 +3495,13 @@ impl ProjectContext {
             )));
         };
         let modules = [module.to_string()];
-        self.find_decorated_decls(py, &modules, vec![name.to_string()], path_regex)
+        self.find_decorated_decls(
+            py,
+            &modules,
+            vec![name.to_string()],
+            path_regex,
+            extract_args,
+        )
     }
 
     #[allow(clippy::type_complexity)]
@@ -3475,6 +3511,7 @@ impl ProjectContext {
         class_fqn: &str,
         include_subclasses: bool,
         path_regex: Option<&str>,
+        extract_args: bool,
     ) -> PyResult<Vec<(usize, CallArgs)>> {
         let Some((module, name)) = class_fqn.rsplit_once('.') else {
             return Err(PyValueError::new_err(format!(
@@ -3497,7 +3534,8 @@ impl ProjectContext {
             }
         }
         let modules = [module.to_string()];
-        let triples = self.find_instance_constructions(py, &modules, ctors, path_regex)?;
+        let triples =
+            self.find_instance_constructions(py, &modules, ctors, path_regex, extract_args)?;
         Ok(triples
             .into_iter()
             .map(|(idx, _name, call_args)| (idx, call_args))
@@ -3511,9 +3549,10 @@ impl ProjectContext {
         instance: &SymbolNode,
         method_names: Vec<String>,
         path_regex: Option<&str>,
+        extract_args: bool,
     ) -> PyResult<Vec<(usize, CallArgs)>> {
         let instance_simple = instance.fqname.rsplit('.').next().unwrap_or("").to_string();
-        let handlers = self.find_handler_decorators(py, method_names, path_regex)?;
+        let handlers = self.find_handler_decorators(py, method_names, path_regex, extract_args)?;
         let outputs = self.materialized("find_decorations_on")?;
         let mut out: Vec<(usize, CallArgs)> = Vec::new();
         for (owner_name, handler_idx, call_args) in handlers {
