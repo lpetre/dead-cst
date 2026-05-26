@@ -673,9 +673,19 @@ class Analysis:
         # callbacks. The thread reads rust-side atomic counters at
         # ~100 ms and fires structured events. Joined in a ``finally``
         # so a build failure still drains the queue.
+        #
+        # Per-file plugins don't get their own progress slot — they
+        # run during populate and contribute to the populate phase
+        # counter, not the plugins phase counter. Filter them out
+        # of `plugin_names` so the poller's slot indices line up
+        # with the whole-project plugins the rust side registers
+        # via `progress_plugins_start`.
+        from .plugins import PerFilePlugin as _PerFilePlugin
+
+        _progress_plugins = [p for p in self._plugins if not isinstance(p, _PerFilePlugin)]
         poller: _ProgressPoller | None = None
         if self._progress_callback is not None:
-            plugin_names = tuple(type(p).__qualname__ for p in self._plugins)
+            plugin_names = tuple(type(p).__qualname__ for p in _progress_plugins)
             poller = _ProgressPoller(
                 ctx,
                 self._progress_callback,
@@ -712,12 +722,26 @@ class Analysis:
         # and to every other plugin's queries, until the apply pass
         # runs.
         try:
+            from .plugins import PerFilePlugin
             from .plugins.decl_shapes import DispatchAppPlugin, _gather_batched
 
-            has_dispatch = any(isinstance(p, DispatchAppPlugin) for p in self._plugins)
-            use_rust_serial = not has_dispatch and (_serial_mode() or len(self._plugins) <= 1)
+            # Per-file plugins run during populate via the salsa-tracked
+            # `file_to_plugin_ops` path; whole-project plugins continue
+            # on the existing post-build harness. Register the per-file
+            # plugins on the ctx BEFORE materialize/build_only kicks off
+            # populate — the rust side installs them into the registry
+            # at the top of those entry points.
+            per_file_plugins = [p for p in self._plugins if isinstance(p, PerFilePlugin)]
+            whole_project_plugins = [p for p in self._plugins if not isinstance(p, PerFilePlugin)]
+            for plugin in per_file_plugins:
+                ctx.add_per_file_plugin(plugin)
+
+            has_dispatch = any(isinstance(p, DispatchAppPlugin) for p in whole_project_plugins)
+            use_rust_serial = not has_dispatch and (
+                _serial_mode() or len(whole_project_plugins) <= 1
+            )
             if use_rust_serial:
-                for plugin in self._plugins:
+                for plugin in whole_project_plugins:
                     ctx.add_plugin(plugin)
                 ctx.materialize()
             else:
@@ -731,7 +755,7 @@ class Analysis:
                 active_specs: list[Any] = []
                 active_slot_by_id: dict[int, int] = {}
                 if has_dispatch:
-                    for p in self._plugins:
+                    for p in whole_project_plugins:
                         if isinstance(p, DispatchAppPlugin) and p._is_active(ctx):
                             active_slot_by_id[id(p)] = len(active_specs)
                             active_specs.append(p.spec)
@@ -742,12 +766,12 @@ class Analysis:
                 # meant to overlap with — without it, a dispatch shim
                 # blocked on the gather future would occupy a worker
                 # the gather itself wants.
-                n_work = len(self._plugins) + (1 if active_specs else 0)
+                n_work = len(whole_project_plugins) + (1 if active_specs else 0)
                 workers = 1 if _serial_mode() else _plugin_worker_count(n_work)
 
                 # Progress names track the *original* plugins so users see
                 # ``FlaskPlugin`` etc. — shims are an implementation detail.
-                plugin_names = [type(p).__qualname__ for p in self._plugins]
+                plugin_names = [type(p).__qualname__ for p in whole_project_plugins]
                 ctx.progress_plugins_start(plugin_names)
                 try:
                     # Plugins are scheduled in registration order;
@@ -789,10 +813,10 @@ class Analysis:
                         )
                         scheduled = (
                             _build_dispatch_schedule(
-                                ctx, self._plugins, gather_future, active_slot_by_id
+                                ctx, whole_project_plugins, gather_future, active_slot_by_id
                             )
                             if has_dispatch
-                            else list(self._plugins)
+                            else list(whole_project_plugins)
                         )
                         futures = [
                             pool.submit(_run_collect, idx, p) for idx, p in enumerate(scheduled)

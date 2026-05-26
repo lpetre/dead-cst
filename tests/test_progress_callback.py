@@ -172,9 +172,17 @@ def test_callback_exception_does_not_deadlock(tmp_path: Path) -> None:
 
 def test_progress_callback_with_concurrent_plugins(tmp_path: Path) -> None:
     """Concurrent plugin pass (>1 plugin) emits plugin_start / plugin_end
-    for each plugin via the Python-side ThreadPoolExecutor wrapper.
+    for each whole-project plugin via the Python-side ThreadPoolExecutor
+    wrapper. Per-file plugins (``ModuleDundersPlugin``,
+    ``MainBlockPlugin``, ...) run during the populate phase via
+    ``file_to_plugin_ops`` and don't get their own plugin-progress slot
+    — their work shows up under the ``populate`` phase counter instead.
     """
-    from dead_cst.plugins import ExplicitEntrypointPlugin, ModuleDundersPlugin
+    from dead_cst.plugins import (
+        ExplicitEntrypointPlugin,
+        InitSubclassPlugin,
+        ModuleDundersPlugin,
+    )
 
     events: list[tuple[str, dict[str, Any]]] = []
 
@@ -186,6 +194,9 @@ def test_progress_callback_with_concurrent_plugins(tmp_path: Path) -> None:
         tmp_path,
         plugins=[
             ExplicitEntrypointPlugin(specs=["a.py"]),
+            InitSubclassPlugin(),
+            # Per-file plugin: present in registration list, runs
+            # during populate, NOT in the plugin progress channel.
             ModuleDundersPlugin(),
         ],
         progress_callback=cb,
@@ -194,19 +205,20 @@ def test_progress_callback_with_concurrent_plugins(tmp_path: Path) -> None:
 
     plugin_starts = [k for (e, k) in events if e == "plugin_start"]
     plugin_ends = [k for (e, k) in events if e == "plugin_end"]
+    # Two whole-project plugins -> two plugin_start / plugin_end events.
+    # The per-file ModuleDundersPlugin is registered but rolls into the
+    # populate phase instead.
     assert len(plugin_starts) == 2
     assert len(plugin_ends) == 2
     names = [k["name"] for k in plugin_starts]
-    # The two plugin class qualnames should both have surfaced.
     assert "ExplicitEntrypointPlugin" in names
-    assert "ModuleDundersPlugin" in names
+    assert "InitSubclassPlugin" in names
+    assert "ModuleDundersPlugin" not in names  # populate phase, not plugin slot
     # With per-plugin counter slabs, each ``plugin_end`` carries the
-    # plugin's actual name (not the registration-order approximation
-    # the old global-counter path used) and a real elapsed_ms.
+    # plugin's actual name and a real elapsed_ms.
     end_names = [k["name"] for k in plugin_ends]
     assert sorted(end_names) == sorted(names)
-    # Each plugin's slot index in ``plugin_start`` matches its
-    # registration order.
+    # Slot indices line up with whole-project registration order.
     indices = sorted(k["index"] for k in plugin_starts)
     assert indices == [0, 1]
 

@@ -20,7 +20,7 @@ builtin name → instance map live in :mod:`dead_cst.cli`.
 
 from __future__ import annotations
 
-from ._base import Plugin
+from ._base import PerFilePlugin, Plugin
 from ._core import (
     EXTERNAL_DIST_PREFIX,
     EXTERNAL_FILE_PREFIX,
@@ -59,6 +59,7 @@ __all__ = [
     "LiteralListPlugin",
     "MainBlockPlugin",
     "ModuleDundersPlugin",
+    "PerFilePlugin",
     "Plugin",
     "ProjectScriptsPlugin",
     "STDLIB_PREFIX",

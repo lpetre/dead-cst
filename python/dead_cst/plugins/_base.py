@@ -17,10 +17,11 @@ pre-graph work (config scans, etc.); the default is a no-op.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Iterable
 
 from dead_cst import _native as native
 
-__all__ = ["Plugin", "native"]
+__all__ = ["PerFilePlugin", "Plugin", "native"]
 
 
 class Plugin:
@@ -57,3 +58,42 @@ class Plugin:
         happens, so they're a clean failure mode for "config
         invalid; can't proceed" cases.
         """
+
+
+PerFileOp = "native.PerFileEdge | native.PerFileEntrypoint | native.PerFileNode"
+
+
+class PerFilePlugin(Plugin):
+    """Plugin that runs once per file, during the parallel populate phase.
+
+    Subclasses implement
+    ``run_per_file(self, file: native.FileScope) -> Iterable[PerFileOp]``
+    and emit :class:`native.PerFileEdge` / :class:`native.PerFileEntrypoint`
+    / :class:`native.PerFileNode` ops that reference file-local node
+    indices (the integers returned by :class:`native.FileScope` query
+    methods). The fan-in pass translates each local index to the
+    final global graph index at assemble time.
+
+    The base class still inherits :meth:`Plugin.run`; whole-project
+    plugins use that path. A per-file plugin's :meth:`run` is never
+    invoked by the harness — only :meth:`run_per_file` is.
+
+    **Caching.** Per-file plugin output is salsa-tracked keyed by the
+    file's revision: editing one file re-runs plugins only for that
+    file. The cache spans materialize() calls on the same
+    :class:`dead_cst.analyze.Analysis` instance.
+
+    **GIL.** :meth:`run_per_file` is invoked from inside a rayon
+    worker that holds the GIL while in Python. First-build cost is
+    GIL-serialised across workers; warm-cache hits skip Python
+    entirely.
+    """
+
+    def run_per_file(self, file: native.FileScope) -> Iterable[object]:
+        """Yield zero or more per-file ops for `file`. Subclasses
+        override; the base raises so the harness fails loudly on a
+        plugin that forgot to implement it.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} subclasses PerFilePlugin but does not implement run_per_file()"
+        )

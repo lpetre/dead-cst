@@ -5,11 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable
 
-from ._base import Plugin, native
+from ._base import PerFilePlugin, native
 
 
 @dataclass
-class ModuleDundersPlugin(Plugin):
+class ModuleDundersPlugin(PerFilePlugin):
     """Keep module-level dunder names and ``__future__`` imports alive.
 
     Variables named ``__xxx__`` at module scope (``__all__``, ``__version__``,
@@ -19,11 +19,10 @@ class ModuleDundersPlugin(Plugin):
     import ...`` statements are compile-time directives. All three are
     observable even when no source reference points at them, so the plugin
     pins them as entrypoints.
+
+    Runs per file during the populate phase; output salsa-cached.
     """
 
-    def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
-        for target_idx in [
-            *native.query(ctx).modules().with_dunders().indices(),
-            *native.query(ctx).imports().of("__future__").indices(),
-        ]:
-            yield native.AddEntrypointByIdx(target_idx, marker="<dunder>")
+    def run_per_file(self, file: native.FileScope) -> Iterable[object]:
+        for target_idx in (*file.dunder_decls(), *file.imports_of("__future__")):
+            yield native.PerFileEntrypoint(target_idx, marker="<dunder>")

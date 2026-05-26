@@ -311,6 +311,102 @@ class AddNodeByIdx:
 
 GraphOp = AddEdge | AddEdgeByIdx | AddEntrypoint | AddEntrypointByIdx | AddNode | AddNodeByIdx
 
+class PerFileEdge:
+    """Add an edge between two file-local nodes.
+
+    File-local analogue of :class:`AddEdgeByIdx`; ``src`` and ``dst``
+    are indices into the file's per-file payload (the ints returned by
+    :class:`FileScope` query methods). The fan-in pass translates them
+    to global graph indices at assemble time.
+    """
+
+    src: int
+    dst: int
+    flags: int
+
+    def __init__(self, src: int, dst: int, *, flags: int = 0) -> None: ...
+
+class PerFileEntrypoint:
+    """Mark a file-local node as an entrypoint.
+
+    File-local analogue of :class:`AddEntrypointByIdx`. ``target`` is
+    an index into the file's per-file payload.
+    """
+
+    target: int
+    marker: str
+
+    def __init__(self, target: int, *, marker: str) -> None: ...
+
+class PerFileNode:
+    """Mint a synthetic node and wire it to file-local nodes.
+
+    File-local analogue of :class:`AddNodeByIdx`. ``edges_from`` and
+    ``edges_to`` are lists of file-local indices.
+    """
+
+    fqname: str
+    kind: NodeKind
+    path: str
+    flags: int
+    edges_from: list[int]
+    edges_to: list[int]
+
+    def __init__(
+        self,
+        fqname: str,
+        *,
+        path: str,
+        kind: NodeKind = "synthetic",
+        flags: int = 0,
+        edges_from: Iterable[int] = ...,
+        edges_to: Iterable[int] = ...,
+    ) -> None: ...
+
+PerFileOp = PerFileEdge | PerFileEntrypoint | PerFileNode
+
+class FileScope:
+    """Narrow per-file query handle handed to :class:`PerFilePlugin`.
+
+    Fully pre-computed once per file before any plugin runs. All
+    methods return plain ``int`` (file-local indices into the file's
+    per-file payload) or lists thereof; the assemble-time fan-in
+    translates the indices to global graph indices.
+
+    Per-file plugins can only reach file-local state — there is no
+    way to query other files from here, by design.
+    """
+
+    @property
+    def path(self) -> str:
+        """Absolute path of the file this scope wraps."""
+        ...
+
+    @property
+    def module_fqname(self) -> str:
+        """Fully-qualified dotted module name."""
+        ...
+
+    @property
+    def module_idx(self) -> int:
+        """Local index of the synthetic module node (always 0)."""
+        ...
+
+    def main_block(self) -> tuple[int, list[int]] | None:
+        """`(module_idx, decl_idxs)` for the file's ``if __name__ == "__main__":``
+        block, or :class:`None` when the file has none.
+        """
+        ...
+
+    def dunder_decls(self) -> list[int]:
+        """Local indices of variable/function decls whose fqname is a
+        Python dunder name."""
+        ...
+
+    def imports_of(self, module_name: str) -> list[int]:
+        """Local indices of import nodes targeting ``module_name``."""
+        ...
+
 class CollectedOps:
     """Opaque handle to one plugin's collected graph ops.
 
@@ -416,6 +512,14 @@ class ProjectContext:
     def add_plugin(self, plugin: _ProjectPluginLike | Any) -> None:
         """Register a plugin. Order of registration is order of
         invocation during :meth:`materialize`."""
+        ...
+
+    def add_per_file_plugin(self, plugin: Any) -> None:
+        """Register a per-file plugin. Per-file plugins implement
+        ``run_per_file(file)`` against a :class:`FileScope` and run
+        during the populate phase via a salsa-tracked function;
+        the output is cached keyed by file revision.
+        """
         ...
 
     def materialize(self) -> NativeGraph:

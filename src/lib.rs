@@ -32,6 +32,7 @@
 mod builder;
 mod file_payload;
 mod file_ref_edges;
+mod file_scope;
 mod graph;
 mod helpers;
 mod ingest;
@@ -45,6 +46,7 @@ use pyo3::prelude::*;
 use crate::builder::{
     AddEdge, AddEdgeByIdx, AddEntrypoint, AddEntrypointByIdx, AddNode, AddNodeByIdx, CollectedOps,
 };
+use crate::file_scope::{FileScope, PerFileEdge, PerFileEntrypoint, PerFileNode};
 use crate::graph::{EdgeFlags, Import, NativeGraph, NodeFlags, SymbolNode};
 use crate::helpers::{ArgLiteral, ArgNodeRef, ArgOpaque, NodeAttrs};
 use crate::io::{read_graph, write_graph, GraphMetadata};
@@ -84,6 +86,10 @@ fn dead_cst_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<AddNode>()?;
     m.add_class::<AddNodeByIdx>()?;
     m.add_class::<CollectedOps>()?;
+    m.add_class::<FileScope>()?;
+    m.add_class::<PerFileEdge>()?;
+    m.add_class::<PerFileEntrypoint>()?;
+    m.add_class::<PerFileNode>()?;
     m.add_class::<NodeFlags>()?;
     m.add_class::<EdgeFlags>()?;
     m.add_class::<DecoratorIdxRef>()?;

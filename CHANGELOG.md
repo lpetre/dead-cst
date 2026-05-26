@@ -9,6 +9,33 @@ two versions.
 
 ## [Unreleased]
 
+### Added
+
+#### Per-file plugin protocol
+- `PerFilePlugin` base class in `dead_cst.plugins`. Subclasses
+  implement `run_per_file(file: native.FileScope) -> Iterable[PerFileOp]`
+  and run during the parallel populate phase against each file in
+  turn, BEFORE the global graph is assembled. Output is salsa-tracked
+  keyed by file revision: editing one file re-runs plugins only for
+  that file (warm-cache hits skip Python entirely).
+- New native types: `FileScope` (narrow per-file query handle
+  returning plain ints into the file's per-file payload),
+  `PerFileEdge`, `PerFileEntrypoint`, `PerFileNode` (file-local
+  analogues of `AddEdgeByIdx` / `AddEntrypointByIdx` /
+  `AddNodeByIdx`). `FileScope` exposes `path`, `module_fqname`,
+  `module_idx`, `main_block()`, `dunder_decls()`,
+  `imports_of(module)`.
+- `ProjectContext.add_per_file_plugin(plugin)` for explicit
+  registration; the `Analysis.materialize_all` harness auto-routes
+  `PerFilePlugin` instances passed via the `plugins=` kwarg.
+- `MainBlockPlugin` and `ModuleDundersPlugin` migrated to the
+  per-file protocol; their public behavior is unchanged.
+
+### Changed
+- Per-file plugins do not appear in the `plugin_start` /
+  `plugin_end` progress events — their work rolls into the
+  `populate` phase counter instead.
+
 ## [0.13.0] - 2026-05-26
 
 ### Added

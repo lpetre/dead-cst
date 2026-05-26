@@ -67,10 +67,17 @@ def run_plugins(
     Thin convenience over :meth:`ProjectContext.add_plugin` +
     :meth:`ProjectContext.materialize` — useful when plugins are
     assembled by the caller (e.g. resolved from entry points) rather
-    than appended one at a time.
+    than appended one at a time. Routes :class:`dead_cst.plugins.PerFilePlugin`
+    instances to :meth:`ProjectContext.add_per_file_plugin` so the
+    same helper covers both plugin shapes.
     """
+    from dead_cst.plugins import PerFilePlugin
+
     for plugin in plugins:
-        ctx.add_plugin(plugin)
+        if isinstance(plugin, PerFilePlugin):
+            ctx.add_per_file_plugin(plugin)
+        else:
+            ctx.add_plugin(plugin)
     return ctx.materialize()
 
 

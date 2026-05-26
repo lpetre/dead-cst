@@ -353,6 +353,12 @@ pub(crate) fn build_project_graph(
                             let _ = file_to_nodes(local_db, file);
                             let _ = file_to_edges(local_db, file);
                             let _ = file_to_ref_edges(local_db, file);
+                            // Per-file plugin output: salsa-cached keyed
+                            // by `(file,)`, invalidates on `file_to_nodes`
+                            // payload change. No-op (returns empty ops)
+                            // when no per-file plugins are registered.
+                            // See `src/file_scope.rs` for the design.
+                            let _ = crate::file_scope::file_to_plugin_ops(local_db, file);
                         });
                         db_tx.send(local_db).expect("channel open");
                         counters_inner.populate_inc();
@@ -397,6 +403,21 @@ pub(crate) fn build_project_graph(
     let class_by_selection = assembled.class_by_selection;
     let decl_by_name_range = assembled.decl_by_name_range;
     let ref_to_global = assembled.ref_to_global;
+
+    // Per-file plugin fan-in. Walks every file's salsa-cached
+    // [`crate::file_scope::file_to_plugin_ops`] payload, translates
+    // file-local indices to global graph indices via `ref_to_global`,
+    // and folds the ops into the builder. Cheap when no per-file
+    // plugins are registered (every file's payload is empty). Folded
+    // BEFORE `build_fqname_indices` so any synthetic nodes minted by
+    // per-file `PerFileNode` ops land in the fqname maps.
+    crate::file_scope::fan_in_per_file_plugin_ops(
+        py,
+        db,
+        &project_files,
+        &mut builder,
+        &ref_to_global,
+    )?;
 
     counters.start_phase(PHASE_FQNAME, Some(builder.nodes.len()));
     let t4 = std::time::Instant::now();
@@ -1076,6 +1097,12 @@ pub(crate) struct ProjectContext {
     /// relative to the project.
     pub(crate) root: String,
     pub(crate) plugins: Vec<PyObject>,
+    /// Per-file plugins, registered via `add_per_file_plugin`. Run during
+    /// the parallel populate phase via [`crate::file_scope::file_to_plugin_ops`],
+    /// fan-in folds their output into the global graph at assemble time.
+    /// See `src/file_scope.rs` for the full pipeline and the salsa-cache
+    /// rationale.
+    pub(crate) per_file_plugins: Vec<PyObject>,
     /// Populated by `materialize` before plugins run. `None` outside a
     /// materialize call — the apply pass / queries assume it's
     /// `Some` and error if a plugin (incorrectly) caches the ctx and
@@ -1152,6 +1179,7 @@ impl ProjectContext {
             db,
             root: root.to_string(),
             plugins: Vec::new(),
+            per_file_plugins: Vec::new(),
             outputs: Arc::new(RwLock::new(None)),
             regex_cache: Mutex::new(FxHashMap::default()),
             show_progress,
@@ -1198,6 +1226,15 @@ impl ProjectContext {
         self.plugins.push(plugin);
     }
 
+    /// Register a per-file plugin. Per-file plugins implement
+    /// `run_per_file(file_scope) -> Iterable[PerFileEdge | PerFileEntrypoint
+    /// | PerFileNode]` and run during the parallel populate phase against
+    /// each file in turn. Output is salsa-cached keyed by the file's
+    /// salsa revision; cache invalidates when the file's payload changes.
+    pub(crate) fn add_per_file_plugin(&mut self, plugin: PyObject) {
+        self.per_file_plugins.push(plugin);
+    }
+
     /// Open a chainable query builder against this context.
     ///
     /// Equivalent to the top-level :func:`query` function; both return
@@ -1229,6 +1266,13 @@ impl ProjectContext {
         let show_progress = slf.borrow(py).show_progress;
         let stack_size = slf.borrow(py).stack_size;
         let counters = Arc::clone(&slf.borrow(py).progress);
+        let per_file_plugins: Vec<PyObject> = slf
+            .borrow(py)
+            .per_file_plugins
+            .iter()
+            .map(|p| p.clone_ref(py))
+            .collect();
+        let _guard = crate::file_scope::PerFilePluginGuard::install(per_file_plugins);
         let build_result = {
             let mut this = slf.borrow_mut(py);
             build_project_graph(py, &mut this.db, show_progress, stack_size, &counters)
@@ -1388,6 +1432,13 @@ impl ProjectContext {
         let show_progress = slf.borrow(py).show_progress;
         let stack_size = slf.borrow(py).stack_size;
         let counters = Arc::clone(&slf.borrow(py).progress);
+        let per_file_plugins: Vec<PyObject> = slf
+            .borrow(py)
+            .per_file_plugins
+            .iter()
+            .map(|p| p.clone_ref(py))
+            .collect();
+        let _guard = crate::file_scope::PerFilePluginGuard::install(per_file_plugins);
         let mut this = slf.borrow_mut(py);
         match build_project_graph(py, &mut this.db, show_progress, stack_size, &counters) {
             Ok(outputs) => {

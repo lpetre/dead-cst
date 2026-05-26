@@ -47,6 +47,7 @@ EXPECTED_PUBLIC_API: dict[str, list[str]] = {
         "LiteralListPlugin",
         "MainBlockPlugin",
         "ModuleDundersPlugin",
+        "PerFilePlugin",
         "Plugin",
         "ProjectScriptsPlugin",
         "STDLIB_PREFIX",
