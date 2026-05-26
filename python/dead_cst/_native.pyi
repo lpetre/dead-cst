@@ -827,6 +827,50 @@ class ProjectContext:
         """
         ...
 
+    def function_parameters(self, indices: Sequence[int]) -> list[list[str]]:
+        """Batched parameter-name snapshot for each function-kind
+        index. Walks the parsed AST once per distinct path; matches
+        each top-level ``FunctionDef`` against the rust-side
+        ``decl_by_name_range`` by its name's byte range.
+
+        Returns the union of positional-only, positional-or-keyword,
+        and keyword-only parameter names in declaration order;
+        ``*args`` and ``**kwargs`` are skipped. Indices that don't
+        resolve to a top-level ``FunctionDef`` (non-function kinds,
+        nested functions, decorator-only stubs) surface an empty list
+        at the same position.
+
+        Used by :class:`dead_cst.contrib.PytestPlugin` to discover
+        ``test_foo(my_fixture)`` → ``test_foo → my_fixture`` edges.
+
+        Validates bounds and raises :class:`IndexError` when any
+        index is out of range.
+        """
+        ...
+
+    def class_method_parameters(self, indices: Sequence[int]) -> list[list[str]]:
+        """Batched class-method parameter-name snapshot for each
+        class-kind index. For each input class, walks its body's
+        top-level ``FunctionDef`` statements and returns the union
+        of their parameter names (positional-only + positional-or-
+        keyword + keyword-only), deduped in first-seen order, with
+        ``self`` and ``cls`` excluded. ``*args`` and ``**kwargs``
+        are skipped.
+
+        Indices that don't resolve to a top-level ``ClassDef`` in the
+        AST surface an empty list at the same position.
+
+        Used by :class:`dead_cst.contrib.PytestPlugin` to wire
+        ``class → fixture`` edges for ``Test*`` classes — class
+        methods aren't represented as their own graph nodes, so the
+        class itself is the rendezvous point for any fixture any
+        method uses.
+
+        Validates bounds and raises :class:`IndexError` when any
+        index is out of range.
+        """
+        ...
+
     # ----- Pure scans over the in-progress graph ------------------------
     #
     # Plugins use the DSL: ``query(ctx).modules().with_dunders().indices()``

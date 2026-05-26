@@ -82,6 +82,11 @@ def test_pytest_plugin_marks_conftest_decls(build_plugin_graph, reachable_fqname
 def test_pytest_plugin_marks_decorated_fixtures_outside_conftest(
     build_plugin_graph, reachable_fqnames
 ):
+    """Every ``@pytest.fixture``-decorated function is unconditionally
+    alive via the synthetic ``<pytest:fixtures>:<module>`` seed,
+    regardless of whether any test parameter mentions it. The
+    parameter-name edges are *additive* — they make the dependency
+    queryable without changing the alive set."""
     graph = build_plugin_graph(
         {
             "tests/__init__.py": "",
@@ -112,6 +117,210 @@ def test_pytest_plugin_marks_decorated_fixtures_outside_conftest(
     assert "tests.fixtures.parametrized_fixture" in reached
     assert "tests.fixtures.imported_fixture" in reached
     assert "tests.fixtures.not_a_fixture" not in reached
+
+
+def test_pytest_plugin_emits_test_to_fixture_edge(build_plugin_graph):
+    """The ``test → fixture`` edge is the load-bearing artifact for
+    the new fixture model. Verify it's actually in the graph (not just
+    that reachability happens to land right)."""
+    graph = build_plugin_graph(
+        {
+            "tests/__init__.py": "",
+            "tests/fixtures.py": """
+            import pytest
+
+            @pytest.fixture
+            def my_fixture():
+                return 1
+            """,
+            "tests/test_x.py": """
+            from tests.fixtures import my_fixture  # noqa: F401
+
+            def test_uses(my_fixture):
+                assert my_fixture == 1
+            """,
+        },
+        [PytestPlugin()],
+    )
+    nodes = graph.nodes()
+    by_fqname = {n.fqname: i for i, n in enumerate(nodes)}
+    test_idx = by_fqname["tests.test_x.test_uses"]
+    fixture_idx = by_fqname["tests.fixtures.my_fixture"]
+    assert (test_idx, fixture_idx, 0) in [(s, d, f) for (s, d, f) in graph.edges()]
+
+
+def test_pytest_plugin_unrelated_param_no_edge(build_plugin_graph):
+    """Parameter names that don't match any project fixture (pytest
+    builtins like ``tmp_path``, third-party plugin fixtures like
+    ``mocker``, free-form ``parametrize`` names) are silently ignored —
+    no spurious edges to unrelated decls that happen to share the
+    name."""
+    graph = build_plugin_graph(
+        {
+            "tests/__init__.py": "",
+            "tests/test_x.py": """
+            def test_uses_builtin(tmp_path, capsys):
+                pass
+            """,
+        },
+        [PytestPlugin()],
+    )
+    # No fixture ⇒ no edge out of test_uses_builtin.
+    nodes = graph.nodes()
+    by_fqname = {n.fqname: i for i, n in enumerate(nodes)}
+    test_idx = by_fqname["tests.test_x.test_uses_builtin"]
+    out_edges = [(s, d, f) for (s, d, f) in graph.edges() if s == test_idx]
+    # Only the module-anchor edge (test → its module).
+    assert all(nodes[d].kind == "module" for (_, d, _) in out_edges)
+
+
+def test_pytest_plugin_class_method_pulls_fixture_alive(build_plugin_graph, reachable_fqnames):
+    """A fixture used only by a ``Test*`` class method must stay alive.
+    We don't have method-level graph nodes, so the class is the
+    rendezvous point — ``class → fixture`` edges by name match."""
+    graph = build_plugin_graph(
+        {
+            "tests/__init__.py": "",
+            "tests/fixtures.py": """
+            import pytest
+
+            @pytest.fixture
+            def class_only_fixture():
+                return 1
+            """,
+            "tests/test_cls.py": """
+            from tests.fixtures import class_only_fixture  # noqa: F401
+
+            class TestThing:
+                def test_method(self, class_only_fixture):
+                    assert class_only_fixture == 1
+            """,
+        },
+        [PytestPlugin()],
+    )
+    reached = reachable_fqnames(graph)
+    assert "tests.fixtures.class_only_fixture" in reached
+
+
+def test_pytest_plugin_emits_class_to_fixture_edge(build_plugin_graph):
+    """The ``class → fixture`` edge is the load-bearing artifact for
+    Test* class fixture deps. Verify it's actually in the graph."""
+    graph = build_plugin_graph(
+        {
+            "tests/__init__.py": "",
+            "tests/fixtures.py": """
+            import pytest
+
+            @pytest.fixture
+            def my_fixture():
+                return 1
+            """,
+            "tests/test_cls.py": """
+            from tests.fixtures import my_fixture  # noqa: F401
+
+            class TestThing:
+                def test_a(self, my_fixture): pass
+                def test_b(self): pass
+            """,
+        },
+        [PytestPlugin()],
+    )
+    nodes = graph.nodes()
+    by_fqname = {n.fqname: i for i, n in enumerate(nodes)}
+    cls_idx = by_fqname["tests.test_cls.TestThing"]
+    fixture_idx = by_fqname["tests.fixtures.my_fixture"]
+    assert (cls_idx, fixture_idx, 0) in [(s, d, f) for (s, d, f) in graph.edges()]
+
+
+def test_pytest_plugin_class_self_cls_excluded(build_plugin_graph):
+    """``self`` and ``cls`` parameter names must NOT produce edges
+    even if a fixture happens to share the name."""
+    graph = build_plugin_graph(
+        {
+            "tests/__init__.py": "",
+            "tests/fixtures.py": """
+            import pytest
+
+            @pytest.fixture
+            def self():
+                return 1
+
+            @pytest.fixture
+            def cls():
+                return 2
+            """,
+            "tests/test_cls.py": """
+            from tests.fixtures import self, cls  # noqa: F401
+
+            class TestThing:
+                def test_a(self): pass
+                @classmethod
+                def test_b(cls): pass
+            """,
+        },
+        [PytestPlugin()],
+    )
+    nodes = graph.nodes()
+    by_fqname = {n.fqname: i for i, n in enumerate(nodes)}
+    cls_idx = by_fqname["tests.test_cls.TestThing"]
+    bad_targets = {by_fqname["tests.fixtures.self"], by_fqname["tests.fixtures.cls"]}
+    edges = [(s, d, f) for (s, d, f) in graph.edges() if s == cls_idx]
+    assert not any(d in bad_targets for (_, d, _) in edges)
+
+
+def test_pytest_plugin_fixture_name_kwarg_alias(build_plugin_graph):
+    """``@pytest.fixture(name="alias")`` binds the fixture under the
+    alias, not its function name. The ``test → fixture`` edge must
+    resolve through the alias — verify the edge is present in the
+    graph. (Reachability of the fixture itself is guaranteed by the
+    unconditional fixture seed, so we check the edge directly.)"""
+    graph = build_plugin_graph(
+        {
+            "tests/__init__.py": "",
+            "tests/fixtures.py": """
+            import pytest
+
+            @pytest.fixture(name="alias")
+            def some_fn():
+                return 1
+            """,
+            "tests/test_uses_alias.py": """
+            from tests.fixtures import some_fn  # noqa: F401
+
+            def test_takes_alias(alias):
+                assert alias == 1
+            """,
+        },
+        [PytestPlugin()],
+    )
+    nodes = graph.nodes()
+    by_fqname = {n.fqname: i for i, n in enumerate(nodes)}
+    test_idx = by_fqname["tests.test_uses_alias.test_takes_alias"]
+    fixture_idx = by_fqname["tests.fixtures.some_fn"]
+    assert (test_idx, fixture_idx, 0) in [(s, d, f) for (s, d, f) in graph.edges()]
+
+
+def test_pytest_plugin_conftest_fixture_unused_stays_alive(build_plugin_graph, reachable_fqnames):
+    """Fixtures defined in a ``conftest.py`` are still seeded alive via
+    the conftest-seeds-everything rule (they're often referenced by
+    tests we don't model precisely). The test → fixture edge is
+    *additive* — it pulls non-conftest fixtures alive when used."""
+    graph = build_plugin_graph(
+        {
+            "tests/__init__.py": "",
+            "tests/conftest.py": """
+            import pytest
+
+            @pytest.fixture
+            def conftest_fixture():
+                return 1
+            """,
+        },
+        [PytestPlugin()],
+    )
+    reached = reachable_fqnames(graph)
+    # No test even uses it — conftest seed still keeps it alive.
+    assert "tests.conftest.conftest_fixture" in reached
 
 
 def test_pytest_plugin_ignores_non_test_modules(build_plugin_graph, reachable_fqnames):
