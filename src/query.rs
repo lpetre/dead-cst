@@ -185,6 +185,9 @@ impl QueryBuilder {
     fn imports(&self, py: Python<'_>) -> ImportQuery {
         ImportQuery::new(self.ctx.clone_ref(py))
     }
+    fn modules(&self, py: Python<'_>) -> ModuleQuery {
+        ModuleQuery::new(self.ctx.clone_ref(py))
+    }
     fn classes(&self, py: Python<'_>) -> ClassQuery {
         ClassQuery::new(self.ctx.clone_ref(py))
     }
@@ -196,6 +199,61 @@ impl QueryBuilder {
     }
     fn decls(&self, py: Python<'_>) -> DeclQuery {
         DeclQuery::new(self.ctx.clone_ref(py))
+    }
+    fn declarations(&self, py: Python<'_>) -> DeclarationsQuery {
+        DeclarationsQuery::new(self.ctx.clone_ref(py))
+    }
+    fn main_blocks(&self, py: Python<'_>) -> MainBlockQuery {
+        MainBlockQuery::new(self.ctx.clone_ref(py))
+    }
+    fn literal_lists(&self, py: Python<'_>) -> LiteralListQuery {
+        LiteralListQuery::new(self.ctx.clone_ref(py))
+    }
+    #[allow(clippy::wrong_self_convention)]
+    fn from_idx(&self, py: Python<'_>, seed_idx: usize) -> TraverseQuery {
+        TraverseQuery::new(self.ctx.clone_ref(py), seed_idx)
+    }
+
+    /// Terminal — seedless reachability over the graph. Forward
+    /// closure from every node carrying any bit in ``seed_flags``
+    /// (default: ``NodeFlags.ENTRYPOINT``), filtering edges by
+    /// ``skip_flags``. Returns indices into ``ctx.nodes()``.
+    #[pyo3(signature = (*, skip_flags = 0, seed_flags = None))]
+    fn reachable(
+        &self,
+        py: Python<'_>,
+        skip_flags: u32,
+        seed_flags: Option<u32>,
+    ) -> PyResult<Vec<usize>> {
+        let ctx = self.ctx.borrow(py);
+        match seed_flags {
+            Some(sf) => ctx.reachable_indices(py, skip_flags, sf),
+            None => ctx.reachable_indices(py, skip_flags, crate::helpers::NODE_FLAG_ENTRYPOINT),
+        }
+    }
+
+    /// Terminal — OR-form spec matcher used by
+    /// :class:`ExplicitEntrypointPlugin`. A node matches if any of:
+    ///
+    /// * ``regexes`` contains a pattern matching the node's path
+    ///   *relative to ``project_root``* (anchored at start of input,
+    ///   like ``re.match``).
+    /// * ``str_specs`` contains the node's relative path OR its
+    ///   fqname.
+    /// * ``abs_paths`` contains the node's absolute path.
+    ///
+    /// Returns indices into ``ctx.nodes()``.
+    #[pyo3(signature = (project_root, *, regexes = Vec::new(), str_specs = Vec::new(), abs_paths = Vec::new()))]
+    fn matching_specs(
+        &self,
+        py: Python<'_>,
+        project_root: &str,
+        regexes: Vec<String>,
+        str_specs: Vec<String>,
+        abs_paths: Vec<String>,
+    ) -> PyResult<Vec<usize>> {
+        let ctx = self.ctx.borrow(py);
+        ctx.find_nodes_matching_specs_indices(py, project_root, regexes, str_specs, abs_paths)
     }
 }
 
@@ -1230,6 +1288,158 @@ impl ImportQuery {
 
 impl_query_methods!(iter_only ImportQuery);
 
+/// Enumerate / inspect project module nodes. Pick exactly one filter
+/// (``with_fqn`` / ``with_path`` / ``with_dunders``), optionally
+/// follow with one transform (``surface`` / ``top_level`` /
+/// ``dunder_all``), then drop into a terminal (``.indices()`` /
+/// ``.first_idx()``).
+///
+/// * ``with_fqn(fqn)`` — narrow to a single module by dotted fqname.
+/// * ``with_path(path)`` — narrow to the module owning ``path``.
+/// * ``with_dunders()`` — project-wide scan of module-level ``__xxx__``
+///   variables and PEP 562 dunder functions (``__getattr__`` /
+///   ``__dir__``).
+///
+/// Transforms:
+///
+/// * ``surface()`` — module + every transitive decl under its fqname
+///   tree. Models ``importlib.import_module(...)`` reachability.
+/// * ``top_level()`` — module's immediate top-level decls
+///   (``from module import *`` semantics).
+/// * ``dunder_all()`` — decls listed in the module's ``__all__``.
+///   Terminal-shaped: returns ``list[int] | None`` (``None`` when
+///   the module doesn't declare ``__all__``).
+#[pyclass(unsendable)]
+pub(crate) struct ModuleQuery {
+    pub(crate) ctx: Py<ProjectContext>,
+    pub(crate) fqn: Option<String>,
+    pub(crate) path: Option<String>,
+    pub(crate) all_dunders: bool,
+    pub(crate) transform: ModuleTransform,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ModuleTransform {
+    None,
+    Surface,
+    TopLevel,
+}
+
+impl ModuleQuery {
+    fn new(ctx: Py<ProjectContext>) -> Self {
+        Self {
+            ctx,
+            fqn: None,
+            path: None,
+            all_dunders: false,
+            transform: ModuleTransform::None,
+        }
+    }
+}
+
+#[pymethods]
+impl ModuleQuery {
+    fn with_fqn<'py>(mut slf: PyRefMut<'py, Self>, fqn: String) -> PyRefMut<'py, Self> {
+        slf.fqn = Some(fqn);
+        slf
+    }
+    fn with_path<'py>(mut slf: PyRefMut<'py, Self>, path: String) -> PyRefMut<'py, Self> {
+        slf.path = Some(path);
+        slf
+    }
+    fn with_dunders<'py>(mut slf: PyRefMut<'py, Self>) -> PyRefMut<'py, Self> {
+        slf.all_dunders = true;
+        slf
+    }
+    fn surface<'py>(mut slf: PyRefMut<'py, Self>) -> PyRefMut<'py, Self> {
+        slf.transform = ModuleTransform::Surface;
+        slf
+    }
+    fn top_level<'py>(mut slf: PyRefMut<'py, Self>) -> PyRefMut<'py, Self> {
+        slf.transform = ModuleTransform::TopLevel;
+        slf
+    }
+
+    /// Terminal — list of matching node indices into ``ctx.nodes()``.
+    ///
+    /// * No transform + ``with_fqn`` / ``with_path``: the matched
+    ///   module idx, as a 0- or 1-element list.
+    /// * ``surface()`` / ``top_level()``: the module + relevant decls.
+    /// * ``with_dunders()``: every project-wide module-level dunder
+    ///   name (``surface`` / ``top_level`` are ignored here — dunders
+    ///   are a flat scan).
+    fn indices(&self, py: Python<'_>) -> PyResult<Vec<usize>> {
+        let ctx = self.ctx.borrow(py);
+        if self.all_dunders {
+            return ctx.find_module_dunders_indices(py);
+        }
+        let fqn = self.resolve_fqn(py, &ctx)?;
+        let Some(fqn) = fqn else {
+            return Ok(Vec::new());
+        };
+        match self.transform {
+            ModuleTransform::None => Ok(ctx
+                .find_module_idx(&fqn)?
+                .map(|i| vec![i])
+                .unwrap_or_default()),
+            ModuleTransform::Surface => ctx.module_surface_indices(py, &fqn),
+            ModuleTransform::TopLevel => ctx.find_module_top_level_decls_indices(py, &fqn),
+        }
+    }
+
+    /// Terminal — first matching idx or ``None``. Convenience for
+    /// single-value lookups (``with_fqn`` / ``with_path`` without a
+    /// transform). For multi-result transforms (``surface`` /
+    /// ``top_level`` / ``with_dunders``) this returns the first row in
+    /// arbitrary order — use ``.indices()`` instead.
+    fn first_idx(&self, py: Python<'_>) -> PyResult<Option<usize>> {
+        Ok(self.indices(py)?.into_iter().next())
+    }
+
+    /// Terminal — decls listed in the module's ``__all__``, or
+    /// ``None`` when the module doesn't declare ``__all__``. Requires
+    /// ``with_fqn(fqn)``; ``with_path`` / ``with_dunders`` / transforms
+    /// are ignored.
+    fn dunder_all(&self, py: Python<'_>) -> PyResult<Option<Vec<usize>>> {
+        let ctx = self.ctx.borrow(py);
+        let fqn = self.fqn.as_deref().ok_or_else(|| {
+            PyValueError::new_err("ModuleQuery.dunder_all() requires .with_fqn(fqn)")
+        })?;
+        ctx.find_module_dunder_all_exports_indices(fqn)
+    }
+
+    /// Iterate over matched indices. Same shape as :meth:`indices`.
+    fn __iter__(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let idxs = self.indices(py)?;
+        let list = pyo3::types::PyList::new_bound(py, idxs);
+        Ok(list.call_method0("__iter__")?.into())
+    }
+
+    fn count(&self, py: Python<'_>) -> PyResult<usize> {
+        Ok(self.indices(py)?.len())
+    }
+}
+
+impl ModuleQuery {
+    /// Resolve the query's filter to a dotted fqname.
+    fn resolve_fqn(&self, py: Python<'_>, ctx: &ProjectContext) -> PyResult<Option<String>> {
+        if let Some(ref fqn) = self.fqn {
+            return Ok(Some(fqn.clone()));
+        }
+        if let Some(ref path) = self.path {
+            // Map path → module idx → fqname via node_attrs.
+            let Some(idx) = ctx.module_for_indices(path)? else {
+                return Ok(None);
+            };
+            let attrs = ctx.node_attrs(py, vec![idx])?;
+            return Ok(attrs.into_iter().next().map(|(_k, _p, fqname, _f)| fqname));
+        }
+        Err(PyValueError::new_err(
+            "ModuleQuery requires one of: .with_fqn(...), .with_path(...), .with_dunders()",
+        ))
+    }
+}
+
 /// Enumerate classes by structural property. Today the only filter
 /// is ``defining_method(name)`` (matches classes whose body has a
 /// ``FunctionDef`` with that name); easy to extend later.
@@ -1536,8 +1746,11 @@ pub(crate) struct DeclQuery {
     pub(crate) kinds: Option<Vec<String>>,
     pub(crate) filenames: Option<Vec<String>>,
     pub(crate) simple_names: Option<Vec<String>>,
+    pub(crate) simple_name_regex: Option<String>,
     pub(crate) paths: Option<Vec<String>>,
     pub(crate) path_regex: Option<String>,
+    pub(crate) path_prefix: Option<String>,
+    pub(crate) path_contains: Option<String>,
     pub(crate) flags_mask: Option<u32>,
     pub(crate) flags_match_any: bool,
     pub(crate) fqname_prefix: Option<String>,
@@ -1567,8 +1780,11 @@ impl DeclQuery {
             kinds: None,
             filenames: None,
             simple_names: None,
+            simple_name_regex: None,
             paths: None,
             path_regex: None,
+            path_prefix: None,
+            path_contains: None,
             flags_mask: None,
             flags_match_any: false,
             fqname_prefix: None,
@@ -1638,6 +1854,35 @@ impl DeclQuery {
     /// Restrict to nodes whose absolute path matches ``regex``.
     fn with_path_regex<'py>(mut slf: PyRefMut<'py, Self>, regex: String) -> PyRefMut<'py, Self> {
         slf.path_regex = Some(regex);
+        slf
+    }
+    /// Restrict to nodes whose absolute path starts with ``prefix``.
+    /// Cheaper than :meth:`with_path_regex` for simple directory
+    /// scoping — folds the per-node ``str.starts_with`` loop into the
+    /// query's single rust pass.
+    fn with_path_prefix<'py>(mut slf: PyRefMut<'py, Self>, prefix: String) -> PyRefMut<'py, Self> {
+        slf.path_prefix = Some(prefix);
+        slf
+    }
+    /// Restrict to nodes whose absolute path contains ``substring``
+    /// anywhere. Useful for path-pattern plugins (``alembic/versions/``,
+    /// ``.ignore.py``).
+    fn with_path_contains<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        substring: String,
+    ) -> PyRefMut<'py, Self> {
+        slf.path_contains = Some(substring);
+        slf
+    }
+    /// Restrict to nodes whose trailing fqname segment matches
+    /// ``pattern`` (a regex). Use with :meth:`with_kind` /
+    /// :meth:`with_kinds` to drop modules from the result set when
+    /// you only want top-level decls.
+    fn with_simple_name_regex<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        pattern: String,
+    ) -> PyRefMut<'py, Self> {
+        slf.simple_name_regex = Some(pattern);
         slf
     }
     /// Restrict to nodes whose ``flags & mask == mask`` (all bits in
@@ -1739,6 +1984,12 @@ impl DeclQuery {
         let ctx = self.ctx.borrow(py);
         let outputs = ctx.materialized("DeclQuery.indices")?;
         let path_regex = _compile_path_regex(self.path_regex.as_deref())?;
+        let simple_name_regex = match self.simple_name_regex.as_deref() {
+            None => None,
+            Some(p) => Some(regex::Regex::new(p).map_err(|e| {
+                PyValueError::new_err(format!("invalid simple-name regex {p:?}: {e}"))
+            })?),
+        };
 
         // Pre-compute hashsets for predicates that take lists. Singular
         // forms reuse the same vec (length 1) so the hashset cost is
@@ -1841,6 +2092,26 @@ impl DeclQuery {
                     continue;
                 }
             }
+            // simple-name regex
+            if let Some(re) = &simple_name_regex {
+                let fq = node.fqname.as_str();
+                let simple = fq.rsplit_once('.').map(|(_, n)| n).unwrap_or(fq);
+                if !re.is_match(simple) {
+                    continue;
+                }
+            }
+            // path prefix
+            if let Some(prefix) = &self.path_prefix {
+                if !node.path.starts_with(prefix.as_str()) {
+                    continue;
+                }
+            }
+            // path substring
+            if let Some(needle) = &self.path_contains {
+                if !node.path.contains(needle.as_str()) {
+                    continue;
+                }
+            }
             // flags mask
             if let Some(mask) = self.flags_mask {
                 if self.flags_match_any {
@@ -1885,6 +2156,221 @@ impl DeclQuery {
 }
 
 impl_query_methods!(no_first DeclQuery);
+
+// ---------------------------------------------------------------------------
+// TraverseQuery — seeded closure walks
+// ---------------------------------------------------------------------------
+
+/// Closure walks over the graph anchored at a single seed node. Built
+/// via :meth:`QueryBuilder.from_idx`. Terminals: :meth:`descendants`,
+/// :meth:`ancestors`, :meth:`direct_predecessors`. Each takes a
+/// keyword-only ``skip_flags`` mask (default ``0``) that filters out
+/// edges whose flag mask intersects — pass ``EdgeFlags.DEAD_BRANCH.value``
+/// for strict reachability.
+///
+/// All terminals return positional indices into ``ctx.nodes()``; revive
+/// rows via :meth:`ProjectContext.nodes_at` if a plugin needs full
+/// :class:`SymbolNode` objects.
+///
+/// For the seedless "alive from entrypoints" closure, use the top-level
+/// :meth:`QueryBuilder.reachable` form instead.
+#[pyclass(unsendable)]
+pub(crate) struct TraverseQuery {
+    pub(crate) ctx: Py<ProjectContext>,
+    pub(crate) seed: usize,
+}
+
+impl TraverseQuery {
+    fn new(ctx: Py<ProjectContext>, seed: usize) -> Self {
+        Self { ctx, seed }
+    }
+}
+
+#[pymethods]
+impl TraverseQuery {
+    /// Forward closure: every node reachable from the seed by
+    /// following edges. ``skip_flags`` filters out edges whose flag
+    /// mask intersects. Returns indices into ``ctx.nodes()``.
+    #[pyo3(signature = (*, skip_flags = 0))]
+    fn descendants(&self, py: Python<'_>, skip_flags: u32) -> PyResult<Vec<usize>> {
+        let ctx = self.ctx.borrow(py);
+        ctx.descendants_indices(self.seed, skip_flags)
+    }
+
+    /// Reverse closure: every node that can reach the seed by
+    /// following edges. ``skip_flags`` filters the same way as
+    /// :meth:`descendants`. Returns indices into ``ctx.nodes()``.
+    #[pyo3(signature = (*, skip_flags = 0))]
+    fn ancestors(&self, py: Python<'_>, skip_flags: u32) -> PyResult<Vec<usize>> {
+        let ctx = self.ctx.borrow(py);
+        ctx.ancestors_indices(self.seed, skip_flags)
+    }
+
+    /// One-hop reverse: the immediate predecessors of the seed (deduped
+    /// by source index, so parallel edges with different flags collapse
+    /// to a single entry). ``skip_flags`` filters edges the same way as
+    /// :meth:`ancestors`.
+    #[pyo3(signature = (*, skip_flags = 0))]
+    fn direct_predecessors(&self, py: Python<'_>, skip_flags: u32) -> PyResult<Vec<usize>> {
+        let ctx = self.ctx.borrow(py);
+        ctx.direct_predecessors_idx(self.seed, skip_flags)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DeclarationsQuery — fqname lookup with optional module fallback
+// ---------------------------------------------------------------------------
+
+/// Look up declarations by fully-qualified name. Built via
+/// :meth:`QueryBuilder.declarations`. Requires :meth:`with_fqname`;
+/// terminals are :meth:`indices` (all matching decls) and
+/// :meth:`resolve_idx` (first match, with module fallback).
+///
+/// Both terminals share the walk-back rule: if the exact fqname
+/// doesn't match, dotted segments are stripped from the right until an
+/// enclosing top-level decl is found (``pkg.lib.Cls.method`` resolves
+/// to ``pkg.lib.Cls`` because methods aren't graph nodes).
+#[pyclass(unsendable)]
+pub(crate) struct DeclarationsQuery {
+    pub(crate) ctx: Py<ProjectContext>,
+    pub(crate) fqname: Option<String>,
+}
+
+impl DeclarationsQuery {
+    fn new(ctx: Py<ProjectContext>) -> Self {
+        Self { ctx, fqname: None }
+    }
+}
+
+#[pymethods]
+impl DeclarationsQuery {
+    fn with_fqname<'py>(mut slf: PyRefMut<'py, Self>, fqname: String) -> PyRefMut<'py, Self> {
+        slf.fqname = Some(fqname);
+        slf
+    }
+
+    /// Terminal — every decl matching ``fqname`` (walk-back included).
+    /// Modules are never returned; use :meth:`QueryBuilder.modules`
+    /// for module lookup. Returns indices into ``ctx.nodes()``.
+    fn indices(&self, py: Python<'_>) -> PyResult<Vec<usize>> {
+        let ctx = self.ctx.borrow(py);
+        let fqname = self.fqname.as_deref().ok_or_else(|| {
+            PyValueError::new_err("DeclarationsQuery requires .with_fqname(fqname)")
+        })?;
+        ctx.find_declarations_indices(fqname)
+    }
+
+    /// Terminal — first decl matching ``fqname``, falling back to a
+    /// module match. Same walk-back rules as :meth:`indices` but
+    /// includes module nodes in the lookup. Returns ``None`` when the
+    /// fqname can't be found anywhere.
+    fn resolve_idx(&self, py: Python<'_>) -> PyResult<Option<usize>> {
+        let ctx = self.ctx.borrow(py);
+        let fqname = self.fqname.as_deref().ok_or_else(|| {
+            PyValueError::new_err("DeclarationsQuery requires .with_fqname(fqname)")
+        })?;
+        ctx.resolve_idx(fqname)
+    }
+
+    /// Iterate over matched indices. Same shape as :meth:`indices`.
+    fn __iter__(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let idxs = self.indices(py)?;
+        let list = pyo3::types::PyList::new_bound(py, idxs);
+        Ok(list.call_method0("__iter__")?.into())
+    }
+
+    fn count(&self, py: Python<'_>) -> PyResult<usize> {
+        Ok(self.indices(py)?.len())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MainBlockQuery — project-wide ``if __name__ == "__main__":`` blocks
+// ---------------------------------------------------------------------------
+
+/// Enumerate every ``if __name__ == "__main__":`` block in the project.
+/// Built via :meth:`QueryBuilder.main_blocks`. The only terminal is
+/// :meth:`index_pairs`, returning ``(module_idx, [decl_idx, ...])``
+/// pairs into ``ctx.nodes()`` — one entry per file that has a main
+/// block, with ``decl_idx`` listing the top-level decls inside the
+/// block.
+#[pyclass(unsendable)]
+pub(crate) struct MainBlockQuery {
+    pub(crate) ctx: Py<ProjectContext>,
+}
+
+impl MainBlockQuery {
+    fn new(ctx: Py<ProjectContext>) -> Self {
+        Self { ctx }
+    }
+}
+
+#[pymethods]
+impl MainBlockQuery {
+    /// Terminal — ``(module_idx, [decl_idx, ...])`` pairs for every
+    /// file with a top-level ``if __name__ == "__main__":`` block.
+    /// Same scan as :meth:`ProjectContext.find_main_blocks_indices`,
+    /// returns indices into ``ctx.nodes()``.
+    fn index_pairs(&self, py: Python<'_>) -> PyResult<Vec<(usize, Vec<usize>)>> {
+        let ctx = self.ctx.borrow(py);
+        ctx.find_main_blocks_indices()
+    }
+
+    /// Iterate over ``(module_idx, [decl_idx, ...])`` pairs.
+    fn __iter__(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let pairs = self.index_pairs(py)?;
+        let list = pyo3::types::PyList::new_bound(py, pairs);
+        Ok(list.call_method0("__iter__")?.into())
+    }
+
+    fn count(&self, py: Python<'_>) -> PyResult<usize> {
+        Ok(self.index_pairs(py)?.len())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LiteralListQuery — per-variable string literal list lookup
+// ---------------------------------------------------------------------------
+
+/// Read the entries of a module-level string-literal list / tuple
+/// (typical use: ``__all__``, but works for any name). Built via
+/// :meth:`QueryBuilder.literal_lists`. Requires :meth:`for_fqn`; the
+/// only terminal is :meth:`entries`.
+///
+/// Returns the concatenation of entries from every matching decl,
+/// preserving declaration order. Returns ``None`` when the fqname
+/// isn't a module-level name or doesn't bind a string-literal list.
+#[pyclass(unsendable)]
+pub(crate) struct LiteralListQuery {
+    pub(crate) ctx: Py<ProjectContext>,
+    pub(crate) fqn: Option<String>,
+}
+
+impl LiteralListQuery {
+    fn new(ctx: Py<ProjectContext>) -> Self {
+        Self { ctx, fqn: None }
+    }
+}
+
+#[pymethods]
+impl LiteralListQuery {
+    fn for_fqn<'py>(mut slf: PyRefMut<'py, Self>, fqn: String) -> PyRefMut<'py, Self> {
+        slf.fqn = Some(fqn);
+        slf
+    }
+
+    /// Terminal — the list of string entries bound to ``fqn`` at
+    /// module scope, or ``None`` when no matching binding declares a
+    /// string-literal list / tuple.
+    fn entries(&self, py: Python<'_>) -> PyResult<Option<Vec<String>>> {
+        let ctx = self.ctx.borrow(py);
+        let fqn = self
+            .fqn
+            .as_deref()
+            .ok_or_else(|| PyValueError::new_err("LiteralListQuery requires .for_fqn(fqn)"))?;
+        ctx.find_literal_list_entries(fqn)
+    }
+}
 
 #[cfg(test)]
 mod tests {

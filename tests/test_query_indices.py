@@ -1227,3 +1227,403 @@ def test_ancestors_indices_out_of_range_raises(build_decl_graph):
     n = len(ctx.nodes())
     with pytest.raises(IndexError, match="out of range"):
         ctx.ancestors_indices(n)
+
+
+# ---------------------------------------------------------------------------
+# ModuleQuery — DSL stream for module-shaped lookups
+# ---------------------------------------------------------------------------
+
+
+def test_module_query_with_fqn_returns_module_idx(build_decl_graph):
+    ctx = build_decl_graph(
+        {"pkg/__init__.py": "", "pkg/sub/__init__.py": "", "pkg/sub/inner.py": "x = 1\n"}
+    )
+    idx = native.query(ctx).modules().with_fqn("pkg.sub.inner").first_idx()
+    assert idx is not None
+    assert ctx.nodes()[idx].fqname == "pkg.sub.inner"
+
+
+def test_module_query_with_fqn_missing_returns_none(build_decl_graph):
+    ctx = build_decl_graph({"pkg/__init__.py": "", "pkg/a.py": "x = 1\n"})
+    assert native.query(ctx).modules().with_fqn("nothing.here").first_idx() is None
+    assert native.query(ctx).modules().with_fqn("nothing.here").indices() == []
+
+
+def test_module_query_with_path(build_decl_graph):
+    ctx = build_decl_graph({"pkg/__init__.py": "", "pkg/svc.py": "def f(): pass\n"})
+    svc_path = next(n.path for n in ctx.nodes() if n.fqname == "pkg.svc")
+    idx = native.query(ctx).modules().with_path(svc_path).first_idx()
+    assert idx is not None
+    assert ctx.nodes()[idx].fqname == "pkg.svc"
+
+
+def test_module_query_surface_includes_submodules(build_decl_graph):
+    ctx = build_decl_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/svc.py": "def handler(): pass\nclass Service: pass\n",
+            "pkg/sub/__init__.py": "",
+            "pkg/sub/inner.py": "def deep(): pass\n",
+        }
+    )
+    indices = native.query(ctx).modules().with_fqn("pkg").surface().indices()
+    fqnames = {ctx.nodes()[i].fqname for i in indices}
+    assert "pkg" in fqnames
+    assert "pkg.svc" in fqnames
+    assert "pkg.svc.handler" in fqnames
+    assert "pkg.sub.inner" in fqnames
+    assert "pkg.sub.inner.deep" in fqnames
+
+
+def test_module_query_top_level_excludes_submodules(build_decl_graph):
+    ctx = build_decl_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/svc.py": "def handler(): pass\n",
+            "pkg/sub/__init__.py": "",
+            "pkg/sub/inner.py": "def deep(): pass\n",
+        }
+    )
+    indices = native.query(ctx).modules().with_fqn("pkg").top_level().indices()
+    fqnames = {ctx.nodes()[i].fqname for i in indices}
+    # ``pkg/__init__.py`` has no top-level decls of its own; the
+    # submodule node itself is excluded by the contract.
+    assert "pkg.svc" not in fqnames
+    assert "pkg.sub" not in fqnames
+
+
+def test_module_query_dunder_all_returns_listed_exports(build_decl_graph):
+    ctx = build_decl_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/m.py": '__all__ = ["f"]\ndef f(): pass\ndef g(): pass\n',
+        }
+    )
+    idxs = native.query(ctx).modules().with_fqn("pkg.m").dunder_all()
+    assert idxs is not None
+    fqnames = {ctx.nodes()[i].fqname for i in idxs}
+    assert fqnames == {"pkg.m.f"}
+
+
+def test_module_query_dunder_all_none_when_unset(build_decl_graph):
+    ctx = build_decl_graph({"pkg/__init__.py": "", "pkg/m.py": "def f(): pass\n"})
+    assert native.query(ctx).modules().with_fqn("pkg.m").dunder_all() is None
+
+
+def test_module_query_with_dunders_project_wide(build_decl_graph):
+    ctx = build_decl_graph(
+        {
+            "pkg/__init__.py": "__all__ = []\n__version__ = '1.0'\n",
+            "pkg/a.py": "def __getattr__(name): pass\nx = 1\n",
+        }
+    )
+    idxs = native.query(ctx).modules().with_dunders().indices()
+    fqnames = {ctx.nodes()[i].fqname for i in idxs}
+    assert "pkg.__all__" in fqnames
+    assert "pkg.__version__" in fqnames
+    assert "pkg.a.__getattr__" in fqnames
+    assert "pkg.a.x" not in fqnames
+
+
+def test_module_query_no_filter_raises(build_decl_graph):
+    ctx = build_decl_graph({"pkg/__init__.py": "", "pkg/a.py": "x = 1\n"})
+    with pytest.raises(ValueError, match="with_fqn"):
+        native.query(ctx).modules().indices()
+
+
+# ---------------------------------------------------------------------------
+# TraverseQuery — parity with ctx.{descendants,ancestors,direct_predecessors}_*
+# ---------------------------------------------------------------------------
+
+
+def test_traverse_descendants_matches_ctx_descendants_indices(build_decl_graph):
+    ctx = build_decl_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/main.py": """
+            def used(): pass
+            def caller(): used()
+            caller()
+            """,
+        }
+    )
+    main_idx = native.query(ctx).modules().with_fqn("pkg.main").first_idx()
+    assert main_idx is not None
+    via_traverse = native.query(ctx).from_idx(main_idx).descendants()
+    via_ctx = ctx.descendants_indices(main_idx)
+    assert sorted(via_traverse) == sorted(via_ctx)
+
+
+def test_traverse_ancestors_matches_ctx_ancestors_indices(build_decl_graph):
+    ctx = build_decl_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/main.py": """
+            def used(): pass
+            def caller(): used()
+            caller()
+            """,
+        }
+    )
+    used_idx = native.query(ctx).declarations().with_fqname("pkg.main.used").resolve_idx()
+    assert used_idx is not None
+    via_traverse = native.query(ctx).from_idx(used_idx).ancestors()
+    via_ctx = ctx.ancestors_indices(used_idx)
+    assert sorted(via_traverse) == sorted(via_ctx)
+
+
+def test_traverse_direct_predecessors_matches_ctx(build_decl_graph):
+    ctx = build_decl_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/main.py": "def f(): pass\ndef g(): f()\ndef h(): f()\n",
+        }
+    )
+    f_idx = native.query(ctx).declarations().with_fqname("pkg.main.f").resolve_idx()
+    assert f_idx is not None
+    via_traverse = native.query(ctx).from_idx(f_idx).direct_predecessors()
+    via_ctx = ctx.direct_predecessors_idx(f_idx)
+    assert sorted(via_traverse) == sorted(via_ctx)
+
+
+def test_traverse_descendants_skip_flags(build_decl_graph):
+    """``skip_flags`` plumbs through to the underlying BFS."""
+    ctx = build_decl_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/m.py": """
+            def live(): pass
+            if False:
+                def dead(): pass
+                live()
+            """,
+        }
+    )
+    mod_idx = native.query(ctx).modules().with_fqn("pkg.m").first_idx()
+    assert mod_idx is not None
+    full = native.query(ctx).from_idx(mod_idx).descendants()
+    strict = (
+        native.query(ctx).from_idx(mod_idx).descendants(skip_flags=native.EdgeFlags.DEAD_BRANCH)
+    )
+    # Strict closure is a subset of the dead-branch-traversing closure.
+    assert set(strict).issubset(set(full))
+
+
+def test_query_reachable_matches_ctx_reachable_indices(build_decl_graph):
+    ctx = build_decl_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/main.py": """
+            def alive(): pass
+            def dead(): pass
+            alive()
+            """,
+        }
+    )
+    via_query = native.query(ctx).reachable()
+    via_ctx = ctx.reachable_indices()
+    assert sorted(via_query) == sorted(via_ctx)
+
+
+def test_query_reachable_seed_flags_kwarg(build_decl_graph):
+    ctx = build_decl_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/main.py": "def f(): pass\nf()\n",
+        }
+    )
+    via_query = native.query(ctx).reachable(
+        skip_flags=native.EdgeFlags.DEAD_BRANCH,
+        seed_flags=native.NodeFlags.ENTRYPOINT,
+    )
+    via_ctx = ctx.reachable_indices(
+        skip_flags=native.EdgeFlags.DEAD_BRANCH,
+        seed_flags=native.NodeFlags.ENTRYPOINT,
+    )
+    assert sorted(via_query) == sorted(via_ctx)
+
+
+# ---------------------------------------------------------------------------
+# DeclarationsQuery — parity with ctx.find_declarations_indices / resolve_idx
+# ---------------------------------------------------------------------------
+
+
+def test_declarations_query_indices_matches_ctx(build_decl_graph):
+    ctx = build_decl_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/lib.py": "class Cls:\n    def method(self): pass\n",
+        }
+    )
+    # Walk-back: pkg.lib.Cls.method → pkg.lib.Cls.
+    via_query = native.query(ctx).declarations().with_fqname("pkg.lib.Cls.method").indices()
+    via_ctx = ctx.find_declarations_indices("pkg.lib.Cls.method")
+    assert sorted(via_query) == sorted(via_ctx)
+    assert len(via_query) == 1
+    assert ctx.nodes()[via_query[0]].fqname == "pkg.lib.Cls"
+
+
+def test_declarations_query_resolve_idx_falls_back_to_module(build_decl_graph):
+    ctx = build_decl_graph({"pkg/__init__.py": "", "pkg/lib.py": "def f(): pass\n"})
+    # find_declarations excludes modules — resolve_idx includes them.
+    decls = native.query(ctx).declarations().with_fqname("pkg.lib").indices()
+    assert decls == []
+    resolved = native.query(ctx).declarations().with_fqname("pkg.lib").resolve_idx()
+    assert resolved is not None
+    assert ctx.nodes()[resolved].kind == "module"
+
+
+def test_declarations_query_resolve_idx_unknown_returns_none(build_decl_graph):
+    ctx = build_decl_graph({"pkg/__init__.py": ""})
+    assert native.query(ctx).declarations().with_fqname("nowhere.such.name").resolve_idx() is None
+
+
+def test_declarations_query_no_fqname_raises(build_decl_graph):
+    ctx = build_decl_graph({"pkg/__init__.py": ""})
+    with pytest.raises(ValueError, match="with_fqname"):
+        native.query(ctx).declarations().indices()
+
+
+# ---------------------------------------------------------------------------
+# MainBlockQuery — parity with ctx.find_main_blocks_indices
+# ---------------------------------------------------------------------------
+
+
+def test_main_block_query_matches_ctx(build_decl_graph):
+    ctx = build_decl_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/script.py": """
+            def helper(): pass
+
+            if __name__ == "__main__":
+                def inner_decl(): pass
+                helper()
+            """,
+            "pkg/lib.py": "def lib_fn(): pass\n",
+        }
+    )
+    via_query = native.query(ctx).main_blocks().index_pairs()
+    via_ctx = ctx.find_main_blocks_indices()
+    # Same pairs, same shapes.
+    assert len(via_query) == len(via_ctx) == 1
+    q_mod, q_decls = via_query[0]
+    c_mod, c_decls = via_ctx[0]
+    assert q_mod == c_mod
+    assert sorted(q_decls) == sorted(c_decls)
+
+
+def test_main_block_query_no_main_block(build_decl_graph):
+    ctx = build_decl_graph({"pkg/__init__.py": "", "pkg/lib.py": "def f(): pass\n"})
+    assert native.query(ctx).main_blocks().index_pairs() == []
+
+
+# ---------------------------------------------------------------------------
+# LiteralListQuery — parity with ctx.find_literal_list_entries
+# ---------------------------------------------------------------------------
+
+
+def test_literal_list_query_matches_ctx(build_decl_graph):
+    ctx = build_decl_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/m.py": """
+            __all__ = ["a", "b"]
+            def a(): pass
+            def b(): pass
+            """,
+        }
+    )
+    via_query = native.query(ctx).literal_lists().for_fqn("pkg.m.__all__").entries()
+    via_ctx = ctx.find_literal_list_entries("pkg.m.__all__")
+    assert via_query == via_ctx == ["a", "b"]
+
+
+def test_literal_list_query_unknown_returns_none(build_decl_graph):
+    ctx = build_decl_graph({"pkg/__init__.py": ""})
+    assert native.query(ctx).literal_lists().for_fqn("pkg.nope").entries() is None
+
+
+def test_literal_list_query_no_fqn_raises(build_decl_graph):
+    ctx = build_decl_graph({"pkg/__init__.py": ""})
+    with pytest.raises(ValueError, match="for_fqn"):
+        native.query(ctx).literal_lists().entries()
+
+
+# ---------------------------------------------------------------------------
+# DeclQuery.with_path_prefix / with_path_contains / with_simple_name_regex
+# ---------------------------------------------------------------------------
+
+
+def test_decl_query_with_path_prefix_matches_decls_under(build_decl_graph, tmp_path):
+    ctx = build_decl_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/sub/__init__.py": "",
+            "pkg/sub/inner.py": "def deep(): pass\n",
+            "pkg/top.py": "def shallow(): pass\n",
+        }
+    )
+    prefix = str(tmp_path / "pkg" / "sub")
+    via_query = native.query(ctx).decls().with_path_prefix(prefix).indices()
+    via_ctx = ctx.decls_under_indices(prefix)
+    assert sorted(via_query) == sorted(via_ctx)
+
+
+def test_decl_query_with_path_contains_matches_decls_matching(build_decl_graph):
+    ctx = build_decl_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/test_a.py": "def t_a(): pass\n",
+            "pkg/lib.py": "def f(): pass\n",
+        }
+    )
+    via_query = native.query(ctx).decls().with_path_contains("test_a").indices()
+    via_ctx = ctx.decls_matching_indices("test_a")
+    assert sorted(via_query) == sorted(via_ctx)
+
+
+def test_decl_query_with_simple_name_regex_matches_decls_matching_name(build_decl_graph):
+    ctx = build_decl_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/a.py": "def test_one(): pass\nclass TestThing: pass\ndef helper(): pass\n",
+        }
+    )
+    # decls_matching_name implicitly filters to function|class|variable|import|type_alias;
+    # DeclQuery composes — apply the same kind filter explicitly.
+    via_query = (
+        native.query(ctx)
+        .decls()
+        .with_simple_name_regex(r"^(test_|Test)")
+        .with_kinds(["function", "class", "variable", "import", "type_alias"])
+        .indices()
+    )
+    via_ctx = ctx.decls_matching_name_indices(r"^(test_|Test)")
+    assert sorted(via_query) == sorted(via_ctx)
+
+
+def test_decl_query_path_and_simple_name_compose(build_decl_graph):
+    ctx = build_decl_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/test_a.py": "def test_one(): pass\ndef helper(): pass\n",
+            "pkg/lib.py": "def test_one(): pass\n",
+        }
+    )
+    indices = (
+        native.query(ctx)
+        .decls()
+        .with_path_contains("test_a")
+        .with_simple_name_regex(r"^test_")
+        .with_kind("function")
+        .indices()
+    )
+    fqnames = {n.fqname for n in ctx.nodes_at(indices)}
+    assert fqnames == {"pkg.test_a.test_one"}
+
+
+def test_decl_query_simple_name_regex_invalid_raises(build_decl_graph):
+    ctx = build_decl_graph({"pkg/__init__.py": "", "pkg/a.py": "x = 1\n"})
+    with pytest.raises(ValueError, match="invalid simple-name regex"):
+        native.query(ctx).decls().with_simple_name_regex(r"(unclosed").indices()

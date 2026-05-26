@@ -66,7 +66,7 @@ class DecoratedDeclPlugin(Plugin):
         def in_scope(path: str) -> bool:
             if not prefix:
                 return True
-            module_idx = ctx.module_for_indices(path)
+            module_idx = native.query(ctx).modules().with_path(path).first_idx()
             if module_idx is None:
                 return False
             (_kind, _path, fqname, _flags) = ctx.node_attrs([module_idx])[0]
@@ -308,7 +308,9 @@ class DispatchAppPlugin(Plugin):
         if spec.seed_as_entrypoint and factory_decls:
             factory_reachers: set[int] = set()
             for fref, _kind in factory_decls:
-                factory_reachers.update(ctx.direct_predecessors_idx(fref.decl_idx))
+                factory_reachers.update(
+                    native.query(ctx).from_idx(fref.decl_idx).direct_predecessors()
+                )
 
             classified: set[tuple[str, str]] = set()
             for h in handlers:
@@ -622,7 +624,7 @@ class LiteralListPlugin(Plugin):
         # The visitor doesn't emit ``var -> referent`` edges for
         # non-``__all__`` string-list assignments, so the plugin can't
         # rely on a descendant walk.
-        entries = ctx.find_literal_list_entries(var_fqname)
+        entries = native.query(ctx).literal_lists().for_fqn(var_fqname).entries()
         if not entries:
             return
 
@@ -637,7 +639,9 @@ class LiteralListPlugin(Plugin):
         surfaces = ctx.module_surfaces_indices(entries)
         for entry in entries:
             target_idxs: list[int] = list(surfaces.get(entry, ()))
-            target_idxs.extend(ctx.find_declarations_indices(entry))
+            target_idxs.extend(
+                native.query(ctx).declarations().with_fqname(entry).indices()
+            )
             if not target_idxs:
                 continue
             (_kind, marker_path, _fq, _flags) = ctx.node_attrs([target_idxs[0]])[0]

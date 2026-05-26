@@ -22,7 +22,7 @@ class MainBlockPlugin(Plugin):
     """
 
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
-        pairs = ctx.find_main_blocks_indices()
+        pairs = native.query(ctx).main_blocks().index_pairs()
         if not pairs:
             return
         # Batch-fetch (fqname, path) for every matched module in one hop.

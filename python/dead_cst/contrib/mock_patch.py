@@ -67,8 +67,10 @@ class MockPatchPlugin(Plugin):
             owners_by_fqname.setdefault(ref.string_arg, []).append((ref.owner_idx, ref.path))
 
         for fqname, owners in owners_by_fqname.items():
-            target_idxs = list(ctx.find_declarations_indices(fqname))
-            mod_idx = ctx.find_module_idx(fqname)
+            target_idxs = list(
+                native.query(ctx).declarations().with_fqname(fqname).indices()
+            )
+            mod_idx = native.query(ctx).modules().with_fqn(fqname).first_idx()
             if mod_idx is not None:
                 target_idxs.append(mod_idx)
             yield native.AddNodeByIdx(

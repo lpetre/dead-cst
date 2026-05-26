@@ -1276,10 +1276,49 @@ class QueryBuilder:
     def calls(self) -> CallQuery: ...
     def subclasses(self) -> SubclassQuery: ...
     def imports(self) -> ImportQuery: ...
+    def modules(self) -> ModuleQuery: ...
     def classes(self) -> ClassQuery: ...
     def factories(self) -> FactoryQuery: ...
     def edges(self) -> EdgeQuery: ...
     def decls(self) -> DeclQuery: ...
+    def declarations(self) -> DeclarationsQuery: ...
+    def main_blocks(self) -> MainBlockQuery: ...
+    def literal_lists(self) -> LiteralListQuery: ...
+    def from_idx(self, seed_idx: int) -> TraverseQuery:
+        """Anchor a closure walk on a single seed. Returns a
+        :class:`TraverseQuery` whose terminals (``descendants`` /
+        ``ancestors`` / ``direct_predecessors``) return positional
+        indices into :meth:`ProjectContext.nodes`.
+        """
+        ...
+
+    def reachable(self, *, skip_flags: int = 0, seed_flags: int | None = None) -> list[int]:
+        """Seedless reachability terminal. Forward closure from every
+        node carrying any bit in ``seed_flags`` (default:
+        ``NodeFlags.ENTRYPOINT``), filtering edges by ``skip_flags``.
+        Returns positional indices into :meth:`ProjectContext.nodes`.
+        """
+        ...
+
+    def matching_specs(
+        self,
+        project_root: str,
+        *,
+        regexes: list[str] = ...,
+        str_specs: list[str] = ...,
+        abs_paths: list[str] = ...,
+    ) -> list[int]:
+        """OR-form spec matcher (used by
+        :class:`ExplicitEntrypointPlugin`). A node matches if any of:
+
+        * ``regexes`` contains a pattern matching the node's path
+          relative to ``project_root`` (anchored, ``re.match`` style);
+        * ``str_specs`` contains the node's relative path or fqname;
+        * ``abs_paths`` contains the node's absolute path.
+
+        Returns positional indices into :meth:`ProjectContext.nodes`.
+        """
+        ...
 
 class DecoratorQuery:
     """Find decorated top-level functions / classes. Pick exactly one
@@ -1463,6 +1502,183 @@ class ImportQuery:
 
     def __iter__(self) -> Iterator[SymbolNode]: ...
 
+class ModuleQuery:
+    """Enumerate / inspect project module nodes.
+
+    Pick exactly one filter (:meth:`with_fqn` / :meth:`with_path` /
+    :meth:`with_dunders`), optionally follow with one transform
+    (:meth:`surface` / :meth:`top_level` / :meth:`dunder_all`), then
+    drop into a terminal (:meth:`indices` / :meth:`first_idx` /
+    :meth:`dunder_all`).
+
+    Idx-only terminals — :class:`ModuleQuery` doesn't have a
+    ``.collect()`` SymbolNode form; plugins consume the idxs and
+    fetch attrs via :meth:`ProjectContext.node_attrs` /
+    :meth:`node_paths` as needed.
+    """
+
+    def with_fqn(self, fqn: str) -> ModuleQuery:
+        """Narrow to a single module by dotted fqname."""
+        ...
+
+    def with_path(self, path: str) -> ModuleQuery:
+        """Narrow to the module owning ``path``. O(1) — backed by the
+        same ``module_nodes_by_file`` index :meth:`find_main_blocks`
+        uses."""
+        ...
+
+    def with_dunders(self) -> ModuleQuery:
+        """Project-wide scan: every module-level variable named
+        ``__xxx__`` plus every PEP 562 dunder function
+        (``__getattr__`` / ``__dir__``). Terminal-friendly with
+        :meth:`indices`. Pairs with no transform.
+        """
+        ...
+
+    def surface(self) -> ModuleQuery:
+        """Transform: module + every transitive decl whose fqname
+        lives under the filtered module's fqname. Models
+        ``importlib.import_module(...)`` reachability — submodules
+        are recursed into, but a decl's sub-fqnames are not.
+        """
+        ...
+
+    def top_level(self) -> ModuleQuery:
+        """Transform: the filtered module's immediate top-level decls.
+        Models ``from <module> import *`` semantics — submodules and
+        their decls are excluded.
+        """
+        ...
+
+    def indices(self) -> list[int]:
+        """Terminal: list of matching positional indices into
+        :meth:`ProjectContext.nodes`.
+
+        * No transform + ``with_fqn`` / ``with_path``: a 0- or
+          1-element list with the matched module idx.
+        * ``surface()`` / ``top_level()``: the module + relevant
+          decls.
+        * ``with_dunders()``: every module-level dunder name in the
+          project.
+        """
+        ...
+
+    def first_idx(self) -> int | None:
+        """Terminal: first matching idx or ``None``. Convenience for
+        single-value lookups (``with_fqn`` / ``with_path`` without a
+        transform).
+        """
+        ...
+
+    def dunder_all(self) -> list[int] | None:
+        """Terminal: decls listed in the module's ``__all__``.
+
+        Returns ``None`` when the module doesn't declare ``__all__``;
+        returns ``[]`` when ``__all__`` exists but resolves to no
+        in-project decls. Requires :meth:`with_fqn`; other filters /
+        transforms are ignored. The distinction between ``None`` and
+        ``[]`` matters: CPython's ``from X import *`` semantics fall
+        back to the non-underscore decl list only in the ``None``
+        case.
+        """
+        ...
+
+    def count(self) -> int: ...
+    def __iter__(self) -> Iterator[int]: ...
+
+class TraverseQuery:
+    """Closure walks anchored at a single seed node. Built via
+    :meth:`QueryBuilder.from_idx`. All terminals return positional
+    indices into :meth:`ProjectContext.nodes`; revive rows via
+    :meth:`ProjectContext.nodes_at` if a plugin needs full
+    :class:`SymbolNode` objects. For the seedless "alive from
+    entrypoints" walk, use :meth:`QueryBuilder.reachable` instead.
+    """
+
+    def descendants(self, *, skip_flags: int = 0) -> list[int]:
+        """Terminal: forward closure from the seed. ``skip_flags`` is
+        an :class:`EdgeFlags` mask — edges whose flag mask intersects
+        are filtered out (e.g. ``EdgeFlags.DEAD_BRANCH.value``).
+        """
+        ...
+
+    def ancestors(self, *, skip_flags: int = 0) -> list[int]:
+        """Terminal: reverse closure to the seed. ``skip_flags``
+        filters edges the same way as :meth:`descendants`.
+        """
+        ...
+
+    def direct_predecessors(self, *, skip_flags: int = 0) -> list[int]:
+        """Terminal: one-hop reverse — the immediate predecessors of
+        the seed (deduped by source idx, so parallel edges with
+        different flags collapse to a single entry).
+        """
+        ...
+
+class DeclarationsQuery:
+    """Look up declarations by fully-qualified name. Built via
+    :meth:`QueryBuilder.declarations`. Requires :meth:`with_fqname`;
+    terminals are :meth:`indices` (all matching decls) and
+    :meth:`resolve_idx` (first match, with module fallback).
+
+    The walk-back rule: when the exact fqname doesn't match, dotted
+    segments are stripped from the right until an enclosing top-level
+    decl is found (``pkg.lib.Cls.method`` resolves to ``pkg.lib.Cls``
+    because methods aren't graph nodes).
+    """
+
+    def with_fqname(self, fqname: str) -> DeclarationsQuery: ...
+    def indices(self) -> list[int]:
+        """Terminal: every decl matching ``fqname`` (walk-back
+        included). Modules are never returned; use
+        :meth:`QueryBuilder.modules` for module lookup.
+        """
+        ...
+
+    def resolve_idx(self) -> int | None:
+        """Terminal: first decl matching ``fqname``, falling back to a
+        module match. Returns ``None`` when the fqname can't be found
+        anywhere.
+        """
+        ...
+
+    def count(self) -> int: ...
+    def __iter__(self) -> Iterator[int]: ...
+
+class MainBlockQuery:
+    """Enumerate every ``if __name__ == "__main__":`` block in the
+    project. Built via :meth:`QueryBuilder.main_blocks`. The only
+    terminal is :meth:`index_pairs`.
+    """
+
+    def index_pairs(self) -> list[tuple[int, list[int]]]:
+        """Terminal: ``(module_idx, [decl_idx, ...])`` pairs for every
+        file with a top-level ``if __name__ == "__main__":`` block.
+        One entry per file; ``decl_idx`` lists the top-level decls
+        whose source position falls inside the block's range.
+        """
+        ...
+
+    def count(self) -> int: ...
+    def __iter__(self) -> Iterator[tuple[int, list[int]]]: ...
+
+class LiteralListQuery:
+    """Read the entries of a module-level string-literal list / tuple
+    (typical use: ``__all__``, but works for any name). Built via
+    :meth:`QueryBuilder.literal_lists`. Requires :meth:`for_fqn`; the
+    only terminal is :meth:`entries`.
+    """
+
+    def for_fqn(self, fqn: str) -> LiteralListQuery: ...
+    def entries(self) -> list[str] | None:
+        """Terminal: the string entries bound to the configured
+        ``fqn`` at module scope (concatenated across multiple decls in
+        declaration order), or ``None`` when the name isn't a
+        module-level decl or doesn't bind a string-literal list /
+        tuple.
+        """
+        ...
+
 class ClassQuery:
     """Enumerate classes by structural property. Today the only filter
     is :meth:`defining_method` (matches classes whose body has a
@@ -1574,6 +1790,27 @@ class DeclQuery:
     def with_simple_names(self, names: str | list[str] | tuple[str, ...]) -> DeclQuery: ...
     def with_paths(self, paths: str | list[str] | tuple[str, ...]) -> DeclQuery: ...
     def with_path_regex(self, regex: str) -> DeclQuery: ...
+    def with_path_prefix(self, prefix: str) -> DeclQuery:
+        """Restrict to nodes whose absolute path starts with
+        ``prefix``. Cheaper than :meth:`with_path_regex` for simple
+        directory scoping.
+        """
+        ...
+
+    def with_path_contains(self, substring: str) -> DeclQuery:
+        """Restrict to nodes whose absolute path contains ``substring``
+        anywhere. Useful for path-pattern plugins like
+        ``alembic/versions/`` or ``.ignore.py``.
+        """
+        ...
+
+    def with_simple_name_regex(self, pattern: str) -> DeclQuery:
+        """Restrict to nodes whose trailing fqname segment matches
+        ``pattern`` (a regex). Combine with :meth:`with_kind` /
+        :meth:`with_kinds` to drop modules when you only want
+        top-level decls.
+        """
+        ...
     def with_flags(self, mask: int) -> DeclQuery:
         """Restrict to nodes whose ``flags & mask == mask`` (all bits set)."""
         ...

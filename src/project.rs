@@ -162,11 +162,11 @@ pub(crate) struct BuildOutputs {
     /// this map.
     pub(crate) children_by_node: FxHashMap<usize, Vec<usize>>,
     /// Project-wide class hierarchy keyed by parent fqname (project or
-    /// external). `base_fqn -> [direct subclass class_idx]`. Lets
-    /// ``subclasses_of_fqn`` answer the "any project classes extending
-    /// ``flask.Flask``?" question in O(1) without re-walking the AST
-    /// or re-resolving imports. Built alongside ``children_by_node``
-    /// from the per-file ``class_bases`` payload.
+    /// external). `base_fqn -> [direct subclass class_idx]`. Built
+    /// alongside ``children_by_node`` from the per-file ``class_bases``
+    /// payload. Retained for the upcoming DSL ``subclasses().of_fqn()``
+    /// O(1) fast path; not yet wired into the current path.
+    #[allow(dead_code)]
     pub(crate) children_by_fqn: FxHashMap<String, Vec<usize>>,
 }
 
@@ -3081,7 +3081,7 @@ impl ProjectContext {
     /// has 3. Pass ``None`` to accept any positional-arg count.
     ///
     /// Returns ``(owning_decl, string_literal_arg)`` pairs.
-    #[allow(clippy::type_complexity)]
+    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
     pub(crate) fn find_calls_on_var(
         &self,
         py: Python<'_>,
@@ -3224,30 +3224,10 @@ impl ProjectContext {
     }
 }
 
-// ``find_subclasses_of`` / ``_indices`` / ``_idx`` back
-// :class:`SubclassQuery`. NOT exposed to Python — plugin authors use
-// the DSL: ``native.query(ctx).subclasses().of_idx(idx).indices()``
-// or ``of_fqn(fqn)``.
-impl ProjectContext {
-    /// Return every transitive subclass of the given class node.
-    ///
-    /// Direct subtypes come from ty's `type_hierarchy_subtypes`; we BFS
-    /// to collect the transitive closure. Results that don't land in
-    /// the project (stdlib / external classes) are dropped.
-    pub(crate) fn find_subclasses_of(
-        &self,
-        py: Python<'_>,
-        class_node: &SymbolNode,
-    ) -> PyResult<Vec<Py<SymbolNode>>> {
-        let indices = self.find_subclasses_of_indices(class_node)?;
-        let outputs = self.materialized("find_subclasses_of")?;
-        Ok(indices
-            .into_iter()
-            .map(|idx| outputs.builder.nodes[idx].clone_ref(py))
-            .collect())
-    }
-}
-
+// ``find_subclasses_of_indices`` / ``_idx`` back :class:`SubclassQuery`.
+// NOT exposed to Python — plugin authors use the DSL:
+// ``native.query(ctx).subclasses().of_idx(idx).indices()`` or
+// ``of_fqn(fqn)``.
 impl ProjectContext {
     /// Idx-only variant of :meth:`find_subclasses_of`. Same lookup,
     /// returns positional indices into ``ctx.nodes()`` rather than
@@ -3726,117 +3706,6 @@ impl ProjectContext {
             }
         }
         Ok(out_idx.into_iter().collect())
-    }
-}
-
-// ``subclasses_of_fqn`` / ``_indices`` / ``subclasses_of_node`` back
-// the project-only subclass-walk path inside :class:`SubclassQuery`.
-// NOT exposed to Python — plugin authors use the DSL.
-impl ProjectContext {
-    /// Project classes that inherit (directly or transitively) from
-    /// the class identified by ``fqn``. ``fqn`` may name a project
-    /// class (e.g. ``pkg.module.MyBase``) or an external one
-    /// (``flask.Flask``, ``typer.Typer``); the lookup is keyed against
-    /// the pre-built ``children_by_fqn`` index (populated at
-    /// materialize time from per-file `class_bases` payloads — see
-    /// `file_payload::ResolvedBase`), so the framework module is
-    /// never loaded out of the venv.
-    ///
-    /// ``transitive=True`` (default) walks the subclass closure via
-    /// ``children_by_node``; ``transitive=False`` returns only direct
-    /// hits. Match shapes per base expression in the class header
-    /// follow the [`ResolvedBase`](crate::file_payload::ResolvedBase)
-    /// contract:
-    ///
-    /// * ``Name(X)`` where ``X`` is imported via
-    ///   ``from <module> import X [as alias]`` → matches when
-    ///   ``<module>.X`` equals ``fqn``.
-    /// * ``Attribute(Name(M).N)`` where ``M`` is bound via
-    ///   ``import <module> [as M]`` → matches when ``<module>.N``
-    ///   equals ``fqn``.
-    /// * ``Name(X)`` referring to a class earlier in the same file →
-    ///   matches when the in-project resolution lands the parent's
-    ///   own fqname or graph idx.
-    ///
-    /// Generics (``class X(Foo[T])``) and other non-identifier
-    /// expressions are skipped — matches the libcst pipeline.
-    pub(crate) fn subclasses_of_fqn(
-        &self,
-        py: Python<'_>,
-        fqn: &str,
-        transitive: bool,
-    ) -> PyResult<Vec<Py<SymbolNode>>> {
-        let indices = self.subclasses_of_fqn_indices(fqn, transitive)?;
-        let outputs = self.materialized("subclasses_of_fqn")?;
-        Ok(indices
-            .into_iter()
-            .map(|i| outputs.builder.nodes[i].clone_ref(py))
-            .collect())
-    }
-
-    /// Idx-only variant of :meth:`subclasses_of_fqn`. Same lookup,
-    /// returns positional indices into ``ctx.nodes()`` rather than
-    /// allocating ``Py<SymbolNode>`` clones.
-    pub(crate) fn subclasses_of_fqn_indices(
-        &self,
-        fqn: &str,
-        transitive: bool,
-    ) -> PyResult<Vec<usize>> {
-        let outputs = self.materialized("subclasses_of_fqn_indices")?;
-        let Some(direct) = outputs.children_by_fqn.get(fqn) else {
-            return Ok(Vec::new());
-        };
-        let mut visited: FxHashSet<usize> = direct.iter().copied().collect();
-        if transitive {
-            for &d in direct {
-                for idx in transitive_subclasses_via_index(d, &outputs.children_by_node) {
-                    visited.insert(idx);
-                }
-            }
-        }
-        Ok(visited.into_iter().collect())
-    }
-
-    /// Project classes that inherit (directly or transitively) from
-    /// ``class_node``. O(1) probe in ``children_by_node`` plus BFS for
-    /// the transitive walk. Returns an empty vec when ``class_node``
-    /// isn't a class kind. Symmetric to :meth:`subclasses_of_fqn` for
-    /// callers that already hold the seed as a `SymbolNode`.
-    pub(crate) fn subclasses_of_node(
-        &self,
-        py: Python<'_>,
-        class_node: &SymbolNode,
-        transitive: bool,
-    ) -> PyResult<Vec<Py<SymbolNode>>> {
-        if class_node.kind != "class" {
-            return Ok(Vec::new());
-        }
-        let outputs = self.materialized("subclasses_of_node")?;
-        let Some((seed_file, seed_range)) = locate_class_def(
-            &self.db,
-            &outputs.path_to_file,
-            &class_node.path,
-            class_node,
-        ) else {
-            return Ok(Vec::new());
-        };
-        let rk = (seed_range.start().to_u32(), seed_range.end().to_u32());
-        let Some(&seed_idx) = outputs.class_by_selection.get(&(seed_file, rk)) else {
-            return Ok(Vec::new());
-        };
-        let out_idx = if transitive {
-            transitive_subclasses_via_index(seed_idx, &outputs.children_by_node)
-        } else {
-            outputs
-                .children_by_node
-                .get(&seed_idx)
-                .cloned()
-                .unwrap_or_default()
-        };
-        Ok(out_idx
-            .into_iter()
-            .map(|idx| outputs.builder.nodes[idx].clone_ref(py))
-            .collect())
     }
 }
 

@@ -47,9 +47,11 @@ class ProjectScriptsPlugin(Plugin):
         for script_name, target in scripts.items():
             module_part, _, decl_part = target.partition(":")
             fqname = f"{module_part}.{decl_part}" if decl_part else module_part
-            target_idxs = ctx.find_declarations_indices(fqname)
+            target_idxs = native.query(ctx).declarations().with_fqname(fqname).indices()
             if not target_idxs:
-                module_idx = ctx.find_module_idx(module_part)
+                module_idx = (
+                    native.query(ctx).modules().with_fqn(module_part).first_idx()
+                )
                 if module_idx is not None:
                     target_idxs = [module_idx]
             if not target_idxs:
