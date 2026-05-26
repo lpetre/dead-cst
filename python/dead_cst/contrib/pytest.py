@@ -36,28 +36,35 @@ class PytestPlugin(Plugin):
             return
         paths = ctx.node_paths(idxs)
 
+        # One pass: bucket conftest decls by path, collect test-file
+        # candidates into a flat (idx, path) pair. Test candidates
+        # still need a ``_is_test_decl`` filter (which wants ``kind``
+        # / ``fqname``), but we defer that to one batched
+        # ``node_attrs`` call across every path instead of one call
+        # per path inside a loop.
         conftest_idxs_by_path: dict[str, list[int]] = {}
-        test_idxs_by_path: dict[str, list[int]] = {}
+        test_candidate_idxs: list[int] = []
+        test_candidate_paths: list[str] = []
         for idx, path in zip(idxs, paths, strict=True):
             filename = Path(path).name
             if filename == "conftest.py":
                 conftest_idxs_by_path.setdefault(path, []).append(idx)
             elif _is_test_filename(filename):
-                test_idxs_by_path.setdefault(path, []).append(idx)
+                test_candidate_idxs.append(idx)
+                test_candidate_paths.append(path)
 
-        # Filter test-file decls by ``_is_test_decl`` — needs the
-        # ``kind`` and ``fqname`` we deliberately didn't fetch above.
-        # We pay the 4-tuple node_attrs cost only for this subset.
+        # Single batched ``node_attrs`` for every test candidate
+        # across every test file — one FFI hop regardless of how many
+        # test files the project has. Re-bucket by path after the
+        # filter.
         test_filtered_by_path: dict[str, list[int]] = {}
-        for path, test_idxs in test_idxs_by_path.items():
-            attrs = ctx.node_attrs(test_idxs)
-            keep = [
-                idx
-                for idx, attr in zip(test_idxs, attrs, strict=True)
-                if _is_test_decl(attr.kind, attr.fqname)
-            ]
-            if keep:
-                test_filtered_by_path[path] = keep
+        if test_candidate_idxs:
+            attrs = ctx.node_attrs(test_candidate_idxs)
+            for idx, path, attr in zip(
+                test_candidate_idxs, test_candidate_paths, attrs, strict=True
+            ):
+                if _is_test_decl(attr.kind, attr.fqname):
+                    test_filtered_by_path.setdefault(path, []).append(idx)
 
         # Module-fqname fetch — only for paths we'll actually seed
         # (conftest + filtered tests). Skips the cost for irrelevant
