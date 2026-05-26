@@ -34,8 +34,9 @@ class CeleryPlugin(DispatchAppPlugin):
     ) -> Iterable[native.GraphOp]:
         # Standard dispatch policy first, then Celery's appless
         # ``@shared_task`` fan-out. Override on ``policy`` (not ``run``)
-        # so :class:`BatchDispatchAppPlugin` honors the extension when
-        # CeleryPlugin is wrapped.
+        # so the harness's auto-batched gather still picks up the
+        # extension when CeleryPlugin sits alongside other dispatch
+        # plugins.
         yield from super().policy(ctx, gathered)
         by_path: dict[str, list[int]] = {}
         for ref in (

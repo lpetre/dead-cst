@@ -32,7 +32,6 @@ from ._core import (
     simple_name,
 )
 from .decl_shapes import (
-    BatchDispatchAppPlugin,
     DecoratedDeclPlugin,
     DispatchAppGather,
     DispatchAppPlugin,
@@ -47,7 +46,6 @@ from .module_dunders import ModuleDundersPlugin
 from .project_scripts import ProjectScriptsPlugin
 
 __all__ = [
-    "BatchDispatchAppPlugin",
     "DecoratedDeclPlugin",
     "DispatchAppGather",
     "DispatchAppPlugin",

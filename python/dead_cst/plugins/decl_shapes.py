@@ -123,9 +123,9 @@ class DispatchAppSpec:
 class DispatchAppGather:
     """Pre-walked data, scoped to one plugin's spec.
 
-    Both the standalone single-plugin path and the batched fused-walk
-    path produce one of these per plugin and hand it to
-    :meth:`DispatchAppPlugin.policy`. ``vars_by_file`` is shared
+    Both the standalone single-plugin path and the harness's auto-
+    batched fused-walk path produce one of these per plugin and hand
+    it to :meth:`DispatchAppPlugin.policy`. ``vars_by_file`` is shared
     across plugins in the batched path (it's plugin-agnostic).
     """
 
@@ -171,9 +171,12 @@ class DispatchAppPlugin(Plugin):
     **Spec / policy split.** Subclasses customize behavior by
     overriding :meth:`policy` — emission is decoupled from the
     fetch (which is described by :attr:`spec` and performed by the
-    shared walker). The batched driver
-    :class:`BatchDispatchAppPlugin` honors policy overrides for every
-    wrapped plugin by calling each instance's :meth:`policy`.
+    shared walker). The :class:`Analysis` harness detects every
+    registered :class:`DispatchAppPlugin` automatically and fuses
+    their specs into a single gather pass before fanning out the
+    per-plugin :meth:`policy` calls through the same
+    :class:`ThreadPoolExecutor` it uses for non-dispatch plugins,
+    so subclass overrides are honored uniformly without any wrapper.
     """
 
     marker_prefix: str
@@ -228,8 +231,8 @@ class DispatchAppPlugin(Plugin):
         Subclasses that want to add framework-specific extras should
         ``yield from super().policy(ctx, gathered)`` first, then yield
         their additional ops. The standalone :meth:`run` path and the
-        batched :class:`BatchDispatchAppPlugin` path both call this
-        method, so any override is honored uniformly.
+        harness's auto-batched gather both call this method, so any
+        override is honored uniformly.
         """
         spec = gathered.spec
         direct = gathered.direct
@@ -333,10 +336,11 @@ class DispatchAppPlugin(Plugin):
 # ---------------------------------------------------------------------------
 # Walker: spec → gather
 #
-# The "gather" half of the spec / policy split. Both the standalone
-# ``DispatchAppPlugin.run`` path and the batched
-# ``BatchDispatchAppPlugin.run`` path flow through these helpers; only
-# the fan-out shape differs.
+# The "gather" half of the spec / policy split. The standalone
+# ``DispatchAppPlugin.run`` path uses ``_gather_one``; the harness's
+# auto-batching path (``Analysis.materialize_all``) uses
+# ``_gather_batched`` to fuse the per-spec queries across every
+# registered ``DispatchAppPlugin``.
 # ---------------------------------------------------------------------------
 
 
@@ -551,52 +555,6 @@ def _gather_batched(
             vars_by_file=vars_by_file,
         )
     return gathered
-
-
-@dataclass(kw_only=True)
-class BatchDispatchAppPlugin(Plugin):
-    """Run multiple :class:`DispatchAppPlugin` instances with a fused
-    gather pass + per-plugin policy.
-
-    Architecture: split each wrapped plugin into a ``spec`` (the
-    pure-data description of what to gather, see
-    :class:`DispatchAppSpec`) and a ``policy(ctx, gathered)`` method
-    (the per-plugin emission, see
-    :meth:`DispatchAppPlugin.policy`). This driver runs a fused walk
-    across every spec, then calls each plugin's :meth:`policy` with
-    its slice of the gather. Subclass overrides of :meth:`policy` are
-    honored uniformly — that's the point of the split.
-
-    Fusion strategy (in the gather phase):
-
-    * Shared subclass-walk cache — each ``app_class`` fqn's
-      transitive lookup runs at most once regardless of how many
-      specs request it.
-    * Per-distinct-module construction & factory queries. Two specs
-      both targeting ``flask.Flask`` (e.g. Flask + a project-level
-      extension) share one query; rows route back to specs by
-      matching ``class_name`` against each spec's map.
-    * Single project-wide variable scan reused across plugins.
-
-    Per-spec handler queries stay un-fused: the ref API doesn't carry
-    which attribute matched, so a fused result can't route to the
-    right spec without further work. Handler queries are
-    text-prefiltered before any AST parse, so this stays cheap.
-    """
-
-    plugins: list[DispatchAppPlugin]
-    name: str = "BatchDispatchApp"
-    version: int = 1
-
-    def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
-        active = [p for p in self.plugins if p._is_active(ctx)]
-        if not active:
-            return
-        gathered = _gather_batched(ctx, [p.spec for p in active])
-        for plugin, g in zip(active, gathered, strict=True):
-            if g is None:
-                continue
-            yield from plugin.policy(ctx, g)
 
 
 @dataclass(kw_only=True)

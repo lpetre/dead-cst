@@ -10,22 +10,27 @@ two versions.
 ## [Unreleased]
 
 ### Added
-- `BatchDispatchAppPlugin` — composes a list of `DispatchAppPlugin`
-  instances and runs them with fused queries. Same observable output
-  as registering every wrapped plugin individually, but the
-  construction / factory / variable scans run once across the union
-  of all plugins' configs instead of once per plugin.
+- `Analysis` auto-batches `DispatchAppPlugin` instances. Registering
+  multiple dispatch plugins with `Analysis` now triggers a single
+  fused `_gather_batched` on the main thread between the build pass
+  and the plugin fan-out; per-plugin `policy(ctx, gathered)` calls
+  fan out through the same `ThreadPoolExecutor` the harness uses for
+  every other plugin. Replaces the explicit `BatchDispatchAppPlugin`
+  wrapper — same observable output, but the construction / factory /
+  variable scans run once across the union of all dispatch plugins'
+  configs instead of once per plugin, and subclass `policy()`
+  overrides are honored uniformly without any user-side glue.
 - `DispatchAppSpec` (frozen dataclass) + `DispatchAppGather`
   (dataclass) split each plugin into a pure-data spec (what to
   gather) and a `policy(ctx, gathered)` method (how to emit ops from
   the gathered data). Subclasses customize behavior by overriding
   `policy()`; the override is honored uniformly by both the
-  standalone `DispatchAppPlugin.run` path and the batched
-  `BatchDispatchAppPlugin.run` path (the previous batched design
-  invoked the standard emission and skipped subclass extensions).
-  `CeleryPlugin`'s `@shared_task` fan-out moved from a `run()`
-  override to a `policy()` override; it now fires correctly when
-  Celery is wrapped in a batch.
+  standalone `DispatchAppPlugin.run` path and the harness's auto-
+  batched gather (the previous batched design invoked the standard
+  emission and skipped subclass extensions). `CeleryPlugin`'s
+  `@shared_task` fan-out moved from a `run()` override to a `policy()`
+  override; it now fires correctly when Celery is registered
+  alongside other dispatch plugins.
 - `AddEntrypointByIdx` graph op — index-keyed sibling of
   `AddEntrypoint`. Takes a positional index into `ctx.nodes()`; the
   apply pass reads the decl's `fqname` / `path` on the rust side to
@@ -63,6 +68,11 @@ two versions.
   than `Py<SymbolNode>` — keeps the idx surface honest end-to-end.
 
 ### Removed
+- `BatchDispatchAppPlugin` — `Analysis` auto-batches every registered
+  `DispatchAppPlugin` (see Added). Migrate by replacing
+  `[BatchDispatchAppPlugin(plugins=[flask_plugin(), fastapi_plugin()])]`
+  with `[flask_plugin(), fastapi_plugin()]` in the
+  `Analysis(plugins=...)` argument.
 - `ctx.find_subclasses(fqn)` / `find_subclasses_indices` /
   `find_subclasses_of(node)` / `find_subclasses_of_indices` /
   `find_subclasses_of_idx(idx)` / `subclasses_of_fqn(fqn)` /

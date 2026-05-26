@@ -1,12 +1,15 @@
-"""Tests for :class:`BatchDispatchAppPlugin`.
+"""Tests for the harness's automatic batching of
+:class:`DispatchAppPlugin` instances.
 
-The plugin's contract is parity with running each wrapped
-``DispatchAppPlugin`` individually — same reachable set, same dead
-set — but with fused queries under the hood. The tests below pin
-that observable equivalence across the framework patterns that
-exercise the trickier branches: ``seed_as_entrypoint=True`` factories,
-``seed_as_entrypoint=False`` dispatch, multiple plugins targeting the
-same module, and plugins targeting disjoint modules.
+Registering multiple ``DispatchAppPlugin``\\ s with :class:`Analysis`
+no longer requires any wrapper — ``Analysis.materialize_all`` detects
+every dispatch plugin, runs one fused ``_gather_batched`` on the main
+thread, and fans the per-plugin :meth:`policy` calls out through the
+same ``ThreadPoolExecutor`` it uses for non-dispatch plugins.
+
+The tests below pin the observable contract: routes wired correctly
+across frameworks, subclass ``policy()`` overrides honored, and inactive
+plugins (framework not imported) no-op cleanly.
 """
 
 from __future__ import annotations
@@ -18,7 +21,7 @@ from dead_cst.contrib import (
     flask_plugin,
     typer_plugin,
 )
-from dead_cst.plugins import BatchDispatchAppPlugin, DispatchAppPlugin
+from dead_cst.plugins import DispatchAppPlugin
 
 
 def _plugins_flask_fastapi() -> list[DispatchAppPlugin]:
@@ -32,7 +35,9 @@ def _plugins_seed_and_dispatch() -> list[DispatchAppPlugin]:
     return [flask_plugin(), CeleryPlugin(), cyclopts_plugin(), typer_plugin()]
 
 
-def test_batch_matches_individual_for_flask_fastapi(build_plugin_graph, reachable_fqnames):
+def test_multiple_dispatch_plugins_wire_routes(build_plugin_graph, reachable_fqnames):
+    """Two ``DispatchAppPlugin`` instances registered together produce
+    a combined reachable set covering both frameworks' routes."""
     files = {
         "app/__init__.py": "",
         "app/flask_app.py": """
@@ -63,14 +68,24 @@ def test_batch_matches_individual_for_flask_fastapi(build_plugin_graph, reachabl
         """,
     }
 
-    individual = reachable_fqnames(build_plugin_graph(files, _plugins_flask_fastapi()))
-    batched = reachable_fqnames(
-        build_plugin_graph(files, [BatchDispatchAppPlugin(plugins=_plugins_flask_fastapi())])
-    )
-    assert individual == batched
+    alive = reachable_fqnames(build_plugin_graph(files, _plugins_flask_fastapi()))
+    # Every Flask + FastAPI handler should be kept alive.
+    for fq in (
+        "app.flask_app.hello",
+        "app.flask_app.get_item",
+        "app.fastapi_app.health",
+        "app.fastapi_app.create_item",
+    ):
+        assert fq in alive, fq
+    # Unused helpers stay dead.
+    assert "app.flask_app.helper" not in alive
+    assert "app.fastapi_app.helper" not in alive
 
 
-def test_batch_matches_individual_for_seed_and_dispatch_mix(build_plugin_graph, reachable_fqnames):
+def test_mixed_seed_and_dispatch_modes(build_plugin_graph, reachable_fqnames):
+    """``seed_as_entrypoint=True`` (Flask, Celery) and
+    ``seed_as_entrypoint=False`` (Cyclopts, Typer) plugins coexisting
+    in one registration list."""
     files = {
         "app/__init__.py": "",
         "app/flask_app.py": """
@@ -110,18 +125,22 @@ def test_batch_matches_individual_for_seed_and_dispatch_mix(build_plugin_graph, 
         """,
     }
 
-    plugins = _plugins_seed_and_dispatch()
-    individual = reachable_fqnames(build_plugin_graph(files, plugins))
-    batched = reachable_fqnames(
-        build_plugin_graph(files, [BatchDispatchAppPlugin(plugins=_plugins_seed_and_dispatch())])
-    )
-    assert individual == batched
+    alive = reachable_fqnames(build_plugin_graph(files, _plugins_seed_and_dispatch()))
+    # seed_as_entrypoint=True frameworks promote their app instances.
+    assert "app.flask_app.app" in alive
+    assert "app.celery_app.celery_app" in alive
+    assert "app.flask_app.hello" in alive
+    assert "app.celery_app.add" in alive
+    # seed_as_entrypoint=False frameworks don't promote the app — the
+    # handler is only alive because no entrypoint reaches it here.
+    # (Cyclopts / Typer apps stay dead without ``[project.scripts]`` /
+    # ``__main__:`` wiring, and that's the documented contract.)
 
 
-def test_batch_with_factory_chains(build_plugin_graph, reachable_fqnames):
-    """Factory-app promotion (``app = create_app()``) must survive the
-    batched path — exercises the step-6 ``direct_predecessors_idx`` walk
-    via per-plugin emission."""
+def test_factory_chains(build_plugin_graph, reachable_fqnames):
+    """Factory-app promotion (``app = create_app()``) survives the
+    harness's auto-batched gather — exercises the step-6
+    ``direct_predecessors_idx`` walk inside :meth:`policy`."""
     files = {
         "app/__init__.py": "",
         "app/factory.py": """
@@ -136,20 +155,17 @@ def test_batch_with_factory_chains(build_plugin_graph, reachable_fqnames):
         def index(): pass
         """,
     }
-    individual = reachable_fqnames(build_plugin_graph(files, [flask_plugin()]))
-    batched = reachable_fqnames(
-        build_plugin_graph(files, [BatchDispatchAppPlugin(plugins=[flask_plugin()])])
-    )
-    assert individual == batched
-    assert "app.factory.index" in batched
-    assert "app.factory.create_app" in batched
-    assert "app.factory.app" in batched
+    alive = reachable_fqnames(build_plugin_graph(files, [flask_plugin()]))
+    assert "app.factory.index" in alive
+    assert "app.factory.create_app" in alive
+    assert "app.factory.app" in alive
 
 
-def test_batch_skips_when_no_framework_imported(build_plugin_graph, reachable_fqnames):
-    """The import-presence guard short-circuits every wrapped plugin
-    cleanly. Parity check against the unbatched run is the contract:
-    same dead set with or without the framework imports."""
+def test_inactive_dispatch_plugins_skip_cleanly(build_plugin_graph, reachable_fqnames):
+    """When no project file imports the framework, every dispatch
+    plugin's ``_is_active(ctx)`` returns ``False`` and the harness's
+    shim becomes a no-op — same reachable set as registering no
+    plugins at all."""
     files = {
         "app/__init__.py": "",
         "app/plain.py": """
@@ -161,16 +177,15 @@ def test_batch_skips_when_no_framework_imported(build_plugin_graph, reachable_fq
         used()
         """,
     }
-    individual = reachable_fqnames(build_plugin_graph(files, _plugins_flask_fastapi()))
-    batched = reachable_fqnames(
-        build_plugin_graph(files, [BatchDispatchAppPlugin(plugins=_plugins_flask_fastapi())])
-    )
-    assert individual == batched
+    with_dispatch = reachable_fqnames(build_plugin_graph(files, _plugins_flask_fastapi()))
+    without_dispatch = reachable_fqnames(build_plugin_graph(files, []))
+    assert with_dispatch == without_dispatch
 
 
-def test_batch_with_one_plugin_matches_individual(build_plugin_graph, reachable_fqnames):
-    """Degenerate batch (single wrapped plugin) must match the
-    individual run exactly — the simplest equivalence check."""
+def test_single_dispatch_plugin_path(build_plugin_graph, reachable_fqnames):
+    """Degenerate batch (one ``DispatchAppPlugin``) — the auto-batching
+    path with a single plugin must wire the same routes a standalone
+    run would."""
     files = {
         "app/__init__.py": "",
         "app/main.py": """
@@ -182,29 +197,24 @@ def test_batch_with_one_plugin_matches_individual(build_plugin_graph, reachable_
         def x(): pass
         """,
     }
-    individual = reachable_fqnames(build_plugin_graph(files, [flask_plugin()]))
-    batched = reachable_fqnames(
-        build_plugin_graph(files, [BatchDispatchAppPlugin(plugins=[flask_plugin()])])
-    )
-    assert individual == batched
+    alive = reachable_fqnames(build_plugin_graph(files, [flask_plugin()]))
+    assert "app.main.app" in alive
+    assert "app.main.x" in alive
 
 
 # ---------------------------------------------------------------------------
 # spec / policy split — subclass overrides of policy() must be honored
-# uniformly by both the standalone DispatchAppPlugin.run path and the
-# batched BatchDispatchAppPlugin.run path. This is the bit the previous
-# "compose existing plugins" design got wrong: it called
-# ``plugin._emit_ops`` rather than letting subclasses override behavior.
+# uniformly by the harness's auto-batched gather. The previous design
+# (composing plugins inside an explicit BatchDispatchAppPlugin wrapper)
+# got this wrong; the spec/policy split fixes it and the harness now
+# inherits the same guarantee for free.
 # ---------------------------------------------------------------------------
 
 
-def test_subclass_policy_override_honored_by_batch(build_plugin_graph, reachable_fqnames):
-    """A subclass that extends ``policy`` to emit additional ops should
-    have those extra ops fire whether it's invoked standalone OR
-    wrapped in ``BatchDispatchAppPlugin``. This is the regression the
-    spec/policy split fixes — the previous batch design only invoked
-    the standard policy and skipped subclass extensions.
-    """
+def test_subclass_policy_override_fires_under_auto_batch(build_plugin_graph, reachable_fqnames):
+    """A subclass that extends ``policy`` to emit extra ops must have
+    those ops fire whether it runs alongside other dispatch plugins
+    (auto-batched) or as the only plugin."""
     from collections.abc import Iterable
     from dataclasses import dataclass
 
@@ -246,25 +256,28 @@ def test_subclass_policy_override_honored_by_batch(build_plugin_graph, reachable
     def _extra_fqnames(ctx) -> set[str]:
         return {n.fqname for n in ctx.nodes() if n.fqname.startswith("<flask-plus-extra>:")}
 
-    standalone_ctx = build_plugin_graph(files, [FlaskPlusMarker()])
-    batched_ctx = build_plugin_graph(files, [BatchDispatchAppPlugin(plugins=[FlaskPlusMarker()])])
+    # Run the subclass on its own AND alongside another DispatchAppPlugin —
+    # both paths hit the harness's auto-batching code, but the second
+    # path exercises the spec/policy fan-out across N > 1 dispatch plugins.
+    solo_ctx = build_plugin_graph(files, [FlaskPlusMarker()])
+    batched_ctx = build_plugin_graph(files, [FlaskPlusMarker(), fastapi_plugin()])
 
-    standalone_extras = _extra_fqnames(standalone_ctx)
+    solo_extras = _extra_fqnames(solo_ctx)
     batched_extras = _extra_fqnames(batched_ctx)
 
-    # Both paths must emit the same set of extension markers.
-    assert standalone_extras
-    assert standalone_extras == batched_extras
-    # And the underlying dispatch reachability must still match.
-    assert reachable_fqnames(standalone_ctx) == reachable_fqnames(batched_ctx)
+    # Both paths emit the same set of extension markers — the
+    # additional fastapi_plugin slot adds no Flask markers and doesn't
+    # suppress FlaskPlusMarker's extras.
+    assert solo_extras
+    assert solo_extras == batched_extras
+    # And the underlying dispatch reachability matches too.
+    assert reachable_fqnames(solo_ctx) == reachable_fqnames(batched_ctx)
 
 
 def test_celery_shared_task_fires_in_batch(build_plugin_graph, reachable_fqnames):
     """CeleryPlugin's ``@shared_task`` fan-out lives in its policy()
-    override. Wrapping it in BatchDispatchAppPlugin must still trigger
-    that fan-out — the original 'compose existing plugins' design
-    skipped subclass run() overrides; the spec/policy split fixes it.
-    """
+    override. The harness's auto-batching must still trigger that
+    fan-out when CeleryPlugin sits in a list of dispatch plugins."""
     files = {
         "app/__init__.py": "",
         "app/tasks.py": """
@@ -274,13 +287,12 @@ def test_celery_shared_task_fires_in_batch(build_plugin_graph, reachable_fqnames
         def send_email(addr): pass
         """,
     }
-    individual = reachable_fqnames(build_plugin_graph(files, [CeleryPlugin()]))
-    batched = reachable_fqnames(
-        build_plugin_graph(files, [BatchDispatchAppPlugin(plugins=[CeleryPlugin()])])
-    )
-    assert "app.tasks.send_email" in individual
+    alone = reachable_fqnames(build_plugin_graph(files, [CeleryPlugin()]))
+    # Pair Celery with another dispatch plugin to hit the multi-plugin
+    # auto-batch path explicitly.
+    batched = reachable_fqnames(build_plugin_graph(files, [CeleryPlugin(), flask_plugin()]))
+    assert "app.tasks.send_email" in alone
     assert "app.tasks.send_email" in batched
-    assert individual == batched
 
 
 def test_spec_property_packages_class_attrs():
