@@ -1715,7 +1715,14 @@ impl ProjectContext {
         }
         Ok(out)
     }
+}
 
+// ``find_imports_of`` / ``_indices`` / ``imports_of_count`` /
+// ``has_imports_of`` back :class:`ImportQuery` and its ``.count()`` /
+// ``.exists()`` shortcuts. NOT exposed to Python — plugin authors use
+// the DSL: ``native.query(ctx).imports().of(module).indices()`` /
+// ``.count()`` / ``.exists()``.
+impl ProjectContext {
     /// Return every import-kind node whose upstream `module` matches.
     ///
     /// Covers both `import <module_name>` and
@@ -1785,7 +1792,10 @@ impl ProjectContext {
             .get(module_name)
             .is_some_and(|v| !v.is_empty()))
     }
+}
 
+#[pymethods]
+impl ProjectContext {
     /// Return every declaration (function / class / variable / import)
     /// whose fully qualified name matches ``fqname``, walking back
     /// through dotted segments to find the enclosing top-level decl
@@ -3134,7 +3144,9 @@ impl ProjectContext {
     }
 }
 
-#[pymethods]
+// ``find_classes_defining_method`` is the rust-side helper backing
+// :class:`ClassQuery`. It's NOT exposed to Python — plugin authors use
+// the DSL: ``native.query(ctx).classes().defining_method(name).collect()``.
 impl ProjectContext {
     /// Every class that defines a method with the given name.
     ///
@@ -3212,7 +3224,10 @@ impl ProjectContext {
     }
 }
 
-#[pymethods]
+// ``find_subclasses_of`` / ``_indices`` / ``_idx`` back
+// :class:`SubclassQuery`. NOT exposed to Python — plugin authors use
+// the DSL: ``native.query(ctx).subclasses().of_idx(idx).indices()``
+// or ``of_fqn(fqn)``.
 impl ProjectContext {
     /// Return every transitive subclass of the given class node.
     ///
@@ -3263,7 +3278,6 @@ impl ProjectContext {
     }
 }
 
-#[pymethods]
 impl ProjectContext {
     /// Idx-keyed variant of :meth:`find_subclasses_of_indices` —
     /// resolves the seed class by positional index into ``ctx.nodes()``
@@ -3568,7 +3582,9 @@ impl ProjectContext {
     }
 }
 
-#[pymethods]
+// ``find_subclasses`` + ``_indices`` back :class:`SubclassQuery`.
+// NOT exposed to Python — plugin authors use the DSL:
+// ``native.query(ctx).subclasses().of_fqn(fqn).collect()``.
 impl ProjectContext {
     /// Subclasses of the class addressed by ``base_fqn``.
     ///
@@ -3578,7 +3594,6 @@ impl ProjectContext {
     /// ``type_hierarchy_subtypes``. ``transitive=True`` (default)
     /// walks the full subclass closure; ``transitive=False`` returns
     /// only direct subclasses.
-    #[pyo3(signature = (base_fqn, *, transitive = true))]
     pub(crate) fn find_subclasses(
         &self,
         py: Python<'_>,
@@ -3714,7 +3729,9 @@ impl ProjectContext {
     }
 }
 
-#[pymethods]
+// ``subclasses_of_fqn`` / ``_indices`` / ``subclasses_of_node`` back
+// the project-only subclass-walk path inside :class:`SubclassQuery`.
+// NOT exposed to Python — plugin authors use the DSL.
 impl ProjectContext {
     /// Project classes that inherit (directly or transitively) from
     /// the class identified by ``fqn``. ``fqn`` may name a project
@@ -3743,7 +3760,6 @@ impl ProjectContext {
     ///
     /// Generics (``class X(Foo[T])``) and other non-identifier
     /// expressions are skipped — matches the libcst pipeline.
-    #[pyo3(signature = (fqn, *, transitive = true))]
     pub(crate) fn subclasses_of_fqn(
         &self,
         py: Python<'_>,
@@ -3761,7 +3777,6 @@ impl ProjectContext {
     /// Idx-only variant of :meth:`subclasses_of_fqn`. Same lookup,
     /// returns positional indices into ``ctx.nodes()`` rather than
     /// allocating ``Py<SymbolNode>`` clones.
-    #[pyo3(signature = (fqn, *, transitive = true))]
     pub(crate) fn subclasses_of_fqn_indices(
         &self,
         fqn: &str,
@@ -3787,7 +3802,6 @@ impl ProjectContext {
     /// the transitive walk. Returns an empty vec when ``class_node``
     /// isn't a class kind. Symmetric to :meth:`subclasses_of_fqn` for
     /// callers that already hold the seed as a `SymbolNode`.
-    #[pyo3(signature = (class_node, *, transitive = true))]
     pub(crate) fn subclasses_of_node(
         &self,
         py: Python<'_>,
@@ -3824,7 +3838,10 @@ impl ProjectContext {
             .map(|idx| outputs.builder.nodes[idx].clone_ref(py))
             .collect())
     }
+}
 
+#[pymethods]
+impl ProjectContext {
     /// Return `(decl_node, comment_text)` for every comment in the
     /// project that matches `pattern` (a regex), paired with the next
     /// declaration that follows it in the same file.

@@ -936,11 +936,9 @@ def test_subclasses_of_fqn_indices_matches_node_form(build_decl_graph):
             ),
         }
     )
-    nodes = ctx.subclasses_of_fqn("pkg.bases.Base", transitive=True)
-    indices = ctx.subclasses_of_fqn_indices("pkg.bases.Base", transitive=True)
-    assert len(nodes) == len(indices)
+    indices = native.query(ctx).subclasses().of_fqn("pkg.bases.Base").indices()
     revived = ctx.nodes_at(indices)
-    assert {n.fqname for n in revived} == {n.fqname for n in nodes}
+    assert {n.fqname for n in revived} == {"pkg.sub.Mid", "pkg.sub.Leaf"}
 
 
 def test_subclasses_of_fqn_indices_transitive_flag(build_decl_graph):
@@ -953,7 +951,7 @@ def test_subclasses_of_fqn_indices_transitive_flag(build_decl_graph):
             ),
         }
     )
-    direct = ctx.subclasses_of_fqn_indices("pkg.bases.Base", transitive=False)
+    direct = native.query(ctx).subclasses().of_fqn("pkg.bases.Base").transitive(False).indices()
     direct_revived = {n.fqname for n in ctx.nodes_at(direct)}
     assert direct_revived == {"pkg.sub.Mid"}  # Leaf is not a *direct* subclass of Base
 
@@ -966,26 +964,23 @@ def test_find_subclasses_of_idx_matches_node_form(build_decl_graph):
         }
     )
     (base_idx,) = ctx.indices_where(fqname_prefix="pkg.a.Base", kind="class")
-    base_node = ctx.nodes_at([base_idx])[0]
-    nodes = ctx.find_subclasses_of(base_node)
-    idx_results = ctx.find_subclasses_of_idx(base_idx)
-    assert len(nodes) == len(idx_results)
+    idx_results = native.query(ctx).subclasses().of_idx(base_idx).indices()
     revived = ctx.nodes_at(idx_results)
-    assert {n.fqname for n in revived} == {n.fqname for n in nodes}
+    assert {n.fqname for n in revived} == {"pkg.a.Sub"}
 
 
 def test_find_subclasses_of_idx_non_class_returns_empty(build_decl_graph):
     ctx = build_decl_graph({"pkg/__init__.py": "", "pkg/a.py": "def f(): pass\n"})
     (f_idx,) = ctx.indices_where(fqname_prefix="pkg.a.f", kind="function")
-    # Same contract as the node-form: non-class seed returns empty.
-    assert ctx.find_subclasses_of_idx(f_idx) == []
+    # Non-class seed → empty result.
+    assert native.query(ctx).subclasses().of_idx(f_idx).indices() == []
 
 
 def test_find_subclasses_of_idx_out_of_range_raises(build_decl_graph):
     ctx = build_decl_graph({"pkg/__init__.py": "", "pkg/a.py": "class X: pass\n"})
     n = len(ctx.nodes())
     with pytest.raises(IndexError, match="out of range"):
-        ctx.find_subclasses_of_idx(n)
+        native.query(ctx).subclasses().of_idx(n).indices()
 
 
 def test_subclass_query_of_idx_matches_of_node(build_decl_graph):

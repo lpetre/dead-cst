@@ -63,6 +63,20 @@ two versions.
   than `Py<SymbolNode>` — keeps the idx surface honest end-to-end.
 
 ### Removed
+- `ctx.find_subclasses(fqn)` / `find_subclasses_indices` /
+  `find_subclasses_of(node)` / `find_subclasses_of_indices` /
+  `find_subclasses_of_idx(idx)` / `subclasses_of_fqn(fqn)` /
+  `subclasses_of_fqn_indices` / `subclasses_of_node` /
+  `find_classes_defining_method(name)` /
+  `find_classes_defining_method_indices` /
+  `find_imports_of(module)` / `find_imports_of_indices` /
+  `has_imports_of` / `imports_of_count`. All four cleanly duplicated
+  the DSL — plugin authors migrate to the chainable form:
+  `native.query(ctx).subclasses().of_fqn(fqn).indices()` /
+  `.of_idx(idx)` / `.of_node(node)`,
+  `native.query(ctx).classes().defining_method(name).indices()`,
+  `native.query(ctx).imports().of(module).indices()` /
+  `.count()` / `.exists()`.
 - The non-idx result types `DecoratorRef` / `ConstructionRef` /
   `CallRef` / `FactoryRef` and the `.row_indices()` terminal on the
   four ref queries. `.collect()` now returns the idx-form rows

@@ -554,85 +554,14 @@ class ProjectContext:
     # ``find_calls_on_var`` methods are no longer part of the public
     # type-stub contract; use ``query(ctx)`` instead.
 
-    def find_subclasses(self, base_fqn: str, *, transitive: bool = True) -> list[SymbolNode]:
-        """Subclasses of the class addressed by ``base_fqn``.
-
-        Works for both project classes (where the fqn resolves to a
-        graph node) and external classes (``unittest.TestCase``,
-        ``pydantic.BaseModel``) via ty's module resolver +
-        ``type_hierarchy_subtypes``. ``transitive=True`` (default)
-        walks the full subclass closure; ``transitive=False`` returns
-        only direct subclasses.
-        """
-        ...
-
-    def find_subclasses_of(self, class_node: SymbolNode) -> list[SymbolNode]:
-        """Transitive subclasses of a class already in the graph.
-
-        Like :meth:`find_subclasses` but takes a ``SymbolNode`` rather
-        than a fqn — useful when you already have the seed in hand and
-        don't want to round-trip through a string. Direct subtypes
-        come from ty's ``type_hierarchy_subtypes``; results that don't
-        land in the project (stdlib / external classes) are dropped.
-        """
-        ...
-
-    def find_subclasses_of_idx(self, class_idx: int) -> list[int]:
-        """Idx-keyed variant of :meth:`find_subclasses_of`. Same lookup,
-        takes a positional index into :meth:`nodes` rather than a
-        ``SymbolNode`` reference; returns indices into :meth:`nodes`
-        instead of allocating ``SymbolNode`` clones. Raises
-        :class:`IndexError` when ``class_idx`` is out of range.
-        """
-        ...
-
-    def subclasses_of_fqn(self, fqn: str, *, transitive: bool = True) -> list[SymbolNode]:
-        """Project classes that inherit from the class identified by
-        ``fqn``. ``fqn`` may name a project or external class.
-
-        Backed by a project-wide index built once at materialize time
-        from each file's per-class resolved base list, so external
-        seeds (``flask.Flask``, ``typer.Typer``) are answered without
-        loading the framework out of the venv. ``transitive=True``
-        (default) walks the full subclass closure; ``transitive=False``
-        returns only direct subclasses.
-
-        Match shapes per base expression in a class header:
-
-        * ``Name(X)`` where ``X`` is imported via
-          ``from <module> import X [as alias]`` matches
-          ``<module>.X``;
-        * ``Attribute(Name(M).N)`` where ``M`` is bound via
-          ``import <module> [as M]`` matches ``<module>.N``;
-        * dotted ``a.b.c.N`` rooted at an imported name matches the
-          flat ``<a-upstream>.b.c.N`` fqname;
-        * a bare ``Name(X)`` referring to a class defined in the same
-          file participates in node-keyed walks.
-
-        Generic parameterizations (``class C(Foo[T])``) and other
-        non-identifier base expressions are skipped — matches the
-        libcst pipeline's behavior.
-        """
-        ...
-
-    def subclasses_of_fqn_indices(self, fqn: str, *, transitive: bool = True) -> list[int]:
-        """Idx-only variant of :meth:`subclasses_of_fqn`. Same lookup,
-        returns positional indices into :meth:`nodes` rather than
-        allocating ``SymbolNode`` clones.
-        """
-        ...
-
-    def subclasses_of_node(
-        self, class_node: SymbolNode, *, transitive: bool = True
-    ) -> list[SymbolNode]:
-        """Project classes that inherit from ``class_node``.
-
-        Sibling of :meth:`subclasses_of_fqn` for callers that already
-        hold the seed as a ``SymbolNode``. Returns an empty list when
-        ``class_node`` isn't of class kind or isn't found in the
-        project's class-by-selection index.
-        """
-        ...
+    # The subclass-walk surface lives entirely on
+    # :class:`SubclassQuery`. The point-lookup ``ctx.find_subclasses(fqn)``
+    # / ``find_subclasses_of(node)`` / ``find_subclasses_of_idx(idx)``
+    # methods that used to mirror these queries are now rust-only
+    # (called by :class:`SubclassQuery` internally). Plugin authors:
+    # use the DSL — ``native.query(ctx).subclasses().of_fqn(fqn)`` /
+    # ``.of_idx(idx)`` / ``.of_node(node)`` (legacy node-form input)
+    # with ``.collect()`` or ``.indices()`` terminals.
 
     # ----- FQN resolution ------------------------------------------------
 
@@ -1046,16 +975,9 @@ class ProjectContext:
         """
         ...
 
-    def find_imports_of(self, module_name: str) -> list[SymbolNode]:
-        """Every import-kind node whose upstream ``module`` matches.
-
-        Covers both ``import <module_name>`` and
-        ``from <module_name> import ...`` styles — both bind
-        import-kind nodes whose ``Import.module`` is the absolute
-        dotted name. Star re-exports synthesized from
-        ``from <module_name> import *`` are also included.
-        """
-        ...
+    # The import-of-module surface lives entirely on
+    # :class:`ImportQuery`. Use ``native.query(ctx).imports().of(m)``
+    # then ``.collect()`` / ``.indices()`` / ``.count()`` / ``.exists()``.
 
     def find_main_blocks(self) -> list[tuple[SymbolNode, list[SymbolNode]]]:
         """``(module_node, [decls inside the block])`` for every file
@@ -1077,15 +999,9 @@ class ProjectContext:
         """
         ...
 
-    def find_classes_defining_method(self, method_name: str) -> list[SymbolNode]:
-        """Every class that defines a method with the given name.
-
-        Walks each class's ``DefinitionKind::Class`` body for an
-        ``Stmt::FunctionDef`` whose name matches. ty's
-        ``parsed_module`` is Salsa-cached, so this is just a body scan
-        per class.
-        """
-        ...
+    # The class-defining-method surface lives on :class:`ClassQuery`.
+    # Use ``native.query(ctx).classes().defining_method(name).collect()`` /
+    # ``.indices()``.
 
     # ----- Decorator / construction shapes (syntactic walks) ------------
     #

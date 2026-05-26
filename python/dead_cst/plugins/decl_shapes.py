@@ -359,7 +359,7 @@ def _module_to_names(
         if subclass_cache is not None and fqn in subclass_cache:
             pairs = subclass_cache[fqn]
         else:
-            sub_idxs = ctx.subclasses_of_fqn_indices(fqn)
+            sub_idxs = native.query(ctx).subclasses().of_fqn(fqn).indices()
             pairs = []
             if sub_idxs:
                 for _kind, _path, sub_fqname, _flags in ctx.node_attrs(sub_idxs):
