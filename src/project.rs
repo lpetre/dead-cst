@@ -3812,6 +3812,195 @@ impl ProjectContext {
         }
         Ok(out)
     }
+
+    /// Batched ``parameter_names`` snapshot for each function-kind
+    /// index in ``indices``. Non-function nodes (and indices that
+    /// don't resolve to a top-level ``FunctionDef`` in the AST)
+    /// surface an empty list at the same position.
+    ///
+    /// Walks the parsed AST once per distinct path; matches each
+    /// top-level ``FunctionDef`` against ``decl_by_name_range`` via
+    /// its name's byte range. Used by ``PytestPlugin`` to discover
+    /// fixture-dependency edges (``test_foo(my_fixture)`` →
+    /// ``test_foo → my_fixture``) — same shape as
+    /// :meth:`node_attrs` / :meth:`node_paths`: one FFI hop per
+    /// batch, validated bounds.
+    ///
+    /// Parameter shape: returns the union of positional-only,
+    /// positional-or-keyword, and keyword-only parameter names in
+    /// declaration order. ``*args`` and ``**kwargs`` are skipped
+    /// (pytest never resolves them as fixture references).
+    pub(crate) fn function_parameters(
+        &self,
+        _py: Python<'_>,
+        indices: Vec<usize>,
+    ) -> PyResult<Vec<Vec<String>>> {
+        let outputs = self.materialized("function_parameters")?;
+        let nodes = &outputs.builder.nodes;
+        let len = nodes.len();
+        for &idx in &indices {
+            if idx >= len {
+                return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                    "node index {idx} out of range (len={len})"
+                )));
+            }
+        }
+        if indices.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Build the wanted set + an idx → (file, name_range) inverse
+        // by scanning ``decl_by_name_range`` once. The decl-by-name
+        // index already has the byte range of every function decl
+        // (the name range, e.g. ``test_foo`` in ``def test_foo``);
+        // we use that as the rendezvous key against the AST below.
+        let wanted: FxHashSet<usize> = indices.iter().copied().collect();
+        let mut idx_to_loc: FxHashMap<usize, (File, (u32, u32))> =
+            FxHashMap::with_capacity_and_hasher(wanted.len(), Default::default());
+        for (&(file, rk), &idx) in &outputs.decl_by_name_range {
+            if wanted.contains(&idx) {
+                idx_to_loc.insert(idx, (file, rk));
+            }
+        }
+
+        // Group wanted ranges by file for a single AST walk per
+        // distinct path.
+        let mut by_file: FxHashMap<File, FxHashMap<(u32, u32), usize>> = FxHashMap::default();
+        for (&idx, &(file, rk)) in &idx_to_loc {
+            by_file.entry(file).or_default().insert(rk, idx);
+        }
+
+        let mut params_for_idx: FxHashMap<usize, Vec<String>> =
+            FxHashMap::with_capacity_and_hasher(wanted.len(), Default::default());
+        for (&file, rk_to_idx) in &by_file {
+            let parsed = parsed_module(&self.db, file).load(&self.db);
+            for stmt in &parsed.syntax().body {
+                let Stmt::FunctionDef(func) = stmt else {
+                    continue;
+                };
+                let rk = crate::helpers::range_key(func.name.range());
+                let Some(&idx) = rk_to_idx.get(&rk) else {
+                    continue;
+                };
+                let params = &func.parameters;
+                let mut names: Vec<String> = Vec::with_capacity(
+                    params.posonlyargs.len() + params.args.len() + params.kwonlyargs.len(),
+                );
+                for p in &params.posonlyargs {
+                    names.push(p.parameter.name.id.to_string());
+                }
+                for p in &params.args {
+                    names.push(p.parameter.name.id.to_string());
+                }
+                for p in &params.kwonlyargs {
+                    names.push(p.parameter.name.id.to_string());
+                }
+                params_for_idx.insert(idx, names);
+            }
+        }
+
+        Ok(indices
+            .into_iter()
+            .map(|idx| params_for_idx.remove(&idx).unwrap_or_default())
+            .collect())
+    }
+
+    /// Batched class-method parameter-name snapshot for each
+    /// class-kind index. For each input class, walks its body's
+    /// top-level ``FunctionDef`` statements and returns the union of
+    /// their parameter names (positional-only + positional-or-keyword
+    /// + keyword-only), deduped in first-seen order, with ``self`` and
+    /// ``cls`` excluded.
+    ///
+    /// Indices that don't resolve to a top-level ``ClassDef`` in the
+    /// AST surface an empty list at the same position. ``*args`` and
+    /// ``**kwargs`` are skipped (pytest never resolves them as
+    /// fixture references).
+    ///
+    /// Used by ``PytestPlugin`` to wire ``class → fixture`` edges for
+    /// ``Test*`` classes whose method signatures mention fixtures.
+    /// We don't represent class methods as their own graph nodes, so
+    /// the class itself is the rendezvous point for any fixture any
+    /// method uses.
+    pub(crate) fn class_method_parameters(
+        &self,
+        _py: Python<'_>,
+        indices: Vec<usize>,
+    ) -> PyResult<Vec<Vec<String>>> {
+        let outputs = self.materialized("class_method_parameters")?;
+        let nodes = &outputs.builder.nodes;
+        let len = nodes.len();
+        for &idx in &indices {
+            if idx >= len {
+                return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                    "node index {idx} out of range (len={len})"
+                )));
+            }
+        }
+        if indices.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Same rendezvous strategy as ``function_parameters``, but
+        // keyed off ``class_by_selection`` (class name-range → idx)
+        // instead of ``decl_by_name_range``.
+        let wanted: FxHashSet<usize> = indices.iter().copied().collect();
+        let mut idx_to_loc: FxHashMap<usize, (File, (u32, u32))> =
+            FxHashMap::with_capacity_and_hasher(wanted.len(), Default::default());
+        for (&(file, rk), &idx) in &outputs.class_by_selection {
+            if wanted.contains(&idx) {
+                idx_to_loc.insert(idx, (file, rk));
+            }
+        }
+
+        let mut by_file: FxHashMap<File, FxHashMap<(u32, u32), usize>> = FxHashMap::default();
+        for (&idx, &(file, rk)) in &idx_to_loc {
+            by_file.entry(file).or_default().insert(rk, idx);
+        }
+
+        let mut params_for_idx: FxHashMap<usize, Vec<String>> =
+            FxHashMap::with_capacity_and_hasher(wanted.len(), Default::default());
+        for (&file, rk_to_idx) in &by_file {
+            let parsed = parsed_module(&self.db, file).load(&self.db);
+            for stmt in &parsed.syntax().body {
+                let Stmt::ClassDef(cls) = stmt else {
+                    continue;
+                };
+                let rk = crate::helpers::range_key(cls.name.range());
+                let Some(&idx) = rk_to_idx.get(&rk) else {
+                    continue;
+                };
+                let mut seen: FxHashSet<String> = FxHashSet::default();
+                let mut names: Vec<String> = Vec::new();
+                for body_stmt in &cls.body {
+                    let Stmt::FunctionDef(method) = body_stmt else {
+                        continue;
+                    };
+                    let params = &method.parameters;
+                    for p in params
+                        .posonlyargs
+                        .iter()
+                        .chain(params.args.iter())
+                        .chain(params.kwonlyargs.iter())
+                    {
+                        let n = p.parameter.name.id.as_str();
+                        if n == "self" || n == "cls" {
+                            continue;
+                        }
+                        if seen.insert(n.to_string()) {
+                            names.push(n.to_string());
+                        }
+                    }
+                }
+                params_for_idx.insert(idx, names);
+            }
+        }
+
+        Ok(indices
+            .into_iter()
+            .map(|idx| params_for_idx.remove(&idx).unwrap_or_default())
+            .collect())
+    }
 }
 
 impl ProjectContext {
