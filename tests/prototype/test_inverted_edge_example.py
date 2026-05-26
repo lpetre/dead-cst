@@ -60,14 +60,20 @@ class HandlerByKwargPlugin:
     def run(self, ctx: "native.ProjectContext") -> Iterable["native.GraphOp"]:
         from dead_cst import _native as native
 
-        refs = native.query(ctx).decorators().where_owner_attr([self.decorator_attr]).collect()
+        refs = (
+            native.query(ctx)
+            .decorators()
+            .where_owner_attr([self.decorator_attr])
+            .with_args(True)
+            .collect()
+        )
         for ref in refs:
             if ref.decorator_owner != self.decorator_owner:
                 continue
             target = ref.kwargs.get(self.kwarg_name)
-            if target is None or not hasattr(target, "fqname"):
+            if not isinstance(target, native.ArgNodeRef):
                 continue
-            yield native.AddEdge(target, ref.decorated)
+            yield native.AddEdgeByIdx(target.idx, ref.decorated_idx)
 
 
 def _edges(graph: "native.NativeGraph") -> set[str]:

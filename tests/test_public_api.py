@@ -35,7 +35,9 @@ EXPECTED_PUBLIC_API: dict[str, list[str]] = {
     ],
     "dead_cst.plugins": [
         "DecoratedDeclPlugin",
+        "DispatchAppGather",
         "DispatchAppPlugin",
+        "DispatchAppSpec",
         "DynamicImportFallbackPlugin",
         "EXTERNAL_DIST_PREFIX",
         "EXTERNAL_FILE_PREFIX",

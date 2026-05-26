@@ -71,10 +71,11 @@ def test_where_kwarg_matches_list_literal(make_ctx):
             .collect()
         )
         any_route = native.query(ctx).decorators().where_owner_attr(["route"]).collect()
+        nodes = ctx.nodes()
         return {
-            "get": [r.decorated.fqname for r in get_refs],
-            "post": [r.decorated.fqname for r in post_refs],
-            "any": [r.decorated.fqname for r in any_route],
+            "get": [nodes[r.decorated_idx].fqname for r in get_refs],
+            "post": [nodes[r.decorated_idx].fqname for r in post_refs],
+            "any": [nodes[r.decorated_idx].fqname for r in any_route],
         }
 
     ctx = make_ctx(
@@ -140,17 +141,37 @@ def test_where_kwarg_missing_kwarg_never_matches(make_ctx):
     assert plugin.result == []
 
 
+def _unwrap_arg(arg):
+    """Helper: peel off the ``ArgLiteral`` / ``ArgNodeRef`` /
+    ``ArgOpaque`` wrapper to compare against raw Python values. Used by
+    the assertion-level tests below.
+    """
+    if isinstance(arg, native.ArgLiteral):
+        v = arg.value
+        if isinstance(v, list):
+            return [_unwrap_arg(x) for x in v]
+        if isinstance(v, tuple):
+            return tuple(_unwrap_arg(x) for x in v)
+        return v
+    if isinstance(arg, native.ArgNodeRef):
+        return ("node", arg.idx)
+    if isinstance(arg, native.ArgOpaque):
+        return ("opaque",)
+    raise TypeError(f"unexpected arg shape: {type(arg)!r}")
+
+
 def test_decorator_ref_args_kwargs_populated(make_ctx):
     """``@app.route("/x", methods=["GET"], strict_slashes=False)``
-    surfaces both ``args`` and ``kwargs`` on the matched ref."""
+    surfaces both ``args`` and ``kwargs`` as the discriminated-union
+    shape on the matched ref."""
 
     def capture(ctx):
-        refs = native.query(ctx).decorators().where_owner_attr(["route"]).collect()
+        refs = native.query(ctx).decorators().where_owner_attr(["route"]).with_args(True).collect()
         assert len(refs) == 1
         ref = refs[0]
         return {
-            "args": list(ref.args),
-            "kwargs": dict(ref.kwargs),
+            "args": [_unwrap_arg(a) for a in ref.args],
+            "kwargs": {k: _unwrap_arg(v) for k, v in ref.kwargs.items()},
         }
 
     ctx = make_ctx(
@@ -208,19 +229,25 @@ def test_decorator_ref_args_kwargs_empty_for_bare_decorator(make_ctx):
 
 
 def test_kwarg_payload_surfaces_nativenode_for_imported_symbol(make_ctx):
-    """``@register(handler=ImportedClass)`` exposes ImportedClass as a
-    SymbolNode in ``ref.kwargs["handler"]`` so plugins can anchor inverted
-    edges off the resolved decl."""
+    """``@register(handler=ImportedClass)`` exposes ImportedClass as an
+    :class:`ArgNodeRef` in ``ref.kwargs["handler"]`` so plugins can
+    anchor inverted edges off the resolved decl."""
 
     def capture(ctx):
-        refs = native.query(ctx).decorators().where_owner_attr(["register"]).collect()
+        refs = (
+            native.query(ctx).decorators().where_owner_attr(["register"]).with_args(True).collect()
+        )
+        nodes = ctx.nodes()
         out = []
         for r in refs:
             handler = r.kwargs.get("handler")
+            handler_fqname = None
+            if isinstance(handler, native.ArgNodeRef):
+                handler_fqname = nodes[handler.idx].fqname
             out.append(
                 {
-                    "decorated": r.decorated.fqname,
-                    "handler_fqname": getattr(handler, "fqname", None),
+                    "decorated": nodes[r.decorated_idx].fqname,
+                    "handler_fqname": handler_fqname,
                 }
             )
         return out
@@ -347,7 +374,7 @@ def test_call_query_where_kwarg_multiple_and_together(make_ctx):
 
 def test_call_ref_args_kwargs_populated(make_ctx):
     """``mocker.patch("X", autospec=True, foo=1)`` surfaces all args
-    and kwargs on the matched ref."""
+    and kwargs on the matched ref (as the discriminated-union shape)."""
 
     def capture(ctx):
         refs = (
@@ -356,14 +383,15 @@ def test_call_ref_args_kwargs_populated(make_ctx):
             .where_owner("mocker")
             .where_attr("patch")
             .string_arg_at(0)
+            .with_args(True)
             .collect()
         )
         assert len(refs) == 1
         ref = refs[0]
         return {
             "string_arg": ref.string_arg,
-            "args": list(ref.args),
-            "kwargs": dict(ref.kwargs),
+            "args": [_unwrap_arg(a) for a in ref.args],
+            "kwargs": {k: _unwrap_arg(v) for k, v in ref.kwargs.items()},
         }
 
     ctx = make_ctx(
@@ -392,8 +420,9 @@ def test_where_kwarg_with_nativenode_raises(make_ctx):
     captured: list[Exception] = []
 
     def capture(ctx):
-        mod = ctx.find_module("tests")
-        assert mod is not None
+        mod_idx = native.query(ctx).modules().with_fqn("tests").first_idx()
+        assert mod_idx is not None
+        mod = ctx.nodes_at([mod_idx])[0]
         try:
             (
                 native.query(ctx)

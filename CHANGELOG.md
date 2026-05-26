@@ -9,6 +9,185 @@ two versions.
 
 ## [Unreleased]
 
+### Added
+- Uniform terminal set on every Tier-1 query stream (`DeclQuery`,
+  `ModuleQuery`, `SubclassQuery`, `ImportQuery`, `ClassQuery`,
+  `DeclarationsQuery`):
+  - `.attrs() -> list[NodeAttrs]` — :class:`NodeAttrs` for every
+    matched index. Folds the `ctx.node_attrs(q.indices())`
+    boilerplate into a single chainable call.
+  - `.first_idx() -> int | None` — first matched index or `None`.
+    `ModuleQuery` already had this; the rest gain it.
+  - `.indices_by_path() -> dict[str, list[int]]` — group matched
+    indices by their owning file path. One `ctx.node_paths` lookup
+    internally; lets plugins fan out per-file work without
+    re-querying.
+- `indices_by_path()` on every Tier-2 row query (`DecoratorQuery`,
+  `ConstructionQuery`, `CallQuery`, `FactoryQuery`). Bucketing reads
+  `path` straight off each row — no extra FFI hop.
+- `NodeAttrs` — tuple-like pyclass returned by
+  `ProjectContext.node_attrs()` and every `.attrs()` terminal.
+  Supports attribute access (`attr.fqname`) AND tuple semantics
+  (`kind, path, fqname, flags = attr`; `attr[2]`; `len(attr) == 4`).
+  Not a `typing.NamedTuple` instance but drop-in compatible for
+  unpacking and subscript.
+- `Analysis` auto-batches `DispatchAppPlugin` instances. Registering
+  multiple dispatch plugins with `Analysis` now triggers a single
+  fused `_gather_batched` on the main thread between the build pass
+  and the plugin fan-out; per-plugin `policy(ctx, gathered)` calls
+  fan out through the same `ThreadPoolExecutor` the harness uses for
+  every other plugin. Replaces the explicit `BatchDispatchAppPlugin`
+  wrapper — same observable output, but the construction / factory /
+  variable scans run once across the union of all dispatch plugins'
+  configs instead of once per plugin, and subclass `policy()`
+  overrides are honored uniformly without any user-side glue.
+- `DispatchAppSpec` (frozen dataclass) + `DispatchAppGather`
+  (dataclass) split each plugin into a pure-data spec (what to
+  gather) and a `policy(ctx, gathered)` method (how to emit ops from
+  the gathered data). Subclasses customize behavior by overriding
+  `policy()`; the override is honored uniformly by both the
+  standalone `DispatchAppPlugin.run` path and the harness's auto-
+  batched gather (the previous batched design invoked the standard
+  emission and skipped subclass extensions). `CeleryPlugin`'s
+  `@shared_task` fan-out moved from a `run()` override to a `policy()`
+  override; it now fires correctly when Celery is registered
+  alongside other dispatch plugins.
+- `AddEntrypointByIdx` graph op — index-keyed sibling of
+  `AddEntrypoint`. Takes a positional index into `ctx.nodes()`; the
+  apply pass reads the decl's `fqname` / `path` on the rust side to
+  mint the marker, so plugins working in idx-space don't pay a
+  `Py<SymbolNode>` allocation to flag a seed.
+- `SubclassQuery.of_idx(idx)` and `ctx.find_subclasses_of_idx(idx)`
+  — idx-keyed siblings of `of_node` / `find_subclasses_of`.
+- `DecoratorQuery.in_decl_idx(idx)` — idx-form sibling of `in_decl`.
+- `ctx.find_module_idx`, `ctx.find_module_dunders_indices`,
+  `ctx.find_nodes_matching_specs_indices`,
+  `ctx.subclasses_of_fqn_indices`, `ctx.direct_predecessors_idx` —
+  the missing idx-form siblings the bundled plugins needed.
+- `ctx.resolve_idx`, `ctx.decls_under_indices`,
+  `ctx.decls_matching_indices`, `ctx.decls_matching_name_indices`,
+  `ctx.descendants_indices`, `ctx.ancestors_indices` — idx-form
+  siblings of the last six lookup / traversal helpers that still
+  allocated ``Py<SymbolNode>`` rows.
+- `DecoratorQuery.with_args(bool)` / `ConstructionQuery.with_args(bool)`
+  / `CallQuery.with_args(bool)` — opt out of rust-side
+  `extract_call_args_kwargs` extraction per query. Defaults to `True`.
+  When `False`, the row's lazy `args` / `kwargs` getters surface
+  empty containers; saves the per-row rust-side enum allocation when
+  the plugin doesn't need to inspect args/kwargs. On `CallQuery` /
+  `DecoratorQuery`, auto-forced back to `True` at row-collection time
+  when any `where_kwarg(...)` is set — kwarg filtering needs the data.
+- `ArgLiteral` / `ArgNodeRef` / `ArgOpaque` pyclasses + `CallArg`
+  discriminated-union alias. The four ref-query terminals now expose
+  `args` / `kwargs` lazily as `list[CallArg]` / `dict[str, CallArg]`,
+  walking each row's rust-side `CallArgs` on access. Plugins that
+  never read args/kwargs pay zero Python allocation cost for the
+  payload; plugins that do read them get a tagged dispatch
+  (``isinstance(a, ArgLiteral)`` / ``match`` patterns) instead of the
+  old `list[Any]` shape that mixed primitives and `SymbolNode` refs.
+  Embedded decl references surface as `ArgNodeRef(idx=...)` rather
+  than `Py<SymbolNode>` — keeps the idx surface honest end-to-end.
+
+### Changed
+- `DecoratorQuery.with_args` / `ConstructionQuery.with_args` /
+  `CallQuery.with_args` flipped from opt-out to opt-in. Default is
+  now `False` — the per-row `extract_call_args_kwargs` walk is
+  skipped and row `args` / `kwargs` getters surface empty
+  containers. Plugins that actually read `args` / `kwargs` off rows
+  must call `.with_args(True)`. The kwarg filter (`.where_kwarg`)
+  still forces extraction back on, so kwarg-filtered queries don't
+  need the explicit opt-in.
+- `ProjectContext.node_attrs(indices)` now returns `list[NodeAttrs]`
+  (the new tuple-like pyclass) instead of `list[tuple[str, str, str,
+  int]]`. Existing destructure callers (`(kind, path, fqname, flags)
+  = attr`) keep working via `__iter__`; subscript (`attr[2]`) keeps
+  working via `__getitem__`. Plugins that prefer attribute access
+  (`attr.fqname`) get that too.
+
+### Removed
+- `BatchDispatchAppPlugin` — `Analysis` auto-batches every registered
+  `DispatchAppPlugin` (see Added). Migrate by replacing
+  `[BatchDispatchAppPlugin(plugins=[flask_plugin(), fastapi_plugin()])]`
+  with `[flask_plugin(), fastapi_plugin()]` in the
+  `Analysis(plugins=...)` argument.
+- `ctx.find_subclasses(fqn)` / `find_subclasses_indices` /
+  `find_subclasses_of(node)` / `find_subclasses_of_indices` /
+  `find_subclasses_of_idx(idx)` / `subclasses_of_fqn(fqn)` /
+  `subclasses_of_fqn_indices` / `subclasses_of_node` /
+  `find_classes_defining_method(name)` /
+  `find_classes_defining_method_indices` /
+  `find_imports_of(module)` / `find_imports_of_indices` /
+  `has_imports_of` / `imports_of_count`. All four cleanly duplicated
+  the DSL — plugin authors migrate to the chainable form:
+  `native.query(ctx).subclasses().of_fqn(fqn).indices()` /
+  `.of_idx(idx)` / `.of_node(node)`,
+  `native.query(ctx).classes().defining_method(name).indices()`,
+  `native.query(ctx).imports().of(module).indices()` /
+  `.count()` / `.exists()`.
+- The non-idx result types `DecoratorRef` / `ConstructionRef` /
+  `CallRef` / `FactoryRef` and the `.row_indices()` terminal on the
+  four ref queries. `.collect()` now returns the idx-form rows
+  (`DecoratorIdxRef` etc.) directly. Plugins migrate via
+  `s/row_indices/collect/` + replacing `ref.decorated.fqname` with
+  `ctx.nodes()[ref.decorated_idx].fqname` (and similar). No bundled
+  plugin pulled args/kwargs off the node-form refs, so the
+  discriminated-union args/kwargs change is purely additive for
+  in-tree usage.
+- Index-form siblings on `ProjectContext`: `find_declarations_indices`,
+  `module_for_indices`, `modules_for_paths`, `module_surface_indices`,
+  `module_surfaces_indices`, `find_main_blocks_indices`. Each returns
+  positional indices into `ctx.nodes()` rather than allocating
+  `Py<SymbolNode>` clones — pair with `AddEdgeByIdx` / `AddNodeByIdx` to
+  stay in idx-space end-to-end.
+- `ProjectContext.node_attrs(indices)` — batched snapshot of
+  `(kind, path, fqname, flags)` per index. One FFI hop instead of N
+  per-attribute `borrow` round-trips. Plugins that filter / partition
+  by these four fields stay GIL-free in the inner loop, which matters
+  once the plugin pass runs concurrently.
+- `.row_indices()` terminal on `DecoratorQuery`, `ConstructionQuery`,
+  `CallQuery`, `FactoryQuery`. Same dispatch as `.collect()`, but each
+  row carries a positional index (`decorated_idx` / `var_idx` /
+  `owner_idx` / `decl_idx`) instead of a `SymbolNode`, and the
+  `args` / `kwargs` row payloads are skipped. Returned rows are new
+  pyclasses `DecoratorIdxRef`, `ConstructionIdxRef`, `CallIdxRef`,
+  `FactoryIdxRef`.
+- `AddNodeByIdx` graph op — index-keyed sibling of `AddNode`.
+  Wires the freshly-minted synthetic node with positional indices
+  into `ctx.nodes()` (`edges_from_idx`, `edges_to_idx`) instead of
+  `SymbolNode` references, so plugins working in index space
+  (paired with the `.indices()` query terminals or
+  `ctx.indices_where`) don't round-trip through `Py<SymbolNode>`
+  just to wire their markers. Bounds-checked at apply time; an
+  out-of-range index raises `IndexError` before the new node is
+  interned, so a bad endpoint never leaves an unconnected
+  synthetic behind.
+
+### Changed
+- Every bundled plugin (`plugins/*` and `contrib/*`) ported to the
+  index-form APIs — no plugin in the tree allocates or reads a
+  `Py<SymbolNode>` anymore. Plugins fan out through `row_indices()` /
+  `.indices()` terminals, batch attr fetches via `ctx.node_attrs`,
+  and yield `AddEdgeByIdx` / `AddNodeByIdx` / `AddEntrypointByIdx`
+  exclusively. The legacy node-returning APIs still work for
+  out-of-tree plugins.
+- `AddNode`'s apply pass now pre-resolves every `edges_from` /
+  `edges_to` key to its builder index *before* minting the
+  synthetic node, matching the discipline `AddNodeByIdx`
+  introduces. A missing key now surfaces as a clean `ValueError`
+  without leaving an orphan node in the graph (previously the
+  synthetic was interned first, then the failing key lookup
+  aborted, stranding the new node).
+- Internal: the `ctx.find_*` helpers backing the chainable query DSL
+  (`find_decorated_decls`, `find_instance_constructions`,
+  `find_handler_decorators`, `find_handler_decorators_via`,
+  `find_calls_to_imported`, `find_calls_on_var`, `find_calls_on_attr`,
+  `find_factory_decls`, plus the `find_decorated`,
+  `find_constructions`, `find_decorations_on` thin wrappers) now
+  return `(idx, …)` tuples instead of `(Py<SymbolNode>, …)`. The
+  `Py<SymbolNode>` materialization moved into the queries' `.collect()`
+  terminals — `.row_indices()` skips it entirely. No public Python API
+  change.
+
 ## [0.12.2] - 2026-05-25
 
 ### Added

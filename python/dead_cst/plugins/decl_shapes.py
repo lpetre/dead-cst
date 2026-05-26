@@ -66,30 +66,74 @@ class DecoratedDeclPlugin(Plugin):
         def in_scope(path: str) -> bool:
             if not prefix:
                 return True
-            module = ctx.module_for(path)
-            if module is None:
+            module_idx = native.query(ctx).modules().with_path(path).first_idx()
+            if module_idx is None:
                 return False
-            return module.fqname == prefix or module.fqname.startswith(prefix + ".")
+            fqname = ctx.node_attrs([module_idx])[0].fqname
+            return fqname == prefix or fqname.startswith(prefix + ".")
 
-        seeds_by_path: dict[str, list[native.SymbolNode]] = {}
-        for dec_ref in (
-            native.query(ctx).decorators().where_module(self.decorator_module).where_name(names)
+        seeds_by_path: dict[str, list[int]] = {}
+        for dec_row in (
+            native.query(ctx)
+            .decorators()
+            .where_module(self.decorator_module)
+            .where_name(names)
+            .collect()
         ):
-            if in_scope(dec_ref.path):
-                seeds_by_path.setdefault(dec_ref.path, []).append(dec_ref.decorated)
-        for cons_ref in (
-            native.query(ctx).constructions().where_module(self.decorator_module).where_name(names)
+            if in_scope(dec_row.path):
+                seeds_by_path.setdefault(dec_row.path, []).append(dec_row.decorated_idx)
+        for cons_row in (
+            native.query(ctx)
+            .constructions()
+            .where_module(self.decorator_module)
+            .where_name(names)
+            .collect()
         ):
-            if in_scope(cons_ref.path):
-                seeds_by_path.setdefault(cons_ref.path, []).append(cons_ref.var)
+            if in_scope(cons_row.path):
+                seeds_by_path.setdefault(cons_row.path, []).append(cons_row.var_idx)
 
-        for path, targets in seeds_by_path.items():
-            yield native.AddNode(
+        for path, target_idxs in seeds_by_path.items():
+            yield native.AddNodeByIdx(
                 fqname=f"<{self.marker_prefix}>:{Path(path).name}",
                 path=path,
                 flags=int(NodeFlags.ENTRYPOINT),
-                edges_to=targets,
+                edges_to_idx=target_idxs,
             )
+
+
+@dataclass(frozen=True)
+class DispatchAppSpec:
+    """Pure-data description of what a :class:`DispatchAppPlugin` needs
+    the walker to gather. Has no behavior or policy hooks — those live
+    on the plugin's :meth:`DispatchAppPlugin.policy` method.
+
+    Fields mirror the plugin's class attributes: same semantics, just
+    repackaged so the batched walker can take a list of specs and run
+    one fused pass instead of one pass per plugin. Frozen so it's
+    hashable / cacheable.
+    """
+
+    marker_prefix: str
+    app_classes: tuple[str, ...]
+    registration_decorators: frozenset[str]
+    seed_as_entrypoint: bool
+
+
+@dataclass
+class DispatchAppGather:
+    """Pre-walked data, scoped to one plugin's spec.
+
+    Both the standalone single-plugin path and the harness's auto-
+    batched fused-walk path produce one of these per plugin and hand
+    it to :meth:`DispatchAppPlugin.policy`. ``vars_by_file`` is shared
+    across plugins in the batched path (it's plugin-agnostic).
+    """
+
+    spec: DispatchAppSpec
+    direct: list[native.ConstructionIdxRef]
+    factory_decls: list[tuple[native.FactoryIdxRef, str]]
+    handlers: list[native.DecoratorIdxRef]
+    vars_by_file: dict[tuple[str, str], int]
 
 
 @dataclass(kw_only=True)
@@ -123,6 +167,16 @@ class DispatchAppPlugin(Plugin):
     Result-level dedup: if the same construction site is reachable
     from two ``app_classes`` entries (e.g. one is a base of the
     other), it only emits one entrypoint marker.
+
+    **Spec / policy split.** Subclasses customize behavior by
+    overriding :meth:`policy` — emission is decoupled from the
+    fetch (which is described by :attr:`spec` and performed by the
+    shared walker). The :class:`Analysis` harness detects every
+    registered :class:`DispatchAppPlugin` automatically and fuses
+    their specs into a single gather pass before fanning out the
+    per-plugin :meth:`policy` calls through the same
+    :class:`ThreadPoolExecutor` it uses for non-dispatch plugins,
+    so subclass overrides are honored uniformly without any wrapper.
     """
 
     marker_prefix: str
@@ -130,127 +184,95 @@ class DispatchAppPlugin(Plugin):
     registration_decorators: frozenset[str] = frozenset()
     seed_as_entrypoint: bool = True
 
+    @property
+    def spec(self) -> DispatchAppSpec:
+        """Frozen-dataclass view of this plugin's gather config.
+
+        Override-friendly: subclasses change what's gathered by
+        overriding the underlying class attributes (or this property
+        if a dynamic spec is needed). The batched walker consumes the
+        spec; it never inspects per-plugin fields directly.
+        """
+        return DispatchAppSpec(
+            marker_prefix=self.marker_prefix,
+            app_classes=self.app_classes,
+            registration_decorators=self.registration_decorators,
+            seed_as_entrypoint=self.seed_as_entrypoint,
+        )
+
     def _prefix(self, kind: str) -> str:
         return f"<{self.marker_prefix}-{kind}>:"
 
-    def _module_to_names(self, ctx: native.ProjectContext) -> dict[str, set[str]]:
-        """Expand each ``app_class`` into ``{module: {simple_name, ...}}``,
-        walking subclasses transitively. Lets module-keyed queries
-        (``where_module(...).where_name(...)``,
-        ``of_module(...).where_name(...)``) discover project / third-party
-        subclasses whose import module differs from the base class.
-
-        Subclasses are resolved by inverting the search: instead of
-        asking ty's ``find_references`` to walk down from each
-        framework class (which forces ty to load + parse the framework
-        out of the venv — ~100-400ms per framework on cold cache), we
-        do one parallel pass over project files reading each
-        ``ClassDef``'s base list and matching against the configured
-        app-class fqnames. The framework module is never loaded.
-        """
-        out: dict[str, set[str]] = {}
-        for fqn in self.app_classes:
-            module, _, name = fqn.rpartition(".")
-            if not module or not name:
-                continue
-            out.setdefault(module, set()).add(name)
-        if not self.app_classes:
-            return out
-        for fqn in self.app_classes:
-            for sub in ctx.subclasses_of_fqn(fqn):
-                sub_module, _, sub_name = sub.fqname.rpartition(".")
-                if sub_module and sub_name:
-                    out.setdefault(sub_module, set()).add(sub_name)
-        return out
-
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
+        if not self._is_active(ctx):
+            return
+        gathered = _gather_one(ctx, self.spec)
+        if gathered is None:
+            return
+        yield from self.policy(ctx, gathered)
+
+    def _is_active(self, ctx: native.ProjectContext) -> bool:
+        """Cheap import-presence + config-completeness guard. Skips the
+        ~100-400ms ``subclasses().of_fqn(...)`` walk when no file in the
+        project imports the framework's root package.
+        """
         if not (self.app_classes and self.registration_decorators):
-            return
-        # Cheap import-presence guard. ``_module_to_names`` triggers
-        # ``subclasses().of_fqn(...)`` for every ``app_class``, which
-        # forces ty to load the framework from the venv (parse + build
-        # SemanticIndex + walk the class hierarchy) — ~100-400ms per
-        # framework. If nothing imports the framework's root package,
-        # the project can't possibly contain an instance of an
-        # ``app_class``, so skip the work.
+            return False
         app_modules = {fqn.rpartition(".")[0] for fqn in self.app_classes if "." in fqn}
-        if not any(native.query(ctx).imports().of(m).exists() for m in app_modules if m):
-            return
-        decorator_attrs = list(self.registration_decorators)
+        return any(native.query(ctx).imports().of(m).exists() for m in app_modules if m)
 
-        module_to_names = self._module_to_names(ctx)
-        if not module_to_names:
-            return
+    def policy(
+        self, ctx: native.ProjectContext, gathered: DispatchAppGather
+    ) -> Iterable[native.GraphOp]:
+        """Emit ops from pre-gathered data. The override point for
+        subclasses that want to extend or customize emission without
+        changing what gets gathered.
 
-        # 1. Direct constructions, deduped by (path, start_line).
-        direct_seen: set[tuple[str, int]] = set()
-        direct: list = []
-        for module, names in module_to_names.items():
-            for ref in (
-                native.query(ctx).constructions().where_module(module).where_name(sorted(names))
-            ):
-                key = (ref.var.path, ref.var.start_line)
-                if key in direct_seen:
-                    continue
-                direct_seen.add(key)
-                direct.append(ref)
+        Subclasses that want to add framework-specific extras should
+        ``yield from super().policy(ctx, gathered)`` first, then yield
+        their additional ops. The standalone :meth:`run` path and the
+        harness's auto-batched gather both call this method, so any
+        override is honored uniformly.
+        """
+        spec = gathered.spec
+        direct = gathered.direct
+        factory_decls = gathered.factory_decls
+        handlers = gathered.handlers
+        vars_by_file = gathered.vars_by_file
 
-        # 2. Factory functions returning one of the listed classes,
-        # deduped by (decl path, decl line, kind). Only relevant when
-        # we'd actually do something with the markers in step 6.
-        factory_seen: set[tuple[str, int, str]] = set()
-        factory_decls: list = []
-        if self.seed_as_entrypoint:
-            for module, names in module_to_names.items():
-                for fref in (
-                    native.query(ctx)
-                    .factories()
-                    .of_module(module)
-                    .where_name(sorted(names))
-                    .collect()
-                ):
-                    for kind in fref.kinds:
-                        key = (fref.decl.path, fref.decl.start_line, kind)
-                        if key in factory_seen:
-                            continue
-                        factory_seen.add(key)
-                        factory_decls.append((fref, kind))
+        # direct_by_owner: (path, simple_name) -> [var_idx, ...]
+        direct_by_owner: dict[tuple[str, str], list[int]] = {}
+        direct_attrs: list[native.NodeAttrs] = []
+        if direct:
+            direct_attrs = ctx.node_attrs([r.var_idx for r in direct])
+            for ref, attr in zip(direct, direct_attrs, strict=True):
+                simple = attr.fqname.rsplit(".", 1)[-1]
+                direct_by_owner.setdefault((ref.path, simple), []).append(ref.var_idx)
 
-        handlers = list(native.query(ctx).decorators().where_owner_attr(decorator_attrs))
-
-        direct_by_owner: dict[tuple[str, str], list[native.SymbolNode]] = {}
-        for ref in direct:
-            simple = ref.var.fqname.rsplit(".", 1)[-1]
-            direct_by_owner.setdefault((ref.var.path, simple), []).append(ref.var)
-
-        vars_by_file: dict[tuple[str, str], native.SymbolNode] = {}
-        # Rust-side fold of the ``kind == variable`` filter — drops the
-        # FFI overhead of materialising every non-variable node.
-        for n in native.query(ctx).decls().with_kind("variable").collect():
-            simple = n.fqname.rsplit(".", 1)[-1]
-            vars_by_file.setdefault((n.path, simple), n)
-
-        app_prefix = self._prefix("app")
-        factory_prefix = self._prefix("factory")
+        app_prefix = f"<{spec.marker_prefix}-app>:"
+        factory_prefix = f"<{spec.marker_prefix}-factory>:"
 
         # 3. Entrypoint-promote every direct construction (when enabled).
-        if self.seed_as_entrypoint:
-            for ref in direct:
-                yield native.AddNode(
-                    fqname=f"{app_prefix}{ref.var.fqname}",
-                    path=ref.var.path,
+        if spec.seed_as_entrypoint and direct:
+            # Reuse the direct_attrs computed above.
+            for ref, attr in zip(direct, direct_attrs, strict=True):
+                yield native.AddNodeByIdx(
+                    fqname=f"{app_prefix}{attr.fqname}",
+                    path=ref.path,
                     flags=int(NodeFlags.ENTRYPOINT),
-                    edges_to=[ref.var],
+                    edges_to_idx=[ref.var_idx],
                 )
 
         # 4. Emit factory markers so the descendant walk in step 6 can
         # find them.
-        for fref, kind in factory_decls:
-            yield native.AddNode(
-                fqname=f"{factory_prefix}{kind}:{fref.decl.fqname}",
-                path=fref.decl.path,
-                edges_from=[fref.decl],
-            )
+        if factory_decls:
+            factory_attrs = ctx.node_attrs([fref.decl_idx for fref, _kind in factory_decls])
+            for (fref, kind), attr in zip(factory_decls, factory_attrs, strict=True):
+                yield native.AddNodeByIdx(
+                    fqname=f"{factory_prefix}{kind}:{attr.fqname}",
+                    path=fref.path,
+                    edges_from_idx=[fref.decl_idx],
+                )
 
         # 5. Wire decorator handlers to their owner var.
         # When seed_as_entrypoint=False (pure dispatch), only wire to
@@ -262,14 +284,14 @@ class DispatchAppPlugin(Plugin):
         # so ``app = create_app()`` factory chains also pick up
         # handler edges.
         for h in handlers:
-            key = (h.decorated.path, h.decorator_owner or "")
-            if self.seed_as_entrypoint:
-                var = vars_by_file.get(key)
-                if var is not None:
-                    yield native.AddEdge(var, h.decorated)
+            key = (h.path, h.decorator_owner or "")
+            if spec.seed_as_entrypoint:
+                var_idx = vars_by_file.get(key)
+                if var_idx is not None:
+                    yield native.AddEdgeByIdx(var_idx, h.decorated_idx)
             else:
-                for var in direct_by_owner.get(key, []):
-                    yield native.AddEdge(var, h.decorated)
+                for var_idx in direct_by_owner.get(key, []):
+                    yield native.AddEdgeByIdx(var_idx, h.decorated_idx)
 
         # 6. Factory walk: vars whose *direct* successor is one of the
         # factory decls get entrypoint-promoted. Skipped under
@@ -284,26 +306,253 @@ class DispatchAppPlugin(Plugin):
         # doesn't reach the factory directly and stays unclassified.
         # Only ``app`` (whose direct successor *is* ``create_app``)
         # promotes.
-        if self.seed_as_entrypoint and factory_decls:
-            factory_reachers: set[native.SymbolNode] = set()
+        if spec.seed_as_entrypoint and factory_decls:
+            factory_reachers: set[int] = set()
             for fref, _kind in factory_decls:
-                factory_reachers.update(ctx.direct_predecessors(fref.decl))
+                factory_reachers.update(
+                    native.query(ctx).from_idx(fref.decl_idx).direct_predecessors()
+                )
 
             classified: set[tuple[str, str]] = set()
             for h in handlers:
-                key = (h.decorated.path, h.decorator_owner or "")
+                key = (h.path, h.decorator_owner or "")
                 if key in direct_by_owner or key in classified:
                     continue
-                var = vars_by_file.get(key)
-                if var is None or var not in factory_reachers:
+                var_idx = vars_by_file.get(key)
+                if var_idx is None or var_idx not in factory_reachers:
                     continue
                 classified.add(key)
-                yield native.AddNode(
-                    fqname=f"{app_prefix}{var.fqname}",
-                    path=var.path,
+                var_attr = ctx.node_attrs([var_idx])[0]
+                yield native.AddNodeByIdx(
+                    fqname=f"{app_prefix}{var_attr.fqname}",
+                    path=var_attr.path,
                     flags=int(NodeFlags.ENTRYPOINT),
-                    edges_to=[var],
+                    edges_to_idx=[var_idx],
                 )
+
+
+# ---------------------------------------------------------------------------
+# Walker: spec → gather
+#
+# The "gather" half of the spec / policy split. The standalone
+# ``DispatchAppPlugin.run`` path uses ``_gather_one``; the harness's
+# auto-batching path (``Analysis.materialize_all``) uses
+# ``_gather_batched`` to fuse the per-spec queries across every
+# registered ``DispatchAppPlugin``.
+# ---------------------------------------------------------------------------
+
+
+def _module_to_names(
+    ctx: native.ProjectContext,
+    app_classes: tuple[str, ...],
+    subclass_cache: dict[str, list[tuple[str, str]]] | None = None,
+) -> dict[str, set[str]]:
+    """Expand each ``app_class`` fqn into ``{module: {simple_name, ...}}``,
+    walking subclasses transitively. ``subclass_cache`` (optional) lets
+    the batched walker memoise across plugins that share an app class.
+    """
+    out: dict[str, set[str]] = {}
+    for fqn in app_classes:
+        module, _, name = fqn.rpartition(".")
+        if not module or not name:
+            continue
+        out.setdefault(module, set()).add(name)
+    if not app_classes:
+        return out
+    for fqn in app_classes:
+        if subclass_cache is not None and fqn in subclass_cache:
+            pairs = subclass_cache[fqn]
+        else:
+            sub_idxs = native.query(ctx).subclasses().of_fqn(fqn).indices()
+            pairs = []
+            if sub_idxs:
+                for attr in ctx.node_attrs(sub_idxs):
+                    sub_module, _, sub_name = attr.fqname.rpartition(".")
+                    if sub_module and sub_name:
+                        pairs.append((sub_module, sub_name))
+            if subclass_cache is not None:
+                subclass_cache[fqn] = pairs
+        for sub_module, sub_name in pairs:
+            out.setdefault(sub_module, set()).add(sub_name)
+    return out
+
+
+def _fetch_direct(
+    ctx: native.ProjectContext, module_to_names: dict[str, set[str]]
+) -> list[native.ConstructionIdxRef]:
+    """Run a construction query per distinct module (with the union of
+    requested names) and dedup by ``var_idx``."""
+    direct_seen: set[int] = set()
+    direct: list[native.ConstructionIdxRef] = []
+    for module, names in module_to_names.items():
+        for ref in (
+            native.query(ctx)
+            .constructions()
+            .where_module(module)
+            .where_name(sorted(names))
+            .collect()
+        ):
+            if ref.var_idx in direct_seen:
+                continue
+            direct_seen.add(ref.var_idx)
+            direct.append(ref)
+    return direct
+
+
+def _fetch_factory_decls(
+    ctx: native.ProjectContext, module_to_names: dict[str, set[str]]
+) -> list[tuple[native.FactoryIdxRef, str]]:
+    """Run a factory query per distinct module and dedup by
+    ``(decl_idx, kind)``."""
+    factory_seen: set[tuple[int, str]] = set()
+    factory_decls: list[tuple[native.FactoryIdxRef, str]] = []
+    for module, names in module_to_names.items():
+        for fref in (
+            native.query(ctx).factories().of_module(module).where_name(sorted(names)).collect()
+        ):
+            for kind in fref.kinds:
+                key = (fref.decl_idx, kind)
+                if key in factory_seen:
+                    continue
+                factory_seen.add(key)
+                factory_decls.append((fref, kind))
+    return factory_decls
+
+
+def _fetch_handlers(
+    ctx: native.ProjectContext, registration_decorators: frozenset[str]
+) -> list[native.DecoratorIdxRef]:
+    return list(
+        native.query(ctx).decorators().where_owner_attr(list(registration_decorators)).collect()
+    )
+
+
+def _build_vars_by_file(ctx: native.ProjectContext) -> dict[tuple[str, str], int]:
+    """One project-wide variable scan + one ``node_attrs`` batch fetch.
+    Result is plugin-agnostic, so the batched walker builds it once
+    and hands the same dict to every plugin's gather."""
+    vars_by_file: dict[tuple[str, str], int] = {}
+    var_idxs = native.query(ctx).decls().with_kind("variable").indices()
+    if not var_idxs:
+        return vars_by_file
+    var_attrs = ctx.node_attrs(var_idxs)
+    for idx, attr in zip(var_idxs, var_attrs, strict=True):
+        simple = attr.fqname.rsplit(".", 1)[-1]
+        vars_by_file.setdefault((attr.path, simple), idx)
+    return vars_by_file
+
+
+def _gather_one(ctx: native.ProjectContext, spec: DispatchAppSpec) -> DispatchAppGather | None:
+    """Standalone single-plugin gather. Returns ``None`` when the spec's
+    ``app_classes`` resolve to no usable ``{module: names}`` map —
+    matches the legacy short-circuit ``DispatchAppPlugin.run`` did."""
+    module_to_names = _module_to_names(ctx, spec.app_classes)
+    if not module_to_names:
+        return None
+    return DispatchAppGather(
+        spec=spec,
+        direct=_fetch_direct(ctx, module_to_names),
+        factory_decls=_fetch_factory_decls(ctx, module_to_names) if spec.seed_as_entrypoint else [],
+        handlers=_fetch_handlers(ctx, spec.registration_decorators),
+        vars_by_file=_build_vars_by_file(ctx),
+    )
+
+
+def _gather_batched(
+    ctx: native.ProjectContext, specs: list[DispatchAppSpec]
+) -> list[DispatchAppGather | None]:
+    """Fused walker for a batch of specs. Returns one
+    ``DispatchAppGather`` per input spec (in order), or ``None`` for
+    any spec whose ``app_classes`` resolved empty.
+
+    Fusion strategy:
+
+    * Shared subclass-walk cache — each ``app_class`` fqn's
+      transitive lookup runs at most once across all specs.
+    * Per-distinct-module construction & factory queries — two specs
+      both targeting ``flask.Flask`` share one query; rows route back
+      to specs by matching ``class_name`` against each spec's map.
+    * Single project-wide ``vars_by_file`` scan shared across specs.
+    * Per-spec handler query (no fusion — the ref API doesn't carry
+      which attr matched, so a fused result can't route to the right
+      spec without further work).
+    """
+    if not specs:
+        return []
+    subclass_cache: dict[str, list[tuple[str, str]]] = {}
+    module_to_names_per_spec: list[dict[str, set[str]]] = [
+        _module_to_names(ctx, spec.app_classes, subclass_cache=subclass_cache) for spec in specs
+    ]
+
+    # Result slot per input spec; ``None`` for empty-map specs.
+    gathered: list[DispatchAppGather | None] = [None] * len(specs)
+    live_indices = [i for i, mtn in enumerate(module_to_names_per_spec) if mtn]
+    if not live_indices:
+        return gathered
+
+    union_modules: dict[str, set[str]] = {}
+    for i in live_indices:
+        for module, names in module_to_names_per_spec[i].items():
+            union_modules.setdefault(module, set()).update(names)
+
+    # Per-spec direct constructions, deduped by var_idx.
+    direct_per_spec: list[list[native.ConstructionIdxRef]] = [[] for _ in specs]
+    direct_seen_per_spec: list[set[int]] = [set() for _ in specs]
+    for module, all_names in union_modules.items():
+        for ref in (
+            native.query(ctx)
+            .constructions()
+            .where_module(module)
+            .where_name(sorted(all_names))
+            .collect()
+        ):
+            for i in live_indices:
+                if ref.class_name not in module_to_names_per_spec[i].get(module, ()):
+                    continue
+                seen = direct_seen_per_spec[i]
+                if ref.var_idx in seen:
+                    continue
+                seen.add(ref.var_idx)
+                direct_per_spec[i].append(ref)
+
+    # Per-spec factory decls (only for seed_as_entrypoint specs).
+    factory_per_spec: list[list[tuple[native.FactoryIdxRef, str]]] = [[] for _ in specs]
+    factory_seen_per_spec: list[set[tuple[int, str]]] = [set() for _ in specs]
+    seed_indices = [i for i in live_indices if specs[i].seed_as_entrypoint]
+    if seed_indices:
+        seed_union_modules: dict[str, set[str]] = {}
+        for i in seed_indices:
+            for module, names in module_to_names_per_spec[i].items():
+                seed_union_modules.setdefault(module, set()).update(names)
+        for module, all_names in seed_union_modules.items():
+            for fref in (
+                native.query(ctx)
+                .factories()
+                .of_module(module)
+                .where_name(sorted(all_names))
+                .collect()
+            ):
+                for kind in fref.kinds:
+                    for i in seed_indices:
+                        if kind not in module_to_names_per_spec[i].get(module, ()):
+                            continue
+                        key = (fref.decl_idx, kind)
+                        if key in factory_seen_per_spec[i]:
+                            continue
+                        factory_seen_per_spec[i].add(key)
+                        factory_per_spec[i].append((fref, kind))
+
+    vars_by_file = _build_vars_by_file(ctx)
+
+    for i in live_indices:
+        gathered[i] = DispatchAppGather(
+            spec=specs[i],
+            direct=direct_per_spec[i],
+            factory_decls=factory_per_spec[i],
+            handlers=_fetch_handlers(ctx, specs[i].registration_decorators),
+            vars_by_file=vars_by_file,
+        )
+    return gathered
 
 
 @dataclass(kw_only=True)
@@ -331,7 +580,7 @@ class LiteralListPlugin(Plugin):
         # The visitor doesn't emit ``var -> referent`` edges for
         # non-``__all__`` string-list assignments, so the plugin can't
         # rely on a descendant walk.
-        entries = ctx.find_literal_list_entries(var_fqname)
+        entries = native.query(ctx).literal_lists().for_fqn(var_fqname).entries()
         if not entries:
             return
 
@@ -343,15 +592,16 @@ class LiteralListPlugin(Plugin):
         # fqname — try both; some entries may match both (e.g.
         # ``pkg.foo`` where ``foo`` is also a re-exported decl in
         # ``pkg/__init__.py``).
-        surfaces = ctx.module_surfaces(entries)
+        surfaces = ctx.module_surfaces_indices(entries)
         for entry in entries:
-            targets: list[native.SymbolNode] = list(surfaces.get(entry, ()))
-            targets.extend(ctx.find_declarations(entry))
-            if not targets:
+            target_idxs: list[int] = list(surfaces.get(entry, ()))
+            target_idxs.extend(native.query(ctx).declarations().with_fqname(entry).indices())
+            if not target_idxs:
                 continue
-            yield native.AddNode(
+            marker_path = ctx.node_attrs([target_idxs[0]])[0].path
+            yield native.AddNodeByIdx(
                 fqname=f"{prefix}{entry}",
-                path=targets[0].path,
+                path=marker_path,
                 flags=int(NodeFlags.ENTRYPOINT),
-                edges_to=targets,
+                edges_to_idx=target_idxs,
             )

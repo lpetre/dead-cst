@@ -29,44 +29,49 @@ class UnittestPlugin(Plugin):
 
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
         # Cheap O(1) presence probe — short-circuits before paying
-        # for the path-set ``collect()`` below. If no file imports
-        # unittest, no project class can subclass ``unittest.TestCase``
-        # (you can't subclass what you haven't imported), and none of
-        # the module-level hooks would qualify either. Skip the ~50ms
-        # ``subclasses().of_fqn(...)`` walk before it forces ty to load
-        # the unittest module.
+        # for the path-set lookup below.
         if not native.query(ctx).imports().of("unittest").exists():
             return
-        importer_paths = {n.path for n in native.query(ctx).imports().of("unittest").collect()}
+        import_idxs = native.query(ctx).imports().of("unittest").indices()
+        # ``node_paths`` rather than ``node_attrs`` — we only need
+        # path here; kind / fqname / flags would be allocated then
+        # thrown away.
+        importer_paths = set(ctx.node_paths(import_idxs))
 
-        decls_by_path: dict[str, list[native.SymbolNode]] = {}
+        # decls_by_path: path -> [decl_idx, ...]
+        decls_by_path: dict[str, list[int]] = {}
         for base_fqname in _UNITTEST_BASE_FQNAMES:
-            for sub in (
-                native.query(ctx).subclasses().of_fqn(base_fqname).transitive(True).collect()
-            ):
-                decls_by_path.setdefault(sub.path, []).append(sub)
+            sub_idxs = native.query(ctx).subclasses().of_fqn(base_fqname).transitive(True).indices()
+            if not sub_idxs:
+                continue
+            for sub_idx, sub_path in zip(sub_idxs, ctx.node_paths(sub_idxs), strict=True):
+                decls_by_path.setdefault(sub_path, []).append(sub_idx)
 
-        # Push the ``kind == function`` + path-set + simple-name-in-set
-        # filter down into rust — folds three Python predicates into one
-        # rust pass over the node pool.
-        for node in (
+        hook_idxs = (
             native.query(ctx)
             .decls()
             .with_kind("function")
             .with_paths(list(importer_paths))
             .with_simple_names(list(_MODULE_HOOKS))
-            .collect()
-        ):
-            decls_by_path.setdefault(node.path, []).append(node)
+            .indices()
+        )
+        if hook_idxs:
+            for hook_idx, hook_path in zip(hook_idxs, ctx.node_paths(hook_idxs), strict=True):
+                decls_by_path.setdefault(hook_path, []).append(hook_idx)
 
         flags = int(NodeFlags.TESTCASE)
-        for path, decls in decls_by_path.items():
-            module = ctx.module_for(path)
-            if module is None:
-                continue
-            yield native.AddNode(
-                fqname=f"{UNITTEST_PREFIX}{module.fqname}",
+        # Module-fqname fetch needs ``fqname``, so ``node_attrs`` is
+        # the right tool here — but only for the seed paths.
+        paths = list(decls_by_path.keys())
+        module_idxs = ctx.modules_for_paths(paths)
+        present_modules = [(p, idx) for p, idx in zip(paths, module_idxs) if idx is not None]
+        if not present_modules:
+            return
+        module_attrs = ctx.node_attrs([idx for _p, idx in present_modules])
+        for (path, _idx), attr in zip(present_modules, module_attrs, strict=True):
+            yield native.AddNodeByIdx(
+                fqname=f"{UNITTEST_PREFIX}{attr.fqname}",
                 path=path,
                 flags=flags,
-                edges_to=decls,
+                edges_to_idx=decls_by_path[path],
             )

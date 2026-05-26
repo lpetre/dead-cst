@@ -1,6 +1,7 @@
 //! The chainable query DSL exposed to Python via `ProjectContext.query()`.
-//! Result types (`DecoratorRef`/`ConstructionRef`/`CallRef`/`FactoryRef`),
-//! the `QueryBuilder` entry point, and the per-stream `Query` builders.
+//! Result types (`DecoratorIdxRef` / `ConstructionIdxRef` / `CallIdxRef`
+//! / `FactoryIdxRef` / `EdgeRef`), the `QueryBuilder` entry point, and
+//! the per-stream `Query` builders.
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -11,97 +12,144 @@ use ty_project::Db as ProjectDb;
 
 use crate::graph::SymbolNode;
 use crate::helpers::{
-    args_to_py_vec, call_args_match_kwargs, file_path_string, kwarg_matcher_from_py,
-    kwargs_to_py_map, KwargMatcher,
+    call_args_match_kwargs, file_path_string, kwarg_matcher_from_py, KwargMatcher,
 };
 use crate::project::ProjectContext;
 
+// ---------------------------------------------------------------------------
+// Result row types
+//
+// One pyclass per query stream; all idx-based. Each carries a
+// positional index into ``ctx.nodes()`` for the row's "node identity"
+// field (``decorated_idx`` / ``var_idx`` / ``owner_idx`` / ``decl_idx``),
+// the row's owning ``path`` as a cheap bucket key, and any
+// query-shape-specific metadata strings (``decorator_owner`` etc.).
+//
+// ``DecoratorIdxRef`` / ``ConstructionIdxRef`` / ``CallIdxRef`` also
+// expose ``args`` / ``kwargs`` lazy getters that walk the row's
+// rust-side :struct:`CallArgs` and produce a Python ``list`` / ``dict``
+// of :class:`ArgLiteral` / :class:`ArgNodeRef` / :class:`ArgOpaque`.
+// The walk runs on every access — plugins that never read args/kwargs
+// pay zero Python allocation cost; plugins that read them pay only
+// for what they touch.
+// ---------------------------------------------------------------------------
+
 /// One decorator application on a top-level function or class.
 ///
-/// Field nullability follows the query shape that produced the ref:
-/// * ``where_module + where_name`` populates ``decorated`` only.
+/// Field nullability follows the query shape that produced the row:
+/// * ``where_module + where_name`` populates ``decorated_idx`` only.
 /// * ``where_owner_attr`` fills ``decorator_owner`` (the textual
 ///   ``@<owner>.<attr>`` prefix).
 /// * ``where_owner_attr_via`` additionally fills ``decorator_via``
 ///   with the middle attribute name.
-#[pyclass(frozen, get_all)]
-pub(crate) struct DecoratorRef {
-    pub(crate) decorated: Py<SymbolNode>,
+#[pyclass]
+pub(crate) struct DecoratorIdxRef {
+    #[pyo3(get)]
+    pub(crate) decorated_idx: usize,
+    #[pyo3(get)]
+    pub(crate) path: String,
+    #[pyo3(get)]
     pub(crate) decorator_name: Option<String>,
+    #[pyo3(get)]
     pub(crate) decorator_owner: Option<String>,
+    #[pyo3(get)]
     pub(crate) decorator_via: Option<String>,
-    /// Positional arguments of the decorator's ``Call`` form. Empty
-    /// for bare attribute decorators (``@app.route`` without ``()``).
-    /// Each entry is a Python literal, a :class:`SymbolNode` (when the
-    /// expression resolves to a project decl), or ``None``.
-    pub(crate) args: Vec<Py<PyAny>>,
-    /// Keyword arguments of the decorator's ``Call`` form. Same value
-    /// shape as ``args``.
-    pub(crate) kwargs: FxHashMap<String, Py<PyAny>>,
+    pub(crate) call_args: crate::helpers::CallArgs,
 }
 
 #[pymethods]
-impl DecoratorRef {
-    /// File path of the decorated decl. Read off ``decorated.path`` —
-    /// surfaced as a top-level attribute for ergonomics in path-keyed
-    /// dispatch.
+impl DecoratorIdxRef {
+    /// Positional arguments of the decorator's ``Call`` form, lazily
+    /// materialised on access. Empty for bare attribute decorators
+    /// (``@app.route`` without ``()``). Each entry is one of
+    /// :class:`ArgLiteral`, :class:`ArgNodeRef`, or :class:`ArgOpaque`.
     #[getter]
-    fn path(&self, py: Python<'_>) -> String {
-        self.decorated.borrow(py).path.clone()
+    fn args(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        crate::helpers::arg_values_to_py_list(py, &self.call_args.args)
+    }
+
+    /// Keyword arguments of the decorator's ``Call`` form, lazily
+    /// materialised on access. Same value shape as :meth:`args`.
+    #[getter]
+    fn kwargs(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        crate::helpers::arg_kwargs_to_py_dict(py, &self.call_args.kwargs)
     }
 }
 
 /// One ``<var> = <Ctor>(...)`` construction at module scope.
 ///
-/// ``class_name`` is the upstream constructor's bare name
-/// (``"Flask"`` even when imported as ``F``).
-///
-/// ``args`` and ``kwargs`` carry the construction's full positional /
-/// keyword argument shape (same Python-side value shape as
-/// :class:`CallRef`).
-#[pyclass(frozen, get_all)]
-pub(crate) struct ConstructionRef {
-    pub(crate) var: Py<SymbolNode>,
+/// ``class_name`` is the upstream constructor's bare name (``"Flask"``
+/// even when imported as ``F``).
+#[pyclass]
+pub(crate) struct ConstructionIdxRef {
+    #[pyo3(get)]
+    pub(crate) var_idx: usize,
+    #[pyo3(get)]
+    pub(crate) path: String,
+    #[pyo3(get)]
     pub(crate) class_name: String,
-    /// Positional arguments of the constructor call. Each entry is a
-    /// Python literal, a :class:`SymbolNode` (when the expression
-    /// resolves to a project decl), or ``None``.
-    pub(crate) args: Vec<Py<PyAny>>,
-    /// Keyword arguments of the constructor call. Same value shape as
-    /// ``args``.
-    pub(crate) kwargs: FxHashMap<String, Py<PyAny>>,
+    pub(crate) call_args: crate::helpers::CallArgs,
 }
 
 #[pymethods]
-impl ConstructionRef {
+impl ConstructionIdxRef {
+    /// Positional arguments of the constructor call, lazily
+    /// materialised on access. Each entry is one of
+    /// :class:`ArgLiteral`, :class:`ArgNodeRef`, or :class:`ArgOpaque`.
     #[getter]
-    fn path(&self, py: Python<'_>) -> String {
-        self.var.borrow(py).path.clone()
+    fn args(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        crate::helpers::arg_values_to_py_list(py, &self.call_args.args)
+    }
+
+    /// Keyword arguments of the constructor call, lazily materialised
+    /// on access. Same value shape as :meth:`args`.
+    #[getter]
+    fn kwargs(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        crate::helpers::arg_kwargs_to_py_dict(py, &self.call_args.kwargs)
     }
 }
 
 /// One matched call site. ``string_arg`` is the literal at the
 /// positional index passed to :meth:`CallQuery.string_arg_at`.
-#[pyclass(frozen, get_all)]
-pub(crate) struct CallRef {
-    pub(crate) owner: Py<SymbolNode>,
+#[pyclass]
+pub(crate) struct CallIdxRef {
+    #[pyo3(get)]
+    pub(crate) owner_idx: usize,
+    #[pyo3(get)]
+    pub(crate) path: String,
+    #[pyo3(get)]
     pub(crate) string_arg: String,
-    /// Positional arguments of the matched call, one entry per source
-    /// positional arg. Each entry is a Python literal, a
-    /// :class:`SymbolNode` (when the expression resolves to a project
-    /// decl), or ``None``.
-    pub(crate) args: Vec<Py<PyAny>>,
-    /// Keyword arguments of the matched call. Same value shape as
-    /// ``args``.
-    pub(crate) kwargs: FxHashMap<String, Py<PyAny>>,
+    pub(crate) call_args: crate::helpers::CallArgs,
 }
 
 #[pymethods]
-impl CallRef {
+impl CallIdxRef {
+    /// Positional arguments of the matched call, lazily materialised
+    /// on access. One entry per source positional arg; each is one of
+    /// :class:`ArgLiteral`, :class:`ArgNodeRef`, or :class:`ArgOpaque`.
     #[getter]
-    fn path(&self, py: Python<'_>) -> String {
-        self.owner.borrow(py).path.clone()
+    fn args(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        crate::helpers::arg_values_to_py_list(py, &self.call_args.args)
     }
+
+    /// Keyword arguments of the matched call, lazily materialised on
+    /// access. Same value shape as :meth:`args`.
+    #[getter]
+    fn kwargs(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        crate::helpers::arg_kwargs_to_py_dict(py, &self.call_args.kwargs)
+    }
+}
+
+/// One factory-function / class hit from :class:`FactoryQuery`.
+/// ``decl_idx`` is the owning top-level decl's positional index into
+/// ``ctx.nodes()``; ``kinds`` is the sorted set of constructor
+/// bare-names matched inside its body. ``path`` is the decl's source
+/// file as a cheap bucket key for per-file fan-out.
+#[pyclass(frozen, get_all)]
+pub(crate) struct FactoryIdxRef {
+    pub(crate) decl_idx: usize,
+    pub(crate) path: String,
+    pub(crate) kinds: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -137,6 +185,9 @@ impl QueryBuilder {
     fn imports(&self, py: Python<'_>) -> ImportQuery {
         ImportQuery::new(self.ctx.clone_ref(py))
     }
+    fn modules(&self, py: Python<'_>) -> ModuleQuery {
+        ModuleQuery::new(self.ctx.clone_ref(py))
+    }
     fn classes(&self, py: Python<'_>) -> ClassQuery {
         ClassQuery::new(self.ctx.clone_ref(py))
     }
@@ -148,6 +199,61 @@ impl QueryBuilder {
     }
     fn decls(&self, py: Python<'_>) -> DeclQuery {
         DeclQuery::new(self.ctx.clone_ref(py))
+    }
+    fn declarations(&self, py: Python<'_>) -> DeclarationsQuery {
+        DeclarationsQuery::new(self.ctx.clone_ref(py))
+    }
+    fn main_blocks(&self, py: Python<'_>) -> MainBlockQuery {
+        MainBlockQuery::new(self.ctx.clone_ref(py))
+    }
+    fn literal_lists(&self, py: Python<'_>) -> LiteralListQuery {
+        LiteralListQuery::new(self.ctx.clone_ref(py))
+    }
+    #[allow(clippy::wrong_self_convention)]
+    fn from_idx(&self, py: Python<'_>, seed_idx: usize) -> TraverseQuery {
+        TraverseQuery::new(self.ctx.clone_ref(py), seed_idx)
+    }
+
+    /// Terminal — seedless reachability over the graph. Forward
+    /// closure from every node carrying any bit in ``seed_flags``
+    /// (default: ``NodeFlags.ENTRYPOINT``), filtering edges by
+    /// ``skip_flags``. Returns indices into ``ctx.nodes()``.
+    #[pyo3(signature = (*, skip_flags = 0, seed_flags = None))]
+    fn reachable(
+        &self,
+        py: Python<'_>,
+        skip_flags: u32,
+        seed_flags: Option<u32>,
+    ) -> PyResult<Vec<usize>> {
+        let ctx = self.ctx.borrow(py);
+        match seed_flags {
+            Some(sf) => ctx.reachable_indices(py, skip_flags, sf),
+            None => ctx.reachable_indices(py, skip_flags, crate::helpers::NODE_FLAG_ENTRYPOINT),
+        }
+    }
+
+    /// Terminal — OR-form spec matcher used by
+    /// :class:`ExplicitEntrypointPlugin`. A node matches if any of:
+    ///
+    /// * ``regexes`` contains a pattern matching the node's path
+    ///   *relative to ``project_root``* (anchored at start of input,
+    ///   like ``re.match``).
+    /// * ``str_specs`` contains the node's relative path OR its
+    ///   fqname.
+    /// * ``abs_paths`` contains the node's absolute path.
+    ///
+    /// Returns indices into ``ctx.nodes()``.
+    #[pyo3(signature = (project_root, *, regexes = Vec::new(), str_specs = Vec::new(), abs_paths = Vec::new()))]
+    fn matching_specs(
+        &self,
+        py: Python<'_>,
+        project_root: &str,
+        regexes: Vec<String>,
+        str_specs: Vec<String>,
+        abs_paths: Vec<String>,
+    ) -> PyResult<Vec<usize>> {
+        let ctx = self.ctx.borrow(py);
+        ctx.find_nodes_matching_specs_indices(py, project_root, regexes, str_specs, abs_paths)
     }
 }
 
@@ -329,6 +435,23 @@ where
     result.into_inner().unwrap_or_default()
 }
 
+/// Bucket a list of node indices by their owning path. Shared by
+/// every Tier-1 query's ``.indices_by_path()`` terminal. One
+/// :meth:`ProjectContext.node_paths` lookup fans the indices into
+/// per-path bins.
+pub(crate) fn _bucket_indices_by_path(
+    ctx: &ProjectContext,
+    py: Python<'_>,
+    indices: Vec<usize>,
+) -> PyResult<FxHashMap<String, Vec<usize>>> {
+    let paths = ctx.node_paths(py, indices.clone())?;
+    let mut buckets: FxHashMap<String, Vec<usize>> = FxHashMap::default();
+    for (idx, path) in indices.into_iter().zip(paths.into_iter()) {
+        buckets.entry(path).or_default().push(idx);
+    }
+    Ok(buckets)
+}
+
 pub(crate) fn _to_iter(py: Python<'_>, items: Vec<Py<impl PyClass>>) -> PyResult<PyObject> {
     let list = pyo3::types::PyList::new_bound(py, items);
     let iter_obj = list.call_method0("__iter__")?;
@@ -404,8 +527,16 @@ pub(crate) struct DecoratorQuery {
     pub(crate) owner_attrs: Option<Vec<String>>,
     pub(crate) via_attr: Option<String>,
     pub(crate) in_decl: Option<Py<SymbolNode>>,
+    pub(crate) in_decl_idx: Option<usize>,
     pub(crate) path_regex: Option<String>,
     pub(crate) kwarg_matchers: Vec<(String, KwargMatcher)>,
+    /// User-controlled args/kwargs extraction gate. Defaults to
+    /// ``true``; flip with ``.with_args(false)`` to skip the rust-side
+    /// :fn:`extract_call_args_kwargs` walk when the plugin doesn't
+    /// read row ``args`` / ``kwargs``. Auto-forced back to ``true``
+    /// at row-collection time when any ``where_kwarg`` is set, since
+    /// kwarg filtering needs the data.
+    pub(crate) with_args: bool,
 }
 
 impl DecoratorQuery {
@@ -418,8 +549,10 @@ impl DecoratorQuery {
             owner_attrs: None,
             via_attr: None,
             in_decl: None,
+            in_decl_idx: None,
             path_regex: None,
             kwarg_matchers: Vec::new(),
+            with_args: false,
         }
     }
 }
@@ -468,17 +601,34 @@ impl DecoratorQuery {
         slf.in_decl = Some(node);
         slf
     }
+    fn in_decl_idx<'py>(mut slf: PyRefMut<'py, Self>, idx: usize) -> PyRefMut<'py, Self> {
+        slf.in_decl_idx = Some(idx);
+        slf
+    }
     fn where_path<'py>(mut slf: PyRefMut<'py, Self>, regex: String) -> PyRefMut<'py, Self> {
         slf.path_regex = Some(regex);
+        slf
+    }
+
+    /// Opt in to rust-side ``args`` / ``kwargs`` extraction.
+    /// Defaults to ``False`` — the per-row
+    /// :fn:`extract_call_args_kwargs` walk is skipped, and row
+    /// ``args`` / ``kwargs`` getters surface empty containers.
+    /// Pass ``True`` when a plugin actually reads ``args`` /
+    /// ``kwargs`` off the matched rows. Forced back to ``True`` at
+    /// row-collection time when any ``where_kwarg`` is set (kwarg
+    /// filtering needs the data).
+    fn with_args<'py>(mut slf: PyRefMut<'py, Self>, value: bool) -> PyRefMut<'py, Self> {
+        slf.with_args = value;
         slf
     }
 
     /// Add a kwarg matcher. Multiple calls AND together.
     ///
     /// ``value`` must be a Python literal (``None`` / ``bool`` /
-    /// ``int`` / ``float`` / ``str`` / ``list`` / ``tuple``). Passing
-    /// any other type — including a :class:`SymbolNode` — raises
-    /// ``ValueError``.
+    /// ``int`` / ``float`` / ``str`` / ``bytes`` / ``list`` /
+    /// ``tuple``). Passing any other type — including a
+    /// :class:`SymbolNode` — raises ``ValueError``.
     fn where_kwarg<'py>(
         mut slf: PyRefMut<'py, Self>,
         name: String,
@@ -490,46 +640,112 @@ impl DecoratorQuery {
         Ok(slf)
     }
 
-    fn collect(&self, py: Python<'_>) -> PyResult<Vec<Py<DecoratorRef>>> {
+    /// Materialise every matched decorator row.
+    ///
+    /// Each row is a :class:`DecoratorIdxRef`: the ``decorated``
+    /// position is given as ``decorated_idx`` (a positional index into
+    /// ``ctx.nodes()``); ``path`` is the owning decl's file; the
+    /// query-shape-specific metadata strings (``decorator_owner`` etc.)
+    /// follow the predicate that produced the row; and ``args`` /
+    /// ``kwargs`` are lazy getters that walk the row's pre-extracted
+    /// :struct:`CallArgs` on access.
+    fn collect(&self, py: Python<'_>) -> PyResult<Vec<Py<DecoratorIdxRef>>> {
+        let rows = self.decorator_rows(py)?;
         let ctx = self.ctx.borrow(py);
-        let path_regex = self.path_regex.as_deref();
-        let mut refs: Vec<Py<DecoratorRef>> = Vec::new();
-        // Cache a snapshot of the build's node pool for arg materialization.
-        // Keep the borrow alive for the duration of the loop so we don't
-        // reborrow on every iteration.
         let outputs = ctx.materialized("DecoratorQuery.collect")?;
         let nodes: &[Py<SymbolNode>] = &outputs.builder.nodes;
+        let mut out: Vec<Py<DecoratorIdxRef>> = Vec::with_capacity(rows.len());
+        for row in rows {
+            let path = nodes[row.decorated_idx].borrow(py).path.clone();
+            out.push(Py::new(
+                py,
+                DecoratorIdxRef {
+                    decorated_idx: row.decorated_idx,
+                    path,
+                    decorator_name: row.decorator_name,
+                    decorator_owner: row.decorator_owner,
+                    decorator_via: row.decorator_via,
+                    call_args: row.call_args,
+                },
+            )?);
+        }
+        Ok(out)
+    }
+
+    /// Terminal — group matched ``decorated_idx`` values by their
+    /// owning file path. Reads ``path`` straight off each row (no
+    /// extra :meth:`ProjectContext.node_paths` lookup). Useful for
+    /// plugins that fan out per-file work without re-querying.
+    fn indices_by_path(&self, py: Python<'_>) -> PyResult<FxHashMap<String, Vec<usize>>> {
+        let rows = self.decorator_rows(py)?;
+        let ctx = self.ctx.borrow(py);
+        let outputs = ctx.materialized("DecoratorQuery.indices_by_path")?;
+        let nodes: &[Py<SymbolNode>] = &outputs.builder.nodes;
+        let mut buckets: FxHashMap<String, Vec<usize>> = FxHashMap::default();
+        for row in rows {
+            let path = nodes[row.decorated_idx].borrow(py).path.clone();
+            buckets.entry(path).or_default().push(row.decorated_idx);
+        }
+        Ok(buckets)
+    }
+}
+
+/// Idx-form intermediate produced by :meth:`DecoratorQuery::decorator_rows`.
+/// Carries the same metadata as :class:`DecoratorIdxRef` plus the
+/// ``call_args`` upstream that kwarg filtering and the per-ref
+/// ``args`` / ``kwargs`` getters both consume.
+struct DecoratorRowIdx {
+    decorated_idx: usize,
+    decorator_name: Option<String>,
+    decorator_owner: Option<String>,
+    decorator_via: Option<String>,
+    call_args: crate::helpers::CallArgs,
+}
+
+impl DecoratorQuery {
+    /// Shared idx-space dispatch backing :meth:`collect`. Applies the
+    /// kwarg-matcher filter rust-side before row construction so the
+    /// terminal stays GIL-light.
+    fn decorator_rows(&self, py: Python<'_>) -> PyResult<Vec<DecoratorRowIdx>> {
+        let ctx = self.ctx.borrow(py);
+        let path_regex = self.path_regex.as_deref();
         let kwarg_matchers = &self.kwarg_matchers;
+        // ``with_args(False)`` skips the rust-side extraction, but
+        // kwarg filtering needs ``CallArgs`` populated — force it back
+        // to ``true`` when any matcher is set.
+        let extract_args = self.with_args || !kwarg_matchers.is_empty();
+        let mut out: Vec<DecoratorRowIdx> = Vec::new();
         if let Some(owner_attrs) = &self.owner_attrs {
             let triples = if let Some(via) = &self.via_attr {
-                ctx.find_handler_decorators_via(py, via, owner_attrs.clone(), path_regex)?
+                ctx.find_handler_decorators_via(
+                    py,
+                    via,
+                    owner_attrs.clone(),
+                    path_regex,
+                    extract_args,
+                )?
             } else {
-                ctx.find_handler_decorators(py, owner_attrs.clone(), path_regex)?
+                ctx.find_handler_decorators(py, owner_attrs.clone(), path_regex, extract_args)?
             };
-            for (owner_name, decorated, call_args) in triples {
+            for (owner_name, decorated_idx, call_args) in triples {
                 if !call_args_match_kwargs(&call_args, kwarg_matchers) {
                     continue;
                 }
-                let args = args_to_py_vec(py, &call_args.args, nodes);
-                let kwargs = kwargs_to_py_map(py, &call_args.kwargs, nodes);
-                refs.push(Py::new(
-                    py,
-                    DecoratorRef {
-                        decorated,
-                        decorator_name: None,
-                        decorator_owner: Some(owner_name),
-                        decorator_via: self.via_attr.clone(),
-                        args,
-                        kwargs,
-                    },
-                )?);
+                out.push(DecoratorRowIdx {
+                    decorated_idx,
+                    decorator_name: None,
+                    decorator_owner: Some(owner_name),
+                    decorator_via: self.via_attr.clone(),
+                    call_args,
+                });
             }
         } else if let Some(in_decl_node) = &self.in_decl {
             let names = self.names.as_ref().ok_or_else(|| {
                 PyValueError::new_err("DecoratorQuery.in_decl(...) requires .where_name(...)")
             })?;
             let in_decl_ref = in_decl_node.borrow(py);
-            let decls = ctx.find_decorations_on(py, &in_decl_ref, names.clone(), path_regex)?;
+            let decls =
+                ctx.find_decorations_on(py, &in_decl_ref, names.clone(), path_regex, extract_args)?;
             let owner_simple = in_decl_ref
                 .fqname
                 .rsplit('.')
@@ -537,76 +753,93 @@ impl DecoratorQuery {
                 .unwrap_or("")
                 .to_string();
             drop(in_decl_ref);
-            for (d, call_args) in decls {
+            for (decorated_idx, call_args) in decls {
                 if !call_args_match_kwargs(&call_args, kwarg_matchers) {
                     continue;
                 }
-                let args = args_to_py_vec(py, &call_args.args, nodes);
-                let kwargs = kwargs_to_py_map(py, &call_args.kwargs, nodes);
-                refs.push(Py::new(
-                    py,
-                    DecoratorRef {
-                        decorated: d,
-                        decorator_name: None,
-                        decorator_owner: Some(owner_simple.clone()),
-                        decorator_via: None,
-                        args,
-                        kwargs,
-                    },
-                )?);
+                out.push(DecoratorRowIdx {
+                    decorated_idx,
+                    decorator_name: None,
+                    decorator_owner: Some(owner_simple.clone()),
+                    decorator_via: None,
+                    call_args,
+                });
+            }
+        } else if let Some(in_decl_idx) = self.in_decl_idx {
+            let names = self.names.as_ref().ok_or_else(|| {
+                PyValueError::new_err("DecoratorQuery.in_decl_idx(...) requires .where_name(...)")
+            })?;
+            let outputs = ctx.materialized("DecoratorQuery.in_decl_idx")?;
+            let len = outputs.builder.nodes.len();
+            if in_decl_idx >= len {
+                return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                    "DecoratorQuery.in_decl_idx: idx {in_decl_idx} out of range (len={len})"
+                )));
+            }
+            let in_decl_ref = outputs.builder.nodes[in_decl_idx].borrow(py);
+            let decls =
+                ctx.find_decorations_on(py, &in_decl_ref, names.clone(), path_regex, extract_args)?;
+            let owner_simple = in_decl_ref
+                .fqname
+                .rsplit('.')
+                .next()
+                .unwrap_or("")
+                .to_string();
+            drop(in_decl_ref);
+            for (decorated_idx, call_args) in decls {
+                if !call_args_match_kwargs(&call_args, kwarg_matchers) {
+                    continue;
+                }
+                out.push(DecoratorRowIdx {
+                    decorated_idx,
+                    decorator_name: None,
+                    decorator_owner: Some(owner_simple.clone()),
+                    decorator_via: None,
+                    call_args,
+                });
             }
         } else if let Some(fqn) = &self.callee_fqn {
-            let decls = ctx.find_decorated(py, fqn, path_regex)?;
-            for (d, call_args) in decls {
+            let decls = ctx.find_decorated(py, fqn, path_regex, extract_args)?;
+            for (decorated_idx, call_args) in decls {
                 if !call_args_match_kwargs(&call_args, kwarg_matchers) {
                     continue;
                 }
-                let args = args_to_py_vec(py, &call_args.args, nodes);
-                let kwargs = kwargs_to_py_map(py, &call_args.kwargs, nodes);
-                refs.push(Py::new(
-                    py,
-                    DecoratorRef {
-                        decorated: d,
-                        decorator_name: None,
-                        decorator_owner: None,
-                        decorator_via: None,
-                        args,
-                        kwargs,
-                    },
-                )?);
+                out.push(DecoratorRowIdx {
+                    decorated_idx,
+                    decorator_name: None,
+                    decorator_owner: None,
+                    decorator_via: None,
+                    call_args,
+                });
             }
         } else if let (Some(modules), Some(names)) = (&self.modules, &self.names) {
-            let decls = ctx.find_decorated_decls(py, modules, names.clone(), path_regex)?;
-            for (d, call_args) in decls {
+            let decls =
+                ctx.find_decorated_decls(py, modules, names.clone(), path_regex, extract_args)?;
+            for (decorated_idx, call_args) in decls {
                 if !call_args_match_kwargs(&call_args, kwarg_matchers) {
                     continue;
                 }
-                let args = args_to_py_vec(py, &call_args.args, nodes);
-                let kwargs = kwargs_to_py_map(py, &call_args.kwargs, nodes);
-                refs.push(Py::new(
-                    py,
-                    DecoratorRef {
-                        decorated: d,
-                        decorator_name: None,
-                        decorator_owner: None,
-                        decorator_via: None,
-                        args,
-                        kwargs,
-                    },
-                )?);
+                out.push(DecoratorRowIdx {
+                    decorated_idx,
+                    decorator_name: None,
+                    decorator_owner: None,
+                    decorator_via: None,
+                    call_args,
+                });
             }
         } else {
             return Err(PyValueError::new_err(
                 "DecoratorQuery requires one of: where_callee(...); \
                  where_module(...) + where_name(...); where_owner_attr(...); \
-                 where_owner_attr_via(via, attrs); or in_decl(node) + where_name(...)",
+                 where_owner_attr_via(via, attrs); in_decl(node) + where_name(...); \
+                 or in_decl_idx(idx) + where_name(...)",
             ));
         }
-        Ok(refs)
+        Ok(out)
     }
 }
 
-impl_query_methods!(with_first DecoratorQuery, DecoratorRef);
+impl_query_methods!(with_first DecoratorQuery, DecoratorIdxRef);
 
 /// Find module-scope ``<var> = <Ctor>(...)`` sites. Pick exactly one
 /// of ``where_module + where_name`` or
@@ -623,6 +856,10 @@ pub(crate) struct ConstructionQuery {
     pub(crate) class_fqn: Option<String>,
     pub(crate) include_subclasses: bool,
     pub(crate) path_regex: Option<String>,
+    /// See :class:`DecoratorQuery::with_args`. Defaults to ``true``.
+    /// :class:`ConstructionQuery` doesn't have its own
+    /// ``where_kwarg`` (yet), so this isn't auto-forced.
+    pub(crate) with_args: bool,
 }
 
 impl ConstructionQuery {
@@ -634,6 +871,7 @@ impl ConstructionQuery {
             class_fqn: None,
             include_subclasses: false,
             path_regex: None,
+            with_args: false,
         }
     }
 }
@@ -671,43 +909,97 @@ impl ConstructionQuery {
         slf
     }
 
-    fn collect(&self, py: Python<'_>) -> PyResult<Vec<Py<ConstructionRef>>> {
+    /// Opt in to rust-side ``args`` / ``kwargs`` extraction; see
+    /// :meth:`DecoratorQuery.with_args` for the contract. Defaults
+    /// to ``False``.
+    fn with_args<'py>(mut slf: PyRefMut<'py, Self>, value: bool) -> PyRefMut<'py, Self> {
+        slf.with_args = value;
+        slf
+    }
+
+    /// Materialise every matched construction row. Each row is a
+    /// :class:`ConstructionIdxRef`: ``var_idx`` is the construction's
+    /// positional index into ``ctx.nodes()``; ``path`` is the owning
+    /// file; ``class_name`` is the upstream constructor's bare name;
+    /// ``args`` / ``kwargs`` are lazy getters over the row's
+    /// pre-extracted :struct:`CallArgs`.
+    fn collect(&self, py: Python<'_>) -> PyResult<Vec<Py<ConstructionIdxRef>>> {
+        let rows = self.construction_rows(py)?;
         let ctx = self.ctx.borrow(py);
-        let path_regex = self.path_regex.as_deref();
-        let mut refs: Vec<Py<ConstructionRef>> = Vec::new();
         let outputs = ctx.materialized("ConstructionQuery.collect")?;
         let nodes: &[Py<SymbolNode>] = &outputs.builder.nodes;
+        let mut out: Vec<Py<ConstructionIdxRef>> = Vec::with_capacity(rows.len());
+        for row in rows {
+            let path = nodes[row.var_idx].borrow(py).path.clone();
+            out.push(Py::new(
+                py,
+                ConstructionIdxRef {
+                    var_idx: row.var_idx,
+                    path,
+                    class_name: row.class_name,
+                    call_args: row.call_args,
+                },
+            )?);
+        }
+        Ok(out)
+    }
+
+    /// Terminal — group matched ``var_idx`` values by their owning
+    /// file path. Reads ``path`` straight off each row (no extra
+    /// :meth:`ProjectContext.node_paths` lookup).
+    fn indices_by_path(&self, py: Python<'_>) -> PyResult<FxHashMap<String, Vec<usize>>> {
+        let rows = self.construction_rows(py)?;
+        let ctx = self.ctx.borrow(py);
+        let outputs = ctx.materialized("ConstructionQuery.indices_by_path")?;
+        let nodes: &[Py<SymbolNode>] = &outputs.builder.nodes;
+        let mut buckets: FxHashMap<String, Vec<usize>> = FxHashMap::default();
+        for row in rows {
+            let path = nodes[row.var_idx].borrow(py).path.clone();
+            buckets.entry(path).or_default().push(row.var_idx);
+        }
+        Ok(buckets)
+    }
+}
+
+/// Idx-form intermediate produced by :meth:`ConstructionQuery::construction_rows`.
+struct ConstructionRowIdx {
+    var_idx: usize,
+    class_name: String,
+    call_args: crate::helpers::CallArgs,
+}
+
+impl ConstructionQuery {
+    /// Shared idx-space dispatch backing :meth:`collect`.
+    fn construction_rows(&self, py: Python<'_>) -> PyResult<Vec<ConstructionRowIdx>> {
+        let ctx = self.ctx.borrow(py);
+        let path_regex = self.path_regex.as_deref();
+        let extract_args = self.with_args;
+        let mut out: Vec<ConstructionRowIdx> = Vec::new();
         if let Some(fqn) = &self.class_fqn {
-            let pairs = ctx.find_constructions(py, fqn, self.include_subclasses, path_regex)?;
+            let pairs =
+                ctx.find_constructions(py, fqn, self.include_subclasses, path_regex, extract_args)?;
             let cls_name = fqn.rsplit('.').next().unwrap_or("").to_string();
-            for (d, call_args) in pairs {
-                let args = args_to_py_vec(py, &call_args.args, nodes);
-                let kwargs = kwargs_to_py_map(py, &call_args.kwargs, nodes);
-                refs.push(Py::new(
-                    py,
-                    ConstructionRef {
-                        var: d,
-                        class_name: cls_name.clone(),
-                        args,
-                        kwargs,
-                    },
-                )?);
+            for (var_idx, call_args) in pairs {
+                out.push(ConstructionRowIdx {
+                    var_idx,
+                    class_name: cls_name.clone(),
+                    call_args,
+                });
             }
         } else if let (Some(modules), Some(names)) = (&self.modules, &self.names) {
-            let triples =
-                ctx.find_instance_constructions(py, modules, names.clone(), path_regex)?;
-            for (var, name, call_args) in triples {
-                let args = args_to_py_vec(py, &call_args.args, nodes);
-                let kwargs = kwargs_to_py_map(py, &call_args.kwargs, nodes);
-                refs.push(Py::new(
-                    py,
-                    ConstructionRef {
-                        var,
-                        class_name: name,
-                        args,
-                        kwargs,
-                    },
-                )?);
+            let triples = ctx.find_instance_constructions(
+                py,
+                modules,
+                names.clone(),
+                path_regex,
+                extract_args,
+            )?;
+            for (var_idx, name, call_args) in triples {
+                out.push(ConstructionRowIdx {
+                    var_idx,
+                    class_name: name,
+                    call_args,
+                });
             }
         } else {
             return Err(PyValueError::new_err(
@@ -715,11 +1007,11 @@ impl ConstructionQuery {
                  or where_module(...) + where_name(...)",
             ));
         }
-        Ok(refs)
+        Ok(out)
     }
 }
 
-impl_query_methods!(with_first ConstructionQuery, ConstructionRef);
+impl_query_methods!(with_first ConstructionQuery, ConstructionIdxRef);
 
 /// Find call sites whose positional string-literal at the configured
 /// index is captured. :meth:`string_arg_at` is required. Pick one of:
@@ -740,6 +1032,9 @@ pub(crate) struct CallQuery {
     pub(crate) required_positional: Option<usize>,
     pub(crate) path_regex: Option<String>,
     pub(crate) kwarg_matchers: Vec<(String, KwargMatcher)>,
+    /// See :class:`DecoratorQuery::with_args`. Auto-forced to ``true``
+    /// when any ``where_kwarg`` is set.
+    pub(crate) with_args: bool,
 }
 
 impl CallQuery {
@@ -754,6 +1049,7 @@ impl CallQuery {
             required_positional: None,
             path_regex: None,
             kwarg_matchers: Vec::new(),
+            with_args: false,
         }
     }
 }
@@ -797,12 +1093,20 @@ impl CallQuery {
         slf
     }
 
+    /// Opt out of rust-side ``args`` / ``kwargs`` extraction; see
+    /// :meth:`DecoratorQuery.with_args` for the trade-off. Auto-forced
+    /// back to ``true`` when any ``where_kwarg`` is set.
+    fn with_args<'py>(mut slf: PyRefMut<'py, Self>, value: bool) -> PyRefMut<'py, Self> {
+        slf.with_args = value;
+        slf
+    }
+
     /// Add a kwarg matcher. Multiple calls AND together.
     ///
     /// ``value`` must be a Python literal (``None`` / ``bool`` /
-    /// ``int`` / ``float`` / ``str`` / ``list`` / ``tuple``). Passing
-    /// any other type — including a :class:`SymbolNode` — raises
-    /// ``ValueError``.
+    /// ``int`` / ``float`` / ``str`` / ``bytes`` / ``list`` /
+    /// ``tuple``). Passing any other type — including a
+    /// :class:`SymbolNode` — raises ``ValueError``.
     fn where_kwarg<'py>(
         mut slf: PyRefMut<'py, Self>,
         name: String,
@@ -814,14 +1118,68 @@ impl CallQuery {
         Ok(slf)
     }
 
-    fn collect(&self, py: Python<'_>) -> PyResult<Vec<Py<CallRef>>> {
+    /// Materialise every matched call row. Each row is a
+    /// :class:`CallIdxRef`: ``owner_idx`` is the owning decl's
+    /// positional index into ``ctx.nodes()``; ``path`` is the owning
+    /// file; ``string_arg`` is the literal at the configured
+    /// positional index; ``args`` / ``kwargs`` are lazy getters over
+    /// the row's pre-extracted :struct:`CallArgs`.
+    fn collect(&self, py: Python<'_>) -> PyResult<Vec<Py<CallIdxRef>>> {
+        let rows = self.call_rows(py)?;
+        let ctx = self.ctx.borrow(py);
+        let outputs = ctx.materialized("CallQuery.collect")?;
+        let nodes: &[Py<SymbolNode>] = &outputs.builder.nodes;
+        let mut out: Vec<Py<CallIdxRef>> = Vec::with_capacity(rows.len());
+        for row in rows {
+            let path = nodes[row.owner_idx].borrow(py).path.clone();
+            out.push(Py::new(
+                py,
+                CallIdxRef {
+                    owner_idx: row.owner_idx,
+                    path,
+                    string_arg: row.string_arg,
+                    call_args: row.call_args,
+                },
+            )?);
+        }
+        Ok(out)
+    }
+
+    /// Terminal — group matched ``owner_idx`` values by their owning
+    /// file path. Reads ``path`` straight off each row (no extra
+    /// :meth:`ProjectContext.node_paths` lookup).
+    fn indices_by_path(&self, py: Python<'_>) -> PyResult<FxHashMap<String, Vec<usize>>> {
+        let rows = self.call_rows(py)?;
+        let ctx = self.ctx.borrow(py);
+        let outputs = ctx.materialized("CallQuery.indices_by_path")?;
+        let nodes: &[Py<SymbolNode>] = &outputs.builder.nodes;
+        let mut buckets: FxHashMap<String, Vec<usize>> = FxHashMap::default();
+        for row in rows {
+            let path = nodes[row.owner_idx].borrow(py).path.clone();
+            buckets.entry(path).or_default().push(row.owner_idx);
+        }
+        Ok(buckets)
+    }
+}
+
+/// Idx-form intermediate produced by :meth:`CallQuery::call_rows`.
+struct CallRowIdx {
+    owner_idx: usize,
+    string_arg: String,
+    call_args: crate::helpers::CallArgs,
+}
+
+impl CallQuery {
+    /// Shared idx-space dispatch backing :meth:`collect`.
+    fn call_rows(&self, py: Python<'_>) -> PyResult<Vec<CallRowIdx>> {
         let ctx = self.ctx.borrow(py);
         let arg_index = self
             .arg_index
             .ok_or_else(|| PyValueError::new_err("CallQuery: .string_arg_at(index) is required"))?;
         let path_regex = self.path_regex.as_deref();
+        let extract_args = self.with_args || !self.kwarg_matchers.is_empty();
         let triples = if let (Some(modules), Some(name)) = (&self.modules, &self.name) {
-            ctx.find_calls_to_imported(py, modules, name, arg_index, path_regex)?
+            ctx.find_calls_to_imported(py, modules, name, arg_index, path_regex, extract_args)?
         } else if let (Some(owner), Some(attr)) = (&self.owner, &self.attr) {
             ctx.find_calls_on_var(
                 py,
@@ -830,40 +1188,33 @@ impl CallQuery {
                 arg_index,
                 self.required_positional,
                 path_regex,
+                extract_args,
             )?
         } else if let Some(attr) = &self.attr {
-            ctx.find_calls_on_attr(py, attr, arg_index, path_regex)?
+            ctx.find_calls_on_attr(py, attr, arg_index, path_regex, extract_args)?
         } else {
             return Err(PyValueError::new_err(
                 "CallQuery requires one of: where_module(...) + where_name(...); \
                  where_owner(...) + where_attr(...); or where_attr(...)",
             ));
         };
-        let outputs = ctx.materialized("CallQuery.collect")?;
-        let nodes: &[Py<SymbolNode>] = &outputs.builder.nodes;
         let kwarg_matchers = &self.kwarg_matchers;
-        let mut refs: Vec<Py<CallRef>> = Vec::new();
-        for (owner_node, s, call_args) in triples {
+        let mut out: Vec<CallRowIdx> = Vec::new();
+        for (owner_idx, string_arg, call_args) in triples {
             if !call_args_match_kwargs(&call_args, kwarg_matchers) {
                 continue;
             }
-            let args = args_to_py_vec(py, &call_args.args, nodes);
-            let kwargs = kwargs_to_py_map(py, &call_args.kwargs, nodes);
-            refs.push(Py::new(
-                py,
-                CallRef {
-                    owner: owner_node,
-                    string_arg: s,
-                    args,
-                    kwargs,
-                },
-            )?);
+            out.push(CallRowIdx {
+                owner_idx,
+                string_arg,
+                call_args,
+            });
         }
-        Ok(refs)
+        Ok(out)
     }
 }
 
-impl_query_methods!(with_first CallQuery, CallRef);
+impl_query_methods!(with_first CallQuery, CallIdxRef);
 
 // ---------------------------------------------------------------------------
 // Subclass / Import / Class / Factory queries
@@ -873,14 +1224,17 @@ impl_query_methods!(with_first CallQuery, CallRef);
 /// * ``of_fqn(fqn)`` — base by dotted name (external classes ok —
 ///   ``unittest.TestCase`` etc.).
 /// * ``of_node(class_node)`` — base by project-local class node.
+/// * ``of_idx(class_idx)`` — base by positional index into
+///   ``ctx.nodes()`` (idx-form sibling of ``of_node``).
 /// ``transitive(bool)`` controls whether the BFS walks past the
-/// direct subclass frontier (default ``True``; for ``of_node`` the
-/// BFS is always transitive).
+/// direct subclass frontier (default ``True``; for ``of_node`` /
+/// ``of_idx`` the BFS is always transitive).
 #[pyclass(unsendable)]
 pub(crate) struct SubclassQuery {
     pub(crate) ctx: Py<ProjectContext>,
     pub(crate) base_fqn: Option<String>,
     pub(crate) base_node: Option<Py<SymbolNode>>,
+    pub(crate) base_idx: Option<usize>,
     pub(crate) transitive: bool,
 }
 
@@ -890,6 +1244,7 @@ impl SubclassQuery {
             ctx,
             base_fqn: None,
             base_node: None,
+            base_idx: None,
             transitive: true,
         }
     }
@@ -905,22 +1260,23 @@ impl SubclassQuery {
         slf.base_node = Some(node);
         slf
     }
+    fn of_idx<'py>(mut slf: PyRefMut<'py, Self>, idx: usize) -> PyRefMut<'py, Self> {
+        slf.base_idx = Some(idx);
+        slf
+    }
     fn transitive<'py>(mut slf: PyRefMut<'py, Self>, value: bool) -> PyRefMut<'py, Self> {
         slf.transitive = value;
         slf
     }
 
     fn collect(&self, py: Python<'_>) -> PyResult<Vec<Py<SymbolNode>>> {
+        let indices = self.indices(py)?;
         let ctx = self.ctx.borrow(py);
-        if let Some(fqn) = &self.base_fqn {
-            ctx.find_subclasses(py, fqn, self.transitive)
-        } else if let Some(node) = &self.base_node {
-            ctx.find_subclasses_of(py, &node.borrow(py))
-        } else {
-            Err(PyValueError::new_err(
-                "SubclassQuery requires .of_fqn(...) or .of_node(...)",
-            ))
-        }
+        let outputs = ctx.materialized("SubclassQuery.collect")?;
+        Ok(indices
+            .into_iter()
+            .map(|i| outputs.builder.nodes[i].clone_ref(py))
+            .collect())
     }
 
     /// Index-returning terminal. Same lookup as :meth:`collect`, but
@@ -932,11 +1288,34 @@ impl SubclassQuery {
             ctx.find_subclasses_indices(py, fqn, self.transitive)
         } else if let Some(node) = &self.base_node {
             ctx.find_subclasses_of_indices(&node.borrow(py))
+        } else if let Some(idx) = self.base_idx {
+            ctx.find_subclasses_of_idx(py, idx)
         } else {
             Err(PyValueError::new_err(
-                "SubclassQuery requires .of_fqn(...) or .of_node(...)",
+                "SubclassQuery requires .of_fqn(...), .of_node(...), or .of_idx(...)",
             ))
         }
+    }
+
+    /// Terminal — :class:`NodeAttrs` for every matched subclass, in
+    /// the same order :meth:`indices` returns.
+    fn attrs(&self, py: Python<'_>) -> PyResult<Vec<crate::helpers::NodeAttrs>> {
+        let indices = self.indices(py)?;
+        let ctx = self.ctx.borrow(py);
+        ctx.node_attrs(py, indices)
+    }
+
+    /// Terminal — first matched subclass's positional index, or
+    /// ``None`` when no subclass exists.
+    fn first_idx(&self, py: Python<'_>) -> PyResult<Option<usize>> {
+        Ok(self.indices(py)?.into_iter().next())
+    }
+
+    /// Terminal — group matched indices by their owning file path.
+    fn indices_by_path(&self, py: Python<'_>) -> PyResult<FxHashMap<String, Vec<usize>>> {
+        let indices = self.indices(py)?;
+        let ctx = self.ctx.borrow(py);
+        _bucket_indices_by_path(&ctx, py, indices)
     }
 }
 
@@ -993,9 +1372,200 @@ impl ImportQuery {
     fn count(&self, py: Python<'_>) -> PyResult<usize> {
         Ok(self.ctx.borrow(py).imports_of_count(self.module_or_err()?))
     }
+
+    /// Terminal — :class:`NodeAttrs` for every matched import node,
+    /// in the same order :meth:`indices` returns.
+    fn attrs(&self, py: Python<'_>) -> PyResult<Vec<crate::helpers::NodeAttrs>> {
+        let indices = self.indices(py)?;
+        let ctx = self.ctx.borrow(py);
+        ctx.node_attrs(py, indices)
+    }
+
+    /// Terminal — first matched import node's positional index, or
+    /// ``None`` when no project file imports the configured module.
+    fn first_idx(&self, py: Python<'_>) -> PyResult<Option<usize>> {
+        Ok(self.indices(py)?.into_iter().next())
+    }
+
+    /// Terminal — group matched indices by their owning file path.
+    fn indices_by_path(&self, py: Python<'_>) -> PyResult<FxHashMap<String, Vec<usize>>> {
+        let indices = self.indices(py)?;
+        let ctx = self.ctx.borrow(py);
+        _bucket_indices_by_path(&ctx, py, indices)
+    }
 }
 
 impl_query_methods!(iter_only ImportQuery);
+
+/// Enumerate / inspect project module nodes. Pick exactly one filter
+/// (``with_fqn`` / ``with_path`` / ``with_dunders``), optionally
+/// follow with one transform (``surface`` / ``top_level`` /
+/// ``dunder_all``), then drop into a terminal (``.indices()`` /
+/// ``.first_idx()``).
+///
+/// * ``with_fqn(fqn)`` — narrow to a single module by dotted fqname.
+/// * ``with_path(path)`` — narrow to the module owning ``path``.
+/// * ``with_dunders()`` — project-wide scan of module-level ``__xxx__``
+///   variables and PEP 562 dunder functions (``__getattr__`` /
+///   ``__dir__``).
+///
+/// Transforms:
+///
+/// * ``surface()`` — module + every transitive decl under its fqname
+///   tree. Models ``importlib.import_module(...)`` reachability.
+/// * ``top_level()`` — module's immediate top-level decls
+///   (``from module import *`` semantics).
+/// * ``dunder_all()`` — decls listed in the module's ``__all__``.
+///   Terminal-shaped: returns ``list[int] | None`` (``None`` when
+///   the module doesn't declare ``__all__``).
+#[pyclass(unsendable)]
+pub(crate) struct ModuleQuery {
+    pub(crate) ctx: Py<ProjectContext>,
+    pub(crate) fqn: Option<String>,
+    pub(crate) path: Option<String>,
+    pub(crate) all_dunders: bool,
+    pub(crate) transform: ModuleTransform,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ModuleTransform {
+    None,
+    Surface,
+    TopLevel,
+}
+
+impl ModuleQuery {
+    fn new(ctx: Py<ProjectContext>) -> Self {
+        Self {
+            ctx,
+            fqn: None,
+            path: None,
+            all_dunders: false,
+            transform: ModuleTransform::None,
+        }
+    }
+}
+
+#[pymethods]
+impl ModuleQuery {
+    fn with_fqn<'py>(mut slf: PyRefMut<'py, Self>, fqn: String) -> PyRefMut<'py, Self> {
+        slf.fqn = Some(fqn);
+        slf
+    }
+    fn with_path<'py>(mut slf: PyRefMut<'py, Self>, path: String) -> PyRefMut<'py, Self> {
+        slf.path = Some(path);
+        slf
+    }
+    fn with_dunders<'py>(mut slf: PyRefMut<'py, Self>) -> PyRefMut<'py, Self> {
+        slf.all_dunders = true;
+        slf
+    }
+    fn surface<'py>(mut slf: PyRefMut<'py, Self>) -> PyRefMut<'py, Self> {
+        slf.transform = ModuleTransform::Surface;
+        slf
+    }
+    fn top_level<'py>(mut slf: PyRefMut<'py, Self>) -> PyRefMut<'py, Self> {
+        slf.transform = ModuleTransform::TopLevel;
+        slf
+    }
+
+    /// Terminal — list of matching node indices into ``ctx.nodes()``.
+    ///
+    /// * No transform + ``with_fqn`` / ``with_path``: the matched
+    ///   module idx, as a 0- or 1-element list.
+    /// * ``surface()`` / ``top_level()``: the module + relevant decls.
+    /// * ``with_dunders()``: every project-wide module-level dunder
+    ///   name (``surface`` / ``top_level`` are ignored here — dunders
+    ///   are a flat scan).
+    fn indices(&self, py: Python<'_>) -> PyResult<Vec<usize>> {
+        let ctx = self.ctx.borrow(py);
+        if self.all_dunders {
+            return ctx.find_module_dunders_indices(py);
+        }
+        let fqn = self.resolve_fqn(py, &ctx)?;
+        let Some(fqn) = fqn else {
+            return Ok(Vec::new());
+        };
+        match self.transform {
+            ModuleTransform::None => Ok(ctx
+                .find_module_idx(&fqn)?
+                .map(|i| vec![i])
+                .unwrap_or_default()),
+            ModuleTransform::Surface => ctx.module_surface_indices(py, &fqn),
+            ModuleTransform::TopLevel => ctx.find_module_top_level_decls_indices(py, &fqn),
+        }
+    }
+
+    /// Terminal — first matching idx or ``None``. Convenience for
+    /// single-value lookups (``with_fqn`` / ``with_path`` without a
+    /// transform). For multi-result transforms (``surface`` /
+    /// ``top_level`` / ``with_dunders``) this returns the first row in
+    /// arbitrary order — use ``.indices()`` instead.
+    fn first_idx(&self, py: Python<'_>) -> PyResult<Option<usize>> {
+        Ok(self.indices(py)?.into_iter().next())
+    }
+
+    /// Terminal — decls listed in the module's ``__all__``, or
+    /// ``None`` when the module doesn't declare ``__all__``. Requires
+    /// ``with_fqn(fqn)``; ``with_path`` / ``with_dunders`` / transforms
+    /// are ignored.
+    fn dunder_all(&self, py: Python<'_>) -> PyResult<Option<Vec<usize>>> {
+        let ctx = self.ctx.borrow(py);
+        let fqn = self.fqn.as_deref().ok_or_else(|| {
+            PyValueError::new_err("ModuleQuery.dunder_all() requires .with_fqn(fqn)")
+        })?;
+        ctx.find_module_dunder_all_exports_indices(fqn)
+    }
+
+    /// Iterate over matched indices. Same shape as :meth:`indices`.
+    fn __iter__(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let idxs = self.indices(py)?;
+        let list = pyo3::types::PyList::new_bound(py, idxs);
+        Ok(list.call_method0("__iter__")?.into())
+    }
+
+    fn count(&self, py: Python<'_>) -> PyResult<usize> {
+        Ok(self.indices(py)?.len())
+    }
+
+    /// Terminal — :class:`NodeAttrs` for every matched index, in the
+    /// same order :meth:`indices` returns. Avoids the boilerplate of
+    /// ``ctx.node_attrs(q.indices())``.
+    fn attrs(&self, py: Python<'_>) -> PyResult<Vec<crate::helpers::NodeAttrs>> {
+        let indices = self.indices(py)?;
+        let ctx = self.ctx.borrow(py);
+        ctx.node_attrs(py, indices)
+    }
+
+    /// Terminal — group matched indices by their owning file path.
+    /// Returns ``dict[path, list[int]]``; one
+    /// :meth:`ProjectContext.node_paths` call internally.
+    fn indices_by_path(&self, py: Python<'_>) -> PyResult<FxHashMap<String, Vec<usize>>> {
+        let indices = self.indices(py)?;
+        let ctx = self.ctx.borrow(py);
+        _bucket_indices_by_path(&ctx, py, indices)
+    }
+}
+
+impl ModuleQuery {
+    /// Resolve the query's filter to a dotted fqname.
+    fn resolve_fqn(&self, py: Python<'_>, ctx: &ProjectContext) -> PyResult<Option<String>> {
+        if let Some(ref fqn) = self.fqn {
+            return Ok(Some(fqn.clone()));
+        }
+        if let Some(ref path) = self.path {
+            // Map path → module idx → fqname via node_attrs.
+            let Some(idx) = ctx.module_for_indices(path)? else {
+                return Ok(None);
+            };
+            let attrs = ctx.node_attrs(py, vec![idx])?;
+            return Ok(attrs.into_iter().next().map(|a| a.fqname));
+        }
+        Err(PyValueError::new_err(
+            "ModuleQuery requires one of: .with_fqn(...), .with_path(...), .with_dunders()",
+        ))
+    }
+}
 
 /// Enumerate classes by structural property. Today the only filter
 /// is ``defining_method(name)`` (matches classes whose body has a
@@ -1042,27 +1612,32 @@ impl ClassQuery {
             .ok_or_else(|| PyValueError::new_err("ClassQuery requires .defining_method(name)"))?;
         ctx.find_classes_defining_method_indices(py, name)
     }
+
+    /// Terminal — :class:`NodeAttrs` for every matched class, in the
+    /// same order :meth:`indices` returns.
+    fn attrs(&self, py: Python<'_>) -> PyResult<Vec<crate::helpers::NodeAttrs>> {
+        let indices = self.indices(py)?;
+        let ctx = self.ctx.borrow(py);
+        ctx.node_attrs(py, indices)
+    }
+
+    /// Terminal — first matched class's positional index, or ``None``
+    /// when no class defines the configured method.
+    fn first_idx(&self, py: Python<'_>) -> PyResult<Option<usize>> {
+        Ok(self.indices(py)?.into_iter().next())
+    }
+
+    /// Terminal — group matched indices by their owning file path.
+    fn indices_by_path(&self, py: Python<'_>) -> PyResult<FxHashMap<String, Vec<usize>>> {
+        let indices = self.indices(py)?;
+        let ctx = self.ctx.borrow(py);
+        _bucket_indices_by_path(&ctx, py, indices)
+    }
 }
 
 impl_query_methods!(no_first ClassQuery);
 
 /// One result row from :class:`FactoryQuery`. ``decl`` is the
-/// owning top-level function or class; ``kinds`` is the sorted set
-/// of constructor bare-names matched inside its body.
-#[pyclass(frozen, get_all)]
-pub(crate) struct FactoryRef {
-    pub(crate) decl: Py<SymbolNode>,
-    pub(crate) kinds: Vec<String>,
-}
-
-#[pymethods]
-impl FactoryRef {
-    #[getter]
-    fn path(&self, py: Python<'_>) -> String {
-        self.decl.borrow(py).path.clone()
-    }
-}
-
 /// Walk function / class bodies for ``<Ctor>(...)`` calls where
 /// ``Ctor`` is imported from ``of_module(...)`` and matches one of
 /// ``where_name(...)``. Both filters are required.
@@ -1104,7 +1679,51 @@ impl FactoryQuery {
         slf.names = Some(_extract_str_or_list(py, names)?);
         Ok(slf)
     }
-    fn collect(&self, py: Python<'_>) -> PyResult<Vec<Py<FactoryRef>>> {
+    /// Materialise every matched factory row. Each row is a
+    /// :class:`FactoryIdxRef`: ``decl_idx`` is the owning decl's
+    /// positional index into ``ctx.nodes()``; ``path`` is the owning
+    /// file; ``kinds`` is the sorted set of constructor bare-names
+    /// matched inside its body.
+    fn collect(&self, py: Python<'_>) -> PyResult<Vec<Py<FactoryIdxRef>>> {
+        let pairs = self.factory_rows(py)?;
+        let ctx = self.ctx.borrow(py);
+        let outputs = ctx.materialized("FactoryQuery.collect")?;
+        let nodes: &[Py<SymbolNode>] = &outputs.builder.nodes;
+        let mut out: Vec<Py<FactoryIdxRef>> = Vec::with_capacity(pairs.len());
+        for (decl_idx, kinds) in pairs {
+            let path = nodes[decl_idx].borrow(py).path.clone();
+            out.push(Py::new(
+                py,
+                FactoryIdxRef {
+                    decl_idx,
+                    path,
+                    kinds,
+                },
+            )?);
+        }
+        Ok(out)
+    }
+
+    /// Terminal — group matched ``decl_idx`` values by their owning
+    /// file path. Reads ``path`` straight off each row (no extra
+    /// :meth:`ProjectContext.node_paths` lookup).
+    fn indices_by_path(&self, py: Python<'_>) -> PyResult<FxHashMap<String, Vec<usize>>> {
+        let pairs = self.factory_rows(py)?;
+        let ctx = self.ctx.borrow(py);
+        let outputs = ctx.materialized("FactoryQuery.indices_by_path")?;
+        let nodes: &[Py<SymbolNode>] = &outputs.builder.nodes;
+        let mut buckets: FxHashMap<String, Vec<usize>> = FxHashMap::default();
+        for (decl_idx, _kinds) in pairs {
+            let path = nodes[decl_idx].borrow(py).path.clone();
+            buckets.entry(path).or_default().push(decl_idx);
+        }
+        Ok(buckets)
+    }
+}
+
+impl FactoryQuery {
+    /// Shared idx-space dispatch backing :meth:`collect`.
+    fn factory_rows(&self, py: Python<'_>) -> PyResult<Vec<(usize, Vec<String>)>> {
         let ctx = self.ctx.borrow(py);
         let modules = self
             .modules
@@ -1114,11 +1733,7 @@ impl FactoryQuery {
             .names
             .clone()
             .ok_or_else(|| PyValueError::new_err("FactoryQuery requires .where_name(...)"))?;
-        let pairs = ctx.find_factory_decls(py, modules, names)?;
-        pairs
-            .into_iter()
-            .map(|(decl, kinds)| Py::new(py, FactoryRef { decl, kinds }))
-            .collect()
+        ctx.find_factory_decls(py, modules, names)
     }
 }
 
@@ -1295,8 +1910,11 @@ pub(crate) struct DeclQuery {
     pub(crate) kinds: Option<Vec<String>>,
     pub(crate) filenames: Option<Vec<String>>,
     pub(crate) simple_names: Option<Vec<String>>,
+    pub(crate) simple_name_regex: Option<String>,
     pub(crate) paths: Option<Vec<String>>,
     pub(crate) path_regex: Option<String>,
+    pub(crate) path_prefix: Option<String>,
+    pub(crate) path_contains: Option<String>,
     pub(crate) flags_mask: Option<u32>,
     pub(crate) flags_match_any: bool,
     pub(crate) fqname_prefix: Option<String>,
@@ -1326,8 +1944,11 @@ impl DeclQuery {
             kinds: None,
             filenames: None,
             simple_names: None,
+            simple_name_regex: None,
             paths: None,
             path_regex: None,
+            path_prefix: None,
+            path_contains: None,
             flags_mask: None,
             flags_match_any: false,
             fqname_prefix: None,
@@ -1397,6 +2018,35 @@ impl DeclQuery {
     /// Restrict to nodes whose absolute path matches ``regex``.
     fn with_path_regex<'py>(mut slf: PyRefMut<'py, Self>, regex: String) -> PyRefMut<'py, Self> {
         slf.path_regex = Some(regex);
+        slf
+    }
+    /// Restrict to nodes whose absolute path starts with ``prefix``.
+    /// Cheaper than :meth:`with_path_regex` for simple directory
+    /// scoping — folds the per-node ``str.starts_with`` loop into the
+    /// query's single rust pass.
+    fn with_path_prefix<'py>(mut slf: PyRefMut<'py, Self>, prefix: String) -> PyRefMut<'py, Self> {
+        slf.path_prefix = Some(prefix);
+        slf
+    }
+    /// Restrict to nodes whose absolute path contains ``substring``
+    /// anywhere. Useful for path-pattern plugins (``alembic/versions/``,
+    /// ``.ignore.py``).
+    fn with_path_contains<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        substring: String,
+    ) -> PyRefMut<'py, Self> {
+        slf.path_contains = Some(substring);
+        slf
+    }
+    /// Restrict to nodes whose trailing fqname segment matches
+    /// ``pattern`` (a regex). Use with :meth:`with_kind` /
+    /// :meth:`with_kinds` to drop modules from the result set when
+    /// you only want top-level decls.
+    fn with_simple_name_regex<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        pattern: String,
+    ) -> PyRefMut<'py, Self> {
+        slf.simple_name_regex = Some(pattern);
         slf
     }
     /// Restrict to nodes whose ``flags & mask == mask`` (all bits in
@@ -1498,6 +2148,12 @@ impl DeclQuery {
         let ctx = self.ctx.borrow(py);
         let outputs = ctx.materialized("DeclQuery.indices")?;
         let path_regex = _compile_path_regex(self.path_regex.as_deref())?;
+        let simple_name_regex = match self.simple_name_regex.as_deref() {
+            None => None,
+            Some(p) => Some(regex::Regex::new(p).map_err(|e| {
+                PyValueError::new_err(format!("invalid simple-name regex {p:?}: {e}"))
+            })?),
+        };
 
         // Pre-compute hashsets for predicates that take lists. Singular
         // forms reuse the same vec (length 1) so the hashset cost is
@@ -1600,6 +2256,26 @@ impl DeclQuery {
                     continue;
                 }
             }
+            // simple-name regex
+            if let Some(re) = &simple_name_regex {
+                let fq = node.fqname.as_str();
+                let simple = fq.rsplit_once('.').map(|(_, n)| n).unwrap_or(fq);
+                if !re.is_match(simple) {
+                    continue;
+                }
+            }
+            // path prefix
+            if let Some(prefix) = &self.path_prefix {
+                if !node.path.starts_with(prefix.as_str()) {
+                    continue;
+                }
+            }
+            // path substring
+            if let Some(needle) = &self.path_contains {
+                if !node.path.contains(needle.as_str()) {
+                    continue;
+                }
+            }
             // flags mask
             if let Some(mask) = self.flags_mask {
                 if self.flags_match_any {
@@ -1641,9 +2317,277 @@ impl DeclQuery {
         }
         Ok(out)
     }
+
+    /// Terminal — :class:`NodeAttrs` (``kind`` / ``path`` / ``fqname``
+    /// / ``flags``) for every surviving node, in the same order
+    /// :meth:`indices` returns. Avoids the boilerplate of
+    /// ``ctx.node_attrs(q.indices())``.
+    fn attrs(&self, py: Python<'_>) -> PyResult<Vec<crate::helpers::NodeAttrs>> {
+        let indices = self.indices(py)?;
+        let ctx = self.ctx.borrow(py);
+        ctx.node_attrs(py, indices)
+    }
+
+    /// Terminal — first matching node's positional index, or ``None``
+    /// when no node matches. Convenience for single-value lookups
+    /// (e.g. fqname-prefix queries that should match at most one
+    /// decl).
+    fn first_idx(&self, py: Python<'_>) -> PyResult<Option<usize>> {
+        Ok(self.indices(py)?.into_iter().next())
+    }
+
+    /// Terminal — group matched indices by their owning file path.
+    /// Returns ``dict[path, list[int]]``; one
+    /// :meth:`ProjectContext.node_paths` call internally. Lets
+    /// plugins fan out per-file work without re-querying.
+    fn indices_by_path(&self, py: Python<'_>) -> PyResult<FxHashMap<String, Vec<usize>>> {
+        let indices = self.indices(py)?;
+        let ctx = self.ctx.borrow(py);
+        _bucket_indices_by_path(&ctx, py, indices)
+    }
 }
 
 impl_query_methods!(no_first DeclQuery);
+
+// ---------------------------------------------------------------------------
+// TraverseQuery — seeded closure walks
+// ---------------------------------------------------------------------------
+
+/// Closure walks over the graph anchored at a single seed node. Built
+/// via :meth:`QueryBuilder.from_idx`. Terminals: :meth:`descendants`,
+/// :meth:`ancestors`, :meth:`direct_predecessors`. Each takes a
+/// keyword-only ``skip_flags`` mask (default ``0``) that filters out
+/// edges whose flag mask intersects — pass ``EdgeFlags.DEAD_BRANCH.value``
+/// for strict reachability.
+///
+/// All terminals return positional indices into ``ctx.nodes()``; revive
+/// rows via :meth:`ProjectContext.nodes_at` if a plugin needs full
+/// :class:`SymbolNode` objects.
+///
+/// For the seedless "alive from entrypoints" closure, use the top-level
+/// :meth:`QueryBuilder.reachable` form instead.
+#[pyclass(unsendable)]
+pub(crate) struct TraverseQuery {
+    pub(crate) ctx: Py<ProjectContext>,
+    pub(crate) seed: usize,
+}
+
+impl TraverseQuery {
+    fn new(ctx: Py<ProjectContext>, seed: usize) -> Self {
+        Self { ctx, seed }
+    }
+}
+
+#[pymethods]
+impl TraverseQuery {
+    /// Forward closure: every node reachable from the seed by
+    /// following edges. ``skip_flags`` filters out edges whose flag
+    /// mask intersects. Returns indices into ``ctx.nodes()``.
+    #[pyo3(signature = (*, skip_flags = 0))]
+    fn descendants(&self, py: Python<'_>, skip_flags: u32) -> PyResult<Vec<usize>> {
+        let ctx = self.ctx.borrow(py);
+        ctx.descendants_indices(self.seed, skip_flags)
+    }
+
+    /// Reverse closure: every node that can reach the seed by
+    /// following edges. ``skip_flags`` filters the same way as
+    /// :meth:`descendants`. Returns indices into ``ctx.nodes()``.
+    #[pyo3(signature = (*, skip_flags = 0))]
+    fn ancestors(&self, py: Python<'_>, skip_flags: u32) -> PyResult<Vec<usize>> {
+        let ctx = self.ctx.borrow(py);
+        ctx.ancestors_indices(self.seed, skip_flags)
+    }
+
+    /// One-hop reverse: the immediate predecessors of the seed (deduped
+    /// by source index, so parallel edges with different flags collapse
+    /// to a single entry). ``skip_flags`` filters edges the same way as
+    /// :meth:`ancestors`.
+    #[pyo3(signature = (*, skip_flags = 0))]
+    fn direct_predecessors(&self, py: Python<'_>, skip_flags: u32) -> PyResult<Vec<usize>> {
+        let ctx = self.ctx.borrow(py);
+        ctx.direct_predecessors_idx(self.seed, skip_flags)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DeclarationsQuery — fqname lookup with optional module fallback
+// ---------------------------------------------------------------------------
+
+/// Look up declarations by fully-qualified name. Built via
+/// :meth:`QueryBuilder.declarations`. Requires :meth:`with_fqname`;
+/// terminals are :meth:`indices` (all matching decls) and
+/// :meth:`resolve_idx` (first match, with module fallback).
+///
+/// Both terminals share the walk-back rule: if the exact fqname
+/// doesn't match, dotted segments are stripped from the right until an
+/// enclosing top-level decl is found (``pkg.lib.Cls.method`` resolves
+/// to ``pkg.lib.Cls`` because methods aren't graph nodes).
+#[pyclass(unsendable)]
+pub(crate) struct DeclarationsQuery {
+    pub(crate) ctx: Py<ProjectContext>,
+    pub(crate) fqname: Option<String>,
+}
+
+impl DeclarationsQuery {
+    fn new(ctx: Py<ProjectContext>) -> Self {
+        Self { ctx, fqname: None }
+    }
+}
+
+#[pymethods]
+impl DeclarationsQuery {
+    fn with_fqname<'py>(mut slf: PyRefMut<'py, Self>, fqname: String) -> PyRefMut<'py, Self> {
+        slf.fqname = Some(fqname);
+        slf
+    }
+
+    /// Terminal — every decl matching ``fqname`` (walk-back included).
+    /// Modules are never returned; use :meth:`QueryBuilder.modules`
+    /// for module lookup. Returns indices into ``ctx.nodes()``.
+    fn indices(&self, py: Python<'_>) -> PyResult<Vec<usize>> {
+        let ctx = self.ctx.borrow(py);
+        let fqname = self.fqname.as_deref().ok_or_else(|| {
+            PyValueError::new_err("DeclarationsQuery requires .with_fqname(fqname)")
+        })?;
+        ctx.find_declarations_indices(fqname)
+    }
+
+    /// Terminal — first decl matching ``fqname``, falling back to a
+    /// module match. Same walk-back rules as :meth:`indices` but
+    /// includes module nodes in the lookup. Returns ``None`` when the
+    /// fqname can't be found anywhere.
+    fn resolve_idx(&self, py: Python<'_>) -> PyResult<Option<usize>> {
+        let ctx = self.ctx.borrow(py);
+        let fqname = self.fqname.as_deref().ok_or_else(|| {
+            PyValueError::new_err("DeclarationsQuery requires .with_fqname(fqname)")
+        })?;
+        ctx.resolve_idx(fqname)
+    }
+
+    /// Iterate over matched indices. Same shape as :meth:`indices`.
+    fn __iter__(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let idxs = self.indices(py)?;
+        let list = pyo3::types::PyList::new_bound(py, idxs);
+        Ok(list.call_method0("__iter__")?.into())
+    }
+
+    fn count(&self, py: Python<'_>) -> PyResult<usize> {
+        Ok(self.indices(py)?.len())
+    }
+
+    /// Terminal — :class:`NodeAttrs` for every matched decl, in the
+    /// same order :meth:`indices` returns. Modules are excluded (same
+    /// rule as :meth:`indices`); use :meth:`resolve_idx` +
+    /// :meth:`ProjectContext.node_attrs` if you need the module
+    /// fallback's attrs.
+    fn attrs(&self, py: Python<'_>) -> PyResult<Vec<crate::helpers::NodeAttrs>> {
+        let indices = self.indices(py)?;
+        let ctx = self.ctx.borrow(py);
+        ctx.node_attrs(py, indices)
+    }
+
+    /// Terminal — first matched decl's positional index, or ``None``
+    /// when no decl matches. Distinct from :meth:`resolve_idx`: this
+    /// one skips the module fallback.
+    fn first_idx(&self, py: Python<'_>) -> PyResult<Option<usize>> {
+        Ok(self.indices(py)?.into_iter().next())
+    }
+
+    /// Terminal — group matched indices by their owning file path.
+    fn indices_by_path(&self, py: Python<'_>) -> PyResult<FxHashMap<String, Vec<usize>>> {
+        let indices = self.indices(py)?;
+        let ctx = self.ctx.borrow(py);
+        _bucket_indices_by_path(&ctx, py, indices)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MainBlockQuery — project-wide ``if __name__ == "__main__":`` blocks
+// ---------------------------------------------------------------------------
+
+/// Enumerate every ``if __name__ == "__main__":`` block in the project.
+/// Built via :meth:`QueryBuilder.main_blocks`. The only terminal is
+/// :meth:`index_pairs`, returning ``(module_idx, [decl_idx, ...])``
+/// pairs into ``ctx.nodes()`` — one entry per file that has a main
+/// block, with ``decl_idx`` listing the top-level decls inside the
+/// block.
+#[pyclass(unsendable)]
+pub(crate) struct MainBlockQuery {
+    pub(crate) ctx: Py<ProjectContext>,
+}
+
+impl MainBlockQuery {
+    fn new(ctx: Py<ProjectContext>) -> Self {
+        Self { ctx }
+    }
+}
+
+#[pymethods]
+impl MainBlockQuery {
+    /// Terminal — ``(module_idx, [decl_idx, ...])`` pairs for every
+    /// file with a top-level ``if __name__ == "__main__":`` block.
+    /// Same scan as :meth:`ProjectContext.find_main_blocks_indices`,
+    /// returns indices into ``ctx.nodes()``.
+    fn index_pairs(&self, py: Python<'_>) -> PyResult<Vec<(usize, Vec<usize>)>> {
+        let ctx = self.ctx.borrow(py);
+        ctx.find_main_blocks_indices()
+    }
+
+    /// Iterate over ``(module_idx, [decl_idx, ...])`` pairs.
+    fn __iter__(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let pairs = self.index_pairs(py)?;
+        let list = pyo3::types::PyList::new_bound(py, pairs);
+        Ok(list.call_method0("__iter__")?.into())
+    }
+
+    fn count(&self, py: Python<'_>) -> PyResult<usize> {
+        Ok(self.index_pairs(py)?.len())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LiteralListQuery — per-variable string literal list lookup
+// ---------------------------------------------------------------------------
+
+/// Read the entries of a module-level string-literal list / tuple
+/// (typical use: ``__all__``, but works for any name). Built via
+/// :meth:`QueryBuilder.literal_lists`. Requires :meth:`for_fqn`; the
+/// only terminal is :meth:`entries`.
+///
+/// Returns the concatenation of entries from every matching decl,
+/// preserving declaration order. Returns ``None`` when the fqname
+/// isn't a module-level name or doesn't bind a string-literal list.
+#[pyclass(unsendable)]
+pub(crate) struct LiteralListQuery {
+    pub(crate) ctx: Py<ProjectContext>,
+    pub(crate) fqn: Option<String>,
+}
+
+impl LiteralListQuery {
+    fn new(ctx: Py<ProjectContext>) -> Self {
+        Self { ctx, fqn: None }
+    }
+}
+
+#[pymethods]
+impl LiteralListQuery {
+    fn for_fqn<'py>(mut slf: PyRefMut<'py, Self>, fqn: String) -> PyRefMut<'py, Self> {
+        slf.fqn = Some(fqn);
+        slf
+    }
+
+    /// Terminal — the list of string entries bound to ``fqn`` at
+    /// module scope, or ``None`` when no matching binding declares a
+    /// string-literal list / tuple.
+    fn entries(&self, py: Python<'_>) -> PyResult<Option<Vec<String>>> {
+        let ctx = self.ctx.borrow(py);
+        let fqn = self
+            .fqn
+            .as_deref()
+            .ok_or_else(|| PyValueError::new_err("LiteralListQuery requires .for_fqn(fqn)"))?;
+        ctx.find_literal_list_entries(fqn)
+    }
+}
 
 #[cfg(test)]
 mod tests {

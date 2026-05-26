@@ -22,8 +22,8 @@ class ModuleDundersPlugin(Plugin):
     """
 
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
-        for target in [
-            *ctx.find_module_dunders(),
-            *native.query(ctx).imports().of("__future__").collect(),
+        for target_idx in [
+            *native.query(ctx).modules().with_dunders().indices(),
+            *native.query(ctx).imports().of("__future__").indices(),
         ]:
-            yield native.AddEntrypoint(target, marker="<dunder>")
+            yield native.AddEntrypointByIdx(target_idx, marker="<dunder>")

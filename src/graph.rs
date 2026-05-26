@@ -254,11 +254,6 @@ pub(crate) type DeclKey = (File, ScopedPlaceId, (u32, u32));
 
 pub(crate) type DeclIndex = FxHashMap<DeclKey, usize>;
 
-/// Return type of `ProjectContext.find_main_blocks`: one entry per
-/// file with a top-level ``if __name__ == "__main__":`` block, paired
-/// with the decls that fall inside it.
-pub(crate) type MainBlock = (Py<SymbolNode>, Vec<Py<SymbolNode>>);
-
 /// Bit values stamped into [`SymbolNode::flags`]. Mirrors
 /// `dead_cst.graph.NodeFlags` exactly so plugin code can mix
 /// rust-emitted and libcst-emitted nodes.

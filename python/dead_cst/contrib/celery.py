@@ -8,7 +8,7 @@ from typing import Iterable
 
 from ..graph import NodeFlags
 from ..plugins._base import native
-from ..plugins.decl_shapes import DispatchAppPlugin
+from ..plugins.decl_shapes import DispatchAppGather, DispatchAppPlugin
 
 _SHARED_TASK_NAMES: frozenset[str] = frozenset({"shared_task"})
 
@@ -29,21 +29,28 @@ class CeleryPlugin(DispatchAppPlugin):
     app_classes: tuple[str, ...] = ("celery.Celery",)
     registration_decorators: frozenset[str] = frozenset({"task"})
 
-    def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
-        yield from DispatchAppPlugin.run(self, ctx)
-        # ``@shared_task`` is appless and not covered by DispatchAppPlugin.
-        by_path: dict[str, list[native.SymbolNode]] = {}
+    def policy(
+        self, ctx: native.ProjectContext, gathered: DispatchAppGather
+    ) -> Iterable[native.GraphOp]:
+        # Standard dispatch policy first, then Celery's appless
+        # ``@shared_task`` fan-out. Override on ``policy`` (not ``run``)
+        # so the harness's auto-batched gather still picks up the
+        # extension when CeleryPlugin sits alongside other dispatch
+        # plugins.
+        yield from super().policy(ctx, gathered)
+        by_path: dict[str, list[int]] = {}
         for ref in (
             native.query(ctx)
             .decorators()
             .where_module("celery")
             .where_name(list(_SHARED_TASK_NAMES))
+            .collect()
         ):
-            by_path.setdefault(ref.path, []).append(ref.decorated)
-        for path, targets in by_path.items():
-            yield native.AddNode(
+            by_path.setdefault(ref.path, []).append(ref.decorated_idx)
+        for path, target_idxs in by_path.items():
+            yield native.AddNodeByIdx(
                 fqname=f"{CELERY_SHARED_PREFIX}{Path(path).name}",
                 path=path,
                 flags=int(NodeFlags.ENTRYPOINT),
-                edges_to=targets,
+                edges_to_idx=target_idxs,
             )

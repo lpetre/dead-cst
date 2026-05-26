@@ -35,26 +35,29 @@ class ServerConfigPlugin(Plugin):
     filenames: tuple[str, ...] = _DEFAULT_FILENAMES
 
     def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
-        targets_by_path: dict[str, list[native.SymbolNode]] = {}
-        # Rust-side fold of the per-node basename + kind filter — saves
-        # the ``pathlib.Path(...).name`` allocation that dominates the
-        # Python-side loop on real codebases.
-        for n in (
+        targets_by_path: dict[str, list[int]] = {}
+        idxs = (
             native.query(ctx)
             .decls()
             .with_filenames(list(self.filenames))
             .with_kinds(list(_TARGET_KINDS))
-            .collect()
-        ):
-            targets_by_path.setdefault(n.path, []).append(n)
+            .indices()
+        )
+        if not idxs:
+            return
+        for idx, path in zip(idxs, ctx.node_paths(idxs), strict=True):
+            targets_by_path.setdefault(path, []).append(idx)
 
-        for path, targets in targets_by_path.items():
-            module = ctx.module_for(path)
-            if module is None:
-                continue
-            yield native.AddNode(
-                fqname=f"{SERVER_CONFIG_PREFIX}{module.fqname}",
+        paths = list(targets_by_path.keys())
+        module_idxs = ctx.modules_for_paths(paths)
+        present = [(p, idx) for p, idx in zip(paths, module_idxs) if idx is not None]
+        if not present:
+            return
+        module_attrs = ctx.node_attrs([idx for _p, idx in present])
+        for (path, _idx), attr in zip(present, module_attrs, strict=True):
+            yield native.AddNodeByIdx(
+                fqname=f"{SERVER_CONFIG_PREFIX}{attr.fqname}",
                 path=path,
                 flags=int(NodeFlags.ENTRYPOINT),
-                edges_to=targets,
+                edges_to_idx=targets_by_path[path],
             )

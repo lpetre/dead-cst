@@ -430,6 +430,71 @@ class _ProgressPoller:
                 )
 
 
+class _DispatchShim:
+    """Internal: wraps a :class:`DispatchAppPlugin` with a pre-computed
+    gather slot. Implements the bare :class:`Plugin` protocol so the
+    harness can drive it through the same threaded fan-out it uses for
+    every other plugin — ``run(ctx)`` returns ``plugin.policy(ctx,
+    gathered)`` instead of calling the plugin's own ``run`` (which
+    would kick off a per-spec gather).
+
+    Used only by :meth:`Analysis.materialize_all`'s dispatch-batching
+    path; never appears in user code.
+    """
+
+    name = "DispatchShim"
+    version = 1
+
+    def __init__(self, plugin: Any, gathered: Any) -> None:
+        self._plugin = plugin
+        self._gathered = gathered
+
+    def prepare(self, project_root: Path) -> None:
+        pass
+
+    def run(self, ctx: native.ProjectContext) -> Iterator[Any]:
+        if self._gathered is None:
+            return iter(())
+        return iter(self._plugin.policy(ctx, self._gathered))
+
+
+def _schedule_with_dispatch_batching(
+    ctx: native.ProjectContext, plugins: Sequence[Any]
+) -> list[Any]:
+    """Return a per-plugin work list with every
+    :class:`DispatchAppPlugin` replaced by a :class:`_DispatchShim`
+    that closes over its slot in a single fused gather.
+
+    Position-preserving: ``len(out) == len(plugins)`` and ``out[i]`` is
+    either ``plugins[i]`` (non-dispatch) or a shim that policy-emits
+    for ``plugins[i]``. The fused gather (:func:`_gather_batched`) runs
+    here on the main thread — once for every active dispatch plugin —
+    so the subsequent per-plugin fan-out only does ``policy(ctx, …)``
+    work in worker threads.
+
+    Inactive dispatch plugins (``_is_active(ctx)`` returns ``False``)
+    get a no-op shim with ``gathered=None`` so progress accounting
+    stays one-shim-per-plugin.
+    """
+    from .plugins.decl_shapes import DispatchAppPlugin, _gather_batched
+
+    dispatch_plugins = [p for p in plugins if isinstance(p, DispatchAppPlugin)]
+    if not dispatch_plugins:
+        return list(plugins)
+
+    active = [p for p in dispatch_plugins if p._is_active(ctx)]
+    if active:
+        gathered = _gather_batched(ctx, [p.spec for p in active])
+        gathered_by_id = {id(p): g for p, g in zip(active, gathered, strict=True)}
+    else:
+        gathered_by_id = {}
+
+    return [
+        _DispatchShim(p, gathered_by_id.get(id(p))) if isinstance(p, DispatchAppPlugin) else p
+        for p in plugins
+    ]
+
+
 def _make_indicatif_callback() -> ProgressCallback:
     """Default progress callback for ``show_progress=True``.
 
@@ -606,12 +671,23 @@ class Analysis:
             )
             poller.start()
 
-        # ``DEAD_CST_PLUGINS_SERIAL=1`` (or no plugins / a single
-        # plugin) keeps the rust-side serial loop. Otherwise we drive
-        # plugins from a ``ThreadPoolExecutor`` so any plugin time
-        # spent in GIL-releasing rust queries (``find_decorated_decls``,
-        # ``find_subclasses_of_class``, ``find_handler_decorators``, ...)
-        # overlaps across workers.
+        # The plugin loop has two modes:
+        #
+        # * **Rust-side serial loop** — ``ctx.materialize()`` drives the
+        #   build pass and every registered plugin's ``run(ctx)`` in
+        #   one C call. Used when ``DEAD_CST_PLUGINS_SERIAL=1`` or
+        #   ``len(plugins) <= 1`` AND no plugin needs a between-build-
+        #   and-run hook (the dispatch-batching path does).
+        # * **Python-driven loop** — ``ctx.build_only()`` runs the
+        #   build pass; Python then drives plugin ``run(ctx)`` calls
+        #   itself, either through a :class:`ThreadPoolExecutor` (so
+        #   GIL-releasing rust queries overlap) or serially when
+        #   ``DEAD_CST_PLUGINS_SERIAL=1``. Lets the harness insert a
+        #   between-build-and-run step: detect every
+        #   :class:`DispatchAppPlugin` instance, run one fused
+        #   ``_gather_batched`` for the whole batch, and replace each
+        #   dispatch plugin with a :class:`_DispatchShim` whose
+        #   ``run(ctx)`` returns ``plugin.policy(ctx, gathered)``.
         #
         # Both paths satisfy the *frozen-graph* contract: every
         # plugin's ``run(ctx)`` observes the same base-graph state.
@@ -621,13 +697,24 @@ class Analysis:
         # and to every other plugin's queries, until the apply pass
         # runs.
         try:
-            if _serial_mode() or len(self._plugins) <= 1:
+            from .plugins.decl_shapes import DispatchAppPlugin
+
+            has_dispatch = any(isinstance(p, DispatchAppPlugin) for p in self._plugins)
+            use_rust_serial = not has_dispatch and (_serial_mode() or len(self._plugins) <= 1)
+            if use_rust_serial:
                 for plugin in self._plugins:
                     ctx.add_plugin(plugin)
                 ctx.materialize()
             else:
                 ctx.build_only()
-                workers = _plugin_worker_count(len(self._plugins))
+                scheduled = (
+                    _schedule_with_dispatch_batching(ctx, self._plugins)
+                    if has_dispatch
+                    else list(self._plugins)
+                )
+                workers = 1 if _serial_mode() else _plugin_worker_count(len(scheduled))
+                # Progress names track the *original* plugins so users see
+                # ``FlaskPlugin`` etc. — shims are an implementation detail.
                 plugin_names = [type(p).__qualname__ for p in self._plugins]
                 ctx.progress_plugins_start(plugin_names)
                 try:
@@ -646,7 +733,7 @@ class Analysis:
                     # uses those to attribute ``plugin_end`` events to
                     # the right plugin even when futures resolve out of
                     # registration order).
-                    def _run_collect(idx: int, plugin: Plugin):
+                    def _run_collect(idx: int, plugin: Any):
                         ctx.progress_plugin_started(idx)
                         try:
                             return ctx.run_plugin_collect(plugin)
@@ -659,7 +746,7 @@ class Analysis:
                         thread_name_prefix="dead-cst-plugin",
                     ) as pool:
                         futures = [
-                            pool.submit(_run_collect, idx, p) for idx, p in enumerate(self._plugins)
+                            pool.submit(_run_collect, idx, p) for idx, p in enumerate(scheduled)
                         ]
                         collected = [fut.result() for fut in futures]
                     ctx.apply_ops_batched(collected)

@@ -42,15 +42,19 @@ mod query;
 
 use pyo3::prelude::*;
 
-use crate::builder::{AddEdge, AddEdgeByIdx, AddEntrypoint, AddNode, CollectedOps};
+use crate::builder::{
+    AddEdge, AddEdgeByIdx, AddEntrypoint, AddEntrypointByIdx, AddNode, AddNodeByIdx, CollectedOps,
+};
 use crate::graph::{EdgeFlags, Import, NativeGraph, NodeFlags, SymbolNode};
+use crate::helpers::{ArgLiteral, ArgNodeRef, ArgOpaque, NodeAttrs};
 use crate::io::{read_graph, write_graph, GraphMetadata};
 use crate::progress::ProgressHandle;
 use crate::project::{Project, ProjectContext};
 use crate::query::{
-    CallQuery, CallRef, ClassQuery, ConstructionQuery, ConstructionRef, DeclQuery, DecoratorQuery,
-    DecoratorRef, EdgeQuery, EdgeRef, FactoryQuery, FactoryRef, ImportQuery, QueryBuilder,
-    SubclassQuery,
+    CallIdxRef, CallQuery, ClassQuery, ConstructionIdxRef, ConstructionQuery, DeclQuery,
+    DeclarationsQuery, DecoratorIdxRef, DecoratorQuery, EdgeQuery, EdgeRef, FactoryIdxRef,
+    FactoryQuery, ImportQuery, LiteralListQuery, MainBlockQuery, ModuleQuery, QueryBuilder,
+    SubclassQuery, TraverseQuery,
 };
 
 // ---------------------------------------------------------------------------
@@ -76,25 +80,36 @@ fn dead_cst_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<AddEdge>()?;
     m.add_class::<AddEdgeByIdx>()?;
     m.add_class::<AddEntrypoint>()?;
+    m.add_class::<AddEntrypointByIdx>()?;
     m.add_class::<AddNode>()?;
+    m.add_class::<AddNodeByIdx>()?;
     m.add_class::<CollectedOps>()?;
     m.add_class::<NodeFlags>()?;
     m.add_class::<EdgeFlags>()?;
-    m.add_class::<DecoratorRef>()?;
-    m.add_class::<ConstructionRef>()?;
-    m.add_class::<CallRef>()?;
+    m.add_class::<DecoratorIdxRef>()?;
+    m.add_class::<ConstructionIdxRef>()?;
+    m.add_class::<CallIdxRef>()?;
+    m.add_class::<ArgLiteral>()?;
+    m.add_class::<ArgNodeRef>()?;
+    m.add_class::<ArgOpaque>()?;
+    m.add_class::<NodeAttrs>()?;
     m.add_class::<QueryBuilder>()?;
     m.add_class::<DecoratorQuery>()?;
     m.add_class::<ConstructionQuery>()?;
     m.add_class::<CallQuery>()?;
     m.add_class::<SubclassQuery>()?;
     m.add_class::<ImportQuery>()?;
+    m.add_class::<ModuleQuery>()?;
     m.add_class::<ClassQuery>()?;
     m.add_class::<FactoryQuery>()?;
-    m.add_class::<FactoryRef>()?;
+    m.add_class::<FactoryIdxRef>()?;
     m.add_class::<EdgeQuery>()?;
     m.add_class::<EdgeRef>()?;
     m.add_class::<DeclQuery>()?;
+    m.add_class::<DeclarationsQuery>()?;
+    m.add_class::<MainBlockQuery>()?;
+    m.add_class::<LiteralListQuery>()?;
+    m.add_class::<TraverseQuery>()?;
     m.add_class::<GraphMetadata>()?;
     m.add_class::<ProgressHandle>()?;
     m.add_function(wrap_pyfunction!(query_fn, m)?)?;

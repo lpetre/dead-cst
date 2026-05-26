@@ -32,51 +32,74 @@ class ClickPlugin(DecoratedDeclPlugin):
         if not native.query(ctx).imports().of(self.decorator_module).exists():
             return
 
-        groups_by_owner: dict[tuple[str, str], list[native.SymbolNode]] = {}
+        # groups_by_owner: (path, simple_name) -> [group_idx, ...]
+        groups_by_owner: dict[tuple[str, str], list[int]] = {}
 
-        def add_group(node: native.SymbolNode) -> None:
-            simple = node.fqname.rsplit(".", 1)[-1]
-            groups_by_owner.setdefault((node.path, simple), []).append(node)
+        def add_group(node_idx: int, path: str, fqname: str) -> None:
+            simple = fqname.rsplit(".", 1)[-1]
+            groups_by_owner.setdefault((path, simple), []).append(node_idx)
 
-        for dec_ref in (
+        dec_rows = (
             native.query(ctx)
             .decorators()
             .where_module(self.decorator_module)
             .where_name(list(self.decorator_names))
-        ):
-            add_group(dec_ref.decorated)
-        for cons_ref in (
+            .collect()
+        )
+        if dec_rows:
+            dec_attrs = ctx.node_attrs([r.decorated_idx for r in dec_rows])
+            for row, attr in zip(dec_rows, dec_attrs, strict=True):
+                add_group(row.decorated_idx, row.path, attr.fqname)
+
+        cons_rows = (
             native.query(ctx)
             .constructions()
             .where_module(self.decorator_module)
             .where_name(list(self.constructor_names))
-        ):
-            add_group(cons_ref.var)
+            .collect()
+        )
+        if cons_rows:
+            cons_attrs = ctx.node_attrs([r.var_idx for r in cons_rows])
+            for row, attr in zip(cons_rows, cons_attrs, strict=True):
+                add_group(row.var_idx, row.path, attr.fqname)
 
-        handlers: list[tuple[str, native.SymbolNode]] = [
-            (h.decorator_owner or "", h.decorated)
-            for h in native.query(ctx).decorators().where_owner_attr(list(_REGISTRATION_DECORATORS))
-        ]
-        # Precompute (path, fqname, owner_name) triples for handlers
-        # decorated with the subgroup decorator — used inside the
-        # fixpoint to upgrade a handler to a group when its owner is
-        # already known. Querying inside the loop would be O(N²).
-        subgroup_links: set[tuple[str, str, str]] = {
-            (h.decorated.path, h.decorated.fqname, h.decorator_owner or "")
-            for h in native.query(ctx).decorators().where_owner_attr(list(_SUBGROUP_DECORATOR))
+        handler_rows = list(
+            native.query(ctx)
+            .decorators()
+            .where_owner_attr(list(_REGISTRATION_DECORATORS))
+            .collect()
+        )
+        # Batched fqname fetch for every handler — used both in the
+        # fixpoint dispatch and for the subgroup_links key.
+        handler_attrs = (
+            ctx.node_attrs([h.decorated_idx for h in handler_rows]) if handler_rows else []
+        )
+        handler_fqnames = [attr.fqname for attr in handler_attrs]
+
+        # Set of (decorated_idx, owner_name) pairs from the subgroup
+        # decorator — used inside the fixpoint to upgrade a handler to
+        # a group when its owner is already known.
+        subgroup_links: set[tuple[int, str]] = {
+            (h.decorated_idx, h.decorator_owner or "")
+            for h in native.query(ctx)
+            .decorators()
+            .where_owner_attr(list(_SUBGROUP_DECORATOR))
+            .collect()
         }
 
-        emitted: set[tuple[str, str, str, str]] = set()
+        # Dedup by (owner_idx, handler_idx) — idx is globally unique.
+        emitted: set[tuple[int, int]] = set()
         changed = True
         while changed:
             changed = False
-            for owner_name, handler_func in handlers:
-                for owner in groups_by_owner.get((handler_func.path, owner_name), []):
-                    key = (owner.path, owner.fqname, handler_func.path, handler_func.fqname)
+            for h, handler_fqname in zip(handler_rows, handler_fqnames, strict=True):
+                owner_name = h.decorator_owner or ""
+                for owner_idx in groups_by_owner.get((h.path, owner_name), []):
+                    key = (owner_idx, h.decorated_idx)
                     if key in emitted:
                         continue
                     emitted.add(key)
-                    yield native.AddEdge(owner, handler_func)
-                    if (handler_func.path, handler_func.fqname, owner_name) in subgroup_links:
-                        add_group(handler_func)
+                    yield native.AddEdgeByIdx(owner_idx, h.decorated_idx)
+                    if (h.decorated_idx, owner_name) in subgroup_links:
+                        add_group(h.decorated_idx, h.path, handler_fqname)
                         changed = True
