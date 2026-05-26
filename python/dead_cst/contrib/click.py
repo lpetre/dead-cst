@@ -48,8 +48,8 @@ class ClickPlugin(DecoratedDeclPlugin):
         )
         if dec_rows:
             dec_attrs = ctx.node_attrs([r.decorated_idx for r in dec_rows])
-            for row, (_k, _p, fqname, _f) in zip(dec_rows, dec_attrs, strict=True):
-                add_group(row.decorated_idx, row.path, fqname)
+            for row, attr in zip(dec_rows, dec_attrs, strict=True):
+                add_group(row.decorated_idx, row.path, attr.fqname)
 
         cons_rows = (
             native.query(ctx)
@@ -60,8 +60,8 @@ class ClickPlugin(DecoratedDeclPlugin):
         )
         if cons_rows:
             cons_attrs = ctx.node_attrs([r.var_idx for r in cons_rows])
-            for row, (_k, _p, fqname, _f) in zip(cons_rows, cons_attrs, strict=True):
-                add_group(row.var_idx, row.path, fqname)
+            for row, attr in zip(cons_rows, cons_attrs, strict=True):
+                add_group(row.var_idx, row.path, attr.fqname)
 
         handler_rows = list(
             native.query(ctx)
@@ -74,7 +74,7 @@ class ClickPlugin(DecoratedDeclPlugin):
         handler_attrs = (
             ctx.node_attrs([h.decorated_idx for h in handler_rows]) if handler_rows else []
         )
-        handler_fqnames = [fq for (_k, _p, fq, _f) in handler_attrs]
+        handler_fqnames = [attr.fqname for attr in handler_attrs]
 
         # Set of (decorated_idx, owner_name) pairs from the subgroup
         # decorator — used inside the fixpoint to upgrade a handler to

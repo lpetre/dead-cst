@@ -3769,10 +3769,10 @@ impl ProjectContext {
         &self,
         py: Python<'_>,
         indices: Vec<usize>,
-    ) -> PyResult<Vec<(String, String, String, u32)>> {
+    ) -> PyResult<Vec<crate::helpers::NodeAttrs>> {
         let outputs = self.materialized("node_attrs")?;
         let len = outputs.builder.nodes.len();
-        let mut out: Vec<(String, String, String, u32)> = Vec::with_capacity(indices.len());
+        let mut out: Vec<crate::helpers::NodeAttrs> = Vec::with_capacity(indices.len());
         for idx in indices {
             if idx >= len {
                 return Err(pyo3::exceptions::PyIndexError::new_err(format!(
@@ -3780,12 +3780,12 @@ impl ProjectContext {
                 )));
             }
             let node = outputs.builder.nodes[idx].borrow(py);
-            out.push((
-                node.kind.to_string(),
-                node.path.clone(),
-                node.fqname.clone(),
-                node.flags,
-            ));
+            out.push(crate::helpers::NodeAttrs {
+                kind: node.kind.to_string(),
+                path: node.path.clone(),
+                fqname: node.fqname.clone(),
+                flags: node.flags,
+            });
         }
         Ok(out)
     }

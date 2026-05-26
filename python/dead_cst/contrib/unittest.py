@@ -68,11 +68,9 @@ class UnittestPlugin(Plugin):
         if not present_modules:
             return
         module_attrs = ctx.node_attrs([idx for _p, idx in present_modules])
-        for (path, _idx), (_k, _p, module_fqname, _f) in zip(
-            present_modules, module_attrs, strict=True
-        ):
+        for (path, _idx), attr in zip(present_modules, module_attrs, strict=True):
             yield native.AddNodeByIdx(
-                fqname=f"{UNITTEST_PREFIX}{module_fqname}",
+                fqname=f"{UNITTEST_PREFIX}{attr.fqname}",
                 path=path,
                 flags=flags,
                 edges_to_idx=decls_by_path[path],

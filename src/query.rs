@@ -7,7 +7,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::PyClass;
 use ruff_db::files::File;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use ty_project::Db as ProjectDb;
 
 use crate::graph::SymbolNode;
@@ -435,6 +435,23 @@ where
     result.into_inner().unwrap_or_default()
 }
 
+/// Bucket a list of node indices by their owning path. Shared by
+/// every Tier-1 query's ``.indices_by_path()`` terminal. One
+/// :meth:`ProjectContext.node_paths` lookup fans the indices into
+/// per-path bins.
+pub(crate) fn _bucket_indices_by_path(
+    ctx: &ProjectContext,
+    py: Python<'_>,
+    indices: Vec<usize>,
+) -> PyResult<FxHashMap<String, Vec<usize>>> {
+    let paths = ctx.node_paths(py, indices.clone())?;
+    let mut buckets: FxHashMap<String, Vec<usize>> = FxHashMap::default();
+    for (idx, path) in indices.into_iter().zip(paths.into_iter()) {
+        buckets.entry(path).or_default().push(idx);
+    }
+    Ok(buckets)
+}
+
 pub(crate) fn _to_iter(py: Python<'_>, items: Vec<Py<impl PyClass>>) -> PyResult<PyObject> {
     let list = pyo3::types::PyList::new_bound(py, items);
     let iter_obj = list.call_method0("__iter__")?;
@@ -535,7 +552,7 @@ impl DecoratorQuery {
             in_decl_idx: None,
             path_regex: None,
             kwarg_matchers: Vec::new(),
-            with_args: true,
+            with_args: false,
         }
     }
 }
@@ -593,14 +610,14 @@ impl DecoratorQuery {
         slf
     }
 
-    /// Opt out of rust-side ``args`` / ``kwargs`` extraction.
-    /// ``with_args(False)`` skips the per-row
-    /// :fn:`extract_call_args_kwargs` walk; row ``args`` / ``kwargs``
-    /// getters then surface empty containers. Useful for plugins that
-    /// only need the row's idx + metadata strings — saves rust-side
-    /// allocation per matched row. Forced back to ``True`` at row-
-    /// collection time when any ``where_kwarg`` is set (kwarg filtering
-    /// needs the data).
+    /// Opt in to rust-side ``args`` / ``kwargs`` extraction.
+    /// Defaults to ``False`` — the per-row
+    /// :fn:`extract_call_args_kwargs` walk is skipped, and row
+    /// ``args`` / ``kwargs`` getters surface empty containers.
+    /// Pass ``True`` when a plugin actually reads ``args`` /
+    /// ``kwargs`` off the matched rows. Forced back to ``True`` at
+    /// row-collection time when any ``where_kwarg`` is set (kwarg
+    /// filtering needs the data).
     fn with_args<'py>(mut slf: PyRefMut<'py, Self>, value: bool) -> PyRefMut<'py, Self> {
         slf.with_args = value;
         slf
@@ -653,6 +670,23 @@ impl DecoratorQuery {
             )?);
         }
         Ok(out)
+    }
+
+    /// Terminal — group matched ``decorated_idx`` values by their
+    /// owning file path. Reads ``path`` straight off each row (no
+    /// extra :meth:`ProjectContext.node_paths` lookup). Useful for
+    /// plugins that fan out per-file work without re-querying.
+    fn indices_by_path(&self, py: Python<'_>) -> PyResult<FxHashMap<String, Vec<usize>>> {
+        let rows = self.decorator_rows(py)?;
+        let ctx = self.ctx.borrow(py);
+        let outputs = ctx.materialized("DecoratorQuery.indices_by_path")?;
+        let nodes: &[Py<SymbolNode>] = &outputs.builder.nodes;
+        let mut buckets: FxHashMap<String, Vec<usize>> = FxHashMap::default();
+        for row in rows {
+            let path = nodes[row.decorated_idx].borrow(py).path.clone();
+            buckets.entry(path).or_default().push(row.decorated_idx);
+        }
+        Ok(buckets)
     }
 }
 
@@ -837,7 +871,7 @@ impl ConstructionQuery {
             class_fqn: None,
             include_subclasses: false,
             path_regex: None,
-            with_args: true,
+            with_args: false,
         }
     }
 }
@@ -875,8 +909,9 @@ impl ConstructionQuery {
         slf
     }
 
-    /// Opt out of rust-side ``args`` / ``kwargs`` extraction; see
-    /// :meth:`DecoratorQuery.with_args` for the trade-off.
+    /// Opt in to rust-side ``args`` / ``kwargs`` extraction; see
+    /// :meth:`DecoratorQuery.with_args` for the contract. Defaults
+    /// to ``False``.
     fn with_args<'py>(mut slf: PyRefMut<'py, Self>, value: bool) -> PyRefMut<'py, Self> {
         slf.with_args = value;
         slf
@@ -907,6 +942,22 @@ impl ConstructionQuery {
             )?);
         }
         Ok(out)
+    }
+
+    /// Terminal — group matched ``var_idx`` values by their owning
+    /// file path. Reads ``path`` straight off each row (no extra
+    /// :meth:`ProjectContext.node_paths` lookup).
+    fn indices_by_path(&self, py: Python<'_>) -> PyResult<FxHashMap<String, Vec<usize>>> {
+        let rows = self.construction_rows(py)?;
+        let ctx = self.ctx.borrow(py);
+        let outputs = ctx.materialized("ConstructionQuery.indices_by_path")?;
+        let nodes: &[Py<SymbolNode>] = &outputs.builder.nodes;
+        let mut buckets: FxHashMap<String, Vec<usize>> = FxHashMap::default();
+        for row in rows {
+            let path = nodes[row.var_idx].borrow(py).path.clone();
+            buckets.entry(path).or_default().push(row.var_idx);
+        }
+        Ok(buckets)
     }
 }
 
@@ -998,7 +1049,7 @@ impl CallQuery {
             required_positional: None,
             path_regex: None,
             kwarg_matchers: Vec::new(),
-            with_args: true,
+            with_args: false,
         }
     }
 }
@@ -1092,6 +1143,22 @@ impl CallQuery {
             )?);
         }
         Ok(out)
+    }
+
+    /// Terminal — group matched ``owner_idx`` values by their owning
+    /// file path. Reads ``path`` straight off each row (no extra
+    /// :meth:`ProjectContext.node_paths` lookup).
+    fn indices_by_path(&self, py: Python<'_>) -> PyResult<FxHashMap<String, Vec<usize>>> {
+        let rows = self.call_rows(py)?;
+        let ctx = self.ctx.borrow(py);
+        let outputs = ctx.materialized("CallQuery.indices_by_path")?;
+        let nodes: &[Py<SymbolNode>] = &outputs.builder.nodes;
+        let mut buckets: FxHashMap<String, Vec<usize>> = FxHashMap::default();
+        for row in rows {
+            let path = nodes[row.owner_idx].borrow(py).path.clone();
+            buckets.entry(path).or_default().push(row.owner_idx);
+        }
+        Ok(buckets)
     }
 }
 
@@ -1229,6 +1296,27 @@ impl SubclassQuery {
             ))
         }
     }
+
+    /// Terminal — :class:`NodeAttrs` for every matched subclass, in
+    /// the same order :meth:`indices` returns.
+    fn attrs(&self, py: Python<'_>) -> PyResult<Vec<crate::helpers::NodeAttrs>> {
+        let indices = self.indices(py)?;
+        let ctx = self.ctx.borrow(py);
+        ctx.node_attrs(py, indices)
+    }
+
+    /// Terminal — first matched subclass's positional index, or
+    /// ``None`` when no subclass exists.
+    fn first_idx(&self, py: Python<'_>) -> PyResult<Option<usize>> {
+        Ok(self.indices(py)?.into_iter().next())
+    }
+
+    /// Terminal — group matched indices by their owning file path.
+    fn indices_by_path(&self, py: Python<'_>) -> PyResult<FxHashMap<String, Vec<usize>>> {
+        let indices = self.indices(py)?;
+        let ctx = self.ctx.borrow(py);
+        _bucket_indices_by_path(&ctx, py, indices)
+    }
 }
 
 impl_query_methods!(no_first SubclassQuery);
@@ -1283,6 +1371,27 @@ impl ImportQuery {
     /// length of the pre-built index entry directly.
     fn count(&self, py: Python<'_>) -> PyResult<usize> {
         Ok(self.ctx.borrow(py).imports_of_count(self.module_or_err()?))
+    }
+
+    /// Terminal — :class:`NodeAttrs` for every matched import node,
+    /// in the same order :meth:`indices` returns.
+    fn attrs(&self, py: Python<'_>) -> PyResult<Vec<crate::helpers::NodeAttrs>> {
+        let indices = self.indices(py)?;
+        let ctx = self.ctx.borrow(py);
+        ctx.node_attrs(py, indices)
+    }
+
+    /// Terminal — first matched import node's positional index, or
+    /// ``None`` when no project file imports the configured module.
+    fn first_idx(&self, py: Python<'_>) -> PyResult<Option<usize>> {
+        Ok(self.indices(py)?.into_iter().next())
+    }
+
+    /// Terminal — group matched indices by their owning file path.
+    fn indices_by_path(&self, py: Python<'_>) -> PyResult<FxHashMap<String, Vec<usize>>> {
+        let indices = self.indices(py)?;
+        let ctx = self.ctx.borrow(py);
+        _bucket_indices_by_path(&ctx, py, indices)
     }
 }
 
@@ -1418,6 +1527,24 @@ impl ModuleQuery {
     fn count(&self, py: Python<'_>) -> PyResult<usize> {
         Ok(self.indices(py)?.len())
     }
+
+    /// Terminal — :class:`NodeAttrs` for every matched index, in the
+    /// same order :meth:`indices` returns. Avoids the boilerplate of
+    /// ``ctx.node_attrs(q.indices())``.
+    fn attrs(&self, py: Python<'_>) -> PyResult<Vec<crate::helpers::NodeAttrs>> {
+        let indices = self.indices(py)?;
+        let ctx = self.ctx.borrow(py);
+        ctx.node_attrs(py, indices)
+    }
+
+    /// Terminal — group matched indices by their owning file path.
+    /// Returns ``dict[path, list[int]]``; one
+    /// :meth:`ProjectContext.node_paths` call internally.
+    fn indices_by_path(&self, py: Python<'_>) -> PyResult<FxHashMap<String, Vec<usize>>> {
+        let indices = self.indices(py)?;
+        let ctx = self.ctx.borrow(py);
+        _bucket_indices_by_path(&ctx, py, indices)
+    }
 }
 
 impl ModuleQuery {
@@ -1432,7 +1559,7 @@ impl ModuleQuery {
                 return Ok(None);
             };
             let attrs = ctx.node_attrs(py, vec![idx])?;
-            return Ok(attrs.into_iter().next().map(|(_k, _p, fqname, _f)| fqname));
+            return Ok(attrs.into_iter().next().map(|a| a.fqname));
         }
         Err(PyValueError::new_err(
             "ModuleQuery requires one of: .with_fqn(...), .with_path(...), .with_dunders()",
@@ -1484,6 +1611,27 @@ impl ClassQuery {
             .as_deref()
             .ok_or_else(|| PyValueError::new_err("ClassQuery requires .defining_method(name)"))?;
         ctx.find_classes_defining_method_indices(py, name)
+    }
+
+    /// Terminal — :class:`NodeAttrs` for every matched class, in the
+    /// same order :meth:`indices` returns.
+    fn attrs(&self, py: Python<'_>) -> PyResult<Vec<crate::helpers::NodeAttrs>> {
+        let indices = self.indices(py)?;
+        let ctx = self.ctx.borrow(py);
+        ctx.node_attrs(py, indices)
+    }
+
+    /// Terminal — first matched class's positional index, or ``None``
+    /// when no class defines the configured method.
+    fn first_idx(&self, py: Python<'_>) -> PyResult<Option<usize>> {
+        Ok(self.indices(py)?.into_iter().next())
+    }
+
+    /// Terminal — group matched indices by their owning file path.
+    fn indices_by_path(&self, py: Python<'_>) -> PyResult<FxHashMap<String, Vec<usize>>> {
+        let indices = self.indices(py)?;
+        let ctx = self.ctx.borrow(py);
+        _bucket_indices_by_path(&ctx, py, indices)
     }
 }
 
@@ -1554,6 +1702,22 @@ impl FactoryQuery {
             )?);
         }
         Ok(out)
+    }
+
+    /// Terminal — group matched ``decl_idx`` values by their owning
+    /// file path. Reads ``path`` straight off each row (no extra
+    /// :meth:`ProjectContext.node_paths` lookup).
+    fn indices_by_path(&self, py: Python<'_>) -> PyResult<FxHashMap<String, Vec<usize>>> {
+        let pairs = self.factory_rows(py)?;
+        let ctx = self.ctx.borrow(py);
+        let outputs = ctx.materialized("FactoryQuery.indices_by_path")?;
+        let nodes: &[Py<SymbolNode>] = &outputs.builder.nodes;
+        let mut buckets: FxHashMap<String, Vec<usize>> = FxHashMap::default();
+        for (decl_idx, _kinds) in pairs {
+            let path = nodes[decl_idx].borrow(py).path.clone();
+            buckets.entry(path).or_default().push(decl_idx);
+        }
+        Ok(buckets)
     }
 }
 
@@ -2153,6 +2317,34 @@ impl DeclQuery {
         }
         Ok(out)
     }
+
+    /// Terminal — :class:`NodeAttrs` (``kind`` / ``path`` / ``fqname``
+    /// / ``flags``) for every surviving node, in the same order
+    /// :meth:`indices` returns. Avoids the boilerplate of
+    /// ``ctx.node_attrs(q.indices())``.
+    fn attrs(&self, py: Python<'_>) -> PyResult<Vec<crate::helpers::NodeAttrs>> {
+        let indices = self.indices(py)?;
+        let ctx = self.ctx.borrow(py);
+        ctx.node_attrs(py, indices)
+    }
+
+    /// Terminal — first matching node's positional index, or ``None``
+    /// when no node matches. Convenience for single-value lookups
+    /// (e.g. fqname-prefix queries that should match at most one
+    /// decl).
+    fn first_idx(&self, py: Python<'_>) -> PyResult<Option<usize>> {
+        Ok(self.indices(py)?.into_iter().next())
+    }
+
+    /// Terminal — group matched indices by their owning file path.
+    /// Returns ``dict[path, list[int]]``; one
+    /// :meth:`ProjectContext.node_paths` call internally. Lets
+    /// plugins fan out per-file work without re-querying.
+    fn indices_by_path(&self, py: Python<'_>) -> PyResult<FxHashMap<String, Vec<usize>>> {
+        let indices = self.indices(py)?;
+        let ctx = self.ctx.borrow(py);
+        _bucket_indices_by_path(&ctx, py, indices)
+    }
 }
 
 impl_query_methods!(no_first DeclQuery);
@@ -2281,6 +2473,31 @@ impl DeclarationsQuery {
 
     fn count(&self, py: Python<'_>) -> PyResult<usize> {
         Ok(self.indices(py)?.len())
+    }
+
+    /// Terminal — :class:`NodeAttrs` for every matched decl, in the
+    /// same order :meth:`indices` returns. Modules are excluded (same
+    /// rule as :meth:`indices`); use :meth:`resolve_idx` +
+    /// :meth:`ProjectContext.node_attrs` if you need the module
+    /// fallback's attrs.
+    fn attrs(&self, py: Python<'_>) -> PyResult<Vec<crate::helpers::NodeAttrs>> {
+        let indices = self.indices(py)?;
+        let ctx = self.ctx.borrow(py);
+        ctx.node_attrs(py, indices)
+    }
+
+    /// Terminal — first matched decl's positional index, or ``None``
+    /// when no decl matches. Distinct from :meth:`resolve_idx`: this
+    /// one skips the module fallback.
+    fn first_idx(&self, py: Python<'_>) -> PyResult<Option<usize>> {
+        Ok(self.indices(py)?.into_iter().next())
+    }
+
+    /// Terminal — group matched indices by their owning file path.
+    fn indices_by_path(&self, py: Python<'_>) -> PyResult<FxHashMap<String, Vec<usize>>> {
+        let indices = self.indices(py)?;
+        let ctx = self.ctx.borrow(py);
+        _bucket_indices_by_path(&ctx, py, indices)
     }
 }
 

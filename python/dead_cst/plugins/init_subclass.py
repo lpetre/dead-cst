@@ -26,13 +26,11 @@ class InitSubclassPlugin(Plugin):
         # One batched attr fetch per matched parent — pulls fqname / path
         # in a single FFI hop instead of N per-attribute borrows.
         attrs = ctx.node_attrs(parent_idxs)
-        for parent_idx, (_kind, parent_path, parent_fqname, _flags) in zip(
-            parent_idxs, attrs, strict=True
-        ):
+        for parent_idx, attr in zip(parent_idxs, attrs, strict=True):
             subclass_idxs = native.query(ctx).subclasses().of_idx(parent_idx).indices()
             yield native.AddNodeByIdx(
-                fqname=f"{INIT_SUBCLASS_PREFIX}{parent_fqname}",
-                path=parent_path,
+                fqname=f"{INIT_SUBCLASS_PREFIX}{attr.fqname}",
+                path=attr.path,
                 edges_from_idx=[parent_idx],
                 edges_to_idx=subclass_idxs,
             )

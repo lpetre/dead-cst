@@ -10,6 +10,27 @@ two versions.
 ## [Unreleased]
 
 ### Added
+- Uniform terminal set on every Tier-1 query stream (`DeclQuery`,
+  `ModuleQuery`, `SubclassQuery`, `ImportQuery`, `ClassQuery`,
+  `DeclarationsQuery`):
+  - `.attrs() -> list[NodeAttrs]` — :class:`NodeAttrs` for every
+    matched index. Folds the `ctx.node_attrs(q.indices())`
+    boilerplate into a single chainable call.
+  - `.first_idx() -> int | None` — first matched index or `None`.
+    `ModuleQuery` already had this; the rest gain it.
+  - `.indices_by_path() -> dict[str, list[int]]` — group matched
+    indices by their owning file path. One `ctx.node_paths` lookup
+    internally; lets plugins fan out per-file work without
+    re-querying.
+- `indices_by_path()` on every Tier-2 row query (`DecoratorQuery`,
+  `ConstructionQuery`, `CallQuery`, `FactoryQuery`). Bucketing reads
+  `path` straight off each row — no extra FFI hop.
+- `NodeAttrs` — tuple-like pyclass returned by
+  `ProjectContext.node_attrs()` and every `.attrs()` terminal.
+  Supports attribute access (`attr.fqname`) AND tuple semantics
+  (`kind, path, fqname, flags = attr`; `attr[2]`; `len(attr) == 4`).
+  Not a `typing.NamedTuple` instance but drop-in compatible for
+  unpacking and subscript.
 - `Analysis` auto-batches `DispatchAppPlugin` instances. Registering
   multiple dispatch plugins with `Analysis` now triggers a single
   fused `_gather_batched` on the main thread between the build pass
@@ -66,6 +87,22 @@ two versions.
   old `list[Any]` shape that mixed primitives and `SymbolNode` refs.
   Embedded decl references surface as `ArgNodeRef(idx=...)` rather
   than `Py<SymbolNode>` — keeps the idx surface honest end-to-end.
+
+### Changed
+- `DecoratorQuery.with_args` / `ConstructionQuery.with_args` /
+  `CallQuery.with_args` flipped from opt-out to opt-in. Default is
+  now `False` — the per-row `extract_call_args_kwargs` walk is
+  skipped and row `args` / `kwargs` getters surface empty
+  containers. Plugins that actually read `args` / `kwargs` off rows
+  must call `.with_args(True)`. The kwarg filter (`.where_kwarg`)
+  still forces extraction back on, so kwarg-filtered queries don't
+  need the explicit opt-in.
+- `ProjectContext.node_attrs(indices)` now returns `list[NodeAttrs]`
+  (the new tuple-like pyclass) instead of `list[tuple[str, str, str,
+  int]]`. Existing destructure callers (`(kind, path, fqname, flags)
+  = attr`) keep working via `__iter__`; subscript (`attr[2]`) keeps
+  working via `__getitem__`. Plugins that prefer attribute access
+  (`attr.fqname`) get that too.
 
 ### Removed
 - `BatchDispatchAppPlugin` — `Analysis` auto-batches every registered

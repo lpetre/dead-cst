@@ -53,8 +53,8 @@ class PytestPlugin(Plugin):
             attrs = ctx.node_attrs(test_idxs)
             keep = [
                 idx
-                for idx, (kind, _p, fqname, _f) in zip(test_idxs, attrs, strict=True)
-                if _is_test_decl(kind, fqname)
+                for idx, attr in zip(test_idxs, attrs, strict=True)
+                if _is_test_decl(attr.kind, attr.fqname)
             ]
             if keep:
                 test_filtered_by_path[path] = keep
@@ -106,10 +106,7 @@ def _module_fqnames(ctx: native.ProjectContext, paths: list[str]) -> dict[str, s
     if not present:
         return {}
     module_attrs = ctx.node_attrs([m for _p, m in present])
-    return {
-        path: module_fqname
-        for (path, _m), (_k, _p, module_fqname, _f) in zip(present, module_attrs, strict=True)
-    }
+    return {path: attr.fqname for (path, _m), attr in zip(present, module_attrs, strict=True)}
 
 
 def _mark_seed(

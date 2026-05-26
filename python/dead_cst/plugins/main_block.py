@@ -28,12 +28,10 @@ class MainBlockPlugin(Plugin):
         # Batch-fetch (fqname, path) for every matched module in one hop.
         module_idxs = [m for (m, _decls) in pairs]
         module_attrs = ctx.node_attrs(module_idxs)
-        for (module_idx, decl_idxs), (_kind, module_path, module_fqname, _flags) in zip(
-            pairs, module_attrs, strict=True
-        ):
+        for (module_idx, decl_idxs), attr in zip(pairs, module_attrs, strict=True):
             yield native.AddNodeByIdx(
-                fqname=f"{MAIN_BLOCK_PREFIX}{module_fqname}",
-                path=module_path,
+                fqname=f"{MAIN_BLOCK_PREFIX}{attr.fqname}",
+                path=attr.path,
                 flags=int(NodeFlags.ENTRYPOINT),
                 edges_to_idx=[module_idx, *decl_idxs],
             )

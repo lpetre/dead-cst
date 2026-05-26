@@ -799,7 +799,7 @@ class ProjectContext:
         """
         ...
 
-    def node_attrs(self, indices: Sequence[int]) -> list[tuple[NodeKind, str, str, int]]:
+    def node_attrs(self, indices: Sequence[int]) -> list[NodeAttrs]:
         """Batched snapshot of ``(kind, path, fqname, flags)`` per
         index. One FFI hop instead of N per-attribute ``borrow``
         round-trips — lets plugins that filter or partition by these
@@ -995,6 +995,26 @@ class ArgOpaque:
     """
 
     def __init__(self) -> None: ...
+
+class NodeAttrs:
+    """Tuple-like row returned by :meth:`ProjectContext.node_attrs`
+    and every query's ``.attrs()`` terminal.
+
+    Supports both attribute access (``attr.fqname``) and tuple
+    semantics (``kind, path, fqname, flags = attr``; ``attr[2]``;
+    ``len(attr) == 4``; ``list(attr)``). Not a `typing.NamedTuple`
+    instance, but drop-in compatible for unpacking and subscript.
+    Frozen — fields are immutable once constructed.
+    """
+
+    kind: NodeKind
+    path: str
+    fqname: str
+    flags: int
+
+    def __len__(self) -> int: ...
+    def __getitem__(self, idx: int) -> Any: ...
+    def __iter__(self) -> Iterator[Any]: ...
 
 CallArg = ArgLiteral | ArgNodeRef | ArgOpaque
 """Discriminated-union type for entries inside the lazy ``args`` /
@@ -1214,13 +1234,13 @@ class DecoratorQuery:
         ...
 
     def with_args(self, value: bool) -> DecoratorQuery:
-        """Opt out of rust-side ``args`` / ``kwargs`` extraction.
+        """Opt in to rust-side ``args`` / ``kwargs`` extraction.
 
-        Defaults to ``True``. When set to ``False`` the per-row
-        :fn:`extract_call_args_kwargs` walk is skipped — the row's
-        ``args`` / ``kwargs`` getters then surface empty containers.
-        Useful for plugins that only need the row's idx + metadata
-        strings; saves rust-side allocation per matched row.
+        Defaults to ``False`` — the per-row
+        :fn:`extract_call_args_kwargs` walk is skipped, and the
+        row's ``args`` / ``kwargs`` getters surface empty containers.
+        Pass ``True`` when a plugin actually reads ``args`` /
+        ``kwargs`` off the matched rows.
 
         Auto-forced back to ``True`` at row-collection time when any
         ``where_kwarg`` is set (kwarg filtering needs the data).
@@ -1231,6 +1251,12 @@ class DecoratorQuery:
     def first(self) -> DecoratorIdxRef | None: ...
     def count(self) -> int: ...
     def __iter__(self) -> Iterator[DecoratorIdxRef]: ...
+    def indices_by_path(self) -> dict[str, list[int]]:
+        """Terminal — group matched ``decorated_idx`` values by their
+        owning file path. ``dict[path, list[int]]``; reads ``path``
+        straight off each row.
+        """
+        ...
 
 class ConstructionQuery:
     """Find module-scope ``<var> = <Ctor>(...)`` sites."""
@@ -1255,6 +1281,11 @@ class ConstructionQuery:
     def first(self) -> ConstructionIdxRef | None: ...
     def count(self) -> int: ...
     def __iter__(self) -> Iterator[ConstructionIdxRef]: ...
+    def indices_by_path(self) -> dict[str, list[int]]:
+        """Terminal — group matched ``var_idx`` values by their owning
+        file path.
+        """
+        ...
 
 class CallQuery:
     """Find call sites with a captured positional string-literal arg.
@@ -1298,6 +1329,11 @@ class CallQuery:
     def first(self) -> CallIdxRef | None: ...
     def count(self) -> int: ...
     def __iter__(self) -> Iterator[CallIdxRef]: ...
+    def indices_by_path(self) -> dict[str, list[int]]:
+        """Terminal — group matched ``owner_idx`` values by their
+        owning file path.
+        """
+        ...
 
 class SubclassQuery:
     """Walk the subclass closure of a class.
@@ -1329,6 +1365,25 @@ class SubclassQuery:
         """
         ...
 
+    def attrs(self) -> list[NodeAttrs]:
+        """Terminal — :class:`NodeAttrs` for every matched subclass,
+        in the same order :meth:`indices` returns. Avoids the
+        boilerplate of ``ctx.node_attrs(q.indices())``.
+        """
+        ...
+
+    def first_idx(self) -> int | None:
+        """Terminal — first matched subclass's positional index, or
+        ``None`` when no subclass exists.
+        """
+        ...
+
+    def indices_by_path(self) -> dict[str, list[int]]:
+        """Terminal — group matched indices by their owning file
+        path.
+        """
+        ...
+
 class ImportQuery:
     """Enumerate the ``kind="import"`` nodes that bind a name from a
     given module. Requires :meth:`of` (the upstream module name).
@@ -1351,6 +1406,25 @@ class ImportQuery:
         configured module? Short-circuits without materialising a
         Python list. Preferred over ``.count() > 0`` / ``.collect()``
         for plugin guards that just need a boolean.
+        """
+        ...
+
+    def attrs(self) -> list[NodeAttrs]:
+        """Terminal — :class:`NodeAttrs` for every matched import
+        node, in the same order :meth:`indices` returns.
+        """
+        ...
+
+    def first_idx(self) -> int | None:
+        """Terminal — first matched import node's positional index,
+        or ``None`` when no project file imports the configured
+        module.
+        """
+        ...
+
+    def indices_by_path(self) -> dict[str, list[int]]:
+        """Terminal — group matched indices by their owning file
+        path.
         """
         ...
 
@@ -1439,6 +1513,18 @@ class ModuleQuery:
 
     def count(self) -> int: ...
     def __iter__(self) -> Iterator[int]: ...
+    def attrs(self) -> list[NodeAttrs]:
+        """Terminal — :class:`NodeAttrs` for every matched index, in
+        the same order :meth:`indices` returns. Avoids the
+        boilerplate of ``ctx.node_attrs(q.indices())``.
+        """
+        ...
+
+    def indices_by_path(self) -> dict[str, list[int]]:
+        """Terminal — group matched indices by their owning file
+        path.
+        """
+        ...
 
 class TraverseQuery:
     """Closure walks anchored at a single seed node. Built via
@@ -1498,6 +1584,25 @@ class DeclarationsQuery:
 
     def count(self) -> int: ...
     def __iter__(self) -> Iterator[int]: ...
+    def attrs(self) -> list[NodeAttrs]:
+        """Terminal — :class:`NodeAttrs` for every matched decl, in
+        the same order :meth:`indices` returns. Modules are excluded
+        (same rule as :meth:`indices`).
+        """
+        ...
+
+    def first_idx(self) -> int | None:
+        """Terminal — first matched decl's positional index, or
+        ``None`` when no decl matches. Distinct from
+        :meth:`resolve_idx`: this one skips the module fallback.
+        """
+        ...
+
+    def indices_by_path(self) -> dict[str, list[int]]:
+        """Terminal — group matched indices by their owning file
+        path.
+        """
+        ...
 
 class MainBlockQuery:
     """Enumerate every ``if __name__ == "__main__":`` block in the
@@ -1553,6 +1658,24 @@ class ClassQuery:
         """
         ...
 
+    def attrs(self) -> list[NodeAttrs]:
+        """Terminal — :class:`NodeAttrs` for every matched class, in
+        the same order :meth:`indices` returns.
+        """
+        ...
+
+    def first_idx(self) -> int | None:
+        """Terminal — first matched class's positional index, or
+        ``None`` when no class defines the configured method.
+        """
+        ...
+
+    def indices_by_path(self) -> dict[str, list[int]]:
+        """Terminal — group matched indices by their owning file
+        path.
+        """
+        ...
+
 class FactoryQuery:
     """Walk function / class bodies for ``<Ctor>(...)`` calls where
     ``Ctor`` is imported from :meth:`of_module` and matches one of
@@ -1572,6 +1695,11 @@ class FactoryQuery:
     def collect(self) -> list[FactoryIdxRef]: ...
     def count(self) -> int: ...
     def __iter__(self) -> Iterator[FactoryIdxRef]: ...
+    def indices_by_path(self) -> dict[str, list[int]]:
+        """Terminal — group matched ``decl_idx`` values by their
+        owning file path.
+        """
+        ...
 
 class EdgeRef:
     """One graph edge with both endpoint nodes resolved.
@@ -1725,6 +1853,27 @@ class DeclQuery:
         :class:`AddEdgeByIdx`); call
         :meth:`ProjectContext.nodes_at` to materialize back to
         ``SymbolNode`` later.
+        """
+        ...
+
+    def attrs(self) -> list[NodeAttrs]:
+        """Terminal — :class:`NodeAttrs` for every surviving node, in
+        the same order :meth:`indices` returns. Avoids the
+        boilerplate of ``ctx.node_attrs(q.indices())``.
+        """
+        ...
+
+    def first_idx(self) -> int | None:
+        """Terminal — first matching node's positional index, or
+        ``None`` when no node matches. Convenience for single-value
+        lookups.
+        """
+        ...
+
+    def indices_by_path(self) -> dict[str, list[int]]:
+        """Terminal — group matched indices by their owning file
+        path. One :meth:`ProjectContext.node_paths` call internally.
+        Lets plugins fan out per-file work without re-querying.
         """
         ...
 

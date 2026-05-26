@@ -581,12 +581,12 @@ def test_call_query_collect_returns_idx_rows(build_decl_graph):
         assert row.string_arg == "settings"
 
 
-def test_with_args_false_yields_empty_args_kwargs(build_decl_graph):
-    """``with_args(False)`` short-circuits the rust-side
-    ``extract_call_args_kwargs`` walk. Row ``args`` / ``kwargs``
-    getters surface empty containers; node-identity + metadata
-    strings (``decorator_owner``, ``string_arg``, etc.) still populate
-    as normal."""
+def test_with_args_opt_in_populates_args_kwargs(build_decl_graph):
+    """``with_args(True)`` opts into the rust-side
+    ``extract_call_args_kwargs`` walk. Default (``with_args(False)``)
+    skips it; row ``args`` / ``kwargs`` getters surface empty
+    containers, but node-identity + metadata strings populate
+    normally."""
     ctx = build_decl_graph(
         {
             "pkg/__init__.py": "",
@@ -595,34 +595,34 @@ def test_with_args_false_yields_empty_args_kwargs(build_decl_graph):
             ),
         }
     )
-    with_args_rows = (
+    default_rows = (
         native.query(ctx).decorators().where_module("functools").where_name("lru_cache").collect()
     )
-    assert len(with_args_rows) == 1
-    # Sanity: default extracts args/kwargs.
-    assert dict(with_args_rows[0].kwargs)
+    assert len(default_rows) == 1
+    # Default skips extraction.
+    assert list(default_rows[0].args) == []
+    assert dict(default_rows[0].kwargs) == {}
 
-    no_args_rows = (
+    with_args_rows = (
         native.query(ctx)
         .decorators()
         .where_module("functools")
         .where_name("lru_cache")
-        .with_args(False)
+        .with_args(True)
         .collect()
     )
-    assert len(no_args_rows) == 1
-    # Empty containers when extraction is skipped.
-    assert list(no_args_rows[0].args) == []
-    assert dict(no_args_rows[0].kwargs) == {}
-    # Identity + metadata fields still populate normally.
-    assert no_args_rows[0].decorated_idx == with_args_rows[0].decorated_idx
-    assert no_args_rows[0].decorator_owner == with_args_rows[0].decorator_owner
+    assert len(with_args_rows) == 1
+    # ``with_args(True)`` populates args/kwargs.
+    assert dict(with_args_rows[0].kwargs)
+    # Identity + metadata fields stable across both calls.
+    assert with_args_rows[0].decorated_idx == default_rows[0].decorated_idx
+    assert with_args_rows[0].decorator_owner == default_rows[0].decorator_owner
 
 
-def test_with_args_false_does_not_disable_kwarg_filter(build_decl_graph):
-    """Even with ``with_args(False)``, ``.where_kwarg(...)`` must still
-    filter — the rust side forces extraction back on when any kwarg
-    matcher is set."""
+def test_where_kwarg_forces_extraction(build_decl_graph):
+    """``.where_kwarg(...)`` filters even at the default
+    ``with_args=False`` — the rust side forces extraction back on
+    when any kwarg matcher is set."""
     ctx = build_decl_graph(
         {
             "pkg/__init__.py": "",
@@ -640,7 +640,6 @@ def test_with_args_false_does_not_disable_kwarg_filter(build_decl_graph):
         .decorators()
         .where_module("functools")
         .where_name("lru_cache")
-        .with_args(False)
         .where_kwarg("maxsize", 128)
         .collect()
     )
@@ -1283,3 +1282,128 @@ def test_decl_query_simple_name_regex_invalid_raises(build_decl_graph):
     ctx = build_decl_graph({"pkg/__init__.py": "", "pkg/a.py": "x = 1\n"})
     with pytest.raises(ValueError, match="invalid simple-name regex"):
         native.query(ctx).decls().with_simple_name_regex(r"(unclosed").indices()
+
+
+# ---------------------------------------------------------------------------
+# NodeAttrs — tuple-like row with named fields
+# ---------------------------------------------------------------------------
+
+
+def test_node_attrs_attribute_access(build_decl_graph):
+    ctx = build_decl_graph({"pkg/__init__.py": "", "pkg/a.py": "def f(): pass\n"})
+    (idx,) = ctx.indices_where(fqname_prefix="pkg.a.f", kind="function")
+    (attr,) = ctx.node_attrs([idx])
+    assert attr.kind == "function"
+    assert attr.fqname == "pkg.a.f"
+    assert attr.path.endswith("pkg/a.py")
+    assert isinstance(attr.flags, int)
+
+
+def test_node_attrs_tuple_unpacking(build_decl_graph):
+    ctx = build_decl_graph({"pkg/__init__.py": "", "pkg/a.py": "def f(): pass\n"})
+    (idx,) = ctx.indices_where(fqname_prefix="pkg.a.f", kind="function")
+    (attr,) = ctx.node_attrs([idx])
+    kind, path, fqname, flags = attr
+    assert kind == attr.kind
+    assert path == attr.path
+    assert fqname == attr.fqname
+    assert flags == attr.flags
+
+
+def test_node_attrs_subscript_and_len(build_decl_graph):
+    ctx = build_decl_graph({"pkg/__init__.py": "", "pkg/a.py": "def f(): pass\n"})
+    (idx,) = ctx.indices_where(fqname_prefix="pkg.a.f", kind="function")
+    (attr,) = ctx.node_attrs([idx])
+    assert len(attr) == 4
+    assert attr[0] == attr.kind
+    assert attr[2] == attr.fqname
+    assert attr[-1] == attr.flags
+    with pytest.raises(IndexError):
+        attr[4]
+
+
+# ---------------------------------------------------------------------------
+# .attrs() / .first_idx() / .indices_by_path() — uniform terminals
+# ---------------------------------------------------------------------------
+
+
+def test_decl_query_attrs_matches_node_attrs(build_decl_graph):
+    ctx = build_decl_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/svc.py": "def handler(): pass\nclass Service: pass\n",
+        }
+    )
+    q = native.query(ctx).decls().with_kind("function")
+    via_terminal = q.attrs()
+    via_ctx = ctx.node_attrs(q.indices())
+    assert [a.fqname for a in via_terminal] == [a.fqname for a in via_ctx]
+
+
+def test_decl_query_first_idx(build_decl_graph):
+    ctx = build_decl_graph(
+        {"pkg/__init__.py": "", "pkg/a.py": "def alpha(): pass\ndef beta(): pass\n"}
+    )
+    idx = native.query(ctx).decls().with_fqname_prefix("pkg.a.alpha").first_idx()
+    assert idx is not None
+    assert ctx.nodes()[idx].fqname == "pkg.a.alpha"
+
+
+def test_decl_query_first_idx_none_when_no_match(build_decl_graph):
+    ctx = build_decl_graph({"pkg/__init__.py": ""})
+    assert native.query(ctx).decls().with_fqname_prefix("nope").first_idx() is None
+
+
+def test_decl_query_indices_by_path(build_decl_graph):
+    ctx = build_decl_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/svc.py": "def handler(): pass\nclass Service: pass\n",
+            "pkg/util.py": "def helper(): pass\n",
+        }
+    )
+    buckets = native.query(ctx).decls().with_kind("function").indices_by_path()
+    fqnames_by_path = {
+        path: sorted(ctx.nodes()[i].fqname for i in idxs) for path, idxs in buckets.items()
+    }
+    assert any(fqs == ["pkg.svc.handler"] for fqs in fqnames_by_path.values()), fqnames_by_path
+    assert any(fqs == ["pkg.util.helper"] for fqs in fqnames_by_path.values()), fqnames_by_path
+
+
+def test_import_query_attrs_first_idx_and_indices_by_path(build_decl_graph):
+    ctx = build_decl_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/a.py": "from os.path import join\n",
+            "pkg/b.py": "from os.path import join as j2\n",
+        }
+    )
+    q = native.query(ctx).imports().of("os.path")
+    attrs = q.attrs()
+    assert all(a.kind == "import" for a in attrs)
+    assert q.first_idx() is not None
+    buckets = q.indices_by_path()
+    # Two distinct files both import os.path.
+    assert len(buckets) == 2
+
+
+def test_decorator_query_indices_by_path(build_decl_graph):
+    ctx = build_decl_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/svc.py": (
+                "import functools\n@functools.lru_cache(maxsize=128)\ndef cached(): pass\n"
+            ),
+        }
+    )
+    buckets = (
+        native.query(ctx)
+        .decorators()
+        .where_module("functools")
+        .where_name("lru_cache")
+        .indices_by_path()
+    )
+    assert len(buckets) == 1
+    (path, idxs) = next(iter(buckets.items()))
+    assert path.endswith("pkg/svc.py")
+    assert ctx.nodes()[idxs[0]].fqname == "pkg.svc.cached"

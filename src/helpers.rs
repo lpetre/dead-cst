@@ -1121,6 +1121,67 @@ pub(crate) struct ArgNodeRef {
 #[pyclass(frozen)]
 pub(crate) struct ArgOpaque;
 
+/// Tuple-like result row returned by
+/// :meth:`ProjectContext.node_attrs` and the per-query
+/// ``.attrs()`` terminals.
+///
+/// Supports both attribute access (``attr.fqname``) and tuple
+/// semantics (``kind, path, fqname, flags = attr``; ``attr[2]``;
+/// ``len(attr) == 4``). Not a `typing.NamedTuple` instance, but
+/// drop-in compatible for unpacking and subscript access. Frozen —
+/// fields are immutable once constructed.
+#[pyclass(frozen, get_all)]
+pub(crate) struct NodeAttrs {
+    pub(crate) kind: String,
+    pub(crate) path: String,
+    pub(crate) fqname: String,
+    pub(crate) flags: u32,
+}
+
+#[pymethods]
+impl NodeAttrs {
+    fn __len__(&self) -> usize {
+        4
+    }
+
+    fn __getitem__(&self, idx: isize, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let n: isize = 4;
+        let i = if idx < 0 { idx + n } else { idx };
+        if !(0..n).contains(&i) {
+            return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                "NodeAttrs index {idx} out of range (len=4)"
+            )));
+        }
+        Ok(match i {
+            0 => self.kind.clone().into_py(py),
+            1 => self.path.clone().into_py(py),
+            2 => self.fqname.clone().into_py(py),
+            3 => self.flags.into_py(py),
+            _ => unreachable!(),
+        })
+    }
+
+    fn __iter__(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let tup = pyo3::types::PyTuple::new_bound(
+            py,
+            &[
+                slf.kind.clone().into_py(py),
+                slf.path.clone().into_py(py),
+                slf.fqname.clone().into_py(py),
+                slf.flags.into_py(py),
+            ],
+        );
+        Ok(tup.call_method0("__iter__")?.into())
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "NodeAttrs(kind={:?}, path={:?}, fqname={:?}, flags={})",
+            self.kind, self.path, self.fqname, self.flags
+        )
+    }
+}
+
 #[pymethods]
 impl ArgOpaque {
     #[new]

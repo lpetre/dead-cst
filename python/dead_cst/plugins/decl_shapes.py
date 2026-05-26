@@ -69,7 +69,7 @@ class DecoratedDeclPlugin(Plugin):
             module_idx = native.query(ctx).modules().with_path(path).first_idx()
             if module_idx is None:
                 return False
-            (_kind, _path, fqname, _flags) = ctx.node_attrs([module_idx])[0]
+            fqname = ctx.node_attrs([module_idx])[0].fqname
             return fqname == prefix or fqname.startswith(prefix + ".")
 
         seeds_by_path: dict[str, list[int]] = {}
@@ -242,11 +242,11 @@ class DispatchAppPlugin(Plugin):
 
         # direct_by_owner: (path, simple_name) -> [var_idx, ...]
         direct_by_owner: dict[tuple[str, str], list[int]] = {}
-        direct_attrs: list[tuple[native.NodeKind, str, str, int]] = []
+        direct_attrs: list[native.NodeAttrs] = []
         if direct:
             direct_attrs = ctx.node_attrs([r.var_idx for r in direct])
-            for ref, (_kind, _path, fqname, _flags) in zip(direct, direct_attrs, strict=True):
-                simple = fqname.rsplit(".", 1)[-1]
+            for ref, attr in zip(direct, direct_attrs, strict=True):
+                simple = attr.fqname.rsplit(".", 1)[-1]
                 direct_by_owner.setdefault((ref.path, simple), []).append(ref.var_idx)
 
         app_prefix = f"<{spec.marker_prefix}-app>:"
@@ -255,9 +255,9 @@ class DispatchAppPlugin(Plugin):
         # 3. Entrypoint-promote every direct construction (when enabled).
         if spec.seed_as_entrypoint and direct:
             # Reuse the direct_attrs computed above.
-            for ref, (_kind, _path, fqname, _flags) in zip(direct, direct_attrs, strict=True):
+            for ref, attr in zip(direct, direct_attrs, strict=True):
                 yield native.AddNodeByIdx(
-                    fqname=f"{app_prefix}{fqname}",
+                    fqname=f"{app_prefix}{attr.fqname}",
                     path=ref.path,
                     flags=int(NodeFlags.ENTRYPOINT),
                     edges_to_idx=[ref.var_idx],
@@ -267,11 +267,9 @@ class DispatchAppPlugin(Plugin):
         # find them.
         if factory_decls:
             factory_attrs = ctx.node_attrs([fref.decl_idx for fref, _kind in factory_decls])
-            for (fref, kind), (_k, _p, decl_fqname, _f) in zip(
-                factory_decls, factory_attrs, strict=True
-            ):
+            for (fref, kind), attr in zip(factory_decls, factory_attrs, strict=True):
                 yield native.AddNodeByIdx(
-                    fqname=f"{factory_prefix}{kind}:{decl_fqname}",
+                    fqname=f"{factory_prefix}{kind}:{attr.fqname}",
                     path=fref.path,
                     edges_from_idx=[fref.decl_idx],
                 )
@@ -324,10 +322,10 @@ class DispatchAppPlugin(Plugin):
                 if var_idx is None or var_idx not in factory_reachers:
                     continue
                 classified.add(key)
-                (_kind, var_path, var_fqname, _flags) = ctx.node_attrs([var_idx])[0]
+                var_attr = ctx.node_attrs([var_idx])[0]
                 yield native.AddNodeByIdx(
-                    fqname=f"{app_prefix}{var_fqname}",
-                    path=var_path,
+                    fqname=f"{app_prefix}{var_attr.fqname}",
+                    path=var_attr.path,
                     flags=int(NodeFlags.ENTRYPOINT),
                     edges_to_idx=[var_idx],
                 )
@@ -368,8 +366,8 @@ def _module_to_names(
             sub_idxs = native.query(ctx).subclasses().of_fqn(fqn).indices()
             pairs = []
             if sub_idxs:
-                for _kind, _path, sub_fqname, _flags in ctx.node_attrs(sub_idxs):
-                    sub_module, _, sub_name = sub_fqname.rpartition(".")
+                for attr in ctx.node_attrs(sub_idxs):
+                    sub_module, _, sub_name = attr.fqname.rpartition(".")
                     if sub_module and sub_name:
                         pairs.append((sub_module, sub_name))
             if subclass_cache is not None:
@@ -438,9 +436,9 @@ def _build_vars_by_file(ctx: native.ProjectContext) -> dict[tuple[str, str], int
     if not var_idxs:
         return vars_by_file
     var_attrs = ctx.node_attrs(var_idxs)
-    for idx, (_kind, path, fqname, _flags) in zip(var_idxs, var_attrs, strict=True):
-        simple = fqname.rsplit(".", 1)[-1]
-        vars_by_file.setdefault((path, simple), idx)
+    for idx, attr in zip(var_idxs, var_attrs, strict=True):
+        simple = attr.fqname.rsplit(".", 1)[-1]
+        vars_by_file.setdefault((attr.path, simple), idx)
     return vars_by_file
 
 
@@ -600,7 +598,7 @@ class LiteralListPlugin(Plugin):
             target_idxs.extend(native.query(ctx).declarations().with_fqname(entry).indices())
             if not target_idxs:
                 continue
-            (_kind, marker_path, _fq, _flags) = ctx.node_attrs([target_idxs[0]])[0]
+            marker_path = ctx.node_attrs([target_idxs[0]])[0].path
             yield native.AddNodeByIdx(
                 fqname=f"{prefix}{entry}",
                 path=marker_path,

@@ -54,9 +54,9 @@ class ServerConfigPlugin(Plugin):
         if not present:
             return
         module_attrs = ctx.node_attrs([idx for _p, idx in present])
-        for (path, _idx), (_k, _p, module_fqname, _f) in zip(present, module_attrs, strict=True):
+        for (path, _idx), attr in zip(present, module_attrs, strict=True):
             yield native.AddNodeByIdx(
-                fqname=f"{SERVER_CONFIG_PREFIX}{module_fqname}",
+                fqname=f"{SERVER_CONFIG_PREFIX}{attr.fqname}",
                 path=path,
                 flags=int(NodeFlags.ENTRYPOINT),
                 edges_to_idx=targets_by_path[path],

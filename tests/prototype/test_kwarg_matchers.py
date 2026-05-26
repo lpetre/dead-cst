@@ -166,7 +166,7 @@ def test_decorator_ref_args_kwargs_populated(make_ctx):
     shape on the matched ref."""
 
     def capture(ctx):
-        refs = native.query(ctx).decorators().where_owner_attr(["route"]).collect()
+        refs = native.query(ctx).decorators().where_owner_attr(["route"]).with_args(True).collect()
         assert len(refs) == 1
         ref = refs[0]
         return {
@@ -234,7 +234,9 @@ def test_kwarg_payload_surfaces_nativenode_for_imported_symbol(make_ctx):
     anchor inverted edges off the resolved decl."""
 
     def capture(ctx):
-        refs = native.query(ctx).decorators().where_owner_attr(["register"]).collect()
+        refs = (
+            native.query(ctx).decorators().where_owner_attr(["register"]).with_args(True).collect()
+        )
         nodes = ctx.nodes()
         out = []
         for r in refs:
@@ -381,6 +383,7 @@ def test_call_ref_args_kwargs_populated(make_ctx):
             .where_owner("mocker")
             .where_attr("patch")
             .string_arg_at(0)
+            .with_args(True)
             .collect()
         )
         assert len(refs) == 1

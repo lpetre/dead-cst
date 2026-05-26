@@ -75,10 +75,10 @@ class DiscordPyPlugin(Plugin):
         bot_vars_by_file: dict[str, dict[str, int]] = {}
         if bot_rows:
             bot_attrs = ctx.node_attrs([r.var_idx for r in bot_rows])
-            for row, (_k, _p, fqname, _f) in zip(bot_rows, bot_attrs, strict=True):
+            for row, attr in zip(bot_rows, bot_attrs, strict=True):
                 if row.path not in discord_paths:
                     continue
-                simple = fqname.rsplit(".", 1)[-1]
+                simple = attr.fqname.rsplit(".", 1)[-1]
                 bot_vars_by_file.setdefault(row.path, {})[simple] = row.var_idx
                 yield native.AddEntrypointByIdx(row.var_idx, marker="<discordpy-app>")
 

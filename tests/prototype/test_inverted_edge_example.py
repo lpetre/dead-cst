@@ -60,7 +60,13 @@ class HandlerByKwargPlugin:
     def run(self, ctx: "native.ProjectContext") -> Iterable["native.GraphOp"]:
         from dead_cst import _native as native
 
-        refs = native.query(ctx).decorators().where_owner_attr([self.decorator_attr]).collect()
+        refs = (
+            native.query(ctx)
+            .decorators()
+            .where_owner_attr([self.decorator_attr])
+            .with_args(True)
+            .collect()
+        )
         for ref in refs:
             if ref.decorator_owner != self.decorator_owner:
                 continue
