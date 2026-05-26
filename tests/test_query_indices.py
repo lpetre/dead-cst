@@ -151,28 +151,6 @@ def test_edge_query_index_triples_matches_collect(build_decl_graph):
 
 
 # ---------------------------------------------------------------------------
-# ctx.reachable_indices parity with ctx.reachable
-# ---------------------------------------------------------------------------
-
-
-def test_reachable_indices_matches_reachable(build_decl_graph):
-    ctx = build_decl_graph(
-        {
-            "pkg/__init__.py": "",
-            "pkg/main.py": """
-            def used(): pass
-            def unused(): pass
-            used()
-            """,
-        }
-    )
-    # Same seed_flags / skip_flags: idx and node forms must agree.
-    nodes = ctx.reachable()
-    indices = ctx.reachable_indices()
-    assert {ctx.nodes()[i].fqname for i in indices} == {n.fqname for n in nodes}
-
-
-# ---------------------------------------------------------------------------
 # ctx.indices_where predicate combos
 # ---------------------------------------------------------------------------
 
@@ -414,67 +392,8 @@ def test_add_node_by_idx_default_no_edges(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# ctx.find_declarations_indices
+# ctx.modules_for_paths — bulk path → module idx lookup
 # ---------------------------------------------------------------------------
-
-
-def test_find_declarations_indices_matches_node_form(build_decl_graph):
-    ctx = build_decl_graph(
-        {
-            "pkg/__init__.py": "",
-            "pkg/svc.py": "def handler(): pass\nclass Service: pass\n",
-        }
-    )
-    nodes = ctx.find_declarations("pkg.svc.handler")
-    indices = ctx.find_declarations_indices("pkg.svc.handler")
-    assert len(nodes) == len(indices) == 1
-    all_nodes = ctx.nodes()
-    assert all_nodes[indices[0]].fqname == nodes[0].fqname
-
-
-def test_find_declarations_indices_walks_back(build_decl_graph):
-    """``pkg.svc.Cls.method`` resolves to ``pkg.svc.Cls`` — methods don't
-    get their own graph node."""
-    ctx = build_decl_graph(
-        {
-            "pkg/__init__.py": "",
-            "pkg/svc.py": "class Cls:\n    def method(self): pass\n",
-        }
-    )
-    indices = ctx.find_declarations_indices("pkg.svc.Cls.method")
-    revived = ctx.nodes_at(indices)
-    assert {n.fqname for n in revived} == {"pkg.svc.Cls"}
-
-
-def test_find_declarations_indices_unknown_returns_empty(build_decl_graph):
-    ctx = build_decl_graph({"pkg/__init__.py": "", "pkg/a.py": "x = 1\n"})
-    assert ctx.find_declarations_indices("nothing.here") == []
-
-
-# ---------------------------------------------------------------------------
-# ctx.module_for_indices + modules_for_paths
-# ---------------------------------------------------------------------------
-
-
-def test_module_for_indices_matches_node_form(build_decl_graph):
-    ctx = build_decl_graph(
-        {
-            "pkg/__init__.py": "",
-            "pkg/svc.py": "def f(): pass\n",
-        }
-    )
-    # ``module_for`` keys on the absolute path stored on the SymbolNode.
-    svc_path = next(n.path for n in ctx.nodes() if n.fqname == "pkg.svc")
-    node = ctx.module_for(svc_path)
-    assert node is not None
-    idx = ctx.module_for_indices(svc_path)
-    assert idx is not None
-    assert ctx.nodes()[idx].fqname == node.fqname
-
-
-def test_module_for_indices_missing_path(build_decl_graph):
-    ctx = build_decl_graph({"pkg/__init__.py": "", "pkg/a.py": "x = 1\n"})
-    assert ctx.module_for_indices("/not/a/real/path.py") is None
 
 
 def test_modules_for_paths_bulk(build_decl_graph):
@@ -498,28 +417,8 @@ def test_modules_for_paths_bulk(build_decl_graph):
 
 
 # ---------------------------------------------------------------------------
-# ctx.module_surface_indices + module_surfaces_indices
+# ctx.module_surfaces_indices — bulk module-surface lookup
 # ---------------------------------------------------------------------------
-
-
-def test_module_surface_indices_matches_node_form(build_decl_graph):
-    ctx = build_decl_graph(
-        {
-            "pkg/__init__.py": "",
-            "pkg/svc.py": "def handler(): pass\nclass Service: pass\n",
-            "pkg/sub/__init__.py": "",
-            "pkg/sub/inner.py": "def deep(): pass\n",
-        }
-    )
-    nodes = ctx.module_surface("pkg")
-    indices = ctx.module_surface_indices("pkg")
-    assert len(nodes) == len(indices)
-    assert {ctx.nodes()[i].fqname for i in indices} == {n.fqname for n in nodes}
-
-
-def test_module_surface_indices_unknown_returns_empty(build_decl_graph):
-    ctx = build_decl_graph({"pkg/__init__.py": "", "pkg/a.py": "x = 1\n"})
-    assert ctx.module_surface_indices("nothing.here") == []
 
 
 def test_module_surfaces_indices_bulk(build_decl_graph):
@@ -532,41 +431,16 @@ def test_module_surfaces_indices_bulk(build_decl_graph):
             "other/m.py": "def m(): pass\n",
         }
     )
-    node_buckets = ctx.module_surfaces(["pkg", "other", "missing"])
     idx_buckets = ctx.module_surfaces_indices(["pkg", "other", "missing"])
-    assert set(node_buckets.keys()) == set(idx_buckets.keys())
-    for key in node_buckets:
-        node_fqs = {n.fqname for n in node_buckets[key]}
-        idx_fqs = {ctx.nodes()[i].fqname for i in idx_buckets[key]}
-        assert node_fqs == idx_fqs
-
-
-# ---------------------------------------------------------------------------
-# ctx.find_main_blocks_indices
-# ---------------------------------------------------------------------------
-
-
-def test_find_main_blocks_indices_matches_node_form(build_decl_graph):
-    ctx = build_decl_graph(
-        {
-            "pkg/__init__.py": "",
-            "pkg/m.py": (
-                'def helper(): pass\nif __name__ == "__main__":\n    helper()\n    x = 1\n'
-            ),
-        }
-    )
-    node_pairs = ctx.find_main_blocks()
-    idx_pairs = ctx.find_main_blocks_indices()
-    assert len(node_pairs) == len(idx_pairs) == 1
-    (mod_node, decls) = node_pairs[0]
-    (mod_idx, decl_idxs) = idx_pairs[0]
-    assert ctx.nodes()[mod_idx].fqname == mod_node.fqname
-    assert {ctx.nodes()[i].fqname for i in decl_idxs} == {d.fqname for d in decls}
-
-
-def test_find_main_blocks_indices_no_main_block(build_decl_graph):
-    ctx = build_decl_graph({"pkg/__init__.py": "", "pkg/a.py": "x = 1\n"})
-    assert ctx.find_main_blocks_indices() == []
+    assert "missing" in idx_buckets and idx_buckets["missing"] == []
+    fqs_pkg = {ctx.nodes()[i].fqname for i in idx_buckets["pkg"]}
+    fqs_other = {ctx.nodes()[i].fqname for i in idx_buckets["other"]}
+    # ``pkg`` surface is the module + every transitive decl under it.
+    assert "pkg.svc.handler" in fqs_pkg
+    assert "pkg.util.helper" in fqs_pkg
+    assert "other.m.m" in fqs_other
+    # Buckets must not bleed across keys.
+    assert not (fqs_pkg & fqs_other)
 
 
 # ---------------------------------------------------------------------------
@@ -845,84 +719,7 @@ def test_add_entrypoint_by_idx_out_of_range_raises(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# ctx.find_module_idx
-# ---------------------------------------------------------------------------
-
-
-def test_find_module_idx_matches_node_form(build_decl_graph):
-    ctx = build_decl_graph(
-        {"pkg/__init__.py": "", "pkg/sub/__init__.py": "", "pkg/sub/inner.py": "x = 1\n"}
-    )
-    for fqn in ("pkg", "pkg.sub", "pkg.sub.inner"):
-        node = ctx.find_module(fqn)
-        idx = ctx.find_module_idx(fqn)
-        assert node is not None
-        assert idx is not None
-        assert ctx.nodes()[idx].fqname == node.fqname
-
-
-def test_find_module_idx_unknown_returns_none(build_decl_graph):
-    ctx = build_decl_graph({"pkg/__init__.py": "", "pkg/a.py": "x = 1\n"})
-    assert ctx.find_module_idx("nothing.here") is None
-
-
-# ---------------------------------------------------------------------------
-# ctx.find_module_dunders_indices
-# ---------------------------------------------------------------------------
-
-
-def test_find_module_dunders_indices_matches_node_form(build_decl_graph):
-    ctx = build_decl_graph(
-        {
-            "pkg/__init__.py": "__all__ = []\n__version__ = '1.0'\n",
-            "pkg/a.py": "def __getattr__(name): pass\nx = 1\n",
-        }
-    )
-    nodes = ctx.find_module_dunders()
-    indices = ctx.find_module_dunders_indices()
-    assert len(nodes) == len(indices)
-    revived = ctx.nodes_at(indices)
-    assert {n.fqname for n in revived} == {n.fqname for n in nodes}
-    # ``x = 1`` is a plain top-level variable — must not be surfaced.
-    assert all("x" not in n.fqname.rsplit(".", 1)[-1] for n in revived)
-
-
-# ---------------------------------------------------------------------------
-# ctx.find_nodes_matching_specs_indices
-# ---------------------------------------------------------------------------
-
-
-def test_find_nodes_matching_specs_indices_matches_node_form(build_decl_graph, tmp_path):
-    ctx = build_decl_graph(
-        {
-            "pkg/__init__.py": "",
-            "pkg/svc.py": "def handler(): pass\n",
-            "pkg/util.py": "def helper(): pass\n",
-        }
-    )
-    # Use the same three spec buckets the ExplicitEntrypointPlugin
-    # exercises: regex, str (relative path or fqname), abs path.
-    nodes = ctx.find_nodes_matching_specs(
-        str(tmp_path),
-        regexes=[r"pkg/svc\.py"],
-        str_specs=["pkg.util.helper"],
-        abs_paths=[],
-    )
-    indices = ctx.find_nodes_matching_specs_indices(
-        str(tmp_path),
-        regexes=[r"pkg/svc\.py"],
-        str_specs=["pkg.util.helper"],
-        abs_paths=[],
-    )
-    assert len(nodes) == len(indices)
-    revived = ctx.nodes_at(indices)
-    assert {n.fqname for n in revived} == {n.fqname for n in nodes}
-    assert {"pkg.svc.handler", "pkg.util.helper"} <= {n.fqname for n in revived}
-
-
-# ---------------------------------------------------------------------------
-# ctx.subclasses_of_fqn_indices + SubclassQuery.of_idx +
-# ctx.find_subclasses_of_idx
+# SubclassQuery.of_fqn / of_idx / of_node
 # ---------------------------------------------------------------------------
 
 
@@ -998,36 +795,6 @@ def test_subclass_query_of_idx_matches_of_node(build_decl_graph):
 
 
 # ---------------------------------------------------------------------------
-# ctx.direct_predecessors_idx
-# ---------------------------------------------------------------------------
-
-
-def test_direct_predecessors_idx_matches_node_form(build_decl_graph):
-    ctx = build_decl_graph(
-        {
-            "pkg/__init__.py": "",
-            "pkg/a.py": "def callee(): pass\ndef caller(): callee()\ncaller()\n",
-        }
-    )
-    (callee_idx,) = ctx.indices_where(fqname_prefix="pkg.a.callee", kind="function")
-    callee_node = ctx.nodes_at([callee_idx])[0]
-    nodes = ctx.direct_predecessors(callee_node)
-    indices = ctx.direct_predecessors_idx(callee_idx)
-    assert len(nodes) == len(indices)
-    revived = ctx.nodes_at(indices)
-    assert {n.fqname for n in revived} == {n.fqname for n in nodes}
-    # ``caller`` definitely calls ``callee`` — sanity check.
-    assert "pkg.a.caller" in {n.fqname for n in revived}
-
-
-def test_direct_predecessors_idx_out_of_range_raises(build_decl_graph):
-    ctx = build_decl_graph({"pkg/__init__.py": "", "pkg/a.py": "def f(): pass\n"})
-    n = len(ctx.nodes())
-    with pytest.raises(IndexError, match="out of range"):
-        ctx.direct_predecessors_idx(n)
-
-
-# ---------------------------------------------------------------------------
 # DecoratorQuery.in_decl_idx
 # ---------------------------------------------------------------------------
 
@@ -1069,164 +836,29 @@ def test_decorator_query_in_decl_idx_out_of_range_raises(build_decl_graph):
 
 
 # ---------------------------------------------------------------------------
-# ctx.resolve_idx
+# TraverseQuery bounds — out-of-range seeds raise IndexError
 # ---------------------------------------------------------------------------
 
 
-def test_resolve_idx_matches_node_form(build_decl_graph):
-    ctx = build_decl_graph(
-        {
-            "pkg/__init__.py": "",
-            "pkg/svc.py": "def handler(): pass\nclass Service: pass\n",
-        }
-    )
-    # Exact decl, exact module, walk-back from method-level fqname.
-    for fqn in ("pkg.svc.handler", "pkg.svc", "pkg.svc.Service.method"):
-        node = ctx.resolve(fqn)
-        idx = ctx.resolve_idx(fqn)
-        assert node is not None
-        assert idx is not None
-        assert ctx.nodes()[idx].fqname == node.fqname
-
-
-def test_resolve_idx_unknown_returns_none(build_decl_graph):
-    ctx = build_decl_graph({"pkg/__init__.py": "", "pkg/a.py": "x = 1\n"})
-    assert ctx.resolve_idx("nothing.here") is None
-
-
-# ---------------------------------------------------------------------------
-# ctx.decls_under_indices / decls_matching_indices / decls_matching_name_indices
-# ---------------------------------------------------------------------------
-
-
-def test_decls_under_indices_matches_node_form(build_decl_graph, tmp_path):
-    ctx = build_decl_graph(
-        {
-            "pkg/__init__.py": "",
-            "pkg/svc.py": "def handler(): pass\n",
-            "pkg/util.py": "def helper(): pass\n",
-            "other/__init__.py": "",
-            "other/m.py": "def m(): pass\n",
-        }
-    )
-    prefix = str(tmp_path / "pkg")
-    nodes = ctx.decls_under(prefix)
-    indices = ctx.decls_under_indices(prefix)
-    assert len(nodes) == len(indices)
-    revived = ctx.nodes_at(indices)
-    assert {n.fqname for n in revived} == {n.fqname for n in nodes}
-    # Sanity: nothing under "other" leaked into the bucket.
-    assert all(not n.fqname.startswith("other.") for n in revived)
-
-
-def test_decls_matching_indices_matches_node_form(build_decl_graph):
-    ctx = build_decl_graph(
-        {
-            "pkg/__init__.py": "",
-            "pkg/test_a.py": "def test_one(): pass\n",
-            "pkg/main.py": "def main(): pass\n",
-        }
-    )
-    nodes = ctx.decls_matching("test_a")
-    indices = ctx.decls_matching_indices("test_a")
-    assert len(nodes) == len(indices)
-    revived = ctx.nodes_at(indices)
-    assert {n.fqname for n in revived} == {n.fqname for n in nodes}
-
-
-def test_decls_matching_name_indices_matches_node_form(build_decl_graph):
-    ctx = build_decl_graph(
-        {
-            "pkg/__init__.py": "",
-            "pkg/a.py": "def test_one(): pass\ndef helper(): pass\nclass TestX: pass\n",
-        }
-    )
-    nodes = ctx.decls_matching_name(r"^(test_|Test)")
-    indices = ctx.decls_matching_name_indices(r"^(test_|Test)")
-    assert len(nodes) == len(indices)
-    revived = ctx.nodes_at(indices)
-    assert {n.fqname for n in revived} == {n.fqname for n in nodes}
-    assert {"pkg.a.test_one", "pkg.a.TestX"} <= {n.fqname for n in revived}
-    # The kind filter excludes module nodes — verify a module's name
-    # isn't accidentally surfaced even though "a" matches no pattern here.
-    assert all(n.kind != "module" for n in revived)
-
-
-# ---------------------------------------------------------------------------
-# ctx.descendants_indices / ancestors_indices
-# ---------------------------------------------------------------------------
-
-
-def test_descendants_indices_matches_node_form(build_decl_graph):
-    ctx = build_decl_graph(
-        {
-            "pkg/__init__.py": "",
-            "pkg/a.py": ("def leaf(): pass\ndef middle(): leaf()\ndef root(): middle()\nroot()\n"),
-        }
-    )
-    (root_idx,) = ctx.indices_where(fqname_prefix="pkg.a.root", kind="function")
-    root_node = ctx.nodes_at([root_idx])[0]
-    nodes = ctx.descendants(root_node)
-    indices = ctx.descendants_indices(root_idx)
-    assert len(nodes) == len(indices)
-    revived = ctx.nodes_at(indices)
-    assert {n.fqname for n in revived} == {n.fqname for n in nodes}
-    # Sanity: the forward closure includes the transitive targets.
-    assert {"pkg.a.middle", "pkg.a.leaf"} <= {n.fqname for n in revived}
-
-
-def test_descendants_indices_skip_flags(build_decl_graph):
-    """``skip_flags`` parity: DEAD_BRANCH edges are filtered the same
-    way by both forms."""
-    ctx = build_decl_graph(
-        {
-            "pkg/__init__.py": "",
-            "pkg/a.py": (
-                "def alive_only_in_dead_branch(): pass\n"
-                "def caller():\n"
-                "    if False:\n"
-                "        alive_only_in_dead_branch()\n"
-                "caller()\n"
-            ),
-        }
-    )
-    (caller_idx,) = ctx.indices_where(fqname_prefix="pkg.a.caller", kind="function")
-    caller_node = ctx.nodes_at([caller_idx])[0]
-    skip = int(native.EdgeFlags.DEAD_BRANCH)
-    nodes = ctx.descendants(caller_node, skip_flags=skip)
-    indices = ctx.descendants_indices(caller_idx, skip_flags=skip)
-    assert {n.fqname for n in nodes} == {ctx.nodes()[i].fqname for i in indices}
-
-
-def test_descendants_indices_out_of_range_raises(build_decl_graph):
+def test_traverse_descendants_out_of_range_raises(build_decl_graph):
     ctx = build_decl_graph({"pkg/__init__.py": "", "pkg/a.py": "def f(): pass\n"})
     n = len(ctx.nodes())
     with pytest.raises(IndexError, match="out of range"):
-        ctx.descendants_indices(n)
+        native.query(ctx).from_idx(n).descendants()
 
 
-def test_ancestors_indices_matches_node_form(build_decl_graph):
-    ctx = build_decl_graph(
-        {
-            "pkg/__init__.py": "",
-            "pkg/a.py": ("def leaf(): pass\ndef middle(): leaf()\ndef root(): middle()\nroot()\n"),
-        }
-    )
-    (leaf_idx,) = ctx.indices_where(fqname_prefix="pkg.a.leaf", kind="function")
-    leaf_node = ctx.nodes_at([leaf_idx])[0]
-    nodes = ctx.ancestors(leaf_node)
-    indices = ctx.ancestors_indices(leaf_idx)
-    assert len(nodes) == len(indices)
-    revived = ctx.nodes_at(indices)
-    assert {n.fqname for n in revived} == {n.fqname for n in nodes}
-    assert {"pkg.a.middle", "pkg.a.root"} <= {n.fqname for n in revived}
-
-
-def test_ancestors_indices_out_of_range_raises(build_decl_graph):
+def test_traverse_ancestors_out_of_range_raises(build_decl_graph):
     ctx = build_decl_graph({"pkg/__init__.py": "", "pkg/a.py": "def f(): pass\n"})
     n = len(ctx.nodes())
     with pytest.raises(IndexError, match="out of range"):
-        ctx.ancestors_indices(n)
+        native.query(ctx).from_idx(n).ancestors()
+
+
+def test_traverse_direct_predecessors_out_of_range_raises(build_decl_graph):
+    ctx = build_decl_graph({"pkg/__init__.py": "", "pkg/a.py": "def f(): pass\n"})
+    n = len(ctx.nodes())
+    with pytest.raises(IndexError, match="out of range"):
+        native.query(ctx).from_idx(n).direct_predecessors()
 
 
 # ---------------------------------------------------------------------------
@@ -1423,6 +1055,30 @@ def test_query_reachable_matches_ctx_reachable_indices(build_decl_graph):
     via_query = native.query(ctx).reachable()
     via_ctx = ctx.reachable_indices()
     assert sorted(via_query) == sorted(via_ctx)
+
+
+def test_query_matching_specs_or_form(build_decl_graph, tmp_path):
+    """``QueryBuilder.matching_specs`` ORs across the three buckets:
+    a node matches if it satisfies any of the regex / str / abs_path
+    sets. Mirrors ``ExplicitEntrypointPlugin`` shape."""
+    ctx = build_decl_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/svc.py": "def handler(): pass\n",
+            "pkg/util.py": "def helper(): pass\n",
+        }
+    )
+    util_path = next(n.path for n in ctx.nodes() if n.fqname == "pkg.util")
+    indices = native.query(ctx).matching_specs(
+        str(tmp_path),
+        regexes=[r"pkg/svc\.py"],
+        str_specs=["pkg.util.helper"],
+        abs_paths=[util_path],
+    )
+    fqnames = {n.fqname for n in ctx.nodes_at(indices)}
+    # Regex bucket pulls pkg.svc + its decl; str-spec bucket pulls
+    # pkg.util.helper; abs-path bucket pulls the pkg.util module.
+    assert {"pkg.svc.handler", "pkg.util.helper", "pkg.util"} <= fqnames
 
 
 def test_query_reachable_seed_flags_kwarg(build_decl_graph):

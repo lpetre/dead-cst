@@ -564,169 +564,85 @@ class ProjectContext:
     # with ``.collect()`` or ``.indices()`` terminals.
 
     # ----- FQN resolution ------------------------------------------------
-
-    def resolve(self, fqname: str) -> SymbolNode | None:
-        """Resolve a dotted FQN to either a declaration or a module
-        node.
-
-        Tries an exact decl match first, then an exact module match,
-        then walks back through dotted segments looking for an
-        enclosing decl (``pkg.lib.Cls.method`` resolves to
-        ``pkg.lib.Cls`` because methods don't get their own graph
-        nodes). Returns ``None`` when the fqname can't be found
-        anywhere — never raises.
-        """
-        ...
+    #
+    # Plugins use the DSL: ``query(ctx).declarations()`` for fqname
+    # → decl lookup, ``query(ctx).modules()`` for module fqname /
+    # path lookup, surface / top-level / dunder-all transforms, and
+    # ``query(ctx).literal_lists().for_fqn(fqn).entries()`` for
+    # module-scope string-literal lists. The flat idx-form helpers
+    # below back those DSL terminals and stay on :class:`ProjectContext`
+    # as a low-level escape hatch.
 
     def resolve_idx(self, fqname: str) -> int | None:
-        """Idx-only variant of :meth:`resolve`. Same walk-back rules,
-        returns the positional index into :meth:`nodes` (``None`` when
-        the fqname can't be found anywhere).
-        """
-        ...
-
-    def find_declarations(self, fqname: str) -> list[SymbolNode]:
-        """Every declaration matching ``fqname``, walking back through
-        dotted segments to find the enclosing top-level decl when the
-        exact name doesn't match.
-
-        ``pkg.lib.Cls.method`` returns ``pkg.lib.Cls`` because methods
-        aren't represented as their own graph nodes — same rule the
-        libcst :func:`find_declarations` follows. Modules are never
-        returned; use :meth:`find_module` for that.
+        """First decl matching ``fqname``, falling back to the module
+        match (same walk-back rules as :meth:`find_declarations_indices`
+        but module nodes are included). Returns ``None`` when the
+        fqname can't be found anywhere.
         """
         ...
 
     def find_declarations_indices(self, fqname: str) -> list[int]:
-        """Idx-only variant of :meth:`find_declarations`.
-
-        Same walk-back rules; returns positional indices into
-        :meth:`nodes` rather than allocating ``SymbolNode`` clones — pair
-        with :class:`AddEdgeByIdx` / :class:`AddNodeByIdx` to skip the
-        ``SymbolNode -> idx`` round-trip when wiring against the matched
-        decls.
+        """Every decl matching ``fqname`` (walk-back through dotted
+        segments included). Modules are never returned; use
+        :meth:`find_module_idx` for that. Returns positional indices
+        into :meth:`nodes`.
         """
-        ...
-
-    def find_module(self, fqname: str) -> SymbolNode | None:
-        """Return the module node for the given dotted fqname, if one
-        exists in the project graph."""
         ...
 
     def find_module_idx(self, fqname: str) -> int | None:
-        """Idx-only variant of :meth:`find_module`. Same O(1) lookup,
-        returns the positional index into :meth:`nodes` (``None`` if
-        ``fqname`` doesn't name a project module).
-        """
-        ...
-
-    def module_for(self, path: str) -> SymbolNode | None:
-        """Return the module node owning ``path``, if any.
-
-        O(1) — backed by the same ``module_nodes_by_file`` index
-        :meth:`find_main_blocks` uses, so plugins don't have to scan
-        :meth:`nodes` per call.
+        """O(1) module-by-fqname lookup. Returns the positional index
+        into :meth:`nodes`, or ``None`` if ``fqname`` doesn't name a
+        project module.
         """
         ...
 
     def module_for_indices(self, path: str) -> int | None:
-        """Idx-only variant of :meth:`module_for`. Same O(1) lookup,
-        returns the positional index into :meth:`nodes` (``None`` if
-        ``path`` doesn't name a project module).
+        """O(1) path-to-module lookup. Returns the positional index
+        into :meth:`nodes`, or ``None`` if ``path`` doesn't name a
+        project module.
         """
         ...
 
     def modules_for_paths(self, paths: list[str]) -> list[int | None]:
         """Bulk form of :meth:`module_for_indices`. One ``materialize``
         check + one O(1) lookup per path; missing paths map to ``None``.
-        Lets plugins that ``module_for(path)`` once per ref row collapse
-        N FFI hops into one.
+        Lets plugins that call ``module_for(path)`` once per ref row
+        collapse N FFI hops into one.
         """
         ...
 
-    def module_surface(self, module_fqn: str) -> list[SymbolNode]:
-        """Module node + every transitive decl whose fqname lives
-        under ``module_fqn``.
-
-        Models ``importlib.import_module(module_fqn)``: the module's
-        whole top-level surface plus everything its submodules expose.
+    def module_surface_indices(self, module_fqn: str) -> list[int]:
+        """BFS over the fqname tree from ``module_fqn``: the module
+        idx + every transitive descendant idx. Models
+        ``importlib.import_module(module_fqn)``: the module's whole
+        top-level surface plus everything its submodules expose.
         Empty list when ``module_fqn`` doesn't resolve to a project
         module.
         """
         ...
 
-    def module_surface_indices(self, module_fqn: str) -> list[int]:
-        """Idx-only variant of :meth:`module_surface`. Same BFS over
-        the fqname tree; returns positional indices into :meth:`nodes`
-        rather than allocating ``SymbolNode`` clones.
-        """
-        ...
-
     def module_surfaces_indices(self, module_fqns: list[str]) -> dict[str, list[int]]:
-        """Idx-only variant of :meth:`module_surfaces`. Same single-
-        sweep scan; the per-fqname buckets carry positional indices
-        into :meth:`nodes` rather than ``SymbolNode`` clones.
-        """
-        ...
-
-    def module_surfaces(self, module_fqns: list[str]) -> dict[str, list[SymbolNode]]:
-        """Batched form of :meth:`module_surface`. Resolves every
-        fqname in ``module_fqns`` in a single scan of the internal
-        ``module_by_fqname`` and ``decl_by_fqname`` indices instead
-        of one scan per fqname.
-
-        Returns a dict keyed by input fqname; modules that don't
-        resolve map to empty lists. Duplicate inputs share the same
-        result list. Use when a plugin needs to resolve many module
-        surfaces in one shot (``LiteralListPlugin``'s ``__all__``
-        entries, ``DiscordPyPlugin``'s ``load_extensions`` args, …).
-        """
-        ...
-
-    def find_module_top_level_decls(self, module_fqn: str) -> list[SymbolNode]:
-        """``module_fqn``'s immediate top-level decls — every
-        function / class / variable / import bound at its module scope.
-
-        Models ``from module_fqn import *``: only the names that
-        statement would bind into the importing scope. Unlike
-        :meth:`module_surface`, submodules and their decls are
-        excluded — a ``from p.functions import *`` doesn't pull in
-        ``p.functions.sub.x``. Empty list when ``module_fqn`` doesn't
-        resolve to a project module.
+        """Bulk form: resolve every fqname in ``module_fqns`` in a
+        single scan instead of one scan per fqname. Returns a dict
+        keyed by input fqname; modules that don't resolve map to empty
+        lists. Duplicate inputs share the same result list.
         """
         ...
 
     def find_module_top_level_decls_indices(self, module_fqn: str) -> list[int]:
-        """Idx-only variant of :meth:`find_module_top_level_decls`.
-
-        Returns positional indices into :meth:`nodes` rather than
-        allocating ``SymbolNode`` clones — pair with
-        :class:`AddEdgeByIdx` to skip the ``SymbolNode -> idx``
-        round-trip when emitting edges to every export of a module.
-        """
-        ...
-
-    def find_module_dunder_all_exports(self, module_fqn: str) -> list[SymbolNode] | None:
-        """Decls listed in ``module_fqn``'s ``__all__``, or ``None``
-        when the module doesn't declare ``__all__``.
-
-        The visitor's ``emit_dunder_all_edges`` already wires
-        ``__all__`` → each string-listed decl as a regular edge; this
-        query walks those successor edges and filters out the default
-        ``decl -> parent_module`` edge. The distinction between "no
-        ``__all__``" (``None``) and "empty ``__all__``" (``[]``)
-        matters: callers that want CPython's ``from X import *``
-        semantics should fall back to the non-underscore decl list
-        only in the ``None`` case.
+        """``module_fqn``'s immediate top-level decls — every function
+        / class / variable / import bound at its module scope.
+        Submodules are excluded. Empty list when ``module_fqn`` isn't
+        a project module.
         """
         ...
 
     def find_module_dunder_all_exports_indices(self, module_fqn: str) -> list[int] | None:
-        """Idx-only variant of :meth:`find_module_dunder_all_exports`.
-
-        ``None`` still means "no ``__all__``"; ``[]`` means "empty /
-        unresolvable ``__all__``" — same semantics as the
-        ``SymbolNode``-returning version.
+        """Decls listed in ``module_fqn``'s ``__all__``. ``None`` means
+        "no ``__all__``"; ``[]`` means "empty / unresolvable
+        ``__all__``" — callers wanting CPython's
+        ``from X import *`` semantics fall back to the non-underscore
+        decl list only in the ``None`` case.
         """
         ...
 
@@ -746,64 +662,26 @@ class ProjectContext:
         ...
 
     # ----- Path / name filters ------------------------------------------
-
-    def decls_under(self, path_prefix: str) -> list[SymbolNode]:
-        """Every node whose ``path`` starts with the given prefix."""
-        ...
+    #
+    # Plugins use the DSL: ``query(ctx).decls()`` with the
+    # ``with_path_prefix`` / ``with_path_contains`` / ``with_simple_name_regex``
+    # predicates; ``query(ctx).matching_specs(...)`` for the
+    # OR-form entrypoint matcher. The idx-form helpers below back
+    # those DSL terminals as low-level escape hatches.
 
     def decls_under_indices(self, path_prefix: str) -> list[int]:
-        """Idx-only variant of :meth:`decls_under`. Same scan, returns
-        positional indices into :meth:`nodes` rather than allocating
-        ``SymbolNode`` clones.
-        """
-        ...
-
-    def decls_matching(self, substring: str) -> list[SymbolNode]:
-        """Every node whose ``path`` contains ``substring`` anywhere.
-
-        Useful for path-pattern plugins (``alembic/versions/``,
-        ``.ignore.py``).
+        """Every node whose ``path`` starts with ``path_prefix``.
+        Returns positional indices into :meth:`nodes`.
         """
         ...
 
     def decls_matching_indices(self, substring: str) -> list[int]:
-        """Idx-only variant of :meth:`decls_matching`. Same scan,
-        returns positional indices into :meth:`nodes`.
-        """
-        ...
-
-    def decls_matching_name(self, pattern: str) -> list[SymbolNode]:
-        """Every top-level decl whose simple name matches ``pattern``
-        (a regex).
-
-        Used by plugins that key on naming conventions —
-        :class:`ModuleDundersPlugin` (``__xxx__`` names),
-        :class:`PytestPlugin` (``test_*`` / ``Test*``), etc.
-        """
+        """Every node whose ``path`` contains ``substring`` anywhere."""
         ...
 
     def decls_matching_name_indices(self, pattern: str) -> list[int]:
-        """Idx-only variant of :meth:`decls_matching_name`. Same scan
-        and kind filter, returns positional indices into :meth:`nodes`.
-        """
-        ...
-
-    def find_nodes_matching_specs(
-        self,
-        project_root: str,
-        regexes: list[str],
-        str_specs: list[str],
-        abs_paths: list[str],
-    ) -> list[SymbolNode]:
-        """Match nodes against pre-classified path / fqname specs.
-
-        Avoids the per-node FFI hop + ``pathlib.Path`` allocation that
-        a ``for node in ctx.nodes(): ...`` loop pays. ``regexes`` are
-        anchored at the start of input (``re.Pattern.match`` semantics).
-        ``str_specs`` match exactly against the relative path OR the
-        node's fqname. ``abs_paths`` match exactly against the
-        absolute path.
-        """
+        """Every top-level decl (function / class / variable / import /
+        type_alias) whose simple name matches ``pattern`` (a regex)."""
         ...
 
     def find_nodes_matching_specs_indices(
@@ -813,9 +691,11 @@ class ProjectContext:
         str_specs: list[str],
         abs_paths: list[str],
     ) -> list[int]:
-        """Idx-only variant of :meth:`find_nodes_matching_specs`. Same
-        scan, returns positional indices into :meth:`nodes` rather than
-        allocating ``SymbolNode`` clones.
+        """OR-form spec matcher. ``regexes`` are anchored at the start
+        of input (``re.Pattern.match`` semantics) against the relative
+        path. ``str_specs`` match exactly against the relative path OR
+        the node's fqname. ``abs_paths`` match exactly against the
+        absolute path. Returns positional indices into :meth:`nodes`.
         """
         ...
 
@@ -856,24 +736,14 @@ class ProjectContext:
         """
         ...
 
-    def direct_predecessors(self, node: SymbolNode, *, skip_flags: int = 0) -> list[SymbolNode]:
-        """One-hop reverse step: every node with an edge directly into
-        ``node``.
-
-        Unlike :meth:`ancestors`, this does *not* take the transitive
-        closure — it only returns the immediate predecessors. Dedups by
-        source node, so a pair of parallel edges with different
-        :class:`EdgeFlags` between the same two nodes only produces one
-        entry. ``skip_flags`` filters edges by intersecting flag mask —
-        same semantics as :meth:`ancestors`.
-        """
-        ...
-
     def direct_predecessors_idx(self, idx: int, *, skip_flags: int = 0) -> list[int]:
-        """Idx-keyed variant of :meth:`direct_predecessors`. Takes a
-        positional index into :meth:`nodes` and returns predecessor
-        indices rather than allocating ``SymbolNode`` clones. Raises
-        :class:`IndexError` when ``idx`` is out of range.
+        """One-hop reverse step: every node with an edge directly into
+        ``idx``. Dedups by source idx, so a pair of parallel edges
+        with different :class:`EdgeFlags` between the same two nodes
+        only produces one entry. ``skip_flags`` filters edges by
+        intersecting flag mask — same semantics as
+        :meth:`ancestors_indices`. Plugins use the DSL:
+        ``native.query(ctx).from_idx(idx).direct_predecessors()``.
         """
         ...
 
@@ -958,44 +828,28 @@ class ProjectContext:
         ...
 
     # ----- Pure scans over the in-progress graph ------------------------
-
-    def find_module_dunders(self) -> list[SymbolNode]:
-        """Every top-level variable node whose name matches ``__xxx__``.
-
-        Pure scan over already-interned nodes — no ty re-query needed
-        — because the visitor's decl pass already minted one node per
-        global-scope variable binding.
-        """
-        ...
+    #
+    # Plugins use the DSL: ``query(ctx).modules().with_dunders().indices()``
+    # for module-dunder enumeration, ``query(ctx).main_blocks().index_pairs()``
+    # for ``if __name__ == "__main__":`` blocks. The idx-form helpers
+    # below back those DSL terminals.
 
     def find_module_dunders_indices(self) -> list[int]:
-        """Idx-only variant of :meth:`find_module_dunders`. Same scan,
-        returns positional indices into :meth:`nodes` rather than
-        allocating ``SymbolNode`` clones.
-        """
+        """Every top-level variable / function node whose name matches
+        ``__xxx__``. Pure scan over already-interned nodes — no ty
+        re-query needed."""
         ...
 
     # The import-of-module surface lives entirely on
     # :class:`ImportQuery`. Use ``native.query(ctx).imports().of(m)``
     # then ``.collect()`` / ``.indices()`` / ``.count()`` / ``.exists()``.
 
-    def find_main_blocks(self) -> list[tuple[SymbolNode, list[SymbolNode]]]:
-        """``(module_node, [decls inside the block])`` for every file
-        with a top-level ``if __name__ == "__main__":`` block.
-
-        The decls list contains the file's class / function / variable
-        / import nodes whose source position falls inside the block's
-        range — same shape ``MainBlockPlugin``'s libcst path computes
-        from the visitor's payload.
-        """
-        ...
-
     def find_main_blocks_indices(self) -> list[tuple[int, list[int]]]:
-        """Idx-only variant of :meth:`find_main_blocks`. Returns
-        ``(module_idx, [decl_idx])`` pairs into :meth:`nodes` rather
-        than ``SymbolNode`` clones — pair with :class:`AddNodeByIdx` to
-        emit a marker per main block without round-tripping its decls
-        through ``Py<SymbolNode>``.
+        """``(module_idx, [decl_idx])`` pairs into :meth:`nodes` for
+        every file with a top-level ``if __name__ == "__main__":``
+        block. The decls list contains the file's class / function /
+        variable / import nodes whose source position falls inside the
+        block's range.
         """
         ...
 

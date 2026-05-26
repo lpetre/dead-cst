@@ -639,9 +639,7 @@ class LiteralListPlugin(Plugin):
         surfaces = ctx.module_surfaces_indices(entries)
         for entry in entries:
             target_idxs: list[int] = list(surfaces.get(entry, ()))
-            target_idxs.extend(
-                native.query(ctx).declarations().with_fqname(entry).indices()
-            )
+            target_idxs.extend(native.query(ctx).declarations().with_fqname(entry).indices())
             if not target_idxs:
                 continue
             (_kind, marker_path, _fq, _flags) = ctx.node_attrs([target_idxs[0]])[0]

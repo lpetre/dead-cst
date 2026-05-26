@@ -34,7 +34,7 @@ use crate::builder::{
 };
 use crate::file_payload::{file_to_edges, file_to_nodes, FileEdges, NodeKind, NodeRef};
 use crate::file_ref_edges::{file_to_ref_edges, FileRefEdges};
-use crate::graph::{intern_kind, DeclIndex, Import, MainBlock, NativeGraph, SymbolNode};
+use crate::graph::{intern_kind, DeclIndex, Import, NativeGraph, SymbolNode};
 use crate::helpers::{
     call_callee_matches_var, class_body_defines_method, collect_all_imports_local,
     collect_modules_imports_local, decorators_match_imports, extract_call_args_kwargs,
@@ -1598,19 +1598,8 @@ impl ProjectContext {
     /// and module-scope PEP 562 dunder functions (``__getattr__``,
     /// ``__dir__``) — both are observable to import / attribute-access
     /// machinery and must be kept alive even when no source reference
-    /// points at them.
-    pub(crate) fn find_module_dunders(&self, py: Python<'_>) -> PyResult<Vec<Py<SymbolNode>>> {
-        let indices = self.find_module_dunders_indices(py)?;
-        let outputs = self.materialized("find_module_dunders")?;
-        Ok(indices
-            .into_iter()
-            .map(|i| outputs.builder.nodes[i].clone_ref(py))
-            .collect())
-    }
-
-    /// Idx-only variant of :meth:`find_module_dunders`. Same scan,
-    /// returns positional indices into ``ctx.nodes()`` rather than
-    /// allocating ``Py<SymbolNode>`` clones.
+    /// points at them. Plugins use the DSL form:
+    /// ``native.query(ctx).modules().with_dunders().indices()``.
     pub(crate) fn find_module_dunders_indices(&self, py: Python<'_>) -> PyResult<Vec<usize>> {
         let outputs = self.materialized("find_module_dunders_indices")?;
         let mut out = Vec::new();
@@ -1642,31 +1631,6 @@ impl ProjectContext {
     ///   OR the node's fqname.
     /// * `abs_paths` — exact equality match against the node's
     ///   absolute path.
-    pub(crate) fn find_nodes_matching_specs(
-        &self,
-        py: Python<'_>,
-        project_root: &str,
-        regexes: Vec<String>,
-        str_specs: Vec<String>,
-        abs_paths: Vec<String>,
-    ) -> PyResult<Vec<Py<SymbolNode>>> {
-        let indices = self.find_nodes_matching_specs_indices(
-            py,
-            project_root,
-            regexes,
-            str_specs,
-            abs_paths,
-        )?;
-        let outputs = self.materialized("find_nodes_matching_specs")?;
-        Ok(indices
-            .into_iter()
-            .map(|i| outputs.builder.nodes[i].clone_ref(py))
-            .collect())
-    }
-
-    /// Idx-only variant of :meth:`find_nodes_matching_specs`. Same scan,
-    /// returns positional indices into ``ctx.nodes()`` rather than
-    /// allocating ``Py<SymbolNode>`` clones.
     pub(crate) fn find_nodes_matching_specs_indices(
         &self,
         py: Python<'_>,
@@ -1805,44 +1769,16 @@ impl ProjectContext {
     /// aren't represented as their own graph nodes — same rule the
     /// libcst :func:`find_declarations` follows. Modules are never
     /// returned; use :meth:`find_module` for that.
-    pub(crate) fn find_declarations(
-        &self,
-        py: Python<'_>,
-        fqname: &str,
-    ) -> PyResult<Vec<Py<SymbolNode>>> {
-        let outputs = self.materialized("find_declarations")?;
-        let indices = find_declarations_indices_in(&outputs, fqname);
-        Ok(indices
-            .into_iter()
-            .map(|i| outputs.builder.nodes[i].clone_ref(py))
-            .collect())
-    }
-
-    /// Idx-only variant of :meth:`find_declarations`. Same walk-back
-    /// rules, returns positional indices into ``ctx.nodes()`` rather
-    /// than allocating ``Py<SymbolNode>`` clones.
+    /// Indices for every project decl whose fqname matches (walk-back
+    /// included). Plugins use the DSL:
+    /// ``native.query(ctx).declarations().with_fqname(fqn).indices()``.
     pub(crate) fn find_declarations_indices(&self, fqname: &str) -> PyResult<Vec<usize>> {
         let outputs = self.materialized("find_declarations_indices")?;
         Ok(find_declarations_indices_in(&outputs, fqname))
     }
 
-    /// Return the module node for the given dotted fqname, if it
-    /// exists in the project graph.
-    pub(crate) fn find_module(
-        &self,
-        py: Python<'_>,
-        fqname: &str,
-    ) -> PyResult<Option<Py<SymbolNode>>> {
-        let outputs = self.materialized("find_module")?;
-        Ok(outputs
-            .module_by_fqname
-            .get(fqname)
-            .map(|&idx| outputs.builder.nodes[idx].clone_ref(py)))
-    }
-
-    /// Idx-only variant of :meth:`find_module`. Same O(1) lookup,
-    /// returns the positional index into ``ctx.nodes()`` (``None`` if
-    /// ``fqname`` doesn't name a project module).
+    /// O(1) module-by-fqname lookup. Plugins use the DSL:
+    /// ``native.query(ctx).modules().with_fqn(fqn).first_idx()``.
     pub(crate) fn find_module_idx(&self, fqname: &str) -> PyResult<Option<usize>> {
         let outputs = self.materialized("find_module_idx")?;
         Ok(outputs.module_by_fqname.get(fqname).copied())
@@ -1851,21 +1787,8 @@ impl ProjectContext {
 
 #[pymethods]
 impl ProjectContext {
-    /// Return the module node owning ``path``, if any. O(1) — backed
-    /// by the same ``module_nodes_by_file`` index `find_main_blocks`
-    /// uses, so plugins don't have to scan ``nodes()`` per call.
-    pub(crate) fn module_for(
-        &self,
-        py: Python<'_>,
-        path: &str,
-    ) -> PyResult<Option<Py<SymbolNode>>> {
-        let outputs = self.materialized("module_for")?;
-        Ok(module_for_idx_in(&outputs, path).map(|idx| outputs.builder.nodes[idx].clone_ref(py)))
-    }
-
-    /// Idx-only variant of :meth:`module_for`. Same O(1) lookup,
-    /// returns the positional index into ``ctx.nodes()`` (``None`` if
-    /// ``path`` doesn't name a project module).
+    /// O(1) path-to-module lookup. Plugins use the DSL:
+    /// ``native.query(ctx).modules().with_path(path).first_idx()``.
     pub(crate) fn module_for_indices(&self, path: &str) -> PyResult<Option<usize>> {
         let outputs = self.materialized("module_for_indices")?;
         Ok(module_for_idx_in(&outputs, path))
@@ -1891,14 +1814,6 @@ impl ProjectContext {
     /// decl (``pkg.lib.Cls.method`` resolves to ``pkg.lib.Cls`` because
     /// methods don't get their own graph nodes). Returns ``None`` when
     /// the fqname can't be found anywhere — never raises.
-    pub(crate) fn resolve(&self, py: Python<'_>, fqname: &str) -> PyResult<Option<Py<SymbolNode>>> {
-        let outputs = self.materialized("resolve")?;
-        Ok(resolve_idx_in(&outputs, fqname).map(|i| outputs.builder.nodes[i].clone_ref(py)))
-    }
-
-    /// Idx-only variant of :meth:`resolve`. Same walk-back rules,
-    /// returns the positional index into ``ctx.nodes()`` (``None``
-    /// when the fqname can't be found anywhere).
     pub(crate) fn resolve_idx(&self, fqname: &str) -> PyResult<Option<usize>> {
         let outputs = self.materialized("resolve_idx")?;
         Ok(resolve_idx_in(&outputs, fqname))
@@ -1918,22 +1833,9 @@ impl ProjectContext {
     /// ``pkg.foo`` but its synthetic sub-fqnames (``pkg.foo.MyClass.method``)
     /// are not surfaced; nested defs aren't graph nodes anyway, and the
     /// "module surface" contract is per-module.
-    pub(crate) fn module_surface(
-        &self,
-        py: Python<'_>,
-        module_fqn: &str,
-    ) -> PyResult<Vec<Py<SymbolNode>>> {
-        let outputs = self.materialized("module_surface")?;
-        let indices = module_surface_indices_in(&outputs, py, module_fqn);
-        Ok(indices
-            .into_iter()
-            .map(|i| outputs.builder.nodes[i].clone_ref(py))
-            .collect())
-    }
-
-    /// Idx-only variant of :meth:`module_surface`. Same BFS over the
-    /// fqname tree; returns positional indices into ``ctx.nodes()``
-    /// instead of allocating ``Py<SymbolNode>`` clones.
+    /// BFS over the fqname tree from ``module_fqn``: the module idx
+    /// + every transitive descendant idx. Plugins use the DSL:
+    /// ``native.query(ctx).modules().with_fqn(fqn).surface().indices()``.
     pub(crate) fn module_surface_indices(
         &self,
         py: Python<'_>,
@@ -1943,40 +1845,17 @@ impl ProjectContext {
         Ok(module_surface_indices_in(&outputs, py, module_fqn))
     }
 
-    /// Batched form of :meth:`module_surface`. Resolves every fqname
-    /// in ``module_fqns`` in a single scan of ``module_by_fqname`` +
-    /// ``decl_by_fqname`` instead of one scan per fqname. The N
-    /// per-call materialize-lookup + N scans collapse to one of each.
-    /// Returns a dict keyed by input fqname; missing modules map to
-    /// empty lists. Duplicate inputs share the same result list.
-    /// Idx-only variant of :meth:`module_surfaces`. Same single-sweep
-    /// scan; the per-fqname buckets carry positional indices into
-    /// ``ctx.nodes()`` instead of allocated ``Py<SymbolNode>`` clones.
+    /// Bulk form: resolve every fqname in ``module_fqns`` in a single
+    /// scan. Returns a dict keyed by input fqname; missing modules
+    /// map to empty lists. No DSL equivalent — the bulk shape is the
+    /// reason this exists (one materialize check + one scan instead
+    /// of N).
     pub(crate) fn module_surfaces_indices(
         &self,
         module_fqns: Vec<String>,
     ) -> PyResult<FxHashMap<String, Vec<usize>>> {
         let outputs = self.materialized("module_surfaces_indices")?;
         Ok(module_surfaces_indices_in(&outputs, &module_fqns))
-    }
-
-    pub(crate) fn module_surfaces(
-        &self,
-        py: Python<'_>,
-        module_fqns: Vec<String>,
-    ) -> PyResult<FxHashMap<String, Vec<Py<SymbolNode>>>> {
-        let outputs = self.materialized("module_surfaces")?;
-        let idx_buckets = module_surfaces_indices_in(&outputs, &module_fqns);
-        let mut buckets: FxHashMap<String, Vec<Py<SymbolNode>>> =
-            FxHashMap::with_capacity_and_hasher(idx_buckets.len(), Default::default());
-        for (key, idxs) in idx_buckets {
-            let nodes = idxs
-                .into_iter()
-                .map(|idx| outputs.builder.nodes[idx].clone_ref(py))
-                .collect();
-            buckets.insert(key, nodes);
-        }
-        Ok(buckets)
     }
 }
 
@@ -1991,22 +1870,9 @@ impl ProjectContext {
     /// excluded — a `from p.functions import *` doesn't pull in
     /// `p.functions.sub.x`. Empty list when ``module_fqn`` doesn't
     /// resolve to a project module.
-    pub(crate) fn find_module_top_level_decls(
-        &self,
-        py: Python<'_>,
-        module_fqn: &str,
-    ) -> PyResult<Vec<Py<SymbolNode>>> {
-        let indices = self.find_module_top_level_decls_indices(py, module_fqn)?;
-        let outputs = self.materialized("find_module_top_level_decls")?;
-        Ok(indices
-            .into_iter()
-            .map(|idx| outputs.builder.nodes[idx].clone_ref(py))
-            .collect())
-    }
-
-    /// Idx-only variant of :meth:`find_module_top_level_decls`. Same
-    /// scan, returns positional indices into ``ctx.nodes()`` rather
-    /// than allocating ``Py<SymbolNode>`` clones.
+    /// One-level lookup via the ``children_by_parent`` fqname tree;
+    /// excludes module children. Plugins use the DSL:
+    /// ``native.query(ctx).modules().with_fqn(fqn).top_level().indices()``.
     pub(crate) fn find_module_top_level_decls_indices(
         &self,
         py: Python<'_>,
@@ -2047,30 +1913,11 @@ impl ProjectContext {
     /// that want CPython's ``from X import *`` semantics should fall
     /// back to the non-underscore decl list only in the ``None``
     /// case.
-    pub(crate) fn find_module_dunder_all_exports(
-        &self,
-        py: Python<'_>,
-        module_fqn: &str,
-    ) -> PyResult<Option<Vec<Py<SymbolNode>>>> {
-        let Some(indices) = self.find_module_dunder_all_exports_indices(module_fqn)? else {
-            return Ok(None);
-        };
-        let outputs = self.materialized("find_module_dunder_all_exports")?;
-        Ok(Some(
-            indices
-                .into_iter()
-                .map(|idx| outputs.builder.nodes[idx].clone_ref(py))
-                .collect(),
-        ))
-    }
-
-    /// Idx-only variant of :meth:`find_module_dunder_all_exports`.
-    /// Same lookup, returns positional indices into ``ctx.nodes()``
-    /// rather than allocating ``Py<SymbolNode>`` clones. ``None``
-    /// still means "no ``__all__``"; ``Some([])`` means "empty /
-    /// unresolvable ``__all__``" (callers wanting CPython's
-    /// ``from X import *`` semantics fall back to the non-underscore
-    /// decl list only in the ``None`` case).
+    /// Read the entries from ``{module_fqn}.__all__``'s string-literal
+    /// RHS and resolve each name in the module's scope. ``None`` means
+    /// "no ``__all__``"; ``Some([])`` means "empty / unresolvable".
+    /// Plugins use the DSL:
+    /// ``native.query(ctx).modules().with_fqn(fqn).dunder_all()``.
     pub(crate) fn find_module_dunder_all_exports_indices(
         &self,
         module_fqn: &str,
@@ -2149,23 +1996,8 @@ impl ProjectContext {
 
 #[pymethods]
 impl ProjectContext {
-    /// Every node whose ``path`` starts with the given prefix.
-    pub(crate) fn decls_under(
-        &self,
-        py: Python<'_>,
-        path_prefix: &str,
-    ) -> PyResult<Vec<Py<SymbolNode>>> {
-        let indices = self.decls_under_indices(py, path_prefix)?;
-        let outputs = self.materialized("decls_under")?;
-        Ok(indices
-            .into_iter()
-            .map(|i| outputs.builder.nodes[i].clone_ref(py))
-            .collect())
-    }
-
-    /// Idx-only variant of :meth:`decls_under`. Same scan, returns
-    /// positional indices into ``ctx.nodes()`` rather than allocating
-    /// ``Py<SymbolNode>`` clones.
+    /// Every node whose ``path`` starts with ``path_prefix``. Plugins
+    /// use the DSL: ``native.query(ctx).decls().with_path_prefix(p)``.
     pub(crate) fn decls_under_indices(
         &self,
         py: Python<'_>,
@@ -2183,22 +2015,8 @@ impl ProjectContext {
     }
 
     /// Every node whose ``path`` contains ``substring`` anywhere.
-    /// Useful for path-pattern plugins (``alembic/versions/``, ``.ignore.py``).
-    pub(crate) fn decls_matching(
-        &self,
-        py: Python<'_>,
-        substring: &str,
-    ) -> PyResult<Vec<Py<SymbolNode>>> {
-        let indices = self.decls_matching_indices(py, substring)?;
-        let outputs = self.materialized("decls_matching")?;
-        Ok(indices
-            .into_iter()
-            .map(|i| outputs.builder.nodes[i].clone_ref(py))
-            .collect())
-    }
-
-    /// Idx-only variant of :meth:`decls_matching`. Same scan, returns
-    /// positional indices into ``ctx.nodes()``.
+    /// Plugins use the DSL:
+    /// ``native.query(ctx).decls().with_path_contains(s)``.
     pub(crate) fn decls_matching_indices(
         &self,
         py: Python<'_>,
@@ -2215,25 +2033,10 @@ impl ProjectContext {
             .collect())
     }
 
-    /// Every top-level decl whose simple name matches ``regex``.
-    /// Fills the gap the screenshot's API doesn't cover — needed by
-    /// :class:`ModuleDundersPlugin` (``__xxx__`` names),
-    /// :class:`PytestPlugin` (``test_*`` / ``Test*``), etc.
-    pub(crate) fn decls_matching_name(
-        &self,
-        py: Python<'_>,
-        pattern: &str,
-    ) -> PyResult<Vec<Py<SymbolNode>>> {
-        let indices = self.decls_matching_name_indices(py, pattern)?;
-        let outputs = self.materialized("decls_matching_name")?;
-        Ok(indices
-            .into_iter()
-            .map(|i| outputs.builder.nodes[i].clone_ref(py))
-            .collect())
-    }
-
-    /// Idx-only variant of :meth:`decls_matching_name`. Same scan and
-    /// kind filter, returns positional indices into ``ctx.nodes()``.
+    /// Every top-level decl (function / class / variable / import /
+    /// type_alias) whose simple name matches ``pattern``. Plugins use
+    /// the DSL — compose
+    /// ``decls().with_simple_name_regex(p).with_kinds([...])``.
     pub(crate) fn decls_matching_name_indices(
         &self,
         py: Python<'_>,
@@ -2345,32 +2148,10 @@ impl ProjectContext {
     }
 
     /// One-hop reverse step: every node with an edge directly into
-    /// ``node`` (i.e. the immediate predecessors, *not* the transitive
-    /// closure :meth:`ancestors` returns). ``skip_flags`` filters edges
-    /// by intersecting flag mask — same semantics as :meth:`ancestors`.
-    ///
-    /// Dedups by source index, so a pair of parallel edges with
-    /// different ``EdgeFlags`` between the same two nodes only produces
-    /// one entry in the result. Result order is unspecified.
-    #[pyo3(signature = (node, *, skip_flags = 0))]
-    pub(crate) fn direct_predecessors(
-        &self,
-        py: Python<'_>,
-        node: &SymbolNode,
-        skip_flags: u32,
-    ) -> PyResult<Vec<Py<SymbolNode>>> {
-        let outputs = self.materialized("direct_predecessors")?;
-        let idx = lookup_idx(&outputs.builder, node, "node")?;
-        let indices = direct_predecessors_idxs_in(&outputs, idx, skip_flags);
-        Ok(indices
-            .into_iter()
-            .map(|i| outputs.builder.nodes[i].clone_ref(py))
-            .collect())
-    }
-
-    /// Idx-keyed variant of :meth:`direct_predecessors`. Takes a
-    /// positional index into ``ctx.nodes()``; returns predecessor
-    /// indices rather than allocating ``Py<SymbolNode>`` clones.
+    /// ``idx``. ``skip_flags`` filters edges by intersecting flag
+    /// mask — same semantics as :meth:`ancestors_indices`. Dedups by
+    /// source index. Plugins use the DSL:
+    /// ``native.query(ctx).from_idx(idx).direct_predecessors()``.
     #[pyo3(signature = (idx, *, skip_flags = 0))]
     pub(crate) fn direct_predecessors_idx(
         &self,
@@ -2414,34 +2195,12 @@ impl ProjectContext {
 
 #[pymethods]
 impl ProjectContext {
-    /// Return ``(module_node, [decls inside the block])`` for every
-    /// file with a top-level ``if __name__ == "__main__":`` block.
-    ///
-    /// The decls list contains the file's class / function / variable
-    /// / import nodes whose source position falls inside the block's
-    /// range — same shape ``MainBlockPlugin``'s libcst path computes
-    /// from the visitor's payload.
-    pub(crate) fn find_main_blocks(&self, py: Python<'_>) -> PyResult<Vec<MainBlock>> {
-        let indexed = self.find_main_blocks_indices()?;
-        let outputs = self.materialized("find_main_blocks")?;
-        Ok(indexed
-            .into_iter()
-            .map(|(module_idx, decl_idxs)| {
-                let module = outputs.builder.nodes[module_idx].clone_ref(py);
-                let decls = decl_idxs
-                    .into_iter()
-                    .map(|i| outputs.builder.nodes[i].clone_ref(py))
-                    .collect();
-                (module, decls)
-            })
-            .collect())
-    }
-
-    /// Idx-only variant of :meth:`find_main_blocks`. Returns
-    /// ``(module_idx, [decl_idx])`` pairs into ``ctx.nodes()`` rather
-    /// than allocating ``Py<SymbolNode>`` clones. Same single-pass
-    /// ``__main__`` substring filter + ``find_main_block_range`` +
-    /// global-index bucketing as the node form.
+    /// Return ``(module_idx, [decl_idx])`` pairs into ``ctx.nodes()``
+    /// for every file with a top-level ``if __name__ == "__main__":``
+    /// block. The decls list contains the file's class / function /
+    /// variable / import nodes whose source position falls inside the
+    /// block's range. Plugins use the DSL:
+    /// ``native.query(ctx).main_blocks().index_pairs()``.
     pub(crate) fn find_main_blocks_indices(&self) -> PyResult<Vec<(usize, Vec<usize>)>> {
         let outputs = self.materialized("find_main_blocks_indices")?;
 

@@ -417,8 +417,9 @@ def test_where_kwarg_with_nativenode_raises(make_ctx):
     captured: list[Exception] = []
 
     def capture(ctx):
-        mod = ctx.find_module("tests")
-        assert mod is not None
+        mod_idx = native.query(ctx).modules().with_fqn("tests").first_idx()
+        assert mod_idx is not None
+        mod = ctx.nodes_at([mod_idx])[0]
         try:
             (
                 native.query(ctx)

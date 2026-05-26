@@ -70,7 +70,7 @@ def test_plugin_runs_once_per_project(make_ctx):
         name = "counter"
 
         def run(self, ctx: native.ProjectContext) -> None:
-            calls.append(len(ctx.find_module_dunders()))
+            calls.append(len(native.query(ctx).modules().with_dunders().indices()))
 
     ctx = make_ctx(
         {
@@ -265,7 +265,7 @@ def test_query_outside_materialize_raises(make_ctx):
     """Calling a query method on an un-materialized context errors clearly."""
     ctx = make_ctx({"mod.py": "x = 1\n"})
     with pytest.raises(RuntimeError, match="find_module_dunders"):
-        ctx.find_module_dunders()
+        native.query(ctx).modules().with_dunders().indices()
 
 
 def test_materialize_is_idempotent(make_ctx):
