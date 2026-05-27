@@ -189,6 +189,37 @@ print(meta.node_count, meta.edge_count, dict(meta.user_meta))
 `kept_alive_by_flags_only`) delegate to the rust BFS without copying
 the graph into Python.
 
+### Incremental rebuilds
+
+For long-lived `Analysis` instances (LSP harnesses, watch loops),
+`Analysis.re_materialize(events=None)` rebuilds the graph against the
+same `ProjectContext` without tearing down ty's salsa db. With no
+argument it auto-detects changes via
+`native.ProjectContext.detect_changes()` (which delegates to ty's
+`apply_changes` rescan handler: mtime-checked `Files::sync_all`,
+project file re-walk, metadata rediscovery). Pass an explicit
+`list[native.ChangeEvent]` when you know what changed (e.g. an LSP
+consuming `didChangeWatchedFiles`):
+
+```python
+from dead_cst import _native as native
+
+analysis.materialize_all()
+# ... source files change on disk ...
+analysis.re_materialize()                                   # autodetect
+analysis.re_materialize([                                   # or explicit
+    native.ChangeEvent.changed("/abs/foo.py"),
+    native.ChangeEvent.created("/abs/new.py"),
+    native.ChangeEvent.deleted("/abs/gone.py"),
+])
+```
+
+Salsa's per-file cache survives across calls, so unchanged files skip
+parsing / `file_to_nodes` / `file_to_edges` / `file_to_ref_edges`
+recomputation; cross-file importers invalidate transitively through
+salsa's read-tracking. The assemble pass and plugin pass run on every
+call, but they're cheap O(N) walks over the warm cache.
+
 Entrypoint detection is fully plugin-driven. Builtins:
 
 | Plugin | Purpose |
