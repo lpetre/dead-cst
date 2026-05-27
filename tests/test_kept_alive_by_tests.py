@@ -111,5 +111,6 @@ def test_analysis_method_returns_strict_diff(make_analysis, write_files):
     )
     analysis = make_analysis(plugins=[PytestPlugin()])
     blast = analysis.kept_alive_by_flags_only(NodeFlags.TESTCASE)
-    fqnames = {n.fqname for n in blast}
+    ctx = analysis.materialize_all()
+    fqnames = {a.fqname for a in ctx.node_attrs(list(blast))}
     assert "pkg.lib.helper" in fqnames

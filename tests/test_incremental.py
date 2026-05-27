@@ -48,7 +48,8 @@ def _node_keys(ctx) -> list[tuple[str, str, int]]:
 
 
 def _dead_fqnames(analysis: Analysis) -> set[str]:
-    return {n.fqname for n in analysis.dead()}
+    ctx = analysis.materialize_all()
+    return {a.fqname for a in ctx.node_attrs(list(analysis.dead()))}
 
 
 def _build_fresh(tmp_path: Path, *, plugins=()) -> Analysis:

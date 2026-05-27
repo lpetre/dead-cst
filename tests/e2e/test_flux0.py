@@ -95,9 +95,9 @@ def _ancestor_fqnames(base: Path, target_fqname: str) -> list[str]:
     """
     analysis = Analysis(base, plugins=[MainBlockPlugin()])
     ctx = analysis.materialize_all()
-    target = next((n for n in ctx.nodes() if n.fqname == target_fqname), None)
-    assert target is not None, f"{target_fqname} not in graph"
-    return [n.fqname for n in analysis.ancestors(target)]
+    target_idx = next((i for i, n in enumerate(ctx.nodes()) if n.fqname == target_fqname), None)
+    assert target_idx is not None, f"{target_fqname} not in graph"
+    return [a.fqname for a in ctx.node_attrs(analysis.ancestors(target_idx))]
 
 
 def test_why_alive_flux0_server_main(flux0_server_src):

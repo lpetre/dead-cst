@@ -1722,7 +1722,19 @@ fn collect_prepared_plugin_ops(
     plugin: &PyObject,
     sink: &mut Vec<PreparedOp>,
 ) -> PyResult<()> {
-    let result = plugin.bind(py).call_method1("run", (ctx.clone_ref(py),))?;
+    // Native fast path: ``NativePlugin`` instances expose a rust
+    // [`NativePluginImpl::run`] that fills ``sink`` directly with
+    // [`PreparedOp`] variants — no Python ``.run(ctx)`` call, no
+    // ``GraphOp`` allocation per yield, no ``prepare_graph_op``
+    // extraction loop. The frozen-graph contract is identical to
+    // the Python path: the impl borrows ``ctx`` immutably; the
+    // apply pass folds ``sink`` in afterwards.
+    let plugin_bound = plugin.bind(py);
+    if let Ok(native) = plugin_bound.downcast::<crate::native_plugins::NativePlugin>() {
+        let ctx_ref = ctx.borrow(py);
+        return native.borrow().inner.run(&ctx_ref, sink);
+    }
+    let result = plugin_bound.call_method1("run", (ctx.clone_ref(py),))?;
     if result.is_none() {
         return Ok(());
     }
@@ -3905,7 +3917,6 @@ impl ProjectContext {
     /// :class:`IndexError` when any index is out of range.
     pub(crate) fn node_attrs(
         &self,
-        py: Python<'_>,
         indices: Vec<usize>,
     ) -> PyResult<Vec<crate::helpers::NodeAttrs>> {
         let outputs = self.materialized("node_attrs")?;
@@ -3917,7 +3928,11 @@ impl ProjectContext {
                     "node index {idx} out of range (len={len})"
                 )));
             }
-            let node = outputs.builder.nodes[idx].borrow(py);
+            // ``Py<T>::get`` is GIL-free for frozen pyclasses with
+            // ``Sync`` fields. ``SymbolNode`` is ``#[pyclass(frozen)]``
+            // with all-``Sync`` fields, so we read its data without
+            // threading ``Python<'_>`` through every internal helper.
+            let node = outputs.builder.nodes[idx].get();
             out.push(crate::helpers::NodeAttrs {
                 kind: node.kind.to_string(),
                 path: node.path.clone(),
@@ -3936,7 +3951,7 @@ impl ProjectContext {
     ///
     /// Validates bounds and raises :class:`IndexError` when any index
     /// is out of range. Mirrors the contract of :meth:`node_attrs`.
-    pub(crate) fn node_paths(&self, py: Python<'_>, indices: Vec<usize>) -> PyResult<Vec<String>> {
+    pub(crate) fn node_paths(&self, indices: Vec<usize>) -> PyResult<Vec<String>> {
         let outputs = self.materialized("node_paths")?;
         let len = outputs.builder.nodes.len();
         let mut out: Vec<String> = Vec::with_capacity(indices.len());
@@ -3946,7 +3961,10 @@ impl ProjectContext {
                     "node index {idx} out of range (len={len})"
                 )));
             }
-            out.push(outputs.builder.nodes[idx].borrow(py).path.clone());
+            // ``Py::get`` is GIL-free on ``#[pyclass(frozen)]`` types
+            // with ``Sync`` fields; SymbolNode qualifies. See
+            // :meth:`node_attrs` for the rationale.
+            out.push(outputs.builder.nodes[idx].get().path.clone());
         }
         Ok(out)
     }

@@ -324,6 +324,51 @@ class CollectedOps:
     the collect and apply phases of plugin execution.
     """
 
+class NativePlugin:
+    """Rust-side plugin — in-tree only.
+
+    Constructed via a static factory (one per available bundled impl,
+    e.g. :meth:`main_block`); the default constructor is intentionally
+    not exposed. Drop-in interchangeable with a Python
+    :class:`Plugin` subclass in :class:`Analysis` plugin lists — the
+    harness detects the wrapper and dispatches to the rust impl
+    directly, skipping the Python ``.run(ctx)`` call and the per-op
+    ``GraphOp`` allocation.
+
+    **Not an extension mechanism.** Native plugins are a hot-path
+    optimization for bundled plugins whose logic is fixed; the
+    underlying rust trait and types are crate-private with no
+    stability commitment. Out-of-tree plugin authors use the Python
+    :class:`Plugin` protocol — they can still write hot code in rust
+    (as a pyo3 extension their ``run(ctx)`` calls into), but they
+    emit ops through the public ``AddNodeByIdx`` / ``AddEdgeByIdx`` /
+    ``AddEntrypointByIdx`` graph ops.
+    """
+
+    @property
+    def name(self) -> str:
+        """Plugin name. Matches the conventional name of the
+        equivalent Python plugin (e.g. ``"MainBlockPlugin"``).
+        """
+        ...
+
+    def prepare(self, project_root: Any) -> None:
+        """``Plugin`` protocol's pre-graph hook. No-op for native
+        plugins today — every impl reads from the frozen ctx in
+        ``run``.
+        """
+        ...
+
+    @staticmethod
+    def main_block() -> NativePlugin:
+        """Native equivalent of
+        :class:`dead_cst.plugins.MainBlockPlugin`. Marks every file
+        with a top-level ``if __name__ == "__main__":`` block as an
+        entrypoint and wires edges to the containing module + every
+        top-level decl inside the block.
+        """
+        ...
+
 class NativeGraph:
     """The project-wide graph snapshot returned by ``Project.build()``
     and ``ProjectContext.materialize()``.

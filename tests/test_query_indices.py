@@ -320,8 +320,8 @@ def test_add_node_by_idx_entrypoint_flag(tmp_path):
             )
 
     analysis = Analysis(tmp_path, plugins=[SeedBoth()])
-    analysis.materialize_all()
-    dead_fqnames = {n.fqname for n in analysis.dead()}
+    ctx = analysis.materialize_all()
+    dead_fqnames = {a.fqname for a in ctx.node_attrs(list(analysis.dead()))}
     assert "mod.alive" not in dead_fqnames
     assert "mod.also_alive" not in dead_fqnames
     assert "mod.dead" in dead_fqnames
@@ -674,7 +674,7 @@ def test_add_entrypoint_by_idx_promotes_seed(tmp_path):
     # Marker is composed as ``<marker>:<decl.fqname>`` — same shape
     # ``AddEntrypoint`` uses.
     assert "<seed>:mod.seed" in fqnames
-    dead_fqnames = {n.fqname for n in analysis.dead()}
+    dead_fqnames = {a.fqname for a in ctx.node_attrs(list(analysis.dead()))}
     assert "mod.seed" not in dead_fqnames
     assert "mod.used_by_seed" not in dead_fqnames
     assert "mod.dead" in dead_fqnames
