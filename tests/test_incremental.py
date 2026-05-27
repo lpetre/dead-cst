@@ -1,8 +1,8 @@
 """Incremental :meth:`Analysis.re_materialize` correctness tests.
 
 Each test builds an initial graph, mutates one or more source files on
-disk, calls ``re_materialize()`` (which autodetects via
-``ctx.detect_changes()`` -> ty's rescan handler), and asserts the
+disk, calls ``re_materialize(events)`` (with events from
+``ctx.detect_changes()`` or an explicit list), and asserts the
 resulting graph matches an independent fresh full build of the same
 end state. The fresh build is the ground truth — incremental is
 correct iff it produces the same edges and the same node set.
@@ -78,7 +78,7 @@ def test_re_materialize_no_op(tmp_path):
     ctx1 = analysis.materialize_all()
     edges_before = _edges(ctx1)
 
-    ctx2 = analysis.re_materialize()
+    ctx2 = analysis.re_materialize(ctx1.detect_changes())
 
     assert ctx1 is ctx2  # re_materialize rebuilds in place.
     assert _edges(ctx2) == edges_before
@@ -94,7 +94,7 @@ def test_re_materialize_add_decl(tmp_path):
     analysis.materialize_all()
 
     _write(tmp_path / "a.py", "def f(): pass\ndef g(): pass\n")
-    analysis.re_materialize()
+    analysis.re_materialize(analysis.materialize_all().detect_changes())
 
     _assert_matches_fresh(analysis, tmp_path)
     assert any(n.fqname == "a.g" for n in analysis.materialize_all().nodes())
@@ -111,7 +111,7 @@ def test_re_materialize_remove_decl(tmp_path):
     assert any(n.fqname == "a.g" for n in analysis.materialize_all().nodes())
 
     _write(tmp_path / "a.py", "def f(): pass\n")
-    analysis.re_materialize()
+    analysis.re_materialize(analysis.materialize_all().detect_changes())
 
     assert not any(n.fqname == "a.g" for n in analysis.materialize_all().nodes())
     _assert_matches_fresh(analysis, tmp_path)
@@ -129,7 +129,7 @@ def test_re_materialize_rename_decl(tmp_path):
     analysis.materialize_all()
 
     _write(tmp_path / "a.py", "def g(): pass\n")
-    analysis.re_materialize()
+    analysis.re_materialize(analysis.materialize_all().detect_changes())
 
     _assert_matches_fresh(analysis, tmp_path)
     fqs = {n.fqname for n in analysis.materialize_all().nodes()}
@@ -148,7 +148,7 @@ def test_re_materialize_new_file(tmp_path):
     assert "c.py" not in initial_files
 
     _write(tmp_path / "c.py", "def h(): pass\nh()\n")
-    analysis.re_materialize()
+    analysis.re_materialize(analysis.materialize_all().detect_changes())
 
     rebuilt_files = {Path(n.path).name for n in analysis.materialize_all().nodes()}
     assert "c.py" in rebuilt_files
@@ -166,7 +166,7 @@ def test_re_materialize_deleted_file(tmp_path):
     assert any(Path(n.path).name == "b.py" for n in analysis.materialize_all().nodes())
 
     (tmp_path / "b.py").unlink()
-    analysis.re_materialize()
+    analysis.re_materialize(analysis.materialize_all().detect_changes())
 
     assert not any(Path(n.path).name == "b.py" for n in analysis.materialize_all().nodes())
     _assert_matches_fresh(analysis, tmp_path)
@@ -183,7 +183,7 @@ def test_re_materialize_multi_file_mutation(tmp_path):
 
     _write(tmp_path / "a.py", "def f(): pass\ndef extra(): pass\n")
     _write(tmp_path / "c.py", "def h(): pass\ndef other(): pass\n")
-    analysis.re_materialize()
+    analysis.re_materialize(analysis.materialize_all().detect_changes())
 
     _assert_matches_fresh(analysis, tmp_path)
 
@@ -257,7 +257,7 @@ def test_re_materialize_with_entrypoint_plugin(tmp_path):
             g()
         """,
     )
-    analysis.re_materialize()
+    analysis.re_materialize(analysis.materialize_all().detect_changes())
 
     dead_after = _dead_fqnames(analysis)
     assert "a.f" not in dead_after
@@ -270,4 +270,4 @@ def test_re_materialize_requires_prior_materialize(tmp_path):
     _write(tmp_path / "a.py", "def f(): pass\n")
     analysis = Analysis(tmp_path)
     with pytest.raises(RuntimeError, match="prior materialize_all"):
-        analysis.re_materialize()
+        analysis.re_materialize([])

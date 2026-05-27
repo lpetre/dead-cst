@@ -147,19 +147,18 @@ demand.
 Folded down from earlier tiers as they landed:
 
 - **Unreleased**: Incremental rebuilds.
-  `Analysis.re_materialize(events=None)` rebuilds the graph against
-  the existing `native.ProjectContext` without tearing down ty's
-  salsa db. With no argument it auto-detects via
+  `Analysis.re_materialize(events)` rebuilds the graph against the
+  existing `native.ProjectContext` without tearing down ty's salsa
+  db. The caller supplies the change set — typically
   `ctx.detect_changes()` (today: a single `ChangeEvent.rescan()` that
   hits ty's mtime-checked `Files::sync_all` + project re-walk +
-  metadata rediscovery). Explicit callers (LSP integrations
-  consuming `didChangeWatchedFiles`) pass a list of
-  `native.ChangeEvent`s built via
-  `.changed(path)` / `.created(path)` / `.deleted(path)` /
-  `.rescan()`. Salsa's per-file cache survives across calls; only
-  dirty + transitively-dirty files re-fire `file_to_nodes` /
-  `file_to_edges` / `file_to_ref_edges`. The assemble + plugin
-  passes still run every call but on a warm cache.
+  metadata rediscovery), or an explicit list of `native.ChangeEvent`s
+  built via `.changed(path)` / `.created(path)` / `.deleted(path)` /
+  `.rescan()` for LSP integrations consuming `didChangeWatchedFiles`.
+  Salsa's per-file cache survives across calls; only dirty +
+  transitively-dirty files re-fire `file_to_nodes` / `file_to_edges`
+  / `file_to_ref_edges`. The assemble + plugin passes still run every
+  call but on a warm cache.
 - **v0.11.0**: Rust-native graph builder. libcst visitor, SQLite cache,
   and networkx are replaced by a pyo3 extension on ty's ``SemanticIndex``;
   libcst now only powers the codemod.

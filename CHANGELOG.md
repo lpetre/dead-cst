@@ -11,12 +11,12 @@ two versions.
 
 ### Added
 
-- `Analysis.re_materialize(events=None)` — incrementally rebuild the
-  project graph against the existing `native.ProjectContext`. With no
-  argument, calls `native.ProjectContext.detect_changes()` to
-  auto-discover what changed on disk (currently emits a single
-  `ChangeEvent.rescan()`); explicit callers (LSP integrations, file
-  watchers) can pass a list of `native.ChangeEvent` instances.
+- `Analysis.re_materialize(events)` — incrementally rebuild the
+  project graph against the existing `native.ProjectContext`. The
+  caller supplies the change events: typically
+  `ctx.detect_changes()` (which today returns a single
+  `ChangeEvent.rescan()`), or an explicit list of
+  `native.ChangeEvent`s for LSP integrations and file-watchers.
   `native.ProjectContext.apply_changes(events)` forwards to
   `ty_project::ProjectDatabase::apply_changes`, which handles each
   variant correctly — `Changed` bumps the file's salsa revision only

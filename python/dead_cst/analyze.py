@@ -673,21 +673,23 @@ class Analysis:
         self._ctx = ctx
         return ctx
 
-    def re_materialize(
-        self, events: Sequence[native.ChangeEvent] | None = None
-    ) -> native.ProjectContext:
+    def re_materialize(self, events: Sequence[native.ChangeEvent]) -> native.ProjectContext:
         """Incrementally re-run materialize against the existing ctx.
 
-        With no argument, autodetects file-system changes via
-        :meth:`native.ProjectContext.detect_changes` (which today
-        returns a single ``ChangeEvent.rescan()`` — ty stats every
-        known file and only invalidates salsa for the ones whose mtime
-        / size actually changed, then re-walks for new / deleted
-        files). Callers with explicit knowledge of what changed (e.g.
-        an LSP integration consuming ``didChangeWatchedFiles``) can
-        pass a list of :class:`native.ChangeEvent` instances directly.
+        ``events`` is the list of :class:`native.ChangeEvent`\\s to
+        apply before rebuilding. Build it from any source you trust:
+        an LSP integration consuming ``didChangeWatchedFiles``, a
+        file-watcher that emits ``Changed`` / ``Created`` / ``Deleted``,
+        or — when you have no precise list — a single
+        ``ChangeEvent.rescan()`` (or the equivalent
+        ``ctx.detect_changes()`` helper, which is the same call).
 
-        Salsa's per-file cache survives across calls, so unchanged
+        :meth:`native.ProjectContext.apply_changes` forwards the events
+        to ty's ``ProjectDatabase::apply_changes``, which only bumps
+        salsa revisions for files whose mtime / size actually changed,
+        registers ``Created`` paths, drops ``Deleted`` ones, and on
+        ``Rescan`` re-walks the project and reloads metadata. Salsa's
+        per-file cache for unaffected files survives, so unchanged
         files skip parsing / ``file_to_nodes`` / ``file_to_edges`` /
         ``file_to_ref_edges`` recomputation; cross-file importers
         invalidate transitively through salsa's auto-tracked reads.
@@ -709,8 +711,7 @@ class Analysis:
             raise RuntimeError(
                 "re_materialize() requires a prior materialize_all() call to construct the ctx"
             )
-        change_events = list(events) if events is not None else self._ctx.detect_changes()
-        self._ctx.apply_changes(change_events)
+        self._ctx.apply_changes(list(events))
         self._ctx.reset_progress()
         self._drive_build(self._ctx)
         return self._ctx

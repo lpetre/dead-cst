@@ -192,33 +192,36 @@ the graph into Python.
 ### Incremental rebuilds
 
 For long-lived `Analysis` instances (LSP harnesses, watch loops),
-`Analysis.re_materialize(events=None)` rebuilds the graph against the
-same `ProjectContext` without tearing down ty's salsa db. With no
-argument it auto-detects changes via
-`native.ProjectContext.detect_changes()` (which delegates to ty's
-`apply_changes` rescan handler: mtime-checked `Files::sync_all`,
-project file re-walk, metadata rediscovery). Pass an explicit
-`list[native.ChangeEvent]` when you know what changed (e.g. an LSP
-consuming `didChangeWatchedFiles`):
+`Analysis.re_materialize(events)` rebuilds the graph against the
+same `ProjectContext` without tearing down ty's salsa db. The caller
+supplies the change events — either an explicit list (from an LSP
+consuming `didChangeWatchedFiles`, a file-watcher, or a CI script
+that knows which files it touched), or `ctx.detect_changes()` to let
+ty figure it out:
 
 ```python
 from dead_cst import _native as native
 
-analysis.materialize_all()
+ctx = analysis.materialize_all()
 # ... source files change on disk ...
-analysis.re_materialize()                                   # autodetect
-analysis.re_materialize([                                   # or explicit
+
+analysis.re_materialize(ctx.detect_changes())              # autodetect via ty
+analysis.re_materialize([                                  # or explicit
     native.ChangeEvent.changed("/abs/foo.py"),
     native.ChangeEvent.created("/abs/new.py"),
     native.ChangeEvent.deleted("/abs/gone.py"),
 ])
 ```
 
-Salsa's per-file cache survives across calls, so unchanged files skip
-parsing / `file_to_nodes` / `file_to_edges` / `file_to_ref_edges`
-recomputation; cross-file importers invalidate transitively through
-salsa's read-tracking. The assemble pass and plugin pass run on every
-call, but they're cheap O(N) walks over the warm cache.
+`ctx.detect_changes()` currently returns a single
+`ChangeEvent.rescan()`, which ty's apply handler turns into an
+mtime-checked `Files::sync_all` + project file re-walk + metadata
+rediscovery. Salsa's per-file cache survives across calls, so
+unchanged files skip parsing / `file_to_nodes` / `file_to_edges` /
+`file_to_ref_edges` recomputation; cross-file importers invalidate
+transitively through salsa's read-tracking. The assemble pass and
+plugin pass run on every call, but they're cheap O(N) walks over the
+warm cache.
 
 Entrypoint detection is fully plugin-driven. Builtins:
 
