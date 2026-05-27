@@ -78,9 +78,7 @@ def test_native_plugin_mixed_with_python_plugins(build_plugin_graph, reachable_f
         """,
     }
     # Mix: rust native main-block + python module-dunders.
-    ctx = build_plugin_graph(
-        files, [native.NativePlugin.main_block(), ModuleDundersPlugin()]
-    )
+    ctx = build_plugin_graph(files, [native.NativePlugin.main_block(), ModuleDundersPlugin()])
     reached = reachable_fqnames(ctx)
     # Main-block contribution.
     assert "pkg.script.main" in reached

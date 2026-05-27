@@ -1,4 +1,4 @@
-//! Native (rust-side) plugins. Prototype.
+//! Native (rust-side) plugins — in-tree only.
 //!
 //! A native plugin is a rust implementation of the plugin contract
 //! that skips the Python `.run(ctx)` call entirely: the harness
@@ -9,7 +9,19 @@
 //! instances are ever constructed, no per-op ``extract`` /
 //! ``prepare_graph_op`` extraction step.
 //!
-//! Trade-off vs the Python-side plugin path:
+//! **Scope.** Native plugins are an in-tree fast-path for bundled
+//! plugins whose logic is fixed and hot. They're not a public
+//! extension mechanism: the trait and its dependent types
+//! ([`PreparedOp`], [`ProjectContext`]) are `pub(crate)` by design,
+//! the `dead-cst-native` crate is not published to crates.io, and
+//! the rust API has no stability commitment. Out-of-tree plugin
+//! authors continue to use the Python :class:`Plugin` protocol —
+//! they can still write hot code in rust, but they ship it as a
+//! pyo3 extension that their `run(ctx)` body calls into, and they
+//! emit ops via the public Python ``AddNodeByIdx`` / ``AddEdgeByIdx``
+//! / ``AddEntrypointByIdx`` graph ops.
+//!
+//! Trade-off vs the Python-side plugin path (for in-tree authors):
 //!
 //! * **Lighter per-op cost** — every Python plugin op pays one
 //!   ``Py::new(AddNodeByIdx { ... })`` allocation on the yield side,
@@ -20,11 +32,11 @@
 //!   still drop the GIL via ``py.allow_threads`` if they want to.
 //! * **Costs flexibility** — a native plugin's logic is compiled
 //!   into the wheel; it can't be authored / overridden / dataclass-
-//!   configured by out-of-tree plugin authors. Python plugins
-//!   remain the right home for anything user-configurable.
+//!   configured externally. Python plugins remain the right home
+//!   for anything user-configurable.
 //!
-//! The contract is the same as the Python ``Plugin`` protocol: see
-//! the base graph (frozen mid-pass), emit ops, ops apply in a
+//! The frozen-graph contract is identical on both paths: the impl
+//! observes the base graph mid-pass, emits ops, ops apply in a
 //! single batch after every plugin completes. Native plugins are
 //! drop-in interchangeable with Python ones in
 //! ``Analysis(plugins=[...])`` and inside the harness's

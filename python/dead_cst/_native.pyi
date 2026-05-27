@@ -325,14 +325,24 @@ class CollectedOps:
     """
 
 class NativePlugin:
-    """Rust-side plugin. Constructed via a static factory (one per
-    available impl, e.g. :meth:`main_block`); the default constructor
-    is intentionally not exposed.
+    """Rust-side plugin — in-tree only.
 
-    Drop-in interchangeable with a Python :class:`Plugin` subclass in
-    :class:`Analysis` plugin lists — the harness detects the wrapper
-    and dispatches to the rust impl directly, skipping the Python
-    ``.run(ctx)`` call and the per-op ``GraphOp`` allocation.
+    Constructed via a static factory (one per available bundled impl,
+    e.g. :meth:`main_block`); the default constructor is intentionally
+    not exposed. Drop-in interchangeable with a Python
+    :class:`Plugin` subclass in :class:`Analysis` plugin lists — the
+    harness detects the wrapper and dispatches to the rust impl
+    directly, skipping the Python ``.run(ctx)`` call and the per-op
+    ``GraphOp`` allocation.
+
+    **Not an extension mechanism.** Native plugins are a hot-path
+    optimization for bundled plugins whose logic is fixed; the
+    underlying rust trait and types are crate-private with no
+    stability commitment. Out-of-tree plugin authors use the Python
+    :class:`Plugin` protocol — they can still write hot code in rust
+    (as a pyo3 extension their ``run(ctx)`` calls into), but they
+    emit ops through the public ``AddNodeByIdx`` / ``AddEdgeByIdx`` /
+    ``AddEntrypointByIdx`` graph ops.
     """
 
     @property
