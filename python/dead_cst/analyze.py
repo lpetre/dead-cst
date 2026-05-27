@@ -642,12 +642,16 @@ class Analysis:
         # construction happens. Type-validate each plugin here so
         # ``Pluign()`` typos and bare dicts fail with a clean
         # ``TypeError`` instead of being silently dropped by the rust
-        # ``add_plugin`` loop below.
+        # ``add_plugin`` loop below. ``_native.NativePlugin`` instances
+        # (rust-side native plugins, e.g.
+        # ``NativePlugin.main_block()``) aren't ``Plugin`` subclasses —
+        # accept them via the tuple check.
+        plugin_types: tuple[type, ...] = (Plugin, _native.NativePlugin)
         for plugin in self._plugins:
-            if not isinstance(plugin, Plugin):
+            if not isinstance(plugin, plugin_types):
                 raise TypeError(
-                    f"Expected a dead_cst.plugins.Plugin instance, got "
-                    f"{type(plugin).__name__!r}: {plugin!r}"
+                    f"Expected a dead_cst.plugins.Plugin or NativePlugin "
+                    f"instance, got {type(plugin).__name__!r}: {plugin!r}"
                 )
             plugin.prepare(self._project_root)
 
