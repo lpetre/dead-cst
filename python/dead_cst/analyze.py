@@ -669,6 +669,68 @@ class Analysis:
         if self._stack_size is not None:
             ctx.set_stack_size(self._stack_size)
 
+        self._drive_build(ctx)
+        self._ctx = ctx
+        return ctx
+
+    def re_materialize(self, events: Sequence[native.ChangeEvent]) -> native.ProjectContext:
+        """Incrementally re-run materialize against the existing ctx.
+
+        ``events`` is the list of :class:`native.ChangeEvent`\\s to
+        apply before rebuilding. Build it from any source you trust:
+        an LSP integration consuming ``didChangeWatchedFiles``, a
+        file-watcher that emits ``Changed`` / ``Created`` / ``Deleted``,
+        or — when you have no precise list — a single
+        ``ChangeEvent.rescan()`` (or the equivalent
+        ``ctx.detect_changes()`` helper, which is the same call).
+
+        :meth:`native.ProjectContext.apply_changes` forwards the events
+        to ty's ``ProjectDatabase::apply_changes``, which only bumps
+        salsa revisions for files whose mtime / size actually changed,
+        registers ``Created`` paths, drops ``Deleted`` ones, and on
+        ``Rescan`` re-walks the project and reloads metadata. Salsa's
+        per-file cache for unaffected files survives, so unchanged
+        files skip parsing / ``file_to_nodes`` / ``file_to_edges`` /
+        ``file_to_ref_edges`` recomputation; cross-file importers
+        invalidate transitively through salsa's auto-tracked reads.
+        The assemble pass and plugin pass run unconditionally — cheap
+        O(N) walks over the warm cache. Plugin ``prepare`` is *not*
+        re-run; plugins are assumed unchanged across the lifetime of
+        the :class:`Analysis`.
+
+        Returns the same (now-rebuilt) :class:`native.ProjectContext`
+        instance that :meth:`materialize_all` returned. Callers that
+        cached :class:`SymbolNode` objects from the previous build
+        must re-fetch them — node identities are rebuilt by the
+        assemble pass.
+
+        Raises :class:`RuntimeError` if :meth:`materialize_all` hasn't
+        been called yet.
+        """
+        if self._ctx is None:
+            raise RuntimeError(
+                "re_materialize() requires a prior materialize_all() call to construct the ctx"
+            )
+        self._ctx.apply_changes(list(events))
+        self._ctx.reset_progress()
+        self._drive_build(self._ctx)
+        return self._ctx
+
+    def _drive_build(self, ctx: native.ProjectContext) -> None:
+        """Run the build + plugin pipeline on an already-constructed ctx.
+
+        Factored out of :meth:`materialize_all` so
+        :meth:`re_materialize` can drive a second build on the same
+        ctx without duplicating the dispatch / progress / plugin-pool
+        plumbing. Plugin ``prepare`` is *not* invoked here — that's a
+        one-shot hook owned by :meth:`materialize_all`.
+        """
+        # The rust-serial path below calls ``ctx.add_plugin(p)`` per
+        # plugin, which appends. Clear first so a re_materialize doesn't
+        # stack a second copy of every plugin on top of the first run's
+        # registrations.
+        ctx.clear_plugins()
+
         # Spin up the progress polling thread if the user asked for
         # callbacks. The thread reads rust-side atomic counters at
         # ~100 ms and fires structured events. Joined in a ``finally``
@@ -810,8 +872,6 @@ class Analysis:
         finally:
             if poller is not None:
                 poller.stop()
-        self._ctx = ctx
-        return ctx
 
     def reachable(self, *, seed_flags: int = KEEPALIVE_DEFAULT) -> set[SymbolNode]:
         """Set of every decl reachable from any seed in ``seed_flags``."""

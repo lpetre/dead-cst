@@ -111,6 +111,22 @@ you ask a question (`materialize_all`, `reachable`, `dead`,
 `materialize_all()` call, so subsequent BFS queries run on the already-
 built graph — one FFI hop per query, no rebuild.
 
+`Analysis.re_materialize(events)` rebuilds the graph against the
+same `ProjectContext` without tearing down the salsa db. The caller
+supplies the change set: typically `ctx.detect_changes()` (which
+today returns a single `ChangeEvent.rescan()`), or an explicit
+`list[native.ChangeEvent]` built via the `.changed(path)` /
+`.created(path)` / `.deleted(path)` / `.rescan()` classmethods for
+LSP / file-watcher integrations. `ctx.apply_changes(events)` forwards
+into ty's `ProjectDatabase::apply_changes`, which bumps file
+revisions only when mtime / size differ, registers `Created` paths so
+new files are visible on the next walk, drops `Deleted` paths, and
+triggers a full rescan + project reload for the `Rescan` sentinel.
+Cross-file importers invalidate transitively through salsa's
+auto-tracked `file_to_nodes` reads. Plugin `prepare(project_root)` is
+one-shot (owned by `materialize_all`); `re_materialize` only
+re-drives the build + plugin pass.
+
 ### 3. Graph materialization — `native.ProjectContext.materialize()`
 
 Driven from Python by `Analysis.materialize_all()`:

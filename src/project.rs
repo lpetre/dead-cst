@@ -11,6 +11,7 @@ use parking_lot::{MappedRwLockReadGuard, Mutex, RwLock, RwLockReadGuard};
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use pyo3::exceptions::{PyOSError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
+use pyo3::types::PyType;
 use ruff_db::files::File;
 use ruff_db::parsed::parsed_module;
 use ruff_db::source::source_text;
@@ -22,6 +23,7 @@ use ruff_text_size::{Ranged, TextRange};
 use ty_project::metadata::options::{EnvironmentOptions, Options};
 use ty_project::metadata::python_version::SupportedPythonVersion;
 use ty_project::metadata::value::RangedValue;
+use ty_project::watch::{ChangeEvent as TyChangeEvent, ChangedKind, CreatedKind, DeletedKind};
 use ty_project::{Db as ProjectDb, ProjectDatabase, ProjectMetadata};
 use ty_python_core::definition::DefinitionState;
 use ty_python_core::program::UseDefaultStrategy;
@@ -1068,6 +1070,145 @@ pub(crate) fn build_fqname_indices(
 /// through `type_hierarchy_subtypes`, method-defines walks each class's
 /// `DefinitionKind::Class`, module dunders scan global-scope variable
 /// nodes, and comment patterns walk the parser's `Tokens` stream.
+/// Variant discriminant for [`ChangeEvent`]. Mirrors the high-level
+/// kinds of [`ty_project::watch::ChangeEvent`] that
+/// [`ProjectContext::apply_changes`] forwards to the salsa db; the
+/// per-variant `kind` enum on the upstream event (FileContent /
+/// FileMetadata / Any) is collapsed to `Any` because that's the right
+/// default for the user-facing constructors and lets ty do its own
+/// stat-based classification.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub(crate) enum ChangeEventKind {
+    Changed,
+    Created,
+    Deleted,
+    Rescan,
+}
+
+/// A file-system change event, passed to
+/// [`ProjectContext::apply_changes`] to incrementally invalidate the
+/// salsa db. Construct via the classmethods
+/// :py:meth:`changed` / :py:meth:`created` / :py:meth:`deleted` /
+/// :py:meth:`rescan`. Returned by
+/// [`ProjectContext::detect_changes`] for auto-detection flows.
+#[pyclass]
+#[derive(Debug, Clone)]
+pub(crate) struct ChangeEvent {
+    pub(crate) kind: ChangeEventKind,
+    /// Absolute or relative path the event refers to. ``None`` for
+    /// :py:meth:`rescan` (which has no path).
+    pub(crate) path: Option<SystemPathBuf>,
+}
+
+impl ChangeEvent {
+    /// Lower this event to the upstream :type:`ty_project::watch::ChangeEvent`
+    /// representation `apply_changes` consumes. Relative paths are
+    /// absolutized against the db's current directory (handled
+    /// downstream by `File::sync_path` and friends).
+    pub(crate) fn to_ty_event(&self) -> TyChangeEvent {
+        match (self.kind, &self.path) {
+            (ChangeEventKind::Changed, Some(path)) => TyChangeEvent::Changed {
+                path: path.clone(),
+                kind: ChangedKind::Any,
+            },
+            (ChangeEventKind::Created, Some(path)) => TyChangeEvent::Created {
+                path: path.clone(),
+                kind: CreatedKind::Any,
+            },
+            (ChangeEventKind::Deleted, Some(path)) => TyChangeEvent::Deleted {
+                path: path.clone(),
+                kind: DeletedKind::Any,
+            },
+            (ChangeEventKind::Rescan, _) => TyChangeEvent::Rescan,
+            // Path is required for non-Rescan variants. The Python
+            // constructors enforce this; if we somehow reach here
+            // without one, fall back to a Rescan which is the safe
+            // sledgehammer.
+            (_, None) => TyChangeEvent::Rescan,
+        }
+    }
+}
+
+#[pymethods]
+impl ChangeEvent {
+    /// File at ``path`` was modified (content or metadata).
+    ///
+    /// Forwarded to ``ty_project`` as a ``Changed{kind: Any}`` event;
+    /// ty's apply pass does the actual mtime / size comparison via
+    /// ``File::sync_path_only`` and only bumps the salsa revision if
+    /// something genuinely differs.
+    #[classmethod]
+    pub(crate) fn changed(_cls: &Bound<'_, PyType>, path: String) -> Self {
+        Self {
+            kind: ChangeEventKind::Changed,
+            path: Some(SystemPathBuf::from(path)),
+        }
+    }
+
+    /// File or directory at ``path`` was created.
+    ///
+    /// Forwarded as ``Created{kind: Any}``; ty stats the path to
+    /// decide whether to register a single file or to walk a
+    /// directory's contents.
+    #[classmethod]
+    pub(crate) fn created(_cls: &Bound<'_, PyType>, path: String) -> Self {
+        Self {
+            kind: ChangeEventKind::Created,
+            path: Some(SystemPathBuf::from(path)),
+        }
+    }
+
+    /// File or directory at ``path`` was deleted.
+    ///
+    /// Forwarded as ``Deleted{kind: Any}``; ty checks whether the
+    /// path was previously a file (drop one entry) or a directory
+    /// (drop recursively).
+    #[classmethod]
+    pub(crate) fn deleted(_cls: &Bound<'_, PyType>, path: String) -> Self {
+        Self {
+            kind: ChangeEventKind::Deleted,
+            path: Some(SystemPathBuf::from(path)),
+        }
+    }
+
+    /// Full-project rescan sentinel. Triggers ``Files::sync_all`` +
+    /// project file re-walk + metadata rediscovery in the apply pass.
+    /// Use when you don't know which paths changed (or want to be
+    /// safe after a long quiet period).
+    #[classmethod]
+    pub(crate) fn rescan(_cls: &Bound<'_, PyType>) -> Self {
+        Self {
+            kind: ChangeEventKind::Rescan,
+            path: None,
+        }
+    }
+
+    /// The path this event refers to, or ``None`` for ``rescan()``.
+    #[getter]
+    pub(crate) fn path(&self) -> Option<String> {
+        self.path.as_ref().map(|p| p.as_str().to_string())
+    }
+
+    /// One of ``"changed"`` / ``"created"`` / ``"deleted"`` /
+    /// ``"rescan"`` — useful for assertions and pretty-printing.
+    #[getter]
+    pub(crate) fn kind(&self) -> &'static str {
+        match self.kind {
+            ChangeEventKind::Changed => "changed",
+            ChangeEventKind::Created => "created",
+            ChangeEventKind::Deleted => "deleted",
+            ChangeEventKind::Rescan => "rescan",
+        }
+    }
+
+    pub(crate) fn __repr__(&self) -> String {
+        match &self.path {
+            Some(p) => format!("ChangeEvent.{}({:?})", self.kind(), p.as_str()),
+            None => format!("ChangeEvent.{}()", self.kind()),
+        }
+    }
+}
+
 #[pyclass]
 pub(crate) struct ProjectContext {
     pub(crate) db: ProjectDatabase,
@@ -1196,6 +1337,86 @@ impl ProjectContext {
     /// invocation during `materialize`.
     pub(crate) fn add_plugin(&mut self, plugin: PyObject) {
         self.plugins.push(plugin);
+    }
+
+    /// Drop every plugin registered via :meth:`add_plugin`.
+    ///
+    /// :class:`dead_cst.Analysis` calls this at the top of its build
+    /// driver so a re-materialize doesn't double-register plugins on
+    /// the rust-serial path (where ``add_plugin`` is invoked once per
+    /// :meth:`materialize` call). Idempotent.
+    pub(crate) fn clear_plugins(&mut self) {
+        self.plugins.clear();
+    }
+
+    /// Apply a batch of file-system change events to the salsa db.
+    ///
+    /// Forwards to :meth:`ty_project::ProjectDatabase::apply_changes`,
+    /// which handles every event variant correctly: ``Changed`` bumps
+    /// the file's revision iff its mtime / size differ; ``Created``
+    /// adds the path to the project file set (so brand-new files
+    /// become visible on the next ``files()`` enumeration);
+    /// ``Deleted`` removes the file from the set; ``Rescan`` triggers
+    /// a full ``Files::sync_all`` + project re-walk. Project
+    /// configuration files (``pyproject.toml``, ignore files,
+    /// ``VERSIONS``) are detected automatically and trigger a project
+    /// reload.
+    ///
+    /// Call before re-running :meth:`materialize` (or
+    /// :meth:`build_only`) to incrementally rebuild after a source
+    /// edit. Salsa's per-file cache for files whose events didn't
+    /// invalidate them stays warm.
+    ///
+    /// :class:`dead_cst.Analysis.re_materialize` calls this in
+    /// combination with :meth:`detect_changes` to autodetect the
+    /// dirty set; callers with explicit knowledge of what changed
+    /// (e.g. an LSP integration) can build :class:`ChangeEvent` lists
+    /// directly via the classmethods on :class:`ChangeEvent`.
+    pub(crate) fn apply_changes(&mut self, events: Vec<Py<ChangeEvent>>, py: Python<'_>) {
+        let ty_events: Vec<TyChangeEvent> =
+            events.iter().map(|e| e.borrow(py).to_ty_event()).collect();
+        self.db.apply_changes(&ty_events, None);
+    }
+
+    /// Return a list of :class:`ChangeEvent`\\s that, when passed to
+    /// :meth:`apply_changes`, brings the salsa db in sync with the
+    /// current on-disk state of the project.
+    ///
+    /// Currently emits a single ``Rescan`` event, which under the
+    /// hood runs:
+    ///
+    /// * ``Files::sync_all(db)`` — stats every salsa-known file; bumps
+    ///   each file's revision only if its mtime / size changed. Per-file
+    ///   salsa caches for unchanged files survive the call.
+    /// * ``Project::reload_files`` — re-walks the project tree to
+    ///   discover newly created files and drop deleted ones.
+    /// * Project metadata rediscovery — re-reads ``pyproject.toml`` /
+    ///   ignore files so config changes take effect.
+    ///
+    /// This is the "simple and correct" implementation; a future
+    /// optimization could compare salsa-cached metadata to disk and
+    /// emit precise ``Changed`` / ``Created`` / ``Deleted`` events to
+    /// skip the metadata rediscovery and tree re-walk in the
+    /// "everything unchanged" case.
+    pub(crate) fn detect_changes(&self, py: Python<'_>) -> PyResult<Vec<Py<ChangeEvent>>> {
+        let ev = Py::new(
+            py,
+            ChangeEvent {
+                kind: ChangeEventKind::Rescan,
+                path: None,
+            },
+        )?;
+        Ok(vec![ev])
+    }
+
+    /// Reset the progress counter state to a fresh instance so a
+    /// subsequent :meth:`materialize` / :meth:`build_only` call starts
+    /// from zero. Without this, the polling thread on the next run
+    /// would observe ``finished=true`` from the prior run and exit
+    /// immediately. Called by :meth:`dead_cst.Analysis.re_materialize`
+    /// before driving a re-build on the same context.
+    pub(crate) fn reset_progress(&mut self) {
+        self.progress = Arc::new(ProgressCounters::new());
     }
 
     /// Open a chainable query builder against this context.

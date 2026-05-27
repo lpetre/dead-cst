@@ -360,6 +360,44 @@ class Project:
 class _ProjectPluginLike(Protocol):
     def run(self, ctx: "ProjectContext") -> Iterable[GraphOp] | None: ...
 
+class ChangeEvent:
+    """A file-system change event consumed by
+    :meth:`ProjectContext.apply_changes`. Construct via the
+    classmethods :meth:`changed` / :meth:`created` / :meth:`deleted` /
+    :meth:`rescan`; or get a list back from
+    :meth:`ProjectContext.detect_changes` to autodetect what changed
+    on disk since the last build."""
+
+    @property
+    def kind(self) -> str:
+        """One of ``"changed"`` / ``"created"`` / ``"deleted"`` /
+        ``"rescan"``."""
+
+    @property
+    def path(self) -> str | None:
+        """The path the event refers to, or ``None`` for
+        :meth:`rescan`."""
+
+    @classmethod
+    def changed(cls, path: str) -> "ChangeEvent":
+        """File at ``path`` was modified (content or metadata)."""
+        ...
+
+    @classmethod
+    def created(cls, path: str) -> "ChangeEvent":
+        """File or directory at ``path`` was created."""
+        ...
+
+    @classmethod
+    def deleted(cls, path: str) -> "ChangeEvent":
+        """File or directory at ``path`` was deleted."""
+        ...
+
+    @classmethod
+    def rescan(cls) -> "ChangeEvent":
+        """Full-project rescan sentinel."""
+        ...
+
 class ProjectContext:
     """Plugin-aware project graph builder.
 
@@ -416,6 +454,57 @@ class ProjectContext:
     def add_plugin(self, plugin: _ProjectPluginLike | Any) -> None:
         """Register a plugin. Order of registration is order of
         invocation during :meth:`materialize`."""
+        ...
+
+    def clear_plugins(self) -> None:
+        """Drop every plugin registered via :meth:`add_plugin`. Used by
+        :class:`dead_cst.Analysis` so a re-materialize doesn't
+        double-register plugins on the rust-serial path."""
+        ...
+
+    def apply_changes(self, events: Iterable[ChangeEvent]) -> None:
+        """Apply a batch of file-system change events to the salsa db.
+
+        Forwards to ty_project's ``ProjectDatabase::apply_changes``,
+        which handles each variant correctly:
+
+        * ``Changed`` — bumps the file's revision iff mtime / size
+          differ; otherwise no-op.
+        * ``Created`` — registers the path with the project file set
+          so brand-new files are visible on next enumeration.
+        * ``Deleted`` — removes the file from the project set.
+        * ``Rescan`` — triggers a full ``sync_all`` + project re-walk
+          + metadata rediscovery.
+
+        Project configuration files (``pyproject.toml``, ignore files,
+        custom-stdlib ``VERSIONS``) are detected automatically and
+        trigger a project reload.
+        """
+        ...
+
+    def detect_changes(self) -> list[ChangeEvent]:
+        """Return :class:`ChangeEvent`\\s that, when fed to
+        :meth:`apply_changes`, bring the salsa db in sync with the
+        current on-disk state.
+
+        Today this returns a single ``ChangeEvent.rescan()``; the
+        underlying ty rescan handler does an mtime-checked
+        ``Files::sync_all`` (so per-file salsa caches survive when
+        the file content hasn't changed), a project file re-walk
+        (so new files are discovered and deleted ones dropped), and
+        a metadata rediscovery (so config changes take effect).
+        """
+        ...
+
+    def reset_progress(self) -> None:
+        """Reset the progress counter state for a re-run.
+
+        Replaces the rust-side ``ProgressCounters`` with a fresh
+        instance so a subsequent :meth:`materialize` /
+        :meth:`build_only` call starts from zero. Without it, a poller
+        spun up for the second build would observe ``finished=true``
+        from the first build and exit immediately.
+        """
         ...
 
     def materialize(self) -> NativeGraph:
