@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterator, Sequence, TypedDict
 
-from .graph import KEEPALIVE_DEFAULT, EdgeFlags, SymbolNode
+from .graph import KEEPALIVE_DEFAULT, EdgeFlags
 
 if TYPE_CHECKING:
     from dead_cst import _native as native
@@ -77,17 +77,22 @@ class ProgressSnapshot(TypedDict):
 
 
 _NON_DECL_TYPES: frozenset[str] = frozenset({"module", "synthetic"})
+_DECL_KINDS: tuple[str, ...] = ("function", "class", "variable", "import", "type_alias")
 
 
-def _iter_dead(
+def _iter_dead_indices(
     ctx: native.ProjectContext,
-    reachable: set[SymbolNode],
-) -> Iterator[SymbolNode]:
-    for n in ctx.nodes():
-        if n.kind in _NON_DECL_TYPES:
-            continue
-        if n not in reachable:
-            yield n
+    reachable: set[int],
+) -> Iterator[int]:
+    """Yield positional indices of every decl-kind node not in
+    ``reachable``. ``module`` / ``synthetic`` nodes are filtered out
+    via the kind whitelist (synthetic markers, anchor modules — they
+    aren't "dead" in any meaningful sense).
+    """
+    for kind in _DECL_KINDS:
+        for idx in ctx.indices_where(kind=kind):
+            if idx not in reachable:
+                yield idx
 
 
 def _serial_mode() -> bool:
@@ -877,44 +882,57 @@ class Analysis:
             if poller is not None:
                 poller.stop()
 
-    def reachable(self, *, seed_flags: int = KEEPALIVE_DEFAULT) -> set[SymbolNode]:
-        """Set of every decl reachable from any seed in ``seed_flags``."""
+    def reachable(self, *, seed_flags: int = KEEPALIVE_DEFAULT) -> set[int]:
+        """Positional indices of every decl reachable from any seed in
+        ``seed_flags``. Pair with :meth:`native.ProjectContext.nodes_at`
+        / :meth:`native.ProjectContext.node_attrs` to materialise the
+        underlying ``SymbolNode``\\ s or batched attribute snapshots
+        on demand.
+        """
         ctx = self.materialize_all()
-        return set(ctx.reachable(seed_flags=seed_flags))
+        return set(ctx.reachable_indices(seed_flags=seed_flags))
 
-    def dead(self, *, seed_flags: int = KEEPALIVE_DEFAULT) -> Iterator[SymbolNode]:
-        """Yield every decl that no seed in ``seed_flags`` reaches."""
+    def dead(self, *, seed_flags: int = KEEPALIVE_DEFAULT) -> Iterator[int]:
+        """Yield positional indices of every decl that no seed in
+        ``seed_flags`` reaches. Skips ``module`` and ``synthetic``
+        nodes (markers/anchors, not "dead" in the actionable sense).
+        """
         ctx = self.materialize_all()
-        return _iter_dead(ctx, self.reachable(seed_flags=seed_flags))
+        return _iter_dead_indices(ctx, self.reachable(seed_flags=seed_flags))
 
-    def descendants(self, root: SymbolNode, *, skip_flags: int = 0) -> list[SymbolNode]:
-        """Forward closure from ``root`` (rust BFS, single FFI hop)."""
+    def descendants(self, root_idx: int, *, skip_flags: int = 0) -> list[int]:
+        """Forward closure from ``root_idx`` (rust BFS, single FFI
+        hop). Returns positional indices into
+        :meth:`native.ProjectContext.nodes`.
+        """
         ctx = self.materialize_all()
-        return list(ctx.descendants(root, skip_flags=skip_flags))
+        return list(ctx.descendants_indices(root_idx, skip_flags=skip_flags))
 
-    def ancestors(self, decl: SymbolNode, *, skip_flags: int = 0) -> list[SymbolNode]:
-        """Reverse closure into ``decl`` (rust BFS, single FFI hop)."""
+    def ancestors(self, decl_idx: int, *, skip_flags: int = 0) -> list[int]:
+        """Reverse closure into ``decl_idx`` (rust BFS, single FFI
+        hop). Returns positional indices into
+        :meth:`native.ProjectContext.nodes`.
+        """
         ctx = self.materialize_all()
-        return list(ctx.ancestors(decl, skip_flags=skip_flags))
+        return list(ctx.ancestors_indices(decl_idx, skip_flags=skip_flags))
 
-    def kept_alive_by_dead_branches(
-        self, *, seed_flags: int = KEEPALIVE_DEFAULT
-    ) -> set[SymbolNode]:
-        """Decls reachable only via ``EdgeFlags.DEAD_BRANCH`` edges."""
+    def kept_alive_by_dead_branches(self, *, seed_flags: int = KEEPALIVE_DEFAULT) -> set[int]:
+        """Indices reachable only via ``EdgeFlags.DEAD_BRANCH`` edges."""
         ctx = self.materialize_all()
-        full = set(ctx.reachable(seed_flags=seed_flags))
-        strict = set(ctx.reachable(seed_flags=seed_flags, skip_flags=EdgeFlags.DEAD_BRANCH))
+        full = set(ctx.reachable_indices(seed_flags=seed_flags))
+        strict = set(ctx.reachable_indices(seed_flags=seed_flags, skip_flags=EdgeFlags.DEAD_BRANCH))
         return full - strict
 
     def kept_alive_by_flags_only(
         self, flags: int, *, seed_flags: int = KEEPALIVE_DEFAULT
-    ) -> set[SymbolNode]:
+    ) -> set[int]:
         """Blast radius of dropping every seed whose flags carry any
-        bit in ``flags`` — the diff between ``reachable(seed_flags)``
-        and ``reachable(seed_flags & ~flags)``."""
+        bit in ``flags`` — the diff between
+        ``reachable_indices(seed_flags)`` and
+        ``reachable_indices(seed_flags & ~flags)``."""
         ctx = self.materialize_all()
-        full = set(ctx.reachable(seed_flags=seed_flags))
-        without = set(ctx.reachable(seed_flags=seed_flags & ~flags))
+        full = set(ctx.reachable_indices(seed_flags=seed_flags))
+        without = set(ctx.reachable_indices(seed_flags=seed_flags & ~flags))
         return full - without
 
 

@@ -444,10 +444,9 @@ where
 /// per-path bins.
 pub(crate) fn _bucket_indices_by_path(
     ctx: &ProjectContext,
-    py: Python<'_>,
     indices: Vec<usize>,
 ) -> PyResult<FxHashMap<String, Vec<usize>>> {
-    let paths = ctx.node_paths(py, indices.clone())?;
+    let paths = ctx.node_paths(indices.clone())?;
     let mut buckets: FxHashMap<String, Vec<usize>> = FxHashMap::default();
     for (idx, path) in indices.into_iter().zip(paths.into_iter()) {
         buckets.entry(path).or_default().push(idx);
@@ -1247,7 +1246,7 @@ impl SubclassQuery {
     fn attrs(&self, py: Python<'_>) -> PyResult<Vec<crate::helpers::NodeAttrs>> {
         let indices = self.indices(py)?;
         let ctx = self.ctx.borrow(py);
-        ctx.node_attrs(py, indices)
+        ctx.node_attrs(indices)
     }
 
     /// Terminal — first matched subclass's positional index, or
@@ -1260,7 +1259,7 @@ impl SubclassQuery {
     fn indices_by_path(&self, py: Python<'_>) -> PyResult<FxHashMap<String, Vec<usize>>> {
         let indices = self.indices(py)?;
         let ctx = self.ctx.borrow(py);
-        _bucket_indices_by_path(&ctx, py, indices)
+        _bucket_indices_by_path(&ctx, indices)
     }
 
     fn count(&self, py: Python<'_>) -> PyResult<usize> {
@@ -1320,7 +1319,7 @@ impl ImportQuery {
     fn attrs(&self, py: Python<'_>) -> PyResult<Vec<crate::helpers::NodeAttrs>> {
         let indices = self.indices(py)?;
         let ctx = self.ctx.borrow(py);
-        ctx.node_attrs(py, indices)
+        ctx.node_attrs(indices)
     }
 
     /// Terminal — first matched import node's positional index, or
@@ -1333,7 +1332,7 @@ impl ImportQuery {
     fn indices_by_path(&self, py: Python<'_>) -> PyResult<FxHashMap<String, Vec<usize>>> {
         let indices = self.indices(py)?;
         let ctx = self.ctx.borrow(py);
-        _bucket_indices_by_path(&ctx, py, indices)
+        _bucket_indices_by_path(&ctx, indices)
     }
 }
 
@@ -1422,7 +1421,7 @@ impl ModuleQuery {
         if self.all_dunders {
             return ctx.find_module_dunders_indices(py);
         }
-        let fqn = self.resolve_fqn(py, &ctx)?;
+        let fqn = self.resolve_fqn(&ctx)?;
         let Some(fqn) = fqn else {
             return Ok(Vec::new());
         };
@@ -1474,7 +1473,7 @@ impl ModuleQuery {
     fn attrs(&self, py: Python<'_>) -> PyResult<Vec<crate::helpers::NodeAttrs>> {
         let indices = self.indices(py)?;
         let ctx = self.ctx.borrow(py);
-        ctx.node_attrs(py, indices)
+        ctx.node_attrs(indices)
     }
 
     /// Terminal — group matched indices by their owning file path.
@@ -1483,13 +1482,13 @@ impl ModuleQuery {
     fn indices_by_path(&self, py: Python<'_>) -> PyResult<FxHashMap<String, Vec<usize>>> {
         let indices = self.indices(py)?;
         let ctx = self.ctx.borrow(py);
-        _bucket_indices_by_path(&ctx, py, indices)
+        _bucket_indices_by_path(&ctx, indices)
     }
 }
 
 impl ModuleQuery {
     /// Resolve the query's filter to a dotted fqname.
-    fn resolve_fqn(&self, py: Python<'_>, ctx: &ProjectContext) -> PyResult<Option<String>> {
+    fn resolve_fqn(&self, ctx: &ProjectContext) -> PyResult<Option<String>> {
         if let Some(ref fqn) = self.fqn {
             return Ok(Some(fqn.clone()));
         }
@@ -1498,7 +1497,7 @@ impl ModuleQuery {
             let Some(idx) = ctx.module_for_indices(path)? else {
                 return Ok(None);
             };
-            let attrs = ctx.node_attrs(py, vec![idx])?;
+            let attrs = ctx.node_attrs(vec![idx])?;
             return Ok(attrs.into_iter().next().map(|a| a.fqname));
         }
         Err(PyValueError::new_err(
@@ -1551,7 +1550,7 @@ impl ClassQuery {
     fn attrs(&self, py: Python<'_>) -> PyResult<Vec<crate::helpers::NodeAttrs>> {
         let indices = self.indices(py)?;
         let ctx = self.ctx.borrow(py);
-        ctx.node_attrs(py, indices)
+        ctx.node_attrs(indices)
     }
 
     /// Terminal — first matched class's positional index, or ``None``
@@ -1564,7 +1563,7 @@ impl ClassQuery {
     fn indices_by_path(&self, py: Python<'_>) -> PyResult<FxHashMap<String, Vec<usize>>> {
         let indices = self.indices(py)?;
         let ctx = self.ctx.borrow(py);
-        _bucket_indices_by_path(&ctx, py, indices)
+        _bucket_indices_by_path(&ctx, indices)
     }
 
     fn count(&self, py: Python<'_>) -> PyResult<usize> {
@@ -2196,7 +2195,7 @@ impl DeclQuery {
     fn attrs(&self, py: Python<'_>) -> PyResult<Vec<crate::helpers::NodeAttrs>> {
         let indices = self.indices(py)?;
         let ctx = self.ctx.borrow(py);
-        ctx.node_attrs(py, indices)
+        ctx.node_attrs(indices)
     }
 
     /// Terminal — first matching node's positional index, or ``None``
@@ -2214,7 +2213,7 @@ impl DeclQuery {
     fn indices_by_path(&self, py: Python<'_>) -> PyResult<FxHashMap<String, Vec<usize>>> {
         let indices = self.indices(py)?;
         let ctx = self.ctx.borrow(py);
-        _bucket_indices_by_path(&ctx, py, indices)
+        _bucket_indices_by_path(&ctx, indices)
     }
 
     fn count(&self, py: Python<'_>) -> PyResult<usize> {
@@ -2356,7 +2355,7 @@ impl DeclarationsQuery {
     fn attrs(&self, py: Python<'_>) -> PyResult<Vec<crate::helpers::NodeAttrs>> {
         let indices = self.indices(py)?;
         let ctx = self.ctx.borrow(py);
-        ctx.node_attrs(py, indices)
+        ctx.node_attrs(indices)
     }
 
     /// Terminal — first matched decl's positional index, or ``None``
@@ -2370,7 +2369,7 @@ impl DeclarationsQuery {
     fn indices_by_path(&self, py: Python<'_>) -> PyResult<FxHashMap<String, Vec<usize>>> {
         let indices = self.indices(py)?;
         let ctx = self.ctx.borrow(py);
-        _bucket_indices_by_path(&ctx, py, indices)
+        _bucket_indices_by_path(&ctx, indices)
     }
 }
 

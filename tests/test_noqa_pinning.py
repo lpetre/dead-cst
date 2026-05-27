@@ -135,7 +135,8 @@ def test_unpinned_import_in_dead_module_stays_dead(make_analysis, write_files):
     """Without the directive, an unused import in an otherwise-dead module is dead."""
     write_files({"m.py": "import os\n"})
     analysis = make_analysis()
-    dead_fqs = {n.fqname for n in analysis.dead()}
+    ctx = analysis.materialize_all()
+    dead_fqs = {a.fqname for a in ctx.node_attrs(list(analysis.dead()))}
     assert "m.os" in dead_fqs
 
 

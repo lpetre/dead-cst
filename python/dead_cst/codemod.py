@@ -161,12 +161,12 @@ def remove_code(dead_nodes: Iterable[SymbolNode], package_path: Path) -> None:
     anything still referenced (defensive -- the graph already classifies
     these as dead, but the scope check is cheap insurance).
 
-    ``dead_nodes`` is typically the set of unreachable nodes from
-    :class:`Analysis`; the codemod does not look at edges. Symbols
-    whose path is not under ``package_path`` are skipped, so call once
-    per package when analysing several packages together. The
-    transformation is destructive -- back the files up first, or run on
-    a clean working tree.
+    ``dead_nodes`` is typically materialised from the dead-index set
+    via ``ctx.nodes_at(list(analysis.dead()))``. The codemod does not
+    look at edges. Symbols whose path is not under ``package_path``
+    are skipped, so call once per package when analysing several
+    packages together. The transformation is destructive -- back the
+    files up first, or run on a clean working tree.
     """
     by_file, deleted_modules = _select_files(dead_nodes, package_path)
 

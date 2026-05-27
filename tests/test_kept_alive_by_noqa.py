@@ -126,5 +126,6 @@ def test_analysis_kept_alive_by_flags_only_noqa(make_analysis, write_files):
     )
     analysis = make_analysis()
     diff = analysis.kept_alive_by_flags_only(NodeFlags.NOQA)
-    fqnames = {n.fqname for n in diff}
+    ctx = analysis.materialize_all()
+    fqnames = {a.fqname for a in ctx.node_attrs(list(diff))}
     assert "pkg.side_effect" in fqnames

@@ -55,7 +55,11 @@ use crate::project::ProjectContext;
 ///
 /// Implementations don't construct Python ``GraphOp`` instances —
 /// they push pure-rust [`PreparedOp`] variants directly, skipping
-/// the prepare-from-Python round-trip.
+/// the prepare-from-Python round-trip. No ``Python<'_>`` parameter
+/// either: every ctx accessor a native plugin needs (``node_attrs``,
+/// ``find_main_blocks_indices``, the query DSL helpers) is GIL-free,
+/// reading ``Sync`` ``#[pyclass(frozen)]`` data via ``Py::get`` rather
+/// than ``Py::borrow``.
 pub(crate) trait NativePluginImpl: Send + Sync {
     /// Human-readable name surfaced by ``NativePlugin.name`` and used
     /// for progress reporting (``plugin_start`` / ``plugin_end``
@@ -67,8 +71,7 @@ pub(crate) trait NativePluginImpl: Send + Sync {
     /// ``sink``. Same frozen-graph contract as the Python path: the
     /// impl observes the base graph only; its emissions are folded in
     /// by the apply pass after every plugin returns.
-    fn run(&self, py: Python<'_>, ctx: &ProjectContext, sink: &mut Vec<PreparedOp>)
-        -> PyResult<()>;
+    fn run(&self, ctx: &ProjectContext, sink: &mut Vec<PreparedOp>) -> PyResult<()>;
 }
 
 /// Python-visible wrapper for a [`NativePluginImpl`]. Constructed via
@@ -134,12 +137,7 @@ impl NativePluginImpl for MainBlockPluginImpl {
         "MainBlockPlugin"
     }
 
-    fn run(
-        &self,
-        py: Python<'_>,
-        ctx: &ProjectContext,
-        sink: &mut Vec<PreparedOp>,
-    ) -> PyResult<()> {
+    fn run(&self, ctx: &ProjectContext, sink: &mut Vec<PreparedOp>) -> PyResult<()> {
         let pairs = ctx.find_main_blocks_indices()?;
         if pairs.is_empty() {
             return Ok(());
@@ -147,9 +145,11 @@ impl NativePluginImpl for MainBlockPluginImpl {
         // One batched ``node_attrs`` for every matched module — same
         // shape the Python ``MainBlockPlugin`` uses, but without the
         // ``Py<NodeAttrs>`` round-trip: we read straight off the
-        // ``Vec<NodeAttrs>`` the rust helper returns.
+        // ``Vec<NodeAttrs>`` the rust helper returns. Note: no ``py``
+        // argument — ``node_attrs`` reads via ``Py::get`` (frozen-Sync
+        // pyclass fast path).
         let module_idxs: Vec<usize> = pairs.iter().map(|(m, _)| *m).collect();
-        let attrs = ctx.node_attrs(py, module_idxs)?;
+        let attrs = ctx.node_attrs(module_idxs)?;
         let synthetic_kind = intern_kind("synthetic")?;
         for ((module_idx, decl_idxs), attr) in pairs.iter().zip(attrs.iter()) {
             let mut edges_to_idx: Vec<usize> = Vec::with_capacity(decl_idxs.len() + 1);
