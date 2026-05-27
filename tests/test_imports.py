@@ -625,6 +625,77 @@ STAR_REEXPORT_EDGES = frozenset(
             },
             id="dunder-all-unknown-name-is-ignored",
         ),
+        # ------------------------------------------------------------------
+        # Common real-world shapes.
+        # ------------------------------------------------------------------
+        pytest.param(
+            # Stdlib import used via a subscript. ``os`` doesn't surface a
+            # synthetic node (stdlib is silent — see
+            # ``test_stdlib_imports_are_silent``), so the only edges are
+            # the local alias and the module-level use of it. The
+            # ``environ["foo"]`` access doesn't add anything past the
+            # alias.
+            'import os\nos.environ["foo"]\n',
+            {
+                "p.x -> p.x.os",
+                "p.x.os -> p.x",
+            },
+            id="stdlib-import-subscript-access",
+        ),
+        pytest.param(
+            # External-dist import combined with a submodule import that
+            # binds the same root name. Both ``import anyio`` and
+            # ``import anyio.to_thread`` bind ``anyio`` locally and
+            # resolve to the same ``[external dist] anyio`` synthetic;
+            # the second statement's module-level side-effect contributes
+            # the ``p.x -> [external dist] anyio`` edge directly.
+            "import anyio\nimport anyio.to_thread\nanyio.run()\n",
+            {
+                "p.x -> [external dist] anyio",
+                "p.x -> p.x.anyio",
+                "p.x.anyio -> [external dist] anyio",
+                "p.x.anyio -> p.x",
+            },
+            id="external-import-with-submodule",
+        ),
+        pytest.param(
+            # Quoted attribute-style annotation (``"futures.Future[str]"``).
+            # The walker re-parses the string and resolves ``futures``
+            # to the local alias. ``concurrent.futures`` is stdlib, so
+            # the alias has no upstream edges — only the alias use
+            # propagates to ``p.x.f``.
+            'from concurrent import futures\ndef f() -> "futures.Future[str]": ...\n',
+            {
+                "p.x.f -> p.x",
+                "p.x.f -> p.x.futures",
+                "p.x.futures -> p.x",
+            },
+            id="quoted-attribute-annotation-on-stdlib-import",
+        ),
+        pytest.param(
+            # ``@dataclass`` decorator + ``field(default_factory=list)``
+            # default-value call inside the class body. Both bind to the
+            # enclosing class ``C`` (decorators and class-body
+            # expressions attribute to the top-level decl per the
+            # "nested defs fold into the enclosing top-level decl"
+            # convention). ``dataclasses`` is stdlib so no upstream
+            # edges; ``list`` and the undefined ``T`` are builtins or
+            # missing names and contribute nothing.
+            (
+                "from dataclasses import dataclass, field\n"
+                "@dataclass\n"
+                "class C:\n"
+                "    a: list[T] = field(default_factory=list)\n"
+            ),
+            {
+                "p.x.C -> p.x",
+                "p.x.C -> p.x.dataclass",
+                "p.x.C -> p.x.field",
+                "p.x.dataclass -> p.x",
+                "p.x.field -> p.x",
+            },
+            id="dataclass-decorator-and-field-factory",
+        ),
     ],
 )
 def test_imports(build_decl_graph, assert_edges, src, expected_extra_edges):
@@ -861,6 +932,66 @@ def test_imports(build_decl_graph, assert_edges, src, expected_extra_edges):
                 "mod.f -> mod.Helper",
             },
             id="type-checking-import-used-only-in-string-annotation",
+        ),
+        pytest.param(
+            # Module-level ``isinstance(foo, SomeClass)``. The use sits
+            # at module scope so the enclosing module owns the edges
+            # (``mod -> mod.SomeClass`` plus the parallel upstream
+            # edges via Principle 2). ``foo`` is undefined and
+            # contributes nothing.
+            {
+                "a.py": "class SomeClass: pass\n",
+                "mod.py": "from a import SomeClass\nisinstance(foo, SomeClass)\n",
+            },
+            {
+                "a.SomeClass -> a",
+                "mod -> a",
+                "mod -> a.SomeClass",
+                "mod -> mod.SomeClass",
+                "mod.SomeClass -> a",
+                "mod.SomeClass -> a.SomeClass",
+                "mod.SomeClass -> mod",
+            },
+            id="isinstance-uses-imported-class",
+        ),
+        pytest.param(
+            # ``if TYPE_CHECKING: from a import SomeClass`` paired with
+            # ``else: SomeClass = None`` — both branches mint a
+            # ``mod.SomeClass`` decl (one import, one variable) that
+            # share an fqname. ``def f(x: SomeClass)`` resolves
+            # *unquoted* against the reaching defs; the import path
+            # carries the upstream edges to ``a.SomeClass`` and the
+            # variable path adds nothing past the parent edge, so the
+            # dedup'd edge set shows the import's upstream resolution
+            # plus the single shared ``mod.f -> mod.SomeClass`` alias
+            # edge. The else-branch assignment is live at runtime
+            # (TYPE_CHECKING is False), but its presence doesn't
+            # suppress the import's upstream resolution — both reaching
+            # defs contribute.
+            {
+                "a.py": "class SomeClass: pass\n",
+                "mod.py": (
+                    "from typing import TYPE_CHECKING\n"
+                    "if TYPE_CHECKING:\n"
+                    "    from a import SomeClass\n"
+                    "else:\n"
+                    "    SomeClass = None\n"
+                    "def f(x: SomeClass): ...\n"
+                ),
+            },
+            {
+                "a.SomeClass -> a",
+                "mod -> mod.TYPE_CHECKING",
+                "mod.SomeClass -> a",
+                "mod.SomeClass -> a.SomeClass",
+                "mod.SomeClass -> mod",
+                "mod.TYPE_CHECKING -> mod",
+                "mod.f -> a",
+                "mod.f -> a.SomeClass",
+                "mod.f -> mod",
+                "mod.f -> mod.SomeClass",
+            },
+            id="type-checking-import-shadowed-by-else-assignment",
         ),
     ],
 )
