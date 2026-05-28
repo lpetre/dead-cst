@@ -2085,3 +2085,15 @@ def read_graph(path: str) -> tuple[NativeGraph, GraphMetadata]:
     a graph is cheap.
     """
     ...
+
+def _main_block_run_count() -> int:
+    """Test helper. Total executions of the per-file ``MainBlockPlugin``
+    impl since the last reset — a salsa cache *miss* counter. Lets the
+    test suite assert an unchanged main-block file isn't re-run on
+    ``re_materialize``. Not part of the supported surface.
+    """
+    ...
+
+def _reset_main_block_run_count() -> None:
+    """Test helper. Zero the :func:`_main_block_run_count` counter."""
+    ...

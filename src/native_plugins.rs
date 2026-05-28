@@ -42,10 +42,18 @@
 //! ``Analysis(plugins=[...])`` and inside the harness's
 //! :class:`ThreadPoolExecutor` fan-out.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use pyo3::prelude::*;
+use ruff_db::files::File;
+use ruff_db::parsed::parsed_module;
+use ruff_db::source::line_index;
+use ty_project::Db as ProjectDb;
 
 use crate::builder::PreparedOp;
+use crate::file_payload::{file_to_nodes, NodeData};
 use crate::graph::{intern_kind, NodeFlags};
+use crate::helpers::find_main_block_range;
 use crate::project::ProjectContext;
 
 /// Rust-side plugin contract. Each impl describes how to derive ops
@@ -65,31 +73,186 @@ pub(crate) trait NativePluginImpl: Send + Sync {
     /// for progress reporting (``plugin_start`` / ``plugin_end``
     /// events). Should match the conventional name of the equivalent
     /// Python plugin so existing harness logs read the same.
+    //
+    // Retained alongside the [`NativePluginKind::ProjectWide`] path for
+    // future native plugins whose logic spans files (subclass walks,
+    // dispatch handlers). The bundled `MainBlockPlugin` moved to the
+    // per-file path, so no impl uses this today.
+    #[allow(dead_code)]
     fn name(&self) -> &'static str;
 
     /// Walk the frozen ``ctx`` and append the plugin's ops to
     /// ``sink``. Same frozen-graph contract as the Python path: the
     /// impl observes the base graph only; its emissions are folded in
     /// by the apply pass after every plugin returns.
+    #[allow(dead_code)]
     fn run(&self, ctx: &ProjectContext, sink: &mut Vec<PreparedOp>) -> PyResult<()>;
 }
 
-/// Python-visible wrapper for a [`NativePluginImpl`]. Constructed via
-/// static factories (one per concrete impl, e.g.
+// ---------------------------------------------------------------------------
+// Per-file native plugins
+//
+// A *per-file* native plugin is invoked once per project file with a
+// restricted [`FileContext`] — it sees only that file's nodes / parsed
+// AST, nothing project-wide. The invocation is wrapped in the
+// [`per_file_plugin_ops`] salsa-tracked query, so when a file's
+// ``file_to_nodes`` / ``parsed_module`` is unchanged across a
+// ``re_materialize``, the plugin's cached output is reused with zero
+// re-run. Cache soundness comes from the restriction: a per-file
+// plugin can only reference nodes in its own file, so its output is a
+// pure function of that file's tracked inputs.
+//
+// Ops are emitted in a *file-local* index space ([`FileLocalOpData`]),
+// positions into ``FileNodes(file).refs``. The harness translates
+// those to global indices at apply time via the ``ref_to_global`` map.
+// ---------------------------------------------------------------------------
+
+/// File-local op produced by a [`PerFileNativePluginImpl`]. Mirrors
+/// ``AddNodeByIdx`` but with ``edges_to_local_idx`` as positions into
+/// the *file's own* ``FileNodes.refs`` array rather than global graph
+/// indices. Salsa-cached as the per-file plugin's output, so it must
+/// be pure rust + ``salsa::Update`` (no ``File`` handle, no global
+/// idx — both would couple the cache to project-wide assemble order).
+#[derive(Debug, Clone, Eq, PartialEq, salsa::Update, get_size2::GetSize)]
+pub(crate) struct FileLocalOpData {
+    pub(crate) fqname: String,
+    pub(crate) kind: &'static str,
+    pub(crate) flags: u32,
+    /// Indices into the owning file's ``FileNodes.refs`` array.
+    pub(crate) edges_to_local_idx: Vec<u32>,
+}
+
+/// Read-only, single-file view handed to a [`PerFileNativePluginImpl`].
+/// Deliberately tiny: it exposes only this file's salsa-tracked
+/// per-file payload + parsed AST. No project-wide queries, no
+/// ``node_attrs(indices)`` over arbitrary nodes — that restriction is
+/// what makes the plugin's output a pure function of the file and
+/// therefore salsa-cacheable.
+pub(crate) struct FileContext<'db> {
+    db: &'db dyn ProjectDb,
+    file: File,
+}
+
+impl<'db> FileContext<'db> {
+    fn new(db: &'db dyn ProjectDb, file: File) -> Self {
+        Self { db, file }
+    }
+
+    /// This file's nodes — index 0 is the synthetic module node, the
+    /// rest are top-level decls. Indices line up with [`Self::refs`].
+    pub(crate) fn nodes(&self) -> &'db [NodeData] {
+        &file_to_nodes(self.db, self.file).nodes
+    }
+
+    /// The file's module fqname (``nodes()[0].fqname``).
+    pub(crate) fn module_fqname(&self) -> &'db str {
+        &file_to_nodes(self.db, self.file).nodes[0].fqname
+    }
+
+    /// Local index of the synthetic module node (always 0 — kept as a
+    /// named accessor so impls don't hard-code the convention).
+    pub(crate) fn module_local_idx(&self) -> u32 {
+        0
+    }
+
+    /// 1-based ``(start_line, end_line)`` of the byte ``range`` in this
+    /// file, via the salsa-cached line index. Used to map a TextRange
+    /// (e.g. the ``if __name__`` block) onto the line numbers carried
+    /// by [`NodeData`].
+    pub(crate) fn line_span(&self, range: ruff_text_size::TextRange) -> (usize, usize) {
+        let source = ruff_db::source::source_text(self.db, self.file);
+        let idx = line_index(self.db, self.file);
+        let start = idx.line_column(range.start(), &source).line.get() as usize;
+        let end = idx.line_column(range.end(), &source).line.get() as usize;
+        (start, end)
+    }
+
+    /// The parsed module for this file (salsa-cached).
+    pub(crate) fn parsed(&self) -> ruff_db::parsed::ParsedModuleRef {
+        parsed_module(self.db, self.file).load(self.db)
+    }
+}
+
+/// Rust-side per-file plugin contract. Called once per project file
+/// with a restricted [`FileContext`]; pushes [`FileLocalOpData`] into
+/// the sink. Pure function of the file's tracked inputs — no
+/// project-wide reads, no side effects — so the harness can cache the
+/// result in salsa keyed on ``(file, name())``.
+pub(crate) trait PerFileNativePluginImpl: Send + Sync {
+    /// Walk ``file_ctx`` and append this file's ops to ``sink``.
+    /// Naming + salsa keying live on [`PerFilePluginKind`], so the
+    /// trait itself only carries the work method.
+    fn run_on_file(&self, file_ctx: &FileContext<'_>, sink: &mut Vec<FileLocalOpData>);
+}
+
+/// Salsa cache-key discriminant for a per-file plugin. A cheap
+/// ``Copy`` enum rather than a ``&'static str`` because salsa tracked
+/// function arguments must be owned + ``'static`` (a borrowed key
+/// would force ``'db: 'static``). One variant per configless per-file
+/// impl; configured per-file plugins would carry a config-hash here
+/// (out of scope).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum PerFilePluginKind {
+    MainBlock,
+}
+
+impl PerFilePluginKind {
+    /// Human-readable name, matching the equivalent Python plugin.
+    fn name(self) -> &'static str {
+        match self {
+            PerFilePluginKind::MainBlock => "MainBlockPlugin",
+        }
+    }
+
+    /// Run the concrete impl for this kind against ``file_ctx``.
+    fn run_on_file(self, file_ctx: &FileContext<'_>, sink: &mut Vec<FileLocalOpData>) {
+        match self {
+            PerFilePluginKind::MainBlock => MainBlockPluginImpl.run_on_file(file_ctx, sink),
+        }
+    }
+}
+
+/// Salsa-tracked per-file plugin invocation. Keyed on ``(file,
+/// kind)``; re-runs only when the file's tracked inputs
+/// (``file_to_nodes`` / ``parsed_module`` / ``line_index``) change.
+/// Returns the file-local ops the harness translates to global
+/// indices at apply time.
+#[salsa::tracked(returns(ref), heap_size = ruff_memory_usage::heap_size)]
+pub(crate) fn per_file_plugin_ops(
+    db: &dyn ProjectDb,
+    file: File,
+    kind: PerFilePluginKind,
+) -> Vec<FileLocalOpData> {
+    let file_ctx = FileContext::new(db, file);
+    let mut sink = Vec::new();
+    kind.run_on_file(&file_ctx, &mut sink);
+    sink
+}
+
+/// Internal classification of what a [`NativePlugin`] wraps. The
+/// harness branches on this: project-wide plugins run once against the
+/// whole ``ProjectContext``; per-file plugins run once per file
+/// through the salsa-cached [`per_file_plugin_ops`] query.
+pub(crate) enum NativePluginKind {
+    /// Project-wide native plugin — one ``run`` against the whole
+    /// graph. Retained for future non-file-local native plugins; the
+    /// bundled `MainBlockPlugin` is per-file, so nothing constructs
+    /// this variant today.
+    #[allow(dead_code)]
+    ProjectWide(Box<dyn NativePluginImpl>),
+    PerFile(PerFilePluginKind),
+}
+
+/// Python-visible wrapper for a native plugin (project-wide or
+/// per-file). Constructed via static factories (e.g.
 /// :meth:`NativePlugin.main_block`); ``__init__`` is intentionally
-/// unsupported so plugin authors discover the existing factories
-/// (and we keep the configuration surface inside the wrapper rust-
-/// side).
+/// unsupported.
 ///
-/// Sendable because the inner trait bound (``Send + Sync``) carries
-/// across: the harness drives plugins from a
-/// :class:`ThreadPoolExecutor`, so the ``Py<NativePlugin>`` handle
-/// shuttles between threads alongside Python plugins. The impl's
-/// :meth:`run` is invoked under the GIL on whichever worker picks
-/// up the task.
+/// Sendable so the harness can shuttle the handle between
+/// :class:`ThreadPoolExecutor` workers alongside Python plugins.
 #[pyclass(name = "NativePlugin")]
 pub(crate) struct NativePlugin {
-    pub(crate) inner: Box<dyn NativePluginImpl>,
+    pub(crate) kind: NativePluginKind,
 }
 
 #[pymethods]
@@ -100,28 +263,31 @@ impl NativePlugin {
     /// native or Python instance is registered.
     #[getter]
     fn name(&self) -> &'static str {
-        self.inner.name()
+        match &self.kind {
+            NativePluginKind::ProjectWide(inner) => inner.name(),
+            NativePluginKind::PerFile(kind) => kind.name(),
+        }
     }
 
     /// ``Plugin`` protocol's ``prepare(project_root)`` no-op hook.
-    /// Native plugins don't have a pre-graph prepare phase today —
-    /// every impl reads from the frozen ctx in :meth:`run`.
+    /// Native plugins don't have a pre-graph prepare phase today.
     fn prepare(&self, _project_root: PyObject) {}
 
-    /// Construct the native [``MainBlockPlugin``](
-    /// crate::native_plugins::MainBlockPluginImpl) — same observable
-    /// behaviour as ``dead_cst.plugins.MainBlockPlugin``, no Python
-    /// loop or ``AddNodeByIdx`` allocation in the hot path.
+    /// Construct the native ``MainBlockPlugin`` — same observable
+    /// behaviour as ``dead_cst.plugins.MainBlockPlugin``, but
+    /// implemented as a *per-file* plugin: invoked once per file
+    /// through a salsa-cached query, so an unchanged file's marker is
+    /// reused across ``re_materialize`` with zero re-run.
     #[staticmethod]
     fn main_block() -> Self {
         Self {
-            inner: Box::new(MainBlockPluginImpl),
+            kind: NativePluginKind::PerFile(PerFilePluginKind::MainBlock),
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// MainBlockPlugin — first native impl. Equivalent to
+// MainBlockPlugin — first per-file impl. Equivalent to
 // ``dead_cst.plugins.main_block.MainBlockPlugin``: emit one synthetic
 // ``<__main__>:<module_fqname>`` entrypoint per file with a top-level
 // ``if __name__ == "__main__":`` block, with edges to the containing
@@ -130,40 +296,54 @@ impl NativePlugin {
 
 const MAIN_BLOCK_PREFIX: &str = "<__main__>:";
 
+/// Test-only counter: number of times [`MainBlockPluginImpl::run_on_file`]
+/// actually executed (i.e. salsa cache *misses* for the per-file
+/// query). A salsa hit reuses the cached ops without touching the
+/// impl, so this counter stays flat for unchanged files across a
+/// ``re_materialize``. Surfaced to tests via
+/// :func:`main_block_run_count` / :func:`reset_main_block_run_count`.
+static MAIN_BLOCK_RUN_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Test helper — total `MainBlockPluginImpl::run_on_file` executions
+/// since the last reset. Lets the cache-behaviour test assert that an
+/// unchanged main-block file isn't re-run on ``re_materialize``.
+#[pyfunction]
+pub(crate) fn _main_block_run_count() -> usize {
+    MAIN_BLOCK_RUN_COUNT.load(Ordering::Relaxed)
+}
+
+/// Test helper — zero the [`MAIN_BLOCK_RUN_COUNT`] counter.
+#[pyfunction]
+pub(crate) fn _reset_main_block_run_count() {
+    MAIN_BLOCK_RUN_COUNT.store(0, Ordering::Relaxed);
+}
+
 pub(crate) struct MainBlockPluginImpl;
 
-impl NativePluginImpl for MainBlockPluginImpl {
-    fn name(&self) -> &'static str {
-        "MainBlockPlugin"
-    }
-
-    fn run(&self, ctx: &ProjectContext, sink: &mut Vec<PreparedOp>) -> PyResult<()> {
-        let pairs = ctx.find_main_blocks_indices()?;
-        if pairs.is_empty() {
-            return Ok(());
+impl PerFileNativePluginImpl for MainBlockPluginImpl {
+    fn run_on_file(&self, file_ctx: &FileContext<'_>, sink: &mut Vec<FileLocalOpData>) {
+        MAIN_BLOCK_RUN_COUNT.fetch_add(1, Ordering::Relaxed);
+        let parsed = file_ctx.parsed();
+        let Some(block_range) = find_main_block_range(&parsed) else {
+            return;
+        };
+        let (block_start_line, block_end_line) = file_ctx.line_span(block_range);
+        let nodes = file_ctx.nodes();
+        // Local indices of every top-level decl whose source span falls
+        // inside the ``if __name__`` block. Skip index 0 (the module
+        // node) — it's added explicitly below as the first edge.
+        let mut edges_to_local_idx: Vec<u32> = vec![file_ctx.module_local_idx()];
+        for (local_idx, node) in nodes.iter().enumerate().skip(1) {
+            if node.start_line >= block_start_line && node.end_line <= block_end_line {
+                edges_to_local_idx.push(local_idx as u32);
+            }
         }
-        // One batched ``node_attrs`` for every matched module — same
-        // shape the Python ``MainBlockPlugin`` uses, but without the
-        // ``Py<NodeAttrs>`` round-trip: we read straight off the
-        // ``Vec<NodeAttrs>`` the rust helper returns. Note: no ``py``
-        // argument — ``node_attrs`` reads via ``Py::get`` (frozen-Sync
-        // pyclass fast path).
-        let module_idxs: Vec<usize> = pairs.iter().map(|(m, _)| *m).collect();
-        let attrs = ctx.node_attrs(module_idxs)?;
-        let synthetic_kind = intern_kind("synthetic")?;
-        for ((module_idx, decl_idxs), attr) in pairs.iter().zip(attrs.iter()) {
-            let mut edges_to_idx: Vec<usize> = Vec::with_capacity(decl_idxs.len() + 1);
-            edges_to_idx.push(*module_idx);
-            edges_to_idx.extend(decl_idxs);
-            sink.push(PreparedOp::NodeByIdx {
-                fqname: format!("{MAIN_BLOCK_PREFIX}{}", attr.fqname),
-                kind: synthetic_kind,
-                path: attr.path.clone(),
-                flags: NodeFlags::ENTRYPOINT,
-                edges_from_idx: Vec::new(),
-                edges_to_idx,
-            });
-        }
-        Ok(())
+        let synthetic_kind = intern_kind("synthetic").expect("'synthetic' is a valid kind");
+        sink.push(FileLocalOpData {
+            fqname: format!("{MAIN_BLOCK_PREFIX}{}", file_ctx.module_fqname()),
+            kind: synthetic_kind,
+            flags: NodeFlags::ENTRYPOINT,
+            edges_to_local_idx,
+        });
     }
 }

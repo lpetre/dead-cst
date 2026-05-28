@@ -170,6 +170,12 @@ pub(crate) struct BuildOutputs {
     /// O(1) fast path; not yet wired into the current path.
     #[allow(dead_code)]
     pub(crate) children_by_fqn: FxHashMap<String, Vec<usize>>,
+    /// `(file, local_idx) -> global node idx`, where ``local_idx`` is a
+    /// position in that file's ``FileNodes.refs`` array. Lets per-file
+    /// native plugins emit ops in file-local index space; the harness
+    /// translates them to global indices at apply time. See
+    /// [`crate::native_plugins`].
+    pub(crate) local_to_global: FxHashMap<(File, u32), usize>,
 }
 
 /// Run the three build phases (ingest → hierarchy+imports → references)
@@ -398,6 +404,7 @@ pub(crate) fn build_project_graph(
     let module_nodes_by_file = assembled.module_nodes_by_file;
     let class_by_selection = assembled.class_by_selection;
     let decl_by_name_range = assembled.decl_by_name_range;
+    let local_to_global = assembled.local_to_global;
     let ref_to_global = assembled.ref_to_global;
 
     counters.start_phase(PHASE_FQNAME, Some(builder.nodes.len()));
@@ -462,6 +469,7 @@ pub(crate) fn build_project_graph(
         children_by_node,
         children_by_fqn,
         children_by_parent,
+        local_to_global,
     })
 }
 
@@ -492,6 +500,12 @@ struct AssembledGraph<'db> {
     module_nodes_by_file: FxHashMap<File, usize>,
     class_by_selection: FxHashMap<(File, (u32, u32)), usize>,
     decl_by_name_range: FxHashMap<(File, (u32, u32)), usize>,
+    /// `(file, local_idx) -> global node idx`. ``local_idx`` is the
+    /// position in that file's ``FileNodes.refs`` array. Lets per-file
+    /// native plugins (which emit ops in file-local index space) get
+    /// translated to global indices at apply time without a live
+    /// ``ref_to_global`` (whose ``'db`` lifetime can't outlive assemble).
+    local_to_global: FxHashMap<(File, u32), usize>,
     /// PROTOTYPE: kept around so the class-hierarchy builder can map
     /// `NodeRef -> global idx`.
     ref_to_global: FxHashMap<NodeRef<'db>, usize>,
@@ -562,6 +576,8 @@ fn assemble_graph<'db>(
         FxHashMap::with_capacity_and_hasher(total_decls, Default::default());
     let mut ref_to_global: FxHashMap<NodeRef<'db>, usize> =
         FxHashMap::with_capacity_and_hasher(total_nodes, Default::default());
+    let mut local_to_global: FxHashMap<(File, u32), usize> =
+        FxHashMap::with_capacity_and_hasher(total_nodes, Default::default());
     let mut all_warnings: Vec<String> = Vec::new();
 
     // Pass 1: node mint.
@@ -628,6 +644,7 @@ fn assemble_graph<'db>(
             };
             let global_idx = builder.intern_node(py, symbol)?;
             ref_to_global.insert(node_ref, global_idx);
+            local_to_global.insert((file, local_idx as u32), global_idx);
 
             match node_ref {
                 NodeRef::Module(_) => {
@@ -844,6 +861,7 @@ fn assemble_graph<'db>(
         module_nodes_by_file,
         class_by_selection,
         decl_by_name_range,
+        local_to_global,
         ref_to_global,
     })
 }
@@ -1722,17 +1740,26 @@ fn collect_prepared_plugin_ops(
     plugin: &PyObject,
     sink: &mut Vec<PreparedOp>,
 ) -> PyResult<()> {
-    // Native fast path: ``NativePlugin`` instances expose a rust
-    // [`NativePluginImpl::run`] that fills ``sink`` directly with
-    // [`PreparedOp`] variants — no Python ``.run(ctx)`` call, no
-    // ``GraphOp`` allocation per yield, no ``prepare_graph_op``
-    // extraction loop. The frozen-graph contract is identical to
-    // the Python path: the impl borrows ``ctx`` immutably; the
-    // apply pass folds ``sink`` in afterwards.
+    // Native fast path: ``NativePlugin`` instances run rust directly,
+    // filling ``sink`` with [`PreparedOp`] variants — no Python
+    // ``.run(ctx)`` call, no ``GraphOp`` allocation per yield, no
+    // ``prepare_graph_op`` extraction loop. The frozen-graph contract
+    // is identical to the Python path.
     let plugin_bound = plugin.bind(py);
     if let Ok(native) = plugin_bound.downcast::<crate::native_plugins::NativePlugin>() {
         let ctx_ref = ctx.borrow(py);
-        return native.borrow().inner.run(&ctx_ref, sink);
+        match &native.borrow().kind {
+            // Project-wide impl: one ``run`` against the whole graph.
+            crate::native_plugins::NativePluginKind::ProjectWide(inner) => {
+                return inner.run(&ctx_ref, sink);
+            }
+            // Per-file impl: invoke the salsa-cached per-file query for
+            // every project file, translating each file-local op to a
+            // global ``PreparedOp::NodeByIdx`` via ``local_to_global``.
+            crate::native_plugins::NativePluginKind::PerFile(kind) => {
+                return ctx_ref.collect_per_file_plugin_ops(*kind, sink);
+            }
+        }
     }
     let result = plugin_bound.call_method1("run", (ctx.clone_ref(py),))?;
     if result.is_none() {
@@ -1818,6 +1845,47 @@ impl ProjectContext {
             return Err(not_materialized(op));
         }
         Ok(RwLockReadGuard::map(guard, |o| o.as_ref().unwrap()))
+    }
+
+    /// Drive a per-file native plugin across every project file and
+    /// translate its file-local ops to global [`PreparedOp`]s.
+    ///
+    /// For each file, the salsa-cached [`per_file_plugin_ops`] query
+    /// returns the plugin's [`FileLocalOpData`] (cheap on cache hit —
+    /// unchanged files skip the plugin re-run entirely). Each op's
+    /// ``edges_to_local_idx`` are positions in that file's
+    /// ``FileNodes.refs``; we map them to global indices via the
+    /// build's ``local_to_global`` table. A local idx with no global
+    /// entry (shouldn't happen for a well-formed plugin) is skipped.
+    pub(crate) fn collect_per_file_plugin_ops(
+        &self,
+        kind: crate::native_plugins::PerFilePluginKind,
+        sink: &mut Vec<PreparedOp>,
+    ) -> PyResult<()> {
+        let outputs = self.materialized("collect_per_file_plugin_ops")?;
+        for &file in &outputs.project_files {
+            let file_ops = crate::native_plugins::per_file_plugin_ops(&self.db, file, kind);
+            if file_ops.is_empty() {
+                continue;
+            }
+            let path = file_path_string(&self.db, file);
+            for op in file_ops {
+                let edges_to_idx: Vec<usize> = op
+                    .edges_to_local_idx
+                    .iter()
+                    .filter_map(|&local| outputs.local_to_global.get(&(file, local)).copied())
+                    .collect();
+                sink.push(PreparedOp::NodeByIdx {
+                    fqname: op.fqname.clone(),
+                    kind: op.kind,
+                    path: path.clone(),
+                    flags: op.flags,
+                    edges_from_idx: Vec::new(),
+                    edges_to_idx,
+                });
+            }
+        }
+        Ok(())
     }
 }
 
