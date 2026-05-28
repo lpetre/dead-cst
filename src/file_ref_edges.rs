@@ -259,7 +259,7 @@ impl<'a, 'db> RefWalker<'a, 'db> {
     ///   silently dropped.
     /// * No `in_string_annotation` plumbing — string annotations
     ///   aren't entered yet.
-    fn find_local_bindings(&self, name: &ExprName) -> Vec<Resolution<'db>> {
+    fn find_local_bindings(&self, name: &ExprName, extra_chain: &[&str]) -> Vec<Resolution<'db>> {
         let db = self.model.db();
         // For names from a string-annotation sub-AST, ty doesn't know
         // their scope (we parsed them ourselves rather than going
@@ -333,6 +333,60 @@ impl<'a, 'db> RefWalker<'a, 'db> {
                 }
             }
             if saw_binding {
+                // Sibling submodule imports (`import a.foo` then
+                // `import a.bar`) all rebind the same root name, so the
+                // flow-sensitive `bindings_at_use` above attributes the
+                // use to the *last* rebind only. But `a.foo.x()` depends
+                // specifically on the `import a.foo` statement —
+                // importing `a.bar` does not make the `a.foo` submodule
+                // available. Walk the scope-wide reachable bindings and
+                // add an alias edge to every plain `import <root>.<seg…>`
+                // whose submodule suffix is a prefix of the access chain,
+                // so each such import keeps its in-edge (codemod
+                // invariant). Gated on a non-empty chain: a bare use of
+                // the root name genuinely is last-write-wins.
+                if !extra_chain.is_empty() {
+                    let root = name.id.as_str();
+                    for binding in use_def_map.reachable_symbol_bindings(symbol_id) {
+                        let Some(def) = binding.binding.definition() else {
+                            continue;
+                        };
+                        if def.file(db) != self.file {
+                            continue;
+                        }
+                        let candidate = NodeRef::Def(def);
+                        let Some(&idx) = self.self_nodes.ref_to_local.get(&candidate) else {
+                            continue;
+                        };
+                        let node = &self.self_nodes.nodes[idx as usize];
+                        if !matches!(node.kind, NodeKind::Import) {
+                            continue;
+                        }
+                        let Some(spec) = node.imports.as_ref() else {
+                            continue;
+                        };
+                        if spec.star || spec.decl.is_some() {
+                            continue;
+                        }
+                        // Plain `import root.seg1.seg2` (no `as`): the
+                        // bound name equals the module's first segment.
+                        let mut segs = spec.module.split('.');
+                        if segs.next() != Some(root) {
+                            continue;
+                        }
+                        let suffix: Vec<&str> = segs.collect();
+                        if suffix.is_empty() || suffix.len() > extra_chain.len() {
+                            continue;
+                        }
+                        if suffix.iter().zip(extra_chain).all(|(s, c)| s == c)
+                            && !results
+                                .iter()
+                                .any(|r| matches!(r, Resolution::Alias(d) if *d == candidate))
+                        {
+                            results.push(Resolution::Alias(candidate));
+                        }
+                    }
+                }
                 return results;
             }
             // Annotation-only declaration fallback (mirrors today's
@@ -364,7 +418,7 @@ impl<'a, 'db> RefWalker<'a, 'db> {
             return;
         }
         self.current_flags = self.flags_for_range(name.range());
-        for resolution in self.find_local_bindings(name) {
+        for resolution in self.find_local_bindings(name, extra_chain) {
             match resolution {
                 Resolution::Alias(dst) => {
                     self.emit_edge(dst);

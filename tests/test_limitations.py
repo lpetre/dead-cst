@@ -55,45 +55,6 @@ def test_limitation(build_decl_graph, assert_edges, files, expected_edges):
     "files, expected_edges",
     [
         pytest.param(
-            # Two sibling submodule imports that share the same root
-            # binding (``import a.foo`` then ``import a.bar`` both bind the
-            # local name ``a``). The use sites ``a.foo.x()`` and
-            # ``a.bar.z()`` resolve their upstream module/decl edges
-            # correctly, but the *alias* edge from each use lands only on
-            # the LAST ``a`` binding (``mod.a@2:7``). The first binding
-            # (``mod.a@1:7`` -- the ``import a.foo`` statement) gets ZERO
-            # in-edges, so the codemod would drop ``import a.foo`` and
-            # break ``a.foo.x()`` (importing ``a.bar`` does not import the
-            # ``a.foo`` submodule).
-            #
-            # Ideal: ``a.foo.x()`` should keep its own binding alive --
-            #     "mod -> mod.a@1:7",
-            # (and, symmetrically, both uses arguably edge to both
-            # reaching ``a`` bindings).
-            {
-                "a/__init__.py": "",
-                "a/foo.py": "def x(): pass\n",
-                "a/bar.py": "def z(): pass\n",
-                "mod.py": "import a.foo\nimport a.bar\na.foo.x()\na.bar.z()\n",
-            },
-            {
-                "a.bar -> a",
-                "a.bar.z@1:0 -> a.bar",
-                "a.foo -> a",
-                "a.foo.x@1:0 -> a.foo",
-                "mod -> a.bar",
-                "mod -> a.bar.z@1:0",
-                "mod -> a.foo",
-                "mod -> a.foo.x@1:0",
-                "mod -> mod.a@2:7",
-                "mod.a@1:7 -> a.foo",
-                "mod.a@1:7 -> mod",
-                "mod.a@2:7 -> a.bar",
-                "mod.a@2:7 -> mod",
-            },
-            id="sibling-submodule-imports-share-root-binding",
-        ),
-        pytest.param(
             # ``if TYPE_CHECKING: from a import X`` / ``else: from b
             # import X`` -- the two branches bind ``SomeClass`` to
             # different upstreams. A use of ``SomeClass`` has two reaching

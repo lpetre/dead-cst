@@ -74,6 +74,13 @@ SymbolNode- and idx-form terminals on the same query.
   subscripted object on the left and every name on the right are now
   walked, so the imports / decls they reference keep their in-edges
   instead of looking dead.
+- Sibling submodule imports that share a root binding (`import a.foo`
+  then `import a.bar`) no longer leave the earlier statement looking
+  dead. ty's flow-sensitive use-def chain attributes a use of the
+  shared root name to the last rebind only, so `a.foo.x()` failed to
+  keep `import a.foo` alive. A chained access now also resolves against
+  the scope-wide reachable bindings and keeps every `import <root>.<…>`
+  whose submodule suffix matches the access chain.
 
 ## [0.13.0] - 2026-05-26
 

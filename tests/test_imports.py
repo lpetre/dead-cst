@@ -908,6 +908,58 @@ def test_full_graph_edges(build_decl_graph, assert_edges, files, expected_edges)
     assert_edges(graph, expected_edges)
 
 
+@pytest.mark.parametrize(
+    "files, expected_edges",
+    [
+        pytest.param(
+            # Sibling submodule imports that share a root binding:
+            # ``import a.foo`` and ``import a.bar`` both rebind the local
+            # name ``a``. ty's flow-sensitive use-def chain attributes a
+            # use of ``a`` to the last rebind only, but ``a.foo.x()``
+            # depends specifically on the ``import a.foo`` statement
+            # (importing ``a.bar`` does not make the ``a.foo`` submodule
+            # available). Both ``mod.a`` aliases must therefore keep an
+            # in-edge -- pinned positionally because they share the
+            # ``mod.a`` fqname and a fqname-keyed assert would dedup them.
+            {
+                "a/__init__.py": "",
+                "a/foo.py": "def x(): pass\n",
+                "a/bar.py": "def z(): pass\n",
+                "mod.py": "import a.foo\nimport a.bar\na.foo.x()\na.bar.z()\n",
+            },
+            {
+                "a.bar -> a",
+                "a.bar.z@1:0 -> a.bar",
+                "a.foo -> a",
+                "a.foo.x@1:0 -> a.foo",
+                "mod -> a.bar",
+                "mod -> a.bar.z@1:0",
+                "mod -> a.foo",
+                "mod -> a.foo.x@1:0",
+                "mod -> mod.a@1:7",
+                "mod -> mod.a@2:7",
+                "mod.a@1:7 -> a.foo",
+                "mod.a@1:7 -> mod",
+                "mod.a@2:7 -> a.bar",
+                "mod.a@2:7 -> mod",
+            },
+            id="sibling-submodule-imports-keep-both-aliases",
+        ),
+    ],
+)
+def test_full_graph_positional_edges(
+    build_decl_graph, assert_positional_edges, files, expected_edges
+):
+    """Like :func:`test_full_graph_edges` but asserts ``fqname@line:col``
+    edges. Used when a case mints multiple nodes that share an fqname
+    (e.g. two ``import a.X`` statements both bound to ``a``), where a
+    fqname-keyed assert would collapse the distinction the test exists
+    to pin.
+    """
+    graph = build_decl_graph(files)
+    assert_positional_edges(graph, expected_edges)
+
+
 def test_third_party_import_creates_synthetic_node(build_decl_graph):
     graph = build_decl_graph(
         {
