@@ -3,13 +3,14 @@
 These tests are gated on the *plugin-host* build. Run them with::
 
     DEAD_CST_PLUGIN_HOST=1 \\
-    PLUGIN_DYLIB="$(uv run dead-cst build-plugin main_block_plugin)" \\
+    PLUGIN_DYLIB="$(uv run dead-cst build-plugin)" \\
     uv run pytest tests/test_plugins/test_external_dylib_plugin.py
 
-``dead-cst build-plugin`` does the prefer-dynamic build (shared runtime) and
-installs the dynamic ``_native``. The default static wheel build can't load
-external plugins (the runtime is statically linked, not shared), so the load
-test skips there; the rejection test runs anywhere.
+``dead-cst build-plugin`` compiles the plugin (the bundled example by default)
+against the prebuilt runtime via ``rustc --extern`` and installs the dynamic
+``_native``. The default static wheel build can't load external plugins (the
+runtime is statically linked, not shared), so the load test skips there; the
+rejection test runs anywhere.
 """
 
 from __future__ import annotations

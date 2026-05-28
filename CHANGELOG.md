@@ -15,19 +15,23 @@ two versions.
   split into a `dead-cst-runtime` library (built as both `rlib` and
   `dylib`) and a thin `dead-cst-native` cdylib shim. The default wheel
   is unchanged — it statically links the `rlib`, so it stays
-  self-contained. The new `dead-cst build-plugin <crate>` command does
-  the opt-in *plugin-host* build (`-C prefer-dynamic`): it links the
-  runtime `dylib`, builds the plugin cdylib against it, installs the
-  matching dynamic `_native`, and prints the plugin's path.
-  `native.load_native_plugins(path)` loads such a plugin
-  through an ABI airlock: it reads a self-contained `repr(C)` manifest
-  and rejects any plugin whose baked ABI fingerprint (rustc commit +
-  runtime version + target) differs from the running runtime's, cleanly
-  and without crashing. Plugins implement
+  self-contained. The new `dead-cst build-plugin [PLUGIN.rs]` command
+  compiles a plugin against a *prebuilt* runtime `dylib` + its metadata
+  via `rustc --extern` (`-C prefer-dynamic`) — no Cargo project, no
+  runtime source, no ruff recompile — and installs the matching dynamic
+  `_native` so the host and plugin share one salsa/ty runtime. Runtime
+  artifacts come from `--runtime-dir`, a plugin-host bundle in the
+  installed package, or a source checkout (built on demand).
+  `native.load_native_plugins(path)` loads the result through an ABI
+  airlock: it reads a self-contained `repr(C)` manifest and rejects any
+  plugin whose baked ABI fingerprint (rustc commit + runtime version +
+  target) differs from the running runtime's, cleanly and without
+  crashing. Plugins implement
   `dead_cst_runtime::native_plugins::plugin_api::ExternalPlugin`; see
-  `examples/main_block_plugin/`. Note: this is a source/dev build today
-  — distributing a plugin-host wheel (bundling the runtime dylib +
-  libstd cross-platform) is not yet wired.
+  `examples/main_block_plugin/`. Note: the prebuilt-bundle distribution
+  (a `dead-cst[plugin-host]` wheel bundling the runtime dylib + dep
+  `.rmeta` + libstd, cross-platform) is not yet wired — today it builds
+  the runtime from a source checkout.
 - `Analysis.re_materialize(events)` — incrementally rebuild the
   project graph against the existing `native.ProjectContext`. The
   caller supplies the change events: typically
