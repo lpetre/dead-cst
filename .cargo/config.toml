@@ -6,6 +6,6 @@
 # NOTE: `-C prefer-dynamic` is intentionally NOT here. The default build
 # links the runtime rlib statically (self-contained wheel, unchanged
 # behavior). The opt-in plugin-host build passes prefer-dynamic via RUSTFLAGS
-# (see scripts/build-plugin-host.sh) so external plugins share one runtime.
+# (via `dead-cst build-plugin`) so external plugins share one runtime.
 [build]
 rustflags = ["-C", "link-args=-Wl,-undefined,dynamic_lookup"]
