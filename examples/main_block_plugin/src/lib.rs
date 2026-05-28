@@ -3,11 +3,12 @@
 //! the public `plugin_api`: keep every top-level `if __name__ == "__main__":`
 //! block (and its enclosing module) reachable.
 //!
-//! Build it with `scripts/build-plugin-host.sh`, then load it from Python:
+//! Build it with `dead-cst build-plugin main_block_plugin` (prints the
+//! plugin path), then load it from Python:
 //!
 //! ```python
 //! from dead_cst import _native as native
-//! plugins = native.load_native_plugins("target/debug/libmain_block_plugin.dylib")
+//! plugins = native.load_native_plugins("target/plugin-host/debug/libmain_block_plugin.dylib")
 //! Analysis(root, plugins=plugins).materialize_all()
 //! ```
 

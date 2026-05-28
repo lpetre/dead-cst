@@ -15,10 +15,11 @@ two versions.
   split into a `dead-cst-runtime` library (built as both `rlib` and
   `dylib`) and a thin `dead-cst-native` cdylib shim. The default wheel
   is unchanged — it statically links the `rlib`, so it stays
-  self-contained. A new opt-in *plugin-host* build (`-C prefer-dynamic`,
-  see `scripts/build-plugin-host.sh`) links the runtime `dylib`, which a
-  separately-compiled plugin cdylib can also link to share one salsa/ty
-  runtime. `native.load_native_plugins(path)` loads such a plugin
+  self-contained. The new `dead-cst build-plugin <crate>` command does
+  the opt-in *plugin-host* build (`-C prefer-dynamic`): it links the
+  runtime `dylib`, builds the plugin cdylib against it, installs the
+  matching dynamic `_native`, and prints the plugin's path.
+  `native.load_native_plugins(path)` loads such a plugin
   through an ABI airlock: it reads a self-contained `repr(C)` manifest
   and rejects any plugin whose baked ABI fingerprint (rustc commit +
   runtime version + target) differs from the running runtime's, cleanly
