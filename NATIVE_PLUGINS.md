@@ -26,7 +26,7 @@ compile in your own crate and load at runtime, without forking dead-cst.
 (There are also *in-tree* native plugins — e.g. `MainBlockPlugin`, exposed as
 `native.NativePlugin.main_block()` — compiled straight into the shipped
 extension. Those aren't covered here; they're an internal fast-path, not an
-extension mechanism.)
+extension mechanism. See [Per-file in-tree native plugins](#per-file-in-tree-native-plugins).)
 
 ---
 
@@ -192,6 +192,59 @@ builds the runtime, gathers the closure, rewrites install names / rpaths to
 `@rpath` / `@loader_path`, strips + ad-hoc re-signs the dylibs, and drops it
 into the `dead_cst_plugin_host` package. (CI wheels for it are still
 [in progress](#limitations).)
+
+---
+
+## Per-file in-tree native plugins
+
+Separate from the external/dylib path above, the runtime has an **in-tree
+per-file native plugin** mechanism. Instead of one `run(ctx)` against the whole
+project, a per-file plugin is invoked once per file with a restricted
+`FileContext` and its output is wrapped in a salsa-tracked query keyed on
+`(file, kind)`. When a file's tracked inputs (`parsed_module`, `file_to_nodes`,
+`line_index`) are unchanged across a `re_materialize`, the plugin's ops are
+served from the cache with **zero re-run**. Cache soundness comes from the
+restriction: a per-file plugin can reference only nodes in its own file, so its
+output is a pure function of that file's inputs. It emits `FileLocalOp`s in the
+file's own index space (positions into `FileNodes.refs`); the harness translates
+those to global indices at apply time.
+
+Two impls ship today, both exposed as `NativePlugin` factories:
+
+- **`NativePlugin.main_block()`** — the per-file equivalent of
+  `MainBlockPlugin`.
+- **`NativePlugin.dispatch_app(marker_prefix, module_to_names,
+  registration_decorators, seed_as_entrypoint)`** — the per-file slice of
+  `DispatchAppPlugin`. It covers exactly the work that is local to one file:
+
+  - **direct construction promotion** — a top-level `app = App(...)` (where
+    `App` resolves, by this file's imports, to one of `module_to_names`) becomes
+    an entrypoint when `seed_as_entrypoint` is set;
+  - **handler wiring** — a top-level function decorated `@app.<deco>(...)`
+    (`deco` in `registration_decorators`) gets an edge from the same-file `app`
+    binding.
+
+  What it deliberately does **not** do — because these are genuinely cross-file
+  and so can't be a pure function of one file — stays on the Python
+  `DispatchAppPlugin`:
+
+  - **subclass-closure expansion** of `app_classes`. Turning `flask.Flask` into
+    the set of constructor names that also covers project-defined
+    `class CustomFlask(Flask)` needs the project-wide class hierarchy. The
+    native plugin therefore takes an **already-resolved** `module_to_names` map;
+    the caller is responsible for expanding it.
+  - the **factory walk** (`app = create_app()` where `create_app` returns an app
+    instance) — promoting the `app` var needs the factory decl's cross-file
+    predecessors.
+
+  This split is the practical answer to "can a per-file native plugin handle the
+  `DispatchApp` structure?": the per-file core (construct + wire) can; the
+  cross-file discovery (subclasses + factories) cannot, and is left where it
+  belongs.
+
+These in-tree impls are an internal fast-path, not an extension mechanism — the
+`FileContext` / `FileLocalOp` / `PerFilePluginKind` types are crate-private with
+no stability commitment.
 
 ---
 

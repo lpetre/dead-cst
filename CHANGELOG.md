@@ -11,6 +11,27 @@ two versions.
 
 ### Added
 
+- **Per-file native dispatch-app plugin (experimental).**
+  `native.NativePlugin.dispatch_app(marker_prefix, module_to_names,
+  registration_decorators, seed_as_entrypoint)` is the native
+  counterpart of `dead_cst.plugins.DispatchAppPlugin` for the portion of
+  the wiring that is genuinely per-file: promoting a direct
+  `app = App(...)` construction to an entrypoint and wiring same-file
+  `@app.deco(...)` handlers to their `app` binding. It runs through the
+  salsa-cached per-file query path (like the native `MainBlockPlugin`),
+  so an unchanged file's dispatch wiring is reused across
+  `re_materialize` with zero re-run. This lands three pieces of the
+  per-file native plugin surface: a **spec-config channel** (per-file
+  plugin kinds can now carry an immutable config handle as a sound salsa
+  key), **per-file query accessors** on the restricted `FileContext`
+  (`package()`, `local_idx_for_name(...)`), and **richer file-local ops**
+  (`FileLocalOp` is now an enum supporting edges and `edges_from`, not
+  just add-node-with-edges-to). The cross-file parts of dispatch —
+  subclass-closure expansion of `app_classes` and the
+  `app = create_app()` factory walk — stay on the Python plugin, so the
+  native plugin takes an *already-resolved* `module_to_names` map. See
+  `NATIVE_PLUGINS.md`.
+
 - **External native plugins (experimental).** The native crate is now
   split into a `dead-cst-runtime` library (built as both `rlib` and
   `dylib`) and a thin `dead-cst-native` cdylib shim. The default wheel

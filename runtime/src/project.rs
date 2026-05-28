@@ -1878,20 +1878,51 @@ impl ProjectContext {
                 continue;
             }
             let path = file_path_string(&self.db, file);
-            for op in file_ops {
-                let edges_to_idx: Vec<usize> = op
-                    .edges_to_local_idx
+            // Translate a file-local idx to its global node idx via the
+            // build's ``local_to_global`` table. A local idx with no
+            // global entry (shouldn't happen for a well-formed plugin)
+            // is dropped.
+            let to_global = |locals: &[u32]| -> Vec<usize> {
+                locals
                     .iter()
                     .filter_map(|&local| outputs.local_to_global.get(&(file, local)).copied())
-                    .collect();
-                sink.push(PreparedOp::NodeByIdx {
-                    fqname: op.fqname.clone(),
-                    kind: op.kind,
-                    path: path.clone(),
-                    flags: op.flags,
-                    edges_from_idx: Vec::new(),
-                    edges_to_idx,
-                });
+                    .collect()
+            };
+            for op in file_ops {
+                match op {
+                    crate::native_plugins::FileLocalOp::Node {
+                        fqname,
+                        kind,
+                        flags,
+                        edges_to_local_idx,
+                        edges_from_local_idx,
+                    } => {
+                        sink.push(PreparedOp::NodeByIdx {
+                            fqname: fqname.clone(),
+                            kind,
+                            path: path.clone(),
+                            flags: *flags,
+                            edges_from_idx: to_global(edges_from_local_idx),
+                            edges_to_idx: to_global(edges_to_local_idx),
+                        });
+                    }
+                    crate::native_plugins::FileLocalOp::Edge {
+                        src_local_idx,
+                        dst_local_idx,
+                    } => {
+                        let (Some(&src_idx), Some(&dst_idx)) = (
+                            outputs.local_to_global.get(&(file, *src_local_idx)),
+                            outputs.local_to_global.get(&(file, *dst_local_idx)),
+                        ) else {
+                            continue;
+                        };
+                        sink.push(PreparedOp::EdgeByIdx {
+                            src_idx,
+                            dst_idx,
+                            flags: 0,
+                        });
+                    }
+                }
             }
         }
         Ok(())

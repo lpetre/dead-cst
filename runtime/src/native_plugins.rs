@@ -109,19 +109,35 @@ pub(crate) trait NativePluginImpl: Send + Sync {
 // those to global indices at apply time via the ``ref_to_global`` map.
 // ---------------------------------------------------------------------------
 
-/// File-local op produced by a [`PerFileNativePluginImpl`]. Mirrors
-/// ``AddNodeByIdx`` but with ``edges_to_local_idx`` as positions into
-/// the *file's own* ``FileNodes.refs`` array rather than global graph
-/// indices. Salsa-cached as the per-file plugin's output, so it must
-/// be pure rust + ``salsa::Update`` (no ``File`` handle, no global
-/// idx — both would couple the cache to project-wide assemble order).
+/// File-local op produced by a [`PerFileNativePluginImpl`]. Indices
+/// are positions into the *file's own* ``FileNodes.refs`` array rather
+/// than global graph indices; the harness translates them to global
+/// indices at apply time via the build's ``local_to_global`` map (a
+/// local idx with no global entry is skipped). Salsa-cached as the
+/// per-file plugin's output, so every field is pure rust +
+/// ``salsa::Update`` (no ``File`` handle, no global idx — both would
+/// couple the cache to project-wide assemble order).
 #[derive(Debug, Clone, Eq, PartialEq, salsa::Update, get_size2::GetSize)]
-pub(crate) struct FileLocalOpData {
-    pub(crate) fqname: String,
-    pub(crate) kind: &'static str,
-    pub(crate) flags: u32,
-    /// Indices into the owning file's ``FileNodes.refs`` array.
-    pub(crate) edges_to_local_idx: Vec<u32>,
+pub(crate) enum FileLocalOp {
+    /// Add a synthetic node with edges to / from file-local nodes.
+    /// Mirrors ``PreparedOp::NodeByIdx`` in file-local index space.
+    Node {
+        fqname: String,
+        kind: &'static str,
+        flags: u32,
+        /// Positions into the file's ``FileNodes.refs`` the new node
+        /// points *at* (``node -> target``).
+        edges_to_local_idx: Vec<u32>,
+        /// Positions into the file's ``FileNodes.refs`` that point *at*
+        /// the new node (``source -> node``).
+        edges_from_local_idx: Vec<u32>,
+    },
+    /// Add an edge between two file-local nodes (``src -> dst``).
+    /// Mirrors ``PreparedOp::EdgeByIdx``.
+    Edge {
+        src_local_idx: u32,
+        dst_local_idx: u32,
+    },
 }
 
 /// Read-only, single-file view handed to a [`PerFileNativePluginImpl`].
@@ -173,6 +189,29 @@ impl<'db> FileContext<'db> {
     pub(crate) fn parsed(&self) -> ruff_db::parsed::ParsedModuleRef {
         parsed_module(self.db, self.file).load(self.db)
     }
+
+    /// The file's enclosing package name (``None`` for a top-level
+    /// module). Needed to resolve relative imports (``from .pkg import
+    /// App``) the same way the project-wide queries do.
+    pub(crate) fn package(&self) -> Option<String> {
+        crate::ingest::file_package_name(self.db, self.file)
+    }
+
+    /// File-local index of the live binding named ``name`` (the last
+    /// reaching one when a name is rebound), or ``None`` if the file
+    /// has no module-level binding of that name. This is the per-file
+    /// analog of the project-wide ``vars_by_file`` lookup: it maps the
+    /// textual owner of a ``@owner.deco`` decorator or the target of a
+    /// ``owner = App(...)`` assignment onto its node in *this* file
+    /// without any cross-file resolution. Backed by ty's
+    /// end-of-scope bindings (``FileNodes.exports_by_name``), so it
+    /// stays a pure function of the file.
+    pub(crate) fn local_idx_for_name(&self, name: &str) -> Option<u32> {
+        file_to_nodes(self.db, self.file)
+            .exports_by_name
+            .get(name)
+            .and_then(|locals| locals.last().copied())
+    }
 }
 
 /// Rust-side per-file plugin contract. Called once per project file
@@ -184,18 +223,27 @@ pub(crate) trait PerFileNativePluginImpl: Send + Sync {
     /// Walk ``file_ctx`` and append this file's ops to ``sink``.
     /// Naming + salsa keying live on [`PerFilePluginKind`], so the
     /// trait itself only carries the work method.
-    fn run_on_file(&self, file_ctx: &FileContext<'_>, sink: &mut Vec<FileLocalOpData>);
+    fn run_on_file(&self, file_ctx: &FileContext<'_>, sink: &mut Vec<FileLocalOp>);
 }
 
 /// Salsa cache-key discriminant for a per-file plugin. A cheap
 /// ``Copy`` enum rather than a ``&'static str`` because salsa tracked
 /// function arguments must be owned + ``'static`` (a borrowed key
-/// would force ``'db: 'static``). One variant per configless per-file
-/// impl; configured per-file plugins would carry a config-hash here
-/// (out of scope).
+/// would force ``'db: 'static``).
+///
+/// A *configured* per-file plugin can't store its config inline (the
+/// config — string lists, maps — is neither ``Copy`` nor cheap to hash
+/// per file). Instead it carries a ``u32`` handle into the
+/// process-global [`DISPATCH_CONFIGS`] registry: the config is
+/// registered once when the Python plugin is constructed and is
+/// thereafter immutable, so the handle is a sound, stable salsa key
+/// (handle ``N`` always denotes the same config).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum PerFilePluginKind {
     MainBlock,
+    /// Per-file dispatch-app plugin, parameterised by the config at
+    /// [`DISPATCH_CONFIGS`]``[id]``.
+    DispatchApp(u32),
 }
 
 impl PerFilePluginKind {
@@ -203,13 +251,17 @@ impl PerFilePluginKind {
     fn name(self) -> &'static str {
         match self {
             PerFilePluginKind::MainBlock => "MainBlockPlugin",
+            PerFilePluginKind::DispatchApp(_) => "DispatchAppPlugin",
         }
     }
 
     /// Run the concrete impl for this kind against ``file_ctx``.
-    fn run_on_file(self, file_ctx: &FileContext<'_>, sink: &mut Vec<FileLocalOpData>) {
+    fn run_on_file(self, file_ctx: &FileContext<'_>, sink: &mut Vec<FileLocalOp>) {
         match self {
             PerFilePluginKind::MainBlock => MainBlockPluginImpl.run_on_file(file_ctx, sink),
+            PerFilePluginKind::DispatchApp(id) => {
+                DispatchAppPluginImpl::new(id).run_on_file(file_ctx, sink)
+            }
         }
     }
 }
@@ -224,7 +276,7 @@ pub(crate) fn per_file_plugin_ops(
     db: &dyn ProjectDb,
     file: File,
     kind: PerFilePluginKind,
-) -> Vec<FileLocalOpData> {
+) -> Vec<FileLocalOp> {
     let file_ctx = FileContext::new(db, file);
     let mut sink = Vec::new();
     kind.run_on_file(&file_ctx, &mut sink);
@@ -297,6 +349,40 @@ impl NativePlugin {
             kind: NativePluginKind::PerFile(PerFilePluginKind::MainBlock),
         }
     }
+
+    /// Construct a *per-file* native dispatch-app plugin — the native
+    /// counterpart of ``dead_cst.plugins.DispatchAppPlugin`` for the
+    /// portion of the work that is genuinely per-file (direct
+    /// construction promotion + same-file ``@app.deco`` handler
+    /// wiring). Invoked once per file through a salsa-cached query, so
+    /// an unchanged file's dispatch wiring is reused across
+    /// ``re_materialize`` with zero re-run.
+    ///
+    /// ``module_to_names`` maps each framework module to the
+    /// constructor bare-names treated as app classes — **already
+    /// expanded over the subclass closure by the caller**, since that
+    /// expansion needs the project-wide class hierarchy and so can't be
+    /// per-file. The cross-file factory walk
+    /// (``app = create_app()``) is likewise out of scope here; both
+    /// remain on the Python plugin. See ``NATIVE_PLUGINS.md``.
+    #[staticmethod]
+    #[pyo3(signature = (marker_prefix, module_to_names, registration_decorators, seed_as_entrypoint))]
+    fn dispatch_app(
+        marker_prefix: String,
+        module_to_names: std::collections::HashMap<String, Vec<String>>,
+        registration_decorators: Vec<String>,
+        seed_as_entrypoint: bool,
+    ) -> Self {
+        let id = register_dispatch_config(DispatchConfigData {
+            marker_prefix,
+            module_to_names: module_to_names.into_iter().collect(),
+            registration_decorators,
+            seed_as_entrypoint,
+        });
+        Self {
+            kind: NativePluginKind::PerFile(PerFilePluginKind::DispatchApp(id)),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -334,7 +420,7 @@ pub(crate) fn _reset_main_block_run_count() {
 pub(crate) struct MainBlockPluginImpl;
 
 impl PerFileNativePluginImpl for MainBlockPluginImpl {
-    fn run_on_file(&self, file_ctx: &FileContext<'_>, sink: &mut Vec<FileLocalOpData>) {
+    fn run_on_file(&self, file_ctx: &FileContext<'_>, sink: &mut Vec<FileLocalOp>) {
         MAIN_BLOCK_RUN_COUNT.fetch_add(1, Ordering::Relaxed);
         let parsed = file_ctx.parsed();
         let Some(block_range) = find_main_block_range(&parsed) else {
@@ -352,12 +438,276 @@ impl PerFileNativePluginImpl for MainBlockPluginImpl {
             }
         }
         let synthetic_kind = intern_kind("synthetic").expect("'synthetic' is a valid kind");
-        sink.push(FileLocalOpData {
+        sink.push(FileLocalOp::Node {
             fqname: format!("{MAIN_BLOCK_PREFIX}{}", file_ctx.module_fqname()),
             kind: synthetic_kind,
             flags: NodeFlags::ENTRYPOINT,
             edges_to_local_idx,
+            edges_from_local_idx: Vec::new(),
         });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DispatchAppPlugin — per-file native counterpart of
+// ``dead_cst.plugins.decl_shapes.DispatchAppPlugin``.
+//
+// Operates on a *resolved* ``DispatchAppSpec``: the cross-file work
+// (expanding ``app_classes`` over the subclass closure into a
+// ``{module: {ctor_name, ...}}`` map) is the caller's job, because it
+// needs the project-wide class hierarchy and so can't be a pure
+// function of one file. What *is* per-file — and therefore lives here,
+// salsa-cached — is everything downstream of that map:
+//
+//   * direct construction promotion  — ``app = App(...)`` → entrypoint
+//     (when ``seed_as_entrypoint``);
+//   * handler wiring                  — ``@app.deco(...)`` → the
+//     same-file ``app`` binding.
+//
+// Deliberately *not* handled (genuinely cross-file, stays on the
+// Python plugin): subclass-closure expansion of ``app_classes`` and
+// the factory walk (``app = create_app()`` where ``create_app``
+// returns an app instance — promoting it needs the factory decl's
+// cross-file predecessors). See ``NATIVE_PLUGINS.md``.
+// ---------------------------------------------------------------------------
+
+/// Resolved, immutable configuration for one per-file dispatch plugin.
+/// The string-heavy fields are why this lives in a side registry
+/// instead of inline in [`PerFilePluginKind`]: a per-file salsa key
+/// must be cheap-`Copy`, so the key carries only a [`u32`] handle into
+/// [`DISPATCH_CONFIGS`] and the impl resolves the config from there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DispatchConfigData {
+    /// Short label for the synthetic ``<{marker}-app>:`` fqnames.
+    pub(crate) marker_prefix: String,
+    /// ``module -> [ctor bare-name, ...]`` — already expanded over the
+    /// subclass closure by the caller.
+    pub(crate) module_to_names: Vec<(String, Vec<String>)>,
+    /// Per-instance registration decorator attribute names
+    /// (``route`` / ``get`` / ``task`` / ...).
+    pub(crate) registration_decorators: Vec<String>,
+    /// Promote each direct construction to an entrypoint (factory-aware
+    /// frameworks); when false, only wire handlers (pure dispatch).
+    pub(crate) seed_as_entrypoint: bool,
+}
+
+/// Process-global registry of resolved dispatch configs. Append-only:
+/// a handle is minted once per ``NativePlugin.dispatch_app(...)`` call
+/// and never reused or mutated, so using it as a salsa cache key is
+/// sound (handle ``N`` always denotes the same config for the life of
+/// the process). The salsa db is per-``ProjectContext``, so handles
+/// only need to be stable, not unique across analyses.
+static DISPATCH_CONFIGS: std::sync::OnceLock<std::sync::RwLock<Vec<Arc<DispatchConfigData>>>> =
+    std::sync::OnceLock::new();
+
+/// Register a resolved config and return its stable handle.
+fn register_dispatch_config(cfg: DispatchConfigData) -> u32 {
+    let reg = DISPATCH_CONFIGS.get_or_init(|| std::sync::RwLock::new(Vec::new()));
+    let mut guard = reg.write().expect("DISPATCH_CONFIGS poisoned");
+    let id = guard.len() as u32;
+    guard.push(Arc::new(cfg));
+    id
+}
+
+/// Resolve a config handle minted by [`register_dispatch_config`].
+fn dispatch_config(id: u32) -> Arc<DispatchConfigData> {
+    DISPATCH_CONFIGS
+        .get()
+        .expect("DISPATCH_CONFIGS uninitialised")
+        .read()
+        .expect("DISPATCH_CONFIGS poisoned")[id as usize]
+        .clone()
+}
+
+/// Test-only counter — number of times [`DispatchAppPluginImpl::run_on_file`]
+/// actually executed (salsa cache *misses*). Lets the cache-behaviour
+/// test assert an unchanged file isn't re-walked across a
+/// ``re_materialize``.
+static DISPATCH_RUN_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Test helper — total `DispatchAppPluginImpl::run_on_file` executions.
+#[pyfunction]
+pub(crate) fn _dispatch_app_run_count() -> usize {
+    DISPATCH_RUN_COUNT.load(Ordering::Relaxed)
+}
+
+/// Test helper — zero the [`DISPATCH_RUN_COUNT`] counter.
+#[pyfunction]
+pub(crate) fn _reset_dispatch_app_run_count() {
+    DISPATCH_RUN_COUNT.store(0, Ordering::Relaxed);
+}
+
+pub(crate) struct DispatchAppPluginImpl {
+    config: Arc<DispatchConfigData>,
+}
+
+impl DispatchAppPluginImpl {
+    fn new(id: u32) -> Self {
+        Self {
+            config: dispatch_config(id),
+        }
+    }
+}
+
+impl PerFileNativePluginImpl for DispatchAppPluginImpl {
+    fn run_on_file(&self, file_ctx: &FileContext<'_>, sink: &mut Vec<FileLocalOp>) {
+        DISPATCH_RUN_COUNT.fetch_add(1, Ordering::Relaxed);
+        let cfg = &*self.config;
+        let parsed = file_ctx.parsed();
+        let package = file_ctx.package();
+
+        // Flatten the resolved map into the (modules, allowed-names)
+        // shape the shared per-file matchers expect.
+        let modules: Vec<String> = cfg.module_to_names.iter().map(|(m, _)| m.clone()).collect();
+        let allowed: rustc_hash::FxHashSet<&str> = cfg
+            .module_to_names
+            .iter()
+            .flat_map(|(_, names)| names.iter().map(String::as_str))
+            .collect();
+        let reg_attrs: rustc_hash::FxHashSet<&str> = cfg
+            .registration_decorators
+            .iter()
+            .map(String::as_str)
+            .collect();
+
+        // --- Pass 1: direct constructions ``owner = Ctor(...)``. -------
+        // Resolve the framework imports in *this* file, then match each
+        // top-level ``owner = Ctor(...)`` whose callee binds to one of
+        // the allowed ctor names. ``direct_owners`` maps the owner's
+        // simple name to its file-local idx (the same name a
+        // ``@owner.deco`` decorator references).
+        let mut direct_owners: rustc_hash::FxHashMap<String, u32> =
+            rustc_hash::FxHashMap::default();
+        let imports = crate::helpers::collect_modules_imports_local(
+            &parsed,
+            &modules,
+            &allowed,
+            package.as_deref(),
+        );
+        if !imports.is_empty() {
+            for stmt in &parsed.syntax().body {
+                let Some((owner_name, value)) = top_level_assign_target_name(stmt) else {
+                    continue;
+                };
+                let ruff_python_ast::Expr::Call(call) = value else {
+                    continue;
+                };
+                if crate::helpers::matched_call_target_any(call, &imports, &modules, &allowed)
+                    .is_none()
+                {
+                    continue;
+                }
+                let Some(owner_idx) = file_ctx.local_idx_for_name(owner_name) else {
+                    continue;
+                };
+                direct_owners.insert(owner_name.to_string(), owner_idx);
+                if cfg.seed_as_entrypoint {
+                    let synthetic_kind =
+                        intern_kind("synthetic").expect("'synthetic' is a valid kind");
+                    sink.push(FileLocalOp::Node {
+                        fqname: format!(
+                            "<{}-app>:{}.{}",
+                            cfg.marker_prefix,
+                            file_ctx.module_fqname(),
+                            owner_name
+                        ),
+                        kind: synthetic_kind,
+                        flags: NodeFlags::ENTRYPOINT,
+                        edges_to_local_idx: vec![owner_idx],
+                        edges_from_local_idx: Vec::new(),
+                    });
+                }
+            }
+        }
+
+        // --- Pass 2: handler wiring ``@owner.deco(...)``. --------------
+        // For each top-level function decorated with ``@owner.<attr>``
+        // (attr a registration decorator), wire the owner binding ->
+        // the handler so reachability flows app -> handler.
+        //
+        //   * seed_as_entrypoint=True  (factory-aware): wire to any
+        //     same-file binding named ``owner`` (mirrors the Python
+        //     plugin's ``vars_by_file`` path, so ``app = create_app()``
+        //     handlers still wire even though the construction itself
+        //     isn't matched here).
+        //   * seed_as_entrypoint=False (pure dispatch): wire only to an
+        //     owner that came from a *direct construction* above, so a
+        //     star-imported ``app = App()`` the matcher can't see stays
+        //     invisible — same conservative rule as the Python plugin.
+        if reg_attrs.is_empty() {
+            return;
+        }
+        for stmt in &parsed.syntax().body {
+            let ruff_python_ast::Stmt::FunctionDef(func) = stmt else {
+                continue;
+            };
+            let mut seen_owners: rustc_hash::FxHashSet<&str> = rustc_hash::FxHashSet::default();
+            for dec in &func.decorator_list {
+                let root = match &dec.expression {
+                    ruff_python_ast::Expr::Call(call) => &*call.func,
+                    other => other,
+                };
+                let root = crate::helpers::unwrap_subscripted_callee(root);
+                let ruff_python_ast::Expr::Attribute(attr) = root else {
+                    continue;
+                };
+                if !reg_attrs.contains(attr.attr.as_str()) {
+                    continue;
+                }
+                let ruff_python_ast::Expr::Name(owner) = attr.value.as_ref() else {
+                    continue;
+                };
+                let owner_name = owner.id.as_str();
+                if !seen_owners.insert(owner_name) {
+                    continue;
+                }
+                let owner_idx = if cfg.seed_as_entrypoint {
+                    file_ctx.local_idx_for_name(owner_name)
+                } else {
+                    direct_owners.get(owner_name).copied()
+                };
+                let Some(owner_idx) = owner_idx else {
+                    continue;
+                };
+                let Some(handler_idx) = file_ctx.local_idx_for_name(func.name.as_str()) else {
+                    continue;
+                };
+                sink.push(FileLocalOp::Edge {
+                    src_local_idx: owner_idx,
+                    dst_local_idx: handler_idx,
+                });
+            }
+        }
+    }
+}
+
+/// Top-level ``owner = <value>`` / ``owner: T = <value>`` with a single
+/// bare-`Name` target — returns ``(owner_name, value_expr)``. Mirrors
+/// the acceptance rules of ``helpers::top_level_assign_to_name`` (which
+/// returns the target's range) but yields the name string directly, so
+/// the dispatch matcher can look it up in
+/// [`FileContext::local_idx_for_name`] without a range→text slice.
+fn top_level_assign_target_name(
+    stmt: &ruff_python_ast::Stmt,
+) -> Option<(&str, &ruff_python_ast::Expr)> {
+    match stmt {
+        ruff_python_ast::Stmt::Assign(assign) => {
+            let [target] = assign.targets.as_slice() else {
+                return None;
+            };
+            let ruff_python_ast::Expr::Name(name) = target else {
+                return None;
+            };
+            Some((name.id.as_str(), assign.value.as_ref()))
+        }
+        ruff_python_ast::Stmt::AnnAssign(ann) => {
+            let value = ann.value.as_deref()?;
+            let ruff_python_ast::Expr::Name(name) = ann.target.as_ref() else {
+                return None;
+            };
+            Some((name.id.as_str(), value))
+        }
+        _ => None,
     }
 }
 

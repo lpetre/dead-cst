@@ -46,7 +46,8 @@ use crate::graph::{EdgeFlags, Import, NativeGraph, NodeFlags, SymbolNode};
 use crate::helpers::{ArgLiteral, ArgNodeRef, ArgOpaque, NodeAttrs};
 use crate::io::{read_graph, write_graph, GraphMetadata};
 use crate::native_plugins::{
-    _main_block_run_count, _reset_main_block_run_count, load_native_plugins, NativePlugin,
+    _dispatch_app_run_count, _main_block_run_count, _reset_dispatch_app_run_count,
+    _reset_main_block_run_count, load_native_plugins, NativePlugin,
 };
 use crate::progress::ProgressHandle;
 use crate::project::{ChangeEvent, Project, ProjectContext};
@@ -115,6 +116,8 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(read_graph, m)?)?;
     m.add_function(wrap_pyfunction!(_main_block_run_count, m)?)?;
     m.add_function(wrap_pyfunction!(_reset_main_block_run_count, m)?)?;
+    m.add_function(wrap_pyfunction!(_dispatch_app_run_count, m)?)?;
+    m.add_function(wrap_pyfunction!(_reset_dispatch_app_run_count, m)?)?;
     m.add_function(wrap_pyfunction!(load_native_plugins, m)?)?;
     Ok(())
 }

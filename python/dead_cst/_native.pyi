@@ -369,6 +369,40 @@ class NativePlugin:
         """
         ...
 
+    @staticmethod
+    def dispatch_app(
+        marker_prefix: str,
+        module_to_names: dict[str, list[str]],
+        registration_decorators: list[str],
+        seed_as_entrypoint: bool,
+    ) -> NativePlugin:
+        """Per-file native counterpart of
+        :class:`dead_cst.plugins.DispatchAppPlugin`, covering the
+        portion of dispatch wiring that is genuinely per-file:
+
+        * **direct construction promotion** — a top-level
+          ``app = App(...)`` (where ``App`` resolves to one of
+          ``module_to_names``) becomes an entrypoint, when
+          ``seed_as_entrypoint`` is set;
+        * **handler wiring** — a top-level function decorated with
+          ``@app.<deco>(...)`` (``deco`` in ``registration_decorators``)
+          gets an edge from the same-file ``app`` binding.
+
+        ``module_to_names`` maps each framework module to the
+        constructor bare-names treated as app classes. It must be
+        **already expanded over the subclass closure** by the caller:
+        that expansion needs the project-wide class hierarchy and so
+        cannot be a per-file (salsa-cacheable) computation. The
+        cross-file factory walk (``app = create_app()``) is likewise
+        out of scope and stays on the Python plugin. See
+        ``NATIVE_PLUGINS.md``.
+
+        Invoked once per file through a salsa-cached query, so an
+        unchanged file's dispatch wiring is reused across
+        ``re_materialize`` with zero re-run.
+        """
+        ...
+
 class NativeGraph:
     """The project-wide graph snapshot returned by ``Project.build()``
     and ``ProjectContext.materialize()``.
@@ -2096,4 +2130,16 @@ def _main_block_run_count() -> int:
 
 def _reset_main_block_run_count() -> None:
     """Test helper. Zero the :func:`_main_block_run_count` counter."""
+    ...
+
+def _dispatch_app_run_count() -> int:
+    """Test helper. Total executions of the per-file ``DispatchAppPlugin``
+    impl since the last reset — a salsa cache *miss* counter. Lets the
+    test suite assert an unchanged file isn't re-walked on
+    ``re_materialize``. Not part of the supported surface.
+    """
+    ...
+
+def _reset_dispatch_app_run_count() -> None:
+    """Test helper. Zero the :func:`_dispatch_app_run_count` counter."""
     ...
