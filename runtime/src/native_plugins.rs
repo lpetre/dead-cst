@@ -297,6 +297,38 @@ impl NativePlugin {
             kind: NativePluginKind::PerFile(PerFilePluginKind::MainBlock),
         }
     }
+
+    /// Native `ModuleDundersPlugin` — pin module-level dunder names and
+    /// `__future__` imports as entrypoints.
+    #[staticmethod]
+    fn module_dunders() -> Self {
+        Self {
+            kind: NativePluginKind::ProjectWide(Box::new(ModuleDundersPluginImpl)),
+        }
+    }
+
+    /// Native `InitSubclassPlugin` — keep transitive subclasses of
+    /// `__init_subclass__`-defining classes alive via a marker node.
+    #[staticmethod]
+    fn init_subclass() -> Self {
+        Self {
+            kind: NativePluginKind::ProjectWide(Box::new(InitSubclassPluginImpl)),
+        }
+    }
+}
+
+/// Resolve a built-in plugin name to its native implementation, or `None`
+/// if no native plugin owns that name (yet). The CLI's `_load_plugin`
+/// consults this before the Python builtin map — as plugins are ported to
+/// Rust they move from that map into this registry.
+#[pyfunction]
+pub(crate) fn _builtin_native_plugin(name: &str) -> Option<NativePlugin> {
+    Some(match name {
+        "main_block" => NativePlugin::main_block(),
+        "module_dunders" => NativePlugin::module_dunders(),
+        "init_subclass" => NativePlugin::init_subclass(),
+        _ => return None,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -533,5 +565,70 @@ pub(crate) fn load_native_plugins(path: String) -> PyResult<Vec<NativePlugin>> {
             });
         }
         Ok(out)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Project-wide native plugins ported from Python. Each runs once against the
+// whole frozen graph and pushes ops into the shared sink — same contract as
+// the former `dead_cst.plugins.*` equivalents. The `py`-taking ctx accessors
+// are reached via `Python::with_gil` (the harness already holds the GIL).
+// ---------------------------------------------------------------------------
+
+const INIT_SUBCLASS_PREFIX: &str = "<__init_subclass__>:";
+
+/// Port of `dead_cst.plugins.module_dunders.ModuleDundersPlugin`: pin every
+/// module-level dunder (variables + PEP 562 functions) and `__future__`
+/// import as an entrypoint.
+pub(crate) struct ModuleDundersPluginImpl;
+
+impl NativePluginImpl for ModuleDundersPluginImpl {
+    fn name(&self) -> &'static str {
+        "ModuleDundersPlugin"
+    }
+
+    fn run(&self, ctx: &ProjectContext, sink: &mut Vec<PreparedOp>) -> PyResult<()> {
+        Python::with_gil(|py| -> PyResult<()> {
+            let mut targets = ctx.find_module_dunders_indices(py)?;
+            targets.extend(ctx.find_imports_of_indices("__future__")?);
+            for decl_idx in targets {
+                sink.push(PreparedOp::EntrypointByIdx {
+                    decl_idx,
+                    marker: "<dunder>".to_string(),
+                });
+            }
+            Ok(())
+        })
+    }
+}
+
+/// Port of `dead_cst.plugins.init_subclass.InitSubclassPlugin`: for each
+/// class defining `__init_subclass__`, emit a marker node reachable from the
+/// parent that keeps every transitive subclass alive.
+pub(crate) struct InitSubclassPluginImpl;
+
+impl NativePluginImpl for InitSubclassPluginImpl {
+    fn name(&self) -> &'static str {
+        "InitSubclassPlugin"
+    }
+
+    fn run(&self, ctx: &ProjectContext, sink: &mut Vec<PreparedOp>) -> PyResult<()> {
+        Python::with_gil(|py| -> PyResult<()> {
+            let parents = ctx.find_classes_defining_method_indices(py, "__init_subclass__")?;
+            let attrs = ctx.node_attrs(parents.clone())?;
+            let synthetic = intern_kind("synthetic").expect("'synthetic' is a valid kind");
+            for (parent_idx, attr) in parents.iter().zip(attrs.iter()) {
+                let subclass_idxs = ctx.find_subclasses_of_idx(py, *parent_idx)?;
+                sink.push(PreparedOp::NodeByIdx {
+                    fqname: format!("{INIT_SUBCLASS_PREFIX}{}", attr.fqname),
+                    kind: synthetic,
+                    path: attr.path.clone(),
+                    flags: 0,
+                    edges_from_idx: vec![*parent_idx],
+                    edges_to_idx: subclass_idxs,
+                });
+            }
+            Ok(())
+        })
     }
 }
