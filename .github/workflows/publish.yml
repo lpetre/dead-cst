@@ -75,9 +75,55 @@ jobs:
           name: sdist
           path: dist/
 
+  # The `dead-cst[build-plugin]` payload: the prebuilt runtime + dependency
+  # closure, packaged as the separate `dead-cst-plugin-host` distribution.
+  # `dead-cst bundle-plugin-host` relocates the dylib closure with
+  # install_name_tool + ad-hoc codesign, so it is macOS/arm64-only today —
+  # hence a single `aarch64-apple-darwin` wheel. The artifact name matches the
+  # `wheel-*` pattern the publish jobs already download.
+  plugin-host:
+    name: Build plugin-host wheel (aarch64-apple-darwin)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          fetch-depth: 0
+      - name: Stamp dev version (Cargo + plugin-host, kept in lockstep)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: bash
+        run: |
+          python3 -m pip install --quiet setuptools-scm
+          # The plugin-host version must match `dead-cst` exactly (the load-time
+          # ABI fingerprint check depends on it). Cargo wants a SemVer
+          # pre-release (`-dev`); the plugin-host's setuptools build wants PEP 440
+          # (`.dev`) — maturin normalizes the wheel the same way.
+          pep440=$(python3 -c "from setuptools_scm import get_version; print(get_version(local_scheme='no-local-version'))")
+          cargo_ver=$(echo "$pep440" | sed 's/\.dev/-dev/')
+          sed -i.bak "s/^version = .*/version = \"$cargo_ver\"/" Cargo.toml
+          sed -i.bak "s/^version = .*/version = \"$pep440\"/" plugin-host/pyproject.toml
+          rm Cargo.toml.bak plugin-host/pyproject.toml.bak
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: 3.12
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+      - name: Build the relocatable plugin-host bundle
+        # Builds the runtime + closure and populates plugin-host/dead_cst_plugin_host/.
+        run: |
+          uv sync
+          uv run dead-cst bundle-plugin-host --release
+      - name: Build the plugin-host wheel
+        run: uv build --wheel --out-dir dist plugin-host
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-plugin-host
+          path: dist/
+
   publish-testpypi:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [wheels, sdist]
+    needs: [wheels, sdist, plugin-host]
     runs-on: ubuntu-latest
     environment: testpypi
     steps:
@@ -97,7 +143,7 @@ jobs:
 
   publish-pypi:
     if: github.event_name == 'release'
-    needs: [wheels, sdist]
+    needs: [wheels, sdist, plugin-host]
     runs-on: ubuntu-latest
     environment: pypi
     steps:

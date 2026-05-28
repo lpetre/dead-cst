@@ -39,9 +39,12 @@ two versions.
   `import dead_cst_plugin_host`. The bundle skips the redundant `.rmeta`
   (the `.rlib` embed metadata) and strips the dylibs: a `--release` bundle
   is ~350 MB on disk / ~130 MB compressed (the rlib dep closure
-  dominates), vs ~1.6 GB debug. Note: today this is macOS-only and the
-  separate package is built locally; producing the cross-platform
-  `dead-cst-plugin-host` wheels in CI is the remaining packaging work.
+  dominates), vs ~1.6 GB debug. The publish workflow now builds this
+  payload on a macOS arm64 runner and uploads the
+  `dead-cst-plugin-host` `aarch64-apple-darwin` wheel to PyPI in
+  lockstep with `dead-cst`, so `pip install dead-cst[build-plugin]`
+  resolves on macOS arm64 (the only platform `bundle-plugin-host`
+  supports today); Linux/Windows wheels remain future work.
 - `Analysis.re_materialize(events)` — incrementally rebuild the
   project graph against the existing `native.ProjectContext`. The
   caller supplies the change events: typically

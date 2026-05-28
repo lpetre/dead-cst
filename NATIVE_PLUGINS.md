@@ -190,8 +190,10 @@ wheel ships only the final linked, stripped extension.
 Maintainers produce that payload with **`dead-cst bundle-plugin-host`**, which
 builds the runtime, gathers the closure, rewrites install names / rpaths to
 `@rpath` / `@loader_path`, strips + ad-hoc re-signs the dylibs, and drops it
-into the `dead_cst_plugin_host` package. (CI wheels for it are still
-[in progress](#limitations).)
+into the `dead_cst_plugin_host` package. The publish workflow runs the same
+command on a macOS arm64 runner and uploads the resulting `aarch64-apple-darwin`
+wheel to PyPI alongside `dead-cst` (see [Limitations](#limitations) for the
+platform coverage caveat).
 
 ---
 
@@ -202,9 +204,11 @@ This is a preview. Known gaps:
 - **macOS (arm64) only.** Linux/Windows loader plumbing isn't wired yet.
 - **Single-`.rs` plugins.** `build-plugin` compiles one source file; multi-crate
   plugins with their own dependencies are a follow-up.
-- **No published `dead-cst-plugin-host` wheels yet.** Today the bundle is built
-  locally (`bundle-plugin-host`) or from a source checkout; the cross-platform
-  CI that publishes the `[build-plugin]` payload is still to come.
+- **`dead-cst-plugin-host` ships for macOS arm64 only.** The publish workflow
+  builds and uploads the `aarch64-apple-darwin` wheel (the only platform
+  `bundle-plugin-host` supports today); there is no Linux/Windows wheel yet, so
+  `pip install dead-cst[build-plugin]` only resolves on macOS arm64. Elsewhere,
+  build the bundle from a source checkout with `bundle-plugin-host`.
 - **Recompile per release**, by design (full Rust fidelity has no stable ABI).
   The airlock makes a mismatch a clean error, not a crash.
 - **Python plugins remain the supported extension path** for anything that
