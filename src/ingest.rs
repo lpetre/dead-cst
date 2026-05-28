@@ -196,16 +196,39 @@ fn process_dist_info(dist_info: &Path, sp_root: &Path) -> Option<Vec<(PathBuf, S
 /// covers, but their *test/iter/etc. expressions* belong to the module
 /// and (b) needs to walk them.
 pub(crate) fn stmt_creates_top_level_definition(stmt: &Stmt) -> bool {
-    matches!(
-        stmt,
+    match stmt {
         Stmt::FunctionDef(_)
-            | Stmt::ClassDef(_)
-            | Stmt::Assign(_)
-            | Stmt::AnnAssign(_)
-            | Stmt::TypeAlias(_)
-            | Stmt::Import(_)
-            | Stmt::ImportFrom(_)
-    )
+        | Stmt::ClassDef(_)
+        | Stmt::TypeAlias(_)
+        | Stmt::Import(_)
+        | Stmt::ImportFrom(_) => true,
+        // An assignment only creates a binding (and thus a ty
+        // Definition the per-decl pass owns) when at least one target
+        // stores into a name. Subscript / attribute targets
+        // (`x[k] = v`, `x.attr = v`) store *through* an existing object
+        // and bind nothing — ty mints no Definition for them, so they
+        // must fall to the module-level walk instead of being treated
+        // as already-handled here. Otherwise their loads (the
+        // subscripted object on the LHS plus every name on the RHS) are
+        // walked by neither pass and look dead.
+        Stmt::Assign(a) => a.targets.iter().any(target_binds_name),
+        Stmt::AnnAssign(a) => target_binds_name(&a.target),
+        _ => false,
+    }
+}
+
+/// True iff an assignment `target` expression stores into at least one
+/// name. `Name` targets bind directly; `Tuple` / `List` / `Starred`
+/// targets bind every name nested inside them. Subscript and attribute
+/// targets bind nothing.
+fn target_binds_name(target: &Expr) -> bool {
+    match target {
+        Expr::Name(_) => true,
+        Expr::Tuple(t) => t.elts.iter().any(target_binds_name),
+        Expr::List(l) => l.elts.iter().any(target_binds_name),
+        Expr::Starred(s) => target_binds_name(&s.value),
+        _ => false,
+    }
 }
 
 /// Pair a tuple-unpack target with the RHS element at the same

@@ -50,7 +50,7 @@ use ty_python_semantic::SemanticModel;
 
 use crate::file_payload::{
     file_to_nodes, import_payload_for_pure as import_payload_for, ExternalKey, FileNodes,
-    ImportPayload, NodeKind, NodeRef,
+    ImportPayload, NodeData, NodeKind, NodeRef,
 };
 
 /// Outcome of resolving a `Name` use to its reaching definition.
@@ -68,7 +68,10 @@ enum Resolution<'db> {
         bound_name: String,
     },
 }
-use crate::helpers::{detect_dead_ranges, EDGE_FLAG_DEAD_BRANCH, EDGE_FLAG_DYNAMIC_IMPORT};
+use crate::helpers::{
+    detect_dead_ranges, detect_type_checking_ranges, EDGE_FLAG_DEAD_BRANCH,
+    EDGE_FLAG_DYNAMIC_IMPORT,
+};
 use crate::ingest::{
     collapse_attribute_chain, detect_dynamic_call, file_package_name, from_module_string,
     module_name_resolves, paired_unpack_rhs, parse_dynamic_args, resolve_dynamic_target,
@@ -103,6 +106,7 @@ pub(crate) fn file_to_ref_edges<'db>(db: &'db dyn ProjectDb, file: File) -> File
 
     let parsed = parsed_module(db, file).load(db);
     let dead_ranges = detect_dead_ranges(&parsed);
+    let tc_ranges = detect_type_checking_ranges(&parsed);
     let index = semantic_index(db, file);
     let global = FileScopeId::global();
     let use_def_map = index.use_def_map(global);
@@ -132,6 +136,7 @@ pub(crate) fn file_to_ref_edges<'db>(db: &'db dyn ProjectDb, file: File) -> File
             self_nodes,
             model: &model,
             dead_ranges: &dead_ranges,
+            tc_ranges: &tc_ranges,
             edges: &mut edges,
             warnings: &mut warnings,
             nested_context: false,
@@ -160,6 +165,7 @@ pub(crate) fn file_to_ref_edges<'db>(db: &'db dyn ProjectDb, file: File) -> File
             self_nodes,
             model: &model,
             dead_ranges: &dead_ranges,
+            tc_ranges: &tc_ranges,
             edges: &mut edges,
             warnings: &mut warnings,
             nested_context: false,
@@ -192,6 +198,12 @@ struct RefWalker<'a, 'db> {
     /// inside any of these get `EDGE_FLAG_DEAD_BRANCH` stamped on
     /// every edge they emit.
     dead_ranges: &'a [TextRange],
+    /// Statement ranges inside `if TYPE_CHECKING:` blocks. A use whose
+    /// flow-resolved binding falls inside one of these has had its
+    /// runtime binding narrowed away by ty (which treats
+    /// `TYPE_CHECKING` as `True`); `find_local_bindings` recovers it
+    /// from the scope-wide reachable bindings.
+    tc_ranges: &'a [TextRange],
     edges: &'a mut FxHashSet<(NodeRef<'db>, NodeRef<'db>, u32)>,
     /// Per-file warnings buffer. Workers push pure-rust strings; the
     /// driver flushes them to Python logging from the main thread.
@@ -248,6 +260,12 @@ impl<'a, 'db> RefWalker<'a, 'db> {
         self.emit_edge(NodeRef::External(key));
     }
 
+    /// True when `range` falls inside a recorded type-checking block
+    /// (see [`detect_type_checking_ranges`]).
+    fn range_in_tc_block(&self, range: TextRange) -> bool {
+        self.tc_ranges.iter().any(|tc| tc.contains_range(range))
+    }
+
     /// Resolve a `Name` use to the reaching local Definition(s) via
     /// ty's flow-sensitive use-def chain. Returns `NodeRef::Def` for
     /// each reaching def whose graph node lives in this file.
@@ -259,7 +277,7 @@ impl<'a, 'db> RefWalker<'a, 'db> {
     ///   silently dropped.
     /// * No `in_string_annotation` plumbing — string annotations
     ///   aren't entered yet.
-    fn find_local_bindings(&self, name: &ExprName) -> Vec<Resolution<'db>> {
+    fn find_local_bindings(&self, name: &ExprName, extra_chain: &[&str]) -> Vec<Resolution<'db>> {
         let db = self.model.db();
         // For names from a string-annotation sub-AST, ty doesn't know
         // their scope (we parsed them ourselves rather than going
@@ -301,6 +319,11 @@ impl<'a, 'db> RefWalker<'a, 'db> {
                 use_def_map.end_of_scope_symbol_bindings(symbol_id)
             };
             let mut saw_binding = false;
+            // True when a flow-resolved binding lives inside an
+            // `if TYPE_CHECKING:` block. ty narrows `TYPE_CHECKING` to
+            // `True`, so in that case the *runtime* binding has been
+            // narrowed away — `find_local_bindings` recovers it below.
+            let mut resolved_in_tc = false;
             let mut results: Vec<Resolution<'db>> = Vec::new();
             for binding in bindings {
                 let Some(def) = binding.binding.definition() else {
@@ -310,6 +333,9 @@ impl<'a, 'db> RefWalker<'a, 'db> {
                     continue;
                 }
                 saw_binding = true;
+                if self.range_in_tc_block(def.full_range(db, self.parsed).range()) {
+                    resolved_in_tc = true;
+                }
                 let candidate = NodeRef::Def(def);
                 if self.self_nodes.ref_to_local.contains_key(&candidate) {
                     results.push(Resolution::Alias(candidate));
@@ -333,6 +359,59 @@ impl<'a, 'db> RefWalker<'a, 'db> {
                 }
             }
             if saw_binding {
+                // Supplement the flow-sensitive resolution with
+                // scope-wide reachable bindings in the two situations
+                // ty's last-write-wins / TYPE_CHECKING-narrowed view
+                // drops a binding the runtime still depends on:
+                //
+                // * Sibling submodule imports (`import a.foo` then
+                //   `import a.bar`) rebind the same root name, so
+                //   `a.foo.x()` resolves only to the last rebind even
+                //   though it needs the `import a.foo` statement
+                //   (importing `a.bar` doesn't import the `a.foo`
+                //   submodule). Keep any plain `import <root>.<seg…>`
+                //   whose submodule suffix is a prefix of the chain.
+                // * `if TYPE_CHECKING: …` narrows to `True`, so the
+                //   resolved binding is the type-checking-only one and
+                //   the branch that runs at runtime (`else:` or a later
+                //   rebind) is dropped. Keep every reachable binding
+                //   *outside* a `TYPE_CHECKING` block.
+                //
+                // Each criterion is gated (chain present / resolved in a
+                // TYPE_CHECKING block), so plain straight-line rebinds
+                // keep their last-write-wins resolution.
+                if !extra_chain.is_empty() || resolved_in_tc {
+                    let root = name.id.as_str();
+                    for binding in use_def_map.reachable_symbol_bindings(symbol_id) {
+                        let Some(def) = binding.binding.definition() else {
+                            continue;
+                        };
+                        if def.file(db) != self.file {
+                            continue;
+                        }
+                        let candidate = NodeRef::Def(def);
+                        let Some(&idx) = self.self_nodes.ref_to_local.get(&candidate) else {
+                            continue;
+                        };
+                        if results
+                            .iter()
+                            .any(|r| matches!(r, Resolution::Alias(d) if *d == candidate))
+                        {
+                            continue;
+                        }
+                        let recovers_runtime_binding = resolved_in_tc
+                            && !self.range_in_tc_block(def.full_range(db, self.parsed).range());
+                        let on_access_chain = !extra_chain.is_empty()
+                            && plain_import_matches_chain(
+                                &self.self_nodes.nodes[idx as usize],
+                                root,
+                                extra_chain,
+                            );
+                        if recovers_runtime_binding || on_access_chain {
+                            results.push(Resolution::Alias(candidate));
+                        }
+                    }
+                }
                 return results;
             }
             // Annotation-only declaration fallback (mirrors today's
@@ -364,7 +443,7 @@ impl<'a, 'db> RefWalker<'a, 'db> {
             return;
         }
         self.current_flags = self.flags_for_range(name.range());
-        for resolution in self.find_local_bindings(name) {
+        for resolution in self.find_local_bindings(name, extra_chain) {
             match resolution {
                 Resolution::Alias(dst) => {
                     self.emit_edge(dst);
@@ -900,6 +979,32 @@ impl<'ast, 'db> Visitor<'ast> for RefWalker<'_, 'db> {
         }
         walk_stmt(self, stmt);
     }
+}
+
+/// True when `node` is a plain `import <root>.<seg…>` (no `as` alias,
+/// no `from`, no `*`) whose submodule segments after the root are a
+/// prefix of `extra_chain` — i.e. the access chain reaches into that
+/// submodule, so the importing statement must stay alive.
+fn plain_import_matches_chain(node: &NodeData, root: &str, extra_chain: &[&str]) -> bool {
+    if !matches!(node.kind, NodeKind::Import) {
+        return false;
+    }
+    let Some(spec) = node.imports.as_ref() else {
+        return false;
+    };
+    if spec.star || spec.decl.is_some() {
+        return false;
+    }
+    // Plain `import root.seg1.seg2` (no `as`): the bound name equals the
+    // module's first segment.
+    let mut segs = spec.module.split('.');
+    if segs.next() != Some(root) {
+        return false;
+    }
+    let suffix: Vec<&str> = segs.collect();
+    !suffix.is_empty()
+        && suffix.len() <= extra_chain.len()
+        && suffix.iter().zip(extra_chain).all(|(s, c)| s == c)
 }
 
 /// Walk every value-bearing AST node a Definition owns. Mirrors

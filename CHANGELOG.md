@@ -64,6 +64,32 @@ one). This drops a layer of `Py<SymbolNode>` allocations on the hot
 path and removes the parallel-API confusion of having both
 SymbolNode- and idx-form terminals on the same query.
 
+### Fixed
+
+- Uses inside an assignment whose target is a subscript or slice
+  (`os.environ["k"] = v`, `f[:] = [SomeClass()]`) are no longer
+  dropped. Such a target binds no name, so ty mints no Definition and
+  the per-decl pass skips it; the module-level walk previously skipped
+  it too because the statement was classified as a definition. The
+  subscripted object on the left and every name on the right are now
+  walked, so the imports / decls they reference keep their in-edges
+  instead of looking dead.
+- Sibling submodule imports that share a root binding (`import a.foo`
+  then `import a.bar`) no longer leave the earlier statement looking
+  dead. ty's flow-sensitive use-def chain attributes a use of the
+  shared root name to the last rebind only, so `a.foo.x()` failed to
+  keep `import a.foo` alive. A chained access now also resolves against
+  the scope-wide reachable bindings and keeps every `import <root>.<…>`
+  whose submodule suffix matches the access chain.
+- A binding introduced only under `if TYPE_CHECKING:` no longer hides
+  the runtime binding of the same name. ty narrows `TYPE_CHECKING` to
+  `True`, so its use-def chain resolves a use to the type-checking-only
+  binding and the branch that actually runs (`else: from b import X`,
+  `else: X = …`, or a later rebind) was left with zero in-edges. When
+  the flow-resolved binding falls inside a `TYPE_CHECKING` block, the
+  resolver now also keeps every reachable binding outside such blocks,
+  so the runtime import/decl survives.
+
 ## [0.13.0] - 2026-05-26
 
 ### Added

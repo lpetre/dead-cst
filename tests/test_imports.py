@@ -862,6 +862,39 @@ def test_imports(build_decl_graph, assert_edges, src, expected_extra_edges):
             },
             id="type-checking-import-used-only-in-string-annotation",
         ),
+        pytest.param(
+            # An assignment whose *target* is a subscript / slice
+            # (``os.environ["k"] = ...``, ``f[:] = ...``) binds no name,
+            # so ty mints no Definition for it. The module-level walk
+            # still has to visit the statement: the subscripted object
+            # on the LHS (``os``, ``f``) is a load, and every name on the
+            # RHS (``SomeClass``) is a use. All three keep their imports /
+            # decls alive (none is left with zero in-edges).
+            {
+                "a.py": "class SomeClass: pass\n",
+                "mod.py": (
+                    "import os\n"
+                    'os.environ["k"] = "v"\n'
+                    "from a import SomeClass\n"
+                    "f = []\n"
+                    "f[:] = [SomeClass()]\n"
+                ),
+            },
+            {
+                "a.SomeClass -> a",
+                "mod -> a",
+                "mod -> a.SomeClass",
+                "mod -> mod.SomeClass",
+                "mod -> mod.f",
+                "mod -> mod.os",
+                "mod.SomeClass -> a",
+                "mod.SomeClass -> a.SomeClass",
+                "mod.SomeClass -> mod",
+                "mod.f -> mod",
+                "mod.os -> mod",
+            },
+            id="subscript-assignment-target-emits-uses",
+        ),
     ],
 )
 def test_full_graph_edges(build_decl_graph, assert_edges, files, expected_edges):
@@ -873,6 +906,100 @@ def test_full_graph_edges(build_decl_graph, assert_edges, files, expected_edges)
     """
     graph = build_decl_graph(files)
     assert_edges(graph, expected_edges)
+
+
+@pytest.mark.parametrize(
+    "files, expected_edges",
+    [
+        pytest.param(
+            # Sibling submodule imports that share a root binding:
+            # ``import a.foo`` and ``import a.bar`` both rebind the local
+            # name ``a``. ty's flow-sensitive use-def chain attributes a
+            # use of ``a`` to the last rebind only, but ``a.foo.x()``
+            # depends specifically on the ``import a.foo`` statement
+            # (importing ``a.bar`` does not make the ``a.foo`` submodule
+            # available). Both ``mod.a`` aliases must therefore keep an
+            # in-edge -- pinned positionally because they share the
+            # ``mod.a`` fqname and a fqname-keyed assert would dedup them.
+            {
+                "a/__init__.py": "",
+                "a/foo.py": "def x(): pass\n",
+                "a/bar.py": "def z(): pass\n",
+                "mod.py": "import a.foo\nimport a.bar\na.foo.x()\na.bar.z()\n",
+            },
+            {
+                "a.bar -> a",
+                "a.bar.z@1:0 -> a.bar",
+                "a.foo -> a",
+                "a.foo.x@1:0 -> a.foo",
+                "mod -> a.bar",
+                "mod -> a.bar.z@1:0",
+                "mod -> a.foo",
+                "mod -> a.foo.x@1:0",
+                "mod -> mod.a@1:7",
+                "mod -> mod.a@2:7",
+                "mod.a@1:7 -> a.foo",
+                "mod.a@1:7 -> mod",
+                "mod.a@2:7 -> a.bar",
+                "mod.a@2:7 -> mod",
+            },
+            id="sibling-submodule-imports-keep-both-aliases",
+        ),
+        pytest.param(
+            # ``if TYPE_CHECKING: from a import X`` / ``else: from b
+            # import X``: ty narrows ``TYPE_CHECKING`` to ``True``, so its
+            # flow-sensitive use-def chain resolves a use of ``SomeClass``
+            # to the if-branch (type-checking) import only. At runtime the
+            # else branch is the one that executes, so both imports must
+            # keep an in-edge -- the resolver recovers the runtime binding
+            # from the reachable bindings outside the ``TYPE_CHECKING``
+            # block. Pinned positionally because both imports share the
+            # ``mod.SomeClass`` fqname.
+            {
+                "a.py": "class SomeClass: pass\n",
+                "b.py": "class SomeClass: pass\n",
+                "mod.py": (
+                    "from typing import TYPE_CHECKING\n"
+                    "if TYPE_CHECKING:\n"
+                    "    from a import SomeClass\n"
+                    "else:\n"
+                    "    from b import SomeClass\n"
+                    "SomeClass()\n"
+                ),
+            },
+            {
+                "a.SomeClass@1:0 -> a",
+                "b.SomeClass@1:0 -> b",
+                "mod -> a",
+                "mod -> a.SomeClass@1:0",
+                "mod -> b",
+                "mod -> b.SomeClass@1:0",
+                "mod -> mod.SomeClass@3:18",
+                "mod -> mod.SomeClass@5:18",
+                "mod -> mod.TYPE_CHECKING@1:19",
+                "mod.SomeClass@3:18 -> a",
+                "mod.SomeClass@3:18 -> a.SomeClass@1:0",
+                "mod.SomeClass@3:18 -> mod",
+                "mod.SomeClass@5:18 -> b",
+                "mod.SomeClass@5:18 -> b.SomeClass@1:0",
+                "mod.SomeClass@5:18 -> mod",
+                "mod.TYPE_CHECKING@1:19 -> mod",
+            },
+            id="type-checking-else-branch-keeps-runtime-import",
+        ),
+    ],
+)
+def test_full_graph_positional_edges(
+    build_decl_graph, assert_positional_edges, files, expected_edges
+):
+    """Like :func:`test_full_graph_edges` but asserts ``fqname@line:col``
+    edges. Used when a case mints multiple nodes that share an fqname
+    (e.g. two ``import a.X`` statements both bound to ``a``), where a
+    fqname-keyed assert would collapse the distinction the test exists
+    to pin.
+    """
+    graph = build_decl_graph(files)
+    assert_positional_edges(graph, expected_edges)
 
 
 def test_third_party_import_creates_synthetic_node(build_decl_graph):

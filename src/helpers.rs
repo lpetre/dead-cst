@@ -1809,6 +1809,75 @@ pub(crate) fn walk_compound_for_dead(stmt: &Stmt, table: &NameTable, dead: &mut 
     }
 }
 
+/// Source ranges of the statements inside an `if TYPE_CHECKING:` block
+/// (the guard spelled bare as `TYPE_CHECKING` or as an attribute like
+/// `typing.TYPE_CHECKING`). ty narrows `TYPE_CHECKING` to `True`, so a
+/// use whose flow-resolved binding lives in one of these ranges has had
+/// its *runtime* binding (in the `else` clause, or after the block)
+/// narrowed away. The ref walker uses these ranges to recover the
+/// runtime binding. The `else`/`elif` clauses are deliberately not
+/// recorded — those are what actually run at runtime.
+pub(crate) fn detect_type_checking_ranges(parsed: &ParsedModuleRef) -> Vec<TextRange> {
+    let mut ranges = Vec::new();
+    collect_type_checking_ranges(&parsed.syntax().body, &mut ranges);
+    ranges
+}
+
+fn collect_type_checking_ranges(stmts: &[Stmt], ranges: &mut Vec<TextRange>) {
+    for stmt in stmts {
+        match stmt {
+            Stmt::If(if_stmt) => {
+                if expr_is_type_checking(&if_stmt.test) {
+                    for s in &if_stmt.body {
+                        ranges.push(s.range());
+                    }
+                }
+                collect_type_checking_ranges(&if_stmt.body, ranges);
+                for clause in &if_stmt.elif_else_clauses {
+                    collect_type_checking_ranges(&clause.body, ranges);
+                }
+            }
+            Stmt::While(w) => {
+                collect_type_checking_ranges(&w.body, ranges);
+                collect_type_checking_ranges(&w.orelse, ranges);
+            }
+            Stmt::For(f) => {
+                collect_type_checking_ranges(&f.body, ranges);
+                collect_type_checking_ranges(&f.orelse, ranges);
+            }
+            Stmt::With(w) => collect_type_checking_ranges(&w.body, ranges),
+            Stmt::Try(t) => {
+                collect_type_checking_ranges(&t.body, ranges);
+                for handler in &t.handlers {
+                    let ruff_python_ast::ExceptHandler::ExceptHandler(h) = handler;
+                    collect_type_checking_ranges(&h.body, ranges);
+                }
+                collect_type_checking_ranges(&t.orelse, ranges);
+                collect_type_checking_ranges(&t.finalbody, ranges);
+            }
+            Stmt::FunctionDef(f) => collect_type_checking_ranges(&f.body, ranges),
+            Stmt::ClassDef(c) => collect_type_checking_ranges(&c.body, ranges),
+            Stmt::Match(m) => {
+                for case in &m.cases {
+                    collect_type_checking_ranges(&case.body, ranges);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// True for the two spellings of the type-checking guard: a bare
+/// `TYPE_CHECKING` name or any `<…>.TYPE_CHECKING` attribute access
+/// (e.g. `typing.TYPE_CHECKING`).
+fn expr_is_type_checking(expr: &Expr) -> bool {
+    match expr {
+        Expr::Name(n) => n.id.as_str() == "TYPE_CHECKING",
+        Expr::Attribute(a) => a.attr.as_str() == "TYPE_CHECKING",
+        _ => false,
+    }
+}
+
 /// Does `stmt` unconditionally hand off control out of the enclosing
 /// suite? Statements *after* a terminator in the same suite are dead.
 ///
