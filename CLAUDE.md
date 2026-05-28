@@ -24,7 +24,9 @@ CI runs `prek run --all-files` and the matrix `pytest` (Python 3.11–3.14) on e
 
 ## Architecture
 
-`dead-cst` builds a symbol-level reachability graph of a Python codebase via the rust-backed [`dead_cst._native`](src/) crate (which uses [ty's](https://github.com/astral-sh/ruff) `SemanticIndex`), walks from configured entrypoints, and reports (or removes) anything unreachable.
+`dead-cst` builds a symbol-level reachability graph of a Python codebase via the rust-backed `dead_cst._native` extension (which uses [ty's](https://github.com/astral-sh/ruff) `SemanticIndex`), walks from configured entrypoints, and reports (or removes) anything unreachable.
+
+The native code is split: **`dead-cst-runtime`** (`runtime/`) holds the whole implementation, built as both an `rlib` and a `dylib`; **`dead-cst-native`** (`src/lib.rs`) is a thin pyo3 `#[pymodule]` shim. The default wheel statically links the runtime `rlib` (one self-contained `_native.{abi3.so,pyd}`); the runtime `dylib` is what external native plugins link to share one salsa/ty instance. See [`NATIVE_PLUGINS.md`](NATIVE_PLUGINS.md) and `runtime/src/CLAUDE.md`.
 
 ### Pipeline (top-down)
 
@@ -89,6 +91,8 @@ def test_something(build_decl_graph, assert_edges):
 4. Out-of-tree plugins register under the `dead_cst.plugins` entry-point group; the CLI's `_load_plugin` checks `_BUILTIN_PLUGINS` first.
 
 The plugin queries live on `native.ProjectContext` — `find_subclasses`, `find_module`, `find_declarations`, `module_for`, `find_main_blocks`, etc. — plus the chainable `query(ctx).decorators()...` / `.constructions()...` / `.calls()...` builder. See `python/dead_cst/_native.pyi` for the full surface.
+
+For **native (Rust) plugins** — in-tree ones (e.g. `NativePlugin.main_block()`) and external ones compiled against the runtime `dylib` and loaded via `native.load_native_plugins(...)` — see [`NATIVE_PLUGINS.md`](NATIVE_PLUGINS.md). The author-facing flow is `dead-cst build-plugin <PLUGIN.rs>` (+ `pip install dead-cst[build-plugin]`); maintainers produce the prebuilt-runtime bundle with `dead-cst bundle-plugin-host`. Both commands are macOS-only today. Prefer Python plugins unless the work needs native speed or plugin-defined salsa-cached queries.
 
 ## Adding a resolver
 

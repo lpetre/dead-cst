@@ -53,24 +53,37 @@ the rust BFS queries.
 
 ## The rust crate
 
-The pyo3 extension lives in `src/` (a maturin-managed cdylib that ships
-as `python/dead_cst/_native.{abi3.so,pyd}`). Type stubs live alongside
-at `python/dead_cst/_native.pyi`.
+The native code is split in two:
 
-Module layout (`src/lib.rs` is the pymodule entry point):
+- **`dead-cst-runtime`** (`runtime/`) — the whole implementation: the build
+  pipeline, the query DSL, the pyclasses, the native-plugin API. Built as
+  **both** an `rlib` and a `dylib`.
+- **`dead-cst-native`** (`src/lib.rs`) — a thin pyo3 `#[pymodule]` shim that
+  ships as `python/dead_cst/_native.{abi3.so,pyd}`.
+
+The default wheel links the runtime `rlib` *statically* into the shim, so it's
+a single self-contained extension (~10 MB) that needs no rust at install time.
+The runtime `dylib` is what **external native plugins** link against to share
+one salsa/ty instance — see [`NATIVE_PLUGINS.md`](NATIVE_PLUGINS.md). Type
+stubs live at `python/dead_cst/_native.pyi`.
+
+Module layout (`runtime/src/lib.rs`'s `register()` registers the pymodule; the
+`src/lib.rs` shim forwards to it):
 
 | File | Purpose |
 | ---- | ------- |
-| `lib.rs`     | pymodule registration, top-level `query()` helper |
-| `project.rs` | `Project`, `ProjectContext`, the `build()` pipeline |
-| `builder.rs` | `NodeKey`, `GraphBuilder`, `AddNode` / `AddEdge` / `AddEntrypoint`, generic BFS |
-| `graph.rs`   | `SymbolNode`, `Import`, `NativeGraph`, `NodeFlags`, `EdgeFlags` |
-| `ingest.rs`  | the three build phases (decls / chain / references) |
-| `query.rs`   | the plugin-facing `query(ctx).decorators()....collect()` builder |
-| `helpers.rs` | shared utilities (noqa parser, notebook decoder, dist-info lookup, …) |
-| `io.rs`      | `write_graph` / `read_graph` (bincode + a hard-versioned header) |
+| `src/lib.rs`                    | the cdylib shim: pyo3 `#[pymodule]` forwarding to `runtime::register` |
+| `runtime/src/lib.rs`            | `register()`, top-level `query()` helper |
+| `runtime/src/project.rs`        | `Project`, `ProjectContext`, the `build()` pipeline |
+| `runtime/src/builder.rs`        | `NodeKey`, `GraphBuilder`, `AddNode` / `AddEdge` / `AddEntrypoint`, generic BFS |
+| `runtime/src/graph.rs`          | `SymbolNode`, `Import`, `NativeGraph`, `NodeFlags`, `EdgeFlags` |
+| `runtime/src/ingest.rs`         | the three build phases (decls / chain / references) |
+| `runtime/src/query.rs`          | the plugin-facing `query(ctx).decorators()....collect()` builder |
+| `runtime/src/native_plugins.rs` | in-tree + external native plugins (the `plugin_api`, the ABI airlock) |
+| `runtime/src/helpers.rs`        | shared utilities (noqa parser, notebook decoder, dist-info lookup, …) |
+| `runtime/src/io.rs`             | `write_graph` / `read_graph` (bincode + a hard-versioned header) |
 
-The deeper crate-level rules live in `src/CLAUDE.md` — ty is the source
+The deeper crate-level rules live in `runtime/src/CLAUDE.md` — ty is the source
 of truth for every piece of Python semantics, every import binds a
 local declaration, and shadowed declarations are first-class graph
 nodes.
