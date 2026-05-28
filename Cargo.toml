@@ -32,4 +32,7 @@ pyo3 = { version = "0.22", features = ["abi3-py311", "multiple-pymethods"] }
 # linked as an rlib (static, self-contained wheel). A `-C prefer-dynamic`
 # build links it as the shared `libdead_cst_runtime.dylib` instead, which
 # external native plugins also link — giving one shared salsa/ty runtime.
-dead-cst-runtime = { path = "runtime" }
+# `default-features = false` so the root's `extension-module` feature is the
+# single switch: `cargo test --no-default-features` then disables it on the
+# runtime too (pyo3 links libpython for the test binary).
+dead-cst-runtime = { path = "runtime", default-features = false }
