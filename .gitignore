@@ -212,3 +212,12 @@ __marimo__/
 
 # Claude Code worktrees (per-agent ephemeral)
 .claude/worktrees/
+
+# Plugin-host bundle payload + example plugin output (regenerable; see
+# `dead-cst bundle-plugin-host` / `dead-cst build-plugin`). The package's
+# __init__.py / pyproject.toml are tracked; only the binary payload is ignored.
+python/dead_cst/_plugin_host/
+plugin-host/dead_cst_plugin_host/*.dylib
+plugin-host/dead_cst_plugin_host/*.rlib
+plugin-host/dead_cst_plugin_host/*.so
+/libmain_block_plugin.dylib

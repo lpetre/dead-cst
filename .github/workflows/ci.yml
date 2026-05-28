@@ -96,7 +96,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci-build
-      - run: cargo test --no-default-features --locked
+      # The rust unit tests live in the `dead-cst-runtime` crate; test it with
+      # its `extension-module` feature off so pyo3 links libpython for the test
+      # binary (otherwise the Python symbols are undefined at link time).
+      - run: cargo test --no-default-features --locked -p dead-cst-runtime
 
   # Install the prebuilt wheel into each Python version's venv and run
   # pytest. No maturin invocation in this job -- the wheel slots in via

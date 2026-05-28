@@ -25,6 +25,15 @@ dependencies = [
     "typer>=0.12",
 ]
 
+[project.optional-dependencies]
+# Authoring native plugins (`dead-cst build-plugin`) needs the prebuilt runtime
+# + its dependency closure to compile against. Those are large (~130 MB
+# compressed) and platform-specific, so they ship as a SEPARATE package pulled
+# in only on demand — the default `dead-cst` wheel stays small + self-contained.
+# (The publish workflow pins this to `== <this version>`; the load-time ABI
+# fingerprint rejects any mismatch regardless.)
+build-plugin = ["dead-cst-plugin-host"]
+
 [project.urls]
 Homepage = "https://github.com/lpetre/dead-cst"
 Repository = "https://github.com/lpetre/dead-cst"
@@ -37,6 +46,13 @@ dead-cst = "dead_cst.cli:main_cli"
 [build-system]
 requires = ["maturin>=1.7,<2"]
 build-backend = "maturin"
+
+[tool.uv.sources]
+# The `build-plugin` extra's payload lives in this repo (a data-only package
+# populated by `dead-cst bundle-plugin-host`); resolve it from the local path
+# rather than an index. Editable so `dead_cst_plugin_host` imports from the
+# source dir the bundle is written into. Only installed via the extra.
+dead-cst-plugin-host = { path = "plugin-host", editable = true }
 
 [tool.maturin]
 # Mixed Rust/Python layout per the maturin user guide and pydantic-core's

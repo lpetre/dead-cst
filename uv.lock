@@ -677,6 +677,11 @@ dependencies = [
     { name = "typer" },
 ]
 
+[package.optional-dependencies]
+build-plugin = [
+    { name = "dead-cst-plugin-host" },
+]
+
 [package.dev-dependencies]
 dev = [
     { name = "celery" },
@@ -694,9 +699,11 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "dead-cst-plugin-host", marker = "extra == 'build-plugin'", editable = "plugin-host" },
     { name = "libcst", specifier = ">=1.8.6" },
     { name = "typer", specifier = ">=0.12" },
 ]
+provides-extras = ["build-plugin"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -712,6 +719,11 @@ dev = [
     { name = "ruff", specifier = ">=0.11.2" },
     { name = "ty", specifier = ">=0.0.1a7" },
 ]
+
+[[package]]
+name = "dead-cst-plugin-host"
+version = "0.13.0"
+source = { editable = "plugin-host" }
 
 [[package]]
 name = "discord-py"

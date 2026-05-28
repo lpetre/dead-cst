@@ -19,7 +19,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import shutil
+import subprocess
 import sys
 from enum import Enum
 from pathlib import Path
@@ -521,6 +524,446 @@ def remove(
     else:
         sys.stdout.write(patch)
         typer.echo("Apply with: dead-cst remove ... | git apply", err=True)
+
+
+# ---------------------------------------------------------------------------
+# build-plugin
+# ---------------------------------------------------------------------------
+
+
+def _detect_source_root() -> Path | None:
+    """The dead-cst source checkout, or None when running from a wheel.
+
+    In an editable (``maturin develop``) layout this file lives at
+    ``<root>/python/dead_cst/cli.py``; walk up to the dir that holds both the
+    workspace ``Cargo.toml`` and the ``runtime`` crate.
+    """
+    for parent in Path(__file__).resolve().parents:
+        if (parent / "Cargo.toml").is_file() and (parent / "runtime" / "Cargo.toml").is_file():
+            return parent
+    return None
+
+
+def _rustc_print(*args: str) -> str:
+    return subprocess.run(
+        ["rustc", *args], capture_output=True, text=True, check=True
+    ).stdout.strip()
+
+
+def _host_std_lib() -> Path:
+    """The toolchain dir holding the shared ``libstd-<hash>.dylib`` (everything
+    is built ``-C prefer-dynamic``, so artifacts rpath here)."""
+    sysroot = Path(_rustc_print("--print", "sysroot"))
+    host = next(
+        (
+            line.split("host: ", 1)[1]
+            for line in _rustc_print("-vV").splitlines()
+            if line.startswith("host: ")
+        ),
+        None,
+    )
+    if host is None:
+        raise typer.BadParameter("could not determine the host target triple from `rustc -vV`.")
+    return sysroot / "lib" / "rustlib" / host / "lib"
+
+
+def _plugin_host_bundle() -> Path | None:
+    """The prebuilt-runtime bundle shipped by the ``dead-cst[build-plugin]``
+    extra as the separate ``dead_cst_plugin_host`` package (the runtime dylib +
+    its rlib/proc-macro-dylib closure + libstd). None if the extra isn't
+    installed."""
+    try:
+        import dead_cst_plugin_host  # ty: ignore[unresolved-import]
+    except Exception:
+        return None
+    bundle = Path(dead_cst_plugin_host.__file__).resolve().parent
+    return bundle if (bundle / "libdead_cst_runtime.dylib").is_file() else None
+
+
+def _build_runtime_from_source(root: Path, *, release: bool, std_lib: Path) -> Path:
+    """Build the runtime dylib + dep metadata (+ the dynamic ``_native``) from a
+    source checkout into ``target/plugin-host``; return the deps dir."""
+    if shutil.which("cargo") is None:
+        raise typer.BadParameter(
+            "cargo not found on PATH; needed to build the runtime from source."
+        )
+    manifest = root / "runtime" / "Cargo.toml"
+    if not manifest.is_file():
+        raise typer.BadParameter(f"no runtime crate at {manifest}; is --source-root correct?")
+    original = manifest.read_text()
+    # Build the runtime dylib-ONLY: under prefer-dynamic a dep available as both
+    # rlib and dylib makes the cdylib bind the rlib's SVH while the loader
+    # resolves the dylib. Restore the manifest afterward.
+    dylib_only = original.replace('crate-type = ["rlib", "dylib"]', 'crate-type = ["dylib"]')
+    if dylib_only == original:
+        raise typer.BadParameter(
+            "could not switch runtime crate-type to dylib-only "
+            '(expected \'crate-type = ["rlib", "dylib"]\' in runtime/Cargo.toml).'
+        )
+    target_dir = root / "target" / "plugin-host"
+    env = {
+        **os.environ,
+        "CARGO_TARGET_DIR": str(target_dir),
+        "RUSTFLAGS": " ".join(
+            [
+                "-C prefer-dynamic",
+                "-C link-arg=-Wl,-undefined,dynamic_lookup",
+                f"-C link-arg=-Wl,-rpath,{std_lib}",
+                "-C link-arg=-Wl,-rpath,@loader_path",
+            ]
+        ),
+    }
+    cmd = ["cargo", "build", "-p", "dead-cst-native"] + (["--release"] if release else [])
+    typer.echo(f"$ {' '.join(cmd)}  (prefer-dynamic, dylib-only runtime)", err=True)
+    try:
+        manifest.write_text(dylib_only)
+        subprocess.run(cmd, cwd=root, env=env, check=True)
+    finally:
+        manifest.write_text(original)
+    return target_dir / ("release" if release else "debug") / "deps"
+
+
+@app.command(name="build-plugin")
+def build_plugin(
+    plugin_src: Annotated[
+        Path | None,
+        typer.Argument(
+            help="Path to the plugin's Rust source (.rs). Defaults to the bundled "
+            "example when run from a source checkout."
+        ),
+    ] = None,
+    name: Annotated[
+        str | None,
+        typer.Option("--name", help="Crate / output name (default: derived from the source)."),
+    ] = None,
+    output: Annotated[
+        Path | None,
+        typer.Option("-o", "--output", help="Where to write the plugin .so."),
+    ] = None,
+    runtime_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--runtime-dir",
+            help="Directory with a prebuilt libdead_cst_runtime.dylib + dep *.rmeta. "
+            "Overrides the bundle / source-checkout lookup.",
+        ),
+    ] = None,
+    source_root: Annotated[
+        Path | None,
+        typer.Option(
+            "--source-root", help="dead-cst source checkout (to build the runtime if needed)."
+        ),
+    ] = None,
+    release: Annotated[
+        bool, typer.Option("--release", help="Build optimized (release) artifacts.")
+    ] = False,
+    install: Annotated[
+        bool,
+        typer.Option(
+            "--install/--no-install",
+            help="Install the matching dynamic _native over the editable extension "
+            "(so the host and plugin share one runtime).",
+        ),
+    ] = True,
+    verbose: Annotated[
+        bool, typer.Option("-v", "--verbose", help="Enable verbose output.")
+    ] = False,
+) -> None:
+    """Compile an external native plugin against the dead-cst runtime.
+
+    The plugin is compiled with ``rustc --extern`` against a *prebuilt* runtime
+    dylib + its metadata — no Cargo project, no runtime source, no ruff
+    recompile. Runtime artifacts are resolved, in order, from: ``--runtime-dir``,
+    a plugin-host bundle shipped in the installed package, or a source checkout
+    (built on demand). Prints the plugin ``.so`` path on stdout; load it with
+    ``native.load_native_plugins(<path>)``.
+
+    Compiles a single ``.rs`` (multi-crate plugins are a follow-up). macOS only
+    for now. Needs the rust toolchain at the version dead-cst was built with —
+    the ABI fingerprint rejects a mismatch at load.
+    """
+    setup_logging(verbose)
+    if sys.platform != "darwin":
+        raise typer.BadParameter("build-plugin currently supports macOS only.")
+    if shutil.which("rustc") is None:
+        raise typer.BadParameter("rustc not found on PATH; the rust toolchain is required.")
+
+    std_lib = _host_std_lib()
+    root = source_root.resolve() if source_root is not None else _detect_source_root()
+
+    # Resolve the runtime artifacts: a deps dir (dylib + dep *.rmeta), an
+    # optional dynamic _native to install, and where to drop the output.
+    native_to_install: Path | None
+    if runtime_dir is not None:
+        deps_dir = runtime_dir.resolve()
+        cand = deps_dir / "libdead_cst_native.dylib"
+        native_to_install = cand if cand.is_file() else None
+        out_dir = Path.cwd()
+    elif (bundle := _plugin_host_bundle()) is not None:
+        deps_dir = bundle
+        cand = bundle / "libdead_cst_native.dylib"
+        native_to_install = cand if cand.is_file() else None
+        out_dir = Path.cwd()
+    elif root is not None:
+        deps_dir = _build_runtime_from_source(root, release=release, std_lib=std_lib)
+        native_to_install = deps_dir.parent / "libdead_cst_native.dylib"
+        out_dir = deps_dir.parent
+    else:
+        raise typer.BadParameter(
+            "no runtime artifacts: pass --runtime-dir, install a plugin-host bundle, "
+            "or run from a dead-cst source checkout."
+        )
+
+    runtime_dylib = deps_dir / "libdead_cst_runtime.dylib"
+    if not runtime_dylib.is_file():
+        raise typer.BadParameter(f"runtime dylib not found at {runtime_dylib}.")
+
+    # Resolve the plugin source.
+    if plugin_src is None:
+        if root is None:
+            raise typer.BadParameter("no plugin source given (and no checkout for the example).")
+        plugin_src = root / "examples" / "main_block_plugin" / "src" / "lib.rs"
+    src = plugin_src.resolve()
+    if not src.is_file():
+        raise typer.BadParameter(f"plugin source not found: {src}")
+
+    if name is None:
+        name = src.parent.parent.name if src.stem in {"lib", "mod", "main"} else src.stem
+    crate_name = name.replace("-", "_")
+    out = output.resolve() if output is not None else out_dir / f"lib{crate_name}.dylib"
+
+    # Compile against the prebuilt runtime — no cargo, no runtime source, no
+    # ruff recompile. --extern reads the dylib's metadata; -L finds the dep
+    # *.rmeta; dynamic_lookup defers Python symbols; the symbols resolve from
+    # the (shared) runtime dylib at load.
+    cmd = [
+        "rustc",
+        "--edition",
+        "2021",
+        "--crate-type",
+        "cdylib",
+        "--crate-name",
+        crate_name,
+        "-C",
+        "prefer-dynamic",
+        "--extern",
+        f"dead_cst_runtime={runtime_dylib}",
+        "-L",
+        f"dependency={deps_dir}",
+        "-C",
+        "link-arg=-Wl,-undefined,dynamic_lookup",
+        "-C",
+        f"link-arg=-Wl,-rpath,{std_lib}",
+        "-C",
+        "link-arg=-Wl,-rpath,@loader_path",
+        *(["-O"] if release else []),
+        str(src),
+        "-o",
+        str(out),
+    ]
+    typer.echo(f"$ rustc --extern dead_cst_runtime=… {src.name} -o {out.name}", err=True)
+    try:
+        subprocess.run(cmd, check=True)
+    except subprocess.CalledProcessError as exc:
+        raise typer.Exit(code=exc.returncode or 1) from exc
+    if not out.is_file():
+        typer.echo(f"error: plugin artifact not produced at {out}", err=True)
+        raise typer.Exit(code=1)
+
+    if install and native_to_install is not None and native_to_install.is_file():
+        from dead_cst import _native
+
+        installed = Path(_native.__file__)
+        shutil.copyfile(native_to_install, installed)
+        # The bundle's _native references the runtime via @rpath (it's
+        # relocatable). Point it at where the runtime artifacts actually live
+        # now (deps_dir), so it resolves wherever the bundle package landed —
+        # editable checkout or site-packages. Re-sign (rpath edit invalidates).
+        if sys.platform == "darwin" and shutil.which("install_name_tool"):
+            subprocess.run(
+                ["install_name_tool", "-add_rpath", str(deps_dir), str(installed)],
+                check=False,
+            )
+            if shutil.which("codesign"):
+                subprocess.run(["codesign", "-s", "-", "-f", str(installed)], check=True)
+        typer.echo(f"Installed dynamic _native -> {installed}", err=True)
+        typer.echo("Restore the default static build with: uv run maturin develop --uv", err=True)
+    elif install and native_to_install is None:
+        typer.echo(
+            "note: no dynamic _native found to install; ensure the active _native "
+            "shares this runtime before loading the plugin.",
+            err=True,
+        )
+
+    # Path on stdout so it can be captured: PLUGIN=$(dead-cst build-plugin ...).
+    typer.echo(str(out))
+
+
+# ---------------------------------------------------------------------------
+# bundle-plugin-host
+# ---------------------------------------------------------------------------
+
+
+def _otool_dep(dylib: Path, needle: str) -> str | None:
+    """The first ``otool -L`` load-command path on ``dylib`` containing ``needle``."""
+    out = subprocess.run(
+        ["otool", "-L", str(dylib)], capture_output=True, text=True, check=True
+    ).stdout
+    for line in out.splitlines()[1:]:
+        path = line.strip().split(" ", 1)[0]
+        if needle in path:
+            return path
+    return None
+
+
+@app.command(name="bundle-plugin-host")
+def bundle_plugin_host(
+    output: Annotated[
+        Path | None,
+        typer.Option(
+            "-o", "--output", help="Bundle directory (default: the dead_cst_plugin_host package)."
+        ),
+    ] = None,
+    source_root: Annotated[
+        Path | None,
+        typer.Option("--source-root", help="dead-cst source checkout (default: auto-detected)."),
+    ] = None,
+    release: Annotated[
+        bool, typer.Option("--release", help="Build optimized (release) artifacts.")
+    ] = False,
+    verbose: Annotated[
+        bool, typer.Option("-v", "--verbose", help="Enable verbose output.")
+    ] = False,
+) -> None:
+    """Assemble a relocatable plugin-host bundle.
+
+    Builds the runtime and gathers ``libdead_cst_runtime.dylib`` + its rlib /
+    proc-macro-dylib dependency closure + the toolchain's ``libstd`` + the
+    dynamic ``_native`` into one directory, with install names / rpaths
+    rewritten to ``@rpath`` / ``@loader_path`` (and stripped + ad-hoc signed) so
+    it relocates. By default it populates the separate ``dead_cst_plugin_host``
+    package (``plugin-host/``) — the payload the ``dead-cst[build-plugin]`` extra
+    ships, which ``build-plugin`` auto-detects via ``import dead_cst_plugin_host``.
+    macOS only; requires a source checkout + the Xcode command line tools.
+    """
+    setup_logging(verbose)
+    if sys.platform != "darwin":
+        raise typer.BadParameter("bundle-plugin-host currently supports macOS only.")
+    for tool in ("cargo", "rustc", "install_name_tool", "codesign", "otool", "strip"):
+        if shutil.which(tool) is None:
+            raise typer.BadParameter(f"{tool} not found on PATH (need rust + Xcode CLT).")
+
+    root = source_root.resolve() if source_root is not None else _detect_source_root()
+    if root is None:
+        raise typer.BadParameter(
+            "a source checkout is required to build the bundle; pass --source-root."
+        )
+
+    std_lib = _host_std_lib()
+    libstds = sorted(std_lib.glob("libstd-*.dylib"))
+    if not libstds:
+        raise typer.BadParameter(f"no libstd-*.dylib under {std_lib}.")
+    libstd = libstds[0]
+
+    deps_dir = _build_runtime_from_source(root, release=release, std_lib=std_lib)
+    runtime_src = deps_dir / "libdead_cst_runtime.dylib"
+    native_src = deps_dir / "libdead_cst_native.dylib"
+    for artifact in (runtime_src, native_src):
+        if not artifact.is_file():
+            raise typer.BadParameter(f"missing build artifact: {artifact}")
+
+    if output is not None:
+        bundle = output.resolve()
+    else:
+        # Default: populate the separate `dead_cst_plugin_host` package that the
+        # `dead-cst[build-plugin]` extra ships.
+        bundle = root / "plugin-host" / "dead_cst_plugin_host"
+
+    bundle.mkdir(parents=True, exist_ok=True)
+    # Clean only prior build artifacts — keep package files like __init__.py.
+    for stale in (*bundle.glob("*.rlib"), *bundle.glob("*.dylib")):
+        stale.unlink()
+
+    # Copy the dependency closure rustc needs to load dead_cst_runtime via
+    # --extern: the .rlib of every dep + the proc-macro dylibs (required to
+    # validate the crate graph) + the runtime dylib + the dynamic _native (all
+    # under deps/). The .rmeta are skipped — they're redundant with the .rlib
+    # (which embed metadata) and would nearly double the bundle. Then add libstd.
+    n_files = 0
+    for entry in deps_dir.iterdir():
+        if entry.is_file() and entry.suffix in {".rlib", ".dylib"}:
+            shutil.copy2(entry, bundle / entry.name)
+            n_files += 1
+    shutil.copy2(libstd, bundle / libstd.name)
+
+    runtime_bundled = bundle / "libdead_cst_runtime.dylib"
+    native_bundled = bundle / "libdead_cst_native.dylib"
+
+    def _imt(*args: str) -> None:
+        subprocess.run(["install_name_tool", *args], check=True)
+
+    def _rpaths(dylib: Path) -> set[str]:
+        out = subprocess.run(
+            ["otool", "-l", str(dylib)], capture_output=True, text=True, check=True
+        ).stdout
+        lines = out.splitlines()
+        found: set[str] = set()
+        for i, line in enumerate(lines):
+            if "LC_RPATH" in line:
+                for follow in lines[i : i + 4]:
+                    s = follow.strip()
+                    if s.startswith("path "):
+                        found.add(s[len("path ") :].split(" (offset")[0].strip())
+        return found
+
+    def _ensure_rpath(dylib: Path, rpath: str) -> None:
+        # The build already bakes @loader_path; install_name_tool errors on a
+        # duplicate, so only add what's missing.
+        if rpath not in _rpaths(dylib):
+            _imt("-add_rpath", rpath, str(dylib))
+
+    def _drop_rpath(dylib: Path, rpath: str) -> None:
+        # Strip the builder's absolute sysroot rpath so the bundle relocates;
+        # libstd is found via the @loader_path rpaths instead.
+        if rpath in _rpaths(dylib):
+            _imt("-delete_rpath", rpath, str(dylib))
+
+    # runtime: relocatable id + rpath to find its sibling libstd.
+    _imt("-id", "@rpath/libdead_cst_runtime.dylib", str(runtime_bundled))
+    _ensure_rpath(runtime_bundled, "@loader_path")
+    _drop_rpath(runtime_bundled, str(std_lib))
+
+    # dynamic _native: relocatable id; ref the runtime via @rpath; rpath into
+    # _plugin_host/ for when it's installed one level up at
+    # dead_cst/_native.abi3.so.
+    _imt("-id", "@rpath/libdead_cst_native.dylib", str(native_bundled))
+    old_runtime_ref = _otool_dep(native_bundled, "libdead_cst_runtime")
+    if old_runtime_ref is not None:
+        _imt("-change", old_runtime_ref, "@rpath/libdead_cst_runtime.dylib", str(native_bundled))
+    # @loader_path covers the native sitting in the bundle dir; `build-plugin`
+    # adds an rpath to the real bundle location when it installs the native into
+    # the dead_cst package.
+    _ensure_rpath(native_bundled, "@loader_path")
+    _drop_rpath(native_bundled, str(std_lib))
+
+    # Strip local symbols, then ad-hoc re-sign every dylib. Both install_name_tool
+    # and strip invalidate the code signature; dyld (and rustc, loading the
+    # proc-macro dylibs) reject edited, unsigned dylibs on Apple Silicon.
+    for dylib in sorted(bundle.glob("*.dylib")):
+        subprocess.run(["strip", "-x", str(dylib)], check=True)
+        subprocess.run(["codesign", "-s", "-", "-f", str(dylib)], check=True)
+
+    # libstd's id is already @rpath; its copy keeps its valid signature.
+
+    typer.echo(f"plugin-host bundle: {bundle}", err=True)
+    typer.echo(
+        f"  {n_files} dep artifacts + {libstd.name} (install names rewritten, ad-hoc signed)",
+        err=True,
+    )
+    typer.echo(
+        "  `dead-cst build-plugin <PLUGIN.rs>` now auto-detects it (no source needed).", err=True
+    )
+    typer.echo(str(bundle))
 
 
 def main_cli() -> None:

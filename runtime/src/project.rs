@@ -1759,6 +1759,15 @@ fn collect_prepared_plugin_ops(
             crate::native_plugins::NativePluginKind::PerFile(kind) => {
                 return ctx_ref.collect_per_file_plugin_ops(*kind, sink);
             }
+            // External dylib plugin: run it against a restricted, public
+            // ``PluginCtx`` view and fold its ops into the shared sink.
+            crate::native_plugins::NativePluginKind::External { plugin, .. } => {
+                let pctx = crate::native_plugins::plugin_api::PluginCtx::new(&ctx_ref);
+                let mut ops = crate::native_plugins::plugin_api::PluginOps::new();
+                plugin.run(&pctx, &mut ops);
+                sink.extend(ops.into_inner());
+                return Ok(());
+            }
         }
     }
     let result = plugin_bound.call_method1("run", (ctx.clone_ref(py),))?;

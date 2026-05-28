@@ -1,0 +1,11 @@
+# The `dead-cst-runtime` crate is built as both rlib and dylib. The dylib
+# artifact has undefined Python symbols (pyo3 `extension-module` skips
+# libpython — the host interpreter provides them at load time), so its link
+# step needs `-undefined dynamic_lookup`. This is machine-independent.
+#
+# NOTE: `-C prefer-dynamic` is intentionally NOT here. The default build
+# links the runtime rlib statically (self-contained wheel, unchanged
+# behavior). The opt-in plugin-host build passes prefer-dynamic via RUSTFLAGS
+# (via `dead-cst build-plugin`) so external plugins share one runtime.
+[build]
+rustflags = ["-C", "link-args=-Wl,-undefined,dynamic_lookup"]

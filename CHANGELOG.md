@@ -11,6 +11,37 @@ two versions.
 
 ### Added
 
+- **External native plugins (experimental).** The native crate is now
+  split into a `dead-cst-runtime` library (built as both `rlib` and
+  `dylib`) and a thin `dead-cst-native` cdylib shim. The default wheel
+  is unchanged — it statically links the `rlib`, so it stays
+  self-contained. The new `dead-cst build-plugin [PLUGIN.rs]` command
+  compiles a plugin against a *prebuilt* runtime `dylib` + its metadata
+  via `rustc --extern` (`-C prefer-dynamic`) — no Cargo project, no
+  runtime source, no ruff recompile — and installs the matching dynamic
+  `_native` so the host and plugin share one salsa/ty runtime. Runtime
+  artifacts come from `--runtime-dir`, a plugin-host bundle in the
+  installed package, or a source checkout (built on demand).
+  `native.load_native_plugins(path)` loads the result through an ABI
+  airlock: it reads a self-contained `repr(C)` manifest and rejects any
+  plugin whose baked ABI fingerprint (rustc commit + runtime version +
+  target) differs from the running runtime's, cleanly and without
+  crashing. Plugins implement
+  `dead_cst_runtime::native_plugins::plugin_api::ExternalPlugin`; see
+  `examples/main_block_plugin/`. `dead-cst bundle-plugin-host` assembles
+  a *relocatable* plugin-host bundle (the runtime dylib + its rlib /
+  proc-macro-dylib closure + libstd + the dynamic `_native`, install
+  names / rpaths rewritten to `@rpath` / `@loader_path`, stripped + ad-hoc
+  re-signed). That bundle ships as a **separate `dead-cst-plugin-host`
+  package** pulled in only via the `dead-cst[build-plugin]` extra — so the
+  default `dead-cst` wheel stays small and self-contained, and the large
+  payload is installed on demand. `build-plugin` locates it via
+  `import dead_cst_plugin_host`. The bundle skips the redundant `.rmeta`
+  (the `.rlib` embed metadata) and strips the dylibs: a `--release` bundle
+  is ~350 MB on disk / ~130 MB compressed (the rlib dep closure
+  dominates), vs ~1.6 GB debug. Note: today this is macOS-only and the
+  separate package is built locally; producing the cross-platform
+  `dead-cst-plugin-host` wheels in CI is the remaining packaging work.
 - `Analysis.re_materialize(events)` — incrementally rebuild the
   project graph against the existing `native.ProjectContext`. The
   caller supplies the change events: typically

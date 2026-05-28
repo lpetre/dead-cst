@@ -287,6 +287,29 @@ Jupyter notebooks (`.ipynb`) are ingested too: code cells are concatenated in do
 - `__all__` is followed only when assigned a list/tuple of string literals; dynamic mutation (`__all__.append`, comprehensions, etc.) is not tracked.
 - PEP 572 walrus targets inside a comprehension (`[last := n for n in nums]`) don't surface as top-level decls and module-level uses of the name go unresolved. ty has a `// TODO walrus in comprehensions is implicitly nonlocal`, so the `last` binding stays scoped to the comprehension instead of leaking to the enclosing module per PEP 572 (see `tests/test_limitations.py::comprehension-walrus-doesnt-leak-to-enclosing-scope`).
 
+## Native plugins (experimental)
+
+Most extensions are [Python plugins](CONTRIBUTING.md#adding-a-plugin) — they
+ship in the wheel and need no toolchain. For hot logic, or plugins that want
+their own salsa-cached queries over ty's database, there's also a **native
+(Rust) plugin** path: a separately-compiled plugin that links the dead-cst
+runtime and runs against a live `ProjectContext`.
+
+```bash
+pip install dead-cst[build-plugin]          # pulls the prebuilt runtime
+PLUGIN=$(dead-cst build-plugin my_plugin.rs)  # compile against it
+```
+
+```python
+from dead_cst import Analysis, _native as native
+plugins = native.load_native_plugins(PLUGIN)
+Analysis(root, plugins=plugins).materialize_all()
+```
+
+This is a preview (macOS only today, recompile-per-release). See
+**[`NATIVE_PLUGINS.md`](NATIVE_PLUGINS.md)** for the full guide and the worked
+`examples/main_block_plugin/`.
+
 ## Development
 
 ```bash

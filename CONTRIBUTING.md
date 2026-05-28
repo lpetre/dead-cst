@@ -52,15 +52,19 @@ fixtures intentionally exercise untyped third-party internals.
 ## Project layout
 
 ```
-src/                  # ty-backed rust crate (pyo3, builds via maturin)
-  lib.rs              # pymodule entry point
-  project.rs          # Project / ProjectContext / build() pipeline
-  builder.rs          # GraphBuilder, AddNode / AddEdge / AddEntrypoint, BFS
-  graph.rs            # SymbolNode / Import / NativeGraph / NodeFlags / EdgeFlags
-  ingest.rs           # the three build phases (decls / chain / references)
-  query.rs            # plugin-facing chainable query builder
-  helpers.rs          # noqa parser, notebook decoder, dist-info lookup, …
-  io.rs               # write_graph / read_graph (bincode + versioned header)
+src/lib.rs            # thin pyo3 cdylib shim -> dead_cst._native (builds via maturin)
+runtime/              # dead-cst-runtime crate: the whole impl, built as rlib + dylib
+  src/lib.rs          # register() (the pymodule body) + top-level query() helper
+  src/project.rs      # Project / ProjectContext / build() pipeline
+  src/builder.rs      # GraphBuilder, AddNode / AddEdge / AddEntrypoint, BFS
+  src/graph.rs        # SymbolNode / Import / NativeGraph / NodeFlags / EdgeFlags
+  src/ingest.rs       # the three build phases (decls / chain / references)
+  src/query.rs        # plugin-facing chainable query builder
+  src/native_plugins.rs  # in-tree + external native plugins (plugin_api, ABI airlock)
+  src/helpers.rs      # noqa parser, notebook decoder, dist-info lookup, …
+  src/io.rs           # write_graph / read_graph (bincode + versioned header)
+examples/main_block_plugin/  # worked example external native plugin
+plugin-host/          # dead-cst-plugin-host package: the `[build-plugin]` extra payload
 python/dead_cst/      # Python source tree (ships alongside _native.so in the wheel)
   __init__.py         # public API: Analysis, SymbolNode, Import, NodeFlags, EdgeFlags
   analyze.py          # Analysis (wraps the rust ProjectContext for BFS queries)
@@ -127,6 +131,16 @@ entry-point group.
 `DispatchAppPlugin` plus a per-file `@shared_task` channel);
 `FastAPIPlugin` / `FlaskPlugin` are the factory-aware shape;
 `TyperPlugin` / `CycloptsPlugin` are the pure-dispatch shape.
+
+### Native plugins
+
+For hot logic — or plugins that want their own salsa-cached queries over ty's
+database — there's a Rust path: an external native plugin compiled against the
+runtime `dylib` and loaded via `native.load_native_plugins(...)`. It's a
+preview (macOS only) and a bigger commitment (a pinned Rust toolchain,
+recompile per release). See **[`NATIVE_PLUGINS.md`](NATIVE_PLUGINS.md)** and the
+worked **`examples/main_block_plugin/`**. Prefer a Python plugin unless you
+specifically need native speed or plugin-defined salsa queries.
 
 ## Adding a resolver
 
