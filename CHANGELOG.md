@@ -34,9 +34,12 @@ two versions.
   `_native`, with install names / rpaths rewritten to `@rpath` /
   `@loader_path` and ad-hoc re-signed) at `dead_cst/_plugin_host`, which
   `build-plugin` then auto-detects — so a plugin builds with no source
-  checkout. Note: today this is macOS-only and the bundle is large (the
-  full debug dep closure); shipping it as a `dead-cst[plugin-host]` wheel
-  (release-stripped, cross-platform) is the remaining packaging work.
+  checkout. The bundle skips the redundant `.rmeta` (the `.rlib` embed
+  metadata) and strips the dylibs: a `--release` bundle is ~350 MB on
+  disk / ~130 MB compressed (the rlib dep closure dominates), vs ~1.6 GB
+  for a debug build. Note: today this is macOS-only; shipping it as a
+  cross-platform `dead-cst[plugin-host]` wheel is the remaining packaging
+  work.
 - `Analysis.re_materialize(events)` — incrementally rebuild the
   project graph against the existing `native.ProjectContext`. The
   caller supplies the change events: typically

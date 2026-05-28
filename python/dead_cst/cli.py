@@ -834,7 +834,7 @@ def bundle_plugin_host(
     setup_logging(verbose)
     if sys.platform != "darwin":
         raise typer.BadParameter("bundle-plugin-host currently supports macOS only.")
-    for tool in ("cargo", "rustc", "install_name_tool", "codesign", "otool"):
+    for tool in ("cargo", "rustc", "install_name_tool", "codesign", "otool", "strip"):
         if shutil.which(tool) is None:
             raise typer.BadParameter(f"{tool} not found on PATH (need rust + Xcode CLT).")
 
@@ -867,14 +867,14 @@ def bundle_plugin_host(
     shutil.rmtree(bundle, ignore_errors=True)
     bundle.mkdir(parents=True)
 
-    # Copy the full dependency closure — rlib + rmeta + proc-macro dylibs (plus
-    # the runtime dylib and the dynamic _native, all under deps/). `rustc
-    # --extern` needs every one of dead_cst_runtime's dependency artifacts to
-    # load it; rmeta alone is not enough, and the proc-macro dylibs are
-    # required to validate the crate graph. Then add the toolchain libstd.
+    # Copy the dependency closure rustc needs to load dead_cst_runtime via
+    # --extern: the .rlib of every dep + the proc-macro dylibs (required to
+    # validate the crate graph) + the runtime dylib + the dynamic _native (all
+    # under deps/). The .rmeta are skipped — they're redundant with the .rlib
+    # (which embed metadata) and would nearly double the bundle. Then add libstd.
     n_files = 0
     for entry in deps_dir.iterdir():
-        if entry.is_file() and entry.suffix in {".rlib", ".rmeta", ".dylib"}:
+        if entry.is_file() and entry.suffix in {".rlib", ".dylib"}:
             shutil.copy2(entry, bundle / entry.name)
             n_files += 1
     shutil.copy2(libstd, bundle / libstd.name)
@@ -911,16 +911,10 @@ def bundle_plugin_host(
         if rpath in _rpaths(dylib):
             _imt("-delete_rpath", rpath, str(dylib))
 
-    def _adhoc_sign(target: Path) -> None:
-        # install_name_tool invalidates the signature; re-sign ad-hoc or dyld
-        # refuses to load the edited dylib on Apple Silicon.
-        subprocess.run(["codesign", "-s", "-", "-f", str(target)], check=True)
-
     # runtime: relocatable id + rpath to find its sibling libstd.
     _imt("-id", "@rpath/libdead_cst_runtime.dylib", str(runtime_bundled))
     _ensure_rpath(runtime_bundled, "@loader_path")
     _drop_rpath(runtime_bundled, str(std_lib))
-    _adhoc_sign(runtime_bundled)
 
     # dynamic _native: relocatable id; ref the runtime via @rpath; rpath into
     # _plugin_host/ for when it's installed one level up at
@@ -931,7 +925,13 @@ def bundle_plugin_host(
         _imt("-change", old_runtime_ref, "@rpath/libdead_cst_runtime.dylib", str(native_bundled))
     _ensure_rpath(native_bundled, "@loader_path/_plugin_host")
     _drop_rpath(native_bundled, str(std_lib))
-    _adhoc_sign(native_bundled)
+
+    # Strip local symbols, then ad-hoc re-sign every dylib. Both install_name_tool
+    # and strip invalidate the code signature; dyld (and rustc, loading the
+    # proc-macro dylibs) reject edited, unsigned dylibs on Apple Silicon.
+    for dylib in sorted(bundle.glob("*.dylib")):
+        subprocess.run(["strip", "-x", str(dylib)], check=True)
+        subprocess.run(["codesign", "-s", "-", "-f", str(dylib)], check=True)
 
     # libstd's id is already @rpath; its copy keeps its valid signature.
 
