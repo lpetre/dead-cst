@@ -50,7 +50,7 @@ use ty_python_semantic::SemanticModel;
 
 use crate::file_payload::{
     file_to_nodes, import_payload_for_pure as import_payload_for, ExternalKey, FileNodes,
-    ImportPayload, NodeKind, NodeRef,
+    ImportPayload, NodeData, NodeKind, NodeRef,
 };
 
 /// Outcome of resolving a `Name` use to its reaching definition.
@@ -359,19 +359,28 @@ impl<'a, 'db> RefWalker<'a, 'db> {
                 }
             }
             if saw_binding {
-                // Sibling submodule imports (`import a.foo` then
-                // `import a.bar`) all rebind the same root name, so the
-                // flow-sensitive `bindings_at_use` above attributes the
-                // use to the *last* rebind only. But `a.foo.x()` depends
-                // specifically on the `import a.foo` statement —
-                // importing `a.bar` does not make the `a.foo` submodule
-                // available. Walk the scope-wide reachable bindings and
-                // add an alias edge to every plain `import <root>.<seg…>`
-                // whose submodule suffix is a prefix of the access chain,
-                // so each such import keeps its in-edge (codemod
-                // invariant). Gated on a non-empty chain: a bare use of
-                // the root name genuinely is last-write-wins.
-                if !extra_chain.is_empty() {
+                // Supplement the flow-sensitive resolution with
+                // scope-wide reachable bindings in the two situations
+                // ty's last-write-wins / TYPE_CHECKING-narrowed view
+                // drops a binding the runtime still depends on:
+                //
+                // * Sibling submodule imports (`import a.foo` then
+                //   `import a.bar`) rebind the same root name, so
+                //   `a.foo.x()` resolves only to the last rebind even
+                //   though it needs the `import a.foo` statement
+                //   (importing `a.bar` doesn't import the `a.foo`
+                //   submodule). Keep any plain `import <root>.<seg…>`
+                //   whose submodule suffix is a prefix of the chain.
+                // * `if TYPE_CHECKING: …` narrows to `True`, so the
+                //   resolved binding is the type-checking-only one and
+                //   the branch that runs at runtime (`else:` or a later
+                //   rebind) is dropped. Keep every reachable binding
+                //   *outside* a `TYPE_CHECKING` block.
+                //
+                // Each criterion is gated (chain present / resolved in a
+                // TYPE_CHECKING block), so plain straight-line rebinds
+                // keep their last-write-wins resolution.
+                if !extra_chain.is_empty() || resolved_in_tc {
                     let root = name.id.as_str();
                     for binding in use_def_map.reachable_symbol_bindings(symbol_id) {
                         let Some(def) = binding.binding.definition() else {
@@ -384,64 +393,21 @@ impl<'a, 'db> RefWalker<'a, 'db> {
                         let Some(&idx) = self.self_nodes.ref_to_local.get(&candidate) else {
                             continue;
                         };
-                        let node = &self.self_nodes.nodes[idx as usize];
-                        if !matches!(node.kind, NodeKind::Import) {
-                            continue;
-                        }
-                        let Some(spec) = node.imports.as_ref() else {
-                            continue;
-                        };
-                        if spec.star || spec.decl.is_some() {
-                            continue;
-                        }
-                        // Plain `import root.seg1.seg2` (no `as`): the
-                        // bound name equals the module's first segment.
-                        let mut segs = spec.module.split('.');
-                        if segs.next() != Some(root) {
-                            continue;
-                        }
-                        let suffix: Vec<&str> = segs.collect();
-                        if suffix.is_empty() || suffix.len() > extra_chain.len() {
-                            continue;
-                        }
-                        if suffix.iter().zip(extra_chain).all(|(s, c)| s == c)
-                            && !results
-                                .iter()
-                                .any(|r| matches!(r, Resolution::Alias(d) if *d == candidate))
-                        {
-                            results.push(Resolution::Alias(candidate));
-                        }
-                    }
-                }
-                // `if TYPE_CHECKING: from a import X` / `else: from b
-                // import X` (or `else: X = …`): ty narrows
-                // `TYPE_CHECKING` to `True`, so the flow-resolved
-                // binding above is the type-checking-only one and the
-                // binding that actually runs has been narrowed away.
-                // Recover every reachable binding *outside* a
-                // `TYPE_CHECKING` block so the codemod keeps whatever
-                // runs at runtime. Gated on `resolved_in_tc`, so plain
-                // straight-line rebinds (no TYPE_CHECKING guard) keep
-                // their last-write-wins resolution.
-                if resolved_in_tc {
-                    for binding in use_def_map.reachable_symbol_bindings(symbol_id) {
-                        let Some(def) = binding.binding.definition() else {
-                            continue;
-                        };
-                        if def.file(db) != self.file {
-                            continue;
-                        }
-                        if self.range_in_tc_block(def.full_range(db, self.parsed).range()) {
-                            continue;
-                        }
-                        let candidate = NodeRef::Def(def);
-                        if !self.self_nodes.ref_to_local.contains_key(&candidate) {
-                            continue;
-                        }
-                        if !results
+                        if results
                             .iter()
                             .any(|r| matches!(r, Resolution::Alias(d) if *d == candidate))
                         {
+                            continue;
+                        }
+                        let recovers_runtime_binding = resolved_in_tc
+                            && !self.range_in_tc_block(def.full_range(db, self.parsed).range());
+                        let on_access_chain = !extra_chain.is_empty()
+                            && plain_import_matches_chain(
+                                &self.self_nodes.nodes[idx as usize],
+                                root,
+                                extra_chain,
+                            );
+                        if recovers_runtime_binding || on_access_chain {
                             results.push(Resolution::Alias(candidate));
                         }
                     }
@@ -1013,6 +979,32 @@ impl<'ast, 'db> Visitor<'ast> for RefWalker<'_, 'db> {
         }
         walk_stmt(self, stmt);
     }
+}
+
+/// True when `node` is a plain `import <root>.<seg…>` (no `as` alias,
+/// no `from`, no `*`) whose submodule segments after the root are a
+/// prefix of `extra_chain` — i.e. the access chain reaches into that
+/// submodule, so the importing statement must stay alive.
+fn plain_import_matches_chain(node: &NodeData, root: &str, extra_chain: &[&str]) -> bool {
+    if !matches!(node.kind, NodeKind::Import) {
+        return false;
+    }
+    let Some(spec) = node.imports.as_ref() else {
+        return false;
+    };
+    if spec.star || spec.decl.is_some() {
+        return false;
+    }
+    // Plain `import root.seg1.seg2` (no `as`): the bound name equals the
+    // module's first segment.
+    let mut segs = spec.module.split('.');
+    if segs.next() != Some(root) {
+        return false;
+    }
+    let suffix: Vec<&str> = segs.collect();
+    !suffix.is_empty()
+        && suffix.len() <= extra_chain.len()
+        && suffix.iter().zip(extra_chain).all(|(s, c)| s == c)
 }
 
 /// Walk every value-bearing AST node a Definition owns. Mirrors
