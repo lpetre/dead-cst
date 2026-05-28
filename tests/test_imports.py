@@ -945,6 +945,82 @@ def test_full_graph_edges(build_decl_graph, assert_edges, files, expected_edges)
             },
             id="sibling-submodule-imports-keep-both-aliases",
         ),
+        pytest.param(
+            # ``if TYPE_CHECKING: from a import X`` / ``else: from b
+            # import X``: ty narrows ``TYPE_CHECKING`` to ``True``, so its
+            # flow-sensitive use-def chain resolves a use of ``SomeClass``
+            # to the if-branch (type-checking) import only. At runtime the
+            # else branch is the one that executes, so both imports must
+            # keep an in-edge -- the resolver recovers the runtime binding
+            # from the reachable bindings outside the ``TYPE_CHECKING``
+            # block. Pinned positionally because both imports share the
+            # ``mod.SomeClass`` fqname.
+            {
+                "a.py": "class SomeClass: pass\n",
+                "b.py": "class SomeClass: pass\n",
+                "mod.py": (
+                    "from typing import TYPE_CHECKING\n"
+                    "if TYPE_CHECKING:\n"
+                    "    from a import SomeClass\n"
+                    "else:\n"
+                    "    from b import SomeClass\n"
+                    "SomeClass()\n"
+                ),
+            },
+            {
+                "a.SomeClass@1:0 -> a",
+                "b.SomeClass@1:0 -> b",
+                "mod -> a",
+                "mod -> a.SomeClass@1:0",
+                "mod -> b",
+                "mod -> b.SomeClass@1:0",
+                "mod -> mod.SomeClass@3:18",
+                "mod -> mod.SomeClass@5:18",
+                "mod -> mod.TYPE_CHECKING@1:19",
+                "mod.SomeClass@3:18 -> a",
+                "mod.SomeClass@3:18 -> a.SomeClass@1:0",
+                "mod.SomeClass@3:18 -> mod",
+                "mod.SomeClass@5:18 -> b",
+                "mod.SomeClass@5:18 -> b.SomeClass@1:0",
+                "mod.SomeClass@5:18 -> mod",
+                "mod.TYPE_CHECKING@1:19 -> mod",
+            },
+            id="type-checking-else-branch-keeps-runtime-import",
+        ),
+        pytest.param(
+            # Variant of the above where the runtime branch binds a
+            # plain value (`SomeClass = None`) rather than re-importing.
+            # The recovered runtime binding is a ``variable`` node, not
+            # an ``import`` -- the annotation use ``def f(x: SomeClass)``
+            # must edge to both the type-checking import (line 3) and the
+            # runtime variable (line 5), so neither is left looking dead.
+            {
+                "a.py": "class SomeClass: pass\n",
+                "mod.py": (
+                    "from typing import TYPE_CHECKING\n"
+                    "if TYPE_CHECKING:\n"
+                    "    from a import SomeClass\n"
+                    "else:\n"
+                    "    SomeClass = None\n"
+                    "def f(x: SomeClass): ...\n"
+                ),
+            },
+            {
+                "a.SomeClass@1:0 -> a",
+                "mod -> mod.TYPE_CHECKING@1:19",
+                "mod.SomeClass@3:18 -> a",
+                "mod.SomeClass@3:18 -> a.SomeClass@1:0",
+                "mod.SomeClass@3:18 -> mod",
+                "mod.SomeClass@5:4 -> mod",
+                "mod.TYPE_CHECKING@1:19 -> mod",
+                "mod.f@6:0 -> a",
+                "mod.f@6:0 -> a.SomeClass@1:0",
+                "mod.f@6:0 -> mod",
+                "mod.f@6:0 -> mod.SomeClass@3:18",
+                "mod.f@6:0 -> mod.SomeClass@5:4",
+            },
+            id="type-checking-else-assignment-keeps-runtime-binding",
+        ),
     ],
 )
 def test_full_graph_positional_edges(

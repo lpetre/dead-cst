@@ -81,6 +81,14 @@ SymbolNode- and idx-form terminals on the same query.
   keep `import a.foo` alive. A chained access now also resolves against
   the scope-wide reachable bindings and keeps every `import <root>.<…>`
   whose submodule suffix matches the access chain.
+- A binding introduced only under `if TYPE_CHECKING:` no longer hides
+  the runtime binding of the same name. ty narrows `TYPE_CHECKING` to
+  `True`, so its use-def chain resolves a use to the type-checking-only
+  binding and the branch that actually runs (`else: from b import X`,
+  `else: X = …`, or a later rebind) was left with zero in-edges. When
+  the flow-resolved binding falls inside a `TYPE_CHECKING` block, the
+  resolver now also keeps every reachable binding outside such blocks,
+  so the runtime import/decl survives.
 
 ## [0.13.0] - 2026-05-26
 

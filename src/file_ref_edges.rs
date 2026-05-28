@@ -68,7 +68,10 @@ enum Resolution<'db> {
         bound_name: String,
     },
 }
-use crate::helpers::{detect_dead_ranges, EDGE_FLAG_DEAD_BRANCH, EDGE_FLAG_DYNAMIC_IMPORT};
+use crate::helpers::{
+    detect_dead_ranges, detect_type_checking_ranges, EDGE_FLAG_DEAD_BRANCH,
+    EDGE_FLAG_DYNAMIC_IMPORT,
+};
 use crate::ingest::{
     collapse_attribute_chain, detect_dynamic_call, file_package_name, from_module_string,
     module_name_resolves, paired_unpack_rhs, parse_dynamic_args, resolve_dynamic_target,
@@ -103,6 +106,7 @@ pub(crate) fn file_to_ref_edges<'db>(db: &'db dyn ProjectDb, file: File) -> File
 
     let parsed = parsed_module(db, file).load(db);
     let dead_ranges = detect_dead_ranges(&parsed);
+    let tc_ranges = detect_type_checking_ranges(&parsed);
     let index = semantic_index(db, file);
     let global = FileScopeId::global();
     let use_def_map = index.use_def_map(global);
@@ -132,6 +136,7 @@ pub(crate) fn file_to_ref_edges<'db>(db: &'db dyn ProjectDb, file: File) -> File
             self_nodes,
             model: &model,
             dead_ranges: &dead_ranges,
+            tc_ranges: &tc_ranges,
             edges: &mut edges,
             warnings: &mut warnings,
             nested_context: false,
@@ -160,6 +165,7 @@ pub(crate) fn file_to_ref_edges<'db>(db: &'db dyn ProjectDb, file: File) -> File
             self_nodes,
             model: &model,
             dead_ranges: &dead_ranges,
+            tc_ranges: &tc_ranges,
             edges: &mut edges,
             warnings: &mut warnings,
             nested_context: false,
@@ -192,6 +198,12 @@ struct RefWalker<'a, 'db> {
     /// inside any of these get `EDGE_FLAG_DEAD_BRANCH` stamped on
     /// every edge they emit.
     dead_ranges: &'a [TextRange],
+    /// Statement ranges inside `if TYPE_CHECKING:` blocks. A use whose
+    /// flow-resolved binding falls inside one of these has had its
+    /// runtime binding narrowed away by ty (which treats
+    /// `TYPE_CHECKING` as `True`); `find_local_bindings` recovers it
+    /// from the scope-wide reachable bindings.
+    tc_ranges: &'a [TextRange],
     edges: &'a mut FxHashSet<(NodeRef<'db>, NodeRef<'db>, u32)>,
     /// Per-file warnings buffer. Workers push pure-rust strings; the
     /// driver flushes them to Python logging from the main thread.
@@ -248,6 +260,12 @@ impl<'a, 'db> RefWalker<'a, 'db> {
         self.emit_edge(NodeRef::External(key));
     }
 
+    /// True when `range` falls inside a recorded type-checking block
+    /// (see [`detect_type_checking_ranges`]).
+    fn range_in_tc_block(&self, range: TextRange) -> bool {
+        self.tc_ranges.iter().any(|tc| tc.contains_range(range))
+    }
+
     /// Resolve a `Name` use to the reaching local Definition(s) via
     /// ty's flow-sensitive use-def chain. Returns `NodeRef::Def` for
     /// each reaching def whose graph node lives in this file.
@@ -301,6 +319,11 @@ impl<'a, 'db> RefWalker<'a, 'db> {
                 use_def_map.end_of_scope_symbol_bindings(symbol_id)
             };
             let mut saw_binding = false;
+            // True when a flow-resolved binding lives inside an
+            // `if TYPE_CHECKING:` block. ty narrows `TYPE_CHECKING` to
+            // `True`, so in that case the *runtime* binding has been
+            // narrowed away — `find_local_bindings` recovers it below.
+            let mut resolved_in_tc = false;
             let mut results: Vec<Resolution<'db>> = Vec::new();
             for binding in bindings {
                 let Some(def) = binding.binding.definition() else {
@@ -310,6 +333,9 @@ impl<'a, 'db> RefWalker<'a, 'db> {
                     continue;
                 }
                 saw_binding = true;
+                if self.range_in_tc_block(def.full_range(db, self.parsed).range()) {
+                    resolved_in_tc = true;
+                }
                 let candidate = NodeRef::Def(def);
                 if self.self_nodes.ref_to_local.contains_key(&candidate) {
                     results.push(Resolution::Alias(candidate));
@@ -382,6 +408,39 @@ impl<'a, 'db> RefWalker<'a, 'db> {
                             && !results
                                 .iter()
                                 .any(|r| matches!(r, Resolution::Alias(d) if *d == candidate))
+                        {
+                            results.push(Resolution::Alias(candidate));
+                        }
+                    }
+                }
+                // `if TYPE_CHECKING: from a import X` / `else: from b
+                // import X` (or `else: X = …`): ty narrows
+                // `TYPE_CHECKING` to `True`, so the flow-resolved
+                // binding above is the type-checking-only one and the
+                // binding that actually runs has been narrowed away.
+                // Recover every reachable binding *outside* a
+                // `TYPE_CHECKING` block so the codemod keeps whatever
+                // runs at runtime. Gated on `resolved_in_tc`, so plain
+                // straight-line rebinds (no TYPE_CHECKING guard) keep
+                // their last-write-wins resolution.
+                if resolved_in_tc {
+                    for binding in use_def_map.reachable_symbol_bindings(symbol_id) {
+                        let Some(def) = binding.binding.definition() else {
+                            continue;
+                        };
+                        if def.file(db) != self.file {
+                            continue;
+                        }
+                        if self.range_in_tc_block(def.full_range(db, self.parsed).range()) {
+                            continue;
+                        }
+                        let candidate = NodeRef::Def(def);
+                        if !self.self_nodes.ref_to_local.contains_key(&candidate) {
+                            continue;
+                        }
+                        if !results
+                            .iter()
+                            .any(|r| matches!(r, Resolution::Alias(d) if *d == candidate))
                         {
                             results.push(Resolution::Alias(candidate));
                         }
