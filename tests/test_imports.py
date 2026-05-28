@@ -862,6 +862,39 @@ def test_imports(build_decl_graph, assert_edges, src, expected_extra_edges):
             },
             id="type-checking-import-used-only-in-string-annotation",
         ),
+        pytest.param(
+            # An assignment whose *target* is a subscript / slice
+            # (``os.environ["k"] = ...``, ``f[:] = ...``) binds no name,
+            # so ty mints no Definition for it. The module-level walk
+            # still has to visit the statement: the subscripted object
+            # on the LHS (``os``, ``f``) is a load, and every name on the
+            # RHS (``SomeClass``) is a use. All three keep their imports /
+            # decls alive (none is left with zero in-edges).
+            {
+                "a.py": "class SomeClass: pass\n",
+                "mod.py": (
+                    "import os\n"
+                    'os.environ["k"] = "v"\n'
+                    "from a import SomeClass\n"
+                    "f = []\n"
+                    "f[:] = [SomeClass()]\n"
+                ),
+            },
+            {
+                "a.SomeClass -> a",
+                "mod -> a",
+                "mod -> a.SomeClass",
+                "mod -> mod.SomeClass",
+                "mod -> mod.f",
+                "mod -> mod.os",
+                "mod.SomeClass -> a",
+                "mod.SomeClass -> a.SomeClass",
+                "mod.SomeClass -> mod",
+                "mod.f -> mod",
+                "mod.os -> mod",
+            },
+            id="subscript-assignment-target-emits-uses",
+        ),
     ],
 )
 def test_full_graph_edges(build_decl_graph, assert_edges, files, expected_edges):

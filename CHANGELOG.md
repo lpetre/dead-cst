@@ -64,6 +64,17 @@ one). This drops a layer of `Py<SymbolNode>` allocations on the hot
 path and removes the parallel-API confusion of having both
 SymbolNode- and idx-form terminals on the same query.
 
+### Fixed
+
+- Uses inside an assignment whose target is a subscript or slice
+  (`os.environ["k"] = v`, `f[:] = [SomeClass()]`) are no longer
+  dropped. Such a target binds no name, so ty mints no Definition and
+  the per-decl pass skips it; the module-level walk previously skipped
+  it too because the statement was classified as a definition. The
+  subscripted object on the left and every name on the right are now
+  walked, so the imports / decls they reference keep their in-edges
+  instead of looking dead.
+
 ## [0.13.0] - 2026-05-26
 
 ### Added

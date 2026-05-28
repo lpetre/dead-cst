@@ -55,43 +55,6 @@ def test_limitation(build_decl_graph, assert_edges, files, expected_edges):
     "files, expected_edges",
     [
         pytest.param(
-            # Uses inside an assignment whose *target* is a subscript /
-            # slice (``x[...] = ...``) are dropped entirely -- neither the
-            # subscripted object on the LHS nor any name on the RHS emits
-            # a use edge. Here ``os`` (loaded to build ``os.environ[...]``),
-            # ``f`` (loaded to build ``f[:]``), and ``SomeClass`` (called
-            # on the RHS) all end up with ZERO in-edges, so each looks
-            # dead and the codemod would happily delete ``import os``,
-            # ``from a import SomeClass``, and ``f = []`` -- breaking the
-            # module at runtime.
-            #
-            # Ideal: the use sites should add
-            #     "mod -> mod.os@1:7",          # os.environ[...] = ...
-            #     "mod -> mod.f@4:0",           # f[:] = ...
-            #     "mod -> mod.SomeClass@3:14",  # ... = [SomeClass()]
-            #     "mod -> a",
-            #     "mod -> a.SomeClass@1:0",
-            {
-                "a.py": "class SomeClass: pass\n",
-                "mod.py": (
-                    "import os\n"
-                    'os.environ["k"] = "v"\n'
-                    "from a import SomeClass\n"
-                    "f = []\n"
-                    "f[:] = [SomeClass()]\n"
-                ),
-            },
-            {
-                "a.SomeClass@1:0 -> a",
-                "mod.SomeClass@3:14 -> a",
-                "mod.SomeClass@3:14 -> a.SomeClass@1:0",
-                "mod.SomeClass@3:14 -> mod",
-                "mod.f@4:0 -> mod",
-                "mod.os@1:7 -> mod",
-            },
-            id="subscript-assignment-target-drops-uses",
-        ),
-        pytest.param(
             # Two sibling submodule imports that share the same root
             # binding (``import a.foo`` then ``import a.bar`` both bind the
             # local name ``a``). The use sites ``a.foo.x()`` and
