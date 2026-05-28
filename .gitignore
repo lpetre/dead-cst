@@ -212,3 +212,8 @@ __marimo__/
 
 # Claude Code worktrees (per-agent ephemeral)
 .claude/worktrees/
+
+# Plugin-host bundle + example plugin output (regenerable; see
+# `dead-cst bundle-plugin-host` / `dead-cst build-plugin`)
+python/dead_cst/_plugin_host/
+/libmain_block_plugin.dylib

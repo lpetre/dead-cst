@@ -28,10 +28,15 @@ two versions.
   target) differs from the running runtime's, cleanly and without
   crashing. Plugins implement
   `dead_cst_runtime::native_plugins::plugin_api::ExternalPlugin`; see
-  `examples/main_block_plugin/`. Note: the prebuilt-bundle distribution
-  (a `dead-cst[plugin-host]` wheel bundling the runtime dylib + dep
-  `.rmeta` + libstd, cross-platform) is not yet wired — today it builds
-  the runtime from a source checkout.
+  `examples/main_block_plugin/`. `dead-cst bundle-plugin-host` assembles
+  a *relocatable* plugin-host bundle (the runtime dylib + the dep
+  rlib/rmeta closure + proc-macro dylibs + libstd + the dynamic
+  `_native`, with install names / rpaths rewritten to `@rpath` /
+  `@loader_path` and ad-hoc re-signed) at `dead_cst/_plugin_host`, which
+  `build-plugin` then auto-detects — so a plugin builds with no source
+  checkout. Note: today this is macOS-only and the bundle is large (the
+  full debug dep closure); shipping it as a `dead-cst[plugin-host]` wheel
+  (release-stripped, cross-platform) is the remaining packaging work.
 - `Analysis.re_materialize(events)` — incrementally rebuild the
   project graph against the existing `native.ProjectContext`. The
   caller supplies the change events: typically
