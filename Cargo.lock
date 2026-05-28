@@ -352,6 +352,14 @@ dependencies = [
 name = "dead-cst-native"
 version = "0.13.0"
 dependencies = [
+ "dead-cst-runtime",
+ "pyo3",
+]
+
+[[package]]
+name = "dead-cst-runtime"
+version = "0.13.0"
+dependencies = [
  "bincode",
  "crossbeam-channel",
  "get-size2",

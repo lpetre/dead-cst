@@ -1,0 +1,41 @@
+[package]
+name = "dead-cst-runtime"
+version = "0.13.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "dead_cst_runtime"
+# rlib: the default `_native` cdylib links this statically (today's behavior,
+# self-contained wheel). dylib: the shared-runtime artifact that external
+# native plugins link against under an opt-in `-C prefer-dynamic` build.
+crate-type = ["rlib", "dylib"]
+
+[features]
+default = ["extension-module"]
+extension-module = ["pyo3/extension-module"]
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["abi3-py311", "multiple-pymethods"] }
+salsa = "0.26"
+ty_project = { path = "../vendor/ruff/crates/ty_project" }
+ty_python_core = { path = "../vendor/ruff/crates/ty_python_core" }
+ty_python_semantic = { path = "../vendor/ruff/crates/ty_python_semantic" }
+ty_module_resolver = { path = "../vendor/ruff/crates/ty_module_resolver" }
+ruff_db = { path = "../vendor/ruff/crates/ruff_db", features = ["os"] }
+ruff_python_ast = { path = "../vendor/ruff/crates/ruff_python_ast" }
+ruff_python_parser = { path = "../vendor/ruff/crates/ruff_python_parser" }
+ruff_source_file = { path = "../vendor/ruff/crates/ruff_source_file" }
+ruff_text_size = { path = "../vendor/ruff/crates/ruff_text_size" }
+ty_ide = { path = "../vendor/ruff/crates/ty_ide" }
+ruff_memory_usage = { path = "../vendor/ruff/crates/ruff_memory_usage" }
+get-size2 = { version = "0.8.0", features = ["smallvec"] }
+rustc-hash = "2.0"
+smallvec = { version = "1.13", features = ["union", "const_generics", "const_new"] }
+indicatif = "0.17"
+rayon = "1.10"
+crossbeam-channel = "0.5"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+bincode = "1.3"
+parking_lot = "0.12"
