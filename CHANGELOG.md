@@ -11,6 +11,22 @@ two versions.
 
 ### Added
 
+- **External native plugins (experimental).** The native crate is now
+  split into a `dead-cst-runtime` library (built as both `rlib` and
+  `dylib`) and a thin `dead-cst-native` cdylib shim. The default wheel
+  is unchanged — it statically links the `rlib`, so it stays
+  self-contained. A new opt-in *plugin-host* build (`-C prefer-dynamic`,
+  see `scripts/build-plugin-host.sh`) links the runtime `dylib`, which a
+  separately-compiled plugin cdylib can also link to share one salsa/ty
+  runtime. `native.load_native_plugins(path)` loads such a plugin
+  through an ABI airlock: it reads a self-contained `repr(C)` manifest
+  and rejects any plugin whose baked ABI fingerprint (rustc commit +
+  runtime version + target) differs from the running runtime's, cleanly
+  and without crashing. Plugins implement
+  `dead_cst_runtime::native_plugins::plugin_api::ExternalPlugin`; see
+  `examples/main_block_plugin/`. Note: this is a source/dev build today
+  — distributing a plugin-host wheel (bundling the runtime dylib +
+  libstd cross-platform) is not yet wired.
 - `Analysis.re_materialize(events)` — incrementally rebuild the
   project graph against the existing `native.ProjectContext`. The
   caller supplies the change events: typically

@@ -42,7 +42,9 @@
 //! ``Analysis(plugins=[...])`` and inside the harness's
 //! :class:`ThreadPoolExecutor` fan-out.
 
+use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use pyo3::prelude::*;
 use ruff_db::files::File;
@@ -241,6 +243,16 @@ pub(crate) enum NativePluginKind {
     #[allow(dead_code)]
     ProjectWide(Box<dyn NativePluginImpl>),
     PerFile(PerFilePluginKind),
+    /// External native plugin loaded from a dylib through the ABI airlock
+    /// (see [`load_native_plugins`]). Holds the boxed trait object and a
+    /// refcount on the loaded library so its code stays mapped for the
+    /// plugin's lifetime. Only meaningful in a `-C prefer-dynamic` build
+    /// where the extension and the plugin share one `dead-cst-runtime`.
+    External {
+        name: String,
+        plugin: Box<dyn plugin_api::ExternalPlugin>,
+        _lib: Arc<libloading::Library>,
+    },
 }
 
 /// Python-visible wrapper for a native plugin (project-wide or
@@ -262,10 +274,11 @@ impl NativePlugin {
     /// and ``progress_callback`` events look the same whether a
     /// native or Python instance is registered.
     #[getter]
-    fn name(&self) -> &'static str {
+    fn name(&self) -> String {
         match &self.kind {
-            NativePluginKind::ProjectWide(inner) => inner.name(),
-            NativePluginKind::PerFile(kind) => kind.name(),
+            NativePluginKind::ProjectWide(inner) => inner.name().to_string(),
+            NativePluginKind::PerFile(kind) => kind.name().to_string(),
+            NativePluginKind::External { name, .. } => name.clone(),
         }
     }
 
@@ -345,5 +358,180 @@ impl PerFileNativePluginImpl for MainBlockPluginImpl {
             flags: NodeFlags::ENTRYPOINT,
             edges_to_local_idx,
         });
+    }
+}
+
+// ===========================================================================
+// External (dylib) native plugins
+//
+// An external native plugin is compiled in a *separate* crate that links the
+// `dead-cst-runtime` *dylib* (under `-C prefer-dynamic`), so the plugin and
+// the extension module share one runtime — one salsa db, one set of types.
+// The plugin ships as a cdylib exporting a C-ABI manifest; the host loads it
+// through an airlock that gates on an ABI fingerprint before touching any
+// version-hashed runtime symbol.
+//
+// This is the sound version of an out-of-tree native plugin: it gives full
+// rust-type fidelity (the plugin runs against a real `ProjectContext`) at
+// the cost of recompiling against each runtime release — enforced by the
+// fingerprint gate, which rejects a stale `.so` cleanly rather than crashing.
+// ===========================================================================
+
+/// The curated public API an external plugin crate compiles against. Kept
+/// deliberately small: a plugin sees a restricted [`PluginCtx`] view of the
+/// frozen graph and emits ops through [`PluginOps`] — it never touches the
+/// internal `PreparedOp` / `ProjectContext` types directly, so the surface
+/// an out-of-tree author depends on stays narrow.
+pub mod plugin_api {
+    use crate::builder::PreparedOp;
+    use crate::project::ProjectContext;
+
+    /// Contract an external native plugin implements. The host calls
+    /// [`run`](ExternalPlugin::run) once per materialize against the frozen
+    /// graph, then folds the emitted ops in as a single batch.
+    pub trait ExternalPlugin: Send + Sync {
+        /// Human-readable name (surfaced in progress logs).
+        fn name(&self) -> &str;
+        /// Inspect `ctx` and append ops to `ops`. Same frozen-graph
+        /// contract as the in-tree native path.
+        fn run(&self, ctx: &PluginCtx<'_>, ops: &mut PluginOps);
+    }
+
+    /// Restricted, mostly-stable view of the frozen graph for external
+    /// plugins. Wraps the internal `ProjectContext`; exposes only the
+    /// index-based queries a plugin needs.
+    pub struct PluginCtx<'a> {
+        inner: &'a ProjectContext,
+    }
+
+    impl<'a> PluginCtx<'a> {
+        pub(crate) fn new(inner: &'a ProjectContext) -> Self {
+            Self { inner }
+        }
+
+        /// Each top-level `if __name__ == "__main__":` block as
+        /// `(module_node_idx, [decl_node_idx, ...])`.
+        pub fn main_blocks(&self) -> Vec<(usize, Vec<usize>)> {
+            self.inner.find_main_blocks_indices().unwrap_or_default()
+        }
+    }
+
+    /// Op sink for external plugins. Wraps the internal `PreparedOp` vec so
+    /// plugins emit through named methods instead of constructing internals.
+    pub struct PluginOps {
+        sink: Vec<PreparedOp>,
+    }
+
+    impl PluginOps {
+        pub(crate) fn new() -> Self {
+            Self { sink: Vec::new() }
+        }
+
+        pub(crate) fn into_inner(self) -> Vec<PreparedOp> {
+            self.sink
+        }
+
+        /// Keep `decl_idx` reachable via a synthetic entrypoint named
+        /// `marker`. Mirrors the in-tree `AddEntrypointByIdx` graph op.
+        pub fn keep_alive(&mut self, decl_idx: usize, marker: String) {
+            self.sink
+                .push(PreparedOp::EntrypointByIdx { decl_idx, marker });
+        }
+    }
+}
+
+/// ABI fingerprint this runtime accepts (see `build.rs`). An external plugin
+/// bakes this exact string at compile time; the airlock rejects any plugin
+/// whose baked fingerprint differs.
+pub const PLUGIN_ABI_FINGERPRINT: &str = env!("RUNTIME_ABI_FINGERPRINT");
+
+/// Magic number prefixing a valid plugin manifest.
+pub const PLUGIN_MANIFEST_MAGIC: u64 = 0xDEAD_C570_0001;
+
+/// One entry per plugin a dylib provides (N per dylib).
+#[repr(C)]
+pub struct PluginDesc {
+    pub name: *const u8,
+    pub name_len: usize,
+    /// Constructs the plugin; returns `*mut Box<dyn ExternalPlugin>`.
+    pub make: extern "C" fn() -> *mut c_void,
+}
+
+/// The self-contained airlock surface a plugin exposes via the
+/// `_dead_cst_plugin_manifest_v1` symbol. Built from plain data + inlined
+/// consts only — never a hashed runtime call — so even an ABI-incompatible
+/// plugin can expose it for inspection before any version-hashed symbol is
+/// touched.
+#[repr(C)]
+pub struct PluginManifest {
+    pub magic: u64,
+    pub abi_fingerprint: *const u8,
+    pub abi_fingerprint_len: usize,
+    pub plugins: *const PluginDesc,
+    pub plugins_len: usize,
+}
+
+/// Load external native plugins from a dylib at `path` through the ABI
+/// airlock. Returns one [`NativePlugin`] per plugin the dylib provides; each
+/// is drop-in usable in ``Analysis(plugins=[...])`` alongside in-tree
+/// plugins. Raises (clean rejection) on a missing manifest, bad magic, or an
+/// ABI-fingerprint mismatch — never crashes the host.
+#[pyfunction]
+pub(crate) fn load_native_plugins(path: String) -> PyResult<Vec<NativePlugin>> {
+    let err = pyo3::exceptions::PyRuntimeError::new_err::<String>;
+    // SAFETY: libloading opens with RTLD_LAZY | RTLD_LOCAL, so unresolved
+    // hashed symbols don't fault the load; we read the self-contained
+    // manifest and gate on the fingerprint before calling any plugin code.
+    unsafe {
+        let lib =
+            libloading::Library::new(&path).map_err(|e| err(format!("dlopen {path}: {e}")))?;
+
+        let manifest_fn: libloading::Symbol<extern "C" fn() -> *const PluginManifest> =
+            lib.get(b"_dead_cst_plugin_manifest_v1\0").map_err(|_| {
+                err(format!(
+                    "{path}: not a dead-cst plugin (no _dead_cst_plugin_manifest_v1) \
+                     — or built before the manifest ABI; rebuild against this release"
+                ))
+            })?;
+        let m = &*manifest_fn();
+        if m.magic != PLUGIN_MANIFEST_MAGIC {
+            return Err(err(format!(
+                "{path}: bad manifest magic 0x{:x} (expected 0x{:x})",
+                m.magic, PLUGIN_MANIFEST_MAGIC
+            )));
+        }
+        let fp = std::str::from_utf8(std::slice::from_raw_parts(
+            m.abi_fingerprint,
+            m.abi_fingerprint_len,
+        ))
+        .unwrap_or("<invalid utf8>");
+        if fp != PLUGIN_ABI_FINGERPRINT {
+            return Err(err(format!(
+                "{path}: ABI mismatch — plugin built against '{fp}', this runtime is \
+                 '{PLUGIN_ABI_FINGERPRINT}'. Rebuild the plugin against this release."
+            )));
+        }
+
+        // Accepted: instantiate each plugin. Hold a refcount on the library
+        // so its code stays mapped for the plugins' lifetime.
+        let lib = Arc::new(lib);
+        let descs = std::slice::from_raw_parts(m.plugins, m.plugins_len);
+        let mut out = Vec::with_capacity(descs.len());
+        for d in descs {
+            let name = std::str::from_utf8(std::slice::from_raw_parts(d.name, d.name_len))
+                .unwrap_or("<?>")
+                .to_string();
+            let raw = (d.make)();
+            let plugin_box: Box<Box<dyn plugin_api::ExternalPlugin>> =
+                Box::from_raw(raw as *mut Box<dyn plugin_api::ExternalPlugin>);
+            out.push(NativePlugin {
+                kind: NativePluginKind::External {
+                    name,
+                    plugin: *plugin_box,
+                    _lib: Arc::clone(&lib),
+                },
+            });
+        }
+        Ok(out)
     }
 }

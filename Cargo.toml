@@ -1,3 +1,11 @@
+[workspace]
+members = ["runtime", "examples/main_block_plugin"]
+# Bare `cargo build` / maturin builds only the extension; the example plugin
+# is built explicitly by scripts/build-plugin-host.sh.
+default-members = ["."]
+# The vendored ruff tree is its own workspace; don't let ours absorb it.
+exclude = ["vendor"]
+
 [package]
 name = "dead-cst-native"
 version = "0.13.0"

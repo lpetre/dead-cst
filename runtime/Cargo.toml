@@ -18,6 +18,7 @@ extension-module = ["pyo3/extension-module"]
 [dependencies]
 pyo3 = { version = "0.22", features = ["abi3-py311", "multiple-pymethods"] }
 salsa = "0.26"
+libloading = "0.8"
 ty_project = { path = "../vendor/ruff/crates/ty_project" }
 ty_python_core = { path = "../vendor/ruff/crates/ty_python_core" }
 ty_python_semantic = { path = "../vendor/ruff/crates/ty_python_semantic" }
