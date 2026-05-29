@@ -89,11 +89,48 @@ impl ExternalPlugin for KeepMainBlocksAlive {
 }
 ```
 
-`PluginCtx` deliberately exposes a small, stable surface (e.g. `main_blocks()`)
+`PluginCtx` deliberately exposes a small, stable, **index-based** surface
 rather than the whole internal `ProjectContext`, and `PluginOps` emits through
-named methods (`keep_alive(...)`) instead of internal op types. The contract is
-the same frozen-graph one as Python plugins: the plugin observes the base graph
-only; its emissions are applied in a single batch after every plugin returns.
+named methods instead of internal op types. The contract is the same
+frozen-graph one as Python plugins: the plugin observes the base graph only;
+its emissions are applied in a single batch after every plugin returns. No
+`Python<'_>` token is ever exposed — `PluginCtx` reads `#[pyclass(frozen)]`
+data directly.
+
+### The `PluginCtx` / `PluginOps` surface
+
+Every query returns positional **indices** into the frozen node list — the
+same index space `PluginOps` emits against. `ctx.node(idx)` turns an index
+into an owned `NodeView { idx, fqname, kind, path, start_line, end_line,
+flags }`.
+
+`PluginCtx<'_>` — read the frozen graph:
+
+| method | returns | what |
+|---|---|---|
+| `node_count()` | `usize` | number of nodes; valid indices are `0..node_count()` |
+| `node(idx)` | `Option<NodeView>` | owned snapshot of one node |
+| `find_module(fqname)` | `Option<usize>` | module node by dotted fqname |
+| `find_declarations(fqname)` | `Vec<usize>` | every decl with this fqname (>1 when shadowed) |
+| `module_for(path)` | `Option<usize>` | module node by source path |
+| `resolve(fqname)` | `Option<usize>` | decl-or-module, walking back dotted segments |
+| `decls_under(path_prefix)` | `Vec<usize>` | every node under a path prefix |
+| `find_subclasses_of(class_idx)` | `Vec<usize>` | transitive subclasses |
+| `descendants(root_idx)` | `Vec<usize>` | forward reachability closure |
+| `ancestors(decl_idx)` | `Vec<usize>` | reverse reachability closure |
+| `direct_predecessors(idx)` | `Vec<usize>` | one-hop reverse step |
+| `main_blocks()` | `Vec<(usize, Vec<usize>)>` | each `if __name__` block as `(module, [decls])` |
+
+`PluginOps` — emit ops (mirrors the three Python graph ops):
+
+| method | mirrors | what |
+|---|---|---|
+| `keep_alive(decl_idx, marker)` | `AddEntrypointByIdx` | make a node a reachability seed |
+| `add_edge(src_idx, dst_idx)` | `AddEdgeByIdx` | add `src -> dst` between existing nodes |
+| `add_synthetic_node(fqname, flags, edges_to_idx)` | `AddNodeByIdx` | mint a `synthetic` node with out-edges; set `flags = plugin_api::FLAG_ENTRYPOINT` to make it a seed |
+
+Endpoint indices are bounds-checked by the host at apply time — a dangling
+index is rejected cleanly rather than minting an unconnected node.
 
 Each plugin `cdylib` also exports a **manifest** — a self-contained
 `#[repr(C)]` table listing the plugins it provides and the ABI fingerprint it

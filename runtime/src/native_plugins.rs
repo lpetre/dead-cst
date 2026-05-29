@@ -382,9 +382,24 @@ impl PerFileNativePluginImpl for MainBlockPluginImpl {
 /// frozen graph and emits ops through [`PluginOps`] — it never touches the
 /// internal `PreparedOp` / `ProjectContext` types directly, so the surface
 /// an out-of-tree author depends on stays narrow.
+///
+/// The view is **index-based**: every query returns positional indices into
+/// the frozen node list (the same index space [`PluginOps`] emits against),
+/// and [`PluginCtx::node`] turns an index into an owned [`NodeView`]. No
+/// `Python<'_>` token is ever exposed — the methods read `#[pyclass(frozen)]`
+/// data directly and acquire the GIL internally only where the underlying
+/// query needs it.
 pub mod plugin_api {
+    use pyo3::Python;
+
     use crate::builder::PreparedOp;
+    use crate::graph::{intern_kind, NodeFlags};
     use crate::project::ProjectContext;
+
+    /// `NodeFlags::ENTRYPOINT` re-exported for plugin authors: set it on a
+    /// node minted via [`PluginOps::add_synthetic_node`] to make that node a
+    /// reachability seed. Single source of truth — tracks the internal bit.
+    pub const FLAG_ENTRYPOINT: u32 = NodeFlags::ENTRYPOINT;
 
     /// Contract an external native plugin implements. The host calls
     /// [`run`](ExternalPlugin::run) once per materialize against the frozen
@@ -395,6 +410,28 @@ pub mod plugin_api {
         /// Inspect `ctx` and append ops to `ops`. Same frozen-graph
         /// contract as the in-tree native path.
         fn run(&self, ctx: &PluginCtx<'_>, ops: &mut PluginOps);
+    }
+
+    /// Owned, plain-data snapshot of one graph node, returned by
+    /// [`PluginCtx::node`]. Decoupled from the internal `SymbolNode`
+    /// pyclass so the author-facing shape stays stable across releases.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct NodeView {
+        /// Positional index of this node in the frozen graph.
+        pub idx: usize,
+        /// Fully-qualified name (e.g. `pkg.mod.func`).
+        pub fqname: String,
+        /// One of `function`, `class`, `variable`, `import`, `type_alias`,
+        /// `module`, `synthetic`.
+        pub kind: String,
+        /// Source path the node was declared in (empty for synthetics).
+        pub path: String,
+        /// 1-based start line, or 0 for synthetic nodes.
+        pub start_line: usize,
+        /// 1-based end line, or 0 for synthetic nodes.
+        pub end_line: usize,
+        /// `NodeFlags` bitset (see [`FLAG_ENTRYPOINT`]).
+        pub flags: u32,
     }
 
     /// Restricted, mostly-stable view of the frozen graph for external
@@ -409,6 +446,101 @@ pub mod plugin_api {
             Self { inner }
         }
 
+        // --- node reads -----------------------------------------------------
+
+        /// Total number of nodes in the frozen graph. Indices in
+        /// `0..node_count()` are valid arguments to [`Self::node`].
+        pub fn node_count(&self) -> usize {
+            self.inner
+                .materialized("plugin")
+                .map(|o| o.builder.nodes.len())
+                .unwrap_or(0)
+        }
+
+        /// Resolve an index to an owned [`NodeView`], or `None` if out of
+        /// range. Reads frozen pyclass data directly — no GIL, no clone of
+        /// the underlying `SymbolNode`.
+        pub fn node(&self, idx: usize) -> Option<NodeView> {
+            let outputs = self.inner.materialized("plugin").ok()?;
+            let node = outputs.builder.nodes.get(idx)?.get();
+            Some(NodeView {
+                idx,
+                fqname: node.fqname.clone(),
+                kind: node.kind.to_string(),
+                path: node.path.clone(),
+                start_line: node.start_line,
+                end_line: node.end_line,
+                flags: node.flags,
+            })
+        }
+
+        // --- structural lookups (index-returning, GIL-free) -----------------
+
+        /// O(1) module-node lookup by dotted fqname.
+        pub fn find_module(&self, fqname: &str) -> Option<usize> {
+            self.inner.find_module_idx(fqname).unwrap_or(None)
+        }
+
+        /// Every declaration node with this exact fqname (more than one
+        /// when a name is shadowed; see the graph-model invariants).
+        pub fn find_declarations(&self, fqname: &str) -> Vec<usize> {
+            self.inner
+                .find_declarations_indices(fqname)
+                .unwrap_or_default()
+        }
+
+        /// O(1) module-node lookup by source path.
+        pub fn module_for(&self, path: &str) -> Option<usize> {
+            self.inner.module_for_indices(path).unwrap_or(None)
+        }
+
+        /// Resolve a dotted fqname to a decl or module node, walking back
+        /// through dotted segments for method/attribute fqnames. `None`
+        /// when nothing matches.
+        pub fn resolve(&self, fqname: &str) -> Option<usize> {
+            self.inner.resolve_idx(fqname).unwrap_or(None)
+        }
+
+        /// Every node whose source path starts with `path_prefix` — a
+        /// cheap way to scope a plugin to one package/directory.
+        pub fn decls_under(&self, path_prefix: &str) -> Vec<usize> {
+            Python::with_gil(|py| self.inner.decls_under_indices(py, path_prefix))
+                .unwrap_or_default()
+        }
+
+        /// Transitive subclasses of the class at `class_idx` (empty when
+        /// `class_idx` isn't a class node).
+        pub fn find_subclasses_of(&self, class_idx: usize) -> Vec<usize> {
+            Python::with_gil(|py| self.inner.find_subclasses_of_idx(py, class_idx))
+                .unwrap_or_default()
+        }
+
+        // --- reachability ---------------------------------------------------
+
+        /// Forward closure: every node reachable from `root_idx` by
+        /// following graph edges (dead-branch edges included, matching the
+        /// default traversal).
+        pub fn descendants(&self, root_idx: usize) -> Vec<usize> {
+            self.inner
+                .descendants_indices(root_idx, 0)
+                .unwrap_or_default()
+        }
+
+        /// Reverse closure: every node that can reach `decl_idx`.
+        pub fn ancestors(&self, decl_idx: usize) -> Vec<usize> {
+            self.inner
+                .ancestors_indices(decl_idx, 0)
+                .unwrap_or_default()
+        }
+
+        /// One-hop reverse step: every node with an edge directly into
+        /// `idx`.
+        pub fn direct_predecessors(&self, idx: usize) -> Vec<usize> {
+            self.inner
+                .direct_predecessors_idx(idx, 0)
+                .unwrap_or_default()
+        }
+
         /// Each top-level `if __name__ == "__main__":` block as
         /// `(module_node_idx, [decl_node_idx, ...])`.
         pub fn main_blocks(&self) -> Vec<(usize, Vec<usize>)> {
@@ -418,6 +550,8 @@ pub mod plugin_api {
 
     /// Op sink for external plugins. Wraps the internal `PreparedOp` vec so
     /// plugins emit through named methods instead of constructing internals.
+    /// Mirrors the three Python graph ops a plugin can yield —
+    /// `AddEntrypointByIdx` / `AddEdgeByIdx` / `AddNodeByIdx`.
     pub struct PluginOps {
         sink: Vec<PreparedOp>,
     }
@@ -436,6 +570,32 @@ pub mod plugin_api {
         pub fn keep_alive(&mut self, decl_idx: usize, marker: String) {
             self.sink
                 .push(PreparedOp::EntrypointByIdx { decl_idx, marker });
+        }
+
+        /// Add a reachability edge `src_idx -> dst_idx` between two
+        /// existing nodes. Mirrors `AddEdgeByIdx`.
+        pub fn add_edge(&mut self, src_idx: usize, dst_idx: usize) {
+            self.sink.push(PreparedOp::EdgeByIdx {
+                src_idx,
+                dst_idx,
+                flags: 0,
+            });
+        }
+
+        /// Mint a new `kind="synthetic"` node named `fqname` with `flags`
+        /// (see [`FLAG_ENTRYPOINT`]) and an out-edge to each index in
+        /// `edges_to_idx`. Mirrors `AddNodeByIdx`; the host bounds-checks
+        /// every endpoint at apply time and rejects a dangling index
+        /// rather than minting an unconnected node.
+        pub fn add_synthetic_node(&mut self, fqname: String, flags: u32, edges_to_idx: Vec<usize>) {
+            self.sink.push(PreparedOp::NodeByIdx {
+                fqname,
+                kind: intern_kind("synthetic").expect("'synthetic' is a valid kind"),
+                path: String::new(),
+                flags,
+                edges_from_idx: Vec::new(),
+                edges_to_idx,
+            });
         }
     }
 }

@@ -46,6 +46,22 @@ two versions.
   Note: today the separate package is built locally; producing the
   cross-platform `dead-cst-plugin-host` wheels in CI is the remaining
   packaging work.
+- **Fleshed-out external native plugin API.** The curated
+  `dead_cst_runtime::native_plugins::plugin_api` an external plugin
+  compiles against grew from a single `PluginCtx::main_blocks()` /
+  `PluginOps::keep_alive(...)` pair into a usable index-based surface.
+  `PluginCtx` now also exposes `node(idx)` (returning an owned
+  `NodeView`), `node_count()`, the structural lookups `find_module`,
+  `find_declarations`, `module_for`, `resolve`, `decls_under`,
+  `find_subclasses_of`, and the reachability walks `descendants`,
+  `ancestors`, `direct_predecessors`. `PluginOps` gained `add_edge(...)`
+  and `add_synthetic_node(...)` alongside `keep_alive(...)` — the three
+  mirror the Python `AddEntrypointByIdx` / `AddEdgeByIdx` /
+  `AddNodeByIdx` graph ops — plus a `FLAG_ENTRYPOINT` constant. Every
+  query is index-based and GIL-free; no `Python<'_>` token is exposed.
+  External native plugins remain **project-wide** (one `run(ctx)` over
+  the whole frozen graph); the salsa-cached *per-file* native plugin
+  path stays in-tree only for now.
 - `Analysis.re_materialize(events)` — incrementally rebuild the
   project graph against the existing `native.ProjectContext`. The
   caller supplies the change events: typically
