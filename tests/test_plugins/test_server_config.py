@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dead_cst import _native as native
 from dead_cst.graph import NodeFlags
 from dead_cst.contrib import ServerConfigPlugin
 
@@ -150,7 +151,32 @@ def test_server_config_plugin_loads_via_cli_loader():
     from dead_cst.cli import _load_plugin
 
     plugin = _load_plugin("server_config")
-    assert isinstance(plugin, ServerConfigPlugin)
+    assert isinstance(plugin, native.NativePlugin)
+    assert plugin.name == "ServerConfigPlugin"
+
+
+def test_native_server_config_matches_python_plugin(build_plugin_graph, reachable_fqnames):
+    """``NativePlugin.server_config()`` produces the same reachable set
+    as the default-filename ``ServerConfigPlugin()``."""
+    files = {
+        "pkg/__init__.py": "",
+        "gunicorn.conf.py": """
+        import os
+
+        bind = "0.0.0.0:8000"
+        workers = 4
+
+        class CustomLogger: pass
+
+        def on_starting(server):
+            pass
+        """,
+        "hypercorn_conf.py": "loglevel = 'info'",
+        "regular.py": "def untouched(): pass",
+    }
+    py_ctx = build_plugin_graph(files, [ServerConfigPlugin()])
+    rs_ctx = build_plugin_graph(files, [native.NativePlugin.server_config()])
+    assert reachable_fqnames(py_ctx) == reachable_fqnames(rs_ctx)
 
 
 def test_seeds_are_not_tagged_testcase(build_plugin_graph):

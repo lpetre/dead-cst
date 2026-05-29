@@ -197,3 +197,49 @@ def test_per_file_main_block_cache_invalidates_on_edit(tmp_path):
     ctx2 = analysis.re_materialize(analysis.materialize_all().detect_changes())
     assert native._main_block_run_count() >= 1  # a.py re-ran
     assert not any(n.fqname == "<__main__>:pkg.a" for n in ctx2.nodes())
+
+
+# ---------------------------------------------------------------------------
+# Project-wide native ports (module_dunders, init_subclass) + the registry.
+# These pin parity with the Python equivalents and the name -> native lookup
+# the CLI resolves through. (The Python plugins are removed in a follow-up;
+# their behavioural tests move to the native versions then.)
+# ---------------------------------------------------------------------------
+
+
+def test_native_module_dunders_matches_python(build_plugin_graph, reachable_fqnames):
+    from dead_cst.plugins import ModuleDundersPlugin
+
+    files = {
+        "pkg/__init__.py": "__all__ = ['x']\nx = 1\n__version__ = '1'\n",
+        "pkg/m.py": "from __future__ import annotations\ndef f(): pass\n",
+    }
+    py = build_plugin_graph(files, [ModuleDundersPlugin()])
+    rs = build_plugin_graph(files, [native.NativePlugin.module_dunders()])
+    assert reachable_fqnames(py) == reachable_fqnames(rs)
+
+
+def test_native_init_subclass_matches_python(build_plugin_graph, reachable_fqnames):
+    from dead_cst.plugins import InitSubclassPlugin
+
+    files = {
+        "pkg/__init__.py": "",
+        "pkg/m.py": (
+            "class Base:\n"
+            "    def __init_subclass__(cls): pass\n"
+            "class Sub(Base): pass\n"
+            "class Sub2(Sub): pass\n"
+        ),
+    }
+    py = build_plugin_graph(files, [InitSubclassPlugin()])
+    rs = build_plugin_graph(files, [native.NativePlugin.init_subclass()])
+    assert reachable_fqnames(py) == reachable_fqnames(rs)
+
+
+def test_builtin_native_plugin_registry():
+    """``_builtin_native_plugin(name)`` resolves ported built-ins to their
+    native impl, and returns ``None`` for names not (yet) ported."""
+    assert native._builtin_native_plugin("main_block").name == "MainBlockPlugin"
+    assert native._builtin_native_plugin("module_dunders").name == "ModuleDundersPlugin"
+    assert native._builtin_native_plugin("init_subclass").name == "InitSubclassPlugin"
+    assert native._builtin_native_plugin("does_not_exist") is None

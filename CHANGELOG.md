@@ -100,6 +100,23 @@ two versions.
   internal helpers `re_materialize` uses to keep plugin registrations
   and progress counters from leaking across calls.
 
+### Changed
+
+- **Built-in plugins are migrating to native (Rust) implementations.**
+  The `main_block`, `module_dunders`, `init_subclass`, `server_config`,
+  and `unittest` built-ins now resolve to native `NativePlugin`
+  instances through a Rust registry
+  (`native._builtin_native_plugin(name)`) that the CLI's `_load_plugin`
+  consults before the Python builtin map. Behaviour is identical;
+  `module_dunders` and `server_config` are *per-file* (salsa-cached)
+  plugins, so an unchanged file's entrypoints are reused across
+  `re_materialize` with zero re-run. The native `server_config` bakes
+  the default server-config filename set; the Python `ServerConfigPlugin`
+  remains for custom filenames. The Python `ModuleDundersPlugin` /
+  `InitSubclassPlugin` / `MainBlockPlugin` / `ServerConfigPlugin` /
+  `UnittestPlugin` classes remain available for now; they will be removed
+  once every built-in is ported.
+
 ### Removed
 
 #### Query DSL — SymbolNode terminals and SymbolNode-taking sugar

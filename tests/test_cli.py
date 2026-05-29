@@ -30,11 +30,17 @@ from dead_cst.cli import (
     setup_logging,
 )
 from dead_cst.graph import GraphMetadata, SymbolNode, read_graph
-from dead_cst.plugins import (
-    ExplicitEntrypointPlugin,
-    MainBlockPlugin,
-    ModuleDundersPlugin,
-)
+from dead_cst.plugins import ExplicitEntrypointPlugin
+
+
+def _plugin_name(p) -> str:
+    """Display name for a plugin regardless of Python vs native.
+
+    Native plugins (``main_block``, ``module_dunders``, …) expose a
+    ``.name`` getter ("MainBlockPlugin"); Python plugins are identified
+    by their class name.
+    """
+    return getattr(p, "name", None) or type(p).__name__
 
 
 def _normalise(s: str) -> str:
@@ -108,12 +114,12 @@ def test_parse_meta_empty_key_raises():
 
 def test_build_plugins_default_only_includes_module_dunders():
     plugins = build_plugins(entrypoints=[], entrypoint_regexes=[], plugin_names=[])
-    assert [type(p) for p in plugins] == [ModuleDundersPlugin]
+    assert [_plugin_name(p) for p in plugins] == ["ModuleDundersPlugin"]
 
 
 def test_build_plugins_named_plugins_run_before_module_dunders():
     plugins = build_plugins(entrypoints=[], entrypoint_regexes=[], plugin_names=["main_block"])
-    assert [type(p) for p in plugins] == [MainBlockPlugin, ModuleDundersPlugin]
+    assert [_plugin_name(p) for p in plugins] == ["MainBlockPlugin", "ModuleDundersPlugin"]
 
 
 def test_build_plugins_appends_explicit_last():
@@ -122,10 +128,10 @@ def test_build_plugins_appends_explicit_last():
         entrypoint_regexes=[],
         plugin_names=["main_block"],
     )
-    assert [type(p) for p in plugins] == [
-        MainBlockPlugin,
-        ModuleDundersPlugin,
-        ExplicitEntrypointPlugin,
+    assert [_plugin_name(p) for p in plugins] == [
+        "MainBlockPlugin",
+        "ModuleDundersPlugin",
+        "ExplicitEntrypointPlugin",
     ]
     explicit = plugins[-1]
     assert isinstance(explicit, ExplicitEntrypointPlugin)

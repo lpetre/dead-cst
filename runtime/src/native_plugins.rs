@@ -55,7 +55,7 @@ use ty_project::Db as ProjectDb;
 use crate::builder::PreparedOp;
 use crate::file_payload::{file_to_nodes, NodeData};
 use crate::graph::{intern_kind, NodeFlags};
-use crate::helpers::find_main_block_range;
+use crate::helpers::{find_main_block_range, is_dunder_name};
 use crate::project::ProjectContext;
 
 /// Rust-side plugin contract. Each impl describes how to derive ops
@@ -196,6 +196,8 @@ pub(crate) trait PerFileNativePluginImpl: Send + Sync {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum PerFilePluginKind {
     MainBlock,
+    ModuleDunders,
+    ServerConfig,
 }
 
 impl PerFilePluginKind {
@@ -203,6 +205,8 @@ impl PerFilePluginKind {
     fn name(self) -> &'static str {
         match self {
             PerFilePluginKind::MainBlock => "MainBlockPlugin",
+            PerFilePluginKind::ModuleDunders => "ModuleDundersPlugin",
+            PerFilePluginKind::ServerConfig => "ServerConfigPlugin",
         }
     }
 
@@ -210,6 +214,8 @@ impl PerFilePluginKind {
     fn run_on_file(self, file_ctx: &FileContext<'_>, sink: &mut Vec<FileLocalOpData>) {
         match self {
             PerFilePluginKind::MainBlock => MainBlockPluginImpl.run_on_file(file_ctx, sink),
+            PerFilePluginKind::ModuleDunders => ModuleDundersPluginImpl.run_on_file(file_ctx, sink),
+            PerFilePluginKind::ServerConfig => ServerConfigPluginImpl.run_on_file(file_ctx, sink),
         }
     }
 }
@@ -362,6 +368,63 @@ impl NativePlugin {
             kind: NativePluginKind::PerFile(PerFilePluginKind::MainBlock),
         }
     }
+
+    /// Native `ModuleDundersPlugin` — pin module-level dunder names and
+    /// `__future__` imports as entrypoints. Per-file (salsa-cached): a file's
+    /// dunders + `__future__` imports are entirely local to it.
+    #[staticmethod]
+    fn module_dunders() -> Self {
+        Self {
+            kind: NativePluginKind::PerFile(PerFilePluginKind::ModuleDunders),
+        }
+    }
+
+    /// Native `InitSubclassPlugin` — keep transitive subclasses of
+    /// `__init_subclass__`-defining classes alive via a marker node.
+    #[staticmethod]
+    fn init_subclass() -> Self {
+        Self {
+            kind: NativePluginKind::ProjectWide(Box::new(InitSubclassPluginImpl)),
+        }
+    }
+
+    /// Native `ServerConfigPlugin` — mark conventional WSGI/ASGI server
+    /// config modules (`gunicorn.conf.py`, `hypercorn.conf.py`, …) as
+    /// entrypoints. Per-file (salsa-cached): a file matches purely on its
+    /// own basename and keeps its own top-level surface alive. Bakes the
+    /// default filename set; the configurable Python plugin remains for
+    /// custom filenames.
+    #[staticmethod]
+    fn server_config() -> Self {
+        Self {
+            kind: NativePluginKind::PerFile(PerFilePluginKind::ServerConfig),
+        }
+    }
+
+    /// Native `UnittestPlugin` — keep stdlib `unittest` test classes and
+    /// lifecycle hooks alive. Project-wide (the subclass walk spans files).
+    #[staticmethod]
+    fn unittest() -> Self {
+        Self {
+            kind: NativePluginKind::ProjectWide(Box::new(UnittestPluginImpl)),
+        }
+    }
+}
+
+/// Resolve a built-in plugin name to its native implementation, or `None`
+/// if no native plugin owns that name (yet). The CLI's `_load_plugin`
+/// consults this before the Python builtin map — as plugins are ported to
+/// Rust they move from that map into this registry.
+#[pyfunction]
+pub(crate) fn _builtin_native_plugin(name: &str) -> Option<NativePlugin> {
+    Some(match name {
+        "main_block" => NativePlugin::main_block(),
+        "module_dunders" => NativePlugin::module_dunders(),
+        "init_subclass" => NativePlugin::init_subclass(),
+        "server_config" => NativePlugin::server_config(),
+        "unittest" => NativePlugin::unittest(),
+        _ => return None,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -958,5 +1021,236 @@ pub(crate) fn load_native_plugins(path: String) -> PyResult<Vec<NativePlugin>> {
             });
         }
         Ok(out)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Native plugins ported from Python. `module_dunders` is *per-file* (its
+// output for a file is a pure function of that file → salsa-cached);
+// `init_subclass` is project-wide (subclasses live in other files, so its
+// output isn't file-local). The project-wide `py`-taking ctx accessors are
+// reached via `Python::with_gil` (the harness already holds the GIL).
+// ---------------------------------------------------------------------------
+
+const MODULE_DUNDERS_PREFIX: &str = "<dunder>:";
+const INIT_SUBCLASS_PREFIX: &str = "<__init_subclass__>:";
+const SERVER_CONFIG_PREFIX: &str = "<server-config>:";
+const UNITTEST_PREFIX: &str = "<unittest>:";
+
+/// Conventional filenames Gunicorn / Hypercorn load at startup. Baked
+/// default for the native [`ServerConfigPluginImpl`]; the configurable
+/// Python `ServerConfigPlugin` covers custom filenames.
+const SERVER_CONFIG_FILENAMES: [&str; 4] = [
+    "gunicorn.conf.py",
+    "gunicorn_conf.py",
+    "hypercorn.conf.py",
+    "hypercorn_conf.py",
+];
+
+/// stdlib `unittest` lifecycle hooks kept alive in any file importing
+/// `unittest` (mirrors `dead_cst.contrib.unittest._MODULE_HOOKS`).
+const UNITTEST_MODULE_HOOKS: [&str; 3] = ["setUpModule", "tearDownModule", "load_tests"];
+
+/// Base classes whose transitive subclasses are kept alive (mirrors
+/// `dead_cst.contrib.unittest._UNITTEST_BASE_FQNAMES`).
+const UNITTEST_BASE_FQNAMES: [&str; 2] = ["unittest.TestCase", "unittest.IsolatedAsyncioTestCase"];
+
+/// Per-file port of `dead_cst.plugins.module_dunders.ModuleDundersPlugin`:
+/// pin a file's module-level dunders (variables + PEP 562 functions) and its
+/// `__future__` imports as entrypoints. All file-local — one synthetic
+/// entrypoint node per file with edges to those decls.
+pub(crate) struct ModuleDundersPluginImpl;
+
+impl PerFileNativePluginImpl for ModuleDundersPluginImpl {
+    fn run_on_file(&self, file_ctx: &FileContext<'_>, sink: &mut Vec<FileLocalOpData>) {
+        let mut targets: Vec<u32> = Vec::new();
+        for (local_idx, node) in file_ctx.nodes().iter().enumerate() {
+            let is_dunder_decl = matches!(node.kind.as_static_str(), "variable" | "function")
+                && is_dunder_name(&node.fqname);
+            let is_future = node
+                .imports
+                .as_ref()
+                .is_some_and(|imp| imp.module == "__future__");
+            if is_dunder_decl || is_future {
+                targets.push(local_idx as u32);
+            }
+        }
+        if targets.is_empty() {
+            return;
+        }
+        let synthetic = intern_kind("synthetic").expect("'synthetic' is a valid kind");
+        sink.push(FileLocalOpData {
+            fqname: format!("{MODULE_DUNDERS_PREFIX}{}", file_ctx.module_fqname()),
+            kind: synthetic,
+            flags: NodeFlags::ENTRYPOINT,
+            edges_to_local_idx: targets,
+        });
+    }
+}
+
+/// Port of `dead_cst.plugins.init_subclass.InitSubclassPlugin`: for each
+/// class defining `__init_subclass__`, emit a marker node reachable from the
+/// parent that keeps every transitive subclass alive.
+pub(crate) struct InitSubclassPluginImpl;
+
+impl NativePluginImpl for InitSubclassPluginImpl {
+    fn name(&self) -> &'static str {
+        "InitSubclassPlugin"
+    }
+
+    fn run(&self, ctx: &ProjectContext, sink: &mut Vec<PreparedOp>) -> PyResult<()> {
+        Python::with_gil(|py| -> PyResult<()> {
+            let parents = ctx.find_classes_defining_method_indices(py, "__init_subclass__")?;
+            let attrs = ctx.node_attrs(parents.clone())?;
+            let synthetic = intern_kind("synthetic").expect("'synthetic' is a valid kind");
+            for (parent_idx, attr) in parents.iter().zip(attrs.iter()) {
+                let subclass_idxs = ctx.find_subclasses_of_idx(py, *parent_idx)?;
+                sink.push(PreparedOp::NodeByIdx {
+                    fqname: format!("{INIT_SUBCLASS_PREFIX}{}", attr.fqname),
+                    kind: synthetic,
+                    path: attr.path.clone(),
+                    flags: 0,
+                    edges_from_idx: vec![*parent_idx],
+                    edges_to_idx: subclass_idxs,
+                });
+            }
+            Ok(())
+        })
+    }
+}
+
+/// Per-file port of `dead_cst.contrib.server_config.ServerConfigPlugin`
+/// (default-filename form): when a file's basename is one of the
+/// conventional server-config names, mint a `<server-config>:` entrypoint
+/// keeping that file's whole top-level surface alive. File-local — the
+/// match and the targets are both functions of the single file.
+pub(crate) struct ServerConfigPluginImpl;
+
+impl PerFileNativePluginImpl for ServerConfigPluginImpl {
+    fn run_on_file(&self, file_ctx: &FileContext<'_>, sink: &mut Vec<FileLocalOpData>) {
+        let nodes = file_ctx.nodes();
+        let path = nodes[0].path.as_str();
+        let basename = path
+            .rsplit_once(std::path::MAIN_SEPARATOR)
+            .map(|(_, name)| name)
+            .unwrap_or(path);
+        if !SERVER_CONFIG_FILENAMES.contains(&basename) {
+            return;
+        }
+        // `_TARGET_KINDS` from the Python plugin: every top-level surface
+        // node (the module node included), excluding `type_alias`.
+        let targets: Vec<u32> = nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| {
+                matches!(
+                    node.kind.as_static_str(),
+                    "module" | "function" | "class" | "variable" | "import"
+                )
+            })
+            .map(|(local_idx, _)| local_idx as u32)
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+        let synthetic = intern_kind("synthetic").expect("'synthetic' is a valid kind");
+        sink.push(FileLocalOpData {
+            fqname: format!("{SERVER_CONFIG_PREFIX}{}", file_ctx.module_fqname()),
+            kind: synthetic,
+            flags: NodeFlags::ENTRYPOINT,
+            edges_to_local_idx: targets,
+        });
+    }
+}
+
+/// Project-wide port of `dead_cst.contrib.unittest.UnittestPlugin`: keep
+/// every transitive subclass of `unittest.TestCase` /
+/// `IsolatedAsyncioTestCase` alive, plus module-level lifecycle hooks
+/// (`setUpModule` / `tearDownModule` / `load_tests`) in any file that
+/// imports `unittest`. Cross-file (the subclass walk spans files), so it
+/// can't be per-file.
+pub(crate) struct UnittestPluginImpl;
+
+impl NativePluginImpl for UnittestPluginImpl {
+    fn name(&self) -> &'static str {
+        "UnittestPlugin"
+    }
+
+    fn run(&self, ctx: &ProjectContext, sink: &mut Vec<PreparedOp>) -> PyResult<()> {
+        // O(1) presence probe — short-circuit before the subclass walk.
+        if !ctx.has_imports_of("unittest")? {
+            return Ok(());
+        }
+        let import_idxs = ctx.find_imports_of_indices("unittest")?;
+        let importer_paths: std::collections::HashSet<String> =
+            ctx.node_paths(import_idxs)?.into_iter().collect();
+
+        // path -> [decl_idx, ...] seeds to keep alive.
+        let mut decls_by_path: std::collections::HashMap<String, Vec<usize>> =
+            std::collections::HashMap::new();
+
+        Python::with_gil(|py| -> PyResult<()> {
+            for base in UNITTEST_BASE_FQNAMES {
+                let sub_idxs = ctx.find_subclasses_indices(py, base, true)?;
+                if sub_idxs.is_empty() {
+                    continue;
+                }
+                let paths = ctx.node_paths(sub_idxs.clone())?;
+                for (idx, path) in sub_idxs.into_iter().zip(paths) {
+                    decls_by_path.entry(path).or_default().push(idx);
+                }
+            }
+            Ok(())
+        })?;
+
+        // Lifecycle hooks: function nodes in an importer file whose
+        // trailing fqname segment is one of the module hooks.
+        {
+            let outputs = ctx.materialized("UnittestPlugin")?;
+            for (idx, node_py) in outputs.builder.nodes.iter().enumerate() {
+                let node = node_py.get();
+                if node.kind != "function" || !importer_paths.contains(node.path.as_str()) {
+                    continue;
+                }
+                let simple = node
+                    .fqname
+                    .rsplit_once('.')
+                    .map(|(_, n)| n)
+                    .unwrap_or(node.fqname.as_str());
+                if UNITTEST_MODULE_HOOKS.contains(&simple) {
+                    decls_by_path
+                        .entry(node.path.clone())
+                        .or_default()
+                        .push(idx);
+                }
+            }
+        }
+
+        if decls_by_path.is_empty() {
+            return Ok(());
+        }
+        let paths: Vec<String> = decls_by_path.keys().cloned().collect();
+        let module_idxs = ctx.modules_for_paths(paths.clone())?;
+        let present: Vec<(String, usize)> = paths
+            .into_iter()
+            .zip(module_idxs)
+            .filter_map(|(p, idx)| idx.map(|i| (p, i)))
+            .collect();
+        if present.is_empty() {
+            return Ok(());
+        }
+        let module_attrs = ctx.node_attrs(present.iter().map(|(_, i)| *i).collect())?;
+        let synthetic = intern_kind("synthetic").expect("'synthetic' is a valid kind");
+        for ((path, _idx), attr) in present.iter().zip(module_attrs.iter()) {
+            sink.push(PreparedOp::NodeByIdx {
+                fqname: format!("{UNITTEST_PREFIX}{}", attr.fqname),
+                kind: synthetic,
+                path: path.clone(),
+                flags: NodeFlags::TESTCASE,
+                edges_from_idx: Vec::new(),
+                edges_to_idx: decls_by_path[path].clone(),
+            });
+        }
+        Ok(())
     }
 }

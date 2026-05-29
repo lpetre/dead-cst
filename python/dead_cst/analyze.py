@@ -574,7 +574,7 @@ class Analysis:
         project_root: Path,
         *,
         venv: Path | None = None,
-        plugins: Sequence[Plugin] = (),
+        plugins: Sequence[Plugin | native.NativePlugin] = (),
         show_progress: bool = False,
         progress_callback: ProgressCallback | None = None,
     ) -> None:
@@ -585,7 +585,7 @@ class Analysis:
             )
         self._project_root: Path = project_root
         self._venv: Path | None = venv
-        self._plugins: tuple[Plugin, ...] = tuple(plugins)
+        self._plugins: tuple[Plugin | native.NativePlugin, ...] = tuple(plugins)
         self._show_progress: bool = show_progress
         # ``show_progress=True`` installs a default stderr-text
         # callback so the rust-side indicatif bars get a Python-side
