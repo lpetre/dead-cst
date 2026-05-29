@@ -30,6 +30,8 @@ from typing import TYPE_CHECKING, Annotated, Iterable, Sequence
 
 import typer
 
+from dead_cst import _native as native
+
 from .analyze import Analysis
 from .codemod import generate_patch
 from .contrib.celery import CeleryPlugin
@@ -62,8 +64,6 @@ from .plugins import (
 )
 
 if TYPE_CHECKING:
-    from dead_cst import _native as native
-
     GraphView = native.ProjectContext | LoadedGraph
 
 
@@ -95,9 +95,7 @@ _BUILTIN_PLUGINS: dict[str, Plugin] = {
 
 
 def _load_plugin(name: str) -> Plugin | native.NativePlugin:
-    from dead_cst import _native
-
-    nat = _native._builtin_native_plugin(name)
+    nat = native._builtin_native_plugin(name)
     if nat is not None:
         return nat
 
@@ -166,10 +164,8 @@ def build_plugins(
     entrypoint_regexes: list[str],
     plugin_names: list[str],
 ) -> list[Plugin | native.NativePlugin]:
-    from dead_cst import _native
-
     plugins: list[Plugin | native.NativePlugin] = [_load_plugin(name) for name in plugin_names]
-    plugins.append(_native.NativePlugin.module_dunders())
+    plugins.append(native.NativePlugin.module_dunders())
     specs: list[str | Path | re.Pattern[str]] = list(entrypoints)
     specs.extend(re.compile(p) for p in entrypoint_regexes)
     if specs:
