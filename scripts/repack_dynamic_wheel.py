@@ -62,29 +62,79 @@ def _host_std_lib() -> Path:
     return sysroot / "lib" / "rustlib" / host / "lib"
 
 
-def _set_rpath_origin(lib: Path) -> None:
-    """Point ``lib`` at its own directory for sibling resolution, dropping the
-    builder's absolute rpaths so the wheel relocates. No-op (with a warning) if
-    the platform tool is missing — the prefer-dynamic build already bakes the
-    loader-relative entry, so siblings still resolve; this is hygiene."""
-    if _is_macos():
-        tool = "install_name_tool"
-        if shutil.which(tool) is None:
-            print(f"warning: {tool} not found; leaving rpaths as built", file=sys.stderr)
-            return
-        # Best-effort: ensure @loader_path is present (the build already adds it).
-        _run(tool, "-add_rpath", "@loader_path", str(lib))
-    else:
-        if shutil.which("patchelf") is None:
-            print("warning: patchelf not found; leaving rpaths as built", file=sys.stderr)
-            return
-        _run("patchelf", "--set-rpath", "$ORIGIN", str(lib))
+def _otool_load_paths(lib: Path) -> list[str]:
+    out = subprocess.run(
+        ["otool", "-L", str(lib)], capture_output=True, text=True, check=True
+    ).stdout
+    return [line.strip().split(" ", 1)[0] for line in out.splitlines()[1:] if line.strip()]
+
+
+def _otool_rpaths(lib: Path) -> set[str]:
+    out = subprocess.run(
+        ["otool", "-l", str(lib)], capture_output=True, text=True, check=True
+    ).stdout
+    lines = out.splitlines()
+    found: set[str] = set()
+    for i, line in enumerate(lines):
+        if "LC_RPATH" in line:
+            for follow in lines[i : i + 4]:
+                s = follow.strip()
+                if s.startswith("path "):
+                    found.add(s[len("path ") :].split(" (offset")[0].strip())
+    return found
+
+
+def _relocate_linux(lib: Path) -> None:
+    """Set ``lib``'s run path to ``$ORIGIN`` (sibling resolution), dropping the
+    builder's absolute rpaths. ``patchelf --set-rpath`` overwrites wholesale.
+    No-op (warning) without patchelf — the build bakes ``$ORIGIN`` too."""
+    if shutil.which("patchelf") is None:
+        print("warning: patchelf not found; leaving rpaths as built", file=sys.stderr)
+        return
+    _run("patchelf", "--set-rpath", "$ORIGIN", str(lib))
+
+
+def _relocate_macos(module: Path, runtime: Path, std_lib: Path) -> None:
+    """Rewrite install names so the shim + runtime load each other (and libstd)
+    relocatably via ``@rpath`` / ``@loader_path``. The prefer-dynamic build
+    already bakes ``@loader_path`` (so only add it when missing) and the absolute
+    sysroot rpath (drop it)."""
+    if shutil.which("install_name_tool") is None:
+        print(
+            "warning: install_name_tool not found; leaving install names as built", file=sys.stderr
+        )
+        return
+    runtime_id = f"@rpath/{runtime.name}"
+
+    def ensure_loader_path(lib: Path) -> None:
+        if "@loader_path" not in _otool_rpaths(lib):
+            _run("install_name_tool", "-add_rpath", "@loader_path", str(lib))
+
+    def drop_abs_std(lib: Path) -> None:
+        if str(std_lib) in _otool_rpaths(lib):
+            _run("install_name_tool", "-delete_rpath", str(std_lib), str(lib))
+
+    # runtime: relocatable id + @loader_path (to find its sibling libstd).
+    _run("install_name_tool", "-id", runtime_id, str(runtime))
+    ensure_loader_path(runtime)
+    drop_abs_std(runtime)
+
+    # shim: point its load command for the runtime at @rpath; @loader_path rpath.
+    for path in _otool_load_paths(module):
+        if "libdead_cst_runtime" in path and path != runtime_id:
+            _run("install_name_tool", "-change", path, runtime_id, str(module))
+            break
+    ensure_loader_path(module)
+    drop_abs_std(module)
 
 
 def _strip(lib: Path) -> None:
+    # Strip debug info only: keeps the dynamic symbol table AND the embedded
+    # rust metadata section, so `build-plugin`'s `rustc --extern` against the
+    # shipped runtime dylib still reads its crate metadata.
     if shutil.which("strip") is None:
         return
-    _run("strip", *(["-x"] if _is_macos() else ["--strip-unneeded"]), str(lib))
+    _run("strip", *(["-S"] if _is_macos() else ["--strip-debug"]), str(lib))
 
 
 def _resign(lib: Path) -> None:
@@ -126,11 +176,15 @@ def repack(static_wheel: Path, deps_dir: Path, std_lib: Path, out_dir: Path) -> 
         shutil.copyfile(runtime_src, runtime_dst)
         shutil.copyfile(libstd_src, libstd_dst)
 
-        for lib in (module, runtime_dst):
-            _set_rpath_origin(lib)
+        if _is_macos():
+            _relocate_macos(module, runtime_dst, std_lib)
+        else:
+            for lib in (module, runtime_dst):
+                _relocate_linux(lib)
         for lib in (module, runtime_dst, libstd_dst):
             _strip(lib)
-            _resign(lib)
+        for lib in (module, runtime_dst, libstd_dst):
+            _resign(lib)  # no-op off macOS
 
         _run(sys.executable, "-m", "wheel", "pack", str(unpacked), "-d", str(out_dir))
 
