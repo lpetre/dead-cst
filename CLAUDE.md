@@ -92,7 +92,7 @@ def test_something(build_decl_graph, assert_edges):
 
 The plugin queries live on `native.ProjectContext` — `find_subclasses`, `find_module`, `find_declarations`, `module_for`, `find_main_blocks`, etc. — plus the chainable `query(ctx).decorators()...` / `.constructions()...` / `.calls()...` builder. See `python/dead_cst/_native.pyi` for the full surface.
 
-For **native (Rust) plugins** — in-tree ones (e.g. `NativePlugin.main_block()`) and external ones compiled against the runtime `dylib` and loaded via `native.load_native_plugins(...)` — see [`NATIVE_PLUGINS.md`](NATIVE_PLUGINS.md). The author-facing flow is `dead-cst build-plugin <PLUGIN.rs>` (+ `pip install dead-cst[build-plugin]`); maintainers produce the prebuilt-runtime bundle with `dead-cst bundle-plugin-host`. Both commands are macOS-only today. Prefer Python plugins unless the work needs native speed or plugin-defined salsa-cached queries.
+For **native (Rust) plugins** — in-tree ones (e.g. `NativePlugin.main_block()`) and external ones compiled against the runtime `dylib` and loaded via `native.load_native_plugins(...)` — see [`NATIVE_PLUGINS.md`](NATIVE_PLUGINS.md). The author-facing flow is `dead-cst build-plugin <PLUGIN.rs>` (+ `pip install dead-cst[build-plugin]`); maintainers produce the prebuilt-runtime bundle with `dead-cst bundle-plugin-host`. Both commands support macOS and Linux today (`bundle-plugin-host` needs the Xcode CLT on macOS / `patchelf` on Linux). Prefer Python plugins unless the work needs native speed or plugin-defined salsa-cached queries.
 
 ## Adding a resolver
 

@@ -30,18 +30,22 @@ two versions.
   `dead_cst_runtime::native_plugins::plugin_api::ExternalPlugin`; see
   `examples/main_block_plugin/`. `dead-cst bundle-plugin-host` assembles
   a *relocatable* plugin-host bundle (the runtime dylib + its rlib /
-  proc-macro-dylib closure + libstd + the dynamic `_native`, install
-  names / rpaths rewritten to `@rpath` / `@loader_path`, stripped + ad-hoc
-  re-signed). That bundle ships as a **separate `dead-cst-plugin-host`
+  proc-macro-dylib closure + libstd + the dynamic `_native`, rpaths
+  rewritten to loader-relative paths — `@rpath` / `@loader_path` on macOS,
+  `$ORIGIN` on Linux — stripped, and ad-hoc re-signed on macOS). That
+  bundle ships as a **separate `dead-cst-plugin-host`
   package** pulled in only via the `dead-cst[build-plugin]` extra — so the
   default `dead-cst` wheel stays small and self-contained, and the large
   payload is installed on demand. `build-plugin` locates it via
   `import dead_cst_plugin_host`. The bundle skips the redundant `.rmeta`
   (the `.rlib` embed metadata) and strips the dylibs: a `--release` bundle
   is ~350 MB on disk / ~130 MB compressed (the rlib dep closure
-  dominates), vs ~1.6 GB debug. Note: today this is macOS-only and the
-  separate package is built locally; producing the cross-platform
-  `dead-cst-plugin-host` wheels in CI is the remaining packaging work.
+  dominates), vs ~1.6 GB debug. The build tooling supports macOS and
+  Linux (`bundle-plugin-host` needs the Xcode CLT on macOS / `patchelf`
+  on Linux); `build-plugin` from a source checkout needs only rust.
+  Note: today the separate package is built locally; producing the
+  cross-platform `dead-cst-plugin-host` wheels in CI is the remaining
+  packaging work.
 - `Analysis.re_materialize(events)` — incrementally rebuild the
   project graph against the existing `native.ProjectContext`. The
   caller supplies the change events: typically

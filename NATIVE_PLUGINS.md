@@ -1,9 +1,10 @@
 # Native plugins
 
-> **Status: experimental, macOS only.** The runtime split and in-tree native
+> **Status: experimental, macOS + Linux.** The runtime split and in-tree native
 > plugins are stable; *external* native plugin authoring is a preview — the
 > API, the build flow, and the distribution are still moving, and only
-> macOS (arm64) is wired today. See [Limitations](#limitations).
+> macOS (arm64) and Linux (x86_64 / aarch64) are wired today. See
+> [Limitations](#limitations).
 
 dead-cst has two ways to extend the reachability graph:
 
@@ -188,9 +189,10 @@ full dependency closure to compile a plugin against the runtime; the default
 wheel ships only the final linked, stripped extension.
 
 Maintainers produce that payload with **`dead-cst bundle-plugin-host`**, which
-builds the runtime, gathers the closure, rewrites install names / rpaths to
-`@rpath` / `@loader_path`, strips + ad-hoc re-signs the dylibs, and drops it
-into the `dead_cst_plugin_host` package. (CI wheels for it are still
+builds the runtime, gathers the closure, rewrites the rpaths to loader-relative
+paths (`@rpath` / `@loader_path` via `install_name_tool` on macOS, `$ORIGIN` via
+`patchelf` on Linux), strips (and, on macOS, ad-hoc re-signs) the libraries, and
+drops it into the `dead_cst_plugin_host` package. (CI wheels for it are still
 [in progress](#limitations).)
 
 ---
@@ -199,7 +201,9 @@ into the `dead_cst_plugin_host` package. (CI wheels for it are still
 
 This is a preview. Known gaps:
 
-- **macOS (arm64) only.** Linux/Windows loader plumbing isn't wired yet.
+- **macOS (arm64) and Linux only.** Windows loader plumbing isn't wired yet.
+  On Linux, `bundle-plugin-host` needs [`patchelf`](https://github.com/NixOS/patchelf)
+  on `PATH`; `build-plugin` from a source checkout does not.
 - **Single-`.rs` plugins.** `build-plugin` compiles one source file; multi-crate
   plugins with their own dependencies are a follow-up.
 - **No published `dead-cst-plugin-host` wheels yet.** Today the bundle is built
