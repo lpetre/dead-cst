@@ -1,9 +1,10 @@
 # Native plugins
 
-> **Status: experimental, macOS only.** The runtime split and in-tree native
+> **Status: experimental, macOS + Linux.** The runtime split and in-tree native
 > plugins are stable; *external* native plugin authoring is a preview — the
 > API, the build flow, and the distribution are still moving, and only
-> macOS (arm64) is wired today. See [Limitations](#limitations).
+> macOS (arm64) and Linux (x86_64 / aarch64) are wired today. See
+> [Limitations](#limitations).
 
 dead-cst has two ways to extend the reachability graph:
 
@@ -40,18 +41,28 @@ The native crate is split in two:
 - **`dead-cst-native`** — a thin pyo3 `#[pymodule]` shim that becomes
   `dead_cst._native`.
 
-The **default wheel** links the runtime `rlib` *statically* into `_native`, so
-it's a single self-contained `.so` (~10 MB compressed) that needs no rust at
-install time. Nothing about the everyday experience changes.
+The runtime is linked one of two ways:
+
+- The **dev build** (`maturin develop` / `uv sync`) and the **Windows wheel**
+  link the runtime `rlib` *statically* into `_native` — one self-contained `.so`
+  / `.pyd` that needs no rust at install time. This is the simplest, most
+  robust layout, and it's what contributors and Windows users get. It cannot
+  load external plugins (the runtime isn't shared).
+- The **shipped macOS + Linux wheel** links the runtime **`dylib`** instead: a
+  thin `_native` shim + `libdead_cst_runtime` + `libstd` ride in the package,
+  resolving each other via `$ORIGIN` / `@loader_path`. The host therefore runs
+  the *shared* runtime out of the box.
 
 An **external plugin** is a separate `cdylib` that links the runtime **`dylib`**
 (under `-C prefer-dynamic`). When both the extension module and the plugin
-dynamically link the *same* `libdead_cst_runtime.dylib`, they share **one
-runtime instance** — one salsa database, one `ProjectContext`, one set of
-types. That's what lets a plugin receive a live `&ProjectContext` and define
-its own salsa-tracked queries that cache against ty's database. (This is the
+dynamically link the *same* `libdead_cst_runtime`, they share **one runtime
+instance** — one salsa database, one `ProjectContext`, one set of types. That's
+what lets a plugin receive a live `&ProjectContext` and define its own
+salsa-tracked queries that cache against ty's database. (This is the
 [dylint](https://github.com/trailofbits/dylint) model: link the host's runtime
-dynamically, pinned to the exact compiler.)
+dynamically, pinned to the exact compiler.) Because the shipped wheel already
+runs the dylib, loading a plugin needs **no `_native` swap** — just the plugin's
+compile closure, which the `[build-plugin]` extra provides.
 
 The price of that fidelity is that a plugin is **ABI-coupled to the exact
 dead-cst build** it was compiled against (Rust has no stable ABI). dead-cst
@@ -88,36 +99,129 @@ impl ExternalPlugin for KeepMainBlocksAlive {
 }
 ```
 
-`PluginCtx` deliberately exposes a small, stable surface (e.g. `main_blocks()`)
+`PluginCtx` deliberately exposes a small, stable, **index-based** surface
 rather than the whole internal `ProjectContext`, and `PluginOps` emits through
-named methods (`keep_alive(...)`) instead of internal op types. The contract is
-the same frozen-graph one as Python plugins: the plugin observes the base graph
-only; its emissions are applied in a single batch after every plugin returns.
+named methods instead of internal op types. The contract is the same
+frozen-graph one as Python plugins: the plugin observes the base graph only;
+its emissions are applied in a single batch after every plugin returns. No
+`Python<'_>` token is ever exposed — `PluginCtx` reads `#[pyclass(frozen)]`
+data directly.
+
+### The `PluginCtx` / `PluginOps` surface
+
+Every query returns positional **indices** into the frozen node list — the
+same index space `PluginOps` emits against. `ctx.node(idx)` turns an index
+into an owned `NodeView { idx, fqname, kind, path, start_line, end_line,
+flags }`.
+
+`PluginCtx<'_>` — read the frozen graph:
+
+| method | returns | what |
+|---|---|---|
+| `node_count()` | `usize` | number of nodes; valid indices are `0..node_count()` |
+| `node(idx)` | `Option<NodeView>` | owned snapshot of one node |
+| `find_module(fqname)` | `Option<usize>` | module node by dotted fqname |
+| `find_declarations(fqname)` | `Vec<usize>` | every decl with this fqname (>1 when shadowed) |
+| `module_for(path)` | `Option<usize>` | module node by source path |
+| `resolve(fqname)` | `Option<usize>` | decl-or-module, walking back dotted segments |
+| `decls_under(path_prefix)` | `Vec<usize>` | every node under a path prefix |
+| `find_subclasses_of(class_idx)` | `Vec<usize>` | transitive subclasses |
+| `descendants(root_idx)` | `Vec<usize>` | forward reachability closure |
+| `ancestors(decl_idx)` | `Vec<usize>` | reverse reachability closure |
+| `direct_predecessors(idx)` | `Vec<usize>` | one-hop reverse step |
+| `main_blocks()` | `Vec<(usize, Vec<usize>)>` | each `if __name__` block as `(module, [decls])` |
+
+`PluginOps` — emit ops (mirrors the three Python graph ops):
+
+| method | mirrors | what |
+|---|---|---|
+| `keep_alive(decl_idx, marker)` | `AddEntrypointByIdx` | make a node a reachability seed |
+| `add_edge(src_idx, dst_idx)` | `AddEdgeByIdx` | add `src -> dst` between existing nodes |
+| `add_synthetic_node(fqname, flags, edges_to_idx)` | `AddNodeByIdx` | mint a `synthetic` node with out-edges; set `flags = plugin_api::FLAG_ENTRYPOINT` to make it a seed |
+
+Endpoint indices are bounds-checked by the host at apply time — a dangling
+index is rejected cleanly rather than minting an unconnected node.
+
+### Per-file plugins (optional, salsa-cached)
+
+By default an `ExternalPlugin` is **project-wide**: its `run(ctx, ops)` is
+called once against the whole frozen graph. A plugin can instead opt into
+**per-file** dispatch — invoked once per project file through a salsa-cached
+query, so an unchanged file's ops are reused across a `re_materialize` with
+zero re-run (the same fast-path the in-tree `MainBlockPlugin` rides).
+
+Opt in by also implementing `PerFilePlugin` and returning `Some(self)` from
+`per_file()`:
+
+```rust
+impl ExternalPlugin for MyPlugin {
+    fn name(&self) -> &str { "MyPlugin" }
+    fn per_file(&self) -> Option<&dyn PerFilePlugin> { Some(self) }   // opt in
+}
+
+impl PerFilePlugin for MyPlugin {
+    fn run_on_file(&self, file: &PluginFileCtx<'_>, ops: &mut FileOps) {
+        if let Some(block) = file.main_block_range() {
+            let (start, end) = file.line_span(block);
+            let mut targets = vec![file.module_local_idx()];
+            for n in file.nodes() {
+                if n.local_idx != 0 && n.start_line >= start && n.end_line <= end {
+                    targets.push(n.local_idx);
+                }
+            }
+            ops.add_synthetic_node(
+                format!("<__main__>:{}", file.module_fqname()),
+                plugin_api::FLAG_ENTRYPOINT,
+                targets,
+            );
+        }
+    }
+}
+```
+
+When `per_file()` returns `Some`, the host ignores `run` entirely. Whether a
+plugin is per-file is read **once, at load**.
+
+`PluginFileCtx<'_>` is a restricted, single-file view — `module_fqname()`,
+`module_local_idx()`, `node_count()`, `node(local_idx)`, `nodes()`,
+`line_span(range)`, `parsed()` (the raw AST), and the `main_block_range()`
+convenience. `FileOps` mirrors `add_synthetic_node` but in the file's **local**
+index space (`edges_to_local_idx` are positions in `file.nodes()`, which the
+host maps to global indices at apply time).
+
+**Purity is the contract that buys the cache.** `run_on_file` must be a pure
+function of its `file` — it may read only what `PluginFileCtx` exposes and must
+not consult project-wide state, other files, globals, the clock, or the
+filesystem, and it may only reference nodes *in this file*. An impure
+`run_on_file` would serve stale ops after an unrelated edit.
 
 Each plugin `cdylib` also exports a **manifest** — a self-contained
 `#[repr(C)]` table listing the plugins it provides and the ABI fingerprint it
-was built against. It's deliberately boring boilerplate; copy it from the
-worked example:
+was built against. It's deliberately boring boilerplate; copy it from a worked
+example:
 
 - **[`examples/main_block_plugin/`](examples/main_block_plugin/)** — a complete
-  external plugin (a `MainBlockPlugin` equivalent) including the manifest. Start
-  here.
+  **project-wide** external plugin (a `MainBlockPlugin` equivalent) including
+  the manifest. Start here.
+- **[`examples/per_file_main_block/`](examples/per_file_main_block/)** — the
+  same behaviour as a **per-file** plugin (`per_file()` + `run_on_file`).
 
 ---
 
 ## Building a plugin
 
-You need:
+You need (on macOS or Linux — the shipped dynamic wheel, not a dev checkout):
 
-1. **The prebuilt runtime**, installed via the extra:
+1. **The compile closure**, installed via the extra:
 
    ```bash
    pip install dead-cst[build-plugin]
    ```
 
    This pulls a separate `dead-cst-plugin-host` package (large — see
-   [Distribution](#distribution)) carrying the runtime dylib + the dependency
-   metadata `rustc` needs to compile against it.
+   [Distribution](#distribution)) carrying the `.rlib` dependency closure +
+   proc-macro dylibs `rustc` needs to compile against the runtime. (The runtime
+   dylib itself already ships inside the `dead_cst` wheel.)
 
 2. **The Rust toolchain at dead-cst's pinned version** (see
    [`rust-toolchain.toml`](rust-toolchain.toml)). A different `rustc` produces a
@@ -126,9 +230,9 @@ You need:
 Then build:
 
 ```bash
-# Compiles plugin.rs against the prebuilt runtime via `rustc --extern`
-# (no Cargo project, no dead-cst source, no ruff recompile), installs the
-# matching dynamic _native, and prints the built .so path on stdout.
+# Compiles plugin.rs against the in-package runtime dylib (via `rustc --extern`)
+# + the extra's rlib closure — no Cargo project, no dead-cst source, no swap —
+# and prints the built plugin path on stdout.
 PLUGIN=$(dead-cst build-plugin path/to/plugin.rs)
 ```
 
@@ -141,9 +245,12 @@ plugins = native.load_native_plugins(PLUGIN)
 ctx = Analysis(root, plugins=plugins).materialize_all()
 ```
 
-`build-plugin` resolves the runtime artifacts from, in order: `--runtime-dir`,
-the installed `dead-cst-plugin-host` package, or a dead-cst **source checkout**
-(building them on demand). Run `dead-cst build-plugin --help` for the options.
+The shipped wheel already runs the shared runtime, so the built plugin loads
+straight away. `build-plugin` finds the runtime dylib inside the installed
+`dead_cst` package and the rlib closure via `import dead_cst_plugin_host`;
+`--runtime-dir` overrides both. Run `dead-cst build-plugin --help` for the
+options. (In a dev/static checkout there's no in-package runtime dylib, so
+`build-plugin` needs a dynamic wheel installed first.)
 
 ---
 
@@ -177,21 +284,27 @@ The split keeps the cost where it belongs:
 
 | install | download | installed | for |
 |---|---|---|---|
-| `dead-cst` | ~10 MB | ~24 MB | everyone — analysis, the CLI, Python plugins |
-| `dead-cst[build-plugin]` | +~130 MB | +~350 MB | authoring native plugins |
+| `dead-cst` | ~25 MB | ~60 MB | everyone — analysis, the CLI, Python plugins |
+| `dead-cst[build-plugin]` | +~130 MB | +~320 MB | authoring native plugins |
 
-The `[build-plugin]` extra pulls **`dead-cst-plugin-host`**, a data-only,
-platform-specific package shipping the runtime dylib + its `.rlib` /
-proc-macro-dylib dependency closure + `libstd`, all relocatable. `build-plugin`
-finds it via `import dead_cst_plugin_host`. It's large because `rustc` needs the
-full dependency closure to compile a plugin against the runtime; the default
-wheel ships only the final linked, stripped extension.
+The base `dead-cst` macOS/Linux wheel carries the shared runtime dylib + libstd
+alongside the `_native` shim (so it's a bit larger than a pure static build, and
+the host runs the shared runtime). The `[build-plugin]` extra then pulls
+**`dead-cst-plugin-host`**, a data-only, platform-specific package shipping only
+the **compile closure**: the `.rlib` dependency archives + proc-macro dylibs
+`rustc` needs to validate the crate graph. `build-plugin` finds it via `import
+dead_cst_plugin_host`. It's large because `rustc` needs the full closure to
+compile against the runtime; nothing in it is needed at *runtime*.
 
-Maintainers produce that payload with **`dead-cst bundle-plugin-host`**, which
-builds the runtime, gathers the closure, rewrites install names / rpaths to
-`@rpath` / `@loader_path`, strips + ad-hoc re-signs the dylibs, and drops it
-into the `dead_cst_plugin_host` package. (CI wheels for it are still
-[in progress](#limitations).)
+Maintainers produce both halves from **one** prefer-dynamic build, so the
+runtime dylib's SVH matches the rlib closure plugins compile against. **`dead-cst
+bundle-plugin-host`** does that build and gathers the rlib closure into the
+`dead_cst_plugin_host` package; the publish workflow then repacks the runtime
+dylib + libstd into the base wheel (`$ORIGIN` / `@loader_path`, stripped) and
+builds one `py3-none-<plat>` `dead-cst-plugin-host` wheel per target (macOS
+arm64 + Linux x86_64/aarch64). Both wheels are version-locked by
+`scripts/stamp_version.py` and shipped to TestPyPI on every push to `main`, to
+PyPI on release.
 
 ---
 
@@ -199,12 +312,19 @@ into the `dead_cst_plugin_host` package. (CI wheels for it are still
 
 This is a preview. Known gaps:
 
-- **macOS (arm64) only.** Linux/Windows loader plumbing isn't wired yet.
+- **macOS (arm64) and Linux only.** The Windows wheel is static — it runs
+  analysis fine but can't load native plugins (no shared runtime); the loader
+  plumbing isn't wired there. Plugins need the shipped *dynamic* macOS/Linux
+  wheel: a dev/static checkout has no in-package runtime dylib, so
+  `build-plugin` there asks you to install a dynamic wheel first.
 - **Single-`.rs` plugins.** `build-plugin` compiles one source file; multi-crate
   plugins with their own dependencies are a follow-up.
-- **No published `dead-cst-plugin-host` wheels yet.** Today the bundle is built
-  locally (`bundle-plugin-host`) or from a source checkout; the cross-platform
-  CI that publishes the `[build-plugin]` payload is still to come.
+- **`dead-cst-plugin-host` wheels are published to TestPyPI** (per push to
+  `main`) **and PyPI** (per release), one per macOS arm64 / Linux x86_64 /
+  Linux aarch64; their version is kept in lockstep with `dead-cst` by
+  `scripts/stamp_version.py`. The base wheel's dynamic-runtime repack uses
+  [`patchelf`](https://github.com/NixOS/patchelf) on Linux (present in the
+  manylinux build image).
 - **Recompile per release**, by design (full Rust fidelity has no stable ABI).
   The airlock makes a mismatch a clean error, not a crash.
 - **Python plugins remain the supported extension path** for anything that

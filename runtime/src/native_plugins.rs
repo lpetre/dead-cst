@@ -217,20 +217,79 @@ impl PerFilePluginKind {
     }
 }
 
-/// Salsa-tracked per-file plugin invocation. Keyed on ``(file,
-/// kind)``; re-runs only when the file's tracked inputs
-/// (``file_to_nodes`` / ``parsed_module`` / ``line_index``) change.
-/// Returns the file-local ops the harness translates to global
-/// indices at apply time.
+/// Salsa cache-key identifying *which* per-file plugin a
+/// [`per_file_plugin_ops`] invocation is for. `Copy + 'static` so it can be
+/// a salsa tracked-function argument. Builtin impls name themselves by
+/// [`PerFilePluginKind`]; external dylib plugins by a process-stable id
+/// assigned at load (see [`register_external_per_file`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum PerFilePluginId {
+    Builtin(PerFilePluginKind),
+    External(u32),
+}
+
+/// Process-global registry of per-file external plugins, indexed by the id
+/// baked into [`PerFilePluginId::External`].
+///
+/// Why a global: [`per_file_plugin_ops`] is a salsa tracked function, so its
+/// key must be `Copy + 'static` — it cannot carry a `&dyn ExternalPlugin`.
+/// We give each per-file external plugin a small stable id at load and look
+/// the trait object back up here from inside the query. The mapping is
+/// append-only and immutable for a given id for the process lifetime, so the
+/// untracked read is sound: a memoized result stays valid exactly as long as
+/// the file's tracked inputs are unchanged, identical to the builtin
+/// enum-dispatch path. (Ids are never reused; a plugin's `Arc` is retained
+/// for the session.)
+static EXTERNAL_PER_FILE_PLUGINS: std::sync::OnceLock<
+    std::sync::RwLock<Vec<Arc<dyn plugin_api::ExternalPlugin>>>,
+> = std::sync::OnceLock::new();
+
+/// Register a per-file external plugin and return its process-stable id.
+fn register_external_per_file(plugin: Arc<dyn plugin_api::ExternalPlugin>) -> u32 {
+    let reg = EXTERNAL_PER_FILE_PLUGINS.get_or_init(|| std::sync::RwLock::new(Vec::new()));
+    let mut guard = reg.write().expect("external per-file registry poisoned");
+    let id = guard.len() as u32;
+    guard.push(plugin);
+    id
+}
+
+/// Look up a per-file external plugin by id.
+fn external_per_file_plugin(id: u32) -> Option<Arc<dyn plugin_api::ExternalPlugin>> {
+    EXTERNAL_PER_FILE_PLUGINS
+        .get()?
+        .read()
+        .expect("external per-file registry poisoned")
+        .get(id as usize)
+        .map(Arc::clone)
+}
+
+/// Salsa-tracked per-file plugin invocation. Keyed on ``(file, id)``;
+/// re-runs only when the file's tracked inputs (``file_to_nodes`` /
+/// ``parsed_module`` / ``line_index``) change. Returns the file-local ops
+/// the harness translates to global indices at apply time.
 #[salsa::tracked(returns(ref), heap_size = ruff_memory_usage::heap_size)]
 pub(crate) fn per_file_plugin_ops(
     db: &dyn ProjectDb,
     file: File,
-    kind: PerFilePluginKind,
+    id: PerFilePluginId,
 ) -> Vec<FileLocalOpData> {
     let file_ctx = FileContext::new(db, file);
     let mut sink = Vec::new();
-    kind.run_on_file(&file_ctx, &mut sink);
+    match id {
+        PerFilePluginId::Builtin(kind) => kind.run_on_file(&file_ctx, &mut sink),
+        PerFilePluginId::External(plugin_id) => {
+            // Resolve the plugin and its per-file capability from the
+            // registry; a stale id (shouldn't happen) yields no ops.
+            if let Some(plugin) = external_per_file_plugin(plugin_id) {
+                if let Some(per_file) = plugin.per_file() {
+                    let pctx = plugin_api::PluginFileCtx::new(&file_ctx);
+                    let mut ops = plugin_api::FileOps::new();
+                    per_file.run_on_file(&pctx, &mut ops);
+                    sink = ops.into_inner();
+                }
+            }
+        }
+    }
     sink
 }
 
@@ -247,13 +306,19 @@ pub(crate) enum NativePluginKind {
     ProjectWide(Box<dyn NativePluginImpl>),
     PerFile(PerFilePluginKind),
     /// External native plugin loaded from a dylib through the ABI airlock
-    /// (see [`load_native_plugins`]). Holds the boxed trait object and a
-    /// refcount on the loaded library so its code stays mapped for the
-    /// plugin's lifetime. Only meaningful in a `-C prefer-dynamic` build
-    /// where the extension and the plugin share one `dead-cst-runtime`.
+    /// (see [`load_native_plugins`]). Holds the trait object and a refcount
+    /// on the loaded library so its code stays mapped for the plugin's
+    /// lifetime. Only meaningful in a `-C prefer-dynamic` build where the
+    /// extension and the plugin share one `dead-cst-runtime`.
+    ///
+    /// `per_file_id` is `Some(id)` when the plugin opted into per-file
+    /// dispatch (`ExternalPlugin::per_file() -> Some`) — the host then routes
+    /// it through the salsa-cached [`per_file_plugin_ops`] query keyed on
+    /// [`PerFilePluginId::External`] instead of the project-wide `run`.
     External {
         name: String,
-        plugin: Box<dyn plugin_api::ExternalPlugin>,
+        plugin: Arc<dyn plugin_api::ExternalPlugin>,
+        per_file_id: Option<u32>,
         _lib: Arc<libloading::Library>,
     },
 }
@@ -418,19 +483,102 @@ impl PerFileNativePluginImpl for MainBlockPluginImpl {
 /// frozen graph and emits ops through [`PluginOps`] — it never touches the
 /// internal `PreparedOp` / `ProjectContext` types directly, so the surface
 /// an out-of-tree author depends on stays narrow.
+///
+/// The view is **index-based**: every query returns positional indices into
+/// the frozen node list (the same index space [`PluginOps`] emits against),
+/// and [`PluginCtx::node`] turns an index into an owned [`NodeView`]. No
+/// `Python<'_>` token is ever exposed — the methods read `#[pyclass(frozen)]`
+/// data directly and acquire the GIL internally only where the underlying
+/// query needs it.
 pub mod plugin_api {
+    use pyo3::Python;
+
+    use super::{FileContext, FileLocalOpData};
     use crate::builder::PreparedOp;
+    use crate::graph::{intern_kind, NodeFlags};
     use crate::project::ProjectContext;
+
+    // Re-exported so a per-file plugin can name the raw AST / range types
+    // [`PluginFileCtx::parsed`] and [`PluginFileCtx::line_span`] traffic in
+    // without depending on the exact ruff crate paths.
+    pub use ruff_db::parsed::ParsedModuleRef;
+    pub use ruff_text_size::TextRange;
+
+    /// `NodeFlags::ENTRYPOINT` re-exported for plugin authors: set it on a
+    /// node minted via [`PluginOps::add_synthetic_node`] /
+    /// [`FileOps::add_synthetic_node`] to make that node a reachability seed.
+    /// Single source of truth — tracks the internal bit.
+    pub const FLAG_ENTRYPOINT: u32 = NodeFlags::ENTRYPOINT;
 
     /// Contract an external native plugin implements. The host calls
     /// [`run`](ExternalPlugin::run) once per materialize against the frozen
     /// graph, then folds the emitted ops in as a single batch.
+    ///
+    /// A plugin can optionally opt into **per-file** dispatch by also
+    /// implementing [`PerFilePlugin`] and returning `Some(self)` from
+    /// [`per_file`](ExternalPlugin::per_file). When it does, the host ignores
+    /// [`run`](ExternalPlugin::run) and instead invokes
+    /// [`PerFilePlugin::run_on_file`] once per project file through a
+    /// salsa-cached query — so an unchanged file's ops are reused across a
+    /// `re_materialize` with zero re-run. (Same fast-path the in-tree
+    /// `MainBlockPlugin` rides.)
     pub trait ExternalPlugin: Send + Sync {
         /// Human-readable name (surfaced in progress logs).
         fn name(&self) -> &str;
-        /// Inspect `ctx` and append ops to `ops`. Same frozen-graph
-        /// contract as the in-tree native path.
-        fn run(&self, ctx: &PluginCtx<'_>, ops: &mut PluginOps);
+
+        /// Inspect the whole frozen graph and append ops to `ops`. Same
+        /// frozen-graph contract as the in-tree native path. Default no-op
+        /// so a pure per-file plugin needn't implement it; the host skips it
+        /// entirely when [`per_file`](ExternalPlugin::per_file) is `Some`.
+        fn run(&self, _ctx: &PluginCtx<'_>, _ops: &mut PluginOps) {}
+
+        /// Opt into per-file (salsa-cached) dispatch by returning
+        /// `Some(self)`. The default `None` keeps the plugin project-wide.
+        ///
+        /// Whether a plugin is per-file is read **once, at load** — it must
+        /// not depend on runtime state.
+        fn per_file(&self) -> Option<&dyn PerFilePlugin> {
+            None
+        }
+    }
+
+    /// Per-file capability for an [`ExternalPlugin`]. Invoked once per
+    /// project file with a restricted [`PluginFileCtx`]; emits file-local
+    /// ops into [`FileOps`].
+    ///
+    /// **Purity contract.** `run_on_file` must be a pure function of its
+    /// `file` — it may read only that file's nodes / parsed AST (everything
+    /// [`PluginFileCtx`] exposes) and must not consult project-wide state,
+    /// other files, globals, the clock, or the filesystem. The host caches
+    /// the result in salsa keyed on the file's tracked inputs, so an impure
+    /// `run_on_file` would serve stale ops after an unrelated edit. Ops may
+    /// only reference nodes *in this file* (file-local indices) — that
+    /// restriction is what makes the output cacheable.
+    pub trait PerFilePlugin: Send + Sync {
+        /// Walk `file` and append this file's ops to `ops`.
+        fn run_on_file(&self, file: &PluginFileCtx<'_>, ops: &mut FileOps);
+    }
+
+    /// Owned, plain-data snapshot of one graph node, returned by
+    /// [`PluginCtx::node`]. Decoupled from the internal `SymbolNode`
+    /// pyclass so the author-facing shape stays stable across releases.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct NodeView {
+        /// Positional index of this node in the frozen graph.
+        pub idx: usize,
+        /// Fully-qualified name (e.g. `pkg.mod.func`).
+        pub fqname: String,
+        /// One of `function`, `class`, `variable`, `import`, `type_alias`,
+        /// `module`, `synthetic`.
+        pub kind: String,
+        /// Source path the node was declared in (empty for synthetics).
+        pub path: String,
+        /// 1-based start line, or 0 for synthetic nodes.
+        pub start_line: usize,
+        /// 1-based end line, or 0 for synthetic nodes.
+        pub end_line: usize,
+        /// `NodeFlags` bitset (see [`FLAG_ENTRYPOINT`]).
+        pub flags: u32,
     }
 
     /// Restricted, mostly-stable view of the frozen graph for external
@@ -445,6 +593,101 @@ pub mod plugin_api {
             Self { inner }
         }
 
+        // --- node reads -----------------------------------------------------
+
+        /// Total number of nodes in the frozen graph. Indices in
+        /// `0..node_count()` are valid arguments to [`Self::node`].
+        pub fn node_count(&self) -> usize {
+            self.inner
+                .materialized("plugin")
+                .map(|o| o.builder.nodes.len())
+                .unwrap_or(0)
+        }
+
+        /// Resolve an index to an owned [`NodeView`], or `None` if out of
+        /// range. Reads frozen pyclass data directly — no GIL, no clone of
+        /// the underlying `SymbolNode`.
+        pub fn node(&self, idx: usize) -> Option<NodeView> {
+            let outputs = self.inner.materialized("plugin").ok()?;
+            let node = outputs.builder.nodes.get(idx)?.get();
+            Some(NodeView {
+                idx,
+                fqname: node.fqname.clone(),
+                kind: node.kind.to_string(),
+                path: node.path.clone(),
+                start_line: node.start_line,
+                end_line: node.end_line,
+                flags: node.flags,
+            })
+        }
+
+        // --- structural lookups (index-returning, GIL-free) -----------------
+
+        /// O(1) module-node lookup by dotted fqname.
+        pub fn find_module(&self, fqname: &str) -> Option<usize> {
+            self.inner.find_module_idx(fqname).unwrap_or(None)
+        }
+
+        /// Every declaration node with this exact fqname (more than one
+        /// when a name is shadowed; see the graph-model invariants).
+        pub fn find_declarations(&self, fqname: &str) -> Vec<usize> {
+            self.inner
+                .find_declarations_indices(fqname)
+                .unwrap_or_default()
+        }
+
+        /// O(1) module-node lookup by source path.
+        pub fn module_for(&self, path: &str) -> Option<usize> {
+            self.inner.module_for_indices(path).unwrap_or(None)
+        }
+
+        /// Resolve a dotted fqname to a decl or module node, walking back
+        /// through dotted segments for method/attribute fqnames. `None`
+        /// when nothing matches.
+        pub fn resolve(&self, fqname: &str) -> Option<usize> {
+            self.inner.resolve_idx(fqname).unwrap_or(None)
+        }
+
+        /// Every node whose source path starts with `path_prefix` — a
+        /// cheap way to scope a plugin to one package/directory.
+        pub fn decls_under(&self, path_prefix: &str) -> Vec<usize> {
+            Python::with_gil(|py| self.inner.decls_under_indices(py, path_prefix))
+                .unwrap_or_default()
+        }
+
+        /// Transitive subclasses of the class at `class_idx` (empty when
+        /// `class_idx` isn't a class node).
+        pub fn find_subclasses_of(&self, class_idx: usize) -> Vec<usize> {
+            Python::with_gil(|py| self.inner.find_subclasses_of_idx(py, class_idx))
+                .unwrap_or_default()
+        }
+
+        // --- reachability ---------------------------------------------------
+
+        /// Forward closure: every node reachable from `root_idx` by
+        /// following graph edges (dead-branch edges included, matching the
+        /// default traversal).
+        pub fn descendants(&self, root_idx: usize) -> Vec<usize> {
+            self.inner
+                .descendants_indices(root_idx, 0)
+                .unwrap_or_default()
+        }
+
+        /// Reverse closure: every node that can reach `decl_idx`.
+        pub fn ancestors(&self, decl_idx: usize) -> Vec<usize> {
+            self.inner
+                .ancestors_indices(decl_idx, 0)
+                .unwrap_or_default()
+        }
+
+        /// One-hop reverse step: every node with an edge directly into
+        /// `idx`.
+        pub fn direct_predecessors(&self, idx: usize) -> Vec<usize> {
+            self.inner
+                .direct_predecessors_idx(idx, 0)
+                .unwrap_or_default()
+        }
+
         /// Each top-level `if __name__ == "__main__":` block as
         /// `(module_node_idx, [decl_node_idx, ...])`.
         pub fn main_blocks(&self) -> Vec<(usize, Vec<usize>)> {
@@ -454,6 +697,8 @@ pub mod plugin_api {
 
     /// Op sink for external plugins. Wraps the internal `PreparedOp` vec so
     /// plugins emit through named methods instead of constructing internals.
+    /// Mirrors the three Python graph ops a plugin can yield —
+    /// `AddEntrypointByIdx` / `AddEdgeByIdx` / `AddNodeByIdx`.
     pub struct PluginOps {
         sink: Vec<PreparedOp>,
     }
@@ -472,6 +717,177 @@ pub mod plugin_api {
         pub fn keep_alive(&mut self, decl_idx: usize, marker: String) {
             self.sink
                 .push(PreparedOp::EntrypointByIdx { decl_idx, marker });
+        }
+
+        /// Add a reachability edge `src_idx -> dst_idx` between two
+        /// existing nodes. Mirrors `AddEdgeByIdx`.
+        pub fn add_edge(&mut self, src_idx: usize, dst_idx: usize) {
+            self.sink.push(PreparedOp::EdgeByIdx {
+                src_idx,
+                dst_idx,
+                flags: 0,
+            });
+        }
+
+        /// Mint a new `kind="synthetic"` node named `fqname` with `flags`
+        /// (see [`FLAG_ENTRYPOINT`]) and an out-edge to each index in
+        /// `edges_to_idx`. Mirrors `AddNodeByIdx`; the host bounds-checks
+        /// every endpoint at apply time and rejects a dangling index
+        /// rather than minting an unconnected node.
+        pub fn add_synthetic_node(&mut self, fqname: String, flags: u32, edges_to_idx: Vec<usize>) {
+            self.sink.push(PreparedOp::NodeByIdx {
+                fqname,
+                kind: intern_kind("synthetic").expect("'synthetic' is a valid kind"),
+                path: String::new(),
+                flags,
+                edges_from_idx: Vec::new(),
+                edges_to_idx,
+            });
+        }
+    }
+
+    // ---- per-file surface --------------------------------------------------
+
+    /// Owned, plain-data snapshot of one node in a single file, returned by
+    /// [`PluginFileCtx::nodes`] / [`PluginFileCtx::node`]. The `local_idx`
+    /// addresses this file only — it's the index space [`FileOps`] emits
+    /// against, *not* the project-wide [`NodeView::idx`].
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct FileNodeView {
+        /// File-local index (0 is always the synthetic module node).
+        pub local_idx: u32,
+        /// Fully-qualified name.
+        pub fqname: String,
+        /// One of `function`, `class`, `variable`, `import`, `type_alias`,
+        /// `module`, `synthetic`.
+        pub kind: String,
+        /// Source path the node was declared in.
+        pub path: String,
+        /// 1-based start line.
+        pub start_line: usize,
+        /// 1-based end line.
+        pub end_line: usize,
+        /// `NodeFlags` bitset.
+        pub flags: u32,
+    }
+
+    /// Restricted, single-file view handed to [`PerFilePlugin::run_on_file`].
+    /// Exposes only this file's salsa-tracked nodes + parsed AST — no
+    /// project-wide queries — which is exactly what makes a per-file plugin's
+    /// output a pure function of the file (and therefore cacheable).
+    pub struct PluginFileCtx<'a> {
+        inner: &'a FileContext<'a>,
+    }
+
+    impl<'a> PluginFileCtx<'a> {
+        pub(crate) fn new(inner: &'a FileContext<'a>) -> Self {
+            Self { inner }
+        }
+
+        /// This file's module fqname.
+        pub fn module_fqname(&self) -> &str {
+            self.inner.module_fqname()
+        }
+
+        /// File-local index of the synthetic module node (always 0).
+        pub fn module_local_idx(&self) -> u32 {
+            self.inner.module_local_idx()
+        }
+
+        /// Number of nodes in this file (index 0 is the module node, the
+        /// rest are top-level decls). Valid `local_idx` are `0..node_count()`.
+        pub fn node_count(&self) -> usize {
+            self.inner.nodes().len()
+        }
+
+        /// Resolve a file-local index to an owned [`FileNodeView`].
+        pub fn node(&self, local_idx: u32) -> Option<FileNodeView> {
+            let node = self.inner.nodes().get(local_idx as usize)?;
+            Some(FileNodeView {
+                local_idx,
+                fqname: node.fqname.clone(),
+                kind: node.kind.as_static_str().to_string(),
+                path: node.path.clone(),
+                start_line: node.start_line,
+                end_line: node.end_line,
+                flags: node.flags,
+            })
+        }
+
+        /// Every node in this file as a [`FileNodeView`], in file-local
+        /// index order.
+        pub fn nodes(&self) -> Vec<FileNodeView> {
+            self.inner
+                .nodes()
+                .iter()
+                .enumerate()
+                .map(|(i, node)| FileNodeView {
+                    local_idx: i as u32,
+                    fqname: node.fqname.clone(),
+                    kind: node.kind.as_static_str().to_string(),
+                    path: node.path.clone(),
+                    start_line: node.start_line,
+                    end_line: node.end_line,
+                    flags: node.flags,
+                })
+                .collect()
+        }
+
+        /// 1-based `(start_line, end_line)` of a byte `range` in this file,
+        /// via the salsa-cached line index. Use it to map a [`TextRange`]
+        /// from [`Self::parsed`] onto the line numbers [`FileNodeView`]
+        /// carries.
+        pub fn line_span(&self, range: TextRange) -> (usize, usize) {
+            self.inner.line_span(range)
+        }
+
+        /// This file's parsed module (salsa-cached) for raw AST walks.
+        pub fn parsed(&self) -> ParsedModuleRef {
+            self.inner.parsed()
+        }
+
+        /// Convenience: the byte range of this file's top-level
+        /// `if __name__ == "__main__":` block, if any — the same helper the
+        /// in-tree `MainBlockPlugin` uses, so the common case needs no raw
+        /// AST walk.
+        pub fn main_block_range(&self) -> Option<TextRange> {
+            crate::helpers::find_main_block_range(&self.parsed())
+        }
+    }
+
+    /// File-local op sink for a [`PerFilePlugin`]. Mirrors
+    /// [`PluginOps::add_synthetic_node`] but in this file's *local* index
+    /// space — endpoints are positions in [`PluginFileCtx::nodes`], which
+    /// the host translates to global indices at apply time.
+    pub struct FileOps {
+        sink: Vec<FileLocalOpData>,
+    }
+
+    impl FileOps {
+        pub(crate) fn new() -> Self {
+            Self { sink: Vec::new() }
+        }
+
+        pub(crate) fn into_inner(self) -> Vec<FileLocalOpData> {
+            self.sink
+        }
+
+        /// Mint a `kind="synthetic"` node named `fqname` with `flags` (see
+        /// [`FLAG_ENTRYPOINT`]) and an out-edge to each file-local index in
+        /// `edges_to_local_idx`. References must stay within this file — a
+        /// local index with no node is dropped at apply time.
+        pub fn add_synthetic_node(
+            &mut self,
+            fqname: String,
+            flags: u32,
+            edges_to_local_idx: Vec<u32>,
+        ) {
+            self.sink.push(FileLocalOpData {
+                fqname,
+                kind: intern_kind("synthetic").expect("'synthetic' is a valid kind"),
+                flags,
+                edges_to_local_idx,
+            });
         }
     }
 }
@@ -560,10 +976,19 @@ pub(crate) fn load_native_plugins(path: String) -> PyResult<Vec<NativePlugin>> {
             let raw = (d.make)();
             let plugin_box: Box<Box<dyn plugin_api::ExternalPlugin>> =
                 Box::from_raw(raw as *mut Box<dyn plugin_api::ExternalPlugin>);
+            let plugin: Arc<dyn plugin_api::ExternalPlugin> = Arc::from(*plugin_box);
+            // Read the per-file capability once, at load: a per-file plugin
+            // is registered for salsa-cached dispatch and carries its id; a
+            // project-wide one keeps `None`.
+            let per_file_id = plugin
+                .per_file()
+                .is_some()
+                .then(|| register_external_per_file(Arc::clone(&plugin)));
             out.push(NativePlugin {
                 kind: NativePluginKind::External {
                     name,
-                    plugin: *plugin_box,
+                    plugin,
+                    per_file_id,
                     _lib: Arc::clone(&lib),
                 },
             });

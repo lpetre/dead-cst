@@ -1,0 +1,17 @@
+[package]
+name = "per_file_main_block"
+version = "0.13.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "per_file_main_block"
+crate-type = ["cdylib"]
+
+[dependencies]
+# Links the dead-cst-runtime *dylib* (under -C prefer-dynamic) so this
+# plugin and the dead_cst._native extension share one runtime instance.
+dead-cst-runtime = { path = "../../runtime" }
+# Match the extension's pyo3 features exactly so the resolver unifies to a
+# single pyo3 across the dylib boundary (else `Bound`/`PyErr` types diverge).
+pyo3 = { version = "0.22", features = ["abi3-py311", "multiple-pymethods", "extension-module"] }
