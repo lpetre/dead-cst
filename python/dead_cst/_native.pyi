@@ -353,9 +353,12 @@ class NativePlugin:
         ...
 
     def prepare(self, project_root: Any) -> None:
-        """``Plugin`` protocol's pre-graph hook. No-op for native
-        plugins today — every impl reads from the frozen ctx in
-        ``run``.
+        """``Plugin`` protocol's pre-graph hook. The harness calls it on
+        every plugin before graph construction; for a native plugin it is
+        forwarded to the underlying rust impl (a project-wide builtin or an
+        external dylib plugin's ``ExternalPlugin::prepare``), so an external
+        plugin can scan ``project_root`` for config up front. Per-file
+        plugins are pure functions of their file and take no prepare step.
         """
         ...
 

@@ -50,12 +50,20 @@ use pyo3::prelude::*;
 use ruff_db::files::File;
 use ruff_db::parsed::parsed_module;
 use ruff_db::source::line_index;
+use ruff_python_ast::visitor::Visitor;
+use ruff_python_ast::{Expr, Stmt};
+use ruff_text_size::{Ranged, TextRange};
+use rustc_hash::FxHashSet;
 use ty_project::Db as ProjectDb;
 
 use crate::builder::PreparedOp;
-use crate::file_payload::{file_to_nodes, NodeData};
+use crate::file_payload::{file_to_nodes, NodeData, NodeKind};
 use crate::graph::{intern_kind, NodeFlags};
-use crate::helpers::{find_main_block_range, is_dunder_name};
+use crate::helpers::{
+    collect_modules_imports_local, decorators_match_imports, find_main_block_range, is_dunder_name,
+    matched_call_target_any, top_level_assign_to_name, FactoryCallFinder,
+};
+use crate::ingest::file_package_name;
 use crate::project::ProjectContext;
 
 /// Rust-side plugin contract. Each impl describes how to derive ops
@@ -89,6 +97,14 @@ pub(crate) trait NativePluginImpl: Send + Sync {
     /// by the apply pass after every plugin returns.
     #[allow(dead_code)]
     fn run(&self, ctx: &ProjectContext, sink: &mut Vec<PreparedOp>) -> PyResult<()>;
+
+    /// Pre-graph hook, mirroring the Python ``Plugin.prepare`` contract:
+    /// called once with the project root before any graph construction, so
+    /// the impl can scan for config files / framework manifests. Default
+    /// no-op. Runs before the graph exists, so it must not touch
+    /// ``ProjectContext``.
+    #[allow(dead_code)]
+    fn prepare(&self, _project_root: &str) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -104,24 +120,41 @@ pub(crate) trait NativePluginImpl: Send + Sync {
 // plugin can only reference nodes in its own file, so its output is a
 // pure function of that file's tracked inputs.
 //
-// Ops are emitted in a *file-local* index space ([`FileLocalOpData`]),
+// Ops are emitted in a *file-local* index space ([`FileLocalOp`]),
 // positions into ``FileNodes(file).refs``. The harness translates
 // those to global indices at apply time via the ``ref_to_global`` map.
 // ---------------------------------------------------------------------------
 
-/// File-local op produced by a [`PerFileNativePluginImpl`]. Mirrors
-/// ``AddNodeByIdx`` but with ``edges_to_local_idx`` as positions into
-/// the *file's own* ``FileNodes.refs`` array rather than global graph
-/// indices. Salsa-cached as the per-file plugin's output, so it must
-/// be pure rust + ``salsa::Update`` (no ``File`` handle, no global
-/// idx — both would couple the cache to project-wide assemble order).
+/// File-local op produced by a [`PerFileNativePluginImpl`]. Every
+/// endpoint is a *file-local* index (position in the file's own
+/// ``FileNodes.refs`` array), never a global graph index — the harness
+/// translates to global indices at apply time. Salsa-cached as the
+/// per-file plugin's output, so it must be pure rust + ``salsa::Update``
+/// (no ``File`` handle, no global idx — both would couple the cache to
+/// project-wide assemble order). Mirrors the three project-wide
+/// ``*ByIdx`` ops, restricted to a single file's index space.
 #[derive(Debug, Clone, Eq, PartialEq, salsa::Update, get_size2::GetSize)]
-pub(crate) struct FileLocalOpData {
-    pub(crate) fqname: String,
-    pub(crate) kind: &'static str,
-    pub(crate) flags: u32,
-    /// Indices into the owning file's ``FileNodes.refs`` array.
-    pub(crate) edges_to_local_idx: Vec<u32>,
+pub(crate) enum FileLocalOp {
+    /// Mint a synthetic node in this file (`AddNodeByIdx` shape) with an
+    /// out-edge to each file-local index in ``edges_to_local_idx``.
+    Node {
+        fqname: String,
+        kind: &'static str,
+        flags: u32,
+        /// Indices into the owning file's ``FileNodes.refs`` array.
+        edges_to_local_idx: Vec<u32>,
+    },
+    /// Reachability edge between two nodes in this file (`AddEdgeByIdx`
+    /// shape). Both endpoints are file-local indices.
+    Edge {
+        src_local_idx: u32,
+        dst_local_idx: u32,
+        flags: u32,
+    },
+    /// Keep a node in this file alive via a synthetic entrypoint marker
+    /// (`AddEntrypointByIdx` shape). ``decl_local_idx`` is a file-local
+    /// index.
+    Entrypoint { decl_local_idx: u32, marker: String },
 }
 
 /// Read-only, single-file view handed to a [`PerFileNativePluginImpl`].
@@ -173,10 +206,212 @@ impl<'db> FileContext<'db> {
     pub(crate) fn parsed(&self) -> ruff_db::parsed::ParsedModuleRef {
         parsed_module(self.db, self.file).load(self.db)
     }
+
+    // --- file-local query helpers ------------------------------------------
+    //
+    // Ready-made matching so a per-file plugin needn't re-implement the
+    // import / decorator / construction / call AST walk by hand. Each
+    // returns *file-local* indices (positions in [`Self::nodes`]) — exactly
+    // the index space [`FileLocalOp`] / [`plugin_api::FileOps`] emit against.
+    // All are pure functions of the file's tracked inputs (parsed AST +
+    // nodes), so they preserve the per-file salsa-cache contract. They reuse
+    // the same helpers the project-wide ``query(ctx).decorators()`` /
+    // ``.constructions()`` / ``.calls()`` DSL is built on, so a per-file
+    // plugin and its project-wide twin match identically.
+
+    /// This file's enclosing package, for resolving relative imports.
+    fn file_package(&self) -> Option<String> {
+        file_package_name(self.db, self.file)
+    }
+
+    /// File-local index of the top-level decl whose name occupies
+    /// `name_range`, found by source line. Top-level decls never share a
+    /// line, so the line is a unique key (a decl's [`NodeData::start_line`]
+    /// is snapped to its keyword/name line). The module node (index 0) and
+    /// `import` nodes are skipped so an assignment / def on an import's line
+    /// can't be misattributed.
+    fn local_idx_for_name_range(&self, name_range: TextRange) -> Option<u32> {
+        let (line, _) = self.line_span(name_range);
+        self.nodes()
+            .iter()
+            .position(|n| {
+                n.start_line == line && !matches!(n.kind, NodeKind::Module | NodeKind::Import)
+            })
+            .map(|i| i as u32)
+    }
+
+    /// Merged ``{local_name -> upstream_target}`` import map for `names`
+    /// imported from any of `modules`. Empty when this file imports nothing
+    /// matching — callers use that as the cheap early-out.
+    fn matching_imports(
+        &self,
+        parsed: &ruff_db::parsed::ParsedModuleRef,
+        modules: &[String],
+        names: &FxHashSet<&str>,
+    ) -> rustc_hash::FxHashMap<String, String> {
+        collect_modules_imports_local(parsed, modules, names, self.file_package().as_deref())
+    }
+
+    /// True if this file imports any of `modules` — the per-file mirror of
+    /// ``query(ctx).imports().of(module).exists()``. A presence guard a
+    /// plugin can check before doing heavier per-file work.
+    pub(crate) fn imports_any_module(&self, modules: &[&str]) -> bool {
+        let parsed = self.parsed();
+        let file_package = self.file_package();
+        parsed.syntax().body.iter().any(|stmt| match stmt {
+            Stmt::Import(im) => im.names.iter().any(|alias| {
+                let name = alias.name.as_str();
+                modules
+                    .iter()
+                    .any(|m| name == *m || name.starts_with(&format!("{m}.")))
+            }),
+            Stmt::ImportFrom(im) => {
+                let tail = im.module.as_ref().map(|n| n.as_str()).unwrap_or("");
+                let absolute = if im.level == 0 {
+                    if tail.is_empty() {
+                        return false;
+                    }
+                    tail.to_string()
+                } else {
+                    match crate::helpers::resolve_relative_import(
+                        im.level,
+                        tail,
+                        file_package.as_deref(),
+                    ) {
+                        Some(a) => a,
+                        None => return false,
+                    }
+                };
+                modules.iter().any(|m| {
+                    absolute == *m
+                        || absolute.starts_with(&format!("{m}."))
+                        || m.starts_with(&format!("{absolute}."))
+                })
+            }
+            _ => false,
+        })
+    }
+
+    /// File-local indices of top-level function / class decls carrying a
+    /// decorator that resolves (through this file's imports) to one of
+    /// `names` imported from one of `modules`. The per-file mirror of
+    /// ``query(ctx).decorators().where_module(modules).where_name(names)``.
+    pub(crate) fn decorated_decls(&self, modules: &[&str], names: &[&str]) -> Vec<u32> {
+        let modules_owned: Vec<String> = modules.iter().map(|m| m.to_string()).collect();
+        let names_set: FxHashSet<&str> = names.iter().copied().collect();
+        let parsed = self.parsed();
+        let imports = self.matching_imports(&parsed, &modules_owned, &names_set);
+        if imports.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for stmt in &parsed.syntax().body {
+            let (decorators, name_range) = match stmt {
+                Stmt::FunctionDef(f) => (&f.decorator_list, f.name.range()),
+                Stmt::ClassDef(c) => (&c.decorator_list, c.name.range()),
+                _ => continue,
+            };
+            if decorators_match_imports(decorators, &imports, &names_set).is_some() {
+                if let Some(idx) = self.local_idx_for_name_range(name_range) {
+                    out.push(idx);
+                }
+            }
+        }
+        out
+    }
+
+    /// File-local indices of top-level ``X = Ctor(...)`` / ``X: T =
+    /// Ctor(...)`` variable decls whose `Ctor` resolves to one of `names`
+    /// imported from one of `modules`. The per-file mirror of
+    /// ``query(ctx).constructions().where_module(...).where_name(...)``.
+    pub(crate) fn constructions(&self, modules: &[&str], names: &[&str]) -> Vec<u32> {
+        let modules_owned: Vec<String> = modules.iter().map(|m| m.to_string()).collect();
+        let names_set: FxHashSet<&str> = names.iter().copied().collect();
+        let parsed = self.parsed();
+        let imports = self.matching_imports(&parsed, &modules_owned, &names_set);
+        if imports.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for stmt in &parsed.syntax().body {
+            let Some((name_range, value)) = top_level_assign_to_name(stmt) else {
+                continue;
+            };
+            let Expr::Call(call) = value else {
+                continue;
+            };
+            if matched_call_target_any(call, &imports, &modules_owned, &names_set).is_some() {
+                if let Some(idx) = self.local_idx_for_name_range(name_range) {
+                    out.push(idx);
+                }
+            }
+        }
+        out
+    }
+
+    /// File-local indices of the decls whose body contains a call to one of
+    /// `names` imported from one of `modules`. A top-level function / class
+    /// owns calls anywhere in its subtree; module-scope calls attribute to
+    /// the module node (index 0). The per-file mirror of
+    /// ``query(ctx).calls().where_module(...).where_name(...)`` — returns
+    /// each owner once.
+    pub(crate) fn calls(&self, modules: &[&str], names: &[&str]) -> Vec<u32> {
+        let modules_owned: Vec<String> = modules.iter().map(|m| m.to_string()).collect();
+        let names_set: FxHashSet<&str> = names.iter().copied().collect();
+        let parsed = self.parsed();
+        let imports = self.matching_imports(&parsed, &modules_owned, &names_set);
+        if imports.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let mut seen: FxHashSet<u32> = FxHashSet::default();
+        let mut push_owner = |idx: u32, out: &mut Vec<u32>| {
+            if seen.insert(idx) {
+                out.push(idx);
+            }
+        };
+        for stmt in &parsed.syntax().body {
+            let (name_range, body): (Option<TextRange>, &[Stmt]) = match stmt {
+                Stmt::FunctionDef(f) => (Some(f.name.range()), &f.body),
+                Stmt::ClassDef(c) => (Some(c.name.range()), &c.body),
+                other => {
+                    let mut finder = FactoryCallFinder {
+                        imports: &imports,
+                        modules: &modules_owned,
+                        allowed: &names_set,
+                        kinds: FxHashSet::default(),
+                    };
+                    finder.visit_stmt(other);
+                    if !finder.kinds.is_empty() {
+                        push_owner(self.module_local_idx(), &mut out);
+                    }
+                    continue;
+                }
+            };
+            let mut finder = FactoryCallFinder {
+                imports: &imports,
+                modules: &modules_owned,
+                allowed: &names_set,
+                kinds: FxHashSet::default(),
+            };
+            for inner in body {
+                finder.visit_stmt(inner);
+            }
+            if finder.kinds.is_empty() {
+                continue;
+            }
+            if let Some(nr) = name_range {
+                if let Some(idx) = self.local_idx_for_name_range(nr) {
+                    push_owner(idx, &mut out);
+                }
+            }
+        }
+        out
+    }
 }
 
 /// Rust-side per-file plugin contract. Called once per project file
-/// with a restricted [`FileContext`]; pushes [`FileLocalOpData`] into
+/// with a restricted [`FileContext`]; pushes [`FileLocalOp`] into
 /// the sink. Pure function of the file's tracked inputs — no
 /// project-wide reads, no side effects — so the harness can cache the
 /// result in salsa keyed on ``(file, name())``.
@@ -184,7 +419,7 @@ pub(crate) trait PerFileNativePluginImpl: Send + Sync {
     /// Walk ``file_ctx`` and append this file's ops to ``sink``.
     /// Naming + salsa keying live on [`PerFilePluginKind`], so the
     /// trait itself only carries the work method.
-    fn run_on_file(&self, file_ctx: &FileContext<'_>, sink: &mut Vec<FileLocalOpData>);
+    fn run_on_file(&self, file_ctx: &FileContext<'_>, sink: &mut Vec<FileLocalOp>);
 }
 
 /// Salsa cache-key discriminant for a per-file plugin. A cheap
@@ -211,7 +446,7 @@ impl PerFilePluginKind {
     }
 
     /// Run the concrete impl for this kind against ``file_ctx``.
-    fn run_on_file(self, file_ctx: &FileContext<'_>, sink: &mut Vec<FileLocalOpData>) {
+    fn run_on_file(self, file_ctx: &FileContext<'_>, sink: &mut Vec<FileLocalOp>) {
         match self {
             PerFilePluginKind::MainBlock => MainBlockPluginImpl.run_on_file(file_ctx, sink),
             PerFilePluginKind::ModuleDunders => ModuleDundersPluginImpl.run_on_file(file_ctx, sink),
@@ -275,7 +510,7 @@ pub(crate) fn per_file_plugin_ops(
     db: &dyn ProjectDb,
     file: File,
     id: PerFilePluginId,
-) -> Vec<FileLocalOpData> {
+) -> Vec<FileLocalOp> {
     let file_ctx = FileContext::new(db, file);
     let mut sink = Vec::new();
     match id {
@@ -353,9 +588,21 @@ impl NativePlugin {
         }
     }
 
-    /// ``Plugin`` protocol's ``prepare(project_root)`` no-op hook.
-    /// Native plugins don't have a pre-graph prepare phase today.
-    fn prepare(&self, _project_root: PyObject) {}
+    /// ``Plugin`` protocol's ``prepare(project_root)`` pre-graph hook.
+    /// The harness calls this on every plugin before graph construction;
+    /// we forward it to the underlying native impl (project-wide builtin or
+    /// external dylib plugin). Per-file plugins are pure functions of their
+    /// file and take no prepare step, so that arm is a no-op. `project_root`
+    /// is coerced to its string form (it arrives as a ``pathlib.Path``).
+    fn prepare(&self, py: Python<'_>, project_root: PyObject) -> PyResult<()> {
+        let root = project_root.bind(py).str()?.to_string();
+        match &self.kind {
+            NativePluginKind::ProjectWide(inner) => inner.prepare(&root),
+            NativePluginKind::PerFile(_) => {}
+            NativePluginKind::External { plugin, .. } => plugin.prepare(&root),
+        }
+        Ok(())
+    }
 
     /// Construct the native ``MainBlockPlugin`` — same observable
     /// behaviour as ``dead_cst.plugins.MainBlockPlugin``, but
@@ -462,7 +709,7 @@ pub(crate) fn _reset_main_block_run_count() {
 pub(crate) struct MainBlockPluginImpl;
 
 impl PerFileNativePluginImpl for MainBlockPluginImpl {
-    fn run_on_file(&self, file_ctx: &FileContext<'_>, sink: &mut Vec<FileLocalOpData>) {
+    fn run_on_file(&self, file_ctx: &FileContext<'_>, sink: &mut Vec<FileLocalOp>) {
         MAIN_BLOCK_RUN_COUNT.fetch_add(1, Ordering::Relaxed);
         let parsed = file_ctx.parsed();
         let Some(block_range) = find_main_block_range(&parsed) else {
@@ -480,7 +727,7 @@ impl PerFileNativePluginImpl for MainBlockPluginImpl {
             }
         }
         let synthetic_kind = intern_kind("synthetic").expect("'synthetic' is a valid kind");
-        sink.push(FileLocalOpData {
+        sink.push(FileLocalOp::Node {
             fqname: format!("{MAIN_BLOCK_PREFIX}{}", file_ctx.module_fqname()),
             kind: synthetic_kind,
             flags: NodeFlags::ENTRYPOINT,
@@ -520,7 +767,7 @@ impl PerFileNativePluginImpl for MainBlockPluginImpl {
 pub mod plugin_api {
     use pyo3::Python;
 
-    use super::{FileContext, FileLocalOpData};
+    use super::{FileContext, FileLocalOp};
     use crate::builder::PreparedOp;
     use crate::graph::{intern_kind, NodeFlags};
     use crate::project::ProjectContext;
@@ -567,6 +814,18 @@ pub mod plugin_api {
         fn per_file(&self) -> Option<&dyn PerFilePlugin> {
             None
         }
+
+        /// Pre-graph hook, mirroring the Python `Plugin.prepare` contract:
+        /// the host calls it once with the project root (as a string) before
+        /// any graph construction, so a plugin can scan for config files or
+        /// framework manifests up front. Default no-op.
+        ///
+        /// Runs before the graph exists — it gets no [`PluginCtx`]. A
+        /// **per-file** plugin must keep `run_on_file` a pure function of its
+        /// file, so anything `prepare` stashes must not leak into per-file
+        /// output (that would break the salsa cache); use it for project-wide
+        /// `run` setup only.
+        fn prepare(&self, _project_root: &str) {}
     }
 
     /// Per-file capability for an [`ExternalPlugin`]. Invoked once per
@@ -880,6 +1139,44 @@ pub mod plugin_api {
         pub fn main_block_range(&self) -> Option<TextRange> {
             crate::helpers::find_main_block_range(&self.parsed())
         }
+
+        // --- ready-made queries ---------------------------------------------
+        //
+        // File-local matching that saves a per-file plugin from hand-rolling
+        // the import / decorator / construction / call AST walk. Each returns
+        // file-local indices (the index space [`FileOps`] emits against), so
+        // a plugin pipes the result straight into `ops.keep_alive(idx, ...)`
+        // / `ops.add_edge(...)`. Same matchers the in-tree project-wide DSL
+        // uses — a per-file plugin and its project-wide twin agree.
+
+        /// True if this file imports any of `modules`. A cheap presence
+        /// guard to short-circuit before heavier per-file work.
+        pub fn imports_any_module(&self, modules: &[&str]) -> bool {
+            self.inner.imports_any_module(modules)
+        }
+
+        /// File-local indices of top-level function / class decls decorated
+        /// by one of `names` imported from one of `modules`
+        /// (e.g. `modules=["flask"], names=["route"]` for `@app.route` via
+        /// a `Flask` instance is *not* this — this matches decorators bound
+        /// directly to an imported name; instance-method decorators need the
+        /// project-wide DSL).
+        pub fn decorated_decls(&self, modules: &[&str], names: &[&str]) -> Vec<u32> {
+            self.inner.decorated_decls(modules, names)
+        }
+
+        /// File-local indices of top-level ``X = Ctor(...)`` decls whose
+        /// `Ctor` is one of `names` imported from one of `modules`.
+        pub fn constructions(&self, modules: &[&str], names: &[&str]) -> Vec<u32> {
+            self.inner.constructions(modules, names)
+        }
+
+        /// File-local indices of decls whose body calls one of `names`
+        /// imported from one of `modules`; module-scope calls map to the
+        /// module node (index 0). Each owner appears once.
+        pub fn calls(&self, modules: &[&str], names: &[&str]) -> Vec<u32> {
+            self.inner.calls(modules, names)
+        }
     }
 
     /// File-local op sink for a [`PerFilePlugin`]. Mirrors
@@ -887,7 +1184,7 @@ pub mod plugin_api {
     /// space — endpoints are positions in [`PluginFileCtx::nodes`], which
     /// the host translates to global indices at apply time.
     pub struct FileOps {
-        sink: Vec<FileLocalOpData>,
+        sink: Vec<FileLocalOp>,
     }
 
     impl FileOps {
@@ -895,7 +1192,7 @@ pub mod plugin_api {
             Self { sink: Vec::new() }
         }
 
-        pub(crate) fn into_inner(self) -> Vec<FileLocalOpData> {
+        pub(crate) fn into_inner(self) -> Vec<FileLocalOp> {
             self.sink
         }
 
@@ -909,11 +1206,33 @@ pub mod plugin_api {
             flags: u32,
             edges_to_local_idx: Vec<u32>,
         ) {
-            self.sink.push(FileLocalOpData {
+            self.sink.push(FileLocalOp::Node {
                 fqname,
                 kind: intern_kind("synthetic").expect("'synthetic' is a valid kind"),
                 flags,
                 edges_to_local_idx,
+            });
+        }
+
+        /// Keep the node at file-local index `decl_local_idx` alive by
+        /// seeding it from a synthetic entrypoint tagged `marker`. The index
+        /// is a position in [`PluginFileCtx::nodes`]; an index with no node
+        /// is dropped at apply time.
+        pub fn keep_alive(&mut self, decl_local_idx: u32, marker: String) {
+            self.sink.push(FileLocalOp::Entrypoint {
+                decl_local_idx,
+                marker,
+            });
+        }
+
+        /// Add a reachability edge from `src_local_idx` to `dst_local_idx`.
+        /// Both endpoints are positions in [`PluginFileCtx::nodes`]; an edge
+        /// with an unresolvable endpoint is dropped at apply time.
+        pub fn add_edge(&mut self, src_local_idx: u32, dst_local_idx: u32) {
+            self.sink.push(FileLocalOp::Edge {
+                src_local_idx,
+                dst_local_idx,
+                flags: 0,
             });
         }
     }
@@ -1062,7 +1381,7 @@ const UNITTEST_BASE_FQNAMES: [&str; 2] = ["unittest.TestCase", "unittest.Isolate
 pub(crate) struct ModuleDundersPluginImpl;
 
 impl PerFileNativePluginImpl for ModuleDundersPluginImpl {
-    fn run_on_file(&self, file_ctx: &FileContext<'_>, sink: &mut Vec<FileLocalOpData>) {
+    fn run_on_file(&self, file_ctx: &FileContext<'_>, sink: &mut Vec<FileLocalOp>) {
         let mut targets: Vec<u32> = Vec::new();
         for (local_idx, node) in file_ctx.nodes().iter().enumerate() {
             let is_dunder_decl = matches!(node.kind.as_static_str(), "variable" | "function")
@@ -1079,7 +1398,7 @@ impl PerFileNativePluginImpl for ModuleDundersPluginImpl {
             return;
         }
         let synthetic = intern_kind("synthetic").expect("'synthetic' is a valid kind");
-        sink.push(FileLocalOpData {
+        sink.push(FileLocalOp::Node {
             fqname: format!("{MODULE_DUNDERS_PREFIX}{}", file_ctx.module_fqname()),
             kind: synthetic,
             flags: NodeFlags::ENTRYPOINT,
@@ -1127,7 +1446,7 @@ impl NativePluginImpl for InitSubclassPluginImpl {
 pub(crate) struct ServerConfigPluginImpl;
 
 impl PerFileNativePluginImpl for ServerConfigPluginImpl {
-    fn run_on_file(&self, file_ctx: &FileContext<'_>, sink: &mut Vec<FileLocalOpData>) {
+    fn run_on_file(&self, file_ctx: &FileContext<'_>, sink: &mut Vec<FileLocalOp>) {
         let nodes = file_ctx.nodes();
         let path = nodes[0].path.as_str();
         let basename = path
@@ -1154,7 +1473,7 @@ impl PerFileNativePluginImpl for ServerConfigPluginImpl {
             return;
         }
         let synthetic = intern_kind("synthetic").expect("'synthetic' is a valid kind");
-        sink.push(FileLocalOpData {
+        sink.push(FileLocalOp::Node {
             fqname: format!("{SERVER_CONFIG_PREFIX}{}", file_ctx.module_fqname()),
             kind: synthetic,
             flags: NodeFlags::ENTRYPOINT,
