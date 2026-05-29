@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 
+from dead_cst import _native as native
 from dead_cst.graph import NodeFlags
 from dead_cst.contrib import UnittestPlugin
 
@@ -172,7 +173,41 @@ def test_unittest_plugin_loads_via_cli_loader():
     from dead_cst.cli import _load_plugin
 
     plugin = _load_plugin("unittest")
-    assert isinstance(plugin, UnittestPlugin)
+    assert isinstance(plugin, native.NativePlugin)
+    assert plugin.name == "UnittestPlugin"
+
+
+def test_native_unittest_matches_python_plugin(build_plugin_graph, reachable_fqnames):
+    """``NativePlugin.unittest()`` produces the same reachable set as
+    ``UnittestPlugin()`` — same subclass walk, same lifecycle hooks."""
+    files = {
+        "pkg/__init__.py": "",
+        "pkg/things.py": """
+        import unittest
+
+        class MyThings(unittest.TestCase):
+            def test_one(self): pass
+
+        class AsyncThings(unittest.IsolatedAsyncioTestCase):
+            async def test_two(self): pass
+
+        class Helper: pass
+
+        def setUpModule(): pass
+        def tearDownModule(): pass
+        def load_tests(loader, tests, pattern): return tests
+        """,
+        "pkg/derived.py": """
+        from pkg.things import MyThings
+
+        class Derived(MyThings):
+            def test_three(self): pass
+        """,
+        "pkg/regular.py": "def untouched(): pass",
+    }
+    py_ctx = build_plugin_graph(files, [UnittestPlugin()])
+    rs_ctx = build_plugin_graph(files, [native.NativePlugin.unittest()])
+    assert reachable_fqnames(py_ctx) == reachable_fqnames(rs_ctx)
 
 
 def test_unittest_plugin_tags_seeds_as_testcase(build_plugin_graph):

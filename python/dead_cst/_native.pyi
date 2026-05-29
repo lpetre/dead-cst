@@ -388,6 +388,26 @@ class NativePlugin:
         """
         ...
 
+    @staticmethod
+    def server_config() -> NativePlugin:
+        """Native equivalent of
+        :class:`dead_cst.contrib.server_config.ServerConfigPlugin`.
+        Marks conventional WSGI/ASGI server-config modules
+        (``gunicorn.conf.py``, ``hypercorn.conf.py``, …) as entrypoints.
+        Per-file (salsa-cached); bakes the default filename set.
+        """
+        ...
+
+    @staticmethod
+    def unittest() -> NativePlugin:
+        """Native equivalent of
+        :class:`dead_cst.contrib.unittest.UnittestPlugin`. Keeps stdlib
+        ``unittest`` test classes (transitive subclasses of
+        ``TestCase`` / ``IsolatedAsyncioTestCase``) and module lifecycle
+        hooks alive.
+        """
+        ...
+
 def _builtin_native_plugin(name: str) -> NativePlugin | None:
     """Resolve a built-in plugin name (e.g. ``"main_block"``) to its
     native implementation, or ``None`` if no native plugin owns that
