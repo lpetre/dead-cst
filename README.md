@@ -296,8 +296,8 @@ their own salsa-cached queries over ty's database, there's also a **native
 runtime and runs against a live `ProjectContext`.
 
 ```bash
-pip install dead-cst[build-plugin]          # pulls the prebuilt runtime
-PLUGIN=$(dead-cst build-plugin my_plugin.rs)  # compile against it
+pip install dead-cst[build-plugin]            # pulls the rlib compile closure
+PLUGIN=$(dead-cst build-plugin my_plugin.rs)  # compile against the shared runtime
 ```
 
 ```python
@@ -306,7 +306,9 @@ plugins = native.load_native_plugins(PLUGIN)
 Analysis(root, plugins=plugins).materialize_all()
 ```
 
-This is a preview (macOS and Linux today, recompile-per-release). See
+The shipped macOS/Linux wheel runs the runtime as a shared dylib, so the built
+plugin loads with no extra steps. This is a preview (macOS and Linux today,
+recompile-per-release). See
 **[`NATIVE_PLUGINS.md`](NATIVE_PLUGINS.md)** for the full guide and the worked
 `examples/main_block_plugin/`.
 

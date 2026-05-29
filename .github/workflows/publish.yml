@@ -11,36 +11,30 @@ permissions:
   contents: read
 
 jobs:
-  # One platform-specific wheel per target. Maturin handles the
-  # cdylib build (abi3-py311, so a single wheel covers every Python
-  # >=3.11) and produces a manylinux/macos/windows wheel with the
-  # ``.so`` / ``.pyd`` embedded inside ``python/dead_cst/``.
-  # The package version is read straight from ``Cargo.toml``; bump
-  # manually per release (pydantic-core style).
+  # Windows ships the self-contained STATIC wheel (the runtime rlib linked into
+  # one `_native.pyd`). macOS + Linux ship a DYNAMIC wheel instead — see the
+  # `dynamic` job — because that's what lets end users load native plugins.
+  # build-plugin is macOS+Linux only, so Windows stays static.
   wheels:
-    name: Build wheel (${{ matrix.platform.target }})
+    name: Build static wheel (${{ matrix.platform.target }})
     runs-on: ${{ matrix.platform.runner }}
     strategy:
       fail-fast: false
       matrix:
         platform:
-          - { runner: ubuntu-latest,  target: x86_64-unknown-linux-gnu,  manylinux: "2_28" }
-          - { runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, manylinux: "2_28" }
-          - { runner: macos-14,       target: aarch64-apple-darwin,       manylinux: "auto" }
-          - { runner: windows-latest, target: x86_64-pc-windows-msvc,     manylinux: "auto" }
+          - { runner: windows-latest, target: x86_64-pc-windows-msvc, manylinux: "auto" }
     steps:
       - uses: actions/checkout@v6
         with:
           submodules: recursive
           fetch-depth: 0
-      - name: Stamp dev version
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      # Stamp dead-cst + dead-cst-plugin-host to the *same* version and pin the
+      # `[build-plugin]` extra to it. See scripts/stamp_version.py.
+      - name: Stamp versions (dead-cst + plugin-host in lockstep)
         shell: bash
         run: |
           python -m pip install --quiet setuptools-scm
-          version=$(python -c "from setuptools_scm import get_version; print(get_version(local_scheme='no-local-version'))" | sed 's/\.dev/-dev/')
-          sed -i.bak "s/^version = .*/version = \"$version\"/" Cargo.toml
-          rm Cargo.toml.bak
+          python scripts/stamp_version.py
       - uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.platform.target }}
@@ -52,6 +46,107 @@ jobs:
           name: wheel-${{ matrix.platform.target }}
           path: dist/
 
+  # macOS + Linux ship the DYNAMIC base wheel (a thin `_native` shim + the
+  # runtime dylib + libstd, `$ORIGIN`/`@loader_path`-relocated) plus the
+  # platform-specific `dead-cst-plugin-host` wheel (the rlib compile closure).
+  # Both are produced from ONE prefer-dynamic build so the runtime dylib's SVH
+  # matches the closure plugins compile against. Linux builds in manylinux_2_28
+  # containers for the glibc floor; rust is pinned via rust-toolchain.toml.
+  dynamic:
+    name: Dynamic wheel + plugin-host (${{ matrix.platform.target }})
+    runs-on: ${{ matrix.platform.runner }}
+    container: ${{ matrix.platform.container }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            plat: manylinux_2_28_x86_64
+            compat: manylinux_2_28
+            container: quay.io/pypa/manylinux_2_28_x86_64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            plat: manylinux_2_28_aarch64
+            compat: manylinux_2_28
+            container: quay.io/pypa/manylinux_2_28_aarch64
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            plat: macosx_11_0_arm64
+            compat: ""
+            container: ""
+    env:
+      # Match the static wheel's macOS floor so pip selects this wheel alongside it.
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          fetch-depth: 0
+      # The manylinux container checks out as root; mark the tree safe so git
+      # (and setuptools-scm) work. Harmless on the macOS host runner.
+      - name: Configure git safe.directory
+        shell: bash
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Install Rust (pinned via rust-toolchain.toml)
+        shell: bash
+        run: |
+          if ! command -v cargo >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --default-toolchain none --profile minimal
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
+      - name: Install uv
+        shell: bash
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Install Python 3.11
+        shell: bash
+        run: uv python install 3.11
+      - name: Stamp versions (dead-cst + plugin-host in lockstep)
+        shell: bash
+        run: uv run --no-project --with setuptools-scm python scripts/stamp_version.py
+      # Static skeleton — discarded binary, kept for its correct metadata +
+      # Python sources + platform tag; the repack swaps in the dynamic payload.
+      - name: Build static skeleton wheel (maturin)
+        shell: bash
+        run: |
+          compat="${{ matrix.platform.compat }}"
+          uv run --no-project --with "maturin>=1.7,<2" maturin build --release \
+            -i 3.11 ${compat:+--compatibility "$compat"} --out dist-static
+      # One prefer-dynamic build: populates the plugin-host rlib closure and
+      # leaves the runtime dylib + shim in target/plugin-host/release/deps for
+      # the repack. Install the skeleton wheel to get the `dead-cst` CLI without
+      # a third recompile.
+      - name: Build runtime closure (prefer-dynamic) + populate plugin-host
+        shell: bash
+        run: |
+          uv venv .ci-venv
+          uv pip install --python .ci-venv dist-static/*.whl
+          .ci-venv/bin/dead-cst bundle-plugin-host --release --source-root "$GITHUB_WORKSPACE"
+      - name: Repack base wheel as dynamic
+        shell: bash
+        run: |
+          uv run --no-project --with wheel python scripts/repack_dynamic_wheel.py \
+            dist-static/*.whl --deps-dir target/plugin-host/release/deps -o dist
+      - name: Build plugin-host wheel
+        shell: bash
+        run: |
+          cd plugin-host
+          uv run --no-project --with "setuptools>=70.1" --with wheel \
+            python setup.py bdist_wheel \
+            --plat-name "${{ matrix.platform.plat }}" \
+            --dist-dir "$GITHUB_WORKSPACE/dist-host"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.platform.target }}
+          path: dist/*.whl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plugin-host-${{ matrix.platform.target }}
+          path: dist-host/*.whl
+
   sdist:
     runs-on: ubuntu-latest
     steps:
@@ -59,13 +154,11 @@ jobs:
         with:
           submodules: recursive
           fetch-depth: 0
-      - name: Stamp dev version
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      - name: Stamp versions (dead-cst + plugin-host in lockstep)
+        shell: bash
         run: |
           python -m pip install --quiet setuptools-scm
-          version=$(python -c "from setuptools_scm import get_version; print(get_version(local_scheme='no-local-version'))" | sed 's/\.dev/-dev/')
-          sed -i.bak "s/^version = .*/version = \"$version\"/" Cargo.toml
-          rm Cargo.toml.bak
+          python scripts/stamp_version.py
       - uses: PyO3/maturin-action@v1
         with:
           command: sdist
@@ -77,13 +170,18 @@ jobs:
 
   publish-testpypi:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [wheels, sdist]
+    needs: [wheels, dynamic, sdist]
     runs-on: ubuntu-latest
     environment: testpypi
     steps:
       - uses: actions/download-artifact@v4
         with:
           pattern: "wheel-*"
+          merge-multiple: true
+          path: dist/
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: "plugin-host-*"
           merge-multiple: true
           path: dist/
       - uses: actions/download-artifact@v4
@@ -97,13 +195,18 @@ jobs:
 
   publish-pypi:
     if: github.event_name == 'release'
-    needs: [wheels, sdist]
+    needs: [wheels, dynamic, sdist]
     runs-on: ubuntu-latest
     environment: pypi
     steps:
       - uses: actions/download-artifact@v4
         with:
           pattern: "wheel-*"
+          merge-multiple: true
+          path: dist/
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: "plugin-host-*"
           merge-multiple: true
           path: dist/
       - uses: actions/download-artifact@v4
@@ -122,6 +225,11 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           pattern: "wheel-*"
+          merge-multiple: true
+          path: dist/
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: "plugin-host-*"
           merge-multiple: true
           path: dist/
       - uses: actions/download-artifact@v4
