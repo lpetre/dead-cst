@@ -306,7 +306,7 @@ plugins = native.load_native_plugins(PLUGIN)
 Analysis(root, plugins=plugins).materialize_all()
 ```
 
-This is a preview (macOS only today, recompile-per-release). See
+This is a preview (macOS and Linux today, recompile-per-release). See
 **[`NATIVE_PLUGINS.md`](NATIVE_PLUGINS.md)** for the full guide and the worked
 `examples/main_block_plugin/`.
 
