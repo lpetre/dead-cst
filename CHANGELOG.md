@@ -47,6 +47,32 @@ two versions.
     <version>`) and shipped to TestPyPI on every push to `main` and PyPI
     on release. The lockstep is mandatory — the runtime version is part
     of the ABI fingerprint. No Windows plugin support (static wheel).
+- **Fleshed-out external native plugin API.** The curated
+  `dead_cst_runtime::native_plugins::plugin_api` an external plugin
+  compiles against grew from a single `PluginCtx::main_blocks()` /
+  `PluginOps::keep_alive(...)` pair into a usable index-based surface.
+  `PluginCtx` now also exposes `node(idx)` (returning an owned
+  `NodeView`), `node_count()`, the structural lookups `find_module`,
+  `find_declarations`, `module_for`, `resolve`, `decls_under`,
+  `find_subclasses_of`, and the reachability walks `descendants`,
+  `ancestors`, `direct_predecessors`. `PluginOps` gained `add_edge(...)`
+  and `add_synthetic_node(...)` alongside `keep_alive(...)` — the three
+  mirror the Python `AddEntrypointByIdx` / `AddEdgeByIdx` /
+  `AddNodeByIdx` graph ops — plus a `FLAG_ENTRYPOINT` constant. Every
+  query is index-based and GIL-free; no `Python<'_>` token is exposed.
+- **Per-file external native plugins.** An external native plugin can
+  now opt into the salsa-cached *per-file* path (previously in-tree
+  only) by implementing the new `PerFilePlugin` trait and returning
+  `Some(self)` from `ExternalPlugin::per_file()`. When it does, the host
+  ignores the project-wide `run` and instead invokes
+  `run_on_file(file, ops)` once per project file through the same
+  salsa-cached query the in-tree `MainBlockPlugin` uses — so an
+  unchanged file's ops are reused across a `re_materialize` with zero
+  re-run. `run_on_file` gets a restricted single-file `PluginFileCtx`
+  (file-local nodes, parsed AST, `line_span`, `main_block_range`) and
+  emits file-local ops through `FileOps::add_synthetic_node`. The
+  per-file output must be a pure function of the file (the documented
+  cache-soundness contract). See `examples/per_file_main_block/`.
 - `Analysis.re_materialize(events)` — incrementally rebuild the
   project graph against the existing `native.ProjectContext`. The
   caller supplies the change events: typically

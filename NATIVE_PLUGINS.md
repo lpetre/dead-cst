@@ -99,20 +99,112 @@ impl ExternalPlugin for KeepMainBlocksAlive {
 }
 ```
 
-`PluginCtx` deliberately exposes a small, stable surface (e.g. `main_blocks()`)
+`PluginCtx` deliberately exposes a small, stable, **index-based** surface
 rather than the whole internal `ProjectContext`, and `PluginOps` emits through
-named methods (`keep_alive(...)`) instead of internal op types. The contract is
-the same frozen-graph one as Python plugins: the plugin observes the base graph
-only; its emissions are applied in a single batch after every plugin returns.
+named methods instead of internal op types. The contract is the same
+frozen-graph one as Python plugins: the plugin observes the base graph only;
+its emissions are applied in a single batch after every plugin returns. No
+`Python<'_>` token is ever exposed — `PluginCtx` reads `#[pyclass(frozen)]`
+data directly.
+
+### The `PluginCtx` / `PluginOps` surface
+
+Every query returns positional **indices** into the frozen node list — the
+same index space `PluginOps` emits against. `ctx.node(idx)` turns an index
+into an owned `NodeView { idx, fqname, kind, path, start_line, end_line,
+flags }`.
+
+`PluginCtx<'_>` — read the frozen graph:
+
+| method | returns | what |
+|---|---|---|
+| `node_count()` | `usize` | number of nodes; valid indices are `0..node_count()` |
+| `node(idx)` | `Option<NodeView>` | owned snapshot of one node |
+| `find_module(fqname)` | `Option<usize>` | module node by dotted fqname |
+| `find_declarations(fqname)` | `Vec<usize>` | every decl with this fqname (>1 when shadowed) |
+| `module_for(path)` | `Option<usize>` | module node by source path |
+| `resolve(fqname)` | `Option<usize>` | decl-or-module, walking back dotted segments |
+| `decls_under(path_prefix)` | `Vec<usize>` | every node under a path prefix |
+| `find_subclasses_of(class_idx)` | `Vec<usize>` | transitive subclasses |
+| `descendants(root_idx)` | `Vec<usize>` | forward reachability closure |
+| `ancestors(decl_idx)` | `Vec<usize>` | reverse reachability closure |
+| `direct_predecessors(idx)` | `Vec<usize>` | one-hop reverse step |
+| `main_blocks()` | `Vec<(usize, Vec<usize>)>` | each `if __name__` block as `(module, [decls])` |
+
+`PluginOps` — emit ops (mirrors the three Python graph ops):
+
+| method | mirrors | what |
+|---|---|---|
+| `keep_alive(decl_idx, marker)` | `AddEntrypointByIdx` | make a node a reachability seed |
+| `add_edge(src_idx, dst_idx)` | `AddEdgeByIdx` | add `src -> dst` between existing nodes |
+| `add_synthetic_node(fqname, flags, edges_to_idx)` | `AddNodeByIdx` | mint a `synthetic` node with out-edges; set `flags = plugin_api::FLAG_ENTRYPOINT` to make it a seed |
+
+Endpoint indices are bounds-checked by the host at apply time — a dangling
+index is rejected cleanly rather than minting an unconnected node.
+
+### Per-file plugins (optional, salsa-cached)
+
+By default an `ExternalPlugin` is **project-wide**: its `run(ctx, ops)` is
+called once against the whole frozen graph. A plugin can instead opt into
+**per-file** dispatch — invoked once per project file through a salsa-cached
+query, so an unchanged file's ops are reused across a `re_materialize` with
+zero re-run (the same fast-path the in-tree `MainBlockPlugin` rides).
+
+Opt in by also implementing `PerFilePlugin` and returning `Some(self)` from
+`per_file()`:
+
+```rust
+impl ExternalPlugin for MyPlugin {
+    fn name(&self) -> &str { "MyPlugin" }
+    fn per_file(&self) -> Option<&dyn PerFilePlugin> { Some(self) }   // opt in
+}
+
+impl PerFilePlugin for MyPlugin {
+    fn run_on_file(&self, file: &PluginFileCtx<'_>, ops: &mut FileOps) {
+        if let Some(block) = file.main_block_range() {
+            let (start, end) = file.line_span(block);
+            let mut targets = vec![file.module_local_idx()];
+            for n in file.nodes() {
+                if n.local_idx != 0 && n.start_line >= start && n.end_line <= end {
+                    targets.push(n.local_idx);
+                }
+            }
+            ops.add_synthetic_node(
+                format!("<__main__>:{}", file.module_fqname()),
+                plugin_api::FLAG_ENTRYPOINT,
+                targets,
+            );
+        }
+    }
+}
+```
+
+When `per_file()` returns `Some`, the host ignores `run` entirely. Whether a
+plugin is per-file is read **once, at load**.
+
+`PluginFileCtx<'_>` is a restricted, single-file view — `module_fqname()`,
+`module_local_idx()`, `node_count()`, `node(local_idx)`, `nodes()`,
+`line_span(range)`, `parsed()` (the raw AST), and the `main_block_range()`
+convenience. `FileOps` mirrors `add_synthetic_node` but in the file's **local**
+index space (`edges_to_local_idx` are positions in `file.nodes()`, which the
+host maps to global indices at apply time).
+
+**Purity is the contract that buys the cache.** `run_on_file` must be a pure
+function of its `file` — it may read only what `PluginFileCtx` exposes and must
+not consult project-wide state, other files, globals, the clock, or the
+filesystem, and it may only reference nodes *in this file*. An impure
+`run_on_file` would serve stale ops after an unrelated edit.
 
 Each plugin `cdylib` also exports a **manifest** — a self-contained
 `#[repr(C)]` table listing the plugins it provides and the ABI fingerprint it
-was built against. It's deliberately boring boilerplate; copy it from the
-worked example:
+was built against. It's deliberately boring boilerplate; copy it from a worked
+example:
 
 - **[`examples/main_block_plugin/`](examples/main_block_plugin/)** — a complete
-  external plugin (a `MainBlockPlugin` equivalent) including the manifest. Start
-  here.
+  **project-wide** external plugin (a `MainBlockPlugin` equivalent) including
+  the manifest. Start here.
+- **[`examples/per_file_main_block/`](examples/per_file_main_block/)** — the
+  same behaviour as a **per-file** plugin (`per_file()` + `run_on_file`).
 
 ---
 
