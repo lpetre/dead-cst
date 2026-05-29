@@ -11,32 +11,25 @@ permissions:
   contents: read
 
 jobs:
-  # One platform-specific wheel per target. Maturin handles the
-  # cdylib build (abi3-py311, so a single wheel covers every Python
-  # >=3.11) and produces a manylinux/macos/windows wheel with the
-  # ``.so`` / ``.pyd`` embedded inside ``python/dead_cst/``.
-  # The package version is read straight from ``Cargo.toml``; bump
-  # manually per release (pydantic-core style).
+  # Windows ships the self-contained STATIC wheel (the runtime rlib linked into
+  # one `_native.pyd`). macOS + Linux ship a DYNAMIC wheel instead — see the
+  # `dynamic` job — because that's what lets end users load native plugins.
+  # build-plugin is macOS+Linux only, so Windows stays static.
   wheels:
-    name: Build wheel (${{ matrix.platform.target }})
+    name: Build static wheel (${{ matrix.platform.target }})
     runs-on: ${{ matrix.platform.runner }}
     strategy:
       fail-fast: false
       matrix:
         platform:
-          - { runner: ubuntu-latest,  target: x86_64-unknown-linux-gnu,  manylinux: "2_28" }
-          - { runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, manylinux: "2_28" }
-          - { runner: macos-14,       target: aarch64-apple-darwin,       manylinux: "auto" }
-          - { runner: windows-latest, target: x86_64-pc-windows-msvc,     manylinux: "auto" }
+          - { runner: windows-latest, target: x86_64-pc-windows-msvc, manylinux: "auto" }
     steps:
       - uses: actions/checkout@v6
         with:
           submodules: recursive
           fetch-depth: 0
       # Stamp dead-cst + dead-cst-plugin-host to the *same* version and pin the
-      # `[build-plugin]` extra to it. On push to main this mints a dev version;
-      # on release it reuses the committed Cargo.toml version. See
-      # scripts/stamp_version.py for why the lockstep is mandatory.
+      # `[build-plugin]` extra to it. See scripts/stamp_version.py.
       - name: Stamp versions (dead-cst + plugin-host in lockstep)
         shell: bash
         run: |
@@ -53,16 +46,14 @@ jobs:
           name: wheel-${{ matrix.platform.target }}
           path: dist/
 
-  # The `dead-cst[build-plugin]` extra's payload: a *separate*,
-  # platform-specific `dead-cst-plugin-host` wheel carrying the prebuilt
-  # runtime dylib + its rlib/proc-macro dependency closure + libstd. Built by
-  # `dead-cst bundle-plugin-host` from source on each target, then packaged as a
-  # `py3-none-<plat>` wheel (see plugin-host/setup.py). The runtime version is
-  # baked into the ABI fingerprint, so this MUST be built from the same stamped
-  # Cargo.toml version as the host wheel above (and with the pinned toolchain).
-  # build-plugin only supports macOS + Linux, so no Windows target here.
-  plugin-host:
-    name: Build plugin-host wheel (${{ matrix.platform.target }})
+  # macOS + Linux ship the DYNAMIC base wheel (a thin `_native` shim + the
+  # runtime dylib + libstd, `$ORIGIN`/`@loader_path`-relocated) plus the
+  # platform-specific `dead-cst-plugin-host` wheel (the rlib compile closure).
+  # Both are produced from ONE prefer-dynamic build so the runtime dylib's SVH
+  # matches the closure plugins compile against. Linux builds in manylinux_2_28
+  # containers for the glibc floor; rust is pinned via rust-toolchain.toml.
+  dynamic:
+    name: Dynamic wheel + plugin-host (${{ matrix.platform.target }})
     runs-on: ${{ matrix.platform.runner }}
     container: ${{ matrix.platform.container }}
     strategy:
@@ -72,17 +63,20 @@ jobs:
           - runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             plat: manylinux_2_28_x86_64
+            compat: manylinux_2_28
             container: quay.io/pypa/manylinux_2_28_x86_64
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             plat: manylinux_2_28_aarch64
+            compat: manylinux_2_28
             container: quay.io/pypa/manylinux_2_28_aarch64
           - runner: macos-14
             target: aarch64-apple-darwin
             plat: macosx_11_0_arm64
+            compat: ""
             container: ""
     env:
-      # Match the host wheel's macOS floor so pip selects this wheel alongside it.
+      # Match the static wheel's macOS floor so pip selects this wheel alongside it.
       MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:
       - uses: actions/checkout@v6
@@ -113,26 +107,45 @@ jobs:
       - name: Stamp versions (dead-cst + plugin-host in lockstep)
         shell: bash
         run: uv run --no-project --with setuptools-scm python scripts/stamp_version.py
-      # `uv sync` compiles + installs dead-cst (the `bundle-plugin-host` command);
-      # the command then rebuilds the runtime prefer-dynamic and assembles the
-      # relocatable bundle into plugin-host/dead_cst_plugin_host/.
-      - name: Build runtime bundle
+      # Static skeleton — discarded binary, kept for its correct metadata +
+      # Python sources + platform tag; the repack swaps in the dynamic payload.
+      - name: Build static skeleton wheel (maturin)
         shell: bash
         run: |
-          uv sync
-          uv run dead-cst bundle-plugin-host --release
-      - name: Build platform wheel
+          compat="${{ matrix.platform.compat }}"
+          uv run --no-project --with "maturin>=1.7,<2" maturin build --release \
+            -i 3.11 ${compat:+--compatibility "$compat"} --out dist-static
+      # One prefer-dynamic build: populates the plugin-host rlib closure and
+      # leaves the runtime dylib + shim in target/plugin-host/release/deps for
+      # the repack. Install the skeleton wheel to get the `dead-cst` CLI without
+      # a third recompile.
+      - name: Build runtime closure (prefer-dynamic) + populate plugin-host
+        shell: bash
+        run: |
+          uv venv .ci-venv
+          uv pip install --python .ci-venv dist-static/*.whl
+          .ci-venv/bin/dead-cst bundle-plugin-host --release --source-root "$GITHUB_WORKSPACE"
+      - name: Repack base wheel as dynamic
+        shell: bash
+        run: |
+          uv run --no-project --with wheel python scripts/repack_dynamic_wheel.py \
+            dist-static/*.whl --deps-dir target/plugin-host/release/deps -o dist
+      - name: Build plugin-host wheel
         shell: bash
         run: |
           cd plugin-host
           uv run --no-project --with "setuptools>=70.1" --with wheel \
             python setup.py bdist_wheel \
             --plat-name "${{ matrix.platform.plat }}" \
-            --dist-dir "$GITHUB_WORKSPACE/dist"
+            --dist-dir "$GITHUB_WORKSPACE/dist-host"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.platform.target }}
+          path: dist/*.whl
       - uses: actions/upload-artifact@v4
         with:
           name: plugin-host-${{ matrix.platform.target }}
-          path: dist/
+          path: dist-host/*.whl
 
   sdist:
     runs-on: ubuntu-latest
@@ -157,7 +170,7 @@ jobs:
 
   publish-testpypi:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [wheels, plugin-host, sdist]
+    needs: [wheels, dynamic, sdist]
     runs-on: ubuntu-latest
     environment: testpypi
     steps:
@@ -182,7 +195,7 @@ jobs:
 
   publish-pypi:
     if: github.event_name == 'release'
-    needs: [wheels, plugin-host, sdist]
+    needs: [wheels, dynamic, sdist]
     runs-on: ubuntu-latest
     environment: pypi
     steps:

@@ -46,6 +46,22 @@ def _run(*args: str) -> None:
     subprocess.run(args, check=True)
 
 
+def _host_std_lib() -> Path:
+    """The toolchain dir holding the shared ``libstd-<hash>`` (prefer-dynamic
+    artifacts rpath here)."""
+
+    def rustc(*a: str) -> str:
+        return subprocess.run(
+            ["rustc", *a], capture_output=True, text=True, check=True
+        ).stdout.strip()
+
+    sysroot = Path(rustc("--print", "sysroot"))
+    host = next(
+        line.split("host: ", 1)[1] for line in rustc("-vV").splitlines() if "host: " in line
+    )
+    return sysroot / "lib" / "rustlib" / host / "lib"
+
+
 def _set_rpath_origin(lib: Path) -> None:
     """Point ``lib`` at its own directory for sibling resolution, dropping the
     builder's absolute rpaths so the wheel relocates. No-op (with a warning) if
@@ -136,11 +152,15 @@ def main() -> None:
         help="prefer-dynamic build deps dir (libdead_cst_native + libdead_cst_runtime)",
     )
     ap.add_argument(
-        "--std-lib", type=Path, required=True, help="toolchain dir holding libstd-<hash>"
+        "--std-lib",
+        type=Path,
+        default=None,
+        help="toolchain dir holding libstd-<hash> (default: derived from rustc)",
     )
     ap.add_argument("-o", "--output", type=Path, required=True, help="output directory")
     args = ap.parse_args()
-    result = repack(args.static_wheel, args.deps_dir, args.std_lib, args.output)
+    std_lib = args.std_lib if args.std_lib is not None else _host_std_lib()
+    result = repack(args.static_wheel, args.deps_dir, std_lib, args.output)
     print(result)
 
 

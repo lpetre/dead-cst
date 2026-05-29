@@ -8,7 +8,7 @@ name = "dead-cst-plugin-host"
 # (rustc commit + version) is checked when a plugin loads. The publish
 # workflow keeps these in lockstep.
 version = "0.13.0"
-description = "Prebuilt dead-cst runtime + dependency closure for building native plugins."
+description = "Prebuilt dead-cst dependency closure for compiling native plugins."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
@@ -16,8 +16,10 @@ requires-python = ">=3.11"
 [tool.setuptools]
 packages = ["dead_cst_plugin_host"]
 
-# The bundle payload is binary + platform-specific (a runtime dylib, the rlib
-# dependency closure, proc-macro dylibs, libstd). `dead-cst bundle-plugin-host`
-# populates these; the publish workflow builds one platform wheel per target.
+# The payload is binary + platform-specific: the `.rlib` dependency closure +
+# proc-macro dylibs that `rustc` needs to compile a plugin against the runtime.
+# (The runtime dylib + libstd ship in the base `dead_cst` wheel.) `dead-cst
+# bundle-plugin-host` populates these; the publish workflow builds one platform
+# wheel per target.
 [tool.setuptools.package-data]
-dead_cst_plugin_host = ["*.dylib", "*.rlib", "*.so", "*.dll", "*.pyd"]
+dead_cst_plugin_host = ["*.rlib", "*.so", "*.dylib"]
