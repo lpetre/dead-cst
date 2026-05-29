@@ -57,9 +57,6 @@ from .graph import (
 from .plugins import (
     DynamicImportFallbackPlugin,
     ExplicitEntrypointPlugin,
-    InitSubclassPlugin,
-    MainBlockPlugin,
-    ModuleDundersPlugin,
     Plugin,
     ProjectScriptsPlugin,
 )
@@ -73,11 +70,13 @@ if TYPE_CHECKING:
 app = typer.Typer(help="Dead code analysis for Python.")
 
 
+# Python-side built-ins. Plugins ported to Rust (``main_block``,
+# ``module_dunders``, ``init_subclass``) are *not* here — ``_load_plugin``
+# resolves those through the native registry (``_builtin_native_plugin``)
+# first, so they move out of this map as they're ported.
 _BUILTIN_PLUGINS: dict[str, Plugin] = {
-    "main_block": MainBlockPlugin(),
     "project_scripts": ProjectScriptsPlugin(),
     "explicit": ExplicitEntrypointPlugin(),
-    "module_dunders": ModuleDundersPlugin(),
     "pytest": PytestPlugin(),
     "unittest": UnittestPlugin(),
     "mock_patch": MockPatchPlugin(),
@@ -91,12 +90,17 @@ _BUILTIN_PLUGINS: dict[str, Plugin] = {
     "celery": CeleryPlugin(),
     "discordpy": DiscordPyPlugin(),
     "slack_bolt": slack_bolt_plugin(),
-    "init_subclass": InitSubclassPlugin(),
     "dynamic_import_fallback": DynamicImportFallbackPlugin(),
 }
 
 
-def _load_plugin(name: str) -> Plugin:
+def _load_plugin(name: str) -> Plugin | native.NativePlugin:
+    from dead_cst import _native
+
+    nat = _native._builtin_native_plugin(name)
+    if nat is not None:
+        return nat
+
     builtin = _BUILTIN_PLUGINS.get(name)
     if builtin is not None:
         return builtin
@@ -161,9 +165,11 @@ def build_plugins(
     entrypoints: list[str],
     entrypoint_regexes: list[str],
     plugin_names: list[str],
-) -> list[Plugin]:
-    plugins: list[Plugin] = [_load_plugin(name) for name in plugin_names]
-    plugins.append(ModuleDundersPlugin())
+) -> list[Plugin | native.NativePlugin]:
+    from dead_cst import _native
+
+    plugins: list[Plugin | native.NativePlugin] = [_load_plugin(name) for name in plugin_names]
+    plugins.append(_native.NativePlugin.module_dunders())
     specs: list[str | Path | re.Pattern[str]] = list(entrypoints)
     specs.extend(re.compile(p) for p in entrypoint_regexes)
     if specs:

@@ -348,7 +348,9 @@ def test_init_subclass_marker_in_predecessor_chain(make_analysis, write_files, p
 
 
 def test_init_subclass_loads_via_cli_loader():
+    from dead_cst import _native as native
     from dead_cst.cli import _load_plugin
 
     plugin = _load_plugin("init_subclass")
-    assert isinstance(plugin, InitSubclassPlugin)
+    assert isinstance(plugin, native.NativePlugin)
+    assert plugin.name == "InitSubclassPlugin"

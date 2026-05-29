@@ -55,7 +55,7 @@ use ty_project::Db as ProjectDb;
 use crate::builder::PreparedOp;
 use crate::file_payload::{file_to_nodes, NodeData};
 use crate::graph::{intern_kind, NodeFlags};
-use crate::helpers::find_main_block_range;
+use crate::helpers::{find_main_block_range, is_dunder_name};
 use crate::project::ProjectContext;
 
 /// Rust-side plugin contract. Each impl describes how to derive ops
@@ -196,6 +196,7 @@ pub(crate) trait PerFileNativePluginImpl: Send + Sync {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum PerFilePluginKind {
     MainBlock,
+    ModuleDunders,
 }
 
 impl PerFilePluginKind {
@@ -203,6 +204,7 @@ impl PerFilePluginKind {
     fn name(self) -> &'static str {
         match self {
             PerFilePluginKind::MainBlock => "MainBlockPlugin",
+            PerFilePluginKind::ModuleDunders => "ModuleDundersPlugin",
         }
     }
 
@@ -210,6 +212,7 @@ impl PerFilePluginKind {
     fn run_on_file(self, file_ctx: &FileContext<'_>, sink: &mut Vec<FileLocalOpData>) {
         match self {
             PerFilePluginKind::MainBlock => MainBlockPluginImpl.run_on_file(file_ctx, sink),
+            PerFilePluginKind::ModuleDunders => ModuleDundersPluginImpl.run_on_file(file_ctx, sink),
         }
     }
 }
@@ -299,11 +302,12 @@ impl NativePlugin {
     }
 
     /// Native `ModuleDundersPlugin` — pin module-level dunder names and
-    /// `__future__` imports as entrypoints.
+    /// `__future__` imports as entrypoints. Per-file (salsa-cached): a file's
+    /// dunders + `__future__` imports are entirely local to it.
     #[staticmethod]
     fn module_dunders() -> Self {
         Self {
-            kind: NativePluginKind::ProjectWide(Box::new(ModuleDundersPluginImpl)),
+            kind: NativePluginKind::PerFile(PerFilePluginKind::ModuleDunders),
         }
     }
 
@@ -569,36 +573,46 @@ pub(crate) fn load_native_plugins(path: String) -> PyResult<Vec<NativePlugin>> {
 }
 
 // ---------------------------------------------------------------------------
-// Project-wide native plugins ported from Python. Each runs once against the
-// whole frozen graph and pushes ops into the shared sink — same contract as
-// the former `dead_cst.plugins.*` equivalents. The `py`-taking ctx accessors
-// are reached via `Python::with_gil` (the harness already holds the GIL).
+// Native plugins ported from Python. `module_dunders` is *per-file* (its
+// output for a file is a pure function of that file → salsa-cached);
+// `init_subclass` is project-wide (subclasses live in other files, so its
+// output isn't file-local). The project-wide `py`-taking ctx accessors are
+// reached via `Python::with_gil` (the harness already holds the GIL).
 // ---------------------------------------------------------------------------
 
+const MODULE_DUNDERS_PREFIX: &str = "<dunder>:";
 const INIT_SUBCLASS_PREFIX: &str = "<__init_subclass__>:";
 
-/// Port of `dead_cst.plugins.module_dunders.ModuleDundersPlugin`: pin every
-/// module-level dunder (variables + PEP 562 functions) and `__future__`
-/// import as an entrypoint.
+/// Per-file port of `dead_cst.plugins.module_dunders.ModuleDundersPlugin`:
+/// pin a file's module-level dunders (variables + PEP 562 functions) and its
+/// `__future__` imports as entrypoints. All file-local — one synthetic
+/// entrypoint node per file with edges to those decls.
 pub(crate) struct ModuleDundersPluginImpl;
 
-impl NativePluginImpl for ModuleDundersPluginImpl {
-    fn name(&self) -> &'static str {
-        "ModuleDundersPlugin"
-    }
-
-    fn run(&self, ctx: &ProjectContext, sink: &mut Vec<PreparedOp>) -> PyResult<()> {
-        Python::with_gil(|py| -> PyResult<()> {
-            let mut targets = ctx.find_module_dunders_indices(py)?;
-            targets.extend(ctx.find_imports_of_indices("__future__")?);
-            for decl_idx in targets {
-                sink.push(PreparedOp::EntrypointByIdx {
-                    decl_idx,
-                    marker: "<dunder>".to_string(),
-                });
+impl PerFileNativePluginImpl for ModuleDundersPluginImpl {
+    fn run_on_file(&self, file_ctx: &FileContext<'_>, sink: &mut Vec<FileLocalOpData>) {
+        let mut targets: Vec<u32> = Vec::new();
+        for (local_idx, node) in file_ctx.nodes().iter().enumerate() {
+            let is_dunder_decl = matches!(node.kind.as_static_str(), "variable" | "function")
+                && is_dunder_name(&node.fqname);
+            let is_future = node
+                .imports
+                .as_ref()
+                .is_some_and(|imp| imp.module == "__future__");
+            if is_dunder_decl || is_future {
+                targets.push(local_idx as u32);
             }
-            Ok(())
-        })
+        }
+        if targets.is_empty() {
+            return;
+        }
+        let synthetic = intern_kind("synthetic").expect("'synthetic' is a valid kind");
+        sink.push(FileLocalOpData {
+            fqname: format!("{MODULE_DUNDERS_PREFIX}{}", file_ctx.module_fqname()),
+            kind: synthetic,
+            flags: NodeFlags::ENTRYPOINT,
+            edges_to_local_idx: targets,
+        });
     }
 }
 

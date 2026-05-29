@@ -369,6 +369,33 @@ class NativePlugin:
         """
         ...
 
+    @staticmethod
+    def module_dunders() -> NativePlugin:
+        """Native equivalent of
+        :class:`dead_cst.plugins.ModuleDundersPlugin`. Pins every
+        module-level dunder (variables + PEP 562 functions) and
+        ``__future__`` import as an entrypoint. Implemented as a
+        per-file (salsa-cached) plugin.
+        """
+        ...
+
+    @staticmethod
+    def init_subclass() -> NativePlugin:
+        """Native equivalent of
+        :class:`dead_cst.plugins.InitSubclassPlugin`. Keeps transitive
+        subclasses of ``__init_subclass__``-defining classes alive via
+        a marker node.
+        """
+        ...
+
+def _builtin_native_plugin(name: str) -> NativePlugin | None:
+    """Resolve a built-in plugin name (e.g. ``"main_block"``) to its
+    native implementation, or ``None`` if no native plugin owns that
+    name yet. The CLI consults this before the Python builtin map; as
+    plugins are ported to Rust they move into this registry.
+    """
+    ...
+
 class NativeGraph:
     """The project-wide graph snapshot returned by ``Project.build()``
     and ``ProjectContext.materialize()``.
