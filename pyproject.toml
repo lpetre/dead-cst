@@ -26,10 +26,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Authoring native plugins (`dead-cst build-plugin`) needs the prebuilt runtime
-# + its dependency closure to compile against. Those are large (~130 MB
-# compressed) and platform-specific, so they ship as a SEPARATE package pulled
-# in only on demand — the default `dead-cst` wheel stays small + self-contained.
+# Authoring native plugins (`dead-cst build-plugin`) needs the `.rlib`
+# dependency closure to compile against (the runtime dylib itself ships in the
+# base macOS/Linux wheel). The closure is large (~130 MB compressed) and
+# platform-specific, so it ships as a SEPARATE package pulled in only on demand.
 # (The publish workflow pins this to `== <this version>`; the load-time ABI
 # fingerprint rejects any mismatch regardless.)
 build-plugin = ["dead-cst-plugin-host"]

@@ -11,41 +11,42 @@ two versions.
 
 ### Added
 
-- **External native plugins (experimental).** The native crate is now
-  split into a `dead-cst-runtime` library (built as both `rlib` and
-  `dylib`) and a thin `dead-cst-native` cdylib shim. The default wheel
-  is unchanged — it statically links the `rlib`, so it stays
-  self-contained. The new `dead-cst build-plugin [PLUGIN.rs]` command
-  compiles a plugin against a *prebuilt* runtime `dylib` + its metadata
-  via `rustc --extern` (`-C prefer-dynamic`) — no Cargo project, no
-  runtime source, no ruff recompile — and installs the matching dynamic
-  `_native` so the host and plugin share one salsa/ty runtime. Runtime
-  artifacts come from `--runtime-dir`, a plugin-host bundle in the
-  installed package, or a source checkout (built on demand).
-  `native.load_native_plugins(path)` loads the result through an ABI
-  airlock: it reads a self-contained `repr(C)` manifest and rejects any
-  plugin whose baked ABI fingerprint (rustc commit + runtime version +
-  target) differs from the running runtime's, cleanly and without
-  crashing. Plugins implement
-  `dead_cst_runtime::native_plugins::plugin_api::ExternalPlugin`; see
-  `examples/main_block_plugin/`. `dead-cst bundle-plugin-host` assembles
-  a *relocatable* plugin-host bundle (the runtime dylib + its rlib /
-  proc-macro-dylib closure + libstd + the dynamic `_native`, rpaths
-  rewritten to loader-relative paths — `@rpath` / `@loader_path` on macOS,
-  `$ORIGIN` on Linux — stripped, and ad-hoc re-signed on macOS). That
-  bundle ships as a **separate `dead-cst-plugin-host`
-  package** pulled in only via the `dead-cst[build-plugin]` extra — so the
-  default `dead-cst` wheel stays small and self-contained, and the large
-  payload is installed on demand. `build-plugin` locates it via
-  `import dead_cst_plugin_host`. The bundle skips the redundant `.rmeta`
-  (the `.rlib` embed metadata) and strips the dylibs: a `--release` bundle
-  is ~350 MB on disk / ~130 MB compressed (the rlib dep closure
-  dominates), vs ~1.6 GB debug. The build tooling supports macOS and
-  Linux (`bundle-plugin-host` needs the Xcode CLT on macOS / `patchelf`
-  on Linux); `build-plugin` from a source checkout needs only rust.
-  Note: today the separate package is built locally; producing the
-  cross-platform `dead-cst-plugin-host` wheels in CI is the remaining
-  packaging work.
+- **External native plugins (experimental).** The native crate is split
+  into a `dead-cst-runtime` library (built as both `rlib` and `dylib`)
+  and a thin `dead-cst-native` cdylib shim, so a plugin can dynamically
+  link the *same* runtime as the extension module and share one salsa/ty
+  instance. Plugins implement
+  `dead_cst_runtime::native_plugins::plugin_api::ExternalPlugin` (see
+  `examples/main_block_plugin/`) and load via
+  `native.load_native_plugins(path)`, which reads a self-contained
+  `repr(C)` manifest and rejects — cleanly, before touching any
+  version-hashed symbol — any plugin whose baked ABI fingerprint
+  (`rustc` commit + runtime version + target) differs from the running
+  runtime's.
+  - The **shipped macOS + Linux wheel is dynamic**: a thin `_native` shim
+    + `libdead_cst_runtime` + `libstd` ride in the package and resolve
+    each other via `$ORIGIN` / `@loader_path`, so the host runs the
+    shared runtime out of the box and plugins load with **no `_native`
+    swap**. The **dev build and the Windows wheel stay static**
+    (self-contained `_native`, no plugin loading).
+  - `dead-cst build-plugin PLUGIN.rs` compiles a plugin with `rustc
+    --extern` against the in-package runtime dylib + the `.rlib`
+    dependency closure from the `dead-cst[build-plugin]` extra, and
+    prints the plugin path — no Cargo project, no runtime source, no
+    swap. Needs the pinned toolchain (the fingerprint enforces it).
+  - The `[build-plugin]` extra ships **`dead-cst-plugin-host`**, a
+    separate platform-specific package carrying only the compile closure
+    (the `.rlib` archives + proc-macro dylibs). `dead-cst
+    bundle-plugin-host` produces it; the publish workflow builds the
+    dynamic base wheel (repacking the runtime dylib + libstd into
+    maturin's static wheel via `scripts/repack_dynamic_wheel.py`) and the
+    `dead-cst-plugin-host` wheel from **one** prefer-dynamic build per
+    target (macOS arm64 + Linux x86_64/aarch64), so the runtime dylib's
+    SVH matches the closure. Both are stamped to the **same** version by
+    `scripts/stamp_version.py` (which also pins the extra to `==
+    <version>`) and shipped to TestPyPI on every push to `main` and PyPI
+    on release. The lockstep is mandatory — the runtime version is part
+    of the ABI fingerprint. No Windows plugin support (static wheel).
 - **Fleshed-out external native plugin API.** The curated
   `dead_cst_runtime::native_plugins::plugin_api` an external plugin
   compiles against grew from a single `PluginCtx::main_blocks()` /

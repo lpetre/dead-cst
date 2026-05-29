@@ -1,18 +1,22 @@
 """External (dylib) native plugin loading.
 
-These tests are gated on the *plugin-host* build. Run them with::
+These tests are gated on the *dynamic-runtime* (shipped macOS/Linux) wheel, in
+which the host already runs the shared runtime. Run them against such an install
+with::
 
     DEAD_CST_PLUGIN_HOST=1 \\
-    PLUGIN_DYLIB="$(uv run dead-cst build-plugin)" \\
-    PLUGIN_DYLIB_PER_FILE="$(uv run dead-cst build-plugin \\
+    PLUGIN_DYLIB="$(dead-cst build-plugin)" \\
+    PLUGIN_DYLIB_PER_FILE="$(dead-cst build-plugin \\
         examples/per_file_main_block/src/lib.rs)" \\
-    uv run pytest tests/test_plugins/test_external_dylib_plugin.py
+    pytest tests/test_plugins/test_external_dylib_plugin.py
 
 ``dead-cst build-plugin`` compiles the plugin (the bundled project-wide example
-by default; pass a path for the per-file example) against the prebuilt runtime
-via ``rustc --extern`` and installs the dynamic ``_native``. The default static
-wheel build can't load external plugins (the runtime is statically linked, not
-shared), so the load tests skip there; the rejection test runs anywhere.
+by default; pass a path for the per-file example) against the in-package runtime
+dylib + the ``dead-cst-plugin-host`` rlib closure via ``rustc --extern``. The
+dev/static build can't load external plugins (the runtime is statically linked,
+not shared) and ``build-plugin`` won't run there (no in-package runtime dylib),
+so the load tests skip; the rejection test runs anywhere. The full path is
+exercised in CI by the publish workflow.
 """
 
 from __future__ import annotations
