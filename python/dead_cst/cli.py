@@ -43,10 +43,8 @@ from .contrib.fastmcp import fastmcp_plugin
 from .contrib.flask import flask_plugin
 from .contrib.mock_patch import MockPatchPlugin
 from .contrib.pytest import PytestPlugin
-from .contrib.server_config import ServerConfigPlugin
 from .contrib.slack_bolt import slack_bolt_plugin
 from .contrib.typer import typer_plugin
-from .contrib.unittest import UnittestPlugin
 from .graph import (
     KEEPALIVE_DEFAULT,
     GraphMetadata,
@@ -71,16 +69,15 @@ app = typer.Typer(help="Dead code analysis for Python.")
 
 
 # Python-side built-ins. Plugins ported to Rust (``main_block``,
-# ``module_dunders``, ``init_subclass``) are *not* here — ``_load_plugin``
-# resolves those through the native registry (``_builtin_native_plugin``)
-# first, so they move out of this map as they're ported.
+# ``module_dunders``, ``init_subclass``, ``server_config``, ``unittest``)
+# are *not* here — ``_load_plugin`` resolves those through the native
+# registry (``_builtin_native_plugin``) first, so they move out of this map
+# as they're ported.
 _BUILTIN_PLUGINS: dict[str, Plugin] = {
     "project_scripts": ProjectScriptsPlugin(),
     "explicit": ExplicitEntrypointPlugin(),
     "pytest": PytestPlugin(),
-    "unittest": UnittestPlugin(),
     "mock_patch": MockPatchPlugin(),
-    "server_config": ServerConfigPlugin(),
     "fastapi": fastapi_plugin(),
     "fastmcp": fastmcp_plugin(),
     "flask": flask_plugin(),
