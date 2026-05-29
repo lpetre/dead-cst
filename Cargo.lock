@@ -1151,6 +1151,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "per_file_main_block"
+version = "0.13.0"
+dependencies = [
+ "dead-cst-runtime",
+ "pyo3",
+]
+
+[[package]]
 name = "phf"
 version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

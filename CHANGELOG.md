@@ -59,9 +59,19 @@ two versions.
   mirror the Python `AddEntrypointByIdx` / `AddEdgeByIdx` /
   `AddNodeByIdx` graph ops — plus a `FLAG_ENTRYPOINT` constant. Every
   query is index-based and GIL-free; no `Python<'_>` token is exposed.
-  External native plugins remain **project-wide** (one `run(ctx)` over
-  the whole frozen graph); the salsa-cached *per-file* native plugin
-  path stays in-tree only for now.
+- **Per-file external native plugins.** An external native plugin can
+  now opt into the salsa-cached *per-file* path (previously in-tree
+  only) by implementing the new `PerFilePlugin` trait and returning
+  `Some(self)` from `ExternalPlugin::per_file()`. When it does, the host
+  ignores the project-wide `run` and instead invokes
+  `run_on_file(file, ops)` once per project file through the same
+  salsa-cached query the in-tree `MainBlockPlugin` uses — so an
+  unchanged file's ops are reused across a `re_materialize` with zero
+  re-run. `run_on_file` gets a restricted single-file `PluginFileCtx`
+  (file-local nodes, parsed AST, `line_span`, `main_block_range`) and
+  emits file-local ops through `FileOps::add_synthetic_node`. The
+  per-file output must be a pure function of the file (the documented
+  cache-soundness contract). See `examples/per_file_main_block/`.
 - `Analysis.re_materialize(events)` — incrementally rebuild the
   project graph against the existing `native.ProjectContext`. The
   caller supplies the change events: typically

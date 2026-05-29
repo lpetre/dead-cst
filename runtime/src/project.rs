@@ -1757,10 +1757,25 @@ fn collect_prepared_plugin_ops(
             // every project file, translating each file-local op to a
             // global ``PreparedOp::NodeByIdx`` via ``local_to_global``.
             crate::native_plugins::NativePluginKind::PerFile(kind) => {
-                return ctx_ref.collect_per_file_plugin_ops(*kind, sink);
+                return ctx_ref.collect_per_file_plugin_ops(
+                    crate::native_plugins::PerFilePluginId::Builtin(*kind),
+                    sink,
+                );
             }
-            // External dylib plugin: run it against a restricted, public
-            // ``PluginCtx`` view and fold its ops into the shared sink.
+            // External dylib plugin opted into per-file dispatch: route it
+            // through the same salsa-cached per-file query as the builtins,
+            // keyed on its registry id.
+            crate::native_plugins::NativePluginKind::External {
+                per_file_id: Some(id),
+                ..
+            } => {
+                return ctx_ref.collect_per_file_plugin_ops(
+                    crate::native_plugins::PerFilePluginId::External(*id),
+                    sink,
+                );
+            }
+            // Project-wide external dylib plugin: run it once against a
+            // restricted, public ``PluginCtx`` view and fold its ops in.
             crate::native_plugins::NativePluginKind::External { plugin, .. } => {
                 let pctx = crate::native_plugins::plugin_api::PluginCtx::new(&ctx_ref);
                 let mut ops = crate::native_plugins::plugin_api::PluginOps::new();
@@ -1868,12 +1883,12 @@ impl ProjectContext {
     /// entry (shouldn't happen for a well-formed plugin) is skipped.
     pub(crate) fn collect_per_file_plugin_ops(
         &self,
-        kind: crate::native_plugins::PerFilePluginKind,
+        id: crate::native_plugins::PerFilePluginId,
         sink: &mut Vec<PreparedOp>,
     ) -> PyResult<()> {
         let outputs = self.materialized("collect_per_file_plugin_ops")?;
         for &file in &outputs.project_files {
-            let file_ops = crate::native_plugins::per_file_plugin_ops(&self.db, file, kind);
+            let file_ops = crate::native_plugins::per_file_plugin_ops(&self.db, file, id);
             if file_ops.is_empty() {
                 continue;
             }
