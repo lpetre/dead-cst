@@ -192,8 +192,10 @@ Maintainers produce that payload with **`dead-cst bundle-plugin-host`**, which
 builds the runtime, gathers the closure, rewrites the rpaths to loader-relative
 paths (`@rpath` / `@loader_path` via `install_name_tool` on macOS, `$ORIGIN` via
 `patchelf` on Linux), strips (and, on macOS, ad-hoc re-signs) the libraries, and
-drops it into the `dead_cst_plugin_host` package. (CI wheels for it are still
-[in progress](#limitations).)
+drops it into the `dead_cst_plugin_host` package. The publish workflow runs this
+per target (macOS arm64 + Linux x86_64/aarch64) and ships one `py3-none-<plat>`
+wheel each, version-locked to `dead-cst` — to TestPyPI on every push to `main`,
+to PyPI on release.
 
 ---
 
@@ -206,9 +208,11 @@ This is a preview. Known gaps:
   on `PATH`; `build-plugin` from a source checkout does not.
 - **Single-`.rs` plugins.** `build-plugin` compiles one source file; multi-crate
   plugins with their own dependencies are a follow-up.
-- **No published `dead-cst-plugin-host` wheels yet.** Today the bundle is built
-  locally (`bundle-plugin-host`) or from a source checkout; the cross-platform
-  CI that publishes the `[build-plugin]` payload is still to come.
+- **`dead-cst-plugin-host` wheels are published to TestPyPI** (per push to
+  `main`) **and PyPI** (per release), one per macOS arm64 / Linux x86_64 /
+  Linux aarch64; their version is kept in lockstep with `dead-cst` by
+  `scripts/stamp_version.py`. The local `bundle-plugin-host` + source-checkout
+  paths still work for development.
 - **Recompile per release**, by design (full Rust fidelity has no stable ABI).
   The airlock makes a mismatch a clean error, not a crash.
 - **Python plugins remain the supported extension path** for anything that

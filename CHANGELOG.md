@@ -11,6 +11,19 @@ two versions.
 
 ### Added
 
+- **`dead-cst-plugin-host` wheels are now built and published in CI.**
+  The publish workflow gained a `plugin-host` matrix job that runs
+  `dead-cst bundle-plugin-host --release` per target (macOS arm64 +
+  Linux x86_64/aarch64) and packages the relocatable bundle as a
+  `py3-none-<plat>` wheel (`plugin-host/setup.py` forces the platform
+  tag), shipped to TestPyPI on every push to `main` and to PyPI on
+  release alongside the main `dead-cst` wheels. `dead-cst` and
+  `dead-cst-plugin-host` are stamped to the **same** version by the new
+  `scripts/stamp_version.py` (the single source of truth, run identically
+  in every job), which also pins the `dead-cst[build-plugin]` extra to
+  `== <that version>`. The lockstep is mandatory: the runtime version is
+  part of the ABI fingerprint a native plugin is validated against at
+  load. No Windows wheel — `build-plugin` is macOS + Linux only.
 - **External native plugins (experimental).** The native crate is now
   split into a `dead-cst-runtime` library (built as both `rlib` and
   `dylib`) and a thin `dead-cst-native` cdylib shim. The default wheel
