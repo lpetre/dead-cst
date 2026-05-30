@@ -131,14 +131,21 @@ two versions.
   consults before the Python builtin map. Behaviour is identical;
   `module_dunders` and `server_config` are *per-file* (salsa-cached)
   plugins, so an unchanged file's entrypoints are reused across
-  `re_materialize` with zero re-run. The native `server_config` bakes
-  the default server-config filename set; the Python `ServerConfigPlugin`
-  remains for custom filenames. The Python `ModuleDundersPlugin` /
-  `InitSubclassPlugin` / `MainBlockPlugin` / `ServerConfigPlugin` /
-  `UnittestPlugin` classes remain available for now; they will be removed
-  once every built-in is ported.
+  `re_materialize` with zero re-run. `NativePlugin.server_config(filenames=…)`
+  is the first *configured* per-file plugin: the matched filename set is
+  carried as config and the per-file cache key is hash-interned on it, so
+  identical filename sets share one salsa cache entry (`filenames=None` bakes
+  the default Gunicorn/Hypercorn set). The Python `ModuleDundersPlugin` /
+  `InitSubclassPlugin` / `MainBlockPlugin` / `UnittestPlugin` classes remain
+  available for now; they will be removed once every built-in is ported.
 
 ### Removed
+
+- The Python `ServerConfigPlugin` (`dead_cst.contrib.ServerConfigPlugin`).
+  `server_config` is now native-only: use `NativePlugin.server_config()` (the
+  CLI's `server_config` key already resolves to it), passing `filenames=[…]`
+  for custom server-config basenames. This is the first built-in whose Python
+  class is removed as part of the native migration.
 
 #### Query DSL — SymbolNode terminals and SymbolNode-taking sugar
 - `SubclassQuery.collect()`, `ImportQuery.collect()`, `ClassQuery.collect()`,
