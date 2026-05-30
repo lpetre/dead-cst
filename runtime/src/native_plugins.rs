@@ -137,13 +137,16 @@ pub(crate) trait NativePluginImpl: Send + Sync {
 #[derive(Debug, Clone, Eq, PartialEq, salsa::Update, get_size2::GetSize)]
 pub(crate) enum FileLocalOp {
     /// Mint a synthetic node in this file (`AddNodeByIdx` shape) with an
-    /// out-edge to each file-local index in ``edges_to_local_idx``.
+    /// out-edge to each file-local index in ``edges_to_local_idx`` and an
+    /// in-edge from each file-local index in ``edges_from_local_idx``.
     Node {
         fqname: String,
         kind: &'static str,
         flags: u32,
-        /// Indices into the owning file's ``FileNodes.refs`` array.
+        /// File-local indices this node points *to* (out-edges).
         edges_to_local_idx: Vec<u32>,
+        /// File-local indices that point *to* this node (in-edges).
+        edges_from_local_idx: Vec<u32>,
     },
     /// Reachability edge between two nodes in this file (`AddEdgeByIdx`
     /// shape). Both endpoints are file-local indices.
@@ -940,6 +943,7 @@ impl PerFileNativePluginImpl for MainBlockPluginImpl {
             kind: synthetic_kind,
             flags: NodeFlags::ENTRYPOINT,
             edges_to_local_idx,
+            edges_from_local_idx: Vec::new(),
         });
     }
 }
@@ -977,7 +981,7 @@ pub mod plugin_api {
 
     use super::{FileContext, FileLocalOp};
     use crate::builder::PreparedOp;
-    use crate::graph::{intern_kind, NodeFlags};
+    use crate::graph::{intern_kind, EdgeFlags, NodeFlags};
     use crate::project::ProjectContext;
 
     // Re-exported so a per-file plugin can name the raw AST / range types
@@ -991,6 +995,18 @@ pub mod plugin_api {
     /// [`FileOps::add_synthetic_node`] to make that node a reachability seed.
     /// Single source of truth — tracks the internal bit.
     pub const FLAG_ENTRYPOINT: u32 = NodeFlags::ENTRYPOINT;
+
+    /// `EdgeFlags::DEAD_BRANCH` re-exported for the `flags` argument of
+    /// [`PluginOps::add_edge`] / [`FileOps::add_edge`]: mark a plugin-added
+    /// edge as originating in a statically-dead region. Metadata only — the
+    /// edge still participates in default reachability.
+    pub const FLAG_DEAD_BRANCH: u32 = EdgeFlags::DEAD_BRANCH;
+
+    /// `EdgeFlags::DYNAMIC_IMPORT` re-exported for the `flags` argument of
+    /// [`PluginOps::add_edge`] / [`FileOps::add_edge`]: mark a plugin-added
+    /// edge as a runtime-import (`__import__` / `importlib.import_module`)
+    /// fan-out, the same bit the visitor stamps on dynamic-import edges.
+    pub const FLAG_DYNAMIC_IMPORT: u32 = EdgeFlags::DYNAMIC_IMPORT;
 
     /// Contract an external native plugin implements. The host calls
     /// [`run`](ExternalPlugin::run) once per materialize against the frozen
@@ -1187,6 +1203,79 @@ pub mod plugin_api {
         pub fn main_blocks(&self) -> Vec<(usize, Vec<usize>)> {
             self.inner.find_main_blocks_indices().unwrap_or_default()
         }
+
+        // --- project-wide matchers (mirror the `query(ctx)` DSL) ------------
+        //
+        // Index-returning twins of the chainable Python `query(ctx)`
+        // builder, so a project-wide native plugin can find its seeds
+        // without hand-rolling the import / decorator / construction AST
+        // walk. They share the exact matchers the per-file
+        // [`PluginFileCtx`] helpers and the Python DSL use, so the three
+        // surfaces agree. Each returns project-wide node indices.
+
+        /// The names `from module_fqn import *` would bind into the
+        /// importing scope — every top-level decl on `module_fqn`'s public
+        /// surface (honoring `__all__` when present). Empty when the module
+        /// isn't found.
+        pub fn module_surface(&self, module_fqn: &str) -> Vec<usize> {
+            Python::with_gil(|py| self.inner.module_surface_indices(py, module_fqn))
+                .unwrap_or_default()
+        }
+
+        /// The decl nodes named by `module_fqn`'s `__all__`, or `None` when
+        /// the module has no `__all__` / it isn't a literal string list.
+        pub fn dunder_all_exports(&self, module_fqn: &str) -> Option<Vec<usize>> {
+            self.inner
+                .find_module_dunder_all_exports_indices(module_fqn)
+                .unwrap_or(None)
+        }
+
+        /// The string entries of a top-level `X = ["a", "b"]` /
+        /// `X: tuple[str, ...] = ("a", "b")` literal-list assignment named
+        /// `var_fqn`, or `None` when the variable isn't a literal string
+        /// list. The read the `LiteralListPlugin` shape is built on.
+        pub fn literal_list_entries(&self, var_fqn: &str) -> Option<Vec<String>> {
+            self.inner
+                .find_literal_list_entries(var_fqn)
+                .unwrap_or(None)
+        }
+
+        /// Every top-level decl (function / class / variable / import /
+        /// type_alias) whose simple name matches the regular expression
+        /// `pattern`. An invalid pattern yields an empty result.
+        pub fn decls_matching_name(&self, pattern: &str) -> Vec<usize> {
+            Python::with_gil(|py| self.inner.decls_matching_name_indices(py, pattern))
+                .unwrap_or_default()
+        }
+
+        /// Project-wide twin of [`PluginFileCtx::decorated_decls`]:
+        /// function / class decls anywhere in the project carrying a
+        /// decorator that resolves to one of `names` imported from one of
+        /// `modules`.
+        pub fn decorated_decls(&self, modules: &[&str], names: &[&str]) -> Vec<usize> {
+            let modules_owned: Vec<String> = modules.iter().map(|m| m.to_string()).collect();
+            let names_owned: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+            Python::with_gil(|py| {
+                self.inner
+                    .find_decorated_decls(py, &modules_owned, names_owned, None, false)
+            })
+            .map(|pairs| pairs.into_iter().map(|(idx, _)| idx).collect())
+            .unwrap_or_default()
+        }
+
+        /// Project-wide twin of [`PluginFileCtx::constructions`]: top-level
+        /// `X = Ctor(...)` decls anywhere in the project whose `Ctor`
+        /// resolves to one of `names` imported from one of `modules`.
+        pub fn constructions(&self, modules: &[&str], names: &[&str]) -> Vec<usize> {
+            let modules_owned: Vec<String> = modules.iter().map(|m| m.to_string()).collect();
+            let names_owned: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+            Python::with_gil(|py| {
+                self.inner
+                    .find_instance_constructions(py, &modules_owned, names_owned, None, false)
+            })
+            .map(|triples| triples.into_iter().map(|(idx, _, _)| idx).collect())
+            .unwrap_or_default()
+        }
     }
 
     /// Op sink for external plugins. Wraps the internal `PreparedOp` vec so
@@ -1214,27 +1303,36 @@ pub mod plugin_api {
         }
 
         /// Add a reachability edge `src_idx -> dst_idx` between two
-        /// existing nodes. Mirrors `AddEdgeByIdx`.
-        pub fn add_edge(&mut self, src_idx: usize, dst_idx: usize) {
+        /// existing nodes, stamped with `flags` (`0` for a plain edge, or
+        /// one of [`FLAG_DEAD_BRANCH`] / [`FLAG_DYNAMIC_IMPORT`]). Mirrors
+        /// `AddEdgeByIdx`.
+        pub fn add_edge(&mut self, src_idx: usize, dst_idx: usize, flags: u32) {
             self.sink.push(PreparedOp::EdgeByIdx {
                 src_idx,
                 dst_idx,
-                flags: 0,
+                flags,
             });
         }
 
         /// Mint a new `kind="synthetic"` node named `fqname` with `flags`
-        /// (see [`FLAG_ENTRYPOINT`]) and an out-edge to each index in
-        /// `edges_to_idx`. Mirrors `AddNodeByIdx`; the host bounds-checks
+        /// (see [`FLAG_ENTRYPOINT`]), an out-edge to each index in
+        /// `edges_to_idx`, and an in-edge from each index in
+        /// `edges_from_idx`. Mirrors `AddNodeByIdx`; the host bounds-checks
         /// every endpoint at apply time and rejects a dangling index
         /// rather than minting an unconnected node.
-        pub fn add_synthetic_node(&mut self, fqname: String, flags: u32, edges_to_idx: Vec<usize>) {
+        pub fn add_synthetic_node(
+            &mut self,
+            fqname: String,
+            flags: u32,
+            edges_to_idx: Vec<usize>,
+            edges_from_idx: Vec<usize>,
+        ) {
             self.sink.push(PreparedOp::NodeByIdx {
                 fqname,
                 kind: intern_kind("synthetic").expect("'synthetic' is a valid kind"),
                 path: String::new(),
                 flags,
-                edges_from_idx: Vec::new(),
+                edges_from_idx,
                 edges_to_idx,
             });
         }
@@ -1405,20 +1503,23 @@ pub mod plugin_api {
         }
 
         /// Mint a `kind="synthetic"` node named `fqname` with `flags` (see
-        /// [`FLAG_ENTRYPOINT`]) and an out-edge to each file-local index in
-        /// `edges_to_local_idx`. References must stay within this file — a
-        /// local index with no node is dropped at apply time.
+        /// [`FLAG_ENTRYPOINT`]), an out-edge to each file-local index in
+        /// `edges_to_local_idx`, and an in-edge from each file-local index
+        /// in `edges_from_local_idx`. References must stay within this
+        /// file — a local index with no node is dropped at apply time.
         pub fn add_synthetic_node(
             &mut self,
             fqname: String,
             flags: u32,
             edges_to_local_idx: Vec<u32>,
+            edges_from_local_idx: Vec<u32>,
         ) {
             self.sink.push(FileLocalOp::Node {
                 fqname,
                 kind: intern_kind("synthetic").expect("'synthetic' is a valid kind"),
                 flags,
                 edges_to_local_idx,
+                edges_from_local_idx,
             });
         }
 
@@ -1433,15 +1534,95 @@ pub mod plugin_api {
             });
         }
 
-        /// Add a reachability edge from `src_local_idx` to `dst_local_idx`.
-        /// Both endpoints are positions in [`PluginFileCtx::nodes`]; an edge
-        /// with an unresolvable endpoint is dropped at apply time.
-        pub fn add_edge(&mut self, src_local_idx: u32, dst_local_idx: u32) {
+        /// Add a reachability edge from `src_local_idx` to `dst_local_idx`,
+        /// stamped with `flags` (`0` for a plain edge, or one of
+        /// [`FLAG_DEAD_BRANCH`] / [`FLAG_DYNAMIC_IMPORT`]). Both endpoints
+        /// are positions in [`PluginFileCtx::nodes`]; an edge with an
+        /// unresolvable endpoint is dropped at apply time.
+        pub fn add_edge(&mut self, src_local_idx: u32, dst_local_idx: u32, flags: u32) {
             self.sink.push(FileLocalOp::Edge {
                 src_local_idx,
                 dst_local_idx,
-                flags: 0,
+                flags,
             });
+        }
+    }
+
+    // The read methods are thin, infallible delegations to `pub(crate)`
+    // `ProjectContext` methods that already carry Python-level test coverage
+    // (the `query(ctx)` DSL + per-file mirror suites), so they don't get a
+    // bespoke harness here — the end-to-end airlock path is exercised by the
+    // gated `tests/test_plugins/test_external_dylib_plugin.py` in CI. These
+    // tests pin the *writer* widening: that `flags` and the in-edge list
+    // thread through to the emitted op rather than being dropped.
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::builder::PreparedOp;
+
+        #[test]
+        fn plugin_ops_add_edge_carries_flags() {
+            let mut ops = PluginOps::new();
+            ops.add_edge(1, 2, FLAG_DYNAMIC_IMPORT);
+            assert!(matches!(
+                ops.into_inner().as_slice(),
+                [PreparedOp::EdgeByIdx { src_idx: 1, dst_idx: 2, flags }]
+                    if *flags == FLAG_DYNAMIC_IMPORT
+            ));
+        }
+
+        #[test]
+        fn plugin_ops_add_synthetic_node_carries_edges_from() {
+            let mut ops = PluginOps::new();
+            ops.add_synthetic_node("syn".to_string(), FLAG_ENTRYPOINT, vec![3], vec![4, 5]);
+            let sink = ops.into_inner();
+            let [PreparedOp::NodeByIdx {
+                fqname,
+                kind,
+                path,
+                flags,
+                edges_from_idx,
+                edges_to_idx,
+            }] = sink.as_slice()
+            else {
+                panic!("expected a single NodeByIdx op");
+            };
+            assert_eq!(fqname, "syn");
+            assert_eq!(*kind, "synthetic");
+            assert!(path.is_empty());
+            assert_eq!(*flags, FLAG_ENTRYPOINT);
+            assert_eq!(edges_to_idx.as_slice(), &[3]);
+            assert_eq!(edges_from_idx.as_slice(), &[4, 5]);
+        }
+
+        #[test]
+        fn file_ops_add_edge_carries_flags() {
+            let mut ops = FileOps::new();
+            ops.add_edge(0, 1, FLAG_DEAD_BRANCH);
+            assert!(matches!(
+                ops.into_inner().as_slice(),
+                [FileLocalOp::Edge { src_local_idx: 0, dst_local_idx: 1, flags }]
+                    if *flags == FLAG_DEAD_BRANCH
+            ));
+        }
+
+        #[test]
+        fn file_ops_add_synthetic_node_carries_edges_from() {
+            let mut ops = FileOps::new();
+            ops.add_synthetic_node("syn".to_string(), FLAG_ENTRYPOINT, vec![2], vec![3]);
+            let sink = ops.into_inner();
+            let [FileLocalOp::Node {
+                fqname,
+                edges_to_local_idx,
+                edges_from_local_idx,
+                ..
+            }] = sink.as_slice()
+            else {
+                panic!("expected a single Node op, got {sink:?}");
+            };
+            assert_eq!(fqname, "syn");
+            assert_eq!(edges_to_local_idx.as_slice(), &[2]);
+            assert_eq!(edges_from_local_idx.as_slice(), &[3]);
         }
     }
 }
@@ -1611,6 +1792,7 @@ impl PerFileNativePluginImpl for ModuleDundersPluginImpl {
             kind: synthetic,
             flags: NodeFlags::ENTRYPOINT,
             edges_to_local_idx: targets,
+            edges_from_local_idx: Vec::new(),
         });
     }
 }
@@ -1712,6 +1894,7 @@ fn server_config_run_on_file(
         kind: synthetic,
         flags: NodeFlags::ENTRYPOINT,
         edges_to_local_idx: targets,
+        edges_from_local_idx: Vec::new(),
     });
 }
 

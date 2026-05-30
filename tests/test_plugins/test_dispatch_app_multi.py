@@ -191,9 +191,7 @@ def test_single_dispatch_plugin_path(build_plugin_graph, reachable_fqnames):
     assert "app.main.x" in alive
 
 
-def test_celery_shared_task_fires_alongside_another_plugin(
-    build_plugin_graph, reachable_fqnames
-):
+def test_celery_shared_task_fires_alongside_another_plugin(build_plugin_graph, reachable_fqnames):
     """Celery's ``@shared_task`` fan-out fires whether it runs alone or
     alongside another dispatch plugin."""
     files = {

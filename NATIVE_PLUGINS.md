@@ -130,14 +130,24 @@ flags }`.
 | `ancestors(decl_idx)` | `Vec<usize>` | reverse reachability closure |
 | `direct_predecessors(idx)` | `Vec<usize>` | one-hop reverse step |
 | `main_blocks()` | `Vec<(usize, Vec<usize>)>` | each `if __name__` block as `(module, [decls])` |
+| `decorated_decls(modules, names)` | `Vec<usize>` | decls decorated by one of `names` imported from one of `modules` (mirrors `query(ctx).decorators()...`) |
+| `constructions(modules, names)` | `Vec<usize>` | `X = Ctor(...)` decls whose `Ctor` is one of `names` imported from one of `modules` |
+| `module_surface(module_fqn)` | `Vec<usize>` | the names `from module_fqn import *` would bind |
+| `dunder_all_exports(module_fqn)` | `Option<Vec<usize>>` | the decls named by `module_fqn`'s `__all__`, or `None` |
+| `literal_list_entries(var_fqn)` | `Option<Vec<String>>` | the string entries of a `X = ["a", "b"]` literal-list assignment |
+| `decls_matching_name(pattern)` | `Vec<usize>` | top-level decls whose simple name matches the regex `pattern` |
+
+The last six delegate to the same query core as the `query(ctx)` DSL, so they
+agree with it; they're the project-wide analogue of the per-file
+[`PluginFileCtx`](#per-file-plugins-optional-salsa-cached) helpers.
 
 `PluginOps` — emit ops (mirrors the three Python graph ops):
 
 | method | mirrors | what |
 |---|---|---|
 | `keep_alive(decl_idx, marker)` | `AddEntrypointByIdx` | make a node a reachability seed |
-| `add_edge(src_idx, dst_idx)` | `AddEdgeByIdx` | add `src -> dst` between existing nodes |
-| `add_synthetic_node(fqname, flags, edges_to_idx)` | `AddNodeByIdx` | mint a `synthetic` node with out-edges; set `flags = plugin_api::FLAG_ENTRYPOINT` to make it a seed |
+| `add_edge(src_idx, dst_idx, flags)` | `AddEdgeByIdx` | add `src -> dst` between existing nodes; `flags` is `0` or one of `plugin_api::FLAG_DEAD_BRANCH` / `FLAG_DYNAMIC_IMPORT` |
+| `add_synthetic_node(fqname, flags, edges_to_idx, edges_from_idx)` | `AddNodeByIdx` | mint a `synthetic` node with out-edges (`edges_to_idx`) and in-edges (`edges_from_idx`); set `flags = plugin_api::FLAG_ENTRYPOINT` to make it a seed |
 
 Endpoint indices are bounds-checked by the host at apply time — a dangling
 index is rejected cleanly rather than minting an unconnected node.
@@ -173,6 +183,7 @@ impl PerFilePlugin for MyPlugin {
                 format!("<__main__>:{}", file.module_fqname()),
                 plugin_api::FLAG_ENTRYPOINT,
                 targets,
+                Vec::new(),   // no in-edges — this node is a seed, not a sink
             );
         }
     }
@@ -184,10 +195,15 @@ plugin is per-file is read **once, at load**.
 
 `PluginFileCtx<'_>` is a restricted, single-file view — `module_fqname()`,
 `module_local_idx()`, `node_count()`, `node(local_idx)`, `nodes()`,
-`line_span(range)`, `parsed()` (the raw AST), and the `main_block_range()`
-convenience. `FileOps` mirrors `add_synthetic_node` but in the file's **local**
-index space (`edges_to_local_idx` are positions in `file.nodes()`, which the
-host maps to global indices at apply time).
+`line_span(range)`, `parsed()` (the raw AST), the `main_block_range()`
+convenience, and the ready-made file-local matchers `imports_any_module(modules)`,
+`decorated_decls(modules, names)`, `constructions(modules, names)`, and
+`calls(modules, names)` (file-local twins of the project-wide `PluginCtx`
+matchers above). `FileOps` mirrors all three `PluginOps` emitters — `keep_alive`,
+`add_edge(src, dst, flags)`, and `add_synthetic_node(fqname, flags,
+edges_to_local_idx, edges_from_local_idx)` — but in the file's **local** index
+space (the index args are positions in `file.nodes()`, which the host maps to
+global indices at apply time).
 
 **Purity is the contract that buys the cache.** `run_on_file` must be a pure
 function of its `file` — it may read only what `PluginFileCtx` exposes and must

@@ -94,6 +94,19 @@ two versions.
   — `NativePlugin.prepare(...)` forwards to it (and to in-tree
   project-wide impls), so a plugin can read config under the project
   root before the graph is built. See `examples/per_file_decorated/`.
+- **Project-wide matcher + write parity for the native plugin airlock.**
+  The project-wide `PluginCtx` now exposes the same ready-made matchers
+  the per-file `PluginFileCtx` got — `decorated_decls(modules, names)`
+  and `constructions(modules, names)` (sharing the matcher behind the
+  `query(ctx)` DSL, so the two surfaces agree) — plus the targeted reads
+  `module_surface`, `dunder_all_exports`, `literal_list_entries`, and
+  `decls_matching_name`. On the write side, `PluginOps`/`FileOps`
+  `add_edge` now takes a `flags` argument (with `plugin_api::FLAG_DEAD_BRANCH`
+  / `FLAG_DYNAMIC_IMPORT` re-exported) and `add_synthetic_node` takes an
+  `edges_from` (in-edge) list, matching the `flags` / `edges_from`
+  parameters the Python `AddEdge` / `AddNode` graph ops already carry — so
+  an out-of-tree plugin porting from the Python `ctx` API has the same
+  read/write surface in Rust.
 - `Analysis.re_materialize(events)` — incrementally rebuild the
   project graph against the existing `native.ProjectContext`. The
   caller supplies the change events: typically
