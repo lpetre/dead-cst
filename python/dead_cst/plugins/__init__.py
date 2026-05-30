@@ -9,8 +9,8 @@ This package contains plugins covering core Python conventions
 (``__main__`` blocks, ``[project.scripts]``, explicit entrypoints,
 module dunders, init-subclass discovery, the ``DYNAMIC_IMPORT``
 fan-out) plus the reusable :class:`DecoratedDeclPlugin` /
-:class:`DispatchAppPlugin` / :class:`LiteralListPlugin` shapes that
-framework-specific plugins build on.
+:class:`LiteralListPlugin` shapes that framework-specific plugins
+build on.
 
 Plugins targeting specific third-party frameworks (FastAPI, Flask,
 Click, Typer, pytest, unittest, ...) live under
@@ -33,9 +33,6 @@ from ._core import (
 )
 from .decl_shapes import (
     DecoratedDeclPlugin,
-    DispatchAppGather,
-    DispatchAppPlugin,
-    DispatchAppSpec,
     LiteralListPlugin,
 )
 from .dynamic_import import DynamicImportFallbackPlugin
@@ -47,9 +44,6 @@ from .project_scripts import ProjectScriptsPlugin
 
 __all__ = [
     "DecoratedDeclPlugin",
-    "DispatchAppGather",
-    "DispatchAppPlugin",
-    "DispatchAppSpec",
     "DynamicImportFallbackPlugin",
     "EXTERNAL_DIST_PREFIX",
     "EXTERNAL_FILE_PREFIX",

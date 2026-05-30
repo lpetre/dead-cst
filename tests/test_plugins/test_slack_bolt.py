@@ -1,11 +1,10 @@
-"""Tests for :func:`slack_bolt_plugin`."""
+"""Tests for the native Slack Bolt dispatch-app plugin (``NativePlugin.slack_bolt()``)."""
 
 from __future__ import annotations
 
 import pytest
 
-from dead_cst.contrib import slack_bolt_plugin
-from dead_cst.plugins import DispatchAppPlugin
+from dead_cst import _native as native
 
 
 def test_slack_bolt_plugin_marks_handlers(build_plugin_graph, reachable_fqnames):
@@ -61,7 +60,7 @@ def test_slack_bolt_plugin_marks_handlers(build_plugin_graph, reachable_fqnames)
                 pass
             """,
         },
-        [slack_bolt_plugin()],
+        [native.NativePlugin.slack_bolt()],
     )
     reached = reachable_fqnames(graph)
     assert "bot.main.app" in reached
@@ -105,7 +104,7 @@ def test_slack_bolt_plugin_handles_async_app(build_plugin_graph, reachable_fqnam
                 await ack()
             """,
         },
-        [slack_bolt_plugin()],
+        [native.NativePlugin.slack_bolt()],
     )
     reached = reachable_fqnames(graph)
     assert "bot.main.app" in reached
@@ -140,7 +139,7 @@ def test_slack_bolt_plugin_keeps_handler_dependencies_alive(build_plugin_graph, 
                 return build_greeting()
             """,
         },
-        [slack_bolt_plugin()],
+        [native.NativePlugin.slack_bolt()],
     )
     reached = reachable_fqnames(graph)
     assert "bot.main.run" in reached
@@ -170,7 +169,7 @@ def test_slack_bolt_plugin_auto_seeds_app_as_entrypoint(build_plugin_graph, reac
                 pass
             """,
         },
-        [slack_bolt_plugin()],
+        [native.NativePlugin.slack_bolt()],
     )
     reached = reachable_fqnames(graph)
     assert "bot.main.app" in reached
@@ -229,7 +228,7 @@ def test_slack_bolt_plugin_auto_seeds_app_as_entrypoint(build_plugin_graph, reac
 def test_slack_bolt_plugin_handles_import_variants(build_plugin_graph, reachable_fqnames, src):
     graph = build_plugin_graph(
         {"bot/__init__.py": "", "bot/main.py": src},
-        [slack_bolt_plugin()],
+        [native.NativePlugin.slack_bolt()],
     )
     assert "bot.main.hello" in reachable_fqnames(graph)
 
@@ -250,7 +249,7 @@ def test_slack_bolt_plugin_ignores_bare_decorators(build_plugin_graph, reachable
             def looks_like_event(): pass
             """,
         },
-        [slack_bolt_plugin()],
+        [native.NativePlugin.slack_bolt()],
     )
     # Bare ``@event`` (no attribute access) is not a Bolt registration --
     # matching it would clobber unrelated decorators with the same name.
@@ -272,7 +271,7 @@ def test_slack_bolt_plugin_ignores_unrelated_decorators(build_plugin_graph, reac
             def not_a_handler(): pass
             """,
         },
-        [slack_bolt_plugin()],
+        [native.NativePlugin.slack_bolt()],
     )
     # ``t`` isn't a ``slack_bolt.App`` instance, so its ``.event`` decorator
     # is ignored.
@@ -297,7 +296,7 @@ def test_slack_bolt_plugin_does_nothing_without_slack_bolt_imports(
             def looks_like_handler(): pass
             """,
         },
-        [slack_bolt_plugin()],
+        [native.NativePlugin.slack_bolt()],
     )
     # ``app`` here is not a slack_bolt App -- no ``slack_bolt`` import in scope.
     assert "pkg.mod.looks_like_handler" not in reachable_fqnames(graph)
@@ -327,7 +326,7 @@ def test_slack_bolt_plugin_handles_factory_function(build_plugin_graph, reachabl
                 ack()
             """,
         },
-        [slack_bolt_plugin()],
+        [native.NativePlugin.slack_bolt()],
     )
     reached = reachable_fqnames(graph)
     assert "bot.main.app" in reached
@@ -335,9 +334,7 @@ def test_slack_bolt_plugin_handles_factory_function(build_plugin_graph, reachabl
     assert "bot.main.echo_command" in reached
 
 
-def test_slack_bolt_plugin_factory_returns_configured_dispatch_app():
-    plugin = slack_bolt_plugin()
-    assert isinstance(plugin, DispatchAppPlugin)
-    assert plugin.marker_prefix == "slack-bolt"
-    assert plugin.app_classes == ("slack_bolt.App", "slack_bolt.async_app.AsyncApp")
-    assert plugin.seed_as_entrypoint is True
+def test_slack_bolt_plugin_factory_returns_native_plugin():
+    plugin = native.NativePlugin.slack_bolt()
+    assert isinstance(plugin, native.NativePlugin)
+    assert plugin.name == "slack_bolt"

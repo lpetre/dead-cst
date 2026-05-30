@@ -1,11 +1,10 @@
-"""Tests for :func:`fastmcp_plugin`."""
+"""Tests for the native FastMCP dispatch-app plugin (``NativePlugin.fastmcp()``)."""
 
 from __future__ import annotations
 
 import pytest
 
-from dead_cst.contrib import fastmcp_plugin
-from dead_cst.plugins import DispatchAppPlugin
+from dead_cst import _native as native
 
 
 def test_fastmcp_plugin_marks_tool_handlers(build_plugin_graph, reachable_fqnames):
@@ -38,7 +37,7 @@ def test_fastmcp_plugin_marks_tool_handlers(build_plugin_graph, reachable_fqname
             def helper(): pass
             """,
         },
-        [fastmcp_plugin()],
+        [native.NativePlugin.fastmcp()],
     )
     reached = reachable_fqnames(graph)
     assert "server.main.mcp" in reached
@@ -76,7 +75,7 @@ def test_fastmcp_plugin_keeps_handler_dependencies_alive(build_plugin_graph, rea
                 return build_result()
             """,
         },
-        [fastmcp_plugin()],
+        [native.NativePlugin.fastmcp()],
     )
     reached = reachable_fqnames(graph)
     assert "server.main.run" in reached
@@ -105,7 +104,7 @@ def test_fastmcp_plugin_auto_seeds_server_as_entrypoint(build_plugin_graph, reac
             def hello(): pass
             """,
         },
-        [fastmcp_plugin()],
+        [native.NativePlugin.fastmcp()],
     )
     reached = reachable_fqnames(graph)
     assert "server.main.mcp" in reached
@@ -153,7 +152,7 @@ def test_fastmcp_plugin_auto_seeds_server_as_entrypoint(build_plugin_graph, reac
 def test_fastmcp_plugin_handles_import_variants(build_plugin_graph, reachable_fqnames, src):
     graph = build_plugin_graph(
         {"server/__init__.py": "", "server/main.py": src},
-        [fastmcp_plugin()],
+        [native.NativePlugin.fastmcp()],
     )
     assert "server.main.hello" in reachable_fqnames(graph)
 
@@ -174,7 +173,7 @@ def test_fastmcp_plugin_ignores_bare_decorators(build_plugin_graph, reachable_fq
             def looks_like_tool(): pass
             """,
         },
-        [fastmcp_plugin()],
+        [native.NativePlugin.fastmcp()],
     )
     # Bare ``@tool`` (no attribute access) is not a FastMCP registration --
     # matching it would clobber unrelated decorators with the same name.
@@ -196,7 +195,7 @@ def test_fastmcp_plugin_ignores_unrelated_decorators(build_plugin_graph, reachab
             def not_a_tool(): pass
             """,
         },
-        [fastmcp_plugin()],
+        [native.NativePlugin.fastmcp()],
     )
     # ``t`` isn't a ``FastMCP`` instance, so its ``.tool`` decorator is ignored.
     assert "pkg.mod.not_a_tool" not in reachable_fqnames(graph)
@@ -218,7 +217,7 @@ def test_fastmcp_plugin_does_nothing_without_fastmcp_imports(build_plugin_graph,
             def looks_like_tool(): pass
             """,
         },
-        [fastmcp_plugin()],
+        [native.NativePlugin.fastmcp()],
     )
     # ``mcp`` here is not a FastMCP instance -- no ``fastmcp`` import in scope.
     assert "pkg.mod.looks_like_tool" not in reachable_fqnames(graph)
@@ -240,7 +239,7 @@ def test_fastmcp_plugin_ignores_import_star(build_plugin_graph, reachable_fqname
             def hello(): pass
             """,
         },
-        [fastmcp_plugin()],
+        [native.NativePlugin.fastmcp()],
     )
     # No instance edge from ``mcp`` to ``hello`` because the plugin ignores
     # star imports. ``hello`` is not referenced by anything reachable.
@@ -271,7 +270,7 @@ def test_fastmcp_plugin_handles_factory_function(build_plugin_graph, reachable_f
                 return {}
             """,
         },
-        [fastmcp_plugin()],
+        [native.NativePlugin.fastmcp()],
     )
     reached = reachable_fqnames(graph)
     assert "server.main.mcp" in reached
@@ -306,7 +305,7 @@ def test_fastmcp_plugin_ignores_non_server_fastmcp_users(build_plugin_graph, rea
             def handler(): pass
             """,
         },
-        [fastmcp_plugin()],
+        [native.NativePlugin.fastmcp()],
     )
     assert "pkg.mod.handler" not in reachable_fqnames(graph)
 
@@ -341,7 +340,9 @@ def test_fastmcp_plugin_factory_in_different_package(
             """,
         }
     )
-    graph = make_analysis(["pkg_a", "pkg_b:pkg_a"], plugins=[fastmcp_plugin()]).materialize_all()
+    graph = make_analysis(
+        ["pkg_a", "pkg_b:pkg_a"], plugins=[native.NativePlugin.fastmcp()]
+    ).materialize_all()
     reached = reachable_fqnames(graph)
     assert "pkg_b.main.mcp" in reached
     assert "pkg_b.main.hello" in reached
@@ -378,18 +379,18 @@ def test_fastmcp_plugin_factory_module_form_in_different_package(
             """,
         }
     )
-    graph = make_analysis(["pkg_a", "pkg_b:pkg_a"], plugins=[fastmcp_plugin()]).materialize_all()
+    graph = make_analysis(
+        ["pkg_a", "pkg_b:pkg_a"], plugins=[native.NativePlugin.fastmcp()]
+    ).materialize_all()
     reached = reachable_fqnames(graph)
     assert "pkg_b.main.mcp" in reached
     assert "pkg_b.main.hello" in reached
 
 
-def test_fastmcp_plugin_factory_returns_configured_dispatch_app():
-    plugin = fastmcp_plugin()
-    assert isinstance(plugin, DispatchAppPlugin)
-    assert plugin.marker_prefix == "fastmcp"
-    assert plugin.app_classes == ("fastmcp.FastMCP", "mcp.server.fastmcp.FastMCP")
-    assert plugin.seed_as_entrypoint is True
+def test_fastmcp_plugin_factory_returns_native_plugin():
+    plugin = native.NativePlugin.fastmcp()
+    assert isinstance(plugin, native.NativePlugin)
+    assert plugin.name == "fastmcp"
 
 
 def test_fastmcp_plugin_handles_anthropic_mcp_sdk_import(build_plugin_graph, reachable_fqnames):
@@ -412,7 +413,7 @@ def test_fastmcp_plugin_handles_anthropic_mcp_sdk_import(build_plugin_graph, rea
                 return {}
             """,
         },
-        [fastmcp_plugin()],
+        [native.NativePlugin.fastmcp()],
     )
     reached = reachable_fqnames(graph)
     assert "server.main.mcp" in reached
@@ -435,6 +436,6 @@ def test_fastmcp_plugin_handles_anthropic_sdk_module_import(build_plugin_graph, 
             def hello(): pass
             """,
         },
-        [fastmcp_plugin()],
+        [native.NativePlugin.fastmcp()],
     )
     assert "server.main.hello" in reachable_fqnames(graph)

@@ -105,9 +105,11 @@ For common shapes, subclass one of the declarative bases in
 * `DecoratedDeclPlugin` — decorated decls in files matching a search
   path.
 * `LiteralListPlugin` — `<owner>.<var> = ['fqn', ...]` registries.
-* `DispatchAppPlugin` — `@<instance>.<reg>(...)` handlers wired to an
-  app instance. Pure-dispatch (Typer / Cyclopts) or factory-aware
-  (Flask / FastAPI / Celery) via `instance_kinds: Mapping[str, bool]`.
+
+The `@<instance>.<reg>(...)` dispatch-app shape (Flask / FastAPI /
+Typer / Cyclopts / Slack Bolt / FastMCP / Celery) is a native (Rust)
+plugin — `NativePlugin.flask()` … `NativePlugin.celery()` — not a
+Python base.
 
 Drop generic-Python plugins in `dead_cst/plugins/<name>.py`
 (re-exported from `dead_cst/plugins/__init__.py`); drop
@@ -127,10 +129,11 @@ my_plugin = "myproj.plugins:MyPlugin"
 The CLI's `_load_plugin` checks `_BUILTIN_PLUGINS` first, then the
 entry-point group.
 
-`CeleryPlugin` is the full-featured reference (factory-aware
-`DispatchAppPlugin` plus a per-file `@shared_task` channel);
-`FastAPIPlugin` / `FlaskPlugin` are the factory-aware shape;
-`TyperPlugin` / `CycloptsPlugin` are the pure-dispatch shape.
+`ClickPlugin` is a good reference for a Python framework plugin
+(group → handler dispatch over the chainable `query(ctx)` DSL). The
+dispatch-app frameworks (Flask / FastAPI / Typer / Cyclopts / Slack
+Bolt / FastMCP / Celery) are native plugins — see
+`DispatchAppPluginImpl` in `runtime/src/native_plugins.rs`.
 
 ### Native plugins
 

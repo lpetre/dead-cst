@@ -86,7 +86,7 @@ def test_something(build_decl_graph, assert_edges):
 ## Adding a plugin
 
 1. Define a class with `name: str`, `version: int` (epoch), and `run(ctx: native.ProjectContext) -> Iterable[native.GraphOp]`. The plugin yields `AddNode` / `AddEdge` / `AddEntrypoint` ops the rust backend applies.
-2. For common shapes, subclass `DecoratedDeclPlugin`, `DispatchAppPlugin`, or `LiteralListPlugin` from `plugins/decl_shapes.py` and configure with class-level attributes (`app_module`, `decorator_names`, etc.).
+2. For common shapes, subclass `DecoratedDeclPlugin` or `LiteralListPlugin` from `plugins/decl_shapes.py` and configure with class-level attributes (`decorator_module`, `decorator_names`, etc.). The dispatch-app frameworks (Flask, FastAPI, Typer, Cyclopts, Slack Bolt, FastMCP, Celery) are native plugins — `NativePlugin.flask()` … `NativePlugin.celery()`.
 3. Drop generic-Python plugins in `dead_cst/plugins/<name>.py` (re-exported from `dead_cst/plugins/__init__.py`). Drop framework / third-party-aware plugins in `dead_cst/contrib/<name>.py` (re-exported from `dead_cst/contrib/__init__.py`). Register the CLI key in `_BUILTIN_PLUGINS` (`cli.py`), importing the plugin directly.
 4. Out-of-tree plugins register under the `dead_cst.plugins` entry-point group; the CLI's `_load_plugin` checks `_BUILTIN_PLUGINS` first.
 

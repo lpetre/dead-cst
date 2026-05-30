@@ -138,6 +138,17 @@ two versions.
   the default Gunicorn/Hypercorn set). The Python `ModuleDundersPlugin` /
   `InitSubclassPlugin` / `MainBlockPlugin` / `UnittestPlugin` classes remain
   available for now; they will be removed once every built-in is ported.
+- **Dispatch-app frameworks ported to a native engine.** The `flask`,
+  `fastapi`, `typer`, `cyclopts`, `slack_bolt`, `fastmcp`, and `celery`
+  built-ins are now native `NativePlugin` instances
+  (`NativePlugin.flask()` … `NativePlugin.celery()`), resolved through the
+  same Rust registry. One `DispatchAppPluginImpl` carries each framework's
+  config — app classes, per-instance registration decorators, and whether
+  the app seeds itself as an entrypoint (Celery additionally fans
+  `@shared_task` out module-wide) — and runs project-wide over the existing
+  `find_*` queries. Behaviour is identical. Because each framework is now an
+  independent project-wide native plugin, the Python-side automatic batching
+  of multiple `DispatchAppPlugin` instances is retired.
 
 ### Removed
 
@@ -146,6 +157,13 @@ two versions.
   CLI's `server_config` key already resolves to it), passing `filenames=[…]`
   for custom server-config basenames. This is the first built-in whose Python
   class is removed as part of the native migration.
+- The Python dispatch-app framework plugins — `dead_cst.contrib.flask_plugin`,
+  `fastapi_plugin`, `typer_plugin`, `cyclopts_plugin`, `slack_bolt_plugin`,
+  `fastmcp_plugin`, and `CeleryPlugin` — and the reusable `DispatchAppPlugin` /
+  `DispatchAppSpec` / `DispatchAppGather` shapes in `dead_cst.plugins`. Use the
+  native factories (`NativePlugin.flask()` … `NativePlugin.celery()`); the CLI
+  keys (`flask`, `fastapi`, `typer`, `cyclopts`, `slack_bolt`, `fastmcp`,
+  `celery`) already resolve to them.
 
 #### Query DSL — SymbolNode terminals and SymbolNode-taking sugar
 - `SubclassQuery.collect()`, `ImportQuery.collect()`, `ClassQuery.collect()`,

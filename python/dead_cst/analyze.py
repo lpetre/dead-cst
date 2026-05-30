@@ -435,83 +435,6 @@ class _ProgressPoller:
                 )
 
 
-class _DispatchShim:
-    """Internal: wraps a :class:`DispatchAppPlugin` so the harness can
-    drive its ``policy(ctx, gathered)`` through the same threaded
-    fan-out it uses for every other plugin.
-
-    The shim is two-phase: at construction time it holds a slot index
-    into a shared fused-gather result and a ``Future`` that the worker
-    thread will block on when ``run(ctx)`` is called. The gather runs
-    as its own task in the same :class:`ThreadPoolExecutor`, so it
-    overlaps with every non-dispatch plugin instead of serializing
-    before them on the main thread.
-
-    Inactive dispatch plugins (``_is_active(ctx)`` returned ``False``
-    upstream) carry ``slot=None`` and ``gather_future=None``; their
-    ``run(ctx)`` is a no-op so progress accounting stays
-    one-shim-per-plugin.
-
-    Used only by :meth:`Analysis.materialize_all`'s dispatch-batching
-    path; never appears in user code.
-    """
-
-    name = "DispatchShim"
-    version = 1
-
-    def __init__(
-        self,
-        plugin: Any,
-        slot: int | None,
-        gather_future: Any | None,
-    ) -> None:
-        self._plugin = plugin
-        self._slot = slot
-        self._gather_future = gather_future
-
-    def prepare(self, project_root: Path) -> None:
-        pass
-
-    def run(self, ctx: native.ProjectContext) -> Iterator[Any]:
-        if self._slot is None or self._gather_future is None:
-            return iter(())
-        # Block until the gather worker has populated every slot. The
-        # gather releases the GIL inside every rust query it issues
-        # (``find_subclasses_indices``, ``find_constructions``, …),
-        # so non-dispatch plugins in sibling workers overlap with it.
-        gathered_list = self._gather_future.result()
-        gathered = gathered_list[self._slot]
-        if gathered is None:
-            return iter(())
-        return iter(self._plugin.policy(ctx, gathered))
-
-
-def _build_dispatch_schedule(
-    ctx: native.ProjectContext,
-    plugins: Sequence[Any],
-    gather_future: Any | None,
-    active_slot_by_id: dict[int, int],
-) -> list[Any]:
-    """Return a per-plugin work list with every
-    :class:`DispatchAppPlugin` replaced by a :class:`_DispatchShim`
-    bound to its slot in ``gather_future``.
-
-    Position-preserving: ``len(out) == len(plugins)``. Non-dispatch
-    plugins pass through unchanged. Dispatch plugins not in
-    ``active_slot_by_id`` (because ``_is_active(ctx)`` returned
-    ``False``) get a no-op shim so progress accounting stays
-    one-shim-per-plugin.
-    """
-    from .plugins.decl_shapes import DispatchAppPlugin
-
-    return [
-        _DispatchShim(p, active_slot_by_id.get(id(p)), gather_future)
-        if isinstance(p, DispatchAppPlugin)
-        else p
-        for p in plugins
-    ]
-
-
 def _make_indicatif_callback() -> ProgressCallback:
     """Default progress callback for ``show_progress=True``.
 
@@ -759,21 +682,11 @@ class Analysis:
         # * **Rust-side serial loop** — ``ctx.materialize()`` drives the
         #   build pass and every registered plugin's ``run(ctx)`` in
         #   one C call. Used when ``DEAD_CST_PLUGINS_SERIAL=1`` or
-        #   ``len(plugins) <= 1`` AND no plugin needs a between-build-
-        #   and-run hook (the dispatch-batching path does).
+        #   ``len(plugins) <= 1``.
         # * **Python-driven loop** — ``ctx.build_only()`` runs the
         #   build pass; Python then drives plugin ``run(ctx)`` calls
-        #   itself, either through a :class:`ThreadPoolExecutor` (so
-        #   GIL-releasing rust queries overlap) or serially when
-        #   ``DEAD_CST_PLUGINS_SERIAL=1``. When any registered plugin
-        #   is a :class:`DispatchAppPlugin`, the harness submits one
-        #   shared ``_gather_batched`` task into the same pool and
-        #   binds each dispatch plugin's :class:`_DispatchShim` to its
-        #   slot in the gather's future. The gather overlaps with
-        #   every non-dispatch plugin in sibling workers (its rust
-        #   queries release the GIL); the dispatch shims block on the
-        #   future inside their own ``run(ctx)``, so they only consume
-        #   CPU once the gather is ready.
+        #   itself through a :class:`ThreadPoolExecutor` (so
+        #   GIL-releasing rust queries overlap).
         #
         # Both paths satisfy the *frozen-graph* contract: every
         # plugin's ``run(ctx)`` observes the same base-graph state.
@@ -783,10 +696,7 @@ class Analysis:
         # and to every other plugin's queries, until the apply pass
         # runs.
         try:
-            from .plugins.decl_shapes import DispatchAppPlugin, _gather_batched
-
-            has_dispatch = any(isinstance(p, DispatchAppPlugin) for p in self._plugins)
-            use_rust_serial = not has_dispatch and (_serial_mode() or len(self._plugins) <= 1)
+            use_rust_serial = _serial_mode() or len(self._plugins) <= 1
             if use_rust_serial:
                 for plugin in self._plugins:
                     ctx.add_plugin(plugin)
@@ -794,30 +704,8 @@ class Analysis:
             else:
                 ctx.build_only()
 
-                # Identify active dispatch plugins on the main thread
-                # (the ``_is_active`` probe is cheap — just an
-                # ``ImportQuery.exists()`` per app module). Build the
-                # spec list + slot map now, but defer the actual gather
-                # to a pool worker below.
-                active_specs: list[Any] = []
-                active_slot_by_id: dict[int, int] = {}
-                if has_dispatch:
-                    for p in self._plugins:
-                        if isinstance(p, DispatchAppPlugin) and p._is_active(ctx):
-                            active_slot_by_id[id(p)] = len(active_specs)
-                            active_specs.append(p.spec)
+                workers = 1 if _serial_mode() else _plugin_worker_count(len(self._plugins))
 
-                # Worker count: regular plugins + one reserved slot
-                # for the gather task when active. The +1 keeps the
-                # gather from starving the non-dispatch plugins it's
-                # meant to overlap with — without it, a dispatch shim
-                # blocked on the gather future would occupy a worker
-                # the gather itself wants.
-                n_work = len(self._plugins) + (1 if active_specs else 0)
-                workers = 1 if _serial_mode() else _plugin_worker_count(n_work)
-
-                # Progress names track the *original* plugins so users see
-                # ``FlaskPlugin`` etc. — shims are an implementation detail.
                 plugin_names = [type(p).__qualname__ for p in self._plugins]
                 ctx.progress_plugins_start(plugin_names)
                 try:
@@ -848,25 +736,8 @@ class Analysis:
                         max_workers=workers,
                         thread_name_prefix="dead-cst-plugin",
                     ) as pool:
-                        # Submit the gather first so it has a head
-                        # start on the per-plugin tasks below — the
-                        # gather is single-purpose work (every active
-                        # dispatch plugin needs its slice), so it
-                        # gets exclusive use of the +1 worker.
-                        gather_future: Any | None = (
-                            pool.submit(_gather_batched, ctx, active_specs)
-                            if active_specs
-                            else None
-                        )
-                        scheduled = (
-                            _build_dispatch_schedule(
-                                ctx, self._plugins, gather_future, active_slot_by_id
-                            )
-                            if has_dispatch
-                            else list(self._plugins)
-                        )
                         futures = [
-                            pool.submit(_run_collect, idx, p) for idx, p in enumerate(scheduled)
+                            pool.submit(_run_collect, idx, p) for idx, p in enumerate(self._plugins)
                         ]
                         collected = [fut.result() for fut in futures]
                     ctx.apply_ops_batched(collected)

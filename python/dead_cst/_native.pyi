@@ -416,6 +416,67 @@ class NativePlugin:
         """
         ...
 
+    @staticmethod
+    def flask() -> NativePlugin:
+        """Native Flask dispatch-app plugin. Finds ``app = Flask(...)``
+        instances (and ``Blueprint``/``Api``/factory functions returning
+        them), wires ``@app.route`` / ``@bp.cli.command`` / … handlers
+        through each instance, and seeds the app itself as an entrypoint.
+        """
+        ...
+
+    @staticmethod
+    def fastapi() -> NativePlugin:
+        """Native FastAPI dispatch-app plugin. Finds ``app = FastAPI(...)``
+        / ``APIRouter(...)`` instances and wires ``@app.get`` / ``@app.post``
+        / … route handlers through them. The ``FastAPI`` app seeds itself;
+        a bare ``APIRouter`` only goes live once mounted/reached.
+        """
+        ...
+
+    @staticmethod
+    def typer() -> NativePlugin:
+        """Native Typer dispatch-app plugin. Finds ``app = Typer(...)``
+        instances and wires ``@app.command`` / ``@app.callback`` handlers
+        through them. The app does **not** seed itself — it goes live only
+        via a main block, ``[project.scripts]``, or an explicit entrypoint.
+        """
+        ...
+
+    @staticmethod
+    def cyclopts() -> NativePlugin:
+        """Native Cyclopts dispatch-app plugin. Finds ``app = App(...)``
+        instances and wires ``@app.command`` / ``@app.default`` handlers
+        through them. Like Typer, the app does not seed itself.
+        """
+        ...
+
+    @staticmethod
+    def slack_bolt() -> NativePlugin:
+        """Native Slack Bolt dispatch-app plugin. Finds ``App(...)`` /
+        ``AsyncApp(...)`` instances and wires ``@app.event`` / ``@app.command``
+        / ``@app.action`` / … listener handlers through them. Seeds the app.
+        """
+        ...
+
+    @staticmethod
+    def fastmcp() -> NativePlugin:
+        """Native FastMCP dispatch-app plugin. Finds ``FastMCP(...)`` /
+        ``Server(...)`` instances and wires ``@mcp.tool`` / ``@mcp.resource``
+        / ``@mcp.prompt`` / ``@mcp.completion`` handlers through them. Seeds
+        the app.
+        """
+        ...
+
+    @staticmethod
+    def celery() -> NativePlugin:
+        """Native Celery dispatch-app plugin. Finds ``app = Celery(...)``
+        instances and wires ``@app.task`` handlers through them, plus a
+        module-wide ``@shared_task`` fan-out (shared tasks bind to no
+        specific app instance). Seeds the app.
+        """
+        ...
+
 def _builtin_native_plugin(name: str) -> NativePlugin | None:
     """Resolve a built-in plugin name (e.g. ``"main_block"``) to its
     native implementation, or ``None`` if no native plugin owns that
@@ -1154,10 +1215,10 @@ class ProjectContext:
         single factory constructs more than one (e.g. a function that
         returns a ``Flask`` after mounting several ``Blueprint``\\ s).
 
-        Not yet wrapped by the builder API — the only caller is
-        :class:`DispatchAppPlugin` and it uses this shape directly.
-        Likely candidate for a ``ConstructionQuery.inside_factory()``
-        predicate in a follow-up.
+        Not yet wrapped by the builder API — the only caller is the
+        native dispatch-app impl (``NativePlugin.flask()`` and friends)
+        and it uses this shape directly. Likely candidate for a
+        ``ConstructionQuery.inside_factory()`` predicate in a follow-up.
         """
         ...
 
