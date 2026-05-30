@@ -1,11 +1,10 @@
-"""Tests for :func:`fastapi_plugin`."""
+"""Tests for the native FastAPI dispatch-app plugin (``NativePlugin.fastapi()``)."""
 
 from __future__ import annotations
 
 import pytest
 
-from dead_cst.contrib import fastapi_plugin
-from dead_cst.plugins import DispatchAppPlugin
+from dead_cst import _native as native
 
 
 def test_fastapi_plugin_marks_route_handlers(build_plugin_graph, reachable_fqnames):
@@ -35,7 +34,7 @@ def test_fastapi_plugin_marks_route_handlers(build_plugin_graph, reachable_fqnam
             def helper(): pass
             """,
         },
-        [fastapi_plugin()],
+        [native.NativePlugin.fastapi()],
     )
     reached = reachable_fqnames(graph)
     assert "app.main.app" in reached
@@ -70,7 +69,7 @@ def test_fastapi_plugin_marks_websocket_and_lifecycle(build_plugin_graph, reacha
             async def startup(): pass
             """,
         },
-        [fastapi_plugin()],
+        [native.NativePlugin.fastapi()],
     )
     reached = reachable_fqnames(graph)
     assert "app.main.ws_endpoint" in reached
@@ -104,7 +103,7 @@ def test_fastapi_plugin_keeps_handler_dependencies_alive(build_plugin_graph, rea
                 return build_item()
             """,
         },
-        [fastapi_plugin()],
+        [native.NativePlugin.fastapi()],
     )
     reached = reachable_fqnames(graph)
     assert "app.main.get_item" in reached
@@ -131,7 +130,7 @@ def test_fastapi_plugin_ignores_bare_decorators(build_plugin_graph, reachable_fq
             def looks_like_route(): pass
             """,
         },
-        [fastapi_plugin()],
+        [native.NativePlugin.fastapi()],
     )
     # Bare ``@get`` (no attribute access) is not a FastAPI registration --
     # matching it would clobber unrelated decorators with the same name.
@@ -153,7 +152,7 @@ def test_fastapi_plugin_ignores_unrelated_decorators(build_plugin_graph, reachab
             def not_a_route(): pass
             """,
         },
-        [fastapi_plugin()],
+        [native.NativePlugin.fastapi()],
     )
     assert "pkg.mod.not_a_route" not in reachable_fqnames(graph)
 
@@ -171,7 +170,7 @@ def test_fastapi_plugin_unused_router_stays_dead(build_plugin_graph, reachable_f
             def orphan(): pass
             """,
         },
-        [fastapi_plugin()],
+        [native.NativePlugin.fastapi()],
     )
     reached = reachable_fqnames(graph)
     # No FastAPI app reaches this router, so it (and its handler) are dead.
@@ -202,7 +201,7 @@ def test_fastapi_plugin_router_reachable_via_include_router(build_plugin_graph, 
             app.include_router(router)
             """,
         },
-        [fastapi_plugin()],
+        [native.NativePlugin.fastapi()],
     )
     reached = reachable_fqnames(graph)
     assert "app.main.app" in reached
@@ -252,7 +251,7 @@ def test_fastapi_plugin_router_reachable_via_include_router(build_plugin_graph, 
 def test_fastapi_plugin_handles_import_variants(build_plugin_graph, reachable_fqnames, src):
     graph = build_plugin_graph(
         {"app/__init__.py": "", "app/main.py": src},
-        [fastapi_plugin()],
+        [native.NativePlugin.fastapi()],
     )
     assert "app.main.index" in reachable_fqnames(graph)
 
@@ -273,7 +272,7 @@ def test_fastapi_plugin_does_nothing_without_fastapi_imports(build_plugin_graph,
             def looks_like_route(): pass
             """,
         },
-        [fastapi_plugin()],
+        [native.NativePlugin.fastapi()],
     )
     # ``app`` here is not a FastAPI instance -- no ``fastapi`` import in scope.
     assert "pkg.mod.looks_like_route" not in reachable_fqnames(graph)
@@ -301,7 +300,7 @@ def test_fastapi_plugin_handles_factory_function(build_plugin_graph, reachable_f
             def create_item(): pass
             """,
         },
-        [fastapi_plugin()],
+        [native.NativePlugin.fastapi()],
     )
     reached = reachable_fqnames(graph)
     assert "app.main.app" in reached
@@ -325,7 +324,7 @@ def test_fastapi_plugin_factory_returning_router_stays_dead(build_plugin_graph, 
             def orphan(): pass
             """,
         },
-        [fastapi_plugin()],
+        [native.NativePlugin.fastapi()],
     )
     # Factory-produced router is treated like a literal APIRouter --
     # never auto-seeded as an entrypoint, so an unincluded one stays dead.
@@ -361,17 +360,15 @@ def test_fastapi_plugin_ignores_non_app_fastapi_users(build_plugin_graph, reacha
             def handler(): pass
             """,
         },
-        [fastapi_plugin()],
+        [native.NativePlugin.fastapi()],
     )
     assert "pkg.mod.handler" not in reachable_fqnames(graph)
 
 
-def test_fastapi_plugin_factory_returns_configured_dispatch_app():
-    plugin = fastapi_plugin()
-    assert isinstance(plugin, DispatchAppPlugin)
-    assert plugin.marker_prefix == "fastapi"
-    assert plugin.app_classes == ("fastapi.FastAPI",)
-    assert plugin.seed_as_entrypoint is True
+def test_fastapi_plugin_factory_returns_native_plugin():
+    plugin = native.NativePlugin.fastapi()
+    assert isinstance(plugin, native.NativePlugin)
+    assert plugin.name == "fastapi"
 
 
 def test_fastapi_plugin_factory_in_different_package(
@@ -404,7 +401,9 @@ def test_fastapi_plugin_factory_in_different_package(
             """,
         }
     )
-    graph = make_analysis(["pkg_a", "pkg_b:pkg_a"], plugins=[fastapi_plugin()]).materialize_all()
+    graph = make_analysis(
+        ["pkg_a", "pkg_b:pkg_a"], plugins=[native.NativePlugin.fastapi()]
+    ).materialize_all()
     reached = reachable_fqnames(graph)
     assert "pkg_b.main.app" in reached
     assert "pkg_b.main.list_items" in reached
@@ -441,7 +440,9 @@ def test_fastapi_plugin_factory_module_form_in_different_package(
             """,
         }
     )
-    graph = make_analysis(["pkg_a", "pkg_b:pkg_a"], plugins=[fastapi_plugin()]).materialize_all()
+    graph = make_analysis(
+        ["pkg_a", "pkg_b:pkg_a"], plugins=[native.NativePlugin.fastapi()]
+    ).materialize_all()
     reached = reachable_fqnames(graph)
     assert "pkg_b.main.app" in reached
     assert "pkg_b.main.list_items" in reached
@@ -481,7 +482,9 @@ def test_fastapi_plugin_router_factory_in_different_package(
             """,
         }
     )
-    graph = make_analysis(["pkg_a", "pkg_b:pkg_a"], plugins=[fastapi_plugin()]).materialize_all()
+    graph = make_analysis(
+        ["pkg_a", "pkg_b:pkg_a"], plugins=[native.NativePlugin.fastapi()]
+    ).materialize_all()
     reached = reachable_fqnames(graph)
     assert "pkg_b.main.app" in reached
     assert "pkg_b.main.router" in reached
@@ -517,7 +520,9 @@ def test_fastapi_plugin_orphan_router_factory_stays_dead_cross_package(
             """,
         }
     )
-    graph = make_analysis(["pkg_a", "pkg_b:pkg_a"], plugins=[fastapi_plugin()]).materialize_all()
+    graph = make_analysis(
+        ["pkg_a", "pkg_b:pkg_a"], plugins=[native.NativePlugin.fastapi()]
+    ).materialize_all()
     reached = reachable_fqnames(graph)
     assert "pkg_b.main.router" not in reached
     assert "pkg_b.main.orphan" not in reached

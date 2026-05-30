@@ -35,9 +35,6 @@ EXPECTED_PUBLIC_API: dict[str, list[str]] = {
     ],
     "dead_cst.plugins": [
         "DecoratedDeclPlugin",
-        "DispatchAppGather",
-        "DispatchAppPlugin",
-        "DispatchAppSpec",
         "DynamicImportFallbackPlugin",
         "EXTERNAL_DIST_PREFIX",
         "EXTERNAL_FILE_PREFIX",
@@ -56,18 +53,11 @@ EXPECTED_PUBLIC_API: dict[str, list[str]] = {
         "simple_name",
     ],
     "dead_cst.contrib": [
-        "CeleryPlugin",
         "ClickPlugin",
         "DiscordPyPlugin",
         "MockPatchPlugin",
         "PytestPlugin",
         "UnittestPlugin",
-        "cyclopts_plugin",
-        "fastapi_plugin",
-        "fastmcp_plugin",
-        "flask_plugin",
-        "slack_bolt_plugin",
-        "typer_plugin",
     ],
 }
 

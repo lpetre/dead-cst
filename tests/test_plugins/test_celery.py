@@ -1,10 +1,10 @@
-"""Tests for :class:`CeleryPlugin`."""
+"""Tests for the native Celery dispatch-app plugin (``NativePlugin.celery()``)."""
 
 from __future__ import annotations
 
 import pytest
 
-from dead_cst.contrib import CeleryPlugin
+from dead_cst import _native as native
 
 
 def test_celery_plugin_marks_task_handlers(build_plugin_graph, reachable_fqnames):
@@ -28,7 +28,7 @@ def test_celery_plugin_marks_task_handlers(build_plugin_graph, reachable_fqnames
             def helper(): pass
             """,
         },
-        [CeleryPlugin()],
+        [native.NativePlugin.celery()],
     )
     reached = reachable_fqnames(graph)
     assert "app.celery.app" in reached
@@ -64,7 +64,7 @@ def test_celery_plugin_keeps_handler_dependencies_alive(build_plugin_graph, reac
                 return build_job()
             """,
         },
-        [CeleryPlugin()],
+        [native.NativePlugin.celery()],
     )
     reached = reachable_fqnames(graph)
     assert "app.celery.run_job" in reached
@@ -114,7 +114,7 @@ def test_celery_plugin_keeps_handler_dependencies_alive(build_plugin_graph, reac
 def test_celery_plugin_handles_import_variants(build_plugin_graph, reachable_fqnames, src):
     graph = build_plugin_graph(
         {"app/__init__.py": "", "app/celery.py": src},
-        [CeleryPlugin()],
+        [native.NativePlugin.celery()],
     )
     assert "app.celery.run" in reachable_fqnames(graph)
 
@@ -140,7 +140,7 @@ def test_celery_plugin_marks_shared_tasks(build_plugin_graph, reachable_fqnames)
             def helper(): pass
             """,
         },
-        [CeleryPlugin()],
+        [native.NativePlugin.celery()],
     )
     reached = reachable_fqnames(graph)
     assert "app.tasks.bare_decorator" in reached
@@ -185,7 +185,7 @@ def test_celery_plugin_shared_task_import_variants(
 ):
     graph = build_plugin_graph(
         {"app/__init__.py": "", "app/tasks.py": src},
-        [CeleryPlugin()],
+        [native.NativePlugin.celery()],
     )
     assert expected <= reachable_fqnames(graph)
 
@@ -206,7 +206,7 @@ def test_celery_plugin_ignores_unrelated_task_decorators(build_plugin_graph, rea
             def not_a_celery_task(): pass
             """,
         },
-        [CeleryPlugin()],
+        [native.NativePlugin.celery()],
     )
     assert "pkg.mod.not_a_celery_task" not in reachable_fqnames(graph)
 
@@ -224,7 +224,7 @@ def test_celery_plugin_ignores_bare_shared_task_name(build_plugin_graph, reachab
             def looks_like_shared(): pass
             """,
         },
-        [CeleryPlugin()],
+        [native.NativePlugin.celery()],
     )
     assert "pkg.mod.looks_like_shared" not in reachable_fqnames(graph)
 
@@ -244,7 +244,7 @@ def test_celery_plugin_does_nothing_without_celery_imports(build_plugin_graph, r
             def fake(): pass
             """,
         },
-        [CeleryPlugin()],
+        [native.NativePlugin.celery()],
     )
     assert "pkg.mod.fake" not in reachable_fqnames(graph)
 
@@ -263,7 +263,7 @@ def test_celery_plugin_ignores_import_star(build_plugin_graph, reachable_fqnames
             def run(): pass
             """,
         },
-        [CeleryPlugin()],
+        [native.NativePlugin.celery()],
     )
     assert "app.celery.run" not in reachable_fqnames(graph)
 
@@ -278,7 +278,7 @@ def test_celery_plugin_does_nothing_when_celery_not_imported_anywhere(
             def index(): pass
             """,
         },
-        [CeleryPlugin()],
+        [native.NativePlugin.celery()],
     )
     assert "pkg.mod.index" not in reachable_fqnames(graph)
 
@@ -298,7 +298,7 @@ def test_celery_plugin_module_prefixed_unknown_attr(build_plugin_graph, reachabl
             def run(): pass
             """,
         },
-        [CeleryPlugin()],
+        [native.NativePlugin.celery()],
     )
     reached = reachable_fqnames(graph)
     assert "app.celery.run" in reached
@@ -328,7 +328,7 @@ def test_celery_plugin_handles_factory_function(build_plugin_graph, reachable_fq
             def bound(self): pass
             """,
         },
-        [CeleryPlugin()],
+        [native.NativePlugin.celery()],
     )
     from dead_cst.graph import KEEPALIVE_DEFAULT
 
@@ -362,7 +362,9 @@ def test_celery_plugin_factory_in_different_package(make_analysis, write_files, 
             """,
         }
     )
-    graph = make_analysis(["pkg_a", "pkg_b:pkg_a"], plugins=[CeleryPlugin()]).materialize_all()
+    graph = make_analysis(
+        ["pkg_a", "pkg_b:pkg_a"], plugins=[native.NativePlugin.celery()]
+    ).materialize_all()
     reached = reachable_fqnames(graph)
     assert "pkg_b.celery.app" in reached
     assert "pkg_b.celery.run" in reached
@@ -397,7 +399,9 @@ def test_celery_plugin_factory_module_form_in_different_package(
             """,
         }
     )
-    graph = make_analysis(["pkg_a", "pkg_b:pkg_a"], plugins=[CeleryPlugin()]).materialize_all()
+    graph = make_analysis(
+        ["pkg_a", "pkg_b:pkg_a"], plugins=[native.NativePlugin.celery()]
+    ).materialize_all()
     reached = reachable_fqnames(graph)
     assert "pkg_b.celery.app" in reached
     assert "pkg_b.celery.run" in reached
@@ -437,7 +441,7 @@ def test_celery_plugin_ignores_non_decorator_assignment_shapes(
             def nested(): pass
             """,
         },
-        [CeleryPlugin()],
+        [native.NativePlugin.celery()],
     )
     reached = reachable_fqnames(graph)
     assert "app.celery.app" in reached
@@ -474,7 +478,7 @@ def test_celery_plugin_ignores_non_app_celery_users(build_plugin_graph, reachabl
             def handler(): pass
             """,
         },
-        [CeleryPlugin()],
+        [native.NativePlugin.celery()],
     )
     assert "pkg.mod.handler" not in reachable_fqnames(graph)
 
@@ -483,4 +487,5 @@ def test_celery_plugin_loads_via_cli_loader():
     from dead_cst.cli import _load_plugin
 
     plugin = _load_plugin("celery")
-    assert isinstance(plugin, CeleryPlugin)
+    assert isinstance(plugin, native.NativePlugin)
+    assert plugin.name == "celery"

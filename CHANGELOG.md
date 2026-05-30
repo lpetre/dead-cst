@@ -94,6 +94,19 @@ two versions.
   — `NativePlugin.prepare(...)` forwards to it (and to in-tree
   project-wide impls), so a plugin can read config under the project
   root before the graph is built. See `examples/per_file_decorated/`.
+- **Project-wide matcher + write parity for the native plugin airlock.**
+  The project-wide `PluginCtx` now exposes the same ready-made matchers
+  the per-file `PluginFileCtx` got — `decorated_decls(modules, names)`
+  and `constructions(modules, names)` (sharing the matcher behind the
+  `query(ctx)` DSL, so the two surfaces agree) — plus the targeted reads
+  `module_surface`, `dunder_all_exports`, `literal_list_entries`, and
+  `decls_matching_name`. On the write side, `PluginOps`/`FileOps`
+  `add_edge` now takes a `flags` argument (with `plugin_api::FLAG_DEAD_BRANCH`
+  / `FLAG_DYNAMIC_IMPORT` re-exported) and `add_synthetic_node` takes an
+  `edges_from` (in-edge) list, matching the `flags` / `edges_from`
+  parameters the Python `AddEdge` / `AddNode` graph ops already carry — so
+  an out-of-tree plugin porting from the Python `ctx` API has the same
+  read/write surface in Rust.
 - `Analysis.re_materialize(events)` — incrementally rebuild the
   project graph against the existing `native.ProjectContext`. The
   caller supplies the change events: typically
@@ -138,6 +151,17 @@ two versions.
   the default Gunicorn/Hypercorn set). The Python `ModuleDundersPlugin` /
   `InitSubclassPlugin` / `MainBlockPlugin` / `UnittestPlugin` classes remain
   available for now; they will be removed once every built-in is ported.
+- **Dispatch-app frameworks ported to a native engine.** The `flask`,
+  `fastapi`, `typer`, `cyclopts`, `slack_bolt`, `fastmcp`, and `celery`
+  built-ins are now native `NativePlugin` instances
+  (`NativePlugin.flask()` … `NativePlugin.celery()`), resolved through the
+  same Rust registry. One `DispatchAppPluginImpl` carries each framework's
+  config — app classes, per-instance registration decorators, and whether
+  the app seeds itself as an entrypoint (Celery additionally fans
+  `@shared_task` out module-wide) — and runs project-wide over the existing
+  `find_*` queries. Behaviour is identical. Because each framework is now an
+  independent project-wide native plugin, the Python-side automatic batching
+  of multiple `DispatchAppPlugin` instances is retired.
 
 ### Removed
 
@@ -146,6 +170,13 @@ two versions.
   CLI's `server_config` key already resolves to it), passing `filenames=[…]`
   for custom server-config basenames. This is the first built-in whose Python
   class is removed as part of the native migration.
+- The Python dispatch-app framework plugins — `dead_cst.contrib.flask_plugin`,
+  `fastapi_plugin`, `typer_plugin`, `cyclopts_plugin`, `slack_bolt_plugin`,
+  `fastmcp_plugin`, and `CeleryPlugin` — and the reusable `DispatchAppPlugin` /
+  `DispatchAppSpec` / `DispatchAppGather` shapes in `dead_cst.plugins`. Use the
+  native factories (`NativePlugin.flask()` … `NativePlugin.celery()`); the CLI
+  keys (`flask`, `fastapi`, `typer`, `cyclopts`, `slack_bolt`, `fastmcp`,
+  `celery`) already resolve to them.
 
 #### Query DSL — SymbolNode terminals and SymbolNode-taking sugar
 - `SubclassQuery.collect()`, `ImportQuery.collect()`, `ClassQuery.collect()`,

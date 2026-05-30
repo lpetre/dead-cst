@@ -1,37 +1,28 @@
 """Extensions targeting specific third-party tools.
 
 Contrib modules know about external systems -- frameworks
-(FastAPI, Flask, Click, Typer), test runners (pytest, unittest).
-Anything that handles a generic Python language convention lives
-in :mod:`dead_cst.plugins` instead.
+(Click, discord.py), test runners (pytest, unittest), and the
+``mock.patch`` idiom. Anything that handles a generic Python
+language convention lives in :mod:`dead_cst.plugins` instead.
+
+The dispatch-app frameworks (Flask, FastAPI, Typer, Cyclopts,
+Slack Bolt, FastMCP, Celery) are now native plugins resolved
+through ``dead_cst._native`` -- see ``NativePlugin.flask()`` and
+friends.
 """
 
 from __future__ import annotations
 
-from .celery import CeleryPlugin
 from .click import ClickPlugin
-from .cyclopts import cyclopts_plugin
 from .discordpy import DiscordPyPlugin
-from .fastapi import fastapi_plugin
-from .fastmcp import fastmcp_plugin
-from .flask import flask_plugin
 from .mock_patch import MockPatchPlugin
 from .pytest import PytestPlugin
-from .slack_bolt import slack_bolt_plugin
-from .typer import typer_plugin
 from .unittest import UnittestPlugin
 
 __all__ = [
-    "CeleryPlugin",
     "ClickPlugin",
     "DiscordPyPlugin",
     "MockPatchPlugin",
     "PytestPlugin",
     "UnittestPlugin",
-    "cyclopts_plugin",
-    "fastapi_plugin",
-    "fastmcp_plugin",
-    "flask_plugin",
-    "slack_bolt_plugin",
-    "typer_plugin",
 ]

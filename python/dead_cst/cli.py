@@ -34,17 +34,10 @@ from dead_cst import _native as native
 
 from .analyze import Analysis
 from .codemod import generate_patch
-from .contrib.celery import CeleryPlugin
 from .contrib.click import ClickPlugin
-from .contrib.cyclopts import cyclopts_plugin
 from .contrib.discordpy import DiscordPyPlugin
-from .contrib.fastapi import fastapi_plugin
-from .contrib.fastmcp import fastmcp_plugin
-from .contrib.flask import flask_plugin
 from .contrib.mock_patch import MockPatchPlugin
 from .contrib.pytest import PytestPlugin
-from .contrib.slack_bolt import slack_bolt_plugin
-from .contrib.typer import typer_plugin
 from .graph import (
     KEEPALIVE_DEFAULT,
     GraphMetadata,
@@ -69,24 +62,19 @@ app = typer.Typer(help="Dead code analysis for Python.")
 
 
 # Python-side built-ins. Plugins ported to Rust (``main_block``,
-# ``module_dunders``, ``init_subclass``, ``server_config``, ``unittest``)
-# are *not* here — ``_load_plugin`` resolves those through the native
-# registry (``_builtin_native_plugin``) first, so they move out of this map
-# as they're ported.
+# ``module_dunders``, ``init_subclass``, ``server_config``, ``unittest``, and
+# the dispatch-app frameworks ``flask`` / ``fastapi`` / ``typer`` /
+# ``cyclopts`` / ``slack_bolt`` / ``fastmcp`` / ``celery``) are *not* here —
+# ``_load_plugin`` resolves those through the native registry
+# (``_builtin_native_plugin``) first, so they move out of this map as they're
+# ported.
 _BUILTIN_PLUGINS: dict[str, Plugin] = {
     "project_scripts": ProjectScriptsPlugin(),
     "explicit": ExplicitEntrypointPlugin(),
     "pytest": PytestPlugin(),
     "mock_patch": MockPatchPlugin(),
-    "fastapi": fastapi_plugin(),
-    "fastmcp": fastmcp_plugin(),
-    "flask": flask_plugin(),
-    "typer": typer_plugin(),
     "click": ClickPlugin(),
-    "cyclopts": cyclopts_plugin(),
-    "celery": CeleryPlugin(),
     "discordpy": DiscordPyPlugin(),
-    "slack_bolt": slack_bolt_plugin(),
     "dynamic_import_fallback": DynamicImportFallbackPlugin(),
 }
 

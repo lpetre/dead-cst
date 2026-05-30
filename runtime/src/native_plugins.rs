@@ -137,13 +137,16 @@ pub(crate) trait NativePluginImpl: Send + Sync {
 #[derive(Debug, Clone, Eq, PartialEq, salsa::Update, get_size2::GetSize)]
 pub(crate) enum FileLocalOp {
     /// Mint a synthetic node in this file (`AddNodeByIdx` shape) with an
-    /// out-edge to each file-local index in ``edges_to_local_idx``.
+    /// out-edge to each file-local index in ``edges_to_local_idx`` and an
+    /// in-edge from each file-local index in ``edges_from_local_idx``.
     Node {
         fqname: String,
         kind: &'static str,
         flags: u32,
-        /// Indices into the owning file's ``FileNodes.refs`` array.
+        /// File-local indices this node points *to* (out-edges).
         edges_to_local_idx: Vec<u32>,
+        /// File-local indices that point *to* this node (in-edges).
+        edges_from_local_idx: Vec<u32>,
     },
     /// Reachability edge between two nodes in this file (`AddEdgeByIdx`
     /// shape). Both endpoints are file-local indices.
@@ -791,6 +794,72 @@ impl NativePlugin {
             kind: NativePluginKind::ProjectWide(Box::new(UnittestPluginImpl)),
         }
     }
+
+    /// Native Flask dispatch-app plugin (port of
+    /// `dead_cst.contrib.flask.flask_plugin`). Mark Flask apps as entrypoints
+    /// and wire `@app.route(...)` &c. handlers through them. Project-wide
+    /// (a handler and its app may live in different files).
+    #[staticmethod]
+    fn flask() -> Self {
+        Self::dispatch_app("flask", FLASK_CONFIG)
+    }
+
+    /// Native FastAPI dispatch-app plugin (port of
+    /// `dead_cst.contrib.fastapi.fastapi_plugin`).
+    #[staticmethod]
+    fn fastapi() -> Self {
+        Self::dispatch_app("fastapi", FASTAPI_CONFIG)
+    }
+
+    /// Native Typer dispatch-app plugin (port of
+    /// `dead_cst.contrib.typer.typer_plugin`). Pure dispatch — apps are not
+    /// entrypoint-promoted, so unused sub-typers surface as dead.
+    #[staticmethod]
+    fn typer() -> Self {
+        Self::dispatch_app("typer", TYPER_CONFIG)
+    }
+
+    /// Native cyclopts dispatch-app plugin (port of
+    /// `dead_cst.contrib.cyclopts.cyclopts_plugin`). Pure dispatch (see
+    /// :meth:`typer`).
+    #[staticmethod]
+    fn cyclopts() -> Self {
+        Self::dispatch_app("cyclopts", CYCLOPTS_CONFIG)
+    }
+
+    /// Native Slack Bolt dispatch-app plugin (port of
+    /// `dead_cst.contrib.slack_bolt.slack_bolt_plugin`). Recognises both the
+    /// sync `App` and async `AsyncApp` bases.
+    #[staticmethod]
+    fn slack_bolt() -> Self {
+        Self::dispatch_app("slack_bolt", SLACK_BOLT_CONFIG)
+    }
+
+    /// Native FastMCP dispatch-app plugin (port of
+    /// `dead_cst.contrib.fastmcp.fastmcp_plugin`). Recognises the standalone
+    /// `fastmcp` package and the MCP SDK's `mcp.server.fastmcp` layer.
+    #[staticmethod]
+    fn fastmcp() -> Self {
+        Self::dispatch_app("fastmcp", FASTMCP_CONFIG)
+    }
+
+    /// Native Celery dispatch-app plugin (port of
+    /// `dead_cst.contrib.celery.CeleryPlugin`). Wires `@app.task` handlers and
+    /// additionally fans out appless `@shared_task` callables as entrypoints.
+    #[staticmethod]
+    fn celery() -> Self {
+        Self::dispatch_app("celery", CELERY_CONFIG)
+    }
+}
+
+impl NativePlugin {
+    /// Wrap a baked [`DispatchAppConfig`] in a project-wide native plugin.
+    /// Shared by the per-framework factories above; not exposed to Python.
+    fn dispatch_app(name: &'static str, config: DispatchAppConfig) -> Self {
+        Self {
+            kind: NativePluginKind::ProjectWide(Box::new(DispatchAppPluginImpl { name, config })),
+        }
+    }
 }
 
 /// Resolve a built-in plugin name to its native implementation, or `None`
@@ -805,6 +874,13 @@ pub(crate) fn _builtin_native_plugin(name: &str) -> Option<NativePlugin> {
         "init_subclass" => NativePlugin::init_subclass(),
         "server_config" => NativePlugin::server_config(None),
         "unittest" => NativePlugin::unittest(),
+        "flask" => NativePlugin::flask(),
+        "fastapi" => NativePlugin::fastapi(),
+        "typer" => NativePlugin::typer(),
+        "cyclopts" => NativePlugin::cyclopts(),
+        "slack_bolt" => NativePlugin::slack_bolt(),
+        "fastmcp" => NativePlugin::fastmcp(),
+        "celery" => NativePlugin::celery(),
         _ => return None,
     })
 }
@@ -867,6 +943,7 @@ impl PerFileNativePluginImpl for MainBlockPluginImpl {
             kind: synthetic_kind,
             flags: NodeFlags::ENTRYPOINT,
             edges_to_local_idx,
+            edges_from_local_idx: Vec::new(),
         });
     }
 }
@@ -904,7 +981,7 @@ pub mod plugin_api {
 
     use super::{FileContext, FileLocalOp};
     use crate::builder::PreparedOp;
-    use crate::graph::{intern_kind, NodeFlags};
+    use crate::graph::{intern_kind, EdgeFlags, NodeFlags};
     use crate::project::ProjectContext;
 
     // Re-exported so a per-file plugin can name the raw AST / range types
@@ -918,6 +995,18 @@ pub mod plugin_api {
     /// [`FileOps::add_synthetic_node`] to make that node a reachability seed.
     /// Single source of truth — tracks the internal bit.
     pub const FLAG_ENTRYPOINT: u32 = NodeFlags::ENTRYPOINT;
+
+    /// `EdgeFlags::DEAD_BRANCH` re-exported for the `flags` argument of
+    /// [`PluginOps::add_edge`] / [`FileOps::add_edge`]: mark a plugin-added
+    /// edge as originating in a statically-dead region. Metadata only — the
+    /// edge still participates in default reachability.
+    pub const FLAG_DEAD_BRANCH: u32 = EdgeFlags::DEAD_BRANCH;
+
+    /// `EdgeFlags::DYNAMIC_IMPORT` re-exported for the `flags` argument of
+    /// [`PluginOps::add_edge`] / [`FileOps::add_edge`]: mark a plugin-added
+    /// edge as a runtime-import (`__import__` / `importlib.import_module`)
+    /// fan-out, the same bit the visitor stamps on dynamic-import edges.
+    pub const FLAG_DYNAMIC_IMPORT: u32 = EdgeFlags::DYNAMIC_IMPORT;
 
     /// Contract an external native plugin implements. The host calls
     /// [`run`](ExternalPlugin::run) once per materialize against the frozen
@@ -1114,6 +1203,79 @@ pub mod plugin_api {
         pub fn main_blocks(&self) -> Vec<(usize, Vec<usize>)> {
             self.inner.find_main_blocks_indices().unwrap_or_default()
         }
+
+        // --- project-wide matchers (mirror the `query(ctx)` DSL) ------------
+        //
+        // Index-returning twins of the chainable Python `query(ctx)`
+        // builder, so a project-wide native plugin can find its seeds
+        // without hand-rolling the import / decorator / construction AST
+        // walk. They share the exact matchers the per-file
+        // [`PluginFileCtx`] helpers and the Python DSL use, so the three
+        // surfaces agree. Each returns project-wide node indices.
+
+        /// The names `from module_fqn import *` would bind into the
+        /// importing scope — every top-level decl on `module_fqn`'s public
+        /// surface (honoring `__all__` when present). Empty when the module
+        /// isn't found.
+        pub fn module_surface(&self, module_fqn: &str) -> Vec<usize> {
+            Python::with_gil(|py| self.inner.module_surface_indices(py, module_fqn))
+                .unwrap_or_default()
+        }
+
+        /// The decl nodes named by `module_fqn`'s `__all__`, or `None` when
+        /// the module has no `__all__` / it isn't a literal string list.
+        pub fn dunder_all_exports(&self, module_fqn: &str) -> Option<Vec<usize>> {
+            self.inner
+                .find_module_dunder_all_exports_indices(module_fqn)
+                .unwrap_or(None)
+        }
+
+        /// The string entries of a top-level `X = ["a", "b"]` /
+        /// `X: tuple[str, ...] = ("a", "b")` literal-list assignment named
+        /// `var_fqn`, or `None` when the variable isn't a literal string
+        /// list. The read the `LiteralListPlugin` shape is built on.
+        pub fn literal_list_entries(&self, var_fqn: &str) -> Option<Vec<String>> {
+            self.inner
+                .find_literal_list_entries(var_fqn)
+                .unwrap_or(None)
+        }
+
+        /// Every top-level decl (function / class / variable / import /
+        /// type_alias) whose simple name matches the regular expression
+        /// `pattern`. An invalid pattern yields an empty result.
+        pub fn decls_matching_name(&self, pattern: &str) -> Vec<usize> {
+            Python::with_gil(|py| self.inner.decls_matching_name_indices(py, pattern))
+                .unwrap_or_default()
+        }
+
+        /// Project-wide twin of [`PluginFileCtx::decorated_decls`]:
+        /// function / class decls anywhere in the project carrying a
+        /// decorator that resolves to one of `names` imported from one of
+        /// `modules`.
+        pub fn decorated_decls(&self, modules: &[&str], names: &[&str]) -> Vec<usize> {
+            let modules_owned: Vec<String> = modules.iter().map(|m| m.to_string()).collect();
+            let names_owned: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+            Python::with_gil(|py| {
+                self.inner
+                    .find_decorated_decls(py, &modules_owned, names_owned, None, false)
+            })
+            .map(|pairs| pairs.into_iter().map(|(idx, _)| idx).collect())
+            .unwrap_or_default()
+        }
+
+        /// Project-wide twin of [`PluginFileCtx::constructions`]: top-level
+        /// `X = Ctor(...)` decls anywhere in the project whose `Ctor`
+        /// resolves to one of `names` imported from one of `modules`.
+        pub fn constructions(&self, modules: &[&str], names: &[&str]) -> Vec<usize> {
+            let modules_owned: Vec<String> = modules.iter().map(|m| m.to_string()).collect();
+            let names_owned: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+            Python::with_gil(|py| {
+                self.inner
+                    .find_instance_constructions(py, &modules_owned, names_owned, None, false)
+            })
+            .map(|triples| triples.into_iter().map(|(idx, _, _)| idx).collect())
+            .unwrap_or_default()
+        }
     }
 
     /// Op sink for external plugins. Wraps the internal `PreparedOp` vec so
@@ -1141,27 +1303,36 @@ pub mod plugin_api {
         }
 
         /// Add a reachability edge `src_idx -> dst_idx` between two
-        /// existing nodes. Mirrors `AddEdgeByIdx`.
-        pub fn add_edge(&mut self, src_idx: usize, dst_idx: usize) {
+        /// existing nodes, stamped with `flags` (`0` for a plain edge, or
+        /// one of [`FLAG_DEAD_BRANCH`] / [`FLAG_DYNAMIC_IMPORT`]). Mirrors
+        /// `AddEdgeByIdx`.
+        pub fn add_edge(&mut self, src_idx: usize, dst_idx: usize, flags: u32) {
             self.sink.push(PreparedOp::EdgeByIdx {
                 src_idx,
                 dst_idx,
-                flags: 0,
+                flags,
             });
         }
 
         /// Mint a new `kind="synthetic"` node named `fqname` with `flags`
-        /// (see [`FLAG_ENTRYPOINT`]) and an out-edge to each index in
-        /// `edges_to_idx`. Mirrors `AddNodeByIdx`; the host bounds-checks
+        /// (see [`FLAG_ENTRYPOINT`]), an out-edge to each index in
+        /// `edges_to_idx`, and an in-edge from each index in
+        /// `edges_from_idx`. Mirrors `AddNodeByIdx`; the host bounds-checks
         /// every endpoint at apply time and rejects a dangling index
         /// rather than minting an unconnected node.
-        pub fn add_synthetic_node(&mut self, fqname: String, flags: u32, edges_to_idx: Vec<usize>) {
+        pub fn add_synthetic_node(
+            &mut self,
+            fqname: String,
+            flags: u32,
+            edges_to_idx: Vec<usize>,
+            edges_from_idx: Vec<usize>,
+        ) {
             self.sink.push(PreparedOp::NodeByIdx {
                 fqname,
                 kind: intern_kind("synthetic").expect("'synthetic' is a valid kind"),
                 path: String::new(),
                 flags,
-                edges_from_idx: Vec::new(),
+                edges_from_idx,
                 edges_to_idx,
             });
         }
@@ -1332,20 +1503,23 @@ pub mod plugin_api {
         }
 
         /// Mint a `kind="synthetic"` node named `fqname` with `flags` (see
-        /// [`FLAG_ENTRYPOINT`]) and an out-edge to each file-local index in
-        /// `edges_to_local_idx`. References must stay within this file — a
-        /// local index with no node is dropped at apply time.
+        /// [`FLAG_ENTRYPOINT`]), an out-edge to each file-local index in
+        /// `edges_to_local_idx`, and an in-edge from each file-local index
+        /// in `edges_from_local_idx`. References must stay within this
+        /// file — a local index with no node is dropped at apply time.
         pub fn add_synthetic_node(
             &mut self,
             fqname: String,
             flags: u32,
             edges_to_local_idx: Vec<u32>,
+            edges_from_local_idx: Vec<u32>,
         ) {
             self.sink.push(FileLocalOp::Node {
                 fqname,
                 kind: intern_kind("synthetic").expect("'synthetic' is a valid kind"),
                 flags,
                 edges_to_local_idx,
+                edges_from_local_idx,
             });
         }
 
@@ -1360,15 +1534,95 @@ pub mod plugin_api {
             });
         }
 
-        /// Add a reachability edge from `src_local_idx` to `dst_local_idx`.
-        /// Both endpoints are positions in [`PluginFileCtx::nodes`]; an edge
-        /// with an unresolvable endpoint is dropped at apply time.
-        pub fn add_edge(&mut self, src_local_idx: u32, dst_local_idx: u32) {
+        /// Add a reachability edge from `src_local_idx` to `dst_local_idx`,
+        /// stamped with `flags` (`0` for a plain edge, or one of
+        /// [`FLAG_DEAD_BRANCH`] / [`FLAG_DYNAMIC_IMPORT`]). Both endpoints
+        /// are positions in [`PluginFileCtx::nodes`]; an edge with an
+        /// unresolvable endpoint is dropped at apply time.
+        pub fn add_edge(&mut self, src_local_idx: u32, dst_local_idx: u32, flags: u32) {
             self.sink.push(FileLocalOp::Edge {
                 src_local_idx,
                 dst_local_idx,
-                flags: 0,
+                flags,
             });
+        }
+    }
+
+    // The read methods are thin, infallible delegations to `pub(crate)`
+    // `ProjectContext` methods that already carry Python-level test coverage
+    // (the `query(ctx)` DSL + per-file mirror suites), so they don't get a
+    // bespoke harness here — the end-to-end airlock path is exercised by the
+    // gated `tests/test_plugins/test_external_dylib_plugin.py` in CI. These
+    // tests pin the *writer* widening: that `flags` and the in-edge list
+    // thread through to the emitted op rather than being dropped.
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::builder::PreparedOp;
+
+        #[test]
+        fn plugin_ops_add_edge_carries_flags() {
+            let mut ops = PluginOps::new();
+            ops.add_edge(1, 2, FLAG_DYNAMIC_IMPORT);
+            assert!(matches!(
+                ops.into_inner().as_slice(),
+                [PreparedOp::EdgeByIdx { src_idx: 1, dst_idx: 2, flags }]
+                    if *flags == FLAG_DYNAMIC_IMPORT
+            ));
+        }
+
+        #[test]
+        fn plugin_ops_add_synthetic_node_carries_edges_from() {
+            let mut ops = PluginOps::new();
+            ops.add_synthetic_node("syn".to_string(), FLAG_ENTRYPOINT, vec![3], vec![4, 5]);
+            let sink = ops.into_inner();
+            let [PreparedOp::NodeByIdx {
+                fqname,
+                kind,
+                path,
+                flags,
+                edges_from_idx,
+                edges_to_idx,
+            }] = sink.as_slice()
+            else {
+                panic!("expected a single NodeByIdx op");
+            };
+            assert_eq!(fqname, "syn");
+            assert_eq!(*kind, "synthetic");
+            assert!(path.is_empty());
+            assert_eq!(*flags, FLAG_ENTRYPOINT);
+            assert_eq!(edges_to_idx.as_slice(), &[3]);
+            assert_eq!(edges_from_idx.as_slice(), &[4, 5]);
+        }
+
+        #[test]
+        fn file_ops_add_edge_carries_flags() {
+            let mut ops = FileOps::new();
+            ops.add_edge(0, 1, FLAG_DEAD_BRANCH);
+            assert!(matches!(
+                ops.into_inner().as_slice(),
+                [FileLocalOp::Edge { src_local_idx: 0, dst_local_idx: 1, flags }]
+                    if *flags == FLAG_DEAD_BRANCH
+            ));
+        }
+
+        #[test]
+        fn file_ops_add_synthetic_node_carries_edges_from() {
+            let mut ops = FileOps::new();
+            ops.add_synthetic_node("syn".to_string(), FLAG_ENTRYPOINT, vec![2], vec![3]);
+            let sink = ops.into_inner();
+            let [FileLocalOp::Node {
+                fqname,
+                edges_to_local_idx,
+                edges_from_local_idx,
+                ..
+            }] = sink.as_slice()
+            else {
+                panic!("expected a single Node op, got {sink:?}");
+            };
+            assert_eq!(fqname, "syn");
+            assert_eq!(edges_to_local_idx.as_slice(), &[2]);
+            assert_eq!(edges_from_local_idx.as_slice(), &[3]);
         }
     }
 }
@@ -1538,6 +1792,7 @@ impl PerFileNativePluginImpl for ModuleDundersPluginImpl {
             kind: synthetic,
             flags: NodeFlags::ENTRYPOINT,
             edges_to_local_idx: targets,
+            edges_from_local_idx: Vec::new(),
         });
     }
 }
@@ -1639,6 +1894,7 @@ fn server_config_run_on_file(
         kind: synthetic,
         flags: NodeFlags::ENTRYPOINT,
         edges_to_local_idx: targets,
+        edges_from_local_idx: Vec::new(),
     });
 }
 
@@ -1733,3 +1989,470 @@ impl NativePluginImpl for UnittestPluginImpl {
         Ok(())
     }
 }
+
+// ---------------------------------------------------------------------------
+// DispatchAppPlugin — project-wide port of
+// `dead_cst.plugins.decl_shapes.DispatchAppPlugin` plus the seven framework
+// configs that drove it (flask / fastapi / typer / cyclopts / slack_bolt /
+// fastmcp / celery). Cross-file by nature — a handler `@app.route(...)` in one
+// file wires to an `app = Flask()` variable that may live in another file — so
+// this is a project-wide `NativePluginImpl`, not a per-file one.
+//
+// Verbatim port of `DispatchAppPlugin._gather_one` (discovery) + `.policy`
+// (steps 3-6 of emission). The Python harness auto-batched the gather across
+// plugins purely for speed; native plugins run independently with identical
+// per-plugin output (the batching was a perf optimization, not a semantic one).
+// ---------------------------------------------------------------------------
+
+/// Celery-style appless `@shared_task` fan-out layered on top of the standard
+/// dispatch policy. Mirrors `CeleryPlugin.policy`'s `super().policy(...)` then
+/// shared-task pass: every top-level function decorated with one of `names`
+/// (imported from `module`) is kept alive via one `<marker_prefix><basename>`
+/// entrypoint per file. `None` for non-celery configs.
+struct SharedTaskFanout {
+    module: &'static str,
+    names: &'static [&'static str],
+    marker_prefix: &'static str,
+}
+
+/// Pure-data description of a dispatch-app framework — the Rust twin of the
+/// Python `DispatchAppSpec` (plus the optional celery `shared_task` extension).
+/// The seven bundled configs are baked as `const` instances below.
+pub(crate) struct DispatchAppConfig {
+    marker_prefix: &'static str,
+    app_classes: &'static [&'static str],
+    registration_decorators: &'static [&'static str],
+    seed_as_entrypoint: bool,
+    shared_task: Option<SharedTaskFanout>,
+}
+
+/// Project-wide native plugin wrapping a [`DispatchAppConfig`]. One instance
+/// per framework, constructed via the `NativePlugin::flask()` &c. factories.
+pub(crate) struct DispatchAppPluginImpl {
+    name: &'static str,
+    config: DispatchAppConfig,
+}
+
+impl DispatchAppPluginImpl {
+    /// Cheap import-presence + config-completeness guard (port of
+    /// `DispatchAppPlugin._is_active`). Skips the subclass walk when no file
+    /// imports any app class's root module.
+    fn is_active(&self, ctx: &ProjectContext) -> PyResult<bool> {
+        let cfg = &self.config;
+        if cfg.app_classes.is_empty() || cfg.registration_decorators.is_empty() {
+            return Ok(false);
+        }
+        for &fqn in cfg.app_classes {
+            if let Some((module, _)) = fqn.rsplit_once('.') {
+                if !module.is_empty() && ctx.has_imports_of(module)? {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+}
+
+/// Trailing path component (`Path(path).name`) for the celery shared-task
+/// marker; matches `server_config_run_on_file`'s basename handling.
+fn path_basename(path: &str) -> &str {
+    path.rsplit_once(std::path::MAIN_SEPARATOR)
+        .map(|(_, name)| name)
+        .unwrap_or(path)
+}
+
+/// Trailing dotted segment of an fqname (`fqname.rsplit(".", 1)[-1]`).
+fn simple_name(fqname: &str) -> &str {
+    fqname.rsplit_once('.').map(|(_, n)| n).unwrap_or(fqname)
+}
+
+impl NativePluginImpl for DispatchAppPluginImpl {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn run(&self, ctx: &ProjectContext, sink: &mut Vec<PreparedOp>) -> PyResult<()> {
+        let cfg = &self.config;
+        Python::with_gil(|py| -> PyResult<()> {
+            if !self.is_active(ctx)? {
+                return Ok(());
+            }
+
+            // --- Phase 1: gather indices. Each ctx call takes (and releases)
+            // its own `materialized` read guard; none is held across another,
+            // matching the convention in `UnittestPluginImpl`. ---
+
+            // module_to_names: {module -> {ctor simple name}}, expanded
+            // transitively over subclasses of each app class.
+            let mut module_to_names: FxHashMap<String, FxHashSet<String>> = FxHashMap::default();
+            for &fqn in cfg.app_classes {
+                if let Some((module, name)) = fqn.rsplit_once('.') {
+                    if !module.is_empty() && !name.is_empty() {
+                        module_to_names
+                            .entry(module.to_string())
+                            .or_default()
+                            .insert(name.to_string());
+                    }
+                }
+            }
+            for &fqn in cfg.app_classes {
+                let sub_idxs = ctx.find_subclasses_indices(py, fqn, true)?;
+                if sub_idxs.is_empty() {
+                    continue;
+                }
+                for attr in ctx.node_attrs(sub_idxs)? {
+                    if let Some((sub_module, sub_name)) = attr.fqname.rsplit_once('.') {
+                        if !sub_module.is_empty() && !sub_name.is_empty() {
+                            module_to_names
+                                .entry(sub_module.to_string())
+                                .or_default()
+                                .insert(sub_name.to_string());
+                        }
+                    }
+                }
+            }
+            if module_to_names.is_empty() {
+                return Ok(());
+            }
+
+            // direct: top-level `X = Ctor(...)` constructions, deduped by var
+            // idx across modules (the single-plugin path ignores `class_name`).
+            let mut direct_seen: FxHashSet<usize> = FxHashSet::default();
+            let mut direct: Vec<usize> = Vec::new();
+            for (module, names) in &module_to_names {
+                let mut names_vec: Vec<String> = names.iter().cloned().collect();
+                names_vec.sort();
+                let rows = ctx.find_instance_constructions(
+                    py,
+                    std::slice::from_ref(module),
+                    names_vec,
+                    None,
+                    false,
+                )?;
+                for (var_idx, _class_name, _args) in rows {
+                    if direct_seen.insert(var_idx) {
+                        direct.push(var_idx);
+                    }
+                }
+            }
+
+            // factory_decls (seed_as_entrypoint only): functions/classes that
+            // return an app instance, deduped by (decl idx, kind).
+            let mut factory_decls: Vec<(usize, String)> = Vec::new();
+            if cfg.seed_as_entrypoint {
+                let mut factory_seen: FxHashSet<(usize, String)> = FxHashSet::default();
+                for (module, names) in &module_to_names {
+                    let mut names_vec: Vec<String> = names.iter().cloned().collect();
+                    names_vec.sort();
+                    let rows =
+                        ctx.find_factory_decls(py, std::slice::from_ref(module), names_vec)?;
+                    for (decl_idx, kinds) in rows {
+                        for kind in kinds {
+                            if factory_seen.insert((decl_idx, kind.clone())) {
+                                factory_decls.push((decl_idx, kind));
+                            }
+                        }
+                    }
+                }
+            }
+
+            // handlers: `@<owner>.<reg_decorator>(...)`-decorated functions.
+            let reg_decorators: Vec<String> = cfg
+                .registration_decorators
+                .iter()
+                .map(|&s| s.to_string())
+                .collect();
+            let handlers: Vec<(String, usize)> = ctx
+                .find_handler_decorators(py, reg_decorators, None, false)?
+                .into_iter()
+                .map(|(owner, decorated_idx, _args)| (owner, decorated_idx))
+                .collect();
+
+            // factory_reachers (seed + factory): union of every factory decl's
+            // direct predecessors. Inverts step 6's question (is this var's
+            // *direct* successor a factory?) into one membership set.
+            let mut factory_reachers: FxHashSet<usize> = FxHashSet::default();
+            if cfg.seed_as_entrypoint && !factory_decls.is_empty() {
+                let mut decl_seen: FxHashSet<usize> = FxHashSet::default();
+                for &(decl_idx, _) in &factory_decls {
+                    if !decl_seen.insert(decl_idx) {
+                        continue;
+                    }
+                    for pred in ctx.direct_predecessors_idx(decl_idx, 0)? {
+                        factory_reachers.insert(pred);
+                    }
+                }
+            }
+
+            // shared_task (celery): `@shared_task`-decorated decls.
+            let shared_idxs: Vec<usize> = match &cfg.shared_task {
+                Some(st) => {
+                    let modules = [st.module.to_string()];
+                    let names: Vec<String> = st.names.iter().map(|&s| s.to_string()).collect();
+                    ctx.find_decorated_decls(py, &modules, names, None, false)?
+                        .into_iter()
+                        .map(|(decl_idx, _args)| decl_idx)
+                        .collect()
+                }
+                None => Vec::new(),
+            };
+
+            // --- Phase 2: resolve paths/fqnames + assemble ops under one
+            // `materialized` read guard. No ctx call that re-acquires the guard
+            // runs in this block (all index gathering happened above). ---
+            let outputs = ctx.materialized("DispatchAppPlugin")?;
+            let nodes = &outputs.builder.nodes;
+            let synthetic = intern_kind("synthetic").expect("'synthetic' is a valid kind");
+
+            let app_prefix = format!("<{}-app>:", cfg.marker_prefix);
+            let factory_prefix = format!("<{}-factory>:", cfg.marker_prefix);
+
+            // vars_by_file: (path, simple var name) -> first var idx wins.
+            let mut vars_by_file: FxHashMap<(String, String), usize> = FxHashMap::default();
+            for (idx, node_py) in nodes.iter().enumerate() {
+                let node = node_py.get();
+                if node.kind != "variable" {
+                    continue;
+                }
+                vars_by_file
+                    .entry((node.path.clone(), simple_name(&node.fqname).to_string()))
+                    .or_insert(idx);
+            }
+
+            // Steps 1 + 3: build direct_by_owner and entrypoint-promote each
+            // direct construction (the latter only under seed_as_entrypoint).
+            let mut direct_by_owner: FxHashMap<(String, String), Vec<usize>> = FxHashMap::default();
+            for &var_idx in &direct {
+                let node = nodes[var_idx].get();
+                direct_by_owner
+                    .entry((node.path.clone(), simple_name(&node.fqname).to_string()))
+                    .or_default()
+                    .push(var_idx);
+                if cfg.seed_as_entrypoint {
+                    sink.push(PreparedOp::NodeByIdx {
+                        fqname: format!("{app_prefix}{}", node.fqname),
+                        kind: synthetic,
+                        path: node.path.clone(),
+                        flags: NodeFlags::ENTRYPOINT,
+                        edges_from_idx: Vec::new(),
+                        edges_to_idx: vec![var_idx],
+                    });
+                }
+            }
+
+            // Step 4: factory markers so step 6's reachability walk can find
+            // them. `factory_decls` is empty unless seed_as_entrypoint.
+            for (decl_idx, kind) in &factory_decls {
+                let node = nodes[*decl_idx].get();
+                sink.push(PreparedOp::NodeByIdx {
+                    fqname: format!("{factory_prefix}{kind}:{}", node.fqname),
+                    kind: synthetic,
+                    path: node.path.clone(),
+                    flags: 0,
+                    edges_from_idx: vec![*decl_idx],
+                    edges_to_idx: Vec::new(),
+                });
+            }
+
+            // Step 5: wire handler decorators to their owner var. Seed mode
+            // uses vars_by_file (so `app = create_app()` factory chains pick up
+            // edges); pure-dispatch mode wires only to direct constructions (so
+            // a star-imported `app = App()` stays invisible).
+            for (owner, decorated_idx) in &handlers {
+                let key = (nodes[*decorated_idx].get().path.clone(), owner.clone());
+                if cfg.seed_as_entrypoint {
+                    if let Some(&var_idx) = vars_by_file.get(&key) {
+                        sink.push(PreparedOp::EdgeByIdx {
+                            src_idx: var_idx,
+                            dst_idx: *decorated_idx,
+                            flags: 0,
+                        });
+                    }
+                } else if let Some(var_idxs) = direct_by_owner.get(&key) {
+                    for &var_idx in var_idxs {
+                        sink.push(PreparedOp::EdgeByIdx {
+                            src_idx: var_idx,
+                            dst_idx: *decorated_idx,
+                            flags: 0,
+                        });
+                    }
+                }
+            }
+
+            // Step 6: factory walk — entrypoint-promote vars whose *direct*
+            // successor is a factory decl (seed + factory only). The
+            // `factory_reachers` membership test rules out the two-hop
+            // `wrapper = app; app = create_app()` over-promotion case.
+            if cfg.seed_as_entrypoint && !factory_decls.is_empty() {
+                let mut classified: FxHashSet<(String, String)> = FxHashSet::default();
+                for (owner, decorated_idx) in &handlers {
+                    let key = (nodes[*decorated_idx].get().path.clone(), owner.clone());
+                    if direct_by_owner.contains_key(&key) || classified.contains(&key) {
+                        continue;
+                    }
+                    let Some(&var_idx) = vars_by_file.get(&key) else {
+                        continue;
+                    };
+                    if !factory_reachers.contains(&var_idx) {
+                        continue;
+                    }
+                    classified.insert(key);
+                    let node = nodes[var_idx].get();
+                    sink.push(PreparedOp::NodeByIdx {
+                        fqname: format!("{app_prefix}{}", node.fqname),
+                        kind: synthetic,
+                        path: node.path.clone(),
+                        flags: NodeFlags::ENTRYPOINT,
+                        edges_from_idx: Vec::new(),
+                        edges_to_idx: vec![var_idx],
+                    });
+                }
+            }
+
+            // Celery `@shared_task` fan-out: one `<marker_prefix><basename>`
+            // entrypoint per file, keeping every appless task callable alive.
+            if let Some(st) = &cfg.shared_task {
+                let mut by_path: FxHashMap<String, Vec<usize>> = FxHashMap::default();
+                let mut path_order: Vec<String> = Vec::new();
+                for &decl_idx in &shared_idxs {
+                    let path = nodes[decl_idx].get().path.clone();
+                    if !by_path.contains_key(&path) {
+                        path_order.push(path.clone());
+                    }
+                    by_path.entry(path).or_default().push(decl_idx);
+                }
+                for path in path_order {
+                    let target_idxs = by_path.remove(&path).unwrap_or_default();
+                    sink.push(PreparedOp::NodeByIdx {
+                        fqname: format!("{}{}", st.marker_prefix, path_basename(&path)),
+                        kind: synthetic,
+                        path: path.clone(),
+                        flags: NodeFlags::ENTRYPOINT,
+                        edges_from_idx: Vec::new(),
+                        edges_to_idx: target_idxs,
+                    });
+                }
+            }
+
+            Ok(())
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Baked framework configs. Values mirror the deleted Python contrib modules
+// (`dead_cst.contrib.{flask,fastapi,typer,cyclopts,slack_bolt,fastmcp,celery}`)
+// verbatim. `seed_as_entrypoint` defaults to true for factory-aware web/task
+// frameworks; the pure-dispatch CLIs (typer / cyclopts) set it false.
+// ---------------------------------------------------------------------------
+
+const FLASK_CONFIG: DispatchAppConfig = DispatchAppConfig {
+    marker_prefix: "flask",
+    app_classes: &["flask.Flask"],
+    registration_decorators: &[
+        "route",
+        "get",
+        "post",
+        "put",
+        "delete",
+        "patch",
+        "before_request",
+        "after_request",
+        "teardown_request",
+        "teardown_appcontext",
+        "before_first_request",
+        "before_app_request",
+        "after_app_request",
+        "teardown_app_request",
+        "before_app_first_request",
+        "errorhandler",
+        "app_errorhandler",
+        "context_processor",
+        "app_context_processor",
+        "template_filter",
+        "app_template_filter",
+        "template_test",
+        "app_template_test",
+        "template_global",
+        "app_template_global",
+        "url_value_preprocessor",
+        "app_url_value_preprocessor",
+        "url_defaults",
+        "app_url_defaults",
+        "shell_context_processor",
+        "record",
+        "record_once",
+    ],
+    seed_as_entrypoint: true,
+    shared_task: None,
+};
+
+const FASTAPI_CONFIG: DispatchAppConfig = DispatchAppConfig {
+    marker_prefix: "fastapi",
+    app_classes: &["fastapi.FastAPI"],
+    registration_decorators: &[
+        "get",
+        "post",
+        "put",
+        "delete",
+        "patch",
+        "options",
+        "head",
+        "trace",
+        "api_route",
+        "websocket",
+        "websocket_route",
+        "middleware",
+        "exception_handler",
+        "on_event",
+    ],
+    seed_as_entrypoint: true,
+    shared_task: None,
+};
+
+const TYPER_CONFIG: DispatchAppConfig = DispatchAppConfig {
+    marker_prefix: "typer",
+    app_classes: &["typer.Typer"],
+    registration_decorators: &["command", "callback"],
+    seed_as_entrypoint: false,
+    shared_task: None,
+};
+
+const CYCLOPTS_CONFIG: DispatchAppConfig = DispatchAppConfig {
+    marker_prefix: "cyclopts",
+    app_classes: &["cyclopts.App"],
+    registration_decorators: &["command", "default"],
+    seed_as_entrypoint: false,
+    shared_task: None,
+};
+
+const SLACK_BOLT_CONFIG: DispatchAppConfig = DispatchAppConfig {
+    marker_prefix: "slack-bolt",
+    app_classes: &["slack_bolt.App", "slack_bolt.async_app.AsyncApp"],
+    registration_decorators: &[
+        "event", "message", "command", "action", "shortcut", "view", "options", "error", "step",
+        "function",
+    ],
+    seed_as_entrypoint: true,
+    shared_task: None,
+};
+
+const FASTMCP_CONFIG: DispatchAppConfig = DispatchAppConfig {
+    marker_prefix: "fastmcp",
+    app_classes: &["fastmcp.FastMCP", "mcp.server.fastmcp.FastMCP"],
+    registration_decorators: &["tool", "resource", "prompt", "completion"],
+    seed_as_entrypoint: true,
+    shared_task: None,
+};
+
+const CELERY_CONFIG: DispatchAppConfig = DispatchAppConfig {
+    marker_prefix: "celery",
+    app_classes: &["celery.Celery"],
+    registration_decorators: &["task"],
+    seed_as_entrypoint: true,
+    shared_task: Some(SharedTaskFanout {
+        module: "celery",
+        names: &["shared_task"],
+        marker_prefix: "<celery-shared>:",
+    }),
+};

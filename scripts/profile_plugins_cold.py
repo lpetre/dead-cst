@@ -61,16 +61,11 @@ def _plugin_label(plugin: object) -> str:
     """Human-readable label for one builtin plugin instance.
 
     Class name alone is ambiguous for the shared
-    :class:`DispatchAppPlugin` / :class:`DecoratedDeclPlugin` shapes —
-    multiple frameworks reuse the same class with different field
-    values. Suffix with the most identifying field so the report
-    distinguishes ``DispatchAppPlugin(fastapi.FastAPI)`` from
-    ``DispatchAppPlugin(flask.Flask)`` etc.
+    :class:`DecoratedDeclPlugin` shape — multiple frameworks reuse the
+    same class with different field values. Suffix with the most
+    identifying field so the report distinguishes the instances.
     """
     base = type(plugin).__qualname__
-    app_classes = getattr(plugin, "app_classes", None)
-    if app_classes:
-        return f"{base}({app_classes[0]})"
     decorator_module = getattr(plugin, "decorator_module", None)
     if decorator_module:
         return f"{base}({decorator_module})"

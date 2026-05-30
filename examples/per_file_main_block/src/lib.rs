@@ -69,10 +69,12 @@ impl PerFilePlugin for PerFileMainBlock {
         }
 
         // One synthetic entrypoint node per file, wired to those targets.
+        // No in-edges — the node is a reachability seed, not a sink.
         ops.add_synthetic_node(
             format!("{MARKER_PREFIX}{}", file.module_fqname()),
             FLAG_ENTRYPOINT,
             targets,
+            Vec::new(),
         );
     }
 }

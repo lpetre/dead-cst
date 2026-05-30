@@ -86,7 +86,6 @@ def main() -> None:
     # are imported by dead_cst plugins.
     seeds = [
         "dead_cst.plugins._base.Plugin",
-        "dead_cst.plugins.decl_shapes.DispatchAppPlugin",
         "dead_cst.plugins.decl_shapes.DecoratedDeclPlugin",
         "typer.Typer",
         "click.Command",

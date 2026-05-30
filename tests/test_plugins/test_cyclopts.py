@@ -1,12 +1,11 @@
-"""Tests for :func:`cyclopts_plugin`."""
+"""Tests for the native Cyclopts dispatch-app plugin (``NativePlugin.cyclopts()``)."""
 
 from __future__ import annotations
 
 import pytest
 
-from dead_cst.contrib import cyclopts_plugin
+from dead_cst import _native as native
 from dead_cst.plugins import (
-    DispatchAppPlugin,
     ExplicitEntrypointPlugin,
     MainBlockPlugin,
 )
@@ -36,7 +35,7 @@ def test_cyclopts_plugin_marks_command_handlers(build_plugin_graph, reachable_fq
                 app()
             """,
         },
-        [MainBlockPlugin(), cyclopts_plugin()],
+        [MainBlockPlugin(), native.NativePlugin.cyclopts()],
     )
     reached = reachable_fqnames(graph)
     assert "cli.main.app" in reached
@@ -75,7 +74,7 @@ def test_cyclopts_plugin_keeps_handler_dependencies_alive(build_plugin_graph, re
                 app()
             """,
         },
-        [MainBlockPlugin(), cyclopts_plugin()],
+        [MainBlockPlugin(), native.NativePlugin.cyclopts()],
     )
     reached = reachable_fqnames(graph)
     assert "cli.main.show" in reached
@@ -103,7 +102,7 @@ def test_cyclopts_plugin_reachable_via_explicit_entrypoint(
         }
     )
     graph = make_analysis(
-        plugins=[ExplicitEntrypointPlugin(specs=["cli.main.app"]), cyclopts_plugin()]
+        plugins=[ExplicitEntrypointPlugin(specs=["cli.main.app"]), native.NativePlugin.cyclopts()]
     ).materialize_all()
     reached = reachable_fqnames(graph)
     assert "cli.main.app" in reached
@@ -125,7 +124,7 @@ def test_cyclopts_plugin_does_not_seed_entrypoint(build_plugin_graph, reachable_
             def orphan(): pass
             """,
         },
-        [cyclopts_plugin()],
+        [native.NativePlugin.cyclopts()],
     )
     reached = reachable_fqnames(graph)
     assert "cli.main.app" not in reached
@@ -158,7 +157,7 @@ def test_cyclopts_plugin_unused_subapp_stays_dead(build_plugin_graph, reachable_
                 app()
             """,
         },
-        [MainBlockPlugin(), cyclopts_plugin()],
+        [MainBlockPlugin(), native.NativePlugin.cyclopts()],
     )
     reached = reachable_fqnames(graph)
     assert "cli.main.hello" in reached
@@ -195,7 +194,7 @@ def test_cyclopts_plugin_subapp_reachable_via_command_attach(build_plugin_graph,
                 app()
             """,
         },
-        [MainBlockPlugin(), cyclopts_plugin()],
+        [MainBlockPlugin(), native.NativePlugin.cyclopts()],
     )
     reached = reachable_fqnames(graph)
     assert "cli.main.app" in reached
@@ -254,7 +253,7 @@ def test_cyclopts_plugin_subapp_reachable_via_command_attach(build_plugin_graph,
 def test_cyclopts_plugin_handles_import_variants(build_plugin_graph, reachable_fqnames, src):
     graph = build_plugin_graph(
         {"cli/__init__.py": "", "cli/main.py": src},
-        [MainBlockPlugin(), cyclopts_plugin()],
+        [MainBlockPlugin(), native.NativePlugin.cyclopts()],
     )
     assert "cli.main.hello" in reachable_fqnames(graph)
 
@@ -278,7 +277,7 @@ def test_cyclopts_plugin_ignores_bare_decorators(build_plugin_graph, reachable_f
                 app()
             """,
         },
-        [MainBlockPlugin(), cyclopts_plugin()],
+        [MainBlockPlugin(), native.NativePlugin.cyclopts()],
     )
     # Bare ``@command`` (no attribute access) is not a cyclopts registration --
     # matching it would clobber unrelated decorators with the same name.
@@ -300,7 +299,7 @@ def test_cyclopts_plugin_ignores_unrelated_decorators(build_plugin_graph, reacha
             def not_a_command(): pass
             """,
         },
-        [cyclopts_plugin()],
+        [native.NativePlugin.cyclopts()],
     )
     # ``t`` isn't a cyclopts ``App`` instance, so its ``.command`` decorator is ignored.
     assert "pkg.mod.not_a_command" not in reachable_fqnames(graph)
@@ -323,7 +322,7 @@ def test_cyclopts_plugin_does_nothing_without_cyclopts_imports(
             def looks_like_command(): pass
             """,
         },
-        [cyclopts_plugin()],
+        [native.NativePlugin.cyclopts()],
     )
     # ``app`` here is not a cyclopts instance -- no ``cyclopts`` import in scope.
     assert "pkg.mod.looks_like_command" not in reachable_fqnames(graph)
@@ -349,7 +348,7 @@ def test_cyclopts_plugin_multiple_instances_in_one_module(build_plugin_graph, re
                 app()
             """,
         },
-        [MainBlockPlugin(), cyclopts_plugin()],
+        [MainBlockPlugin(), native.NativePlugin.cyclopts()],
     )
     reached = reachable_fqnames(graph)
     # ``app`` is reached via the main block; its command is alive.
@@ -379,16 +378,14 @@ def test_cyclopts_plugin_ignores_import_star(build_plugin_graph, reachable_fqnam
                 app()
             """,
         },
-        [MainBlockPlugin(), cyclopts_plugin()],
+        [MainBlockPlugin(), native.NativePlugin.cyclopts()],
     )
     # No instance edge from ``app`` to ``hello`` because the plugin ignores
     # star imports. ``hello`` is not referenced by anything reachable.
     assert "cli.main.hello" not in reachable_fqnames(graph)
 
 
-def test_cyclopts_plugin_factory_returns_configured_dispatch_app():
-    plugin = cyclopts_plugin()
-    assert isinstance(plugin, DispatchAppPlugin)
-    assert plugin.marker_prefix == "cyclopts"
-    assert plugin.app_classes == ("cyclopts.App",)
-    assert plugin.seed_as_entrypoint is False
+def test_cyclopts_plugin_factory_returns_native_plugin():
+    plugin = native.NativePlugin.cyclopts()
+    assert isinstance(plugin, native.NativePlugin)
+    assert plugin.name == "cyclopts"

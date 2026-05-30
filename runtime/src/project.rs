@@ -1899,8 +1899,13 @@ impl ProjectContext {
                         kind,
                         flags,
                         edges_to_local_idx,
+                        edges_from_local_idx,
                     } => {
                         let edges_to_idx: Vec<usize> = edges_to_local_idx
+                            .iter()
+                            .filter_map(|&local| to_global(local))
+                            .collect();
+                        let edges_from_idx: Vec<usize> = edges_from_local_idx
                             .iter()
                             .filter_map(|&local| to_global(local))
                             .collect();
@@ -1909,7 +1914,7 @@ impl ProjectContext {
                             kind,
                             path: path.clone(),
                             flags: *flags,
-                            edges_from_idx: Vec::new(),
+                            edges_from_idx,
                             edges_to_idx,
                         });
                     }

@@ -211,26 +211,26 @@ Direct accessors (`find_module`, `find_declarations`, `module_for`,
 `find_main_blocks`, …) cover the rest. See `python/dead_cst/_native.pyi`
 for the full surface.
 
-Three declarative bases ship as scaffolding for common shapes
+Two declarative bases ship as scaffolding for common shapes
 (`plugins/decl_shapes.py`):
 
 * `DecoratedDeclPlugin` — decorated decls in files matching a search
   path.
 * `LiteralListPlugin` — `<owner>.<var> = ['fqn', ...]` registries.
-* `DispatchAppPlugin` — `@<instance>.<reg>(...)` handlers wired to an
-  app instance. Pure-dispatch by default (Typer / Cyclopts); opt into
-  factory-aware mode by setting `instance_kinds: Mapping[str, bool]`
-  (Flask / FastAPI / Celery) — the plugin then emits
-  `<{name}-app>` / `<{name}-pending>` / `<{name}-factory>` synthetics
-  and classifies factory chains across files.
 
-Builtins ship in `cli._BUILTIN_PLUGINS`. Generic-Python plugins live
+The `@<instance>.<reg>(...)` dispatch-app shape (Flask / FastAPI /
+Typer / Cyclopts / Slack Bolt / FastMCP / Celery) is a native
+(Rust) plugin — `NativePlugin.flask()` … `NativePlugin.celery()` —
+not a Python base.
+
+Builtins ship in `cli._BUILTIN_PLUGINS` (Python) and
+`native._builtin_native_plugin` (Rust). Generic-Python plugins live
 in `dead_cst/plugins/` (`MainBlockPlugin`, `ProjectScriptsPlugin`,
 `ExplicitEntrypointPlugin`, `ModuleDundersPlugin`,
 `InitSubclassPlugin`, `DynamicImportFallbackPlugin`); framework-aware
-plugins live in `dead_cst/contrib/` (FastAPI, Flask, Typer, Click,
-Cyclopts, pytest, unittest, Celery, FastMCP, DiscordPy, MockPatch,
-ServerConfig).
+Python plugins live in `dead_cst/contrib/` (Click, pytest, unittest,
+DiscordPy, MockPatch). The dispatch-app frameworks and `server_config`
+are native (see `native._builtin_native_plugin`).
 
 ### 5. Reachability — `Analysis.reachable` and friends
 
