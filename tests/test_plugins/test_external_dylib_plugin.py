@@ -8,6 +8,8 @@ with::
     PLUGIN_DYLIB="$(dead-cst build-plugin)" \\
     PLUGIN_DYLIB_PER_FILE="$(dead-cst build-plugin \\
         examples/per_file_main_block/src/lib.rs)" \\
+    PLUGIN_DYLIB_PER_FILE_DECORATED="$(dead-cst build-plugin \\
+        examples/per_file_decorated/src/lib.rs)" \\
     pytest tests/test_plugins/test_external_dylib_plugin.py
 
 ``dead-cst build-plugin`` compiles the plugin (the bundled project-wide example
@@ -28,6 +30,7 @@ import pytest
 _PLUGIN_HOST = bool(os.environ.get("DEAD_CST_PLUGIN_HOST"))
 _PLUGIN_DYLIB = os.environ.get("PLUGIN_DYLIB", "")
 _PLUGIN_DYLIB_PER_FILE = os.environ.get("PLUGIN_DYLIB_PER_FILE", "")
+_PLUGIN_DYLIB_PER_FILE_DECORATED = os.environ.get("PLUGIN_DYLIB_PER_FILE_DECORATED", "")
 
 
 @pytest.mark.skipif(
@@ -88,6 +91,50 @@ def test_external_per_file_plugin_keeps_main_alive(build_plugin_graph, reachable
     assert "pkg.script.main" in reached
     assert "pkg.script.unused" not in reached
     assert "pkg.lib.helper" not in reached
+
+
+@pytest.mark.skipif(
+    not (_PLUGIN_HOST and _PLUGIN_DYLIB_PER_FILE_DECORATED),
+    reason="decorated per-file plugin requires PLUGIN_DYLIB_PER_FILE_DECORATED built via `dead-cst build-plugin`",
+)
+def test_external_per_file_decorated_plugin_keeps_decorated_alive(
+    build_plugin_graph, reachable_fqnames
+):
+    """The decorated per-file external plugin uses the ready-made file-local
+    query API (`imports_any_module` + `decorated_decls`) and `keep_alive`:
+    a `@click.command`-decorated function stays reachable, an undecorated
+    helper stays dead, and a file that never imports `click` is untouched."""
+    from dead_cst import _native as native
+
+    plugins = native.load_native_plugins(_PLUGIN_DYLIB_PER_FILE_DECORATED)
+    assert [p.name for p in plugins] == ["ExternalPerFileDecoratedPlugin"]
+
+    files = {
+        "pkg/__init__.py": "",
+        "pkg/app.py": """
+        import click
+
+        @click.command()
+        def cli(): pass
+
+        def helper(): pass
+        """,
+        # Aliased direct import resolves through the same matcher.
+        "pkg/aliased.py": """
+        from click import group as grp
+
+        @grp()
+        def root(): pass
+        """,
+        # No `click` import -> the presence guard skips this file entirely.
+        "pkg/lib.py": "def untouched(): pass\n",
+    }
+    ctx = build_plugin_graph(files, plugins)
+    reached = reachable_fqnames(ctx)
+    assert "pkg.app.cli" in reached
+    assert "pkg.app.helper" not in reached
+    assert "pkg.aliased.root" in reached
+    assert "pkg.lib.untouched" not in reached
 
 
 def test_load_rejects_dylib_without_manifest():

@@ -73,6 +73,27 @@ two versions.
   emits file-local ops through `FileOps::add_synthetic_node`. The
   per-file output must be a pure function of the file (the documented
   cache-soundness contract). See `examples/per_file_main_block/`.
+- **Ready-made per-file query API + richer file ops + a pre-graph
+  hook for native plugins.** A per-file plugin no longer has to
+  hand-roll import / decorator / call matching from the raw AST. The
+  restricted `PluginFileCtx` (and the in-tree `FileContext` it wraps)
+  now exposes file-local queries that reuse the *same* matcher the
+  project-wide `query(ctx)` DSL is built on, so a per-file plugin and
+  a project-wide twin agree on what matches:
+  - `imports_any_module(&["click"])` — a cheap presence guard.
+  - `decorated_decls(&["click"], &["command", "group"])` — file-local
+    indices of decls decorated by the named imports (resolving direct
+    imports + aliases).
+  - `constructions(&["flask"], &["Flask"])` / `calls(&["typer"],
+    &["Typer"])` — file-local owners of matched constructor calls /
+    call targets.
+  `FileOps` gained `keep_alive(local_idx, marker)` and
+  `add_edge(src_local, dst_local)` alongside `add_synthetic_node`, so
+  the common "keep these decls alive" shape is one call. And
+  `ExternalPlugin::prepare(project_root)` is now a real pre-graph hook
+  — `NativePlugin.prepare(...)` forwards to it (and to in-tree
+  project-wide impls), so a plugin can read config under the project
+  root before the graph is built. See `examples/per_file_decorated/`.
 - `Analysis.re_materialize(events)` — incrementally rebuild the
   project graph against the existing `native.ProjectContext`. The
   caller supplies the change events: typically

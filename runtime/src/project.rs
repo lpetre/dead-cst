@@ -1875,7 +1875,7 @@ impl ProjectContext {
     /// translate its file-local ops to global [`PreparedOp`]s.
     ///
     /// For each file, the salsa-cached [`per_file_plugin_ops`] query
-    /// returns the plugin's [`FileLocalOpData`] (cheap on cache hit —
+    /// returns the plugin's [`FileLocalOp`] (cheap on cache hit —
     /// unchanged files skip the plugin re-run entirely). Each op's
     /// ``edges_to_local_idx`` are positions in that file's
     /// ``FileNodes.refs``; we map them to global indices via the
@@ -1893,20 +1893,58 @@ impl ProjectContext {
                 continue;
             }
             let path = file_path_string(&self.db, file);
+            let to_global = |local: u32| outputs.local_to_global.get(&(file, local)).copied();
             for op in file_ops {
-                let edges_to_idx: Vec<usize> = op
-                    .edges_to_local_idx
-                    .iter()
-                    .filter_map(|&local| outputs.local_to_global.get(&(file, local)).copied())
-                    .collect();
-                sink.push(PreparedOp::NodeByIdx {
-                    fqname: op.fqname.clone(),
-                    kind: op.kind,
-                    path: path.clone(),
-                    flags: op.flags,
-                    edges_from_idx: Vec::new(),
-                    edges_to_idx,
-                });
+                use crate::native_plugins::FileLocalOp;
+                match op {
+                    FileLocalOp::Node {
+                        fqname,
+                        kind,
+                        flags,
+                        edges_to_local_idx,
+                    } => {
+                        let edges_to_idx: Vec<usize> = edges_to_local_idx
+                            .iter()
+                            .filter_map(|&local| to_global(local))
+                            .collect();
+                        sink.push(PreparedOp::NodeByIdx {
+                            fqname: fqname.clone(),
+                            kind,
+                            path: path.clone(),
+                            flags: *flags,
+                            edges_from_idx: Vec::new(),
+                            edges_to_idx,
+                        });
+                    }
+                    FileLocalOp::Edge {
+                        src_local_idx,
+                        dst_local_idx,
+                        flags,
+                    } => {
+                        let (Some(src_idx), Some(dst_idx)) =
+                            (to_global(*src_local_idx), to_global(*dst_local_idx))
+                        else {
+                            continue;
+                        };
+                        sink.push(PreparedOp::EdgeByIdx {
+                            src_idx,
+                            dst_idx,
+                            flags: *flags,
+                        });
+                    }
+                    FileLocalOp::Entrypoint {
+                        decl_local_idx,
+                        marker,
+                    } => {
+                        let Some(decl_idx) = to_global(*decl_local_idx) else {
+                            continue;
+                        };
+                        sink.push(PreparedOp::EntrypointByIdx {
+                            decl_idx,
+                            marker: marker.clone(),
+                        });
+                    }
+                }
             }
         }
         Ok(())

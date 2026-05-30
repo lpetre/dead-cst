@@ -1,5 +1,10 @@
 [workspace]
-members = ["runtime", "examples/main_block_plugin", "examples/per_file_main_block"]
+members = [
+    "runtime",
+    "examples/main_block_plugin",
+    "examples/per_file_main_block",
+    "examples/per_file_decorated",
+]
 # Bare `cargo build` / maturin builds only the extension; the example plugin
 # is built explicitly by `dead-cst build-plugin`.
 default-members = ["."]
