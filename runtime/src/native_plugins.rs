@@ -43,6 +43,7 @@
 //! :class:`ThreadPoolExecutor` fan-out.
 
 use std::ffi::c_void;
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -53,7 +54,7 @@ use ruff_db::source::line_index;
 use ruff_python_ast::visitor::Visitor;
 use ruff_python_ast::{Expr, Stmt};
 use ruff_text_size::{Ranged, TextRange};
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 use ty_project::Db as ProjectDb;
 
 use crate::builder::PreparedOp;
@@ -422,17 +423,16 @@ pub(crate) trait PerFileNativePluginImpl: Send + Sync {
     fn run_on_file(&self, file_ctx: &FileContext<'_>, sink: &mut Vec<FileLocalOp>);
 }
 
-/// Salsa cache-key discriminant for a per-file plugin. A cheap
+/// Salsa cache-key discriminant for a *configless* per-file plugin. A cheap
 /// ``Copy`` enum rather than a ``&'static str`` because salsa tracked
 /// function arguments must be owned + ``'static`` (a borrowed key
 /// would force ``'db: 'static``). One variant per configless per-file
-/// impl; configured per-file plugins would carry a config-hash here
-/// (out of scope).
+/// impl; per-file plugins that carry config use
+/// [`PerFilePluginId::Configured`] + [`ConfiguredPerFile`] instead.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum PerFilePluginKind {
     MainBlock,
     ModuleDunders,
-    ServerConfig,
 }
 
 impl PerFilePluginKind {
@@ -441,7 +441,6 @@ impl PerFilePluginKind {
         match self {
             PerFilePluginKind::MainBlock => "MainBlockPlugin",
             PerFilePluginKind::ModuleDunders => "ModuleDundersPlugin",
-            PerFilePluginKind::ServerConfig => "ServerConfigPlugin",
         }
     }
 
@@ -450,20 +449,45 @@ impl PerFilePluginKind {
         match self {
             PerFilePluginKind::MainBlock => MainBlockPluginImpl.run_on_file(file_ctx, sink),
             PerFilePluginKind::ModuleDunders => ModuleDundersPluginImpl.run_on_file(file_ctx, sink),
-            PerFilePluginKind::ServerConfig => ServerConfigPluginImpl.run_on_file(file_ctx, sink),
         }
     }
 }
 
 /// Salsa cache-key identifying *which* per-file plugin a
 /// [`per_file_plugin_ops`] invocation is for. `Copy + 'static` so it can be
-/// a salsa tracked-function argument. Builtin impls name themselves by
-/// [`PerFilePluginKind`]; external dylib plugins by a process-stable id
-/// assigned at load (see [`register_external_per_file`]).
+/// a salsa tracked-function argument. Configless builtin impls name themselves
+/// by [`PerFilePluginKind`]; *configured* builtins and external dylib plugins
+/// by a process-stable id assigned on registration (hash-interned for
+/// configured plugins, see [`register_configured_per_file`] /
+/// [`register_external_per_file`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum PerFilePluginId {
     Builtin(PerFilePluginKind),
+    /// Configured built-in per-file plugin — carries config (e.g.
+    /// `ServerConfig`'s filename set) behind a process-stable id into
+    /// [`CONFIGURED_PER_FILE_PLUGINS`]. The id is hash-interned on the config,
+    /// so identical configs share an id and thus a salsa cache entry.
+    Configured(u32),
     External(u32),
+}
+
+impl PerFilePluginId {
+    /// Human-readable plugin name for harness logs / `progress_callback`.
+    fn name(self) -> String {
+        match self {
+            PerFilePluginId::Builtin(kind) => kind.name().to_string(),
+            PerFilePluginId::Configured(id) => configured_per_file_plugin(id)
+                .map(|cfg| cfg.name().to_string())
+                .unwrap_or_default(),
+            // External per-file plugins flow through
+            // `NativePluginKind::External`, never `PerFile`, so this arm is
+            // unreachable under the name getter.
+            PerFilePluginId::External(_) => {
+                debug_assert!(false, "External per-file id has no PerFile name");
+                String::new()
+            }
+        }
+    }
 }
 
 /// Process-global registry of per-file external plugins, indexed by the id
@@ -501,6 +525,99 @@ fn external_per_file_plugin(id: u32) -> Option<Arc<dyn plugin_api::ExternalPlugi
         .map(Arc::clone)
 }
 
+/// A *configured* built-in per-file plugin: carries its config inline and
+/// dispatches to the matching impl. Unlike [`PerFilePluginKind`] (a configless
+/// `Copy` discriminant), these hold owned config, so they live behind an id in
+/// [`CONFIGURED_PER_FILE_PLUGINS`] and are reached from inside the salsa query.
+#[derive(Debug)]
+pub(crate) enum ConfiguredPerFile {
+    /// `ServerConfigPlugin` with a caller-supplied filename set.
+    ServerConfig { filenames: Vec<String> },
+}
+
+impl ConfiguredPerFile {
+    /// Human-readable name, matching the equivalent Python plugin.
+    fn name(&self) -> &'static str {
+        match self {
+            ConfiguredPerFile::ServerConfig { .. } => "ServerConfigPlugin",
+        }
+    }
+
+    /// Stable hash of the config, used to intern identical configs to one id.
+    /// Canonicalizes collection fields (sort + dedup) so logically-equal
+    /// configs hash equal and share a salsa cache entry; the leading
+    /// discriminant byte keeps variants from colliding. A hash collision only
+    /// costs a needless recompute, never correctness.
+    fn config_hash(&self) -> u64 {
+        let mut hasher = FxHasher::default();
+        match self {
+            ConfiguredPerFile::ServerConfig { filenames } => {
+                0u8.hash(&mut hasher);
+                let mut canon: Vec<&str> = filenames.iter().map(String::as_str).collect();
+                canon.sort_unstable();
+                canon.dedup();
+                canon.hash(&mut hasher);
+            }
+        }
+        hasher.finish()
+    }
+
+    /// Run the configured impl against ``file_ctx``.
+    fn run_on_file(&self, file_ctx: &FileContext<'_>, sink: &mut Vec<FileLocalOp>) {
+        match self {
+            ConfiguredPerFile::ServerConfig { filenames } => {
+                server_config_run_on_file(filenames, file_ctx, sink)
+            }
+        }
+    }
+}
+
+/// Process-global registry of *configured* built-in per-file plugins, indexed
+/// by the id baked into [`PerFilePluginId::Configured`]. Mirrors
+/// [`EXTERNAL_PER_FILE_PLUGINS`] — append-only and immutable for a given id, so
+/// the untracked read from inside [`per_file_plugin_ops`] is sound (a memoized
+/// result stays valid exactly as long as the file's tracked inputs are
+/// unchanged). It additionally *hash-interns* by
+/// [`ConfiguredPerFile::config_hash`]: registering an equal config returns the
+/// existing id, so a config reconstructed across a `re_materialize` reuses the
+/// same salsa cache entry rather than minting a fresh, cold key.
+static CONFIGURED_PER_FILE_PLUGINS: std::sync::OnceLock<std::sync::RwLock<ConfiguredRegistry>> =
+    std::sync::OnceLock::new();
+
+#[derive(Default)]
+struct ConfiguredRegistry {
+    plugins: Vec<Arc<ConfiguredPerFile>>,
+    by_hash: FxHashMap<u64, u32>,
+}
+
+/// Register (intern) a configured per-file plugin and return its
+/// process-stable id. Identical config (same [`ConfiguredPerFile::config_hash`])
+/// returns the id assigned on first registration.
+fn register_configured_per_file(cfg: ConfiguredPerFile) -> u32 {
+    let reg = CONFIGURED_PER_FILE_PLUGINS
+        .get_or_init(|| std::sync::RwLock::new(ConfiguredRegistry::default()));
+    let hash = cfg.config_hash();
+    let mut guard = reg.write().expect("configured per-file registry poisoned");
+    if let Some(&id) = guard.by_hash.get(&hash) {
+        return id;
+    }
+    let id = guard.plugins.len() as u32;
+    guard.plugins.push(Arc::new(cfg));
+    guard.by_hash.insert(hash, id);
+    id
+}
+
+/// Look up a configured per-file plugin by id.
+fn configured_per_file_plugin(id: u32) -> Option<Arc<ConfiguredPerFile>> {
+    CONFIGURED_PER_FILE_PLUGINS
+        .get()?
+        .read()
+        .expect("configured per-file registry poisoned")
+        .plugins
+        .get(id as usize)
+        .map(Arc::clone)
+}
+
 /// Salsa-tracked per-file plugin invocation. Keyed on ``(file, id)``;
 /// re-runs only when the file's tracked inputs (``file_to_nodes`` /
 /// ``parsed_module`` / ``line_index``) change. Returns the file-local ops
@@ -515,6 +632,13 @@ pub(crate) fn per_file_plugin_ops(
     let mut sink = Vec::new();
     match id {
         PerFilePluginId::Builtin(kind) => kind.run_on_file(&file_ctx, &mut sink),
+        PerFilePluginId::Configured(plugin_id) => {
+            // Resolve the configured plugin from the registry; a stale id
+            // (shouldn't happen) yields no ops.
+            if let Some(cfg) = configured_per_file_plugin(plugin_id) {
+                cfg.run_on_file(&file_ctx, &mut sink);
+            }
+        }
         PerFilePluginId::External(plugin_id) => {
             // Resolve the plugin and its per-file capability from the
             // registry; a stale id (shouldn't happen) yields no ops.
@@ -542,7 +666,7 @@ pub(crate) enum NativePluginKind {
     /// this variant today.
     #[allow(dead_code)]
     ProjectWide(Box<dyn NativePluginImpl>),
-    PerFile(PerFilePluginKind),
+    PerFile(PerFilePluginId),
     /// External native plugin loaded from a dylib through the ABI airlock
     /// (see [`load_native_plugins`]). Holds the trait object and a refcount
     /// on the loaded library so its code stays mapped for the plugin's
@@ -583,7 +707,7 @@ impl NativePlugin {
     fn name(&self) -> String {
         match &self.kind {
             NativePluginKind::ProjectWide(inner) => inner.name().to_string(),
-            NativePluginKind::PerFile(kind) => kind.name().to_string(),
+            NativePluginKind::PerFile(id) => id.name(),
             NativePluginKind::External { name, .. } => name.clone(),
         }
     }
@@ -612,7 +736,7 @@ impl NativePlugin {
     #[staticmethod]
     fn main_block() -> Self {
         Self {
-            kind: NativePluginKind::PerFile(PerFilePluginKind::MainBlock),
+            kind: NativePluginKind::PerFile(PerFilePluginId::Builtin(PerFilePluginKind::MainBlock)),
         }
     }
 
@@ -622,7 +746,9 @@ impl NativePlugin {
     #[staticmethod]
     fn module_dunders() -> Self {
         Self {
-            kind: NativePluginKind::PerFile(PerFilePluginKind::ModuleDunders),
+            kind: NativePluginKind::PerFile(PerFilePluginId::Builtin(
+                PerFilePluginKind::ModuleDunders,
+            )),
         }
     }
 
@@ -637,14 +763,23 @@ impl NativePlugin {
 
     /// Native `ServerConfigPlugin` — mark conventional WSGI/ASGI server
     /// config modules (`gunicorn.conf.py`, `hypercorn.conf.py`, …) as
-    /// entrypoints. Per-file (salsa-cached): a file matches purely on its
-    /// own basename and keeps its own top-level surface alive. Bakes the
-    /// default filename set; the configurable Python plugin remains for
-    /// custom filenames.
+    /// entrypoints. Per-file (salsa-cached): a file matches purely on its own
+    /// basename and keeps its own top-level surface alive. `filenames` defaults
+    /// to the conventional Gunicorn/Hypercorn set; pass a custom list to match
+    /// other server-config basenames. Identical filename sets intern to one
+    /// salsa cache key (see [`register_configured_per_file`]).
     #[staticmethod]
-    fn server_config() -> Self {
+    #[pyo3(signature = (filenames = None))]
+    fn server_config(filenames: Option<Vec<String>>) -> Self {
+        let filenames = filenames.unwrap_or_else(|| {
+            SERVER_CONFIG_FILENAMES
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect()
+        });
+        let id = register_configured_per_file(ConfiguredPerFile::ServerConfig { filenames });
         Self {
-            kind: NativePluginKind::PerFile(PerFilePluginKind::ServerConfig),
+            kind: NativePluginKind::PerFile(PerFilePluginId::Configured(id)),
         }
     }
 
@@ -668,7 +803,7 @@ pub(crate) fn _builtin_native_plugin(name: &str) -> Option<NativePlugin> {
         "main_block" => NativePlugin::main_block(),
         "module_dunders" => NativePlugin::module_dunders(),
         "init_subclass" => NativePlugin::init_subclass(),
-        "server_config" => NativePlugin::server_config(),
+        "server_config" => NativePlugin::server_config(None),
         "unittest" => NativePlugin::unittest(),
         _ => return None,
     })
@@ -1356,9 +1491,9 @@ const INIT_SUBCLASS_PREFIX: &str = "<__init_subclass__>:";
 const SERVER_CONFIG_PREFIX: &str = "<server-config>:";
 const UNITTEST_PREFIX: &str = "<unittest>:";
 
-/// Conventional filenames Gunicorn / Hypercorn load at startup. Baked
-/// default for the native [`ServerConfigPluginImpl`]; the configurable
-/// Python `ServerConfigPlugin` covers custom filenames.
+/// Conventional filenames Gunicorn / Hypercorn load at startup. The default
+/// the [`NativePlugin::server_config`] factory supplies when no `filenames`
+/// are given; callers pass a custom set for other server-config basenames.
 const SERVER_CONFIG_FILENAMES: [&str; 4] = [
     "gunicorn.conf.py",
     "gunicorn_conf.py",
@@ -1438,48 +1573,73 @@ impl NativePluginImpl for InitSubclassPluginImpl {
     }
 }
 
-/// Per-file port of `dead_cst.contrib.server_config.ServerConfigPlugin`
-/// (default-filename form): when a file's basename is one of the
-/// conventional server-config names, mint a `<server-config>:` entrypoint
-/// keeping that file's whole top-level surface alive. File-local — the
-/// match and the targets are both functions of the single file.
-pub(crate) struct ServerConfigPluginImpl;
+/// Test-only counter: number of times [`server_config_run_on_file`] actually
+/// executed (i.e. salsa cache *misses* for the configured per-file query). A
+/// salsa hit reuses the cached ops without touching the body, so this counter
+/// stays flat for unchanged files across a ``re_materialize``. Surfaced to
+/// tests via :func:`_server_config_run_count` /
+/// :func:`_reset_server_config_run_count`.
+static SERVER_CONFIG_RUN_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-impl PerFileNativePluginImpl for ServerConfigPluginImpl {
-    fn run_on_file(&self, file_ctx: &FileContext<'_>, sink: &mut Vec<FileLocalOp>) {
-        let nodes = file_ctx.nodes();
-        let path = nodes[0].path.as_str();
-        let basename = path
-            .rsplit_once(std::path::MAIN_SEPARATOR)
-            .map(|(_, name)| name)
-            .unwrap_or(path);
-        if !SERVER_CONFIG_FILENAMES.contains(&basename) {
-            return;
-        }
-        // `_TARGET_KINDS` from the Python plugin: every top-level surface
-        // node (the module node included), excluding `type_alias`.
-        let targets: Vec<u32> = nodes
-            .iter()
-            .enumerate()
-            .filter(|(_, node)| {
-                matches!(
-                    node.kind.as_static_str(),
-                    "module" | "function" | "class" | "variable" | "import"
-                )
-            })
-            .map(|(local_idx, _)| local_idx as u32)
-            .collect();
-        if targets.is_empty() {
-            return;
-        }
-        let synthetic = intern_kind("synthetic").expect("'synthetic' is a valid kind");
-        sink.push(FileLocalOp::Node {
-            fqname: format!("{SERVER_CONFIG_PREFIX}{}", file_ctx.module_fqname()),
-            kind: synthetic,
-            flags: NodeFlags::ENTRYPOINT,
-            edges_to_local_idx: targets,
-        });
+/// Test helper — total `server_config_run_on_file` executions since the last
+/// reset. Lets the cache-behaviour test assert that an unchanged server-config
+/// file isn't re-run on ``re_materialize`` and that distinct filename configs
+/// key separately.
+#[pyfunction]
+pub(crate) fn _server_config_run_count() -> usize {
+    SERVER_CONFIG_RUN_COUNT.load(Ordering::Relaxed)
+}
+
+/// Test helper — zero the [`SERVER_CONFIG_RUN_COUNT`] counter.
+#[pyfunction]
+pub(crate) fn _reset_server_config_run_count() {
+    SERVER_CONFIG_RUN_COUNT.store(0, Ordering::Relaxed);
+}
+
+/// Per-file body for `ServerConfigPlugin` (see
+/// [`ConfiguredPerFile::ServerConfig`], ported from
+/// `dead_cst.contrib.server_config.ServerConfigPlugin`): when a file's basename
+/// is one of `filenames`, mint a `<server-config>:` entrypoint keeping that
+/// file's whole top-level surface alive. File-local — the match and the targets
+/// are both functions of the single file.
+fn server_config_run_on_file(
+    filenames: &[String],
+    file_ctx: &FileContext<'_>,
+    sink: &mut Vec<FileLocalOp>,
+) {
+    SERVER_CONFIG_RUN_COUNT.fetch_add(1, Ordering::Relaxed);
+    let nodes = file_ctx.nodes();
+    let path = nodes[0].path.as_str();
+    let basename = path
+        .rsplit_once(std::path::MAIN_SEPARATOR)
+        .map(|(_, name)| name)
+        .unwrap_or(path);
+    if !filenames.iter().any(|f| f == basename) {
+        return;
     }
+    // `_TARGET_KINDS` from the Python plugin: every top-level surface
+    // node (the module node included), excluding `type_alias`.
+    let targets: Vec<u32> = nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| {
+            matches!(
+                node.kind.as_static_str(),
+                "module" | "function" | "class" | "variable" | "import"
+            )
+        })
+        .map(|(local_idx, _)| local_idx as u32)
+        .collect();
+    if targets.is_empty() {
+        return;
+    }
+    let synthetic = intern_kind("synthetic").expect("'synthetic' is a valid kind");
+    sink.push(FileLocalOp::Node {
+        fqname: format!("{SERVER_CONFIG_PREFIX}{}", file_ctx.module_fqname()),
+        kind: synthetic,
+        flags: NodeFlags::ENTRYPOINT,
+        edges_to_local_idx: targets,
+    });
 }
 
 /// Project-wide port of `dead_cst.contrib.unittest.UnittestPlugin`: keep

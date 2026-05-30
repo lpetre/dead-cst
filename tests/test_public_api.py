@@ -61,7 +61,6 @@ EXPECTED_PUBLIC_API: dict[str, list[str]] = {
         "DiscordPyPlugin",
         "MockPatchPlugin",
         "PytestPlugin",
-        "ServerConfigPlugin",
         "UnittestPlugin",
         "cyclopts_plugin",
         "fastapi_plugin",

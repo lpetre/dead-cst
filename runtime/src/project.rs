@@ -1756,11 +1756,8 @@ fn collect_prepared_plugin_ops(
             // Per-file impl: invoke the salsa-cached per-file query for
             // every project file, translating each file-local op to a
             // global ``PreparedOp::NodeByIdx`` via ``local_to_global``.
-            crate::native_plugins::NativePluginKind::PerFile(kind) => {
-                return ctx_ref.collect_per_file_plugin_ops(
-                    crate::native_plugins::PerFilePluginId::Builtin(*kind),
-                    sink,
-                );
+            crate::native_plugins::NativePluginKind::PerFile(id) => {
+                return ctx_ref.collect_per_file_plugin_ops(*id, sink);
             }
             // External dylib plugin opted into per-file dispatch: route it
             // through the same salsa-cached per-file query as the builtins,

@@ -17,7 +17,6 @@ from .fastmcp import fastmcp_plugin
 from .flask import flask_plugin
 from .mock_patch import MockPatchPlugin
 from .pytest import PytestPlugin
-from .server_config import ServerConfigPlugin
 from .slack_bolt import slack_bolt_plugin
 from .typer import typer_plugin
 from .unittest import UnittestPlugin
@@ -28,7 +27,6 @@ __all__ = [
     "DiscordPyPlugin",
     "MockPatchPlugin",
     "PytestPlugin",
-    "ServerConfigPlugin",
     "UnittestPlugin",
     "cyclopts_plugin",
     "fastapi_plugin",

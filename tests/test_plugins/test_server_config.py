@@ -1,10 +1,24 @@
-"""Tests for :class:`ServerConfigPlugin`."""
+"""Tests for the native ``ServerConfigPlugin`` (``NativePlugin.server_config()``).
+
+It is a *configured* per-file plugin: the matched filename set is carried as
+config and the per-file pass is salsa-cached, keyed on the config (identical
+filename sets share a cache entry). The behavioural tests assert the reachable
+surface; the cache tests use the rust-side run-counter
+(``_server_config_run_count`` / reset) to assert the salsa cache fires.
+"""
 
 from __future__ import annotations
 
+import textwrap
+
+from dead_cst import Analysis
 from dead_cst import _native as native
 from dead_cst.graph import NodeFlags
-from dead_cst.contrib import ServerConfigPlugin
+
+
+def _write(path, src: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(textwrap.dedent(src).strip() + "\n")
 
 
 def test_gunicorn_conf_module_stays_alive(build_plugin_graph, reachable_fqnames):
@@ -22,7 +36,7 @@ def test_gunicorn_conf_module_stays_alive(build_plugin_graph, reachable_fqnames)
                 pass
             """,
         },
-        [ServerConfigPlugin()],
+        [native.NativePlugin.server_config()],
     )
     reached = reachable_fqnames(graph)
     assert "gunicorn.conf" in reached
@@ -43,7 +57,7 @@ def test_hypercorn_conf_module_stays_alive(build_plugin_graph, reachable_fqnames
                 pass
             """,
         },
-        [ServerConfigPlugin()],
+        [native.NativePlugin.server_config()],
     )
     reached = reachable_fqnames(graph)
     assert "hypercorn.conf" in reached
@@ -58,7 +72,7 @@ def test_underscore_naming_variants_match(build_plugin_graph, reachable_fqnames)
             "gunicorn_conf.py": "workers = 4",
             "hypercorn_conf.py": "bind = ['0.0.0.0:8000']",
         },
-        [ServerConfigPlugin()],
+        [native.NativePlugin.server_config()],
     )
     reached = reachable_fqnames(graph)
     assert "gunicorn_conf.workers" in reached
@@ -82,7 +96,7 @@ def test_imports_used_only_in_config_stay_alive(build_plugin_graph, reachable_fq
             workers = read_env("WORKERS", 4)
             """,
         },
-        [ServerConfigPlugin()],
+        [native.NativePlugin.server_config()],
     )
     reached = reachable_fqnames(graph)
     assert "pkg.helpers.read_env" in reached
@@ -98,7 +112,7 @@ def test_unrelated_modules_are_not_affected(build_plugin_graph, reachable_fqname
             def helper(): pass
             """,
         },
-        [ServerConfigPlugin()],
+        [native.NativePlugin.server_config()],
     )
     assert "pkg.gunicorn.helper" not in reachable_fqnames(graph)
 
@@ -115,13 +129,13 @@ def test_filenames_override(make_analysis, write_files, reachable_fqnames):
         }
     )
     reached_default = reachable_fqnames(
-        make_analysis(plugins=[ServerConfigPlugin()]).materialize_all()
+        make_analysis(plugins=[native.NativePlugin.server_config()]).materialize_all()
     )
     assert "deploy.prod_gunicorn.workers" not in reached_default
 
     reached_override = reachable_fqnames(
         make_analysis(
-            plugins=[ServerConfigPlugin(filenames=("prod_gunicorn.py",))]
+            plugins=[native.NativePlugin.server_config(filenames=["prod_gunicorn.py"])]
         ).materialize_all()
     )
     assert "deploy.prod_gunicorn.workers" in reached_override
@@ -140,43 +154,19 @@ def test_classes_in_config_stay_alive(build_plugin_graph, reachable_fqnames):
             logger_class = CustomLogger
             """,
         },
-        [ServerConfigPlugin()],
+        [native.NativePlugin.server_config()],
     )
     reached = reachable_fqnames(graph)
     assert "gunicorn.conf.CustomLogger" in reached
     assert "gunicorn.conf.logger_class" in reached
 
 
-def test_server_config_plugin_loads_via_cli_loader():
+def test_server_config_loads_via_cli_loader():
     from dead_cst.cli import _load_plugin
 
     plugin = _load_plugin("server_config")
     assert isinstance(plugin, native.NativePlugin)
     assert plugin.name == "ServerConfigPlugin"
-
-
-def test_native_server_config_matches_python_plugin(build_plugin_graph, reachable_fqnames):
-    """``NativePlugin.server_config()`` produces the same reachable set
-    as the default-filename ``ServerConfigPlugin()``."""
-    files = {
-        "pkg/__init__.py": "",
-        "gunicorn.conf.py": """
-        import os
-
-        bind = "0.0.0.0:8000"
-        workers = 4
-
-        class CustomLogger: pass
-
-        def on_starting(server):
-            pass
-        """,
-        "hypercorn_conf.py": "loglevel = 'info'",
-        "regular.py": "def untouched(): pass",
-    }
-    py_ctx = build_plugin_graph(files, [ServerConfigPlugin()])
-    rs_ctx = build_plugin_graph(files, [native.NativePlugin.server_config()])
-    assert reachable_fqnames(py_ctx) == reachable_fqnames(rs_ctx)
 
 
 def test_seeds_are_not_tagged_testcase(build_plugin_graph):
@@ -188,10 +178,121 @@ def test_seeds_are_not_tagged_testcase(build_plugin_graph):
             "pkg/__init__.py": "",
             "gunicorn.conf.py": "workers = 4",
         },
-        [ServerConfigPlugin()],
+        [native.NativePlugin.server_config()],
     )
     seeds = [n for n in graph.nodes() if n.flags & NodeFlags.ENTRYPOINT]
     server_seeds = [s for s in seeds if s.fqname.startswith("<server-config>:")]
     assert server_seeds
     for seed in server_seeds:
         assert not (seed.flags & NodeFlags.TESTCASE), seed.fqname
+
+
+# ---------------------------------------------------------------------------
+# Per-file salsa caching + config interning. server_config is a *configured*
+# per-file plugin: the per-file pass is keyed on (file, Configured(id)), where
+# id is hash-interned on the filename set. Unchanged files reuse cached ops
+# across re_materialize, and identical configs collapse to one cache key.
+# ---------------------------------------------------------------------------
+
+
+def test_per_file_server_config_caches_unchanged_files(tmp_path):
+    """Editing one file should re-run the per-file server_config plugin for
+    *only* that file on ``re_materialize`` — every other file's result is
+    served from the salsa cache (even though only the matched config file
+    emits ops, the impl is invoked once per file)."""
+    _write(tmp_path / "pkg/__init__.py", "")
+    _write(tmp_path / "gunicorn.conf.py", "workers = 4\n")
+    _write(tmp_path / "pkg/a.py", "def f(): pass\n")
+    _write(tmp_path / "pkg/b.py", "def g(): pass\n")
+
+    analysis = Analysis(tmp_path, plugins=[native.NativePlugin.server_config()])
+    native._reset_server_config_run_count()
+    analysis.materialize_all()
+    # Cold build: the impl runs once per project file (gunicorn.conf, a, b, __init__).
+    assert native._server_config_run_count() >= 4
+
+    # Edit only b.py (never a server-config match). On re_materialize, every
+    # other file hits the salsa cache; only b.py re-runs the impl.
+    native._reset_server_config_run_count()
+    _write(tmp_path / "pkg/b.py", "def g(): pass\ndef extra(): pass\n")
+    analysis.re_materialize(analysis.materialize_all().detect_changes())
+    assert native._server_config_run_count() == 1, (
+        f"expected exactly 1 per-file re-run (the edited b.py), got "
+        f"{native._server_config_run_count()} — salsa cache for unchanged files "
+        "should have served their ops"
+    )
+
+
+def test_per_file_server_config_cache_invalidates_on_edit(tmp_path):
+    """Editing the matched config file re-runs its per-file plugin and
+    reflects the new top-level surface."""
+    _write(tmp_path / "pkg/__init__.py", "")
+    _write(tmp_path / "gunicorn.conf.py", "workers = 4\n")
+
+    analysis = Analysis(tmp_path, plugins=[native.NativePlugin.server_config()])
+    ctx = analysis.materialize_all()
+    assert any(n.fqname == "<server-config>:gunicorn.conf" for n in ctx.nodes())
+
+    native._reset_server_config_run_count()
+    _write(tmp_path / "gunicorn.conf.py", "workers = 4\nbind = '0.0.0.0:8000'\n")
+    ctx2 = analysis.re_materialize(analysis.materialize_all().detect_changes())
+    assert native._server_config_run_count() >= 1  # gunicorn.conf re-ran
+    reached = {n.fqname for n in ctx2.reachable()}
+    assert "gunicorn.conf.bind" in reached
+
+
+def test_identical_filenames_intern_to_one_cache_key(tmp_path):
+    """Two server_config plugins with the *same* filenames intern to one id,
+    so they share a salsa cache entry — the per-file impl runs once per file,
+    not once per plugin. Distinct filenames key separately (twice per file)."""
+    _write(tmp_path / "pkg/__init__.py", "")
+    _write(tmp_path / "gunicorn.conf.py", "workers = 4\n")
+    _write(tmp_path / "pkg/a.py", "def f(): pass\n")
+
+    # Same config twice -> one interned id -> one run per file.
+    native._reset_server_config_run_count()
+    Analysis(
+        tmp_path,
+        plugins=[
+            native.NativePlugin.server_config(filenames=["gunicorn.conf.py"]),
+            native.NativePlugin.server_config(filenames=["gunicorn.conf.py"]),
+        ],
+    ).materialize_all()
+    count_same = native._server_config_run_count()
+
+    # Distinct configs -> two ids -> two runs per file.
+    native._reset_server_config_run_count()
+    Analysis(
+        tmp_path,
+        plugins=[
+            native.NativePlugin.server_config(filenames=["gunicorn.conf.py"]),
+            native.NativePlugin.server_config(filenames=["other.conf.py"]),
+        ],
+    ).materialize_all()
+    count_diff = native._server_config_run_count()
+
+    assert count_same >= 1
+    assert count_diff == 2 * count_same, (
+        f"identical filename configs should share one cache key (got "
+        f"{count_same} runs) and distinct configs should key separately (got "
+        f"{count_diff}); expected the latter to be exactly double"
+    )
+
+
+def test_filename_order_and_dupes_intern_equal(tmp_path):
+    """The config hash canonicalises filenames (sort + dedup), so configs that
+    differ only in order/duplication share a cache key."""
+    _write(tmp_path / "pkg/__init__.py", "")
+    _write(tmp_path / "gunicorn.conf.py", "workers = 4\n")
+
+    native._reset_server_config_run_count()
+    Analysis(
+        tmp_path,
+        plugins=[
+            native.NativePlugin.server_config(filenames=["a.py", "gunicorn.conf.py"]),
+            native.NativePlugin.server_config(filenames=["gunicorn.conf.py", "a.py", "a.py"]),
+        ],
+    ).materialize_all()
+    # Both plugins canonicalise to the same {a.py, gunicorn.conf.py} set ->
+    # one interned id -> one run per file (2: gunicorn.conf, __init__).
+    assert native._server_config_run_count() == 2

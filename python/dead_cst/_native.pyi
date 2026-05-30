@@ -392,12 +392,17 @@ class NativePlugin:
         ...
 
     @staticmethod
-    def server_config() -> NativePlugin:
-        """Native equivalent of
-        :class:`dead_cst.contrib.server_config.ServerConfigPlugin`.
-        Marks conventional WSGI/ASGI server-config modules
-        (``gunicorn.conf.py``, ``hypercorn.conf.py``, …) as entrypoints.
-        Per-file (salsa-cached); bakes the default filename set.
+    def server_config(filenames: Sequence[str] | None = None) -> NativePlugin:
+        """Native ``ServerConfigPlugin``. Marks conventional WSGI/ASGI
+        server-config modules (``gunicorn.conf.py``, ``hypercorn.conf.py``,
+        …) as entrypoints, keeping each matched file's whole top-level
+        surface alive.
+
+        ``filenames`` defaults to the conventional Gunicorn/Hypercorn set;
+        pass a custom sequence to match other server-config basenames.
+        Per-file (salsa-cached): a file matches purely on its own basename,
+        so an unchanged file's marker is reused across ``re_materialize``.
+        Identical filename sets intern to one cache key.
         """
         ...
 
@@ -2146,4 +2151,17 @@ def _main_block_run_count() -> int:
 
 def _reset_main_block_run_count() -> None:
     """Test helper. Zero the :func:`_main_block_run_count` counter."""
+    ...
+
+def _server_config_run_count() -> int:
+    """Test helper. Total executions of the configured per-file
+    ``ServerConfigPlugin`` impl since the last reset — a salsa cache *miss*
+    counter. Lets the test suite assert an unchanged server-config file
+    isn't re-run on ``re_materialize`` and that distinct filename configs
+    key separately. Not part of the supported surface.
+    """
+    ...
+
+def _reset_server_config_run_count() -> None:
+    """Test helper. Zero the :func:`_server_config_run_count` counter."""
     ...
