@@ -55,9 +55,7 @@ def test_dispatch_app_threads_app_classes_and_decorators(build_plugin_graph, rea
     assert "svc.main.helper" not in reached
 
 
-def test_dispatch_app_seed_as_entrypoint_false_does_not_seed(
-    build_plugin_graph, reachable_fqnames
-):
+def test_dispatch_app_seed_as_entrypoint_false_does_not_seed(build_plugin_graph, reachable_fqnames):
     # Same source, same decorators, but pure-dispatch mode: the app instance is
     # not auto-seeded, so with no other entrypoint nothing comes alive.
     plugin = native.NativePlugin.dispatch_app(
