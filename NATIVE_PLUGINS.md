@@ -125,20 +125,25 @@ flags }`.
 | `module_for(path)` | `Option<usize>` | module node by source path |
 | `resolve(fqname)` | `Option<usize>` | decl-or-module, walking back dotted segments |
 | `decls_under(path_prefix)` | `Vec<usize>` | every node under a path prefix |
-| `find_subclasses_of(class_idx)` | `Vec<usize>` | transitive subclasses |
+| `find_subclasses_of(class_idx)` | `Vec<usize>` | transitive subclasses of the class at `class_idx` |
+| `find_subclasses_of_fqn(fqn)` | `Vec<usize>` | transitive subclasses of the class named by dotted `fqn` (fqn twin of `find_subclasses_of`) |
 | `descendants(root_idx)` | `Vec<usize>` | forward reachability closure |
 | `ancestors(decl_idx)` | `Vec<usize>` | reverse reachability closure |
 | `direct_predecessors(idx)` | `Vec<usize>` | one-hop reverse step |
 | `main_blocks()` | `Vec<(usize, Vec<usize>)>` | each `if __name__` block as `(module, [decls])` |
 | `decorated_decls(modules, names)` | `Vec<usize>` | decls decorated by one of `names` imported from one of `modules` (mirrors `query(ctx).decorators()...`) |
 | `constructions(modules, names)` | `Vec<usize>` | `X = Ctor(...)` decls whose `Ctor` is one of `names` imported from one of `modules` |
+| `handler_decorators(attrs)` | `Vec<(String, usize)>` | top-level fns decorated `@<owner>.<attr>(...)` for `attr` in `attrs`; returns `(owner_name, decl_idx)` — the raw textual owner, unresolved (mirrors `query(ctx).decorators().where_owner_attr(...)`) |
+| `calls_with_string_arg(modules, name, arg_index)` | `Vec<(usize, String)>` | calls to `name` (imported from one of `modules`) whose arg at `arg_index` is a string literal; returns `(owning_decl_idx, literal)` (mirrors `query(ctx).calls()...string_arg_at(...)`) |
+| `calls_on_attr(attr, arg_index)` | `Vec<(usize, String)>` | `<recv>.<attr>(...)` calls (any receiver shape) whose arg at `arg_index` is a string literal; returns `(owning_decl_idx, literal)` (mirrors `query(ctx).calls().where_attr(attr).string_arg_at(...)`) |
 | `module_surface(module_fqn)` | `Vec<usize>` | the names `from module_fqn import *` would bind |
 | `dunder_all_exports(module_fqn)` | `Option<Vec<usize>>` | the decls named by `module_fqn`'s `__all__`, or `None` |
 | `literal_list_entries(var_fqn)` | `Option<Vec<String>>` | the string entries of a `X = ["a", "b"]` literal-list assignment |
 | `decls_matching_name(pattern)` | `Vec<usize>` | top-level decls whose simple name matches the regex `pattern` |
 
-The last six delegate to the same query core as the `query(ctx)` DSL, so they
-agree with it; they're the project-wide analogue of the per-file
+The decorator / construction / call / subclass-by-fqn / name-pattern matchers
+delegate to the same query core as the `query(ctx)` DSL, so they agree with it;
+they're the project-wide analogue of the per-file
 [`PluginFileCtx`](#per-file-plugins-optional-salsa-cached) helpers.
 
 `PluginOps` — emit ops (mirrors the three Python graph ops):
@@ -270,13 +275,14 @@ options. (In a dev/static checkout there's no in-package runtime dylib, so
 
 ### Dependencies available to a plugin
 
-`build-plugin` wires `--extern serde_json` for you, so a plugin can pull in
-`serde_json` directly (e.g. `use serde_json::Value;`) to parse config or
-metadata — it's pinned into the compile closure for exactly this. The rest of
-the runtime's transitive dependency tree is *not* exposed as a stable surface:
-it ships in the closure (so the runtime itself links), but its crates and
-versions are an implementation detail and may change between releases. Build on
-`dead_cst_runtime` and `serde_json` only.
+`build-plugin` wires `--extern` for a small, curated allowlist of runtime
+dependencies, so a plugin can pull them in directly: `serde_json` (e.g. `use
+serde_json::Value;`) to parse config or metadata, and `regex` (`use
+regex::Regex;`) for pattern matching. Both are pinned into the compile closure
+for exactly this. The rest of the runtime's transitive dependency tree is *not*
+exposed as a stable surface: it ships in the closure (so the runtime itself
+links), but its crates and versions are an implementation detail and may change
+between releases. Build on `dead_cst_runtime`, `serde_json`, and `regex` only.
 
 ---
 

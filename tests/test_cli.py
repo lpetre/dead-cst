@@ -22,6 +22,7 @@ import typer
 from typer.testing import CliRunner
 
 from dead_cst.cli import (
+    _crate_key,
     _dead_real,
     _rel_path,
     app,
@@ -177,6 +178,31 @@ def test_dead_real_filters_synthetic_nodes():
 
 def test_dead_real_empty_input_returns_empty_list():
     assert _dead_real([]) == []
+
+
+# ---------------------------------------------------------------------------
+# _crate_key (plugin-host closure dedup)
+# ---------------------------------------------------------------------------
+
+
+def test_crate_key_strips_lib_prefix_ext_and_svh():
+    # rlib, proc-macro dylib, and .so all reduce to the bare crate name.
+    assert _crate_key("libserde_json-1a2b3c4d5e6f7a8b.rlib") == "serde_json"
+    assert _crate_key("libserde_derive-9f8e7d6c.dylib") == "serde_derive"
+    assert _crate_key("libregex-abc123.so") == "regex"
+
+
+def test_crate_key_preserves_underscores_in_crate_name():
+    # Only the trailing `-<hash>` segment is dropped; internal `_` stays.
+    assert _crate_key("libregex_automata-deadbeefcafef00d.rlib") == "regex_automata"
+
+
+def test_crate_key_collapses_distinct_svh_of_same_crate():
+    # The dedup invariant: two SVH-distinct artifacts of one crate (the stale
+    # leftover scenario `bundle-plugin-host` must collapse) map to one key.
+    assert _crate_key("libregex-1111111111111111.rlib") == _crate_key(
+        "libregex-2222222222222222.rlib"
+    )
 
 
 # ---------------------------------------------------------------------------
