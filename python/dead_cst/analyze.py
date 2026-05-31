@@ -702,6 +702,15 @@ class Analysis:
                     ctx.add_plugin(plugin)
                 ctx.materialize()
             else:
+                # Register every plugin before ``build_only`` so the
+                # build can fold per-file native plugins inline — it
+                # reads the registered set to find their ids, warms the
+                # per-file ops in the parallel fan-out, and replays them
+                # during assembly. Project-wide plugins still run below
+                # via the executor; per-file plugins no-op there since
+                # they're already applied.
+                for plugin in self._plugins:
+                    ctx.add_plugin(plugin)
                 ctx.build_only()
 
                 workers = 1 if _serial_mode() else _plugin_worker_count(len(self._plugins))

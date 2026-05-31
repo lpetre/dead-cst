@@ -31,8 +31,8 @@ use ty_python_core::scope::FileScopeId;
 use ty_python_core::semantic_index;
 
 use crate::builder::{
-    apply_prepared_batch, bfs, lookup_idx, not_materialized, prepare_graph_op, CollectedOps,
-    Direction, GraphBuilder, PreparedOp,
+    apply_prepared_batch, bfs, lookup_idx, not_materialized, prepare_graph_op, synthetic_node,
+    CollectedOps, Direction, GraphBuilder, PreparedOp,
 };
 use crate::file_payload::{file_to_edges, file_to_nodes, FileEdges, NodeKind, NodeRef};
 use crate::file_ref_edges::{file_to_ref_edges, FileRefEdges};
@@ -92,7 +92,7 @@ impl Project {
     /// Build the project-wide symbol graph (single-pass, no plugins).
     pub(crate) fn build(&mut self, py: Python<'_>) -> PyResult<NativeGraph> {
         let counters = Arc::new(ProgressCounters::new());
-        let outputs = build_project_graph(py, &mut self.db, false, None, &counters)?;
+        let outputs = build_project_graph(py, &mut self.db, false, None, &counters, &[])?;
         Ok(NativeGraph {
             nodes: outputs.builder.nodes,
             edges: outputs.builder.edges,
@@ -170,12 +170,6 @@ pub(crate) struct BuildOutputs {
     /// O(1) fast path; not yet wired into the current path.
     #[allow(dead_code)]
     pub(crate) children_by_fqn: FxHashMap<String, Vec<usize>>,
-    /// `(file, local_idx) -> global node idx`, where ``local_idx`` is a
-    /// position in that file's ``FileNodes.refs`` array. Lets per-file
-    /// native plugins emit ops in file-local index space; the harness
-    /// translates them to global indices at apply time. See
-    /// [`crate::native_plugins`].
-    pub(crate) local_to_global: FxHashMap<(File, u32), usize>,
 }
 
 /// Run the three build phases (ingest → hierarchy+imports → references)
@@ -250,6 +244,7 @@ pub(crate) fn build_project_graph(
     show_progress: bool,
     stack_size: Option<usize>,
     counters: &Arc<ProgressCounters>,
+    per_file_plugin_ids: &[crate::native_plugins::PerFilePluginId],
 ) -> PyResult<BuildOutputs> {
     let timing = std::env::var_os("DEAD_CST_TIMING").is_some();
 
@@ -344,6 +339,7 @@ pub(crate) fn build_project_graph(
         // commit message for the hazard.
         let dist_db: ProjectDatabase = db.clone();
         let files_ref: &[File] = &project_files;
+        let per_file_ids_ref: &[crate::native_plugins::PerFilePluginId] = per_file_plugin_ids;
         let counters_ref = Arc::clone(counters);
         let run_populate = move || {
             use salsa::Database as _;
@@ -361,6 +357,16 @@ pub(crate) fn build_project_graph(
                             let _ = file_to_nodes(local_db, file);
                             let _ = file_to_edges(local_db, file);
                             let _ = file_to_ref_edges(local_db, file);
+                            // Per-file native plugins: warm the salsa-cached
+                            // `per_file_plugin_ops(file, id)` query on this
+                            // worker so the serial assembly fold below is a
+                            // pure cache read. `run_on_file` is GIL-free and
+                            // touches only this file, so it composes with the
+                            // GIL-released fan-out.
+                            for &id in per_file_ids_ref {
+                                let _ =
+                                    crate::native_plugins::per_file_plugin_ops(local_db, file, id);
+                            }
                         });
                         db_tx.send(local_db).expect("channel open");
                         counters_inner.populate_inc();
@@ -395,7 +401,14 @@ pub(crate) fn build_project_graph(
     // memoized from the parallel pre-populate above so this pass
     // is pure hashmap/index work plus the GIL-bound Py creation.
     let t_assemble = std::time::Instant::now();
-    let assembled = assemble_graph(py, db, &project_files, &peer_pyi_to_py, counters)?;
+    let assembled = assemble_graph(
+        py,
+        db,
+        &project_files,
+        &peer_pyi_to_py,
+        per_file_plugin_ids,
+        counters,
+    )?;
     let t_assemble_elapsed = t_assemble.elapsed();
     counters.finish_phase(PHASE_ASSEMBLE);
 
@@ -404,7 +417,6 @@ pub(crate) fn build_project_graph(
     let module_nodes_by_file = assembled.module_nodes_by_file;
     let class_by_selection = assembled.class_by_selection;
     let decl_by_name_range = assembled.decl_by_name_range;
-    let local_to_global = assembled.local_to_global;
     let ref_to_global = assembled.ref_to_global;
 
     counters.start_phase(PHASE_FQNAME, Some(builder.nodes.len()));
@@ -469,7 +481,6 @@ pub(crate) fn build_project_graph(
         children_by_node,
         children_by_fqn,
         children_by_parent,
-        local_to_global,
     })
 }
 
@@ -500,12 +511,6 @@ struct AssembledGraph<'db> {
     module_nodes_by_file: FxHashMap<File, usize>,
     class_by_selection: FxHashMap<(File, (u32, u32)), usize>,
     decl_by_name_range: FxHashMap<(File, (u32, u32)), usize>,
-    /// `(file, local_idx) -> global node idx`. ``local_idx`` is the
-    /// position in that file's ``FileNodes.refs`` array. Lets per-file
-    /// native plugins (which emit ops in file-local index space) get
-    /// translated to global indices at apply time without a live
-    /// ``ref_to_global`` (whose ``'db`` lifetime can't outlive assemble).
-    local_to_global: FxHashMap<(File, u32), usize>,
     /// PROTOTYPE: kept around so the class-hierarchy builder can map
     /// `NodeRef -> global idx`.
     ref_to_global: FxHashMap<NodeRef<'db>, usize>,
@@ -544,6 +549,7 @@ fn assemble_graph<'db>(
     db: &'db ProjectDatabase,
     project_files: &[File],
     peer_pyi_to_py: &FxHashMap<File, File>,
+    per_file_plugin_ids: &[crate::native_plugins::PerFilePluginId],
     counters: &Arc<ProgressCounters>,
 ) -> PyResult<AssembledGraph<'db>> {
     // Pre-count total nodes across project_files. file_to_nodes is
@@ -849,6 +855,23 @@ fn assemble_graph<'db>(
         }
     }
 
+    // Pass 4: per-file native plugin fold. Replay each per-file
+    // plugin's salsa-cached `FileLocalOp`s (warmed in the parallel
+    // fan-out) into the builder, translating file-local indices to
+    // global ones via `local_to_global`. Runs here, after the real
+    // graph is fully assembled, so plugin synthetic nodes get the
+    // highest indices — the same ordering the old post-build apply
+    // pass produced. Synthetic nodes still dedup by fqname, so a
+    // later project-wide plugin emitting the same node merges.
+    fold_per_file_plugin_ops(
+        py,
+        db,
+        &mut builder,
+        project_files,
+        per_file_plugin_ids,
+        &local_to_global,
+    )?;
+
     // Flush warnings to Python logger from the main thread (we hold
     // the GIL here; workers don't).
     for msg in &all_warnings {
@@ -861,9 +884,142 @@ fn assemble_graph<'db>(
         module_nodes_by_file,
         class_by_selection,
         decl_by_name_range,
-        local_to_global,
         ref_to_global,
     })
+}
+
+/// Fold every registered per-file native plugin's file-local ops into
+/// the assembled graph. Each op is applied with the same semantics as
+/// the `apply_prepared` handlers for the `*ByIdx` [`PreparedOp`]
+/// variants:
+///
+/// * [`FileLocalOp::Node`] → intern a synthetic node (dedup by
+///   fqname) and wire its `edges_from`/`edges_to` with flags 0.
+/// * [`FileLocalOp::Edge`] → add the translated edge with its flags.
+/// * [`FileLocalOp::Entrypoint`] → mint the `{marker}:{decl_fqname}`
+///   synthetic with [`NODE_FLAG_ENTRYPOINT`] and edge it to the decl.
+///
+/// Endpoints are file-local indices into that file's `FileNodes.refs`;
+/// `local_to_global` maps them to global node indices (built in pass
+/// 1, so every well-formed endpoint resolves). A local idx with no
+/// global entry is skipped — same lenient contract as the old path.
+///
+/// `per_file_plugin_ops(db, file, id)` is a no-op cache read here: the
+/// parallel fan-out already warmed it on a worker thread. `run_on_file`
+/// is GIL-free and intra-file, so nothing in this fold needs the salsa
+/// DB beyond the cached lookup.
+fn fold_per_file_plugin_ops(
+    py: Python<'_>,
+    db: &ProjectDatabase,
+    builder: &mut GraphBuilder,
+    project_files: &[File],
+    per_file_plugin_ids: &[crate::native_plugins::PerFilePluginId],
+    local_to_global: &FxHashMap<(File, u32), usize>,
+) -> PyResult<()> {
+    if per_file_plugin_ids.is_empty() {
+        return Ok(());
+    }
+    use crate::native_plugins::{per_file_plugin_ops, FileLocalOp};
+    for &file in project_files {
+        let path = file_path_string(db, file);
+        for &id in per_file_plugin_ids {
+            let file_ops = per_file_plugin_ops(db, file, id);
+            if file_ops.is_empty() {
+                continue;
+            }
+            let to_global = |local: u32| local_to_global.get(&(file, local)).copied();
+            for op in file_ops {
+                match op {
+                    FileLocalOp::Node {
+                        fqname,
+                        kind,
+                        flags,
+                        edges_to_local_idx,
+                        edges_from_local_idx,
+                    } => {
+                        let node_idx = builder.intern_node(
+                            py,
+                            synthetic_node(fqname.clone(), kind, path.clone(), *flags),
+                        )?;
+                        for &local in edges_from_local_idx {
+                            if let Some(src_idx) = to_global(local) {
+                                builder.add_edge(src_idx, node_idx, 0);
+                            }
+                        }
+                        for &local in edges_to_local_idx {
+                            if let Some(dst_idx) = to_global(local) {
+                                builder.add_edge(node_idx, dst_idx, 0);
+                            }
+                        }
+                    }
+                    FileLocalOp::Edge {
+                        src_local_idx,
+                        dst_local_idx,
+                        flags,
+                    } => {
+                        if let (Some(src_idx), Some(dst_idx)) =
+                            (to_global(*src_local_idx), to_global(*dst_local_idx))
+                        {
+                            builder.add_edge(src_idx, dst_idx, *flags);
+                        }
+                    }
+                    FileLocalOp::Entrypoint {
+                        decl_local_idx,
+                        marker,
+                    } => {
+                        let Some(decl_idx) = to_global(*decl_local_idx) else {
+                            continue;
+                        };
+                        let (decl_fqname, decl_path) = {
+                            let node = builder.nodes[decl_idx].borrow(py);
+                            (node.fqname.clone(), node.path.clone())
+                        };
+                        let marker_fqname = format!("{marker}:{decl_fqname}");
+                        let marker_idx = builder.intern_node(
+                            py,
+                            synthetic_node(
+                                marker_fqname,
+                                "synthetic",
+                                decl_path,
+                                NODE_FLAG_ENTRYPOINT,
+                            ),
+                        )?;
+                        builder.add_edge(marker_idx, decl_idx, 0);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Collect the [`PerFilePluginId`](crate::native_plugins::PerFilePluginId)
+/// of every registered per-file native plugin, in registration order.
+/// These are folded into the graph during the build (parallel warm in
+/// the fan-out, serial replay in [`assemble_graph`]) rather than in the
+/// post-build plugin pass. Project-wide plugins (including project-wide
+/// external dylibs) and non-native Python plugins are skipped here —
+/// they still run in [`collect_prepared_plugin_ops`].
+fn extract_per_file_plugin_ids(
+    py: Python<'_>,
+    plugins: &[PyObject],
+) -> Vec<crate::native_plugins::PerFilePluginId> {
+    use crate::native_plugins::{NativePlugin, NativePluginKind, PerFilePluginId};
+    let mut ids = Vec::new();
+    for p in plugins {
+        let Ok(native) = p.bind(py).downcast::<NativePlugin>() else {
+            continue;
+        };
+        match &native.borrow().kind {
+            NativePluginKind::PerFile(id) => ids.push(*id),
+            NativePluginKind::External {
+                per_file_id: Some(eid),
+                ..
+            } => ids.push(PerFilePluginId::External(*eid)),
+            _ => {}
+        }
+    }
+    ids
 }
 
 /// Fold every file's per-file `class_bases` payload (see
@@ -1470,7 +1626,15 @@ impl ProjectContext {
         let counters = Arc::clone(&slf.borrow(py).progress);
         let build_result = {
             let mut this = slf.borrow_mut(py);
-            build_project_graph(py, &mut this.db, show_progress, stack_size, &counters)
+            let per_file_ids = extract_per_file_plugin_ids(py, &this.plugins);
+            build_project_graph(
+                py,
+                &mut this.db,
+                show_progress,
+                stack_size,
+                &counters,
+                &per_file_ids,
+            )
         };
         let outputs = match build_result {
             Ok(o) => o,
@@ -1628,7 +1792,15 @@ impl ProjectContext {
         let stack_size = slf.borrow(py).stack_size;
         let counters = Arc::clone(&slf.borrow(py).progress);
         let mut this = slf.borrow_mut(py);
-        match build_project_graph(py, &mut this.db, show_progress, stack_size, &counters) {
+        let per_file_ids = extract_per_file_plugin_ids(py, &this.plugins);
+        match build_project_graph(
+            py,
+            &mut this.db,
+            show_progress,
+            stack_size,
+            &counters,
+            &per_file_ids,
+        ) {
             Ok(outputs) => {
                 *this.outputs.write() = Some(outputs);
                 Ok(())
@@ -1753,23 +1925,18 @@ fn collect_prepared_plugin_ops(
             crate::native_plugins::NativePluginKind::ProjectWide(inner) => {
                 return inner.run(&ctx_ref, sink);
             }
-            // Per-file impl: invoke the salsa-cached per-file query for
-            // every project file, translating each file-local op to a
-            // global ``PreparedOp::NodeByIdx`` via ``local_to_global``.
-            crate::native_plugins::NativePluginKind::PerFile(id) => {
-                return ctx_ref.collect_per_file_plugin_ops(*id, sink);
-            }
-            // External dylib plugin opted into per-file dispatch: route it
-            // through the same salsa-cached per-file query as the builtins,
-            // keyed on its registry id.
-            crate::native_plugins::NativePluginKind::External {
-                per_file_id: Some(id),
+            // Per-file impls (builtin + external-with-per-file dispatch)
+            // are folded into the graph during the build itself —
+            // their salsa-cached ops are warmed in the parallel fan-out
+            // and replayed in `assemble_graph`'s per-file fold. By the
+            // time this post-build plugin pass runs they're already
+            // applied; collecting them here would double-apply. No-op.
+            crate::native_plugins::NativePluginKind::PerFile(_)
+            | crate::native_plugins::NativePluginKind::External {
+                per_file_id: Some(_),
                 ..
             } => {
-                return ctx_ref.collect_per_file_plugin_ops(
-                    crate::native_plugins::PerFilePluginId::External(*id),
-                    sink,
-                );
+                return Ok(());
             }
             // Project-wide external dylib plugin: run it once against a
             // restricted, public ``PluginCtx`` view and fold its ops in.
@@ -1866,90 +2033,6 @@ impl ProjectContext {
             return Err(not_materialized(op));
         }
         Ok(RwLockReadGuard::map(guard, |o| o.as_ref().unwrap()))
-    }
-
-    /// Drive a per-file native plugin across every project file and
-    /// translate its file-local ops to global [`PreparedOp`]s.
-    ///
-    /// For each file, the salsa-cached [`per_file_plugin_ops`] query
-    /// returns the plugin's [`FileLocalOp`] (cheap on cache hit —
-    /// unchanged files skip the plugin re-run entirely). Each op's
-    /// ``edges_to_local_idx`` are positions in that file's
-    /// ``FileNodes.refs``; we map them to global indices via the
-    /// build's ``local_to_global`` table. A local idx with no global
-    /// entry (shouldn't happen for a well-formed plugin) is skipped.
-    pub(crate) fn collect_per_file_plugin_ops(
-        &self,
-        id: crate::native_plugins::PerFilePluginId,
-        sink: &mut Vec<PreparedOp>,
-    ) -> PyResult<()> {
-        let outputs = self.materialized("collect_per_file_plugin_ops")?;
-        for &file in &outputs.project_files {
-            let file_ops = crate::native_plugins::per_file_plugin_ops(&self.db, file, id);
-            if file_ops.is_empty() {
-                continue;
-            }
-            let path = file_path_string(&self.db, file);
-            let to_global = |local: u32| outputs.local_to_global.get(&(file, local)).copied();
-            for op in file_ops {
-                use crate::native_plugins::FileLocalOp;
-                match op {
-                    FileLocalOp::Node {
-                        fqname,
-                        kind,
-                        flags,
-                        edges_to_local_idx,
-                        edges_from_local_idx,
-                    } => {
-                        let edges_to_idx: Vec<usize> = edges_to_local_idx
-                            .iter()
-                            .filter_map(|&local| to_global(local))
-                            .collect();
-                        let edges_from_idx: Vec<usize> = edges_from_local_idx
-                            .iter()
-                            .filter_map(|&local| to_global(local))
-                            .collect();
-                        sink.push(PreparedOp::NodeByIdx {
-                            fqname: fqname.clone(),
-                            kind,
-                            path: path.clone(),
-                            flags: *flags,
-                            edges_from_idx,
-                            edges_to_idx,
-                        });
-                    }
-                    FileLocalOp::Edge {
-                        src_local_idx,
-                        dst_local_idx,
-                        flags,
-                    } => {
-                        let (Some(src_idx), Some(dst_idx)) =
-                            (to_global(*src_local_idx), to_global(*dst_local_idx))
-                        else {
-                            continue;
-                        };
-                        sink.push(PreparedOp::EdgeByIdx {
-                            src_idx,
-                            dst_idx,
-                            flags: *flags,
-                        });
-                    }
-                    FileLocalOp::Entrypoint {
-                        decl_local_idx,
-                        marker,
-                    } => {
-                        let Some(decl_idx) = to_global(*decl_local_idx) else {
-                            continue;
-                        };
-                        sink.push(PreparedOp::EntrypointByIdx {
-                            decl_idx,
-                            marker: marker.clone(),
-                        });
-                    }
-                }
-            }
-        }
-        Ok(())
     }
 }
 
