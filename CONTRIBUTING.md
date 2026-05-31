@@ -129,11 +129,12 @@ my_plugin = "myproj.plugins:MyPlugin"
 The CLI's `_load_plugin` checks `_BUILTIN_PLUGINS` first, then the
 entry-point group.
 
-`ClickPlugin` is a good reference for a Python framework plugin
-(group → handler dispatch over the chainable `query(ctx)` DSL). The
-dispatch-app frameworks (Flask / FastAPI / Typer / Cyclopts / Slack
-Bolt / FastMCP / Celery) are native plugins — see
-`DispatchAppPluginImpl` in `runtime/src/native_plugins.rs`.
+`DiscordPyPlugin` is a good reference for a Python framework plugin
+(a `DecoratedDeclPlugin` subclass wiring bot-instance → handler
+edges). Click and the dispatch-app frameworks (Flask / FastAPI /
+Typer / Cyclopts / Slack Bolt / FastMCP / Celery) are native plugins
+— see `ClickPluginImpl` and `DispatchAppPluginImpl` in
+`runtime/src/native_plugins.rs`.
 
 ### Native plugins
 

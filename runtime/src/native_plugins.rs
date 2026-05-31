@@ -885,6 +885,19 @@ impl NativePlugin {
             },
         )
     }
+
+    /// The Click CLI plugin. Wires `@<group>.command` / `@<group>.group` /
+    /// `@<group>.result_callback` handlers to their owning Click group, with a
+    /// fixpoint so a `@<group>.group()` handler is itself promoted to a group.
+    /// Groups are *not* seeded as entrypoints — reachability enters through
+    /// `[project.scripts]` / `__main__` / `add_command`. Project-wide because a
+    /// group declared in one file may collect handlers registered in another.
+    #[staticmethod]
+    fn click() -> Self {
+        Self {
+            kind: NativePluginKind::ProjectWide(Box::new(ClickPluginImpl)),
+        }
+    }
 }
 
 impl NativePlugin {
@@ -916,6 +929,7 @@ pub(crate) fn _builtin_native_plugin(name: &str) -> Option<NativePlugin> {
         "slack_bolt" => NativePlugin::slack_bolt(),
         "fastmcp" => NativePlugin::fastmcp(),
         "celery" => NativePlugin::celery(),
+        "click" => NativePlugin::click(),
         _ => return None,
     })
 }
@@ -2604,5 +2618,164 @@ fn celery_config() -> DispatchAppConfig {
             names: owned(&["shared_task"]),
             marker_prefix: "<celery-shared>:".to_string(),
         }),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ClickPlugin — project-wide port of `dead_cst.contrib.click.ClickPlugin`.
+//
+// Click is *not* a dispatch-app framework: groups are never seeded as
+// entrypoints (reachability enters via `[project.scripts]` / `__main__` /
+// `add_command`), and a command handler can itself *become* a group
+// (`@group.group()` defines a nested group whose own `@subgroup.command()`
+// handlers must then be wired). That second property needs a group->handler
+// *fixpoint* — a single registration pass over a config (as the dispatch-app
+// engine does) can't express it — so Click gets its own impl instead of a
+// `DispatchAppConfig`. Cross-file by nature (a group in one file, handlers
+// registered on it in another), hence project-wide.
+// ---------------------------------------------------------------------------
+
+const CLICK_GROUP_DECORATORS: [&str; 2] = ["group", "Group"];
+const CLICK_REGISTRATION_DECORATORS: [&str; 3] = ["command", "group", "result_callback"];
+const CLICK_SUBGROUP_DECORATOR: &str = "group";
+
+pub(crate) struct ClickPluginImpl;
+
+impl NativePluginImpl for ClickPluginImpl {
+    fn name(&self) -> &str {
+        "click"
+    }
+
+    fn run(&self, ctx: &ProjectContext, sink: &mut Vec<PreparedOp>) -> PyResult<()> {
+        Python::with_gil(|py| -> PyResult<()> {
+            // Cheap import-presence guard (port of
+            // `query(ctx).imports().of("click").exists()`).
+            if !ctx.has_imports_of("click")? {
+                return Ok(());
+            }
+            let click_mod = ["click".to_string()];
+
+            // --- Phase 1: gather indices. Each ctx call takes (and releases)
+            // its own `materialized` read guard; mirrors DispatchAppPluginImpl. ---
+
+            // Groups via `@click.group` / `@click.Group`-decorated decls.
+            let group_decls: Vec<usize> = ctx
+                .find_decorated_decls(
+                    py,
+                    &click_mod,
+                    CLICK_GROUP_DECORATORS
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
+                    None,
+                    false,
+                )?
+                .into_iter()
+                .map(|(idx, _)| idx)
+                .collect();
+
+            // Groups via `X = click.Group(...)` constructions.
+            let group_ctors: Vec<usize> = ctx
+                .find_instance_constructions(
+                    py,
+                    &click_mod,
+                    vec!["Group".to_string()],
+                    None,
+                    false,
+                )?
+                .into_iter()
+                .map(|(idx, _, _)| idx)
+                .collect();
+
+            // No groups => no wiring to do (the fixpoint would no-op anyway).
+            if group_decls.is_empty() && group_ctors.is_empty() {
+                return Ok(());
+            }
+
+            // Handlers: `@<owner>.{command,group,result_callback}(...)`.
+            let handlers: Vec<(String, usize)> = ctx
+                .find_handler_decorators(
+                    py,
+                    CLICK_REGISTRATION_DECORATORS
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
+                    None,
+                    false,
+                )?
+                .into_iter()
+                .map(|(owner, idx, _)| (owner, idx))
+                .collect();
+
+            // Subgroup links: handlers decorated specifically with
+            // `@<owner>.group(...)`. Wiring such a handler promotes it to a
+            // group so its own `@<handler>.command()` handlers wire next pass.
+            let subgroup_links: FxHashSet<(usize, String)> = ctx
+                .find_handler_decorators(
+                    py,
+                    vec![CLICK_SUBGROUP_DECORATOR.to_string()],
+                    None,
+                    false,
+                )?
+                .into_iter()
+                .map(|(owner, idx, _)| (idx, owner))
+                .collect();
+
+            // --- Phase 2: resolve paths/fqnames + run the group->handler
+            // fixpoint under one `materialized` read guard. ---
+            let outputs = ctx.materialized("ClickPlugin")?;
+            let nodes = &outputs.builder.nodes;
+
+            // groups_by_owner: (path, simple name) -> [group idx, ...].
+            let mut groups_by_owner: FxHashMap<(String, String), Vec<usize>> = FxHashMap::default();
+            for &idx in group_decls.iter().chain(group_ctors.iter()) {
+                let node = &nodes[idx];
+                groups_by_owner
+                    .entry((node.path.clone(), simple_name(&node.fqname).to_string()))
+                    .or_default()
+                    .push(idx);
+            }
+
+            // Fixpoint: wire each handler to its owning group(s); a newly wired
+            // subgroup handler becomes a group, exposing its own handlers on the
+            // next pass. `emitted` dedups edges so the loop terminates once no
+            // new group is discovered. Verbatim port of `ClickPlugin.run`'s loop.
+            let mut emitted: FxHashSet<(usize, usize)> = FxHashSet::default();
+            let mut changed = true;
+            while changed {
+                changed = false;
+                for (owner_name, decorated_idx) in &handlers {
+                    let path = nodes[*decorated_idx].path.clone();
+                    // Snapshot the owner's group idxs: `add_group` below may
+                    // mutate `groups_by_owner`, and the dedup + outer loop make
+                    // deferring a same-pass insertion to the next pass
+                    // fixpoint-equivalent.
+                    let Some(owner_idxs) = groups_by_owner.get(&(path.clone(), owner_name.clone()))
+                    else {
+                        continue;
+                    };
+                    for owner_idx in owner_idxs.clone() {
+                        if !emitted.insert((owner_idx, *decorated_idx)) {
+                            continue;
+                        }
+                        sink.push(PreparedOp::EdgeByIdx {
+                            src_idx: owner_idx,
+                            dst_idx: *decorated_idx,
+                            flags: 0,
+                        });
+                        if subgroup_links.contains(&(*decorated_idx, owner_name.clone())) {
+                            let simple = simple_name(&nodes[*decorated_idx].fqname).to_string();
+                            groups_by_owner
+                                .entry((path.clone(), simple))
+                                .or_default()
+                                .push(*decorated_idx);
+                            changed = true;
+                        }
+                    }
+                }
+            }
+
+            Ok(())
+        })
     }
 }

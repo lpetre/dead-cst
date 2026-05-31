@@ -34,7 +34,6 @@ from dead_cst import _native as native
 
 from .analyze import Analysis
 from .codemod import generate_patch
-from .contrib.click import ClickPlugin
 from .contrib.discordpy import DiscordPyPlugin
 from .contrib.mock_patch import MockPatchPlugin
 from .contrib.pytest import PytestPlugin
@@ -62,9 +61,9 @@ app = typer.Typer(help="Dead code analysis for Python.")
 
 
 # Python-side built-ins. Plugins ported to Rust (``main_block``,
-# ``module_dunders``, ``init_subclass``, ``server_config``, ``unittest``, and
-# the dispatch-app frameworks ``flask`` / ``fastapi`` / ``typer`` /
-# ``cyclopts`` / ``slack_bolt`` / ``fastmcp`` / ``celery``) are *not* here —
+# ``module_dunders``, ``init_subclass``, ``server_config``, ``unittest``, the
+# dispatch-app frameworks ``flask`` / ``fastapi`` / ``typer`` / ``cyclopts`` /
+# ``slack_bolt`` / ``fastmcp`` / ``celery``, and ``click``) are *not* here —
 # ``_load_plugin`` resolves those through the native registry
 # (``_builtin_native_plugin``) first, so they move out of this map as they're
 # ported.
@@ -73,7 +72,6 @@ _BUILTIN_PLUGINS: dict[str, Plugin] = {
     "explicit": ExplicitEntrypointPlugin(),
     "pytest": PytestPlugin(),
     "mock_patch": MockPatchPlugin(),
-    "click": ClickPlugin(),
     "discordpy": DiscordPyPlugin(),
     "dynamic_import_fallback": DynamicImportFallbackPlugin(),
 }

@@ -53,7 +53,6 @@ EXPECTED_PUBLIC_API: dict[str, list[str]] = {
         "simple_name",
     ],
     "dead_cst.contrib": [
-        "ClickPlugin",
         "DiscordPyPlugin",
         "MockPatchPlugin",
         "PytestPlugin",
