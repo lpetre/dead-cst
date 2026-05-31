@@ -162,6 +162,13 @@ two versions.
   `find_*` queries. Behaviour is identical. Because each framework is now an
   independent project-wide native plugin, the Python-side automatic batching
   of multiple `DispatchAppPlugin` instances is retired.
+- **Per-file native plugins now run inside the build pipeline.** Their
+  salsa-cached file-local ops are warmed during the parallel (GIL-released)
+  file fan-out and folded into the graph during serial assembly, instead of a
+  separate post-build plugin pass. Project-wide plugins still run after the
+  build. Behaviour is identical; per-file plugins no longer emit ops in the
+  post-build pass (they would double-apply), so a graph with only per-file
+  native plugins skips that pass entirely.
 
 ### Removed
 
