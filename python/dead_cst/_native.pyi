@@ -477,6 +477,34 @@ class NativePlugin:
         """
         ...
 
+    @staticmethod
+    def dispatch_app(
+        name: str,
+        marker_prefix: str,
+        app_classes: Sequence[str],
+        registration_decorators: Sequence[str],
+        seed_as_entrypoint: bool,
+    ) -> NativePlugin:
+        """Build a dispatch-app plugin for a framework ``dead-cst`` doesn't
+        bundle — the generalized form behind :meth:`flask` … :meth:`celery`.
+
+        ``name`` labels the plugin in progress logs; ``marker_prefix``
+        namespaces the synthetic entrypoint / factory nodes it mints.
+        ``app_classes`` are dotted fqnames of the application classes (e.g.
+        ``["myframework.App"]``) whose instances — and transitive subclasses —
+        anchor handler wiring; ``registration_decorators`` are the bare method
+        names a handler is decorated with on such an instance
+        (``@app.route`` → ``"route"``).
+
+        When ``seed_as_entrypoint`` is true the discovered app instances (and
+        factory functions returning them) are kept alive — the web/task
+        default (Flask/FastAPI/Celery). Pass ``False`` for a pure-dispatch CLI
+        (Typer/Cyclopts), where an unused app surfaces as dead. The
+        Celery-style appless ``@shared_task`` fan-out is not exposed here; use
+        :meth:`celery`.
+        """
+        ...
+
 def _builtin_native_plugin(name: str) -> NativePlugin | None:
     """Resolve a built-in plugin name (e.g. ``"main_block"``) to its
     native implementation, or ``None`` if no native plugin owns that
