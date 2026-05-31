@@ -505,6 +505,19 @@ class NativePlugin:
         """
         ...
 
+    @staticmethod
+    def click() -> NativePlugin:
+        """Native Click CLI plugin. Finds Click groups (functions decorated
+        ``@click.group`` / ``@click.Group`` or ``X = click.Group(...)``
+        constructions) and wires ``@<group>.command`` / ``@<group>.group`` /
+        ``@<group>.result_callback`` handlers to their owning group. A
+        ``@<group>.group()`` handler is itself promoted to a group via a
+        fixpoint, so nested sub-commands wire transitively. Groups are *not*
+        seeded as entrypoints — reach them through ``[project.scripts]`` /
+        ``__main__`` / ``add_command``.
+        """
+        ...
+
 def _builtin_native_plugin(name: str) -> NativePlugin | None:
     """Resolve a built-in plugin name (e.g. ``"main_block"``) to its
     native implementation, or ``None`` if no native plugin owns that

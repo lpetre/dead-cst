@@ -1,10 +1,10 @@
-"""Tests for :class:`ClickPlugin`."""
+"""Tests for the native Click plugin (``NativePlugin.click()``)."""
 
 from __future__ import annotations
 
 import pytest
 
-from dead_cst.contrib import ClickPlugin
+from dead_cst import _native as native
 from dead_cst.plugins import (
     ExplicitEntrypointPlugin,
     MainBlockPlugin,
@@ -36,7 +36,7 @@ def test_click_plugin_marks_command_handlers(build_plugin_graph, reachable_fqnam
                 cli()
             """,
         },
-        [MainBlockPlugin(), ClickPlugin()],
+        [MainBlockPlugin(), native.NativePlugin.click()],
     )
     reached = reachable_fqnames(graph)
     assert "cli.main.cli" in reached
@@ -76,7 +76,7 @@ def test_click_plugin_keeps_handler_dependencies_alive(build_plugin_graph, reach
                 cli()
             """,
         },
-        [MainBlockPlugin(), ClickPlugin()],
+        [MainBlockPlugin(), native.NativePlugin.click()],
     )
     reached = reachable_fqnames(graph)
     assert "cli.main.show" in reached
@@ -105,7 +105,7 @@ def test_click_plugin_reachable_via_explicit_entrypoint(
         }
     )
     graph = make_analysis(
-        plugins=[ExplicitEntrypointPlugin(specs=["cli.main.cli"]), ClickPlugin()]
+        plugins=[ExplicitEntrypointPlugin(specs=["cli.main.cli"]), native.NativePlugin.click()]
     ).materialize_all()
     reached = reachable_fqnames(graph)
     assert "cli.main.cli" in reached
@@ -115,7 +115,7 @@ def test_click_plugin_reachable_via_explicit_entrypoint(
 def test_click_plugin_does_not_seed_entrypoint(build_plugin_graph, reachable_fqnames):
     """Without an external reach (no main block, no project.scripts, no -e),
     the Click group itself stays dead -- and so do its commands. Mirrors
-    the ``APIRouter`` behavior in :class:`FastAPIPlugin`."""
+    the ``APIRouter`` behavior in ``NativePlugin.fastapi()``."""
     graph = build_plugin_graph(
         {
             "cli/__init__.py": "",
@@ -129,7 +129,7 @@ def test_click_plugin_does_not_seed_entrypoint(build_plugin_graph, reachable_fqn
             def orphan(): pass
             """,
         },
-        [ClickPlugin()],
+        [native.NativePlugin.click()],
     )
     reached = reachable_fqnames(graph)
     assert "cli.main.cli" not in reached
@@ -164,7 +164,7 @@ def test_click_plugin_unused_subgroup_stays_dead(build_plugin_graph, reachable_f
                 cli()
             """,
         },
-        [MainBlockPlugin(), ClickPlugin()],
+        [MainBlockPlugin(), native.NativePlugin.click()],
     )
     reached = reachable_fqnames(graph)
     assert "cli.main.hello" in reached
@@ -201,7 +201,7 @@ def test_click_plugin_subgroup_reachable_via_add_command(build_plugin_graph, rea
                 cli()
             """,
         },
-        [MainBlockPlugin(), ClickPlugin()],
+        [MainBlockPlugin(), native.NativePlugin.click()],
     )
     reached = reachable_fqnames(graph)
     assert "cli.main.cli" in reached
@@ -231,7 +231,7 @@ def test_click_plugin_subgroup_via_decorator(build_plugin_graph, reachable_fqnam
                 cli()
             """,
         },
-        [MainBlockPlugin(), ClickPlugin()],
+        [MainBlockPlugin(), native.NativePlugin.click()],
     )
     reached = reachable_fqnames(graph)
     assert "cli.main.cli" in reached
@@ -306,7 +306,7 @@ def test_click_plugin_subgroup_via_decorator(build_plugin_graph, reachable_fqnam
 def test_click_plugin_handles_import_variants(build_plugin_graph, reachable_fqnames, src):
     graph = build_plugin_graph(
         {"cli/__init__.py": "", "cli/main.py": src},
-        [MainBlockPlugin(), ClickPlugin()],
+        [MainBlockPlugin(), native.NativePlugin.click()],
     )
     assert "cli.main.hello" in reachable_fqnames(graph)
 
@@ -331,7 +331,7 @@ def test_click_plugin_ignores_bare_decorators(build_plugin_graph, reachable_fqna
                 cli()
             """,
         },
-        [MainBlockPlugin(), ClickPlugin()],
+        [MainBlockPlugin(), native.NativePlugin.click()],
     )
     # Bare ``@command`` (no attribute access) is not a Click registration --
     # matching it would clobber unrelated decorators with the same name.
@@ -353,7 +353,7 @@ def test_click_plugin_ignores_unrelated_decorators(build_plugin_graph, reachable
             def not_a_command(): pass
             """,
         },
-        [ClickPlugin()],
+        [native.NativePlugin.click()],
     )
     # ``t`` isn't a Click group, so its ``.command`` decorator is ignored.
     assert "pkg.mod.not_a_command" not in reachable_fqnames(graph)
@@ -375,7 +375,7 @@ def test_click_plugin_does_nothing_without_click_imports(build_plugin_graph, rea
             def looks_like_command(): pass
             """,
         },
-        [ClickPlugin()],
+        [native.NativePlugin.click()],
     )
     # ``cli`` here is not a Click group -- no ``click`` import in scope.
     assert "pkg.mod.looks_like_command" not in reachable_fqnames(graph)
@@ -404,7 +404,7 @@ def test_click_plugin_multiple_groups_in_one_module(build_plugin_graph, reachabl
                 cli()
             """,
         },
-        [MainBlockPlugin(), ClickPlugin()],
+        [MainBlockPlugin(), native.NativePlugin.click()],
     )
     reached = reachable_fqnames(graph)
     # ``cli`` is reached via the main block; its command is alive.
@@ -435,7 +435,7 @@ def test_click_plugin_ignores_import_star(build_plugin_graph, reachable_fqnames)
                 cli()
             """,
         },
-        [MainBlockPlugin(), ClickPlugin()],
+        [MainBlockPlugin(), native.NativePlugin.click()],
     )
     # No instance edge from ``cli`` to ``hello`` because the plugin ignores
     # star imports.
@@ -452,7 +452,7 @@ def test_click_plugin_does_nothing_when_click_not_installed(build_plugin_graph, 
             def helper(): pass
             """,
         },
-        [ClickPlugin()],
+        [native.NativePlugin.click()],
     )
     assert "pkg.mod.helper" not in reachable_fqnames(graph)
 
@@ -473,7 +473,7 @@ def test_click_plugin_ignores_relative_imports_and_unrelated_names(
             def helper(): pass
             """,
         },
-        [ClickPlugin()],
+        [native.NativePlugin.click()],
     )
     assert "cli.main.helper" not in reachable_fqnames(graph)
 
@@ -482,8 +482,8 @@ def test_click_plugin_no_groups_when_click_imported_but_unused(
     build_plugin_graph, reachable_fqnames
 ):
     """A file that imports ``click`` but never declares a group is a
-    no-op for the plugin (and the early-return after ``_find_instances``
-    is exercised)."""
+    no-op for the plugin (exercising the early return when no group
+    declarations or constructions are found)."""
     graph = build_plugin_graph(
         {
             "cli/__init__.py": "",
@@ -495,7 +495,7 @@ def test_click_plugin_no_groups_when_click_imported_but_unused(
             def helper(): pass
             """,
         },
-        [ClickPlugin()],
+        [native.NativePlugin.click()],
     )
     assert "cli.main.helper" not in reachable_fqnames(graph)
 
@@ -510,7 +510,7 @@ def test_click_plugin_ignores_non_group_assignment_shapes(build_plugin_graph, re
             import click
             from click import Group
 
-            # Multi-target -- ignored by _single_target_assignment
+            # Multi-target -- ignored by single-target assignment matching
             x = y = Group("x")
 
             # Tuple unpacking -- not a Name target
@@ -548,7 +548,7 @@ def test_click_plugin_ignores_non_group_assignment_shapes(build_plugin_graph, re
                 cli()
             """,
         },
-        [MainBlockPlugin(), ClickPlugin()],
+        [MainBlockPlugin(), native.NativePlugin.click()],
     )
     reached = reachable_fqnames(graph)
     assert "cli.main.cli" in reached
@@ -568,4 +568,11 @@ def test_click_plugin_loads_via_cli_loader():
     from dead_cst.cli import _load_plugin
 
     plugin = _load_plugin("click")
-    assert isinstance(plugin, ClickPlugin)
+    assert isinstance(plugin, native.NativePlugin)
+    assert plugin.name == "click"
+
+
+def test_click_plugin_factory_returns_native_plugin():
+    plugin = native.NativePlugin.click()
+    assert isinstance(plugin, native.NativePlugin)
+    assert plugin.name == "click"

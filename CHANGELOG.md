@@ -187,6 +187,13 @@ two versions.
   `find_*` queries. Behaviour is identical. Because each framework is now an
   independent project-wide native plugin, the Python-side automatic batching
   of multiple `DispatchAppPlugin` instances is retired.
+- **`click` ported to a native plugin.** The `click` built-in is now a native
+  `NativePlugin.click()`, resolved through the same Rust registry. Unlike the
+  dispatch-app frameworks it keeps its own implementation: Click groups never
+  seed themselves as entrypoints (reach them via `[project.scripts]` /
+  `__main__` / `add_command`), and a `@<group>.group()` handler is promoted to
+  a group through a fixpoint so nested sub-commands wire transitively.
+  Behaviour is identical.
 - **Per-file native plugins now run inside the build pipeline.** Their
   salsa-cached file-local ops are warmed during the parallel (GIL-released)
   file fan-out and folded into the graph during serial assembly, instead of a
@@ -209,6 +216,9 @@ two versions.
   native factories (`NativePlugin.flask()` … `NativePlugin.celery()`); the CLI
   keys (`flask`, `fastapi`, `typer`, `cyclopts`, `slack_bolt`, `fastmcp`,
   `celery`) already resolve to them.
+- The Python `ClickPlugin` (`dead_cst.contrib.ClickPlugin`). `click` is now
+  native-only: use `NativePlugin.click()` (the CLI's `click` key already
+  resolves to it).
 
 #### Query DSL — SymbolNode terminals and SymbolNode-taking sugar
 - `SubclassQuery.collect()`, `ImportQuery.collect()`, `ClassQuery.collect()`,
