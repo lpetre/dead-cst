@@ -194,6 +194,17 @@ two versions.
   `__main__` / `add_command`), and a `@<group>.group()` handler is promoted to
   a group through a fixpoint so nested sub-commands wire transitively.
   Behaviour is identical.
+- **Remaining built-in plugins ported to native.** The `mock_patch`,
+  `discordpy`, `pytest`, `project_scripts`, and `dynamic_import_fallback`
+  built-ins are now native `NativePlugin` instances resolved through the same
+  Rust registry (`NativePlugin.mock_patch()` …
+  `NativePlugin.dynamic_import_fallback()`, or the matching `--plugin` keys).
+  The explicit-entrypoint plugin is likewise native —
+  `NativePlugin.explicit(regexes, str_specs, abs_paths)`, which the CLI drives
+  from `-e` / `--entrypoint-regex` (it is not a `--plugin` key). Behaviour is
+  identical. With this, every built-in plugin is native and the CLI's Python
+  `_BUILTIN_PLUGINS` map is empty (kept only as the fall-through slot for
+  out-of-tree Python plugins).
 - **Per-file native plugins now run inside the build pipeline.** Their
   salsa-cached file-local ops are warmed during the parallel (GIL-released)
   file fan-out and folded into the graph during serial assembly, instead of a
@@ -219,6 +230,16 @@ two versions.
 - The Python `ClickPlugin` (`dead_cst.contrib.ClickPlugin`). `click` is now
   native-only: use `NativePlugin.click()` (the CLI's `click` key already
   resolves to it).
+- The Python standalone plugins — `dead_cst.plugins.DynamicImportFallbackPlugin`,
+  `ExplicitEntrypointPlugin`, and `ProjectScriptsPlugin`, plus
+  `dead_cst.contrib.MockPatchPlugin`, `PytestPlugin`, and `DiscordPyPlugin`. Use
+  the native factories (`NativePlugin.dynamic_import_fallback()`,
+  `NativePlugin.explicit(…)`, `NativePlugin.project_scripts()`,
+  `NativePlugin.mock_patch()`, `NativePlugin.pytest()`, `NativePlugin.discordpy()`);
+  the CLI keys already resolve to them (and `-e` / `--entrypoint-regex` drive
+  `explicit`). `dead_cst.plugins.__all__` drops `DynamicImportFallbackPlugin` /
+  `ExplicitEntrypointPlugin` / `ProjectScriptsPlugin`; `dead_cst.contrib.__all__`
+  is now just `UnittestPlugin`.
 
 #### Query DSL — SymbolNode terminals and SymbolNode-taking sugar
 - `SubclassQuery.collect()`, `ImportQuery.collect()`, `ClassQuery.collect()`,

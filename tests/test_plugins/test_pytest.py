@@ -1,9 +1,9 @@
-"""Tests for :class:`PytestPlugin`."""
+"""Tests for the native ``pytest`` plugin."""
 
 from __future__ import annotations
 
+from dead_cst import _native as native
 from dead_cst.graph import NodeFlags
-from dead_cst.contrib import PytestPlugin
 
 
 def test_pytest_plugin_marks_test_functions(build_plugin_graph, reachable_fqnames):
@@ -16,7 +16,7 @@ def test_pytest_plugin_marks_test_functions(build_plugin_graph, reachable_fqname
             def helper(): pass
             """,
         },
-        [PytestPlugin()],
+        [native.NativePlugin.pytest()],
     )
     reached = reachable_fqnames(graph)
     assert "tests.test_things.test_one" in reached
@@ -31,7 +31,7 @@ def test_pytest_plugin_recognizes_underscore_test_suffix(build_plugin_graph, rea
             "pkg/__init__.py": "",
             "pkg/things_test.py": "def test_one(): pass",
         },
-        [PytestPlugin()],
+        [native.NativePlugin.pytest()],
     )
     assert "pkg.things_test.test_one" in reachable_fqnames(graph)
 
@@ -47,7 +47,7 @@ def test_pytest_plugin_marks_test_classes(build_plugin_graph, reachable_fqnames)
                 pass
             """,
         },
-        [PytestPlugin()],
+        [native.NativePlugin.pytest()],
     )
     reached = reachable_fqnames(graph)
     assert "tests.test_cls.TestThing" in reached
@@ -71,7 +71,7 @@ def test_pytest_plugin_marks_conftest_decls(build_plugin_graph, reachable_fqname
             collect_ignore = ["legacy.py"]
             """,
         },
-        [PytestPlugin()],
+        [native.NativePlugin.pytest()],
     )
     reached = reachable_fqnames(graph)
     assert "tests.conftest.my_fixture" in reached
@@ -110,7 +110,7 @@ def test_pytest_plugin_marks_decorated_fixtures_outside_conftest(
                 return 4
             """,
         },
-        [PytestPlugin()],
+        [native.NativePlugin.pytest()],
     )
     reached = reachable_fqnames(graph)
     assert "tests.fixtures.bare_fixture" in reached
@@ -140,7 +140,7 @@ def test_pytest_plugin_emits_test_to_fixture_edge(build_plugin_graph):
                 assert my_fixture == 1
             """,
         },
-        [PytestPlugin()],
+        [native.NativePlugin.pytest()],
     )
     nodes = graph.nodes()
     by_fqname = {n.fqname: i for i, n in enumerate(nodes)}
@@ -163,7 +163,7 @@ def test_pytest_plugin_unrelated_param_no_edge(build_plugin_graph):
                 pass
             """,
         },
-        [PytestPlugin()],
+        [native.NativePlugin.pytest()],
     )
     # No fixture ⇒ no edge out of test_uses_builtin.
     nodes = graph.nodes()
@@ -196,7 +196,7 @@ def test_pytest_plugin_class_method_pulls_fixture_alive(build_plugin_graph, reac
                     assert class_only_fixture == 1
             """,
         },
-        [PytestPlugin()],
+        [native.NativePlugin.pytest()],
     )
     reached = reachable_fqnames(graph)
     assert "tests.fixtures.class_only_fixture" in reached
@@ -223,7 +223,7 @@ def test_pytest_plugin_emits_class_to_fixture_edge(build_plugin_graph):
                 def test_b(self): pass
             """,
         },
-        [PytestPlugin()],
+        [native.NativePlugin.pytest()],
     )
     nodes = graph.nodes()
     by_fqname = {n.fqname: i for i, n in enumerate(nodes)}
@@ -258,7 +258,7 @@ def test_pytest_plugin_class_self_cls_excluded(build_plugin_graph):
                 def test_b(cls): pass
             """,
         },
-        [PytestPlugin()],
+        [native.NativePlugin.pytest()],
     )
     nodes = graph.nodes()
     by_fqname = {n.fqname: i for i, n in enumerate(nodes)}
@@ -291,7 +291,7 @@ def test_pytest_plugin_fixture_name_kwarg_alias(build_plugin_graph):
                 assert alias == 1
             """,
         },
-        [PytestPlugin()],
+        [native.NativePlugin.pytest()],
     )
     nodes = graph.nodes()
     by_fqname = {n.fqname: i for i, n in enumerate(nodes)}
@@ -316,7 +316,7 @@ def test_pytest_plugin_conftest_fixture_unused_stays_alive(build_plugin_graph, r
                 return 1
             """,
         },
-        [PytestPlugin()],
+        [native.NativePlugin.pytest()],
     )
     reached = reachable_fqnames(graph)
     # No test even uses it — conftest seed still keeps it alive.
@@ -332,7 +332,7 @@ def test_pytest_plugin_ignores_non_test_modules(build_plugin_graph, reachable_fq
             class TestData: pass
             """,
         },
-        [PytestPlugin()],
+        [native.NativePlugin.pytest()],
     )
     reached = reachable_fqnames(graph)
     # ``utils.py`` isn't a pytest-discovered file even though its symbols
@@ -345,7 +345,8 @@ def test_pytest_plugin_loads_via_cli_loader():
     from dead_cst.cli import _load_plugin
 
     plugin = _load_plugin("pytest")
-    assert isinstance(plugin, PytestPlugin)
+    assert isinstance(plugin, native.NativePlugin)
+    assert plugin.name == "PytestPlugin"
 
 
 def test_pytest_plugin_tags_seeds_as_testcase(build_plugin_graph):
@@ -360,7 +361,7 @@ def test_pytest_plugin_tags_seeds_as_testcase(build_plugin_graph):
             def my_fixture(): return 1
             """,
         },
-        [PytestPlugin()],
+        [native.NativePlugin.pytest()],
     )
     seeds = [n for n in graph.nodes() if n.flags & NodeFlags.TESTCASE]
     assert seeds, "expected pytest plugin to seed at least one TESTCASE node"

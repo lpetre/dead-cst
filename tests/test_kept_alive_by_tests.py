@@ -10,8 +10,9 @@ touch it.
 from __future__ import annotations
 
 from dead_cst import NodeFlags
+from dead_cst import _native as native
 from dead_cst.graph import KEEPALIVE_DEFAULT
-from dead_cst.contrib import PytestPlugin, UnittestPlugin
+from dead_cst.contrib import UnittestPlugin
 
 
 def find_reachable_excluding_tests(graph):
@@ -40,7 +41,7 @@ def test_test_only_helper_is_kept_alive_by_tests(make_analysis, write_files):
             """,
         }
     )
-    graph = make_analysis(plugins=[PytestPlugin()]).materialize_all()
+    graph = make_analysis(plugins=[native.NativePlugin.pytest()]).materialize_all()
     helper = next(n for n in graph.nodes() if n.fqname == "pkg.lib.helper")
     assert helper in set(graph.reachable(seed_flags=KEEPALIVE_DEFAULT))
     assert helper not in find_reachable_excluding_tests(graph)
@@ -69,7 +70,9 @@ def test_production_only_decl_survives_strict_pass(make_analysis, write_files):
     )
     from dead_cst.plugins import MainBlockPlugin
 
-    graph = make_analysis(plugins=[MainBlockPlugin(), PytestPlugin()]).materialize_all()
+    graph = make_analysis(
+        plugins=[MainBlockPlugin(), native.NativePlugin.pytest()]
+    ).materialize_all()
     helper = next(n for n in graph.nodes() if n.fqname == "pkg.lib.helper")
     # ``MainBlockPlugin`` keeps it alive without any test seed.
     assert helper in find_reachable_excluding_tests(graph)
@@ -109,7 +112,7 @@ def test_analysis_method_returns_strict_diff(make_analysis, write_files):
             """,
         }
     )
-    analysis = make_analysis(plugins=[PytestPlugin()])
+    analysis = make_analysis(plugins=[native.NativePlugin.pytest()])
     blast = analysis.kept_alive_by_flags_only(NodeFlags.TESTCASE)
     ctx = analysis.materialize_all()
     fqnames = {a.fqname for a in ctx.node_attrs(list(blast))}

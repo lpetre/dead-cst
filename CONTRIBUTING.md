@@ -129,12 +129,14 @@ my_plugin = "myproj.plugins:MyPlugin"
 The CLI's `_load_plugin` checks `_BUILTIN_PLUGINS` first, then the
 entry-point group.
 
-`DiscordPyPlugin` is a good reference for a Python framework plugin
-(a `DecoratedDeclPlugin` subclass wiring bot-instance → handler
-edges). Click and the dispatch-app frameworks (Flask / FastAPI /
-Typer / Cyclopts / Slack Bolt / FastMCP / Celery) are native plugins
-— see `ClickPluginImpl` and `DispatchAppPluginImpl` in
-`runtime/src/native_plugins.rs`.
+The reusable `DecoratedDeclPlugin` / `LiteralListPlugin` shapes in
+`dead_cst/plugins/decl_shapes.py` are the reference scaffolding for a
+Python framework plugin (decorated-decl → handler edges, or
+`<owner>.<var> = [...]` literal lists). Every in-tree framework plugin
+is now native — Click and the dispatch-app frameworks (Flask / FastAPI
+/ Typer / Cyclopts / Slack Bolt / FastMCP / Celery), plus pytest,
+mock_patch, and discordpy — see `ClickPluginImpl`,
+`DispatchAppPluginImpl`, and friends in `runtime/src/native_plugins.rs`.
 
 ### Native plugins
 

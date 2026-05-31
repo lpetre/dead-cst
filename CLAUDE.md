@@ -108,7 +108,7 @@ Implement `PathResolver`: `resolve(project_root) -> tuple[Package, ...]`. Drop g
 
 ## Known limitations to keep in mind
 
-- `import *` is treated pessimistically (every top-level decl in the target is considered used) by default. `__import__('m')` and `importlib.import_module('m')` calls with a string-literal name emit `EdgeFlags.DYNAMIC_IMPORT` edges; opt into per-name fan-out with `DynamicImportFallbackPlugin`.
+- `import *` is treated pessimistically (every top-level decl in the target is considered used) by default. `__import__('m')` and `importlib.import_module('m')` calls with a string-literal name emit `EdgeFlags.DYNAMIC_IMPORT` edges; opt into per-name fan-out with `NativePlugin.dynamic_import_fallback()`.
 - Dynamic attribute access (`getattr`) and runtime-generated symbols are invisible to static analysis.
 - `__all__` is followed only when assigned a list/tuple of string literals.
 - ty has a `TODO walrus in comprehensions is implicitly nonlocal` so walrus-in-comprehension target bindings don't leak to the enclosing module scope yet (see `tests/test_limitations.py`).

@@ -223,14 +223,14 @@ Typer / Cyclopts / Slack Bolt / FastMCP / Celery) is a native
 (Rust) plugin — `NativePlugin.flask()` … `NativePlugin.celery()` —
 not a Python base.
 
-Builtins ship in `cli._BUILTIN_PLUGINS` (Python) and
-`native._builtin_native_plugin` (Rust). Generic-Python plugins live
-in `dead_cst/plugins/` (`MainBlockPlugin`, `ProjectScriptsPlugin`,
-`ExplicitEntrypointPlugin`, `ModuleDundersPlugin`,
-`InitSubclassPlugin`, `DynamicImportFallbackPlugin`); framework-aware
-Python plugins live in `dead_cst/contrib/` (Click, pytest, unittest,
-DiscordPy, MockPatch). The dispatch-app frameworks and `server_config`
-are native (see `native._builtin_native_plugin`).
+Every builtin is now a native (Rust) plugin, resolved through
+`native._builtin_native_plugin` (consulted first by the CLI's
+`_load_plugin`); `cli._BUILTIN_PLUGINS` (Python) is empty, kept only
+as the fall-through slot for out-of-tree Python plugins. A few Python
+plugins survive in `dead_cst/plugins/` (`MainBlockPlugin`,
+`ModuleDundersPlugin`, `InitSubclassPlugin`) and `dead_cst/contrib/`
+(`UnittestPlugin`) purely as native-parity test twins; they go when
+the Python `Plugin` ABC is removed.
 
 ### 5. Reachability — `Analysis.reachable` and friends
 

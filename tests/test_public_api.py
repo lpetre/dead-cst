@@ -35,17 +35,14 @@ EXPECTED_PUBLIC_API: dict[str, list[str]] = {
     ],
     "dead_cst.plugins": [
         "DecoratedDeclPlugin",
-        "DynamicImportFallbackPlugin",
         "EXTERNAL_DIST_PREFIX",
         "EXTERNAL_FILE_PREFIX",
         "EXTERNAL_PREFIXES",
-        "ExplicitEntrypointPlugin",
         "InitSubclassPlugin",
         "LiteralListPlugin",
         "MainBlockPlugin",
         "ModuleDundersPlugin",
         "Plugin",
-        "ProjectScriptsPlugin",
         "STDLIB_PREFIX",
         "SYNTHETIC_PATH_PREFIXES",
         "UNPARSEABLE_PREFIX",
@@ -53,9 +50,6 @@ EXPECTED_PUBLIC_API: dict[str, list[str]] = {
         "simple_name",
     ],
     "dead_cst.contrib": [
-        "DiscordPyPlugin",
-        "MockPatchPlugin",
-        "PytestPlugin",
         "UnittestPlugin",
     ],
 }

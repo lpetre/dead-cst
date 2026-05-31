@@ -1,7 +1,6 @@
 """Cold-path perf breakdown by plugin on the rust backend.
 
-For every builtin plugin that supports the rust ``ProjectPlugin``
-protocol (i.e. exposes ``run(ctx)``), measure
+For every built-in native plugin, measure
 ``ProjectContext.materialize()`` wall-clock with that plugin enabled
 versus the no-plugins baseline. Reports the delta so the per-plugin
 cost is comparable across targets.
@@ -18,11 +17,12 @@ Usage:
     uv run python scripts/profile_plugins_cold.py --targets flux0_workspace
     uv run python scripts/profile_plugins_cold.py --plugins click pytest fastapi
 
-Plugins without a ``run(ctx)`` method (``UnittestPlugin``,
-``MockPatchPlugin``, ``DiscordPyPlugin`` today) are listed as
-``SKIP``. The rust extension must be importable; if it's not the
-script exits with a clear error since the libcst path is irrelevant
-to a cold-rust profile.
+Every built-in plugin is now native (Rust), resolved by its CLI name
+through ``dead_cst._native._builtin_native_plugin``. The ``explicit``
+plugin is intentionally absent — it's driven by ``-e`` /
+``--entrypoint-regex``, not ``--plugin``. The rust extension must be
+importable; if it's not the script exits with a clear error since the
+libcst path is irrelevant to a cold-rust profile.
 """
 
 from __future__ import annotations
@@ -41,7 +41,6 @@ from _bench_common import (
     require_native,
     stage_dead_cst,
 )
-from dead_cst.cli import _BUILTIN_PLUGINS as BUILTIN_PLUGINS
 
 # Silence the visitor's WARNING-level breadcrumbs (e.g.
 # ``importlib.import_module(<not-a-literal>)``) — useful in normal
@@ -56,45 +55,42 @@ from dead_cst import _native as native  # noqa: E402  (require_native gates this
 # Plugin set
 # ---------------------------------------------------------------------------
 
+# Every built-in plugin is now native. These are the CLI ``--plugin``
+# names resolved through ``native._builtin_native_plugin``. ``explicit``
+# is intentionally absent (driven by ``-e`` / ``--entrypoint-regex``).
+_BUILTIN_NATIVE_PLUGIN_NAMES = (
+    "main_block",
+    "module_dunders",
+    "init_subclass",
+    "server_config",
+    "unittest",
+    "flask",
+    "fastapi",
+    "typer",
+    "cyclopts",
+    "slack_bolt",
+    "fastmcp",
+    "celery",
+    "click",
+    "mock_patch",
+    "discordpy",
+    "pytest",
+    "project_scripts",
+    "dynamic_import_fallback",
+)
 
-def _plugin_label(plugin: object) -> str:
-    """Human-readable label for one builtin plugin instance.
 
-    Class name alone is ambiguous for the shared
-    :class:`DecoratedDeclPlugin` shape — multiple frameworks reuse the
-    same class with different field values. Suffix with the most
-    identifying field so the report distinguishes the instances.
-    """
-    base = type(plugin).__qualname__
-    decorator_module = getattr(plugin, "decorator_module", None)
-    if decorator_module:
-        return f"{base}({decorator_module})"
-    return base
-
-
-def _rust_capable_plugins(filter_names: set[str] | None) -> list[tuple[str, object]]:
-    """Return ``[(label, plugin_instance)]`` for every builtin plugin
-    with a ``run(ctx)`` method. Optionally filtered by class qualname."""
+def _native_builtin_plugins(filter_names: set[str] | None) -> list[tuple[str, object]]:
+    """Return ``[(name, native_plugin)]`` for every built-in native
+    plugin, optionally filtered by CLI registry name."""
     out: list[tuple[str, object]] = []
-    for plugin in BUILTIN_PLUGINS.values():
-        label = _plugin_label(plugin)
-        if filter_names is not None and label not in filter_names:
+    for name in _BUILTIN_NATIVE_PLUGIN_NAMES:
+        if filter_names is not None and name not in filter_names:
             continue
-        if not hasattr(plugin, "run"):
+        plugin = native._builtin_native_plugin(name)
+        if plugin is None:
             continue
-        out.append((label, plugin))
-    return out
-
-
-def _skipped_plugins(filter_names: set[str] | None) -> list[str]:
-    """Builtin plugins explicitly missing rust support."""
-    out: list[str] = []
-    for plugin in BUILTIN_PLUGINS.values():
-        label = _plugin_label(plugin)
-        if filter_names is not None and label not in filter_names:
-            continue
-        if not hasattr(plugin, "run"):
-            out.append(label)
+        out.append((name, plugin))
     return out
 
 
@@ -107,11 +103,10 @@ def _materialize_once(target: TargetConfig, plugin: object | None) -> float:
     """One cold iteration: fresh ProjectContext, optionally one plugin,
     materialize(), return wall-clock seconds.
 
-    Reuses the configured ``BUILTIN_PLUGINS`` instance — each rust-capable
-    builtin is already a ready-to-use, default-configured plugin
-    (``ExplicitEntrypointPlugin`` has ``specs=[]``, which makes it a
-    no-op but still pays the ``run()`` dispatch cost — that's what we
-    want to measure)."""
+    Reuses the default-configured native plugin instance resolved from
+    ``native._builtin_native_plugin`` — each is ready to add to a
+    context and pays its real per-plugin dispatch cost, which is what we
+    want to measure."""
     ctx = native.ProjectContext(str(target.root), **target.project_kwargs)
     if plugin is not None:
         ctx.add_plugin(plugin)
@@ -207,14 +202,11 @@ def main() -> None:
     args = parser.parse_args()
 
     filter_names = set(args.plugins) if args.plugins else None
-    plugins = _rust_capable_plugins(filter_names)
-    skipped = _skipped_plugins(filter_names)
+    plugins = _native_builtin_plugins(filter_names)
 
     print(f"python: {sys.version.split()[0]}")
     print(f"repeats: {args.repeats}")
     print(f"plugins measured: {len(plugins)}")
-    if skipped:
-        print(f"plugins SKIP (no rust run()): {', '.join(skipped)}")
 
     targets: list[TargetConfig] = []
     if "dead_cst" in args.targets:

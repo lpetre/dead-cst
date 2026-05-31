@@ -1,8 +1,8 @@
-"""Tests for :class:`DiscordPyPlugin`."""
+"""Tests for the native ``discordpy`` plugin."""
 
 from __future__ import annotations
 
-from dead_cst.contrib import DiscordPyPlugin
+from dead_cst import _native as native
 
 
 def test_discordpy_plugin_marks_bot_command_handlers(build_plugin_graph, reachable_fqnames):
@@ -29,7 +29,7 @@ def test_discordpy_plugin_marks_bot_command_handlers(build_plugin_graph, reachab
             def helper(): pass
             """,
         },
-        [DiscordPyPlugin()],
+        [native.NativePlugin.discordpy()],
     )
     reached = reachable_fqnames(graph)
     assert "app.main.bot" in reached
@@ -58,7 +58,7 @@ def test_discordpy_plugin_marks_slash_command_tree_handlers(build_plugin_graph, 
                 pass
             """,
         },
-        [DiscordPyPlugin()],
+        [native.NativePlugin.discordpy()],
     )
     reached = reachable_fqnames(graph)
     assert "app.main.slash_ping" in reached
@@ -79,7 +79,7 @@ def test_discordpy_plugin_handles_direct_client(build_plugin_graph, reachable_fq
                 pass
             """,
         },
-        [DiscordPyPlugin()],
+        [native.NativePlugin.discordpy()],
     )
     reached = reachable_fqnames(graph)
     assert "app.main.client" in reached
@@ -100,7 +100,7 @@ def test_discordpy_plugin_handles_aliased_class_import(build_plugin_graph, reach
                 pass
             """,
         },
-        [DiscordPyPlugin()],
+        [native.NativePlugin.discordpy()],
     )
     assert "app.main.ping" in reachable_fqnames(graph)
 
@@ -123,7 +123,7 @@ def test_discordpy_plugin_handles_autosharded_variants(build_plugin_graph, reach
             async def on_ready(): pass
             """,
         },
-        [DiscordPyPlugin()],
+        [native.NativePlugin.discordpy()],
     )
     reached = reachable_fqnames(graph)
     assert "app.main.b_cmd" in reached
@@ -149,7 +149,7 @@ def test_discordpy_plugin_keeps_cog_class_alive(build_plugin_graph, reachable_fq
                 await bot.add_cog(Greetings(bot))
             """,
         },
-        [DiscordPyPlugin()],
+        [native.NativePlugin.discordpy()],
     )
     reached = reachable_fqnames(graph)
     # Cog class + module-level setup function both kept alive by the
@@ -175,7 +175,7 @@ def test_discordpy_plugin_marks_teardown_alongside_setup(build_plugin_graph, rea
                 await bot.remove_cog("Admin")
             """,
         },
-        [DiscordPyPlugin()],
+        [native.NativePlugin.discordpy()],
     )
     reached = reachable_fqnames(graph)
     assert "cogs.admin.Admin" in reached
@@ -196,7 +196,7 @@ def test_discordpy_plugin_setup_without_cog_stays_dead(build_plugin_graph, reach
                 pass
             """,
         },
-        [DiscordPyPlugin()],
+        [native.NativePlugin.discordpy()],
     )
     assert "pkg.helpers.setup" not in reachable_fqnames(graph)
 
@@ -237,7 +237,7 @@ def test_discordpy_plugin_load_extension_pulls_target_module(build_plugin_graph,
                 pass
             """,
         },
-        [DiscordPyPlugin()],
+        [native.NativePlugin.discordpy()],
     )
     reached = reachable_fqnames(graph)
     assert "app.cogs.greet" in reached
@@ -269,7 +269,7 @@ def test_discordpy_plugin_load_extension_non_literal_dropped(build_plugin_graph,
                 pass
             """,
         },
-        [DiscordPyPlugin()],
+        [native.NativePlugin.discordpy()],
     )
     # Non-literal argument is dropped silently; nothing keeps the cog alive.
     assert "app.cogs.dynamic.setup" not in reachable_fqnames(graph)
@@ -294,7 +294,7 @@ def test_discordpy_plugin_ignores_unrelated_bare_decorators(build_plugin_graph, 
             def not_a_handler(): pass
             """,
         },
-        [DiscordPyPlugin()],
+        [native.NativePlugin.discordpy()],
     )
     assert "pkg.mod.not_a_handler" not in reachable_fqnames(graph)
 
@@ -321,7 +321,7 @@ def test_discordpy_plugin_ignores_files_without_discord_imports(
                 pass
             """,
         },
-        [DiscordPyPlugin()],
+        [native.NativePlugin.discordpy()],
     )
     assert "pkg.target.setup" not in reachable_fqnames(graph)
 
@@ -348,7 +348,7 @@ def test_discordpy_plugin_handler_dependencies_stay_alive(build_plugin_graph, re
                 await ctx.send(render_greeting())
             """,
         },
-        [DiscordPyPlugin()],
+        [native.NativePlugin.discordpy()],
     )
     reached = reachable_fqnames(graph)
     assert "app.main.hello" in reached
@@ -362,4 +362,5 @@ def test_discordpy_plugin_loads_via_cli_loader():
     from dead_cst.cli import _load_plugin
 
     plugin = _load_plugin("discordpy")
-    assert isinstance(plugin, DiscordPyPlugin)
+    assert isinstance(plugin, native.NativePlugin)
+    assert plugin.name == "DiscordPyPlugin"

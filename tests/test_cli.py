@@ -30,8 +30,8 @@ from dead_cst.cli import (
     parse_meta,
     setup_logging,
 )
+from dead_cst import _native as native
 from dead_cst.graph import GraphMetadata, SymbolNode, read_graph
-from dead_cst.plugins import ExplicitEntrypointPlugin
 
 
 def _plugin_name(p) -> str:
@@ -135,21 +135,19 @@ def test_build_plugins_appends_explicit_last():
         "ExplicitEntrypointPlugin",
     ]
     explicit = plugins[-1]
-    assert isinstance(explicit, ExplicitEntrypointPlugin)
-    assert explicit.specs == ["pkg.foo"]
+    assert isinstance(explicit, native.NativePlugin)
+    assert explicit.name == "ExplicitEntrypointPlugin"
 
 
 def test_build_plugins_compiles_entrypoint_regex():
-    import re
-
     plugins = build_plugins(
         entrypoints=[],
         entrypoint_regexes=[".*main.*"],
         plugin_names=[],
     )
     explicit = plugins[-1]
-    assert isinstance(explicit, ExplicitEntrypointPlugin)
-    assert isinstance(explicit.specs[0], re.Pattern)
+    assert isinstance(explicit, native.NativePlugin)
+    assert explicit.name == "ExplicitEntrypointPlugin"
 
 
 def test_build_plugins_unknown_plugin_name_raises():
