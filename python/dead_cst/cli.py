@@ -582,6 +582,26 @@ def _dylib_name(stem: str) -> str:
     return f"lib{stem}{_dylib_suffix()}"
 
 
+# Curated allowlist of runtime deps exposed to plugin authors via `rustc
+# --extern` in `build-plugin`. Each must be a *direct* dependency of the runtime
+# crate (so its `.rlib` is guaranteed in the compile closure). The rest of the
+# runtime's transitive dep tree is intentionally NOT a stable surface — exposing
+# it would leak ruff/ty's private deps as a de-facto public API.
+_PLUGIN_EXTERN_CRATES = ("serde_json", "regex")
+
+
+def _crate_key(filename: str) -> str:
+    """Crate name from a cargo ``deps/`` artifact filename, dropping the SVH
+    suffix: ``libserde_json-1a2b3c4d.rlib`` (or ``.dylib`` / ``.so`` for a
+    proc-macro) -> ``serde_json``. Cargo names every dep artifact
+    ``lib<crate>-<hash>.<ext>``, so strip the ``lib`` prefix, the extension, and
+    the trailing ``-<hash>``."""
+    stem = filename.rsplit(".", 1)[0]
+    if stem.startswith("lib"):
+        stem = stem[3:]
+    return stem.rsplit("-", 1)[0]
+
+
 def _prefer_dynamic_link_args(std_lib: Path) -> list[str]:
     """The ``-Wl,...`` linker args (without the ``-C link-arg=`` prefix) that
     make a ``prefer-dynamic`` artifact defer host symbols and find libstd + its
@@ -698,9 +718,10 @@ def build_plugin(
     Prints the plugin path on stdout; load it with
     ``native.load_native_plugins(<path>)``.
 
-    ``serde_json`` is wired in via ``--extern`` for plugin authors (``use
-    serde_json::Value;`` works out of the box); the rest of the runtime's
-    private dependency tree is intentionally not exposed.
+    A curated allowlist of runtime deps (``serde_json``, ``regex``) is wired in
+    via ``--extern`` for plugin authors (``use serde_json::Value;`` / ``use
+    regex::Regex;`` work out of the box); the rest of the runtime's private
+    dependency tree is intentionally not exposed.
 
     Needs the pinned rust toolchain (the ABI fingerprint rejects a mismatch at
     load) and the dynamic-runtime wheel (``pip install dead-cst[build-plugin]``).
@@ -756,17 +777,19 @@ def build_plugin(
     crate_name = name.replace("-", "_")
     out = output.resolve() if output is not None else Path.cwd() / _dylib_name(crate_name)
 
-    # Curated allowlist: expose serde_json to plugin authors (it's pinned as a
-    # direct runtime dep, so its rlib is always in the closure). Newest wins if a
-    # deps dir holds stale copies; absent (unexpected) → skip rather than fail.
-    serde_json_externs: list[str] = []
-    serde_json_rlibs = sorted(dep_dir.glob("libserde_json-*.rlib"), key=lambda p: p.stat().st_mtime)
-    if serde_json_rlibs:
-        serde_json_externs = ["--extern", f"serde_json={serde_json_rlibs[-1]}"]
-    elif verbose:
-        typer.echo(
-            "note: serde_json rlib not found in dep dir; --extern serde_json skipped.", err=True
-        )
+    # Curated allowlist (`_PLUGIN_EXTERN_CRATES`): expose these direct runtime
+    # deps to plugin authors via `--extern` (their rlibs are always in the
+    # closure). Newest wins if a deps dir holds stale SVH-suffixed copies; an
+    # absent crate (unexpected) is skipped rather than fatal.
+    exposed_externs: list[str] = []
+    for crate in _PLUGIN_EXTERN_CRATES:
+        rlibs = sorted(dep_dir.glob(f"lib{crate}-*.rlib"), key=lambda p: p.stat().st_mtime)
+        if rlibs:
+            exposed_externs += ["--extern", f"{crate}={rlibs[-1]}"]
+        elif verbose:
+            typer.echo(
+                f"note: {crate} rlib not found in dep dir; --extern {crate} skipped.", err=True
+            )
 
     # --extern reads the runtime dylib's embedded metadata; -L finds the dep
     # rlibs/proc-macro dylibs; undefined Python + runtime symbols resolve from
@@ -783,7 +806,7 @@ def build_plugin(
         "prefer-dynamic",
         "--extern",
         f"dead_cst_runtime={runtime_dylib}",
-        *serde_json_externs,
+        *exposed_externs,
         "-L",
         f"dependency={dep_dir}",
         *(
@@ -876,8 +899,17 @@ def bundle_plugin_host(
     # the dynamic `_native`, and libstd are EXCLUDED — they ship in the base
     # `dead_cst` wheel. (.rmeta are skipped: redundant with the .rlib, which
     # embed metadata, and would nearly double the payload.)
+    #
+    # Dedup by (crate, kind): cargo's deps/ accumulates multiple SVH-suffixed
+    # artifacts per crate across incremental rebuilds (this target dir is reused,
+    # not cleaned, to keep rebuilds fast). Ship exactly one per (crate, kind) —
+    # the newest, which is the set this build's runtime dylib actually binds
+    # against (mtime is a faithful proxy right after a successful build).
+    # Without this, stale copies (e.g. a second `regex` rlib) leak in and bloat
+    # the wheel — and a `--extern <crate>` glob in `build-plugin` could pick the
+    # wrong SVH.
     excluded = {_dylib_name("dead_cst_runtime"), _dylib_name("dead_cst_native")}
-    n_files = 0
+    newest: dict[tuple[str, str], Path] = {}
     for entry in deps_dir.iterdir():
         if not entry.is_file():
             continue
@@ -887,8 +919,14 @@ def bundle_plugin_host(
             and not entry.name.startswith("libstd-")
         )
         if entry.suffix == ".rlib" or is_proc_macro:
-            shutil.copy2(entry, bundle / entry.name)
-            n_files += 1
+            key = (_crate_key(entry.name), entry.suffix)
+            cur = newest.get(key)
+            if cur is None or entry.stat().st_mtime > cur.stat().st_mtime:
+                newest[key] = entry
+    n_files = 0
+    for entry in newest.values():
+        shutil.copy2(entry, bundle / entry.name)
+        n_files += 1
 
     typer.echo(f"plugin-host closure: {bundle}  (deps build: {deps_dir})", err=True)
     typer.echo(

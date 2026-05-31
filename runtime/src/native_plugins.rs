@@ -1371,6 +1371,32 @@ pub mod plugin_api {
             })
             .unwrap_or_default()
         }
+
+        /// Attr-method twin of [`PluginCtx::calls_with_string_arg`]: calls of
+        /// the form `<recv>.<attr>(...)` — *any* receiver shape
+        /// (`bot.load_extension(x)`, `self.bot.load_extension(x)`,
+        /// `get_bot().load_extension(x)`) — whose argument at `arg_index` is a
+        /// string literal. A list/tuple of string literals fans out to one row
+        /// per element. Returns `(owning_decl_idx, literal)` — the top-level
+        /// decl whose body makes the call (module-scope calls map to the module
+        /// node) and the literal's value. Keyed on the method name, so the
+        /// receiver is the plugin's concern (typically gated by a per-file
+        /// import check); the attr twin of
+        /// `query(ctx).calls().where_attr(attr).string_arg_at(arg_index)`. Calls
+        /// whose arg isn't a string literal (or string collection) are skipped.
+        pub fn calls_on_attr(&self, attr: &str, arg_index: usize) -> Vec<(usize, String)> {
+            Python::with_gil(|py| {
+                self.inner
+                    .find_calls_on_attr(py, attr, arg_index, None, false)
+            })
+            .map(|triples| {
+                triples
+                    .into_iter()
+                    .map(|(idx, literal, _args)| (idx, literal))
+                    .collect()
+            })
+            .unwrap_or_default()
+        }
     }
 
     /// Op sink for external plugins. Wraps the internal `PreparedOp` vec so

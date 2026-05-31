@@ -139,20 +139,25 @@ two versions.
   closed: `PluginCtx` gains `find_subclasses_of_fqn(base_fqn, transitive)`
   (subclass search by string FQN, not just an in-graph index),
   `handler_decorators(&[attr])` (functions decorated `@<owner>.<attr>(...)`,
-  paired with their owner), and `calls_with_string_arg(modules, name,
+  paired with their owner), `calls_with_string_arg(modules, name,
   arg_index)` (calls to an imported callable paired with a string-literal
-  positional argument); `PluginOps::add_synthetic_node` now takes a source
+  positional argument), and `calls_on_attr(attr, arg_index)` (its attr-method
+  twin — `<recv>.<attr>(...)` calls of any receiver shape paired with a
+  string-literal positional argument, mirroring
+  `query(ctx).calls().where_attr(...).string_arg_at(...)`);
+  `PluginOps::add_synthetic_node` now takes a source
   `path` (empty for a placeless marker) so a project-wide synthetic node can
   be attributed to a file. On the Python side, `NativePlugin.dispatch_app(name,
   marker_prefix, app_classes, registration_decorators, seed_as_entrypoint)`
   exposes the generic engine behind `flask()` … `celery()`, so a custom
   framework can be wired without a bespoke plugin (the celery `@shared_task`
   fan-out stays internal to `celery()`).
-- **`serde_json` is available to external plugin authors.** It is pinned as a
-  direct runtime dependency so its `.rlib` is always in the plugin-compile
-  closure, and `dead-cst build-plugin` wires `--extern serde_json` so a plugin
-  can `use serde_json::Value;` out of the box. The rest of the runtime's
-  private dependency tree is intentionally not exposed.
+- **`serde_json` and `regex` are available to external plugin authors.** Both
+  are pinned as direct runtime dependencies so their `.rlib`s are always in the
+  plugin-compile closure, and `dead-cst build-plugin` wires `--extern serde_json`
+  / `--extern regex` from a curated allowlist so a plugin can `use
+  serde_json::Value;` / `use regex::Regex;` out of the box. The rest of the
+  runtime's private dependency tree is intentionally not exposed.
 
 ### Changed
 
@@ -231,6 +236,12 @@ SymbolNode- and idx-form terminals on the same query.
 
 ### Fixed
 
+- `dead-cst bundle-plugin-host` no longer ships duplicate dependency archives.
+  Cargo's `deps/` directory accumulates multiple SVH-suffixed artifacts per
+  crate across incremental rebuilds, and the closure copy previously shipped all
+  of them (e.g. two `regex` rlibs), bloating the `dead-cst-plugin-host` payload.
+  The closure is now deduplicated to exactly one artifact per `(crate, kind)` —
+  the newest, which is the set this build's runtime dylib binds against.
 - Uses inside an assignment whose target is a subscript or slice
   (`os.environ["k"] = v`, `f[:] = [SomeClass()]`) are no longer
   dropped. Such a target binds no name, so ty mints no Definition and
