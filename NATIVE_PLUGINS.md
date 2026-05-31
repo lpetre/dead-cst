@@ -268,6 +268,16 @@ straight away. `build-plugin` finds the runtime dylib inside the installed
 options. (In a dev/static checkout there's no in-package runtime dylib, so
 `build-plugin` needs a dynamic wheel installed first.)
 
+### Dependencies available to a plugin
+
+`build-plugin` wires `--extern serde_json` for you, so a plugin can pull in
+`serde_json` directly (e.g. `use serde_json::Value;`) to parse config or
+metadata — it's pinned into the compile closure for exactly this. The rest of
+the runtime's transitive dependency tree is *not* exposed as a stable surface:
+it ships in the closure (so the runtime itself links), but its crates and
+versions are an implementation detail and may change between releases. Build on
+`dead_cst_runtime` and `serde_json` only.
+
 ---
 
 ## The ABI airlock

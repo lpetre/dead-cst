@@ -698,6 +698,10 @@ def build_plugin(
     Prints the plugin path on stdout; load it with
     ``native.load_native_plugins(<path>)``.
 
+    ``serde_json`` is wired in via ``--extern`` for plugin authors (``use
+    serde_json::Value;`` works out of the box); the rest of the runtime's
+    private dependency tree is intentionally not exposed.
+
     Needs the pinned rust toolchain (the ABI fingerprint rejects a mismatch at
     load) and the dynamic-runtime wheel (``pip install dead-cst[build-plugin]``).
     Compiles a single ``.rs`` (multi-crate plugins are a follow-up); macOS + Linux.
@@ -752,6 +756,18 @@ def build_plugin(
     crate_name = name.replace("-", "_")
     out = output.resolve() if output is not None else Path.cwd() / _dylib_name(crate_name)
 
+    # Curated allowlist: expose serde_json to plugin authors (it's pinned as a
+    # direct runtime dep, so its rlib is always in the closure). Newest wins if a
+    # deps dir holds stale copies; absent (unexpected) → skip rather than fail.
+    serde_json_externs: list[str] = []
+    serde_json_rlibs = sorted(dep_dir.glob("libserde_json-*.rlib"), key=lambda p: p.stat().st_mtime)
+    if serde_json_rlibs:
+        serde_json_externs = ["--extern", f"serde_json={serde_json_rlibs[-1]}"]
+    elif verbose:
+        typer.echo(
+            "note: serde_json rlib not found in dep dir; --extern serde_json skipped.", err=True
+        )
+
     # --extern reads the runtime dylib's embedded metadata; -L finds the dep
     # rlibs/proc-macro dylibs; undefined Python + runtime symbols resolve from
     # the (already-loaded, shared) runtime at load.
@@ -767,6 +783,7 @@ def build_plugin(
         "prefer-dynamic",
         "--extern",
         f"dead_cst_runtime={runtime_dylib}",
+        *serde_json_externs,
         "-L",
         f"dependency={dep_dir}",
         *(

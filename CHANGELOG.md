@@ -133,6 +133,26 @@ two versions.
 - `native.ProjectContext.clear_plugins()` and `reset_progress()` —
   internal helpers `re_materialize` uses to keep plugin registrations
   and progress counters from leaking across calls.
+- **External plugin read/write API reaches `query(ctx)` parity, plus a
+  configurable `dispatch_app` factory.** The remaining gaps between the
+  external Rust `plugin_api` surface and the Python `query(ctx)` DSL are
+  closed: `PluginCtx` gains `find_subclasses_of_fqn(base_fqn, transitive)`
+  (subclass search by string FQN, not just an in-graph index),
+  `handler_decorators(&[attr])` (functions decorated `@<owner>.<attr>(...)`,
+  paired with their owner), and `calls_with_string_arg(modules, name,
+  arg_index)` (calls to an imported callable paired with a string-literal
+  positional argument); `PluginOps::add_synthetic_node` now takes a source
+  `path` (empty for a placeless marker) so a project-wide synthetic node can
+  be attributed to a file. On the Python side, `NativePlugin.dispatch_app(name,
+  marker_prefix, app_classes, registration_decorators, seed_as_entrypoint)`
+  exposes the generic engine behind `flask()` … `celery()`, so a custom
+  framework can be wired without a bespoke plugin (the celery `@shared_task`
+  fan-out stays internal to `celery()`).
+- **`serde_json` is available to external plugin authors.** It is pinned as a
+  direct runtime dependency so its `.rlib` is always in the plugin-compile
+  closure, and `dead-cst build-plugin` wires `--extern serde_json` so a plugin
+  can `use serde_json::Value;` out of the box. The rest of the runtime's
+  private dependency tree is intentionally not exposed.
 
 ### Changed
 

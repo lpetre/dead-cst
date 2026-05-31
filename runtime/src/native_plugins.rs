@@ -85,12 +85,11 @@ pub(crate) trait NativePluginImpl: Send + Sync {
     /// events). Should match the conventional name of the equivalent
     /// Python plugin so existing harness logs read the same.
     //
-    // Retained alongside the [`NativePluginKind::ProjectWide`] path for
-    // future native plugins whose logic spans files (subclass walks,
-    // dispatch handlers). The bundled `MainBlockPlugin` moved to the
-    // per-file path, so no impl uses this today.
+    // Borrowed (not `&'static`) so an impl can own a runtime-built name —
+    // the custom `DispatchAppPluginImpl` carries a caller-supplied `String`.
+    // The bundled impls still return string literals.
     #[allow(dead_code)]
-    fn name(&self) -> &'static str;
+    fn name(&self) -> &str;
 
     /// Walk the frozen ``ctx`` and append the plugin's ops to
     /// ``sink``. Same frozen-graph contract as the Python path: the
@@ -801,14 +800,14 @@ impl NativePlugin {
     /// (a handler and its app may live in different files).
     #[staticmethod]
     fn flask() -> Self {
-        Self::dispatch_app("flask", FLASK_CONFIG)
+        Self::from_dispatch_config("flask".to_string(), flask_config())
     }
 
     /// Native FastAPI dispatch-app plugin (port of
     /// `dead_cst.contrib.fastapi.fastapi_plugin`).
     #[staticmethod]
     fn fastapi() -> Self {
-        Self::dispatch_app("fastapi", FASTAPI_CONFIG)
+        Self::from_dispatch_config("fastapi".to_string(), fastapi_config())
     }
 
     /// Native Typer dispatch-app plugin (port of
@@ -816,7 +815,7 @@ impl NativePlugin {
     /// entrypoint-promoted, so unused sub-typers surface as dead.
     #[staticmethod]
     fn typer() -> Self {
-        Self::dispatch_app("typer", TYPER_CONFIG)
+        Self::from_dispatch_config("typer".to_string(), typer_config())
     }
 
     /// Native cyclopts dispatch-app plugin (port of
@@ -824,7 +823,7 @@ impl NativePlugin {
     /// :meth:`typer`).
     #[staticmethod]
     fn cyclopts() -> Self {
-        Self::dispatch_app("cyclopts", CYCLOPTS_CONFIG)
+        Self::from_dispatch_config("cyclopts".to_string(), cyclopts_config())
     }
 
     /// Native Slack Bolt dispatch-app plugin (port of
@@ -832,7 +831,7 @@ impl NativePlugin {
     /// sync `App` and async `AsyncApp` bases.
     #[staticmethod]
     fn slack_bolt() -> Self {
-        Self::dispatch_app("slack_bolt", SLACK_BOLT_CONFIG)
+        Self::from_dispatch_config("slack_bolt".to_string(), slack_bolt_config())
     }
 
     /// Native FastMCP dispatch-app plugin (port of
@@ -840,7 +839,7 @@ impl NativePlugin {
     /// `fastmcp` package and the MCP SDK's `mcp.server.fastmcp` layer.
     #[staticmethod]
     fn fastmcp() -> Self {
-        Self::dispatch_app("fastmcp", FASTMCP_CONFIG)
+        Self::from_dispatch_config("fastmcp".to_string(), fastmcp_config())
     }
 
     /// Native Celery dispatch-app plugin (port of
@@ -848,14 +847,50 @@ impl NativePlugin {
     /// additionally fans out appless `@shared_task` callables as entrypoints.
     #[staticmethod]
     fn celery() -> Self {
-        Self::dispatch_app("celery", CELERY_CONFIG)
+        Self::from_dispatch_config("celery".to_string(), celery_config())
+    }
+
+    /// Build a dispatch-app plugin from a caller-supplied config — the
+    /// generalized form behind :meth:`flask` … :meth:`celery`, for a
+    /// framework `dead-cst` doesn't bundle. `name` labels the plugin in
+    /// progress logs; `marker_prefix` namespaces the synthetic entrypoint /
+    /// factory nodes it mints. `app_classes` are dotted fqnames of the
+    /// application classes (e.g. `["myframework.App"]`) whose instances —
+    /// and transitive subclasses — anchor handler wiring;
+    /// `registration_decorators` are the bare method names a handler is
+    /// decorated with on such an instance (`@app.route` → `"route"`).
+    ///
+    /// When `seed_as_entrypoint` is true the discovered app instances (and
+    /// factory functions returning them) are themselves kept alive — the
+    /// web/task-framework default (flask/fastapi/celery). Pass false for a
+    /// pure-dispatch CLI (typer/cyclopts), where an unused app surfaces as
+    /// dead. The celery-style appless `@shared_task` fan-out is not exposed
+    /// here; use :meth:`celery`.
+    #[staticmethod]
+    fn dispatch_app(
+        name: String,
+        marker_prefix: String,
+        app_classes: Vec<String>,
+        registration_decorators: Vec<String>,
+        seed_as_entrypoint: bool,
+    ) -> Self {
+        Self::from_dispatch_config(
+            name,
+            DispatchAppConfig {
+                marker_prefix,
+                app_classes,
+                registration_decorators,
+                seed_as_entrypoint,
+                shared_task: None,
+            },
+        )
     }
 }
 
 impl NativePlugin {
-    /// Wrap a baked [`DispatchAppConfig`] in a project-wide native plugin.
-    /// Shared by the per-framework factories above; not exposed to Python.
-    fn dispatch_app(name: &'static str, config: DispatchAppConfig) -> Self {
+    /// Wrap a [`DispatchAppConfig`] in a project-wide native plugin. Shared by
+    /// the per-framework factories and the custom `dispatch_app` factory.
+    fn from_dispatch_config(name: String, config: DispatchAppConfig) -> Self {
         Self {
             kind: NativePluginKind::ProjectWide(Box::new(DispatchAppPluginImpl { name, config })),
         }
@@ -1172,6 +1207,18 @@ pub mod plugin_api {
                 .unwrap_or_default()
         }
 
+        /// Subclasses of the class named by dotted `base_fqn`, resolved
+        /// through ty's module resolver — so the base may live in another
+        /// file or a dependency (e.g. `"unittest.TestCase"`). `transitive`
+        /// walks the whole hierarchy; `false` returns only direct subclasses.
+        /// The by-fqname twin of [`Self::find_subclasses_of`] (which takes a
+        /// node index); mirrors `query(ctx).subclasses().of_fqn(...)`. Empty
+        /// when nothing resolves.
+        pub fn find_subclasses_of_fqn(&self, base_fqn: &str, transitive: bool) -> Vec<usize> {
+            Python::with_gil(|py| self.inner.find_subclasses_indices(py, base_fqn, transitive))
+                .unwrap_or_default()
+        }
+
         // --- reachability ---------------------------------------------------
 
         /// Forward closure: every node reachable from `root_idx` by
@@ -1276,6 +1323,54 @@ pub mod plugin_api {
             .map(|triples| triples.into_iter().map(|(idx, _, _)| idx).collect())
             .unwrap_or_default()
         }
+
+        /// Top-level functions decorated `@<owner>.<attr>(...)` where `attr`
+        /// is one of `decorator_attrs`. Returns `(owner_name, decl_idx)` —
+        /// the raw textual decorator owner (`"app"` for `@app.route`, *not*
+        /// resolved to a node: the caller decides which owners map to real
+        /// framework instances) and the decorated decl's node index. The
+        /// owner-attr twin of `query(ctx).decorators().where_owner_attr(...)`;
+        /// the read the dispatch-app / click handler wiring is built on.
+        /// Multiple matching decorators on one function yield multiple rows.
+        pub fn handler_decorators(&self, decorator_attrs: &[&str]) -> Vec<(String, usize)> {
+            let attrs: Vec<String> = decorator_attrs.iter().map(|s| s.to_string()).collect();
+            Python::with_gil(|py| self.inner.find_handler_decorators(py, attrs, None, false))
+                .map(|triples| {
+                    triples
+                        .into_iter()
+                        .map(|(owner, idx, _args)| (owner, idx))
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+
+        /// Calls to `name` (imported from one of `modules`) whose argument at
+        /// position `arg_index` is a string literal. Returns
+        /// `(owning_decl_idx, literal)` — the top-level decl whose body makes
+        /// the call (module-scope calls map to the module node) and the
+        /// literal's value. The string-arg twin of
+        /// `query(ctx).calls(...).string_arg_at(...)`; powers FQN/path-string
+        /// reads like `mock.patch("pkg.mod.target")`. Calls whose arg isn't a
+        /// plain string literal are skipped.
+        pub fn calls_with_string_arg(
+            &self,
+            modules: &[&str],
+            name: &str,
+            arg_index: usize,
+        ) -> Vec<(usize, String)> {
+            let modules_owned: Vec<String> = modules.iter().map(|m| m.to_string()).collect();
+            Python::with_gil(|py| {
+                self.inner
+                    .find_calls_to_imported(py, &modules_owned, name, arg_index, None, false)
+            })
+            .map(|triples| {
+                triples
+                    .into_iter()
+                    .map(|(idx, literal, _args)| (idx, literal))
+                    .collect()
+            })
+            .unwrap_or_default()
+        }
     }
 
     /// Op sink for external plugins. Wraps the internal `PreparedOp` vec so
@@ -1314,15 +1409,17 @@ pub mod plugin_api {
             });
         }
 
-        /// Mint a new `kind="synthetic"` node named `fqname` with `flags`
-        /// (see [`FLAG_ENTRYPOINT`]), an out-edge to each index in
-        /// `edges_to_idx`, and an in-edge from each index in
-        /// `edges_from_idx`. Mirrors `AddNodeByIdx`; the host bounds-checks
-        /// every endpoint at apply time and rejects a dangling index
-        /// rather than minting an unconnected node.
+        /// Mint a new `kind="synthetic"` node named `fqname`, attributed to
+        /// source `path` (empty for a placeless marker), with `flags` (see
+        /// [`FLAG_ENTRYPOINT`]), an out-edge to each index in `edges_to_idx`,
+        /// and an in-edge from each index in `edges_from_idx`. Mirrors
+        /// `AddNodeByIdx`; the host bounds-checks every endpoint at apply time
+        /// and rejects a dangling index rather than minting an unconnected
+        /// node.
         pub fn add_synthetic_node(
             &mut self,
             fqname: String,
+            path: String,
             flags: u32,
             edges_to_idx: Vec<usize>,
             edges_from_idx: Vec<usize>,
@@ -1330,7 +1427,7 @@ pub mod plugin_api {
             self.sink.push(PreparedOp::NodeByIdx {
                 fqname,
                 kind: intern_kind("synthetic").expect("'synthetic' is a valid kind"),
-                path: String::new(),
+                path,
                 flags,
                 edges_from_idx,
                 edges_to_idx,
@@ -1574,7 +1671,13 @@ pub mod plugin_api {
         #[test]
         fn plugin_ops_add_synthetic_node_carries_edges_from() {
             let mut ops = PluginOps::new();
-            ops.add_synthetic_node("syn".to_string(), FLAG_ENTRYPOINT, vec![3], vec![4, 5]);
+            ops.add_synthetic_node(
+                "syn".to_string(),
+                "pkg/mod.py".to_string(),
+                FLAG_ENTRYPOINT,
+                vec![3],
+                vec![4, 5],
+            );
             let sink = ops.into_inner();
             let [PreparedOp::NodeByIdx {
                 fqname,
@@ -1589,7 +1692,7 @@ pub mod plugin_api {
             };
             assert_eq!(fqname, "syn");
             assert_eq!(*kind, "synthetic");
-            assert!(path.is_empty());
+            assert_eq!(path, "pkg/mod.py");
             assert_eq!(*flags, FLAG_ENTRYPOINT);
             assert_eq!(edges_to_idx.as_slice(), &[3]);
             assert_eq!(edges_from_idx.as_slice(), &[4, 5]);
@@ -1803,7 +1906,7 @@ impl PerFileNativePluginImpl for ModuleDundersPluginImpl {
 pub(crate) struct InitSubclassPluginImpl;
 
 impl NativePluginImpl for InitSubclassPluginImpl {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "InitSubclassPlugin"
     }
 
@@ -1907,7 +2010,7 @@ fn server_config_run_on_file(
 pub(crate) struct UnittestPluginImpl;
 
 impl NativePluginImpl for UnittestPluginImpl {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "UnittestPlugin"
     }
 
@@ -2010,26 +2113,29 @@ impl NativePluginImpl for UnittestPluginImpl {
 /// (imported from `module`) is kept alive via one `<marker_prefix><basename>`
 /// entrypoint per file. `None` for non-celery configs.
 struct SharedTaskFanout {
-    module: &'static str,
-    names: &'static [&'static str],
-    marker_prefix: &'static str,
+    module: String,
+    names: Vec<String>,
+    marker_prefix: String,
 }
 
 /// Pure-data description of a dispatch-app framework — the Rust twin of the
 /// Python `DispatchAppSpec` (plus the optional celery `shared_task` extension).
-/// The seven bundled configs are baked as `const` instances below.
+/// The seven bundled framework configs are built by the `*_config()` helpers
+/// below; the Python `NativePlugin.dispatch_app(...)` factory builds one from
+/// caller-supplied values (owned, so the config need not be `'static`).
 pub(crate) struct DispatchAppConfig {
-    marker_prefix: &'static str,
-    app_classes: &'static [&'static str],
-    registration_decorators: &'static [&'static str],
+    marker_prefix: String,
+    app_classes: Vec<String>,
+    registration_decorators: Vec<String>,
     seed_as_entrypoint: bool,
     shared_task: Option<SharedTaskFanout>,
 }
 
 /// Project-wide native plugin wrapping a [`DispatchAppConfig`]. One instance
-/// per framework, constructed via the `NativePlugin::flask()` &c. factories.
+/// per framework, constructed via the `NativePlugin::flask()` &c. factories
+/// or the custom `NativePlugin::dispatch_app(...)` factory.
 pub(crate) struct DispatchAppPluginImpl {
-    name: &'static str,
+    name: String,
     config: DispatchAppConfig,
 }
 
@@ -2042,7 +2148,7 @@ impl DispatchAppPluginImpl {
         if cfg.app_classes.is_empty() || cfg.registration_decorators.is_empty() {
             return Ok(false);
         }
-        for &fqn in cfg.app_classes {
+        for fqn in &cfg.app_classes {
             if let Some((module, _)) = fqn.rsplit_once('.') {
                 if !module.is_empty() && ctx.has_imports_of(module)? {
                     return Ok(true);
@@ -2067,8 +2173,8 @@ fn simple_name(fqname: &str) -> &str {
 }
 
 impl NativePluginImpl for DispatchAppPluginImpl {
-    fn name(&self) -> &'static str {
-        self.name
+    fn name(&self) -> &str {
+        &self.name
     }
 
     fn run(&self, ctx: &ProjectContext, sink: &mut Vec<PreparedOp>) -> PyResult<()> {
@@ -2085,7 +2191,7 @@ impl NativePluginImpl for DispatchAppPluginImpl {
             // module_to_names: {module -> {ctor simple name}}, expanded
             // transitively over subclasses of each app class.
             let mut module_to_names: FxHashMap<String, FxHashSet<String>> = FxHashMap::default();
-            for &fqn in cfg.app_classes {
+            for fqn in &cfg.app_classes {
                 if let Some((module, name)) = fqn.rsplit_once('.') {
                     if !module.is_empty() && !name.is_empty() {
                         module_to_names
@@ -2095,7 +2201,7 @@ impl NativePluginImpl for DispatchAppPluginImpl {
                     }
                 }
             }
-            for &fqn in cfg.app_classes {
+            for fqn in &cfg.app_classes {
                 let sub_idxs = ctx.find_subclasses_indices(py, fqn, true)?;
                 if sub_idxs.is_empty() {
                     continue;
@@ -2157,11 +2263,7 @@ impl NativePluginImpl for DispatchAppPluginImpl {
             }
 
             // handlers: `@<owner>.<reg_decorator>(...)`-decorated functions.
-            let reg_decorators: Vec<String> = cfg
-                .registration_decorators
-                .iter()
-                .map(|&s| s.to_string())
-                .collect();
+            let reg_decorators: Vec<String> = cfg.registration_decorators.clone();
             let handlers: Vec<(String, usize)> = ctx
                 .find_handler_decorators(py, reg_decorators, None, false)?
                 .into_iter()
@@ -2187,8 +2289,8 @@ impl NativePluginImpl for DispatchAppPluginImpl {
             // shared_task (celery): `@shared_task`-decorated decls.
             let shared_idxs: Vec<usize> = match &cfg.shared_task {
                 Some(st) => {
-                    let modules = [st.module.to_string()];
-                    let names: Vec<String> = st.names.iter().map(|&s| s.to_string()).collect();
+                    let modules = [st.module.clone()];
+                    let names: Vec<String> = st.names.clone();
                     ctx.find_decorated_decls(py, &modules, names, None, false)?
                         .into_iter()
                         .map(|(decl_idx, _args)| decl_idx)
@@ -2346,113 +2448,133 @@ impl NativePluginImpl for DispatchAppPluginImpl {
 // frameworks; the pure-dispatch CLIs (typer / cyclopts) set it false.
 // ---------------------------------------------------------------------------
 
-const FLASK_CONFIG: DispatchAppConfig = DispatchAppConfig {
-    marker_prefix: "flask",
-    app_classes: &["flask.Flask"],
-    registration_decorators: &[
-        "route",
-        "get",
-        "post",
-        "put",
-        "delete",
-        "patch",
-        "before_request",
-        "after_request",
-        "teardown_request",
-        "teardown_appcontext",
-        "before_first_request",
-        "before_app_request",
-        "after_app_request",
-        "teardown_app_request",
-        "before_app_first_request",
-        "errorhandler",
-        "app_errorhandler",
-        "context_processor",
-        "app_context_processor",
-        "template_filter",
-        "app_template_filter",
-        "template_test",
-        "app_template_test",
-        "template_global",
-        "app_template_global",
-        "url_value_preprocessor",
-        "app_url_value_preprocessor",
-        "url_defaults",
-        "app_url_defaults",
-        "shell_context_processor",
-        "record",
-        "record_once",
-    ],
-    seed_as_entrypoint: true,
-    shared_task: None,
-};
+/// Own a slice of string literals as a `Vec<String>` — keeps the baked
+/// config builders below readable now that the fields are owned.
+fn owned(items: &[&str]) -> Vec<String> {
+    items.iter().map(|s| (*s).to_string()).collect()
+}
 
-const FASTAPI_CONFIG: DispatchAppConfig = DispatchAppConfig {
-    marker_prefix: "fastapi",
-    app_classes: &["fastapi.FastAPI"],
-    registration_decorators: &[
-        "get",
-        "post",
-        "put",
-        "delete",
-        "patch",
-        "options",
-        "head",
-        "trace",
-        "api_route",
-        "websocket",
-        "websocket_route",
-        "middleware",
-        "exception_handler",
-        "on_event",
-    ],
-    seed_as_entrypoint: true,
-    shared_task: None,
-};
+fn flask_config() -> DispatchAppConfig {
+    DispatchAppConfig {
+        marker_prefix: "flask".to_string(),
+        app_classes: owned(&["flask.Flask"]),
+        registration_decorators: owned(&[
+            "route",
+            "get",
+            "post",
+            "put",
+            "delete",
+            "patch",
+            "before_request",
+            "after_request",
+            "teardown_request",
+            "teardown_appcontext",
+            "before_first_request",
+            "before_app_request",
+            "after_app_request",
+            "teardown_app_request",
+            "before_app_first_request",
+            "errorhandler",
+            "app_errorhandler",
+            "context_processor",
+            "app_context_processor",
+            "template_filter",
+            "app_template_filter",
+            "template_test",
+            "app_template_test",
+            "template_global",
+            "app_template_global",
+            "url_value_preprocessor",
+            "app_url_value_preprocessor",
+            "url_defaults",
+            "app_url_defaults",
+            "shell_context_processor",
+            "record",
+            "record_once",
+        ]),
+        seed_as_entrypoint: true,
+        shared_task: None,
+    }
+}
 
-const TYPER_CONFIG: DispatchAppConfig = DispatchAppConfig {
-    marker_prefix: "typer",
-    app_classes: &["typer.Typer"],
-    registration_decorators: &["command", "callback"],
-    seed_as_entrypoint: false,
-    shared_task: None,
-};
+fn fastapi_config() -> DispatchAppConfig {
+    DispatchAppConfig {
+        marker_prefix: "fastapi".to_string(),
+        app_classes: owned(&["fastapi.FastAPI"]),
+        registration_decorators: owned(&[
+            "get",
+            "post",
+            "put",
+            "delete",
+            "patch",
+            "options",
+            "head",
+            "trace",
+            "api_route",
+            "websocket",
+            "websocket_route",
+            "middleware",
+            "exception_handler",
+            "on_event",
+        ]),
+        seed_as_entrypoint: true,
+        shared_task: None,
+    }
+}
 
-const CYCLOPTS_CONFIG: DispatchAppConfig = DispatchAppConfig {
-    marker_prefix: "cyclopts",
-    app_classes: &["cyclopts.App"],
-    registration_decorators: &["command", "default"],
-    seed_as_entrypoint: false,
-    shared_task: None,
-};
+fn typer_config() -> DispatchAppConfig {
+    DispatchAppConfig {
+        marker_prefix: "typer".to_string(),
+        app_classes: owned(&["typer.Typer"]),
+        registration_decorators: owned(&["command", "callback"]),
+        seed_as_entrypoint: false,
+        shared_task: None,
+    }
+}
 
-const SLACK_BOLT_CONFIG: DispatchAppConfig = DispatchAppConfig {
-    marker_prefix: "slack-bolt",
-    app_classes: &["slack_bolt.App", "slack_bolt.async_app.AsyncApp"],
-    registration_decorators: &[
-        "event", "message", "command", "action", "shortcut", "view", "options", "error", "step",
-        "function",
-    ],
-    seed_as_entrypoint: true,
-    shared_task: None,
-};
+fn cyclopts_config() -> DispatchAppConfig {
+    DispatchAppConfig {
+        marker_prefix: "cyclopts".to_string(),
+        app_classes: owned(&["cyclopts.App"]),
+        registration_decorators: owned(&["command", "default"]),
+        seed_as_entrypoint: false,
+        shared_task: None,
+    }
+}
 
-const FASTMCP_CONFIG: DispatchAppConfig = DispatchAppConfig {
-    marker_prefix: "fastmcp",
-    app_classes: &["fastmcp.FastMCP", "mcp.server.fastmcp.FastMCP"],
-    registration_decorators: &["tool", "resource", "prompt", "completion"],
-    seed_as_entrypoint: true,
-    shared_task: None,
-};
+fn slack_bolt_config() -> DispatchAppConfig {
+    DispatchAppConfig {
+        marker_prefix: "slack-bolt".to_string(),
+        app_classes: owned(&["slack_bolt.App", "slack_bolt.async_app.AsyncApp"]),
+        registration_decorators: owned(&[
+            "event", "message", "command", "action", "shortcut", "view", "options", "error",
+            "step", "function",
+        ]),
+        seed_as_entrypoint: true,
+        shared_task: None,
+    }
+}
 
-const CELERY_CONFIG: DispatchAppConfig = DispatchAppConfig {
-    marker_prefix: "celery",
-    app_classes: &["celery.Celery"],
-    registration_decorators: &["task"],
-    seed_as_entrypoint: true,
-    shared_task: Some(SharedTaskFanout {
-        module: "celery",
-        names: &["shared_task"],
-        marker_prefix: "<celery-shared>:",
-    }),
-};
+fn fastmcp_config() -> DispatchAppConfig {
+    DispatchAppConfig {
+        marker_prefix: "fastmcp".to_string(),
+        app_classes: owned(&["fastmcp.FastMCP", "mcp.server.fastmcp.FastMCP"]),
+        registration_decorators: owned(&["tool", "resource", "prompt", "completion"]),
+        seed_as_entrypoint: true,
+        shared_task: None,
+    }
+}
+
+fn celery_config() -> DispatchAppConfig {
+    DispatchAppConfig {
+        marker_prefix: "celery".to_string(),
+        app_classes: owned(&["celery.Celery"]),
+        registration_decorators: owned(&["task"]),
+        seed_as_entrypoint: true,
+        shared_task: Some(SharedTaskFanout {
+            module: "celery".to_string(),
+            names: owned(&["shared_task"]),
+            marker_prefix: "<celery-shared>:".to_string(),
+        }),
+    }
+}
