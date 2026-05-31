@@ -13,7 +13,6 @@ use ruff_db::files::File;
 use rustc_hash::{FxHashMap, FxHashSet};
 use ty_project::Db as ProjectDb;
 
-use crate::graph::SymbolNode;
 use crate::helpers::{
     call_args_match_kwargs, file_path_string, kwarg_matcher_from_py, KwargMatcher,
 };
@@ -230,8 +229,8 @@ impl QueryBuilder {
     ) -> PyResult<Vec<usize>> {
         let ctx = self.ctx.borrow(py);
         match seed_flags {
-            Some(sf) => ctx.reachable_indices(py, skip_flags, sf),
-            None => ctx.reachable_indices(py, skip_flags, crate::helpers::NODE_FLAG_ENTRYPOINT),
+            Some(sf) => ctx.reachable_indices(skip_flags, sf),
+            None => ctx.reachable_indices(skip_flags, crate::helpers::NODE_FLAG_ENTRYPOINT),
         }
     }
 
@@ -256,7 +255,7 @@ impl QueryBuilder {
         abs_paths: Vec<String>,
     ) -> PyResult<Vec<usize>> {
         let ctx = self.ctx.borrow(py);
-        ctx.find_nodes_matching_specs_indices(py, project_root, regexes, str_specs, abs_paths)
+        ctx.find_nodes_matching_specs_indices(project_root, regexes, str_specs, abs_paths)
     }
 }
 
@@ -640,10 +639,10 @@ impl DecoratorQuery {
         let rows = self.decorator_rows(py)?;
         let ctx = self.ctx.borrow(py);
         let outputs = ctx.materialized("DecoratorQuery.collect")?;
-        let nodes: &[Py<SymbolNode>] = &outputs.builder.nodes;
+        let nodes = &outputs.builder.nodes;
         let mut out: Vec<Py<DecoratorIdxRef>> = Vec::with_capacity(rows.len());
         for row in rows {
-            let path = nodes[row.decorated_idx].borrow(py).path.clone();
+            let path = nodes[row.decorated_idx].path.clone();
             out.push(Py::new(
                 py,
                 DecoratorIdxRef {
@@ -667,10 +666,10 @@ impl DecoratorQuery {
         let rows = self.decorator_rows(py)?;
         let ctx = self.ctx.borrow(py);
         let outputs = ctx.materialized("DecoratorQuery.indices_by_path")?;
-        let nodes: &[Py<SymbolNode>] = &outputs.builder.nodes;
+        let nodes = &outputs.builder.nodes;
         let mut buckets: FxHashMap<String, Vec<usize>> = FxHashMap::default();
         for row in rows {
-            let path = nodes[row.decorated_idx].borrow(py).path.clone();
+            let path = nodes[row.decorated_idx].path.clone();
             buckets.entry(path).or_default().push(row.decorated_idx);
         }
         Ok(buckets)
@@ -737,16 +736,15 @@ impl DecoratorQuery {
                     "DecoratorQuery.in_decl_idx: idx {in_decl_idx} out of range (len={len})"
                 )));
             }
-            let in_decl_ref = outputs.builder.nodes[in_decl_idx].borrow(py);
+            let in_decl_ref = &outputs.builder.nodes[in_decl_idx];
             let decls =
-                ctx.find_decorations_on(py, &in_decl_ref, names.clone(), path_regex, extract_args)?;
+                ctx.find_decorations_on(py, in_decl_ref, names.clone(), path_regex, extract_args)?;
             let owner_simple = in_decl_ref
                 .fqname
                 .rsplit('.')
                 .next()
                 .unwrap_or("")
                 .to_string();
-            drop(in_decl_ref);
             for (decorated_idx, call_args) in decls {
                 if !call_args_match_kwargs(&call_args, kwarg_matchers) {
                     continue;
@@ -888,10 +886,10 @@ impl ConstructionQuery {
         let rows = self.construction_rows(py)?;
         let ctx = self.ctx.borrow(py);
         let outputs = ctx.materialized("ConstructionQuery.collect")?;
-        let nodes: &[Py<SymbolNode>] = &outputs.builder.nodes;
+        let nodes = &outputs.builder.nodes;
         let mut out: Vec<Py<ConstructionIdxRef>> = Vec::with_capacity(rows.len());
         for row in rows {
-            let path = nodes[row.var_idx].borrow(py).path.clone();
+            let path = nodes[row.var_idx].path.clone();
             out.push(Py::new(
                 py,
                 ConstructionIdxRef {
@@ -912,10 +910,10 @@ impl ConstructionQuery {
         let rows = self.construction_rows(py)?;
         let ctx = self.ctx.borrow(py);
         let outputs = ctx.materialized("ConstructionQuery.indices_by_path")?;
-        let nodes: &[Py<SymbolNode>] = &outputs.builder.nodes;
+        let nodes = &outputs.builder.nodes;
         let mut buckets: FxHashMap<String, Vec<usize>> = FxHashMap::default();
         for row in rows {
-            let path = nodes[row.var_idx].borrow(py).path.clone();
+            let path = nodes[row.var_idx].path.clone();
             buckets.entry(path).or_default().push(row.var_idx);
         }
         Ok(buckets)
@@ -1089,10 +1087,10 @@ impl CallQuery {
         let rows = self.call_rows(py)?;
         let ctx = self.ctx.borrow(py);
         let outputs = ctx.materialized("CallQuery.collect")?;
-        let nodes: &[Py<SymbolNode>] = &outputs.builder.nodes;
+        let nodes = &outputs.builder.nodes;
         let mut out: Vec<Py<CallIdxRef>> = Vec::with_capacity(rows.len());
         for row in rows {
-            let path = nodes[row.owner_idx].borrow(py).path.clone();
+            let path = nodes[row.owner_idx].path.clone();
             out.push(Py::new(
                 py,
                 CallIdxRef {
@@ -1113,10 +1111,10 @@ impl CallQuery {
         let rows = self.call_rows(py)?;
         let ctx = self.ctx.borrow(py);
         let outputs = ctx.materialized("CallQuery.indices_by_path")?;
-        let nodes: &[Py<SymbolNode>] = &outputs.builder.nodes;
+        let nodes = &outputs.builder.nodes;
         let mut buckets: FxHashMap<String, Vec<usize>> = FxHashMap::default();
         for row in rows {
-            let path = nodes[row.owner_idx].borrow(py).path.clone();
+            let path = nodes[row.owner_idx].path.clone();
             buckets.entry(path).or_default().push(row.owner_idx);
         }
         Ok(buckets)
@@ -1233,7 +1231,7 @@ impl SubclassQuery {
         if let Some(fqn) = &self.base_fqn {
             ctx.find_subclasses_indices(py, fqn, self.transitive)
         } else if let Some(idx) = self.base_idx {
-            ctx.find_subclasses_of_idx(py, idx)
+            ctx.find_subclasses_of_idx(idx)
         } else {
             Err(PyValueError::new_err(
                 "SubclassQuery requires .of_fqn(...) or .of_idx(...)",
@@ -1419,7 +1417,7 @@ impl ModuleQuery {
     fn indices(&self, py: Python<'_>) -> PyResult<Vec<usize>> {
         let ctx = self.ctx.borrow(py);
         if self.all_dunders {
-            return ctx.find_module_dunders_indices(py);
+            return ctx.find_module_dunders_indices();
         }
         let fqn = self.resolve_fqn(&ctx)?;
         let Some(fqn) = fqn else {
@@ -1430,8 +1428,8 @@ impl ModuleQuery {
                 .find_module_idx(&fqn)?
                 .map(|i| vec![i])
                 .unwrap_or_default()),
-            ModuleTransform::Surface => ctx.module_surface_indices(py, &fqn),
-            ModuleTransform::TopLevel => ctx.find_module_top_level_decls_indices(py, &fqn),
+            ModuleTransform::Surface => ctx.module_surface_indices(&fqn),
+            ModuleTransform::TopLevel => ctx.find_module_top_level_decls_indices(&fqn),
         }
     }
 
@@ -1622,10 +1620,10 @@ impl FactoryQuery {
         let pairs = self.factory_rows(py)?;
         let ctx = self.ctx.borrow(py);
         let outputs = ctx.materialized("FactoryQuery.collect")?;
-        let nodes: &[Py<SymbolNode>] = &outputs.builder.nodes;
+        let nodes = &outputs.builder.nodes;
         let mut out: Vec<Py<FactoryIdxRef>> = Vec::with_capacity(pairs.len());
         for (decl_idx, kinds) in pairs {
-            let path = nodes[decl_idx].borrow(py).path.clone();
+            let path = nodes[decl_idx].path.clone();
             out.push(Py::new(
                 py,
                 FactoryIdxRef {
@@ -1645,10 +1643,10 @@ impl FactoryQuery {
         let pairs = self.factory_rows(py)?;
         let ctx = self.ctx.borrow(py);
         let outputs = ctx.materialized("FactoryQuery.indices_by_path")?;
-        let nodes: &[Py<SymbolNode>] = &outputs.builder.nodes;
+        let nodes = &outputs.builder.nodes;
         let mut buckets: FxHashMap<String, Vec<usize>> = FxHashMap::default();
         for (decl_idx, _kinds) in pairs {
-            let path = nodes[decl_idx].borrow(py).path.clone();
+            let path = nodes[decl_idx].path.clone();
             buckets.entry(path).or_default().push(decl_idx);
         }
         Ok(buckets)
@@ -1737,7 +1735,7 @@ impl EdgeQuery {
     fn index_triples(&self, py: Python<'_>) -> PyResult<Vec<(usize, usize, u32)>> {
         let ctx = self.ctx.borrow(py);
         let outputs = ctx.materialized("EdgeQuery.index_triples")?;
-        let nodes: &[Py<SymbolNode>] = &outputs.builder.nodes;
+        let nodes = &outputs.builder.nodes;
         let edges: &[(usize, usize, u32)] = &outputs.builder.edges;
         let flag_mask = self.flag_mask;
         let src_kind = self.src_kind.as_deref();
@@ -1750,12 +1748,12 @@ impl EdgeQuery {
                 }
             }
             if let Some(needle) = src_kind {
-                if nodes[src_idx].borrow(py).kind != needle {
+                if nodes[src_idx].kind != needle {
                     continue;
                 }
             }
             if let Some(needle) = dst_kind {
-                if nodes[dst_idx].borrow(py).kind != needle {
+                if nodes[dst_idx].kind != needle {
                     continue;
                 }
             }
@@ -2076,7 +2074,7 @@ impl DeclQuery {
                         if !set.insert(child_idx) {
                             continue;
                         }
-                        let child = outputs.builder.nodes[child_idx].borrow(py);
+                        let child = &outputs.builder.nodes[child_idx];
                         if child.kind == "module" {
                             queue.push_back(child.fqname.clone());
                         }
@@ -2086,7 +2084,7 @@ impl DeclQuery {
             });
 
         let mut out = Vec::new();
-        for (node_idx, node_py) in outputs.builder.nodes.iter().enumerate() {
+        for (node_idx, node) in outputs.builder.nodes.iter().enumerate() {
             // fqname-under (cheapest gate first when set — restricts
             // to a tiny candidate set out of all nodes).
             if let Some(set) = &fqname_under_indices {
@@ -2094,7 +2092,6 @@ impl DeclQuery {
                     continue;
                 }
             }
-            let node = node_py.borrow(py);
             // kind
             if let Some(k) = &kinds_set {
                 if !k.contains(node.kind) {

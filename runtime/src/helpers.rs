@@ -22,6 +22,7 @@ use ty_module_resolver::{
 use ty_project::metadata::value::RelativePathBuf;
 use ty_project::{Db as ProjectDb, ProjectDatabase};
 
+use crate::builder::GraphNode;
 use crate::graph::{EdgeFlags, NodeFlags, SymbolNode};
 use crate::ingest::collapse_attribute_chain;
 use crate::project::BuildOutputs;
@@ -119,7 +120,7 @@ pub(crate) fn locate_class_def(
     db: &ProjectDatabase,
     path_to_file: &FxHashMap<String, File>,
     path: &str,
-    class_node: &SymbolNode,
+    class_node: &GraphNode,
 ) -> Option<(File, TextRange)> {
     let &file = path_to_file.get(path)?;
     let parsed = parsed_module(db, file).load(db);
@@ -512,18 +513,17 @@ pub(crate) fn class_def_named<'a>(
 pub(crate) fn locate_class_seed(
     db: &ProjectDatabase,
     outputs: &BuildOutputs,
-    py: Python<'_>,
     fqn: &str,
 ) -> Option<(File, TextRange)> {
     // Project class: cheap path through the existing indices.
     if let Some(idxs) = outputs.decl_by_fqname.get(fqn) {
         for &idx in idxs {
-            let node = outputs.builder.nodes[idx].borrow(py);
+            let node = &outputs.builder.nodes[idx];
             if node.kind != "class" {
                 continue;
             }
             let path = node.path.clone();
-            if let Some(seed) = locate_class_def(db, &outputs.path_to_file, &path, &node) {
+            if let Some(seed) = locate_class_def(db, &outputs.path_to_file, &path, node) {
                 return Some(seed);
             }
         }

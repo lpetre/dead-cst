@@ -1154,7 +1154,7 @@ pub mod plugin_api {
         /// the underlying `SymbolNode`.
         pub fn node(&self, idx: usize) -> Option<NodeView> {
             let outputs = self.inner.materialized("plugin").ok()?;
-            let node = outputs.builder.nodes.get(idx)?.get();
+            let node = outputs.builder.nodes.get(idx)?;
             Some(NodeView {
                 idx,
                 fqname: node.fqname.clone(),
@@ -1196,14 +1196,16 @@ pub mod plugin_api {
         /// Every node whose source path starts with `path_prefix` — a
         /// cheap way to scope a plugin to one package/directory.
         pub fn decls_under(&self, path_prefix: &str) -> Vec<usize> {
-            Python::with_gil(|py| self.inner.decls_under_indices(py, path_prefix))
+            self.inner
+                .decls_under_indices(path_prefix)
                 .unwrap_or_default()
         }
 
         /// Transitive subclasses of the class at `class_idx` (empty when
         /// `class_idx` isn't a class node).
         pub fn find_subclasses_of(&self, class_idx: usize) -> Vec<usize> {
-            Python::with_gil(|py| self.inner.find_subclasses_of_idx(py, class_idx))
+            self.inner
+                .find_subclasses_of_idx(class_idx)
                 .unwrap_or_default()
         }
 
@@ -1265,7 +1267,8 @@ pub mod plugin_api {
         /// surface (honoring `__all__` when present). Empty when the module
         /// isn't found.
         pub fn module_surface(&self, module_fqn: &str) -> Vec<usize> {
-            Python::with_gil(|py| self.inner.module_surface_indices(py, module_fqn))
+            self.inner
+                .module_surface_indices(module_fqn)
                 .unwrap_or_default()
         }
 
@@ -1291,7 +1294,8 @@ pub mod plugin_api {
         /// type_alias) whose simple name matches the regular expression
         /// `pattern`. An invalid pattern yields an empty result.
         pub fn decls_matching_name(&self, pattern: &str) -> Vec<usize> {
-            Python::with_gil(|py| self.inner.decls_matching_name_indices(py, pattern))
+            self.inner
+                .decls_matching_name_indices(pattern)
                 .unwrap_or_default()
         }
 
@@ -1942,7 +1946,7 @@ impl NativePluginImpl for InitSubclassPluginImpl {
             let attrs = ctx.node_attrs(parents.clone())?;
             let synthetic = intern_kind("synthetic").expect("'synthetic' is a valid kind");
             for (parent_idx, attr) in parents.iter().zip(attrs.iter()) {
-                let subclass_idxs = ctx.find_subclasses_of_idx(py, *parent_idx)?;
+                let subclass_idxs = ctx.find_subclasses_of_idx(*parent_idx)?;
                 sink.push(PreparedOp::NodeByIdx {
                     fqname: format!("{INIT_SUBCLASS_PREFIX}{}", attr.fqname),
                     kind: synthetic,
@@ -2071,8 +2075,7 @@ impl NativePluginImpl for UnittestPluginImpl {
         // trailing fqname segment is one of the module hooks.
         {
             let outputs = ctx.materialized("UnittestPlugin")?;
-            for (idx, node_py) in outputs.builder.nodes.iter().enumerate() {
-                let node = node_py.get();
+            for (idx, node) in outputs.builder.nodes.iter().enumerate() {
                 if node.kind != "function" || !importer_paths.contains(node.path.as_str()) {
                     continue;
                 }
@@ -2337,8 +2340,7 @@ impl NativePluginImpl for DispatchAppPluginImpl {
 
             // vars_by_file: (path, simple var name) -> first var idx wins.
             let mut vars_by_file: FxHashMap<(String, String), usize> = FxHashMap::default();
-            for (idx, node_py) in nodes.iter().enumerate() {
-                let node = node_py.get();
+            for (idx, node) in nodes.iter().enumerate() {
                 if node.kind != "variable" {
                     continue;
                 }
@@ -2351,7 +2353,7 @@ impl NativePluginImpl for DispatchAppPluginImpl {
             // direct construction (the latter only under seed_as_entrypoint).
             let mut direct_by_owner: FxHashMap<(String, String), Vec<usize>> = FxHashMap::default();
             for &var_idx in &direct {
-                let node = nodes[var_idx].get();
+                let node = &nodes[var_idx];
                 direct_by_owner
                     .entry((node.path.clone(), simple_name(&node.fqname).to_string()))
                     .or_default()
@@ -2371,7 +2373,7 @@ impl NativePluginImpl for DispatchAppPluginImpl {
             // Step 4: factory markers so step 6's reachability walk can find
             // them. `factory_decls` is empty unless seed_as_entrypoint.
             for (decl_idx, kind) in &factory_decls {
-                let node = nodes[*decl_idx].get();
+                let node = &nodes[*decl_idx];
                 sink.push(PreparedOp::NodeByIdx {
                     fqname: format!("{factory_prefix}{kind}:{}", node.fqname),
                     kind: synthetic,
@@ -2387,7 +2389,7 @@ impl NativePluginImpl for DispatchAppPluginImpl {
             // edges); pure-dispatch mode wires only to direct constructions (so
             // a star-imported `app = App()` stays invisible).
             for (owner, decorated_idx) in &handlers {
-                let key = (nodes[*decorated_idx].get().path.clone(), owner.clone());
+                let key = (nodes[*decorated_idx].path.clone(), owner.clone());
                 if cfg.seed_as_entrypoint {
                     if let Some(&var_idx) = vars_by_file.get(&key) {
                         sink.push(PreparedOp::EdgeByIdx {
@@ -2414,7 +2416,7 @@ impl NativePluginImpl for DispatchAppPluginImpl {
             if cfg.seed_as_entrypoint && !factory_decls.is_empty() {
                 let mut classified: FxHashSet<(String, String)> = FxHashSet::default();
                 for (owner, decorated_idx) in &handlers {
-                    let key = (nodes[*decorated_idx].get().path.clone(), owner.clone());
+                    let key = (nodes[*decorated_idx].path.clone(), owner.clone());
                     if direct_by_owner.contains_key(&key) || classified.contains(&key) {
                         continue;
                     }
@@ -2425,7 +2427,7 @@ impl NativePluginImpl for DispatchAppPluginImpl {
                         continue;
                     }
                     classified.insert(key);
-                    let node = nodes[var_idx].get();
+                    let node = &nodes[var_idx];
                     sink.push(PreparedOp::NodeByIdx {
                         fqname: format!("{app_prefix}{}", node.fqname),
                         kind: synthetic,
@@ -2443,7 +2445,7 @@ impl NativePluginImpl for DispatchAppPluginImpl {
                 let mut by_path: FxHashMap<String, Vec<usize>> = FxHashMap::default();
                 let mut path_order: Vec<String> = Vec::new();
                 for &decl_idx in &shared_idxs {
-                    let path = nodes[decl_idx].get().path.clone();
+                    let path = nodes[decl_idx].path.clone();
                     if !by_path.contains_key(&path) {
                         path_order.push(path.clone());
                     }
