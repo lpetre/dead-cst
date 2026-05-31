@@ -11,7 +11,8 @@ use pyo3::prelude::*;
 use ruff_db::files::File;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::graph::{intern_kind, SymbolNode};
+use crate::file_payload::ImportPayload;
+use crate::graph::{intern_kind, Import, SymbolNode};
 use crate::helpers::NODE_FLAG_ENTRYPOINT;
 use crate::project::ProjectContext;
 
@@ -31,8 +32,78 @@ pub(crate) struct NodeKey {
     pub(crate) end_column: usize,
 }
 
+/// Pure-rust mirror of [`SymbolNode`]'s data fields.
+///
+/// The builder stores these instead of `Py<SymbolNode>` so node
+/// interning costs no GIL acquisition or Python heap allocation — the
+/// hot path during a build mints hundreds of thousands of nodes, the
+/// vast majority of which are never handed back to Python. A
+/// `Py<SymbolNode>` is materialized lazily by [`GraphNode::to_symbol`]
+/// only for the nodes a Python caller actually surfaces (`nodes()`,
+/// `nodes_at()`, the descendants / ancestors / reachable snapshots).
+/// Internal queries read the fields here directly with no borrow.
+pub(crate) struct GraphNode {
+    pub(crate) fqname: String,
+    pub(crate) kind: &'static str,
+    pub(crate) path: String,
+    pub(crate) start_line: usize,
+    pub(crate) start_column: usize,
+    pub(crate) end_line: usize,
+    pub(crate) end_column: usize,
+    pub(crate) flags: u32,
+    pub(crate) imports: Option<ImportPayload>,
+}
+
+impl GraphNode {
+    /// Positional identity for the intern table. Mirrors
+    /// [`node_key_of`] (which projects a `SymbolNode`) but reads the
+    /// pure-rust fields directly.
+    pub(crate) fn key(&self) -> NodeKey {
+        NodeKey {
+            fqname: self.fqname.clone(),
+            kind: self.kind,
+            path: self.path.clone(),
+            start_line: self.start_line,
+            start_column: self.start_column,
+            end_line: self.end_line,
+            end_column: self.end_column,
+        }
+    }
+
+    /// Mint the `Py<SymbolNode>` for this node. Called lazily, only at
+    /// the boundary where a node is actually handed to Python.
+    pub(crate) fn to_symbol(&self, py: Python<'_>) -> PyResult<Py<SymbolNode>> {
+        let imports = match &self.imports {
+            Some(ip) => Some(Py::new(
+                py,
+                Import {
+                    module: ip.module.clone(),
+                    decl: ip.decl.clone(),
+                    star: ip.star,
+                },
+            )?),
+            None => None,
+        };
+        Py::new(
+            py,
+            SymbolNode {
+                fqname: self.fqname.clone(),
+                kind: self.kind,
+                path: self.path.clone(),
+                start_line: self.start_line,
+                start_column: self.start_column,
+                end_line: self.end_line,
+                end_column: self.end_column,
+                flags: self.flags,
+                imports,
+                cached_hash: OnceLock::new(),
+            },
+        )
+    }
+}
+
 pub(crate) struct GraphBuilder {
-    pub(crate) nodes: Vec<Py<SymbolNode>>,
+    pub(crate) nodes: Vec<GraphNode>,
     pub(crate) node_index: FxHashMap<NodeKey, usize>,
     pub(crate) edges: Vec<(usize, usize, u32)>,
     pub(crate) edge_set: FxHashSet<(usize, usize, u32)>,
@@ -87,17 +158,17 @@ impl GraphBuilder {
         }
     }
 
-    pub(crate) fn intern_node(&mut self, py: Python<'_>, node: SymbolNode) -> PyResult<usize> {
-        let key = node_key_of(&node);
+    pub(crate) fn intern_node(&mut self, node: GraphNode) -> usize {
+        let key = node.key();
         if let Some(&idx) = self.node_index.get(&key) {
-            return Ok(idx);
+            return idx;
         }
         let idx = self.nodes.len();
-        self.nodes.push(Py::new(py, node)?);
+        self.nodes.push(node);
         self.node_index.insert(key, idx);
         self.forward_adj.push(Vec::new());
         self.reverse_adj.push(Vec::new());
-        Ok(idx)
+        idx
     }
 
     /// Get (or mint) the deduplicated synthetic node with the given
@@ -107,16 +178,18 @@ impl GraphBuilder {
     /// genuinely-missing top-level names. Path is empty (synthetics
     /// don't correspond to a file in the project tree) and position
     /// is the (0, 0) sentinel.
-    pub(crate) fn intern_synthetic(&mut self, py: Python<'_>, fqname: String) -> PyResult<usize> {
+    pub(crate) fn intern_synthetic(&mut self, fqname: String) -> usize {
         if let Some(&idx) = self.synthetic_nodes.get(&fqname) {
-            return Ok(idx);
+            return idx;
         }
-        let idx = self.intern_node(
-            py,
-            synthetic_node(fqname.clone(), "synthetic", String::new(), 0),
-        )?;
+        let idx = self.intern_node(synthetic_node(
+            fqname.clone(),
+            "synthetic",
+            String::new(),
+            0,
+        ));
         self.synthetic_nodes.insert(fqname, idx);
-        Ok(idx)
+        idx
     }
 
     pub(crate) fn add_edge(&mut self, src: usize, dst: usize, flags: u32) {
@@ -416,7 +489,7 @@ pub(crate) fn bfs(
     visited
 }
 
-/// Construct a position-less `SymbolNode` (start/end zeroed, `imports`
+/// Construct a position-less [`GraphNode`] (start/end zeroed, `imports`
 /// absent) for ops minted at plugin-apply time. The four
 /// caller-supplied fields are the only ones that vary across the
 /// synthetic / entrypoint / `AddNode` shapes.
@@ -425,8 +498,8 @@ pub(crate) fn synthetic_node(
     kind: &'static str,
     path: String,
     flags: u32,
-) -> SymbolNode {
-    SymbolNode {
+) -> GraphNode {
+    GraphNode {
         fqname,
         kind,
         path,
@@ -436,7 +509,6 @@ pub(crate) fn synthetic_node(
         end_column: 0,
         flags,
         imports: None,
-        cached_hash: OnceLock::new(),
     }
 }
 
@@ -597,10 +669,10 @@ pub(crate) fn prepare_graph_op(py: Python<'_>, op: &Bound<'_, PyAny>) -> PyResul
 }
 
 /// Apply a batch of pre-prepared ops to the graph in a single
-/// write-lock window. The GIL is released before contending for the
-/// write lock and re-acquired only inside [`apply_prepared`] for the
-/// ops that actually need it — amortised across the whole batch
-/// rather than per-op as the legacy single-op apply did.
+/// write-lock window. The GIL is released for the entire apply pass:
+/// every op is pure-rust now — node interning stores [`GraphNode`]s
+/// with no `Py<SymbolNode>` allocation — so the apply never needs the
+/// GIL back.
 ///
 /// Ops apply in input order; an error in any op fails the whole
 /// batch with that op's error. Earlier ops in the batch still land
@@ -613,10 +685,9 @@ pub(crate) fn apply_prepared_batch(
     if prepared.is_empty() {
         return Ok(());
     }
-    // The ``write()`` MUST happen with the GIL released, then the
-    // GIL re-acquired *after* we own the write guard. Otherwise a
+    // The ``write()`` MUST happen with the GIL released. Otherwise a
     // concurrent reader returning from ``allow_threads`` and waiting
-    // on ``take_gil`` will deadlock against us — we'd be holding the
+    // on ``take_gil`` would deadlock against us — we'd be holding the
     // GIL while blocked on ``wait_for_readers``, and the reader
     // can't drop its read guard without first re-attaching the GIL.
     //
@@ -630,18 +701,15 @@ pub(crate) fn apply_prepared_batch(
         let outputs = outputs
             .as_mut()
             .ok_or_else(|| not_materialized("apply_ops_batched"))?;
-        Python::with_gil(|py| {
-            for op in prepared {
-                apply_prepared(outputs, py, op)?;
-            }
-            Ok(())
-        })
+        for op in prepared {
+            apply_prepared(outputs, op)?;
+        }
+        Ok(())
     })
 }
 
 fn apply_prepared(
     outputs: &mut crate::project::BuildOutputs,
-    py: Python<'_>,
     prepared: PreparedOp,
 ) -> PyResult<()> {
     match prepared {
@@ -670,10 +738,12 @@ fn apply_prepared(
         } => {
             let decl_idx = lookup_idx_by_key(&outputs.builder, &decl, "decl")?;
             let marker_fqname = format!("{marker}:{decl_fqname}");
-            let marker_idx = outputs.builder.intern_node(
-                py,
-                synthetic_node(marker_fqname, "synthetic", decl_path, NODE_FLAG_ENTRYPOINT),
-            )?;
+            let marker_idx = outputs.builder.intern_node(synthetic_node(
+                marker_fqname,
+                "synthetic",
+                decl_path,
+                NODE_FLAG_ENTRYPOINT,
+            ));
             outputs.builder.add_edge(marker_idx, decl_idx, 0);
             Ok(())
         }
@@ -681,17 +751,18 @@ fn apply_prepared(
             let len = outputs.builder.nodes.len();
             check_idx_in_range(len, decl_idx, "AddEntrypointByIdx", "decl_idx")?;
             // Read fqname / path off the existing node — same shape
-            // the ``AddEntrypoint`` arm gets from the prepare step,
-            // but without a ``Py<SymbolNode>`` round-trip.
+            // the ``AddEntrypoint`` arm gets from the prepare step.
             let (decl_fqname, decl_path) = {
-                let node = outputs.builder.nodes[decl_idx].borrow(py);
+                let node = &outputs.builder.nodes[decl_idx];
                 (node.fqname.clone(), node.path.clone())
             };
             let marker_fqname = format!("{marker}:{decl_fqname}");
-            let marker_idx = outputs.builder.intern_node(
-                py,
-                synthetic_node(marker_fqname, "synthetic", decl_path, NODE_FLAG_ENTRYPOINT),
-            )?;
+            let marker_idx = outputs.builder.intern_node(synthetic_node(
+                marker_fqname,
+                "synthetic",
+                decl_path,
+                NODE_FLAG_ENTRYPOINT,
+            ));
             outputs.builder.add_edge(marker_idx, decl_idx, 0);
             Ok(())
         }
@@ -712,7 +783,7 @@ fn apply_prepared(
             let to_idxs = resolve_edge_keys(&outputs.builder, &edges_to, "edges_to")?;
             let node_idx = outputs
                 .builder
-                .intern_node(py, synthetic_node(fqname, kind, path, flags))?;
+                .intern_node(synthetic_node(fqname, kind, path, flags));
             wire_synthetic_edges(&mut outputs.builder, node_idx, &from_idxs, &to_idxs);
             Ok(())
         }
@@ -735,7 +806,7 @@ fn apply_prepared(
             check_idx_slice_in_range(len, &edges_to_idx, "AddNodeByIdx", "edges_to_idx")?;
             let node_idx = outputs
                 .builder
-                .intern_node(py, synthetic_node(fqname, kind, path, flags))?;
+                .intern_node(synthetic_node(fqname, kind, path, flags));
             wire_synthetic_edges(
                 &mut outputs.builder,
                 node_idx,

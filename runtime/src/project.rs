@@ -32,11 +32,11 @@ use ty_python_core::semantic_index;
 
 use crate::builder::{
     apply_prepared_batch, bfs, lookup_idx, not_materialized, prepare_graph_op, synthetic_node,
-    CollectedOps, Direction, GraphBuilder, PreparedOp,
+    CollectedOps, Direction, GraphBuilder, GraphNode, PreparedOp,
 };
 use crate::file_payload::{file_to_edges, file_to_nodes, FileEdges, NodeKind, NodeRef};
 use crate::file_ref_edges::{file_to_ref_edges, FileRefEdges};
-use crate::graph::{intern_kind, DeclIndex, Import, NativeGraph, SymbolNode};
+use crate::graph::{intern_kind, DeclIndex, NativeGraph, SymbolNode};
 use crate::helpers::{
     call_callee_matches_var, class_body_defines_method, collect_all_imports_local,
     collect_modules_imports_local, decorators_match_imports, extract_call_args_kwargs,
@@ -56,7 +56,6 @@ use crate::query::{
     QueryBuilder,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
-use std::sync::OnceLock as StdOnceLock;
 
 /// A ty-backed analysis project with explicitly-injected configuration.
 #[pyclass(unsendable)]
@@ -93,8 +92,14 @@ impl Project {
     pub(crate) fn build(&mut self, py: Python<'_>) -> PyResult<NativeGraph> {
         let counters = Arc::new(ProgressCounters::new());
         let outputs = build_project_graph(py, &mut self.db, false, None, &counters, &[])?;
+        let nodes = outputs
+            .builder
+            .nodes
+            .iter()
+            .map(|n| n.to_symbol(py))
+            .collect::<PyResult<Vec<_>>>()?;
         Ok(NativeGraph {
-            nodes: outputs.builder.nodes,
+            nodes,
             edges: outputs.builder.edges,
         })
     }
@@ -422,7 +427,7 @@ pub(crate) fn build_project_graph(
     counters.start_phase(PHASE_FQNAME, Some(builder.nodes.len()));
     let t4 = std::time::Instant::now();
     let (decl_by_fqname, module_by_fqname, imports_by_module, children_by_parent) =
-        build_fqname_indices(py, &builder, counters);
+        build_fqname_indices(&builder, counters);
     let t_fqname = t4.elapsed();
     counters.finish_phase(PHASE_FQNAME);
 
@@ -439,7 +444,6 @@ pub(crate) fn build_project_graph(
         &class_by_selection,
         &ref_to_global,
         &decl_by_fqname,
-        py,
         &builder.nodes,
     );
     let t_hierarchy_elapsed = t_hierarchy.elapsed();
@@ -621,22 +625,7 @@ fn assemble_graph<'db>(
                 }
             }
 
-            let imports = node_data
-                .imports
-                .as_ref()
-                .map(|ip| {
-                    Py::new(
-                        py,
-                        Import {
-                            module: ip.module.clone(),
-                            decl: ip.decl.clone(),
-                            star: ip.star,
-                        },
-                    )
-                })
-                .transpose()?;
-
-            let symbol = SymbolNode {
+            let node = GraphNode {
                 fqname: node_data.fqname.clone(),
                 kind: intern_kind(node_data.kind.as_static_str())?,
                 path: node_data.path.clone(),
@@ -645,10 +634,9 @@ fn assemble_graph<'db>(
                 end_line: node_data.end_line,
                 end_column: node_data.end_column,
                 flags,
-                imports,
-                cached_hash: StdOnceLock::new(),
+                imports: node_data.imports.clone(),
             };
-            let global_idx = builder.intern_node(py, symbol)?;
+            let global_idx = builder.intern_node(node);
             ref_to_global.insert(node_ref, global_idx);
             local_to_global.insert((file, local_idx as u32), global_idx);
 
@@ -722,12 +710,12 @@ fn assemble_graph<'db>(
         for payload in &edge_payloads {
             for &(src, dst, flags) in &payload.edges {
                 let Some(src_idx) =
-                    serial_lookup_or_mint(py, db, &mut builder, &mut ref_to_global, src)?
+                    serial_lookup_or_mint(db, &mut builder, &mut ref_to_global, src)?
                 else {
                     continue;
                 };
                 let Some(dst_idx) =
-                    serial_lookup_or_mint(py, db, &mut builder, &mut ref_to_global, dst)?
+                    serial_lookup_or_mint(db, &mut builder, &mut ref_to_global, dst)?
                 else {
                     continue;
                 };
@@ -737,12 +725,12 @@ fn assemble_graph<'db>(
         for payload in &ref_edge_payloads {
             for &(src, dst, flags) in &payload.edges {
                 let Some(src_idx) =
-                    serial_lookup_or_mint(py, db, &mut builder, &mut ref_to_global, src)?
+                    serial_lookup_or_mint(db, &mut builder, &mut ref_to_global, src)?
                 else {
                     continue;
                 };
                 let Some(dst_idx) =
-                    serial_lookup_or_mint(py, db, &mut builder, &mut ref_to_global, dst)?
+                    serial_lookup_or_mint(db, &mut builder, &mut ref_to_global, dst)?
                 else {
                     continue;
                 };
@@ -778,7 +766,7 @@ fn assemble_graph<'db>(
         for r in external_keys {
             if let NodeRef::External(key) = r {
                 let fqname = key.fqname(db).clone();
-                let idx = builder.intern_synthetic(py, fqname)?;
+                let idx = builder.intern_synthetic(fqname);
                 ref_to_global.insert(r, idx);
             }
         }
@@ -864,7 +852,6 @@ fn assemble_graph<'db>(
     // pass produced. Synthetic nodes still dedup by fqname, so a
     // later project-wide plugin emitting the same node merges.
     fold_per_file_plugin_ops(
-        py,
         db,
         &mut builder,
         project_files,
@@ -909,7 +896,6 @@ fn assemble_graph<'db>(
 /// is GIL-free and intra-file, so nothing in this fold needs the salsa
 /// DB beyond the cached lookup.
 fn fold_per_file_plugin_ops(
-    py: Python<'_>,
     db: &ProjectDatabase,
     builder: &mut GraphBuilder,
     project_files: &[File],
@@ -937,10 +923,12 @@ fn fold_per_file_plugin_ops(
                         edges_to_local_idx,
                         edges_from_local_idx,
                     } => {
-                        let node_idx = builder.intern_node(
-                            py,
-                            synthetic_node(fqname.clone(), kind, path.clone(), *flags),
-                        )?;
+                        let node_idx = builder.intern_node(synthetic_node(
+                            fqname.clone(),
+                            kind,
+                            path.clone(),
+                            *flags,
+                        ));
                         for &local in edges_from_local_idx {
                             if let Some(src_idx) = to_global(local) {
                                 builder.add_edge(src_idx, node_idx, 0);
@@ -971,19 +959,16 @@ fn fold_per_file_plugin_ops(
                             continue;
                         };
                         let (decl_fqname, decl_path) = {
-                            let node = builder.nodes[decl_idx].borrow(py);
+                            let node = &builder.nodes[decl_idx];
                             (node.fqname.clone(), node.path.clone())
                         };
                         let marker_fqname = format!("{marker}:{decl_fqname}");
-                        let marker_idx = builder.intern_node(
-                            py,
-                            synthetic_node(
-                                marker_fqname,
-                                "synthetic",
-                                decl_path,
-                                NODE_FLAG_ENTRYPOINT,
-                            ),
-                        )?;
+                        let marker_idx = builder.intern_node(synthetic_node(
+                            marker_fqname,
+                            "synthetic",
+                            decl_path,
+                            NODE_FLAG_ENTRYPOINT,
+                        ));
                         builder.add_edge(marker_idx, decl_idx, 0);
                     }
                 }
@@ -1060,8 +1045,7 @@ fn build_class_hierarchy_indices<'db>(
     class_by_selection: &FxHashMap<(File, (u32, u32)), usize>,
     ref_to_global: &FxHashMap<NodeRef<'db>, usize>,
     decl_by_fqname: &FxHashMap<String, Vec<usize>>,
-    py: Python<'_>,
-    nodes: &[Py<SymbolNode>],
+    nodes: &[GraphNode],
 ) -> (FxHashMap<usize, Vec<usize>>, FxHashMap<String, Vec<usize>>) {
     use crate::file_payload::ResolvedBase;
     let mut by_node: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
@@ -1078,7 +1062,7 @@ fn build_class_hierarchy_indices<'db>(
                     ResolvedBase::LocalSameFileClass(local_idx) => {
                         let r = payload.refs[*local_idx as usize];
                         if let Some(&parent_idx) = ref_to_global.get(&r) {
-                            if nodes[parent_idx].borrow(py).kind == "class" {
+                            if nodes[parent_idx].kind == "class" {
                                 by_node.entry(parent_idx).or_default().push(child_idx);
                             }
                         }
@@ -1087,7 +1071,7 @@ fn build_class_hierarchy_indices<'db>(
                         by_fqn.entry(fqn.clone()).or_default().push(child_idx);
                         if let Some(idxs) = decl_by_fqname.get(fqn) {
                             for &parent_idx in idxs {
-                                if nodes[parent_idx].borrow(py).kind == "class" {
+                                if nodes[parent_idx].kind == "class" {
                                     by_node.entry(parent_idx).or_default().push(child_idx);
                                 }
                             }
@@ -1108,7 +1092,7 @@ fn build_class_hierarchy_indices<'db>(
                         // `exports_by_name`.
                         if let Some(idxs) = decl_by_fqname.get(&composed) {
                             for &parent_idx in idxs {
-                                if nodes[parent_idx].borrow(py).kind == "class" {
+                                if nodes[parent_idx].kind == "class" {
                                     by_node.entry(parent_idx).or_default().push(child_idx);
                                 }
                             }
@@ -1135,7 +1119,6 @@ fn build_class_hierarchy_indices<'db>(
 /// its global graph index. Only used when `DEAD_CST_PASS2_SERIAL=1`
 /// is set (kept for A/B comparison and as a kill switch).
 fn serial_lookup_or_mint<'db>(
-    py: Python<'_>,
     db: &'db ProjectDatabase,
     builder: &mut GraphBuilder,
     ref_to_global: &mut FxHashMap<NodeRef<'db>, usize>,
@@ -1147,7 +1130,7 @@ fn serial_lookup_or_mint<'db>(
     match r {
         NodeRef::External(key) => {
             let fqname = key.fqname(db).clone();
-            let idx = builder.intern_synthetic(py, fqname)?;
+            let idx = builder.intern_synthetic(fqname);
             ref_to_global.insert(r, idx);
             Ok(Some(idx))
         }
@@ -1171,7 +1154,6 @@ fn serial_lookup_or_mint<'db>(
 /// names keyed under the empty string.
 #[allow(clippy::type_complexity)]
 pub(crate) fn build_fqname_indices(
-    py: Python<'_>,
     builder: &GraphBuilder,
     counters: &Arc<ProgressCounters>,
 ) -> (
@@ -1184,9 +1166,8 @@ pub(crate) fn build_fqname_indices(
     let mut modules: FxHashMap<String, usize> = FxHashMap::default();
     let mut imports_by_module: FxHashMap<String, Vec<usize>> = FxHashMap::default();
     let mut children_by_parent: FxHashMap<String, Vec<usize>> = FxHashMap::default();
-    for (idx, node_py) in builder.nodes.iter().enumerate() {
+    for (idx, node) in builder.nodes.iter().enumerate() {
         counters.fqname_inc();
-        let node = node_py.borrow(py);
         // `OVERLOAD`-flagged decls (the `@typing.overload`-decorated
         // stubs of an in-file overload group) are excluded from the
         // fqname trie so cross-module `from mod import f` resolves to
@@ -1207,9 +1188,9 @@ pub(crate) fn build_fqname_indices(
             }
             "import" => {
                 decls.entry(node.fqname.clone()).or_default().push(idx);
-                if let Some(import_py) = node.imports.as_ref() {
+                if let Some(import) = node.imports.as_ref() {
                     imports_by_module
-                        .entry(import_py.borrow(py).module.clone())
+                        .entry(import.module.clone())
                         .or_default()
                         .push(idx);
                 }
@@ -1696,13 +1677,14 @@ impl ProjectContext {
         let outputs = outputs_ref
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("ProjectContext lost its outputs"))?;
+        let nodes = outputs
+            .builder
+            .nodes
+            .iter()
+            .map(|n| n.to_symbol(py))
+            .collect::<PyResult<Vec<_>>>()?;
         Ok(NativeGraph {
-            nodes: outputs
-                .builder
-                .nodes
-                .iter()
-                .map(|n| n.clone_ref(py))
-                .collect(),
+            nodes,
             edges: outputs.builder.edges.clone(),
         })
     }
@@ -1771,13 +1753,14 @@ impl ProjectContext {
         let outputs = outputs_ref
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("ProjectContext lost its outputs"))?;
+        let nodes = outputs
+            .builder
+            .nodes
+            .iter()
+            .map(|n| n.to_symbol(py))
+            .collect::<PyResult<Vec<_>>>()?;
         Ok(NativeGraph {
-            nodes: outputs
-                .builder
-                .nodes
-                .iter()
-                .map(|n| n.clone_ref(py))
-                .collect(),
+            nodes,
             edges: outputs.builder.edges.clone(),
         })
     }
@@ -2048,11 +2031,10 @@ impl ProjectContext {
     /// machinery and must be kept alive even when no source reference
     /// points at them. Plugins use the DSL form:
     /// ``native.query(ctx).modules().with_dunders().indices()``.
-    pub(crate) fn find_module_dunders_indices(&self, py: Python<'_>) -> PyResult<Vec<usize>> {
+    pub(crate) fn find_module_dunders_indices(&self) -> PyResult<Vec<usize>> {
         let outputs = self.materialized("find_module_dunders_indices")?;
         let mut out = Vec::new();
-        for (idx, node_py) in outputs.builder.nodes.iter().enumerate() {
-            let node = node_py.borrow(py);
+        for (idx, node) in outputs.builder.nodes.iter().enumerate() {
             if !matches!(node.kind, "variable" | "function") {
                 continue;
             }
@@ -2081,7 +2063,6 @@ impl ProjectContext {
     ///   absolute path.
     pub(crate) fn find_nodes_matching_specs_indices(
         &self,
-        py: Python<'_>,
         project_root: &str,
         regexes: Vec<String>,
         str_specs: Vec<String>,
@@ -2106,8 +2087,7 @@ impl ProjectContext {
 
         let outputs = self.materialized("find_nodes_matching_specs_indices")?;
         let mut out: Vec<usize> = Vec::new();
-        for (idx, node_py) in outputs.builder.nodes.iter().enumerate() {
-            let node = node_py.borrow(py);
+        for (idx, node) in outputs.builder.nodes.iter().enumerate() {
             let path = node.path.as_str();
             if abs_set.contains(path) {
                 out.push(idx);
@@ -2263,13 +2243,9 @@ impl ProjectContext {
     /// BFS over the fqname tree from ``module_fqn``: the module idx
     /// + every transitive descendant idx. Plugins use the DSL:
     /// ``native.query(ctx).modules().with_fqn(fqn).surface().indices()``.
-    pub(crate) fn module_surface_indices(
-        &self,
-        py: Python<'_>,
-        module_fqn: &str,
-    ) -> PyResult<Vec<usize>> {
+    pub(crate) fn module_surface_indices(&self, module_fqn: &str) -> PyResult<Vec<usize>> {
         let outputs = self.materialized("module_surface_indices")?;
-        Ok(module_surface_indices_in(&outputs, py, module_fqn))
+        Ok(module_surface_indices_in(&outputs, module_fqn))
     }
 
     /// Bulk form: resolve every fqname in ``module_fqns`` in a single
@@ -2302,7 +2278,6 @@ impl ProjectContext {
     /// ``native.query(ctx).modules().with_fqn(fqn).top_level().indices()``.
     pub(crate) fn find_module_top_level_decls_indices(
         &self,
-        py: Python<'_>,
         module_fqn: &str,
     ) -> PyResult<Vec<usize>> {
         let outputs = self.materialized("find_module_top_level_decls_indices")?;
@@ -2316,7 +2291,7 @@ impl ProjectContext {
         let mut out: Vec<usize> = Vec::new();
         if let Some(children) = outputs.children_by_parent.get(module_fqn) {
             for &idx in children {
-                if outputs.builder.nodes[idx].borrow(py).kind == "module" {
+                if outputs.builder.nodes[idx].kind == "module" {
                     continue;
                 }
                 out.push(idx);
@@ -2390,8 +2365,7 @@ impl ProjectContext {
         let mut out: Vec<String> = Vec::new();
         let mut found_any = false;
         for &idx in idxs {
-            let path =
-                pyo3::Python::with_gil(|py| outputs.builder.nodes[idx].borrow(py).path.clone());
+            let path = outputs.builder.nodes[idx].path.clone();
             let Some(&file) = outputs.path_to_file.get(&path) else {
                 continue;
             };
@@ -2425,18 +2399,14 @@ impl ProjectContext {
 impl ProjectContext {
     /// Every node whose ``path`` starts with ``path_prefix``. Plugins
     /// use the DSL: ``native.query(ctx).decls().with_path_prefix(p)``.
-    pub(crate) fn decls_under_indices(
-        &self,
-        py: Python<'_>,
-        path_prefix: &str,
-    ) -> PyResult<Vec<usize>> {
+    pub(crate) fn decls_under_indices(&self, path_prefix: &str) -> PyResult<Vec<usize>> {
         let outputs = self.materialized("decls_under_indices")?;
         Ok(outputs
             .builder
             .nodes
             .iter()
             .enumerate()
-            .filter(|(_i, n)| n.borrow(py).path.starts_with(path_prefix))
+            .filter(|(_i, n)| n.path.starts_with(path_prefix))
             .map(|(i, _n)| i)
             .collect())
     }
@@ -2444,18 +2414,14 @@ impl ProjectContext {
     /// Every node whose ``path`` contains ``substring`` anywhere.
     /// Plugins use the DSL:
     /// ``native.query(ctx).decls().with_path_contains(s)``.
-    pub(crate) fn decls_matching_indices(
-        &self,
-        py: Python<'_>,
-        substring: &str,
-    ) -> PyResult<Vec<usize>> {
+    pub(crate) fn decls_matching_indices(&self, substring: &str) -> PyResult<Vec<usize>> {
         let outputs = self.materialized("decls_matching_indices")?;
         Ok(outputs
             .builder
             .nodes
             .iter()
             .enumerate()
-            .filter(|(_i, n)| n.borrow(py).path.contains(substring))
+            .filter(|(_i, n)| n.path.contains(substring))
             .map(|(i, _n)| i)
             .collect())
     }
@@ -2464,16 +2430,11 @@ impl ProjectContext {
     /// type_alias) whose simple name matches ``pattern``. Plugins use
     /// the DSL — compose
     /// ``decls().with_simple_name_regex(p).with_kinds([...])``.
-    pub(crate) fn decls_matching_name_indices(
-        &self,
-        py: Python<'_>,
-        pattern: &str,
-    ) -> PyResult<Vec<usize>> {
+    pub(crate) fn decls_matching_name_indices(&self, pattern: &str) -> PyResult<Vec<usize>> {
         let regex = self.compile_regex(pattern)?;
         let outputs = self.materialized("decls_matching_name_indices")?;
         let mut out: Vec<usize> = Vec::new();
-        for (idx, node_py) in outputs.builder.nodes.iter().enumerate() {
-            let node = node_py.borrow(py);
+        for (idx, node) in outputs.builder.nodes.iter().enumerate() {
             if !matches!(
                 node.kind,
                 "function" | "class" | "variable" | "import" | "type_alias"
@@ -2501,12 +2462,10 @@ impl ProjectContext {
     ) -> PyResult<Vec<Py<SymbolNode>>> {
         let outputs = self.materialized("descendants")?;
         let root_idx = lookup_idx(&outputs.builder, root, "root")?;
-        Ok(
-            bfs(&outputs.builder, [root_idx], Direction::Forward, skip_flags)
-                .into_iter()
-                .map(|i| outputs.builder.nodes[i].clone_ref(py))
-                .collect(),
-        )
+        bfs(&outputs.builder, [root_idx], Direction::Forward, skip_flags)
+            .into_iter()
+            .map(|i| outputs.builder.nodes[i].to_symbol(py))
+            .collect()
     }
 
     /// Idx-keyed variant of :meth:`descendants`. Takes a positional
@@ -2544,10 +2503,10 @@ impl ProjectContext {
     ) -> PyResult<Vec<Py<SymbolNode>>> {
         let outputs = self.materialized("ancestors")?;
         let idx = lookup_idx(&outputs.builder, decl, "decl")?;
-        Ok(bfs(&outputs.builder, [idx], Direction::Reverse, skip_flags)
+        bfs(&outputs.builder, [idx], Direction::Reverse, skip_flags)
             .into_iter()
-            .map(|i| outputs.builder.nodes[i].clone_ref(py))
-            .collect())
+            .map(|i| outputs.builder.nodes[i].to_symbol(py))
+            .collect()
     }
 
     /// Idx-keyed variant of :meth:`ancestors`. Takes a positional
@@ -2612,11 +2571,11 @@ impl ProjectContext {
             .nodes
             .iter()
             .enumerate()
-            .filter_map(|(idx, n)| (n.borrow(py).flags & seed_flags != 0).then_some(idx));
-        Ok(bfs(&outputs.builder, seeds, Direction::Forward, skip_flags)
+            .filter_map(|(idx, n)| (n.flags & seed_flags != 0).then_some(idx));
+        bfs(&outputs.builder, seeds, Direction::Forward, skip_flags)
             .into_iter()
-            .map(|i| outputs.builder.nodes[i].clone_ref(py))
-            .collect())
+            .map(|i| outputs.builder.nodes[i].to_symbol(py))
+            .collect()
     }
 }
 
@@ -3403,11 +3362,7 @@ impl ProjectContext {
     /// ``ctx.nodes()``. Bounds-checks the index and raises
     /// :class:`IndexError` when out of range; returns an empty list
     /// when the seed isn't a class node.
-    pub(crate) fn find_subclasses_of_idx(
-        &self,
-        py: Python<'_>,
-        class_idx: usize,
-    ) -> PyResult<Vec<usize>> {
+    pub(crate) fn find_subclasses_of_idx(&self, class_idx: usize) -> PyResult<Vec<usize>> {
         let outputs = self.materialized("find_subclasses_of_idx")?;
         let len = outputs.builder.nodes.len();
         if class_idx >= len {
@@ -3417,7 +3372,7 @@ impl ProjectContext {
         }
         // Snapshot the node fields the inner helper reads — same shape
         // it gets when called from the node-form ``find_subclasses_of``.
-        let class_node = outputs.builder.nodes[class_idx].borrow(py);
+        let class_node = &outputs.builder.nodes[class_idx];
         if class_node.kind != "class" {
             return Ok(Vec::new());
         }
@@ -3425,7 +3380,7 @@ impl ProjectContext {
             &self.db,
             &outputs.path_to_file,
             &class_node.path,
-            &class_node,
+            class_node,
         ) {
             let rk = (seed_range.start().to_u32(), seed_range.end().to_u32());
             if let Some(&seed_idx) = outputs.class_by_selection.get(&(seed_file, rk)) {
@@ -3460,11 +3415,7 @@ fn direct_predecessors_idxs_in(outputs: &BuildOutputs, idx: usize, skip_flags: u
 /// :meth:`module_surface_indices` — the module index, then every
 /// transitive child node (modules recursed into; non-module decls
 /// surfaced but not chased for sub-fqnames).
-fn module_surface_indices_in(
-    outputs: &BuildOutputs,
-    py: Python<'_>,
-    module_fqn: &str,
-) -> Vec<usize> {
+fn module_surface_indices_in(outputs: &BuildOutputs, module_fqn: &str) -> Vec<usize> {
     let Some(&module_idx) = outputs.module_by_fqname.get(module_fqn) else {
         return Vec::new();
     };
@@ -3476,15 +3427,13 @@ fn module_surface_indices_in(
             continue;
         };
         for &child_idx in children {
-            let child_py = &outputs.builder.nodes[child_idx];
-            let child = child_py.borrow(py);
+            let child = &outputs.builder.nodes[child_idx];
             let is_module = child.kind == "module";
             let child_fqname = if is_module {
                 Some(child.fqname.clone())
             } else {
                 None
             };
-            drop(child);
             out.push(child_idx);
             if let Some(fqn) = child_fqname {
                 queue.push_back(fqn);
@@ -3658,7 +3607,6 @@ impl ProjectContext {
             let outputs = self.materialized("find_constructions.subclasses")?;
             for idx in sub_idxs {
                 let simple = outputs.builder.nodes[idx]
-                    .borrow(py)
                     .fqname
                     .rsplit('.')
                     .next()
@@ -3682,7 +3630,7 @@ impl ProjectContext {
     pub(crate) fn find_decorations_on(
         &self,
         py: Python<'_>,
-        instance: &SymbolNode,
+        instance: &GraphNode,
         method_names: Vec<String>,
         path_regex: Option<&str>,
         extract_args: bool,
@@ -3695,7 +3643,7 @@ impl ProjectContext {
             if owner_name != instance_simple {
                 continue;
             }
-            if outputs.builder.nodes[handler_idx].borrow(py).path != instance.path {
+            if outputs.builder.nodes[handler_idx].path != instance.path {
                 continue;
             }
             out.push((handler_idx, call_args));
@@ -3724,8 +3672,7 @@ impl ProjectContext {
         transitive: bool,
     ) -> PyResult<Vec<usize>> {
         let outputs = self.materialized("find_subclasses_indices")?;
-        let Some((seed_file, seed_range)) = locate_class_seed(&self.db, &outputs, py, base_fqn)
-        else {
+        let Some((seed_file, seed_range)) = locate_class_seed(&self.db, &outputs, base_fqn) else {
             return Ok(Vec::new());
         };
         // Project seeds: use the in-memory class-hierarchy index for
@@ -3886,7 +3833,7 @@ impl ProjectContext {
                     continue;
                 };
                 out.push((
-                    outputs.builder.nodes[decl_idx].clone_ref(py),
+                    outputs.builder.nodes[decl_idx].to_symbol(py)?,
                     text.to_string(),
                 ));
             }
@@ -3902,12 +3849,12 @@ impl ProjectContext {
     /// Live nodes in the in-progress graph. Cheap, no copy.
     pub(crate) fn nodes(&self, py: Python<'_>) -> PyResult<Vec<Py<SymbolNode>>> {
         let outputs = self.materialized("nodes")?;
-        Ok(outputs
+        outputs
             .builder
             .nodes
             .iter()
-            .map(|n| n.clone_ref(py))
-            .collect())
+            .map(|n| n.to_symbol(py))
+            .collect()
     }
 
     /// Live edges as `(src_idx, dst_idx, flags)` triples.
@@ -3927,7 +3874,6 @@ impl ProjectContext {
     #[pyo3(signature = (*, skip_flags = 0, seed_flags = NODE_FLAG_ENTRYPOINT))]
     pub(crate) fn reachable_indices(
         &self,
-        py: Python<'_>,
         skip_flags: u32,
         seed_flags: u32,
     ) -> PyResult<Vec<usize>> {
@@ -3937,7 +3883,7 @@ impl ProjectContext {
             .nodes
             .iter()
             .enumerate()
-            .filter_map(|(idx, n)| (n.borrow(py).flags & seed_flags != 0).then_some(idx));
+            .filter_map(|(idx, n)| (n.flags & seed_flags != 0).then_some(idx));
         Ok(bfs(&outputs.builder, seeds, Direction::Forward, skip_flags)
             .into_iter()
             .collect())
@@ -3973,7 +3919,6 @@ impl ProjectContext {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn indices_where(
         &self,
-        py: Python<'_>,
         kind: Option<String>,
         kinds: Option<Vec<String>>,
         filename: Option<String>,
@@ -4041,8 +3986,7 @@ impl ProjectContext {
         // should be passed; if both are given, AND them (require all
         // bits in ``flags`` AND any bit in ``flags_any``).
         let mut out: Vec<usize> = Vec::new();
-        for (idx, node_py) in outputs.builder.nodes.iter().enumerate() {
-            let node = node_py.borrow(py);
+        for (idx, node) in outputs.builder.nodes.iter().enumerate() {
             if let Some(k) = &kinds_set {
                 if !k.contains(node.kind) {
                     continue;
@@ -4113,7 +4057,7 @@ impl ProjectContext {
                     "node index {idx} out of range (len={len})"
                 )));
             }
-            out.push(outputs.builder.nodes[idx].clone_ref(py));
+            out.push(outputs.builder.nodes[idx].to_symbol(py)?);
         }
         Ok(out)
     }
@@ -4143,11 +4087,9 @@ impl ProjectContext {
                     "node index {idx} out of range (len={len})"
                 )));
             }
-            // ``Py<T>::get`` is GIL-free for frozen pyclasses with
-            // ``Sync`` fields. ``SymbolNode`` is ``#[pyclass(frozen)]``
-            // with all-``Sync`` fields, so we read its data without
-            // threading ``Python<'_>`` through every internal helper.
-            let node = outputs.builder.nodes[idx].get();
+            // The builder stores pure-rust ``GraphNode``s, so reading a
+            // node's fields needs neither the GIL nor a ``Py`` borrow.
+            let node = &outputs.builder.nodes[idx];
             out.push(crate::helpers::NodeAttrs {
                 kind: node.kind.to_string(),
                 path: node.path.clone(),
@@ -4176,10 +4118,9 @@ impl ProjectContext {
                     "node index {idx} out of range (len={len})"
                 )));
             }
-            // ``Py::get`` is GIL-free on ``#[pyclass(frozen)]`` types
-            // with ``Sync`` fields; SymbolNode qualifies. See
-            // :meth:`node_attrs` for the rationale.
-            out.push(outputs.builder.nodes[idx].get().path.clone());
+            // Pure-rust ``GraphNode`` read — no GIL, no ``Py`` borrow.
+            // See :meth:`node_attrs` for the rationale.
+            out.push(outputs.builder.nodes[idx].path.clone());
         }
         Ok(out)
     }
