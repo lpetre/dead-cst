@@ -1,11 +1,10 @@
-"""Tests for :class:`UnittestPlugin`."""
+"""Tests for the native ``unittest`` plugin (``NativePlugin.unittest``)."""
 
 from __future__ import annotations
 
 
 from dead_cst import _native as native
 from dead_cst.graph import NodeFlags
-from dead_cst.contrib import UnittestPlugin
 
 
 def test_unittest_plugin_marks_testcase_subclass(build_plugin_graph, reachable_fqnames):
@@ -22,7 +21,7 @@ def test_unittest_plugin_marks_testcase_subclass(build_plugin_graph, reachable_f
                 pass
             """,
         },
-        [UnittestPlugin()],
+        [native.NativePlugin.unittest()],
     )
     reached = reachable_fqnames(graph)
     assert "pkg.things.MyThings" in reached
@@ -40,7 +39,7 @@ def test_unittest_plugin_handles_from_import(build_plugin_graph, reachable_fqnam
                 def test_one(self): pass
             """,
         },
-        [UnittestPlugin()],
+        [native.NativePlugin.unittest()],
     )
     assert "pkg.things.MyThings" in reachable_fqnames(graph)
 
@@ -62,7 +61,7 @@ def test_unittest_plugin_handles_aliased_imports(build_plugin_graph, reachable_f
                 def test_one(self): pass
             """,
         },
-        [UnittestPlugin()],
+        [native.NativePlugin.unittest()],
     )
     reached = reachable_fqnames(graph)
     assert "pkg.aliased_module.ModAliased" in reached
@@ -80,7 +79,7 @@ def test_unittest_plugin_marks_async_testcase(build_plugin_graph, reachable_fqna
                 async def test_one(self): pass
             """,
         },
-        [UnittestPlugin()],
+        [native.NativePlugin.unittest()],
     )
     assert "pkg.things.MyAsync" in reachable_fqnames(graph)
 
@@ -101,7 +100,7 @@ def test_unittest_plugin_marks_module_hooks(build_plugin_graph, reachable_fqname
                 def test_one(self): pass
             """,
         },
-        [UnittestPlugin()],
+        [native.NativePlugin.unittest()],
     )
     reached = reachable_fqnames(graph)
     assert "pkg.things.setUpModule" in reached
@@ -125,7 +124,7 @@ def test_unittest_plugin_ignores_unrelated_classes(build_plugin_graph, reachable
                 def test_one(self): pass
             """,
         },
-        [UnittestPlugin()],
+        [native.NativePlugin.unittest()],
     )
     reached = reachable_fqnames(graph)
     # Bare ``TestCase`` is the locally-defined class (we never imported the
@@ -145,7 +144,7 @@ def test_unittest_plugin_skips_files_not_importing_unittest(build_plugin_graph, 
                 def test_one(self): pass
             """,
         },
-        [UnittestPlugin()],
+        [native.NativePlugin.unittest()],
     )
     assert "pkg.things.MyThings" not in reachable_fqnames(graph)
 
@@ -164,7 +163,7 @@ def test_unittest_plugin_resolves_through_star_import(build_plugin_graph, reacha
                 def test_one(self): pass
             """,
         },
-        [UnittestPlugin()],
+        [native.NativePlugin.unittest()],
     )
     assert "pkg.things.MyThings" in reachable_fqnames(graph)
 
@@ -177,9 +176,10 @@ def test_unittest_plugin_loads_via_cli_loader():
     assert plugin.name == "UnittestPlugin"
 
 
-def test_native_unittest_matches_python_plugin(build_plugin_graph, reachable_fqnames):
-    """``NativePlugin.unittest()`` produces the same reachable set as
-    ``UnittestPlugin()`` — same subclass walk, same lifecycle hooks."""
+def test_native_unittest_full_walk(build_plugin_graph, reachable_fqnames):
+    """``NativePlugin.unittest()`` walks the whole ``TestCase`` hierarchy
+    (sync + async + cross-module subclass) and pins module lifecycle hooks,
+    while leaving unrelated decls dead."""
     files = {
         "pkg/__init__.py": "",
         "pkg/things.py": """
@@ -205,9 +205,17 @@ def test_native_unittest_matches_python_plugin(build_plugin_graph, reachable_fqn
         """,
         "pkg/regular.py": "def untouched(): pass",
     }
-    py_ctx = build_plugin_graph(files, [UnittestPlugin()])
-    rs_ctx = build_plugin_graph(files, [native.NativePlugin.unittest()])
-    assert reachable_fqnames(py_ctx) == reachable_fqnames(rs_ctx)
+    reached = reachable_fqnames(build_plugin_graph(files, [native.NativePlugin.unittest()]))
+    assert {
+        "pkg.things.MyThings",
+        "pkg.things.AsyncThings",
+        "pkg.things.setUpModule",
+        "pkg.things.tearDownModule",
+        "pkg.things.load_tests",
+        "pkg.derived.Derived",
+    } <= reached
+    assert "pkg.things.Helper" not in reached
+    assert "pkg.regular.untouched" not in reached
 
 
 def test_unittest_plugin_tags_seeds_as_testcase(build_plugin_graph):
@@ -221,7 +229,7 @@ def test_unittest_plugin_tags_seeds_as_testcase(build_plugin_graph):
                 def test_one(self): pass
             """,
         },
-        [UnittestPlugin()],
+        [native.NativePlugin.unittest()],
     )
     seeds = [n for n in graph.nodes() if n.flags & NodeFlags.TESTCASE]
     assert seeds, "expected unittest plugin to seed at least one TESTCASE node"
@@ -245,7 +253,7 @@ def test_unittest_plugin_marks_subclass_via_local_mixin(build_plugin_graph, reac
                 def test_one(self): pass
             """,
         },
-        [UnittestPlugin()],
+        [native.NativePlugin.unittest()],
     )
     reached = reachable_fqnames(graph)
     assert "tests.base.ProjectTestCase" in reached
@@ -265,7 +273,7 @@ def test_unittest_plugin_marks_subclass_via_reexport(build_plugin_graph, reachab
                 def test_one(self): pass
             """,
         },
-        [UnittestPlugin()],
+        [native.NativePlugin.unittest()],
     )
     assert "pkg.things.MyThings" in reachable_fqnames(graph)
 
@@ -294,7 +302,7 @@ def test_unittest_plugin_marks_three_level_subclass_chain(build_plugin_graph, re
                 def test_one(self): pass
             """,
         },
-        [UnittestPlugin()],
+        [native.NativePlugin.unittest()],
     )
     reached = reachable_fqnames(graph)
     assert "tests.a.L1" in reached

@@ -1,8 +1,8 @@
-"""Tests for :class:`MainBlockPlugin`."""
+"""Tests for the native ``main_block`` plugin (``NativePlugin.main_block``)."""
 
 from __future__ import annotations
 
-from dead_cst.plugins import MainBlockPlugin
+from dead_cst import _native as native
 
 
 def test_main_block_plugin_marks_module_entrypoint(build_plugin_graph, reachable_fqnames):
@@ -17,7 +17,7 @@ def test_main_block_plugin_marks_module_entrypoint(build_plugin_graph, reachable
             """,
             "pkg/other.py": "def g(): pass",
         },
-        [MainBlockPlugin()],
+        [native.NativePlugin.main_block()],
     )
     reached = reachable_fqnames(graph)
     assert "pkg.script" in reached
@@ -50,7 +50,7 @@ def test_main_block_keeps_block_decls_alive(build_plugin_graph, reachable_fqname
                 app = Foo(fn=main).cli()
             """,
         },
-        [MainBlockPlugin()],
+        [native.NativePlugin.main_block()],
     )
     reached = reachable_fqnames(graph)
     assert {"pkg.script", "pkg.script.app", "pkg.script.Foo", "pkg.script.main"} <= reached
@@ -73,7 +73,7 @@ def test_main_block_keeps_nested_block_decls_alive(build_plugin_graph, reachable
                     app = Foo()
             """,
         },
-        [MainBlockPlugin()],
+        [native.NativePlugin.main_block()],
     )
     reached = reachable_fqnames(graph)
     assert {"pkg.script.app", "pkg.script.Foo"} <= reached
@@ -90,6 +90,6 @@ def test_main_block_reversed_comparison(build_plugin_graph, reachable_fqnames):
                 main()
             """,
         },
-        [MainBlockPlugin()],
+        [native.NativePlugin.main_block()],
     )
     assert "pkg.script" in reachable_fqnames(graph)

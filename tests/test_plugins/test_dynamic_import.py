@@ -1,4 +1,4 @@
-"""Tests for :class:`DynamicImportFallbackPlugin`.
+"""Tests for the native ``dynamic_import_fallback`` plugin.
 
 The plugin reads ``EdgeFlags.DYNAMIC_IMPORT`` edges and fans each
 flagged ``src -> module`` edge out to the module's exports.
@@ -7,7 +7,6 @@ flagged ``src -> module`` edge out to the module's exports.
 from __future__ import annotations
 
 from dead_cst import _native as native
-from dead_cst.plugins import MainBlockPlugin
 
 
 def test_plugin_loadable_by_name():
@@ -32,7 +31,7 @@ def test_run_fans_importlib_call_to_module_exports(build_plugin_graph, reachable
             ),
             "pkg/target.py": ("def public(): pass\ndef _private(): pass\ndef other(): pass\n"),
         },
-        [native.NativePlugin.dynamic_import_fallback(), MainBlockPlugin()],
+        [native.NativePlugin.dynamic_import_fallback(), native.NativePlugin.main_block()],
     )
     reached = reachable_fqnames(graph)
     assert "pkg.target.public" in reached
@@ -54,7 +53,7 @@ def test_run_respects_dunder_all(build_plugin_graph, reachable_fqnames):
             ),
             "pkg/target.py": ("__all__ = ['kept']\ndef kept(): pass\ndef dropped(): pass\n"),
         },
-        [native.NativePlugin.dynamic_import_fallback(), MainBlockPlugin()],
+        [native.NativePlugin.dynamic_import_fallback(), native.NativePlugin.main_block()],
     )
     reached = reachable_fqnames(graph)
     assert "pkg.target.kept" in reached
@@ -74,7 +73,7 @@ def test_run_include_underscore_picks_private_names(build_plugin_graph, reachabl
         },
         [
             native.NativePlugin.dynamic_import_fallback(include_underscore=True),
-            MainBlockPlugin(),
+            native.NativePlugin.main_block(),
         ],
     )
     reached = reachable_fqnames(graph)
@@ -95,7 +94,7 @@ def test_run_no_op_without_dynamic_imports(build_plugin_graph, reachable_fqnames
             ),
             "pkg/target.py": "def public(): pass\ndef other(): pass\n",
         },
-        [native.NativePlugin.dynamic_import_fallback(), MainBlockPlugin()],
+        [native.NativePlugin.dynamic_import_fallback(), native.NativePlugin.main_block()],
     )
     reached = reachable_fqnames(graph)
     assert "pkg.target.public" in reached
@@ -123,7 +122,7 @@ def test_exclude_sources_skips_matching_files(build_plugin_graph, reachable_fqna
         },
         [
             native.NativePlugin.dynamic_import_fallback(exclude_sources=("pkg/handled_loader.py",)),
-            MainBlockPlugin(),
+            native.NativePlugin.main_block(),
         ],
     )
     reached = reachable_fqnames(graph)
@@ -151,7 +150,7 @@ def test_exclude_sources_supports_glob_patterns(build_plugin_graph, reachable_fq
         },
         [
             native.NativePlugin.dynamic_import_fallback(exclude_sources=("pkg/loaders/*.py",)),
-            MainBlockPlugin(),
+            native.NativePlugin.main_block(),
         ],
     )
     reached = reachable_fqnames(graph)
@@ -176,7 +175,7 @@ def test_exclude_targets_silences_module_tree(build_plugin_graph, reachable_fqna
         },
         [
             native.NativePlugin.dynamic_import_fallback(exclude_targets=("pkg.vendored.*",)),
-            MainBlockPlugin(),
+            native.NativePlugin.main_block(),
         ],
     )
     reached = reachable_fqnames(graph)
@@ -203,7 +202,7 @@ def test_include_sources_acts_as_allowlist(build_plugin_graph, reachable_fqnames
         },
         [
             native.NativePlugin.dynamic_import_fallback(include_sources=("pkg/legacy.py",)),
-            MainBlockPlugin(),
+            native.NativePlugin.main_block(),
         ],
     )
     reached = reachable_fqnames(graph)
@@ -234,7 +233,7 @@ def test_include_and_exclude_combine(build_plugin_graph, reachable_fqnames):
                 include_sources=("pkg/legacy/*.py",),
                 exclude_sources=("pkg/legacy/b.py",),
             ),
-            MainBlockPlugin(),
+            native.NativePlugin.main_block(),
         ],
     )
     reached = reachable_fqnames(graph)

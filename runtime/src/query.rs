@@ -2009,8 +2009,7 @@ impl DeclQuery {
     /// after applying every configured predicate.
     ///
     /// Use when you only need set membership / counting on the
-    /// surviving nodes (or want to feed an index-keyed
-    /// :class:`AddEdgeByIdx`); call :meth:`ProjectContext.nodes_at`
+    /// surviving nodes; call :meth:`ProjectContext.nodes_at`
     /// / :meth:`node_attrs` to revive node fields if you need them.
     fn indices(&self, py: Python<'_>) -> PyResult<Vec<usize>> {
         let ctx = self.ctx.borrow(py);

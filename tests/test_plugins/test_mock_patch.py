@@ -1,4 +1,4 @@
-"""Tests for :class:`MockPatchPlugin`."""
+"""Tests for the native ``mock_patch`` plugin (``NativePlugin.mock_patch``)."""
 
 from __future__ import annotations
 

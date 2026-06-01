@@ -17,7 +17,6 @@ import pytest
 
 from dead_cst import Analysis
 from dead_cst import _native as native
-from dead_cst.plugins import MainBlockPlugin
 
 
 def _write(path: Path, src: str) -> None:
@@ -241,7 +240,7 @@ def test_re_materialize_with_entrypoint_plugin(tmp_path):
         """,
     )
 
-    analysis = Analysis(tmp_path, plugins=[MainBlockPlugin()])
+    analysis = Analysis(tmp_path, plugins=[native.NativePlugin.main_block()])
     analysis.materialize_all()
     dead_before = _dead_fqnames(analysis)
     assert "a.f" not in dead_before  # main block keeps it alive
@@ -264,7 +263,7 @@ def test_re_materialize_with_entrypoint_plugin(tmp_path):
     assert "a.f" not in dead_after
     assert "a.g" not in dead_after
 
-    _assert_matches_fresh(analysis, tmp_path, plugins=[MainBlockPlugin()])
+    _assert_matches_fresh(analysis, tmp_path, plugins=[native.NativePlugin.main_block()])
 
 
 def test_re_materialize_requires_prior_materialize(tmp_path):

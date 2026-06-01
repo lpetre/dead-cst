@@ -226,12 +226,12 @@ Entrypoint detection is fully plugin-driven. Builtins:
 
 | Plugin | Purpose |
 |---|---|
-| `MainBlockPlugin` | Mark modules containing `if __name__ == "__main__":` as entrypoints |
+| `NativePlugin.main_block()` | Mark modules containing `if __name__ == "__main__":` as entrypoints (always on) |
 | `NativePlugin.project_scripts()` | Read `pyproject.toml [project.scripts]` and mark each target as an entrypoint |
 | `NativePlugin.explicit()` | Match user-supplied file paths / FQNs / regexes (powers `-e` and `--entrypoint-regex`) |
-| `ModuleDundersPlugin` | Keep top-level dunder variables (`__all__`, `__version__`, etc.) alive (always on) |
+| `NativePlugin.module_dunders()` | Keep top-level dunder variables (`__all__`, `__version__`, etc.) alive (always on) |
 | `NativePlugin.pytest()` | Keep pytest-discovered tests, `conftest.py` decls, and `@pytest.fixture` functions alive (`--plugin pytest`) |
-| `UnittestPlugin` | Keep stdlib `unittest.TestCase` / `IsolatedAsyncioTestCase` subclasses and `setUpModule` / `tearDownModule` / `load_tests` hooks alive. Transitive: a class extending a project-local `TestCase` mixin or a re-exported `TestCase` is detected (`--plugin unittest`) |
+| `NativePlugin.unittest()` | Keep stdlib `unittest.TestCase` / `IsolatedAsyncioTestCase` subclasses and `setUpModule` / `tearDownModule` / `load_tests` hooks alive. Transitive: a class extending a project-local `TestCase` mixin or a re-exported `TestCase` is detected (`--plugin unittest`) |
 | `NativePlugin.mock_patch()` | Resolve string-fqname patch targets so symbols whose only consumers are tests stay alive. Recognizes `unittest.mock.patch` / `mock.patch` (decorator and context-manager forms, plus aliased imports), pytest-mock's `mocker.patch`, and pytest's `monkeypatch.setattr("X.Y", v)` / `monkeypatch.delattr("X.Y")` (`--plugin mock_patch`) |
 | `NativePlugin.server_config()` | Mark Gunicorn / Hypercorn config modules (`gunicorn.conf.py`, `hypercorn.conf.py`, and the `*_conf.py` variants) as entrypoints. The server loads these files by path at startup — nothing imports them statically, so the whole top-level surface would otherwise look dead. Override the `filenames` tuple for non-standard layouts (`--plugin server_config`) |
 | `NativePlugin.fastapi()` | Detect top-level `FastAPI()` / `APIRouter()` instances; mark `FastAPI` apps as entrypoints and add `instance -> handler` edges for every `@app.get(...)`-style decorator (HTTP methods, websockets, middleware, exception handlers, `on_event`). Routers stay pass-through, so an `APIRouter` that's never `include_router`'d remains dead (`--plugin fastapi`) |
@@ -241,18 +241,11 @@ Entrypoint detection is fully plugin-driven. Builtins:
 | `NativePlugin.cyclopts()` | Detect top-level `cyclopts.App()` instances and add `instance -> handler` edges for every `@app.command(...)` / `@app.default(...)` decorator. Apps are pass-through, mirroring the Typer plugin (`--plugin cyclopts`) |
 | `NativePlugin.discordpy()` | Detect top-level `commands.Bot()` / `discord.Client()` (and `AutoSharded*`) instances, mark them as entrypoints, and add `instance -> handler` edges for `@bot.command()` / `event` / `listen()` / `group()` / `hybrid_command()` / `before_invoke` / `after_invoke` / `check` decorators plus the two-level `@bot.tree.command()` / `@bot.tree.context_menu()` slash-command form (`--plugin discordpy`) |
 | `NativePlugin.fastmcp()` | Detect top-level `FastMCP()` server instances, mark them as entrypoints, and add `instance -> handler` edges for every `@mcp.tool` / `@mcp.resource` / `@mcp.prompt` / `@mcp.completion` decorator. Factory-aware: `def create_server() -> FastMCP: ...` chains classify across packages (`--plugin fastmcp`) |
-| `InitSubclassPlugin` | Detect classes that define `__init_subclass__` and add `parent -> subclass` edges for every (transitive) first-party subclass. Parents stay pass-through, so a registry base class only keeps subclasses alive once something else keeps the parent alive (`--plugin init_subclass`) |
+| `NativePlugin.init_subclass()` | Detect classes that define `__init_subclass__` and add `parent -> subclass` edges for every (transitive) first-party subclass. Parents stay pass-through, so a registry base class only keeps subclasses alive once something else keeps the parent alive (`--plugin init_subclass`) |
 
-For project-specific dynamic-import patterns, two abstract bases ship as scaffolding that subclasses configure in 4-5 lines:
+The dispatch-app frameworks (Flask, FastAPI, Typer, Cyclopts, Slack Bolt, FastMCP, Celery) are built-in native plugins too — `NativePlugin.flask()` … `NativePlugin.celery()`, or `--plugin flask` … `--plugin celery` on the CLI.
 
-| Abstract base | Use it for |
-|---|---|
-| `DecoratedDeclPlugin` | "Find decorated decls in files matching a search path." Subclass with `package_prefix`, `decorator_module`, `decorator_names`, `marker_prefix`. |
-| `LiteralListPlugin` | "Read `<owner>.<var> = ['fqn', ...]` and treat each entry as alive." Subclass with `owner_fqname`, `variable_name`, `marker_prefix`. |
-
-The dispatch-app frameworks (Flask, FastAPI, Typer, Cyclopts, Slack Bolt, FastMCP, Celery) are built-in native plugins — `NativePlugin.flask()` … `NativePlugin.celery()`, or `--plugin flask` … `--plugin celery` on the CLI.
-
-Write your own plugin from scratch by subclassing `dead_cst.plugins.Plugin` and implementing `run(ctx)` to yield `AddNode` / `AddEdge` / `AddEntrypoint` ops. Register under the `dead_cst.plugins` entry-point group for CLI discovery.
+Every built-in is a `dead_cst._native.NativePlugin`; there is no Python plugin protocol. Write your own as an **external native (Rust) plugin** that links the dead-cst runtime (see [`NATIVE_PLUGINS.md`](NATIVE_PLUGINS.md)). Out-of-tree plugins register under the `dead_cst.plugins` entry-point group for CLI discovery; the entry point must resolve to (or return) a `NativePlugin`.
 
 Path resolution is similarly pluggable. `PathResolver` implementations return a tuple of `Package` records (`path`, `name`, `deps`) to feed `Analysis`. Builtins: `ManualResolver` (explicit `package:dep` specs from `-p`) and `UvResolver` (parses `uv.lock` to discover workspace members and their inter-member dep edges). Third-party resolvers register under `dead_cst.resolvers`.
 
@@ -289,11 +282,11 @@ Jupyter notebooks (`.ipynb`) are ingested too: code cells are concatenated in do
 
 ## Native plugins (experimental)
 
-Most extensions are [Python plugins](CONTRIBUTING.md#adding-a-plugin) — they
-ship in the wheel and need no toolchain. For hot logic, or plugins that want
-their own salsa-cached queries over ty's database, there's also a **native
-(Rust) plugin** path: a separately-compiled plugin that links the dead-cst
-runtime and runs against a live `ProjectContext`.
+Every built-in plugin is native and ships in the wheel. Out-of-tree extensions
+are also **native (Rust) plugins**: a separately-compiled plugin that links the
+dead-cst runtime and runs against a live `ProjectContext` — including its own
+salsa-cached queries over ty's database. The external compile-and-load flow
+below is still a preview.
 
 ```bash
 pip install dead-cst[build-plugin]            # pulls the rlib compile closure

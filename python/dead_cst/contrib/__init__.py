@@ -1,22 +1,13 @@
-"""Extensions targeting specific third-party tools.
+"""Third-party-aware extensions.
 
-Contrib modules know about external systems -- test runners
-(unittest). Anything that handles a generic Python language
-convention lives in :mod:`dead_cst.plugins` instead.
-
-Click, discord.py, pytest, the ``mock.patch`` idiom, and the
-dispatch-app frameworks (Flask, FastAPI, Typer, Cyclopts, Slack Bolt,
-FastMCP, Celery) are now native plugins resolved through
-``dead_cst._native`` -- see ``NativePlugin.click()``,
-``NativePlugin.discordpy()``, ``NativePlugin.pytest()`` and friends.
-``UnittestPlugin`` is the lone remaining Python contrib plugin (kept
-for its native-parity test until the Python ``Plugin`` ABC is removed).
+The framework- and test-runner-aware plugins that used to live here
+(Flask, FastAPI, Typer, Cyclopts, Slack Bolt, FastMCP, Celery, Click,
+discord.py, pytest, the ``mock.patch`` idiom, unittest) are now native
+plugins resolved through :mod:`dead_cst._native` — see
+``NativePlugin.flask()`` … ``NativePlugin.unittest()``. The package is
+retained as the home for any future third-party-aware contributions.
 """
 
 from __future__ import annotations
 
-from .unittest import UnittestPlugin
-
-__all__ = [
-    "UnittestPlugin",
-]
+__all__: list[str] = []

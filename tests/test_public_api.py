@@ -34,24 +34,16 @@ EXPECTED_PUBLIC_API: dict[str, list[str]] = {
         "write_graph",
     ],
     "dead_cst.plugins": [
-        "DecoratedDeclPlugin",
         "EXTERNAL_DIST_PREFIX",
         "EXTERNAL_FILE_PREFIX",
         "EXTERNAL_PREFIXES",
-        "InitSubclassPlugin",
-        "LiteralListPlugin",
-        "MainBlockPlugin",
-        "ModuleDundersPlugin",
-        "Plugin",
         "STDLIB_PREFIX",
         "SYNTHETIC_PATH_PREFIXES",
         "UNPARSEABLE_PREFIX",
         "UNRESOLVED_PREFIX",
         "simple_name",
     ],
-    "dead_cst.contrib": [
-        "UnittestPlugin",
-    ],
+    "dead_cst.contrib": [],
 }
 
 

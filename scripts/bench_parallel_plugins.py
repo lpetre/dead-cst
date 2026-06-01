@@ -32,14 +32,39 @@ from _bench_common import (  # noqa: E402
 )
 
 from dead_cst import Analysis  # noqa: E402
-from dead_cst.cli import _BUILTIN_PLUGINS  # noqa: E402
+from dead_cst import _native as native  # noqa: E402
+
+# Every built-in plugin name the CLI accepts via ``--plugin``, resolved
+# through the same native registry (``_builtin_native_plugin``). Listed
+# explicitly so the bench covers the full shipped set.
+_BUILTIN_PLUGIN_NAMES = [
+    "main_block",
+    "module_dunders",
+    "init_subclass",
+    "server_config",
+    "unittest",
+    "flask",
+    "fastapi",
+    "typer",
+    "cyclopts",
+    "slack_bolt",
+    "fastmcp",
+    "celery",
+    "click",
+    "mock_patch",
+    "discordpy",
+    "pytest",
+    "project_scripts",
+    "dynamic_import_fallback",
+]
 
 
 def _all_builtin_plugins() -> list:
-    """Return the CLI's default set of built-in plugins. Plugins are
-    stateless after construction so reusing one instance per
-    materialize call is safe."""
-    return list(_BUILTIN_PLUGINS.values())
+    """Every built-in plugin, resolved through the native registry
+    (``_builtin_native_plugin``) the CLI uses for ``--plugin``. Native
+    plugins are stateless after construction, so reusing one instance
+    per materialize call is safe."""
+    return [native._builtin_native_plugin(name) for name in _BUILTIN_PLUGIN_NAMES]
 
 
 def _one_run(target: TargetConfig, plugins: list) -> float:

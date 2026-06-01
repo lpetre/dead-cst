@@ -42,7 +42,6 @@ from .graph import (
     read_graph,
     write_graph,
 )
-from .plugins import Plugin
 
 if TYPE_CHECKING:
     GraphView = native.ProjectContext | LoadedGraph
@@ -51,37 +50,33 @@ if TYPE_CHECKING:
 app = typer.Typer(help="Dead code analysis for Python.")
 
 
-# Python-side built-ins. Every built-in plugin is now a native (Rust)
-# plugin resolved through ``_builtin_native_plugin`` (consulted first by
-# ``_load_plugin``), so this map is empty — it remains only as the
-# fall-through slot for any future Python-only built-in. The ``explicit``
-# entrypoint plugin is driven by ``-e`` / ``--entrypoint-regex`` (see
-# ``build_plugins``), not by ``--plugin``.
-_BUILTIN_PLUGINS: dict[str, Plugin] = {}
+def _load_plugin(name: str) -> native.NativePlugin:
+    """Resolve a ``--plugin`` name to a :class:`native.NativePlugin`.
 
-
-def _load_plugin(name: str) -> Plugin | native.NativePlugin:
+    Built-in names (``main_block``, ``flask``, ``pytest``, …) resolve
+    through ``_builtin_native_plugin``. Out-of-tree plugins register a
+    ``dead_cst.plugins`` entry point whose target is (or returns) a
+    :class:`native.NativePlugin` — typically a configured built-in or
+    an external dylib plugin loaded via
+    :func:`native.load_native_plugins`.
+    """
     nat = native._builtin_native_plugin(name)
     if nat is not None:
         return nat
-
-    builtin = _BUILTIN_PLUGINS.get(name)
-    if builtin is not None:
-        return builtin
 
     from importlib.metadata import entry_points
 
     for ep in entry_points(group="dead_cst.plugins"):
         if ep.name == name:
             loaded = ep.load()
-            if isinstance(loaded, Plugin):
+            if isinstance(loaded, native.NativePlugin):
                 return loaded
             if callable(loaded):
                 instance = loaded()
-                if isinstance(instance, Plugin):
+                if isinstance(instance, native.NativePlugin):
                     return instance
             raise TypeError(
-                f"Plugin entry point {name!r} did not resolve to a Plugin instance "
+                f"Plugin entry point {name!r} did not resolve to a NativePlugin instance "
                 f"(got {type(loaded).__name__})"
             )
     raise KeyError(f"Unknown edge plugin: {name!r}")
@@ -129,8 +124,8 @@ def build_plugins(
     entrypoints: list[str],
     entrypoint_regexes: list[str],
     plugin_names: list[str],
-) -> list[Plugin | native.NativePlugin]:
-    plugins: list[Plugin | native.NativePlugin] = [_load_plugin(name) for name in plugin_names]
+) -> list[native.NativePlugin]:
+    plugins: list[native.NativePlugin] = [_load_plugin(name) for name in plugin_names]
     plugins.append(native.NativePlugin.module_dunders())
     # ``entrypoints`` are exact fqnames / project-relative file paths;
     # ``entrypoint_regexes`` match the project-relative path. The native

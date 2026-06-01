@@ -1,19 +1,14 @@
-"""Tests for :class:`ModuleDundersPlugin`.
-
-Runs against both backends via :func:`build_plugin_graph` so the rust
-``ProjectContext`` plugin protocol is exercised against the same scenarios
-as libcst's ``observe`` / ``finalize`` pair.
-"""
+"""Tests for the native ``module_dunders`` plugin (``NativePlugin.module_dunders``)."""
 
 from __future__ import annotations
 
-from dead_cst.plugins import ModuleDundersPlugin
+from dead_cst import _native as native
 
 
 def test_keeps_all_alive(build_plugin_graph, reachable_fqnames):
     graph = build_plugin_graph(
         {"pkg/__init__.py": '__all__ = ["a"]\na = 1'},
-        [ModuleDundersPlugin()],
+        [native.NativePlugin.module_dunders()],
     )
     reached = reachable_fqnames(graph)
     assert "pkg.__all__" in reached
@@ -29,7 +24,7 @@ def test_keeps_other_dunders_alive(build_plugin_graph, reachable_fqnames):
                 '__version__ = "1.0.0"\n__author__ = "someone"\n__license__ = "MIT"\nunused = 1\n'
             ),
         },
-        [ModuleDundersPlugin()],
+        [native.NativePlugin.module_dunders()],
     )
     reached = reachable_fqnames(graph)
     assert {"pkg.__version__", "pkg.__author__", "pkg.__license__"} <= reached
@@ -44,7 +39,7 @@ def test_keeps_future_imports_alive(build_plugin_graph, reachable_fqnames):
                 "from __future__ import annotations\nfrom __future__ import division\nunused = 1\n"
             ),
         },
-        [ModuleDundersPlugin()],
+        [native.NativePlugin.module_dunders()],
     )
     reached = reachable_fqnames(graph)
     # The local bindings of ``from __future__ import X`` are kept alive
@@ -57,7 +52,7 @@ def test_keeps_future_imports_alive(build_plugin_graph, reachable_fqnames):
 def test_ignores_non_future_imports_with_plain_names(build_plugin_graph, reachable_fqnames):
     graph = build_plugin_graph(
         {"pkg/__init__.py": "from os import path\n"},
-        [ModuleDundersPlugin()],
+        [native.NativePlugin.module_dunders()],
     )
     reached = reachable_fqnames(graph)
     # Non-``__future__`` imports of plain names stay dead absent another entrypoint.
@@ -82,7 +77,7 @@ def test_keeps_module_level_dunder_functions_alive(build_plugin_graph, reachable
                 "    return _EXPORTS\n"
             ),
         },
-        [ModuleDundersPlugin()],
+        [native.NativePlugin.module_dunders()],
     )
     reached = reachable_fqnames(graph)
     assert {"pkg.__getattr__", "pkg.__dir__"} <= reached
@@ -104,7 +99,7 @@ def test_does_not_pin_class_dunder_methods(build_plugin_graph, reachable_fqnames
                 "class C:\n    def __init__(self): pass\n    def __call__(self): pass\n"
             ),
         },
-        [ModuleDundersPlugin()],
+        [native.NativePlugin.module_dunders()],
     )
     reached = reachable_fqnames(graph)
     # The class itself isn't pinned absent another entrypoint.
@@ -120,7 +115,7 @@ def test_ignores_non_dunder_underscore_names(build_plugin_graph, reachable_fqnam
                 "trailing__ = 3\n"  # trailing dunder only
             ),
         },
-        [ModuleDundersPlugin()],
+        [native.NativePlugin.module_dunders()],
     )
     reached = reachable_fqnames(graph)
     assert "pkg._private" not in reached

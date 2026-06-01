@@ -28,7 +28,7 @@ touching the rust crate.
 │   Phase 1 — decls       ty SemanticIndex + ruff AST          │
 │   Phase 2 — chain       parent-module + import edges         │
 │   Phase 3 — references  ty use-def chains for every Name     │
-│   Plugins               plugin.run(ctx) -> AddNode/AddEdge   │
+│   Plugins               NativePlugin ops → Node/Edge/Entry   │
 └────────────────────────────┬─────────────────────────────────┘
                              │ live ProjectContext
                              ▼
@@ -75,7 +75,7 @@ Module layout (`runtime/src/lib.rs`'s `register()` registers the pymodule; the
 | `src/lib.rs`                    | the cdylib shim: pyo3 `#[pymodule]` forwarding to `runtime::register` |
 | `runtime/src/lib.rs`            | `register()`, top-level `query()` helper |
 | `runtime/src/project.rs`        | `Project`, `ProjectContext`, the `build()` pipeline |
-| `runtime/src/builder.rs`        | `NodeKey`, `GraphBuilder`, `AddNode` / `AddEdge` / `AddEntrypoint`, generic BFS |
+| `runtime/src/builder.rs`        | `NodeKey`, `GraphBuilder`, `PreparedOp` (`Node` / `Edge` / `Entrypoint`), generic BFS |
 | `runtime/src/graph.rs`          | `SymbolNode`, `Import`, `NativeGraph`, `NodeFlags`, `EdgeFlags` |
 | `runtime/src/ingest.rs`         | the three build phases (decls / chain / references) |
 | `runtime/src/query.rs`          | the plugin-facing `query(ctx).decorators()....collect()` builder |
@@ -183,54 +183,39 @@ non-definition statements attribute to the module node itself.
 Statically-dead regions identified by ty's reachability constraints
 get their outgoing edges flagged `EdgeFlags.DEAD_BRANCH`.
 
-### 4. Plugins — `dead_cst/plugins/` and `dead_cst/contrib/`
+### 4. Plugins — `runtime/src/native_plugins.rs`
 
-After the three phases, each registered plugin's `run(ctx)` is invoked
-with the in-progress `ProjectContext`. Plugins yield `AddNode` /
-`AddEdge` / `AddEntrypoint` ops; the rust apply pass folds them into
-the graph atomically before `materialize()` returns. There is no
-two-phase observe/finalize split anymore — one method, one pass.
+After the three phases, the registered plugins contribute graph ops.
+Every plugin is a native (Rust) `NativePlugin`; there is no Python
+`Plugin` protocol. Project-wide plugins run against the in-progress
+`ProjectContext` and collect `PreparedOp` rows (`Node` / `Edge` /
+`Entrypoint`); per-file plugins are salsa-cached during the build. The
+rust apply pass folds every collected handle into the graph atomically
+(`apply_ops_batched`) before `materialize()` returns. There is no
+two-phase observe/finalize split — one collect, one apply.
 
-The plugin contract:
-
-```python
-class Plugin:
-    def run(self, ctx: native.ProjectContext) -> Iterable[native.GraphOp]:
-        ...
-```
-
-Plugin queries live on `native.ProjectContext`. For common shapes use
-the chainable builder:
+A plugin builds against the query surface on `native.ProjectContext`.
+For common shapes use the chainable builder:
 
 ```python
-for ref in query(ctx).decorators().where_module("flask").collect():
-    yield AddEdge(...)
+native.query(ctx).decorators().where_module("flask").where_name("route").collect()
 ```
 
 Direct accessors (`find_module`, `find_declarations`, `module_for`,
-`find_main_blocks`, …) cover the rest. See `python/dead_cst/_native.pyi`
-for the full surface.
+`find_main_blocks`, …) cover the rest. The same DSL is callable from
+Python against a materialized context; `collect()` returns index-keyed
+rows (`DecoratorIdxRef.decorated_idx`, etc.). See
+`python/dead_cst/_native.pyi` for the full surface.
 
-Two declarative bases ship as scaffolding for common shapes
-(`plugins/decl_shapes.py`):
-
-* `DecoratedDeclPlugin` — decorated decls in files matching a search
-  path.
-* `LiteralListPlugin` — `<owner>.<var> = ['fqn', ...]` registries.
-
-The `@<instance>.<reg>(...)` dispatch-app shape (Flask / FastAPI /
-Typer / Cyclopts / Slack Bolt / FastMCP / Celery) is a native
-(Rust) plugin — `NativePlugin.flask()` … `NativePlugin.celery()` —
-not a Python base.
-
-Every builtin is now a native (Rust) plugin, resolved through
-`native._builtin_native_plugin` (consulted first by the CLI's
-`_load_plugin`); `cli._BUILTIN_PLUGINS` (Python) is empty, kept only
-as the fall-through slot for out-of-tree Python plugins. A few Python
-plugins survive in `dead_cst/plugins/` (`MainBlockPlugin`,
-`ModuleDundersPlugin`, `InitSubclassPlugin`) and `dead_cst/contrib/`
-(`UnittestPlugin`) purely as native-parity test twins; they go when
-the Python `Plugin` ABC is removed.
+Every built-in is resolved through `native._builtin_native_plugin`
+(consulted first by the CLI's `_load_plugin`, which otherwise falls
+through to the `dead_cst.plugins` entry-point group). The dispatch-app
+frameworks (Flask / FastAPI / Typer / Cyclopts / Slack Bolt / FastMCP /
+Celery), Click, pytest, mock_patch, discordpy, and the rest are all
+`*PluginImpl`s in `runtime/src/native_plugins.rs` (see `ClickPluginImpl`,
+`DispatchAppPluginImpl`, and friends). Out-of-tree plugins are external
+native plugins compiled against the runtime dylib (see
+[`NATIVE_PLUGINS.md`](NATIVE_PLUGINS.md)).
 
 ### 5. Reachability — `Analysis.reachable` and friends
 

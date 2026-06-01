@@ -1,10 +1,8 @@
-"""Shared constants and helpers for edge plugins.
+"""Synthetic-node prefixes and the :func:`simple_name` helper.
 
-Plugins implement :meth:`run(ctx)` against a
-:class:`dead_cst._native.ProjectContext`. The rust backend invokes
-each plugin's ``run`` once after building the project's symbol graph,
-collecting the yielded ``GraphOp`` values and applying them to the
-in-progress graph.
+The rust backend emits these fqname prefixes for non-first-party
+imports; callers consume them to filter the graph for external
+dependencies (``[external dist] requests``, ``[stdlib] os``, …).
 """
 
 from __future__ import annotations

@@ -35,13 +35,13 @@ from dead_cst.graph import GraphMetadata, SymbolNode, read_graph
 
 
 def _plugin_name(p) -> str:
-    """Display name for a plugin regardless of Python vs native.
+    """Display name for a plugin — its native ``.name`` getter.
 
-    Native plugins (``main_block``, ``module_dunders``, …) expose a
-    ``.name`` getter ("MainBlockPlugin"); Python plugins are identified
-    by their class name.
+    Every built-in is a ``NativePlugin`` (``main_block``,
+    ``module_dunders``, …) whose ``.name`` mirrors the conventional
+    class name ("MainBlockPlugin").
     """
-    return getattr(p, "name", None) or type(p).__name__
+    return p.name
 
 
 def _normalise(s: str) -> str:

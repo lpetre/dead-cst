@@ -5,9 +5,6 @@ from __future__ import annotations
 import pytest
 
 from dead_cst import _native as native
-from dead_cst.plugins import (
-    MainBlockPlugin,
-)
 
 
 def test_click_plugin_marks_command_handlers(build_plugin_graph, reachable_fqnames):
@@ -35,7 +32,7 @@ def test_click_plugin_marks_command_handlers(build_plugin_graph, reachable_fqnam
                 cli()
             """,
         },
-        [MainBlockPlugin(), native.NativePlugin.click()],
+        [native.NativePlugin.main_block(), native.NativePlugin.click()],
     )
     reached = reachable_fqnames(graph)
     assert "cli.main.cli" in reached
@@ -75,7 +72,7 @@ def test_click_plugin_keeps_handler_dependencies_alive(build_plugin_graph, reach
                 cli()
             """,
         },
-        [MainBlockPlugin(), native.NativePlugin.click()],
+        [native.NativePlugin.main_block(), native.NativePlugin.click()],
     )
     reached = reachable_fqnames(graph)
     assert "cli.main.show" in reached
@@ -166,7 +163,7 @@ def test_click_plugin_unused_subgroup_stays_dead(build_plugin_graph, reachable_f
                 cli()
             """,
         },
-        [MainBlockPlugin(), native.NativePlugin.click()],
+        [native.NativePlugin.main_block(), native.NativePlugin.click()],
     )
     reached = reachable_fqnames(graph)
     assert "cli.main.hello" in reached
@@ -203,7 +200,7 @@ def test_click_plugin_subgroup_reachable_via_add_command(build_plugin_graph, rea
                 cli()
             """,
         },
-        [MainBlockPlugin(), native.NativePlugin.click()],
+        [native.NativePlugin.main_block(), native.NativePlugin.click()],
     )
     reached = reachable_fqnames(graph)
     assert "cli.main.cli" in reached
@@ -233,7 +230,7 @@ def test_click_plugin_subgroup_via_decorator(build_plugin_graph, reachable_fqnam
                 cli()
             """,
         },
-        [MainBlockPlugin(), native.NativePlugin.click()],
+        [native.NativePlugin.main_block(), native.NativePlugin.click()],
     )
     reached = reachable_fqnames(graph)
     assert "cli.main.cli" in reached
@@ -308,7 +305,7 @@ def test_click_plugin_subgroup_via_decorator(build_plugin_graph, reachable_fqnam
 def test_click_plugin_handles_import_variants(build_plugin_graph, reachable_fqnames, src):
     graph = build_plugin_graph(
         {"cli/__init__.py": "", "cli/main.py": src},
-        [MainBlockPlugin(), native.NativePlugin.click()],
+        [native.NativePlugin.main_block(), native.NativePlugin.click()],
     )
     assert "cli.main.hello" in reachable_fqnames(graph)
 
@@ -333,7 +330,7 @@ def test_click_plugin_ignores_bare_decorators(build_plugin_graph, reachable_fqna
                 cli()
             """,
         },
-        [MainBlockPlugin(), native.NativePlugin.click()],
+        [native.NativePlugin.main_block(), native.NativePlugin.click()],
     )
     # Bare ``@command`` (no attribute access) is not a Click registration --
     # matching it would clobber unrelated decorators with the same name.
@@ -406,7 +403,7 @@ def test_click_plugin_multiple_groups_in_one_module(build_plugin_graph, reachabl
                 cli()
             """,
         },
-        [MainBlockPlugin(), native.NativePlugin.click()],
+        [native.NativePlugin.main_block(), native.NativePlugin.click()],
     )
     reached = reachable_fqnames(graph)
     # ``cli`` is reached via the main block; its command is alive.
@@ -437,7 +434,7 @@ def test_click_plugin_ignores_import_star(build_plugin_graph, reachable_fqnames)
                 cli()
             """,
         },
-        [MainBlockPlugin(), native.NativePlugin.click()],
+        [native.NativePlugin.main_block(), native.NativePlugin.click()],
     )
     # No instance edge from ``cli`` to ``hello`` because the plugin ignores
     # star imports.
@@ -550,7 +547,7 @@ def test_click_plugin_ignores_non_group_assignment_shapes(build_plugin_graph, re
                 cli()
             """,
         },
-        [MainBlockPlugin(), native.NativePlugin.click()],
+        [native.NativePlugin.main_block(), native.NativePlugin.click()],
     )
     reached = reachable_fqnames(graph)
     assert "cli.main.cli" in reached

@@ -1,46 +1,38 @@
-//! Native (rust-side) plugins — in-tree only.
+//! Native (rust-side) plugins — the only plugin mechanism.
 //!
-//! A native plugin is a rust implementation of the plugin contract
-//! that skips the Python `.run(ctx)` call entirely: the harness
-//! detects a :class:`NativePlugin` pyclass via downcast in
+//! A native plugin is a rust implementation of the plugin contract:
+//! the harness detects a :class:`NativePlugin` pyclass via downcast in
 //! ``collect_prepared_plugin_ops``, invokes the inner
-//! [`NativePluginImpl::run`] directly, and the impl pushes its
-//! ops into the shared [`PreparedOp`] sink — no Python ``GraphOp``
-//! instances are ever constructed, no per-op ``extract`` /
-//! ``prepare_graph_op`` extraction step.
+//! [`NativePluginImpl::run`] directly, and the impl pushes its ops into
+//! the shared [`PreparedOp`] sink the harness drains at the end of the
+//! plugin pass. There is no Python ``.run(ctx)`` call and no per-op
+//! ``extract`` round-trip — the impl emits pure-rust [`PreparedOp`]
+//! variants directly.
 //!
-//! **Scope.** Native plugins are an in-tree fast-path for bundled
-//! plugins whose logic is fixed and hot. They're not a public
-//! extension mechanism: the trait and its dependent types
-//! ([`PreparedOp`], [`ProjectContext`]) are `pub(crate)` by design,
-//! the `dead-cst-native` crate is not published to crates.io, and
-//! the rust API has no stability commitment. Out-of-tree plugin
-//! authors continue to use the Python :class:`Plugin` protocol —
-//! they can still write hot code in rust, but they ship it as a
-//! pyo3 extension that their `run(ctx)` body calls into, and they
-//! emit ops via the public Python ``AddNodeByIdx`` / ``AddEdgeByIdx``
-//! / ``AddEntrypointByIdx`` graph ops.
+//! **Scope.** The trait and its dependent types ([`PreparedOp`],
+//! [`ProjectContext`]) are `pub(crate)` by design, the
+//! `dead-cst-native` crate is not published to crates.io, and the rust
+//! API has no stability commitment. In-tree plugins implement
+//! [`NativePluginImpl`] directly; out-of-tree authors ship an external
+//! native plugin compiled against the shipped runtime dylib and loaded
+//! via [`load_native_plugins`] (see ``NATIVE_PLUGINS.md``).
 //!
-//! Trade-off vs the Python-side plugin path (for in-tree authors):
+//! Design properties:
 //!
-//! * **Lighter per-op cost** — every Python plugin op pays one
-//!   ``Py::new(AddNodeByIdx { ... })`` allocation on the yield side,
-//!   then one ``extract::<PyRef<...>>`` + ``.clone()`` of the inner
-//!   fields on the harness side. Native plugins skip both ends.
-//! * **No GIL release between op yields** — the impl runs entirely
-//!   in rust under one GIL hold; rust queries inside the impl can
-//!   still drop the GIL via ``py.allow_threads`` if they want to.
-//! * **Costs flexibility** — a native plugin's logic is compiled
-//!   into the wheel; it can't be authored / overridden / dataclass-
-//!   configured externally. Python plugins remain the right home
-//!   for anything user-configurable.
+//! * **Pure-rust ops** — the impl pushes [`PreparedOp`] variants
+//!   straight into the sink; no ``Py::new`` per op and no
+//!   ``extract::<PyRef<...>>`` on the harness side.
+//! * **One GIL hold** — the impl runs entirely in rust under a single
+//!   GIL hold; rust queries inside the impl can still drop the GIL via
+//!   ``py.allow_threads`` when they want to.
+//! * **Fixed at build time** — a native plugin's logic is compiled into
+//!   the wheel; configuration is supplied through its factory (e.g.
+//!   ``NativePlugin::server_config(filenames=...)``).
 //!
-//! The frozen-graph contract is identical on both paths: the impl
-//! observes the base graph mid-pass, emits ops, ops apply in a
-//! single batch after every plugin completes. Native plugins are
-//! drop-in interchangeable with Python ones in
-//! ``Analysis(plugins=[...])`` and inside the harness's
-//! :class:`ThreadPoolExecutor` fan-out.
+//! Frozen-graph contract: the impl observes the base graph mid-pass,
+//! emits ops, and ops apply in a single batch after every plugin
+//! completes. Native plugins run in ``Analysis(plugins=[...])`` and
+//! inside the harness's :class:`ThreadPoolExecutor` fan-out.
 
 use std::ffi::c_void;
 use std::hash::{Hash, Hasher};
@@ -72,9 +64,8 @@ use crate::project::ProjectContext;
 /// shared [`PreparedOp`] sink the harness drains at the end of the
 /// plugin pass.
 ///
-/// Implementations don't construct Python ``GraphOp`` instances —
-/// they push pure-rust [`PreparedOp`] variants directly, skipping
-/// the prepare-from-Python round-trip. No ``Python<'_>`` parameter
+/// Implementations push pure-rust [`PreparedOp`] variants directly
+/// into the sink. No ``Python<'_>`` parameter
 /// either: every ctx accessor a native plugin needs (``node_attrs``,
 /// ``find_main_blocks_indices``, the query DSL helpers) is GIL-free,
 /// reading ``Sync`` ``#[pyclass(frozen)]`` data via ``Py::get`` rather
@@ -132,10 +123,10 @@ pub(crate) trait NativePluginImpl: Send + Sync {
 /// per-file plugin's output, so it must be pure rust + ``salsa::Update``
 /// (no ``File`` handle, no global idx — both would couple the cache to
 /// project-wide assemble order). Mirrors the three project-wide
-/// ``*ByIdx`` ops, restricted to a single file's index space.
+/// [`PreparedOp`] variants, restricted to a single file's index space.
 #[derive(Debug, Clone, Eq, PartialEq, salsa::Update, get_size2::GetSize)]
 pub(crate) enum FileLocalOp {
-    /// Mint a synthetic node in this file (`AddNodeByIdx` shape) with an
+    /// Mint a synthetic node in this file (`PreparedOp::Node` shape) with an
     /// out-edge to each file-local index in ``edges_to_local_idx`` and an
     /// in-edge from each file-local index in ``edges_from_local_idx``.
     Node {
@@ -147,7 +138,7 @@ pub(crate) enum FileLocalOp {
         /// File-local indices that point *to* this node (in-edges).
         edges_from_local_idx: Vec<u32>,
     },
-    /// Reachability edge between two nodes in this file (`AddEdgeByIdx`
+    /// Reachability edge between two nodes in this file (`PreparedOp::Edge`
     /// shape). Both endpoints are file-local indices.
     Edge {
         src_local_idx: u32,
@@ -155,7 +146,7 @@ pub(crate) enum FileLocalOp {
         flags: u32,
     },
     /// Keep a node in this file alive via a synthetic entrypoint marker
-    /// (`AddEntrypointByIdx` shape). ``decl_local_idx`` is a file-local
+    /// (`PreparedOp::Entrypoint` shape). ``decl_local_idx`` is a file-local
     /// index.
     Entrypoint { decl_local_idx: u32, marker: String },
 }
@@ -1527,8 +1518,9 @@ pub mod plugin_api {
 
     /// Op sink for external plugins. Wraps the internal `PreparedOp` vec so
     /// plugins emit through named methods instead of constructing internals.
-    /// Mirrors the three Python graph ops a plugin can yield —
-    /// `AddEntrypointByIdx` / `AddEdgeByIdx` / `AddNodeByIdx`.
+    /// Exposes the three [`PreparedOp`] variants —
+    /// `Entrypoint` / `Edge` / `Node` — as `keep_alive` / `add_edge` /
+    /// `add_synthetic_node`.
     pub struct PluginOps {
         sink: Vec<PreparedOp>,
     }
@@ -1543,18 +1535,17 @@ pub mod plugin_api {
         }
 
         /// Keep `decl_idx` reachable via a synthetic entrypoint named
-        /// `marker`. Mirrors the in-tree `AddEntrypointByIdx` graph op.
+        /// `marker`. Emits a [`PreparedOp::Entrypoint`].
         pub fn keep_alive(&mut self, decl_idx: usize, marker: String) {
-            self.sink
-                .push(PreparedOp::EntrypointByIdx { decl_idx, marker });
+            self.sink.push(PreparedOp::Entrypoint { decl_idx, marker });
         }
 
         /// Add a reachability edge `src_idx -> dst_idx` between two
         /// existing nodes, stamped with `flags` (`0` for a plain edge, or
-        /// one of [`FLAG_DEAD_BRANCH`] / [`FLAG_DYNAMIC_IMPORT`]). Mirrors
-        /// `AddEdgeByIdx`.
+        /// one of [`FLAG_DEAD_BRANCH`] / [`FLAG_DYNAMIC_IMPORT`]). Emits a
+        /// [`PreparedOp::Edge`].
         pub fn add_edge(&mut self, src_idx: usize, dst_idx: usize, flags: u32) {
-            self.sink.push(PreparedOp::EdgeByIdx {
+            self.sink.push(PreparedOp::Edge {
                 src_idx,
                 dst_idx,
                 flags,
@@ -1564,9 +1555,9 @@ pub mod plugin_api {
         /// Mint a new `kind="synthetic"` node named `fqname`, attributed to
         /// source `path` (empty for a placeless marker), with `flags` (see
         /// [`FLAG_ENTRYPOINT`]), an out-edge to each index in `edges_to_idx`,
-        /// and an in-edge from each index in `edges_from_idx`. Mirrors
-        /// `AddNodeByIdx`; the host bounds-checks every endpoint at apply time
-        /// and rejects a dangling index rather than minting an unconnected
+        /// and an in-edge from each index in `edges_from_idx`. Emits a
+        /// [`PreparedOp::Node`]; the host bounds-checks every endpoint at apply
+        /// time and rejects a dangling index rather than minting an unconnected
         /// node.
         pub fn add_synthetic_node(
             &mut self,
@@ -1576,7 +1567,7 @@ pub mod plugin_api {
             edges_to_idx: Vec<usize>,
             edges_from_idx: Vec<usize>,
         ) {
-            self.sink.push(PreparedOp::NodeByIdx {
+            self.sink.push(PreparedOp::Node {
                 fqname,
                 kind: intern_kind("synthetic").expect("'synthetic' is a valid kind"),
                 path,
@@ -1815,7 +1806,7 @@ pub mod plugin_api {
             ops.add_edge(1, 2, FLAG_DYNAMIC_IMPORT);
             assert!(matches!(
                 ops.into_inner().as_slice(),
-                [PreparedOp::EdgeByIdx { src_idx: 1, dst_idx: 2, flags }]
+                [PreparedOp::Edge { src_idx: 1, dst_idx: 2, flags }]
                     if *flags == FLAG_DYNAMIC_IMPORT
             ));
         }
@@ -1831,7 +1822,7 @@ pub mod plugin_api {
                 vec![4, 5],
             );
             let sink = ops.into_inner();
-            let [PreparedOp::NodeByIdx {
+            let [PreparedOp::Node {
                 fqname,
                 kind,
                 path,
@@ -1840,7 +1831,7 @@ pub mod plugin_api {
                 edges_to_idx,
             }] = sink.as_slice()
             else {
-                panic!("expected a single NodeByIdx op");
+                panic!("expected a single Node op");
             };
             assert_eq!(fqname, "syn");
             assert_eq!(*kind, "synthetic");
@@ -2069,7 +2060,7 @@ impl NativePluginImpl for InitSubclassPluginImpl {
             let synthetic = intern_kind("synthetic").expect("'synthetic' is a valid kind");
             for (parent_idx, attr) in parents.iter().zip(attrs.iter()) {
                 let subclass_idxs = ctx.find_subclasses_of_idx(*parent_idx)?;
-                sink.push(PreparedOp::NodeByIdx {
+                sink.push(PreparedOp::Node {
                     fqname: format!("{INIT_SUBCLASS_PREFIX}{}", attr.fqname),
                     kind: synthetic,
                     path: attr.path.clone(),
@@ -2231,7 +2222,7 @@ impl NativePluginImpl for UnittestPluginImpl {
         let module_attrs = ctx.node_attrs(present.iter().map(|(_, i)| *i).collect())?;
         let synthetic = intern_kind("synthetic").expect("'synthetic' is a valid kind");
         for ((path, _idx), attr) in present.iter().zip(module_attrs.iter()) {
-            sink.push(PreparedOp::NodeByIdx {
+            sink.push(PreparedOp::Node {
                 fqname: format!("{UNITTEST_PREFIX}{}", attr.fqname),
                 kind: synthetic,
                 path: path.clone(),
@@ -2481,7 +2472,7 @@ impl NativePluginImpl for DispatchAppPluginImpl {
                     .or_default()
                     .push(var_idx);
                 if cfg.seed_as_entrypoint {
-                    sink.push(PreparedOp::NodeByIdx {
+                    sink.push(PreparedOp::Node {
                         fqname: format!("{app_prefix}{}", node.fqname),
                         kind: synthetic,
                         path: node.path.clone(),
@@ -2496,7 +2487,7 @@ impl NativePluginImpl for DispatchAppPluginImpl {
             // them. `factory_decls` is empty unless seed_as_entrypoint.
             for (decl_idx, kind) in &factory_decls {
                 let node = &nodes[*decl_idx];
-                sink.push(PreparedOp::NodeByIdx {
+                sink.push(PreparedOp::Node {
                     fqname: format!("{factory_prefix}{kind}:{}", node.fqname),
                     kind: synthetic,
                     path: node.path.clone(),
@@ -2514,7 +2505,7 @@ impl NativePluginImpl for DispatchAppPluginImpl {
                 let key = (nodes[*decorated_idx].path.clone(), owner.clone());
                 if cfg.seed_as_entrypoint {
                     if let Some(&var_idx) = vars_by_file.get(&key) {
-                        sink.push(PreparedOp::EdgeByIdx {
+                        sink.push(PreparedOp::Edge {
                             src_idx: var_idx,
                             dst_idx: *decorated_idx,
                             flags: 0,
@@ -2522,7 +2513,7 @@ impl NativePluginImpl for DispatchAppPluginImpl {
                     }
                 } else if let Some(var_idxs) = direct_by_owner.get(&key) {
                     for &var_idx in var_idxs {
-                        sink.push(PreparedOp::EdgeByIdx {
+                        sink.push(PreparedOp::Edge {
                             src_idx: var_idx,
                             dst_idx: *decorated_idx,
                             flags: 0,
@@ -2550,7 +2541,7 @@ impl NativePluginImpl for DispatchAppPluginImpl {
                     }
                     classified.insert(key);
                     let node = &nodes[var_idx];
-                    sink.push(PreparedOp::NodeByIdx {
+                    sink.push(PreparedOp::Node {
                         fqname: format!("{app_prefix}{}", node.fqname),
                         kind: synthetic,
                         path: node.path.clone(),
@@ -2575,7 +2566,7 @@ impl NativePluginImpl for DispatchAppPluginImpl {
                 }
                 for path in path_order {
                     let target_idxs = by_path.remove(&path).unwrap_or_default();
-                    sink.push(PreparedOp::NodeByIdx {
+                    sink.push(PreparedOp::Node {
                         fqname: format!("{}{}", st.marker_prefix, path_basename(&path)),
                         kind: synthetic,
                         path: path.clone(),
@@ -2866,7 +2857,7 @@ impl NativePluginImpl for ClickPluginImpl {
                         if !emitted.insert((owner_idx, *decorated_idx)) {
                             continue;
                         }
-                        sink.push(PreparedOp::EdgeByIdx {
+                        sink.push(PreparedOp::Edge {
                             src_idx: owner_idx,
                             dst_idx: *decorated_idx,
                             flags: 0,
@@ -2975,7 +2966,7 @@ impl NativePluginImpl for MockPatchPluginImpl {
                 .into_iter()
                 .next()
                 .unwrap_or_default();
-            sink.push(PreparedOp::NodeByIdx {
+            sink.push(PreparedOp::Node {
                 fqname: format!("{PATCH_TARGET_PREFIX}{fqname}"),
                 kind: synthetic,
                 path: owner_path,
@@ -3172,7 +3163,7 @@ impl NativePluginImpl for DiscordPyPluginImpl {
                         .entry(node.path.clone())
                         .or_default()
                         .insert(simple_name(&node.fqname).to_string(), var_idx);
-                    sink.push(PreparedOp::EntrypointByIdx {
+                    sink.push(PreparedOp::Entrypoint {
                         decl_idx: var_idx,
                         marker: DISCORDPY_APP_MARKER.to_string(),
                     });
@@ -3183,7 +3174,7 @@ impl NativePluginImpl for DiscordPyPluginImpl {
                     let path = nodes[*decorated_idx].path.as_str();
                     if let Some(&owner_idx) = bot_vars_by_file.get(path).and_then(|m| m.get(owner))
                     {
-                        sink.push(PreparedOp::EdgeByIdx {
+                        sink.push(PreparedOp::Edge {
                             src_idx: owner_idx,
                             dst_idx: *decorated_idx,
                             flags: 0,
@@ -3211,7 +3202,7 @@ impl NativePluginImpl for DiscordPyPluginImpl {
                 if let Some(hooks) = hook_funcs_by_path.get(path) {
                     targets.extend(hooks.iter().copied());
                 }
-                sink.push(PreparedOp::NodeByIdx {
+                sink.push(PreparedOp::Node {
                     fqname: format!("{DISCORDPY_COG_PREFIX}{}", path_basename(path)),
                     kind: synthetic,
                     path: path.clone(),
@@ -3231,7 +3222,7 @@ impl NativePluginImpl for DiscordPyPluginImpl {
                     if targets.is_empty() {
                         continue;
                     }
-                    sink.push(PreparedOp::NodeByIdx {
+                    sink.push(PreparedOp::Node {
                         fqname: format!("{DISCORDPY_EXTENSION_PREFIX}{ext_fqname}"),
                         kind: synthetic,
                         path: owner_path.clone(),
@@ -3420,7 +3411,7 @@ impl NativePluginImpl for DynamicImportFallbackPluginImpl {
                 cache.insert(dst_fqname.clone(), exports);
             }
             for &export_idx in &cache[&dst_fqname] {
-                sink.push(PreparedOp::EdgeByIdx {
+                sink.push(PreparedOp::Edge {
                     src_idx,
                     dst_idx: export_idx,
                     flags: 0,
@@ -3464,7 +3455,7 @@ impl NativePluginImpl for ExplicitEntrypointPluginImpl {
             self.abs_paths.clone(),
         )?;
         for idx in idxs {
-            sink.push(PreparedOp::EntrypointByIdx {
+            sink.push(PreparedOp::Entrypoint {
                 decl_idx: idx,
                 marker: EXPLICIT_ENTRYPOINT_MARKER.to_string(),
             });
@@ -3546,7 +3537,7 @@ impl NativePluginImpl for ProjectScriptsPluginImpl {
             if target_idxs.is_empty() {
                 continue;
             }
-            sink.push(PreparedOp::NodeByIdx {
+            sink.push(PreparedOp::Node {
                 fqname: format!("{PROJECT_SCRIPTS_PREFIX}{script_name}"),
                 kind: synthetic,
                 path: pyproject.clone(),
@@ -3592,7 +3583,7 @@ fn mark_seed(
     if target_idxs.is_empty() {
         return;
     }
-    sink.push(PreparedOp::NodeByIdx {
+    sink.push(PreparedOp::Node {
         fqname,
         kind,
         path,
@@ -3795,7 +3786,7 @@ impl NativePluginImpl for PytestPluginImpl {
                     for name in names {
                         if let Some(fixture_idxs) = fixtures_by_name.get(&name) {
                             for &fixture_idx in fixture_idxs {
-                                sink.push(PreparedOp::EdgeByIdx {
+                                sink.push(PreparedOp::Edge {
                                     src_idx: *test_idx,
                                     dst_idx: fixture_idx,
                                     flags: 0,
@@ -3811,7 +3802,7 @@ impl NativePluginImpl for PytestPluginImpl {
                     for name in names {
                         if let Some(fixture_idxs) = fixtures_by_name.get(&name) {
                             for &fixture_idx in fixture_idxs {
-                                sink.push(PreparedOp::EdgeByIdx {
+                                sink.push(PreparedOp::Edge {
                                     src_idx: *cls_idx,
                                     dst_idx: fixture_idx,
                                     flags: 0,

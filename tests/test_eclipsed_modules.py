@@ -13,7 +13,6 @@ from __future__ import annotations
 
 from dead_cst import _native as native
 from dead_cst.graph import KEEPALIVE_DEFAULT
-from dead_cst.plugins import MainBlockPlugin
 
 
 def test_package_wins_trie_slot_for_cross_module_imports(
@@ -54,7 +53,7 @@ def test_eclipsed_file_keeps_main_block_entrypoint(tmp_path, write_files, make_a
             "pkg/foo/__init__.py": "value = 1\n",
         }
     )
-    analysis = make_analysis(plugins=[MainBlockPlugin()])
+    analysis = make_analysis(plugins=[native.NativePlugin.main_block()])
     graph = analysis.materialize_all()
     reachable = set(graph.reachable(seed_flags=KEEPALIVE_DEFAULT))
 
