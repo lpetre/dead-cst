@@ -105,6 +105,34 @@ two versions.
   `edges_from` (in-edge) list — so the airlock's write surface can stamp
   dead-branch / dynamic-import edges and wire a synthetic node's full
   in/out edges.
+- **Unified plugin API — every built-in dogfoods the curated surface.**
+  All in-tree built-ins now implement the *same*
+  `plugin_api::ExternalPlugin` / `PerFilePlugin` traits an external plugin
+  compiles against; the parallel internal plugin traits are gone, so the
+  curated surface is the only plugin surface and can no longer drift from
+  what the shipped plugins use. To make that possible:
+  - `ExternalPlugin::run` is now **fallible** —
+    `run(&PluginCtx, &mut PluginOps) -> Result<(), PluginError>`. A
+    returned `Err` aborts the materialize and surfaces to Python as an
+    exception (`PluginError::value(..)` → `ValueError`,
+    `PluginError::runtime(..)` → `RuntimeError`); previously an external
+    plugin's failure was silently swallowed. `PluginError` is pyo3-free;
+    per-file `run_on_file` stays infallible. (Breaking for the
+    experimental external API: a plugin's `run` must now return
+    `Ok(())`.)
+  - `PluginCtx` grew to cover every query the built-ins use: bulk reads
+    (`nodes_at`, `node_paths`, `modules_for_paths`, `module_surfaces`),
+    more matchers (`calls_on_var`, `handler_decorators_via`,
+    `decorated_decls_with_args`, `factory_decls`, `classes_defining_method`,
+    `module_top_level_decls`, `has_imports_of` / `imports_of`,
+    `function_parameters` / `class_method_parameters`), a structured
+    `nodes_matching(&NodeFilter)` filter, and the borrowing `nodes()` /
+    `edges()` iterators (`NodeRef` / `EdgeRef`) for whole-graph scans.
+    `CallArgs` / `ArgValue` are re-exported from `plugin_api`.
+  - The internal `FrozenView` query layer was de-Pythoned: its methods
+    return plain `Option` / `Vec` / `Result<_, PluginError>`, so `pyo3`
+    survives only at the true host boundary (the `NativePlugin` pyclass +
+    `materialize`), never threading Python types through GIL-free Rust.
 - `Analysis.re_materialize(events)` — incrementally rebuild the
   project graph against the existing `native.ProjectContext`. The
   caller supplies the change events: typically

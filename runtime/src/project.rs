@@ -51,9 +51,7 @@ use crate::progress::{
     ProgressCounters, ProgressHandle, ProgressSnapshot, PHASE_ASSEMBLE, PHASE_ENUM, PHASE_FQNAME,
     PHASE_PLUGINS, PHASE_POPULATE,
 };
-use crate::query::{
-    _compile_path_regex, _contains_any_identifier, _contains_identifier, par_scan_files,
-};
+use crate::query::{_contains_any_identifier, _contains_identifier, par_scan_files};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 /// A ty-backed analysis project with explicitly-injected configuration.
@@ -3511,17 +3509,6 @@ impl<'a> FrozenView<'a> {
         self.outputs.builder.nodes.len()
     }
 
-    /// `(kind, path, fqname, flags)` snapshot for each index, or `None`
-    /// if any index is out of range.
-    pub(crate) fn node_attrs(&self, indices: &[usize]) -> Option<Vec<crate::helpers::NodeAttrs>> {
-        node_attrs_in(self.outputs, indices)
-    }
-
-    /// Path-only snapshot for each index, or `None` on out-of-range.
-    pub(crate) fn node_paths(&self, indices: &[usize]) -> Option<Vec<String>> {
-        node_paths_in(self.outputs, indices)
-    }
-
     // --- pure-read structural lookups -----------------------------------
 
     pub(crate) fn has_imports_of(&self, module_name: &str) -> bool {
@@ -3735,27 +3722,25 @@ impl<'a> FrozenView<'a> {
     //
     // Each `dyn_clone`s the owned db for the inner `par_scan_files`
     // rayon scope. Nested inside the project-wide plugin scope, this is
-    // safe: rayon scopes compose. `_compile_path_regex` returns a
-    // `PyResult` only to surface a bad caller regex; constructing that
-    // `PyErr` does not touch the interpreter, so these stay GIL-free.
+    // safe: rayon scopes compose. These are GIL-free: no path filtering,
+    // no `PyResult` — the curated plugin surface is the only caller and
+    // it never path-scopes, so the matchers walk every project file.
 
     #[allow(clippy::type_complexity)]
     pub(crate) fn find_decorated_decls(
         &self,
         decorator_modules: &[String],
         decorator_names: &[String],
-        path_regex: Option<&str>,
         extract_args: bool,
-    ) -> PyResult<Vec<(usize, CallArgs)>> {
-        let path_re = _compile_path_regex(path_regex)?;
-        Ok(find_decorated_decls_core(
+    ) -> Vec<(usize, CallArgs)> {
+        find_decorated_decls_core(
             ProjectDb::dyn_clone(&self.db),
             self.outputs,
             decorator_modules,
             decorator_names,
             extract_args,
-            &path_re,
-        ))
+            &None,
+        )
     }
 
     #[allow(clippy::type_complexity)]
@@ -3763,35 +3748,31 @@ impl<'a> FrozenView<'a> {
         &self,
         modules: &[String],
         ctor_names: &[String],
-        path_regex: Option<&str>,
         extract_args: bool,
-    ) -> PyResult<Vec<(usize, String, CallArgs)>> {
-        let path_re = _compile_path_regex(path_regex)?;
-        Ok(find_instance_constructions_core(
+    ) -> Vec<(usize, String, CallArgs)> {
+        find_instance_constructions_core(
             ProjectDb::dyn_clone(&self.db),
             self.outputs,
             modules,
             ctor_names,
             extract_args,
-            &path_re,
-        ))
+            &None,
+        )
     }
 
     #[allow(clippy::type_complexity)]
     pub(crate) fn find_handler_decorators(
         &self,
         decorator_attrs: &[String],
-        path_regex: Option<&str>,
         extract_args: bool,
-    ) -> PyResult<Vec<(String, usize, CallArgs)>> {
-        let path_re = _compile_path_regex(path_regex)?;
-        Ok(find_handler_decorators_core(
+    ) -> Vec<(String, usize, CallArgs)> {
+        find_handler_decorators_core(
             ProjectDb::dyn_clone(&self.db),
             self.outputs,
             decorator_attrs,
             extract_args,
-            &path_re,
-        ))
+            &None,
+        )
     }
 
     #[allow(clippy::type_complexity)]
@@ -3799,18 +3780,16 @@ impl<'a> FrozenView<'a> {
         &self,
         via_attr: &str,
         decorator_attrs: &[String],
-        path_regex: Option<&str>,
         extract_args: bool,
-    ) -> PyResult<Vec<(String, usize, CallArgs)>> {
-        let path_re = _compile_path_regex(path_regex)?;
-        Ok(find_handler_decorators_via_core(
+    ) -> Vec<(String, usize, CallArgs)> {
+        find_handler_decorators_via_core(
             ProjectDb::dyn_clone(&self.db),
             self.outputs,
             via_attr,
             decorator_attrs,
             extract_args,
-            &path_re,
-        ))
+            &None,
+        )
     }
 
     #[allow(clippy::type_complexity)]
@@ -3818,18 +3797,16 @@ impl<'a> FrozenView<'a> {
         &self,
         attr: &str,
         arg_index: usize,
-        path_regex: Option<&str>,
         extract_args: bool,
-    ) -> PyResult<Vec<(usize, String, CallArgs)>> {
-        let path_re = _compile_path_regex(path_regex)?;
-        Ok(find_calls_on_attr_core(
+    ) -> Vec<(usize, String, CallArgs)> {
+        find_calls_on_attr_core(
             ProjectDb::dyn_clone(&self.db),
             self.outputs,
             attr,
             arg_index,
             extract_args,
-            &path_re,
-        ))
+            &None,
+        )
     }
 
     pub(crate) fn find_factory_decls(
@@ -3851,22 +3828,19 @@ impl<'a> FrozenView<'a> {
         modules: &[String],
         name: &str,
         arg_index: usize,
-        path_regex: Option<&str>,
         extract_args: bool,
-    ) -> PyResult<Vec<(usize, String, CallArgs)>> {
-        let path_re = _compile_path_regex(path_regex)?;
-        Ok(find_calls_to_imported_core(
+    ) -> Vec<(usize, String, CallArgs)> {
+        find_calls_to_imported_core(
             ProjectDb::dyn_clone(&self.db),
             self.outputs,
             modules,
             name,
             arg_index,
             extract_args,
-            &path_re,
-        ))
+            &None,
+        )
     }
 
-    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::type_complexity)]
     pub(crate) fn find_calls_on_var(
         &self,
@@ -3874,11 +3848,9 @@ impl<'a> FrozenView<'a> {
         attr: &str,
         arg_index: usize,
         required_positional: Option<usize>,
-        path_regex: Option<&str>,
         extract_args: bool,
-    ) -> PyResult<Vec<(usize, String, CallArgs)>> {
-        let path_re = _compile_path_regex(path_regex)?;
-        Ok(find_calls_on_var_core(
+    ) -> Vec<(usize, String, CallArgs)> {
+        find_calls_on_var_core(
             ProjectDb::dyn_clone(&self.db),
             self.outputs,
             owner,
@@ -3886,8 +3858,8 @@ impl<'a> FrozenView<'a> {
             arg_index,
             required_positional,
             extract_args,
-            &path_re,
-        ))
+            &None,
+        )
     }
 
     pub(crate) fn find_classes_defining_method_indices(&self, method_name: &str) -> Vec<usize> {

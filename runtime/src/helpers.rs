@@ -1050,18 +1050,41 @@ pub(crate) fn nth_positional_string(
 }
 
 /// A string literal extracted from a call keyword argument, or
-/// ``Unknown`` for anything else. The only consumer today is the
+/// ``Unknown`` for anything else. The only in-tree consumer is the
 /// pytest plugin, which reads the ``name=`` alias on ``@pytest.fixture``;
-/// every non-string expression collapses to ``Unknown``.
-#[derive(Clone, Debug)]
-pub(crate) enum ArgValue {
+/// every non-string expression collapses to ``Unknown``. Re-exported from
+/// [`crate::native_plugins::plugin_api`] (pyo3-free) so external plugins
+/// can read decorator/constructor arguments too.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ArgValue {
     Str(String),
     Unknown,
 }
 
+/// Captured keyword arguments of a matched call/decorator, keyed by name.
+/// The map itself is crate-internal (it carries an `FxHashMap`, which the
+/// curated airlock doesn't expose); external plugins read values through
+/// the [`CallArgs::get`] / [`CallArgs::str_value`] accessors.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct CallArgs {
+pub struct CallArgs {
     pub(crate) kwargs: FxHashMap<String, ArgValue>,
+}
+
+impl CallArgs {
+    /// The captured value of keyword argument `key`, if present.
+    pub fn get(&self, key: &str) -> Option<&ArgValue> {
+        self.kwargs.get(key)
+    }
+
+    /// The string value of keyword argument `key`, if it was captured as a
+    /// string literal (the `@pytest.fixture(name="…")` shape). `None` for a
+    /// missing key or a non-string value.
+    pub fn str_value(&self, key: &str) -> Option<&str> {
+        match self.kwargs.get(key) {
+            Some(ArgValue::Str(s)) => Some(s.as_str()),
+            _ => None,
+        }
+    }
 }
 
 /// Tuple-like result row returned by

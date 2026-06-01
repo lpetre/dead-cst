@@ -1,21 +1,25 @@
 //! Native (rust-side) plugins — the only plugin mechanism.
 //!
-//! A native plugin is a rust implementation of the plugin contract:
-//! the harness detects a :class:`NativePlugin` pyclass via downcast in
+//! A native plugin is a rust implementation of the curated
+//! [`plugin_api::ExternalPlugin`] contract: the harness detects a
+//! :class:`NativePlugin` pyclass via downcast in
 //! ``collect_prepared_plugin_ops``, invokes the inner
-//! [`NativePluginImpl::run`] directly, and the impl pushes its ops into
-//! the shared [`PreparedOp`] sink the harness drains at the end of the
+//! [`plugin_api::ExternalPlugin::run`] directly, and the impl pushes its ops
+//! into the shared [`PreparedOp`] sink the harness drains at the end of the
 //! plugin pass. There is no Python ``.run(ctx)`` call and no per-op
-//! ``extract`` round-trip — the impl emits pure-rust [`PreparedOp`]
-//! variants directly.
+//! ``extract`` round-trip — the impl emits ops through the GIL-free
+//! [`plugin_api::PluginOps`] surface, lowered to pure-rust [`PreparedOp`]
+//! variants.
 //!
-//! **Scope.** The trait and its dependent types ([`PreparedOp`],
-//! [`ProjectContext`]) are `pub(crate)` by design, the
-//! `dead-cst-native` crate is not published to crates.io, and the rust
-//! API has no stability commitment. In-tree plugins implement
-//! [`NativePluginImpl`] directly; out-of-tree authors ship an external
-//! native plugin compiled against the shipped runtime dylib and loaded
-//! via [`load_native_plugins`] (see ``NATIVE_PLUGINS.md``).
+//! **One surface.** In-tree built-ins and out-of-tree authors implement the
+//! *same* curated [`plugin_api`] traits ([`plugin_api::ExternalPlugin`] /
+//! [`plugin_api::PerFilePlugin`]) — there is no separate internal trait. An
+//! out-of-tree author ships an external native plugin compiled against the
+//! shipped runtime dylib and loaded via [`load_native_plugins`] (see
+//! ``NATIVE_PLUGINS.md``); a built-in is the same trait object constructed
+//! in-process. [`PreparedOp`] and [`ProjectContext`] stay `pub(crate)`, the
+//! `dead-cst-native` crate is not published to crates.io, and the rust API
+//! has no stability commitment.
 //!
 //! Design properties:
 //!
@@ -51,56 +55,50 @@ use ty_project::Db as ProjectDb;
 
 use crate::builder::PreparedOp;
 use crate::file_payload::{file_to_nodes, NodeData, NodeKind};
-use crate::graph::{intern_kind, EdgeFlags, NodeFlags};
+use crate::graph::{EdgeFlags, NodeFlags};
 use crate::helpers::{
-    collect_modules_imports_local, decorators_match_imports, find_main_block_range, is_dunder_name,
+    collect_modules_imports_local, decorators_match_imports, is_dunder_name,
     matched_call_target_any, top_level_assign_to_name, ArgValue, CallArgs, FactoryCallFinder,
 };
 use crate::ingest::file_package_name;
 use crate::project::FrozenView;
 
-/// Rust-side plugin contract. Each impl describes how to derive ops
-/// from a frozen [`FrozenView`] and push them into the shared
-/// [`PreparedOp`] sink the harness drains at the end of the plugin pass.
-///
-/// Implementations push pure-rust [`PreparedOp`] variants directly
-/// into the sink. No ``Python<'_>`` parameter either: a [`FrozenView`]
-/// owns its ``ProjectDatabase`` + borrows the frozen ``BuildOutputs``,
-/// so every query a native plugin needs runs GIL-free. That is what
-/// lets the harness fan plugins out across a GIL-free ``rayon`` scope —
-/// each worker holds its own ``Send`` view.
-pub(crate) trait NativePluginImpl: Send + Sync {
-    /// Human-readable name surfaced by ``NativePlugin.name`` and used
-    /// for progress reporting (``plugin_start`` / ``plugin_end``
-    /// events). Should match the conventional name of the equivalent
-    /// Python plugin so existing harness logs read the same.
-    //
-    // Borrowed (not `&'static`) so an impl can own a runtime-built name —
-    // the custom `DispatchAppPluginImpl` carries a caller-supplied `String`.
-    // The bundled impls still return string literals.
-    fn name(&self) -> &str;
-
-    /// Walk the frozen ``ctx`` and append the plugin's ops to
-    /// ``sink``. Same frozen-graph contract as the Python path: the
-    /// impl observes the base graph only; its emissions are folded in
-    /// by the apply pass after every plugin returns.
-    fn run(&self, ctx: &FrozenView<'_>, sink: &mut Vec<PreparedOp>) -> PyResult<()>;
-
-    /// Pre-graph hook, mirroring the Python ``Plugin.prepare`` contract:
-    /// called once with the project root before any graph construction, so
-    /// the impl can scan for config files / framework manifests. Default
-    /// no-op. Runs before the graph exists, so it must not touch
-    /// ``ProjectContext``.
-    fn prepare(&self, _project_root: &str) {}
+/// Map a curated [`plugin_api::PluginError`] onto a Python exception. The
+/// curated surface stays pyo3-free; this is the single crossing point where a
+/// plugin failure becomes a `PyErr` (raised out of `materialize`).
+impl From<plugin_api::PluginError> for PyErr {
+    fn from(err: plugin_api::PluginError) -> Self {
+        let msg = err.message().to_string();
+        match err.kind() {
+            plugin_api::PluginErrorKind::Value => pyo3::exceptions::PyValueError::new_err(msg),
+            plugin_api::PluginErrorKind::Runtime => pyo3::exceptions::PyRuntimeError::new_err(msg),
+        }
+    }
 }
 
-/// Plugin bodies pass indices sourced from the same [`FrozenView`], so a
-/// bounds-checked accessor returning `None` is an internal invariant
-/// violation, not a caller error. Surface it as an `IndexError` (the
-/// contract the former `ProjectContext` pymethods carried) so a logic bug
-/// fails loudly instead of silently truncating results.
-fn in_range<T>(opt: Option<T>) -> PyResult<T> {
-    opt.ok_or_else(|| pyo3::exceptions::PyIndexError::new_err("node index out of range"))
+// Gated to the libpython-linked build (CI's `--no-default-features`); under the
+// default `extension-module` feature pyo3 doesn't link an interpreter, so the
+// GIL calls below would not link.
+#[cfg(all(test, not(feature = "extension-module")))]
+mod plugin_error_boundary_tests {
+    use super::*;
+
+    // Regression guard for the swallow bug: a plugin failure must cross the
+    // boundary as a *typed* `PyErr` (the conversion `PluginJob::run`'s `?`
+    // relies on), not be silently dropped. Locks the kind→exception mapping.
+    #[test]
+    fn plugin_error_maps_to_typed_pyerr() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let runtime: PyErr = plugin_api::PluginError::runtime("boom").into();
+            assert!(runtime.is_instance_of::<pyo3::exceptions::PyRuntimeError>(py));
+            assert!(runtime.to_string().contains("boom"));
+
+            let value: PyErr = plugin_api::PluginError::value("bad toml").into();
+            assert!(value.is_instance_of::<pyo3::exceptions::PyValueError>(py));
+            assert!(value.to_string().contains("bad toml"));
+        });
+    }
 }
 
 /// One registered plugin's GIL-free unit of work for the
@@ -116,7 +114,6 @@ fn in_range<T>(opt: Option<T>) -> PyResult<T> {
 /// post-build work — [`PluginJob::Noop`] keeps the progress-slot
 /// indices aligned with registration order.
 pub(crate) enum PluginJob {
-    ProjectWide(Arc<dyn NativePluginImpl>),
     External(Arc<dyn plugin_api::ExternalPlugin>),
     Noop,
 }
@@ -129,11 +126,12 @@ impl PluginJob {
     /// are folded in; a per-file no-op contributes nothing.
     pub(crate) fn run(&self, view: &FrozenView<'_>, sink: &mut Vec<PreparedOp>) -> PyResult<()> {
         match self {
-            PluginJob::ProjectWide(inner) => inner.run(view, sink),
             PluginJob::External(plugin) => {
                 let pctx = plugin_api::PluginCtx::new(view);
                 let mut ops = plugin_api::PluginOps::new();
-                plugin.run(&pctx, &mut ops);
+                // Propagate (no longer swallow) a plugin failure: `PluginError`
+                // converts to `PyErr` at this boundary and aborts the apply.
+                plugin.run(&pctx, &mut ops)?;
                 sink.extend(ops.into_inner());
                 Ok(())
             }
@@ -169,10 +167,6 @@ pub(crate) fn extract_plugin_jobs(
         };
         let native_ref = native.borrow();
         let (job, name) = match &native_ref.kind {
-            NativePluginKind::ProjectWide(inner) => (
-                PluginJob::ProjectWide(Arc::clone(inner)),
-                inner.name().to_string(),
-            ),
             NativePluginKind::External {
                 plugin,
                 per_file_id: None,
@@ -210,7 +204,7 @@ pub(crate) fn extract_plugin_jobs(
 // those to global indices at apply time via the ``ref_to_global`` map.
 // ---------------------------------------------------------------------------
 
-/// File-local op produced by a [`PerFileNativePluginImpl`]. Every
+/// File-local op produced by a [`plugin_api::PerFilePlugin`]. Every
 /// endpoint is a *file-local* index (position in the file's own
 /// ``FileNodes.refs`` array), never a global graph index — the harness
 /// translates to global indices at apply time. Salsa-cached as the
@@ -245,7 +239,8 @@ pub(crate) enum FileLocalOp {
     Entrypoint { decl_local_idx: u32, marker: String },
 }
 
-/// Read-only, single-file view handed to a [`PerFileNativePluginImpl`].
+/// Read-only, single-file view a [`plugin_api::PerFilePlugin`] is run
+/// against (wrapped by [`plugin_api::PluginFileCtx`]).
 /// Deliberately tiny: it exposes only this file's salsa-tracked
 /// per-file payload + parsed AST. No project-wide queries, no
 /// ``node_attrs(indices)`` over arbitrary nodes — that restriction is
@@ -496,18 +491,6 @@ impl<'db> FileContext<'db> {
     }
 }
 
-/// Rust-side per-file plugin contract. Called once per project file
-/// with a restricted [`FileContext`]; pushes [`FileLocalOp`] into
-/// the sink. Pure function of the file's tracked inputs — no
-/// project-wide reads, no side effects — so the harness can cache the
-/// result in salsa keyed on ``(file, name())``.
-pub(crate) trait PerFileNativePluginImpl: Send + Sync {
-    /// Walk ``file_ctx`` and append this file's ops to ``sink``.
-    /// Naming + salsa keying live on [`PerFilePluginKind`], so the
-    /// trait itself only carries the work method.
-    fn run_on_file(&self, file_ctx: &FileContext<'_>, sink: &mut Vec<FileLocalOp>);
-}
-
 /// Salsa cache-key discriminant for a *configless* per-file plugin. A cheap
 /// ``Copy`` enum rather than a ``&'static str`` because salsa tracked
 /// function arguments must be owned + ``'static`` (a borrowed key
@@ -529,11 +512,13 @@ impl PerFilePluginKind {
         }
     }
 
-    /// Run the concrete impl for this kind against ``file_ctx``.
-    fn run_on_file(self, file_ctx: &FileContext<'_>, sink: &mut Vec<FileLocalOp>) {
+    /// The `'static` curated [`plugin_api::PerFilePlugin`] impl for this
+    /// configless built-in kind. Unit structs promote to `'static`, so the
+    /// dispatch in [`per_file_plugin_ops`] hands back a borrowed trait object.
+    fn plugin(self) -> &'static dyn plugin_api::PerFilePlugin {
         match self {
-            PerFilePluginKind::MainBlock => MainBlockPluginImpl.run_on_file(file_ctx, sink),
-            PerFilePluginKind::ModuleDunders => ModuleDundersPluginImpl.run_on_file(file_ctx, sink),
+            PerFilePluginKind::MainBlock => &MainBlockPluginImpl,
+            PerFilePluginKind::ModuleDunders => &ModuleDundersPluginImpl,
         }
     }
 }
@@ -646,12 +631,14 @@ impl ConfiguredPerFile {
         }
         hasher.finish()
     }
+}
 
-    /// Run the configured impl against ``file_ctx``.
-    fn run_on_file(&self, file_ctx: &FileContext<'_>, sink: &mut Vec<FileLocalOp>) {
+impl plugin_api::PerFilePlugin for ConfiguredPerFile {
+    /// Run the configured impl against ``file``.
+    fn run_on_file(&self, file: &plugin_api::PluginFileCtx<'_>, ops: &mut plugin_api::FileOps) {
         match self {
             ConfiguredPerFile::ServerConfig { filenames } => {
-                server_config_run_on_file(filenames, file_ctx, sink)
+                server_config_run_on_file(filenames, file, ops)
             }
         }
     }
@@ -714,14 +701,18 @@ pub(crate) fn per_file_plugin_ops(
     id: PerFilePluginId,
 ) -> Vec<FileLocalOp> {
     let file_ctx = FileContext::new(db, file);
-    let mut sink = Vec::new();
+    let pctx = plugin_api::PluginFileCtx::new(&file_ctx);
+    let mut ops = plugin_api::FileOps::new();
+    // Every per-file plugin — configless builtin, configured builtin, or
+    // external dylib — runs through the one curated `PerFilePlugin` surface.
     match id {
-        PerFilePluginId::Builtin(kind) => kind.run_on_file(&file_ctx, &mut sink),
+        PerFilePluginId::Builtin(kind) => kind.plugin().run_on_file(&pctx, &mut ops),
         PerFilePluginId::Configured(plugin_id) => {
             // Resolve the configured plugin from the registry; a stale id
             // (shouldn't happen) yields no ops.
             if let Some(cfg) = configured_per_file_plugin(plugin_id) {
-                cfg.run_on_file(&file_ctx, &mut sink);
+                let per_file: &dyn plugin_api::PerFilePlugin = cfg.as_ref();
+                per_file.run_on_file(&pctx, &mut ops);
             }
         }
         PerFilePluginId::External(plugin_id) => {
@@ -729,15 +720,12 @@ pub(crate) fn per_file_plugin_ops(
             // registry; a stale id (shouldn't happen) yields no ops.
             if let Some(plugin) = external_per_file_plugin(plugin_id) {
                 if let Some(per_file) = plugin.per_file() {
-                    let pctx = plugin_api::PluginFileCtx::new(&file_ctx);
-                    let mut ops = plugin_api::FileOps::new();
                     per_file.run_on_file(&pctx, &mut ops);
-                    sink = ops.into_inner();
                 }
             }
         }
     }
-    sink
+    ops.into_inner()
 }
 
 /// Internal classification of what a [`NativePlugin`] wraps. The
@@ -745,27 +733,31 @@ pub(crate) fn per_file_plugin_ops(
 /// whole ``ProjectContext``; per-file plugins run once per file
 /// through the salsa-cached [`per_file_plugin_ops`] query.
 pub(crate) enum NativePluginKind {
-    /// Project-wide native plugin — one ``run`` against a frozen,
-    /// ``Send`` view of the whole graph. Held in an [`Arc`] so the
-    /// materialize fan-out can clone a handle into each GIL-free rayon
-    /// worker (the trait is ``Send + Sync``).
-    ProjectWide(Arc<dyn NativePluginImpl>),
+    /// Built-in *per-file* plugin selected by a configless/configured id;
+    /// dispatched through the salsa-cached [`per_file_plugin_ops`] query.
     PerFile(PerFilePluginId),
-    /// External native plugin loaded from a dylib through the ABI airlock
-    /// (see [`load_native_plugins`]). Holds the trait object and a refcount
-    /// on the loaded library so its code stays mapped for the plugin's
-    /// lifetime. Only meaningful in a `-C prefer-dynamic` build where the
-    /// extension and the plugin share one `dead-cst-runtime`.
+    /// A plugin backed by the curated [`plugin_api::ExternalPlugin`] trait —
+    /// covers *both* every in-tree project-wide built-in and every dylib-loaded
+    /// external plugin, so the two surfaces share one dispatch path. A
+    /// project-wide `run` fans out against a frozen, ``Send`` view of the whole
+    /// graph; the [`Arc`] lets the materialize fan-out clone a handle into each
+    /// GIL-free rayon worker (the trait is ``Send + Sync``).
     ///
     /// `per_file_id` is `Some(id)` when the plugin opted into per-file
     /// dispatch (`ExternalPlugin::per_file() -> Some`) — the host then routes
     /// it through the salsa-cached [`per_file_plugin_ops`] query keyed on
     /// [`PerFilePluginId::External`] instead of the project-wide `run`.
+    ///
+    /// `_lib` holds a refcount on the loaded library so its code stays mapped
+    /// for the plugin's lifetime (only meaningful in a `-C prefer-dynamic`
+    /// build where the extension and the plugin share one `dead-cst-runtime`).
+    /// It is `None` for in-tree built-ins — statically linked, nothing to keep
+    /// mapped.
     External {
         name: String,
         plugin: Arc<dyn plugin_api::ExternalPlugin>,
         per_file_id: Option<u32>,
-        _lib: Arc<libloading::Library>,
+        _lib: Option<Arc<libloading::Library>>,
     },
 }
 
@@ -790,7 +782,6 @@ impl NativePlugin {
     #[getter]
     fn name(&self) -> String {
         match &self.kind {
-            NativePluginKind::ProjectWide(inner) => inner.name().to_string(),
             NativePluginKind::PerFile(id) => id.name(),
             NativePluginKind::External { name, .. } => name.clone(),
         }
@@ -805,7 +796,6 @@ impl NativePlugin {
     fn prepare(&self, py: Python<'_>, project_root: PyObject) -> PyResult<()> {
         let root = project_root.bind(py).str()?.to_string();
         match &self.kind {
-            NativePluginKind::ProjectWide(inner) => inner.prepare(&root),
             NativePluginKind::PerFile(_) => {}
             NativePluginKind::External { plugin, .. } => plugin.prepare(&root),
         }
@@ -840,9 +830,7 @@ impl NativePlugin {
     /// `__init_subclass__`-defining classes alive via a marker node.
     #[staticmethod]
     fn init_subclass() -> Self {
-        Self {
-            kind: NativePluginKind::ProjectWide(Arc::new(InitSubclassPluginImpl)),
-        }
+        Self::project_wide(Arc::new(InitSubclassPluginImpl))
     }
 
     /// Native `ServerConfigPlugin` — mark conventional WSGI/ASGI server
@@ -871,9 +859,7 @@ impl NativePlugin {
     /// lifecycle hooks alive. Project-wide (the subclass walk spans files).
     #[staticmethod]
     fn unittest() -> Self {
-        Self {
-            kind: NativePluginKind::ProjectWide(Arc::new(UnittestPluginImpl)),
-        }
+        Self::project_wide(Arc::new(UnittestPluginImpl))
     }
 
     /// Native Flask dispatch-app plugin (port of
@@ -976,9 +962,7 @@ impl NativePlugin {
     /// group declared in one file may collect handlers registered in another.
     #[staticmethod]
     fn click() -> Self {
-        Self {
-            kind: NativePluginKind::ProjectWide(Arc::new(ClickPluginImpl)),
-        }
+        Self::project_wide(Arc::new(ClickPluginImpl))
     }
 
     /// Native `MockPatchPlugin` (port of `dead_cst.contrib.mock_patch`).
@@ -988,9 +972,7 @@ impl NativePlugin {
     /// targets a decl in another).
     #[staticmethod]
     fn mock_patch() -> Self {
-        Self {
-            kind: NativePluginKind::ProjectWide(Arc::new(MockPatchPluginImpl)),
-        }
+        Self::project_wide(Arc::new(MockPatchPluginImpl))
     }
 
     /// Native `DiscordPyPlugin` (port of `dead_cst.contrib.discordpy`). Wire
@@ -999,9 +981,7 @@ impl NativePlugin {
     /// may live in different files; Cog subclasses span files).
     #[staticmethod]
     fn discordpy() -> Self {
-        Self {
-            kind: NativePluginKind::ProjectWide(Arc::new(DiscordPyPluginImpl)),
-        }
+        Self::project_wide(Arc::new(DiscordPyPluginImpl))
     }
 
     /// Native `PytestPlugin` (port of `dead_cst.contrib.pytest`). Seed
@@ -1010,9 +990,7 @@ impl NativePlugin {
     /// (the subclass / fixture walk spans files).
     #[staticmethod]
     fn pytest() -> Self {
-        Self {
-            kind: NativePluginKind::ProjectWide(Arc::new(PytestPluginImpl)),
-        }
+        Self::project_wide(Arc::new(PytestPluginImpl))
     }
 
     /// Native `ProjectScriptsPlugin` (port of
@@ -1023,11 +1001,7 @@ impl NativePlugin {
     #[staticmethod]
     #[pyo3(signature = (pyproject_path = None))]
     fn project_scripts(pyproject_path: Option<String>) -> Self {
-        Self {
-            kind: NativePluginKind::ProjectWide(Arc::new(ProjectScriptsPluginImpl {
-                pyproject_path,
-            })),
-        }
+        Self::project_wide(Arc::new(ProjectScriptsPluginImpl { pyproject_path }))
     }
 
     /// Native `DynamicImportFallbackPlugin` (port of
@@ -1053,16 +1027,14 @@ impl NativePlugin {
         include_sources: Option<Vec<String>>,
         include_targets: Option<Vec<String>>,
     ) -> Self {
-        Self {
-            kind: NativePluginKind::ProjectWide(Arc::new(DynamicImportFallbackPluginImpl {
-                include_underscore,
-                respect_dunder_all,
-                exclude_sources: exclude_sources.unwrap_or_default(),
-                exclude_targets: exclude_targets.unwrap_or_default(),
-                include_sources: include_sources.unwrap_or_default(),
-                include_targets: include_targets.unwrap_or_default(),
-            })),
-        }
+        Self::project_wide(Arc::new(DynamicImportFallbackPluginImpl {
+            include_underscore,
+            respect_dunder_all,
+            exclude_sources: exclude_sources.unwrap_or_default(),
+            exclude_targets: exclude_targets.unwrap_or_default(),
+            include_sources: include_sources.unwrap_or_default(),
+            include_targets: include_targets.unwrap_or_default(),
+        }))
     }
 
     /// Native `ExplicitEntrypointPlugin` (port of
@@ -1073,23 +1045,34 @@ impl NativePlugin {
     /// path). Not in `_builtin_native_plugin` — it needs caller-supplied specs.
     #[staticmethod]
     fn explicit(regexes: Vec<String>, str_specs: Vec<String>, abs_paths: Vec<String>) -> Self {
-        Self {
-            kind: NativePluginKind::ProjectWide(Arc::new(ExplicitEntrypointPluginImpl {
-                regexes,
-                str_specs,
-                abs_paths,
-            })),
-        }
+        Self::project_wide(Arc::new(ExplicitEntrypointPluginImpl {
+            regexes,
+            str_specs,
+            abs_paths,
+        }))
     }
 }
 
 impl NativePlugin {
+    /// Wrap a curated project-wide [`plugin_api::ExternalPlugin`] built-in: no
+    /// per-file dispatch, no dylib to keep mapped. The in-tree twin of the
+    /// dylib-loaded `External` variant the ABI airlock builds — both share the
+    /// one project-wide dispatch path now.
+    fn project_wide(plugin: Arc<dyn plugin_api::ExternalPlugin>) -> Self {
+        Self {
+            kind: NativePluginKind::External {
+                name: plugin.name().to_string(),
+                plugin,
+                per_file_id: None,
+                _lib: None,
+            },
+        }
+    }
+
     /// Wrap a [`DispatchAppConfig`] in a project-wide native plugin. Shared by
     /// the per-framework factories and the custom `dispatch_app` factory.
     fn from_dispatch_config(name: String, config: DispatchAppConfig) -> Self {
-        Self {
-            kind: NativePluginKind::ProjectWide(Arc::new(DispatchAppPluginImpl { name, config })),
-        }
+        Self::project_wide(Arc::new(DispatchAppPluginImpl { name, config }))
     }
 }
 
@@ -1158,32 +1141,28 @@ pub(crate) fn _reset_main_block_run_count() {
 
 pub(crate) struct MainBlockPluginImpl;
 
-impl PerFileNativePluginImpl for MainBlockPluginImpl {
-    fn run_on_file(&self, file_ctx: &FileContext<'_>, sink: &mut Vec<FileLocalOp>) {
+impl plugin_api::PerFilePlugin for MainBlockPluginImpl {
+    fn run_on_file(&self, file: &plugin_api::PluginFileCtx<'_>, ops: &mut plugin_api::FileOps) {
         MAIN_BLOCK_RUN_COUNT.fetch_add(1, Ordering::Relaxed);
-        let parsed = file_ctx.parsed();
-        let Some(block_range) = find_main_block_range(&parsed) else {
+        let Some(block_range) = file.main_block_range() else {
             return;
         };
-        let (block_start_line, block_end_line) = file_ctx.line_span(block_range);
-        let nodes = file_ctx.nodes();
+        let (block_start_line, block_end_line) = file.line_span(block_range);
         // Local indices of every top-level decl whose source span falls
         // inside the ``if __name__`` block. Skip index 0 (the module
         // node) — it's added explicitly below as the first edge.
-        let mut edges_to_local_idx: Vec<u32> = vec![file_ctx.module_local_idx()];
-        for (local_idx, node) in nodes.iter().enumerate().skip(1) {
+        let mut edges_to_local_idx: Vec<u32> = vec![file.module_local_idx()];
+        for node in file.nodes().iter().skip(1) {
             if node.start_line >= block_start_line && node.end_line <= block_end_line {
-                edges_to_local_idx.push(local_idx as u32);
+                edges_to_local_idx.push(node.local_idx);
             }
         }
-        let synthetic_kind = intern_kind("synthetic").expect("'synthetic' is a valid kind");
-        sink.push(FileLocalOp::Node {
-            fqname: format!("{MAIN_BLOCK_PREFIX}{}", file_ctx.module_fqname()),
-            kind: synthetic_kind,
-            flags: NodeFlags::ENTRYPOINT,
+        ops.add_synthetic_node(
+            format!("{MAIN_BLOCK_PREFIX}{}", file.module_fqname()),
+            NodeFlags::ENTRYPOINT,
             edges_to_local_idx,
-            edges_from_local_idx: Vec::new(),
-        });
+            Vec::new(),
+        );
     }
 }
 
@@ -1227,6 +1206,12 @@ pub mod plugin_api {
     pub use ruff_db::parsed::ParsedModuleRef;
     pub use ruff_text_size::TextRange;
 
+    // Decorator / constructor argument captures (plain Rust, pyo3-free), so a
+    // plugin reading the args returned by [`PluginCtx::decorated_decls_with_args`]
+    // need not reach into crate internals. `kwargs` is crate-private; read
+    // values via [`CallArgs::get`] / [`CallArgs::str_value`].
+    pub use crate::helpers::{ArgValue, CallArgs};
+
     /// `NodeFlags::ENTRYPOINT` re-exported for plugin authors: set it on a
     /// node minted via [`PluginOps::add_synthetic_node`] /
     /// [`FileOps::add_synthetic_node`] to make that node a reachability seed.
@@ -1245,6 +1230,77 @@ pub mod plugin_api {
     /// fan-out, the same bit the visitor stamps on dynamic-import edges.
     pub const FLAG_DYNAMIC_IMPORT: u32 = EdgeFlags::DYNAMIC_IMPORT;
 
+    /// Error a plugin returns from [`ExternalPlugin::run`]. **Pyo3-free by
+    /// design** — the curated surface never names a `PyErr`, so a plugin author
+    /// depends only on this crate's API, not on pyo3. The host maps it to a
+    /// Python exception once, at the `materialize` boundary, by [`kind`]
+    /// ([`Value`](PluginErrorKind::Value) → `ValueError`,
+    /// [`Runtime`](PluginErrorKind::Runtime) → `RuntimeError`).
+    #[derive(Debug, Clone)]
+    pub struct PluginError {
+        message: String,
+        kind: PluginErrorKind,
+    }
+
+    /// Coarse classification carried by a [`PluginError`]; selects which Python
+    /// exception type the host raises. A plain enum (no pyo3) so the airlock
+    /// stays dependency-encapsulated.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum PluginErrorKind {
+        /// Bad plugin input or configuration; surfaces as a `ValueError`.
+        Value,
+        /// Any other failure; surfaces as a `RuntimeError`.
+        Runtime,
+    }
+
+    impl PluginError {
+        /// A [`Value`](PluginErrorKind::Value)-kind error (bad config/input).
+        pub fn value(message: impl Into<String>) -> Self {
+            Self {
+                message: message.into(),
+                kind: PluginErrorKind::Value,
+            }
+        }
+
+        /// A [`Runtime`](PluginErrorKind::Runtime)-kind error.
+        pub fn runtime(message: impl Into<String>) -> Self {
+            Self {
+                message: message.into(),
+                kind: PluginErrorKind::Runtime,
+            }
+        }
+
+        /// The human-readable message.
+        pub fn message(&self) -> &str {
+            &self.message
+        }
+
+        /// The error's classification (drives the host's exception mapping).
+        pub fn kind(&self) -> PluginErrorKind {
+            self.kind
+        }
+    }
+
+    impl std::fmt::Display for PluginError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(&self.message)
+        }
+    }
+
+    impl std::error::Error for PluginError {}
+
+    impl From<String> for PluginError {
+        fn from(message: String) -> Self {
+            Self::runtime(message)
+        }
+    }
+
+    impl From<&str> for PluginError {
+        fn from(message: &str) -> Self {
+            Self::runtime(message)
+        }
+    }
+
     /// Contract an external native plugin implements. The host calls
     /// [`run`](ExternalPlugin::run) once per materialize against the frozen
     /// graph, then folds the emitted ops in as a single batch.
@@ -1262,10 +1318,15 @@ pub mod plugin_api {
         fn name(&self) -> &str;
 
         /// Inspect the whole frozen graph and append ops to `ops`. Same
-        /// frozen-graph contract as the in-tree native path. Default no-op
-        /// so a pure per-file plugin needn't implement it; the host skips it
-        /// entirely when [`per_file`](ExternalPlugin::per_file) is `Some`.
-        fn run(&self, _ctx: &PluginCtx<'_>, _ops: &mut PluginOps) {}
+        /// frozen-graph contract as every built-in. Return
+        /// `Err(`[`PluginError`]`)` to fail the whole materialize with that
+        /// message; the host raises the mapped Python exception. Default no-op
+        /// (`Ok(())`) so a pure per-file plugin needn't implement it — the host
+        /// skips it entirely when [`per_file`](ExternalPlugin::per_file) is
+        /// `Some`.
+        fn run(&self, _ctx: &PluginCtx<'_>, _ops: &mut PluginOps) -> Result<(), PluginError> {
+            Ok(())
+        }
 
         /// Opt into per-file (salsa-cached) dispatch by returning
         /// `Some(self)`. The default `None` keeps the plugin project-wide.
@@ -1326,6 +1387,64 @@ pub mod plugin_api {
         pub end_line: usize,
         /// `NodeFlags` bitset (see [`FLAG_ENTRYPOINT`]).
         pub flags: u32,
+    }
+
+    /// Borrowing view of one graph node, yielded by [`PluginCtx::nodes`].
+    /// Unlike the owned [`NodeView`], the string fields borrow the frozen
+    /// graph — so a full-graph scan filtering on `kind` / `path` costs no
+    /// allocation until the plugin keeps a match. Use [`PluginCtx::node`]
+    /// for the owned single-node read.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct NodeRef<'a> {
+        /// Positional index of this node in the frozen graph.
+        pub idx: usize,
+        /// Fully-qualified name.
+        pub fqname: &'a str,
+        /// One of `function`, `class`, `variable`, `import`, `type_alias`,
+        /// `module`, `synthetic`.
+        pub kind: &'a str,
+        /// Source path (empty for synthetics).
+        pub path: &'a str,
+        /// 1-based start line, or 0 for synthetic nodes.
+        pub start_line: usize,
+        /// 1-based end line, or 0 for synthetic nodes.
+        pub end_line: usize,
+        /// `NodeFlags` bitset (see [`FLAG_ENTRYPOINT`]).
+        pub flags: u32,
+    }
+
+    /// One directed graph edge, yielded by [`PluginCtx::edges`]: `src -> dst`
+    /// (both positional node indices) stamped with an `EdgeFlags` bitset (see
+    /// [`FLAG_DEAD_BRANCH`] / [`FLAG_DYNAMIC_IMPORT`]).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct EdgeRef {
+        /// Source node index.
+        pub src: usize,
+        /// Destination node index.
+        pub dst: usize,
+        /// `EdgeFlags` bitset.
+        pub flags: u32,
+    }
+
+    /// Conjunctive filter for [`PluginCtx::nodes_matching`] — a node must
+    /// satisfy every set criterion. All fields default to "no constraint"
+    /// (`Default`), so a plugin sets only what it needs:
+    /// `NodeFilter { kinds: &["function"], simple_names: &["setup", "teardown"], paths: &cog_paths, ..Default::default() }`.
+    /// Empty slices mean "unconstrained" (not "matches nothing").
+    #[derive(Debug, Clone, Default)]
+    pub struct NodeFilter<'a> {
+        /// Match only these node kinds (`function` / `class` / …). Empty = any.
+        pub kinds: &'a [&'a str],
+        /// Match only nodes whose trailing fqname segment is one of these.
+        pub simple_names: &'a [&'a str],
+        /// Match only nodes declared in one of these exact source paths.
+        pub paths: &'a [&'a str],
+        /// Match only nodes whose fqname starts with this dotted prefix.
+        pub fqname_prefix: Option<&'a str>,
+        /// Match only nodes whose flags contain *all* of these bits.
+        pub flags_all: Option<u32>,
+        /// Match only nodes whose flags contain *any* of these bits.
+        pub flags_any: Option<u32>,
     }
 
     /// Restricted, mostly-stable view of the frozen graph for external
@@ -1462,6 +1581,20 @@ pub mod plugin_api {
             self.inner.module_surface_indices(module_fqn)
         }
 
+        /// Bulk twin of [`Self::module_surface`]: the public surface of each
+        /// `module_fqn`, keyed by fqname, resolved in a single sweep. The shape
+        /// discord.py's `load_extension` fan-out reads. A module that isn't
+        /// found maps to an empty vec.
+        pub fn module_surfaces(
+            &self,
+            module_fqns: &[String],
+        ) -> std::collections::HashMap<String, Vec<usize>> {
+            self.inner
+                .module_surfaces_indices(module_fqns)
+                .into_iter()
+                .collect()
+        }
+
         /// The decl nodes named by `module_fqn`'s `__all__`, or `None` when
         /// the module has no `__all__` / it isn't a literal string list.
         pub fn dunder_all_exports(&self, module_fqn: &str) -> Option<Vec<usize>> {
@@ -1492,9 +1625,10 @@ pub mod plugin_api {
             let modules_owned: Vec<String> = modules.iter().map(|m| m.to_string()).collect();
             let names_owned: Vec<String> = names.iter().map(|n| n.to_string()).collect();
             self.inner
-                .find_decorated_decls(&modules_owned, &names_owned, None, false)
-                .map(|pairs| pairs.into_iter().map(|(idx, _)| idx).collect())
-                .unwrap_or_default()
+                .find_decorated_decls(&modules_owned, &names_owned, false)
+                .into_iter()
+                .map(|(idx, _)| idx)
+                .collect()
         }
 
         /// Project-wide twin of [`PluginFileCtx::constructions`]: top-level
@@ -1504,9 +1638,10 @@ pub mod plugin_api {
             let modules_owned: Vec<String> = modules.iter().map(|m| m.to_string()).collect();
             let names_owned: Vec<String> = names.iter().map(|n| n.to_string()).collect();
             self.inner
-                .find_instance_constructions(&modules_owned, &names_owned, None, false)
-                .map(|triples| triples.into_iter().map(|(idx, _, _)| idx).collect())
-                .unwrap_or_default()
+                .find_instance_constructions(&modules_owned, &names_owned, false)
+                .into_iter()
+                .map(|(idx, _, _)| idx)
+                .collect()
         }
 
         /// Top-level functions decorated `@<owner>.<attr>(...)` where `attr`
@@ -1519,14 +1654,10 @@ pub mod plugin_api {
         pub fn handler_decorators(&self, decorator_attrs: &[&str]) -> Vec<(String, usize)> {
             let attrs: Vec<String> = decorator_attrs.iter().map(|s| s.to_string()).collect();
             self.inner
-                .find_handler_decorators(&attrs, None, false)
-                .map(|triples| {
-                    triples
-                        .into_iter()
-                        .map(|(owner, idx, _args)| (owner, idx))
-                        .collect()
-                })
-                .unwrap_or_default()
+                .find_handler_decorators(&attrs, false)
+                .into_iter()
+                .map(|(owner, idx, _args)| (owner, idx))
+                .collect()
         }
 
         /// Calls to `name` (imported from one of `modules`) whose argument at
@@ -1544,14 +1675,10 @@ pub mod plugin_api {
         ) -> Vec<(usize, String)> {
             let modules_owned: Vec<String> = modules.iter().map(|m| m.to_string()).collect();
             self.inner
-                .find_calls_to_imported(&modules_owned, name, arg_index, None, false)
-                .map(|triples| {
-                    triples
-                        .into_iter()
-                        .map(|(idx, literal, _args)| (idx, literal))
-                        .collect()
-                })
-                .unwrap_or_default()
+                .find_calls_to_imported(&modules_owned, name, arg_index, false)
+                .into_iter()
+                .map(|(idx, literal, _args)| (idx, literal))
+                .collect()
         }
 
         /// Attr-method twin of [`PluginCtx::calls_with_string_arg`]: calls of
@@ -1567,14 +1694,225 @@ pub mod plugin_api {
         /// collection) are skipped.
         pub fn calls_on_attr(&self, attr: &str, arg_index: usize) -> Vec<(usize, String)> {
             self.inner
-                .find_calls_on_attr(attr, arg_index, None, false)
-                .map(|triples| {
-                    triples
-                        .into_iter()
-                        .map(|(idx, literal, _args)| (idx, literal))
-                        .collect()
+                .find_calls_on_attr(attr, arg_index, false)
+                .into_iter()
+                .map(|(idx, literal, _args)| (idx, literal))
+                .collect()
+        }
+
+        /// Var-method twin of [`Self::calls_with_string_arg`]: calls
+        /// `<owner>.<attr>(...)` whose argument at `arg_index` is a string
+        /// literal, where `owner` is a bare variable name (`mocker`,
+        /// `monkeypatch`). `required_positional`, when set, restricts to
+        /// calls with exactly that many positional args — the
+        /// `monkeypatch.setattr("x.y", v)` (2) vs `setattr(obj, "n", v)` (3)
+        /// disambiguation. Returns `(owning_decl_idx, literal)`.
+        pub fn calls_on_var(
+            &self,
+            owner: &str,
+            attr: &str,
+            arg_index: usize,
+            required_positional: Option<usize>,
+        ) -> Vec<(usize, String)> {
+            self.inner
+                .find_calls_on_var(owner, attr, arg_index, required_positional, false)
+                .into_iter()
+                .map(|(idx, literal, _args)| (idx, literal))
+                .collect()
+        }
+
+        /// Two-level twin of [`Self::handler_decorators`]: top-level functions
+        /// decorated `@<owner>.<via_attr>.<attr>(...)` where `attr` is one of
+        /// `decorator_attrs` (e.g. `via_attr="tree"` for discord.py
+        /// `@bot.tree.command`). Returns `(owner_name, decl_idx)` — the raw
+        /// textual root owner and the decorated decl's index.
+        pub fn handler_decorators_via(
+            &self,
+            via_attr: &str,
+            decorator_attrs: &[&str],
+        ) -> Vec<(String, usize)> {
+            let attrs: Vec<String> = decorator_attrs.iter().map(|s| s.to_string()).collect();
+            self.inner
+                .find_handler_decorators_via(via_attr, &attrs, false)
+                .into_iter()
+                .map(|(owner, idx, _args)| (owner, idx))
+                .collect()
+        }
+
+        /// Args-capturing twin of [`Self::decorated_decls`]: each match paired
+        /// with its decorator's captured keyword arguments
+        /// ([`CallArgs`]). Read values via [`CallArgs::str_value`] — e.g.
+        /// the `name=` alias on `@pytest.fixture(name="…")`.
+        pub fn decorated_decls_with_args(
+            &self,
+            modules: &[&str],
+            names: &[&str],
+        ) -> Vec<(usize, CallArgs)> {
+            let modules_owned: Vec<String> = modules.iter().map(|m| m.to_string()).collect();
+            let names_owned: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+            self.inner
+                .find_decorated_decls(&modules_owned, &names_owned, true)
+        }
+
+        /// Functions / classes that *return* an instance of one of `names`
+        /// imported from one of `modules` (app-factory shape). Returns
+        /// `(decl_idx, return_kinds)` where `return_kinds` lists the node
+        /// kinds the factory yields.
+        pub fn factory_decls(
+            &self,
+            modules: &[&str],
+            ctor_names: &[&str],
+        ) -> Vec<(usize, Vec<String>)> {
+            let modules_owned: Vec<String> = modules.iter().map(|m| m.to_string()).collect();
+            let names_owned: Vec<String> = ctor_names.iter().map(|n| n.to_string()).collect();
+            self.inner.find_factory_decls(&modules_owned, &names_owned)
+        }
+
+        /// Class nodes that define a method named `method_name` directly in
+        /// their body (e.g. `"__init_subclass__"`).
+        pub fn classes_defining_method(&self, method_name: &str) -> Vec<usize> {
+            self.inner.find_classes_defining_method_indices(method_name)
+        }
+
+        // --- import presence ------------------------------------------------
+
+        /// True if any file imports `module` (or a submodule of it). A cheap
+        /// O(1) presence probe to short-circuit before heavier walks.
+        pub fn has_imports_of(&self, module: &str) -> bool {
+            self.inner.has_imports_of(module)
+        }
+
+        /// The `kind="import"` node indices that import `module` (or a
+        /// submodule). Pair with [`Self::node_paths`] to learn which files
+        /// import it.
+        pub fn imports_of(&self, module: &str) -> Vec<usize> {
+            self.inner.find_imports_of_indices(module)
+        }
+
+        // --- bulk node reads ------------------------------------------------
+
+        /// Owned [`NodeView`] for each index, skipping any out of range. The
+        /// bulk twin of [`Self::node`].
+        pub fn nodes_at(&self, idxs: &[usize]) -> Vec<NodeView> {
+            idxs.iter().filter_map(|&i| self.node(i)).collect()
+        }
+
+        /// Source path for each index, skipping any out of range. Convenience
+        /// over [`Self::nodes_at`] when only the path is needed.
+        pub fn node_paths(&self, idxs: &[usize]) -> Vec<String> {
+            idxs.iter()
+                .filter_map(|&i| self.node(i).map(|v| v.path))
+                .collect()
+        }
+
+        /// The module node index for each source `path`, `None` where the
+        /// path isn't a known project module. Order matches `paths`.
+        pub fn modules_for_paths(&self, paths: &[String]) -> Vec<Option<usize>> {
+            self.inner.modules_for_paths(paths)
+        }
+
+        /// Every top-level decl (function / class / variable / import /
+        /// type_alias) of `module_fqn`, ignoring `__all__`. Empty when the
+        /// module isn't found.
+        pub fn module_top_level_decls(&self, module_fqn: &str) -> Vec<usize> {
+            self.inner.find_module_top_level_decls_indices(module_fqn)
+        }
+
+        /// Parameter names of each function index (positional + keyword, in
+        /// source order). Order matches `idxs`; a non-function index yields an
+        /// empty list.
+        pub fn function_parameters(&self, idxs: &[usize]) -> Vec<Vec<String>> {
+            self.inner.function_parameters(idxs).unwrap_or_default()
+        }
+
+        /// Union of every method's parameter names per class index (excluding
+        /// `self` / `cls`). Order matches `idxs`; a non-class index yields an
+        /// empty list. Powers pytest's fixture-by-parameter wiring.
+        pub fn class_method_parameters(&self, idxs: &[usize]) -> Vec<Vec<String>> {
+            self.inner.class_method_parameters(idxs).unwrap_or_default()
+        }
+
+        // --- whole-graph iteration ------------------------------------------
+
+        /// Borrowing iterator over every node in the frozen graph, in index
+        /// order. Filter on the borrowed `kind` / `path` without allocating;
+        /// keep [`NodeRef::idx`] for the matches you act on. For a known index
+        /// use [`Self::node`] (owned) instead.
+        pub fn nodes(&self) -> impl Iterator<Item = NodeRef<'_>> {
+            self.inner
+                .outputs
+                .builder
+                .nodes
+                .iter()
+                .enumerate()
+                .map(|(idx, n)| NodeRef {
+                    idx,
+                    fqname: &n.fqname,
+                    kind: n.kind,
+                    path: &n.path,
+                    start_line: n.start_line,
+                    end_line: n.end_line,
+                    flags: n.flags,
                 })
-                .unwrap_or_default()
+        }
+
+        /// Iterator over every directed edge in the frozen graph. Combine with
+        /// [`Self::node`] to inspect endpoints — e.g. fan out each
+        /// [`FLAG_DYNAMIC_IMPORT`] edge whose `dst` is a module node.
+        pub fn edges(&self) -> impl Iterator<Item = EdgeRef> + '_ {
+            self.inner
+                .outputs
+                .builder
+                .edges
+                .iter()
+                .map(|&(src, dst, flags)| EdgeRef { src, dst, flags })
+        }
+
+        /// Node indices matching every set criterion of `filter` (see
+        /// [`NodeFilter`]). The general-purpose structural finder behind the
+        /// narrower `find_*` helpers.
+        pub fn nodes_matching(&self, filter: &NodeFilter<'_>) -> Vec<usize> {
+            let to_owned = |s: &[&str]| -> Option<Vec<String>> {
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(s.iter().map(|x| x.to_string()).collect())
+                }
+            };
+            self.inner.indices_where(
+                None,
+                to_owned(filter.kinds),
+                None,
+                None,
+                None,
+                to_owned(filter.simple_names),
+                to_owned(filter.paths),
+                None,
+                filter.flags_all,
+                filter.flags_any,
+                filter.fqname_prefix.map(|s| s.to_string()),
+            )
+        }
+
+        /// Node indices matching the pre-bucketed entrypoint specs of
+        /// [`crate::native_plugins`]' explicit-entrypoint plugin: `regexes`
+        /// match a node's fqname (`re.match` semantics), `str_specs` are exact
+        /// fqname / module / path matches, `abs_paths` match a node's source
+        /// path. A regex that doesn't compile is dropped.
+        pub fn nodes_matching_specs(
+            &self,
+            regexes: &[String],
+            str_specs: &[String],
+            abs_paths: &[String],
+        ) -> Vec<usize> {
+            self.inner
+                .find_nodes_matching_specs_indices(regexes, str_specs, abs_paths)
+        }
+
+        /// The project root passed to the analysis, as a path string. Use it
+        /// to locate config files or to relativize node paths.
+        pub fn project_root(&self) -> &str {
+            self.inner.project_root()
         }
     }
 
@@ -1642,6 +1980,22 @@ pub mod plugin_api {
 
     // ---- per-file surface --------------------------------------------------
 
+    /// The import a `kind="import"` node binds, exposed on
+    /// [`FileNodeView::imports`]. Mirrors the per-file `ImportPayload`:
+    /// `import foo` → `{module: "foo", decl: None, star: false}`;
+    /// `from foo import bar` → `{module: "foo", decl: Some("bar"), …}`;
+    /// `from foo import *` → `{module: "foo", decl: None, star: true}`.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct ImportRef {
+        /// The imported-from module (absolute where ty could resolve it).
+        pub module: String,
+        /// The specific name pulled in, for `from … import name`; `None`
+        /// for plain `import module` and for star imports.
+        pub decl: Option<String>,
+        /// True when this alias was bound by `from … import *`.
+        pub star: bool,
+    }
+
     /// Owned, plain-data snapshot of one node in a single file, returned by
     /// [`PluginFileCtx::nodes`] / [`PluginFileCtx::node`]. The `local_idx`
     /// addresses this file only — it's the index space [`FileOps`] emits
@@ -1663,6 +2017,29 @@ pub mod plugin_api {
         pub end_line: usize,
         /// `NodeFlags` bitset.
         pub flags: u32,
+        /// For `kind == "import"` nodes, the import this alias binds;
+        /// `None` for every other kind.
+        pub imports: Option<ImportRef>,
+    }
+
+    /// Project the crate-internal per-file `NodeData` onto the curated,
+    /// owned [`FileNodeView`]. Shared by [`PluginFileCtx::node`] and
+    /// [`PluginFileCtx::nodes`] so the two stay in lockstep.
+    fn file_node_view(local_idx: u32, node: &crate::file_payload::NodeData) -> FileNodeView {
+        FileNodeView {
+            local_idx,
+            fqname: node.fqname.clone(),
+            kind: node.kind.as_static_str().to_string(),
+            path: node.path.clone(),
+            start_line: node.start_line,
+            end_line: node.end_line,
+            flags: node.flags,
+            imports: node.imports.as_ref().map(|i| ImportRef {
+                module: i.module.clone(),
+                decl: i.decl.clone(),
+                star: i.star,
+            }),
+        }
     }
 
     /// Restricted, single-file view handed to [`PerFilePlugin::run_on_file`].
@@ -1697,15 +2074,7 @@ pub mod plugin_api {
         /// Resolve a file-local index to an owned [`FileNodeView`].
         pub fn node(&self, local_idx: u32) -> Option<FileNodeView> {
             let node = self.inner.nodes().get(local_idx as usize)?;
-            Some(FileNodeView {
-                local_idx,
-                fqname: node.fqname.clone(),
-                kind: node.kind.as_static_str().to_string(),
-                path: node.path.clone(),
-                start_line: node.start_line,
-                end_line: node.end_line,
-                flags: node.flags,
-            })
+            Some(file_node_view(local_idx, node))
         }
 
         /// Every node in this file as a [`FileNodeView`], in file-local
@@ -1715,15 +2084,7 @@ pub mod plugin_api {
                 .nodes()
                 .iter()
                 .enumerate()
-                .map(|(i, node)| FileNodeView {
-                    local_idx: i as u32,
-                    fqname: node.fqname.clone(),
-                    kind: node.kind.as_static_str().to_string(),
-                    path: node.path.clone(),
-                    start_line: node.start_line,
-                    end_line: node.end_line,
-                    flags: node.flags,
-                })
+                .map(|(i, node)| file_node_view(i as u32, node))
                 .collect()
         }
 
@@ -2032,7 +2393,7 @@ pub(crate) fn load_native_plugins(path: String) -> PyResult<Vec<NativePlugin>> {
                     name,
                     plugin,
                     per_file_id,
-                    _lib: Arc::clone(&lib),
+                    _lib: Some(Arc::clone(&lib)),
                 },
             });
         }
@@ -2077,31 +2438,29 @@ const UNITTEST_BASE_FQNAMES: [&str; 2] = ["unittest.TestCase", "unittest.Isolate
 /// entrypoint node per file with edges to those decls.
 pub(crate) struct ModuleDundersPluginImpl;
 
-impl PerFileNativePluginImpl for ModuleDundersPluginImpl {
-    fn run_on_file(&self, file_ctx: &FileContext<'_>, sink: &mut Vec<FileLocalOp>) {
+impl plugin_api::PerFilePlugin for ModuleDundersPluginImpl {
+    fn run_on_file(&self, file: &plugin_api::PluginFileCtx<'_>, ops: &mut plugin_api::FileOps) {
         let mut targets: Vec<u32> = Vec::new();
-        for (local_idx, node) in file_ctx.nodes().iter().enumerate() {
-            let is_dunder_decl = matches!(node.kind.as_static_str(), "variable" | "function")
+        for node in file.nodes() {
+            let is_dunder_decl = matches!(node.kind.as_str(), "variable" | "function")
                 && is_dunder_name(&node.fqname);
             let is_future = node
                 .imports
                 .as_ref()
                 .is_some_and(|imp| imp.module == "__future__");
             if is_dunder_decl || is_future {
-                targets.push(local_idx as u32);
+                targets.push(node.local_idx);
             }
         }
         if targets.is_empty() {
             return;
         }
-        let synthetic = intern_kind("synthetic").expect("'synthetic' is a valid kind");
-        sink.push(FileLocalOp::Node {
-            fqname: format!("{MODULE_DUNDERS_PREFIX}{}", file_ctx.module_fqname()),
-            kind: synthetic,
-            flags: NodeFlags::ENTRYPOINT,
-            edges_to_local_idx: targets,
-            edges_from_local_idx: Vec::new(),
-        });
+        ops.add_synthetic_node(
+            format!("{MODULE_DUNDERS_PREFIX}{}", file.module_fqname()),
+            NodeFlags::ENTRYPOINT,
+            targets,
+            Vec::new(),
+        );
     }
 }
 
@@ -2110,25 +2469,27 @@ impl PerFileNativePluginImpl for ModuleDundersPluginImpl {
 /// parent that keeps every transitive subclass alive.
 pub(crate) struct InitSubclassPluginImpl;
 
-impl NativePluginImpl for InitSubclassPluginImpl {
+impl plugin_api::ExternalPlugin for InitSubclassPluginImpl {
     fn name(&self) -> &str {
         "InitSubclassPlugin"
     }
 
-    fn run(&self, ctx: &FrozenView<'_>, sink: &mut Vec<PreparedOp>) -> PyResult<()> {
-        let parents = ctx.find_classes_defining_method_indices("__init_subclass__");
-        let attrs = in_range(ctx.node_attrs(&parents))?;
-        let synthetic = intern_kind("synthetic").expect("'synthetic' is a valid kind");
+    fn run(
+        &self,
+        ctx: &plugin_api::PluginCtx<'_>,
+        ops: &mut plugin_api::PluginOps,
+    ) -> Result<(), plugin_api::PluginError> {
+        let parents = ctx.classes_defining_method("__init_subclass__");
+        let attrs = ctx.nodes_at(&parents);
         for (parent_idx, attr) in parents.iter().zip(attrs.iter()) {
-            let subclass_idxs = in_range(ctx.find_subclasses_of_idx(*parent_idx))?;
-            sink.push(PreparedOp::Node {
-                fqname: format!("{INIT_SUBCLASS_PREFIX}{}", attr.fqname),
-                kind: synthetic,
-                path: attr.path.clone(),
-                flags: 0,
-                edges_from_idx: vec![*parent_idx],
-                edges_to_idx: subclass_idxs,
-            });
+            let subclass_idxs = ctx.find_subclasses_of(*parent_idx);
+            ops.add_synthetic_node(
+                format!("{INIT_SUBCLASS_PREFIX}{}", attr.fqname),
+                attr.path.clone(),
+                0,
+                subclass_idxs,
+                vec![*parent_idx],
+            );
         }
         Ok(())
     }
@@ -2165,11 +2526,11 @@ pub(crate) fn _reset_server_config_run_count() {
 /// are both functions of the single file.
 fn server_config_run_on_file(
     filenames: &[String],
-    file_ctx: &FileContext<'_>,
-    sink: &mut Vec<FileLocalOp>,
+    file: &plugin_api::PluginFileCtx<'_>,
+    ops: &mut plugin_api::FileOps,
 ) {
     SERVER_CONFIG_RUN_COUNT.fetch_add(1, Ordering::Relaxed);
-    let nodes = file_ctx.nodes();
+    let nodes = file.nodes();
     let path = nodes[0].path.as_str();
     let basename = path
         .rsplit_once(std::path::MAIN_SEPARATOR)
@@ -2182,26 +2543,23 @@ fn server_config_run_on_file(
     // node (the module node included), excluding `type_alias`.
     let targets: Vec<u32> = nodes
         .iter()
-        .enumerate()
-        .filter(|(_, node)| {
+        .filter(|node| {
             matches!(
-                node.kind.as_static_str(),
+                node.kind.as_str(),
                 "module" | "function" | "class" | "variable" | "import"
             )
         })
-        .map(|(local_idx, _)| local_idx as u32)
+        .map(|node| node.local_idx)
         .collect();
     if targets.is_empty() {
         return;
     }
-    let synthetic = intern_kind("synthetic").expect("'synthetic' is a valid kind");
-    sink.push(FileLocalOp::Node {
-        fqname: format!("{SERVER_CONFIG_PREFIX}{}", file_ctx.module_fqname()),
-        kind: synthetic,
-        flags: NodeFlags::ENTRYPOINT,
-        edges_to_local_idx: targets,
-        edges_from_local_idx: Vec::new(),
-    });
+    ops.add_synthetic_node(
+        format!("{SERVER_CONFIG_PREFIX}{}", file.module_fqname()),
+        NodeFlags::ENTRYPOINT,
+        targets,
+        Vec::new(),
+    );
 }
 
 /// Project-wide port of `dead_cst.contrib.unittest.UnittestPlugin`: keep
@@ -2212,32 +2570,34 @@ fn server_config_run_on_file(
 /// can't be per-file.
 pub(crate) struct UnittestPluginImpl;
 
-impl NativePluginImpl for UnittestPluginImpl {
+impl plugin_api::ExternalPlugin for UnittestPluginImpl {
     fn name(&self) -> &str {
         "UnittestPlugin"
     }
 
-    fn run(&self, ctx: &FrozenView<'_>, sink: &mut Vec<PreparedOp>) -> PyResult<()> {
+    fn run(
+        &self,
+        ctx: &plugin_api::PluginCtx<'_>,
+        ops: &mut plugin_api::PluginOps,
+    ) -> Result<(), plugin_api::PluginError> {
         // O(1) presence probe — short-circuit before the subclass walk.
         if !ctx.has_imports_of("unittest") {
             return Ok(());
         }
-        let import_idxs = ctx.find_imports_of_indices("unittest");
+        let import_idxs = ctx.imports_of("unittest");
         let importer_paths: std::collections::HashSet<String> =
-            in_range(ctx.node_paths(&import_idxs))?
-                .into_iter()
-                .collect();
+            ctx.node_paths(&import_idxs).into_iter().collect();
 
         // path -> [decl_idx, ...] seeds to keep alive.
         let mut decls_by_path: std::collections::HashMap<String, Vec<usize>> =
             std::collections::HashMap::new();
 
         for base in UNITTEST_BASE_FQNAMES {
-            let sub_idxs = ctx.find_subclasses_indices(base, true);
+            let sub_idxs = ctx.find_subclasses_of_fqn(base, true);
             if sub_idxs.is_empty() {
                 continue;
             }
-            let paths = in_range(ctx.node_paths(&sub_idxs))?;
+            let paths = ctx.node_paths(&sub_idxs);
             for (idx, path) in sub_idxs.into_iter().zip(paths) {
                 decls_by_path.entry(path).or_default().push(idx);
             }
@@ -2245,23 +2605,20 @@ impl NativePluginImpl for UnittestPluginImpl {
 
         // Lifecycle hooks: function nodes in an importer file whose
         // trailing fqname segment is one of the module hooks.
-        {
-            let outputs = ctx.outputs;
-            for (idx, node) in outputs.builder.nodes.iter().enumerate() {
-                if node.kind != "function" || !importer_paths.contains(node.path.as_str()) {
-                    continue;
-                }
-                let simple = node
-                    .fqname
-                    .rsplit_once('.')
-                    .map(|(_, n)| n)
-                    .unwrap_or(node.fqname.as_str());
-                if UNITTEST_MODULE_HOOKS.contains(&simple) {
-                    decls_by_path
-                        .entry(node.path.clone())
-                        .or_default()
-                        .push(idx);
-                }
+        for node in ctx.nodes() {
+            if node.kind != "function" || !importer_paths.contains(node.path) {
+                continue;
+            }
+            let simple = node
+                .fqname
+                .rsplit_once('.')
+                .map(|(_, n)| n)
+                .unwrap_or(node.fqname);
+            if UNITTEST_MODULE_HOOKS.contains(&simple) {
+                decls_by_path
+                    .entry(node.path.to_string())
+                    .or_default()
+                    .push(node.idx);
             }
         }
 
@@ -2278,18 +2635,15 @@ impl NativePluginImpl for UnittestPluginImpl {
         if present.is_empty() {
             return Ok(());
         }
-        let module_attrs =
-            in_range(ctx.node_attrs(&present.iter().map(|(_, i)| *i).collect::<Vec<_>>()))?;
-        let synthetic = intern_kind("synthetic").expect("'synthetic' is a valid kind");
+        let module_attrs = ctx.nodes_at(&present.iter().map(|(_, i)| *i).collect::<Vec<_>>());
         for ((path, _idx), attr) in present.iter().zip(module_attrs.iter()) {
-            sink.push(PreparedOp::Node {
-                fqname: format!("{UNITTEST_PREFIX}{}", attr.fqname),
-                kind: synthetic,
-                path: path.clone(),
-                flags: NodeFlags::TESTCASE,
-                edges_from_idx: Vec::new(),
-                edges_to_idx: decls_by_path[path].clone(),
-            });
+            ops.add_synthetic_node(
+                format!("{UNITTEST_PREFIX}{}", attr.fqname),
+                path.clone(),
+                NodeFlags::TESTCASE,
+                decls_by_path[path].clone(),
+                Vec::new(),
+            );
         }
         Ok(())
     }
@@ -2301,7 +2655,7 @@ impl NativePluginImpl for UnittestPluginImpl {
 // configs that drove it (flask / fastapi / typer / cyclopts / slack_bolt /
 // fastmcp / celery). Cross-file by nature — a handler `@app.route(...)` in one
 // file wires to an `app = Flask()` variable that may live in another file — so
-// this is a project-wide `NativePluginImpl`, not a per-file one.
+// this is a project-wide `ExternalPlugin`, not a per-file one.
 //
 // Verbatim port of `DispatchAppPlugin._gather_one` (discovery) + `.policy`
 // (steps 3-6 of emission). The Python harness auto-batched the gather across
@@ -2345,7 +2699,7 @@ impl DispatchAppPluginImpl {
     /// Cheap import-presence + config-completeness guard (port of
     /// `DispatchAppPlugin._is_active`). Skips the subclass walk when no file
     /// imports any app class's root module.
-    fn is_active(&self, ctx: &FrozenView<'_>) -> bool {
+    fn is_active(&self, ctx: &plugin_api::PluginCtx<'_>) -> bool {
         let cfg = &self.config;
         if cfg.app_classes.is_empty() || cfg.registration_decorators.is_empty() {
             return false;
@@ -2374,12 +2728,16 @@ fn simple_name(fqname: &str) -> &str {
     fqname.rsplit_once('.').map(|(_, n)| n).unwrap_or(fqname)
 }
 
-impl NativePluginImpl for DispatchAppPluginImpl {
+impl plugin_api::ExternalPlugin for DispatchAppPluginImpl {
     fn name(&self) -> &str {
         &self.name
     }
 
-    fn run(&self, ctx: &FrozenView<'_>, sink: &mut Vec<PreparedOp>) -> PyResult<()> {
+    fn run(
+        &self,
+        ctx: &plugin_api::PluginCtx<'_>,
+        ops: &mut plugin_api::PluginOps,
+    ) -> Result<(), plugin_api::PluginError> {
         let cfg = &self.config;
         if !self.is_active(ctx) {
             return Ok(());
@@ -2401,11 +2759,11 @@ impl NativePluginImpl for DispatchAppPluginImpl {
             }
         }
         for fqn in &cfg.app_classes {
-            let sub_idxs = ctx.find_subclasses_indices(fqn, true);
+            let sub_idxs = ctx.find_subclasses_of_fqn(fqn, true);
             if sub_idxs.is_empty() {
                 continue;
             }
-            for attr in in_range(ctx.node_attrs(&sub_idxs))? {
+            for attr in ctx.nodes_at(&sub_idxs) {
                 if let Some((sub_module, sub_name)) = attr.fqname.rsplit_once('.') {
                     if !sub_module.is_empty() && !sub_name.is_empty() {
                         module_to_names
@@ -2427,13 +2785,8 @@ impl NativePluginImpl for DispatchAppPluginImpl {
         for (module, names) in &module_to_names {
             let mut names_vec: Vec<String> = names.iter().cloned().collect();
             names_vec.sort();
-            let rows = ctx.find_instance_constructions(
-                std::slice::from_ref(module),
-                &names_vec,
-                None,
-                false,
-            )?;
-            for (var_idx, _class_name, _args) in rows {
+            let names_ref: Vec<&str> = names_vec.iter().map(String::as_str).collect();
+            for var_idx in ctx.constructions(&[module.as_str()], &names_ref) {
                 if direct_seen.insert(var_idx) {
                     direct.push(var_idx);
                 }
@@ -2448,8 +2801,8 @@ impl NativePluginImpl for DispatchAppPluginImpl {
             for (module, names) in &module_to_names {
                 let mut names_vec: Vec<String> = names.iter().cloned().collect();
                 names_vec.sort();
-                let rows = ctx.find_factory_decls(std::slice::from_ref(module), &names_vec);
-                for (decl_idx, kinds) in rows {
+                let names_ref: Vec<&str> = names_vec.iter().map(String::as_str).collect();
+                for (decl_idx, kinds) in ctx.factory_decls(&[module.as_str()], &names_ref) {
                     for kind in kinds {
                         if factory_seen.insert((decl_idx, kind.clone())) {
                             factory_decls.push((decl_idx, kind));
@@ -2460,12 +2813,12 @@ impl NativePluginImpl for DispatchAppPluginImpl {
         }
 
         // handlers: `@<owner>.<reg_decorator>(...)`-decorated functions.
-        let reg_decorators: Vec<String> = cfg.registration_decorators.clone();
-        let handlers: Vec<(String, usize)> = ctx
-            .find_handler_decorators(&reg_decorators, None, false)?
-            .into_iter()
-            .map(|(owner, decorated_idx, _args)| (owner, decorated_idx))
+        let reg_ref: Vec<&str> = cfg
+            .registration_decorators
+            .iter()
+            .map(String::as_str)
             .collect();
+        let handlers: Vec<(String, usize)> = ctx.handler_decorators(&reg_ref);
 
         // factory_reachers (seed + factory): union of every factory decl's
         // direct predecessors. Inverts step 6's question (is this var's
@@ -2477,7 +2830,7 @@ impl NativePluginImpl for DispatchAppPluginImpl {
                 if !decl_seen.insert(decl_idx) {
                     continue;
                 }
-                for pred in in_range(ctx.direct_predecessors_idx(decl_idx, 0))? {
+                for pred in ctx.direct_predecessors(decl_idx) {
                     factory_reachers.insert(pred);
                 }
             }
@@ -2486,92 +2839,78 @@ impl NativePluginImpl for DispatchAppPluginImpl {
         // shared_task (celery): `@shared_task`-decorated decls.
         let shared_idxs: Vec<usize> = match &cfg.shared_task {
             Some(st) => {
-                let modules = [st.module.clone()];
-                let names: Vec<String> = st.names.clone();
-                ctx.find_decorated_decls(&modules, &names, None, false)?
-                    .into_iter()
-                    .map(|(decl_idx, _args)| decl_idx)
-                    .collect()
+                let names_ref: Vec<&str> = st.names.iter().map(String::as_str).collect();
+                ctx.decorated_decls(&[st.module.as_str()], &names_ref)
             }
             None => Vec::new(),
         };
 
-        // --- Phase 2: resolve paths/fqnames + assemble ops against the
-        // frozen outputs (all index gathering happened above). ---
-        let outputs = ctx.outputs;
-        let nodes = &outputs.builder.nodes;
-        let synthetic = intern_kind("synthetic").expect("'synthetic' is a valid kind");
-
+        // --- Phase 2: resolve paths/fqnames + assemble ops. All index
+        // gathering happened above; bulk-fetch the node attrs the emission
+        // loops need (parallel to their index vecs), then emit through `ops`.
         let app_prefix = format!("<{}-app>:", cfg.marker_prefix);
         let factory_prefix = format!("<{}-factory>:", cfg.marker_prefix);
 
         // vars_by_file: (path, simple var name) -> first var idx wins.
         let mut vars_by_file: FxHashMap<(String, String), usize> = FxHashMap::default();
-        for (idx, node) in nodes.iter().enumerate() {
+        for node in ctx.nodes() {
             if node.kind != "variable" {
                 continue;
             }
             vars_by_file
-                .entry((node.path.clone(), simple_name(&node.fqname).to_string()))
-                .or_insert(idx);
+                .entry((node.path.to_string(), simple_name(node.fqname).to_string()))
+                .or_insert(node.idx);
         }
 
         // Steps 1 + 3: build direct_by_owner and entrypoint-promote each
         // direct construction (the latter only under seed_as_entrypoint).
+        let direct_attrs = ctx.nodes_at(&direct);
         let mut direct_by_owner: FxHashMap<(String, String), Vec<usize>> = FxHashMap::default();
-        for &var_idx in &direct {
-            let node = &nodes[var_idx];
+        for (&var_idx, node) in direct.iter().zip(direct_attrs.iter()) {
             direct_by_owner
                 .entry((node.path.clone(), simple_name(&node.fqname).to_string()))
                 .or_default()
                 .push(var_idx);
             if cfg.seed_as_entrypoint {
-                sink.push(PreparedOp::Node {
-                    fqname: format!("{app_prefix}{}", node.fqname),
-                    kind: synthetic,
-                    path: node.path.clone(),
-                    flags: NodeFlags::ENTRYPOINT,
-                    edges_from_idx: Vec::new(),
-                    edges_to_idx: vec![var_idx],
-                });
+                ops.add_synthetic_node(
+                    format!("{app_prefix}{}", node.fqname),
+                    node.path.clone(),
+                    NodeFlags::ENTRYPOINT,
+                    vec![var_idx],
+                    Vec::new(),
+                );
             }
         }
 
         // Step 4: factory markers so step 6's reachability walk can find
         // them. `factory_decls` is empty unless seed_as_entrypoint.
-        for (decl_idx, kind) in &factory_decls {
-            let node = &nodes[*decl_idx];
-            sink.push(PreparedOp::Node {
-                fqname: format!("{factory_prefix}{kind}:{}", node.fqname),
-                kind: synthetic,
-                path: node.path.clone(),
-                flags: 0,
-                edges_from_idx: vec![*decl_idx],
-                edges_to_idx: Vec::new(),
-            });
+        let factory_idxs: Vec<usize> = factory_decls.iter().map(|(i, _)| *i).collect();
+        let factory_attrs = ctx.nodes_at(&factory_idxs);
+        for ((decl_idx, kind), node) in factory_decls.iter().zip(factory_attrs.iter()) {
+            ops.add_synthetic_node(
+                format!("{factory_prefix}{kind}:{}", node.fqname),
+                node.path.clone(),
+                0,
+                Vec::new(),
+                vec![*decl_idx],
+            );
         }
 
         // Step 5: wire handler decorators to their owner var. Seed mode
         // uses vars_by_file (so `app = create_app()` factory chains pick up
         // edges); pure-dispatch mode wires only to direct constructions (so
         // a star-imported `app = App()` stays invisible).
-        for (owner, decorated_idx) in &handlers {
-            let key = (nodes[*decorated_idx].path.clone(), owner.clone());
+        let handler_idxs: Vec<usize> = handlers.iter().map(|(_, i)| *i).collect();
+        let handler_paths = ctx.node_paths(&handler_idxs);
+        for ((owner, decorated_idx), dpath) in handlers.iter().zip(handler_paths.iter()) {
+            let key = (dpath.clone(), owner.clone());
             if cfg.seed_as_entrypoint {
                 if let Some(&var_idx) = vars_by_file.get(&key) {
-                    sink.push(PreparedOp::Edge {
-                        src_idx: var_idx,
-                        dst_idx: *decorated_idx,
-                        flags: 0,
-                    });
+                    ops.add_edge(var_idx, *decorated_idx, 0);
                 }
             } else if let Some(var_idxs) = direct_by_owner.get(&key) {
                 for &var_idx in var_idxs {
-                    sink.push(PreparedOp::Edge {
-                        src_idx: var_idx,
-                        dst_idx: *decorated_idx,
-                        flags: 0,
-                    });
+                    ops.add_edge(var_idx, *decorated_idx, 0);
                 }
             }
         }
@@ -2582,8 +2921,8 @@ impl NativePluginImpl for DispatchAppPluginImpl {
         // `wrapper = app; app = create_app()` over-promotion case.
         if cfg.seed_as_entrypoint && !factory_decls.is_empty() {
             let mut classified: FxHashSet<(String, String)> = FxHashSet::default();
-            for (owner, decorated_idx) in &handlers {
-                let key = (nodes[*decorated_idx].path.clone(), owner.clone());
+            for ((owner, _decorated_idx), dpath) in handlers.iter().zip(handler_paths.iter()) {
+                let key = (dpath.clone(), owner.clone());
                 if direct_by_owner.contains_key(&key) || classified.contains(&key) {
                     continue;
                 }
@@ -2594,40 +2933,40 @@ impl NativePluginImpl for DispatchAppPluginImpl {
                     continue;
                 }
                 classified.insert(key);
-                let node = &nodes[var_idx];
-                sink.push(PreparedOp::Node {
-                    fqname: format!("{app_prefix}{}", node.fqname),
-                    kind: synthetic,
-                    path: node.path.clone(),
-                    flags: NodeFlags::ENTRYPOINT,
-                    edges_from_idx: Vec::new(),
-                    edges_to_idx: vec![var_idx],
-                });
+                let node = ctx
+                    .node(var_idx)
+                    .expect("var index from frozen scan is in range");
+                ops.add_synthetic_node(
+                    format!("{app_prefix}{}", node.fqname),
+                    node.path.clone(),
+                    NodeFlags::ENTRYPOINT,
+                    vec![var_idx],
+                    Vec::new(),
+                );
             }
         }
 
         // Celery `@shared_task` fan-out: one `<marker_prefix><basename>`
         // entrypoint per file, keeping every appless task callable alive.
         if let Some(st) = &cfg.shared_task {
+            let shared_paths = ctx.node_paths(&shared_idxs);
             let mut by_path: FxHashMap<String, Vec<usize>> = FxHashMap::default();
             let mut path_order: Vec<String> = Vec::new();
-            for &decl_idx in &shared_idxs {
-                let path = nodes[decl_idx].path.clone();
-                if !by_path.contains_key(&path) {
+            for (&decl_idx, path) in shared_idxs.iter().zip(shared_paths.iter()) {
+                if !by_path.contains_key(path) {
                     path_order.push(path.clone());
                 }
-                by_path.entry(path).or_default().push(decl_idx);
+                by_path.entry(path.clone()).or_default().push(decl_idx);
             }
             for path in path_order {
                 let target_idxs = by_path.remove(&path).unwrap_or_default();
-                sink.push(PreparedOp::Node {
-                    fqname: format!("{}{}", st.marker_prefix, path_basename(&path)),
-                    kind: synthetic,
-                    path: path.clone(),
-                    flags: NodeFlags::ENTRYPOINT,
-                    edges_from_idx: Vec::new(),
-                    edges_to_idx: target_idxs,
-                });
+                ops.add_synthetic_node(
+                    format!("{}{}", st.marker_prefix, path_basename(&path)),
+                    path.clone(),
+                    NodeFlags::ENTRYPOINT,
+                    target_idxs,
+                    Vec::new(),
+                );
             }
         }
 
@@ -2793,41 +3132,28 @@ const CLICK_SUBGROUP_DECORATOR: &str = "group";
 
 pub(crate) struct ClickPluginImpl;
 
-impl NativePluginImpl for ClickPluginImpl {
+impl plugin_api::ExternalPlugin for ClickPluginImpl {
     fn name(&self) -> &str {
         "click"
     }
 
-    fn run(&self, ctx: &FrozenView<'_>, sink: &mut Vec<PreparedOp>) -> PyResult<()> {
+    fn run(
+        &self,
+        ctx: &plugin_api::PluginCtx<'_>,
+        ops: &mut plugin_api::PluginOps,
+    ) -> Result<(), plugin_api::PluginError> {
         // Cheap import-presence guard (`has_imports_of("click")`).
         if !ctx.has_imports_of("click") {
             return Ok(());
         }
-        let click_mod = ["click".to_string()];
 
         // --- Phase 1: gather indices. ---
 
         // Groups via `@click.group` / `@click.Group`-decorated decls.
-        let group_decls: Vec<usize> = ctx
-            .find_decorated_decls(
-                &click_mod,
-                &CLICK_GROUP_DECORATORS
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect::<Vec<String>>(),
-                None,
-                false,
-            )?
-            .into_iter()
-            .map(|(idx, _)| idx)
-            .collect();
+        let group_decls: Vec<usize> = ctx.decorated_decls(&["click"], &CLICK_GROUP_DECORATORS);
 
         // Groups via `X = click.Group(...)` constructions.
-        let group_ctors: Vec<usize> = ctx
-            .find_instance_constructions(&click_mod, &["Group".to_string()], None, false)?
-            .into_iter()
-            .map(|(idx, _, _)| idx)
-            .collect();
+        let group_ctors: Vec<usize> = ctx.constructions(&["click"], &["Group"]);
 
         // No groups => no wiring to do (the fixpoint would no-op anyway).
         if group_decls.is_empty() && group_ctors.is_empty() {
@@ -2835,42 +3161,46 @@ impl NativePluginImpl for ClickPluginImpl {
         }
 
         // Handlers: `@<owner>.{command,group,result_callback}(...)`.
-        let handlers: Vec<(String, usize)> = ctx
-            .find_handler_decorators(
-                &CLICK_REGISTRATION_DECORATORS
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect::<Vec<String>>(),
-                None,
-                false,
-            )?
-            .into_iter()
-            .map(|(owner, idx, _)| (owner, idx))
-            .collect();
+        let handlers: Vec<(String, usize)> = ctx.handler_decorators(&CLICK_REGISTRATION_DECORATORS);
 
         // Subgroup links: handlers decorated specifically with
         // `@<owner>.group(...)`. Wiring such a handler promotes it to a
         // group so its own `@<handler>.command()` handlers wire next pass.
         let subgroup_links: FxHashSet<(usize, String)> = ctx
-            .find_handler_decorators(&[CLICK_SUBGROUP_DECORATOR.to_string()], None, false)?
+            .handler_decorators(&[CLICK_SUBGROUP_DECORATOR])
             .into_iter()
-            .map(|(owner, idx, _)| (idx, owner))
+            .map(|(owner, idx)| (idx, owner))
             .collect();
 
         // --- Phase 2: resolve paths/fqnames + run the group->handler
-        // fixpoint against the frozen outputs. ---
-        let outputs = ctx.outputs;
-        let nodes = &outputs.builder.nodes;
+        // fixpoint. Pre-fetch (path, simple name) for every group + handler
+        // node up front so the loop needs no random node access. ---
 
         // groups_by_owner: (path, simple name) -> [group idx, ...].
+        let group_idxs: Vec<usize> = group_decls
+            .iter()
+            .chain(group_ctors.iter())
+            .copied()
+            .collect();
         let mut groups_by_owner: FxHashMap<(String, String), Vec<usize>> = FxHashMap::default();
-        for &idx in group_decls.iter().chain(group_ctors.iter()) {
-            let node = &nodes[idx];
+        for nv in ctx.nodes_at(&group_idxs) {
+            let simple = simple_name(&nv.fqname).to_string();
             groups_by_owner
-                .entry((node.path.clone(), simple_name(&node.fqname).to_string()))
+                .entry((nv.path, simple))
                 .or_default()
-                .push(idx);
+                .push(nv.idx);
         }
+
+        // decorated_idx -> (path, simple name) for every handler decl.
+        let handler_idxs: Vec<usize> = handlers.iter().map(|(_, idx)| *idx).collect();
+        let handler_attr: FxHashMap<usize, (String, String)> = ctx
+            .nodes_at(&handler_idxs)
+            .into_iter()
+            .map(|nv| {
+                let simple = simple_name(&nv.fqname).to_string();
+                (nv.idx, (nv.path, simple))
+            })
+            .collect();
 
         // Fixpoint: wire each handler to its owning group(s); a newly wired
         // subgroup handler becomes a group, exposing its own handlers on the
@@ -2881,8 +3211,11 @@ impl NativePluginImpl for ClickPluginImpl {
         while changed {
             changed = false;
             for (owner_name, decorated_idx) in &handlers {
-                let path = nodes[*decorated_idx].path.clone();
-                // Snapshot the owner's group idxs: `add_group` below may
+                let Some((path, decorated_simple)) = handler_attr.get(decorated_idx).cloned()
+                else {
+                    continue;
+                };
+                // Snapshot the owner's group idxs: the insert below may
                 // mutate `groups_by_owner`, and the dedup + outer loop make
                 // deferring a same-pass insertion to the next pass
                 // fixpoint-equivalent.
@@ -2894,15 +3227,10 @@ impl NativePluginImpl for ClickPluginImpl {
                     if !emitted.insert((owner_idx, *decorated_idx)) {
                         continue;
                     }
-                    sink.push(PreparedOp::Edge {
-                        src_idx: owner_idx,
-                        dst_idx: *decorated_idx,
-                        flags: 0,
-                    });
+                    ops.add_edge(owner_idx, *decorated_idx, 0);
                     if subgroup_links.contains(&(*decorated_idx, owner_name.clone())) {
-                        let simple = simple_name(&nodes[*decorated_idx].fqname).to_string();
                         groups_by_owner
-                            .entry((path.clone(), simple))
+                            .entry((path.clone(), decorated_simple.clone()))
                             .or_default()
                             .push(*decorated_idx);
                         changed = true;
@@ -2927,26 +3255,26 @@ const PATCH_TARGET_PREFIX: &str = "<patch-target>:";
 
 pub(crate) struct MockPatchPluginImpl;
 
-impl NativePluginImpl for MockPatchPluginImpl {
+impl plugin_api::ExternalPlugin for MockPatchPluginImpl {
     fn name(&self) -> &str {
         "MockPatchPlugin"
     }
 
-    fn run(&self, ctx: &FrozenView<'_>, sink: &mut Vec<PreparedOp>) -> PyResult<()> {
+    fn run(
+        &self,
+        ctx: &plugin_api::PluginCtx<'_>,
+        ops: &mut plugin_api::PluginOps,
+    ) -> Result<(), plugin_api::PluginError> {
         // Phase 1: gather (enclosing decl idx, target fqname) rows from the
         // four patch-call shapes.
         let mut rows: Vec<(usize, String)> = Vec::new();
         // `patch("X.Y")` imported from unittest.mock / mock.
-        let mock_modules = ["unittest.mock".to_string(), "mock".to_string()];
-        for (owner_idx, target, _args) in
-            ctx.find_calls_to_imported(&mock_modules, "patch", 0, None, false)?
+        for (owner_idx, target) in ctx.calls_with_string_arg(&["unittest.mock", "mock"], "patch", 0)
         {
             rows.push((owner_idx, target));
         }
         // `mocker.patch("X.Y")` (pytest-mock fixture).
-        for (owner_idx, target, _args) in
-            ctx.find_calls_on_var("mocker", "patch", 0, None, None, false)?
-        {
+        for (owner_idx, target) in ctx.calls_on_var("mocker", "patch", 0, None) {
             rows.push((owner_idx, target));
         }
         // `monkeypatch.setattr("X.Y", v)` (2 positional) /
@@ -2954,9 +3282,7 @@ impl NativePluginImpl for MockPatchPluginImpl {
         // required-positional count distinguishes the fqname form from the
         // object form (`setattr(obj, "name", v)`).
         for (attr, required) in [("setattr", 2usize), ("delattr", 1usize)] {
-            for (owner_idx, target, _args) in
-                ctx.find_calls_on_var("monkeypatch", attr, 0, Some(required), None, false)?
-            {
+            for (owner_idx, target) in ctx.calls_on_var("monkeypatch", attr, 0, Some(required)) {
                 rows.push((owner_idx, target));
             }
         }
@@ -2980,25 +3306,24 @@ impl NativePluginImpl for MockPatchPluginImpl {
         // itself a module). One synthetic `<patch-target>:<fqname>` per fqname,
         // emitted unconditionally — an empty target set still records the
         // patch site for introspection, matching the Python plugin.
-        let synthetic = intern_kind("synthetic").expect("'synthetic' is a valid kind");
         for fqname in order {
             let owners = &owners_by_fqname[&fqname];
-            let mut target_idxs = ctx.find_declarations_indices(&fqname);
-            if let Some(mod_idx) = ctx.find_module_idx(&fqname) {
+            let mut target_idxs = ctx.find_declarations(&fqname);
+            if let Some(mod_idx) = ctx.find_module(&fqname) {
                 target_idxs.push(mod_idx);
             }
-            let owner_path = in_range(ctx.node_paths(&[owners[0]]))?
+            let owner_path = ctx
+                .node_paths(&[owners[0]])
                 .into_iter()
                 .next()
                 .unwrap_or_default();
-            sink.push(PreparedOp::Node {
-                fqname: format!("{PATCH_TARGET_PREFIX}{fqname}"),
-                kind: synthetic,
-                path: owner_path,
-                flags: 0,
-                edges_from_idx: owners.clone(),
-                edges_to_idx: target_idxs,
-            });
+            ops.add_synthetic_node(
+                format!("{PATCH_TARGET_PREFIX}{fqname}"),
+                owner_path,
+                0,
+                target_idxs,
+                owners.clone(),
+            );
         }
         Ok(())
     }
@@ -3034,12 +3359,16 @@ const DISCORD_COG_BASES: [&str; 2] = ["discord.ext.commands.Cog", "discord.ext.c
 
 pub(crate) struct DiscordPyPluginImpl;
 
-impl NativePluginImpl for DiscordPyPluginImpl {
+impl plugin_api::ExternalPlugin for DiscordPyPluginImpl {
     fn name(&self) -> &str {
         "DiscordPyPlugin"
     }
 
-    fn run(&self, ctx: &FrozenView<'_>, sink: &mut Vec<PreparedOp>) -> PyResult<()> {
+    fn run(
+        &self,
+        ctx: &plugin_api::PluginCtx<'_>,
+        ops: &mut plugin_api::PluginOps,
+    ) -> Result<(), plugin_api::PluginError> {
         // Cheap presence probe — short-circuit before any walk.
         let mut imports_discord = false;
         for m in DISCORD_PROBE_MODULES {
@@ -3055,208 +3384,175 @@ impl NativePluginImpl for DiscordPyPluginImpl {
         // Per-file gate: files that import discord.
         let mut discord_paths: FxHashSet<String> = FxHashSet::default();
         for m in DISCORD_PROBE_MODULES {
-            let idxs = ctx.find_imports_of_indices(m);
-            for p in in_range(ctx.node_paths(&idxs))? {
+            let idxs = ctx.imports_of(m);
+            for p in ctx.node_paths(&idxs) {
                 discord_paths.insert(p);
             }
         }
 
-        let synthetic = intern_kind("synthetic").expect("'synthetic' is a valid kind");
+        // --- Phase 1: gather indices. ---
 
-        {
-            // --- Phase 1: gather indices. ---
+        // 1. Bot / Client constructions (var idxs, in discovery order).
+        let mut bot_var_idxs: Vec<usize> = Vec::new();
+        let mut bot_names: Vec<String> = DISCORD_COMMANDS_BOT_KINDS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        bot_names.sort();
+        let bot_names_ref: Vec<&str> = bot_names.iter().map(String::as_str).collect();
+        bot_var_idxs.extend(ctx.constructions(&["discord.ext.commands"], &bot_names_ref));
+        let mut client_names: Vec<String> =
+            DISCORD_CLIENT_KINDS.iter().map(|s| s.to_string()).collect();
+        client_names.sort();
+        let client_names_ref: Vec<&str> = client_names.iter().map(String::as_str).collect();
+        bot_var_idxs.extend(ctx.constructions(&["discord"], &client_names_ref));
 
-            // 1. Bot / Client constructions (var idxs, in discovery order).
-            let mut bot_var_idxs: Vec<usize> = Vec::new();
-            let commands_mod = ["discord.ext.commands".to_string()];
-            let mut bot_names: Vec<String> = DISCORD_COMMANDS_BOT_KINDS
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
-            bot_names.sort();
-            for (var_idx, _ctor, _args) in
-                ctx.find_instance_constructions(&commands_mod, &bot_names, None, false)?
-            {
-                bot_var_idxs.push(var_idx);
+        // 2 + 3. Handler decorators: single-attr `@<bot>.<verb>` and
+        // two-level `@<bot>.tree.<verb>` slash commands.
+        let bot_handlers: Vec<(String, usize)> = ctx.handler_decorators(&DISCORD_BOT_DECORATORS);
+        let tree_handlers: Vec<(String, usize)> =
+            ctx.handler_decorators_via("tree", &DISCORD_TREE_DECORATORS);
+
+        // 4. Cog subclasses + their files; module setup/teardown hooks.
+        let mut cogs_by_path: FxHashMap<String, Vec<usize>> = FxHashMap::default();
+        let mut cog_path_order: Vec<String> = Vec::new();
+        for base in DISCORD_COG_BASES {
+            let cog_idxs = ctx.find_subclasses_of_fqn(base, true);
+            if cog_idxs.is_empty() {
+                continue;
             }
-            let discord_mod = ["discord".to_string()];
-            let mut client_names: Vec<String> =
-                DISCORD_CLIENT_KINDS.iter().map(|s| s.to_string()).collect();
-            client_names.sort();
-            for (var_idx, _ctor, _args) in
-                ctx.find_instance_constructions(&discord_mod, &client_names, None, false)?
-            {
-                bot_var_idxs.push(var_idx);
+            let cog_paths = ctx.node_paths(&cog_idxs);
+            for (idx, path) in cog_idxs.into_iter().zip(cog_paths) {
+                if !cogs_by_path.contains_key(&path) {
+                    cog_path_order.push(path.clone());
+                }
+                cogs_by_path.entry(path).or_default().push(idx);
             }
+        }
+        let mut hook_funcs_by_path: FxHashMap<String, Vec<usize>> = FxHashMap::default();
+        if !cogs_by_path.is_empty() {
+            let cog_path_refs: Vec<&str> = cog_path_order.iter().map(String::as_str).collect();
+            let hook_idxs = ctx.nodes_matching(&plugin_api::NodeFilter {
+                kinds: &["function"],
+                simple_names: &["setup", "teardown"],
+                paths: &cog_path_refs,
+                fqname_prefix: None,
+                flags_all: None,
+                flags_any: None,
+            });
+            if !hook_idxs.is_empty() {
+                let hook_paths = ctx.node_paths(&hook_idxs);
+                for (idx, path) in hook_idxs.into_iter().zip(hook_paths) {
+                    hook_funcs_by_path.entry(path).or_default().push(idx);
+                }
+            }
+        }
 
-            // 2 + 3. Handler decorators: single-attr `@<bot>.<verb>` and
-            // two-level `@<bot>.tree.<verb>` slash commands.
-            let bot_handlers: Vec<(String, usize)> = ctx
-                .find_handler_decorators(
-                    &DISCORD_BOT_DECORATORS
-                        .iter()
-                        .map(|s| s.to_string())
-                        .collect::<Vec<String>>(),
-                    None,
-                    false,
-                )?
-                .into_iter()
-                .map(|(owner, idx, _)| (owner, idx))
-                .collect();
-            let tree_handlers: Vec<(String, usize)> = ctx
-                .find_handler_decorators_via(
-                    "tree",
-                    &DISCORD_TREE_DECORATORS
-                        .iter()
-                        .map(|s| s.to_string())
-                        .collect::<Vec<String>>(),
-                    None,
-                    false,
-                )?
-                .into_iter()
-                .map(|(owner, idx, _)| (owner, idx))
-                .collect();
+        // 6. load_extension / load_extensions string-literal targets
+        // (owner decl idx + extension fqname), raw — gated/deduped below.
+        let mut raw_ext_calls: Vec<(usize, String)> = Vec::new();
+        for attr in ["load_extension", "load_extensions"] {
+            for (owner_idx, ext_fqname) in ctx.calls_on_attr(attr, 0) {
+                raw_ext_calls.push((owner_idx, ext_fqname));
+            }
+        }
 
-            // 4. Cog subclasses + their files; module setup/teardown hooks.
-            let mut cogs_by_path: FxHashMap<String, Vec<usize>> = FxHashMap::default();
-            let mut cog_path_order: Vec<String> = Vec::new();
-            for base in DISCORD_COG_BASES {
-                let cog_idxs = ctx.find_subclasses_indices(base, true);
-                if cog_idxs.is_empty() {
+        // --- Phase 2a: build bot var map, emit bot entrypoints + handler
+        // edges, gate + dedup extension calls. Node attrs (path / simple name)
+        // are pre-fetched in bulk so the loops need no random node access. ---
+        let mut pending_extensions: Vec<(String, String)> = Vec::new();
+
+        // bot_vars_by_file: path -> { simple var name -> var idx }.
+        let mut bot_vars_by_file: FxHashMap<String, FxHashMap<String, usize>> =
+            FxHashMap::default();
+        for nv in ctx.nodes_at(&bot_var_idxs) {
+            if !discord_paths.contains(nv.path.as_str()) {
+                continue;
+            }
+            bot_vars_by_file
+                .entry(nv.path.clone())
+                .or_default()
+                .insert(simple_name(&nv.fqname).to_string(), nv.idx);
+            ops.keep_alive(nv.idx, DISCORDPY_APP_MARKER.to_string());
+        }
+
+        // Wire single-attr + two-level handler decorators to their bot.
+        let handler_idxs: Vec<usize> = bot_handlers
+            .iter()
+            .chain(tree_handlers.iter())
+            .map(|(_, idx)| *idx)
+            .collect();
+        let handler_paths: FxHashMap<usize, String> = handler_idxs
+            .iter()
+            .copied()
+            .zip(ctx.node_paths(&handler_idxs))
+            .collect();
+        for (owner, decorated_idx) in bot_handlers.iter().chain(tree_handlers.iter()) {
+            let Some(path) = handler_paths.get(decorated_idx) else {
+                continue;
+            };
+            if let Some(&owner_idx) = bot_vars_by_file.get(path).and_then(|m| m.get(owner)) {
+                ops.add_edge(owner_idx, *decorated_idx, 0);
+            }
+        }
+
+        // Gate extension calls on importer files; dedup by fqname.
+        let ext_owner_idxs: Vec<usize> = raw_ext_calls.iter().map(|(idx, _)| *idx).collect();
+        let ext_owner_paths: FxHashMap<usize, String> = ext_owner_idxs
+            .iter()
+            .copied()
+            .zip(ctx.node_paths(&ext_owner_idxs))
+            .collect();
+        let mut seen_extensions: FxHashSet<String> = FxHashSet::default();
+        for (owner_idx, ext_fqname) in &raw_ext_calls {
+            let Some(path) = ext_owner_paths.get(owner_idx) else {
+                continue;
+            };
+            if !discord_paths.contains(path.as_str()) {
+                continue;
+            }
+            if !seen_extensions.insert(ext_fqname.clone()) {
+                continue;
+            }
+            pending_extensions.push((path.clone(), ext_fqname.clone()));
+        }
+
+        // --- Phase 2b: Cog entrypoint nodes (one per cog file). ---
+        for path in &cog_path_order {
+            let mut targets = cogs_by_path[path].clone();
+            if let Some(hooks) = hook_funcs_by_path.get(path) {
+                targets.extend(hooks.iter().copied());
+            }
+            ops.add_synthetic_node(
+                format!("{DISCORDPY_COG_PREFIX}{}", path_basename(path)),
+                path.clone(),
+                NodeFlags::ENTRYPOINT,
+                targets,
+                Vec::new(),
+            );
+        }
+
+        // --- Phase 2c: extension surface fan-out. ---
+        if !pending_extensions.is_empty() {
+            let ext_fqnames: Vec<String> =
+                pending_extensions.iter().map(|(_, e)| e.clone()).collect();
+            let surfaces = ctx.module_surfaces(&ext_fqnames);
+            for (owner_path, ext_fqname) in &pending_extensions {
+                let targets = surfaces.get(ext_fqname).cloned().unwrap_or_default();
+                if targets.is_empty() {
                     continue;
                 }
-                let cog_paths = in_range(ctx.node_paths(&cog_idxs))?;
-                for (idx, path) in cog_idxs.into_iter().zip(cog_paths) {
-                    if !cogs_by_path.contains_key(&path) {
-                        cog_path_order.push(path.clone());
-                    }
-                    cogs_by_path.entry(path).or_default().push(idx);
-                }
-            }
-            let mut hook_funcs_by_path: FxHashMap<String, Vec<usize>> = FxHashMap::default();
-            if !cogs_by_path.is_empty() {
-                let hook_idxs = ctx.indices_where(
-                    Some("function".to_string()),
-                    None,
-                    None,
-                    None,
-                    None,
-                    Some(vec!["setup".to_string(), "teardown".to_string()]),
-                    Some(cog_path_order.clone()),
-                    None,
-                    None,
-                    None,
-                    None,
+                ops.add_synthetic_node(
+                    format!("{DISCORDPY_EXTENSION_PREFIX}{ext_fqname}"),
+                    owner_path.clone(),
+                    NodeFlags::ENTRYPOINT,
+                    targets,
+                    Vec::new(),
                 );
-                if !hook_idxs.is_empty() {
-                    let hook_paths = in_range(ctx.node_paths(&hook_idxs))?;
-                    for (idx, path) in hook_idxs.into_iter().zip(hook_paths) {
-                        hook_funcs_by_path.entry(path).or_default().push(idx);
-                    }
-                }
             }
-
-            // 6. load_extension / load_extensions string-literal targets
-            // (owner decl idx + extension fqname), raw — gated/deduped below.
-            let mut raw_ext_calls: Vec<(usize, String)> = Vec::new();
-            for attr in ["load_extension", "load_extensions"] {
-                for (owner_idx, ext_fqname, _args) in
-                    ctx.find_calls_on_attr(attr, 0, None, false)?
-                {
-                    raw_ext_calls.push((owner_idx, ext_fqname));
-                }
-            }
-
-            // --- Phase 2a: build bot var map, emit bot entrypoints + handler
-            // edges, gate + dedup extension calls. One guard, dropped after. ---
-            let mut pending_extensions: Vec<(String, String)> = Vec::new();
-            {
-                let nodes = &ctx.outputs.builder.nodes;
-
-                // bot_vars_by_file: path -> { simple var name -> var idx }.
-                let mut bot_vars_by_file: FxHashMap<String, FxHashMap<String, usize>> =
-                    FxHashMap::default();
-                for &var_idx in &bot_var_idxs {
-                    let node = &nodes[var_idx];
-                    if !discord_paths.contains(node.path.as_str()) {
-                        continue;
-                    }
-                    bot_vars_by_file
-                        .entry(node.path.clone())
-                        .or_default()
-                        .insert(simple_name(&node.fqname).to_string(), var_idx);
-                    sink.push(PreparedOp::Entrypoint {
-                        decl_idx: var_idx,
-                        marker: DISCORDPY_APP_MARKER.to_string(),
-                    });
-                }
-
-                // Wire single-attr + two-level handler decorators to their bot.
-                for (owner, decorated_idx) in bot_handlers.iter().chain(tree_handlers.iter()) {
-                    let path = nodes[*decorated_idx].path.as_str();
-                    if let Some(&owner_idx) = bot_vars_by_file.get(path).and_then(|m| m.get(owner))
-                    {
-                        sink.push(PreparedOp::Edge {
-                            src_idx: owner_idx,
-                            dst_idx: *decorated_idx,
-                            flags: 0,
-                        });
-                    }
-                }
-
-                // Gate extension calls on importer files; dedup by fqname.
-                let mut seen_extensions: FxHashSet<String> = FxHashSet::default();
-                for (owner_idx, ext_fqname) in &raw_ext_calls {
-                    let path = nodes[*owner_idx].path.clone();
-                    if !discord_paths.contains(path.as_str()) {
-                        continue;
-                    }
-                    if !seen_extensions.insert(ext_fqname.clone()) {
-                        continue;
-                    }
-                    pending_extensions.push((path, ext_fqname.clone()));
-                }
-            }
-
-            // --- Phase 2b: Cog entrypoint nodes (one per cog file). ---
-            for path in &cog_path_order {
-                let mut targets = cogs_by_path[path].clone();
-                if let Some(hooks) = hook_funcs_by_path.get(path) {
-                    targets.extend(hooks.iter().copied());
-                }
-                sink.push(PreparedOp::Node {
-                    fqname: format!("{DISCORDPY_COG_PREFIX}{}", path_basename(path)),
-                    kind: synthetic,
-                    path: path.clone(),
-                    flags: NodeFlags::ENTRYPOINT,
-                    edges_from_idx: Vec::new(),
-                    edges_to_idx: targets,
-                });
-            }
-
-            // --- Phase 2c: extension surface fan-out (re-acquires a guard). ---
-            if !pending_extensions.is_empty() {
-                let ext_fqnames: Vec<String> =
-                    pending_extensions.iter().map(|(_, e)| e.clone()).collect();
-                let surfaces = ctx.module_surfaces_indices(&ext_fqnames);
-                for (owner_path, ext_fqname) in &pending_extensions {
-                    let targets = surfaces.get(ext_fqname).cloned().unwrap_or_default();
-                    if targets.is_empty() {
-                        continue;
-                    }
-                    sink.push(PreparedOp::Node {
-                        fqname: format!("{DISCORDPY_EXTENSION_PREFIX}{ext_fqname}"),
-                        kind: synthetic,
-                        path: owner_path.clone(),
-                        flags: NodeFlags::ENTRYPOINT,
-                        edges_from_idx: Vec::new(),
-                        edges_to_idx: targets,
-                    });
-                }
-            }
-
-            Ok(())
         }
+
+        Ok(())
     }
 }
 
@@ -3291,23 +3587,23 @@ impl DynamicImportFallbackPluginImpl {
     /// Exports of `module_fqname` per `_exports_indices_for`: `__all__` when
     /// `respect_dunder_all` and present, else the module's top-level decls
     /// (dropping `_`-prefixed names unless `include_underscore`).
-    fn exports_for(&self, ctx: &FrozenView<'_>, module_fqname: &str) -> PyResult<Vec<usize>> {
+    fn exports_for(&self, ctx: &plugin_api::PluginCtx<'_>, module_fqname: &str) -> Vec<usize> {
         if self.respect_dunder_all {
-            if let Some(exports) = ctx.find_module_dunder_all_exports_indices(module_fqname) {
-                return Ok(exports);
+            if let Some(exports) = ctx.dunder_all_exports(module_fqname) {
+                return exports;
             }
         }
-        let decls = ctx.find_module_top_level_decls_indices(module_fqname);
+        let decls = ctx.module_top_level_decls(module_fqname);
         if self.include_underscore || decls.is_empty() {
-            return Ok(decls);
+            return decls;
         }
-        let attrs = in_range(ctx.node_attrs(&decls))?;
-        Ok(decls
+        let attrs = ctx.nodes_at(&decls);
+        decls
             .into_iter()
             .zip(attrs)
             .filter(|(_idx, attr)| !simple_name(&attr.fqname).starts_with('_'))
             .map(|(idx, _attr)| idx)
-            .collect())
+            .collect()
     }
 }
 
@@ -3441,29 +3737,34 @@ fn fnmatch_regex(pat: &str) -> String {
     out
 }
 
-impl NativePluginImpl for DynamicImportFallbackPluginImpl {
+impl plugin_api::ExternalPlugin for DynamicImportFallbackPluginImpl {
     fn name(&self) -> &str {
         "DynamicImportFallbackPlugin"
     }
 
-    fn run(&self, ctx: &FrozenView<'_>, sink: &mut Vec<PreparedOp>) -> PyResult<()> {
+    fn run(
+        &self,
+        ctx: &plugin_api::PluginCtx<'_>,
+        ops: &mut plugin_api::PluginOps,
+    ) -> Result<(), plugin_api::PluginError> {
         let project_root = ctx.project_root().to_string();
 
         // Snapshot DYNAMIC_IMPORT edges whose dst is a module node:
         // (src idx, src path, dst module fqname).
-        let candidates: Vec<(usize, String, String)> = {
-            let b = &ctx.outputs.builder;
-            b.edges
-                .iter()
-                .filter_map(|&(src, dst, flags)| {
-                    if flags & EdgeFlags::DYNAMIC_IMPORT != 0 && b.nodes[dst].kind == "module" {
-                        Some((src, b.nodes[src].path.clone(), b.nodes[dst].fqname.clone()))
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        };
+        let candidates: Vec<(usize, String, String)> = ctx
+            .edges()
+            .filter_map(|e| {
+                if e.flags & EdgeFlags::DYNAMIC_IMPORT == 0 {
+                    return None;
+                }
+                let dst = ctx.node(e.dst)?;
+                if dst.kind != "module" {
+                    return None;
+                }
+                let src = ctx.node(e.src)?;
+                Some((e.src, src.path, dst.fqname))
+            })
+            .collect();
         if candidates.is_empty() {
             return Ok(());
         }
@@ -3532,15 +3833,11 @@ impl NativePluginImpl for DynamicImportFallbackPluginImpl {
         let mut cache: FxHashMap<String, Vec<usize>> = FxHashMap::default();
         for (src_idx, dst_fqname) in allowed {
             if !cache.contains_key(&dst_fqname) {
-                let exports = self.exports_for(ctx, &dst_fqname)?;
+                let exports = self.exports_for(ctx, &dst_fqname);
                 cache.insert(dst_fqname.clone(), exports);
             }
             for &export_idx in &cache[&dst_fqname] {
-                sink.push(PreparedOp::Edge {
-                    src_idx,
-                    dst_idx: export_idx,
-                    flags: 0,
-                });
+                ops.add_edge(src_idx, export_idx, 0);
             }
         }
         Ok(())
@@ -3563,22 +3860,22 @@ pub(crate) struct ExplicitEntrypointPluginImpl {
     abs_paths: Vec<String>,
 }
 
-impl NativePluginImpl for ExplicitEntrypointPluginImpl {
+impl plugin_api::ExternalPlugin for ExplicitEntrypointPluginImpl {
     fn name(&self) -> &str {
         "ExplicitEntrypointPlugin"
     }
 
-    fn run(&self, ctx: &FrozenView<'_>, sink: &mut Vec<PreparedOp>) -> PyResult<()> {
+    fn run(
+        &self,
+        ctx: &plugin_api::PluginCtx<'_>,
+        ops: &mut plugin_api::PluginOps,
+    ) -> Result<(), plugin_api::PluginError> {
         if self.regexes.is_empty() && self.str_specs.is_empty() && self.abs_paths.is_empty() {
             return Ok(());
         }
-        let idxs =
-            ctx.find_nodes_matching_specs_indices(&self.regexes, &self.str_specs, &self.abs_paths);
+        let idxs = ctx.nodes_matching_specs(&self.regexes, &self.str_specs, &self.abs_paths);
         for idx in idxs {
-            sink.push(PreparedOp::Entrypoint {
-                decl_idx: idx,
-                marker: EXPLICIT_ENTRYPOINT_MARKER.to_string(),
-            });
+            ops.keep_alive(idx, EXPLICIT_ENTRYPOINT_MARKER.to_string());
         }
         Ok(())
     }
@@ -3597,12 +3894,16 @@ pub(crate) struct ProjectScriptsPluginImpl {
     pyproject_path: Option<String>,
 }
 
-impl NativePluginImpl for ProjectScriptsPluginImpl {
+impl plugin_api::ExternalPlugin for ProjectScriptsPluginImpl {
     fn name(&self) -> &str {
         "ProjectScriptsPlugin"
     }
 
-    fn run(&self, ctx: &FrozenView<'_>, sink: &mut Vec<PreparedOp>) -> PyResult<()> {
+    fn run(
+        &self,
+        ctx: &plugin_api::PluginCtx<'_>,
+        ops: &mut plugin_api::PluginOps,
+    ) -> Result<(), plugin_api::PluginError> {
         let pyproject = match &self.pyproject_path {
             Some(p) => p.clone(),
             None => std::path::Path::new(ctx.project_root())
@@ -3621,7 +3922,7 @@ impl NativePluginImpl for ProjectScriptsPluginImpl {
         // missing `[project]` / `[project.scripts]` (or a non-string value) is
         // simply skipped.
         let table: toml::Table = text.parse().map_err(|e| {
-            pyo3::exceptions::PyValueError::new_err(format!("{pyproject}: invalid TOML: {e}"))
+            plugin_api::PluginError::value(format!("{pyproject}: invalid TOML: {e}"))
         })?;
         let scripts: Vec<(String, String)> = table
             .get("project")
@@ -3637,7 +3938,6 @@ impl NativePluginImpl for ProjectScriptsPluginImpl {
             })
             .unwrap_or_default();
 
-        let synthetic = intern_kind("synthetic").expect("'synthetic' is a valid kind");
         for (script_name, target) in scripts {
             let (module_part, decl_part) = match target.split_once(':') {
                 Some((m, d)) => (m, d),
@@ -3648,23 +3948,22 @@ impl NativePluginImpl for ProjectScriptsPluginImpl {
             } else {
                 format!("{module_part}.{decl_part}")
             };
-            let mut target_idxs = ctx.find_declarations_indices(&fqname);
+            let mut target_idxs = ctx.find_declarations(&fqname);
             if target_idxs.is_empty() {
-                if let Some(module_idx) = ctx.find_module_idx(module_part) {
+                if let Some(module_idx) = ctx.find_module(module_part) {
                     target_idxs.push(module_idx);
                 }
             }
             if target_idxs.is_empty() {
                 continue;
             }
-            sink.push(PreparedOp::Node {
-                fqname: format!("{PROJECT_SCRIPTS_PREFIX}{script_name}"),
-                kind: synthetic,
-                path: pyproject.clone(),
-                flags: NodeFlags::ENTRYPOINT,
-                edges_from_idx: Vec::new(),
-                edges_to_idx: target_idxs,
-            });
+            ops.add_synthetic_node(
+                format!("{PROJECT_SCRIPTS_PREFIX}{script_name}"),
+                pyproject.clone(),
+                NodeFlags::ENTRYPOINT,
+                target_idxs,
+                Vec::new(),
+            );
         }
         Ok(())
     }
@@ -3694,8 +3993,7 @@ fn is_test_decl(kind: &str, fqname: &str) -> bool {
 
 /// Emit a `TESTCASE` seed node keeping `target_idxs` alive (no-op when empty).
 fn mark_seed(
-    sink: &mut Vec<PreparedOp>,
-    kind: &'static str,
+    ops: &mut plugin_api::PluginOps,
     fqname: String,
     path: String,
     target_idxs: Vec<usize>,
@@ -3703,23 +4001,16 @@ fn mark_seed(
     if target_idxs.is_empty() {
         return;
     }
-    sink.push(PreparedOp::Node {
-        fqname,
-        kind,
-        path,
-        flags: NodeFlags::TESTCASE,
-        edges_from_idx: Vec::new(),
-        edges_to_idx: target_idxs,
-    });
+    ops.add_synthetic_node(fqname, path, NodeFlags::TESTCASE, target_idxs, Vec::new());
 }
 
 /// `{ path: module_fqname }` for every path resolving to a project module.
 fn module_fqnames_for(
-    ctx: &FrozenView<'_>,
+    ctx: &plugin_api::PluginCtx<'_>,
     paths: &[String],
-) -> PyResult<FxHashMap<String, String>> {
+) -> FxHashMap<String, String> {
     if paths.is_empty() {
-        return Ok(FxHashMap::default());
+        return FxHashMap::default();
     }
     let module_idxs = ctx.modules_for_paths(paths);
     let present: Vec<(String, usize)> = paths
@@ -3729,46 +4020,41 @@ fn module_fqnames_for(
         .filter_map(|(p, m)| m.map(|i| (p, i)))
         .collect();
     if present.is_empty() {
-        return Ok(FxHashMap::default());
+        return FxHashMap::default();
     }
-    let attrs = in_range(ctx.node_attrs(&present.iter().map(|(_, i)| *i).collect::<Vec<_>>()))?;
-    Ok(present
+    let attrs = ctx.nodes_at(&present.iter().map(|(_, i)| *i).collect::<Vec<_>>());
+    present
         .into_iter()
         .zip(attrs)
         .map(|((path, _), attr)| (path, attr.fqname))
-        .collect())
+        .collect()
 }
 
 pub(crate) struct PytestPluginImpl;
 
-impl NativePluginImpl for PytestPluginImpl {
+impl plugin_api::ExternalPlugin for PytestPluginImpl {
     fn name(&self) -> &str {
         "PytestPlugin"
     }
 
-    fn run(&self, ctx: &FrozenView<'_>, sink: &mut Vec<PreparedOp>) -> PyResult<()> {
+    fn run(
+        &self,
+        ctx: &plugin_api::PluginCtx<'_>,
+        ops: &mut plugin_api::PluginOps,
+    ) -> Result<(), plugin_api::PluginError> {
         // Every top-level function / class / variable decl + its path.
-        let idxs = ctx.indices_where(
-            None,
-            Some(vec![
-                "function".to_string(),
-                "class".to_string(),
-                "variable".to_string(),
-            ]),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
+        let idxs = ctx.nodes_matching(&plugin_api::NodeFilter {
+            kinds: &["function", "class", "variable"],
+            simple_names: &[],
+            paths: &[],
+            fqname_prefix: None,
+            flags_all: None,
+            flags_any: None,
+        });
         if idxs.is_empty() {
             return Ok(());
         }
-        let paths = in_range(ctx.node_paths(&idxs))?;
+        let paths = ctx.node_paths(&idxs);
 
         // Bucket conftest decls; collect test-file candidates (idx + path).
         let mut conftest_by_path: FxHashMap<String, Vec<usize>> = FxHashMap::default();
@@ -3794,7 +4080,7 @@ impl NativePluginImpl for PytestPluginImpl {
         let mut test_function_idxs: Vec<usize> = Vec::new();
         let mut test_class_idxs: Vec<usize> = Vec::new();
         if !cand_idxs.is_empty() {
-            let attrs = in_range(ctx.node_attrs(&cand_idxs))?;
+            let attrs = ctx.nodes_at(&cand_idxs);
             for ((idx, path), attr) in cand_idxs.iter().zip(cand_paths.iter()).zip(attrs.iter()) {
                 if !is_test_decl(&attr.kind, &attr.fqname) {
                     continue;
@@ -3812,19 +4098,17 @@ impl NativePluginImpl for PytestPluginImpl {
         }
 
         // Module fqnames for the paths we'll seed (conftest + filtered tests).
-        let synthetic = intern_kind("synthetic").expect("'synthetic' is a valid kind");
         let mut seed_paths: Vec<String> = conftest_order.clone();
         for p in &tests_order {
             if !conftest_by_path.contains_key(p) {
                 seed_paths.push(p.clone());
             }
         }
-        let seed_module_fqnames = module_fqnames_for(ctx, &seed_paths)?;
+        let seed_module_fqnames = module_fqnames_for(ctx, &seed_paths);
         for path in &conftest_order {
             if let Some(module_fqname) = seed_module_fqnames.get(path) {
                 mark_seed(
-                    sink,
-                    synthetic,
+                    ops,
                     format!("{PYTEST_CONFTEST_PREFIX}{module_fqname}"),
                     path.clone(),
                     conftest_by_path[path].clone(),
@@ -3834,8 +4118,7 @@ impl NativePluginImpl for PytestPluginImpl {
         for path in &tests_order {
             if let Some(module_fqname) = seed_module_fqnames.get(path) {
                 mark_seed(
-                    sink,
-                    synthetic,
+                    ops,
                     format!("{PYTEST_TESTS_PREFIX}{module_fqname}"),
                     path.clone(),
                     tests_by_path[path].clone(),
@@ -3844,13 +4127,9 @@ impl NativePluginImpl for PytestPluginImpl {
         }
 
         // `@pytest.fixture`-decorated decls (args extracted for the `name=`
-        // alias). Needs the GIL for the parallel decorator scan.
-        let fixture_refs: Vec<(usize, CallArgs)> = ctx.find_decorated_decls(
-            &["pytest".to_string()],
-            &["fixture".to_string()],
-            None,
-            true,
-        )?;
+        // alias).
+        let fixture_refs: Vec<(usize, CallArgs)> =
+            ctx.decorated_decls_with_args(&["pytest"], &["fixture"]);
         if fixture_refs.is_empty() {
             return Ok(());
         }
@@ -3858,7 +4137,7 @@ impl NativePluginImpl for PytestPluginImpl {
 
         // Per-file fixture seed (every `@pytest.fixture` stays alive — the
         // conservative rule that catches autouse / usefixtures / indirect).
-        let fixture_paths = in_range(ctx.node_paths(&fixture_idxs_all))?;
+        let fixture_paths = ctx.node_paths(&fixture_idxs_all);
         let mut fixtures_by_path: FxHashMap<String, Vec<usize>> = FxHashMap::default();
         let mut fixtures_path_order: Vec<String> = Vec::new();
         for (idx, path) in fixture_idxs_all.iter().zip(fixture_paths.iter()) {
@@ -3867,12 +4146,11 @@ impl NativePluginImpl for PytestPluginImpl {
             }
             fixtures_by_path.entry(path.clone()).or_default().push(*idx);
         }
-        let fixture_module_fqnames = module_fqnames_for(ctx, &fixtures_path_order)?;
+        let fixture_module_fqnames = module_fqnames_for(ctx, &fixtures_path_order);
         for path in &fixtures_path_order {
             if let Some(module_fqname) = fixture_module_fqnames.get(path) {
                 mark_seed(
-                    sink,
-                    synthetic,
+                    ops,
                     format!("{PYTEST_FIXTURES_PREFIX}{module_fqname}"),
                     path.clone(),
                     fixtures_by_path[path].clone(),
@@ -3886,7 +4164,7 @@ impl NativePluginImpl for PytestPluginImpl {
         }
         // binding name -> [fixture idx]. Binding is the `name=` kwarg literal
         // when present, else the function's simple name.
-        let fixture_attrs = in_range(ctx.node_attrs(&fixture_idxs_all))?;
+        let fixture_attrs = ctx.nodes_at(&fixture_idxs_all);
         let mut fixtures_by_name: FxHashMap<String, Vec<usize>> = FxHashMap::default();
         for ((idx, args), attr) in fixture_refs.iter().zip(fixture_attrs.iter()) {
             let binding = match args.kwargs.get("name") {
@@ -3897,32 +4175,24 @@ impl NativePluginImpl for PytestPluginImpl {
         }
 
         if !test_function_idxs.is_empty() {
-            let params = in_range(ctx.function_parameters(&test_function_idxs))?;
+            let params = ctx.function_parameters(&test_function_idxs);
             for (test_idx, names) in test_function_idxs.iter().zip(params) {
                 for name in names {
                     if let Some(fixture_idxs) = fixtures_by_name.get(&name) {
                         for &fixture_idx in fixture_idxs {
-                            sink.push(PreparedOp::Edge {
-                                src_idx: *test_idx,
-                                dst_idx: fixture_idx,
-                                flags: 0,
-                            });
+                            ops.add_edge(*test_idx, fixture_idx, 0);
                         }
                     }
                 }
             }
         }
         if !test_class_idxs.is_empty() {
-            let params = in_range(ctx.class_method_parameters(&test_class_idxs))?;
+            let params = ctx.class_method_parameters(&test_class_idxs);
             for (cls_idx, names) in test_class_idxs.iter().zip(params) {
                 for name in names {
                     if let Some(fixture_idxs) = fixtures_by_name.get(&name) {
                         for &fixture_idx in fixture_idxs {
-                            sink.push(PreparedOp::Edge {
-                                src_idx: *cls_idx,
-                                dst_idx: fixture_idx,
-                                flags: 0,
-                            });
+                            ops.add_edge(*cls_idx, fixture_idx, 0);
                         }
                     }
                 }

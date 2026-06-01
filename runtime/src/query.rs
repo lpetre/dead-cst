@@ -3,30 +3,16 @@
 //! What remains here after the chainable `query()` DSL was retired:
 //! the identifier prefilter (`_contains_identifier` and friends) that
 //! lets a per-file walk skip the parse on files that don't even
-//! mention the target name, the `_compile_path_regex` /
-//! `_path_re_matches` path-scoping pair, and `par_scan_files` — the
-//! generic GIL-free parallel per-file walk that every `find_*` query
-//! on [`crate::project::ProjectContext`] drives. These are pure-rust,
-//! Salsa-snapshot-based, and shared by `project.rs` and `helpers.rs`.
+//! mention the target name, the `_path_re_matches` path-scoping check,
+//! and `par_scan_files` — the generic GIL-free parallel per-file walk
+//! that every `find_*` query on [`crate::project::ProjectContext`]
+//! drives. These are pure-rust, Salsa-snapshot-based, and shared by
+//! `project.rs` and `helpers.rs`.
 
-use pyo3::exceptions::PyValueError;
-use pyo3::prelude::*;
 use ruff_db::files::File;
 use ty_project::Db as ProjectDb;
 
 use crate::helpers::file_path_string;
-
-/// Compile an optional path regex once for a query's file-iteration
-/// loop. Centralized so every ``find_*`` method that takes a
-/// ``path_regex`` parameter shares the same error reporting.
-pub(crate) fn _compile_path_regex(re_str: Option<&str>) -> PyResult<Option<regex::Regex>> {
-    match re_str {
-        None => Ok(None),
-        Some(s) => regex::Regex::new(s)
-            .map(Some)
-            .map_err(|e| PyValueError::new_err(format!("invalid path regex {s:?}: {e}"))),
-    }
-}
 
 /// Per-file predicate-fusion check. ``true`` when the file should be
 /// processed (no regex, or regex matches its absolute path).
