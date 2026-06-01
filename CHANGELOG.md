@@ -220,6 +220,13 @@ two versions.
   (`build_only`, `run_plugin`, `run_plugin_collect`, `apply_ops_batched`,
   `snapshot_graph`, the per-plugin progress-driver methods, the `CollectedOps`
   type, and the leftover `query()`-DSL query wrappers). Behaviour is identical.
+- **The last native plugins that re-entered Python at build time are now pure
+  Rust.** `project_scripts` parses `[project.scripts]` with the `toml` crate
+  instead of stdlib `tomllib`, and `dynamic_import_fallback` matches its
+  include/exclude globs with the `regex` crate instead of `fnmatch.fnmatchcase`
+  / `pathlib.PurePosixPath.match` (componentwise, from the right, case-sensitive
+  — same match set). Behaviour is identical, but no built-in plugin re-acquires
+  the GIL inside the GIL-free `rayon` fan-out anymore.
 
 ### Removed
 
