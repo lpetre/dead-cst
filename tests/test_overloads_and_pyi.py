@@ -7,9 +7,9 @@ import textwrap
 
 
 from dead_cst import NodeFlags
+from dead_cst import _native as native
 from dead_cst.graph import KEEPALIVE_DEFAULT
 from dead_cst.codemod import remove_code
-from dead_cst.plugins import ExplicitEntrypointPlugin
 
 
 def _normalise(s: str) -> str:
@@ -98,7 +98,7 @@ def test_live_overloads_survive_codemod(tmp_path, make_analysis):
             """
         )
     )
-    a = make_analysis(plugins=[ExplicitEntrypointPlugin(specs=["mod.f"])])
+    a = make_analysis(plugins=[native.NativePlugin.explicit([], ["mod.f"], [])])
     graph = a.materialize_all()
     reachable = set(graph.reachable(seed_flags=KEEPALIVE_DEFAULT))
     unreachable = [n for n in graph.nodes() if n not in reachable]
@@ -230,7 +230,7 @@ def test_orphan_pyi_stub_uses_runtime_fqname(tmp_path, make_analysis, successors
     (pkg / "_native.pyi").write_text("def compute(x: int) -> int: ...\n")
     (tmp_path / "main.py").write_text("from mypkg import compute\ncompute(1)\n")
 
-    a = make_analysis(plugins=[ExplicitEntrypointPlugin(specs=["main"])])
+    a = make_analysis(plugins=[native.NativePlugin.explicit([], ["main"], [])])
     graph = a.materialize_all()
     reachable = set(graph.reachable(seed_flags=KEEPALIVE_DEFAULT))
 

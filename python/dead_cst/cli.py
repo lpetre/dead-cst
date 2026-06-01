@@ -20,7 +20,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -34,9 +33,6 @@ from dead_cst import _native as native
 
 from .analyze import Analysis
 from .codemod import generate_patch
-from .contrib.discordpy import DiscordPyPlugin
-from .contrib.mock_patch import MockPatchPlugin
-from .contrib.pytest import PytestPlugin
 from .graph import (
     KEEPALIVE_DEFAULT,
     GraphMetadata,
@@ -46,12 +42,7 @@ from .graph import (
     read_graph,
     write_graph,
 )
-from .plugins import (
-    DynamicImportFallbackPlugin,
-    ExplicitEntrypointPlugin,
-    Plugin,
-    ProjectScriptsPlugin,
-)
+from .plugins import Plugin
 
 if TYPE_CHECKING:
     GraphView = native.ProjectContext | LoadedGraph
@@ -60,21 +51,13 @@ if TYPE_CHECKING:
 app = typer.Typer(help="Dead code analysis for Python.")
 
 
-# Python-side built-ins. Plugins ported to Rust (``main_block``,
-# ``module_dunders``, ``init_subclass``, ``server_config``, ``unittest``, the
-# dispatch-app frameworks ``flask`` / ``fastapi`` / ``typer`` / ``cyclopts`` /
-# ``slack_bolt`` / ``fastmcp`` / ``celery``, and ``click``) are *not* here —
-# ``_load_plugin`` resolves those through the native registry
-# (``_builtin_native_plugin``) first, so they move out of this map as they're
-# ported.
-_BUILTIN_PLUGINS: dict[str, Plugin] = {
-    "project_scripts": ProjectScriptsPlugin(),
-    "explicit": ExplicitEntrypointPlugin(),
-    "pytest": PytestPlugin(),
-    "mock_patch": MockPatchPlugin(),
-    "discordpy": DiscordPyPlugin(),
-    "dynamic_import_fallback": DynamicImportFallbackPlugin(),
-}
+# Python-side built-ins. Every built-in plugin is now a native (Rust)
+# plugin resolved through ``_builtin_native_plugin`` (consulted first by
+# ``_load_plugin``), so this map is empty — it remains only as the
+# fall-through slot for any future Python-only built-in. The ``explicit``
+# entrypoint plugin is driven by ``-e`` / ``--entrypoint-regex`` (see
+# ``build_plugins``), not by ``--plugin``.
+_BUILTIN_PLUGINS: dict[str, Plugin] = {}
 
 
 def _load_plugin(name: str) -> Plugin | native.NativePlugin:
@@ -149,10 +132,14 @@ def build_plugins(
 ) -> list[Plugin | native.NativePlugin]:
     plugins: list[Plugin | native.NativePlugin] = [_load_plugin(name) for name in plugin_names]
     plugins.append(native.NativePlugin.module_dunders())
-    specs: list[str | Path | re.Pattern[str]] = list(entrypoints)
-    specs.extend(re.compile(p) for p in entrypoint_regexes)
-    if specs:
-        plugins.append(ExplicitEntrypointPlugin(specs=specs))
+    # ``entrypoints`` are exact fqnames / project-relative file paths;
+    # ``entrypoint_regexes`` match the project-relative path. The native
+    # ``explicit`` plugin takes the two buckets directly (no abs-path specs
+    # from the CLI).
+    if entrypoints or entrypoint_regexes:
+        plugins.append(
+            native.NativePlugin.explicit(list(entrypoint_regexes), list(entrypoints), [])
+        )
     return plugins
 
 

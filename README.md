@@ -127,10 +127,8 @@ dead-cst remove . -e mypkg.__main__ | patch -p1
 ## Python API
 
 ```python
-import re
 from pathlib import Path
-from dead_cst import Analysis
-from dead_cst.plugins import ExplicitEntrypointPlugin, MainBlockPlugin
+from dead_cst import Analysis, _native as native
 from dead_cst.resolvers import ManualResolver
 
 root = Path("./src")
@@ -138,8 +136,9 @@ analysis = Analysis(
     root,
     resolver=ManualResolver(specs=["."]),
     plugins=[
-        MainBlockPlugin(),
-        ExplicitEntrypointPlugin(specs=[re.compile(r".*__main__\.py")]),
+        native.NativePlugin.main_block(),
+        # explicit(regexes, str_specs, abs_paths): match __main__.py via regex.
+        native.NativePlugin.explicit([r".*__main__\.py"], [], []),
     ],
 )
 
@@ -228,19 +227,19 @@ Entrypoint detection is fully plugin-driven. Builtins:
 | Plugin | Purpose |
 |---|---|
 | `MainBlockPlugin` | Mark modules containing `if __name__ == "__main__":` as entrypoints |
-| `ProjectScriptsPlugin` | Read `pyproject.toml [project.scripts]` and mark each target as an entrypoint |
-| `ExplicitEntrypointPlugin` | Match user-supplied file paths / FQNs / regexes (powers `-e` and `--entrypoint-regex`) |
+| `NativePlugin.project_scripts()` | Read `pyproject.toml [project.scripts]` and mark each target as an entrypoint |
+| `NativePlugin.explicit()` | Match user-supplied file paths / FQNs / regexes (powers `-e` and `--entrypoint-regex`) |
 | `ModuleDundersPlugin` | Keep top-level dunder variables (`__all__`, `__version__`, etc.) alive (always on) |
-| `PytestPlugin` | Keep pytest-discovered tests, `conftest.py` decls, and `@pytest.fixture` functions alive (`--plugin pytest`) |
+| `NativePlugin.pytest()` | Keep pytest-discovered tests, `conftest.py` decls, and `@pytest.fixture` functions alive (`--plugin pytest`) |
 | `UnittestPlugin` | Keep stdlib `unittest.TestCase` / `IsolatedAsyncioTestCase` subclasses and `setUpModule` / `tearDownModule` / `load_tests` hooks alive. Transitive: a class extending a project-local `TestCase` mixin or a re-exported `TestCase` is detected (`--plugin unittest`) |
-| `MockPatchPlugin` | Resolve string-fqname patch targets so symbols whose only consumers are tests stay alive. Recognizes `unittest.mock.patch` / `mock.patch` (decorator and context-manager forms, plus aliased imports), pytest-mock's `mocker.patch`, and pytest's `monkeypatch.setattr("X.Y", v)` / `monkeypatch.delattr("X.Y")` (`--plugin mock_patch`) |
-| `ServerConfigPlugin` | Mark Gunicorn / Hypercorn config modules (`gunicorn.conf.py`, `hypercorn.conf.py`, and the `*_conf.py` variants) as entrypoints. The server loads these files by path at startup — nothing imports them statically, so the whole top-level surface would otherwise look dead. Override the `filenames` tuple for non-standard layouts (`--plugin server_config`) |
+| `NativePlugin.mock_patch()` | Resolve string-fqname patch targets so symbols whose only consumers are tests stay alive. Recognizes `unittest.mock.patch` / `mock.patch` (decorator and context-manager forms, plus aliased imports), pytest-mock's `mocker.patch`, and pytest's `monkeypatch.setattr("X.Y", v)` / `monkeypatch.delattr("X.Y")` (`--plugin mock_patch`) |
+| `NativePlugin.server_config()` | Mark Gunicorn / Hypercorn config modules (`gunicorn.conf.py`, `hypercorn.conf.py`, and the `*_conf.py` variants) as entrypoints. The server loads these files by path at startup — nothing imports them statically, so the whole top-level surface would otherwise look dead. Override the `filenames` tuple for non-standard layouts (`--plugin server_config`) |
 | `NativePlugin.fastapi()` | Detect top-level `FastAPI()` / `APIRouter()` instances; mark `FastAPI` apps as entrypoints and add `instance -> handler` edges for every `@app.get(...)`-style decorator (HTTP methods, websockets, middleware, exception handlers, `on_event`). Routers stay pass-through, so an `APIRouter` that's never `include_router`'d remains dead (`--plugin fastapi`) |
 | `NativePlugin.flask()` | Detect top-level `Flask()` / `Blueprint()` instances; mark `Flask` apps as entrypoints and add `instance -> handler` edges for every `@app.route(...)` / `@app.get(...)` / lifecycle / errorhandler / template-helper / URL-processor decorator. Blueprints stay pass-through, so a `Blueprint` that's never `register_blueprint`'d remains dead (`--plugin flask`) |
 | `NativePlugin.typer()` | Detect top-level `Typer()` instances and add `instance -> handler` edges for every `@app.command(...)` / `@app.callback(...)` decorator. Typer apps are pass-through (reach them via `[project.scripts]` or `if __name__ == "__main__": app()`), so a sub-typer that's never `add_typer`'d stays dead (`--plugin typer`) |
 | `NativePlugin.click()` | Detect top-level Click `Group` instances (functions decorated `@click.group(...)` or `X = click.Group(...)`) and add `instance -> handler` edges for every `@cli.command(...)` / `@cli.group(...)` / `@cli.result_callback(...)` decorator. Groups are pass-through, so a sub-group that's never `add_command`'d stays dead (`--plugin click`) |
 | `NativePlugin.cyclopts()` | Detect top-level `cyclopts.App()` instances and add `instance -> handler` edges for every `@app.command(...)` / `@app.default(...)` decorator. Apps are pass-through, mirroring the Typer plugin (`--plugin cyclopts`) |
-| `DiscordPyPlugin` | Detect top-level `commands.Bot()` / `discord.Client()` (and `AutoSharded*`) instances, mark them as entrypoints, and add `instance -> handler` edges for `@bot.command()` / `event` / `listen()` / `group()` / `hybrid_command()` / `before_invoke` / `after_invoke` / `check` decorators plus the two-level `@bot.tree.command()` / `@bot.tree.context_menu()` slash-command form (`--plugin discordpy`) |
+| `NativePlugin.discordpy()` | Detect top-level `commands.Bot()` / `discord.Client()` (and `AutoSharded*`) instances, mark them as entrypoints, and add `instance -> handler` edges for `@bot.command()` / `event` / `listen()` / `group()` / `hybrid_command()` / `before_invoke` / `after_invoke` / `check` decorators plus the two-level `@bot.tree.command()` / `@bot.tree.context_menu()` slash-command form (`--plugin discordpy`) |
 | `NativePlugin.fastmcp()` | Detect top-level `FastMCP()` server instances, mark them as entrypoints, and add `instance -> handler` edges for every `@mcp.tool` / `@mcp.resource` / `@mcp.prompt` / `@mcp.completion` decorator. Factory-aware: `def create_server() -> FastMCP: ...` chains classify across packages (`--plugin fastmcp`) |
 | `InitSubclassPlugin` | Detect classes that define `__init_subclass__` and add `parent -> subclass` edges for every (transitive) first-party subclass. Parents stay pass-through, so a registry base class only keeps subclasses alive once something else keeps the parent alive (`--plugin init_subclass`) |
 
@@ -282,7 +281,7 @@ Jupyter notebooks (`.ipynb`) are ingested too: code cells are concatenated in do
 ## Limitations
 
 - `from X import *` is treated pessimistically (every top-level declaration in the target stays alive). Cross-module `from <importer> import <name>` still resolves through to `<name>`'s real source — even across chained `__init__.py` star re-exports — via ty's name resolution, and bare-name uses inside function bodies (`from x import *; def a(): g()`) edge to the upstream decl. When two stars in the same module export the same name, "first writer wins"; Python's runtime "last star wins" semantics is not implemented.
-- `__import__('pkg.mod')` and `importlib.import_module('pkg.mod')` with string-literal arguments emit `EdgeFlags.DYNAMIC_IMPORT` edges to the resolved module / decls; non-literal arguments fall back to opaque external nodes. `DynamicImportFallbackPlugin` opts into per-name fan-out for the dynamic-import case.
+- `__import__('pkg.mod')` and `importlib.import_module('pkg.mod')` with string-literal arguments emit `EdgeFlags.DYNAMIC_IMPORT` edges to the resolved module / decls; non-literal arguments fall back to opaque external nodes. `NativePlugin.dynamic_import_fallback()` opts into per-name fan-out for the dynamic-import case.
 - Dynamic attribute access (`getattr`) and runtime-generated symbols are invisible to static analysis.
 - Only first-party code is analysed; third-party dependencies appear as synthetic `[external dist] <name>` / `[external file] <name>` nodes in the graph (and are the targets of every import that resolves outside the project).
 - `__all__` is followed only when assigned a list/tuple of string literals; dynamic mutation (`__all__.append`, comprehensions, etc.) is not tracked.

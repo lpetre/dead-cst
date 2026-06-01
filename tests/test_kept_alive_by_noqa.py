@@ -104,9 +104,9 @@ def test_excluding_multiple_flags_in_one_pass(make_analysis, write_files):
             """,
         }
     )
-    from dead_cst.contrib import PytestPlugin
+    from dead_cst import _native as native
 
-    graph = make_analysis(plugins=[PytestPlugin()]).materialize_all()
+    graph = make_analysis(plugins=[native.NativePlugin.pytest()]).materialize_all()
     side = next(n for n in graph.nodes() if n.fqname == "pkg.side_effect")
     assert side in set(graph.reachable(seed_flags=KEEPALIVE_DEFAULT))
     excluded = set(

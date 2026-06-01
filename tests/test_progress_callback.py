@@ -174,7 +174,7 @@ def test_progress_callback_with_concurrent_plugins(tmp_path: Path) -> None:
     """Concurrent plugin pass (>1 plugin) emits plugin_start / plugin_end
     for each plugin via the Python-side ThreadPoolExecutor wrapper.
     """
-    from dead_cst.plugins import ExplicitEntrypointPlugin, ModuleDundersPlugin
+    from dead_cst.plugins import MainBlockPlugin, ModuleDundersPlugin
 
     events: list[tuple[str, dict[str, Any]]] = []
 
@@ -185,7 +185,7 @@ def test_progress_callback_with_concurrent_plugins(tmp_path: Path) -> None:
     analysis = Analysis(
         tmp_path,
         plugins=[
-            ExplicitEntrypointPlugin(specs=["a.py"]),
+            MainBlockPlugin(),
             ModuleDundersPlugin(),
         ],
         progress_callback=cb,
@@ -198,7 +198,7 @@ def test_progress_callback_with_concurrent_plugins(tmp_path: Path) -> None:
     assert len(plugin_ends) == 2
     names = [k["name"] for k in plugin_starts]
     # The two plugin class qualnames should both have surfaced.
-    assert "ExplicitEntrypointPlugin" in names
+    assert "MainBlockPlugin" in names
     assert "ModuleDundersPlugin" in names
     # With per-plugin counter slabs, each ``plugin_end`` carries the
     # plugin's actual name (not the registration-order approximation

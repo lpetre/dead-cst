@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+from dead_cst import _native as native
 from dead_cst.plugins import (
-    ExplicitEntrypointPlugin,
     InitSubclassPlugin,
     MainBlockPlugin,
 )
@@ -40,7 +40,7 @@ def test_init_subclass_keeps_subclass_alive_via_parent(
     )
     graph = make_analysis(
         plugins=[
-            ExplicitEntrypointPlugin(specs=["pkg.base.Plugin"]),
+            native.NativePlugin.explicit([], ["pkg.base.Plugin"], []),
             InitSubclassPlugin(),
         ]
     ).materialize_all()
@@ -72,7 +72,7 @@ def test_init_subclass_transitive_subclasses(make_analysis, write_files, reachab
     )
     graph = make_analysis(
         plugins=[
-            ExplicitEntrypointPlugin(specs=["pkg.mod.Root"]),
+            native.NativePlugin.explicit([], ["pkg.mod.Root"], []),
             InitSubclassPlugin(),
         ]
     ).materialize_all()
@@ -168,7 +168,7 @@ def test_init_subclass_aliased_import(make_analysis, write_files, reachable_fqna
     )
     graph = make_analysis(
         plugins=[
-            ExplicitEntrypointPlugin(specs=["pkg.base.Plugin"]),
+            native.NativePlugin.explicit([], ["pkg.base.Plugin"], []),
             InitSubclassPlugin(),
         ]
     ).materialize_all()
@@ -194,7 +194,7 @@ def test_init_subclass_dotted_attribute_base(make_analysis, write_files, reachab
     )
     graph = make_analysis(
         plugins=[
-            ExplicitEntrypointPlugin(specs=["pkg.base.Plugin"]),
+            native.NativePlugin.explicit([], ["pkg.base.Plugin"], []),
             InitSubclassPlugin(),
         ]
     ).materialize_all()
@@ -224,7 +224,7 @@ def test_init_subclass_class_without_init_subclass_no_edges(
     )
     graph = make_analysis(
         plugins=[
-            ExplicitEntrypointPlugin(specs=["pkg.base.Plain"]),
+            native.NativePlugin.explicit([], ["pkg.base.Plain"], []),
             InitSubclassPlugin(),
         ]
     ).materialize_all()
@@ -266,7 +266,7 @@ def test_init_subclass_keeps_subclass_method_references_alive(
     )
     graph = make_analysis(
         plugins=[
-            ExplicitEntrypointPlugin(specs=["pkg.base.Plugin"]),
+            native.NativePlugin.explicit([], ["pkg.base.Plugin"], []),
             InitSubclassPlugin(),
         ]
     ).materialize_all()
@@ -301,7 +301,7 @@ def test_init_subclass_subscripted_base(make_analysis, write_files, reachable_fq
     )
     graph = make_analysis(
         plugins=[
-            ExplicitEntrypointPlugin(specs=["pkg.base.Plugin"]),
+            native.NativePlugin.explicit([], ["pkg.base.Plugin"], []),
             InitSubclassPlugin(),
         ]
     ).materialize_all()
@@ -329,7 +329,7 @@ def test_init_subclass_marker_in_predecessor_chain(make_analysis, write_files, p
     )
     graph = make_analysis(
         plugins=[
-            ExplicitEntrypointPlugin(specs=["pkg.base.Plugin"]),
+            native.NativePlugin.explicit([], ["pkg.base.Plugin"], []),
             InitSubclassPlugin(),
         ]
     ).materialize_all()

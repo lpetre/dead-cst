@@ -6,14 +6,16 @@ flagged ``src -> module`` edge out to the module's exports.
 
 from __future__ import annotations
 
-from dead_cst.plugins import DynamicImportFallbackPlugin, MainBlockPlugin
+from dead_cst import _native as native
+from dead_cst.plugins import MainBlockPlugin
 
 
 def test_plugin_loadable_by_name():
     from dead_cst.cli import _load_plugin
 
     plugin = _load_plugin("dynamic_import_fallback")
-    assert isinstance(plugin, DynamicImportFallbackPlugin)
+    assert isinstance(plugin, native.NativePlugin)
+    assert plugin.name == "DynamicImportFallbackPlugin"
 
 
 def test_run_fans_importlib_call_to_module_exports(build_plugin_graph, reachable_fqnames):
@@ -30,7 +32,7 @@ def test_run_fans_importlib_call_to_module_exports(build_plugin_graph, reachable
             ),
             "pkg/target.py": ("def public(): pass\ndef _private(): pass\ndef other(): pass\n"),
         },
-        [DynamicImportFallbackPlugin(), MainBlockPlugin()],
+        [native.NativePlugin.dynamic_import_fallback(), MainBlockPlugin()],
     )
     reached = reachable_fqnames(graph)
     assert "pkg.target.public" in reached
@@ -52,7 +54,7 @@ def test_run_respects_dunder_all(build_plugin_graph, reachable_fqnames):
             ),
             "pkg/target.py": ("__all__ = ['kept']\ndef kept(): pass\ndef dropped(): pass\n"),
         },
-        [DynamicImportFallbackPlugin(), MainBlockPlugin()],
+        [native.NativePlugin.dynamic_import_fallback(), MainBlockPlugin()],
     )
     reached = reachable_fqnames(graph)
     assert "pkg.target.kept" in reached
@@ -71,7 +73,7 @@ def test_run_include_underscore_picks_private_names(build_plugin_graph, reachabl
             "pkg/target.py": "def public(): pass\ndef _private(): pass\n",
         },
         [
-            DynamicImportFallbackPlugin(include_underscore=True),
+            native.NativePlugin.dynamic_import_fallback(include_underscore=True),
             MainBlockPlugin(),
         ],
     )
@@ -93,7 +95,7 @@ def test_run_no_op_without_dynamic_imports(build_plugin_graph, reachable_fqnames
             ),
             "pkg/target.py": "def public(): pass\ndef other(): pass\n",
         },
-        [DynamicImportFallbackPlugin(), MainBlockPlugin()],
+        [native.NativePlugin.dynamic_import_fallback(), MainBlockPlugin()],
     )
     reached = reachable_fqnames(graph)
     assert "pkg.target.public" in reached
@@ -120,7 +122,7 @@ def test_exclude_sources_skips_matching_files(build_plugin_graph, reachable_fqna
             "pkg/other.py": "def other_export(): pass\n",
         },
         [
-            DynamicImportFallbackPlugin(exclude_sources=("pkg/handled_loader.py",)),
+            native.NativePlugin.dynamic_import_fallback(exclude_sources=("pkg/handled_loader.py",)),
             MainBlockPlugin(),
         ],
     )
@@ -148,7 +150,7 @@ def test_exclude_sources_supports_glob_patterns(build_plugin_graph, reachable_fq
             "pkg/target_b.py": "def b_export(): pass\n",
         },
         [
-            DynamicImportFallbackPlugin(exclude_sources=("pkg/loaders/*.py",)),
+            native.NativePlugin.dynamic_import_fallback(exclude_sources=("pkg/loaders/*.py",)),
             MainBlockPlugin(),
         ],
     )
@@ -173,7 +175,7 @@ def test_exclude_targets_silences_module_tree(build_plugin_graph, reachable_fqna
             "pkg/vendored/email.py": "def vendored_export(): pass\n",
         },
         [
-            DynamicImportFallbackPlugin(exclude_targets=("pkg.vendored.*",)),
+            native.NativePlugin.dynamic_import_fallback(exclude_targets=("pkg.vendored.*",)),
             MainBlockPlugin(),
         ],
     )
@@ -200,7 +202,7 @@ def test_include_sources_acts_as_allowlist(build_plugin_graph, reachable_fqnames
             "pkg/modern_target.py": "def modern_export(): pass\n",
         },
         [
-            DynamicImportFallbackPlugin(include_sources=("pkg/legacy.py",)),
+            native.NativePlugin.dynamic_import_fallback(include_sources=("pkg/legacy.py",)),
             MainBlockPlugin(),
         ],
     )
@@ -228,7 +230,7 @@ def test_include_and_exclude_combine(build_plugin_graph, reachable_fqnames):
             "pkg/t_b.py": "def b_export(): pass\n",
         },
         [
-            DynamicImportFallbackPlugin(
+            native.NativePlugin.dynamic_import_fallback(
                 include_sources=("pkg/legacy/*.py",),
                 exclude_sources=("pkg/legacy/b.py",),
             ),

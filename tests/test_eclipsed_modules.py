@@ -11,8 +11,9 @@ synthetics) keep working -- but consumer imports never see its decls.
 
 from __future__ import annotations
 
+from dead_cst import _native as native
 from dead_cst.graph import KEEPALIVE_DEFAULT
-from dead_cst.plugins import ExplicitEntrypointPlugin, MainBlockPlugin
+from dead_cst.plugins import MainBlockPlugin
 
 
 def test_package_wins_trie_slot_for_cross_module_imports(
@@ -26,7 +27,7 @@ def test_package_wins_trie_slot_for_cross_module_imports(
             "caller.py": "from pkg.foo import x\nx()\n",
         }
     )
-    analysis = make_analysis(plugins=[ExplicitEntrypointPlugin(specs=["caller"])])
+    analysis = make_analysis(plugins=[native.NativePlugin.explicit([], ["caller"], [])])
     graph = analysis.materialize_all()
 
     caller_x = next(n for n in graph.nodes() if n.fqname == "caller.x")
@@ -91,7 +92,7 @@ def test_name_only_in_eclipsed_file_is_unresolvable(
             "caller.py": "from pkg.foo import ONLY_IN_PY\n",
         }
     )
-    analysis = make_analysis(plugins=[ExplicitEntrypointPlugin(specs=["caller"])])
+    analysis = make_analysis(plugins=[native.NativePlugin.explicit([], ["caller"], [])])
     graph = analysis.materialize_all()
     # The import doesn't bind a real decl, so the caller's import node
     # does not edge to any ``ONLY_IN_PY`` decl.

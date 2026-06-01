@@ -6,7 +6,6 @@ import pytest
 
 from dead_cst import _native as native
 from dead_cst.plugins import (
-    ExplicitEntrypointPlugin,
     MainBlockPlugin,
 )
 
@@ -102,7 +101,10 @@ def test_typer_plugin_reachable_via_explicit_entrypoint(
         }
     )
     graph = make_analysis(
-        plugins=[ExplicitEntrypointPlugin(specs=["cli.main.app"]), native.NativePlugin.typer()]
+        plugins=[
+            native.NativePlugin.explicit([], ["cli.main.app"], []),
+            native.NativePlugin.typer(),
+        ]
     ).materialize_all()
     reached = reachable_fqnames(graph)
     assert "cli.main.app" in reached

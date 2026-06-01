@@ -518,6 +518,94 @@ class NativePlugin:
         """
         ...
 
+    @staticmethod
+    def mock_patch() -> NativePlugin:
+        """Native mock-patch plugin. Resolves the string-fqname target of
+        ``unittest.mock.patch`` / ``mock.patch``, pytest-mock's
+        ``mocker.patch``, and pytest's ``monkeypatch.setattr`` /
+        ``monkeypatch.delattr`` to its target decl (and module), wiring a
+        synthetic ``<patch-target>:<fqname>`` keep-alive node from each call
+        site to the resolved targets.
+        """
+        ...
+
+    @staticmethod
+    def discordpy() -> NativePlugin:
+        """Native discord.py plugin. Gated on a ``discord`` import. Seeds
+        ``Bot`` / ``Client`` constructions as ``<discordpy-app>`` entrypoints,
+        wires ``@<bot>.<verb>`` and ``@<bot>.tree.<verb>`` handler decorators
+        to their owning instance, keeps ``commands.Cog`` subclasses plus their
+        module-level ``setup`` / ``teardown`` hooks alive
+        (``<discordpy-cog>:<file>``), and keeps the module surface of every
+        ``load_extension`` / ``load_extensions`` string-literal target alive
+        (``<discordpy-extension>:<fqname>``).
+        """
+        ...
+
+    @staticmethod
+    def pytest() -> NativePlugin:
+        """Native pytest plugin. Seeds every top-level decl in ``conftest.py``
+        (``<pytest:conftest>:<module>``), every ``test_*`` function / ``Test*``
+        class in ``test_*.py`` / ``*_test.py`` (``<pytest:tests>:<module>``),
+        and every ``@pytest.fixture`` function (``<pytest:fixtures>:<module>``)
+        as ``TESTCASE`` entrypoints. On top of the seed it wires
+        ``test → fixture`` / ``class → fixture`` edges by parameter-name
+        matching (honoring the ``name=`` kwarg alias), so the dependency graph
+        is queryable. Unmatched parameter names (pytest builtins, plugin
+        fixtures) are silently ignored.
+        """
+        ...
+
+    @staticmethod
+    def project_scripts(pyproject_path: str | None = None) -> NativePlugin:
+        """Native ``[project.scripts]`` plugin. Reads ``pyproject.toml`` (from
+        ``pyproject_path`` if given, else ``<project_root>/pyproject.toml``)
+        and, for each ``name = "pkg.mod:func"`` entry, wires a synthetic
+        ``<project.scripts>:<name>`` entrypoint to the resolved ``pkg.mod.func``
+        decl (falling back to the ``pkg.mod`` module node). A missing file or
+        unresolved target is skipped silently.
+        """
+        ...
+
+    @staticmethod
+    def dynamic_import_fallback(
+        *,
+        include_underscore: bool = False,
+        respect_dunder_all: bool = True,
+        exclude_sources: Sequence[str] | None = None,
+        exclude_targets: Sequence[str] | None = None,
+        include_sources: Sequence[str] | None = None,
+        include_targets: Sequence[str] | None = None,
+    ) -> NativePlugin:
+        """Native dynamic-import fan-out plugin. Fans every
+        ``EdgeFlags.DYNAMIC_IMPORT`` edge that targets a module out to that
+        module's exports (``__all__`` when ``respect_dunder_all`` and present,
+        else top-level decls; ``_``-prefixed names dropped unless
+        ``include_underscore``).
+
+        ``include_sources`` / ``include_targets`` allowlist call-site paths
+        (matched via ``PurePosixPath.match`` against the project-relative path)
+        and target module fqnames (``fnmatch.fnmatchcase``); ``exclude_*``
+        denylist them. When both are set an edge must match an ``include_*``
+        AND no ``exclude_*``.
+        """
+        ...
+
+    @staticmethod
+    def explicit(
+        regexes: Sequence[str],
+        str_specs: Sequence[str],
+        abs_paths: Sequence[str],
+    ) -> NativePlugin:
+        """Native explicit-entrypoint plugin. Marks every node matching one of
+        the pre-bucketed specs as a ``<entrypoint>``: ``regexes`` match the
+        project-relative file path, ``str_specs`` match an exact fqname or a
+        project-relative file path, and ``abs_paths`` match an exact absolute
+        path. The CLI buckets its ``str | Path | re.Pattern`` specs into these
+        three lists before calling.
+        """
+        ...
+
 def _builtin_native_plugin(name: str) -> NativePlugin | None:
     """Resolve a built-in plugin name (e.g. ``"main_block"``) to its
     native implementation, or ``None`` if no native plugin owns that
@@ -1128,8 +1216,8 @@ class ProjectContext:
         nested functions, decorator-only stubs) surface an empty list
         at the same position.
 
-        Used by :class:`dead_cst.contrib.PytestPlugin` to discover
-        ``test_foo(my_fixture)`` → ``test_foo → my_fixture`` edges.
+        Used by the native pytest plugin (``NativePlugin.pytest()``) to
+        discover ``test_foo(my_fixture)`` → ``test_foo → my_fixture`` edges.
 
         Validates bounds and raises :class:`IndexError` when any
         index is out of range.
@@ -1148,8 +1236,8 @@ class ProjectContext:
         Indices that don't resolve to a top-level ``ClassDef`` in the
         AST surface an empty list at the same position.
 
-        Used by :class:`dead_cst.contrib.PytestPlugin` to wire
-        ``class → fixture`` edges for ``Test*`` classes — class
+        Used by the native pytest plugin (``NativePlugin.pytest()``) to
+        wire ``class → fixture`` edges for ``Test*`` classes — class
         methods aren't represented as their own graph nodes, so the
         class itself is the rendezvous point for any fixture any
         method uses.
@@ -1518,8 +1606,8 @@ class QueryBuilder:
         str_specs: list[str] = ...,
         abs_paths: list[str] = ...,
     ) -> list[int]:
-        """OR-form spec matcher (used by
-        :class:`ExplicitEntrypointPlugin`). A node matches if any of:
+        """OR-form spec matcher (used by the native explicit-entrypoint
+        plugin, ``NativePlugin.explicit()``). A node matches if any of:
 
         * ``regexes`` contains a pattern matching the node's path
           relative to ``project_root`` (anchored, ``re.match`` style);

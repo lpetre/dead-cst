@@ -5,12 +5,13 @@ against a :class:`dead_cst._native.ProjectContext`, yielding
 :class:`AddNode` / :class:`AddEdge` / :class:`AddEntrypoint` ops the
 rust backend applies to the in-progress project graph.
 
-This package contains plugins covering core Python conventions
-(``__main__`` blocks, ``[project.scripts]``, explicit entrypoints,
-module dunders, init-subclass discovery, the ``DYNAMIC_IMPORT``
-fan-out) plus the reusable :class:`DecoratedDeclPlugin` /
+This package contains the reusable :class:`DecoratedDeclPlugin` /
 :class:`LiteralListPlugin` shapes that framework-specific plugins
-build on.
+build on, plus the parity-tested Python ``main_block`` /
+``module_dunders`` / ``init_subclass`` plugins kept alongside their
+native ports. Core conventions (``[project.scripts]``, explicit
+entrypoints, the ``DYNAMIC_IMPORT`` fan-out, ...) are now native
+plugins on :class:`dead_cst._native.NativePlugin`.
 
 Plugins targeting specific third-party frameworks (FastAPI, Flask,
 Click, Typer, pytest, unittest, ...) live under
@@ -35,26 +36,20 @@ from .decl_shapes import (
     DecoratedDeclPlugin,
     LiteralListPlugin,
 )
-from .dynamic_import import DynamicImportFallbackPlugin
-from .explicit_entrypoint import ExplicitEntrypointPlugin
 from .init_subclass import InitSubclassPlugin
 from .main_block import MainBlockPlugin
 from .module_dunders import ModuleDundersPlugin
-from .project_scripts import ProjectScriptsPlugin
 
 __all__ = [
     "DecoratedDeclPlugin",
-    "DynamicImportFallbackPlugin",
     "EXTERNAL_DIST_PREFIX",
     "EXTERNAL_FILE_PREFIX",
     "EXTERNAL_PREFIXES",
-    "ExplicitEntrypointPlugin",
     "InitSubclassPlugin",
     "LiteralListPlugin",
     "MainBlockPlugin",
     "ModuleDundersPlugin",
     "Plugin",
-    "ProjectScriptsPlugin",
     "STDLIB_PREFIX",
     "SYNTHETIC_PATH_PREFIXES",
     "UNPARSEABLE_PREFIX",
