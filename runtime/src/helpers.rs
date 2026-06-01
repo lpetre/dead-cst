@@ -1,9 +1,8 @@
 //! Leftover utilities shared across modules: AST navigation helpers,
-//! call-args/kwargs extraction for the chainable query payloads,
+//! call-args extraction used by the native plugin query helpers,
 //! dead-region detection, noqa scanning, position/file helpers, and the
 //! shared `NodeFlags`/`EdgeFlags` constant aliases.
 
-use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use ruff_db::files::{File, FilePath};
 use ruff_db::parsed::{parsed_module, ParsedModuleRef};
@@ -23,7 +22,7 @@ use ty_project::metadata::value::RelativePathBuf;
 use ty_project::{Db as ProjectDb, ProjectDatabase};
 
 use crate::builder::GraphNode;
-use crate::graph::{EdgeFlags, NodeFlags, SymbolNode};
+use crate::graph::{EdgeFlags, NodeFlags};
 use crate::ingest::collapse_attribute_chain;
 use crate::project::BuildOutputs;
 
@@ -890,7 +889,7 @@ pub(crate) fn unwrap_subscripted_callee(expr: &Expr) -> &Expr {
 
 /// Multi-module variant of [`matched_call_target`]: returns the matched
 /// upstream name as soon as any of ``modules`` produces a hit. Used by
-/// the multi-module ``where_module([...])`` query forms.
+/// the query forms that accept a list of modules to match against.
 pub(crate) fn matched_call_target_any(
     call: &ruff_python_ast::ExprCall,
     imports: &FxHashMap<String, String>,
@@ -1050,76 +1049,20 @@ pub(crate) fn nth_positional_string(
     }
 }
 
-/// Send-able value extracted from an AST expression.
-///
-/// ``DeclRef(idx)`` holds an index into ``BuildOutputs.builder.nodes``.
-/// The ``Py<SymbolNode>`` materialization runs in the GIL-holding
-/// caller after :fn:`par_scan_files` returns (the rust extractor must
-/// stay ``Send``).
-///
-/// ``Unknown`` is reported when the expression is neither a recognized
-/// literal nor a name/attribute that resolves through the file's
-/// imports to a project decl. Python-side it surfaces as
-/// :class:`ArgOpaque` so callers can distinguish "literal ``None``"
-/// from "unresolvable expression".
+/// A string literal extracted from a call keyword argument, or
+/// ``Unknown`` for anything else. The only consumer today is the
+/// pytest plugin, which reads the ``name=`` alias on ``@pytest.fixture``;
+/// every non-string expression collapses to ``Unknown``.
 #[derive(Clone, Debug)]
 pub(crate) enum ArgValue {
-    None,
-    Bool(bool),
-    Int(i64),
-    Float(f64),
     Str(String),
-    Bytes(Vec<u8>),
-    List(Vec<ArgValue>),
-    Tuple(Vec<ArgValue>),
-    DeclRef(usize),
     Unknown,
 }
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CallArgs {
-    pub(crate) args: Vec<ArgValue>,
     pub(crate) kwargs: FxHashMap<String, ArgValue>,
 }
-
-// ---------------------------------------------------------------------------
-// Python-side discriminated union for ``args`` / ``kwargs`` entries.
-//
-// The rust :enum:`ArgValue` carries everything needed; the Python
-// surface flattens it into a three-way tagged union — :class:`ArgLiteral`
-// (any Python literal), :class:`ArgNodeRef` (resolved decl, carrying
-// just the positional index), :class:`ArgOpaque` (non-literal /
-// non-resolvable). Plugin code uses ``match arg:`` or
-// ``isinstance(arg, ArgLiteral)`` to dispatch.
-//
-// The pyclasses are materialised lazily by the per-ref ``args`` /
-// ``kwargs`` getters — see :class:`DecoratorIdxRef` etc. Plugins that
-// never read ``args`` / ``kwargs`` pay zero Python allocation cost.
-// ---------------------------------------------------------------------------
-
-/// A literal arg / kwarg value. ``value`` is a native Python primitive:
-/// ``str`` / ``int`` / ``float`` / ``bool`` / ``None`` / ``bytes`` /
-/// ``list`` / ``tuple``. Nested collections are recursively native too.
-#[pyclass(frozen, get_all)]
-pub(crate) struct ArgLiteral {
-    pub(crate) value: Py<PyAny>,
-}
-
-/// A decl reference inside an arg / kwarg position — e.g. ``func(some_class)``
-/// where ``some_class`` resolves through the file's imports to a project
-/// decl. ``idx`` is a positional index into ``ctx.nodes()``.
-#[pyclass(frozen, get_all)]
-pub(crate) struct ArgNodeRef {
-    pub(crate) idx: usize,
-}
-
-/// An arg / kwarg expression that's neither a recognised literal nor a
-/// statically-resolvable decl reference (e.g. a function call result,
-/// a complex expression, a name we can't pin to a decl). Carries no
-/// payload — callers who need the source text should fall back to ty's
-/// parsed module.
-#[pyclass(frozen)]
-pub(crate) struct ArgOpaque;
 
 /// Tuple-like result row returned by
 /// :meth:`ProjectContext.node_attrs` and the per-query
@@ -1182,340 +1125,26 @@ impl NodeAttrs {
     }
 }
 
-#[pymethods]
-impl ArgOpaque {
-    #[new]
-    fn new() -> Self {
-        Self
-    }
-
-    fn __repr__(&self) -> &'static str {
-        "ArgOpaque()"
-    }
-}
-
-/// Materialize a single :enum:`ArgValue` into the Python discriminated
-/// union (``ArgLiteral`` / ``ArgNodeRef`` / ``ArgOpaque``). Allocates
-/// one pyclass per call; the lazy ``args`` / ``kwargs`` getters on the
-/// ref types call this per-entry on demand.
-pub(crate) fn arg_value_to_py_arg(py: Python<'_>, v: &ArgValue) -> PyResult<Py<PyAny>> {
-    let py_obj: Py<PyAny> = match v {
-        ArgValue::None => Py::new(py, ArgLiteral { value: py.None() })?.into_py(py),
-        ArgValue::Bool(b) => Py::new(
-            py,
-            ArgLiteral {
-                value: b.into_py(py),
-            },
-        )?
-        .into_py(py),
-        ArgValue::Int(i) => Py::new(
-            py,
-            ArgLiteral {
-                value: i.into_py(py),
-            },
-        )?
-        .into_py(py),
-        ArgValue::Float(f) => Py::new(
-            py,
-            ArgLiteral {
-                value: f.into_py(py),
-            },
-        )?
-        .into_py(py),
-        ArgValue::Str(s) => Py::new(
-            py,
-            ArgLiteral {
-                value: s.into_py(py),
-            },
-        )?
-        .into_py(py),
-        ArgValue::Bytes(b) => Py::new(
-            py,
-            ArgLiteral {
-                value: pyo3::types::PyBytes::new_bound(py, b).into_py(py),
-            },
-        )?
-        .into_py(py),
-        // ``List`` / ``Tuple`` recurse through ``arg_value_to_py_arg``
-        // so nested ``DeclRef`` / ``Unknown`` entries surface as
-        // ``ArgNodeRef`` / ``ArgOpaque`` inside the literal container.
-        // The outer ``ArgLiteral.value`` is therefore a Python
-        // ``list`` / ``tuple`` whose elements are themselves
-        // ``ArgLiteral | ArgNodeRef | ArgOpaque``.
-        ArgValue::List(items) => {
-            let py_items: PyResult<Vec<Py<PyAny>>> =
-                items.iter().map(|v| arg_value_to_py_arg(py, v)).collect();
-            Py::new(
-                py,
-                ArgLiteral {
-                    value: pyo3::types::PyList::new_bound(py, py_items?).into_py(py),
-                },
-            )?
-            .into_py(py)
-        }
-        ArgValue::Tuple(items) => {
-            let py_items: PyResult<Vec<Py<PyAny>>> =
-                items.iter().map(|v| arg_value_to_py_arg(py, v)).collect();
-            Py::new(
-                py,
-                ArgLiteral {
-                    value: pyo3::types::PyTuple::new_bound(py, py_items?).into_py(py),
-                },
-            )?
-            .into_py(py)
-        }
-        ArgValue::DeclRef(idx) => Py::new(py, ArgNodeRef { idx: *idx })?.into_py(py),
-        ArgValue::Unknown => Py::new(py, ArgOpaque)?.into_py(py),
-    };
-    Ok(py_obj)
-}
-
-/// Materialize a ``Vec<ArgValue>`` into a Python ``list[ArgLiteral |
-/// ArgNodeRef | ArgOpaque]``. Used by per-ref ``args`` getters.
-pub(crate) fn arg_values_to_py_list(py: Python<'_>, values: &[ArgValue]) -> PyResult<Py<PyAny>> {
-    let items: PyResult<Vec<Py<PyAny>>> =
-        values.iter().map(|v| arg_value_to_py_arg(py, v)).collect();
-    Ok(pyo3::types::PyList::new_bound(py, items?).into_py(py))
-}
-
-/// Materialize a ``FxHashMap<String, ArgValue>`` into a Python
-/// ``dict[str, ArgLiteral | ArgNodeRef | ArgOpaque]``.
-pub(crate) fn arg_kwargs_to_py_dict(
-    py: Python<'_>,
-    kwargs: &FxHashMap<String, ArgValue>,
-) -> PyResult<Py<PyAny>> {
-    let out = pyo3::types::PyDict::new_bound(py);
-    for (k, v) in kwargs {
-        out.set_item(k, arg_value_to_py_arg(py, v)?)?;
-    }
-    Ok(out.into_py(py))
-}
-
-/// Resolve a dotted Name / Attribute chain to a project decl index
-/// using the file's imports map. Returns the matching node index when
-/// the leftmost ``Name`` is a known local import and the resulting
-/// dotted upstream fqname (``upstream + remaining attrs``) is present
-/// in ``decl_by_fqname``. Picks the first index when multiple bindings
-/// exist.
-pub(crate) fn resolve_dotted_name_to_decl(
-    root: &str,
-    segs: &[&str],
-    file_imports: &FxHashMap<String, String>,
-    decl_by_fqname: &FxHashMap<String, Vec<usize>>,
-) -> Option<usize> {
-    let upstream = file_imports.get(root)?;
-    let mut fqn =
-        String::with_capacity(upstream.len() + segs.iter().map(|s| s.len() + 1).sum::<usize>());
-    fqn.push_str(upstream);
-    for seg in segs {
-        fqn.push('.');
-        fqn.push_str(seg);
-    }
-    let idxs = decl_by_fqname.get(&fqn)?;
-    idxs.first().copied()
-}
-
-/// Convert one AST argument expression to an ``ArgValue``.
-pub(crate) fn extract_arg_value(
-    expr: &Expr,
-    file_imports: &FxHashMap<String, String>,
-    decl_by_fqname: &FxHashMap<String, Vec<usize>>,
-) -> ArgValue {
+/// Convert one AST argument expression to an ``ArgValue``. Only string
+/// literals are captured; every other expression is ``Unknown``.
+pub(crate) fn extract_arg_value(expr: &Expr) -> ArgValue {
     match expr {
-        Expr::NoneLiteral(_) => ArgValue::None,
-        Expr::BooleanLiteral(b) => ArgValue::Bool(b.value),
         Expr::StringLiteral(s) => ArgValue::Str(s.value.to_str().to_string()),
-        Expr::BytesLiteral(b) => ArgValue::Bytes(b.value.bytes().collect()),
-        Expr::NumberLiteral(n) => match &n.value {
-            ruff_python_ast::Number::Int(i) => match i.as_i64() {
-                Some(v) => ArgValue::Int(v),
-                None => ArgValue::Unknown,
-            },
-            ruff_python_ast::Number::Float(f) => ArgValue::Float(*f),
-            ruff_python_ast::Number::Complex { .. } => ArgValue::Unknown,
-        },
-        Expr::List(list) => ArgValue::List(
-            list.elts
-                .iter()
-                .map(|e| extract_arg_value(e, file_imports, decl_by_fqname))
-                .collect(),
-        ),
-        Expr::Tuple(tup) => ArgValue::Tuple(
-            tup.elts
-                .iter()
-                .map(|e| extract_arg_value(e, file_imports, decl_by_fqname))
-                .collect(),
-        ),
-        Expr::Name(n) => {
-            if let Some(idx) =
-                resolve_dotted_name_to_decl(n.id.as_str(), &[], file_imports, decl_by_fqname)
-            {
-                ArgValue::DeclRef(idx)
-            } else {
-                ArgValue::Unknown
-            }
-        }
-        Expr::Attribute(_) => {
-            if let Some((root, segs)) = collapse_attribute_chain(expr) {
-                if let Some(idx) = resolve_dotted_name_to_decl(
-                    root.id.as_str(),
-                    &segs,
-                    file_imports,
-                    decl_by_fqname,
-                ) {
-                    return ArgValue::DeclRef(idx);
-                }
-            }
-            ArgValue::Unknown
-        }
         _ => ArgValue::Unknown,
     }
 }
 
-/// Extract positional + keyword arguments from a call.
-pub(crate) fn extract_call_args_kwargs(
-    call: &ruff_python_ast::ExprCall,
-    file_imports: &FxHashMap<String, String>,
-    decl_by_fqname: &FxHashMap<String, Vec<usize>>,
-) -> CallArgs {
-    let args: Vec<ArgValue> = call
-        .arguments
-        .args
-        .iter()
-        .map(|a| extract_arg_value(a, file_imports, decl_by_fqname))
-        .collect();
+/// Extract keyword arguments from a call. Positional args are not
+/// captured — no consumer reads them.
+pub(crate) fn extract_call_kwargs(call: &ruff_python_ast::ExprCall) -> CallArgs {
     let mut kwargs: FxHashMap<String, ArgValue> = FxHashMap::default();
     for kw in &call.arguments.keywords {
         let Some(name) = kw.arg.as_ref() else {
             continue;
         };
-        kwargs.insert(
-            name.as_str().to_string(),
-            extract_arg_value(&kw.value, file_imports, decl_by_fqname),
-        );
+        kwargs.insert(name.as_str().to_string(), extract_arg_value(&kw.value));
     }
-    CallArgs { args, kwargs }
-}
-
-/// A user-supplied kwarg matcher. Only literal-value equality is
-/// supported; ``SymbolNode``-valued matchers are rejected at
-/// ``where_kwarg`` call time.
-#[derive(Clone, Debug)]
-pub(crate) enum KwargMatcher {
-    Literal(ArgValue),
-}
-
-/// True iff two ``ArgValue``s are equal as literals. ``Unknown`` never
-/// compares equal to anything.
-pub(crate) fn arg_value_eq_literal(a: &ArgValue, b: &ArgValue) -> bool {
-    match (a, b) {
-        (ArgValue::None, ArgValue::None) => true,
-        (ArgValue::Bool(x), ArgValue::Bool(y)) => x == y,
-        (ArgValue::Int(x), ArgValue::Int(y)) => x == y,
-        (ArgValue::Float(x), ArgValue::Float(y)) => x == y,
-        // Allow mixed int/float comparison for ergonomic matching.
-        (ArgValue::Int(x), ArgValue::Float(y)) => (*x as f64) == *y,
-        (ArgValue::Float(x), ArgValue::Int(y)) => *x == (*y as f64),
-        (ArgValue::Str(x), ArgValue::Str(y)) => x == y,
-        (ArgValue::Bytes(x), ArgValue::Bytes(y)) => x == y,
-        (ArgValue::List(xs), ArgValue::List(ys))
-        | (ArgValue::Tuple(xs), ArgValue::Tuple(ys))
-        | (ArgValue::List(xs), ArgValue::Tuple(ys))
-        | (ArgValue::Tuple(xs), ArgValue::List(ys)) => {
-            xs.len() == ys.len()
-                && xs
-                    .iter()
-                    .zip(ys.iter())
-                    .all(|(a, b)| arg_value_eq_literal(a, b))
-        }
-        _ => false,
-    }
-}
-
-/// Extract a ``KwargMatcher`` from a Python value supplied at
-/// ``.where_kwarg(name, value)`` call time. Accepts only Python
-/// literals (``None``, ``bool``, ``int``, ``float``, ``str``,
-/// ``list[...]``, ``tuple[...]``); passing a ``SymbolNode`` (or any
-/// other unsupported type) raises ``PyValueError``.
-pub(crate) fn kwarg_matcher_from_py(py: Python<'_>, value: &Py<PyAny>) -> PyResult<KwargMatcher> {
-    let bound = value.bind(py);
-    // Reject SymbolNode explicitly with a targeted error so callers
-    // see the dropped feature rather than the generic "unknown type"
-    // message from `py_to_arg_value`.
-    if bound.extract::<PyRef<'_, SymbolNode>>().is_ok() {
-        return Err(PyValueError::new_err(
-            "where_kwarg value must be a Python literal (str/int/float/bool/None/list/tuple), got SymbolNode",
-        ));
-    }
-    Ok(KwargMatcher::Literal(py_to_arg_value(bound)?))
-}
-
-/// Convert a Python value to an ``ArgValue`` literal. Errors when the
-/// value isn't a recognized literal shape (so the matcher never
-/// silently matches "anything").
-pub(crate) fn py_to_arg_value(value: &Bound<'_, PyAny>) -> PyResult<ArgValue> {
-    if value.is_none() {
-        return Ok(ArgValue::None);
-    }
-    // Order matters: bool is a subclass of int in Python, so we must
-    // check bool BEFORE int. ``extract::<bool>()`` succeeds for both
-    // True/False and the literal ints 0/1 — the strict ``is_instance_of``
-    // guard distinguishes a real bool from a coerced int.
-    if value.is_instance_of::<pyo3::types::PyBool>() {
-        return Ok(ArgValue::Bool(value.extract::<bool>()?));
-    }
-    if let Ok(i) = value.extract::<i64>() {
-        return Ok(ArgValue::Int(i));
-    }
-    if let Ok(f) = value.extract::<f64>() {
-        return Ok(ArgValue::Float(f));
-    }
-    if let Ok(s) = value.extract::<String>() {
-        return Ok(ArgValue::Str(s));
-    }
-    if let Ok(b) = value.downcast::<pyo3::types::PyBytes>() {
-        return Ok(ArgValue::Bytes(b.as_bytes().to_vec()));
-    }
-    if let Ok(list) = value.downcast::<pyo3::types::PyList>() {
-        let mut out = Vec::with_capacity(list.len());
-        for item in list.iter() {
-            out.push(py_to_arg_value(&item)?);
-        }
-        return Ok(ArgValue::List(out));
-    }
-    if let Ok(tup) = value.downcast::<pyo3::types::PyTuple>() {
-        let mut out = Vec::with_capacity(tup.len());
-        for item in tup.iter() {
-            out.push(py_to_arg_value(&item)?);
-        }
-        return Ok(ArgValue::Tuple(out));
-    }
-    Err(PyValueError::new_err(format!(
-        "where_kwarg value must be a literal \
-         (None / bool / int / float / str / bytes / list / tuple); got {}",
-        value.get_type().name()?,
-    )))
-}
-
-/// True iff every ``(name, matcher)`` pair holds against the call's
-/// ``kwargs``. A missing kwarg never matches.
-pub(crate) fn call_args_match_kwargs(
-    call_args: &CallArgs,
-    matchers: &[(String, KwargMatcher)],
-) -> bool {
-    for (name, matcher) in matchers {
-        let Some(av) = call_args.kwargs.get(name) else {
-            return false;
-        };
-        match matcher {
-            KwargMatcher::Literal(expected) => {
-                if !arg_value_eq_literal(av, expected) {
-                    return false;
-                }
-            }
-        }
-    }
-    true
+    CallArgs { kwargs }
 }
 
 /// Match ``<owner>.<attr>(...)`` where ``<owner>`` is a bare ``Name``
@@ -1551,22 +1180,20 @@ pub(crate) fn call_callee_matches_var(
 /// Visit every Call expression in a subtree, push
 /// ``(string_arg_at_index, CallArgs)`` whenever ``predicate(call)``
 /// returns ``true``. Backs both call-finder queries.
-pub(crate) struct StringArgCallFinder<'a, F>
+pub(crate) struct StringArgCallFinder<F>
 where
     F: FnMut(&ruff_python_ast::ExprCall) -> bool,
 {
     pub(crate) predicate: F,
     pub(crate) arg_index: usize,
-    pub(crate) file_imports: &'a FxHashMap<String, String>,
-    pub(crate) decl_by_fqname: &'a FxHashMap<String, Vec<usize>>,
     /// When ``false``, every result row gets a default-constructed
     /// (empty) :struct:`CallArgs`. The caller pays for the rust-side
-    /// arg / kwarg walk only when ``extract_args = true``.
+    /// kwarg walk only when ``extract_args = true``.
     pub(crate) extract_args: bool,
     pub(crate) results: Vec<(String, CallArgs)>,
 }
 
-impl<'ast, 'a, F> Visitor<'ast> for StringArgCallFinder<'a, F>
+impl<'ast, F> Visitor<'ast> for StringArgCallFinder<F>
 where
     F: FnMut(&ruff_python_ast::ExprCall) -> bool,
 {
@@ -1575,7 +1202,7 @@ where
             if (self.predicate)(call) {
                 if let Some(value) = nth_positional_string(call, self.arg_index) {
                     let call_args = if self.extract_args {
-                        extract_call_args_kwargs(call, self.file_imports, self.decl_by_fqname)
+                        extract_call_kwargs(call)
                     } else {
                         CallArgs::default()
                     };
@@ -1598,8 +1225,6 @@ where
 pub(crate) struct AttrCallFinder<'a> {
     pub(crate) attr: &'a str,
     pub(crate) arg_index: usize,
-    pub(crate) file_imports: &'a FxHashMap<String, String>,
-    pub(crate) decl_by_fqname: &'a FxHashMap<String, Vec<usize>>,
     /// See :struct:`StringArgCallFinder` — same gate.
     pub(crate) extract_args: bool,
     pub(crate) results: Vec<(String, CallArgs)>,
@@ -1614,11 +1239,7 @@ impl<'ast, 'a> Visitor<'ast> for AttrCallFinder<'a> {
                         let hits = string_or_string_collection(arg);
                         if !hits.is_empty() {
                             let call_args = if self.extract_args {
-                                extract_call_args_kwargs(
-                                    call,
-                                    self.file_imports,
-                                    self.decl_by_fqname,
-                                )
+                                extract_call_kwargs(call)
                             } else {
                                 CallArgs::default()
                             };
@@ -2736,81 +2357,6 @@ mod tests {
         use ruff_text_size::TextSize;
         let range = TextRange::new(TextSize::from(5), TextSize::from(12));
         assert_eq!(range_key(range), (5, 12));
-    }
-
-    // -- arg_value_eq_literal ---------------------------------------------
-
-    #[test]
-    fn arg_value_eq_literal_compares_simple_scalars() {
-        assert!(arg_value_eq_literal(&ArgValue::None, &ArgValue::None));
-        assert!(arg_value_eq_literal(
-            &ArgValue::Bool(true),
-            &ArgValue::Bool(true)
-        ));
-        assert!(!arg_value_eq_literal(
-            &ArgValue::Bool(true),
-            &ArgValue::Bool(false)
-        ));
-        assert!(arg_value_eq_literal(&ArgValue::Int(42), &ArgValue::Int(42)));
-        assert!(arg_value_eq_literal(
-            &ArgValue::Str("hi".into()),
-            &ArgValue::Str("hi".into())
-        ));
-        assert!(!arg_value_eq_literal(
-            &ArgValue::Str("hi".into()),
-            &ArgValue::Str("ho".into())
-        ));
-    }
-
-    #[test]
-    fn arg_value_eq_literal_int_float_cross_compares() {
-        // The helper opts into mixed int/float equality (ergonomic match).
-        assert!(arg_value_eq_literal(
-            &ArgValue::Int(5),
-            &ArgValue::Float(5.0)
-        ));
-        assert!(arg_value_eq_literal(
-            &ArgValue::Float(5.0),
-            &ArgValue::Int(5)
-        ));
-        assert!(!arg_value_eq_literal(
-            &ArgValue::Int(5),
-            &ArgValue::Float(5.5)
-        ));
-    }
-
-    #[test]
-    fn arg_value_eq_literal_unknown_never_matches() {
-        assert!(!arg_value_eq_literal(
-            &ArgValue::Unknown,
-            &ArgValue::Unknown
-        ));
-        assert!(!arg_value_eq_literal(&ArgValue::Unknown, &ArgValue::None));
-    }
-
-    #[test]
-    fn arg_value_eq_literal_list_tuple_interchangeable() {
-        let list = ArgValue::List(vec![ArgValue::Int(1), ArgValue::Int(2)]);
-        let tup = ArgValue::Tuple(vec![ArgValue::Int(1), ArgValue::Int(2)]);
-        let diff = ArgValue::List(vec![ArgValue::Int(1), ArgValue::Int(3)]);
-        let short = ArgValue::List(vec![ArgValue::Int(1)]);
-        assert!(arg_value_eq_literal(&list, &tup));
-        assert!(arg_value_eq_literal(&tup, &list));
-        assert!(!arg_value_eq_literal(&list, &diff));
-        assert!(!arg_value_eq_literal(&list, &short));
-    }
-
-    #[test]
-    fn arg_value_eq_literal_mixed_types_rejected() {
-        assert!(!arg_value_eq_literal(
-            &ArgValue::Int(0),
-            &ArgValue::Bool(false)
-        ));
-        assert!(!arg_value_eq_literal(&ArgValue::None, &ArgValue::Int(0)));
-        assert!(!arg_value_eq_literal(
-            &ArgValue::Str("".into()),
-            &ArgValue::List(vec![])
-        ));
     }
 
     // -- evaluate_truthiness ----------------------------------------------

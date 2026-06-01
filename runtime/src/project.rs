@@ -38,9 +38,9 @@ use crate::file_payload::{file_to_edges, file_to_nodes, FileEdges, NodeKind, Nod
 use crate::file_ref_edges::{file_to_ref_edges, FileRefEdges};
 use crate::graph::{intern_kind, DeclIndex, NativeGraph, SymbolNode};
 use crate::helpers::{
-    call_callee_matches_var, class_body_defines_method, collect_all_imports_local,
-    collect_modules_imports_local, decorators_match_imports, extract_call_args_kwargs,
-    file_path_string, find_external_seed_direct_subclasses_par, find_main_block_range,
+    call_callee_matches_var, class_body_defines_method, collect_modules_imports_local,
+    decorators_match_imports, extract_call_kwargs, file_path_string,
+    find_external_seed_direct_subclasses_par, find_main_block_range,
     find_subclass_indices_via_refs_with_queue, is_dunder_name, locate_class_def, locate_class_seed,
     matched_call_target_any, owner_idx_for_stmt_with, range_key, rel_path,
     top_level_assign_to_name, unwrap_subscripted_callee, AttrCallFinder, CallArgs,
@@ -53,7 +53,6 @@ use crate::progress::{
 };
 use crate::query::{
     _compile_path_regex, _contains_any_identifier, _contains_identifier, par_scan_files,
-    QueryBuilder,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -1538,17 +1537,6 @@ impl ProjectContext {
         self.progress = Arc::new(ProgressCounters::new());
     }
 
-    /// Open a chainable query builder against this context.
-    ///
-    /// Equivalent to the top-level :func:`query` function; both return
-    /// a :class:`QueryBuilder` that can chain into
-    /// :class:`DecoratorQuery` / :class:`ConstructionQuery` /
-    /// :class:`CallQuery`. See the result-type docstrings for the
-    /// predicate vocabulary.
-    pub(crate) fn query(slf: Py<Self>, _py: Python<'_>) -> QueryBuilder {
-        QueryBuilder { ctx: slf }
-    }
-
     /// Build the project-wide graph, run each plugin's `run(ctx)`,
     /// then snapshot the final state.
     ///
@@ -1989,8 +1977,7 @@ impl ProjectContext {
     /// and module-scope PEP 562 dunder functions (``__getattr__``,
     /// ``__dir__``) — both are observable to import / attribute-access
     /// machinery and must be kept alive even when no source reference
-    /// points at them. Plugins use the DSL form:
-    /// ``native.query(ctx).modules().with_dunders().indices()``.
+    /// points at them.
     pub(crate) fn find_module_dunders_indices(&self) -> PyResult<Vec<usize>> {
         let outputs = self.materialized("find_module_dunders_indices")?;
         let mut out = Vec::new();
@@ -2069,12 +2056,9 @@ impl ProjectContext {
     }
 }
 
-// ``find_imports_of`` / ``_indices`` / ``imports_of_count`` /
-// ``find_imports_of_indices`` / ``imports_of_count`` / ``has_imports_of``
-// back :class:`ImportQuery` and its ``.count()`` / ``.exists()``
-// shortcuts. NOT exposed to Python — plugin authors use the DSL:
-// ``native.query(ctx).imports().of(module).indices()`` / ``.count()`` /
-// ``.exists()``.
+// ``find_imports_of_indices`` / ``has_imports_of`` are consumed by
+// native plugins (e.g. the unittest and framework plugins) as O(1)
+// probes against ``imports_by_module``; they are not exposed to Python.
 impl ProjectContext {
     /// Every import-kind node whose upstream `module` matches, as
     /// positional indices into ``ctx.nodes()``.
@@ -2091,23 +2075,6 @@ impl ProjectContext {
             .get(module_name)
             .cloned()
             .unwrap_or_default())
-    }
-
-    /// O(1) count of how many project import nodes target
-    /// ``module_name`` — pre-built index lookup, no Py allocation.
-    pub(crate) fn imports_of_count(&self, module_name: &str) -> usize {
-        // Fast path: uncontended read avoids GIL juggling. Slow
-        // path matches the GIL-drop discipline in
-        // :meth:`materialized` — see that method's docstring for
-        // the deadlock rationale.
-        let read_guard = match self.outputs.try_read() {
-            Some(g) => g,
-            None => acquire_read_releasing_gil(&self.outputs),
-        };
-        read_guard
-            .as_ref()
-            .and_then(|o| o.imports_by_module.get(module_name).map(Vec::len))
-            .unwrap_or(0)
     }
 
     /// Cheap "does any project file import ``module_name``?" check.
@@ -2137,15 +2104,13 @@ impl ProjectContext {
     /// libcst :func:`find_declarations` follows. Modules are never
     /// returned; use :meth:`find_module` for that.
     /// Indices for every project decl whose fqname matches (walk-back
-    /// included). Plugins use the DSL:
-    /// ``native.query(ctx).declarations().with_fqname(fqn).indices()``.
+    /// included).
     pub(crate) fn find_declarations_indices(&self, fqname: &str) -> PyResult<Vec<usize>> {
         let outputs = self.materialized("find_declarations_indices")?;
         Ok(find_declarations_indices_in(&outputs, fqname))
     }
 
-    /// O(1) module-by-fqname lookup. Plugins use the DSL:
-    /// ``native.query(ctx).modules().with_fqn(fqn).first_idx()``.
+    /// O(1) module-by-fqname lookup.
     pub(crate) fn find_module_idx(&self, fqname: &str) -> PyResult<Option<usize>> {
         let outputs = self.materialized("find_module_idx")?;
         Ok(outputs.module_by_fqname.get(fqname).copied())
@@ -2154,8 +2119,7 @@ impl ProjectContext {
 
 #[pymethods]
 impl ProjectContext {
-    /// O(1) path-to-module lookup. Plugins use the DSL:
-    /// ``native.query(ctx).modules().with_path(path).first_idx()``.
+    /// O(1) path-to-module lookup.
     pub(crate) fn module_for_indices(&self, path: &str) -> PyResult<Option<usize>> {
         let outputs = self.materialized("module_for_indices")?;
         Ok(module_for_idx_in(&outputs, path))
@@ -2201,8 +2165,7 @@ impl ProjectContext {
     /// are not surfaced; nested defs aren't graph nodes anyway, and the
     /// "module surface" contract is per-module.
     /// BFS over the fqname tree from ``module_fqn``: the module idx
-    /// + every transitive descendant idx. Plugins use the DSL:
-    /// ``native.query(ctx).modules().with_fqn(fqn).surface().indices()``.
+    /// + every transitive descendant idx.
     pub(crate) fn module_surface_indices(&self, module_fqn: &str) -> PyResult<Vec<usize>> {
         let outputs = self.materialized("module_surface_indices")?;
         Ok(module_surface_indices_in(&outputs, module_fqn))
@@ -2210,9 +2173,8 @@ impl ProjectContext {
 
     /// Bulk form: resolve every fqname in ``module_fqns`` in a single
     /// scan. Returns a dict keyed by input fqname; missing modules
-    /// map to empty lists. No DSL equivalent — the bulk shape is the
-    /// reason this exists (one materialize check + one scan instead
-    /// of N).
+    /// map to empty lists — the bulk shape is the reason this exists
+    /// (one materialize check + one scan instead of N).
     pub(crate) fn module_surfaces_indices(
         &self,
         module_fqns: Vec<String>,
@@ -2234,8 +2196,7 @@ impl ProjectContext {
     /// `p.functions.sub.x`. Empty list when ``module_fqn`` doesn't
     /// resolve to a project module.
     /// One-level lookup via the ``children_by_parent`` fqname tree;
-    /// excludes module children. Plugins use the DSL:
-    /// ``native.query(ctx).modules().with_fqn(fqn).top_level().indices()``.
+    /// excludes module children.
     pub(crate) fn find_module_top_level_decls_indices(
         &self,
         module_fqn: &str,
@@ -2278,8 +2239,6 @@ impl ProjectContext {
     /// Read the entries from ``{module_fqn}.__all__``'s string-literal
     /// RHS and resolve each name in the module's scope. ``None`` means
     /// "no ``__all__``"; ``Some([])`` means "empty / unresolvable".
-    /// Plugins use the DSL:
-    /// ``native.query(ctx).modules().with_fqn(fqn).dunder_all()``.
     pub(crate) fn find_module_dunder_all_exports_indices(
         &self,
         module_fqn: &str,
@@ -2357,8 +2316,7 @@ impl ProjectContext {
 
 #[pymethods]
 impl ProjectContext {
-    /// Every node whose ``path`` starts with ``path_prefix``. Plugins
-    /// use the DSL: ``native.query(ctx).decls().with_path_prefix(p)``.
+    /// Every node whose ``path`` starts with ``path_prefix``.
     pub(crate) fn decls_under_indices(&self, path_prefix: &str) -> PyResult<Vec<usize>> {
         let outputs = self.materialized("decls_under_indices")?;
         Ok(outputs
@@ -2372,8 +2330,6 @@ impl ProjectContext {
     }
 
     /// Every node whose ``path`` contains ``substring`` anywhere.
-    /// Plugins use the DSL:
-    /// ``native.query(ctx).decls().with_path_contains(s)``.
     pub(crate) fn decls_matching_indices(&self, substring: &str) -> PyResult<Vec<usize>> {
         let outputs = self.materialized("decls_matching_indices")?;
         Ok(outputs
@@ -2387,9 +2343,7 @@ impl ProjectContext {
     }
 
     /// Every top-level decl (function / class / variable / import /
-    /// type_alias) whose simple name matches ``pattern``. Plugins use
-    /// the DSL — compose
-    /// ``decls().with_simple_name_regex(p).with_kinds([...])``.
+    /// type_alias) whose simple name matches ``pattern``.
     pub(crate) fn decls_matching_name_indices(&self, pattern: &str) -> PyResult<Vec<usize>> {
         let regex = self.compile_regex(pattern)?;
         let outputs = self.materialized("decls_matching_name_indices")?;
@@ -2496,8 +2450,7 @@ impl ProjectContext {
     /// One-hop reverse step: every node with an edge directly into
     /// ``idx``. ``skip_flags`` filters edges by intersecting flag
     /// mask — same semantics as :meth:`ancestors_indices`. Dedups by
-    /// source index. Plugins use the DSL:
-    /// ``native.query(ctx).from_idx(idx).direct_predecessors()``.
+    /// source index.
     #[pyo3(signature = (idx, *, skip_flags = 0))]
     pub(crate) fn direct_predecessors_idx(
         &self,
@@ -2545,8 +2498,7 @@ impl ProjectContext {
     /// for every file with a top-level ``if __name__ == "__main__":``
     /// block. The decls list contains the file's class / function /
     /// variable / import nodes whose source position falls inside the
-    /// block's range. Plugins use the DSL:
-    /// ``native.query(ctx).main_blocks().index_pairs()``.
+    /// block's range.
     pub(crate) fn find_main_blocks_indices(&self) -> PyResult<Vec<(usize, Vec<usize>)>> {
         let outputs = self.materialized("find_main_blocks_indices")?;
 
@@ -2637,7 +2589,6 @@ impl ProjectContext {
         let names: FxHashSet<&str> = decorator_names.iter().map(String::as_str).collect();
         let needle_strs: Vec<&str> = decorator_names.iter().map(String::as_str).collect();
         let decl_by_name_range = &outputs.decl_by_name_range;
-        let decl_by_fqname = &outputs.decl_by_fqname;
         let project_files = &outputs.project_files;
         // Text prefilter inside the parallel walk mirrors the LSP's
         // find_references — skip files that don't even mention any
@@ -2667,7 +2618,6 @@ impl ProjectContext {
                 if imports.is_empty() {
                     return Vec::new();
                 }
-                let file_imports = collect_all_imports_local(&parsed);
                 let mut local = Vec::new();
                 for stmt in &parsed.syntax().body {
                     let Stmt::FunctionDef(func) = stmt else {
@@ -2681,9 +2631,7 @@ impl ProjectContext {
                     let key = (file, range_key(func.name.range()));
                     if let Some(&idx) = decl_by_name_range.get(&key) {
                         let call_args = if extract_args {
-                            call_form
-                                .map(|c| extract_call_args_kwargs(c, &file_imports, decl_by_fqname))
-                                .unwrap_or_default()
+                            call_form.map(extract_call_kwargs).unwrap_or_default()
                         } else {
                             CallArgs::default()
                         };
@@ -2725,7 +2673,6 @@ impl ProjectContext {
         let allowed: FxHashSet<&str> = ctor_names.iter().map(String::as_str).collect();
         let needle_strs: Vec<&str> = ctor_names.iter().map(String::as_str).collect();
         let decl_by_name_range = &outputs.decl_by_name_range;
-        let decl_by_fqname = &outputs.decl_by_fqname;
         let project_files: &[File] = &outputs.project_files;
         let db_handle: Box<dyn ProjectDb> = ProjectDb::dyn_clone(&self.db);
         let path_re_ref = &path_re;
@@ -2749,7 +2696,6 @@ impl ProjectContext {
                 if imports.is_empty() {
                     return Vec::new();
                 }
-                let file_imports = collect_all_imports_local(&parsed);
                 let mut local: Vec<(usize, String, CallArgs)> = Vec::new();
                 for stmt in &parsed.syntax().body {
                     let (target_range, value) = match top_level_assign_to_name(stmt) {
@@ -2763,7 +2709,7 @@ impl ProjectContext {
                         let key = (file, range_key(target_range));
                         if let Some(&idx) = decl_by_name_range.get(&key) {
                             let call_args = if extract_args {
-                                extract_call_args_kwargs(call, &file_imports, decl_by_fqname)
+                                extract_call_kwargs(call)
                             } else {
                                 CallArgs::default()
                             };
@@ -2799,7 +2745,6 @@ impl ProjectContext {
         let attrs: FxHashSet<&str> = decorator_attrs.iter().map(String::as_str).collect();
         let needle_strs: Vec<&str> = decorator_attrs.iter().map(String::as_str).collect();
         let decl_by_name_range = &outputs.decl_by_name_range;
-        let decl_by_fqname = &outputs.decl_by_fqname;
         let project_files: &[File] = &outputs.project_files;
         let db_handle: Box<dyn ProjectDb> = ProjectDb::dyn_clone(&self.db);
         let path_re_ref = &path_re;
@@ -2812,7 +2757,6 @@ impl ProjectContext {
                     return Vec::new();
                 }
                 let parsed = parsed_module(db, file).load(db);
-                let file_imports = collect_all_imports_local(&parsed);
                 let mut local: Vec<(String, usize, CallArgs)> = Vec::new();
                 for stmt in &parsed.syntax().body {
                     let Stmt::FunctionDef(func) = stmt else {
@@ -2845,11 +2789,7 @@ impl ProjectContext {
                         let key = (file, range_key(func.name.range()));
                         if let Some(&idx) = decl_by_name_range.get(&key) {
                             let call_args = if extract_args {
-                                call_form
-                                    .map(|c| {
-                                        extract_call_args_kwargs(c, &file_imports, decl_by_fqname)
-                                    })
-                                    .unwrap_or_default()
+                                call_form.map(extract_call_kwargs).unwrap_or_default()
                             } else {
                                 CallArgs::default()
                             };
@@ -2882,7 +2822,6 @@ impl ProjectContext {
         let path_re = _compile_path_regex(path_regex)?;
         let attrs: FxHashSet<&str> = decorator_attrs.iter().map(String::as_str).collect();
         let decl_by_name_range = &outputs.decl_by_name_range;
-        let decl_by_fqname = &outputs.decl_by_fqname;
         let project_files: &[File] = &outputs.project_files;
         let db_handle: Box<dyn ProjectDb> = ProjectDb::dyn_clone(&self.db);
         let path_re_ref = &path_re;
@@ -2896,7 +2835,6 @@ impl ProjectContext {
                     return Vec::new();
                 }
                 let parsed = parsed_module(db, file).load(db);
-                let file_imports = collect_all_imports_local(&parsed);
                 let mut local: Vec<(String, usize, CallArgs)> = Vec::new();
                 for stmt in &parsed.syntax().body {
                     let Stmt::FunctionDef(func) = stmt else {
@@ -2932,11 +2870,7 @@ impl ProjectContext {
                         let key = (file, range_key(func.name.range()));
                         if let Some(&idx) = decl_by_name_range.get(&key) {
                             let call_args = if extract_args {
-                                call_form
-                                    .map(|c| {
-                                        extract_call_args_kwargs(c, &file_imports, decl_by_fqname)
-                                    })
-                                    .unwrap_or_default()
+                                call_form.map(extract_call_kwargs).unwrap_or_default()
                             } else {
                                 CallArgs::default()
                             };
@@ -2974,7 +2908,6 @@ impl ProjectContext {
         let outputs = self.materialized("find_calls_on_attr")?;
         let path_re = _compile_path_regex(path_regex)?;
         let decl_by_name_range = &outputs.decl_by_name_range;
-        let decl_by_fqname = &outputs.decl_by_fqname;
         let module_nodes_by_file = &outputs.module_nodes_by_file;
         let project_files: &[File] = &outputs.project_files;
         let db_handle: Box<dyn ProjectDb> = ProjectDb::dyn_clone(&self.db);
@@ -2986,7 +2919,6 @@ impl ProjectContext {
                     return Vec::new();
                 }
                 let parsed = parsed_module(db, file).load(db);
-                let file_imports = collect_all_imports_local(&parsed);
                 let mut local: Vec<(usize, String, CallArgs)> = Vec::new();
                 for stmt in &parsed.syntax().body {
                     let Some(owner_idx) = owner_idx_for_stmt_with(
@@ -3000,8 +2932,6 @@ impl ProjectContext {
                     let mut finder = AttrCallFinder {
                         attr,
                         arg_index,
-                        file_imports: &file_imports,
-                        decl_by_fqname,
                         extract_args,
                         results: Vec::new(),
                     };
@@ -3117,7 +3047,6 @@ impl ProjectContext {
         let path_re = _compile_path_regex(path_regex)?;
         let allowed: FxHashSet<&str> = [name].into_iter().collect();
         let decl_by_name_range = &outputs.decl_by_name_range;
-        let decl_by_fqname = &outputs.decl_by_fqname;
         let module_nodes_by_file = &outputs.module_nodes_by_file;
         let project_files: &[File] = &outputs.project_files;
         let db_handle: Box<dyn ProjectDb> = ProjectDb::dyn_clone(&self.db);
@@ -3141,7 +3070,6 @@ impl ProjectContext {
                 if imports.is_empty() {
                     return Vec::new();
                 }
-                let file_imports = collect_all_imports_local(&parsed);
                 let mut local: Vec<(usize, String, CallArgs)> = Vec::new();
                 for stmt in &parsed.syntax().body {
                     let Some(owner_idx) = owner_idx_for_stmt_with(
@@ -3158,8 +3086,6 @@ impl ProjectContext {
                                 .is_some()
                         },
                         arg_index,
-                        file_imports: &file_imports,
-                        decl_by_fqname,
                         extract_args,
                         results: Vec::new(),
                     };
@@ -3200,7 +3126,6 @@ impl ProjectContext {
         let outputs = self.materialized("find_calls_on_var")?;
         let path_re = _compile_path_regex(path_regex)?;
         let decl_by_name_range = &outputs.decl_by_name_range;
-        let decl_by_fqname = &outputs.decl_by_fqname;
         let module_nodes_by_file = &outputs.module_nodes_by_file;
         let project_files: &[File] = &outputs.project_files;
         let db_handle: Box<dyn ProjectDb> = ProjectDb::dyn_clone(&self.db);
@@ -3215,7 +3140,6 @@ impl ProjectContext {
                     return Vec::new();
                 }
                 let parsed = parsed_module(db, file).load(db);
-                let file_imports = collect_all_imports_local(&parsed);
                 let mut local: Vec<(usize, String, CallArgs)> = Vec::new();
                 for stmt in &parsed.syntax().body {
                     let Some(owner_idx) = owner_idx_for_stmt_with(
@@ -3231,8 +3155,6 @@ impl ProjectContext {
                             call_callee_matches_var(call, owner, attr, required_positional)
                         },
                         arg_index,
-                        file_imports: &file_imports,
-                        decl_by_fqname,
                         extract_args,
                         results: Vec::new(),
                     };
@@ -3249,10 +3171,8 @@ impl ProjectContext {
     }
 }
 
-// ``find_classes_defining_method_indices`` is the rust-side helper
-// backing :class:`ClassQuery`. It's NOT exposed to Python — plugin
-// authors use the DSL:
-// ``native.query(ctx).classes().defining_method(name).indices()``.
+// ``find_classes_defining_method_indices`` is a rust-side helper
+// consumed by native plugins; it is not exposed to Python.
 impl ProjectContext {
     /// Every class that defines a method with the given name, as
     /// positional indices into ``ctx.nodes()``.
@@ -3313,10 +3233,8 @@ impl ProjectContext {
     }
 }
 
-// ``find_subclasses_of_idx`` backs :class:`SubclassQuery.of_idx`.
-// NOT exposed to Python — plugin authors use the DSL:
-// ``native.query(ctx).subclasses().of_idx(idx).indices()`` or
-// ``of_fqn(fqn)``.
+// ``find_subclasses_of_idx`` finds subclasses of a class given its
+// node index; consumed by native plugins, not exposed to Python.
 impl ProjectContext {
     /// Subclasses of the class at positional index ``class_idx`` into
     /// ``ctx.nodes()``. Bounds-checks the index and raises
@@ -3521,100 +3439,8 @@ fn transitive_subclasses_via_index(
     out
 }
 
-impl ProjectContext {
-    // ----- Convenience helpers used by the chainable QueryBuilder ----------
-
-    #[allow(clippy::type_complexity)]
-    pub(crate) fn find_decorated(
-        &self,
-        py: Python<'_>,
-        decorator_fqn: &str,
-        path_regex: Option<&str>,
-        extract_args: bool,
-    ) -> PyResult<Vec<(usize, CallArgs)>> {
-        let Some((module, name)) = decorator_fqn.rsplit_once('.') else {
-            return Err(PyValueError::new_err(format!(
-                "expected a dotted decorator fqn (e.g. 'pytest.fixture'), got {decorator_fqn:?}"
-            )));
-        };
-        let modules = [module.to_string()];
-        self.find_decorated_decls(
-            py,
-            &modules,
-            vec![name.to_string()],
-            path_regex,
-            extract_args,
-        )
-    }
-
-    #[allow(clippy::type_complexity)]
-    pub(crate) fn find_constructions(
-        &self,
-        py: Python<'_>,
-        class_fqn: &str,
-        include_subclasses: bool,
-        path_regex: Option<&str>,
-        extract_args: bool,
-    ) -> PyResult<Vec<(usize, CallArgs)>> {
-        let Some((module, name)) = class_fqn.rsplit_once('.') else {
-            return Err(PyValueError::new_err(format!(
-                "expected a dotted class fqn, got {class_fqn:?}"
-            )));
-        };
-        let mut ctors: Vec<String> = vec![name.to_string()];
-        if include_subclasses {
-            let sub_idxs = self.find_subclasses_indices(py, class_fqn, true)?;
-            let outputs = self.materialized("find_constructions.subclasses")?;
-            for idx in sub_idxs {
-                let simple = outputs.builder.nodes[idx]
-                    .fqname
-                    .rsplit('.')
-                    .next()
-                    .unwrap_or("")
-                    .to_string();
-                if !simple.is_empty() && !ctors.contains(&simple) {
-                    ctors.push(simple);
-                }
-            }
-        }
-        let modules = [module.to_string()];
-        let triples =
-            self.find_instance_constructions(py, &modules, ctors, path_regex, extract_args)?;
-        Ok(triples
-            .into_iter()
-            .map(|(idx, _name, call_args)| (idx, call_args))
-            .collect())
-    }
-
-    #[allow(clippy::type_complexity)]
-    pub(crate) fn find_decorations_on(
-        &self,
-        py: Python<'_>,
-        instance: &GraphNode,
-        method_names: Vec<String>,
-        path_regex: Option<&str>,
-        extract_args: bool,
-    ) -> PyResult<Vec<(usize, CallArgs)>> {
-        let instance_simple = instance.fqname.rsplit('.').next().unwrap_or("").to_string();
-        let handlers = self.find_handler_decorators(py, method_names, path_regex, extract_args)?;
-        let outputs = self.materialized("find_decorations_on")?;
-        let mut out: Vec<(usize, CallArgs)> = Vec::new();
-        for (owner_name, handler_idx, call_args) in handlers {
-            if owner_name != instance_simple {
-                continue;
-            }
-            if outputs.builder.nodes[handler_idx].path != instance.path {
-                continue;
-            }
-            out.push((handler_idx, call_args));
-        }
-        Ok(out)
-    }
-}
-
-// ``find_subclasses_indices`` backs :class:`SubclassQuery`.
-// NOT exposed to Python — plugin authors use the DSL:
-// ``native.query(ctx).subclasses().of_fqn(fqn).indices()``.
+// ``find_subclasses_indices`` is consumed by native plugins (e.g. the
+// init_subclass plugin); it is not exposed to Python.
 impl ProjectContext {
     /// Subclasses of the class addressed by ``base_fqn``, as positional
     /// indices into ``ctx.nodes()``.
@@ -3850,13 +3676,11 @@ impl ProjectContext {
     }
 
     /// Flat-form predicate filter returning positional indices into
-    /// ``ctx.nodes()``. Mirrors the :class:`DeclQuery` predicate
-    /// vocabulary (``kind`` / ``kinds`` / ``filename`` /
-    /// ``filenames`` / ``simple_name`` / ``simple_names`` / ``paths``
-    /// / ``path_regex`` / ``flags`` / ``flags_any`` /
-    /// ``fqname_prefix``) but skips the builder construction —
-    /// useful when you only have one filter step and just need a
-    /// ``list[int]`` of indices.
+    /// ``ctx.nodes()``. Accepts the predicate vocabulary (``kind`` /
+    /// ``kinds`` / ``filename`` / ``filenames`` / ``simple_name`` /
+    /// ``simple_names`` / ``paths`` / ``path_regex`` / ``flags`` /
+    /// ``flags_any`` / ``fqname_prefix``) directly — no builder, just
+    /// the one filter step yielding a ``list[int]`` of indices.
     ///
     /// Every parameter is keyword-only and optional; unset arguments
     /// don't filter. ``kind`` and ``kinds`` (and similarly ``filename``

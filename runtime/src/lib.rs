@@ -41,7 +41,7 @@ use pyo3::prelude::*;
 
 use crate::builder::CollectedOps;
 use crate::graph::{EdgeFlags, Import, NativeGraph, NodeFlags, SymbolNode};
-use crate::helpers::{ArgLiteral, ArgNodeRef, ArgOpaque, NodeAttrs};
+use crate::helpers::NodeAttrs;
 use crate::io::{read_graph, write_graph, GraphMetadata};
 use crate::native_plugins::{
     _builtin_native_plugin, _main_block_run_count, _reset_main_block_run_count,
@@ -49,20 +49,6 @@ use crate::native_plugins::{
 };
 use crate::progress::ProgressHandle;
 use crate::project::{ChangeEvent, Project, ProjectContext};
-use crate::query::{
-    CallIdxRef, CallQuery, ClassQuery, ConstructionIdxRef, ConstructionQuery, DeclQuery,
-    DeclarationsQuery, DecoratorIdxRef, DecoratorQuery, EdgeQuery, FactoryIdxRef, FactoryQuery,
-    ImportQuery, LiteralListQuery, MainBlockQuery, ModuleQuery, QueryBuilder, SubclassQuery,
-    TraverseQuery,
-};
-
-/// Module-level alias for ``ctx.query()`` — exists for the ergonomic
-/// ``from dead_cst import _native as native; native.query(ctx)...``
-/// idiom that the plugins rely on.
-#[pyfunction(name = "query")]
-fn query_fn(slf: Py<ProjectContext>, _py: Python<'_>) -> QueryBuilder {
-    QueryBuilder { ctx: slf }
-}
 
 /// Register every pyclass + function on the `_native` module object. The
 /// `#[pymodule]` entry point lives in the thin `dead-cst-native` cdylib
@@ -78,32 +64,9 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<NativePlugin>()?;
     m.add_class::<NodeFlags>()?;
     m.add_class::<EdgeFlags>()?;
-    m.add_class::<DecoratorIdxRef>()?;
-    m.add_class::<ConstructionIdxRef>()?;
-    m.add_class::<CallIdxRef>()?;
-    m.add_class::<ArgLiteral>()?;
-    m.add_class::<ArgNodeRef>()?;
-    m.add_class::<ArgOpaque>()?;
     m.add_class::<NodeAttrs>()?;
-    m.add_class::<QueryBuilder>()?;
-    m.add_class::<DecoratorQuery>()?;
-    m.add_class::<ConstructionQuery>()?;
-    m.add_class::<CallQuery>()?;
-    m.add_class::<SubclassQuery>()?;
-    m.add_class::<ImportQuery>()?;
-    m.add_class::<ModuleQuery>()?;
-    m.add_class::<ClassQuery>()?;
-    m.add_class::<FactoryQuery>()?;
-    m.add_class::<FactoryIdxRef>()?;
-    m.add_class::<EdgeQuery>()?;
-    m.add_class::<DeclQuery>()?;
-    m.add_class::<DeclarationsQuery>()?;
-    m.add_class::<MainBlockQuery>()?;
-    m.add_class::<LiteralListQuery>()?;
-    m.add_class::<TraverseQuery>()?;
     m.add_class::<GraphMetadata>()?;
     m.add_class::<ProgressHandle>()?;
-    m.add_function(wrap_pyfunction!(query_fn, m)?)?;
     m.add_function(wrap_pyfunction!(write_graph, m)?)?;
     m.add_function(wrap_pyfunction!(read_graph, m)?)?;
     m.add_function(wrap_pyfunction!(_main_block_run_count, m)?)?;

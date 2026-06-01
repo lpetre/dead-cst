@@ -12,9 +12,9 @@
 //!   decorated decls, which pipe straight into [`FileOps::keep_alive`].
 //!
 //! No raw `parsed()` walk, no re-implementing import/alias resolution: the
-//! query reuses the same matcher the in-tree project-wide
-//! `query(ctx).decorators()` DSL is built on, so this per-file plugin and a
-//! project-wide twin agree on what matches.
+//! query reuses the same decorator matcher core the in-tree project-wide
+//! native plugins drive, so this per-file plugin and a project-wide twin
+//! agree on what matches.
 //!
 //! Build it with
 //! `dead-cst build-plugin examples/per_file_decorated/src/lib.rs` and load it

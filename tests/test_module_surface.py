@@ -1,40 +1,33 @@
-"""Tests for the fqname-tree-backed ``ModuleQuery.surface`` /
-``ModuleQuery.top_level`` DSL terminals and the matching
-``DeclQuery.with_fqname_under`` predicate.
+"""Tests for the fqname-tree-backed module-surface pymethods on
+:class:`ProjectContext`:
 
-All three are backed by ``BuildOutputs.children_by_parent``, a parent
+* ``ctx.module_surface_indices(M)``: module ``M`` plus every transitive
+  descendant in the fqname tree. Decls under ``M`` are included but
+  their sub-fqnames (synthetic method-of-class names, etc.) are NOT
+  recursed into — the BFS only steps through module children.
+* ``ctx.find_module_top_level_decls_indices(M)``: just the immediate
+  top-level decls (non-module children of ``M``). Submodules are
+  excluded.
+
+Both are backed by ``BuildOutputs.children_by_parent``, a parent
 fqname -> [child node idx] index built in ``build_fqname_indices``.
-The behavior contracts these tests pin:
-
-* ``modules().with_fqn(M).surface()``: module ``M`` plus every
-  transitive descendant in the fqname tree. Decls under ``M`` are
-  included but their sub-fqnames (synthetic method-of-class names,
-  etc.) are NOT recursed into — the BFS only steps through module
-  children.
-* ``modules().with_fqn(M).top_level()``: just the immediate top-level
-  decls (non-module children of ``M``). Submodules are excluded.
-* ``DeclQuery.with_fqname_under(P)``: ``P`` itself plus every
-  segment-bounded descendant. Distinct from
-  ``with_fqname_prefix(P)`` which is raw ``starts_with``.
 """
 
 from __future__ import annotations
 
-from dead_cst import _native as native
-
 
 def _surface_fqnames(ctx, fqn: str) -> set[str]:
-    idxs = native.query(ctx).modules().with_fqn(fqn).surface().indices()
+    idxs = ctx.module_surface_indices(fqn)
     return {n.fqname for n in ctx.nodes_at(idxs)}
 
 
 def _top_level_fqnames(ctx, fqn: str) -> set[str]:
-    idxs = native.query(ctx).modules().with_fqn(fqn).top_level().indices()
+    idxs = ctx.find_module_top_level_decls_indices(fqn)
     return {n.fqname for n in ctx.nodes_at(idxs)}
 
 
 # ---------------------------------------------------------------------------
-# ModuleQuery.surface
+# module_surface_indices
 # ---------------------------------------------------------------------------
 
 
@@ -74,9 +67,9 @@ def test_module_surface_includes_transitive_submodules(build_decl_graph):
 
 
 def test_module_surface_segment_bounded(build_decl_graph):
-    """``surface(pkg.foo)`` must NOT pick up ``pkg.foobar`` — the old
-    linear-prefix-scan would have. The fqname-tree BFS is
-    segment-bounded by construction."""
+    """``module_surface_indices(pkg.foo)`` must NOT pick up
+    ``pkg.foobar`` — the old linear-prefix-scan would have. The
+    fqname-tree BFS is segment-bounded by construction."""
     ctx = build_decl_graph(
         {
             "pkg/__init__.py": "",
@@ -93,7 +86,7 @@ def test_module_surface_segment_bounded(build_decl_graph):
 
 def test_module_surface_unknown_module_returns_empty(build_decl_graph):
     ctx = build_decl_graph({"pkg/__init__.py": "", "pkg/a.py": "def f(): ...\n"})
-    assert native.query(ctx).modules().with_fqn("does.not.exist").surface().indices() == []
+    assert ctx.module_surface_indices("does.not.exist") == []
 
 
 def test_module_surface_does_not_recurse_into_decls(build_decl_graph):
@@ -117,7 +110,7 @@ def test_module_surface_does_not_recurse_into_decls(build_decl_graph):
 
 
 # ---------------------------------------------------------------------------
-# ModuleQuery.top_level
+# find_module_top_level_decls_indices
 # ---------------------------------------------------------------------------
 
 
@@ -152,7 +145,7 @@ def test_top_level_does_not_descend(build_decl_graph):
 
 
 def test_top_level_segment_bounded(build_decl_graph):
-    """Same segment-bounded guarantee as ``surface``: the sibling
+    """Same segment-bounded guarantee as the surface query: the sibling
     ``pkg.foobar`` is not pulled in by querying ``pkg.foo``."""
     ctx = build_decl_graph(
         {
@@ -169,99 +162,4 @@ def test_top_level_segment_bounded(build_decl_graph):
 
 def test_top_level_unknown_module_returns_empty(build_decl_graph):
     ctx = build_decl_graph({"pkg/__init__.py": "", "pkg/a.py": "def f(): ...\n"})
-    assert native.query(ctx).modules().with_fqn("does.not.exist").top_level().indices() == []
-
-
-# ---------------------------------------------------------------------------
-# DeclQuery.with_fqname_under (new) vs with_fqname_prefix (raw)
-# ---------------------------------------------------------------------------
-
-
-def test_with_fqname_under_segment_bounded(build_decl_graph):
-    """``with_fqname_under("pkg.foo")`` matches ``pkg.foo`` and its
-    descendants — but NOT the sibling ``pkg.foobar``."""
-    ctx = build_decl_graph(
-        {
-            "pkg/__init__.py": "",
-            "pkg/foo/__init__.py": "A = 1\n",
-            "pkg/foo/inner.py": "B = 2\n",
-            "pkg/foobar.py": "C = 3\n",
-        }
-    )
-    fqnames = {r.fqname for r in native.query(ctx).decls().with_fqname_under("pkg.foo").attrs()}
-    assert "pkg.foo.A" in fqnames
-    assert "pkg.foo.inner.B" in fqnames
-    assert "pkg.foobar" not in fqnames
-    assert "pkg.foobar.C" not in fqnames
-
-
-def test_with_fqname_under_includes_root_module(build_decl_graph):
-    """The module ``pkg.foo`` itself is included (when its kind isn't
-    filtered out), not just its descendants."""
-    ctx = build_decl_graph(
-        {
-            "pkg/__init__.py": "",
-            "pkg/foo/__init__.py": "A = 1\n",
-        }
-    )
-    rows = (
-        native.query(ctx)
-        .decls()
-        .with_fqname_under("pkg.foo")
-        .with_kinds(["module", "variable"])
-        .attrs()
-    )
-    fqnames = {r.fqname for r in rows}
-    assert "pkg.foo" in fqnames
-    assert "pkg.foo.A" in fqnames
-
-
-def test_with_fqname_under_unknown_parent_yields_empty(build_decl_graph):
-    ctx = build_decl_graph(
-        {
-            "pkg/__init__.py": "",
-            "pkg/a.py": "def f(): ...\n",
-        }
-    )
-    indices = native.query(ctx).decls().with_fqname_under("does.not.exist").indices()
-    assert indices == []
-
-
-def test_with_fqname_prefix_remains_raw_starts_with(build_decl_graph):
-    """``with_fqname_prefix`` is documented as raw ``starts_with``;
-    this test pins that behavior so the segment-bounded
-    ``with_fqname_under`` doesn't accidentally take its place."""
-    ctx = build_decl_graph(
-        {
-            "pkg/__init__.py": "",
-            "pkg/foo/__init__.py": "A = 1\n",
-            "pkg/foobar.py": "C = 3\n",
-        }
-    )
-    fqnames = {
-        r.fqname
-        for r in native.query(ctx).decls().with_kind("module").with_fqname_prefix("pkg.foo").attrs()
-    }
-    # Raw starts_with picks up both ``pkg.foo`` AND ``pkg.foobar``.
-    assert "pkg.foo" in fqnames
-    assert "pkg.foobar" in fqnames
-
-
-def test_with_fqname_under_composes_with_other_predicates(build_decl_graph):
-    """Predicates AND together. ``with_fqname_under("pkg") &
-    with_kind("function")`` yields only function decls under pkg."""
-    ctx = build_decl_graph(
-        {
-            "pkg/__init__.py": "",
-            "pkg/a.py": """
-            def foo(): ...
-            X = 1
-            class Klass: ...
-            """,
-        }
-    )
-    fqnames = {
-        r.fqname
-        for r in native.query(ctx).decls().with_fqname_under("pkg").with_kind("function").attrs()
-    }
-    assert fqnames == {"pkg.a.foo"}
+    assert ctx.find_module_top_level_decls_indices("does.not.exist") == []

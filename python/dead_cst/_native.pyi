@@ -10,7 +10,6 @@ mirrors the rust-side rustdoc, and a behavior change in the crate
 should land in both places at once.
 """
 
-import re
 from typing import TYPE_CHECKING, Any, Iterable, Iterator, Literal, Sequence
 
 if TYPE_CHECKING:
@@ -763,38 +762,12 @@ class ProjectContext:
         once every plugin future has resolved."""
         ...
 
-    def query(self) -> QueryBuilder:
-        """Open a chainable query builder against this context.
-
-        Sugar for ``query(ctx)`` — same return value, picked up by
-        ``__init__.py`` from the rust module surface."""
-        ...
-
-    # Decorator / construction / call queries route through
-    # :meth:`query` and the builder API (``DecoratorQuery`` /
-    # ``ConstructionQuery`` / ``CallQuery`` below). The legacy
-    # ``find_decorated`` / ``find_constructions`` / ``find_decorations_on``
-    # / ``find_decorated_decls`` / ``find_instance_constructions`` /
-    # ``find_handler_decorators`` / ``find_handler_decorators_via`` /
-    # ``find_calls_on_attr`` / ``find_calls_to_imported`` /
-    # ``find_calls_on_var`` methods are no longer part of the public
-    # type-stub contract; use ``query(ctx)`` instead.
-
-    # The subclass-walk surface lives entirely on
-    # :class:`SubclassQuery`. The point-lookup helpers that backed it
-    # are rust-internal — plugin authors use the DSL:
-    # ``native.query(ctx).subclasses().of_fqn(fqn).indices()`` or
-    # ``.of_idx(idx).indices()``.
-
     # ----- FQN resolution ------------------------------------------------
     #
-    # Plugins use the DSL: ``query(ctx).declarations()`` for fqname
-    # → decl lookup, ``query(ctx).modules()`` for module fqname /
-    # path lookup, surface / top-level / dunder-all transforms, and
-    # ``query(ctx).literal_lists().for_fqn(fqn).entries()`` for
-    # module-scope string-literal lists. The flat idx-form helpers
-    # below back those DSL terminals and stay on :class:`ProjectContext`
-    # as a low-level escape hatch.
+    # Flat idx-form lookups: fqname → decl, module fqname / path →
+    # module idx, surface / top-level / dunder-all transforms, and
+    # module-scope string-literal lists. Plugins and
+    # :class:`dead_cst.Analysis` call these directly.
 
     def resolve_idx(self, fqname: str) -> int | None:
         """First decl matching ``fqname``, falling back to the module
@@ -885,11 +858,8 @@ class ProjectContext:
 
     # ----- Path / name filters ------------------------------------------
     #
-    # Plugins use the DSL: ``query(ctx).decls()`` with the
-    # ``with_path_prefix`` / ``with_path_contains`` / ``with_simple_name_regex``
-    # predicates; ``query(ctx).matching_specs(...)`` for the
-    # OR-form entrypoint matcher. The idx-form helpers below back
-    # those DSL terminals as low-level escape hatches.
+    # Idx-form path / name / spec matchers, consumed by the entrypoint
+    # and discovery plugins and by :class:`dead_cst.Analysis`.
 
     def decls_under_indices(self, path_prefix: str) -> list[int]:
         """Every node whose ``path`` starts with ``path_prefix``.
@@ -964,8 +934,7 @@ class ProjectContext:
         with different :class:`EdgeFlags` between the same two nodes
         only produces one entry. ``skip_flags`` filters edges by
         intersecting flag mask — same semantics as
-        :meth:`ancestors_indices`. Plugins use the DSL:
-        ``native.query(ctx).from_idx(idx).direct_predecessors()``.
+        :meth:`ancestors_indices`.
         """
         ...
 
@@ -1000,9 +969,9 @@ class ProjectContext:
         fqname_prefix: str | None = None,
     ) -> list[int]:
         """Flat-form predicate filter returning positional indices into
-        :meth:`nodes`. Mirrors the :class:`DeclQuery` predicate
-        vocabulary but skips the builder construction — useful when
-        you only have one filter step and just need a ``list[int]``.
+        :meth:`nodes`. A single-call attribute predicate — compose as
+        many of the parameters as you need when you just want a
+        ``list[int]``.
 
         Every parameter is keyword-only and optional; unset arguments
         don't filter. ``kind`` / ``kinds`` (and similarly the
@@ -1014,8 +983,8 @@ class ProjectContext:
         ...
 
     def nodes_at(self, indices: Sequence[int]) -> list[SymbolNode]:
-        """Inverse of the ``.indices()`` terminals: materialize
-        specific nodes by their positional indices into :meth:`nodes`.
+        """Inverse of the ``*_indices`` queries: materialize specific
+        nodes by their positional indices into :meth:`nodes`.
         Validates bounds and raises :class:`IndexError` when any index
         is out of range.
         """
@@ -1095,20 +1064,14 @@ class ProjectContext:
 
     # ----- Pure scans over the in-progress graph ------------------------
     #
-    # Plugins use the DSL: ``query(ctx).modules().with_dunders().indices()``
-    # for module-dunder enumeration, ``query(ctx).main_blocks().index_pairs()``
-    # for ``if __name__ == "__main__":`` blocks. The idx-form helpers
-    # below back those DSL terminals.
+    # Idx-form scans over already-interned nodes — module-dunder
+    # enumeration and ``if __name__ == "__main__":`` block discovery.
 
     def find_module_dunders_indices(self) -> list[int]:
         """Every top-level variable / function node whose name matches
         ``__xxx__``. Pure scan over already-interned nodes — no ty
         re-query needed."""
         ...
-
-    # The import-of-module surface lives entirely on
-    # :class:`ImportQuery`. Use ``native.query(ctx).imports().of(m)``
-    # then ``.collect()`` / ``.indices()`` / ``.count()`` / ``.exists()``.
 
     def find_main_blocks_indices(self) -> list[tuple[int, list[int]]]:
         """``(module_idx, [decl_idx])`` pairs into :meth:`nodes` for
@@ -1119,17 +1082,13 @@ class ProjectContext:
         """
         ...
 
-    # The class-defining-method surface lives on :class:`ClassQuery`.
-    # Use ``native.query(ctx).classes().defining_method(name).collect()`` /
-    # ``.indices()``.
-
     # ----- Decorator / construction shapes (syntactic walks) ------------
     #
-    # These three queries (``find_decorated_decls``,
-    # ``find_instance_constructions``, ``find_calls_to_imported``)
-    # match upstream callables / classes by their *bare name* combined
-    # with a per-file import check — they deliberately do **not** route
-    # through ty's module resolver.
+    # ``find_factory_decls`` here, plus the rust-internal decorator /
+    # construction / call walks the native plugins drive, match upstream
+    # callables / classes by their *bare name* combined with a per-file
+    # import check — they deliberately do **not** route through ty's
+    # module resolver.
     #
     # The reason is contract-level: these queries underpin plugins for
     # third-party frameworks (``celery``, ``flask``, ``fastapi``,
@@ -1159,23 +1118,13 @@ class ProjectContext:
     # ``shared_task = celery.shared_task``) is the only place the ty
     # path would catch something the syntactic path misses; today no
     # plugin needs that.
-
-    # The decorator / construction / call queries that used to live
-    # here (``find_decorated_decls``, ``find_instance_constructions``,
-    # ``find_handler_decorators``, ``find_handler_decorators_via``,
-    # ``find_calls_on_attr``, ``find_calls_to_imported``,
-    # ``find_calls_on_var``) are no longer part of the public type-stub
-    # contract. Use the builder API instead:
-    # ``query(ctx).decorators().where_module(...).where_name(...)``,
-    # ``query(ctx).constructions().where_module(...).where_name(...)``,
-    # ``query(ctx).calls().where_module(...).where_name(...).string_arg_at(...)``,
-    # etc. See :class:`DecoratorQuery` / :class:`ConstructionQuery` /
-    # :class:`CallQuery` below for the full predicate vocabulary.
     #
-    # The rust pyo3 methods still exist at runtime — they're the
-    # underlying impl the builder dispatches into — but they aren't
-    # exposed in this stub. A follow-up cleanup will move them out of
-    # ``#[pymethods]`` so they're rust-internal too.
+    # The decorator / construction / call walks (``find_decorated_decls``,
+    # ``find_instance_constructions``, ``find_handler_decorators``,
+    # ``find_calls_on_attr``, ``find_calls_to_imported``,
+    # ``find_calls_on_var``) are rust-internal — the native plugins call
+    # them directly, so they're not part of this stub. ``find_factory_decls``
+    # is the one shape still surfaced to Python.
 
     def find_factory_decls(
         self, module: str, ctor_names: list[str]
@@ -1190,10 +1139,9 @@ class ProjectContext:
         single factory constructs more than one (e.g. a function that
         returns a ``Flask`` after mounting several ``Blueprint``\\ s).
 
-        Not yet wrapped by the builder API — the only caller is the
-        native dispatch-app impl (``NativePlugin.flask()`` and friends)
-        and it uses this shape directly. Likely candidate for a
-        ``ConstructionQuery.inside_factory()`` predicate in a follow-up.
+        The only caller is the native dispatch-app impl
+        (``NativePlugin.flask()`` and friends), which uses this shape
+        directly.
         """
         ...
 
@@ -1220,51 +1168,10 @@ class ProjectContext:
         """Live edges as ``(src_idx, dst_idx, flags)`` triples."""
         ...
 
-# ---------- Builder query API ---------------------------------------------
-#
-# Phase 3 surface: rust pyclasses with the chainable predicate API.
-# ``collect()`` walks ``project_files`` via the underlying ``find_*``
-# pyo3 helpers (now internal — removed from the public stub above) and
-# ``where_path(regex)`` is fused into each helper's file-iteration
-# loop so unrelated files skip parsing entirely. A follow-up will
-# also move the ``find_*`` methods out of ``#[pymethods]`` and inline
-# their bodies into each query's ``collect()`` directly.
-
-class ArgLiteral:
-    """A literal arg / kwarg value. ``value`` is a native Python
-    primitive: ``str`` / ``int`` / ``float`` / ``bool`` / ``None`` /
-    ``bytes`` / ``list`` / ``tuple``. Nested ``list`` / ``tuple``
-    elements are themselves :class:`ArgLiteral` / :class:`ArgNodeRef`
-    / :class:`ArgOpaque` instances (the discriminated union recurses).
-    """
-
-    value: Any
-
-class ArgNodeRef:
-    """A decl reference inside an arg / kwarg position.
-
-    Materialised when the expression at that position resolves through
-    the file's imports to a project decl — e.g. ``func(SomeClass)``
-    where ``SomeClass`` is imported. ``idx`` is a positional index
-    into :meth:`ProjectContext.nodes`; pair with
-    :meth:`ProjectContext.node_attrs` to consume it without leaving
-    idx-space.
-    """
-
-    idx: int
-
-class ArgOpaque:
-    """An arg / kwarg expression that's neither a recognised literal
-    nor a statically-resolvable decl reference. Callers who need the
-    source text should fall back to ty's parsed module — the rust
-    extractor doesn't preserve unresolved expressions verbatim.
-    """
-
-    def __init__(self) -> None: ...
+# ---------- Node-attribute rows ------------------------------------------
 
 class NodeAttrs:
-    """Tuple-like row returned by :meth:`ProjectContext.node_attrs`
-    and every query's ``.attrs()`` terminal.
+    """Tuple-like row returned by :meth:`ProjectContext.node_attrs`.
 
     Supports both attribute access (``attr.fqname``) and tuple
     semantics (``kind, path, fqname, flags = attr``; ``attr[2]``;
@@ -1281,839 +1188,6 @@ class NodeAttrs:
     def __len__(self) -> int: ...
     def __getitem__(self, idx: int) -> Any: ...
     def __iter__(self) -> Iterator[Any]: ...
-
-CallArg = ArgLiteral | ArgNodeRef | ArgOpaque
-"""Discriminated-union type for entries inside the lazy ``args`` /
-``kwargs`` getters on :class:`DecoratorIdxRef` / :class:`ConstructionIdxRef`
-/ :class:`CallIdxRef`. Use ``isinstance`` or ``match`` to dispatch:
-
-.. code-block:: python
-
-    for arg in row.kwargs.values():
-        match arg:
-            case native.ArgLiteral(value=str() as s):
-                ...
-            case native.ArgNodeRef(idx=i):
-                ...
-            case native.ArgOpaque():
-                ...
-"""
-
-class DecoratorIdxRef:
-    """One decorator application on a top-level function or class.
-
-    Field nullability follows the query shape that produced the row:
-
-    * ``where_module + where_name`` populates ``decorated_idx`` only.
-    * ``where_owner_attr`` fills ``decorator_owner`` (the textual
-      ``@<owner>.<attr>`` prefix).
-    * ``where_owner_attr_via`` additionally fills ``decorator_via``
-      with the middle attribute name.
-
-    ``args`` and ``kwargs`` are **lazy** — accessing them walks the
-    row's rust-side ``CallArgs`` and materialises a Python ``list`` /
-    ``dict`` of :class:`ArgLiteral` / :class:`ArgNodeRef` /
-    :class:`ArgOpaque`. Plugins that never touch them pay zero Python
-    allocation cost for the args payload. Bare-attribute decorators
-    (``@app.route`` without ``()``) get empty containers.
-
-    Returned by :meth:`DecoratorQuery.collect`.
-    """
-
-    decorated_idx: int
-    path: str
-    decorator_name: str | None
-    decorator_owner: str | None
-    decorator_via: str | None
-
-    @property
-    def args(self) -> list[CallArg]: ...
-    @property
-    def kwargs(self) -> dict[str, CallArg]: ...
-
-class ConstructionIdxRef:
-    """One ``<var> = <Ctor>(...)`` construction at module scope.
-
-    ``class_name`` is the upstream constructor's bare name (``"Flask"``
-    even when imported as ``F``). ``args`` / ``kwargs`` are the
-    constructor call's positional / keyword arguments — lazy getters,
-    same discriminated-union shape as :class:`DecoratorIdxRef`.
-
-    Returned by :meth:`ConstructionQuery.collect`.
-    """
-
-    var_idx: int
-    path: str
-    class_name: str
-
-    @property
-    def args(self) -> list[CallArg]: ...
-    @property
-    def kwargs(self) -> dict[str, CallArg]: ...
-
-class CallIdxRef:
-    """One matched call site.
-
-    ``string_arg`` is the positional string literal at the index passed
-    to :meth:`CallQuery.string_arg_at`. ``args`` / ``kwargs`` are the
-    call's full positional / keyword arguments — lazy getters, same
-    discriminated-union shape as :class:`DecoratorIdxRef`.
-
-    Returned by :meth:`CallQuery.collect`.
-    """
-
-    owner_idx: int
-    path: str
-    string_arg: str
-
-    @property
-    def args(self) -> list[CallArg]: ...
-    @property
-    def kwargs(self) -> dict[str, CallArg]: ...
-
-class FactoryIdxRef:
-    """One factory-function / class hit. ``decl_idx`` is the owning
-    top-level decl's positional index into :meth:`ProjectContext.nodes`;
-    ``kinds`` is the sorted set of constructor bare-names matched
-    inside its body. ``path`` is the decl's source file as a cheap
-    bucket key for per-file fan-out.
-
-    Returned by :meth:`FactoryQuery.collect`.
-    """
-
-    decl_idx: int
-    path: str
-    kinds: list[str]
-
-def query(ctx: ProjectContext) -> QueryBuilder:
-    """Open a chainable query builder against ``ctx``.
-
-    Equivalent to :meth:`ProjectContext.query`; exists so plugins can
-    write ``query(ctx).decorators()...`` without first dereferencing
-    the method.
-    """
-    ...
-
-class QueryBuilder:
-    """Entry point for the chainable query API.
-
-    Every terminal returns positional indices into
-    :meth:`ProjectContext.nodes` (or one of the ``IdxRef`` row types
-    that carry an idx + per-row metadata for decorator / construction
-    / call / factory rows). Pair index returns with
-    :meth:`ProjectContext.nodes_at` / :meth:`node_attrs` to revive
-    :class:`SymbolNode` / :class:`NodeAttrs` fields on demand.
-
-    Filtered streams:
-    :meth:`decorators` / :meth:`constructions` / :meth:`calls` /
-    :meth:`subclasses` / :meth:`imports` / :meth:`classes` /
-    :meth:`factories` / :meth:`edges`.
-
-    Point lookups (e.g. :meth:`ProjectContext.find_main_blocks`,
-    :meth:`ProjectContext.find_comment_patterns`,
-    :meth:`ProjectContext.find_literal_list_entries`) live directly on
-    :class:`ProjectContext`.
-    """
-
-    def decorators(self) -> DecoratorQuery: ...
-    def constructions(self) -> ConstructionQuery: ...
-    def calls(self) -> CallQuery: ...
-    def subclasses(self) -> SubclassQuery: ...
-    def imports(self) -> ImportQuery: ...
-    def modules(self) -> ModuleQuery: ...
-    def classes(self) -> ClassQuery: ...
-    def factories(self) -> FactoryQuery: ...
-    def edges(self) -> EdgeQuery: ...
-    def decls(self) -> DeclQuery: ...
-    def declarations(self) -> DeclarationsQuery: ...
-    def main_blocks(self) -> MainBlockQuery: ...
-    def literal_lists(self) -> LiteralListQuery: ...
-    def from_idx(self, seed_idx: int) -> TraverseQuery:
-        """Anchor a closure walk on a single seed. Returns a
-        :class:`TraverseQuery` whose terminals (``descendants`` /
-        ``ancestors`` / ``direct_predecessors``) return positional
-        indices into :meth:`ProjectContext.nodes`.
-        """
-        ...
-
-    def reachable(self, *, skip_flags: int = 0, seed_flags: int | None = None) -> list[int]:
-        """Seedless reachability terminal. Forward closure from every
-        node carrying any bit in ``seed_flags`` (default:
-        ``NodeFlags.ENTRYPOINT``), filtering edges by ``skip_flags``.
-        Returns positional indices into :meth:`ProjectContext.nodes`.
-        """
-        ...
-
-    def matching_specs(
-        self,
-        project_root: str,
-        *,
-        regexes: list[str] = ...,
-        str_specs: list[str] = ...,
-        abs_paths: list[str] = ...,
-    ) -> list[int]:
-        """OR-form spec matcher (used by the native explicit-entrypoint
-        plugin, ``NativePlugin.explicit()``). A node matches if any of:
-
-        * ``regexes`` contains a pattern matching the node's path
-          relative to ``project_root`` (anchored, ``re.match`` style);
-        * ``str_specs`` contains the node's relative path or fqname;
-        * ``abs_paths`` contains the node's absolute path.
-
-        Returns positional indices into :meth:`ProjectContext.nodes`.
-        """
-        ...
-
-class DecoratorQuery:
-    """Find decorated top-level functions / classes. Pick exactly one
-    of the four decorator-shape predicates per chain — mixing raises
-    ``ValueError`` at ``collect()`` time."""
-
-    def where_module(self, module: str | list[str]) -> DecoratorQuery:
-        """Filter decorators to those resolved through an import of
-        ``module``. Pass a list to match any of several modules (OR
-        semantics — useful for framework-family predicates like
-        ``["flask", "quart"]``). A single string is the common case
-        and stays supported.
-        """
-        ...
-
-    def where_callee(self, fqn: str) -> DecoratorQuery: ...
-    def where_name(self, names: str | list[str] | tuple[str, ...]) -> DecoratorQuery: ...
-    def where_owner_attr(self, attrs: str | list[str] | tuple[str, ...]) -> DecoratorQuery: ...
-    def where_owner_attr_via(
-        self, via: str, attrs: str | list[str] | tuple[str, ...]
-    ) -> DecoratorQuery: ...
-    def in_decl_idx(self, idx: int) -> DecoratorQuery:
-        """Anchor the decorator search on the decl at positional index
-        ``idx`` into :meth:`ProjectContext.nodes`. Pairs with
-        :meth:`where_name` to match ``@<owner>.<name>`` same-file
-        instance-method decorators where ``<owner>`` is the decl at
-        ``idx``. Raises :class:`IndexError` at terminal time when
-        ``idx`` is out of range.
-        """
-        ...
-    def where_path(self, regex: str) -> DecoratorQuery: ...
-    def where_kwarg(self, name: str, value: Any) -> DecoratorQuery:
-        """Filter to decorator calls whose ``name=value`` kwarg matches.
-
-        Multiple ``.where_kwarg`` calls AND together. ``value`` must
-        be a Python literal (``None`` / ``bool`` / ``int`` /
-        ``float`` / ``str`` / ``list`` / ``tuple``). A missing kwarg
-        on the call never matches. A non-literal kwarg expression
-        never matches.
-        """
-        ...
-
-    def with_args(self, value: bool) -> DecoratorQuery:
-        """Opt in to rust-side ``args`` / ``kwargs`` extraction.
-
-        Defaults to ``False`` — the per-row
-        :fn:`extract_call_args_kwargs` walk is skipped, and the
-        row's ``args`` / ``kwargs`` getters surface empty containers.
-        Pass ``True`` when a plugin actually reads ``args`` /
-        ``kwargs`` off the matched rows.
-
-        Auto-forced back to ``True`` at row-collection time when any
-        ``where_kwarg`` is set (kwarg filtering needs the data).
-        """
-        ...
-
-    def collect(self) -> list[DecoratorIdxRef]: ...
-    def first(self) -> DecoratorIdxRef | None: ...
-    def count(self) -> int: ...
-    def __iter__(self) -> Iterator[DecoratorIdxRef]: ...
-    def indices_by_path(self) -> dict[str, list[int]]:
-        """Terminal — group matched ``decorated_idx`` values by their
-        owning file path. ``dict[path, list[int]]``; reads ``path``
-        straight off each row.
-        """
-        ...
-
-class ConstructionQuery:
-    """Find module-scope ``<var> = <Ctor>(...)`` sites."""
-
-    def where_module(self, module: str | list[str]) -> ConstructionQuery:
-        """Filter constructions to those whose constructor is imported
-        from ``module``. Pass a list to match any of several modules
-        (OR semantics).
-        """
-        ...
-
-    def where_name(self, names: str | list[str] | tuple[str, ...]) -> ConstructionQuery: ...
-    def where_class(self, fqn: str, *, include_subclasses: bool = False) -> ConstructionQuery: ...
-    def where_path(self, regex: str) -> ConstructionQuery: ...
-    def with_args(self, value: bool) -> ConstructionQuery:
-        """Opt out of rust-side ``args`` / ``kwargs`` extraction. See
-        :meth:`DecoratorQuery.with_args`.
-        """
-        ...
-
-    def collect(self) -> list[ConstructionIdxRef]: ...
-    def first(self) -> ConstructionIdxRef | None: ...
-    def count(self) -> int: ...
-    def __iter__(self) -> Iterator[ConstructionIdxRef]: ...
-    def indices_by_path(self) -> dict[str, list[int]]:
-        """Terminal — group matched ``var_idx`` values by their owning
-        file path.
-        """
-        ...
-
-class CallQuery:
-    """Find call sites with a captured positional string-literal arg.
-
-    :meth:`string_arg_at` is required — it picks the positional
-    index. Pick one of the three receiver shapes per chain.
-    """
-
-    def where_module(self, module: str | list[str]) -> CallQuery:
-        """Filter calls to those whose callee is imported from
-        ``module``. Pass a list to match any of several modules (OR
-        semantics).
-        """
-        ...
-
-    def where_name(self, name: str) -> CallQuery: ...
-    def where_owner(self, owner: str) -> CallQuery: ...
-    def where_attr(self, attr: str) -> CallQuery: ...
-    def string_arg_at(self, index: int) -> CallQuery: ...
-    def where_required_positional(self, n: int | None = ...) -> CallQuery: ...
-    def where_path(self, regex: str) -> CallQuery: ...
-    def where_kwarg(self, name: str, value: Any) -> CallQuery:
-        """Filter to call sites whose ``name=value`` kwarg matches.
-
-        Multiple ``.where_kwarg`` calls AND together. ``value`` must
-        be a Python literal (``None`` / ``bool`` / ``int`` /
-        ``float`` / ``str`` / ``list`` / ``tuple``). A missing kwarg
-        on the call never matches. A non-literal kwarg expression
-        never matches.
-        """
-        ...
-
-    def with_args(self, value: bool) -> CallQuery:
-        """Opt out of rust-side ``args`` / ``kwargs`` extraction. See
-        :meth:`DecoratorQuery.with_args`. Auto-forced back to ``True``
-        when any ``where_kwarg`` is set.
-        """
-        ...
-
-    def collect(self) -> list[CallIdxRef]: ...
-    def first(self) -> CallIdxRef | None: ...
-    def count(self) -> int: ...
-    def __iter__(self) -> Iterator[CallIdxRef]: ...
-    def indices_by_path(self) -> dict[str, list[int]]:
-        """Terminal — group matched ``owner_idx`` values by their
-        owning file path.
-        """
-        ...
-
-class SubclassQuery:
-    """Walk the subclass closure of a class.
-
-    Pick exactly one of :meth:`of_fqn` / :meth:`of_idx`. The default
-    :meth:`transitive` is ``True``; flip to ``False`` for direct
-    subclasses only.
-    """
-
-    def of_fqn(self, fqn: str) -> SubclassQuery: ...
-    def of_idx(self, idx: int) -> SubclassQuery:
-        """Anchor the walk on the class at positional index ``idx``
-        into :meth:`ProjectContext.nodes`. Raises :class:`IndexError`
-        at terminal time when ``idx`` is out of range; returns an
-        empty list when the seed isn't a class node.
-        """
-        ...
-
-    def transitive(self, value: bool) -> SubclassQuery: ...
-    def count(self) -> int: ...
-    def indices(self) -> list[int]:
-        """Index-returning terminal. Emits each subclass's positional
-        index into :meth:`ProjectContext.nodes`; pair with
-        :meth:`ProjectContext.node_attrs` / :meth:`nodes_at` to revive
-        ``kind`` / ``path`` / ``fqname`` / ``flags`` on demand.
-        """
-        ...
-
-    def attrs(self) -> list[NodeAttrs]:
-        """Terminal — :class:`NodeAttrs` for every matched subclass,
-        in the same order :meth:`indices` returns. Avoids the
-        boilerplate of ``ctx.node_attrs(q.indices())``.
-        """
-        ...
-
-    def first_idx(self) -> int | None:
-        """Terminal — first matched subclass's positional index, or
-        ``None`` when no subclass exists.
-        """
-        ...
-
-    def indices_by_path(self) -> dict[str, list[int]]:
-        """Terminal — group matched indices by their owning file
-        path.
-        """
-        ...
-
-class ImportQuery:
-    """Enumerate the ``kind="import"`` nodes that bind a name from a
-    given module. Requires :meth:`of` (the upstream module name).
-    """
-
-    def of(self, module: str) -> ImportQuery: ...
-    def indices(self) -> list[int]:
-        """Index-returning terminal. Reads positional indices straight
-        out of the pre-built ``imports_by_module`` index — no Python
-        allocation per row.
-        """
-        ...
-
-    def count(self) -> int: ...
-    def exists(self) -> bool:
-        """O(1) presence probe — does any project file import the
-        configured module? Short-circuits without materialising a
-        Python list. Preferred over ``.count() > 0`` for plugin
-        guards that just need a boolean.
-        """
-        ...
-
-    def attrs(self) -> list[NodeAttrs]:
-        """Terminal — :class:`NodeAttrs` for every matched import
-        node, in the same order :meth:`indices` returns.
-        """
-        ...
-
-    def first_idx(self) -> int | None:
-        """Terminal — first matched import node's positional index,
-        or ``None`` when no project file imports the configured
-        module.
-        """
-        ...
-
-    def indices_by_path(self) -> dict[str, list[int]]:
-        """Terminal — group matched indices by their owning file
-        path.
-        """
-        ...
-
-class ModuleQuery:
-    """Enumerate / inspect project module nodes.
-
-    Pick exactly one filter (:meth:`with_fqn` / :meth:`with_path` /
-    :meth:`with_dunders`), optionally follow with one transform
-    (:meth:`surface` / :meth:`top_level` / :meth:`dunder_all`), then
-    drop into a terminal (:meth:`indices` / :meth:`first_idx` /
-    :meth:`dunder_all`).
-
-    Idx-only terminals — :class:`ModuleQuery` doesn't have a
-    ``.collect()`` SymbolNode form; plugins consume the idxs and
-    fetch attrs via :meth:`ProjectContext.node_attrs` /
-    :meth:`node_paths` as needed.
-    """
-
-    def with_fqn(self, fqn: str) -> ModuleQuery:
-        """Narrow to a single module by dotted fqname."""
-        ...
-
-    def with_path(self, path: str) -> ModuleQuery:
-        """Narrow to the module owning ``path``. O(1) — backed by the
-        same ``module_nodes_by_file`` index :meth:`find_main_blocks`
-        uses."""
-        ...
-
-    def with_dunders(self) -> ModuleQuery:
-        """Project-wide scan: every module-level variable named
-        ``__xxx__`` plus every PEP 562 dunder function
-        (``__getattr__`` / ``__dir__``). Terminal-friendly with
-        :meth:`indices`. Pairs with no transform.
-        """
-        ...
-
-    def surface(self) -> ModuleQuery:
-        """Transform: module + every transitive decl whose fqname
-        lives under the filtered module's fqname. Models
-        ``importlib.import_module(...)`` reachability — submodules
-        are recursed into, but a decl's sub-fqnames are not.
-        """
-        ...
-
-    def top_level(self) -> ModuleQuery:
-        """Transform: the filtered module's immediate top-level decls.
-        Models ``from <module> import *`` semantics — submodules and
-        their decls are excluded.
-        """
-        ...
-
-    def indices(self) -> list[int]:
-        """Terminal: list of matching positional indices into
-        :meth:`ProjectContext.nodes`.
-
-        * No transform + ``with_fqn`` / ``with_path``: a 0- or
-          1-element list with the matched module idx.
-        * ``surface()`` / ``top_level()``: the module + relevant
-          decls.
-        * ``with_dunders()``: every module-level dunder name in the
-          project.
-        """
-        ...
-
-    def first_idx(self) -> int | None:
-        """Terminal: first matching idx or ``None``. Convenience for
-        single-value lookups (``with_fqn`` / ``with_path`` without a
-        transform).
-        """
-        ...
-
-    def dunder_all(self) -> list[int] | None:
-        """Terminal: decls listed in the module's ``__all__``.
-
-        Returns ``None`` when the module doesn't declare ``__all__``;
-        returns ``[]`` when ``__all__`` exists but resolves to no
-        in-project decls. Requires :meth:`with_fqn`; other filters /
-        transforms are ignored. The distinction between ``None`` and
-        ``[]`` matters: CPython's ``from X import *`` semantics fall
-        back to the non-underscore decl list only in the ``None``
-        case.
-        """
-        ...
-
-    def count(self) -> int: ...
-    def __iter__(self) -> Iterator[int]: ...
-    def attrs(self) -> list[NodeAttrs]:
-        """Terminal — :class:`NodeAttrs` for every matched index, in
-        the same order :meth:`indices` returns. Avoids the
-        boilerplate of ``ctx.node_attrs(q.indices())``.
-        """
-        ...
-
-    def indices_by_path(self) -> dict[str, list[int]]:
-        """Terminal — group matched indices by their owning file
-        path.
-        """
-        ...
-
-class TraverseQuery:
-    """Closure walks anchored at a single seed node. Built via
-    :meth:`QueryBuilder.from_idx`. All terminals return positional
-    indices into :meth:`ProjectContext.nodes`; revive rows via
-    :meth:`ProjectContext.nodes_at` if a plugin needs full
-    :class:`SymbolNode` objects. For the seedless "alive from
-    entrypoints" walk, use :meth:`QueryBuilder.reachable` instead.
-    """
-
-    def descendants(self, *, skip_flags: int = 0) -> list[int]:
-        """Terminal: forward closure from the seed. ``skip_flags`` is
-        an :class:`EdgeFlags` mask — edges whose flag mask intersects
-        are filtered out (e.g. ``EdgeFlags.DEAD_BRANCH.value``).
-        """
-        ...
-
-    def ancestors(self, *, skip_flags: int = 0) -> list[int]:
-        """Terminal: reverse closure to the seed. ``skip_flags``
-        filters edges the same way as :meth:`descendants`.
-        """
-        ...
-
-    def direct_predecessors(self, *, skip_flags: int = 0) -> list[int]:
-        """Terminal: one-hop reverse — the immediate predecessors of
-        the seed (deduped by source idx, so parallel edges with
-        different flags collapse to a single entry).
-        """
-        ...
-
-class DeclarationsQuery:
-    """Look up declarations by fully-qualified name. Built via
-    :meth:`QueryBuilder.declarations`. Requires :meth:`with_fqname`;
-    terminals are :meth:`indices` (all matching decls) and
-    :meth:`resolve_idx` (first match, with module fallback).
-
-    The walk-back rule: when the exact fqname doesn't match, dotted
-    segments are stripped from the right until an enclosing top-level
-    decl is found (``pkg.lib.Cls.method`` resolves to ``pkg.lib.Cls``
-    because methods aren't graph nodes).
-    """
-
-    def with_fqname(self, fqname: str) -> DeclarationsQuery: ...
-    def indices(self) -> list[int]:
-        """Terminal: every decl matching ``fqname`` (walk-back
-        included). Modules are never returned; use
-        :meth:`QueryBuilder.modules` for module lookup.
-        """
-        ...
-
-    def resolve_idx(self) -> int | None:
-        """Terminal: first decl matching ``fqname``, falling back to a
-        module match. Returns ``None`` when the fqname can't be found
-        anywhere.
-        """
-        ...
-
-    def count(self) -> int: ...
-    def __iter__(self) -> Iterator[int]: ...
-    def attrs(self) -> list[NodeAttrs]:
-        """Terminal — :class:`NodeAttrs` for every matched decl, in
-        the same order :meth:`indices` returns. Modules are excluded
-        (same rule as :meth:`indices`).
-        """
-        ...
-
-    def first_idx(self) -> int | None:
-        """Terminal — first matched decl's positional index, or
-        ``None`` when no decl matches. Distinct from
-        :meth:`resolve_idx`: this one skips the module fallback.
-        """
-        ...
-
-    def indices_by_path(self) -> dict[str, list[int]]:
-        """Terminal — group matched indices by their owning file
-        path.
-        """
-        ...
-
-class MainBlockQuery:
-    """Enumerate every ``if __name__ == "__main__":`` block in the
-    project. Built via :meth:`QueryBuilder.main_blocks`. The only
-    terminal is :meth:`index_pairs`.
-    """
-
-    def index_pairs(self) -> list[tuple[int, list[int]]]:
-        """Terminal: ``(module_idx, [decl_idx, ...])`` pairs for every
-        file with a top-level ``if __name__ == "__main__":`` block.
-        One entry per file; ``decl_idx`` lists the top-level decls
-        whose source position falls inside the block's range.
-        """
-        ...
-
-    def count(self) -> int: ...
-    def __iter__(self) -> Iterator[tuple[int, list[int]]]: ...
-
-class LiteralListQuery:
-    """Read the entries of a module-level string-literal list / tuple
-    (typical use: ``__all__``, but works for any name). Built via
-    :meth:`QueryBuilder.literal_lists`. Requires :meth:`for_fqn`; the
-    only terminal is :meth:`entries`.
-    """
-
-    def for_fqn(self, fqn: str) -> LiteralListQuery: ...
-    def entries(self) -> list[str] | None:
-        """Terminal: the string entries bound to the configured
-        ``fqn`` at module scope (concatenated across multiple decls in
-        declaration order), or ``None`` when the name isn't a
-        module-level decl or doesn't bind a string-literal list /
-        tuple.
-        """
-        ...
-
-class ClassQuery:
-    """Enumerate classes by structural property. Today the only filter
-    is :meth:`defining_method` (matches classes whose body has a
-    ``FunctionDef`` with that name).
-    """
-
-    def defining_method(self, name: str) -> ClassQuery: ...
-    def count(self) -> int: ...
-    def indices(self) -> list[int]:
-        """Index-returning terminal. Per-file parallel walk emitting
-        each matched class's positional index into
-        :meth:`ProjectContext.nodes`; pair with
-        :meth:`ProjectContext.node_attrs` / :meth:`nodes_at` to revive
-        ``kind`` / ``path`` / ``fqname`` / ``flags`` on demand.
-        """
-        ...
-
-    def attrs(self) -> list[NodeAttrs]:
-        """Terminal — :class:`NodeAttrs` for every matched class, in
-        the same order :meth:`indices` returns.
-        """
-        ...
-
-    def first_idx(self) -> int | None:
-        """Terminal — first matched class's positional index, or
-        ``None`` when no class defines the configured method.
-        """
-        ...
-
-    def indices_by_path(self) -> dict[str, list[int]]:
-        """Terminal — group matched indices by their owning file
-        path.
-        """
-        ...
-
-class FactoryQuery:
-    """Walk function / class bodies for ``<Ctor>(...)`` calls where
-    ``Ctor`` is imported from :meth:`of_module` and matches one of
-    :meth:`where_name`. Both filters are required.
-
-    Mirrors :meth:`ProjectContext.find_factory_decls`.
-    """
-
-    def of_module(self, module: str | list[str]) -> FactoryQuery:
-        """Filter to factories whose constructed type is imported from
-        ``module``. Pass a list to match any of several modules (OR
-        semantics).
-        """
-        ...
-
-    def where_name(self, names: str | list[str] | tuple[str, ...]) -> FactoryQuery: ...
-    def collect(self) -> list[FactoryIdxRef]: ...
-    def count(self) -> int: ...
-    def __iter__(self) -> Iterator[FactoryIdxRef]: ...
-    def indices_by_path(self) -> dict[str, list[int]]:
-        """Terminal — group matched ``decl_idx`` values by their
-        owning file path.
-        """
-        ...
-
-class EdgeQuery:
-    """Filtered enumeration over the in-progress graph's edges.
-
-    Predicates AND together; any unset predicate doesn't filter. The
-    entire filter runs rust-side; the only terminal is
-    :meth:`index_triples`.
-    """
-
-    def with_flags(self, mask: int) -> EdgeQuery:
-        """Keep edges where ``flags & mask != 0``. Pass an
-        :class:`EdgeFlags` constant (or OR of constants) to filter to
-        a specific edge classification.
-        """
-        ...
-
-    def with_src_kind(self, kind: str) -> EdgeQuery:
-        """Keep edges whose ``src`` node has the given ``kind``
-        (``"module"``, ``"function"``, ``"import"``, …). Matches by
-        exact string compare against :attr:`SymbolNode.kind`.
-        """
-        ...
-
-    def with_dst_kind(self, kind: str) -> EdgeQuery:
-        """Keep edges whose ``dst`` node has the given ``kind``."""
-        ...
-
-    def count(self) -> int: ...
-    def index_triples(self) -> list[tuple[int, int, int]]:
-        """Index-returning terminal for edges. Emits
-        ``(src_idx, dst_idx, flags)`` triples into
-        :meth:`ProjectContext.nodes` after applying every configured
-        predicate. Pair with :meth:`ProjectContext.nodes_at` to revive
-        the surviving endpoints on demand.
-        """
-        ...
-
-class DeclQuery:
-    """Generic filter over every interned node in the in-progress graph.
-
-    Folds the per-node Python filter loops that show up in plugins
-    (filter on ``kind``, basename, simple-name, flag mask, path set,
-    path regex) down into one rust pass. All configured predicates are
-    AND-ed; an empty predicate set yields every node.
-    """
-
-    def with_kind(self, kind: str) -> DeclQuery: ...
-    def with_kinds(self, kinds: str | list[str] | tuple[str, ...]) -> DeclQuery: ...
-    def with_filename(self, name: str) -> DeclQuery: ...
-    def with_filenames(self, names: str | list[str] | tuple[str, ...]) -> DeclQuery: ...
-    def with_simple_name(self, name: str) -> DeclQuery: ...
-    def with_simple_names(self, names: str | list[str] | tuple[str, ...]) -> DeclQuery: ...
-    def with_paths(self, paths: str | list[str] | tuple[str, ...]) -> DeclQuery: ...
-    def with_path_regex(self, regex: str) -> DeclQuery: ...
-    def with_path_prefix(self, prefix: str) -> DeclQuery:
-        """Restrict to nodes whose absolute path starts with
-        ``prefix``. Cheaper than :meth:`with_path_regex` for simple
-        directory scoping.
-        """
-        ...
-
-    def with_path_contains(self, substring: str) -> DeclQuery:
-        """Restrict to nodes whose absolute path contains ``substring``
-        anywhere. Useful for path-pattern plugins like
-        ``alembic/versions/`` or ``.ignore.py``.
-        """
-        ...
-
-    def with_simple_name_regex(self, pattern: str) -> DeclQuery:
-        """Restrict to nodes whose trailing fqname segment matches
-        ``pattern`` (a regex). Combine with :meth:`with_kind` /
-        :meth:`with_kinds` to drop modules when you only want
-        top-level decls.
-        """
-        ...
-    def with_flags(self, mask: int) -> DeclQuery:
-        """Restrict to nodes whose ``flags & mask == mask`` (all bits set)."""
-        ...
-
-    def with_any_flag(self, mask: int) -> DeclQuery:
-        """Restrict to nodes whose ``flags & mask != 0`` (any bit set)."""
-        ...
-
-    def with_fqname_prefix(self, prefix: str) -> DeclQuery:
-        """Restrict to nodes whose ``fqname`` starts with ``prefix`` —
-        a raw string prefix, not segment-bounded. ``prefix="foo"``
-        matches both ``foo.bar`` and ``foobar``. Use
-        :meth:`with_fqname_under` for the segment-bounded
-        "descendants of this fqname" predicate that walks the fqname
-        tree via the ``children_by_parent`` index.
-        """
-        ...
-
-    def with_fqname_under(self, parent_fqn: str) -> DeclQuery:
-        """Restrict to nodes whose ``fqname`` equals ``parent_fqn``
-        or is a transitive descendant of it in the fqname tree.
-
-        Segment-bounded: ``parent_fqn="pkg.foo"`` matches ``pkg.foo``,
-        ``pkg.foo.bar``, ``pkg.foo.bar.baz`` — but **not** ``pkg.foobar``.
-        Backed by the project's ``children_by_parent`` index, so this
-        is O(matches) instead of the O(all_nodes) scan
-        :meth:`with_fqname_prefix` performs.
-        """
-        ...
-
-    def where_fqname(
-        self,
-        value: str | re.Pattern[str] | Sequence[str | re.Pattern[str]],
-    ) -> DeclQuery:
-        """Restrict to nodes whose ``fqname`` matches the predicate.
-
-        Accepts any combination of ``str`` (literal equality) and
-        ``re.Pattern`` (regex match). A sequence value matches when
-        the node's ``fqname`` matches any element. ``re.Pattern``
-        instances are recompiled rust-side using rust's ``regex``
-        crate, so any PCRE-only syntax raises ``ValueError`` at the
-        call site (not later at the terminal).
-        """
-        ...
-
-    def count(self) -> int: ...
-    def indices(self) -> list[int]:
-        """Index-returning terminal. Emits each surviving node's
-        positional index into :meth:`ProjectContext.nodes` (a plain
-        ``list[int]``) after applying every configured predicate.
-
-        Use when you only need set membership / counting on the
-        surviving nodes (or want to wire edges in idx-space); call
-        :meth:`ProjectContext.nodes_at` / :meth:`node_attrs` to
-        revive ``SymbolNode`` / :class:`NodeAttrs` rows on demand.
-        """
-        ...
-
-    def attrs(self) -> list[NodeAttrs]:
-        """Terminal — :class:`NodeAttrs` for every surviving node, in
-        the same order :meth:`indices` returns. Avoids the
-        boilerplate of ``ctx.node_attrs(q.indices())``.
-        """
-        ...
-
-    def first_idx(self) -> int | None:
-        """Terminal — first matching node's positional index, or
-        ``None`` when no node matches. Convenience for single-value
-        lookups.
-        """
-        ...
-
-    def indices_by_path(self) -> dict[str, list[int]]:
-        """Terminal — group matched indices by their owning file
-        path. One :meth:`ProjectContext.node_paths` call internally.
-        Lets plugins fan out per-file work without re-querying.
-        """
-        ...
 
 # ---------- Graph persistence --------------------------------------------
 
