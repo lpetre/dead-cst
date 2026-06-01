@@ -168,13 +168,6 @@ pub(crate) struct BuildOutputs {
     /// project; once a project class is found, transitive walks use
     /// this map.
     pub(crate) children_by_node: FxHashMap<usize, Vec<usize>>,
-    /// Project-wide class hierarchy keyed by parent fqname (project or
-    /// external). `base_fqn -> [direct subclass class_idx]`. Built
-    /// alongside ``children_by_node`` from the per-file ``class_bases``
-    /// payload. Retained for the upcoming DSL ``subclasses().of_fqn()``
-    /// O(1) fast path; not yet wired into the current path.
-    #[allow(dead_code)]
-    pub(crate) children_by_fqn: FxHashMap<String, Vec<usize>>,
 }
 
 /// Run the three build phases (ingest → hierarchy+imports → references)
@@ -432,13 +425,11 @@ pub(crate) fn build_project_graph(
     counters.finish_phase(PHASE_FQNAME);
 
     // Class hierarchy fan-in: fold every file's per-file `class_bases`
-    // payload (see `file_payload::FileNodes::class_bases`) into two
-    // project-wide indices — node-keyed (intra-project subclass
-    // walks) and fqname-keyed (external seeds + the dispatch-plugin
-    // hot path). One pass over the per-file payloads + one pass per
-    // base; no AST re-walk.
+    // payload (see `file_payload::FileNodes::class_bases`) into the
+    // node-keyed project-wide subclass index. One pass over the
+    // per-file payloads + one pass per base; no AST re-walk.
     let t_hierarchy = std::time::Instant::now();
-    let (children_by_node, children_by_fqn) = build_class_hierarchy_indices(
+    let children_by_node = build_class_hierarchy_indices(
         db,
         &project_files,
         &class_by_selection,
@@ -483,7 +474,6 @@ pub(crate) fn build_project_graph(
         module_by_fqname,
         imports_by_module,
         children_by_node,
-        children_by_fqn,
         children_by_parent,
     })
 }
@@ -593,7 +583,6 @@ fn assemble_graph<'db>(
     // Pass 1: node mint.
     for &file in project_files {
         let payload = file_to_nodes(db, file);
-        let parsed = parsed_module(db, file).load(db);
 
         // Stub-only ENTRYPOINT context: if this is a .pyi without a
         // .py twin, every decl needs ENTRYPOINT. If it has a twin,
@@ -646,9 +635,7 @@ fn assemble_graph<'db>(
                 }
                 NodeRef::Def(d) => {
                     let place_id = d.place(db);
-                    let kind = d.kind(db);
-                    let tr = kind.target_range(&parsed);
-                    let rk = (tr.start().to_u32(), tr.end().to_u32());
+                    let rk = node_data.name_range;
                     global_index.insert((file, place_id, rk), global_idx);
                     if matches!(node_data.kind, NodeKind::Class) {
                         class_by_selection.insert((file, rk), global_idx);
@@ -1007,36 +994,25 @@ fn extract_per_file_plugin_ids(
 }
 
 /// Fold every file's per-file `class_bases` payload (see
-/// [`crate::file_payload::FileNodes::class_bases`]) into two
-/// project-wide indices used by the subclass queries:
+/// [`crate::file_payload::FileNodes::class_bases`]) into the
+/// node-keyed project-wide subclass index:
 ///
 /// * `children_by_node` — parent class graph idx → direct subclass
 ///   graph idxs. Drives intra-project BFS for both project and
 ///   external seeds (once the first hop lands a project class).
-/// * `children_by_fqn` — base fqname → direct subclass graph idxs.
-///   Lets external seeds (`unittest.TestCase`, `flask.Flask`) be
-///   answered without an AST re-walk and without ty's framework
-///   loader. The same map also serves project bases via the import
-///   path — `class C(Foo): ...` with `from m import Foo` lands as
-///   `ImportedFqn("m.Foo")`, which matches the project's own
-///   `m.Foo` class node when fqname lookup hits `decl_by_fqname`.
 ///
 /// Resolution rules per `ResolvedBase` variant:
 ///
 /// * `LocalSameFileClass(local_idx)` — translate via the file's
 ///   `refs[local_idx]` + `ref_to_global` to a parent class graph idx
 ///   and emit a `children_by_node` entry.
-/// * `ImportedFqn(fqn)` — index in `children_by_fqn`. Additionally,
-///   when the fqn resolves in `decl_by_fqname` to a project class
-///   node, emit a `children_by_node` entry too (so a project base
-///   imported via `from m import C` participates in node-keyed
-///   walks).
-/// * `Attribute { module_fqn, attr_name }` — probe `module_fqname`
-///   via `module_by_fqname` (project-side) and resolve the attr in
-///   that module's `exports_by_name`. Project hits emit
-///   `children_by_node` entries; the fqname form
-///   `{module_fqn}.{attr_name}` also lands in `children_by_fqn` so
-///   external `M.N` references are answerable by string match.
+/// * `ImportedFqn(fqn)` — when the fqn resolves in `decl_by_fqname` to
+///   a project class node, emit a `children_by_node` entry (so a
+///   project base imported via `from m import C` participates in
+///   node-keyed walks).
+/// * `Attribute { module_fqn, attr_name }` — resolve
+///   `{module_fqn}.{attr_name}` via `decl_by_fqname`; project class
+///   hits emit `children_by_node` entries.
 /// * `Unresolvable` — dropped.
 fn build_class_hierarchy_indices<'db>(
     db: &'db ProjectDatabase,
@@ -1045,10 +1021,9 @@ fn build_class_hierarchy_indices<'db>(
     ref_to_global: &FxHashMap<NodeRef<'db>, usize>,
     decl_by_fqname: &FxHashMap<String, Vec<usize>>,
     nodes: &[GraphNode],
-) -> (FxHashMap<usize, Vec<usize>>, FxHashMap<String, Vec<usize>>) {
+) -> FxHashMap<usize, Vec<usize>> {
     use crate::file_payload::ResolvedBase;
     let mut by_node: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
-    let mut by_fqn: FxHashMap<String, Vec<usize>> = FxHashMap::default();
 
     for &file in project_files {
         let payload = file_to_nodes(db, file);
@@ -1067,7 +1042,6 @@ fn build_class_hierarchy_indices<'db>(
                         }
                     }
                     ResolvedBase::ImportedFqn(fqn) => {
-                        by_fqn.entry(fqn.clone()).or_default().push(child_idx);
                         if let Some(idxs) = decl_by_fqname.get(fqn) {
                             for &parent_idx in idxs {
                                 if nodes[parent_idx].kind == "class" {
@@ -1080,15 +1054,11 @@ fn build_class_hierarchy_indices<'db>(
                         module_fqn,
                         attr_name,
                     } => {
-                        // Index by the synthesised fqname for
-                        // external bases + dispatch-plugin matches.
-                        let composed = format!("{module_fqn}.{attr_name}");
-                        by_fqn.entry(composed.clone()).or_default().push(child_idx);
                         // Project-side: resolve `module_fqn.attr_name`
                         // via `decl_by_fqname` (handles the common
                         // case where the target module's class is in
-                        // the project) or via the target module's
-                        // `exports_by_name`.
+                        // the project).
+                        let composed = format!("{module_fqn}.{attr_name}");
                         if let Some(idxs) = decl_by_fqname.get(&composed) {
                             for &parent_idx in idxs {
                                 if nodes[parent_idx].kind == "class" {
@@ -1107,11 +1077,7 @@ fn build_class_hierarchy_indices<'db>(
         v.sort_unstable();
         v.dedup();
     }
-    for v in by_fqn.values_mut() {
-        v.sort_unstable();
-        v.dedup();
-    }
-    (by_node, by_fqn)
+    by_node
 }
 
 /// Serial pre-parallel Pass-2 helper: lookup-or-mint a `NodeRef` into
