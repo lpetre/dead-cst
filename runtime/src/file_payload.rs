@@ -143,6 +143,11 @@ pub(crate) struct NodeData {
     pub(crate) end_column: usize,
     pub(crate) flags: u32,
     pub(crate) imports: Option<ImportPayload>,
+    /// Byte range of the bound *name* (ty's `DefinitionKind::target_range`),
+    /// stashed so the assembly pass can rebuild its `(File, place_id,
+    /// range)` decl index without re-parsing the module. `(0, 0)` for
+    /// module and synthetic nodes, which the assemble pass never keys on.
+    pub(crate) name_range: (u32, u32),
 }
 
 /// Compact 1-byte discriminant for the graph's `kind` field. Mirrors
@@ -329,6 +334,7 @@ pub(crate) fn ref_to_node<'db>(db: &'db dyn ProjectDb, r: NodeRef<'db>) -> NodeD
             end_column: 0,
             flags: 0,
             imports: None,
+            name_range: (0, 0),
         },
     }
 }
@@ -419,6 +425,7 @@ pub(crate) fn file_to_nodes<'db>(db: &'db dyn ProjectDb, file: File) -> FileNode
         end_column: mec,
         flags: default_flags,
         imports: None,
+        name_range: (0, 0),
     });
     refs.push(NodeRef::Module(file));
     ref_to_local.insert(NodeRef::Module(file), 0);
@@ -544,6 +551,7 @@ pub(crate) fn file_to_nodes<'db>(db: &'db dyn ProjectDb, file: File) -> FileNode
             end_column: ec,
             flags,
             imports: import_spec.clone(),
+            name_range: (target_range.start().to_u32(), target_range.end().to_u32()),
         };
         let local_idx = nodes.len() as u32;
         nodes.push(node);
@@ -646,8 +654,8 @@ pub(crate) fn file_to_nodes<'db>(db: &'db dyn ProjectDb, file: File) -> FileNode
     // Build per-file `class_bases`: walk every top-level ClassDef and
     // resolve each base expression against the file's imports + the
     // same-file class name table. No project-wide state needed; the
-    // assemble pass turns these into the global `children_by_node` /
-    // `children_by_fqn` indices.
+    // assemble pass turns these into the global `children_by_node`
+    // index.
     let class_bases = build_class_bases(&parsed, &exports_by_name, &nodes);
 
     FileNodes {
