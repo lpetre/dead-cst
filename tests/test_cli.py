@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import lzma
 import textwrap
 from pathlib import Path
 
@@ -24,6 +25,7 @@ from typer.testing import CliRunner
 from dead_cst.cli import (
     _crate_key,
     _dead_real,
+    _materialize_dep_closure,
     _rel_path,
     app,
     build_plugins,
@@ -201,6 +203,41 @@ def test_crate_key_collapses_distinct_svh_of_same_crate():
     assert _crate_key("libregex-1111111111111111.rlib") == _crate_key(
         "libregex-2222222222222222.rlib"
     )
+
+
+# ---------------------------------------------------------------------------
+# _materialize_dep_closure
+# ---------------------------------------------------------------------------
+
+
+def test_materialize_dep_closure_decompresses_xz(tmp_path):
+    # The shipped plugin-host closure stores each artifact xz-compressed; the
+    # consumer must decompress to original filenames before handing paths to rustc.
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    payloads = {
+        "libregex-abc.rlib": b"rlib-bytes-" * 1000,
+        "libserde_derive-def.dylib": b"proc-macro-bytes-" * 1000,
+    }
+    for name, data in payloads.items():
+        (bundle / f"{name}.xz").write_bytes(lzma.compress(data))
+
+    staged = _materialize_dep_closure(bundle)
+
+    assert staged != bundle  # decompressed into a fresh temp dir
+    assert {p.name for p in staged.iterdir()} == set(payloads)
+    for name, data in payloads.items():
+        assert (staged / name).read_bytes() == data
+
+
+def test_materialize_dep_closure_passes_through_raw_dir(tmp_path):
+    # A raw local deps dir (e.g. a `--runtime-dir` build) has no `*.xz`; it must
+    # be returned unchanged so rustc reads the rlibs in place.
+    raw = tmp_path / "deps"
+    raw.mkdir()
+    (raw / "libregex-abc.rlib").write_bytes(b"plain")
+
+    assert _materialize_dep_closure(raw) == raw
 
 
 # ---------------------------------------------------------------------------

@@ -348,7 +348,7 @@ The split keeps the cost where it belongs:
 | install | download | installed | for |
 |---|---|---|---|
 | `dead-cst` | ~25 MB | ~60 MB | everyone — analysis, the CLI, the built-in plugins |
-| `dead-cst[build-plugin]` | +~130 MB | +~320 MB | authoring native plugins |
+| `dead-cst[build-plugin]` | +~70 MB | +~70 MB | authoring native plugins |
 
 The base `dead-cst` macOS/Linux wheel carries the shared runtime dylib + libstd
 alongside the `_native` shim (so it's a bit larger than a pure static build, and
@@ -356,8 +356,11 @@ the host runs the shared runtime). The `[build-plugin]` extra then pulls
 **`dead-cst-plugin-host`**, a data-only, platform-specific package shipping only
 the **compile closure**: the `.rlib` dependency archives + proc-macro dylibs
 `rustc` needs to validate the crate graph. `build-plugin` finds it via `import
-dead_cst_plugin_host`. It's large because `rustc` needs the full closure to
-compile against the runtime; nothing in it is needed at *runtime*.
+dead_cst_plugin_host`. Each artifact ships **xz-compressed** — the raw closure is
+~320 MB and zip's deflate only gets it to ~107 MB (over PyPI's 100 MB/file cap),
+while xz packs it to ~70 MB; `build-plugin` decompresses to a temp dir (~320 MB,
+freed on exit) before invoking `rustc`. It's large because `rustc` needs the full
+closure to compile against the runtime; nothing in it is needed at *runtime*.
 
 Maintainers produce both halves from **one** prefer-dynamic build, so the
 runtime dylib's SVH matches the rlib closure plugins compile against. **`dead-cst
