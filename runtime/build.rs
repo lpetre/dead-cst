@@ -1,10 +1,20 @@
 use std::process::Command;
 
+/// Epoch of the curated `plugin_api` surface external plugins compile against.
+/// **Bump this** whenever that surface changes incompatibly — a trait method
+/// signature (`ExternalPlugin::run`, `PerFilePlugin::run_on_file`), a
+/// renamed/removed `PluginCtx`/`PluginOps` query, a changed re-exported type —
+/// so a plugin built against the old API is rejected at load, distinct from a
+/// plain version bump. Folded into the ABI fingerprint below and re-exported as
+/// `native_plugins::plugin_api::PLUGIN_API_EPOCH`.
+const PLUGIN_API_EPOCH: u32 = 1;
+
 /// Compose the ABI fingerprint that gates external native-plugin loading.
 /// It changes whenever anything that could break the dylib ABI changes:
-/// the compiler (commit hash), the runtime version, the target, or a manual
-/// epoch bump. A plugin bakes the runtime's fingerprint at compile time, so
-/// a plugin built against a different runtime is rejected at load.
+/// the compiler (commit hash), the runtime version, the target, the curated
+/// [`PLUGIN_API_EPOCH`], or a manual `DEAD_CST_ABI_EPOCH` bump. A plugin bakes
+/// the runtime's fingerprint at compile time, so a plugin built against a
+/// different runtime is rejected at load.
 fn main() {
     let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
     let vv = Command::new(&rustc)
@@ -21,6 +31,9 @@ fn main() {
     let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0".into());
     let epoch = std::env::var("DEAD_CST_ABI_EPOCH").unwrap_or_else(|_| "1".into());
 
-    println!("cargo:rustc-env=RUNTIME_ABI_FINGERPRINT={epoch}|{commit}|v{version}|{target}");
+    println!("cargo:rustc-env=PLUGIN_API_EPOCH={PLUGIN_API_EPOCH}");
+    println!(
+        "cargo:rustc-env=RUNTIME_ABI_FINGERPRINT={epoch}|api{PLUGIN_API_EPOCH}|{commit}|v{version}|{target}"
+    );
     println!("cargo:rerun-if-env-changed=DEAD_CST_ABI_EPOCH");
 }

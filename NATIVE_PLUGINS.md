@@ -323,8 +323,10 @@ A plugin is compiled against one exact dead-cst build, so it must be
 **recompiled for each release**. dead-cst enforces that without ever crashing:
 
 - Every plugin bakes an **ABI fingerprint** at compile time —
-  `epoch | rustc commit | runtime version | target` — taken from the runtime it
-  built against.
+  `epoch | api<plugin_api epoch> | rustc commit | runtime version | target` —
+  taken from the runtime it built against. The `api<N>` segment is a dedicated
+  epoch for the curated `plugin_api` surface: bumping it (in `runtime/build.rs`)
+  rejects plugins compiled against an older API even when nothing else changed.
 - `native.load_native_plugins(path)` opens the dylib lazily and reads a
   **self-contained manifest** (plain data + the baked fingerprint) *before*
   touching any version-hashed runtime symbol.
@@ -332,8 +334,8 @@ A plugin is compiled against one exact dead-cst build, so it must be
   match the running runtime, the load is **rejected with a clear error**:
 
   ```
-  ABI mismatch — plugin built against '1|commit-hash: …|v0.13.0|aarch64-apple-darwin',
-  this runtime is '1|…|v0.14.0|…'. Rebuild the plugin against this release.
+  ABI mismatch — plugin built against '1|api1|commit-hash: …|v0.13.0|aarch64-apple-darwin',
+  this runtime is '1|api2|…|v0.14.0|…'. Rebuild the plugin against this release.
   ```
 
 So a stale `.so` is refused, not segfaulted. Rebuild with `build-plugin` and

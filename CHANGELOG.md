@@ -11,6 +11,13 @@ two versions.
 
 ### Added
 
+- **`plugin_api` epoch in the ABI fingerprint.** The native-plugin ABI
+  fingerprint gains a dedicated `api<N>` segment
+  (`native_plugins::plugin_api::PLUGIN_API_EPOCH`, bumped in
+  `runtime/build.rs`) tracking the curated `plugin_api` surface. Bumping it
+  rejects plugins compiled against an older API at load — distinct from a
+  rustc / runtime-version / target change — so an incompatible `plugin_api`
+  edit can invalidate stale plugins on its own.
 - **External native plugins (experimental).** The native crate is split
   into a `dead-cst-runtime` library (built as both `rlib` and `dylib`)
   and a thin `dead-cst-native` cdylib shim, so a plugin can dynamically

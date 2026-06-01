@@ -1230,6 +1230,15 @@ pub mod plugin_api {
     /// fan-out, the same bit the visitor stamps on dynamic-import edges.
     pub const FLAG_DYNAMIC_IMPORT: u32 = EdgeFlags::DYNAMIC_IMPORT;
 
+    /// Epoch of this curated `plugin_api` surface — the author-facing contract
+    /// version, baked into the [ABI fingerprint](super::PLUGIN_ABI_FINGERPRINT)
+    /// (the `api<N>` segment). It is **bumped in `runtime/build.rs`** whenever
+    /// this surface changes incompatibly, so a plugin compiled against an older
+    /// `plugin_api` is rejected at load even if nothing else (rustc, version,
+    /// target) changed. Exposed for plugin authors and diagnostics; the
+    /// load-time gate compares the whole fingerprint, not this value alone.
+    pub const PLUGIN_API_EPOCH: &str = env!("PLUGIN_API_EPOCH");
+
     /// Error a plugin returns from [`ExternalPlugin::run`]. **Pyo3-free by
     /// design** — the curated surface never names a `PyErr`, so a plugin author
     /// depends only on this crate's API, not on pyo3. The host maps it to a
@@ -2296,9 +2305,11 @@ pub mod plugin_api {
     }
 }
 
-/// ABI fingerprint this runtime accepts (see `build.rs`). An external plugin
-/// bakes this exact string at compile time; the airlock rejects any plugin
-/// whose baked fingerprint differs.
+/// ABI fingerprint this runtime accepts (see `build.rs`):
+/// `<abi-epoch>|api<plugin-api-epoch>|<rustc-commit>|v<version>|<target>`. An
+/// external plugin bakes this exact string at compile time; the airlock rejects
+/// any plugin whose baked fingerprint differs. The `api<N>` segment tracks
+/// [`plugin_api::PLUGIN_API_EPOCH`].
 pub const PLUGIN_ABI_FINGERPRINT: &str = env!("RUNTIME_ABI_FINGERPRINT");
 
 /// Magic number prefixing a valid plugin manifest.
@@ -4266,5 +4277,23 @@ mod dynamic_import_glob_tests {
     fn path_match_literal_filename() {
         assert!(path_match("pkg/legacy/b.py", "pkg/legacy/b.py"));
         assert!(!path_match("pkg/legacy/a.py", "pkg/legacy/b.py"));
+    }
+}
+
+#[cfg(test)]
+mod fingerprint_tests {
+    use super::plugin_api::PLUGIN_API_EPOCH;
+    use super::PLUGIN_ABI_FINGERPRINT;
+
+    #[test]
+    fn fingerprint_embeds_plugin_api_epoch() {
+        // The curated-API epoch is part of the load-time gate, so bumping it
+        // invalidates plugins built against an older `plugin_api`. Lock the
+        // wiring: build.rs must keep the `api<N>` segment in the fingerprint.
+        let seg = format!("|api{PLUGIN_API_EPOCH}|");
+        assert!(
+            PLUGIN_ABI_FINGERPRINT.contains(&seg),
+            "fingerprint {PLUGIN_ABI_FINGERPRINT:?} missing segment {seg:?}"
+        );
     }
 }
