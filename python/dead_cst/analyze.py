@@ -12,8 +12,6 @@ from .graph import KEEPALIVE_DEFAULT, EdgeFlags
 if TYPE_CHECKING:
     from dead_cst import _native as native
 
-    from .plugins import Plugin
-
 
 #: Public, ordered list of progress phases. The polling thread fires
 #: ``phase_start`` / ``phase_progress`` / ``phase_end`` events keyed on
@@ -497,7 +495,7 @@ class Analysis:
         project_root: Path,
         *,
         venv: Path | None = None,
-        plugins: Sequence[Plugin | native.NativePlugin] = (),
+        plugins: Sequence[native.NativePlugin] = (),
         show_progress: bool = False,
         progress_callback: ProgressCallback | None = None,
     ) -> None:
@@ -508,7 +506,7 @@ class Analysis:
             )
         self._project_root: Path = project_root
         self._venv: Path | None = venv
-        self._plugins: tuple[Plugin | native.NativePlugin, ...] = tuple(plugins)
+        self._plugins: tuple[native.NativePlugin, ...] = tuple(plugins)
         self._show_progress: bool = show_progress
         # ``show_progress=True`` installs a default stderr-text
         # callback so the rust-side indicatif bars get a Python-side
@@ -563,23 +561,17 @@ class Analysis:
             return self._ctx
         from dead_cst import _native
 
-        from .plugins import Plugin
-
         # Pre-graph plugin hook. Plugins may scan ``project_root`` for
         # config files / framework manifests / etc. before any graph
-        # construction happens. Type-validate each plugin here so
-        # ``Pluign()`` typos and bare dicts fail with a clean
+        # construction happens. Type-validate each plugin here so a
+        # bare dict or a ``Pluign()`` typo fails with a clean
         # ``TypeError`` instead of being silently dropped by the rust
-        # ``add_plugin`` loop below. ``_native.NativePlugin`` instances
-        # (rust-side native plugins, e.g.
-        # ``NativePlugin.main_block()``) aren't ``Plugin`` subclasses —
-        # accept them via the tuple check.
-        plugin_types: tuple[type, ...] = (Plugin, _native.NativePlugin)
+        # ``add_plugin`` loop below.
         for plugin in self._plugins:
-            if not isinstance(plugin, plugin_types):
+            if not isinstance(plugin, _native.NativePlugin):
                 raise TypeError(
-                    f"Expected a dead_cst.plugins.Plugin or NativePlugin "
-                    f"instance, got {type(plugin).__name__!r}: {plugin!r}"
+                    f"Expected a dead_cst._native.NativePlugin instance, "
+                    f"got {type(plugin).__name__!r}: {plugin!r}"
                 )
             plugin.prepare(self._project_root)
 
@@ -669,7 +661,7 @@ class Analysis:
         # so a build failure still drains the queue.
         poller: _ProgressPoller | None = None
         if self._progress_callback is not None:
-            plugin_names = tuple(type(p).__qualname__ for p in self._plugins)
+            plugin_names = tuple(p.name for p in self._plugins)
             poller = _ProgressPoller(
                 ctx,
                 self._progress_callback,
@@ -715,7 +707,7 @@ class Analysis:
 
                 workers = 1 if _serial_mode() else _plugin_worker_count(len(self._plugins))
 
-                plugin_names = [type(p).__qualname__ for p in self._plugins]
+                plugin_names = [p.name for p in self._plugins]
                 ctx.progress_plugins_start(plugin_names)
                 try:
                     # Plugins are scheduled in registration order;

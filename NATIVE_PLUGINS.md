@@ -6,28 +6,23 @@
 > macOS (arm64) and Linux (x86_64 / aarch64) are wired today. See
 > [Limitations](#limitations).
 
-dead-cst has two ways to extend the reachability graph:
+dead-cst extends the reachability graph through **native (Rust) plugins** —
+there is no Python plugin protocol. They come in two flavors:
 
-| | Python plugins | Native plugins |
+| | Built-in plugins | External plugins |
 |---|---|---|
-| Language | Python (the [`Plugin`](python/dead_cst/plugins/_base.py) protocol) | Rust |
-| Toolchain to author | none | rust, pinned to the build version |
-| Ships in | the default wheel | a separate `[build-plugin]` extra |
-| Per-op cost | a `Py` alloc + `extract` per emitted op | none — pure rust |
-| View of the graph | the full `ProjectContext` Python API | the full `ProjectContext` **by rust reference** |
-| Own salsa-cached queries | no | yes |
+| Where they live | `runtime/src/native_plugins.rs`, compiled into the shipped extension | your own crate, compiled against the runtime `dylib` |
+| How you get one | `NativePlugin.main_block()` … `NativePlugin.celery()`, or `--plugin <name>` | `native.load_native_plugins(<path>)` |
+| Toolchain to author | n/a (in-tree) | rust, pinned to the build version |
+| View of the graph | the full `ProjectContext` **by rust reference** | same |
+| Own salsa-cached queries | yes | yes |
 
-**Most plugins should be Python plugins** — see
-[CONTRIBUTING.md → Adding a plugin](CONTRIBUTING.md#adding-a-plugin). Reach for
-a native plugin only when the work is hot enough that the per-op Python
-crossing matters, or when you want to define your own salsa-cached queries over
-ty's database. This document is about **external** native plugins: ones you
-compile in your own crate and load at runtime, without forking dead-cst.
-
-(There are also *in-tree* native plugins — e.g. `MainBlockPlugin`, exposed as
-`native.NativePlugin.main_block()` — compiled straight into the shipped
-extension. Those aren't covered here; they're an internal fast-path, not an
-extension mechanism.)
+Built-ins ship in the default wheel and need no toolchain — author one by adding
+an impl to the runtime crate (see
+[CONTRIBUTING.md → Adding a plugin](CONTRIBUTING.md#adding-a-plugin)). This
+document is about **external** native plugins: ones you compile in your own
+crate and load at runtime, without forking dead-cst. The `[build-plugin]` extra
+(`pip install dead-cst[build-plugin]`) provides the compile closure.
 
 ---
 
@@ -101,9 +96,9 @@ impl ExternalPlugin for KeepMainBlocksAlive {
 
 `PluginCtx` deliberately exposes a small, stable, **index-based** surface
 rather than the whole internal `ProjectContext`, and `PluginOps` emits through
-named methods instead of internal op types. The contract is the same
-frozen-graph one as Python plugins: the plugin observes the base graph only;
-its emissions are applied in a single batch after every plugin returns. No
+named methods instead of internal op types. The contract is a frozen-graph
+one: the plugin observes the base graph only; its emissions are applied in a
+single batch after every plugin returns. No
 `Python<'_>` token is ever exposed — `PluginCtx` reads `#[pyclass(frozen)]`
 data directly.
 
@@ -146,13 +141,13 @@ delegate to the same query core as the `query(ctx)` DSL, so they agree with it;
 they're the project-wide analogue of the per-file
 [`PluginFileCtx`](#per-file-plugins-optional-salsa-cached) helpers.
 
-`PluginOps` — emit ops (mirrors the three Python graph ops):
+`PluginOps` — emit ops (each maps to one host `PreparedOp`):
 
-| method | mirrors | what |
+| method | host op | what |
 |---|---|---|
-| `keep_alive(decl_idx, marker)` | `AddEntrypointByIdx` | make a node a reachability seed |
-| `add_edge(src_idx, dst_idx, flags)` | `AddEdgeByIdx` | add `src -> dst` between existing nodes; `flags` is `0` or one of `plugin_api::FLAG_DEAD_BRANCH` / `FLAG_DYNAMIC_IMPORT` |
-| `add_synthetic_node(fqname, flags, edges_to_idx, edges_from_idx)` | `AddNodeByIdx` | mint a `synthetic` node with out-edges (`edges_to_idx`) and in-edges (`edges_from_idx`); set `flags = plugin_api::FLAG_ENTRYPOINT` to make it a seed |
+| `keep_alive(decl_idx, marker)` | `PreparedOp::Entrypoint` | make a node a reachability seed |
+| `add_edge(src_idx, dst_idx, flags)` | `PreparedOp::Edge` | add `src -> dst` between existing nodes; `flags` is `0` or one of `plugin_api::FLAG_DEAD_BRANCH` / `FLAG_DYNAMIC_IMPORT` |
+| `add_synthetic_node(fqname, flags, edges_to_idx, edges_from_idx)` | `PreparedOp::Node` | mint a `synthetic` node with out-edges (`edges_to_idx`) and in-edges (`edges_from_idx`); set `flags = plugin_api::FLAG_ENTRYPOINT` to make it a seed |
 
 Endpoint indices are bounds-checked by the host at apply time — a dangling
 index is rejected cleanly rather than minting an unconnected node.
@@ -316,7 +311,7 @@ The split keeps the cost where it belongs:
 
 | install | download | installed | for |
 |---|---|---|---|
-| `dead-cst` | ~25 MB | ~60 MB | everyone — analysis, the CLI, Python plugins |
+| `dead-cst` | ~25 MB | ~60 MB | everyone — analysis, the CLI, the built-in plugins |
 | `dead-cst[build-plugin]` | +~130 MB | +~320 MB | authoring native plugins |
 
 The base `dead-cst` macOS/Linux wheel carries the shared runtime dylib + libstd
@@ -359,5 +354,7 @@ This is a preview. Known gaps:
   manylinux build image).
 - **Recompile per release**, by design (full Rust fidelity has no stable ABI).
   The airlock makes a mismatch a clean error, not a crash.
-- **Python plugins remain the supported extension path** for anything that
-  doesn't specifically need native speed or plugin-defined salsa queries.
+- **External native plugins are the only out-of-tree extension path** — there
+  is no Python plugin protocol — so extending dead-cst without forking means
+  either opting into this preview or contributing a built-in to the runtime
+  crate upstream.

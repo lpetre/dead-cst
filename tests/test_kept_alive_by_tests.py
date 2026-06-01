@@ -12,7 +12,6 @@ from __future__ import annotations
 from dead_cst import NodeFlags
 from dead_cst import _native as native
 from dead_cst.graph import KEEPALIVE_DEFAULT
-from dead_cst.contrib import UnittestPlugin
 
 
 def find_reachable_excluding_tests(graph):
@@ -68,13 +67,11 @@ def test_production_only_decl_survives_strict_pass(make_analysis, write_files):
             """,
         }
     )
-    from dead_cst.plugins import MainBlockPlugin
-
     graph = make_analysis(
-        plugins=[MainBlockPlugin(), native.NativePlugin.pytest()]
+        plugins=[native.NativePlugin.main_block(), native.NativePlugin.pytest()]
     ).materialize_all()
     helper = next(n for n in graph.nodes() if n.fqname == "pkg.lib.helper")
-    # ``MainBlockPlugin`` keeps it alive without any test seed.
+    # The main_block plugin keeps it alive without any test seed.
     assert helper in find_reachable_excluding_tests(graph)
     assert helper not in find_kept_alive_by_tests_only(graph)
 
@@ -93,7 +90,7 @@ def test_unittest_kept_alive_by_tests(make_analysis, write_files):
             """,
         }
     )
-    graph = make_analysis(plugins=[UnittestPlugin()]).materialize_all()
+    graph = make_analysis(plugins=[native.NativePlugin.unittest()]).materialize_all()
     helper = next(n for n in graph.nodes() if n.fqname == "pkg.lib.helper")
     assert helper in set(graph.reachable(seed_flags=KEEPALIVE_DEFAULT))
     assert helper in find_kept_alive_by_tests_only(graph)

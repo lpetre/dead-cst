@@ -1,13 +1,12 @@
-"""Tests for :class:`InitSubclassPlugin`."""
+"""Tests for the native ``init_subclass`` plugin (``NativePlugin.init_subclass``)."""
 
 from __future__ import annotations
 
 from dead_cst import _native as native
-from dead_cst.plugins import (
-    InitSubclassPlugin,
-    MainBlockPlugin,
-)
-from dead_cst.plugins.init_subclass import INIT_SUBCLASS_PREFIX
+
+# Synthetic marker-node prefix the native backend emits for each
+# ``__init_subclass__``-defining base (runtime/src/native_plugins.rs).
+INIT_SUBCLASS_PREFIX = "<__init_subclass__>:"
 
 
 def test_init_subclass_keeps_subclass_alive_via_parent(
@@ -41,7 +40,7 @@ def test_init_subclass_keeps_subclass_alive_via_parent(
     graph = make_analysis(
         plugins=[
             native.NativePlugin.explicit([], ["pkg.base.Plugin"], []),
-            InitSubclassPlugin(),
+            native.NativePlugin.init_subclass(),
         ]
     ).materialize_all()
     reached = reachable_fqnames(graph)
@@ -73,7 +72,7 @@ def test_init_subclass_transitive_subclasses(make_analysis, write_files, reachab
     graph = make_analysis(
         plugins=[
             native.NativePlugin.explicit([], ["pkg.mod.Root"], []),
-            InitSubclassPlugin(),
+            native.NativePlugin.init_subclass(),
         ]
     ).materialize_all()
     reached = reachable_fqnames(graph)
@@ -100,7 +99,7 @@ def test_init_subclass_does_not_seed_parent_entrypoint(build_plugin_graph, reach
                 pass
             """,
         },
-        [InitSubclassPlugin()],
+        [native.NativePlugin.init_subclass()],
     )
     reached = reachable_fqnames(graph)
     assert "pkg.base.Plugin" not in reached
@@ -141,7 +140,7 @@ def test_init_subclass_via_main_block(build_plugin_graph, reachable_fqnames):
                 run()
             """,
         },
-        [MainBlockPlugin(), InitSubclassPlugin()],
+        [native.NativePlugin.main_block(), native.NativePlugin.init_subclass()],
     )
     reached = reachable_fqnames(graph)
     assert "pkg.base.Handler" in reached
@@ -169,7 +168,7 @@ def test_init_subclass_aliased_import(make_analysis, write_files, reachable_fqna
     graph = make_analysis(
         plugins=[
             native.NativePlugin.explicit([], ["pkg.base.Plugin"], []),
-            InitSubclassPlugin(),
+            native.NativePlugin.init_subclass(),
         ]
     ).materialize_all()
     assert "pkg.impls.Foo" in reachable_fqnames(graph)
@@ -195,7 +194,7 @@ def test_init_subclass_dotted_attribute_base(make_analysis, write_files, reachab
     graph = make_analysis(
         plugins=[
             native.NativePlugin.explicit([], ["pkg.base.Plugin"], []),
-            InitSubclassPlugin(),
+            native.NativePlugin.init_subclass(),
         ]
     ).materialize_all()
     assert "pkg.impls.Foo" in reachable_fqnames(graph)
@@ -225,7 +224,7 @@ def test_init_subclass_class_without_init_subclass_no_edges(
     graph = make_analysis(
         plugins=[
             native.NativePlugin.explicit([], ["pkg.base.Plain"], []),
-            InitSubclassPlugin(),
+            native.NativePlugin.init_subclass(),
         ]
     ).materialize_all()
     reached = reachable_fqnames(graph)
@@ -267,7 +266,7 @@ def test_init_subclass_keeps_subclass_method_references_alive(
     graph = make_analysis(
         plugins=[
             native.NativePlugin.explicit([], ["pkg.base.Plugin"], []),
-            InitSubclassPlugin(),
+            native.NativePlugin.init_subclass(),
         ]
     ).materialize_all()
     reached = reachable_fqnames(graph)
@@ -302,7 +301,7 @@ def test_init_subclass_subscripted_base(make_analysis, write_files, reachable_fq
     graph = make_analysis(
         plugins=[
             native.NativePlugin.explicit([], ["pkg.base.Plugin"], []),
-            InitSubclassPlugin(),
+            native.NativePlugin.init_subclass(),
         ]
     ).materialize_all()
     assert "pkg.impls.Foo" in reachable_fqnames(graph)
@@ -330,7 +329,7 @@ def test_init_subclass_marker_in_predecessor_chain(make_analysis, write_files, p
     graph = make_analysis(
         plugins=[
             native.NativePlugin.explicit([], ["pkg.base.Plugin"], []),
-            InitSubclassPlugin(),
+            native.NativePlugin.init_subclass(),
         ]
     ).materialize_all()
     foo = next(n for n in graph.nodes() if n.fqname == "pkg.impls.Foo")

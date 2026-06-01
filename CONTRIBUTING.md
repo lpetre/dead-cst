@@ -56,7 +56,7 @@ src/lib.rs            # thin pyo3 cdylib shim -> dead_cst._native (builds via ma
 runtime/              # dead-cst-runtime crate: the whole impl, built as rlib + dylib
   src/lib.rs          # register() (the pymodule body) + top-level query() helper
   src/project.rs      # Project / ProjectContext / build() pipeline
-  src/builder.rs      # GraphBuilder, AddNode / AddEdge / AddEntrypoint, BFS
+  src/builder.rs      # GraphBuilder, PreparedOp (Node / Edge / Entrypoint), BFS
   src/graph.rs        # SymbolNode / Import / NativeGraph / NodeFlags / EdgeFlags
   src/ingest.rs       # the three build phases (decls / chain / references)
   src/query.rs        # plugin-facing chainable query builder
@@ -68,12 +68,12 @@ plugin-host/          # dead-cst-plugin-host package: the `[build-plugin]` extra
 python/dead_cst/      # Python source tree (ships alongside _native.so in the wheel)
   __init__.py         # public API: Analysis, SymbolNode, Import, NodeFlags, EdgeFlags
   analyze.py          # Analysis (wraps the rust ProjectContext for BFS queries)
-  cli.py              # build / analyze / remove + builtin plugin & resolver maps
+  cli.py              # build / analyze / remove + plugin/resolver CLI wiring
   codemod.py          # remove_code, generate_patch (only stage still on libcst)
   graph.py            # graph data types + write_graph / read_graph / LoadedGraph
   _native.pyi         # hand-written type stubs for the rust extension
-  plugins/            # generic-Python plugins (main_block, project_scripts, …)
-  contrib/            # framework-aware plugins + UvResolver
+  plugins/            # public synthetic-node prefix constants + simple_name (_core.py)
+  contrib/            # third-party-aware extensions (public namespace)
   resolvers/          # PathResolver, ManualResolver
 tests/                # fixture-driven pytest suite (e2e under tests/e2e/)
 ```
@@ -86,67 +86,46 @@ snapshot.
 
 ## Adding a plugin
 
-Define a class that subclasses `dead_cst.plugins.Plugin` and
-implements `run(ctx) -> Iterable[GraphOp]`:
+Every built-in plugin is a native (Rust) `NativePlugin`; there is no
+Python `Plugin` protocol. Built-ins are constructed via factories —
+`NativePlugin.main_block()`, `NativePlugin.pytest()`,
+`NativePlugin.flask()` … `NativePlugin.celery()`, `NativePlugin.click()`,
+`NativePlugin.mock_patch()`, `NativePlugin.discordpy()`, and the rest.
 
-```python
-from dead_cst.plugins import Plugin
-from dead_cst._native import AddEntrypoint, query
+To add a built-in, write the impl in the runtime crate
+(`runtime/src/native_plugins.rs` — see `ClickPluginImpl`,
+`DispatchAppPluginImpl`, and friends) and wire its `--plugin` name into
+`_builtin_native_plugin`. The CLI's `_load_plugin` resolves a name
+through that native registry first, then falls back to the
+`dead_cst.plugins` entry-point group.
 
-class MyPlugin(Plugin):
-    def run(self, ctx):
-        for ref in query(ctx).decorators().where_module("myframework").collect():
-            yield AddEntrypoint(ref.owner)
-```
+A plugin builds against the query surface on `native.ProjectContext` —
+`find_subclasses`, `find_module`, `find_declarations`, `module_for`,
+`find_main_blocks`, etc. — plus the chainable
+`query(ctx).decorators().where_module(...).where_name(...)` /
+`.constructions()...` / `.calls()...` builder. The same DSL is callable
+from Python against a materialized context (`native.query(ctx)`); each
+`collect()` returns index-keyed rows (e.g.
+`DecoratorIdxRef.decorated_idx`). See `python/dead_cst/_native.pyi` for
+the full surface.
 
-For common shapes, subclass one of the declarative bases in
-`dead_cst/plugins/decl_shapes.py`:
-
-* `DecoratedDeclPlugin` — decorated decls in files matching a search
-  path.
-* `LiteralListPlugin` — `<owner>.<var> = ['fqn', ...]` registries.
-
-The `@<instance>.<reg>(...)` dispatch-app shape (Flask / FastAPI /
-Typer / Cyclopts / Slack Bolt / FastMCP / Celery) is a native (Rust)
-plugin — `NativePlugin.flask()` … `NativePlugin.celery()` — not a
-Python base.
-
-Drop generic-Python plugins in `dead_cst/plugins/<name>.py`
-(re-exported from `dead_cst/plugins/__init__.py`); drop
-framework-aware plugins in `dead_cst/contrib/<name>.py` (re-exported
-from `dead_cst/contrib/__init__.py`). Register the CLI key in
-`_BUILTIN_PLUGINS` in `dead_cst/cli.py`, importing the plugin
-directly.
-
-Out-of-tree plugins register under the `dead_cst.plugins`
-entry-point group:
+Out-of-tree plugins register under the `dead_cst.plugins` entry-point
+group; the target must resolve to (or return) a `NativePlugin`:
 
 ```toml
 [project.entry-points."dead_cst.plugins"]
-my_plugin = "myproj.plugins:MyPlugin"
+my_plugin = "myproj.plugins:make_plugin"  # -> NativePlugin
 ```
-
-The CLI's `_load_plugin` checks `_BUILTIN_PLUGINS` first, then the
-entry-point group.
-
-The reusable `DecoratedDeclPlugin` / `LiteralListPlugin` shapes in
-`dead_cst/plugins/decl_shapes.py` are the reference scaffolding for a
-Python framework plugin (decorated-decl → handler edges, or
-`<owner>.<var> = [...]` literal lists). Every in-tree framework plugin
-is now native — Click and the dispatch-app frameworks (Flask / FastAPI
-/ Typer / Cyclopts / Slack Bolt / FastMCP / Celery), plus pytest,
-mock_patch, and discordpy — see `ClickPluginImpl`,
-`DispatchAppPluginImpl`, and friends in `runtime/src/native_plugins.rs`.
 
 ### Native plugins
 
-For hot logic — or plugins that want their own salsa-cached queries over ty's
-database — there's a Rust path: an external native plugin compiled against the
-runtime `dylib` and loaded via `native.load_native_plugins(...)`. It's a
-preview (macOS only) and a bigger commitment (a pinned Rust toolchain,
-recompile per release). See **[`NATIVE_PLUGINS.md`](NATIVE_PLUGINS.md)** and the
-worked **`examples/main_block_plugin/`**. Prefer a Python plugin unless you
-specifically need native speed or plugin-defined salsa queries.
+An out-of-tree `NativePlugin` is a Rust plugin compiled against the
+runtime `dylib` and loaded via `native.load_native_plugins(...)`; it can
+define its own salsa-cached queries over ty's database. The author flow
+is `pip install dead-cst[build-plugin]` then `dead-cst build-plugin
+<PLUGIN.rs>` — a preview (macOS + Linux, pinned Rust toolchain,
+recompile per release). See **[`NATIVE_PLUGINS.md`](NATIVE_PLUGINS.md)**
+and the worked **`examples/main_block_plugin/`**.
 
 ## Adding a resolver
 

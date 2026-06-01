@@ -2,47 +2,16 @@
 :class:`DecoratorQuery` and :class:`CallQuery`, plus the ``args`` /
 ``kwargs`` payload on :class:`DecoratorRef` and :class:`CallRef`.
 
-Each test materializes a small project through ``ProjectContext``, runs
-one plugin that captures refs in a module-level holder, and asserts on
-the captured payload.
+Each test materializes a small project, then drives the chainable
+``native.query(ctx)`` DSL directly against the built graph and asserts
+on the matched refs / their arg payloads.
 """
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Any
-
 import pytest
 
 native = pytest.importorskip("dead_cst._native")
-
-
-@pytest.fixture
-def make_ctx(tmp_path: Path):
-    """Write ``{relpath: source}`` files and return a fresh ProjectContext."""
-
-    def make(files: dict[str, str], **kwargs) -> native.ProjectContext:
-        for relpath, source in files.items():
-            target = tmp_path / relpath
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(source, encoding="utf-8")
-        return native.ProjectContext(str(tmp_path), **kwargs)
-
-    return make
-
-
-class _CapturePlugin:
-    """Run a caller-supplied callable on ``ctx`` and stash its result."""
-
-    name = "capture"
-
-    def __init__(self, fn) -> None:
-        self.fn = fn
-        self.result: Any = None
-
-    def run(self, ctx: "native.ProjectContext"):
-        self.result = self.fn(ctx)
-        return ()
 
 
 # ---------------------------------------------------------------------------
@@ -50,35 +19,11 @@ class _CapturePlugin:
 # ---------------------------------------------------------------------------
 
 
-def test_where_kwarg_matches_list_literal(make_ctx):
+def test_where_kwarg_matches_list_literal(build_decl_graph):
     """A function decorated ``@app.route("/x", methods=["GET"])`` is
     matched by ``.where_kwarg("methods", ["GET"])`` and is NOT matched
     by ``.where_kwarg("methods", ["POST"])``."""
-
-    def capture(ctx):
-        get_refs = (
-            native.query(ctx)
-            .decorators()
-            .where_owner_attr(["route"])
-            .where_kwarg("methods", ["GET"])
-            .collect()
-        )
-        post_refs = (
-            native.query(ctx)
-            .decorators()
-            .where_owner_attr(["route"])
-            .where_kwarg("methods", ["POST"])
-            .collect()
-        )
-        any_route = native.query(ctx).decorators().where_owner_attr(["route"]).collect()
-        nodes = ctx.nodes()
-        return {
-            "get": [nodes[r.decorated_idx].fqname for r in get_refs],
-            "post": [nodes[r.decorated_idx].fqname for r in post_refs],
-            "any": [nodes[r.decorated_idx].fqname for r in any_route],
-        }
-
-    ctx = make_ctx(
+    ctx = build_decl_graph(
         {
             "app.py": (
                 "class App:\n"
@@ -95,33 +40,35 @@ def test_where_kwarg_matches_list_literal(make_ctx):
             ),
         }
     )
-    plugin = _CapturePlugin(capture)
-    ctx.add_plugin(plugin)
-    ctx.materialize()
-    assert plugin.result["get"] == ["app.get_handler"]
-    assert plugin.result["post"] == ["app.post_handler"]
+    nodes = ctx.nodes()
+    get_refs = (
+        native.query(ctx)
+        .decorators()
+        .where_owner_attr(["route"])
+        .where_kwarg("methods", ["GET"])
+        .collect()
+    )
+    post_refs = (
+        native.query(ctx)
+        .decorators()
+        .where_owner_attr(["route"])
+        .where_kwarg("methods", ["POST"])
+        .collect()
+    )
+    any_route = native.query(ctx).decorators().where_owner_attr(["route"]).collect()
+    assert [nodes[r.decorated_idx].fqname for r in get_refs] == ["app.get_handler"]
+    assert [nodes[r.decorated_idx].fqname for r in post_refs] == ["app.post_handler"]
     # Sanity: without the filter both decorated funcs land.
-    assert sorted(plugin.result["any"]) == [
+    assert sorted(nodes[r.decorated_idx].fqname for r in any_route) == [
         "app.get_handler",
         "app.post_handler",
     ]
 
 
-def test_where_kwarg_missing_kwarg_never_matches(make_ctx):
+def test_where_kwarg_missing_kwarg_never_matches(build_decl_graph):
     """``@app.route("/x")`` (no ``methods=`` kwarg) is NOT matched by
     ``.where_kwarg("methods", ["GET"])``."""
-
-    def capture(ctx):
-        refs = (
-            native.query(ctx)
-            .decorators()
-            .where_owner_attr(["route"])
-            .where_kwarg("methods", ["GET"])
-            .collect()
-        )
-        return [r.decorated.fqname for r in refs]
-
-    ctx = make_ctx(
+    ctx = build_decl_graph(
         {
             "app.py": (
                 "class App:\n"
@@ -135,10 +82,14 @@ def test_where_kwarg_missing_kwarg_never_matches(make_ctx):
             ),
         }
     )
-    plugin = _CapturePlugin(capture)
-    ctx.add_plugin(plugin)
-    ctx.materialize()
-    assert plugin.result == []
+    refs = (
+        native.query(ctx)
+        .decorators()
+        .where_owner_attr(["route"])
+        .where_kwarg("methods", ["GET"])
+        .collect()
+    )
+    assert [r.decorated.fqname for r in refs] == []
 
 
 def _unwrap_arg(arg):
@@ -160,21 +111,11 @@ def _unwrap_arg(arg):
     raise TypeError(f"unexpected arg shape: {type(arg)!r}")
 
 
-def test_decorator_ref_args_kwargs_populated(make_ctx):
+def test_decorator_ref_args_kwargs_populated(build_decl_graph):
     """``@app.route("/x", methods=["GET"], strict_slashes=False)``
     surfaces both ``args`` and ``kwargs`` as the discriminated-union
     shape on the matched ref."""
-
-    def capture(ctx):
-        refs = native.query(ctx).decorators().where_owner_attr(["route"]).with_args(True).collect()
-        assert len(refs) == 1
-        ref = refs[0]
-        return {
-            "args": [_unwrap_arg(a) for a in ref.args],
-            "kwargs": {k: _unwrap_arg(v) for k, v in ref.kwargs.items()},
-        }
-
-    ctx = make_ctx(
+    ctx = build_decl_graph(
         {
             "app.py": (
                 "class App:\n"
@@ -188,27 +129,20 @@ def test_decorator_ref_args_kwargs_populated(make_ctx):
             ),
         }
     )
-    plugin = _CapturePlugin(capture)
-    ctx.add_plugin(plugin)
-    ctx.materialize()
-    assert plugin.result["args"] == ["/x"]
-    assert plugin.result["kwargs"] == {
+    refs = native.query(ctx).decorators().where_owner_attr(["route"]).with_args(True).collect()
+    assert len(refs) == 1
+    ref = refs[0]
+    assert [_unwrap_arg(a) for a in ref.args] == ["/x"]
+    assert {k: _unwrap_arg(v) for k, v in ref.kwargs.items()} == {
         "methods": ["GET"],
         "strict_slashes": False,
     }
 
 
-def test_decorator_ref_args_kwargs_empty_for_bare_decorator(make_ctx):
+def test_decorator_ref_args_kwargs_empty_for_bare_decorator(build_decl_graph):
     """A bare ``@app.route`` (no ``()``) surfaces empty ``args`` /
     ``kwargs`` on the matched ref."""
-
-    def capture(ctx):
-        refs = native.query(ctx).decorators().where_owner_attr(["route"]).collect()
-        assert len(refs) == 1
-        ref = refs[0]
-        return {"args": list(ref.args), "kwargs": dict(ref.kwargs)}
-
-    ctx = make_ctx(
+    ctx = build_decl_graph(
         {
             "app.py": (
                 "class App:\n"
@@ -222,37 +156,18 @@ def test_decorator_ref_args_kwargs_empty_for_bare_decorator(make_ctx):
             ),
         }
     )
-    plugin = _CapturePlugin(capture)
-    ctx.add_plugin(plugin)
-    ctx.materialize()
-    assert plugin.result == {"args": [], "kwargs": {}}
+    refs = native.query(ctx).decorators().where_owner_attr(["route"]).collect()
+    assert len(refs) == 1
+    ref = refs[0]
+    assert list(ref.args) == []
+    assert dict(ref.kwargs) == {}
 
 
-def test_kwarg_payload_surfaces_nativenode_for_imported_symbol(make_ctx):
+def test_kwarg_payload_surfaces_nativenode_for_imported_symbol(build_decl_graph):
     """``@register(handler=ImportedClass)`` exposes ImportedClass as an
     :class:`ArgNodeRef` in ``ref.kwargs["handler"]`` so plugins can
     anchor inverted edges off the resolved decl."""
-
-    def capture(ctx):
-        refs = (
-            native.query(ctx).decorators().where_owner_attr(["register"]).with_args(True).collect()
-        )
-        nodes = ctx.nodes()
-        out = []
-        for r in refs:
-            handler = r.kwargs.get("handler")
-            handler_fqname = None
-            if isinstance(handler, native.ArgNodeRef):
-                handler_fqname = nodes[handler.idx].fqname
-            out.append(
-                {
-                    "decorated": nodes[r.decorated_idx].fqname,
-                    "handler_fqname": handler_fqname,
-                }
-            )
-        return out
-
-    ctx = make_ctx(
+    ctx = build_decl_graph(
         {
             "events.py": "class UserCreated: pass\n",
             "registry.py": (
@@ -271,15 +186,18 @@ def test_kwarg_payload_surfaces_nativenode_for_imported_symbol(make_ctx):
             ),
         }
     )
-    plugin = _CapturePlugin(capture)
-    ctx.add_plugin(plugin)
-    ctx.materialize()
+    refs = native.query(ctx).decorators().where_owner_attr(["register"]).with_args(True).collect()
+    nodes = ctx.nodes()
+    assert len(refs) == 1
+    ref = refs[0]
+    handler = ref.kwargs.get("handler")
+    assert isinstance(handler, native.ArgNodeRef)
+    assert nodes[ref.decorated_idx].fqname == "handlers.on_user_created"
     # SymbolNode resolution finds the local import alias (handlers.UserCreated),
     # not the upstream class (events.UserCreated) — the alias is the codemod
     # invariant target. Either is acceptable; the test asserts the fqname is one
     # of those two so the resolution succeeded.
-    assert plugin.result[0]["decorated"] == "handlers.on_user_created"
-    assert plugin.result[0]["handler_fqname"] in {
+    assert nodes[handler.idx].fqname in {
         "handlers.UserCreated",
         "events.UserCreated",
     }
@@ -290,36 +208,11 @@ def test_kwarg_payload_surfaces_nativenode_for_imported_symbol(make_ctx):
 # ---------------------------------------------------------------------------
 
 
-def test_call_query_where_kwarg_bool(make_ctx):
+def test_call_query_where_kwarg_bool(build_decl_graph):
     """``mocker.patch("X", autospec=True)`` is matched by
     ``.where_kwarg("autospec", True)``; the ``autospec=False`` form is
     not."""
-
-    def capture(ctx):
-        true_refs = (
-            native.query(ctx)
-            .calls()
-            .where_owner("mocker")
-            .where_attr("patch")
-            .string_arg_at(0)
-            .where_kwarg("autospec", True)
-            .collect()
-        )
-        false_refs = (
-            native.query(ctx)
-            .calls()
-            .where_owner("mocker")
-            .where_attr("patch")
-            .string_arg_at(0)
-            .where_kwarg("autospec", False)
-            .collect()
-        )
-        return {
-            "true": [r.string_arg for r in true_refs],
-            "false": [r.string_arg for r in false_refs],
-        }
-
-    ctx = make_ctx(
+    ctx = build_decl_graph(
         {
             "tests.py": (
                 "def test_a(mocker):\n"
@@ -331,30 +224,31 @@ def test_call_query_where_kwarg_bool(make_ctx):
             ),
         }
     )
-    plugin = _CapturePlugin(capture)
-    ctx.add_plugin(plugin)
-    ctx.materialize()
-    assert plugin.result["true"] == ["pkg.a"]
-    assert plugin.result["false"] == ["pkg.b"]
+    true_refs = (
+        native.query(ctx)
+        .calls()
+        .where_owner("mocker")
+        .where_attr("patch")
+        .string_arg_at(0)
+        .where_kwarg("autospec", True)
+        .collect()
+    )
+    false_refs = (
+        native.query(ctx)
+        .calls()
+        .where_owner("mocker")
+        .where_attr("patch")
+        .string_arg_at(0)
+        .where_kwarg("autospec", False)
+        .collect()
+    )
+    assert [r.string_arg for r in true_refs] == ["pkg.a"]
+    assert [r.string_arg for r in false_refs] == ["pkg.b"]
 
 
-def test_call_query_where_kwarg_multiple_and_together(make_ctx):
+def test_call_query_where_kwarg_multiple_and_together(build_decl_graph):
     """Two ``.where_kwarg`` calls AND together — both kwargs must match."""
-
-    def capture(ctx):
-        refs = (
-            native.query(ctx)
-            .calls()
-            .where_owner("mocker")
-            .where_attr("patch")
-            .string_arg_at(0)
-            .where_kwarg("autospec", True)
-            .where_kwarg("create", True)
-            .collect()
-        )
-        return [r.string_arg for r in refs]
-
-    ctx = make_ctx(
+    ctx = build_decl_graph(
         {
             "tests.py": (
                 "def test_a(mocker):\n"
@@ -366,47 +260,43 @@ def test_call_query_where_kwarg_multiple_and_together(make_ctx):
             ),
         }
     )
-    plugin = _CapturePlugin(capture)
-    ctx.add_plugin(plugin)
-    ctx.materialize()
-    assert plugin.result == ["pkg.a"]
+    refs = (
+        native.query(ctx)
+        .calls()
+        .where_owner("mocker")
+        .where_attr("patch")
+        .string_arg_at(0)
+        .where_kwarg("autospec", True)
+        .where_kwarg("create", True)
+        .collect()
+    )
+    assert [r.string_arg for r in refs] == ["pkg.a"]
 
 
-def test_call_ref_args_kwargs_populated(make_ctx):
+def test_call_ref_args_kwargs_populated(build_decl_graph):
     """``mocker.patch("X", autospec=True, foo=1)`` surfaces all args
     and kwargs on the matched ref (as the discriminated-union shape)."""
-
-    def capture(ctx):
-        refs = (
-            native.query(ctx)
-            .calls()
-            .where_owner("mocker")
-            .where_attr("patch")
-            .string_arg_at(0)
-            .with_args(True)
-            .collect()
-        )
-        assert len(refs) == 1
-        ref = refs[0]
-        return {
-            "string_arg": ref.string_arg,
-            "args": [_unwrap_arg(a) for a in ref.args],
-            "kwargs": {k: _unwrap_arg(v) for k, v in ref.kwargs.items()},
-        }
-
-    ctx = make_ctx(
+    ctx = build_decl_graph(
         {
             "tests.py": (
                 "def test_a(mocker):\n    mocker.patch('pkg.a', autospec=True, count=3)\n"
             ),
         }
     )
-    plugin = _CapturePlugin(capture)
-    ctx.add_plugin(plugin)
-    ctx.materialize()
-    assert plugin.result["string_arg"] == "pkg.a"
-    assert plugin.result["args"] == ["pkg.a"]
-    assert plugin.result["kwargs"] == {"autospec": True, "count": 3}
+    refs = (
+        native.query(ctx)
+        .calls()
+        .where_owner("mocker")
+        .where_attr("patch")
+        .string_arg_at(0)
+        .with_args(True)
+        .collect()
+    )
+    assert len(refs) == 1
+    ref = refs[0]
+    assert ref.string_arg == "pkg.a"
+    assert [_unwrap_arg(a) for a in ref.args] == ["pkg.a"]
+    assert {k: _unwrap_arg(v) for k, v in ref.kwargs.items()} == {"autospec": True, "count": 3}
 
 
 # ---------------------------------------------------------------------------
@@ -414,58 +304,32 @@ def test_call_ref_args_kwargs_populated(make_ctx):
 # ---------------------------------------------------------------------------
 
 
-def test_where_kwarg_with_nativenode_raises(make_ctx):
+def test_where_kwarg_with_nativenode_raises(build_decl_graph):
     """``where_kwarg`` is literal-only; passing a ``SymbolNode`` errors."""
-
-    captured: list[Exception] = []
-
-    def capture(ctx):
-        mod_idx = native.query(ctx).modules().with_fqn("tests").first_idx()
-        assert mod_idx is not None
-        mod = ctx.nodes_at([mod_idx])[0]
-        try:
-            (
-                native.query(ctx)
-                .calls()
-                .where_owner("mocker")
-                .where_attr("patch")
-                .string_arg_at(0)
-                .where_kwarg("new_callable", mod)
-            )
-        except Exception as exc:
-            captured.append(exc)
-        return None
-
-    ctx = make_ctx({"tests.py": "x = 1\n"})
-    plugin = _CapturePlugin(capture)
-    ctx.add_plugin(plugin)
-    ctx.materialize()
-    assert captured, "expected an error from where_kwarg(SymbolNode)"
-    assert "where_kwarg value must be" in str(captured[0])
+    ctx = build_decl_graph({"tests.py": "x = 1\n"})
+    mod_idx = native.query(ctx).modules().with_fqn("tests").first_idx()
+    assert mod_idx is not None
+    mod = ctx.nodes_at([mod_idx])[0]
+    with pytest.raises(Exception, match="where_kwarg value must be"):
+        (
+            native.query(ctx)
+            .calls()
+            .where_owner("mocker")
+            .where_attr("patch")
+            .string_arg_at(0)
+            .where_kwarg("new_callable", mod)
+        )
 
 
-def test_where_kwarg_rejects_unknown_value_type(make_ctx):
+def test_where_kwarg_rejects_unknown_value_type(build_decl_graph):
     """``where_kwarg`` errors on a Python value that's not a literal."""
-
-    captured: list[Exception] = []
-
-    def capture(ctx):
-        try:
-            (
-                native.query(ctx)
-                .calls()
-                .where_owner("mocker")
-                .where_attr("patch")
-                .string_arg_at(0)
-                .where_kwarg("foo", object())
-            )
-        except Exception as exc:
-            captured.append(exc)
-        return None
-
-    ctx = make_ctx({"tests.py": "x = 1\n"})
-    plugin = _CapturePlugin(capture)
-    ctx.add_plugin(plugin)
-    ctx.materialize()
-    assert captured, "expected an error from where_kwarg(object())"
-    assert "where_kwarg value must be" in str(captured[0])
+    ctx = build_decl_graph({"tests.py": "x = 1\n"})
+    with pytest.raises(Exception, match="where_kwarg value must be"):
+        (
+            native.query(ctx)
+            .calls()
+            .where_owner("mocker")
+            .where_attr("patch")
+            .string_arg_at(0)
+            .where_kwarg("foo", object())
+        )

@@ -5,9 +5,6 @@ from __future__ import annotations
 import pytest
 
 from dead_cst import _native as native
-from dead_cst.plugins import (
-    MainBlockPlugin,
-)
 
 
 def test_cyclopts_plugin_marks_command_handlers(build_plugin_graph, reachable_fqnames):
@@ -34,7 +31,7 @@ def test_cyclopts_plugin_marks_command_handlers(build_plugin_graph, reachable_fq
                 app()
             """,
         },
-        [MainBlockPlugin(), native.NativePlugin.cyclopts()],
+        [native.NativePlugin.main_block(), native.NativePlugin.cyclopts()],
     )
     reached = reachable_fqnames(graph)
     assert "cli.main.app" in reached
@@ -73,7 +70,7 @@ def test_cyclopts_plugin_keeps_handler_dependencies_alive(build_plugin_graph, re
                 app()
             """,
         },
-        [MainBlockPlugin(), native.NativePlugin.cyclopts()],
+        [native.NativePlugin.main_block(), native.NativePlugin.cyclopts()],
     )
     reached = reachable_fqnames(graph)
     assert "cli.main.show" in reached
@@ -159,7 +156,7 @@ def test_cyclopts_plugin_unused_subapp_stays_dead(build_plugin_graph, reachable_
                 app()
             """,
         },
-        [MainBlockPlugin(), native.NativePlugin.cyclopts()],
+        [native.NativePlugin.main_block(), native.NativePlugin.cyclopts()],
     )
     reached = reachable_fqnames(graph)
     assert "cli.main.hello" in reached
@@ -196,7 +193,7 @@ def test_cyclopts_plugin_subapp_reachable_via_command_attach(build_plugin_graph,
                 app()
             """,
         },
-        [MainBlockPlugin(), native.NativePlugin.cyclopts()],
+        [native.NativePlugin.main_block(), native.NativePlugin.cyclopts()],
     )
     reached = reachable_fqnames(graph)
     assert "cli.main.app" in reached
@@ -255,7 +252,7 @@ def test_cyclopts_plugin_subapp_reachable_via_command_attach(build_plugin_graph,
 def test_cyclopts_plugin_handles_import_variants(build_plugin_graph, reachable_fqnames, src):
     graph = build_plugin_graph(
         {"cli/__init__.py": "", "cli/main.py": src},
-        [MainBlockPlugin(), native.NativePlugin.cyclopts()],
+        [native.NativePlugin.main_block(), native.NativePlugin.cyclopts()],
     )
     assert "cli.main.hello" in reachable_fqnames(graph)
 
@@ -279,7 +276,7 @@ def test_cyclopts_plugin_ignores_bare_decorators(build_plugin_graph, reachable_f
                 app()
             """,
         },
-        [MainBlockPlugin(), native.NativePlugin.cyclopts()],
+        [native.NativePlugin.main_block(), native.NativePlugin.cyclopts()],
     )
     # Bare ``@command`` (no attribute access) is not a cyclopts registration --
     # matching it would clobber unrelated decorators with the same name.
@@ -350,7 +347,7 @@ def test_cyclopts_plugin_multiple_instances_in_one_module(build_plugin_graph, re
                 app()
             """,
         },
-        [MainBlockPlugin(), native.NativePlugin.cyclopts()],
+        [native.NativePlugin.main_block(), native.NativePlugin.cyclopts()],
     )
     reached = reachable_fqnames(graph)
     # ``app`` is reached via the main block; its command is alive.
@@ -380,7 +377,7 @@ def test_cyclopts_plugin_ignores_import_star(build_plugin_graph, reachable_fqnam
                 app()
             """,
         },
-        [MainBlockPlugin(), native.NativePlugin.cyclopts()],
+        [native.NativePlugin.main_block(), native.NativePlugin.cyclopts()],
     )
     # No instance edge from ``app`` to ``hello`` because the plugin ignores
     # star imports. ``hello`` is not referenced by anything reachable.

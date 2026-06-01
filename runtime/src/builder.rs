@@ -1,8 +1,7 @@
 //! Graph-construction primitives: `NodeKey` (positional identity for an
 //! interned node), `GraphBuilder` (the in-progress graph), the
-//! plugin-facing graph ops (`AddNode`/`AddEdge`/`AddEntrypoint`), the
-//! generic BFS walker, and the batched `apply_prepared_batch`
-//! apply pass.
+//! `PreparedOp` mutation vocabulary native plugins emit, the generic
+//! BFS walker, and the batched `apply_prepared_batch` apply pass.
 
 use std::sync::OnceLock;
 
@@ -12,7 +11,7 @@ use ruff_db::files::File;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::file_payload::ImportPayload;
-use crate::graph::{intern_kind, Import, SymbolNode};
+use crate::graph::{Import, SymbolNode};
 use crate::helpers::NODE_FLAG_ENTRYPOINT;
 use crate::project::ProjectContext;
 
@@ -227,207 +226,6 @@ impl GraphBuilder {
     }
 }
 
-/// Add an edge between two interned nodes.
-///
-/// ``flags`` carries ``DEAD_BRANCH`` / future edge classifications.
-/// Plugins yield this from ``run(ctx)`` instead of mutating the graph
-/// directly so the apply pass is a single atomic step on the rust side.
-#[pyclass(frozen, get_all)]
-pub(crate) struct AddEdge {
-    pub(crate) src: Py<SymbolNode>,
-    pub(crate) dst: Py<SymbolNode>,
-    pub(crate) flags: u32,
-}
-
-#[pymethods]
-impl AddEdge {
-    #[new]
-    #[pyo3(signature = (src, dst, *, flags = 0))]
-    fn new(src: Py<SymbolNode>, dst: Py<SymbolNode>, flags: u32) -> Self {
-        Self { src, dst, flags }
-    }
-}
-
-/// Index-keyed variant of :class:`AddEdge`. Accepts positional
-/// indices into ``ctx.nodes()`` instead of ``SymbolNode`` references.
-///
-/// Lets plugins that already work in index space (e.g. paired with
-/// :meth:`DeclQuery.indices` or :meth:`ProjectContext.indices_where`)
-/// emit edges without ever round-tripping through ``Py<SymbolNode>``.
-/// The apply pass treats it identically to :class:`AddEdge` once the
-/// indices land in :meth:`GraphBuilder::add_edge`.
-///
-/// Raises :class:`IndexError` at apply time when either endpoint is
-/// out of range for the current graph snapshot.
-#[pyclass(frozen, get_all)]
-pub(crate) struct AddEdgeByIdx {
-    pub(crate) src_idx: usize,
-    pub(crate) dst_idx: usize,
-    pub(crate) flags: u32,
-}
-
-#[pymethods]
-impl AddEdgeByIdx {
-    #[new]
-    #[pyo3(signature = (src_idx, dst_idx, *, flags = 0))]
-    fn new(src_idx: usize, dst_idx: usize, flags: u32) -> Self {
-        Self {
-            src_idx,
-            dst_idx,
-            flags,
-        }
-    }
-}
-
-/// Mark ``decl`` as an entrypoint.
-///
-/// ``marker`` is a self-documenting label (``"<celery-worker>"``,
-/// ``"<external-execution>:alembic"``, ...) shown in ``why-alive`` to
-/// explain *why* the decl is alive without minting a synthetic graph
-/// node for the reason.
-#[pyclass(frozen, get_all)]
-pub(crate) struct AddEntrypoint {
-    pub(crate) decl: Py<SymbolNode>,
-    pub(crate) marker: String,
-}
-
-#[pymethods]
-impl AddEntrypoint {
-    #[new]
-    #[pyo3(signature = (decl, *, marker))]
-    fn new(decl: Py<SymbolNode>, marker: String) -> Self {
-        Self { decl, marker }
-    }
-}
-
-/// Index-keyed variant of :class:`AddEntrypoint`. Takes a positional
-/// index into ``ctx.nodes()`` instead of a ``SymbolNode`` reference;
-/// the apply pass derefs the decl on the rust side to read its
-/// ``fqname`` / ``path`` for the marker, so plugins working in
-/// idx-space don't pay the ``Py<SymbolNode>`` allocation just to flag
-/// a seed.
-///
-/// Raises :class:`IndexError` at apply time when ``decl_idx`` is out
-/// of range.
-#[pyclass(frozen, get_all)]
-pub(crate) struct AddEntrypointByIdx {
-    pub(crate) decl_idx: usize,
-    pub(crate) marker: String,
-}
-
-#[pymethods]
-impl AddEntrypointByIdx {
-    #[new]
-    #[pyo3(signature = (decl_idx, *, marker))]
-    fn new(decl_idx: usize, marker: String) -> Self {
-        Self { decl_idx, marker }
-    }
-}
-
-/// Mint a synthetic intermediate node.
-///
-/// ``edges_from`` / ``edges_to`` wire the new node atomically — every
-/// element of ``edges_from`` becomes a ``source -> this`` edge, every
-/// element of ``edges_to`` a ``this -> target`` edge — so a plugin
-/// doesn't need a separate handle to reference the freshly-minted node
-/// from subsequent ops. Set ``flags = NodeFlags.ENTRYPOINT`` to make
-/// the node a seed (``AddEntrypoint`` / ``AddEntrypointByIdx`` are the
-/// single-target sugar).
-#[pyclass(frozen, get_all)]
-pub(crate) struct AddNode {
-    pub(crate) fqname: String,
-    pub(crate) kind: &'static str,
-    pub(crate) path: String,
-    pub(crate) flags: u32,
-    pub(crate) edges_from: Vec<Py<SymbolNode>>,
-    pub(crate) edges_to: Vec<Py<SymbolNode>>,
-}
-
-#[pymethods]
-impl AddNode {
-    #[new]
-    #[pyo3(signature = (
-        fqname,
-        *,
-        path,
-        kind = "synthetic",
-        flags = 0,
-        edges_from = Vec::new(),
-        edges_to = Vec::new(),
-    ))]
-    fn new(
-        fqname: String,
-        path: String,
-        kind: &str,
-        flags: u32,
-        edges_from: Vec<Py<SymbolNode>>,
-        edges_to: Vec<Py<SymbolNode>>,
-    ) -> PyResult<Self> {
-        Ok(Self {
-            fqname,
-            kind: intern_kind(kind)?,
-            path,
-            flags,
-            edges_from,
-            edges_to,
-        })
-    }
-}
-
-/// Index-keyed variant of :class:`AddNode`. Wires the freshly-minted
-/// synthetic node with positional indices into ``ctx.nodes()`` instead
-/// of ``SymbolNode`` references for ``edges_from`` / ``edges_to``.
-///
-/// Pairs with the ``.indices()`` query terminals and
-/// :meth:`ProjectContext.indices_where` so plugins that work in index
-/// space don't have to round-trip through ``Py<SymbolNode>`` just to
-/// wire their synthetic markers. The apply pass treats it identically
-/// to :class:`AddNode` once the indices land in the builder.
-///
-/// Raises :class:`IndexError` at apply time when any endpoint is out
-/// of range for the current graph snapshot (pre-intern, so the new
-/// node is not created if any endpoint check fails).
-#[pyclass(frozen, get_all)]
-pub(crate) struct AddNodeByIdx {
-    pub(crate) fqname: String,
-    pub(crate) kind: &'static str,
-    pub(crate) path: String,
-    pub(crate) flags: u32,
-    pub(crate) edges_from_idx: Vec<usize>,
-    pub(crate) edges_to_idx: Vec<usize>,
-}
-
-#[pymethods]
-impl AddNodeByIdx {
-    #[new]
-    #[pyo3(signature = (
-        fqname,
-        *,
-        path,
-        kind = "synthetic",
-        flags = 0,
-        edges_from_idx = Vec::new(),
-        edges_to_idx = Vec::new(),
-    ))]
-    fn new(
-        fqname: String,
-        path: String,
-        kind: &str,
-        flags: u32,
-        edges_from_idx: Vec<usize>,
-        edges_to_idx: Vec<usize>,
-    ) -> PyResult<Self> {
-        Ok(Self {
-            fqname,
-            kind: intern_kind(kind)?,
-            path,
-            flags,
-            edges_from_idx,
-            edges_to_idx,
-        })
-    }
-}
-
 pub(crate) fn not_materialized(op: &str) -> PyErr {
     PyRuntimeError::new_err(format!(
         "ProjectContext.{op}() called outside an active materialize() — \
@@ -492,7 +290,7 @@ pub(crate) fn bfs(
 /// Construct a position-less [`GraphNode`] (start/end zeroed, `imports`
 /// absent) for ops minted at plugin-apply time. The four
 /// caller-supplied fields are the only ones that vary across the
-/// synthetic / entrypoint / `AddNode` shapes.
+/// [`PreparedOp::Node`] / [`PreparedOp::Entrypoint`] shapes.
 pub(crate) fn synthetic_node(
     fqname: String,
     kind: &'static str,
@@ -512,43 +310,23 @@ pub(crate) fn synthetic_node(
     }
 }
 
-/// A [`GraphOp`] prepared for application: every Python-owned field
-/// has been hoisted into pure-rust storage so that
-/// [`apply_prepared_batch`] can drop the GIL before contending for
-/// the write lock on ``outputs``. Edge endpoints are represented as
-/// [`NodeKey`]s (the positional identity used by the builder's
-/// index) plus the source ``decl.fqname`` for entrypoint markers.
-/// See [`apply_prepared_batch`] for the concurrency rationale.
+/// A graph mutation prepared for application: a native plugin emits
+/// these directly so that [`apply_prepared_batch`] can drop the GIL
+/// before contending for the write lock on ``outputs``. Endpoints are
+/// positional indices into the current graph snapshot
+/// (``ctx.nodes()``); see [`apply_prepared_batch`] for the concurrency
+/// rationale.
 pub(crate) enum PreparedOp {
     Edge {
-        src: NodeKey,
-        dst: NodeKey,
-        flags: u32,
-    },
-    EdgeByIdx {
         src_idx: usize,
         dst_idx: usize,
         flags: u32,
     },
     Entrypoint {
-        decl: NodeKey,
-        decl_fqname: String,
-        decl_path: String,
-        marker: String,
-    },
-    EntrypointByIdx {
         decl_idx: usize,
         marker: String,
     },
     Node {
-        fqname: String,
-        kind: &'static str,
-        path: String,
-        flags: u32,
-        edges_from: Vec<NodeKey>,
-        edges_to: Vec<NodeKey>,
-    },
-    NodeByIdx {
         fqname: String,
         kind: &'static str,
         path: String,
@@ -598,76 +376,6 @@ impl CollectedOps {
     }
 }
 
-/// Convert a single Python-owned :class:`GraphOp` into a [`PreparedOp`].
-///
-/// The "prepare" half of the old single-op apply pipeline. Splitting
-/// this out lets the batched-apply pass extract every op's fields
-/// under one GIL window, then drop the GIL once for the full apply
-/// rather than ping-ponging the GIL / write lock per op.
-pub(crate) fn prepare_graph_op(py: Python<'_>, op: &Bound<'_, PyAny>) -> PyResult<PreparedOp> {
-    let prepared = if let Ok(add_edge) = op.extract::<PyRef<AddEdge>>() {
-        PreparedOp::Edge {
-            src: node_key_of(&add_edge.src.borrow(py)),
-            dst: node_key_of(&add_edge.dst.borrow(py)),
-            flags: add_edge.flags,
-        }
-    } else if let Ok(add_edge_idx) = op.extract::<PyRef<AddEdgeByIdx>>() {
-        PreparedOp::EdgeByIdx {
-            src_idx: add_edge_idx.src_idx,
-            dst_idx: add_edge_idx.dst_idx,
-            flags: add_edge_idx.flags,
-        }
-    } else if let Ok(add_ep) = op.extract::<PyRef<AddEntrypoint>>() {
-        let decl_ref = add_ep.decl.borrow(py);
-        PreparedOp::Entrypoint {
-            decl: node_key_of(&decl_ref),
-            decl_fqname: decl_ref.fqname.clone(),
-            decl_path: decl_ref.path.clone(),
-            marker: add_ep.marker.clone(),
-        }
-    } else if let Ok(add_ep_idx) = op.extract::<PyRef<AddEntrypointByIdx>>() {
-        PreparedOp::EntrypointByIdx {
-            decl_idx: add_ep_idx.decl_idx,
-            marker: add_ep_idx.marker.clone(),
-        }
-    } else if let Ok(add_node) = op.extract::<PyRef<AddNode>>() {
-        let edges_from: Vec<NodeKey> = add_node
-            .edges_from
-            .iter()
-            .map(|n| node_key_of(&n.borrow(py)))
-            .collect();
-        let edges_to: Vec<NodeKey> = add_node
-            .edges_to
-            .iter()
-            .map(|n| node_key_of(&n.borrow(py)))
-            .collect();
-        PreparedOp::Node {
-            fqname: add_node.fqname.clone(),
-            kind: add_node.kind,
-            path: add_node.path.clone(),
-            flags: add_node.flags,
-            edges_from,
-            edges_to,
-        }
-    } else if let Ok(add_node_idx) = op.extract::<PyRef<AddNodeByIdx>>() {
-        PreparedOp::NodeByIdx {
-            fqname: add_node_idx.fqname.clone(),
-            kind: add_node_idx.kind,
-            path: add_node_idx.path.clone(),
-            flags: add_node_idx.flags,
-            edges_from_idx: add_node_idx.edges_from_idx.clone(),
-            edges_to_idx: add_node_idx.edges_to_idx.clone(),
-        }
-    } else {
-        return Err(PyValueError::new_err(format!(
-            "expected a GraphOp (AddEdge / AddEdgeByIdx / AddEntrypoint / \
-             AddEntrypointByIdx / AddNode / AddNodeByIdx), got {:?}",
-            op.get_type().name()?,
-        )));
-    };
-    Ok(prepared)
-}
-
 /// Apply a batch of pre-prepared ops to the graph in a single
 /// write-lock window. The GIL is released for the entire apply pass:
 /// every op is pure-rust now — node interning stores [`GraphNode`]s
@@ -713,45 +421,22 @@ fn apply_prepared(
     prepared: PreparedOp,
 ) -> PyResult<()> {
     match prepared {
-        PreparedOp::Edge { src, dst, flags } => {
-            let src_idx = lookup_idx_by_key(&outputs.builder, &src, "src")?;
-            let dst_idx = lookup_idx_by_key(&outputs.builder, &dst, "dst")?;
-            outputs.builder.add_edge(src_idx, dst_idx, flags);
-            Ok(())
-        }
-        PreparedOp::EdgeByIdx {
+        PreparedOp::Edge {
             src_idx,
             dst_idx,
             flags,
         } => {
             let len = outputs.builder.nodes.len();
-            check_idx_in_range(len, src_idx, "AddEdgeByIdx", "src_idx")?;
-            check_idx_in_range(len, dst_idx, "AddEdgeByIdx", "dst_idx")?;
+            check_idx_in_range(len, src_idx, "PreparedOp::Edge", "src_idx")?;
+            check_idx_in_range(len, dst_idx, "PreparedOp::Edge", "dst_idx")?;
             outputs.builder.add_edge(src_idx, dst_idx, flags);
             Ok(())
         }
-        PreparedOp::Entrypoint {
-            decl,
-            decl_fqname,
-            decl_path,
-            marker,
-        } => {
-            let decl_idx = lookup_idx_by_key(&outputs.builder, &decl, "decl")?;
-            let marker_fqname = format!("{marker}:{decl_fqname}");
-            let marker_idx = outputs.builder.intern_node(synthetic_node(
-                marker_fqname,
-                "synthetic",
-                decl_path,
-                NODE_FLAG_ENTRYPOINT,
-            ));
-            outputs.builder.add_edge(marker_idx, decl_idx, 0);
-            Ok(())
-        }
-        PreparedOp::EntrypointByIdx { decl_idx, marker } => {
+        PreparedOp::Entrypoint { decl_idx, marker } => {
             let len = outputs.builder.nodes.len();
-            check_idx_in_range(len, decl_idx, "AddEntrypointByIdx", "decl_idx")?;
-            // Read fqname / path off the existing node — same shape
-            // the ``AddEntrypoint`` arm gets from the prepare step.
+            check_idx_in_range(len, decl_idx, "PreparedOp::Entrypoint", "decl_idx")?;
+            // Read fqname / path off the existing node to build the
+            // ``marker:fqname`` synthetic entrypoint.
             let (decl_fqname, decl_path) = {
                 let node = &outputs.builder.nodes[decl_idx];
                 (node.fqname.clone(), node.path.clone())
@@ -771,27 +456,6 @@ fn apply_prepared(
             kind,
             path,
             flags,
-            edges_from,
-            edges_to,
-        } => {
-            // Resolve endpoint keys to indices *before* minting the
-            // node — a missing key then surfaces as a clean
-            // ``ValueError`` without leaving an unconnected synthetic
-            // behind in the graph. Same pre-validation discipline as
-            // the ``NodeByIdx`` arm below.
-            let from_idxs = resolve_edge_keys(&outputs.builder, &edges_from, "edges_from")?;
-            let to_idxs = resolve_edge_keys(&outputs.builder, &edges_to, "edges_to")?;
-            let node_idx = outputs
-                .builder
-                .intern_node(synthetic_node(fqname, kind, path, flags));
-            wire_synthetic_edges(&mut outputs.builder, node_idx, &from_idxs, &to_idxs);
-            Ok(())
-        }
-        PreparedOp::NodeByIdx {
-            fqname,
-            kind,
-            path,
-            flags,
             edges_from_idx,
             edges_to_idx,
         } => {
@@ -802,8 +466,8 @@ fn apply_prepared(
             // doesn't yet exist (including the about-to-be-minted
             // node).
             let len = outputs.builder.nodes.len();
-            check_idx_slice_in_range(len, &edges_from_idx, "AddNodeByIdx", "edges_from_idx")?;
-            check_idx_slice_in_range(len, &edges_to_idx, "AddNodeByIdx", "edges_to_idx")?;
+            check_idx_slice_in_range(len, &edges_from_idx, "PreparedOp::Node", "edges_from_idx")?;
+            check_idx_slice_in_range(len, &edges_to_idx, "PreparedOp::Node", "edges_to_idx")?;
             let node_idx = outputs
                 .builder
                 .intern_node(synthetic_node(fqname, kind, path, flags));
@@ -836,18 +500,8 @@ fn wire_synthetic_edges(
     }
 }
 
-/// Resolve every endpoint key to its builder-side index, propagating
-/// the first lookup failure as a ``ValueError`` with the matching
-/// ``side`` label.
-fn resolve_edge_keys(builder: &GraphBuilder, keys: &[NodeKey], side: &str) -> PyResult<Vec<usize>> {
-    keys.iter()
-        .map(|k| lookup_idx_by_key(builder, k, side))
-        .collect()
-}
-
 /// Bounds-check a single index against the builder's current node
-/// count, surfacing an ``IndexError`` matching the existing
-/// ``AddEdgeByIdx`` style.
+/// count, surfacing an ``IndexError`` with the op name and side.
 fn check_idx_in_range(len: usize, idx: usize, op: &str, side: &str) -> PyResult<()> {
     if idx >= len {
         return Err(PyIndexError::new_err(format!(
@@ -880,22 +534,6 @@ pub(crate) fn lookup_idx(builder: &GraphBuilder, node: &SymbolNode, side: &str) 
                 node.fqname
             ))
         })
-}
-
-/// Variant of [`lookup_idx`] that takes a [`NodeKey`] directly so it
-/// can be called from [`apply_prepared_batch`]'s GIL-free post-prepare
-/// section — see [`PreparedOp`] for why the key is pre-extracted.
-pub(crate) fn lookup_idx_by_key(
-    builder: &GraphBuilder,
-    key: &NodeKey,
-    side: &str,
-) -> PyResult<usize> {
-    builder.node_index.get(key).copied().ok_or_else(|| {
-        PyValueError::new_err(format!(
-            "add_edge: {side} node {:?} is not interned in this ProjectContext",
-            key.fqname
-        ))
-    })
 }
 
 #[cfg(test)]

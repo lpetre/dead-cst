@@ -31,8 +31,8 @@ use ty_python_core::scope::FileScopeId;
 use ty_python_core::semantic_index;
 
 use crate::builder::{
-    apply_prepared_batch, bfs, lookup_idx, not_materialized, prepare_graph_op, synthetic_node,
-    CollectedOps, Direction, GraphBuilder, GraphNode, PreparedOp,
+    apply_prepared_batch, bfs, lookup_idx, not_materialized, synthetic_node, CollectedOps,
+    Direction, GraphBuilder, GraphNode, PreparedOp,
 };
 use crate::file_payload::{file_to_edges, file_to_nodes, FileEdges, NodeKind, NodeRef};
 use crate::file_ref_edges::{file_to_ref_edges, FileRefEdges};
@@ -877,8 +877,7 @@ fn assemble_graph<'db>(
 
 /// Fold every registered per-file native plugin's file-local ops into
 /// the assembled graph. Each op is applied with the same semantics as
-/// the `apply_prepared` handlers for the `*ByIdx` [`PreparedOp`]
-/// variants:
+/// the `apply_prepared` handlers for the [`PreparedOp`] variants:
 ///
 /// * [`FileLocalOp::Node`] → intern a synthetic node (dedup by
 ///   fqname) and wire its `edges_from`/`edges_to` with flags 0.
@@ -1212,14 +1211,13 @@ pub(crate) fn build_fqname_indices(
 
 /// Plugin-aware project graph builder.
 ///
-/// Python instantiates a `ProjectContext`, registers Python plugins via
-/// `add_plugin`, then calls `materialize()`. `materialize` runs the
-/// project-wide build in rust, then for each registered plugin calls
-/// `plugin.run(ctx)` back into Python with `ctx` set to the same
-/// `ProjectContext` instance. Plugins yield `GraphOp` values
-/// (``AddNode`` / ``AddEdge`` / ``AddEntrypoint``) that we apply to
-/// the graph; the rust `find_*` methods listed below answer queries
-/// against the graph in-progress.
+/// Python instantiates a `ProjectContext`, registers
+/// :class:`NativePlugin`s via `add_plugin`, then calls `materialize()`.
+/// `materialize` runs the project-wide build in rust, then runs each
+/// registered plugin's native impl against the same `ProjectContext`.
+/// The impl emits [`PreparedOp`] values that we apply to the graph; the
+/// rust `find_*` methods listed below answer queries against the graph
+/// in-progress.
 ///
 /// Queries are answered from ty's semantic index: subclass closure goes
 /// through `type_hierarchy_subtypes`, method-defines walks each class's
@@ -1881,25 +1879,25 @@ impl ProjectContext {
     }
 }
 
-/// Invoke ``plugin.run(ctx)`` and collect every yielded op into
+/// Run a registered ``NativePlugin`` and collect every emitted op into
 /// ``sink`` as a [`PreparedOp`]. The graph is read-only for the
 /// duration — the plugin's own emissions never make it into
 /// ``outputs`` until the apply pass runs.
 ///
 /// Used by both the serial fallback in :meth:`ProjectContext::materialize`
 /// and the per-plugin :meth:`ProjectContext::run_plugin_collect` worker
-/// driven from Python.
+/// driven from Python. Only ``NativePlugin`` is supported — the legacy
+/// Python plugin protocol (``plugin.run(ctx)`` yielding ``GraphOp``s)
+/// has been removed.
 fn collect_prepared_plugin_ops(
     py: Python<'_>,
     ctx: &Py<ProjectContext>,
     plugin: &PyObject,
     sink: &mut Vec<PreparedOp>,
 ) -> PyResult<()> {
-    // Native fast path: ``NativePlugin`` instances run rust directly,
-    // filling ``sink`` with [`PreparedOp`] variants — no Python
-    // ``.run(ctx)`` call, no ``GraphOp`` allocation per yield, no
-    // ``prepare_graph_op`` extraction loop. The frozen-graph contract
-    // is identical to the Python path.
+    // ``NativePlugin`` instances run rust directly, filling ``sink``
+    // with [`PreparedOp`] variants — no Python ``.run(ctx)`` call and
+    // no per-yield ``GraphOp`` allocation.
     let plugin_bound = plugin.bind(py);
     if let Ok(native) = plugin_bound.downcast::<crate::native_plugins::NativePlugin>() {
         let ctx_ref = ctx.borrow(py);
@@ -1932,15 +1930,11 @@ fn collect_prepared_plugin_ops(
             }
         }
     }
-    let result = plugin_bound.call_method1("run", (ctx.clone_ref(py),))?;
-    if result.is_none() {
-        return Ok(());
-    }
-    for item in result.iter()? {
-        let op = item?;
-        sink.push(prepare_graph_op(py, &op)?);
-    }
-    Ok(())
+    Err(pyo3::exceptions::PyTypeError::new_err(format!(
+        "expected a dead_cst._native.NativePlugin, got {:?}; the Python \
+         plugin protocol (plugin.run(ctx) yielding GraphOps) has been removed",
+        plugin_bound.get_type().name()?,
+    )))
 }
 
 /// Acquire a read guard on ``lock`` while releasing the GIL during

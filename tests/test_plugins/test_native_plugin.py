@@ -1,39 +1,21 @@
-"""Tests for the prototype rust-side ``NativePlugin``.
+"""Tests for the rust-side ``NativePlugin`` harness wrapper.
 
 A native plugin is a pyo3 wrapper around a rust :trait:`NativePluginImpl`
-that the harness drives through the same ``ThreadPoolExecutor`` /
-``CollectedOps`` / ``apply_ops_batched`` flow as a Python plugin —
-the only difference is that the per-op extraction step is replaced
-by a direct ``Vec<PreparedOp>`` push from rust.
+that the harness drives through the same ``CollectedOps`` /
+``apply_ops_batched`` flow used for every plugin, with the per-op
+extraction replaced by a direct ``Vec<PreparedOp>`` push from rust.
 
-These tests pin: parity with the Python equivalent, registration
-acceptance by the ``Analysis`` harness, mix-and-match with Python
-plugins in the same registration list.
+These tests pin harness integration: registration acceptance by the
+``Analysis`` harness, running several native plugins in one list, the
+``name`` attribute used by progress logs, per-file salsa caching, and the
+builtin name -> native lookup the CLI resolves through.
 """
 
 from __future__ import annotations
 
+import pytest
+
 from dead_cst import _native as native
-from dead_cst.plugins import MainBlockPlugin
-
-
-def test_native_main_block_matches_python_plugin(build_plugin_graph, reachable_fqnames):
-    """``NativePlugin.main_block()`` produces the same reachable set as
-    ``MainBlockPlugin()`` — same synthetic entrypoint per main block,
-    same edges, same alive set."""
-    files = {
-        "pkg/__init__.py": "",
-        "pkg/script.py": """
-        def main(): pass
-        def unused(): pass
-        if __name__ == "__main__":
-            main()
-        """,
-        "pkg/other.py": "def g(): pass",
-    }
-    py_ctx = build_plugin_graph(files, [MainBlockPlugin()])
-    rs_ctx = build_plugin_graph(files, [native.NativePlugin.main_block()])
-    assert reachable_fqnames(py_ctx) == reachable_fqnames(rs_ctx)
 
 
 def test_native_main_block_emits_entrypoint_marker(build_plugin_graph):
@@ -63,12 +45,10 @@ def test_native_plugin_name_attribute():
     assert plugin.name == "MainBlockPlugin"
 
 
-def test_native_plugin_mixed_with_python_plugins(build_plugin_graph, reachable_fqnames):
-    """A native plugin and a Python plugin in the same registration
-    list both run; the harness routes each to the appropriate path
-    transparently."""
-    from dead_cst.plugins import ModuleDundersPlugin
-
+def test_multiple_native_plugins_in_one_list(build_plugin_graph, reachable_fqnames):
+    """Several native plugins in the same registration list all run; the
+    harness routes each through the shared collect/apply flow and folds
+    every plugin's ops into one graph."""
     files = {
         "pkg/__init__.py": "__all__ = ['x']\nx = 1\n",
         "pkg/script.py": """
@@ -77,8 +57,10 @@ def test_native_plugin_mixed_with_python_plugins(build_plugin_graph, reachable_f
             main()
         """,
     }
-    # Mix: rust native main-block + python module-dunders.
-    ctx = build_plugin_graph(files, [native.NativePlugin.main_block(), ModuleDundersPlugin()])
+    ctx = build_plugin_graph(
+        files,
+        [native.NativePlugin.main_block(), native.NativePlugin.module_dunders()],
+    )
     reached = reachable_fqnames(ctx)
     # Main-block contribution.
     assert "pkg.script.main" in reached
@@ -104,8 +86,6 @@ def test_native_plugin_cannot_be_directly_instantiated():
     a factory like :meth:`NativePlugin.main_block` to bind to a
     concrete impl. Pinned so the constructor doesn't silently
     succeed with no inner impl."""
-    import pytest
-
     with pytest.raises(TypeError):
         native.NativePlugin()
 
@@ -200,40 +180,27 @@ def test_per_file_main_block_cache_invalidates_on_edit(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Project-wide native ports (module_dunders, init_subclass) + the registry.
-# These pin parity with the Python equivalents and the name -> native lookup
-# the CLI resolves through. (The Python plugins are removed in a follow-up;
-# their behavioural tests move to the native versions then.)
+# Harness plumbing: plugin-list type validation and the builtin name ->
+# native lookup the CLI resolves through. Per-plugin behaviour lives in
+# test_main_block.py / test_module_dunders.py / test_init_subclass.py /
+# test_unittest.py.
 # ---------------------------------------------------------------------------
 
 
-def test_native_module_dunders_matches_python(build_plugin_graph, reachable_fqnames):
-    from dead_cst.plugins import ModuleDundersPlugin
+def test_non_native_plugin_in_list_raises_typeerror(tmp_path):
+    """``Analysis`` type-validates its plugins list up front — a non-
+    ``NativePlugin`` entry raises ``TypeError`` before any graph build,
+    so a ``Pluign()`` typo doesn't slip past."""
+    from dead_cst.analyze import Analysis
 
-    files = {
-        "pkg/__init__.py": "__all__ = ['x']\nx = 1\n__version__ = '1'\n",
-        "pkg/m.py": "from __future__ import annotations\ndef f(): pass\n",
-    }
-    py = build_plugin_graph(files, [ModuleDundersPlugin()])
-    rs = build_plugin_graph(files, [native.NativePlugin.module_dunders()])
-    assert reachable_fqnames(py) == reachable_fqnames(rs)
-
-
-def test_native_init_subclass_matches_python(build_plugin_graph, reachable_fqnames):
-    from dead_cst.plugins import InitSubclassPlugin
-
-    files = {
-        "pkg/__init__.py": "",
-        "pkg/m.py": (
-            "class Base:\n"
-            "    def __init_subclass__(cls): pass\n"
-            "class Sub(Base): pass\n"
-            "class Sub2(Sub): pass\n"
-        ),
-    }
-    py = build_plugin_graph(files, [InitSubclassPlugin()])
-    rs = build_plugin_graph(files, [native.NativePlugin.init_subclass()])
-    assert reachable_fqnames(py) == reachable_fqnames(rs)
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "__init__.py").write_text("")
+    (tmp_path / "pkg" / "a.py").write_text("def foo(): pass\n")
+    analysis = Analysis(tmp_path, plugins=[object()])  # type: ignore[list-item]
+    with pytest.raises(TypeError, match="Expected a dead_cst._native.NativePlugin"):
+        analysis.materialize_all()
+    # The graph itself was never built — Analysis._ctx stays None.
+    assert analysis._ctx is None  # noqa: SLF001 — testing the invariant
 
 
 def test_builtin_native_plugin_registry():

@@ -57,9 +57,9 @@ def test_production_only_decl_survives_strict_pass(make_analysis, write_files):
             """,
         }
     )
-    from dead_cst.plugins import MainBlockPlugin
+    from dead_cst import _native as native
 
-    graph = make_analysis(plugins=[MainBlockPlugin()]).materialize_all()
+    graph = make_analysis(plugins=[native.NativePlugin.main_block()]).materialize_all()
     helper = next(n for n in graph.nodes() if n.fqname == "pkg.lib.helper")
     assert helper in find_reachable_excluding_noqa(graph)
     assert helper not in find_kept_alive_by_noqa_only(graph)

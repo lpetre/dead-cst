@@ -56,10 +56,9 @@ two versions.
   `find_declarations`, `module_for`, `resolve`, `decls_under`,
   `find_subclasses_of`, and the reachability walks `descendants`,
   `ancestors`, `direct_predecessors`. `PluginOps` gained `add_edge(...)`
-  and `add_synthetic_node(...)` alongside `keep_alive(...)` — the three
-  mirror the Python `AddEntrypointByIdx` / `AddEdgeByIdx` /
-  `AddNodeByIdx` graph ops — plus a `FLAG_ENTRYPOINT` constant. Every
-  query is index-based and GIL-free; no `Python<'_>` token is exposed.
+  and `add_synthetic_node(...)` alongside `keep_alive(...)`, plus a
+  `FLAG_ENTRYPOINT` constant. Every query is index-based and GIL-free;
+  no `Python<'_>` token is exposed.
 - **Per-file external native plugins.** An external native plugin can
   now opt into the salsa-cached *per-file* path (previously in-tree
   only) by implementing the new `PerFilePlugin` trait and returning
@@ -103,10 +102,9 @@ two versions.
   `decls_matching_name`. On the write side, `PluginOps`/`FileOps`
   `add_edge` now takes a `flags` argument (with `plugin_api::FLAG_DEAD_BRANCH`
   / `FLAG_DYNAMIC_IMPORT` re-exported) and `add_synthetic_node` takes an
-  `edges_from` (in-edge) list, matching the `flags` / `edges_from`
-  parameters the Python `AddEdge` / `AddNode` graph ops already carry — so
-  an out-of-tree plugin porting from the Python `ctx` API has the same
-  read/write surface in Rust.
+  `edges_from` (in-edge) list — so the airlock's write surface can stamp
+  dead-branch / dynamic-import edges and wire a synthetic node's full
+  in/out edges.
 - `Analysis.re_materialize(events)` — incrementally rebuild the
   project graph against the existing `native.ProjectContext`. The
   caller supplies the change events: typically
@@ -202,9 +200,8 @@ two versions.
   The explicit-entrypoint plugin is likewise native —
   `NativePlugin.explicit(regexes, str_specs, abs_paths)`, which the CLI drives
   from `-e` / `--entrypoint-regex` (it is not a `--plugin` key). Behaviour is
-  identical. With this, every built-in plugin is native and the CLI's Python
-  `_BUILTIN_PLUGINS` map is empty (kept only as the fall-through slot for
-  out-of-tree Python plugins).
+  identical. With this, every built-in plugin is native; the CLI resolves
+  `--plugin` names through the native registry (`_builtin_native_plugin`).
 - **Per-file native plugins now run inside the build pipeline.** Their
   salsa-cached file-local ops are warmed during the parallel (GIL-released)
   file fan-out and folded into the graph during serial assembly, instead of a
@@ -237,9 +234,22 @@ two versions.
   `NativePlugin.explicit(…)`, `NativePlugin.project_scripts()`,
   `NativePlugin.mock_patch()`, `NativePlugin.pytest()`, `NativePlugin.discordpy()`);
   the CLI keys already resolve to them (and `-e` / `--entrypoint-regex` drive
-  `explicit`). `dead_cst.plugins.__all__` drops `DynamicImportFallbackPlugin` /
-  `ExplicitEntrypointPlugin` / `ProjectScriptsPlugin`; `dead_cst.contrib.__all__`
-  is now just `UnittestPlugin`.
+  `explicit`).
+- **The Python `Plugin` protocol is removed.** With every built-in now native,
+  the `Plugin` ABC (`dead_cst.plugins.Plugin`), the reusable
+  `DecoratedDeclPlugin` / `LiteralListPlugin` base shapes, and the
+  `dead_cst.plugins.decl_shapes` module are gone, along with the four
+  parity-twin Python classes (`MainBlockPlugin`, `ModuleDundersPlugin`,
+  `InitSubclassPlugin`, `UnittestPlugin`). The rust harness no longer runs
+  Python `plugin.run(ctx)` callbacks, so the `AddNode` / `AddEdge` /
+  `AddEntrypoint` graph-op pyclasses and their `AddNodeByIdx` / `AddEdgeByIdx` /
+  `AddEntrypointByIdx` index-keyed siblings are removed too. Built-in plugins
+  are the `NativePlugin.<name>()` factories; author out-of-tree plugins as
+  external native plugins (see `NATIVE_PLUGINS.md`). `Analysis(...,
+  plugins=[…])` accepts only `dead_cst._native.NativePlugin` instances.
+  `dead_cst.plugins.__all__` is now just the synthetic-node prefix constants
+  plus `simple_name`; `dead_cst.contrib.__all__` is empty. The
+  `native.query(ctx)` DSL, `CollectedOps`, and `PreparedOp` are unaffected.
 
 #### Query DSL — SymbolNode terminals and SymbolNode-taking sugar
 - `SubclassQuery.collect()`, `ImportQuery.collect()`, `ClassQuery.collect()`,

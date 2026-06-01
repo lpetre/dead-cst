@@ -11,7 +11,7 @@ should land in both places at once.
 """
 
 import re
-from typing import TYPE_CHECKING, Any, Iterable, Iterator, Literal, Protocol, Sequence
+from typing import TYPE_CHECKING, Any, Iterable, Iterator, Literal, Sequence
 
 if TYPE_CHECKING:
     from dead_cst.analyze import ProgressSnapshot
@@ -171,146 +171,6 @@ class SymbolNode:
         imports: Import | None = ...,
     ) -> None: ...
 
-# ----- Graph operations (yielded from plugin.run) ------------------------
-
-class AddEdge:
-    """Add an edge between two already-interned nodes.
-
-    ``flags`` carries ``DEAD_BRANCH`` / future edge classifications.
-    Plugins yield this from ``run(ctx)`` instead of mutating the graph
-    directly so the apply pass is a single atomic step on the rust
-    side.
-    """
-
-    src: SymbolNode
-    dst: SymbolNode
-    flags: int
-
-    def __init__(self, src: SymbolNode, dst: SymbolNode, *, flags: int = 0) -> None: ...
-
-class AddEdgeByIdx:
-    """Index-keyed variant of :class:`AddEdge`. Accepts positional
-    indices into ``ctx.nodes()`` instead of ``SymbolNode`` references.
-
-    Lets plugins that already work in index space (paired with the
-    ``.indices()`` query terminals or
-    :meth:`ProjectContext.indices_where`) emit edges without ever
-    round-tripping through ``Py<SymbolNode>``. The apply pass treats
-    it identically to :class:`AddEdge` once the indices land in the
-    builder. Raises :class:`IndexError` at apply time when either
-    endpoint is out of range.
-    """
-
-    src_idx: int
-    dst_idx: int
-    flags: int
-
-    def __init__(self, src_idx: int, dst_idx: int, *, flags: int = 0) -> None: ...
-
-class AddEntrypoint:
-    """Mark ``decl`` as an entrypoint.
-
-    ``marker`` is a self-documenting label (``"<celery-worker>"``,
-    ``"<external-execution>:alembic"``, …) used in the
-    :meth:`Analysis.ancestors` chain to explain *why* the decl is
-    alive without minting a synthetic graph node for the reason.
-
-    Sugar for the single-target case; for multi-target
-    (``marker -> [t1, t2, t3]``) or intermediate
-    (``source -> marker -> targets``) markers use ``AddNode`` with
-    ``edges_to`` / ``edges_from``.
-    """
-
-    decl: SymbolNode
-    marker: str
-
-    def __init__(self, decl: SymbolNode, *, marker: str) -> None: ...
-
-class AddEntrypointByIdx:
-    """Index-keyed variant of :class:`AddEntrypoint`. Takes a positional
-    index into :meth:`ProjectContext.nodes` instead of a ``SymbolNode``
-    reference; the apply pass reads the decl's ``fqname`` / ``path``
-    on the rust side to compose the marker, so plugins working in
-    idx-space don't pay the ``Py<SymbolNode>`` allocation just to flag
-    a seed.
-
-    Raises :class:`IndexError` at apply time when ``decl_idx`` is out
-    of range.
-    """
-
-    decl_idx: int
-    marker: str
-
-    def __init__(self, decl_idx: int, *, marker: str) -> None: ...
-
-class AddNode:
-    """Mint a synthetic intermediate node, optionally wiring it with
-    edges in the same op.
-
-    Every element of ``edges_from`` becomes a ``source -> this`` edge;
-    every element of ``edges_to`` becomes a ``this -> target`` edge —
-    so a plugin doesn't need a separate handle to reference the
-    freshly-minted node from subsequent ops. Set
-    ``flags = NodeFlags.ENTRYPOINT`` to make the node a reachability
-    seed; for the common single-target entrypoint pattern, prefer
-    :class:`AddEntrypoint` (or :class:`AddEntrypointByIdx` from
-    idx-space).
-    """
-
-    fqname: str
-    kind: NodeKind
-    path: str
-    flags: int
-    edges_from: list[SymbolNode]
-    edges_to: list[SymbolNode]
-
-    def __init__(
-        self,
-        fqname: str,
-        *,
-        path: str,
-        kind: NodeKind = "synthetic",
-        flags: int = 0,
-        edges_from: Iterable[SymbolNode] = ...,
-        edges_to: Iterable[SymbolNode] = ...,
-    ) -> None: ...
-
-class AddNodeByIdx:
-    """Index-keyed variant of :class:`AddNode`. Wires the freshly-minted
-    synthetic node with positional indices into ``ctx.nodes()`` instead
-    of :class:`SymbolNode` references for ``edges_from`` / ``edges_to``.
-
-    Pairs with the ``.indices()`` query terminals and
-    :meth:`ProjectContext.indices_where` so plugins that already work
-    in index space don't round-trip through ``Py<SymbolNode>`` just to
-    wire their synthetic markers. The apply pass treats it identically
-    to :class:`AddNode` once the indices land in the builder.
-
-    Raises :class:`IndexError` at apply time when any endpoint is out
-    of range. The bounds check runs *before* the new node is interned,
-    so a bad index never leaves an unconnected synthetic behind.
-    """
-
-    fqname: str
-    kind: NodeKind
-    path: str
-    flags: int
-    edges_from_idx: list[int]
-    edges_to_idx: list[int]
-
-    def __init__(
-        self,
-        fqname: str,
-        *,
-        path: str,
-        kind: NodeKind = "synthetic",
-        flags: int = 0,
-        edges_from_idx: Iterable[int] = ...,
-        edges_to_idx: Iterable[int] = ...,
-    ) -> None: ...
-
-GraphOp = AddEdge | AddEdgeByIdx | AddEntrypoint | AddEntrypointByIdx | AddNode | AddNodeByIdx
-
 class CollectedOps:
     """Opaque handle to one plugin's collected graph ops.
 
@@ -325,69 +185,60 @@ class CollectedOps:
     """
 
 class NativePlugin:
-    """Rust-side plugin — in-tree only.
+    """A rust-backed plugin — the only plugin mechanism.
 
-    Constructed via a static factory (one per available bundled impl,
-    e.g. :meth:`main_block`); the default constructor is intentionally
-    not exposed. Drop-in interchangeable with a Python
-    :class:`Plugin` subclass in :class:`Analysis` plugin lists — the
-    harness detects the wrapper and dispatches to the rust impl
-    directly, skipping the Python ``.run(ctx)`` call and the per-op
-    ``GraphOp`` allocation.
+    Every built-in plugin is a ``NativePlugin``, constructed via a
+    static factory (one per bundled impl, e.g. :meth:`main_block`); the
+    default constructor is intentionally not exposed. Pass instances to
+    :class:`Analysis` in its ``plugins=`` list; the harness runs each
+    plugin's rust impl directly during ``materialize()``.
 
-    **Not an extension mechanism.** Native plugins are a hot-path
-    optimization for bundled plugins whose logic is fixed; the
-    underlying rust trait and types are crate-private with no
-    stability commitment. Out-of-tree plugin authors use the Python
-    :class:`Plugin` protocol — they can still write hot code in rust
-    (as a pyo3 extension their ``run(ctx)`` calls into), but they
-    emit ops through the public ``AddNodeByIdx`` / ``AddEdgeByIdx`` /
-    ``AddEntrypointByIdx`` graph ops.
+    Out-of-tree plugins are *external* native plugins compiled against
+    the shipped runtime dylib and loaded via
+    :func:`load_native_plugins` (see ``NATIVE_PLUGINS.md``); they arrive
+    as ``NativePlugin`` instances too. The underlying rust trait and op
+    types are crate-private with no stability commitment — the stable
+    surface is this class plus its factories.
     """
 
     @property
     def name(self) -> str:
-        """Plugin name. Matches the conventional name of the
-        equivalent Python plugin (e.g. ``"MainBlockPlugin"``).
+        """Plugin name (e.g. ``"MainBlockPlugin"``). Used in harness
+        logs and ``progress_callback`` events.
         """
         ...
 
     def prepare(self, project_root: Any) -> None:
-        """``Plugin`` protocol's pre-graph hook. The harness calls it on
-        every plugin before graph construction; for a native plugin it is
-        forwarded to the underlying rust impl (a project-wide builtin or an
-        external dylib plugin's ``ExternalPlugin::prepare``), so an external
-        plugin can scan ``project_root`` for config up front. Per-file
-        plugins are pure functions of their file and take no prepare step.
+        """Pre-graph hook. The harness calls it on every plugin before
+        graph construction; it is forwarded to the underlying rust impl
+        (a project-wide builtin or an external dylib plugin's
+        ``ExternalPlugin::prepare``), so an external plugin can scan
+        ``project_root`` for config up front. Per-file plugins are pure
+        functions of their file and take no prepare step.
         """
         ...
 
     @staticmethod
     def main_block() -> NativePlugin:
-        """Native equivalent of
-        :class:`dead_cst.plugins.MainBlockPlugin`. Marks every file
-        with a top-level ``if __name__ == "__main__":`` block as an
-        entrypoint and wires edges to the containing module + every
-        top-level decl inside the block.
+        """``MainBlockPlugin``. Marks every file with a top-level
+        ``if __name__ == "__main__":`` block as an entrypoint and wires
+        edges to the containing module + every top-level decl inside the
+        block. Implemented as a per-file (salsa-cached) plugin.
         """
         ...
 
     @staticmethod
     def module_dunders() -> NativePlugin:
-        """Native equivalent of
-        :class:`dead_cst.plugins.ModuleDundersPlugin`. Pins every
-        module-level dunder (variables + PEP 562 functions) and
-        ``__future__`` import as an entrypoint. Implemented as a
-        per-file (salsa-cached) plugin.
+        """``ModuleDundersPlugin``. Pins every module-level dunder
+        (variables + PEP 562 functions) and ``__future__`` import as an
+        entrypoint. Implemented as a per-file (salsa-cached) plugin.
         """
         ...
 
     @staticmethod
     def init_subclass() -> NativePlugin:
-        """Native equivalent of
-        :class:`dead_cst.plugins.InitSubclassPlugin`. Keeps transitive
-        subclasses of ``__init_subclass__``-defining classes alive via
-        a marker node.
+        """``InitSubclassPlugin``. Keeps transitive subclasses of
+        ``__init_subclass__``-defining classes alive via a marker node.
         """
         ...
 
@@ -408,11 +259,9 @@ class NativePlugin:
 
     @staticmethod
     def unittest() -> NativePlugin:
-        """Native equivalent of
-        :class:`dead_cst.contrib.unittest.UnittestPlugin`. Keeps stdlib
-        ``unittest`` test classes (transitive subclasses of
-        ``TestCase`` / ``IsolatedAsyncioTestCase``) and module lifecycle
-        hooks alive.
+        """``UnittestPlugin``. Keeps stdlib ``unittest`` test classes
+        (transitive subclasses of ``TestCase`` /
+        ``IsolatedAsyncioTestCase``) and module lifecycle hooks alive.
         """
         ...
 
@@ -647,9 +496,6 @@ class Project:
         """Build the project-wide symbol graph in one pass."""
         ...
 
-class _ProjectPluginLike(Protocol):
-    def run(self, ctx: "ProjectContext") -> Iterable[GraphOp] | None: ...
-
 class ChangeEvent:
     """A file-system change event consumed by
     :meth:`ProjectContext.apply_changes`. Construct via the
@@ -691,15 +537,16 @@ class ChangeEvent:
 class ProjectContext:
     """Plugin-aware project graph builder.
 
-    Python instantiates a ``ProjectContext``, registers Python plugins
-    via :meth:`add_plugin`, then calls :meth:`materialize`. Each
-    plugin's ``run(ctx)`` is invoked with this same instance; the
-    plugin yields ``GraphOp`` values that are applied to the in-progress
-    graph, and may call any of the ``find_*`` / ``decls_*`` /
-    ``descendants`` / ``ancestors`` / ``reachable`` queries below.
+    Python instantiates a ``ProjectContext``, registers
+    :class:`NativePlugin` instances via :meth:`add_plugin`, then calls
+    :meth:`materialize`. Each plugin's rust impl runs against this same
+    instance, emitting graph mutations the apply pass folds into the
+    in-progress graph; an impl may call any of the ``find_*`` /
+    ``decls_*`` / ``descendants`` / ``ancestors`` / ``reachable``
+    queries below.
 
     Queries answer against the live in-progress graph (so an op
-    yielded earlier in the same plugin is visible to later queries).
+    emitted earlier in the same plugin is visible to later queries).
     They go through ty's semantic index when possible — subclass
     closure via ``type_hierarchy_subtypes``, method-defines through
     each class's ``DefinitionKind::Class``, etc. — and fall back to
@@ -741,7 +588,7 @@ class ProjectContext:
         (protobuf modules, ML-generated ASTs, big literal dicts)
         that overflow rayon's default 2 MiB stack."""
 
-    def add_plugin(self, plugin: _ProjectPluginLike | Any) -> None:
+    def add_plugin(self, plugin: NativePlugin) -> None:
         """Register a plugin. Order of registration is order of
         invocation during :meth:`materialize`."""
         ...
@@ -799,10 +646,10 @@ class ProjectContext:
 
     def materialize(self) -> NativeGraph:
         """Build the project-wide graph, run each registered plugin's
-        ``run(ctx)``, then snapshot the final state.
+        rust impl, then snapshot the final state.
 
-        Borrows are released between phases so plugin ``run`` methods
-        can re-enter queries through the same ``ctx`` without aliasing
+        Borrows are released between phases so a plugin impl can
+        re-enter queries through the same ``ctx`` without aliasing
         violations.
         """
         ...
@@ -814,19 +661,19 @@ class ProjectContext:
         Python :class:`concurrent.futures.ThreadPoolExecutor`."""
         ...
 
-    def run_plugin(self, plugin: _ProjectPluginLike | Any) -> None:
-        """Invoke ``plugin.run(ctx)`` once, collecting every yielded
+    def run_plugin(self, plugin: NativePlugin) -> None:
+        """Run ``plugin``'s rust impl once, collecting every emitted
         op and applying the batch under one write-lock window at
         the end. The plugin's own emissions are invisible to its
-        own queries — the graph is frozen for the duration of
-        ``run``. Prefer :meth:`run_plugin_collect` +
+        own queries — the graph is frozen for the duration of the
+        run. Prefer :meth:`run_plugin_collect` +
         :meth:`apply_ops_batched` when driving multiple plugins
         concurrently so the apply pass runs once for the full
         cohort."""
         ...
 
-    def run_plugin_collect(self, plugin: _ProjectPluginLike | Any) -> CollectedOps:
-        """Invoke ``plugin.run(ctx)`` once and return its yielded ops
+    def run_plugin_collect(self, plugin: NativePlugin) -> CollectedOps:
+        """Run ``plugin``'s rust impl once and return its emitted ops
         as an opaque :class:`CollectedOps` handle without mutating
         the graph. Safe to call concurrently from multiple Python
         threads — the graph is read-only for the duration. The
@@ -1030,10 +877,9 @@ class ProjectContext:
         Returns ``None`` when the variable isn't found, when its
         assignment value isn't a list / tuple of string literals, or
         when any element is a non-literal (``[*BASE, "c"]``,
-        ``list(...)``, etc.). Targeted read used by
-        :class:`dead_cst.plugins.decl_shapes.LiteralListPlugin` to
-        stay independent of the visitor's ``__all__``-only string-list
-        edge emission.
+        ``list(...)``, etc.). Targeted read for literal-list keep-alive
+        idioms, independent of the visitor's ``__all__``-only
+        string-list edge emission.
         """
         ...
 
@@ -1401,8 +1247,8 @@ class ArgNodeRef:
     the file's imports to a project decl — e.g. ``func(SomeClass)``
     where ``SomeClass`` is imported. ``idx`` is a positional index
     into :meth:`ProjectContext.nodes`; pair with
-    :meth:`ProjectContext.node_attrs` (or :class:`AddEdgeByIdx`) to
-    consume it without leaving idx-space.
+    :meth:`ProjectContext.node_attrs` to consume it without leaving
+    idx-space.
     """
 
     idx: int
@@ -2242,8 +2088,7 @@ class DeclQuery:
         ``list[int]``) after applying every configured predicate.
 
         Use when you only need set membership / counting on the
-        surviving nodes (or want to feed an index-keyed
-        :class:`AddEdgeByIdx`); call
+        surviving nodes (or want to wire edges in idx-space); call
         :meth:`ProjectContext.nodes_at` / :meth:`node_attrs` to
         revive ``SymbolNode`` / :class:`NodeAttrs` rows on demand.
         """
