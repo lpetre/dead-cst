@@ -187,12 +187,14 @@ get their outgoing edges flagged `EdgeFlags.DEAD_BRANCH`.
 
 After the three phases, the registered plugins contribute graph ops.
 Every plugin is a native (Rust) `NativePlugin`; there is no Python
-`Plugin` protocol. Project-wide plugins run against the in-progress
-`ProjectContext` and collect `PreparedOp` rows (`Node` / `Edge` /
-`Entrypoint`); per-file plugins are salsa-cached during the build. The
-rust apply pass folds every collected handle into the graph atomically
-(`apply_ops_batched`) before `materialize()` returns. There is no
-two-phase observe/finalize split — one collect, one apply.
+`Plugin` protocol. Project-wide plugins fan out across a GIL-free
+`rayon` scope, each running against a `FrozenView` (a `Send` snapshot
+of the build outputs) and collecting `PreparedOp` rows (`Node` / `Edge`
+/ `Entrypoint`); per-file plugins are salsa-cached during the build. The
+rust apply pass folds every plugin's ops into the graph atomically
+(`apply_prepared_batch`), in registration order, before `materialize()`
+returns. There is no two-phase observe/finalize split — one collect, one
+apply.
 
 A plugin builds against the query surface on `native.ProjectContext`:
 the `*_indices` queries (`find_declarations_indices`,

@@ -104,12 +104,11 @@ pub(crate) struct ProgressCounters {
     start: Instant,
 }
 
-/// Pre-sized per-plugin counter slabs. The Python driver stamps each
-/// plugin's index when it calls
-/// [`crate::project::ProjectContext::run_plugin_collect`]; the rust
-/// side writes the started / finished timestamps into the matching
-/// slot. All three vectors are the same length and indexed by the
-/// plugin's registration order.
+/// Pre-sized per-plugin counter slabs. The per-plugin rayon worker in
+/// [`crate::project::ProjectContext::materialize`] stamps its own index
+/// as it starts / finishes; the started / finished timestamps land in
+/// the matching slot. All three vectors are the same length and indexed
+/// by the plugin's registration order.
 pub(crate) struct PluginSlots {
     /// Display names — ``type(plugin).__qualname__`` (or a fallback).
     /// Read-only after [`ProgressCounters::init_plugin_slots`] returns.
@@ -168,10 +167,10 @@ impl ProgressCounters {
         });
     }
 
-    /// Stamp the per-plugin start time. Called by
-    /// [`crate::project::ProjectContext::run_plugin_collect`] on
-    /// worker-thread entry. No-op if the slot wasn't pre-allocated
-    /// (e.g. a caller that skipped [`Self::init_plugin_slots`]).
+    /// Stamp the per-plugin start time. Called from the per-plugin
+    /// rayon worker in [`crate::project::ProjectContext::materialize`]
+    /// on entry. No-op if the slot wasn't pre-allocated (e.g. a caller
+    /// that skipped [`Self::init_plugin_slots`]).
     pub(crate) fn plugin_started(&self, idx: usize) {
         if let Some(slots) = self.plugin_slots.get() {
             if let Some(cell) = slots.started_us.get(idx) {
@@ -180,10 +179,10 @@ impl ProgressCounters {
         }
     }
 
-    /// Stamp the per-plugin finish time. Called by
-    /// [`crate::project::ProjectContext::run_plugin_collect`] on
-    /// worker-thread exit (success path or exception path — the
-    /// Python driver wraps the call in a ``try/finally``).
+    /// Stamp the per-plugin finish time. Called from the per-plugin
+    /// rayon worker in [`crate::project::ProjectContext::materialize`]
+    /// once the plugin's ``run`` returns (whether it succeeded or
+    /// produced an error to be folded in later).
     pub(crate) fn plugin_finished(&self, idx: usize) {
         if let Some(slots) = self.plugin_slots.get() {
             if let Some(cell) = slots.finished_us.get(idx) {

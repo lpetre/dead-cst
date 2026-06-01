@@ -336,46 +336,6 @@ pub(crate) enum PreparedOp {
     },
 }
 
-/// Opaque Python handle wrapping a plugin's pre-prepared op queue.
-///
-/// :meth:`ProjectContext.run_plugin_collect` mints one of these per
-/// plugin (containing the plugin's full yield order in pure-rust
-/// form); :meth:`ProjectContext.apply_ops_batched` takes a list of
-/// these and folds them all into the graph under a single write-lock
-/// window. Holding the prepared ops in an opaque pyclass lets the
-/// Python driver shuttle them through a
-/// :class:`concurrent.futures.ThreadPoolExecutor` without paying
-/// per-op FFI roundtrips and without ``PreparedOp`` having to be a
-/// pyclass itself.
-///
-/// Concurrency: the inner [`Mutex`] is never observed contended by
-/// design — each `CollectedOps` is created on one thread, consumed
-/// on another (the apply pass), and never aliased. The lock is here
-/// so the pyclass can be ``Send``.
-#[pyclass]
-pub(crate) struct CollectedOps {
-    pub(crate) ops: parking_lot::Mutex<Option<Vec<PreparedOp>>>,
-}
-
-impl CollectedOps {
-    pub(crate) fn new(ops: Vec<PreparedOp>) -> Self {
-        Self {
-            ops: parking_lot::Mutex::new(Some(ops)),
-        }
-    }
-
-    /// Drain the inner ops. Returns an error if already drained
-    /// (calling :meth:`apply_ops_batched` twice on the same handle).
-    pub(crate) fn take(&self) -> PyResult<Vec<PreparedOp>> {
-        self.ops.lock().take().ok_or_else(|| {
-            PyValueError::new_err(
-                "CollectedOps already drained: \
-                 apply_ops_batched consumes the handle and it cannot be re-used.",
-            )
-        })
-    }
-}
-
 /// Apply a batch of pre-prepared ops to the graph in a single
 /// write-lock window. The GIL is released for the entire apply pass:
 /// every op is pure-rust now — node interning stores [`GraphNode`]s
@@ -408,7 +368,7 @@ pub(crate) fn apply_prepared_batch(
         let mut outputs = outputs_lock.write();
         let outputs = outputs
             .as_mut()
-            .ok_or_else(|| not_materialized("apply_ops_batched"))?;
+            .ok_or_else(|| not_materialized("apply_prepared_batch"))?;
         for op in prepared {
             apply_prepared(outputs, op)?;
         }
