@@ -31,7 +31,7 @@ crate and load at runtime, without forking dead-cst. The `[build-plugin]` extra
 The native crate is split in two:
 
 - **`dead-cst-runtime`** — the entire implementation (the graph builder, the
-  query DSL, the pyclasses, the plugin API). Built as both an **`rlib`** and a
+  query surface, the pyclasses, the plugin API). Built as both an **`rlib`** and a
   **`dylib`**.
 - **`dead-cst-native`** — a thin pyo3 `#[pymodule]` shim that becomes
   `dead_cst._native`.
@@ -126,19 +126,19 @@ flags }`.
 | `ancestors(decl_idx)` | `Vec<usize>` | reverse reachability closure |
 | `direct_predecessors(idx)` | `Vec<usize>` | one-hop reverse step |
 | `main_blocks()` | `Vec<(usize, Vec<usize>)>` | each `if __name__` block as `(module, [decls])` |
-| `decorated_decls(modules, names)` | `Vec<usize>` | decls decorated by one of `names` imported from one of `modules` (mirrors `query(ctx).decorators()...`) |
+| `decorated_decls(modules, names)` | `Vec<usize>` | decls decorated by one of `names` imported from one of `modules` |
 | `constructions(modules, names)` | `Vec<usize>` | `X = Ctor(...)` decls whose `Ctor` is one of `names` imported from one of `modules` |
-| `handler_decorators(attrs)` | `Vec<(String, usize)>` | top-level fns decorated `@<owner>.<attr>(...)` for `attr` in `attrs`; returns `(owner_name, decl_idx)` — the raw textual owner, unresolved (mirrors `query(ctx).decorators().where_owner_attr(...)`) |
-| `calls_with_string_arg(modules, name, arg_index)` | `Vec<(usize, String)>` | calls to `name` (imported from one of `modules`) whose arg at `arg_index` is a string literal; returns `(owning_decl_idx, literal)` (mirrors `query(ctx).calls()...string_arg_at(...)`) |
-| `calls_on_attr(attr, arg_index)` | `Vec<(usize, String)>` | `<recv>.<attr>(...)` calls (any receiver shape) whose arg at `arg_index` is a string literal; returns `(owning_decl_idx, literal)` (mirrors `query(ctx).calls().where_attr(attr).string_arg_at(...)`) |
+| `handler_decorators(attrs)` | `Vec<(String, usize)>` | top-level fns decorated `@<owner>.<attr>(...)` for `attr` in `attrs`; returns `(owner_name, decl_idx)` — the raw textual owner, unresolved |
+| `calls_with_string_arg(modules, name, arg_index)` | `Vec<(usize, String)>` | calls to `name` (imported from one of `modules`) whose arg at `arg_index` is a string literal; returns `(owning_decl_idx, literal)` |
+| `calls_on_attr(attr, arg_index)` | `Vec<(usize, String)>` | `<recv>.<attr>(...)` calls (any receiver shape) whose arg at `arg_index` is a string literal; returns `(owning_decl_idx, literal)` |
 | `module_surface(module_fqn)` | `Vec<usize>` | the names `from module_fqn import *` would bind |
 | `dunder_all_exports(module_fqn)` | `Option<Vec<usize>>` | the decls named by `module_fqn`'s `__all__`, or `None` |
 | `literal_list_entries(var_fqn)` | `Option<Vec<String>>` | the string entries of a `X = ["a", "b"]` literal-list assignment |
 | `decls_matching_name(pattern)` | `Vec<usize>` | top-level decls whose simple name matches the regex `pattern` |
 
 The decorator / construction / call / subclass-by-fqn / name-pattern matchers
-delegate to the same query core as the `query(ctx)` DSL, so they agree with it;
-they're the project-wide analogue of the per-file
+delegate to the same rust query cores the in-tree native plugins use; they're
+the project-wide analogue of the per-file
 [`PluginFileCtx`](#per-file-plugins-optional-salsa-cached) helpers.
 
 `PluginOps` — emit ops (each maps to one host `PreparedOp`):

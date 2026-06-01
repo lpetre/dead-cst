@@ -54,12 +54,12 @@ fixtures intentionally exercise untyped third-party internals.
 ```
 src/lib.rs            # thin pyo3 cdylib shim -> dead_cst._native (builds via maturin)
 runtime/              # dead-cst-runtime crate: the whole impl, built as rlib + dylib
-  src/lib.rs          # register() (the pymodule body) + top-level query() helper
+  src/lib.rs          # register() (the pymodule body)
   src/project.rs      # Project / ProjectContext / build() pipeline
   src/builder.rs      # GraphBuilder, PreparedOp (Node / Edge / Entrypoint), BFS
   src/graph.rs        # SymbolNode / Import / NativeGraph / NodeFlags / EdgeFlags
   src/ingest.rs       # the three build phases (decls / chain / references)
-  src/query.rs        # plugin-facing chainable query builder
+  src/query.rs        # shared per-file scan helpers (prefilter, path-regex, par_scan_files)
   src/native_plugins.rs  # in-tree + external native plugins (plugin_api, ABI airlock)
   src/helpers.rs      # noqa parser, notebook decoder, dist-info lookup, …
   src/io.rs           # write_graph / read_graph (bincode + versioned header)
@@ -100,14 +100,14 @@ through that native registry first, then falls back to the
 `dead_cst.plugins` entry-point group.
 
 A plugin builds against the query surface on `native.ProjectContext` —
-`find_subclasses`, `find_module`, `find_declarations`, `module_for`,
-`find_main_blocks`, etc. — plus the chainable
-`query(ctx).decorators().where_module(...).where_name(...)` /
-`.constructions()...` / `.calls()...` builder. The same DSL is callable
-from Python against a materialized context (`native.query(ctx)`); each
-`collect()` returns index-keyed rows (e.g.
-`DecoratorIdxRef.decorated_idx`). See `python/dead_cst/_native.pyi` for
-the full surface.
+the `*_indices` queries (`find_declarations_indices`,
+`module_surface_indices`, `decls_matching_indices`, `indices_where`, …)
+return positional indices into `ctx.nodes()`, materialized in bulk with
+`ctx.nodes_at(idxs)` / `ctx.node_attrs(idxs)`, plus direct accessors
+(`find_module_idx`, `module_for_indices`, `find_main_blocks_indices`,
+`find_factory_decls`, …). The decorator / construction / call walks the
+dispatch-app plugins drive are rust-internal. See
+`python/dead_cst/_native.pyi` for the full surface.
 
 Out-of-tree plugins register under the `dead_cst.plugins` entry-point
 group; the target must resolve to (or return) a `NativePlugin`:

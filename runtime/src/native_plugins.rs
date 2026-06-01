@@ -67,7 +67,7 @@ use crate::project::ProjectContext;
 /// Implementations push pure-rust [`PreparedOp`] variants directly
 /// into the sink. No ``Python<'_>`` parameter
 /// either: every ctx accessor a native plugin needs (``node_attrs``,
-/// ``find_main_blocks_indices``, the query DSL helpers) is GIL-free,
+/// ``find_main_blocks_indices``, the ``find_*`` query helpers) is GIL-free,
 /// reading ``Sync`` ``#[pyclass(frozen)]`` data via ``Py::get`` rather
 /// than ``Py::borrow``.
 pub(crate) trait NativePluginImpl: Send + Sync {
@@ -209,9 +209,9 @@ impl<'db> FileContext<'db> {
     // the index space [`FileLocalOp`] / [`plugin_api::FileOps`] emit against.
     // All are pure functions of the file's tracked inputs (parsed AST +
     // nodes), so they preserve the per-file salsa-cache contract. They reuse
-    // the same helpers the project-wide ``query(ctx).decorators()`` /
-    // ``.constructions()`` / ``.calls()`` DSL is built on, so a per-file
-    // plugin and its project-wide twin match identically.
+    // the same decorator / construction / call matchers the project-wide
+    // ``ProjectContext`` finders are built on, so a per-file plugin and its
+    // project-wide twin match identically.
 
     /// This file's enclosing package, for resolving relative imports.
     fn file_package(&self) -> Option<String> {
@@ -246,9 +246,9 @@ impl<'db> FileContext<'db> {
         collect_modules_imports_local(parsed, modules, names, self.file_package().as_deref())
     }
 
-    /// True if this file imports any of `modules` — the per-file mirror of
-    /// ``query(ctx).imports().of(module).exists()``. A presence guard a
-    /// plugin can check before doing heavier per-file work.
+    /// True if this file imports any of `modules` — the per-file twin of
+    /// the project-wide ``ProjectContext::has_imports_of``. A presence guard
+    /// a plugin can check before doing heavier per-file work.
     pub(crate) fn imports_any_module(&self, modules: &[&str]) -> bool {
         let parsed = self.parsed();
         let file_package = self.file_package();
@@ -288,8 +288,8 @@ impl<'db> FileContext<'db> {
 
     /// File-local indices of top-level function / class decls carrying a
     /// decorator that resolves (through this file's imports) to one of
-    /// `names` imported from one of `modules`. The per-file mirror of
-    /// ``query(ctx).decorators().where_module(modules).where_name(names)``.
+    /// `names` imported from one of `modules`. The per-file twin of the
+    /// project-wide ``ProjectContext::find_decorated_decls``.
     pub(crate) fn decorated_decls(&self, modules: &[&str], names: &[&str]) -> Vec<u32> {
         let modules_owned: Vec<String> = modules.iter().map(|m| m.to_string()).collect();
         let names_set: FxHashSet<&str> = names.iter().copied().collect();
@@ -316,8 +316,8 @@ impl<'db> FileContext<'db> {
 
     /// File-local indices of top-level ``X = Ctor(...)`` / ``X: T =
     /// Ctor(...)`` variable decls whose `Ctor` resolves to one of `names`
-    /// imported from one of `modules`. The per-file mirror of
-    /// ``query(ctx).constructions().where_module(...).where_name(...)``.
+    /// imported from one of `modules`. The per-file twin of the project-wide
+    /// ``ProjectContext::find_instance_constructions``.
     pub(crate) fn constructions(&self, modules: &[&str], names: &[&str]) -> Vec<u32> {
         let modules_owned: Vec<String> = modules.iter().map(|m| m.to_string()).collect();
         let names_set: FxHashSet<&str> = names.iter().copied().collect();
@@ -346,9 +346,7 @@ impl<'db> FileContext<'db> {
     /// File-local indices of the decls whose body contains a call to one of
     /// `names` imported from one of `modules`. A top-level function / class
     /// owns calls anywhere in its subtree; module-scope calls attribute to
-    /// the module node (index 0). The per-file mirror of
-    /// ``query(ctx).calls().where_module(...).where_name(...)`` — returns
-    /// each owner once.
+    /// the module node (index 0). Returns each owner once.
     pub(crate) fn calls(&self, modules: &[&str], names: &[&str]) -> Vec<u32> {
         let modules_owned: Vec<String> = modules.iter().map(|m| m.to_string()).collect();
         let names_set: FxHashSet<&str> = names.iter().copied().collect();
@@ -1327,8 +1325,7 @@ pub mod plugin_api {
         /// file or a dependency (e.g. `"unittest.TestCase"`). `transitive`
         /// walks the whole hierarchy; `false` returns only direct subclasses.
         /// The by-fqname twin of [`Self::find_subclasses_of`] (which takes a
-        /// node index); mirrors `query(ctx).subclasses().of_fqn(...)`. Empty
-        /// when nothing resolves.
+        /// node index). Empty when nothing resolves.
         pub fn find_subclasses_of_fqn(&self, base_fqn: &str, transitive: bool) -> Vec<usize> {
             Python::with_gil(|py| self.inner.find_subclasses_indices(py, base_fqn, transitive))
                 .unwrap_or_default()
@@ -1366,14 +1363,14 @@ pub mod plugin_api {
             self.inner.find_main_blocks_indices().unwrap_or_default()
         }
 
-        // --- project-wide matchers (mirror the `query(ctx)` DSL) ------------
+        // --- project-wide matchers ------------------------------------------
         //
-        // Index-returning twins of the chainable Python `query(ctx)`
-        // builder, so a project-wide native plugin can find its seeds
-        // without hand-rolling the import / decorator / construction AST
-        // walk. They share the exact matchers the per-file
-        // [`PluginFileCtx`] helpers and the Python DSL use, so the three
-        // surfaces agree. Each returns project-wide node indices.
+        // Index-returning project-wide finders, so a project-wide native
+        // plugin can find its seeds without hand-rolling the import /
+        // decorator / construction AST walk. They share the exact matchers
+        // the per-file [`PluginFileCtx`] helpers use, so the per-file and
+        // project-wide surfaces agree. Each returns project-wide node
+        // indices.
 
         /// The names `from module_fqn import *` would bind into the
         /// importing scope — every top-level decl on `module_fqn`'s public
@@ -1445,9 +1442,8 @@ pub mod plugin_api {
         /// is one of `decorator_attrs`. Returns `(owner_name, decl_idx)` —
         /// the raw textual decorator owner (`"app"` for `@app.route`, *not*
         /// resolved to a node: the caller decides which owners map to real
-        /// framework instances) and the decorated decl's node index. The
-        /// owner-attr twin of `query(ctx).decorators().where_owner_attr(...)`;
-        /// the read the dispatch-app / click handler wiring is built on.
+        /// framework instances) and the decorated decl's node index. This
+        /// owner-attr read powers the dispatch-app / click handler wiring.
         /// Multiple matching decorators on one function yield multiple rows.
         pub fn handler_decorators(&self, decorator_attrs: &[&str]) -> Vec<(String, usize)> {
             let attrs: Vec<String> = decorator_attrs.iter().map(|s| s.to_string()).collect();
@@ -1465,8 +1461,7 @@ pub mod plugin_api {
         /// position `arg_index` is a string literal. Returns
         /// `(owning_decl_idx, literal)` — the top-level decl whose body makes
         /// the call (module-scope calls map to the module node) and the
-        /// literal's value. The string-arg twin of
-        /// `query(ctx).calls(...).string_arg_at(...)`; powers FQN/path-string
+        /// literal's value. This string-arg read powers FQN/path-string
         /// reads like `mock.patch("pkg.mod.target")`. Calls whose arg isn't a
         /// plain string literal are skipped.
         pub fn calls_with_string_arg(
@@ -1498,9 +1493,8 @@ pub mod plugin_api {
         /// decl whose body makes the call (module-scope calls map to the module
         /// node) and the literal's value. Keyed on the method name, so the
         /// receiver is the plugin's concern (typically gated by a per-file
-        /// import check); the attr twin of
-        /// `query(ctx).calls().where_attr(attr).string_arg_at(arg_index)`. Calls
-        /// whose arg isn't a string literal (or string collection) are skipped.
+        /// import check). Calls whose arg isn't a string literal (or string
+        /// collection) are skipped.
         pub fn calls_on_attr(&self, attr: &str, arg_index: usize) -> Vec<(usize, String)> {
             Python::with_gil(|py| {
                 self.inner
@@ -1692,8 +1686,8 @@ pub mod plugin_api {
         // the import / decorator / construction / call AST walk. Each returns
         // file-local indices (the index space [`FileOps`] emits against), so
         // a plugin pipes the result straight into `ops.keep_alive(idx, ...)`
-        // / `ops.add_edge(...)`. Same matchers the in-tree project-wide DSL
-        // uses — a per-file plugin and its project-wide twin agree.
+        // / `ops.add_edge(...)`. Same matcher cores the in-tree project-wide
+        // queries use — a per-file plugin and its project-wide twin agree.
 
         /// True if this file imports any of `modules`. A cheap presence
         /// guard to short-circuit before heavier per-file work.
@@ -1706,7 +1700,7 @@ pub mod plugin_api {
         /// (e.g. `modules=["flask"], names=["route"]` for `@app.route` via
         /// a `Flask` instance is *not* this — this matches decorators bound
         /// directly to an imported name; instance-method decorators need the
-        /// project-wide DSL).
+        /// project-wide query).
         pub fn decorated_decls(&self, modules: &[&str], names: &[&str]) -> Vec<u32> {
             self.inner.decorated_decls(modules, names)
         }
@@ -1790,7 +1784,7 @@ pub mod plugin_api {
 
     // The read methods are thin, infallible delegations to `pub(crate)`
     // `ProjectContext` methods that already carry Python-level test coverage
-    // (the `query(ctx)` DSL + per-file mirror suites), so they don't get a
+    // (the native-plugin and per-file query suites), so they don't get a
     // bespoke harness here — the end-to-end airlock path is exercised by the
     // gated `tests/test_plugins/test_external_dylib_plugin.py` in CI. These
     // tests pin the *writer* widening: that `flags` and the in-edge list
@@ -2747,8 +2741,7 @@ impl NativePluginImpl for ClickPluginImpl {
 
     fn run(&self, ctx: &ProjectContext, sink: &mut Vec<PreparedOp>) -> PyResult<()> {
         Python::with_gil(|py| -> PyResult<()> {
-            // Cheap import-presence guard (port of
-            // `query(ctx).imports().of("click").exists()`).
+            // Cheap import-presence guard (`has_imports_of("click")`).
             if !ctx.has_imports_of("click")? {
                 return Ok(());
             }

@@ -56,7 +56,7 @@ the rust BFS queries.
 The native code is split in two:
 
 - **`dead-cst-runtime`** (`runtime/`) — the whole implementation: the build
-  pipeline, the query DSL, the pyclasses, the native-plugin API. Built as
+  pipeline, the query surface, the pyclasses, the native-plugin API. Built as
   **both** an `rlib` and a `dylib`.
 - **`dead-cst-native`** (`src/lib.rs`) — a thin pyo3 `#[pymodule]` shim that
   ships as `python/dead_cst/_native.{abi3.so,pyd}`.
@@ -73,12 +73,12 @@ Module layout (`runtime/src/lib.rs`'s `register()` registers the pymodule; the
 | File | Purpose |
 | ---- | ------- |
 | `src/lib.rs`                    | the cdylib shim: pyo3 `#[pymodule]` forwarding to `runtime::register` |
-| `runtime/src/lib.rs`            | `register()`, top-level `query()` helper |
+| `runtime/src/lib.rs`            | `register()` — the pyo3 module registration |
 | `runtime/src/project.rs`        | `Project`, `ProjectContext`, the `build()` pipeline |
 | `runtime/src/builder.rs`        | `NodeKey`, `GraphBuilder`, `PreparedOp` (`Node` / `Edge` / `Entrypoint`), generic BFS |
 | `runtime/src/graph.rs`          | `SymbolNode`, `Import`, `NativeGraph`, `NodeFlags`, `EdgeFlags` |
 | `runtime/src/ingest.rs`         | the three build phases (decls / chain / references) |
-| `runtime/src/query.rs`          | the plugin-facing `query(ctx).decorators()....collect()` builder |
+| `runtime/src/query.rs`          | shared per-file scan helpers (identifier prefilter, path-regex, `par_scan_files`) |
 | `runtime/src/native_plugins.rs` | in-tree + external native plugins (the `plugin_api`, the ABI airlock) |
 | `runtime/src/helpers.rs`        | shared utilities (noqa parser, notebook decoder, dist-info lookup, …) |
 | `runtime/src/io.rs`             | `write_graph` / `read_graph` (bincode + a hard-versioned header) |
@@ -194,17 +194,14 @@ rust apply pass folds every collected handle into the graph atomically
 (`apply_ops_batched`) before `materialize()` returns. There is no
 two-phase observe/finalize split — one collect, one apply.
 
-A plugin builds against the query surface on `native.ProjectContext`.
-For common shapes use the chainable builder:
-
-```python
-native.query(ctx).decorators().where_module("flask").where_name("route").collect()
-```
-
-Direct accessors (`find_module`, `find_declarations`, `module_for`,
-`find_main_blocks`, …) cover the rest. The same DSL is callable from
-Python against a materialized context; `collect()` returns index-keyed
-rows (`DecoratorIdxRef.decorated_idx`, etc.). See
+A plugin builds against the query surface on `native.ProjectContext`:
+the `*_indices` queries (`find_declarations_indices`,
+`module_surface_indices`, `decls_matching_indices`, `indices_where`, …)
+return positional indices into `ctx.nodes()`, materialized in bulk via
+`ctx.nodes_at(idxs)` / `ctx.node_attrs(idxs)`. Direct accessors
+(`find_module_idx`, `module_for_indices`, `find_main_blocks_indices`,
+`find_factory_decls`, …) cover the rest. The decorator / construction /
+call walks the dispatch-app plugins drive are rust-internal. See
 `python/dead_cst/_native.pyi` for the full surface.
 
 Every built-in is resolved through `native._builtin_native_plugin`
@@ -335,8 +332,8 @@ The codemod is the only stage that still uses LibCST.
 | Recognize a new decl shape                                     | `src/ingest.rs` (Phase 1)                          |
 | Tweak how imports resolve                                      | `src/ingest.rs` (Phase 2, `emit_import_edges`)     |
 | Tweak how references attribute                                 | `src/ingest.rs` (Phase 3, `emit_reference_edges`)  |
-| Add a new plugin query                                         | `src/query.rs` (extend `QueryBuilder`)             |
-| Keep alive symbols a framework registers dynamically           | new `Plugin` under `dead_cst/contrib/`             |
+| Add a new plugin query                                         | a `*_indices` pymethod on `ProjectContext` (`src/project.rs`) |
+| Keep alive symbols a framework registers dynamically           | new `NativePlugin` impl in `src/native_plugins.rs` |
 | Support a new project layout / lockfile                        | new `PathResolver` under `dead_cst/contrib/`       |
 | Change graph persistence format                                | `src/io.rs` (bump the format version)              |
 | Change codemod output shape                                    | `dead_cst/codemod.py` (`RemoveDeadSymbols` / `_rewrite_one`) |

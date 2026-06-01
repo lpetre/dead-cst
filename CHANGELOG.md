@@ -76,8 +76,8 @@ two versions.
   hook for native plugins.** A per-file plugin no longer has to
   hand-roll import / decorator / call matching from the raw AST. The
   restricted `PluginFileCtx` (and the in-tree `FileContext` it wraps)
-  now exposes file-local queries that reuse the *same* matcher the
-  project-wide `query(ctx)` DSL is built on, so a per-file plugin and
+  now exposes file-local queries that reuse the *same* matcher cores
+  the project-wide native plugins are built on, so a per-file plugin and
   a project-wide twin agree on what matches:
   - `imports_any_module(&["click"])` — a cheap presence guard.
   - `decorated_decls(&["click"], &["command", "group"])` — file-local
@@ -96,8 +96,8 @@ two versions.
 - **Project-wide matcher + write parity for the native plugin airlock.**
   The project-wide `PluginCtx` now exposes the same ready-made matchers
   the per-file `PluginFileCtx` got — `decorated_decls(modules, names)`
-  and `constructions(modules, names)` (sharing the matcher behind the
-  `query(ctx)` DSL, so the two surfaces agree) — plus the targeted reads
+  and `constructions(modules, names)` (sharing the matcher cores the
+  in-tree native plugins use, so the two surfaces agree) — plus the targeted reads
   `module_surface`, `dunder_all_exports`, `literal_list_entries`, and
   `decls_matching_name`. On the write side, `PluginOps`/`FileOps`
   `add_edge` now takes a `flags` argument (with `plugin_api::FLAG_DEAD_BRANCH`
@@ -248,32 +248,26 @@ two versions.
   external native plugins (see `NATIVE_PLUGINS.md`). `Analysis(...,
   plugins=[…])` accepts only `dead_cst._native.NativePlugin` instances.
   `dead_cst.plugins.__all__` is now just the synthetic-node prefix constants
-  plus `simple_name`; `dead_cst.contrib.__all__` is empty. The
-  `native.query(ctx)` DSL, `CollectedOps`, and `PreparedOp` are unaffected.
+  plus `simple_name`; `dead_cst.contrib.__all__` is empty. `CollectedOps` and
+  `PreparedOp` are unaffected.
 
-#### Query DSL — SymbolNode terminals and SymbolNode-taking sugar
-- `SubclassQuery.collect()`, `ImportQuery.collect()`, `ClassQuery.collect()`,
-  `DeclQuery.collect()` (each previously returned `list[SymbolNode]`).
-  Use the existing `.indices()` terminal (positional indices into
-  `ctx.nodes()`), `.attrs()` (`list[NodeAttrs]`), or `.first_idx()`
-  instead — pair with `ctx.nodes_at(indices)` if you need
-  `SymbolNode` rows.
-- `EdgeQuery.collect()` and the `EdgeRef` class (previously returned
-  `list[EdgeRef]` with `SymbolNode` endpoints). Use the existing
-  `.index_triples()` terminal (`list[tuple[src_idx, dst_idx, flags]]`).
-  `EdgeQuery.first()` is gone for the same reason.
-- `SubclassQuery.of_node(node)` and `DecoratorQuery.in_decl(node)`
-  (both took a `SymbolNode`). Use `.of_idx(idx)` / `.in_decl_idx(idx)`
-  with a positional index into `ctx.nodes()`.
-- `__iter__` on `SubclassQuery` / `ImportQuery` / `ClassQuery` /
-  `DeclQuery` / `EdgeQuery` (which iterated `SymbolNode` / `EdgeRef`).
-  Iterate the appropriate idx-form terminal instead.
-
-The chainable query DSL is now fully idx-form: every terminal returns
-positional indices into `ctx.nodes()` (or an `IdxRef` row that carries
-one). This drops a layer of `Py<SymbolNode>` allocations on the hot
-path and removes the parallel-API confusion of having both
-SymbolNode- and idx-form terminals on the same query.
+#### The chainable `query(ctx)` DSL is removed
+- `native.query(ctx)` and the whole chainable builder — `QueryBuilder` and
+  every `*Query` class (`DeclQuery`, `DecoratorQuery`, `ConstructionQuery`,
+  `CallQuery`, `ImportQuery`, `ClassQuery`, `SubclassQuery`, `EdgeQuery`,
+  `ModuleQuery`, `MainBlockQuery`, `FactoryQuery`), their `*IdxRef` result
+  rows, and the `CallArg` / `ArgLiteral` / `ArgNodeRef` / `ArgOpaque` argument
+  union. Every built-in plugin is now a native Rust `NativePlugin` that calls
+  the rust query cores directly, so the Python-facing DSL had no remaining
+  in-tree consumers.
+- The query surface that stays on `native.ProjectContext` is the `*_indices`
+  methods (`find_declarations_indices`, `module_surface_indices`,
+  `decls_matching_indices`, `indices_where`, …) — each returns positional
+  indices into `ctx.nodes()`, materialized in bulk via `ctx.nodes_at(idxs)` /
+  `ctx.node_attrs(idxs)` — plus the direct accessors (`find_module_idx`,
+  `module_for_indices`, `find_main_blocks_indices`, `find_factory_decls`, …).
+  The decorator / construction / call walks the native plugins drive are now
+  rust-internal.
 
 ### Fixed
 
