@@ -78,14 +78,12 @@ pub(crate) trait NativePluginImpl: Send + Sync {
     // Borrowed (not `&'static`) so an impl can own a runtime-built name —
     // the custom `DispatchAppPluginImpl` carries a caller-supplied `String`.
     // The bundled impls still return string literals.
-    #[allow(dead_code)]
     fn name(&self) -> &str;
 
     /// Walk the frozen ``ctx`` and append the plugin's ops to
     /// ``sink``. Same frozen-graph contract as the Python path: the
     /// impl observes the base graph only; its emissions are folded in
     /// by the apply pass after every plugin returns.
-    #[allow(dead_code)]
     fn run(&self, ctx: &FrozenView<'_>, sink: &mut Vec<PreparedOp>) -> PyResult<()>;
 
     /// Pre-graph hook, mirroring the Python ``Plugin.prepare`` contract:
@@ -93,7 +91,6 @@ pub(crate) trait NativePluginImpl: Send + Sync {
     /// the impl can scan for config files / framework manifests. Default
     /// no-op. Runs before the graph exists, so it must not touch
     /// ``ProjectContext``.
-    #[allow(dead_code)]
     fn prepare(&self, _project_root: &str) {}
 }
 
