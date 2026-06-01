@@ -3265,9 +3265,10 @@ impl NativePluginImpl for DiscordPyPluginImpl {
 // `dead_cst.plugins.dynamic_import`. Fan out each `EdgeFlags.DYNAMIC_IMPORT`
 // edge whose dst is a module node to that module's exports. The include/exclude
 // glob knobs gate the fan-out; with no filters every such edge fans out.
-// Glob matching reuses Python's `pathlib.PurePosixPath.match` (sources) +
-// `fnmatch.fnmatchcase` (targets) for byte-parity, but only when a filter is
-// configured — the zero-config catch-all never touches Python.
+// Source globs match like `pathlib.PurePosixPath.match` (componentwise, from
+// the right, case-sensitive); target globs match like `fnmatch.fnmatchcase`.
+// Both are reimplemented in Rust over the `regex` crate (`fnmatch_regex` /
+// `PathGlob`) — no host-Python call on any path.
 // ---------------------------------------------------------------------------
 
 pub(crate) struct DynamicImportFallbackPluginImpl {
@@ -3285,42 +3286,6 @@ impl DynamicImportFallbackPluginImpl {
             || !self.include_targets.is_empty()
             || !self.exclude_sources.is_empty()
             || !self.exclude_targets.is_empty()
-    }
-
-    /// Port of `_allowed`: include filters (if set) must all match; exclude
-    /// filters (if set) must none match. `rel_pp` is the source path made
-    /// relative to the project root as a `PurePosixPath`; `target_fqname` is
-    /// the imported module's fqname.
-    fn is_allowed(
-        &self,
-        fnmatch: &Bound<'_, PyAny>,
-        pure_posix: &Bound<'_, PyAny>,
-        src_path: &str,
-        project_root: &str,
-        target_fqname: &str,
-    ) -> PyResult<bool> {
-        let rel = std::path::Path::new(src_path)
-            .strip_prefix(project_root)
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| src_path.to_string());
-        let rel_pp = pure_posix.call1((rel,))?;
-        if !self.include_sources.is_empty() && !match_pure_path(&rel_pp, &self.include_sources)? {
-            return Ok(false);
-        }
-        if !self.include_targets.is_empty()
-            && !match_fnmatch(fnmatch, target_fqname, &self.include_targets)?
-        {
-            return Ok(false);
-        }
-        if !self.exclude_sources.is_empty() && match_pure_path(&rel_pp, &self.exclude_sources)? {
-            return Ok(false);
-        }
-        if !self.exclude_targets.is_empty()
-            && match_fnmatch(fnmatch, target_fqname, &self.exclude_targets)?
-        {
-            return Ok(false);
-        }
-        Ok(true)
     }
 
     /// Exports of `module_fqname` per `_exports_indices_for`: `__all__` when
@@ -3346,27 +3311,134 @@ impl DynamicImportFallbackPluginImpl {
     }
 }
 
-/// `any(rel_pp.match(p) for p in patterns)`.
-fn match_pure_path(rel_pp: &Bound<'_, PyAny>, patterns: &[String]) -> PyResult<bool> {
-    for p in patterns {
-        if rel_pp.call_method1("match", (p,))?.extract::<bool>()? {
-            return Ok(true);
-        }
+/// A shell glob compiled to a regex, matching like `fnmatch.fnmatchcase`
+/// (case-sensitive, anchored to the whole string). A pattern that fails to
+/// compile never matches (degenerate input; real globs always compile).
+struct FnGlob(Option<regex::Regex>);
+
+impl FnGlob {
+    fn new(pat: &str) -> Self {
+        FnGlob(regex::Regex::new(&fnmatch_regex(pat)).ok())
     }
-    Ok(false)
+
+    fn is_match(&self, s: &str) -> bool {
+        self.0.as_ref().is_some_and(|re| re.is_match(s))
+    }
 }
 
-/// `any(fnmatch.fnmatchcase(fqname, p) for p in patterns)`.
-fn match_fnmatch(fnmatch: &Bound<'_, PyAny>, fqname: &str, patterns: &[String]) -> PyResult<bool> {
-    for p in patterns {
-        if fnmatch
-            .call_method1("fnmatchcase", (fqname, p))?
-            .extract::<bool>()?
-        {
-            return Ok(true);
+/// A path glob matching like `pathlib.PurePosixPath.match`: split into `/`
+/// components, compared from the right, each component matched case-sensitively
+/// as an `fnmatch` glob (so `*`/`?` never cross a `/`). A relative pattern
+/// matches any path whose trailing components match; an absolute pattern must
+/// align component-for-component.
+struct PathGlob {
+    absolute: bool,
+    components: Vec<FnGlob>,
+}
+
+impl PathGlob {
+    fn new(pattern: &str) -> Self {
+        PathGlob {
+            absolute: pattern.starts_with('/'),
+            components: posix_parts(pattern)
+                .iter()
+                .map(|c| FnGlob::new(c))
+                .collect(),
         }
     }
-    Ok(false)
+
+    fn matches(&self, rel: &str) -> bool {
+        if self.components.is_empty() {
+            // `PurePosixPath("").match(_)` raises; an empty glob matches nothing.
+            return false;
+        }
+        if self.absolute != rel.starts_with('/') {
+            return false;
+        }
+        let parts = posix_parts(rel);
+        if self.absolute {
+            if self.components.len() != parts.len() {
+                return false;
+            }
+        } else if self.components.len() > parts.len() {
+            return false;
+        }
+        parts
+            .iter()
+            .rev()
+            .zip(self.components.iter().rev())
+            .all(|(part, glob)| glob.is_match(part))
+    }
+}
+
+/// Split a posix path/pattern into components, dropping empty segments and `.`
+/// (mirrors `pathlib`'s `parse_parts`). Backslashes are literal on posix.
+fn posix_parts(p: &str) -> Vec<&str> {
+    p.split('/')
+        .filter(|c| !c.is_empty() && *c != ".")
+        .collect()
+}
+
+/// Translate an `fnmatch` glob to an anchored regex with the same match set as
+/// CPython's `fnmatch.translate`. `*` becomes a greedy `.*` (CPython's atomic
+/// groups only bound backtracking; the accepted language is identical and the
+/// `regex` crate already matches in linear time), `?` becomes `.`, `[...]`
+/// becomes a character class (`!` negation, ranges), everything else is
+/// escaped. Exotic class set-operations are not reproduced — no real import
+/// glob uses them.
+fn fnmatch_regex(pat: &str) -> String {
+    let chars: Vec<char> = pat.chars().collect();
+    let n = chars.len();
+    let mut out = String::from("(?s)^(?:");
+    let mut i = 0;
+    while i < n {
+        let c = chars[i];
+        i += 1;
+        match c {
+            '*' => out.push_str(".*"),
+            '?' => out.push('.'),
+            '[' => {
+                let mut j = i;
+                if j < n && chars[j] == '!' {
+                    j += 1;
+                }
+                if j < n && chars[j] == ']' {
+                    j += 1;
+                }
+                while j < n && chars[j] != ']' {
+                    j += 1;
+                }
+                if j >= n {
+                    // No closing `]`: a literal `[`.
+                    out.push_str("\\[");
+                } else {
+                    out.push('[');
+                    let body = &chars[i..j];
+                    let mut k = 0;
+                    if body.first() == Some(&'!') {
+                        out.push('^');
+                        k = 1;
+                    }
+                    while k < body.len() {
+                        let ch = body[k];
+                        // Escape regex class metacharacters so `&&`/`~~`/nested
+                        // `[` are not read as set operations; `-` stays literal
+                        // so ranges keep working.
+                        if matches!(ch, '\\' | ']' | '^' | '&' | '~' | '|' | '[') {
+                            out.push('\\');
+                        }
+                        out.push(ch);
+                        k += 1;
+                    }
+                    out.push(']');
+                    i = j + 1;
+                }
+            }
+            _ => out.push_str(&regex::escape(&c.to_string())),
+        }
+    }
+    out.push_str(")\\z");
+    out
 }
 
 impl NativePluginImpl for DynamicImportFallbackPluginImpl {
@@ -3396,26 +3468,58 @@ impl NativePluginImpl for DynamicImportFallbackPluginImpl {
             return Ok(());
         }
 
-        // Apply include/exclude filters. Zero-config => every edge passes and
-        // Python is never entered.
+        // Apply include/exclude filters (compiled once). Zero-config => every
+        // edge passes with no glob work at all.
         let allowed: Vec<(usize, String)> = if self.needs_matching() {
-            Python::with_gil(|py| -> PyResult<Vec<(usize, String)>> {
-                let fnmatch = py.import_bound("fnmatch")?.into_any();
-                let pure_posix = py.import_bound("pathlib")?.getattr("PurePosixPath")?;
-                let mut out: Vec<(usize, String)> = Vec::new();
-                for (src_idx, src_path, dst_fqname) in &candidates {
-                    if self.is_allowed(
-                        &fnmatch,
-                        &pure_posix,
-                        src_path,
-                        &project_root,
-                        dst_fqname,
-                    )? {
-                        out.push((*src_idx, dst_fqname.clone()));
+            let include_src: Vec<PathGlob> = self
+                .include_sources
+                .iter()
+                .map(|p| PathGlob::new(p))
+                .collect();
+            let include_tgt: Vec<FnGlob> = self
+                .include_targets
+                .iter()
+                .map(|p| FnGlob::new(p))
+                .collect();
+            let exclude_src: Vec<PathGlob> = self
+                .exclude_sources
+                .iter()
+                .map(|p| PathGlob::new(p))
+                .collect();
+            let exclude_tgt: Vec<FnGlob> = self
+                .exclude_targets
+                .iter()
+                .map(|p| FnGlob::new(p))
+                .collect();
+            candidates
+                .into_iter()
+                .filter_map(|(src_idx, src_path, dst_fqname)| {
+                    // Source path relative to the project root, matched as a
+                    // `PurePosixPath`; falls back to the raw path when it is not
+                    // under the root (mirrors the original strip_prefix).
+                    let rel = std::path::Path::new(&src_path)
+                        .strip_prefix(&project_root)
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_else(|_| src_path.clone());
+                    // Include filters (if any) must all match; exclude filters
+                    // (if any) must none match.
+                    if !include_src.is_empty() && !include_src.iter().any(|g| g.matches(&rel)) {
+                        return None;
                     }
-                }
-                Ok(out)
-            })?
+                    if !include_tgt.is_empty()
+                        && !include_tgt.iter().any(|g| g.is_match(&dst_fqname))
+                    {
+                        return None;
+                    }
+                    if exclude_src.iter().any(|g| g.matches(&rel)) {
+                        return None;
+                    }
+                    if exclude_tgt.iter().any(|g| g.is_match(&dst_fqname)) {
+                        return None;
+                    }
+                    Some((src_idx, dst_fqname))
+                })
+                .collect()
         } else {
             candidates
                 .into_iter()
@@ -3483,8 +3587,8 @@ impl NativePluginImpl for ExplicitEntrypointPluginImpl {
 // ---------------------------------------------------------------------------
 // ProjectScriptsPlugin — project-wide port of
 // `dead_cst.plugins.project_scripts`. Mark every `[project.scripts]` entry in
-// `pyproject.toml` as an entrypoint. TOML is parsed via Python's stdlib
-// `tomllib` (no Rust toml dependency); a missing file is a no-op.
+// `pyproject.toml` as an entrypoint. TOML is parsed in Rust via the `toml`
+// crate; a missing file is a no-op.
 // ---------------------------------------------------------------------------
 
 const PROJECT_SCRIPTS_PREFIX: &str = "<project.scripts>:";
@@ -3512,26 +3616,26 @@ impl NativePluginImpl for ProjectScriptsPluginImpl {
             Err(_) => return Ok(()),
         };
 
-        // Parse `[project.scripts]` (name -> "pkg.mod:func") via tomllib.
-        let scripts: Vec<(String, String)> =
-            Python::with_gil(|py| -> PyResult<Vec<(String, String)>> {
-                let tomllib = py.import_bound("tomllib")?;
-                let data = tomllib.call_method1("loads", (text,))?;
-                let project = data.call_method1("get", ("project",))?;
-                if project.is_none() {
-                    return Ok(Vec::new());
-                }
-                let scripts_obj = project.call_method1("get", ("scripts",))?;
-                if scripts_obj.is_none() {
-                    return Ok(Vec::new());
-                }
-                let mut out: Vec<(String, String)> = Vec::new();
-                for item in scripts_obj.call_method0("items")?.iter()? {
-                    let (name, target): (String, String) = item?.extract()?;
-                    out.push((name, target));
-                }
-                Ok(out)
-            })?;
+        // Parse `[project.scripts]` (name -> "pkg.mod:func") in Rust. A parse
+        // error surfaces as a `ValueError` (mirroring `tomllib.loads`); a
+        // missing `[project]` / `[project.scripts]` (or a non-string value) is
+        // simply skipped.
+        let table: toml::Table = text.parse().map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!("{pyproject}: invalid TOML: {e}"))
+        })?;
+        let scripts: Vec<(String, String)> = table
+            .get("project")
+            .and_then(|project| project.get("scripts"))
+            .and_then(|scripts| scripts.as_table())
+            .map(|scripts| {
+                scripts
+                    .iter()
+                    .filter_map(|(name, target)| {
+                        target.as_str().map(|t| (name.clone(), t.to_string()))
+                    })
+                    .collect::<Vec<(String, String)>>()
+            })
+            .unwrap_or_default();
 
         let synthetic = intern_kind("synthetic").expect("'synthetic' is a valid kind");
         for (script_name, target) in scripts {
@@ -3825,5 +3929,72 @@ impl NativePluginImpl for PytestPluginImpl {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod dynamic_import_glob_tests {
+    use super::{FnGlob, PathGlob};
+
+    fn fn_match(name: &str, pat: &str) -> bool {
+        FnGlob::new(pat).is_match(name)
+    }
+
+    fn path_match(rel: &str, pat: &str) -> bool {
+        PathGlob::new(pat).matches(rel)
+    }
+
+    #[test]
+    fn fnmatch_star_and_question() {
+        assert!(fn_match("foo.py", "*.py"));
+        assert!(!fn_match("foo.txt", "*.py"));
+        assert!(fn_match("a", "?"));
+        assert!(!fn_match("ab", "?"));
+        assert!(fn_match("ab", "??"));
+    }
+
+    #[test]
+    fn fnmatch_dot_is_literal() {
+        // The glob `.` is a literal dot, not "any char".
+        assert!(fn_match("a.b", "a.b"));
+        assert!(!fn_match("axb", "a.b"));
+    }
+
+    #[test]
+    fn fnmatch_prefix_glob() {
+        assert!(fn_match("pkg.vendored.x", "pkg.vendored.*"));
+        assert!(fn_match("pkg.vendored.sub.y", "pkg.vendored.*"));
+        assert!(!fn_match("pkg.other.x", "pkg.vendored.*"));
+    }
+
+    #[test]
+    fn fnmatch_char_class() {
+        assert!(fn_match("a1", "a[0-9]"));
+        assert!(!fn_match("aX", "a[0-9]"));
+        assert!(fn_match("aX", "a[!0-9]"));
+    }
+
+    #[test]
+    fn path_match_componentwise() {
+        assert!(path_match("pkg/loaders/foo.py", "pkg/loaders/*.py"));
+        assert!(!path_match("pkg/loaders/foo.txt", "pkg/loaders/*.py"));
+        // `*` does not cross a `/`.
+        assert!(!path_match("pkg/loaders/sub/foo.py", "pkg/loaders/*.py"));
+        // `*` matches a whole single component.
+        assert!(path_match("pkg/loaders/foo.py", "pkg/*/foo.py"));
+    }
+
+    #[test]
+    fn path_match_relative_from_the_right() {
+        assert!(path_match("pkg/loaders/foo.py", "loaders/*.py"));
+        assert!(path_match("a/b/c.py", "*.py"));
+        // A pattern longer than the path cannot match.
+        assert!(!path_match("c.py", "b/c.py"));
+    }
+
+    #[test]
+    fn path_match_literal_filename() {
+        assert!(path_match("pkg/legacy/b.py", "pkg/legacy/b.py"));
+        assert!(!path_match("pkg/legacy/a.py", "pkg/legacy/b.py"));
     }
 }

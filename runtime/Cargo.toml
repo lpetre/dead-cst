@@ -37,6 +37,11 @@ indicatif = "0.17"
 rayon = "1.10"
 crossbeam-channel = "0.5"
 regex = "1"
+# Already in the locked tree (transitive via ruff/ty); promoted to a direct dep
+# so `project_scripts` parses `pyproject.toml` in Rust instead of shelling out
+# to Python's `tomllib`. `preserve_order` keeps `[project.scripts]` iteration in
+# document order, matching the old tomllib behavior.
+toml = { version = "1", features = ["preserve_order"] }
 serde = { version = "1", features = ["derive"] }
 # Direct dep (not used by the runtime itself) so its rlib is guaranteed in the
 # plugin-compile closure: build-plugin wires `--extern serde_json` for authors.
