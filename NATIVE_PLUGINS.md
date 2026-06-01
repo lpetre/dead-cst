@@ -72,7 +72,9 @@ the [`ExternalPlugin`](runtime/src/native_plugins.rs) trait from the curated
 `plugin_api`:
 
 ```rust
-use dead_cst_runtime::native_plugins::plugin_api::{ExternalPlugin, PluginCtx, PluginOps};
+use dead_cst_runtime::native_plugins::plugin_api::{
+    ExternalPlugin, PluginCtx, PluginError, PluginOps,
+};
 
 struct KeepMainBlocksAlive;
 
@@ -81,7 +83,7 @@ impl ExternalPlugin for KeepMainBlocksAlive {
         "KeepMainBlocksAlive"
     }
 
-    fn run(&self, ctx: &PluginCtx<'_>, ops: &mut PluginOps) {
+    fn run(&self, ctx: &PluginCtx<'_>, ops: &mut PluginOps) -> Result<(), PluginError> {
         // `ctx` is a restricted, mostly-stable view of the frozen graph.
         for (module_idx, decl_indices) in ctx.main_blocks() {
             // Emit ops the host folds in after every plugin has run.
@@ -90,6 +92,7 @@ impl ExternalPlugin for KeepMainBlocksAlive {
                 ops.keep_alive(decl_idx, "<__main__>".to_string());
             }
         }
+        Ok(())
     }
 }
 ```
@@ -100,7 +103,17 @@ named methods instead of internal op types. The contract is a frozen-graph
 one: the plugin observes the base graph only; its emissions are applied in a
 single batch after every plugin returns. No
 `Python<'_>` token is ever exposed — `PluginCtx` reads `#[pyclass(frozen)]`
-data directly.
+data directly. This is the *same* trait every in-tree built-in implements — no
+separate internal plugin surface exists, so anything a shipped plugin does is
+expressible here.
+
+**`run` is fallible.** It returns `Result<(), PluginError>`; a returned `Err`
+aborts the materialize and surfaces to Python as an exception (`PluginError`'s
+kind picks the type — `PluginError::value(..)` → `ValueError`,
+`PluginError::runtime(..)` → `RuntimeError`). `PluginError` is pyo3-free, so
+the curated surface stays GIL-free; the conversion happens once, at the host
+boundary. A plugin that can't fail just ends with `Ok(())`. (Per-file
+`run_on_file` stays infallible — see below.)
 
 ### The `PluginCtx` / `PluginOps` surface
 
@@ -131,15 +144,38 @@ flags }`.
 | `handler_decorators(attrs)` | `Vec<(String, usize)>` | top-level fns decorated `@<owner>.<attr>(...)` for `attr` in `attrs`; returns `(owner_name, decl_idx)` — the raw textual owner, unresolved |
 | `calls_with_string_arg(modules, name, arg_index)` | `Vec<(usize, String)>` | calls to `name` (imported from one of `modules`) whose arg at `arg_index` is a string literal; returns `(owning_decl_idx, literal)` |
 | `calls_on_attr(attr, arg_index)` | `Vec<(usize, String)>` | `<recv>.<attr>(...)` calls (any receiver shape) whose arg at `arg_index` is a string literal; returns `(owning_decl_idx, literal)` |
+| `calls_on_var(owner, attr, arg_index, required_positional)` | `Vec<(usize, String)>` | `<owner>.<attr>(...)` calls where `owner` is a bare variable (`mocker`, `monkeypatch`) and the arg at `arg_index` is a string literal; `required_positional` (if set) restricts to calls with exactly that many positional args |
+| `handler_decorators_via(via_attr, attrs)` | `Vec<(String, usize)>` | two-level twin of `handler_decorators`: `@<owner>.<via_attr>.<attr>(...)` (e.g. `via_attr="tree"` for `@bot.tree.command`) |
+| `decorated_decls_with_args(modules, names)` | `Vec<(usize, CallArgs)>` | args-capturing twin of `decorated_decls`: each match paired with its decorator's captured kwargs (read via `CallArgs`) |
+| `factory_decls(modules, ctor_names)` | `Vec<(usize, Vec<String>)>` | fns/classes that *return* an instance of one of `ctor_names` (app-factory shape); `(decl_idx, return_kinds)` |
+| `classes_defining_method(method_name)` | `Vec<usize>` | classes with a top-level `def <method_name>` |
 | `module_surface(module_fqn)` | `Vec<usize>` | the names `from module_fqn import *` would bind |
+| `module_surfaces(module_fqns)` | `Vec<Vec<usize>>` | bulk `module_surface`, one row per input fqn |
+| `module_top_level_decls(module_fqn)` | `Vec<usize>` | every top-level decl in a module (not just the `*`-exported surface) |
 | `dunder_all_exports(module_fqn)` | `Option<Vec<usize>>` | the decls named by `module_fqn`'s `__all__`, or `None` |
 | `literal_list_entries(var_fqn)` | `Option<Vec<String>>` | the string entries of a `X = ["a", "b"]` literal-list assignment |
 | `decls_matching_name(pattern)` | `Vec<usize>` | top-level decls whose simple name matches the regex `pattern` |
+| `nodes_matching(&filter)` | `Vec<usize>` | nodes matching a `NodeFilter` (kinds / simple names / paths / fqname prefix / flags-all / flags-any) |
+| `has_imports_of(module)` | `bool` | does any file import `module`? |
+| `imports_of(module)` | `Vec<usize>` | the `import` nodes binding names from `module` |
+| `module_for(path)` / `modules_for_paths(paths)` | `Option<usize>` / `Vec<Option<usize>>` | module node(s) by source path, one-shot or bulk |
+| `nodes_at(idxs)` | `Vec<NodeView>` | bulk `node()` — owned snapshots, out-of-range indices skipped |
+| `node_paths(idxs)` | `Vec<String>` | source path per index (cheaper than `nodes_at` when only paths are needed) |
+| `function_parameters(idxs)` / `class_method_parameters(idxs)` | `Vec<Vec<String>>` | parameter-name lists for the function (or `__init__`) at each index |
+| `nodes()` | `impl Iterator<Item = NodeRef<'_>>` | borrowing walk over every node (no per-node `String` clone — use over `nodes_at(0..n)` for a full scan) |
+| `edges()` | `impl Iterator<Item = EdgeRef>` | borrowing walk over every `(src, dst, flags)` edge |
 
 The decorator / construction / call / subclass-by-fqn / name-pattern matchers
 delegate to the same rust query cores the in-tree native plugins use; they're
 the project-wide analogue of the per-file
 [`PluginFileCtx`](#per-file-plugins-optional-salsa-cached) helpers.
+
+`NodeView` (owned, from `node`/`nodes_at`) vs. `NodeRef<'_>` / `EdgeRef`
+(borrowing, from `nodes()`/`edges()`): reach for the borrowing iterators when
+scanning the whole graph and the owned `NodeView` for a handful of specific
+indices. `CallArgs` / `ArgValue` (the captured decorator/constructor kwargs
+returned by `decorated_decls_with_args`) are re-exported from `plugin_api`;
+read a keyword via `CallArgs::str_value(name)`.
 
 `PluginOps` — emit ops (each maps to one host `PreparedOp`):
 
