@@ -17,9 +17,11 @@ requires-python = ">=3.11"
 packages = ["dead_cst_plugin_host"]
 
 # The payload is binary + platform-specific: the `.rlib` dependency closure +
-# proc-macro dylibs that `rustc` needs to compile a plugin against the runtime.
-# (The runtime dylib + libstd ship in the base `dead_cst` wheel.) `dead-cst
+# proc-macro dylibs that `rustc` needs to compile a plugin against the runtime,
+# each stored xz-compressed (`<name>.rlib.xz` / `…dylib.xz`) so the wheel clears
+# PyPI's 100 MB/file cap — `build-plugin` decompresses them before rustc. (The
+# runtime dylib + libstd ship in the base `dead_cst` wheel.) `dead-cst
 # bundle-plugin-host` populates these; the publish workflow builds one platform
 # wheel per target.
 [tool.setuptools.package-data]
-dead_cst_plugin_host = ["*.rlib", "*.so", "*.dylib"]
+dead_cst_plugin_host = ["*.xz"]

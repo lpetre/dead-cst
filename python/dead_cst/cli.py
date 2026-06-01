@@ -17,12 +17,15 @@ them as additional module-resolution search paths.
 
 from __future__ import annotations
 
+import atexit
 import json
 import logging
+import lzma
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Iterable, Sequence
@@ -608,14 +611,33 @@ def _plugin_host_bundle() -> Path | None:
     """The compile-time payload shipped by the ``dead-cst[build-plugin]`` extra
     as the separate ``dead_cst_plugin_host`` package: the ``.rlib`` dependency
     closure + proc-macro dylibs ``rustc`` needs to compile a plugin against the
-    runtime. (The runtime dylib + libstd ship in the base ``dead_cst`` wheel.)
-    None if the extra isn't installed."""
+    runtime, each stored xz-compressed so the wheel clears PyPI's per-file size
+    cap. (The runtime dylib + libstd ship in the base ``dead_cst`` wheel.) None
+    if the extra isn't installed."""
     try:
         import dead_cst_plugin_host  # ty: ignore[unresolved-import]
     except Exception:
         return None
     bundle = Path(dead_cst_plugin_host.__file__).resolve().parent
-    return bundle if any(bundle.glob("*.rlib")) else None
+    return bundle if any(bundle.glob("*.rlib.xz")) else None
+
+
+def _materialize_dep_closure(dep_dir: Path) -> Path:
+    """``rustc`` needs the dependency closure uncompressed under its original
+    filenames, but the shipped ``dead_cst_plugin_host`` payload stores each
+    artifact xz-compressed (to keep the wheel under PyPI's per-file size cap).
+    Decompress any ``*.xz`` into a temp dir (cleaned at exit) and return it; a
+    raw deps dir (e.g. a local ``--runtime-dir`` build) has no ``*.xz`` and is
+    returned unchanged."""
+    compressed = sorted(dep_dir.glob("*.xz"))
+    if not compressed:
+        return dep_dir
+    staging = Path(tempfile.mkdtemp(prefix="dead-cst-plugin-host-"))
+    atexit.register(shutil.rmtree, staging, ignore_errors=True)
+    for src in compressed:
+        with lzma.open(src, "rb") as fsrc, open(staging / src.name[: -len(".xz")], "wb") as fdst:
+            shutil.copyfileobj(fsrc, fdst)
+    return staging
 
 
 def _build_runtime_from_source(root: Path, *, release: bool, std_lib: Path) -> Path:
@@ -741,6 +763,10 @@ def build_plugin(
             f"shared runtime dylib not found at {runtime_dylib}; build-plugin needs the "
             "dynamic-runtime wheel (pip install dead-cst[build-plugin])."
         )
+
+    # The shipped closure is xz-compressed (PyPI per-file size cap); rustc needs
+    # it decompressed. No-op for a raw local deps dir.
+    dep_dir = _materialize_dep_closure(dep_dir)
 
     # Resolve the plugin source (default: bundled example from a source checkout).
     if plugin_src is None:
@@ -871,7 +897,7 @@ def bundle_plugin_host(
 
     bundle.mkdir(parents=True, exist_ok=True)
     # Clean only prior build artifacts — keep package files like __init__.py.
-    for stale in (*bundle.glob("*.rlib"), *bundle.glob(f"*{suffix}")):
+    for stale in (*bundle.glob("*.rlib"), *bundle.glob(f"*{suffix}"), *bundle.glob("*.xz")):
         stale.unlink()
 
     # The plugin-compile closure: every dependency `.rlib` + the proc-macro
@@ -903,14 +929,31 @@ def bundle_plugin_host(
             cur = newest.get(key)
             if cur is None or entry.stat().st_mtime > cur.stat().st_mtime:
                 newest[key] = entry
+    # Store each artifact xz-compressed (`<name>.xz`). A wheel is a zip, and the
+    # raw `.rlib` closure deflates to ~107 MB — over PyPI's 100 MB/file cap. The
+    # bulk is `lib.rmeta` crate metadata embedded in each rlib, which can't be
+    # stripped without breaking `rustc --extern`. xz packs far tighter than zip's
+    # deflate (~70 MB here); `build-plugin` decompresses via `_materialize_dep_closure`
+    # before handing paths to rustc. stdlib `lzma` keeps `[build-plugin]` dep-free.
     n_files = 0
+    raw_bytes = 0
+    xz_bytes = 0
     for entry in newest.values():
-        shutil.copy2(entry, bundle / entry.name)
+        dest = bundle / f"{entry.name}.xz"
+        with (
+            open(entry, "rb") as fsrc,
+            lzma.open(dest, "wb", preset=9 | lzma.PRESET_EXTREME) as fdst,
+        ):
+            shutil.copyfileobj(fsrc, fdst)
         n_files += 1
+        raw_bytes += entry.stat().st_size
+        xz_bytes += dest.stat().st_size
 
     typer.echo(f"plugin-host closure: {bundle}  (deps build: {deps_dir})", err=True)
     typer.echo(
-        f"  {n_files} rlib / proc-macro artifacts (runtime dylib + libstd ship in dead_cst)",
+        f"  {n_files} rlib / proc-macro artifacts, xz-compressed "
+        f"{raw_bytes / 1_000_000:.1f} MB -> {xz_bytes / 1_000_000:.1f} MB "
+        f"(runtime dylib + libstd ship in dead_cst)",
         err=True,
     )
     typer.echo(str(bundle))

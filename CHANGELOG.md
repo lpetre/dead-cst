@@ -47,6 +47,13 @@ two versions.
     <version>`) and shipped to TestPyPI on every push to `main` and PyPI
     on release. The lockstep is mandatory — the runtime version is part
     of the ABI fingerprint. No Windows plugin support (static wheel).
+  - The `dead-cst-plugin-host` closure is now stored **xz-compressed**
+    inside the wheel (each `.rlib` / proc-macro dylib as `<name>.xz`,
+    `ZIP_STORED`). The raw closure is ~320 MB and a deflate wheel lands at
+    ~107 MB — over PyPI's 100 MB/file cap; xz packs it to ~70 MB.
+    `build-plugin` decompresses to a temp dir (freed on exit) before
+    invoking `rustc`. Uses the stdlib `lzma` module, so the
+    `[build-plugin]` extra gains no dependency.
 - **Fleshed-out external native plugin API.** The curated
   `dead_cst_runtime::native_plugins::plugin_api` an external plugin
   compiles against grew from a single `PluginCtx::main_blocks()` /

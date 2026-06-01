@@ -138,6 +138,24 @@ jobs:
             python setup.py bdist_wheel \
             --plat-name "${{ matrix.platform.plat }}" \
             --dist-dir "$GITHUB_WORKSPACE/dist-host"
+      # Report-only: surface each wheel's size so the real per-platform numbers
+      # are visible (esp. the plugin-host wheel vs PyPI's 100 MB/file cap).
+      - name: Report wheel sizes
+        shell: bash
+        run: |
+          limit=100000000  # PyPI's per-file cap: 100 MB
+          {
+            echo "### Wheel sizes (${{ matrix.platform.target }})"
+            echo ""
+            echo "| wheel | size | PyPI 100 MB/file |"
+            echo "|---|---|---|"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          for whl in dist/*.whl dist-host/*.whl; do
+            bytes=$(stat -c%s "$whl" 2>/dev/null || stat -f%z "$whl")
+            mb=$(awk "BEGIN{printf \"%.1f\", $bytes/1000000}")
+            if [ "$bytes" -gt "$limit" ]; then flag="OVER"; else flag="ok"; fi
+            echo "| $(basename "$whl") | ${mb} MB | ${flag} |" | tee -a "$GITHUB_STEP_SUMMARY"
+          done
       - uses: actions/upload-artifact@v4
         with:
           name: wheel-${{ matrix.platform.target }}
