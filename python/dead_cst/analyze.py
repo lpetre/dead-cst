@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import os
 import threading
 import warnings
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterator, Sequence, TypedDict
 
@@ -91,36 +89,6 @@ def _iter_dead_indices(
         for idx in ctx.indices_where(kind=kind):
             if idx not in reachable:
                 yield idx
-
-
-def _serial_mode() -> bool:
-    """``True`` if ``DEAD_CST_PLUGINS_SERIAL=1`` is set in the env.
-
-    Kill switch for the concurrent plugin executor — falls back to
-    the rust-side serial loop. Useful for debugging plugin races,
-    flaky CI environments, or comparing serial vs parallel timings.
-    """
-    return os.environ.get("DEAD_CST_PLUGINS_SERIAL", "") == "1"
-
-
-def _plugin_worker_count(n_plugins: int) -> int:
-    """Worker count for the plugin :class:`ThreadPoolExecutor`.
-
-    Resolves to ``DEAD_CST_PLUGIN_WORKERS`` if set (clamped to
-    ``[1, n_plugins]``), otherwise ``min(n_plugins, cpu_count or 4)``.
-    Never returns more workers than plugins — extra workers just
-    idle.
-    """
-    raw = os.environ.get("DEAD_CST_PLUGIN_WORKERS", "")
-    if raw:
-        try:
-            requested = int(raw)
-        except ValueError as exc:
-            raise ValueError(f"DEAD_CST_PLUGIN_WORKERS must be an integer, got {raw!r}") from exc
-        if requested < 1:
-            raise ValueError(f"DEAD_CST_PLUGIN_WORKERS must be >= 1, got {requested}")
-        return min(requested, n_plugins)
-    return min(n_plugins, os.cpu_count() or 4)
 
 
 def _safe_invoke_callback(cb: ProgressCallback, event: str, **kwargs: Any) -> None:
@@ -406,8 +374,8 @@ class _ProgressPoller:
 
         Slot order is registration order, so ``idx`` is meaningful;
         completion order across slots can interleave freely under the
-        parallel ``ThreadPoolExecutor`` pass — each slot writes only
-        to its own atomic so attribution is exact.
+        rust-side rayon plugin fan-out — each slot writes only to its
+        own atomic so attribution is exact.
         """
         states = snap["plugin_states"]
         plugin_total = total if total > 0 else len(states)
@@ -645,11 +613,11 @@ class Analysis:
 
         Factored out of :meth:`materialize_all` so
         :meth:`re_materialize` can drive a second build on the same
-        ctx without duplicating the dispatch / progress / plugin-pool
-        plumbing. Plugin ``prepare`` is *not* invoked here — that's a
-        one-shot hook owned by :meth:`materialize_all`.
+        ctx without duplicating the dispatch / progress plumbing.
+        Plugin ``prepare`` is *not* invoked here — that's a one-shot
+        hook owned by :meth:`materialize_all`.
         """
-        # The rust-serial path below calls ``ctx.add_plugin(p)`` per
+        # ``ctx.materialize()`` below calls ``ctx.add_plugin(p)`` per
         # plugin, which appends. Clear first so a re_materialize doesn't
         # stack a second copy of every plugin on top of the first run's
         # registrations.
@@ -669,81 +637,18 @@ class Analysis:
             )
             poller.start()
 
-        # The plugin loop has two modes:
-        #
-        # * **Rust-side serial loop** — ``ctx.materialize()`` drives the
-        #   build pass and every registered plugin's ``run(ctx)`` in
-        #   one C call. Used when ``DEAD_CST_PLUGINS_SERIAL=1`` or
-        #   ``len(plugins) <= 1``.
-        # * **Python-driven loop** — ``ctx.build_only()`` runs the
-        #   build pass; Python then drives plugin ``run(ctx)`` calls
-        #   itself through a :class:`ThreadPoolExecutor` (so
-        #   GIL-releasing rust queries overlap).
-        #
-        # Both paths satisfy the *frozen-graph* contract: every
-        # plugin's ``run(ctx)`` observes the same base-graph state.
-        # Ops collected from each plugin land in registration order
-        # via a single end-of-pass :meth:`apply_ops_batched` call —
-        # a plugin's own emissions are invisible to its own queries,
-        # and to every other plugin's queries, until the apply pass
-        # runs.
+        # Build + plugin pass in one rust call. ``ctx.materialize()``
+        # runs the build pass, then fans every registered project-wide
+        # plugin out across a GIL-free rayon scope (per-file plugins are
+        # folded inline during the build's own parallel file walk). Every
+        # plugin observes the same frozen base-graph state; the ops each
+        # emits fold into the graph in registration order in one
+        # end-of-pass apply — a plugin's own emissions are invisible to
+        # its own queries, and to every other plugin's, until then.
         try:
-            use_rust_serial = _serial_mode() or len(self._plugins) <= 1
-            if use_rust_serial:
-                for plugin in self._plugins:
-                    ctx.add_plugin(plugin)
-                ctx.materialize()
-            else:
-                # Register every plugin before ``build_only`` so the
-                # build can fold per-file native plugins inline — it
-                # reads the registered set to find their ids, warms the
-                # per-file ops in the parallel fan-out, and replays them
-                # during assembly. Project-wide plugins still run below
-                # via the executor; per-file plugins no-op there since
-                # they're already applied.
-                for plugin in self._plugins:
-                    ctx.add_plugin(plugin)
-                ctx.build_only()
-
-                workers = 1 if _serial_mode() else _plugin_worker_count(len(self._plugins))
-
-                plugin_names = [p.name for p in self._plugins]
-                ctx.progress_plugins_start(plugin_names)
-                try:
-                    # Plugins are scheduled in registration order;
-                    # ``.result()`` waits in the same order. Errors
-                    # propagate via the future. Each worker collects
-                    # its plugin's ops into a :class:`CollectedOps`
-                    # handle (no graph mutation); the main thread
-                    # folds every handle into the graph in registration
-                    # order via one ``apply_ops_batched`` call.
-                    #
-                    # The per-plugin ``progress_plugin_started`` /
-                    # ``progress_plugin_finished`` stamps live in this
-                    # worker so the rust per-plugin counter slabs see
-                    # the actual completion order (the polling thread
-                    # uses those to attribute ``plugin_end`` events to
-                    # the right plugin even when futures resolve out of
-                    # registration order).
-                    def _run_collect(idx: int, plugin: Any):
-                        ctx.progress_plugin_started(idx)
-                        try:
-                            return ctx.run_plugin_collect(plugin)
-                        finally:
-                            ctx.progress_plugin_finished(idx)
-                            ctx.progress_plugin_done()
-
-                    with ThreadPoolExecutor(
-                        max_workers=workers,
-                        thread_name_prefix="dead-cst-plugin",
-                    ) as pool:
-                        futures = [
-                            pool.submit(_run_collect, idx, p) for idx, p in enumerate(self._plugins)
-                        ]
-                        collected = [fut.result() for fut in futures]
-                    ctx.apply_ops_batched(collected)
-                finally:
-                    ctx.progress_plugins_finish()
+            for plugin in self._plugins:
+                ctx.add_plugin(plugin)
+            ctx.materialize()
         except BaseException:
             # Make sure the polling thread doesn't outlive a failed
             # build. ``mark_progress_finished`` flips the rust-side

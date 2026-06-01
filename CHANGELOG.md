@@ -209,6 +209,17 @@ two versions.
   build. Behaviour is identical; per-file plugins no longer emit ops in the
   post-build pass (they would double-apply), so a graph with only per-file
   native plugins skips that pass entirely.
+- **Project-wide plugin orchestration moved into Rust.** The project-wide
+  plugin pass now fans out across a GIL-free `rayon` scope inside
+  `ProjectContext.materialize()` (one `py.allow_threads` wrapping the scope, one
+  worker per plugin), each plugin running against a `Send` `FrozenView` snapshot
+  of the build outputs and pushing a `Vec<PreparedOp>` that folds into the graph
+  in registration order in one atomic apply — mirroring the existing per-file
+  fan-out. This replaces the Python `ThreadPoolExecutor` that previously drove
+  the pass, so the now-unused `_native` methods that only served it are gone
+  (`build_only`, `run_plugin`, `run_plugin_collect`, `apply_ops_batched`,
+  `snapshot_graph`, the per-plugin progress-driver methods, the `CollectedOps`
+  type, and the leftover `query()`-DSL query wrappers). Behaviour is identical.
 
 ### Removed
 

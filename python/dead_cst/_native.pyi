@@ -170,19 +170,6 @@ class SymbolNode:
         imports: Import | None = ...,
     ) -> None: ...
 
-class CollectedOps:
-    """Opaque handle to one plugin's collected graph ops.
-
-    Returned by :meth:`ProjectContext.run_plugin_collect`; consumed by
-    :meth:`ProjectContext.apply_ops_batched`. The handle is single-use:
-    a second ``apply_ops_batched`` on the same instance raises
-    :class:`ValueError`.
-
-    There is no Python-side constructor or accessor — the type exists
-    solely as a transport for the (pure-rust) prepared ops between
-    the collect and apply phases of plugin execution.
-    """
-
 class NativePlugin:
     """A rust-backed plugin — the only plugin mechanism.
 
@@ -636,65 +623,26 @@ class ProjectContext:
         """Reset the progress counter state for a re-run.
 
         Replaces the rust-side ``ProgressCounters`` with a fresh
-        instance so a subsequent :meth:`materialize` /
-        :meth:`build_only` call starts from zero. Without it, a poller
-        spun up for the second build would observe ``finished=true``
-        from the first build and exit immediately.
+        instance so a subsequent :meth:`materialize` call starts from
+        zero. Without it, a poller spun up for the second build would
+        observe ``finished=true`` from the first build and exit
+        immediately.
         """
         ...
 
     def materialize(self) -> NativeGraph:
-        """Build the project-wide graph, run each registered plugin's
-        rust impl, then snapshot the final state.
+        """Build the project-wide graph, run every registered plugin,
+        then snapshot the final state.
 
-        Borrows are released between phases so a plugin impl can
-        re-enter queries through the same ``ctx`` without aliasing
-        violations.
+        The build pass runs first; project-wide plugins then fan out
+        across a GIL-free ``rayon`` scope (one task per plugin, each
+        with its own salsa-db snapshot), while per-file plugins are
+        folded inline during the build's own parallel file walk. Every
+        plugin observes the same frozen base-graph state — its own
+        emissions are invisible to its own queries and to other
+        plugins' — and the collected ops fold into the graph in
+        registration order in one end-of-pass apply.
         """
-        ...
-
-    def build_only(self) -> None:
-        """Run only the project-wide build pass, without invoking any
-        registered plugins. Used by :class:`dead_cst.Analysis` to
-        split build from the plugin pass so the latter can run on a
-        Python :class:`concurrent.futures.ThreadPoolExecutor`."""
-        ...
-
-    def run_plugin(self, plugin: NativePlugin) -> None:
-        """Run ``plugin``'s rust impl once, collecting every emitted
-        op and applying the batch under one write-lock window at
-        the end. The plugin's own emissions are invisible to its
-        own queries — the graph is frozen for the duration of the
-        run. Prefer :meth:`run_plugin_collect` +
-        :meth:`apply_ops_batched` when driving multiple plugins
-        concurrently so the apply pass runs once for the full
-        cohort."""
-        ...
-
-    def run_plugin_collect(self, plugin: NativePlugin) -> CollectedOps:
-        """Run ``plugin``'s rust impl once and return its emitted ops
-        as an opaque :class:`CollectedOps` handle without mutating
-        the graph. Safe to call concurrently from multiple Python
-        threads — the graph is read-only for the duration. The
-        handle is passed (alongside other plugins' handles) to
-        :meth:`apply_ops_batched`, which folds them all into the
-        graph under one write-lock window."""
-        ...
-
-    def apply_ops_batched(self, ops: list[CollectedOps]) -> None:
-        """Apply a list of :class:`CollectedOps` handles to the graph
-        in list order under a single write-lock window. Each handle
-        is consumed; re-applying the same handle raises
-        :class:`ValueError`. Ops within a handle apply in the order
-        the plugin yielded them; ops across handles apply in
-        ``ops`` order."""
-        ...
-
-    def snapshot_graph(self) -> NativeGraph:
-        """Snapshot the current graph (post-:meth:`build_only` +
-        any :meth:`run_plugin` calls) as a :class:`NativeGraph`.
-        Used by :class:`dead_cst.Analysis` to return the final graph
-        without re-running :meth:`materialize`."""
         ...
 
     def read_progress_snapshot(self) -> "ProgressSnapshot":
@@ -725,41 +673,6 @@ class ProjectContext:
         """Force the build-progress ``finished`` atomic to ``True``.
         Used by :class:`dead_cst.Analysis` after a build error so the
         polling thread exits cleanly. Idempotent."""
-        ...
-
-    def progress_plugin_done(self) -> None:
-        """Bump the plugins-done counter by one. Used by the Python
-        :class:`concurrent.futures.ThreadPoolExecutor` plugin pass to
-        signal per-plugin completion to the polling thread."""
-        ...
-
-    def progress_plugins_start(self, names: list[str]) -> None:
-        """Stamp the plugins phase as started + allocate per-plugin
-        counter slabs keyed by registration order. ``names`` is
-        the plugin list (``type(plugin).__qualname__`` per entry);
-        indices passed to :meth:`progress_plugin_started` /
-        :meth:`progress_plugin_finished` match. Called by
-        :class:`dead_cst.Analysis` before launching the
-        :class:`concurrent.futures.ThreadPoolExecutor`."""
-        ...
-
-    def progress_plugin_started(self, idx: int) -> None:
-        """Stamp the indexed plugin's start time. Called by the
-        :class:`concurrent.futures.ThreadPoolExecutor` worker on
-        entry so the per-plugin slot snapshot reflects the actual
-        start order (not the registration order)."""
-        ...
-
-    def progress_plugin_finished(self, idx: int) -> None:
-        """Stamp the indexed plugin's finish time. Called by the
-        :class:`concurrent.futures.ThreadPoolExecutor` worker on
-        exit (both success and exception paths)."""
-        ...
-
-    def progress_plugins_finish(self) -> None:
-        """Stamp the plugins phase as finished + mark the whole
-        build pipeline finished. Called by :class:`dead_cst.Analysis`
-        once every plugin future has resolved."""
         ...
 
     # ----- FQN resolution ------------------------------------------------

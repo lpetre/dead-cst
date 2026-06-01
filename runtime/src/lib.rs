@@ -39,7 +39,6 @@ mod query;
 
 use pyo3::prelude::*;
 
-use crate::builder::CollectedOps;
 use crate::graph::{EdgeFlags, Import, NativeGraph, NodeFlags, SymbolNode};
 use crate::helpers::NodeAttrs;
 use crate::io::{read_graph, write_graph, GraphMetadata};
@@ -60,7 +59,6 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Project>()?;
     m.add_class::<ProjectContext>()?;
     m.add_class::<ChangeEvent>()?;
-    m.add_class::<CollectedOps>()?;
     m.add_class::<NativePlugin>()?;
     m.add_class::<NodeFlags>()?;
     m.add_class::<EdgeFlags>()?;

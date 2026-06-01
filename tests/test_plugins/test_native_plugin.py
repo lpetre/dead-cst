@@ -1,9 +1,9 @@
 """Tests for the rust-side ``NativePlugin`` harness wrapper.
 
 A native plugin is a pyo3 wrapper around a rust :trait:`NativePluginImpl`
-that the harness drives through the same ``CollectedOps`` /
-``apply_ops_batched`` flow used for every plugin, with the per-op
-extraction replaced by a direct ``Vec<PreparedOp>`` push from rust.
+that the harness fans out across a GIL-free ``rayon`` scope during
+``materialize()`` — each plugin pushes a ``Vec<PreparedOp>`` that folds
+into the graph in registration order in one end-of-pass apply.
 
 These tests pin harness integration: registration acceptance by the
 ``Analysis`` harness, running several native plugins in one list, the
