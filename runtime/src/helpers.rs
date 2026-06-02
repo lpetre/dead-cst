@@ -129,10 +129,29 @@ pub(crate) fn locate_class_seed(
         }
     }
     // External class: resolve the module via ty, then follow any
-    // re-export chains until we find the actual class def.
+    // re-export chains until we find the actual class def. Shared with the
+    // subclass-index store side (`build_class_hierarchy_indices`) so both
+    // the observed bases and the query input normalize through one
+    // resolver, collapsing sibling spellings by construction.
+    let anchor = *outputs.project_files.first()?;
+    locate_external_class_seed(db, anchor, fqn)
+}
+
+/// Resolve a dotted *external* class fqn to ``(File, name_range)`` by
+/// resolving its module via ty and following re-export / alias chains
+/// (see [`follow_class_through_module`]). Sibling spellings of the same
+/// class (``unittest.TestCase`` vs ``unittest.case.TestCase``) resolve to
+/// the *same* ``(File, name_range)``, so this is the normalization both
+/// the subclass-index store side and the query side funnel through —
+/// co-reference becomes structural (one key), not a query-time string
+/// scan.
+pub(crate) fn locate_external_class_seed(
+    db: &ProjectDatabase,
+    anchor: File,
+    fqn: &str,
+) -> Option<(File, TextRange)> {
     let (module_str, class_name) = fqn.rsplit_once('.')?;
     let module_name = ModuleName::new(module_str)?;
-    let anchor = *outputs.project_files.first()?;
     let module = resolve_module(db, anchor, &module_name)?;
     let module_file = module.file(db)?;
     let mut visited: FxHashSet<File> = FxHashSet::default();
