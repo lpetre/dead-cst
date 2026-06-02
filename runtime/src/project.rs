@@ -14,10 +14,8 @@ use pyo3::prelude::*;
 use pyo3::types::PyType;
 use ruff_db::files::File;
 use ruff_db::parsed::parsed_module;
-use ruff_db::source::source_text;
 use ruff_db::system::{OsSystem, SystemPathBuf};
-use ruff_python_ast::token::TokenKind;
-use ruff_text_size::{Ranged, TextRange};
+use ruff_text_size::TextRange;
 use ty_project::metadata::options::{EnvironmentOptions, Options};
 use ty_project::metadata::python_version::SupportedPythonVersion;
 use ty_project::metadata::value::RangedValue;
@@ -37,8 +35,7 @@ use crate::file_payload::{file_to_edges, file_to_nodes, FileEdges, NodeKind, Nod
 use crate::file_ref_edges::{file_to_ref_edges, FileRefEdges};
 use crate::graph::{intern_kind, DeclIndex, NativeGraph, SymbolNode};
 use crate::helpers::{
-    file_path_string, find_external_seed_direct_subclasses_par,
-    find_subclass_indices_via_refs_with_queue, is_dunder_name, locate_class_def, locate_class_seed,
+    file_path_string, find_subclass_indices_via_refs_with_queue, is_dunder_name, locate_class_seed,
     rel_path, CallArgs, MODULE_ALIAS_MARKER, NODE_FLAG_ENTRYPOINT,
 };
 use crate::ingest::emit_visitor_warning;
@@ -113,6 +110,11 @@ pub(crate) struct BuildOutputs {
     /// `find_subclasses_of` map ty's `TypeHierarchyClass.selection_range`
     /// back to a graph node in O(1).
     pub(crate) class_by_selection: FxHashMap<(File, (u32, u32)), usize>,
+    /// Inverse of `class_by_selection`: `class node idx -> (file, name
+    /// TextRange)`. Lets `locate_class_seed` recover a project class's
+    /// name range for ty `Type` lookups (`class_def_at` + `inferred_type`)
+    /// without re-parsing the file to re-find the def by line.
+    pub(crate) class_selection_by_idx: FxHashMap<usize, (File, TextRange)>,
     /// `file -> module node idx`. Lets `find_main_blocks` reach the
     /// file's module node without a linear scan over `builder.nodes`.
     pub(crate) module_nodes_by_file: FxHashMap<File, usize>,
@@ -160,6 +162,17 @@ pub(crate) struct BuildOutputs {
     /// project; once a project class is found, transitive walks use
     /// this map.
     pub(crate) children_by_node: FxHashMap<usize, Vec<usize>>,
+    /// External base fqn (e.g. ``"unittest.TestCase"``) -> direct
+    /// subclass class graph idxs. Derived in the same
+    /// `class_bases` fan-in as `children_by_node`, but keyed by the
+    /// resolved *external* base fqn rather than a project node idx.
+    ///
+    /// Lets the external-seed branch of `find_subclasses_indices_core`
+    /// recover the first hop into the project straight from the cached
+    /// per-file payloads, instead of a full re-parse over every project
+    /// file. Re-export / alias chains through project modules are still
+    /// walked via `find_references` (gated on `imports_by_module`).
+    pub(crate) external_base_children: FxHashMap<String, Vec<usize>>,
 }
 
 /// Run the three build phases (ingest → hierarchy+imports → references)
@@ -368,12 +381,11 @@ pub(crate) fn build_project_graph(
                             // through assembly and the project-wide plugin
                             // pass — that's the memory win. Assembly, fqname,
                             // and class-hierarchy read only the cached
-                            // payloads, never the AST. Subclass-resolution
-                            // plugins and the `find_comment_patterns` pymethod
-                            // re-parse the specific files they touch on demand
-                            // (`ParsedModule::load`), so only that subset
-                            // re-materializes; the all-ASTs-resident peak
-                            // never forms.
+                            // payloads, never the AST. The gated re-export
+                            // fallback in subclass resolution can still reload a
+                            // file on demand through ty's `find_references`, so
+                            // only that subset re-materializes; the
+                            // all-ASTs-resident peak never forms.
                             parsed_module(local_db, file).clear();
                         });
                         db_tx.send(local_db).expect("channel open");
@@ -439,7 +451,10 @@ pub(crate) fn build_project_graph(
     // node-keyed project-wide subclass index. One pass over the
     // per-file payloads + one pass per base; no AST re-walk.
     let t_hierarchy = std::time::Instant::now();
-    let children_by_node = build_class_hierarchy_indices(
+    let ClassHierarchyIndices {
+        children_by_node,
+        external_base_children,
+    } = build_class_hierarchy_indices(
         db,
         &project_files,
         &class_by_selection,
@@ -471,6 +486,17 @@ pub(crate) fn build_project_graph(
             eprintln!("{}", dump.display_short());
         }
     }
+    // Invert `class_by_selection` once so per-class name-range lookups
+    // (subclass seed resolution) are O(1) cache reads instead of an AST
+    // re-parse. It's a bijection — one class node per `(file, range)` —
+    // so no value is clobbered.
+    let class_selection_by_idx: FxHashMap<usize, (File, TextRange)> = class_by_selection
+        .iter()
+        .map(|(&(file, (start, end)), &idx)| {
+            (idx, (file, TextRange::new(start.into(), end.into())))
+        })
+        .collect();
+
     builder.peer_pyi_to_py = peer_pyi_to_py;
     Ok(BuildOutputs {
         builder,
@@ -478,12 +504,14 @@ pub(crate) fn build_project_graph(
         global_index,
         path_to_file,
         class_by_selection,
+        class_selection_by_idx,
         module_nodes_by_file,
         decl_by_name_range,
         decl_by_fqname,
         module_by_fqname,
         imports_by_module,
         children_by_node,
+        external_base_children,
         children_by_parent,
     })
 }
@@ -1003,13 +1031,28 @@ fn extract_per_file_plugin_ids(
     ids
 }
 
+/// Project-wide class-hierarchy indices produced in a single pass over
+/// the per-file `class_bases` payloads by [`build_class_hierarchy_indices`].
+pub(crate) struct ClassHierarchyIndices {
+    /// Parent class graph idx → direct subclass graph idxs (project
+    /// bases only). See [`BuildOutputs::children_by_node`].
+    pub(crate) children_by_node: FxHashMap<usize, Vec<usize>>,
+    /// External base fqn → direct subclass graph idxs. See
+    /// [`BuildOutputs::external_base_children`].
+    pub(crate) external_base_children: FxHashMap<String, Vec<usize>>,
+}
+
 /// Fold every file's per-file `class_bases` payload (see
-/// [`crate::file_payload::FileNodes::class_bases`]) into the
-/// node-keyed project-wide subclass index:
+/// [`crate::file_payload::FileNodes::class_bases`]) into the project-wide
+/// subclass indices:
 ///
 /// * `children_by_node` — parent class graph idx → direct subclass
 ///   graph idxs. Drives intra-project BFS for both project and
 ///   external seeds (once the first hop lands a project class).
+/// * `external_base_children` — external base fqn (a base not present in
+///   `decl_by_fqname`, e.g. `unittest.TestCase`) → direct subclass graph
+///   idxs. Lets the external-seed query recover the first project hop
+///   from cached payloads instead of re-parsing every file.
 ///
 /// Resolution rules per `ResolvedBase` variant:
 ///
@@ -1019,10 +1062,12 @@ fn extract_per_file_plugin_ids(
 /// * `ImportedFqn(fqn)` — when the fqn resolves in `decl_by_fqname` to
 ///   a project class node, emit a `children_by_node` entry (so a
 ///   project base imported via `from m import C` participates in
-///   node-keyed walks).
+///   node-keyed walks). When the fqn is absent from `decl_by_fqname`
+///   (an external base), emit an `external_base_children` entry instead.
 /// * `Attribute { module_fqn, attr_name }` — resolve
 ///   `{module_fqn}.{attr_name}` via `decl_by_fqname`; project class
-///   hits emit `children_by_node` entries.
+///   hits emit `children_by_node` entries, an absent fqn emits an
+///   `external_base_children` entry.
 /// * `Unresolvable` — dropped.
 fn build_class_hierarchy_indices<'db>(
     db: &'db ProjectDatabase,
@@ -1031,9 +1076,10 @@ fn build_class_hierarchy_indices<'db>(
     ref_to_global: &FxHashMap<NodeRef<'db>, usize>,
     decl_by_fqname: &FxHashMap<String, Vec<usize>>,
     nodes: &[GraphNode],
-) -> FxHashMap<usize, Vec<usize>> {
+) -> ClassHierarchyIndices {
     use crate::file_payload::ResolvedBase;
     let mut by_node: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
+    let mut external_base_children: FxHashMap<String, Vec<usize>> = FxHashMap::default();
 
     for &file in project_files {
         let payload = file_to_nodes(db, file);
@@ -1051,30 +1097,47 @@ fn build_class_hierarchy_indices<'db>(
                             }
                         }
                     }
-                    ResolvedBase::ImportedFqn(fqn) => {
-                        if let Some(idxs) = decl_by_fqname.get(fqn) {
+                    ResolvedBase::ImportedFqn(fqn) => match decl_by_fqname.get(fqn) {
+                        Some(idxs) => {
                             for &parent_idx in idxs {
                                 if nodes[parent_idx].kind == "class" {
                                     by_node.entry(parent_idx).or_default().push(child_idx);
                                 }
                             }
                         }
-                    }
+                        // Not a project decl at all → an external base.
+                        // Key it by the resolved fqn so the external-seed
+                        // query can recover this subclass without a
+                        // re-parse. (A project decl that exists but isn't
+                        // a class is intentionally dropped: its subclass
+                        // set is empty either way.)
+                        None => external_base_children
+                            .entry(fqn.clone())
+                            .or_default()
+                            .push(child_idx),
+                    },
                     ResolvedBase::Attribute {
                         module_fqn,
                         attr_name,
                     } => {
-                        // Project-side: resolve `module_fqn.attr_name`
-                        // via `decl_by_fqname` (handles the common
-                        // case where the target module's class is in
-                        // the project).
+                        // Resolve `module_fqn.attr_name` via
+                        // `decl_by_fqname` (the common case where the
+                        // target module's class is in the project); an
+                        // absent fqn is an external base, keyed for the
+                        // external-seed query.
                         let composed = format!("{module_fqn}.{attr_name}");
-                        if let Some(idxs) = decl_by_fqname.get(&composed) {
-                            for &parent_idx in idxs {
-                                if nodes[parent_idx].kind == "class" {
-                                    by_node.entry(parent_idx).or_default().push(child_idx);
+                        match decl_by_fqname.get(&composed) {
+                            Some(idxs) => {
+                                for &parent_idx in idxs {
+                                    if nodes[parent_idx].kind == "class" {
+                                        by_node.entry(parent_idx).or_default().push(child_idx);
+                                    }
                                 }
                             }
+                            None => external_base_children
+                                .entry(composed)
+                                .or_default()
+                                .push(child_idx),
                         }
                     }
                     ResolvedBase::Unresolvable => {}
@@ -1087,7 +1150,14 @@ fn build_class_hierarchy_indices<'db>(
         v.sort_unstable();
         v.dedup();
     }
-    by_node
+    for v in external_base_children.values_mut() {
+        v.sort_unstable();
+        v.dedup();
+    }
+    ClassHierarchyIndices {
+        children_by_node: by_node,
+        external_base_children,
+    }
 }
 
 /// Serial pre-parallel Pass-2 helper: lookup-or-mint a `NodeRef` into
@@ -1367,7 +1437,7 @@ pub(crate) struct ProjectContext {
     /// it re-attaches).
     pub(crate) outputs: Arc<RwLock<Option<BuildOutputs>>>,
     /// Compiled regexes keyed by the source pattern. Plugins call
-    /// :meth:`decls_matching_name` / :meth:`find_comment_patterns`
+    /// :meth:`decls_matching_name`
     /// repeatedly across files with the same pattern, so caching keeps
     /// us off the regex compiler in the hot path. Mutex (rather than
     /// RwLock) because the cache write path is cheap and the hot path
@@ -1591,7 +1661,7 @@ impl ProjectContext {
 
         // Project-wide plugin pass — fan out across a GIL-free
         // ``rayon`` scope, one task per plugin, mirroring the per-file
-        // fan-out (:func:`crate::query::par_scan_files`). Each worker
+        // query fan-out. Each worker
         // owns a cheap salsa clone of the db wrapped in a
         // [`FrozenView`], so every plugin query runs with the GIL
         // released; the frozen ``BuildOutputs`` is shared read-only
@@ -1612,6 +1682,9 @@ impl ProjectContext {
         let plugin_bar = ProgressBars::plugin_bar(show_progress, n_plugins as u64);
         counters.init_plugin_slots(plugin_names);
         counters.start_phase(PHASE_PLUGINS, Some(n_plugins));
+        let num_workers = std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(4);
 
         // Clone the salsa db + project root + outputs handle out of the
         // pyclass *before* releasing the GIL — no ``PyRef`` may cross
@@ -1636,27 +1709,46 @@ impl ProjectContext {
             let results_ref = &results;
             // ``base_db`` + ``outputs_lock`` move *into* the closure: a
             // ``&ProjectDatabase`` is ``!Send`` (salsa's ``ZalsaLocal`` is
-            // ``!Sync``), so — exactly as in ``par_scan_files`` — we move an
-            // owned db in and ``.clone()`` a cheap snapshot per worker.
+            // ``!Sync``), so — like every GIL-free per-file scan here — we
+            // move an owned db in and ``.clone()`` a cheap snapshot per worker.
             py.allow_threads(move || {
                 let guard = outputs_lock.read();
                 let outputs_ref: &BuildOutputs =
                     guard.as_ref().expect("materialize stored outputs above");
-                rayon::scope(move |s| {
-                    for (idx, job) in jobs_ref.iter().enumerate() {
-                        let db_t = base_db.clone();
-                        s.spawn(move |_| {
-                            counters_ref.plugin_started(idx);
-                            let view = FrozenView::new(db_t, outputs_ref, root_ref);
-                            let mut sink: Vec<PreparedOp> = Vec::new();
-                            let res = job.run(&view, &mut sink).map(|()| sink);
-                            results_ref.lock().unwrap().push((idx, res));
-                            counters_ref.plugin_finished(idx);
-                            counters_ref.plugins_inc();
-                            bar_ref.inc(1);
-                        });
+                // `move` so it owns `base_db` (`ProjectDatabase` is `Send`,
+                // a borrow would not be) and thus satisfies `install`'s
+                // `Send` bound — same shape as `run_populate`.
+                let run_plugins = move || {
+                    rayon::scope(move |s| {
+                        for (idx, job) in jobs_ref.iter().enumerate() {
+                            let db_t = base_db.clone();
+                            s.spawn(move |_| {
+                                counters_ref.plugin_started(idx);
+                                let view = FrozenView::new(db_t, outputs_ref, root_ref);
+                                let mut sink: Vec<PreparedOp> = Vec::new();
+                                let res = job.run(&view, &mut sink).map(|()| sink);
+                                results_ref.lock().unwrap().push((idx, res));
+                                counters_ref.plugin_finished(idx);
+                                counters_ref.plugins_inc();
+                                bar_ref.inc(1);
+                            });
+                        }
+                    });
+                };
+                // Honour `set_stack_size` here too: subclass-resolution
+                // plugins recurse over the class hierarchy, so the deep
+                // stack lives in this pass, not only the populate phase.
+                match stack_size {
+                    Some(n) => {
+                        let pool = rayon::ThreadPoolBuilder::new()
+                            .num_threads(num_workers)
+                            .stack_size(n)
+                            .build()
+                            .expect("build rayon thread pool");
+                        pool.install(run_plugins);
                     }
-                });
+                    None => run_plugins(),
+                }
             });
         }
         plugin_bar.finish_and_clear();
@@ -1677,6 +1769,22 @@ impl ProjectContext {
         counters.finish_phase(PHASE_PLUGINS);
         counters.mark_finished();
         plugin_result?;
+
+        // The plugin pass can reload individual files on demand (the gated
+        // re-export fallback in subclass resolution walks ty's
+        // `find_references`), repopulating those files' salsa `parsed_module`
+        // slots. Clear them again so the post-build resident set stays at the
+        // lean post-populate level instead of creeping back up — the same
+        // memory win `build_project_graph`'s populate phase secures.
+        {
+            let this = slf.borrow(py);
+            let outputs_ref = this.outputs.read();
+            if let Some(outputs) = outputs_ref.as_ref() {
+                for &file in &outputs.project_files {
+                    parsed_module(&this.db, file).clear();
+                }
+            }
+        }
 
         // Snapshot a fresh ``NativeGraph`` from the builder's
         // interned node + edge vecs; the originals stay put.
@@ -3255,11 +3363,14 @@ fn find_classes_defining_method_indices_core(
 }
 
 /// Subclasses of the class addressed by ``base_fqn`` (project or
-/// external seed). Takes an owned ``ProjectDatabase`` so it can both
-/// resolve the seed serially (``locate_class_seed`` needs a concrete
-/// db) and hand a ``Box<dyn ProjectDb>`` snapshot to the parallel
-/// ``find_references`` fallback. See ``FrozenView::find_subclasses_indices``
-/// for the fast/slow-path rationale.
+/// external seed). Takes an owned ``ProjectDatabase`` so it can resolve
+/// the seed serially (``locate_class_seed`` needs a concrete db) and run
+/// the ``find_references`` re-export fallback. A project seed walks the
+/// cached ``children_by_node`` index directly; an external seed reads its
+/// direct project subclasses from the cached ``external_base_children``
+/// index (no re-parse) and only walks ``find_references`` when a project
+/// file actually imports the seed module. See
+/// ``FrozenView::find_subclasses_indices`` for the fast/slow-path rationale.
 fn find_subclasses_indices_core(
     db: ProjectDatabase,
     outputs: &BuildOutputs,
@@ -3281,42 +3392,36 @@ fn find_subclasses_indices_core(
                 .unwrap_or_default()
         };
     }
-    let class_by_selection = &outputs.class_by_selection;
     let children_by_node = &outputs.children_by_node;
-    let project_files: &[File] = &outputs.project_files;
-    let seed_split: Option<(String, String)> = base_fqn
+    // External seed: the class lives outside the project. Its direct
+    // project subclasses are cached in `external_base_children` (folded
+    // from the per-file `class_bases` payloads — no re-parse). A re-export
+    // / alias chain that binds the external class through a project module
+    // resolves the base to that *project* fqn, so it isn't keyed here;
+    // walk those via find_references — but only when some project file
+    // imports the seed module (the `imports_by_module` gate), since
+    // otherwise there is provably no reference for the walk to find.
+    let mut direct: FxHashSet<usize> = outputs
+        .external_base_children
+        .get(base_fqn)
+        .map(|idxs| idxs.iter().copied().collect())
+        .unwrap_or_default();
+    let imports_seed_module = base_fqn
         .rsplit_once('.')
-        .map(|(m, n)| (m.to_string(), n.to_string()));
-    let db_handle: Box<dyn ProjectDb> = ProjectDb::dyn_clone(&db);
-    let direct: Vec<usize> = {
-        let db: &dyn ProjectDb = &*db_handle;
-        type FileRangeList = Vec<(File, TextRange)>;
-        let (initial_queue, prefound): (FileRangeList, FileRangeList) =
-            if let Some((module, name)) = seed_split.as_ref() {
-                let res = find_external_seed_direct_subclasses_par(db, project_files, module, name);
-                let initial = if res.any_project_file_imports_seed_module {
-                    vec![(seed_file, seed_range)]
-                } else {
-                    Vec::new()
-                };
-                (initial, res.direct_classes)
-            } else {
-                (vec![(seed_file, seed_range)], Vec::new())
-            };
-        find_subclass_indices_via_refs_with_queue(
-            db,
-            class_by_selection,
-            initial_queue,
-            &prefound,
+        .is_some_and(|(module, _)| outputs.imports_by_module.contains_key(module));
+    if imports_seed_module {
+        direct.extend(find_subclass_indices_via_refs_with_queue(
+            &db,
+            &outputs.class_by_selection,
+            vec![(seed_file, seed_range)],
+            &[],
             /*transitive=*/ false,
-        )
-    };
+        ));
+    }
     let mut out_idx: FxHashSet<usize> = direct.iter().copied().collect();
     if transitive {
         for &d in &direct {
-            for idx in transitive_subclasses_via_index(d, children_by_node) {
-                out_idx.insert(idx);
-            }
+            out_idx.extend(transitive_subclasses_via_index(d, children_by_node));
         }
     }
     out_idx.into_iter().collect()
@@ -3326,31 +3431,24 @@ fn find_subclasses_indices_core(
 /// ``None`` when ``class_idx`` is out of range (callers map that to an
 /// ``IndexError``); ``Some(vec)`` otherwise (empty when the node isn't
 /// a class or has no subclasses).
-fn find_subclasses_of_idx_in(
-    db: &ProjectDatabase,
-    outputs: &BuildOutputs,
-    class_idx: usize,
-) -> Option<Vec<usize>> {
+fn find_subclasses_of_idx_in(outputs: &BuildOutputs, class_idx: usize) -> Option<Vec<usize>> {
     let len = outputs.builder.nodes.len();
     if class_idx >= len {
         return None;
     }
-    let class_node = &outputs.builder.nodes[class_idx];
-    if class_node.kind != "class" {
+    if outputs.builder.nodes[class_idx].kind != "class" {
         return Some(Vec::new());
     }
-    if let Some((seed_file, seed_range)) =
-        locate_class_def(db, &outputs.path_to_file, &class_node.path, class_node)
-    {
-        let rk = (seed_range.start().to_u32(), seed_range.end().to_u32());
-        if let Some(&seed_idx) = outputs.class_by_selection.get(&(seed_file, rk)) {
-            return Some(transitive_subclasses_via_index(
-                seed_idx,
-                &outputs.children_by_node,
-            ));
-        }
-    }
-    Some(Vec::new())
+    // `class_idx` is its own hierarchy seed: assemble records every
+    // class node in `class_by_selection`, and `children_by_node` is
+    // keyed by those same global indices. The former locate-by-line
+    // round trip (re-parse → name range → `class_by_selection`) always
+    // resolved straight back to `class_idx`, so walk the cached
+    // hierarchy from it directly.
+    Some(transitive_subclasses_via_index(
+        class_idx,
+        &outputs.children_by_node,
+    ))
 }
 
 // ============================================================
@@ -3598,7 +3696,7 @@ impl<'a> FrozenView<'a> {
     /// Subclasses of the class at `class_idx`, or `None` on out-of-range
     /// (an empty vec means "not a class node").
     pub(crate) fn find_subclasses_of_idx(&self, class_idx: usize) -> Option<Vec<usize>> {
-        find_subclasses_of_idx_in(&self.db, self.outputs, class_idx)
+        find_subclasses_of_idx_in(self.outputs, class_idx)
     }
 
     pub(crate) fn find_subclasses_indices(&self, base_fqn: &str, transitive: bool) -> Vec<usize> {
@@ -3607,8 +3705,8 @@ impl<'a> FrozenView<'a> {
 
     // --- parallel file-walk matchers ------------------------------------
     //
-    // Each `dyn_clone`s the owned db for the inner `par_scan_files`
-    // rayon scope. Nested inside the project-wide plugin scope, this is
+    // Each `dyn_clone`s the owned db for the inner rayon scope.
+    // Nested inside the project-wide plugin scope, this is
     // safe: rayon scopes compose. These are GIL-free: no path filtering,
     // no `PyResult` — the curated plugin surface is the only caller and
     // it never path-scopes, so the matchers walk every project file.
@@ -3755,68 +3853,6 @@ impl<'a> FrozenView<'a> {
             self.outputs,
             method_name,
         )
-    }
-}
-
-#[pymethods]
-impl ProjectContext {
-    /// Return `(decl_node, comment_text)` for every comment in the
-    /// project that matches `pattern` (a regex), paired with the next
-    /// declaration that follows it in the same file.
-    ///
-    /// Comments are scanned from the parser's `Tokens` stream (no
-    /// re-lexing); regex matching is full-text against the comment
-    /// content (leading `#` included).
-    pub(crate) fn find_comment_patterns(
-        &self,
-        py: Python<'_>,
-        pattern: &str,
-    ) -> PyResult<Vec<(Py<SymbolNode>, String)>> {
-        let regex = self.compile_regex(pattern)?;
-        let outputs = self.materialized("find_comment_patterns")?;
-        let mut out = Vec::new();
-        // Per-file bucketed view of `global_index`, materialized lazily on
-        // the first matching comment anywhere in the project. The naive
-        // approach filtered `global_index` once per matched file — O(F × N).
-        // Bucketing once flips that to O(N) + O(1) per matched file.
-        let mut decls_by_file: Option<FxHashMap<File, Vec<(u32, usize)>>> = None;
-        for &file in &outputs.project_files {
-            let parsed = parsed_module(&self.db, file).load(&self.db);
-            let source = source_text(&self.db, file);
-            for token in parsed.tokens() {
-                if token.kind() != TokenKind::Comment {
-                    continue;
-                }
-                let range = token.range();
-                let text = &source[range];
-                if !regex.is_match(text) {
-                    continue;
-                }
-                let bucket = decls_by_file.get_or_insert_with(|| {
-                    let mut m: FxHashMap<File, Vec<(u32, usize)>> = FxHashMap::default();
-                    for ((f, _, (start, _)), &idx) in &outputs.global_index {
-                        m.entry(*f).or_default().push((*start, idx));
-                    }
-                    for sites in m.values_mut() {
-                        sites.sort_by_key(|(s, _)| *s);
-                    }
-                    m
-                });
-                let Some(decls) = bucket.get(&file) else {
-                    continue;
-                };
-                let comment_end = range.end().to_u32();
-                let i = decls.partition_point(|(start, _)| *start < comment_end);
-                let Some(&(_, decl_idx)) = decls.get(i) else {
-                    continue;
-                };
-                out.push((
-                    outputs.builder.nodes[decl_idx].to_symbol(py)?,
-                    text.to_string(),
-                ));
-            }
-        }
-        Ok(out)
     }
 }
 

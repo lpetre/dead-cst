@@ -198,6 +198,16 @@ two versions.
   / `--extern regex` from a curated allowlist so a plugin can `use
   serde_json::Value;` / `use regex::Regex;` out of the box. The rest of the
   runtime's private dependency tree is intentionally not exposed.
+- **`Analysis.set_stack_size(bytes)` for deeply-nested ASTs.** Overrides the
+  rayon worker-thread stack size for *both* the per-file populate fan-out and
+  the project-wide plugin pass (the class-hierarchy re-walks subclass resolution
+  drives recurse as deep as file ingest). Call it before `materialize_all()`;
+  with no override both phases use rayon's default stack (2 MiB unless
+  `RAYON_STACK_SIZE` / `RUST_MIN_STACK` is set process-wide), which suffices for
+  typical code. Use it on projects with deeply-nested generated code (protobuf
+  modules, ML-generated ASTs, large nested literal dicts) that stack-overflow at
+  the default — the size is virtual address space, so a large value costs no
+  resident memory unless actually used.
 
 ### Changed
 
@@ -211,8 +221,13 @@ two versions.
   instead of staying resident through assembly and the project-wide plugin
   pass. On a 250-file synthetic project this takes the parsed-AST salsa heap
   from ~5 MB to ~0 at build-end (~30% of total salsa memory). Subclass
-  resolution and the `find_comment_patterns` query re-parse the specific files
-  they touch on demand, so all results are unchanged.
+  resolution no longer re-parses: per-file class bases captured during the
+  fan-out feed an external-base→subclass index and an idx→name-range reverse
+  map, so both the in-project and external-seed paths resolve from those cached
+  facts (re-export / alias chains still walk ty's own `find_references`). That
+  fallback is the one remaining on-demand reloader — it can pull a file's AST
+  back in during the project-wide plugin pass — so any AST it reloads is dropped
+  again once the pass completes. All results are unchanged.
 - **Built-in plugins are migrating to native (Rust) implementations.**
   The `main_block`, `module_dunders`, `init_subclass`, `server_config`,
   and `unittest` built-ins now resolve to native `NativePlugin`
@@ -284,6 +299,10 @@ two versions.
 
 ### Removed
 
+- `ProjectContext.find_comment_patterns(pattern)` (the regex-over-comments
+  query) and its `_native.pyi` stub. It had no in-tree callers and was the last
+  graph query that re-parsed files on demand after the build; removing it drops
+  that re-parse path entirely.
 - The Python `ServerConfigPlugin` (`dead_cst.contrib.ServerConfigPlugin`).
   `server_config` is now native-only: use `NativePlugin.server_config()` (the
   CLI's `server_config` key already resolves to it), passing `filenames=[…]`
