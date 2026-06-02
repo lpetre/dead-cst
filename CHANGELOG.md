@@ -201,6 +201,18 @@ two versions.
 
 ### Changed
 
+- **Per-file parsed ASTs are freed mid-build to cut the memory peak.** The
+  project-wide plugin queries that used to re-walk each file's AST (parameters,
+  class-defining-method, decorators, constructions, factories, and the
+  call-site family) now read precomputed per-file facts from a salsa-cached
+  `FileExtraction`, warmed during the per-file fan-out alongside the existing
+  node/edge payloads. Once a file's payloads, `FileExtraction`, and per-file
+  plugins are computed, its parsed AST is dropped (`ParsedModule::clear`)
+  instead of staying resident through assembly and the project-wide plugin
+  pass. On a 250-file synthetic project this takes the parsed-AST salsa heap
+  from ~5 MB to ~0 at build-end (~30% of total salsa memory). Subclass
+  resolution and the `find_comment_patterns` query re-parse the specific files
+  they touch on demand, so all results are unchanged.
 - **Built-in plugins are migrating to native (Rust) implementations.**
   The `main_block`, `module_dunders`, `init_subclass`, `server_config`,
   and `unittest` built-ins now resolve to native `NativePlugin`

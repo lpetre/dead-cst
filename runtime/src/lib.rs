@@ -26,6 +26,7 @@
 #![allow(clippy::useless_conversion)]
 
 mod builder;
+mod file_extraction;
 mod file_payload;
 mod file_ref_edges;
 mod graph;

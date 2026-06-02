@@ -39,13 +39,6 @@ pub(crate) fn is_dunder_name(fqname: &str) -> bool {
     name.len() > 4 && name.starts_with("__") && name.ends_with("__")
 }
 
-pub(crate) fn class_body_defines_method(class_def: &StmtClassDef, method_name: &str) -> bool {
-    class_def.body.iter().any(|stmt| match stmt {
-        Stmt::FunctionDef(f) => f.name.as_str() == method_name,
-        _ => false,
-    })
-}
-
 /// Return ``true`` if any decorator in ``decorators`` matches
 /// ``@<module>.<name>`` (literal module name) or ``@<name>`` for
 /// any ``name`` in ``names``. Trailing ``(...)`` is unwrapped before
@@ -1008,54 +1001,13 @@ impl<'ast, 'a> Visitor<'ast> for FactoryCallFinder<'a> {
     }
 }
 
-/// Owner-resolution helper shared by the call-finder queries.
-/// Top-level ``FunctionDef`` / ``ClassDef`` own calls inside their
-/// subtree (decorators included via the walk); other top-level stmts
-/// attribute their calls to the module node.
-/// Look up the owning decl index for a top-level statement. Takes
-/// the two hashmaps directly (rather than ``&BuildOutputs``) because
-/// ``BuildOutputs`` carries ``Vec<Py<SymbolNode>>`` and is therefore
-/// ``!Sync`` — these maps are ``Sync`` on their own, which lets the
-/// callers borrow them across rayon thread boundaries.
-pub(crate) fn owner_idx_for_stmt_with(
-    decl_by_name_range: &FxHashMap<(File, (u32, u32)), usize>,
-    module_nodes_by_file: &FxHashMap<File, usize>,
-    file: File,
-    stmt: &Stmt,
-) -> Option<usize> {
-    let module_idx = module_nodes_by_file.get(&file).copied();
-    let name_range = match stmt {
-        Stmt::FunctionDef(f) => f.name.range(),
-        Stmt::ClassDef(c) => c.name.range(),
-        _ => return module_idx,
-    };
-    decl_by_name_range
-        .get(&(file, range_key(name_range)))
-        .copied()
-        .or(module_idx)
-}
-
-/// Extract the string-literal value of a call's ``args[arg_index]``
-/// positional argument. ``None`` when out of range or not a single
-/// string literal — concatenated / f-string / b-string forms don't
-/// project to a static fqname and are deliberately rejected.
-pub(crate) fn nth_positional_string(
-    call: &ruff_python_ast::ExprCall,
-    arg_index: usize,
-) -> Option<String> {
-    match call.arguments.args.get(arg_index)? {
-        Expr::StringLiteral(s) => Some(s.value.to_str().to_string()),
-        _ => None,
-    }
-}
-
 /// A string literal extracted from a call keyword argument, or
 /// ``Unknown`` for anything else. The only in-tree consumer is the
 /// pytest plugin, which reads the ``name=`` alias on ``@pytest.fixture``;
 /// every non-string expression collapses to ``Unknown``. Re-exported from
 /// [`crate::native_plugins::plugin_api`] (pyo3-free) so external plugins
 /// can read decorator/constructor arguments too.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, salsa::Update, get_size2::GetSize)]
 pub enum ArgValue {
     Str(String),
     Unknown,
@@ -1065,7 +1017,7 @@ pub enum ArgValue {
 /// The map itself is crate-internal (it carries an `FxHashMap`, which the
 /// curated airlock doesn't expose); external plugins read values through
 /// the [`CallArgs::get`] / [`CallArgs::str_value`] accessors.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, salsa::Update, get_size2::GetSize)]
 pub struct CallArgs {
     pub(crate) kwargs: FxHashMap<String, ArgValue>,
 }
@@ -1168,131 +1120,6 @@ pub(crate) fn extract_call_kwargs(call: &ruff_python_ast::ExprCall) -> CallArgs 
         kwargs.insert(name.as_str().to_string(), extract_arg_value(&kw.value));
     }
     CallArgs { kwargs }
-}
-
-/// Match ``<owner>.<attr>(...)`` where ``<owner>`` is a bare ``Name``
-/// equal to the given owner string and ``<attr>`` matches. No import
-/// resolution — meant for pytest fixture conventions (``mocker``,
-/// ``monkeypatch``) whose names come from function parameters.
-pub(crate) fn call_callee_matches_var(
-    call: &ruff_python_ast::ExprCall,
-    owner: &str,
-    attr: &str,
-    required_positional: Option<usize>,
-) -> bool {
-    let Expr::Attribute(attribute) = unwrap_subscripted_callee(call.func.as_ref()) else {
-        return false;
-    };
-    if attribute.attr.as_str() != attr {
-        return false;
-    }
-    let Expr::Name(name) = attribute.value.as_ref() else {
-        return false;
-    };
-    if name.id.as_str() != owner {
-        return false;
-    }
-    if let Some(expected) = required_positional {
-        if call.arguments.args.len() != expected {
-            return false;
-        }
-    }
-    true
-}
-
-/// Visit every Call expression in a subtree, push
-/// ``(string_arg_at_index, CallArgs)`` whenever ``predicate(call)``
-/// returns ``true``. Backs both call-finder queries.
-pub(crate) struct StringArgCallFinder<F>
-where
-    F: FnMut(&ruff_python_ast::ExprCall) -> bool,
-{
-    pub(crate) predicate: F,
-    pub(crate) arg_index: usize,
-    /// When ``false``, every result row gets a default-constructed
-    /// (empty) :struct:`CallArgs`. The caller pays for the rust-side
-    /// kwarg walk only when ``extract_args = true``.
-    pub(crate) extract_args: bool,
-    pub(crate) results: Vec<(String, CallArgs)>,
-}
-
-impl<'ast, F> Visitor<'ast> for StringArgCallFinder<F>
-where
-    F: FnMut(&ruff_python_ast::ExprCall) -> bool,
-{
-    fn visit_expr(&mut self, expr: &'ast Expr) {
-        if let Expr::Call(call) = expr {
-            if (self.predicate)(call) {
-                if let Some(value) = nth_positional_string(call, self.arg_index) {
-                    let call_args = if self.extract_args {
-                        extract_call_kwargs(call)
-                    } else {
-                        CallArgs::default()
-                    };
-                    self.results.push((value, call_args));
-                }
-            }
-        }
-        walk_expr(self, expr);
-    }
-}
-
-/// Visit every Call expression in a subtree, capture string-literal
-/// args at ``arg_index`` for calls whose callee is ``<expr>.<attr>(...)``
-/// regardless of receiver shape. The captured arg can be a single
-/// string literal **or** a list/tuple of string literals (the latter
-/// produces multiple results for one call). Backs ``find_calls_on_attr``.
-///
-/// Each emitted row is ``(captured_string, CallArgs)``. Multiple rows
-/// from one call (list/tuple shape) share the same ``CallArgs``.
-pub(crate) struct AttrCallFinder<'a> {
-    pub(crate) attr: &'a str,
-    pub(crate) arg_index: usize,
-    /// See :struct:`StringArgCallFinder` — same gate.
-    pub(crate) extract_args: bool,
-    pub(crate) results: Vec<(String, CallArgs)>,
-}
-
-impl<'ast, 'a> Visitor<'ast> for AttrCallFinder<'a> {
-    fn visit_expr(&mut self, expr: &'ast Expr) {
-        if let Expr::Call(call) = expr {
-            if let Expr::Attribute(attribute) = unwrap_subscripted_callee(call.func.as_ref()) {
-                if attribute.attr.as_str() == self.attr {
-                    if let Some(arg) = call.arguments.args.get(self.arg_index) {
-                        let hits = string_or_string_collection(arg);
-                        if !hits.is_empty() {
-                            let call_args = if self.extract_args {
-                                extract_call_kwargs(call)
-                            } else {
-                                CallArgs::default()
-                            };
-                            for s in hits {
-                                self.results.push((s, call_args.clone()));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        walk_expr(self, expr);
-    }
-}
-
-/// Pull string-literal values out of either a single ``"..."`` or a
-/// homogeneous list/tuple of string literals. Non-string elements in a
-/// list/tuple are silently dropped; non-matching expressions yield an
-/// empty vec.
-fn string_or_string_collection(arg: &Expr) -> Vec<String> {
-    let lit = |e: &Expr| match e {
-        Expr::StringLiteral(s) => Some(s.value.to_str().to_string()),
-        _ => None,
-    };
-    match arg {
-        Expr::StringLiteral(s) => vec![s.value.to_str().to_string()],
-        Expr::List(list) => list.elts.iter().filter_map(lit).collect(),
-        Expr::Tuple(tup) => tup.elts.iter().filter_map(lit).collect(),
-        _ => Vec::new(),
-    }
 }
 
 pub(crate) fn rel_path<P: AsRef<str>>(path: P) -> RelativePathBuf {
@@ -2280,32 +2107,7 @@ mod tests {
         assert!(top_level_assign_to_name(&stmts[0]).is_none());
     }
 
-    // -- class_body_defines_method -----------------------------------------
-
-    #[test]
-    fn class_body_defines_method_finds_named_method() {
-        let stmts = parse_stmts("class C:\n    def m(self): pass\n    def n(self): pass\n");
-        let cls = match &stmts[0] {
-            Stmt::ClassDef(c) => c,
-            _ => unreachable!(),
-        };
-        assert!(class_body_defines_method(cls, "m"));
-        assert!(class_body_defines_method(cls, "n"));
-        assert!(!class_body_defines_method(cls, "missing"));
-    }
-
-    #[test]
-    fn class_body_defines_method_ignores_non_function_members() {
-        let stmts = parse_stmts("class C:\n    x = 1\n    class Inner: pass\n");
-        let cls = match &stmts[0] {
-            Stmt::ClassDef(c) => c,
-            _ => unreachable!(),
-        };
-        assert!(!class_body_defines_method(cls, "x"));
-        assert!(!class_body_defines_method(cls, "Inner"));
-    }
-
-    // -- nth_positional_string --------------------------------------------
+    // -- first_call: shared call-parsing helper for the call-target tests --
 
     fn first_call(source: &str) -> ruff_python_ast::ExprCall {
         let expr = parse_expr(source);
@@ -2313,64 +2115,6 @@ mod tests {
             Expr::Call(c) => c,
             _ => panic!("expected a call expression"),
         }
-    }
-
-    #[test]
-    fn nth_positional_string_returns_literal_value() {
-        let call = first_call("f('hello', 'world')");
-        assert_eq!(nth_positional_string(&call, 0), Some("hello".to_string()));
-        assert_eq!(nth_positional_string(&call, 1), Some("world".to_string()));
-    }
-
-    #[test]
-    fn nth_positional_string_returns_none_for_non_string() {
-        let call = first_call("f(42, foo)");
-        assert_eq!(nth_positional_string(&call, 0), None);
-        assert_eq!(nth_positional_string(&call, 1), None);
-    }
-
-    #[test]
-    fn nth_positional_string_out_of_range_returns_none() {
-        let call = first_call("f('a')");
-        assert_eq!(nth_positional_string(&call, 5), None);
-    }
-
-    #[test]
-    fn nth_positional_string_rejects_f_string() {
-        // f-strings are not StringLiteral nodes — should be rejected.
-        let call = first_call("f(f'value-{x}')");
-        assert_eq!(nth_positional_string(&call, 0), None);
-    }
-
-    // -- call_callee_matches_var ------------------------------------------
-
-    #[test]
-    fn call_callee_matches_var_matches_owner_attr() {
-        let call = first_call("mocker.patch('x')");
-        assert!(call_callee_matches_var(&call, "mocker", "patch", None));
-        assert!(call_callee_matches_var(&call, "mocker", "patch", Some(1)));
-        assert!(!call_callee_matches_var(&call, "mocker", "patch", Some(2)));
-    }
-
-    #[test]
-    fn call_callee_matches_var_rejects_wrong_owner_or_attr() {
-        let call = first_call("mocker.patch('x')");
-        assert!(!call_callee_matches_var(&call, "other", "patch", None));
-        assert!(!call_callee_matches_var(&call, "mocker", "spy", None));
-    }
-
-    #[test]
-    fn call_callee_matches_var_rejects_non_attribute_callee() {
-        let call = first_call("f('x')");
-        assert!(!call_callee_matches_var(&call, "f", "patch", None));
-    }
-
-    #[test]
-    fn call_callee_matches_var_rejects_chained_receiver() {
-        // ``a.b.patch(...)`` has ``a.b`` (Attribute) as the receiver, not
-        // a bare Name — should not match.
-        let call = first_call("a.b.patch('x')");
-        assert!(!call_callee_matches_var(&call, "b", "patch", None));
     }
 
     // -- range_key ---------------------------------------------------------
