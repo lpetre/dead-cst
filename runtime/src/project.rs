@@ -170,8 +170,12 @@ pub(crate) struct BuildOutputs {
     /// Lets the external-seed branch of `find_subclasses_indices_core`
     /// recover the first hop into the project straight from the cached
     /// per-file payloads, instead of a full re-parse over every project
-    /// file. Re-export / alias chains through project modules are still
-    /// walked via `find_references` (gated on `imports_by_module`).
+    /// file. Re-export / alias chains through project modules are folded
+    /// in statically by `chase_base_fqn` (which walks the per-file
+    /// `name_bindings`), so a subclass reached only through a re-export is
+    /// keyed here under the terminal external fqn. The `find_references`
+    /// walk is now only an opt-in fallback for chains the static ladder
+    /// can't see (`DEAD_CST_SUBCLASS_REF_FALLBACK`).
     pub(crate) external_base_children: FxHashMap<String, Vec<usize>>,
 }
 
@@ -1054,20 +1058,23 @@ pub(crate) struct ClassHierarchyIndices {
 ///   idxs. Lets the external-seed query recover the first project hop
 ///   from cached payloads instead of re-parsing every file.
 ///
+/// A first pass folds every file's per-file `name_bindings` into a
+/// project-wide re-export / alias chain (`{module_fqn}.{name} ->
+/// next_fqn`); the second pass resolves each base through it so a base
+/// that hops across files (re-export, star-import, module-level alias)
+/// is chased to its terminal class. See [`chase_base_fqn`].
+///
 /// Resolution rules per `ResolvedBase` variant:
 ///
 /// * `LocalSameFileClass(local_idx)` — translate via the file's
 ///   `refs[local_idx]` + `ref_to_global` to a parent class graph idx
 ///   and emit a `children_by_node` entry.
-/// * `ImportedFqn(fqn)` — when the fqn resolves in `decl_by_fqname` to
-///   a project class node, emit a `children_by_node` entry (so a
-///   project base imported via `from m import C` participates in
-///   node-keyed walks). When the fqn is absent from `decl_by_fqname`
-///   (an external base), emit an `external_base_children` entry instead.
-/// * `Attribute { module_fqn, attr_name }` — resolve
-///   `{module_fqn}.{attr_name}` via `decl_by_fqname`; project class
-///   hits emit `children_by_node` entries, an absent fqn emits an
-///   `external_base_children` entry.
+/// * `ImportedFqn(fqn)` / `Attribute { module_fqn, attr_name }` — chase
+///   the (composed) fqn through the alias chain to its terminal, then:
+///   a project class hit emits `children_by_node` entries; a terminal
+///   absent from `decl_by_fqname` (an external base, possibly reached
+///   through a project re-export) emits an `external_base_children`
+///   entry keyed by that terminal fqn. See [`register_chased_base`].
 /// * `Unresolvable` — dropped.
 fn build_class_hierarchy_indices<'db>(
     db: &'db ProjectDatabase,
@@ -1077,9 +1084,34 @@ fn build_class_hierarchy_indices<'db>(
     decl_by_fqname: &FxHashMap<String, Vec<usize>>,
     nodes: &[GraphNode],
 ) -> ClassHierarchyIndices {
-    use crate::file_payload::ResolvedBase;
+    use crate::file_payload::{NameBinding, ResolvedBase};
     let mut by_node: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
     let mut external_base_children: FxHashMap<String, Vec<usize>> = FxHashMap::default();
+
+    // First pass: fold every file's per-file `name_bindings` into a
+    // project-wide re-export / alias chain, `{module_fqn}.{name} ->
+    // next_fqn`. This is the cross-file half of the uniform binder
+    // ladder: a base that resolves (in its own file) to a name which is
+    // itself an import, star-import, or module-level alias is chased
+    // through this map to the terminal class fqn, so a class reached only
+    // via one or more re-export hops still lands in `children_by_node` /
+    // `external_base_children` without re-parsing. `LocalClass` bindings
+    // are terminal (the class itself, found in `decl_by_fqname`) so they
+    // need no chain edge.
+    let mut alias_chain: FxHashMap<String, String> = FxHashMap::default();
+    for &file in project_files {
+        let payload = file_to_nodes(db, file);
+        let module_fqn = payload.nodes[0].fqname.as_str();
+        for (name, binding) in &payload.name_bindings {
+            let next = match binding {
+                NameBinding::LocalClass(_) => continue,
+                NameBinding::Import(fqn) => fqn.clone(),
+                NameBinding::StarImport(module) => format!("{module}.{name}"),
+                NameBinding::ModuleAlias(other) => format!("{module_fqn}.{other}"),
+            };
+            alias_chain.insert(format!("{module_fqn}.{name}"), next);
+        }
+    }
 
     for &file in project_files {
         let payload = file_to_nodes(db, file);
@@ -1097,48 +1129,32 @@ fn build_class_hierarchy_indices<'db>(
                             }
                         }
                     }
-                    ResolvedBase::ImportedFqn(fqn) => match decl_by_fqname.get(fqn) {
-                        Some(idxs) => {
-                            for &parent_idx in idxs {
-                                if nodes[parent_idx].kind == "class" {
-                                    by_node.entry(parent_idx).or_default().push(child_idx);
-                                }
-                            }
-                        }
-                        // Not a project decl at all → an external base.
-                        // Key it by the resolved fqn so the external-seed
-                        // query can recover this subclass without a
-                        // re-parse. (A project decl that exists but isn't
-                        // a class is intentionally dropped: its subclass
-                        // set is empty either way.)
-                        None => external_base_children
-                            .entry(fqn.clone())
-                            .or_default()
-                            .push(child_idx),
-                    },
+                    ResolvedBase::ImportedFqn(fqn) => {
+                        let terminal = chase_base_fqn(fqn, &alias_chain, decl_by_fqname, nodes);
+                        register_chased_base(
+                            terminal,
+                            child_idx,
+                            decl_by_fqname,
+                            nodes,
+                            &mut by_node,
+                            &mut external_base_children,
+                        );
+                    }
                     ResolvedBase::Attribute {
                         module_fqn,
                         attr_name,
                     } => {
-                        // Resolve `module_fqn.attr_name` via
-                        // `decl_by_fqname` (the common case where the
-                        // target module's class is in the project); an
-                        // absent fqn is an external base, keyed for the
-                        // external-seed query.
                         let composed = format!("{module_fqn}.{attr_name}");
-                        match decl_by_fqname.get(&composed) {
-                            Some(idxs) => {
-                                for &parent_idx in idxs {
-                                    if nodes[parent_idx].kind == "class" {
-                                        by_node.entry(parent_idx).or_default().push(child_idx);
-                                    }
-                                }
-                            }
-                            None => external_base_children
-                                .entry(composed)
-                                .or_default()
-                                .push(child_idx),
-                        }
+                        let terminal =
+                            chase_base_fqn(&composed, &alias_chain, decl_by_fqname, nodes);
+                        register_chased_base(
+                            terminal,
+                            child_idx,
+                            decl_by_fqname,
+                            nodes,
+                            &mut by_node,
+                            &mut external_base_children,
+                        );
                     }
                     ResolvedBase::Unresolvable => {}
                 }
@@ -1157,6 +1173,65 @@ fn build_class_hierarchy_indices<'db>(
     ClassHierarchyIndices {
         children_by_node: by_node,
         external_base_children,
+    }
+}
+
+/// Follow a base-class fqn through the project-wide re-export / alias
+/// chain (`alias_chain`, built by [`build_class_hierarchy_indices`]) to
+/// its terminal fqn. Stops at the first fqn that names a live project
+/// class — so a re-exported project base resolves to the class itself,
+/// not the intermediate import node — or at a fqn that isn't a project
+/// re-export (an external base, or an unresolvable leaf). Cycle-guarded.
+fn chase_base_fqn<'a>(
+    start: &'a str,
+    alias_chain: &'a FxHashMap<String, String>,
+    decl_by_fqname: &FxHashMap<String, Vec<usize>>,
+    nodes: &[GraphNode],
+) -> &'a str {
+    let mut cur = start;
+    let mut seen: FxHashSet<&str> = FxHashSet::default();
+    loop {
+        // A fqn that already names a live project class is the terminal:
+        // don't chase past it through a same-name re-export shadow.
+        if decl_by_fqname
+            .get(cur)
+            .is_some_and(|idxs| idxs.iter().any(|&i| nodes[i].kind == "class"))
+        {
+            return cur;
+        }
+        match alias_chain.get(cur) {
+            Some(next) if seen.insert(cur) => cur = next.as_str(),
+            _ => return cur,
+        }
+    }
+}
+
+/// Fold a chased terminal base fqn into the project-wide subclass
+/// indices. A project class hit emits `children_by_node` entries; a
+/// terminal absent from `decl_by_fqname` is an external base, keyed into
+/// `external_base_children`. A project decl that exists but isn't a class
+/// is dropped (its subclass set is empty either way), matching the
+/// pre-chase behaviour.
+fn register_chased_base(
+    terminal: &str,
+    child_idx: usize,
+    decl_by_fqname: &FxHashMap<String, Vec<usize>>,
+    nodes: &[GraphNode],
+    by_node: &mut FxHashMap<usize, Vec<usize>>,
+    external_base_children: &mut FxHashMap<String, Vec<usize>>,
+) {
+    match decl_by_fqname.get(terminal) {
+        Some(idxs) => {
+            for &parent_idx in idxs {
+                if nodes[parent_idx].kind == "class" {
+                    by_node.entry(parent_idx).or_default().push(child_idx);
+                }
+            }
+        }
+        None => external_base_children
+            .entry(terminal.to_string())
+            .or_default()
+            .push(child_idx),
     }
 }
 
@@ -3364,13 +3439,16 @@ fn find_classes_defining_method_indices_core(
 
 /// Subclasses of the class addressed by ``base_fqn`` (project or
 /// external seed). Takes an owned ``ProjectDatabase`` so it can resolve
-/// the seed serially (``locate_class_seed`` needs a concrete db) and run
-/// the ``find_references`` re-export fallback. A project seed walks the
-/// cached ``children_by_node`` index directly; an external seed reads its
-/// direct project subclasses from the cached ``external_base_children``
-/// index (no re-parse) and only walks ``find_references`` when a project
-/// file actually imports the seed module. See
-/// ``FrozenView::find_subclasses_indices`` for the fast/slow-path rationale.
+/// the seed serially (``locate_class_seed`` needs a concrete db) and, when
+/// opted in, run the ``find_references`` re-export fallback. A project
+/// seed walks the cached ``children_by_node`` index directly; an external
+/// seed reads its direct project subclasses from the cached
+/// ``external_base_children`` index (no re-parse — re-export / alias
+/// chains are now resolved statically into that index by
+/// ``chase_base_fqn``). The ``find_references`` walk is an opt-in fallback
+/// (``DEAD_CST_SUBCLASS_REF_FALLBACK``) for chains the static ladder can't
+/// see. See ``FrozenView::find_subclasses_indices`` for the fast/slow-path
+/// rationale.
 fn find_subclasses_indices_core(
     db: ProjectDatabase,
     outputs: &BuildOutputs,
@@ -3395,21 +3473,28 @@ fn find_subclasses_indices_core(
     let children_by_node = &outputs.children_by_node;
     // External seed: the class lives outside the project. Its direct
     // project subclasses are cached in `external_base_children` (folded
-    // from the per-file `class_bases` payloads — no re-parse). A re-export
-    // / alias chain that binds the external class through a project module
-    // resolves the base to that *project* fqn, so it isn't keyed here;
-    // walk those via find_references — but only when some project file
-    // imports the seed module (the `imports_by_module` gate), since
-    // otherwise there is provably no reference for the walk to find.
+    // from the per-file `class_bases` payloads — no re-parse). Re-export /
+    // alias chains that bind the external class through one or more
+    // project modules are now resolved statically by `chase_base_fqn` at
+    // assemble time, so they too land in `external_base_children` without
+    // a walk.
     let mut direct: FxHashSet<usize> = outputs
         .external_base_children
         .get(base_fqn)
         .map(|idxs| idxs.iter().copied().collect())
         .unwrap_or_default();
+    // Opt-in `find_references` fallback. The cached index above covers
+    // every statically-resolvable subclass; the ref walk additionally
+    // catches chains ty's resolver reaches but the static binder ladder
+    // can't (e.g. relative-import or conditional re-exports). It re-parses
+    // on demand, so it is gated behind `DEAD_CST_SUBCLASS_REF_FALLBACK`
+    // and still only runs when some project file imports the seed module
+    // (otherwise there is provably no reference for the walk to find).
+    let ref_fallback = std::env::var_os("DEAD_CST_SUBCLASS_REF_FALLBACK").is_some();
     let imports_seed_module = base_fqn
         .rsplit_once('.')
         .is_some_and(|(module, _)| outputs.imports_by_module.contains_key(module));
-    if imports_seed_module {
+    if ref_fallback && imports_seed_module {
         direct.extend(find_subclass_indices_via_refs_with_queue(
             &db,
             &outputs.class_by_selection,
