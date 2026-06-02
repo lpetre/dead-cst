@@ -5,7 +5,7 @@
 
 use pyo3::prelude::*;
 use ruff_db::files::{File, FilePath};
-use ruff_db::parsed::{parsed_module, ParsedModuleRef};
+use ruff_db::parsed::ParsedModuleRef;
 use ruff_db::system::SystemPath;
 use ruff_python_ast::token::TokenKind;
 use ruff_python_ast::visitor::{walk_expr, Visitor};
@@ -19,6 +19,9 @@ use ty_module_resolver::{
 };
 use ty_project::metadata::value::RelativePathBuf;
 use ty_project::{Db as ProjectDb, ProjectDatabase};
+use ty_python_semantic::types::list_members::all_members;
+use ty_python_semantic::types::Type;
+use ty_python_semantic::SemanticModel;
 
 use crate::graph::{EdgeFlags, NodeFlags};
 use crate::ingest::collapse_attribute_chain;
@@ -97,19 +100,10 @@ pub(crate) fn iter_top_level_classes(
     })
 }
 
-/// Find a top-level ``StmtClassDef`` by its bound name.
-pub(crate) fn class_def_named<'a>(
-    parsed: &'a ParsedModuleRef,
-    name: &str,
-) -> Option<&'a StmtClassDef> {
-    iter_top_level_classes(parsed).find(|cls| cls.name.as_str() == name)
-}
-
-/// Resolve a dotted class fqn to ``(File, name_range)`` so the caller
-/// can fetch the corresponding ``Type`` via ``class_def_at`` +
-/// ``inferred_type``. Handles both project classes (looked up via
-/// ``decl_by_fqname``) and external classes (ty's ``resolve_module``
-/// + AST scan by name in the resolved module).
+/// Resolve a dotted class fqn to ``(File, name_range)``. Handles both
+/// project classes (looked up via ``decl_by_fqname`` + the inverted
+/// ``class_by_selection``) and external classes (resolved through ty's
+/// type system by [`external_class_seed_via_ty`]).
 pub(crate) fn locate_class_seed(
     db: &ProjectDatabase,
     outputs: &BuildOutputs,
@@ -128,93 +122,53 @@ pub(crate) fn locate_class_seed(
             }
         }
     }
-    // External class: resolve the module via ty, then follow any
-    // re-export chains until we find the actual class def. Shared with the
-    // subclass-index store side (`build_class_hierarchy_indices`) so both
-    // the observed bases and the query input normalize through one
-    // resolver, collapsing sibling spellings by construction.
+    // External class: resolve through ty's type system. The store side
+    // (`build_class_bases`) resolves every observed base the same way —
+    // both land on the canonical `ClassLiteral`'s `focus_range` — so
+    // sibling spellings (`unittest.TestCase` vs `unittest.case.TestCase`)
+    // and renamed re-exports collapse to one `external_base_children`
+    // key by construction, not a query-time string scan.
     let anchor = *outputs.project_files.first()?;
-    locate_external_class_seed(db, anchor, fqn)
+    external_class_seed_via_ty(db, anchor, fqn)
 }
 
-/// Resolve a dotted *external* class fqn to ``(File, name_range)`` by
-/// resolving its module via ty and following re-export / alias chains
-/// (see [`follow_class_through_module`]). Sibling spellings of the same
-/// class (``unittest.TestCase`` vs ``unittest.case.TestCase``) resolve to
-/// the *same* ``(File, name_range)``, so this is the normalization both
-/// the subclass-index store side and the query side funnel through —
-/// co-reference becomes structural (one key), not a query-time string
-/// scan.
-pub(crate) fn locate_external_class_seed(
+/// Resolve a dotted *external* class fqn to ``(File, name_range)`` via
+/// ty: resolve the owning module to a module-literal type, find the
+/// member bound to the final segment, and take its ``ClassLiteral``'s
+/// definition. Because the member's type is the canonical class object,
+/// re-exports (`unittest` re-exporting `unittest.case.TestCase`) and
+/// renamed aliases resolve to the same class as their original
+/// spelling — the normalization that makes co-reference structural.
+fn external_class_seed_via_ty(
     db: &ProjectDatabase,
     anchor: File,
     fqn: &str,
 ) -> Option<(File, TextRange)> {
     let (module_str, class_name) = fqn.rsplit_once('.')?;
-    let module_name = ModuleName::new(module_str)?;
-    let module = resolve_module(db, anchor, &module_name)?;
-    let module_file = module.file(db)?;
-    let mut visited: FxHashSet<File> = FxHashSet::default();
-    follow_class_through_module(db, module_file, class_name, &mut visited)
+    let model = SemanticModel::new(db, anchor);
+    let module_ty = model.resolve_module_type(Some(module_str), 0)?;
+    let member = all_members(db, module_ty)
+        .into_iter()
+        .find(|m| m.name.as_str() == class_name)?;
+    class_literal_seed(db, member.ty)
 }
 
-/// Walk through a module looking for ``class_name``. Handles three
-/// re-export shapes: a direct ``class class_name: ...`` definition,
-/// an explicit ``from .other import class_name [as class_name]``
-/// re-export, and ``from .other import *`` (which exposes everything
-/// the source module defines at the top level). Bounded by a
-/// visited-file set so cycles can't loop forever.
-pub(crate) fn follow_class_through_module(
-    db: &ProjectDatabase,
-    start_file: File,
-    class_name: &str,
-    visited: &mut FxHashSet<File>,
+/// Resolve a ``Type`` to the ``(File, name_range)`` of the class it
+/// names, when it names a statically-known class — returns ``None`` for
+/// any non-class type (`Generic`, a function, a module, an instance, a
+/// dynamic base ty can't pin down). The range is the class's *name*
+/// (`TypeDefinition::focus_range`), which is exactly the key
+/// `class_by_selection` is built on. Both the store side (resolving a
+/// base *expression*) and the query side (resolving a base *fqn*) funnel
+/// through this helper, so the same class produces the same key from
+/// either entry point.
+pub(crate) fn class_literal_seed<'db>(
+    db: &'db dyn ty_python_semantic::Db,
+    ty: Type<'db>,
 ) -> Option<(File, TextRange)> {
-    if !visited.insert(start_file) {
-        return None;
-    }
-    let parsed = parsed_module(db, start_file).load(db);
-    if let Some(cls) = class_def_named(&parsed, class_name) {
-        return Some((start_file, cls.name.range()));
-    }
-    for stmt in &parsed.syntax().body {
-        let Stmt::ImportFrom(im) = stmt else {
-            continue;
-        };
-        let Ok(module_name) = ModuleName::from_import_statement(db, start_file, im) else {
-            continue;
-        };
-        let Some(resolved) = resolve_module(db, start_file, &module_name) else {
-            continue;
-        };
-        let Some(source_file) = resolved.file(db) else {
-            continue;
-        };
-        for alias in &im.names {
-            let imported_name = alias.name.as_str();
-            if imported_name == "*" {
-                if let Some(seed) =
-                    follow_class_through_module(db, source_file, class_name, visited)
-                {
-                    return Some(seed);
-                }
-                continue;
-            }
-            let local_name = alias
-                .asname
-                .as_ref()
-                .map(|n| n.as_str())
-                .unwrap_or(imported_name);
-            if local_name != class_name {
-                continue;
-            }
-            if let Some(seed) = follow_class_through_module(db, source_file, imported_name, visited)
-            {
-                return Some(seed);
-            }
-        }
-    }
-    None
+    ty.as_class_literal()?;
+    let frange = ty.definition(db)?.focus_range(db)?;
+    Some((frange.file(), frange.range()))
 }
 
 /// Locate the top-level ``if __name__ == "__main__":`` block in a
@@ -260,48 +214,6 @@ pub(crate) fn is_name(expr: &Expr, value: &str) -> bool {
 
 pub(crate) fn is_string_literal(expr: &Expr, value: &str) -> bool {
     matches!(expr, Expr::StringLiteral(s) if s.value.to_str() == value)
-}
-
-/// Resolve a class-base expression to an upstream fqname using the
-/// file's full imports map (as produced by
-/// :func:`collect_all_imports_local`).
-///
-/// Supported expression shapes:
-/// * ``Name(X)`` — looked up in ``file_imports``; returns the upstream
-///   fqname when ``X`` is an imported name.
-/// * ``Attribute(Name(M).N)`` — when ``M`` is bound to a module via
-///   ``import <module> [as M]``, returns ``<module>.N``.
-/// * Deeper attribute chain ``a.b.c.N`` rooted at an imported name
-///   ``a`` — appends segments to reach ``<a-upstream>.b.c.N``.
-///
-/// Returns ``None`` when the expression doesn't have a single
-/// recognized identifier shape, the root isn't imported, or the chain
-/// can't be resolved. Generics (``Base[T]``) are not supported (the
-/// caller is matching against `class C(Base[T]): ...` only to the
-/// extent ``ruff_python_ast`` exposes ``Base[T]`` as an
-/// ``ExprSubscript`` — those drop here, which is the correct
-/// behavior).
-pub(crate) fn resolve_base_fqn(
-    expr: &Expr,
-    file_imports: &FxHashMap<String, String>,
-) -> Option<String> {
-    match expr {
-        Expr::Name(name) => file_imports.get(name.id.as_str()).cloned(),
-        Expr::Attribute(_) => {
-            let (root, segs) = collapse_attribute_chain(expr)?;
-            let root_target = file_imports.get(root.id.as_str())?;
-            let mut out = String::with_capacity(
-                root_target.len() + segs.iter().map(|s| s.len() + 1).sum::<usize>(),
-            );
-            out.push_str(root_target);
-            for seg in &segs {
-                out.push('.');
-                out.push_str(seg);
-            }
-            Some(out)
-        }
-        _ => None,
-    }
 }
 
 /// Walk every `Stmt::Import` / `Stmt::ImportFrom` in `parsed` and

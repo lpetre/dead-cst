@@ -222,26 +222,26 @@ two versions.
   pass. On a 250-file synthetic project this takes the parsed-AST salsa heap
   from ~5 MB to ~0 at build-end (~30% of total salsa memory). Subclass
   resolution no longer re-parses **and no longer runs ty's `find_references`
-  walk at all**: each file captures its module-level name bindings during
-  the fan-out, and every class base — just a name, bound one of four ways
-  (local class, explicit import, `from … import *`, or a module-level alias,
-  `Base = Imported` *or* the attribute form `Base = mod.Imported`) — resolves
-  through that one uniform binder ladder. The
-  import table reads each `from … import` statement's leading-dot level, so
-  *relative* re-exports (`from .bases import TestCase`) resolve to the same
-  terminal class as absolute ones. Sibling spellings of one external base
+  walk at all**: each top-level class base is resolved during the per-file
+  fan-out straight through ty's type inference. The base expression's inferred
+  type, when it names a statically-known class, yields that class's canonical
+  `ClassLiteral`, keyed by its definition's `(file, name-range)` — the same key
+  the project's class index is built on. Because ty follows imports, aliases,
+  and re-exports while inferring the type, every spelling of one base collapses
+  to a single key by construction: an external base's sibling spellings
   (`unittest.TestCase` and `unittest.case.TestCase` both name the single
-  `class TestCase`) fold together, so a subclass written against either
-  spelling is found regardless of which spelling a plugin queries. At assemble
-  time the per-file bindings fold
-  into a project-wide alias/re-export chain that is chased cross-file to each
-  base's terminal class, so subclasses reached through a star import, a
-  module-level alias, or an absolute *or* relative re-export now resolve
-  statically from those cached facts — no on-demand AST reload, no env-var
-  fallback. The memory and no-re-parse mechanics are results-neutral; the one
-  behavioral change is that the static chase now keeps star-import /
-  module-alias / re-export subclasses alive where the default path previously
-  dropped them.
+  `class TestCase`), relative re-exports (`from .bases import TestCase`),
+  `from … import *` names, and module-level aliases (`Base = Imported` *or* the
+  attribute form `Base = mod.Imported`) all resolve to the same `ClassLiteral`
+  as the original spelling. At assemble time each base is a single hashmap probe
+  against the class index — a hit is a project parent, a miss is an external
+  base, keyed by that same `(file, name-range)` so the subclass query is an O(1)
+  lookup with no scan. No per-file name-binding table, no cross-file fqn chase,
+  no on-demand AST reload, no env-var fallback. The memory and no-re-parse
+  mechanics are results-neutral; the one behavioral change is that subclasses
+  reached through a star import, a module-level alias, or an absolute *or*
+  relative re-export are kept alive where the default path previously dropped
+  them.
 - **Built-in plugins are migrating to native (Rust) implementations.**
   The `main_block`, `module_dunders`, `init_subclass`, `server_config`,
   and `unittest` built-ins now resolve to native `NativePlugin`
