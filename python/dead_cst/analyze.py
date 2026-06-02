@@ -495,11 +495,15 @@ class Analysis:
 
     def set_stack_size(self, bytes_: int) -> None:
         """Override the rayon worker stack size (bytes) used by the
-        populate phase. Call BEFORE :meth:`materialize_all`; calls
-        after the graph is materialized have no effect on the
-        already-built graph.
+        populate phase AND the project-wide plugin pass. Call BEFORE
+        :meth:`materialize_all`; calls after the graph is materialized
+        have no effect on the already-built graph.
 
-        With no override set, the populate phase uses rayon's global
+        Both fan-outs honour the override because the deep recursion
+        spans both: file ingest in populate, and the class-hierarchy
+        re-walks subclass-resolution plugins drive in the plugin pass.
+
+        With no override set, both phases use rayon's global
         pool with rayon's own default stack (2 MiB unless
         ``RAYON_STACK_SIZE`` / ``RUST_MIN_STACK`` are set
         process-wide), which is sufficient for typical Python code.

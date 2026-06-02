@@ -6,7 +6,6 @@
 use pyo3::prelude::*;
 use ruff_db::files::{File, FilePath};
 use ruff_db::parsed::{parsed_module, ParsedModuleRef};
-use ruff_db::source::{line_index, source_text};
 use ruff_db::system::SystemPath;
 use ruff_python_ast::token::TokenKind;
 use ruff_python_ast::visitor::{walk_expr, Visitor};
@@ -21,7 +20,6 @@ use ty_module_resolver::{
 use ty_project::metadata::value::RelativePathBuf;
 use ty_project::{Db as ProjectDb, ProjectDatabase};
 
-use crate::builder::GraphNode;
 use crate::graph::{EdgeFlags, NodeFlags};
 use crate::ingest::collapse_attribute_chain;
 use crate::project::BuildOutputs;
@@ -37,13 +35,6 @@ pub(crate) const MODULE_ALIAS_MARKER: &str = "<module>";
 pub(crate) fn is_dunder_name(fqname: &str) -> bool {
     let name = fqname.rsplit('.').next().unwrap_or("");
     name.len() > 4 && name.starts_with("__") && name.ends_with("__")
-}
-
-pub(crate) fn class_body_defines_method(class_def: &StmtClassDef, method_name: &str) -> bool {
-    class_def.body.iter().any(|stmt| match stmt {
-        Stmt::FunctionDef(f) => f.name.as_str() == method_name,
-        _ => false,
-    })
 }
 
 /// Return ``true`` if any decorator in ``decorators`` matches
@@ -106,396 +97,6 @@ pub(crate) fn iter_top_level_classes(
     })
 }
 
-/// Locate a class's File + name TextRange from its SymbolNode positions.
-///
-/// We don't store ty `Definition<'db>` references across plugin calls
-/// (the `'db` lifetime is tied to the active borrow), so this re-walks
-/// the matching file's top-level classes for one whose name lands on
-/// the node's start line. Match-by-line (not line+column) because
-/// Function / Class / TypeAlias node columns are snapped to the line's
-/// indent — not the bound name's column — to align with libcst, and
-/// two top-level classes can't share a source line.
-pub(crate) fn locate_class_def(
-    db: &ProjectDatabase,
-    path_to_file: &FxHashMap<String, File>,
-    path: &str,
-    class_node: &GraphNode,
-) -> Option<(File, TextRange)> {
-    let &file = path_to_file.get(path)?;
-    let parsed = parsed_module(db, file).load(db);
-    let source = source_text(db, file);
-    let line_index = line_index(db, file);
-    for cls in iter_top_level_classes(&parsed) {
-        let name_range = cls.name.range();
-        let (sl, _, _, _) = position(&line_index, &source, name_range);
-        if sl == class_node.start_line {
-            return Some((file, name_range));
-        }
-    }
-    None
-}
-
-/// Find a top-level `StmtClassDef` whose name range equals `selection_range`.
-/// Return the top-level ``StmtClassDef`` (if any) that uses
-/// ``ref_range`` as one of its direct base-list arguments.
-///
-/// Used by the find_references-based subclass walk: each
-/// :func:`ty_ide::find_references` hit gives us a ``(File, range)``
-/// for a use of the seed class; if that range falls inside a top-level
-/// class's ``arguments.args`` list, the surrounding class is a direct
-/// subclass.
-///
-/// Note: this is a syntactic match (range containment), so a use of
-/// ``TestCase`` inside a parameterized generic base
-/// (``class X(SomeGeneric[TestCase]):``) will falsely flag ``X`` as a
-/// subclass of ``TestCase``. ty's :func:`type_hierarchy_subtypes`
-/// avoids that via real type inference; we trade that accuracy for
-/// the prefilter+rayon scan ty_ide's find_references provides.
-pub(crate) fn class_base_arg_owner(
-    parsed: &ParsedModuleRef,
-    ref_range: TextRange,
-) -> Option<&StmtClassDef> {
-    for stmt in &parsed.syntax().body {
-        let Stmt::ClassDef(class_def) = stmt else {
-            continue;
-        };
-        let Some(arguments) = &class_def.arguments else {
-            continue;
-        };
-        for arg in &arguments.args {
-            if arg.range().contains_range(ref_range) {
-                return Some(class_def);
-            }
-        }
-    }
-    None
-}
-
-/// If ``ref_range`` covers the "original name" of an aliased
-/// ``from M import Name as Alias`` (or ``import M as Alias``), return
-/// the alias's local-binding name range so the BFS can follow the
-/// re-binding to its uses.
-///
-/// ty_ide's :func:`find_references` is designed for IDE rename
-/// semantics: it does NOT follow aliased imports across the
-/// re-binding (renaming ``TestCase`` should not rename uses of
-/// ``TC`` from ``from unittest import TestCase as TC``). For our
-/// subclass walk we DO want the alias's uses — they're the
-/// subclasses we'd otherwise miss — so we seed the BFS with the
-/// alias's local name range and call find_references on that.
-pub(crate) fn aliased_import_local_name_range(
-    parsed: &ParsedModuleRef,
-    ref_range: TextRange,
-) -> Option<TextRange> {
-    for stmt in &parsed.syntax().body {
-        let aliases: &[ruff_python_ast::Alias] = match stmt {
-            Stmt::ImportFrom(import_from) => &import_from.names,
-            Stmt::Import(import) => &import.names,
-            _ => continue,
-        };
-        for alias in aliases {
-            let Some(asname) = &alias.asname else {
-                continue;
-            };
-            if alias.name.range() == ref_range {
-                return Some(asname.range());
-            }
-        }
-    }
-    None
-}
-
-/// Walk transitive subclasses of the seed class via
-/// :func:`ty_ide::find_references`, which carries an
-/// identifier-aware text prefilter and per-file rayon parallelism for
-/// free. Each find_references hit is filtered to "syntactically in a
-/// class base list"; matched classes seed the next round when
-/// ``transitive`` is set.
-///
-/// Returns ``Vec<usize>`` of indices into
-/// ``BuildOutputs::builder.nodes`` (only project classes — typeshed
-/// / external matches are dropped because they don't have a
-/// :attr:`class_by_selection` entry).
-#[allow(dead_code)]
-pub(crate) fn find_subclass_indices_via_refs(
-    db: &ProjectDatabase,
-    outputs: &BuildOutputs,
-    seed_file: File,
-    seed_name_range: TextRange,
-    transitive: bool,
-) -> Vec<usize> {
-    find_subclass_indices_via_refs_with_queue(
-        db,
-        &outputs.class_by_selection,
-        vec![(seed_file, seed_name_range)],
-        &[],
-        transitive,
-    )
-}
-
-/// Lower-level entry point for [`find_subclass_indices_via_refs`] that
-/// takes a pre-built initial BFS queue + a "pre-found" set of direct
-/// subclasses and just the ``class_by_selection`` index. Used by
-/// [`find_subclasses`](crate::project::ProjectContext::find_subclasses)
-/// after the fast-path parallel scan has produced the first-hop
-/// frontier from an external seed.
-///
-/// ``prefound_direct_subclasses`` is the list of
-/// ``(File, class_name_range)`` pairs the fast path already classified
-/// as direct subclasses; they're recorded as hits up-front *and*
-/// seeded into the BFS so transitive subclasses + alias chains are
-/// still walked through find_references. ``initial_queue`` is the
-/// remaining seeds to run find_references on (typically the original
-/// external seed range, so re-exports through project modules / star
-/// imports are still caught).
-pub(crate) fn find_subclass_indices_via_refs_with_queue(
-    db: &dyn ProjectDb,
-    class_by_selection: &FxHashMap<(File, (u32, u32)), usize>,
-    initial_queue: Vec<(File, TextRange)>,
-    prefound_direct_subclasses: &[(File, TextRange)],
-    transitive: bool,
-) -> Vec<usize> {
-    let mut out_idx: FxHashSet<usize> = FxHashSet::default();
-    let mut visited_seeds: FxHashSet<(File, (u32, u32))> = FxHashSet::default();
-    let mut queue: Vec<(File, TextRange)> = initial_queue;
-
-    // Record the fast-path direct subclasses as hits up-front. When
-    // transitive=true also seed the BFS with them so subclasses of
-    // these local classes get walked through find_references.
-    for &(f, r) in prefound_direct_subclasses {
-        let key = (f, range_key(r));
-        if let Some(&idx) = class_by_selection.get(&key) {
-            if out_idx.insert(idx) && transitive {
-                queue.push((f, r));
-            }
-        }
-    }
-
-    while let Some((cur_file, cur_range)) = queue.pop() {
-        if !visited_seeds.insert((cur_file, range_key(cur_range))) {
-            continue;
-        }
-        // Cursor offset inside the identifier (start can sit on the
-        // token boundary and ty_ide's tokens.at_offset has edge-cases
-        // there). Anywhere inside the identifier resolves the same
-        // goto target.
-        let offset =
-            cur_range.start() + ruff_text_size::TextSize::from(u32::from(cur_range.len()) / 2);
-        // Pass include_declaration=true: skip-declaration mode filters
-        // out re-binding declarations like `from M import Name as Alias`
-        // alongside the seed itself. We need that import-line entry to
-        // detect the alias and recurse, so we take the full list and
-        // drop the seed in class_base_arg_owner / via the visited_seeds
-        // dedup.
-        let Some(refs) = ty_ide::find_references(db, cur_file, offset, true) else {
-            continue;
-        };
-        for r in refs {
-            let r_file = r.file();
-            let r_range = r.range();
-            let parsed = parsed_module(db, r_file).load(db);
-            if let Some(class_def) = class_base_arg_owner(&parsed, r_range) {
-                let class_name_range = class_def.name.range();
-                let key = (r_file, range_key(class_name_range));
-                let Some(&idx) = class_by_selection.get(&key) else {
-                    continue;
-                };
-                if out_idx.insert(idx) && transitive {
-                    queue.push((r_file, class_name_range));
-                }
-            } else if let Some(alias_range) = aliased_import_local_name_range(&parsed, r_range) {
-                queue.push((r_file, alias_range));
-            }
-        }
-    }
-
-    out_idx.into_iter().collect()
-}
-
-/// Fast first-hop scan for the external-seed branch of
-/// [`crate::project::ProjectContext::find_subclasses`]. Returns the
-/// ``(File, class_name_range)`` of every top-level project class whose
-/// base-arg list resolves (through the file's local imports) to
-/// ``<seed_module>.<seed_simple_name>``.
-///
-/// This intentionally bypasses [`ty_ide::find_references`] (which is
-/// the dominant cost when the seed is in an external package — e.g.
-/// ``typer.Typer`` or ``fastapi.FastAPI``) and instead does a parallel
-/// per-file text-prefilter + AST walk over project files. The result
-/// seeds the BFS so transitive subclasses + alias chains are still
-/// walked through the existing find_references path.
-///
-/// Recognized base shapes (mirroring
-/// [`decorators_match_imports`]'s import-aware matcher):
-///
-/// * ``class X(SimpleName): ...`` where the file has
-///   ``from <seed_module> import <seed_simple_name>`` (with or without
-///   an ``as`` alias, so ``SimpleName`` may be the alias).
-/// * ``class X(<alias>.<simple_name>): ...`` where ``<alias>`` is
-///   bound to ``seed_module`` via ``import <seed_module>`` or
-///   ``import <seed_module> as <alias>``.
-///
-/// Subscripted generics (``class X(SomeGeneric[<base>]): ...``) and
-/// nested attribute chains are NOT matched — these are the rare
-/// shapes the upstream ``find_references`` walk would catch via
-/// semantic resolution. Callers run the historic find_references
-/// path as a fallback when the fast path returns empty.
-///
-/// Trade-off vs the find_references walk: this is a *syntactic*
-/// match against the file's import map. It can miss a subclass
-/// whose base is bound via a re-export through an intermediate
-/// project module (``from my_lib import Typer`` where ``my_lib``
-/// re-exports ``typer.Typer``). Callers wishing to keep that path
-/// must compose with find_references.
-///
-/// Caller must wrap in [`pyo3::Python::allow_threads`] — the inner
-/// per-file scan uses rayon and is GIL-free.
-/// Per-file fast-path result. ``direct_classes`` is the list of
-/// class-name ranges identified as direct subclasses of the external
-/// seed. ``has_module_import`` is ``true`` if this file imports the
-/// seed module in any form (``from <module> import ...``,
-/// ``import <module>``, ``from <module> import *``) — used by the
-/// caller as a presence signal: if no file in the project has a
-/// module import, the find_references fallback can be skipped (a
-/// re-export chain through a project module would still surface here).
-pub(crate) struct ExternalSeedFastPathResult {
-    pub(crate) direct_classes: Vec<(File, TextRange)>,
-    pub(crate) any_project_file_imports_seed_module: bool,
-}
-
-pub(crate) fn find_external_seed_direct_subclasses_par(
-    db: &dyn ProjectDb,
-    project_files: &[File],
-    seed_module: &str,
-    seed_simple_name: &str,
-) -> ExternalSeedFastPathResult {
-    use crate::query::{_contains_identifier, par_scan_files};
-    let db_handle: Box<dyn ProjectDb> = ProjectDb::dyn_clone(db);
-    let needle: &str = seed_simple_name;
-    let module: &str = seed_module;
-    // Per-file output: (class subclass ranges, file-imports-seed-module).
-    let per_file: Vec<(Vec<(File, TextRange)>, bool)> =
-        par_scan_files(db_handle, project_files, &None, |db, file| {
-            // Cheap text prefilter on the seed module's leftmost
-            // segment — every form of seed-module import (``import
-            // <module>``, ``from <module> import …``, ``from <module>
-            // import *``) mentions that segment in the source.
-            let source = source_text(db, file);
-            let module_root = module.split('.').next().unwrap_or(module);
-            if !_contains_identifier(&source, module_root) {
-                return Vec::new();
-            }
-            let parsed = parsed_module(db, file).load(db);
-            let has_module_import = file_imports_module(&parsed, module);
-            let mentions_name = _contains_identifier(&source, needle);
-            // Only build the imports map + walk class bases when the
-            // file textually mentions the simple name — the typical
-            // shortcut.
-            let direct: Vec<(File, TextRange)> = if mentions_name {
-                let allowed: FxHashSet<&str> = std::iter::once(needle).collect();
-                // ``file_package`` is `None`: relative imports of
-                // external framework names (``from .foo import
-                // Typer``) are vanishingly rare; the
-                // ``find_references`` fallback covers them when
-                // ``any_project_file_imports_seed_module`` flips on.
-                let imports = collect_module_imports_local(&parsed, module, &allowed, None);
-                if imports.is_empty() {
-                    Vec::new()
-                } else {
-                    let mut out: Vec<(File, TextRange)> = Vec::new();
-                    for cls in iter_top_level_classes(&parsed) {
-                        let Some(arguments) = &cls.arguments else {
-                            continue;
-                        };
-                        for arg in &arguments.args {
-                            if base_arg_resolves_to_seed(arg, &imports, needle) {
-                                out.push((file, cls.name.range()));
-                                break;
-                            }
-                        }
-                    }
-                    out
-                }
-            } else {
-                Vec::new()
-            };
-            vec![(direct, has_module_import)]
-        });
-    let mut direct_classes: Vec<(File, TextRange)> = Vec::new();
-    let mut any_project_file_imports_seed_module = false;
-    for (per, imports_seed) in per_file {
-        direct_classes.extend(per);
-        any_project_file_imports_seed_module |= imports_seed;
-    }
-    ExternalSeedFastPathResult {
-        direct_classes,
-        any_project_file_imports_seed_module,
-    }
-}
-
-/// Returns ``true`` if ``parsed`` imports ``module`` in any of:
-/// ``from <module> import …``, ``from <module> import *``,
-/// ``import <module>``, or ``import <module> as …``. Used as the
-/// presence-signal for the fast-path "no project file imports the
-/// seed module" shortcut.
-fn file_imports_module(parsed: &ParsedModuleRef, module: &str) -> bool {
-    for stmt in &parsed.syntax().body {
-        match stmt {
-            Stmt::ImportFrom(im) => {
-                if let Some(name) = &im.module {
-                    if name.as_str() == module {
-                        return true;
-                    }
-                }
-            }
-            Stmt::Import(im) => {
-                for alias in &im.names {
-                    if alias.name.as_str() == module {
-                        return true;
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    false
-}
-
-/// Return ``true`` if ``arg`` is a base-list reference that, after
-/// resolving through the file's local imports, names the seed class.
-/// Recognized shapes (matching what
-/// [`find_external_seed_direct_subclasses_par`] documents):
-///
-/// * ``Name(local)`` where ``imports[local] == seed_simple_name``
-///   (the local binding is the imported class).
-/// * ``Attribute(Name(local).attr)`` where ``imports[local] ==
-///   MODULE_ALIAS_MARKER`` and ``attr == seed_simple_name`` (the
-///   local binding is the module alias and we're accessing the class
-///   through it).
-fn base_arg_resolves_to_seed(
-    arg: &Expr,
-    imports: &FxHashMap<String, String>,
-    seed_simple_name: &str,
-) -> bool {
-    match arg {
-        Expr::Name(n) => imports
-            .get(n.id.as_str())
-            .is_some_and(|target| target == seed_simple_name),
-        Expr::Attribute(attr) => {
-            if attr.attr.as_str() != seed_simple_name {
-                return false;
-            }
-            let Expr::Name(prefix) = attr.value.as_ref() else {
-                return false;
-            };
-            imports
-                .get(prefix.id.as_str())
-                .is_some_and(|t| t == MODULE_ALIAS_MARKER)
-        }
-        _ => false,
-    }
-}
-
 /// Find a top-level ``StmtClassDef`` by its bound name.
 pub(crate) fn class_def_named<'a>(
     parsed: &'a ParsedModuleRef,
@@ -514,15 +115,15 @@ pub(crate) fn locate_class_seed(
     outputs: &BuildOutputs,
     fqn: &str,
 ) -> Option<(File, TextRange)> {
-    // Project class: cheap path through the existing indices.
+    // Project class: cheap path through the existing indices. The
+    // inverted `class_by_selection` hands back the name range directly,
+    // so no AST re-parse is needed to relocate the def.
     if let Some(idxs) = outputs.decl_by_fqname.get(fqn) {
         for &idx in idxs {
-            let node = &outputs.builder.nodes[idx];
-            if node.kind != "class" {
+            if outputs.builder.nodes[idx].kind != "class" {
                 continue;
             }
-            let path = node.path.clone();
-            if let Some(seed) = locate_class_def(db, &outputs.path_to_file, &path, node) {
+            if let Some(&seed) = outputs.class_selection_by_idx.get(&idx) {
                 return Some(seed);
             }
         }
@@ -695,27 +296,41 @@ pub(crate) fn resolve_base_fqn(
 /// Mappings produced:
 /// * ``from foo.bar import Baz`` → ``"Baz" -> "foo.bar.Baz"``
 /// * ``from foo.bar import Baz as B`` → ``"B" -> "foo.bar.Baz"``
+/// * ``from .bases import Baz`` (in package ``pkg``) →
+///   ``"Baz" -> "pkg.bases.Baz"`` — relative dots are resolved against
+///   ``file_package`` via ``im.level``. ``file_package`` is the
+///   importing file's enclosing package (``None`` for a top-level
+///   module, in which case a relative import is dropped).
 /// * ``import foo`` → ``"foo" -> "foo"``
 /// * ``import foo.bar as fb`` → ``"fb" -> "foo.bar"``
 /// * ``import foo.bar`` → ``"foo" -> "foo"`` (Python binds the
 ///   leftmost segment; the runtime module ``foo`` is what the name
 ///   resolves to).
-pub(crate) fn collect_all_imports_local(parsed: &ParsedModuleRef) -> FxHashMap<String, String> {
+pub(crate) fn collect_all_imports_local(
+    parsed: &ParsedModuleRef,
+    file_package: Option<&str>,
+) -> FxHashMap<String, String> {
     let mut out: FxHashMap<String, String> = FxHashMap::default();
     for stmt in &parsed.syntax().body {
         match stmt {
             Stmt::ImportFrom(im) => {
-                let Some(mod_name) = &im.module else { continue };
-                let module = mod_name.as_str();
+                // Resolve the source module to an absolute dotted path.
+                // `im.module` is only the suffix after the dots; the dot
+                // count lives in `im.level`, so a relative re-export like
+                // `from .bases import TestCase` resolves against the
+                // importing file's package instead of being mis-keyed to
+                // a bogus top-level `bases.TestCase`.
+                let tail = im.module.as_ref().map(|n| n.as_str()).unwrap_or("");
+                let module = if im.level == 0 {
+                    (!tail.is_empty()).then(|| tail.to_string())
+                } else {
+                    resolve_relative_import(im.level, tail, file_package)
+                };
+                let Some(module) = module else { continue };
                 for alias in &im.names {
                     let target = alias.name.as_str();
                     let local = alias.asname.as_ref().map(|n| n.as_str()).unwrap_or(target);
-                    let upstream = if module.is_empty() {
-                        target.to_string()
-                    } else {
-                        format!("{module}.{target}")
-                    };
-                    out.insert(local.to_string(), upstream);
+                    out.insert(local.to_string(), format!("{module}.{target}"));
                 }
             }
             Stmt::Import(im) => {
@@ -1008,54 +623,13 @@ impl<'ast, 'a> Visitor<'ast> for FactoryCallFinder<'a> {
     }
 }
 
-/// Owner-resolution helper shared by the call-finder queries.
-/// Top-level ``FunctionDef`` / ``ClassDef`` own calls inside their
-/// subtree (decorators included via the walk); other top-level stmts
-/// attribute their calls to the module node.
-/// Look up the owning decl index for a top-level statement. Takes
-/// the two hashmaps directly (rather than ``&BuildOutputs``) because
-/// ``BuildOutputs`` carries ``Vec<Py<SymbolNode>>`` and is therefore
-/// ``!Sync`` — these maps are ``Sync`` on their own, which lets the
-/// callers borrow them across rayon thread boundaries.
-pub(crate) fn owner_idx_for_stmt_with(
-    decl_by_name_range: &FxHashMap<(File, (u32, u32)), usize>,
-    module_nodes_by_file: &FxHashMap<File, usize>,
-    file: File,
-    stmt: &Stmt,
-) -> Option<usize> {
-    let module_idx = module_nodes_by_file.get(&file).copied();
-    let name_range = match stmt {
-        Stmt::FunctionDef(f) => f.name.range(),
-        Stmt::ClassDef(c) => c.name.range(),
-        _ => return module_idx,
-    };
-    decl_by_name_range
-        .get(&(file, range_key(name_range)))
-        .copied()
-        .or(module_idx)
-}
-
-/// Extract the string-literal value of a call's ``args[arg_index]``
-/// positional argument. ``None`` when out of range or not a single
-/// string literal — concatenated / f-string / b-string forms don't
-/// project to a static fqname and are deliberately rejected.
-pub(crate) fn nth_positional_string(
-    call: &ruff_python_ast::ExprCall,
-    arg_index: usize,
-) -> Option<String> {
-    match call.arguments.args.get(arg_index)? {
-        Expr::StringLiteral(s) => Some(s.value.to_str().to_string()),
-        _ => None,
-    }
-}
-
 /// A string literal extracted from a call keyword argument, or
 /// ``Unknown`` for anything else. The only in-tree consumer is the
 /// pytest plugin, which reads the ``name=`` alias on ``@pytest.fixture``;
 /// every non-string expression collapses to ``Unknown``. Re-exported from
 /// [`crate::native_plugins::plugin_api`] (pyo3-free) so external plugins
 /// can read decorator/constructor arguments too.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, salsa::Update, get_size2::GetSize)]
 pub enum ArgValue {
     Str(String),
     Unknown,
@@ -1065,7 +639,7 @@ pub enum ArgValue {
 /// The map itself is crate-internal (it carries an `FxHashMap`, which the
 /// curated airlock doesn't expose); external plugins read values through
 /// the [`CallArgs::get`] / [`CallArgs::str_value`] accessors.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, salsa::Update, get_size2::GetSize)]
 pub struct CallArgs {
     pub(crate) kwargs: FxHashMap<String, ArgValue>,
 }
@@ -1168,131 +742,6 @@ pub(crate) fn extract_call_kwargs(call: &ruff_python_ast::ExprCall) -> CallArgs 
         kwargs.insert(name.as_str().to_string(), extract_arg_value(&kw.value));
     }
     CallArgs { kwargs }
-}
-
-/// Match ``<owner>.<attr>(...)`` where ``<owner>`` is a bare ``Name``
-/// equal to the given owner string and ``<attr>`` matches. No import
-/// resolution — meant for pytest fixture conventions (``mocker``,
-/// ``monkeypatch``) whose names come from function parameters.
-pub(crate) fn call_callee_matches_var(
-    call: &ruff_python_ast::ExprCall,
-    owner: &str,
-    attr: &str,
-    required_positional: Option<usize>,
-) -> bool {
-    let Expr::Attribute(attribute) = unwrap_subscripted_callee(call.func.as_ref()) else {
-        return false;
-    };
-    if attribute.attr.as_str() != attr {
-        return false;
-    }
-    let Expr::Name(name) = attribute.value.as_ref() else {
-        return false;
-    };
-    if name.id.as_str() != owner {
-        return false;
-    }
-    if let Some(expected) = required_positional {
-        if call.arguments.args.len() != expected {
-            return false;
-        }
-    }
-    true
-}
-
-/// Visit every Call expression in a subtree, push
-/// ``(string_arg_at_index, CallArgs)`` whenever ``predicate(call)``
-/// returns ``true``. Backs both call-finder queries.
-pub(crate) struct StringArgCallFinder<F>
-where
-    F: FnMut(&ruff_python_ast::ExprCall) -> bool,
-{
-    pub(crate) predicate: F,
-    pub(crate) arg_index: usize,
-    /// When ``false``, every result row gets a default-constructed
-    /// (empty) :struct:`CallArgs`. The caller pays for the rust-side
-    /// kwarg walk only when ``extract_args = true``.
-    pub(crate) extract_args: bool,
-    pub(crate) results: Vec<(String, CallArgs)>,
-}
-
-impl<'ast, F> Visitor<'ast> for StringArgCallFinder<F>
-where
-    F: FnMut(&ruff_python_ast::ExprCall) -> bool,
-{
-    fn visit_expr(&mut self, expr: &'ast Expr) {
-        if let Expr::Call(call) = expr {
-            if (self.predicate)(call) {
-                if let Some(value) = nth_positional_string(call, self.arg_index) {
-                    let call_args = if self.extract_args {
-                        extract_call_kwargs(call)
-                    } else {
-                        CallArgs::default()
-                    };
-                    self.results.push((value, call_args));
-                }
-            }
-        }
-        walk_expr(self, expr);
-    }
-}
-
-/// Visit every Call expression in a subtree, capture string-literal
-/// args at ``arg_index`` for calls whose callee is ``<expr>.<attr>(...)``
-/// regardless of receiver shape. The captured arg can be a single
-/// string literal **or** a list/tuple of string literals (the latter
-/// produces multiple results for one call). Backs ``find_calls_on_attr``.
-///
-/// Each emitted row is ``(captured_string, CallArgs)``. Multiple rows
-/// from one call (list/tuple shape) share the same ``CallArgs``.
-pub(crate) struct AttrCallFinder<'a> {
-    pub(crate) attr: &'a str,
-    pub(crate) arg_index: usize,
-    /// See :struct:`StringArgCallFinder` — same gate.
-    pub(crate) extract_args: bool,
-    pub(crate) results: Vec<(String, CallArgs)>,
-}
-
-impl<'ast, 'a> Visitor<'ast> for AttrCallFinder<'a> {
-    fn visit_expr(&mut self, expr: &'ast Expr) {
-        if let Expr::Call(call) = expr {
-            if let Expr::Attribute(attribute) = unwrap_subscripted_callee(call.func.as_ref()) {
-                if attribute.attr.as_str() == self.attr {
-                    if let Some(arg) = call.arguments.args.get(self.arg_index) {
-                        let hits = string_or_string_collection(arg);
-                        if !hits.is_empty() {
-                            let call_args = if self.extract_args {
-                                extract_call_kwargs(call)
-                            } else {
-                                CallArgs::default()
-                            };
-                            for s in hits {
-                                self.results.push((s, call_args.clone()));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        walk_expr(self, expr);
-    }
-}
-
-/// Pull string-literal values out of either a single ``"..."`` or a
-/// homogeneous list/tuple of string literals. Non-string elements in a
-/// list/tuple are silently dropped; non-matching expressions yield an
-/// empty vec.
-fn string_or_string_collection(arg: &Expr) -> Vec<String> {
-    let lit = |e: &Expr| match e {
-        Expr::StringLiteral(s) => Some(s.value.to_str().to_string()),
-        _ => None,
-    };
-    match arg {
-        Expr::StringLiteral(s) => vec![s.value.to_str().to_string()],
-        Expr::List(list) => list.elts.iter().filter_map(lit).collect(),
-        Expr::Tuple(tup) => tup.elts.iter().filter_map(lit).collect(),
-        _ => Vec::new(),
-    }
 }
 
 pub(crate) fn rel_path<P: AsRef<str>>(path: P) -> RelativePathBuf {
@@ -2280,32 +1729,7 @@ mod tests {
         assert!(top_level_assign_to_name(&stmts[0]).is_none());
     }
 
-    // -- class_body_defines_method -----------------------------------------
-
-    #[test]
-    fn class_body_defines_method_finds_named_method() {
-        let stmts = parse_stmts("class C:\n    def m(self): pass\n    def n(self): pass\n");
-        let cls = match &stmts[0] {
-            Stmt::ClassDef(c) => c,
-            _ => unreachable!(),
-        };
-        assert!(class_body_defines_method(cls, "m"));
-        assert!(class_body_defines_method(cls, "n"));
-        assert!(!class_body_defines_method(cls, "missing"));
-    }
-
-    #[test]
-    fn class_body_defines_method_ignores_non_function_members() {
-        let stmts = parse_stmts("class C:\n    x = 1\n    class Inner: pass\n");
-        let cls = match &stmts[0] {
-            Stmt::ClassDef(c) => c,
-            _ => unreachable!(),
-        };
-        assert!(!class_body_defines_method(cls, "x"));
-        assert!(!class_body_defines_method(cls, "Inner"));
-    }
-
-    // -- nth_positional_string --------------------------------------------
+    // -- first_call: shared call-parsing helper for the call-target tests --
 
     fn first_call(source: &str) -> ruff_python_ast::ExprCall {
         let expr = parse_expr(source);
@@ -2313,64 +1737,6 @@ mod tests {
             Expr::Call(c) => c,
             _ => panic!("expected a call expression"),
         }
-    }
-
-    #[test]
-    fn nth_positional_string_returns_literal_value() {
-        let call = first_call("f('hello', 'world')");
-        assert_eq!(nth_positional_string(&call, 0), Some("hello".to_string()));
-        assert_eq!(nth_positional_string(&call, 1), Some("world".to_string()));
-    }
-
-    #[test]
-    fn nth_positional_string_returns_none_for_non_string() {
-        let call = first_call("f(42, foo)");
-        assert_eq!(nth_positional_string(&call, 0), None);
-        assert_eq!(nth_positional_string(&call, 1), None);
-    }
-
-    #[test]
-    fn nth_positional_string_out_of_range_returns_none() {
-        let call = first_call("f('a')");
-        assert_eq!(nth_positional_string(&call, 5), None);
-    }
-
-    #[test]
-    fn nth_positional_string_rejects_f_string() {
-        // f-strings are not StringLiteral nodes — should be rejected.
-        let call = first_call("f(f'value-{x}')");
-        assert_eq!(nth_positional_string(&call, 0), None);
-    }
-
-    // -- call_callee_matches_var ------------------------------------------
-
-    #[test]
-    fn call_callee_matches_var_matches_owner_attr() {
-        let call = first_call("mocker.patch('x')");
-        assert!(call_callee_matches_var(&call, "mocker", "patch", None));
-        assert!(call_callee_matches_var(&call, "mocker", "patch", Some(1)));
-        assert!(!call_callee_matches_var(&call, "mocker", "patch", Some(2)));
-    }
-
-    #[test]
-    fn call_callee_matches_var_rejects_wrong_owner_or_attr() {
-        let call = first_call("mocker.patch('x')");
-        assert!(!call_callee_matches_var(&call, "other", "patch", None));
-        assert!(!call_callee_matches_var(&call, "mocker", "spy", None));
-    }
-
-    #[test]
-    fn call_callee_matches_var_rejects_non_attribute_callee() {
-        let call = first_call("f('x')");
-        assert!(!call_callee_matches_var(&call, "f", "patch", None));
-    }
-
-    #[test]
-    fn call_callee_matches_var_rejects_chained_receiver() {
-        // ``a.b.patch(...)`` has ``a.b`` (Attribute) as the receiver, not
-        // a bare Name — should not match.
-        let call = first_call("a.b.patch('x')");
-        assert!(!call_callee_matches_var(&call, "b", "patch", None));
     }
 
     // -- range_key ---------------------------------------------------------

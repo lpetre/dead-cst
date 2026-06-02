@@ -1,13 +1,11 @@
 //! Shared per-file scan helpers for the native query surface.
 //!
-//! What remains here after the chainable `query()` DSL was retired:
-//! the identifier prefilter (`_contains_identifier` and friends) that
-//! lets a per-file walk skip the parse on files that don't even
-//! mention the target name, the `_path_re_matches` path-scoping check,
-//! and `par_scan_files` — the generic GIL-free parallel per-file walk
-//! that every `find_*` query on [`crate::project::ProjectContext`]
-//! drives. These are pure-rust, Salsa-snapshot-based, and shared by
-//! `project.rs` and `helpers.rs`.
+//! What remains here after the chainable `query()` DSL was retired and
+//! the `find_*` queries moved onto the cached per-file payloads: the
+//! identifier prefilter (`_contains_identifier` and friends) that lets a
+//! per-file walk skip the parse on files that don't even mention the
+//! target name, and the `_path_re_matches` path-scoping check. These are
+//! pure-rust, Salsa-snapshot-based, and shared by `project.rs`.
 
 use ruff_db::files::File;
 use ty_project::Db as ProjectDb;
@@ -67,51 +65,6 @@ pub(crate) fn _is_ident_continue(byte: u8) -> bool {
 /// per-file prefilter passes when the file mentions any of them.
 pub(crate) fn _contains_any_identifier(source: &str, needles: &[&str]) -> bool {
     needles.iter().any(|n| _contains_identifier(source, n))
-}
-
-/// Generic parallel per-file walk. ``per_file`` runs on a Salsa
-/// snapshot of ``db`` (one ``Db::dyn_clone`` per worker, mirroring
-/// the ty_ide find_references pattern at
-/// ``vendor/ruff/crates/ty_ide/src/references.rs:107-130``) and
-/// returns a ``Vec<T>`` of opaque per-file results.
-///
-/// Caller is responsible for releasing the GIL with
-/// :meth:`pyo3::Python::allow_threads` — the closure passed in must
-/// be ``Send + Sync`` and ``T`` must be ``Send``. Materializing
-/// ``Py<SymbolNode>`` values (which are GIL-bound) belongs in the
-/// caller AFTER ``allow_threads`` returns.
-pub(crate) fn par_scan_files<T, F>(
-    db: Box<dyn ProjectDb>,
-    files: &[File],
-    path_re: &Option<regex::Regex>,
-    per_file: F,
-) -> Vec<T>
-where
-    T: Send,
-    F: Fn(&dyn ProjectDb, File) -> Vec<T> + Send + Sync,
-{
-    let result = std::sync::Mutex::new(Vec::<T>::new());
-    let per_file_ref = &per_file;
-    let result_ref = &result;
-    // `move` captures `db: Box<dyn ProjectDb>` by value — `dyn Db`
-    // has a `Send` supertrait via `salsa::Database`, so the box is
-    // Send, but `&dyn Db` is NOT Send (the trait isn't Sync), which
-    // is why the box can't be borrowed across the rayon scope.
-    rayon::scope(move |s| {
-        for &file in files {
-            if !_path_re_matches(path_re, &*db, file) {
-                continue;
-            }
-            let db_t: Box<dyn ProjectDb> = ProjectDb::dyn_clone(&*db);
-            s.spawn(move |_| {
-                let local = per_file_ref(&*db_t, file);
-                if !local.is_empty() {
-                    result_ref.lock().unwrap().extend(local);
-                }
-            });
-        }
-    });
-    result.into_inner().unwrap_or_default()
 }
 
 #[cfg(test)]

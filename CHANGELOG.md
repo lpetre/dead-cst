@@ -198,9 +198,45 @@ two versions.
   / `--extern regex` from a curated allowlist so a plugin can `use
   serde_json::Value;` / `use regex::Regex;` out of the box. The rest of the
   runtime's private dependency tree is intentionally not exposed.
+- **`Analysis.set_stack_size(bytes)` for deeply-nested ASTs.** Overrides the
+  rayon worker-thread stack size for *both* the per-file populate fan-out and
+  the project-wide plugin pass (the class-hierarchy re-walks subclass resolution
+  drives recurse as deep as file ingest). Call it before `materialize_all()`;
+  with no override both phases use rayon's default stack (2 MiB unless
+  `RAYON_STACK_SIZE` / `RUST_MIN_STACK` is set process-wide), which suffices for
+  typical code. Use it on projects with deeply-nested generated code (protobuf
+  modules, ML-generated ASTs, large nested literal dicts) that stack-overflow at
+  the default — the size is virtual address space, so a large value costs no
+  resident memory unless actually used.
 
 ### Changed
 
+- **Per-file parsed ASTs are freed mid-build to cut the memory peak.** The
+  project-wide plugin queries that used to re-walk each file's AST (parameters,
+  class-defining-method, decorators, constructions, factories, and the
+  call-site family) now read precomputed per-file facts from a salsa-cached
+  `FileExtraction`, warmed during the per-file fan-out alongside the existing
+  node/edge payloads. Once a file's payloads, `FileExtraction`, and per-file
+  plugins are computed, its parsed AST is dropped (`ParsedModule::clear`)
+  instead of staying resident through assembly and the project-wide plugin
+  pass. On a 250-file synthetic project this takes the parsed-AST salsa heap
+  from ~5 MB to ~0 at build-end (~30% of total salsa memory). Subclass
+  resolution no longer re-parses **and no longer runs ty's `find_references`
+  walk at all**: each file captures its module-level name bindings during
+  the fan-out, and every class base — just a name, bound one of four ways
+  (local class, explicit import, `from … import *`, or a module-level alias
+  `Base = Imported`) — resolves through that one uniform binder ladder. The
+  import table reads each `from … import` statement's leading-dot level, so
+  *relative* re-exports (`from .bases import TestCase`) resolve to the same
+  terminal class as absolute ones. At assemble time the per-file bindings fold
+  into a project-wide alias/re-export chain that is chased cross-file to each
+  base's terminal class, so subclasses reached through a star import, a
+  module-level alias, or an absolute *or* relative re-export now resolve
+  statically from those cached facts — no on-demand AST reload, no env-var
+  fallback. The memory and no-re-parse mechanics are results-neutral; the one
+  behavioral change is that the static chase now keeps star-import /
+  module-alias / re-export subclasses alive where the default path previously
+  dropped them.
 - **Built-in plugins are migrating to native (Rust) implementations.**
   The `main_block`, `module_dunders`, `init_subclass`, `server_config`,
   and `unittest` built-ins now resolve to native `NativePlugin`
@@ -272,6 +308,10 @@ two versions.
 
 ### Removed
 
+- `ProjectContext.find_comment_patterns(pattern)` (the regex-over-comments
+  query) and its `_native.pyi` stub. It had no in-tree callers and was the last
+  graph query that re-parsed files on demand after the build; removing it drops
+  that re-parse path entirely.
 - The Python `ServerConfigPlugin` (`dead_cst.contrib.ServerConfigPlugin`).
   `server_config` is now native-only: use `NativePlugin.server_config()` (the
   CLI's `server_config` key already resolves to it), passing `filenames=[…]`

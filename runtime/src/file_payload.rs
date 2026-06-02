@@ -43,7 +43,7 @@ use crate::helpers::{
     module_fqname_for_file, position, range_key, resolve_base_fqn, scan_noqa_directives,
     NODE_FLAGS_NOQA_PIN,
 };
-use crate::ingest::{decl_kind_str, from_module_string};
+use crate::ingest::{decl_kind_str, file_package_name, from_module_string};
 
 /// Stable handle for a graph node, used as the public identity across
 /// the fan-out pipeline. Edge endpoints in `file_to_edges` are
@@ -234,6 +234,11 @@ pub(crate) struct ImportPayload {
 ///   walk. Same-file `LocalSameFileClass(local_idx)` bases reference
 ///   the file's own `refs[local_idx]`; assemble translates them via
 ///   the same `NodeRef -> global_idx` map used for edges.
+/// * `name_bindings` — per module-level name → how it's bound
+///   ([`NameBinding`]): local class, import, star import, or module
+///   alias. The single uniform ladder `build_class_bases` resolves every
+///   class base through, and the source the assemble pass folds into the
+///   project-wide re-export / alias chain.
 /// * `overload_anchors` — `(impl_local_idx, stub_local_idx)` pairs for
 ///   in-file `@typing.overload` groups. The assembly pass emits one
 ///   `impl → stub` edge per pair so reachability propagates from a
@@ -249,6 +254,7 @@ pub(crate) struct FileNodes<'db> {
     pub(crate) exports_by_name: FxHashMap<String, SmallVec<[u32; 2]>>,
     pub(crate) star_reexports: FxHashMap<String, String>,
     pub(crate) class_bases: Vec<ClassBaseEntry>,
+    pub(crate) name_bindings: FxHashMap<String, NameBinding>,
     pub(crate) overload_anchors: Box<[(u32, u32)]>,
 }
 
@@ -292,6 +298,37 @@ pub(crate) enum ResolvedBase {
         attr_name: String,
     },
     Unresolvable,
+}
+
+/// How a module-level name is bound in a single file, captured while the
+/// AST is hot in [`file_to_nodes`]. A class base is "just a name", and a
+/// module-scope name is bound exactly one of four ways; capturing all
+/// four (rather than only imports + same-file classes) means a base is
+/// never silently dropped — star-imported and module-aliased bases
+/// resolve through the same uniform ladder as direct imports.
+///
+/// The assemble pass folds these into a project-wide `{module}.{name} ->
+/// next_fqn` chain (see `build_class_hierarchy_indices`), so a base that
+/// hops through one or more re-export / alias bindings across files is
+/// chased to its terminal class without re-parsing.
+///
+/// Ladder precedence when a name is bound more than once (a rare shadow):
+/// `LocalClass` > `Import` > `StarImport` > `ModuleAlias`.
+#[derive(Debug, Clone, Eq, PartialEq, Hash, salsa::Update, get_size2::GetSize)]
+pub(crate) enum NameBinding {
+    /// `class Name: ...` — a top-level class in this file. Local idx into
+    /// `refs`/`nodes` (the live binding; first wins on rebind).
+    LocalClass(u32),
+    /// `from m import Name [as Name]` / `import m [as Name]` — the
+    /// upstream fqn produced by [`collect_all_imports_local`].
+    Import(String),
+    /// `from m import *` brought `Name` in — the source module `m`. The
+    /// name resolves to `{m}.{Name}`.
+    StarImport(String),
+    /// `Name = Other` at module scope — an alias to another module-level
+    /// name `Other` in this file. Resolves to `{this_module}.{Other}`,
+    /// whose own binding continues the chain.
+    ModuleAlias(String),
 }
 
 /// Resolve a `NodeRef` to its `NodeData` payload.
@@ -450,7 +487,8 @@ pub(crate) fn file_to_nodes<'db>(db: &'db dyn ProjectDb, file: File) -> FileNode
     // function's name TextRange (which is what `DefinitionKind::Function`
     // reports as its `target_range`), so we can flag the matching decl
     // when ty enumerates it below.
-    let local_imports = collect_all_imports_local(&parsed);
+    let file_package = file_package_name(db, file);
+    let local_imports = collect_all_imports_local(&parsed, file_package.as_deref());
     let mut overload_decorated: FxHashSet<TextRange> = FxHashSet::default();
     for stmt in &parsed.syntax().body {
         if let Stmt::FunctionDef(func) = stmt {
@@ -651,12 +689,21 @@ pub(crate) fn file_to_nodes<'db>(db: &'db dyn ProjectDb, file: File) -> FileNode
         }
     }
 
-    // Build per-file `class_bases`: walk every top-level ClassDef and
-    // resolve each base expression against the file's imports + the
-    // same-file class name table. No project-wide state needed; the
-    // assemble pass turns these into the global `children_by_node`
-    // index.
-    let class_bases = build_class_bases(&parsed, &exports_by_name, &nodes);
+    // Capture the module's name-binding table (all four binding kinds)
+    // while the AST is hot, then resolve every top-level class base
+    // against it through the uniform ladder. No project-wide state
+    // needed here; the assemble pass folds `name_bindings` into the
+    // cross-file re-export / alias chain and turns `class_bases` into the
+    // global `children_by_node` / `external_base_children` indices.
+    let file_imports = collect_all_imports_local(&parsed, file_package.as_deref());
+    let name_bindings = build_name_bindings(
+        &parsed,
+        &file_imports,
+        &star_reexports,
+        &exports_by_name,
+        &nodes,
+    );
+    let class_bases = build_class_bases(&parsed, &name_bindings, &file_imports, &nodes);
 
     FileNodes {
         nodes: nodes.into_boxed_slice(),
@@ -665,55 +712,105 @@ pub(crate) fn file_to_nodes<'db>(db: &'db dyn ProjectDb, file: File) -> FileNode
         exports_by_name,
         star_reexports,
         class_bases,
+        name_bindings,
         overload_anchors: overload_anchors.into_boxed_slice(),
     }
 }
 
-/// Per-file class-hierarchy producer used by [`file_to_nodes`].
+/// Capture every module-level name binding in `parsed` as a uniform
+/// [`NameBinding`] table — the per-file half of the "a class base is just
+/// a name" model. Built once while the AST is hot and stored in
+/// [`FileNodes::name_bindings`]; consumed by both [`build_class_bases`]
+/// (within-file base resolution) and the assemble pass (cross-file chain
+/// following).
 ///
-/// For each top-level `ClassDef`, locate its corresponding graph node
-/// (via `exports_by_name` + `nodes[..]` kind probe) and resolve each
-/// base expression to a [`ResolvedBase`]. The result is a flat list of
-/// `(local_class_idx, bases)` pairs the assemble pass folds into the
-/// project-wide hierarchy without re-parsing.
-///
-/// Resolution mirrors today's `build_class_children` + `resolve_base_fqn`
-/// helpers but reads everything from the per-file state:
-///
-/// * `Name(Foo)` where `Foo` is in `file_imports` → `ImportedFqn`.
-/// * `Name(Foo)` where `Foo` is a top-level class earlier in this
-///   file → `LocalSameFileClass(local_idx)`.
-/// * `Attribute(Name(M).N)` where `M` is in `file_imports` →
-///   `Attribute { module_fqn, attr_name: N }`.
-/// * Deeper `a.b.c.N` chains rooted at an import → flattened into
-///   `ImportedFqn("<a-upstream>.b.c.N")` (matches today's
-///   `resolve_base_fqn` behaviour for the `find_subclasses_via_bases`
-///   path).
-/// * Anything else → `ResolvedBase::Unresolvable`.
-fn build_class_bases(
+/// All four binding kinds are recorded so no base is dropped: module-level
+/// aliases (`Base = Other`), `from m import *` names, explicit imports,
+/// and same-file classes. Higher-precedence rungs overwrite lower ones
+/// (see [`NameBinding`]): local class > import > star import > module
+/// alias.
+fn build_name_bindings(
     parsed: &ruff_db::parsed::ParsedModuleRef,
+    file_imports: &FxHashMap<String, String>,
+    star_reexports: &FxHashMap<String, String>,
     exports_by_name: &FxHashMap<String, SmallVec<[u32; 2]>>,
     nodes: &[NodeData],
-) -> Vec<ClassBaseEntry> {
+) -> FxHashMap<String, NameBinding> {
     use ruff_python_ast::Expr;
-    let file_imports = collect_all_imports_local(parsed);
+    let mut out: FxHashMap<String, NameBinding> = FxHashMap::default();
 
-    // Build name → local class idx for same-file class references.
-    // Multiple top-level `class Foo` rebinds at the same name keep
-    // the *first* (matching the historical libcst behaviour where a
-    // syntactic base reference resolves to the lexically-earliest
-    // class with that name). The cross-module case is unaffected —
-    // `subclasses_of_fqn` indexes by fqname, so shadowed declarations
-    // resolve through the import path, not this map.
-    let mut same_file_classes: FxHashMap<&str, u32> = FxHashMap::default();
+    // Rung 4 (lowest): module-level aliases `Name = Other`. Only the
+    // simple single-`Name` target = single-`Name` value form is a base
+    // alias; richer right-hand sides (calls, conditionals, attributes)
+    // aren't class aliases and stay unbound here.
+    for stmt in &parsed.syntax().body {
+        if let Stmt::Assign(assign) = stmt {
+            if let ([Expr::Name(target)], Expr::Name(value)) =
+                (assign.targets.as_slice(), assign.value.as_ref())
+            {
+                out.insert(
+                    target.id.as_str().to_string(),
+                    NameBinding::ModuleAlias(value.id.as_str().to_string()),
+                );
+            }
+        }
+    }
+
+    // Rung 3: `from m import *` names → source module.
+    for (name, module) in star_reexports {
+        out.insert(name.clone(), NameBinding::StarImport(module.clone()));
+    }
+
+    // Rung 2: explicit imports → upstream fqn.
+    for (name, fqn) in file_imports {
+        out.insert(name.clone(), NameBinding::Import(fqn.clone()));
+    }
+
+    // Rung 1 (highest): same-file top-level classes. The first class
+    // binding for a name wins (matching the lexically-earliest rule the
+    // cross-module path relies on).
     for (name, locals) in exports_by_name {
         for &local_idx in locals {
             if matches!(nodes[local_idx as usize].kind, NodeKind::Class) {
-                same_file_classes.entry(name.as_str()).or_insert(local_idx);
+                out.insert(name.clone(), NameBinding::LocalClass(local_idx));
                 break;
             }
         }
     }
+
+    out
+}
+
+/// Per-file class-hierarchy producer used by [`file_to_nodes`].
+///
+/// For each top-level `ClassDef`, key on its name range and resolve every
+/// base expression to a [`ResolvedBase`]. The result is a flat list of
+/// `(name_range_key, bases)` pairs the assemble pass folds into the
+/// project-wide hierarchy without re-parsing.
+///
+/// A bare-name base resolves through the uniform binder ladder
+/// (`name_bindings`); an attribute base keeps the dedicated `Attribute`
+/// shape via `resolve_base_fqn`:
+///
+/// * `Name(Foo)` → whatever `Foo`'s [`NameBinding`] resolves to (local
+///   class, import fqn, `{star_module}.Foo`, or `{this_module}.{alias}`).
+/// * `Attribute(Name(M).N)` where `M` is in `file_imports` →
+///   `Attribute { module_fqn, attr_name: N }`.
+/// * Deeper `a.b.c.N` chains rooted at an import → flattened into
+///   `ImportedFqn("<a-upstream>.b.c.N")`.
+/// * Anything else → `ResolvedBase::Unresolvable`.
+fn build_class_bases(
+    parsed: &ruff_db::parsed::ParsedModuleRef,
+    name_bindings: &FxHashMap<String, NameBinding>,
+    file_imports: &FxHashMap<String, String>,
+    nodes: &[NodeData],
+) -> Vec<ClassBaseEntry> {
+    use ruff_python_ast::Expr;
+
+    // `nodes[0]` is always the synthetic module node; its fqname is this
+    // file's module fqn, needed to express a `Base = Other` alias as the
+    // chaseable fqn `{module}.{Other}`.
+    let module_fqn = nodes[0].fqname.as_str();
 
     let mut out: Vec<ClassBaseEntry> = Vec::new();
     for cls in iter_top_level_classes(parsed) {
@@ -728,55 +825,62 @@ fn build_class_bases(
         };
         let mut bases: SmallVec<[ResolvedBase; 2]> = SmallVec::new();
         for raw_base in &args.args {
-            // Unwrap `Foo[T]`, `Generic[T]`, `Protocol[T]`, etc.
-            // The original `build_class_children` matched these
-            // before the fqn-aware resolver ran; preserve that
-            // behaviour so subscripted generic bases still feed
-            // the class hierarchy.
+            // Unwrap `Foo[T]`, `Generic[T]`, `Protocol[T]`, etc. so a
+            // subscripted generic base still feeds the class hierarchy.
             let base = match raw_base {
                 Expr::Subscript(s) => s.value.as_ref(),
                 other => other,
             };
-            // First-pass: try the fqn-aware resolver. It returns an
-            // upstream fqname for Name/Attribute chains rooted at an
-            // imported name. For a single Attribute(Name(M).N) we
-            // override to the `Attribute` variant so the assemble pass
-            // can probe the target module's `exports_by_name` for the
-            // project-side class lookup.
-            if let Some(fqn) = resolve_base_fqn(base, &file_imports) {
-                match base {
-                    Expr::Attribute(a) => {
-                        if let Expr::Name(root) = a.value.as_ref() {
-                            if let Some(module_fqn) = file_imports.get(root.id.as_str()) {
-                                bases.push(ResolvedBase::Attribute {
-                                    module_fqn: module_fqn.clone(),
-                                    attr_name: a.attr.as_str().to_string(),
-                                });
-                                continue;
+            let resolved = match base {
+                // A bare-name base resolves through the uniform binder
+                // ladder. Star and alias bindings produce a chaseable fqn
+                // the assemble pass follows across files.
+                Expr::Name(name) => resolve_name_base(name.id.as_str(), name_bindings, module_fqn),
+                // An attribute base `M.N` rooted at an imported module
+                // keeps the dedicated `Attribute` shape so assemble can
+                // probe the target module's exports; a deeper chain keeps
+                // the flat fqn.
+                Expr::Attribute(a) => match resolve_base_fqn(base, file_imports) {
+                    Some(fqn) => match a.value.as_ref() {
+                        Expr::Name(root) if file_imports.contains_key(root.id.as_str()) => {
+                            ResolvedBase::Attribute {
+                                module_fqn: file_imports[root.id.as_str()].clone(),
+                                attr_name: a.attr.as_str().to_string(),
                             }
                         }
-                        // Deeper chains: keep the flat fqn — used by
-                        // the fqn-keyed lookup.
-                        bases.push(ResolvedBase::ImportedFqn(fqn));
-                    }
-                    _ => {
-                        bases.push(ResolvedBase::ImportedFqn(fqn));
-                    }
-                }
-                continue;
-            }
-            // Fallback: same-file bare-name class reference.
-            if let Expr::Name(name) = base {
-                if let Some(&local_idx) = same_file_classes.get(name.id.as_str()) {
-                    bases.push(ResolvedBase::LocalSameFileClass(local_idx));
-                    continue;
-                }
-            }
-            bases.push(ResolvedBase::Unresolvable);
+                        _ => ResolvedBase::ImportedFqn(fqn),
+                    },
+                    None => ResolvedBase::Unresolvable,
+                },
+                _ => ResolvedBase::Unresolvable,
+            };
+            bases.push(resolved);
         }
         out.push((cls_rk, bases));
     }
     out
+}
+
+/// Resolve a bare-name class base through the uniform binder ladder.
+/// `LocalClass` → same-file class; `Import` → upstream fqn; `StarImport`
+/// → `{module}.{name}`; `ModuleAlias` → `{this_module}.{other}` (chased
+/// across files at assemble). An unbound name is `Unresolvable`.
+fn resolve_name_base(
+    name: &str,
+    name_bindings: &FxHashMap<String, NameBinding>,
+    module_fqn: &str,
+) -> ResolvedBase {
+    match name_bindings.get(name) {
+        Some(NameBinding::LocalClass(idx)) => ResolvedBase::LocalSameFileClass(*idx),
+        Some(NameBinding::Import(fqn)) => ResolvedBase::ImportedFqn(fqn.clone()),
+        Some(NameBinding::StarImport(module)) => {
+            ResolvedBase::ImportedFqn(format!("{module}.{name}"))
+        }
+        Some(NameBinding::ModuleAlias(other)) => {
+            ResolvedBase::ImportedFqn(format!("{module_fqn}.{other}"))
+        }
+        None => ResolvedBase::Unresolvable,
+    }
 }
 
 /// Pure-rust variant of `ingest::import_payload_for`. Returns the same

@@ -1058,19 +1058,6 @@ class ProjectContext:
         """
         ...
 
-    # ----- Comment-driven patterns --------------------------------------
-
-    def find_comment_patterns(self, pattern: str) -> list[tuple[SymbolNode, str]]:
-        """``(decl_node, comment_text)`` for every comment in the
-        project matching ``pattern`` (a regex), paired with the next
-        declaration that follows it in the same file.
-
-        Comments are scanned from the parser's ``Tokens`` stream (no
-        re-lexing); regex matching is full-text against the comment
-        content (leading ``#`` included).
-        """
-        ...
-
     # ----- Read-only graph accessors ------------------------------------
 
     def nodes(self) -> list[SymbolNode]:
