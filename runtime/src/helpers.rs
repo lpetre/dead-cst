@@ -97,183 +97,6 @@ pub(crate) fn iter_top_level_classes(
     })
 }
 
-/// Find a top-level `StmtClassDef` whose name range equals `selection_range`.
-/// Return the top-level ``StmtClassDef`` (if any) that uses
-/// ``ref_range`` as one of its direct base-list arguments.
-///
-/// Used by the find_references-based subclass walk: each
-/// :func:`ty_ide::find_references` hit gives us a ``(File, range)``
-/// for a use of the seed class; if that range falls inside a top-level
-/// class's ``arguments.args`` list, the surrounding class is a direct
-/// subclass.
-///
-/// Note: this is a syntactic match (range containment), so a use of
-/// ``TestCase`` inside a parameterized generic base
-/// (``class X(SomeGeneric[TestCase]):``) will falsely flag ``X`` as a
-/// subclass of ``TestCase``. ty's :func:`type_hierarchy_subtypes`
-/// avoids that via real type inference; we trade that accuracy for
-/// the prefilter+rayon scan ty_ide's find_references provides.
-pub(crate) fn class_base_arg_owner(
-    parsed: &ParsedModuleRef,
-    ref_range: TextRange,
-) -> Option<&StmtClassDef> {
-    for stmt in &parsed.syntax().body {
-        let Stmt::ClassDef(class_def) = stmt else {
-            continue;
-        };
-        let Some(arguments) = &class_def.arguments else {
-            continue;
-        };
-        for arg in &arguments.args {
-            if arg.range().contains_range(ref_range) {
-                return Some(class_def);
-            }
-        }
-    }
-    None
-}
-
-/// If ``ref_range`` covers the "original name" of an aliased
-/// ``from M import Name as Alias`` (or ``import M as Alias``), return
-/// the alias's local-binding name range so the BFS can follow the
-/// re-binding to its uses.
-///
-/// ty_ide's :func:`find_references` is designed for IDE rename
-/// semantics: it does NOT follow aliased imports across the
-/// re-binding (renaming ``TestCase`` should not rename uses of
-/// ``TC`` from ``from unittest import TestCase as TC``). For our
-/// subclass walk we DO want the alias's uses — they're the
-/// subclasses we'd otherwise miss — so we seed the BFS with the
-/// alias's local name range and call find_references on that.
-pub(crate) fn aliased_import_local_name_range(
-    parsed: &ParsedModuleRef,
-    ref_range: TextRange,
-) -> Option<TextRange> {
-    for stmt in &parsed.syntax().body {
-        let aliases: &[ruff_python_ast::Alias] = match stmt {
-            Stmt::ImportFrom(import_from) => &import_from.names,
-            Stmt::Import(import) => &import.names,
-            _ => continue,
-        };
-        for alias in aliases {
-            let Some(asname) = &alias.asname else {
-                continue;
-            };
-            if alias.name.range() == ref_range {
-                return Some(asname.range());
-            }
-        }
-    }
-    None
-}
-
-/// Walk transitive subclasses of the seed class via
-/// :func:`ty_ide::find_references`, which carries an
-/// identifier-aware text prefilter and per-file rayon parallelism for
-/// free. Each find_references hit is filtered to "syntactically in a
-/// class base list"; matched classes seed the next round when
-/// ``transitive`` is set.
-///
-/// Returns ``Vec<usize>`` of indices into
-/// ``BuildOutputs::builder.nodes`` (only project classes — typeshed
-/// / external matches are dropped because they don't have a
-/// :attr:`class_by_selection` entry).
-#[allow(dead_code)]
-pub(crate) fn find_subclass_indices_via_refs(
-    db: &ProjectDatabase,
-    outputs: &BuildOutputs,
-    seed_file: File,
-    seed_name_range: TextRange,
-    transitive: bool,
-) -> Vec<usize> {
-    find_subclass_indices_via_refs_with_queue(
-        db,
-        &outputs.class_by_selection,
-        vec![(seed_file, seed_name_range)],
-        &[],
-        transitive,
-    )
-}
-
-/// Lower-level entry point for [`find_subclass_indices_via_refs`] that
-/// takes a pre-built initial BFS queue + a "pre-found" set of direct
-/// subclasses and just the ``class_by_selection`` index. Used by
-/// [`find_subclasses`](crate::project::ProjectContext::find_subclasses)
-/// after the fast-path parallel scan has produced the first-hop
-/// frontier from an external seed.
-///
-/// ``prefound_direct_subclasses`` is the list of
-/// ``(File, class_name_range)`` pairs the fast path already classified
-/// as direct subclasses; they're recorded as hits up-front *and*
-/// seeded into the BFS so transitive subclasses + alias chains are
-/// still walked through find_references. ``initial_queue`` is the
-/// remaining seeds to run find_references on (typically the original
-/// external seed range, so re-exports through project modules / star
-/// imports are still caught).
-pub(crate) fn find_subclass_indices_via_refs_with_queue(
-    db: &dyn ProjectDb,
-    class_by_selection: &FxHashMap<(File, (u32, u32)), usize>,
-    initial_queue: Vec<(File, TextRange)>,
-    prefound_direct_subclasses: &[(File, TextRange)],
-    transitive: bool,
-) -> Vec<usize> {
-    let mut out_idx: FxHashSet<usize> = FxHashSet::default();
-    let mut visited_seeds: FxHashSet<(File, (u32, u32))> = FxHashSet::default();
-    let mut queue: Vec<(File, TextRange)> = initial_queue;
-
-    // Record the fast-path direct subclasses as hits up-front. When
-    // transitive=true also seed the BFS with them so subclasses of
-    // these local classes get walked through find_references.
-    for &(f, r) in prefound_direct_subclasses {
-        let key = (f, range_key(r));
-        if let Some(&idx) = class_by_selection.get(&key) {
-            if out_idx.insert(idx) && transitive {
-                queue.push((f, r));
-            }
-        }
-    }
-
-    while let Some((cur_file, cur_range)) = queue.pop() {
-        if !visited_seeds.insert((cur_file, range_key(cur_range))) {
-            continue;
-        }
-        // Cursor offset inside the identifier (start can sit on the
-        // token boundary and ty_ide's tokens.at_offset has edge-cases
-        // there). Anywhere inside the identifier resolves the same
-        // goto target.
-        let offset =
-            cur_range.start() + ruff_text_size::TextSize::from(u32::from(cur_range.len()) / 2);
-        // Pass include_declaration=true: skip-declaration mode filters
-        // out re-binding declarations like `from M import Name as Alias`
-        // alongside the seed itself. We need that import-line entry to
-        // detect the alias and recurse, so we take the full list and
-        // drop the seed in class_base_arg_owner / via the visited_seeds
-        // dedup.
-        let Some(refs) = ty_ide::find_references(db, cur_file, offset, true) else {
-            continue;
-        };
-        for r in refs {
-            let r_file = r.file();
-            let r_range = r.range();
-            let parsed = parsed_module(db, r_file).load(db);
-            if let Some(class_def) = class_base_arg_owner(&parsed, r_range) {
-                let class_name_range = class_def.name.range();
-                let key = (r_file, range_key(class_name_range));
-                let Some(&idx) = class_by_selection.get(&key) else {
-                    continue;
-                };
-                if out_idx.insert(idx) && transitive {
-                    queue.push((r_file, class_name_range));
-                }
-            } else if let Some(alias_range) = aliased_import_local_name_range(&parsed, r_range) {
-                queue.push((r_file, alias_range));
-            }
-        }
-    }
-
-    out_idx.into_iter().collect()
-}
-
 /// Find a top-level ``StmtClassDef`` by its bound name.
 pub(crate) fn class_def_named<'a>(
     parsed: &'a ParsedModuleRef,
@@ -473,27 +296,41 @@ pub(crate) fn resolve_base_fqn(
 /// Mappings produced:
 /// * ``from foo.bar import Baz`` → ``"Baz" -> "foo.bar.Baz"``
 /// * ``from foo.bar import Baz as B`` → ``"B" -> "foo.bar.Baz"``
+/// * ``from .bases import Baz`` (in package ``pkg``) →
+///   ``"Baz" -> "pkg.bases.Baz"`` — relative dots are resolved against
+///   ``file_package`` via ``im.level``. ``file_package`` is the
+///   importing file's enclosing package (``None`` for a top-level
+///   module, in which case a relative import is dropped).
 /// * ``import foo`` → ``"foo" -> "foo"``
 /// * ``import foo.bar as fb`` → ``"fb" -> "foo.bar"``
 /// * ``import foo.bar`` → ``"foo" -> "foo"`` (Python binds the
 ///   leftmost segment; the runtime module ``foo`` is what the name
 ///   resolves to).
-pub(crate) fn collect_all_imports_local(parsed: &ParsedModuleRef) -> FxHashMap<String, String> {
+pub(crate) fn collect_all_imports_local(
+    parsed: &ParsedModuleRef,
+    file_package: Option<&str>,
+) -> FxHashMap<String, String> {
     let mut out: FxHashMap<String, String> = FxHashMap::default();
     for stmt in &parsed.syntax().body {
         match stmt {
             Stmt::ImportFrom(im) => {
-                let Some(mod_name) = &im.module else { continue };
-                let module = mod_name.as_str();
+                // Resolve the source module to an absolute dotted path.
+                // `im.module` is only the suffix after the dots; the dot
+                // count lives in `im.level`, so a relative re-export like
+                // `from .bases import TestCase` resolves against the
+                // importing file's package instead of being mis-keyed to
+                // a bogus top-level `bases.TestCase`.
+                let tail = im.module.as_ref().map(|n| n.as_str()).unwrap_or("");
+                let module = if im.level == 0 {
+                    (!tail.is_empty()).then(|| tail.to_string())
+                } else {
+                    resolve_relative_import(im.level, tail, file_package)
+                };
+                let Some(module) = module else { continue };
                 for alias in &im.names {
                     let target = alias.name.as_str();
                     let local = alias.asname.as_ref().map(|n| n.as_str()).unwrap_or(target);
-                    let upstream = if module.is_empty() {
-                        target.to_string()
-                    } else {
-                        format!("{module}.{target}")
-                    };
-                    out.insert(local.to_string(), upstream);
+                    out.insert(local.to_string(), format!("{module}.{target}"));
                 }
             }
             Stmt::Import(im) => {

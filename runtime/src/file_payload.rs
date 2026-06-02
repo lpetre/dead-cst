@@ -43,7 +43,7 @@ use crate::helpers::{
     module_fqname_for_file, position, range_key, resolve_base_fqn, scan_noqa_directives,
     NODE_FLAGS_NOQA_PIN,
 };
-use crate::ingest::{decl_kind_str, from_module_string};
+use crate::ingest::{decl_kind_str, file_package_name, from_module_string};
 
 /// Stable handle for a graph node, used as the public identity across
 /// the fan-out pipeline. Edge endpoints in `file_to_edges` are
@@ -487,7 +487,8 @@ pub(crate) fn file_to_nodes<'db>(db: &'db dyn ProjectDb, file: File) -> FileNode
     // function's name TextRange (which is what `DefinitionKind::Function`
     // reports as its `target_range`), so we can flag the matching decl
     // when ty enumerates it below.
-    let local_imports = collect_all_imports_local(&parsed);
+    let file_package = file_package_name(db, file);
+    let local_imports = collect_all_imports_local(&parsed, file_package.as_deref());
     let mut overload_decorated: FxHashSet<TextRange> = FxHashSet::default();
     for stmt in &parsed.syntax().body {
         if let Stmt::FunctionDef(func) = stmt {
@@ -694,7 +695,7 @@ pub(crate) fn file_to_nodes<'db>(db: &'db dyn ProjectDb, file: File) -> FileNode
     // needed here; the assemble pass folds `name_bindings` into the
     // cross-file re-export / alias chain and turns `class_bases` into the
     // global `children_by_node` / `external_base_children` indices.
-    let file_imports = collect_all_imports_local(&parsed);
+    let file_imports = collect_all_imports_local(&parsed, file_package.as_deref());
     let name_bindings = build_name_bindings(
         &parsed,
         &file_imports,

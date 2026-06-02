@@ -35,8 +35,8 @@ use crate::file_payload::{file_to_edges, file_to_nodes, FileEdges, NodeKind, Nod
 use crate::file_ref_edges::{file_to_ref_edges, FileRefEdges};
 use crate::graph::{intern_kind, DeclIndex, NativeGraph, SymbolNode};
 use crate::helpers::{
-    file_path_string, find_subclass_indices_via_refs_with_queue, is_dunder_name, locate_class_seed,
-    rel_path, CallArgs, MODULE_ALIAS_MARKER, NODE_FLAG_ENTRYPOINT,
+    file_path_string, is_dunder_name, locate_class_seed, rel_path, CallArgs, MODULE_ALIAS_MARKER,
+    NODE_FLAG_ENTRYPOINT,
 };
 use crate::ingest::emit_visitor_warning;
 use crate::progress::{
@@ -157,10 +157,9 @@ pub(crate) struct BuildOutputs {
     ///
     /// Lets ``UnittestPlugin`` / ``InitSubclassPlugin`` do an O(N) BFS
     /// over this map instead of calling ``find_references`` per class.
-    /// External seeds (e.g. ``unittest.TestCase``) still need
-    /// ``find_subclass_indices_via_refs`` for the first hop into the
-    /// project; once a project class is found, transitive walks use
-    /// this map.
+    /// External seeds (e.g. ``unittest.TestCase``) get their first hop
+    /// into the project from the cached ``external_base_children`` index;
+    /// once a project class is found, transitive walks use this map.
     pub(crate) children_by_node: FxHashMap<usize, Vec<usize>>,
     /// External base fqn (e.g. ``"unittest.TestCase"``) -> direct
     /// subclass class graph idxs. Derived in the same
@@ -172,10 +171,9 @@ pub(crate) struct BuildOutputs {
     /// per-file payloads, instead of a full re-parse over every project
     /// file. Re-export / alias chains through project modules are folded
     /// in statically by `chase_base_fqn` (which walks the per-file
-    /// `name_bindings`), so a subclass reached only through a re-export is
-    /// keyed here under the terminal external fqn. The `find_references`
-    /// walk is now only an opt-in fallback for chains the static ladder
-    /// can't see (`DEAD_CST_SUBCLASS_REF_FALLBACK`).
+    /// `name_bindings`, resolving explicit, star, alias, and relative
+    /// re-export rungs), so a subclass reached only through a re-export is
+    /// keyed here under the terminal external fqn.
     pub(crate) external_base_children: FxHashMap<String, Vec<usize>>,
 }
 
@@ -384,12 +382,13 @@ pub(crate) fn build_project_graph(
                             // parsed AST rather than let it sit resident
                             // through assembly and the project-wide plugin
                             // pass — that's the memory win. Assembly, fqname,
-                            // and class-hierarchy read only the cached
-                            // payloads, never the AST. The gated re-export
-                            // fallback in subclass resolution can still reload a
-                            // file on demand through ty's `find_references`, so
-                            // only that subset re-materializes; the
-                            // all-ASTs-resident peak never forms.
+                            // and the class hierarchy read only the cached
+                            // payloads (`name_bindings`, `external_base_children`,
+                            // `children_by_node`), never the AST, so the
+                            // all-ASTs-resident peak never forms. Subclass
+                            // resolution can still pull an individual file's AST
+                            // back on demand to relocate a class seed; that rare
+                            // reload is re-cleared right after the plugin pass.
                             parsed_module(local_db, file).clear();
                         });
                         db_tx.send(local_db).expect("channel open");
@@ -1845,9 +1844,11 @@ impl ProjectContext {
         counters.mark_finished();
         plugin_result?;
 
-        // The plugin pass can reload individual files on demand (the gated
-        // re-export fallback in subclass resolution walks ty's
-        // `find_references`), repopulating those files' salsa `parsed_module`
+        // The plugin pass can still reload individual files on demand:
+        // subclass resolution's `locate_class_seed` / `follow_class_through_module`
+        // chase calls `parsed_module(..).load()` to relocate a class seed (and
+        // follow its re-export chain) when the base resolves to a file rather
+        // than a cached decl, repopulating those files' salsa `parsed_module`
         // slots. Clear them again so the post-build resident set stays at the
         // lean post-populate level instead of creeping back up — the same
         // memory win `build_project_graph`'s populate phase secures.
@@ -3439,15 +3440,13 @@ fn find_classes_defining_method_indices_core(
 
 /// Subclasses of the class addressed by ``base_fqn`` (project or
 /// external seed). Takes an owned ``ProjectDatabase`` so it can resolve
-/// the seed serially (``locate_class_seed`` needs a concrete db) and, when
-/// opted in, run the ``find_references`` re-export fallback. A project
-/// seed walks the cached ``children_by_node`` index directly; an external
-/// seed reads its direct project subclasses from the cached
+/// the seed serially (``locate_class_seed`` needs a concrete db). A
+/// project seed walks the cached ``children_by_node`` index directly; an
+/// external seed reads its direct project subclasses from the cached
 /// ``external_base_children`` index (no re-parse — re-export / alias
-/// chains are now resolved statically into that index by
-/// ``chase_base_fqn``). The ``find_references`` walk is an opt-in fallback
-/// (``DEAD_CST_SUBCLASS_REF_FALLBACK``) for chains the static ladder can't
-/// see. See ``FrozenView::find_subclasses_indices`` for the fast/slow-path
+/// chains, including relative re-exports, are resolved statically into
+/// that index by ``chase_base_fqn``). See
+/// ``FrozenView::find_subclasses_indices`` for the fast/slow-path
 /// rationale.
 fn find_subclasses_indices_core(
     db: ProjectDatabase,
@@ -3475,34 +3474,14 @@ fn find_subclasses_indices_core(
     // project subclasses are cached in `external_base_children` (folded
     // from the per-file `class_bases` payloads — no re-parse). Re-export /
     // alias chains that bind the external class through one or more
-    // project modules are now resolved statically by `chase_base_fqn` at
-    // assemble time, so they too land in `external_base_children` without
-    // a walk.
-    let mut direct: FxHashSet<usize> = outputs
+    // project modules — including relative re-exports — are resolved
+    // statically by `chase_base_fqn` at assemble time, so they too land in
+    // `external_base_children`.
+    let direct: FxHashSet<usize> = outputs
         .external_base_children
         .get(base_fqn)
         .map(|idxs| idxs.iter().copied().collect())
         .unwrap_or_default();
-    // Opt-in `find_references` fallback. The cached index above covers
-    // every statically-resolvable subclass; the ref walk additionally
-    // catches chains ty's resolver reaches but the static binder ladder
-    // can't (e.g. relative-import or conditional re-exports). It re-parses
-    // on demand, so it is gated behind `DEAD_CST_SUBCLASS_REF_FALLBACK`
-    // and still only runs when some project file imports the seed module
-    // (otherwise there is provably no reference for the walk to find).
-    let ref_fallback = std::env::var_os("DEAD_CST_SUBCLASS_REF_FALLBACK").is_some();
-    let imports_seed_module = base_fqn
-        .rsplit_once('.')
-        .is_some_and(|(module, _)| outputs.imports_by_module.contains_key(module));
-    if ref_fallback && imports_seed_module {
-        direct.extend(find_subclass_indices_via_refs_with_queue(
-            &db,
-            &outputs.class_by_selection,
-            vec![(seed_file, seed_range)],
-            &[],
-            /*transitive=*/ false,
-        ));
-    }
     let mut out_idx: FxHashSet<usize> = direct.iter().copied().collect();
     if transitive {
         for &d in &direct {

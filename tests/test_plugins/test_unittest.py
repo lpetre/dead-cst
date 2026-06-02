@@ -310,12 +310,9 @@ def test_unittest_plugin_marks_three_level_subclass_chain(build_plugin_graph, re
     assert "tests.c.L3" in reached
 
 
-def test_unittest_plugin_marks_subclass_via_module_alias(
-    build_plugin_graph, reachable_fqnames, monkeypatch
-):
+def test_unittest_plugin_marks_subclass_via_module_alias(build_plugin_graph, reachable_fqnames):
     """A module-level alias of an imported ``TestCase`` (``Base = TestCase``)
-    resolves through the uniform binder ladder — no ``find_references`` walk."""
-    monkeypatch.delenv("DEAD_CST_SUBCLASS_REF_FALLBACK", raising=False)
+    resolves statically through the uniform binder ladder."""
     graph = build_plugin_graph(
         {
             "pkg/__init__.py": "",
@@ -333,28 +330,25 @@ def test_unittest_plugin_marks_subclass_via_module_alias(
     assert "pkg.things.MyThings" in reachable_fqnames(graph)
 
 
-def test_unittest_plugin_relative_reexport_needs_ref_fallback(
-    build_plugin_graph, reachable_fqnames, monkeypatch
+def test_unittest_plugin_marks_subclass_via_relative_reexport(
+    build_plugin_graph, reachable_fqnames
 ):
-    """A ``TestCase`` re-exported through a *relative* import can't be resolved
-    by the static binder ladder (``collect_all_imports_local`` doesn't apply
-    relative-import resolution), so the subclass is found only when the opt-in
-    ``DEAD_CST_SUBCLASS_REF_FALLBACK`` ``find_references`` walk is enabled."""
-    files = {
-        "pkg/__init__.py": "",
-        "pkg/bases.py": "from unittest import TestCase\n",
-        "pkg/things.py": """
-        from .bases import TestCase
+    """A ``TestCase`` re-exported through a *relative* import
+    (``from .bases import TestCase``) resolves statically: the binder ladder
+    reads ``im.level`` and resolves the dotted prefix against the importing
+    file's package, so the cross-file chase reaches the external seed with no
+    ``find_references`` walk."""
+    graph = build_plugin_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/bases.py": "from unittest import TestCase\n",
+            "pkg/things.py": """
+            from .bases import TestCase
 
-        class MyThings(TestCase):
-            def test_one(self): pass
-        """,
-    }
-
-    monkeypatch.delenv("DEAD_CST_SUBCLASS_REF_FALLBACK", raising=False)
-    reached_off = reachable_fqnames(build_plugin_graph(files, [native.NativePlugin.unittest()]))
-    assert "pkg.things.MyThings" not in reached_off
-
-    monkeypatch.setenv("DEAD_CST_SUBCLASS_REF_FALLBACK", "1")
-    reached_on = reachable_fqnames(build_plugin_graph(files, [native.NativePlugin.unittest()]))
-    assert "pkg.things.MyThings" in reached_on
+            class MyThings(TestCase):
+                def test_one(self): pass
+            """,
+        },
+        [native.NativePlugin.unittest()],
+    )
+    assert "pkg.things.MyThings" in reachable_fqnames(graph)

@@ -222,23 +222,21 @@ two versions.
   pass. On a 250-file synthetic project this takes the parsed-AST salsa heap
   from ~5 MB to ~0 at build-end (~30% of total salsa memory). Subclass
   resolution no longer re-parses **and no longer runs ty's `find_references`
-  walk by default**: each file captures its module-level name bindings during
+  walk at all**: each file captures its module-level name bindings during
   the fan-out, and every class base — just a name, bound one of four ways
   (local class, explicit import, `from … import *`, or a module-level alias
-  `Base = Imported`) — resolves through that one uniform binder ladder. At
-  assemble time the per-file bindings fold into a project-wide alias/re-export
-  chain that is chased cross-file to each base's terminal class, so subclasses
-  reached through a star import, a module-level alias, or an *absolute*
-  re-export now resolve statically from those cached facts. The
-  `find_references` re-export/alias walk — previously always run, and the one
-  remaining on-demand AST reloader — is now an opt-in fallback gated behind
-  `DEAD_CST_SUBCLASS_REF_FALLBACK`, needed only for bases re-exported through a
-  *relative* import (which the static import table doesn't resolve); only when
-  enabled can it pull a file's AST back in during the project-wide plugin pass.
-  The memory and no-re-parse mechanics are results-neutral; the one behavioral
-  change is that the static chase now keeps star-import / module-alias /
-  absolute-re-export subclasses alive where the default path previously dropped
-  them.
+  `Base = Imported`) — resolves through that one uniform binder ladder. The
+  import table reads each `from … import` statement's leading-dot level, so
+  *relative* re-exports (`from .bases import TestCase`) resolve to the same
+  terminal class as absolute ones. At assemble time the per-file bindings fold
+  into a project-wide alias/re-export chain that is chased cross-file to each
+  base's terminal class, so subclasses reached through a star import, a
+  module-level alias, or an absolute *or* relative re-export now resolve
+  statically from those cached facts — no on-demand AST reload, no env-var
+  fallback. The memory and no-re-parse mechanics are results-neutral; the one
+  behavioral change is that the static chase now keeps star-import /
+  module-alias / re-export subclasses alive where the default path previously
+  dropped them.
 - **Built-in plugins are migrating to native (Rust) implementations.**
   The `main_block`, `module_dunders`, `init_subclass`, `server_config`,
   and `unittest` built-ins now resolve to native `NativePlugin`
