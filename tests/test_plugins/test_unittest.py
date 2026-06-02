@@ -352,3 +352,46 @@ def test_unittest_plugin_marks_subclass_via_relative_reexport(
         [native.NativePlugin.unittest()],
     )
     assert "pkg.things.MyThings" in reachable_fqnames(graph)
+
+
+def test_unittest_plugin_marks_subclass_via_attribute_alias(build_plugin_graph, reachable_fqnames):
+    """A module-level alias whose RHS is an *attribute* on an imported module
+    (``Base = unittest.TestCase``) binds through the uniform binder ladder to
+    the absolute fqn, so ``class MyThings(Base)`` resolves its base."""
+    graph = build_plugin_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/things.py": """
+            import unittest
+
+            Base = unittest.TestCase
+
+            class MyThings(Base):
+                def test_one(self): pass
+            """,
+        },
+        [native.NativePlugin.unittest()],
+    )
+    assert "pkg.things.MyThings" in reachable_fqnames(graph)
+
+
+def test_unittest_plugin_marks_subclass_via_sibling_module_spelling(
+    build_plugin_graph, reachable_fqnames
+):
+    """A subclass spelled through the submodule (``from unittest.case import
+    TestCase``) is found even though the plugin queries the package spelling
+    (``unittest.TestCase``): both fqns resolve to the same class seed, so the
+    sibling fold collects the subclass keyed under either spelling."""
+    graph = build_plugin_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/things.py": """
+            from unittest.case import TestCase
+
+            class MyThings(TestCase):
+                def test_one(self): pass
+            """,
+        },
+        [native.NativePlugin.unittest()],
+    )
+    assert "pkg.things.MyThings" in reachable_fqnames(graph)

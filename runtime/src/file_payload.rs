@@ -739,20 +739,33 @@ fn build_name_bindings(
     use ruff_python_ast::Expr;
     let mut out: FxHashMap<String, NameBinding> = FxHashMap::default();
 
-    // Rung 4 (lowest): module-level aliases `Name = Other`. Only the
-    // simple single-`Name` target = single-`Name` value form is a base
-    // alias; richer right-hand sides (calls, conditionals, attributes)
-    // aren't class aliases and stay unbound here.
+    // Rung 4 (lowest): module-level aliases `Name = Other`. A single-`Name`
+    // target with a single-`Name` value (`Base = Other`) is a within-file
+    // alias; a target with an attribute value rooted at an imported module
+    // (`Base = mod.Class`) resolves to an absolute fqn just like
+    // `from mod import Class as Base`, so it binds as an `Import` rung.
+    // Richer right-hand sides (calls, conditionals) aren't class aliases
+    // and stay unbound here.
     for stmt in &parsed.syntax().body {
-        if let Stmt::Assign(assign) = stmt {
-            if let ([Expr::Name(target)], Expr::Name(value)) =
-                (assign.targets.as_slice(), assign.value.as_ref())
-            {
+        let Stmt::Assign(assign) = stmt else {
+            continue;
+        };
+        let [Expr::Name(target)] = assign.targets.as_slice() else {
+            continue;
+        };
+        match assign.value.as_ref() {
+            Expr::Name(value) => {
                 out.insert(
                     target.id.as_str().to_string(),
                     NameBinding::ModuleAlias(value.id.as_str().to_string()),
                 );
             }
+            Expr::Attribute(_) => {
+                if let Some(fqn) = resolve_base_fqn(assign.value.as_ref(), file_imports) {
+                    out.insert(target.id.as_str().to_string(), NameBinding::Import(fqn));
+                }
+            }
+            _ => {}
         }
     }
 

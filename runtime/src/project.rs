@@ -161,7 +161,8 @@ pub(crate) struct BuildOutputs {
     /// into the project from the cached ``external_base_children`` index;
     /// once a project class is found, transitive walks use this map.
     pub(crate) children_by_node: FxHashMap<usize, Vec<usize>>,
-    /// External base fqn (e.g. ``"unittest.TestCase"``) -> direct
+    /// Resolved external base class fqn (a base not present in
+    /// `decl_by_fqname`, e.g. ``unittest.TestCase``) -> direct
     /// subclass class graph idxs. Derived in the same
     /// `class_bases` fan-in as `children_by_node`, but keyed by the
     /// resolved *external* base fqn rather than a project node idx.
@@ -2546,20 +2547,36 @@ fn find_declarations_indices_in(outputs: &BuildOutputs, fqname: &str) -> Vec<usi
 
 /// Shared O(1) probe behind :meth:`ProjectContext::has_imports_of`.
 fn has_imports_of_in(outputs: &BuildOutputs, module_name: &str) -> bool {
-    outputs
+    if outputs
         .imports_by_module
         .get(module_name)
         .is_some_and(|v| !v.is_empty())
+    {
+        return true;
+    }
+    // A submodule import (`from unittest.case import …`) counts as importing
+    // the package (`unittest`), per the documented contract. Match on the
+    // dot boundary so `flask_login` doesn't satisfy a probe for `flask`.
+    let prefix = format!("{module_name}.");
+    outputs
+        .imports_by_module
+        .iter()
+        .any(|(k, v)| !v.is_empty() && k.starts_with(prefix.as_str()))
 }
 
 /// Shared import-by-module lookup behind
 /// :meth:`ProjectContext::find_imports_of_indices`.
 fn find_imports_of_indices_in(outputs: &BuildOutputs, module_name: &str) -> Vec<usize> {
-    outputs
-        .imports_by_module
-        .get(module_name)
-        .cloned()
-        .unwrap_or_default()
+    // Exact module plus any submodule (dot boundary), per the documented
+    // contract — `from unittest.case import …` imports the `unittest` tree.
+    let prefix = format!("{module_name}.");
+    let mut out: Vec<usize> = Vec::new();
+    for (k, idxs) in &outputs.imports_by_module {
+        if k.as_str() == module_name || k.starts_with(prefix.as_str()) {
+            out.extend(idxs.iter().copied());
+        }
+    }
+    out
 }
 
 /// Shared O(1) module-by-fqname lookup behind
@@ -3477,11 +3494,22 @@ fn find_subclasses_indices_core(
     // project modules — including relative re-exports — are resolved
     // statically by `chase_base_fqn` at assemble time, so they too land in
     // `external_base_children`.
-    let direct: FxHashSet<usize> = outputs
-        .external_base_children
-        .get(base_fqn)
-        .map(|idxs| idxs.iter().copied().collect())
-        .unwrap_or_default();
+    //
+    // Sibling fold: the same external class can be spelled several ways
+    // (`unittest.TestCase` vs `unittest.case.TestCase`), and a project
+    // subclass is keyed under whichever spelling it wrote. A plugin queries
+    // one canonical spelling, so we must collect every key that resolves to
+    // the *same* class seed — not just an exact string match. Sibling
+    // spellings (and renamed re-exports) all resolve through
+    // `locate_class_seed` to `(seed_file, seed_range)`.
+    let mut direct: FxHashSet<usize> = FxHashSet::default();
+    for (key_fqn, idxs) in &outputs.external_base_children {
+        let is_sibling = key_fqn == base_fqn
+            || locate_class_seed(&db, outputs, key_fqn) == Some((seed_file, seed_range));
+        if is_sibling {
+            direct.extend(idxs.iter().copied());
+        }
+    }
     let mut out_idx: FxHashSet<usize> = direct.iter().copied().collect();
     if transitive {
         for &d in &direct {
