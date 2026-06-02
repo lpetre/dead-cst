@@ -1063,11 +1063,12 @@ pub(crate) struct ClassHierarchyIndices {
 ///   every file, and — because store and query funnel through the same
 ///   resolver — collapses sibling spellings to one key.
 ///
-/// A first pass folds every file's per-file `name_bindings` into a
-/// project-wide re-export / alias chain (`{module_fqn}.{name} ->
-/// next_fqn`); the second pass resolves each base through it so a base
-/// that hops across files (re-export, star-import, module-level alias)
-/// is chased to its terminal class. See [`chase_base_fqn`].
+/// A base that hops across files (re-export, star-import, module-level
+/// alias) is chased to its terminal class on demand: each hop loads the
+/// next module's (salsa-cached) `name_bindings`, so the cross-file chain
+/// is never materialized in bulk. A `{module_fqn} -> File` map (one entry
+/// per file) lets the chaser find each hop's module. See
+/// [`chase_base_fqn`].
 ///
 /// Resolution rules per `ResolvedBase` variant:
 ///
@@ -1091,35 +1092,29 @@ fn build_class_hierarchy_indices<'db>(
     decl_by_fqname: &FxHashMap<String, Vec<usize>>,
     nodes: &[GraphNode],
 ) -> ClassHierarchyIndices {
-    use crate::file_payload::{NameBinding, ResolvedBase};
+    use crate::file_payload::ResolvedBase;
     let mut by_node: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
     let mut external_base_children: FxHashMap<(File, (u32, u32)), Vec<usize>> =
         FxHashMap::default();
 
-    // First pass: fold every file's per-file `name_bindings` into a
-    // project-wide re-export / alias chain, `{module_fqn}.{name} ->
-    // next_fqn`. This is the cross-file half of the uniform binder
-    // ladder: a base that resolves (in its own file) to a name which is
-    // itself an import, star-import, or module-level alias is chased
-    // through this map to the terminal class fqn, so a class reached only
-    // via one or more re-export hops still lands in `children_by_node` /
-    // `external_base_children` without re-parsing. `LocalClass` bindings
-    // are terminal (the class itself, found in `decl_by_fqname`) so they
-    // need no chain edge.
-    let mut alias_chain: FxHashMap<String, String> = FxHashMap::default();
+    // The cross-file half of the uniform binder ladder chases a base
+    // through re-export / alias hops to its terminal class. Rather than
+    // eagerly folding *every* file's `name_bindings` into a project-wide
+    // `{module_fqn}.{name} -> next_fqn` chain — O(total project imports),
+    // nearly all of which is never chased — resolve on demand: a base is
+    // walked one hop at a time, loading the *next* module's (salsa-cached)
+    // `name_bindings` only when the chase reaches it (see
+    // [`chase_base_fqn`]). The only index that must exist up front is a
+    // `{module_fqn} -> File` map so the chaser can find the module owning
+    // the next hop; that's one entry per file, far cheaper than the dense
+    // chain. Per-starting-fqn memoization (`chase_memo`) collapses the
+    // shared suffix every subclass of one re-exported base would re-walk.
+    let mut module_to_file: FxHashMap<String, File> = FxHashMap::default();
     for &file in project_files {
         let payload = file_to_nodes(db, file);
-        let module_fqn = payload.nodes[0].fqname.as_str();
-        for (name, binding) in &payload.name_bindings {
-            let next = match binding {
-                NameBinding::LocalClass(_) => continue,
-                NameBinding::Import(fqn) => fqn.clone(),
-                NameBinding::StarImport(module) => format!("{module}.{name}"),
-                NameBinding::ModuleAlias(other) => format!("{module_fqn}.{other}"),
-            };
-            alias_chain.insert(format!("{module_fqn}.{name}"), next);
-        }
+        module_to_file.insert(payload.nodes[0].fqname.clone(), file);
     }
+    let mut chase_memo: FxHashMap<String, String> = FxHashMap::default();
 
     // An external terminal is resolved one hop further — through the
     // external boundary, via `locate_external_class_seed` — so it's keyed
@@ -1152,9 +1147,16 @@ fn build_class_hierarchy_indices<'db>(
                         }
                     }
                     ResolvedBase::ImportedFqn(fqn) => {
-                        let terminal = chase_base_fqn(fqn, &alias_chain, decl_by_fqname, nodes);
+                        let terminal = chase_base_fqn(
+                            fqn,
+                            &module_to_file,
+                            db,
+                            decl_by_fqname,
+                            nodes,
+                            &mut chase_memo,
+                        );
                         register_chased_base(
-                            terminal,
+                            &terminal,
                             child_idx,
                             &mut chase_ctx,
                             decl_by_fqname,
@@ -1168,10 +1170,16 @@ fn build_class_hierarchy_indices<'db>(
                         attr_name,
                     } => {
                         let composed = format!("{module_fqn}.{attr_name}");
-                        let terminal =
-                            chase_base_fqn(&composed, &alias_chain, decl_by_fqname, nodes);
+                        let terminal = chase_base_fqn(
+                            &composed,
+                            &module_to_file,
+                            db,
+                            decl_by_fqname,
+                            nodes,
+                            &mut chase_memo,
+                        );
                         register_chased_base(
-                            terminal,
+                            &terminal,
                             child_idx,
                             &mut chase_ctx,
                             decl_by_fqname,
@@ -1201,33 +1209,63 @@ fn build_class_hierarchy_indices<'db>(
 }
 
 /// Follow a base-class fqn through the project-wide re-export / alias
-/// chain (`alias_chain`, built by [`build_class_hierarchy_indices`]) to
-/// its terminal fqn. Stops at the first fqn that names a live project
-/// class — so a re-exported project base resolves to the class itself,
-/// not the intermediate import node — or at a fqn that isn't a project
-/// re-export (an external base, or an unresolvable leaf). Cycle-guarded.
-fn chase_base_fqn<'a>(
-    start: &'a str,
-    alias_chain: &'a FxHashMap<String, String>,
+/// chain to its terminal fqn, resolving each hop on demand instead of
+/// from a pre-built chain. Stops at the first fqn that names a live
+/// project class — so a re-exported project base resolves to the class
+/// itself, not the intermediate import node — or at a fqn that isn't a
+/// project re-export (an external base, or an unresolvable leaf).
+///
+/// Each hop splits the current fqn at its last dot into `{module}.{name}`,
+/// finds the module's file via `module_to_file`, and reads that file's
+/// (salsa-cached) `name_bindings` for `name` — the same `{module_fqn}.{name}
+/// -> next` edge the old eager fold materialized, computed lazily. A
+/// `LocalClass`/absent binding (or a non-project module) ends the chase.
+/// `seen` guards re-export cycles; `memo` caches each starting fqn's
+/// terminal so a base shared across many subclasses resolves once.
+fn chase_base_fqn(
+    start: &str,
+    module_to_file: &FxHashMap<String, File>,
+    db: &ProjectDatabase,
     decl_by_fqname: &FxHashMap<String, Vec<usize>>,
     nodes: &[GraphNode],
-) -> &'a str {
-    let mut cur = start;
-    let mut seen: FxHashSet<&str> = FxHashSet::default();
-    loop {
+    memo: &mut FxHashMap<String, String>,
+) -> String {
+    use crate::file_payload::NameBinding;
+    if let Some(terminal) = memo.get(start) {
+        return terminal.clone();
+    }
+    let mut cur = start.to_string();
+    let mut seen: FxHashSet<String> = FxHashSet::default();
+    let terminal = loop {
         // A fqn that already names a live project class is the terminal:
         // don't chase past it through a same-name re-export shadow.
         if decl_by_fqname
-            .get(cur)
+            .get(cur.as_str())
             .is_some_and(|idxs| idxs.iter().any(|&i| nodes[i].kind == "class"))
         {
-            return cur;
+            break cur;
         }
-        match alias_chain.get(cur) {
-            Some(next) if seen.insert(cur) => cur = next.as_str(),
-            _ => return cur,
+        // Resolve the next hop as an owned fqn, releasing every borrow of
+        // `cur` before it's reassigned below.
+        let next: Option<String> = match cur.rsplit_once('.') {
+            Some((module, name)) => match module_to_file.get(module) {
+                Some(&file) => match file_to_nodes(db, file).name_bindings.get(name) {
+                    None | Some(NameBinding::LocalClass(_)) => None,
+                    Some(NameBinding::Import(fqn)) => Some(fqn.clone()),
+                    Some(NameBinding::StarImport(m)) => Some(format!("{m}.{name}")),
+                    Some(NameBinding::ModuleAlias(other)) => Some(format!("{module}.{other}")),
+                },
+                None => None,
+            },
+            None => None,
+        };
+        match next {
+            Some(n) if seen.insert(cur.clone()) => cur = n,
+            _ => break cur,
         }
-    }
+    };
+    memo.insert(start.to_string(), terminal.clone());
+    terminal
 }
 
 /// Memo for `register_chased_base`'s external-boundary resolution:
