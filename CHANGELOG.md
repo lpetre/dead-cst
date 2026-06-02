@@ -224,11 +224,16 @@ two versions.
   resolution no longer re-parses **and no longer runs ty's `find_references`
   walk at all**: each file captures its module-level name bindings during
   the fan-out, and every class base — just a name, bound one of four ways
-  (local class, explicit import, `from … import *`, or a module-level alias
-  `Base = Imported`) — resolves through that one uniform binder ladder. The
+  (local class, explicit import, `from … import *`, or a module-level alias,
+  `Base = Imported` *or* the attribute form `Base = mod.Imported`) — resolves
+  through that one uniform binder ladder. The
   import table reads each `from … import` statement's leading-dot level, so
   *relative* re-exports (`from .bases import TestCase`) resolve to the same
-  terminal class as absolute ones. At assemble time the per-file bindings fold
+  terminal class as absolute ones. Sibling spellings of one external base
+  (`unittest.TestCase` and `unittest.case.TestCase` both name the single
+  `class TestCase`) fold together, so a subclass written against either
+  spelling is found regardless of which spelling a plugin queries. At assemble
+  time the per-file bindings fold
   into a project-wide alias/re-export chain that is chased cross-file to each
   base's terminal class, so subclasses reached through a star import, a
   module-level alias, or an absolute *or* relative re-export now resolve

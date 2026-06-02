@@ -35,8 +35,8 @@ use crate::file_payload::{file_to_edges, file_to_nodes, FileEdges, NodeKind, Nod
 use crate::file_ref_edges::{file_to_ref_edges, FileRefEdges};
 use crate::graph::{intern_kind, DeclIndex, NativeGraph, SymbolNode};
 use crate::helpers::{
-    file_path_string, is_dunder_name, locate_class_seed, rel_path, CallArgs, MODULE_ALIAS_MARKER,
-    NODE_FLAG_ENTRYPOINT,
+    file_path_string, is_dunder_name, locate_class_seed, locate_external_class_seed, rel_path,
+    CallArgs, MODULE_ALIAS_MARKER, NODE_FLAG_ENTRYPOINT,
 };
 use crate::ingest::emit_visitor_warning;
 use crate::progress::{
@@ -161,20 +161,23 @@ pub(crate) struct BuildOutputs {
     /// into the project from the cached ``external_base_children`` index;
     /// once a project class is found, transitive walks use this map.
     pub(crate) children_by_node: FxHashMap<usize, Vec<usize>>,
-    /// External base fqn (e.g. ``"unittest.TestCase"``) -> direct
-    /// subclass class graph idxs. Derived in the same
-    /// `class_bases` fan-in as `children_by_node`, but keyed by the
-    /// resolved *external* base fqn rather than a project node idx.
+    /// Resolved *external* base class (a base not present in
+    /// `decl_by_fqname`, e.g. ``unittest.TestCase``) -> direct subclass
+    /// class graph idxs. Derived in the same `class_bases` fan-in as
+    /// `children_by_node`, but keyed by the external class's resolved decl
+    /// ``(File, name_range)`` rather than a project node idx.
     ///
-    /// Lets the external-seed branch of `find_subclasses_indices_core`
-    /// recover the first hop into the project straight from the cached
-    /// per-file payloads, instead of a full re-parse over every project
-    /// file. Re-export / alias chains through project modules are folded
-    /// in statically by `chase_base_fqn` (which walks the per-file
-    /// `name_bindings`, resolving explicit, star, alias, and relative
-    /// re-export rungs), so a subclass reached only through a re-export is
-    /// keyed here under the terminal external fqn.
-    pub(crate) external_base_children: FxHashMap<String, Vec<usize>>,
+    /// The key is produced by `locate_external_class_seed` — the same
+    /// resolver the external-seed branch of `find_subclasses_indices_core`
+    /// runs on its query input. Funneling both the observed bases and the
+    /// query through one normalization collapses sibling spellings
+    /// (`unittest.TestCase` vs `unittest.case.TestCase`) and renamed
+    /// re-exports to a single key by construction, so the query is an O(1)
+    /// lookup with no scan. Re-export / alias chains through project
+    /// modules are folded in statically by `chase_base_fqn` first, so a
+    /// subclass reached only through a re-export is keyed here under the
+    /// terminal external class's decl.
+    pub(crate) external_base_children: FxHashMap<(File, (u32, u32)), Vec<usize>>,
 }
 
 /// Run the three build phases (ingest → hierarchy+imports → references)
@@ -1040,9 +1043,9 @@ pub(crate) struct ClassHierarchyIndices {
     /// Parent class graph idx → direct subclass graph idxs (project
     /// bases only). See [`BuildOutputs::children_by_node`].
     pub(crate) children_by_node: FxHashMap<usize, Vec<usize>>,
-    /// External base fqn → direct subclass graph idxs. See
-    /// [`BuildOutputs::external_base_children`].
-    pub(crate) external_base_children: FxHashMap<String, Vec<usize>>,
+    /// Resolved external base class decl ``(File, name_range)`` → direct
+    /// subclass graph idxs. See [`BuildOutputs::external_base_children`].
+    pub(crate) external_base_children: FxHashMap<(File, (u32, u32)), Vec<usize>>,
 }
 
 /// Fold every file's per-file `class_bases` payload (see
@@ -1052,16 +1055,20 @@ pub(crate) struct ClassHierarchyIndices {
 /// * `children_by_node` — parent class graph idx → direct subclass
 ///   graph idxs. Drives intra-project BFS for both project and
 ///   external seeds (once the first hop lands a project class).
-/// * `external_base_children` — external base fqn (a base not present in
-///   `decl_by_fqname`, e.g. `unittest.TestCase`) → direct subclass graph
-///   idxs. Lets the external-seed query recover the first project hop
-///   from cached payloads instead of re-parsing every file.
+/// * `external_base_children` — external base class decl `(File,
+///   name_range)` (a base not present in `decl_by_fqname`, e.g.
+///   `unittest.TestCase`, resolved through `locate_external_class_seed`)
+///   → direct subclass graph idxs. Lets the external-seed query recover
+///   the first project hop from cached payloads instead of re-parsing
+///   every file, and — because store and query funnel through the same
+///   resolver — collapses sibling spellings to one key.
 ///
-/// A first pass folds every file's per-file `name_bindings` into a
-/// project-wide re-export / alias chain (`{module_fqn}.{name} ->
-/// next_fqn`); the second pass resolves each base through it so a base
-/// that hops across files (re-export, star-import, module-level alias)
-/// is chased to its terminal class. See [`chase_base_fqn`].
+/// A base that hops across files (re-export, star-import, module-level
+/// alias) is chased to its terminal class on demand: each hop loads the
+/// next module's (salsa-cached) `name_bindings`, so the cross-file chain
+/// is never materialized in bulk. A `{module_fqn} -> File` map (one entry
+/// per file) lets the chaser find each hop's module. See
+/// [`chase_base_fqn`].
 ///
 /// Resolution rules per `ResolvedBase` variant:
 ///
@@ -1072,8 +1079,10 @@ pub(crate) struct ClassHierarchyIndices {
 ///   the (composed) fqn through the alias chain to its terminal, then:
 ///   a project class hit emits `children_by_node` entries; a terminal
 ///   absent from `decl_by_fqname` (an external base, possibly reached
-///   through a project re-export) emits an `external_base_children`
-///   entry keyed by that terminal fqn. See [`register_chased_base`].
+///   through a project re-export) is resolved one more hop — through the
+///   external boundary via `locate_external_class_seed` — and emits an
+///   `external_base_children` entry keyed by the resolved decl `(File,
+///   name_range)`. See [`register_chased_base`].
 /// * `Unresolvable` — dropped.
 fn build_class_hierarchy_indices<'db>(
     db: &'db ProjectDatabase,
@@ -1083,34 +1092,43 @@ fn build_class_hierarchy_indices<'db>(
     decl_by_fqname: &FxHashMap<String, Vec<usize>>,
     nodes: &[GraphNode],
 ) -> ClassHierarchyIndices {
-    use crate::file_payload::{NameBinding, ResolvedBase};
+    use crate::file_payload::ResolvedBase;
     let mut by_node: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
-    let mut external_base_children: FxHashMap<String, Vec<usize>> = FxHashMap::default();
+    let mut external_base_children: FxHashMap<(File, (u32, u32)), Vec<usize>> =
+        FxHashMap::default();
 
-    // First pass: fold every file's per-file `name_bindings` into a
-    // project-wide re-export / alias chain, `{module_fqn}.{name} ->
-    // next_fqn`. This is the cross-file half of the uniform binder
-    // ladder: a base that resolves (in its own file) to a name which is
-    // itself an import, star-import, or module-level alias is chased
-    // through this map to the terminal class fqn, so a class reached only
-    // via one or more re-export hops still lands in `children_by_node` /
-    // `external_base_children` without re-parsing. `LocalClass` bindings
-    // are terminal (the class itself, found in `decl_by_fqname`) so they
-    // need no chain edge.
-    let mut alias_chain: FxHashMap<String, String> = FxHashMap::default();
+    // The cross-file half of the uniform binder ladder chases a base
+    // through re-export / alias hops to its terminal class. Rather than
+    // eagerly folding *every* file's `name_bindings` into a project-wide
+    // `{module_fqn}.{name} -> next_fqn` chain — O(total project imports),
+    // nearly all of which is never chased — resolve on demand: a base is
+    // walked one hop at a time, loading the *next* module's (salsa-cached)
+    // `name_bindings` only when the chase reaches it (see
+    // [`chase_base_fqn`]). The only index that must exist up front is a
+    // `{module_fqn} -> File` map so the chaser can find the module owning
+    // the next hop; that's one entry per file, far cheaper than the dense
+    // chain. Per-starting-fqn memoization (`chase_memo`) collapses the
+    // shared suffix every subclass of one re-exported base would re-walk.
+    let mut module_to_file: FxHashMap<String, File> = FxHashMap::default();
     for &file in project_files {
         let payload = file_to_nodes(db, file);
-        let module_fqn = payload.nodes[0].fqname.as_str();
-        for (name, binding) in &payload.name_bindings {
-            let next = match binding {
-                NameBinding::LocalClass(_) => continue,
-                NameBinding::Import(fqn) => fqn.clone(),
-                NameBinding::StarImport(module) => format!("{module}.{name}"),
-                NameBinding::ModuleAlias(other) => format!("{module_fqn}.{other}"),
-            };
-            alias_chain.insert(format!("{module_fqn}.{name}"), next);
-        }
+        module_to_file.insert(payload.nodes[0].fqname.clone(), file);
     }
+    let mut chase_memo: FxHashMap<String, String> = FxHashMap::default();
+
+    // An external terminal is resolved one hop further — through the
+    // external boundary, via `locate_external_class_seed` — so it's keyed
+    // by the class's real decl `(file, range)` rather than its (possibly
+    // sibling-spelled) fqn. ty's module resolver needs an anchor file; any
+    // project file works. Results are memoized per terminal fqn so a base
+    // repeated across files resolves once.
+    let anchor = project_files.first().copied();
+    let mut ext_seed_memo: ExtSeedMemo = FxHashMap::default();
+    let mut chase_ctx = ChaseCtx {
+        db,
+        anchor,
+        ext_seed_memo: &mut ext_seed_memo,
+    };
 
     for &file in project_files {
         let payload = file_to_nodes(db, file);
@@ -1129,10 +1147,18 @@ fn build_class_hierarchy_indices<'db>(
                         }
                     }
                     ResolvedBase::ImportedFqn(fqn) => {
-                        let terminal = chase_base_fqn(fqn, &alias_chain, decl_by_fqname, nodes);
+                        let terminal = chase_base_fqn(
+                            fqn,
+                            &module_to_file,
+                            db,
+                            decl_by_fqname,
+                            nodes,
+                            &mut chase_memo,
+                        );
                         register_chased_base(
-                            terminal,
+                            &terminal,
                             child_idx,
+                            &mut chase_ctx,
                             decl_by_fqname,
                             nodes,
                             &mut by_node,
@@ -1144,11 +1170,18 @@ fn build_class_hierarchy_indices<'db>(
                         attr_name,
                     } => {
                         let composed = format!("{module_fqn}.{attr_name}");
-                        let terminal =
-                            chase_base_fqn(&composed, &alias_chain, decl_by_fqname, nodes);
+                        let terminal = chase_base_fqn(
+                            &composed,
+                            &module_to_file,
+                            db,
+                            decl_by_fqname,
+                            nodes,
+                            &mut chase_memo,
+                        );
                         register_chased_base(
-                            terminal,
+                            &terminal,
                             child_idx,
+                            &mut chase_ctx,
                             decl_by_fqname,
                             nodes,
                             &mut by_node,
@@ -1176,48 +1209,101 @@ fn build_class_hierarchy_indices<'db>(
 }
 
 /// Follow a base-class fqn through the project-wide re-export / alias
-/// chain (`alias_chain`, built by [`build_class_hierarchy_indices`]) to
-/// its terminal fqn. Stops at the first fqn that names a live project
-/// class — so a re-exported project base resolves to the class itself,
-/// not the intermediate import node — or at a fqn that isn't a project
-/// re-export (an external base, or an unresolvable leaf). Cycle-guarded.
-fn chase_base_fqn<'a>(
-    start: &'a str,
-    alias_chain: &'a FxHashMap<String, String>,
+/// chain to its terminal fqn, resolving each hop on demand instead of
+/// from a pre-built chain. Stops at the first fqn that names a live
+/// project class — so a re-exported project base resolves to the class
+/// itself, not the intermediate import node — or at a fqn that isn't a
+/// project re-export (an external base, or an unresolvable leaf).
+///
+/// Each hop splits the current fqn at its last dot into `{module}.{name}`,
+/// finds the module's file via `module_to_file`, and reads that file's
+/// (salsa-cached) `name_bindings` for `name` — the same `{module_fqn}.{name}
+/// -> next` edge the old eager fold materialized, computed lazily. A
+/// `LocalClass`/absent binding (or a non-project module) ends the chase.
+/// `seen` guards re-export cycles; `memo` caches each starting fqn's
+/// terminal so a base shared across many subclasses resolves once.
+fn chase_base_fqn(
+    start: &str,
+    module_to_file: &FxHashMap<String, File>,
+    db: &ProjectDatabase,
     decl_by_fqname: &FxHashMap<String, Vec<usize>>,
     nodes: &[GraphNode],
-) -> &'a str {
-    let mut cur = start;
-    let mut seen: FxHashSet<&str> = FxHashSet::default();
-    loop {
+    memo: &mut FxHashMap<String, String>,
+) -> String {
+    use crate::file_payload::NameBinding;
+    if let Some(terminal) = memo.get(start) {
+        return terminal.clone();
+    }
+    let mut cur = start.to_string();
+    let mut seen: FxHashSet<String> = FxHashSet::default();
+    let terminal = loop {
         // A fqn that already names a live project class is the terminal:
         // don't chase past it through a same-name re-export shadow.
         if decl_by_fqname
-            .get(cur)
+            .get(cur.as_str())
             .is_some_and(|idxs| idxs.iter().any(|&i| nodes[i].kind == "class"))
         {
-            return cur;
+            break cur;
         }
-        match alias_chain.get(cur) {
-            Some(next) if seen.insert(cur) => cur = next.as_str(),
-            _ => return cur,
+        // Resolve the next hop as an owned fqn, releasing every borrow of
+        // `cur` before it's reassigned below.
+        let next: Option<String> = match cur.rsplit_once('.') {
+            Some((module, name)) => match module_to_file.get(module) {
+                Some(&file) => match file_to_nodes(db, file).name_bindings.get(name) {
+                    None | Some(NameBinding::LocalClass(_)) => None,
+                    Some(NameBinding::Import(fqn)) => Some(fqn.clone()),
+                    Some(NameBinding::StarImport(m)) => Some(format!("{m}.{name}")),
+                    Some(NameBinding::ModuleAlias(other)) => Some(format!("{module}.{other}")),
+                },
+                None => None,
+            },
+            None => None,
+        };
+        match next {
+            Some(n) if seen.insert(cur.clone()) => cur = n,
+            _ => break cur,
         }
-    }
+    };
+    memo.insert(start.to_string(), terminal.clone());
+    terminal
+}
+
+/// Memo for `register_chased_base`'s external-boundary resolution:
+/// terminal fqn → resolved class decl `(file, range)` (or `None` when ty
+/// can't resolve it). Keyed by spelling, so a base repeated across files
+/// resolves once; sibling spellings of one class hold distinct entries
+/// that resolve to the same value.
+type ExtSeedMemo = FxHashMap<String, Option<(File, (u32, u32))>>;
+
+/// Carries the external-boundary resolver context for
+/// [`register_chased_base`]'s external arm: the db + anchor file
+/// `locate_external_class_seed` needs, plus a per-terminal-fqn memo so a
+/// base repeated across files resolves once. Bundled into one struct to
+/// keep `register_chased_base` at the clippy arg-count limit.
+struct ChaseCtx<'a> {
+    db: &'a ProjectDatabase,
+    anchor: Option<File>,
+    ext_seed_memo: &'a mut ExtSeedMemo,
 }
 
 /// Fold a chased terminal base fqn into the project-wide subclass
 /// indices. A project class hit emits `children_by_node` entries; a
-/// terminal absent from `decl_by_fqname` is an external base, keyed into
-/// `external_base_children`. A project decl that exists but isn't a class
-/// is dropped (its subclass set is empty either way), matching the
-/// pre-chase behaviour.
+/// terminal absent from `decl_by_fqname` is an external base — resolved
+/// one hop further through the external boundary
+/// ([`locate_external_class_seed`]) and keyed into `external_base_children`
+/// by its real decl `(file, range)`, so sibling spellings of the same
+/// class share a key and the subclass query needs no scan. An external
+/// base ty can't resolve (and a project decl that exists but isn't a
+/// class) is dropped — its subclass set is empty either way, and the
+/// query would resolve to nothing too.
 fn register_chased_base(
     terminal: &str,
     child_idx: usize,
+    ctx: &mut ChaseCtx,
     decl_by_fqname: &FxHashMap<String, Vec<usize>>,
     nodes: &[GraphNode],
     by_node: &mut FxHashMap<usize, Vec<usize>>,
-    external_base_children: &mut FxHashMap<String, Vec<usize>>,
+    external_base_children: &mut FxHashMap<(File, (u32, u32)), Vec<usize>>,
 ) {
     match decl_by_fqname.get(terminal) {
         Some(idxs) => {
@@ -1227,10 +1313,25 @@ fn register_chased_base(
                 }
             }
         }
-        None => external_base_children
-            .entry(terminal.to_string())
-            .or_default()
-            .push(child_idx),
+        None => {
+            let Some(anchor) = ctx.anchor else {
+                return;
+            };
+            let db = ctx.db;
+            let seed = *ctx
+                .ext_seed_memo
+                .entry(terminal.to_string())
+                .or_insert_with(|| {
+                    locate_external_class_seed(db, anchor, terminal)
+                        .map(|(f, r)| (f, (r.start().to_u32(), r.end().to_u32())))
+                });
+            if let Some(key) = seed {
+                external_base_children
+                    .entry(key)
+                    .or_default()
+                    .push(child_idx);
+            }
+        }
     }
 }
 
@@ -2546,20 +2647,36 @@ fn find_declarations_indices_in(outputs: &BuildOutputs, fqname: &str) -> Vec<usi
 
 /// Shared O(1) probe behind :meth:`ProjectContext::has_imports_of`.
 fn has_imports_of_in(outputs: &BuildOutputs, module_name: &str) -> bool {
-    outputs
+    if outputs
         .imports_by_module
         .get(module_name)
         .is_some_and(|v| !v.is_empty())
+    {
+        return true;
+    }
+    // A submodule import (`from unittest.case import …`) counts as importing
+    // the package (`unittest`), per the documented contract. Match on the
+    // dot boundary so `flask_login` doesn't satisfy a probe for `flask`.
+    let prefix = format!("{module_name}.");
+    outputs
+        .imports_by_module
+        .iter()
+        .any(|(k, v)| !v.is_empty() && k.starts_with(prefix.as_str()))
 }
 
 /// Shared import-by-module lookup behind
 /// :meth:`ProjectContext::find_imports_of_indices`.
 fn find_imports_of_indices_in(outputs: &BuildOutputs, module_name: &str) -> Vec<usize> {
-    outputs
-        .imports_by_module
-        .get(module_name)
-        .cloned()
-        .unwrap_or_default()
+    // Exact module plus any submodule (dot boundary), per the documented
+    // contract — `from unittest.case import …` imports the `unittest` tree.
+    let prefix = format!("{module_name}.");
+    let mut out: Vec<usize> = Vec::new();
+    for (k, idxs) in &outputs.imports_by_module {
+        if k.as_str() == module_name || k.starts_with(prefix.as_str()) {
+            out.extend(idxs.iter().copied());
+        }
+    }
+    out
 }
 
 /// Shared O(1) module-by-fqname lookup behind
@@ -3477,16 +3594,26 @@ fn find_subclasses_indices_core(
     // project modules — including relative re-exports — are resolved
     // statically by `chase_base_fqn` at assemble time, so they too land in
     // `external_base_children`.
-    let direct: FxHashSet<usize> = outputs
+    //
+    // Sibling fold by construction: the same external class can be spelled
+    // several ways (`unittest.TestCase` vs `unittest.case.TestCase`), but
+    // the store side ran every observed base through
+    // `locate_external_class_seed`, keying by the class's real decl
+    // `(file, range)`. `locate_class_seed` resolved this query's input
+    // through the same boundary, so `(seed_file, rk)` is that same key:
+    // sibling spellings and renamed re-exports already collapsed into one
+    // entry. A single O(1) lookup, no scan.
+    let direct = outputs
         .external_base_children
-        .get(base_fqn)
-        .map(|idxs| idxs.iter().copied().collect())
+        .get(&(seed_file, rk))
+        .cloned()
         .unwrap_or_default();
+    if !transitive {
+        return direct;
+    }
     let mut out_idx: FxHashSet<usize> = direct.iter().copied().collect();
-    if transitive {
-        for &d in &direct {
-            out_idx.extend(transitive_subclasses_via_index(d, children_by_node));
-        }
+    for &d in &direct {
+        out_idx.extend(transitive_subclasses_via_index(d, children_by_node));
     }
     out_idx.into_iter().collect()
 }
