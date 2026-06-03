@@ -857,12 +857,23 @@ fn assemble_graph<'db>(
                 }
             }
         }
-        for r in external_keys {
-            if let NodeRef::External(key) = r {
-                let fqname = key.fqname(db).clone();
-                let idx = builder.intern_synthetic(fqname);
-                ref_to_global.insert(r, idx);
-            }
+        // Mint the synthetic External nodes in a deterministic order.
+        // `external_keys` is an FxHashSet whose iteration order tracks
+        // the salsa id layout and so varies run-to-run; minting in that
+        // order would hand the synthetics run-dependent graph indices.
+        // Sort by fqname — the dedup identity `intern_synthetic` keys on
+        // — so each External lands at the same index every run.
+        let mut externals: Vec<(String, NodeRef<'db>)> = external_keys
+            .into_iter()
+            .filter_map(|r| match r {
+                NodeRef::External(key) => Some((key.fqname(db).clone(), r)),
+                _ => None,
+            })
+            .collect();
+        externals.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        for (fqname, r) in externals {
+            let idx = builder.intern_synthetic(fqname);
+            ref_to_global.insert(r, idx);
         }
 
         // 2c: parallel translation. `ref_to_global` is owned + read-
@@ -913,7 +924,13 @@ fn assemble_graph<'db>(
         );
     }
 
-    // Pass 3: peer .pyi/.py reachability edges.
+    // Pass 3: peer .pyi/.py reachability edges. Collect every peer
+    // edge first, then sort + dedup before inserting: the source maps
+    // (`peer_pyi_to_py` and each file's `exports_by_name`) are
+    // FxHashMaps whose iteration order isn't stable run-to-run, so
+    // inserting as we walk them would give the adjacency lists a
+    // run-dependent order. Sorting the collected triples pins it.
+    let mut peer_triples: Vec<(usize, usize, u32)> = Vec::new();
     for (&pyi_file, &py_twin) in peer_pyi_to_py {
         let pyi_payload = file_to_nodes(db, pyi_file);
         let py_payload = file_to_nodes(db, py_twin);
@@ -931,11 +948,14 @@ fn assemble_graph<'db>(
                     let Some(&py_idx) = ref_to_global.get(&py_ref) else {
                         continue;
                     };
-                    builder.add_edge(pyi_idx, py_idx, 0);
+                    peer_triples.push((pyi_idx, py_idx, 0));
                 }
             }
         }
     }
+    peer_triples.sort_unstable();
+    peer_triples.dedup();
+    builder.extend_edges(peer_triples);
 
     // Pass 4: per-file native plugin fold. Replay each per-file
     // plugin's salsa-cached `FileLocalOp`s (warmed in the parallel
