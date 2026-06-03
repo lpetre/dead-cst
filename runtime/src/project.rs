@@ -35,8 +35,8 @@ use crate::file_payload::{file_to_edges, file_to_nodes, FileEdges, NodeKind, Nod
 use crate::file_ref_edges::{file_to_ref_edges, FileRefEdges};
 use crate::graph::{intern_kind, DeclIndex, NativeGraph, SymbolNode};
 use crate::helpers::{
-    file_path_string, is_dunder_name, locate_class_seed, rel_path, CallArgs, MODULE_ALIAS_MARKER,
-    NODE_FLAG_ENTRYPOINT,
+    file_path_string, is_dunder_name, locate_class_seed, range_key, rel_path, resolve_base_spec,
+    CallArgs, MODULE_ALIAS_MARKER, NODE_FLAG_ENTRYPOINT,
 };
 use crate::ingest::emit_visitor_warning;
 use crate::progress::{
@@ -162,23 +162,22 @@ pub(crate) struct BuildOutputs {
     /// into the project from the cached ``external_base_children`` index;
     /// once a project class is found, transitive walks use this map.
     pub(crate) children_by_node: FxHashMap<usize, Vec<usize>>,
-    /// Resolved *external* base class (a base whose `ClassLiteral` lives
+    /// Resolved *external* base class (a base whose definition lives
     /// outside the project, e.g. ``unittest.TestCase`` in typeshed) ->
     /// direct subclass class graph idxs. Derived in the same `class_bases`
     /// fan-in as `children_by_node`, but keyed by the external class's
     /// resolved decl ``(File, name_range)`` rather than a project node idx.
     ///
-    /// The key is the canonical `ClassLiteral`'s `focus_range`, produced by
-    /// [`crate::helpers::class_literal_seed`] — the same resolver the
-    /// external-seed branch of `find_subclasses_indices_core` runs on its
-    /// query input (via `locate_class_seed`). Funneling both the observed
-    /// bases and the query through ty's type system collapses sibling
-    /// spellings (`unittest.TestCase` vs `unittest.case.TestCase`) and
-    /// renamed re-exports to a single key by construction, so the query is
-    /// an O(1) lookup with no scan. A base reached through a project
-    /// re-export or module-level alias resolves to the same `ClassLiteral`
-    /// directly — ty follows the alias — so no separate chase step is
-    /// needed.
+    /// The key is the resolved decl's name-token range, produced by
+    /// [`crate::helpers::resolve_member_def`] (ty's module resolver plus the
+    /// same use-def decomposition the store side runs, which follows re-export
+    /// and assignment-alias chains) — the same resolver the external-seed
+    /// branch of `find_subclasses_indices_core` runs on its query input (via
+    /// `locate_class_seed`). Funneling both the observed bases (via
+    /// [`crate::helpers::resolve_base_spec`]) and the query through
+    /// `resolve_member_def` collapses sibling spellings (`unittest.TestCase`
+    /// vs `unittest.case.TestCase`) and renamed re-exports to a single key
+    /// by construction, so the query is an O(1) lookup with no scan.
     pub(crate) external_base_children: FxHashMap<(File, (u32, u32)), Vec<usize>>,
 }
 
@@ -1046,15 +1045,22 @@ pub(crate) struct ClassHierarchyIndices {
 ///   graph idxs. Drives intra-project BFS for both project and
 ///   external seeds (once the first hop lands a project class).
 /// * `external_base_children` — external base class decl `(File,
-///   name_range)` (a base whose `ClassLiteral` lives outside the project,
+///   name_range)` (a base whose definition lives outside the project,
 ///   e.g. `unittest.TestCase` in typeshed) → direct subclass graph idxs.
 ///   Lets the external-seed query recover the first project hop from
 ///   cached payloads instead of re-parsing every file.
 ///
-/// Each base in a payload is already the `(File, name_range)` key of the
-/// canonical `ClassLiteral` ty resolved it to (store side, in
-/// `build_class_bases`). Dispatch is therefore a single hashmap probe per
-/// base — no fqn chasing, no external-boundary re-resolution:
+/// Each base in a payload is a lightweight
+/// [`ClassBaseSpec`](crate::file_payload::ClassBaseSpec) — a
+/// `LocalClass(range)` for a same-file class or a `ModuleMember{module,
+/// name}` symbolic reference — deliberately *not* resolved at store time
+/// so the per-file payload stays salsa-invalidation-local (see
+/// `build_class_bases`). Assembly resolves each spec here, through
+/// [`crate::helpers::resolve_base_spec`], to the `(File, name_range)` key
+/// of the class's name token; `resolve_base_spec` chases `ModuleMember`
+/// rows via [`crate::helpers::resolve_member_def`] (ty's module resolver +
+/// re-export / assignment-alias following). Dispatch is then a single
+/// hashmap probe per resolved base:
 ///
 /// * the key hits `class_by_selection` → it's a project class; record a
 ///   `children_by_node` edge to that parent (every value in the map is a
@@ -1062,11 +1068,11 @@ pub(crate) struct ClassHierarchyIndices {
 /// * the key misses → it's an external base; record the child under
 ///   `external_base_children` keyed by that same `(File, name_range)`.
 ///
-/// Because store and query both derive the key from the class's
-/// `ClassLiteral`, every spelling of one base (direct, aliased,
-/// re-exported, sibling-module) collapses to the same key by
-/// construction — the query side ([`crate::helpers::locate_class_seed`])
-/// lands on the identical key.
+/// Because assembly and the query side both funnel `ModuleMember` rows
+/// through the same `resolve_member_def`, every spelling of one base
+/// (direct, aliased, re-exported, sibling-module) collapses to the same
+/// `(File, name_range)` key by construction — the query side
+/// ([`crate::helpers::locate_class_seed`]) lands on the identical key.
 fn build_class_hierarchy_indices(
     db: &ProjectDatabase,
     project_files: &[File],
@@ -1082,7 +1088,12 @@ fn build_class_hierarchy_indices(
             let Some(&child_idx) = class_by_selection.get(&(file, *cls_rk)) else {
                 continue;
             };
-            for &(base_file, base_rk) in bases {
+            for base in bases {
+                let Some((base_file, base_range)) = resolve_base_spec(db, base, file, file, 0)
+                else {
+                    continue;
+                };
+                let base_rk = range_key(base_range);
                 match class_by_selection.get(&(base_file, base_rk)) {
                     Some(&parent_idx) => by_node.entry(parent_idx).or_default().push(child_idx),
                     None => external_base_children
@@ -1720,9 +1731,10 @@ impl ProjectContext {
 
         // The plugin pass can still reload individual files on demand:
         // subclass resolution's `locate_class_seed` resolves an external base
-        // through ty (`SemanticModel` + `inferred_type`), which loads the
-        // target module's `parsed_module` to infer its members' types,
-        // repopulating those files' salsa `parsed_module` slots. Clear them
+        // through ty (`resolve_member_def` → the module resolver + use-def
+        // chain), which loads the target module's `parsed_module` to look up
+        // the member's binding, repopulating those files' salsa
+        // `parsed_module` slots. Clear them
         // again so the post-build resident set stays at the lean
         // post-populate level instead of creeping back up — the same memory
         // win `build_project_graph`'s populate phase secures.
@@ -3334,8 +3346,8 @@ fn find_classes_defining_method_indices_core(
 /// project seed walks the cached ``children_by_node`` index directly; an
 /// external seed reads its direct project subclasses from the cached
 /// ``external_base_children`` index (no re-parse — re-export / alias
-/// chains resolve to the same `ClassLiteral` through ty, so they're
-/// already folded into that index). See
+/// chains resolve to the same decl through `resolve_member_def`, so
+/// they're already folded into that index). See
 /// ``FrozenView::find_subclasses_indices`` for the fast/slow-path
 /// rationale.
 fn find_subclasses_indices_core(
@@ -3364,17 +3376,18 @@ fn find_subclasses_indices_core(
     // project subclasses are cached in `external_base_children` (folded
     // from the per-file `class_bases` payloads — no re-parse). A base bound
     // through one or more project re-exports or module-level aliases
-    // resolves to the same external `ClassLiteral` directly (ty follows the
-    // alias), so those subclasses land in `external_base_children` too.
+    // resolves to the same external decl through `resolve_member_def`
+    // (which follows re-export and alias chains), so those subclasses land
+    // in `external_base_children` too.
     //
     // Sibling fold by construction: the same external class can be spelled
     // several ways (`unittest.TestCase` vs `unittest.case.TestCase`), but
-    // the store side ran every observed base through ty's type system,
-    // keying by the canonical `ClassLiteral`'s `(file, range)`.
-    // `locate_class_seed` resolved this query's input through the same
-    // mechanism, so `(seed_file, rk)` is that same key: sibling spellings
-    // and renamed re-exports already collapsed into one entry. A single
-    // O(1) lookup, no scan.
+    // assemble ran every observed base through `resolve_member_def`, keying
+    // by the resolved decl's `(file, name-range)`. `locate_class_seed`
+    // resolved this query's input through the same resolver, so
+    // `(seed_file, rk)` is that same key: sibling spellings and renamed
+    // re-exports already collapsed into one entry. A single O(1) lookup,
+    // no scan.
     let direct = outputs
         .external_base_children
         .get(&(seed_file, rk))

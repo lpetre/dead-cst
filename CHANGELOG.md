@@ -222,26 +222,32 @@ two versions.
   pass. On a 250-file synthetic project this takes the parsed-AST salsa heap
   from ~5 MB to ~0 at build-end (~30% of total salsa memory). Subclass
   resolution no longer re-parses **and no longer runs ty's `find_references`
-  walk at all**: each top-level class base is resolved during the per-file
-  fan-out straight through ty's type inference. The base expression's inferred
-  type, when it names a statically-known class, yields that class's canonical
-  `ClassLiteral`, keyed by its definition's `(file, name-range)` — the same key
-  the project's class index is built on. Because ty follows imports, aliases,
-  and re-exports while inferring the type, every spelling of one base collapses
-  to a single key by construction: an external base's sibling spellings
-  (`unittest.TestCase` and `unittest.case.TestCase` both name the single
-  `class TestCase`), relative re-exports (`from .bases import TestCase`),
-  `from … import *` names, and module-level aliases (`Base = Imported` *or* the
-  attribute form `Base = mod.Imported`) all resolve to the same `ClassLiteral`
-  as the original spelling. At assemble time each base is a single hashmap probe
-  against the class index — a hit is a project parent, a miss is an external
-  base, keyed by that same `(file, name-range)` so the subclass query is an O(1)
-  lookup with no scan. No per-file name-binding table, no cross-file fqn chase,
-  no on-demand AST reload, no env-var fallback. The memory and no-re-parse
-  mechanics are results-neutral; the one behavioral change is that subclasses
-  reached through a star import, a module-level alias, or an absolute *or*
-  relative re-export are kept alive where the default path previously dropped
-  them.
+  walk at all**: during the per-file fan-out each top-level class base is
+  decomposed — via ty's use-def chain, not type inference — into a lightweight
+  symbolic spec: a same-file class (keyed by its name-range) or a
+  `module` + `name` member reference for anything imported. These specs are
+  deliberately *not* resolved across files at store time, so a file's cached
+  payload stays salsa-invalidation-local. Cross-file resolution happens later,
+  at both assemble and query time, through one shared member resolver
+  (`resolve_member_def`) built on ty's module resolver plus the same use-def
+  decomposition the store side runs (ty's `global_scope`/`place_table`/
+  `use_def_map` primitives), which follows re-export and alias chains.
+  Because the observed bases (at assemble) and the subclass query both funnel
+  every member reference through that same resolver, every spelling of one base
+  collapses to a single `(file, name-range)` key by construction: an external
+  base's sibling spellings (`unittest.TestCase` and `unittest.case.TestCase`
+  both name the single `class TestCase`), relative re-exports
+  (`from .bases import TestCase`), `from … import *` names, and module-level
+  aliases (`Base = Imported` *or* the attribute form `Base = mod.Imported`) all
+  resolve to the same decl as the original spelling. At assemble time each
+  resolved base is a single hashmap probe against the class index — a hit is a
+  project parent, a miss is an external base, keyed by that same
+  `(file, name-range)` so the subclass query is an O(1) lookup with no scan. No
+  per-file name-binding table, no eager cross-file resolution, no hand-rolled
+  fqn chase, no env-var fallback. The memory and no-re-parse mechanics are
+  results-neutral; the one behavioral change is that subclasses reached through
+  a star import, a module-level alias, or an absolute *or* relative re-export
+  are kept alive where the default path previously dropped them.
 - **Built-in plugins are migrating to native (Rust) implementations.**
   The `main_block`, `module_dunders`, `init_subclass`, `server_config`,
   and `unittest` built-ins now resolve to native `NativePlugin`

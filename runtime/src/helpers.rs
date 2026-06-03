@@ -5,11 +5,11 @@
 
 use pyo3::prelude::*;
 use ruff_db::files::{File, FilePath};
-use ruff_db::parsed::ParsedModuleRef;
+use ruff_db::parsed::{parsed_module, ParsedModuleRef};
 use ruff_db::system::SystemPath;
 use ruff_python_ast::token::TokenKind;
 use ruff_python_ast::visitor::{walk_expr, Visitor};
-use ruff_python_ast::{Expr, Stmt, StmtClassDef};
+use ruff_python_ast::{Expr, ExprName, Stmt, StmtClassDef};
 use ruff_source_file::LineIndex;
 use ruff_text_size::{Ranged, TextRange};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -19,12 +19,12 @@ use ty_module_resolver::{
 };
 use ty_project::metadata::value::RelativePathBuf;
 use ty_project::{Db as ProjectDb, ProjectDatabase};
-use ty_python_semantic::types::list_members::all_members;
-use ty_python_semantic::types::Type;
-use ty_python_semantic::SemanticModel;
+use ty_python_core::definition::{Definition, DefinitionKind};
+use ty_python_core::{global_scope, place_table, use_def_map};
 
+use crate::file_payload::ClassBaseSpec;
 use crate::graph::{EdgeFlags, NodeFlags};
-use crate::ingest::collapse_attribute_chain;
+use crate::ingest::{collapse_attribute_chain, from_module_string};
 use crate::project::BuildOutputs;
 
 /// Sentinel value stored in a file's local imports map (the value half
@@ -102,8 +102,8 @@ pub(crate) fn iter_top_level_classes(
 
 /// Resolve a dotted class fqn to ``(File, name_range)``. Handles both
 /// project classes (looked up via ``decl_by_fqname`` + the inverted
-/// ``class_by_selection``) and external classes (resolved through ty's
-/// type system by [`external_class_seed_via_ty`]).
+/// ``class_by_selection``) and external classes (resolved through
+/// [`resolve_member_def`]).
 pub(crate) fn locate_class_seed(
     db: &ProjectDatabase,
     outputs: &BuildOutputs,
@@ -122,53 +122,250 @@ pub(crate) fn locate_class_seed(
             }
         }
     }
-    // External class: resolve through ty's type system. The store side
-    // (`build_class_bases`) resolves every observed base the same way —
-    // both land on the canonical `ClassLiteral`'s `focus_range` — so
-    // sibling spellings (`unittest.TestCase` vs `unittest.case.TestCase`)
-    // and renamed re-exports collapse to one `external_base_children`
-    // key by construction, not a query-time string scan.
+    // External class: split the fqn into `(module, member)` and resolve
+    // through the same `resolve_member_def` the store/assemble side uses,
+    // so a query for `unittest.TestCase` lands on the identical
+    // `(File, name_range)` key the assemble pass recorded in
+    // `external_base_children` — sibling spellings and re-exports collapse
+    // by construction, not via a query-time string scan.
     let anchor = *outputs.project_files.first()?;
-    external_class_seed_via_ty(db, anchor, fqn)
+    let (seed_module, seed_name) = fqn.rsplit_once('.')?;
+    resolve_member_def(db, seed_module, seed_name, anchor, 0)
 }
 
-/// Resolve a dotted *external* class fqn to ``(File, name_range)`` via
-/// ty: resolve the owning module to a module-literal type, find the
-/// member bound to the final segment, and take its ``ClassLiteral``'s
-/// definition. Because the member's type is the canonical class object,
-/// re-exports (`unittest` re-exporting `unittest.case.TestCase`) and
-/// renamed aliases resolve to the same class as their original
-/// spelling — the normalization that makes co-reference structural.
-fn external_class_seed_via_ty(
-    db: &ProjectDatabase,
-    anchor: File,
-    fqn: &str,
-) -> Option<(File, TextRange)> {
-    let (module_str, class_name) = fqn.rsplit_once('.')?;
-    let model = SemanticModel::new(db, anchor);
-    let module_ty = model.resolve_module_type(Some(module_str), 0)?;
-    let member = all_members(db, module_ty)
+/// Maximum hops [`resolve_member_def`] / [`classify_base`] follow through
+/// assignment-style re-export chains before giving up. ty's import
+/// resolution has its own cycle guard; this only bounds the
+/// assignment-following recursion (which ty does *not* perform), so a
+/// pathological `A = B; B = A` can't loop. Legitimate re-export chains are
+/// only a hop or two deep.
+const MEMBER_RESOLVE_DEPTH_CAP: u32 = 16;
+
+/// Raw, *local-scope-only* definitions bound to `name` in `file`'s global
+/// scope — bindings and declarations, no cross-file alias resolution.
+/// Mirrors ty's internal `find_symbol_in_scope` (which is private to
+/// `ide_support`), the building block for the store-side first-hop
+/// classification.
+fn local_member_defs<'db>(db: &'db dyn ProjectDb, file: File, name: &str) -> Vec<Definition<'db>> {
+    let scope = global_scope(db, file);
+    let table = place_table(db, scope);
+    let Some(symbol_id) = table.symbol_id(name) else {
+        return Vec::new();
+    };
+    let use_def = use_def_map(db, scope);
+    let mut defs = Vec::new();
+    for binding in use_def.reachable_symbol_bindings(symbol_id) {
+        if let Some(def) = binding.binding.definition() {
+            defs.push(def);
+        }
+    }
+    for declaration in use_def.reachable_symbol_declarations(symbol_id) {
+        if let Some(def) = declaration.declaration.definition() {
+            defs.push(def);
+        }
+    }
+    defs
+}
+
+/// Describe one class-base expression as a [`ClassBaseSpec`] using only
+/// `file`'s own use-def chain — the first symbolic hop, no cross-file
+/// resolution (that's [`resolve_member_def`]'s job). Subscripted bases
+/// (`Base[T]`, `Generic[T]`) are unwrapped to the bare callee. `depth`
+/// bounds same-file alias chains (`Z = Y; class C(Z)`).
+pub(crate) fn classify_base(
+    db: &dyn ProjectDb,
+    file: File,
+    parsed: &ParsedModuleRef,
+    expr: &Expr,
+    depth: u32,
+) -> Option<ClassBaseSpec> {
+    if depth > MEMBER_RESOLVE_DEPTH_CAP {
+        return None;
+    }
+    let expr = match expr {
+        Expr::Subscript(subscript) => subscript.value.as_ref(),
+        other => other,
+    };
+    match expr {
+        Expr::Name(name) => {
+            let symbol = name.id.as_str();
+            local_member_defs(db, file, symbol)
+                .into_iter()
+                .find_map(|def| classify_name_def(db, file, parsed, def, symbol, depth))
+        }
+        Expr::Attribute(_) => {
+            let (module, name) = attribute_to_module_member(db, file, parsed, expr)?;
+            Some(ClassBaseSpec::ModuleMember { module, name })
+        }
+        _ => None,
+    }
+}
+
+/// Classify one local definition of a bare-name base (`name`, the symbol
+/// being referenced) into a [`ClassBaseSpec`]: a same-file class, a
+/// `from`-import member, a `from X import *` member, or a same-file
+/// assignment alias whose RHS is followed recursively.
+fn classify_name_def<'db>(
+    db: &'db dyn ProjectDb,
+    file: File,
+    parsed: &ParsedModuleRef,
+    def: Definition<'db>,
+    name: &str,
+    depth: u32,
+) -> Option<ClassBaseSpec> {
+    match def.kind(db) {
+        DefinitionKind::Class(class) => Some(ClassBaseSpec::LocalClass(range_key(
+            class.node(parsed).name.range(),
+        ))),
+        DefinitionKind::ImportFrom(import_from) => {
+            let module = from_module_string(db, file, import_from.import(parsed));
+            if module.is_empty() {
+                return None;
+            }
+            Some(ClassBaseSpec::ModuleMember {
+                module,
+                name: import_from.alias(parsed).name.as_str().to_string(),
+            })
+        }
+        DefinitionKind::StarImport(star_import) => {
+            let module = from_module_string(db, file, star_import.import(parsed));
+            if module.is_empty() {
+                return None;
+            }
+            Some(ClassBaseSpec::ModuleMember {
+                module,
+                name: name.to_string(),
+            })
+        }
+        DefinitionKind::Assignment(assign) => {
+            classify_base(db, file, parsed, assign.value(parsed), depth + 1)
+        }
+        DefinitionKind::AnnotatedAssignment(assign) => {
+            classify_base(db, file, parsed, assign.value(parsed)?, depth + 1)
+        }
+        _ => None,
+    }
+}
+
+/// Decompose an attribute-form base (`mod.Base`, `pkg.mod.Base`,
+/// `alias.Base`) into `(absolute_module, member_name)`, resolving the
+/// chain root to a module prefix via `file`'s imports and extending it
+/// with every segment but the last.
+fn attribute_to_module_member(
+    db: &dyn ProjectDb,
+    file: File,
+    parsed: &ParsedModuleRef,
+    expr: &Expr,
+) -> Option<(String, String)> {
+    let (root, segments) = collapse_attribute_chain(expr)?;
+    let (member, middle) = segments.split_last()?;
+    let prefix = root_module_prefix(db, file, parsed, root)?;
+    let module = if middle.is_empty() {
+        prefix
+    } else {
+        format!("{prefix}.{}", middle.join("."))
+    };
+    Some((module, (*member).to_string()))
+}
+
+/// Resolve the chain-root name of an attribute-form base to the absolute
+/// module it refers to: an `import a.b[ as r]` binding (→ `a.b`), or a
+/// `from pkg import mod` binding (→ `pkg.mod`). Returns `None` for
+/// anything that isn't an import of a module.
+fn root_module_prefix(
+    db: &dyn ProjectDb,
+    file: File,
+    parsed: &ParsedModuleRef,
+    root: &ExprName,
+) -> Option<String> {
+    local_member_defs(db, file, root.id.as_str())
         .into_iter()
-        .find(|m| m.name.as_str() == class_name)?;
-    class_literal_seed(db, member.ty)
+        .find_map(|def| match def.kind(db) {
+            DefinitionKind::Import(import) => {
+                let alias = import.alias(parsed);
+                Some(if alias.asname.is_some() {
+                    alias.name.as_str().to_string()
+                } else {
+                    root.id.as_str().to_string()
+                })
+            }
+            DefinitionKind::ImportFrom(import_from) => {
+                let from_module = from_module_string(db, file, import_from.import(parsed));
+                if from_module.is_empty() {
+                    return None;
+                }
+                Some(format!(
+                    "{from_module}.{}",
+                    import_from.alias(parsed).name.as_str()
+                ))
+            }
+            _ => None,
+        })
 }
 
-/// Resolve a ``Type`` to the ``(File, name_range)`` of the class it
-/// names, when it names a statically-known class — returns ``None`` for
-/// any non-class type (`Generic`, a function, a module, an instance, a
-/// dynamic base ty can't pin down). The range is the class's *name*
-/// (`TypeDefinition::focus_range`), which is exactly the key
-/// `class_by_selection` is built on. Both the store side (resolving a
-/// base *expression*) and the query side (resolving a base *fqn*) funnel
-/// through this helper, so the same class produces the same key from
-/// either entry point.
-pub(crate) fn class_literal_seed<'db>(
-    db: &'db dyn ty_python_semantic::Db,
-    ty: Type<'db>,
+/// Resolve a [`ClassBaseSpec`] to the canonical `(File, name_range)` of
+/// the definition it names. `LocalClass` lands on `local_file` (the file
+/// the spec was produced/followed in); `ModuleMember` resolves through
+/// [`resolve_member_def`] from `anchor`. Both the assemble pass and the
+/// assignment-following path funnel through here.
+pub(crate) fn resolve_base_spec(
+    db: &dyn ProjectDb,
+    spec: &ClassBaseSpec,
+    local_file: File,
+    anchor: File,
+    depth: u32,
 ) -> Option<(File, TextRange)> {
-    ty.as_class_literal()?;
-    let frange = ty.definition(db)?.focus_range(db)?;
-    Some((frange.file(), frange.range()))
+    match spec {
+        ClassBaseSpec::LocalClass((start, end)) => {
+            Some((local_file, TextRange::new((*start).into(), (*end).into())))
+        }
+        ClassBaseSpec::ModuleMember { module, name } => {
+            resolve_member_def(db, module, name, anchor, depth)
+        }
+    }
+}
+
+/// Resolve an absolute `module` string + member `name` to the canonical
+/// `(File, name_range)` of the definition it ultimately names, as seen
+/// from `anchor`. Re-exports are followed by [`resolve_member_in_file`],
+/// which reuses the store-side decomposition. `depth` bounds the chase.
+pub(crate) fn resolve_member_def(
+    db: &dyn ProjectDb,
+    module: &str,
+    name: &str,
+    anchor: File,
+    depth: u32,
+) -> Option<(File, TextRange)> {
+    if depth > MEMBER_RESOLVE_DEPTH_CAP {
+        return None;
+    }
+    let module_name = ModuleName::new(module)?;
+    let module_file = resolve_module(db, anchor, &module_name)?.file(db)?;
+    resolve_member_in_file(db, module_file, name, anchor, depth)
+}
+
+/// Resolve `name` in `file`'s global scope to a canonical
+/// `(File, name_range)`, reusing [`classify_name_def`] — the same
+/// decomposition the store side runs on observed bases. A class binding
+/// lands directly; an import re-export (`from x import name`,
+/// `from x import *`) recurses cross-file through [`resolve_member_def`];
+/// an assignment binding (`Alias = Real`) follows its RHS. `depth` bounds
+/// the recursion (cross-file import hops and assignment chains both
+/// increment it), standing in for ty's visited-set cycle guard.
+fn resolve_member_in_file(
+    db: &dyn ProjectDb,
+    file: File,
+    name: &str,
+    anchor: File,
+    depth: u32,
+) -> Option<(File, TextRange)> {
+    let parsed = parsed_module(db, file).load(db);
+    local_member_defs(db, file, name)
+        .into_iter()
+        .find_map(|def| {
+            let spec = classify_name_def(db, file, &parsed, def, name, depth)?;
+            resolve_base_spec(db, &spec, file, anchor, depth + 1)
+        })
 }
 
 /// Locate the top-level ``if __name__ == "__main__":`` block in a

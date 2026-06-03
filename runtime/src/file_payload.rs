@@ -36,11 +36,10 @@ use ty_python_core::definition::{Definition, DefinitionKind, DefinitionState};
 use ty_python_core::place::{PlaceExprRef, ScopedPlaceId};
 use ty_python_core::scope::FileScopeId;
 use ty_python_core::semantic_index;
-use ty_python_semantic::{HasType, SemanticModel};
 
 use crate::graph::NodeFlags;
 use crate::helpers::{
-    class_literal_seed, collect_all_imports_local, file_default_flags, file_path_string,
+    classify_base, collect_all_imports_local, file_default_flags, file_path_string,
     iter_top_level_classes, module_fqname_for_file, position, range_key, scan_noqa_directives,
     NODE_FLAGS_NOQA_PIN,
 };
@@ -227,18 +226,20 @@ pub(crate) struct ImportPayload {
 ///   `name` is bound in this file by `from <upstream> import *`. Lets
 ///   downstream chain walks hop through this file.
 /// * `class_bases` — per top-level class declaration with at least one
-///   statically-resolvable base, the resolved base list. Each entry is
-///   `(name_range_key, bases)` where `name_range_key` matches the
+///   statically-describable base, the symbolic base list. Each entry is
+///   `(name_range_key, specs)` where `name_range_key` matches the
 ///   `(start, end)` `u32` pair the assemble pass stores in
-///   `class_by_selection`, and `bases` is a small-vec of [`ClassBaseKey`]
-///   `(File, name_range)` pairs — each the canonical `ClassLiteral`'s
-///   `focus_range`, resolved through ty's type system
-///   ([`crate::helpers::class_literal_seed`]). A same-file base lands on
-///   this file's own selection key; a project base in another file lands
-///   on that file's; an external base (`unittest.TestCase`) lands on
-///   typeshed's. Assemble dispatches each key against `class_by_selection`
-///   with no chasing — sibling spellings collapse to one key because they
-///   share a `ClassLiteral`. Classes with no resolvable base are omitted.
+///   `class_by_selection`, and `specs` is a small-vec of [`ClassBaseSpec`]
+///   first-hop descriptors derived from each base expression via ty's
+///   use-def chain ([`crate::helpers::classify_base`]). The spec carries
+///   only this file's view — a same-file class name range, or an
+///   `(absolute module, member)` pair — never a resolved cross-file
+///   target, so editing the base's defining file doesn't dirty this
+///   payload. Assemble resolves each spec through
+///   [`crate::helpers::resolve_member_def`] and dispatches the resulting
+///   `(File, name_range)` against `class_by_selection`; sibling spellings
+///   collapse to one key because resolution lands them on the same
+///   canonical definition. Classes with no describable base are omitted.
 /// * `overload_anchors` — `(impl_local_idx, stub_local_idx)` pairs for
 ///   in-file `@typing.overload` groups. The assembly pass emits one
 ///   `impl → stub` edge per pair so reachability propagates from a
@@ -257,22 +258,34 @@ pub(crate) struct FileNodes<'db> {
     pub(crate) overload_anchors: Box<[(u32, u32)]>,
 }
 
-/// `(name_range_key, base_keys)` pair stored in
+/// `(name_range_key, base_specs)` pair stored in
 /// [`FileNodes::class_bases`]. The range key matches what the
 /// assemble pass writes into `class_by_selection`, so the project-wide
-/// fan-in is a hashmap probe.
-pub(crate) type ClassBaseEntry = ((u32, u32), SmallVec<[ClassBaseKey; 2]>);
+/// fan-in is a hashmap probe once each [`ClassBaseSpec`] is resolved.
+pub(crate) type ClassBaseEntry = ((u32, u32), SmallVec<[ClassBaseSpec; 2]>);
 
-/// A resolved class base: the `(File, name_range)` of the canonical
-/// `ClassLiteral` the base expression evaluates to, as computed by
-/// [`crate::helpers::class_literal_seed`] from ty's inferred type. This
-/// is byte-identical to the key the assemble pass writes into
-/// `class_by_selection` for a project class, and to the key the query
-/// side derives for an external base — so resolution, not chasing,
-/// collapses every spelling of one class (direct, aliased, re-exported,
-/// sibling-module) to a single key. The `(u32, u32)` is the name range's
-/// `(start, end)` byte offsets; `File` is lifetime-free (a salsa input).
-pub(crate) type ClassBaseKey = (File, (u32, u32));
+/// A symbolic, per-file description of one class base — the first hop
+/// only, with no cross-file resolution, so a file's payload stays
+/// invalidation-local (editing the base's defining file never dirties
+/// this one). [`crate::helpers::classify_base`] derives it from the base
+/// expression via ty's use-def chain; both the assemble pass and the
+/// query side then resolve it through
+/// [`crate::helpers::resolve_member_def`], so every spelling of one base
+/// (direct, aliased, re-exported, sibling-module) lands on the same
+/// `(File, name_range)` key by construction.
+///
+/// * `LocalClass` — the base name binds a class defined in *this* file;
+///   the `(start, end)` is that class's name range, byte-identical to the
+///   `class_by_selection` key the assemble pass mints for it.
+/// * `ModuleMember` — the base is a member `name` of absolute module
+///   `module` (a `from`-import, an attribute access on an imported
+///   module, or a same-file alias of one). Resolution maps it to the
+///   member's canonical definition range.
+#[derive(Debug, Clone, PartialEq, Eq, salsa::Update, get_size2::GetSize)]
+pub(crate) enum ClassBaseSpec {
+    LocalClass((u32, u32)),
+    ModuleMember { module: String, name: String },
+}
 
 /// Resolve a `NodeRef` to its `NodeData` payload.
 ///
@@ -632,15 +645,14 @@ pub(crate) fn file_to_nodes<'db>(db: &'db dyn ProjectDb, file: File) -> FileNode
         }
     }
 
-    // Resolve every top-level class base through ty's type system: each
-    // base expression's inferred type, when it names a statically-known
-    // class, yields that `ClassLiteral`'s `(File, name_range)` — the same
-    // key the assemble pass writes into `class_by_selection`. A cheap
-    // `SemanticModel` over this file drives it; classes with no
-    // resolvable base contribute nothing, so no project-wide chasing or
-    // re-parse is needed downstream.
-    let model = SemanticModel::new(db, file);
-    let class_bases = build_class_bases(&model, &parsed);
+    // Describe every top-level class base symbolically via ty's use-def
+    // chain: each base expression becomes a first-hop `ClassBaseSpec`
+    // (this file's view only — a same-file class range or an
+    // `(absolute module, member)` pair), never an eagerly-resolved
+    // cross-file target. Classes with no describable base contribute
+    // nothing; resolution is deferred to the assemble/query side, which
+    // keeps this payload invalidation-local.
+    let class_bases = build_class_bases(db, file, &parsed);
 
     FileNodes {
         nodes: nodes.into_boxed_slice(),
@@ -655,49 +667,38 @@ pub(crate) fn file_to_nodes<'db>(db: &'db dyn ProjectDb, file: File) -> FileNode
 
 /// Per-file class-hierarchy producer used by [`file_to_nodes`].
 ///
-/// For each top-level `ClassDef` with at least one statically-resolvable
-/// base, key on its name range and resolve every base expression through
-/// ty's type system to the `(File, name_range)` of the canonical
-/// `ClassLiteral` it names (see [`crate::helpers::class_literal_seed`]).
-/// The result is a flat list of `(name_range_key, base_keys)` pairs the
-/// assemble pass dispatches against `class_by_selection` with no chasing
-/// — one mechanism for every base shape:
+/// For each top-level `ClassDef` with at least one statically-describable
+/// base, key on its name range and describe every base expression
+/// symbolically via [`crate::helpers::classify_base`] — ty's use-def
+/// chain, this file's scope only. Each base becomes a [`ClassBaseSpec`]:
 ///
-/// * `Name(Base)`, whether `Base` is a same-file class, a direct import,
-///   a star import, or a module-level alias — ty infers the bound
-///   `ClassLiteral` directly.
-/// * `Attribute(mod.Base)` / deeper `a.b.Base` — ty resolves the
-///   attribute access to the same `ClassLiteral`, so a sibling-module
-///   spelling collapses onto the canonical class.
-/// * `Base[T]` — the subscript is unwrapped to `Base` so the bare class
-///   resolves (the specialized alias type wouldn't be a `ClassLiteral`).
+/// * a same-file class name → `LocalClass(range)` (the
+///   `class_by_selection` key the assemble pass mints for that class);
+/// * a `from`-import, an attribute access on an imported module
+///   (`mod.Base`, `a.b.Base`), or a same-file alias chain that bottoms
+///   out at one → `ModuleMember { module, name }` with an *absolute*
+///   module string.
 ///
-/// Anything ty can't pin to a single statically-known class (a dynamic
-/// base, `Generic[T]`/`Protocol[T]`, a union) yields no key and is
-/// dropped; a class left with no keys is omitted entirely.
-fn build_class_bases<'db>(
-    model: &SemanticModel<'db>,
+/// `Base[T]` is unwrapped to `Base` inside `classify_base`. Anything that
+/// doesn't bottom out at a class name or an importable member (a dynamic
+/// base, a bare imported module, a union) yields no spec and is dropped;
+/// a class left with no specs is omitted entirely. No cross-file
+/// resolution happens here — that's deferred to
+/// [`crate::helpers::resolve_member_def`] at assemble/query time.
+fn build_class_bases(
+    db: &dyn ProjectDb,
+    file: File,
     parsed: &ruff_db::parsed::ParsedModuleRef,
 ) -> Vec<ClassBaseEntry> {
-    use ruff_python_ast::Expr;
     let mut out: Vec<ClassBaseEntry> = Vec::new();
     for cls in iter_top_level_classes(parsed) {
         let Some(args) = &cls.arguments else {
             continue;
         };
-        let mut bases: SmallVec<[ClassBaseKey; 2]> = SmallVec::new();
+        let mut bases: SmallVec<[ClassBaseSpec; 2]> = SmallVec::new();
         for raw_base in &args.args {
-            // Unwrap `Foo[T]`, `Generic[T]`, `Protocol[T]` to the bare
-            // class so a subscripted generic base still resolves to its
-            // `ClassLiteral`; the specialized alias type would not.
-            let base_expr = match raw_base {
-                Expr::Subscript(s) => s.value.as_ref(),
-                other => other,
-            };
-            if let Some(ty) = base_expr.inferred_type(model) {
-                if let Some((file, rng)) = class_literal_seed(model.db(), ty) {
-                    bases.push((file, range_key(rng)));
-                }
+            if let Some(spec) = classify_base(db, file, parsed, raw_base, 0) {
+                bases.push(spec);
             }
         }
         if !bases.is_empty() {
