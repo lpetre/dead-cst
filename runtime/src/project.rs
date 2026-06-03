@@ -373,56 +373,77 @@ pub(crate) fn build_project_graph(
             dist_db.attach(|local_db| {
                 let _ = crate::file_payload::project_dist_lookup(local_db);
             });
+            // Stride the spawn order with a block transpose so the tasks
+            // in flight at any instant come from different packages. The
+            // path sort clusters a package's files contiguously, so a
+            // naive in-order fan-out runs sibling files concurrently and
+            // they contend on the shared upstream salsa queries a package
+            // resolves into (its `__init__`, common imports). Walking
+            // `lane * cols + col` column-major over a `lanes x cols` grid
+            // decorrelates neighbours: consecutive spawns sit `cols` apart
+            // in sorted order, i.e. in different packages. This only
+            // permutes processing order; each task still records its count
+            // at its true sorted `file_idx`, so offsets stay deterministic.
+            let lanes = num_workers.max(1);
+            let cols = files_ref.len().div_ceil(lanes);
             rayon::scope(|s| {
-                for (file_idx, &file) in files_ref.iter().enumerate() {
-                    let db_tx = db_tx.clone();
-                    let db_rx = db_rx.clone();
-                    let counters_inner = Arc::clone(&counters_ref);
-                    s.spawn(move |_| {
-                        let local_db = db_rx.recv().expect("snapshot available");
-                        local_db.attach(|local_db| {
-                            // Record this file's node count for the offset
-                            // prefix-sum. `nodes` and `refs` are parallel
-                            // arrays, so `nodes.len()` is exactly what the
-                            // assembly mint loop iterates for this file.
-                            counts_ref[file_idx].store(
-                                file_to_nodes(local_db, file).nodes.len(),
-                                Ordering::Relaxed,
-                            );
-                            let _ = file_to_edges(local_db, file);
-                            let _ = file_to_ref_edges(local_db, file);
-                            // Owned per-file facts for the project-wide
-                            // plugin queries. Warmed here, while the AST
-                            // is live, so the queries below run as cache
-                            // reads.
-                            let _ = file_extraction(local_db, file);
-                            // Per-file native plugins: warm the salsa-cached
-                            // `per_file_plugin_ops(file, id)` query on this
-                            // worker so the serial assembly fold below is a
-                            // pure cache read. `run_on_file` is GIL-free and
-                            // touches only this file, so it composes with the
-                            // GIL-released fan-out.
-                            for &id in per_file_ids_ref {
-                                let _ =
-                                    crate::native_plugins::per_file_plugin_ops(local_db, file, id);
-                            }
-                            // Every per-file AST consumer for this file has
-                            // now run and memoized its result, so drop the
-                            // parsed AST rather than let it sit resident
-                            // through assembly and the project-wide plugin
-                            // pass — that's the memory win. Assembly, fqname,
-                            // and the class hierarchy read only the cached
-                            // payloads (`class_bases`, `external_base_children`,
-                            // `children_by_node`), never the AST, so the
-                            // all-ASTs-resident peak never forms. Subclass
-                            // resolution can still pull an individual file's AST
-                            // back on demand to relocate a class seed; that rare
-                            // reload is re-cleared right after the plugin pass.
-                            parsed_module(local_db, file).clear();
+                for col in 0..cols {
+                    for lane in 0..lanes {
+                        let file_idx = lane * cols + col;
+                        if file_idx >= files_ref.len() {
+                            continue;
+                        }
+                        let file = files_ref[file_idx];
+                        let db_tx = db_tx.clone();
+                        let db_rx = db_rx.clone();
+                        let counters_inner = Arc::clone(&counters_ref);
+                        s.spawn(move |_| {
+                            let local_db = db_rx.recv().expect("snapshot available");
+                            local_db.attach(|local_db| {
+                                // Record this file's node count for the offset
+                                // prefix-sum. `nodes` and `refs` are parallel
+                                // arrays, so `nodes.len()` is exactly what the
+                                // assembly mint loop iterates for this file.
+                                counts_ref[file_idx].store(
+                                    file_to_nodes(local_db, file).nodes.len(),
+                                    Ordering::Relaxed,
+                                );
+                                let _ = file_to_edges(local_db, file);
+                                let _ = file_to_ref_edges(local_db, file);
+                                // Owned per-file facts for the project-wide
+                                // plugin queries. Warmed here, while the AST
+                                // is live, so the queries below run as cache
+                                // reads.
+                                let _ = file_extraction(local_db, file);
+                                // Per-file native plugins: warm the salsa-cached
+                                // `per_file_plugin_ops(file, id)` query on this
+                                // worker so the serial assembly fold below is a
+                                // pure cache read. `run_on_file` is GIL-free and
+                                // touches only this file, so it composes with the
+                                // GIL-released fan-out.
+                                for &id in per_file_ids_ref {
+                                    let _ = crate::native_plugins::per_file_plugin_ops(
+                                        local_db, file, id,
+                                    );
+                                }
+                                // Every per-file AST consumer for this file has
+                                // now run and memoized its result, so drop the
+                                // parsed AST rather than let it sit resident
+                                // through assembly and the project-wide plugin
+                                // pass — that's the memory win. Assembly, fqname,
+                                // and the class hierarchy read only the cached
+                                // payloads (`class_bases`, `external_base_children`,
+                                // `children_by_node`), never the AST, so the
+                                // all-ASTs-resident peak never forms. Subclass
+                                // resolution can still pull an individual file's AST
+                                // back on demand to relocate a class seed; that rare
+                                // reload is re-cleared right after the plugin pass.
+                                parsed_module(local_db, file).clear();
+                            });
+                            db_tx.send(local_db).expect("channel open");
+                            counters_inner.populate_inc();
                         });
-                        db_tx.send(local_db).expect("channel open");
-                        counters_inner.populate_inc();
-                    });
+                    }
                 }
             });
         };
