@@ -21,6 +21,7 @@ from libcst.metadata import FullRepoManager, MetadataWrapper
 
 from dead_cst.codemod import RemoveDeadSymbols, generate_patch, remove_code
 from dead_cst._fqn import FixedFullyQualifiedNameProvider
+from dead_cst.graph import NodeFlags
 
 
 def _normalise(s: str) -> str:
@@ -814,3 +815,29 @@ def test_generate_patch_per_subgraph_slice_isolates_decls(build_unreachable_node
     assert "-def dead_one():" in patch
     # The slice excludes dead_two, so the downstream SCC pass owns it.
     assert "-def dead_two():" not in patch
+
+
+def test_codemod_skips_star_reexport_per_name_nodes(build_unreachable_nodes, tmp_path):
+    """Per-name ``STAR_REEXPORT`` nodes share the ``*`` token's source
+    range, so the codemod must skip them: on their own they yield an
+    empty patch, and feeding the whole dead set never rewrites the
+    ``from X import *`` line they fan out from."""
+    unreachable = build_unreachable_nodes(
+        {
+            "consumer.py": "from helpers import *\ndef main():\n    return 1\n",
+            "helpers.py": "def helper_a(): pass\ndef helper_b(): pass\n",
+        },
+        {"consumer.main"},
+    )
+    per_name = [n for n in unreachable if n.flags & NodeFlags.STAR_REEXPORT]
+    assert {n.fqname for n in per_name} == {"consumer.helper_a", "consumer.helper_b"}
+
+    # Skipped entirely -- no removable span of their own.
+    assert generate_patch(per_name, tmp_path) == ""
+
+    # The full dead set deletes the dead ``helpers`` module but leaves
+    # ``consumer.py`` byte-for-byte intact: the star statement is not
+    # individually removable and the per-name nodes are skipped.
+    patch = generate_patch(unreachable, tmp_path)
+    assert "b/consumer.py" not in patch
+    assert "from helpers import *" in (tmp_path / "consumer.py").read_text()

@@ -85,9 +85,14 @@ class NodeFlags:
     owning package opts into exposing."""
 
     STAR_REEXPORT: int
-    """Import decl synthesized from ``from X import *`` — one per name
-    the star statement brought in. Set so the cross-module trie can
-    distinguish "real" import aliases from per-name star fan-out."""
+    """Per-name import decl synthesized from ``from X import *`` — one
+    node per name the star statement brought in, keyed on ty's
+    per-name ``StarImport`` definition so uses resolve straight to it.
+    Each edges to the kept ``<mod>.*<src>`` statement node (which
+    carries the single upstream-module edge and stays the unit the
+    codemod removes). The codemod skips ``STAR_REEXPORT`` nodes
+    themselves: they share the ``*`` statement's source range and have
+    no removable span of their own."""
 
 class EdgeFlags:
     """Bit values stamped into the third slot of each
