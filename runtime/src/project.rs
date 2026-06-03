@@ -668,9 +668,10 @@ fn assemble_graph<'db>(
                     module_nodes_by_file.insert(file, global_idx);
                 }
                 NodeRef::Def(d) => {
-                    let place_id = d.place(db);
+                    // `d` is already the `(file, place_id, name_range)`
+                    // triple `global_index` keys on.
+                    global_index.insert(d, global_idx);
                     let rk = node_data.name_range;
-                    global_index.insert((file, place_id, rk), global_idx);
                     if matches!(node_data.kind, NodeKind::Class) {
                         class_by_selection.insert((file, rk), global_idx);
                     }

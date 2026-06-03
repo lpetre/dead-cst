@@ -49,7 +49,7 @@ use ty_python_core::{semantic_index, SemanticIndex};
 use ty_python_semantic::SemanticModel;
 
 use crate::file_payload::{
-    file_to_nodes, import_payload_for_pure as import_payload_for, ExternalKey, FileNodes,
+    def_key, file_to_nodes, import_payload_for_pure as import_payload_for, ExternalKey, FileNodes,
     ImportPayload, NodeData, NodeKind, NodeRef,
 };
 
@@ -121,7 +121,7 @@ pub(crate) fn file_to_ref_edges<'db>(db: &'db dyn ProjectDb, file: File) -> File
         if def.file(db) != file || def.file_scope(db) != global {
             continue;
         }
-        let owner_ref = NodeRef::Def(def);
+        let owner_ref = NodeRef::Def(def_key(db, def, &parsed));
         if !self_nodes.ref_to_local.contains_key(&owner_ref) {
             continue;
         }
@@ -336,7 +336,7 @@ impl<'a, 'db> RefWalker<'a, 'db> {
                 if self.range_in_tc_block(def.full_range(db, self.parsed).range()) {
                     resolved_in_tc = true;
                 }
-                let candidate = NodeRef::Def(def);
+                let candidate = NodeRef::Def(def_key(self.db, def, self.parsed));
                 if self.self_nodes.ref_to_local.contains_key(&candidate) {
                     results.push(Resolution::Alias(candidate));
                     continue;
@@ -389,7 +389,7 @@ impl<'a, 'db> RefWalker<'a, 'db> {
                         if def.file(db) != self.file {
                             continue;
                         }
-                        let candidate = NodeRef::Def(def);
+                        let candidate = NodeRef::Def(def_key(self.db, def, self.parsed));
                         let Some(&idx) = self.self_nodes.ref_to_local.get(&candidate) else {
                             continue;
                         };
@@ -423,7 +423,7 @@ impl<'a, 'db> RefWalker<'a, 'db> {
                 if def.file(db) != self.file {
                     continue;
                 }
-                let candidate = NodeRef::Def(def);
+                let candidate = NodeRef::Def(def_key(self.db, def, self.parsed));
                 if self.self_nodes.ref_to_local.contains_key(&candidate) {
                     results.push(Resolution::Alias(candidate));
                 }
@@ -737,7 +737,7 @@ impl<'a, 'db> RefWalker<'a, 'db> {
             if def.file(self.model.db()) != self.file {
                 continue;
             }
-            let candidate = NodeRef::Def(def);
+            let candidate = NodeRef::Def(def_key(self.db, def, self.parsed));
             if self.self_nodes.ref_to_local.contains_key(&candidate) {
                 return Some(candidate);
             }

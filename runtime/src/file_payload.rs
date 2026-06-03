@@ -37,7 +37,7 @@ use ty_python_core::place::{PlaceExprRef, ScopedPlaceId};
 use ty_python_core::scope::FileScopeId;
 use ty_python_core::semantic_index;
 
-use crate::graph::NodeFlags;
+use crate::graph::{DeclKey, NodeFlags};
 use crate::helpers::{
     classify_base, collect_all_imports_local, file_default_flags, file_path_string,
     iter_top_level_classes, module_fqname_for_file, position, range_key, scan_noqa_directives,
@@ -51,18 +51,41 @@ use crate::ingest::{decl_kind_str, file_package_name, from_module_string};
 /// `NodeRef` to its final `u32` graph index after all per-file
 /// payloads are collected.
 ///
-/// `NodeRef::Def` covers every binding ty enumerates as a `Definition`.
+/// `NodeRef::Def` covers every binding ty enumerates as a `Definition`,
+/// keyed by an owned [`DeclKey`] (`(File, ScopedPlaceId, name_range)`)
+/// rather than the `Definition<'db>` itself. The triple is the same
+/// cross-file identity the assembly pass interns into `global_index`,
+/// and — unlike `Definition` — it carries no `semantic_index` lifetime,
+/// so storing it lets salsa evict the per-file `SemanticIndex` once the
+/// payloads are built. `def_key` mints it from a `Definition`.
 /// `NodeRef::Module` covers the synthetic `kind="module"` node per
 /// file — `File` is itself a salsa input ingredient, so its handle is
-/// stable and `Hash + Eq + Copy` just like `Definition`.
+/// stable and `Hash + Eq + Copy`.
 /// `NodeRef::External` covers the synthetic `[external] X` /
 /// `[stdlib] X` / `[unresolved] X` nodes via a globally-interned
 /// `ExternalKey` — same fqname produces the same key, dedup is free.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, salsa::Update, get_size2::GetSize)]
 pub(crate) enum NodeRef<'db> {
-    Def(Definition<'db>),
+    Def(DeclKey),
     Module(File),
     External(ExternalKey<'db>),
+}
+
+/// Mint the owned [`DeclKey`] for a global-scope `Definition`: the
+/// `(file, bound place, name target_range)` triple. Deterministic in
+/// `def`, so a construction site and a later lookup that pass the same
+/// `Definition` agree by construction — which is what lets
+/// `ref_to_local` and `global_index` use the key interchangeably.
+pub(crate) fn def_key<'db>(
+    db: &'db dyn ProjectDb,
+    def: Definition<'db>,
+    parsed: &ruff_db::parsed::ParsedModuleRef,
+) -> DeclKey {
+    (
+        def.file(db),
+        def.place(db),
+        range_key(def.kind(db).target_range(parsed)),
+    )
 }
 
 /// Globally-interned synthetic external node identity. Same `fqname`
@@ -304,7 +327,7 @@ pub(crate) enum ClassBaseSpec {
 pub(crate) fn ref_to_node<'db>(db: &'db dyn ProjectDb, r: NodeRef<'db>) -> NodeData {
     match r {
         NodeRef::Def(d) => {
-            let file = d.file(db);
+            let file = d.0;
             let payload = file_to_nodes(db, file);
             let idx = *payload
                 .ref_to_local
@@ -547,10 +570,13 @@ pub(crate) fn file_to_nodes<'db>(db: &'db dyn ProjectDb, file: File) -> FileNode
             imports: import_spec.clone(),
             name_range: (target_range.start().to_u32(), target_range.end().to_u32()),
         };
+        // Same triple `def_key` would mint, reusing the `place_id` /
+        // `target_range` already computed above.
+        let key = NodeRef::Def((file, place_id, range_key(target_range)));
         let local_idx = nodes.len() as u32;
         nodes.push(node);
-        refs.push(NodeRef::Def(def));
-        ref_to_local.insert(NodeRef::Def(def), local_idx);
+        refs.push(key);
+        ref_to_local.insert(key, local_idx);
 
         // Star-reexport tracking: mirror `ingest_decls`'s logic — a
         // later non-star binding for the same name clears the star
@@ -633,7 +659,7 @@ pub(crate) fn file_to_nodes<'db>(db: &'db dyn ProjectDb, file: File) -> FileNode
             if def.file(db) != file || def.file_scope(db) != global {
                 continue;
             }
-            if let Some(&local_idx) = ref_to_local.get(&NodeRef::Def(def)) {
+            if let Some(&local_idx) = ref_to_local.get(&NodeRef::Def(def_key(db, def, &parsed))) {
                 if nodes[local_idx as usize].flags & NodeFlags::OVERLOAD != 0 {
                     continue;
                 }
@@ -915,7 +941,7 @@ pub(crate) fn file_to_edges<'db>(db: &'db dyn ProjectDb, file: File) -> FileEdge
         if def.file(db) != file || def.file_scope(db) != global {
             continue;
         }
-        let alias_ref = NodeRef::Def(def);
+        let alias_ref = NodeRef::Def(def_key(db, def, &parsed));
         // Skip Definitions that file_to_nodes didn't mint (non-symbol
         // places, unsupported kinds). Keeps the edge set internally
         // consistent with the node set.
