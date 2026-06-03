@@ -677,6 +677,13 @@ fn assemble_graph<'db>(
                     }
                     decl_by_name_range.insert((file, rk), global_idx);
                 }
+                NodeRef::StarStmt(_, _) => {
+                    // The kept `*<src>` star-statement node. Not a real
+                    // decl, so it contributes nothing to the decl indices
+                    // (`global_index` / `decl_by_name_range` /
+                    // `class_by_selection`); `ref_to_global` +
+                    // `local_to_global` above already wired it up.
+                }
                 NodeRef::External(_) => {
                     // External NodeRefs never appear in FileNodes.refs;
                     // they're only emitted as edge endpoints. This

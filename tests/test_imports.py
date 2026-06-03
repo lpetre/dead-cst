@@ -10,6 +10,7 @@ import logging
 
 import pytest
 
+from dead_cst.graph import NodeFlags
 from dead_cst.plugins._core import EXTERNAL_PREFIXES, STDLIB_PREFIX, UNRESOLVED_PREFIX
 
 IMPORT_TEST_FILES = {
@@ -33,23 +34,6 @@ IMPORT_BASE_EDGES = frozenset(
         "p.functions.f -> p.functions",
         "p.functions.g -> p.functions",
         "p.x -> p",
-    }
-)
-
-# Edges from materializing ``from p.functions import *`` (or a synonym)
-# into ``p/x.py``: one synthetic re-export per name plus the
-# ``module -> synthetic -> target`` chain. Used by every star-shaped
-# test case in this file.
-STAR_REEXPORT_EDGES = frozenset(
-    {
-        "p.x -> p.x.f",
-        "p.x -> p.x.g",
-        "p.x.f -> p.functions",
-        "p.x.f -> p.functions.f",
-        "p.x.f -> p.x",
-        "p.x.g -> p.functions",
-        "p.x.g -> p.functions.g",
-        "p.x.g -> p.x",
     }
 )
 
@@ -427,23 +411,29 @@ STAR_REEXPORT_EDGES = frozenset(
             },
             id="import-package-then-dotted-access",
         ),
-        # libcst minted per-name synthetic aliases as a workaround for
-        # its inability to resolve uses *through* a star import; the
-        # rust backend leans on ty and mints one node per
-        # `from X import *` statement (named `<mod>.*<src>`) with a
-        # single outgoing edge to the upstream module. Use sites
-        # route through this node and emit the standard parallel
+        # `from X import *` mints one `STAR_REEXPORT`-flagged per-name
+        # node per name X exports (`p.x.f`, `p.x.g`) plus the kept
+        # `<mod>.*<src>` statement node (`p.x.*p.functions`). Each
+        # per-name node edges to the statement node; the statement node
+        # carries the single upstream-module edge. Because the per-name
+        # nodes are keyed on the same ty definition each use resolves
+        # to, a use site attributes straight to its per-name node
+        # (`p.x.a -> p.x.f`) and still emits the standard parallel
         # upstream module/decl edges via ty's name resolution
         # (Principle 2).
         pytest.param(
             "from p.functions import *\ndef a(): f()",
             {
-                "p.x.*p.functions -> p.x",
                 "p.x.*p.functions -> p.functions",
-                "p.x.a -> p.x",
-                "p.x.a -> p.x.*p.functions",
+                "p.x.*p.functions -> p.x",
                 "p.x.a -> p.functions",
                 "p.x.a -> p.functions.f",
+                "p.x.a -> p.x",
+                "p.x.a -> p.x.f",
+                "p.x.f -> p.x",
+                "p.x.f -> p.x.*p.functions",
+                "p.x.g -> p.x",
+                "p.x.g -> p.x.*p.functions",
             },
             id="star-import-fans-out-to-all-decls-rust",
         ),
@@ -697,14 +687,14 @@ def test_imports(build_decl_graph, assert_edges, src, expected_extra_edges):
         ),
         pytest.param(
             # ``from pkg import g`` resolves through the star node to
-            # ``pkg._internal.g``. The rust backend mints one
-            # ``*pkg._internal`` node per ``from pkg._internal import *``
-            # statement rather than a per-name ``pkg.g`` alias; ty
-            # resolves ``from pkg import g`` straight to
-            # ``pkg._internal.g``, so the consumer alias edges directly
-            # to the upstream decl. The absence of any
-            # ``consumer.g -> pkg.g`` edge from the set below codifies
-            # the "no per-name alias is minted" invariant.
+            # ``pkg._internal.g``. ``pkg`` mints a ``STAR_REEXPORT``
+            # per-name node ``pkg.g`` that edges to the kept
+            # ``*pkg._internal`` statement node, which carries the
+            # single upstream-module edge. The consumer's import alias
+            # chases the star chain to the *real* decl, so it edges to
+            # ``pkg._internal.g`` (not the intermediate ``pkg.g``); the
+            # module-level ``g()`` use emits the parallel reachability
+            # edge to the immediate binding ``pkg.g``.
             {
                 "pkg/__init__.py": "from pkg._internal import *\n",
                 "pkg/_internal.py": "def g(): pass\n",
@@ -713,7 +703,7 @@ def test_imports(build_decl_graph, assert_edges, src, expected_extra_edges):
             {
                 "consumer -> consumer.g",
                 "consumer -> pkg",
-                "consumer -> pkg.*pkg._internal",
+                "consumer -> pkg.g",
                 "consumer.g -> consumer",
                 "consumer.g -> pkg",
                 "consumer.g -> pkg._internal.g",
@@ -722,12 +712,17 @@ def test_imports(build_decl_graph, assert_edges, src, expected_extra_edges):
                 "pkg._internal -> pkg",
                 "pkg._internal -> pkg._internal",
                 "pkg._internal.g -> pkg._internal",
+                "pkg.g -> pkg",
+                "pkg.g -> pkg.*pkg._internal",
             },
             id="import-resolves-through-star-reexport",
         ),
         pytest.param(
             # ``from A import g`` follows the ``A -> B -> C`` star
-            # chain to ``C.g``.
+            # chain to ``C.g``. Each link mints its own ``STAR_REEXPORT``
+            # per-name ``g`` node (``A.g``, ``B.g``) edging to that
+            # link's kept statement node; the consumer alias still
+            # chases the chain to the terminal real decl ``C.g``.
             {
                 "A.py": "from B import *\n",
                 "B.py": "from C import *\n",
@@ -737,11 +732,15 @@ def test_imports(build_decl_graph, assert_edges, src, expected_extra_edges):
             {
                 "A.*B -> A",
                 "A.*B -> B",
+                "A.g -> A",
+                "A.g -> A.*B",
                 "B.*C -> B",
                 "B.*C -> C",
+                "B.g -> B",
+                "B.g -> B.*C",
                 "C.g -> C",
                 "consumer -> A",
-                "consumer -> A.*B",
+                "consumer -> A.g",
                 "consumer -> consumer.g",
                 "consumer.g -> A",
                 "consumer.g -> C.g",
@@ -752,7 +751,14 @@ def test_imports(build_decl_graph, assert_edges, src, expected_extra_edges):
         pytest.param(
             # Mutual ``from B import *`` / ``from A import *``
             # terminates without spinning; consumer's ``b`` still
-            # resolves to ``B.b``.
+            # resolves to ``B.b``. Each module re-exports both names, so
+            # within ``A`` the name ``a`` exists twice: the real
+            # ``def a`` and a ``STAR_REEXPORT`` per-name node (``a``
+            # round-tripped back through ``from B import *``). They
+            # share the fqname ``A.a`` but are distinct nodes keyed on
+            # different definitions, so the set shows both the real
+            # decl's anchor (``A.a -> A``) and the per-name node's
+            # statement edge (``A.a -> A.*B``); likewise for ``B.b``.
             {
                 "A.py": "from B import *\ndef a(): pass\n",
                 "B.py": "from A import *\ndef b(): pass\n",
@@ -762,9 +768,15 @@ def test_imports(build_decl_graph, assert_edges, src, expected_extra_edges):
                 "A.*B -> A",
                 "A.*B -> B",
                 "A.a -> A",
+                "A.a -> A.*B",
+                "A.b -> A",
+                "A.b -> A.*B",
                 "B.*A -> A",
                 "B.*A -> B",
+                "B.a -> B",
+                "B.a -> B.*A",
                 "B.b -> B",
+                "B.b -> B.*A",
                 "consumer.b -> A",
                 "consumer.b -> B.b",
                 "consumer.b -> consumer",
@@ -776,7 +788,11 @@ def test_imports(build_decl_graph, assert_edges, src, expected_extra_edges):
             # re-export of the same name. The absence of
             # ``consumer.g -> other.g`` from the set below codifies
             # that the consumer's ``g`` resolves to ``mod.g`` (not
-            # through the star re-export to ``other.g``).
+            # through the star re-export to ``other.g``). The shadowed
+            # ``STAR_REEXPORT`` per-name node still exists -- it shares
+            # the fqname ``mod.g`` with the real decl but is a distinct
+            # node, contributing the ``mod.g -> mod.*other`` statement
+            # edge.
             {
                 "other.py": "def g(): pass\n",
                 "mod.py": "from other import *\ndef g(): return 1\n",
@@ -792,6 +808,7 @@ def test_imports(build_decl_graph, assert_edges, src, expected_extra_edges):
                 "mod.*other -> mod",
                 "mod.*other -> other",
                 "mod.g -> mod",
+                "mod.g -> mod.*other",
                 "other.g -> other",
             },
             id="star-reexport-shadowed-by-real-decl",
@@ -1172,14 +1189,20 @@ def test_from_import_prefers_namespace_binding_over_submodule(build_decl_graph):
     assert ("p.q", "module") not in targets, targets
 
 
-def test_star_reexport_is_skipped_by_codemod_rust(build_decl_graph):
-    """The rust backend mints one node per ``from X import *`` named
-    ``<mod>.*<src>`` with ``kind="import"`` and an ``imports.star=True``
-    payload — the ``*`` prefix is the codemod's marker."""
+def test_star_reexport_mints_per_name_and_statement_nodes(build_decl_graph):
+    """``from X import *`` mints a per-name ``STAR_REEXPORT`` node for
+    each name X exports *and* the kept ``<mod>.*<src>`` statement node.
+
+    The statement node (``kind="import"``, ``imports.star=True``, the
+    ``*`` prefix as the codemod marker) is the removable unit and is
+    *not* ``STAR_REEXPORT``-flagged. The per-name nodes are flagged so
+    the codemod skips them -- they share the ``*`` token's source range
+    and have no removable span of their own.
+    """
     graph = build_decl_graph(
         {
             "pkg/__init__.py": "from pkg._internal import *\n",
-            "pkg/_internal.py": "def g(): pass\n",
+            "pkg/_internal.py": "def g(): pass\ndef h(): pass\n",
         }
     )
     star_nodes = [
@@ -1189,6 +1212,15 @@ def test_star_reexport_is_skipped_by_codemod_rust(build_decl_graph):
     assert star_nodes[0].imports is not None
     assert star_nodes[0].imports.star is True
     assert star_nodes[0].imports.module == "pkg._internal"
+    # The statement node is the removable unit, so it carries no
+    # STAR_REEXPORT flag.
+    assert not star_nodes[0].flags & NodeFlags.STAR_REEXPORT
+
+    # One STAR_REEXPORT-flagged per-name node per name _internal exports.
+    per_name = {
+        n.fqname for n in graph.nodes() if n.flags & NodeFlags.STAR_REEXPORT and n.kind == "import"
+    }
+    assert per_name == {"pkg.g", "pkg.h"}
 
 
 def test_cross_dep_submodule_import(tmp_path, make_analysis, assert_edges):

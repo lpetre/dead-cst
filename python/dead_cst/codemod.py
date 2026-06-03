@@ -99,6 +99,11 @@ def _select_files(
 
     ``NodeFlags.NOTEBOOK`` nodes are dropped: cell-aware writeback into
     the notebook JSON envelope is not implemented today.
+
+    ``NodeFlags.STAR_REEXPORT`` nodes are dropped: a per-name binding from
+    ``from mod import *`` has no source range of its own (it shares the
+    ``*`` token), so it can't be removed individually. The statement-level
+    ``mod.*<src>`` node -- unflagged -- stays the removable unit.
     """
     by_file: dict[Path, list[SymbolNode]] = {}
     deleted_modules: list[Path] = []
@@ -109,6 +114,8 @@ def _select_files(
         if not path.exists():
             continue
         if node.flags & NodeFlags.NOTEBOOK:
+            continue
+        if node.flags & NodeFlags.STAR_REEXPORT:
             continue
         match node.kind:
             case "function" | "class" | "variable" | "type_alias" | "import":

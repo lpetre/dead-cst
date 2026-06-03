@@ -143,16 +143,16 @@ def test_aliased_import_binds_asname(project_factory):
     assert "pkg.mod.gee -> pkg.other.g" in _edges(g)
 
 
-def test_star_import_mints_one_node_per_statement(project_factory):
-    """`from X import *` mints exactly one `kind=import` node per
-    statement (named `<importing_module>.*<source>`), not one per
-    name `X` exports — ty already resolves uses of star-bound names
-    to their specific upstream definitions, so the per-name aliases
-    libcst minted as a workaround aren't needed here. The single
-    star node carries one outgoing edge to the upstream module; uses
-    of star-bound names emit `use → star_node` plus the standard
-    parallel `use → upstream_module` / `use → upstream_decl` edges
-    via Principle 2.
+def test_star_import_mints_per_name_nodes_plus_statement_node(project_factory):
+    """`from X import *` mints one `STAR_REEXPORT`-flagged per-name
+    `kind=import` node for each name `X` exports, plus the kept
+    statement node `<importing_module>.*<source>`. Each per-name node
+    edges to the statement node, which carries the single outgoing
+    edge to the upstream module. Because the per-name nodes are keyed
+    on ty's per-name `StarImport` definitions, uses of star-bound names
+    resolve straight to them (alongside the standard parallel
+    `use → upstream_module` / `use → upstream_decl` edges, Principle 2).
+    Underscored names `X` doesn't export are skipped.
     """
     proj, _ = project_factory(
         {
@@ -163,20 +163,28 @@ def test_star_import_mints_one_node_per_statement(project_factory):
     )
     g = proj.build()
     fqs = _fqnames(g)
-    # One star node per statement — the underscored-private decl
-    # didn't matter for node count, and per-name `pkg.mod.g` /
-    # `pkg.mod.h` aliases are gone.
+    # The kept statement node plus one per-name node per exported name;
+    # the underscored-private decl is not star-exported.
     assert "pkg.mod.*pkg.other" in fqs
-    assert "pkg.mod.g" not in fqs
-    assert "pkg.mod.h" not in fqs
+    assert "pkg.mod.g" in fqs
+    assert "pkg.mod.h" in fqs
+    assert "pkg.mod._private" not in fqs
+    per_name = {n.fqname for n in g.nodes if n.flags & NodeFlags.STAR_REEXPORT}
+    assert per_name == {"pkg.mod.g", "pkg.mod.h"}
+
     edges = _edges(g)
-    # Star alias's one outgoing edge: to the upstream module.
+    # Each per-name node edges to the statement node; the statement
+    # node carries the single upstream-module edge.
+    assert "pkg.mod.g -> pkg.mod.*pkg.other" in edges
+    assert "pkg.mod.h -> pkg.mod.*pkg.other" in edges
     assert "pkg.mod.*pkg.other -> pkg.other" in edges
-    # Use sites: alias edge through the star + parallel upstream
-    # (ty's resolution finds `g` / `h` in `pkg.other`).
-    assert "pkg.mod.use -> pkg.mod.*pkg.other" in edges
+    # Uses resolve to the per-name nodes, not through the statement
+    # node, plus the parallel upstream-decl edges via ty's resolution.
+    assert "pkg.mod.use -> pkg.mod.g" in edges
+    assert "pkg.mod.use -> pkg.mod.h" in edges
     assert "pkg.mod.use -> pkg.other.g" in edges
     assert "pkg.mod.use -> pkg.other.h" in edges
+    assert "pkg.mod.use -> pkg.mod.*pkg.other" not in edges
 
 
 def test_star_import_node_carries_star_spec(project_factory):

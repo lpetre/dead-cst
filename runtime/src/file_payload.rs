@@ -69,6 +69,14 @@ pub(crate) enum NodeRef<'db> {
     Def(DeclKey),
     Module(File),
     External(ExternalKey<'db>),
+    /// The kept `*<module>` node for a `from <module> import *` statement.
+    /// Keyed on `(file, <star-token range>)` rather than a ty def: the
+    /// per-name `StarImport` defs back the individual `STAR_REEXPORT`
+    /// nodes now, so the statement-level node it folds into needs its own
+    /// identity. Carries the import payload + the module-level upstream
+    /// edge, and stays the unit the codemod removes when the whole star
+    /// import is unused.
+    StarStmt(File, (u32, u32)),
 }
 
 /// Mint the owned [`DeclKey`] for a global-scope `Definition`: the
@@ -340,6 +348,15 @@ pub(crate) fn ref_to_node<'db>(db: &'db dyn ProjectDb, r: NodeRef<'db>) -> NodeD
             let payload = file_to_nodes(db, f);
             payload.nodes[0].clone()
         }
+        NodeRef::StarStmt(file, _) => {
+            let payload = file_to_nodes(db, file);
+            let idx = *payload
+                .ref_to_local
+                .get(&r)
+                .expect("NodeRef::StarStmt does not belong to its claimed file's payload")
+                as usize;
+            payload.nodes[idx].clone()
+        }
         NodeRef::External(k) => NodeData {
             fqname: k.fqname(db).clone(),
             kind: NodeKind::Synthetic,
@@ -452,11 +469,11 @@ pub(crate) fn file_to_nodes<'db>(db: &'db dyn ProjectDb, file: File) -> FileNode
     let use_def_map = index.use_def_map(global);
 
     // Star imports: ty mints one Definition per name brought in by
-    // `from X import *`, but every per-name def from the same statement
-    // shares the `*` token's range. Cache the synthesized `*<src>`
-    // local name so we don't re-format / re-resolve it N times for
-    // a star with N names. Identical names → identical NodeData →
-    // dedup happens naturally at assembly time.
+    // `from X import *`, each kept as its own `STAR_REEXPORT` node. Every
+    // per-name def from the same statement shares the `*` token's range,
+    // so this map (range → `*<src>` fqname) doubles as the "already
+    // minted the statement-level `*<src>` node?" guard — `insert`
+    // returning `None` means this is the first name of the statement.
     let mut star_local_name_cache: HashMap<TextRange, String> = HashMap::new();
 
     let mut star_reexports: FxHashMap<String, String> = FxHashMap::default();
@@ -504,16 +521,11 @@ pub(crate) fn file_to_nodes<'db>(db: &'db dyn ProjectDb, file: File) -> FileNode
         let per_name = symbol.name().as_str().to_string();
 
         let target_range = kind.target_range(&parsed);
-        let local_name = match kind {
-            DefinitionKind::StarImport(k) => star_local_name_cache
-                .entry(target_range)
-                .or_insert_with(|| {
-                    let src = from_module_string(db, file, k.import(&parsed));
-                    format!("*{src}")
-                })
-                .clone(),
-            _ => per_name.clone(),
-        };
+        let is_star = matches!(kind, DefinitionKind::StarImport(_));
+        // Per-name star bindings keep their real name now (one
+        // `STAR_REEXPORT` node per exported name); the statement-level
+        // `*<src>` node is minted separately, once, below.
+        let local_name = per_name.clone();
 
         let (mut sl, mut sc, el, ec) = position(&line_index, &source, target_range);
 
@@ -541,9 +553,9 @@ pub(crate) fn file_to_nodes<'db>(db: &'db dyn ProjectDb, file: File) -> FileNode
         };
 
         let mut flags: u32 = default_flags;
-        if matches!(node_kind, NodeKind::Import)
-            && (file_pinned_by_noqa || per_line_noqa_pins.contains(&sl))
-        {
+        let import_noqa_pin = matches!(node_kind, NodeKind::Import)
+            && (file_pinned_by_noqa || per_line_noqa_pins.contains(&sl));
+        if import_noqa_pin {
             flags |= NODE_FLAGS_NOQA_PIN;
         }
         // `@typing.overload`-decorated function defs: flag now so the
@@ -552,6 +564,13 @@ pub(crate) fn file_to_nodes<'db>(db: &'db dyn ProjectDb, file: File) -> FileNode
         // exactly what `DefinitionKind::Function::target_range` returns.
         if matches!(node_kind, NodeKind::Function) && overload_decorated.contains(&target_range) {
             flags |= NodeFlags::OVERLOAD;
+        }
+        // Per-name implicit star bindings: flag so the codemod skips
+        // them. They share the `*` token's range and can't be removed
+        // individually; the `*<src>` statement node (minted below, no
+        // `STAR_REEXPORT` flag) stays the removable unit.
+        if is_star {
+            flags |= NodeFlags::STAR_REEXPORT;
         }
         // Stub-only ENTRYPOINT flagging is deferred to the assembly
         // pass; it needs the project-wide peer-stub map and the .py
@@ -577,6 +596,43 @@ pub(crate) fn file_to_nodes<'db>(db: &'db dyn ProjectDb, file: File) -> FileNode
         nodes.push(node);
         refs.push(key);
         ref_to_local.insert(key, local_idx);
+
+        // Mint the statement-level `*<src>` node once per `from <src>
+        // import *` (keyed on the shared `*` token range). It carries the
+        // import payload + the module-level upstream edge, and stays the
+        // codemod's removable unit — so it gets the import flags but NOT
+        // `STAR_REEXPORT`. The per-name nodes above edge into it.
+        if is_star {
+            if let Some(spec) = &import_spec {
+                let star_fqname = format!("{module_fqname}.*{}", spec.module);
+                if star_local_name_cache
+                    .insert(target_range, star_fqname.clone())
+                    .is_none()
+                {
+                    let mut star_flags: u32 = default_flags;
+                    if import_noqa_pin {
+                        star_flags |= NODE_FLAGS_NOQA_PIN;
+                    }
+                    let star_node = NodeData {
+                        fqname: star_fqname,
+                        kind: NodeKind::Import,
+                        path: path_str.clone(),
+                        start_line: sl,
+                        start_column: sc,
+                        end_line: el,
+                        end_column: ec,
+                        flags: star_flags,
+                        imports: import_spec.clone(),
+                        name_range: (target_range.start().to_u32(), target_range.end().to_u32()),
+                    };
+                    let star_key = NodeRef::StarStmt(file, range_key(target_range));
+                    let star_idx = nodes.len() as u32;
+                    nodes.push(star_node);
+                    refs.push(star_key);
+                    ref_to_local.insert(star_key, star_idx);
+                }
+            }
+        }
 
         // Star-reexport tracking: mirror `ingest_decls`'s logic — a
         // later non-star binding for the same name clears the star
@@ -941,7 +997,7 @@ pub(crate) fn file_to_edges<'db>(db: &'db dyn ProjectDb, file: File) -> FileEdge
         if def.file(db) != file || def.file_scope(db) != global {
             continue;
         }
-        let alias_ref = NodeRef::Def(def_key(db, def, &parsed));
+        let mut alias_ref = NodeRef::Def(def_key(db, def, &parsed));
         // Skip Definitions that file_to_nodes didn't mint (non-symbol
         // places, unsupported kinds). Keeps the edge set internally
         // consistent with the node set.
@@ -984,17 +1040,20 @@ pub(crate) fn file_to_edges<'db>(db: &'db dyn ProjectDb, file: File) -> FileEdge
                 (target, None)
             }
             DefinitionKind::StarImport(k) => {
-                // `from X import *` — emit only the module-level
-                // edge (`alias → Module(X)`); no per-name decl
-                // fan-out. We collapse the per-name aliases to one
-                // node per statement (see file_to_nodes), and the
-                // existing pipeline matches this by returning
-                // Vec::new() in resolve_from_imported's StarImport
-                // branch. Uses of star-bound names still get
-                // resolved via walk_exports_chain on the consumer's
-                // from-import lookup; the chain walk takes care of
-                // them.
+                // `from X import *`. Each per-name `STAR_REEXPORT` node
+                // edges into the kept statement-level `*X` node, which in
+                // turn carries the module-level edge (`*X → Module(X)`).
+                // Rebind `alias_ref` to that `*X` node so the generic
+                // resolution below (stdlib / external / unresolved
+                // handling) emits the upstream edge from `*X`, not from
+                // the per-name node. Uses of star-bound names land on the
+                // per-name node (ty's use-def chain distinguishes them);
+                // `from <here> import name` lookups resolve per-name via
+                // walk_exports_chain.
                 let module = from_module_string(db, file, k.import(&parsed));
+                let star_ref = NodeRef::StarStmt(file, range_key(kind.target_range(&parsed)));
+                edges.insert((alias_ref, star_ref, 0));
+                alias_ref = star_ref;
                 (module, None)
             }
             _ => continue,

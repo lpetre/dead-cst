@@ -211,6 +211,19 @@ two versions.
 
 ### Changed
 
+- **`from X import *` now mints a node per re-exported name.** Previously a
+  star import collapsed to a single `<mod>.*<source>` statement node. It now
+  also mints one `NodeFlags.STAR_REEXPORT` per-name `kind="import"` node for
+  each name `X` exports (`mod.g`, `mod.h`, …), each keyed on ty's per-name
+  `StarImport` definition so a use of a star-bound name resolves *straight to
+  its own node* rather than to the shared statement node. Every per-name node
+  edges to the kept statement node, which retains the single upstream-module
+  edge and stays the unit the codemod removes; cross-module `from X import g`
+  still chases the star chain to the real upstream decl. The codemod skips
+  `STAR_REEXPORT` nodes — they share the `*` token's source range and have no
+  removable span of their own — so a dead star import is handled exactly as
+  before. This grows the graph but lets shadowed/duplicate star re-exports and
+  per-name reachability be expressed precisely.
 - **Per-file parsed ASTs are freed mid-build to cut the memory peak.** The
   project-wide plugin queries that used to re-walk each file's AST (parameters,
   class-defining-method, decorators, constructions, factories, and the
