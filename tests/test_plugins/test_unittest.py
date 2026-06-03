@@ -312,7 +312,7 @@ def test_unittest_plugin_marks_three_level_subclass_chain(build_plugin_graph, re
 
 def test_unittest_plugin_marks_subclass_via_module_alias(build_plugin_graph, reachable_fqnames):
     """A module-level alias of an imported ``TestCase`` (``Base = TestCase``)
-    resolves statically through the uniform binder ladder."""
+    resolves statically through ty's use-def chain."""
     graph = build_plugin_graph(
         {
             "pkg/__init__.py": "",
@@ -334,10 +334,9 @@ def test_unittest_plugin_marks_subclass_via_relative_reexport(
     build_plugin_graph, reachable_fqnames
 ):
     """A ``TestCase`` re-exported through a *relative* import
-    (``from .bases import TestCase``) resolves statically: the binder ladder
-    reads ``im.level`` and resolves the dotted prefix against the importing
-    file's package, so the cross-file chase reaches the external seed with no
-    ``find_references`` walk."""
+    (``from .bases import TestCase``) resolves statically: the shared member
+    resolver follows the re-export through ty's module resolver to the external
+    seed, with no ``find_references`` walk."""
     graph = build_plugin_graph(
         {
             "pkg/__init__.py": "",
@@ -356,8 +355,9 @@ def test_unittest_plugin_marks_subclass_via_relative_reexport(
 
 def test_unittest_plugin_marks_subclass_via_attribute_alias(build_plugin_graph, reachable_fqnames):
     """A module-level alias whose RHS is an *attribute* on an imported module
-    (``Base = unittest.TestCase``) binds through the uniform binder ladder to
-    the absolute fqn, so ``class MyThings(Base)`` resolves its base."""
+    (``Base = unittest.TestCase``) decomposes to its absolute ``module``/``name``
+    reference (resolved through ty's module resolver), so ``class MyThings(Base)``
+    resolves its base."""
     graph = build_plugin_graph(
         {
             "pkg/__init__.py": "",
