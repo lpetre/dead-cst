@@ -237,6 +237,37 @@ def test_submodule_edges_to_parent(project_factory):
 
 
 # ---------------------------------------------------------------------------
+# Deterministic node indices
+# ---------------------------------------------------------------------------
+
+
+def test_node_indices_follow_sorted_file_order(project_factory):
+    """Global node indices are a pure function of (sorted file position,
+    local index): each file's nodes occupy one contiguous index run, and
+    the runs ascend by file path. ty's `files()` set has no stable
+    iteration order, so the build sorts files first — without that, these
+    indices (and everything keyed on them) would vary run-to-run."""
+    proj, _ = project_factory(
+        {
+            "z.py": "def z(): pass\n",
+            "a.py": "def a(): pass\n",
+            "pkg/__init__.py": "",
+            "pkg/m.py": "def m(): pass\n",
+        }
+    )
+    g = proj.build()
+    # Per-file nodes carry the file's path; synthetics (none here) carry "".
+    paths = [n.path for n in g.nodes if n.path]
+    first_seen = list(dict.fromkeys(paths))
+    # Each file is one contiguous run of indices (offset placement, no
+    # interleaving): the number of run-starts equals the distinct count.
+    run_starts = sum(1 for i, p in enumerate(paths) if i == 0 or paths[i - 1] != p)
+    assert run_starts == len(first_seen)
+    # The runs ascend by path — the deterministic, sorted order.
+    assert first_seen == sorted(first_seen)
+
+
+# ---------------------------------------------------------------------------
 # Shadowed declarations (Principle 3 — first-class graph nodes)
 # ---------------------------------------------------------------------------
 

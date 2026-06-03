@@ -211,6 +211,13 @@ two versions.
 
 ### Changed
 
+- **Graph node indices are now deterministic across runs.** ty's `files()`
+  set has no stable iteration order, so the global index assigned to each node
+  (and therefore the order of `Analysis.dead()` / `reachable()` results and the
+  CLI's reports) could vary run-to-run. The build now sorts files into
+  canonical path order and assigns each node a position-derived index
+  (`offset[file] + local_index`) — the per-file offsets come from prefix-summing
+  node counts captured during the parallel fan-out — so output is reproducible.
 - **`from X import *` now mints a node per re-exported name.** Previously a
   star import collapsed to a single `<mod>.*<source>` statement node. It now
   also mints one `NodeFlags.STAR_REEXPORT` per-name `kind="import"` node for
