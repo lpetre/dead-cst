@@ -388,6 +388,15 @@ pub(crate) enum PreparedOp {
     Entrypoint {
         decl_idx: usize,
     },
+    /// OR `flags` onto an existing decl's node flags (no new node). Unlike
+    /// [`PreparedOp::Entrypoint`] (which always ORs `ENTRYPOINT`), the bits
+    /// are caller-supplied — used to stamp a registered node flag, e.g.
+    /// `test/testcase`, directly on a decl the plugin discovered rather than
+    /// routing it through a seed marker node.
+    FlagDecl {
+        decl_idx: usize,
+        flags: u32,
+    },
     Node {
         fqname: String,
         kind: &'static str,
@@ -461,6 +470,12 @@ fn apply_prepared(
             // marker node, since reachability seeds off the flag, not
             // an edge from a marker.
             outputs.builder.nodes[decl_idx].flags |= NODE_FLAG_ENTRYPOINT;
+            Ok(())
+        }
+        PreparedOp::FlagDecl { decl_idx, flags } => {
+            let len = outputs.builder.nodes.len();
+            check_idx_in_range(len, decl_idx, "PreparedOp::FlagDecl", "decl_idx")?;
+            outputs.builder.nodes[decl_idx].flags |= flags;
             Ok(())
         }
         PreparedOp::Node {

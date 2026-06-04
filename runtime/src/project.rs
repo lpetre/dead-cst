@@ -1013,6 +1013,8 @@ fn assemble_graph<'db>(
 /// * [`FileLocalOp::Edge`] → add the translated edge with its flags.
 /// * [`FileLocalOp::Entrypoint`] → OR [`NODE_FLAG_ENTRYPOINT`] onto the
 ///   decl itself (reachability seeds off the flag, not a marker node).
+/// * [`FileLocalOp::FlagDecl`] → OR the caller-supplied flags onto the
+///   decl itself (e.g. a registered plugin flag like `test/testcase`).
 ///
 /// Endpoints are file-local indices into that file's `FileNodes.refs`;
 /// `local_to_global` maps them to global node indices (built in pass
@@ -1087,6 +1089,15 @@ fn fold_per_file_plugin_ops(
                         // synthetic marker node (reachability seeds off
                         // the flag, not an edge from a marker).
                         builder.nodes[decl_idx].flags |= NODE_FLAG_ENTRYPOINT;
+                    }
+                    FileLocalOp::FlagDecl {
+                        decl_local_idx,
+                        flags,
+                    } => {
+                        let Some(decl_idx) = to_global(*decl_local_idx) else {
+                            continue;
+                        };
+                        builder.nodes[decl_idx].flags |= flags;
                     }
                 }
             }

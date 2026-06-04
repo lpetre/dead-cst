@@ -254,6 +254,10 @@ pub(crate) enum FileLocalOp {
     /// (`PreparedOp::Entrypoint` shape). ``decl_local_idx`` is a file-local
     /// index.
     Entrypoint { decl_local_idx: u32 },
+    /// OR `flags` onto an existing node in this file (`PreparedOp::FlagDecl`
+    /// shape). ``decl_local_idx`` is a file-local index; unlike
+    /// [`FileLocalOp::Entrypoint`] the bits are caller-supplied.
+    FlagDecl { decl_local_idx: u32, flags: u32 },
 }
 
 /// Read-only, single-file view a [`plugin_api::PerFilePlugin`] is run
@@ -1998,6 +2002,15 @@ pub mod plugin_api {
             self.sink.push(PreparedOp::Entrypoint { decl_idx });
         }
 
+        /// OR `flags` onto the existing decl at `decl_idx` (no new node).
+        /// Use this to stamp a registered node flag — the bit resolved from
+        /// [`PluginCtx::node_flag`] — directly on a discovered decl, instead
+        /// of routing it through a seed marker node. Emits a
+        /// [`PreparedOp::FlagDecl`].
+        pub fn flag_decl(&mut self, decl_idx: usize, flags: u32) {
+            self.sink.push(PreparedOp::FlagDecl { decl_idx, flags });
+        }
+
         /// Add a reachability edge `src_idx -> dst_idx` between two
         /// existing nodes, stamped with `flags` (`0` for a plain edge, or
         /// one of [`FLAG_DEAD_BRANCH`] / [`FLAG_DYNAMIC_IMPORT`]). Emits a
@@ -2252,6 +2265,18 @@ pub mod plugin_api {
             self.sink.push(FileLocalOp::Entrypoint { decl_local_idx });
         }
 
+        /// OR `flags` onto the existing node at file-local index
+        /// `decl_local_idx` (no new node) — the per-file twin of
+        /// [`PluginOps::flag_decl`]. The index is a position in
+        /// [`PluginFileCtx::nodes`]; an index with no node is dropped at
+        /// apply time. Emits a [`FileLocalOp::FlagDecl`].
+        pub fn flag_decl(&mut self, decl_local_idx: u32, flags: u32) {
+            self.sink.push(FileLocalOp::FlagDecl {
+                decl_local_idx,
+                flags,
+            });
+        }
+
         /// Add a reachability edge from `src_local_idx` to `dst_local_idx`,
         /// stamped with `flags` (`0` for a plain edge, or one of
         /// [`FLAG_DEAD_BRANCH`] / [`FLAG_DYNAMIC_IMPORT`]). Both endpoints
@@ -2466,7 +2491,6 @@ pub(crate) fn load_native_plugins(path: String) -> PyResult<Vec<NativePlugin>> {
 // ---------------------------------------------------------------------------
 
 const SERVER_CONFIG_PREFIX: &str = "<server-config>:";
-const UNITTEST_PREFIX: &str = "<unittest>:";
 
 /// Conventional filenames Gunicorn / Hypercorn load at startup. The default
 /// the [`NativePlugin::server_config`] factory supplies when no `filenames`
@@ -2612,23 +2636,26 @@ impl plugin_api::ExternalPlugin for UnittestPluginImpl {
         let importer_paths: std::collections::HashSet<String> =
             ctx.node_paths(&import_idxs).into_iter().collect();
 
-        // path -> [decl_idx, ...] seeds to keep alive.
-        let mut decls_by_path: std::collections::HashMap<String, Vec<usize>> =
-            std::collections::HashMap::new();
-
+        // TestCase subclasses are unconditional roots — a test class stays
+        // alive even if nothing imports its module — so stamp the
+        // `test/testcase` seed flag directly on the decl. Deduped because a
+        // class can match two bases (`IsolatedAsyncioTestCase` is itself a
+        // `TestCase` subclass, so its descendants resolve under both).
+        let mut flagged: FxHashSet<usize> = FxHashSet::default();
         for base in UNITTEST_BASE_FQNAMES {
-            let sub_idxs = ctx.find_subclasses_of_fqn(base, true);
-            if sub_idxs.is_empty() {
-                continue;
-            }
-            let paths = ctx.node_paths(&sub_idxs);
-            for (idx, path) in sub_idxs.into_iter().zip(paths) {
-                decls_by_path.entry(path).or_default().push(idx);
+            for idx in ctx.find_subclasses_of_fqn(base, true) {
+                if flagged.insert(idx) {
+                    ops.flag_decl(idx, testcase_flag);
+                }
             }
         }
 
-        // Lifecycle hooks: function nodes in an importer file whose
-        // trailing fqname segment is one of the module hooks.
+        // Module lifecycle hooks (`setUpModule` / `tearDownModule` /
+        // `load_tests`) only fire while their module's tests run, so they
+        // ride a `module -> hook` edge: alive iff the module is reached (its
+        // own live TestCases keep it so), dead with it — the same shape as
+        // the engine's module-dunder edges. Restricted to files importing
+        // unittest so an unrelated `setUpModule` is never pinned.
         for node in ctx.nodes() {
             if node.kind != "function" || !importer_paths.contains(node.path) {
                 continue;
@@ -2639,35 +2666,10 @@ impl plugin_api::ExternalPlugin for UnittestPluginImpl {
                 .map(|(_, n)| n)
                 .unwrap_or(node.fqname);
             if UNITTEST_MODULE_HOOKS.contains(&simple) {
-                decls_by_path
-                    .entry(node.path.to_string())
-                    .or_default()
-                    .push(node.idx);
+                if let Some(module_idx) = ctx.module_for(node.path) {
+                    ops.add_edge(module_idx, node.idx, 0);
+                }
             }
-        }
-
-        if decls_by_path.is_empty() {
-            return Ok(());
-        }
-        let paths: Vec<String> = decls_by_path.keys().cloned().collect();
-        let module_idxs = ctx.modules_for_paths(&paths);
-        let present: Vec<(String, usize)> = paths
-            .into_iter()
-            .zip(module_idxs)
-            .filter_map(|(p, idx)| idx.map(|i| (p, i)))
-            .collect();
-        if present.is_empty() {
-            return Ok(());
-        }
-        let module_attrs = ctx.nodes_at(&present.iter().map(|(_, i)| *i).collect::<Vec<_>>());
-        for ((path, _idx), attr) in present.iter().zip(module_attrs.iter()) {
-            ops.add_synthetic_node(
-                format!("{UNITTEST_PREFIX}{}", attr.fqname),
-                path.clone(),
-                testcase_flag,
-                decls_by_path[path].clone(),
-                Vec::new(),
-            );
         }
         Ok(())
     }

@@ -14,7 +14,9 @@ use std::process::Command;
 /// 2 → 3: `PluginOps::keep_alive` / `FileOps::keep_alive` dropped their
 /// `marker: String` parameter (seeds flag the decl directly now), and added
 /// the re-exported `FLAG_INIT_SUBCLASS` edge-flag constant.
-const PLUGIN_API_EPOCH: u32 = 3;
+/// 3 → 4: added `PluginOps::flag_decl` / `FileOps::flag_decl` (OR a
+/// registered node flag onto an existing decl, no marker node).
+const PLUGIN_API_EPOCH: u32 = 4;
 
 /// Compose the ABI fingerprint that gates external native-plugin loading.
 /// It changes whenever anything that could break the dylib ABI changes:

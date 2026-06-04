@@ -18,6 +18,12 @@ two versions.
   rejects plugins compiled against an older API at load — distinct from a
   rustc / runtime-version / target change — so an incompatible `plugin_api`
   edit can invalidate stale plugins on its own.
+- **`flag_decl` plugin op.** `PluginOps::flag_decl(decl_idx, flags)` and the
+  per-file `FileOps::flag_decl(decl_local_idx, flags)` OR a node-flag bitset
+  onto an existing decl (mapping to the new `PreparedOp::FlagDecl` /
+  `FileLocalOp::FlagDecl`). Plugins use it to stamp a registered flag — the bit
+  from `ctx.node_flag(name)` — directly on a discovered decl instead of routing
+  it through a synthetic seed marker node. Bumps `PLUGIN_API_EPOCH` to 4.
 - **External native plugins (experimental).** The native crate is split
   into a `dead-cst-runtime` library (built as both `rlib` and `dylib`)
   and a thin `dead-cst-native` cdylib shim, so a plugin can dynamically
@@ -240,6 +246,15 @@ two versions.
   per-file `ModuleDundersPlugin` (and its synthetic `<dunder>:` seed node) with
   a `module -> dunder` edge; the CLI no longer appends it to the default plugin
   set because the behavior is now unconditional.
+- **`unittest` plugin no longer mints a `<unittest>:` synthetic seed.**
+  `TestCase` subclasses (unconditional test roots) now carry the
+  `test/testcase` flag stamped directly on the decl via the new
+  `PluginOps::flag_decl`, and module lifecycle hooks (`setUpModule`,
+  `tearDownModule`, `load_tests`) are kept alive by a `module -> hook` edge
+  instead of the seed marker. Behavior change: a lifecycle hook in a module
+  with no live `TestCase` now dies with its (unreachable) module, matching the
+  module-dunder model — previously the per-module seed kept it alive
+  unconditionally.
 - **Resolved site-packages imports are now real `kind="external"` graph
   nodes.** A site-packages import (`[external dist] requests`) mints a real
   external node carrying the resolved site-packages path, replacing the old
