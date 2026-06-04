@@ -210,10 +210,10 @@ class NativePlugin:
 
     @staticmethod
     def main_block() -> NativePlugin:
-        """``MainBlockPlugin``. Marks every file with a top-level
-        ``if __name__ == "__main__":`` block as an entrypoint and wires
-        edges to the containing module + every top-level decl inside the
-        block. Implemented as a per-file (salsa-cached) plugin.
+        """``MainBlockPlugin``. For every file with a top-level
+        ``if __name__ == "__main__":`` block, keeps the containing module
+        node and every top-level decl inside the block alive as entrypoints.
+        Implemented as a per-file (salsa-cached) plugin.
         """
         ...
 
@@ -234,7 +234,7 @@ class NativePlugin:
         ``filenames`` defaults to the conventional Gunicorn/Hypercorn set;
         pass a custom sequence to match other server-config basenames.
         Per-file (salsa-cached): a file matches purely on its own basename,
-        so an unchanged file's marker is reused across ``re_materialize``.
+        so an unchanged file's ops are reused across ``re_materialize``.
         Identical filename sets intern to one cache key.
         """
         ...
@@ -390,10 +390,10 @@ class NativePlugin:
     def project_scripts(pyproject_path: str | None = None) -> NativePlugin:
         """Native ``[project.scripts]`` plugin. Reads ``pyproject.toml`` (from
         ``pyproject_path`` if given, else ``<project_root>/pyproject.toml``)
-        and, for each ``name = "pkg.mod:func"`` entry, wires a synthetic
-        ``<project.scripts>:<name>`` entrypoint to the resolved ``pkg.mod.func``
-        decl (falling back to the ``pkg.mod`` module node). A missing file or
-        unresolved target is skipped silently.
+        and, for each ``name = "pkg.mod:func"`` entry, keeps the resolved
+        ``pkg.mod.func`` decl alive as an entrypoint (falling back to the
+        ``pkg.mod`` module node). A missing file or unresolved target is
+        skipped silently.
         """
         ...
 

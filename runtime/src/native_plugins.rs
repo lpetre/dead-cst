@@ -1110,14 +1110,11 @@ pub(crate) fn _builtin_native_plugin(name: &str) -> Option<NativePlugin> {
 }
 
 // ---------------------------------------------------------------------------
-// MainBlockPlugin — first per-file impl. Equivalent to
-// ``dead_cst.plugins.main_block.MainBlockPlugin``: emit one synthetic
-// ``<__main__>:<module_fqname>`` entrypoint per file with a top-level
-// ``if __name__ == "__main__":`` block, with edges to the containing
-// module and to every top-level decl inside the block.
+// MainBlockPlugin — first per-file impl. For every file with a top-level
+// ``if __name__ == "__main__":`` block, keep the module node alive plus
+// every top-level decl whose source span falls inside the block (via
+// ``keep_alive``, which stamps ENTRYPOINT directly on each target).
 // ---------------------------------------------------------------------------
-
-const MAIN_BLOCK_PREFIX: &str = "<__main__>:";
 
 /// Test-only counter: number of times [`MainBlockPluginImpl::run_on_file`]
 /// actually executed (i.e. salsa cache *misses* for the per-file
@@ -1150,21 +1147,15 @@ impl plugin_api::PerFilePlugin for MainBlockPluginImpl {
             return;
         };
         let (block_start_line, block_end_line) = file.line_span(block_range);
-        // Local indices of every top-level decl whose source span falls
-        // inside the ``if __name__`` block. Skip index 0 (the module
-        // node) — it's added explicitly below as the first edge.
-        let mut edges_to_local_idx: Vec<u32> = vec![file.module_local_idx()];
+        // Keep the module node alive, plus every top-level decl whose source
+        // span falls inside the ``if __name__`` block. Skip index 0 (the
+        // module node) — it's kept alive explicitly first.
+        ops.keep_alive(file.module_local_idx());
         for node in file.nodes().iter().skip(1) {
             if node.start_line >= block_start_line && node.end_line <= block_end_line {
-                edges_to_local_idx.push(node.local_idx);
+                ops.keep_alive(node.local_idx);
             }
         }
-        ops.add_synthetic_node(
-            format!("{MAIN_BLOCK_PREFIX}{}", file.module_fqname()),
-            NodeFlags::ENTRYPOINT,
-            edges_to_local_idx,
-            Vec::new(),
-        );
     }
 }
 
@@ -2487,8 +2478,6 @@ pub(crate) fn load_native_plugins(path: String) -> PyResult<Vec<NativePlugin>> {
 // (the harness already holds the GIL).
 // ---------------------------------------------------------------------------
 
-const SERVER_CONFIG_PREFIX: &str = "<server-config>:";
-
 /// Conventional filenames Gunicorn / Hypercorn load at startup. The default
 /// the [`NativePlugin::server_config`] factory supplies when no `filenames`
 /// are given; callers pass a custom set for other server-config basenames.
@@ -2558,9 +2547,9 @@ pub(crate) fn _reset_server_config_run_count() {
 /// Per-file body for `ServerConfigPlugin` (see
 /// [`ConfiguredPerFile::ServerConfig`], ported from
 /// `dead_cst.contrib.server_config.ServerConfigPlugin`): when a file's basename
-/// is one of `filenames`, mint a `<server-config>:` entrypoint keeping that
-/// file's whole top-level surface alive. File-local — the match and the targets
-/// are both functions of the single file.
+/// is one of `filenames`, keep that file's whole top-level surface alive (via
+/// `keep_alive`, stamping ENTRYPOINT on each node). File-local — the match and
+/// the targets are both functions of the single file.
 fn server_config_run_on_file(
     filenames: &[String],
     file: &plugin_api::PluginFileCtx<'_>,
@@ -2588,15 +2577,9 @@ fn server_config_run_on_file(
         })
         .map(|node| node.local_idx)
         .collect();
-    if targets.is_empty() {
-        return;
+    for local in targets {
+        ops.keep_alive(local);
     }
-    ops.add_synthetic_node(
-        format!("{SERVER_CONFIG_PREFIX}{}", file.module_fqname()),
-        NodeFlags::ENTRYPOINT,
-        targets,
-        Vec::new(),
-    );
 }
 
 /// Project-wide port of `dead_cst.contrib.unittest.UnittestPlugin`: keep
@@ -3842,8 +3825,6 @@ impl plugin_api::ExternalPlugin for ExplicitEntrypointPluginImpl {
 // crate; a missing file is a no-op.
 // ---------------------------------------------------------------------------
 
-const PROJECT_SCRIPTS_PREFIX: &str = "<project.scripts>:";
-
 pub(crate) struct ProjectScriptsPluginImpl {
     pyproject_path: Option<String>,
 }
@@ -3892,7 +3873,7 @@ impl plugin_api::ExternalPlugin for ProjectScriptsPluginImpl {
             })
             .unwrap_or_default();
 
-        for (script_name, target) in scripts {
+        for (_script_name, target) in scripts {
             let (module_part, decl_part) = match target.split_once(':') {
                 Some((m, d)) => (m, d),
                 None => (target.as_str(), ""),
@@ -3908,16 +3889,9 @@ impl plugin_api::ExternalPlugin for ProjectScriptsPluginImpl {
                     target_idxs.push(module_idx);
                 }
             }
-            if target_idxs.is_empty() {
-                continue;
+            for idx in target_idxs {
+                ops.keep_alive(idx);
             }
-            ops.add_synthetic_node(
-                format!("{PROJECT_SCRIPTS_PREFIX}{script_name}"),
-                pyproject.clone(),
-                NodeFlags::ENTRYPOINT,
-                target_idxs,
-                Vec::new(),
-            );
         }
         Ok(())
     }
