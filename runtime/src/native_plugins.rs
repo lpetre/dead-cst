@@ -3262,8 +3262,6 @@ impl plugin_api::ExternalPlugin for ClickPluginImpl {
 // test file targets a decl in another), hence project-wide.
 // ---------------------------------------------------------------------------
 
-const PATCH_TARGET_PREFIX: &str = "<patch-target>:";
-
 pub(crate) struct MockPatchPluginImpl;
 
 impl plugin_api::ExternalPlugin for MockPatchPluginImpl {
@@ -3314,27 +3312,20 @@ impl plugin_api::ExternalPlugin for MockPatchPluginImpl {
         }
 
         // Resolve targets per fqname (decls + the module node if the fqname is
-        // itself a module). One synthetic `<patch-target>:<fqname>` per fqname,
-        // emitted unconditionally — an empty target set still records the
-        // patch site for introspection, matching the Python plugin.
+        // itself a module) and wire a direct `owner -> target` keep-alive edge
+        // for each patch site. An unresolved fqname has no targets and emits no
+        // edge — there is nothing to keep alive.
         for fqname in order {
             let owners = &owners_by_fqname[&fqname];
             let mut target_idxs = ctx.find_declarations(&fqname);
             if let Some(mod_idx) = ctx.find_module(&fqname) {
                 target_idxs.push(mod_idx);
             }
-            let owner_path = ctx
-                .node_paths(&[owners[0]])
-                .into_iter()
-                .next()
-                .unwrap_or_default();
-            ops.add_synthetic_node(
-                format!("{PATCH_TARGET_PREFIX}{fqname}"),
-                owner_path,
-                0,
-                target_idxs,
-                owners.clone(),
-            );
+            for &owner_idx in owners {
+                for &target_idx in &target_idxs {
+                    ops.add_edge(owner_idx, target_idx, 0);
+                }
+            }
         }
         Ok(())
     }
@@ -3985,10 +3976,6 @@ impl plugin_api::ExternalPlugin for ProjectScriptsPluginImpl {
 // tests anywhere), hence project-wide.
 // ---------------------------------------------------------------------------
 
-const PYTEST_CONFTEST_PREFIX: &str = "<pytest:conftest>:";
-const PYTEST_TESTS_PREFIX: &str = "<pytest:tests>:";
-const PYTEST_FIXTURES_PREFIX: &str = "<pytest:fixtures>:";
-
 fn is_test_filename(name: &str) -> bool {
     (name.starts_with("test_") && name.ends_with(".py")) || name.ends_with("_test.py")
 }
@@ -4002,58 +3989,42 @@ fn is_test_decl(kind: &str, fqname: &str) -> bool {
 /// The shared `test/testcase` node-flag spec declared by both the pytest and
 /// unittest plugins. Identical from both, so the registry collapses it to a
 /// single bit (idempotent registration); `seed + default_on` puts it in the
-/// default keepalive mask whenever a test plugin is registered.
+/// default keepalive mask whenever a test plugin is registered. Scoped to
+/// *genuine* test roots (things a framework collects and runs) — the
+/// conservatively-kept pytest support code (fixtures, conftest) rides the
+/// separate [`fixture_flag_spec`] instead.
 fn testcase_flag_spec() -> plugin_api::FlagSpec {
     plugin_api::FlagSpec {
         name: "test/testcase".to_string(),
         seed: true,
         default_on: true,
-        description: "Symbol kept alive because a test framework (pytest / unittest) \
-                      discovers it as a test, fixture, or lifecycle hook."
+        description: "Symbol a test framework collects and runs directly: a pytest \
+                      `test_*` function / `Test*` class, or a `unittest.TestCase` \
+                      subclass."
             .to_string(),
     }
 }
 
-/// Emit a seed node stamped with `flags` keeping `target_idxs` alive (no-op
-/// when empty). `flags` is the resolved `test/testcase` bit (see
-/// [`testcase_flag_spec`]).
-fn mark_seed(
-    ops: &mut plugin_api::PluginOps,
-    fqname: String,
-    path: String,
-    flags: u32,
-    target_idxs: Vec<usize>,
-) {
-    if target_idxs.is_empty() {
-        return;
+/// The pytest plugin's provisional `test/fixture` node-flag spec, stamped on
+/// symbols kept alive *conservatively* — every `@pytest.fixture` and every
+/// `conftest.py` decl — because their real usage (autouse / usefixtures /
+/// indirect parametrization, conftest auto-loading) is not modeled as edges
+/// yet. `seed + default_on` preserves today's keep-everything behavior; it is
+/// kept distinct from [`testcase_flag_spec`] so the conservative blast radius
+/// is measurable (`kept_alive_by_flags_only`) and can be flipped to
+/// `seed: false` in isolation once that usage is traced precisely. Declared by
+/// pytest only.
+fn fixture_flag_spec() -> plugin_api::FlagSpec {
+    plugin_api::FlagSpec {
+        name: "test/fixture".to_string(),
+        seed: true,
+        default_on: true,
+        description: "Conservatively kept alive by the pytest plugin (a @pytest.fixture \
+                      or a conftest.py decl) pending precise fixture/conftest-usage \
+                      modeling; provisional, flips to non-seeding once that usage is \
+                      traced as edges."
+            .to_string(),
     }
-    ops.add_synthetic_node(fqname, path, flags, target_idxs, Vec::new());
-}
-
-/// `{ path: module_fqname }` for every path resolving to a project module.
-fn module_fqnames_for(
-    ctx: &plugin_api::PluginCtx<'_>,
-    paths: &[String],
-) -> FxHashMap<String, String> {
-    if paths.is_empty() {
-        return FxHashMap::default();
-    }
-    let module_idxs = ctx.modules_for_paths(paths);
-    let present: Vec<(String, usize)> = paths
-        .iter()
-        .cloned()
-        .zip(module_idxs)
-        .filter_map(|(p, m)| m.map(|i| (p, i)))
-        .collect();
-    if present.is_empty() {
-        return FxHashMap::default();
-    }
-    let attrs = ctx.nodes_at(&present.iter().map(|(_, i)| *i).collect::<Vec<_>>());
-    present
-        .into_iter()
-        .zip(attrs)
-        .map(|((path, _), attr)| (path, attr.fqname))
-        .collect()
 }
 
 pub(crate) struct PytestPluginImpl;
@@ -4064,7 +4035,7 @@ impl plugin_api::ExternalPlugin for PytestPluginImpl {
     }
 
     fn declare_node_flags(&self) -> Vec<plugin_api::FlagSpec> {
-        vec![testcase_flag_spec()]
+        vec![testcase_flag_spec(), fixture_flag_spec()]
     }
 
     fn run(
@@ -4072,10 +4043,13 @@ impl plugin_api::ExternalPlugin for PytestPluginImpl {
         ctx: &plugin_api::PluginCtx<'_>,
         ops: &mut plugin_api::PluginOps,
     ) -> Result<(), plugin_api::PluginError> {
-        // The bit the host allocated for our declared `test/testcase` flag.
+        // The bits the host allocated for our declared flags.
         let testcase_flag = ctx
             .node_flag("test/testcase")
             .expect("test/testcase is declared in declare_node_flags");
+        let fixture_flag = ctx
+            .node_flag("test/fixture")
+            .expect("test/fixture is declared in declare_node_flags");
         // Every top-level function / class / variable decl + its path.
         let idxs = ctx.nodes_matching(&plugin_api::NodeFilter {
             kinds: &["function", "class", "variable"],
@@ -4090,39 +4064,34 @@ impl plugin_api::ExternalPlugin for PytestPluginImpl {
         }
         let paths = ctx.node_paths(&idxs);
 
-        // Bucket conftest decls; collect test-file candidates (idx + path).
-        let mut conftest_by_path: FxHashMap<String, Vec<usize>> = FxHashMap::default();
-        let mut conftest_order: Vec<String> = Vec::new();
+        // Flag every conftest.py decl `test/fixture`; collect test-file
+        // candidates for the `test/testcase` pass below. `fixture_flagged`
+        // dedups against the `@pytest.fixture` pass so a fixture defined in a
+        // conftest is flagged exactly once.
+        let mut fixture_flagged: FxHashSet<usize> = FxHashSet::default();
         let mut cand_idxs: Vec<usize> = Vec::new();
-        let mut cand_paths: Vec<String> = Vec::new();
         for (idx, path) in idxs.iter().zip(paths.iter()) {
             let filename = path_basename(path);
             if filename == "conftest.py" {
-                if !conftest_by_path.contains_key(path) {
-                    conftest_order.push(path.clone());
+                if fixture_flagged.insert(*idx) {
+                    ops.flag_decl(*idx, fixture_flag);
                 }
-                conftest_by_path.entry(path.clone()).or_default().push(*idx);
             } else if is_test_filename(filename) {
                 cand_idxs.push(*idx);
-                cand_paths.push(path.clone());
             }
         }
 
-        // Filter test candidates by `_is_test_decl`; track function/class kinds.
-        let mut tests_by_path: FxHashMap<String, Vec<usize>> = FxHashMap::default();
-        let mut tests_order: Vec<String> = Vec::new();
+        // Flag genuine test decls `test/testcase`; track function/class kinds
+        // for the fixture-parameter edges below.
         let mut test_function_idxs: Vec<usize> = Vec::new();
         let mut test_class_idxs: Vec<usize> = Vec::new();
         if !cand_idxs.is_empty() {
             let attrs = ctx.nodes_at(&cand_idxs);
-            for ((idx, path), attr) in cand_idxs.iter().zip(cand_paths.iter()).zip(attrs.iter()) {
+            for (idx, attr) in cand_idxs.iter().zip(attrs.iter()) {
                 if !is_test_decl(&attr.kind, &attr.fqname) {
                     continue;
                 }
-                if !tests_by_path.contains_key(path) {
-                    tests_order.push(path.clone());
-                }
-                tests_by_path.entry(path.clone()).or_default().push(*idx);
+                ops.flag_decl(*idx, testcase_flag);
                 if attr.kind == "function" {
                     test_function_idxs.push(*idx);
                 } else if attr.kind == "class" {
@@ -4131,69 +4100,20 @@ impl plugin_api::ExternalPlugin for PytestPluginImpl {
             }
         }
 
-        // Module fqnames for the paths we'll seed (conftest + filtered tests).
-        let mut seed_paths: Vec<String> = conftest_order.clone();
-        for p in &tests_order {
-            if !conftest_by_path.contains_key(p) {
-                seed_paths.push(p.clone());
-            }
-        }
-        let seed_module_fqnames = module_fqnames_for(ctx, &seed_paths);
-        for path in &conftest_order {
-            if let Some(module_fqname) = seed_module_fqnames.get(path) {
-                mark_seed(
-                    ops,
-                    format!("{PYTEST_CONFTEST_PREFIX}{module_fqname}"),
-                    path.clone(),
-                    testcase_flag,
-                    conftest_by_path[path].clone(),
-                );
-            }
-        }
-        for path in &tests_order {
-            if let Some(module_fqname) = seed_module_fqnames.get(path) {
-                mark_seed(
-                    ops,
-                    format!("{PYTEST_TESTS_PREFIX}{module_fqname}"),
-                    path.clone(),
-                    testcase_flag,
-                    tests_by_path[path].clone(),
-                );
-            }
-        }
-
         // `@pytest.fixture`-decorated decls (args extracted for the `name=`
-        // alias).
+        // alias). Each is conservatively flagged `test/fixture` — the rule
+        // that catches autouse / usefixtures / indirect without modeling them.
         let fixture_refs: Vec<(usize, CallArgs)> =
             ctx.decorated_decls_with_args(&["pytest"], &["fixture"]);
         if fixture_refs.is_empty() {
             return Ok(());
         }
+        for (idx, _) in &fixture_refs {
+            if fixture_flagged.insert(*idx) {
+                ops.flag_decl(*idx, fixture_flag);
+            }
+        }
         let fixture_idxs_all: Vec<usize> = fixture_refs.iter().map(|(idx, _)| *idx).collect();
-
-        // Per-file fixture seed (every `@pytest.fixture` stays alive — the
-        // conservative rule that catches autouse / usefixtures / indirect).
-        let fixture_paths = ctx.node_paths(&fixture_idxs_all);
-        let mut fixtures_by_path: FxHashMap<String, Vec<usize>> = FxHashMap::default();
-        let mut fixtures_path_order: Vec<String> = Vec::new();
-        for (idx, path) in fixture_idxs_all.iter().zip(fixture_paths.iter()) {
-            if !fixtures_by_path.contains_key(path) {
-                fixtures_path_order.push(path.clone());
-            }
-            fixtures_by_path.entry(path.clone()).or_default().push(*idx);
-        }
-        let fixture_module_fqnames = module_fqnames_for(ctx, &fixtures_path_order);
-        for path in &fixtures_path_order {
-            if let Some(module_fqname) = fixture_module_fqnames.get(path) {
-                mark_seed(
-                    ops,
-                    format!("{PYTEST_FIXTURES_PREFIX}{module_fqname}"),
-                    path.clone(),
-                    testcase_flag,
-                    fixtures_by_path[path].clone(),
-                );
-            }
-        }
 
         // Parameter-name edges. Skip when no test signature to inspect.
         if test_function_idxs.is_empty() && test_class_idxs.is_empty() {

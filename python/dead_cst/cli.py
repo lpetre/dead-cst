@@ -220,8 +220,9 @@ def _select_dead(view: GraphView, query: Query) -> list[SymbolNode]:
         return [n for n in view.nodes() if n not in reachable]
     if query is Query.test_only:
         testcase = view.node_flag("test/testcase") or 0
+        fixture = view.node_flag("test/fixture") or 0
         full = set(view.reachable(seed_flags=seed_mask))
-        without_tests = set(view.reachable(seed_flags=seed_mask & ~testcase))
+        without_tests = set(view.reachable(seed_flags=seed_mask & ~(testcase | fixture)))
         return list(full - without_tests)
     raise typer.BadParameter(f"unknown --query value: {query!r}")
 

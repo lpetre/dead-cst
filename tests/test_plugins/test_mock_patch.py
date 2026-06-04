@@ -6,8 +6,6 @@ import pytest
 
 from dead_cst import _native as native
 
-PATCH_TARGET_PREFIX = "<patch-target>:"
-
 # Each entry is a ``tests/test_lib.py`` body that should keep
 # ``pkg.lib.helper`` alive via a string-fqname patch reference. The id
 # names the recognized form so failures point at the specific shape.
@@ -265,8 +263,7 @@ def test_only_marks_target_when_test_alive(build_plugin_graph, reachable_fqnames
     """A patch reference inside a dead decl doesn't promote anything.
 
     No entrypoint reaches ``isolated_helper``, so the synthesized
-    ``isolated_helper -> <patch-target>:pkg.lib.helper`` edge never
-    fires.
+    ``isolated_helper -> pkg.lib.helper`` keep-alive edge never fires.
     """
     graph = build_plugin_graph(
         {
@@ -285,12 +282,10 @@ def test_only_marks_target_when_test_alive(build_plugin_graph, reachable_fqnames
     assert "pkg.lib.helper" not in reachable_fqnames(graph)
 
 
-def test_monkeypatch_setattr_object_form_not_treated_as_fqname(
-    build_plugin_graph, reachable_fqnames
-):
+def test_monkeypatch_setattr_object_form_not_treated_as_fqname(build_plugin_graph):
     """``monkeypatch.setattr(obj, "attr", value)`` has 3 positional args
     and is the object form -- the ``"attr"`` string must not be treated
-    as a fqname reference."""
+    as a fqname reference, so no ``test -> helper`` patch edge is wired."""
     graph = build_plugin_graph(
         {
             "pkg/__init__.py": "",
@@ -302,15 +297,43 @@ def test_monkeypatch_setattr_object_form_not_treated_as_fqname(
             def test_helper(monkeypatch):
                 # 3 positional args: object form, "helper" is just an
                 # attribute name on the pkg.lib module object, not an
-                # fqname string. The reference to ``pkg.lib`` is what
-                # keeps the module alive (and ``helper`` with it).
+                # fqname string.
                 monkeypatch.setattr(pkg.lib, "helper", lambda: 2)
             """,
         },
         [native.NativePlugin.mock_patch(), native.NativePlugin.pytest()],
     )
-    synthetics = {n.fqname for n in graph.nodes() if n.kind == "synthetic"}
-    assert f"{PATCH_TARGET_PREFIX}helper" not in synthetics
+    nodes = graph.nodes()
+    by_fqname = {n.fqname: i for i, n in enumerate(nodes)}
+    test_idx = by_fqname["tests.test_lib.test_helper"]
+    helper_idx = by_fqname["pkg.lib.helper"]
+    assert (test_idx, helper_idx, 0) not in [(s, d, f) for (s, d, f) in graph.edges()]
+
+
+def test_mock_patch_emits_direct_owner_to_target_edge(build_plugin_graph):
+    """The keep-alive is a direct ``owner -> target`` edge, not a synthetic
+    relay node. Verify the edge is in the graph and no patch-target synthetic
+    remains."""
+    graph = build_plugin_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/lib.py": "def helper(): return 1",
+            "tests/__init__.py": "",
+            "tests/test_lib.py": """
+            from unittest.mock import patch
+
+            @patch("pkg.lib.helper")
+            def test_helper(_): pass
+            """,
+        },
+        [native.NativePlugin.mock_patch(), native.NativePlugin.pytest()],
+    )
+    nodes = graph.nodes()
+    by_fqname = {n.fqname: i for i, n in enumerate(nodes)}
+    owner_idx = by_fqname["tests.test_lib.test_helper"]
+    target_idx = by_fqname["pkg.lib.helper"]
+    assert (owner_idx, target_idx, 0) in [(s, d, f) for (s, d, f) in graph.edges()]
+    assert not any(n.kind == "synthetic" and "patch-target" in n.fqname for n in nodes)
 
 
 def test_monkeypatch_setitem_not_recognized(build_plugin_graph, reachable_fqnames):
