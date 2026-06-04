@@ -197,12 +197,13 @@ impl GraphBuilder {
     /// assembly pass owns the index, so this writes `nodes[idx]`
     /// directly and records the key. Payload nodes are
     /// position-distinct (`CLAUDE.md` principle 3), so no two ever
-    /// share a [`NodeKey`]; the debug assertion guards that invariant.
-    /// Requires the region to be pre-sized via
-    /// [`prefill_payload_region`].
+    /// share a [`NodeKey`]; an assertion — kept on in release too,
+    /// since a collision would silently overwrite a node and corrupt
+    /// the index map — guards that invariant. Requires the region to
+    /// be pre-sized via [`prefill_payload_region`].
     pub(crate) fn place_node(&mut self, idx: usize, node: GraphNode) {
         let prev = self.node_index.insert(node.key(), idx);
-        debug_assert!(
+        assert!(
             prev.is_none(),
             "payload node key collision at index {idx}: assembly must mint each NodeKey once"
         );
