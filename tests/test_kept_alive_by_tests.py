@@ -1,25 +1,26 @@
-"""End-to-end tests for :data:`NodeFlags.TESTCASE` and ``kept_alive_by_flags_only(NodeFlags.TESTCASE)``.
+"""End-to-end tests for the ``test/testcase`` plugin flag and
+``kept_alive_by_flags_only(test/testcase)``.
 
-Test plugins (pytest, unittest) stamp their synthetic seed nodes with
-``ENTRYPOINT | TESTCASE``. Default reachability treats those seeds the
-same as any other entrypoint; the flag-taking blast-radius query
+Test plugins (pytest, unittest) declare and stamp their synthetic seed
+nodes with the registered ``test/testcase`` flag (resolved by name via
+``node_flag("test/testcase")``). Default reachability treats those seeds
+the same as any other entrypoint; the flag-taking blast-radius query
 returns production code currently kept alive only because tests still
 touch it.
 """
 
 from __future__ import annotations
 
-from dead_cst import NodeFlags
 from dead_cst import _native as native
-from dead_cst.graph import KEEPALIVE_DEFAULT
 
 
 def find_reachable_excluding_tests(graph):
-    return set(graph.reachable(seed_flags=KEEPALIVE_DEFAULT & ~NodeFlags.TESTCASE))
+    testcase = graph.node_flag("test/testcase") or 0
+    return set(graph.reachable(seed_flags=graph.default_seed_mask() & ~testcase))
 
 
 def find_kept_alive_by_tests_only(graph):
-    full = set(graph.reachable(seed_flags=KEEPALIVE_DEFAULT))
+    full = set(graph.reachable(seed_flags=graph.default_seed_mask()))
     return full - find_reachable_excluding_tests(graph)
 
 
@@ -42,7 +43,7 @@ def test_test_only_helper_is_kept_alive_by_tests(make_analysis, write_files):
     )
     graph = make_analysis(plugins=[native.NativePlugin.pytest()]).materialize_all()
     helper = next(n for n in graph.nodes() if n.fqname == "pkg.lib.helper")
-    assert helper in set(graph.reachable(seed_flags=KEEPALIVE_DEFAULT))
+    assert helper in set(graph.reachable(seed_flags=graph.default_seed_mask()))
     assert helper not in find_reachable_excluding_tests(graph)
     assert helper in find_kept_alive_by_tests_only(graph)
 
@@ -92,7 +93,7 @@ def test_unittest_kept_alive_by_tests(make_analysis, write_files):
     )
     graph = make_analysis(plugins=[native.NativePlugin.unittest()]).materialize_all()
     helper = next(n for n in graph.nodes() if n.fqname == "pkg.lib.helper")
-    assert helper in set(graph.reachable(seed_flags=KEEPALIVE_DEFAULT))
+    assert helper in set(graph.reachable(seed_flags=graph.default_seed_mask()))
     assert helper in find_kept_alive_by_tests_only(graph)
 
 
@@ -110,7 +111,7 @@ def test_analysis_method_returns_strict_diff(make_analysis, write_files):
         }
     )
     analysis = make_analysis(plugins=[native.NativePlugin.pytest()])
-    blast = analysis.kept_alive_by_flags_only(NodeFlags.TESTCASE)
+    blast = analysis.kept_alive_by_flags_only(analysis.node_flag("test/testcase"))
     ctx = analysis.materialize_all()
     fqnames = {a.fqname for a in ctx.node_attrs(list(blast))}
     assert "pkg.lib.helper" in fqnames

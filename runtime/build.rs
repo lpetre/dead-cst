@@ -7,7 +7,11 @@ use std::process::Command;
 /// so a plugin built against the old API is rejected at load, distinct from a
 /// plain version bump. Folded into the ABI fingerprint below and re-exported as
 /// `native_plugins::plugin_api::PLUGIN_API_EPOCH`.
-const PLUGIN_API_EPOCH: u32 = 1;
+///
+/// 1 → 2: added `ExternalPlugin::declare_node_flags` / `declare_edge_flags`,
+/// `PluginCtx::node_flag` / `edge_flag`, the re-exported `FlagSpec`, and
+/// narrowed edge `flags` from `u32` to `u8`.
+const PLUGIN_API_EPOCH: u32 = 2;
 
 /// Compose the ABI fingerprint that gates external native-plugin loading.
 /// It changes whenever anything that could break the dylib ABI changes:

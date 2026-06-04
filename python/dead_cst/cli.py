@@ -37,10 +37,8 @@ from dead_cst import _native as native
 from .analyze import Analysis
 from .codemod import generate_patch
 from .graph import (
-    KEEPALIVE_DEFAULT,
     GraphMetadata,
     LoadedGraph,
-    NodeFlags,
     SymbolNode,
     read_graph,
     write_graph,
@@ -217,12 +215,14 @@ def _load_or_build(
 
 
 def _select_dead(view: GraphView, query: Query) -> list[SymbolNode]:
+    seed_mask = view.default_seed_mask()
     if query is Query.dead:
-        reachable = set(view.reachable(seed_flags=KEEPALIVE_DEFAULT))
+        reachable = set(view.reachable(seed_flags=seed_mask))
         return [n for n in view.nodes() if n not in reachable]
     if query is Query.test_only:
-        full = set(view.reachable(seed_flags=KEEPALIVE_DEFAULT))
-        without_tests = set(view.reachable(seed_flags=KEEPALIVE_DEFAULT & ~NodeFlags.TESTCASE))
+        testcase = view.node_flag("test/testcase") or 0
+        full = set(view.reachable(seed_flags=seed_mask))
+        without_tests = set(view.reachable(seed_flags=seed_mask & ~testcase))
         return list(full - without_tests)
     raise typer.BadParameter(f"unknown --query value: {query!r}")
 

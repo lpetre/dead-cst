@@ -39,9 +39,9 @@ use ty_python_core::semantic_index;
 
 use crate::graph::{DeclKey, NodeFlags};
 use crate::helpers::{
-    classify_base, collect_all_imports_local, file_default_flags, file_path_string,
-    iter_top_level_classes, module_fqname_for_file, position, range_key, scan_noqa_directives,
-    NODE_FLAGS_NOQA_PIN,
+    classify_base, collect_all_imports_local, detect_dead_ranges, file_default_flags,
+    file_path_string, iter_top_level_classes, module_fqname_for_file, position, range_key,
+    scan_noqa_directives, NODE_FLAGS_NOQA_PIN,
 };
 use crate::ingest::{decl_kind_str, file_package_name, from_module_string};
 
@@ -173,6 +173,11 @@ pub(crate) struct NodeData {
     pub(crate) end_line: usize,
     pub(crate) end_column: usize,
     pub(crate) flags: u32,
+    /// Whether this decl is an `@overload` stub. Build-time only: drives the
+    /// `impl → stub` anchor-edge pass and the export-binding / fqname-trie
+    /// exclusions, then is dropped — overload status is neither serialized nor
+    /// Python-visible (a loaded graph behaves correctly off the anchor edges).
+    pub(crate) is_overload: bool,
     pub(crate) imports: Option<ImportPayload>,
     /// Byte range of the bound *name* (ty's `DefinitionKind::target_range`),
     /// stashed so the assembly pass can rebuild its `(File, place_id,
@@ -275,8 +280,8 @@ pub(crate) struct ImportPayload {
 ///   in-file `@typing.overload` groups. The assembly pass emits one
 ///   `impl → stub` edge per pair so reachability propagates from a
 ///   live impl to its stubs (and a dead impl drags its stubs along
-///   for the codemod). Stubs are also flagged `NodeFlags::OVERLOAD`
-///   in `nodes` and excluded from `exports_by_name` so cross-module
+///   for the codemod). Stubs also carry `NodeData::is_overload`
+///   in `nodes` and are excluded from `exports_by_name` so cross-module
 ///   `from mod import f` resolves to the impl only.
 #[derive(Debug, Eq, PartialEq, salsa::Update, get_size2::GetSize)]
 pub(crate) struct FileNodes<'db> {
@@ -366,6 +371,7 @@ pub(crate) fn ref_to_node<'db>(db: &'db dyn ProjectDb, r: NodeRef<'db>) -> NodeD
             end_line: 0,
             end_column: 0,
             flags: 0,
+            is_overload: false,
             imports: None,
             name_range: (0, 0),
         },
@@ -457,6 +463,7 @@ pub(crate) fn file_to_nodes<'db>(db: &'db dyn ProjectDb, file: File) -> FileNode
         end_line: mel,
         end_column: mec,
         flags: default_flags,
+        is_overload: false,
         imports: None,
         name_range: (0, 0),
     });
@@ -497,6 +504,13 @@ pub(crate) fn file_to_nodes<'db>(db: &'db dyn ProjectDb, file: File) -> FileNode
             }
         }
     }
+
+    // Statically-dead statement ranges (`if False:` bodies, post-`return`
+    // suites, …). A decl whose name sits inside one is stamped
+    // `NodeFlags::DEAD_BRANCH` — the node-level companion to the edge flag
+    // of the same name. Metadata only (not a seed); recorded for the
+    // explorer / blast-radius queries.
+    let dead_ranges = detect_dead_ranges(&parsed);
 
     for (_def_id, state, _used) in use_def_map.all_definitions_with_usage() {
         let DefinitionState::Defined(def) = state else {
@@ -558,19 +572,23 @@ pub(crate) fn file_to_nodes<'db>(db: &'db dyn ProjectDb, file: File) -> FileNode
         if import_noqa_pin {
             flags |= NODE_FLAGS_NOQA_PIN;
         }
-        // `@typing.overload`-decorated function defs: flag now so the
+        // `@typing.overload`-decorated function defs: record now so the
         // post-pass can partition same-name groups into impl / stubs.
         // The set is keyed on the function's name TextRange, which is
         // exactly what `DefinitionKind::Function::target_range` returns.
-        if matches!(node_kind, NodeKind::Function) && overload_decorated.contains(&target_range) {
-            flags |= NodeFlags::OVERLOAD;
-        }
+        let is_overload =
+            matches!(node_kind, NodeKind::Function) && overload_decorated.contains(&target_range);
         // Per-name implicit star bindings: flag so the codemod skips
         // them. They share the `*` token's range and can't be removed
         // individually; the `*<src>` statement node (minted below, no
         // `STAR_REEXPORT` flag) stays the removable unit.
         if is_star {
             flags |= NodeFlags::STAR_REEXPORT;
+        }
+        // Decl sitting in a statically-dead region — node-level companion
+        // to `EdgeFlags::DEAD_BRANCH`.
+        if dead_ranges.iter().any(|r| r.contains_range(target_range)) {
+            flags |= NodeFlags::DEAD_BRANCH;
         }
         // Stub-only ENTRYPOINT flagging is deferred to the assembly
         // pass; it needs the project-wide peer-stub map and the .py
@@ -586,6 +604,7 @@ pub(crate) fn file_to_nodes<'db>(db: &'db dyn ProjectDb, file: File) -> FileNode
             end_line: el,
             end_column: ec,
             flags,
+            is_overload,
             imports: import_spec.clone(),
             name_range: (target_range.start().to_u32(), target_range.end().to_u32()),
         };
@@ -622,6 +641,7 @@ pub(crate) fn file_to_nodes<'db>(db: &'db dyn ProjectDb, file: File) -> FileNode
                         end_line: el,
                         end_column: ec,
                         flags: star_flags,
+                        is_overload: false,
                         imports: import_spec.clone(),
                         name_range: (target_range.start().to_u32(), target_range.end().to_u32()),
                     };
@@ -654,9 +674,9 @@ pub(crate) fn file_to_nodes<'db>(db: &'db dyn ProjectDb, file: File) -> FileNode
     // non-overload impl, pair each stub with the *last* non-overload
     // decl (CPython's runtime semantics — the impl is the final one).
     // Stubs that aren't anchored to an impl (e.g. a .pyi stub file
-    // where every `def f` is `@overload`) keep their OVERLOAD flag
-    // but emit no anchor; reachability falls back to the
-    // module-anchor edge.
+    // where every `def f` is `@overload`) stay `is_overload` but
+    // emit no anchor; reachability falls back to the module-anchor
+    // edge.
     let mut overload_anchors: Vec<(u32, u32)> = Vec::new();
     let mut by_name: FxHashMap<String, Vec<u32>> = FxHashMap::default();
     for (i, node) in nodes.iter().enumerate() {
@@ -680,12 +700,12 @@ pub(crate) fn file_to_nodes<'db>(db: &'db dyn ProjectDb, file: File) -> FileNode
         let Some(&impl_idx) = group
             .iter()
             .rev()
-            .find(|&&i| nodes[i as usize].flags & NodeFlags::OVERLOAD == 0)
+            .find(|&&i| !nodes[i as usize].is_overload)
         else {
             continue;
         };
         for &i in group {
-            if nodes[i as usize].flags & NodeFlags::OVERLOAD != 0 {
+            if nodes[i as usize].is_overload {
                 overload_anchors.push((impl_idx, i));
             }
         }
@@ -716,7 +736,7 @@ pub(crate) fn file_to_nodes<'db>(db: &'db dyn ProjectDb, file: File) -> FileNode
                 continue;
             }
             if let Some(&local_idx) = ref_to_local.get(&NodeRef::Def(def_key(db, def, &parsed))) {
-                if nodes[local_idx as usize].flags & NodeFlags::OVERLOAD != 0 {
+                if nodes[local_idx as usize].is_overload {
                     continue;
                 }
                 live.push(local_idx);
@@ -896,7 +916,7 @@ pub(crate) fn import_payload_for_pure<'db>(
 /// payloads are collected.
 #[derive(Debug, Eq, PartialEq, salsa::Update, get_size2::GetSize)]
 pub(crate) struct FileEdges<'db> {
-    pub(crate) edges: FxHashSet<(NodeRef<'db>, NodeRef<'db>, u32)>,
+    pub(crate) edges: FxHashSet<(NodeRef<'db>, NodeRef<'db>, u8)>,
 }
 
 /// Per-file edge emission. Salsa-tracked so the per-file walk
@@ -944,7 +964,7 @@ pub(crate) struct FileEdges<'db> {
 pub(crate) fn file_to_edges<'db>(db: &'db dyn ProjectDb, file: File) -> FileEdges<'db> {
     let self_nodes = file_to_nodes(db, file);
     let module_ref = NodeRef::Module(file);
-    let mut edges: FxHashSet<(NodeRef<'db>, NodeRef<'db>, u32)> = FxHashSet::default();
+    let mut edges: FxHashSet<(NodeRef<'db>, NodeRef<'db>, u8)> = FxHashSet::default();
 
     // 1. Decl → module anchor edges. Every per-file def points at the
     //    module node so reachability seeded from the module covers all
@@ -956,7 +976,7 @@ pub(crate) fn file_to_edges<'db>(db: &'db dyn ProjectDb, file: File) -> FileEdge
     // 1a. `impl → stub` anchor edges for in-file `@typing.overload`
     //     groups. Lets reachability propagate from a live impl to its
     //     stubs and lets the codemod drop a dead impl's stubs in the
-    //     same pass. (`NodeFlags::OVERLOAD` on the stub additionally
+    //     same pass. (`NodeData::is_overload` on the stub additionally
     //     excludes it from cross-module `from mod import f` lookups.)
     for &(impl_local, stub_local) in self_nodes.overload_anchors.iter() {
         let impl_ref = self_nodes.refs[impl_local as usize];

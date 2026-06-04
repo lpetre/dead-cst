@@ -6,9 +6,7 @@ from __future__ import annotations
 import textwrap
 
 
-from dead_cst import NodeFlags
 from dead_cst import _native as native
-from dead_cst.graph import KEEPALIVE_DEFAULT
 from dead_cst.codemod import remove_code
 
 
@@ -46,8 +44,11 @@ def test_overloads_are_excluded_from_cross_module_lookup(tmp_path, make_analysis
         if s.fqname == "mod.f" and s.kind == "function"
     ]
     assert targets, "main.f should reach mod.f"
-    assert all(not (t.flags & NodeFlags.OVERLOAD) for t in targets), (
-        "Cross-module imports should resolve to the impl, not the overload"
+    # Overload status is internal (not Python-visible); the observable proxy
+    # is that resolution lands on the impl (line 5), never the overload stub
+    # (line 4).
+    assert {t.start_line for t in targets} == {5}, (
+        "Cross-module imports should resolve to the impl (line 5), not the overload (line 4)"
     )
 
 
@@ -100,7 +101,7 @@ def test_live_overloads_survive_codemod(tmp_path, make_analysis):
     )
     a = make_analysis(plugins=[native.NativePlugin.explicit([], ["mod.f"], [])])
     graph = a.materialize_all()
-    reachable = set(graph.reachable(seed_flags=KEEPALIVE_DEFAULT))
+    reachable = set(graph.reachable(seed_flags=graph.default_seed_mask()))
     unreachable = [n for n in graph.nodes() if n not in reachable]
     remove_code(unreachable, tmp_path)
 
@@ -109,10 +110,13 @@ def test_live_overloads_survive_codemod(tmp_path, make_analysis):
     assert rewritten.count("@overload") == 2
 
 
-def test_overload_stub_flag_set_on_stubs_only(build_decl_graph):
-    """`NodeFlags.OVERLOAD` is set on `@typing.overload`-decorated stubs and
-    not on the impl. Recognise both `@overload` (from-import / aliased) and
-    the `@typing.overload` attribute form (plain `import typing`)."""
+def test_overload_decorator_forms_recognised(build_decl_graph):
+    """Both `@overload` (from-import / aliased) and the `@typing.overload`
+    attribute form (plain `import typing`) are recognised as overload stubs.
+    Overload status is internal (not Python-visible); the observable proxy is
+    that each recognised stub gets an `impl -> stub` anchor edge, so both
+    stubs are descendants of the impl while the impl itself isn't anchored to
+    anything."""
     graph = build_decl_graph(
         {
             "mod.py": """
@@ -140,9 +144,11 @@ def test_overload_stub_flag_set_on_stubs_only(build_decl_graph):
     f_nodes = [n for n in graph.nodes() if n.fqname == "mod.f" and n.kind == "function"]
     by_line = {n.start_line: n for n in f_nodes}
     assert set(by_line) == {5, 7, 8}, f"unexpected lines: {sorted(by_line)}"
-    assert by_line[5].flags & NodeFlags.OVERLOAD
-    assert by_line[7].flags & NodeFlags.OVERLOAD
-    assert not (by_line[8].flags & NodeFlags.OVERLOAD)
+    descendants = set(graph.descendants(by_line[8]))
+    assert by_line[5] in descendants, "@ovl (aliased) stub should anchor to the impl"
+    assert by_line[7] in descendants, (
+        "@typing.overload (attribute form) stub should anchor to the impl"
+    )
 
 
 def test_impl_to_overload_anchor_edges(build_decl_graph):
@@ -186,7 +192,7 @@ def test_impl_to_overload_anchor_edges(build_decl_graph):
 def test_cross_module_import_reaches_impl_not_stubs(build_decl_graph):
     """`from mod import f` should produce exactly one decl edge per consumer
     use — to the impl, not the stubs (which are deliberately excluded from
-    the cross-module trie via `NodeFlags.OVERLOAD`)."""
+    the cross-module trie as overload stubs)."""
     graph = build_decl_graph(
         {
             "mod.py": """
@@ -212,7 +218,11 @@ def test_cross_module_import_reaches_impl_not_stubs(build_decl_graph):
         if nodes[u] == main_alias and nodes[v].fqname == "mod.f" and nodes[v].kind == "function"
     ]
     assert targets, "import alias should reach at least one mod.f decl"
-    assert all(not (t.flags & NodeFlags.OVERLOAD) for t in targets)
+    # Overload stubs (lines 4, 6) are excluded from the cross-module trie, so
+    # the only reachable decl is the impl (line 7).
+    assert {t.start_line for t in targets} == {7}, (
+        "import alias should reach only the impl (line 7), not the stubs (lines 4, 6)"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -232,7 +242,7 @@ def test_orphan_pyi_stub_uses_runtime_fqname(tmp_path, make_analysis, successors
 
     a = make_analysis(plugins=[native.NativePlugin.explicit([], ["main"], [])])
     graph = a.materialize_all()
-    reachable = set(graph.reachable(seed_flags=KEEPALIVE_DEFAULT))
+    reachable = set(graph.reachable(seed_flags=graph.default_seed_mask()))
 
     stub_compute = next(
         n for n in graph.nodes() if n.fqname == "mypkg._native.compute" and n.kind == "function"

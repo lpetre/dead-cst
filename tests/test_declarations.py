@@ -1723,8 +1723,8 @@ def test_notebook_decls_carry_notebook_flag(write_notebook, build_decl_graph):
 
     ``NOTEBOOK`` does two jobs:
 
-    * It's a keepalive bit in :data:`KEEPALIVE_DEFAULT` so cells stay
-      alive (notebooks are executed top-to-bottom, not imported).
+    * It's a seed flag (``engine/notebook``) in the default seed mask so
+      cells stay alive (notebooks are executed top-to-bottom, not imported).
     * It tells the codemod to skip these nodes — it can't rewrite cell
       JSON envelopes safely.
     """

@@ -29,6 +29,7 @@ mod builder;
 mod file_extraction;
 mod file_payload;
 mod file_ref_edges;
+mod flag_registry;
 mod graph;
 mod helpers;
 mod ingest;

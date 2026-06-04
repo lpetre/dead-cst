@@ -55,6 +55,10 @@ pub(crate) struct GraphNode {
     pub(crate) end_line: usize,
     pub(crate) end_column: usize,
     pub(crate) flags: u32,
+    /// `@overload` stub marker carried from [`NodeData`]. Build-time only —
+    /// drives the fqname-trie exclusion in `build_fqname_indices`; never
+    /// reaches `SymbolNode`, the dcg file, or Python.
+    pub(crate) is_overload: bool,
     pub(crate) imports: Option<ImportPayload>,
 }
 
@@ -109,13 +113,13 @@ impl GraphNode {
 pub(crate) struct GraphBuilder {
     pub(crate) nodes: Vec<GraphNode>,
     pub(crate) node_index: FxHashMap<NodeKey, usize>,
-    pub(crate) edges: Vec<(usize, usize, u32)>,
-    pub(crate) edge_set: FxHashSet<(usize, usize, u32)>,
+    pub(crate) edges: Vec<(usize, usize, u8)>,
+    pub(crate) edge_set: FxHashSet<(usize, usize, u8)>,
     /// Per-node forward / reverse adjacency lists kept in sync with
     /// ``edges``. ``bfs`` reads these so traversals are O(deg(i)) per
     /// pop instead of O(|edges|).
-    pub(crate) forward_adj: Vec<Vec<(usize, u32)>>,
-    pub(crate) reverse_adj: Vec<Vec<(usize, u32)>>,
+    pub(crate) forward_adj: Vec<Vec<(usize, u8)>>,
+    pub(crate) reverse_adj: Vec<Vec<(usize, u8)>>,
     /// `{ pyi_file -> py_twin_file }` for peer ``.pyi`` files whose
     /// ``.py`` twin is also in the project. Both files get ingested
     /// independently (the rust path differs from libcst here — we
@@ -231,7 +235,7 @@ impl GraphBuilder {
         idx
     }
 
-    pub(crate) fn add_edge(&mut self, src: usize, dst: usize, flags: u32) {
+    pub(crate) fn add_edge(&mut self, src: usize, dst: usize, flags: u8) {
         let triple = (src, dst, flags);
         if self.edge_set.insert(triple) {
             self.edges.push(triple);
@@ -249,7 +253,7 @@ impl GraphBuilder {
     /// with looping `add_edge`, the win is amortising the per-edge
     /// branch / hash overhead and pre-reserving capacity on `edges`
     /// and the per-node adjacency vectors.
-    pub(crate) fn extend_edges(&mut self, triples: Vec<(usize, usize, u32)>) {
+    pub(crate) fn extend_edges(&mut self, triples: Vec<(usize, usize, u8)>) {
         if triples.is_empty() {
             return;
         }
@@ -303,7 +307,7 @@ pub(crate) fn bfs(
     builder: &GraphBuilder,
     seeds: impl IntoIterator<Item = usize>,
     direction: Direction,
-    skip_flags: u32,
+    skip_flags: u8,
 ) -> FxHashSet<usize> {
     let mut visited: FxHashSet<usize> = FxHashSet::default();
     let mut stack: Vec<usize> = seeds.into_iter().collect();
@@ -346,6 +350,7 @@ pub(crate) fn synthetic_node(
         end_line: 0,
         end_column: 0,
         flags,
+        is_overload: false,
         imports: None,
     }
 }
@@ -360,7 +365,7 @@ pub(crate) enum PreparedOp {
     Edge {
         src_idx: usize,
         dst_idx: usize,
-        flags: u32,
+        flags: u8,
     },
     Entrypoint {
         decl_idx: usize,
@@ -688,7 +693,7 @@ mod tests {
     /// Append a forward+reverse adjacency entry. The plain `Vec::push`
     /// path is enough because `bfs` only reads `forward_adj` /
     /// `reverse_adj` — it never inspects `edges` / `edge_set` / `nodes`.
-    fn add_edge_manual(b: &mut GraphBuilder, src: usize, dst: usize, flags: u32) {
+    fn add_edge_manual(b: &mut GraphBuilder, src: usize, dst: usize, flags: u8) {
         b.forward_adj[src].push((dst, flags));
         b.reverse_adj[dst].push((src, flags));
     }

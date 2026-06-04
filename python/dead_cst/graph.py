@@ -3,8 +3,8 @@
 :class:`SymbolNode` is what every node in the project graph is.
 :class:`Import` captures a cross-file reference (the dotted module
 name plus optional decl). :class:`NodeFlags` and :class:`EdgeFlags`
-mark structural attributes (``SHADOWED`` decls, ``DEAD_BRANCH`` edges,
-explicit ``ENTRYPOINT``\\s).
+mark structural attributes (``NOQA``-pinned imports, ``DEAD_BRANCH``
+edges, explicit ``ENTRYPOINT``\\s).
 
 All four are re-exported straight from the rust extension
 (:mod:`dead_cst._native`) — there is no parallel Python copy anymore.
@@ -34,24 +34,19 @@ from dead_cst._native import (
 if TYPE_CHECKING:
     from dead_cst import _native as native
 
-#: Default seed mask for reachability queries. ORs together every
-#: :class:`NodeFlags` bit that semantically "keeps a node alive":
-#:
-#: * :data:`NodeFlags.ENTRYPOINT` — explicit entrypoints (plugin-emitted
-#:   seeds, ``-e`` CLI flag, ``[project.scripts]`` targets, ...).
-#: * :data:`NodeFlags.TESTCASE` — pytest / unittest discoveries.
-#: * :data:`NodeFlags.NOQA` — imports pinned by a ``# noqa: F401``
-#:   directive.
-#: * :data:`NodeFlags.NOTEBOOK` — notebook cells (run top-to-bottom,
-#:   never imported, always alive).
-#:
-#: :meth:`Analysis.reachable` / :meth:`Analysis.dead` default to this
-#: mask. Pass a subset to scope the question — e.g.
-#: ``reachable(seed_flags=NodeFlags.ENTRYPOINT)`` asks "what would be
-#: alive if the test suite, ``noqa`` pins, and notebooks didn't exist."
-KEEPALIVE_DEFAULT: int = (
-    NodeFlags.ENTRYPOINT | NodeFlags.TESTCASE | NodeFlags.NOQA | NodeFlags.NOTEBOOK
-)
+#: A flag-registry entry: ``(name, bit, seed, default_on, description)``.
+FlagEntry = tuple[str, int, bool, bool, str]
+
+
+def _seed_mask_from_registry(registry: Sequence[FlagEntry]) -> int:
+    """OR of every node-flag bit whose flag both seeds reachability and is
+    on by default — the registry-derived replacement for the old
+    hand-maintained ``KEEPALIVE_DEFAULT`` constant."""
+    mask = 0
+    for _name, bit, seed, default_on, _description in registry:
+        if seed and default_on:
+            mask |= bit
+    return mask
 
 
 class LoadedGraph:
@@ -65,12 +60,22 @@ class LoadedGraph:
     walk here keeps the ``ProjectContext`` off the critical path.
     """
 
-    __slots__ = ("_nodes", "_edges", "_out", "_index")
+    __slots__ = (
+        "_nodes",
+        "_edges",
+        "_out",
+        "_index",
+        "_node_flag_registry",
+        "_edge_flag_registry",
+        "_default_seed_mask",
+    )
 
     def __init__(
         self,
         nodes: Sequence[SymbolNode],
         edges: Sequence[tuple[int, int, int]],
+        node_flag_registry: Sequence[FlagEntry] = (),
+        edge_flag_registry: Sequence[FlagEntry] = (),
     ) -> None:
         self._nodes: list[SymbolNode] = list(nodes)
         self._edges: list[tuple[int, int, int]] = list(edges)
@@ -79,6 +84,9 @@ class LoadedGraph:
         for src, dst, flags in self._edges:
             out[src].append((dst, flags))
         self._out: list[list[tuple[int, int]]] = out
+        self._node_flag_registry: list[FlagEntry] = list(node_flag_registry)
+        self._edge_flag_registry: list[FlagEntry] = list(edge_flag_registry)
+        self._default_seed_mask: int = _seed_mask_from_registry(self._node_flag_registry)
 
     def nodes(self) -> list[SymbolNode]:
         return list(self._nodes)
@@ -86,18 +94,46 @@ class LoadedGraph:
     def edges(self) -> list[tuple[int, int, int]]:
         return list(self._edges)
 
+    def node_flag_registry(self) -> list[FlagEntry]:
+        """The node-flag registry loaded from the graph file, so a
+        loaded-then-rewritten graph preserves it. Empty for a graph
+        written before format version 2."""
+        return list(self._node_flag_registry)
+
+    def edge_flag_registry(self) -> list[FlagEntry]:
+        """The edge-flag registry loaded from the graph file."""
+        return list(self._edge_flag_registry)
+
+    def default_seed_mask(self) -> int:
+        """Registry-derived default keepalive mask (see
+        :func:`_seed_mask_from_registry`)."""
+        return self._default_seed_mask
+
+    def node_flag(self, name: str) -> int | None:
+        """Resolve a node-flag bit by its registered ``owner/name`` from
+        the loaded registry, mirroring
+        :meth:`native.ProjectContext.node_flag`. ``None`` if no flag with
+        that name is recorded in the file."""
+        for entry_name, bit, *_rest in self._node_flag_registry:
+            if entry_name == name:
+                return bit
+        return None
+
     def reachable(
         self,
         *,
-        seed_flags: int = KEEPALIVE_DEFAULT,
+        seed_flags: int | None = None,
         skip_flags: int = 0,
     ) -> list[SymbolNode]:
         """Forward closure from every node whose ``flags & seed_flags``.
 
         Mirrors :meth:`native.ProjectContext.reachable` — same seed
         semantics, same ``skip_flags`` masking on edges — implemented
-        as a Python BFS over the loaded adjacency list.
+        as a Python BFS over the loaded adjacency list. ``seed_flags``
+        defaults to the registry-derived :meth:`default_seed_mask`.
         """
+        if seed_flags is None:
+            seed_flags = self._default_seed_mask
         seeds = [i for i, n in enumerate(self._nodes) if n.flags & seed_flags]
         visited: set[int] = set()
         stack: list[int] = list(seeds)
@@ -131,6 +167,17 @@ def _edge_iterable(obj: object) -> list[tuple[int, int, int]]:
     return list(edges_fn())
 
 
+def _flag_registry(obj: object, attr: str) -> list[FlagEntry]:
+    """Read a ``node_flag_registry`` / ``edge_flag_registry`` table off a
+    duck-typed graph. Both :class:`native.ProjectContext` and
+    :class:`LoadedGraph` expose them as methods; a graph without them
+    (e.g. a third-party duck type) serializes an empty table."""
+    fn = getattr(obj, attr, None)
+    if fn is None:
+        return []
+    return [tuple(entry) for entry in fn()]
+
+
 def write_graph(
     path: Path | str,
     graph: native.ProjectContext | LoadedGraph,
@@ -149,7 +196,11 @@ def write_graph(
     """
     nodes = _node_iterable(graph)
     edges = _edge_iterable(graph)
-    _native_mod.write_graph(str(path), nodes, edges, list(meta))
+    node_flag_registry = _flag_registry(graph, "node_flag_registry")
+    edge_flag_registry = _flag_registry(graph, "edge_flag_registry")
+    _native_mod.write_graph(
+        str(path), nodes, edges, list(meta), node_flag_registry, edge_flag_registry
+    )
 
 
 def read_graph(path: Path | str) -> tuple[LoadedGraph, GraphMetadata]:
@@ -161,11 +212,18 @@ def read_graph(path: Path | str) -> tuple[LoadedGraph, GraphMetadata]:
     in-place migrations.
     """
     native_graph, metadata = _native_mod.read_graph(str(path))
-    return LoadedGraph(list(native_graph.nodes), list(native_graph.edges)), metadata
+    return (
+        LoadedGraph(
+            list(native_graph.nodes),
+            list(native_graph.edges),
+            list(metadata.node_flag_registry),
+            list(metadata.edge_flag_registry),
+        ),
+        metadata,
+    )
 
 
 __all__ = [
-    "KEEPALIVE_DEFAULT",
     "EdgeFlags",
     "GraphMetadata",
     "Import",

@@ -55,6 +55,7 @@ use ty_project::Db as ProjectDb;
 
 use crate::builder::PreparedOp;
 use crate::file_payload::{file_to_nodes, NodeData, NodeKind};
+use crate::flag_registry::FlagRegistry;
 use crate::graph::{EdgeFlags, NodeFlags};
 use crate::helpers::{
     collect_modules_imports_local, decorators_match_imports, is_dunder_name,
@@ -150,9 +151,15 @@ impl PluginJob {
 pub(crate) fn extract_plugin_jobs(
     py: Python<'_>,
     plugins: &[PyObject],
-) -> PyResult<(Vec<PluginJob>, Vec<String>)> {
+) -> PyResult<(Vec<PluginJob>, Vec<String>, FlagRegistry, FlagRegistry)> {
     let mut jobs = Vec::with_capacity(plugins.len());
     let mut names = Vec::with_capacity(plugins.len());
+    // Seed both registries with the engine built-ins, then fold in each
+    // plugin's declared flags in registration order (so bit allocation is a
+    // pure function of plugin order). A conflicting / reserved / overflowing
+    // declaration surfaces here, on the GIL thread, before the parallel run.
+    let mut node_reg = FlagRegistry::with_node_builtins();
+    let mut edge_reg = FlagRegistry::with_edge_builtins();
     for plugin in plugins {
         let bound = plugin.bind(py);
         let native = match bound.downcast::<NativePlugin>() {
@@ -166,6 +173,16 @@ pub(crate) fn extract_plugin_jobs(
             }
         };
         let native_ref = native.borrow();
+        // Any plugin carrying an `ExternalPlugin` (project-wide or
+        // per-file-capable) may declare flags; pure per-file built-ins don't.
+        if let NativePluginKind::External { plugin, .. } = &native_ref.kind {
+            for spec in plugin.declare_node_flags() {
+                node_reg.register_plugin(spec)?;
+            }
+            for spec in plugin.declare_edge_flags() {
+                edge_reg.register_plugin(spec)?;
+            }
+        }
         let (job, name) = match &native_ref.kind {
             NativePluginKind::External {
                 plugin,
@@ -183,7 +200,7 @@ pub(crate) fn extract_plugin_jobs(
         jobs.push(job);
         names.push(name);
     }
-    Ok((jobs, names))
+    Ok((jobs, names, node_reg, edge_reg))
 }
 
 // ---------------------------------------------------------------------------
@@ -231,7 +248,7 @@ pub(crate) enum FileLocalOp {
     Edge {
         src_local_idx: u32,
         dst_local_idx: u32,
-        flags: u32,
+        flags: u8,
     },
     /// Keep a node in this file alive via a synthetic entrypoint marker
     /// (`PreparedOp::Entrypoint` shape). ``decl_local_idx`` is a file-local
@@ -1212,6 +1229,12 @@ pub mod plugin_api {
     // values via [`CallArgs::get`] / [`CallArgs::str_value`].
     pub use crate::helpers::{ArgValue, CallArgs};
 
+    // Flag declaration vocabulary. A plugin returns these from
+    // [`ExternalPlugin::declare_node_flags`] / [`declare_edge_flags`]; the host
+    // allocates each a bit and the plugin reads it back via
+    // [`PluginCtx::node_flag`] / [`edge_flag`]. Pyo3-free.
+    pub use crate::flag_registry::FlagSpec;
+
     /// `NodeFlags::ENTRYPOINT` re-exported for plugin authors: set it on a
     /// node minted via [`PluginOps::add_synthetic_node`] /
     /// [`FileOps::add_synthetic_node`] to make that node a reachability seed.
@@ -1222,13 +1245,13 @@ pub mod plugin_api {
     /// [`PluginOps::add_edge`] / [`FileOps::add_edge`]: mark a plugin-added
     /// edge as originating in a statically-dead region. Metadata only — the
     /// edge still participates in default reachability.
-    pub const FLAG_DEAD_BRANCH: u32 = EdgeFlags::DEAD_BRANCH;
+    pub const FLAG_DEAD_BRANCH: u8 = EdgeFlags::DEAD_BRANCH;
 
     /// `EdgeFlags::DYNAMIC_IMPORT` re-exported for the `flags` argument of
     /// [`PluginOps::add_edge`] / [`FileOps::add_edge`]: mark a plugin-added
     /// edge as a runtime-import (`__import__` / `importlib.import_module`)
     /// fan-out, the same bit the visitor stamps on dynamic-import edges.
-    pub const FLAG_DYNAMIC_IMPORT: u32 = EdgeFlags::DYNAMIC_IMPORT;
+    pub const FLAG_DYNAMIC_IMPORT: u8 = EdgeFlags::DYNAMIC_IMPORT;
 
     /// Epoch of this curated `plugin_api` surface — the author-facing contract
     /// version, baked into the [ABI fingerprint](super::PLUGIN_ABI_FINGERPRINT)
@@ -1357,6 +1380,25 @@ pub mod plugin_api {
         /// output (that would break the salsa cache); use it for project-wide
         /// `run` setup only.
         fn prepare(&self, _project_root: &str) {}
+
+        /// Node flags this plugin contributes to the registry. Each returned
+        /// [`FlagSpec`] is assigned a bit by the host (above the engine flags,
+        /// in registration order) before [`run`](Self::run); read the bit back
+        /// with [`PluginCtx::node_flag`]. Declaring the same `owner/name` spec
+        /// from two plugins is idempotent (they share one bit); a conflicting
+        /// re-declaration, an `engine/`-prefixed name, or exhausting the 32-bit
+        /// node width fails the whole materialize. Default none.
+        fn declare_node_flags(&self) -> Vec<FlagSpec> {
+            Vec::new()
+        }
+
+        /// Edge flags this plugin contributes to the registry — the edge-space
+        /// twin of [`declare_node_flags`](Self::declare_node_flags), read back
+        /// with [`PluginCtx::edge_flag`]. Edge flags share an 8-bit width.
+        /// Default none.
+        fn declare_edge_flags(&self) -> Vec<FlagSpec> {
+            Vec::new()
+        }
     }
 
     /// Per-file capability for an [`ExternalPlugin`]. Invoked once per
@@ -1432,7 +1474,7 @@ pub mod plugin_api {
         /// Destination node index.
         pub dst: usize,
         /// `EdgeFlags` bitset.
-        pub flags: u32,
+        pub flags: u8,
     }
 
     /// Conjunctive filter for [`PluginCtx::nodes_matching`] — a node must
@@ -1923,6 +1965,23 @@ pub mod plugin_api {
         pub fn project_root(&self) -> &str {
             self.inner.project_root()
         }
+
+        // --- flag registry --------------------------------------------------
+
+        /// The bit a node flag named `name` (`owner/name`) was assigned, or
+        /// `None` if no plugin/engine declared it. A plugin reads its own
+        /// declared flag this way: the host allocated the bit from
+        /// [`ExternalPlugin::declare_node_flags`] before `run`, so a plugin
+        /// that declared `name` can `.expect()` the lookup.
+        pub fn node_flag(&self, name: &str) -> Option<u32> {
+            self.inner.node_flags.get(name).map(|bit| bit as u32)
+        }
+
+        /// The bit an edge flag named `name` was assigned (edge-space twin of
+        /// [`Self::node_flag`]), or `None` if undeclared.
+        pub fn edge_flag(&self, name: &str) -> Option<u8> {
+            self.inner.edge_flags.get(name).map(|bit| bit as u8)
+        }
     }
 
     /// Op sink for external plugins. Wraps the internal `PreparedOp` vec so
@@ -1953,7 +2012,7 @@ pub mod plugin_api {
         /// existing nodes, stamped with `flags` (`0` for a plain edge, or
         /// one of [`FLAG_DEAD_BRANCH`] / [`FLAG_DYNAMIC_IMPORT`]). Emits a
         /// [`PreparedOp::Edge`].
-        pub fn add_edge(&mut self, src_idx: usize, dst_idx: usize, flags: u32) {
+        pub fn add_edge(&mut self, src_idx: usize, dst_idx: usize, flags: u8) {
             self.sink.push(PreparedOp::Edge {
                 src_idx,
                 dst_idx,
@@ -2211,7 +2270,7 @@ pub mod plugin_api {
         /// [`FLAG_DEAD_BRANCH`] / [`FLAG_DYNAMIC_IMPORT`]). Both endpoints
         /// are positions in [`PluginFileCtx::nodes`]; an edge with an
         /// unresolvable endpoint is dropped at apply time.
-        pub fn add_edge(&mut self, src_local_idx: u32, dst_local_idx: u32, flags: u32) {
+        pub fn add_edge(&mut self, src_local_idx: u32, dst_local_idx: u32, flags: u8) {
             self.sink.push(FileLocalOp::Edge {
                 src_local_idx,
                 dst_local_idx,
@@ -2586,6 +2645,10 @@ impl plugin_api::ExternalPlugin for UnittestPluginImpl {
         "UnittestPlugin"
     }
 
+    fn declare_node_flags(&self) -> Vec<plugin_api::FlagSpec> {
+        vec![testcase_flag_spec()]
+    }
+
     fn run(
         &self,
         ctx: &plugin_api::PluginCtx<'_>,
@@ -2595,6 +2658,10 @@ impl plugin_api::ExternalPlugin for UnittestPluginImpl {
         if !ctx.has_imports_of("unittest") {
             return Ok(());
         }
+        // The bit the host allocated for our declared `test/testcase` flag.
+        let testcase_flag = ctx
+            .node_flag("test/testcase")
+            .expect("test/testcase is declared in declare_node_flags");
         let import_idxs = ctx.imports_of("unittest");
         let importer_paths: std::collections::HashSet<String> =
             ctx.node_paths(&import_idxs).into_iter().collect();
@@ -2651,7 +2718,7 @@ impl plugin_api::ExternalPlugin for UnittestPluginImpl {
             ops.add_synthetic_node(
                 format!("{UNITTEST_PREFIX}{}", attr.fqname),
                 path.clone(),
-                NodeFlags::TESTCASE,
+                testcase_flag,
                 decls_by_path[path].clone(),
                 Vec::new(),
             );
@@ -4002,17 +4069,35 @@ fn is_test_decl(kind: &str, fqname: &str) -> bool {
         || (kind == "class" && simple.starts_with("Test"))
 }
 
-/// Emit a `TESTCASE` seed node keeping `target_idxs` alive (no-op when empty).
+/// The shared `test/testcase` node-flag spec declared by both the pytest and
+/// unittest plugins. Identical from both, so the registry collapses it to a
+/// single bit (idempotent registration); `seed + default_on` puts it in the
+/// default keepalive mask whenever a test plugin is registered.
+fn testcase_flag_spec() -> plugin_api::FlagSpec {
+    plugin_api::FlagSpec {
+        name: "test/testcase".to_string(),
+        seed: true,
+        default_on: true,
+        description: "Symbol kept alive because a test framework (pytest / unittest) \
+                      discovers it as a test, fixture, or lifecycle hook."
+            .to_string(),
+    }
+}
+
+/// Emit a seed node stamped with `flags` keeping `target_idxs` alive (no-op
+/// when empty). `flags` is the resolved `test/testcase` bit (see
+/// [`testcase_flag_spec`]).
 fn mark_seed(
     ops: &mut plugin_api::PluginOps,
     fqname: String,
     path: String,
+    flags: u32,
     target_idxs: Vec<usize>,
 ) {
     if target_idxs.is_empty() {
         return;
     }
-    ops.add_synthetic_node(fqname, path, NodeFlags::TESTCASE, target_idxs, Vec::new());
+    ops.add_synthetic_node(fqname, path, flags, target_idxs, Vec::new());
 }
 
 /// `{ path: module_fqname }` for every path resolving to a project module.
@@ -4048,11 +4133,19 @@ impl plugin_api::ExternalPlugin for PytestPluginImpl {
         "PytestPlugin"
     }
 
+    fn declare_node_flags(&self) -> Vec<plugin_api::FlagSpec> {
+        vec![testcase_flag_spec()]
+    }
+
     fn run(
         &self,
         ctx: &plugin_api::PluginCtx<'_>,
         ops: &mut plugin_api::PluginOps,
     ) -> Result<(), plugin_api::PluginError> {
+        // The bit the host allocated for our declared `test/testcase` flag.
+        let testcase_flag = ctx
+            .node_flag("test/testcase")
+            .expect("test/testcase is declared in declare_node_flags");
         // Every top-level function / class / variable decl + its path.
         let idxs = ctx.nodes_matching(&plugin_api::NodeFilter {
             kinds: &["function", "class", "variable"],
@@ -4122,6 +4215,7 @@ impl plugin_api::ExternalPlugin for PytestPluginImpl {
                     ops,
                     format!("{PYTEST_CONFTEST_PREFIX}{module_fqname}"),
                     path.clone(),
+                    testcase_flag,
                     conftest_by_path[path].clone(),
                 );
             }
@@ -4132,6 +4226,7 @@ impl plugin_api::ExternalPlugin for PytestPluginImpl {
                     ops,
                     format!("{PYTEST_TESTS_PREFIX}{module_fqname}"),
                     path.clone(),
+                    testcase_flag,
                     tests_by_path[path].clone(),
                 );
             }
@@ -4164,6 +4259,7 @@ impl plugin_api::ExternalPlugin for PytestPluginImpl {
                     ops,
                     format!("{PYTEST_FIXTURES_PREFIX}{module_fqname}"),
                     path.clone(),
+                    testcase_flag,
                     fixtures_by_path[path].clone(),
                 );
             }

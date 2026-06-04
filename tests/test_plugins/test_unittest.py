@@ -4,7 +4,6 @@ from __future__ import annotations
 
 
 from dead_cst import _native as native
-from dead_cst.graph import NodeFlags
 
 
 def test_unittest_plugin_marks_testcase_subclass(build_plugin_graph, reachable_fqnames):
@@ -231,8 +230,10 @@ def test_unittest_plugin_tags_seeds_as_testcase(build_plugin_graph):
         },
         [native.NativePlugin.unittest()],
     )
-    seeds = [n for n in graph.nodes() if n.flags & NodeFlags.TESTCASE]
-    assert seeds, "expected unittest plugin to seed at least one TESTCASE node"
+    testcase = graph.node_flag("test/testcase")
+    assert testcase is not None, "unittest plugin should register the test/testcase flag"
+    seeds = [n for n in graph.nodes() if n.flags & testcase]
+    assert seeds, "expected unittest plugin to seed at least one test/testcase node"
 
 
 def test_unittest_plugin_marks_subclass_via_local_mixin(build_plugin_graph, reachable_fqnames):

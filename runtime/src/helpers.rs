@@ -896,8 +896,8 @@ pub(crate) const NODE_FLAGS_NOQA_PIN: u32 = NodeFlags::NOQA;
 /// `NodeFlags::ENTRYPOINT` (which would force every reader to chase the
 /// `pyclass` macro to decide whether it's a runtime lookup or a const).
 pub(crate) const NODE_FLAG_ENTRYPOINT: u32 = NodeFlags::ENTRYPOINT;
-pub(crate) const EDGE_FLAG_DEAD_BRANCH: u32 = EdgeFlags::DEAD_BRANCH;
-pub(crate) const EDGE_FLAG_DYNAMIC_IMPORT: u32 = EdgeFlags::DYNAMIC_IMPORT;
+pub(crate) const EDGE_FLAG_DEAD_BRANCH: u8 = EdgeFlags::DEAD_BRANCH;
+pub(crate) const EDGE_FLAG_DYNAMIC_IMPORT: u8 = EdgeFlags::DYNAMIC_IMPORT;
 
 /// Collect the source ranges of every statically-dead statement in
 /// `parsed` — bodies of `if False` / `else` of `if True` / `while False`

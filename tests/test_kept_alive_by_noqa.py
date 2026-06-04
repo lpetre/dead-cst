@@ -2,24 +2,23 @@
 
 Imports preserved by a ruff/pyflakes ``# noqa[: ...F401...]`` (per-line)
 or a file-level ``# ruff: noqa`` / ``# flake8: noqa`` are stamped with
-:data:`NodeFlags.NOQA` -- one of the keepalive bits in
-:data:`KEEPALIVE_DEFAULT`, so reachability seeds from them by default.
-The flag-taking blast-radius query returns modules and decls currently
-kept alive only because of those pinned imports.
+:data:`NodeFlags.NOQA` -- a seed flag (registered ``engine/noqa``), so
+reachability seeds from them by default. The flag-taking blast-radius
+query returns modules and decls currently kept alive only because of
+those pinned imports.
 """
 
 from __future__ import annotations
 
 from dead_cst import NodeFlags
-from dead_cst.graph import KEEPALIVE_DEFAULT
 
 
 def find_reachable_excluding_noqa(graph):
-    return set(graph.reachable(seed_flags=KEEPALIVE_DEFAULT & ~NodeFlags.NOQA))
+    return set(graph.reachable(seed_flags=graph.default_seed_mask() & ~NodeFlags.NOQA))
 
 
 def find_kept_alive_by_noqa_only(graph):
-    full = set(graph.reachable(seed_flags=KEEPALIVE_DEFAULT))
+    full = set(graph.reachable(seed_flags=graph.default_seed_mask()))
     return full - find_reachable_excluding_noqa(graph)
 
 
@@ -38,7 +37,7 @@ def test_noqa_pin_keeps_module_alive_only_via_noqa(make_analysis, write_files):
     )
     graph = make_analysis().materialize_all()
     side = next(n for n in graph.nodes() if n.fqname == "pkg.side_effect")
-    assert side in set(graph.reachable(seed_flags=KEEPALIVE_DEFAULT))
+    assert side in set(graph.reachable(seed_flags=graph.default_seed_mask()))
     assert side not in find_reachable_excluding_noqa(graph)
     assert side in find_kept_alive_by_noqa_only(graph)
 
@@ -108,9 +107,10 @@ def test_excluding_multiple_flags_in_one_pass(make_analysis, write_files):
 
     graph = make_analysis(plugins=[native.NativePlugin.pytest()]).materialize_all()
     side = next(n for n in graph.nodes() if n.fqname == "pkg.side_effect")
-    assert side in set(graph.reachable(seed_flags=KEEPALIVE_DEFAULT))
+    assert side in set(graph.reachable(seed_flags=graph.default_seed_mask()))
+    testcase = graph.node_flag("test/testcase") or 0
     excluded = set(
-        graph.reachable(seed_flags=KEEPALIVE_DEFAULT & ~(NodeFlags.TESTCASE | NodeFlags.NOQA))
+        graph.reachable(seed_flags=graph.default_seed_mask() & ~(testcase | NodeFlags.NOQA))
     )
     assert side not in excluded
 

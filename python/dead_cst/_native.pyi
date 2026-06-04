@@ -41,48 +41,32 @@ class NodeFlags:
     """
 
     NONE: int
-    SHADOWED: int
-    """Decl rebound by a later assignment in the same file. Kept in
-    the graph (with its parent-module edge) but excluded from the
-    cross-module lookup so consumers of an exported name route to the
-    live binding."""
 
     ENTRYPOINT: int
     """Explicit entrypoint — plugin-emitted seeds, the CLI's ``-e`` flag,
-    ``[project.scripts]`` targets, factory-app synthetics, etc. One of
-    the keepalive bits ORed into ``KEEPALIVE_DEFAULT`` on the Python
-    side, so reachability seeds from ``ENTRYPOINT``-flagged nodes by
-    default."""
-
-    OVERLOAD: int
-    """``typing.overload`` stub (or any same-name decl anchored to a
-    matching impl). Excluded from the lookup trie like ``SHADOWED``;
-    kept alive by an explicit ``impl -> overload`` edge."""
-
-    TESTCASE: int
-    """Pytest / unittest test discoveries. One of the keepalive bits in
-    ``KEEPALIVE_DEFAULT``, so tests are alive by default. The
-    ``kept_alive_by_flags_only(TESTCASE)`` blast-radius query isolates
-    "what's only alive because of tests" by computing the diff against
-    ``reachable(seed_flags=KEEPALIVE_DEFAULT & ~TESTCASE)``."""
+    ``[project.scripts]`` targets, factory-app synthetics, etc. A seed
+    flag (registered ``engine/entrypoint``), so reachability seeds from
+    ``ENTRYPOINT``-flagged nodes by default."""
 
     NOQA: int
     """Import alias preserved by a user noqa directive (bare
     ``# noqa``, ``# noqa: F401``, multi-rule ``# noqa: E501, F401``, or
-    the file-level ``# ruff: noqa`` / ``# flake8: noqa``). One of the
-    keepalive bits in ``KEEPALIVE_DEFAULT``."""
+    the file-level ``# ruff: noqa`` / ``# flake8: noqa``). A seed flag
+    (registered ``engine/noqa``)."""
 
     NOTEBOOK: int
     """Every node sourced from a Jupyter ``.ipynb`` file. Cells run
     top-to-bottom rather than being imported, so the bit alone keeps
-    the node alive (no ``ENTRYPOINT`` overlay needed — ``NOTEBOOK`` is
-    in ``KEEPALIVE_DEFAULT``). The codemod also reads the bit to skip
-    notebook nodes (it can't rewrite the cell JSON envelope)."""
+    the node alive — a seed flag (registered ``engine/notebook``). The
+    codemod also reads the bit to skip notebook nodes (it can't rewrite
+    the cell JSON envelope)."""
 
-    EXPORTED: int
-    """Every node sourced from a file under the package's ``exported``
-    glob. Used by the cross-package merge to filter to entries the
-    owning package opts into exposing."""
+    DEAD_BRANCH: int
+    """Decl that sits in a statically-dead region (the body of
+    ``if False:``, the else of ``if True:``, code after an
+    unconditional ``return`` / ``raise``, …) — the node-level companion
+    to ``EdgeFlags.DEAD_BRANCH``. Metadata only (not a seed); registered
+    ``engine/dead_branch``."""
 
     STAR_REEXPORT: int
     """Per-name import decl synthesized from ``from X import *`` — one
@@ -1073,6 +1057,43 @@ class ProjectContext:
         """Live edges as ``(src_idx, dst_idx, flags)`` triples."""
         ...
 
+    # ----- Flag registries ----------------------------------------------
+    #
+    # The engine seeds both registries with its built-in flags at
+    # construction; plugins extend the node / edge registries during
+    # :meth:`materialize`. The getters decode bits by name and feed the
+    # registry-derived keepalive seed the Python layer uses.
+
+    def node_flag_registry(self) -> list[tuple[str, int, bool, bool, str]]:
+        """Every registered node flag as
+        ``(name, bit, seed, default_on, description)`` tuples, sorted by
+        bit. Includes the engine built-ins plus any flag a registered
+        plugin declared via ``declare_node_flags``."""
+        ...
+
+    def edge_flag_registry(self) -> list[tuple[str, int, bool, bool, str]]:
+        """Every registered edge flag, same tuple shape as
+        :meth:`node_flag_registry`."""
+        ...
+
+    def default_seed_mask(self) -> int:
+        """OR of every node-flag bit whose flag both seeds reachability
+        and is on by default — the registry-derived replacement for the
+        old ``KEEPALIVE_DEFAULT`` constant. The default ``seed_flags`` for
+        :class:`dead_cst.Analysis` reachability queries."""
+        ...
+
+    def node_flag(self, name: str) -> int | None:
+        """Resolve a node-flag bit by its registered ``owner/name`` (e.g.
+        ``"engine/entrypoint"``, ``"test/testcase"``), or ``None`` when no
+        flag with that name is registered."""
+        ...
+
+    def edge_flag(self, name: str) -> int | None:
+        """Resolve an edge-flag bit by its registered ``owner/name``, or
+        ``None`` when no flag with that name is registered."""
+        ...
+
 # ---------- Node-attribute rows ------------------------------------------
 
 class NodeAttrs:
@@ -1101,9 +1122,12 @@ class GraphMetadata:
 
     ``created_at`` is unix-epoch seconds at write time. ``user_meta``
     is the list of ``(key, value)`` pairs the writer passed (from
-    ``dead-cst build --meta key=value``). The counts mirror the
-    graph stamped into the file and double as a sanity check against
-    the deserialized payload.
+    ``dead-cst build --meta key=value``). ``node_flag_registry`` /
+    ``edge_flag_registry`` carry the flag tables stamped into the file
+    (``(name, bit, seed, default_on, description)`` tuples) so a reader
+    can decode flag bits by name. The counts mirror the graph stamped
+    into the file and double as a sanity check against the deserialized
+    payload.
     """
 
     format_version: int
@@ -1113,6 +1137,8 @@ class GraphMetadata:
     file_count: int
     line_count: int
     user_meta: list[tuple[str, str]]
+    node_flag_registry: list[tuple[str, int, bool, bool, str]]
+    edge_flag_registry: list[tuple[str, int, bool, bool, str]]
 
 class ProgressHandle:
     """Borrow-free view over the build-progress atomic counters.
@@ -1137,11 +1163,16 @@ def write_graph(
     nodes: list[SymbolNode],
     edges: list[tuple[int, int, int]],
     meta: list[tuple[str, str]],
+    node_flag_registry: list[tuple[str, int, bool, bool, str]],
+    edge_flag_registry: list[tuple[str, int, bool, bool, str]],
 ) -> None:
     """Persist ``nodes`` + ``edges`` to ``path`` as a bincode-encoded
     graph file. ``meta`` is the user-supplied list of ``(key, value)``
     pairs (from ``--meta`` on the CLI); they are stored verbatim in
-    the file's metadata block.
+    the file's metadata block. ``node_flag_registry`` /
+    ``edge_flag_registry`` are the flag tables
+    (``(name, bit, seed, default_on, description)`` tuples) so a reader
+    can decode flag bits by name.
     """
     ...
 

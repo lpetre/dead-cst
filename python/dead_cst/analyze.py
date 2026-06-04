@@ -5,7 +5,7 @@ import warnings
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterator, Sequence, TypedDict
 
-from .graph import KEEPALIVE_DEFAULT, EdgeFlags
+from .graph import EdgeFlags
 
 if TYPE_CHECKING:
     from dead_cst import _native as native
@@ -663,20 +663,25 @@ class Analysis:
             if poller is not None:
                 poller.stop()
 
-    def reachable(self, *, seed_flags: int = KEEPALIVE_DEFAULT) -> set[int]:
+    def reachable(self, *, seed_flags: int | None = None) -> set[int]:
         """Positional indices of every decl reachable from any seed in
         ``seed_flags``. Pair with :meth:`native.ProjectContext.nodes_at`
         / :meth:`native.ProjectContext.node_attrs` to materialise the
         underlying ``SymbolNode``\\ s or batched attribute snapshots
-        on demand.
+        on demand. ``seed_flags`` defaults to the registry-derived
+        :meth:`native.ProjectContext.default_seed_mask`.
         """
         ctx = self.materialize_all()
+        if seed_flags is None:
+            seed_flags = ctx.default_seed_mask()
         return set(ctx.reachable_indices(seed_flags=seed_flags))
 
-    def dead(self, *, seed_flags: int = KEEPALIVE_DEFAULT) -> Iterator[int]:
+    def dead(self, *, seed_flags: int | None = None) -> Iterator[int]:
         """Yield positional indices of every decl that no seed in
         ``seed_flags`` reaches. Skips ``module`` and ``synthetic``
         nodes (markers/anchors, not "dead" in the actionable sense).
+        ``seed_flags`` defaults to the registry-derived
+        :meth:`native.ProjectContext.default_seed_mask`.
         """
         ctx = self.materialize_all()
         return _iter_dead_indices(ctx, self.reachable(seed_flags=seed_flags))
@@ -697,24 +702,38 @@ class Analysis:
         ctx = self.materialize_all()
         return list(ctx.ancestors_indices(decl_idx, skip_flags=skip_flags))
 
-    def kept_alive_by_dead_branches(self, *, seed_flags: int = KEEPALIVE_DEFAULT) -> set[int]:
-        """Indices reachable only via ``EdgeFlags.DEAD_BRANCH`` edges."""
+    def kept_alive_by_dead_branches(self, *, seed_flags: int | None = None) -> set[int]:
+        """Indices reachable only via ``EdgeFlags.DEAD_BRANCH`` edges.
+        ``seed_flags`` defaults to the registry-derived
+        :meth:`native.ProjectContext.default_seed_mask`."""
         ctx = self.materialize_all()
+        if seed_flags is None:
+            seed_flags = ctx.default_seed_mask()
         full = set(ctx.reachable_indices(seed_flags=seed_flags))
         strict = set(ctx.reachable_indices(seed_flags=seed_flags, skip_flags=EdgeFlags.DEAD_BRANCH))
         return full - strict
 
-    def kept_alive_by_flags_only(
-        self, flags: int, *, seed_flags: int = KEEPALIVE_DEFAULT
-    ) -> set[int]:
+    def kept_alive_by_flags_only(self, flags: int, *, seed_flags: int | None = None) -> set[int]:
         """Blast radius of dropping every seed whose flags carry any
         bit in ``flags`` — the diff between
         ``reachable_indices(seed_flags)`` and
-        ``reachable_indices(seed_flags & ~flags)``."""
+        ``reachable_indices(seed_flags & ~flags)``. ``seed_flags``
+        defaults to the registry-derived
+        :meth:`native.ProjectContext.default_seed_mask`."""
         ctx = self.materialize_all()
+        if seed_flags is None:
+            seed_flags = ctx.default_seed_mask()
         full = set(ctx.reachable_indices(seed_flags=seed_flags))
         without = set(ctx.reachable_indices(seed_flags=seed_flags & ~flags))
         return full - without
+
+    def node_flag(self, name: str) -> int | None:
+        """Resolve a node-flag bit by its registered ``owner/name`` (e.g.
+        ``"engine/entrypoint"``, ``"test/testcase"``), or ``None`` if no
+        flag with that name is registered. The available names depend on
+        the registered plugin set — a flag a plugin declares only exists
+        once that plugin is registered."""
+        return self.materialize_all().node_flag(name)
 
 
 __all__ = [

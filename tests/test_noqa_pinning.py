@@ -1,7 +1,7 @@
 """Imports flagged with a ruff/pyflakes ``# noqa`` directive that silences
-F401 are pinned alive (flagged with :data:`NodeFlags.NOQA`, which is one
-of the keepalive bits in :data:`KEEPALIVE_DEFAULT`), matching the
-semantics ruff itself uses for the unused-import rule.
+F401 are pinned alive (flagged with :data:`NodeFlags.NOQA`, a seed flag in
+the default seed mask), matching the semantics ruff itself uses for the
+unused-import rule.
 
 Both per-line directives (``# noqa``, ``# noqa: F401``, multi-rule
 ``# noqa: E501, F401``, case-insensitive ``noqa`` keyword) and file-level
