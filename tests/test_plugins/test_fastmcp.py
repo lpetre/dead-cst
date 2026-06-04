@@ -316,9 +316,9 @@ def test_fastmcp_plugin_factory_in_different_package(
     """Factory in dep package, consumer in dependent package.
 
     The classic uv-workspace layout: ``pkg_a`` owns the FastMCP factory
-    and ``pkg_b`` imports + calls it. Walking from the pending marker
-    in ``pkg_b`` must reach the ``FastMCP`` import inside ``pkg_a``'s
-    factory body.
+    and ``pkg_b`` imports + calls it. The factory walk must recognize
+    ``create_server`` (whose ``FastMCP`` return type is imported inside
+    ``pkg_a``'s factory body) and keep ``pkg_b``'s ``mcp`` alive.
     """
     write_files(
         {
@@ -353,8 +353,7 @@ def test_fastmcp_plugin_factory_module_form_in_different_package(
 ):
     """Factory in dep package uses ``import fastmcp; fastmcp.FastMCP()``.
 
-    Without the factory-marker synthetic the cross-package walk has no
-    discriminator: the external-edge classifier drops the
+    In module-attribute form the external-edge classifier drops the
     ``decl='FastMCP'`` half of the access, so every reference to
     ``fastmcp`` would collapse to the same ``[external dist] fastmcp``
     node.

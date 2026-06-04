@@ -373,7 +373,7 @@ def test_celery_plugin_factory_in_different_package(make_analysis, write_files, 
 def test_celery_plugin_factory_module_form_in_different_package(
     make_analysis, write_files, reachable_fqnames
 ):
-    """Factory uses ``import celery; celery.Celery()`` -- factory marker required.
+    """Factory uses ``import celery; celery.Celery()`` -- module-attribute form.
 
     See ``test_flask_plugin_factory_module_form_in_different_package``
     for the rationale; the external-edge classifier drops the

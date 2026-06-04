@@ -194,7 +194,7 @@ two versions.
   `PluginOps::add_synthetic_node` now takes a source
   `path` (empty for a placeless marker) so a project-wide synthetic node can
   be attributed to a file. On the Python side, `NativePlugin.dispatch_app(name,
-  marker_prefix, app_classes, registration_decorators, seed_as_entrypoint)`
+  app_classes, registration_decorators, seed_as_entrypoint)`
   exposes the generic engine behind `flask()` … `celery()`, so a custom
   framework can be wired without a bespoke plugin (the celery `@shared_task`
   fan-out stays internal to `celery()`).
@@ -299,6 +299,18 @@ two versions.
   relay node. An unresolved fqname keeps nothing alive (the previous empty-target
   introspection record is dropped, matching the other relay eliminations). No
   `plugin_api` epoch or `FORMAT_VERSION` bump — `add_edge` already exists.
+- **Dispatch-app plugins no longer mint `<{framework}-app>:` synthetic seeds.**
+  The shared dispatch engine behind `flask()`, `fastapi()`, `typer()`,
+  `cyclopts()`, `slack_bolt()`, `fastmcp()`, `celery()`, and the generic
+  `dispatch_app()` factory previously seeded each discovered app instance (and
+  each factory function returning one) with a `<{framework}-app>:<fqname>`
+  synthetic node, and celery fanned out appless `@shared_task` callables through
+  one `<celery-shared>:` seed per file. Each is now kept alive by setting
+  `NodeFlags.ENTRYPOINT` directly on the decl via `PluginOps::keep_alive`; the
+  handler-wiring edges (`app -> @app.route` &c.) are unchanged. The
+  `dispatch_app()` factory dropped its now-purposeless `marker_prefix` parameter
+  (it only named the removed synthetic nodes). No `plugin_api` epoch or
+  `FORMAT_VERSION` bump — `keep_alive` already exists.
 - **Graph node indices are now deterministic across runs.** ty's `files()`
   set has no stable iteration order, so the global index assigned to each node
   (and therefore the order of `Analysis.dead()` / `reachable()` results and the

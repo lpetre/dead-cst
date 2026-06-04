@@ -311,7 +311,6 @@ class NativePlugin:
     @staticmethod
     def dispatch_app(
         name: str,
-        marker_prefix: str,
         app_classes: Sequence[str],
         registration_decorators: Sequence[str],
         seed_as_entrypoint: bool,
@@ -319,9 +318,8 @@ class NativePlugin:
         """Build a dispatch-app plugin for a framework ``dead-cst`` doesn't
         bundle — the generalized form behind :meth:`flask` … :meth:`celery`.
 
-        ``name`` labels the plugin in progress logs; ``marker_prefix``
-        namespaces the synthetic entrypoint / factory nodes it mints.
-        ``app_classes`` are dotted fqnames of the application classes (e.g.
+        ``name`` labels the plugin in progress logs. ``app_classes`` are
+        dotted fqnames of the application classes (e.g.
         ``["myframework.App"]``) whose instances — and transitive subclasses —
         anchor handler wiring; ``registration_decorators`` are the bare method
         names a handler is decorated with on such an instance

@@ -927,8 +927,7 @@ impl NativePlugin {
     /// Build a dispatch-app plugin from a caller-supplied config — the
     /// generalized form behind :meth:`flask` … :meth:`celery`, for a
     /// framework `dead-cst` doesn't bundle. `name` labels the plugin in
-    /// progress logs; `marker_prefix` namespaces the synthetic entrypoint /
-    /// factory nodes it mints. `app_classes` are dotted fqnames of the
+    /// progress logs. `app_classes` are dotted fqnames of the
     /// application classes (e.g. `["myframework.App"]`) whose instances —
     /// and transitive subclasses — anchor handler wiring;
     /// `registration_decorators` are the bare method names a handler is
@@ -943,7 +942,6 @@ impl NativePlugin {
     #[staticmethod]
     fn dispatch_app(
         name: String,
-        marker_prefix: String,
         app_classes: Vec<String>,
         registration_decorators: Vec<String>,
         seed_as_entrypoint: bool,
@@ -951,7 +949,6 @@ impl NativePlugin {
         Self::from_dispatch_config(
             name,
             DispatchAppConfig {
-                marker_prefix,
                 app_classes,
                 registration_decorators,
                 seed_as_entrypoint,
@@ -2692,12 +2689,11 @@ impl plugin_api::ExternalPlugin for UnittestPluginImpl {
 /// Celery-style appless `@shared_task` fan-out layered on top of the standard
 /// dispatch policy. Mirrors `CeleryPlugin.policy`'s `super().policy(...)` then
 /// shared-task pass: every top-level function decorated with one of `names`
-/// (imported from `module`) is kept alive via one `<marker_prefix><basename>`
-/// entrypoint per file. `None` for non-celery configs.
+/// (imported from `module`) is kept alive directly. `None` for non-celery
+/// configs.
 struct SharedTaskFanout {
     module: String,
     names: Vec<String>,
-    marker_prefix: String,
 }
 
 /// Pure-data description of a dispatch-app framework — the Rust twin of the
@@ -2706,7 +2702,6 @@ struct SharedTaskFanout {
 /// below; the Python `NativePlugin.dispatch_app(...)` factory builds one from
 /// caller-supplied values (owned, so the config need not be `'static`).
 pub(crate) struct DispatchAppConfig {
-    marker_prefix: String,
     app_classes: Vec<String>,
     registration_decorators: Vec<String>,
     seed_as_entrypoint: bool,
@@ -2874,7 +2869,6 @@ impl plugin_api::ExternalPlugin for DispatchAppPluginImpl {
         // --- Phase 2: resolve paths/fqnames + assemble ops. All index
         // gathering happened above; bulk-fetch the node attrs the emission
         // loops need (parallel to their index vecs), then emit through `ops`.
-        let app_prefix = format!("<{}-app>:", cfg.marker_prefix);
 
         // vars_by_file: (path, simple var name) -> first var idx wins.
         let mut vars_by_file: FxHashMap<(String, String), usize> = FxHashMap::default();
@@ -2897,13 +2891,7 @@ impl plugin_api::ExternalPlugin for DispatchAppPluginImpl {
                 .or_default()
                 .push(var_idx);
             if cfg.seed_as_entrypoint {
-                ops.add_synthetic_node(
-                    format!("{app_prefix}{}", node.fqname),
-                    node.path.clone(),
-                    NodeFlags::ENTRYPOINT,
-                    vec![var_idx],
-                    Vec::new(),
-                );
+                ops.keep_alive(var_idx);
             }
         }
 
@@ -2944,40 +2932,15 @@ impl plugin_api::ExternalPlugin for DispatchAppPluginImpl {
                     continue;
                 }
                 classified.insert(key);
-                let node = ctx
-                    .node(var_idx)
-                    .expect("var index from frozen scan is in range");
-                ops.add_synthetic_node(
-                    format!("{app_prefix}{}", node.fqname),
-                    node.path.clone(),
-                    NodeFlags::ENTRYPOINT,
-                    vec![var_idx],
-                    Vec::new(),
-                );
+                ops.keep_alive(var_idx);
             }
         }
 
-        // Celery `@shared_task` fan-out: one `<marker_prefix><basename>`
-        // entrypoint per file, keeping every appless task callable alive.
-        if let Some(st) = &cfg.shared_task {
-            let shared_paths = ctx.node_paths(&shared_idxs);
-            let mut by_path: FxHashMap<String, Vec<usize>> = FxHashMap::default();
-            let mut path_order: Vec<String> = Vec::new();
-            for (&decl_idx, path) in shared_idxs.iter().zip(shared_paths.iter()) {
-                if !by_path.contains_key(path) {
-                    path_order.push(path.clone());
-                }
-                by_path.entry(path.clone()).or_default().push(decl_idx);
-            }
-            for path in path_order {
-                let target_idxs = by_path.remove(&path).unwrap_or_default();
-                ops.add_synthetic_node(
-                    format!("{}{}", st.marker_prefix, path_basename(&path)),
-                    path.clone(),
-                    NodeFlags::ENTRYPOINT,
-                    target_idxs,
-                    Vec::new(),
-                );
+        // Celery `@shared_task` fan-out: keep every appless task callable
+        // alive directly (no per-file marker node).
+        if cfg.shared_task.is_some() {
+            for &decl_idx in &shared_idxs {
+                ops.keep_alive(decl_idx);
             }
         }
 
@@ -3000,7 +2963,6 @@ fn owned(items: &[&str]) -> Vec<String> {
 
 fn flask_config() -> DispatchAppConfig {
     DispatchAppConfig {
-        marker_prefix: "flask".to_string(),
         app_classes: owned(&["flask.Flask"]),
         registration_decorators: owned(&[
             "route",
@@ -3043,7 +3005,6 @@ fn flask_config() -> DispatchAppConfig {
 
 fn fastapi_config() -> DispatchAppConfig {
     DispatchAppConfig {
-        marker_prefix: "fastapi".to_string(),
         app_classes: owned(&["fastapi.FastAPI"]),
         registration_decorators: owned(&[
             "get",
@@ -3068,7 +3029,6 @@ fn fastapi_config() -> DispatchAppConfig {
 
 fn typer_config() -> DispatchAppConfig {
     DispatchAppConfig {
-        marker_prefix: "typer".to_string(),
         app_classes: owned(&["typer.Typer"]),
         registration_decorators: owned(&["command", "callback"]),
         seed_as_entrypoint: false,
@@ -3078,7 +3038,6 @@ fn typer_config() -> DispatchAppConfig {
 
 fn cyclopts_config() -> DispatchAppConfig {
     DispatchAppConfig {
-        marker_prefix: "cyclopts".to_string(),
         app_classes: owned(&["cyclopts.App"]),
         registration_decorators: owned(&["command", "default"]),
         seed_as_entrypoint: false,
@@ -3088,7 +3047,6 @@ fn cyclopts_config() -> DispatchAppConfig {
 
 fn slack_bolt_config() -> DispatchAppConfig {
     DispatchAppConfig {
-        marker_prefix: "slack-bolt".to_string(),
         app_classes: owned(&["slack_bolt.App", "slack_bolt.async_app.AsyncApp"]),
         registration_decorators: owned(&[
             "event", "message", "command", "action", "shortcut", "view", "options", "error",
@@ -3101,7 +3059,6 @@ fn slack_bolt_config() -> DispatchAppConfig {
 
 fn fastmcp_config() -> DispatchAppConfig {
     DispatchAppConfig {
-        marker_prefix: "fastmcp".to_string(),
         app_classes: owned(&["fastmcp.FastMCP", "mcp.server.fastmcp.FastMCP"]),
         registration_decorators: owned(&["tool", "resource", "prompt", "completion"]),
         seed_as_entrypoint: true,
@@ -3111,14 +3068,12 @@ fn fastmcp_config() -> DispatchAppConfig {
 
 fn celery_config() -> DispatchAppConfig {
     DispatchAppConfig {
-        marker_prefix: "celery".to_string(),
         app_classes: owned(&["celery.Celery"]),
         registration_decorators: owned(&["task"]),
         seed_as_entrypoint: true,
         shared_task: Some(SharedTaskFanout {
             module: "celery".to_string(),
             names: owned(&["shared_task"]),
-            marker_prefix: "<celery-shared>:".to_string(),
         }),
     }
 }

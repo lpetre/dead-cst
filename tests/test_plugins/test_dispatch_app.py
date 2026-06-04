@@ -37,7 +37,6 @@ _SOURCE = {
 def test_dispatch_app_threads_app_classes_and_decorators(build_plugin_graph, reachable_fqnames):
     plugin = native.NativePlugin.dispatch_app(
         name="myframework",
-        marker_prefix="myframework",
         app_classes=["flask.Flask"],
         registration_decorators=["route", "get"],
         seed_as_entrypoint=True,
@@ -60,7 +59,6 @@ def test_dispatch_app_seed_as_entrypoint_false_does_not_seed(build_plugin_graph,
     # not auto-seeded, so with no other entrypoint nothing comes alive.
     plugin = native.NativePlugin.dispatch_app(
         name="myframework",
-        marker_prefix="myframework",
         app_classes=["flask.Flask"],
         registration_decorators=["route", "get"],
         seed_as_entrypoint=False,
