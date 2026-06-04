@@ -255,6 +255,19 @@ two versions.
   with no live `TestCase` now dies with its (unreachable) module, matching the
   module-dunder model — previously the per-module seed kept it alive
   unconditionally.
+- **`pytest` plugin no longer mints `<pytest:tests>:` / `<pytest:conftest>:` /
+  `<pytest:fixtures>:` synthetic seeds.** Each kind is now flagged directly on
+  the decl via `PluginOps::flag_decl`: `test_*` functions / `Test*` classes
+  (genuine test roots) carry the existing `test/testcase` flag, while every
+  `@pytest.fixture` function and every top-level `conftest.py` decl carry a new
+  provisional `test/fixture` flag (`seed: true, default_on: true`) — a
+  conservative keepalive that flips to non-seeding once fixture / conftest usage
+  is traced precisely as edges. Both flags are default-on seeds, so the alive
+  set is unchanged; the `test → fixture` / `class → fixture` parameter-name
+  edges are still emitted on top. `kept_alive_by_flags_only(test/fixture)` now
+  isolates the fixture-kept-alive blast radius, and the CLI `--query test_only`
+  subtracts both flags. Conftest decls moved from `test/testcase` to
+  `test/fixture` (they are support code, not collected tests).
 - **Resolved site-packages imports are now real `kind="external"` graph
   nodes.** A site-packages import (`[external dist] requests`) mints a real
   external node carrying the resolved site-packages path, replacing the old

@@ -375,12 +375,13 @@ class NativePlugin:
 
     @staticmethod
     def pytest() -> NativePlugin:
-        """Native pytest plugin. Seeds every top-level decl in ``conftest.py``
-        (``<pytest:conftest>:<module>``), every ``test_*`` function / ``Test*``
-        class in ``test_*.py`` / ``*_test.py`` (``<pytest:tests>:<module>``),
-        and every ``@pytest.fixture`` function (``<pytest:fixtures>:<module>``)
-        as ``TESTCASE`` entrypoints. On top of the seed it wires
-        ``test → fixture`` / ``class → fixture`` edges by parameter-name
+        """Native pytest plugin. Flags every ``test_*`` function / ``Test*``
+        class in ``test_*.py`` / ``*_test.py`` with the ``test/testcase`` node
+        flag, and flags every ``@pytest.fixture`` function plus every
+        top-level ``conftest.py`` decl with the provisional ``test/fixture``
+        node flag (a conservative keepalive pending precise fixture/conftest
+        usage modeling). Both are default-on seed flags. On top of the flags it
+        wires ``test → fixture`` / ``class → fixture`` edges by parameter-name
         matching (honoring the ``name=`` kwarg alias), so the dependency graph
         is queryable. Unmatched parameter names (pytest builtins, plugin
         fixtures) are silently ignored.
