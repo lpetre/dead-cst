@@ -69,8 +69,8 @@ enum Resolution<'db> {
     },
 }
 use crate::helpers::{
-    detect_dead_ranges, detect_type_checking_ranges, file_path_string, EDGE_FLAG_DEAD_BRANCH,
-    EDGE_FLAG_DYNAMIC_IMPORT,
+    detect_dead_ranges, detect_type_checking_ranges, file_path_string, is_dunder_name,
+    EDGE_FLAG_DEAD_BRANCH, EDGE_FLAG_DYNAMIC_IMPORT,
 };
 use crate::ingest::{
     collapse_attribute_chain, detect_dynamic_call, file_package_name, from_module_string,
@@ -174,6 +174,28 @@ pub(crate) fn file_to_ref_edges<'db>(db: &'db dyn ProjectDb, file: File) -> File
             in_string_annotation: false,
         };
         walker.visit_stmt(stmt);
+    }
+
+    // (c) Module-level dunders (`__all__`, `__version__`, PEP 562
+    //     `__getattr__`/`__dir__`, …) and `__future__` imports are kept
+    //     alive by an edge *from the module node*, not by a seed flag of
+    //     their own: removing one changes module semantics, but only
+    //     while the module itself is live. A module nothing reaches dies,
+    //     and its dunders die with it. This is the node-level analogue of
+    //     the `__all__ -> listed-name` edges emitted in pass (a).
+    for (local_idx, node) in self_nodes.nodes.iter().enumerate() {
+        let is_dunder_decl = matches!(node.kind, NodeKind::Variable | NodeKind::Function)
+            && is_dunder_name(&node.fqname);
+        let is_future_import = node
+            .imports
+            .as_ref()
+            .is_some_and(|imp| imp.module == "__future__");
+        if is_dunder_decl || is_future_import {
+            let dst = self_nodes.refs[local_idx];
+            if dst != module_ref {
+                edges.insert((module_ref, dst, 0));
+            }
+        }
     }
 
     FileRefEdges { edges, warnings }

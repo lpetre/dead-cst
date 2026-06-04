@@ -58,8 +58,8 @@ use crate::file_payload::{file_to_nodes, NodeData, NodeKind};
 use crate::flag_registry::FlagRegistry;
 use crate::graph::{EdgeFlags, NodeFlags};
 use crate::helpers::{
-    collect_modules_imports_local, decorators_match_imports, is_dunder_name,
-    matched_call_target_any, top_level_assign_to_name, ArgValue, CallArgs, FactoryCallFinder,
+    collect_modules_imports_local, decorators_match_imports, matched_call_target_any,
+    top_level_assign_to_name, ArgValue, CallArgs, FactoryCallFinder,
 };
 use crate::ingest::file_package_name;
 use crate::project::FrozenView;
@@ -517,7 +517,6 @@ impl<'db> FileContext<'db> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum PerFilePluginKind {
     MainBlock,
-    ModuleDunders,
 }
 
 impl PerFilePluginKind {
@@ -525,7 +524,6 @@ impl PerFilePluginKind {
     fn name(self) -> &'static str {
         match self {
             PerFilePluginKind::MainBlock => "MainBlockPlugin",
-            PerFilePluginKind::ModuleDunders => "ModuleDundersPlugin",
         }
     }
 
@@ -535,7 +533,6 @@ impl PerFilePluginKind {
     fn plugin(self) -> &'static dyn plugin_api::PerFilePlugin {
         match self {
             PerFilePluginKind::MainBlock => &MainBlockPluginImpl,
-            PerFilePluginKind::ModuleDunders => &ModuleDundersPluginImpl,
         }
     }
 }
@@ -831,18 +828,6 @@ impl NativePlugin {
         }
     }
 
-    /// Native `ModuleDundersPlugin` — pin module-level dunder names and
-    /// `__future__` imports as entrypoints. Per-file (salsa-cached): a file's
-    /// dunders + `__future__` imports are entirely local to it.
-    #[staticmethod]
-    fn module_dunders() -> Self {
-        Self {
-            kind: NativePluginKind::PerFile(PerFilePluginId::Builtin(
-                PerFilePluginKind::ModuleDunders,
-            )),
-        }
-    }
-
     /// Native `InitSubclassPlugin` — keep transitive subclasses of
     /// `__init_subclass__`-defining classes alive via a marker node.
     #[staticmethod]
@@ -1101,7 +1086,6 @@ impl NativePlugin {
 pub(crate) fn _builtin_native_plugin(name: &str) -> Option<NativePlugin> {
     Some(match name {
         "main_block" => NativePlugin::main_block(),
-        "module_dunders" => NativePlugin::module_dunders(),
         "init_subclass" => NativePlugin::init_subclass(),
         "server_config" => NativePlugin::server_config(None),
         "unittest" => NativePlugin::unittest(),
@@ -2475,14 +2459,12 @@ pub(crate) fn load_native_plugins(path: String) -> PyResult<Vec<NativePlugin>> {
 }
 
 // ---------------------------------------------------------------------------
-// Native plugins ported from Python. `module_dunders` is *per-file* (its
-// output for a file is a pure function of that file → salsa-cached);
-// `init_subclass` is project-wide (subclasses live in other files, so its
-// output isn't file-local). The project-wide `py`-taking ctx accessors are
-// reached via `Python::with_gil` (the harness already holds the GIL).
+// Native plugins ported from Python. `init_subclass` is project-wide
+// (subclasses live in other files, so its output isn't file-local). The
+// project-wide `py`-taking ctx accessors are reached via `Python::with_gil`
+// (the harness already holds the GIL).
 // ---------------------------------------------------------------------------
 
-const MODULE_DUNDERS_PREFIX: &str = "<dunder>:";
 const SERVER_CONFIG_PREFIX: &str = "<server-config>:";
 const UNITTEST_PREFIX: &str = "<unittest>:";
 
@@ -2503,38 +2485,6 @@ const UNITTEST_MODULE_HOOKS: [&str; 3] = ["setUpModule", "tearDownModule", "load
 /// Base classes whose transitive subclasses are kept alive (mirrors
 /// `dead_cst.contrib.unittest._UNITTEST_BASE_FQNAMES`).
 const UNITTEST_BASE_FQNAMES: [&str; 2] = ["unittest.TestCase", "unittest.IsolatedAsyncioTestCase"];
-
-/// Per-file port of `dead_cst.plugins.module_dunders.ModuleDundersPlugin`:
-/// pin a file's module-level dunders (variables + PEP 562 functions) and its
-/// `__future__` imports as entrypoints. All file-local — one synthetic
-/// entrypoint node per file with edges to those decls.
-pub(crate) struct ModuleDundersPluginImpl;
-
-impl plugin_api::PerFilePlugin for ModuleDundersPluginImpl {
-    fn run_on_file(&self, file: &plugin_api::PluginFileCtx<'_>, ops: &mut plugin_api::FileOps) {
-        let mut targets: Vec<u32> = Vec::new();
-        for node in file.nodes() {
-            let is_dunder_decl = matches!(node.kind.as_str(), "variable" | "function")
-                && is_dunder_name(&node.fqname);
-            let is_future = node
-                .imports
-                .as_ref()
-                .is_some_and(|imp| imp.module == "__future__");
-            if is_dunder_decl || is_future {
-                targets.push(node.local_idx);
-            }
-        }
-        if targets.is_empty() {
-            return;
-        }
-        ops.add_synthetic_node(
-            format!("{MODULE_DUNDERS_PREFIX}{}", file.module_fqname()),
-            NodeFlags::ENTRYPOINT,
-            targets,
-            Vec::new(),
-        );
-    }
-}
 
 /// Port of `dead_cst.plugins.init_subclass.InitSubclassPlugin`: for each
 /// class defining `__init_subclass__`, emit a marker node reachable from the
@@ -2923,7 +2873,6 @@ impl plugin_api::ExternalPlugin for DispatchAppPluginImpl {
         // gathering happened above; bulk-fetch the node attrs the emission
         // loops need (parallel to their index vecs), then emit through `ops`.
         let app_prefix = format!("<{}-app>:", cfg.marker_prefix);
-        let factory_prefix = format!("<{}-factory>:", cfg.marker_prefix);
 
         // vars_by_file: (path, simple var name) -> first var idx wins.
         let mut vars_by_file: FxHashMap<(String, String), usize> = FxHashMap::default();
@@ -2954,20 +2903,6 @@ impl plugin_api::ExternalPlugin for DispatchAppPluginImpl {
                     Vec::new(),
                 );
             }
-        }
-
-        // Step 4: factory markers so step 6's reachability walk can find
-        // them. `factory_decls` is empty unless seed_as_entrypoint.
-        let factory_idxs: Vec<usize> = factory_decls.iter().map(|(i, _)| *i).collect();
-        let factory_attrs = ctx.nodes_at(&factory_idxs);
-        for ((decl_idx, kind), node) in factory_decls.iter().zip(factory_attrs.iter()) {
-            ops.add_synthetic_node(
-                format!("{factory_prefix}{kind}:{}", node.fqname),
-                node.path.clone(),
-                0,
-                Vec::new(),
-                vec![*decl_idx],
-            );
         }
 
         // Step 5: wire handler decorators to their owner var. Seed mode

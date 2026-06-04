@@ -50,7 +50,8 @@ def test_multiple_native_plugins_in_one_list(build_plugin_graph, reachable_fqnam
     harness routes each through the shared collect/apply flow and folds
     every plugin's ops into one graph."""
     files = {
-        "pkg/__init__.py": "__all__ = ['x']\nx = 1\n",
+        "pkg/__init__.py": "",
+        "pkg/lib.py": "def explicitly_kept(): pass\ndef dead(): pass\n",
         "pkg/script.py": """
         def main(): pass
         if __name__ == "__main__":
@@ -59,14 +60,17 @@ def test_multiple_native_plugins_in_one_list(build_plugin_graph, reachable_fqnam
     }
     ctx = build_plugin_graph(
         files,
-        [native.NativePlugin.main_block(), native.NativePlugin.module_dunders()],
+        [
+            native.NativePlugin.main_block(),
+            native.NativePlugin.explicit([], ["pkg.lib.explicitly_kept"], []),
+        ],
     )
     reached = reachable_fqnames(ctx)
     # Main-block contribution.
     assert "pkg.script.main" in reached
-    # Module-dunders contribution.
-    assert "pkg.__all__" in reached
-    assert "pkg.x" in reached
+    # Explicit-entrypoint contribution (selective: only the named decl).
+    assert "pkg.lib.explicitly_kept" in reached
+    assert "pkg.lib.dead" not in reached
 
 
 def test_native_plugin_no_main_block_no_ops(build_plugin_graph):
@@ -182,8 +186,8 @@ def test_per_file_main_block_cache_invalidates_on_edit(tmp_path):
 # ---------------------------------------------------------------------------
 # Harness plumbing: plugin-list type validation and the builtin name ->
 # native lookup the CLI resolves through. Per-plugin behaviour lives in
-# test_main_block.py / test_module_dunders.py / test_init_subclass.py /
-# test_unittest.py.
+# test_main_block.py / test_init_subclass.py / test_unittest.py (module
+# dunders are engine behaviour now — see tests/test_module_dunders.py).
 # ---------------------------------------------------------------------------
 
 
@@ -207,6 +211,5 @@ def test_builtin_native_plugin_registry():
     """``_builtin_native_plugin(name)`` resolves ported built-ins to their
     native impl, and returns ``None`` for names not (yet) ported."""
     assert native._builtin_native_plugin("main_block").name == "MainBlockPlugin"
-    assert native._builtin_native_plugin("module_dunders").name == "ModuleDundersPlugin"
     assert native._builtin_native_plugin("init_subclass").name == "InitSubclassPlugin"
     assert native._builtin_native_plugin("does_not_exist") is None

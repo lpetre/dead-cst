@@ -127,7 +127,6 @@ def build_plugins(
     plugin_names: list[str],
 ) -> list[native.NativePlugin]:
     plugins: list[native.NativePlugin] = [_load_plugin(name) for name in plugin_names]
-    plugins.append(native.NativePlugin.module_dunders())
     # ``entrypoints`` are exact fqnames / project-relative file paths;
     # ``entrypoint_regexes`` match the project-relative path. The native
     # ``explicit`` plugin takes the two buckets directly (no abs-path specs

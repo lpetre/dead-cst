@@ -218,14 +218,6 @@ class NativePlugin:
         ...
 
     @staticmethod
-    def module_dunders() -> NativePlugin:
-        """``ModuleDundersPlugin``. Pins every module-level dunder
-        (variables + PEP 562 functions) and ``__future__`` import as an
-        entrypoint. Implemented as a per-file (salsa-cached) plugin.
-        """
-        ...
-
-    @staticmethod
     def init_subclass() -> NativePlugin:
         """``InitSubclassPlugin``. Keeps transitive subclasses of
         ``__init_subclass__``-defining classes alive via a marker node.

@@ -231,6 +231,15 @@ two versions.
 
 ### Changed
 
+- **Module-level dunder / `__future__` keep-alive moved into the engine.**
+  Module-scope dunders (`__all__`, `__version__`, PEP 562
+  `__getattr__` / `__dir__`, …) and `__future__` imports are now kept alive by
+  an edge *from their module node*, emitted at edge-collection time. They are
+  not standalone reachability seeds: a dunder survives only while its module is
+  reachable, so an unreachable module's dunders die with it. This replaces the
+  per-file `ModuleDundersPlugin` (and its synthetic `<dunder>:` seed node) with
+  a `module -> dunder` edge; the CLI no longer appends it to the default plugin
+  set because the behavior is now unconditional.
 - **Resolved site-packages imports are now real `kind="external"` graph
   nodes.** A site-packages import (`[external dist] requests`) mints a real
   external node carrying the resolved site-packages path, replacing the old
@@ -397,6 +406,12 @@ two versions.
 
 ### Removed
 
+- **`NativePlugin.module_dunders()` / `ModuleDundersPlugin` (breaking).** The
+  per-file module-dunder plugin is gone; its keep-alive behavior is now
+  always-on engine policy (see Changed). The CLI `--plugin module_dunders`
+  name and the `_builtin_native_plugin("module_dunders")` lookup are removed.
+  The `ProjectContext.find_module_dunders_indices()` introspection query is
+  retained.
 - **`NodeFlags` roster surgery (breaking).** `NodeFlags.SHADOWED` and
   `NodeFlags.EXPORTED` (both dead — no set/read site) are deleted;
   `NodeFlags.OVERLOAD` and `NodeFlags.TESTCASE` are removed from the public flag

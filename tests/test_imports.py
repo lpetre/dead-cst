@@ -558,6 +558,7 @@ IMPORT_BASE_EDGES = frozenset(
         pytest.param(
             'from p.functions import f\n__all__ = ["f"]',
             {
+                "p.x -> p.x.__all__",
                 "p.x.__all__ -> p.x",
                 "p.x.__all__ -> p.x.f",
                 "p.x.f -> p.functions",
@@ -569,6 +570,7 @@ IMPORT_BASE_EDGES = frozenset(
         pytest.param(
             'from p.functions import f\nfrom p.classes import C\n__all__ = ("f", "C")',
             {
+                "p.x -> p.x.__all__",
                 "p.x.C -> p.classes",
                 "p.x.C -> p.classes.C",
                 "p.x.C -> p.x",
@@ -584,6 +586,7 @@ IMPORT_BASE_EDGES = frozenset(
         pytest.param(
             'def g(): pass\nfrom p.functions import f\n__all__ = ["f", "g"]',
             {
+                "p.x -> p.x.__all__",
                 "p.x.__all__ -> p.x",
                 "p.x.__all__ -> p.x.f",
                 "p.x.__all__ -> p.x.g",
@@ -597,6 +600,7 @@ IMPORT_BASE_EDGES = frozenset(
         pytest.param(
             'from p.functions import f\n__all__: list[str] = ["f"]',
             {
+                "p.x -> p.x.__all__",
                 "p.x.__all__ -> p.x",
                 "p.x.__all__ -> p.x.f",
                 "p.x.f -> p.functions",
@@ -608,6 +612,7 @@ IMPORT_BASE_EDGES = frozenset(
         pytest.param(
             'from p.functions import f\n__all__ = ["missing"]',
             {
+                "p.x -> p.x.__all__",
                 "p.x.__all__ -> p.x",
                 "p.x.f -> p.functions",
                 "p.x.f -> p.functions.f",
@@ -867,6 +872,7 @@ def test_imports(build_decl_graph, assert_edges, src, expected_extra_edges):
             {
                 "helpers.Helper -> helpers",
                 "mod -> mod.TYPE_CHECKING",
+                "mod -> mod.annotations",
                 "mod.Helper -> helpers",
                 "mod.Helper -> helpers.Helper",
                 "mod.Helper -> mod",
