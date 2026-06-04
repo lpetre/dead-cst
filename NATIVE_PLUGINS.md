@@ -182,6 +182,7 @@ read a keyword via `CallArgs::str_value(name)`.
 | method | host op | what |
 |---|---|---|
 | `keep_alive(decl_idx)` | `PreparedOp::Entrypoint` | flag a node `ENTRYPOINT` so it seeds reachability directly |
+| `flag_decl(decl_idx, flags)` | `PreparedOp::FlagDecl` | OR `flags` onto an existing decl — e.g. a registered node flag resolved via `ctx.node_flag(name)` — without minting a marker node |
 | `add_edge(src_idx, dst_idx, flags)` | `PreparedOp::Edge` | add `src -> dst` between existing nodes; `flags` is `0` or one of `plugin_api::FLAG_DEAD_BRANCH` / `FLAG_DYNAMIC_IMPORT` / `FLAG_INIT_SUBCLASS` |
 | `add_synthetic_node(fqname, flags, edges_to_idx, edges_from_idx)` | `PreparedOp::Node` | mint a `synthetic` node with out-edges (`edges_to_idx`) and in-edges (`edges_from_idx`); set `flags = plugin_api::FLAG_ENTRYPOINT` to make it a seed |
 
@@ -214,7 +215,9 @@ impl ExternalPlugin for MyPlugin {
         let handler = ctx
             .node_flag("acme/handler")
             .expect("declared in declare_node_flags");
-        // …stamp `handler` on synthetic seeds via `ops.add_synthetic_node(..)`.
+        // …stamp `handler` directly on discovered decls via
+        // `ops.flag_decl(idx, handler)` (or on a synthetic seed via
+        // `ops.add_synthetic_node(..)`).
         Ok(())
     }
 }
@@ -294,11 +297,11 @@ plugin is per-file is read **once, at load**.
 convenience, and the ready-made file-local matchers `imports_any_module(modules)`,
 `decorated_decls(modules, names)`, `constructions(modules, names)`, and
 `calls(modules, names)` (file-local twins of the project-wide `PluginCtx`
-matchers above). `FileOps` mirrors all three `PluginOps` emitters — `keep_alive`,
-`add_edge(src, dst, flags)`, and `add_synthetic_node(fqname, flags,
-edges_to_local_idx, edges_from_local_idx)` — but in the file's **local** index
-space (the index args are positions in `file.nodes()`, which the host maps to
-global indices at apply time).
+matchers above). `FileOps` mirrors every `PluginOps` emitter — `keep_alive`,
+`flag_decl(decl_idx, flags)`, `add_edge(src, dst, flags)`, and
+`add_synthetic_node(fqname, flags, edges_to_local_idx, edges_from_local_idx)` —
+but in the file's **local** index space (the index args are positions in
+`file.nodes()`, which the host maps to global indices at apply time).
 
 **Purity is the contract that buys the cache.** `run_on_file` must be a pure
 function of its `file` — it may read only what `PluginFileCtx` exposes and must

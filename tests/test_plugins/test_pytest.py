@@ -82,10 +82,9 @@ def test_pytest_plugin_marks_decorated_fixtures_outside_conftest(
     build_plugin_graph, reachable_fqnames
 ):
     """Every ``@pytest.fixture``-decorated function is unconditionally
-    alive via the synthetic ``<pytest:fixtures>:<module>`` seed,
-    regardless of whether any test parameter mentions it. The
-    parameter-name edges are *additive* — they make the dependency
-    queryable without changing the alive set."""
+    alive via the ``test/fixture`` flag, regardless of whether any test
+    parameter mentions it. The parameter-name edges are *additive* —
+    they make the dependency queryable without changing the alive set."""
     graph = build_plugin_graph(
         {
             "tests/__init__.py": "",
@@ -272,7 +271,7 @@ def test_pytest_plugin_fixture_name_kwarg_alias(build_plugin_graph):
     alias, not its function name. The ``test → fixture`` edge must
     resolve through the alias — verify the edge is present in the
     graph. (Reachability of the fixture itself is guaranteed by the
-    unconditional fixture seed, so we check the edge directly.)"""
+    ``test/fixture`` flag, so we check the edge directly.)"""
     graph = build_plugin_graph(
         {
             "tests/__init__.py": "",
@@ -300,10 +299,11 @@ def test_pytest_plugin_fixture_name_kwarg_alias(build_plugin_graph):
 
 
 def test_pytest_plugin_conftest_fixture_unused_stays_alive(build_plugin_graph, reachable_fqnames):
-    """Fixtures defined in a ``conftest.py`` are still seeded alive via
-    the conftest-seeds-everything rule (they're often referenced by
-    tests we don't model precisely). The test → fixture edge is
-    *additive* — it pulls non-conftest fixtures alive when used."""
+    """Fixtures defined in a ``conftest.py`` are still kept alive via the
+    ``test/fixture`` flag (conftest decls are flagged wholesale — they're
+    often referenced by tests we don't model precisely). The test →
+    fixture edge is *additive* — it pulls non-conftest fixtures alive
+    when used."""
     graph = build_plugin_graph(
         {
             "tests/__init__.py": "",
@@ -348,21 +348,79 @@ def test_pytest_plugin_loads_via_cli_loader():
     assert plugin.name == "PytestPlugin"
 
 
-def test_pytest_plugin_tags_seeds_as_testcase(build_plugin_graph):
+def test_pytest_plugin_flag_split_testcase_vs_fixture(build_plugin_graph):
+    """Genuine tests carry ``test/testcase``; fixtures and conftest decls
+    carry the provisional ``test/fixture`` flag instead. The two are
+    distinct bits and never overlap on a node."""
     graph = build_plugin_graph(
         {
             "tests/__init__.py": "",
-            "tests/test_things.py": "def test_one(): pass",
+            "tests/test_things.py": """
+            import pytest
+
+            def test_one(): pass
+
+            @pytest.fixture
+            def local_fixture(): return 1
+            """,
             "tests/conftest.py": """
             import pytest
 
             @pytest.fixture
             def my_fixture(): return 1
+
+            def pytest_configure(config): pass
             """,
         },
         [native.NativePlugin.pytest()],
     )
     testcase = graph.node_flag("test/testcase")
-    assert testcase is not None, "pytest plugin should register the test/testcase flag"
-    seeds = [n for n in graph.nodes() if n.flags & testcase]
-    assert seeds, "expected pytest plugin to seed at least one test/testcase node"
+    fixture = graph.node_flag("test/fixture")
+    assert testcase is not None, "pytest plugin should register test/testcase"
+    assert fixture is not None, "pytest plugin should register test/fixture"
+    assert testcase != fixture, "the two flags must be distinct bits"
+
+    by_fqname = {n.fqname: n for n in graph.nodes()}
+
+    # Genuine test → testcase only.
+    test_one = by_fqname["tests.test_things.test_one"]
+    assert test_one.flags & testcase
+    assert not test_one.flags & fixture
+
+    # Fixtures (in a test module or a conftest) → fixture only.
+    for fq in ("tests.test_things.local_fixture", "tests.conftest.my_fixture"):
+        node = by_fqname[fq]
+        assert node.flags & fixture, f"{fq} should carry test/fixture"
+        assert not node.flags & testcase, f"{fq} should not carry test/testcase"
+
+    # Non-fixture conftest decls → fixture (conftest is flagged wholesale).
+    configure = by_fqname["tests.conftest.pytest_configure"]
+    assert configure.flags & fixture
+    assert not configure.flags & testcase
+
+
+def test_pytest_plugin_fixture_flag_is_measurable(build_plugin_graph):
+    """Dropping the ``test/fixture`` bit from the seed mask removes exactly
+    the fixture-kept-alive set — the blast-radius query the provisional
+    flag exists to support."""
+    graph = build_plugin_graph(
+        {
+            "tests/__init__.py": "",
+            "tests/conftest.py": """
+            import pytest
+
+            @pytest.fixture
+            def only_fixture(): return 1
+            """,
+        },
+        [native.NativePlugin.pytest()],
+    )
+    fixture = graph.node_flag("test/fixture")
+    assert fixture is not None
+    seed = graph.default_seed_mask()
+    assert seed & fixture, "test/fixture is a default-on seed"
+
+    with_fixture = {n.fqname for n in graph.reachable(seed_flags=seed)}
+    without_fixture = {n.fqname for n in graph.reachable(seed_flags=seed & ~fixture)}
+    assert "tests.conftest.only_fixture" in with_fixture
+    assert "tests.conftest.only_fixture" not in without_fixture

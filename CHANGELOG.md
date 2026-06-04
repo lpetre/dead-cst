@@ -18,6 +18,12 @@ two versions.
   rejects plugins compiled against an older API at load — distinct from a
   rustc / runtime-version / target change — so an incompatible `plugin_api`
   edit can invalidate stale plugins on its own.
+- **`flag_decl` plugin op.** `PluginOps::flag_decl(decl_idx, flags)` and the
+  per-file `FileOps::flag_decl(decl_local_idx, flags)` OR a node-flag bitset
+  onto an existing decl (mapping to the new `PreparedOp::FlagDecl` /
+  `FileLocalOp::FlagDecl`). Plugins use it to stamp a registered flag — the bit
+  from `ctx.node_flag(name)` — directly on a discovered decl instead of routing
+  it through a synthetic seed marker node. Bumps `PLUGIN_API_EPOCH` to 4.
 - **External native plugins (experimental).** The native crate is split
   into a `dead-cst-runtime` library (built as both `rlib` and `dylib`)
   and a thin `dead-cst-native` cdylib shim, so a plugin can dynamically
@@ -240,6 +246,28 @@ two versions.
   per-file `ModuleDundersPlugin` (and its synthetic `<dunder>:` seed node) with
   a `module -> dunder` edge; the CLI no longer appends it to the default plugin
   set because the behavior is now unconditional.
+- **`unittest` plugin no longer mints a `<unittest>:` synthetic seed.**
+  `TestCase` subclasses (unconditional test roots) now carry the
+  `test/testcase` flag stamped directly on the decl via the new
+  `PluginOps::flag_decl`, and module lifecycle hooks (`setUpModule`,
+  `tearDownModule`, `load_tests`) are kept alive by a `module -> hook` edge
+  instead of the seed marker. Behavior change: a lifecycle hook in a module
+  with no live `TestCase` now dies with its (unreachable) module, matching the
+  module-dunder model — previously the per-module seed kept it alive
+  unconditionally.
+- **`pytest` plugin no longer mints `<pytest:tests>:` / `<pytest:conftest>:` /
+  `<pytest:fixtures>:` synthetic seeds.** Each kind is now flagged directly on
+  the decl via `PluginOps::flag_decl`: `test_*` functions / `Test*` classes
+  (genuine test roots) carry the existing `test/testcase` flag, while every
+  `@pytest.fixture` function and every top-level `conftest.py` decl carry a new
+  provisional `test/fixture` flag (`seed: true, default_on: true`) — a
+  conservative keepalive that flips to non-seeding once fixture / conftest usage
+  is traced precisely as edges. Both flags are default-on seeds, so the alive
+  set is unchanged; the `test → fixture` / `class → fixture` parameter-name
+  edges are still emitted on top. `kept_alive_by_flags_only(test/fixture)` now
+  isolates the fixture-kept-alive blast radius, and the CLI `--query test_only`
+  subtracts both flags. Conftest decls moved from `test/testcase` to
+  `test/fixture` (they are support code, not collected tests).
 - **Resolved site-packages imports are now real `kind="external"` graph
   nodes.** A site-packages import (`[external dist] requests`) mints a real
   external node carrying the resolved site-packages path, replacing the old
@@ -263,6 +291,14 @@ two versions.
   `NodeFlags.ENTRYPOINT` on that decl instead of minting a `{marker}:{fqname}`
   synthetic seed plus an edge. The `PluginOps`/`FileOps` `keep_alive` op
   dropped its `marker: String` parameter (`plugin_api` epoch 2 → 3).
+- **`mock_patch` no longer mints `<patch-target>:` synthetic relay nodes.** A
+  recognized patch reference (`unittest.mock.patch` / `mock.patch`,
+  `mocker.patch`, `monkeypatch.setattr` / `.delattr`) now keeps each resolved
+  target alive with a direct `owner -> target` edge from the enclosing call
+  site, instead of routing every owner through a shared `<patch-target>:<fqname>`
+  relay node. An unresolved fqname keeps nothing alive (the previous empty-target
+  introspection record is dropped, matching the other relay eliminations). No
+  `plugin_api` epoch or `FORMAT_VERSION` bump — `add_edge` already exists.
 - **Graph node indices are now deterministic across runs.** ty's `files()`
   set has no stable iteration order, so the global index assigned to each node
   (and therefore the order of `Analysis.dead()` / `reachable()` results and the
