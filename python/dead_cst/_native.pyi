@@ -355,8 +355,8 @@ class NativePlugin:
         ``unittest.mock.patch`` / ``mock.patch``, pytest-mock's
         ``mocker.patch``, and pytest's ``monkeypatch.setattr`` /
         ``monkeypatch.delattr`` to its target decl (and module), wiring a
-        synthetic ``<patch-target>:<fqname>`` keep-alive node from each call
-        site to the resolved targets.
+        direct keep-alive edge from each enclosing call site to every
+        resolved target. An unresolved fqname keeps nothing alive.
         """
         ...
 

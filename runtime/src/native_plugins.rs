@@ -3262,8 +3262,6 @@ impl plugin_api::ExternalPlugin for ClickPluginImpl {
 // test file targets a decl in another), hence project-wide.
 // ---------------------------------------------------------------------------
 
-const PATCH_TARGET_PREFIX: &str = "<patch-target>:";
-
 pub(crate) struct MockPatchPluginImpl;
 
 impl plugin_api::ExternalPlugin for MockPatchPluginImpl {
@@ -3314,27 +3312,20 @@ impl plugin_api::ExternalPlugin for MockPatchPluginImpl {
         }
 
         // Resolve targets per fqname (decls + the module node if the fqname is
-        // itself a module). One synthetic `<patch-target>:<fqname>` per fqname,
-        // emitted unconditionally — an empty target set still records the
-        // patch site for introspection, matching the Python plugin.
+        // itself a module) and wire a direct `owner -> target` keep-alive edge
+        // for each patch site. An unresolved fqname has no targets and emits no
+        // edge — there is nothing to keep alive.
         for fqname in order {
             let owners = &owners_by_fqname[&fqname];
             let mut target_idxs = ctx.find_declarations(&fqname);
             if let Some(mod_idx) = ctx.find_module(&fqname) {
                 target_idxs.push(mod_idx);
             }
-            let owner_path = ctx
-                .node_paths(&[owners[0]])
-                .into_iter()
-                .next()
-                .unwrap_or_default();
-            ops.add_synthetic_node(
-                format!("{PATCH_TARGET_PREFIX}{fqname}"),
-                owner_path,
-                0,
-                target_idxs,
-                owners.clone(),
-            );
+            for &owner_idx in owners {
+                for &target_idx in &target_idxs {
+                    ops.add_edge(owner_idx, target_idx, 0);
+                }
+            }
         }
         Ok(())
     }

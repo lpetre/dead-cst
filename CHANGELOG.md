@@ -291,6 +291,14 @@ two versions.
   `NodeFlags.ENTRYPOINT` on that decl instead of minting a `{marker}:{fqname}`
   synthetic seed plus an edge. The `PluginOps`/`FileOps` `keep_alive` op
   dropped its `marker: String` parameter (`plugin_api` epoch 2 → 3).
+- **`mock_patch` no longer mints `<patch-target>:` synthetic relay nodes.** A
+  recognized patch reference (`unittest.mock.patch` / `mock.patch`,
+  `mocker.patch`, `monkeypatch.setattr` / `.delattr`) now keeps each resolved
+  target alive with a direct `owner -> target` edge from the enclosing call
+  site, instead of routing every owner through a shared `<patch-target>:<fqname>`
+  relay node. An unresolved fqname keeps nothing alive (the previous empty-target
+  introspection record is dropped, matching the other relay eliminations). No
+  `plugin_api` epoch or `FORMAT_VERSION` bump — `add_edge` already exists.
 - **Graph node indices are now deterministic across runs.** ty's `files()`
   set has no stable iteration order, so the global index assigned to each node
   (and therefore the order of `Analysis.dead()` / `reachable()` results and the
