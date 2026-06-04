@@ -208,6 +208,26 @@ two versions.
   modules, ML-generated ASTs, large nested literal dicts) that stack-overflow at
   the default — the size is virtual address space, so a large value costs no
   resident memory unless actually used.
+- **Extensible node/edge flag registry (`FlagSpec`).** Flags are no longer a
+  fixed catalog of compile-time bits. Every flag — engine built-ins included —
+  is now described by a `FlagSpec` (`name` as `owner/name`, `seed`, `default_on`,
+  `description`) and lives in one of two registries (a 32-bit node space, an
+  8-bit edge space). The engine registers its `engine/…` flags with explicit
+  masks (so hot-path reads still constant-fold); a native plugin contributes its
+  own through the new `ExternalPlugin::declare_node_flags()` /
+  `declare_edge_flags()` hooks and reads the host-assigned bit back at run time
+  with `PluginCtx::node_flag(name) -> Option<u32>` / `edge_flag(name) ->
+  Option<u8>`. Plugin bits are allocated above the engine masks in registration
+  order (deterministic); the `engine/` namespace is reserved (a plugin using it
+  fails the materialize); declaring the same spec from two plugins is idempotent
+  and shares one bit (this is how the built-in `pytest` and `unittest` plugins
+  now share a `test/testcase` flag), while a conflicting re-declaration or
+  exhausting the bit width fails loudly. Both registries are **serialized into
+  the `.dcg` graph file** so an external reader can decode any bit by name;
+  `native.ProjectContext` / a loaded graph expose `node_flag_registry()`,
+  `edge_flag_registry()`, `default_seed_mask()`, `node_flag(name)`, and
+  `edge_flag(name)`, and `GraphMetadata` carries both tables. (`PLUGIN_API_EPOCH`
+  bumped 1→2; `FORMAT_VERSION` bumped 1→2 — old graph files are rejected.)
 
 ### Changed
 
@@ -336,9 +356,37 @@ two versions.
   / `pathlib.PurePosixPath.match` (componentwise, from the right, case-sensitive
   — same match set). Behaviour is identical, but no built-in plugin re-acquires
   the GIL inside the GIL-free `rayon` fan-out anymore.
+- **Edge flags narrowed to `u8`** (node flags stay `u32`). `EdgeFlags` and every
+  edge-flag carrier across the runtime are now 8-bit; Python still sees edge-tuple
+  flags and node `.flags` as plain `int`, so the change is transparent across the
+  FFI boundary (the bincode layout change rides the `FORMAT_VERSION` 2 bump).
+- **The default keepalive mask is now registry-derived.** Reachability defaults
+  to `ctx.default_seed_mask()` — the OR of every registered flag that is `seed &&
+  default_on` — instead of the hand-maintained `KEEPALIVE_DEFAULT` constant. A
+  consequence: `test/testcase` is in the default mask **iff** a test plugin
+  (`pytest` / `unittest`) is registered, which is exactly the right behaviour.
+- **Overload status is now internal build-time metadata.** The `OVERLOAD` node
+  flag is replaced by an internal `is_overload` field on the build-time node
+  payload; it is no longer a reachability flag, is not serialized into the graph
+  file, and is not Python-visible. Overload behaviour is unchanged (the
+  `impl → stub` anchor edges are still emitted and cross-module imports still
+  resolve to the implementation, not a stub).
 
 ### Removed
 
+- **`NodeFlags` roster surgery (breaking).** `NodeFlags.SHADOWED` and
+  `NodeFlags.EXPORTED` (both dead — no set/read site) are deleted;
+  `NodeFlags.OVERLOAD` and `NodeFlags.TESTCASE` are removed from the public flag
+  surface. Overload status became internal build-time metadata (see Changed),
+  and `TESTCASE` became the registered `test/testcase` plugin flag — resolve it
+  with `ctx.node_flag("test/testcase")` (returns `None` when no test plugin is
+  registered). A new `NodeFlags.DEAD_BRANCH` (engine metadata for decls in a
+  statically-dead region; not a seed) is added. The surviving roster is `NONE`,
+  `ENTRYPOINT`, `NOQA`, `NOTEBOOK`, `DEAD_BRANCH`, `STAR_REEXPORT`.
+- **`dead_cst.graph.KEEPALIVE_DEFAULT` (breaking).** The hand-maintained
+  keepalive constant is gone; callers default `seed_flags` to the registry-derived
+  `default_seed_mask()` instead (available on `Analysis`, `native.ProjectContext`,
+  and a loaded graph). `Analysis` also gains a `node_flag(name)` passthrough.
 - `ProjectContext.find_comment_patterns(pattern)` (the regex-over-comments
   query) and its `_native.pyi` stub. It had no in-tree callers and was the last
   graph query that re-parsed files on demand after the build; removing it drops

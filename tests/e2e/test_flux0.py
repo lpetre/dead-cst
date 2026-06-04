@@ -22,7 +22,6 @@ import pytest
 from typer.testing import CliRunner
 
 from dead_cst import Analysis, _native as native
-from dead_cst.graph import KEEPALIVE_DEFAULT
 from dead_cst.cli import app
 
 pytestmark = pytest.mark.e2e
@@ -126,7 +125,7 @@ def test_flux0_cli_cmds_dead_without_dynamic_seed(flux0_cli_src):
     so with only ``main_block`` the cmds modules are correctly dead."""
     base = Path(flux0_cli_src)
     graph = Analysis(base, plugins=[native.NativePlugin.main_block()]).materialize_all()
-    reachable = graph.reachable(seed_flags=KEEPALIVE_DEFAULT)
+    reachable = graph.reachable(seed_flags=graph.default_seed_mask())
 
     cmds_agents = _module_node(graph, "flux0_cli.cmds.agents")
     assert cmds_agents is not None, "cmds.agents module should be in the graph"

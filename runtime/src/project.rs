@@ -34,6 +34,7 @@ use crate::file_extraction::{
 };
 use crate::file_payload::{file_to_edges, file_to_nodes, FileEdges, NodeKind, NodeRef};
 use crate::file_ref_edges::{file_to_ref_edges, FileRefEdges};
+use crate::flag_registry::FlagRegistry;
 use crate::graph::{intern_kind, DeclIndex, NativeGraph, SymbolNode};
 use crate::helpers::{
     file_path_string, is_dunder_name, locate_class_seed, range_key, rel_path, resolve_base_spec,
@@ -721,6 +722,7 @@ fn assemble_graph<'db>(
                 end_line: node_data.end_line,
                 end_column: node_data.end_column,
                 flags,
+                is_overload: node_data.is_overload,
                 imports: node_data.imports.clone(),
             };
             let global_idx = base + local_idx;
@@ -775,7 +777,7 @@ fn assemble_graph<'db>(
     //       the parallel phase only has to read `ref_to_global`.
     //   2c. `Python::allow_threads` + `par_iter().flat_map(...)` to
     //       translate every `(NodeRef, NodeRef, flags)` triple into
-    //       `(usize, usize, u32)` via two `ref_to_global` probes.
+    //       `(usize, usize, u8)` via two `ref_to_global` probes.
     //       Drops endpoints whose owning file wasn't enumerated.
     //
     // After the parallel phase, sort + dedup the triple list and
@@ -884,7 +886,7 @@ fn assemble_graph<'db>(
         let ref_to_global_ref = &ref_to_global;
         let edge_payloads_ref = &edge_payloads;
         let ref_edge_payloads_ref = &ref_edge_payloads;
-        let mut triples: Vec<(usize, usize, u32)> = py.allow_threads(|| {
+        let mut triples: Vec<(usize, usize, u8)> = py.allow_threads(|| {
             use rayon::prelude::*;
             let from_edges = edge_payloads_ref.par_iter().flat_map_iter(|payload| {
                 payload.edges.iter().filter_map(|&(src, dst, flags)| {
@@ -900,7 +902,7 @@ fn assemble_graph<'db>(
                     Some((src_idx, dst_idx, flags))
                 })
             });
-            let mut t: Vec<(usize, usize, u32)> = from_edges.chain(from_refs).collect();
+            let mut t: Vec<(usize, usize, u8)> = from_edges.chain(from_refs).collect();
             t.par_sort_unstable();
             t.dedup();
             t
@@ -930,7 +932,7 @@ fn assemble_graph<'db>(
     // FxHashMaps whose iteration order isn't stable run-to-run, so
     // inserting as we walk them would give the adjacency lists a
     // run-dependent order. Sorting the collected triples pins it.
-    let mut peer_triples: Vec<(usize, usize, u32)> = Vec::new();
+    let mut peer_triples: Vec<(usize, usize, u8)> = Vec::new();
     for (&pyi_file, &py_twin) in peer_pyi_to_py {
         let pyi_payload = file_to_nodes(db, pyi_file);
         let py_payload = file_to_nodes(db, py_twin);
@@ -1265,12 +1267,12 @@ pub(crate) fn build_fqname_indices(
     let mut children_by_parent: FxHashMap<String, Vec<usize>> = FxHashMap::default();
     for (idx, node) in builder.nodes.iter().enumerate() {
         counters.fqname_inc();
-        // `OVERLOAD`-flagged decls (the `@typing.overload`-decorated
-        // stubs of an in-file overload group) are excluded from the
-        // fqname trie so cross-module `from mod import f` resolves to
-        // the impl only. Reachability still anchors them via the
-        // explicit `impl → stub` edge emitted in `file_to_edges`.
-        if node.flags & crate::graph::NodeFlags::OVERLOAD != 0 {
+        // `@typing.overload`-decorated stubs of an in-file overload group
+        // are excluded from the fqname trie so cross-module `from mod
+        // import f` resolves to the impl only. Reachability still anchors
+        // them via the explicit `impl → stub` edge emitted in
+        // `file_to_edges`.
+        if node.is_overload {
             continue;
         }
         let mut index_child = false;
@@ -1514,6 +1516,16 @@ pub(crate) struct ProjectContext {
     /// deeply-nested generated code (protobuf modules, long
     /// star-reexport chains) that overflow the default.
     pub(crate) stack_size: Option<usize>,
+    /// Node-flag registry: engine built-ins plus every flag the registered
+    /// plugins declared. Seeded with `with_node_builtins()` at construction
+    /// (so a never-materialized ctx still decodes the engine flags) and
+    /// overwritten by `materialize` with the post-declaration registry. Read
+    /// by the `node_flag` / `default_seed_mask` / `node_flag_registry`
+    /// getters and serialized into the graph file.
+    pub(crate) node_flag_registry: FlagRegistry,
+    /// Edge-flag registry — the edge-space twin of
+    /// [`Self::node_flag_registry`] (`u8`-width).
+    pub(crate) edge_flag_registry: FlagRegistry,
 }
 
 #[pymethods]
@@ -1549,6 +1561,8 @@ impl ProjectContext {
             show_progress,
             stack_size: None,
             progress: Arc::new(ProgressCounters::new()),
+            node_flag_registry: FlagRegistry::with_node_builtins(),
+            edge_flag_registry: FlagRegistry::with_edge_builtins(),
         })
     }
 
@@ -1556,6 +1570,43 @@ impl ProjectContext {
     #[getter]
     pub(crate) fn project_root(&self) -> &str {
         &self.root
+    }
+
+    /// Node-flag registry entries `(name, bit, seed, default_on, description)`,
+    /// bit-sorted: engine built-ins plus every flag the registered plugins
+    /// declared (populated by :meth:`materialize`; engine-only before then).
+    /// Threaded into :func:`write_graph` so the graph file records the table.
+    /// A method (not a getter) to match the duck-typed `nodes()` / `edges()`
+    /// the `write_graph` wrapper calls.
+    pub(crate) fn node_flag_registry(&self) -> Vec<(String, u64, bool, bool, String)> {
+        flag_registry_tuples(&self.node_flag_registry)
+    }
+
+    /// Edge-flag registry entries — the edge-space twin of
+    /// :meth:`node_flag_registry`.
+    pub(crate) fn edge_flag_registry(&self) -> Vec<(String, u64, bool, bool, String)> {
+        flag_registry_tuples(&self.edge_flag_registry)
+    }
+
+    /// Default reachability seed mask: the OR of every node-flag bit whose
+    /// flag both seeds reachability and is on by default (e.g.
+    /// ``engine/entrypoint``, and ``test/testcase`` when a test plugin is
+    /// registered). The Python layer uses it as the default ``seed_flags``.
+    pub(crate) fn default_seed_mask(&self) -> u32 {
+        self.node_flag_registry.default_seed_mask() as u32
+    }
+
+    /// The bit a node flag named ``name`` (``owner/name``) occupies, or
+    /// ``None`` if undeclared. Engine flags resolve even before materialize;
+    /// plugin flags resolve after.
+    pub(crate) fn node_flag(&self, name: &str) -> Option<u32> {
+        self.node_flag_registry.get(name).map(|bit| bit as u32)
+    }
+
+    /// The bit an edge flag named ``name`` occupies (edge-space twin of
+    /// :meth:`node_flag`), or ``None`` if undeclared.
+    pub(crate) fn edge_flag(&self, name: &str) -> Option<u8> {
+        self.edge_flag_registry.get(name).map(|bit| bit as u8)
     }
 
     /// Override the rayon worker stack size (bytes) used by the
@@ -1722,7 +1773,7 @@ impl ProjectContext {
         // ops fold into the graph in one end-of-pass apply, in
         // registration order — the same frozen-graph contract the old
         // Python ``ThreadPoolExecutor`` driver honoured.
-        let (jobs, plugin_names) =
+        let (jobs, plugin_names, node_reg, edge_reg) =
             match crate::native_plugins::extract_plugin_jobs(py, &slf.borrow(py).plugins) {
                 Ok(extracted) => extracted,
                 Err(e) => {
@@ -1759,6 +1810,13 @@ impl ProjectContext {
             let root_ref: &str = &root;
             let jobs_ref = &jobs;
             let results_ref = &results;
+            // Lend the frozen registries into each worker's `FrozenView`.
+            // `&FlagRegistry` is `Send` (the registry is `Sync`), so the refs
+            // ride the `allow_threads` boundary the way `root_ref` does; the
+            // owned registries stay on this stack and move into the pyclass
+            // after the pass.
+            let node_reg_ref = &node_reg;
+            let edge_reg_ref = &edge_reg;
             // ``base_db`` + ``outputs_lock`` move *into* the closure: a
             // ``&ProjectDatabase`` is ``!Send`` (salsa's ``ZalsaLocal`` is
             // ``!Sync``), so — like every GIL-free per-file scan here — we
@@ -1776,7 +1834,13 @@ impl ProjectContext {
                             let db_t = base_db.clone();
                             s.spawn(move |_| {
                                 counters_ref.plugin_started(idx);
-                                let view = FrozenView::new(db_t, outputs_ref, root_ref);
+                                let view = FrozenView::new(
+                                    db_t,
+                                    outputs_ref,
+                                    root_ref,
+                                    node_reg_ref,
+                                    edge_reg_ref,
+                                );
                                 let mut sink: Vec<PreparedOp> = Vec::new();
                                 let res = job.run(&view, &mut sink).map(|()| sink);
                                 results_ref.lock().unwrap().push((idx, res));
@@ -1821,6 +1885,17 @@ impl ProjectContext {
         counters.finish_phase(PHASE_PLUGINS);
         counters.mark_finished();
         plugin_result?;
+
+        // Persist the post-declaration registries on the pyclass so the
+        // `node_flag` / `default_seed_mask` / `*_flag_registry` getters and
+        // the graph-file writer see the plugin-allocated bits. The parallel
+        // pass's borrows have ended (the `allow_threads` block above returned),
+        // so the owned registries are free to move in.
+        {
+            let mut this = slf.borrow_mut(py);
+            this.node_flag_registry = node_reg;
+            this.edge_flag_registry = edge_reg;
+        }
 
         // The plugin pass can still reload individual files on demand:
         // subclass resolution's `locate_class_seed` resolves an external base
@@ -2246,7 +2321,7 @@ impl ProjectContext {
         &self,
         py: Python<'_>,
         root: &SymbolNode,
-        skip_flags: u32,
+        skip_flags: u8,
     ) -> PyResult<Vec<Py<SymbolNode>>> {
         let outputs = self.materialized("descendants")?;
         let root_idx = lookup_idx(&outputs.builder, root, "root")?;
@@ -2264,7 +2339,7 @@ impl ProjectContext {
     pub(crate) fn descendants_indices(
         &self,
         root_idx: usize,
-        skip_flags: u32,
+        skip_flags: u8,
     ) -> PyResult<Vec<usize>> {
         let outputs = self.materialized("descendants_indices")?;
         let len = outputs.builder.nodes.len();
@@ -2287,7 +2362,7 @@ impl ProjectContext {
         &self,
         py: Python<'_>,
         decl: &SymbolNode,
-        skip_flags: u32,
+        skip_flags: u8,
     ) -> PyResult<Vec<Py<SymbolNode>>> {
         let outputs = self.materialized("ancestors")?;
         let idx = lookup_idx(&outputs.builder, decl, "decl")?;
@@ -2305,7 +2380,7 @@ impl ProjectContext {
     pub(crate) fn ancestors_indices(
         &self,
         decl_idx: usize,
-        skip_flags: u32,
+        skip_flags: u8,
     ) -> PyResult<Vec<usize>> {
         let outputs = self.materialized("ancestors_indices")?;
         let len = outputs.builder.nodes.len();
@@ -2329,7 +2404,7 @@ impl ProjectContext {
     pub(crate) fn direct_predecessors_idx(
         &self,
         idx: usize,
-        skip_flags: u32,
+        skip_flags: u8,
     ) -> PyResult<Vec<usize>> {
         let outputs = self.materialized("direct_predecessors_idx")?;
         let len = outputs.builder.nodes.len();
@@ -2349,7 +2424,7 @@ impl ProjectContext {
     pub(crate) fn reachable(
         &self,
         py: Python<'_>,
-        skip_flags: u32,
+        skip_flags: u8,
         seed_flags: u32,
     ) -> PyResult<Vec<Py<SymbolNode>>> {
         let outputs = self.materialized("reachable")?;
@@ -2382,7 +2457,7 @@ impl ProjectContext {
 /// Shared one-hop reverse-adjacency walk used by
 /// :meth:`ProjectContext::direct_predecessors` and
 /// :meth:`direct_predecessors_idx`.
-fn direct_predecessors_idxs_in(outputs: &BuildOutputs, idx: usize, skip_flags: u32) -> Vec<usize> {
+fn direct_predecessors_idxs_in(outputs: &BuildOutputs, idx: usize, skip_flags: u8) -> Vec<usize> {
     let mut seen: FxHashSet<usize> = FxHashSet::default();
     let mut out: Vec<usize> = Vec::new();
     for &(src, flags) in &outputs.builder.reverse_adj[idx] {
@@ -3539,6 +3614,16 @@ fn find_subclasses_of_idx_in(outputs: &BuildOutputs, class_idx: usize) -> Option
 // subclass walk clones it once (it resolves the seed serially first).
 // ============================================================
 
+/// Flatten a [`FlagRegistry`] into the bit-sorted `(name, bit, seed,
+/// default_on, description)` tuples the Python getters and `write_graph`
+/// consume.
+fn flag_registry_tuples(reg: &FlagRegistry) -> Vec<(String, u64, bool, bool, String)> {
+    reg.entries()
+        .into_iter()
+        .map(|(bit, spec)| (spec.name, bit, spec.seed, spec.default_on, spec.description))
+        .collect()
+}
+
 /// Read-only, owned-db snapshot of a materialized project, handed to a
 /// project-wide native plugin's `run`. `Send` but `!Sync`: each
 /// fan-out task owns its view; views are never shared across threads.
@@ -3546,11 +3631,30 @@ pub(crate) struct FrozenView<'a> {
     pub(crate) db: ProjectDatabase,
     pub(crate) outputs: &'a BuildOutputs,
     pub(crate) root: &'a str,
+    /// Frozen node/edge flag registries (engine built-ins + plugin
+    /// declarations), lent read-only for the parallel plugin pass so a
+    /// plugin can resolve a declared flag name to its bit via
+    /// [`crate::native_plugins::plugin_api::PluginCtx::node_flag`] /
+    /// `edge_flag`.
+    pub(crate) node_flags: &'a FlagRegistry,
+    pub(crate) edge_flags: &'a FlagRegistry,
 }
 
 impl<'a> FrozenView<'a> {
-    pub(crate) fn new(db: ProjectDatabase, outputs: &'a BuildOutputs, root: &'a str) -> Self {
-        Self { db, outputs, root }
+    pub(crate) fn new(
+        db: ProjectDatabase,
+        outputs: &'a BuildOutputs,
+        root: &'a str,
+        node_flags: &'a FlagRegistry,
+        edge_flags: &'a FlagRegistry,
+    ) -> Self {
+        Self {
+            db,
+            outputs,
+            root,
+            node_flags,
+            edge_flags,
+        }
     }
 
     // --- data accessors -------------------------------------------------
@@ -3688,7 +3792,7 @@ impl<'a> FrozenView<'a> {
     pub(crate) fn descendants_indices(
         &self,
         root_idx: usize,
-        skip_flags: u32,
+        skip_flags: u8,
     ) -> Option<Vec<usize>> {
         if root_idx >= self.outputs.builder.nodes.len() {
             return None;
@@ -3705,7 +3809,7 @@ impl<'a> FrozenView<'a> {
         )
     }
 
-    pub(crate) fn ancestors_indices(&self, decl_idx: usize, skip_flags: u32) -> Option<Vec<usize>> {
+    pub(crate) fn ancestors_indices(&self, decl_idx: usize, skip_flags: u8) -> Option<Vec<usize>> {
         if decl_idx >= self.outputs.builder.nodes.len() {
             return None;
         }
@@ -3721,11 +3825,7 @@ impl<'a> FrozenView<'a> {
         )
     }
 
-    pub(crate) fn direct_predecessors_idx(
-        &self,
-        idx: usize,
-        skip_flags: u32,
-    ) -> Option<Vec<usize>> {
+    pub(crate) fn direct_predecessors_idx(&self, idx: usize, skip_flags: u8) -> Option<Vec<usize>> {
         if idx >= self.outputs.builder.nodes.len() {
             return None;
         }
@@ -3941,7 +4041,7 @@ impl ProjectContext {
     }
 
     /// Live edges as `(src_idx, dst_idx, flags)` triples.
-    pub(crate) fn edges(&self) -> PyResult<Vec<(usize, usize, u32)>> {
+    pub(crate) fn edges(&self) -> PyResult<Vec<(usize, usize, u8)>> {
         Ok(self.materialized("edges")?.builder.edges.clone())
     }
 
@@ -3957,7 +4057,7 @@ impl ProjectContext {
     #[pyo3(signature = (*, skip_flags = 0, seed_flags = NODE_FLAG_ENTRYPOINT))]
     pub(crate) fn reachable_indices(
         &self,
-        skip_flags: u32,
+        skip_flags: u8,
         seed_flags: u32,
     ) -> PyResult<Vec<usize>> {
         let outputs = self.materialized("reachable_indices")?;

@@ -188,6 +188,65 @@ read a keyword via `CallArgs::str_value(name)`.
 Endpoint indices are bounds-checked by the host at apply time — a dangling
 index is rejected cleanly rather than minting an unconnected node.
 
+### Declaring flags
+
+Node and edge flags are described by a single `FlagSpec` vocabulary (re-exported
+from `plugin_api`) and live in two separate registries — a 32-bit node space and
+an 8-bit edge space. The engine registers its built-ins first (`engine/…`);
+plugins contribute their own through two optional `ExternalPlugin` hooks:
+
+```rust
+use dead_cst_runtime::native_plugins::plugin_api::FlagSpec;
+
+impl ExternalPlugin for MyPlugin {
+    fn name(&self) -> &str { "MyPlugin" }
+
+    fn declare_node_flags(&self) -> Vec<FlagSpec> {
+        vec![FlagSpec {
+            name: "acme/handler".to_string(),   // owner/name; "engine/" is reserved
+            seed: true,         // contributes to the default reachability seed mask…
+            default_on: true,   // …when also default_on
+            description: "Kept alive because acme's router registers it.".to_string(),
+        }]
+    }
+
+    fn run(&self, ctx: &PluginCtx<'_>, ops: &mut PluginOps) -> Result<(), PluginError> {
+        let handler = ctx
+            .node_flag("acme/handler")
+            .expect("declared in declare_node_flags");
+        // …stamp `handler` on synthetic seeds via `ops.add_synthetic_node(..)`.
+        Ok(())
+    }
+}
+```
+
+`FlagSpec` carries **no bit value**. The host allocates each plugin flag a bit
+**above the engine masks, in plugin registration order** — so two builds with
+the same plugin set produce identical bits. Read the assigned bit back at `run`
+time with `ctx.node_flag(name) -> Option<u32>` / `ctx.edge_flag(name) ->
+Option<u8>` (`None` if no plugin declared it). `declare_edge_flags` is the
+edge-space twin; edge flags share the 8-bit width and `seed`/`default_on` are
+node-reachability concepts (recorded but unused for edges today).
+
+Registration rules — all enforced once, under the GIL, before the parallel run:
+
+- **`engine/` is protected.** A plugin declaring an `engine/…` flag fails the
+  whole materialize.
+- **Idempotent on an identical spec.** Two plugins declaring the *same*
+  `owner/name` with the same `seed`/`default_on`/`description` collapse to one
+  shared bit — this is exactly how the built-in `pytest` and `unittest` plugins
+  both declare `test/testcase` and share it. A re-declaration with a
+  *conflicting* spec (same name, different fields) fails loudly.
+- **Width is capped.** Exhausting the node width (bit 31) or edge width (bit 7)
+  fails with a clear error naming the flag and the cap.
+
+Both registries are serialized into the `.dcg` graph file (`FORMAT_VERSION` 2),
+so an external reader can decode any bit — engine or plugin — back to its name.
+The Python layer derives its default keepalive mask from the registry
+(`ctx.default_seed_mask()`, the OR of every `seed && default_on` bit) rather than
+a hand-maintained constant, so a plugin's seed flag is kept alive by default iff
+that plugin is registered.
+
 ### Per-file plugins (optional, salsa-cached)
 
 By default an `ExternalPlugin` is **project-wide**: its `run(ctx, ops)` is
@@ -246,6 +305,14 @@ function of its `file` — it may read only what `PluginFileCtx` exposes and mus
 not consult project-wide state, other files, globals, the clock, or the
 filesystem, and it may only reference nodes *in this file*. An impure
 `run_on_file` would serve stale ops after an unrelated edit.
+
+This is also why a per-file plugin **cannot** look flags up through the registry
+(`ctx.node_flag` / `ctx.edge_flag` exist only on the project-wide `PluginCtx`):
+the flag registry is derived from the *whole* plugin set, which isn't a file
+input, so reading it from `run_on_file` would serve stale bits after a
+plugin-set change. Per-file plugins emit the built-in engine flag constants
+(`plugin_api::FLAG_*`) instead; declaring custom flags is a project-wide-plugin
+capability today.
 
 Each plugin `cdylib` also exports a **manifest** — a self-contained
 `#[repr(C)]` table listing the plugins it provides and the ABI fingerprint it

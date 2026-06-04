@@ -12,7 +12,6 @@ synthetics) keep working -- but consumer imports never see its decls.
 from __future__ import annotations
 
 from dead_cst import _native as native
-from dead_cst.graph import KEEPALIVE_DEFAULT
 
 
 def test_package_wins_trie_slot_for_cross_module_imports(
@@ -34,7 +33,7 @@ def test_package_wins_trie_slot_for_cross_module_imports(
     assert len(targets) == 1
     assert targets[0].path.endswith("/__init__.py")
 
-    reachable = set(graph.reachable(seed_flags=KEEPALIVE_DEFAULT))
+    reachable = set(graph.reachable(seed_flags=graph.default_seed_mask()))
     package_x = next(
         n for n in graph.nodes() if n.fqname == "pkg.foo.x" and n.path.endswith("/__init__.py")
     )
@@ -55,7 +54,7 @@ def test_eclipsed_file_keeps_main_block_entrypoint(tmp_path, write_files, make_a
     )
     analysis = make_analysis(plugins=[native.NativePlugin.main_block()])
     graph = analysis.materialize_all()
-    reachable = set(graph.reachable(seed_flags=KEEPALIVE_DEFAULT))
+    reachable = set(graph.reachable(seed_flags=graph.default_seed_mask()))
 
     helper = next(n for n in graph.nodes() if n.fqname == "pkg.foo.helper")
     eclipsed_module = next(

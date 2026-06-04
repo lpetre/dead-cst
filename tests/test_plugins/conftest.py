@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING
 import pytest
 
 from dead_cst import Analysis
-from dead_cst.graph import KEEPALIVE_DEFAULT
 
 if TYPE_CHECKING:
     from dead_cst import _native as native
@@ -18,7 +17,7 @@ def reachable_fqnames():
     """``{fqname for n in ctx.reachable() if n.kind != "synthetic"}``."""
 
     def _reachable(ctx: "native.ProjectContext") -> set[str]:
-        reached = ctx.reachable(seed_flags=KEEPALIVE_DEFAULT)
+        reached = ctx.reachable(seed_flags=ctx.default_seed_mask())
         return {n.fqname for n in reached if n.kind != "synthetic"}
 
     return _reachable

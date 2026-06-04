@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dead_cst import _native as native
-from dead_cst.graph import NodeFlags
 
 
 def test_pytest_plugin_marks_test_functions(build_plugin_graph, reachable_fqnames):
@@ -363,5 +362,7 @@ def test_pytest_plugin_tags_seeds_as_testcase(build_plugin_graph):
         },
         [native.NativePlugin.pytest()],
     )
-    seeds = [n for n in graph.nodes() if n.flags & NodeFlags.TESTCASE]
-    assert seeds, "expected pytest plugin to seed at least one TESTCASE node"
+    testcase = graph.node_flag("test/testcase")
+    assert testcase is not None, "pytest plugin should register the test/testcase flag"
+    seeds = [n for n in graph.nodes() if n.flags & testcase]
+    assert seeds, "expected pytest plugin to seed at least one test/testcase node"

@@ -229,7 +229,7 @@ impl SymbolNode {
 #[pyclass(get_all, frozen)]
 pub(crate) struct NativeGraph {
     pub(crate) nodes: Vec<Py<SymbolNode>>,
-    pub(crate) edges: Vec<(usize, usize, u32)>,
+    pub(crate) edges: Vec<(usize, usize, u8)>,
 }
 
 #[pymethods]
@@ -268,55 +268,81 @@ pub(crate) struct NodeFlags;
 impl NodeFlags {
     #[classattr]
     pub(crate) const NONE: u32 = 0;
-    /// Decl rebound by a later assignment in the same file. Kept in the
-    /// graph (with its parent-module edge) but excluded from the
-    /// cross-module lookup so consumers of an exported name route to
-    /// the live binding.
-    #[classattr]
-    pub(crate) const SHADOWED: u32 = 1;
-    /// Explicit entrypoint — plugin-emitted seeds, the CLI's `-e`
-    /// flag, `[project.scripts]` targets, factory-app synthetics, etc.
-    /// One of the keepalive bits ORed into `KEEPALIVE_DEFAULT` on the
-    /// Python side, so reachability seeds from `ENTRYPOINT`-flagged
-    /// nodes by default.
+    /// Explicit entrypoint — plugin-emitted seeds, the CLI's `-e` flag,
+    /// `[project.scripts]` targets, factory-app synthetics, etc. A `seed`
+    /// flag (registered `engine/entrypoint`), so reachability seeds from
+    /// `ENTRYPOINT`-flagged nodes by default.
     #[classattr]
     pub(crate) const ENTRYPOINT: u32 = 2;
-    /// `typing.overload` stub (or any same-name decl whose lifetime is
-    /// anchored to a matching impl). Excluded from the lookup trie like
-    /// `SHADOWED`; kept alive by an explicit `impl -> overload` edge.
-    #[classattr]
-    pub(crate) const OVERLOAD: u32 = 4;
-    /// Pytest / unittest test discoveries. One of the keepalive bits in
-    /// `KEEPALIVE_DEFAULT`, so tests are alive by default. The
-    /// `kept_alive_by_flags_only(TESTCASE)` blast-radius query isolates
-    /// "what's only alive because of tests" by computing the diff
-    /// against `reachable(seed_flags=KEEPALIVE_DEFAULT & ~TESTCASE)`.
-    #[classattr]
-    pub(crate) const TESTCASE: u32 = 8;
     /// Import alias preserved by a user noqa directive (bare `# noqa`,
-    /// `# noqa: F401`, multi-rule `# noqa: E501, F401`, or the
-    /// file-level `# ruff: noqa` / `# flake8: noqa`). One of the
-    /// keepalive bits in `KEEPALIVE_DEFAULT`.
+    /// `# noqa: F401`, multi-rule `# noqa: E501, F401`, or the file-level
+    /// `# ruff: noqa` / `# flake8: noqa`). A `seed` flag (registered
+    /// `engine/noqa`).
     #[classattr]
     pub(crate) const NOQA: u32 = 16;
     /// Every node sourced from a Jupyter `.ipynb` file. Cells run
-    /// top-to-bottom rather than being imported, so the bit alone keeps
-    /// the node alive (no `ENTRYPOINT` overlay needed — `NOTEBOOK` is in
-    /// `KEEPALIVE_DEFAULT`). The codemod also reads the bit to skip
-    /// notebook nodes (it can't rewrite the cell JSON envelope).
+    /// top-to-bottom rather than being imported, so the bit alone keeps the
+    /// node alive. A `seed` flag (registered `engine/notebook`). The codemod
+    /// also reads the bit to skip notebook nodes (it can't rewrite the cell
+    /// JSON envelope).
     #[classattr]
     pub(crate) const NOTEBOOK: u32 = 32;
-    /// Every node sourced from a file under the package's `exported`
-    /// glob. Used by the cross-package merge to filter to entries the
-    /// owning package opts into exposing.
+    /// Decl that sits in a statically-dead region (the body of `if False:`,
+    /// the else of `if True:`, code after an unconditional `return` /
+    /// `raise`, …) — the node-level companion to [`EdgeFlags::DEAD_BRANCH`].
+    /// Metadata only (not a seed); registered `engine/dead_branch`.
     #[classattr]
-    pub(crate) const EXPORTED: u32 = 64;
-    /// Import decl synthesized from `from X import *` — one per name
-    /// the star statement brought in. Set so the cross-module trie can
+    pub(crate) const DEAD_BRANCH: u32 = 64;
+    /// Import decl synthesized from `from X import *` — one per name the
+    /// star statement brought in. Set so the cross-module trie can
     /// distinguish "real" import aliases from per-name star fan-out.
+    /// Registered `engine/star_reexport` (not a seed).
     #[classattr]
     pub(crate) const STAR_REEXPORT: u32 = 128;
 }
+
+/// Engine node flags, seeded into the node `FlagRegistry` before any plugin
+/// registers. Tuple = `(mask, owner/name, seed, default_on, description)`;
+/// the masks are the [`NodeFlags`] consts so hot-path `flags & CONST` reads
+/// still constant-fold. Single source of truth for the engine roster — the
+/// distinct-bits test iterates it.
+pub(crate) const BUILTIN_NODE_FLAGS: &[(u64, &str, bool, bool, &str)] = &[
+    (
+        NodeFlags::ENTRYPOINT as u64,
+        "engine/entrypoint",
+        true,
+        true,
+        "Explicit reachability entrypoint.",
+    ),
+    (
+        NodeFlags::NOQA as u64,
+        "engine/noqa",
+        true,
+        true,
+        "Import alias pinned by a noqa directive.",
+    ),
+    (
+        NodeFlags::NOTEBOOK as u64,
+        "engine/notebook",
+        true,
+        true,
+        "Node sourced from a Jupyter notebook cell.",
+    ),
+    (
+        NodeFlags::DEAD_BRANCH as u64,
+        "engine/dead_branch",
+        false,
+        false,
+        "Decl in a statically-dead region.",
+    ),
+    (
+        NodeFlags::STAR_REEXPORT as u64,
+        "engine/star_reexport",
+        false,
+        false,
+        "Per-name binding synthesized from a star import.",
+    ),
+];
 
 /// Bit values stamped into the third tuple slot of each `NativeGraph`
 /// edge. Mirrors `dead_cst.graph.EdgeFlags`.
@@ -326,7 +352,7 @@ pub(crate) struct EdgeFlags;
 #[pymethods]
 impl EdgeFlags {
     #[classattr]
-    pub(crate) const NONE: u32 = 0;
+    pub(crate) const NONE: u8 = 0;
     /// Reference originated inside a statically-dead region (the body of
     /// `if False:`, the else of `if True:`, after an unconditional
     /// `return` / `raise` / `break` / `continue`, …). Metadata only —
@@ -334,14 +360,34 @@ impl EdgeFlags {
     /// `descendants(..., skip_flags=EdgeFlags.DEAD_BRANCH)` to compute
     /// the kept-alive-only-by-dead-branches set.
     #[classattr]
-    pub(crate) const DEAD_BRANCH: u32 = 1;
+    pub(crate) const DEAD_BRANCH: u8 = 1;
     /// Edge emitted from a runtime-import call (`__import__('X')` /
     /// `importlib.import_module('X')`). Lets plugins read which edges
     /// the visitor produced from dynamic-import shapes and choose to
     /// fan out / specialize.
     #[classattr]
-    pub(crate) const DYNAMIC_IMPORT: u32 = 2;
+    pub(crate) const DYNAMIC_IMPORT: u8 = 2;
 }
+
+/// Engine edge flags, seeded into the edge `FlagRegistry` before any plugin
+/// registers. Same tuple shape as [`BUILTIN_NODE_FLAGS`]; `seed` / `default_on`
+/// are node-reachability concepts, recorded-but-unused for edges in v1.
+pub(crate) const BUILTIN_EDGE_FLAGS: &[(u64, &str, bool, bool, &str)] = &[
+    (
+        EdgeFlags::DEAD_BRANCH as u64,
+        "engine/dead_branch",
+        false,
+        false,
+        "Edge originating in a statically-dead region.",
+    ),
+    (
+        EdgeFlags::DYNAMIC_IMPORT as u64,
+        "engine/dynamic_import",
+        false,
+        false,
+        "Edge from a runtime-import call.",
+    ),
+];
 
 #[cfg(test)]
 mod tests {
@@ -380,26 +426,16 @@ mod tests {
 
     #[test]
     fn node_flags_constants_are_distinct_bits() {
-        // Each flag should be a single distinct bit (or zero for NONE).
-        let flags = [
-            NodeFlags::SHADOWED,
-            NodeFlags::ENTRYPOINT,
-            NodeFlags::OVERLOAD,
-            NodeFlags::TESTCASE,
-            NodeFlags::NOQA,
-            NodeFlags::NOTEBOOK,
-            NodeFlags::EXPORTED,
-            NodeFlags::STAR_REEXPORT,
-        ];
+        // The engine roster table is authoritative: every mask is a single
+        // distinct bit, all in u32 range.
         assert_eq!(NodeFlags::NONE, 0);
-        for &f in &flags {
-            // Single-bit invariant.
-            assert!(f.is_power_of_two(), "flag {f} is not a single bit");
-        }
-        // All distinct.
         let mut seen = std::collections::HashSet::new();
-        for &f in &flags {
-            assert!(seen.insert(f), "duplicate flag value {f}");
+        for &(mask, name, ..) in BUILTIN_NODE_FLAGS {
+            assert!(
+                mask.is_power_of_two() && mask < (1u64 << 32),
+                "node flag {name:?} mask {mask:#x} is not a single in-range bit",
+            );
+            assert!(seen.insert(mask), "duplicate node flag mask {mask:#x}");
         }
     }
 
@@ -408,14 +444,21 @@ mod tests {
         let combo = NodeFlags::ENTRYPOINT | NodeFlags::NOQA;
         assert!(combo & NodeFlags::ENTRYPOINT != 0);
         assert!(combo & NodeFlags::NOQA != 0);
-        assert!(combo & NodeFlags::TESTCASE == 0);
+        assert!(combo & NodeFlags::STAR_REEXPORT == 0);
     }
 
     #[test]
-    fn edge_flags_are_distinct_bits() {
+    fn edge_flags_constants_are_distinct_bits() {
+        // Mirror of the node-flag table check over the edge roster (u8).
         assert_eq!(EdgeFlags::NONE, 0);
-        assert!(EdgeFlags::DEAD_BRANCH.is_power_of_two());
-        assert!(EdgeFlags::DYNAMIC_IMPORT.is_power_of_two());
+        let mut seen = std::collections::HashSet::new();
+        for &(mask, name, ..) in BUILTIN_EDGE_FLAGS {
+            assert!(
+                mask.is_power_of_two() && mask < (1u64 << 8),
+                "edge flag {name:?} mask {mask:#x} is not a single in-range bit",
+            );
+            assert!(seen.insert(mask), "duplicate edge flag mask {mask:#x}");
+        }
         assert_ne!(EdgeFlags::DEAD_BRANCH, EdgeFlags::DYNAMIC_IMPORT);
     }
 }

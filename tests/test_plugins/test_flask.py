@@ -485,10 +485,10 @@ def test_flask_plugin_handles_factory_function(build_plugin_graph, reachable_fqn
         },
         [native.NativePlugin.flask()],
     )
-    from dead_cst.graph import KEEPALIVE_DEFAULT
-
     reached = {
-        n.fqname for n in graph.reachable(seed_flags=KEEPALIVE_DEFAULT) if n.kind != "synthetic"
+        n.fqname
+        for n in graph.reachable(seed_flags=graph.default_seed_mask())
+        if n.kind != "synthetic"
     }
     assert "app.main.app" in reached
     assert "app.main.list_items" in reached

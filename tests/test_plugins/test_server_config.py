@@ -171,20 +171,24 @@ def test_server_config_loads_via_cli_loader():
 
 def test_seeds_are_not_tagged_testcase(build_plugin_graph):
     # Server-config entrypoints are production code, not tests -- they
-    # should seed reachability but not get filtered by
-    # ``kept_alive_by_flags_only(NodeFlags.TESTCASE)``.
+    # should seed reachability but never carry the ``test/testcase`` flag
+    # (so ``kept_alive_by_flags_only(test/testcase)`` doesn't filter them).
+    # Register pytest alongside so the ``test/testcase`` flag is registered
+    # and there's a bit to check against.
     graph = build_plugin_graph(
         {
             "pkg/__init__.py": "",
             "gunicorn.conf.py": "workers = 4",
         },
-        [native.NativePlugin.server_config()],
+        [native.NativePlugin.server_config(), native.NativePlugin.pytest()],
     )
+    testcase = graph.node_flag("test/testcase")
+    assert testcase is not None, "pytest plugin should register the test/testcase flag"
     seeds = [n for n in graph.nodes() if n.flags & NodeFlags.ENTRYPOINT]
     server_seeds = [s for s in seeds if s.fqname.startswith("<server-config>:")]
     assert server_seeds
     for seed in server_seeds:
-        assert not (seed.flags & NodeFlags.TESTCASE), seed.fqname
+        assert not (seed.flags & testcase), seed.fqname
 
 
 # ---------------------------------------------------------------------------

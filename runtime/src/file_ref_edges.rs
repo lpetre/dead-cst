@@ -91,7 +91,7 @@ use crate::ingest::{
 /// GIL-free so workers run inside `py.allow_threads` cleanly.
 #[derive(Debug, Eq, PartialEq, salsa::Update, get_size2::GetSize)]
 pub(crate) struct FileRefEdges<'db> {
-    pub(crate) edges: FxHashSet<(NodeRef<'db>, NodeRef<'db>, u32)>,
+    pub(crate) edges: FxHashSet<(NodeRef<'db>, NodeRef<'db>, u8)>,
     pub(crate) warnings: Vec<String>,
 }
 
@@ -101,7 +101,7 @@ pub(crate) struct FileRefEdges<'db> {
 #[salsa::tracked(returns(ref), heap_size = ruff_memory_usage::heap_size)]
 pub(crate) fn file_to_ref_edges<'db>(db: &'db dyn ProjectDb, file: File) -> FileRefEdges<'db> {
     let self_nodes = file_to_nodes(db, file);
-    let mut edges: FxHashSet<(NodeRef<'db>, NodeRef<'db>, u32)> = FxHashSet::default();
+    let mut edges: FxHashSet<(NodeRef<'db>, NodeRef<'db>, u8)> = FxHashSet::default();
     let mut warnings: Vec<String> = Vec::new();
 
     let parsed = parsed_module(db, file).load(db);
@@ -204,7 +204,7 @@ struct RefWalker<'a, 'db> {
     /// `TYPE_CHECKING` as `True`); `find_local_bindings` recovers it
     /// from the scope-wide reachable bindings.
     tc_ranges: &'a [TextRange],
-    edges: &'a mut FxHashSet<(NodeRef<'db>, NodeRef<'db>, u32)>,
+    edges: &'a mut FxHashSet<(NodeRef<'db>, NodeRef<'db>, u8)>,
     /// Per-file warnings buffer. Workers push pure-rust strings; the
     /// driver flushes them to Python logging from the main thread.
     warnings: &'a mut Vec<String>,
@@ -225,7 +225,7 @@ struct RefWalker<'a, 'db> {
     /// (set by `emit_name_use` / nested-import handlers from
     /// `flags_for_range` on the reference's source position;
     /// reset to 0 after the reference completes).
-    current_flags: u32,
+    current_flags: u8,
 }
 
 impl<'a, 'db> RefWalker<'a, 'db> {
@@ -237,7 +237,7 @@ impl<'a, 'db> RefWalker<'a, 'db> {
 
     /// Returns `EDGE_FLAG_DEAD_BRANCH` if `range` is contained in any
     /// statically-dead region recorded for this file, else `0`.
-    fn flags_for_range(&self, range: TextRange) -> u32 {
+    fn flags_for_range(&self, range: TextRange) -> u8 {
         if self.dead_ranges.iter().any(|r| r.contains_range(range)) {
             EDGE_FLAG_DEAD_BRANCH
         } else {

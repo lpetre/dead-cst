@@ -26,7 +26,6 @@ EXPECTED_PUBLIC_API: dict[str, list[str]] = {
         "EdgeFlags",
         "GraphMetadata",
         "Import",
-        "KEEPALIVE_DEFAULT",
         "LoadedGraph",
         "NodeFlags",
         "SymbolNode",

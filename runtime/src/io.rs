@@ -8,11 +8,13 @@
 //! body        : bincode(GraphFile)
 //! ```
 //!
-//! The body holds the project-wide node + edge lists and a small
+//! The body holds the project-wide node + edge lists, a small
 //! [`GraphMetadata`] block (creation timestamp, counts, user-supplied
-//! `--meta key=value` pairs). The format intentionally captures only
-//! the graph — plugins must rebuild on load — so the file stays small
-//! and the rust ↔ Python round-trip is one allocation per node.
+//! `--meta key=value` pairs), and the node + edge flag registries (so a
+//! reader can decode a flag bit to its `owner/name`). The format
+//! intentionally captures only the graph — plugins must rebuild on load
+//! — so the file stays small and the rust ↔ Python round-trip is one
+//! allocation per node.
 
 use std::fs::File as StdFile;
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -30,14 +32,62 @@ pub(crate) const MAGIC: &[u8; 8] = b"DEADCSTG";
 
 /// On-disk format version. Bumped on any breaking layout change to
 /// [`GraphFileBody`]; the loader rejects mismatched values outright
-/// (graphs are cheap to rebuild — no migration logic).
-pub(crate) const FORMAT_VERSION: u32 = 1;
+/// (graphs are cheap to rebuild — no migration logic). Bumped 1 → 2
+/// when the flag registries were added to the body and edge flags
+/// narrowed to `u8`.
+pub(crate) const FORMAT_VERSION: u32 = 2;
 
 #[derive(Serialize, Deserialize)]
 struct GraphFileBody {
     metadata: GraphMetadataRecord,
     nodes: Vec<NodeRecord>,
-    edges: Vec<(u32, u32, u32)>,
+    edges: Vec<(u32, u32, u8)>,
+    /// Node-flag registry (engine built-ins + plugin declarations) so a
+    /// reader can decode a node's flag bits to `owner/name`. Top-level
+    /// (structural), not user metadata.
+    node_flag_registry: Vec<FlagRecord>,
+    /// Edge-flag registry — the edge-space twin of [`Self::node_flag_registry`].
+    edge_flag_registry: Vec<FlagRecord>,
+}
+
+/// One serialized flag-registry entry: a `owner/name` flag and the bit it
+/// occupies, plus its reachability semantics. `bit` is stored as `u64` for
+/// headroom against a future width widen; the runtime narrows it to `u32`
+/// (node) / `u8` (edge) on read.
+#[derive(Serialize, Deserialize, Clone)]
+struct FlagRecord {
+    name: String,
+    bit: u64,
+    seed: bool,
+    default_on: bool,
+    description: String,
+}
+
+/// Python-facing flag-registry entry tuple: `(name, bit, seed, default_on,
+/// description)`. The shape `GraphMetadata` exposes and `write_graph` accepts,
+/// so a loaded graph can be re-written without reshaping.
+type FlagTuple = (String, u64, bool, bool, String);
+
+impl FlagRecord {
+    fn from_tuple((name, bit, seed, default_on, description): FlagTuple) -> Self {
+        Self {
+            name,
+            bit,
+            seed,
+            default_on,
+            description,
+        }
+    }
+
+    fn into_tuple(self) -> FlagTuple {
+        (
+            self.name,
+            self.bit,
+            self.seed,
+            self.default_on,
+            self.description,
+        )
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -87,13 +137,20 @@ pub(crate) struct GraphMetadata {
     pub(crate) file_count: u64,
     pub(crate) line_count: u64,
     pub(crate) user_meta: Vec<(String, String)>,
+    /// Node-flag registry entries `(name, bit, seed, default_on, description)`,
+    /// bit-sorted. Lets a Python reader decode a node's flags by name and a
+    /// re-write preserve the registry.
+    pub(crate) node_flag_registry: Vec<FlagTuple>,
+    /// Edge-flag registry entries — the edge-space twin of
+    /// [`Self::node_flag_registry`].
+    pub(crate) edge_flag_registry: Vec<FlagTuple>,
 }
 
 #[pymethods]
 impl GraphMetadata {
     fn __repr__(&self) -> String {
         format!(
-            "GraphMetadata(format_version={}, created_at={}, nodes={}, edges={}, files={}, lines={}, user_meta={} entries)",
+            "GraphMetadata(format_version={}, created_at={}, nodes={}, edges={}, files={}, lines={}, user_meta={} entries, node_flags={}, edge_flags={})",
             self.format_version,
             self.created_at,
             self.node_count,
@@ -101,6 +158,8 @@ impl GraphMetadata {
             self.file_count,
             self.line_count,
             self.user_meta.len(),
+            self.node_flag_registry.len(),
+            self.edge_flag_registry.len(),
         )
     }
 }
@@ -133,14 +192,19 @@ where
 /// `nodes` / `edges` are the same payload `NativeGraph` exposes —
 /// passed as plain Python objects so callers don't need to keep the
 /// `NativeGraph` instance around. `meta` is the user-supplied list of
-/// `(key, value)` pairs from `--meta`.
+/// `(key, value)` pairs from `--meta`. `node_flag_registry` /
+/// `edge_flag_registry` are the `(name, bit, seed, default_on,
+/// description)` tuples from `ProjectContext.{node,edge}_flag_registry`,
+/// persisted so a reader can decode flag bits by name.
 #[pyfunction]
-#[pyo3(signature = (path, nodes, edges, meta))]
+#[pyo3(signature = (path, nodes, edges, meta, node_flag_registry, edge_flag_registry))]
 pub(crate) fn write_graph(
     path: String,
     nodes: Vec<Py<SymbolNode>>,
-    edges: Vec<(u32, u32, u32)>,
+    edges: Vec<(u32, u32, u8)>,
     meta: Vec<(String, String)>,
+    node_flag_registry: Vec<FlagTuple>,
+    edge_flag_registry: Vec<FlagTuple>,
     py: Python<'_>,
 ) -> PyResult<()> {
     let mut node_records: Vec<NodeRecord> = Vec::with_capacity(nodes.len());
@@ -189,6 +253,14 @@ pub(crate) fn write_graph(
         },
         nodes: node_records,
         edges,
+        node_flag_registry: node_flag_registry
+            .into_iter()
+            .map(FlagRecord::from_tuple)
+            .collect(),
+        edge_flag_registry: edge_flag_registry
+            .into_iter()
+            .map(FlagRecord::from_tuple)
+            .collect(),
     };
 
     let file = StdFile::create(&path)
@@ -252,6 +324,8 @@ pub(crate) fn read_graph(
         metadata,
         nodes,
         edges,
+        node_flag_registry,
+        edge_flag_registry,
     } = body;
 
     let mut node_objs: Vec<Py<SymbolNode>> = Vec::with_capacity(nodes.len());
@@ -298,6 +372,14 @@ pub(crate) fn read_graph(
         file_count: metadata.file_count,
         line_count: metadata.line_count,
         user_meta: metadata.user_meta,
+        node_flag_registry: node_flag_registry
+            .into_iter()
+            .map(FlagRecord::into_tuple)
+            .collect(),
+        edge_flag_registry: edge_flag_registry
+            .into_iter()
+            .map(FlagRecord::into_tuple)
+            .collect(),
     };
     Ok((Py::new(py, graph)?, Py::new(py, meta)?))
 }

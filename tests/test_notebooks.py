@@ -4,7 +4,7 @@ from __future__ import annotations
 
 
 from dead_cst.codemod import generate_patch
-from dead_cst.graph import KEEPALIVE_DEFAULT, NodeFlags
+from dead_cst.graph import NodeFlags
 
 
 def test_every_notebook_node_carries_notebook_flag(write_notebook, make_analysis):
@@ -18,10 +18,11 @@ def test_every_notebook_node_carries_notebook_flag(write_notebook, make_analysis
     ctx = make_analysis().materialize_all()
     notebook_nodes = [n for n in ctx.nodes() if n.flags & NodeFlags.NOTEBOOK]
     assert notebook_nodes
-    # ``NOTEBOOK`` alone is enough — it's a keepalive bit in
-    # ``KEEPALIVE_DEFAULT``, so the BFS seeds from these nodes by default
-    # without needing an explicit ``ENTRYPOINT`` overlay.
-    assert any(n.flags & KEEPALIVE_DEFAULT for n in notebook_nodes), (
+    # ``NOTEBOOK`` alone is enough — it's a seed flag, so the BFS seeds
+    # from these nodes by default (it's in the registry-derived
+    # ``default_seed_mask``) without needing an explicit ``ENTRYPOINT``
+    # overlay.
+    assert any(n.flags & ctx.default_seed_mask() for n in notebook_nodes), (
         "notebook nodes should be keepalive seeds"
     )
 
@@ -30,7 +31,7 @@ def test_notebook_keeps_referenced_py_code_alive(write_notebook, write_files, ma
     write_files({"lib.py": "def used(): return 1\ndef unused(): return 2\n"})
     write_notebook("use.ipynb", ["from lib import used\nused()\n"])
     ctx = make_analysis().materialize_all()
-    reachable = set(ctx.reachable(seed_flags=KEEPALIVE_DEFAULT))
+    reachable = set(ctx.reachable(seed_flags=ctx.default_seed_mask()))
     used = next(n for n in ctx.nodes() if n.fqname == "lib.used")
     unused = next(n for n in ctx.nodes() if n.fqname == "lib.unused")
     assert used in reachable
