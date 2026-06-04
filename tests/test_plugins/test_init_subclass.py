@@ -3,10 +3,7 @@
 from __future__ import annotations
 
 from dead_cst import _native as native
-
-# Synthetic marker-node prefix the native backend emits for each
-# ``__init_subclass__``-defining base (runtime/src/native_plugins.rs).
-INIT_SUBCLASS_PREFIX = "<__init_subclass__>:"
+from dead_cst.graph import EdgeFlags
 
 
 def test_init_subclass_keeps_subclass_alive_via_parent(
@@ -307,9 +304,10 @@ def test_init_subclass_subscripted_base(make_analysis, write_files, reachable_fq
     assert "pkg.impls.Foo" in reachable_fqnames(graph)
 
 
-def test_init_subclass_marker_in_predecessor_chain(make_analysis, write_files, predecessors_of):
-    """Reachability of a subclass routes through a labeled marker node so
-    ``why-alive`` chains read ``Foo <- <__init_subclass__>:Plugin <- Plugin``."""
+def test_init_subclass_parent_is_direct_predecessor(make_analysis, write_files, predecessors_of):
+    """Reachability of a subclass routes through a direct, INIT_SUBCLASS-flagged
+    ``parent -> subclass`` edge, so ``why-alive`` chains read ``Foo <- Plugin``
+    (no intermediate synthetic marker node)."""
     write_files(
         {
             "pkg/__init__.py": "",
@@ -332,18 +330,16 @@ def test_init_subclass_marker_in_predecessor_chain(make_analysis, write_files, p
             native.NativePlugin.init_subclass(),
         ]
     ).materialize_all()
-    foo = next(n for n in graph.nodes() if n.fqname == "pkg.impls.Foo")
+    nodes = graph.nodes()
+    foo = next(n for n in nodes if n.fqname == "pkg.impls.Foo")
+    # The parent class is a *direct* predecessor -- no synthetic marker hop.
     preds = predecessors_of(graph, foo)
-    marker = next(
-        (p for p in preds if p.kind == "synthetic" and p.fqname.startswith(INIT_SUBCLASS_PREFIX)),
-        None,
-    )
-    assert marker is not None, f"expected a marker predecessor, got {preds!r}"
-    assert marker.fqname == f"{INIT_SUBCLASS_PREFIX}pkg.base.Plugin"
-
-    marker_preds = predecessors_of(graph, marker)
-    parent = next(p for p in marker_preds if p.fqname == "pkg.base.Plugin")
+    parent = next(p for p in preds if p.fqname == "pkg.base.Plugin")
     assert parent.kind == "class"
+    # The parent -> subclass edge carries the INIT_SUBCLASS flag.
+    parent_idx, foo_idx = nodes.index(parent), nodes.index(foo)
+    flags = next(p for u, v, p in graph.edges() if u == parent_idx and v == foo_idx)
+    assert flags & EdgeFlags.INIT_SUBCLASS
 
 
 def test_init_subclass_loads_via_cli_loader():

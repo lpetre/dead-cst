@@ -246,12 +246,12 @@ mod tests {
 
     #[test]
     fn edge_width_exhaustion_is_loud() {
-        // Edge registry is u8: engine masks 1 and 2, plugins from bit 4.
-        // Free plugin bits are 4,8,16,32,64,128 (six), then exhaustion.
+        // Edge registry is u8: engine masks 1, 2, 4, plugins from bit 8.
+        // Free plugin bits are 8,16,32,64,128 (five), then exhaustion.
         let mut reg = FlagRegistry::with_edge_builtins();
-        for i in 0..6 {
+        for i in 0..5 {
             reg.register_plugin(spec(&format!("acme/e{i}"), false, false))
-                .expect("six plugin edge bits should fit in u8");
+                .expect("five plugin edge bits should fit in u8");
         }
         assert!(reg
             .register_plugin(spec("acme/overflow", false, false))

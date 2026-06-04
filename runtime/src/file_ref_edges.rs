@@ -69,7 +69,7 @@ enum Resolution<'db> {
     },
 }
 use crate::helpers::{
-    detect_dead_ranges, detect_type_checking_ranges, EDGE_FLAG_DEAD_BRANCH,
+    detect_dead_ranges, detect_type_checking_ranges, file_path_string, EDGE_FLAG_DEAD_BRANCH,
     EDGE_FLAG_DYNAMIC_IMPORT,
 };
 use crate::ingest::{
@@ -245,18 +245,11 @@ impl<'a, 'db> RefWalker<'a, 'db> {
         }
     }
 
-    /// Emit an edge from `self.owner` to a synthetic External node.
-    /// `target_file` Some when the import resolved to a file
-    /// (drives `[external dist] X` PEP 503 canonicalisation via
-    /// project_dist_lookup); None for genuinely-unresolved imports
-    /// (`[unresolved] X`).
-    fn emit_external(&mut self, dotted: &str, target_file: Option<File>) {
-        let top_level = dotted.split('.').next().unwrap_or(dotted);
-        let fqname = match target_file {
-            Some(f) => crate::file_payload::external_fqname_for(self.db, f, top_level),
-            None => format!("[unresolved] {top_level}"),
-        };
-        let key = ExternalKey::new(self.db, fqname);
+    /// Emit an edge from `self.owner` to a real External node carrying
+    /// the resolved upstream path: `[external dist] X` / `[external file] X`
+    /// for site-packages (via `external_fqname_for`'s PEP 503 lookup).
+    fn emit_external_node(&mut self, fqname: String, target_file: File) {
+        let key = ExternalKey::new(self.db, fqname, file_path_string(self.db, target_file));
         self.emit_edge(NodeRef::External(key));
     }
 
@@ -665,15 +658,19 @@ impl<'a, 'db> RefWalker<'a, 'db> {
         self.current_flags = saved;
     }
 
-    /// Emit a single edge to the resolved module's NodeRef. Stdlib
-    /// drops silently; otherwise routes to first-party (Module) or
-    /// External as appropriate.
+    /// Emit a single edge to the resolved module's NodeRef. First-party
+    /// modules route to a `Module` ref; site-packages modules become real
+    /// `External` nodes carrying the upstream path; stdlib and
+    /// genuinely-unresolved targets emit nothing.
     fn emit_resolved_module(&mut self, dotted: &str) {
+        let top_level = dotted.split('.').next().unwrap_or(dotted);
         let Some(mn) = ModuleName::new(dotted) else {
             return;
         };
         let Some(module) = resolve_module(self.db, self.file, &mn) else {
-            self.emit_external(dotted, None);
+            return;
+        };
+        let Some(target_file) = module.file(self.db) else {
             return;
         };
         if module
@@ -682,15 +679,12 @@ impl<'a, 'db> RefWalker<'a, 'db> {
         {
             return;
         }
-        let Some(target_file) = module.file(self.db) else {
-            self.emit_external(dotted, None);
-            return;
-        };
         if module
             .search_path(self.db)
             .is_some_and(|sp| !sp.is_first_party() && sp.is_site_packages())
         {
-            self.emit_external(dotted, Some(target_file));
+            let fqname = crate::file_payload::external_fqname_for(self.db, target_file, top_level);
+            self.emit_external_node(fqname, target_file);
             return;
         }
         self.emit_edge(NodeRef::Module(target_file));
@@ -746,9 +740,9 @@ impl<'a, 'db> RefWalker<'a, 'db> {
     }
 
     /// Emit parallel reachability edges past a local import alias.
-    /// First-party path only — stdlib / external / unresolved targets
-    /// silently drop. Synthetic external nodes land with
-    /// `NodeRef::External` in a follow-up.
+    /// First-party targets walk the submodule chain; site-packages
+    /// targets emit a single `NodeRef::External` edge and stop; stdlib
+    /// and genuinely-unresolved targets silently drop.
     ///
     /// Mirrors today's `ingest::RefCollector::emit_upstream` (lines
     /// 1880–2032): classify the loading target, walk the submodule
@@ -808,39 +802,37 @@ impl<'a, 'db> RefWalker<'a, 'db> {
             }
         }
 
-        // Classify the loading target. Stdlib drops silently (matches
-        // existing pipeline); external/unresolved targets emit a
-        // single edge to a globally-interned synthetic External node
-        // and stop (no submodule chain walk through them, since they
-        // don't have file_to_nodes payloads to look up against).
+        // Classify the loading target. Site-packages targets emit a
+        // single edge to a globally-interned External node carrying the
+        // upstream path and stop (no submodule chain walk through them,
+        // since they don't have file_to_nodes payloads to look up
+        // against). Stdlib and genuinely-unresolved targets emit nothing.
+        let top_level = loading_target.split('.').next().unwrap_or(&loading_target);
         let Some(start_mn) = ModuleName::new(&loading_target) else {
-            self.emit_external(&loading_target, None);
             return;
         };
         let Some(start_module) = resolve_module(db, self.file, &start_mn) else {
-            self.emit_external(&loading_target, None);
+            return;
+        };
+        let Some(start_file) = start_module.file(db) else {
             return;
         };
         if start_module
             .search_path(db)
             .is_some_and(|sp| sp.is_standard_library())
         {
-            // Stdlib drops silently — matches today's behavior.
             return;
         }
-        let Some(start_file) = start_module.file(db) else {
-            self.emit_external(&loading_target, None);
-            return;
-        };
-        // Non-first-party (site-packages / external paths). Mint a
-        // synthetic External node keyed by PEP 503 canonical dist
-        // name via project_dist_lookup; falls back to
-        // `[external file] X` for orphan site-packages files.
+        // Non-first-party (site-packages / external paths). Mint an
+        // External node keyed by PEP 503 canonical dist name via
+        // project_dist_lookup; falls back to `[external file] X` for
+        // orphan site-packages files.
         if start_module
             .search_path(db)
             .is_some_and(|sp| !sp.is_first_party() && sp.is_site_packages())
         {
-            self.emit_external(&loading_target, Some(start_file));
+            let fqname = crate::file_payload::external_fqname_for(self.db, start_file, top_level);
+            self.emit_external_node(fqname, start_file);
             return;
         }
 

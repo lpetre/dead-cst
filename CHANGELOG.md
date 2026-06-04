@@ -100,7 +100,7 @@ two versions.
   - `constructions(&["flask"], &["Flask"])` / `calls(&["typer"],
     &["Typer"])` — file-local owners of matched constructor calls /
     call targets.
-  `FileOps` gained `keep_alive(local_idx, marker)` and
+  `FileOps` gained `keep_alive(local_idx)` and
   `add_edge(src_local, dst_local)` alongside `add_synthetic_node`, so
   the common "keep these decls alive" shape is one call. And
   `ExternalPlugin::prepare(project_root)` is now a real pre-graph hook
@@ -231,6 +231,29 @@ two versions.
 
 ### Changed
 
+- **Resolved site-packages imports are now real `kind="external"` graph
+  nodes.** A site-packages import (`[external dist] requests`) mints a real
+  external node carrying the resolved site-packages path, replacing the old
+  path-less synthetic sink. The real path lets the codemod exclude them by
+  the same `is_relative_to(package)` test it uses for everything else.
+  **Stdlib imports mint no node** — an unused `import os` is still caught
+  dead via its alias's zero in-edge count, so a stdlib endpoint would be
+  pure noise. An import that genuinely doesn't resolve also mints **no**
+  sink node — its local alias is flagged `NodeFlags.UNRESOLVED` instead. The
+  `[unresolved]` / unparseable synthetic-node prefix constants
+  (`UNRESOLVED_PREFIX`, `UNPARSEABLE_PREFIX`, `SYNTHETIC_PATH_PREFIXES`, and
+  the now-unused `STDLIB_PREFIX`) are dropped from `dead_cst.plugins`.
+- **`__init_subclass__` now emits direct `parent -> subclass` edges.** A base
+  class that defines `__init_subclass__` previously kept its subclasses alive
+  through a `<__init_subclass__>:Parent` synthetic anchor node; it now links
+  the parent straight to each subclass with an edge flagged
+  `EdgeFlags.INIT_SUBCLASS`, so `why-alive` chains read `Foo <- Parent`
+  without the intermediate hop.
+- **1:1 keep-alive plugins flag the target decl directly.** A plugin that
+  keeps a single decl alive (explicit entrypoints, discord.py apps) now sets
+  `NodeFlags.ENTRYPOINT` on that decl instead of minting a `{marker}:{fqname}`
+  synthetic seed plus an edge. The `PluginOps`/`FileOps` `keep_alive` op
+  dropped its `marker: String` parameter (`plugin_api` epoch 2 → 3).
 - **Graph node indices are now deterministic across runs.** ty's `files()`
   set has no stable iteration order, so the global index assigned to each node
   (and therefore the order of `Analysis.dead()` / `reachable()` results and the
@@ -426,7 +449,7 @@ two versions.
   are the `NativePlugin.<name>()` factories; author out-of-tree plugins as
   external native plugins (see `NATIVE_PLUGINS.md`). `Analysis(...,
   plugins=[…])` accepts only `dead_cst._native.NativePlugin` instances.
-  `dead_cst.plugins.__all__` is now just the synthetic-node prefix constants
+  `dead_cst.plugins.__all__` is now just the external-node prefix constants
   plus `simple_name`; `dead_cst.contrib.__all__` is empty. `CollectedOps` and
   `PreparedOp` are unaffected.
 

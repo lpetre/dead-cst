@@ -38,7 +38,7 @@ use crate::flag_registry::FlagRegistry;
 use crate::graph::{intern_kind, DeclIndex, NativeGraph, SymbolNode};
 use crate::helpers::{
     file_path_string, is_dunder_name, locate_class_seed, range_key, rel_path, resolve_base_spec,
-    CallArgs, MODULE_ALIAS_MARKER, NODE_FLAG_ENTRYPOINT,
+    CallArgs, MODULE_ALIAS_MARKER, NODE_FLAG_ENTRYPOINT, NODE_FLAG_UNRESOLVED,
 };
 use crate::ingest::emit_visitor_warning;
 use crate::progress::{
@@ -801,6 +801,19 @@ fn assemble_graph<'db>(
         ref_edge_payloads.push(file_to_ref_edges(db, file));
     }
 
+    // Stamp `NodeFlags::UNRESOLVED` on every import alias whose upstream
+    // module didn't resolve — the flag rides the alias node directly,
+    // in place of the old `[unresolved] X` synthetic sink. Pass 1 has
+    // fully populated `ref_to_global`, so every in-project alias
+    // resolves; a ref with no global node is skipped.
+    for payload in &edge_payloads {
+        for r in &payload.unresolved_aliases {
+            if let Some(&idx) = ref_to_global.get(r) {
+                builder.nodes[idx].flags |= NODE_FLAG_UNRESOLVED;
+            }
+        }
+    }
+
     if serial_pass2 {
         // Original serial path: lazy-mint Externals as encountered.
         for payload in &edge_payloads {
@@ -859,22 +872,23 @@ fn assemble_graph<'db>(
                 }
             }
         }
-        // Mint the synthetic External nodes in a deterministic order.
+        // Mint the External nodes in a deterministic order.
         // `external_keys` is an FxHashSet whose iteration order tracks
         // the salsa id layout and so varies run-to-run; minting in that
-        // order would hand the synthetics run-dependent graph indices.
-        // Sort by fqname — the dedup identity `intern_synthetic` keys on
-        // — so each External lands at the same index every run.
-        let mut externals: Vec<(String, NodeRef<'db>)> = external_keys
+        // order would hand the externals run-dependent graph indices.
+        // Sort by (fqname, path) — `intern_external` dedups on fqname, so
+        // the first path after the sort wins deterministically, and every
+        // External lands at the same index every run.
+        let mut externals: Vec<(String, String, NodeRef<'db>)> = external_keys
             .into_iter()
             .filter_map(|r| match r {
-                NodeRef::External(key) => Some((key.fqname(db).clone(), r)),
+                NodeRef::External(key) => Some((key.fqname(db).clone(), key.path(db).clone(), r)),
                 _ => None,
             })
             .collect();
-        externals.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        for (fqname, r) in externals {
-            let idx = builder.intern_synthetic(fqname);
+        externals.sort_unstable_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+        for (fqname, path, r) in externals {
+            let idx = builder.intern_external(fqname, path);
             ref_to_global.insert(r, idx);
         }
 
@@ -997,8 +1011,8 @@ fn assemble_graph<'db>(
 /// * [`FileLocalOp::Node`] → intern a synthetic node (dedup by
 ///   fqname) and wire its `edges_from`/`edges_to` with flags 0.
 /// * [`FileLocalOp::Edge`] → add the translated edge with its flags.
-/// * [`FileLocalOp::Entrypoint`] → mint the `{marker}:{decl_fqname}`
-///   synthetic with [`NODE_FLAG_ENTRYPOINT`] and edge it to the decl.
+/// * [`FileLocalOp::Entrypoint`] → OR [`NODE_FLAG_ENTRYPOINT`] onto the
+///   decl itself (reachability seeds off the flag, not a marker node).
 ///
 /// Endpoints are file-local indices into that file's `FileNodes.refs`;
 /// `local_to_global` maps them to global node indices (built in pass
@@ -1065,25 +1079,14 @@ fn fold_per_file_plugin_ops(
                             builder.add_edge(src_idx, dst_idx, *flags);
                         }
                     }
-                    FileLocalOp::Entrypoint {
-                        decl_local_idx,
-                        marker,
-                    } => {
+                    FileLocalOp::Entrypoint { decl_local_idx } => {
                         let Some(decl_idx) = to_global(*decl_local_idx) else {
                             continue;
                         };
-                        let (decl_fqname, decl_path) = {
-                            let node = &builder.nodes[decl_idx];
-                            (node.fqname.clone(), node.path.clone())
-                        };
-                        let marker_fqname = format!("{marker}:{decl_fqname}");
-                        let marker_idx = builder.intern_node(synthetic_node(
-                            marker_fqname,
-                            "synthetic",
-                            decl_path,
-                            NODE_FLAG_ENTRYPOINT,
-                        ));
-                        builder.add_edge(marker_idx, decl_idx, 0);
+                        // Flag the decl itself an entrypoint seed — no
+                        // synthetic marker node (reachability seeds off
+                        // the flag, not an edge from a marker).
+                        builder.nodes[decl_idx].flags |= NODE_FLAG_ENTRYPOINT;
                     }
                 }
             }

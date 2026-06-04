@@ -267,30 +267,24 @@ def test_node_indices_follow_sorted_file_order(project_factory):
     assert first_seen == sorted(first_seen)
 
 
-def test_external_synthetic_nodes_minted_in_fqname_order(project_factory):
-    """Synthetic external nodes (the `[unresolved] X` endpoints for
-    non-first-party imports) are minted in fqname order, so their graph
-    indices are deterministic. Assembly collects the external endpoints
-    into an FxHashSet whose iteration order tracks salsa ids and varies
-    run-to-run; it sorts by fqname before minting to pin the indices.
-    Without that sort these indices would follow hash order."""
-    # Import several unresolved top-level modules whose names are *not*
-    # in sorted order, so hash order and fqname order diverge.
+def test_external_nodes_minted_in_fqname_order(project_factory):
+    """Real external nodes (the `[external dist] X` endpoints for resolved
+    site-packages imports) are minted in fqname order, so their graph indices
+    are deterministic. Assembly collects the external endpoints into an
+    FxHashSet whose iteration order tracks salsa ids and varies run-to-run;
+    it sorts by fqname before minting to pin the indices. Without that sort
+    these indices would follow hash order."""
+    # Import several resolvable site-packages dists whose canonical names
+    # are *not* in import order, so hash order and fqname order diverge.
     proj, _ = project_factory(
         {
-            "mod.py": (
-                "import qux_zzz\n"
-                "import abc_aaa\n"
-                "import mno_mmm\n"
-                "import def_ddd\n"
-                "import ghi_ggg\n"
-                "import jkl_jjj\n"
-            ),
+            "mod.py": ("import typer\nimport flask\nimport click\nimport fastapi\n"),
         }
     )
     g = proj.build()
-    externals = [n.fqname for n in g.nodes if n.fqname.startswith("[unresolved] ")]
-    assert len(externals) == 6
+    externals = [n.fqname for n in g.nodes if n.fqname.startswith("[external dist] ")]
+    # All four dists resolved (no stdlib/unresolved leakage into this list).
+    assert len(externals) == 4
     # Listed in graph-index order, the external fqnames come out sorted —
     # i.e. they were minted in fqname order, which pins their indices.
     assert externals == sorted(externals)

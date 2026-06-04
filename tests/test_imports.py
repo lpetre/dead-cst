@@ -11,7 +11,7 @@ import logging
 import pytest
 
 from dead_cst.graph import NodeFlags
-from dead_cst.plugins._core import EXTERNAL_PREFIXES, STDLIB_PREFIX, UNRESOLVED_PREFIX
+from dead_cst.plugins._core import EXTERNAL_PREFIXES
 
 IMPORT_TEST_FILES = {
     "p/__init__.py": "",
@@ -1019,7 +1019,7 @@ def test_full_graph_positional_edges(
     assert_positional_edges(graph, expected_edges)
 
 
-def test_third_party_import_creates_synthetic_node(build_decl_graph):
+def test_third_party_import_creates_external_node(build_decl_graph):
     graph = build_decl_graph(
         {
             "p/__init__.py": "",
@@ -1029,12 +1029,14 @@ def test_third_party_import_creates_synthetic_node(build_decl_graph):
     rx_nodes = {
         n
         for n in graph.nodes()
-        if n.kind == "synthetic" and n.fqname.startswith(EXTERNAL_PREFIXES) and "click" in n.fqname
+        if n.kind == "external" and n.fqname.startswith(EXTERNAL_PREFIXES) and "click" in n.fqname
     }
     assert rx_nodes, (
-        "expected an external-dep synthetic node for click, got "
-        f"{[n.fqname for n in graph.nodes() if n.kind == 'synthetic']}"
+        "expected an external-dep node for click, got "
+        f"{[n.fqname for n in graph.nodes() if n.kind == 'external']}"
     )
+    # External nodes carry the resolved site-packages path, not an empty one.
+    assert all(n.path for n in rx_nodes)
 
     edge_srcs = {
         graph.nodes()[u].fqname for u, v, _ in graph.edges() if graph.nodes()[v] in rx_nodes
@@ -1056,12 +1058,17 @@ def test_third_party_import_uses_canonical_dist_name(build_decl_graph):
             "p/uses_yaml.py": "import yaml\nDATA = yaml.safe_load('a: 1')\n",
         }
     )
-    fqnames = {n.fqname for n in graph.nodes() if n.kind == "synthetic"}
+    fqnames = {n.fqname for n in graph.nodes() if n.kind == "external"}
     assert "[external dist] pyyaml" in fqnames, fqnames
 
 
 def test_stdlib_imports_are_silent(build_decl_graph, caplog):
-    """Stdlib imports drop without surfacing a synthetic node or a warning."""
+    """Stdlib imports mint no external sink node (and emit no warning).
+
+    Stdlib targets resolve cleanly but are deliberately not represented
+    in the graph: an unused ``import os`` is still detected dead via its
+    alias's zero in-edge count, so a stdlib endpoint would be pure noise.
+    Only site-packages imports become real ``external`` nodes."""
     with caplog.at_level(logging.WARNING, logger="dead_cst._edges"):
         graph = build_decl_graph(
             {
@@ -1076,16 +1083,13 @@ def test_stdlib_imports_are_silent(build_decl_graph, caplog):
         )
 
     assert [r.getMessage() for r in caplog.records] == []
-    synthetics = {n.fqname for n in graph.nodes() if n.kind == "synthetic"}
-    # No stdlib ever surfaces as a graph node, and ``collections.abc``
-    # must not fall through to ``[unresolved] collections`` (regression
-    # against the synthesized-submodule parent-fallback).
-    assert not [fq for fq in synthetics if fq.startswith(STDLIB_PREFIX)]
-    assert f"{UNRESOLVED_PREFIX}collections" not in synthetics
+    # No external node is minted for any stdlib module.
+    assert [n.fqname for n in graph.nodes() if n.kind == "external"] == []
 
 
-def test_unresolved_import_emits_synthetic_silently(build_decl_graph, caplog):
-    """A genuinely-missing top-level import gets a ``[unresolved]`` node, no warning."""
+def test_unresolved_import_flags_alias_silently(build_decl_graph, caplog):
+    """A genuinely-missing top-level import flags its local alias
+    ``NodeFlags.UNRESOLVED`` (no ``[unresolved]`` node, no warning)."""
     with caplog.at_level(logging.WARNING, logger="dead_cst._edges"):
         graph = build_decl_graph(
             {
@@ -1095,10 +1099,14 @@ def test_unresolved_import_emits_synthetic_silently(build_decl_graph, caplog):
         )
 
     assert [r.getMessage() for r in caplog.records] == []
-    assert any(
-        n.kind == "synthetic" and n.fqname == f"{UNRESOLVED_PREFIX}unknown_pkg_xyz"
-        for n in graph.nodes()
-    )
+    # No external/synthetic sink node was minted for the missing import.
+    assert not [n for n in graph.nodes() if "unknown_pkg_xyz" in n.fqname and n.kind != "import"]
+    # The local import alias is flagged UNRESOLVED.
+    aliases = [
+        n for n in graph.nodes() if n.kind == "import" and n.path.endswith("uses_missing.py")
+    ]
+    assert aliases
+    assert all(n.flags & NodeFlags.UNRESOLVED for n in aliases)
 
 
 def test_module_runtime_dunder_access_is_module_dep(build_decl_graph, assert_edges, caplog):

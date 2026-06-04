@@ -11,7 +11,10 @@ use std::process::Command;
 /// 1 → 2: added `ExternalPlugin::declare_node_flags` / `declare_edge_flags`,
 /// `PluginCtx::node_flag` / `edge_flag`, the re-exported `FlagSpec`, and
 /// narrowed edge `flags` from `u32` to `u8`.
-const PLUGIN_API_EPOCH: u32 = 2;
+/// 2 → 3: `PluginOps::keep_alive` / `FileOps::keep_alive` dropped their
+/// `marker: String` parameter (seeds flag the decl directly now), and added
+/// the re-exported `FLAG_INIT_SUBCLASS` edge-flag constant.
+const PLUGIN_API_EPOCH: u32 = 3;
 
 /// Compose the ABI fingerprint that gates external native-plugin loading.
 /// It changes whenever anything that could break the dylib ABI changes:

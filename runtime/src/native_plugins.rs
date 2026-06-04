@@ -250,10 +250,10 @@ pub(crate) enum FileLocalOp {
         dst_local_idx: u32,
         flags: u8,
     },
-    /// Keep a node in this file alive via a synthetic entrypoint marker
+    /// Keep a node in this file alive by flagging it an entrypoint seed
     /// (`PreparedOp::Entrypoint` shape). ``decl_local_idx`` is a file-local
     /// index.
-    Entrypoint { decl_local_idx: u32, marker: String },
+    Entrypoint { decl_local_idx: u32 },
 }
 
 /// Read-only, single-file view a [`plugin_api::PerFilePlugin`] is run
@@ -1253,6 +1253,12 @@ pub mod plugin_api {
     /// fan-out, the same bit the visitor stamps on dynamic-import edges.
     pub const FLAG_DYNAMIC_IMPORT: u8 = EdgeFlags::DYNAMIC_IMPORT;
 
+    /// `EdgeFlags::INIT_SUBCLASS` re-exported for the `flags` argument of
+    /// [`PluginOps::add_edge`] / [`FileOps::add_edge`]: mark a plugin-added
+    /// edge as a base-class → `__init_subclass__`-discovered subclass link,
+    /// the same bit the built-in init-subclass plugin stamps.
+    pub const FLAG_INIT_SUBCLASS: u8 = EdgeFlags::INIT_SUBCLASS;
+
     /// Epoch of this curated `plugin_api` surface — the author-facing contract
     /// version, baked into the [ABI fingerprint](super::PLUGIN_ABI_FINGERPRINT)
     /// (the `api<N>` segment). It is **bumped in `runtime/build.rs`** whenever
@@ -2002,10 +2008,10 @@ pub mod plugin_api {
             self.sink
         }
 
-        /// Keep `decl_idx` reachable via a synthetic entrypoint named
-        /// `marker`. Emits a [`PreparedOp::Entrypoint`].
-        pub fn keep_alive(&mut self, decl_idx: usize, marker: String) {
-            self.sink.push(PreparedOp::Entrypoint { decl_idx, marker });
+        /// Keep `decl_idx` reachable by flagging it an entrypoint seed.
+        /// Emits a [`PreparedOp::Entrypoint`].
+        pub fn keep_alive(&mut self, decl_idx: usize) {
+            self.sink.push(PreparedOp::Entrypoint { decl_idx });
         }
 
         /// Add a reachability edge `src_idx -> dst_idx` between two
@@ -2182,7 +2188,7 @@ pub mod plugin_api {
         // File-local matching that saves a per-file plugin from hand-rolling
         // the import / decorator / construction / call AST walk. Each returns
         // file-local indices (the index space [`FileOps`] emits against), so
-        // a plugin pipes the result straight into `ops.keep_alive(idx, ...)`
+        // a plugin pipes the result straight into `ops.keep_alive(idx)`
         // / `ops.add_edge(...)`. Same matcher cores the in-tree project-wide
         // queries use — a per-file plugin and its project-wide twin agree.
 
@@ -2255,14 +2261,11 @@ pub mod plugin_api {
         }
 
         /// Keep the node at file-local index `decl_local_idx` alive by
-        /// seeding it from a synthetic entrypoint tagged `marker`. The index
-        /// is a position in [`PluginFileCtx::nodes`]; an index with no node
-        /// is dropped at apply time.
-        pub fn keep_alive(&mut self, decl_local_idx: u32, marker: String) {
-            self.sink.push(FileLocalOp::Entrypoint {
-                decl_local_idx,
-                marker,
-            });
+        /// flagging it an entrypoint seed. The index is a position in
+        /// [`PluginFileCtx::nodes`]; an index with no node is dropped at
+        /// apply time.
+        pub fn keep_alive(&mut self, decl_local_idx: u32) {
+            self.sink.push(FileLocalOp::Entrypoint { decl_local_idx });
         }
 
         /// Add a reachability edge from `src_local_idx` to `dst_local_idx`,
@@ -2480,7 +2483,6 @@ pub(crate) fn load_native_plugins(path: String) -> PyResult<Vec<NativePlugin>> {
 // ---------------------------------------------------------------------------
 
 const MODULE_DUNDERS_PREFIX: &str = "<dunder>:";
-const INIT_SUBCLASS_PREFIX: &str = "<__init_subclass__>:";
 const SERVER_CONFIG_PREFIX: &str = "<server-config>:";
 const UNITTEST_PREFIX: &str = "<unittest>:";
 
@@ -2550,16 +2552,10 @@ impl plugin_api::ExternalPlugin for InitSubclassPluginImpl {
         ops: &mut plugin_api::PluginOps,
     ) -> Result<(), plugin_api::PluginError> {
         let parents = ctx.classes_defining_method("__init_subclass__");
-        let attrs = ctx.nodes_at(&parents);
-        for (parent_idx, attr) in parents.iter().zip(attrs.iter()) {
-            let subclass_idxs = ctx.find_subclasses_of(*parent_idx);
-            ops.add_synthetic_node(
-                format!("{INIT_SUBCLASS_PREFIX}{}", attr.fqname),
-                attr.path.clone(),
-                0,
-                subclass_idxs,
-                vec![*parent_idx],
-            );
+        for parent_idx in &parents {
+            for subclass_idx in ctx.find_subclasses_of(*parent_idx) {
+                ops.add_edge(*parent_idx, subclass_idx, plugin_api::FLAG_INIT_SUBCLASS);
+            }
         }
         Ok(())
     }
@@ -3416,7 +3412,6 @@ impl plugin_api::ExternalPlugin for MockPatchPluginImpl {
 
 const DISCORDPY_COG_PREFIX: &str = "<discordpy-cog>:";
 const DISCORDPY_EXTENSION_PREFIX: &str = "<discordpy-extension>:";
-const DISCORDPY_APP_MARKER: &str = "<discordpy-app>";
 const DISCORD_PROBE_MODULES: [&str; 3] = ["discord", "discord.ext", "discord.ext.commands"];
 const DISCORD_COMMANDS_BOT_KINDS: [&str; 2] = ["Bot", "AutoShardedBot"];
 const DISCORD_CLIENT_KINDS: [&str; 2] = ["Client", "AutoShardedClient"];
@@ -3551,7 +3546,7 @@ impl plugin_api::ExternalPlugin for DiscordPyPluginImpl {
                 .entry(nv.path.clone())
                 .or_default()
                 .insert(simple_name(&nv.fqname).to_string(), nv.idx);
-            ops.keep_alive(nv.idx, DISCORDPY_APP_MARKER.to_string());
+            ops.keep_alive(nv.idx);
         }
 
         // Wire single-attr + two-level handler decorators to their bot.
@@ -3930,8 +3925,6 @@ impl plugin_api::ExternalPlugin for DynamicImportFallbackPluginImpl {
 // `find_nodes_matching_specs_indices` (already GIL-free).
 // ---------------------------------------------------------------------------
 
-const EXPLICIT_ENTRYPOINT_MARKER: &str = "<entrypoint>";
-
 pub(crate) struct ExplicitEntrypointPluginImpl {
     regexes: Vec<String>,
     str_specs: Vec<String>,
@@ -3953,7 +3946,7 @@ impl plugin_api::ExternalPlugin for ExplicitEntrypointPluginImpl {
         }
         let idxs = ctx.nodes_matching_specs(&self.regexes, &self.str_specs, &self.abs_paths);
         for idx in idxs {
-            ops.keep_alive(idx, EXPLICIT_ENTRYPOINT_MARKER.to_string());
+            ops.keep_alive(idx);
         }
         Ok(())
     }

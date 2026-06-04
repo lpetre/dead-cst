@@ -87,9 +87,9 @@ impl ExternalPlugin for KeepMainBlocksAlive {
         // `ctx` is a restricted, mostly-stable view of the frozen graph.
         for (module_idx, decl_indices) in ctx.main_blocks() {
             // Emit ops the host folds in after every plugin has run.
-            ops.keep_alive(module_idx, "<__main__>".to_string());
+            ops.keep_alive(module_idx);
             for decl_idx in decl_indices {
-                ops.keep_alive(decl_idx, "<__main__>".to_string());
+                ops.keep_alive(decl_idx);
             }
         }
         Ok(())
@@ -181,8 +181,8 @@ read a keyword via `CallArgs::str_value(name)`.
 
 | method | host op | what |
 |---|---|---|
-| `keep_alive(decl_idx, marker)` | `PreparedOp::Entrypoint` | make a node a reachability seed |
-| `add_edge(src_idx, dst_idx, flags)` | `PreparedOp::Edge` | add `src -> dst` between existing nodes; `flags` is `0` or one of `plugin_api::FLAG_DEAD_BRANCH` / `FLAG_DYNAMIC_IMPORT` |
+| `keep_alive(decl_idx)` | `PreparedOp::Entrypoint` | flag a node `ENTRYPOINT` so it seeds reachability directly |
+| `add_edge(src_idx, dst_idx, flags)` | `PreparedOp::Edge` | add `src -> dst` between existing nodes; `flags` is `0` or one of `plugin_api::FLAG_DEAD_BRANCH` / `FLAG_DYNAMIC_IMPORT` / `FLAG_INIT_SUBCLASS` |
 | `add_synthetic_node(fqname, flags, edges_to_idx, edges_from_idx)` | `PreparedOp::Node` | mint a `synthetic` node with out-edges (`edges_to_idx`) and in-edges (`edges_from_idx`); set `flags = plugin_api::FLAG_ENTRYPOINT` to make it a seed |
 
 Endpoint indices are bounds-checked by the host at apply time — a dangling

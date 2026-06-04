@@ -104,6 +104,7 @@ const VALID_KINDS: &[&str] = &[
     "type_alias",
     "module",
     "synthetic",
+    "external",
 ];
 
 pub(crate) fn intern_kind(kind: &str) -> PyResult<&'static str> {
@@ -268,6 +269,13 @@ pub(crate) struct NodeFlags;
 impl NodeFlags {
     #[classattr]
     pub(crate) const NONE: u32 = 0;
+    /// Import alias whose upstream module ty could not resolve (a bad
+    /// relative-import name, a module that doesn't resolve at all, or a
+    /// resolved module with no backing file). Set on the alias node
+    /// itself in place of the old `[unresolved] X` synthetic sink.
+    /// Metadata only (not a seed); registered `engine/unresolved`.
+    #[classattr]
+    pub(crate) const UNRESOLVED: u32 = 1;
     /// Explicit entrypoint — plugin-emitted seeds, the CLI's `-e` flag,
     /// `[project.scripts]` targets, factory-app synthetics, etc. A `seed`
     /// flag (registered `engine/entrypoint`), so reachability seeds from
@@ -307,6 +315,13 @@ impl NodeFlags {
 /// still constant-fold. Single source of truth for the engine roster — the
 /// distinct-bits test iterates it.
 pub(crate) const BUILTIN_NODE_FLAGS: &[(u64, &str, bool, bool, &str)] = &[
+    (
+        NodeFlags::UNRESOLVED as u64,
+        "engine/unresolved",
+        false,
+        false,
+        "Import alias whose upstream module did not resolve.",
+    ),
     (
         NodeFlags::ENTRYPOINT as u64,
         "engine/entrypoint",
@@ -367,6 +382,13 @@ impl EdgeFlags {
     /// fan out / specialize.
     #[classattr]
     pub(crate) const DYNAMIC_IMPORT: u8 = 2;
+    /// Edge from a base class to a subclass discovered via the
+    /// `__init_subclass__` / `__subclasshook__` plugin. Replaces the old
+    /// `<__init_subclass__>:Parent` anchor synthetic — reachability flows
+    /// `parent → subclass` directly so a live base keeps its subclasses
+    /// alive.
+    #[classattr]
+    pub(crate) const INIT_SUBCLASS: u8 = 4;
 }
 
 /// Engine edge flags, seeded into the edge `FlagRegistry` before any plugin
@@ -387,6 +409,13 @@ pub(crate) const BUILTIN_EDGE_FLAGS: &[(u64, &str, bool, bool, &str)] = &[
         false,
         "Edge from a runtime-import call.",
     ),
+    (
+        EdgeFlags::INIT_SUBCLASS as u64,
+        "engine/init_subclass",
+        false,
+        false,
+        "Edge from a base class to an __init_subclass__-discovered subclass.",
+    ),
 ];
 
 #[cfg(test)]
@@ -403,6 +432,7 @@ mod tests {
             "type_alias",
             "module",
             "synthetic",
+            "external",
         ] {
             let interned = intern_kind(kind).expect("known kinds must intern");
             // The returned string is the static slice — pointer-equal to
