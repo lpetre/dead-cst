@@ -222,14 +222,18 @@ transitively through salsa's read-tracking. The assemble pass and
 plugin pass run on every call, but they're cheap O(N) walks over the
 warm cache.
 
-Entrypoint detection is fully plugin-driven. Builtins:
+Module-level dunders (`__all__`, `__version__`, PEP 562
+`__getattr__`/`__dir__`, …) and `__future__` imports are kept alive by the
+engine itself — no plugin required — for as long as their module is
+reachable. An unreachable module's dunders die with it.
+
+Beyond that, entrypoint detection is fully plugin-driven. Builtins:
 
 | Plugin | Purpose |
 |---|---|
 | `NativePlugin.main_block()` | Mark modules containing `if __name__ == "__main__":` as entrypoints (always on) |
 | `NativePlugin.project_scripts()` | Read `pyproject.toml [project.scripts]` and mark each target as an entrypoint |
 | `NativePlugin.explicit()` | Match user-supplied file paths / FQNs / regexes (powers `-e` and `--entrypoint-regex`) |
-| `NativePlugin.module_dunders()` | Keep top-level dunder variables (`__all__`, `__version__`, etc.) alive (always on) |
 | `NativePlugin.pytest()` | Keep pytest-discovered tests, `conftest.py` decls, and `@pytest.fixture` functions alive (`--plugin pytest`) |
 | `NativePlugin.unittest()` | Keep stdlib `unittest.TestCase` / `IsolatedAsyncioTestCase` subclasses and `setUpModule` / `tearDownModule` / `load_tests` hooks alive. Transitive: a class extending a project-local `TestCase` mixin or a re-exported `TestCase` is detected (`--plugin unittest`) |
 | `NativePlugin.mock_patch()` | Resolve string-fqname patch targets so symbols whose only consumers are tests stay alive. Recognizes `unittest.mock.patch` / `mock.patch` (decorator and context-manager forms, plus aliased imports), pytest-mock's `mocker.patch`, and pytest's `monkeypatch.setattr("X.Y", v)` / `monkeypatch.delattr("X.Y")` (`--plugin mock_patch`) |

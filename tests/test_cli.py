@@ -40,7 +40,7 @@ def _plugin_name(p) -> str:
     """Display name for a plugin — its native ``.name`` getter.
 
     Every built-in is a ``NativePlugin`` (``main_block``,
-    ``module_dunders``, …) whose ``.name`` mirrors the conventional
+    ``init_subclass``, …) whose ``.name`` mirrors the conventional
     class name ("MainBlockPlugin").
     """
     return p.name
@@ -115,14 +115,14 @@ def test_parse_meta_empty_key_raises():
         parse_meta("=v")
 
 
-def test_build_plugins_default_only_includes_module_dunders():
+def test_build_plugins_default_is_empty():
     plugins = build_plugins(entrypoints=[], entrypoint_regexes=[], plugin_names=[])
-    assert [_plugin_name(p) for p in plugins] == ["ModuleDundersPlugin"]
+    assert plugins == []
 
 
-def test_build_plugins_named_plugins_run_before_module_dunders():
+def test_build_plugins_preserves_named_plugin_order():
     plugins = build_plugins(entrypoints=[], entrypoint_regexes=[], plugin_names=["main_block"])
-    assert [_plugin_name(p) for p in plugins] == ["MainBlockPlugin", "ModuleDundersPlugin"]
+    assert [_plugin_name(p) for p in plugins] == ["MainBlockPlugin"]
 
 
 def test_build_plugins_appends_explicit_last():
@@ -133,7 +133,6 @@ def test_build_plugins_appends_explicit_last():
     )
     assert [_plugin_name(p) for p in plugins] == [
         "MainBlockPlugin",
-        "ModuleDundersPlugin",
         "ExplicitEntrypointPlugin",
     ]
     explicit = plugins[-1]

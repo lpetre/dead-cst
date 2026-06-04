@@ -4,8 +4,8 @@ flux0 is a uv-workspace FastAPI app with several first-party packages
 under ``packages/*/src/``. We point dead-cst at the ``flux0_server``
 package -- it has a real ``if __name__ == "__main__":`` block calling
 ``main()``, which gives us a stable level-1 anchor without needing the
-workspace's venv (cross-package imports degrade to ``[unresolved]``
-synthetic nodes, which is fine for these checks).
+workspace's venv (cross-package imports that don't resolve just flag
+their local alias ``NodeFlags.UNRESOLVED``, which is fine for these checks).
 
 Levels:
 - **0**: ``analyze`` runs to completion without raising; exit code is

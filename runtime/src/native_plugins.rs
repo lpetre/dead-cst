@@ -58,8 +58,8 @@ use crate::file_payload::{file_to_nodes, NodeData, NodeKind};
 use crate::flag_registry::FlagRegistry;
 use crate::graph::{EdgeFlags, NodeFlags};
 use crate::helpers::{
-    collect_modules_imports_local, decorators_match_imports, is_dunder_name,
-    matched_call_target_any, top_level_assign_to_name, ArgValue, CallArgs, FactoryCallFinder,
+    collect_modules_imports_local, decorators_match_imports, matched_call_target_any,
+    top_level_assign_to_name, ArgValue, CallArgs, FactoryCallFinder,
 };
 use crate::ingest::file_package_name;
 use crate::project::FrozenView;
@@ -250,10 +250,10 @@ pub(crate) enum FileLocalOp {
         dst_local_idx: u32,
         flags: u8,
     },
-    /// Keep a node in this file alive via a synthetic entrypoint marker
+    /// Keep a node in this file alive by flagging it an entrypoint seed
     /// (`PreparedOp::Entrypoint` shape). ``decl_local_idx`` is a file-local
     /// index.
-    Entrypoint { decl_local_idx: u32, marker: String },
+    Entrypoint { decl_local_idx: u32 },
 }
 
 /// Read-only, single-file view a [`plugin_api::PerFilePlugin`] is run
@@ -517,7 +517,6 @@ impl<'db> FileContext<'db> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum PerFilePluginKind {
     MainBlock,
-    ModuleDunders,
 }
 
 impl PerFilePluginKind {
@@ -525,7 +524,6 @@ impl PerFilePluginKind {
     fn name(self) -> &'static str {
         match self {
             PerFilePluginKind::MainBlock => "MainBlockPlugin",
-            PerFilePluginKind::ModuleDunders => "ModuleDundersPlugin",
         }
     }
 
@@ -535,7 +533,6 @@ impl PerFilePluginKind {
     fn plugin(self) -> &'static dyn plugin_api::PerFilePlugin {
         match self {
             PerFilePluginKind::MainBlock => &MainBlockPluginImpl,
-            PerFilePluginKind::ModuleDunders => &ModuleDundersPluginImpl,
         }
     }
 }
@@ -831,18 +828,6 @@ impl NativePlugin {
         }
     }
 
-    /// Native `ModuleDundersPlugin` — pin module-level dunder names and
-    /// `__future__` imports as entrypoints. Per-file (salsa-cached): a file's
-    /// dunders + `__future__` imports are entirely local to it.
-    #[staticmethod]
-    fn module_dunders() -> Self {
-        Self {
-            kind: NativePluginKind::PerFile(PerFilePluginId::Builtin(
-                PerFilePluginKind::ModuleDunders,
-            )),
-        }
-    }
-
     /// Native `InitSubclassPlugin` — keep transitive subclasses of
     /// `__init_subclass__`-defining classes alive via a marker node.
     #[staticmethod]
@@ -1101,7 +1086,6 @@ impl NativePlugin {
 pub(crate) fn _builtin_native_plugin(name: &str) -> Option<NativePlugin> {
     Some(match name {
         "main_block" => NativePlugin::main_block(),
-        "module_dunders" => NativePlugin::module_dunders(),
         "init_subclass" => NativePlugin::init_subclass(),
         "server_config" => NativePlugin::server_config(None),
         "unittest" => NativePlugin::unittest(),
@@ -1252,6 +1236,12 @@ pub mod plugin_api {
     /// edge as a runtime-import (`__import__` / `importlib.import_module`)
     /// fan-out, the same bit the visitor stamps on dynamic-import edges.
     pub const FLAG_DYNAMIC_IMPORT: u8 = EdgeFlags::DYNAMIC_IMPORT;
+
+    /// `EdgeFlags::INIT_SUBCLASS` re-exported for the `flags` argument of
+    /// [`PluginOps::add_edge`] / [`FileOps::add_edge`]: mark a plugin-added
+    /// edge as a base-class → `__init_subclass__`-discovered subclass link,
+    /// the same bit the built-in init-subclass plugin stamps.
+    pub const FLAG_INIT_SUBCLASS: u8 = EdgeFlags::INIT_SUBCLASS;
 
     /// Epoch of this curated `plugin_api` surface — the author-facing contract
     /// version, baked into the [ABI fingerprint](super::PLUGIN_ABI_FINGERPRINT)
@@ -2002,10 +1992,10 @@ pub mod plugin_api {
             self.sink
         }
 
-        /// Keep `decl_idx` reachable via a synthetic entrypoint named
-        /// `marker`. Emits a [`PreparedOp::Entrypoint`].
-        pub fn keep_alive(&mut self, decl_idx: usize, marker: String) {
-            self.sink.push(PreparedOp::Entrypoint { decl_idx, marker });
+        /// Keep `decl_idx` reachable by flagging it an entrypoint seed.
+        /// Emits a [`PreparedOp::Entrypoint`].
+        pub fn keep_alive(&mut self, decl_idx: usize) {
+            self.sink.push(PreparedOp::Entrypoint { decl_idx });
         }
 
         /// Add a reachability edge `src_idx -> dst_idx` between two
@@ -2182,7 +2172,7 @@ pub mod plugin_api {
         // File-local matching that saves a per-file plugin from hand-rolling
         // the import / decorator / construction / call AST walk. Each returns
         // file-local indices (the index space [`FileOps`] emits against), so
-        // a plugin pipes the result straight into `ops.keep_alive(idx, ...)`
+        // a plugin pipes the result straight into `ops.keep_alive(idx)`
         // / `ops.add_edge(...)`. Same matcher cores the in-tree project-wide
         // queries use — a per-file plugin and its project-wide twin agree.
 
@@ -2255,14 +2245,11 @@ pub mod plugin_api {
         }
 
         /// Keep the node at file-local index `decl_local_idx` alive by
-        /// seeding it from a synthetic entrypoint tagged `marker`. The index
-        /// is a position in [`PluginFileCtx::nodes`]; an index with no node
-        /// is dropped at apply time.
-        pub fn keep_alive(&mut self, decl_local_idx: u32, marker: String) {
-            self.sink.push(FileLocalOp::Entrypoint {
-                decl_local_idx,
-                marker,
-            });
+        /// flagging it an entrypoint seed. The index is a position in
+        /// [`PluginFileCtx::nodes`]; an index with no node is dropped at
+        /// apply time.
+        pub fn keep_alive(&mut self, decl_local_idx: u32) {
+            self.sink.push(FileLocalOp::Entrypoint { decl_local_idx });
         }
 
         /// Add a reachability edge from `src_local_idx` to `dst_local_idx`,
@@ -2472,15 +2459,12 @@ pub(crate) fn load_native_plugins(path: String) -> PyResult<Vec<NativePlugin>> {
 }
 
 // ---------------------------------------------------------------------------
-// Native plugins ported from Python. `module_dunders` is *per-file* (its
-// output for a file is a pure function of that file → salsa-cached);
-// `init_subclass` is project-wide (subclasses live in other files, so its
-// output isn't file-local). The project-wide `py`-taking ctx accessors are
-// reached via `Python::with_gil` (the harness already holds the GIL).
+// Native plugins ported from Python. `init_subclass` is project-wide
+// (subclasses live in other files, so its output isn't file-local). The
+// project-wide `py`-taking ctx accessors are reached via `Python::with_gil`
+// (the harness already holds the GIL).
 // ---------------------------------------------------------------------------
 
-const MODULE_DUNDERS_PREFIX: &str = "<dunder>:";
-const INIT_SUBCLASS_PREFIX: &str = "<__init_subclass__>:";
 const SERVER_CONFIG_PREFIX: &str = "<server-config>:";
 const UNITTEST_PREFIX: &str = "<unittest>:";
 
@@ -2502,38 +2486,6 @@ const UNITTEST_MODULE_HOOKS: [&str; 3] = ["setUpModule", "tearDownModule", "load
 /// `dead_cst.contrib.unittest._UNITTEST_BASE_FQNAMES`).
 const UNITTEST_BASE_FQNAMES: [&str; 2] = ["unittest.TestCase", "unittest.IsolatedAsyncioTestCase"];
 
-/// Per-file port of `dead_cst.plugins.module_dunders.ModuleDundersPlugin`:
-/// pin a file's module-level dunders (variables + PEP 562 functions) and its
-/// `__future__` imports as entrypoints. All file-local — one synthetic
-/// entrypoint node per file with edges to those decls.
-pub(crate) struct ModuleDundersPluginImpl;
-
-impl plugin_api::PerFilePlugin for ModuleDundersPluginImpl {
-    fn run_on_file(&self, file: &plugin_api::PluginFileCtx<'_>, ops: &mut plugin_api::FileOps) {
-        let mut targets: Vec<u32> = Vec::new();
-        for node in file.nodes() {
-            let is_dunder_decl = matches!(node.kind.as_str(), "variable" | "function")
-                && is_dunder_name(&node.fqname);
-            let is_future = node
-                .imports
-                .as_ref()
-                .is_some_and(|imp| imp.module == "__future__");
-            if is_dunder_decl || is_future {
-                targets.push(node.local_idx);
-            }
-        }
-        if targets.is_empty() {
-            return;
-        }
-        ops.add_synthetic_node(
-            format!("{MODULE_DUNDERS_PREFIX}{}", file.module_fqname()),
-            NodeFlags::ENTRYPOINT,
-            targets,
-            Vec::new(),
-        );
-    }
-}
-
 /// Port of `dead_cst.plugins.init_subclass.InitSubclassPlugin`: for each
 /// class defining `__init_subclass__`, emit a marker node reachable from the
 /// parent that keeps every transitive subclass alive.
@@ -2550,16 +2502,10 @@ impl plugin_api::ExternalPlugin for InitSubclassPluginImpl {
         ops: &mut plugin_api::PluginOps,
     ) -> Result<(), plugin_api::PluginError> {
         let parents = ctx.classes_defining_method("__init_subclass__");
-        let attrs = ctx.nodes_at(&parents);
-        for (parent_idx, attr) in parents.iter().zip(attrs.iter()) {
-            let subclass_idxs = ctx.find_subclasses_of(*parent_idx);
-            ops.add_synthetic_node(
-                format!("{INIT_SUBCLASS_PREFIX}{}", attr.fqname),
-                attr.path.clone(),
-                0,
-                subclass_idxs,
-                vec![*parent_idx],
-            );
+        for parent_idx in &parents {
+            for subclass_idx in ctx.find_subclasses_of(*parent_idx) {
+                ops.add_edge(*parent_idx, subclass_idx, plugin_api::FLAG_INIT_SUBCLASS);
+            }
         }
         Ok(())
     }
@@ -2927,7 +2873,6 @@ impl plugin_api::ExternalPlugin for DispatchAppPluginImpl {
         // gathering happened above; bulk-fetch the node attrs the emission
         // loops need (parallel to their index vecs), then emit through `ops`.
         let app_prefix = format!("<{}-app>:", cfg.marker_prefix);
-        let factory_prefix = format!("<{}-factory>:", cfg.marker_prefix);
 
         // vars_by_file: (path, simple var name) -> first var idx wins.
         let mut vars_by_file: FxHashMap<(String, String), usize> = FxHashMap::default();
@@ -2958,20 +2903,6 @@ impl plugin_api::ExternalPlugin for DispatchAppPluginImpl {
                     Vec::new(),
                 );
             }
-        }
-
-        // Step 4: factory markers so step 6's reachability walk can find
-        // them. `factory_decls` is empty unless seed_as_entrypoint.
-        let factory_idxs: Vec<usize> = factory_decls.iter().map(|(i, _)| *i).collect();
-        let factory_attrs = ctx.nodes_at(&factory_idxs);
-        for ((decl_idx, kind), node) in factory_decls.iter().zip(factory_attrs.iter()) {
-            ops.add_synthetic_node(
-                format!("{factory_prefix}{kind}:{}", node.fqname),
-                node.path.clone(),
-                0,
-                Vec::new(),
-                vec![*decl_idx],
-            );
         }
 
         // Step 5: wire handler decorators to their owner var. Seed mode
@@ -3416,7 +3347,6 @@ impl plugin_api::ExternalPlugin for MockPatchPluginImpl {
 
 const DISCORDPY_COG_PREFIX: &str = "<discordpy-cog>:";
 const DISCORDPY_EXTENSION_PREFIX: &str = "<discordpy-extension>:";
-const DISCORDPY_APP_MARKER: &str = "<discordpy-app>";
 const DISCORD_PROBE_MODULES: [&str; 3] = ["discord", "discord.ext", "discord.ext.commands"];
 const DISCORD_COMMANDS_BOT_KINDS: [&str; 2] = ["Bot", "AutoShardedBot"];
 const DISCORD_CLIENT_KINDS: [&str; 2] = ["Client", "AutoShardedClient"];
@@ -3551,7 +3481,7 @@ impl plugin_api::ExternalPlugin for DiscordPyPluginImpl {
                 .entry(nv.path.clone())
                 .or_default()
                 .insert(simple_name(&nv.fqname).to_string(), nv.idx);
-            ops.keep_alive(nv.idx, DISCORDPY_APP_MARKER.to_string());
+            ops.keep_alive(nv.idx);
         }
 
         // Wire single-attr + two-level handler decorators to their bot.
@@ -3930,8 +3860,6 @@ impl plugin_api::ExternalPlugin for DynamicImportFallbackPluginImpl {
 // `find_nodes_matching_specs_indices` (already GIL-free).
 // ---------------------------------------------------------------------------
 
-const EXPLICIT_ENTRYPOINT_MARKER: &str = "<entrypoint>";
-
 pub(crate) struct ExplicitEntrypointPluginImpl {
     regexes: Vec<String>,
     str_specs: Vec<String>,
@@ -3953,7 +3881,7 @@ impl plugin_api::ExternalPlugin for ExplicitEntrypointPluginImpl {
         }
         let idxs = ctx.nodes_matching_specs(&self.regexes, &self.str_specs, &self.abs_paths);
         for idx in idxs {
-            ops.keep_alive(idx, EXPLICIT_ENTRYPOINT_MARKER.to_string());
+            ops.keep_alive(idx);
         }
         Ok(())
     }

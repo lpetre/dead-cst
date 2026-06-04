@@ -235,6 +235,24 @@ impl GraphBuilder {
         idx
     }
 
+    /// Get (or mint) the deduplicated `kind="external"` node for a
+    /// site-packages import target — ``[external dist] X`` /
+    /// ``[external file] X``. Unlike [`intern_synthetic`] these carry
+    /// the resolved target's site-packages `path` so callers can
+    /// exclude them by path.
+    /// Deduped by fqname project-wide (shares the synthetic dedup map —
+    /// the fqname namespaces are disjoint); the first `path` seen for a
+    /// given fqname wins, so several submodules of one dist collapse to
+    /// a single node.
+    pub(crate) fn intern_external(&mut self, fqname: String, path: String) -> usize {
+        if let Some(&idx) = self.synthetic_nodes.get(&fqname) {
+            return idx;
+        }
+        let idx = self.intern_node(synthetic_node(fqname.clone(), "external", path, 0));
+        self.synthetic_nodes.insert(fqname, idx);
+        idx
+    }
+
     pub(crate) fn add_edge(&mut self, src: usize, dst: usize, flags: u8) {
         let triple = (src, dst, flags);
         if self.edge_set.insert(triple) {
@@ -369,7 +387,6 @@ pub(crate) enum PreparedOp {
     },
     Entrypoint {
         decl_idx: usize,
-        marker: String,
     },
     Node {
         fqname: String,
@@ -437,23 +454,13 @@ fn apply_prepared(
             outputs.builder.add_edge(src_idx, dst_idx, flags);
             Ok(())
         }
-        PreparedOp::Entrypoint { decl_idx, marker } => {
+        PreparedOp::Entrypoint { decl_idx } => {
             let len = outputs.builder.nodes.len();
             check_idx_in_range(len, decl_idx, "PreparedOp::Entrypoint", "decl_idx")?;
-            // Read fqname / path off the existing node to build the
-            // ``marker:fqname`` synthetic entrypoint.
-            let (decl_fqname, decl_path) = {
-                let node = &outputs.builder.nodes[decl_idx];
-                (node.fqname.clone(), node.path.clone())
-            };
-            let marker_fqname = format!("{marker}:{decl_fqname}");
-            let marker_idx = outputs.builder.intern_node(synthetic_node(
-                marker_fqname,
-                "synthetic",
-                decl_path,
-                NODE_FLAG_ENTRYPOINT,
-            ));
-            outputs.builder.add_edge(marker_idx, decl_idx, 0);
+            // Flag the decl itself an entrypoint seed — no synthetic
+            // marker node, since reachability seeds off the flag, not
+            // an edge from a marker.
+            outputs.builder.nodes[decl_idx].flags |= NODE_FLAG_ENTRYPOINT;
             Ok(())
         }
         PreparedOp::Node {

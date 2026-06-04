@@ -72,7 +72,6 @@ class ProgressSnapshot(TypedDict):
     plugin_states: list[tuple[str, int, int]]
 
 
-_NON_DECL_TYPES: frozenset[str] = frozenset({"module", "synthetic"})
 _DECL_KINDS: tuple[str, ...] = ("function", "class", "variable", "import", "type_alias")
 
 
@@ -81,9 +80,10 @@ def _iter_dead_indices(
     reachable: set[int],
 ) -> Iterator[int]:
     """Yield positional indices of every decl-kind node not in
-    ``reachable``. ``module`` / ``synthetic`` nodes are filtered out
-    via the kind whitelist (synthetic markers, anchor modules — they
-    aren't "dead" in any meaningful sense).
+    ``reachable``. ``module`` / ``synthetic`` / ``external`` nodes are
+    filtered out via the kind whitelist (synthetic markers, anchor
+    modules, external dependencies — none are "dead" in any meaningful
+    sense).
     """
     for kind in _DECL_KINDS:
         for idx in ctx.indices_where(kind=kind):
@@ -555,7 +555,7 @@ class Analysis:
         # project root becomes a safe fallback for single-package
         # setups whose editable install uses a PEP 660 ``MetaPathFinder``
         # (no flat ``.pth``) — the case that #222 reproduced as
-        # ``[unresolved]`` synthetics.
+        # first-party imports that failed to resolve.
         venv_str = str(self._venv) if self._venv is not None else None
         ctx = _native.ProjectContext(
             str(self._project_root),

@@ -186,7 +186,7 @@ def test_progress_callback_with_concurrent_plugins(tmp_path: Path) -> None:
         tmp_path,
         plugins=[
             native.NativePlugin.main_block(),
-            native.NativePlugin.module_dunders(),
+            native.NativePlugin.server_config(),
         ],
         progress_callback=cb,
     )
@@ -199,7 +199,7 @@ def test_progress_callback_with_concurrent_plugins(tmp_path: Path) -> None:
     names = [k["name"] for k in plugin_starts]
     # The two plugin names should both have surfaced.
     assert "MainBlockPlugin" in names
-    assert "ModuleDundersPlugin" in names
+    assert "ServerConfigPlugin" in names
     # With per-plugin counter slabs, each ``plugin_end`` carries the
     # plugin's actual name (not the registration-order approximation
     # the old global-counter path used) and a real elapsed_ms.

@@ -61,8 +61,8 @@ use crate::ingest::{decl_kind_str, file_package_name, from_module_string};
 /// `NodeRef::Module` covers the synthetic `kind="module"` node per
 /// file — `File` is itself a salsa input ingredient, so its handle is
 /// stable and `Hash + Eq + Copy`.
-/// `NodeRef::External` covers the synthetic `[external] X` /
-/// `[stdlib] X` / `[unresolved] X` nodes via a globally-interned
+/// `NodeRef::External` covers the synthetic `[external dist] X` /
+/// `[external file] X` site-packages nodes via a globally-interned
 /// `ExternalKey` — same fqname produces the same key, dedup is free.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, salsa::Update, get_size2::GetSize)]
 pub(crate) enum NodeRef<'db> {
@@ -100,19 +100,25 @@ pub(crate) fn def_key<'db>(
 /// → same key → same final graph node, regardless of which file
 /// emitted the edge.
 ///
-/// Today's fqname conventions (simplified — full dist classification
-/// is a separate follow-up):
+/// Only site-packages targets mint an `ExternalKey`; the fqname
+/// conventions:
 ///
-/// * `[stdlib] X` — module X resolves to ty's standard library
-///   search path.
-/// * `[external] X` — module X resolves to a non-stdlib non-first-
-///   party search path (site-packages). `X` is the *top-level*
-///   module name; canonicalising to a PEP 503 dist name needs a
-///   project-wide dist_lookup which lands later.
-/// * `[unresolved] X` — module X doesn't resolve at all.
+/// * `[external dist] X` — module resolves to a site-packages dist;
+///   `X` is the PEP 503 canonical dist name (via `external_fqname_for`).
+/// * `[external file] X` — a site-packages file with no owning dist;
+///   `X` is the top-level module name.
+///
+/// `path` is the resolved target file's site-packages path so the
+/// assembled `kind="external"` node can be excluded by path (codemod,
+/// scoping). Several keys may share an fqname with different paths —
+/// e.g. two submodules of one dist; assembly dedups by fqname and keeps
+/// the first path. Stdlib targets and genuinely-unresolved imports mint
+/// no `ExternalKey`: stdlib stays silent, and an unresolved import's
+/// alias node carries `NodeFlags::UNRESOLVED`.
 #[salsa::interned(debug)]
 pub(crate) struct ExternalKey<'db> {
     pub(crate) fqname: String,
+    pub(crate) path: String,
 }
 
 // Salsa tracks the interned heap separately; report 0 from GetSize.
@@ -199,6 +205,7 @@ pub(crate) enum NodeKind {
     TypeAlias = 4,
     Module = 5,
     Synthetic = 6,
+    External = 7,
 }
 
 impl NodeKind {
@@ -214,6 +221,7 @@ impl NodeKind {
             NodeKind::TypeAlias => "type_alias",
             NodeKind::Module => "module",
             NodeKind::Synthetic => "synthetic",
+            NodeKind::External => "external",
         }
     }
 
@@ -226,6 +234,7 @@ impl NodeKind {
             "type_alias" => NodeKind::TypeAlias,
             "module" => NodeKind::Module,
             "synthetic" => NodeKind::Synthetic,
+            "external" => NodeKind::External,
             _ => return None,
         })
     }
@@ -364,8 +373,8 @@ pub(crate) fn ref_to_node<'db>(db: &'db dyn ProjectDb, r: NodeRef<'db>) -> NodeD
         }
         NodeRef::External(k) => NodeData {
             fqname: k.fqname(db).clone(),
-            kind: NodeKind::Synthetic,
-            path: String::new(),
+            kind: NodeKind::External,
+            path: k.path(db).clone(),
             start_line: 0,
             start_column: 0,
             end_line: 0,
@@ -917,6 +926,10 @@ pub(crate) fn import_payload_for_pure<'db>(
 #[derive(Debug, Eq, PartialEq, salsa::Update, get_size2::GetSize)]
 pub(crate) struct FileEdges<'db> {
     pub(crate) edges: FxHashSet<(NodeRef<'db>, NodeRef<'db>, u8)>,
+    /// Import-alias nodes in this file whose upstream module did not
+    /// resolve. The assembly pass ORs `NodeFlags::UNRESOLVED` into each
+    /// (in place of the old `[unresolved] X` synthetic sink edge).
+    pub(crate) unresolved_aliases: FxHashSet<NodeRef<'db>>,
 }
 
 /// Per-file edge emission. Salsa-tracked so the per-file walk
@@ -965,6 +978,7 @@ pub(crate) fn file_to_edges<'db>(db: &'db dyn ProjectDb, file: File) -> FileEdge
     let self_nodes = file_to_nodes(db, file);
     let module_ref = NodeRef::Module(file);
     let mut edges: FxHashSet<(NodeRef<'db>, NodeRef<'db>, u8)> = FxHashSet::default();
+    let mut unresolved_aliases: FxHashSet<NodeRef<'db>> = FxHashSet::default();
 
     // 1. Decl → module anchor edges. Every per-file def points at the
     //    module node so reachability seeded from the module covers all
@@ -1002,9 +1016,10 @@ pub(crate) fn file_to_edges<'db>(db: &'db dyn ProjectDb, file: File) -> FileEdge
     //    * `Def(alias) → Def(target_decl)` for from-imports whose
     //      `decl_name` resolves in the target's `exports_by_name`.
     //
-    //    Targets outside the project (stdlib / dist / unresolved)
-    //    are SKIPPED in this cut — the External NodeRef variant
-    //    lands later.
+    //    * `Def(alias) → External(key)` for site-packages targets.
+    //
+    //    Stdlib and genuinely-unresolved targets emit no edge here
+    //    (stdlib stays silent; unresolved aliases are flagged instead).
     let index = semantic_index(db, file);
     let global = FileScopeId::global();
     let use_def_map = index.use_def_map(global);
@@ -1113,54 +1128,44 @@ pub(crate) fn file_to_edges<'db>(db: &'db dyn ProjectDb, file: File) -> FileEdge
         } else {
             (target_module_str, decl_name)
         };
+        // Bad module name (relative-dots overflow, etc.), a module that
+        // doesn't resolve, or a resolved module with no backing file:
+        // flag the alias `NodeFlags::UNRESOLVED` (the assembly pass ORs
+        // it in) rather than minting an `[unresolved] X` sink.
         let Some(target_module_name) = ModuleName::new(&target_module_str) else {
-            // Bad module name (relative-dots overflow, etc.). Route
-            // to a synthetic `[unresolved] X` external node.
-            let top_level = target_module_str
-                .split('.')
-                .next()
-                .unwrap_or(&target_module_str);
-            let key = ExternalKey::new(db, format!("[unresolved] {top_level}"));
-            edges.insert((alias_ref, NodeRef::External(key), 0));
+            unresolved_aliases.insert(alias_ref);
             continue;
         };
         let Some(target_module) = resolve_module(db, file, &target_module_name) else {
-            let top_level = target_module_str
-                .split('.')
-                .next()
-                .unwrap_or(&target_module_str);
-            let key = ExternalKey::new(db, format!("[unresolved] {top_level}"));
-            edges.insert((alias_ref, NodeRef::External(key), 0));
+            unresolved_aliases.insert(alias_ref);
             continue;
         };
-        // Stdlib targets drop silently — matches existing pipeline.
+        let Some(target_file) = target_module.file(db) else {
+            unresolved_aliases.insert(alias_ref);
+            continue;
+        };
+        let top_level = target_module_str
+            .split('.')
+            .next()
+            .unwrap_or(&target_module_str);
+        // Stdlib targets emit no node: an unused stdlib import is still
+        // caught dead via its alias's zero in-edge count, so a stdlib
+        // endpoint would be pure noise.
         if target_module
             .search_path(db)
             .is_some_and(|sp| sp.is_standard_library())
         {
             continue;
         }
-        let Some(target_file) = target_module.file(db) else {
-            let top_level = target_module_str
-                .split('.')
-                .next()
-                .unwrap_or(&target_module_str);
-            let key = ExternalKey::new(db, format!("[unresolved] {top_level}"));
-            edges.insert((alias_ref, NodeRef::External(key), 0));
-            continue;
-        };
-        // Non-first-party (site-packages) → External node keyed on
-        // top-level module name. TODO: dist_lookup canonicalisation.
+        // Non-first-party (site-packages) → External node keyed on the
+        // PEP 503 dist name (or top-level module name) with the resolved
+        // file's path.
         if target_module
             .search_path(db)
             .is_some_and(|sp| !sp.is_first_party() && sp.is_site_packages())
         {
-            let top_level = target_module_str
-                .split('.')
-                .next()
-                .unwrap_or(&target_module_str);
             let fqname = external_fqname_for(db, target_file, top_level);
-            let key = ExternalKey::new(db, fqname);
+            let key = ExternalKey::new(db, fqname, file_path_string(db, target_file));
             edges.insert((alias_ref, NodeRef::External(key), 0));
             continue;
         }
@@ -1186,7 +1191,10 @@ pub(crate) fn file_to_edges<'db>(db: &'db dyn ProjectDb, file: File) -> FileEdge
         }
     }
 
-    FileEdges { edges }
+    FileEdges {
+        edges,
+        unresolved_aliases,
+    }
 }
 
 /// Resolve a file's parent module to its `File` handle, when the

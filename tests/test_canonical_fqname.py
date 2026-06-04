@@ -67,7 +67,7 @@ def test_pep660_finder_install_resolves_via_project_root(
     assert by_path[str(tmp_path / "myapp" / "routes" / "job.py")] == "myapp.routes.job"
 
     # The import alias in main.py must resolve to the real router var,
-    # not to ``[unresolved] myapp``.
+    # rather than failing to resolve (which would flag it ``UNRESOLVED``).
     job_router_alias = next(n for n in graph.nodes() if n.fqname == "myapp.main.job_router")
     router_var = next(n for n in graph.nodes() if n.fqname == "myapp.routes.job.router")
     # The alias's descendant set should reach the upstream var.

@@ -60,7 +60,6 @@ from dead_cst import _native as native  # noqa: E402  (require_native gates this
 # is intentionally absent (driven by ``-e`` / ``--entrypoint-regex``).
 _BUILTIN_NATIVE_PLUGIN_NAMES = (
     "main_block",
-    "module_dunders",
     "init_subclass",
     "server_config",
     "unittest",

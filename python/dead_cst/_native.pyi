@@ -26,6 +26,7 @@ NodeKind = Literal[
     "type_alias",
     "module",
     "synthetic",
+    "external",
 ]
 
 class NodeFlags:
@@ -41,6 +42,13 @@ class NodeFlags:
     """
 
     NONE: int
+
+    UNRESOLVED: int
+    """Import alias whose upstream module ty could not resolve (a bad
+    relative-dots target, a missing dependency, …). Stamped on the local
+    ``kind="import"`` node in place of the old ``[unresolved] X``
+    synthetic sink. Metadata only (not a seed); registered
+    ``engine/unresolved``."""
 
     ENTRYPOINT: int
     """Explicit entrypoint — plugin-emitted seeds, the CLI's ``-e`` flag,
@@ -99,6 +107,13 @@ class EdgeFlags:
     ``importlib.import_module('X')``). Lets plugins read which edges
     the visitor produced from dynamic-import shapes and choose to fan
     out / specialize."""
+
+    INIT_SUBCLASS: int
+    """Edge from a base class to a subclass discovered via
+    ``__init_subclass__`` (the built-in init-subclass plugin emits one
+    ``parent -> subclass`` edge per registered subclass). Keeps the
+    subclass alive whenever the base is, without a synthetic anchor
+    node. Metadata only — the edge participates in default reachability."""
 
 class Import:
     """Raw record of one cross-file import reference, attached to a
@@ -199,14 +214,6 @@ class NativePlugin:
         ``if __name__ == "__main__":`` block as an entrypoint and wires
         edges to the containing module + every top-level decl inside the
         block. Implemented as a per-file (salsa-cached) plugin.
-        """
-        ...
-
-    @staticmethod
-    def module_dunders() -> NativePlugin:
-        """``ModuleDundersPlugin``. Pins every module-level dunder
-        (variables + PEP 562 functions) and ``__future__`` import as an
-        entrypoint. Implemented as a per-file (salsa-cached) plugin.
         """
         ...
 
