@@ -414,8 +414,7 @@ def test_fastapi_plugin_factory_module_form_in_different_package(
 ):
     """Factory in dep package uses ``import fastapi; fastapi.FastAPI()``.
 
-    Without the factory-marker synthetic the cross-package walk has no
-    discriminator: the external-edge classifier drops the
+    In module-attribute form the external-edge classifier drops the
     ``decl='FastAPI'`` half of the access, so every reference to
     ``fastapi`` collapses to the same ``[external dist] fastapi``
     node regardless of which class is being constructed.
@@ -453,9 +452,9 @@ def test_fastapi_plugin_router_factory_in_different_package(
 ):
     """APIRouter factory in dep package, consumer wires it via include_router.
 
-    The factory-marker route shouldn't promote routers to entrypoints
-    on its own -- only a FastAPI app that ``include_router``s it keeps
-    the router alive.
+    A router factory shouldn't promote routers to entrypoints on its
+    own -- only a FastAPI app that ``include_router``s it keeps the
+    router alive.
     """
     write_files(
         {
@@ -495,10 +494,10 @@ def test_fastapi_plugin_orphan_router_factory_stays_dead_cross_package(
 ):
     """APIRouter factory in dep package that nobody ``include_router``s.
 
-    The factory marker carries the ``APIRouter`` kind, which finalize
-    explicitly leaves un-entrypointed -- so a downstream consumer that
-    only constructs the router (without registering it on a FastAPI
-    app) still gets flagged dead.
+    The factory walk only seeds factories returning the app class
+    (``FastAPI``); an ``APIRouter`` factory is never entrypointed on
+    its own -- so a downstream consumer that only constructs the router
+    (without registering it on a FastAPI app) still gets flagged dead.
     """
     write_files(
         {

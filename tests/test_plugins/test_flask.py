@@ -639,9 +639,9 @@ def test_flask_plugin_factory_module_form_in_different_package(
 ):
     """Factory in dep package uses ``import flask; flask.Flask()``.
 
-    Without the factory-marker synthetic the cross-package walk has no
-    discriminator -- the external-edge classifier drops the
-    ``decl='Flask'`` half of the access.
+    In module-attribute form the external-edge classifier drops the
+    ``decl='Flask'`` half of the access, so the plugin's own factory
+    detection -- not the import graph -- is what keeps ``app`` alive.
     """
     write_files(
         {
@@ -713,10 +713,10 @@ def test_flask_plugin_orphan_blueprint_factory_stays_dead_cross_package(
 ):
     """Blueprint factory in dep package that nobody ``register_blueprint``s.
 
-    The factory marker carries the ``Blueprint`` kind, which finalize
-    explicitly leaves un-entrypointed -- so a downstream consumer that
-    only constructs the blueprint (without registering it on a Flask
-    app) still gets flagged dead.
+    The factory walk only seeds factories returning the app class
+    (``Flask``); a ``Blueprint`` factory is never entrypointed on its
+    own -- so a downstream consumer that only constructs the blueprint
+    (without registering it on a Flask app) still gets flagged dead.
     """
     write_files(
         {
