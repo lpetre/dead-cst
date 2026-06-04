@@ -41,6 +41,11 @@ pub(crate) struct NodeKey {
 /// only for the nodes a Python caller actually surfaces (`nodes()`,
 /// `nodes_at()`, the descendants / ancestors / reachable snapshots).
 /// Internal queries read the fields here directly with no borrow.
+///
+/// `Default` yields an empty placeholder used by
+/// [`GraphBuilder::prefill_payload_region`]; every slot it creates is
+/// overwritten by [`GraphBuilder::place_node`] before the graph is read.
+#[derive(Default)]
 pub(crate) struct GraphNode {
     pub(crate) fqname: String,
     pub(crate) kind: &'static str,
@@ -168,6 +173,41 @@ impl GraphBuilder {
         self.forward_adj.push(Vec::new());
         self.reverse_adj.push(Vec::new());
         idx
+    }
+
+    /// Pre-size the payload region to `total_nodes` so the
+    /// offset-driven assembly pass can write each file's nodes at a
+    /// precomputed global index (`offset[file] + local_idx`) via
+    /// [`place_node`] instead of relying on serial append order.
+    /// `nodes` is filled with `GraphNode::default()` placeholders that
+    /// `place_node` overwrites exactly once each — the per-file
+    /// offsets partition `[0, total_nodes)`, so no placeholder
+    /// survives into the finished graph. Synthetic nodes minted later
+    /// via [`intern_node`] append past this region (index
+    /// `total_nodes` onward).
+    pub(crate) fn prefill_payload_region(&mut self, total_nodes: usize) {
+        self.nodes.resize_with(total_nodes, GraphNode::default);
+        self.forward_adj.resize_with(total_nodes, Vec::new);
+        self.reverse_adj.resize_with(total_nodes, Vec::new);
+        self.node_index.reserve(total_nodes);
+    }
+
+    /// Place a payload node at its precomputed global index. Unlike
+    /// [`intern_node`] (append + dedup-by-key), the offset-driven
+    /// assembly pass owns the index, so this writes `nodes[idx]`
+    /// directly and records the key. Payload nodes are
+    /// position-distinct (`CLAUDE.md` principle 3), so no two ever
+    /// share a [`NodeKey`]; an assertion — kept on in release too,
+    /// since a collision would silently overwrite a node and corrupt
+    /// the index map — guards that invariant. Requires the region to
+    /// be pre-sized via [`prefill_payload_region`].
+    pub(crate) fn place_node(&mut self, idx: usize, node: GraphNode) {
+        let prev = self.node_index.insert(node.key(), idx);
+        assert!(
+            prev.is_none(),
+            "payload node key collision at index {idx}: assembly must mint each NodeKey once"
+        );
+        self.nodes[idx] = node;
     }
 
     /// Get (or mint) the deduplicated synthetic node with the given
