@@ -23,9 +23,7 @@ def _module_successors(ctx: "native_t.ProjectContext", module_fqname: str) -> se
     """One-hop targets of the ``module_fqname`` module node — i.e. the dst
     fqnames of every ``module -> X`` edge the engine emitted."""
     nodes = ctx.nodes()
-    midx = next(
-        i for i, n in enumerate(nodes) if n.kind == "module" and n.fqname == module_fqname
-    )
+    midx = next(i for i, n in enumerate(nodes) if n.kind == "module" and n.fqname == module_fqname)
     return {nodes[v].fqname for u, v, _ in ctx.edges() if u == midx}
 
 
