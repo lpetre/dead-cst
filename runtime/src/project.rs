@@ -45,6 +45,7 @@ use crate::progress::{
     PHASE_PLUGINS, PHASE_POPULATE,
 };
 use crate::query::_path_re_matches;
+use crate::topic_registry::TopicRegistry;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 /// A ty-backed analysis project with explicitly-injected configuration.
@@ -180,6 +181,15 @@ pub(crate) struct BuildOutputs {
     /// vs `unittest.case.TestCase`) and renamed re-exports to a single key
     /// by construction, so the query is an O(1) lookup with no scan.
     pub(crate) external_base_children: FxHashMap<(File, (u32, u32)), Vec<usize>>,
+    /// Per-file plugin facts, keyed by topic **name** (the salsa-stable key the
+    /// per-file side emits under — see [`crate::native_plugins::FileLocalOp`]).
+    /// Collected from every file's `per_file_plugin_ops` in `assemble_graph`,
+    /// with each fact's optional decl already translated to a global node idx.
+    /// The project-wide plugin pass reads it through
+    /// [`crate::native_plugins::plugin_api::PluginCtx::facts_for_topic`]
+    /// (handle → name → this map); Python reads it via
+    /// `ProjectContext.facts_for_topic`.
+    pub(crate) topic_facts: FxHashMap<String, Vec<crate::native_plugins::plugin_api::Fact>>,
 }
 
 /// Run the three build phases (ingest → hierarchy+imports → references)
@@ -504,6 +514,7 @@ pub(crate) fn build_project_graph(
     let module_nodes_by_file = assembled.module_nodes_by_file;
     let class_by_selection = assembled.class_by_selection;
     let decl_by_name_range = assembled.decl_by_name_range;
+    let topic_facts = assembled.topic_facts;
 
     counters.start_phase(PHASE_FQNAME, Some(builder.nodes.len()));
     let t4 = std::time::Instant::now();
@@ -572,6 +583,7 @@ pub(crate) fn build_project_graph(
         children_by_node,
         external_base_children,
         children_by_parent,
+        topic_facts,
     })
 }
 
@@ -602,6 +614,7 @@ struct AssembledGraph {
     module_nodes_by_file: FxHashMap<File, usize>,
     class_by_selection: FxHashMap<(File, (u32, u32)), usize>,
     decl_by_name_range: FxHashMap<(File, (u32, u32)), usize>,
+    topic_facts: FxHashMap<String, Vec<crate::native_plugins::plugin_api::Fact>>,
 }
 
 /// Serial pass that converts the salsa-tracked per-file payloads
@@ -941,7 +954,7 @@ fn assemble_graph<'db>(
     // global ones via `local_to_global`. Runs here, after the real
     // graph is fully assembled, so every decl endpoint a plugin
     // edge/flag op references already has its global index.
-    fold_per_file_plugin_ops(
+    let topic_facts = fold_per_file_plugin_ops(
         db,
         &mut builder,
         project_files,
@@ -961,6 +974,7 @@ fn assemble_graph<'db>(
         module_nodes_by_file,
         class_by_selection,
         decl_by_name_range,
+        topic_facts,
     })
 }
 
@@ -989,12 +1003,17 @@ fn fold_per_file_plugin_ops(
     project_files: &[File],
     per_file_plugin_ids: &[crate::native_plugins::PerFilePluginId],
     local_to_global: &FxHashMap<(File, u32), usize>,
-) -> PyResult<()> {
+) -> PyResult<FxHashMap<String, Vec<crate::native_plugins::plugin_api::Fact>>> {
+    use crate::native_plugins::plugin_api::Fact;
+    let mut topic_facts: FxHashMap<String, Vec<Fact>> = FxHashMap::default();
     if per_file_plugin_ids.is_empty() {
-        return Ok(());
+        return Ok(topic_facts);
     }
     use crate::native_plugins::{per_file_plugin_ops, FileLocalOp};
     for &file in project_files {
+        // The fact `path` is the same for every fact in this file; resolve
+        // it once, lazily, since most files emit no facts at all.
+        let mut file_path: Option<String> = None;
         for &id in per_file_plugin_ids {
             let file_ops = per_file_plugin_ops(db, file, id);
             if file_ops.is_empty() {
@@ -1032,11 +1051,36 @@ fn fold_per_file_plugin_ops(
                         };
                         builder.nodes[decl_idx].flags |= flags;
                     }
+                    FileLocalOp::Fact {
+                        topic,
+                        decl_local_idx,
+                        value,
+                    } => {
+                        // A fact that pinned a decl is dropped when that decl
+                        // doesn't resolve to a global node — same lenient
+                        // contract as edge/flag ops, and it keeps a `Some`
+                        // `decl_idx` always naming a live node.
+                        let decl_idx = match decl_local_idx {
+                            Some(local) => match to_global(*local) {
+                                Some(global) => Some(global),
+                                None => continue,
+                            },
+                            None => None,
+                        };
+                        let path = file_path
+                            .get_or_insert_with(|| file_path_string(db, file))
+                            .clone();
+                        topic_facts.entry(topic.clone()).or_default().push(Fact {
+                            path,
+                            decl_idx,
+                            value: value.clone(),
+                        });
+                    }
                 }
             }
         }
     }
-    Ok(())
+    Ok(topic_facts)
 }
 
 /// Collect the [`PerFilePluginId`](crate::native_plugins::PerFilePluginId)
@@ -1450,6 +1494,13 @@ pub(crate) struct ProjectContext {
     /// Edge-flag registry — the edge-space twin of
     /// [`Self::node_flag_registry`] (`u8`-width).
     pub(crate) edge_flag_registry: FlagRegistry,
+    /// Topic registry: every topic the registered plugins declared, in
+    /// registration order. Empty at construction (topics are plugin-only —
+    /// no engine built-ins) and overwritten by `materialize` with the
+    /// post-declaration registry. Read by the `topic_registry` /
+    /// `facts_for_topic` getters; not serialized (facts are an in-memory
+    /// build-time channel, not graph-file content).
+    pub(crate) topic_registry: TopicRegistry,
 }
 
 #[pymethods]
@@ -1487,6 +1538,7 @@ impl ProjectContext {
             progress: Arc::new(ProgressCounters::new()),
             node_flag_registry: FlagRegistry::with_node_builtins(),
             edge_flag_registry: FlagRegistry::with_edge_builtins(),
+            topic_registry: TopicRegistry::new(),
         })
     }
 
@@ -1531,6 +1583,40 @@ impl ProjectContext {
     /// :meth:`node_flag`), or ``None`` if undeclared.
     pub(crate) fn edge_flag(&self, name: &str) -> Option<u8> {
         self.edge_flag_registry.get(name).map(|bit| bit as u8)
+    }
+
+    /// Topic registry entries ``(name, handle, description)`` in handle
+    /// (registration) order: every topic the registered plugins declared
+    /// (populated by :meth:`materialize`; empty before then). Topics are a
+    /// plugin-only channel, so there are no engine built-ins.
+    pub(crate) fn topic_registry(&self) -> Vec<(String, u32, String)> {
+        self.topic_registry
+            .entries()
+            .into_iter()
+            .map(|(handle, spec)| (spec.name, handle, spec.description))
+            .collect()
+    }
+
+    /// Every fact published under topic ``name`` across the project, as
+    /// ``(path, decl_idx, value)`` tuples — ``decl_idx`` is the global node
+    /// index a fact was pinned to (or ``None``). Empty for an unknown topic or
+    /// one nothing published under. Errors only if called before
+    /// :meth:`materialize`.
+    pub(crate) fn facts_for_topic(
+        &self,
+        name: &str,
+    ) -> PyResult<Vec<(String, Option<usize>, String)>> {
+        let outputs = self.materialized("facts_for_topic")?;
+        Ok(outputs
+            .topic_facts
+            .get(name)
+            .map(|facts| {
+                facts
+                    .iter()
+                    .map(|f| (f.path.clone(), f.decl_idx, f.value.clone()))
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 
     /// Override the rayon worker stack size (bytes) used by the
@@ -1714,7 +1800,7 @@ impl ProjectContext {
         // ops fold into the graph in one end-of-pass apply, in
         // registration order — the same frozen-graph contract the old
         // Python ``ThreadPoolExecutor`` driver honoured.
-        let (jobs, plugin_names, node_reg, edge_reg) =
+        let (jobs, plugin_names, node_reg, edge_reg, topic_reg) =
             match crate::native_plugins::extract_plugin_jobs(py, &slf.borrow(py).plugins) {
                 Ok(extracted) => extracted,
                 Err(e) => {
@@ -1758,6 +1844,10 @@ impl ProjectContext {
             // after the pass.
             let node_reg_ref = &node_reg;
             let edge_reg_ref = &edge_reg;
+            // The topic registry rides the same way — `&TopicRegistry` is
+            // `Send` (the registry is `Sync`); plugins resolve topic handles
+            // and read collected facts off it inside the GIL-free pass.
+            let topic_reg_ref = &topic_reg;
             // ``base_db`` + ``outputs_lock`` move *into* the closure: a
             // ``&ProjectDatabase`` is ``!Send`` (salsa's ``ZalsaLocal`` is
             // ``!Sync``), so — like every GIL-free per-file scan here — we
@@ -1781,6 +1871,7 @@ impl ProjectContext {
                                     root_ref,
                                     node_reg_ref,
                                     edge_reg_ref,
+                                    topic_reg_ref,
                                 );
                                 let mut sink: Vec<PreparedOp> = Vec::new();
                                 let res = job.run(&view, &mut sink).map(|()| sink);
@@ -1836,6 +1927,7 @@ impl ProjectContext {
             let mut this = slf.borrow_mut(py);
             this.node_flag_registry = node_reg;
             this.edge_flag_registry = edge_reg;
+            this.topic_registry = topic_reg;
         }
 
         // The plugin pass can still reload individual files on demand:
@@ -3548,6 +3640,11 @@ pub(crate) struct FrozenView<'a> {
     /// `edge_flag`.
     pub(crate) node_flags: &'a FlagRegistry,
     pub(crate) edge_flags: &'a FlagRegistry,
+    /// Frozen topic registry, lent the same way as the flag registries so a
+    /// plugin resolves a declared topic name to its handle via
+    /// [`crate::native_plugins::plugin_api::PluginCtx::topic`] and reads the
+    /// collected facts via `facts_for_topic`.
+    pub(crate) topics: &'a TopicRegistry,
 }
 
 impl<'a> FrozenView<'a> {
@@ -3557,6 +3654,7 @@ impl<'a> FrozenView<'a> {
         root: &'a str,
         node_flags: &'a FlagRegistry,
         edge_flags: &'a FlagRegistry,
+        topics: &'a TopicRegistry,
     ) -> Self {
         Self {
             db,
@@ -3564,6 +3662,7 @@ impl<'a> FrozenView<'a> {
             root,
             node_flags,
             edge_flags,
+            topics,
         }
     }
 

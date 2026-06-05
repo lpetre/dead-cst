@@ -15,12 +15,12 @@
 
 use std::ffi::c_void;
 
-use dead_cst_runtime::native_plugins::plugin_api::{ExternalPlugin, PluginCtx, PluginOps};
+use dead_cst_runtime::native_plugins::plugin_api::{
+    ExternalPlugin, PluginCtx, PluginError, PluginOps,
+};
 use dead_cst_runtime::native_plugins::{
     PluginDesc, PluginManifest, PLUGIN_ABI_FINGERPRINT, PLUGIN_MANIFEST_MAGIC,
 };
-
-const MARKER: &str = "<__main__>:external";
 
 struct MainBlockPlugin;
 
@@ -29,15 +29,16 @@ impl ExternalPlugin for MainBlockPlugin {
         "ExternalMainBlockPlugin"
     }
 
-    fn run(&self, ctx: &PluginCtx<'_>, ops: &mut PluginOps) {
+    fn run(&self, ctx: &PluginCtx<'_>, ops: &mut PluginOps) -> Result<(), PluginError> {
         for (module_idx, decl_indices) in ctx.main_blocks() {
             // Keep the module alive, plus every top-level decl inside the
             // `if __name__ == "__main__":` block.
-            ops.keep_alive(module_idx, MARKER.to_string());
+            ops.keep_alive(module_idx);
             for decl_idx in decl_indices {
-                ops.keep_alive(decl_idx, MARKER.to_string());
+                ops.keep_alive(decl_idx);
             }
         }
+        Ok(())
     }
 }
 

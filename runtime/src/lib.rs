@@ -38,6 +38,7 @@ pub mod native_plugins;
 mod progress;
 mod project;
 mod query;
+mod topic_registry;
 
 use pyo3::prelude::*;
 

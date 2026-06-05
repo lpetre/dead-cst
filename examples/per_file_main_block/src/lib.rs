@@ -24,13 +24,11 @@
 use std::ffi::c_void;
 
 use dead_cst_runtime::native_plugins::plugin_api::{
-    ExternalPlugin, FileOps, PerFilePlugin, PluginFileCtx, FLAG_ENTRYPOINT,
+    ExternalPlugin, FileOps, PerFilePlugin, PluginFileCtx,
 };
 use dead_cst_runtime::native_plugins::{
     PluginDesc, PluginManifest, PLUGIN_ABI_FINGERPRINT, PLUGIN_MANIFEST_MAGIC,
 };
-
-const MARKER_PREFIX: &str = "<__main__>:per-file:";
 
 struct PerFileMainBlock;
 
@@ -55,27 +53,19 @@ impl PerFilePlugin for PerFileMainBlock {
         };
         let (block_start, block_end) = file.line_span(block);
 
-        // Keep the module node (local index 0) plus every top-level decl
-        // whose source span falls inside the block. All indices are
-        // file-local — the host maps them to global indices at apply time.
-        let mut targets = vec![file.module_local_idx()];
+        // Keep the module node (local index 0) alive, plus every top-level
+        // decl whose source span falls inside the block. `keep_alive` flags
+        // each as a reachability seed directly — all indices are file-local,
+        // and the host maps them to global indices at apply time.
+        ops.keep_alive(file.module_local_idx());
         for node in file.nodes() {
             if node.local_idx != file.module_local_idx()
                 && node.start_line >= block_start
                 && node.end_line <= block_end
             {
-                targets.push(node.local_idx);
+                ops.keep_alive(node.local_idx);
             }
         }
-
-        // One synthetic entrypoint node per file, wired to those targets.
-        // No in-edges — the node is a reachability seed, not a sink.
-        ops.add_synthetic_node(
-            format!("{MARKER_PREFIX}{}", file.module_fqname()),
-            FLAG_ENTRYPOINT,
-            targets,
-            Vec::new(),
-        );
     }
 }
 

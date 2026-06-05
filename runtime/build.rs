@@ -18,7 +18,10 @@ use std::process::Command;
 /// registered node flag onto an existing decl, no marker node).
 /// 4 → 5: removed `PluginOps::add_synthetic_node` / `FileOps::add_synthetic_node`
 /// (plugins no longer mint nodes; the `kind="synthetic"` node kind is gone).
-const PLUGIN_API_EPOCH: u32 = 5;
+/// 5 → 6: added the topic/fact channel — `ExternalPlugin::declare_topics`, the
+/// re-exported `TopicSpec` + author-facing `Fact`, `FileOps::emit_fact`, and
+/// `PluginCtx::topic` / `facts_for_topic`.
+const PLUGIN_API_EPOCH: u32 = 6;
 
 /// Compose the ABI fingerprint that gates external native-plugin loading.
 /// It changes whenever anything that could break the dylib ABI changes:
