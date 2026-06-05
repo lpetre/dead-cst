@@ -520,7 +520,7 @@ pub(crate) fn build_project_graph(
     counters.start_phase(PHASE_FQNAME, Some(builder.nodes.len()));
     let t4 = std::time::Instant::now();
     let (decl_by_fqname, module_by_fqname, imports_by_module, children_by_parent) =
-        build_fqname_indices(&builder, counters);
+        py.allow_threads(|| build_fqname_indices(&builder, counters));
     let t_fqname = t4.elapsed();
     counters.finish_phase(PHASE_FQNAME);
 
@@ -943,8 +943,10 @@ fn assemble_graph<'db>(
     //       Drops endpoints whose owning file wasn't enumerated.
     //
     // After the parallel phase, sort + dedup the triple list and
-    // bulk-insert via `extend_edges` (which still probes `edge_set`
-    // so any pre-existing edges merge cleanly).
+    // bulk-initialize the edge storage via `init_edges_bulk` — the
+    // builder has no edges yet, so the adjacency lists are scattered
+    // from the sorted triples on rayon workers instead of looping
+    // `extend_edges`'s serial per-edge probe.
     //
     // Skipped endpoints reference Definitions in non-project files.
 
@@ -1049,9 +1051,12 @@ fn assemble_graph<'db>(
         t
     });
 
-    // Bulk-insert the translated triples. `extend_edges` keeps
-    // the `edge_set` dedup so any prior edges merge correctly.
-    builder.extend_edges(std::mem::take(&mut triples));
+    // Bulk-initialize the edge storage from the translated triples.
+    // The builder is edge-less here (pass 1 mints only nodes), so the
+    // adjacency fills run as a parallel scatter; the GIL is released
+    // for the same reason as 2c.
+    let bulk_triples = std::mem::take(&mut triples);
+    py.allow_threads(|| builder.init_edges_bulk(bulk_triples));
 
     // Warnings are still serial — they live on `FileRefEdges` only.
     for payload in &ref_edge_payloads {
@@ -1354,11 +1359,12 @@ fn build_class_hierarchy_indices(
 
 /// Pre-build the fqname -> idx maps used by ``find_declarations``,
 /// ``find_module``, ``find_imports_of``, and ``module_surface``. One
-/// pass over interned nodes; module entries are 1:1 (one module node
-/// per fqname) while decl entries (and per-upstream-module import
-/// entries) can have multiple binders for the same key — try/except
-/// rebinds, conditional re-imports, and multiple ``from X import Y, Z``
-/// aliases all bind into the same upstream module.
+/// map-reduce pass over interned nodes (callers should release the
+/// GIL); module entries are 1:1 (one module node per fqname) while
+/// decl entries (and per-upstream-module import entries) can have
+/// multiple binders for the same key — try/except rebinds, conditional
+/// re-imports, and multiple ``from X import Y, Z`` aliases all bind
+/// into the same upstream module.
 ///
 /// ``children_by_parent`` is the fqname-tree index used by
 /// :meth:`ProjectContext::module_surface` and
@@ -1376,52 +1382,111 @@ pub(crate) fn build_fqname_indices(
     FxHashMap<String, Vec<usize>>,
     FxHashMap<String, Vec<usize>>,
 ) {
-    let mut decls: FxHashMap<String, Vec<usize>> = FxHashMap::default();
-    let mut modules: FxHashMap<String, usize> = FxHashMap::default();
-    let mut imports_by_module: FxHashMap<String, Vec<usize>> = FxHashMap::default();
-    let mut children_by_parent: FxHashMap<String, Vec<usize>> = FxHashMap::default();
-    for (idx, node) in builder.nodes.iter().enumerate() {
-        counters.fqname_inc();
-        // `@typing.overload`-decorated stubs of an in-file overload group
-        // are excluded from the fqname trie so cross-module `from mod
-        // import f` resolves to the impl only. Reachability still anchors
-        // them via the explicit `impl → stub` edge emitted in
-        // `file_to_edges`.
-        if node.is_overload {
-            continue;
+    use rayon::prelude::*;
+    use std::collections::hash_map::Entry;
+
+    /// Per-range accumulator for the rayon `fold`: the four maps, built
+    /// over one contiguous slice of `builder.nodes`.
+    #[derive(Default)]
+    struct FqnameAcc {
+        decls: FxHashMap<String, Vec<usize>>,
+        modules: FxHashMap<String, usize>,
+        imports_by_module: FxHashMap<String, Vec<usize>>,
+        children_by_parent: FxHashMap<String, Vec<usize>>,
+    }
+
+    /// Merge a right-range multi-map into the left one, appending the
+    /// right's index lists after the left's. Entries move (no String
+    /// re-clone); an empty left steals the right map outright so
+    /// reducing against the identity accumulator is free.
+    fn merge_multi(into: &mut FxHashMap<String, Vec<usize>>, from: FxHashMap<String, Vec<usize>>) {
+        if into.is_empty() {
+            *into = from;
+            return;
         }
-        let mut index_child = false;
-        match node.kind {
-            "module" => {
-                modules.insert(node.fqname.clone(), idx);
-                index_child = true;
-            }
-            "function" | "class" | "variable" => {
-                decls.entry(node.fqname.clone()).or_default().push(idx);
-                index_child = true;
-            }
-            "import" => {
-                decls.entry(node.fqname.clone()).or_default().push(idx);
-                if let Some(import) = node.imports.as_ref() {
-                    imports_by_module
-                        .entry(import.module.clone())
-                        .or_default()
-                        .push(idx);
+        into.reserve(from.len());
+        for (k, v) in from {
+            match into.entry(k) {
+                Entry::Occupied(mut e) => e.get_mut().extend(v),
+                Entry::Vacant(e) => {
+                    e.insert(v);
                 }
-                index_child = true;
             }
-            _ => {}
-        }
-        if index_child {
-            let parent = node
-                .fqname
-                .rsplit_once('.')
-                .map(|(p, _)| p.to_string())
-                .unwrap_or_default();
-            children_by_parent.entry(parent).or_default().push(idx);
         }
     }
-    (decls, modules, imports_by_module, children_by_parent)
+
+    // Map-reduce over the node table. The fold builds per-range maps
+    // (where the String clones + hashing happen, on rayon workers);
+    // the reduce merges adjacent ranges left-to-right. rayon's reduce
+    // tree combines accumulators in sequence order — `op(left, right)`
+    // over adjacent ranges, never reordered — so appending right after
+    // left reproduces the serial loop's idx order in every Vec, and
+    // `modules.extend` (right wins) reproduces its last-write-wins.
+    // Output is deterministic and identical to the serial fold.
+    let acc = builder
+        .nodes
+        .par_iter()
+        .enumerate()
+        .with_min_len(1024)
+        .fold(FqnameAcc::default, |mut acc, (idx, node)| {
+            counters.fqname_inc();
+            // `@typing.overload`-decorated stubs of an in-file overload group
+            // are excluded from the fqname trie so cross-module `from mod
+            // import f` resolves to the impl only. Reachability still anchors
+            // them via the explicit `impl → stub` edge emitted in
+            // `file_to_edges`.
+            if node.is_overload {
+                return acc;
+            }
+            let mut index_child = false;
+            match node.kind {
+                "module" => {
+                    acc.modules.insert(node.fqname.clone(), idx);
+                    index_child = true;
+                }
+                "function" | "class" | "variable" => {
+                    acc.decls.entry(node.fqname.clone()).or_default().push(idx);
+                    index_child = true;
+                }
+                "import" => {
+                    acc.decls.entry(node.fqname.clone()).or_default().push(idx);
+                    if let Some(import) = node.imports.as_ref() {
+                        acc.imports_by_module
+                            .entry(import.module.clone())
+                            .or_default()
+                            .push(idx);
+                    }
+                    index_child = true;
+                }
+                _ => {}
+            }
+            if index_child {
+                let parent = node
+                    .fqname
+                    .rsplit_once('.')
+                    .map(|(p, _)| p.to_string())
+                    .unwrap_or_default();
+                acc.children_by_parent.entry(parent).or_default().push(idx);
+            }
+            acc
+        })
+        .reduce(FqnameAcc::default, |mut a, b| {
+            merge_multi(&mut a.decls, b.decls);
+            if a.modules.is_empty() {
+                a.modules = b.modules;
+            } else {
+                a.modules.extend(b.modules);
+            }
+            merge_multi(&mut a.imports_by_module, b.imports_by_module);
+            merge_multi(&mut a.children_by_parent, b.children_by_parent);
+            a
+        });
+    (
+        acc.decls,
+        acc.modules,
+        acc.imports_by_module,
+        acc.children_by_parent,
+    )
 }
 
 /// Plugin-aware project graph builder.
@@ -4466,4 +4531,149 @@ pub(crate) fn make_db(root: &str, env: EnvironmentOptions) -> PyResult<ProjectDa
     })?;
     let system = OsSystem::new(cwd);
     Ok(ProjectDatabase::use_defaults(metadata, system))
+}
+
+#[cfg(test)]
+mod tests {
+    //! Pure-rust tests for the project-level index builders. The
+    //! salsa/pyo3-backed pipeline is exercised end-to-end by the
+    //! python suite; here we cover `build_fqname_indices`' map-reduce
+    //! against a serial reference over hand-built `GraphNode` tables.
+    use super::*;
+    use crate::file_payload::ImportPayload;
+
+    fn node(fqname: &str, kind: &'static str) -> GraphNode {
+        GraphNode {
+            fqname: fqname.to_string(),
+            kind,
+            ..GraphNode::default()
+        }
+    }
+
+    /// The pre-map-reduce serial loop, kept verbatim as the reference.
+    #[allow(clippy::type_complexity)]
+    fn serial_reference(
+        builder: &GraphBuilder,
+    ) -> (
+        FxHashMap<String, Vec<usize>>,
+        FxHashMap<String, usize>,
+        FxHashMap<String, Vec<usize>>,
+        FxHashMap<String, Vec<usize>>,
+    ) {
+        let mut decls: FxHashMap<String, Vec<usize>> = FxHashMap::default();
+        let mut modules: FxHashMap<String, usize> = FxHashMap::default();
+        let mut imports_by_module: FxHashMap<String, Vec<usize>> = FxHashMap::default();
+        let mut children_by_parent: FxHashMap<String, Vec<usize>> = FxHashMap::default();
+        for (idx, node) in builder.nodes.iter().enumerate() {
+            if node.is_overload {
+                continue;
+            }
+            let mut index_child = false;
+            match node.kind {
+                "module" => {
+                    modules.insert(node.fqname.clone(), idx);
+                    index_child = true;
+                }
+                "function" | "class" | "variable" => {
+                    decls.entry(node.fqname.clone()).or_default().push(idx);
+                    index_child = true;
+                }
+                "import" => {
+                    decls.entry(node.fqname.clone()).or_default().push(idx);
+                    if let Some(import) = node.imports.as_ref() {
+                        imports_by_module
+                            .entry(import.module.clone())
+                            .or_default()
+                            .push(idx);
+                    }
+                    index_child = true;
+                }
+                _ => {}
+            }
+            if index_child {
+                let parent = node
+                    .fqname
+                    .rsplit_once('.')
+                    .map(|(p, _)| p.to_string())
+                    .unwrap_or_default();
+                children_by_parent.entry(parent).or_default().push(idx);
+            }
+        }
+        (decls, modules, imports_by_module, children_by_parent)
+    }
+
+    fn assert_matches_reference(builder: &GraphBuilder) {
+        let counters = Arc::new(ProgressCounters::new());
+        let expected = serial_reference(builder);
+        let actual = build_fqname_indices(builder, &counters);
+        // Vec orders matter: multi-binder decl lists and
+        // children_by_parent buckets are index-ordered in the serial
+        // loop, and the ordered reduce must reproduce that exactly.
+        assert_eq!(actual.0, expected.0);
+        assert_eq!(actual.1, expected.1);
+        assert_eq!(actual.2, expected.2);
+        assert_eq!(actual.3, expected.3);
+    }
+
+    #[test]
+    fn fqname_indices_match_serial_reference_small() {
+        let mut b = GraphBuilder::with_capacity(0);
+        b.nodes.push(node("pkg.mod", "module"));
+        b.nodes.push(node("pkg.mod.f", "function"));
+        b.nodes.push(node("pkg.mod.C", "class"));
+        b.nodes.push(node("pkg.mod.x", "variable"));
+        let mut imp = node("pkg.mod.os", "import");
+        imp.imports = Some(ImportPayload {
+            module: "os".to_string(),
+            decl: None,
+            star: false,
+        });
+        b.nodes.push(imp);
+        // Shadowed decl: same fqname, second binder — multi-entry list.
+        b.nodes.push(node("pkg.mod.f", "function"));
+        // Overload stubs are skipped entirely.
+        let mut ov = node("pkg.mod.g", "function");
+        ov.is_overload = true;
+        b.nodes.push(ov);
+        // External nodes don't index.
+        b.nodes.push(node("[external dist] numpy", "external"));
+        // Top-level name buckets under the empty-string parent.
+        b.nodes.push(node("toplevel", "module"));
+        assert_matches_reference(&b);
+    }
+
+    #[test]
+    fn fqname_indices_match_serial_reference_large() {
+        // Big enough that rayon actually splits (with_min_len = 1024),
+        // with heavy fqname collisions so the ordered reduce's
+        // append-after semantics are really exercised: every Vec must
+        // come back in ascending idx order.
+        let mut b = GraphBuilder::with_capacity(0);
+        for i in 0..6000 {
+            match i % 5 {
+                0 => b.nodes.push(node(&format!("pkg.m{}", i % 7), "module")),
+                1 => b
+                    .nodes
+                    .push(node(&format!("pkg.m{}.f", i % 11), "function")),
+                2 => b.nodes.push(node(&format!("pkg.m{}.C", i % 13), "class")),
+                3 => {
+                    let mut imp = node(&format!("pkg.m{}.dep", i % 11), "import");
+                    imp.imports = Some(ImportPayload {
+                        module: format!("dep{}", i % 3),
+                        decl: Some("thing".to_string()),
+                        star: false,
+                    });
+                    b.nodes.push(imp);
+                }
+                _ => b
+                    .nodes
+                    .push(node(&format!("pkg.m{}.x", i % 17), "variable")),
+            }
+        }
+        let (decls, ..) = build_fqname_indices(&b, &Arc::new(ProgressCounters::new()));
+        for list in decls.values() {
+            assert!(list.windows(2).all(|w| w[0] < w[1]), "idx order scrambled");
+        }
+        assert_matches_reference(&b);
+    }
 }

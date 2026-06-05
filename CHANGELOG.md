@@ -255,6 +255,17 @@ two versions.
 
 ### Changed
 
+- **Parallel edge-storage init and fqname-index map-reduce.** Two more serial
+  build chunks now run on rayon workers with the GIL released. The assemble
+  pass's bulk edge insert (`GraphBuilder::init_edges_bulk`) derives `edges`,
+  `edge_set`, and both adjacency tables from the sorted triple list on
+  concurrent tasks — the per-node adjacency lists are written as a partitioned
+  scatter over disjoint `&mut` windows, each list allocated once at its exact
+  size. `build_fqname_indices` becomes a rayon fold/reduce whose ordered merge
+  reproduces the serial loop's index order exactly. Both outputs are
+  bit-for-bit identical to the serial versions (parity-tested); on a 4-core
+  machine the edge insert runs ~2× faster and the fqname phase ~1.4×, another
+  ~12% off end-to-end `materialize()` on decl-heavy projects.
 - **Parallel node mint in the assemble pass.** The first phase of
   `assemble_graph` (per-file `GraphNode` minting plus the secondary index
   folds) now fans out across rayon workers with the GIL released, writing each
