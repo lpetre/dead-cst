@@ -80,10 +80,9 @@ def _iter_dead_indices(
     reachable: set[int],
 ) -> Iterator[int]:
     """Yield positional indices of every decl-kind node not in
-    ``reachable``. ``module`` / ``synthetic`` / ``external`` nodes are
-    filtered out via the kind whitelist (synthetic markers, anchor
-    modules, external dependencies — none are "dead" in any meaningful
-    sense).
+    ``reachable``. ``module`` / ``external`` nodes are filtered out via
+    the kind whitelist (anchor modules and external dependencies —
+    neither is "dead" in any meaningful sense).
     """
     for kind in _DECL_KINDS:
         for idx in ctx.indices_where(kind=kind):
@@ -678,8 +677,8 @@ class Analysis:
 
     def dead(self, *, seed_flags: int | None = None) -> Iterator[int]:
         """Yield positional indices of every decl that no seed in
-        ``seed_flags`` reaches. Skips ``module`` and ``synthetic``
-        nodes (markers/anchors, not "dead" in the actionable sense).
+        ``seed_flags`` reaches. Skips ``module`` and ``external``
+        nodes (anchors/dependencies, not "dead" in the actionable sense).
         ``seed_flags`` defaults to the registry-derived
         :meth:`native.ProjectContext.default_seed_mask`.
         """

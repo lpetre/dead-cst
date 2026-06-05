@@ -311,8 +311,8 @@ def test_monkeypatch_setattr_object_form_not_treated_as_fqname(build_plugin_grap
 
 
 def test_mock_patch_emits_direct_owner_to_target_edge(build_plugin_graph):
-    """The keep-alive is a direct ``owner -> target`` edge, not a synthetic
-    relay node. Verify the edge is in the graph and no patch-target synthetic
+    """The keep-alive is a direct ``owner -> target`` edge, not a relay
+    node. Verify the edge is in the graph and no patch-target marker node
     remains."""
     graph = build_plugin_graph(
         {
@@ -333,7 +333,7 @@ def test_mock_patch_emits_direct_owner_to_target_edge(build_plugin_graph):
     owner_idx = by_fqname["tests.test_lib.test_helper"]
     target_idx = by_fqname["pkg.lib.helper"]
     assert (owner_idx, target_idx, 0) in [(s, d, f) for (s, d, f) in graph.edges()]
-    assert not any(n.kind == "synthetic" and "patch-target" in n.fqname for n in nodes)
+    assert not any("patch-target" in n.fqname for n in nodes)
 
 
 def test_monkeypatch_setitem_not_recognized(build_plugin_graph, reachable_fqnames):

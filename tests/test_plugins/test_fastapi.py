@@ -336,7 +336,7 @@ def test_fastapi_plugin_factory_returning_router_stays_dead(build_plugin_graph, 
 def test_fastapi_plugin_ignores_non_app_fastapi_users(build_plugin_graph, reachable_fqnames):
     """Variables that touch ``fastapi`` for unrelated reasons stay dead.
 
-    Walking only to the ``fastapi`` synthetic isn't enough -- the plugin
+    Walking only to the ``fastapi`` external node isn't enough -- the plugin
     must require a discriminating ``FastAPI``/``APIRouter`` import on
     the path before treating ``X`` as an instance. Otherwise any value
     derived from e.g. ``HTTPException`` would get marked as an app.

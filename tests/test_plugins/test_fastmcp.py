@@ -281,7 +281,7 @@ def test_fastmcp_plugin_handles_factory_function(build_plugin_graph, reachable_f
 def test_fastmcp_plugin_ignores_non_server_fastmcp_users(build_plugin_graph, reachable_fqnames):
     """Variables that touch ``fastmcp`` for unrelated reasons stay dead.
 
-    Walking only to the ``fastmcp`` synthetic isn't enough -- the plugin
+    Walking only to the ``fastmcp`` external node isn't enough -- the plugin
     must require a discriminating ``FastMCP`` import on the path before
     treating ``X`` as an instance. Otherwise any value derived from some
     other ``fastmcp`` export would get marked as a server.

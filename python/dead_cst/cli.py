@@ -383,8 +383,6 @@ def _output_text(
     dead_counts = _count_by_kind(dead_nodes)
     typer.echo(f"\n{root}:")
     for kind in sorted(total_counts):
-        if kind == "synthetic":
-            continue
         total = total_counts[kind]
         dead = dead_counts.get(kind, 0)
         if dead > 0:
@@ -392,15 +390,10 @@ def _output_text(
         else:
             typer.echo(f"  {kind}: {total} total")
 
-    dead_real = _dead_real(dead_nodes)
-    if dead_real:
-        typer.echo(f"\nDead symbols ({len(dead_real)}):")
-        for node in sorted(dead_real, key=lambda n: (str(n.path), n.fqname)):
+    if dead_nodes:
+        typer.echo(f"\nDead symbols ({len(dead_nodes)}):")
+        for node in sorted(dead_nodes, key=lambda n: (str(n.path), n.fqname)):
             typer.echo(f"  {node.fqname} ({node.kind}) at {_rel_path(node.path, root)}")
-
-
-def _dead_real(dead_nodes: Iterable[SymbolNode]) -> list[SymbolNode]:
-    return [n for n in dead_nodes if n.kind != "synthetic"]
 
 
 def _output_json(
@@ -414,11 +407,10 @@ def _output_json(
         "summary": {
             kind: {"total": total_counts[kind], "dead": dead_counts.get(kind, 0)}
             for kind in total_counts
-            if kind != "synthetic"
         },
         "dead_symbols": [],
     }
-    for node in sorted(_dead_real(dead_nodes), key=lambda n: (str(n.path), n.fqname)):
+    for node in sorted(dead_nodes, key=lambda n: (str(n.path), n.fqname)):
         result["dead_symbols"].append(
             {
                 "fqname": node.fqname,

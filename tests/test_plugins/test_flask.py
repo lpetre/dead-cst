@@ -485,11 +485,7 @@ def test_flask_plugin_handles_factory_function(build_plugin_graph, reachable_fqn
         },
         [native.NativePlugin.flask()],
     )
-    reached = {
-        n.fqname
-        for n in graph.reachable(seed_flags=graph.default_seed_mask())
-        if n.kind != "synthetic"
-    }
+    reached = {n.fqname for n in graph.reachable(seed_flags=graph.default_seed_mask())}
     assert "app.main.app" in reached
     assert "app.main.list_items" in reached
     assert "app.main.create_item" in reached
@@ -569,7 +565,7 @@ def test_flask_plugin_factory_returning_blueprint_stays_dead(build_plugin_graph,
 def test_flask_plugin_ignores_non_app_flask_users(build_plugin_graph, reachable_fqnames):
     """Variables that touch ``flask`` for unrelated reasons stay dead.
 
-    Walking only to the ``flask`` synthetic isn't enough -- the plugin
+    Walking only to the ``flask`` external node isn't enough -- the plugin
     must require a discriminating ``Flask`` / ``Blueprint`` import on
     the path before treating ``X`` as an instance. Otherwise any value
     derived from e.g. ``request`` would get marked as an app.

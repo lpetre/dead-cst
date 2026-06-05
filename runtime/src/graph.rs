@@ -103,7 +103,6 @@ const VALID_KINDS: &[&str] = &[
     "import",
     "type_alias",
     "module",
-    "synthetic",
     "external",
 ];
 
@@ -272,12 +271,12 @@ impl NodeFlags {
     /// Import alias whose upstream module ty could not resolve (a bad
     /// relative-import name, a module that doesn't resolve at all, or a
     /// resolved module with no backing file). Set on the alias node
-    /// itself in place of the old `[unresolved] X` synthetic sink.
+    /// itself in place of the old `[unresolved] X` sink node.
     /// Metadata only (not a seed); registered `engine/unresolved`.
     #[classattr]
     pub(crate) const UNRESOLVED: u32 = 1;
     /// Explicit entrypoint — plugin-emitted seeds, the CLI's `-e` flag,
-    /// `[project.scripts]` targets, factory-app synthetics, etc. A `seed`
+    /// `[project.scripts]` targets, factory-app entrypoints, etc. A `seed`
     /// flag (registered `engine/entrypoint`), so reachability seeds from
     /// `ENTRYPOINT`-flagged nodes by default.
     #[classattr]
@@ -384,7 +383,7 @@ impl EdgeFlags {
     pub(crate) const DYNAMIC_IMPORT: u8 = 2;
     /// Edge from a base class to a subclass discovered via the
     /// `__init_subclass__` / `__subclasshook__` plugin. Replaces the old
-    /// `<__init_subclass__>:Parent` anchor synthetic — reachability flows
+    /// `<__init_subclass__>:Parent` anchor node — reachability flows
     /// `parent → subclass` directly so a live base keeps its subclasses
     /// alive.
     #[classattr]
@@ -431,7 +430,6 @@ mod tests {
             "import",
             "type_alias",
             "module",
-            "synthetic",
             "external",
         ] {
             let interned = intern_kind(kind).expect("known kinds must intern");

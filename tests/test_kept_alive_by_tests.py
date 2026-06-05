@@ -1,7 +1,7 @@
 """End-to-end tests for the ``test/testcase`` plugin flag and
 ``kept_alive_by_flags_only(test/testcase)``.
 
-Test plugins (pytest, unittest) declare and stamp their synthetic seed
+Test plugins (pytest, unittest) declare and stamp their seed
 nodes with the registered ``test/testcase`` flag (resolved by name via
 ``node_flag("test/testcase")``). Default reachability treats those seeds
 the same as any other entrypoint; the flag-taking blast-radius query

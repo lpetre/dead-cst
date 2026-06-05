@@ -307,7 +307,7 @@ def test_init_subclass_subscripted_base(make_analysis, write_files, reachable_fq
 def test_init_subclass_parent_is_direct_predecessor(make_analysis, write_files, predecessors_of):
     """Reachability of a subclass routes through a direct, INIT_SUBCLASS-flagged
     ``parent -> subclass`` edge, so ``why-alive`` chains read ``Foo <- Plugin``
-    (no intermediate synthetic marker node)."""
+    (no intermediate marker node)."""
     write_files(
         {
             "pkg/__init__.py": "",
@@ -332,7 +332,7 @@ def test_init_subclass_parent_is_direct_predecessor(make_analysis, write_files, 
     ).materialize_all()
     nodes = graph.nodes()
     foo = next(n for n in nodes if n.fqname == "pkg.impls.Foo")
-    # The parent class is a *direct* predecessor -- no synthetic marker hop.
+    # The parent class is a *direct* predecessor -- no marker hop.
     preds = predecessors_of(graph, foo)
     parent = next(p for p in preds if p.fqname == "pkg.base.Plugin")
     assert parent.kind == "class"

@@ -83,7 +83,7 @@ This applies equally to:
   importing file's global scope and mint one local node per imported
   name. The libcst pipeline labels these `NodeFlags.STAR_REEXPORT`;
   in the rust path the `kind == "import"` plus a missing source
-  position (it's synthetic) is enough.
+  position is enough.
 
 ### 3. Shadowed declarations are first-class graph nodes
 

@@ -330,11 +330,7 @@ def test_celery_plugin_handles_factory_function(build_plugin_graph, reachable_fq
         },
         [native.NativePlugin.celery()],
     )
-    reached = {
-        n.fqname
-        for n in graph.reachable(seed_flags=graph.default_seed_mask())
-        if n.kind != "synthetic"
-    }
+    reached = {n.fqname for n in graph.reachable(seed_flags=graph.default_seed_mask())}
     assert "app.celery.app" in reached
     assert "app.celery.run" in reached
     assert "app.celery.bound" in reached

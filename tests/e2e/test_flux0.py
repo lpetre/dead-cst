@@ -11,7 +11,7 @@ Levels:
 - **0**: ``analyze`` runs to completion without raising; exit code is
   the documented 0 / 1.
 - **1**: :meth:`Analysis.ancestors` on the pinned ``main`` symbol
-  reports the native ``main_block`` synthetic in its predecessor chain.
+  reports the native ``main_block`` entrypoint in its predecessor chain.
 """
 
 from __future__ import annotations
