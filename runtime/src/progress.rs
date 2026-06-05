@@ -28,7 +28,7 @@ pub(crate) const PHASE_ENUM: usize = 1;
 /// Parallel rayon ingest (`file_to_nodes` / `file_to_edges` /
 /// `file_to_ref_edges`).
 pub(crate) const PHASE_POPULATE: usize = 2;
-/// Serial fan-in (`assemble_graph`).
+/// Fan-in (`assemble_graph`).
 pub(crate) const PHASE_ASSEMBLE: usize = 3;
 /// Post-assemble fqname-index build (`build_fqname_indices`).
 pub(crate) const PHASE_FQNAME: usize = 4;

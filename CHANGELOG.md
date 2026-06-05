@@ -255,6 +255,14 @@ two versions.
 
 ### Changed
 
+- **Parallel node mint in the assemble pass.** The first phase of
+  `assemble_graph` (per-file `GraphNode` minting plus the secondary index
+  folds) now fans out across rayon workers with the GIL released, writing each
+  file's nodes through its disjoint offset-derived slice of the prefilled
+  payload region — the same shape the edge-translation phase already used. The
+  graph is bit-for-bit identical (node indices stay offset-derived and
+  deterministic); on a 4-core machine the phase runs ~3.5× faster, cutting
+  end-to-end `materialize()` by ~20% on decl-heavy projects.
 - **`re_materialize` drops the previous graph off-thread.** When a rebuild
   swaps in fresh `BuildOutputs`, the previous build's graph (nodes, edges,
   adjacency, the fqname/base indices) is now deallocated on a detached thread
