@@ -283,17 +283,16 @@ IMPORT_BASE_EDGES = frozenset(
             id="nested-try-except-cst.Import",
         ),
         pytest.param(
-            # Nested star import fans out to every name `p.functions`
-            # exports, attributed to the enclosing function. No alias
-            # node is minted.
+            # `from X import *` nested in a function body is a SyntaxError
+            # ("import * only allowed at module level"), so it cannot occur
+            # in runnable Python. We deliberately do not fan it out: the
+            # nested star contributes no edges, leaving only the enclosing
+            # function's parent-module edge (`f()` resolves to nothing).
             "def a():\n    from p.functions import *\n    f()\n",
             {
-                "p.x.a -> p.functions",
-                "p.x.a -> p.functions.f",
-                "p.x.a -> p.functions.g",
                 "p.x.a -> p.x",
             },
-            id="nested-star-import",
+            id="nested-star-import-is-skipped",
         ),
         pytest.param(
             "from .functions import f\ndef a(): f()",

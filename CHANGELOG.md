@@ -237,6 +237,12 @@ two versions.
 
 ### Changed
 
+- **Nested `from X import *` is no longer fanned out.** A `from X import *`
+  inside a function or class body is a `SyntaxError` ("import * only allowed at
+  module level"), so it cannot occur in runnable Python. The engine previously
+  expanded such a statement to an edge per public export of the target module;
+  it now skips it (contributing no edges). Module-level star imports — the only
+  valid form — are unaffected.
 - **Module-level dunder / `__future__` keep-alive moved into the engine.**
   Module-scope dunders (`__all__`, `__version__`, PEP 562
   `__getattr__` / `__dir__`, …) and `__future__` imports are now kept alive by

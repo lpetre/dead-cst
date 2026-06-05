@@ -513,12 +513,12 @@ impl<'a, 'db> RefWalker<'a, 'db> {
         self.current_flags = 0;
     }
 
-    /// `from X import …` inside a function/class body. Resolves the
+    /// `from X import name` inside a function/class body. Resolves the
     /// from-clause through ty (so relative imports get level dots
-    /// converted to absolute), then walks each alias. `*` fans out to
-    /// every non-underscore export in the upstream via
-    /// [`emit_nested_star`]. Mirrors today's
-    /// `RefCollector::emit_nested_import_from` (lines 2071–2096).
+    /// converted to absolute), then walks each alias and emits the
+    /// upstream edges. A nested `from X import *` is a SyntaxError
+    /// ("import * only allowed at module level") so it cannot occur in
+    /// runnable Python — it is skipped rather than fanned out.
     fn emit_nested_import_from(&mut self, stmt: &ruff_python_ast::StmtImportFrom) {
         let module_str = from_module_string(self.model.db(), self.file, stmt);
         if module_str.is_empty() {
@@ -527,11 +527,9 @@ impl<'a, 'db> RefWalker<'a, 'db> {
         self.current_flags = self.flags_for_range(stmt.range);
         for alias in &stmt.names {
             let name = alias.name.id.as_str();
+            // `from X import *` here would be a module-level-only
+            // SyntaxError; skip it (no fan-out for non-runnable code).
             if name == "*" {
-                let Some(module_name) = ModuleName::new(&module_str) else {
-                    continue;
-                };
-                self.emit_nested_star(&module_name);
                 continue;
             }
             let bound_name = match &alias.asname {
@@ -546,28 +544,6 @@ impl<'a, 'db> RefWalker<'a, 'db> {
             self.emit_upstream(&spec, bound_name, &[]);
         }
         self.current_flags = 0;
-    }
-
-    /// Fan a nested `from X import *` out to every non-underscore
-    /// export in the upstream module. Mirrors today's
-    /// `RefCollector::emit_nested_star` (lines 2109–2129).
-    fn emit_nested_star(&mut self, module_name: &ModuleName) {
-        let Some(module) = resolve_module(self.db, self.file, module_name) else {
-            return;
-        };
-        let Some(target_file) = module.file(self.db) else {
-            return;
-        };
-        self.emit_edge(NodeRef::Module(target_file));
-        let target_nodes = file_to_nodes(self.db, target_file);
-        for (name, locals) in &target_nodes.exports_by_name {
-            if name.starts_with('_') {
-                continue;
-            }
-            for &local_idx in locals {
-                self.emit_edge(target_nodes.refs[local_idx as usize]);
-            }
-        }
     }
 
     /// Walk an annotation expression, marking the recursion so any
