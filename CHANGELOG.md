@@ -321,6 +321,15 @@ two versions.
   `NodeFlags.ENTRYPOINT` directly on the decl via `keep_alive` — same
   reachability, no orphan seed node. No `plugin_api` epoch or `FORMAT_VERSION`
   bump — `keep_alive` already exists.
+- **`discordpy` no longer mints `<discordpy-cog>:` / `<discordpy-extension>:`
+  synthetic seeds.** A cog file's `Cog` subclasses plus its `setup`/`teardown`
+  hooks were seeded through a `<discordpy-cog>:<module>` node, and each
+  `load_extension(...)` target module's surface through a
+  `<discordpy-extension>:<fqname>` node. Each target is now kept alive by
+  setting `NodeFlags.ENTRYPOINT` directly on the decl via `keep_alive`; the
+  bot/client variable keep-alive and the handler-decorator edges
+  (`bot -> @bot.command` &c.) are unchanged. No `plugin_api` epoch or
+  `FORMAT_VERSION` bump — `keep_alive` already exists.
 - **Graph node indices are now deterministic across runs.** ty's `files()`
   set has no stable iteration order, so the global index assigned to each node
   (and therefore the order of `Analysis.dead()` / `reachable()` results and the
