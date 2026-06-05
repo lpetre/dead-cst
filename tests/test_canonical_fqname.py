@@ -35,7 +35,7 @@ def _module_fqnames(graph) -> dict[str, str]:
 
 
 def test_pep660_finder_install_resolves_via_project_root(
-    tmp_path, write_files, make_workspace_venv
+    tmp_path, write_files, make_workspace_venv, descendants_of
 ):
     """Reproduces #222: a venv whose ``.pth`` is a PEP 660 finder stub
     (no flat path entries) must not break first-party resolution. We
@@ -71,7 +71,7 @@ def test_pep660_finder_install_resolves_via_project_root(
     job_router_alias = next(n for n in graph.nodes() if n.fqname == "myapp.main.job_router")
     router_var = next(n for n in graph.nodes() if n.fqname == "myapp.routes.job.router")
     # The alias's descendant set should reach the upstream var.
-    assert router_var in graph.descendants(job_router_alias)
+    assert router_var in descendants_of(graph, job_router_alias)
 
 
 def test_monorepo_pth_beats_project_root_in_fqname(tmp_path, write_files, make_workspace_venv):

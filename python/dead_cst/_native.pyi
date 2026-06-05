@@ -522,8 +522,8 @@ class ProjectContext:
     :meth:`materialize`. Each plugin's rust impl runs against this same
     instance, emitting graph mutations the apply pass folds into the
     in-progress graph; an impl may call any of the ``find_*`` /
-    ``decls_*`` / ``descendants`` / ``ancestors`` / ``reachable``
-    queries below.
+    ``decls_*`` / ``descendants_indices`` / ``ancestors_indices`` /
+    ``reachable`` queries below.
 
     Queries answer against the live in-progress graph (so an op
     emitted earlier in the same plugin is visible to later queries).
@@ -800,38 +800,27 @@ class ProjectContext:
 
     # ----- Traversal -----------------------------------------------------
 
-    def descendants(self, root: SymbolNode, *, skip_flags: int = 0) -> list[SymbolNode]:
-        """Forward closure: every node reachable from ``root`` by
-        following graph edges.
+    def descendants_indices(self, root_idx: int, *, skip_flags: int = 0) -> list[int]:
+        """Forward closure: every node reachable from ``root_idx`` by
+        following graph edges. Takes a positional index into
+        :meth:`nodes` and returns descendant indices.
 
         ``skip_flags`` filters out edges whose flag mask intersects —
         pass ``EdgeFlags.DEAD_BRANCH`` to compute strict reachability
-        excluding dead branches.
-        """
-        ...
-
-    def descendants_indices(self, root_idx: int, *, skip_flags: int = 0) -> list[int]:
-        """Idx-keyed variant of :meth:`descendants`. Takes a positional
-        index into :meth:`nodes` and returns descendant indices rather
-        than allocating ``SymbolNode`` clones. Raises
-        :class:`IndexError` when ``root_idx`` is out of range.
-        """
-        ...
-
-    def ancestors(self, decl: SymbolNode, *, skip_flags: int = 0) -> list[SymbolNode]:
-        """Reverse closure: every node that can reach ``decl`` by
-        following graph edges.
-
-        Used for predecessor-chain walks and blast-radius scoping.
-        ``skip_flags`` works the same as in :meth:`descendants`.
+        excluding dead branches. Raises :class:`IndexError` when
+        ``root_idx`` is out of range.
         """
         ...
 
     def ancestors_indices(self, decl_idx: int, *, skip_flags: int = 0) -> list[int]:
-        """Idx-keyed variant of :meth:`ancestors`. Takes a positional
-        index into :meth:`nodes` and returns ancestor indices rather
-        than allocating ``SymbolNode`` clones. Raises
-        :class:`IndexError` when ``decl_idx`` is out of range.
+        """Reverse closure: every node that can reach ``decl_idx`` by
+        following graph edges. Takes a positional index into
+        :meth:`nodes` and returns ancestor indices. Used for
+        predecessor-chain walks and blast-radius scoping.
+
+        ``skip_flags`` works the same as in
+        :meth:`descendants_indices`. Raises :class:`IndexError` when
+        ``decl_idx`` is out of range.
         """
         ...
 

@@ -40,8 +40,8 @@ use ty_python_core::semantic_index;
 use crate::graph::{DeclKey, NodeFlags};
 use crate::helpers::{
     classify_base, collect_all_imports_local, detect_dead_ranges, file_default_flags,
-    file_path_string, iter_top_level_classes, module_fqname_for_file, position, range_key,
-    scan_noqa_directives, NODE_FLAGS_NOQA_PIN,
+    iter_top_level_classes, module_fqname_for_file, position, range_key, scan_noqa_directives,
+    NODE_FLAGS_NOQA_PIN,
 };
 use crate::ingest::{decl_kind_str, file_package_name, from_module_string};
 
@@ -108,17 +108,18 @@ pub(crate) fn def_key<'db>(
 /// * `[external file] X` — a site-packages file with no owning dist;
 ///   `X` is the top-level module name.
 ///
-/// `path` is the resolved target file's site-packages path so the
-/// assembled `kind="external"` node can be excluded by path (codemod,
-/// scoping). Several keys may share an fqname with different paths —
-/// e.g. two submodules of one dist; assembly dedups by fqname and keeps
-/// the first path. Stdlib targets and genuinely-unresolved imports mint
-/// no `ExternalKey`: stdlib stays silent, and an unresolved import's
-/// alias node carries `NodeFlags::UNRESOLVED`.
+/// `file` is the resolved target's site-packages `File`, carried so the
+/// assembled `kind="external"` node can re-derive its path (for codemod
+/// / scoping exclusion) without re-resolving. Several keys may share an
+/// fqname with different files — e.g. two submodules of one dist;
+/// assembly dedups by fqname and keeps the first (path-sorted) file.
+/// Stdlib targets and genuinely-unresolved imports mint no `ExternalKey`:
+/// stdlib stays silent, and an unresolved import's alias node carries
+/// `NodeFlags::UNRESOLVED`.
 #[salsa::interned(debug)]
 pub(crate) struct ExternalKey<'db> {
     pub(crate) fqname: String,
-    pub(crate) path: String,
+    pub(crate) file: File,
 }
 
 // Salsa tracks the interned heap separately; report 0 from GetSize.
@@ -173,7 +174,10 @@ pub(crate) fn external_fqname_for(
 pub(crate) struct NodeData {
     pub(crate) fqname: String,
     pub(crate) kind: NodeKind,
-    pub(crate) path: String,
+    /// The file this node belongs to. Every node in a `file_to_nodes`
+    /// payload shares it; the assembly pass re-derives the path string
+    /// from it (one allocation per file instead of one per node).
+    pub(crate) file: File,
     pub(crate) start_line: usize,
     pub(crate) start_column: usize,
     pub(crate) end_line: usize,
@@ -249,8 +253,8 @@ pub(crate) struct ImportPayload {
 
 /// Salsa-tracked output of [`file_to_nodes`]. Parallel arrays plus a
 /// reverse lookup map make every per-file node addressable in O(1)
-/// either by index (assembly pass) or by `NodeRef` identity
-/// (cross-file edge resolution via [`ref_to_node`]).
+/// either by index (assembly pass) or by `NodeRef` identity via
+/// `ref_to_local` (cross-file edge resolution).
 ///
 /// Indexing convention: `nodes[0]` is the synthetic `kind="module"`
 /// node for the file; `nodes[1..]` are global-scope definitions in
@@ -329,61 +333,6 @@ pub(crate) enum ClassBaseSpec {
     ModuleMember { module: String, name: String },
 }
 
-/// Resolve a `NodeRef` to its `NodeData` payload.
-///
-/// Thin accessor (not salsa-tracked — see PR discussion): one
-/// `file_to_nodes` lookup (memoized, ~ns) plus one HashMap probe.
-/// Keeps the public identity model (callers traffic in `NodeRef`,
-/// fetch `NodeData` on demand) without paying the ~200–400MB of
-/// salsa ingredient overhead a `#[salsa::tracked] ref_to_node` would
-/// cost at 4M-node scale.
-///
-/// Panics if the `NodeRef` doesn't belong to the project (file not
-/// in the project, or `Def(d)` whose `d.file(db)` doesn't enumerate
-/// `d` at module scope). Both indicate a contract violation upstream;
-/// surface the bug loudly.
-#[allow(dead_code)]
-pub(crate) fn ref_to_node<'db>(db: &'db dyn ProjectDb, r: NodeRef<'db>) -> NodeData {
-    match r {
-        NodeRef::Def(d) => {
-            let file = d.0;
-            let payload = file_to_nodes(db, file);
-            let idx = *payload
-                .ref_to_local
-                .get(&r)
-                .expect("NodeRef::Def does not belong to its claimed file's payload")
-                as usize;
-            payload.nodes[idx].clone()
-        }
-        NodeRef::Module(f) => {
-            let payload = file_to_nodes(db, f);
-            payload.nodes[0].clone()
-        }
-        NodeRef::StarStmt(file, _) => {
-            let payload = file_to_nodes(db, file);
-            let idx = *payload
-                .ref_to_local
-                .get(&r)
-                .expect("NodeRef::StarStmt does not belong to its claimed file's payload")
-                as usize;
-            payload.nodes[idx].clone()
-        }
-        NodeRef::External(k) => NodeData {
-            fqname: k.fqname(db).clone(),
-            kind: NodeKind::External,
-            path: k.path(db).clone(),
-            start_line: 0,
-            start_column: 0,
-            end_line: 0,
-            end_column: 0,
-            flags: 0,
-            is_overload: false,
-            imports: None,
-            name_range: (0, 0),
-        },
-    }
-}
-
 /// Modules whose `.overload` attribute marks a function decl as a stub.
 const OVERLOAD_MODULES: &[&str] = &["typing", "typing_extensions"];
 
@@ -445,7 +394,6 @@ pub(crate) fn file_to_nodes<'db>(db: &'db dyn ProjectDb, file: File) -> FileNode
     let parsed = parsed_module(db, file).load(db);
     let source = source_text(db, file);
     let line_index = line_index(db, file);
-    let path_str = file_path_string(db, file);
     let module_fqname = module_fqname_for_file(db, file);
     let default_flags = file_default_flags(db, file);
     let (file_pinned_by_noqa, per_line_noqa_pins) =
@@ -463,7 +411,7 @@ pub(crate) fn file_to_nodes<'db>(db: &'db dyn ProjectDb, file: File) -> FileNode
     nodes.push(NodeData {
         fqname: module_fqname.clone(),
         kind: NodeKind::Module,
-        path: path_str.clone(),
+        file,
         start_line: msl,
         start_column: msc,
         end_line: mel,
@@ -604,7 +552,7 @@ pub(crate) fn file_to_nodes<'db>(db: &'db dyn ProjectDb, file: File) -> FileNode
         let node = NodeData {
             fqname: format!("{module_fqname}.{local_name}"),
             kind: node_kind,
-            path: path_str.clone(),
+            file,
             start_line: sl,
             start_column: sc,
             end_line: el,
@@ -641,7 +589,7 @@ pub(crate) fn file_to_nodes<'db>(db: &'db dyn ProjectDb, file: File) -> FileNode
                     let star_node = NodeData {
                         fqname: star_fqname,
                         kind: NodeKind::Import,
-                        path: path_str.clone(),
+                        file,
                         start_line: sl,
                         start_column: sc,
                         end_line: el,
@@ -1156,13 +1104,13 @@ pub(crate) fn file_to_edges<'db>(db: &'db dyn ProjectDb, file: File) -> FileEdge
         }
         // Non-first-party (site-packages) → External node keyed on the
         // PEP 503 dist name (or top-level module name) with the resolved
-        // file's path.
+        // target file (its path is re-derived at assembly).
         if target_module
             .search_path(db)
             .is_some_and(|sp| !sp.is_first_party() && sp.is_site_packages())
         {
             let fqname = external_fqname_for(db, target_file, top_level);
-            let key = ExternalKey::new(db, fqname, file_path_string(db, target_file));
+            let key = ExternalKey::new(db, fqname, target_file);
             edges.insert((alias_ref, NodeRef::External(key), 0));
             continue;
         }

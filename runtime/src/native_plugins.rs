@@ -58,8 +58,8 @@ use crate::file_payload::{file_to_nodes, NodeData, NodeKind};
 use crate::flag_registry::FlagRegistry;
 use crate::graph::EdgeFlags;
 use crate::helpers::{
-    collect_modules_imports_local, decorators_match_imports, matched_call_target_any,
-    top_level_assign_to_name, ArgValue, CallArgs, FactoryCallFinder,
+    collect_modules_imports_local, decorators_match_imports, file_path_string,
+    matched_call_target_any, top_level_assign_to_name, ArgValue, CallArgs, FactoryCallFinder,
 };
 use crate::ingest::file_package_name;
 use crate::project::FrozenView;
@@ -274,6 +274,13 @@ impl<'db> FileContext<'db> {
     /// The file's module fqname (``nodes()[0].fqname``).
     pub(crate) fn module_fqname(&self) -> &'db str {
         &file_to_nodes(self.db, self.file).nodes[0].fqname
+    }
+
+    /// This file's source path, re-derived from its [`File`]. Every node
+    /// in the file shares it, so [`PluginFileCtx`] computes it once per
+    /// call and lends it to [`file_node_view`].
+    pub(crate) fn path(&self) -> String {
+        file_path_string(self.db, self.file)
     }
 
     /// Local index of the module node (always 0 — kept as a
@@ -2050,12 +2057,16 @@ pub mod plugin_api {
     /// Project the crate-internal per-file `NodeData` onto the curated,
     /// owned [`FileNodeView`]. Shared by [`PluginFileCtx::node`] and
     /// [`PluginFileCtx::nodes`] so the two stay in lockstep.
-    fn file_node_view(local_idx: u32, node: &crate::file_payload::NodeData) -> FileNodeView {
+    fn file_node_view(
+        local_idx: u32,
+        node: &crate::file_payload::NodeData,
+        path: &str,
+    ) -> FileNodeView {
         FileNodeView {
             local_idx,
             fqname: node.fqname.clone(),
             kind: node.kind.as_static_str().to_string(),
-            path: node.path.clone(),
+            path: path.to_string(),
             start_line: node.start_line,
             end_line: node.end_line,
             flags: node.flags,
@@ -2099,17 +2110,18 @@ pub mod plugin_api {
         /// Resolve a file-local index to an owned [`FileNodeView`].
         pub fn node(&self, local_idx: u32) -> Option<FileNodeView> {
             let node = self.inner.nodes().get(local_idx as usize)?;
-            Some(file_node_view(local_idx, node))
+            Some(file_node_view(local_idx, node, &self.inner.path()))
         }
 
         /// Every node in this file as a [`FileNodeView`], in file-local
         /// index order.
         pub fn nodes(&self) -> Vec<FileNodeView> {
+            let path = self.inner.path();
             self.inner
                 .nodes()
                 .iter()
                 .enumerate()
-                .map(|(i, node)| file_node_view(i as u32, node))
+                .map(|(i, node)| file_node_view(i as u32, node, &path))
                 .collect()
         }
 

@@ -94,12 +94,13 @@ def build_unreachable_nodes(tmp_path, make_analysis):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(_normalise(src))
         ctx = make_analysis().materialize_all()
-        seeds = [n for n in ctx.nodes() if n.fqname in entrypoints]
-        reachable: set = set()
-        for seed in seeds:
-            reachable.update(ctx.descendants(seed))
-            reachable.add(seed)
-        return [n for n in ctx.nodes() if n not in reachable]
+        nodes = ctx.nodes()
+        seed_idxs = [i for i, n in enumerate(nodes) if n.fqname in entrypoints]
+        reachable: set[int] = set()
+        for idx in seed_idxs:
+            reachable.update(ctx.descendants_indices(idx))
+            reachable.add(idx)
+        return [n for i, n in enumerate(nodes) if i not in reachable]
 
     return _build
 

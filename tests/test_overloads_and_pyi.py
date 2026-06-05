@@ -72,9 +72,10 @@ def test_dead_overloads_are_removed_with_impl(tmp_path, make_analysis):
         )
     )
     graph = make_analysis().materialize_all()
-    keep = next(n for n in graph.nodes() if n.fqname == "mod.keep")
-    reachable = set(graph.descendants(keep)) | {keep}
-    unreachable = [n for n in graph.nodes() if n not in reachable]
+    nodes = graph.nodes()
+    keep_idx = next(i for i, n in enumerate(nodes) if n.fqname == "mod.keep")
+    reachable = set(graph.descendants_indices(keep_idx)) | {keep_idx}
+    unreachable = [n for i, n in enumerate(nodes) if i not in reachable]
     remove_code(unreachable, tmp_path)
 
     rewritten = (tmp_path / "mod.py").read_text()
@@ -110,7 +111,7 @@ def test_live_overloads_survive_codemod(tmp_path, make_analysis):
     assert rewritten.count("@overload") == 2
 
 
-def test_overload_decorator_forms_recognised(build_decl_graph):
+def test_overload_decorator_forms_recognised(build_decl_graph, descendants_of):
     """Both `@overload` (from-import / aliased) and the `@typing.overload`
     attribute form (plain `import typing`) are recognised as overload stubs.
     Overload status is internal (not Python-visible); the observable proxy is
@@ -144,14 +145,14 @@ def test_overload_decorator_forms_recognised(build_decl_graph):
     f_nodes = [n for n in graph.nodes() if n.fqname == "mod.f" and n.kind == "function"]
     by_line = {n.start_line: n for n in f_nodes}
     assert set(by_line) == {5, 7, 8}, f"unexpected lines: {sorted(by_line)}"
-    descendants = set(graph.descendants(by_line[8]))
+    descendants = set(descendants_of(graph, by_line[8]))
     assert by_line[5] in descendants, "@ovl (aliased) stub should anchor to the impl"
     assert by_line[7] in descendants, (
         "@typing.overload (attribute form) stub should anchor to the impl"
     )
 
 
-def test_impl_to_overload_anchor_edges(build_decl_graph):
+def test_impl_to_overload_anchor_edges(build_decl_graph, descendants_of):
     """Each in-file `@overload` stub gets an explicit `impl -> stub` edge,
     visible in `descendants(impl)`."""
     graph = build_decl_graph(
@@ -183,7 +184,7 @@ def test_impl_to_overload_anchor_edges(build_decl_graph):
         if n.fqname == "mod.f" and n.kind == "function" and n.start_line in (4, 6)
     ]
     assert len(stubs) == 2
-    descendants = set(graph.descendants(impl))
+    descendants = set(descendants_of(graph, impl))
     assert all(s in descendants for s in stubs), (
         "Each overload stub should be a descendant of the impl via the anchor edge"
     )

@@ -69,8 +69,8 @@ enum Resolution<'db> {
     },
 }
 use crate::helpers::{
-    detect_dead_ranges, detect_type_checking_ranges, file_path_string, is_dunder_name,
-    EDGE_FLAG_DEAD_BRANCH, EDGE_FLAG_DYNAMIC_IMPORT,
+    detect_dead_ranges, detect_type_checking_ranges, is_dunder_name, EDGE_FLAG_DEAD_BRANCH,
+    EDGE_FLAG_DYNAMIC_IMPORT,
 };
 use crate::ingest::{
     collapse_attribute_chain, detect_dynamic_call, file_package_name, from_module_string,
@@ -271,7 +271,7 @@ impl<'a, 'db> RefWalker<'a, 'db> {
     /// the resolved upstream path: `[external dist] X` / `[external file] X`
     /// for site-packages (via `external_fqname_for`'s PEP 503 lookup).
     fn emit_external_node(&mut self, fqname: String, target_file: File) {
-        let key = ExternalKey::new(self.db, fqname, file_path_string(self.db, target_file));
+        let key = ExternalKey::new(self.db, fqname, target_file);
         self.emit_edge(NodeRef::External(key));
     }
 

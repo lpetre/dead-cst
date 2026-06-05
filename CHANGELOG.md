@@ -479,6 +479,12 @@ two versions.
 
 ### Removed
 
+- **`ProjectContext.descendants(root)` / `ancestors(decl)` (breaking,
+  native API).** The two `SymbolNode`-keyed traversal methods are removed
+  in favor of the index-keyed `descendants_indices(root_idx)` /
+  `ancestors_indices(decl_idx)` already used by `Analysis`. Callers that hold
+  a `SymbolNode` resolve its index via `ctx.nodes().index(node)` first. The
+  internal `node_key_of` / `lookup_idx` helpers go with them.
 - **`add_synthetic_node` plugin op and the `kind="synthetic"` node kind
   (breaking, plugin API).** `PluginOps::add_synthetic_node` /
   `FileOps::add_synthetic_node` — and the `PreparedOp::Node` /
