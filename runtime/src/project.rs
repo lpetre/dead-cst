@@ -25,13 +25,14 @@ use ty_project::{Db as ProjectDb, ProjectDatabase, ProjectMetadata};
 use ty_python_core::program::UseDefaultStrategy;
 
 use crate::builder::{
-    apply_prepared_batch, bfs, not_materialized, Direction, GraphBuilder, GraphNode, PreparedOp,
+    apply_prepared_batch, bfs, not_materialized, Direction, GraphBuilder, GraphNode, NodeKey,
+    PreparedOp,
 };
 use crate::file_extraction::{
     file_extraction, imports_local_from_facts, match_callee_chain, match_callee_descriptor,
     CallSiteFact, FileExtraction,
 };
-use crate::file_payload::{file_to_edges, file_to_nodes, FileEdges, NodeKind, NodeRef};
+use crate::file_payload::{file_to_edges, file_to_nodes, FileEdges, FileNodes, NodeKind, NodeRef};
 use crate::file_ref_edges::{file_to_ref_edges, FileRefEdges};
 use crate::flag_registry::FlagRegistry;
 use crate::graph::{intern_kind, DeclIndex, NativeGraph, SymbolNode};
@@ -479,12 +480,12 @@ pub(crate) fn build_project_graph(
 
     counters.start_phase(PHASE_ASSEMBLE, Some(project_files.len()));
 
-    // Serial assembly pass: walk files in deterministic order,
-    // assign global graph node indices to each NodeRef, translate
-    // edges, mint synthetic External nodes, build Py<SymbolNode>
-    // wrappers, flush warnings. All salsa-tracked queries are
+    // Assembly pass: assign global graph node indices to each
+    // NodeRef (offset-derived, so deterministic regardless of
+    // worker scheduling), translate edges, mint synthetic External
+    // nodes, flush warnings. All salsa-tracked queries are
     // memoized from the parallel pre-populate above so this pass
-    // is pure hashmap/index work plus the GIL-bound Py creation.
+    // is pure hashmap/index work.
     let t_assemble = std::time::Instant::now();
     let assembled = assemble_graph(
         py,
@@ -604,19 +605,22 @@ struct AssembledGraph {
     decl_by_name_range: FxHashMap<(File, (u32, u32)), usize>,
 }
 
-/// Serial pass that converts the salsa-tracked per-file payloads
+/// Fan-in pass that converts the salsa-tracked per-file payloads
 /// (`file_to_nodes` / `file_to_edges` / `file_to_ref_edges`) into a
 /// fully-populated `GraphBuilder`.
 ///
 /// Three sub-passes:
 ///
-/// 1. **Node mint** — walk `project_files` in order, intern each
-///    file's payload `NodeData` into the builder. Build the
+/// 1. **Node mint** — write each file's payload `NodeData` into its
+///    offset-derived block of the prefilled payload region (the
+///    per-file blocks are disjoint, so the fill fans out across
+///    rayon workers with the GIL released). Build the
 ///    `NodeRef -> global_idx` map and the assorted secondary
 ///    indices (`global_index`, `module_nodes_by_file`,
-///    `class_by_selection`, `decl_by_name_range`). Apply the
-///    stub-only `ENTRYPOINT` flag fixup for `.pyi` decls whose
-///    runtime twin doesn't expose the same name.
+///    `class_by_selection`, `decl_by_name_range`) on concurrent
+///    sibling tasks. Apply the stub-only `ENTRYPOINT` flag fixup
+///    for `.pyi` decls whose runtime twin doesn't expose the same
+///    name.
 ///
 /// 2. **Edge translation** — walk each file's `FileEdges` and
 ///    `FileRefEdges`, translate every `NodeRef` to its `usize`
@@ -676,93 +680,236 @@ fn assemble_graph<'db>(
     let mut all_warnings: Vec<String> = Vec::new();
 
     // Pass 1: node mint.
-    for (file_pos, &file) in project_files.iter().enumerate() {
-        let payload = file_to_nodes(db, file);
-        // This file's nodes occupy the contiguous global-index block
-        // starting at `base`; each local ref lands at `base + local_idx`.
-        let base = node_offsets[file_pos];
+    //
+    // Mirrors pass 2's shape so the alloc-heavy work runs without the
+    // GIL on rayon workers:
+    //
+    //   1a. Serial fetch of every file's salsa-tracked `FileNodes`
+    //       payload (a memoized cache read after the populate fan-out),
+    //       its path string, and — for peer stubs — the `.py` twin's
+    //       payload for the stub-only ENTRYPOINT fixup.
+    //   1b. `Python::allow_threads` + rayon. The per-file offsets
+    //       partition the prefilled payload region, so each file's
+    //       `GraphNode`s are written through a disjoint `&mut` slice by
+    //       a parallel fill (one rayon item per file) that also collects
+    //       the file's `(NodeKey, global_idx)` rows. Concurrently,
+    //       sibling rayon tasks fold the secondary index maps
+    //       (`ref_to_global`, `local_to_global`, and the decl indices)
+    //       — each needs only the payload refs plus the offsets, so
+    //       they're independent of the node fill and of each other.
+    //   1c. Serial fold of the `NodeKey` rows into `node_index`,
+    //       keeping the key-collision assert that guards the
+    //       position-distinct invariant (`CLAUDE.md` principle 3).
 
-        // Stub-only ENTRYPOINT context: if this is a .pyi without a
-        // .py twin, every decl needs ENTRYPOINT. If it has a twin,
-        // only decls whose name isn't in the twin's exports need it.
+    let t_pass1_start = std::time::Instant::now();
+
+    // 1a: serial prefetch.
+    struct FileMint<'db> {
+        file: File,
+        /// This file's nodes occupy the contiguous global-index block
+        /// `[base, base + payload.nodes.len())`; each local ref lands
+        /// at `base + local_idx`.
+        base: usize,
+        payload: &'db FileNodes<'db>,
+        path_str: String,
+        is_stub: bool,
+        /// Stub-only ENTRYPOINT context: if this is a .pyi without a
+        /// .py twin (`None`), every decl needs ENTRYPOINT. If it has a
+        /// twin, only decls whose name isn't in the twin's exports
+        /// need it.
+        twin_payload: Option<&'db FileNodes<'db>>,
+    }
+    let mut mints: Vec<FileMint<'db>> = Vec::with_capacity(project_files.len());
+    for (file_pos, &file) in project_files.iter().enumerate() {
         let path_str = file_path_string(db, file);
         let is_stub = path_str.ends_with(".pyi");
-        let stub_twin: Option<File> = if is_stub {
-            peer_pyi_to_py.get(&file).copied()
+        let twin_payload = if is_stub {
+            peer_pyi_to_py
+                .get(&file)
+                .map(|&py_file| file_to_nodes(db, py_file))
         } else {
             None
         };
+        mints.push(FileMint {
+            file,
+            base: node_offsets[file_pos],
+            payload: file_to_nodes(db, file),
+            path_str,
+            is_stub,
+            twin_payload,
+        });
+    }
 
-        for (local_idx, &node_ref) in payload.refs.iter().enumerate() {
-            let node_data = &payload.nodes[local_idx];
+    // Disjoint per-file `&mut` windows over the prefilled payload
+    // region. The offsets are the exclusive prefix sum of the payload
+    // lengths, so successive `split_at_mut` calls reproduce them
+    // exactly (debug-asserted) and partition `[0, total_nodes)`.
+    let mut file_slices: Vec<&mut [GraphNode]> = Vec::with_capacity(mints.len());
+    let mut rest: &mut [GraphNode] = &mut builder.nodes;
+    for mint in &mints {
+        debug_assert_eq!(total_nodes - rest.len(), mint.base);
+        let (head, tail) = rest.split_at_mut(mint.payload.nodes.len());
+        file_slices.push(head);
+        rest = tail;
+    }
 
-            // Apply stub-only ENTRYPOINT flag if needed.
-            let mut flags = node_data.flags;
-            if is_stub && matches!(node_ref, NodeRef::Def(_)) {
-                let has_runtime = match stub_twin {
-                    Some(py_file) => {
-                        let py_payload = file_to_nodes(db, py_file);
-                        let name = node_data.fqname.rsplit('.').next().unwrap_or("");
-                        py_payload.exports_by_name.contains_key(name)
-                    }
-                    None => false,
-                };
-                if !has_runtime {
-                    flags |= NODE_FLAG_ENTRYPOINT;
-                }
-            }
+    // 1b: parallel node fill + concurrent index folds.
+    let mints_ref = &mints;
+    let counters_ref: &ProgressCounters = counters;
+    let ref_to_global_mut = &mut ref_to_global;
+    let local_to_global_mut = &mut local_to_global;
+    let global_index_mut = &mut global_index;
+    let module_nodes_mut = &mut module_nodes_by_file;
+    let class_by_selection_mut = &mut class_by_selection;
+    let decl_by_name_range_mut = &mut decl_by_name_range;
+    let (key_rows, ()) = py.allow_threads(move || {
+        use rayon::prelude::*;
+        rayon::join(
+            move || -> PyResult<Vec<Vec<(NodeKey, usize)>>> {
+                mints_ref
+                    .par_iter()
+                    .zip_eq(file_slices)
+                    .map(|(mint, slots)| {
+                        let mut keys: Vec<(NodeKey, usize)> =
+                            Vec::with_capacity(mint.payload.nodes.len());
+                        for (local_idx, node_data) in mint.payload.nodes.iter().enumerate() {
+                            let node_ref = mint.payload.refs[local_idx];
 
-            let node = GraphNode {
-                fqname: node_data.fqname.clone(),
-                kind: intern_kind(node_data.kind.as_static_str())?,
-                // Every node in this file's payload shares the file, so
-                // its path is `path_str` (computed once above) — re-derived
-                // here instead of stored per `NodeData`.
-                path: path_str.clone(),
-                start_line: node_data.start_line,
-                start_column: node_data.start_column,
-                end_line: node_data.end_line,
-                end_column: node_data.end_column,
-                flags,
-                is_overload: node_data.is_overload,
-                imports: node_data.imports.clone(),
-            };
-            let global_idx = base + local_idx;
-            builder.place_node(global_idx, node, file);
-            ref_to_global.insert(node_ref, global_idx);
-            local_to_global.insert((file, local_idx as u32), global_idx);
+                            // Apply stub-only ENTRYPOINT flag if needed.
+                            let mut flags = node_data.flags;
+                            if mint.is_stub && matches!(node_ref, NodeRef::Def(_)) {
+                                let has_runtime = match mint.twin_payload {
+                                    Some(py_payload) => {
+                                        let name =
+                                            node_data.fqname.rsplit('.').next().unwrap_or("");
+                                        py_payload.exports_by_name.contains_key(name)
+                                    }
+                                    None => false,
+                                };
+                                if !has_runtime {
+                                    flags |= NODE_FLAG_ENTRYPOINT;
+                                }
+                            }
 
-            match node_ref {
-                NodeRef::Module(_) => {
-                    module_nodes_by_file.insert(file, global_idx);
-                }
-                NodeRef::Def(d) => {
-                    // `d` is already the `(file, place_id, name_range)`
-                    // triple `global_index` keys on.
-                    global_index.insert(d, global_idx);
-                    let rk = node_data.name_range;
-                    if matches!(node_data.kind, NodeKind::Class) {
-                        class_by_selection.insert((file, rk), global_idx);
-                    }
-                    decl_by_name_range.insert((file, rk), global_idx);
-                }
-                NodeRef::StarStmt(_, _) => {
-                    // The kept `*<src>` star-statement node. Not a real
-                    // decl, so it contributes nothing to the decl indices
-                    // (`global_index` / `decl_by_name_range` /
-                    // `class_by_selection`); `ref_to_global` +
-                    // `local_to_global` above already wired it up.
-                }
-                NodeRef::External(_) => {
-                    // External NodeRefs never appear in FileNodes.refs;
-                    // they're only emitted as edge endpoints. This
-                    // branch is unreachable in practice but kept
-                    // exhaustive so a future variant addition fails
-                    // loudly instead of silently dropping.
-                }
-            }
+                            let node = GraphNode {
+                                fqname: node_data.fqname.clone(),
+                                kind: intern_kind(node_data.kind.as_static_str())?,
+                                // Every node in this file's payload shares
+                                // the file, so its path is the per-file
+                                // `path_str` — re-derived once per file
+                                // instead of stored per `NodeData`.
+                                path: mint.path_str.clone(),
+                                start_line: node_data.start_line,
+                                start_column: node_data.start_column,
+                                end_line: node_data.end_line,
+                                end_column: node_data.end_column,
+                                flags,
+                                is_overload: node_data.is_overload,
+                                imports: node_data.imports.clone(),
+                            };
+                            keys.push((node.key(mint.file), mint.base + local_idx));
+                            slots[local_idx] = node;
+                        }
+                        counters_ref.assemble_inc();
+                        Ok(keys)
+                    })
+                    .collect()
+            },
+            move || {
+                // Each index fold is a serial insert loop over `Copy`
+                // keys — cheap enough per map that one task per map
+                // (rather than per-file sharding + merge) hides them
+                // behind the node fill.
+                rayon::join(
+                    move || {
+                        for mint in mints_ref {
+                            for (local_idx, &node_ref) in mint.payload.refs.iter().enumerate() {
+                                ref_to_global_mut.insert(node_ref, mint.base + local_idx);
+                            }
+                        }
+                    },
+                    move || {
+                        rayon::join(
+                            move || {
+                                for mint in mints_ref {
+                                    for local_idx in 0..mint.payload.refs.len() {
+                                        local_to_global_mut.insert(
+                                            (mint.file, local_idx as u32),
+                                            mint.base + local_idx,
+                                        );
+                                    }
+                                }
+                            },
+                            move || {
+                                for mint in mints_ref {
+                                    for (local_idx, &node_ref) in
+                                        mint.payload.refs.iter().enumerate()
+                                    {
+                                        let global_idx = mint.base + local_idx;
+                                        match node_ref {
+                                            NodeRef::Module(_) => {
+                                                module_nodes_mut.insert(mint.file, global_idx);
+                                            }
+                                            NodeRef::Def(d) => {
+                                                // `d` is already the `(file,
+                                                // place_id, name_range)` triple
+                                                // `global_index` keys on.
+                                                global_index_mut.insert(d, global_idx);
+                                                let node_data = &mint.payload.nodes[local_idx];
+                                                let rk = node_data.name_range;
+                                                if matches!(node_data.kind, NodeKind::Class) {
+                                                    class_by_selection_mut
+                                                        .insert((mint.file, rk), global_idx);
+                                                }
+                                                decl_by_name_range_mut
+                                                    .insert((mint.file, rk), global_idx);
+                                            }
+                                            NodeRef::StarStmt(_, _) => {
+                                                // The kept `*<src>` star-statement
+                                                // node. Not a real decl, so it
+                                                // contributes nothing to the decl
+                                                // indices; the `ref_to_global` /
+                                                // `local_to_global` folds already
+                                                // wired it up.
+                                            }
+                                            NodeRef::External(_) => {
+                                                // External NodeRefs never appear in
+                                                // FileNodes.refs; they're only
+                                                // emitted as edge endpoints. This
+                                                // branch is unreachable in practice
+                                                // but kept exhaustive so a future
+                                                // variant addition fails loudly
+                                                // instead of silently dropping.
+                                            }
+                                        }
+                                    }
+                                }
+                            },
+                        );
+                    },
+                );
+            },
+        )
+    });
+
+    // 1c: fold the parallel fill's key rows into `node_index`. Payload
+    // nodes are position-distinct (`CLAUDE.md` principle 3), so no two
+    // ever share a `NodeKey`; the assert — kept on in release too,
+    // since a collision would silently corrupt the index map — guards
+    // that invariant.
+    for rows in key_rows? {
+        for (key, global_idx) in rows {
+            let prev = builder.node_index.insert(key, global_idx);
+            assert!(
+                prev.is_none(),
+                "payload node key collision at index {global_idx}: \
+                 assembly must mint each NodeKey once"
+            );
         }
-        counters.assemble_inc();
+    }
+
+    if std::env::var_os("DEAD_CST_TIMING").is_some() {
+        eprintln!("[dead-cst-timing] pass1={:?}", t_pass1_start.elapsed());
     }
 
     // Pass 2: edge translation.
