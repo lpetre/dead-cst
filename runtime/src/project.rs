@@ -25,8 +25,7 @@ use ty_project::{Db as ProjectDb, ProjectDatabase, ProjectMetadata};
 use ty_python_core::program::UseDefaultStrategy;
 
 use crate::builder::{
-    apply_prepared_batch, bfs, lookup_idx, not_materialized, Direction, GraphBuilder, GraphNode,
-    PreparedOp,
+    apply_prepared_batch, bfs, not_materialized, Direction, GraphBuilder, GraphNode, PreparedOp,
 };
 use crate::file_extraction::{
     file_extraction, imports_local_from_facts, match_callee_chain, match_callee_descriptor,
@@ -716,7 +715,10 @@ fn assemble_graph<'db>(
             let node = GraphNode {
                 fqname: node_data.fqname.clone(),
                 kind: intern_kind(node_data.kind.as_static_str())?,
-                path: node_data.path.clone(),
+                // Every node in this file's payload shares the file, so
+                // its path is `path_str` (computed once above) — re-derived
+                // here instead of stored per `NodeData`.
+                path: path_str.clone(),
                 start_line: node_data.start_line,
                 start_column: node_data.start_column,
                 end_line: node_data.end_line,
@@ -726,7 +728,7 @@ fn assemble_graph<'db>(
                 imports: node_data.imports.clone(),
             };
             let global_idx = base + local_idx;
-            builder.place_node(global_idx, node);
+            builder.place_node(global_idx, node, file);
             ref_to_global.insert(node_ref, global_idx);
             local_to_global.insert((file, local_idx as u32), global_idx);
 
@@ -841,16 +843,19 @@ fn assemble_graph<'db>(
     // Sort by (fqname, path) — `intern_external` dedups on fqname, so
     // the first path after the sort wins deterministically, and every
     // External lands at the same index every run.
-    let mut externals: Vec<(String, String, NodeRef<'db>)> = external_keys
+    let mut externals: Vec<(String, String, File, NodeRef<'db>)> = external_keys
         .into_iter()
         .filter_map(|r| match r {
-            NodeRef::External(key) => Some((key.fqname(db).clone(), key.path(db).clone(), r)),
+            NodeRef::External(key) => {
+                let file = key.file(db);
+                Some((key.fqname(db).clone(), file_path_string(db, file), file, r))
+            }
             _ => None,
         })
         .collect();
     externals.sort_unstable_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
-    for (fqname, path, r) in externals {
-        let idx = builder.intern_external(fqname, path);
+    for (fqname, path, file, r) in externals {
+        let idx = builder.intern_external(fqname, path, file);
         ref_to_global.insert(r, idx);
     }
 
@@ -2231,29 +2236,13 @@ impl ProjectContext {
         Ok(decls_matching_name_indices_in(&outputs, &regex))
     }
 
-    /// Forward closure: every node reachable from ``root`` by following
-    /// graph edges. ``skip_flags`` filters out edges whose flag mask
-    /// matches (pass ``EdgeFlags.DEAD_BRANCH.value`` to compute strict
-    /// reachability excluding dead branches).
-    #[pyo3(signature = (root, *, skip_flags = 0))]
-    pub(crate) fn descendants(
-        &self,
-        py: Python<'_>,
-        root: &SymbolNode,
-        skip_flags: u8,
-    ) -> PyResult<Vec<Py<SymbolNode>>> {
-        let outputs = self.materialized("descendants")?;
-        let root_idx = lookup_idx(&outputs.builder, root, "root")?;
-        bfs(&outputs.builder, [root_idx], Direction::Forward, skip_flags)
-            .into_iter()
-            .map(|i| outputs.builder.nodes[i].to_symbol(py))
-            .collect()
-    }
-
-    /// Idx-keyed variant of :meth:`descendants`. Takes a positional
-    /// index into ``ctx.nodes()`` and returns descendant indices
-    /// rather than allocating ``Py<SymbolNode>`` clones. Raises
-    /// :class:`IndexError` when ``root_idx`` is out of range.
+    /// Forward closure: every node reachable from ``root_idx`` by
+    /// following graph edges. Takes a positional index into
+    /// ``ctx.nodes()`` and returns descendant indices. ``skip_flags``
+    /// filters out edges whose flag mask matches (pass
+    /// ``EdgeFlags.DEAD_BRANCH.value`` for strict reachability excluding
+    /// dead branches). Raises :class:`IndexError` when ``root_idx`` is
+    /// out of range.
     #[pyo3(signature = (root_idx, *, skip_flags = 0))]
     pub(crate) fn descendants_indices(
         &self,
@@ -2274,27 +2263,12 @@ impl ProjectContext {
         )
     }
 
-    /// Reverse closure: every node that can reach ``decl`` by following
-    /// graph edges. Used for ``why-alive`` and blast-radius scoping.
-    #[pyo3(signature = (decl, *, skip_flags = 0))]
-    pub(crate) fn ancestors(
-        &self,
-        py: Python<'_>,
-        decl: &SymbolNode,
-        skip_flags: u8,
-    ) -> PyResult<Vec<Py<SymbolNode>>> {
-        let outputs = self.materialized("ancestors")?;
-        let idx = lookup_idx(&outputs.builder, decl, "decl")?;
-        bfs(&outputs.builder, [idx], Direction::Reverse, skip_flags)
-            .into_iter()
-            .map(|i| outputs.builder.nodes[i].to_symbol(py))
-            .collect()
-    }
-
-    /// Idx-keyed variant of :meth:`ancestors`. Takes a positional
-    /// index into ``ctx.nodes()`` and returns ancestor indices rather
-    /// than allocating ``Py<SymbolNode>`` clones. Raises
-    /// :class:`IndexError` when ``decl_idx`` is out of range.
+    /// Reverse closure: every node that can reach ``decl_idx`` by
+    /// following graph edges. Takes a positional index into
+    /// ``ctx.nodes()`` and returns ancestor indices. Used for
+    /// ``why-alive`` and blast-radius scoping. ``skip_flags`` works the
+    /// same as in :meth:`descendants_indices`. Raises :class:`IndexError`
+    /// when ``decl_idx`` is out of range.
     #[pyo3(signature = (decl_idx, *, skip_flags = 0))]
     pub(crate) fn ancestors_indices(
         &self,

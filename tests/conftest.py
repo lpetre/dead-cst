@@ -210,15 +210,32 @@ def assert_dynamic_import_edges():
 def successors_of():
     """Return the one-hop successors of ``node`` in ``ctx`` (test-only).
 
-    Production code uses :meth:`ProjectContext.descendants` for the
-    transitive closure; the one-hop accessor lives here because only
-    tests reach for it.
+    The transitive closure lives in :func:`descendants_of`; this one-hop
+    accessor stays here because only tests reach for it.
     """
 
     def _of(ctx: "native.ProjectContext", node) -> list:
         nodes = ctx.nodes()
         idx = nodes.index(node)
         return [nodes[v] for u, v, _ in ctx.edges() if u == idx]
+
+    return _of
+
+
+@pytest.fixture
+def descendants_of():
+    """Return the transitive forward closure of ``node`` in ``ctx`` as
+    ``SymbolNode``s (test-only).
+
+    The native surface is index-keyed (``descendants_indices``); this
+    fixture maps the seed node to its index, runs the closure, and maps
+    the result back to nodes so tests can assert on ``SymbolNode``s.
+    """
+
+    def _of(ctx: "native.ProjectContext", node, *, skip_flags: int = 0) -> list:
+        nodes = ctx.nodes()
+        idx = nodes.index(node)
+        return [nodes[i] for i in ctx.descendants_indices(idx, skip_flags=skip_flags)]
 
     return _of
 

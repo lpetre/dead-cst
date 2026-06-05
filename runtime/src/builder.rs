@@ -5,7 +5,7 @@
 
 use std::sync::OnceLock;
 
-use pyo3::exceptions::{PyIndexError, PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyIndexError, PyRuntimeError};
 use pyo3::prelude::*;
 use ruff_db::files::File;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -18,13 +18,15 @@ use crate::project::ProjectContext;
 /// Positional identity for a node.
 ///
 /// Per `CLAUDE.md` principle 3, `flags` is deliberately *not* part of
-/// the key: two nodes for the same `(fqname, kind, path, position)` are
-/// the same node regardless of which path computed their flags.
+/// the key: two nodes for the same `(fqname, kind, file, position)` are
+/// the same node regardless of which path computed their flags. `file`
+/// is a `Copy` salsa id (one per path), so it discriminates exactly as
+/// the old path string did without the per-node `String` clone.
 #[derive(Hash, Eq, PartialEq, Clone)]
 pub(crate) struct NodeKey {
     pub(crate) fqname: String,
     pub(crate) kind: &'static str,
-    pub(crate) path: String,
+    pub(crate) file: File,
     pub(crate) start_line: usize,
     pub(crate) start_column: usize,
     pub(crate) end_line: usize,
@@ -63,14 +65,15 @@ pub(crate) struct GraphNode {
 }
 
 impl GraphNode {
-    /// Positional identity for the intern table. Mirrors
-    /// [`node_key_of`] (which projects a `SymbolNode`) but reads the
-    /// pure-rust fields directly.
-    pub(crate) fn key(&self) -> NodeKey {
+    /// Positional identity for the intern table. The `file` is supplied
+    /// by the caller (it owns the `File` at mint — the assembly loop and
+    /// [`GraphBuilder::intern_external`]) so [`GraphNode`] need not carry
+    /// one and can stay `Default`-constructible for the prefill region.
+    pub(crate) fn key(&self, file: File) -> NodeKey {
         NodeKey {
             fqname: self.fqname.clone(),
             kind: self.kind,
-            path: self.path.clone(),
+            file,
             start_line: self.start_line,
             start_column: self.start_column,
             end_line: self.end_line,
@@ -167,8 +170,8 @@ impl GraphBuilder {
         }
     }
 
-    pub(crate) fn intern_node(&mut self, node: GraphNode) -> usize {
-        let key = node.key();
+    pub(crate) fn intern_node(&mut self, node: GraphNode, file: File) -> usize {
+        let key = node.key(file);
         if let Some(&idx) = self.node_index.get(&key) {
             return idx;
         }
@@ -206,8 +209,8 @@ impl GraphBuilder {
     /// since a collision would silently overwrite a node and corrupt
     /// the index map — guards that invariant. Requires the region to
     /// be pre-sized via [`prefill_payload_region`].
-    pub(crate) fn place_node(&mut self, idx: usize, node: GraphNode) {
-        let prev = self.node_index.insert(node.key(), idx);
+    pub(crate) fn place_node(&mut self, idx: usize, node: GraphNode, file: File) {
+        let prev = self.node_index.insert(node.key(file), idx);
         assert!(
             prev.is_none(),
             "payload node key collision at index {idx}: assembly must mint each NodeKey once"
@@ -216,20 +219,21 @@ impl GraphBuilder {
     }
 
     /// Get (or mint) the deduplicated `kind="external"` node for a
-    /// non-first-party import target the project doesn't own —
-    /// ``[external dist] X`` covers third-party site-packages,
-    /// ``[external file] X`` a resolved-but-out-of-tree file, and
-    /// ``[unresolved] X`` a genuinely-missing top-level name. The
-    /// resolved target's `path` (empty for ``[unresolved]``, which has
-    /// no file) is carried so callers can exclude these nodes by path;
-    /// position is the (0, 0) sentinel. Deduped by fqname project-wide;
-    /// the first `path` seen for a given fqname wins, so several
-    /// submodules of one dist collapse to a single node.
-    pub(crate) fn intern_external(&mut self, fqname: String, path: String) -> usize {
+    /// resolved non-first-party import target the project doesn't own —
+    /// ``[external dist] X`` covers third-party site-packages and
+    /// ``[external file] X`` a resolved-but-out-of-tree file. (Genuinely
+    /// unresolved imports never reach here: they keep their alias node,
+    /// flagged `NodeFlags::UNRESOLVED`.) The resolved target's `path` is
+    /// carried so callers can exclude these nodes by path, and its
+    /// `file` keys the [`NodeKey`]; position is the (0, 0) sentinel.
+    /// Deduped by fqname project-wide; the first `path`/`file` seen for a
+    /// given fqname wins, so several submodules of one dist collapse to a
+    /// single node.
+    pub(crate) fn intern_external(&mut self, fqname: String, path: String, file: File) -> usize {
         if let Some(&idx) = self.external_nodes.get(&fqname) {
             return idx;
         }
-        let idx = self.intern_node(positionless_node(fqname.clone(), "external", path, 0));
+        let idx = self.intern_node(positionless_node(fqname.clone(), "external", path, 0), file);
         self.external_nodes.insert(fqname, idx);
         idx
     }
@@ -274,21 +278,6 @@ pub(crate) fn not_materialized(op: &str) -> PyErr {
         "ProjectContext.{op}() called outside an active materialize() — \
          did you call it from a plugin's run() method?"
     ))
-}
-
-/// Project a `SymbolNode` onto the `NodeKey` used for intern-table
-/// identity. Clones the two `String` fields (`fqname`, `path`); the
-/// rest are `Copy`.
-pub(crate) fn node_key_of(node: &SymbolNode) -> NodeKey {
-    NodeKey {
-        fqname: node.fqname.clone(),
-        kind: node.kind,
-        path: node.path.clone(),
-        start_line: node.start_line,
-        start_column: node.start_column,
-        end_line: node.end_line,
-        end_column: node.end_column,
-    }
 }
 
 /// Direction passed to :func:`bfs` — forward follows ``src -> dst``
@@ -465,22 +454,6 @@ fn check_idx_in_range(len: usize, idx: usize, op: &str, side: &str) -> PyResult<
     Ok(())
 }
 
-/// Resolve a `SymbolNode` reference to its builder-side index for an
-/// edge endpoint. Surfaces a precise `ValueError` (with `side`) when
-/// the node was never interned in this context.
-pub(crate) fn lookup_idx(builder: &GraphBuilder, node: &SymbolNode, side: &str) -> PyResult<usize> {
-    builder
-        .node_index
-        .get(&node_key_of(node))
-        .copied()
-        .ok_or_else(|| {
-            PyValueError::new_err(format!(
-                "add_edge: {side} node {:?} is not interned in this ProjectContext",
-                node.fqname
-            ))
-        })
-}
-
 #[cfg(test)]
 mod tests {
     //! Pure-rust tests for the graph-building primitives.
@@ -489,89 +462,13 @@ mod tests {
     //! pyo3-init / a GIL; those paths are exercised by the python suite
     //! end-to-end. Here we cover the data-only pieces:
     //!
-    //! * `NodeKey` equality / hashing (flags excluded from identity).
-    //! * `node_key_of` projection.
     //! * `positionless_node` field defaults.
     //! * `bfs` traversal — direction switch + `skip_flags` filtering.
+    //!
+    //! `NodeKey` identity (positional, flags-excluded) is keyed on a
+    //! salsa `File`, which needs a db to construct, so it's covered by
+    //! the Python suite's shadowing / cross-file tests rather than here.
     use super::*;
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    /// Build a bare `SymbolNode` for projection tests. Avoids pyo3
-    /// because the helper doesn't need to be reachable from Python.
-    fn raw_symbol(
-        fqname: &str,
-        kind: &'static str,
-        path: &str,
-        start_line: usize,
-        flags: u32,
-    ) -> SymbolNode {
-        SymbolNode {
-            fqname: fqname.to_string(),
-            kind,
-            path: path.to_string(),
-            start_line,
-            start_column: 0,
-            end_line: start_line,
-            end_column: 0,
-            flags,
-            imports: None,
-            cached_hash: OnceLock::new(),
-        }
-    }
-
-    fn hash_of(key: &NodeKey) -> u64 {
-        let mut h = DefaultHasher::new();
-        key.hash(&mut h);
-        h.finish()
-    }
-
-    // -- node_key_of / NodeKey -------------------------------------------
-
-    #[test]
-    fn node_key_of_projects_identity_fields() {
-        let n = raw_symbol("pkg.mod.f", "function", "pkg/mod.py", 12, 0);
-        let key = node_key_of(&n);
-        assert_eq!(key.fqname, "pkg.mod.f");
-        assert_eq!(key.kind, "function");
-        assert_eq!(key.path, "pkg/mod.py");
-        assert_eq!(key.start_line, 12);
-        assert_eq!(key.end_line, 12);
-    }
-
-    #[test]
-    fn node_key_excludes_flags_from_identity() {
-        // Principle 3 from CLAUDE.md: two nodes for the same
-        // (fqname, kind, path, position) are the same node regardless
-        // of which path computed their flags.
-        let a = node_key_of(&raw_symbol("m.f", "function", "m.py", 1, 0));
-        let b = node_key_of(&raw_symbol("m.f", "function", "m.py", 1, 7));
-        assert!(a == b);
-        assert_eq!(hash_of(&a), hash_of(&b));
-    }
-
-    #[test]
-    fn node_key_distinguishes_by_position() {
-        // Two `def f` at different lines must be distinct nodes
-        // (shadowing semantics).
-        let a = node_key_of(&raw_symbol("m.f", "function", "m.py", 1, 0));
-        let b = node_key_of(&raw_symbol("m.f", "function", "m.py", 9, 0));
-        assert!(a != b);
-    }
-
-    #[test]
-    fn node_key_distinguishes_by_kind() {
-        let a = node_key_of(&raw_symbol("m.X", "class", "m.py", 1, 0));
-        let b = node_key_of(&raw_symbol("m.X", "variable", "m.py", 1, 0));
-        assert!(a != b);
-    }
-
-    #[test]
-    fn node_key_distinguishes_by_path() {
-        let a = node_key_of(&raw_symbol("X", "class", "a/m.py", 1, 0));
-        let b = node_key_of(&raw_symbol("X", "class", "b/m.py", 1, 0));
-        assert!(a != b);
-    }
 
     // -- positionless_node ------------------------------------------------
 
