@@ -1742,6 +1742,14 @@ mod tests {
         assert!(!is_dunder_name("foo.bar.baz"));
     }
 
+    #[test]
+    fn is_dunder_name_checks_only_last_segment() {
+        // Only the final dotted segment counts: a dunder module with a
+        // plain member is not a dunder, and vice versa.
+        assert!(is_dunder_name("pkg.mod.__all__"));
+        assert!(!is_dunder_name("pkg.__init__.helper"));
+    }
+
     // -- rel_path ----------------------------------------------------------
 
     #[test]
