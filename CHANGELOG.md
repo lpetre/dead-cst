@@ -237,6 +237,11 @@ two versions.
 
 ### Changed
 
+- **`re_materialize` drops the previous graph off-thread.** When a rebuild
+  swaps in fresh `BuildOutputs`, the previous build's graph (nodes, edges,
+  adjacency, the fqname/base indices) is now deallocated on a detached thread
+  instead of inline under the GIL, so `re_materialize` returns without waiting
+  on the old graph's dealloc. Behavior is unchanged; only the drop is offloaded.
 - **Nested `from X import *` is no longer fanned out.** A `from X import *`
   inside a function or class body is a `SyntaxError` ("import * only allowed at
   module level"), so it cannot occur in runnable Python. The engine previously

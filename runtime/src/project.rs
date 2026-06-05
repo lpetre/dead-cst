@@ -1684,7 +1684,24 @@ impl ProjectContext {
                 return Err(e);
             }
         };
-        *slf.borrow(py).outputs.write() = Some(outputs);
+        // Swap in the freshly built outputs and offload the *previous*
+        // ``BuildOutputs`` to a detached thread for dropping. It's ``None``
+        // on the first build and ``Some`` on every ``re_materialize``; the
+        // old graph (nodes, edges, adjacency, the fqname/base indices) is a
+        // large web of allocations whose dealloc would otherwise run on this
+        // GIL-holding thread and stall the caller. The swap itself is a
+        // pointer move under the write lock; the drop happens after the lock
+        // is released. ``BuildOutputs`` is ``Send + 'static`` (it already
+        // rides the ``Arc<RwLock<…>>`` here and the rayon plugin scope below),
+        // so the move is sound. If the OS can't spawn the thread, the unrun
+        // closure is dropped and ``old`` deallocs inline — correct, just not
+        // offloaded.
+        let previous = slf.borrow(py).outputs.write().replace(outputs);
+        if let Some(old) = previous {
+            let _ = std::thread::Builder::new()
+                .name("dead-cst-drop-outputs".into())
+                .spawn(move || drop(old));
+        }
 
         // Project-wide plugin pass — fan out across a GIL-free
         // ``rayon`` scope, one task per plugin, mirroring the per-file
